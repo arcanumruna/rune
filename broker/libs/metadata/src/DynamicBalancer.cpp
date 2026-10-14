@@ -226,6 +226,7 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
         if (members.empty()) return;
         const int32_t partCount = members[0]->partitionCount;
 
+        std::vector<int32_t> electionOnly;   // Task 11 fix round 5 (M2): reused across partitions
         for (int32_t p = 0; p < partCount; ++p) {
 
             enum class Action { None, Failover, Preferred };
@@ -254,8 +255,10 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
                     if (ex.topicId == topicId && ex.partition == p && ex.node == node) return true;
                 return false;
             };
-            // Task 11 fix round 4: election-only exclusions at this partition index.
-            std::vector<int32_t> electionOnly;
+            // Task 11 fix round 4: election-only exclusions at this partition index
+            // (review M2: one vector per tick, cleared per partition — no
+            // allocation for partitions without an exclusion).
+            electionOnly.clear();
             for (const auto& ex : in.electionExcluded)
                 for (const TopicSpec* ts : members)
                     if (ex.topicId == ts->topicId && ex.partition == p && !isIn(ex.node, electionOnly))
@@ -447,6 +450,7 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
                         rune::consensus::Term bestEp = -1; int64_t bestLeo = -1;
                         for (int32_t r : mc->replicas) {
                             if (!isIn(r, in.liveNodes)) continue;
+                            if (isIn(r, electionOnly)) continue;   // review M3 (round 5): never a survivor either
                             auto opt = in.positions->get(ts->topicId, p, r);
                             if (!opt.has_value()) continue; // no proof → not a candidate
                             const auto ep  = static_cast<rune::consensus::Term>(opt->leaderEpoch);

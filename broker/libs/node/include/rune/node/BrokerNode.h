@@ -1851,6 +1851,7 @@ private:
     uint64_t unbuiltScanVersion_ = ~0ull;
     bool     unbuiltScanHalted_  = false;
     int64_t  unbuiltLastPassNs_  = 0;
+    int64_t  unbuiltResumeKey_   = 0;   // review M1: the next pass starts at the first refused key
     /// TEST-ONLY seam (control thread): hold this broker's catalog-halt broadcast
     /// (forces the placement race of fix round 2: a create placed on a broker that
     /// halts on it before any member knows).
@@ -1867,6 +1868,9 @@ private:
     std::int64_t     unplaceableCounterRegId_ = -1;
     std::shared_ptr<aeron::Counter> unplaceableCounter_;
     std::int64_t     unplaceablePublished_ = -1;
+    std::int64_t     blockedCounterRegId_  = -1;   // Task 11 fix round 5 (M5)
+    std::shared_ptr<aeron::Counter> blockedCounter_;
+    std::int64_t     blockedPublished_     = -1;
     /// Control thread: a halted broker never drives catalog placement — it
     /// reports its halt to every member (never a placement target) and, while it
     /// leads the consensus, stands down to a live healthy peer when one exists

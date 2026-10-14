@@ -291,6 +291,30 @@ private:
     int applyUserPartitionRoles(
         const rune::metadata::AssignmentMap& currentMap) noexcept
     {
+        // Fix-on-sight (catalog history Task 11 fix round 5): a role committed
+        // BEFORE this broker built the replica (it applied the topic's create a
+        // moment after the controller placed it) was skipped — apply it once the
+        // replica is registered, never only at the partition's next change.
+        int late = 0;
+        if (!rolesWithoutReplica_.empty() && registry_.generation() != lateRoleGen_) [[unlikely]] {
+            lateRoleGen_ = registry_.generation();
+            for (auto it = rolesWithoutReplica_.begin(); it != rolesWithoutReplica_.end();) {
+                const rune::metadata::PartitionKey key{it->first, it->second};
+                const auto* pa = currentMap.get(key.topicId, key.partition);
+                if (pa == nullptr || std::find(pa->replicas.begin(), pa->replicas.end(),
+                                               static_cast<int32_t>(selfId_)) == pa->replicas.end()) {
+                    it = rolesWithoutReplica_.erase(it);   // no longer ours: nothing to apply
+                    continue;
+                }
+                if (registry_.lookup(key.topicId, key.partition) == nullptr) { ++it; continue; }
+                it = rolesWithoutReplica_.erase(it);
+                if (pa->leaderNode == static_cast<int32_t>(selfId_)) applyBecomeLeaderForKey(key, currentMap);
+                else applyBecomeFollowerForKey(key, currentMap);
+                ++lateRolesApplied_;
+                late = 1;
+            }
+        }
+
         // Compute delta via the production MetadataStateMachine::deriveLocalDelta.
         rune::metadata::LocalRoleDelta delta =
             msm_->deriveLocalDelta(static_cast<int32_t>(selfId_), prevMap_);
@@ -302,7 +326,7 @@ private:
             !delta.deletes.empty();
 
         if (!anyChange) {
-            return 0;
+            return late;
         }
 
         // Apply role transitions for user partitions only.
@@ -458,7 +482,7 @@ private:
             return;
         }
         auto* replica = registry_.lookup(key.topicId, key.partition);
-        if (!replica) return;
+        if (!replica) { noteRoleWithoutReplica_(key); return; }
 
         const rune::metadata::PartitionAssignment* pa =
             currentMap.get(key.topicId, key.partition);
@@ -486,7 +510,7 @@ private:
             return;
         }
         auto* replica = registry_.lookup(key.topicId, key.partition);
-        if (!replica) return;
+        if (!replica) { noteRoleWithoutReplica_(key); return; }
 
         const rune::metadata::PartitionAssignment* pa =
             currentMap.get(key.topicId, key.partition);
@@ -567,6 +591,20 @@ private:
     bool                                           coordinatorOnController_ = false;   ///< MEDIUM-B
     std::vector<rune::replication::NodeId>         allReplicaIds_;
     ReplicaRegistry&                               registry_;
+    // Fix round 5 (fix-on-sight): roles skipped because the replica was not
+    // built yet; applied once the registry has it (generation change).
+    std::vector<std::pair<int32_t, int32_t>>       rolesWithoutReplica_;
+    std::uint64_t                                  lateRoleGen_      = ~0ull;
+    std::uint64_t                                  lateRolesApplied_ = 0;
+    void noteRoleWithoutReplica_(const rune::metadata::PartitionKey& key) noexcept {
+        if (key.topicId < 0) return;   // internal partitions are built at boot
+        for (const auto& k : rolesWithoutReplica_) if (k.first == key.topicId && k.second == key.partition) return;
+        try { rolesWithoutReplica_.emplace_back(key.topicId, key.partition); } catch (...) {}
+        lateRoleGen_ = ~0ull;
+    }
+public:
+    [[nodiscard]] std::uint64_t lateRolesAppliedForTest() const noexcept { return lateRolesApplied_; }
+private:
 
     // Non-owning pointer to the WorkerPool.  When non-null, role changes are
     // routed to the owning worker's SPSC ingress (shared-nothing E2 fix).

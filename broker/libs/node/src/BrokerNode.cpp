@@ -421,10 +421,11 @@ void BrokerNode::start() {
             // created after the halt are unknown here, their dirs hold committed
             // data.  Nothing is moved, renamed, deleted or quarantined; once the
             // operator repairs the catalog a restart builds them from those dirs.
-            spdlog::critical("BrokerNode[{}]: the __catalog boot replay halts before its checkpoint — NO topic dir is "
-                             "moved, renamed, deleted or quarantined this boot (catalog damage: no destructive "
-                             "cleanup); topics created after the halt are not served until the catalog is repaired",
-                             config_.nodeId);
+            spdlog::critical("BrokerNode[{}]: the __catalog boot replay halts before its checkpoint — the topic-dir "
+                             "reconcile is SKIPPED this boot: NO topic dir is moved, renamed, deleted or quarantined "
+                             "(catalog damage: no destructive cleanup), and its non-destructive steps (marker heal, "
+                             "stale-marker clearing, the .catalog-damaged latch) wait for the next healthy boot; topics "
+                             "created after the halt are not served until the catalog is repaired", config_.nodeId);
         } else {
             (void)reconcileTopicDirs(config_.dataDir, claims, /*placeholderIds=*/{},
                                      std::chrono::duration_cast<std::chrono::seconds>(
@@ -513,6 +514,9 @@ void BrokerNode::start() {
         unplaceableCounterRegId_ = aeron_->addCounter(
             kCatalogUnplaceableTopicsCounterTypeId, roleKey, kRoleKeyLength,
             catalogUnplaceableTopicsLabel(config_.nodeId));
+        blockedCounterRegId_ = aeron_->addCounter(
+            kCatalogBlockedPartitionsCounterTypeId, roleKey, kRoleKeyLength,
+            catalogBlockedPartitionsLabel(config_.nodeId));
     }
     const auto t2 = sclock::now();
 
@@ -2552,6 +2556,9 @@ void BrokerNode::buildGateway() {
                 // collapse).  See DynamicBalancerInputs::minIsr.
                 metadataService_->setMinIsr(config_.gatewayMinIsr);
                 metadataService_->setAllowSurvivorElection(config_.survivorLeaderElection);
+                // Task 11 fix round 5 (I1): a young controller process waits one
+                // report TTL before deciding user-partition leadership.
+                metadataService_->setUnservableReportWarmup(MetadataService::kUnservableReportTtlNs);
                 // D15: the metadata feature level is raised only once every
                 // member advertised it (its node-control registration).
                 metadataService_->setClusterMembers(balancerNodes);
@@ -3752,6 +3759,7 @@ void BrokerNode::stop() {
     outOfSyncCounter_.reset();      // readiness gate (L5): same rule
     catalogHaltedCounter_.reset();  // catalog history Task 7: same rule
     unplaceableCounter_.reset();    // Task 11 fix round 1
+    blockedCounter_.reset();        // Task 11 fix round 5 (M5)
     catalogAppliedCounter_.reset();
     for (auto& c : provCounters_) c.reset();   // re-review N4: same rule (the provisioner is stopped)
 
@@ -4168,10 +4176,18 @@ int BrokerNode::reportUnbuildableReplicas_() {
     });
     if (nowNs - unbuiltLastPassNs_ < kUnservableReportPeriodNs) return 0;   // the live report's period
     unbuiltLastPassNs_ = nowNs;
-    const int32_t ctl = static_cast<int32_t>(election_->leaderMemberId());
-    if (ctl < 0) return 0;
+    // Fix round 5 (I1): BROADCAST to every metadata member (as the node-control
+    // halt report is) — each keeps a TTL'd copy, so a successor controller holds
+    // fresh reports at its first decision.  Review M1: a full outbound ring never
+    // starves the same tail — the next pass starts at the first key it refused.
     int work = 0;
-    for (auto& [key, u] : unbuilt_) {
+    auto start = unbuilt_.lower_bound(unbuiltResumeKey_);
+    if (start == unbuilt_.end()) start = unbuilt_.begin();
+    bool refused = false;
+    auto it = start;
+    for (std::size_t i = 0; i < unbuilt_.size(); ++i, ++it) {
+        if (it == unbuilt_.end()) it = unbuilt_.begin();
+        auto& [key, u] = *it;
         if (!halted && nowNs - u.firstSeenNs < kUnbuiltReportGraceNs) continue;   // may still apply the create
         if (u.lastSentNs == 0)
             spdlog::warn("BrokerNode[{}]: assigned ({}, {}) but cannot serve it ({}) — reporting it to the controller "
@@ -4186,9 +4202,13 @@ int BrokerNode::reportUnbuildableReplicas_() {
         m.isr[1]    = rune::replication::AlterIsrMsg::kBumpReplicaUnservable;
         m.isr[3]    = static_cast<int32_t>(static_cast<uint32_t>(lifecycleNonce_));
         m.isr[4]    = static_cast<int32_t>(static_cast<uint32_t>(static_cast<uint64_t>(lifecycleNonce_) >> 32));
-        (void)replTransport_->sendNodeControl(ctl, m);   // a lost one: the next period's report
+        bool allSent = true;
+        for (const auto& peer : config_.peers)   // incl. self (delivered locally)
+            allSent = replTransport_->sendNodeControl(peer.id, m) && allSent;
+        if (!allSent && !refused) { refused = true; unbuiltResumeKey_ = key; }   // M1: resume here next pass
         ++work;
     }
+    if (!refused) unbuiltResumeKey_ = 0;
     return work;
 }
 
@@ -4204,6 +4224,17 @@ int BrokerNode::publishPlacementView_() {
         if (unplaceableCounter_) {
             unplaceableCounter_->set(unplaceable);
             unplaceablePublished_ = unplaceable;
+        }
+    }
+    // Review M5 (round 5): BLOCKED partitions on their own gauge.
+    const auto blockedN = static_cast<std::int64_t>(metadataService_->blockedPartitionCount());
+    if (blockedN != blockedPublished_) {
+        if (!blockedCounter_ && blockedCounterRegId_ >= 0 && aeron_) {
+            try { blockedCounter_ = aeron_->findCounter(blockedCounterRegId_); } catch (...) { blockedCounter_.reset(); }
+        }
+        if (blockedCounter_) {
+            blockedCounter_->set(blockedN);
+            blockedPublished_ = blockedN;
         }
     }
     // The view: every configured broker minus the catalog-halted ones (a fixed

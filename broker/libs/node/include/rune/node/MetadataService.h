@@ -413,9 +413,17 @@ public:
     struct UnplaceableTopic { std::string reason; };
     /// Task 11 fix round 4: one live "cannot serve" report (refreshed by its sender).
     struct UnservableReport { int32_t topicId; int32_t partition; int32_t node; int64_t lastSeenNs; };
-    /// Never-placed topics + BLOCKED partitions (fix round 4) — the
-    /// rune-catalog-unplaceable-topics gauge.
-    [[nodiscard]] std::size_t unplaceableTopicCount() const noexcept { return unplaceable_.size() + blocked_.size(); }
+    /// Never-placed TOPICS (the rune-catalog-unplaceable-topics gauge).  BLOCKED
+    /// PARTITIONS have their own gauge (review M5: never summed together).
+    [[nodiscard]] std::size_t unplaceableTopicCount() const noexcept { return unplaceable_.size(); }
+    /// I1 (round 5): a controller whose PROCESS has held the broadcast reports for
+    /// less than `ns` defers user-partition leader elections until it has (it may
+    /// lack a fresh "cannot serve" report).  BrokerNode sets kUnservableReportTtlNs
+    /// multi-node; 0 (unit rigs) = off.
+    void setUnservableReportWarmup(int64_t ns) noexcept { unservableWarmupNs_ = ns; }
+    [[nodiscard]] bool unservableWarmingUp() const noexcept {
+        return unservableWarmupNs_ > 0 && (firstPassNs_ < 0 || lastNowNs_ - firstPassNs_ < unservableWarmupNs_);
+    }
 
     // -----------------------------------------------------------------------
     // Catalog history Task 11 fix round 4 — replicas that cannot SERVE.
@@ -1282,6 +1290,11 @@ public:
                 const auto& reps = leaderlessReports_[k];
                 for (int32_t n : pa->replicas) {
                     if (!isEligible_(n)) continue;
+                    // Task 11 fix round 5 (I2): a replica that reports it cannot
+                    // serve has no PartitionReplica — it never sends a follower
+                    // report: never waited for (and never a candidate, below).
+                    if (reportedUnservable(static_cast<int32_t>(k >> 32), static_cast<int32_t>(static_cast<uint32_t>(k)), n))
+                        continue;
                     const auto r = reps.find(n);
                     if (r == reps.end() || r->second.epoch != pa->leaderEpoch) { ready = false; break; }
                 }
@@ -1296,6 +1309,9 @@ public:
             if (!recs.empty() && static_cast<int>(recs.size() + members.size()) > maxRecords) continue;
             auto avail = [&](const View& v, int32_t n, int32_t* leo) {
                 if (!isEligible_(n) || isShutting_(n)) return false;
+                if (reportedUnservable(static_cast<int32_t>(v.key >> 32),
+                                       static_cast<int32_t>(static_cast<uint32_t>(v.key)), n))
+                    return false;   // fix round 5 (I2): never a candidate
                 if (std::find(v.pa->replicas.begin(), v.pa->replicas.end(), n) == v.pa->replicas.end()) return false;
                 const auto r = v.reps->find(n);
                 if (r == v.reps->end() || r->second.logDirFailed || r->second.epoch != v.pa->leaderEpoch) return false;
@@ -1402,6 +1418,10 @@ public:
     std::vector<int32_t>                haltedScratch_;   // M2: reused (capacity persists)
     // Task 11 fix round 4: live "cannot serve" reports + the BLOCKED partitions derived from them.
     std::vector<UnservableReport>       unservable_;
+    std::vector<rune::metadata::DynamicBalancerInputs::LeaderExclusion> electionExcludedScratch_;
+    int64_t                             firstPassNs_    = -1;   // I1: this process's first doWork
+    uint64_t                            warmupLogged_   = 0;
+    int64_t                             unservableWarmupNs_ = 0;  // I1: 0 = off (unit rigs)
     std::vector<int64_t>                blocked_;
     std::vector<int64_t>                blockedScratch_;
     uint64_t                            unplaceableEvents_     = 0;
@@ -1698,6 +1718,16 @@ public:
 
         // MEDIUM-B: coordinator partitions (controller-ISR path).
         const std::size_t coord = reconcileCoordinatorPartitions(eligibleNodes);
+        // Task 11 fix round 5 (I1): every member holds the broadcast "cannot serve"
+        // reports; a controller PROCESS younger than one report TTL may lack one —
+        // it decides no user-partition leadership until it has held them a full TTL.
+        if (unservableWarmingUp()) {
+            if (warmupLogged_++ == 0)
+                spdlog::info("MetadataService[{}]: user-partition leader elections deferred until this process has "
+                             "held the replicas' 'cannot serve' reports for {} ms", selfId_,
+                             unservableWarmupNs_ / 1'000'000);
+            return coord;
+        }
         if (configuredTopics_.empty()) {
             // Coordinator partitions only: their bump requests (MAJOR-1).
             std::vector<rune::metadata::DynamicBalancerInputs::LeaderExclusion> ex;
@@ -1766,6 +1796,7 @@ public:
 
         rune::metadata::DynamicBalancer bal;
         std::vector<rune::metadata::BalancerRecord> recs = bal.rebalance(in);
+        electionExcludedScratch_.swap(in.electionExcluded);   // M2: capacity kept for the next tick
         if (userDecisionHoldNs_ > 0 && lastNowNs_ < readySinceNs_ + userDecisionHoldNs_) [[unlikely]] {
             // TEST-ONLY hold (NodeConfig::testUserDecisionHoldMs): no USER partition decision yet.
             std::erase_if(recs, [](const rune::metadata::BalancerRecord& br) { return br.rec.topicId >= 0; });
@@ -1908,6 +1939,7 @@ public:
     int doWork(int64_t nowNs) {
         if (!replica_) return 0;
         lastNowNs_ = nowNs;
+        if (firstPassNs_ < 0) firstPassNs_ = nowNs;   // I1 (round 5): report warm-up start
         if (userDecisionHoldNs_ > 0) {   // TEST-ONLY (NodeConfig::testUserDecisionHoldMs)
             const bool ready = controllerReady_();
             if (ready && !holdWasReady_) readySinceNs_ = nowNs;
@@ -2500,6 +2532,15 @@ private:
 
     void noteUnservable_(const rune::replication::AlterIsrMsg& m) {
         const int64_t now = lastNowNs_;
+        // Review M4 (round 5): a late report of an OLDER process of the node is
+        // dropped; a report about a partition it is not a replica of is ignored.
+        const int64_t inc = incarnationOf_(m);
+        if (const auto it = nodeLifecycle_.find(m.leaderId);
+            inc != 0 && it != nodeLifecycle_.end() && it->second.nonce != 0 && it->second.nonce != inc)
+            return;
+        if (const auto* pa = msm_.assignment(m.topicId, m.partition);
+            pa != nullptr && std::find(pa->replicas.begin(), pa->replicas.end(), m.leaderId) == pa->replicas.end())
+            return;
         for (auto& u : unservable_)
             if (u.topicId == m.topicId && u.partition == m.partition && u.node == m.leaderId) {
                 u.lastSeenNs = now;
@@ -2509,7 +2550,10 @@ private:
         spdlog::warn("MetadataService[{}]: node {} reports it cannot serve ({}, {}) — never elected its leader while "
                      "it reports", selfId_, m.leaderId, m.topicId, m.partition);
     }
-    void unservableExclusions_(std::vector<rune::metadata::DynamicBalancerInputs::LeaderExclusion>& out) const {
+    void unservableExclusions_(std::vector<rune::metadata::DynamicBalancerInputs::LeaderExclusion>& out) {
+        // Review M2 (round 5): the vector is the reused member scratch, moved in
+        // and back by the tick (capacity persists — no per-tick allocation).
+        out.swap(electionExcludedScratch_);
         out.clear();
         for (const auto& u : unservable_) out.push_back({u.topicId, u.partition, u.node});
     }

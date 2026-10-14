@@ -293,7 +293,14 @@ void MetadataStateMachine::restore(Reader& r)
         for (int32_t j = 0; j < repCount; ++j) pa.replicas[j] = r.readInt32();
         if (v1) {
             pa.cleanElection    = r.readInt32() != 0;
-            pa.mark.kind        = static_cast<LeaderlessMark::Kind>(r.readInt32());
+            {   // Review M6b (round 5): only the known kinds — an image from another
+                // (dev) binary with an unknown kind restores as no mark.
+                const int32_t kind = r.readInt32();
+                pa.mark.kind = (kind == static_cast<int32_t>(LeaderlessMark::Kind::EmptyMemoryLeader) ||
+                                kind == static_cast<int32_t>(LeaderlessMark::Kind::LogDirOffline))
+                                   ? static_cast<LeaderlessMark::Kind>(kind)
+                                   : LeaderlessMark::Kind::None;
+            }
             pa.mark.node        = r.readInt32();
             pa.mark.incarnation = r.readInt64();
         }

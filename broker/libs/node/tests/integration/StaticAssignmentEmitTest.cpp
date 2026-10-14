@@ -3064,7 +3064,7 @@ TEST(CatalogUnservableRegression, SoleUnservableIsrMemberStaysBlockedAndIsNeverR
     EXPECT_EQ(c.pa().isr, std::vector<int32_t>{L}) << "the lineage is kept";
     EXPECT_TRUE(c.svc->blocked(0, 0));
     EXPECT_EQ(c.svc->blockedPartitionCount(), 1u);
-    EXPECT_GE(c.svc->unplaceableTopicCount(), 1u) << "counted on the gauge";
+    EXPECT_EQ(c.svc->unplaceableTopicCount(), 0u) << "review M5: blocked partitions have their own gauge";
     EXPECT_EQ(c.r1->logEndOffset(), leo) << "blocked: no record";
     // It serves again: the reports stop; past the TTL the block clears and it leads.
     c.clock += MetadataService::kUnservableReportTtlNs + 1'000'000;
@@ -3111,4 +3111,139 @@ TEST(CatalogUnservableRegression, ExclusionsAreRebuiltFromReportsAfterAControlle
         (void)svc2.onAlterIsr(unservable(0, 0, 3));
         EXPECT_NE(svc2.assignment(0, 0)->leaderNode, 3) << "the rebuilt exclusion holds";
     }
+}
+
+// ===========================================================================
+// Task 11 fix round 5
+// ===========================================================================
+namespace {
+/// A successor MetadataService on broker 2 that takes the controllership from 1.
+struct Successor {
+    CtlRig& c;
+    MetadataService svc2;
+    explicit Successor(CtlRig& rig) : c(rig), svc2(rig.r2.get(), 2) { svc2.configure(c.topics, c.all); }
+    void drive(int n) {
+        for (int i = 0; i < n; ++i) {
+            c.clock += 1'000'000LL;
+            c.r1->doWork(c.clock); c.r2->doWork(c.clock); c.r3->doWork(c.clock);
+            c.transport.pump(c.clock);
+            (void)svc2.doWork(c.clock);
+        }
+    }
+    void takeOver() {
+        c.r1->becomeFollower(2, 2);
+        c.r2->becomeLeader(2, c.all);
+        c.r3->becomeFollower(2, 2);
+        c.transport.setLeader(c.r2.get());
+        c.transport.removeFollower(2);
+        c.transport.addFollower(1, c.r1.get());
+        drive(200);
+    }
+};
+} // namespace
+
+// Review I1: the "cannot serve" reports are BROADCAST to every metadata member,
+// each keeping its TTL'd copy — a successor already holds h's report at its
+// FIRST decision.  Partition ISR {L, h}; L dies right at the handover.  RED
+// (reports kept by the controller only): the successor's first tick elects h —
+// the sole live in-sync member, without its data.
+TEST(CatalogUnservableRegression, SuccessorHoldsTheBroadcastReportAndNeverElectsTheUnservableBrokerRegression) {
+    CtlRig c;
+    const int32_t L = c.pa().leaderNode;
+    const int32_t h = L == 3 ? 1 : 3;
+    ASSERT_TRUE(proposeIsr(c, {L, h}));
+    ASSERT_EQ(c.pa().isr.size(), 2u);
+    Successor s(c);
+    s.drive(50);
+    (void)s.svc2.onAlterIsr(unservable(0, 0, h));   // the broadcast copy, as a FOLLOWER member
+    EXPECT_TRUE(s.svc2.reportedUnservable(0, 0, h)) << "every member records it";
+    s.takeOver();
+    ASSERT_TRUE(s.svc2.controllerCaughtUpForTest());
+    std::vector<NodeId> live;
+    for (int32_t n : {1, 2, 3}) if (n != L) live.push_back(n);
+    for (int i = 0; i < 5; ++i) {                     // the successor's first ticks
+        (void)s.svc2.reassignDeadPartitionLeaders(live, 1024);
+        s.drive(20);
+        (void)s.svc2.onAlterIsr(unservable(0, 0, h));
+        EXPECT_NE(s.svc2.assignment(0, 0)->leaderNode, h) << "tick " << i;
+    }
+    EXPECT_EQ(s.svc2.blockedPartitionCount(), 1u) << "no live in-sync replica can serve it";
+}
+
+// Review I1 (second rule): a controller PROCESS younger than one report TTL may
+// lack a report — it decides no user-partition leadership until it has held
+// them a full TTL.  RED (no warm-up): its first tick elects h.
+TEST(CatalogUnservableRegression, YoungControllerDefersUserElectionsUntilItHeldTheReportsRegression) {
+    CtlRig c;
+    const int32_t L = c.pa().leaderNode;
+    const int32_t h = L == 3 ? 1 : 3;
+    ASSERT_TRUE(proposeIsr(c, {L, h}));
+    Successor s(c);
+    s.svc2.setUnservableReportWarmup(MetadataService::kUnservableReportTtlNs);
+    s.takeOver();                                       // a fresh process: no report yet
+    ASSERT_TRUE(s.svc2.controllerCaughtUpForTest());
+    ASSERT_TRUE(s.svc2.unservableWarmingUp());
+    std::vector<NodeId> live;
+    for (int32_t n : {1, 2, 3}) if (n != L) live.push_back(n);
+    (void)s.svc2.reassignDeadPartitionLeaders(live, 1024);
+    s.drive(20);
+    EXPECT_NE(s.svc2.assignment(0, 0)->leaderNode, h) << "no election while warming up";
+    (void)s.svc2.onAlterIsr(unservable(0, 0, h));     // the next period's report arrives
+    c.clock += MetadataService::kUnservableReportTtlNs;
+    s.drive(1);
+    (void)s.svc2.onAlterIsr(unservable(0, 0, h));     // and keeps coming (live)
+    ASSERT_FALSE(s.svc2.unservableWarmingUp());
+    (void)s.svc2.reassignDeadPartitionLeaders(live, 1024);
+    s.drive(20);
+    EXPECT_NE(s.svc2.assignment(0, 0)->leaderNode, h) << "the held report excludes it";
+}
+
+// Review I2: a TRANSIENT partition whose sole-ISR leader restarts EMPTY is
+// decided on the fresh reports of its live replicas — never waiting for (nor
+// electing) a replica that reports it cannot serve (it has no PartitionReplica:
+// it never sends a follower report).  RED: held forever, waiting for h.
+TEST(CatalogUnservableRegression, LeaderlessDecisionNeverWaitsForAnUnservableReplicaRegression) {
+    CtlRig c;
+    c.soleIsr();
+    const int32_t L = c.pa().leaderNode, le = c.pa().leaderEpoch;
+    const int32_t F = L == 1 ? 2 : 1;
+    const int32_t h = 6 - L - F;
+    auto bump = c.bump(le, /*memory=*/true);
+    bump.isr[3] = 2;
+    (void)c.svc->onAlterIsr(bump);
+    c.tick();
+    ASSERT_EQ(c.pa().leaderNode, rune::metadata::NO_LEADER);
+    const int32_t lle = c.pa().leaderEpoch;
+    (void)c.svc->onAlterIsr(unservable(0, 0, h));    // h cannot serve: it never sends a follower report
+    (void)c.svc->onAlterIsr(leaderlessReport(L, lle, 0, 2));
+    (void)c.svc->onAlterIsr(leaderlessReport(F, lle, 0, 7));
+    c.tick();
+    EXPECT_NE(c.pa().leaderNode, rune::metadata::NO_LEADER) << "decided without h's report";
+    EXPECT_NE(c.pa().leaderNode, h) << "h never leads";
+    EXPECT_EQ(c.pa().leaderNode, L) << "the clean in-sync candidate";
+}
+
+// Review M4 (round 5): a report of an OLDER process of the node is dropped, and
+// a report about a partition the node is not a replica of is ignored.
+TEST(CatalogUnservableRegression, StaleProcessAndNonReplicaReportsAreIgnoredRegression) {
+    CtlRig c;
+    c.svc->addRuntimeTopic(TopicSpec{5, 1, 2, "", "rf2"});
+    c.drive(100);
+    const auto* pa = c.svc->assignment(5, 0);
+    ASSERT_NE(pa, nullptr);
+    int32_t outsider = -1;
+    for (int32_t n : {1, 2, 3}) if (!has(pa->replicas, n)) outsider = n;
+    ASSERT_GT(outsider, 0);
+    (void)c.svc->onAlterIsr(unservable(5, 0, outsider));
+    EXPECT_FALSE(c.svc->reportedUnservable(5, 0, outsider)) << "not a replica: ignored";
+    const int32_t r = pa->replicas[0];
+    (void)c.svc->onAlterIsr(nodeControl(r, 41, false));            // r's live process is 41
+    auto stale = unservable(5, 0, r);
+    stale.isr[3] = 40;                                              // an older process
+    (void)c.svc->onAlterIsr(stale);
+    EXPECT_FALSE(c.svc->reportedUnservable(5, 0, r)) << "an older process's late report";
+    auto live = unservable(5, 0, r);
+    live.isr[3] = 41;
+    (void)c.svc->onAlterIsr(live);
+    EXPECT_TRUE(c.svc->reportedUnservable(5, 0, r));
 }

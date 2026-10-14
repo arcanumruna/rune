@@ -647,3 +647,27 @@ TEST_F(BridgePerPartitionTest, CatalogRoleHeldOnAFullRingSupersededAndDeliveredI
     EXPECT_EQ(roles[0].leaderId, kNode3);
     EXPECT_EQ(bridge->catalogRolesPostedForTest(), 1u);
 }
+
+// ===========================================================================
+// Catalog history Task 11 fix round 5 (fix-on-sight): a role committed BEFORE
+// this broker built the replica (it applied the topic's create a moment after
+// the controller placed it) is applied once the replica is registered — never
+// only at the partition's next assignment change.  RED: the replica stayed a
+// Follower of a partition it leads (it served nothing until an unrelated change).
+// ===========================================================================
+TEST_F(BridgePerPartitionTest, RoleCommittedBeforeTheReplicaWasBuiltIsAppliedOnceItIsRegisteredRegression) {
+    MetadataStateMachine msm;
+    auto [cbuf, csz] = encodeCreate(0, 1, 1);
+    msm.apply(cbuf.data(), csz, 0);
+    msm.commit(0);
+    auto [ubuf, usz] = encodeUpdate({0, 0, kSelf, {kSelf, kNode2}, {kSelf, kNode2}, 4, 6});
+    msm.apply(ubuf.data(), usz, 1);
+    msm.commit(1);
+    auto bridge = makeBridge(&msm);
+    (void)bridge->doWork(kSelf, 10);                 // the role arrives: no replica here yet
+    PartitionReplica* rep = addReplica(0, 0, kSelf, Role::Follower, 1);   // built a moment later
+    (void)bridge->doWork(kSelf, 10);                 // the map did not change
+    EXPECT_EQ(rep->role(), Role::Leader) << "the committed role applied once the replica exists";
+    EXPECT_EQ(rep->epoch(), 4u);
+    EXPECT_EQ(bridge->lateRolesAppliedForTest(), 1u);
+}
