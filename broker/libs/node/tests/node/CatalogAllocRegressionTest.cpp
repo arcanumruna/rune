@@ -1,6 +1,7 @@
 // CatalogAllocRegressionTest.cpp — catalog history: the admin thread's catalog steady
 // state never allocates.  Replaces the global operator new (binary-wide), so it lives in
 // its own binary (rune_catalog_alloc_regression_tests).  Tasks 12 and 23 append here.
+#include "support/CatalogReadRig.h"
 #include "support/CatalogRig.h"
 #include <gtest/gtest.h>
 #include <cstdlib>
@@ -48,6 +49,20 @@ TEST(CatalogAllocRegression, HaltedApplierAllocatesNothingRegression) {
     gArmedAllocs = 0;
     gArmed = true;
     for (int i = 0; i < 1000; ++i) (void)rig.applier.applyCommitted(rig.replica());
+    gArmed = false;
+    EXPECT_EQ(gArmedAllocs, 0u);
+}
+
+// Catalog history Task 12: a caught-up (Live) catalog subscription costs nothing
+// while no event commits — the read server's idle pass reads and allocates nothing.
+TEST(CatalogAllocRegression, IdleCatalogSubscriptionsAllocateNothingRegression) {
+    rune::node::test::ReadRig r("rd_alloc");
+    r.commitEvents(3);
+    r.server.subscribe(7, 1, -2);
+    r.server.pump();                                   // backlog + marker: the sub is Live
+    gArmedAllocs = 0;
+    gArmed = true;
+    for (int i = 0; i < 1000; ++i) (void)r.server.pump();
     gArmed = false;
     EXPECT_EQ(gArmedAllocs, 0u);
 }

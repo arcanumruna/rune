@@ -671,6 +671,7 @@ int ClientGateway::doWork(int64_t nowNs) {
     // preserving the "no silent drop on back-pressure" invariant.
     drainPendingResponses(nowNs);
     if (!pendingLineageNotes_.empty()) [[unlikely]] (void)flushPendingLineageNotes_();   // round 6 (F1)
+    if (!pendingCatalogUnsubs_.empty()) [[unlikely]] (void)flushPendingCatalogUnsubs_();   // catalog Task 12
     // No-hang fix round 3: the no-hang counters, logged while the broker runs
     // (on change, at most every kNoHangStatsLogNs) — one compare per duty cycle.
     if (nowNs >= nextNoHangStatsLogNs_) [[unlikely]] (void)logNoHangStatsIfChanged_(nowNs);
@@ -1485,6 +1486,8 @@ bool ClientGateway::closeSession_(int64_t sid, bool notifyExpired)
     }
 
     dropSessionSubscriptions_(sid);
+    // Catalog history Task 12: its catalog subscriptions (admin-owned) end too.
+    forwardCatalogUnsubscribe_(sid, -1);
 
     // CG-4 fix (#2): erase the group-member tracking entry so groupMemberSubs_
     // does not grow unboundedly under connect/disconnect churn.
@@ -3100,6 +3103,7 @@ std::size_t ClientGateway::endTopicSubscriptions(int32_t topicId)
 void ClientGateway::forgetDroppedTopic(int32_t topicId, int32_t partitions,
                                        std::span<rune::storage::Log* const> logs)
 {
+    std::erase(viewSinksAwaitingPlan_, topicId);   // Task 12 (N5): a dropped sink waits for nothing
     for (int32_t p = 0; p < partitions; ++p) {
         partitionTxnStates_.erase(partitionKey(topicId, p));
         if (const auto it = inlinePsm_.find(inlinePsmKey_(topicId, p)); it != inlinePsm_.end()) {
@@ -4371,6 +4375,14 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
         return;
     }
 
+    // Catalog history Task 12 (spec §7, F19): `__catalog` is readable from ANY
+    // broker — never redirected, never routed by the data-plane image.  The
+    // admin thread (the catalog replica's owner) answers it.
+    if (msg.topicId == pc::kCatalogTopicId) [[unlikely]] {
+        handleCatalogSubscribe_(*session, msg);
+        return;
+    }
+
     // GB-4 / MD1-9: Leadership check — data ops MUST reach the partition leader.
     //
     // Helper: send redirect/notleader error response for subscribe.
@@ -4779,6 +4791,84 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
 }
 
 // ---------------------------------------------------------------------------
+// Catalog history Task 12: a Subscribe on `__catalog` (topic id −6).  Every one
+// is answered: a pre-v8 session as before (UnknownTopic — it cannot parse the
+// caught-up marker), partition ≠ 0 / a key-resolved partition InvalidRequest, no
+// admin thread Internal, a full admin ring the retriable NotLeader; otherwise
+// the admin thread sends the SubscribeResponse, the backlog up to this broker's
+// HW, the caught-up marker and the live events.
+// ---------------------------------------------------------------------------
+void ClientGateway::handleCatalogSubscribe_(Session& session, const pc::Subscribe& msg)
+{
+    auto answer = [&](pc::ErrorCode ec) {
+        pc::SubscribeResponse resp;
+        resp.sessionId      = msg.sessionId;
+        resp.correlationId  = msg.correlationId;
+        resp.errorCode      = static_cast<int16_t>(ec);
+        resp.partition      = msg.partition;
+        resp.subscriptionId = 0;
+        const std::size_t n = resp.encode(scratch_.data());
+        sendAnswer_(session, scratch_.data(), n);
+    };
+    if (!pc::clientUnderstandsCatalogDdl(session.clientVersion)) {
+        answer(pc::ErrorCode::UnknownTopic);
+        return;
+    }
+    if (msg.partitionKnown != 1 || msg.partition != 0) {
+        spdlog::debug("ClientGateway: catalog Subscribe sessionId={} partition={} known={} — InvalidRequest "
+                      "(__catalog has partition 0 only)", msg.sessionId, msg.partition, msg.partitionKnown);
+        answer(pc::ErrorCode::InvalidRequest);
+        return;
+    }
+    if (adminSink_ == nullptr) {
+        answer(pc::ErrorCode::Internal);
+        return;
+    }
+    if (!adminSink_->submitCatalogSubscribe(msg.sessionId, msg.correlationId, msg.fromOffset)) {
+        // Back-pressure on the admin ring: the retriable NotLeader (the client retries).
+        pc::ErrorResponse er;
+        er.sessionId     = msg.sessionId;
+        er.correlationId = msg.correlationId;
+        er.code          = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+        const std::size_t n = er.encode(scratch_.data());
+        sendAnswer_(session, scratch_.data(), n);
+        return;
+    }
+    ++catalogSubscribesForwarded_;
+}
+
+void ClientGateway::forwardCatalogUnsubscribe_(int64_t sid, int64_t subscriptionId)
+{
+    if (adminSink_ == nullptr) return;
+    // FIFO behind any already waiting (a close after a single unsubscribe stays after it).
+    if (pendingCatalogUnsubs_.empty() && adminSink_->submitCatalogUnsubscribe(sid, subscriptionId)) return;
+    pendingCatalogUnsubs_.push_back(PendingCatalogUnsubscribe{sid, subscriptionId});
+}
+
+int ClientGateway::flushPendingCatalogUnsubs_()
+{
+    std::size_t sent = 0;
+    while (sent < pendingCatalogUnsubs_.size() &&
+           adminSink_->submitCatalogUnsubscribe(pendingCatalogUnsubs_[sent].sessionId,
+                                                pendingCatalogUnsubs_[sent].subscriptionId))
+        ++sent;
+    if (sent != 0)
+        pendingCatalogUnsubs_.erase(pendingCatalogUnsubs_.begin(),
+                                    pendingCatalogUnsubs_.begin() + static_cast<std::ptrdiff_t>(sent));
+    return static_cast<int>(sent);
+}
+
+void ClientGateway::noteViewSinkAwaitingPlan(int32_t viewTopicId)
+{
+    if (!viewSinkAwaitingPlan(viewTopicId)) viewSinksAwaitingPlan_.push_back(viewTopicId);   // cold
+}
+
+void ClientGateway::noteViewPlanDelivered(int32_t viewTopicId)
+{
+    std::erase(viewSinksAwaitingPlan_, viewTopicId);
+}
+
+// ---------------------------------------------------------------------------
 // E2 residual round 6 (F1): the transient LINEAGE NOTE — a Records frame of the
 // subscription whose recordBatch is exactly the 8-byte LE lineage token (see
 // rune-protocol kClientVersionLineageNote), on the session's reliable egress
@@ -4849,6 +4939,12 @@ void ClientGateway::handleUnsubscribe(const uint8_t* buf, std::size_t len)
         // (the client removes its routing entry locally; the broker-side
         // subscription dies with the session at the latest).  Counted + warned.
         noteUnanswerable_(buf, len, "Unsubscribe body undecodable (no response type)");
+        return;
+    }
+    // Catalog history Task 12: a catalog subscription lives on the admin thread
+    // (its owner check is there too).
+    if (rune::gateway::isCatalogSubscriptionId(msgOpt->subscriptionId)) [[unlikely]] {
+        forwardCatalogUnsubscribe_(msgOpt->sessionId, msgOpt->subscriptionId);
         return;
     }
     // Only the owning session may remove a subscription (an Unsubscribe from
@@ -7167,6 +7263,10 @@ uint16_t ClientGateway::viewRowGate_(int32_t viewTopicId, int32_t partition) con
     using St = TopicRegistry::TopicState;
     const St st = topicRegistry_->state(viewTopicId);
     if (st == St::Dropped) return pc::ViewRowResponse::kUnknownView;
+    // Catalog history Task 12 (Task 8 review N5): a sink applied here whose plan
+    // has not reached every worker yet — retriable, never the worker's UnknownView.
+    if (!viewSinksAwaitingPlan_.empty() && viewSinkAwaitingPlan(viewTopicId)) [[unlikely]]
+        return pc::ViewRowResponse::kNotReady;
     if (st == St::Pending || (st == St::Unknown && placementCommitted_(viewTopicId, 0)) ||
         (st == St::Serving && topicRegistry_->placementGated(viewTopicId) &&
          !placementCommitted_(viewTopicId, partition)))

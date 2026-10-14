@@ -84,7 +84,16 @@ enum : int32_t {
     kMsgDropView          = 11,
     kMsgAlterView         = 12,
     kMsgAlterTopicConfig  = 13,
+    // Catalog history Task 12 — gateway → admin: catalog reads (CatalogReadServer).
+    kMsgCatalogSubscribe   = 14,   // [session:i64][corr:i64][fromOffset:i64]
+    kMsgCatalogUnsubscribe = 15,   // [session:i64][subscriptionId:i64]; -1 = the session closed (all of it)
 };
+
+/// kMsgCatalogSubscribe / kMsgCatalogUnsubscribe (fixed layouts).
+struct CatalogSubscribeMsg   { int64_t session = 0; int64_t corr = 0; int64_t fromOffset = 0; };
+struct CatalogUnsubscribeMsg { int64_t session = 0; int64_t subscriptionId = 0; };
+inline constexpr std::size_t kCatalogSubscribeWireLen   = 24;
+inline constexpr std::size_t kCatalogUnsubscribeWireLen = 16;
 
 // ---------------------------------------------------------------------------
 // Admin → control ring (AdminWorkerAgent::failureRing_; T10) message ids.
@@ -112,6 +121,10 @@ enum : int32_t {
     kA2cViewUninstall       = 8,    // a DropView / AlterView retired a view plan
     kA2cCatalogHalted       = 9,    // the applier HALTED (metric + loud log on the control thread)
     kA2cCatalogApplied      = 11,   // the applier applied offset N (metric)
+    // Catalog history Task 12 (Task 8 review N5): a VIEW SINK applied — the
+    // kA2cCatalogTopicApplied layout; the control thread also marks the sink
+    // "awaiting its plan" until the view's plan reached every worker.
+    kA2cCatalogSinkApplied  = 12,
 };
 
 // ---------------------------------------------------------------------------
@@ -657,6 +670,39 @@ inline DdlRequest decodeAlterTopicConfig(const uint8_t* buf, std::size_t len) {
     }
     admin_wire::readMeta(r, m.meta);
     return admin_wire::finish(r, std::move(m), kTidAlterTopicConfig);
+}
+
+// ---- Catalog reads (catalog history Task 12) ----
+/// false = ring full (the gateway answers the retriable NotLeader / retries).
+[[nodiscard]] inline bool encodeCatalogSubscribe(OneToOneByteRing& ring, const CatalogSubscribeMsg& m) {
+    const auto idx = ring.tryClaim(kMsgCatalogSubscribe, kCatalogSubscribeWireLen);
+    if (idx < 0) return false;
+    uint8_t* p = ring.base() + idx;
+    admin_wire::putI64(p, m.session);
+    admin_wire::putI64(p + 8, m.corr);
+    admin_wire::putI64(p + 16, m.fromOffset);
+    ring.commit(idx);
+    return true;
+}
+[[nodiscard]] inline bool encodeCatalogUnsubscribe(OneToOneByteRing& ring, const CatalogUnsubscribeMsg& m) {
+    const auto idx = ring.tryClaim(kMsgCatalogUnsubscribe, kCatalogUnsubscribeWireLen);
+    if (idx < 0) return false;
+    uint8_t* p = ring.base() + idx;
+    admin_wire::putI64(p, m.session);
+    admin_wire::putI64(p + 8, m.subscriptionId);
+    ring.commit(idx);
+    return true;
+}
+/// Checked decodes: false on a frame of any other length (reported, never applied).
+[[nodiscard]] inline bool decodeCatalogSubscribe(const uint8_t* p, std::size_t n, CatalogSubscribeMsg& m) noexcept {
+    if (n != kCatalogSubscribeWireLen) return false;
+    m = CatalogSubscribeMsg{admin_wire::getI64(p), admin_wire::getI64(p + 8), admin_wire::getI64(p + 16)};
+    return true;
+}
+[[nodiscard]] inline bool decodeCatalogUnsubscribe(const uint8_t* p, std::size_t n, CatalogUnsubscribeMsg& m) noexcept {
+    if (n != kCatalogUnsubscribeWireLen) return false;
+    m = CatalogUnsubscribeMsg{admin_wire::getI64(p), admin_wire::getI64(p + 8)};
+    return true;
 }
 
 // ---- GetSchema ----

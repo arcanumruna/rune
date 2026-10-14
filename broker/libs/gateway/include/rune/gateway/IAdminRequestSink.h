@@ -51,6 +51,15 @@ struct DdlMetaView {
 ///              answers InvalidRequest with a detail (permanent, never a retry loop).
 enum class AdminSubmit : uint8_t { Accepted, RingFull, TooLarge };
 
+/// Catalog history Task 12: the ids of `__catalog` subscriptions (served by the
+/// admin thread's CatalogReadServer) have bit 62 set; a gateway subscription id
+/// (node prefix << 40 | a 40-bit counter) never does — an Unsubscribe is routed
+/// by its id alone.
+inline constexpr int64_t kCatalogSubscriptionIdBase = int64_t{1} << 62;
+[[nodiscard]] constexpr bool isCatalogSubscriptionId(int64_t subscriptionId) noexcept {
+    return subscriptionId > 0 && (subscriptionId & kCatalogSubscriptionIdBase) != 0;
+}
+
 struct IAdminRequestSink {
     virtual ~IAdminRequestSink() = default;
 
@@ -104,6 +113,17 @@ struct IAdminRequestSink {
                                         uint8_t persistence, uint32_t expectedVersion,
                                         const uint8_t* planBlob, uint32_t planLen,
                                         const DdlMetaView& meta) = 0;
+
+    // Catalog history Task 12 (spec §7, F19): a Subscribe on `__catalog`
+    // (topic id −6, partition 0) — served by the admin thread from this broker's
+    // replica up to its HW; the admin thread sends the SubscribeResponse, the
+    // Records and the caught-up marker.  true = enqueued, false = ring full (the
+    // gateway answers the retriable NotLeader).
+    virtual bool submitCatalogSubscribe(int64_t sessionId, int64_t correlationId, int64_t fromOffset) = 0;
+    // An Unsubscribe of a catalog subscription id; subscriptionId −1 = every
+    // catalog subscription of the session (its close).  false = ring full (the
+    // gateway retries it — never dropped).
+    virtual bool submitCatalogUnsubscribe(int64_t sessionId, int64_t subscriptionId) = 0;
 };
 
 } // namespace rune::gateway

@@ -579,6 +579,21 @@ public:
         const std::size_t len = m.encode(buf.data());
         return send(ch, stream, buf.data(), len) ? m.correlationId : 0;
     }
+    /// Catalog history Task 12: a Subscribe on `__catalog` (−6, partition 0) from
+    /// `fromOffset`; returns its correlation id (0 = not sent).
+    int64_t sendCatalogSubscribe(const std::string& ch, int32_t stream, int64_t sid, int64_t fromOffset) {
+        pc::Subscribe m;
+        m.sessionId = sid; m.correlationId = ++corr_; m.topicId = pc::kCatalogTopicId; m.partition = 0;
+        m.partitionKnown = 1; m.fromOffset = fromOffset; m.isolation = 0;
+        std::vector<uint8_t> buf(m.encodedSize());
+        const std::size_t len = m.encode(buf.data());
+        return send(ch, stream, buf.data(), len) ? m.correlationId : 0;
+    }
+    /// The subscriptionId a SubscribeResponse on `corr` carried (nullopt: none seen yet).
+    std::optional<int64_t> subscriptionIdOf(int64_t corr) const {
+        if (auto it = subscribeIds_.find(corr); it != subscribeIds_.end()) return it->second;
+        return std::nullopt;
+    }
     /// The answer to a subscribe: its SubscribeResponse errorCode, or the code of an
     /// ErrorResponse on that correlation id (NotLeader / Redirect paths).
     std::optional<int16_t> awaitSubscribeCode(int64_t corr, Clock::time_point deadline) {
@@ -787,7 +802,10 @@ private:
                 if (auto r = pc::DefineTopicResponse::decode(p, n)) defines_[r->correlationId] = *r;
                 break;
             case pc::TemplateId::SubscribeResponse:
-                if (auto r = pc::SubscribeResponse::decode(p, n)) subscribes_[r->correlationId] = r->errorCode;
+                if (auto r = pc::SubscribeResponse::decode(p, n)) {
+                    subscribes_[r->correlationId]   = r->errorCode;
+                    subscribeIds_[r->correlationId] = r->subscriptionId;   // catalog Task 12
+                }
                 break;
             case pc::TemplateId::CreateViewResponse:
                 if (auto r = pc::CreateViewResponse::decode(p, n)) views_[r->correlationId] = *r;
@@ -880,6 +898,7 @@ private:
     std::map<int64_t, uint16_t>                     viewRows_;   // ViewRowResponse status by corr
     std::map<int64_t, SchemaAnswer>                 schemas_;
     std::map<int64_t, int16_t>                      subscribes_;   // SubscribeResponse errorCode by corr
+    std::map<int64_t, int64_t>                      subscribeIds_; // SubscribeResponse subscriptionId by corr
     int32_t                                         clientVersion_ = 1;
     std::map<int64_t, JoinAnswer>                   joins_;
     std::map<int64_t, int16_t>                      heartbeats_;

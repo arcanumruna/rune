@@ -203,7 +203,7 @@ protected:
                                            aeron::util::index_t off, aeron::util::index_t len) {
             const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
             const auto n = static_cast<std::size_t>(len);
-            if (tid == kA2cCatalogTopicApplied) {
+            if (tid == kA2cCatalogTopicApplied || tid == kA2cCatalogSinkApplied) {   // Task 12: sinks have their own type
                 CatalogTopicAppliedMsg m;
                 ASSERT_TRUE(decodeCatalogTopicApplied(p, n, m));
                 appliedIds_.push_back(m.topicId);

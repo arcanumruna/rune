@@ -554,7 +554,7 @@ TEST_P(CatalogEffectsRegression, InstalledViewUninstalledThroughTheCatalogAnswer
         c.partitionKey  = "characterId";
         std::vector<uint8_t> f(catalogTopicAppliedWireLen("char_hp", c));
         writeCatalogTopicApplied(f.data(), 1, "char_hp", 1, 0, /*persistence=*/1, c);
-        n.postRaw(kA2cCatalogTopicApplied, std::move(f));
+        n.postRaw(kA2cCatalogSinkApplied, std::move(f));   // Task 12: a sink's own effect type
     }
     ASSERT_TRUE(n.awaitServes(1, 10s));
     const auto plan = rune::view::serialize(comp->plan);
@@ -573,6 +573,55 @@ TEST_P(CatalogEffectsRegression, InstalledViewUninstalledThroughTheCatalogAnswer
         st = n.viewRowStatus(1, 7);
         return st && *st == pc::ViewRowResponse::kUnknownView;
     }, 10s)) << "the uninstalled view still answers (status " << (st ? int(*st) : -1) << ")";
+}
+
+// BINDING (catalog history Task 12 / Task 8 review N5): a view sink APPLIED and
+// PLACED here whose plan has not reached the workers yet answers the retriable
+// NotReady over the wire — never the permanent UnknownView; once its plan is
+// fanned out the view serves.  RED: UnknownView while the sink served (the gate
+// passed a Serving + placed sink; the worker had no plan).
+TEST_P(CatalogEffectsRegression, AppliedPlacedSinkAwaitingItsPlanAnswersNotReadyNeverUnknownViewRegression) {
+    SingleNode n("eff_n5", GetParam());
+    const auto src = rune::codec::DescriptorBuilder("character", 1)
+                         .add("characterId", rune::codec::PrimType::Int64, 1, /*isKey*/ true)
+                         .add("hp", rune::codec::PrimType::Int32)
+                         .build();
+    n.applyCreateTopic(0, "character", 1);
+    ASSERT_TRUE(n.awaitServes(0, 10s));
+    rune::protocol::TopicConfig c;
+    c.cleanupPolicy = 1;
+    c.partitionKey  = "characterId";
+    std::vector<uint8_t> sink(catalogTopicAppliedWireLen("char_hp", c));
+    writeCatalogTopicApplied(sink.data(), 1, "char_hp", 1, 0, /*persistence=*/1, c);
+    n.postRaw(kA2cCatalogSinkApplied, std::move(sink));
+    ASSERT_TRUE(n.awaitServes(1, 10s)) << "applied + placed: the sink topic serves";
+    for (int i = 0; i < 5; ++i) {   // the plan is still in flight: retriable, every time
+        const std::optional<uint16_t> st = n.viewRowStatus(1, 7);
+        ASSERT_TRUE(st.has_value());
+        EXPECT_EQ(*st, pc::ViewRowResponse::kNotReady) << "read " << i;
+        std::this_thread::sleep_for(20ms);
+    }
+    rune::view::ViewPlan v;
+    v.viewName = "char_hp";
+    v.key      = "characterId";
+    v.sources  = {{0, "characterId"}};
+    v.output   = {{"characterId", rune::codec::PrimType::Int64, 0, "characterId", rune::view::MergeRule::Replace},
+                  {"hp", rune::codec::PrimType::Int32, 0, "hp", rune::view::MergeRule::Replace}};
+    v.persistence = 1;
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(v, srcs, /*viewTopicId=*/1);
+    ASSERT_TRUE(comp.has_value());
+    const auto plan = rune::view::serialize(comp->plan);
+    const auto out  = rune::codec::serialize(comp->outputDescriptor);
+    const auto sd   = rune::codec::serialize(src);
+    std::vector<uint8_t> f(viewPlanUpdateWireLen(plan, out, sd));
+    writeViewPlanUpdate(f.data(), 1, /*persistence=*/1, /*recovery=*/0, plan, out, sd);
+    n.postRaw(kA2cViewPlanUpdate, std::move(f));
+    std::optional<uint16_t> st;
+    EXPECT_TRUE(SingleNode::awaitTrue([&] {
+        st = n.viewRowStatus(1, 7);
+        return st && *st == pc::ViewRowResponse::kAbsentKey;
+    }, 10s)) << "the view serves once its plan is on every worker (status " << (st ? int(*st) : -1) << ")";
 }
 
 // Fix round 1 (M2): a dropped topic's dir rename that FAILS is retried (with a

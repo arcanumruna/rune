@@ -552,3 +552,20 @@ TEST(CatalogWritePathRegression, InDoubtAnswerNamesWhyTheCommittedTopicDoesNotSe
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(r->detail, why);
 }
+
+// Catalog history Task 12 (fix-on-sight): the leader appended events up to half
+// a fetch (512 KiB) — larger than one Records frame of a catalog subscriber
+// (kCatalogReadMaxBatchBytes, ~256 KiB), so a written event could never be READ
+// by any client.  The leader's bound now includes the read bound: an event no
+// subscriber could read is refused (InvalidRequest, named), never written.
+TEST(CatalogWritePathRegression, EventLargerThanOneCatalogReadFrameIsRefusedRegression) {
+    CatalogDdlRig rig("wp_readable", /*brokers=*/3);
+    rig.becomeServingLeader();
+    const auto big = rig.define({.name = "huge", .statement = std::string(rune::node::kCatalogMaxEventBytes, 's')});
+    EXPECT_EQ(big.code, 39) << big.detail;
+    EXPECT_NE(big.detail.find("catalog record limit"), std::string::npos) << big.detail;
+    EXPECT_TRUE(rig.recordedLog().empty()) << "nothing written";
+    const auto fits = rig.define({.name = "fits", .statement = std::string(rune::node::kCatalogMaxEventBytes / 2, 's')});
+    EXPECT_EQ(fits.code, 0) << fits.detail;
+    ASSERT_EQ(rig.recordedLog().size(), 1u);
+}

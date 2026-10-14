@@ -16,6 +16,7 @@ add_library(rune_node
     src/CatalogPartition.cpp
     src/CatalogCheckpoint.cpp
     src/CatalogApplier.cpp
+    src/CatalogReadServer.cpp
     src/CatalogEffectFrames.cpp
     src/ViewSnapshotIoAgent.cpp
     src/WorkerViewSet.cpp
@@ -165,6 +166,7 @@ if(BUILD_TESTING)
         tests/node/CatalogApplierTest.cpp
         tests/node/CatalogWritePathTest.cpp
         tests/node/CatalogLeadershipTest.cpp
+        tests/node/CatalogReadServerTest.cpp
         )
     target_include_directories(rune_node_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     target_link_libraries(rune_node_tests PRIVATE
@@ -1522,6 +1524,14 @@ if(BUILD_TESTING)
         target_link_libraries(rune_catalog_leadership_broker_tests PRIVATE rune_node rune_view rune_codec aeron::aeron
                               GTest::gtest_main)
         gtest_discover_tests(rune_catalog_leadership_broker_tests PROPERTIES TIMEOUT 360 RESOURCE_LOCK rune_udp_ports)
+
+        # Catalog history Task 12: a Subscribe on __catalog served by every broker
+        # (leader, follower, halted) over real Aeron — backlog, marker, live, close.
+        add_executable(rune_catalog_read_broker_tests tests/integration/CatalogReadBrokerTest.cpp)
+        target_include_directories(rune_catalog_read_broker_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_catalog_read_broker_tests PRIVATE rune_node rune_view rune_codec aeron::aeron
+                              GTest::gtest_main)
+        gtest_discover_tests(rune_catalog_read_broker_tests PROPERTIES TIMEOUT 360 RESOURCE_LOCK rune_udp_ports)
 
         # Catalog history Task 6: the __catalog partition on every broker —
         # real replication on its admin-thread plane, controller-ISR leader

@@ -418,8 +418,8 @@ TEST(CatalogApplierRegression, ProductionSinkEncodesEveryEffectOnTheAdminToContr
         kA2cSchemaUpdate, kA2cCatalogApplied,                             // 6
         kA2cCatalogTopicConfig, kA2cCatalogApplied,                       // 7
         kA2cCatalogTopicConfig, kA2cCatalogApplied,                       // 8
-        kA2cCatalogTopicApplied, kA2cViewPlanUpdate, kA2cCatalogApplied,  // 9
-        kA2cCatalogTopicApplied, kA2cViewPlanUpdate, kA2cViewUninstall, kA2cCatalogTopicDropped,
+        kA2cCatalogSinkApplied, kA2cViewPlanUpdate, kA2cCatalogApplied,   // 9 (Task 12: a sink's own type)
+        kA2cCatalogSinkApplied, kA2cViewPlanUpdate, kA2cViewUninstall, kA2cCatalogTopicDropped,
         kA2cCatalogApplied,                                               // 10
     };
     ASSERT_EQ(typesOf(frames), expect);

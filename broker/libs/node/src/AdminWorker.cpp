@@ -12,6 +12,8 @@
 #include <rune/codec/Fingerprint.h>
 #include <rune/codec/Serialize.h>
 #include <rune/protocol/RecordBatch.h>
+#include <rune/protocol/client/DataMessages.h>
+#include <rune/protocol/client/Protocol.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/replication/WorkerReplicationTransport.h>   // the __catalog plane (Task 6)
 #include <rune/view/AggState.h>      // rune::view::isAggregateView (Phase 2a)
@@ -67,7 +69,10 @@ const DdlMeta& metaOf(const DdlRequest& req) noexcept {
 /// every follower in one fetch (kDefaultMaxFetchBytes) and the applier's first
 /// read; half of it leaves the batch framing ample room.  Every request the admin
 /// ring can carry (<= 128 KiB) yields far less, so this is a backstop.
-constexpr std::size_t kMaxCatalogEventBytes = static_cast<std::size_t>(rune::replication::kDefaultMaxFetchBytes) / 2;
+/// Task 12: and every event must fit one Records frame of every catalog
+/// subscriber (kCatalogMaxEventBytes) — an event no client could read is never written.
+constexpr std::size_t kMaxCatalogEventBytes =
+    std::min(static_cast<std::size_t>(rune::replication::kDefaultMaxFetchBytes) / 2, kCatalogMaxEventBytes);
 
 std::string quotedName(std::string_view s) { return "'" + cat::escapeNameForLog(s) + "'"; }
 
@@ -267,8 +272,39 @@ AdminWorker::AdminWorker(SchemaRegistry& reg,
         // One max fetch + the batch framing slack the worker's scratch carries.
         catalogReadScratch_.resize(static_cast<std::size_t>(rune::replication::kDefaultMaxFetchBytes) + 64u * 1024u);
         catalogReplica_->setReadScratch(catalogReadScratch_.data(), catalogReadScratch_.size());
+        // Task 12: catalog reads.  Ids carry the node prefix the gateway's do
+        // ((nodeId + 1) << 40), so they stay cluster-unique.
+        // No egress wired (DDL-only rigs): nothing ever leaves — a subscription
+        // stays Answering (bounded by the cap), never answered as if served.
+        if (!deps_.catalogRead) spdlog::debug("AdminWorker: no catalog read egress wired — catalog reads not served");
+        readServer_.emplace(*catalogReplica_,
+                            deps_.catalogRead ? deps_.catalogRead
+                                              : CatalogReadEgress([](int64_t, std::span<const uint8_t>) { return false; }),
+                            kMaxCatalogSubscriptions, static_cast<int64_t>(selfId_ + 1) << 40);
     }
     eventBuf_.reserve(64 * 1024);
+}
+
+void AdminWorker::catalogSubscribe(const CatalogSubscribeMsg& m) {
+    if (readServer_) {
+        readServer_->subscribe(m.session, m.corr, m.fromOffset);
+        return;
+    }
+    spdlog::error("AdminWorker: catalog Subscribe (session {}) on a broker without a __catalog — answered Internal",
+                  m.session);
+    if (!deps_.catalogRead) return;
+    namespace pc = rune::protocol::client;
+    pc::SubscribeResponse r;
+    r.sessionId     = m.session;
+    r.correlationId = m.corr;
+    r.errorCode     = static_cast<int16_t>(pc::ErrorCode::Internal);
+    uint8_t frame[pc::SubscribeResponse::ENCODED_SIZE];
+    const std::size_t n = r.encode(frame);
+    (void)deps_.catalogRead(m.session, std::span<const uint8_t>(frame, n));   // cold: test configurations only
+}
+
+void AdminWorker::catalogUnsubscribe(const CatalogUnsubscribeMsg& m) {
+    if (readServer_) readServer_->unsubscribe(m.session, m.subscriptionId);
 }
 
 int AdminWorker::bootCatalog(BootEffects boot, LiveEffects live) {
@@ -468,6 +504,9 @@ int AdminWorker::doWork(int64_t nowNs) {
     if (catalogReplica_) {
         work += catalogReplica_->doWork(nowNs);
         if (!applyHeldForTest_) [[likely]] work += applier_.applyCommitted(*catalogReplica_);
+        // Task 12: catalog reads, after the applier (what it serves is the HW the
+        // replica pass just computed; a halted applier does not stop reads).
+        work += readServer_->pump();
     }
     if (advance_(nowNs)) ++work;
     if (updateRole_()) ++work;

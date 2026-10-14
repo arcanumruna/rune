@@ -349,6 +349,14 @@ public:
         return submitDdl_(m);
     }
 
+    // Catalog history Task 12: catalog reads (gateway → admin, the same request ring).
+    bool submitCatalogSubscribe(int64_t sessionId, int64_t correlationId, int64_t fromOffset) override {
+        return encodeCatalogSubscribe(requestRing_, CatalogSubscribeMsg{sessionId, correlationId, fromOffset});
+    }
+    bool submitCatalogUnsubscribe(int64_t sessionId, int64_t subscriptionId) override {
+        return encodeCatalogUnsubscribe(requestRing_, CatalogUnsubscribeMsg{sessionId, subscriptionId});
+    }
+
     int doWork(int64_t nowNs) noexcept override {
         int work = 0;
 
@@ -441,6 +449,18 @@ public:
             case kMsgDropView:         worker_.submit(decodeDropView(p, n)); break;
             case kMsgAlterView:        worker_.submit(decodeAlterView(p, n)); break;
             case kMsgAlterTopicConfig: worker_.submit(decodeAlterTopicConfig(p, n)); break;
+            case kMsgCatalogSubscribe: {   // Task 12
+                CatalogSubscribeMsg m;
+                if (decodeCatalogSubscribe(p, n, m)) worker_.catalogSubscribe(m);
+                else reportBadRequestFrame_(tid, n);
+                break;
+            }
+            case kMsgCatalogUnsubscribe: {
+                CatalogUnsubscribeMsg m;
+                if (decodeCatalogUnsubscribe(p, n, m)) worker_.catalogUnsubscribe(m);
+                else reportBadRequestFrame_(tid, n);
+                break;
+            }
             default:
                 if (badRequestFrames_++ % 1024 == 0)
                     spdlog::error("AdminWorkerAgent: request-ring frame type={} len={} refused (unknown; refused so "
@@ -597,6 +617,22 @@ public:
     OneToOneByteRing& controlToAdminRing() noexcept { return controlToAdminRing_; }
     OneToOneByteRing& roleRing()      noexcept { return roleRing_;    }
     OneToOneByteRing& egressRing()    noexcept { return egressRing_;   } // admin → control (response frames)
+    /// Catalog history Task 12: admin → control catalog-read frames ([sessionId:i64][frame]).
+    OneToOneByteRing& catalogReadRing() noexcept { return catalogReadRing_; }
+
+    /// ADMIN thread only (deps.catalogRead): one catalog-read frame for `session`.
+    /// false = the ring is full — the read server keeps its position and retries
+    /// (nothing is queued here: the reads' memory stays bounded by the ring).
+    [[nodiscard]] bool postCatalogReadFrame(int64_t session, std::span<const uint8_t> frame) {
+        if (8 + frame.size() > static_cast<std::size_t>(catalogReadRing_.maxMsgLength())) [[unlikely]] return false;
+        const auto idx = catalogReadRing_.tryClaim(kMsgEgressFrame, 8 + frame.size());
+        if (idx < 0) return false;
+        uint8_t* p = catalogReadRing_.base() + idx;
+        std::memcpy(p, &session, 8);
+        std::memcpy(p + 8, frame.data(), frame.size());
+        catalogReadRing_.commit(idx);
+        return true;
+    }
 
     AdminWorker& worker() noexcept { return worker_; }
 
@@ -677,6 +713,11 @@ private:
             return rune::gateway::AdminSubmit::TooLarge;
         return encodeDdl(requestRing_, m) ? rune::gateway::AdminSubmit::Accepted : rune::gateway::AdminSubmit::RingFull;
     }
+    [[gnu::cold]] [[gnu::noinline]] void reportBadRequestFrame_(int32_t tid, std::size_t n) noexcept {
+        if (badRequestFrames_++ % 1024 == 0)
+            spdlog::error("AdminWorkerAgent: request-ring frame type={} len={} refused (malformed; refused so far: {})",
+                          tid, n, badRequestFrames_);
+    }
     [[gnu::cold]] [[gnu::noinline]] void reportBadRoleFrame_(int32_t tid, std::size_t n) noexcept {
         if (badRoleFrames_++ % 1024 == 0)
             spdlog::error("AdminWorkerAgent: role-ring frame type={} len={} refused (malformed or unknown; "
@@ -730,6 +771,13 @@ private:
     }
     OneToOneByteRing roleRing_;        // control → admin (role events)
     OneToOneByteRing egressRing_{kAdminEgressRingBytes};   // admin → control (response frames: [sessionId:i64][frame])
+    // Catalog history Task 12: the catalog read server's own egress — never behind
+    // the DDL answer gate, never filling the DDL answers' ring.  One frame (a
+    // Records of whole catalog batches) always fits the gateway's spill staging.
+    OneToOneByteRing catalogReadRing_{kCatalogReadRingBytes};
+    static_assert(static_cast<std::size_t>(kCatalogReadRingBytes) / 8 <=
+                      rune::gateway::ClientGateway::spillSizing().stage,
+                  "catalog read frames must be spillable");
     // Fix round 5: an admin answer (at most the ring's max message, capacity/8)
     // always fits the gateway spill's staging buffer.
     static_assert(static_cast<std::size_t>(kAdminEgressRingBytes) / 8 <=
@@ -838,10 +886,11 @@ private:
     }
 
     void postCatalogTopicApplied_(int32_t topicId, std::string_view name, int32_t partitions, int16_t rf,
-                                  rune::catalog::Persistence persistence, const rune::protocol::TopicConfig& c) {
+                                  rune::catalog::Persistence persistence, const rune::protocol::TopicConfig& c,
+                                  int32_t typeId = kA2cCatalogTopicApplied) {
         const std::size_t len = catalogTopicAppliedWireLen(name, c);
         const uint8_t pers = persistence == rune::catalog::Persistence::Transient ? 1 : 0;
-        postCatalog_(kA2cCatalogTopicApplied, len, [&](uint8_t* p) {
+        postCatalog_(typeId, len, [&](uint8_t* p) {
             writeCatalogTopicApplied(p, topicId, name, partitions, rf, pers, c);
         });
     }
@@ -874,7 +923,8 @@ private:
             rune::protocol::TopicConfig c;
             c.cleanupPolicy = 1;   // Compact
             c.partitionKey  = s.keyField;
-            postCatalogTopicApplied_(s.topicId, s.name, s.partitions, /*rf=*/0, s.persistence, c);
+            postCatalogTopicApplied_(s.topicId, s.name, s.partitions, /*rf=*/0, s.persistence, c,
+                                     kA2cCatalogSinkApplied);   // Task 12 (N5)
         };
         fx.topicDropped = [this](int32_t topicId, const std::string& name) {
             postCatalog_(kA2cCatalogTopicDropped, catalogTopicDroppedWireLen(name),

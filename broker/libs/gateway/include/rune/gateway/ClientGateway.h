@@ -992,6 +992,19 @@ public:
     // -----------------------------------------------------------------------
     // subscriptionCount — number of active subscriptions (for tests).
     // -----------------------------------------------------------------------
+    /// Catalog history Task 12: catalog Subscribes forwarded to the admin thread /
+    /// catalog Unsubscribes waiting for room on its request ring.
+    [[nodiscard]] uint64_t catalogSubscribesForwarded() const noexcept { return catalogSubscribesForwarded_; }
+    [[nodiscard]] std::size_t pendingCatalogUnsubscribes() const noexcept { return pendingCatalogUnsubs_.size(); }
+    /// Catalog history Task 12 (N5) — control thread: a view sink was applied here
+    /// (kA2cCatalogSinkApplied); its plan is not on every worker yet.  Then: its
+    /// plan reached every worker's install ring (or the view was dropped).
+    void noteViewSinkAwaitingPlan(int32_t viewTopicId);
+    void noteViewPlanDelivered(int32_t viewTopicId);
+    [[nodiscard]] bool viewSinkAwaitingPlan(int32_t viewTopicId) const noexcept {
+        for (const int32_t id : viewSinksAwaitingPlan_) if (id == viewTopicId) return true;
+        return false;
+    }
     [[nodiscard]] std::size_t subscriptionCount() const {
         return subscriptions_.size();
     }
@@ -1974,6 +1987,27 @@ private:
     void sendLineageNote_(Session& session, int64_t subId, const Subscription& sub, uint64_t lineage);
     int  flushPendingLineageNotes_();
 
+    // Catalog history Task 12: catalog Unsubscribes / session closes the admin
+    // request ring could not take (full) — retried every duty cycle, in order,
+    // never dropped (a lost close would keep the admin pushing to a dead session
+    // and hold one of its bounded subscription slots).  Reserved; grows only on a
+    // pathological backlog.
+    struct PendingCatalogUnsubscribe { int64_t sessionId; int64_t subscriptionId; };
+    std::vector<PendingCatalogUnsubscribe> pendingCatalogUnsubs_ = [] {
+        std::vector<PendingCatalogUnsubscribe> v; v.reserve(256); return v;
+    }();
+    uint64_t catalogSubscribesForwarded_ = 0;
+    void forwardCatalogUnsubscribe_(int64_t sid, int64_t subscriptionId);
+    int  flushPendingCatalogUnsubs_();
+    /// handleSubscribe for topicId == kCatalogTopicId: answered here or forwarded.
+    void handleCatalogSubscribe_(Session& session, const rune::protocol::client::Subscribe& msg);
+
+    // Catalog history Task 12 (Task 8 review N5): view sinks APPLIED here whose
+    // compiled plan has not reached every worker yet — a GetViewRow of one is
+    // the retriable NotReady, never the worker's permanent UnknownView.  Cold
+    // (one entry per view in creation); usually empty — one size check per read.
+    std::vector<int32_t> viewSinksAwaitingPlan_;
+
     // E5.1.3 (e): per-worker ingress active flag.
     //
     // When true, the gateway produce fanout (tryEnqueueOp for Produce) is SKIPPED.
@@ -2387,6 +2421,8 @@ public:
         if (Session* s = sessions_.find(sid)) s->recordEgressByWorker[worker] = std::move(pub);
     }
     void closeSessionForTest(int64_t sid) { (void)closeSession_(sid); }
+    /// Task 12: the doWork step that retries catalog Unsubscribes the admin ring refused.
+    int pumpCatalogUnsubscribesForTest() { return pendingCatalogUnsubs_.empty() ? 0 : flushPendingCatalogUnsubs_(); }
     /// Drive the resolve-completion path for (sid, worker) with `pub` and one
     /// buffered subscribe `subId` on (topicId, partition).
     void resolveRecordEgressForTest(int64_t sid, int32_t worker, std::shared_ptr<aeron::ExclusivePublication> pub,

@@ -3152,6 +3152,13 @@ private:
 
         // 1. No view set on this worker, or no view installed for this id.
         uint64_t outputFp = 0;
+        // Catalog history Task 12 (Task 8 review N5): the control thread posts a
+        // view's plan to this worker's install ring BEFORE the gateway forwards
+        // any read of it (the gateway gates a sink whose plan is not on every
+        // install ring yet), but this pass drains ops before installs — drain
+        // them once before answering the permanent UnknownView.  Error path only.
+        if (viewSet_ != nullptr && !viewSet_->viewOutputFingerprint(viewTopicId, outputFp)) [[unlikely]]
+            (void)viewSet_->drainInstalls();
         if (viewSet_ == nullptr || !viewSet_->viewOutputFingerprint(viewTopicId, outputFp)) {
             ret.errorCode = static_cast<int16_t>(RS::kUnknownView);
             enqueueReturn_(std::move(ret));

@@ -3405,6 +3405,11 @@ void BrokerNode::buildAdminWorker() {
             if (!adminWorkerAgent_) return;
             adminWorkerAgent_->postErrorResponse(session, corr, code, message);
         };
+        // Catalog history Task 12: the catalog read server's frames (admin thread)
+        // → the agent's catalog-read ring → the control thread → the session.
+        deps.catalogRead = [this](int64_t session, std::span<const uint8_t> frame) {
+            return adminWorkerAgent_ != nullptr && adminWorkerAgent_->postCatalogReadFrame(session, frame);
+        };
 
         // Construct AdminWorkerAgent (owns the AdminWorker — the __catalog replica,
         // its applier and the registries it projects; the retired __topic_schemas /
@@ -3832,6 +3837,9 @@ int BrokerNode::pumpViewFanout_() {
             ++work;
         }
         if (pend.nextWorker < n) break;   // FIFO back-pressure
+        // Task 12 (N5): the plan is on every worker's install ring — a worker
+        // drains it before answering a GetViewRow it has no plan for.
+        if (gateway_ && !pend.msg.uninstall) gateway_->noteViewPlanDelivered(pend.msg.viewTopicId);
         ++done;
     }
     if (done)
@@ -3984,6 +3992,15 @@ int BrokerNode::serviceAdminControl_() {
             // thread owns TopicRegistry, the replicas, the placement and the
             // cleaner's policy ring.  Every handler is idempotent (see BrokerNode.h).
             if (tid == kA2cCatalogTopicApplied) { onCatalogTopicApplied_(p, n); return; }
+            if (tid == kA2cCatalogSinkApplied) {   // Task 12 (N5): a view sink — gated until its plan is on every worker
+                if (gateway_ && n >= 4) {
+                    int32_t viewTopicId;
+                    std::memcpy(&viewTopicId, p, 4);
+                    gateway_->noteViewSinkAwaitingPlan(viewTopicId);
+                }
+                onCatalogTopicApplied_(p, n);
+                return;
+            }
             if (tid == kA2cCatalogTopicDropped) {
                 CatalogTopicDroppedMsg m;
                 if (decodeCatalogTopicDropped(p, n, m)) dropRuntimeTopic_(m.topicId, m.name);
@@ -4057,6 +4074,21 @@ int BrokerNode::serviceAdminControl_() {
                 return DdlAnswerGate::Explanation{why, v8};
             });
     }
+    // (4) Catalog history Task 12: catalog-read frames (SubscribeResponse /
+    //     Records / the caught-up marker / an ended subscription's answer) →
+    //     the session's egress (sendControlFrame: queued under back-pressure; a
+    //     session its spill cannot hold is expired explicitly, which ends its
+    //     catalog subscriptions).  Never behind the DDL answer gate.
+    work += agent->catalogReadRing().drain(
+        [&send](int32_t /*tid*/, aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off,
+                aeron::util::index_t len) {
+            const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
+            const auto n = static_cast<std::size_t>(len);
+            if (n < 8) return;
+            int64_t session;
+            std::memcpy(&session, p, 8);
+            send(session, p + 8, n - 8);
+        }, 16);
     if (ddlAnswerGate_.empty()) {
         work += agent->egressRing().drain(
             [this, &send, &serves](int32_t /*tid*/,
@@ -4656,6 +4688,7 @@ void BrokerNode::attachFusedRuntimeDoorbell_() {
     if (auto* admin = adminWorkerAgent_.get()) {
         attach(admin->failureRing());
         attach(admin->egressRing());
+        attach(admin->catalogReadRing());   // Task 12
     }
     if (refused != 0)
         spdlog::warn("BrokerNode[{}]: fused runtime doorbell full — {} ring(s) attached, {} bounded by the park cap",

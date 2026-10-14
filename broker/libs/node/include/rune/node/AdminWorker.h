@@ -36,6 +36,7 @@
 #include "rune/node/AdminChannels.h"
 #include "rune/node/CatalogApplier.h"
 #include "rune/node/CatalogPartition.h"
+#include "rune/node/CatalogReadServer.h"
 #include "rune/node/SchemaRegistry.h"
 #include "rune/node/ViewRegistry.h"
 
@@ -100,6 +101,12 @@ struct AdminDeps {
     /// production ring).  The leader refuses an event any of whose effect frames
     /// would not fit (Task 7 C1).  Tests shrink it together with the applier sink's.
     std::size_t effectMaxFrameBytes = 0;
+
+    /// Catalog history Task 12: the catalog read server's egress (production:
+    /// the admin → control catalog-read ring, then the session's egress).
+    /// false = full (the server keeps the position and retries).  Unset: catalog
+    /// subscribes are answered nowhere — every production / rig AdminWorker sets it.
+    CatalogReadEgress catalogRead;
 };
 
 // ---------------------------------------------------------------------------
@@ -182,6 +189,13 @@ public:
     void submit(DdlRequest req);
     /// GetSchema is a pure read of the projected registry — answered at once.
     void submitGetSchema(const GetSchemaMsg& msg);
+    /// Catalog history Task 12 (spec §7): a Subscribe / Unsubscribe / session close
+    /// on `__catalog`, served by readServer_ from this broker's replica up to its
+    /// HW — on any role, a halted applier included (it serves what it holds
+    /// committed).  No catalog replica: the Subscribe is answered Internal.
+    void catalogSubscribe(const CatalogSubscribeMsg& m);
+    void catalogUnsubscribe(const CatalogUnsubscribeMsg& m);
+    [[nodiscard]] const CatalogReadServer* readServer() const noexcept { return readServer_ ? &*readServer_ : nullptr; }
 
     /// Task 20: resolve a view NAME for an open-for-read handshake.  Returns a
     /// ViewRowResponse status: 0 OK (out params set), 3 SchemaMismatch (a pin to
@@ -248,6 +262,8 @@ public:
     [[nodiscard]] bool isLeader() const noexcept { return std::holds_alternative<CatalogLeaderServing>(role_); }
     [[nodiscard]] std::size_t pendingCount() const noexcept { return pending_.size(); }
     static constexpr std::size_t kMaxPendingDdl = 256;
+    /// Task 12: concurrent catalog subscriptions per broker (beyond: answered Internal).
+    static constexpr std::size_t kMaxCatalogSubscriptions = 256;
     [[nodiscard]] uint64_t pendingDdlRefused() const noexcept { return pendingDdlRefused_; }
     [[nodiscard]] bool hasInFlight() const noexcept { return !std::holds_alternative<Idle>(inFlight_); }
     /// "Idle" | "AwaitingCommit".
@@ -357,6 +373,7 @@ private:
 
     CatalogApplier                        applier_;
     CatalogRole                           role_{CatalogFollower{}};
+    std::optional<CatalogReadServer>      readServer_;   // set iff catalogReplica_ (Task 12)
 
     InFlight               inFlight_;
     std::deque<DdlRequest> pending_;            // <= kMaxPendingDdl

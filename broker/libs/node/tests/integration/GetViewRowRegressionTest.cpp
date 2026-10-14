@@ -292,6 +292,45 @@ TEST(GetViewRowRegression, ShardDutyCyclePassDrainsViewInstallRing) {
 }
 
 // ---------------------------------------------------------------------------
+// BINDING (catalog history Task 12 / Task 8 review N5): a view's plan posted to
+// the worker's install ring BEFORE a GetViewRow op is answered as the installed
+// view — never the permanent UnknownView.  The pass drains ops before installs,
+// so the worker drains the install ring once before answering "no plan".
+//   RED: UnknownView (4) — the op ran in the same pass, ahead of the install.
+// Both duty-cycle passes (classic doWork_ and the shard pass).
+// ---------------------------------------------------------------------------
+TEST(GetViewRowRegression, PlanOnTheInstallRingAheadOfTheReadIsNeverUnknownViewRegression) {
+    for (const bool shard : {false, true}) {
+        SCOPED_TRACE(shard ? "shard pass" : "classic pass");
+        auto src = charSourceV1();
+        const Descriptor* srcs[] = {&src};
+        auto comp = rv::compileView(hpView(), srcs, kViewTopicId).value();
+
+        ViewSnapshotChannel channel;
+        WorkerViewSet vs(channel, tmpDir(shard ? "rune-views-n5-shard" : "rune-views-n5-classic"));
+        ViewPlanUpdateMsg vp;
+        vp.viewTopicId = kViewTopicId;
+        vp.persistence = 1;
+        vp.planBlob    = rv::serialize(comp.plan);
+        vp.outDescBlob = rune::codec::serialize(comp.outputDescriptor);
+        vp.srcDescBlob = rune::codec::serialize(src);
+        ASSERT_TRUE(encodeViewPlanUpdate(channel.install, ViewSnapshotChannel::kInstallMsgType, vp));
+
+        Worker w(/*workerId*/ 0);
+        w.setShardMode(shard);
+        w.setViewSet(&vs);
+        ASSERT_EQ(vs.viewCount(), 0u) << "precondition: the plan is still on the ring";
+        const WorkerReturn ret = runGetViewRow(w, kViewTopicId, 0, /*key=*/7, /*fp=*/0);
+        EXPECT_NE(ret.errorCode, static_cast<int16_t>(pc::ViewRowResponse::kUnknownView))
+            << "a view whose plan is on the ring is not unknown";
+        EXPECT_TRUE(ret.errorCode == static_cast<int16_t>(pc::ViewRowResponse::kAbsentKey) ||
+                    ret.errorCode == static_cast<int16_t>(pc::ViewRowResponse::kNotReady))
+            << ret.errorCode;
+        EXPECT_EQ(vs.viewCount(), 1u);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // MULTI-WORKER routing (IMPORTANT 1): the view-partition table for
 // (viewTopicId, p) is folded on the worker that owns the SOURCE partition p
 // (driveViews_ iterates owned source replicas).  A GetViewRow is routed by

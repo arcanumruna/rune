@@ -81,6 +81,22 @@ struct CountingAdminSink final : IAdminRequestSink {
                                 const uint8_t*, uint32_t, const DdlMetaView&) override {
         ++submits; return AdminSubmit::Accepted;
     }
+    // Task 12: catalog reads.  `ringFull` makes every catalog submit refuse (back-pressure).
+    struct CatalogSub { int64_t session, corr, from; };
+    struct CatalogUnsub { int64_t session, subscriptionId; };
+    std::vector<CatalogSub>   catalogSubs;
+    std::vector<CatalogUnsub> catalogUnsubs;
+    bool ringFull = false;
+    bool submitCatalogSubscribe(int64_t s, int64_t c, int64_t from) override {
+        if (ringFull) return false;
+        catalogSubs.push_back({s, c, from});
+        return true;
+    }
+    bool submitCatalogUnsubscribe(int64_t s, int64_t id) override {
+        if (ringFull) return false;
+        catalogUnsubs.push_back({s, id});
+        return true;
+    }
 };
 
 /// One DDL answer as the client sees it: the frame's template, its code and message.
@@ -666,4 +682,135 @@ TEST(CatalogGatewayRegression, PreV8DdlHaltedIsInternalAndUnknownIsNotLeaderInIt
     EXPECT_FALSE(g.sendDdl(pc::TemplateId::CreateView).answered);
     EXPECT_EQ(g.adminSubmits(), 1u) << "on the leader a pre-v8 DDL is served as before";
     EXPECT_EQ(g.gateway().preV8DdlRefused(), 0u);
+}
+
+// ===========================================================================
+// Catalog history Task 12 (spec §7, F19): `__catalog` (topic id −6) is readable
+// with Subscribe on ANY broker.  The gateway never redirects / routes it: it is
+// forwarded to the admin thread (the catalog replica's owner), which answers.
+// ===========================================================================
+namespace {
+int64_t catalogSubscribe(GatewayRig& g, int32_t partition, uint8_t partitionKnown = 1, int64_t from = -2) {
+    pc::Subscribe s;
+    s.sessionId = g.sid; s.correlationId = ++g.corr; s.topicId = pc::kCatalogTopicId; s.partition = partition;
+    s.partitionKnown = partitionKnown; s.fromOffset = from; s.isolation = 0;
+    std::vector<uint8_t> buf(s.encodedSize());
+    buf.resize(s.encode(buf.data()));
+    g.gw.applySubscribeForTest(buf.data(), buf.size());
+    return s.correlationId;
+}
+void unsubscribe(GatewayRig& g, int64_t subscriptionId) {
+    pc::Unsubscribe u;
+    u.sessionId = g.sid; u.correlationId = ++g.corr; u.subscriptionId = subscriptionId;
+    std::vector<uint8_t> buf(pc::Unsubscribe::ENCODED_SIZE);
+    u.encode(buf.data());
+    g.gw.applyUnsubscribeForTest(buf.data(), buf.size());
+}
+}   // namespace
+
+// RED (before Task 12): a −6 Subscribe went through the data-plane routing —
+// Redirect / NotLeader on a non-leader, UnknownTopic everywhere (no −6 in the
+// TopicRegistry) — so no broker served the catalog.
+TEST(CatalogGatewayRegression, CatalogSubscribeIsForwardedOnAnyBrokerAndPartitionMustBeZero) {
+    GatewayRig g;
+    std::size_t forwarded = 0;
+    for (const rune::gateway::CatalogRoute& route :
+         {rune::gateway::CatalogRoute{rune::gateway::RouteRemote{"10.0.0.2:40200"}},
+          rune::gateway::CatalogRoute{rune::gateway::RouteUnknown{}},
+          rune::gateway::CatalogRoute{rune::gateway::RouteHalted{5}},
+          rune::gateway::CatalogRoute{rune::gateway::RouteLocalLeader{}}}) {
+        g.gateway().setCatalogRoute(route);
+        const int64_t c = catalogSubscribe(g, /*partition=*/0, 1, /*from=*/7);
+        ++forwarded;
+        ASSERT_EQ(g.admin.catalogSubs.size(), forwarded) << catalogRouteName(route);
+        EXPECT_EQ(g.admin.catalogSubs.back().corr, c);
+        EXPECT_EQ(g.admin.catalogSubs.back().from, 7);
+        EXPECT_EQ(g.admin.catalogSubs.back().session, g.sid);
+        EXPECT_FALSE(g.codeOf(c).has_value()) << "the admin thread answers it (" << catalogRouteName(route) << ")";
+    }
+    EXPECT_EQ(g.gw.catalogSubscribesForwarded(), forwarded);
+    EXPECT_EQ(g.gw.subscriptionCount(), 0u) << "never a gateway (data-plane) subscription";
+
+    const int64_t bad = catalogSubscribe(g, /*partition=*/1);
+    EXPECT_EQ(g.codeOf(bad).value_or(-1), static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    const int64_t keyed = catalogSubscribe(g, 0, /*partitionKnown=*/0);
+    EXPECT_EQ(g.codeOf(keyed).value_or(-1), static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    EXPECT_EQ(g.admin.catalogSubs.size(), forwarded) << "refused ones are not forwarded";
+}
+
+TEST(CatalogGatewayRegression, PreV8CatalogSubscribeIsAnsweredUnknownTopic) {
+    GatewayRig g(/*clientVersion=*/7);
+    const int64_t c = catalogSubscribe(g, 0);
+    EXPECT_EQ(g.codeOf(c).value_or(-1), kUnknownTopic) << "answered, as before Task 12 (it cannot parse the marker)";
+    EXPECT_TRUE(g.admin.catalogSubs.empty());
+}
+
+TEST(CatalogGatewayRegression, CatalogSubscribeOnAFullAdminRingIsTheRetriableNotLeaderRegression) {
+    GatewayRig g;
+    g.admin.ringFull = true;
+    const int64_t c = catalogSubscribe(g, 0);
+    EXPECT_EQ(g.codeOf(c).value_or(-1), kNotLeader) << "back-pressure is answered, never a silent stall";
+    EXPECT_EQ(g.gw.catalogSubscribesForwarded(), 0u);
+}
+
+// A catalog Unsubscribe and a session close reach the admin thread — retried
+// while its ring is full, in order, never dropped (a lost close would hold a
+// bounded read slot and keep pushing to a dead session).
+TEST(CatalogGatewayRegression, CatalogUnsubscribeAndSessionCloseReachTheAdminEvenThroughAFullRingRegression) {
+    GatewayRig g;
+    const int64_t catalogSubId = rune::gateway::kCatalogSubscriptionIdBase | (int64_t{2} << 40) | 1;
+    unsubscribe(g, catalogSubId);
+    ASSERT_EQ(g.admin.catalogUnsubs.size(), 1u);
+    EXPECT_EQ(g.admin.catalogUnsubs[0].subscriptionId, catalogSubId);
+    EXPECT_EQ(g.admin.catalogUnsubs[0].session, g.sid);
+
+    g.admin.ringFull = true;
+    unsubscribe(g, catalogSubId + 1);
+    g.gw.closeSessionForTest(g.sid);
+    EXPECT_EQ(g.gw.pendingCatalogUnsubscribes(), 2u);
+    (void)g.gw.pumpCatalogUnsubscribesForTest();   // the doWork retry step
+    EXPECT_EQ(g.gw.pendingCatalogUnsubscribes(), 2u) << "still full: kept";
+    g.admin.ringFull = false;
+    (void)g.gw.pumpCatalogUnsubscribesForTest();
+    EXPECT_EQ(g.gw.pendingCatalogUnsubscribes(), 0u);
+    ASSERT_EQ(g.admin.catalogUnsubs.size(), 3u);
+    EXPECT_EQ(g.admin.catalogUnsubs[1].subscriptionId, catalogSubId + 1) << "in order";
+    EXPECT_EQ(g.admin.catalogUnsubs[2].subscriptionId, -1) << "the session close: every catalog subscription";
+}
+
+// A data-plane Unsubscribe is never sent to the admin thread.
+TEST(CatalogGatewayRegression, DataPlaneUnsubscribeStaysInTheGateway) {
+    GatewayRig g;
+    g.applyWithoutPlacement(2, 1);
+    g.place(2, 1);
+    const int64_t c = g.subscribe(2, 0);
+    ASSERT_EQ(g.codeOf(c).value_or(-1), 0);
+    const int64_t subId = g.subscribeAnswers.back().subscriptionId;
+    EXPECT_FALSE(rune::gateway::isCatalogSubscriptionId(subId));
+    unsubscribe(g, subId);
+    EXPECT_TRUE(g.admin.catalogUnsubs.empty());
+    EXPECT_EQ(g.gw.subscriptionCount(), 0u);
+}
+
+// BINDING (Task 8 review N5): a view sink that is applied and placed here but
+// whose plan has not reached every worker yet answers the retriable NotReady —
+// never the worker's permanent UnknownView.  RED: the gate passed it (Serving +
+// placed) and the worker, with no plan, answered UnknownView.
+TEST(CatalogGatewayRegression, AppliedPlacedSinkWithoutItsPlanOnTheWorkersIsNotReadyRegression) {
+    GatewayRig g;
+    g.applyWithoutPlacement(5, 1);
+    g.place(5, 1);
+    g.gw.noteViewSinkAwaitingPlan(5);              // kA2cCatalogSinkApplied: the plan is still in flight
+    EXPECT_EQ(g.viewRowStatus(5), pc::ViewRowResponse::kNotReady);
+    g.gw.noteViewPlanDelivered(5);                 // on every worker's install ring
+    EXPECT_EQ(g.viewRowStatus(5), pc::ViewRowResponse::kUnknownView)
+        << "the gate lifts (this rig has no workers: their answer)";
+    g.gw.noteViewSinkAwaitingPlan(6);
+    ASSERT_TRUE(g.gw.viewSinkAwaitingPlan(6));
+    ASSERT_EQ(g.apply(6, 1, "s6"), 6);
+    ASSERT_TRUE(g.registry->dropTopic(6));
+    rune::storage::Log* logs[] = {g.registry->log(6, 0)};
+    g.gw.forgetDroppedTopic(6, 1, logs);
+    EXPECT_FALSE(g.gw.viewSinkAwaitingPlan(6)) << "a dropped sink waits for nothing";
+    EXPECT_EQ(g.viewRowStatus(6), pc::ViewRowResponse::kUnknownView);
 }
