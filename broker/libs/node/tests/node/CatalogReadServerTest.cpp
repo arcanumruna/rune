@@ -881,6 +881,7 @@ TEST(CatalogReadServerRegression, ATruncationBelowAServedHwChangesTheEpochDurabl
     ASSERT_EQ(r.errors(7).size(), 1u) << "the read ended once (NotLeader)";
     EXPECT_EQ(r.server.epochBumps(), 1u);
     EXPECT_NE(r.server.historyEpoch(), e0);
+    EXPECT_NE(r.server.historyEpoch(), e0 + 1) << "a fresh draw, never the next integer";
     const auto d = rune::node::readCatalogHistoryEpoch(epochFileOf(r));
     ASSERT_TRUE(d.has_value());
     EXPECT_EQ(d->epoch, r.server.historyEpoch()) << "the new epoch is durable at once";
@@ -1073,4 +1074,32 @@ TEST(CatalogReadServerRegression, ADroppedNoteIsSentAgainAndADroppedDataFrameNev
         EXPECT_EQ(notes, 1) << "the client holds the note: a data-frame resume never repeats it";
         EXPECT_EQ(h.seen(7).first, range(0, 3));
     }
+}
+
+// Fix round 3 (I1-r2): a stream opened AT the HW sends its note and, right behind
+// it, its marker.  The note is dropped (the session's window is full) — and the
+// marker with it.  The resume must re-send the note AND the marker.  RED: the
+// stream resumed Live (the marker counted as delivered) — no marker ever, the
+// client's refresh ended Timeout.
+TEST(CatalogReadServerRegression, ADroppedNoteOnAStreamOpenedAtTheHwStillGetsItsMarkerRegression) {
+    ReadRig r("rd_ep_flow_note_hw");
+    r.commitEvents(2);
+    FlowHarness h(r);
+    h.sessions[7] = {/*window=*/1 << 20, /*inFlight=*/1 << 20, /*drainPerPass=*/0};   // full: the note drops
+    r.server.subscribe(7, 1, /*from=*/2);   // at the HW
+    h.pass();
+    ASSERT_EQ(h.flow.pauses(), 1u);
+    h.sessions[7].drainPerPass = 1 << 20;
+    for (int i = 0; i < 10; ++i) h.pass();
+    int notes = 0, marks = 0;
+    int64_t markAt = -1;
+    for (const auto& f : h.delivered[7])
+        if (auto rec = pc::Records::decode(f.data(), f.size()); rec && rec->recordBatch.size() == 8) {
+            if (rec->baseOffset < 0) ++notes;
+            else { ++marks; markAt = rec->baseOffset; }
+        }
+    EXPECT_EQ(notes, 1) << "the dropped note, once more";
+    EXPECT_EQ(marks, 1) << "and the marker dropped behind it";
+    EXPECT_EQ(markAt, 2);
+    EXPECT_TRUE(h.seen(7).first.empty()) << "no data below the HW";
 }

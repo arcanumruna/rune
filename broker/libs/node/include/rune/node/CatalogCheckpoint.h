@@ -73,6 +73,13 @@ inline constexpr const char* kCatalogCheckpointFile = "applied";
 //   anchorLeaderEpoch i32 | anchorCrc u32 | check u64 (FNV-1a-64 of the 40 before)
 // Written like the checkpoint (tmp + fsync + rename + directory fsync).  Owned by
 // the admin thread (the CatalogReadServer).
+//
+// OPERATIONS (fix round 3): restoring a data dir from a backup, or cloning it to
+// another broker, MUST delete `__catalog/history_epoch` — a self-consistent
+// rollback (log and file restored together) cannot be detected at boot, and the
+// restored broker would serve another history under an epoch clients cached.
+// A missing file only costs every client one re-read.  Every change of the epoch
+// is a fresh random draw (never +1), so lineages that once shared a value part.
 struct CatalogHistoryEpoch {
     uint64_t epoch             = 0;
     int64_t  servedFloor       = 0;

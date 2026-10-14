@@ -86,7 +86,11 @@ void CatalogReadServer::loadEpoch_() {
 }
 
 void CatalogReadServer::bumpEpoch_(const char* why) {
-    ++historyEpoch_;
+    // Fix round 3 (M1-r2): a fresh random draw, never the next integer — two
+    // lineages that once shared a value (a cloned / restored dir) never step
+    // onto the same next value (but with probability 2^-64).
+    const uint64_t was = historyEpoch_;
+    do historyEpoch_ = freshEpoch(idPrefix_); while (historyEpoch_ == was);
     ++epochBumps_;
     spdlog::critical("CatalogReadServer: catalog history epoch -> {:#x} — {}; every client cache is re-read "
                      "from 0", historyEpoch_, why);
@@ -224,9 +228,13 @@ void CatalogReadServer::onPaused(int64_t session, int64_t subscriptionId, int64_
         const Live& l = std::get<Live>(cur);
         const int64_t at = std::min(from, l.nextOffset);
         // I1: the marker is re-sent only if IT was dropped, or a data frame
-        // BEFORE it was (the marker behind it was in flight, dropped too).  A
-        // dropped data frame at the marker's offset follows the marker.
-        if ((droppedMarker && !noteDropped) || at < l.markedAt) return Backlog{at};
+        // BEFORE it was (the marker behind it was in flight, dropped too), or —
+        // fix round 3 — the stream's NOTE was dropped: every later frame of the
+        // stream was dropped with it, the marker included if it had been sent,
+        // so the client holds nothing of this stream and a Live stream resumes
+        // as Backlog (the marker is sent again).  A dropped data frame at the
+        // marker's offset follows the marker.
+        if (noteDropped || droppedMarker || at < l.markedAt) return Backlog{at};
         return Live{at, l.markedAt};
     };
     auto resumption = [&](const Resumable& r) -> Resumption {
