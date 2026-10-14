@@ -248,6 +248,12 @@ public:
         w_->submitCreateView(std::move(m));
         return corr;
     }
+    /// A ring frame that failed to decode: its own variant alternative.
+    int64_t submitRawMalformed(uint16_t templateId, std::string reason) {
+        const int64_t corr = nextCorr_(Op::ViewPersisted);
+        w_->submit(DdlRequest{MalformedDdl{templateId, 1, corr, std::move(reason)}});
+        return corr;
+    }
     int64_t submitRawAlter(AlterTopicMsg m) {
         const int64_t corr = nextCorr_(Op::AlterAdd);
         m.session = 1; m.corr = corr;

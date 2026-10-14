@@ -18,6 +18,7 @@
 #include <spdlog/spdlog.h>
 
 #include <rune/node/RuntimeTopicRecovery.h>
+#include "support/LegacyRuntimeTopicRecovery.h"   // the retired recovery (test-only)
 #include <rune/node/SchemaRegistry.h>
 #include <rune/catalog/TopicName.h>
 #include <rune/node/ViewRegistry.h>

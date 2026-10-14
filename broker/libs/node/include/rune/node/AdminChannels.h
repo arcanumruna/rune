@@ -33,7 +33,9 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <optional>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace rune::node {
@@ -131,23 +133,21 @@ inline uint16_t getU16(const uint8_t* p){ uint16_t v; std::memcpy(&v, p, 2); ret
 // client's word.  Owning form after drain (cold: DDL is rare).
 // ---------------------------------------------------------------------------
 struct DdlMeta {
-    std::string               statement;
-    std::string               clientName;
-    std::string               sourceAddress;
-    int64_t                   sessionId = 0;
-    rune::protocol::RequestId requestId{};
-    bool                      hasReplayedFrom = false;
-    std::string               replayedClusterId;
-    int64_t                   replayedOffset = -1;
-    std::string               replayedPrincipal;
+    std::string                                statement;
+    std::string                                clientName;
+    std::string                                sourceAddress;
+    int64_t                                    sessionId = 0;
+    rune::protocol::RequestId                  requestId{};
+    std::optional<rune::catalog::ReplayedFrom> replayedFrom;   // set only by `rune catalog replay` (spec §7)
     bool operator==(const DdlMeta&) const = default;
 };
 
 // ---------------------------------------------------------------------------
 // The DDL requests (gateway → admin, AdminRequestRing).  Owning forms after
-// drain.  `malformed` = the ring decode could not read the frame (or saw an
-// out-of-range byte it never casts): session / corr survive (when present) so the
-// admin thread answers it InvalidSchema / InvalidRequest — never dropped.
+// drain.  A frame the ring decode cannot read — short, over-long, or a byte out
+// of the range it never casts — decodes to its own alternative, MalformedDdl
+// (hard rule 3: no flag beside fields that would mean nothing): session / corr
+// survive (when present) so the admin thread answers it, never dropped.
 // ---------------------------------------------------------------------------
 
 /// DefineTopic: an empty `blob` is an UNTYPED topic (ruling 3); a non-empty one
@@ -165,7 +165,6 @@ struct DefineTopicMsg {
     int16_t                     replicationFactor = 0;
     rune::protocol::TopicConfig config;
     DdlMeta                     meta;
-    bool                        malformed = false;
 };
 
 /// AlterTopic: the client's CAS expectation (expectedVersion = the topic's SCHEMA
@@ -177,7 +176,6 @@ struct AlterTopicMsg {
     std::string          topicName;
     std::vector<uint8_t> opsBlob;               // encodeAlterOps() wire bytes
     DdlMeta              meta;
-    bool                 malformed = false;
 };
 
 /// CreateView: `planBlob` is the authored rune::view::ViewPlan (serializeAuthored).
@@ -185,7 +183,6 @@ struct CreateViewMsg {
     int64_t              session     = 0;
     int64_t              corr        = 0;
     uint8_t              persistence = 0;   // 0 = persisted, 1 = transient
-    bool                 malformed   = false;
     std::string          viewName;
     std::string          keyField;
     std::vector<uint8_t> planBlob;          // authored ViewPlan (serializeAuthored)
@@ -197,7 +194,6 @@ struct DropTopicMsg {
     int64_t     corr    = 0;
     std::string name;
     DdlMeta     meta;
-    bool        malformed = false;
 };
 
 struct DropViewMsg {
@@ -205,7 +201,6 @@ struct DropViewMsg {
     int64_t     corr    = 0;
     std::string name;
     DdlMeta     meta;
-    bool        malformed = false;
 };
 
 /// AlterView (ruling 4): the view's plan and output replaced under the same
@@ -219,7 +214,6 @@ struct AlterViewMsg {
     uint32_t             expectedVersion = 0;
     std::vector<uint8_t> planBlob;
     DdlMeta              meta;
-    bool                 malformed = false;
 };
 
 /// AlterTopicConfig (ruling 5): expectedVersion = the topic's OBJECT version (0 = no check).
@@ -230,8 +224,31 @@ struct AlterTopicConfigMsg {
     uint32_t                                 expectedVersion = 0;
     std::vector<rune::catalog::ConfigChange> changes;
     DdlMeta                                  meta;
-    bool                                     malformed = false;
 };
+
+/// The client-protocol template id each DDL request arrived as (TemplateId values).
+inline constexpr uint16_t kTidDefineTopic      = 64;
+inline constexpr uint16_t kTidAlterTopic       = 68;
+inline constexpr uint16_t kTidCreateView       = 70;
+inline constexpr uint16_t kTidDropTopic        = 74;
+inline constexpr uint16_t kTidAlterTopicConfig = 75;
+inline constexpr uint16_t kTidDropView         = 76;
+inline constexpr uint16_t kTidAlterView        = 77;
+
+/// A DDL frame the ring decode could not read: what can still be answered (the
+/// request's template id, session and correlation id — 0 when even those are
+/// missing) and why.  Answered once, in the request's own response type.
+struct MalformedDdl {
+    uint16_t    templateId = 0;
+    int64_t     session    = 0;
+    int64_t     corr       = 0;
+    std::string reason;
+    bool operator==(const MalformedDdl&) const = default;
+};
+
+/// One queued DDL: exactly one request message (the alternative IS the kind).
+using DdlRequest = std::variant<DefineTopicMsg, AlterTopicMsg, CreateViewMsg, DropTopicMsg, DropViewMsg,
+                                AlterViewMsg, AlterTopicConfigMsg, MalformedDdl>;
 
 // ---------------------------------------------------------------------------
 // GetSchema request (gateway → admin).  Owning form after drain.
@@ -280,7 +297,8 @@ struct AdminRoleMsg {
 // One LAYOUT per message, written once and used twice: by the Sizer (the exact
 // frame length, and whether every length fits its prefix) and by the Writer.
 // The decoders are checked (the Reader): a short / over-long frame, or a byte
-// out of its range, is `malformed` — never a default applied as a real request.
+// out of its range, decodes to MalformedDdl (with its reason) — never a default
+// applied as a real request.
 //
 //   meta    : statement:u32+bytes, clientName:u16+bytes, sourceAddress:u16+bytes,
 //             sessionId:i64, requestIdHi:u64, requestIdLo:u64, hasReplayedFrom:u8,
@@ -344,8 +362,13 @@ struct Reader {
     std::size_t    len;
     std::size_t    pos = 0;
     bool           ok  = true;
+    const char*    why = nullptr;   // the first failure's reason
+    void fail(const char* reason) noexcept {
+        if (ok) why = reason;
+        ok = false;
+    }
     bool need(std::size_t k) noexcept {
-        if (!ok || len - pos < k || pos > len) { ok = false; return false; }
+        if (!ok || pos > len || len - pos < k) { fail("the frame is shorter than its fields"); return false; }
         return true;
     }
     int64_t  i64() noexcept { if (!need(8)) return 0; const int64_t v = getI64(b + pos); pos += 8; return v; }
@@ -373,8 +396,11 @@ struct Reader {
         out.assign(reinterpret_cast<const char*>(b + pos), n);
         pos += n;
     }
-    /// The whole frame was consumed exactly.
-    [[nodiscard]] bool done() const noexcept { return ok && pos == len; }
+    /// The whole frame was consumed exactly (false — with a reason — otherwise).
+    [[nodiscard]] bool done() noexcept {
+        if (ok && pos != len) fail("trailing bytes after the last field");
+        return ok;
+    }
 };
 
 template <class W>
@@ -385,11 +411,11 @@ void layoutMeta(W& w, const DdlMeta& m) {
     w.i64(m.sessionId);
     w.u64(m.requestId.hi);
     w.u64(m.requestId.lo);
-    w.u8(m.hasReplayedFrom ? 1 : 0);
-    if (m.hasReplayedFrom) {
-        w.str16(m.replayedClusterId);
-        w.i64(m.replayedOffset);
-        w.str16(m.replayedPrincipal);
+    w.u8(m.replayedFrom ? 1 : 0);
+    if (m.replayedFrom) {
+        w.str16(m.replayedFrom->clusterId);
+        w.i64(m.replayedFrom->offset);
+        w.str16(m.replayedFrom->principal);
     }
 }
 inline void readMeta(Reader& r, DdlMeta& m) {
@@ -400,12 +426,13 @@ inline void readMeta(Reader& r, DdlMeta& m) {
     m.requestId.hi = r.u64();
     m.requestId.lo = r.u64();
     const uint8_t rf = r.u8();
-    if (rf > 1) { r.ok = false; return; }   // never cast
-    m.hasReplayedFrom = rf == 1;
-    if (m.hasReplayedFrom) {
-        r.str16(m.replayedClusterId);
-        m.replayedOffset = r.i64();
-        r.str16(m.replayedPrincipal);
+    if (rf > 1) { r.fail("a replayedFrom flag other than 0/1"); return; }   // never cast
+    if (rf == 1) {
+        rune::catalog::ReplayedFrom from;
+        r.str16(from.clusterId);
+        from.offset = r.i64();
+        r.str16(from.principal);
+        m.replayedFrom = std::move(from);
     }
 }
 
@@ -517,12 +544,15 @@ inline bool encodeCreateView(OneToOneByteRing& ring, const CreateViewMsg& m)   {
 namespace admin_wire {
 /// session + corr first (so a malformed frame can still be answered).
 template <class M> inline void readHead(Reader& r, M& m) { m.session = r.i64(); m.corr = r.i64(); }
-template <class M> inline void finish(Reader& r, M& m) {
-    if (!r.done()) m.malformed = true;
+/// The decoded request, or — when the frame did not read exactly — its MalformedDdl.
+template <class M> inline DdlRequest finish(Reader& r, M&& m, uint16_t templateId) {
+    if (!r.done())
+        return MalformedDdl{templateId, m.session, m.corr, r.why != nullptr ? r.why : "unreadable frame"};
+    return DdlRequest{std::forward<M>(m)};
 }
 } // namespace admin_wire
 
-inline DefineTopicMsg decodeDefineTopic(const uint8_t* buf, std::size_t len) {
+inline DdlRequest decodeDefineTopic(const uint8_t* buf, std::size_t len) {
     admin_wire::Reader r{buf, len};
     DefineTopicMsg m;
     admin_wire::readHead(r, m);
@@ -532,14 +562,13 @@ inline DefineTopicMsg decodeDefineTopic(const uint8_t* buf, std::size_t len) {
     r.str16(m.keyField);
     r.bytes32(m.blob);
     m.persistence = r.u8();
-    if (m.persistence > 1) m.malformed = true;   // never cast
+    if (r.ok && m.persistence > 1) r.fail("an unknown persistence byte");   // never cast
     m.replicationFactor = r.i16();
     admin_wire::readConfig(r, m.config);
     admin_wire::readMeta(r, m.meta);
-    admin_wire::finish(r, m);
-    return m;
+    return admin_wire::finish(r, std::move(m), kTidDefineTopic);
 }
-inline AlterTopicMsg decodeAlterTopic(const uint8_t* buf, std::size_t len) {
+inline DdlRequest decodeAlterTopic(const uint8_t* buf, std::size_t len) {
     admin_wire::Reader r{buf, len};
     AlterTopicMsg m;
     admin_wire::readHead(r, m);
@@ -547,81 +576,71 @@ inline AlterTopicMsg decodeAlterTopic(const uint8_t* buf, std::size_t len) {
     r.str16(m.topicName);
     r.bytes32(m.opsBlob);
     admin_wire::readMeta(r, m.meta);
-    admin_wire::finish(r, m);
-    return m;
+    return admin_wire::finish(r, std::move(m), kTidAlterTopic);
 }
-inline CreateViewMsg decodeCreateView(const uint8_t* buf, std::size_t len) {
+inline DdlRequest decodeCreateView(const uint8_t* buf, std::size_t len) {
     admin_wire::Reader r{buf, len};
     CreateViewMsg m;
     admin_wire::readHead(r, m);
     m.persistence = r.u8();
-    if (m.persistence > 1) m.malformed = true;   // never cast
+    if (r.ok && m.persistence > 1) r.fail("an unknown persistence byte");   // never cast
     r.str16(m.viewName);
     r.str16(m.keyField);
     r.bytes32(m.planBlob);
     admin_wire::readMeta(r, m.meta);
-    admin_wire::finish(r, m);
-    return m;
+    return admin_wire::finish(r, std::move(m), kTidCreateView);
 }
-inline DropTopicMsg decodeDropTopic(const uint8_t* buf, std::size_t len) {
+inline DdlRequest decodeDropTopic(const uint8_t* buf, std::size_t len) {
     admin_wire::Reader r{buf, len};
     DropTopicMsg m;
     admin_wire::readHead(r, m);
     r.str16(m.name);
     admin_wire::readMeta(r, m.meta);
-    admin_wire::finish(r, m);
-    return m;
+    return admin_wire::finish(r, std::move(m), kTidDropTopic);
 }
-inline DropViewMsg decodeDropView(const uint8_t* buf, std::size_t len) {
+inline DdlRequest decodeDropView(const uint8_t* buf, std::size_t len) {
     admin_wire::Reader r{buf, len};
     DropViewMsg m;
     admin_wire::readHead(r, m);
     r.str16(m.name);
     admin_wire::readMeta(r, m.meta);
-    admin_wire::finish(r, m);
-    return m;
+    return admin_wire::finish(r, std::move(m), kTidDropView);
 }
-inline AlterViewMsg decodeAlterView(const uint8_t* buf, std::size_t len) {
+inline DdlRequest decodeAlterView(const uint8_t* buf, std::size_t len) {
     admin_wire::Reader r{buf, len};
     AlterViewMsg m;
     admin_wire::readHead(r, m);
     r.str16(m.name);
     r.str16(m.keyField);
     m.persistence = r.u8();
-    if (m.persistence > 1) m.malformed = true;   // never cast
+    if (r.ok && m.persistence > 1) r.fail("an unknown persistence byte");   // never cast
     m.expectedVersion = r.u32();
     r.bytes32(m.planBlob);
     admin_wire::readMeta(r, m.meta);
-    admin_wire::finish(r, m);
-    return m;
+    return admin_wire::finish(r, std::move(m), kTidAlterView);
 }
-inline AlterTopicConfigMsg decodeAlterTopicConfig(const uint8_t* buf, std::size_t len) {
+inline DdlRequest decodeAlterTopicConfig(const uint8_t* buf, std::size_t len) {
     admin_wire::Reader r{buf, len};
     AlterTopicConfigMsg m;
     admin_wire::readHead(r, m);
     r.str16(m.name);
     m.expectedVersion = r.u32();
     const uint16_t count = r.u16();
-    if (r.ok && static_cast<std::size_t>(count) * 9u <= len - r.pos) {
-        m.changes.reserve(count);
-        for (uint16_t i = 0; i < count && r.ok; ++i) {
-            const uint8_t key   = r.u8();
-            const int64_t value = r.i64();
-            if (key < static_cast<uint8_t>(rune::protocol::kFirstConfigKey) ||
-                key > static_cast<uint8_t>(rune::protocol::kLastConfigKey)) {
-                m.malformed = true;   // never cast
-                continue;
-            }
-            m.changes.push_back(rune::catalog::ConfigChange{static_cast<rune::catalog::ConfigKey>(key), value});
+    if (r.ok && static_cast<std::size_t>(count) * 9u > len - r.pos) r.fail("the frame is shorter than its fields");
+    if (r.ok) m.changes.reserve(count);
+    for (uint16_t i = 0; i < count && r.ok; ++i) {
+        const uint8_t key   = r.u8();
+        const int64_t value = r.i64();
+        if (key < static_cast<uint8_t>(rune::protocol::kFirstConfigKey) ||
+            key > static_cast<uint8_t>(rune::protocol::kLastConfigKey)) {
+            r.fail("an unknown config key");   // never cast
+            break;
         }
-    } else {
-        r.ok = false;
+        m.changes.push_back(rune::catalog::ConfigChange{static_cast<rune::catalog::ConfigKey>(key), value});
     }
     admin_wire::readMeta(r, m.meta);
-    admin_wire::finish(r, m);
-    return m;
+    return admin_wire::finish(r, std::move(m), kTidAlterTopicConfig);
 }
-
 
 // ---- GetSchema ----
 // Wire layout: session:i64, corr:i64, requestedFingerprint:u64 (0=latest),

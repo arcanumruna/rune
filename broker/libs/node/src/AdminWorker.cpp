@@ -53,15 +53,15 @@ constexpr uint16_t kInvalidRequest       = 39;
 constexpr uint16_t kInvalidTopicName     = 40;
 constexpr uint16_t kViewSourceIsView     = 41;
 
-// Client-protocol template ids (rune::protocol::client::TemplateId) — the
-// request kind a fingerprint covers.
-constexpr uint16_t kTidDefineTopic      = 64;
-constexpr uint16_t kTidAlterTopic       = 68;
-constexpr uint16_t kTidCreateView       = 70;
-constexpr uint16_t kTidDropTopic        = 74;
-constexpr uint16_t kTidAlterTopicConfig = 75;
-constexpr uint16_t kTidDropView         = 76;
-constexpr uint16_t kTidAlterView        = 77;
+/// A malformed request carries no meta: it is treated as id-less (pre-v8) — it is
+/// answered before the dedupe and never fingerprinted.
+const DdlMeta kNoMeta{};
+const DdlMeta& metaOf(const DdlRequest& req) noexcept {
+    return std::visit([](const auto& m) -> const DdlMeta& {
+        if constexpr (std::is_same_v<std::decay_t<decltype(m)>, MalformedDdl>) return kNoMeta;
+        else return m.meta;
+    }, req);
+}
 
 /// The largest encoded event the leader writes.  A catalog record must reach
 /// every follower in one fetch (kDefaultMaxFetchBytes) and the applier's first
@@ -178,6 +178,7 @@ uint16_t requestTemplateId(const DdlRequest& req) noexcept {
         else if constexpr (std::is_same_v<M, DropTopicMsg>)   return kTidDropTopic;
         else if constexpr (std::is_same_v<M, DropViewMsg>)    return kTidDropView;
         else if constexpr (std::is_same_v<M, AlterViewMsg>)   return kTidAlterView;
+        else if constexpr (std::is_same_v<M, MalformedDdl>)   return m.templateId;
         else                                                  return kTidAlterTopicConfig;
     }, req);
 }
@@ -187,6 +188,9 @@ uint64_t requestFingerprint(const DdlRequest& req) noexcept {
     f.u(requestTemplateId(req));
     std::visit([&f](const auto& m) {
         using M = std::decay_t<decltype(m)>;
+        if constexpr (std::is_same_v<M, MalformedDdl>) {
+            return;   // never deduped: answered before the dedupe (startNext_)
+        } else {
         f.s(m.meta.statement);
         if constexpr (std::is_same_v<M, DefineTopicMsg>) {
             f.s(m.name);
@@ -210,6 +214,7 @@ uint64_t requestFingerprint(const DdlRequest& req) noexcept {
         } else {
             f.s(m.name); f.u(m.expectedVersion); f.u(m.changes.size());
             for (const auto& c : m.changes) { f.u(static_cast<uint8_t>(c.key)); f.u(static_cast<uint64_t>(c.value)); }
+        }
         }
     }, req);
     return f.h;
@@ -388,7 +393,7 @@ void AdminWorker::submit(DdlRequest req) {
     if (pending_.size() >= kMaxPendingDdl) [[unlikely]] {
         ++pendingDdlRefused_;
         // Not started: answered directly (respond_), outside the started/answered pair.
-        respond_(req, kInternal, {}, -1, 0, 0, 0, -1, 0);
+        respond_(req, Response{kInternal, {}, -1, 0, 0, 0, -1, 0});
         return;
     }
     pending_.push_back(std::move(req));
@@ -450,7 +455,7 @@ void AdminWorker::startNext_(int64_t nowNs) {
     ++started_;
     DdlRequest req = std::move(pending_.front());
     pending_.pop_front();
-    const DdlMeta& meta = std::visit([](const auto& m) -> const DdlMeta& { return m.meta; }, req);
+    const DdlMeta& meta = metaOf(req);
 
     // 1. The role gate.  A halted applier accepts no catalog change (spec §5.3).
     if (catalogReplica_ == nullptr) {
@@ -482,8 +487,19 @@ void AdminWorker::startNext_(int64_t nowNs) {
         return;
     }
 
+    // 2. A frame the ring decode could not read: answered with its reason
+    //    (InvalidSchema for the pre-v8 kinds, InvalidRequest + detail for 74–77).
+    if (const auto* bad = std::get_if<MalformedDdl>(&req)) {
+        spdlog::warn("AdminWorker: malformed DDL frame (template {}, session {}, corr {}): {} — answered",
+                     bad->templateId, bad->session, bad->corr, bad->reason);
+        const bool v8Only = bad->templateId >= kTidDropTopic;
+        answer_(req, v8Only ? kInvalidRequest : kInvalidSchema,
+                v8Only ? "malformed request: " + bad->reason : std::string{});
+        return;
+    }
+
     const cat::CatalogState& state = applier_.state();
-    // 2. Dedupe (F14) on (requestId, statement fingerprint).
+    // 3. Dedupe (F14) on (requestId, statement fingerprint).
     const uint64_t fp = requestFingerprint(req);
     if (!meta.requestId.none()) {
         if (const auto rec = state.request(meta.requestId)) {
@@ -496,7 +512,7 @@ void AdminWorker::startNext_(int64_t nowNs) {
         }
     }
 
-    // 3. Build the event against the applied catalog (the dry run is its gate).
+    // 4. Build the event against the applied catalog (the dry run is its gate).
     Built built = buildEvent_(req, state);
     if (!built) {
         answerRejection_(req, built.error());
@@ -560,7 +576,7 @@ bool AdminWorker::advance_(int64_t nowNs) {
     // the halt: an event applied before a later halt still gets its OK.
     if (applier_.lastApplied().offset >= a->offset) {
         // The answer is what the applied event recorded.
-        const DdlMeta& meta = std::visit([](const auto& m) -> const DdlMeta& { return m.meta; }, a->req);
+        const DdlMeta& meta = metaOf(a->req);
         std::optional<cat::RequestRecord> rec =
             meta.requestId.none() ? recordOfLastApplied_(a->offset) : applier_.state().request(meta.requestId);
         DdlRequest req = std::move(a->req);
@@ -622,23 +638,23 @@ std::optional<cat::RequestRecord> AdminWorker::recordOfLastApplied_(int64_t offs
     return r;
 }
 
-uint64_t AdminWorker::viewOutputFingerprint_(const cat::RequestRecord& r) const {
-    auto fpOf = [](const std::vector<uint8_t>& blob) -> uint64_t {
+std::optional<uint64_t> AdminWorker::viewOutputFingerprint_(const cat::RequestRecord& r) const {
+    auto fpOf = [](const std::vector<uint8_t>& blob) -> std::optional<uint64_t> {
         try {
             return rune::codec::fingerprint(rune::codec::deserialize(std::span<const uint8_t>(blob.data(), blob.size())));
         } catch (const std::exception&) {
-            return 0;
+            return std::nullopt;
         }
     };
     if (const cat::ViewObject* v = applier_.state().viewByObjectId(r.objectId); v && v->version == r.newVersion)
         return fpOf(v->def.outputDescriptorBlob);
     // The view changed since (a retry answered after a later DDL): the event at
     // the record's offset holds the original definition.
-    if (catalogReplica_ == nullptr) return 0;
+    if (catalogReplica_ == nullptr) return std::nullopt;
     const std::vector<uint8_t> data = catalogReplica_->read(r.offset, rune::replication::kDefaultMaxFetchBytes);
-    uint64_t out = 0;
+    std::optional<uint64_t> out;
     std::size_t pos = 0;
-    while (pos < data.size() && out == 0) {
+    while (pos < data.size() && !out) {
         rune::protocol::RecordBatchReader reader(data.data() + pos, data.size() - pos);
         if (!reader.ensureValid()) break;
         const auto tl = static_cast<std::size_t>(reader.totalLength());
@@ -656,10 +672,15 @@ uint64_t AdminWorker::viewOutputFingerprint_(const cat::RequestRecord& r) const 
 }
 
 // ─── answers ────────────────────────────────────────────────────────────────
+// Every exit of a STARTED DDL ends here — the one place answered_ moves.
+void AdminWorker::answer_(const DdlRequest& req, const Response& r) {
+    ++answered_;
+    respond_(req, r);
+}
+
 void AdminWorker::answer_(const DdlRequest& req, uint16_t code, std::string_view detail, int32_t topicId,
                           uint16_t version) {
-    ++answered_;
-    respond_(req, code, detail, topicId, version, 0, version, -1, 0);
+    answer_(req, Response{code, detail, topicId, version, 0, version, -1, 0});
 }
 
 void AdminWorker::answerRejection_(const DdlRequest& req, const DdlRejection& r) {
@@ -667,34 +688,48 @@ void AdminWorker::answerRejection_(const DdlRequest& req, const DdlRejection& r)
 }
 
 void AdminWorker::answerOk_(const DdlRequest& req, const cat::RequestRecord& r) {
-    ++answered_;
-    const bool isView = std::holds_alternative<CreateViewMsg>(req);
+    uint64_t viewFp = 0;
+    if (std::holds_alternative<CreateViewMsg>(req)) {
+        const std::optional<uint64_t> fp = viewOutputFingerprint_(r);
+        if (!fp) {
+            // Never an OK carrying a made-up fingerprint (a client pins it).
+            spdlog::error("AdminWorker: the CreateView at offset {} cannot be re-read for its output fingerprint — "
+                          "answered Internal", r.offset);
+            answer_(req, kInternal);
+            return;
+        }
+        viewFp = *fp;
+    }
     const int32_t gate = r.kind == cat::EventKind::AlterView ? r.topicId : -1;
-    respond_(req, kOK, {}, r.topicId, r.schemaVersion, r.objectId, r.newVersion, gate,
-             isView ? viewOutputFingerprint_(r) : 0);
+    answer_(req, Response{kOK, {}, r.topicId, r.schemaVersion, r.objectId, r.newVersion, gate, viewFp});
 }
 
-void AdminWorker::respond_(const DdlRequest& req, uint16_t code, std::string_view detail, int32_t topicId,
-                           uint16_t version, uint64_t objectId, uint32_t newVersion, int32_t gateTopicId,
-                           uint64_t viewFingerprint) {
-    std::visit([&](const auto& m) {
-        using M = std::decay_t<decltype(m)>;
-        // A detail rides an ErrorResponse for the pre-v8 response types (their
-        // own frames have no detail field) — InvalidRequest only (spec §9).
-        const bool viaError = code == kInvalidRequest && !detail.empty() && deps_.respondError;
-        if constexpr (std::is_same_v<M, DefineTopicMsg>) {
-            if (viaError) deps_.respondError(m.session, m.corr, code, detail);
-            else if (deps_.respondDefine) deps_.respondDefine(m.session, m.corr, topicId, version, code);
-        } else if constexpr (std::is_same_v<M, AlterTopicMsg>) {
-            if (viaError) deps_.respondError(m.session, m.corr, code, detail);
-            else if (deps_.respondAlter) deps_.respondAlter(m.session, m.corr, topicId, version, code);
-        } else if constexpr (std::is_same_v<M, CreateViewMsg>) {
-            if (viaError) deps_.respondError(m.session, m.corr, code, detail);
-            else if (deps_.respondCreateView) deps_.respondCreateView(m.session, m.corr, topicId, viewFingerprint, code);
-        } else {
-            if (deps_.respondDdl) deps_.respondDdl(m.session, m.corr, code, objectId, newVersion, gateTopicId, detail);
+void AdminWorker::respond_(const DdlRequest& req, const Response& r) {
+    // A detail rides an ErrorResponse for the pre-v8 response types (their own
+    // frames have no detail field) — InvalidRequest only (spec §9).
+    const bool viaError = r.code == kInvalidRequest && !r.detail.empty() && deps_.respondError;
+    auto byTemplate = [&](uint16_t tid, int64_t session, int64_t corr) {
+        switch (tid) {
+        case kTidDefineTopic:
+            if (viaError) deps_.respondError(session, corr, r.code, r.detail);
+            else if (deps_.respondDefine) deps_.respondDefine(session, corr, r.topicId, r.version, r.code);
+            return;
+        case kTidAlterTopic:
+            if (viaError) deps_.respondError(session, corr, r.code, r.detail);
+            else if (deps_.respondAlter) deps_.respondAlter(session, corr, r.topicId, r.version, r.code);
+            return;
+        case kTidCreateView:
+            if (viaError) deps_.respondError(session, corr, r.code, r.detail);
+            else if (deps_.respondCreateView)
+                deps_.respondCreateView(session, corr, r.topicId, r.viewFingerprint, r.code);
+            return;
+        default:
+            if (deps_.respondDdl)
+                deps_.respondDdl(session, corr, r.code, r.objectId, r.newVersion, r.gateTopicId, r.detail);
+            return;
         }
-    }, req);
+    };
+    std::visit([&](const auto& m) { byTemplate(requestTemplateId(req), m.session, m.corr); }, req);
 }
 
 // ─── event building ─────────────────────────────────────────────────────────
@@ -715,13 +750,14 @@ AdminWorker::Built AdminWorker::buildEvent_(const DdlRequest& req, const cat::Ca
         else if constexpr (std::is_same_v<M, AlterViewMsg>)   return buildAlterView_(m, s);
         else if constexpr (std::is_same_v<M, DropViewMsg>)    return buildDropView_(m, s);
         else if constexpr (std::is_same_v<M, DropTopicMsg>)   return buildDropTopic_(m, s);
+        else if constexpr (std::is_same_v<M, MalformedDdl>)   return Rejected(reject(kInternal));   // answered earlier
         else                                                  return buildAlterConfig_(m, s);
     }, req);
     if (!b) return b;
 
     // The principal, statement and time (spec §4; F22: timestampMs is the
     // leader's wall clock when the event is built for its append).
-    const DdlMeta& meta = std::visit([](const auto& m) -> const DdlMeta& { return m.meta; }, req);
+    const DdlMeta& meta = metaOf(req);
     const int64_t session = std::visit([](const auto& m) { return m.session; }, req);
     b->formatVer                 = cat::kCurrentFormatVer;
     b->statement                 = meta.statement;
@@ -729,8 +765,7 @@ AdminWorker::Built AdminWorker::buildEvent_(const DdlRequest& req, const cat::Ca
     b->principal.clientName      = meta.clientName;
     b->principal.sourceAddress   = meta.sourceAddress;
     b->principal.requestId       = meta.requestId;
-    if (meta.hasReplayedFrom)
-        b->replayedFrom = cat::ReplayedFrom{meta.replayedClusterId, meta.replayedOffset, meta.replayedPrincipal};
+    b->replayedFrom = meta.replayedFrom;
     b->timestampMs = wallClockMs();
     b->kind        = cat::kindOf(b->ops);
 
@@ -757,7 +792,7 @@ AdminWorker::Built AdminWorker::buildEvent_(const DdlRequest& req, const cat::Ca
 }
 
 AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat::CatalogState& s) const {
-    if (m.malformed || !persistenceFromWire(m.persistence)) return Rejected(reject(kInvalidSchema));
+    if (!persistenceFromWire(m.persistence)) return Rejected(reject(kInvalidSchema));   // a direct submit
     if (!cat::isValidTopicName(m.name)) return Rejected(reject(kInvalidTopicName));
     if (m.partitionCount < 1) return Rejected(reject(kInvalidSchema));
 
@@ -827,7 +862,6 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
 }
 
 AdminWorker::Built AdminWorker::buildAlter_(const AlterTopicMsg& m, const cat::CatalogState& s) const {
-    if (m.malformed) return Rejected(reject(kInvalidSchema));
     // U1: a view's output is derived from its plan — never altered directly.
     if (s.viewByName(m.topicName)) return Rejected(reject(kViewNotAlterable));
     const cat::TopicObject* t = s.topicByName(m.topicName);
@@ -921,7 +955,7 @@ AdminWorker::viewDef_(const std::string& name, const std::string& keyField, uint
 }
 
 AdminWorker::Built AdminWorker::buildCreateView_(const CreateViewMsg& m, const cat::CatalogState& s) const {
-    if (m.malformed || m.persistence > 1) return Rejected(reject(kInvalidSchema));
+    if (m.persistence > 1) return Rejected(reject(kInvalidSchema));   // a direct submit
     if (!cat::isValidTopicName(m.viewName)) return Rejected(reject(kInvalidTopicName));
     if (const cat::ViewObject* v = s.viewByName(m.viewName))
         return Rejected(reject(kViewExists, {}, v->def.viewTopicId));
@@ -940,7 +974,7 @@ AdminWorker::Built AdminWorker::buildCreateView_(const CreateViewMsg& m, const c
 }
 
 AdminWorker::Built AdminWorker::buildAlterView_(const AlterViewMsg& m, const cat::CatalogState& s) const {
-    if (m.malformed || m.persistence > 1) return Rejected(reject(kInvalidSchema));
+    if (m.persistence > 1) return Rejected(reject(kInvalidSchema));   // a direct submit
     const cat::ViewObject* v = s.viewByName(m.name);
     if (v == nullptr) return Rejected(reject(kUnknownTopic, "no view named " + quotedName(m.name)));
     if (m.expectedVersion != 0 && m.expectedVersion != v->version)
@@ -960,7 +994,6 @@ AdminWorker::Built AdminWorker::buildAlterView_(const AlterViewMsg& m, const cat
 }
 
 AdminWorker::Built AdminWorker::buildDropView_(const DropViewMsg& m, const cat::CatalogState& s) const {
-    if (m.malformed) return Rejected(reject(kInvalidRequest, "the DropView request is malformed"));
     const cat::ViewObject* v = s.viewByName(m.name);
     if (v == nullptr) return Rejected(reject(kUnknownTopic, "no view named " + quotedName(m.name)));
     cat::CatalogEvent e;
@@ -973,7 +1006,6 @@ AdminWorker::Built AdminWorker::buildDropView_(const DropViewMsg& m, const cat::
 }
 
 AdminWorker::Built AdminWorker::buildDropTopic_(const DropTopicMsg& m, const cat::CatalogState& s) const {
-    if (m.malformed) return Rejected(reject(kInvalidRequest, "the DropTopic request is malformed"));
     if (s.viewByName(m.name)) return Rejected(reject(kInvalidRequest, quotedName(m.name) + " is a view; use DROP VIEW"));
     const cat::TopicObject* t = s.topicByName(m.name);
     if (t == nullptr) return Rejected(reject(kUnknownTopic, "no topic named " + quotedName(m.name)));
@@ -989,7 +1021,6 @@ AdminWorker::Built AdminWorker::buildDropTopic_(const DropTopicMsg& m, const cat
 }
 
 AdminWorker::Built AdminWorker::buildAlterConfig_(const AlterTopicConfigMsg& m, const cat::CatalogState& s) const {
-    if (m.malformed) return Rejected(reject(kInvalidRequest, "the AlterTopicConfig request is malformed"));
     if (s.viewByName(m.name)) return Rejected(reject(kViewNotAlterable));
     const cat::TopicObject* t = s.topicByName(m.name);
     if (t == nullptr) return Rejected(reject(kUnknownTopic, "no topic named " + quotedName(m.name)));

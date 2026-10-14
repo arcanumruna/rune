@@ -21,22 +21,27 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string_view>
 
 namespace rune::gateway {
 
+/// Where a replayed DDL came from (`rune catalog replay`, spec §7).
+struct ReplayedFromView {
+    std::string_view clusterId;
+    int64_t          offset = -1;
+    std::string_view principal;
+};
+
 /// The principal + statement of one DDL (catalog history spec §4; ruling 13).
 struct DdlMetaView {
-    std::string_view          statement;
-    std::string_view          clientName;
-    std::string_view          sourceAddress;     // the session's egress channel (gateway-supplied)
-    int64_t                   sessionId = 0;     // the session (gateway-supplied)
-    rune::protocol::RequestId requestId{};       // {0, 0} = a pre-v8 client (F14)
-    bool                      hasReplayedFrom = false;
-    std::string_view          replayedClusterId;
-    int64_t                   replayedOffset = -1;
-    std::string_view          replayedPrincipal;
+    std::string_view                statement;
+    std::string_view                clientName;
+    std::string_view                sourceAddress;   // the session's egress channel (gateway-supplied)
+    int64_t                         sessionId = 0;   // the session (gateway-supplied)
+    rune::protocol::RequestId       requestId{};     // {0, 0} = a pre-v8 client (F14)
+    std::optional<ReplayedFromView> replayedFrom;    // absent unless the DDL is a replay
 };
 
 /// The outcome of handing a request to the admin thread.

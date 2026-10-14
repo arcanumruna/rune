@@ -4341,9 +4341,13 @@ bool BrokerNode::catalogTopicServes_(int32_t topicId) const noexcept {
 // placed (every partition assigned, its role routed) — catalogTopicServes_.  An
 // OK whose topic is not applied yet waits; one that never serves is answered
 // Internal (in doubt) by the gate.
+// Fix round 1 (Minor 2): an OK naming a topic this broker has DROPPED is a
+// dedupe retry's ORIGINAL result (a DefineTopic whose topic was dropped since, an
+// AlterView whose sink was retired since) — it will never serve, and it need not:
+// it passes at once, never held into an in-doubt Internal.
 bool BrokerNode::ddlTopicServes_(int32_t topicId) const noexcept {
-    if (!topicRegistry_) return true;
-    return catalogTopicServes_(topicId);
+    return ddlGatedTopicServes(topicRegistry_.get(), topicId,
+                               [this](int32_t id) { return catalogTopicServes_(id); });
 }
 
 // ---------------------------------------------------------------------------

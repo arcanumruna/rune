@@ -3034,6 +3034,17 @@ bool ClientGateway::placementCommitted_(int32_t topicId, int32_t partition, cons
     return e.leaderNodeId != rune::metadata::RoutingImage::NO_LEADER_NODE_ID;
 }
 
+bool ClientGateway::topicAssignable(int32_t topicId) const noexcept
+{
+    if (topicRegistry_ == nullptr) return true;
+    const rune::node::TopicSpec* spec = topicRegistry_->topic(topicId);
+    if (spec == nullptr) return false;
+    if (!topicRegistry_->placementGated(topicId)) return true;   // a static topic serves from boot
+    for (int32_t p = 0; p < spec->partitionCount; ++p)
+        if (!placementCommitted_(topicId, p)) return false;
+    return true;
+}
+
 pc::ErrorCode ClientGateway::unappliedTopicCode_(int32_t topicId, int32_t partition) const noexcept
 {
     using St = rune::gateway::TopicRegistry::TopicState;
@@ -6820,10 +6831,9 @@ rune::gateway::DdlMetaView ClientGateway::ddlMetaOf_(const pc::DdlExtension* ext
         m.statement         = ext->statement;
         m.clientName        = ext->clientName;
         m.requestId         = ext->requestId;
-        m.hasReplayedFrom   = ext->hasReplayedFrom == 1;
-        m.replayedClusterId = ext->replayedClusterId;
-        m.replayedOffset    = ext->replayedOffset;
-        m.replayedPrincipal = ext->replayedPrincipal;
+        if (ext->hasReplayedFrom == 1)   // the wire's flag (decode refuses anything but 0 / 1)
+            m.replayedFrom = rune::gateway::ReplayedFromView{ext->replayedClusterId, ext->replayedOffset,
+                                                             ext->replayedPrincipal};
     }
     return m;
 }

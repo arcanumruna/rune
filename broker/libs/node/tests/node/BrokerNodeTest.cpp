@@ -1504,8 +1504,8 @@ TEST(BrokerNodeRegression, HeterogeneousFollowerDropIsBoundedRegression) {
 // ---------------------------------------------------------------------------
 // F3 round 7, item 1: the REAL production SchemaUpdate path end to end on a
 // live single-node BrokerNode (2 workers): a client DefineTopic(validate=true)
-// → gateway → admin thread commits it to __topic_schemas → pushValidators →
-// AdminWorkerAgent::postSchemaUpdate (admin→control ring, kA2cSchemaUpdate) →
+// → gateway → admin thread commits it to __catalog → the applier's schemaChanged
+// effect (admin→control ring, kA2cSchemaUpdate) →
 // control-thread hook type dispatch → schemaFanout_.pump → EVERY worker's
 // ingress ring → each worker installs the Validator on ITS OWN thread.
 // Then a non-conforming produce is rejected (SchemaValidationFailed) and a

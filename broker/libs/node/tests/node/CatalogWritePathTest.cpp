@@ -113,6 +113,52 @@ TEST(CatalogWritePathRegression, CommitTimeoutAnswersRetriableNotLeaderAndTheRet
     EXPECT_EQ(rig.countEventsWithRequestId(rid), 1u);
 }
 
+// Task 9 fix round 1 (Minor 3): the applier HALTS while a DDL is AwaitingCommit
+// (its event commits, the local apply refuses it): the in-flight DDL is answered
+// Internal — never OK, never left unanswered — and the next DDL is refused too.
+TEST(CatalogWritePathRegression, ApplierHaltWhileAwaitingCommitAnswersInternalRegression) {
+    CatalogDdlRig rig("wp_halt_inflight", 3);
+    rig.becomeServingLeader(/*isr=*/{1, 2});              // follower 2 silent: the event waits for commit
+    const int64_t corr = rig.submitDefineNoWait({.name = "t", .partitions = 1});
+    ASSERT_FALSE(rig.answerFor(corr).has_value()) << "AwaitingCommit";
+    ASSERT_EQ(rig.recordedLog().size(), 1u) << "appended";
+    rig.admin().applierForTest().tamperNextFingerprintForTest();   // the apply of the committed event fails
+    rig.resumeFollower(2);
+    for (int i = 0; i < 16 && !rig.answerFor(corr).has_value(); ++i) rig.pump();
+    const auto a = rig.answerFor(corr);
+    ASSERT_TRUE(a.has_value()) << "answered, never left in flight";
+    EXPECT_EQ(a->code, 6) << "Internal: the event will never be applied here";
+    EXPECT_TRUE(rig.admin().applier().halted());
+    EXPECT_EQ(rig.admin().startedCount(), rig.admin().answeredCount());
+    EXPECT_EQ(rig.define({.name = "u", .partitions = 1}).code, 6) << "a halted applier accepts no change";
+    EXPECT_EQ(rig.recordedLog().size(), 1u);
+}
+
+// Task 9 fix round 1 (Minor 3): a same-requestId retry that arrives while the
+// original is still in flight waits in the queue and is answered the ORIGINAL
+// result once it committed — one event, two identical OKs, never TopicExists.
+TEST(CatalogWritePathRegression, SameRequestIdRetryWhileTheOriginalIsInFlightIsItsResultRegression) {
+    CatalogDdlRig rig("wp_retry_inflight", 3);
+    rig.becomeServingLeader(/*isr=*/{1, 2});              // follower 2 silent: the original stays in flight
+    const rune::protocol::RequestId rid{.hi = 0xC11E, .lo = 77};
+    const int64_t first = rig.submitDefineNoWait({.name = "t", .partitions = 1, .typed = true, .requestId = rid});
+    const int64_t retry = rig.submitDefineNoWait({.name = "t", .partitions = 1, .typed = true, .requestId = rid});
+    EXPECT_FALSE(rig.answerFor(first).has_value());
+    EXPECT_FALSE(rig.answerFor(retry).has_value()) << "queued behind the original, not answered early";
+    rig.resumeFollower(2);
+    for (int i = 0; i < 64 && !(rig.answerFor(first) && rig.answerFor(retry)); ++i) rig.pump();
+    const auto a = rig.answerFor(first);
+    const auto b = rig.answerFor(retry);
+    ASSERT_TRUE(a.has_value());
+    ASSERT_TRUE(b.has_value());
+    EXPECT_EQ(a->code, 0);
+    EXPECT_EQ(b->code, 0) << "the original success, not TopicExists";
+    EXPECT_EQ(b->topicId, a->topicId);
+    EXPECT_EQ(b->version, a->version);
+    EXPECT_EQ(rig.countEventsWithRequestId(rid), 1u);
+    EXPECT_EQ(rig.admin().startedCount(), rig.admin().answeredCount());
+}
+
 TEST(CatalogWritePathRegression, AlterOfAnUntypedTopicIsUnknownTopicAsToday) {
     // F3: today's startAlter_ answers UnknownTopic (7) for a topic with no schema; DdlExpectations pins it.
     CatalogDdlRig rig("wp_untyped_alter", 3);

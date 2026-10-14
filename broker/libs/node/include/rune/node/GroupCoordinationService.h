@@ -223,6 +223,11 @@ public:
     // -----------------------------------------------------------------------
     std::size_t onTopicDropped(std::string_view topicName, int64_t nowNs);
 
+    /// The topic -> partition-count map a rebalance assigns from (test seam, cold).
+    [[nodiscard]] rune::coordination::TopicPartitionCounts topicPartitionCountsForTest() const {
+        return buildTopicPartitionCounts();
+    }
+
 private:
     // -----------------------------------------------------------------------
     // Internal helpers

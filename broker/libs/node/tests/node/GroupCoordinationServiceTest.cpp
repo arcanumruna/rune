@@ -32,7 +32,10 @@
 #include <gtest/gtest.h>
 
 #include <rune/node/GroupCoordinationService.h>
+#include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
+#include <rune/metadata/Gpid.h>
+#include <rune/metadata/RoutingImage.h>
 #include <rune/coordination/GroupCoordinator.h>
 #include <rune/coordination/ReplicatedOffsetStore.h>
 #include <rune/replication/PartitionReplica.h>
@@ -1650,4 +1653,37 @@ TEST_F(CG3ServiceTest, DroppedTopicIsRebalancedAwayFromItsGroupsRegression) {
     ASSERT_TRUE(driveUntil([&] { return service_->coordinator(groupId).state() == GroupState::Stable; }, 10));
     EXPECT_GT(service_->coordinator(groupId).generationId(), genBefore);
     EXPECT_FALSE(holdsTopic()) << "the dropped topic's partitions are no longer assigned";
+}
+
+// Task 9 fix round 1 (Minor 1, C1 for groups): a catalog topic APPLIED here but not
+// PLACED yet is not assignable — a rebalance in that window would hand out
+// partitions the gateway refuses NotPlaced.  It joins the next rebalance once its
+// placement commits; a static topic is assignable from boot.
+TEST_F(CG3ServiceTest, AppliedButNotPlacedTopicIsNotAssignedUntilPlacedRegression) {
+    rune::node::TopicSpec rt = makeTopicSpec("runtime", /*partitions=*/3, /*id=*/kTestTopicId + 1);
+    ASSERT_EQ(registry_->createTopicAt(kTestTopicId + 1, rt), kTestTopicId + 1);
+    rune::gateway::ClientGateway gw = rune::gateway::ClientGateway::makeForTest(
+        [](const uint8_t*, std::size_t) -> int64_t { return 1; }, 1);
+    gw.setTopicRegistry(registry_.get());
+    gw.setNodeIdForTest(kLeader);
+    auto route = [&](bool placed) {
+        std::vector<rune::metadata::RoutingImage::BuildEntry> img;
+        for (int32_t p = 0; p < 2; ++p) img.push_back({rune::metadata::gpidOf(kTestTopicId, p), kLeader, 1});
+        if (placed)
+            for (int32_t p = 0; p < 3; ++p) img.push_back({rune::metadata::gpidOf(kTestTopicId + 1, p), kLeader, 1});
+        gw.setRoutingImageSnapshot(
+            rune::metadata::RoutingImage::build(img, rune::metadata::RoutingImage::Source::Committed));
+    };
+    route(/*placed=*/false);
+    service_->setGateway(&gw);
+
+    auto counts = service_->topicPartitionCountsForTest();
+    EXPECT_EQ(counts.count(std::string(kTestTopic)), 1u) << "a static topic is assignable";
+    EXPECT_EQ(counts.count("runtime"), 0u) << "applied, not placed: not assignable";
+
+    route(/*placed=*/true);
+    counts = service_->topicPartitionCountsForTest();
+    ASSERT_EQ(counts.count("runtime"), 1u) << "placed: assignable";
+    EXPECT_EQ(counts.at("runtime"), 3);
+    service_->setGateway(nullptr);
 }

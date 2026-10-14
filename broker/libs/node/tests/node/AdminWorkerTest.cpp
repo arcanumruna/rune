@@ -395,8 +395,8 @@ TEST(AdminWorkerRegression, RedefineExistingTopicWithOtherPersistenceIsTopicExis
 TEST(AdminWorkerRegression, CatalogDdlRingFramesRoundTripEveryRequestRegression) {
     DdlMeta meta;
     meta.statement = "topic p {...};"; meta.clientName = "cli"; meta.sourceAddress = "aeron:udp?endpoint=h:1";
-    meta.sessionId = 77; meta.requestId = {5, 6}; meta.hasReplayedFrom = true;
-    meta.replayedClusterId = "east"; meta.replayedOffset = 41; meta.replayedPrincipal = "ops";
+    meta.sessionId = 77; meta.requestId = {5, 6};
+    meta.replayedFrom = rune::catalog::ReplayedFrom{"east", 41, "ops"};
 
     OneToOneByteRing ring{kAdminRequestRingBytes};
     DefineTopicMsg d; d.session = 7; d.corr = 8; d.name = "p"; d.blob = {1, 2}; d.persistence = 1;
@@ -416,44 +416,109 @@ TEST(AdminWorkerRegression, CatalogDdlRingFramesRoundTripEveryRequestRegression)
         const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
         const auto n = static_cast<std::size_t>(len);
         if (tid == kMsgDefineTopic) {
-            const DefineTopicMsg got = decodeDefineTopic(p, n);
-            EXPECT_FALSE(got.malformed);
+            const DdlRequest r = decodeDefineTopic(p, n);
+            ASSERT_TRUE(std::holds_alternative<DefineTopicMsg>(r));
+            const auto& got = std::get<DefineTopicMsg>(r);
             EXPECT_EQ(got.blob, d.blob); EXPECT_EQ(got.persistence, 1u); EXPECT_EQ(got.replicationFactor, 3);
             EXPECT_EQ(got.config, d.config); EXPECT_EQ(got.meta, meta);
             // Truncated: malformed, never a default request; session / corr survive.
-            const DefineTopicMsg cut = decodeDefineTopic(p, n - 1);
-            EXPECT_TRUE(cut.malformed); EXPECT_EQ(cut.corr, 8);
+            const DdlRequest cutR = decodeDefineTopic(p, n - 1);
+            const auto* cut = std::get_if<MalformedDdl>(&cutR);
+            ASSERT_NE(cut, nullptr);
+            EXPECT_EQ(cut->corr, 8); EXPECT_EQ(cut->session, 7); EXPECT_EQ(cut->templateId, kTidDefineTopic);
+            EXPECT_FALSE(cut->reason.empty());
             // Unknown persistence byte: malformed, never cast.
             std::vector<uint8_t> bad(p, p + n);
             bad[8 + 8 + 4 + 1 + 2 + 1 + 2 + 0 + 4 + 2] = 2;   // the persistence byte (name "p", empty key, 2-byte blob)
-            EXPECT_TRUE(decodeDefineTopic(bad.data(), bad.size()).malformed);
+            const DdlRequest badR = decodeDefineTopic(bad.data(), bad.size());
+            const auto* badM = std::get_if<MalformedDdl>(&badR);
+            ASSERT_NE(badM, nullptr);
+            EXPECT_EQ(badM->reason, "an unknown persistence byte");
         } else if (tid == kMsgAlterTopicConfig) {
-            const AlterTopicConfigMsg got = decodeAlterTopicConfig(p, n);
-            EXPECT_FALSE(got.malformed);
+            const DdlRequest r = decodeAlterTopicConfig(p, n);
+            ASSERT_TRUE(std::holds_alternative<AlterTopicConfigMsg>(r));
+            const auto& got = std::get<AlterTopicConfigMsg>(r);
             EXPECT_EQ(got.changes, c.changes); EXPECT_EQ(got.expectedVersion, 4u); EXPECT_EQ(got.meta, meta);
         } else if (tid == kMsgAlterView) {
-            const AlterViewMsg got = decodeAlterView(p, n);
-            EXPECT_FALSE(got.malformed);
+            const DdlRequest r = decodeAlterView(p, n);
+            ASSERT_TRUE(std::holds_alternative<AlterViewMsg>(r));
+            const auto& got = std::get<AlterViewMsg>(r);
             EXPECT_EQ(got.planBlob, v.planBlob); EXPECT_EQ(got.persistence, 1u); EXPECT_EQ(got.expectedVersion, 2u);
         } else if (tid == kMsgDropTopic) {
-            const DropTopicMsg got = decodeDropTopic(p, n);
-            EXPECT_FALSE(got.malformed);
+            const DdlRequest r = decodeDropTopic(p, n);
+            ASSERT_TRUE(std::holds_alternative<DropTopicMsg>(r));
+            const auto& got = std::get<DropTopicMsg>(r);
             EXPECT_EQ(got.name, "p"); EXPECT_EQ(got.meta, meta);
         }
     }, 8);
     EXPECT_EQ(types, (std::vector<int32_t>{kMsgDefineTopic, kMsgAlterTopicConfig, kMsgAlterView, kMsgDropTopic}));
 }
 
+// Task 9 fix round 1 (I1, hard rule 3): a frame that does not decode is its own
+// variant alternative — MalformedDdl{templateId, session, corr, reason} — never a
+// flag beside fields that mean nothing.  Every one of the seven DDL decoders: a
+// whole frame is its message, a truncated one is MalformedDdl naming why, and a
+// frame with trailing bytes is MalformedDdl naming that.
+namespace {
+template <typename M>
+std::vector<uint8_t> ringFrame(const M& m) {
+    OneToOneByteRing ring{kAdminRequestRingBytes};
+    EXPECT_TRUE(encodeDdl(ring, m));
+    std::vector<uint8_t> raw;
+    ring.drain([&](int32_t, aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off, aeron::util::index_t len) {
+        const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
+        raw.assign(p, p + len);
+    }, 1);
+    return raw;
+}
+template <typename M>
+void expectMalformedAlternative(const M& m, DdlRequest (*decode)(const uint8_t*, std::size_t), uint16_t tid) {
+    SCOPED_TRACE(tid);
+    std::vector<uint8_t> raw = ringFrame(m);
+    ASSERT_FALSE(raw.empty());
+    EXPECT_TRUE(std::holds_alternative<M>(decode(raw.data(), raw.size())));
+
+    const DdlRequest cut = decode(raw.data(), raw.size() - 1);
+    const auto* c = std::get_if<MalformedDdl>(&cut);
+    ASSERT_NE(c, nullptr) << "a truncated frame is the Malformed alternative";
+    EXPECT_EQ(c->templateId, tid);
+    EXPECT_EQ(c->session, m.session);
+    EXPECT_EQ(c->corr, m.corr);
+    EXPECT_EQ(c->reason, "the frame is shorter than its fields");
+
+    raw.push_back(0);
+    const DdlRequest longer = decode(raw.data(), raw.size());
+    const auto* l = std::get_if<MalformedDdl>(&longer);
+    ASSERT_NE(l, nullptr) << "trailing bytes are the Malformed alternative";
+    EXPECT_EQ(l->templateId, tid);
+    EXPECT_EQ(l->reason, "trailing bytes after the last field");
+}
+} // namespace
+
+TEST(AdminWorkerRegression, MalformedFrameIsTheMalformedAlternativeWithItsReasonRegression) {
+    DefineTopicMsg d; d.session = 3; d.corr = 31; d.name = "p"; d.blob = {1};
+    AlterTopicMsg a; a.session = 3; a.corr = 32; a.topicName = "p"; a.opsBlob = {1, 2};
+    CreateViewMsg cv; cv.session = 3; cv.corr = 33; cv.viewName = "v"; cv.keyField = "id"; cv.planBlob = {7};
+    DropTopicMsg dt; dt.session = 3; dt.corr = 34; dt.name = "p";
+    DropViewMsg dv; dv.session = 3; dv.corr = 35; dv.name = "v";
+    AlterViewMsg av; av.session = 3; av.corr = 36; av.name = "v"; av.keyField = "id"; av.planBlob = {8};
+    AlterTopicConfigMsg ac; ac.session = 3; ac.corr = 37; ac.name = "p";
+    ac.changes = {{rc::ConfigKey::RetentionBytes, 10}};
+    expectMalformedAlternative(d, &decodeDefineTopic, kTidDefineTopic);
+    expectMalformedAlternative(a, &decodeAlterTopic, kTidAlterTopic);
+    expectMalformedAlternative(cv, &decodeCreateView, kTidCreateView);
+    expectMalformedAlternative(dt, &decodeDropTopic, kTidDropTopic);
+    expectMalformedAlternative(dv, &decodeDropView, kTidDropView);
+    expectMalformedAlternative(av, &decodeAlterView, kTidAlterView);
+    expectMalformedAlternative(ac, &decodeAlterTopicConfig, kTidAlterTopicConfig);
+}
+
 // A malformed request is answered (InvalidSchema / InvalidRequest), never dropped.
 TEST(AdminWorkerRegression, MalformedRingRequestIsAnsweredNeverDroppedRegression) {
     CatalogDdlRig rig("aw_malformed_ring", 1);
     rig.becomeServingLeader();
-    DefineTopicMsg m; m.session = rig.sessionId(); m.corr = rig.nextCorr(); m.malformed = true;
-    m.meta.requestId = rig.freshRequestId();
-    EXPECT_EQ(rig.submitRaw(DdlRequest{std::move(m)}).code, 23);
-    DropTopicMsg d; d.session = rig.sessionId(); d.corr = rig.nextCorr(); d.malformed = true;
-    d.meta.requestId = rig.freshRequestId();
-    EXPECT_EQ(rig.submitRaw(DdlRequest{std::move(d)}).code, 39);
+    EXPECT_EQ(rig.submitRaw(DdlRequest{MalformedDdl{kTidDefineTopic, rig.sessionId(), rig.nextCorr(), "x"}}).code, 23);
+    EXPECT_EQ(rig.submitRaw(DdlRequest{MalformedDdl{kTidDropTopic, rig.sessionId(), rig.nextCorr(), "x"}}).code, 39);
     EXPECT_TRUE(rig.recordedLog().empty());
 }
 

@@ -158,6 +158,7 @@ if(BUILD_TESTING)
         tests/node/ViewSnapshotIoAgentTest.cpp
         tests/node/WorkerViewSetTest.cpp
         tests/node/RuntimeTopicRecoveryTest.cpp
+        tests/support/LegacyRuntimeTopicRecovery.cpp
         tests/node/TopicNameTest.cpp
         tests/node/ViewReadinessRegressionTest.cpp
         tests/node/ViewRecoveryRegressionTest.cpp

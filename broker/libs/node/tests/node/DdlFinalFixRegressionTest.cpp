@@ -18,9 +18,13 @@
 #include <gtest/gtest.h>
 #include "support/CatalogDdlRig.h"
 #include <rune/node/AdminWorker.h>
+#include <rune/node/BrokerNode.h>
+#include <rune/gateway/TopicRegistry.h>
 #include <rune/node/DdlAnswerGate.h>
 
+#include <filesystem>
 #include <string>
+#include <unistd.h>
 #include <type_traits>
 #include <vector>
 
@@ -195,4 +199,41 @@ TEST(DdlAnswerGateRegression, HeldOkWhoseTopicServesInTimeIsSentAsOkRegression) 
     ASSERT_EQ(sent.size(), 1u);
     EXPECT_EQ(sent[0].frame, d) << "the original OK frame, byte for byte";
     EXPECT_EQ(overdue, 0);
+}
+
+// Task 9 fix round 1 (Minor 2): a held OK whose topic the catalog has since
+// DROPPED — a dedupe retry of a define whose topic was dropped, an AlterView whose
+// sink was replaced and retired — is released as its ORIGINAL OK at once, never
+// held to the in-doubt Internal.  A live topic that does not serve is still held.
+TEST(DdlAnswerGateRegression, HeldOkForADroppedTopicIsReleasedAsTheOriginalOkRegression) {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / ("rune_gate_dropped_" + std::to_string(::getpid()));
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    {
+        rune::gateway::TopicRegistry reg({}, dir.string());
+        TopicSpec t; t.name = "t"; t.partitionCount = 1; t.topicId = 0;
+        ASSERT_EQ(reg.createTopicAt(0, t), 0);
+        auto notPlaced = [](int32_t) { return false; };
+        auto serves = [&](int32_t id) { return BrokerNode::ddlGatedTopicServes(&reg, id, notPlaced); };
+        EXPECT_FALSE(serves(0)) << "a live topic not placed yet is held";
+
+        constexpr int64_t kHold = 1'000;
+        DdlAnswerGate gate(4096, kHold);
+        std::vector<Sent> sent;
+        auto send = [&](int64_t s, const uint8_t* f, std::size_t n) { sent.push_back({s, {f, f + n}}); };
+        int overdue = 0;
+        auto onOverdue = [&](int64_t, int32_t) { ++overdue; };
+        const auto d = defineOk(41, 0);
+        ASSERT_EQ(gate.offer(100, d.data(), d.size(), 0, serves), DdlAnswerGate::Offer::Held);
+
+        ASSERT_TRUE(reg.dropTopic(0));
+        EXPECT_TRUE(serves(0)) << "a tombstone is never waited on";
+        EXPECT_EQ(gate.release(10, serves, send, onOverdue), 1) << "released before the hold limit";
+        ASSERT_EQ(sent.size(), 1u);
+        EXPECT_EQ(sent[0].frame, d) << "the original OK, byte for byte";
+        EXPECT_EQ(overdue, 0);
+        EXPECT_TRUE(BrokerNode::ddlGatedTopicServes(nullptr, 0, notPlaced)) << "no registry: nothing to gate";
+    }
+    fs::remove_all(dir);
 }

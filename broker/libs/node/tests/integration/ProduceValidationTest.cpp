@@ -699,8 +699,14 @@ TEST(ProduceValidationRegression, SchemaUpdateEnqueuedOnlyByControlThreadRegress
     std::thread::id adminId, controlId;
     std::thread admin([&] {
         adminId = std::this_thread::get_id();
-        for (int t = 0; t < kTopics; ++t) agent.postSchemaUpdate(100 + t, /*version=*/1, blob);
-        while (agent.schemaBacklogForTest() != 0) agent.flushSchemaBacklogForTest();
+        // Catalog history Task 9: validators reach the control thread as the
+        // applier's catalog effects (the production sink's postCatalog_ path).
+        for (int t = 0; t < kTopics; ++t) {
+            std::vector<uint8_t> frame(rune::node::schemaUpdateWireLen(blob.size()));
+            rune::node::writeSchemaUpdate(frame.data(), 100 + t, /*version=*/1, blob);
+            agent.postCatalogFrameForTest(rune::node::kA2cSchemaUpdate, frame);
+        }
+        while (agent.catalogBacklogForTest() != 0) agent.flushCatalogBacklogForTest();
     });
     std::thread control([&] {
         controlId = std::this_thread::get_id();

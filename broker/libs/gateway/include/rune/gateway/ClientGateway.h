@@ -1112,6 +1112,11 @@ public:
     void applyCreateViewForTest(const uint8_t* buf, std::size_t len) {
         handleCreateView(buf, len);
     }
+    /// Catalog history Task 9 fix round 1 (Minor 1): a topic a consumer group may be
+    /// assigned — served here and, a catalog topic, PLACED (its committed routing
+    /// image names a leader for every partition; C1 generalized, spec §5.4).
+    /// Control thread; cold (a rebalance).
+    [[nodiscard]] bool topicAssignable(int32_t topicId) const noexcept;
     // Catalog history Task 9: any DDL frame through the real dispatch path.
     void applyDdlFrameForTest(const uint8_t* buf, std::size_t len) {
         const auto h = rune::protocol::client::MessageHeader::decode(buf, len);

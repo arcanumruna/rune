@@ -104,7 +104,10 @@ coord::TopicPartitionCounts GroupCoordinationService::buildTopicPartitionCounts(
     const int32_t n = topics_->topicCount();
     for (int32_t tid = 0; tid < n; ++tid) {
         const rune::node::TopicSpec* spec = topics_->topic(tid);
-        if (spec) {
+        // C1 (catalog history Task 9 fix round 1): a catalog topic applied but not
+        // PLACED yet is not assignable (the gateway would refuse its partitions
+        // NotPlaced) — it joins the next rebalance once placed.
+        if (spec && (gateway_ == nullptr || gateway_->topicAssignable(tid))) {
             counts[spec->name] = spec->partitionCount;
         }
     }

@@ -446,7 +446,6 @@ public:
 
         // 4b. F3 round 6, item 3: retry SchemaUpdates the admin→control ring
         //     could not take (full) — retry-on-full, never a drop.
-        if (!schemaBacklog_.empty()) [[unlikely]] work += flushSchemaBacklog_();
         if (!egressBacklog_.empty()) [[unlikely]] work += flushEgressBacklog_();       // no-hang R2 / fix round 2
         // Catalog history Task 7: the CatalogApplier's effects that found the ring full.
         if (!catalogBacklog_.empty()) [[unlikely]] work += flushCatalogBacklog_();
@@ -483,29 +482,6 @@ public:
     /// ([errno:i32][dir]) and kA2cSchemaUpdate ([topicId:i32][version:u16][blob]).
     OneToOneByteRing& failureRing() noexcept { return failureRing_; }
 
-    /// F3 round 6, item 3 — ADMIN thread only.  The admin thread must NEVER enqueue into a
-    /// worker's SPSC ingress ring (the control thread is its single producer):
-    /// post the update on the admin→control ring; the control thread fans it
-    /// out (SchemaFanout).  Ring full → admin-owned backlog, retried every
-    /// doWork.  A descriptor that can never fit the ring is refused loudly.
-    /// Task 12: `version` is the schema version `blob` was materialized as of
-    /// (the caller passes RegistryEntry.descriptor/version, never the raw
-    /// evolving descriptorBlob).
-    void postSchemaUpdate(int32_t topicId, uint16_t version, const std::vector<uint8_t>& blob) {
-        // Unreachable by construction (static_assert in AdminChannels.h: every
-        // descriptor the request ring can deliver fits one SchemaUpdate); kept
-        // as a loud backstop rather than a silent tryClaim throw.
-        if (schemaUpdateWireLen(blob.size()) > static_cast<std::size_t>(failureRing_.maxMsgLength()))
-            [[unlikely]] {
-            spdlog::error("AdminWorkerAgent: SchemaUpdate for topicId={} version={} ({} B descriptor) "
-                          "exceeds the admin→control ring max message ({} B); validator "
-                          "NOT pushed", topicId, version, blob.size(), failureRing_.maxMsgLength());
-            return;
-        }
-        if (!schemaBacklog_.empty() || !encodeSchemaUpdate(failureRing_, topicId, version, blob))
-            schemaBacklog_.push_back(SchemaUpdateMsg{topicId, version, blob});   // keep FIFO order
-    }
-    [[nodiscard]] std::size_t schemaBacklogForTest() const noexcept { return schemaBacklog_.size(); }
 
     /// No-hang wave (R2) / fix round 2 — ADMIN thread only (the deps.respond*
     /// callbacks).  Post one DDL response frame for `session` on the
@@ -603,7 +579,6 @@ public:
     [[nodiscard]] bool egressBacklogEmpty() const noexcept { return egressBacklog_.empty(); }
     [[nodiscard]] std::size_t egressBacklogForTest() const noexcept { return egressBacklog_.count(); }
     int flushEgressBacklogForTest() { return flushEgressBacklog_(); }
-    int flushSchemaBacklogForTest() { return flushSchemaBacklog_(); }
 
     // -----------------------------------------------------------------------
     // Producer-side accessors — the gateway/control thread enqueues here.
@@ -679,12 +654,10 @@ private:
         m.sourceAddress.assign(v.sourceAddress);
         m.sessionId       = v.sessionId;
         m.requestId       = v.requestId;
-        m.hasReplayedFrom = v.hasReplayedFrom;
-        if (v.hasReplayedFrom) {
-            m.replayedClusterId.assign(v.replayedClusterId);
-            m.replayedOffset = v.replayedOffset;
-            m.replayedPrincipal.assign(v.replayedPrincipal);
-        }
+        if (v.replayedFrom)
+            m.replayedFrom = rune::catalog::ReplayedFrom{std::string(v.replayedFrom->clusterId),
+                                                         v.replayedFrom->offset,
+                                                         std::string(v.replayedFrom->principal)};
         return m;
     }
     /// Encode a DDL on the request ring: TooLarge when it can never fit one ring
@@ -764,7 +737,6 @@ private:
     rune::consensus::ControlRing<4096> testTaskRing_;   // test threads → admin (test-only)
     uint64_t         badRoleFrames_ = 0;
     bool             storageFailureSignalled_ = false;
-    std::vector<SchemaUpdateMsg> schemaBacklog_;   // admin-thread-owned (ring-full retry)
     uint64_t         badRequestFrames_ = 0;        // request-ring frames of an unknown type
     // Fix round 2: preallocated, bounded (was an unbounded vector<vector> with
     // O(n) front erase).  4x the ring: one tick's answers fit by construction.
@@ -979,16 +951,6 @@ private:
         return sent;
     }
 
-    int flushSchemaBacklog_() {
-        std::size_t sent = 0;
-        while (sent < schemaBacklog_.size() &&
-               encodeSchemaUpdate(failureRing_, schemaBacklog_[sent].topicId,
-                                  schemaBacklog_[sent].version, schemaBacklog_[sent].blob))
-            ++sent;
-        schemaBacklog_.erase(schemaBacklog_.begin(),
-                             schemaBacklog_.begin() + static_cast<std::ptrdiff_t>(sent));
-        return static_cast<int>(sent);
-    }
 
 };
 
@@ -997,6 +959,18 @@ private:
 // ---------------------------------------------------------------------------
 class BrokerNode {
 public:
+    /// Task 9 fix round 1 (Minor 2): the DdlAnswerGate's "does the gated topic serve"
+    /// — a topic the catalog has since DROPPED (a dedupe retry of a define whose topic
+    /// was dropped, an AlterView whose sink was since replaced and retired) is a
+    /// tombstone: its original OK is released at once, never held to the in-doubt
+    /// Internal.  Otherwise the topic must serve (`catalogServes`: built + placed).
+    template <class CatalogServes>
+    [[nodiscard]] static bool ddlGatedTopicServes(const rune::gateway::TopicRegistry* registry, int32_t topicId,
+                                                  CatalogServes&& catalogServes) noexcept {
+        if (registry == nullptr) return true;
+        if (registry->state(topicId) == rune::gateway::TopicRegistry::TopicState::Dropped) return true;
+        return catalogServes(topicId);
+    }
     explicit BrokerNode(NodeConfig config);
     ~BrokerNode();
 

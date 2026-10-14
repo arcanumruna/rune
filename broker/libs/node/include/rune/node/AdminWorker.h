@@ -115,9 +115,8 @@ struct CatalogLeaderCatchingUp { int32_t epoch = 0; };
 struct CatalogLeaderServing    { int32_t epoch = 0; };
 using CatalogRole = std::variant<CatalogFollower, CatalogLeaderCatchingUp, CatalogLeaderServing>;
 
-/// One queued DDL: exactly one request message (the alternative IS the kind).
-using DdlRequest = std::variant<DefineTopicMsg, AlterTopicMsg, CreateViewMsg, DropTopicMsg, DropViewMsg,
-                                AlterViewMsg, AlterTopicConfigMsg>;
+// DdlRequest (one queued DDL: one request message, or a MalformedDdl) lives in
+// AdminChannels.h — its decoders produce it.
 
 /// A DDL the leader refuses: nothing is appended; answered at once in the request's
 /// own response type (or ErrorResponse / DdlResponse when it carries a detail).
@@ -287,20 +286,31 @@ private:
     /// Encode + append `e` (key = objectId LE) — false: answered already.
     bool appendEvent_(const DdlRequest& req, rune::catalog::CatalogEvent e, int64_t nowNs);
 
-    // Answers — every exit of a STARTED DDL goes through answer_ (one counter).
+    // Answers — every exit of a STARTED DDL goes through answer_(req, Response),
+    // the ONE place answeredCount() moves; respond_ only encodes (a queue-overflow
+    // refusal, never started, calls it directly).
+    struct Response {
+        uint16_t         code            = 0;
+        std::string_view detail;
+        int32_t          topicId         = -1;
+        uint16_t         version         = 0;
+        uint64_t         objectId        = 0;
+        uint32_t         newVersion      = 0;
+        int32_t          gateTopicId     = -1;
+        uint64_t         viewFingerprint = 0;
+    };
+    void answer_(const DdlRequest& req, const Response& r);
     void answer_(const DdlRequest& req, uint16_t code, std::string_view detail = {}, int32_t topicId = -1,
                  uint16_t version = 0);
     void answerRejection_(const DdlRequest& req, const DdlRejection& r);
     void answerOk_(const DdlRequest& req, const rune::catalog::RequestRecord& r);
-    void respond_(const DdlRequest& req, uint16_t code, std::string_view detail, int32_t topicId,
-                  uint16_t version, uint64_t objectId, uint32_t newVersion, int32_t gateTopicId,
-                  uint64_t viewFingerprint);
+    void respond_(const DdlRequest& req, const Response& r);
     /// The RequestRecord of a requestId-less DDL (F28): from the applier's last
     /// applied event, which must be the in-flight one.
     [[nodiscard]] std::optional<rune::catalog::RequestRecord> recordOfLastApplied_(int64_t offset) const;
     /// A view answer's output fingerprint (the view at `r`'s version; else read
-    /// from the event in the log).
-    [[nodiscard]] uint64_t viewOutputFingerprint_(const rune::catalog::RequestRecord& r) const;
+    /// from the event in the log).  nullopt: it cannot be recovered (answered Internal).
+    [[nodiscard]] std::optional<uint64_t> viewOutputFingerprint_(const rune::catalog::RequestRecord& r) const;
 
     SchemaRegistry&                       reg_;
     rune::replication::PartitionReplica*  replica_;          // retired __topic_schemas (role only)

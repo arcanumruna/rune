@@ -319,8 +319,7 @@ TEST_F(DdlMalformedRequestRegression, CreateViewWithUnknownPersistenceByteIsInva
 }
 
 TEST_F(DdlMalformedRequestRegression, CreateViewMarkedMalformedIsInvalidSchema) {
-    CreateViewMsg m; m.malformed = true; m.viewName = "v";
-    const int64_t c = h.submitRawView(std::move(m));
+    const int64_t c = h.submitRawMalformed(kTidCreateView, "an unknown persistence byte");
     h.settle();
     expectAnsweredUntouched(c, kInvalidSchema);
 }

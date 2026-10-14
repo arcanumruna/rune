@@ -532,8 +532,8 @@ TEST_F(CreateViewRegression, PersistedViewOverTransientSourceIsRejectedRegressio
 }
 
 // Final review M5: an unknown persistence byte on the CreateView ring frame is
-// never cast; the decode marks the message malformed and the worker answers
-// InvalidSchema (23) with the frame's session/corr.
+// never cast; the decode yields the MalformedDdl alternative (with its reason)
+// and the worker answers InvalidSchema (23) with the frame's session/corr.
 TEST_F(CreateViewRegression, RingDecodeRejectsUnknownPersistenceByteRegression) {
     CreateViewMsg ok; ok.session = 1; ok.corr = 71; ok.persistence = 1; ok.viewName = "v"; ok.keyField = "id";
     OneToOneByteRing ring{kAdminRequestRingBytes};
@@ -544,26 +544,30 @@ TEST_F(CreateViewRegression, RingDecodeRejectsUnknownPersistenceByteRegression) 
         raw.assign(p, p + len);
     }, 1);
     ASSERT_FALSE(raw.empty());
-    EXPECT_FALSE(decodeCreateView(raw.data(), raw.size()).malformed) << "a known mode is not flagged";
+    EXPECT_TRUE(std::holds_alternative<CreateViewMsg>(decodeCreateView(raw.data(), raw.size())))
+        << "a known mode is not malformed";
     raw[16] = 2;           // persistence: one past Transient
-    const CreateViewMsg cv = decodeCreateView(raw.data(), raw.size());
-    EXPECT_TRUE(cv.malformed);
-    EXPECT_EQ(cv.session, 1);
-    EXPECT_EQ(cv.corr, 71);
+    DdlRequest req = decodeCreateView(raw.data(), raw.size());
+    const auto* bad = std::get_if<MalformedDdl>(&req);
+    ASSERT_NE(bad, nullptr);
+    EXPECT_EQ(bad->templateId, kTidCreateView);
+    EXPECT_EQ(bad->reason, "an unknown persistence byte");
+    EXPECT_EQ(bad->session, 1);
+    EXPECT_EQ(bad->corr, 71);
 
-    driveCreateView(cv);
+    adminWorker_->submit(std::move(req));
+    pump_();
     EXPECT_EQ(lastViewError_, 23u);
     EXPECT_EQ(lastViewTopicId_, -1);
 }
 
 // No-hang wave (R1): a DIRECTLY submitted CreateViewMsg (not via the ring
-// decode, so `malformed` is false) with an unknown persistence byte is
+// decode, so never the MalformedDdl alternative) with an unknown persistence byte is
 // rejected InvalidSchema — it used to pass as "not 0" (transient-like) and be
 // recorded as 2.
 TEST_F(CreateViewRegression, DirectCreateViewWithUnknownPersistenceIsInvalidSchemaRegression) {
     CreateViewMsg cv;
     cv.session = 1; cv.corr = 72; cv.persistence = 2; cv.viewName = "v2"; cv.keyField = "id";
-    ASSERT_FALSE(cv.malformed);
     const uint64_t eventsBefore = events();
     driveCreateView(cv);
     EXPECT_EQ(lastViewError_, 23u);

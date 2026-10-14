@@ -161,7 +161,31 @@ TEST(TopicServabilityRegression, AppliedButNotPlacedTopicRefusesProduceRetriably
     const int64_t c = r.produce(r.runtimeId);
     ASSERT_TRUE(r.codeOf(c).has_value()) << "answered, never silent";
     EXPECT_EQ(*r.codeOf(c), kNotLeader) << "retriable";
-    EXPECT_EQ(r.registry->log(r.runtimeId, 0)->logEndOffset(), 0) << "nothing appended";
+    rune::storage::Log* const log = r.registry->log(r.runtimeId, 0);
+    ASSERT_NE(log, nullptr);
+    EXPECT_EQ(log->logEndOffset(), 0) << "nothing appended";
+    // Fix round 1 (Minor 4): the refusal is the DATA PLANE's placement gate, not a
+    // missing log — the very log the produce would have written exists, and the
+    // same produce once placed lands in it (0 -> 1).
+    EXPECT_FALSE(r.gw.topicAssignable(r.runtimeId)) << "the gateway's gate: not placed";
+    r.place();
+    const int64_t ok = r.produce(r.runtimeId);
+    ASSERT_TRUE(r.codeOf(ok).has_value());
+    EXPECT_EQ(*r.codeOf(ok), 0);
+    EXPECT_EQ(r.registry->log(r.runtimeId, 0), log) << "the same log";
+    EXPECT_EQ(log->logEndOffset(), 1) << "only the placed produce appended";
+}
+
+// Fix round 1 (Minor 1): topicAssignable is the gate group rebalances assign by —
+// applied-but-not-placed is not assignable (its partitions would be refused
+// NotPlaced); placed and static topics are; an unknown id is not.
+TEST(TopicServabilityRegression, OnlyPlacedOrStaticTopicsAreAssignableRegression) {
+    Rig r;
+    EXPECT_TRUE(r.gw.topicAssignable(0)) << "a static topic";
+    EXPECT_FALSE(r.gw.topicAssignable(r.runtimeId)) << "applied, not placed";
+    EXPECT_FALSE(r.gw.topicAssignable(99)) << "unknown";
+    r.place();
+    EXPECT_TRUE(r.gw.topicAssignable(r.runtimeId)) << "placed";
 }
 
 TEST(TopicServabilityRegression, AppliedButNotPlacedTopicRefusesSubscribeRetriablyRegression) {
