@@ -75,7 +75,8 @@ void CatalogReadServer::subscribe(int64_t session, int64_t corr, int64_t fromOff
             owe_(OwedError{session, corr, kInternal, OwedKind::SubscribeAnswer, 0});
         return;
     }
-    noteCommittedFloor(catalog_.highWatermark());
+    (void)checkTruncation_();
+    raiseFloor_();
     const int64_t hw = servedHw_;   // C1: never a HW that regressed with a leader change
     int64_t next = 0;
     if (fromOffset == kFromEarliest) next = 0;
@@ -193,6 +194,43 @@ int CatalogReadServer::flushOwed_() {
     return static_cast<int>(sent);
 }
 
+// The floor rises only from the replica's committed HW (never the applier's
+// applied offset: after a truncation that would lift it back over the cut).
+void CatalogReadServer::raiseFloor_() noexcept {
+    const int64_t hw = catalog_.highWatermark();
+    if (hw > servedHw_) servedHw_ = hw;
+    if (floorEpoch_ < 0) floorEpoch_ = catalog_.epoch();
+}
+
+// N2: the replica's log generation catches a truncate-and-regrow inside one
+// replica pass (the LEO alone would be back above the floor); the LEO check is
+// the backstop for a log cut under the replica.  Once per truncation.
+bool CatalogReadServer::checkTruncation_() {
+    int64_t cut = INT64_MAX;
+    const uint64_t gen = catalog_.logGeneration();
+    if (gen != seenLogGen_) {
+        // More than one change since the last look: an earlier cut may have been
+        // lower than the last one recorded — assume the whole history changed.
+        cut = gen == seenLogGen_ + 1 ? catalog_.lastTruncationOffset() : 0;
+        seenLogGen_ = gen;
+    }
+    cut = std::min(cut, catalog_.logEndOffset());
+    if (cut >= servedHw_) return false;   // only uncommitted bytes changed (the normal follower case)
+    spdlog::critical("CatalogReadServer: the __catalog log was cut to {} — below the committed offset {} already "
+                     "served (an unclean / deficient election upstream) — ending every catalog subscription once "
+                     "(NotLeader: resubscribe); the floor restarts at the new committed history (epoch {})",
+                     cut, servedHw_, catalog_.epoch());
+    for (std::size_t i = 0; i < subs_.size(); ++i) {
+        if (std::holds_alternative<Ending>(subs_[i].phase)) continue;
+        ++truncationEnds_;
+        end_(i, kNotLeader, "the log was truncated below a served high watermark", cut);
+    }
+    std::erase_if(subs_, [](const Sub& x) { return std::holds_alternative<Ending>(x.phase); });
+    servedHw_   = std::min(catalog_.highWatermark(), cut);
+    floorEpoch_ = catalog_.epoch();
+    return true;
+}
+
 void CatalogReadServer::owe_(const OwedError& e) {
     if (owed_.size() >= owedCapacity_) [[unlikely]] {
         // Unreachable by the bounds above (intakePaused gates the only open-ended
@@ -302,19 +340,8 @@ int CatalogReadServer::pump() {
     // election upstream can): every subscription ends EXPLICITLY with the
     // retriable NotLeader — the client resubscribes — never served past the
     // truncation, never rewound silently.
-    const int64_t leo = catalog_.logEndOffset();
-    if (leo < servedHw_) [[unlikely]] {
-        spdlog::critical("CatalogReadServer: the __catalog log ends at {} — below the committed offset {} already "
-                         "served — ending every catalog subscription (NotLeader: resubscribe)", leo, servedHw_);
-        for (std::size_t i = 0; i < subs_.size(); ++i) {
-            ++truncationEnds_;
-            end_(i, kNotLeader, "the log was truncated below a served high watermark", leo);
-        }
-        std::erase_if(subs_, [](const Sub& x) { return std::holds_alternative<Ending>(x.phase); });
-        servedHw_ = std::min(catalog_.highWatermark(), leo);
-        return work + 1;
-    }
-    noteCommittedFloor(catalog_.highWatermark());
+    if (checkTruncation_()) [[unlikely]] return work + 1;
+    raiseFloor_();
     const int64_t hw = servedHw_;
     // The marker claims "the whole committed prefix": only while this replica's
     // HW is current (a leader, or a follower its current leader answered) —
@@ -323,18 +350,17 @@ int CatalogReadServer::pump() {
 
     // M2: round-robin.
     const std::size_t n = subs_.size();
-    std::size_t first = rr_ % n;
-    bool blocked = false;
-    for (std::size_t k = 0; k < n && !blocked; ++k) {
+    const std::size_t first = rr_ % n;
+    for (std::size_t k = 0; k < n; ++k) {
         const std::size_t i = (first + k) % n;
         Sub& s = subs_[i];
         if (auto* a = std::get_if<Answering>(&s.phase)) {
-            if (!sendSubscribeResponse_(s.session, s.corr, kOk, s.subscriptionId)) { blocked = true; first = i; break; }
+            if (!sendSubscribeResponse_(s.session, s.corr, kOk, s.subscriptionId)) break;
             ++work;
             s.phase = Backlog{a->nextOffset};
         }
         if (auto* pp = std::get_if<PausePending>(&s.phase)) {
-            if (!sendPauseAck_(s.session, s.subscriptionId)) { blocked = true; first = i; break; }
+            if (!sendPauseAck_(s.session, s.subscriptionId)) break;
             ++work;
             s.phase = Paused{pp->resumeAs};
         }
@@ -345,8 +371,6 @@ int CatalogReadServer::pump() {
         const PushResult r = pushRange_(s, *next, hw);
         if (r.kind == Push::Blocked) {
             work += *next != before ? 1 : 0;
-            blocked = true;
-            first = i;
             break;
         }
         if (r.kind == Push::Ended) {
@@ -358,7 +382,7 @@ int CatalogReadServer::pump() {
         if (auto* bl = std::get_if<Backlog>(&s.phase); bl != nullptr && bl->nextOffset >= hw && hwCurrent) {
             // The caught-up marker (ruling 10): one empty Records at the HW — the
             // Backlog → Live transition is the "once".
-            if (!sendRecords_(s, bl->nextOffset, {})) { blocked = true; first = i; break; }
+            if (!sendRecords_(s, bl->nextOffset, {})) break;
             s.phase = Live{bl->nextOffset, bl->nextOffset};
             ++work;
         }

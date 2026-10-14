@@ -679,3 +679,77 @@ TEST(CatalogReadServerRegression, OwedAnswersPauseIntakeInsteadOfGrowingRegressi
     EXPECT_FALSE(r.server.intakePaused());
     for (int c = 0; c < refused; ++c) EXPECT_EQ(r.subscribeError(3, c), pc::ErrorCode::Internal) << c;
 }
+
+// Fix round 2 (re-review N1): a truncation below the served floor (unclean /
+// survivor election, deficient leader) ends the reads EXACTLY ONCE; the floor
+// restarts at the post-truncation committed HW, so a resubscribe is served from
+// the new history — never a NotLeader loop, never a byte above the current
+// committed HW (the new leader's appended-but-uncommitted tail).  RED: a floor
+// fed by a stale applied offset rose back to 6 every pass — every resubscribe
+// ended again, and the new lineage's offsets 4.. were served uncommitted.
+TEST(CatalogReadServerRegression, TruncationEndsReadsOnceAndTheResubscribeServesOnlyTheNewCommittedHistoryRegression) {
+    ReadRig r("rd_n1", /*asFollower=*/true);
+    r.followerAppend(6);
+    r.followerSetHighWatermark(6);
+    r.server.subscribe(7, 1, -2);
+    r.server.pump();
+    ASSERT_EQ(r.markers(7), (std::vector<int64_t>{6}));
+    r.replica().truncateLogForTest(3);                 // a deficient leader's lineage ends at 3
+    ASSERT_EQ(r.replica().logEndOffset(), 3);
+    r.server.pump();
+    ASSERT_EQ(r.server.subscriptions(), 0u);
+    ASSERT_EQ(r.errors(7).size(), 1u);
+    EXPECT_EQ(r.errors(7)[0].code, static_cast<int16_t>(pc::ErrorCode::NotLeader));
+    // A resubscribe right away (the log still ends at 3): served, never ended again.
+    r.server.subscribe(7, 3, -2);
+    for (int i = 0; i < 10; ++i) r.server.pump();
+    ASSERT_TRUE(r.subscribeAnswered(7, 3));
+    ASSERT_EQ(r.errors(7).size(), 1u) << "no NotLeader loop on a quiet catalog";
+    r.server.unsubscribe(7, r.subscriptionIdOf(7, 3));
+    // The new leader appends its own 3..8; only up to 4 is committed.
+    r.followerAppendWithHighWatermark(3, /*hw=*/4);   // the source holds 9: the follower gets 3..8
+    ASSERT_EQ(r.replica().logEndOffset(), 9);
+    ASSERT_EQ(r.replica().highWatermark(), 4);
+    r.server.subscribe(7, 2, -2);                      // the client resubscribes
+    for (int i = 0; i < 20; ++i) r.server.pump();
+    ASSERT_TRUE(r.subscribeAnswered(7, 2));
+    EXPECT_EQ(r.errors(7).size(), 1u) << "ended exactly once — no NotLeader loop";
+    EXPECT_EQ(r.server.subscriptions(), 1u);
+    std::vector<int64_t> second;
+    for (const auto& rec : r.records(7))
+        if (rec.correlationId == 2 && !rec.recordBatch.empty()) {
+            std::size_t pos = 0;
+            while (pos + 61 <= rec.recordBatch.size()) {
+                rune::protocol::RecordBatchReader rd(rec.recordBatch.data() + pos, rec.recordBatch.size() - pos);
+                for (int32_t k = 0; k <= rd.lastOffsetDelta(); ++k) second.push_back(rd.baseOffset() + k);
+                pos += static_cast<std::size_t>(rd.totalLength());
+            }
+        }
+    EXPECT_EQ(second, range(0, 4)) << "the new committed history, nothing above its HW";
+    EXPECT_EQ(r.markers(7).back(), 4) << "caught up at the new committed HW";
+    EXPECT_EQ(r.server.servedHighWatermark(), 4);
+    EXPECT_EQ(r.server.truncationEnds(), 1u);
+}
+
+// Fix round 2 (re-review N2): a truncation below the floor that REGROWS past it
+// before the read server's next pass (the LEO alone looks fine) still ends the
+// reads once — the replica's log generation + its cut point tell.  RED: the
+// subscriptions kept their old-lineage prefix without being told.
+TEST(CatalogReadServerRegression, TruncateAndRegrowWithinOnePassStillEndsTheReadsOnceRegression) {
+    ReadRig r("rd_n2", /*asFollower=*/true);
+    r.followerAppend(6);
+    r.followerSetHighWatermark(6);
+    r.server.subscribe(7, 1, -2);
+    r.server.pump();
+    ASSERT_EQ(r.markers(7), (std::vector<int64_t>{6}));
+    r.replica().truncateLogForTest(3);
+    r.followerAppendWithHighWatermark(3, /*hw=*/4);    // the new leader's 3..8, before the next pass
+    ASSERT_GE(r.replica().logEndOffset(), 6) << "precondition: the LEO is back above the floor";
+    r.server.pump();
+    EXPECT_EQ(r.server.subscriptions(), 0u);
+    ASSERT_EQ(r.errors(7).size(), 1u);
+    EXPECT_EQ(r.errors(7)[0].code, static_cast<int16_t>(pc::ErrorCode::NotLeader));
+    EXPECT_EQ(r.server.servedHighWatermark(), 3) << "restarted at the cut (the new committed HW is not above it yet)";
+    for (int i = 0; i < 5; ++i) r.server.pump();
+    EXPECT_EQ(r.server.truncationEnds(), 1u) << "once";
+}

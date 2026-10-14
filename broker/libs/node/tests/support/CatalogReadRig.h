@@ -79,6 +79,11 @@ public:
     }
     /// Follower: `n` more records replicated from the source leader; the HW the
     /// follower learns stays the one last set (followerSetHighWatermark).
+    /// Follower: `n` more records whose leader reports HW `hw` (a new lineage after a truncation).
+    void followerAppendWithHighWatermark(int n, int64_t hw) {
+        followerHw_ = hw;
+        followerAppend(n);
+    }
     void followerAppend(int n) {
         for (int i = 0; i < n; ++i) appendOne_(*source_);
         (void)source_->doWork(now_ += 1'000'000);

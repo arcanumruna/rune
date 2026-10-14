@@ -148,13 +148,15 @@ public:
     /// control → admin: the session's egress has room again — continue from the cursor.
     void onResume(int64_t session, int64_t subscriptionId);
 
-    /// Fix round 1 (C1): the committed prefix this server has served from —
-    /// MONOTONIC (max of every HW the replica reported and `noteCommittedFloor`):
-    /// a follower's HW reads 0 after every leader change until the new leader
-    /// answers it, which must never rewind a clamp or fake a caught-up marker.
+    /// Fix round 1 (C1) / round 2 (N1): the committed prefix this server serves
+    /// from — fed ONLY by the replica's committed HW, monotonic within one log
+    /// history: a follower's HW reads 0 after every leader change until the new
+    /// leader answers it, which must never rewind a clamp or fake a marker.  A
+    /// truncation below it (unclean / survivor election, deficient leader) ends
+    /// every read once and restarts it at the post-truncation committed HW,
+    /// tagged with the epoch it restarted in (floorEpoch()).
     [[nodiscard]] int64_t servedHighWatermark() const noexcept { return servedHw_; }
-    /// A known-committed offset from elsewhere (the applier: applied ⇒ committed).
-    void noteCommittedFloor(int64_t committed) noexcept { if (committed > servedHw_) servedHw_ = committed; }
+    [[nodiscard]] int32_t floorEpoch() const noexcept { return floorEpoch_; }
     /// Fix round 1 (M3): while true the admin takes no catalog request off the
     /// request ring (the gateway answers the retriable NotLeader) — the owed
     /// answers stay within their preallocated capacity.
@@ -195,6 +197,10 @@ private:
     bool sendReliable_(int64_t session, std::size_t n);
     void end_(std::size_t index, int16_t code, const char* why, int64_t at);
     void owe_(const OwedError& e);
+    /// N1 / N2: a truncation below the floor since the last pass → end every
+    /// read once, restart the floor.  true = it happened (the pass ends).
+    bool checkTruncation_();
+    void raiseFloor_() noexcept;
     static constexpr std::size_t kIntakeSlack = 32;   // > one request-ring drain (16)
     int  flushOwed_();
 
@@ -208,7 +214,9 @@ private:
     std::vector<uint8_t>                 readBuf_;    // kCatalogReadBufferBytes
     std::vector<uint8_t>                 frameBuf_;   // kCatalogReadMaxFrameBytes
     std::size_t                          owedCapacity_ = 0;
-    int64_t                              servedHw_ = 0;   // monotonic committed floor (C1)
+    int64_t                              servedHw_ = 0;   // the committed floor (C1, N1)
+    int32_t                              floorEpoch_ = -1;   // the replica epoch the floor (re)started in
+    uint64_t                             seenLogGen_ = 0;    // N2: the replica's log generation already checked
     std::size_t                          rr_ = 0;          // round-robin start (M2)
     uint64_t                             truncationEnds_ = 0;
     uint64_t                             refused_ = 0;

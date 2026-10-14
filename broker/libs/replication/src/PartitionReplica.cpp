@@ -513,6 +513,7 @@ void PartitionReplica::becomeFollower(Epoch leaderEpoch, NodeId leaderId)
     role_     = Role::Follower;
     leaderId_ = leaderId;
     followerHw_ = 0;
+    hwLearnedEpoch_ = -1;     // catalog Task 12 re-review F2: a new leader (even same epoch) must answer first
     followerSync_.reset();    // new leadership epoch → bootstrap fetch state afresh
     wedgedAtOffset_ = -1;     // F18: a new leadership may serve it (re-evaluated)
     stampEpochOnLog_(-1);
