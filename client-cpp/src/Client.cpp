@@ -39,6 +39,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 
 namespace rune::client {
@@ -138,6 +139,7 @@ Client::Client(ClientConfig cfg)
     : cfg_(std::move(cfg))
     , agent_(toAgentConfig(cfg_))
     , partitionRouter_(metadataCache_)
+    , catalogReader_(std::make_unique<CatalogReader>(*this))   // eagerly, on the owning thread (I2)
 {
     // F8c review n1: releaseCq_ is noexcept and may defer a release; the list
     // never holds more than one entry per registry slot, so reserve it once
@@ -1952,7 +1954,10 @@ void Client::andWait_(const char* what, std::chrono::nanoseconds timeout, uint32
 // ---------------------------------------------------------------------------
 
 CatalogReader& Client::catalogReader() {
-    if (!catalogReader_) catalogReader_ = std::make_unique<CatalogReader>(*this);
+    // Hard rule 1: the reader is built in the constructor and the pointer never changes
+    // (const) — no lazy creation, no first-caller race.  Its owner thread is the
+    // constructing thread; any other thread's call throws std::logic_error.
+    static_assert(std::is_const_v<decltype(catalogReader_)>, "the catalog reader must be created eagerly and never reassigned");
     return *catalogReader_;
 }
 

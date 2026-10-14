@@ -528,70 +528,84 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv, int64_t currentSessi
         return;
     }
 
-    rune::protocol::RecordBatchReader reader(rb.data(), rb.size());
-    if (!reader.ensureValid()) {
-        return; // Malformed batch — drop (never crash).
-    }
-
-    // E2 final fix wave (I1): a moved subscription resumes at its position,
-    // but the new leader may push from BELOW it — a batch straddling it
-    // (brokers push whole batches), or whole batches below it while the new
-    // leader's HW still lags the old one's (the gateway clamps the resume
-    // offset to its HW).  Every record below the position was delivered
-    // before the move: never twice.  The floor is STICKY until a record at or
-    // above it is delivered (a re-armed subscription never meets a restarted
-    // log: a restart ends the session, so the move fails explicitly).  No
-    // allocation; one predicted compare per batch while no floor is set.
-    int64_t dropBelow = -1;
-    if (impl.resumeFloor >= 0) [[unlikely]] {
-        const int64_t last = reader.baseOffset() + static_cast<int64_t>(reader.lastOffsetDelta());
-        if (last < impl.resumeFloor) {   // wholly below: duplicates only
-            ++movedDuplicateBatchesDropped_;
-            return;
-        }
-        dropBelow        = impl.resumeFloor;   // this batch carries a record at/above it
-        impl.resumeFloor = -1;
-    }
-
+    // A frame carries ONE batch, or — from the catalog read server, which coalesces —
+    // SEVERAL whole batches back to back: decode every one (a batch after the first
+    // was silently dropped before: the catalog reader only healed it by re-reading).
     const int64_t before = impl.nextOffset;
     dispatching_ = &impl;
-    reader.forEach([&](std::string_view keyView,
-                       std::string_view valView,
-                       int64_t          absOffset,
-                       int64_t          timestamp)
-    {
-        // The handler may have unsubscribed this subscription (directly, on
-        // this thread): deliver nothing more of the batch.
-        if (!impl.active) return;
-        if (absOffset < dropBelow) [[unlikely]] return;   // delivered before the move
-
-        Record rec;
-        rec.offset    = absOffset;
-        rec.timestamp = timestamp;
-        rec.key   = std::span<const uint8_t>(
-            reinterpret_cast<const uint8_t*>(keyView.data()), keyView.size());
-        rec.value = std::span<const uint8_t>(
-            reinterpret_cast<const uint8_t*>(valView.data()), valView.size());
-
-        // Invoke the handler (duty thread; must not block). fix1 C1: this runs
-        // inside the noexcept ClientAgent::doWork chain — a throwing handler
-        // must never escape it.
-        try {
-            impl.handler(rec);
-        } catch (const std::exception& e) {
-            ++callbackExceptions_;
-            std::fprintf(stderr,
-                "rune-client: subscription record handler threw: %s (caught; the duty "
-                "cycle continues)\n", e.what());
-        } catch (...) {
-            ++callbackExceptions_;
-            std::fprintf(stderr,
-                "rune-client: subscription record handler threw a non-std::exception "
-                "(caught; the duty cycle continues)\n");
+    std::span<const uint8_t> rest(rb.data(), rb.size());
+    bool first = true;
+    while (!rest.empty() && impl.active) {
+        rune::protocol::RecordBatchReader reader(rest.data(), rest.size());
+        if (!reader.ensureValid()) {
+            if (first) { dispatching_ = nullptr; return; }   // Malformed batch — drop (never crash).
+            break;                                           // a malformed tail: what was decoded stands
         }
+        first = false;
+        const auto batchLen = static_cast<std::size_t>(reader.totalLength());
+        // E2 final fix wave (I1): a moved subscription resumes at its position,
+        // but the new leader may push from BELOW it — a batch straddling it
+        // (brokers push whole batches), or whole batches below it while the new
+        // leader's HW still lags the old one's (the gateway clamps the resume
+        // offset to its HW).  Every record below the position was delivered
+        // before the move: never twice.  The floor is STICKY until a record at or
+        // above it is delivered (a re-armed subscription never meets a restarted
+        // log: a restart ends the session, so the move fails explicitly).  No
+        // allocation; one predicted compare per batch while no floor is set.
+        int64_t dropBelow = -1;
+        bool skip = false;
+        if (impl.resumeFloor >= 0) [[unlikely]] {
+            const int64_t last = reader.baseOffset() + static_cast<int64_t>(reader.lastOffsetDelta());
+            if (last < impl.resumeFloor) {   // wholly below: duplicates only
+                ++movedDuplicateBatchesDropped_;
+                skip = true;
+            } else {
+                dropBelow        = impl.resumeFloor;   // this batch carries a record at/above it
+                impl.resumeFloor = -1;
+            }
+        }
+        if (!skip) {
+            reader.forEach([&](std::string_view keyView,
+                               std::string_view valView,
+                               int64_t          absOffset,
+                               int64_t          timestamp)
+            {
+                // The handler may have unsubscribed this subscription (directly, on
+                // this thread): deliver nothing more of the batch.
+                if (!impl.active) return;
+                if (absOffset < dropBelow) [[unlikely]] return;   // delivered before the move
 
-        impl.nextOffset = absOffset + 1;
-    });
+                Record rec;
+                rec.offset    = absOffset;
+                rec.timestamp = timestamp;
+                rec.key   = std::span<const uint8_t>(
+                    reinterpret_cast<const uint8_t*>(keyView.data()), keyView.size());
+                rec.value = std::span<const uint8_t>(
+                    reinterpret_cast<const uint8_t*>(valView.data()), valView.size());
+
+                // Invoke the handler (duty thread; must not block). fix1 C1: this runs
+                // inside the noexcept ClientAgent::doWork chain — a throwing handler
+                // must never escape it.
+                try {
+                    impl.handler(rec);
+                } catch (const std::exception& e) {
+                    ++callbackExceptions_;
+                    std::fprintf(stderr,
+                        "rune-client: subscription record handler threw: %s (caught; the duty "
+                        "cycle continues)\n", e.what());
+                } catch (...) {
+                    ++callbackExceptions_;
+                    std::fprintf(stderr,
+                        "rune-client: subscription record handler threw a non-std::exception "
+                        "(caught; the duty cycle continues)\n");
+                }
+
+                impl.nextOffset = absOffset + 1;
+            });
+        }
+        if (batchLen == 0 || batchLen >= rest.size()) break;
+        rest = rest.subspan(batchLen);
+    }
     dispatching_ = nullptr;
 
     if (!impl.active) {

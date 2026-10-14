@@ -832,12 +832,13 @@ public:
 
     // ---- Catalog history (Task 13, spec §7): reads of `__catalog` ----------------
     // Each call refreshes this Client's CatalogReader (catalogReader()): it reads
-    // the committed tail from the cache end (from 0 the first time) on the seed
-    // broker — any broker serves it — until the caught-up marker, replaying every
+    // the committed tail from the cache end minus one (the overlap event is
+    // verified; from 0 the first time) on the seed broker — any broker serves it — until the caught-up marker, replaying every
     // event with the shared verifying library, then answers from the cached,
     // replayed prefix with that library's history / stateAsOf / diff.  Blocking
-    // like the *AndWait sugar (the Invoker owner pumps doWork()); one app thread
-    // at a time (the reader's owner).  Never a hang: no marker before `timeout`
+    // like the *AndWait sugar (the Invoker owner pumps doWork()); callable ONLY
+    // from the Client's constructing thread (the reader's owner, bound in the
+    // constructor): any other thread gets std::logic_error.  Never a hang: no marker before `timeout`
     // is CatalogReadError::Kind::Timeout (a long-leaderless catalog withholds the
     // marker); a fingerprint / decode / gap failure is Kind::Replay naming its
     // offset (the verified prefix stays cached); a stale prefix (a truncation
@@ -852,8 +853,8 @@ public:
     CatalogResult<std::vector<rune::catalog::DiffEntry>> catalogDiff(const rune::catalog::AsOf& a,
                                                                      const rune::catalog::AsOf& b,
                                                                      std::chrono::milliseconds timeout);
-    /// The Client's own reader (created on first use; owned by the calling app
-    /// thread from then on) — e.g. for its non-blocking beginRefresh / pollRefresh.
+    /// The Client's own reader (built in the constructor; owned by the Client's
+    /// constructing thread) — e.g. for its non-blocking beginRefresh / pollRefresh.
     CatalogReader& catalogReader();
 
     /// Topics successfully defined through this Client (Task 9 CLI), in
@@ -1793,10 +1794,11 @@ private:
     int64_t lastUrgentMetadataNs_ = INT64_MIN;
     int     metadataResponses_    = 0;  // MetadataResponses applied (test hook)
 
-    // Catalog history (Task 13): created on first use by its owner app thread
+    // Catalog history (Task 13): built eagerly in the constructor, so its owner thread
+    // is the Client's constructing thread and there is no lazy-creation race
     // (never touched by the duty thread — its callbacks only write the reader's
-    // own ring).  The LAST member: destroyed first, after ~Client's close.
-    std::unique_ptr<CatalogReader> catalogReader_;
+    // own ring).  Declared late: destroyed early, after ~Client's close.
+    const std::unique_ptr<CatalogReader> catalogReader_;
     uint32_t testSkewDdlRequestIdAt_ = 0;   // F4 test seam: issuing thread only (testSkewNextDdlRequestIdAt)
 
     // Task 1.3: produce routing moved to the agent's flush→sendFn boundary
