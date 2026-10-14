@@ -255,3 +255,33 @@ TEST(RuneCliOfflineRegression, AlterDryRunPrintsAllOpKinds) {
     EXPECT_NE(o.find("SET_COMPATIBILITY"), std::string::npos) << "got: " << o;
     EXPECT_NE(o.find("FORWARD"), std::string::npos)          << "got: " << o;
 }
+
+// F8: `schema apply` takes exactly one statement; a second one is an explicit parse
+// error pointing at `rune ql -f`, never "apply the first and drop the rest".
+TEST(RuneCliOfflineRegression, SchemaApplyRefusesAMultiStatementFileRegression) {
+    fs::path f = fs::temp_directory_path()/"regression_apply_multi.rql";
+    { std::ofstream o(f);
+      o << "topic a { id int64 } partitions 1 key id;\ntopic b { id int64 } partitions 1 key id;\n"; }
+    std::ostringstream out, err;
+    int rc = rune::cli::run({"schema","apply", f.string(), "--dry-run"}, out, err);
+    EXPECT_NE(rc, 0);
+    EXPECT_NE(err.str().find("rune ql -f"), std::string::npos) << "got: " << err.str();
+    EXPECT_TRUE(out.str().empty()) << "nothing may be applied/printed; got: " << out.str();
+}
+
+// The new rune-ql statements are not `schema apply` statements (until Task 15's `rune ql`),
+// and a topic feature apply would drop (untyped / replicas / with) is refused, not ignored.
+TEST(RuneCliOfflineRegression, SchemaApplyRefusesStatementsItWouldDrop) {
+    for (const char* src : {"drop topic a;", "show history;", "diff catalog offset 0 to 1;",
+                            "alter topic a set retention.ms = 5;", "topic a partitions 1;",
+                            "topic a { id int64 } partitions 1 replicas 3 key id;",
+                            "topic a { id int64 } partitions 1 key id with (retention.ms = 5);"}) {
+        fs::path f = fs::temp_directory_path()/"regression_apply_unsupported.rql";
+        { std::ofstream o(f); o << src; }
+        std::ostringstream out, err;
+        int rc = rune::cli::run({"schema","apply", f.string(), "--dry-run"}, out, err);
+        EXPECT_NE(rc, 0) << src;
+        EXPECT_NE(err.str().find("use 'rune ql'"), std::string::npos) << src << " got: " << err.str();
+        EXPECT_TRUE(out.str().empty()) << src;
+    }
+}

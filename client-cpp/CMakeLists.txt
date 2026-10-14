@@ -192,7 +192,7 @@ set(RUNE_QL_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../rune-ql"
     CACHE PATH "Path to the rune-ql sibling repo")
 file(GLOB RUNE_QL_SRCS "${RUNE_QL_ROOT}/src/*.cpp")
 add_library(rune_ql STATIC ${RUNE_QL_SRCS})
-target_include_directories(rune_ql PUBLIC ${RUNE_QL_ROOT}/include)
+target_include_directories(rune_ql PUBLIC ${RUNE_QL_ROOT}/include ${RUNE_PROTOCOL_INCLUDE})
 target_link_libraries(rune_ql PUBLIC rune_codec)
 target_compile_features(rune_ql PUBLIC cxx_std_23)
 

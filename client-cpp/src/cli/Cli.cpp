@@ -26,6 +26,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <variant>
 #include <vector>
 
@@ -316,6 +317,27 @@ int cmdSchemaApply(const std::vector<std::string>& args,
         return 2;
     }
 
+    // Only 'topic' (typed, plain) and 'alter topic <ops>' are `schema apply` statements;
+    // every other alternative (and any topic feature apply would silently drop) is refused
+    // until `rune ql` (Task 15) runs them.
+    const std::string_view unsupported = std::visit([](const auto& st) -> std::string_view {
+        using T = std::decay_t<decltype(st)>;
+        if constexpr (std::is_same_v<T, rune::ql::TopicDef>) {
+            if (st.fields.empty())  return "an untyped topic";
+            if (st.replicas != 0)   return "'replicas'";
+            if (!st.with.empty())   return "'with (…)' settings";
+            return {};
+        } else if constexpr (std::is_same_v<T, rune::ql::AlterTopicDef>) {
+            return {};
+        } else {
+            return "this statement";
+        }
+    }, *result);
+    if (!unsupported.empty()) {
+        err << path << ": " << unsupported << " is not supported by 'schema apply' — use 'rune ql'\n";
+        return 2;
+    }
+
     const bool isAlter = std::holds_alternative<rune::ql::AlterTopicDef>(*result);
 
     // ── Dry run: emit descriptor/plan as text, no broker contact ──────────────
@@ -450,8 +472,8 @@ int cmdSchemaAlter(const std::vector<std::string>& args,
     }
 
     if (!std::holds_alternative<rune::ql::AlterTopicDef>(*result)) {
-        err << path << ": expected an 'alter topic' statement, got a 'topic' statement "
-               "(use `rune schema apply` to define a new topic)\n";
+        err << path << ": expected an 'alter topic <ops>' statement "
+               "(use `rune schema apply` to define a topic, `rune ql` for other statements)\n";
         return 2;
     }
     const auto& ad = std::get<rune::ql::AlterTopicDef>(*result);
