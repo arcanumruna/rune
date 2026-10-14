@@ -169,7 +169,19 @@ TopicRegistry::reserveTopicAt(int32_t topicId, const std::string& name)
 bool
 TopicRegistry::dropTopic(int32_t topicId)
 {
-    if (topicId < 0 || static_cast<std::size_t>(topicId) >= topics_.size()) return false;
+    if (topicId < 0) return false;
+    if (static_cast<std::size_t>(topicId) >= topics_.size()) {
+        // Task 16 (B3 / Task 8 N2): an id this broker never built — created and
+        // dropped before it ever saw the create (a boot from a catalog whose tail
+        // ids are all dropped, or a drop applied before its create).  It is SEEN
+        // now: a Dropped slot (ids below it are Gaps), never refilled.
+        fillGapsBelow_(static_cast<std::size_t>(topicId));
+        rune::node::TopicSpec spec;
+        spec.topicId = topicId;
+        topics_.emplace_back(std::in_place_type<Dropped>, Dropped{std::move(spec), {}});
+        ++catalogGeneration_;
+        return true;
+    }
     Slot& e = topics_[static_cast<std::size_t>(topicId)];
     if (std::holds_alternative<Dropped>(e)) return false;
     Live* l = live_(e);

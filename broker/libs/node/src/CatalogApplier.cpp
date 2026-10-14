@@ -77,6 +77,13 @@ cat::ApplyError localFailure(int64_t offset, cat::ApplyError::Code code, std::st
 
 } // namespace
 
+std::vector<int32_t> droppedTopicIds(const cat::CatalogState& s) {
+    std::vector<int32_t> out;
+    for (int32_t id = 0; id < s.nextTopicId(); ++id)
+        if (s.topicByTopicId(id) == nullptr && s.viewByViewTopicId(id) == nullptr) out.push_back(id);
+    return out;
+}
+
 CatalogApplier::CatalogApplier(std::string catalogDir, SchemaRegistry& schemas, ViewRegistry& views)
     : dir_(std::move(catalogDir)), schemas_(&schemas), views_(&views),
       st_(Applying{0}), phase_(AwaitingBoot{}), readBuf_(kCatalogReadChunk) {}
@@ -116,6 +123,15 @@ const CatalogEffects* CatalogApplier::sink_() const noexcept {
 
 // ─── replayLocal — the one boot replay of [0, checkpoint] ────────────────────
 int CatalogApplier::replayLocal(rune::replication::PartitionReplica& r, BootEffects boot) {
+    rune::storage::Log* log = r.log();
+    return replay_(log, log ? log->logEndOffset() : r.logEndOffset(), std::move(boot));
+}
+
+int CatalogApplier::replayLocal(rune::storage::Log& log, BootEffects boot) {
+    return replay_(&log, log.logEndOffset(), std::move(boot));
+}
+
+int CatalogApplier::replay_(rune::storage::Log* log, int64_t leo, BootEffects boot) {
     if (!std::holds_alternative<AwaitingBoot>(phase_)) {
         spdlog::error("CatalogApplier: replayLocal refused in phase {} — the boot prefix is applied exactly once "
                       "(a second replay would re-apply recorded request ids)", phaseName());
@@ -125,8 +141,6 @@ int CatalogApplier::replayLocal(rune::replication::PartitionReplica& r, BootEffe
 
     // Throws (refuse to start) on an unreadable / corrupt checkpoint.
     const std::optional<CatalogCheckpoint> ckpt = readCatalogCheckpoint(dir_);
-    const rune::storage::Log* log = r.log();
-    const int64_t leo = log ? log->logEndOffset() : r.logEndOffset();
     if (auto refusal = catalogCheckpointBeyondLog(ckpt, leo, dir_)) {
         spdlog::critical("CatalogApplier: {}", *refusal);
         throw std::runtime_error(*refusal);
@@ -136,7 +150,7 @@ int CatalogApplier::replayLocal(rune::replication::PartitionReplica& r, BootEffe
         return 0;
     }
 
-    const int applied = applyRange_(r, ckpt->appliedOffset + 1);
+    const int applied = applyRange_(log, ckpt->appliedOffset + 1);
     if (!halted() && nextOffset() != ckpt->appliedOffset + 1) {
         halt_(localFailure(nextOffset(), cat::ApplyError::Code::Precondition,
                            "boot replay stopped at offset " + std::to_string(nextOffset()) +
@@ -161,6 +175,24 @@ int CatalogApplier::replayLocal(rune::replication::PartitionReplica& r, BootEffe
     // The coalesced boot sink (I1): what was applied is served — halted or not.
     emitFinalState_();
     return applied;
+}
+
+// ─── postBootStash — the boot effects that need the workers (Task 16) ────────
+// The BROKER's boot sink collects the topics (it builds them before any builder
+// runs); what needs a running broker — the validators, the view sinks' plan gate,
+// the view installs, the metric and a halt — is posted from the applied state
+// once the workers exist.
+void CatalogApplier::postBootStash(const CatalogEffects& sink) const {
+    if (lastApplied_.offset >= 0) {
+        for (const cat::TopicObject* t : state_.topics())
+            if (t->schema && sink.schemaChanged) sink.schemaChanged(*t);
+        for (const cat::ViewObject* v : state_.views()) {
+            if (sink.sinkApplied) sink.sinkApplied(sinkSpecOf(*v));
+            if (sink.viewInstalled) sink.viewInstalled(*v);
+        }
+        if (sink.applied) sink.applied(lastApplied_.offset, state_.digest());
+    }
+    if (const Halted* h = std::get_if<Halted>(&st_); h != nullptr && sink.halted) sink.halted(h->error);
 }
 
 // ─── emitFinalState_ — the coalesced boot effects (fix round 1, I1) ──────────
@@ -228,13 +260,12 @@ int CatalogApplier::applyCommitted(rune::replication::PartitionReplica& r) {
     if (a == nullptr) return 0;   // halted: no further apply, ever
     const int64_t hw = r.highWatermark();
     if (a->nextOffset >= hw) return 0;   // idle: one compare, no allocation
-    return applyRange_(r, hw);
+    return applyRange_(r.log(), hw);
 }
 
 // ─── applyRange_ — read [nextOffset, bound) and apply record by record ───────
-int CatalogApplier::applyRange_(rune::replication::PartitionReplica& r, int64_t bound) {
+int CatalogApplier::applyRange_(rune::storage::Log* log, int64_t bound) {
     namespace st = rune::storage;
-    st::Log* log = r.log();
     if (log == nullptr) {
         halt_(localFailure(nextOffset(), cat::ApplyError::Code::Precondition,
                            "the __catalog replica has no disk log (the catalog is always disk-backed)"));

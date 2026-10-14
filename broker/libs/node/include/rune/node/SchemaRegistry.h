@@ -14,25 +14,10 @@
 
 namespace rune::node {
 
-inline constexpr int32_t  kSchemaTopicId        = -4;
-inline constexpr int32_t  kViewsTopicId         = -5;
-inline constexpr uint32_t RUNTIME_TOPIC_ID_BASE  = 0x40000000u;
-
-/// Wire record stored on the __topic_schemas internal topic.
-/// serialize() LE layout:
-///   topicId:i32, version:u16, partitionCount:i32, validate:u8,
-///   keyFieldLen:u16 + keyField bytes,
-///   descriptorLen:u32 + descriptorBlob bytes,
-///   nextTag:u16, compatMode:u8
-///   [, nameLen:u16 + name [, persistence:u8 (=1, transient only)]].
-/// The trailing (nextTag, compatMode) pair is APPENDED after the original
-/// layout (schema-evolution, Task 9) so legacy records written before these
-/// fields existed still deserialize: when the trailing bytes are absent
-/// entirely, deserialize() defaults compatMode=BACKWARD and nextTag to the
-/// field count of the embedded descriptor. A trailing tail that is present
-/// but not exactly 3 bytes (1 or 2 leftover bytes, or >3) is truncated/
-/// malformed and deserialize() rejects it (returns std::nullopt), same as
-/// every other bounds check in this function.
+/// One topic schema version as the SchemaRegistry applies it.  Catalog history
+/// Task 16: this is only the CatalogApplier's projection input (a TopicObject's
+/// SchemaState); the retired `__topic_schemas` wire record and its
+/// serialize / deserialize are gone — `__catalog` is the catalog.
 struct TopicSchema {
     int32_t               topicId        = -1;
     uint16_t              version        = 1;
@@ -43,18 +28,10 @@ struct TopicSchema {
     uint16_t              nextTag        = 0;    // next durable tag to allocate on ADD
     rune::codec::CompatMode compatMode   = rune::codec::CompatMode::Backward;
     // The TOPIC name this schema belongs to (Client::defineTopic takes it
-    // independently of the descriptor's name).  Optional trailer — empty on
-    // records written before it existed; boot recovery recreates the topic
-    // under this name (RuntimeTopicRecovery).
+    // independently of the descriptor's name).
     std::string           topicName;
-    // Phase 2b E: the topic's persistence mode.  Optional trailing byte AFTER the
-    // topicName trailer, written only when Transient (a disk record is
-    // byte-identical to the pre-2b layout).  Boot recovery recreates a runtime
-    // topic as transient from it (RuntimeTopicRecovery); ALTER carries it forward.
+    // Phase 2b E: the topic's persistence mode.
     PersistenceMode       persistence    = PersistenceMode::Disk;
-
-    [[nodiscard]] std::vector<uint8_t> serialize() const;
-    [[nodiscard]] static std::optional<TopicSchema> deserialize(std::span<const uint8_t> buf);
 };
 
 /// In-memory registry entry built from a TopicSchema.
@@ -116,12 +93,6 @@ public:
     /// latest applied version). Returns 0 if the topic has no applied schema.
     [[nodiscard]] uint16_t nextTagFor(int32_t topicId) const;
 
-    /// Allocate the next runtime topic id: returns hw, then hw++.
-    [[nodiscard]] int32_t allocateRuntimeId();
-
-    /// Startup replay: clear and re-apply a span of records.
-    void rebuildFromRecords(std::span<const TopicSchema> records);
-
     /// Catalog history Task 7: forget every version of `topicId` (a DropTopic /
     /// DropView / AlterView-retired sink applied).  Its name stops resolving (only
     /// when it still names THIS id — a reused name already re-pointed is kept).
@@ -129,11 +100,9 @@ public:
     /// (only); an unknown id is a no-op.  Returns whether anything was erased.
     bool erase(int32_t topicId);
 
-    [[nodiscard]] uint32_t runtimeIdHighWater() const noexcept { return runtimeIdHighWater_; }
-
 private:
     // topicId -> all applied versions, indexed by (version - 1); versions
-    // are applied in order by AdminWorker/rebuildFromRecords so this never
+    // are applied in order by the CatalogApplier so this never
     // has gaps in practice. Single-writer (admin-thread-owned) — no atomics.
     //
     // std::deque, NOT std::vector: callers (e.g. Task 11's ALTER flow) hold
@@ -145,7 +114,6 @@ private:
     // pointers stay valid.
     std::unordered_map<int32_t, std::deque<RegistryEntry>> byId_;
     std::unordered_map<std::string, int32_t>   nameToId_;
-    uint32_t runtimeIdHighWater_ = RUNTIME_TOPIC_ID_BASE;
 };
 
 } // namespace rune::node

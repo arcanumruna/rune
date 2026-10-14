@@ -36,7 +36,8 @@
 // Task 6: AdminWorker + SchemaRegistry + __topic_schemas persistence.
 #include <rune/node/AdminWorker.h>
 #include <rune/node/SchemaRegistry.h>
-#include <rune/node/RuntimeTopicRecovery.h>
+#include <rune/node/CatalogEffectFrames.h>
+#include <rune/node/TopicDirReconcile.h>
 #include <rune/codec/Serialize.h>
 #include <rune/view/ViewPlan.h>   // Task 20: deserializeCompiledViewPlan (view->source co-location)
 // Task 6: RecordBatch reader for rebuildFromLog (same as TxnStateStore).
@@ -378,66 +379,38 @@ void BrokerNode::start() {
         }
     }
 
-    // 1b. Catalog history Task 9: every DDL topic is a __catalog object — its
-    //     topic is built at its catalog id by the applier's boot replay (the
-    //     admin's bootCatalog, before the admin thread starts).  The retired
-    //     __topic_schemas / __views catalogs are never read (no migration, spec
-    //     §1; Task 16 deletes them): their runtime-topic recovery — the old
-    //     sequential-id path — is gone, so the two id spaces never meet in one
-    //     process (binding 8).  Old data in them is logged once.
-    //     Topic dirs: claimed = the static topics + the catalog's live topics and
-    //     view sinks at its checkpoint (an interim read-only scan until Task 16's
-    //     reconcile against the booted catalog); every other dir is quarantined,
-    //     never deleted — a dropped topic's dir included, so a reused name starts
-    //     empty.  BEFORE the TopicRegistry opens logs.
-    {
-        for (const char* retired : {"__topic_schemas", "__views"}) {
-            std::error_code rec;
-            const fs::path rdir = fs::path{config_.dataDir} / retired;
-            bool holdsData = false;
-            for (fs::directory_iterator it(rdir, rec), end; !rec && it != end; it.increment(rec)) {
-                std::error_code fec;
-                if (it->path().extension() == ".log" && fs::file_size(it->path(), fec) > 0 && !fec) holdsData = true;
-            }
-            if (holdsData)
-                spdlog::warn("BrokerNode[{}]: retired catalog dir {} ignored — __catalog is the catalog (no "
-                             "migration); topics recorded only there are not recovered",
-                             config_.nodeId, rdir.string());
-        }
-        bool catalogReplayHalted = false;
-        std::vector<TopicSpec> catalogTopics = catalogLiveTopicSpecs(config_.dataDir, &catalogReplayHalted);
-        // Task 10 fix round 1 (INTERIM until Task 17): a static topic colliding with
-        // a catalog topic by name or id would open / quarantine its dir or take its
-        // id — refuse to start, explicitly, BEFORE anything on disk is touched.
-        if (auto collision = staticCatalogCollision(config_.topics, catalogTopics)) {
-            spdlog::critical("BrokerNode[{}]: {}", config_.nodeId, *collision);
-            throw std::runtime_error("BrokerNode: " + *collision);
-        }
-        std::vector<TopicSpec> claims = config_.topics;
-        for (TopicSpec& t : catalogTopics) claims.push_back(std::move(t));
-        if (catalogReplayHalted) {
-            // Task 11 fix round 4 (the Part E rule: catalog damage ⇒ no destructive
-            // cleanup): the boot replay HALTS before the checkpoint — the topics
-            // created after the halt are unknown here, their dirs hold committed
-            // data.  Nothing is moved, renamed, deleted or quarantined; once the
-            // operator repairs the catalog a restart builds them from those dirs.
-            spdlog::critical("BrokerNode[{}]: the __catalog boot replay halts before its checkpoint — the topic-dir "
-                             "reconcile is SKIPPED this boot: NO topic dir is moved, renamed, deleted or quarantined "
-                             "(catalog damage: no destructive cleanup), and its non-destructive steps (marker heal, "
-                             "stale-marker clearing, the .catalog-damaged latch) wait for the next healthy boot; topics "
-                             "created after the halt are not served until the catalog is repaired", config_.nodeId);
-        } else {
-            (void)reconcileTopicDirs(config_.dataDir, claims, /*placeholderIds=*/{},
-                                     std::chrono::duration_cast<std::chrono::seconds>(
-                                         std::chrono::system_clock::now().time_since_epoch()).count());
-        }
-    }
+    // 1b. Catalog history Task 16 (spec §3, §5.3): the broker BOOTS FROM __catalog.
+    //     bootFromCatalog_ opens the local __catalog log, runs the ONE boot replay
+    //     of its checkpointed prefix HERE, on the startup thread, before any boot
+    //     builder (F4), and leaves bootTopics_ (the static topics + the catalog's
+    //     live topics and view sinks, in topic-id order), bootDroppedIds_ and the
+    //     booted applier.  Everything below — the TopicRegistry, replication, the
+    //     worker placement, the MetadataService — is built from bootTopics_, so it
+    //     sees every topic exactly as the catalog says.  The retired
+    //     __topic_schemas / __views dirs are never read (no migration).
+    bootFromCatalog_();
 
     // 2. Build the TopicRegistry (after dataDir creation, before the gateway).
     //    recover() is called for each Log in the ctor so restart resumes at LEO.
     //    Logs are single-writer: only the AgentRunner duty-cycle thread appends/reads.
     topicRegistry_ = std::make_unique<rune::gateway::TopicRegistry>(
         config_.topics, config_.dataDir);
+    // Task 16: the catalog's live topics at THEIR ids (the statics hold [0, n); a
+    // collision with a catalog id refused the boot above), then a Dropped slot for
+    // every id the catalog dropped — including ids this broker never built (a
+    // dropped topic never serves again, and its id is never refilled).
+    for (std::size_t i = config_.topics.size(); i < bootTopics_.size(); ++i) {   // [0, n) are the static topics
+        const TopicSpec& t = bootTopics_[i];
+        if (topicRegistry_->createTopicAt(t.topicId, t) < 0)
+            throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: the catalog topic '" +
+                                     t.name + "' (id " + std::to_string(t.topicId) +
+                                     ") could not be built at boot — refusing to start");
+    }
+    for (const int32_t id : bootDroppedIds_) (void)topicRegistry_->dropTopic(id);
+    topicsAtReplicationBuild_.clear();
+    for (int32_t id = 0; id < topicRegistry_->topicCount(); ++id)
+        if (topicRegistry_->state(id) == rune::gateway::TopicRegistry::TopicState::Serving)
+            topicsAtReplicationBuild_.push_back(id);
 
     // 2b. DR-15 fix round 1: the cold peer-hostname resolver.  No duty thread
     //     (worker / runtime / driver conductor) ever calls getaddrinfo for a
@@ -624,21 +597,20 @@ void BrokerNode::start() {
                                        : agentRunner_->threadId();
 
     // 7c. Task 6: start the AdminWorker AgentRunner thread.
-    //     Catalog history Task 9 (binding 7): FIRST the one boot replay of the
-    //     local __catalog prefix, HERE on the startup thread, before the admin
-    //     thread exists — replayLocal throws to refuse boot (a damaged / too-far
-    //     checkpoint), which propagates out of start().  Its sink is the agent's
-    //     ring encoders with the view-install RECOVERY byte (boot effects); the
-    //     control thread (running) builds each live topic at its catalog id.  The
-    //     ring's single producer is this thread until the admin thread starts
-    //     (the thread start orders every claim before the admin's first).  Task 16
-    //     moves this replay before the boot builders (F4).
+    //     Catalog history Task 16 (F4): the ONE boot replay of the local __catalog
+    //     prefix already ran, on the startup thread, in bootFromCatalog_ (step 1b)
+    //     — before any boot builder — and the AdminWorker adopted the booted
+    //     applier.  What needs a running broker is posted from the applied state
+    //     HERE, now that the workers exist: the validators, the view sinks' plan
+    //     gate and the recovery installs, the applied metric, and — when the replay
+    //     halted — the halt.  The admin thread's first pass makes the applier Live.
+    //     The ring's single producer is this thread until the admin thread starts
+    //     (the thread start orders every claim before the admin's first).
     if (adminWorkerAgent_) {
-        const int replayed = adminWorkerAgent_->worker().bootCatalog(adminWorkerAgent_->catalogBootEffects(),
-                                                                     adminWorkerAgent_->catalogLiveEffects());
-        spdlog::info("BrokerNode[{}]: __catalog boot replay applied {} event(s); applier {} ({})", config_.nodeId,
-                     replayed, adminWorkerAgent_->worker().applier().phaseName(),
-                     adminWorkerAgent_->worker().applier().stateName());
+        adminWorkerAgent_->worker().applier().postBootStash(adminWorkerAgent_->catalogBootEffects().sink);
+        spdlog::info("BrokerNode[{}]: __catalog booted — {} boot replay, applier {} ({}), {} topic(s) built, {} "
+                     "dropped id(s)", config_.nodeId, bootReplays_, adminWorkerAgent_->worker().applier().phaseName(),
+                     adminWorkerAgent_->worker().applier().stateName(), bootTopics_.size(), bootDroppedIds_.size());
     }
     if (adminWorkerRunner_) {
         adminWorkerRunner_->start();
@@ -1169,13 +1141,13 @@ void BrokerNode::buildReplication() {
     if (!perWorkerReplTransports_.empty()) {
         const int32_t wc = static_cast<int32_t>(perWorkerReplTransports_.size());
         std::set<std::string> groups;
-        for (const auto& ts : config_.topics)
+        for (const auto& ts : bootTopics_)
             if (!ts.coPartitionGroup.empty()) groups.insert(ts.coPartitionGroup);
         std::unordered_map<std::string, int32_t> groupKey;
         int32_t nextGk = -1;
         for (const auto& g : groups) groupKey[g] = nextGk--;
         rune::metadata::ShardRouter sr(wc);
-        for (const auto& ts : config_.topics) {
+        for (const auto& ts : bootTopics_) {
             if (!ts.coPartitionGroup.empty())
                 sr.mapTopicToGroupKey(ts.topicId, groupKey[ts.coPartitionGroup]);
         }
@@ -1394,13 +1366,13 @@ int32_t BrokerNode::createRuntimeUserReplicas(const TopicSpec& spec) {
     if (!perWorkerReplTransports_.empty()) {
         const int32_t wc = static_cast<int32_t>(perWorkerReplTransports_.size());
         std::set<std::string> groups;
-        for (const auto& ts : config_.topics)
+        for (const auto& ts : bootTopics_)
             if (!ts.coPartitionGroup.empty()) groups.insert(ts.coPartitionGroup);
         std::unordered_map<std::string, int32_t> groupKey;
         int32_t nextGk = -1;
         for (const auto& g : groups) groupKey[g] = nextGk--;
         rune::metadata::ShardRouter sr(wc);
-        for (const auto& ts : config_.topics)
+        for (const auto& ts : bootTopics_)
             if (!ts.coPartitionGroup.empty())
                 sr.mapTopicToGroupKey(ts.topicId, groupKey[ts.coPartitionGroup]);
         rtReplRouter = std::move(sr);
@@ -1548,14 +1520,14 @@ void BrokerNode::buildWorkerPool() {
     // coPartitionGroup, in sorted group-name order (matches StaticBalancer
     // determinism so every node derives identical shard identities).
     std::set<std::string> groups;
-    for (const auto& ts : config_.topics)
+    for (const auto& ts : bootTopics_)
         if (!ts.coPartitionGroup.empty()) groups.insert(ts.coPartitionGroup);
     std::unordered_map<std::string, int32_t> groupKey;
     int32_t next = -1;
     for (const auto& g : groups) groupKey[g] = next--;
 
     rune::metadata::ShardRouter router(wc);
-    for (const auto& ts : config_.topics) {
+    for (const auto& ts : bootTopics_) {
         if (!ts.coPartitionGroup.empty())
             router.mapTopicToGroupKey(ts.topicId, groupKey[ts.coPartitionGroup]);
         // ungrouped topics: router uses topicId as-is (ShardRouter default).
@@ -1699,7 +1671,7 @@ void BrokerNode::buildWorkerPool() {
                 // so flushDirtyLogs() skips them (the worker calls log->sync on its
                 // own thread — the only thread appending to these logs).
                 if (replicaRegistry_ && topicRegistry_) {
-                    for (const auto& ts : config_.topics) {
+                    for (const auto& ts : bootTopics_) {
                         for (int32_t p = 0; p < ts.partitionCount; ++p) {
                             rune::storage::Log* log = topicRegistry_->log(ts.topicId, p);
                             if (log) {
@@ -1708,7 +1680,7 @@ void BrokerNode::buildWorkerPool() {
                         }
                     }
                     spdlog::info("BrokerNode[{}]: {} user-partition logs marked worker-owned (R7 fix)",
-                                 config_.nodeId, config_.topics.size());
+                                 config_.nodeId, bootTopics_.size());
                 }
             }
             spdlog::info("BrokerNode[{}]: per-worker ingress ACTIVE ({} subscriptions on base stream {})",
@@ -1874,23 +1846,23 @@ void BrokerNode::onInvariantViolation_(const std::string& what) {
 
 void BrokerNode::refuseStartOnFailedRecovery_() {
     // Every log this node will serve — registry replicas AND the logs outside
-    // the registry (schema; the internal offset / txn / metadata logs; every
+    // the registry (__catalog; the internal offset / txn / metadata logs; every
     // configured topic's partition logs).  Enumerated explicitly (Task 10 fix 3
     // / I1): the registry is not assumed to be complete.
     std::vector<rune::storage::Log*> logs;
     if (replicaRegistry_)
         for (auto* r : replicaRegistry_->allReplicas())
             if (r && r->isDiskBacked()) logs.push_back(r->log());
-    for (auto* l : {schemaLog_.get(), offsetLog_.get(), txnLog_.get(), metadataLog_.get()})
+    for (auto* l : {catalogLog_.get(), offsetLog_.get(), txnLog_.get(), metadataLog_.get()})
         if (l) logs.push_back(l);
     if (topicRegistry_)
-        for (const auto& ts : config_.topics)
+        for (const auto& ts : bootTopics_)
             for (int32_t p = 0; p < ts.partitionCount; ++p)
                 if (auto* l = topicRegistry_->log(ts.topicId, p)) logs.push_back(l);
-    if (schemaRecoveryFaultForTest_ != 0 && schemaLog_) {
-        schemaLog_->setSyncFaultForTest(schemaRecoveryFaultForTest_);
-        schemaLog_->recover();
-        schemaLog_->setSyncFaultForTest(0);
+    if (catalogRecoveryFaultForTest_ != 0 && catalogLog_) {
+        catalogLog_->setSyncFaultForTest(catalogRecoveryFaultForTest_);
+        catalogLog_->recover();
+        catalogLog_->setSyncFaultForTest(0);
     }
     for (auto* l : logs) {
         if (!l->storageFailed()) continue;
@@ -2529,15 +2501,20 @@ void BrokerNode::buildGateway() {
             // from the parsed TopicSpec (previously hard-coded empty strings).
             {
                 std::vector<rune::metadata::TopicSpec> balancerTopics;
-                balancerTopics.reserve(config_.topics.size());
+                balancerTopics.reserve(bootTopics_.size());
                 const auto rf = static_cast<int16_t>(
                     std::max(1, static_cast<int>(allNodeIds.size())));
-                for (const auto& ts : config_.topics) {
+                for (std::size_t bi = 0; bi < bootTopics_.size(); ++bi) {
+                    const auto& ts = bootTopics_[bi];
                     if (ts.topicId < 0) continue; // skip internal topics
                     rune::metadata::TopicSpec bs;
                     bs.topicId          = ts.topicId;
                     bs.partitionCount   = ts.partitionCount;
-                    bs.rf               = ts.replicationFactor > 0 ? std::min<int16_t>(ts.replicationFactor, rf) : rf;
+                    // A catalog topic's rf 0 = every PLACEABLE broker (resolved by the
+                    // MetadataService, exactly as addRuntimeTopic did); a static topic's = the cluster size.
+                    const bool fromCatalog = bi >= config_.topics.size();
+                    bs.rf               = ts.replicationFactor > 0 ? std::min<int16_t>(ts.replicationFactor, rf)
+                                                                   : (fromCatalog ? int16_t{0} : rf);
                     bs.coPartitionGroup = ts.coPartitionGroup; // Note C fix: from parsed config
                     bs.partitionKey     = ts.partitionKey;     // Note C fix: from parsed config
                     balancerTopics.push_back(std::move(bs));
@@ -2549,6 +2526,11 @@ void BrokerNode::buildGateway() {
                     balancerNodes.push_back(static_cast<rune::metadata::NodeId>(nid));
                 }
                 metadataService_->configure(balancerTopics, balancerNodes);
+                // Task 16 (B3): every topic id the catalog dropped is unplaced — the
+                // metadata log may still hold its assignments (this broker was the
+                // controller, or replicated them), and a restart must not resurrect
+                // them.  Idempotent; the controller commits the removals once ready.
+                for (const int32_t droppedId : bootDroppedIds_) metadataService_->removeRuntimeTopic(droppedId);
                 // Commit-quorum failover floor: a partition failover must never
                 // install an ISR below the same minIsr the gateway enforces for
                 // acks=all — otherwise a transiently-isolated controller seizes
@@ -2777,7 +2759,7 @@ void BrokerNode::buildGateway() {
         // all configured topics (so the strictest topic limit governs the cleaner).
         // If no topic sets a limit (all -1), the throttle remains unlimited (-1).
         int64_t cleanerIoMaxBytesPerSec = -1; // -1 = unlimited (Kafka default)
-        for (const auto& ts : config_.topics) {
+        for (const auto& ts : bootTopics_) {
             if (ts.ioMaxBytesPerSecond > 0) {
                 if (cleanerIoMaxBytesPerSec < 0 ||
                     ts.ioMaxBytesPerSecond < cleanerIoMaxBytesPerSec) {
@@ -3046,18 +3028,141 @@ std::string BrokerNode::leaderClientEndpointFor_(const LeaderSnapshot& v) const 
 }
 
 // ---------------------------------------------------------------------------
-// BrokerNode::buildAdminWorker — Task 6; catalog history Task 9.
+// BrokerNode::buildAdminWorker — Task 6; catalog history Tasks 9 and 16.
 //
-//   1. buildCatalog_: the __catalog log + replica (+ its plane), outside the
-//      admin block's catch — a broker never starts without its catalog.
-//   2. The retired __topic_schemas / __views logs + replicas (opened, never read
-//      or written — Task 16 deletes them).
-//   3. AdminDeps: the DDL answers (encode + the admin → control egress ring),
+//   1. buildCatalog_: the __catalog replica (+ its plane) over the Log the startup
+//      phase opened and replayed, outside the admin block's catch — a broker never
+//      starts without its catalog.
+//   2. AdminDeps: the DDL answers (encode + the admin → control egress ring),
 //      brokerCount / topicMinIsr (spec §8), the static topic names (interim).
-//   4. The AdminWorkerAgent (owns the AdminWorker: replica, applier, registries)
-//      + its AdminWorkerRunner (dedicated thread, started by start() AFTER the
-//      boot replay — bootCatalog).
+//   3. The AdminWorkerAgent (owns the AdminWorker: replica, registries) adopts the
+//      applier bootFromCatalog_ booted (phase Booted; its first admin pass makes it
+//      Live) + its AdminWorkerRunner (dedicated thread, started by start() AFTER
+//      the boot stash is posted).
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// BrokerNode::bootFromCatalog_ — catalog history Task 16 (spec §3, §5.3; STARTUP
+// thread, step 1b, before the TopicRegistry and every builder).
+//
+//   1. dataDir/__catalog: a recovered disk Log (never InMemoryLog); the registries
+//      the applier projects into; the CatalogApplier (AwaitingBoot).
+//   2. THE one boot replay (F4): applier.replayLocal(log, BootCatalogSink) of the
+//      checkpointed prefix.  It throws — the broker refuses to start — on a
+//      corrupt checkpoint file or a checkpoint at/after the local log end (events
+//      this broker already applied are missing: never replay a shorter history,
+//      B1).  A HALTED replay (a bad event, a digest mismatch) does not refuse: the
+//      broker boots with the applied prefix, halted (route RouteHalted, critical).
+//      The BootCatalogSink fills the topic list (topicApplied / sinkApplied); what
+//      needs a running broker is posted from the applied state by postBootStash.
+//   3. bootTopics_ = the static topics + the catalog's live topics and view sinks
+//      in topic-id order; bootDroppedIds_ = every topic id the catalog dropped
+//      (CatalogState: ids assigned and no longer live — tombstoned topics and
+//      retired view sinks), kept for the registry's Dropped slots and the
+//      MetadataService's placement removal.
+//   4. The topic-dir reconcile (TopicDirReconcile.h):
+//        halted         → NONE (nothing is moved, renamed, deleted or quarantined:
+//                         catalog damage ⇒ no destructive cleanup; B5);
+//        nothing applied and the data dir holds topic dirs (the local catalog was
+//                       wiped, or the disk is new) → DEFERRED until the applier has
+//                       caught up to the catalog leader's committed prefix, then
+//                       run once by the admin thread (B6);
+//        otherwise      → run now.
+// ---------------------------------------------------------------------------
+namespace {
+TopicSpec topicSpecFromCatalog(const CatalogTopicAppliedMsg& m);   // defined with the control thread's effect handlers
+// The TopicSpec the control thread's effect handler built from a CatalogTopicApplied
+// frame — the SAME mapping (a boot topic is byte-for-byte the topic the live effect
+// would have built).
+TopicSpec bootSpecOfFrame(int32_t topicId, const std::string& name, int32_t partitions, int16_t rf,
+                          rune::catalog::Persistence persistence, const rune::protocol::TopicConfig& c) {
+    CatalogTopicAppliedMsg m;
+    m.topicId           = topicId;
+    m.name              = name;
+    m.partitions        = partitions;
+    m.replicationFactor = rf;
+    m.persistence       = persistence == rune::catalog::Persistence::Transient ? 1 : 0;
+    m.config            = c;
+    return topicSpecFromCatalog(m);
+}
+
+bool dirHoldsEntries(const fs::path& d) {
+    std::error_code ec;
+    fs::directory_iterator it(d, ec), end;
+    return !ec && it != end;
+}
+} // namespace
+
+void BrokerNode::bootFromCatalog_() {
+    namespace cat = rune::catalog;
+    warnRetiredCatalogDirs(config_.dataDir);
+
+    const fs::path dir = fs::path{config_.dataDir} / "__catalog";
+    fs::create_directories(dir);
+    catalogLog_ = std::make_unique<rune::storage::Log>(dir.string(), config_.offsetLogSegmentRollBytes);
+    catalogLog_->recover();
+    // Never compacted / retention-deleted: a recovered catalog always starts at
+    // 0 — a follower can never be "below the leader's start".  Anything else is
+    // a damaged (or foreign) directory: refuse loudly instead of serving it.
+    if (catalogLog_->logStartOffset() != 0) {
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: __catalog at " +
+                                 dir.string() + " starts at offset " +
+                                 std::to_string(catalogLog_->logStartOffset()) +
+                                 " — the catalog is never truncated at the front; refusing to start");
+    }
+
+    schemaRegistry_ = std::make_unique<SchemaRegistry>();
+    viewRegistry_   = std::make_unique<ViewRegistry>();
+    bootApplier_.emplace(dir.string(), *schemaRegistry_, *viewRegistry_);
+
+    // The BootCatalogSink: the topics the TopicRegistry / replication / placement
+    // build below.  (A dropped object posts nothing: the final state is replayed.)
+    std::vector<TopicSpec> catalogTopics;
+    CatalogEffects sink;
+    sink.maxFrameBytes = catalogEffectMaxFrame();   // an effect that could never be posted halts the boot, as before
+    sink.topicApplied = [&catalogTopics](const cat::TopicObject& t) {
+        catalogTopics.push_back(bootSpecOfFrame(t.topicId, t.name, t.partitions, t.replicationFactor, t.persistence,
+                                                t.config));
+    };
+    sink.sinkApplied = [&catalogTopics](const SinkSpec& sp) {   // a view's sink: a keyed, compacted table, every broker
+        rune::protocol::TopicConfig c;
+        c.cleanupPolicy = 1;   // Compact
+        c.partitionKey  = sp.keyField;
+        catalogTopics.push_back(bootSpecOfFrame(sp.topicId, sp.name, sp.partitions, /*rf=*/0, sp.persistence, c));
+    };
+    const int replayed = bootApplier_->replayLocal(*catalogLog_, BootEffects{std::move(sink)});   // throws: refuse boot
+    if (replayed >= 0) ++bootReplays_;
+    std::sort(catalogTopics.begin(), catalogTopics.end(),
+              [](const TopicSpec& a, const TopicSpec& b) { return a.topicId < b.topicId; });
+
+    // INTERIM (until Task 17): a static topic never shares a broker with a catalog topic.
+    if (auto collision = staticCatalogCollision(config_.topics, catalogTopics)) {
+        spdlog::critical("BrokerNode[{}]: {}", config_.nodeId, *collision);
+        throw std::runtime_error("BrokerNode: " + *collision);
+    }
+    bootDroppedIds_ = droppedTopicIds(bootApplier_->state());
+    bootTopics_     = config_.topics;
+    for (TopicSpec& t : catalogTopics) bootTopics_.push_back(std::move(t));
+
+    const auto nowSeconds = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    if (bootApplier_->halted()) {
+        spdlog::critical("BrokerNode[{}]: the __catalog boot replay HALTED — the broker boots with the prefix it "
+                         "applied ({} topic(s)), halted, and accepts no catalog change.  The topic-dir reconcile is "
+                         "SKIPPED this boot: NO topic dir is moved, renamed, deleted or quarantined (catalog damage: "
+                         "no destructive cleanup); topics created after the halt are not served until the catalog is "
+                         "repaired", config_.nodeId, bootTopics_.size());
+    } else if (bootApplier_->lastApplied().offset < 0 &&
+               (dirHoldsEntries(fs::path{config_.dataDir} / "topics") ||
+                dirHoldsEntries(fs::path{config_.dataDir} / "dropped"))) {
+        bootReconcileDeferred_ = true;
+        spdlog::warn("BrokerNode[{}]: the local __catalog is empty but {} holds topic dirs (the catalog was wiped, or "
+                     "this is a new disk) — NO topic dir is touched at boot; the reconcile waits until this broker "
+                     "has caught up to the catalog leader's committed prefix", config_.nodeId, config_.dataDir);
+    } else {
+        (void)reconcileTopicDirs(config_.dataDir, bootTopics_, bootDroppedIds_, nowSeconds);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // BrokerNode::buildCatalog_ — catalog history Task 6 (spec §3, §5.6, ruling 7).
 //
@@ -3076,28 +3181,12 @@ std::string BrokerNode::leaderClientEndpointFor_(const LeaderSnapshot& v) const 
 // ---------------------------------------------------------------------------
 void BrokerNode::buildCatalog_() {
     namespace rr = rune::replication;
+    // Task 16: the catalog Log was opened, recovered and replayed by bootFromCatalog_
+    // (the startup phase); here it only gets its replica and replication plane.
+    if (!catalogLog_)
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: buildCatalog_ before "
+                                 "bootFromCatalog_ — the __catalog log is not open");
     const fs::path dir = fs::path{config_.dataDir} / "__catalog";
-    fs::create_directories(dir);
-    catalogLog_ = std::make_unique<rune::storage::Log>(dir.string(), config_.offsetLogSegmentRollBytes);
-    catalogLog_->recover();
-    // Never compacted / retention-deleted: a recovered catalog always starts at
-    // 0 — a follower can never be "below the leader's start".  Anything else is
-    // a damaged (or foreign) directory: refuse loudly instead of serving it.
-    if (catalogLog_->logStartOffset() != 0) {
-        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: __catalog at " +
-                                 dir.string() + " starts at offset " +
-                                 std::to_string(catalogLog_->logStartOffset()) +
-                                 " — the catalog is never truncated at the front; refusing to start");
-    }
-    // Catalog history Task 7 (review M8): the applied checkpoint (ruling 8) must
-    // never let this broker replay a SHORTER history than it already applied — a
-    // checkpoint at or past the recovered log end (lost writes, a replaced data
-    // dir) refuses to start, explicitly.  A damaged checkpoint file throws too.
-    if (auto refusal = catalogCheckpointBeyondLog(readCatalogCheckpoint(dir.string()),
-                                                  catalogLog_->logEndOffset(), dir.string())) {
-        spdlog::critical("BrokerNode[{}]: {}", config_.nodeId, *refusal);
-        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: " + *refusal);
-    }
 
     std::vector<rr::NodeId> allNodeIds;
     allNodeIds.reserve(config_.peers.size());
@@ -3187,148 +3276,11 @@ void BrokerNode::buildAdminWorker() {
     // block's catch — a broker without its catalog never starts.
     buildCatalog_();
     try {
-        const fs::path schemaDir = fs::path{config_.dataDir} / "__topic_schemas";
-        fs::create_directories(schemaDir);
-
-        schemaLog_ = std::make_unique<rune::storage::Log>(schemaDir.string());
-        schemaLog_->recover();
-
-        const NodeId selfId = static_cast<NodeId>(config_.nodeId);
-
-        std::vector<NodeId> allNodeIds;
-        allNodeIds.reserve(config_.peers.size());
-        for (const auto& peer : config_.peers) {
-            allNodeIds.push_back(static_cast<NodeId>(peer.id));
-        }
-
-        rune::replication::PartitionConfig scfg;
-        scfg.topicId              = kSchemaTopicId;  // -4: sentinel for __topic_schemas
-        scfg.partitionId          = 0;
-        scfg.selfId               = selfId;
-        // Majority-durable (same as __transaction_state): schema records must
-        // survive leader failover without data loss.
-        scfg.minIsr               = std::min(2, static_cast<int>(allNodeIds.size()));
-        scfg.replicaLagMaxMs      = config_.replicaLagMaxMs;
-        scfg.replicaLagMaxOffset  = 1'000'000'000;  // TIME-based lag only
-        scfg.fetchIntervalNs      = config_.fetchIntervalNs;
-        scfg.isrCheckIntervalNs   = 10'000'000LL;
-        scfg.maxFetchBytes        = rune::replication::kDefaultMaxFetchBytes;
-        // Compacted: keep latest schema record per topicId (key = topicId bytes).
-        scfg.cleanupPolicy        = rune::replication::CleanupPolicy::Compact;
-        scfg.minCleanableDirtyRatio = 0.5;
-        scfg.deleteRetentionMs      = 86'400'000LL;  // 1 day tombstone retention
-        scfg.segmentRollBytes       = config_.offsetLogSegmentRollBytes;
-
-        // RULING-2 A: the schema replica is SOLELY owned + driven by the admin
-        // thread.  It is therefore NOT registered with replTransport_ and NOT
-        // added to replicaRegistry_ — this keeps it out of BOTH the control
-        // thread's allReplicas() doWork loop AND the bridge's role-flip loop
-        // (which iterates allReplicas() and would call becomeLeader/Follower on
-        // the admin-owned replica from the control thread — the RULING-2 race).
-        //
-        // A dedicated NullPartitionTransport backs it so no cross-thread transport
-        // poll (AeronPartitionTransport::poll → replica->applyReplicated on the
-        // control thread) ever touches it.  Real multi-node follower fetch
-        // routing on an admin-thread-owned transport is Docker-gated (Task 8b).
-        nullTransports_.push_back(
-            std::make_unique<rune::replication::NullPartitionTransport>());
-        rune::replication::PartitionTransport* schemaTransport =
-            nullTransports_.back().get();
-
-        schemaReplica_ = std::make_unique<rune::replication::PartitionReplica>(
-            scfg,
-            rune::replication::Role::Follower,
-            /*epoch=*/0,
-            allNodeIds,
-            allNodeIds,
-            schemaLog_.get(),
-            schemaTransport);
-
-        // schemaReplica_ stays owned HERE (never handed to replicaRegistry_).
-        rune::replication::PartitionReplica* schemaReplicaRaw = schemaReplica_.get();
-
-        // Build the replica-set vector for the AdminWorker's becomeLeader ISR seed.
-        std::vector<int32_t> replicaSetIds;
-        replicaSetIds.reserve(allNodeIds.size());
-        for (auto id : allNodeIds) replicaSetIds.push_back(static_cast<int32_t>(id));
-
-        // Build the in-memory schema registry.
-        schemaRegistry_ = std::make_unique<SchemaRegistry>();
-
-        // Catalog history Task 9: the retired __topic_schemas log is NEVER read —
-        // the SchemaRegistry is the CatalogApplier's projection of __catalog.
-        (void)schemaReplicaRaw;  // replica handed to the AdminWorker below
-
-        // ── Task 17: __views internal partition + startup replay ────────────
-        // Durable view catalog (ViewRegistry), mirroring the __topic_schemas
-        // block above (log + PartitionReplica + boot replay) exactly. Scoped
-        // in its OWN try/catch: a __views setup failure must not also tear
-        // down the already-successful schema persistence + AdminWorker wiring
-        // above. The CreateView DDL path that APPENDS records to
-        // viewsReplica_ is Task 19 — not yet reachable, so only the
-        // partition + startup replay + registry are wired here.
-        try {
-            const fs::path viewsDir = fs::path{config_.dataDir} / "__views";
-            fs::create_directories(viewsDir);
-
-            viewsLog_ = std::make_unique<rune::storage::Log>(viewsDir.string());
-            viewsLog_->recover();
-
-            rune::replication::PartitionConfig vcfg;
-            vcfg.topicId              = kViewsTopicId;  // -5: sentinel for __views
-            vcfg.partitionId          = 0;
-            vcfg.selfId               = selfId;
-            // Majority-durable (same as __topic_schemas): view definitions must
-            // survive leader failover without data loss.
-            vcfg.minIsr               = std::min(2, static_cast<int>(allNodeIds.size()));
-            vcfg.replicaLagMaxMs      = config_.replicaLagMaxMs;
-            vcfg.replicaLagMaxOffset  = 1'000'000'000;  // TIME-based lag only
-            vcfg.fetchIntervalNs      = config_.fetchIntervalNs;
-            vcfg.isrCheckIntervalNs   = 10'000'000LL;
-            vcfg.maxFetchBytes        = rune::replication::kDefaultMaxFetchBytes;
-            // Compacted: keep latest view record per viewTopicId (key = viewTopicId bytes).
-            vcfg.cleanupPolicy        = rune::replication::CleanupPolicy::Compact;
-            vcfg.minCleanableDirtyRatio = 0.5;
-            vcfg.deleteRetentionMs      = 86'400'000LL;  // 1 day tombstone retention
-            vcfg.segmentRollBytes       = config_.offsetLogSegmentRollBytes;
-
-            // RULING-2 A (same rationale as schemaReplica_ above): the views
-            // replica is SOLELY owned + driven by the admin thread, so it is
-            // NOT registered with replTransport_ and NOT added to
-            // replicaRegistry_ — keeping it out of both the control thread's
-            // allReplicas() doWork loop and the bridge's role-flip loop.
-            // A dedicated NullPartitionTransport backs it so no cross-thread
-            // transport poll ever touches it.
-            nullTransports_.push_back(
-                std::make_unique<rune::replication::NullPartitionTransport>());
-            rune::replication::PartitionTransport* viewsTransport =
-                nullTransports_.back().get();
-
-            viewsReplica_ = std::make_unique<rune::replication::PartitionReplica>(
-                vcfg,
-                rune::replication::Role::Follower,
-                /*epoch=*/0,
-                allNodeIds,
-                allNodeIds,
-                viewsLog_.get(),
-                viewsTransport);
-
-            viewRegistry_ = std::make_unique<ViewRegistry>();
-
-            // Catalog history Task 9: the retired __views log is NEVER read — the
-            // ViewRegistry is the CatalogApplier's projection of __catalog.
-            spdlog::info(
-                "BrokerNode[{}]: __views persistence wired (dir={})",
-                nodeId, viewsDir.string());
-        } catch (const std::exception& ex) {
-            spdlog::error(
-                "BrokerNode[{}]: __views setup failed: {}; view catalog will not be "
-                "durable (CreateView DDL — Task 19 — would be affected, not this build)",
-                nodeId, ex.what());
-            viewRegistry_.reset();
-            viewsReplica_.reset();
-            viewsLog_.reset();
-        }
+        // Catalog history Task 16: the SchemaRegistry / ViewRegistry are the
+        // CatalogApplier's projections of __catalog (built by bootFromCatalog_);
+        // the retired __topic_schemas / __views logs are never opened, read or
+        // written.
+        std::vector<int32_t> replicaSetIds;   // (the retired replicas' ISR seed: none left)
 
         // ── Wire AdminDeps ───────────────────────────────────────────────────
         // Catalog history Task 9: the AdminWorker writes __catalog (on the catalog
@@ -3416,14 +3368,21 @@ void BrokerNode::buildAdminWorker() {
             return adminWorkerAgent_ != nullptr && adminWorkerAgent_->postCatalogReadFrame(head, frame);
         };
 
-        // Construct AdminWorkerAgent (owns the AdminWorker — the __catalog replica,
-        // its applier and the registries it projects; the retired __topic_schemas /
-        // __views replicas ride along until Task 16 deletes them).
+        // Construct AdminWorkerAgent (owns the AdminWorker — the __catalog replica
+        // and the registries its applier projects).
         adminWorkerAgent_ = std::make_unique<AdminWorkerAgent>(
-            *schemaRegistry_, schemaReplica_.get(), config_.nodeId,
+            *schemaRegistry_, /*retired replica=*/nullptr, config_.nodeId,
             std::move(replicaSetIds), std::move(deps),
-            viewsReplica_.get(), viewRegistry_.get(),
+            /*retired viewsReplica=*/nullptr, viewRegistry_.get(),
             catalogReplica_.get(), catalogPlane_.get());
+        // Task 16 (F4): the applier the startup phase booted — Booted, never replayed
+        // again; the admin thread's first pass makes it Live.
+        adminWorkerAgent_->worker().adoptBootedApplier(std::move(*bootApplier_), adminWorkerAgent_->catalogLiveEffects());
+        bootApplier_.reset();
+        if (holdCatalogApplyAtBootForTest_) adminWorkerAgent_->worker().holdApplyForTest(true);
+        if (bootReconcileDeferred_) {
+            adminWorkerAgent_->worker().deferTopicDirReconcile(config_.dataDir, config_.topics);
+        }
 
         // Catalog history Task 6: wire the __catalog replica's controller path
         // before any thread drives it.  ISR proposals → the admin→control ring
@@ -3442,9 +3401,7 @@ void BrokerNode::buildAdminWorker() {
         adminWorkerRunner_ = std::make_unique<rune::consensus::AgentRunner>(
             *adminWorkerAgent_, *adminWorkerIdleStrategy_, adminWorkerClock_);
 
-        spdlog::info(
-            "BrokerNode[{}]: __topic_schemas persistence + AdminWorker wired (dir={})",
-            nodeId, schemaDir.string());
+        spdlog::info("BrokerNode[{}]: AdminWorker wired over the booted __catalog applier", nodeId);
 
     } catch (const std::exception& ex) {
         spdlog::error(
@@ -3452,23 +3409,6 @@ void BrokerNode::buildAdminWorker() {
             nodeId, ex.what());
         adminWorkerRunner_.reset();
         adminWorkerAgent_.reset();
-        schemaRegistry_.reset();
-        schemaReplica_.reset();
-        schemaLog_.reset();
-        // Task 17: the __views block (its own inner try/catch, above) runs
-        // BEFORE this function's AdminDeps/adminWorkerAgent_/adminWorkerRunner_
-        // construction. So this outer catch IS reachable with an already-
-        // successful views*_ trio still set — e.g. adminWorkerAgent_'s or
-        // adminWorkerRunner_'s constructor throwing after __views succeeded.
-        // Resetting views*_ here too is intentional, not defensive-only
-        // dead code: without a live adminWorkerAgent_ there is no DDL control
-        // plane at all in this phase (Task 19's CreateView path is routed
-        // through AdminWorker), so there is nothing useful views*_ could do
-        // standing alone — treat the whole admin subsystem (schema + views)
-        // as one failure unit and tear it down together.
-        viewRegistry_.reset();
-        viewsReplica_.reset();
-        viewsLog_.reset();
     }
     // Catalog history Task 6: the catalog has no other driver than the admin
     // thread — no admin worker means an undriven catalog: never start so.
@@ -3693,13 +3633,7 @@ void BrokerNode::stop() {
     // schemaRegistry_ is NOT reset: it owns no replica pointers and no thread
     // touches it once the admin worker is gone, so it stays readable after stop()
     // (schemaRegistryForTest's contract) and is freed with the node.
-    schemaReplica_.reset();   // no-op: ownership transferred to replicaRegistry_ in buildAdminWorker
-    schemaLog_.reset();       // Log for __topic_schemas (file flush on dtor)
-    // Task 17: viewsReplica_ is admin-thread-owned only, same as schemaReplica_ —
-    // never transferred to replicaRegistry_, but reset here for symmetry.
     // viewRegistry_ is kept for the same reason (viewRegistryForTest after stop()).
-    viewsReplica_.reset();    // admin-thread-owned only (RULING-2 A) — not in replicaRegistry_
-    viewsLog_.reset();        // Log for __views (file flush on dtor)
     // Catalog history Task 6: the admin thread is joined and the agent gone —
     // the replica (holds the plane + log pointers) goes; the Log stays readable
     // after stop() (catalogLogForTest's contract: quiesced) and is freed with
@@ -4940,7 +4874,7 @@ void BrokerNode::attachShardRuntimes_() {
         // Task 13: announce-before-accept, worker-side acks, worker PSM authority.
         gateway_->setShardMode(true);
         if (topicRegistry_)
-            for (const auto& ts : config_.topics)
+            for (const auto& ts : bootTopics_)
                 for (int32_t p = 0; p < ts.partitionCount; ++p)
                     if (auto* log = topicRegistry_->log(ts.topicId, p)) gateway_->addWorkerOwnedLog(log);
     }

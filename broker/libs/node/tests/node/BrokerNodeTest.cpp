@@ -16,7 +16,6 @@
 #include <rune/aeronutil/testing/FreePort.h>
 #include "../support/TestNodeConfig.h"
 #include <rune/node/BrokerNode.h>
-#include <rune/node/RuntimeTopicRecovery.h>   // kTopicIdMarkerFile
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/node/HostDefaults.h>
 #include <rune/node/Worker.h>
@@ -1756,7 +1755,7 @@ TEST(BrokerNodeTest, OwnerThreadHookRunsOnTrueOwnerThreadRegression) {
     // Misuse fails loudly; the callable's own exceptions propagate.
     EXPECT_FALSE(rune::node::test::hasReplica(node, 0, 99));            // pointer form: nullptr
     EXPECT_THROW(rune::node::test::leoOnOwner(node, 0, 99), std::runtime_error);  // ref form
-    EXPECT_THROW(node.onOwnerThreadForTest(kSchemaTopicId, 0, threadOf), std::invalid_argument);
+    EXPECT_THROW(node.onOwnerThreadForTest(kCatalogTopicId, 0, threadOf), std::invalid_argument);
     EXPECT_THROW(node.onOwnerThreadForTest(0, 0,
                      [](PartitionReplica&) -> int { throw std::domain_error("boom"); }),
                  std::domain_error);
@@ -2108,7 +2107,7 @@ TEST(BrokerNodeRegression, CatalogDefineTopicBuildsTheTopicAtItsCatalogIdWithNoM
     EXPECT_EQ(topicId, 0) << "the first catalog id";
     EXPECT_TRUE(rune::node::test::hasReplica(node, topicId, 0)) << "built from the applied event";
     EXPECT_TRUE(fs::exists(dir / "topics" / "marked" / "0"));
-    EXPECT_FALSE(fs::exists(dir / "topics" / "marked" / rune::node::kTopicIdMarkerFile))
+    EXPECT_FALSE(fs::exists(dir / "topics" / "marked" / "topic-id"))
         << "a catalog topic carries no topic-id marker";
 
     node.stop();

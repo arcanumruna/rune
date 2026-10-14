@@ -39,8 +39,8 @@ TEST(TopicNameRegression, RejectsPathControlAndNonAsciiBytes) {
 }
 
 TEST(TopicNameRegression, ReservesTheDoubleUnderscorePrefix) {
-    for (const char* n : {"__topic_schemas", "__views", "__consumer_offsets", "__transaction_state",
-                          "__cluster_metadata", "__view_snapshots", "__orphan.3", "__"})
+    for (const char* n : {"__catalog", "__consumer_offsets", "__transaction_state", "__cluster_metadata",
+                          "__view_snapshots", "__topic_schemas", "__views", "__orphan.3", "__"})
         EXPECT_EQ(rune::catalog::checkTopicName(n), rune::catalog::TopicNameError::Reserved) << n;
     EXPECT_EQ(rune::catalog::checkTopicName("_single"), rune::catalog::TopicNameError::None);
 }

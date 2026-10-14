@@ -20,8 +20,10 @@
 // Multi-node: real per-peer UDP publications + ingress subscription.
 // Both paths now serve clients via ClientGateway (single-writer duty-cycle).
 
+#include <algorithm>
 #include <cstring>
 #include <cassert>
+#include <optional>
 #include <rune/protocol/client/SchemaMessages.h>
 #include <rune/node/CatalogReadFlow.h>
 #include <cstdlib>
@@ -198,7 +200,7 @@ using NullSink = rune::consensus::NullSink;   // moved to rune/consensus/NullSin
 // Agent so it can be driven by an AgentRunner on a dedicated thread.
 //
 // Shared-nothing (Rule #1): AdminWorkerAgent owns the AdminWorker (which SOLELY
-// owns the __topic_schemas replica).  Every cross-thread hop is an SPSC ring
+// owns the __catalog replica).  Every cross-thread hop is an SPSC ring
 // (Rule #2, Aeron-style):
 //
 //   requestRing_ (gateway/control → admin) : every DDL request + GetSchema.
@@ -1130,8 +1132,8 @@ public:
     /// Test-only (D19 L8): build the provisioner but not its runner thread —
     /// start() must refuse (every provisioned roll would wait forever).
     void skipProvisionerRunnerForTest() noexcept { skipProvisionerRunnerForTest_ = true; }
-    /// Test-only: during start(), re-run the SCHEMA log's recovery with this msync errno.
-    void setSchemaRecoveryFaultForTest(int err) noexcept { schemaRecoveryFaultForTest_ = err; }
+    /// Test-only: during start(), re-run the __catalog log's recovery with this msync errno.
+    void setCatalogRecoveryFaultForTest(int err) noexcept { catalogRecoveryFaultForTest_ = err; }
     /// Test-only (concern 4): building the catalog topic `name` (its applied
     /// kA2cCatalogTopicApplied effect) fails — the topic never serves, so its held
     /// DDL OK must be answered Internal (in doubt).  Set before start();
@@ -1214,26 +1216,25 @@ public:
     // thread is alive to drain the task.  stop() additionally SKIPS any task
     // still queued on the control ring when the runtime is joined.
     // Preconditions (fail loudly with std::logic_error / invalid_argument):
-    //   node started and not stopped; topicId != kSchemaTopicId (-4, the
-    //   __topic_schemas replica is AdminWorker-owned — not routable here).
+    //   node started and not stopped; topicId != kCatalogTopicId (-6, the
+    //   __catalog replica is AdminWorker-owned — not routable here).
     // Callers may be on any test thread: the control test-task ring is
     // many-to-one (F9a — no test-side mutex).
     // -----------------------------------------------------------------------
     template <class F>
     auto onOwnerThreadForTest(int32_t topicId, int32_t partition, F&& f,
                               std::chrono::milliseconds timeout = std::chrono::seconds{10}) {
-        if (topicId == kSchemaTopicId) {
+        if (topicId == kCatalogTopicId) {
             throw std::invalid_argument(
-                "onOwnerThreadForTest: __topic_schemas (topicId=-4) is AdminWorker-owned; "
-                "not routable via the owner-thread hook");
+                "onOwnerThreadForTest: __catalog (topicId=-6) is AdminWorker-owned; "
+                "not routable via the owner-thread hook (use onAdminThreadForTest)");
         }
         return submitOwnerThreadTestTask_<OwnerThreadTestTask::Target::Replica>(
             topicId, partition, std::forward<F>(f), timeout);
     }
 
     /// Catalog history Task 6: run `f()` on the ADMIN (AdminWorkerAgent) thread —
-    /// the owner of the __catalog replica, its Log and its plane (and the
-    /// __topic_schemas / __views replicas).  Same contract as
+    /// the owner of the __catalog replica, its Log and its plane.  Same contract as
     /// onOwnerThreadForTest (F9a): the admin thread decides run-or-skip from the
     /// deadline alone; the caller waits for its decision with no bound of its
     /// own.  Precondition: node started (admin worker running), not stopped.
@@ -1263,6 +1264,47 @@ public:
     /// Test-only: the __catalog Log — ONLY while the admin thread is quiesced
     /// (before start(), after stop()); otherwise read it inside onAdminThreadForTest.
     [[nodiscard]] rune::storage::Log* catalogLogForTest() const noexcept { return catalogLog_.get(); }
+    /// Test-only (Task 16): the number of boot replays (CatalogApplier::replayLocal calls that
+    /// returned >= 0) since construction — exactly 1 after every start(): the ONE boot replay,
+    /// on the startup thread (F4).  Immutable once start() returned.
+    [[nodiscard]] int bootReplaysForTest() const noexcept { return bootReplays_; }
+    /// Test-only (Task 16): true iff the TopicRegistry served topic `topicId` when replication
+    /// was built — the catalog's topics are in the registry BEFORE any boot builder runs.
+    [[nodiscard]] bool registryHadTopicBeforeReplicationBuildForTest(int32_t topicId) const noexcept {
+        return std::find(topicsAtReplicationBuild_.begin(), topicsAtReplicationBuild_.end(), topicId) !=
+               topicsAtReplicationBuild_.end();
+    }
+    /// Test-only (Task 16): the topics / dropped ids the boot replay produced (immutable after start()).
+    [[nodiscard]] const std::vector<TopicSpec>& bootTopicsForTest() const noexcept { return bootTopics_; }
+    [[nodiscard]] const std::vector<int32_t>& bootDroppedIdsForTest() const noexcept { return bootDroppedIds_; }
+    /// Test-only (Task 16): the applier's effects phase ("Live" once the admin thread ran),
+    /// read ON the admin thread.
+    [[nodiscard]] std::string catalogApplierPhaseForTest() {
+        return onAdminThreadForTest([this]() { return std::string{adminWorkerAgent_->worker().applier().phaseName()}; });
+    }
+    /// Test-only (Task 16, B6): set BEFORE start(), the __catalog applier applies nothing (the
+    /// replica still replicates) until releaseCatalogApplyForTest — a broker that has received
+    /// the leader's prefix but not applied it has NOT caught up, so a deferred boot reconcile
+    /// must keep waiting.
+    void holdCatalogApplyAtBootForTest(bool on) noexcept { holdCatalogApplyAtBootForTest_ = on; }
+    void releaseCatalogApplyForTest() {
+        onAdminThreadForTest([this]() { adminWorkerAgent_->worker().holdApplyForTest(false); return 0; });
+    }
+    /// Test-only (Task 16): the deferred boot reconcile's state ("None" | "AwaitingCatchUp" |
+    /// "Done"), read ON the admin thread.
+    [[nodiscard]] std::string bootReconcileStateForTest() {
+        return onAdminThreadForTest([this]() { return std::string{adminWorkerAgent_->worker().bootReconcileStateName()}; });
+    }
+    /// Test-only (Task 16): true once no deferred boot reconcile is waiting (it never was, or it
+    /// ran) — bounded by `timeout`.  Needs a running admin thread.
+    [[nodiscard]] bool awaitBootReconcileSettledForTest(std::chrono::milliseconds timeout) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (bootReconcileStateForTest() != "AwaitingCatchUp") return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return bootReconcileStateForTest() != "AwaitingCatchUp";
+    }
     /// Test-only: the control (runtime) thread's id — its own runner, or worker
     /// 0's in fused placement.  Recorded by start() on the controller, immutable
     /// until stop(); default id when not running.
@@ -1461,24 +1503,11 @@ public:
         return schemaRegistry_.get();
     }
 
-    /// Test-only: return raw pointer to the __topic_schemas Log (for record-count
-    /// assertions in SchemaPersistenceTest).
-    rune::storage::Log* schemaLogForTest() const noexcept {
-        return schemaLog_.get();
-    }
-
     /// Test-only: return the ViewRegistry (for byName/byViewTopicId queries in
-    /// tests). Non-null after start() if __views persistence construction
-    /// succeeded. NOT safe for concurrent use — call only when the admin
+    /// tests). Non-null after start(). NOT safe for concurrent use — call only when the admin
     /// thread is quiesced or the node is stopped (mirrors schemaRegistryForTest).
     ViewRegistry* viewRegistryForTest() const noexcept {
         return viewRegistry_.get();
-    }
-
-    /// Test-only: return raw pointer to the __views Log (for record-count
-    /// assertions), mirrors schemaLogForTest.
-    rune::storage::Log* viewsLogForTest() const noexcept {
-        return viewsLog_.get();
     }
 
     /// Test-only: return the AdminWorkerAgent (for direct onDefineTopic calls).
@@ -1642,7 +1671,7 @@ private:
     void buildReplication();   // GR-2/GR-3: replicas + transport + bridge
     void buildGateway();
     void buildWorkerPool();    // E1: shard→worker assignment (must call after replicaRegistry_ is fully built)
-    void buildAdminWorker();   // Task 6: __topic_schemas log/replica + AdminWorker thread
+    void buildAdminWorker();   // Task 6 / 16: the __catalog replica + AdminWorker thread (adopts the booted applier)
     // Catalog history Task 6: dataDir/__catalog Log + replica + its replication
     // plane (admin-thread-owned).  Called from buildAdminWorker before the
     // schema block.  Throws on any failure (no silent fallback: a broker
@@ -1867,23 +1896,6 @@ private:
     std::unique_ptr<MetadataService>                      metadataService_;
 
     // -----------------------------------------------------------------------
-    // Schema registry (Task 6 — __topic_schemas persistence).
-    // schemaLog_         — durable Log for __topic_schemas (one partition).
-    // schemaReplica_     — PartitionReplica wrapping the schema Log.
-    //                      topicId=-4 (kSchemaTopicId), cleanupPolicy=Compact.
-    //                      Majority-durable (minIsr=2) like __transaction_state.
-    //                      Registered in replicaRegistry_ so the bridge drives
-    //                      its leader/follower role from cluster leadership.
-    // schemaRegistry_    — In-memory schema registry (owned by admin thread).
-    //                      Rebuilt from schemaLog_ on startup.
-    // adminWorkerAgent_  — AdminWorkerAgent running on adminWorkerRunner_ thread.
-    //                      Owns the SchemaRegistry; dispatches DefineTopic/Get ops.
-    //
-    // Destruction order (reverse of construction, in stop()):
-    //   adminWorkerRunner_ → adminWorkerAgent_ → schemaRegistry_
-    //   → schemaReplica_ (in registry) → schemaLog_ → …
-    // -----------------------------------------------------------------------
-    // -----------------------------------------------------------------------
     // Catalog history Task 6 — the __catalog partition (topic -6, partition 0).
     // catalogLog_          — durable Log at dataDir/__catalog (never InMemoryLog).
     // catalogPlane_        — its replication plane: a WorkerReplicationTransport
@@ -1902,6 +1914,16 @@ private:
     std::unique_ptr<rune::replication::PubAddBroker>      catalogAddBroker_;
     std::unique_ptr<rune::replication::PartitionReplica>  catalogReplica_;
     bool                                                  catalogOnController_ = false;
+    // Catalog history Task 16 — the boot from __catalog (startup thread; immutable after start()).
+    /// Opens/replays the local __catalog on the startup thread and fills the members below.
+    void bootFromCatalog_();
+    std::vector<TopicSpec>                                bootTopics_;           // static topics, then the catalog's live topics + view sinks (topic-id order)
+    std::vector<int32_t>                                  bootDroppedIds_;       // every topic id the catalog dropped
+    std::optional<CatalogApplier>                         bootApplier_;          // Booted; handed to the AdminWorker by buildAdminWorker
+    int                                                   bootReplays_ = 0;      // replayLocal calls that returned >= 0
+    bool                                                  bootReconcileDeferred_ = false;   // B6: the admin thread reconciles after catch-up
+    bool                                                  holdCatalogApplyAtBootForTest_ = false;
+    std::vector<int32_t>                                  topicsAtReplicationBuild_;   // serving topic ids when replication was built
     std::thread::id                                       controlThreadId_;   // start() (controller); see controlThreadIdForTest
     // Control thread: the last consensus-driven catalog role posted (single node).
     struct PostedRole { bool leader = false; int32_t epoch = -1; };
@@ -1957,31 +1979,15 @@ private:
     int resignIfHalted_(bool consensusLeader);
     uint64_t                                              catalogAlterIsrRefused_ = 0;   // control thread
 
-    std::unique_ptr<rune::storage::Log>                   schemaLog_;
-    std::unique_ptr<rune::replication::PartitionReplica>  schemaReplica_;
+    // Catalog history Task 16: the SchemaRegistry / ViewRegistry are the CatalogApplier's
+    // projections of __catalog (built by bootFromCatalog_ on the startup thread, then
+    // owned by the admin thread); the retired __topic_schemas / __views logs and
+    // replicas are gone.
     std::unique_ptr<SchemaRegistry>                       schemaRegistry_;
     std::unique_ptr<AdminWorkerAgent>                     adminWorkerAgent_;
 
-    // -----------------------------------------------------------------------
-    // View catalog (Task 17 — __views persistence, mirrors __topic_schemas).
-    // viewsLog_         — durable Log for __views (one partition).
-    // viewsReplica_     — PartitionReplica wrapping the views Log.
-    //                      topicId=-5 (kViewsTopicId), cleanupPolicy=Compact.
-    //                      Admin-thread-owned only (same RULING-2 A rationale
-    //                      as schemaReplica_ above): NOT registered in
-    //                      replicaRegistry_/replTransport_, backed by its own
-    //                      NullPartitionTransport.
-    // viewRegistry_     — In-memory view catalog (ViewRegistry), rebuilt from
-    //                      viewsLog_ on startup. The CreateView DDL path that
-    //                      APPENDS records to viewsReplica_ is Task 19 — this
-    //                      wiring only creates the partition + replays it.
-    //
-    // Destruction order (reverse of construction, in stop()):
-    //   viewRegistry_ → viewsReplica_ → viewsLog_ → …
-    // -----------------------------------------------------------------------
-    std::unique_ptr<rune::storage::Log>                   viewsLog_;
-    std::unique_ptr<rune::replication::PartitionReplica>  viewsReplica_;
-    std::unique_ptr<ViewRegistry>                         viewRegistry_;
+    std::unique_ptr<ViewRegistry>                         viewRegistry_;   // (see schemaRegistry_)
+
 
     // -----------------------------------------------------------------------
     // Task 19: live view-fold wiring.  One ViewSnapshotChannel + one
@@ -2081,7 +2087,7 @@ private:
     void onInvariantViolation_(const std::string& what);
     int  recoveryFaultForTest_ = 0;
     bool skipProvisionerRunnerForTest_ = false;
-    int  schemaRecoveryFaultForTest_ = 0;
+    int  catalogRecoveryFaultForTest_ = 0;
     std::optional<std::string>             commitReplicaFault_; // control thread after start()
     // C1 / M7: a DefineTopic / CreateView OK leaves only once its topic serves
     // (see DdlAnswerGate.h).  Control-thread-owned; one drain of the admin egress

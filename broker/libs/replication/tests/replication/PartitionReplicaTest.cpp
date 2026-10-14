@@ -4721,9 +4721,9 @@ TEST(InternalIsrRegression, AdoptRejectsImplausibleLearnedStates) {
 // Re-review 2026-10-04 (fix round 2) MEDIUM-C: the lag shrink restored for
 // internal partitions (MAJOR-3) is safe only where the removal commits on a
 // majority's durable knowledge that the consensus vote rule reads.  An internal
-// partition OUTSIDE that store (__topic_schemas, -4: self-managed, not in the
+// partition OUTSIDE that store (__catalog, -6: admin-owned, not in the
 // replica registry) must not lag-shrink — once replicated it would shrink at
-// once while the shrunk node stays electable (MAJOR-2 reopened for schemas).
+// once while the shrunk node stays electable (MAJOR-2 reopened for the catalog).
 // User partitions and partitions on the internal-ISR store still shrink.
 TEST(InternalIsrRegression, InternalPartitionOutsideKnowledgeStoreNeverLagShrinks) {
     TempDir lDir("iisr_c_L"), fDir("iisr_c_F"), gDir("iisr_c_G");
@@ -4733,7 +4733,7 @@ TEST(InternalIsrRegression, InternalPartitionOutsideKnowledgeStoreNeverLagShrink
     std::vector<NodeId> all = {kL, kF, kG};
     auto cfgFor = [&](NodeId id) {
         PartitionConfig c = makeConfig(id, /*lagMs=*/10, /*lagOff=*/1'000'000);
-        c.topicId = -4;                          // __topic_schemas: no knowledge store wired
+        c.topicId = -6;                          // __catalog: no knowledge store wired
         return c;
     };
     PartitionReplica l(cfgFor(kL), Role::Follower, 0, all, all, &lLog, &transport);
@@ -4904,4 +4904,47 @@ TEST(InternalIsrRegression, TransientOpenErrorRetriedNotFailClosed) {
     EXPECT_EQ(k->latest(-3, 0)->version, 2);
     EXPECT_FALSE(k->eligible(3));
     EXPECT_TRUE(k->eligible(1));
+}
+
+// Catalog history Task 16 (B6): a wiped / fresh follower is NOT caught up until its CURRENT-epoch leader told
+// it its HW and answered its last fetch with nothing beyond its log end.  RED (before caughtUpWithLeader):
+// there was no signal to defer the destructive boot reconcile on — a follower's HW reads 0 until its leader
+// answers, and a chunked catch-up reads "HW == LEO" after the first chunk.
+TEST(PartitionReplicaCaughtUpRegression, AFollowerIsCaughtUpOnlyOnceItsCurrentLeaderAnsweredEmpty) {
+    TempDir dir("caughtup");
+    rune::storage::Log log(dir.path);
+    InMemoryTransport transport;
+    constexpr NodeId kL = 1, kF = 2;
+    PartitionReplica f(makeConfig(kF), Role::Follower, /*epoch=*/1, {kL, kF}, {kL, kF}, &log, &transport);
+    EXPECT_FALSE(f.caughtUpWithLeader()) << "never heard a leader";
+
+    auto p = makePayload(0x42, 8);
+    FetchResponseMsg withRecords{};
+    withRecords.leaderEpoch = 1; withRecords.partition = 0; withRecords.highWatermark = 5;
+    withRecords.logStartOffset = 0; withRecords.errorCode = kErrNone;
+    withRecords.records = std::span<const uint8_t>(p.data(), p.size());
+    f.applyReplicated(withRecords);
+    ASSERT_EQ(f.logEndOffset(), 1);
+    EXPECT_FALSE(f.caughtUpWithLeader()) << "a response that carried records: more to pull (leader HW 5 > our end 1)";
+
+    FetchResponseMsg empty{};
+    empty.leaderEpoch = 1; empty.partition = 0; empty.highWatermark = 1;
+    empty.logStartOffset = 0; empty.errorCode = kErrNone;
+    f.applyReplicated(empty);
+    EXPECT_TRUE(f.caughtUpWithLeader()) << "the leader had nothing beyond our log end and told us its HW";
+    EXPECT_EQ(f.highWatermark(), 1);
+
+    f.becomeFollower(2, kL);   // a new leader epoch: start over
+    EXPECT_FALSE(f.caughtUpWithLeader()) << "the new epoch's leader has not answered yet";
+    FetchResponseMsg empty2{};
+    empty2.leaderEpoch = 2; empty2.partition = 0; empty2.highWatermark = 1;
+    empty2.logStartOffset = 0; empty2.errorCode = kErrNone;
+    f.applyReplicated(empty2);
+    EXPECT_TRUE(f.caughtUpWithLeader());
+
+    TempDir ldir("caughtup_l");
+    rune::storage::Log llog(ldir.path);
+    PartitionReplica l(makeConfig(kL), Role::Follower, 0, {kL}, {kL}, &llog, &transport);
+    l.becomeLeader(3, {kL});
+    EXPECT_TRUE(l.caughtUpWithLeader()) << "a leader's own HW is the truth (the caller checks its commit state)";
 }

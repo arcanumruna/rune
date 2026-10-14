@@ -65,7 +65,7 @@ public:
         // MAJOR-2/3: internal replicas commit ISR changes on a majority's
         // durable knowledge (this node's store).
         // MEDIUM-B: only __cluster_metadata (the coordinator partitions are on
-        // the controller-ISR path; __topic_schemas is not in this registry).
+        // the controller-ISR path; __catalog is not in this registry).
         if (topicId == rune::replication::InternalIsrKnowledge::kCandidacyTopicId &&
             internalIsrKnowledge_ != nullptr)
             replica->setInternalIsrKnowledge(internalIsrKnowledge_);

@@ -316,6 +316,59 @@ int AdminWorker::bootCatalog(BootEffects boot, LiveEffects live) {
     return replayed;
 }
 
+void AdminWorker::adoptBootedApplier(CatalogApplier booted, LiveEffects live) {
+    if (booted.phaseName() != "Booted")
+        throw std::runtime_error("AdminWorker: the adopted CatalogApplier is in phase " +
+                                 std::string{booted.phaseName()} + ", not Booted — the broker's startup phase runs "
+                                 "the one boot replay; refusing to start");
+    if (pendingLive_)
+        throw std::logic_error("AdminWorker: an applier was already adopted");
+    applier_     = std::move(booted);
+    pendingLive_ = std::move(live);
+}
+
+void AdminWorker::deferTopicDirReconcile(std::string dataDir, std::vector<TopicSpec> alsoClaimed) {
+    bootReconcile_ = AwaitingCatchUp{std::move(dataDir), std::move(alsoClaimed)};
+}
+
+std::string_view AdminWorker::bootReconcileStateName() const noexcept {
+    switch (bootReconcile_.index()) {
+    case 0:  return "None";
+    case 1:  return "AwaitingCatchUp";
+    default: return "Done";
+    }
+}
+
+bool AdminWorker::bootReconcileReady_() const noexcept {
+    if (catalogReplica_ == nullptr || applier_.halted()) return false;
+    if (catalogReplica_->role() == rune::replication::Role::Leader) return caughtUp_();
+    return catalogReplica_->caughtUpWithLeader() && applier_.nextOffset() >= catalogReplica_->logEndOffset();
+}
+
+int AdminWorker::stepBootReconcile_() {
+    const auto* d = std::get_if<AwaitingCatchUp>(&bootReconcile_);
+    if (d == nullptr) return 0;
+    if (applier_.halted()) {
+        spdlog::critical("AdminWorker: the deferred topic-dir reconcile is CANCELLED — the catalog apply halted "
+                         "(catalog damage: no destructive cleanup)");
+        bootReconcile_ = BootReconcileDone{};
+        return 1;
+    }
+    if (!bootReconcileReady_()) return 0;
+    const cat::CatalogState& s = applier_.state();
+    std::vector<TopicSpec> live = d->alsoClaimed;
+    for (const cat::TopicObject* t : s.topics()) { TopicSpec ts; ts.name = t->name; ts.topicId = t->topicId; live.push_back(std::move(ts)); }
+    for (const cat::ViewObject* v : s.views())  { TopicSpec ts; ts.name = v->name; ts.topicId = v->def.viewTopicId; live.push_back(std::move(ts)); }
+    const std::vector<int32_t> dropped = droppedTopicIds(s);
+    spdlog::info("AdminWorker: the applier caught up to the catalog leader at offset {} ({} live topic(s)) — "
+                 "running the topic-dir reconcile deferred at boot", applier_.nextOffset(), live.size());
+    reconciled_ = reconcileTopicDirs(d->dataDir, live, dropped,
+                                     std::chrono::duration_cast<std::chrono::seconds>(
+                                         std::chrono::system_clock::now().time_since_epoch()).count());
+    bootReconcile_ = BootReconcileDone{};
+    return 1;
+}
+
 std::string_view AdminWorker::roleName() const noexcept {
     switch (role_.index()) {
     case 0:  return "Follower";
@@ -490,6 +543,13 @@ void AdminWorker::submitGetSchema(const GetSchemaMsg& msg) {
 // ─── doWork ─────────────────────────────────────────────────────────────────
 int AdminWorker::doWork(int64_t nowNs) {
     int work = 0;
+    if (pendingLive_) [[unlikely]] {   // Task 16: the booted applier goes live, once, on this thread
+        if (!applier_.goLive(std::move(*pendingLive_)))
+            spdlog::critical("AdminWorker: the booted CatalogApplier refused to go live (phase {}) — the catalog "
+                             "will not apply", applier_.phaseName());
+        pendingLive_.reset();
+        ++work;
+    }
     if (catalogPlane_ && catalogReplica_) {
         work += catalogPlane_->drivePeerResolve();
         work += catalogPlane_->poll(kCatalogFragmentLimit,
@@ -504,6 +564,7 @@ int AdminWorker::doWork(int64_t nowNs) {
     if (catalogReplica_) {
         work += catalogReplica_->doWork(nowNs);
         if (!applyHeldForTest_) [[likely]] work += applier_.applyCommitted(*catalogReplica_);
+        if (std::holds_alternative<AwaitingCatchUp>(bootReconcile_)) [[unlikely]] work += stepBootReconcile_();
         // Task 12: catalog reads, after the applier (what it serves is the HW the
         // replica pass just computed; a halted applier does not stop reads).
         work += readServer_->pump(nowNs);

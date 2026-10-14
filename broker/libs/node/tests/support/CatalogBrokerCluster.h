@@ -183,10 +183,15 @@ struct ThreeNodes {
         return c;
     }
 
+    /// Catalog history Task 16: called with (id, the constructed, not yet started node) —
+    /// the pre-start test seams (holdCatalogApplyAtBootForTest).
+    std::function<void(int, BrokerNode&)> beforeStart;
+
     void startNode(int id) {
         NodeConfig cfg = makeConfig(id, dirs[static_cast<std::size_t>(id - 1)]->path, ports, 3, mode);
         if (configTweak) configTweak(cfg);
         nodes[static_cast<std::size_t>(id - 1)] = std::make_unique<BrokerNode>(cfg);
+        if (beforeStart) beforeStart(id, *nodes[static_cast<std::size_t>(id - 1)]);
         nodes[static_cast<std::size_t>(id - 1)]->start();
     }
     void stop(int id) {

@@ -87,42 +87,34 @@ One rule applies to `RUNE_TOPICS` entries, the client's `defineTopic` and `creat
 
 ### Data directory clean-up at boot
 
-- A topic id whose definition never committed has no catalog record. The usual cause is a
-  `defineTopic` or `createView` that failed after its topic was created and was not retried.
-  Such a topic never held data: it was not writable before its definition committed. Boot keeps
-  the id as a hidden placeholder `__orphan.<id>` with zero partitions, so later topics keep their
-  ids. A placeholder is not listed in metadata, and produce and subscribe to it are refused. Boot
-  logs all placeholders in one warning line.
-- Every runtime-defined disk topic directory holds a `topic-id` marker file. It reads
-  `pending <id>` when the topic is created and is rewritten to `committed <id>` once the catalog
-  record commits. At boot, a `pending` marker on a directory the catalog claims is promoted to
-  `committed`. `RUNE_TOPICS` topics get no marker.
-- At boot the broker reconciles `dataDir/topics/` with the catalog. A directory no topic claims is
-  **deleted** only if all of these hold:
-  - its marker reads `pending <id>`, and boot created the `__orphan.<id>` placeholder for that id
-    (matched by id, never by name);
-  - every `<partition>/*.log` file in it is 0 bytes. A directory whose log holds bytes is
-    quarantined, and an error line names the placeholder;
-  - neither catalog log (`__topic_schemas`, `__views`) was truncated at recovery, and neither is
-    missing while the other exists — on this boot or an earlier one (see below).
-- Any other unclaimed directory is **moved, never deleted**, to
-  `dataDir/quarantine/<name>-<unix-timestamp>/`, and a warning names both paths. This covers a
+`__catalog` is the single source of truth for which topics exist. At boot the broker replays its
+local copy of `__catalog` once, before it builds anything, and builds every topic, schema and view
+from that replay. The old `dataDir/__topic_schemas` and `dataDir/__views` directories are never
+read and never changed (there is no migration); a warning names them if they hold data.
+
+- At boot the broker reconciles `dataDir/topics/` with the catalog. A directory no live topic
+  claims is **moved, never deleted**, to `dataDir/quarantine/<name>-<unix-timestamp>/`, and a
+  warning names both paths. A name matches exactly or ignoring ASCII letter case. This covers a
   topic removed from `RUNE_TOPICS`, a misspelt name, and a directory left by another build.
-  With a damaged catalog nothing is deleted that boot, and one warning line says why. The damage is
-  remembered in `dataDir/.catalog-damaged`, so later boots delete nothing either (recovery cuts
-  the damaged catalog, so a later boot would otherwise read it as intact). The file is removed
-  once a boot leaves no unclaimed topic directory in `dataDir/topics/`; you may also remove it by
-  hand after checking `dataDir/quarantine/`.
+- `dataDir/dropped/<id>.<name>` holds the data of a dropped topic until its purge finishes. At boot
+  the broker finishes any purge that a crash interrupted, but only for a topic id the catalog marks
+  dropped. Any other entry is left alone and a warning names it.
 - Reconcile only considers direct children of `dataDir/topics/` laid out as
   `<name>/<partition number>/<files>`. It never follows a symlink, and it leaves anything else
-  alone.
-- **Removing a topic from `RUNE_TOPICS` quarantines its data at the next boot.** Adding the
-  topic back starts it **empty**; the broker never restores quarantined data by itself. To restore:
-  1. Stop the broker.
-  2. Make sure `RUNE_TOPICS` lists the topic with the **same partition count**.
-  3. Delete the new, empty `dataDir/topics/<name>/` if it exists.
-  4. Run `mv dataDir/quarantine/<name>-<timestamp> dataDir/topics/<name>`.
-  5. Start the broker.
+  alone. A crash during reconcile is safe: the next boot finishes the same moves.
+- **A boot whose catalog replay halts moves, renames, deletes and quarantines nothing.** The
+  broker boots with the catalog it had already applied, accepts no catalog change, and logs the
+  halt at critical level. Repair the catalog, then restart.
+- **A broker whose local `__catalog` is empty or missing while `dataDir/topics/` holds topics**
+  (an operator deleted it, or the disk is new) does not reconcile at boot. It first catches up
+  to the catalog leader's committed history, serves the topics that history names over their
+  existing directories, and only then quarantines the directories no topic claims.
+- A boot refuses to start, with an error that names both offsets, when `dataDir/__catalog/applied`
+  (the last applied offset) is at or past the end of the local `__catalog` log: events this broker
+  already applied are missing, and replaying a shorter history would fork its catalog. Restore the
+  data directory, or delete `dataDir/__catalog` entirely (including `applied`) so the broker
+  refetches the catalog from its peers. A corrupt `applied` file refuses to start too. A missing
+  one means nothing was applied yet.
 - Delete quarantined directories yourself once you no longer need them; the broker never
   deletes from `dataDir/quarantine/`.
 - **A `RUNE_TOPICS` name may not collide with a runtime topic.** If a `RUNE_TOPICS` entry has

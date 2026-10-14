@@ -20,7 +20,7 @@ add_library(rune_node
     src/CatalogEffectFrames.cpp
     src/ViewSnapshotIoAgent.cpp
     src/WorkerViewSet.cpp
-    src/RuntimeTopicRecovery.cpp)
+    src/TopicDirReconcile.cpp)
 
 # The worker's io backends, as their own leaf library: Worker.h's header-inline
 # code (instantiated by rune_replication's AeronPartitionTransport.cpp too) calls
@@ -158,8 +158,7 @@ if(BUILD_TESTING)
         tests/node/RingDoorbellTest.cpp
         tests/node/ViewSnapshotIoAgentTest.cpp
         tests/node/WorkerViewSetTest.cpp
-        tests/node/RuntimeTopicRecoveryTest.cpp
-        tests/support/LegacyRuntimeTopicRecovery.cpp
+        tests/node/TopicDirReconcileTest.cpp
         tests/node/TopicNameTest.cpp
         tests/node/ViewReadinessRegressionTest.cpp
         tests/node/ViewRecoveryRegressionTest.cpp
@@ -1552,6 +1551,14 @@ if(BUILD_TESTING)
         target_include_directories(rune_catalog_effects_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_catalog_effects_tests PRIVATE rune_node rune_view rune_codec aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_catalog_effects_tests PROPERTIES TIMEOUT 360 RESOURCE_LOCK rune_udp_ports)
+
+        # Catalog history Task 16: the broker boots from __catalog (the one boot
+        # replay on the startup thread, topics built from the catalog, dropped ids
+        # tombstoned, the topic-dir reconcile) — real single-node and 3-node brokers.
+        add_executable(rune_catalog_boot_tests tests/node/CatalogBootTest.cpp)
+        target_include_directories(rune_catalog_boot_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_catalog_boot_tests PRIVATE rune_node rune_view rune_codec aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_catalog_boot_tests PROPERTIES TIMEOUT 360 RESOURCE_LOCK rune_udp_ports)
 
         # Leader-epoch monotonicity across restarts (Kafka parity): full cold
         # restart, single-node restart, stale same-epoch tail on a follower.

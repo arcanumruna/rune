@@ -10,6 +10,7 @@
 #include "support/CatalogRig.h"
 
 #include <rune/node/AdminChannels.h>
+#include <rune/node/AdminWorker.h>
 #include <rune/node/BrokerNode.h>   // AdminWorkerAgent (the production sinks)
 #include <rune/node/CatalogApplier.h>
 #include <rune/node/CatalogCheckpoint.h>
@@ -30,6 +31,7 @@
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -978,4 +980,147 @@ TEST(CatalogApplierRegression, GoLiveWithoutTheBootReplayIsRefusedWhenACheckpoin
     ASSERT_EQ(rig.applier.replayLocal(rig.replica(), rig.rec.bootEffects()), 3);
     EXPECT_TRUE(rig.applier.goLive(rig.rec.liveEffects()));
     EXPECT_FALSE(rig.applier.goLive(rig.rec.liveEffects())) << "already Live";
+}
+
+// ═══ Catalog history Task 16: the startup boot ═══════════════════════════════
+
+// The broker's startup phase replays over the catalog LOG alone (no replica or transport exists yet):
+// the same state, the same digest, the same one-replay rule as the replica form.
+TEST(CatalogApplierRegression, ReplayLocalOverTheLogAloneBootsTheSameStateAsTheReplicaFormRegression) {
+    CatalogRig rig("ap_logform");
+    rig.appendEvents(0, 10);
+    rig.applier.applyCommitted(rig.replica());
+    const uint64_t digest = rig.applier.state().digest();
+    rig.restart();
+    rune::node::SchemaRegistry schemas;
+    rune::node::ViewRegistry views;
+    rune::node::CatalogApplier boot(rig.catalogDir(), schemas, views);
+    EXPECT_EQ(boot.replayLocal(rig.log(), rig.rec.bootEffects()), 10);
+    EXPECT_EQ(boot.phaseName(), "Booted");
+    EXPECT_EQ(boot.state().digest(), digest);
+    EXPECT_NE(schemas.byName("players"), nullptr) << "the registries are the applier's projections";
+    EXPECT_EQ(boot.replayLocal(rig.log(), rig.rec.bootEffects()), -1) << "exactly one boot replay";
+}
+
+TEST(CatalogApplierRegression, ReplayLocalOverTheLogRefusesACheckpointAheadOfTheLogRegression) {
+    CatalogRig rig("ap_logahead");
+    rig.appendEvents(0, 4);
+    rig.applier.applyCommitted(rig.replica());
+    rig.restart();
+    ASSERT_TRUE(rune::node::writeCatalogCheckpoint(rig.catalogDir(), {rig.log().logEndOffset() + 2, 0x1234}));
+    rune::node::SchemaRegistry schemas;
+    rune::node::ViewRegistry views;
+    rune::node::CatalogApplier boot(rig.catalogDir(), schemas, views);
+    try {
+        (void)boot.replayLocal(rig.log(), rig.rec.bootEffects());
+        FAIL() << "a checkpoint ahead of the log must refuse to boot";
+    } catch (const std::runtime_error& ex) {
+        const std::string what = ex.what();
+        EXPECT_NE(what.find("offset " + std::to_string(rig.log().logEndOffset() + 2)), std::string::npos) << what;
+        EXPECT_NE(what.find("ends at " + std::to_string(rig.log().logEndOffset())), std::string::npos) << what;
+    }
+}
+
+// The boot sink the BROKER passes collects the topics; everything that needs a running broker is
+// posted afterwards from the applied state by postBootStash — validators, view sink gate + recovery
+// install, the metric — and never a topic create / drop.
+TEST(CatalogApplierRegression, PostBootStashPostsOnlyWhatNeedsARunningBrokerRegression) {
+    CatalogRig rig("ap_stash");
+    rig.appendEvents(0, rig.golden().size());
+    rig.applier.applyCommitted(rig.replica());
+    ASSERT_FALSE(rig.applier.halted());
+    const uint64_t digest = rig.applier.state().digest();
+    const int64_t  last   = rig.applier.lastApplied().offset;
+    rig.restart();
+    rune::node::SchemaRegistry schemas;
+    rune::node::ViewRegistry views;
+    rune::node::CatalogApplier boot(rig.catalogDir(), schemas, views);
+    std::vector<int32_t> topics, sinks;
+    rune::node::CatalogEffects collect;
+    collect.topicApplied = [&](const cat::TopicObject& t) { topics.push_back(t.topicId); };
+    collect.sinkApplied  = [&](const rune::node::SinkSpec& s) { sinks.push_back(s.topicId); };
+    ASSERT_GT(boot.replayLocal(rig.log(), rune::node::BootEffects{std::move(collect)}), 0);
+    EXPECT_EQ(topics.size(), boot.state().topics().size());
+    EXPECT_EQ(sinks.size(), boot.state().views().size());
+    EXPECT_TRUE(rig.rec.sequence.empty()) << "the boot sink given to replayLocal is the only one that ran";
+
+    boot.postBootStash(rig.rec.bootEffects().sink);
+    EXPECT_EQ(rig.rec.appliedOffsets, (std::vector<int64_t>{last}));
+    EXPECT_EQ(rig.rec.appliedDigests, (std::vector<uint64_t>{digest}));
+    EXPECT_TRUE(rig.rec.halts.empty());
+    EXPECT_FALSE(rig.rec.bootViewInstalls.empty()) << "every live view reinstalls through the BOOT sink";
+    std::size_t sinkPosts = 0;
+    for (const std::string& s : rig.rec.sequence) {
+        EXPECT_NE(s.rfind("topicApplied:", 0), 0u) << s << ": topics are the startup phase's";
+        EXPECT_NE(s.rfind("topicDropped:", 0), 0u) << s << ": a dropped object posts nothing";
+        sinkPosts += s.rfind("sinkApplied:", 0) == 0 ? 1 : 0;
+    }
+    EXPECT_EQ(sinkPosts, boot.state().views().size());
+}
+
+TEST(CatalogApplierRegression, PostBootStashDeliversTheHaltOfAHaltedBootRegression) {
+    CatalogRig rig("ap_stash_halt");
+    rig.appendEvents(0, 5);
+    rig.applier.applyCommitted(rig.replica());
+    rig.restart();
+    ASSERT_TRUE(rune::node::writeCatalogCheckpoint(rig.catalogDir(), {4, 0xBAD}));
+    rune::node::SchemaRegistry schemas;
+    rune::node::ViewRegistry views;
+    rune::node::CatalogApplier boot(rig.catalogDir(), schemas, views);
+    (void)boot.replayLocal(rig.log(), rune::node::BootEffects{});
+    ASSERT_TRUE(boot.halted());
+    boot.postBootStash(rig.rec.bootEffects().sink);
+    ASSERT_EQ(rig.rec.halts.size(), 1u) << "the control thread reports the halt once the broker runs";
+    EXPECT_EQ(rig.rec.halts[0].code, cat::ApplyError::Code::FingerprintMismatch);
+}
+
+// B3: the dropped ids are the complement of the live ids below nextTopicId — a tombstone records the
+// object, not its topic id, and an AlterView-retired sink has no tombstone at all.
+TEST(CatalogApplierRegression, DroppedTopicIdsAreEveryAssignedIdNoLiveTopicOrSinkHoldsRegression) {
+    CatalogRig rig("ap_dropped");
+    rig.appendEvents(0, rig.golden().size());
+    rig.applier.applyCommitted(rig.replica());
+    ASSERT_FALSE(rig.applier.halted());
+    const cat::CatalogState& s = rig.applier.state();
+    ASSERT_FALSE(s.tombstones().empty()) << "the golden script drops topics and views";
+    const std::vector<int32_t> dropped = rune::node::droppedTopicIds(s);
+    std::set<int32_t> live;
+    for (const auto* t : s.topics()) live.insert(t->topicId);
+    for (const auto* v : s.views()) live.insert(v->def.viewTopicId);
+    EXPECT_EQ(dropped.size() + live.size(), static_cast<std::size_t>(s.nextTopicId()));
+    EXPECT_TRUE(std::is_sorted(dropped.begin(), dropped.end()));
+    for (const int32_t id : dropped) {
+        EXPECT_GE(id, 0);
+        EXPECT_LT(id, s.nextTopicId());
+        EXPECT_EQ(live.count(id), 0u) << id << " is live";
+    }
+    EXPECT_TRUE(rune::node::droppedTopicIds(cat::CatalogState{}).empty()) << "an empty catalog";
+}
+
+// F4: the admin thread never replays — it adopts the applier the startup phase booted, and its FIRST pass
+// makes it Live.  An applier that did not boot is a refusal to start, never a second replay.
+TEST(CatalogApplierRegression, AdminWorkerAdoptsOnlyABootedApplierAndGoesLiveOnItsFirstPassRegression) {
+    CatalogRig rig("ap_adopt");
+    rig.appendEvents(0, 3);
+    rig.applier.applyCommitted(rig.replica());
+    rig.restart();
+    rune::node::SchemaRegistry schemas;
+    rune::node::ViewRegistry views;
+    rune::node::AdminDeps deps;
+    rune::node::AdminWorker worker(schemas, nullptr, 0, {}, deps, nullptr, &views);
+
+    rune::node::CatalogApplier unbooted(rig.catalogDir(), schemas, views);
+    EXPECT_THROW(worker.adoptBootedApplier(std::move(unbooted), rune::node::LiveEffects{}), std::runtime_error)
+        << "an AwaitingBoot applier would replay on the admin thread";
+
+    rune::node::CatalogApplier booted(rig.catalogDir(), schemas, views);
+    ASSERT_EQ(booted.replayLocal(rig.log(), rune::node::BootEffects{}), 3);
+    ASSERT_EQ(booted.phaseName(), "Booted");
+    worker.adoptBootedApplier(std::move(booted), rig.rec.liveEffects());
+    EXPECT_EQ(worker.applier().phaseName(), "Booted") << "still Booted until the admin thread's first pass";
+    EXPECT_EQ(worker.applier().nextOffset(), 3);
+    (void)worker.doWork(1'000'000);
+    EXPECT_EQ(worker.applier().phaseName(), "Live");
+    EXPECT_EQ(worker.applier().nextOffset(), 3) << "nothing replayed";
+    EXPECT_TRUE(rig.rec.sequence.empty()) << "and no effect re-posted";
 }

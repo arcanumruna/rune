@@ -38,6 +38,7 @@
 #include "rune/node/CatalogPartition.h"
 #include "rune/node/CatalogReadServer.h"
 #include "rune/node/SchemaRegistry.h"
+#include "rune/node/TopicDirReconcile.h"
 #include "rune/node/ViewRegistry.h"
 
 #include <rune/catalog/CatalogEvent.h>
@@ -163,7 +164,7 @@ struct DdlRejection {
 class AdminWorker {
 public:
     /// \param reg            the SchemaRegistry the applier projects (admin-owned).
-    /// \param replica        the retired __topic_schemas replica (Task 16 deletes it):
+    /// \param replica        the retired __topic_schemas replica (null since Task 16; kept for the rigs):
     ///                       its role is still driven by onRole, nothing reads or writes it.
     /// \param selfId         this node's id.
     /// \param replicaSet     every broker (onRole's ISR seed for the retired replicas).
@@ -227,16 +228,39 @@ public:
     }
 
     // ── Boot (startup thread, BEFORE the admin thread starts — binding 7) ───
-    /// The one boot replay of the local __catalog prefix (applier.replayLocal
-    /// through `boot`), then applier.goLive(`live`).  Throws std::runtime_error
-    /// (the broker refuses to start) when the replay refuses — a damaged or
-    /// too-far checkpoint.  No catalog replica: goes live on an empty catalog.
-    /// Returns the events replayed.  Task 16 moves the replay to the startup
-    /// phase proper (F4).
+    /// Rigs without a BrokerNode only: the one boot replay of the local __catalog
+    /// prefix (applier.replayLocal through `boot`), then applier.goLive(`live`).
+    /// Throws std::runtime_error (refuse to start) when the replay refuses — a
+    /// damaged or too-far checkpoint.  No catalog replica: goes live on an empty
+    /// catalog.  Returns the events replayed.  A BrokerNode never calls it (Task 16,
+    /// F4): its STARTUP phase ran the one replay before any builder and hands the
+    /// booted applier over with adoptBootedApplier — a second replay is refused
+    /// by the applier.
     int bootCatalog(BootEffects boot, LiveEffects live);
 
+    /// Task 16: take over the applier the broker's startup phase booted (phase
+    /// Booted — std::runtime_error otherwise: the broker refuses to start).  The
+    /// admin thread's FIRST pass makes it Live through `live` (the ring encoders);
+    /// nothing is replayed again.  The applier's registries must be the ones this
+    /// worker was built over.  Startup thread, before the admin thread starts.
+    void adoptBootedApplier(CatalogApplier booted, LiveEffects live);
+
+    /// Task 16 (B6): the broker booted from an EMPTY local catalog while dataDir
+    /// holds topic dirs (the catalog was wiped, or a new disk) — the topic-dir
+    /// reconcile waits until this broker's applier has caught up to the catalog
+    /// leader's committed prefix, then runs ONCE on the admin thread against the
+    /// applied catalog.  Never run on a halted applier.  Startup thread, before the
+    /// admin thread starts.
+    /// `alsoClaimed`: topics the catalog does not name but this broker serves
+    /// (the INTERIM static RUNE_TOPICS topics until Task 17).
+    void deferTopicDirReconcile(std::string dataDir, std::vector<TopicSpec> alsoClaimed = {});
+    /// "None" | "AwaitingCatchUp" | "Done" — the deferred reconcile's state.
+    [[nodiscard]] std::string_view bootReconcileStateName() const noexcept;
+    /// The last deferred reconcile's outcome (admin thread, after it ran).
+    [[nodiscard]] const TopicDirReconciliation& bootReconcileResultForTest() const noexcept { return reconciled_; }
+
     // ── Roles (control → admin, admin thread) ───────────────────────────────
-    /// The retired __topic_schemas / __views replicas' role (nothing reads them).
+    /// The retired __topic_schemas / __views replicas' role (null in a broker since Task 16).
     void onRole(const AdminRoleMsg& role);
     /// The __catalog replica's role (multi-node: the committed (-6, 0) assignment;
     /// single node: the consensus leader).  Demotion answers an in-flight DDL the
@@ -396,6 +420,21 @@ private:
     uint64_t eventsAppended_    = 0;
     uint64_t preV8Refused_      = 0;
     bool     applyHeldForTest_  = false;   // holdApplyForTest (test seam only)
+
+    // The booted applier's goLive, owed to the admin thread's first pass (Task 16).
+    std::optional<LiveEffects> pendingLive_;
+    // The deferred boot reconcile (B6) — rule 3: one state, its own variables.
+    struct NoBootReconcile {};
+    struct AwaitingCatchUp { std::string dataDir; std::vector<TopicSpec> alsoClaimed; };
+    struct BootReconcileDone {};
+    std::variant<NoBootReconcile, AwaitingCatchUp, BootReconcileDone> bootReconcile_{NoBootReconcile{}};
+    TopicDirReconciliation reconciled_;
+    /// The applier has caught up to the catalog leader's committed prefix: a
+    /// serving leader, or a follower whose leader told it its HW and answered
+    /// its last fetch with nothing beyond this broker's log end — and everything
+    /// this broker holds is applied.
+    [[nodiscard]] bool bootReconcileReady_() const noexcept;
+    int stepBootReconcile_();
     PlacementViewMsg placement_{};         // the control thread's placement view (onPlacementView)
     bool             placementKnown_ = false;
 

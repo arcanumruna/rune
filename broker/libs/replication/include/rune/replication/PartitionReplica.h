@@ -698,6 +698,16 @@ public:
         return role_ == Role::Leader || hwLearnedEpoch_ == static_cast<int64_t>(epoch_);
     }
 
+    /// Catalog history Task 16 (B6): this replica has LEARNED its current leader's
+    /// committed prefix and holds all of it — a leader (its own HW is the truth;
+    /// the caller checks its commit state), or a follower whose current-epoch
+    /// leader answered its last fetch with nothing beyond our log end (FollowerSync
+    /// InSync) after telling us its HW.  A fresh or wiped follower is false until
+    /// it has fetched everything the leader had.
+    [[nodiscard]] bool caughtUpWithLeader() const noexcept {
+        return role_ == Role::Leader || (committedHwKnown() && followerSync_.inSync());
+    }
+
     /// Soft per-replica position snapshot for the controller's election path.
     /// leaderEpoch = epoch(); logEndPosition = logEndOffset().
     [[nodiscard]] ReplicaPositionReport positionReport() const noexcept {

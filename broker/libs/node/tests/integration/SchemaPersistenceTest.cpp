@@ -17,11 +17,10 @@
 //   * an event past the HW is never applied;
 //   * every version survives: __catalog is NEVER compacted (the composite
 //     compaction key of __topic_schemas is moot — no compaction to survive);
-//   * a topic is claimed under its OWN name at boot (catalogLiveTopicSpecs).
-// Retired with __topic_schemas' boot replay (Task 16 deletes the log): its
+//   * a topic is claimed under its OWN name at boot (the boot replay's topics).
+// Retired with __topic_schemas (Task 16 deleted the log and TopicSchema's codec): its
 // corrupt / truncated-record boot aborts — the catalog's are CatalogApplier's
 // (Task 7: decode / fingerprint / digest halts, checkpoint-beyond-log refusal).
-// TopicSchema's own codec (still in the tree until Task 16) keeps its tests.
 // ---------------------------------------------------------------------------
 
 #include <unistd.h>
@@ -31,7 +30,8 @@
 
 #include <rune/node/AdminWorker.h>
 #include <rune/node/CatalogPartition.h>
-#include <rune/node/RuntimeTopicRecovery.h>
+#include <rune/node/CatalogApplier.h>
+#include <rune/node/ViewRegistry.h>
 #include <rune/node/SchemaRegistry.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/replication/Types.h>
@@ -343,155 +343,25 @@ TEST(SchemaPersistenceTest, DefineTopicRecordRecoversTopicUnderItsOwnNameRegress
     ASSERT_EQ(rig.define({.name = "src", .partitions = 1, .typed = true}).code, 0);
     ASSERT_EQ(rig.createView("v_src", "src").code, 0);
     ASSERT_EQ(rig.dropTopic("gone").code, 0);
-    const std::string dataDir = fs::path(rig.catalogDir()).parent_path().string();
-    const auto specs = catalogLiveTopicSpecs(dataDir);
+    // The broker's startup boot (Task 16): a fresh applier's one replay over the catalog Log
+    // names the topics boot builds — a topic under its OWN name, a view sink under the view's;
+    // a dropped topic is in the dropped ids, not the topics.
+    rune::storage::Log log(rig.catalogDir());
+    log.recover();
+    SchemaRegistry schemas;
+    ViewRegistry views;
+    CatalogApplier boot(rig.catalogDir(), schemas, views);
+    struct Named { std::string name; int32_t id; int32_t partitions; };
+    std::vector<Named> specs;
+    CatalogEffects fx;
+    fx.topicApplied = [&](const rune::catalog::TopicObject& t) { specs.push_back({t.name, t.topicId, t.partitions}); };
+    fx.sinkApplied  = [&](const SinkSpec& s) { specs.push_back({s.name, s.topicId, s.partitions}); };
+    ASSERT_GE(boot.replayLocal(log, BootEffects{std::move(fx)}), 0);
     std::vector<std::string> names;
     for (const auto& s : specs) names.push_back(s.name);
     std::sort(names.begin(), names.end());
     EXPECT_EQ(names, (std::vector<std::string>{"src", "typed_route", "v_src"}));
     for (const auto& s : specs)
-        if (s.name == "typed_route") { EXPECT_EQ(s.partitionCount, 3); EXPECT_EQ(s.topicId, 0); }
-}
-
-// ---------------------------------------------------------------------------
-// Final-review Regression (Finding 2): CompatMode2RejectedRegression
-//
-// TopicSchema::deserialize's trailing (nextTag, compatMode) tail previously
-// static_cast the raw compatMode byte straight into rune::codec::CompatMode
-// with no range check — a byte outside {0=Backward, 1=Forward} was silently
-// accepted as a well-formed (if semantically bogus) CompatMode. This test
-// proves a byte of 2 (neither enumerator) is now rejected, same as every
-// other bounds/shape check in deserialize().
-// ---------------------------------------------------------------------------
-TEST(TopicSchemaDeserializeRegression, CompatMode2RejectedRegression) {
-    TopicSchema ts;
-    ts.topicId        = 1;
-    ts.version        = 1;
-    ts.partitionCount = 1;
-    ts.validate       = false;
-    ts.keyField       = "id";
-    ts.descriptorBlob = serialize(DescriptorBuilder("t", 1).add("id", PrimType::Int64).build());
-    ts.nextTag        = 1;
-    // Deliberately malformed: neither CompatMode::Backward(0) nor
-    // CompatMode::Forward(1) — bypass the enum's type safety the same way a
-    // corrupt/garbled on-disk byte would.
-    ts.compatMode     = static_cast<CompatMode>(2);
-
-    const std::vector<uint8_t> blob = ts.serialize();
-    const auto decoded = TopicSchema::deserialize(
-        std::span<const uint8_t>(blob.data(), blob.size()));
-
-    EXPECT_FALSE(decoded.has_value())
-        << "Regression: compatMode byte=2 (neither Backward(0) nor Forward(1)) must be "
-           "REJECTED by deserialize(), not silently accepted as a valid CompatMode";
-}
-
-// ---------------------------------------------------------------------------
-// GC4 (crash-recovery matrix): truncation points -- unit level.
-//
-// CompatMode2RejectedRegression above proves a MALFORMED trailing byte is
-// rejected; these three prove deserialize() rejects a record TRUNCATED at
-// each of the three distinct variable-length regions of the wire layout
-// (see the header comment on TopicSchema in SchemaRegistry.h) -- inside the
-// keyField bytes, inside the descriptorBlob bytes, and inside the trailing
-// (nextTag, compatMode) tail -- not just the gross few-byte garbage payload
-// the integration-level CorruptRecordAbortsRebuildRegression/
-// CorruptRecordAbortsBootReplayRegression tests use (that garbage is
-// truncated inside the very FIRST field, topicId). Each case must recover
-// NOTHING (nullopt), never a partial/garbled TopicSchema.
-// ---------------------------------------------------------------------------
-TEST(TopicSchemaDeserializeRegression, TruncatedInsideKeyFieldRejectedRegression) {
-    TopicSchema ts;
-    ts.topicId        = 7;
-    ts.version        = 1;
-    ts.partitionCount = 4;
-    ts.validate       = false;
-    ts.keyField       = "userId";  // 6 bytes
-    ts.descriptorBlob = serialize(DescriptorBuilder("t", 1).add("id", PrimType::Int64).build());
-    ts.nextTag        = 1;
-    ts.compatMode     = CompatMode::Backward;
-
-    const std::vector<uint8_t> full = ts.serialize();
-
-    // Fixed header (topicId+version+partitionCount+validate) = 11 bytes,
-    // + u16 keyLen prefix = 13 -- keyField bytes start there and run for
-    // keyField.size() (6) bytes. Truncate to 3 of the 6 keyField bytes: the
-    // keyLen prefix promises 6 bytes but only 3 are actually present.
-    constexpr size_t kKeyFieldStart = 13;
-    const size_t truncateLen = kKeyFieldStart + 3;
-    ASSERT_LT(truncateLen, full.size()) << "vacuousness guard: must actually truncate";
-
-    const std::vector<uint8_t> truncated(full.begin(), full.begin() + truncateLen);
-    const auto decoded = TopicSchema::deserialize(
-        std::span<const uint8_t>(truncated.data(), truncated.size()));
-    EXPECT_FALSE(decoded.has_value())
-        << "Regression: a record truncated MID-keyField (keyLen prefix promises more "
-           "bytes than are present) must be rejected, never partially decoded";
-}
-
-TEST(TopicSchemaDeserializeRegression, TruncatedInsideDescriptorBlobRejectedRegression) {
-    TopicSchema ts;
-    ts.topicId        = 7;
-    ts.version        = 1;
-    ts.partitionCount = 4;
-    ts.validate       = false;
-    ts.keyField       = "userId";
-    ts.descriptorBlob = serialize(DescriptorBuilder("characters", 1)
-        .add("id",     PrimType::Int64)
-        .add("userId", PrimType::Int64, 1, true)
-        .add("name",   PrimType::String)
-        .build());
-    ts.nextTag        = 3;
-    ts.compatMode     = CompatMode::Backward;
-
-    const std::vector<uint8_t> full = ts.serialize();
-
-    constexpr size_t kKeyFieldStart = 13;
-    const size_t descLenPos    = kKeyFieldStart + ts.keyField.size();      // 19
-    const size_t descBlobStart = descLenPos + 4;                          // 23
-    ASSERT_GT(ts.descriptorBlob.size(), 4u)
-        << "vacuousness guard: need a descriptorBlob big enough to truncate mid-blob";
-    const size_t truncateLen = descBlobStart + (ts.descriptorBlob.size() / 2);
-    ASSERT_LT(truncateLen, full.size()) << "vacuousness guard: must actually truncate";
-
-    const std::vector<uint8_t> truncated(full.begin(), full.begin() + truncateLen);
-    const auto decoded = TopicSchema::deserialize(
-        std::span<const uint8_t>(truncated.data(), truncated.size()));
-    EXPECT_FALSE(decoded.has_value())
-        << "Regression: a record truncated MID-descriptorBlob (descLen prefix promises "
-           "more bytes than are present) must be rejected, never partially decoded";
-}
-
-TEST(TopicSchemaDeserializeRegression, TruncatedInsideTrailingTailRejectedRegression) {
-    TopicSchema ts;
-    ts.topicId        = 7;
-    ts.version        = 1;
-    ts.partitionCount = 4;
-    ts.validate       = false;
-    ts.keyField       = "userId";
-    ts.descriptorBlob = serialize(DescriptorBuilder("t", 1).add("id", PrimType::Int64).build());
-    ts.nextTag        = 1;
-    ts.compatMode     = CompatMode::Forward;  // non-default, so a wrong decode would be visible
-
-    const std::vector<uint8_t> full = ts.serialize();
-    ASSERT_GE(full.size(), 3u);
-    const size_t tailStart = full.size() - 3;  // nextTag(2) + compatMode(1)
-
-    // remaining == 1: only nextTag's first byte present.
-    {
-        const std::vector<uint8_t> truncated(full.begin(), full.begin() + tailStart + 1);
-        const auto decoded = TopicSchema::deserialize(
-            std::span<const uint8_t>(truncated.data(), truncated.size()));
-        EXPECT_FALSE(decoded.has_value())
-            << "Regression: a tail truncated to 1 leftover byte (mid-nextTag) must be rejected";
-    }
-    // remaining == 2: nextTag fully present, compatMode byte missing.
-    {
-        const std::vector<uint8_t> truncated(full.begin(), full.begin() + tailStart + 2);
-        const auto decoded = TopicSchema::deserialize(
-            std::span<const uint8_t>(truncated.data(), truncated.size()));
-        EXPECT_FALSE(decoded.has_value())
-            << "Regression: a tail truncated to 2 leftover bytes (nextTag present, "
-               "compatMode byte missing) must be rejected";
-    }
+        if (s.name == "typed_route") { EXPECT_EQ(s.partitions, 3); EXPECT_EQ(s.id, 0); }
+    EXPECT_EQ(droppedTopicIds(boot.state()), std::vector<int32_t>{1}) << "'gone' (id 1) is dropped";
 }

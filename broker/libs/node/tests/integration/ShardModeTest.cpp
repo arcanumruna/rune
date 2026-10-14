@@ -827,15 +827,16 @@ TEST(ShardModeRegression, StartRefusesWithAnUnwiredProvisionerRegression) {
     node.stop();
 }
 
-TEST(ShardModeRegression, StartRefusesWhenTheSchemaLogFailedRecovery) {
-    // Task 10 fix 3 / I1: the schema log lives outside the replica registry.
+TEST(ShardModeRegression, StartRefusesWhenTheCatalogLogFailedRecovery) {
+    // Task 10 fix 3 / I1: the __catalog log lives outside the replica registry (Task 16: it
+    // replaced the retired schema log).
     TmpDir dir{"schemafail"};
     const auto ports = ShardPorts::discover(1, 1);
     BrokerNode node{makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/false)};
     HaltCapture halt;
     node.setHaltHandler(&HaltCapture::handler, &halt);
-    node.setSchemaRecoveryFaultForTest(EIO);
-    EXPECT_THROW(node.start(), std::runtime_error) << "a failed schema log never serves";
+    node.setCatalogRecoveryFaultForTest(EIO);
+    EXPECT_THROW(node.start(), std::runtime_error) << "a failed catalog log never serves";
     EXPECT_EQ(halt.await(1'000ms), BrokerNode::kExitStorageFailure);
     node.stop();
 }

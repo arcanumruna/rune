@@ -695,6 +695,9 @@ TEST(DdlConformanceBrokerRegression, T8_RemovedStaticTopicIsQuarantinedNotDelete
         BrokerNode node{cfg2};
         node.start();
         ASSERT_TRUE(node.awaitLeader(30s));
+        // Task 16 (B6): the local catalog is empty here, so the reconcile is deferred until this
+        // broker has caught up to the catalog leader (itself) — then it quarantines the dir.
+        ASSERT_TRUE(node.awaitBootReconcileSettledForTest(30s));
         node.stop();
         EXPECT_FALSE(fs::exists(dir / "topics" / "events")) << "moved out of topics/";
         for (const auto& e : fs::directory_iterator(dir / "quarantine"))

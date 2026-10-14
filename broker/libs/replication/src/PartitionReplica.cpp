@@ -2877,7 +2877,7 @@ bool PartitionReplica::updateIsr_(int64_t nowNs)
     // election respects — user partitions, partitions whose ISR the controller
     // commits (isrChannel_: the coordinator partitions, MEDIUM-B), and
     // partitions on the internal-ISR store.  Any other internal partition
-    // (__topic_schemas, -4: self-managed, outside the store) never lag-shrinks:
+    // (a self-managed one outside the store, e.g. a single-node __catalog) never lag-shrinks:
     // a shrunk node would stay electable while missing acked records.
     isrManager_->setIsr(committedIsr_);
     if (!internalPartition_() || internalQuorum_() || isrChannel_ != nullptr)

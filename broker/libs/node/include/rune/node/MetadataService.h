@@ -506,6 +506,9 @@ public:
         if (at == removedTopics_.end() || *at != topicId) removedTopics_.insert(at, topicId);   // sorted
         reconcileRemovedTopics_(/*force=*/true);
     }
+    /// Test-only: every topic id handed to removeRuntimeTopic in this process (sorted) — a restart's
+    /// boot hands it every id the catalog dropped (Task 16, B3).
+    [[nodiscard]] const std::vector<int32_t>& removedTopicIdsForTest() const noexcept { return removedTopics_; }
     /// Test-only: placement removals decided but not yet committed (queued + in flight).
     [[nodiscard]] std::size_t removalsInFlightForTest() const noexcept {
         return pendingRemovalRecords_.size() + removalInflight_.size();

@@ -19,17 +19,6 @@ static TopicSchema makeSchema(int32_t id, const char* name, bool validate) {
     ts.validate = validate; ts.descriptorBlob = serialize(d); return ts;
 }
 
-TEST(SchemaRegistry, TopicSchemaRecordRoundTrip) {
-    TopicSchema ts = makeSchema(0x40000000, "characters", true);
-    auto bytes = ts.serialize();
-    auto back = TopicSchema::deserialize(bytes);
-    ASSERT_TRUE(back.has_value());
-    EXPECT_EQ(back->topicId, 0x40000000);
-    EXPECT_EQ(back->keyField, "userId");
-    EXPECT_TRUE(back->validate);
-    EXPECT_EQ(back->descriptorBlob, ts.descriptorBlob);
-}
-
 TEST(SchemaRegistry, ApplyBuildsValidatorIffValidate) {
     SchemaRegistry reg;
     reg.applyRecord(makeSchema(0x40000000, "chars", true));
@@ -42,30 +31,6 @@ TEST(SchemaRegistry, ApplyBuildsValidatorIffValidate) {
     ASSERT_NE(b, nullptr);
     EXPECT_FALSE(b->validator.has_value());
     EXPECT_EQ(reg.byId(0x40000000), a);
-}
-
-TEST(SchemaRegistry, RuntimeIdHighWaterAdvancesAndRecovers) {
-    SchemaRegistry reg;
-    EXPECT_EQ(reg.allocateRuntimeId(), static_cast<int32_t>(RUNTIME_TOPIC_ID_BASE));
-    EXPECT_EQ(reg.allocateRuntimeId(), static_cast<int32_t>(RUNTIME_TOPIC_ID_BASE) + 1);
-    // Rebuild from records with a higher id -> high-water jumps past it.
-    std::vector<TopicSchema> recs{ makeSchema(0x40000005, "z", false) };
-    SchemaRegistry reg2; reg2.rebuildFromRecords(recs);
-    EXPECT_EQ(reg2.allocateRuntimeId(), 0x40000006);
-}
-
-// Regression: a negative internal id (e.g. kSchemaTopicId = -4) must NOT advance
-// the runtime-id high-water. Prior to the M1 fix, uint32_t(-4) = 0xFFFFFFFC would
-// satisfy the >= RUNTIME_TOPIC_ID_BASE guard and corrupt the water mark.
-TEST(SchemaRegistryRegression, NegativeInternalIdDoesNotAdvanceHighWater) {
-    SchemaRegistry reg;
-    reg.applyRecord(makeSchema(kSchemaTopicId, "__topic_schemas", false));
-    EXPECT_EQ(reg.runtimeIdHighWater(), RUNTIME_TOPIC_ID_BASE);
-    EXPECT_EQ(reg.allocateRuntimeId(), static_cast<int32_t>(RUNTIME_TOPIC_ID_BASE));
-    // The internal record is still indexed and retrievable by its negative id.
-    const auto* e = reg.byId(kSchemaTopicId);
-    ASSERT_NE(e, nullptr);
-    EXPECT_EQ(e->topicId, kSchemaTopicId);
 }
 
 // ---------------------------------------------------------------------------
@@ -127,50 +92,6 @@ TEST(SchemaRegistry, KeepsMultipleVersionsAndLooksUpByFingerprint) {
     EXPECT_NE(fp1, fp2);
 
     EXPECT_EQ(reg.nextTagFor(1), 4);
-}
-
-// Regression: a legacy TopicSchema record (serialized before nextTag/compatMode
-// existed) must still deserialize cleanly, defaulting compatMode=BACKWARD and
-// nextTag to the embedded descriptor's field count.
-TEST(SchemaRegistryRegression, LegacyRecordWithoutTrailingFieldsDeserializesWithDefaults) {
-    TopicSchema ts = makeSchema(0x40000002, "legacy", false);
-    auto bytes = ts.serialize();
-    // Strip the trailing (nextTag:u16, compatMode:u8) bytes this build's
-    // serialize() appended, to simulate a pre-Task-9 record on disk.
-    ASSERT_GE(bytes.size(), 3u);
-    bytes.resize(bytes.size() - 3);
-
-    auto back = TopicSchema::deserialize(bytes);
-    ASSERT_TRUE(back.has_value());
-    EXPECT_EQ(back->compatMode, CompatMode::Backward);
-    EXPECT_EQ(back->nextTag, 3u);  // makeSchema() builds a 3-field descriptor
-}
-
-// Regression: a trailing tail that is PRESENT but truncated (1 or 2 of the 3
-// bytes) must be rejected as malformed, not silently treated as a legacy
-// (zero-trailing-byte) record.
-TEST(SchemaRegistryRegression, PartiallyTruncatedTrailingTailIsRejected) {
-    TopicSchema ts = makeSchema(0x40000003, "partial_tail", false);
-    ts.nextTag = 7;
-    ts.compatMode = CompatMode::Forward;
-    auto bytes = ts.serialize();
-    ASSERT_GE(bytes.size(), 3u);
-
-    // Drop 2 of the 3 trailing bytes -> exactly 1 leftover byte.
-    auto oneLeftover = bytes;
-    oneLeftover.resize(oneLeftover.size() - 2);
-    EXPECT_FALSE(TopicSchema::deserialize(oneLeftover).has_value());
-
-    // Drop 1 of the 3 trailing bytes -> exactly 2 leftover bytes.
-    auto twoLeftover = bytes;
-    twoLeftover.resize(twoLeftover.size() - 1);
-    EXPECT_FALSE(TopicSchema::deserialize(twoLeftover).has_value());
-
-    // Sanity: the untruncated record still deserializes fine.
-    auto whole = TopicSchema::deserialize(bytes);
-    ASSERT_TRUE(whole.has_value());
-    EXPECT_EQ(whole->nextTag, 7);
-    EXPECT_EQ(whole->compatMode, CompatMode::Forward);
 }
 
 // Regression: a `const RegistryEntry*` taken from latest() before a new
@@ -322,58 +243,6 @@ TEST(SchemaRegistry, LongLineageWithDropAndRenameResolvesEveryVersionByIdAndFing
     EXPECT_EQ(reg.byIdVersion(topicId, 5)->descriptor.fields.size(), 3u);   // id, rating, level
 }
 
-// ---------------------------------------------------------------------------
-// REGRESSION (user-topic restart recovery). A DefineTopic topic's NAME is
-// independent of its descriptor's name — Client::defineTopic takes both — so the
-// broker must persist it in the schema record; boot recovery recreates the topic
-// under exactly this name (a wrong name would open the wrong on-disk log).
-// ---------------------------------------------------------------------------
-TEST(SchemaRegistryRegression, TopicNameTrailerRoundTrips) {
-    TopicSchema ts = makeSchema(0x40000010, "descriptor_name", false);
-    ts.nextTag    = 5;
-    ts.compatMode = CompatMode::Forward;
-    ts.topicName  = "orders_topic";
-
-    auto back = TopicSchema::deserialize(ts.serialize());
-    ASSERT_TRUE(back.has_value());
-    EXPECT_EQ(back->topicName, "orders_topic");
-    EXPECT_EQ(back->nextTag, 5u);
-    EXPECT_EQ(back->compatMode, CompatMode::Forward);
-}
-
-// A record written before the name trailer existed (exact 3-byte tail) still
-// parses, with an empty topicName — recovery then falls back to the descriptor name.
-TEST(SchemaRegistryRegression, PreNameRecordParsesWithEmptyTopicName) {
-    TopicSchema ts = makeSchema(0x40000011, "pre_name", false);
-    ts.nextTag = 9;
-    const auto bytes = ts.serialize();   // no topicName -> byte-identical pre-name layout
-
-    auto back = TopicSchema::deserialize(bytes);
-    ASSERT_TRUE(back.has_value());
-    EXPECT_TRUE(back->topicName.empty());
-    EXPECT_EQ(back->nextTag, 9u);
-}
-
-// A present-but-truncated name trailer is malformed and must be rejected, never
-// silently read as a shorter name or as a pre-name record.
-TEST(SchemaRegistryRegression, TruncatedTopicNameTrailerIsRejected) {
-    TopicSchema ts = makeSchema(0x40000012, "trunc", false);
-    ts.topicName = "abcdef";
-    const auto bytes = ts.serialize();
-
-    auto minusOne = bytes;              // name bytes short by one
-    minusOne.resize(minusOne.size() - 1);
-    EXPECT_FALSE(TopicSchema::deserialize(minusOne).has_value());
-
-    auto halfLen = bytes;               // only 1 of the 2 length-prefix bytes present
-    halfLen.resize(halfLen.size() - ts.topicName.size() - 1);
-    EXPECT_FALSE(TopicSchema::deserialize(halfLen).has_value());
-
-    auto extra = bytes;                 // an unknown byte after the name
-    extra.push_back(0x7F);
-    EXPECT_FALSE(TopicSchema::deserialize(extra).has_value());
-}
-
 TEST(SchemaRegistryRegression, ApplyRecordCarriesTopicNameToEntry) {
     SchemaRegistry reg;
     TopicSchema ts = makeSchema(0x40000013, "desc", false);
@@ -423,97 +292,6 @@ TEST(SchemaRegistryRegression, PreNameRecordResolvesByDescriptorName) {
     reg.applyRecord(makeSchema(0x40000023, "legacy_chars", false));   // empty topicName
     ASSERT_NE(reg.byName("legacy_chars"), nullptr);
     EXPECT_EQ(reg.byName("legacy_chars")->topicId, 0x40000023);
-}
-
-// ---------------------------------------------------------------------------
-// SchemaRegistryRegression.RebuildFromRecordsIndexesTopicNameNotDescriptorName
-// — Phase 2b C final review I2: the e044159 fix (index by the topic's defined
-// name) must survive a restart.  The durable record goes through its real wire
-// form (serialize → deserialize, as boot replay / rebuildFromLog_ read it from
-// __topic_schemas) and a FRESH registry is rebuilt from it: "typed_route"
-// resolves, the descriptor name "characters" does not.
-// ---------------------------------------------------------------------------
-TEST(SchemaRegistryRegression, RebuildFromRecordsIndexesTopicNameNotDescriptorName) {
-    TopicSchema ts = makeSchema(0x40000030, "characters", false);
-    ts.topicName      = "typed_route";
-    ts.partitionCount = 8;
-    const std::vector<uint8_t> wire = ts.serialize();
-
-    const std::optional<TopicSchema> replayed = TopicSchema::deserialize(
-        std::span<const uint8_t>(wire.data(), wire.size()));
-    ASSERT_TRUE(replayed.has_value());
-    EXPECT_EQ(replayed->topicName, "typed_route");
-
-    SchemaRegistry reg;
-    // A stale pre-restart index must not leak into the rebuild.
-    reg.applyRecord(makeSchema(0x40000031, "characters", false));
-    const std::vector<TopicSchema> records{*replayed};
-    reg.rebuildFromRecords(std::span<const TopicSchema>(records.data(), records.size()));
-
-    const RegistryEntry* e = reg.byName("typed_route");
-    ASSERT_NE(e, nullptr) << "after restart the topic resolves by its defined name";
-    EXPECT_EQ(e->topicId, 0x40000030);
-    EXPECT_EQ(e->partitionCount, 8);
-    EXPECT_EQ(reg.byName("characters"), nullptr)
-        << "after restart the descriptor name is not a topic name";
-}
-
-// ---------------------------------------------------------------------------
-// Phase 2b E: TopicSchema records the persistence mode so boot recovery can
-// recreate a runtime topic as TRANSIENT.  Disk records stay byte-identical.
-// ---------------------------------------------------------------------------
-TEST(SchemaRegistryRegression, TransientPersistenceTrailerRoundTrips) {
-    TopicSchema ts = makeSchema(0x40000020, "desc", false);
-    ts.topicName   = "presence";
-    ts.persistence = PersistenceMode::Transient;
-    auto back = TopicSchema::deserialize(ts.serialize());
-    ASSERT_TRUE(back.has_value());
-    EXPECT_EQ(back->persistence, PersistenceMode::Transient);
-    EXPECT_EQ(back->topicName, "presence");
-}
-
-TEST(SchemaRegistryRegression, DiskRecordIsByteIdenticalToPrePersistenceLayout) {
-    TopicSchema ts = makeSchema(0x40000021, "desc", false);
-    ts.topicName = "orders";
-    const auto disk = ts.serialize();               // persistence defaults to Disk
-    ts.persistence = PersistenceMode::Transient;
-    const auto transientBytes = ts.serialize();
-    ASSERT_EQ(transientBytes.size(), disk.size() + 1);
-    EXPECT_TRUE(std::equal(disk.begin(), disk.end(), transientBytes.begin()));
-    EXPECT_EQ(transientBytes.back(), 1u);
-    auto back = TopicSchema::deserialize(disk);
-    ASSERT_TRUE(back.has_value());
-    EXPECT_EQ(back->persistence, PersistenceMode::Disk);
-}
-
-// A transient record with NO topic name still carries the mode (empty name
-// trailer + the byte), and a pre-name record (3-byte tail) parses as Disk.
-TEST(SchemaRegistryRegression, TransientWithoutNameAndPreNameRecords) {
-    TopicSchema ts = makeSchema(0x40000022, "desc", false);
-    ts.persistence = PersistenceMode::Transient;
-    auto back = TopicSchema::deserialize(ts.serialize());
-    ASSERT_TRUE(back.has_value());
-    EXPECT_EQ(back->persistence, PersistenceMode::Transient);
-    EXPECT_TRUE(back->topicName.empty());
-
-    TopicSchema pre = makeSchema(0x40000023, "desc", false);
-    auto preBack = TopicSchema::deserialize(pre.serialize());
-    ASSERT_TRUE(preBack.has_value());
-    EXPECT_EQ(preBack->persistence, PersistenceMode::Disk);
-}
-
-TEST(SchemaRegistryRegression, UnknownPersistenceByteIsRejected) {
-    TopicSchema ts = makeSchema(0x40000024, "desc", false);
-    ts.topicName   = "p";
-    ts.persistence = PersistenceMode::Transient;
-    auto bytes = ts.serialize();
-    bytes.back() = 2;                                // append-only: never cast
-    EXPECT_FALSE(TopicSchema::deserialize(bytes).has_value());
-    bytes.back() = 0;                                // a writer never emits an explicit 0
-    EXPECT_FALSE(TopicSchema::deserialize(bytes).has_value());
-    bytes.back() = 1;
-    bytes.push_back(1);                              // two bytes after the name: malformed
-    EXPECT_FALSE(TopicSchema::deserialize(bytes).has_value());
 }
 
 TEST(SchemaRegistryRegression, ApplyRecordCarriesPersistenceToEntry) {

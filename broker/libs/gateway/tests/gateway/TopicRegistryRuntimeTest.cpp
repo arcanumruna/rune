@@ -270,3 +270,32 @@ TEST(TopicRegistrySlotRegression, EverySlotStateAnswersExactlyItsOwnWayRegressio
     ASSERT_TRUE(reg.dropTopic(1));
     EXPECT_EQ(reg.state(1), St::Dropped);
 }
+
+// Catalog history Task 16 (B3 / Task 8 N2): the broker boots from the catalog and marks EVERY id the
+// catalog dropped — including ids beyond the topics it built (a dropped tail, or ids created and dropped
+// before this broker ever saw the create).  RED (before): dropTopic(id >= topicCount) was a no-op, so the
+// id was left Unknown and a later create at that id (or a produce) was not refused as a dropped id.
+TEST(TopicRegistryRuntimeRegression, DropOfAnIdBeyondTheRegistryTombstonesItAndTheGapsBelowRegression) {
+    using St = TopicRegistry::TopicState;
+    fs::path dir = makeTempDir("drop_beyond");
+    fs::create_directories(dir);
+    TopicRegistry reg(std::vector<TopicSpec>{}, dir.string());
+    TopicSpec keep; keep.name = "keep"; keep.partitionCount = 1;
+    ASSERT_EQ(reg.createTopicAt(0, keep), 0);
+    ASSERT_EQ(reg.topicCount(), 1);
+
+    ASSERT_TRUE(reg.dropTopic(3)) << "an id this broker never built still gets a Dropped slot";
+    EXPECT_EQ(reg.state(3), St::Dropped);
+    EXPECT_EQ(reg.topicCount(), 4);
+    EXPECT_EQ(reg.state(1), St::Unknown) << "the ids below are Gaps (fillable until dropped)";
+    EXPECT_EQ(reg.state(2), St::Unknown);
+    EXPECT_FALSE(reg.dropTopic(3)) << "idempotent";
+    TopicSpec reborn; reborn.name = "reborn"; reborn.partitionCount = 1;
+    EXPECT_EQ(reg.createTopicAt(3, reborn), -1) << "a dropped catalog id is never re-created";
+    EXPECT_EQ(reg.topic(3), nullptr);
+    EXPECT_EQ(reg.log(3, 0), nullptr);
+    ASSERT_TRUE(reg.dropTopic(1));
+    ASSERT_TRUE(reg.dropTopic(2));
+    EXPECT_EQ(reg.state(0), St::Serving) << "the live topic is untouched";
+    EXPECT_FALSE(reg.dropTopic(-1));
+}

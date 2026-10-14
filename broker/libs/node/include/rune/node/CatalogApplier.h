@@ -64,6 +64,7 @@
 #include <vector>
 
 namespace rune::replication { class PartitionReplica; }
+namespace rune::storage { class Log; }
 
 namespace rune::node {
 
@@ -112,6 +113,13 @@ inline constexpr std::size_t kCatalogReadChunk = std::size_t{1} << 20;
 /// per-pass allocation) up to this cap; past it the read is an explicit halt.
 inline constexpr std::size_t kCatalogReadMaxBuffer = std::size_t{64} << 20;
 
+/// Task 16 (B3): every topic id the catalog assigned that no live topic or live
+/// view sink holds — the dropped topics (CatalogState tombstones) AND the sinks an
+/// AlterView retired.  A tombstone records the object, not its topic id; the ids are
+/// dense [0, nextTopicId), so the complement of the live ids is exactly the dropped
+/// set.  Ascending.  Cold.
+[[nodiscard]] std::vector<int32_t> droppedTopicIds(const rune::catalog::CatalogState& s);
+
 class CatalogApplier {
 public:
     struct Applying { int64_t nextOffset = 0; };
@@ -138,6 +146,16 @@ public:
     /// refuse to start — when the checkpoint is unreadable or names an offset at or
     /// past the local log end (review M8: never replay a shorter history).
     int replayLocal(rune::replication::PartitionReplica& r, BootEffects boot);
+    /// The same replay over the catalog's Log alone — what the broker's startup
+    /// phase calls (Task 16, F4: the one boot replay runs before any replica or
+    /// transport exists).
+    int replayLocal(rune::storage::Log& log, BootEffects boot);
+    /// Task 16: the effects of the booted state that need a running broker,
+    /// posted ONCE after the workers exist (the broker's boot sink builds the
+    /// topics itself): each typed topic's validator (schemaChanged), each live
+    /// view's sink gate (sinkApplied) + recovery install (viewInstalled), the
+    /// `applied` metric, and — when the replay halted — the `halted` effect.
+    void postBootStash(const CatalogEffects& sink) const;
     /// Booted → Live; AwaitingBoot → Live only when no checkpoint exists (an empty
     /// catalog — fix round 1, M2: with one, the boot replay must run first or the
     /// whole history would be re-applied live).  Refused: an error log, the phase
@@ -171,7 +189,8 @@ public:
 private:
     // The step list is the phase's: Booted (replayLocal) skips the checkpoint
     // rewrite, Live (applyCommitted) writes it before the effects.
-    int  applyRange_(rune::replication::PartitionReplica& r, int64_t bound);
+    int  replay_(rune::storage::Log* log, int64_t leo, BootEffects boot);
+    int  applyRange_(rune::storage::Log* log, int64_t bound);
     bool applyRecord_(int64_t offset, std::span<const uint8_t> bytes);
     void project_(const rune::catalog::CatalogEvent& e, const rune::catalog::Applied& a);
     void effects_(const CatalogEffects& sink, const rune::catalog::CatalogEvent& e, const rune::catalog::Applied& a);

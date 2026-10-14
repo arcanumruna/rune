@@ -10,35 +10,19 @@
 
 namespace rune::node {
 
-/// Wire record stored on the __views internal topic (kViewsTopicId = -5).
-/// Mirrors TopicSchema (SchemaRegistry.h): a durable, flat little-endian
-/// record that survives restart.
-///
-/// serialize() LE layout:
-///   viewTopicId:i32,
-///   viewNameLen:u16 + viewName bytes,
-///   compiledPlanLen:u32 + compiledPlanBlob bytes (= Task 8's
-///     rune::view::serialize(CompiledViewPlan)),
-///   persistence:u8  (0 = persisted, 1 = transient),
-///   [OPTIONAL, appended Task 19b] outDescLen:u32 + outputDescriptorBlob bytes
-///     (= rune::codec::serialize(outputDescriptor)).
-///
-/// Task 19b: the view's OUTPUT descriptor is persisted here so a cold restart
-/// can re-register the view's typed output topic in the SchemaRegistry
-/// (GetTopicSchema / openView) EXACTLY as created — the compiled plan drops
-/// field names + FixedStr widths, so the descriptor (and thus its fingerprint)
-/// cannot be reconstructed from compiledPlanBlob alone.  The field is an
-/// OPTIONAL trailing blob: a pre-19b record (none appended) deserializes with
-/// an empty outputDescriptorBlob, unchanged.
+/// One view as the ViewRegistry holds it — the CatalogApplier's projection of a
+/// ViewObject (catalog history Task 16: the retired `__views` wire record and its
+/// serialize / deserialize are gone — `__catalog` is the catalog).  The view's
+/// OUTPUT descriptor rides along so the typed output topic can be registered in the
+/// SchemaRegistry (GetTopicSchema / openView) exactly as created: the compiled plan
+/// drops field names + FixedStr widths, so the descriptor (and its fingerprint)
+/// cannot be reconstructed from compiledPlanBlob alone.
 struct ViewRecord {
     int32_t              viewTopicId = -1;
     std::string           viewName;
     std::vector<uint8_t>  compiledPlanBlob;
     uint8_t               persistence = 0;
     std::vector<uint8_t>  outputDescriptorBlob;  // Task 19b: rune::codec::serialize(outputDescriptor)
-
-    [[nodiscard]] std::vector<uint8_t> serialize() const;
-    [[nodiscard]] static std::optional<ViewRecord> deserialize(std::span<const uint8_t> buf);
 };
 
 /// Single-threaded, admin-thread-owned view catalog. No locks, no atomics —
@@ -58,9 +42,6 @@ public:
 
     /// Look up by the view's own (runtime) topic id. Returns nullptr if absent.
     [[nodiscard]] const ViewRecord* byViewTopicId(int32_t viewTopicId) const;
-
-    /// Startup replay: clear and re-apply a span of records.
-    void rebuildFromRecords(std::span<const ViewRecord> records);
 
     /// All currently-registered views (stable pointers into the backing store).
     [[nodiscard]] std::vector<const ViewRecord*> all() const;

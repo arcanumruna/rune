@@ -197,8 +197,8 @@ TEST(PerWorkerReplicationWiring, FlagOnUserPartsOnPlanesInternalOnLegacy)
               &legacyTransport)  << "topicId=-2 (__transaction_state) must use legacy";
     EXPECT_EQ(selectReplTransport(planes, &legacyTransport, router, -3, 0),
               &legacyTransport)  << "topicId=-3 (__cluster_metadata) must use legacy";
-    EXPECT_EQ(selectReplTransport(planes, &legacyTransport, router, -4, 0),
-              &legacyTransport)  << "topicId=-4 (__topic_schemas) must use legacy";
+    EXPECT_EQ(selectReplTransport(planes, &legacyTransport, router, -6, 0),
+              &legacyTransport)  << "topicId=-6 (__catalog) must use legacy";
 
     // User partitions (topicId >= 0) MUST return a per-worker plane, NOT legacy.
     for (int32_t tid = 0; tid < 4; ++tid) {

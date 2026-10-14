@@ -136,8 +136,10 @@ public:
     // (topic() / log() / servableLog() answer nullptr) and its name is freed
     // from the name index.  The Logs stay owned until releaseDroppedLogs(): a
     // retired replica may still reference them until every holder acked.  A
-    // Pending or Gap slot is dropped too (seen: dropped).  Returns true iff the
-    // entry moved to Dropped (idempotent: false again).
+    // Pending or Gap slot is dropped too (seen: dropped), and so is an id beyond
+    // the registry (this broker never built it: Gap slots below, a Dropped slot at
+    // the id — Task 16, B3).  Returns true iff the entry moved to Dropped
+    // (idempotent: false again).
     bool dropTopic(int32_t topicId);
 
     /// Test-only: Logs still owned by the entry (a Dropped one: 0 once released).
