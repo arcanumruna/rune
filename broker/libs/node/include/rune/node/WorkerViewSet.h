@@ -247,6 +247,14 @@ public:
                      rune::codec::Descriptor evolvingSrc, bool persisted,
                      bool underRecovery = false);
 
+    // Catalog history Task 8: a DropView / AlterView retired the view
+    // `viewTopicId` — drop its plan template, every (view, partition) instance
+    // (its table, aggregate state, pending delta and dirty tracking), its
+    // reactor-index entries and its recovery mark, on THIS (the worker's own)
+    // thread.  From now on nothing folds into it and getRow answers NotFound
+    // (no instance).  Idempotent: an unknown view is a no-op (returns false).
+    bool uninstallView(int32_t viewTopicId);
+
     // Task 19: drain the control->worker install ring (channel_.install) and
     // install each compiled view plan ON THIS (the worker's OWN) thread — so a
     // view created at runtime folds live without any cross-thread write into the

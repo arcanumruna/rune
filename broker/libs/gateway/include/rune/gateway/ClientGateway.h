@@ -865,6 +865,17 @@ public:
     // are unaffected.  No-op if the session has no group subscriptions.
     void revokeGroupSubscriptions(int64_t memberSessionId);
 
+    // -----------------------------------------------------------------------
+    // Catalog history Task 8: the topic `topicId` was DROPPED (control thread,
+    // BrokerNode's drop effect, right after TopicRegistry::dropTopic).  Every
+    // live subscription of it — plain and group-created — ends EXPLICITLY: its
+    // Subscribe correlation id is answered ErrorResponse{UnknownTopic} (queued +
+    // retried, never best-effort), it is dropped here and on its owning worker.
+    // Producers learn it on their next Produce (UnknownTopic).  Cold.  Returns
+    // the number of subscriptions ended.
+    // -----------------------------------------------------------------------
+    std::size_t endTopicSubscriptions(int32_t topicId);
+
     // sendControlFrame — send an already-encoded frame (e.g. Assign) on a
     // session's egress.  Reuses the same sendTo path as all other responses.
     // Returns true if the frame was accepted by the egress publication.
@@ -2119,11 +2130,25 @@ private:
     //                    published HW is the subscribe clamp).
     //   Unknown        — nothing servable here.
     struct ServedPartition {
-        enum class Kind : uint8_t { Unknown, AwaitingCommit, Disk, Transient };
+        // Catalog history Task 8 (C1 generalized, spec §5.4): NotPlaced = a
+        // catalog-applied topic whose placement is not committed yet — answered
+        // like AwaitingCommit (retriable NotLeader, hidden from metadata).
+        enum class Kind : uint8_t { Unknown, AwaitingCommit, NotPlaced, Disk, Transient };
         Kind                kind = Kind::Unknown;
         rune::storage::Log* log  = nullptr;   ///< Kind::Disk only
     };
     [[nodiscard]] ServedPartition servedPartition_(int32_t topicId, int32_t partition) const noexcept;
+    /// Catalog history Task 8 (C1 generalized): the MSM holds a COMMITTED
+    /// placement for (topicId, partition) — the steady-state routing image
+    /// (built from the committed assignment map only once committed metadata is
+    /// ready; the bootstrap image is the static balancer's, never "committed")
+    /// names a leader for it.  Cold (only off the servable fast path).
+    [[nodiscard]] bool placementCommitted_(int32_t topicId, int32_t partition) const noexcept;
+    /// C1 generalized: the code for a topic id this broker has not applied —
+    /// NotLeader (retriable) when its placement is already committed (a producer
+    /// learned it from another broker, this one applies it next), UnknownTopic
+    /// otherwise and always for a Dropped id.
+    [[nodiscard]] rune::protocol::client::ErrorCode unappliedTopicCode_(int32_t topicId, int32_t partition) const noexcept;
     /// E2 Task 11 ruling: may a read_committed subscription to (topicId,
     /// partition) be accepted HERE?  read_committed is served from a LEADER's RC
     /// state only (RcState I2): a follower answered OK and then delivered nothing

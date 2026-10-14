@@ -25,6 +25,7 @@
 #include <rune/view/ViewRow.h>
 #include <rune/view/ViewCheckpoint.h>
 
+#include <rune/node/AdminChannels.h>
 #include <rune/node/ViewSnapshotChannel.h>
 #include <rune/node/WorkerViewSet.h>
 
@@ -1279,4 +1280,92 @@ TEST(WorkerViewSetRegression, TransientSourceGenerationJumpRefoldsFromRingStartR
             << "stale row for key " << k;
     EXPECT_EQ(vs.foldCounters(0x40000038, 0)->transientSourceResets, 1u);
     EXPECT_EQ(vs.foldCounters(0x40000038, 0)->transientRecordsEvicted, 0u);
+}
+
+// ---------------------------------------------------------------------------
+// Catalog history Task 8: a DropView / AlterView retired the view — the worker
+// drops its plan template, every instance (table, dirty state) and its reactor
+// index on its own thread; nothing folds into it any more.  RED: uninstall a
+// no-op (the dropped view keeps folding and serving rows, its memory never freed).
+// ---------------------------------------------------------------------------
+TEST(WorkerViewSetRegression, UninstallViewStopsFoldingAndFreesItsInstances) {
+    auto src = charSourceV1();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp  = rune::view::compileView(hpView(), srcs, 0x40000007).value();
+    auto other = rune::view::compileView(hpView(), srcs, 0x40000008).value();   // a 2nd view over the source
+
+    rune::node::ViewSnapshotChannel channel;
+    rune::node::WorkerViewSet vs(channel, tmpDir("rune-views-uninstall"));
+    vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ false);
+    vs.installView(other.plan, other.rowLayout, src, /*persisted*/ false);
+
+    const auto batch = twoUpsertsKey7();
+    auto readRange = [&](int64_t, int64_t) -> rune::storage::LogReadView {
+        return rune::storage::LogReadView{batch.data(), batch.size(), 0, 2};
+    };
+    vs.driveFolds(5, 0, readRange, 2, 0);
+    vs.driveFolds(5, 1, readRange, 2, 0);
+    ASSERT_EQ(vs.viewCount(), 2u);
+    ASSERT_EQ(vs.instanceCount(), 4u);
+
+    EXPECT_TRUE(vs.uninstallView(0x40000007));
+    EXPECT_EQ(vs.viewCount(), 1u);
+    EXPECT_EQ(vs.instanceCount(), 2u) << "both partitions' instances of the dropped view are freed";
+    const rune::view::RowLayout* L = nullptr;
+    rune::node::WorkerViewSet::RowStatus st = rune::node::WorkerViewSet::RowStatus::Ok;
+    EXPECT_EQ(vs.getRow(0x40000007, 0, 7, L, &st), nullptr);
+    EXPECT_EQ(st, rune::node::WorkerViewSet::RowStatus::NotFound);
+    uint64_t fp = 0;
+    EXPECT_FALSE(vs.viewOutputFingerprint(0x40000007, fp)) << "its plan template is gone";
+
+    // Folding the source again creates nothing for the dropped view; the other view still serves.
+    vs.driveFolds(5, 0, readRange, 2, 0);
+    EXPECT_EQ(vs.instanceCount(), 2u) << "a dropped view never folds again (no lazy re-create)";
+    EXPECT_NE(vs.getRow(0x40000008, 0, 7, L), nullptr);
+    EXPECT_TRUE(vs.interestedIn(5)) << "the other view keeps the source's reactor entry";
+
+    EXPECT_TRUE(vs.uninstallView(0x40000008));
+    EXPECT_FALSE(vs.interestedIn(5)) << "no view left: the source's reactor entry is removed";
+    EXPECT_EQ(vs.instanceCount(), 0u);
+}
+
+TEST(WorkerViewSetRegression, UninstallUnknownViewIsANoOp) {
+    auto src = charSourceV1();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(hpView(), srcs, 0x40000007).value();
+    rune::node::ViewSnapshotChannel channel;
+    rune::node::WorkerViewSet vs(channel, tmpDir("rune-views-uninstall-unknown"));
+    vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ false);
+    EXPECT_FALSE(vs.uninstallView(0x7777));
+    EXPECT_EQ(vs.viewCount(), 1u) << "an unknown id touches nothing";
+    EXPECT_TRUE(vs.uninstallView(0x40000007));
+    EXPECT_FALSE(vs.uninstallView(0x40000007)) << "the same uninstall again is a no-op (idempotent)";
+    EXPECT_EQ(vs.viewCount(), 0u);
+}
+
+// The production delivery: the control thread fans the uninstall out on each
+// worker's install ring (ViewPlanUpdateMsg.uninstall, op byte 2).
+TEST(WorkerViewSetRegression, UninstallArrivesOnTheInstallRing) {
+    auto src = charSourceV1();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(hpView(), srcs, 0x40000007).value();
+    rune::node::ViewSnapshotChannel channel;
+    rune::node::WorkerViewSet vs(channel, tmpDir("rune-views-uninstall-ring"));
+    vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ false);
+    rune::node::ViewPlanUpdateMsg m;
+    m.viewTopicId = 0x40000007;
+    m.uninstall   = true;
+    ASSERT_TRUE(rune::node::encodeViewPlanUpdate(channel.install, rune::node::ViewSnapshotChannel::kInstallMsgType, m));
+    (void)vs.drainInstalls();
+    EXPECT_EQ(vs.viewCount(), 0u);
+    // Round trip of the op byte: uninstall / recovery / install never alias.
+    std::vector<uint8_t> buf(rune::node::viewPlanUpdateWireLen(m));
+    rune::node::writeViewPlanUpdate(buf.data(), m.viewTopicId, 0, rune::node::kViewPlanUninstallByte, {}, {}, {});
+    const auto d = rune::node::decodeViewPlanUpdate(buf.data(), buf.size());
+    EXPECT_TRUE(d.uninstall);
+    EXPECT_FALSE(d.recovery);
+    rune::node::writeViewPlanUpdate(buf.data(), m.viewTopicId, 0, 1, {}, {}, {});
+    const auto r = rune::node::decodeViewPlanUpdate(buf.data(), buf.size());
+    EXPECT_TRUE(r.recovery);
+    EXPECT_FALSE(r.uninstall);
 }

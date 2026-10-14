@@ -98,6 +98,7 @@ extern "C" {
 
 #include <chrono>
 #include <filesystem>
+#include <variant>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -199,7 +200,9 @@ using NullSink = rune::consensus::NullSink;   // moved to rune/consensus/NullSin
 // (Rule #2, Aeron-style):
 //
 //   requestRing_ (gateway/control → admin) : DefineTopic / GetSchema ops.
-//   replyRing_   (control → admin)          : authoritative topicId back.
+//   controlToAdminRing_ (control → admin)   : authoritative topicId back
+//                                             (kMsgCreateTopicReply) and dropped-dir
+//                                             purges (kMsgPurgeDroppedDir, Task 8).
 //   roleRing_    (control → admin)           : Follower/Leader role events.
 //   createReqRing_ (admin → control)         : "create this physical topic".
 //
@@ -221,7 +224,7 @@ public:
                   viewsReplica, viewRegistry, catalogReplica, catalogPlane)
         , catalogSchemas_(&reg)
         , requestRing_(kAdminRequestRingBytes)
-        , replyRing_(kCreateTopicRingBytes)
+        , controlToAdminRing_(kCreateTopicRingBytes)
         , roleRing_(kAdminRoleRingBytes) {}
 
     const char* name() const noexcept override { return "rune-admin"; }
@@ -337,14 +340,27 @@ public:
             runOwnerThreadTestTask(reinterpret_cast<void*>(static_cast<std::uintptr_t>(a)), nullptr);
         }, 16);
 
-        // 2. Drain create-topic replies (control → admin).
-        work += replyRing_.drain([this](int32_t /*tid*/,
-                                        aeron::concurrent::AtomicBuffer& b,
-                                        aeron::util::index_t off,
-                                        aeron::util::index_t len) {
+        // 2. Drain the control → admin ring: create-topic replies, and (catalog
+        //    history Task 8) dropped-dir purges — explicit per-type dispatch.
+        work += controlToAdminRing_.drain([this](int32_t tid,
+                                                 aeron::concurrent::AtomicBuffer& b,
+                                                 aeron::util::index_t off,
+                                                 aeron::util::index_t len) {
             const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
-            worker_.onCreateTopicReply(decodeCreateTopicReply(p, static_cast<std::size_t>(len)));
+            const auto  n = static_cast<std::size_t>(len);
+            if (tid == kMsgPurgeDroppedDir) {
+                onPurgeDroppedDir_(std::string_view(reinterpret_cast<const char*>(p), n));
+                return;
+            }
+            if (tid == kMsgCreateTopicReply) {
+                worker_.onCreateTopicReply(decodeCreateTopicReply(p, n));
+                return;
+            }
+            if (badControlFrames_++ % 1024 == 0)
+                spdlog::error("AdminWorkerAgent: control→admin frame type={} len={} refused (unknown; refused "
+                              "so far: {})", tid, n, badControlFrames_);
         }, 16);
+        if (!holdDroppedDirPurge_ && !heldDroppedDirPurges_.empty()) [[unlikely]] work += releaseHeldPurges_();
 
         // 3. Drain gateway requests (DefineTopic / GetSchema).
         //    Fix round 2: while DDL answers wait in the egress backlog, NO new
@@ -542,11 +558,11 @@ public:
     // -----------------------------------------------------------------------
     // Producer-side accessors — the gateway/control thread enqueues here.
     // requestRing_ producer = gateway/control duty-cycle thread.
-    // replyRing_ / roleRing_ producer = control thread.
+    // controlToAdminRing_ / roleRing_ producer = control thread.
     // createReqRing_ consumer = control thread; producer = admin (via deps).
     // -----------------------------------------------------------------------
     OneToOneByteRing& requestRing()   noexcept { return requestRing_; }
-    OneToOneByteRing& replyRing()     noexcept { return replyRing_;   }
+    OneToOneByteRing& controlToAdminRing() noexcept { return controlToAdminRing_; }
     OneToOneByteRing& roleRing()      noexcept { return roleRing_;    }
     OneToOneByteRing& createReqRing() noexcept { return createReqRing_; }
     OneToOneByteRing& egressRing()    noexcept { return egressRing_;   } // admin → control (response frames)
@@ -571,6 +587,18 @@ public:
     [[nodiscard]] std::size_t catalogBacklogBytesForTest() const noexcept { return catalogBacklog_.usedBytes(); }
     [[nodiscard]] uint64_t catalogEffectsRefusedForTest() const noexcept { return catalogEffectsRefused_; }
     int flushCatalogBacklogForTest() { return flushCatalogBacklog_(); }
+
+    /// Catalog history Task 8 — ADMIN thread only (BrokerNode::postCatalogEffectForTest /
+    /// holdDroppedDirPurgeForTest, inside onAdminThreadForTest): post one raw catalog
+    /// effect frame through the production sink path; hold / release dropped-dir purges.
+    void postCatalogFrameForTest(int32_t typeId, const std::vector<uint8_t>& payload) {
+        postCatalog_(typeId, payload.size(), [&](uint8_t* p) {
+            if (!payload.empty()) std::memcpy(p, payload.data(), payload.size());
+        });
+    }
+    void setHoldDroppedDirPurgeForTest(bool on) noexcept { holdDroppedDirPurge_ = on; }
+    [[nodiscard]] std::size_t heldDroppedDirPurgesForTest() const noexcept { return heldDroppedDirPurges_.size(); }
+    [[nodiscard]] uint64_t droppedDirsPurgedForTest() const noexcept { return droppedDirsPurged_; }
 
     /// Catalog history Task 6: the __catalog replica's ISR channel (admin →
     /// control, kA2cCatalogAlterIsr).  BrokerNode wires it as the replica's
@@ -604,7 +632,36 @@ private:
     AdminWorker      worker_;
     SchemaRegistry*  catalogSchemas_;  // admin-owned (the AdminWorker's registry): validator / view-source descriptors
     OneToOneByteRing requestRing_;     // gateway/control → admin (DefineTopic/GetSchema)
-    OneToOneByteRing replyRing_;       // control → admin (createTopic reply)
+    OneToOneByteRing controlToAdminRing_;   // control → admin (createTopic reply; Task 8: dropped-dir purges)
+    // Catalog history Task 8 (F23): an admin-thread-owned hold under which purge
+    // paths queue (preallocated) instead of being removed; releasing it purges
+    // them on the next admin pass.
+    bool                     holdDroppedDirPurge_ = false;
+    std::vector<std::string> heldDroppedDirPurges_ = [] { std::vector<std::string> v; v.reserve(64); return v; }();
+    uint64_t                 droppedDirsPurged_ = 0;   // admin-owned (test observability via onAdminThreadForTest)
+    uint64_t                 badControlFrames_  = 0;
+    void onPurgeDroppedDir_(std::string_view path) {
+        if (holdDroppedDirPurge_) { heldDroppedDirPurges_.emplace_back(path); return; }
+        purgeDroppedDir_(path);
+    }
+    int releaseHeldPurges_() {
+        int n = 0;
+        for (const std::string& path : heldDroppedDirPurges_) { purgeDroppedDir_(path); ++n; }
+        heldDroppedDirPurges_.clear();   // capacity kept
+        return n;
+    }
+    void purgeDroppedDir_(std::string_view path) {
+        std::error_code ec;
+        const auto removed = std::filesystem::remove_all(std::filesystem::path(path), ec);
+        if (ec) {
+            spdlog::error("AdminWorkerAgent: purging the dropped topic dir '{}' failed: {} — it stays for the "
+                          "boot purge", path, ec.message());
+            return;
+        }
+        ++droppedDirsPurged_;
+        spdlog::info("AdminWorkerAgent: dropped topic dir '{}' purged ({} entries)", path,
+                     static_cast<uint64_t>(removed));
+    }
     OneToOneByteRing roleRing_;        // control → admin (role events)
     OneToOneByteRing createReqRing_{kCreateTopicRingBytes}; // admin → control (createTopic req)
     OneToOneByteRing egressRing_{kAdminEgressRingBytes};   // admin → control (response frames: [sessionId:i64][frame])
@@ -1107,6 +1164,24 @@ public:
             -1, -1, std::forward<F>(f), timeout);
     }
 
+    // -----------------------------------------------------------------------
+    // Catalog history Task 8 test hooks.
+    // postCatalogEffectForTest: encode one catalog effect frame (an admin→control
+    //   message type kA2c..., its payload) onto the admin→control ring FROM THE
+    //   ADMIN THREAD, through the production sink path — exactly as the
+    //   CatalogApplier's effects reach the control thread.
+    // catalogTopicServesForTest: (control thread) the topic is applied here AND
+    //   its placement is committed (every partition assigned in the MSM and its
+    //   role routed) — spec §5.4.
+    // holdDroppedDirPurgeForTest (F23): an admin-thread-owned hold under which
+    //   kMsgPurgeDroppedDir paths queue instead of being removed; releasing it
+    //   purges them on the next admin pass.
+    // -----------------------------------------------------------------------
+    void postCatalogEffectForTest(int32_t typeId, std::vector<uint8_t> payload);   // defined in BrokerNode.cpp
+    bool catalogTopicServesForTest(int32_t topicId);
+    void holdDroppedDirPurgeForTest(bool on);
+
+
     /// E2 residual round 5 (R2), TEST-ONLY: a controller answers this node's
     /// node-control identity kNodeSuperseded (as after a late frame of an
     /// unseen older process) — the node ROTATES its process identity.  Runs on
@@ -1238,6 +1313,10 @@ public:
     MetadataService* metadataServiceForTest() const noexcept {
         return metadataService_.get();
     }
+    /// Test-only (catalog history Task 8): the cleaner (cleaner-thread-owned) —
+    /// read its policy override only after LogCleanerAgent::policyUpdatesForTest()
+    /// (acquire) showed the update.
+    const LogCleanerAgent* cleanerForTest() const noexcept { return cleanerAgent_.get(); }
 
     /// Test-only: return the SchemaRegistry (for byName/byId queries in tests).
     /// Non-null after start() if schema persistence construction succeeded.
@@ -1452,6 +1531,40 @@ private:
     // registries — no cross-thread mutation).  Returns the number of partitions
     // registered.  Multi-node partition placement is OUT OF SCOPE (deferred).
     int32_t createRuntimeUserReplicas(const TopicSpec& spec);
+
+    // -----------------------------------------------------------------------
+    // Catalog history Task 8 — the control thread executes the CatalogApplier's
+    // effects (admin→control ring).  Every handler is IDEMPOTENT: a crash
+    // between the applier's checkpoint and the effects re-runs them at the next
+    // boot, and a repeated create / drop / config / uninstall must leave the
+    // same final state (never a duplicate, an error or a double placement).
+    //
+    // The drop sequence, one explicit state per step (rule 3):
+    //   1. dropRuntimeTopic_: TopicRegistry::dropTopic (serves nothing; the
+    //      gateway answers UnknownTopic and ends the topic's subscriptions),
+    //      MetadataService::removeRuntimeTopic (placement removal), every
+    //      partition's replica fenced + removed (transient ring with it), the
+    //      cleaner's override cleared → DroppedTopic{AwaitingRetire{retireGen}}.
+    //   2. serviceDroppedTopics_ (each pass): once every worker and the cleaner /
+    //      provisioner acked a generation >= retireGen (collectRetired's bound),
+    //      the Logs are closed (releaseDroppedLogs) → AwaitingRename; then
+    //      rename(topics/<name>, dropped/<id>.<name>) — atomic; a failure is
+    //      logged and retried next pass, never deleted in place — and the path
+    //      is posted to the admin thread (kMsgPurgeDroppedDir), which removes it
+    //      (a failure leaves it for the boot purge: reconcileTopicDirs, Task 16).
+    //   3. A create whose name a DroppedTopic still holds waits as a
+    //      PendingCreateBehindDrop{spec} (FIFO per name) and runs right after
+    //      that name's rename succeeded: the reused name starts EMPTY.
+    // -----------------------------------------------------------------------
+    void onCatalogTopicApplied_(const uint8_t* p, std::size_t n);
+    void runCatalogCreate_(const TopicSpec& spec);
+    void dropRuntimeTopic_(int32_t topicId, const std::string& name);
+    void onCatalogTopicConfig_(const uint8_t* p, std::size_t n);
+    void onViewUninstall_(int32_t viewTopicId);
+    int  serviceDroppedTopics_();
+    int  pumpCatalogOutboxes_();
+    [[nodiscard]] bool catalogNameHeldByDrop_(const std::string& name) const noexcept;
+    [[nodiscard]] bool catalogTopicServes_(int32_t topicId) const noexcept;
 
     // -----------------------------------------------------------------------
     // Configuration (immutable after construction)
@@ -1704,6 +1817,26 @@ private:
     std::unique_ptr<rune::consensus::AgentRunner>         viewSnapshotIoRunner_;
     struct ViewFanoutPending { ViewPlanUpdateMsg msg; int32_t nextWorker = 0; };
     std::vector<ViewFanoutPending>                        viewFanoutBacklog_;  // control-thread-owned
+
+    // Catalog history Task 8 (control-thread-owned): the drop sequence's states
+    // (see dropRuntimeTopic_), the creates waiting behind a drop of their name,
+    // and the frames a full ring could not take yet (retried, never dropped).
+    struct AwaitingRetire { uint64_t retireGen = 0; };   // step 2: holders still ack the removal
+    struct AwaitingRename {};                            // step 2: logs closed; the dir rename (retried)
+    struct DroppedTopic {
+        int32_t                                    id = -1;
+        std::string                                name;
+        bool                                       diskBacked = true;
+        std::vector<rune::storage::InMemoryLog*>   memLogs;   // transient rings, freed with the replicas
+        std::variant<AwaitingRetire, AwaitingRename> step;
+        uint64_t                                   renameFailures = 0;
+    };
+    std::vector<DroppedTopic>                             droppedAwaitingRetire_;
+    struct PendingCreateBehindDrop { TopicSpec spec; };
+    std::vector<PendingCreateBehindDrop>                  pendingCreatesBehindDrop_;   // FIFO (per name)
+    std::vector<std::string>                              purgeOutbox_;        // kMsgPurgeDroppedDir ring-full retry
+    std::vector<std::vector<uint8_t>>                     cleanerPolicyOutbox_;  // kPolicyMsgType ring-full retry
+    CleanerViewChannel*                                   cleanerViewChannel_ = nullptr;   // owned by runtimeAgent_
     void fanoutViewPlan_(ViewPlanUpdateMsg msg);   // control thread
     int  pumpViewFanout_();                        // control thread (every cycle)
     // Task 19b (restart recovery): a restarted broker's durable view catalog is

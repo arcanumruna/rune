@@ -992,6 +992,17 @@ if(BUILD_TESTING)
     #   single-writer safety; compact+delete combined without double-delete.
     # No Aeron required.
     # ---------------------------------------------------------------------------
+    # Catalog history Task 8 (ruling 5): an AlterTopicConfig reaches the cleaner as
+    # a per-topic policy override (its view ring) — the replica config is untouched.
+    add_executable(rune_log_cleaner_policy_override_tests
+        tests/node/LogCleanerPolicyOverrideTest.cpp)
+    target_link_libraries(rune_log_cleaner_policy_override_tests PRIVATE
+        rune_node
+        rune_replication
+        rune_storage
+        GTest::gtest_main)
+    gtest_discover_tests(rune_log_cleaner_policy_override_tests PROPERTIES TIMEOUT 120)
+
     add_executable(rune_retention_cleaner_agent_tests
         tests/integration/RetentionCleanerAgentTest.cpp)
     target_link_libraries(rune_retention_cleaner_agent_tests PRIVATE
@@ -1489,6 +1500,14 @@ if(BUILD_TESTING)
         target_include_directories(rune_catalog_replication_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_catalog_replication_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_catalog_replication_tests PROPERTIES TIMEOUT 360 RESOURCE_LOCK rune_udp_ports)
+
+        # Catalog history Task 8: the control thread executes the catalog's effects
+        # (topics created / dropped at catalog ids, placement add / remove, config
+        # override, view uninstall; every effect idempotent) on a real BrokerNode.
+        add_executable(rune_catalog_effects_tests tests/node/CatalogEffectsTest.cpp)
+        target_include_directories(rune_catalog_effects_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_catalog_effects_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_catalog_effects_tests PROPERTIES TIMEOUT 360 RESOURCE_LOCK rune_udp_ports)
 
         # Leader-epoch monotonicity across restarts (Kafka parity): full cold
         # restart, single-node restart, stale same-epoch tail on a follower.

@@ -159,6 +159,44 @@ inline constexpr uint64_t kLineageUntrusted = UINT64_MAX;
            rec->confirmedEpoch == pa->leaderEpoch && (selfIncarnation == 0 || rec->incarnation == selfIncarnation);
 }
 
+// ---------------------------------------------------------------------------
+// 4. RemoveTopicPlacementRecord (recordType 0x8003) — catalog history Task 8.
+//    A topic the catalog DROPPED: at commit every (topicId, p) assignment is
+//    erased from the committed map (and its transient lineages), so each
+//    replica of it sees a delete in its LocalRoleDelta.  An unknown topic id is
+//    a no-op.  Appended once by the controller (MetadataService::
+//    removeRuntimeTopic).  Topic ids are never reused (catalog ids), so a later
+//    assignment for the same id never exists.  An older MSM skips the type.
+//
+//    Wire (LE): [0..1] type=0x8003 [2] version=0 [3..6] topicId int32
+// ---------------------------------------------------------------------------
+inline constexpr uint16_t kRemoveTopicPlacementRecordType = 0x8003;
+
+struct RemoveTopicPlacementRecord {
+    int32_t topicId = 0;
+    static constexpr std::size_t ENCODED_SIZE = 7;
+
+    std::size_t encode(uint8_t* buf, std::size_t len) const noexcept {
+        if (len < ENCODED_SIZE) return 0;
+        namespace d = rune::protocol::metadata::detail;
+        buf[0] = static_cast<uint8_t>(kRemoveTopicPlacementRecordType & 0xff);
+        buf[1] = static_cast<uint8_t>(kRemoveTopicPlacementRecordType >> 8);
+        buf[2] = 0;
+        d::putS32(buf, 3, topicId);
+        return ENCODED_SIZE;
+    }
+    static std::optional<RemoveTopicPlacementRecord> decode(const uint8_t* buf, std::size_t len) noexcept {
+        if (len < ENCODED_SIZE) return std::nullopt;
+        const uint16_t type = static_cast<uint16_t>(buf[0] | (buf[1] << 8));
+        if (type != kRemoveTopicPlacementRecordType || buf[2] != 0) return std::nullopt;
+        namespace d = rune::protocol::metadata::detail;
+        RemoveTopicPlacementRecord r;
+        r.topicId = d::getS32(buf, 3);
+        if (r.topicId < 0) return std::nullopt;   // internal partitions are never removed this way
+        return r;
+    }
+};
+
 namespace leaderless_trailer {
 inline constexpr uint8_t     kTag  = 0xD1;
 inline constexpr std::size_t kSize = 14;

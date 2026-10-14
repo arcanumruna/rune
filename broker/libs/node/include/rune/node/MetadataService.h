@@ -386,6 +386,36 @@ public:
         drainDynamicQueue();
     }
 
+    // -----------------------------------------------------------------------
+    // Catalog history Task 8: the catalog DROPPED topic `topicId`.  Removes it
+    // from configuredTopics_ (no routing-image build, rebalance or balancer
+    // decision names it again), purges any of its records decided but not yet
+    // appended, and remembers it in removedTopics_.  The controller (when ready — now, or on its catch-up
+    // edge, or as soon as a successor controller is ready) appends ONE
+    // RemoveTopicPlacementRecord; at commit every replica of it sees a delete.
+    // Never stranded: a broker that is not the controller still records it, so
+    // whichever broker becomes controller next completes the removal.
+    // Idempotent (a second call changes nothing and appends nothing more).
+    // Single-writer: control thread.
+    // -----------------------------------------------------------------------
+    void removeRuntimeTopic(int32_t topicId) {
+        if (topicId < 0) return;   // internal partitions are never removed this way
+        const auto before = configuredTopics_.size();
+        std::erase_if(configuredTopics_, [topicId](const rune::metadata::TopicSpec& ts) { return ts.topicId == topicId; });
+        if (configuredTopics_.size() != before) ++routingInputsEpoch_;
+        std::erase_if(pendingDynamicRecords_,
+                      [topicId](const rune::metadata::BalancerRecord& br) { return br.rec.topicId == topicId; });
+        std::erase_if(pendingLineageRecords_,
+                      [topicId](const rune::metadata::TransientLineageRecord& r) { return r.topicId == topicId; });
+        const auto at = std::lower_bound(removedTopics_.begin(), removedTopics_.end(), topicId);
+        if (at == removedTopics_.end() || *at != topicId) removedTopics_.insert(at, topicId);   // sorted
+        reconcileRemovedTopics_(/*force=*/true);
+    }
+    /// Test-only: placement removals decided but not yet committed (queued + in flight).
+    [[nodiscard]] std::size_t removalsInFlightForTest() const noexcept {
+        return pendingRemovalRecords_.size() + removalInflight_.size();
+    }
+
     /// Emit static assignment records to the metadata log if needed.
     ///
     /// This is the leader-claim action.  It:
@@ -1837,6 +1867,9 @@ public:
             inflight_.clear();
             pendingLineageRecords_.clear();   // C1: the next controller re-decides (leaders re-send)
             lineageInflight_.clear();
+            pendingRemovalRecords_.clear();   // Task 8: removedTopics_ is kept — the next controller removes
+            removalInflight_.clear();
+            removedReconciledVersion_ = UINT64_MAX;
             pendingFeatureLevel_  = -1;   // D15: the next controller re-decides
             featureInflightLevel_ = -1;
             // Controlled-shutdown marks are kept (soft, every member holds
@@ -1853,6 +1886,8 @@ public:
             it = (it->second <= hw) ? inflight_.erase(it) : std::next(it);
         for (auto it = lineageInflight_.begin(); it != lineageInflight_.end();)
             it = (it->second <= hw) ? lineageInflight_.erase(it) : std::next(it);
+        for (auto it = removalInflight_.begin(); it != removalInflight_.end();)   // Task 8
+            it = (it->second <= hw) ? removalInflight_.erase(it) : std::next(it);
         if (amLeader) maybeRaiseFeatureLevel_();   // D15 (no-op once at the supported level)
         if (amLeader) maybeConfirmSingleNodeLineages_();   // C1 (single node only)
         if (hw <= 0 || hw <= lastApplied_) {
@@ -1861,6 +1896,7 @@ public:
             msm_.commit(hw - 1);
             if (amLeader) maybeCatchUp_();
             // Still drain the dynamic queue even if the log is caught up.
+            reconcileRemovedTopics_();   // Task 8 (no-op when nothing was dropped)
             if (amLeader) drainDynamicQueue();
             onMapChangeForShutdown_();
             return 0;
@@ -1929,6 +1965,7 @@ public:
         if (amLeader) maybeCatchUp_();
 
         // Drain the dynamic assignment queue (bounded per cycle).
+        reconcileRemovedTopics_();   // Task 8 (no-op when nothing was dropped)
         if (amLeader) drainDynamicQueue();
         onMapChangeForShutdown_();
 
@@ -2157,6 +2194,7 @@ private:
             pendingFeatureLevel_ = supportedFeatureLevel_;
         restoreLeaderlessMarks_();   // D15 item 1
         emitStaticAssignmentIfNeeded();
+        reconcileRemovedTopics_(/*force=*/true);   // Task 8: removals recorded while not the ready controller
         drainDynamicQueue();
     }
 
@@ -2247,8 +2285,34 @@ private:
         }
     }
 
+    /// Task 8: on the READY controller, queue ONE RemoveTopicPlacementRecord for
+    /// every dropped topic the committed map still places (and no removal of it
+    /// queued / in flight).  removedTopics_ is never forgotten in this process:
+    /// a placement of a dropped topic can still COMMIT later (an assignment
+    /// appended before the drop, by this or a predecessor controller) and must
+    /// be removed then too — so every broker keeps the set, whichever becomes
+    /// controller completes it.  Runs only when something changed (the
+    /// committed map's version, a new drop, the readiness edge): cold.
+    void reconcileRemovedTopics_(bool force = false) {
+        if (removedTopics_.empty() || !controllerReady_()) return;
+        const uint64_t v = msm_.committedVersion();
+        if (!force && v == removedReconciledVersion_) return;
+        removedReconciledVersion_ = v;
+        bool queued = false;
+        msm_.committedMap().forEach([&](int32_t t, int32_t, const rune::metadata::PartitionAssignment&) {
+            if (!std::binary_search(removedTopics_.begin(), removedTopics_.end(), t)) return;
+            if (removalInflight_.count(t) != 0) return;
+            if (std::find(pendingRemovalRecords_.begin(), pendingRemovalRecords_.end(), t) !=
+                pendingRemovalRecords_.end())
+                return;
+            pendingRemovalRecords_.push_back(t);
+            queued = true;
+        });
+        if (queued) drainDynamicQueue();
+    }
+
     void drainDynamicQueue() {
-        if (pendingDynamicRecords_.empty() && pendingLineageRecords_.empty() &&
+        if (pendingDynamicRecords_.empty() && pendingLineageRecords_.empty() && pendingRemovalRecords_.empty() &&
             pendingFeatureLevel_ <= msm_.featureLevel())
             return;
         if (!leaderReady_()) return;   // kept queued until this replica may append
@@ -2267,6 +2331,18 @@ private:
             if (replica_->append(std::span<const uint8_t>(encBuf, n), /*acksAll=*/false) < 0) return;
             lineageInflight_[partitionKey_(lr.topicId, lr.partition)] = replica_->logEndOffset();
             pendingLineageRecords_.pop_front();
+            ++cycleRecords;
+            cycleBytes += n;
+        }
+
+        // Catalog history Task 8: whole-topic placement removals (dropped topics).
+        while (!pendingRemovalRecords_.empty() && cycleRecords < kMaxRecordsPerBatch) {
+            rune::metadata::RemoveTopicPlacementRecord rr;
+            rr.topicId = pendingRemovalRecords_.front();
+            const std::size_t n = rr.encode(encBuf, kEncBufSize);
+            if (replica_->append(std::span<const uint8_t>(encBuf, n), /*acksAll=*/false) < 0) return;
+            removalInflight_[rr.topicId] = replica_->logEndOffset();
+            pendingRemovalRecords_.pop_front();
             ++cycleRecords;
             cycleBytes += n;
         }
@@ -2437,6 +2513,15 @@ private:
     // C1 multi-node: lineage decisions to append, and the appended-not-yet-
     // committed ones (partition key -> metadata-log end offset).
     std::deque<rune::metadata::TransientLineageRecord> pendingLineageRecords_;
+    // Catalog history Task 8 (removeRuntimeTopic): the topics the catalog dropped
+    // (every broker records them — a successor controller completes the removal;
+    // kept for the process: see reconcileRemovedTopics_), the committed-map
+    // version last reconciled, the removals decided but not appended, and
+    // topic → metadata-log end offset of its appended, uncommitted removal.
+    std::vector<int32_t>                               removedTopics_;   // sorted
+    uint64_t                                           removedReconciledVersion_ = UINT64_MAX;
+    std::deque<int32_t>                                pendingRemovalRecords_;
+    std::unordered_map<int32_t, rune::replication::Offset> removalInflight_;
     int64_t userDecisionHoldNs_ = 0, readySinceNs_ = 0, lastNowNs_ = 0;   ///< TEST-ONLY hold
     bool    holdWasReady_       = false;
     std::unordered_map<int64_t, rune::replication::Offset> lineageInflight_;

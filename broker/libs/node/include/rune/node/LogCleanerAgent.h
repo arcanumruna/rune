@@ -100,6 +100,7 @@
 #include <iomanip>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -144,7 +145,9 @@ public:
         , useCoalescing_(useCoalescing)
         , coalescingRollBytes_(coalescingRollBytes)
         , dedupeMap_(rune::storage::SkimpyOffsetMap::maxSlotsFromBudget(dedupeBufferBytes_))
-    {}
+    {
+        overrides_.reserve(kPolicyOverridesReserved);   // Task 8: buckets reserved at start
+    }
 
     LogCleanerAgent(const LogCleanerAgent&)            = delete;
     LogCleanerAgent& operator=(const LogCleanerAgent&) = delete;
@@ -171,6 +174,73 @@ public:
     [[nodiscard]] int64_t producerIdExpirationMsForTest() const noexcept { return producerIdExpirationMs_; }
     [[nodiscard]] uint64_t viewGenerationForTest() const noexcept { return viewGen_; }
     [[nodiscard]] std::size_t viewSizeForTest() const noexcept { return view_.size(); }
+
+    // -----------------------------------------------------------------------
+    // Catalog history Task 8: per-topic cleaner policy override (an
+    // AlterTopicConfig applied by the catalog, delivered on the view ring as
+    // CleanerViewChannel::kPolicyMsgType).  Every key unset = the replica's own
+    // config.  Consulted before replica->retentionMs() & co. in runRetention and
+    // the compaction gates.  Cleaner-thread-owned.
+    // -----------------------------------------------------------------------
+    struct PolicyOverride {
+        std::optional<int64_t> retentionMs;
+        std::optional<int64_t> retentionBytes;
+        std::optional<int64_t> deleteRetentionMs;
+        std::optional<double>  minCleanableDirtyRatio;
+        std::optional<int64_t> minCompactionLagMs;
+        std::optional<int64_t> maxCompactionLagMs;
+    };
+    /// Apply one kPolicyMsgType payload (cleaner thread; also the unit-test
+    /// seam).  false = malformed (refused whole, logged — never half-applied).
+    bool applyPolicyMessage(const uint8_t* p, std::size_t n) {
+        if (n < CleanerViewChannel::kPolicyHeaderBytes) return refusePolicy_(n);
+        int32_t topicId; uint16_t count;
+        std::memcpy(&topicId, p, 4);
+        std::memcpy(&count, p + 4, 2);
+        if (n != CleanerViewChannel::kPolicyHeaderBytes + count * CleanerViewChannel::kPolicyEntryBytes)
+            return refusePolicy_(n);
+        if (count == 0) {   // the topic was dropped: clear
+            overrides_.erase(topicId);
+            ++policyUpdates_;
+            policyUpdatesForTest_.store(policyUpdates_, std::memory_order_release);
+            return true;
+        }
+        PolicyOverride next = [&] {
+            const auto it = overrides_.find(topicId);
+            return it == overrides_.end() ? PolicyOverride{} : it->second;
+        }();
+        for (uint16_t i = 0; i < count; ++i) {
+            const uint8_t* e = p + CleanerViewChannel::kPolicyHeaderBytes + i * CleanerViewChannel::kPolicyEntryBytes;
+            int64_t v;
+            std::memcpy(&v, e + 1, 8);
+            switch (e[0]) {
+                case 1: next.retentionMs = v; break;
+                case 2: next.retentionBytes = v; break;
+                case 3: next.deleteRetentionMs = v; break;
+                case 4: next.minCleanableDirtyRatio = static_cast<double>(v) / 1'000'000.0; break;
+                case 5: next.minCompactionLagMs = v; break;
+                case 6: next.maxCompactionLagMs = v; break;
+                default: return refusePolicy_(n);
+            }
+        }
+        overrides_[topicId] = next;
+        ++policyUpdates_;
+        policyUpdatesForTest_.store(policyUpdates_, std::memory_order_release);
+        return true;
+    }
+    /// Test-only: the override of `topicId` (nullptr = none).  Read it on the
+    /// cleaner thread, or from a test thread after policyUpdatesForTest()
+    /// (acquire) shows the update and no further one is sent.
+    [[nodiscard]] const PolicyOverride* policyOverrideForTest(int32_t topicId) const noexcept {
+        const auto it = overrides_.find(topicId);
+        return it == overrides_.end() ? nullptr : &it->second;
+    }
+    /// Test-only (any thread): policy messages applied so far (release-published).
+    [[nodiscard]] uint64_t policyUpdatesForTest() const noexcept {
+        return policyUpdatesForTest_.load(std::memory_order_acquire);
+    }
+    /// Test-only: CP-7 checkpoint entries held (one per compacted Log).
+    [[nodiscard]] std::size_t checkpointCountForTest() const noexcept { return checkpoints_.size(); }
 
     /// Test-only accessor: return the configured I/O throttle rate.
     /// -1 = unlimited.  Used by BrokerNodeTest to prove Fix-1 wiring.
@@ -391,7 +461,9 @@ public:
             // largestTimestamp <= 0 means unknown → treated as old → cleanable
             // (compaction never deletes a live key's latest value, so an unknown
             // age only lets compaction run earlier; time RETENTION keeps it).
-            const int64_t minLagMs = replica->minCompactionLagMs();
+            const PolicyOverride* ov = overrideFor_(replica->topicId());   // Task 8
+            const int64_t minLagMs = ov && ov->minCompactionLagMs ? *ov->minCompactionLagMs
+                                                                  : replica->minCompactionLagMs();
             if (minLagMs > 0) {
                 for (std::size_t ii = 0; ii < snap->size(); ++ii) {
                     const auto& si = (*snap)[ii];
@@ -452,7 +524,8 @@ public:
             // When forced, the log is eligible even if dirtyRatio <=
             // minCleanableDirtyRatio.
             bool needCompactionNow = false;
-            const int64_t maxLagMs = replica->maxCompactionLagMs();
+            const int64_t maxLagMs = ov && ov->maxCompactionLagMs ? *ov->maxCompactionLagMs
+                                                                  : replica->maxCompactionLagMs();
             if (maxLagMs > 0 && oldestDirtyTs < std::numeric_limits<int64_t>::max()) {
                 const int64_t ageMs = nowMs - oldestDirtyTs;
                 if (ageMs > maxLagMs) needCompactionNow = true;
@@ -468,7 +541,8 @@ public:
             // below the watermark (the drcp1/3/4 "key delivered seq 37 AND 197" bug).
             const bool wouldSkip =
                 (!needCompactionNow &&
-                 dirtyRatio <= replica->minCleanableDirtyRatio());
+                 dirtyRatio <= (ov && ov->minCleanableDirtyRatio ? *ov->minCleanableDirtyRatio
+                                                                 : replica->minCleanableDirtyRatio()));
             if (wouldSkip) continue;
 
             // Filthiest-first: keep the highest-ratio candidate; a forced log
@@ -596,7 +670,7 @@ public:
             /*activeBase=*/       best.firstUncleanable,
             /*globalDirtyStart=*/ globalDirtyStart,
             nowNs,
-            best.replica->deleteRetentionMs(),
+            effectiveDeleteRetentionMs_(*best.replica),
             /*map=*/              dedupeMap_,
             /*useCoalescing=*/    useCoalescing_,
             /*groupRollBytes=*/   groupRollBytes,
@@ -738,8 +812,10 @@ private:
             rune::storage::Log* log = replica->log();
             if (!log) continue;
 
-            const int64_t retentionMs     = replica->retentionMs();
-            const int64_t retentionBytes  = replica->retentionBytes();
+            const PolicyOverride* ov = overrideFor_(replica->topicId());   // Task 8
+            const int64_t retentionMs     = ov && ov->retentionMs ? *ov->retentionMs : replica->retentionMs();
+            const int64_t retentionBytes  = ov && ov->retentionBytes ? *ov->retentionBytes
+                                                                     : replica->retentionBytes();
             const int64_t logStartOffset  = replica->logStartOffset();
             const int64_t fileDelayMs     = replica->fileDeleteDelayMs();
 
@@ -901,6 +977,38 @@ private:
         checkpoints_.emplace(log, std::move(ckpt));
     }
 
+    // Task 8: per-topic policy overrides (see applyPolicyMessage).
+    static constexpr std::size_t kPolicyOverridesReserved = 1024;
+    std::unordered_map<int32_t, PolicyOverride> overrides_;
+    uint64_t                                    policyUpdates_ = 0;
+    uint64_t                                    policyRefused_ = 0;
+    std::atomic<uint64_t>                       policyUpdatesForTest_{0};   // test observability only
+    [[nodiscard]] const PolicyOverride* overrideFor_(int32_t topicId) const noexcept {
+        if (overrides_.empty()) [[likely]] return nullptr;
+        const auto it = overrides_.find(topicId);
+        return it == overrides_.end() ? nullptr : &it->second;
+    }
+    [[nodiscard]] int64_t effectiveDeleteRetentionMs_(const rune::replication::PartitionReplica& r) const noexcept {
+        const PolicyOverride* ov = overrideFor_(r.topicId());
+        return ov && ov->deleteRetentionMs ? *ov->deleteRetentionMs : r.deleteRetentionMs();
+    }
+    bool refusePolicy_(std::size_t n) {
+        if (policyRefused_++ % 1024 == 0)
+            spdlog::error("LogCleanerAgent: malformed policy override ({} B) refused (refused so far: {})", n,
+                          policyRefused_);
+        return false;
+    }
+    /// Task 8: a dropped topic's Log may be freed and a new one allocated at the
+    /// same address — a CP-7 checkpoint keyed by Log* must not outlive its
+    /// replica's view membership.  Cold (on a view swap only).
+    void pruneCheckpoints_() {
+        for (auto it = checkpoints_.begin(); it != checkpoints_.end();) {
+            bool live = false;
+            for (auto* r : view_) live = live || (r && r->isDiskBacked() && r->log() == it->first);
+            it = live ? std::next(it) : checkpoints_.erase(it);
+        }
+    }
+
     ReplicaRegistry*        registry_;            // non-owning; nullptr once a view channel is attached
 
     // Task 10 round 4: cleaner-owned replica view (see CleanerViewChannel.h).
@@ -917,6 +1025,11 @@ private:
     void applyViewUpdates_() {
         channel_->view.drain([this](int32_t type, aeron::concurrent::AtomicBuffer& buf,
                                     aeron::util::index_t off, aeron::util::index_t len) {
+            if (type == CleanerViewChannel::kPolicyMsgType) {   // Task 8
+                (void)applyPolicyMessage(reinterpret_cast<const uint8_t*>(buf.buffer() + off),
+                                         static_cast<std::size_t>(len));
+                return;
+            }
             if (type != CleanerViewChannel::kViewMsgType ||
                 static_cast<std::size_t>(len) < CleanerViewChannel::kHeaderBytes) return;
             const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + off);
@@ -935,6 +1048,7 @@ private:
                 building_.clear();
                 viewGen_    = gen;
                 ackPending_ = true;
+                if (!checkpoints_.empty()) pruneCheckpoints_();   // Task 8 (cold)
             }
         }, 64);
         if (ackPending_ && channel_->ack.write(reinterpret_cast<const uint8_t*>(&viewGen_), 8,

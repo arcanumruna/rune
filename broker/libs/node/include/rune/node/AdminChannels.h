@@ -61,6 +61,11 @@ enum : int32_t {
     // Catalog history Task 6 (control → admin, on the AdminRoleRing):
     kMsgCatalogRole       = 9,   // the __catalog replica's role (AdminRoleMsg, full form)
     kMsgCatalogAlterIsrResponse = 10,  // the controller's AlterIsrResponse for (-6, 0), verbatim SBE
+    // Catalog history Task 8 (control → admin, on controlToAdminRing — the former
+    // create-topic reply ring): [path bytes] — a dropped topic's renamed dir
+    // (dataDir/dropped/<id>.<name>) to remove (cold; std::filesystem::remove_all on
+    // the admin thread; a failure is logged and the dir stays for the boot purge).
+    kMsgPurgeDroppedDir   = 16,
 };
 
 // ---------------------------------------------------------------------------
@@ -658,10 +663,16 @@ inline SchemaUpdateMsg decodeSchemaUpdate(const uint8_t* buf, std::size_t len) {
 // WorkerViewSet::installViewForRecovery (checkpoint load + RebuildingViews +
 // serve-guard) instead of the plain-install lazy path (which would serve
 // immediately).  Default false => the create path is byte-for-byte unchanged.
+// Catalog history Task 8: the same byte that carries `recovery` carries the
+// UNINSTALL op (value kViewPlanUninstallByte; blobs empty) on the control →
+// worker install ring — a DropView / AlterView retired the view.  One op byte:
+// 0 = install, 1 = recovery install, 2 = uninstall.
+inline constexpr uint8_t kViewPlanUninstallByte = 2;
 struct ViewPlanUpdateMsg {
     int32_t              viewTopicId = -1;
     uint8_t              persistence = 0;
     bool                 recovery    = false;  // Task 19b: restart-recovery install
+    bool                 uninstall   = false;  // Task 8: retire the view (op byte 2)
     std::vector<uint8_t> planBlob;      // rune::view::serialize(CompiledViewPlan)
     std::vector<uint8_t> outDescBlob;   // rune::codec::serialize(outputDescriptor)
     std::vector<uint8_t> srcDescBlob;   // rune::codec::serialize(sourceDescriptor)
@@ -699,7 +710,8 @@ inline bool encodeViewPlanUpdate(OneToOneByteRing& ring, int32_t msgType,
                                  const ViewPlanUpdateMsg& m) {
     const auto idx = ring.tryClaim(msgType, viewPlanUpdateWireLen(m));
     if (idx < 0) return false;
-    writeViewPlanUpdate(ring.base() + idx, m.viewTopicId, m.persistence, m.recovery ? uint8_t{1} : uint8_t{0},
+    const uint8_t op = m.uninstall ? kViewPlanUninstallByte : (m.recovery ? uint8_t{1} : uint8_t{0});
+    writeViewPlanUpdate(ring.base() + idx, m.viewTopicId, m.persistence, op,
                         m.planBlob, m.outDescBlob, m.srcDescBlob);
     ring.commit(idx);
     return true;
@@ -712,7 +724,9 @@ inline ViewPlanUpdateMsg decodeViewPlanUpdate(const uint8_t* buf, std::size_t le
     if (len < 10) return m;  // viewTopicId(4) + persistence(1) + recovery(1) + planLen(4)
     m.viewTopicId = getI32(buf + pos); pos += 4;
     m.persistence = buf[pos++];
-    m.recovery    = buf[pos++] != 0;
+    const uint8_t op = buf[pos++];
+    m.uninstall   = op == kViewPlanUninstallByte;
+    m.recovery    = op == 1;
     auto readBlob = [&](std::vector<uint8_t>& out) -> bool {
         if (pos + 4 > len) return false;
         const int32_t bl = getI32(buf + pos); pos += 4;

@@ -2742,7 +2742,10 @@ void BrokerNode::buildGateway() {
         // own replica view over a ring from the control thread, which frees a
         // removed replica only after the cleaner acked the generation dropping it.
         cleanerAgent_->setProducerIdExpirationMs(config_.producerIdExpirationMs);   // PSM round 1, I1
-        if (runtimeAgent_) cleanerAgent_->attachViewChannel(runtimeAgent_->enableCleanerView());
+        if (runtimeAgent_) {
+            cleanerViewChannel_ = runtimeAgent_->enableCleanerView();   // Task 8: also the policy-override ring
+            cleanerAgent_->attachViewChannel(cleanerViewChannel_);
+        }
         cleanerRunner_ = std::make_unique<rune::consensus::AgentRunner>(
             *cleanerAgent_, cleanerIdleStrategy_, cleanerClock_);
         // hotpath-A F2: pre-provisioning + staging renames belong to the
@@ -4170,6 +4173,26 @@ int BrokerNode::serviceAdminControl_() {
                 forwardCatalogAlterIsr_(p, n);
                 return;
             }
+            // Catalog history Task 8: the CatalogApplier's effects — this (control)
+            // thread owns TopicRegistry, the replicas, the placement and the
+            // cleaner's policy ring.  Every handler is idempotent (see BrokerNode.h).
+            if (tid == kA2cCatalogTopicApplied) { onCatalogTopicApplied_(p, n); return; }
+            if (tid == kA2cCatalogTopicDropped) {
+                CatalogTopicDroppedMsg m;
+                if (decodeCatalogTopicDropped(p, n, m)) dropRuntimeTopic_(m.topicId, m.name);
+                else if (adminToControlRejects_++ % 1024 == 0) [[unlikely]]
+                    spdlog::error("BrokerNode[{}]: malformed kA2cCatalogTopicDropped (len={}) skipped",
+                                  config_.nodeId, n);
+                return;
+            }
+            if (tid == kA2cCatalogTopicConfig) { onCatalogTopicConfig_(p, n); return; }
+            if (tid == kA2cViewUninstall) {
+                const int32_t viewTopicId = decodeViewUninstall(p, n);
+                if (viewTopicId >= 0) onViewUninstall_(viewTopicId);
+                else if (adminToControlRejects_++ % 1024 == 0) [[unlikely]]
+                    spdlog::error("BrokerNode[{}]: malformed kA2cViewUninstall (len={}) skipped", config_.nodeId, n);
+                return;
+            }
             // B10 / D4 fix round 1: the topic's catalog record committed — this
             // (control) thread owns TopicRegistry, so it rewrites the dir marker.
             // C1 (final review): the commit is also what makes a runtime topic
@@ -4216,6 +4239,9 @@ int BrokerNode::serviceAdminControl_() {
     if (workerPool_) work += schemaFanout_.pump(*workerPool_);
     // Task 19: retry any view-plan install frames a worker ring could not take.
     if (!viewFanoutBacklog_.empty()) work += pumpViewFanout_();
+    // Catalog history Task 8: the drop sequence's later steps + ring-full retries.
+    if (!droppedAwaitingRetire_.empty()) [[unlikely]] work += serviceDroppedTopics_();
+    if (!purgeOutbox_.empty() || !cleanerPolicyOutbox_.empty()) [[unlikely]] work += pumpCatalogOutboxes_();
 
     // (2) Drain create-topic requests (admin → control).
     work += agent->createReqRing().drain(
@@ -4251,7 +4277,7 @@ int BrokerNode::serviceAdminControl_() {
                 }
             }
             // Reply ring is 1-deep in flight (one DDL at a time) → never full.
-            (void)encodeCreateTopicReply(agent->replyRing(), reply);
+            (void)encodeCreateTopicReply(agent->controlToAdminRing(), reply);
         }, 8);
 
     // (3) Drain response frames (admin → control) → session egress.
@@ -4302,6 +4328,276 @@ int BrokerNode::serviceAdminControl_() {
 }
 
 int AdminControlPlane::doWork(int64_t /*nowNs*/) { return node_.serviceAdminControl_(); }
+
+// ---------------------------------------------------------------------------
+// Catalog history Task 8 — the control thread executes the catalog's effects.
+// Cold (DDL rate).  See BrokerNode.h for the drop sequence and idempotency.
+// ---------------------------------------------------------------------------
+namespace {
+TopicSpec topicSpecFromCatalog(const CatalogTopicAppliedMsg& m) {
+    TopicSpec s;
+    s.name                   = m.name;
+    s.topicId                = m.topicId;
+    s.partitionCount         = m.partitions;
+    s.replicationFactor      = m.replicationFactor;
+    s.persistence            = m.persistence == 1 ? PersistenceMode::Transient : PersistenceMode::Disk;
+    const auto& c            = m.config;
+    s.cleanupPolicy          = c.cleanupPolicy <= 2 ? static_cast<TopicSpec::CleanupPolicy>(c.cleanupPolicy)
+                                                    : TopicSpec::CleanupPolicy::Delete;
+    s.retentionMs            = c.retentionMs;
+    s.retentionBytes         = c.retentionBytes;
+    s.deleteRetentionMs      = c.deleteRetentionMs;
+    s.minCleanableDirtyRatio = static_cast<double>(c.minCleanableDirtyRatioPpm) / 1'000'000.0;
+    s.segmentRollBytes       = c.segmentRollBytes;
+    s.minCompactionLagMs     = c.minCompactionLagMs;
+    s.maxCompactionLagMs     = c.maxCompactionLagMs;
+    s.retentionCheckMs       = c.retentionCheckMs;
+    s.fileDeleteDelayMs      = c.fileDeleteDelayMs;
+    s.durability             = c.durability;
+    s.durabilityTier         = c.durabilityTier;
+    s.coPartitionGroup       = c.coPartitionGroup;
+    s.partitionKey           = c.partitionKey;
+    return s;
+}
+} // namespace
+
+void BrokerNode::postCatalogEffectForTest(int32_t typeId, std::vector<uint8_t> payload) {
+    onAdminThreadForTest([this, typeId, payload = std::move(payload)]() {
+        adminWorkerAgent_->postCatalogFrameForTest(typeId, payload);
+    });
+}
+bool BrokerNode::catalogTopicServesForTest(int32_t topicId) {
+    return onControlThreadForTest([this, topicId]() { return catalogTopicServes_(topicId); });
+}
+void BrokerNode::holdDroppedDirPurgeForTest(bool on) {
+    onAdminThreadForTest([this, on]() { adminWorkerAgent_->setHoldDroppedDirPurgeForTest(on); });
+}
+
+bool BrokerNode::catalogNameHeldByDrop_(const std::string& name) const noexcept {
+    for (const auto& d : droppedAwaitingRetire_) if (d.name == name) return true;
+    return false;
+}
+
+void BrokerNode::onCatalogTopicApplied_(const uint8_t* p, std::size_t n) {
+    CatalogTopicAppliedMsg m;
+    if (!decodeCatalogTopicApplied(p, n, m)) {
+        if (adminToControlRejects_++ % 1024 == 0) [[unlikely]]
+            spdlog::error("BrokerNode[{}]: malformed kA2cCatalogTopicApplied (len={}) skipped", config_.nodeId, n);
+        return;
+    }
+    TopicSpec spec = topicSpecFromCatalog(m);
+    // Step 3: a create whose name a dropped topic still holds (its dir not renamed
+    // away yet) waits — FIFO per name, behind any create of that name already waiting.
+    bool behind = catalogNameHeldByDrop_(spec.name);
+    for (const auto& pc : pendingCreatesBehindDrop_) {
+        if (pc.spec.name != spec.name) continue;
+        if (pc.spec.topicId == spec.topicId) return;   // the same effect again: already queued (idempotent)
+        behind = true;
+    }
+    if (behind) {
+        spdlog::info("BrokerNode[{}]: catalog topic '{}' (id={}) waits behind the drop of its name "
+                     "(PendingCreateBehindDrop)", config_.nodeId, spec.name, spec.topicId);
+        pendingCreatesBehindDrop_.push_back(PendingCreateBehindDrop{std::move(spec)});
+        return;
+    }
+    runCatalogCreate_(spec);
+}
+
+void BrokerNode::runCatalogCreate_(const TopicSpec& spec) {
+    if (!topicRegistry_) return;
+    try {
+        if (commitReplicaFault_ && *commitReplicaFault_ == spec.name) [[unlikely]]
+            throw std::runtime_error("injected replica-build fault (test)");
+        const int32_t id = topicRegistry_->createTopicAt(spec.topicId, spec);   // idempotent (same id + name)
+        if (id < 0) return;                                                      // refused (logged)
+        if (const TopicSpec* built = topicRegistry_->topic(id))
+            (void)createRuntimeUserReplicas(*built);   // idempotent: skips existing replicas; addRuntimeTopic
+    } catch (const std::exception& ex) {
+        // The topic does not serve (produce answers NotLeader / UnknownTopic) — as
+        // commitReplicaFault_ on the old path; the next boot rebuilds it.
+        spdlog::error("BrokerNode[{}]: catalog topic '{}' (id={}) — building it failed: {}", config_.nodeId,
+                      spec.name, spec.topicId, ex.what());
+    }
+}
+
+void BrokerNode::dropRuntimeTopic_(int32_t topicId, const std::string& name) {
+    // A create of this id still waiting behind an older drop never ran: forget it.
+    const auto before = pendingCreatesBehindDrop_.size();
+    std::erase_if(pendingCreatesBehindDrop_,
+                  [topicId](const PendingCreateBehindDrop& pc) { return pc.spec.topicId == topicId; });
+    if (metadataService_) metadataService_->removeRuntimeTopic(topicId);   // idempotent
+    if (pendingCreatesBehindDrop_.size() != before || !topicRegistry_) return;
+
+    const TopicSpec* spec = topicRegistry_->topic(topicId);
+    if (spec == nullptr) return;   // unknown or already dropped: the same effect again (idempotent)
+    DroppedTopic d;
+    d.id         = topicId;
+    d.name       = spec->name;
+    d.diskBacked = spec->persistence != PersistenceMode::Transient;
+    const int32_t partitions = spec->partitionCount;
+    if (d.name != name)
+        spdlog::warn("BrokerNode[{}]: catalog drop of id={} names '{}' but the topic is '{}' — dropping by id",
+                     config_.nodeId, topicId, name, d.name);
+    (void)topicRegistry_->dropTopic(topicId);   // serves nothing from now on (`spec` is not used after)
+    if (gateway_) (void)gateway_->endTopicSubscriptions(topicId);   // explicit UnknownTopic, never silent
+    for (int32_t part = 0; part < partitions; ++part) {
+        rune::replication::PartitionReplica* r = replicaRegistry_ ? replicaRegistry_->lookup(topicId, part) : nullptr;
+        if (r == nullptr) continue;
+        if (!r->isDiskBacked()) d.memLogs.push_back(r->memoryLog());
+        if (replTransport_) replTransport_->unregisterReplica(topicId, part);   // never a dangling route
+        // Fence (routed to the owning worker, FIFO before the SetOwnership that drops
+        // it) + retire: freed only once every holder acked the generation.
+        if (replBridge_) replBridge_->removePartition(topicId, part);
+        else             replicaRegistry_->remove(topicId, part);
+    }
+    if (cleanerViewChannel_) {   // clear the cleaner's override (count 0)
+        std::vector<uint8_t> clear(CleanerViewChannel::kPolicyHeaderBytes, 0);
+        std::memcpy(clear.data(), &topicId, 4);
+        cleanerPolicyOutbox_.push_back(std::move(clear));
+        (void)pumpCatalogOutboxes_();
+    }
+    d.step = AwaitingRetire{replicaRegistry_ ? replicaRegistry_->generation() : 0};
+    spdlog::info("BrokerNode[{}]: catalog dropped topic '{}' (id={}): not served; {} partition(s) retiring",
+                 config_.nodeId, d.name, topicId, partitions);
+    droppedAwaitingRetire_.push_back(std::move(d));
+}
+
+int BrokerNode::serviceDroppedTopics_() {
+    namespace fs = std::filesystem;
+    int work = 0;
+    const uint64_t safeGen = runtimeAgent_ ? runtimeAgent_->retireSafeGeneration()
+                                           : (replicaRegistry_ ? replicaRegistry_->generation() : 0);
+    bool renamed = false;
+    for (std::size_t i = 0; i < droppedAwaitingRetire_.size();) {
+        DroppedTopic& d = droppedAwaitingRetire_[i];
+        if (const auto* w = std::get_if<AwaitingRetire>(&d.step)) {
+            if (w->retireGen > safeGen) { ++i; continue; }   // a holder may still reference its Logs
+            if (topicRegistry_) (void)topicRegistry_->releaseDroppedLogs(d.id);
+            for (auto* ml : d.memLogs)
+                std::erase_if(memoryLogs_, [ml](const std::unique_ptr<rune::storage::InMemoryLog>& l) {
+                    return l.get() == ml;
+                });
+            d.memLogs.clear();
+            d.step = AwaitingRename{};
+            ++work;
+        }
+        // AwaitingRename: move the data away atomically, then hand it to the admin purge.
+        const fs::path from = fs::path(config_.dataDir) / "topics" / d.name;
+        std::error_code ec;
+        if (d.diskBacked && fs::exists(fs::symlink_status(from, ec))) {
+            const fs::path droppedRoot = fs::path(config_.dataDir) / "dropped";
+            const fs::path to = droppedRoot / (std::to_string(d.id) + "." + d.name);
+            fs::create_directories(droppedRoot, ec);
+            if (!ec) fs::rename(from, to, ec);
+            if (ec) {
+                if (d.renameFailures++ % 1024 == 0)
+                    spdlog::error("BrokerNode[{}]: renaming the dropped topic dir '{}' -> '{}' failed: {} — "
+                                  "retried next pass (never deleted in place; failures {})", config_.nodeId,
+                                  from.string(), to.string(), ec.message(), d.renameFailures);
+                ++i;
+                continue;
+            }
+            purgeOutbox_.push_back(to.string());
+        }
+        spdlog::info("BrokerNode[{}]: dropped topic '{}' (id={}) retired — its data moved to dropped/",
+                     config_.nodeId, d.name, d.id);
+        droppedAwaitingRetire_.erase(droppedAwaitingRetire_.begin() + static_cast<std::ptrdiff_t>(i));
+        renamed = true;
+        ++work;
+    }
+    if (renamed && !pendingCreatesBehindDrop_.empty()) {
+        // Step 3: run, in arrival order, every waiting create whose name no drop
+        // holds any more (a later create of a still-held name keeps waiting).
+        std::vector<PendingCreateBehindDrop> waiting;
+        waiting.swap(pendingCreatesBehindDrop_);
+        for (auto& pc : waiting) {
+            bool held = catalogNameHeldByDrop_(pc.spec.name);
+            for (const auto& q : pendingCreatesBehindDrop_) held = held || q.spec.name == pc.spec.name;
+            if (held) pendingCreatesBehindDrop_.push_back(std::move(pc));
+            else      runCatalogCreate_(pc.spec);
+        }
+    }
+    if (!purgeOutbox_.empty()) work += pumpCatalogOutboxes_();
+    return work;
+}
+
+int BrokerNode::pumpCatalogOutboxes_() {
+    int work = 0;
+    if (!purgeOutbox_.empty() && adminWorkerAgent_) {
+        std::size_t sent = 0;
+        for (const std::string& path : purgeOutbox_) {
+            OneToOneByteRing& ring = adminWorkerAgent_->controlToAdminRing();
+            if (path.size() > static_cast<std::size_t>(ring.maxMsgLength())) [[unlikely]] {
+                spdlog::error("BrokerNode[{}]: dropped dir path '{}' exceeds the control→admin ring message — "
+                              "left for the boot purge", config_.nodeId, path);
+                ++sent;
+                continue;
+            }
+            if (!ring.write(reinterpret_cast<const uint8_t*>(path.data()), path.size(), kMsgPurgeDroppedDir)) break;
+            ++sent;
+        }
+        purgeOutbox_.erase(purgeOutbox_.begin(), purgeOutbox_.begin() + static_cast<std::ptrdiff_t>(sent));
+        work += static_cast<int>(sent);
+    } else if (!purgeOutbox_.empty()) {
+        purgeOutbox_.clear();   // no admin thread: the boot purge removes them
+    }
+    if (!cleanerPolicyOutbox_.empty()) {
+        std::size_t sent = 0;
+        if (cleanerViewChannel_) {
+            for (const auto& f : cleanerPolicyOutbox_) {
+                if (!cleanerViewChannel_->view.write(f.data(), f.size(), CleanerViewChannel::kPolicyMsgType)) break;
+                ++sent;
+            }
+        } else {
+            sent = cleanerPolicyOutbox_.size();   // no cleaner: nothing consumes overrides
+        }
+        cleanerPolicyOutbox_.erase(cleanerPolicyOutbox_.begin(),
+                                   cleanerPolicyOutbox_.begin() + static_cast<std::ptrdiff_t>(sent));
+        work += static_cast<int>(sent);
+    }
+    return work;
+}
+
+void BrokerNode::onCatalogTopicConfig_(const uint8_t* p, std::size_t n) {
+    CatalogTopicConfigMsg m;
+    if (!decodeCatalogTopicConfig(p, n, m)) {
+        if (adminToControlRejects_++ % 1024 == 0) [[unlikely]]
+            spdlog::error("BrokerNode[{}]: malformed kA2cCatalogTopicConfig (len={}) skipped", config_.nodeId, n);
+        return;
+    }
+    // Ruling 5: the alterable keys reach the CLEANER (policy override on its view
+    // ring) — the replica's construction-time config is never touched.  The
+    // layout is the cleaner's kPolicyMsgType verbatim (checked above).
+    static_assert(CleanerViewChannel::kPolicyHeaderBytes == 6 && CleanerViewChannel::kPolicyEntryBytes ==
+                      kCatalogConfigEntryBytes, "kA2cCatalogTopicConfig is forwarded verbatim as kPolicyMsgType");
+    cleanerPolicyOutbox_.emplace_back(p, p + n);
+    (void)pumpCatalogOutboxes_();
+}
+
+void BrokerNode::onViewUninstall_(int32_t viewTopicId) {
+    // Every worker drops the view's instances on its own thread (the install ring).
+    ViewPlanUpdateMsg msg;
+    msg.viewTopicId = viewTopicId;
+    msg.uninstall   = true;
+    viewFanoutBacklog_.push_back(ViewFanoutPending{std::move(msg), 0});
+    (void)pumpViewFanout_();
+}
+
+bool BrokerNode::catalogTopicServes_(int32_t topicId) const noexcept {
+    if (!topicRegistry_ || topicRegistry_->state(topicId) != rune::gateway::TopicRegistry::TopicState::Serving ||
+        topicRegistry_->awaitingCommit(topicId))
+        return false;
+    const TopicSpec* spec = topicRegistry_->topic(topicId);
+    if (spec == nullptr) return false;
+    if (!metadataService_) return true;   // no placement authority: applied is serving
+    for (int32_t p = 0; p < spec->partitionCount; ++p) {
+        if (metadataService_->assignment(topicId, p) == nullptr) return false;
+        if (replicaRegistry_ &&
+            replicaRegistry_->lookupHandle(topicId, p).intendedRole == ReplicaRegistry::IntendedRole::Unknown)
+            return false;
+    }
+    return true;
+}
 
 // C1 / M7: the topic of a DDL OK serves — its record committed (servable) and, when
 // a metadata service drives assignments, every partition's role has been routed

@@ -43,6 +43,15 @@ void MetadataStateMachine::apply(const uint8_t* buf, std::size_t len, int64_t re
         return;
     }
 
+    if (static_cast<uint16_t>(*typeOpt) == kRemoveTopicPlacementRecordType) {   // catalog history Task 8
+        const auto rec = RemoveTopicPlacementRecord::decode(buf, len);
+        if (!rec.has_value()) return;
+        if (recordPos <= committedPos_) removeTopic_(rec->topicId);
+        else pending_.push_back(PendingEntry{recordPos, rec->topicId, -1, PartitionAssignment{},
+                                             PendingKind::RemoveTopic});
+        return;
+    }
+
     switch (*typeOpt) {
     case MetadataRecordType::CreateTopic: {
         // CreateTopicRecord: we register the topic but don't pre-create partition
@@ -132,10 +141,11 @@ void MetadataStateMachine::commit(int64_t committedPos)
     flushPending(committedPos);
 }
 
-// N4 (fix round 2) — LATENT HAZARD: the MSM has no topic-delete path; if one
-// lands with topic-id REUSE, the delete must erase committed_ for the old
-// topic's partitions, or this guard silently rejects the recreated topic's
-// epoch-0 records (leaderless forever).  Topic ids are never reused today.
+// N4 (fix round 2): the regression guard below compares against the committed
+// assignment of the same (topic, partition).  The topic-delete path
+// (RemoveTopicPlacementRecord, catalog history Task 8) ERASES committed_ for the
+// dropped topic's partitions, and catalog topic ids are never reused, so a
+// recreated name (a new id) never meets an old epoch here.
 void MetadataStateMachine::install_(int32_t topicId, int32_t partition,
                                     const PartitionAssignment& pa)
 {
@@ -161,6 +171,23 @@ void MetadataStateMachine::install_(int32_t topicId, int32_t partition,
     installed.cleanElection = clean;
     committed_.put(topicId, partition, installed);
     ++committedVersion_;
+}
+
+void MetadataStateMachine::removeTopic_(int32_t topicId)
+{
+    // Cold (a topic drop): collect the keys first — never erase while iterating.
+    std::vector<int32_t> parts;
+    committed_.forEach([&](int32_t t, int32_t p, const PartitionAssignment&) {
+        if (t == topicId) parts.push_back(p);
+    });
+    for (int32_t p : parts) committed_.remove(topicId, p);
+    bool lineage = false;
+    for (auto it = lineages_.begin(); it != lineages_.end();) {
+        if (static_cast<int32_t>(it->first >> 32) == topicId) { it = lineages_.erase(it); lineage = true; }
+        else ++it;
+    }
+    if (!parts.empty()) ++committedVersion_;   // an unknown topic id is a no-op
+    if (lineage) ++lineageVersion_;
 }
 
 void MetadataStateMachine::installLineage_(int64_t key, const TransientLineage& l)
@@ -203,7 +230,8 @@ void MetadataStateMachine::flushPending(int64_t upToPos)
     std::size_t kept = 0;
     for (auto& e : pending_) {
         if (e.pos <= upToPos) {
-            install_(e.topicId, e.partition, e.assignment);
+            if (e.kind == PendingKind::RemoveTopic) removeTopic_(e.topicId);
+            else install_(e.topicId, e.partition, e.assignment);
         } else {
             // Move back to the kept region
             pending_[kept++] = std::move(e);

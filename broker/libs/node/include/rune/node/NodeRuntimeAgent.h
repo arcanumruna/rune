@@ -244,6 +244,13 @@ public:
     /// placement) = every cycle.  Set before the agent runs.
     void setSlowTickIntervalNs(int64_t ns) noexcept { failoverTick_.intervalNs = ns > 0 ? ns : 0; }
 
+    /// Catalog history Task 8 (this agent's thread): the replica-registry
+    /// generation every holder of a replica pointer (each worker's ownership
+    /// ack, the cleaner's and the provisioner's view acks) has reached — the
+    /// SAME bound collectRetired frees by.  A replica removed at a generation
+    /// <= this is freed: nothing references its Log any more.
+    [[nodiscard]] std::uint64_t retireSafeGeneration() const noexcept { return retireSafeGen_; }
+
     /// Test-only (this agent's thread): duty cycles run / routing images published.
     [[nodiscard]] std::uint64_t cyclesForTest() const noexcept { return cycles_; }
     [[nodiscard]] std::uint64_t routingImagePublishesForTest() const noexcept { return routingImagePublishes_; }
@@ -285,6 +292,7 @@ private:
                 if (v.channel && v.ackedGen < safe) safe = v.ackedGen;
             }
             registry_->collectRetired(safe);
+            retireSafeGen_ = safe;   // catalog history Task 8: the dropped-topic retire gate
         }
 
         // 2. Metadata bridge — detect leader/epoch change and flip replica roles.
@@ -1095,6 +1103,7 @@ private:
     }
     rune::consensus::SlowTick                          failoverTick_;
     std::uint64_t                                      cycles_                = 0;
+    std::uint64_t                                      retireSafeGen_         = 0;   // see retireSafeGeneration()
     std::uint64_t                                      routingImagePublishes_ = 0;
     // routingVersion() of the image last published; UINT64_MAX = none yet
     // (routingVersion() starts at 0, so the first cycle always builds).

@@ -239,6 +239,26 @@ void WorkerViewSet::installView(rune::view::CompiledViewPlan plan,
                      underRecovery});
 }
 
+bool WorkerViewSet::uninstallView(int32_t viewTopicId) {
+    bool had = templates_.erase(viewTopicId) != 0;
+    for (auto it = views_.begin(); it != views_.end();) {
+        if (static_cast<int32_t>(static_cast<uint32_t>(it->first >> 32)) == viewTopicId) {
+            it = views_.erase(it);   // frees the instance's table / aggregate / pending delta
+            had = true;
+        } else {
+            ++it;
+        }
+    }
+    for (auto it = subscriptionIndex_.begin(); it != subscriptionIndex_.end();) {
+        std::erase(it->second, viewTopicId);
+        it = it->second.empty() ? subscriptionIndex_.erase(it) : std::next(it);
+    }
+    had = (recoveryViews_.erase(viewTopicId) != 0) || had;
+    if (had) spdlog::info("WorkerViewSet: view viewTopicId={} uninstalled (stops folding, instances freed)",
+                          viewTopicId);
+    return had;
+}
+
 int WorkerViewSet::drainInstalls() {
     // Single consumer (this worker thread) of the control->worker install ring.
     return channel_.install.drain(
@@ -247,6 +267,10 @@ int WorkerViewSet::drainInstalls() {
             if (tid != ViewSnapshotChannel::kInstallMsgType) return;
             const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
             const ViewPlanUpdateMsg m = decodeViewPlanUpdate(p, static_cast<std::size_t>(len));
+            if (m.uninstall) {   // catalog history Task 8: DropView / AlterView retired it
+                (void)uninstallView(m.viewTopicId);
+                return;
+            }
 
             std::optional<rune::view::CompiledViewPlan> plan =
                 rune::view::deserializeCompiledViewPlan(

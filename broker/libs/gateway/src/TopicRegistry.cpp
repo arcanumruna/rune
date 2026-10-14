@@ -44,38 +44,16 @@ TopicRegistry::createTopic(const rune::node::TopicSpec& spec)
     return createTopicImpl(spec, CreateOrigin::Runtime);
 }
 
-int32_t
-TopicRegistry::createTopicImpl(const rune::node::TopicSpec& spec, CreateOrigin origin)
+TopicRegistry::TopicEntry
+TopicRegistry::buildEntry_(const rune::node::TopicSpec& spec, int32_t id, CreateOrigin origin)
 {
-    // Idempotent guard: if a topic with this name already exists, return its id.
-    {
-        auto it = nameIndex_.find(spec.name);
-        if (it != nameIndex_.end()) {
-            spdlog::debug(
-                "TopicRegistry::createTopic: topic='{}' already registered with id={}",
-                spec.name, it->second);
-            return it->second;
-        }
-    }
-
     const fs::path root{dataDir_};
 
-    // Assign the next sequential topicId (the registry owns id assignment so that
-    // topics_[topicId] lookups stay valid — spec.topicId is the caller's hint but
-    // is intentionally ignored for placement).
-    const int32_t assignedId = static_cast<int32_t>(topics_.size());
-
     TopicEntry entry;
-    entry.spec           = spec;
-    entry.spec.topicId   = assignedId;   // store the assigned (sequential) id
+    entry.spec         = spec;
+    entry.spec.topicId = id;
+    entry.origin       = origin;
     entry.partitions.reserve(static_cast<std::size_t>(spec.partitionCount));
-
-    // B10 / D4 (review M1): the marker is only ever written into a topic dir THIS
-    // create made — never stamped onto a pre-existing dir (e.g. one a case-variant
-    // name shares on a case-insensitive filesystem, or a surviving old dir).
-    const fs::path topicDir = root / "topics" / spec.name;
-    std::error_code existEc;
-    const bool topicDirPreexisted = fs::exists(fs::symlink_status(topicDir, existEc));
 
     for (int32_t p = 0; p < spec.partitionCount; ++p) {
         PartitionEntry pe;
@@ -116,6 +94,38 @@ TopicRegistry::createTopicImpl(const rune::node::TopicSpec& spec, CreateOrigin o
         pe.log = std::move(logPtr);
         entry.partitions.push_back(std::move(pe));
     }
+    return entry;
+}
+
+int32_t
+TopicRegistry::createTopicImpl(const rune::node::TopicSpec& spec, CreateOrigin origin)
+{
+    // Idempotent guard: if a topic with this name already exists, return its id.
+    {
+        auto it = nameIndex_.find(spec.name);
+        if (it != nameIndex_.end()) {
+            spdlog::debug(
+                "TopicRegistry::createTopic: topic='{}' already registered with id={}",
+                spec.name, it->second);
+            return it->second;
+        }
+    }
+
+    const fs::path root{dataDir_};
+
+    // Assign the next sequential topicId (the registry owns id assignment so that
+    // topics_[topicId] lookups stay valid — spec.topicId is the caller's hint but
+    // is intentionally ignored for placement).
+    const int32_t assignedId = static_cast<int32_t>(topics_.size());
+
+    // B10 / D4 (review M1): the marker is only ever written into a topic dir THIS
+    // create made — never stamped onto a pre-existing dir (e.g. one a case-variant
+    // name shares on a case-insensitive filesystem, or a surviving old dir).
+    const fs::path topicDir = root / "topics" / spec.name;
+    std::error_code existEc;
+    const bool topicDirPreexisted = fs::exists(fs::symlink_status(topicDir, existEc));
+
+    TopicEntry entry = buildEntry_(spec, assignedId, origin);
 
     // B10 / D4: the two-phase topic-id marker ties this directory to its id, so
     // boot can tell a never-committed orphan's dir (pending: deleted) from any other
@@ -136,7 +146,7 @@ TopicRegistry::createTopicImpl(const rune::node::TopicSpec& spec, CreateOrigin o
     }
 
     // C1: a runtime create is not servable until its catalog record commits.
-    entry.committed = (origin == CreateOrigin::Boot);
+    entry.lifecycle = (origin == CreateOrigin::Runtime) ? Lifecycle::AwaitingCommit : Lifecycle::Serving;
 
     nameIndex_.emplace(spec.name, assignedId);
     topics_.push_back(std::move(entry));
@@ -147,6 +157,80 @@ TopicRegistry::createTopicImpl(const rune::node::TopicSpec& spec, CreateOrigin o
         spec.name, assignedId, spec.partitionCount);
 
     return assignedId;
+}
+
+// ---------------------------------------------------------------------------
+// Catalog history Task 8: createTopicAt / dropTopic / releaseDroppedLogs
+// ---------------------------------------------------------------------------
+int32_t
+TopicRegistry::createTopicAt(int32_t topicId, const rune::node::TopicSpec& spec)
+{
+    if (topicId < 0 || spec.name.empty()) {
+        spdlog::error("TopicRegistry::createTopicAt: refused id={} name='{}' (invalid)", topicId, spec.name);
+        return -1;
+    }
+    const auto slot = static_cast<std::size_t>(topicId);
+    if (slot < topics_.size()) {
+        const TopicEntry& e = topics_[slot];
+        if (e.lifecycle == Lifecycle::Dropped) {
+            spdlog::error("TopicRegistry::createTopicAt: id={} ('{}') is a dropped catalog id — never re-created",
+                          topicId, spec.name);
+            return -1;
+        }
+        if (e.spec.name == spec.name) return topicId;   // idempotent: the same effect again
+        spdlog::error("TopicRegistry::createTopicAt: id={} already holds '{}', refused for '{}'",
+                      topicId, e.spec.name, spec.name);
+        return -1;
+    }
+    if (const auto it = nameIndex_.find(spec.name); it != nameIndex_.end()) {
+        spdlog::error("TopicRegistry::createTopicAt: name '{}' is held by live id={}, refused for id={}",
+                      spec.name, it->second, topicId);
+        return -1;
+    }
+
+    TopicEntry entry = buildEntry_(spec, topicId, CreateOrigin::Catalog);   // may throw: nothing changed yet
+    entry.lifecycle = Lifecycle::Serving;
+    // A gap below topicId: ids created AND dropped before this broker's
+    // checkpoint (it never saw their create) — Dropped tombstones.
+    while (topics_.size() < slot) {
+        TopicEntry gap;
+        gap.spec.topicId = static_cast<int32_t>(topics_.size());
+        gap.origin       = CreateOrigin::Catalog;
+        gap.lifecycle    = Lifecycle::Dropped;
+        topics_.push_back(std::move(gap));
+    }
+    nameIndex_.emplace(spec.name, topicId);
+    topics_.push_back(std::move(entry));
+    ++catalogGeneration_;
+    spdlog::info("TopicRegistry::createTopicAt: topic='{}' id={} partitions={} (catalog)",
+                 spec.name, topicId, spec.partitionCount);
+    return topicId;
+}
+
+bool
+TopicRegistry::dropTopic(int32_t topicId)
+{
+    if (topicId < 0 || static_cast<std::size_t>(topicId) >= topics_.size()) return false;
+    TopicEntry& e = topics_[static_cast<std::size_t>(topicId)];
+    if (e.lifecycle == Lifecycle::Dropped) return false;
+    e.lifecycle = Lifecycle::Dropped;
+    if (const auto it = nameIndex_.find(e.spec.name); it != nameIndex_.end() && it->second == topicId)
+        nameIndex_.erase(it);
+    ++catalogGeneration_;
+    spdlog::info("TopicRegistry::dropTopic: topic='{}' id={} dropped (serves nothing; logs held until released)",
+                 e.spec.name, topicId);
+    return true;
+}
+
+bool
+TopicRegistry::releaseDroppedLogs(int32_t topicId)
+{
+    if (topicId < 0 || static_cast<std::size_t>(topicId) >= topics_.size()) return false;
+    TopicEntry& e = topics_[static_cast<std::size_t>(topicId)];
+    if (e.lifecycle != Lifecycle::Dropped || e.partitions.empty()) return false;
+    e.partitions.clear();   // closes every Log (unmaps its segments)
+    e.partitions.shrink_to_fit();
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -255,8 +339,8 @@ TopicRegistry::commitTopic(int32_t topicId)
     // The marker rewrite is best-effort (logged on failure); servability never
     // waits on it — the record IS committed.
     (void)markTopicCommitted(topicId);
-    if (e.committed) return false;
-    e.committed = true;
+    if (e.lifecycle != Lifecycle::AwaitingCommit) return false;
+    e.lifecycle = Lifecycle::Serving;
     ++catalogGeneration_;
     return true;
 }
@@ -267,7 +351,7 @@ TopicRegistry::servableLog(int32_t topicId, int32_t partition) noexcept
     if (topicId < 0 || static_cast<std::size_t>(topicId) >= topics_.size())
         return nullptr;
     const auto& entry = topics_[static_cast<std::size_t>(topicId)];
-    if (!entry.committed) [[unlikely]] return nullptr;
+    if (entry.lifecycle != Lifecycle::Serving) [[unlikely]] return nullptr;   // C1 / dropped
     if (partition < 0 || static_cast<std::size_t>(partition) >= entry.partitions.size())
         return nullptr;
     return entry.partitions[static_cast<std::size_t>(partition)].log.get();
@@ -304,7 +388,9 @@ TopicRegistry::topic(int32_t topicId) const noexcept
 {
     if (topicId < 0 || static_cast<std::size_t>(topicId) >= topics_.size())
         return nullptr;
-    return &topics_[static_cast<std::size_t>(topicId)].spec;
+    const auto& entry = topics_[static_cast<std::size_t>(topicId)];
+    if (entry.lifecycle == Lifecycle::Dropped) return nullptr;   // Task 8: a dropped id is unknown
+    return &entry.spec;
 }
 
 // ---------------------------------------------------------------------------
@@ -316,6 +402,7 @@ TopicRegistry::log(int32_t topicId, int32_t partition) noexcept
     if (topicId < 0 || static_cast<std::size_t>(topicId) >= topics_.size())
         return nullptr;
     const auto& entry = topics_[static_cast<std::size_t>(topicId)];
+    if (entry.lifecycle == Lifecycle::Dropped) return nullptr;   // Task 8
     if (partition < 0 || static_cast<std::size_t>(partition) >= entry.partitions.size())
         return nullptr;
     return entry.partitions[static_cast<std::size_t>(partition)].log.get();
@@ -330,8 +417,9 @@ TopicRegistry::partitionForKey(int32_t topicId,
 {
     if (topicId < 0 || static_cast<std::size_t>(topicId) >= topics_.size())
         return -1;
-    const int32_t pc = topics_[static_cast<std::size_t>(topicId)].spec.partitionCount;
-    return rune::protocol::partitionForKey(key, pc);
+    const auto& entry = topics_[static_cast<std::size_t>(topicId)];
+    if (entry.lifecycle == Lifecycle::Dropped) return -1;   // Task 8: UnknownTopic
+    return rune::protocol::partitionForKey(key, entry.spec.partitionCount);
 }
 
 // ---------------------------------------------------------------------------

@@ -425,6 +425,13 @@ public:
     void applyDeleteForTest(int32_t topicId, int32_t partition) noexcept {
         applyDeleteForKey(rune::metadata::PartitionKey{topicId, partition}, prevMap_);
     }
+    /// Catalog history Task 8: the catalog DROPPED the topic — fence the replica
+    /// on its owner thread and retire it out of routing NOW (the same path a
+    /// committed placement delete takes; that later delete then finds nothing:
+    /// idempotent).  Control thread.
+    void removePartition(int32_t topicId, int32_t partition) noexcept {
+        applyDeleteForKey(rune::metadata::PartitionKey{topicId, partition}, prevMap_);
+    }
 
     /// M1: an invariant violation caught at the bridge boundary (once).
     /// NodeRuntimeAgent takes it after doWork and halts (exit 70).

@@ -142,11 +142,16 @@ private:
 
     // Pending records: encoded as a compact struct so we don't need to
     // re-decode on commit.
+    // Catalog history Task 8: a pending entry is an assignment to install OR a
+    // whole-topic placement removal (RemoveTopicPlacementRecord) — one kind
+    // field, applied in log-position order with the assignments.
+    enum class PendingKind : uint8_t { Assign, RemoveTopic };
     struct PendingEntry {
         int64_t          pos;
         int32_t          topicId;
         int32_t          partition;
         PartitionAssignment assignment;
+        PendingKind      kind = PendingKind::Assign;
     };
 
     std::vector<PendingEntry> pending_;
@@ -174,6 +179,8 @@ private:
 
     void flushPending(int64_t upToPos);
     void install_(int32_t topicId, int32_t partition, const PartitionAssignment& pa);
+    /// Task 8: erase every committed (topicId, *) assignment + lineage.
+    void removeTopic_(int32_t topicId);
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

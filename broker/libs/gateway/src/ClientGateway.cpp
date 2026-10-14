@@ -2979,6 +2979,12 @@ ClientGateway::ServedPartition ClientGateway::servedPartition_(int32_t topicId, 
     ServedPartition s;
     if (topicRegistry_ == nullptr) return s;
     if (rune::storage::Log* log = topicRegistry_->servableLog(topicId, partition)) [[likely]] {
+        // Task 8 (C1 generalized): a catalog-applied topic serves only once its
+        // placement is committed too.  One byte compare for every other topic.
+        if (topicRegistry_->placementGated(topicId) && !placementCommitted_(topicId, partition)) [[unlikely]] {
+            s.kind = Kind::NotPlaced;
+            return s;
+        }
         s.kind = Kind::Disk;
         s.log  = log;
         return s;
@@ -2987,9 +2993,61 @@ ClientGateway::ServedPartition ClientGateway::servedPartition_(int32_t topicId, 
     const rune::node::TopicSpec* spec = topicRegistry_->topic(topicId);
     if (spec == nullptr || spec->persistence != rune::node::PersistenceMode::Transient) return s;
     if (partition < 0 || partition >= spec->partitionCount) return s;
+    if (topicRegistry_->placementGated(topicId) && !placementCommitted_(topicId, partition)) {
+        s.kind = Kind::NotPlaced;   // Task 8 (C1 generalized), transient too
+        return s;
+    }
     if (replicaRegistry_ != nullptr && replicaRegistry_->lookup(topicId, partition) != nullptr)
         s.kind = Kind::Transient;
     return s;
+}
+
+bool ClientGateway::placementCommitted_(int32_t topicId, int32_t partition) const noexcept
+{
+    if (!committedMetadataReady_ || !routingImage_) return false;
+    return routingImage_->lookup(rune::metadata::gpidOf(topicId, partition)).leaderNodeId !=
+           rune::metadata::RoutingImage::NO_LEADER_NODE_ID;
+}
+
+pc::ErrorCode ClientGateway::unappliedTopicCode_(int32_t topicId, int32_t partition) const noexcept
+{
+    if (topicRegistry_ != nullptr &&
+        topicRegistry_->state(topicId) == rune::gateway::TopicRegistry::TopicState::Dropped)
+        return pc::ErrorCode::UnknownTopic;
+    return placementCommitted_(topicId, partition < 0 ? 0 : partition) ? pc::ErrorCode::NotLeader
+                                                                       : pc::ErrorCode::UnknownTopic;
+}
+
+std::size_t ClientGateway::endTopicSubscriptions(int32_t topicId)
+{
+    std::size_t ended = 0;
+    const bool workerSubs = perWorkerEgressActive_ && workerPool_;
+    for (auto it = subscriptions_.begin(); it != subscriptions_.end();) {
+        const int64_t subId = it->first;
+        Subscription& sub   = it->second;
+        if (sub.topicId != topicId) { ++it; continue; }
+        if (Session* session = sessions_.find(sub.sessionId)) {
+            pc::ErrorResponse err;
+            err.sessionId     = sub.sessionId;
+            err.correlationId = sub.subscribeCorrId;
+            err.code          = static_cast<int16_t>(pc::ErrorCode::UnknownTopic);
+            err.message       = "topic dropped";
+            const std::size_t encoded = err.encode(scratch_.data());
+            sendAnswer_(*session, scratch_.data(), encoded);   // queued + retried, never best-effort
+            if (const auto ix = session->subIdByKey.find(Session::SubKey{sub.subscribeCorrId, sub.topicId,
+                                                                         sub.partition});
+                ix != session->subIdByKey.end() && ix->second == subId)
+                session->subIdByKey.erase(ix);
+        }
+        if (workerSubs) forwardUnsubscribeToWorker_(subId, sub.topicId, sub.partition);
+        pendingWorkerReads_.erase(subId);
+        it = subscriptions_.erase(it);
+        ++ended;
+    }
+    if (ended > 0)
+        spdlog::info("ClientGateway: topic id={} dropped — {} subscription(s) ended with UnknownTopic",
+                     topicId, ended);
+    return ended;
 }
 
 bool ClientGateway::readCommittedServableHere_(int32_t topicId, int32_t partition) const noexcept
@@ -3242,7 +3300,7 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         partition = topicRegistry_->partitionForKey(msg.topicId, msg.key);
         if (partition < 0) {
             spdlog::debug("ClientGateway: Produce partitionForKey → unknown topicId={}", msg.topicId);
-            sendResp(pc::ErrorCode::UnknownTopic, 0, 0);
+            sendResp(unappliedTopicCode_(msg.topicId, 0), 0, 0);   // Task 8: C1 generalized
             return true;
         }
     }
@@ -3297,6 +3355,13 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
             }
             // leaderView_ says we ARE the leader (or is null) — serve locally (fall through).
         } else if (entry.leaderNodeId != thisNodeId_) {
+            // Catalog history Task 8: a topic this broker DROPPED is UnknownTopic at
+            // once — never a redirect on a placement whose removal has not committed.
+            if (topicRegistry_ != nullptr &&
+                topicRegistry_->state(msg.topicId) == TopicRegistry::TopicState::Dropped) [[unlikely]] {
+                sendResp(pc::ErrorCode::UnknownTopic, partition, 0);
+                return true;
+            }
             // This partition is led by a different node — REDIRECT.
             const std::string& redirectEndpoint = [&]() -> const std::string& {
                 auto it = nodeEndpointMap_.find(entry.leaderNodeId);
@@ -3324,8 +3389,12 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     // topic() returns nullptr for unknown topicId.
     const rune::node::TopicSpec* spec = topicRegistry_->topic(msg.topicId);
     if (!spec) {
-        spdlog::debug("ClientGateway: Produce unknown topicId={}", msg.topicId);
-        sendResp(pc::ErrorCode::UnknownTopic, partition, 0);
+        // Task 8 (C1 generalized): not applied HERE — NotLeader (retriable) when the
+        // MSM already holds its committed placement, UnknownTopic otherwise / dropped.
+        const pc::ErrorCode code = unappliedTopicCode_(msg.topicId, partition);
+        spdlog::debug("ClientGateway: Produce unknown topicId={} — {}", msg.topicId,
+                      code == pc::ErrorCode::NotLeader ? "placed, not applied here: NotLeader" : "UnknownTopic");
+        sendResp(code, partition, 0);
         return true;
     }
 
@@ -3337,9 +3406,10 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     // Phase 2b E2: a TRANSIENT partition has no disk Log — routed to its owning
     // worker below (op.logPtr = nullptr: the worker appends to the replica's ring).
     const ServedPartition served = servedPartition_(msg.topicId, partition);
-    if (served.kind == ServedPartition::Kind::AwaitingCommit) [[unlikely]] {
-        spdlog::debug("ClientGateway: Produce to topicId={} awaiting its DDL commit — NotLeader "
-                      "(retriable)", msg.topicId);
+    if (served.kind == ServedPartition::Kind::AwaitingCommit ||
+        served.kind == ServedPartition::Kind::NotPlaced) [[unlikely]] {
+        spdlog::debug("ClientGateway: Produce to topicId={} awaiting its DDL commit / committed placement — "
+                      "NotLeader (retriable)", msg.topicId);
         sendResp(pc::ErrorCode::NotLeader, partition, 0);
         return true;
     }
@@ -4302,6 +4372,10 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
         partition = topicRegistry_->partitionForKey(msg.topicId, msg.key);
         if (partition < 0) {
             spdlog::debug("ClientGateway: Subscribe partitionForKey → unknown topicId={}", msg.topicId);
+            if (unappliedTopicCode_(msg.topicId, 0) == pc::ErrorCode::NotLeader) {   // Task 8
+                sendSubRedirect(std::string{}, msg.correlationId);
+                return;
+            }
             sendResp(pc::ErrorCode::UnknownTopic, 0, 0);
             return;
         }
@@ -4332,6 +4406,12 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
             }
             // leaderView_ says we ARE the leader (or is null) — serve locally (fall through).
         } else if (entry.leaderNodeId != thisNodeId_) {
+            // Catalog history Task 8: a dropped topic is UnknownTopic at once (see produce).
+            if (topicRegistry_ != nullptr &&
+                topicRegistry_->state(msg.topicId) == TopicRegistry::TopicState::Dropped) [[unlikely]] {
+                sendResp(pc::ErrorCode::UnknownTopic, partition, 0);
+                return;
+            }
             const std::string& redirectEndpoint = [&]() -> const std::string& {
                 auto it = nodeEndpointMap_.find(entry.leaderNodeId);
                 if (it != nodeEndpointMap_.end()) return it->second;
@@ -4357,6 +4437,13 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
 
     const rune::node::TopicSpec* spec = topicRegistry_->topic(msg.topicId);
     if (!spec) {
+        // Task 8 (C1 generalized): placed but not applied here → the retriable NotLeader.
+        if (unappliedTopicCode_(msg.topicId, partition) == pc::ErrorCode::NotLeader) {
+            spdlog::debug("ClientGateway: Subscribe to topicId={} placed but not applied here — NotLeader",
+                          msg.topicId);
+            sendSubRedirect(std::string{}, msg.correlationId);
+            return;
+        }
         spdlog::debug("ClientGateway: Subscribe unknown topicId={}", msg.topicId);
         sendResp(pc::ErrorCode::UnknownTopic, partition, 0);
         return;
@@ -4366,9 +4453,10 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     // ErrorResponse{NotLeader} every unservable-here subscribe gets (retriable:
     // refresh metadata, retry); no subscription is registered.
     const ServedPartition served = servedPartition_(msg.topicId, partition);
-    if (served.kind == ServedPartition::Kind::AwaitingCommit) {
-        spdlog::debug("ClientGateway: Subscribe to topicId={} awaiting its DDL commit — NotLeader "
-                      "(retriable)", msg.topicId);
+    if (served.kind == ServedPartition::Kind::AwaitingCommit ||
+        served.kind == ServedPartition::Kind::NotPlaced) {
+        spdlog::debug("ClientGateway: Subscribe to topicId={} awaiting its DDL commit / committed placement — "
+                      "NotLeader (retriable)", msg.topicId);
         sendSubRedirect(std::string{}, msg.correlationId);
         return;
     }
@@ -6924,7 +7012,8 @@ int64_t ClientGateway::addGroupSubscription(int64_t memberSessionId,
     // C1 + E2: uncommitted / unknown → refused; a TRANSIENT partition (no disk
     // Log) is pushed by its owning worker only — refused without a worker pool.
     const ServedPartition served = servedPartition_(topicId, partition);
-    if (served.kind == ServedPartition::Kind::AwaitingCommit || served.kind == ServedPartition::Kind::Unknown ||
+    if (served.kind == ServedPartition::Kind::AwaitingCommit || served.kind == ServedPartition::Kind::NotPlaced ||
+        served.kind == ServedPartition::Kind::Unknown ||
         (served.kind == ServedPartition::Kind::Transient && !workerPool_)) {
         spdlog::warn("ClientGateway::addGroupSubscription: unknown (or uncommitted) topicId={} partition={}",
                      topicId, partition);
@@ -7472,6 +7561,9 @@ void ClientGateway::handleMetadata(const uint8_t* buf, std::size_t len)
                 const rune::node::TopicSpec* spec = topicRegistry_->topic(topicId);
                 if (spec == nullptr || partition >= spec->partitionCount) continue;
                 if (topicRegistry_->awaitingCommit(topicId)) continue;
+                // Task 8 (C1 generalized): a catalog topic is listed once its
+                // placement is committed (the bootstrap image is not committed).
+                if (topicRegistry_->placementGated(topicId) && !committedMetadataReady_) continue;
             }
 
             // Filter: requested topics only (when non-empty topic list in request).

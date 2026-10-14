@@ -217,6 +217,11 @@ if(BUILD_TESTING)
     target_link_libraries(rune_gateway_topic_servability_tests PRIVATE rune_gateway rune_node spdlog::spdlog GTest::gtest_main)
     gtest_discover_tests(rune_gateway_topic_servability_tests)
 
+    # Catalog history Task 8: C1 generalized (applied AND placed) + dropped topics — no Aeron.
+    add_executable(rune_gateway_catalog_tests tests/gateway/CatalogGatewayTest.cpp)
+    target_link_libraries(rune_gateway_catalog_tests PRIVATE rune_gateway rune_node spdlog::spdlog GTest::gtest_main)
+    gtest_discover_tests(rune_gateway_catalog_tests)
+
     # Phase 2b E2: TRANSIENT partitions served through their owning worker (C1-gated) — no Aeron.
     add_executable(rune_gateway_transient_tests tests/gateway/TransientGatewayTest.cpp)
     target_link_libraries(rune_gateway_transient_tests PRIVATE rune_gateway rune_node rune_replication rune_storage

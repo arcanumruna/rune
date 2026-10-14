@@ -164,6 +164,57 @@ public:
     int32_t createTopic(const rune::node::TopicSpec& spec);
 
     // -----------------------------------------------------------------------
+    // Catalog history Task 8: topics created and dropped BY THE CATALOG.
+    //
+    // createTopicAt — creates the entry at EXACTLY `topicId` (the catalog's id;
+    // spec.topicId is ignored).  A gap below it is filled with Dropped
+    // tombstones: an id whose create this broker never saw (it was created AND
+    // dropped before this broker's checkpoint) is a Dropped slot.  Creates
+    // dataDir/topics/<name>/<p>/ for a disk topic and opens + recovers each Log
+    // (an existing dir is recovered, never wiped: a restart re-runs the effect).
+    // No topic-id marker (the catalog is the record of truth).  The entry
+    // serves at once — C1 is structural: an entry exists only once applied —
+    // but is PLACEMENT-GATED (placementGated(): the gateway also requires its
+    // committed placement, spec §5.4).
+    // Idempotent for the same id + name (returns topicId, nothing rebuilt).
+    // Returns -1 (logged) when the id is a Dropped slot (catalog ids are never
+    // re-created), holds another name, or the name is held by another live id.
+    // Throws std::runtime_error if a directory cannot be created.
+    // SINGLE-WRITER: control thread only.
+    int32_t createTopicAt(int32_t topicId, const rune::node::TopicSpec& spec);
+
+    // dropTopic — the entry becomes Dropped: it serves nothing from now on
+    // (topic() / log() / servableLog() answer nullptr) and its name is freed
+    // from the name index.  The Logs stay owned until releaseDroppedLogs(): a
+    // retired replica may still reference them until every holder acked.
+    // Returns true iff the entry moved to Dropped (idempotent: false again).
+    bool dropTopic(int32_t topicId);
+
+    // releaseDroppedLogs — closes (destroys) a Dropped entry's Logs.  The
+    // caller guarantees nothing references them any more.  Returns true iff
+    // any Log was released (idempotent).
+    bool releaseDroppedLogs(int32_t topicId);
+
+    // The catalog view of an id.  Serving = registered and not dropped (the old
+    // runtime path's uncommitted entries are told apart by awaitingCommit()
+    // until Task 9 removes that path); Dropped = a dropped (or never-seen gap)
+    // catalog id; Unknown = never registered here.
+    enum class TopicState : uint8_t { Unknown, Serving, Dropped };
+    [[nodiscard]] TopicState state(int32_t topicId) const noexcept {
+        if (topicId < 0 || static_cast<std::size_t>(topicId) >= topics_.size()) return TopicState::Unknown;
+        return topics_[static_cast<std::size_t>(topicId)].lifecycle == Lifecycle::Dropped ? TopicState::Dropped
+                                                                                          : TopicState::Serving;
+    }
+
+    /// A catalog-applied topic (createTopicAt) that serves only once its
+    /// placement is committed too (C1 generalized, spec §5.4).  Cold probe.
+    [[nodiscard]] bool placementGated(int32_t topicId) const noexcept {
+        return topicId >= 0 && static_cast<std::size_t>(topicId) < topics_.size() &&
+               topics_[static_cast<std::size_t>(topicId)].origin == CreateOrigin::Catalog &&
+               topics_[static_cast<std::size_t>(topicId)].lifecycle == Lifecycle::Serving;
+    }
+
+    // -----------------------------------------------------------------------
     // markTopicCommitted — B10 / D4 fix round 1: the topic's catalog record
     // (DefineTopic schema / CreateView record) has committed.  Rewrites a
     // "pending <id>" marker as "committed <id>" (atomic temp + rename).  A topic
@@ -197,12 +248,12 @@ public:
     /// The topic exists and is still awaiting its commit (not servable).
     [[nodiscard]] bool awaitingCommit(int32_t topicId) const noexcept {
         return topicId >= 0 && static_cast<std::size_t>(topicId) < topics_.size() &&
-               !topics_[static_cast<std::size_t>(topicId)].committed;
+               topics_[static_cast<std::size_t>(topicId)].lifecycle == Lifecycle::AwaitingCommit;
     }
 
     /// The data-plane accessor: log() for a SERVABLE topic, nullptr while the topic
-    /// is awaiting commit (callers tell the two apart with awaitingCommit(), off the
-    /// hot path).  One extra byte compare on the entry log() already reads.
+    /// is awaiting commit or Dropped (callers tell them apart with awaitingCommit() /
+    /// state(), off the hot path).  One extra byte compare on the entry log() reads.
     /// SINGLE-WRITER: gateway duty-cycle (control) thread only.
     [[nodiscard]] rune::storage::Log*
     servableLog(int32_t topicId, int32_t partition) noexcept;
@@ -229,10 +280,18 @@ public:
 
 private:
     uint64_t catalogGeneration_ = 0;   ///< M6: see catalogGeneration()
-    // Which caller built the topic: the constructor (static + recovered topics) or
-    // a runtime DDL create.  Only a runtime create writes the topic-id marker.
-    enum class CreateOrigin : uint8_t { Boot, Runtime };
+    // Which caller built the topic: the constructor (static + recovered topics), a
+    // runtime DDL create (only it writes the topic-id marker), or the catalog
+    // (createTopicAt: placement-gated, no marker).
+    enum class CreateOrigin : uint8_t { Boot, Runtime, Catalog };
+    // One state per entry (rule 3): AwaitingCommit = the old runtime path's create
+    // before its record committed (C1); Serving; Dropped = a dropped catalog id
+    // (or a gap slot) — its Logs held until releaseDroppedLogs.
+    enum class Lifecycle : uint8_t { AwaitingCommit, Serving, Dropped };
     int32_t createTopicImpl(const rune::node::TopicSpec& spec, CreateOrigin origin);
+    // Builds dirs + Logs for `spec` at `id` (shared by createTopicImpl / createTopicAt).
+    struct TopicEntry;
+    TopicEntry buildEntry_(const rune::node::TopicSpec& spec, int32_t id, CreateOrigin origin);
 
     // Per-partition entry: the Log and its directory path.
     struct PartitionEntry {
@@ -248,7 +307,8 @@ private:
         rune::node::TopicSpec             spec;
         std::vector<PartitionEntry>       partitions; // size == spec.partitionCount
         MarkerState                       marker = MarkerState::None;
-        bool                              committed = true;   // false: runtime create awaiting its record (C1)
+        CreateOrigin                      origin    = CreateOrigin::Boot;
+        Lifecycle                         lifecycle = Lifecycle::Serving;
     };
 
     std::string                            dataDir_;       // root data directory (for createTopic)

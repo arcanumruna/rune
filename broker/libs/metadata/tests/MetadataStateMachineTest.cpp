@@ -1346,3 +1346,91 @@ TEST(MetadataStateMachineRegression, SnapshotRestoreCarriesLineagesAndOldImagesS
     EXPECT_EQ(old.lineage(1, 0), nullptr);
     EXPECT_EQ(old.featureLevel(), 0);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Catalog history Task 8: RemoveTopicPlacementRecord (0x8003) — a topic the
+// catalog dropped loses EVERY partition's committed assignment at COMMIT (never
+// before), so each replica of it sees a delete in its LocalRoleDelta; an unknown
+// topic id is a no-op; an older MSM skips the type; it applies in log order.
+// RED: the record ignored (assignments survive the drop: the partitions keep a
+// placement forever), or applied before its commit.
+// ─────────────────────────────────────────────────────────────────────────────
+TEST(MetadataStateMachineRegression, RemoveTopicPlacementRecordErasesEveryPartitionAtCommit) {
+    MetadataStateMachine msm;
+    int64_t pos = 0;
+    for (int32_t p = 0; p < 3; ++p) {
+        auto [b, n] = encodeUpdate({7, p, /*leader=*/1, {1, 2}, {1, 2}, 1, 1});
+        msm.apply(b.data(), n, pos++);
+    }
+    {
+        auto [b, n] = encodeUpdate({8, 0, 2, {1, 2}, {1, 2}, 1, 1});   // another topic: untouched
+        msm.apply(b.data(), n, pos++);
+    }
+    msm.commit(pos - 1);
+    const AssignmentMap before = msm.committedMap();
+    ASSERT_NE(msm.assignment(7, 2), nullptr);
+
+    uint8_t rb[16];
+    RemoveTopicPlacementRecord rec;
+    rec.topicId = 7;
+    const std::size_t rn = rec.encode(rb, sizeof rb);
+    ASSERT_EQ(rn, RemoveTopicPlacementRecord::ENCODED_SIZE);
+    const auto t = peekRecordType(rb, rn);
+    ASSERT_TRUE(t.has_value());
+    EXPECT_NE(*t, MetadataRecordType::UpdatePartitionAssignment) << "an older MSM must skip it";
+
+    const uint64_t v0 = msm.committedVersion();
+    const int64_t removePos = pos++;
+    msm.apply(rb, rn, removePos);
+    EXPECT_NE(msm.assignment(7, 0), nullptr) << "a removal must not apply before its commit";
+    msm.revert(removePos - 1);
+    msm.commit(removePos);
+    EXPECT_NE(msm.assignment(7, 0), nullptr) << "a reverted removal took effect";
+
+    msm.apply(rb, rn, pos);
+    msm.commit(pos);
+    for (int32_t p = 0; p < 3; ++p) EXPECT_EQ(msm.assignment(7, p), nullptr) << "partition " << p;
+    EXPECT_NE(msm.assignment(8, 0), nullptr) << "another topic's placement is untouched";
+    EXPECT_GT(msm.committedVersion(), v0) << "the routing image must rebuild";
+
+    // Every self replica sees the delete (node 1 and node 2 are both replicas).
+    for (int32_t self : {1, 2}) {
+        const LocalRoleDelta d = msm.deriveLocalDelta(self, before);
+        int deletes = 0;
+        for (const auto& k : d.deletes) deletes += k.topicId == 7 ? 1 : 0;
+        EXPECT_EQ(deletes, 3) << "node " << self;
+    }
+    // A node that was not a replica sees none.
+    EXPECT_TRUE(msm.deriveLocalDelta(3, before).deletes.empty());
+
+    // An unknown topic id (and the same removal again) is a no-op.
+    const uint64_t v1 = msm.committedVersion();
+    rec.topicId = 99;
+    const std::size_t un = rec.encode(rb, sizeof rb);
+    msm.apply(rb, un, ++pos);
+    rec.topicId = 7;
+    (void)rec.encode(rb, sizeof rb);
+    msm.apply(rb, rn, ++pos);
+    msm.commit(pos);
+    EXPECT_EQ(msm.committedVersion(), v1);
+    EXPECT_NE(msm.assignment(8, 0), nullptr);
+}
+
+TEST(MetadataStateMachineRegression, RemoveTopicPlacementAppliesInLogOrderWithAssignments) {
+    // An assignment appended BEFORE the removal is erased by it; one decoded in
+    // the same commit window keeps log order (pending entries sort by position).
+    MetadataStateMachine msm;
+    auto [b0, n0] = encodeUpdate({5, 0, 1, {1}, {1}, 1, 1});
+    uint8_t rb[16];
+    RemoveTopicPlacementRecord rec;
+    rec.topicId = 5;
+    const std::size_t rn = rec.encode(rb, sizeof rb);
+    msm.apply(rb, rn, 1);              // decoded first, positioned AFTER the assignment
+    msm.apply(b0.data(), n0, 0);
+    msm.commit(1);
+    EXPECT_EQ(msm.assignment(5, 0), nullptr) << "the removal at pos 1 must erase the assignment at pos 0";
+    EXPECT_FALSE(RemoveTopicPlacementRecord::decode(rb, rn - 1).has_value()) << "short frame";
+    rec.topicId = -6;
+    (void)rec.encode(rb, sizeof rb);
+    EXPECT_FALSE(RemoveTopicPlacementRecord::decode(rb, rn).has_value()) << "internal ids are never removed";
+}

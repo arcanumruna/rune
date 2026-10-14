@@ -2797,3 +2797,76 @@ TEST(TransientLineageControllerRegression, DeathDetectionClearsTheRememberedLead
     (void)answer(*c.svc, rep);
     EXPECT_EQ(c.svc->trustedTransientLineage(0, 0), token) << "the live process's own report did not restore trust";
 }
+
+// ---------------------------------------------------------------------------
+// Catalog history Task 8: placement removal of a DROPPED topic is never
+// stranded.  The controller drops a topic whose static assignment is appended
+// but NOT committed yet (no follower fetched): there is nothing committed to
+// remove at the drop — yet once the assignment commits, the controller still
+// removes it (RemoveTopicPlacementRecord), and every broker forgets nothing it
+// may still need.  A follower appends nothing.  A second removal is a no-op.
+// RED: the dropped topic forgotten at the drop (nothing committed then) — its
+// assignment commits afterwards and stays placed forever.
+// ---------------------------------------------------------------------------
+TEST(MetadataRemoveTopicRegression, DroppedTopicWhoseAssignmentCommitsLaterIsStillRemovedRegression) {
+    SaeTempDir dir1("rm1"), dir2("rm2"), dir3("rm3");
+    rune::storage::Log log1(dir1.path), log2(dir2.path), log3(dir3.path);
+    log1.recover(); log2.recover(); log3.recover();
+    constexpr NodeId kNode1 = 1, kNode2 = 2, kNode3 = 3;
+    const std::vector<NodeId> allNodes = {kNode1, kNode2, kNode3};
+    InMemoryTransport transport;
+    auto r1 = std::make_unique<PartitionReplica>(makeMetaCfg(kNode1), Role::Follower, 0, allNodes, allNodes, &log1, &transport);
+    auto r2 = std::make_unique<PartitionReplica>(makeMetaCfg(kNode2), Role::Follower, 0, allNodes, allNodes, &log2, &transport);
+    auto r3 = std::make_unique<PartitionReplica>(makeMetaCfg(kNode3), Role::Follower, 0, allNodes, allNodes, &log3, &transport);
+    transport.setLeader(r1.get());
+    transport.addFollower(kNode2, r2.get());
+    transport.addFollower(kNode3, r3.get());
+    r1->becomeLeader(1, allNodes);
+
+    std::vector<TopicSpec> topics = {TopicSpec{0, 2, 3, "", "t"}};
+    MetadataService svc1(r1.get(), kNode1);
+    svc1.configure(topics, allNodes);
+    MetadataService svc2(r2.get(), kNode2);   // a follower broker's service
+    svc2.configure(topics, allNodes);
+    int64_t clock = 1'000'000LL;
+    for (int i = 0; i < 5; ++i) { clock += 1'000'000LL; (void)svc1.doWork(clock); }
+    const auto leoAppended = r1->logEndOffset();
+    ASSERT_GT(leoAppended, 0) << "the static assignment is appended";
+    ASSERT_EQ(svc1.assignment(0, 0), nullptr) << "non-vacuous: not committed yet (no follower fetched)";
+
+    // The catalog drops topic 0 on every broker.
+    svc1.removeRuntimeTopic(0);
+    svc2.removeRuntimeTopic(0);
+    EXPECT_EQ(r1->logEndOffset(), leoAppended) << "nothing committed to remove yet";
+    EXPECT_EQ(r2->logEndOffset(), 0) << "a follower never appends";
+
+    // The followers fetch: the assignment commits, then the controller removes it.
+    r2->becomeFollower(1, kNode1);
+    r3->becomeFollower(1, kNode1);
+    bool placed = false, removed = false;
+    for (int i = 0; i < kDriveCap && !removed; ++i) {
+        clock += 1'000'000LL;
+        r1->doWork(clock); r2->doWork(clock); r3->doWork(clock);
+        transport.pump(clock);
+        (void)svc1.doWork(clock);
+        (void)svc2.doWork(clock);
+        placed  = placed || svc1.assignment(0, 0) != nullptr;
+        removed = r1->logEndOffset() > leoAppended && svc1.assignment(0, 0) == nullptr &&
+                  svc1.assignment(0, 1) == nullptr && svc2.assignment(0, 0) == nullptr &&
+                  svc2.assignment(0, 1) == nullptr && svc1.removalsInFlightForTest() == 0;
+    }
+    ASSERT_TRUE(removed) << "stranded: placed=" << placed << " leo=" << r1->logEndOffset()
+                         << " hw=" << r1->highWatermark();
+
+    // Idempotent: the same drop again appends nothing more.
+    const auto leoAfter = r1->logEndOffset();
+    svc1.removeRuntimeTopic(0);
+    for (int i = 0; i < 20; ++i) {
+        clock += 1'000'000LL;
+        r1->doWork(clock); r2->doWork(clock); r3->doWork(clock);
+        transport.pump(clock);
+        (void)svc1.doWork(clock);
+    }
+    EXPECT_EQ(r1->logEndOffset(), leoAfter) << "a second removal appended a record";
+    EXPECT_EQ(svc1.assignment(0, 0), nullptr);
+}
