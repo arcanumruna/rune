@@ -85,6 +85,7 @@ namespace rune::node { class WorkerPool; struct WorkerReturn; }
 // G0.1: ErrorCode enum for sendRespReliable() signature.
 #include <rune/protocol/client/Protocol.h>
 #include <rune/protocol/client/MessageHeader.h>
+#include <rune/protocol/client/SchemaMessages.h>   // DdlExtension (catalog history Task 9)
 
 #include <algorithm>
 #include <array>
@@ -956,6 +957,14 @@ public:
         sessions_.add(sid, /*egress=*/nullptr, nowNs, {}, 0, clientVersion);
         return sid;
     }
+    /// Catalog history Task 9: a test session whose egress CHANNEL is known (the
+    /// DDL principal's source address is the session's egress channel).
+    int64_t injectTestSessionOnChannel(std::string egressChannel, int64_t nowNs = 0) {
+        const int64_t sid = sessions_.nextSessionId();
+        sessions_.add(sid, /*egress=*/nullptr, nowNs, std::move(egressChannel), 0,
+                      rune::protocol::client::kClientVersion);
+        return sid;
+    }
 
     // -----------------------------------------------------------------------
     // sessionCount — number of active sessions.
@@ -1102,6 +1111,22 @@ public:
     // Task 19: CreateView (70) test seam — mirrors applyDefineTopicForTest.
     void applyCreateViewForTest(const uint8_t* buf, std::size_t len) {
         handleCreateView(buf, len);
+    }
+    // Catalog history Task 9: any DDL frame through the real dispatch path.
+    void applyDdlFrameForTest(const uint8_t* buf, std::size_t len) {
+        const auto h = rune::protocol::client::MessageHeader::decode(buf, len);
+        if (!h) return;
+        namespace pc = rune::protocol::client;
+        switch (static_cast<pc::TemplateId>(h->templateId)) {
+        case pc::TemplateId::DefineTopic:      handleDefineTopic(buf, len); break;
+        case pc::TemplateId::AlterTopic:       handleAlterTopic(buf, len); break;
+        case pc::TemplateId::CreateView:       handleCreateView(buf, len); break;
+        case pc::TemplateId::DropTopic:        handleDropTopic(buf, len); break;
+        case pc::TemplateId::AlterTopicConfig: handleAlterTopicConfig(buf, len); break;
+        case pc::TemplateId::DropView:         handleDropView(buf, len); break;
+        case pc::TemplateId::AlterView:        handleAlterView(buf, len); break;
+        default: break;
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1503,6 +1528,17 @@ private:
     // on the session egress via the admin→control egress ring (respondAlter).
     void handleAlterTopic   (const uint8_t* buf, std::size_t len);
     void handleCreateView   (const uint8_t* buf, std::size_t len);
+    // Catalog history Task 9: the catalog DDL ops (74–77) and their shared parts.
+    void handleDropTopic       (const uint8_t* buf, std::size_t len);
+    void handleAlterTopicConfig(const uint8_t* buf, std::size_t len);
+    void handleDropView        (const uint8_t* buf, std::size_t len);
+    void handleAlterView       (const uint8_t* buf, std::size_t len);
+    template <class Msg, class Submit>
+    void handleCatalogDdl_(const uint8_t* buf, std::size_t len, const char* what, Submit&& submit);
+    [[nodiscard]] static rune::gateway::DdlMetaView
+        ddlMetaOf_(const rune::protocol::client::DdlExtension* ext, int64_t sessionId, const Session& session) noexcept;
+    void answerAdminSubmit_(const uint8_t* buf, std::size_t len, rune::gateway::AdminSubmit r,
+                            const char* ringFull, const char* tooLarge);
     // Task 20: GetViewRow (72) — build a GetViewRow WorkerOp routed to the
     // owning worker (same op/return plumbing as PushRead); the worker's
     // ViewRowResult is encoded as a ViewRowResponse (73) in drainWorkerReturns_.
@@ -2129,8 +2165,8 @@ private:
 
     // Phase 2b E2: what this gateway can serve for (topic, partition) — ONE
     // explicit kind each (CLAUDE.md rule 3), C1 first:
-    //   AwaitingCommit — a runtime topic whose catalog record has not committed
-    //                    (TopicRegistry::awaitingCommit): retriable NotLeader.
+    //   NotPlaced      — a catalog-applied topic whose placement is not committed
+    //                    yet: retriable NotLeader, hidden from metadata.
     //   Disk           — its servable disk Log (`log`).
     //   Transient      — committed, persistence=transient, in range, replica
     //                    registered: NO disk Log; its InMemoryLog is owned by the
@@ -2138,10 +2174,9 @@ private:
     //                    published HW is the subscribe clamp).
     //   Unknown        — nothing servable here.
     struct ServedPartition {
-        // Catalog history Task 8 (C1 generalized, spec §5.4): NotPlaced = a
-        // catalog-applied topic whose placement is not committed yet — answered
-        // like AwaitingCommit (retriable NotLeader, hidden from metadata).
-        enum class Kind : uint8_t { Unknown, AwaitingCommit, NotPlaced, Disk, Transient };
+        // Catalog history Task 8 (C1 generalized, spec §5.4); Task 9 removed the
+        // old runtime path's AwaitingCommit (an entry exists only once applied).
+        enum class Kind : uint8_t { Unknown, NotPlaced, Disk, Transient };
         Kind                kind = Kind::Unknown;
         rune::storage::Log* log  = nullptr;   ///< Kind::Disk only
     };

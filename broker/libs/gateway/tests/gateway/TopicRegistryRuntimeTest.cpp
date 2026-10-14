@@ -22,12 +22,18 @@ static fs::path makeTempDir(const char* stem)
     static std::atomic<uint64_t> g_seq{0};
     auto id = std::to_string(::getpid()) + "_" +
               std::to_string(g_seq.fetch_add(1, std::memory_order_relaxed));
-    return fs::temp_directory_path() /
-           (std::string("rune_tr_rt_") + stem + "_" + id);
+    // A reused pid could meet a previous run's dir (these tests never remove
+    // theirs): start from an empty one, so a recovery assertion never reads stale data.
+    auto p = fs::temp_directory_path() / (std::string("rune_tr_rt_") + stem + "_" + id);
+    std::error_code ec;
+    fs::remove_all(p, ec);
+    return p;
 }
 
 // ---------------------------------------------------------------------------
-// TopicRegistryRuntime — createTopic tests
+// TopicRegistryRuntime — topics created after boot.  Catalog history Task 9:
+// the runtime createTopic (sequential ids) is gone; every post-boot topic is
+// built at its CATALOG id (createTopicAt).  Same scenarios, catalog ids.
 // ---------------------------------------------------------------------------
 
 // Task 5: runtime topic creation creates partition dirs and a recoverable log.
@@ -43,8 +49,8 @@ TEST(TopicRegistryRuntime, CreateTopicMakesProducibleTopic) {
     spec.topicId        = 0x40000000;  // caller hint; registry assigns sequentially
     spec.partitionCount = 2;
 
-    const int32_t id = reg.createTopic(spec);
-    // The registry assigns the next sequential id (0 — first topic in empty registry).
+    const int32_t id = reg.createTopicAt(0, spec);
+    // The topic lives at exactly its catalog id (spec.topicId is ignored).
     EXPECT_EQ(id, 0);
 
     // Partition log directories now exist under dataDir/topics/<name>/<partition>/
@@ -59,11 +65,11 @@ TEST(TopicRegistryRuntime, CreateTopicMakesProducibleTopic) {
     EXPECT_EQ(reg.topicCount(), 1);
 
     // Idempotent: creating again returns the same id, no throw, no double-create.
-    EXPECT_EQ(reg.createTopic(spec), 0);
+    EXPECT_EQ(reg.createTopicAt(0, spec), 0);
     EXPECT_EQ(reg.topicCount(), 1);
 }
 
-// Task 5: createTopic after boot-time topics assigns the next sequential id.
+// Task 5: a catalog topic after the boot-time (static) topics, at its catalog id.
 TEST(TopicRegistryRuntime, CreateTopicAfterBootTopicsAssignsSequentialId) {
     fs::path dir = makeTempDir("seq");
     fs::create_directories(dir);
@@ -81,7 +87,8 @@ TEST(TopicRegistryRuntime, CreateTopicAfterBootTopicsAssignsSequentialId) {
     runtime.partitionCount = 2;
     runtime.topicId        = 0x40000000;  // hint ignored by registry
 
-    const int32_t id = reg.createTopic(runtime);
+    EXPECT_EQ(reg.createTopicAt(0, runtime), -1) << "a static topic's id is never a catalog topic's";
+    const int32_t id = reg.createTopicAt(1, runtime);
     EXPECT_EQ(id, 1);  // second topic → id 1
     EXPECT_EQ(reg.topicCount(), 2);
 
@@ -96,7 +103,8 @@ TEST(TopicRegistryRuntime, CreateTopicAfterBootTopicsAssignsSequentialId) {
     EXPECT_TRUE(fs::exists(dir / "topics" / "characters" / "1"));
 }
 
-// Task 5: createTopic is idempotent by name — repeated calls return the same id.
+// Task 5: createTopicAt is idempotent for the same id + name; the name at another
+// live id is refused.
 TEST(TopicRegistryRuntime, CreateTopicIdempotentByName) {
     fs::path dir = makeTempDir("idem");
     fs::create_directories(dir);
@@ -107,17 +115,18 @@ TEST(TopicRegistryRuntime, CreateTopicIdempotentByName) {
     spec.name           = "orders";
     spec.partitionCount = 1;
 
-    const int32_t first  = reg.createTopic(spec);
-    const int32_t second = reg.createTopic(spec);
-    const int32_t third  = reg.createTopic(spec);
+    const int32_t first  = reg.createTopicAt(0, spec);
+    const int32_t second = reg.createTopicAt(0, spec);
+    const int32_t third  = reg.createTopicAt(1, spec);
 
     EXPECT_EQ(first, 0);
     EXPECT_EQ(second, 0);
-    EXPECT_EQ(third, 0);
+    EXPECT_EQ(third, -1) << "the name is held by live id 0";
     EXPECT_EQ(reg.topicCount(), 1);
 }
 
-// Task 5: multiple distinct runtime topics each get unique sequential ids.
+// Task 5: multiple distinct catalog topics, each at its own id (a gap below an id
+// is a Gap slot: unknown here, fillable).
 TEST(TopicRegistryRuntime, CreateMultipleTopicsUniqueIds) {
     fs::path dir = makeTempDir("multi");
     fs::create_directories(dir);
@@ -131,12 +140,13 @@ TEST(TopicRegistryRuntime, CreateMultipleTopicsUniqueIds) {
         return ts;
     };
 
-    const int32_t id0 = reg.createTopic(makeSpec("inventory", 8));
-    const int32_t id1 = reg.createTopic(makeSpec("chat",      1));
-    const int32_t id2 = reg.createTopic(makeSpec("entities",  4));
+    const int32_t id0 = reg.createTopicAt(0, makeSpec("inventory", 8));
+    const int32_t id2 = reg.createTopicAt(2, makeSpec("entities",  4));
+    EXPECT_EQ(reg.state(1), TopicRegistry::TopicState::Unknown) << "a Gap: never seen here";
+    const int32_t id1 = reg.createTopicAt(1, makeSpec("chat",      1));
 
     EXPECT_EQ(id0, 0);
-    EXPECT_EQ(id1, 1);
+    EXPECT_EQ(id1, 1) << "a Gap is fillable";
     EXPECT_EQ(id2, 2);
     EXPECT_EQ(reg.topicCount(), 3);
 
@@ -180,7 +190,7 @@ TEST(TopicRegistryRuntimeRegression, CreateTopicLogRecoverAcrossRebuild) {
     int64_t leoAfterAppend = 0;
     {
         TopicRegistry reg({}, dir.string());
-        const int32_t id = reg.createTopic(ts);
+        const int32_t id = reg.createTopicAt(0, ts);
         ASSERT_EQ(id, 0);
 
         Log* l = reg.log(0, 0);
@@ -194,15 +204,69 @@ TEST(TopicRegistryRuntimeRegression, CreateTopicLogRecoverAcrossRebuild) {
         EXPECT_GT(leoAfterAppend, 0);
     }
 
-    // Rebuild on the same dir — createTopic must recover the existing log.
+    // Rebuild on the same dir — createTopicAt must recover the existing log
+    // (a restart re-runs the effect: an existing dir is recovered, never wiped).
     {
         TopicRegistry reg({}, dir.string());
-        const int32_t id = reg.createTopic(ts);
+        const int32_t id = reg.createTopicAt(0, ts);
         ASSERT_EQ(id, 0);
 
         Log* l = reg.log(0, 0);
         ASSERT_NE(l, nullptr);
         EXPECT_EQ(l->logEndOffset(), leoAfterAppend)
-            << "logEndOffset not recovered across createTopic rebuild";
+            << "logEndOffset not recovered across a createTopicAt rebuild";
     }
+}
+
+// ---------------------------------------------------------------------------
+// Catalog history Task 9 (fix-on-sight, Task 8 N1, hard rule 3): a slot is ONE
+// state holding exactly its variables — Static / Serving {spec, partitions},
+// Pending {name}, Gap {}, Dropped {spec, held logs} — never a tag over one struct.
+// Each state answers its own way; a transition rebuilds the slot.
+// ---------------------------------------------------------------------------
+TEST(TopicRegistrySlotRegression, EverySlotStateAnswersExactlyItsOwnWayRegression) {
+    fs::path dir = makeTempDir("slots");
+    fs::create_directories(dir);
+    TopicSpec boot;
+    boot.name = "static"; boot.partitionCount = 1;
+    TopicRegistry reg({boot}, dir.string());
+    using St = TopicRegistry::TopicState;
+
+    // Static: serves, not placement-gated.
+    EXPECT_EQ(reg.state(0), St::Serving);
+    EXPECT_FALSE(reg.placementGated(0));
+    EXPECT_NE(reg.log(0, 0), nullptr);
+
+    // Pending {name}: no spec, no logs, not served — and only its own name fills it.
+    ASSERT_TRUE(reg.reserveTopicAt(2, "waiting"));
+    EXPECT_EQ(reg.state(2), St::Pending);
+    EXPECT_EQ(reg.topic(2), nullptr);
+    EXPECT_EQ(reg.log(2, 0), nullptr);
+    EXPECT_EQ(reg.state(1), St::Unknown) << "the id below is a Gap";
+    TopicSpec other; other.name = "other"; other.partitionCount = 1;
+    EXPECT_EQ(reg.createTopicAt(2, other), -1) << "reserved for 'waiting'";
+    TopicSpec waiting; waiting.name = "waiting"; waiting.partitionCount = 2;
+    waiting.cleanupPolicy = rune::node::TopicSpec::CleanupPolicy::Compact;
+    ASSERT_EQ(reg.createTopicAt(2, waiting), 2);
+    EXPECT_EQ(reg.state(2), St::Serving);
+    EXPECT_TRUE(reg.placementGated(2)) << "a catalog topic serves once placed";
+    EXPECT_EQ(reg.heldLogCountForTest(2), 2u);
+
+    // Dropped {spec, logs}: serves nothing, its config still answers, never refilled.
+    ASSERT_TRUE(reg.dropTopic(2));
+    EXPECT_EQ(reg.state(2), St::Dropped);
+    EXPECT_EQ(reg.topic(2), nullptr);
+    EXPECT_EQ(reg.log(2, 0), nullptr);
+    EXPECT_FALSE(reg.topicIdForName("waiting").has_value()) << "the name is free again";
+    EXPECT_EQ(reg.cleanupPolicyOf(2), rune::node::TopicSpec::CleanupPolicy::Compact);
+    EXPECT_EQ(reg.heldLogCountForTest(2), 2u) << "logs held until released";
+    EXPECT_TRUE(reg.releaseDroppedLogs(2));
+    EXPECT_EQ(reg.heldLogCountForTest(2), 0u);
+    EXPECT_EQ(reg.createTopicAt(2, waiting), -1) << "a dropped catalog id is never re-created";
+
+    // A static topic's id is never taken by a catalog create, even of its own name.
+    EXPECT_EQ(reg.createTopicAt(0, boot), -1);
+    // The Gap at 1 is fillable; a dropped Gap / Pending becomes Dropped.
+    ASSERT_TRUE(reg.dropTopic(1));
+    EXPECT_EQ(reg.state(1), St::Dropped);
 }

@@ -304,7 +304,11 @@ TEST(TransientTopicDataPathRegression, RestartKeepsTheTopicAndEmptiesItRegressio
 TEST(TransientTopicDataPathRegression, LegacyRuntimeTransientDefineThenProduceAndSubscribeRegression) {
     TmpDir dir{"rt_legacy"}, cdir{"rt_legacy_c"};
     const auto ports = Ports::discover(1);
-    BrokerNode node{makeConfig(0, dir.path, ports, 1, /*shard=*/false)};
+    // Catalog history Task 9: a DDL topic never shares a broker with static
+    // RUNE_TOPICS topics (their ids would collide with the catalog's).
+    NodeConfig cfg = makeConfig(0, dir.path, ports, 1, /*shard=*/false);
+    cfg.topics.clear();
+    BrokerNode node{cfg};
     node.start();
     ASSERT_TRUE(node.awaitLeader(10'000ms));
     {
@@ -380,7 +384,10 @@ TEST_P(TransientSliceRegression, ProduceAndSubscribeCells) {
     const mx::Entity e{mx::Persist::Transient, mode, mx::Role::Leader, commit};
     TmpDir dir{"slice"}, c1{"slice_c1"}, c2{"slice_c2"};
     const auto ports = Ports::discover(1);
-    const NodeConfig cfg = makeConfig(0, dir.path, ports, 1, shard, /*ringBytes=*/evict ? 16 * 1024 : 0);
+    NodeConfig cfg = makeConfig(0, dir.path, ports, 1, shard, /*ringBytes=*/evict ? 16 * 1024 : 0);
+    // Catalog history Task 9: a DDL topic never shares a broker with static
+    // RUNE_TOPICS topics (their ids would collide with the catalog's).
+    if (commit == mx::Commit::Uncommitted) cfg.topics.clear();
     auto node = std::make_unique<BrokerNode>(cfg);
     node->start();
     ASSERT_TRUE(node->awaitLeader(10'000ms));

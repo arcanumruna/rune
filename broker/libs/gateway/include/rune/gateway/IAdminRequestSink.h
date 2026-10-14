@@ -1,83 +1,104 @@
 #pragma once
-// IAdminRequestSink.h — Task 8a: abstract sink for schema DDL requests, owned by
+// IAdminRequestSink.h — the gateway's abstract sink for DDL requests, owned by
 // the gateway lib so ClientGateway depends only on this interface rather than on
 // rune_node symbols (mirrors ITxnRequestHandler / IGroupRequestHandler).
 //
-// The AdminWorkerAgent (in rune_node) provides an adapter that implements this
-// interface by ENCODING the request onto the gateway→admin SPSC ring.  The
-// gateway holds an IAdminRequestSink* (set via setAdminSink) and, on DefineTopic
-// (64) / GetTopicSchema (66), copies the decoded fields into the sink and RETURNS
-// IMMEDIATELY — no registry access, no blocking on the gateway hot path.  DDL
-// therefore never delays produce routing (SchemaGatewayRegression).
+// The AdminWorkerAgent (in rune_node) implements it by ENCODING the request onto
+// the gateway→admin SPSC ring.  The gateway decodes the frame, requires a known
+// session, copies the fields into the sink and RETURNS IMMEDIATELY — no registry
+// access, no blocking on the gateway hot path.  DDL therefore never delays
+// produce routing (SchemaGatewayRegression).
+//
+// Catalog history Task 9: every DDL submit carries a DdlMetaView — the DDL
+// extension the client sent (statement, client name, request id, replayedFrom;
+// empty with a {0, 0} request id for a pre-v8 frame) plus the gateway's own
+// session id and the session's egress channel as the source address (ruling 13).
+// Every view points into the ingress buffer and MUST NOT be retained past return.
 //
 // Namespace: rune::gateway.  C++23.
 
+#include <rune/protocol/CatalogTypes.h>
+
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <string_view>
 
 namespace rune::gateway {
 
+/// The principal + statement of one DDL (catalog history spec §4; ruling 13).
+struct DdlMetaView {
+    std::string_view          statement;
+    std::string_view          clientName;
+    std::string_view          sourceAddress;     // the session's egress channel (gateway-supplied)
+    int64_t                   sessionId = 0;     // the session (gateway-supplied)
+    rune::protocol::RequestId requestId{};       // {0, 0} = a pre-v8 client (F14)
+    bool                      hasReplayedFrom = false;
+    std::string_view          replayedClusterId;
+    int64_t                   replayedOffset = -1;
+    std::string_view          replayedPrincipal;
+};
+
+/// The outcome of handing a request to the admin thread.
+///   Accepted — enqueued; the admin thread answers it.
+///   RingFull — back-pressure (retriable): the gateway answers Internal.
+///   TooLarge — the request can never fit one admin ring message: the gateway
+///              answers InvalidRequest with a detail (permanent, never a retry loop).
+enum class AdminSubmit : uint8_t { Accepted, RingFull, TooLarge };
+
 struct IAdminRequestSink {
     virtual ~IAdminRequestSink() = default;
 
-    // DefineTopic (templateId 64) — the gateway has decoded the frame and
-    // validated the session.  The sink OWNS the copied bytes (name/keyField/blob
-    // views point into the ingress buffer and MUST NOT be retained past return).
-    //
-    // Returns true if the request was accepted (enqueued on the admin ring);
-    // false on back-pressure (ring full) — the caller may drop (client retries).
-    virtual bool submitDefineTopic(int64_t sessionId, int64_t correlationId,
-                                   std::string_view name,
-                                   uint32_t partitionCount,
-                                   std::string_view keyField,
-                                   bool validate,
-                                   const uint8_t* descriptorBlob,
-                                   uint32_t descriptorLen,
-                                   uint8_t persistence) = 0;   // Phase 2b E: 0 disk, 1 transient
+    // DefineTopic (64).  An empty descriptor is an UNTYPED topic (ruling 3).
+    // v8: `replicationFactor` (0 = every broker) and the creation `config`
+    // (the defaults for a pre-v8 frame).
+    virtual AdminSubmit submitDefineTopic(int64_t sessionId, int64_t correlationId,
+                                          std::string_view name, uint32_t partitionCount,
+                                          std::string_view keyField, bool validate,
+                                          const uint8_t* descriptorBlob, uint32_t descriptorLen,
+                                          uint8_t persistence,   // Phase 2b E: 0 disk, 1 transient
+                                          int16_t replicationFactor,
+                                          const rune::protocol::TopicConfigView& config,
+                                          const DdlMetaView& meta) = 0;
 
-    // GetTopicSchema (templateId 66) — likewise, copy-and-return.
-    // requestedFingerprint (Task 13): 0 = latest; non-zero = the SPECIFIC
-    // version whose per-version fingerprint matches (so a typed client can
-    // fetch the older descriptor it was compiled against).
+    // GetTopicSchema (66) — a read, no DDL extension.  requestedFingerprint
+    // (Task 13): 0 = latest; non-zero = the SPECIFIC version whose per-version
+    // fingerprint matches.  true = enqueued, false = ring full.
     virtual bool submitGetSchema(int64_t sessionId, int64_t correlationId,
                                  std::string_view name,
                                  uint64_t requestedFingerprint) = 0;
 
-    // AlterTopic (templateId 68) — Task 14: the gateway has decoded the frame
-    // (expectedVersion CAS + the opaque ALTER ops blob) and copies the fields
-    // into the sink, which OWNS the copy; RETURNS IMMEDIATELY (copy-and-return,
-    // same discipline as submitDefineTopic/submitGetSchema — no registry
-    // access, no blocking on the gateway hot path).
-    //
-    // expectedVersion: 0 = unconditional (no CAS); non-zero = the admin thread
-    // rejects with SchemaConflict if the topic's current version differs.
-    // opsBlob: rune::codec::encodeAlterOps() wire bytes (opaque to the gateway).
-    //
-    // Returns true if the request was accepted (enqueued on the admin ring);
-    // false on back-pressure (ring full) — the caller may drop (client retries).
-    virtual bool submitAlterTopic(int64_t sessionId, int64_t correlationId,
-                                  std::string_view topicName,
-                                  uint16_t expectedVersion,
-                                  const uint8_t* opsBlob,
-                                  uint32_t opsLen) = 0;
+    // AlterTopic (68).  expectedVersion: 0 = unconditional; non-zero = the
+    // topic's schema version (SchemaConflict on a mismatch).  opsBlob:
+    // rune::codec::encodeAlterOps() wire bytes (opaque to the gateway).
+    virtual AdminSubmit submitAlterTopic(int64_t sessionId, int64_t correlationId,
+                                         std::string_view topicName, uint16_t expectedVersion,
+                                         const uint8_t* opsBlob, uint32_t opsLen,
+                                         const DdlMetaView& meta) = 0;
 
-    // CreateView (templateId 70) — Task 19: the gateway has decoded the frame
-    // (viewName + keyField + persistence + the authored ViewPlan planBlob) and
-    // copies the fields into the sink, which OWNS the copy; RETURNS IMMEDIATELY
-    // (copy-and-return, same discipline as the other DDL submits — no registry
-    // access, no blocking on the gateway hot path).  The admin thread
-    // deserializes + compiles + validates the plan asynchronously and produces
-    // the CreateViewResponse on the session egress.
-    //
-    // Returns true if the request was accepted (enqueued on the admin ring);
-    // false on back-pressure (ring full) — the caller may drop (client retries).
-    virtual bool submitCreateView(int64_t sessionId, int64_t correlationId,
-                                  std::string_view viewName,
-                                  std::string_view keyField,
-                                  uint8_t persistence,
-                                  const uint8_t* planBlob,
-                                  uint32_t planLen) = 0;
+    // CreateView (70): the authored ViewPlan (serializeAuthored) in planBlob.
+    virtual AdminSubmit submitCreateView(int64_t sessionId, int64_t correlationId,
+                                         std::string_view viewName, std::string_view keyField,
+                                         uint8_t persistence, const uint8_t* planBlob, uint32_t planLen,
+                                         const DdlMetaView& meta) = 0;
+
+    // Catalog history (client version 8): DropTopic (74), AlterTopicConfig (75),
+    // DropView (76), AlterView (77) — each answered by a DdlResponse (78).
+    virtual AdminSubmit submitDropTopic(int64_t sessionId, int64_t correlationId,
+                                        std::string_view name, const DdlMetaView& meta) = 0;
+    /// `changes` = the wire's count-prefixed (key:u8, value:i64)* block
+    /// (SchemaMessages.h AlterTopicConfig; keys already range-checked by its decode).
+    virtual AdminSubmit submitAlterTopicConfig(int64_t sessionId, int64_t correlationId,
+                                               std::string_view name, uint32_t expectedVersion,
+                                               std::span<const uint8_t> changes,
+                                               const DdlMetaView& meta) = 0;
+    virtual AdminSubmit submitDropView(int64_t sessionId, int64_t correlationId,
+                                       std::string_view name, const DdlMetaView& meta) = 0;
+    virtual AdminSubmit submitAlterView(int64_t sessionId, int64_t correlationId,
+                                        std::string_view name, std::string_view keyField,
+                                        uint8_t persistence, uint32_t expectedVersion,
+                                        const uint8_t* planBlob, uint32_t planLen,
+                                        const DdlMetaView& meta) = 0;
 };
 
 } // namespace rune::gateway

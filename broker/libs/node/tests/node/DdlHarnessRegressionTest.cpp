@@ -5,7 +5,7 @@
 #include "support/DdlHarness.h"
 
 #include <rune/codec/AlterOps.h>
-#include <rune/node/TopicName.h>
+#include <rune/catalog/TopicName.h>
 
 #include <spdlog/sinks/ringbuffer_sink.h>
 #include <spdlog/spdlog.h>
@@ -181,41 +181,41 @@ TEST(DdlHarnessRegression, InvariantFlagsAnAnswerWhileAnotherOpIsInFlight) {
 }
 
 // ── B1 / B2 / B6 ──────────────────────────────────────────────────────────────
-// Every TopicNameError kind, sampled several ways each, on every path: DefineTopic
+// Every rune::catalog::TopicNameError kind, sampled several ways each, on every path: DefineTopic
 // (disk + transient), CreateView (persisted + transient), createTopicForAdmin (the
 // control thread).  The config-parse path is in NodeConfigTest.cpp (Task 5a).
 namespace {
 struct BadName {
     std::string   name;
-    TopicNameError kind;
+    rune::catalog::TopicNameError kind;
     const char*   label;
 };
 std::vector<BadName> badNames() {
     return {
-        {"", TopicNameError::Empty, "empty"},
-        {std::string(250, 'x'), TopicNameError::TooLong, "len250"},
-        {std::string(1000, 'y'), TopicNameError::TooLong, "len1000"},
-        {".", TopicNameError::DotSegment, "dot"},
-        {"..", TopicNameError::DotSegment, "dotdot"},
-        {"../escape", TopicNameError::BadChar, "traversal"},
-        {"a/b", TopicNameError::BadChar, "slash"},
-        {"/abs", TopicNameError::BadChar, "absolute"},
-        {"a\\b", TopicNameError::BadChar, "backslash"},
-        {"has space", TopicNameError::BadChar, "space"},
-        {"tab\tname", TopicNameError::BadChar, "tab"},
-        {"new\nline", TopicNameError::BadChar, "newline"},
-        {std::string("nul\0byte", 8), TopicNameError::BadChar, "nul"},
-        {"caf\xc3\xa9", TopicNameError::BadChar, "nonascii"},
-        {"a:b", TopicNameError::BadChar, "colon"},
-        {"__topic_schemas", TopicNameError::Reserved, "topic_schemas"},
-        {"__views", TopicNameError::Reserved, "views"},
-        {"__consumer_offsets", TopicNameError::Reserved, "consumer_offsets"},
-        {"__transaction_state", TopicNameError::Reserved, "transaction_state"},
-        {"__cluster_metadata", TopicNameError::Reserved, "cluster_metadata"},
-        {"__view_snapshots", TopicNameError::Reserved, "view_snapshots"},
-        {"__orphan.1", TopicNameError::Reserved, "orphan"},
-        {"__x", TopicNameError::Reserved, "x"},
-        {"__", TopicNameError::Reserved, "bare"},
+        {"", rune::catalog::TopicNameError::Empty, "empty"},
+        {std::string(250, 'x'), rune::catalog::TopicNameError::TooLong, "len250"},
+        {std::string(1000, 'y'), rune::catalog::TopicNameError::TooLong, "len1000"},
+        {".", rune::catalog::TopicNameError::DotSegment, "dot"},
+        {"..", rune::catalog::TopicNameError::DotSegment, "dotdot"},
+        {"../escape", rune::catalog::TopicNameError::BadChar, "traversal"},
+        {"a/b", rune::catalog::TopicNameError::BadChar, "slash"},
+        {"/abs", rune::catalog::TopicNameError::BadChar, "absolute"},
+        {"a\\b", rune::catalog::TopicNameError::BadChar, "backslash"},
+        {"has space", rune::catalog::TopicNameError::BadChar, "space"},
+        {"tab\tname", rune::catalog::TopicNameError::BadChar, "tab"},
+        {"new\nline", rune::catalog::TopicNameError::BadChar, "newline"},
+        {std::string("nul\0byte", 8), rune::catalog::TopicNameError::BadChar, "nul"},
+        {"caf\xc3\xa9", rune::catalog::TopicNameError::BadChar, "nonascii"},
+        {"a:b", rune::catalog::TopicNameError::BadChar, "colon"},
+        {"__topic_schemas", rune::catalog::TopicNameError::Reserved, "topic_schemas"},
+        {"__views", rune::catalog::TopicNameError::Reserved, "views"},
+        {"__consumer_offsets", rune::catalog::TopicNameError::Reserved, "consumer_offsets"},
+        {"__transaction_state", rune::catalog::TopicNameError::Reserved, "transaction_state"},
+        {"__cluster_metadata", rune::catalog::TopicNameError::Reserved, "cluster_metadata"},
+        {"__view_snapshots", rune::catalog::TopicNameError::Reserved, "view_snapshots"},
+        {"__orphan.1", rune::catalog::TopicNameError::Reserved, "orphan"},
+        {"__x", rune::catalog::TopicNameError::Reserved, "x"},
+        {"__", rune::catalog::TopicNameError::Reserved, "bare"},
     };
 }
 } // namespace
@@ -223,7 +223,7 @@ std::vector<BadName> badNames() {
 class DdlNameRegression : public ::testing::TestWithParam<BadName> {};
 
 TEST_P(DdlNameRegression, TableCoversTheKindItClaims) {
-    EXPECT_EQ(checkTopicName(GetParam().name), GetParam().kind);
+    EXPECT_EQ(rune::catalog::checkTopicName(GetParam().name), GetParam().kind);
 }
 
 TEST_P(DdlNameRegression, AdminPathRejectsEveryOpWithInvalidTopicNameAndCreatesNothing) {
@@ -289,9 +289,9 @@ INSTANTIATE_TEST_SUITE_P(EveryKind, DdlNameRegression, ::testing::ValuesIn(badNa
 TEST(DdlFixRegression, B1_EveryTopicNameErrorKindIsCoveredByTheTable) {
     bool seen[6] = {};
     for (const BadName& b : badNames()) seen[static_cast<int>(b.kind)] = true;
-    EXPECT_FALSE(seen[static_cast<int>(TopicNameError::None)]);
-    for (const TopicNameError k : {TopicNameError::Empty, TopicNameError::TooLong, TopicNameError::DotSegment,
-                                   TopicNameError::BadChar, TopicNameError::Reserved})
+    EXPECT_FALSE(seen[static_cast<int>(rune::catalog::TopicNameError::None)]);
+    for (const rune::catalog::TopicNameError k : {rune::catalog::TopicNameError::Empty, rune::catalog::TopicNameError::TooLong, rune::catalog::TopicNameError::DotSegment,
+                                   rune::catalog::TopicNameError::BadChar, rune::catalog::TopicNameError::Reserved})
         EXPECT_TRUE(seen[static_cast<int>(k)]) << static_cast<int>(k);
 }
 
@@ -677,7 +677,7 @@ TEST(DdlFixRegression, B3_OrphanPlaceholderNamesCanNeverBeAFoldTarget) {
     std::string upper = placeholder;
     for (char& ch : upper) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
     ASSERT_NE(upper, placeholder);
-    ASSERT_TRUE(topicNamesFoldEqual(upper, placeholder));
+    ASSERT_TRUE(rune::catalog::topicNamesFoldEqual(upper, placeholder));
     const int32_t topics = h.topicCount();
     int64_t c[4];
     int i = 0;
@@ -848,7 +848,7 @@ class DdlLogEscapeRegression : public ::testing::TestWithParam<EscapeCase> {};
 
 TEST_P(DdlLogEscapeRegression, EscapedNameIsPrintableAsciiOnly) {
     const EscapeCase& c = GetParam();
-    const std::string got = escapeNameForLog(c.raw);
+    const std::string got = rune::catalog::escapeNameForLog(c.raw);
     EXPECT_EQ(got, c.logged);
     for (const char ch : got) {
         const auto u = static_cast<unsigned char>(ch);
@@ -858,7 +858,7 @@ TEST_P(DdlLogEscapeRegression, EscapedNameIsPrintableAsciiOnly) {
 
 TEST_P(DdlLogEscapeRegression, ControlThreadLogsTheRejectedNameOnOneEscapedLine) {
     const EscapeCase& c = GetParam();
-    if (isValidTopicName(c.raw)) GTEST_SKIP() << "only rejected names are logged here";
+    if (rune::catalog::isValidTopicName(c.raw)) GTEST_SKIP() << "only rejected names are logged here";
     const fs::path dir = fs::temp_directory_path() / ("rune_ddl_logesc_" + std::to_string(::getpid()));
     fs::create_directories(dir);
     {

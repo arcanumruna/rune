@@ -27,7 +27,9 @@
 
 #include <rune/node/AdminWorker.h>
 #include <rune/node/AdminChannels.h>
-#include <rune/node/AdminCreateTopic.h>
+#include <rune/node/BrokerNode.h>        // AdminWorkerAgent (the production catalog sink)
+#include <rune/node/CatalogPartition.h>
+#include "support/CatalogDdlRig.h"
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/node/SchemaRegistry.h>
 #include <rune/node/ViewRegistry.h>
@@ -84,21 +86,6 @@ struct TmpDir {
     ~TmpDir() { std::error_code ec; std::filesystem::remove_all(path, ec); }
 };
 
-PartitionConfig singleNodeCfg(int32_t topicId) {
-    PartitionConfig cfg;
-    cfg.topicId             = topicId;
-    cfg.partitionId         = 0;
-    cfg.selfId              = 1;
-    cfg.replicaLagMaxMs     = 10'000;
-    cfg.replicaLagMaxOffset = 10'000;
-    cfg.minIsr              = 1;   // single-node: appendKeyed commits without followers
-    cfg.fetchIntervalNs     = 1'000'000LL;
-    cfg.isrCheckIntervalNs  = 1'000'000LL;
-    cfg.maxFetchBytes       = 1 << 20;
-    cfg.pushOnAppend        = false;
-    cfg.cleanupPolicy       = CleanupPolicy::Compact;
-    return cfg;
-}
 
 // "character" source schema: id (Int64 key) + hp (Int64).
 std::vector<uint8_t> characterBlob() {
@@ -123,53 +110,38 @@ std::vector<uint8_t> charHpPlanBlob(int32_t srcTopicId) {
 } // namespace
 
 // ---------------------------------------------------------------------------
-// Fixture — admin worker driving BOTH __topic_schemas and __views, plus a real
-// WorkerViewSet fed by the real control->worker install ring.
+// Fixture (catalog history Task 9) — the REAL AdminWorkerAgent over a
+// single-node __catalog leader: the catalog write path + the CatalogApplier +
+// its production effect sink.  The test plays the control thread: it drains
+// the agent's admin→control ring, builds nothing, and re-posts each
+// ViewPlanUpdate on the worker's REAL install ring (as fanoutViewPlan_ does),
+// where a real WorkerViewSet installs it.
 // ---------------------------------------------------------------------------
 class CreateViewRegression : public ::testing::Test {
 protected:
     CreateViewRegression()
-        : schemaDir_("schema"), viewsDir_("views")
-        , schemaLog_(schemaDir_.path), viewsLog_(viewsDir_.path)
+        : catalogDir_("catalog"), viewsDir_("views")
+        , catalogLog_(catalogDir_.path)
         , viewSet_(installChannel_, viewsDir_.path) {}
 
     void SetUp() override {
-        schemaLog_.recover();
-        viewsLog_.recover();
-        schemaTransport_ = std::make_unique<NullPartitionTransport>();
-        viewsTransport_  = std::make_unique<NullPartitionTransport>();
-
-        schemaReplica_ = std::make_unique<PartitionReplica>(
-            singleNodeCfg(kSchemaTopicId), Role::Leader, /*epoch=*/1,
-            std::vector<NodeId>{1}, std::vector<NodeId>{1}, &schemaLog_, schemaTransport_.get());
-        viewsReplica_ = std::make_unique<PartitionReplica>(
-            singleNodeCfg(kViewsTopicId), Role::Leader, /*epoch=*/1,
-            std::vector<NodeId>{1}, std::vector<NodeId>{1}, &viewsLog_, viewsTransport_.get());
-
+        catalogLog_.recover();
+        transport_ = std::make_unique<NullPartitionTransport>();
         buildAdmin_();
     }
 
-    // Build the admin side (registries + AdminWorker) over the CURRENT replicas
-    // and promote it — on a restart (restartAdmin_) the promotion edge replays
-    // __topic_schemas + __views exactly as a broker boot does.
+    // Build the admin side (registries + agent) over the catalog log: its boot
+    // replay (bootCatalog) re-applies the local prefix — on a restart
+    // (restartAdmin_) exactly as a broker boot does — then it leads.
     void buildAdmin_() {
         schemaRegistry_ = std::make_unique<SchemaRegistry>();
         viewRegistry_   = std::make_unique<ViewRegistry>();
-
+        rune::node::NodeConfig nc;
+        nc.nodeId = 1;
+        replica_ = std::make_unique<PartitionReplica>(makeCatalogPartitionConfig(nc, 1), Role::Follower, 0,
+                                                      std::vector<NodeId>{1}, std::vector<NodeId>{1}, &catalogLog_,
+                                                      transport_.get());
         AdminDeps deps;
-        deps.requestCreateTopic = [this](int64_t ticket, int32_t parts, const std::string& name,
-                                         const std::string& keyField, uint8_t cleanupPolicy,
-                                         uint8_t /*persistence*/) -> bool {
-            pendingTicket_ = ticket;
-            ++createRequests_;
-            maxOutstanding_ = std::max(maxOutstanding_, ++outstandingCreates_);
-            pendingReq_ = CreateTopicReqMsg{ticket, parts, name, keyField, cleanupPolicy};
-            lastSinkKeyField_      = keyField;       // capture: a view sink is keyed...
-            lastSinkCleanupPolicy_ = cleanupPolicy;  // ...and Compact.
-            return true;
-        };
-        deps.pushValidators = [](const RegistryEntry&, int32_t) {};
-        deps.topicCommitted = [this](int32_t topicId) { committedIds_.push_back(topicId); };
         deps.respondDefine  = [this](int64_t, int64_t, int32_t topicId, uint16_t, uint16_t err) {
             lastDefineTopicId_ = topicId; lastDefineError_ = err;
             defineResults_.push_back(err);
@@ -178,79 +150,75 @@ protected:
         deps.respondAlter = [this](int64_t, int64_t, int32_t topicId, uint16_t version, uint16_t err) {
             alterResults_.push_back(AlterResult{topicId, version, err});
         };
-        deps.respondCreateView = [this](int64_t, int64_t, int32_t viewTopicId,
-                                        uint64_t fp, uint16_t err) {
+        deps.respondCreateView = [this](int64_t, int64_t, int32_t viewTopicId, uint64_t fp, uint16_t err) {
             lastViewTopicId_  = viewTopicId;
             lastViewFinger_   = fp;
             lastViewError_    = err;
             viewResults_.push_back(err);
         };
-        // Fan the compiled plan out exactly as the control thread does: encode it
-        // onto the worker's REAL install ring (the worker drains it on its own
-        // thread via WorkerViewSet::drainInstalls).
-        deps.pushViewPlan = [this](const ViewPlanUpdateMsg& vp) {
-            ASSERT_TRUE(encodeViewPlanUpdate(installChannel_.install,
-                                             ViewSnapshotChannel::kInstallMsgType, vp));
-        };
-
-        adminWorker_ = std::make_unique<AdminWorker>(
-            *schemaRegistry_, schemaReplica_.get(), /*selfId=*/1, std::vector<int32_t>{1},
-            std::move(deps), viewsReplica_.get(), viewRegistry_.get());
-        adminWorker_->onRole(AdminRoleMsg{/*leader=*/true, /*epoch=*/1, /*leaderId=*/1});
+        agent_ = std::make_unique<AdminWorkerAgent>(*schemaRegistry_, nullptr, 1, std::vector<int32_t>{1},
+                                                    std::move(deps), nullptr, viewRegistry_.get(), replica_.get(),
+                                                    nullptr);
+        adminWorker_ = &agent_->worker();
+        (void)adminWorker_->bootCatalog(agent_->catalogBootEffects(), agent_->catalogLiveEffects());
+        AdminRoleMsg role;
+        role.leader = true; role.epoch = ++epoch_; role.leaderId = 1; role.partitionEpoch = 0;
+        role.isrCount = 1; role.isr[0] = 1;
+        adminWorker_->onCatalogRole(role);
+        pump_();
+        ASSERT_EQ(adminWorker_->roleName(), "LeaderServing");
     }
 
-    // Simulated broker restart: fresh replicas (Follower, as at boot) over the
-    // SAME durable logs, fresh registries, fresh AdminWorker, promoted to leader
-    // (rebuildFromLog_ + recoverViewsOnPromotion_ run on that edge).
+    // Simulated broker restart: a fresh replica (Follower, as at boot) over the
+    // SAME durable catalog log, fresh registries, a fresh agent — its one boot
+    // replay re-applies every event and RECOVERY-installs every live view.
     void restartAdmin_() {
-        adminWorker_.reset();
-        schemaReplica_ = std::make_unique<PartitionReplica>(
-            singleNodeCfg(kSchemaTopicId), Role::Follower, /*epoch=*/0,
-            std::vector<NodeId>{1}, std::vector<NodeId>{1}, &schemaLog_, schemaTransport_.get());
-        viewsReplica_ = std::make_unique<PartitionReplica>(
-            singleNodeCfg(kViewsTopicId), Role::Follower, /*epoch=*/0,
-            std::vector<NodeId>{1}, std::vector<NodeId>{1}, &viewsLog_, viewsTransport_.get());
+        adminWorker_ = nullptr;
+        agent_.reset();
+        replica_.reset();
         buildAdmin_();
     }
 
-    // Final review I1: answer create-topic requests like BrokerNode's control
-    // thread (createTopicForAdmin over a REAL TopicRegistry — idempotent by
-    // name, authoritative count, `existed`) instead of a fresh fake id.
-    void useRealTopicRegistry_(const std::vector<rune::node::TopicSpec>& bootTopics) {
-        topicReg_ = std::make_unique<rune::gateway::TopicRegistry>(bootTopics, topicsDir_.path);
-    }
-
     void driveDefine(const DefineTopicMsg& msg) {
-        adminWorker_->submitDefineTopic(msg);
+        adminWorker_->submit(DdlRequest{msg});
         pump_();
     }
     void driveCreateView(const CreateViewMsg& msg) {
-        adminWorker_->submitCreateView(msg);
+        adminWorker_->submit(DdlRequest{msg});
         pump_();
     }
-    // Drive the async state machine: tick doWork, answering the simulated
-    // control-thread createTopic reply with a fresh sequential id.
+    // Drive the admin thread and play the control thread (bounded).  Tracks the
+    // started-but-unanswered DDLs (never more than one: serialized).
     void pump_() {
-        pendingTicket_ = -1;
-        int64_t nowNs = 0;
         for (int i = 0; i < 100; ++i) {
-            nowNs += 1'000'000LL;
-            adminWorker_->doWork(nowNs);
-            if (pendingTicket_ >= 0) {
-                CreateTopicReplyMsg reply;
-                if (topicReg_) {
-                    reply = createTopicForAdmin(*topicReg_, pendingReq_);
-                } else {
-                    reply.ticket         = pendingTicket_;
-                    reply.topicId        = nextTopicId_++;
-                    reply.partitionCount = pendingReq_.partitionCount;
-                }
-                pendingTicket_ = -1;
-                --outstandingCreates_;
-                adminWorker_->onCreateTopicReply(reply);
-            }
+            nowNs_ += 1'000'000LL;
+            agent_->doWork(nowNs_);
+            serviceControl_();
+            maxOutstanding_ = std::max<int>(maxOutstanding_,
+                static_cast<int>(adminWorker_->startedCount() - adminWorker_->answeredCount()));
         }
     }
+    void serviceControl_() {
+        agent_->failureRing().drain([this](int32_t tid, aeron::concurrent::AtomicBuffer& b,
+                                           aeron::util::index_t off, aeron::util::index_t len) {
+            const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
+            const auto n = static_cast<std::size_t>(len);
+            if (tid == kA2cCatalogTopicApplied) {
+                CatalogTopicAppliedMsg m;
+                ASSERT_TRUE(decodeCatalogTopicApplied(p, n, m));
+                appliedIds_.push_back(m.topicId);
+                if (m.config.cleanupPolicy == 1) {   // a view sink (the production sink: a compacted table)
+                    lastSinkKeyField_      = m.config.partitionKey;
+                    lastSinkCleanupPolicy_ = m.config.cleanupPolicy;
+                }
+            } else if (tid == kA2cViewPlanUpdate) {
+                ASSERT_TRUE(encodeViewPlanUpdate(installChannel_.install, ViewSnapshotChannel::kInstallMsgType,
+                                                 decodeViewPlanUpdate(p, n)));
+            }
+        }, 64);
+    }
+    /// Events in __catalog (an accepted DDL appends exactly one).
+    [[nodiscard]] uint64_t events() const { return adminWorker_->eventsAppended(); }
 
     DefineTopicMsg defineCharacter() {
         DefineTopicMsg d;
@@ -259,34 +227,29 @@ protected:
         return d;
     }
 
-    TmpDir schemaDir_, viewsDir_;
-    TmpDir topicsDir_{"topics"};
-    std::unique_ptr<rune::gateway::TopicRegistry> topicReg_;   // null = fake control ids
-    CreateTopicReqMsg pendingReq_;
-    rune::storage::Log schemaLog_, viewsLog_;
+    TmpDir catalogDir_, viewsDir_;
+    rune::storage::Log catalogLog_;
     ViewSnapshotChannel installChannel_;        // the worker's own channel (install ring used here)
     WorkerViewSet       viewSet_;               // a real per-worker view set
-    std::unique_ptr<NullPartitionTransport> schemaTransport_, viewsTransport_;
-    std::unique_ptr<PartitionReplica>       schemaReplica_, viewsReplica_;
+    std::unique_ptr<NullPartitionTransport> transport_;
+    std::unique_ptr<PartitionReplica>       replica_;
     std::unique_ptr<SchemaRegistry>         schemaRegistry_;
     std::unique_ptr<ViewRegistry>           viewRegistry_;
-    std::unique_ptr<AdminWorker>            adminWorker_;
+    std::unique_ptr<AdminWorkerAgent>       agent_;
+    AdminWorker*                            adminWorker_ = nullptr;
+    int32_t epoch_  = 0;
+    int64_t nowNs_  = 0;
 
-    int32_t nextTopicId_   = 0;
-    int64_t pendingTicket_ = -1;
-
-    // U2: per-op response capture + create-request accounting.
+    // U2: per-op response capture + serialization accounting.
     struct AlterResult { int32_t topicId; uint16_t version; uint16_t err; };
     std::vector<uint16_t>    defineResults_, viewResults_;
     std::vector<AlterResult> alterResults_;
-    int createRequests_    = 0;   // requestCreateTopic calls
-    int outstandingCreates_ = 0;  // requested, reply not yet delivered
-    int maxOutstanding_     = 0;  // must never exceed 1 (single in-flight DDL op)
+    int maxOutstanding_     = 0;  // started-but-unanswered DDLs: must never exceed 1
 
     int32_t  lastDefineTopicId_ = -1;
     uint16_t lastDefineError_   = 0xffff;
     int32_t  lastViewTopicId_   = -2;
-    std::vector<int32_t> committedIds_;   // B10 fix round 1: deps.topicCommitted
+    std::vector<int32_t> appliedIds_;   // every topic the control thread was told to build
     uint64_t lastViewFinger_    = 0;
     uint16_t lastViewError_     = 0xffff;
     std::string lastSinkKeyField_;
@@ -339,9 +302,9 @@ TEST_F(CreateViewRegression, CreateViewPersistsCompilesAndInstalls) {
     driveCreateView(cv2);
     EXPECT_EQ(lastViewError_, static_cast<uint16_t>(pc::ErrorCode::ViewExists));
 
-    // 8. B10 fix round 1 (I1): the source's DefineTopic and the view sink's record
-    //    each signalled "committed" exactly once; the refused duplicate did not.
-    EXPECT_EQ(committedIds_, (std::vector<int32_t>{srcTopicId, lastViewTopicId_}));
+    // 8. B10 → the catalog: the source topic and the view sink were each built
+    //    exactly once (kA2cCatalogTopicApplied); the refused duplicate built nothing.
+    EXPECT_EQ(appliedIds_, (std::vector<int32_t>{srcTopicId, lastViewTopicId_}));
 }
 
 namespace {
@@ -435,7 +398,6 @@ TEST_F(CreateViewRegression, AggregateOverSinglePartitionSourceIsAllowed) {
 // rejected with TopicExists, leaving the topic and its schema untouched.
 // ---------------------------------------------------------------------------
 TEST_F(CreateViewRegression, ViewNamedLikeExistingTypedTopicIsRejectedRegression) {
-    useRealTopicRegistry_({});
     driveDefine(defineCharacter());
     ASSERT_EQ(lastDefineError_, 0u);
     const int32_t srcTopicId = lastDefineTopicId_;
@@ -458,8 +420,11 @@ TEST_F(CreateViewRegression, ViewNamedLikeExistingTypedTopicIsRejectedRegression
 }
 
 TEST_F(CreateViewRegression, ViewNamedLikeExistingUntypedTopicIsRejectedRegression) {
-    rune::node::TopicSpec boot; boot.name = "raw_events"; boot.partitionCount = 1; boot.topicId = 0;
-    useRealTopicRegistry_({boot});   // a RUNE_TOPICS boot topic: no schema
+    DefineTopicMsg untyped;   // catalog history Task 9: the schema-less topic is an untyped DDL topic
+    untyped.session = 1; untyped.corr = 9; untyped.partitionCount = 1; untyped.name = "raw_events";
+    driveDefine(untyped);
+    ASSERT_EQ(lastDefineError_, 0u);
+    const int32_t rawId = lastDefineTopicId_;
     driveDefine(defineCharacter());
     ASSERT_EQ(lastDefineError_, 0u);
     const int32_t srcTopicId = lastDefineTopicId_;
@@ -474,8 +439,10 @@ TEST_F(CreateViewRegression, ViewNamedLikeExistingUntypedTopicIsRejectedRegressi
     EXPECT_EQ(viewSet_.drainInstalls(), 0) << "no view plan may be installed";
     EXPECT_EQ(schemaRegistry_->byName("raw_events"), nullptr)
         << "the existing topic must not acquire the view's output schema";
-    EXPECT_EQ(topicReg_->topic(0)->cleanupPolicy, rune::node::TopicSpec::CleanupPolicy::Delete)
-        << "the existing topic is not turned into a view sink";
+    const auto* raw = adminWorker_->applier().state().topicByName("raw_events");
+    ASSERT_NE(raw, nullptr);
+    EXPECT_EQ(raw->topicId, rawId);
+    EXPECT_EQ(raw->config.cleanupPolicy, 0u) << "the existing topic is not turned into a view sink";
 }
 
 // ---------------------------------------------------------------------------
@@ -484,8 +451,8 @@ TEST_F(CreateViewRegression, ViewNamedLikeExistingUntypedTopicIsRejectedRegressi
 // view TopicSchema used to carry an empty topicName, so it was indexed under
 // the descriptor name (here "char_hp", which names nothing the client created)
 // and GetTopicSchema("hp_by_char") answered UnknownTopic.  The restart leg also
-// covers final review I2 through the AdminWorker rebuildFromLog_ path: the
-// source topic "chars_src" (descriptor "character") resolves by its own name.
+// covers final review I2 through the catalog boot replay: the source topic
+// "chars_src" (descriptor "character") resolves by its own name.
 // ---------------------------------------------------------------------------
 TEST_F(CreateViewRegression, ViewSinkResolvesByViewNameAcrossRestartRegression) {
     DefineTopicMsg d = defineCharacter();
@@ -518,7 +485,7 @@ TEST_F(CreateViewRegression, ViewSinkResolvesByViewNameAcrossRestartRegression) 
     check("before restart");
 
     restartAdmin_();
-    ASSERT_FALSE(adminWorker_->rebuildFailed());
+    ASSERT_FALSE(adminWorker_->applier().halted()) << "the boot replay verified every event";
     ASSERT_NE(viewRegistry_->byName("hp_by_char"), nullptr) << "the view catalog recovered";
     check("after restart");
 }
@@ -552,14 +519,15 @@ TEST_F(CreateViewRegression, PersistedViewOverTransientSourceIsRejectedRegressio
     CreateViewMsg cv;
     cv.session = 1; cv.corr = 70; cv.persistence = 0;   // persisted
     cv.viewName = "char_hp"; cv.keyField = "id"; cv.planBlob = charHpPlanBlobP(src, 0);
-    pendingTicket_ = -1;
+    const uint64_t eventsBefore = events();
     driveCreateView(cv);
 
     EXPECT_EQ(lastViewError_, 37u);
     EXPECT_EQ(lastViewTopicId_, -1);
     EXPECT_EQ(viewRegistry_->byName("char_hp"), nullptr) << "no __views record";
     EXPECT_EQ(schemaRegistry_->byName("char_hp"), nullptr) << "no sink topic schema";
-    EXPECT_TRUE(lastSinkKeyField_.empty()) << "no sink topic was requested";
+    EXPECT_EQ(events(), eventsBefore) << "no event (no sink) was written";
+    EXPECT_TRUE(lastSinkKeyField_.empty()) << "no sink topic was built";
     EXPECT_EQ(viewSet_.drainInstalls(), 0);
 }
 
@@ -567,22 +535,25 @@ TEST_F(CreateViewRegression, PersistedViewOverTransientSourceIsRejectedRegressio
 // never cast; the decode marks the message malformed and the worker answers
 // InvalidSchema (23) with the frame's session/corr.
 TEST_F(CreateViewRegression, RingDecodeRejectsUnknownPersistenceByteRegression) {
-    std::vector<uint8_t> raw(8 + 8 + 1 + 2 + 2 + 4, 0);
-    raw[0] = 1;            // session = 1
-    raw[8] = 71;           // corr = 71
+    CreateViewMsg ok; ok.session = 1; ok.corr = 71; ok.persistence = 1; ok.viewName = "v"; ok.keyField = "id";
+    OneToOneByteRing ring{kAdminRequestRingBytes};
+    ASSERT_TRUE(encodeDdl(ring, ok));
+    std::vector<uint8_t> raw;
+    ring.drain([&](int32_t, aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off, aeron::util::index_t len) {
+        const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
+        raw.assign(p, p + len);
+    }, 1);
+    ASSERT_FALSE(raw.empty());
+    EXPECT_FALSE(decodeCreateView(raw.data(), raw.size()).malformed) << "a known mode is not flagged";
     raw[16] = 2;           // persistence: one past Transient
     const CreateViewMsg cv = decodeCreateView(raw.data(), raw.size());
     EXPECT_TRUE(cv.malformed);
     EXPECT_EQ(cv.session, 1);
     EXPECT_EQ(cv.corr, 71);
 
-    pendingTicket_ = -1;
     driveCreateView(cv);
     EXPECT_EQ(lastViewError_, 23u);
     EXPECT_EQ(lastViewTopicId_, -1);
-
-    raw[16] = 1;           // a known mode is not flagged
-    EXPECT_FALSE(decodeCreateView(raw.data(), raw.size()).malformed);
 }
 
 // No-hang wave (R1): a DIRECTLY submitted CreateViewMsg (not via the ring
@@ -593,11 +564,11 @@ TEST_F(CreateViewRegression, DirectCreateViewWithUnknownPersistenceIsInvalidSche
     CreateViewMsg cv;
     cv.session = 1; cv.corr = 72; cv.persistence = 2; cv.viewName = "v2"; cv.keyField = "id";
     ASSERT_FALSE(cv.malformed);
-    pendingTicket_ = -1;
+    const uint64_t eventsBefore = events();
     driveCreateView(cv);
     EXPECT_EQ(lastViewError_, 23u);
     EXPECT_EQ(lastViewTopicId_, -1);
-    EXPECT_EQ(pendingTicket_, -1) << "no sink create requested";
+    EXPECT_EQ(events(), eventsBefore) << "nothing written";
 }
 
 // ===========================================================================
@@ -629,17 +600,17 @@ TEST_F(CreateViewRegression, U1_AlterTopicOnAViewIsViewNotAlterableRegression) {
     ASSERT_EQ(lastDefineError_, 0u);
     driveCreateView(viewNamed(2, "char_hp", lastDefineTopicId_));
     ASSERT_EQ(lastViewError_, 0u);
-    const int64_t schemaEnd = schemaLog_.logEndOffset();
+    const int64_t catalogEnd = catalogLog_.logEndOffset();
     const uint16_t versionBefore = schemaRegistry_->byName("char_hp")->version;
 
     AlterTopicMsg a; a.session = 1; a.corr = 3; a.topicName = "char_hp";
     a.expectedVersion = 0; a.opsBlob = addColumnOps();
-    adminWorker_->submitAlterTopic(a);
+    adminWorker_->submit(DdlRequest{a});
     pump_();
 
     ASSERT_EQ(alterResults_.size(), 1u);
     EXPECT_EQ(alterResults_[0].err, 38u) << "ViewNotAlterable";
-    EXPECT_EQ(schemaLog_.logEndOffset(), schemaEnd) << "nothing appended";
+    EXPECT_EQ(catalogLog_.logEndOffset(), catalogEnd) << "nothing appended";
     EXPECT_EQ(schemaRegistry_->byName("char_hp")->version, versionBefore);
 }
 
@@ -647,17 +618,16 @@ TEST_F(CreateViewRegression, U2_SameNameTopicsBackToBackExactlyOneWinsRegression
     for (const uint8_t secondPersistence : {uint8_t{0}, uint8_t{1}}) {
         SCOPED_TRACE(secondPersistence);
         const std::string name = secondPersistence ? "dup_t" : "dup_d";
-        defineResults_.clear(); createRequests_ = 0;
-        const int64_t before = schemaLog_.logEndOffset();
-        adminWorker_->submitDefineTopic(defineNamed(1, name, 0));
-        adminWorker_->submitDefineTopic(defineNamed(2, name, secondPersistence));
+        defineResults_.clear();
+        const int64_t before = catalogLog_.logEndOffset();
+        adminWorker_->submit(DdlRequest{defineNamed(1, name, 0)});
+        adminWorker_->submit(DdlRequest{defineNamed(2, name, secondPersistence)});
         pump_();
         ASSERT_EQ(defineResults_.size(), 2u);
         EXPECT_EQ(defineResults_[0], 0u) << "FIFO: the first define wins";
         EXPECT_EQ(defineResults_[1], 25u) << "TopicExists";
-        EXPECT_EQ(createRequests_, 1) << "the loser never reaches the control thread";
         EXPECT_EQ(schemaRegistry_->byName(name)->version, 1u);
-        EXPECT_EQ(schemaLog_.logEndOffset() - before, 1) << "exactly one TopicSchema record";
+        EXPECT_EQ(catalogLog_.logEndOffset() - before, 1) << "exactly one event: the loser writes nothing";
         EXPECT_EQ(adminWorker_->pendingCount(), 0u);
     }
     EXPECT_EQ(maxOutstanding_, 1);
@@ -669,26 +639,28 @@ TEST_F(CreateViewRegression, U2_ViewThenTopicAndTopicThenViewSameNameRegression)
     const int32_t src = lastDefineTopicId_;
 
     // view X then topic X
-    defineResults_.clear(); viewResults_.clear(); createRequests_ = 0;
-    adminWorker_->submitCreateView(viewNamed(10, "X", src));
-    adminWorker_->submitDefineTopic(defineNamed(11, "X"));
+    defineResults_.clear(); viewResults_.clear();
+    uint64_t before = events();
+    adminWorker_->submit(DdlRequest{viewNamed(10, "X", src)});
+    adminWorker_->submit(DdlRequest{defineNamed(11, "X")});
     pump_();
     ASSERT_EQ(viewResults_.size(), 1u);
     ASSERT_EQ(defineResults_.size(), 1u);
     EXPECT_EQ(viewResults_[0], 0u);
     EXPECT_EQ(defineResults_[0], 25u) << "topic over a view's name: TopicExists";
-    EXPECT_EQ(createRequests_, 1) << "nothing created for the loser";
+    EXPECT_EQ(events() - before, 1u) << "nothing written for the loser";
 
     // topic Y then view Y
-    defineResults_.clear(); viewResults_.clear(); createRequests_ = 0;
-    adminWorker_->submitDefineTopic(defineNamed(20, "Y"));
-    adminWorker_->submitCreateView(viewNamed(21, "Y", src));
+    defineResults_.clear(); viewResults_.clear();
+    before = events();
+    adminWorker_->submit(DdlRequest{defineNamed(20, "Y")});
+    adminWorker_->submit(DdlRequest{viewNamed(21, "Y", src)});
     pump_();
     ASSERT_EQ(defineResults_.size(), 1u);
     ASSERT_EQ(viewResults_.size(), 1u);
     EXPECT_EQ(defineResults_[0], 0u);
     EXPECT_EQ(viewResults_[0], 25u) << "view over a topic's name: TopicExists";
-    EXPECT_EQ(createRequests_, 1);
+    EXPECT_EQ(events() - before, 1u);
     EXPECT_EQ(viewRegistry_->byName("Y"), nullptr);
     EXPECT_EQ(maxOutstanding_, 1);
 }
@@ -696,48 +668,47 @@ TEST_F(CreateViewRegression, U2_ViewThenTopicAndTopicThenViewSameNameRegression)
 TEST_F(CreateViewRegression, U2_SameNameViewsBackToBackOneViewExistsRegression) {
     driveDefine(defineNamed(1, "character"));
     ASSERT_EQ(lastDefineError_, 0u);
-    viewResults_.clear(); createRequests_ = 0;
-    adminWorker_->submitCreateView(viewNamed(10, "X", lastDefineTopicId_));
-    adminWorker_->submitCreateView(viewNamed(11, "X", lastDefineTopicId_));
+    viewResults_.clear();
+    const uint64_t before = events();
+    adminWorker_->submit(DdlRequest{viewNamed(10, "X", lastDefineTopicId_)});
+    adminWorker_->submit(DdlRequest{viewNamed(11, "X", lastDefineTopicId_)});
     pump_();
     ASSERT_EQ(viewResults_.size(), 2u);
     EXPECT_EQ(viewResults_[0], 0u);
     EXPECT_EQ(viewResults_[1], 32u) << "ViewExists";
-    EXPECT_EQ(createRequests_, 1);
+    EXPECT_EQ(events() - before, 1u);
     EXPECT_EQ(viewRegistry_->all().size(), 1u);
     EXPECT_EQ(maxOutstanding_, 1);
 }
 
-TEST_F(CreateViewRegression, U2_AlterQueuedBehindCreateRunsAfterCommitRegression) {
-    adminWorker_->submitDefineTopic(defineNamed(1, "t"));
-    AlterTopicMsg a; a.session = 1; a.corr = 2; a.topicName = "t";
+// An ALTER queued behind a CREATE whose event is appended but not committed waits
+// (one DDL in flight) and runs once the CREATE committed and applied.  Needs a held
+// commit: a 3-broker catalog whose follower 2 is silent (CatalogDdlRig).
+TEST(CreateViewCatalogRegression, U2_AlterQueuedBehindCreateRunsAfterCommitRegression) {
+    rune::node::test::CatalogDdlRig rig("cv_u2_alter", 3);
+    rig.becomeServingLeader({1, 2});   // follower 2 silent
+    DefineTopicMsg d = defineNamed(rig.nextCorr(), "t");
+    d.meta.requestId = rig.freshRequestId();
+    const int64_t defineCorr = rig.submitRawNoWait(DdlRequest{d});
+    AlterTopicMsg a; a.session = 1; a.corr = rig.nextCorr(); a.topicName = "t";
     a.expectedVersion = 0; a.opsBlob = addColumnOps();
-    adminWorker_->submitAlterTopic(a);
+    a.meta.requestId = rig.freshRequestId();
+    const int64_t alterCorr = rig.submitRawNoWait(DdlRequest{a});
+    for (int i = 0; i < 16; ++i) rig.pump();
+    EXPECT_FALSE(rig.answerFor(defineCorr).has_value()) << "the CREATE's event is held at the HW";
+    EXPECT_FALSE(rig.answerFor(alterCorr).has_value()) << "ALTER must not start while the CREATE is in flight";
+    EXPECT_EQ(rig.admin().pendingCount(), 1u) << "the ALTER waits in the FIFO";
+    EXPECT_EQ(rig.schemas().byName("t"), nullptr);
 
-    // Tick until the create's id request is out; the control reply is withheld.
-    int64_t now = 0;
-    while (pendingTicket_ < 0 && now < 50'000'000LL) { now += 1'000'000LL; adminWorker_->doWork(now); }
-    ASSERT_GE(pendingTicket_, 0);
-    for (int i = 0; i < 5; ++i) { now += 1'000'000LL; adminWorker_->doWork(now); }
-    EXPECT_TRUE(alterResults_.empty()) << "ALTER must not start while the CREATE is in flight";
-    EXPECT_TRUE(defineResults_.empty());
-    EXPECT_EQ(adminWorker_->pendingCount(), 1u) << "the ALTER waits in the FIFO";
-    EXPECT_EQ(schemaRegistry_->byName("t"), nullptr);
-
-    // Deliver the reply; CREATE commits, THEN the ALTER runs and succeeds at v2.
-    CreateTopicReplyMsg reply; reply.ticket = pendingTicket_; reply.topicId = nextTopicId_++;
-    pendingTicket_ = -1; --outstandingCreates_;
-    adminWorker_->onCreateTopicReply(reply);
-    for (int i = 0; i < 100; ++i) { now += 1'000'000LL; adminWorker_->doWork(now); }
-
-    ASSERT_EQ(defineResults_.size(), 1u);
-    EXPECT_EQ(defineResults_[0], 0u);
-    ASSERT_EQ(alterResults_.size(), 1u);
-    EXPECT_EQ(alterResults_[0].err, 0u);
-    EXPECT_EQ(alterResults_[0].version, 2u);
-    EXPECT_EQ(schemaRegistry_->byName("t")->version, 2u);
-    EXPECT_EQ(adminWorker_->pendingCount(), 0u);
-    EXPECT_EQ(maxOutstanding_, 1);
+    rig.resumeFollower(2);   // the CREATE commits, THEN the ALTER runs and succeeds at v2
+    for (int i = 0; i < 64 && !rig.answerFor(alterCorr); ++i) rig.pump();
+    ASSERT_TRUE(rig.answerFor(defineCorr).has_value());
+    EXPECT_EQ(rig.answerFor(defineCorr)->code, 0);
+    ASSERT_TRUE(rig.answerFor(alterCorr).has_value());
+    EXPECT_EQ(rig.answerFor(alterCorr)->code, 0);
+    EXPECT_EQ(rig.answerFor(alterCorr)->version, 2u);
+    EXPECT_EQ(rig.schemas().byName("t")->version, 2u);
+    EXPECT_EQ(rig.admin().pendingCount(), 0u);
 }
 
 TEST_F(CreateViewRegression, TransientViewOverTransientSourceIsAcceptedAndFoldsRegression) {

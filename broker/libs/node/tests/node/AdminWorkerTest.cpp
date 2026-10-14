@@ -1,178 +1,52 @@
-// AdminWorkerTest.cpp — Task 8a unit tests for the async DDL state machine.
+// AdminWorkerTest.cpp — the AdminWorker's DDL state machine over the catalog
+// write path (catalog history Task 9 port).
 //
-// The AdminWorker now SOLELY owns the __topic_schemas PartitionReplica (RULING-2)
-// and the DDL path is ASYNC: createTopic is a ring round-trip to the (simulated)
-// control thread.  The test harness plays the control thread by capturing
-// createTopic requests via deps.requestCreateTopic and feeding the reply back via
-// onCreateTopicReply, then driving doWork() to advance the replica HW (single-node
-// leader → HW advances immediately) so AWAITING_COMMIT resolves.
+// Every scenario of the pre-catalog suite whose behaviour is unchanged keeps its
+// name and assertions, now driven through CatalogDdlRig (a real __catalog leader
+// replica, the CatalogApplier and recording deps).  A scenario that only existed
+// for the deleted create-topic round-trip (the control thread's reply, its
+// `existed` / persistence bytes, kA2cTopicCommitted) is its catalog-state
+// equivalent, named the same with `Catalog` prefixed.
+#include "support/CatalogDdlRig.h"
 
-#include <gtest/gtest.h>
-#include "rune/node/AdminWorker.h"
 #include <rune/node/AdminChannels.h>
-#include <rune/protocol/RecordBatch.h>
-#include <rune/replication/PartitionReplica.h>
-#include <rune/replication/Types.h>
-#include <rune/storage/Log.h>
+#include <rune/node/AdminWorker.h>
+#include <rune/node/OneToOneByteRing.h>
+#include <rune/node/SchemaRegistry.h>
+
+#include <rune/catalog/CatalogEvent.h>
+#include <rune/codec/AlterOps.h>
 #include <rune/codec/Descriptor.h>
 #include <rune/codec/Serialize.h>
-#include <rune/codec/AlterOps.h>
+
+#include <gtest/gtest.h>
 
 #include <algorithm>
-#include <atomic>
-#include <chrono>
-#include <filesystem>
-#include <memory>
-#include <optional>
+#include <string>
+#include <vector>
 
 using namespace rune::node;
-using namespace rune::codec;
-using namespace rune::replication;
+using rune::node::test::CatalogDdlRig;
+using rune::codec::AlterOp;
+using rune::codec::AlterOpType;
+using rune::codec::CompatMode;
+using rune::codec::DescriptorBuilder;
+using rune::codec::PrimType;
+namespace rc = rune::catalog;
 
 namespace {
 
+// "characters": id (Int64 key), userId (Int64), name (String) — 3 fields.
 std::vector<uint8_t> charsBlob() {
-    return serialize(DescriptorBuilder("characters",1)
-        .add("id",PrimType::Int64).add("userId",PrimType::Int64,1,true)
-        .add("name",PrimType::String).build());
-}
-
-std::string uniqDir(const char* tag) {
-    static std::atomic<uint64_t> seq{0};
-    const auto ts = std::chrono::steady_clock::now().time_since_epoch().count();
-    auto p = std::filesystem::temp_directory_path().string() + "/rune_awt_" + tag + "_"
-           + std::to_string(seq.fetch_add(1)) + "_" + std::to_string(ts);
-    std::filesystem::create_directories(p);
-    return p;
-}
-
-class NullPartitionTransport : public PartitionTransport {
-public:
-    bool sendFetchRequest(const FetchRequestMsg&) override { return true; }
-    bool sendFetchResponse(NodeId, const FetchResponseMsg&) override { return true; }
-};
-
-// Harness: real single-node leader schema replica + AdminWorker + a simulated
-// control thread that answers createTopic requests.
-struct Harness {
-    std::string dir;
-    rune::storage::Log log;
-    std::unique_ptr<NullPartitionTransport> transport;
-    std::unique_ptr<PartitionReplica> replica;
-    SchemaRegistry reg;
-    std::unique_ptr<AdminWorker> w;
-
-    // Captured control-thread state.
-    int  creates = 0, pushes = 0;
-    int32_t nextTopicId = 0;
-    int32_t lastTopicId = -1;
-    uint16_t lastErr = 0xffff;
-    int getCount = 0;
-    int32_t lastGetPartitionCount = -1;   // Phase 2b C: respondGet's partitionCount
-    // ALTER response capture (Task 11).
-    int      alterResponses  = 0;
-    uint16_t lastAlterErr     = 0xffff;
-    uint16_t lastAlterVersion = 0;
-    int32_t  lastAlterTopicId = -1;
-    // Pending createTopic request (ticket, partitionCount) awaiting a reply.
-    int64_t pendingTicket = -1;
-    bool    failCreate = false;
-    uint8_t lastCreatePersistence = 0xff;
-    uint8_t replyPersistence = CreateTopicReplyMsg::kPersistenceNotReported;   // no-hang R1
-    // B10 fix round 1: deps.topicCommitted capture + the HW at the moment it fired.
-    std::vector<int32_t> committedIds;
-    int64_t hwAtCommitSignal = -1;
-
-    explicit Harness()
-        : dir(uniqDir("h")), log(dir) {
-        log.recover();
-        transport = std::make_unique<NullPartitionTransport>();
-        PartitionConfig cfg;
-        cfg.topicId = kSchemaTopicId; cfg.partitionId = 0; cfg.selfId = 1;
-        cfg.minIsr = 1; cfg.replicaLagMaxMs = 10'000; cfg.replicaLagMaxOffset = 10'000;
-        cfg.fetchIntervalNs = 1'000'000LL; cfg.isrCheckIntervalNs = 1'000'000LL;
-        cfg.maxFetchBytes = 1 << 20; cfg.cleanupPolicy = CleanupPolicy::Compact;
-        replica = std::make_unique<PartitionReplica>(
-            cfg, Role::Follower, /*epoch=*/0,
-            std::vector<NodeId>{1}, std::vector<NodeId>{1}, &log, transport.get());
-
-        AdminDeps d;
-        d.requestCreateTopic = [this](int64_t ticket, int32_t, const std::string&,
-                                      const std::string&, uint8_t, uint8_t persistence) -> bool {
-            ++creates; pendingTicket = ticket; lastCreatePersistence = persistence; return true;
-        };
-        d.pushValidators = [this](const RegistryEntry&, int32_t) { ++pushes; };
-        d.topicCommitted = [this](int32_t topicId) {
-            committedIds.push_back(topicId);
-            hwAtCommitSignal = replica->highWatermark();
-        };
-        d.respondDefine = [this](int64_t,int64_t,int32_t tid,uint16_t,uint16_t e) {
-            lastTopicId = tid; lastErr = e;
-        };
-        d.respondGet = [this](int64_t,int64_t,int32_t,uint16_t,int32_t parts,
-                              const std::vector<uint8_t>&,uint16_t e) {
-            ++getCount; lastErr = e; lastGetPartitionCount = parts;
-        };
-        d.respondAlter = [this](int64_t,int64_t,int32_t tid,uint16_t v,uint16_t e) {
-            ++alterResponses; lastAlterTopicId = tid; lastAlterVersion = v; lastAlterErr = e;
-        };
-        w = std::make_unique<AdminWorker>(reg, replica.get(), 1,
-                                          std::vector<int32_t>{1}, std::move(d));
-        // Promote to leader (control thread posts a role event; here direct).
-        w->onRole(AdminRoleMsg{/*leader=*/true, /*epoch=*/1, /*leaderId=*/1});
-    }
-
-    // Drive one full DDL to completion: submit → doWork (starts + requests) →
-    // control reply → doWork loop until the state machine settles.
-    void runDefine(int64_t session, int64_t corr, const std::string& name,
-                   const std::string& keyField, int32_t parts, bool validate,
-                   std::vector<uint8_t> blob, uint8_t persistence = 0) {
-        DefineTopicMsg m;
-        m.persistence = persistence;
-        m.session = session; m.corr = corr; m.name = name; m.keyField = keyField;
-        m.partitionCount = parts; m.validate = validate; m.blob = std::move(blob);
-        w->submitDefineTopic(std::move(m));
-        pendingTicket = -1;
-        int64_t nowNs = 0;
-        for (int i = 0; i < 50; ++i) {
-            nowNs += 1'000'000LL;
-            w->doWork(nowNs);
-            // Simulate the control thread answering a pending createTopic request.
-            if (pendingTicket >= 0) {
-                CreateTopicReplyMsg reply;
-                reply.ticket  = pendingTicket;
-                reply.topicId = failCreate ? -1 : nextTopicId++;
-                reply.persistence = replyPersistence;
-                pendingTicket = -1;
-                w->onCreateTopicReply(reply);
-            }
-            if (w->pendingCount() == 0) {
-                // keep ticking a few cycles so AWAITING_COMMIT HW gate resolves
-            }
-        }
-    }
-
-    // Drive one ALTER to completion.  ALTER skips the createTopic round-trip, so
-    // we just submit and pump doWork() until the single-node HW gate resolves.
-    void runAlter(int64_t session, int64_t corr, const std::string& name,
-                  uint16_t expectedVersion, std::vector<uint8_t> opsBlob) {
-        AlterTopicMsg m;
-        m.session = session; m.corr = corr; m.topicName = name;
-        m.expectedVersion = expectedVersion; m.opsBlob = std::move(opsBlob);
-        w->submitAlterTopic(std::move(m));
-        int64_t nowNs = 0;
-        for (int i = 0; i < 50; ++i) { nowNs += 1'000'000LL; w->doWork(nowNs); }
-    }
-};
-
-// Build an ALTER ops blob (shared rune-ql/broker wire format) from `ops`.
-std::vector<uint8_t> opsBlob(const std::vector<AlterOp>& ops) {
-    return encodeAlterOps(ops);
+    return rune::codec::serialize(DescriptorBuilder("characters", 1)
+                                      .add("id", PrimType::Int64, 1, /*isKey=*/true)
+                                      .add("userId", PrimType::Int64)
+                                      .add("name", PrimType::String)
+                                      .build());
 }
 
 AlterOp addOp(const std::string& name, PrimType t) {
-    AlterOp op{}; op.type = AlterOpType::Add; op.name = name; op.primType = t; op.fixedLen = 0;
-    return op;
+    AlterOp op{}; op.type = AlterOpType::Add; op.name = name; op.primType = t; return op;
 }
 AlterOp dropOp(const std::string& name) {
     AlterOp op{}; op.type = AlterOpType::Drop; op.name = name; return op;
@@ -181,525 +55,435 @@ AlterOp setCompatOp(CompatMode m) {
     AlterOp op{}; op.type = AlterOpType::SetCompatibility; op.mode = m; return op;
 }
 
+/// A DefineTopic as the pre-catalog suite sent it (the "characters" descriptor).
+CatalogDdlRig::Answer define(CatalogDdlRig& rig, const std::string& name, int32_t partitions, bool validate,
+                             std::vector<uint8_t> blob, uint8_t persistence = 0, const std::string& keyField = "userId") {
+    DefineTopicMsg m;
+    m.session = rig.sessionId(); m.corr = rig.nextCorr(); m.name = name; m.partitionCount = partitions;
+    m.keyField = keyField; m.validate = validate; m.blob = std::move(blob); m.persistence = persistence;
+    m.meta.sessionId = rig.sessionId();
+    m.meta.requestId = rig.freshRequestId();
+    return rig.submitRaw(DdlRequest{std::move(m)});
+}
+
+std::size_t countEffects(const CatalogDdlRig& rig, const std::string& prefix) {
+    return static_cast<std::size_t>(std::count_if(rig.effects().begin(), rig.effects().end(),
+                                                  [&](const std::string& e) { return e.rfind(prefix, 0) == 0; }));
+}
+
 } // namespace
 
 TEST(AdminWorker, DefineTopicHappyPath) {
-    Harness h;
-    h.runDefine(1,2,"characters","userId",16,true,charsBlob());
-    EXPECT_EQ(h.creates,1);
-    EXPECT_EQ(h.pushes,1);                       // validate=true → validators pushed
-    EXPECT_EQ(h.lastErr,0);                       // OK
-    EXPECT_EQ(h.lastTopicId, 0);                  // first sequential id
-    ASSERT_NE(h.reg.byName("characters"), nullptr);
+    CatalogDdlRig rig("aw_happy", 1);
+    rig.becomeServingLeader();
+    const auto a = define(rig, "characters", 16, /*validate=*/true, charsBlob());
+    EXPECT_EQ(a.code, 0);
+    EXPECT_EQ(a.topicId, 0) << "the first catalog id";
+    ASSERT_NE(rig.schemas().byName("characters"), nullptr);
+    EXPECT_EQ(countEffects(rig, "topicApplied:0"), 1u);
+    EXPECT_EQ(countEffects(rig, "schemaChanged:0@v1"), 1u) << "a typed topic's validators follow it";
 }
 
 TEST(AdminWorker, RejectsMalformedDescriptor) {
-    Harness h;
-    h.runDefine(1,2,"bad","",1,false,{0,1,2});    // not a valid blob
-    EXPECT_EQ(h.creates,0);                        // never reached createTopic
-    EXPECT_EQ(h.lastErr,23);                       // InvalidSchema
+    CatalogDdlRig rig("aw_malformed", 1);
+    rig.becomeServingLeader();
+    EXPECT_EQ(define(rig, "bad", 1, false, {0, 1, 2}).code, 23);   // InvalidSchema
+    EXPECT_TRUE(rig.recordedLog().empty()) << "nothing appended";
 }
 
 TEST(AdminWorker, DuplicateNameReturnsTopicExists) {
-    Harness h;
-    h.runDefine(1,2,"characters","userId",16,false,charsBlob());
-    ASSERT_EQ(h.lastErr,0);
-    h.lastErr = 0xffff;
-    h.runDefine(1,3,"characters","userId",16,false,charsBlob());
-    EXPECT_EQ(h.lastErr,25);                       // TopicExists
-    EXPECT_EQ(h.creates,1);                         // no second create
-}
-
-TEST(AdminWorker, NoValidatorPushWhenValidateOff) {
-    Harness h;
-    h.runDefine(1,2,"characters","userId",16,false,charsBlob());
-    EXPECT_EQ(h.pushes,0);
-    EXPECT_EQ(h.lastErr,0);
+    CatalogDdlRig rig("aw_dup", 1);
+    rig.becomeServingLeader();
+    ASSERT_EQ(define(rig, "characters", 16, false, charsBlob()).code, 0);
+    const auto again = define(rig, "characters", 16, false, charsBlob());
+    EXPECT_EQ(again.code, 25);   // TopicExists
+    EXPECT_EQ(again.topicId, 0);
+    EXPECT_EQ(again.version, 1u);
+    EXPECT_EQ(rig.recordedLog().size(), 1u) << "no second event";
 }
 
 TEST(AdminWorker, GetSchemaUnknownTopic) {
-    Harness h;
-    h.w->submitGetSchema(GetSchemaMsg{1,2,"nope"});
-    EXPECT_EQ(h.lastErr,7);                         // UnknownTopic
+    CatalogDdlRig rig("aw_get_unknown", 1);
+    EXPECT_EQ(rig.getSchema("nope").code, 7);   // UnknownTopic
 }
 
 TEST(AdminWorker, GetSchemaKnownTopic) {
-    Harness h;
-    h.runDefine(1,2,"characters","userId",16,false,charsBlob());
-    ASSERT_EQ(h.lastErr,0);
-    h.lastErr = 0xffff;
-    h.w->submitGetSchema(GetSchemaMsg{1,2,"characters"});
-    EXPECT_EQ(h.lastErr,0);                          // OK
+    CatalogDdlRig rig("aw_get_known", 1);
+    rig.becomeServingLeader();
+    ASSERT_EQ(define(rig, "characters", 16, false, charsBlob()).code, 0);
+    EXPECT_EQ(rig.getSchema("characters").code, 0);
 }
 
-TEST(AdminWorker, CreateTopicFailureRespondsInternal) {
-    Harness h;
-    h.failCreate = true;
-    h.runDefine(1,2,"characters","userId",16,false,charsBlob());
-    EXPECT_EQ(h.lastErr,6);                          // Internal
-    EXPECT_EQ(h.reg.byName("characters"), nullptr);  // no registry update
+// The deleted CreateTopicFailureRespondsInternal (a failed control-thread create):
+// the catalog's Internal is a HALTED applier — the DDL is never answered OK.
+TEST(AdminWorker, CatalogHaltedApplyRespondsInternal) {
+    CatalogDdlRig rig("aw_halted", 1);
+    rig.becomeServingLeader();
+    rig.admin().applierForTest().tamperNextFingerprintForTest();
+    const auto a = define(rig, "characters", 16, false, charsBlob());
+    EXPECT_EQ(a.code, 6);   // Internal
+    EXPECT_TRUE(rig.admin().applier().halted());
+    EXPECT_EQ(rig.schemas().byName("characters"), nullptr) << "no projection of an unapplied event";
+    EXPECT_EQ(define(rig, "orders", 1, false, charsBlob()).code, 6) << "a halted broker accepts no catalog change";
 }
 
-// Regression (RULING-2 D): appendDurable is committed only when the replica HW
-// covers the appended offset — never on base>=0 alone.  On a single-node leader
-// (minIsr=1) HW advances on doWork; the happy path proves the HW gate resolves.
+// RULING-2 D: an answer only once the replica HW covers the appended event.
 TEST(AdminWorkerRegression, CommitGatedOnHighWatermark) {
-    Harness h;
-    h.runDefine(1,2,"characters","userId",16,false,charsBlob());
-    EXPECT_EQ(h.lastErr,0);
-    EXPECT_GE(h.log.logEndOffset(), 1LL);
-    EXPECT_GE(h.replica->highWatermark(), 1LL);
+    CatalogDdlRig rig("aw_hw", 3);
+    rig.becomeServingLeader(/*isr=*/{1, 2});   // follower 2 silent
+    DefineTopicMsg m;
+    m.session = rig.sessionId(); m.corr = rig.nextCorr(); m.name = "characters"; m.partitionCount = 1;
+    m.blob = charsBlob(); m.keyField = "userId";
+    m.meta.requestId = rig.freshRequestId();
+    const int64_t corr = rig.submitRawNoWait(DdlRequest{std::move(m)});
+    for (int i = 0; i < 64; ++i) rig.pump();
+    EXPECT_FALSE(rig.answerFor(corr).has_value()) << "answered before the HW covered the event";
+    EXPECT_EQ(rig.replica().highWatermark(), 0);
+    rig.resumeFollower(2);
+    for (int i = 0; i < 64 && !rig.answerFor(corr); ++i) rig.pump();
+    ASSERT_TRUE(rig.answerFor(corr).has_value());
+    EXPECT_EQ(rig.answerFor(corr)->code, 0);
+    EXPECT_GE(rig.replica().highWatermark(), 1);
 }
 
-// B10 / D4 fix round 1 (I1): the admin thread signals "record committed" for a
-// DefineTopic exactly once, only AFTER the HW covers the record (the control
-// thread then rewrites the dir marker pending -> committed).  A refused, failed,
-// duplicate or ALTER DDL never signals.
-TEST(AdminWorkerRegression, TopicCommittedSignalledOnceAfterTheRecordCommitsRegression) {
-    Harness h;
-    h.runDefine(1,2,"characters","userId",16,false,charsBlob());
-    ASSERT_EQ(h.lastErr,0);
-    EXPECT_EQ(h.committedIds, (std::vector<int32_t>{0}));
-    EXPECT_GE(h.hwAtCommitSignal, h.log.logEndOffset()) << "signalled only once the HW covers the record";
-    h.runDefine(1,3,"characters","userId",16,false,charsBlob());   // TopicExists
-    h.runAlter(1,4,"characters",1,opsBlob({addOp("level", PrimType::Int32)}));
-    EXPECT_EQ(h.committedIds, (std::vector<int32_t>{0})) << "duplicate / ALTER never re-signal";
+// B10 / D4 → the catalog: a topic is built (topicApplied) exactly once, after its
+// event committed and applied; a refused / duplicate / ALTER DDL builds nothing.
+TEST(AdminWorkerRegression, CatalogTopicAppliedPostedOnceAfterTheEventCommitsRegression) {
+    CatalogDdlRig rig("aw_applied_once", 1);
+    rig.becomeServingLeader();
+    ASSERT_EQ(define(rig, "characters", 16, false, charsBlob()).code, 0);
+    EXPECT_EQ(countEffects(rig, "topicApplied:"), 1u);
+    (void)define(rig, "characters", 16, false, charsBlob());   // TopicExists
+    ASSERT_EQ(rig.alter("characters", {addOp("level", PrimType::Int32)}).code, 0);
+    EXPECT_EQ(countEffects(rig, "topicApplied:"), 1u) << "duplicate / ALTER never re-build the topic";
 }
 
-TEST(AdminWorkerRegression, NoTopicCommittedSignalWhenTheDdlNeverCommitsRegression) {
+TEST(AdminWorkerRegression, CatalogNoTopicAppliedWhenTheDdlIsRefusedRegression) {
     {
-        Harness h;
-        h.failCreate = true;
-        h.runDefine(1,2,"characters","userId",16,false,charsBlob());
-        EXPECT_EQ(h.lastErr,6);
-        EXPECT_TRUE(h.committedIds.empty()) << "a failed create is never marked committed";
+        CatalogDdlRig rig("aw_refused_follower", 3);   // never leads
+        EXPECT_EQ(define(rig, "characters", 16, false, charsBlob()).code, 2);
+        EXPECT_TRUE(rig.effects().empty()) << "a follower builds nothing";
     }
     {
-        Harness h;
-        h.w->onRole(AdminRoleMsg{/*leader=*/false, /*epoch=*/2, /*leaderId=*/2});
-        h.runDefine(1,2,"characters","userId",16,false,charsBlob());
-        EXPECT_TRUE(h.committedIds.empty()) << "a follower commits nothing";
-    }
-    {
-        Harness h;
-        h.runDefine(1,2,"bad","",1,false,{0,1,2});   // InvalidSchema
-        EXPECT_TRUE(h.committedIds.empty());
+        CatalogDdlRig rig("aw_refused_bad", 1);
+        rig.becomeServingLeader();
+        EXPECT_EQ(define(rig, "bad", 1, false, {0, 1, 2}).code, 23);
+        EXPECT_TRUE(rig.effects().empty());
     }
 }
 
-// The kA2cTopicCommitted frame on a real SPSC ring: [topicId:i32]; a short frame
-// decodes to -1 (the control thread ignores it).
-TEST(AdminWorkerRegression, TopicCommittedRingFrameRoundTripsRegression) {
-    OneToOneByteRing ring(kAdminToControlRingBytes);
-    ASSERT_TRUE(encodeTopicCommitted(ring, 42));
-    int32_t gotType = 0, gotId = -2;
-    const int n = ring.drain([&](int32_t tid, aeron::concurrent::AtomicBuffer& b,
-                                 aeron::util::index_t off, aeron::util::index_t len) {
-        gotType = tid;
-        gotId = decodeTopicCommitted(reinterpret_cast<const uint8_t*>(b.buffer() + off),
-                                     static_cast<std::size_t>(len));
-    }, 4);
-    EXPECT_EQ(n, 1);
-    EXPECT_EQ(gotType, kA2cTopicCommitted);
-    EXPECT_EQ(gotId, 42);
-    const uint8_t shortFrame[3] = {1, 2, 3};
-    EXPECT_EQ(decodeTopicCommitted(shortFrame, sizeof shortFrame), -1);
-}
-
-// Regression (RULING-2 D): DDL is leader-only.  A follower AdminWorker must
-// reject DefineTopic with Internal rather than asserting.
+// RULING-2 D, catalog form: DDL is leader-only — a follower answers the
+// retriable NotLeader (spec §5.2), never Internal, and appends nothing.
 TEST(AdminWorkerRegression, FollowerRejectsDefine) {
-    Harness h;
-    h.w->onRole(AdminRoleMsg{/*leader=*/false, /*epoch=*/2, /*leaderId=*/2});
-    h.runDefine(1,2,"characters","userId",16,false,charsBlob());
-    EXPECT_EQ(h.lastErr,6);                          // Internal (not leader)
-    EXPECT_EQ(h.creates,0);
+    CatalogDdlRig rig("aw_follower", 3);
+    rig.becomeFollower(/*leaderId=*/2);
+    EXPECT_EQ(define(rig, "characters", 16, false, charsBlob()).code, 2);
+    EXPECT_TRUE(rig.recordedLog().empty());
 }
 
-// Regression (Task 10): the create path must route version/nextTag through a
-// single contiguous-version helper rather than a hardcoded literal. A freshly
-// defined topic is still version 1 (no behavior change), and nextTag starts
-// past every field the schema already declares (fieldCount) so Task 11's
-// ALTER allocates a fresh tag instead of colliding with an existing one.
+// Task 10: a fresh topic is schema version 1 and nextTag starts past every field
+// it declares, so the first ALTER ADD allocates a fresh tag.
 TEST(AdminWorkerRegression, DefineTopicVersionOneAndNextTagEqualsFieldCount) {
-    Harness h;
-    h.runDefine(1,2,"characters","userId",16,false,charsBlob());
-    ASSERT_EQ(h.lastErr,0);
-    EXPECT_EQ(h.lastTopicId, 0);
-    const RegistryEntry* e = h.reg.byName("characters");
+    CatalogDdlRig rig("aw_nexttag", 1);
+    rig.becomeServingLeader();
+    const auto a = define(rig, "characters", 16, false, charsBlob());
+    ASSERT_EQ(a.code, 0);
+    EXPECT_EQ(a.topicId, 0);
+    const RegistryEntry* e = rig.schemas().byName("characters");
     ASSERT_NE(e, nullptr);
     EXPECT_EQ(e->version, 1);
-    // charsBlob(): id, userId, name == 3 fields.
-    EXPECT_EQ(h.reg.nextTagFor(e->topicId), 3);
+    EXPECT_EQ(rig.schemas().nextTagFor(e->topicId), 3);
 }
 
 // ── Task 11: ALTER TOPIC ─────────────────────────────────────────────────────
 
-// Happy path: ADD a column bumps the version contiguously (v1 → v2) and the new
-// field is allocated a fresh durable tag == the pre-ALTER field count (3).
 TEST(AdminWorker, AlterAddColumnBumpsVersionAndAllocatesTag) {
-    Harness h;
-    h.runDefine(1,2,"characters","userId",16,false,charsBlob());
-    ASSERT_EQ(h.lastErr,0);
-    const int32_t tid = h.reg.byName("characters")->topicId;
-
-    h.runAlter(10,11,"characters",/*expected=*/0, opsBlob({addOp("score",PrimType::Int64)}));
-    EXPECT_EQ(h.lastAlterErr, 0);
-    EXPECT_EQ(h.lastAlterVersion, 2);
-
-    const RegistryEntry* e = h.reg.byName("characters");
+    CatalogDdlRig rig("aw_alter_add", 1);
+    rig.becomeServingLeader();
+    ASSERT_EQ(define(rig, "characters", 16, false, charsBlob()).code, 0);
+    const int32_t tid = rig.schemas().byName("characters")->topicId;
+    const auto a = rig.alter("characters", {addOp("score", PrimType::Int64)});
+    EXPECT_EQ(a.code, 0);
+    EXPECT_EQ(a.version, 2u);
+    const RegistryEntry* e = rig.schemas().byName("characters");
     ASSERT_NE(e, nullptr);
     EXPECT_EQ(e->version, 2);
-    // nextTag advanced past the newly allocated tag (3 → 4).
-    EXPECT_EQ(h.reg.nextTagFor(tid), 4);
-    // The new field is live at v2 and carries durable tag 3 (== old fieldCount).
+    EXPECT_EQ(rig.schemas().nextTagFor(tid), 4);
     const auto& fields = e->descriptor.fields;
-    auto it = std::find_if(fields.begin(), fields.end(),
-                           [](const auto& f){ return f.name == "score"; });
+    auto it = std::find_if(fields.begin(), fields.end(), [](const auto& f) { return f.name == "score"; });
     ASSERT_NE(it, fields.end());
     EXPECT_EQ(it->id, 3);
+    // F20: the event stores the op RESOLVED to its durable tag.
+    const auto log = rig.recordedLog();
+    ASSERT_EQ(log.back().event.kind, rc::EventKind::AlterSchema);
+    const auto& ops = std::get<rc::AlterSchemaOps>(log.back().event.ops).ops;
+    ASSERT_EQ(ops.size(), 1u);
+    EXPECT_EQ(ops[0].tag, 3);
 }
 
-// Regression (compat gate): DROP under FORWARD compatibility is rejected with
-// SchemaIncompatible and the version is NOT bumped.  Also pins that the compat
-// mode set by a prior ALTER persists into the next ALTER's gate.
 TEST(AdminWorkerRegression, AlterDropUnderForwardRejected) {
-    Harness h;
-    h.runDefine(1,2,"characters","userId",16,false,charsBlob());
-    ASSERT_EQ(h.lastErr,0);
-
-    // ALTER #1: switch to FORWARD compatibility → v2.
-    h.runAlter(10,11,"characters",0, opsBlob({setCompatOp(CompatMode::Forward)}));
-    ASSERT_EQ(h.lastAlterErr, 0);
-    ASSERT_EQ(h.reg.byName("characters")->version, 2);
-
-    // ALTER #2: DROP a live field under the now-persisted FORWARD mode → reject.
-    h.runAlter(12,13,"characters",0, opsBlob({dropOp("name")}));
-    EXPECT_EQ(h.lastAlterErr, 30);                       // SchemaIncompatible
-    EXPECT_EQ(h.reg.byName("characters")->version, 2);   // version unchanged
+    CatalogDdlRig rig("aw_alter_fwd", 1);
+    rig.becomeServingLeader();
+    ASSERT_EQ(define(rig, "characters", 16, false, charsBlob()).code, 0);
+    ASSERT_EQ(rig.alter("characters", {setCompatOp(CompatMode::Forward)}).code, 0);
+    ASSERT_EQ(rig.schemas().byName("characters")->version, 2);
+    EXPECT_EQ(rig.recordedLog().back().event.kind, rc::EventKind::SetCompatibility) << "ruling 3";
+    EXPECT_EQ(rig.alter("characters", {dropOp("name")}).code, 30);   // SchemaIncompatible
+    EXPECT_EQ(rig.schemas().byName("characters")->version, 2);
 }
 
-// Regression (optimistic CAS): a stale expectedVersion must be rejected with
-// SchemaConflict and must NOT clobber the newer committed version (no lost update).
 TEST(AdminWorkerRegression, AlterWithStaleExpectedVersionConflicts) {
-    Harness h;
-    h.runDefine(1,2,"characters","userId",16,false,charsBlob());
-    ASSERT_EQ(h.lastErr,0);
-
-    // Unconditional ALTER → v2.
-    h.runAlter(10,11,"characters",0, opsBlob({addOp("score",PrimType::Int64)}));
-    ASSERT_EQ(h.lastAlterErr, 0);
-    ASSERT_EQ(h.reg.byName("characters")->version, 2);
-
-    // Now a client that still thinks the topic is v1 tries to ALTER with
-    // expectedVersion=1 → stale → SchemaConflict, registry stays v2.
-    h.runAlter(12,13,"characters",/*expected=*/1, opsBlob({addOp("extra",PrimType::Int64)}));
-    EXPECT_EQ(h.lastAlterErr, 31);                       // SchemaConflict
-    EXPECT_EQ(h.lastAlterVersion, 2);                    // response carries current version
-    EXPECT_EQ(h.reg.byName("characters")->version, 2);   // no lost update
+    CatalogDdlRig rig("aw_alter_cas", 1);
+    rig.becomeServingLeader();
+    ASSERT_EQ(define(rig, "characters", 16, false, charsBlob()).code, 0);
+    ASSERT_EQ(rig.alter("characters", {addOp("score", PrimType::Int64)}).code, 0);
+    const auto stale = rig.alter("characters", {addOp("extra", PrimType::Int64)}, {}, /*expectedVersion=*/1);
+    EXPECT_EQ(stale.code, 31);   // SchemaConflict
+    EXPECT_EQ(stale.version, 2u);
+    EXPECT_EQ(rig.schemas().byName("characters")->version, 2);
 }
 
-// Regression (atomicity): a multi-op ALTER where a later op fails rejects the
-// WHOLE statement — nothing is committed and the version is not bumped.
 TEST(AdminWorkerRegression, MultiOpAlterIsAtomicOnFailure) {
-    Harness h;
-    h.runDefine(1,2,"characters","userId",16,false,charsBlob());
-    ASSERT_EQ(h.lastErr,0);
-    const int32_t tid = h.reg.byName("characters")->topicId;
-
-    // ADD (valid) then DROP a field that does not exist → applyOps fails on the
-    // DROP, so the ADD is rolled back too (atomic).
-    h.runAlter(10,11,"characters",0,
-               opsBlob({addOp("score",PrimType::Int64), dropOp("ghost")}));
-    EXPECT_EQ(h.lastAlterErr, 23);                       // InvalidSchema
-    EXPECT_EQ(h.reg.byName("characters")->version, 1);   // version unchanged
-    EXPECT_EQ(h.reg.nextTagFor(tid), 3);                 // no tag burned
+    CatalogDdlRig rig("aw_alter_atomic", 1);
+    rig.becomeServingLeader();
+    ASSERT_EQ(define(rig, "characters", 16, false, charsBlob()).code, 0);
+    const int32_t tid = rig.schemas().byName("characters")->topicId;
+    EXPECT_EQ(rig.alter("characters", {addOp("score", PrimType::Int64), dropOp("ghost")}).code, 23);
+    EXPECT_EQ(rig.schemas().byName("characters")->version, 1);
+    EXPECT_EQ(rig.schemas().nextTagFor(tid), 3);
+    EXPECT_EQ(rig.recordedLog().size(), 1u);
 }
 
-// Task 12 regression: AdminWorker::advance_'s ALTER-commit seam must push the
-// freshly-committed version's validator (validate=true) — not just DefineTopic
-// — so worker validators_ stays in sync with every committed ALTER.
+// Task 12: every committed ALTER fans out its version's schema (the validators).
 TEST(AdminWorkerRegression, AlterPushesValidatorForNewVersionWhenValidateOnRegression) {
-    Harness h;
-    h.runDefine(1,2,"characters","userId",16,/*validate=*/true,charsBlob());
-    ASSERT_EQ(h.lastErr,0);
-    EXPECT_EQ(h.pushes, 1);                               // CREATE pushed v1
-
-    h.runAlter(10,11,"characters",0, opsBlob({addOp("score",PrimType::Int64)}));
-    EXPECT_EQ(h.lastAlterErr, 0);
-    EXPECT_EQ(h.lastAlterVersion, 2);
-    EXPECT_EQ(h.pushes, 2)
-        << "ALTER must ALSO push a validator for the newly committed version";
+    CatalogDdlRig rig("aw_alter_validator", 1);
+    rig.becomeServingLeader();
+    ASSERT_EQ(define(rig, "characters", 16, /*validate=*/true, charsBlob()).code, 0);
+    EXPECT_EQ(countEffects(rig, "schemaChanged:0@v1"), 1u);
+    const auto a = rig.alter("characters", {addOp("score", PrimType::Int64)});
+    EXPECT_EQ(a.code, 0);
+    EXPECT_EQ(a.version, 2u);
+    EXPECT_EQ(countEffects(rig, "schemaChanged:0@v2"), 1u) << "the newly committed version's validator";
 }
 
-// Task 12 regression: an ALTER on a validate=false topic must NOT push a
-// validator (no validator was ever installed for v1 either — nothing to
-// refresh).
+// Task 12: the production sink pushes a validator frame only for a validate=true
+// topic (AdminWorkerAgent::postCatalogValidator_ — CatalogApplierTest pins the
+// frames); the schema projection still moves.
 TEST(AdminWorkerRegression, AlterDoesNotPushValidatorWhenValidateOffRegression) {
-    Harness h;
-    h.runDefine(1,2,"characters","userId",16,/*validate=*/false,charsBlob());
-    ASSERT_EQ(h.lastErr,0);
-    EXPECT_EQ(h.pushes, 0);
-
-    h.runAlter(10,11,"characters",0, opsBlob({addOp("score",PrimType::Int64)}));
-    EXPECT_EQ(h.lastAlterErr, 0);
-    EXPECT_EQ(h.pushes, 0);
+    CatalogDdlRig rig("aw_alter_novalidator", 1);
+    rig.becomeServingLeader();
+    ASSERT_EQ(define(rig, "characters", 16, /*validate=*/false, charsBlob()).code, 0);
+    ASSERT_EQ(rig.alter("characters", {addOp("score", PrimType::Int64)}).code, 0);
+    const auto* t = rig.admin().applier().state().topicByName("characters");
+    ASSERT_NE(t, nullptr);
+    ASSERT_TRUE(t->schema.has_value());
+    EXPECT_FALSE(t->schema->validate) << "validate=false is recorded: the sink posts no validator frame";
 }
 
-// Regression (Phase 2b Part C): GetTopicSchema must report the topic's
-// partition count — the typed client routes records by key over it.  Before
-// 2b the response carried none and TypedTopic sent every record to partition 0.
 TEST(AdminWorkerRegression, GetSchemaReportsRegistryPartitionCount) {
-    Harness h;
-    h.runDefine(1,2,"characters","userId",8,false,charsBlob());
-    ASSERT_EQ(h.lastErr,0);
-    h.lastErr = 0xffff;
-    h.w->submitGetSchema(GetSchemaMsg{1,3,"characters"});
-    EXPECT_EQ(h.lastErr,0);
-    EXPECT_EQ(h.lastGetPartitionCount, 8);
+    CatalogDdlRig rig("aw_get_parts", 1);
+    rig.becomeServingLeader();
+    ASSERT_EQ(define(rig, "characters", 8, false, charsBlob()).code, 0);
+    const auto g = rig.getSchema("characters");
+    EXPECT_EQ(g.code, 0);
+    EXPECT_EQ(g.partitionCount, 8);
 }
 
-// Regression (Phase 2b Part C): a client bound to a HISTORICAL version
-// (fingerprint-selected GetTopicSchema) routes over the same partitions —
-// partition count is a property of the topic, not of a schema version.
 TEST(AdminWorkerRegression, GetSchemaByFingerprintReportsPartitionCount) {
-    Harness h;
-    h.runDefine(1,2,"characters","userId",8,false,charsBlob());
-    ASSERT_EQ(h.lastErr,0);
-    const uint64_t v1Fp = h.reg.byName("characters")->fingerprint;
-    h.runAlter(10,11,"characters",/*expected=*/0, opsBlob({addOp("score",PrimType::Int64)}));
-    ASSERT_EQ(h.lastAlterErr, 0);
-    ASSERT_EQ(h.lastAlterVersion, 2);
-
-    h.lastErr = 0xffff;
-    h.lastGetPartitionCount = -1;
-    h.w->submitGetSchema(GetSchemaMsg{1,4,"characters", v1Fp});
-    EXPECT_EQ(h.lastErr,0) << "v1's fingerprint must resolve to the v1 descriptor";
-    EXPECT_EQ(h.lastGetPartitionCount, 8);
+    CatalogDdlRig rig("aw_get_fp", 1);
+    rig.becomeServingLeader();
+    ASSERT_EQ(define(rig, "characters", 8, false, charsBlob()).code, 0);
+    const uint64_t v1Fp = rig.schemas().byName("characters")->fingerprint;
+    ASSERT_EQ(rig.alter("characters", {addOp("score", PrimType::Int64)}).code, 0);
+    const auto g = rig.getSchema("characters", v1Fp);
+    EXPECT_EQ(g.code, 0) << "v1's fingerprint must resolve to the v1 descriptor";
+    EXPECT_EQ(g.version, 1);
+    EXPECT_EQ(g.partitionCount, 8);
 }
 
-// Regression (Phase 2b Part C): an error response reports 0 ("not reported"),
-// never a stale or default-1 count.
 TEST(AdminWorkerRegression, GetSchemaUnknownTopicReportsZeroPartitions) {
-    Harness h;
-    h.w->submitGetSchema(GetSchemaMsg{1,2,"nope"});
-    EXPECT_EQ(h.lastErr,7);                         // UnknownTopic
-    EXPECT_EQ(h.lastGetPartitionCount, 0);
+    CatalogDdlRig rig("aw_get_zero", 1);
+    const auto g = rig.getSchema("nope");
+    EXPECT_EQ(g.code, 7);
+    EXPECT_EQ(g.partitionCount, 0);
 }
 
-// Regression (Phase 2b C real-broker e2e): a topic's name is independent of its
-// descriptor's name.  DefineTopic("typed_route", <"characters" descriptor>) then
-// GetTopicSchema("typed_route") returned UnknownTopic (7) because the registry
-// indexed the descriptor name — the e2e's typed_route leg failed with exit 41.
 TEST(AdminWorkerRegression, GetSchemaByTopicNameWhenItDiffersFromDescriptorName) {
-    Harness h;
-    h.runDefine(1,2,"typed_route","userId",8,false,charsBlob());
-    ASSERT_EQ(h.lastErr,0);
-    h.lastErr = 0xffff;
-    h.lastGetPartitionCount = -1;
-    h.w->submitGetSchema(GetSchemaMsg{1,3,"typed_route"});
-    EXPECT_EQ(h.lastErr,0) << "GetTopicSchema must resolve the DEFINED topic name";
-    EXPECT_EQ(h.lastGetPartitionCount, 8);
-
-    h.lastErr = 0xffff;
-    h.w->submitGetSchema(GetSchemaMsg{1,4,"characters"});
-    EXPECT_EQ(h.lastErr,7) << "the descriptor name was never defined as a topic";
+    CatalogDdlRig rig("aw_get_name", 1);
+    rig.becomeServingLeader();
+    ASSERT_EQ(define(rig, "typed_route", 8, false, charsBlob()).code, 0);
+    const auto g = rig.getSchema("typed_route");
+    EXPECT_EQ(g.code, 0) << "GetTopicSchema must resolve the DEFINED topic name";
+    EXPECT_EQ(g.partitionCount, 8);
+    EXPECT_EQ(rig.getSchema("characters").code, 7) << "the descriptor name was never defined as a topic";
 }
 
-// Regression: two topics may share one descriptor; the second define is not a
-// TopicExists, and each name resolves to its own topic.  Re-defining an
-// existing topic NAME still reports TopicExists (25).
 TEST(AdminWorkerRegression, TwoTopicsSharingADescriptorAreDistinctTopics) {
-    Harness h;
-    h.runDefine(1,2,"chars_a","userId",1,false,charsBlob());
-    ASSERT_EQ(h.lastErr,0);
-    const int32_t idA = h.lastTopicId;
-    h.runDefine(1,3,"chars_b","userId",4,false,charsBlob());
-    ASSERT_EQ(h.lastErr,0) << "a second topic with the same descriptor is not TopicExists";
-    const int32_t idB = h.lastTopicId;
-    EXPECT_NE(idA, idB);
-    ASSERT_NE(h.reg.byName("chars_a"), nullptr);
-    ASSERT_NE(h.reg.byName("chars_b"), nullptr);
-    EXPECT_EQ(h.reg.byName("chars_a")->topicId, idA);
-    EXPECT_EQ(h.reg.byName("chars_b")->topicId, idB);
-    EXPECT_EQ(h.reg.byName("chars_b")->partitionCount, 4);
-
-    h.runDefine(1,4,"chars_a","userId",1,false,charsBlob());
-    EXPECT_EQ(h.lastErr,25) << "re-defining an existing topic name is TopicExists";
+    CatalogDdlRig rig("aw_shared_desc", 1);
+    rig.becomeServingLeader();
+    const auto a = define(rig, "chars_a", 1, false, charsBlob());
+    ASSERT_EQ(a.code, 0);
+    const auto b = define(rig, "chars_b", 4, false, charsBlob());
+    ASSERT_EQ(b.code, 0) << "a second topic with the same descriptor is not TopicExists";
+    EXPECT_NE(a.topicId, b.topicId);
+    EXPECT_EQ(rig.schemas().byName("chars_a")->topicId, a.topicId);
+    EXPECT_EQ(rig.schemas().byName("chars_b")->topicId, b.topicId);
+    EXPECT_EQ(rig.schemas().byName("chars_b")->partitionCount, 4);
+    EXPECT_EQ(define(rig, "chars_a", 1, false, charsBlob()).code, 25);
 }
 
-// Regression: ALTER resolves the topic by its defined name too.
 TEST(AdminWorkerRegression, AlterByTopicNameWhenItDiffersFromDescriptorName) {
-    Harness h;
-    h.runDefine(1,2,"typed_route","userId",8,false,charsBlob());
-    ASSERT_EQ(h.lastErr,0);
-    h.runAlter(10,11,"typed_route",/*expected=*/0, opsBlob({addOp("score",PrimType::Int64)}));
-    EXPECT_EQ(h.lastAlterErr, 0);
-    EXPECT_EQ(h.lastAlterVersion, 2);
-    ASSERT_NE(h.reg.byName("typed_route"), nullptr);
-    EXPECT_EQ(h.reg.byName("typed_route")->version, 2);
-    EXPECT_EQ(h.reg.byName("typed_route")->partitionCount, 8);
+    CatalogDdlRig rig("aw_alter_name", 1);
+    rig.becomeServingLeader();
+    ASSERT_EQ(define(rig, "typed_route", 8, false, charsBlob()).code, 0);
+    const auto a = rig.alter("typed_route", {addOp("score", PrimType::Int64)});
+    EXPECT_EQ(a.code, 0);
+    EXPECT_EQ(a.version, 2u);
+    EXPECT_EQ(rig.schemas().byName("typed_route")->version, 2);
+    EXPECT_EQ(rig.schemas().byName("typed_route")->partitionCount, 8);
 }
 
 // ---------------------------------------------------------------------------
 // Phase 2b E: transient topics through the DDL state machine.
 // ---------------------------------------------------------------------------
 TEST(AdminWorkerRegression, TransientDefineRequestsTransientTopicAndRecordsMode) {
-    Harness h;
-    h.runDefine(1, 2, "characters", "userId", 4, false, charsBlob(), /*persistence=*/1);
-    ASSERT_EQ(h.lastErr, 0);
-    EXPECT_EQ(h.lastCreatePersistence, 1u) << "control thread must be asked for a transient topic";
-    const RegistryEntry* e = h.reg.byName("characters");
+    CatalogDdlRig rig("aw_transient", 1);
+    rig.becomeServingLeader();
+    ASSERT_EQ(define(rig, "characters", 4, false, charsBlob(), /*persistence=*/1).code, 0);
+    const RegistryEntry* e = rig.schemas().byName("characters");
     ASSERT_NE(e, nullptr);
     EXPECT_EQ(e->persistence, PersistenceMode::Transient);
-
-    // The DURABLE record (what boot recovery reads) carries the mode too.
-    const std::vector<uint8_t> raw = h.log.read(0, 1 << 20);
-    ASSERT_FALSE(raw.empty());
-    rune::protocol::RecordBatchReader rd(raw.data(), raw.size());
-    ASSERT_TRUE(rd.ensureValid());
-    std::optional<TopicSchema> rec;
-    rd.forEachRecord([&](std::string_view, std::string_view v, int64_t, int64_t) {
-        rec = TopicSchema::deserialize(std::span<const uint8_t>(
-            reinterpret_cast<const uint8_t*>(v.data()), v.size()));
-    });
-    ASSERT_TRUE(rec.has_value());
-    EXPECT_EQ(rec->persistence, PersistenceMode::Transient);
+    // The DURABLE record (the event every broker applies) carries the mode.
+    const auto log = rig.recordedLog();
+    ASSERT_EQ(log.size(), 1u);
+    EXPECT_EQ(std::get<rc::CreateTopicOps>(log[0].event.ops).persistence, rc::Persistence::Transient);
 }
 
 TEST(AdminWorkerRegression, DiskDefineRequestsDiskTopic) {
-    Harness h;
-    h.runDefine(1, 2, "characters", "userId", 4, false, charsBlob());
-    ASSERT_EQ(h.lastErr, 0);
-    EXPECT_EQ(h.lastCreatePersistence, 0u);
-    EXPECT_EQ(h.reg.byName("characters")->persistence, PersistenceMode::Disk);
+    CatalogDdlRig rig("aw_disk", 1);
+    rig.becomeServingLeader();
+    ASSERT_EQ(define(rig, "characters", 4, false, charsBlob()).code, 0);
+    EXPECT_EQ(rig.schemas().byName("characters")->persistence, PersistenceMode::Disk);
+    EXPECT_EQ(std::get<rc::CreateTopicOps>(rig.recordedLog()[0].event.ops).persistence, rc::Persistence::Disk);
 }
 
-// ALTER writes a NEW TopicSchema version — the one recovery reads.  It must
-// carry the mode forward or a restart would recreate the topic on disk.
 TEST(AdminWorkerRegression, AlterCarriesTransientPersistenceForward) {
-    Harness h;
-    h.runDefine(1, 2, "characters", "userId", 4, false, charsBlob(), /*persistence=*/1);
-    ASSERT_EQ(h.lastErr, 0);
-    h.runAlter(1, 3, "characters", /*expectedVersion=*/1, opsBlob({addOp("email", PrimType::String)}));
-    ASSERT_EQ(h.lastAlterErr, 0);
-    ASSERT_EQ(h.lastAlterVersion, 2u);
-    const RegistryEntry* v2 = h.reg.byName("characters");
+    CatalogDdlRig rig("aw_transient_alter", 1);
+    rig.becomeServingLeader();
+    ASSERT_EQ(define(rig, "characters", 4, false, charsBlob(), /*persistence=*/1).code, 0);
+    const auto a = rig.alter("characters", {addOp("email", PrimType::String)}, {}, /*expectedVersion=*/1);
+    ASSERT_EQ(a.code, 0);
+    ASSERT_EQ(a.version, 2u);
+    const RegistryEntry* v2 = rig.schemas().byName("characters");
     ASSERT_NE(v2, nullptr);
     EXPECT_EQ(v2->version, 2u);
     EXPECT_EQ(v2->persistence, PersistenceMode::Transient);
 }
 
-// Re-defining an existing name with the OTHER persistence is TopicExists and
-// never flips the mode (no second create, registry unchanged).
 TEST(AdminWorkerRegression, RedefineExistingTopicWithOtherPersistenceIsTopicExists) {
-    Harness h;
-    h.runDefine(1, 2, "characters", "userId", 4, false, charsBlob(), /*persistence=*/0);
-    ASSERT_EQ(h.lastErr, 0);
-    h.lastErr = 0xffff;
-    h.runDefine(1, 3, "characters", "userId", 4, false, charsBlob(), /*persistence=*/1);
-    EXPECT_EQ(h.lastErr, 25) << "TopicExists";
-    EXPECT_EQ(h.creates, 1);
-    EXPECT_EQ(h.reg.byName("characters")->persistence, PersistenceMode::Disk);
+    CatalogDdlRig rig("aw_redefine_mode", 1);
+    rig.becomeServingLeader();
+    ASSERT_EQ(define(rig, "characters", 4, false, charsBlob(), /*persistence=*/0).code, 0);
+    EXPECT_EQ(define(rig, "characters", 4, false, charsBlob(), /*persistence=*/1).code, 25);
+    EXPECT_EQ(rig.recordedLog().size(), 1u);
+    EXPECT_EQ(rig.schemas().byName("characters")->persistence, PersistenceMode::Disk);
 }
 
-// The in-process ring frames carry the byte; a frame without it decodes as disk;
-// an unknown value is never cast into the enum.
-TEST(AdminWorkerRegression, AdminRingFramesCarryPersistence) {
+// Every DDL request survives the gateway → admin ring exactly (its meta too); an
+// unknown persistence byte / a truncated frame is MALFORMED — never cast, never a
+// default applied as a real request, and session / corr survive to answer it.
+TEST(AdminWorkerRegression, CatalogDdlRingFramesRoundTripEveryRequestRegression) {
+    DdlMeta meta;
+    meta.statement = "topic p {...};"; meta.clientName = "cli"; meta.sourceAddress = "aeron:udp?endpoint=h:1";
+    meta.sessionId = 77; meta.requestId = {5, 6}; meta.hasReplayedFrom = true;
+    meta.replayedClusterId = "east"; meta.replayedOffset = 41; meta.replayedPrincipal = "ops";
+
     OneToOneByteRing ring{kAdminRequestRingBytes};
-    DefineTopicMsg m; m.session = 7; m.corr = 8; m.name = "p"; m.blob = {1, 2}; m.persistence = 1;
-    ASSERT_TRUE(encodeDefineTopic(ring, m));
-    DefineTopicMsg got;
-    ring.drain([&](int32_t, aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off,
-                   aeron::util::index_t len) {
+    DefineTopicMsg d; d.session = 7; d.corr = 8; d.name = "p"; d.blob = {1, 2}; d.persistence = 1;
+    d.replicationFactor = 3; d.config.retentionMs = 99; d.config.partitionKey = "k"; d.meta = meta;
+    AlterTopicConfigMsg c; c.session = 7; c.corr = 9; c.name = "p"; c.expectedVersion = 4;
+    c.changes = {{rc::ConfigKey::RetentionBytes, 10}, {rc::ConfigKey::MaxCompactionLagMs, -1}}; c.meta = meta;
+    AlterViewMsg v; v.session = 7; v.corr = 10; v.name = "v"; v.keyField = "id"; v.persistence = 1;
+    v.expectedVersion = 2; v.planBlob = {9, 9}; v.meta = meta;
+    DropTopicMsg dt; dt.session = 7; dt.corr = 11; dt.name = "p"; dt.meta = meta;
+    ASSERT_TRUE(encodeDdl(ring, d));
+    ASSERT_TRUE(encodeDdl(ring, c));
+    ASSERT_TRUE(encodeDdl(ring, v));
+    ASSERT_TRUE(encodeDdl(ring, dt));
+    std::vector<int32_t> types;
+    ring.drain([&](int32_t tid, aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off, aeron::util::index_t len) {
+        types.push_back(tid);
         const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
-        const std::size_t n = static_cast<std::size_t>(len);
-        got = decodeDefineTopic(p, n);
-        // Same frame minus the trailing persistence byte = a pre-2b frame -> disk.
-        const DefineTopicMsg legacy = decodeDefineTopic(p, n - 1);
-        EXPECT_EQ(legacy.persistence, 0u);
-        EXPECT_EQ(legacy.blob, (std::vector<uint8_t>{1, 2}));
-        // Unknown value: rejected (blob dropped => InvalidSchema), never cast.
-        std::vector<uint8_t> bad(p, p + n);
-        bad.back() = 2;
-        const DefineTopicMsg rej = decodeDefineTopic(bad.data(), bad.size());
-        EXPECT_EQ(rej.persistence, 0u);
-        EXPECT_TRUE(rej.blob.empty());
-        EXPECT_EQ(rej.corr, 8);
-    }, 1);
-    EXPECT_EQ(got.persistence, 1u);
-    EXPECT_EQ(got.blob, (std::vector<uint8_t>{1, 2}));
-
-    OneToOneByteRing creq{kCreateTopicRingBytes};
-    CreateTopicReqMsg c; c.ticket = 3; c.partitionCount = 2; c.name = "p"; c.persistence = 1;
-    ASSERT_TRUE(encodeCreateTopicReq(creq, c));
-    CreateTopicReqMsg cgot;
-    creq.drain([&](int32_t, aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off,
-                   aeron::util::index_t len) {
-        const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
-        const std::size_t n = static_cast<std::size_t>(len);
-        cgot = decodeCreateTopicReq(p, n);
-        EXPECT_EQ(decodeCreateTopicReq(p, n - 1).persistence, 0u);
-        std::vector<uint8_t> bad(p, p + n);
-        bad.back() = 2;
-        const CreateTopicReqMsg rej = decodeCreateTopicReq(bad.data(), bad.size());
-        EXPECT_EQ(rej.persistence, 0u);
-        EXPECT_TRUE(rej.name.empty());
-    }, 1);
-    EXPECT_EQ(cgot.persistence, 1u);
-    EXPECT_EQ(cgot.cleanupPolicy, 0u);
+        const auto n = static_cast<std::size_t>(len);
+        if (tid == kMsgDefineTopic) {
+            const DefineTopicMsg got = decodeDefineTopic(p, n);
+            EXPECT_FALSE(got.malformed);
+            EXPECT_EQ(got.blob, d.blob); EXPECT_EQ(got.persistence, 1u); EXPECT_EQ(got.replicationFactor, 3);
+            EXPECT_EQ(got.config, d.config); EXPECT_EQ(got.meta, meta);
+            // Truncated: malformed, never a default request; session / corr survive.
+            const DefineTopicMsg cut = decodeDefineTopic(p, n - 1);
+            EXPECT_TRUE(cut.malformed); EXPECT_EQ(cut.corr, 8);
+            // Unknown persistence byte: malformed, never cast.
+            std::vector<uint8_t> bad(p, p + n);
+            bad[8 + 8 + 4 + 1 + 2 + 1 + 2 + 0 + 4 + 2] = 2;   // the persistence byte (name "p", empty key, 2-byte blob)
+            EXPECT_TRUE(decodeDefineTopic(bad.data(), bad.size()).malformed);
+        } else if (tid == kMsgAlterTopicConfig) {
+            const AlterTopicConfigMsg got = decodeAlterTopicConfig(p, n);
+            EXPECT_FALSE(got.malformed);
+            EXPECT_EQ(got.changes, c.changes); EXPECT_EQ(got.expectedVersion, 4u); EXPECT_EQ(got.meta, meta);
+        } else if (tid == kMsgAlterView) {
+            const AlterViewMsg got = decodeAlterView(p, n);
+            EXPECT_FALSE(got.malformed);
+            EXPECT_EQ(got.planBlob, v.planBlob); EXPECT_EQ(got.persistence, 1u); EXPECT_EQ(got.expectedVersion, 2u);
+        } else if (tid == kMsgDropTopic) {
+            const DropTopicMsg got = decodeDropTopic(p, n);
+            EXPECT_FALSE(got.malformed);
+            EXPECT_EQ(got.name, "p"); EXPECT_EQ(got.meta, meta);
+        }
+    }, 8);
+    EXPECT_EQ(types, (std::vector<int32_t>{kMsgDefineTopic, kMsgAlterTopicConfig, kMsgAlterView, kMsgDropTopic}));
 }
 
-// ===========================================================================
+// A malformed request is answered (InvalidSchema / InvalidRequest), never dropped.
+TEST(AdminWorkerRegression, MalformedRingRequestIsAnsweredNeverDroppedRegression) {
+    CatalogDdlRig rig("aw_malformed_ring", 1);
+    rig.becomeServingLeader();
+    DefineTopicMsg m; m.session = rig.sessionId(); m.corr = rig.nextCorr(); m.malformed = true;
+    m.meta.requestId = rig.freshRequestId();
+    EXPECT_EQ(rig.submitRaw(DdlRequest{std::move(m)}).code, 23);
+    DropTopicMsg d; d.session = rig.sessionId(); d.corr = rig.nextCorr(); d.malformed = true;
+    d.meta.requestId = rig.freshRequestId();
+    EXPECT_EQ(rig.submitRaw(DdlRequest{std::move(d)}).code, 39);
+    EXPECT_TRUE(rig.recordedLog().empty());
+}
+
 // No-hang wave (R1): an unknown persistence byte is never defaulted to Disk.
-// ===========================================================================
-
-// A directly submitted DefineTopicMsg (no ring decode) with persistence 2 is
-// rejected InvalidSchema before anything starts.
 TEST(AdminWorkerRegression, DirectDefineWithUnknownPersistenceIsInvalidSchemaRegression) {
-    Harness h;
-    h.runDefine(1, 2, "characters", "userId", 4, false, charsBlob(), /*persistence=*/2);
-    EXPECT_EQ(h.lastErr, 23u) << "InvalidSchema";
-    EXPECT_EQ(h.creates, 0) << "nothing started";
-    EXPECT_EQ(h.reg.byName("characters"), nullptr);
+    CatalogDdlRig rig("aw_bad_mode", 1);
+    rig.becomeServingLeader();
+    EXPECT_EQ(define(rig, "characters", 4, false, charsBlob(), /*persistence=*/2).code, 23);
+    EXPECT_TRUE(rig.recordedLog().empty()) << "nothing appended";
+    EXPECT_EQ(rig.schemas().byName("characters"), nullptr);
 }
 
-// The control thread's reply reports an unknown mode: the define fails Internal,
-// nothing is recorded, and the worker is Idle again (the next define runs).
-TEST(AdminWorkerRegression, CreateReplyWithUnknownPersistenceFailsInternalAndGoesIdleRegression) {
-    Harness h;
-    h.replyPersistence = 2;
-    h.runDefine(1, 2, "characters", "userId", 4, false, charsBlob());
-    EXPECT_EQ(h.lastErr, 6u) << "Internal";
-    EXPECT_EQ(h.reg.byName("characters"), nullptr) << "nothing recorded";
-    EXPECT_EQ(h.w->pendingCount(), 0u);
-
-    h.replyPersistence = CreateTopicReplyMsg::kPersistenceNotReported;
-    h.lastErr = 0xffff;
-    h.runDefine(1, 3, "orders", "userId", 4, false, charsBlob());
-    EXPECT_EQ(h.lastErr, 0u) << "the worker went Idle: the next define completes";
-    ASSERT_NE(h.reg.byName("orders"), nullptr);
-}
-
-// No-hang fix round 3 (fix-on-sight): the DDL queue is bounded — a request
-// beyond kMaxPendingDdl is answered Internal at once instead of queued forever.
+// No-hang fix round 3: the DDL queue is bounded — a request beyond kMaxPendingDdl
+// is answered Internal at once instead of queued forever.
 TEST(AdminWorkerRegression, DdlQueueIsBoundedAndOverflowIsAnsweredInternalRegression) {
-    Harness h;
+    CatalogDdlRig rig("aw_queue", 1);
     for (std::size_t i = 0; i < AdminWorker::kMaxPendingDdl; ++i) {
         DefineTopicMsg m; m.session = 1; m.corr = static_cast<int64_t>(i); m.name = "t" + std::to_string(i);
-        m.partitionCount = 1; m.blob = charsBlob();
-        h.w->submitDefineTopic(std::move(m));
+        m.partitionCount = 1;
+        rig.admin().submit(DdlRequest{std::move(m)});
     }
-    ASSERT_EQ(h.w->pendingCount(), AdminWorker::kMaxPendingDdl);
-    h.lastErr = 0xffff;
+    ASSERT_EQ(rig.admin().pendingCount(), AdminWorker::kMaxPendingDdl);
     DefineTopicMsg over; over.session = 1; over.corr = 999; over.name = "over"; over.partitionCount = 1;
-    over.blob = charsBlob();
-    h.w->submitDefineTopic(std::move(over));
-    EXPECT_EQ(h.lastErr, 6u) << "a DDL beyond the bound was queued (or dropped) instead of answered Internal";
-    EXPECT_EQ(h.w->pendingCount(), AdminWorker::kMaxPendingDdl);
-    EXPECT_EQ(h.w->pendingDdlRefused(), 1u);
-    h.lastAlterErr = 0xffff;
+    rig.admin().submit(DdlRequest{std::move(over)});
+    ASSERT_TRUE(rig.answerFor(999).has_value()) << "a DDL beyond the bound was queued (or dropped)";
+    EXPECT_EQ(rig.answerFor(999)->code, 6);
+    EXPECT_EQ(rig.admin().pendingCount(), AdminWorker::kMaxPendingDdl);
+    EXPECT_EQ(rig.admin().pendingDdlRefused(), 1u);
     AlterTopicMsg a; a.session = 1; a.corr = 1000; a.topicName = "t0";
-    h.w->submitAlterTopic(std::move(a));
-    EXPECT_EQ(h.lastAlterErr, 6u);
+    rig.admin().submit(DdlRequest{std::move(a)});
+    ASSERT_TRUE(rig.answerFor(1000).has_value());
+    EXPECT_EQ(rig.answerFor(1000)->code, 6);
 }

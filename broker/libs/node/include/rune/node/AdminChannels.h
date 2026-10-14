@@ -1,37 +1,29 @@
 #pragma once
-// AdminChannels.h — Task 8a: shared-nothing cross-thread channels for the
-// schema-registry DDL control plane (RULING-2).
+// AdminChannels.h — shared-nothing cross-thread channels of the DDL control
+// plane (RULING-2; catalog history Task 9).
 //
-// The AdminWorker runs on its OWN thread and SOLELY owns the __topic_schemas
-// PartitionReplica.  Every cross-thread hop is an SPSC ring (HARD RULE #2,
-// Aeron-style), never a shared mutable field.  Three ring channels connect the
-// admin thread to the rest of the broker:
+// The AdminWorker runs on its OWN thread and SOLELY owns the __catalog replica,
+// the CatalogApplier and the registries it projects.  Every cross-thread hop is
+// an SPSC ring (HARD RULE #2, Aeron-style), never a shared mutable field:
 //
-//   1. gateway  → admin   (AdminRequestRing)      — DefineTopic / GetSchema ops
-//   2. admin    → control (CreateTopicRequestRing)— "create this physical topic"
-//   3. control  → admin   (CreateTopicReplyRing)  — authoritative topicId back
-//   4. control  → admin   (AdminRoleRing)         — Follower/Leader role events
+//   1. gateway → admin   (AdminRequestRing)   — every DDL request + GetSchema
+//   2. control → admin   (controlToAdminRing) — dropped-dir purges (Task 8)
+//   3. control → admin   (AdminRoleRing)      — the __catalog role + its AlterIsr answers
+//   4. admin   → control (failure ring)       — the applier's effects, storage failures
+//   5. admin   → control (egress ring)        — DDL answer frames for the session egress
 //
-// Because these are SPSC OneToOneByteRings, each ring has exactly ONE producer
-// thread and ONE consumer thread:
+// Each ring has exactly ONE producer thread and ONE consumer thread.  The
+// create-topic round-trip (admin → control "create this topic", control → admin
+// "here is its id") is gone (Task 9): a topic's id comes from the catalog, and
+// the control thread builds it from the applier's kA2cCatalogTopicApplied effect.
 //
-//   AdminRequestRing      : producer = gateway/control duty-cycle thread; consumer = admin
-//   CreateTopicRequestRing: producer = admin thread;                      consumer = control
-//   CreateTopicReplyRing   : producer = control thread;                    consumer = admin
-//   AdminRoleRing          : producer = control thread (bridge);           consumer = admin
-//
-// The messages are plain trivially-copyable structs carrying small ids plus
-// heap-owned byte vectors for the descriptor/name.  Because a ring frame is a
-// flat byte copy, we serialise a small fixed header and copy the variable-length
-// bytes inline; the consumer reconstructs owning std::vectors/std::strings on
-// its own thread (single-writer per side — no shared ownership).
-//
-// C++23.  Header-only wire helpers; no allocations on the drain path beyond the
-// per-op owning containers the consumer must build (admin path is cold — DDL is
-// rare — so a per-op allocation there is acceptable and off any hot path).
+// A ring frame is a flat byte copy: a small fixed header plus the variable-length
+// bytes inline; the consumer rebuilds owning strings / vectors on its own thread.
+// Cold path (DDL is rare): the per-op owning containers are acceptable here.
 
 #include <rune/node/OneToOneByteRing.h>
 #include <rune/protocol/CatalogTypes.h>
+#include <rune/catalog/CatalogEvent.h>   // rune::catalog::ConfigChange (AlterTopicConfig)
 
 #include <concurrent/AtomicBuffer.h>
 
@@ -52,8 +44,7 @@ namespace rune::node {
 enum : int32_t {
     kMsgDefineTopic       = 1,
     kMsgGetSchema         = 2,
-    kMsgCreateTopicReq    = 3,
-    kMsgCreateTopicReply  = 4,
+    // 3, 4: the retired create-topic request / reply (Task 9) — never reused.
     kMsgAdminRole         = 5,
     kMsgEgressFrame       = 6,   // admin → control: [sessionId:i64][response frame]
     kMsgAlterTopic        = 7,   // gateway → admin: ALTER TOPIC (Task 11)
@@ -67,6 +58,14 @@ enum : int32_t {
     // the admin thread; a failure is logged and the dir stays for the boot purge).
     kMsgPurgeDroppedDir   = 16,
 };
+// Catalog history Task 9 — gateway → admin, on the AdminRequestRing (ring-scoped
+// ids: 10 is kMsgCatalogAlterIsrResponse on the ROLE ring, a different ring).
+enum : int32_t {
+    kMsgDropTopic         = 10,
+    kMsgDropView          = 11,
+    kMsgAlterView         = 12,
+    kMsgAlterTopicConfig  = 13,
+};
 
 // ---------------------------------------------------------------------------
 // Admin → control ring (AdminWorkerAgent::failureRing_; T10) message ids.
@@ -75,18 +74,13 @@ enum : int32_t {
 //   kA2cSchemaUpdate   : [topicId:i32][descriptor blob] (F3 round 6, item 3:
 //                        the control thread — the ONLY producer of the worker
 //                        SPSC ingress rings — fans it out to every worker)
-//   kA2cTopicCommitted : [topicId:i32] (B10 / D4 fix round 1: the topic's catalog
-//                        record committed; the control thread rewrites its
-//                        topic-id marker pending -> committed)
 // ---------------------------------------------------------------------------
 enum : int32_t {
     kA2cStorageFailure = 1,
     kA2cSchemaUpdate   = 2,
     kA2cViewPlanUpdate = 3,   // Task 19: admin → control, fan out a compiled view plan
-    // B10 / D4 fix round 1: [topicId:i32] — a runtime topic's catalog record
-    // (DefineTopic schema / CreateView record) COMMITTED; the control thread (owner
-    // of TopicRegistry) rewrites its topic-id marker pending -> committed.
-    kA2cTopicCommitted = 4,
+    // 4: the retired kA2cTopicCommitted (Task 9: a catalog topic is built from
+    //    kA2cCatalogTopicApplied) — never reused.
     // Catalog history Task 6: the __catalog replica's AlterIsr proposal (verbatim
     // SBE AlterIsrMsg).  The control thread hands it to the controller channel
     // (replTransport_->sendAlterIsr) — the same one the coordinator partitions use.
@@ -105,7 +99,7 @@ enum : int32_t {
 // Ring capacities.  DDL is rare; a small ring is plenty.  Power-of-two payload.
 // ---------------------------------------------------------------------------
 inline constexpr int kAdminRequestRingBytes     = 1 << 20;  // 1 MiB (descriptor blobs)
-inline constexpr int kCreateTopicRingBytes      = 1 << 16;  // 64 KiB
+inline constexpr int kControlToAdminRingBytes   = 1 << 16;  // 64 KiB (dropped-dir purges)
 inline constexpr int kAdminRoleRingBytes        = 1 << 12;  // 4 KiB (max message 512 B >= the largest role)
 // admin → control (T10 storage failure + F3 r6 SchemaUpdate).  Sized so that
 // every descriptor the request ring can deliver fits ONE SchemaUpdate message
@@ -129,46 +123,114 @@ inline uint16_t getU16(const uint8_t* p){ uint16_t v; std::memcpy(&v, p, 2); ret
 } // namespace admin_wire
 
 // ---------------------------------------------------------------------------
-// DefineTopic request (gateway → admin).  Owning form after drain.
+// Catalog history Task 9: what every DDL carries besides its operation (spec §4
+// principal + statement + replayedFrom; ruling 13).  `requestId` is the client's
+// 128-bit id of the logical DDL, stable across retries (F14); {0, 0} = a pre-v8
+// client (no DDL extension on the wire).  `sessionId` / `sourceAddress` are the
+// gateway's (the session id and the session's egress channel), never the
+// client's word.  Owning form after drain (cold: DDL is rare).
 // ---------------------------------------------------------------------------
-struct DefineTopicMsg {
-    int64_t              session        = 0;
-    int64_t              corr           = 0;
-    int32_t              partitionCount = 1;
-    bool                 validate       = false;
-    std::string          name;
-    std::string          keyField;
-    std::vector<uint8_t> blob;
-    uint8_t              persistence    = 0;   // Phase 2b E: 0 = disk, 1 = transient
+struct DdlMeta {
+    std::string               statement;
+    std::string               clientName;
+    std::string               sourceAddress;
+    int64_t                   sessionId = 0;
+    rune::protocol::RequestId requestId{};
+    bool                      hasReplayedFrom = false;
+    std::string               replayedClusterId;
+    int64_t                   replayedOffset = -1;
+    std::string               replayedPrincipal;
+    bool operator==(const DdlMeta&) const = default;
 };
 
 // ---------------------------------------------------------------------------
-// AlterTopic request (gateway → admin).  Owning form after drain (Task 11).
-// Carries the client's CAS expectation (expectedVersion; 0 = don't check) and
-// the opaque ALTER ops blob (rune::codec::encodeAlterOps wire format) that the
-// admin thread decodes + applies against the topic's current evolving schema.
+// The DDL requests (gateway → admin, AdminRequestRing).  Owning forms after
+// drain.  `malformed` = the ring decode could not read the frame (or saw an
+// out-of-range byte it never casts): session / corr survive (when present) so the
+// admin thread answers it InvalidSchema / InvalidRequest — never dropped.
 // ---------------------------------------------------------------------------
+
+/// DefineTopic: an empty `blob` is an UNTYPED topic (ruling 3); a non-empty one
+/// must deserialize.  v8 adds the replication factor (0 = every broker), the
+/// creation config and the meta.
+struct DefineTopicMsg {
+    int64_t                     session        = 0;
+    int64_t                     corr           = 0;
+    int32_t                     partitionCount = 1;
+    bool                        validate       = false;
+    std::string                 name;
+    std::string                 keyField;
+    std::vector<uint8_t>        blob;
+    uint8_t                     persistence    = 0;   // Phase 2b E: 0 = disk, 1 = transient
+    int16_t                     replicationFactor = 0;
+    rune::protocol::TopicConfig config;
+    DdlMeta                     meta;
+    bool                        malformed = false;
+};
+
+/// AlterTopic: the client's CAS expectation (expectedVersion = the topic's SCHEMA
+/// version; 0 = don't check) and the opaque ALTER ops (encodeAlterOps wire bytes).
 struct AlterTopicMsg {
     int64_t              session         = 0;
     int64_t              corr            = 0;
     uint16_t             expectedVersion = 0;   // 0 = unconditional (no CAS)
     std::string          topicName;
     std::vector<uint8_t> opsBlob;               // encodeAlterOps() wire bytes
+    DdlMeta              meta;
+    bool                 malformed = false;
 };
 
-// ---------------------------------------------------------------------------
-// CreateView request (gateway → admin).  Owning form after drain (Task 19).
-// `planBlob` is the authored rune::view::ViewPlan (rune::view::serializeAuthored);
-// the admin thread deserializes + compiles it against the source descriptor(s).
-// ---------------------------------------------------------------------------
+/// CreateView: `planBlob` is the authored rune::view::ViewPlan (serializeAuthored).
 struct CreateViewMsg {
     int64_t              session     = 0;
     int64_t              corr        = 0;
     uint8_t              persistence = 0;   // 0 = persisted, 1 = transient
-    bool                 malformed   = false;   // ring decode saw an unknown persistence byte
+    bool                 malformed   = false;
     std::string          viewName;
     std::string          keyField;
     std::vector<uint8_t> planBlob;          // authored ViewPlan (serializeAuthored)
+    DdlMeta              meta;
+};
+
+struct DropTopicMsg {
+    int64_t     session = 0;
+    int64_t     corr    = 0;
+    std::string name;
+    DdlMeta     meta;
+    bool        malformed = false;
+};
+
+struct DropViewMsg {
+    int64_t     session = 0;
+    int64_t     corr    = 0;
+    std::string name;
+    DdlMeta     meta;
+    bool        malformed = false;
+};
+
+/// AlterView (ruling 4): the view's plan and output replaced under the same
+/// objectId with a fresh sink.  expectedVersion = the view's OBJECT version (0 = no check).
+struct AlterViewMsg {
+    int64_t              session         = 0;
+    int64_t              corr            = 0;
+    std::string          name;
+    std::string          keyField;
+    uint8_t              persistence     = 0;
+    uint32_t             expectedVersion = 0;
+    std::vector<uint8_t> planBlob;
+    DdlMeta              meta;
+    bool                 malformed = false;
+};
+
+/// AlterTopicConfig (ruling 5): expectedVersion = the topic's OBJECT version (0 = no check).
+struct AlterTopicConfigMsg {
+    int64_t                                  session         = 0;
+    int64_t                                  corr            = 0;
+    std::string                              name;
+    uint32_t                                 expectedVersion = 0;
+    std::vector<rune::catalog::ConfigChange> changes;
+    DdlMeta                                  meta;
+    bool                                     malformed = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -188,63 +250,6 @@ struct GetSchemaMsg {
     uint64_t    requestedFingerprint = 0;
 };
 
-// ---------------------------------------------------------------------------
-// CreateTopicRequest (admin → control).  Carries the pending DefineTopic corr
-// so the control-thread reply can be matched back to the admin-side pending op.
-// ---------------------------------------------------------------------------
-// Task 19: `keyField` + `cleanupPolicy` extend the request so the control thread
-// can create a VIEW SINK as a keyed + Compact "table" (not the default Delete
-// topic).  DefineTopic leaves them default (empty keyField, cleanupPolicy 0 =
-// Delete) — byte-compatible with the pre-Task-19 behaviour.
-struct CreateTopicReqMsg {
-    int64_t     ticket         = 0;   // admin-assigned monotone id (matches reply)
-    int32_t     partitionCount = 1;
-    std::string name;
-    std::string keyField;             // Task 19: view sink key field (empty = none)
-    uint8_t     cleanupPolicy  = 0;   // Task 19: 0=Delete, 1=Compact, 2=CompactDelete
-    uint8_t     persistence    = 0;   // Phase 2b E: 0 = disk, 1 = transient (InMemoryLog)
-};
-
-// ---------------------------------------------------------------------------
-// CreateTopicReply (control → admin).  Authoritative id (or -1 on failure).
-//
-// Phase 2b C final review I1: TopicRegistry::createTopic is idempotent by name —
-// when the name is already taken (a RUNE_TOPICS boot topic, a recovered runtime
-// topic) it returns the EXISTING topic's id and ignores the requested spec.  The
-// reply therefore carries the AUTHORITATIVE partition count (read back from the
-// registry's spec, never the request's) and an `existed` flag, so the admin
-// thread records the real count in the schema registry (typed clients route by
-// it) and can refuse to adopt an existing topic as a view sink.
-// ---------------------------------------------------------------------------
-struct CreateTopicReplyMsg {
-    int64_t ticket         = 0;
-    int32_t topicId        = -1;    // >=0 on success; -1 on failure
-    int32_t partitionCount = 0;     // authoritative; <= 0 = not reported (keep requested)
-    bool    existed        = false; // true = the name already named a topic (not created)
-    // Phase 2b E: the topic's REAL persistence wire byte (0/1), read back from the
-    // registry — an existing schema-less topic keeps ITS mode, not the request's.
-    // kPersistenceNotReported = frame without it (caller keeps the requested mode).
-    static constexpr uint8_t kPersistenceNotReported = 0xff;
-    uint8_t persistence    = kPersistenceNotReported;
-    // DDL conformance B3: the requested name differs only in ASCII case from the
-    // existing topic `topicId` (existed = true): nothing was created and the admin
-    // thread answers TopicExists.  Ring trailer byte 18; absent => false.
-    bool    caseConflict   = false;
-    // OPTIONAL KL1 follow-up: the existing topic is a RUNTIME topic whose spec is
-    // exactly the requested view sink's (Compact, key, partitions, mode) — the admin
-    // thread may adopt it when no catalog record claims it (its own orphan sink).
-    // Ring trailer byte 19; absent => false.
-    // Final review I1: also requires the topic to be UNCOMMITTED (not servable — so
-    // nothing could have been acknowledged into it) and every partition log EMPTY
-    // (read by the control thread, which alone has touched an uncommitted topic).
-    bool    sinkSpecMatches = false;
-    // Final review I2: the existing topic is a RUNTIME topic with the Compact
-    // cleanup policy — only a CREATE VIEW sink is one (DefineTopic creates Delete
-    // topics).  The admin thread answers a DefineTopic over it TopicExists (25):
-    // a view sink is never adopted as a typed topic (KL1b closed), so the two
-    // catalogs never both claim one id.  Ring trailer byte 20; absent => false.
-    bool    existingIsRuntimeCompact = false;
-};
 
 // ---------------------------------------------------------------------------
 // AdminRole event (control → admin).  The bridge posts a Leader/Follower role
@@ -271,153 +276,352 @@ struct AdminRoleMsg {
 // Encoders / decoders
 // ===========================================================================
 
-// ---- DefineTopic ----
-inline bool encodeDefineTopic(OneToOneByteRing& ring, const DefineTopicMsg& m) {
-    using namespace admin_wire;
-    const std::size_t len = 8 + 8 + 4 + 1
-                          + 2 + m.name.size()
-                          + 2 + m.keyField.size()
-                          + 4 + m.blob.size()
-                          + 1;   // Phase 2b E: trailing persistence byte (always written;
-                                 // accounted for in kDefineTopicFixedBytes)
-    const auto idx = ring.tryClaim(kMsgDefineTopic, len);
+// ---- The DDL request codecs (catalog history Task 9) ----
+// One LAYOUT per message, written once and used twice: by the Sizer (the exact
+// frame length, and whether every length fits its prefix) and by the Writer.
+// The decoders are checked (the Reader): a short / over-long frame, or a byte
+// out of its range, is `malformed` — never a default applied as a real request.
+//
+//   meta    : statement:u32+bytes, clientName:u16+bytes, sourceAddress:u16+bytes,
+//             sessionId:i64, requestIdHi:u64, requestIdLo:u64, hasReplayedFrom:u8,
+//             [clusterId:u16+bytes, offset:i64, principal:u16+bytes]
+//   config  : the TopicConfig block (kTopicConfigFixedBytes + its two str16s)
+//   Define  : session, corr, partitions:i32, validate:u8, name, keyField,
+//             blob:u32+bytes, persistence:u8, rf:i16, config, meta
+//   Alter   : session, corr, expectedVersion:u16, name, ops:u32+bytes, meta
+//   View    : session, corr, persistence:u8, name, keyField, plan:u32+bytes, meta
+//   DropT/V : session, corr, name, meta
+//   AlterV  : session, corr, name, keyField, persistence:u8, expectedVersion:u32,
+//             plan:u32+bytes, meta
+//   Config  : session, corr, name, expectedVersion:u32, count:u16, (key:u8, value:i64)*, meta
+namespace admin_wire {
+
+inline constexpr std::size_t kStr16Max = 0xFFFF;
+
+struct Sizer {
+    std::size_t n    = 0;
+    bool        fits = true;
+    void i64(int64_t) noexcept { n += 8; }
+    void u64(uint64_t) noexcept { n += 8; }
+    void i32(int32_t) noexcept { n += 4; }
+    void u32(uint32_t) noexcept { n += 4; }
+    void i16(int16_t) noexcept { n += 2; }
+    void u16(uint16_t) noexcept { n += 2; }
+    void u8(uint8_t) noexcept { n += 1; }
+    void str16(std::string_view s) noexcept { fits = fits && s.size() <= kStr16Max; n += 2 + s.size(); }
+    void bytes32(std::span<const uint8_t> b) noexcept {
+        fits = fits && b.size() <= 0x7FFF'FFFFu;
+        n += 4 + b.size();
+    }
+    void str32(std::string_view s) noexcept { bytes32({reinterpret_cast<const uint8_t*>(s.data()), s.size()}); }
+};
+
+struct Writer {
+    uint8_t* p;
+    void i64(int64_t v) noexcept { putI64(p, v); p += 8; }
+    void u64(uint64_t v) noexcept { std::memcpy(p, &v, 8); p += 8; }
+    void i32(int32_t v) noexcept { putI32(p, v); p += 4; }
+    void u32(uint32_t v) noexcept { std::memcpy(p, &v, 4); p += 4; }
+    void i16(int16_t v) noexcept { std::memcpy(p, &v, 2); p += 2; }
+    void u16(uint16_t v) noexcept { putU16(p, v); p += 2; }
+    void u8(uint8_t v) noexcept { *p++ = v; }
+    void str16(std::string_view s) noexcept {
+        u16(static_cast<uint16_t>(s.size()));
+        if (!s.empty()) std::memcpy(p, s.data(), s.size());
+        p += s.size();
+    }
+    void bytes32(std::span<const uint8_t> b) noexcept {
+        u32(static_cast<uint32_t>(b.size()));
+        if (!b.empty()) std::memcpy(p, b.data(), b.size());
+        p += b.size();
+    }
+    void str32(std::string_view s) noexcept { bytes32({reinterpret_cast<const uint8_t*>(s.data()), s.size()}); }
+};
+
+/// Checked reader: every short read clears `ok` (and reads nothing further).
+struct Reader {
+    const uint8_t* b;
+    std::size_t    len;
+    std::size_t    pos = 0;
+    bool           ok  = true;
+    bool need(std::size_t k) noexcept {
+        if (!ok || len - pos < k || pos > len) { ok = false; return false; }
+        return true;
+    }
+    int64_t  i64() noexcept { if (!need(8)) return 0; const int64_t v = getI64(b + pos); pos += 8; return v; }
+    uint64_t u64() noexcept { if (!need(8)) return 0; uint64_t v; std::memcpy(&v, b + pos, 8); pos += 8; return v; }
+    int32_t  i32() noexcept { if (!need(4)) return 0; const int32_t v = getI32(b + pos); pos += 4; return v; }
+    uint32_t u32() noexcept { if (!need(4)) return 0; uint32_t v; std::memcpy(&v, b + pos, 4); pos += 4; return v; }
+    int16_t  i16() noexcept { if (!need(2)) return 0; int16_t v; std::memcpy(&v, b + pos, 2); pos += 2; return v; }
+    uint16_t u16() noexcept { if (!need(2)) return 0; const uint16_t v = getU16(b + pos); pos += 2; return v; }
+    uint8_t  u8() noexcept { if (!need(1)) return 0; return b[pos++]; }
+    void str16(std::string& out) {
+        const uint16_t n = u16();
+        if (!need(n)) return;
+        out.assign(reinterpret_cast<const char*>(b + pos), n);
+        pos += n;
+    }
+    void bytes32(std::vector<uint8_t>& out) {
+        const uint32_t n = u32();
+        if (!need(n)) return;
+        out.assign(b + pos, b + pos + n);
+        pos += n;
+    }
+    void str32(std::string& out) {
+        const uint32_t n = u32();
+        if (!need(n)) return;
+        out.assign(reinterpret_cast<const char*>(b + pos), n);
+        pos += n;
+    }
+    /// The whole frame was consumed exactly.
+    [[nodiscard]] bool done() const noexcept { return ok && pos == len; }
+};
+
+template <class W>
+void layoutMeta(W& w, const DdlMeta& m) {
+    w.str32(m.statement);
+    w.str16(m.clientName);
+    w.str16(m.sourceAddress);
+    w.i64(m.sessionId);
+    w.u64(m.requestId.hi);
+    w.u64(m.requestId.lo);
+    w.u8(m.hasReplayedFrom ? 1 : 0);
+    if (m.hasReplayedFrom) {
+        w.str16(m.replayedClusterId);
+        w.i64(m.replayedOffset);
+        w.str16(m.replayedPrincipal);
+    }
+}
+inline void readMeta(Reader& r, DdlMeta& m) {
+    r.str32(m.statement);
+    r.str16(m.clientName);
+    r.str16(m.sourceAddress);
+    m.sessionId    = r.i64();
+    m.requestId.hi = r.u64();
+    m.requestId.lo = r.u64();
+    const uint8_t rf = r.u8();
+    if (rf > 1) { r.ok = false; return; }   // never cast
+    m.hasReplayedFrom = rf == 1;
+    if (m.hasReplayedFrom) {
+        r.str16(m.replayedClusterId);
+        m.replayedOffset = r.i64();
+        r.str16(m.replayedPrincipal);
+    }
+}
+
+template <class W>
+void layoutConfig(W& w, const rune::protocol::TopicConfig& c) {
+    w.u8(c.cleanupPolicy);
+    w.i64(c.retentionMs);
+    w.i64(c.retentionBytes);
+    w.i64(c.deleteRetentionMs);
+    w.i32(c.minCleanableDirtyRatioPpm);
+    w.i64(c.segmentRollBytes);
+    w.i64(c.minCompactionLagMs);
+    w.i64(c.maxCompactionLagMs);
+    w.i64(c.retentionCheckMs);
+    w.i64(c.fileDeleteDelayMs);
+    w.u8(c.durability);
+    w.u8(c.durabilityTier);
+    w.str16(c.coPartitionGroup);
+    w.str16(c.partitionKey);
+}
+inline void readConfig(Reader& r, rune::protocol::TopicConfig& c) {
+    c.cleanupPolicy             = r.u8();
+    c.retentionMs               = r.i64();
+    c.retentionBytes            = r.i64();
+    c.deleteRetentionMs         = r.i64();
+    c.minCleanableDirtyRatioPpm = r.i32();
+    c.segmentRollBytes          = r.i64();
+    c.minCompactionLagMs        = r.i64();
+    c.maxCompactionLagMs        = r.i64();
+    c.retentionCheckMs          = r.i64();
+    c.fileDeleteDelayMs         = r.i64();
+    c.durability                = r.u8();
+    c.durabilityTier            = r.u8();
+    r.str16(c.coPartitionGroup);
+    r.str16(c.partitionKey);
+}
+
+inline std::span<const uint8_t> span8(const std::vector<uint8_t>& v) noexcept { return {v.data(), v.size()}; }
+
+template <class W> void layout(W& w, const DefineTopicMsg& m) {
+    w.i64(m.session); w.i64(m.corr); w.i32(m.partitionCount); w.u8(m.validate ? 1 : 0);
+    w.str16(m.name); w.str16(m.keyField); w.bytes32(span8(m.blob)); w.u8(m.persistence);
+    w.i16(m.replicationFactor); layoutConfig(w, m.config); layoutMeta(w, m.meta);
+}
+template <class W> void layout(W& w, const AlterTopicMsg& m) {
+    w.i64(m.session); w.i64(m.corr); w.u16(m.expectedVersion); w.str16(m.topicName);
+    w.bytes32(span8(m.opsBlob)); layoutMeta(w, m.meta);
+}
+template <class W> void layout(W& w, const CreateViewMsg& m) {
+    w.i64(m.session); w.i64(m.corr); w.u8(m.persistence); w.str16(m.viewName); w.str16(m.keyField);
+    w.bytes32(span8(m.planBlob)); layoutMeta(w, m.meta);
+}
+template <class W> void layout(W& w, const DropTopicMsg& m) {
+    w.i64(m.session); w.i64(m.corr); w.str16(m.name); layoutMeta(w, m.meta);
+}
+template <class W> void layout(W& w, const DropViewMsg& m) {
+    w.i64(m.session); w.i64(m.corr); w.str16(m.name); layoutMeta(w, m.meta);
+}
+template <class W> void layout(W& w, const AlterViewMsg& m) {
+    w.i64(m.session); w.i64(m.corr); w.str16(m.name); w.str16(m.keyField); w.u8(m.persistence);
+    w.u32(m.expectedVersion); w.bytes32(span8(m.planBlob)); layoutMeta(w, m.meta);
+}
+template <class W> void layout(W& w, const AlterTopicConfigMsg& m) {
+    w.i64(m.session); w.i64(m.corr); w.str16(m.name); w.u32(m.expectedVersion);
+    w.u16(static_cast<uint16_t>(m.changes.size()));
+    for (const auto& c : m.changes) { w.u8(static_cast<uint8_t>(c.key)); w.i64(c.value); }
+    layoutMeta(w, m.meta);
+}
+
+} // namespace admin_wire
+
+template <class M> inline constexpr int32_t kDdlMsgType = 0;
+template <> inline constexpr int32_t kDdlMsgType<DefineTopicMsg>      = kMsgDefineTopic;
+template <> inline constexpr int32_t kDdlMsgType<AlterTopicMsg>       = kMsgAlterTopic;
+template <> inline constexpr int32_t kDdlMsgType<CreateViewMsg>       = kMsgCreateView;
+template <> inline constexpr int32_t kDdlMsgType<DropTopicMsg>        = kMsgDropTopic;
+template <> inline constexpr int32_t kDdlMsgType<DropViewMsg>         = kMsgDropView;
+template <> inline constexpr int32_t kDdlMsgType<AlterViewMsg>        = kMsgAlterView;
+template <> inline constexpr int32_t kDdlMsgType<AlterTopicConfigMsg> = kMsgAlterTopicConfig;
+
+/// The ring frame length of `m`, or 0 when a field does not fit its length prefix.
+template <class M>
+[[nodiscard]] inline std::size_t ddlWireLen(const M& m) noexcept {
+    admin_wire::Sizer s;
+    admin_wire::layout(s, m);
+    return s.fits ? s.n : 0;
+}
+
+/// Encode a DDL request on the gateway → admin ring.  false = it cannot be
+/// encoded (ddlWireLen 0, or longer than the ring's max message — the caller
+/// tells the two apart with ddlWireLen) or the ring is full.
+template <class M>
+[[nodiscard]] inline bool encodeDdl(OneToOneByteRing& ring, const M& m) {
+    const std::size_t len = ddlWireLen(m);
+    if (len == 0 || len > static_cast<std::size_t>(ring.maxMsgLength())) return false;
+    const auto idx = ring.tryClaim(kDdlMsgType<M>, len);
     if (idx < 0) return false;
-    uint8_t* p = ring.base() + idx;
-    putI64(p, m.session);        p += 8;
-    putI64(p, m.corr);           p += 8;
-    putI32(p, m.partitionCount); p += 4;
-    *p++ = m.validate ? 1 : 0;
-    putU16(p, static_cast<uint16_t>(m.name.size())); p += 2;
-    std::memcpy(p, m.name.data(), m.name.size());    p += m.name.size();
-    putU16(p, static_cast<uint16_t>(m.keyField.size())); p += 2;
-    std::memcpy(p, m.keyField.data(), m.keyField.size()); p += m.keyField.size();
-    putI32(p, static_cast<int32_t>(m.blob.size())); p += 4;
-    std::memcpy(p, m.blob.data(), m.blob.size()); p += m.blob.size();
-    *p = m.persistence;   // trailing; decode tolerates absence (=> disk)
+    admin_wire::Writer w{ring.base() + idx};
+    admin_wire::layout(w, m);
     ring.commit(idx);
     return true;
 }
+
+// Back-compat spellings (tests and the agent call these names).
+inline bool encodeDefineTopic(OneToOneByteRing& ring, const DefineTopicMsg& m) { return encodeDdl(ring, m); }
+inline bool encodeAlterTopic(OneToOneByteRing& ring, const AlterTopicMsg& m)   { return encodeDdl(ring, m); }
+inline bool encodeCreateView(OneToOneByteRing& ring, const CreateViewMsg& m)   { return encodeDdl(ring, m); }
+
+namespace admin_wire {
+/// session + corr first (so a malformed frame can still be answered).
+template <class M> inline void readHead(Reader& r, M& m) { m.session = r.i64(); m.corr = r.i64(); }
+template <class M> inline void finish(Reader& r, M& m) {
+    if (!r.done()) m.malformed = true;
+}
+} // namespace admin_wire
 
 inline DefineTopicMsg decodeDefineTopic(const uint8_t* buf, std::size_t len) {
-    using namespace admin_wire;
+    admin_wire::Reader r{buf, len};
     DefineTopicMsg m;
-    std::size_t pos = 0;
-    if (len < 21) return m;
-    m.session = getI64(buf + pos); pos += 8;
-    m.corr    = getI64(buf + pos); pos += 8;
-    m.partitionCount = getI32(buf + pos); pos += 4;
-    m.validate = buf[pos++] != 0;
-    const uint16_t nl = getU16(buf + pos); pos += 2;
-    if (pos + nl > len) return m;
-    m.name.assign(reinterpret_cast<const char*>(buf + pos), nl); pos += nl;
-    if (pos + 2 > len) return m;
-    const uint16_t kl = getU16(buf + pos); pos += 2;
-    if (pos + kl > len) return m;
-    m.keyField.assign(reinterpret_cast<const char*>(buf + pos), kl); pos += kl;
-    if (pos + 4 > len) return m;
-    const int32_t bl = getI32(buf + pos); pos += 4;
-    if (bl < 0 || pos + static_cast<std::size_t>(bl) > len) return m;
-    if (bl > 0) m.blob.assign(buf + pos, buf + pos + bl);
-    pos += static_cast<std::size_t>(bl);
-    if (pos < len) {   // Phase 2b E; absent => disk
-        if (buf[pos] > 1) {   // unknown mode: never cast it — drop the blob so the
-            m.blob.clear();   // worker answers InvalidSchema (session/corr survive)
-            return m;
-        }
-        m.persistence = buf[pos];
-    }
+    admin_wire::readHead(r, m);
+    m.partitionCount = r.i32();
+    m.validate       = r.u8() != 0;
+    r.str16(m.name);
+    r.str16(m.keyField);
+    r.bytes32(m.blob);
+    m.persistence = r.u8();
+    if (m.persistence > 1) m.malformed = true;   // never cast
+    m.replicationFactor = r.i16();
+    admin_wire::readConfig(r, m.config);
+    admin_wire::readMeta(r, m.meta);
+    admin_wire::finish(r, m);
     return m;
 }
-
-// ---- AlterTopic (Task 11) ----
-inline bool encodeAlterTopic(OneToOneByteRing& ring, const AlterTopicMsg& m) {
-    using namespace admin_wire;
-    const std::size_t len = 8 + 8 + 2
-                          + 2 + m.topicName.size()
-                          + 4 + m.opsBlob.size();
-    const auto idx = ring.tryClaim(kMsgAlterTopic, len);
-    if (idx < 0) return false;
-    uint8_t* p = ring.base() + idx;
-    putI64(p, m.session);         p += 8;
-    putI64(p, m.corr);            p += 8;
-    putU16(p, m.expectedVersion); p += 2;
-    putU16(p, static_cast<uint16_t>(m.topicName.size())); p += 2;
-    std::memcpy(p, m.topicName.data(), m.topicName.size()); p += m.topicName.size();
-    putI32(p, static_cast<int32_t>(m.opsBlob.size())); p += 4;
-    if (!m.opsBlob.empty()) std::memcpy(p, m.opsBlob.data(), m.opsBlob.size());
-    ring.commit(idx);
-    return true;
-}
-
 inline AlterTopicMsg decodeAlterTopic(const uint8_t* buf, std::size_t len) {
-    using namespace admin_wire;
+    admin_wire::Reader r{buf, len};
     AlterTopicMsg m;
-    std::size_t pos = 0;
-    if (len < 20) return m;  // session(8)+corr(8)+expectedVersion(2)+nameLen(2)
-    m.session = getI64(buf + pos); pos += 8;
-    m.corr    = getI64(buf + pos); pos += 8;
-    m.expectedVersion = getU16(buf + pos); pos += 2;
-    const uint16_t nl = getU16(buf + pos); pos += 2;
-    if (pos + nl > len) return m;
-    m.topicName.assign(reinterpret_cast<const char*>(buf + pos), nl); pos += nl;
-    if (pos + 4 > len) return m;
-    const int32_t bl = getI32(buf + pos); pos += 4;
-    if (bl > 0 && pos + static_cast<std::size_t>(bl) <= len)
-        m.opsBlob.assign(buf + pos, buf + pos + bl);
+    admin_wire::readHead(r, m);
+    m.expectedVersion = r.u16();
+    r.str16(m.topicName);
+    r.bytes32(m.opsBlob);
+    admin_wire::readMeta(r, m.meta);
+    admin_wire::finish(r, m);
     return m;
 }
-
-// ---- CreateView (Task 19) ----
-// Wire layout: session:i64, corr:i64, persistence:u8,
-//   viewNameLen:u16 + name, keyFieldLen:u16 + keyField, planLen:i32 + planBlob.
-inline bool encodeCreateView(OneToOneByteRing& ring, const CreateViewMsg& m) {
-    using namespace admin_wire;
-    const std::size_t len = 8 + 8 + 1
-                          + 2 + m.viewName.size()
-                          + 2 + m.keyField.size()
-                          + 4 + m.planBlob.size();
-    const auto idx = ring.tryClaim(kMsgCreateView, len);
-    if (idx < 0) return false;
-    uint8_t* p = ring.base() + idx;
-    putI64(p, m.session); p += 8;
-    putI64(p, m.corr);    p += 8;
-    *p++ = m.persistence;
-    putU16(p, static_cast<uint16_t>(m.viewName.size())); p += 2;
-    std::memcpy(p, m.viewName.data(), m.viewName.size()); p += m.viewName.size();
-    putU16(p, static_cast<uint16_t>(m.keyField.size())); p += 2;
-    std::memcpy(p, m.keyField.data(), m.keyField.size()); p += m.keyField.size();
-    putI32(p, static_cast<int32_t>(m.planBlob.size())); p += 4;
-    if (!m.planBlob.empty()) std::memcpy(p, m.planBlob.data(), m.planBlob.size());
-    ring.commit(idx);
-    return true;
-}
-
 inline CreateViewMsg decodeCreateView(const uint8_t* buf, std::size_t len) {
-    using namespace admin_wire;
+    admin_wire::Reader r{buf, len};
     CreateViewMsg m;
-    std::size_t pos = 0;
-    if (len < 19) return m;  // session(8)+corr(8)+persistence(1)+viewNameLen(2)
-    m.session = getI64(buf + pos); pos += 8;
-    m.corr    = getI64(buf + pos); pos += 8;
-    if (buf[pos] > 1) {   // unknown mode: never cast it — session/corr survive so the
-                          // worker answers InvalidSchema (see startCreateView_)
-        m.malformed = true;
-        return m;
-    }
-    m.persistence = buf[pos++];
-    const uint16_t nl = getU16(buf + pos); pos += 2;
-    if (pos + nl > len) return m;
-    m.viewName.assign(reinterpret_cast<const char*>(buf + pos), nl); pos += nl;
-    if (pos + 2 > len) return m;
-    const uint16_t kl = getU16(buf + pos); pos += 2;
-    if (pos + kl > len) return m;
-    m.keyField.assign(reinterpret_cast<const char*>(buf + pos), kl); pos += kl;
-    if (pos + 4 > len) return m;
-    const int32_t bl = getI32(buf + pos); pos += 4;
-    if (bl > 0 && pos + static_cast<std::size_t>(bl) <= len)
-        m.planBlob.assign(buf + pos, buf + pos + bl);
+    admin_wire::readHead(r, m);
+    m.persistence = r.u8();
+    if (m.persistence > 1) m.malformed = true;   // never cast
+    r.str16(m.viewName);
+    r.str16(m.keyField);
+    r.bytes32(m.planBlob);
+    admin_wire::readMeta(r, m.meta);
+    admin_wire::finish(r, m);
     return m;
 }
+inline DropTopicMsg decodeDropTopic(const uint8_t* buf, std::size_t len) {
+    admin_wire::Reader r{buf, len};
+    DropTopicMsg m;
+    admin_wire::readHead(r, m);
+    r.str16(m.name);
+    admin_wire::readMeta(r, m.meta);
+    admin_wire::finish(r, m);
+    return m;
+}
+inline DropViewMsg decodeDropView(const uint8_t* buf, std::size_t len) {
+    admin_wire::Reader r{buf, len};
+    DropViewMsg m;
+    admin_wire::readHead(r, m);
+    r.str16(m.name);
+    admin_wire::readMeta(r, m.meta);
+    admin_wire::finish(r, m);
+    return m;
+}
+inline AlterViewMsg decodeAlterView(const uint8_t* buf, std::size_t len) {
+    admin_wire::Reader r{buf, len};
+    AlterViewMsg m;
+    admin_wire::readHead(r, m);
+    r.str16(m.name);
+    r.str16(m.keyField);
+    m.persistence = r.u8();
+    if (m.persistence > 1) m.malformed = true;   // never cast
+    m.expectedVersion = r.u32();
+    r.bytes32(m.planBlob);
+    admin_wire::readMeta(r, m.meta);
+    admin_wire::finish(r, m);
+    return m;
+}
+inline AlterTopicConfigMsg decodeAlterTopicConfig(const uint8_t* buf, std::size_t len) {
+    admin_wire::Reader r{buf, len};
+    AlterTopicConfigMsg m;
+    admin_wire::readHead(r, m);
+    r.str16(m.name);
+    m.expectedVersion = r.u32();
+    const uint16_t count = r.u16();
+    if (r.ok && static_cast<std::size_t>(count) * 9u <= len - r.pos) {
+        m.changes.reserve(count);
+        for (uint16_t i = 0; i < count && r.ok; ++i) {
+            const uint8_t key   = r.u8();
+            const int64_t value = r.i64();
+            if (key < static_cast<uint8_t>(rune::protocol::kFirstConfigKey) ||
+                key > static_cast<uint8_t>(rune::protocol::kLastConfigKey)) {
+                m.malformed = true;   // never cast
+                continue;
+            }
+            m.changes.push_back(rune::catalog::ConfigChange{static_cast<rune::catalog::ConfigKey>(key), value});
+        }
+    } else {
+        r.ok = false;
+    }
+    admin_wire::readMeta(r, m.meta);
+    admin_wire::finish(r, m);
+    return m;
+}
+
 
 // ---- GetSchema ----
 // Wire layout: session:i64, corr:i64, requestedFingerprint:u64 (0=latest),
@@ -447,102 +651,6 @@ inline GetSchemaMsg decodeGetSchema(const uint8_t* buf, std::size_t len) {
     const uint16_t nl = getU16(buf + 24);
     if (26 + static_cast<std::size_t>(nl) <= len)
         m.name.assign(reinterpret_cast<const char*>(buf + 26), nl);
-    return m;
-}
-
-// ---- CreateTopicReq ----
-// Layout: ticket:i64, partitionCount:i32, nameLen:u16 + name,
-//         keyFieldLen:u16 + keyField, cleanupPolicy:u8   (Task 19 trailer),
-//         persistence:u8 (Phase 2b E trailer; absent => disk).
-inline bool encodeCreateTopicReq(OneToOneByteRing& ring, const CreateTopicReqMsg& m) {
-    using namespace admin_wire;
-    const std::size_t len = 8 + 4 + 2 + m.name.size()
-                          + 2 + m.keyField.size() + 1 + 1;
-    const auto idx = ring.tryClaim(kMsgCreateTopicReq, len);
-    if (idx < 0) return false;
-    uint8_t* p = ring.base() + idx;
-    putI64(p, m.ticket);         p += 8;
-    putI32(p, m.partitionCount); p += 4;
-    putU16(p, static_cast<uint16_t>(m.name.size())); p += 2;
-    std::memcpy(p, m.name.data(), m.name.size()); p += m.name.size();
-    putU16(p, static_cast<uint16_t>(m.keyField.size())); p += 2;
-    std::memcpy(p, m.keyField.data(), m.keyField.size()); p += m.keyField.size();
-    *p++ = m.cleanupPolicy;
-    *p   = m.persistence;
-    ring.commit(idx);
-    return true;
-}
-
-inline CreateTopicReqMsg decodeCreateTopicReq(const uint8_t* buf, std::size_t len) {
-    using namespace admin_wire;
-    CreateTopicReqMsg m;
-    if (len < 14) return m;
-    m.ticket = getI64(buf);
-    m.partitionCount = getI32(buf + 8);
-    const uint16_t nl = getU16(buf + 12);
-    std::size_t pos = 14;
-    if (pos + nl > len) return m;
-    m.name.assign(reinterpret_cast<const char*>(buf + pos), nl); pos += nl;
-    // Task 19 trailer (keyField + cleanupPolicy) — tolerate its absence so a
-    // decode of a legacy frame still yields name (defaults: empty / Delete).
-    if (pos + 2 > len) return m;
-    const uint16_t kl = getU16(buf + pos); pos += 2;
-    if (pos + kl > len) return m;
-    m.keyField.assign(reinterpret_cast<const char*>(buf + pos), kl); pos += kl;
-    if (pos + 1 > len) return m;
-    m.cleanupPolicy = buf[pos++];
-    if (pos < len) {   // Phase 2b E; absent => disk
-        if (buf[pos] > 1) {   // unknown mode: never cast it — a nameless request fails
-            m.name.clear();   // on the control thread (createTopicForAdmin refuses an invalid name)
-            m.partitionCount = 0;
-            return m;
-        }
-        m.persistence = buf[pos];
-    }
-    return m;
-}
-
-// ---- CreateTopicReply ----
-inline bool encodeCreateTopicReply(OneToOneByteRing& ring, const CreateTopicReplyMsg& m) {
-    using namespace admin_wire;
-    const std::size_t len = 8 + 4 + 4 + 1 + 1 + 1 + 1 + 1;
-    const auto idx = ring.tryClaim(kMsgCreateTopicReply, len);
-    if (idx < 0) return false;
-    uint8_t* p = ring.base() + idx;
-    putI64(p, m.ticket);  p += 8;
-    putI32(p, m.topicId); p += 4;
-    putI32(p, m.partitionCount); p += 4;
-    *p++ = m.existed ? 1 : 0;
-    *p++ = m.persistence;
-    *p++ = m.caseConflict ? 1 : 0;      // DDL conformance B3 trailer
-    *p++ = m.sinkSpecMatches ? 1 : 0;   // Task 14 (KL1 follow-up) trailer
-    *p   = m.existingIsRuntimeCompact ? 1 : 0;   // final review I2 trailer
-    ring.commit(idx);
-    return true;
-}
-
-inline CreateTopicReplyMsg decodeCreateTopicReply(const uint8_t* buf, std::size_t len) {
-    using namespace admin_wire;
-    CreateTopicReplyMsg m;
-    if (len < 12) return m;
-    m.ticket  = getI64(buf);
-    m.topicId = getI32(buf + 8);
-    if (len < 17) return m;   // pre-I1 frame: count not reported, not existed
-    m.partitionCount = getI32(buf + 12);
-    m.existed        = buf[16] != 0;
-    if (len < 18) return m;   // pre-2b-E frame: persistence not reported
-    if (len >= 19) m.caseConflict = buf[18] != 0;   // DDL conformance B3 trailer
-    if (len >= 20) m.sinkSpecMatches = buf[19] != 0;   // Task 14 (KL1 follow-up) trailer
-    if (len >= 21) m.existingIsRuntimeCompact = buf[20] != 0;   // final review I2 trailer
-    if (buf[17] == CreateTopicReplyMsg::kPersistenceNotReported) return m;
-    if (buf[17] > 1) {        // unknown mode: never cast — fail the create
-        m.topicId      = -1;
-        m.caseConflict = false;   // a failed create is Internal, never TopicExists
-        m.sinkSpecMatches = false;   // nor an adoptable sink
-        m.existingIsRuntimeCompact = false;
-        return m;
-    }
-    m.persistence = buf[17];
     return m;
 }
 
@@ -739,24 +847,6 @@ inline ViewPlanUpdateMsg decodeViewPlanUpdate(const uint8_t* buf, std::size_t le
     if (!readBlob(m.outDescBlob)) return m;
     (void)readBlob(m.srcDescBlob);
     return m;
-}
-
-// ---- TopicCommitted (admin → control; B10 / D4 fix round 1) ----
-// Layout: [topicId:i32].
-inline constexpr std::size_t kTopicCommittedWireLen = 4;
-
-inline bool encodeTopicCommitted(OneToOneByteRing& ring, int32_t topicId) {
-    const auto idx = ring.tryClaim(kA2cTopicCommitted, kTopicCommittedWireLen);
-    if (idx < 0) return false;
-    admin_wire::putI32(ring.base() + idx, topicId);
-    ring.commit(idx);
-    return true;
-}
-
-/// The committed topic id, or -1 on a malformed (short) frame.
-[[nodiscard]] inline int32_t decodeTopicCommitted(const uint8_t* buf, std::size_t len) {
-    if (len < kTopicCommittedWireLen) return -1;
-    return admin_wire::getI32(buf);
 }
 
 // ===========================================================================
@@ -1003,16 +1093,15 @@ template <typename Write>
 }
 
 // ---- F3 round 7, item 4: descriptor size is bounded BY CONSTRUCTION ----
-// A descriptor reaches the admin thread only inside a DefineTopic on the
-// request ring (O2O ring: maxMsgLength = capacity / 8), whose fixed framing is
-// session(8)+corr(8)+partitions(4)+validate(1)+nameLen(2)+keyLen(2)+blobLen(4)
-// + the trailing persistence byte (1, Phase 2b E: always written on this in-process
-// ring, so a transient DefineTopic with a max-size descriptor still fits).
+// A descriptor reaches the admin thread only inside a DefineTopic on the request
+// ring (O2O ring: maxMsgLength = capacity / 8), whose fixed framing (catalog
+// history Task 9 layout) is session + corr + partitions + validate + the three
+// length prefixes + persistence + rf + the config block + the meta's fixed part.
 // The SchemaUpdate that re-posts it on the admin→control ring carries only a
-// 4-byte topicId in front, so every committed descriptor fits — the
-// "descriptor too large → validator not pushed" path in
-// AdminWorkerAgent::postSchemaUpdate is unreachable.
-inline constexpr std::size_t kDefineTopicFixedBytes = 8 + 8 + 4 + 1 + 2 + 2 + 4 + 1;
+// 6-byte header in front, so every committed descriptor fits.
+inline constexpr std::size_t kDdlMetaFixedBytes     = 4 + 2 + 2 + 8 + 8 + 8 + 1;
+inline constexpr std::size_t kDefineTopicFixedBytes =
+    8 + 8 + 4 + 1 + 2 + 2 + 4 + 1 + 2 + kTopicConfigFixedBytes + 2 + 2 + kDdlMetaFixedBytes;
 inline constexpr std::size_t kMaxDescriptorViaRequestRing =
     static_cast<std::size_t>(kAdminRequestRingBytes) / 8 - kDefineTopicFixedBytes;
 static_assert(schemaUpdateWireLen(kMaxDescriptorViaRequestRing) <=

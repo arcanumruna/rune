@@ -1,17 +1,19 @@
 #pragma once
 // DdlAnswerGate.h — DDL conformance final review C1 / M7: a DefineTopic /
-// CreateView OK reaches the client only once its topic SERVES.
+// CreateView OK (and, catalog history Task 9, a DdlResponse OK naming a
+// gateTopicId — AlterView's fresh sink) reaches the client only once its topic SERVES.
 //
-// The admin thread posts kA2cTopicCommitted (failure ring) and then the client's
-// OK (egress ring): two rings, no order between them.  The control thread owns
-// the topic's servability (TopicRegistry::commitTopic, driven by that very
-// kA2cTopicCommitted) and its replicas / assignment, so it is the one place that
-// can tell "the topic serves" — no cross-thread read, no ring-order assumption.
+// The admin thread posts the applied topic (kA2cCatalogTopicApplied, failure
+// ring) and then the client's OK (egress ring): two rings, no order between them.
+// The control thread builds the topic (TopicRegistry::createTopicAt) and its
+// replicas / assignment, so it is the one place that can tell "the topic serves"
+// — no cross-thread read, no ring-order assumption.
 //
 // Every admin egress frame passes through offer():
-//   * a DefineTopicResponse / CreateViewResponse with errorCode 0 and a topic id
-//     is GATED on that topic: it leaves only when ready(topicId) holds (the
-//     caller's predicate: committed + every partition's role routed);
+//   * a DefineTopicResponse / CreateViewResponse with errorCode 0 and a topic id,
+//     or a DdlResponse with errorCode 0 and gateTopicId >= 0, is GATED on that
+//     topic: it leaves only when ready(topicId) holds (the caller's predicate:
+//     applied + every partition assigned and its role routed);
 //   * any other frame is gated on nothing;
 //   * FIFO: once one frame is held, every later frame queues behind it (a
 //     session's answers never overtake each other).
@@ -55,6 +57,12 @@ public:
             const auto r = pc::CreateViewResponse::decode(frame, n);
             return (r && r->errorCode == 0) ? r->viewTopicId : -1;
         }
+        // Catalog history Task 9: a DdlResponse names the topic its answer is
+        // gated on (AlterView's fresh sink; -1 = none).
+        if (h->templateId == pc::DdlResponse::TEMPLATE_ID) {
+            const auto r = pc::DdlResponse::decode(frame, n);
+            return (r && r->errorCode == 0 && r->gateTopicId >= 0) ? r->gateTopicId : -1;
+        }
         return -1;
     }
 
@@ -96,6 +104,13 @@ public:
             if (!r) return 0;
             r->viewTopicId = -1; r->outputFingerprint = 0; r->errorCode = internal;
             static_assert(pc::MessageHeader::ENCODED_SIZE + pc::CreateViewResponse::BODY_FIXED <= kInDoubtMaxBytes);
+            return r->encode(out);
+        }
+        if (h->templateId == pc::DdlResponse::TEMPLATE_ID) {
+            auto r = pc::DdlResponse::decode(frame, n);
+            if (!r) return 0;
+            r->errorCode = internal; r->gateTopicId = -1; r->detail = {};   // the OK's detail is empty anyway
+            static_assert(pc::MessageHeader::ENCODED_SIZE + pc::DdlResponse::BODY_FIXED + 2 <= kInDoubtMaxBytes);
             return r->encode(out);
         }
         return 0;

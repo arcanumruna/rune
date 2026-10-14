@@ -14,6 +14,8 @@
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/ITxnRequestHandler.h>
 #include <rune/gateway/TopicRegistry.h>
+#include <rune/metadata/Gpid.h>
+#include <rune/metadata/RoutingImage.h>
 #include <rune/metadata/ShardRouter.h>
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/node/WorkerOp.h>
@@ -187,8 +189,9 @@ struct Rig {
         const bool runtime = c.e.commit == mx::Commit::Uncommitted;
         if (runtime) {
             topics = std::make_unique<TopicRegistry>(std::vector<rune::node::TopicSpec>{}, dataDir.string());
-            EXPECT_EQ(topics->createTopic(tt), kTT);   // C1: awaiting the catalog commit
-            EXPECT_EQ(topics->createTopic(dt), kDT);
+            // C1 (catalog history Task 9): "uncommitted" is now "applied but not placed".
+            EXPECT_EQ(topics->createTopicAt(kTT, tt), kTT);
+            EXPECT_EQ(topics->createTopicAt(kDT, dt), kDT);
         } else {
             topics = std::make_unique<TopicRegistry>(std::vector<rune::node::TopicSpec>{tt, dt}, dataDir.string());
         }
@@ -231,10 +234,13 @@ struct Rig {
         rep[topicId] = r.get();
         reg.add(topicId, 0, std::move(r));
     }
-    /// What BrokerNode's kA2cTopicCommitted handler does (C1): servable + replicas built.
+    /// The placement commits (C1): the committed routing image names this node,
+    /// and the replicas are built (createRuntimeUserReplicas).
     void commitTopics() {
-        ASSERT_TRUE(topics->commitTopic(kTT));
-        ASSERT_TRUE(topics->commitTopic(kDT));
+        gw.setNodeIdForTest(1);
+        gw.setRoutingImageSnapshot(rune::metadata::RoutingImage::build(
+            {{rune::metadata::gpidOf(kTT, 0), 1, 1}, {rune::metadata::gpidOf(kDT, 0), 1, 1}},
+            rune::metadata::RoutingImage::Source::Committed));
         addReplica(kTT);
         addReplica(kDT);
         pool->assignFromRegistry(reg);

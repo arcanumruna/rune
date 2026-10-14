@@ -47,7 +47,8 @@ namespace rune::node {
                                                                 std::size_t maxFrame);
 /// LEADER-side dry run (Task 9 wires it into the AdminWorker): apply a copy of
 /// `e` (its fingerprint re-stamped) to a copy of `before` and size every effect
-/// frame it would produce.  nullopt = the event's effects fit; otherwise the
+/// frame it would produce — and, for a schema change of a topic, the plan frame of
+/// every live view that reads that topic (its source descriptor grows with it).  nullopt = the event's effects fit; otherwise the
 /// InvalidRequest detail.  An event the rules refuse is not this function's
 /// business: nullopt (the write path reports the apply refusal itself).
 [[nodiscard]] std::optional<std::string> catalogEventEffectsRefusal(const rune::catalog::CatalogState& before,

@@ -74,7 +74,7 @@ struct RigOpts {
 
 // Gateway + topic 0 "presence" (1 partition, TRANSIENT) + its leader replica on
 // an InMemoryLog (built at construction, or — runtime — only on commit(), the
-// way BrokerNode builds it on kA2cTopicCommitted).
+// way BrokerNode builds it on kA2cCatalogTopicApplied).
 struct Rig {
     TempDir                                   dir;
     RigOpts                                   o;
@@ -105,8 +105,9 @@ struct Rig {
         ts.persistence = rune::node::PersistenceMode::Transient;
         if (o.runtime) {
             registry = std::make_unique<TopicRegistry>(std::vector<rune::node::TopicSpec>{}, dir.path.string());
-            EXPECT_EQ(registry->createTopic(ts), 0);   // C1: awaiting its catalog commit
-            EXPECT_TRUE(registry->awaitingCommit(0));
+            // C1 (catalog history Task 9): applied at its catalog id, not placed yet.
+            EXPECT_EQ(registry->createTopicAt(0, ts), 0);
+            EXPECT_TRUE(registry->placementGated(0));
         } else {
             registry = std::make_unique<TopicRegistry>(std::vector<rune::node::TopicSpec>{ts}, dir.path.string());
         }
@@ -147,10 +148,14 @@ struct Rig {
         reg.add(0, 0, std::move(r));
         if (pool) pool->assignFromRegistry(reg);
     }
-    /// What BrokerNode's kA2cTopicCommitted handler does: the topic becomes
-    /// servable and its replicas are built (createRuntimeUserReplicas).
+    /// The catalog topic's placement commits (the committed routing image names
+    /// this node) and its replicas are built (createRuntimeUserReplicas).
     void commit() {
-        ASSERT_TRUE(registry->commitTopic(0));
+        std::vector<rune::metadata::RoutingImage::BuildEntry> img;
+        for (int32_t p = 0; p < o.partitions; ++p) img.push_back({rune::metadata::gpidOf(0, p), 1, 1});
+        gw.setNodeIdForTest(1);
+        gw.setRoutingImageSnapshot(
+            rune::metadata::RoutingImage::build(img, rune::metadata::RoutingImage::Source::Committed));
         addReplica();
     }
     void onFrame(const uint8_t* b, std::size_t n, bool sessionEgress) {
@@ -314,7 +319,7 @@ TEST(TransientGatewayRegression, TxnMarkerForATransientPartitionIsRoutedToTheWor
 // catalog record has not committed serves NOTHING — produce NotLeader (nothing
 // appended), subscribe the bare ErrorResponse{NotLeader} (nothing registered),
 // no group subscription, no marker — exactly like an uncommitted disk topic.
-// Once committed (and its replica built, as kA2cTopicCommitted does) it serves.
+// Once committed (and its replica built, as kA2cCatalogTopicApplied does) it serves.
 TEST(TransientGatewayRegression, UncommittedTransientTopicServesNothingUntilCommitRegression) {
     Rig r({.workers = true, .runtime = true});
     const int64_t sid = r.gw.injectTestSession(0);
@@ -1034,7 +1039,7 @@ TEST(TransientGatewayRegression, SubscriptionAcceptedBeforeItsReplicaIsRetiredWh
 // ---------------------------------------------------------------------------
 // E2 final fix wave (final review M6): the legacy-mode push loop classified
 // every transient subscription on every cycle (servedPartition_: servableLog,
-// awaitingCommit, topic, a replica lookup — then a second and a third lookup).
+// state, topic, a replica lookup — then a second and a third lookup).
 // The classification and replica are now cached on the subscription and
 // refreshed only when the replica registry or the catalog changes; delivery is
 // unchanged.  RED (classified every pass): 200 classifications for 200 passes.

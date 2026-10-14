@@ -16,6 +16,7 @@
 #include <rune/aeronutil/testing/FreePort.h>
 #include "../support/TestNodeConfig.h"
 #include <rune/node/BrokerNode.h>
+#include <rune/node/RuntimeTopicRecovery.h>   // kTopicIdMarkerFile
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/node/HostDefaults.h>
 #include <rune/node/Worker.h>
@@ -1922,6 +1923,61 @@ TEST(BrokerNodeRegression, GatewayConstructionFailureRefusesToStartNotHeadless) 
 // the topic on an InMemoryLog (no disk partition dir), and after a node restart
 // the topic EXISTS again as a transient topic and is EMPTY (data never on disk).
 // ---------------------------------------------------------------------------
+// Catalog history Task 9: a DISK topic created by DDL comes back after a restart
+// from the __catalog boot replay — at its catalog id, WITH its data: boot's topic
+// dir reconcile claims the catalog's live topics (the interim scan until Task
+// 16), so the dir is never quarantined and the topic never restarts empty.
+TEST(BrokerNodeRegression, CatalogDiskTopicKeepsItsDataAcrossARestartRegression) {
+    using Clock = std::chrono::steady_clock;
+    using rune::replication::PartitionReplica;
+    const fs::path dir = makeTempDataDir("catalog_restart_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    const uint16_t clientPort = rune::node::test::freeUdpPort();
+    cfg.clientEndpoint.channel = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(clientPort);
+    const std::string& gw = cfg.clientEndpoint.channel;
+    const int32_t stream  = cfg.clientEndpoint.streamId;
+    const std::vector<uint8_t> blob = rune::codec::serialize(
+        rune::codec::DescriptorBuilder("kept_disk").add("id", rune::codec::PrimType::Int64, 1, true).build());
+    auto awaitLeaderReplica = [](BrokerNode& n, int32_t topicId, Clock::time_point deadline) {
+        while (Clock::now() < deadline) {
+            if (rune::node::test::hasReplica(n, topicId, 0) &&
+                rune::node::test::roleOnOwner(n, topicId, 0) == rune::replication::Role::Leader)
+                return true;
+            std::this_thread::sleep_for(5ms);   // poll interval, not correctness
+        }
+        return false;
+    };
+    int32_t topicId = -1;
+    {
+        BrokerNode node{cfg};
+        node.start();
+        ASSERT_TRUE(node.awaitLeader(30s));
+        rune::node::test::ShardTestClient client(dir / "client-aeron");
+        const int64_t sid = client.connect(gw, stream);
+        ASSERT_GT(sid, 0);
+        const auto def = client.defineTopicUntil(gw, stream, sid, "kept_disk", 1, /*validate=*/false, blob,
+                                                 Clock::now() + 20s);
+        ASSERT_TRUE(def.has_value());
+        ASSERT_EQ(def->errorCode, 0u);
+        topicId = def->topicId;
+        ASSERT_TRUE(awaitLeaderReplica(node, topicId, Clock::now() + 10s));
+        const std::vector<uint8_t> rec(24, 0x5A);
+        ASSERT_GE(rune::node::test::appendOnOwner(node, rec, /*acksAll=*/false, topicId, 0), 0);
+        ASSERT_EQ(rune::node::test::leoOnOwner(node, topicId, 0), 1);
+        node.stop();
+    }
+    {
+        BrokerNode node{cfg};
+        node.start();
+        ASSERT_TRUE(node.awaitLeader(30s));
+        ASSERT_TRUE(awaitLeaderReplica(node, topicId, Clock::now() + 20s)) << "rebuilt by the boot replay";
+        EXPECT_EQ(rune::node::test::leoOnOwner(node, topicId, 0), 1) << "its data survived the restart";
+        EXPECT_FALSE(fs::exists(dir / "quarantine")) << "the catalog topic's dir was claimed, never quarantined";
+        node.stop();
+    }
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+
 TEST(BrokerNodeRegression, RuntimeTransientTopicIsInMemoryAndRestartsEmptyRegression) {
     namespace pc = rune::protocol::client;
     using Clock = std::chrono::steady_clock;
@@ -1993,7 +2049,7 @@ TEST(BrokerNodeRegression, RuntimeTransientTopicIsInMemoryAndRestartsEmptyRegres
         node.start();
         ASSERT_TRUE(node.awaitLeader(30s));
         ASSERT_TRUE(awaitLeaderReplica(node, topicId, Clock::now() + 20s))
-            << "the transient topic's metadata must survive the restart (recovered from __topic_schemas)";
+            << "the transient topic's metadata must survive the restart (the __catalog boot replay)";
         const auto [mem, leo] = node.onOwnerThreadForTest(topicId, 0,
             [](PartitionReplica& r) { return std::pair{r.isMemoryBacked(), r.logEndOffset()}; });
         EXPECT_TRUE(mem) << "recovered as TRANSIENT, not as a disk topic";
@@ -2005,14 +2061,13 @@ TEST(BrokerNodeRegression, RuntimeTransientTopicIsInMemoryAndRestartsEmptyRegres
 }
 
 // ---------------------------------------------------------------------------
-// B10 / D4 fix round 1 (I1): the REAL production path of the two-phase topic-id
-// marker on a live single-node BrokerNode.  A client DefineTopic → the control
-// thread's createTopic writes "pending <id>" → the admin thread commits the
-// __topic_schemas record (HW gate) → deps.topicCommitted → kA2cTopicCommitted on
-// the admin→control ring → the control thread (TopicRegistry's single writer)
-// rewrites the marker "committed <id>".  Condition-driven, bounded.
+// Catalog history Task 9 (the catalog equivalent of B10 / D4's marker test): on a
+// live single-node BrokerNode a client DefineTopic is ONE __catalog event; once it
+// is committed and applied the control thread builds the topic at its catalog id
+// (kA2cCatalogTopicApplied) — replicas included — and writes NO topic-id marker
+// (the catalog is the record of truth).  Condition-driven, bounded.
 // ---------------------------------------------------------------------------
-TEST(BrokerNodeRegression, DefineTopicMarksTheTopicDirCommittedOverTheAdminRingRegression) {
+TEST(BrokerNodeRegression, CatalogDefineTopicBuildsTheTopicAtItsCatalogIdWithNoMarkerRegression) {
     const fs::path dir = makeTempDataDir("marker_e2e_");
     NodeConfig cfg = makeSingleNodeConfig(dir);
     const uint16_t clientPort = rune::node::test::freeUdpPort();
@@ -2050,34 +2105,85 @@ TEST(BrokerNodeRegression, DefineTopicMarksTheTopicDirCommittedOverTheAdminRingR
     }
     ASSERT_GE(topicId, 0);
 
-    const fs::path marker = dir / "topics" / "marked" / rune::gateway::kTopicIdMarkerFile;
-    const std::string want = "committed " + std::to_string(topicId) + "\n";
-    std::string got;
-    while (Clock::now() < deadline) {
-        std::ifstream in(marker, std::ios::binary);
-        got.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
-        if (got == want) break;
-        std::this_thread::sleep_for(5ms);
-    }
-    EXPECT_EQ(got, want) << "the control thread must rewrite the marker once the record commits";
-    EXPECT_FALSE(fs::exists(marker.parent_path() / rune::gateway::kTopicIdMarkerTmpFile));
+    EXPECT_EQ(topicId, 0) << "the first catalog id";
+    EXPECT_TRUE(rune::node::test::hasReplica(node, topicId, 0)) << "built from the applied event";
+    EXPECT_TRUE(fs::exists(dir / "topics" / "marked" / "0"));
+    EXPECT_FALSE(fs::exists(dir / "topics" / "marked" / rune::node::kTopicIdMarkerFile))
+        << "a catalog topic carries no topic-id marker";
 
     node.stop();
     std::error_code ec; fs::remove_all(dir, ec);
 }
 
 // ---------------------------------------------------------------------------
+// Catalog history Task 9 (fix-on-sight, Task 4 M3): a test helper whose encoder
+// refuses a frame (encode() returns 0 for a field over its wire width) never
+// sends a zero-length frame — the DDL helpers report the refusal explicitly.
+// ---------------------------------------------------------------------------
+TEST(ShardTestClientRegression, AnEncoderRefusalIsNeverSentRegression) {
+    const fs::path dir = makeTempDataDir("stc_encode0_");
+    fs::create_directories(dir);
+    rune::node::test::ShardTestClient client(dir / "client-aeron");
+    const std::string tooLong(0x10000, 'x');   // one past a varstr's u16 length
+    const std::string channel = "aeron:udp?endpoint=127.0.0.1:9";   // never reached
+    EXPECT_EQ(client.sendDefineTopic(channel, 1, 1, tooLong, 1, {}), 0) << "DefineTopic";
+    EXPECT_EQ(client.sendCreateView(channel, 1, 1, tooLong, "id", 0, {}), 0) << "CreateView";
+    EXPECT_EQ(client.sendAlterTopic(channel, 1, 1, tooLong, 0, {}), 0) << "AlterTopic";
+    EXPECT_EQ(client.sendGetTopicSchema(channel, 1, 1, tooLong), 0) << "GetTopicSchema";
+    EXPECT_FALSE(client.defineTopicUntil(channel, 1, 1, tooLong, 1, false, {},
+                                         std::chrono::steady_clock::now() + 1s).has_value());
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+
+// ---------------------------------------------------------------------------
+// Catalog history Task 9 (found while wiring the catalog OK): the admin thread
+// posts the applied topic (failure ring) and the client's OK (egress ring) with
+// no order between them, so the DDL answer gate must hold an OK until the
+// control thread has BUILT the topic at its catalog id and placed it — the old
+// predicate treated "not built yet" as "serves" and released the OK at once.
+// Deterministic: building the topic fails (setCommitReplicaFaultForTest), so it
+// never serves — the client must get Internal (in doubt) after the hold, never OK.
+// ---------------------------------------------------------------------------
+TEST(BrokerNodeRegression, CatalogDefineTopicOkIsNeverSentForATopicNotBuiltRegression) {
+    const fs::path dir = makeTempDataDir("catalog_ok_gate_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    const uint16_t clientPort = rune::node::test::freeUdpPort();
+    cfg.clientEndpoint.channel = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(clientPort);
+    BrokerNode node{cfg};
+    node.setCommitReplicaFaultForTest("unbuilt");
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(30s));
+
+    rune::node::test::ShardTestClient client(dir / "client-aeron");
+    const std::string& gw = cfg.clientEndpoint.channel;
+    const int32_t stream  = cfg.clientEndpoint.streamId;
+    const int64_t sid = client.connect(gw, stream);
+    ASSERT_GT(sid, 0);
+    const std::vector<uint8_t> blob = rune::codec::serialize(
+        rune::codec::DescriptorBuilder("unbuilt").add("id", rune::codec::PrimType::Int64).build());
+    namespace pc = rune::protocol::client;
+    const auto def = client.defineTopicUntil(gw, stream, sid, "unbuilt", 1, /*validate=*/false, blob,
+                                             std::chrono::steady_clock::now() + 20s);
+    ASSERT_TRUE(def.has_value()) << "the DDL must be answered (never a wait-out)";
+    EXPECT_EQ(def->errorCode, static_cast<uint16_t>(pc::ErrorCode::Internal))
+        << "an OK for a topic that was never built is a silent fallback";
+    EXPECT_FALSE(rune::node::test::hasReplica(node, 0, 0));
+    node.stop();
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+
+// ---------------------------------------------------------------------------
 // DDL conformance B3 end to end on a live single-node BrokerNode: a DefineTopic
-// whose name differs only in letter case from an existing topic (runtime or
-// RUNE_TOPICS static) is TopicExists carrying the existing topic's id, and the
-// control thread creates NOTHING for it (no topic id consumed, no replica) —
-// the caseConflict trailer crosses the real CreateTopicReply ring.
+// whose name differs only in letter case from an existing topic is TopicExists
+// carrying the existing topic's id, and NOTHING is created for it (no catalog id
+// consumed, no replica) — catalog history Task 9: decided by the catalog leader
+// from its applied state (rune/catalog/TopicName.h fold), no event appended.
 // ---------------------------------------------------------------------------
 TEST(BrokerNodeRegression, CaseVariantDefineTopicIsTopicExistsEndToEndRegression) {
     const fs::path dir = makeTempDataDir("case_fold_e2e_");
     NodeConfig cfg = makeSingleNodeConfig(dir);
-    TopicSpec stat; stat.name = "Stat"; stat.partitionCount = 1; stat.topicId = 0;
-    cfg.topics = {stat};
+    // Catalog history Task 9: DDL-created and static topics never share a broker
+    // (the catalog's ids would collide) — the case rule is the catalog's own.
     BrokerNode node{cfg};
     node.start();
     ASSERT_TRUE(node.awaitLeader(30s));
@@ -2119,13 +2225,6 @@ TEST(BrokerNodeRegression, CaseVariantDefineTopicIsTopicExistsEndToEndRegression
         ASSERT_TRUE(r.has_value()) << "no DefineTopicResponse";
         EXPECT_EQ(r->errorCode, kExists);
         EXPECT_EQ(r->topicId, ordersId) << "answers the colliding topic's id";
-    }
-    for (const std::string name : {"stat", "STAT"}) {
-        SCOPED_TRACE(name);
-        const auto r = define(name, 0);
-        ASSERT_TRUE(r.has_value());
-        EXPECT_EQ(r->errorCode, kExists);
-        EXPECT_EQ(r->topicId, 0) << "the static topic's id";
     }
 
     // Nothing was created for any refused variant: the next topic takes the very

@@ -23,8 +23,12 @@ static std::filesystem::path makeTempDir(const char* stem)
     static std::atomic<uint64_t> g_seq{0};
     auto id = std::to_string(::getpid()) + "_" +
               std::to_string(g_seq.fetch_add(1, std::memory_order_relaxed));
-    return std::filesystem::temp_directory_path() /
-           (std::string("rune_tr_") + stem + "_" + id);
+    // A reused pid could meet a previous run's dir (these tests never remove
+    // theirs): start from an empty one, so a recovery assertion never reads stale data.
+    auto p = std::filesystem::temp_directory_path() / (std::string("rune_tr_") + stem + "_" + id);
+    std::error_code ec;
+    std::filesystem::remove_all(p, ec);
+    return p;
 }
 
 // Helper: build a TopicSpec.

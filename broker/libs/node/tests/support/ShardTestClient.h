@@ -160,8 +160,8 @@ public:
         msg.acks = acks; msg.producerId = -1; msg.producerEpoch = 0; msg.baseSequence = -1;
         msg.recordBatch = std::span<const uint8_t>(batch.data(), batch.size());
         std::vector<uint8_t> buf(msg.encodedSize());
-        msg.encode(buf.data());
-        return send(channel, stream, buf.data(), buf.size());
+        const std::size_t encodedLen = msg.encode(buf.data());
+        return send(channel, stream, buf.data(), encodedLen);
     }
 
     /// An idempotent produce (F15 S5 e2e): producer id / epoch / sequence on the wire.
@@ -175,8 +175,8 @@ public:
         msg.baseSequence = baseSequence;
         msg.recordBatch = std::span<const uint8_t>(batch.data(), batch.size());
         std::vector<uint8_t> buf(msg.encodedSize());
-        msg.encode(buf.data());
-        return send(channel, stream, buf.data(), buf.size());
+        const std::size_t encodedLen = msg.encode(buf.data());
+        return send(channel, stream, buf.data(), encodedLen);
     }
 
     std::optional<pc::ProduceResponse> awaitProduceResponse(int64_t corr) {
@@ -214,9 +214,9 @@ public:
         pc::MetadataRequest req;
         req.sessionId = sessionId; req.correlationId = ++corr_;
         std::vector<uint8_t> buf(req.encodedSize());
-        req.encode(buf.data());
+        const std::size_t encodedLen = req.encode(buf.data());
         metadata_.reset();
-        if (!send(gatewayChannel, stream, buf.data(), buf.size())) return {};
+        if (!send(gatewayChannel, stream, buf.data(), encodedLen)) return {};
         for (int i = 0; i < kMaxIters && !metadata_; ++i) { poll_(); pause_(); }
         return metadata_.value_or(std::vector<PartitionInfo>{});
     }
@@ -290,18 +290,31 @@ public:
                                                             Clock::time_point deadline,
                                                             uint8_t persistence = 0) {
         pc::DefineTopic m;
-        m.sessionId = sessionId; m.correlationId = ++corr_;
+        m.sessionId = sessionId;
         m.topicName = name; m.partitionCount = partitions; m.validate = validate;
         m.persistence = persistence;
         m.descriptorBlob = descriptor.data();
         m.descriptorLen  = static_cast<uint32_t>(descriptor.size());
-        std::vector<uint8_t> buf(m.encodedSize());
-        const std::size_t len = m.encode(buf.data());
-        const int64_t c = m.correlationId;
-        if (!send(gatewayChannel, stream, buf.data(), len)) return std::nullopt;
+        // Catalog history Task 9: a v8 DDL (the extension carries a requestId, stable
+        // across the resends below) — a broker that is not (yet) the catalog leader
+        // answers the retriable NotLeader, resent here within the deadline exactly
+        // as the client does; a retry of a committed DDL gets its original result.
+        m.hasExt = true;
+        m.ext.clientName = "shard-test-client";
+        m.ext.requestId  = nextRequestId_();
         while (Clock::now() < deadline) {
-            poll_();
-            if (auto it = defines_.find(c); it != defines_.end()) return it->second;
+            m.correlationId = ++corr_;
+            std::vector<uint8_t> buf(m.encodedSize());
+            const std::size_t len = m.encode(buf.data());
+            const int64_t c = m.correlationId;
+            if (!send(gatewayChannel, stream, buf.data(), len)) return std::nullopt;
+            std::optional<pc::DefineTopicResponse> got;
+            while (!got && Clock::now() < deadline) {
+                poll_();
+                if (auto it = defines_.find(c); it != defines_.end()) got = it->second;
+                else pause_();
+            }
+            if (!got || got->errorCode != static_cast<uint16_t>(pc::ErrorCode::NotLeader)) return got;
             pause_();
         }
         return std::nullopt;
@@ -430,6 +443,7 @@ public:
         m.sessionId = sid; m.correlationId = ++corr_; m.topicName = name; m.partitionCount = partitions;
         m.keyField = "id"; m.validate = false; m.persistence = persistence;
         m.descriptorBlob = descriptor.data(); m.descriptorLen = static_cast<uint32_t>(descriptor.size());
+        m.hasExt = true; m.ext.clientName = "shard-test-client"; m.ext.requestId = nextRequestId_();
         std::vector<uint8_t> buf(m.encodedSize());
         const std::size_t len = m.encode(buf.data());
         return send(ch, stream, buf.data(), len) ? m.correlationId : 0;
@@ -439,6 +453,7 @@ public:
         pc::CreateView m;
         m.sessionId = sid; m.correlationId = ++corr_; m.viewName = viewName; m.keyField = keyField;
         m.persistence = persistence; m.planBlob = plan.data(); m.planLen = static_cast<uint32_t>(plan.size());
+        m.hasExt = true; m.ext.clientName = "shard-test-client"; m.ext.requestId = nextRequestId_();
         std::vector<uint8_t> buf(m.encodedSize());
         const std::size_t len = m.encode(buf.data());
         return send(ch, stream, buf.data(), len) ? m.correlationId : 0;
@@ -448,6 +463,7 @@ public:
         pc::AlterTopic m;
         m.sessionId = sid; m.correlationId = ++corr_; m.topicName = name; m.expectedVersion = expectedVersion;
         m.opsBlob = ops.data(); m.opsLen = static_cast<uint32_t>(ops.size());
+        m.hasExt = true; m.ext.clientName = "shard-test-client"; m.ext.requestId = nextRequestId_();
         std::vector<uint8_t> buf(m.encodedSize());
         const std::size_t len = m.encode(buf.data());
         return send(ch, stream, buf.data(), len) ? m.correlationId : 0;
@@ -570,6 +586,10 @@ public:
     }
 
     bool send(const std::string& channel, int32_t stream, const uint8_t* buf, std::size_t len) {
+        // Catalog history Task 9 (Task 4 M3): an encoder that returns 0 refused the
+        // frame (a field over its wire width) — never send a zero-length frame: an
+        // explicit failure for the caller (a DDL helper answers 0 / nullopt).
+        if (len == 0) return false;
         auto& pub = pubs_[{channel, stream}];
         if (!pub) {
             const int64_t reg = aeron_->addPublication(channel, stream);
@@ -585,6 +605,12 @@ public:
     }
 
 private:
+    /// A v8 DDL's 128-bit id: this client's instance tag + a counter (F14).
+    rune::protocol::RequestId nextRequestId_() noexcept {
+        return {0x5C1E'0000'0000'0000ull | static_cast<uint64_t>(reinterpret_cast<std::uintptr_t>(this) & 0xFFFF'FFFF),
+                ++requestCounter_};
+    }
+    uint64_t requestCounter_ = 0;
     static EmbeddedDriverConfig cfgFor(const std::filesystem::path& d, int32_t termBufferBytes,
                                        bool legacyTransport = false) {
         EmbeddedDriverConfig c; c.dir = d.string(); c.termBufferBytes = termBufferBytes;

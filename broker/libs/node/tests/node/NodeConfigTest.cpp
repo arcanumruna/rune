@@ -1,5 +1,5 @@
 #include <rune/node/NodeConfig.h>
-#include <rune/node/TopicName.h>
+#include <rune/catalog/TopicName.h>
 #include <rune/node/EmbeddedDriver.h>
 #include <rune/node/HostDefaults.h>
 #include <rune/node/EmbeddedDriver.h>
@@ -2952,29 +2952,29 @@ TEST(NodeConfigRegression, TransientLogRingBytesWinsOverAlias) {
 // ── DDL conformance B7 / user decision D2d: static RUNE_TOPICS names obey the DDL
 //    name rule (TopicName.h) — a bad name is a boot config error naming the entry.
 namespace {
-struct BadStaticName { std::string name; rune::node::TopicNameError kind; const char* label; };
+struct BadStaticName { std::string name; rune::catalog::TopicNameError kind; const char* label; };
 std::vector<BadStaticName> badStaticNames() {
-    using rune::node::TopicNameError;
+    using rune::catalog::TopicNameError;
     return {
-        {std::string(250, 'x'), TopicNameError::TooLong, "len250"},
-        {std::string(600, 'y'), TopicNameError::TooLong, "len600"},
-        {".", TopicNameError::DotSegment, "dot"},
-        {"..", TopicNameError::DotSegment, "dotdot"},
-        {"../escape", TopicNameError::BadChar, "traversal"},
-        {"a/b", TopicNameError::BadChar, "slash"},
-        {"/abs", TopicNameError::BadChar, "absolute"},
-        {"a\\b", TopicNameError::BadChar, "backslash"},
-        {"has space", TopicNameError::BadChar, "space"},
-        {"tab\tname", TopicNameError::BadChar, "tab"},
-        {"caf\xc3\xa9", TopicNameError::BadChar, "nonascii"},
-        {"__topic_schemas", TopicNameError::Reserved, "topic_schemas"},
-        {"__views", TopicNameError::Reserved, "views"},
-        {"__consumer_offsets", TopicNameError::Reserved, "consumer_offsets"},
-        {"__transaction_state", TopicNameError::Reserved, "transaction_state"},
-        {"__cluster_metadata", TopicNameError::Reserved, "cluster_metadata"},
-        {"__view_snapshots", TopicNameError::Reserved, "view_snapshots"},
-        {"__orphan.1", TopicNameError::Reserved, "orphan"},
-        {"__x", TopicNameError::Reserved, "x"},
+        {std::string(250, 'x'), rune::catalog::TopicNameError::TooLong, "len250"},
+        {std::string(600, 'y'), rune::catalog::TopicNameError::TooLong, "len600"},
+        {".", rune::catalog::TopicNameError::DotSegment, "dot"},
+        {"..", rune::catalog::TopicNameError::DotSegment, "dotdot"},
+        {"../escape", rune::catalog::TopicNameError::BadChar, "traversal"},
+        {"a/b", rune::catalog::TopicNameError::BadChar, "slash"},
+        {"/abs", rune::catalog::TopicNameError::BadChar, "absolute"},
+        {"a\\b", rune::catalog::TopicNameError::BadChar, "backslash"},
+        {"has space", rune::catalog::TopicNameError::BadChar, "space"},
+        {"tab\tname", rune::catalog::TopicNameError::BadChar, "tab"},
+        {"caf\xc3\xa9", rune::catalog::TopicNameError::BadChar, "nonascii"},
+        {"__topic_schemas", rune::catalog::TopicNameError::Reserved, "topic_schemas"},
+        {"__views", rune::catalog::TopicNameError::Reserved, "views"},
+        {"__consumer_offsets", rune::catalog::TopicNameError::Reserved, "consumer_offsets"},
+        {"__transaction_state", rune::catalog::TopicNameError::Reserved, "transaction_state"},
+        {"__cluster_metadata", rune::catalog::TopicNameError::Reserved, "cluster_metadata"},
+        {"__view_snapshots", rune::catalog::TopicNameError::Reserved, "view_snapshots"},
+        {"__orphan.1", rune::catalog::TopicNameError::Reserved, "orphan"},
+        {"__x", rune::catalog::TopicNameError::Reserved, "x"},
     };
 }
 } // namespace
@@ -2983,15 +2983,15 @@ class RuneTopicsNameRegression : public ::testing::TestWithParam<BadStaticName> 
 
 TEST_P(RuneTopicsNameRegression, InvalidNameIsAConfigErrorNamingTheEntry) {
     const BadStaticName& b = GetParam();
-    ASSERT_EQ(rune::node::checkTopicName(b.name), b.kind) << "table sanity";
-    const std::string reason(rune::node::topicNameErrorText(b.kind));
+    ASSERT_EQ(rune::catalog::checkTopicName(b.name), b.kind) << "table sanity";
+    const std::string reason(rune::catalog::topicNameErrorText(b.kind));
     // First, in the middle (after a valid entry), and last.
     for (const std::string& list : {b.name + ":1", "ok:1," + b.name + ":2", b.name + ":1,ok:2"}) {
         SCOPED_TRACE(list);
         const auto res = parseWithTopics(list.c_str());
         ASSERT_FALSE(res.config.has_value()) << "must refuse to boot";
         // The name and entry are escaped (fix-on-sight: no raw control bytes in the error).
-        const std::string shown = rune::node::escapeNameForLog(b.name);
+        const std::string shown = rune::catalog::escapeNameForLog(b.name);
         EXPECT_NE(res.error.find("RUNE_TOPICS topic name '" + shown + "' is invalid"), std::string::npos) << res.error;
         EXPECT_NE(res.error.find(reason), std::string::npos) << res.error;
         EXPECT_NE(res.error.find("in entry: " + shown + ":"), std::string::npos) << "names the entry: " << res.error;

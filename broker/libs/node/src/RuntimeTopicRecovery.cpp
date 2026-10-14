@@ -3,11 +3,12 @@
 
 #include <rune/node/PersistenceMode.h>
 #include <rune/node/SchemaRegistry.h>   // TopicSchema
-#include <rune/node/TopicName.h>        // topicNamesFoldEqual
+#include <rune/node/CatalogCheckpoint.h>
 #include <rune/node/ViewRegistry.h>     // ViewRecord
 
 #include <rune/codec/Serialize.h>       // rune::codec::deserialize
-#include <rune/gateway/TopicRegistry.h> // kTopicIdMarkerFile
+#include <rune/catalog/CatalogReplayer.h>
+#include <rune/catalog/TopicName.h>      // topicNamesFoldEqual
 #include <rune/protocol/RecordBatch.h>  // RecordBatchReader
 #include <rune/storage/Log.h>
 #include <rune/view/ViewPlan.h>         // deserializeCompiledViewPlan
@@ -15,6 +16,9 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
 #include <climits>
 #include <filesystem>
 #include <fstream>
@@ -26,9 +30,16 @@
 #include <string>
 #include <string_view>
 
+#include <fcntl.h>
+#include <unistd.h>
+
 namespace fs = std::filesystem;
 
 namespace rune::node {
+
+using rune::catalog::isValidTopicName;
+using rune::catalog::topicNamesFoldEqual;
+using rune::catalog::escapeNameForLog;
 
 namespace {
 
@@ -121,8 +132,8 @@ bool isTopicDirLayout(const fs::path& topicDir) {
         const fs::file_status st = it->symlink_status(ec);
         if (ec) return false;
         const std::string child = it->path().filename().string();
-        if ((child == rune::gateway::kTopicIdMarkerFile ||
-             child == rune::gateway::kTopicIdMarkerTmpFile) && fs::is_regular_file(st))
+        if ((child == kTopicIdMarkerFile ||
+             child == kTopicIdMarkerTmpFile) && fs::is_regular_file(st))
             continue;   // the marker, or a marker write interrupted before its rename
         if (!fs::is_directory(st) || !allDigits(child)) return false;
         std::error_code pec;
@@ -136,7 +147,7 @@ bool isTopicDirLayout(const fs::path& topicDir) {
     return !ec && sawPartition;
 }
 
-/// The parsed topic-id marker (see rune::gateway::kTopicIdMarkerFile).
+/// The parsed topic-id marker (see kTopicIdMarkerFile).
 enum class MarkerKind : uint8_t { Invalid, Pending, Committed };
 struct TopicIdMarker {
     MarkerKind kind = MarkerKind::Invalid;
@@ -148,7 +159,7 @@ struct TopicIdMarker {
 /// absent, unreadable, a bare number, extra spaces/lines, other case — is Invalid:
 /// a delete is never decided on a guess.
 TopicIdMarker readTopicIdMarker(const fs::path& topicDir) {
-    std::ifstream in(topicDir / rune::gateway::kTopicIdMarkerFile, std::ios::binary);
+    std::ifstream in(topicDir / kTopicIdMarkerFile, std::ios::binary);
     if (!in) return {};
     std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     if (!text.empty() && text.back() == '\n') text.pop_back();
@@ -157,8 +168,8 @@ TopicIdMarker readTopicIdMarker(const fs::path& topicDir) {
     const std::string_view state(text.data(), sp);
     const std::string digits = text.substr(sp + 1);
     MarkerKind kind = MarkerKind::Invalid;
-    if (state == rune::gateway::kTopicIdMarkerPending) kind = MarkerKind::Pending;
-    else if (state == rune::gateway::kTopicIdMarkerCommitted) kind = MarkerKind::Committed;
+    if (state == kTopicIdMarkerPending) kind = MarkerKind::Pending;
+    else if (state == kTopicIdMarkerCommitted) kind = MarkerKind::Committed;
     else return {};
     if (!allDigits(digits) || digits.size() > 10) return {};
     if (digits.size() > 1 && digits[0] == '0') return {};   // the writer never pads: "0002" is not ours
@@ -292,7 +303,7 @@ TopicDirReconciliation reconcileTopicDirs(const std::string& dataDir,
             if (t.name == n) { owner = &t; break; }
         if (owner == nullptr || placeholders.count(owner->topicId) != 0) return;
         std::error_code pec;
-        const fs::file_status mst = fs::symlink_status(entry / rune::gateway::kTopicIdMarkerFile, pec);
+        const fs::file_status mst = fs::symlink_status(entry / kTopicIdMarkerFile, pec);
         if (pec || !fs::is_regular_file(mst)) return;   // no marker, or a symlinked one
         const fs::path c = fs::canonical(entry, pec);
         if (pec || c.parent_path() != canonicalRoot) return;
@@ -303,7 +314,7 @@ TopicDirReconciliation reconcileTopicDirs(const std::string& dataDir,
             // it: a stale "pending <X>" must never arm a delete of the owner's data
             // should X be a placeholder at some later boot.  Removal only ever turns
             // a delete into a quarantine.
-            if (rune::gateway::clearTopicIdMarker(c.string())) {
+            if (clearTopicIdMarker(c.string())) {
                 spdlog::warn("topic-dir reconcile: '{}' carried a stale topic-id marker (id {}, owner "
                              "id {}) — removed", c.string(), m.id, owner->topicId);
                 result.markersCleared.push_back(c);
@@ -311,7 +322,7 @@ TopicDirReconciliation reconcileTopicDirs(const std::string& dataDir,
             return;
         }
         if (m.kind != MarkerKind::Pending) return;
-        if (rune::gateway::writeTopicIdMarker(c.string(), rune::gateway::kTopicIdMarkerCommitted, m.id)) {
+        if (writeTopicIdMarker(c.string(), kTopicIdMarkerCommitted, m.id)) {
             spdlog::info("topic-dir reconcile: '{}' marker promoted pending -> committed (topic id {} "
                          "is in the catalog)", c.string(), m.id);
             result.promoted.push_back(c);
@@ -356,11 +367,11 @@ TopicDirReconciliation reconcileTopicDirs(const std::string& dataDir,
         // on-disk evidence the record may have committed.  Never delete then.
         std::error_code tec;
         const bool tmpPresent =
-            fs::exists(fs::symlink_status(c / rune::gateway::kTopicIdMarkerTmpFile, tec));
+            fs::exists(fs::symlink_status(c / kTopicIdMarkerTmpFile, tec));
         if (marker.kind == MarkerKind::Pending && isPlaceholderId && tmpPresent) {
             spdlog::warn("topic-dir reconcile: '{}' is a pending orphan but holds an interrupted "
                          "marker rewrite ('{}') — quarantining, NOT deleting", c.string(),
-                         rune::gateway::kTopicIdMarkerTmpFile);
+                         kTopicIdMarkerTmpFile);
         }
         // Final review C1 (a): an uncommitted topic is unwritable (C1 b), so a
         // never-committed orphan's logs are empty.  One holding bytes (acked data on
@@ -591,6 +602,158 @@ RecoveredRuntimeTopics recoverRuntimeTopics(const std::string& dataDir,
                      "zero-partition placeholders so later topics keep their ids: {}", placeholders);
     }
     return result;
+}
+
+// ---------------------------------------------------------------------------
+// writeTopicIdMarker / clearTopicIdMarker (B10 / D4; moved from TopicRegistry, Task 9)
+// ---------------------------------------------------------------------------
+namespace {
+// Ensures `dir` is a real directory (never a symlink).
+bool isPlainMarkerDir(const fs::path& dir) {
+    std::error_code ec;
+    const fs::file_status st = fs::symlink_status(dir, ec);
+    return !ec && fs::is_directory(st) && !fs::is_symlink(st);
+}
+} // namespace
+
+bool
+writeTopicIdMarker(const std::string& topicDir, std::string_view state, int32_t id)
+{
+    const fs::path dir{topicDir};
+    const fs::path tmp    = dir / kTopicIdMarkerTmpFile;
+    const fs::path marker = dir / kTopicIdMarkerFile;
+    if (!isPlainMarkerDir(dir)) {
+        spdlog::warn("topic-id marker: not writing topic-id marker — '{}' is not a plain directory",
+                     dir.string());
+        return false;
+    }
+    {   // the final path must be absent or a regular file — never a symlink
+        std::error_code ec;
+        const fs::file_status mst = fs::symlink_status(marker, ec);
+        if (fs::exists(mst) && !fs::is_regular_file(mst)) {
+            spdlog::warn("topic-id marker: not writing topic-id marker — '{}' is not a regular file",
+                         marker.string());
+            return false;
+        }
+    }
+    std::error_code rmEc;
+    fs::remove(tmp, rmEc);   // unlinks a leftover/planted entry itself, never a symlink's target
+
+    char buf[48];
+    const int len = std::snprintf(buf, sizeof buf, "%.*s %d\n",
+                                  static_cast<int>(state.size()), state.data(), id);
+    if (len <= 0 || static_cast<std::size_t>(len) >= sizeof buf) return false;
+
+    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        spdlog::warn("topic-id marker: cannot create topic-id marker temp '{}': {}", tmp.string(),
+                     std::strerror(errno));
+        return false;
+    }
+    bool ok = true;
+    std::size_t off = 0;
+    while (off < static_cast<std::size_t>(len)) {
+        const ssize_t w = ::write(fd, buf + off, static_cast<std::size_t>(len) - off);
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) { ok = false; break; }
+        off += static_cast<std::size_t>(w);
+    }
+    if (::close(fd) != 0) ok = false;
+    if (!ok) {
+        spdlog::warn("topic-id marker: cannot write topic-id marker temp '{}'", tmp.string());
+        std::error_code rec;
+        fs::remove(tmp, rec);
+        return false;
+    }
+    std::error_code ec;
+    fs::rename(tmp, marker, ec);   // atomic replace: a reader sees the old or the new marker
+    if (ec) {
+        spdlog::warn("topic-id marker: cannot install topic-id marker '{}': {}", marker.string(),
+                     ec.message());
+        std::error_code rec;
+        fs::remove(tmp, rec);
+        return false;
+    }
+    return true;
+}
+
+bool
+clearTopicIdMarker(const std::string& topicDir)
+{
+    const fs::path dir{topicDir};
+    if (!isPlainMarkerDir(dir)) return false;
+    bool removed = false;
+    std::error_code ec;
+    if (fs::remove(dir / kTopicIdMarkerFile, ec)) removed = true;   // unlink only
+    ec.clear();
+    if (fs::remove(dir / kTopicIdMarkerTmpFile, ec)) removed = true;
+    return removed;
+}
+
+
+// ---------------------------------------------------------------------------
+// catalogLiveTopicSpecs — INTERIM (Task 9): the live topics of the local catalog
+// at its checkpoint, for reconcileTopicDirs' claims.
+// ---------------------------------------------------------------------------
+std::vector<TopicSpec> catalogLiveTopicSpecs(const std::string& dataDir) {
+    namespace cat = rune::catalog;
+    const fs::path dir = fs::path{dataDir} / "__catalog";
+    std::error_code ec;
+    if (!fs::is_directory(dir, ec)) return {};
+    const std::optional<CatalogCheckpoint> ckpt = readCatalogCheckpoint(dir.string());   // throws: refuse boot
+    if (!ckpt) return {};
+    rune::storage::Log log(dir.string());
+    log.recover();
+    cat::CatalogReplayer replayer;
+    bool stop = false;
+    while (!stop && replayer.nextOffset() <= ckpt->appliedOffset) {
+        const int64_t from = replayer.nextOffset();
+        const std::vector<uint8_t> data = log.read(from, 1 << 20);
+        if (data.empty()) break;
+        std::size_t pos = 0;
+        while (pos < data.size() && !stop) {
+            if (data.size() - pos < static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead)) break;
+            rune::protocol::RecordBatchReader reader(data.data() + pos, data.size() - pos);
+            if (!reader.ensureValid()) { stop = true; break; }
+            const auto tl = static_cast<std::size_t>(reader.totalLength());
+            if (!reader.isControl()) {
+                reader.forEachRecord([&](std::string_view, std::string_view val, int64_t off, int64_t) {
+                    if (stop || off != replayer.nextOffset() || off > ckpt->appliedOffset) return;
+                    auto r = replayer.feed(off, std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(val.data()),
+                                                                        val.size()));
+                    if (!r) {
+                        spdlog::error("catalogLiveTopicSpecs: the local __catalog stops at {} — {} (the applier halts "
+                                      "on it; topic dirs claimed from the prefix before it)", off,
+                                      cat::describe(r.error()));
+                        stop = true;
+                    }
+                });
+            }
+            if (tl == 0) { stop = true; break; }
+            pos += tl;
+        }
+        if (replayer.nextOffset() == from) break;   // no progress: a gap / control batch past it
+    }
+    std::vector<TopicSpec> out;
+    for (const cat::TopicObject* t : replayer.state().topics()) {
+        TopicSpec s;
+        s.name           = t->name;
+        s.topicId        = t->topicId;
+        s.partitionCount = t->partitions;
+        s.persistence    = t->persistence == cat::Persistence::Transient ? PersistenceMode::Transient
+                                                                         : PersistenceMode::Disk;
+        out.push_back(std::move(s));
+    }
+    for (const cat::ViewObject* v : replayer.state().views()) {
+        TopicSpec s;
+        s.name           = v->name;   // the view's sink topic is named after the view
+        s.topicId        = v->def.viewTopicId;
+        s.partitionCount = v->def.sinkPartitions;
+        s.persistence    = v->def.persistence == cat::Persistence::Transient ? PersistenceMode::Transient
+                                                                             : PersistenceMode::Disk;
+        out.push_back(std::move(s));
+    }
+    return out;
 }
 
 } // namespace rune::node

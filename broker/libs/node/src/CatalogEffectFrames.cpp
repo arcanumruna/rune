@@ -7,6 +7,7 @@
 #include <rune/codec/Evolve.h>
 #include <rune/codec/Serialize.h>
 
+#include <algorithm>
 #include <exception>
 #include <span>
 
@@ -113,6 +114,26 @@ std::optional<std::string> catalogEventEffectsRefusal(const cat::CatalogState& b
     if (!a) return std::nullopt;
     if (auto err = eventEffectFramesError(dry, ev, *a, maxFrame))
         return std::string{cat::kindName(e.kind)} + " '" + e.objectName + "' refused: " + *err;
+    // Task 7 re-review (binding for Task 9): a source's schema change re-sizes the
+    // plan of every view that reads it — a dependent view's ViewPlanUpdate carries
+    // the source's materialized descriptor, and a boot (or a later install) posts
+    // it.  An event that would push one past the frame is refused here, never
+    // written (else every broker would halt at the next boot).
+    switch (e.kind) {
+    case cat::EventKind::CreateSchema:
+    case cat::EventKind::AlterSchema:
+    case cat::EventKind::SetCompatibility:
+        for (const cat::ViewObject* v : dry.views()) {
+            const auto& srcs = v->def.sourceNames;
+            if (std::find(srcs.begin(), srcs.end(), e.objectName) == srcs.end()) continue;
+            if (auto err = viewEffectFramesError(*v, dry, maxFrame))
+                return std::string{cat::kindName(e.kind)} + " '" + e.objectName + "' refused: dependent view '" +
+                       v->name + "': " + *err;
+        }
+        break;
+    default:
+        break;
+    }
     return std::nullopt;
 }
 

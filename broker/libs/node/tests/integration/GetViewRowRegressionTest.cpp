@@ -25,6 +25,7 @@
 
 #include <unistd.h>
 #include <gtest/gtest.h>
+#include "support/CatalogDdlRig.h"
 
 #include <rune/node/Worker.h>
 #include <rune/node/WorkerOp.h>
@@ -399,22 +400,6 @@ struct TmpDir {
     ~TmpDir() { std::error_code ec; std::filesystem::remove_all(path, ec); }
 };
 
-PartitionConfig singleNodeCfg(int32_t topicId) {
-    PartitionConfig cfg;
-    cfg.topicId             = topicId;
-    cfg.partitionId         = 0;
-    cfg.selfId              = 1;
-    cfg.replicaLagMaxMs     = 10'000;
-    cfg.replicaLagMaxOffset = 10'000;
-    cfg.minIsr              = 1;
-    cfg.fetchIntervalNs     = 1'000'000LL;
-    cfg.isrCheckIntervalNs  = 1'000'000LL;
-    cfg.maxFetchBytes       = 1 << 20;
-    cfg.pushOnAppend        = false;
-    cfg.cleanupPolicy       = CleanupPolicy::Compact;
-    return cfg;
-}
-
 std::vector<uint8_t> characterBlob() {
     return serialize(DescriptorBuilder("character", 1)
         .add("id", PrimType::Int64, 1, /*isKey=*/true)
@@ -435,85 +420,13 @@ std::vector<uint8_t> charHpPlanBlob(int32_t srcTopicId) {
 
 } // namespace
 
+// Catalog history Task 9: the admin side is the catalog write path — one AdminWorker
+// over a __catalog leader replica (CatalogDdlRig); the view's typed output is the
+// applier's projection of its CreateView event.
 class GetViewRowOpenRegression : public ::testing::Test {
 protected:
-    GetViewRowOpenRegression()
-        : schemaDir_("schema"), viewsDir_("views")
-        , schemaLog_(schemaDir_.path), viewsLog_(viewsDir_.path) {}
-
-    void SetUp() override {
-        schemaLog_.recover();
-        viewsLog_.recover();
-        schemaTransport_ = std::make_unique<NullPartitionTransport>();
-        viewsTransport_  = std::make_unique<NullPartitionTransport>();
-
-        schemaReplica_ = std::make_unique<PartitionReplica>(
-            singleNodeCfg(kSchemaTopicId), Role::Leader, /*epoch=*/1,
-            std::vector<NodeId>{1}, std::vector<NodeId>{1}, &schemaLog_, schemaTransport_.get());
-        viewsReplica_ = std::make_unique<PartitionReplica>(
-            singleNodeCfg(kViewsTopicId), Role::Leader, /*epoch=*/1,
-            std::vector<NodeId>{1}, std::vector<NodeId>{1}, &viewsLog_, viewsTransport_.get());
-
-        schemaRegistry_ = std::make_unique<SchemaRegistry>();
-        viewRegistry_   = std::make_unique<ViewRegistry>();
-
-        AdminDeps deps;
-        deps.requestCreateTopic = [this](int64_t ticket, int32_t, const std::string&,
-                                         const std::string&, uint8_t, uint8_t) -> bool {
-            pendingTicket_ = ticket;
-            return true;
-        };
-        deps.pushValidators = [](const RegistryEntry&, int32_t) {};
-        deps.respondDefine  = [this](int64_t, int64_t, int32_t topicId, uint16_t, uint16_t err) {
-            lastDefineTopicId_ = topicId; lastDefineError_ = err;
-        };
-        deps.respondGet   = [](int64_t, int64_t, int32_t, uint16_t, int32_t, const std::vector<uint8_t>&, uint16_t) {};
-        deps.respondAlter = [](int64_t, int64_t, int32_t, uint16_t, uint16_t) {};
-        deps.respondCreateView = [this](int64_t, int64_t, int32_t viewTopicId,
-                                        uint64_t fp, uint16_t err) {
-            lastViewTopicId_ = viewTopicId;
-            lastViewFinger_  = fp;
-            lastViewError_   = err;
-        };
-        deps.pushViewPlan = [](const ViewPlanUpdateMsg&) {};
-
-        adminWorker_ = std::make_unique<AdminWorker>(
-            *schemaRegistry_, schemaReplica_.get(), /*selfId=*/1, std::vector<int32_t>{1},
-            std::move(deps), viewsReplica_.get(), viewRegistry_.get());
-        adminWorker_->onRole(AdminRoleMsg{/*leader=*/true, /*epoch=*/1, /*leaderId=*/1});
-    }
-
-    void pump_() {
-        pendingTicket_ = -1;
-        int64_t nowNs = 0;
-        for (int i = 0; i < 100; ++i) {
-            nowNs += 1'000'000LL;
-            adminWorker_->doWork(nowNs);
-            if (pendingTicket_ >= 0) {
-                CreateTopicReplyMsg reply;
-                reply.ticket  = pendingTicket_;
-                reply.topicId = nextTopicId_++;
-                pendingTicket_ = -1;
-                adminWorker_->onCreateTopicReply(reply);
-            }
-        }
-    }
-
-    TmpDir schemaDir_, viewsDir_;
-    rune::storage::Log schemaLog_, viewsLog_;
-    std::unique_ptr<NullPartitionTransport> schemaTransport_, viewsTransport_;
-    std::unique_ptr<PartitionReplica>       schemaReplica_, viewsReplica_;
-    std::unique_ptr<SchemaRegistry>         schemaRegistry_;
-    std::unique_ptr<ViewRegistry>           viewRegistry_;
-    std::unique_ptr<AdminWorker>            adminWorker_;
-
-    int32_t  nextTopicId_       = 0;
-    int64_t  pendingTicket_     = -1;
-    int32_t  lastDefineTopicId_ = -1;
-    uint16_t lastDefineError_   = 0xffff;
-    int32_t  lastViewTopicId_   = -2;
-    uint64_t lastViewFinger_    = 0;
-    uint16_t lastViewError_     = 0xffff;
+    void SetUp() override { rig_.becomeServingLeader(); }
+    rune::node::test::CatalogDdlRig rig_{"gvr_open", 1};
 };
 
 TEST_F(GetViewRowOpenRegression, OpenViewFingerprintMismatchRejected) {
@@ -521,20 +434,22 @@ TEST_F(GetViewRowOpenRegression, OpenViewFingerprintMismatchRejected) {
     DefineTopicMsg d;
     d.session = 1; d.corr = 10; d.partitionCount = 1; d.name = "character";
     d.keyField = "id"; d.validate = false; d.blob = characterBlob();
-    adminWorker_->submitDefineTopic(d);
-    pump_();
-    ASSERT_EQ(lastDefineError_, 0u);
-    const int32_t srcTopicId = lastDefineTopicId_;
+    d.meta.requestId = rig_.freshRequestId();
+    const auto def = rig_.submitRaw(rune::node::DdlRequest{d});
+    ASSERT_EQ(def.code, 0u);
+    const int32_t srcTopicId = def.topicId;
     ASSERT_GE(srcTopicId, 0);
 
     // 2. CreateView over it (registers the view's typed output topic).
     CreateViewMsg cv;
     cv.session = 1; cv.corr = 20; cv.persistence = 0;
     cv.viewName = "char_hp"; cv.keyField = "id"; cv.planBlob = charHpPlanBlob(srcTopicId);
-    adminWorker_->submitCreateView(cv);
-    pump_();
-    ASSERT_EQ(lastViewError_, static_cast<uint16_t>(pc::ErrorCode::OK));
+    cv.meta.requestId = rig_.freshRequestId();
+    const auto view = rig_.submitRaw(rune::node::DdlRequest{cv});
+    ASSERT_EQ(view.code, static_cast<uint16_t>(pc::ErrorCode::OK));
+    const int32_t lastViewTopicId_ = view.topicId;
     ASSERT_GE(lastViewTopicId_, 0);
+    AdminWorker* adminWorker_ = &rig_.admin();
 
     // 3. openView by name with fp=0 (latest) resolves OK + the current fingerprint.
     int32_t  gotId = -1;

@@ -1,24 +1,18 @@
 #include <rune/gateway/TopicRegistry.h>
-#include <rune/node/TopicName.h>
+#include <rune/catalog/TopicName.h>
 
 #include <spdlog/spdlog.h>
 
-#include <cerrno>
-#include <cstdio>
-#include <cstring>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
-
-#include <fcntl.h>
-#include <unistd.h>
 
 namespace fs = std::filesystem;
 
 namespace rune::gateway {
 
 // ---------------------------------------------------------------------------
-// TopicRegistry::TopicRegistry
+// TopicRegistry::TopicRegistry — the static topics, at ids [0, n) in list order.
 // ---------------------------------------------------------------------------
 TopicRegistry::TopicRegistry(
     const std::vector<rune::node::TopicSpec>& topics,
@@ -29,31 +23,30 @@ TopicRegistry::TopicRegistry(
     nameIndex_.reserve(topics.size());
 
     for (const auto& spec : topics) {
-        createTopicImpl(spec, CreateOrigin::Boot);
+        // Idempotent by name: a repeated static name is one topic.
+        if (nameIndex_.contains(spec.name)) {
+            spdlog::debug("TopicRegistry: static topic='{}' listed twice — one topic", spec.name);
+            continue;
+        }
+        const auto id = static_cast<int32_t>(topics_.size());
+        Live live = buildLive_(spec, id);
+        topics_.emplace_back(std::in_place_type<Static>, Static{std::move(live)});
+        nameIndex_.emplace(spec.name, id);
+        ++catalogGeneration_;
     }
 
     spdlog::info("TopicRegistry: {} topic(s) initialised", topics_.size());
 }
 
-// ---------------------------------------------------------------------------
-// TopicRegistry::createTopic
-// ---------------------------------------------------------------------------
-int32_t
-TopicRegistry::createTopic(const rune::node::TopicSpec& spec)
-{
-    return createTopicImpl(spec, CreateOrigin::Runtime);
-}
-
-TopicRegistry::TopicEntry
-TopicRegistry::buildEntry_(const rune::node::TopicSpec& spec, int32_t id, CreateOrigin origin)
+TopicRegistry::Live
+TopicRegistry::buildLive_(const rune::node::TopicSpec& spec, int32_t id)
 {
     const fs::path root{dataDir_};
 
-    TopicEntry entry;
-    entry.spec         = spec;
-    entry.spec.topicId = id;
-    entry.origin       = origin;
-    entry.partitions.reserve(static_cast<std::size_t>(spec.partitionCount));
+    Live live;
+    live.spec         = spec;
+    live.spec.topicId = id;
+    live.partitions.reserve(static_cast<std::size_t>(spec.partitionCount));
 
     for (int32_t p = 0; p < spec.partitionCount; ++p) {
         PartitionEntry pe;
@@ -65,7 +58,7 @@ TopicRegistry::buildEntry_(const rune::node::TopicSpec& spec, int32_t id, Create
             spdlog::debug(
                 "TopicRegistry: topic='{}' partition={} [transient, no disk log]",
                 spec.name, p);
-            entry.partitions.push_back(std::move(pe));
+            live.partitions.push_back(std::move(pe));
             continue;
         }
 
@@ -92,86 +85,18 @@ TopicRegistry::buildEntry_(const rune::node::TopicSpec& spec, int32_t id, Create
             spec.name, p, partDir.string(), logPtr->logEndOffset());
 
         pe.log = std::move(logPtr);
-        entry.partitions.push_back(std::move(pe));
+        live.partitions.push_back(std::move(pe));
     }
-    return entry;
-}
-
-int32_t
-TopicRegistry::createTopicImpl(const rune::node::TopicSpec& spec, CreateOrigin origin)
-{
-    // Idempotent guard: if a topic with this name already exists, return its id.
-    {
-        auto it = nameIndex_.find(spec.name);
-        if (it != nameIndex_.end()) {
-            spdlog::debug(
-                "TopicRegistry::createTopic: topic='{}' already registered with id={}",
-                spec.name, it->second);
-            return it->second;
-        }
-    }
-
-    const fs::path root{dataDir_};
-
-    // Assign the next sequential topicId (the registry owns id assignment so that
-    // topics_[topicId] lookups stay valid — spec.topicId is the caller's hint but
-    // is intentionally ignored for placement).
-    const int32_t assignedId = static_cast<int32_t>(topics_.size());
-
-    // B10 / D4 (review M1): the marker is only ever written into a topic dir THIS
-    // create made — never stamped onto a pre-existing dir (e.g. one a case-variant
-    // name shares on a case-insensitive filesystem, or a surviving old dir).
-    const fs::path topicDir = root / "topics" / spec.name;
-    std::error_code existEc;
-    const bool topicDirPreexisted = fs::exists(fs::symlink_status(topicDir, existEc));
-
-    TopicEntry entry = buildEntry_(spec, assignedId, origin);
-
-    // B10 / D4: the two-phase topic-id marker ties this directory to its id, so
-    // boot can tell a never-committed orphan's dir (pending: deleted) from any other
-    // unclaimed dir (quarantined).  Runtime creates only — see kTopicIdMarkerFile.
-    // Fix round 2 (N2): a runtime create that REUSES a pre-existing dir (a surviving
-    // orphan's dir) clears any stale marker there, so an old "pending <otherId>"
-    // can never arm a delete of this topic's data.
-    if (origin == CreateOrigin::Runtime && topicDirPreexisted &&
-        spec.persistence != rune::node::PersistenceMode::Transient && spec.partitionCount > 0) {
-        if (clearTopicIdMarker(topicDir.string()))
-            spdlog::warn("TopicRegistry: topic='{}' reuses an existing dir — removed its stale "
-                         "topic-id marker", spec.name);
-    }
-    if (origin == CreateOrigin::Runtime && !topicDirPreexisted &&
-        spec.persistence != rune::node::PersistenceMode::Transient && spec.partitionCount > 0) {
-        if (writeTopicIdMarker(topicDir.string(), kTopicIdMarkerPending, assignedId))
-            entry.marker = MarkerState::Pending;
-    }
-
-    // C1: a runtime create is not servable until its catalog record commits.
-    entry.lifecycle = (origin == CreateOrigin::Runtime) ? Lifecycle::AwaitingCommit : Lifecycle::Serving;
-
-    nameIndex_.emplace(spec.name, assignedId);
-    topics_.push_back(std::move(entry));
-    ++catalogGeneration_;
-
-    spdlog::info(
-        "TopicRegistry::createTopic: topic='{}' id={} partitions={}",
-        spec.name, assignedId, spec.partitionCount);
-
-    return assignedId;
+    return live;
 }
 
 // ---------------------------------------------------------------------------
-// Catalog history Task 8: createTopicAt / dropTopic / releaseDroppedLogs
+// Catalog history Task 8: createTopicAt / reserveTopicAt / dropTopic / releaseDroppedLogs
 // ---------------------------------------------------------------------------
 void
 TopicRegistry::fillGapsBelow_(std::size_t slot)
 {
-    while (topics_.size() < slot) {
-        TopicEntry gap;
-        gap.spec.topicId = static_cast<int32_t>(topics_.size());
-        gap.origin       = CreateOrigin::Catalog;
-        gap.lifecycle    = Lifecycle::Gap;
-        topics_.push_back(std::move(gap));
-    }
+    while (topics_.size() < slot) topics_.emplace_back(std::in_place_type<Gap>);
 }
 
 int32_t
@@ -183,25 +108,24 @@ TopicRegistry::createTopicAt(int32_t topicId, const rune::node::TopicSpec& spec)
     }
     const auto slot = static_cast<std::size_t>(topicId);
     if (slot < topics_.size()) {
-        const TopicEntry& e = topics_[slot];
-        switch (e.lifecycle) {
-            case Lifecycle::Dropped:
-                spdlog::error("TopicRegistry::createTopicAt: id={} ('{}') is a dropped catalog id — never re-created",
-                              topicId, spec.name);
-                return -1;
-            case Lifecycle::Gap:
-                break;   // a never-seen id: filled below
-            case Lifecycle::Pending:
-                if (e.spec.name == spec.name) break;   // the create that waited behind a drop
-                spdlog::error("TopicRegistry::createTopicAt: id={} is reserved for '{}', refused for '{}'",
-                              topicId, e.spec.name, spec.name);
-                return -1;
-            default:
-                if (e.spec.name == spec.name) return topicId;   // idempotent: the same effect again
-                spdlog::error("TopicRegistry::createTopicAt: id={} already holds '{}', refused for '{}'",
-                              topicId, e.spec.name, spec.name);
-                return -1;
+        const Slot& e = topics_[slot];
+        if (std::holds_alternative<Dropped>(e)) {
+            spdlog::error("TopicRegistry::createTopicAt: id={} ('{}') is a dropped catalog id — never re-created",
+                          topicId, spec.name);
+            return -1;
         }
+        if (const auto* p = std::get_if<Pending>(&e); p != nullptr && p->name != spec.name) {
+            spdlog::error("TopicRegistry::createTopicAt: id={} is reserved for '{}', refused for '{}'",
+                          topicId, p->name, spec.name);
+            return -1;
+        }
+        if (const Live* l = live_(e)) {
+            if (l->spec.name == spec.name && std::holds_alternative<Serving>(e)) return topicId;   // the same effect again
+            spdlog::error("TopicRegistry::createTopicAt: id={} already holds {} '{}', refused for '{}'", topicId,
+                          std::holds_alternative<Static>(e) ? "the static topic" : "", l->spec.name, spec.name);
+            return -1;
+        }
+        // Gap, or the Pending slot of this very create: filled below.
     }
     if (const auto it = nameIndex_.find(spec.name); it != nameIndex_.end()) {
         spdlog::error("TopicRegistry::createTopicAt: name '{}' is held by live id={}, refused for id={}",
@@ -209,11 +133,10 @@ TopicRegistry::createTopicAt(int32_t topicId, const rune::node::TopicSpec& spec)
         return -1;
     }
 
-    TopicEntry entry = buildEntry_(spec, topicId, CreateOrigin::Catalog);   // may throw: nothing changed yet
-    entry.lifecycle = Lifecycle::Serving;
-    fillGapsBelow_(slot);   // ids this broker has not seen (yet): Gap, fillable
-    if (slot < topics_.size()) topics_[slot] = std::move(entry);
-    else                       topics_.push_back(std::move(entry));
+    Live live = buildLive_(spec, topicId);   // may throw: nothing changed yet
+    fillGapsBelow_(slot);                    // ids this broker has not seen (yet): Gap, fillable
+    if (slot < topics_.size()) topics_[slot].emplace<Serving>(Serving{std::move(live)});
+    else                       topics_.emplace_back(std::in_place_type<Serving>, Serving{std::move(live)});
     nameIndex_.emplace(spec.name, topicId);
     ++catalogGeneration_;
     spdlog::info("TopicRegistry::createTopicAt: topic='{}' id={} partitions={} (catalog)",
@@ -227,24 +150,18 @@ TopicRegistry::reserveTopicAt(int32_t topicId, const std::string& name)
     if (topicId < 0 || name.empty()) return false;
     const auto slot = static_cast<std::size_t>(topicId);
     if (slot < topics_.size()) {
-        TopicEntry& e = topics_[slot];
-        if (e.lifecycle == Lifecycle::Pending && e.spec.name == name) return true;   // idempotent
-        if (e.lifecycle != Lifecycle::Gap) {
+        Slot& e = topics_[slot];
+        if (const auto* p = std::get_if<Pending>(&e); p != nullptr && p->name == name) return true;   // idempotent
+        if (!std::holds_alternative<Gap>(e)) {
             spdlog::error("TopicRegistry::reserveTopicAt: id={} cannot be reserved for '{}' (taken)", topicId, name);
             return false;
         }
-        e.spec.name = name;
-        e.lifecycle = Lifecycle::Pending;
+        e.emplace<Pending>(Pending{name});
         ++catalogGeneration_;
         return true;
     }
     fillGapsBelow_(slot);
-    TopicEntry pending;
-    pending.spec.topicId = topicId;
-    pending.spec.name    = name;
-    pending.origin       = CreateOrigin::Catalog;
-    pending.lifecycle    = Lifecycle::Pending;
-    topics_.push_back(std::move(pending));
+    topics_.emplace_back(std::in_place_type<Pending>, Pending{name});
     ++catalogGeneration_;
     return true;
 }
@@ -253,16 +170,25 @@ bool
 TopicRegistry::dropTopic(int32_t topicId)
 {
     if (topicId < 0 || static_cast<std::size_t>(topicId) >= topics_.size()) return false;
-    TopicEntry& e = topics_[static_cast<std::size_t>(topicId)];
-    if (e.lifecycle == Lifecycle::Dropped) return false;
-    const bool wasServing = !absent_(e.lifecycle);
-    e.lifecycle = Lifecycle::Dropped;
-    if (!wasServing) { ++catalogGeneration_; return true; }   // Pending / Gap: nothing indexed, no Logs
-    if (const auto it = nameIndex_.find(e.spec.name); it != nameIndex_.end() && it->second == topicId)
+    Slot& e = topics_[static_cast<std::size_t>(topicId)];
+    if (std::holds_alternative<Dropped>(e)) return false;
+    Live* l = live_(e);
+    if (l == nullptr) {   // Pending / Gap: nothing indexed, no Logs — seen now, dropped
+        rune::node::TopicSpec spec;
+        spec.topicId = topicId;
+        if (const auto* p = std::get_if<Pending>(&e)) spec.name = p->name;
+        e.emplace<Dropped>(Dropped{std::move(spec), {}});
+        ++catalogGeneration_;
+        return true;
+    }
+    if (const auto it = nameIndex_.find(l->spec.name); it != nameIndex_.end() && it->second == topicId)
         nameIndex_.erase(it);
+    const std::string name = l->spec.name;
+    Dropped d{std::move(l->spec), std::move(l->partitions)};
+    e.emplace<Dropped>(std::move(d));
     ++catalogGeneration_;
     spdlog::info("TopicRegistry::dropTopic: topic='{}' id={} dropped (serves nothing; logs held until released)",
-                 e.spec.name, topicId);
+                 name, topicId);
     return true;
 }
 
@@ -270,135 +196,17 @@ bool
 TopicRegistry::releaseDroppedLogs(int32_t topicId)
 {
     if (topicId < 0 || static_cast<std::size_t>(topicId) >= topics_.size()) return false;
-    TopicEntry& e = topics_[static_cast<std::size_t>(topicId)];
-    if (e.lifecycle != Lifecycle::Dropped || e.partitions.empty()) return false;
-    e.partitions.clear();   // closes every Log (unmaps its segments)
-    e.partitions.shrink_to_fit();
-    return true;
-}
-
-// ---------------------------------------------------------------------------
-// writeTopicIdMarker / TopicRegistry::markTopicCommitted (B10 / D4, fix round 1)
-// ---------------------------------------------------------------------------
-namespace {
-// Ensures `dir` is a real directory (never a symlink).
-bool isPlainDir(const fs::path& dir) {
-    std::error_code ec;
-    const fs::file_status st = fs::symlink_status(dir, ec);
-    return !ec && fs::is_directory(st) && !fs::is_symlink(st);
-}
-} // namespace
-
-bool
-writeTopicIdMarker(const std::string& topicDir, std::string_view state, int32_t id)
-{
-    const fs::path dir{topicDir};
-    const fs::path tmp    = dir / kTopicIdMarkerTmpFile;
-    const fs::path marker = dir / kTopicIdMarkerFile;
-    if (!isPlainDir(dir)) {
-        spdlog::warn("TopicRegistry: not writing topic-id marker — '{}' is not a plain directory",
-                     dir.string());
-        return false;
-    }
-    {   // the final path must be absent or a regular file — never a symlink
-        std::error_code ec;
-        const fs::file_status mst = fs::symlink_status(marker, ec);
-        if (fs::exists(mst) && !fs::is_regular_file(mst)) {
-            spdlog::warn("TopicRegistry: not writing topic-id marker — '{}' is not a regular file",
-                         marker.string());
-            return false;
-        }
-    }
-    std::error_code rmEc;
-    fs::remove(tmp, rmEc);   // unlinks a leftover/planted entry itself, never a symlink's target
-
-    char buf[48];
-    const int len = std::snprintf(buf, sizeof buf, "%.*s %d\n",
-                                  static_cast<int>(state.size()), state.data(), id);
-    if (len <= 0 || static_cast<std::size_t>(len) >= sizeof buf) return false;
-
-    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
-    if (fd < 0) {
-        spdlog::warn("TopicRegistry: cannot create topic-id marker temp '{}': {}", tmp.string(),
-                     std::strerror(errno));
-        return false;
-    }
-    bool ok = true;
-    std::size_t off = 0;
-    while (off < static_cast<std::size_t>(len)) {
-        const ssize_t w = ::write(fd, buf + off, static_cast<std::size_t>(len) - off);
-        if (w < 0 && errno == EINTR) continue;
-        if (w <= 0) { ok = false; break; }
-        off += static_cast<std::size_t>(w);
-    }
-    if (::close(fd) != 0) ok = false;
-    if (!ok) {
-        spdlog::warn("TopicRegistry: cannot write topic-id marker temp '{}'", tmp.string());
-        std::error_code rec;
-        fs::remove(tmp, rec);
-        return false;
-    }
-    std::error_code ec;
-    fs::rename(tmp, marker, ec);   // atomic replace: a reader sees the old or the new marker
-    if (ec) {
-        spdlog::warn("TopicRegistry: cannot install topic-id marker '{}': {}", marker.string(),
-                     ec.message());
-        std::error_code rec;
-        fs::remove(tmp, rec);
-        return false;
-    }
-    return true;
-}
-
-bool
-clearTopicIdMarker(const std::string& topicDir)
-{
-    const fs::path dir{topicDir};
-    if (!isPlainDir(dir)) return false;
-    bool removed = false;
-    std::error_code ec;
-    if (fs::remove(dir / kTopicIdMarkerFile, ec)) removed = true;   // unlink only
-    ec.clear();
-    if (fs::remove(dir / kTopicIdMarkerTmpFile, ec)) removed = true;
-    return removed;
-}
-
-bool
-TopicRegistry::markTopicCommitted(int32_t topicId)
-{
-    if (topicId < 0 || static_cast<std::size_t>(topicId) >= topics_.size()) return false;
-    TopicEntry& e = topics_[static_cast<std::size_t>(topicId)];
-    if (e.marker != MarkerState::Pending) return false;
-    const fs::path topicDir = fs::path(dataDir_) / "topics" / e.spec.name;
-    if (!writeTopicIdMarker(topicDir.string(), kTopicIdMarkerCommitted, topicId)) return false;
-    e.marker = MarkerState::Committed;
-    return true;
-}
-
-bool
-TopicRegistry::commitTopic(int32_t topicId)
-{
-    if (topicId < 0 || static_cast<std::size_t>(topicId) >= topics_.size()) return false;
-    TopicEntry& e = topics_[static_cast<std::size_t>(topicId)];
-    // The marker rewrite is best-effort (logged on failure); servability never
-    // waits on it — the record IS committed.
-    (void)markTopicCommitted(topicId);
-    if (e.lifecycle != Lifecycle::AwaitingCommit) return false;
-    e.lifecycle = Lifecycle::Serving;
-    ++catalogGeneration_;
+    auto* d = std::get_if<Dropped>(&topics_[static_cast<std::size_t>(topicId)]);
+    if (d == nullptr || d->partitions.empty()) return false;
+    d->partitions.clear();   // closes every Log (unmaps its segments)
+    d->partitions.shrink_to_fit();
     return true;
 }
 
 rune::storage::Log*
 TopicRegistry::servableLog(int32_t topicId, int32_t partition) noexcept
 {
-    if (topicId < 0 || static_cast<std::size_t>(topicId) >= topics_.size())
-        return nullptr;
-    const auto& entry = topics_[static_cast<std::size_t>(topicId)];
-    if (entry.lifecycle != Lifecycle::Serving) [[unlikely]] return nullptr;   // C1 / dropped
-    if (partition < 0 || static_cast<std::size_t>(partition) >= entry.partitions.size())
-        return nullptr;
-    return entry.partitions[static_cast<std::size_t>(partition)].log.get();
+    return log(topicId, partition);
 }
 
 // ---------------------------------------------------------------------------
@@ -419,37 +227,34 @@ std::optional<int32_t>
 TopicRegistry::topicIdForFoldedName(std::string_view name) const
 {
     for (const auto& [n, id] : nameIndex_) {
-        if (n != name && rune::node::topicNamesFoldEqual(n, name)) return id;
+        if (n != name && rune::catalog::topicNamesFoldEqual(n, name)) return id;
     }
     return std::nullopt;
 }
 
 // ---------------------------------------------------------------------------
-// TopicRegistry::topic
+// TopicRegistry::topic — a serving slot's spec; nullptr for any other.
 // ---------------------------------------------------------------------------
 const rune::node::TopicSpec*
 TopicRegistry::topic(int32_t topicId) const noexcept
 {
-    if (topicId < 0 || static_cast<std::size_t>(topicId) >= topics_.size())
-        return nullptr;
-    const auto& entry = topics_[static_cast<std::size_t>(topicId)];
-    if (absent_(entry.lifecycle)) return nullptr;   // Task 8: a dropped / gap / pending id is unknown
-    return &entry.spec;
+    const Slot* sl = slot_(topicId);
+    if (sl == nullptr) return nullptr;
+    const Live* l = live_(*sl);
+    return l != nullptr ? &l->spec : nullptr;
 }
 
 // ---------------------------------------------------------------------------
-// TopicRegistry::log
+// TopicRegistry::log — a serving slot's partition Log; nullptr for any other.
 // ---------------------------------------------------------------------------
 rune::storage::Log*
 TopicRegistry::log(int32_t topicId, int32_t partition) noexcept
 {
-    if (topicId < 0 || static_cast<std::size_t>(topicId) >= topics_.size())
-        return nullptr;
-    const auto& entry = topics_[static_cast<std::size_t>(topicId)];
-    if (absent_(entry.lifecycle)) return nullptr;   // Task 8
-    if (partition < 0 || static_cast<std::size_t>(partition) >= entry.partitions.size())
-        return nullptr;
-    return entry.partitions[static_cast<std::size_t>(partition)].log.get();
+    if (topicId < 0 || static_cast<std::size_t>(topicId) >= topics_.size()) return nullptr;
+    Live* l = live_(topics_[static_cast<std::size_t>(topicId)]);
+    if (l == nullptr) [[unlikely]] return nullptr;   // dropped / gap / pending
+    if (partition < 0 || static_cast<std::size_t>(partition) >= l->partitions.size()) return nullptr;
+    return l->partitions[static_cast<std::size_t>(partition)].log.get();
 }
 
 // ---------------------------------------------------------------------------
@@ -459,44 +264,33 @@ int32_t
 TopicRegistry::partitionForKey(int32_t topicId,
                                 std::span<const uint8_t> key) const noexcept
 {
-    if (topicId < 0 || static_cast<std::size_t>(topicId) >= topics_.size())
-        return -1;
-    const auto& entry = topics_[static_cast<std::size_t>(topicId)];
-    if (absent_(entry.lifecycle)) return -1;   // Task 8: not served here
-    return rune::protocol::partitionForKey(key, entry.spec.partitionCount);
+    const rune::node::TopicSpec* spec = topic(topicId);
+    if (spec == nullptr) return -1;   // not served here
+    return rune::protocol::partitionForKey(key, spec->partitionCount);
 }
 
 // ---------------------------------------------------------------------------
-// TopicRegistry::cleanupPolicyOf (CP-1)
+// CP-1 config accessors — any slot with a spec (a Dropped one too); defaults otherwise.
 // ---------------------------------------------------------------------------
 rune::node::TopicSpec::CleanupPolicy
 TopicRegistry::cleanupPolicyOf(int32_t topicId) const noexcept
 {
-    if (topicId < 0 || static_cast<std::size_t>(topicId) >= topics_.size())
-        return rune::node::TopicSpec::CleanupPolicy::Delete;
-    return topics_[static_cast<std::size_t>(topicId)].spec.cleanupPolicy;
+    const rune::node::TopicSpec* spec = specOf_(topicId);
+    return spec != nullptr ? spec->cleanupPolicy : rune::node::TopicSpec::CleanupPolicy::Delete;
 }
 
-// ---------------------------------------------------------------------------
-// TopicRegistry::dirtyRatioThresholdOf (CP-1)
-// ---------------------------------------------------------------------------
 double
 TopicRegistry::dirtyRatioThresholdOf(int32_t topicId) const noexcept
 {
-    if (topicId < 0 || static_cast<std::size_t>(topicId) >= topics_.size())
-        return 0.5;
-    return topics_[static_cast<std::size_t>(topicId)].spec.minCleanableDirtyRatio;
+    const rune::node::TopicSpec* spec = specOf_(topicId);
+    return spec != nullptr ? spec->minCleanableDirtyRatio : 0.5;
 }
 
-// ---------------------------------------------------------------------------
-// TopicRegistry::deleteRetentionMsOf (CP-1)
-// ---------------------------------------------------------------------------
 int64_t
 TopicRegistry::deleteRetentionMsOf(int32_t topicId) const noexcept
 {
-    if (topicId < 0 || static_cast<std::size_t>(topicId) >= topics_.size())
-        return 86'400'000LL;
-    return topics_[static_cast<std::size_t>(topicId)].spec.deleteRetentionMs;
+    const rune::node::TopicSpec* spec = specOf_(topicId);
+    return spec != nullptr ? spec->deleteRetentionMs : 86'400'000LL;
 }
 
 } // namespace rune::gateway

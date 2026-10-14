@@ -150,6 +150,16 @@ inline constexpr std::size_t kMaxRejectionBytes = 64;
         r.sessionId = sessionId; r.correlationId = correlationId; r.errorCode = code;
         return r.encode(out);
     }
+    // Catalog history (client version 8): the catalog DDL ops answer DdlResponse.
+    case T::DropTopic:
+    case T::AlterTopicConfig:
+    case T::DropView:
+    case T::AlterView: {
+        pc::DdlResponse r;
+        r.sessionId = sessionId; r.correlationId = correlationId; r.errorCode = code;
+        static_assert(pc::MessageHeader::ENCODED_SIZE + pc::DdlResponse::BODY_FIXED + 2 <= kMaxRejectionBytes);
+        return r.encode(out);
+    }
     case T::GetViewRow: {
         pc::ViewRowResponse r;
         r.sessionId = sessionId; r.correlationId = correlationId; r.status = code;

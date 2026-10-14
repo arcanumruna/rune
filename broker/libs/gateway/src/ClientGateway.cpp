@@ -1201,6 +1201,11 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
         case pc::TemplateId::DefineTopic:
         case pc::TemplateId::GetTopicSchema:
         case pc::TemplateId::AlterTopic:
+        case pc::TemplateId::CreateView:
+        case pc::TemplateId::DropTopic:
+        case pc::TemplateId::AlterTopicConfig:
+        case pc::TemplateId::DropView:
+        case pc::TemplateId::AlterView:
         case pc::TemplateId::GetViewRow:
             if (const auto hdr = pc::MessageHeader::decode(buf, len)) {
                 sessions_.touch(hdr->sessionId, nowNs_);
@@ -1273,6 +1278,19 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
             break;
         case pc::TemplateId::CreateView:
             handleCreateView(buf, len);
+            break;
+        // Catalog history Task 9: the catalog DDL ops (74–77).
+        case pc::TemplateId::DropTopic:
+            handleDropTopic(buf, len);
+            break;
+        case pc::TemplateId::AlterTopicConfig:
+            handleAlterTopicConfig(buf, len);
+            break;
+        case pc::TemplateId::DropView:
+            handleDropView(buf, len);
+            break;
+        case pc::TemplateId::AlterView:
+            handleAlterView(buf, len);
             break;
         // Task 20: point read of a materialized view row — routed to the owning
         // worker via the same op/return plumbing as PushRead.
@@ -2993,7 +3011,6 @@ ClientGateway::ServedPartition ClientGateway::servedPartition_(int32_t topicId, 
         s.log  = log;
         return s;
     }
-    if (topicRegistry_->awaitingCommit(topicId)) { s.kind = Kind::AwaitingCommit; return s; }   // C1
     const rune::node::TopicSpec* spec = topicRegistry_->topic(topicId);
     if (spec == nullptr || spec->persistence != rune::node::PersistenceMode::Transient) return s;
     if (partition < 0 || partition >= spec->partitionCount) return s;
@@ -3444,9 +3461,8 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     // Phase 2b E2: a TRANSIENT partition has no disk Log — routed to its owning
     // worker below (op.logPtr = nullptr: the worker appends to the replica's ring).
     const ServedPartition served = servedPartition_(msg.topicId, partition, routed);
-    if (served.kind == ServedPartition::Kind::AwaitingCommit ||
-        served.kind == ServedPartition::Kind::NotPlaced) [[unlikely]] {
-        spdlog::debug("ClientGateway: Produce to topicId={} awaiting its DDL commit / committed placement — "
+    if (served.kind == ServedPartition::Kind::NotPlaced) [[unlikely]] {
+        spdlog::debug("ClientGateway: Produce to topicId={} awaiting its committed placement — "
                       "NotLeader (retriable)", msg.topicId);
         sendResp(pc::ErrorCode::NotLeader, partition, 0);
         return true;
@@ -4493,9 +4509,8 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     // ErrorResponse{NotLeader} every unservable-here subscribe gets (retriable:
     // refresh metadata, retry); no subscription is registered.
     const ServedPartition served = servedPartition_(msg.topicId, partition, routed);
-    if (served.kind == ServedPartition::Kind::AwaitingCommit ||
-        served.kind == ServedPartition::Kind::NotPlaced) {
-        spdlog::debug("ClientGateway: Subscribe to topicId={} awaiting its DDL commit / committed placement — "
+    if (served.kind == ServedPartition::Kind::NotPlaced) {
+        spdlog::debug("ClientGateway: Subscribe to topicId={} awaiting its committed placement — "
                       "NotLeader (retriable)", msg.topicId);
         sendSubRedirect(std::string{}, msg.correlationId);
         return;
@@ -6790,10 +6805,53 @@ void ClientGateway::handleTxnMessage(const uint8_t* buf, std::size_t len,
 }
 
 // ---------------------------------------------------------------------------
+// Catalog history Task 9: the DDL extension → the admin sink's DdlMetaView.  The
+// session id and the source address (the session's egress channel) are the
+// gateway's own (ruling 13); a pre-v8 frame (no extension) carries none of the
+// client fields and a {0, 0} request id.  Views into the ingress buffer / session.
+// ---------------------------------------------------------------------------
+rune::gateway::DdlMetaView ClientGateway::ddlMetaOf_(const pc::DdlExtension* ext, int64_t sessionId,
+                                                     const Session& session) noexcept
+{
+    rune::gateway::DdlMetaView m;
+    m.sessionId     = sessionId;
+    m.sourceAddress = session.egressChannel;
+    if (ext != nullptr) {
+        m.statement         = ext->statement;
+        m.clientName        = ext->clientName;
+        m.requestId         = ext->requestId;
+        m.hasReplayedFrom   = ext->hasReplayedFrom == 1;
+        m.replayedClusterId = ext->replayedClusterId;
+        m.replayedOffset    = ext->replayedOffset;
+        m.replayedPrincipal = ext->replayedPrincipal;
+    }
+    return m;
+}
+
+// The admin sink's verdict → the answer when it did not take the request.
+// RingFull: Internal (retriable back-pressure, as before).  TooLarge: the
+// request can never fit one admin ring message — InvalidRequest, explicitly.
+void ClientGateway::answerAdminSubmit_(const uint8_t* buf, std::size_t len, rune::gateway::AdminSubmit r,
+                                       const char* ringFull, const char* tooLarge)
+{
+    switch (r) {
+    case rune::gateway::AdminSubmit::Accepted:
+        return;   // the AdminWorker answers asynchronously on the session egress
+    case rune::gateway::AdminSubmit::RingFull:
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal), ringFull);
+        return;
+    case rune::gateway::AdminSubmit::TooLarge:
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), tooLarge);
+        return;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Task 8a: handleDefineTopic (RULING-2 F) — route DefineTopic (64) to the admin
 // sink via a ring hand-off.  Validate + require known session + decode, then
 // copy the fields into the sink and RETURN immediately.  NO registry access, NO
 // blocking on the gateway hot path — a stalled AdminWorker never delays produce.
+// Catalog history Task 9: the v8 trailer (rf, config, DDL extension) rides along.
 // ---------------------------------------------------------------------------
 void ClientGateway::handleDefineTopic(const uint8_t* buf, std::size_t len)
 {
@@ -6819,19 +6877,14 @@ void ClientGateway::handleDefineTopic(const uint8_t* buf, std::size_t len)
         return;
     }
 
-    // Copy-and-return: the sink OWNS the copied bytes (name/keyField/blob views
-    // point into the ingress buffer and are copied by the sink before return).
-    if (!adminSink_->submitDefineTopic(m.sessionId, m.correlationId,
-                                       m.topicName, m.partitionCount,
-                                       m.keyField, m.validate,
-                                       m.descriptorBlob, m.descriptorLen,
-                                       m.persistence)) {
-        // No-hang (R2): admin request ring full — answered Internal (retry later).
-        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal), "DefineTopic: admin ring full");
-        return;
-    }
-    // Return immediately — the AdminWorker produces the DefineTopicResponse
-    // asynchronously on the session egress (via the admin→control egress ring).
+    // Copy-and-return: the sink OWNS the copied bytes (every view points into
+    // the ingress buffer and is copied by the sink before return).
+    answerAdminSubmit_(buf, len,
+                       adminSink_->submitDefineTopic(m.sessionId, m.correlationId, m.topicName, m.partitionCount,
+                                                     m.keyField, m.validate, m.descriptorBlob, m.descriptorLen,
+                                                     m.persistence, m.replicationFactor, m.config,
+                                                     ddlMetaOf_(m.hasExt ? &m.ext : nullptr, m.sessionId, *session)),
+                       "DefineTopic: admin ring full", "DefineTopic: request larger than the admin ring message");
 }
 
 // ---------------------------------------------------------------------------
@@ -6895,13 +6948,11 @@ void ClientGateway::handleAlterTopic(const uint8_t* buf, std::size_t len)
 
     // Copy-and-return: the sink OWNS the copied bytes (topicName/opsBlob views
     // point into the ingress buffer and are copied by the sink before return).
-    if (!adminSink_->submitAlterTopic(m.sessionId, m.correlationId, m.topicName,
-                                      m.expectedVersion, m.opsBlob, m.opsLen)) {
-        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal), "AlterTopic: admin ring full");
-        return;
-    }
-    // Return immediately — the AdminWorker produces the AlterTopicResponse
-    // asynchronously on the session egress (via the admin→control egress ring).
+    answerAdminSubmit_(buf, len,
+                       adminSink_->submitAlterTopic(m.sessionId, m.correlationId, m.topicName, m.expectedVersion,
+                                                    m.opsBlob, m.opsLen,
+                                                    ddlMetaOf_(m.hasExt ? &m.ext : nullptr, m.sessionId, *session)),
+                       "AlterTopic: admin ring full", "AlterTopic: request larger than the admin ring message");
 }
 
 // ---------------------------------------------------------------------------
@@ -6937,14 +6988,73 @@ void ClientGateway::handleCreateView(const uint8_t* buf, std::size_t len)
 
     // Copy-and-return: the sink OWNS the copied bytes (viewName/keyField/planBlob
     // views point into the ingress buffer and are copied by the sink before return).
-    if (!adminSink_->submitCreateView(m.sessionId, m.correlationId,
-                                      m.viewName, m.keyField, m.persistence,
-                                      m.planBlob, m.planLen)) {
-        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal), "CreateView: admin ring full");
+    answerAdminSubmit_(buf, len,
+                       adminSink_->submitCreateView(m.sessionId, m.correlationId, m.viewName, m.keyField,
+                                                    m.persistence, m.planBlob, m.planLen,
+                                                    ddlMetaOf_(m.hasExt ? &m.ext : nullptr, m.sessionId, *session)),
+                       "CreateView: admin ring full", "CreateView: request larger than the admin ring message");
+}
+
+// ---------------------------------------------------------------------------
+// Catalog history Task 9: DropTopic (74), AlterTopicConfig (75), DropView (76),
+// AlterView (77) — the same copy-and-return discipline as handleDefineTopic;
+// answered by a DdlResponse (78) from the admin thread.  Each carries a
+// mandatory DDL extension: an undecodable body is answered InvalidRequest.
+// ---------------------------------------------------------------------------
+template <class Msg, class Submit>
+void ClientGateway::handleCatalogDdl_(const uint8_t* buf, std::size_t len, const char* what, Submit&& submit)
+{
+    if (!adminSink_) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal), what);
         return;
     }
-    // Return immediately — the AdminWorker produces the CreateViewResponse
-    // asynchronously on the session egress (via the admin→control egress ring).
+    auto msgOpt = Msg::decode(buf, len);
+    if (!msgOpt) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), what);
+        return;
+    }
+    const Msg& m = *msgOpt;
+    Session* session = sessions_.find(m.sessionId);
+    if (!session) {
+        noteUnanswerable_(buf, len, what);
+        return;
+    }
+    answerAdminSubmit_(buf, len, submit(m, ddlMetaOf_(&m.ext, m.sessionId, *session)),
+                       "catalog DDL: admin ring full", "catalog DDL: request larger than the admin ring message");
+}
+
+void ClientGateway::handleDropTopic(const uint8_t* buf, std::size_t len)
+{
+    handleCatalogDdl_<pc::DropTopic>(buf, len, "DropTopic not routable",
+        [this](const pc::DropTopic& m, const rune::gateway::DdlMetaView& meta) {
+            return adminSink_->submitDropTopic(m.sessionId, m.correlationId, m.topicName, meta);
+        });
+}
+
+void ClientGateway::handleAlterTopicConfig(const uint8_t* buf, std::size_t len)
+{
+    handleCatalogDdl_<pc::AlterTopicConfig>(buf, len, "AlterTopicConfig not routable",
+        [this](const pc::AlterTopicConfig& m, const rune::gateway::DdlMetaView& meta) {
+            return adminSink_->submitAlterTopicConfig(m.sessionId, m.correlationId, m.topicName,
+                                                      m.expectedVersion, m.changes, meta);
+        });
+}
+
+void ClientGateway::handleDropView(const uint8_t* buf, std::size_t len)
+{
+    handleCatalogDdl_<pc::DropView>(buf, len, "DropView not routable",
+        [this](const pc::DropView& m, const rune::gateway::DdlMetaView& meta) {
+            return adminSink_->submitDropView(m.sessionId, m.correlationId, m.viewName, meta);
+        });
+}
+
+void ClientGateway::handleAlterView(const uint8_t* buf, std::size_t len)
+{
+    handleCatalogDdl_<pc::AlterView>(buf, len, "AlterView not routable",
+        [this](const pc::AlterView& m, const rune::gateway::DdlMetaView& meta) {
+            return adminSink_->submitAlterView(m.sessionId, m.correlationId, m.viewName, m.keyField,
+                                               m.persistence, m.expectedVersion, m.planBlob, m.planLen, meta);
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -7083,7 +7193,7 @@ int64_t ClientGateway::addGroupSubscription(int64_t memberSessionId,
     // C1 + E2: uncommitted / unknown → refused; a TRANSIENT partition (no disk
     // Log) is pushed by its owning worker only — refused without a worker pool.
     const ServedPartition served = servedPartition_(topicId, partition);
-    if (served.kind == ServedPartition::Kind::AwaitingCommit || served.kind == ServedPartition::Kind::NotPlaced ||
+    if (served.kind == ServedPartition::Kind::NotPlaced ||
         served.kind == ServedPartition::Kind::Unknown ||
         (served.kind == ServedPartition::Kind::Transient && !workerPool_)) {
         spdlog::warn("ClientGateway::addGroupSubscription: unknown (or uncommitted) topicId={} partition={}",
@@ -7626,12 +7736,10 @@ void ClientGateway::handleMetadata(const uint8_t* buf, std::size_t len)
             // assign a partition the registry no longer holds (DDL conformance
             // D1: a ZERO-partition __orphan.<id> placeholder recovered at boot
             // keeps its pre-restart assignment in __cluster_metadata).
-            // C1: a runtime topic awaiting its DDL commit is not listed.
             if (topicRegistry_) {
                 if (topicId >= topicRegistry_->topicCount()) continue;
                 const rune::node::TopicSpec* spec = topicRegistry_->topic(topicId);
                 if (spec == nullptr || partition >= spec->partitionCount) continue;
-                if (topicRegistry_->awaitingCommit(topicId)) continue;
                 // Task 8 (C1 generalized): a catalog topic is listed once its
                 // placement is committed (the bootstrap image is not committed).
                 if (topicRegistry_->placementGated(topicId) && !img->committed()) continue;

@@ -12,12 +12,14 @@
 // their source after a restart.
 #include <gtest/gtest.h>
 
+#include <map>
+
 #include <spdlog/sinks/ringbuffer_sink.h>
 #include <spdlog/spdlog.h>
 
 #include <rune/node/RuntimeTopicRecovery.h>
 #include <rune/node/SchemaRegistry.h>
-#include <rune/node/TopicName.h>
+#include <rune/catalog/TopicName.h>
 #include <rune/node/ViewRegistry.h>
 
 #include <rune/gateway/TopicRegistry.h>
@@ -227,7 +229,7 @@ TEST(RuntimeTopicRecoveryRegression, GapAtFirstRuntimeIdIsFilledRegression) {
 // The placeholder name is reserved: no DDL can ever create or address it.
 TEST(RuntimeTopicRecoveryRegression, PlaceholderNameIsReservedRegression) {
     EXPECT_EQ(rune::node::orphanPlaceholderName(7), "__orphan.7");
-    EXPECT_FALSE(rune::node::isValidTopicName(rune::node::orphanPlaceholderName(7)));
+    EXPECT_FALSE(rune::catalog::isValidTopicName(rune::node::orphanPlaceholderName(7)));
 }
 
 // D1: placeholders are logged ONCE per boot (one line naming every id), not per id.
@@ -326,7 +328,7 @@ std::vector<uint8_t> oneRecordBatch(std::string_view value) {
     return b.build();
 }
 std::string readMarker(const fs::path& topicDir) {
-    std::ifstream in(topicDir / rune::gateway::kTopicIdMarkerFile, std::ios::binary);
+    std::ifstream in(topicDir / rune::node::kTopicIdMarkerFile, std::ios::binary);
     return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 }
 // Boot 2 of an end-to-end scenario: static topics + recovery, exactly as BrokerNode.
@@ -353,6 +355,43 @@ std::string readAll(const fs::path& p) {
     std::ifstream in(p, std::ios::binary);
     return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 }
+// Catalog history Task 9: the runtime create path (TopicRegistry::createTopic and
+// its topic-id marker, markTopicCommitted) is gone — topics are built at their
+// catalog ids.  Boot's reconcile still meets the dirs a pre-Task-9 broker left, so
+// LegacyRuntimeTopics reproduces them EXACTLY (the next sequential id, "pending
+// <id>" in a dir it made, a stale marker cleared from a reused dir, the
+// "committed" rewrite) to keep these reconcile cases pinned until Task 16 retires
+// RuntimeTopicRecovery with them.
+class LegacyRuntimeTopics {
+public:
+    LegacyRuntimeTopics(rune::gateway::TopicRegistry& reg, std::string dataDir)
+        : reg_(reg), dataDir_(std::move(dataDir)) {}
+    int32_t createTopic(const TopicSpec& s) {
+        if (const auto id = reg_.topicIdForName(s.name)) return *id;   // idempotent by name
+        const auto id = reg_.topicCount();
+        const fs::path dir = fs::path(dataDir_) / "topics" / s.name;
+        std::error_code ec;
+        const bool preexisted = fs::exists(fs::symlink_status(dir, ec));
+        if (reg_.createTopicAt(id, s) != id) return -1;
+        const bool disk = s.persistence != rune::node::PersistenceMode::Transient && s.partitionCount > 0;
+        if (disk && preexisted) (void)rune::node::clearTopicIdMarker(dir.string());
+        if (disk && !preexisted && rune::node::writeTopicIdMarker(dir.string(), rune::node::kTopicIdMarkerPending, id))
+            pending_[id] = s.name;
+        return id;
+    }
+    bool markTopicCommitted(int32_t id) {
+        const auto it = pending_.find(id);
+        if (it == pending_.end()) return false;
+        const fs::path dir = fs::path(dataDir_) / "topics" / it->second;
+        if (!rune::node::writeTopicIdMarker(dir.string(), rune::node::kTopicIdMarkerCommitted, id)) return false;
+        pending_.erase(it);
+        return true;
+    }
+private:
+    rune::gateway::TopicRegistry&  reg_;
+    std::string                    dataDir_;
+    std::map<int32_t, std::string> pending_;
+};
 } // namespace
 
 // The marker is written by a RUNTIME create (DefineTopic / CreateView sink) of a disk
@@ -364,23 +403,24 @@ TEST(RuntimeTopicRecoveryRegression, TopicRegistryWritesTheTopicIdMarkerRegressi
     TempDataDir d("marker");
     {
         rune::gateway::TopicRegistry reg({spec("events", 0, 2)}, d.path.string());
-        ASSERT_EQ(reg.createTopic(spec("runtime_disk", -1, 2)), 1);
+        LegacyRuntimeTopics legacy(reg, d.path.string());
+        ASSERT_EQ(legacy.createTopic(spec("runtime_disk", -1, 2)), 1);
         EXPECT_EQ(readMarker(d.path / "topics" / "runtime_disk"), "pending 1\n");
         TopicSpec t = spec("later", -1); t.persistence = rune::node::PersistenceMode::Transient;
-        EXPECT_EQ(reg.createTopic(t), 2);   // transient: no dir, no marker
-        (void)reg.createTopic(spec("runtime_disk", -1, 2));   // idempotent: marker unchanged
+        EXPECT_EQ(legacy.createTopic(t), 2);   // transient: no dir, no marker
+        (void)legacy.createTopic(spec("runtime_disk", -1, 2));   // idempotent: marker unchanged
         EXPECT_EQ(readMarker(d.path / "topics" / "runtime_disk"), "pending 1\n");
 
-        EXPECT_TRUE(reg.markTopicCommitted(1));
+        EXPECT_TRUE(legacy.markTopicCommitted(1));
         EXPECT_EQ(readMarker(d.path / "topics" / "runtime_disk"), "committed 1\n");
-        EXPECT_FALSE(reg.markTopicCommitted(1)) << "Committed is terminal";
-        EXPECT_FALSE(reg.markTopicCommitted(0)) << "a boot-built topic has no marker to commit";
-        EXPECT_FALSE(reg.markTopicCommitted(2)) << "a transient topic has no marker";
-        EXPECT_FALSE(reg.markTopicCommitted(99)) << "unknown id";
+        EXPECT_FALSE(legacy.markTopicCommitted(1)) << "Committed is terminal";
+        EXPECT_FALSE(legacy.markTopicCommitted(0)) << "a boot-built topic has no marker to commit";
+        EXPECT_FALSE(legacy.markTopicCommitted(2)) << "a transient topic has no marker";
+        EXPECT_FALSE(legacy.markTopicCommitted(99)) << "unknown id";
     }
-    EXPECT_FALSE(fs::exists(d.path / "topics" / "runtime_disk" / rune::gateway::kTopicIdMarkerTmpFile))
+    EXPECT_FALSE(fs::exists(d.path / "topics" / "runtime_disk" / rune::node::kTopicIdMarkerTmpFile))
         << "the atomic write leaves no temp file behind";
-    EXPECT_FALSE(fs::exists(d.path / "topics" / "events" / rune::gateway::kTopicIdMarkerFile))
+    EXPECT_FALSE(fs::exists(d.path / "topics" / "events" / rune::node::kTopicIdMarkerFile))
         << "a boot-built (static/recovered) topic is never marked";
     EXPECT_TRUE(fs::exists(d.path / "topics" / "events" / "1"));
     EXPECT_FALSE(fs::exists(d.path / "topics" / "later"));
@@ -397,12 +437,13 @@ TEST(RuntimeTopicRecoveryRegression, MarkerIsNeverWrittenIntoAPreexistingDirRegr
     touchFile(d.path / "topics" / "old_dir" / "topic-id.tmp", "committed 7\n");
     {
         rune::gateway::TopicRegistry reg({}, d.path.string());
-        ASSERT_EQ(reg.createTopic(spec("old_dir", -1)), 0);
-        EXPECT_FALSE(reg.markTopicCommitted(0));
+        LegacyRuntimeTopics legacy(reg, d.path.string());
+        ASSERT_EQ(legacy.createTopic(spec("old_dir", -1)), 0);
+        EXPECT_FALSE(legacy.markTopicCommitted(0));
     }
-    EXPECT_FALSE(fs::exists(d.path / "topics" / "old_dir" / rune::gateway::kTopicIdMarkerFile))
+    EXPECT_FALSE(fs::exists(d.path / "topics" / "old_dir" / rune::node::kTopicIdMarkerFile))
         << "fix round 2 (N2): a reused dir's stale marker is removed, never kept";
-    EXPECT_FALSE(fs::exists(d.path / "topics" / "old_dir" / rune::gateway::kTopicIdMarkerTmpFile));
+    EXPECT_FALSE(fs::exists(d.path / "topics" / "old_dir" / rune::node::kTopicIdMarkerTmpFile));
     EXPECT_TRUE(fs::exists(d.path / "topics" / "old_dir" / "0" / "00000000000000000000.log"));
 }
 
@@ -430,13 +471,14 @@ TEST(RuntimeTopicRecoveryRegression, FailedCreateOrphanDirIsDeletedEndToEndRegre
     TempDataDir d("orphan-e2e");
     {   // boot 1: static "events" (id 0); runtime "orphan_v" (id 1, never recorded), "kept" (id 2)
         rune::gateway::TopicRegistry reg({spec("events", 0)}, d.path.string());
-        ASSERT_EQ(reg.createTopic(spec("orphan_v", -1)), 1);
-        ASSERT_EQ(reg.createTopic(spec("kept", -1)), 2);
+        LegacyRuntimeTopics legacy(reg, d.path.string());
+        ASSERT_EQ(legacy.createTopic(spec("orphan_v", -1)), 1);
+        ASSERT_EQ(legacy.createTopic(spec("kept", -1)), 2);
         // Final review C1: an uncommitted topic is unwritable — the orphan holds nothing.
         reg.log(2, 0)->append(oneRecordBatch("kept-data"), 0);
         appendRecords(d.path / "__topic_schemas", {schemaRecord(2, 1, 1, "kept", "kept_desc")});
         fs::create_directories(d.path / "__views");   // a real broker always has both catalogs
-        ASSERT_TRUE(reg.markTopicCommitted(2));   // the admin thread's kA2cTopicCommitted
+        ASSERT_TRUE(legacy.markTopicCommitted(2));   // the admin thread's kA2cTopicCommitted
     }
     // boot 2
     const Boot b = recoverBoot(d.path, {spec("events", 0)});
@@ -450,6 +492,7 @@ TEST(RuntimeTopicRecoveryRegression, FailedCreateOrphanDirIsDeletedEndToEndRegre
     EXPECT_TRUE(r.quarantined.empty());
     EXPECT_FALSE(fs::exists(d.path / "topics" / "orphan_v"));
     rune::gateway::TopicRegistry reg(b.all, d.path.string());
+    LegacyRuntimeTopics legacy(reg, d.path.string());
     EXPECT_EQ(reg.topicIdForName("kept"), 2) << "later topics keep their ids";
     EXPECT_EQ(reg.log(2, 0)->logEndOffset(), 1) << "the recorded topic's data is intact";
     EXPECT_EQ(reg.log(1, 0), nullptr) << "the placeholder has no partition";
@@ -465,13 +508,14 @@ TEST(RuntimeTopicRecoveryRegression, CrcTruncatedSchemaCatalogQuarantinesCommitt
     TempDataDir d("crc-trunc");
     {   // boot 1: static "src" (0); runtime DefineTopic "t1" (1, committed); view sink "v2" (2, committed)
         rune::gateway::TopicRegistry reg({spec("src", 0)}, d.path.string());
-        ASSERT_EQ(reg.createTopic(spec("t1", -1)), 1);
-        ASSERT_EQ(reg.createTopic(spec("v2", -1)), 2);
+        LegacyRuntimeTopics legacy(reg, d.path.string());
+        ASSERT_EQ(legacy.createTopic(spec("t1", -1)), 1);
+        ASSERT_EQ(legacy.createTopic(spec("v2", -1)), 2);
         reg.log(1, 0)->append(oneRecordBatch("acked-t1-data"), 0);
         appendRecords(d.path / "__topic_schemas", {schemaRecord(1, 1, 1, "t1", "t1_desc")});
         appendRecords(d.path / "__views", {viewRecord(2, "v2", /*source*/ 0)});
-        ASSERT_TRUE(reg.markTopicCommitted(1));
-        ASSERT_TRUE(reg.markTopicCommitted(2));
+        ASSERT_TRUE(legacy.markTopicCommitted(1));
+        ASSERT_TRUE(legacy.markTopicCommitted(2));
     }
     {   // damage __topic_schemas: flip a byte inside its only record -> CRC mismatch
         const fs::path seg = onlySegment(d.path / "__topic_schemas");
@@ -511,15 +555,16 @@ TEST(RuntimeTopicRecoveryRegression, MissingSchemaCatalogWithSurvivingViewsDelet
     TempDataDir d("missing-schemas");
     {
         rune::gateway::TopicRegistry reg({spec("src", 0)}, d.path.string());
-        ASSERT_EQ(reg.createTopic(spec("t1", -1)), 1);
-        ASSERT_EQ(reg.createTopic(spec("t2", -1)), 2);
-        ASSERT_EQ(reg.createTopic(spec("v3", -1)), 3);
+        LegacyRuntimeTopics legacy(reg, d.path.string());
+        ASSERT_EQ(legacy.createTopic(spec("t1", -1)), 1);
+        ASSERT_EQ(legacy.createTopic(spec("t2", -1)), 2);
+        ASSERT_EQ(legacy.createTopic(spec("v3", -1)), 3);
         reg.log(1, 0)->append(oneRecordBatch("acked-t1"), 0);
         reg.log(2, 0)->append(oneRecordBatch("acked-t2"), 0);
         appendRecords(d.path / "__topic_schemas",
                       {schemaRecord(1, 1, 1, "t1", "d1"), schemaRecord(2, 1, 1, "t2", "d2")});
         appendRecords(d.path / "__views", {viewRecord(3, "v3", /*source*/ 0)});
-        for (int32_t id : {1, 2, 3}) ASSERT_TRUE(reg.markTopicCommitted(id));
+        for (int32_t id : {1, 2, 3}) ASSERT_TRUE(legacy.markTopicCommitted(id));
     }
     fs::remove_all(d.path / "__topic_schemas");
     const Boot b = recoverBoot(d.path, {spec("src", 0)});
@@ -545,12 +590,13 @@ TEST(RuntimeTopicRecoveryRegression, BootPromotesAClaimedPendingMarkerSoALaterCa
         // broker crashes before kA2cTopicCommitted is applied (marker stays pending);
         // view sink "v2" (2) committed normally.
         rune::gateway::TopicRegistry reg({spec("src", 0)}, d.path.string());
-        ASSERT_EQ(reg.createTopic(spec("t1", -1)), 1);
-        ASSERT_EQ(reg.createTopic(spec("v2", -1)), 2);
+        LegacyRuntimeTopics legacy(reg, d.path.string());
+        ASSERT_EQ(legacy.createTopic(spec("t1", -1)), 1);
+        ASSERT_EQ(legacy.createTopic(spec("v2", -1)), 2);
         reg.log(1, 0)->append(oneRecordBatch("acked-t1"), 0);
         appendRecords(d.path / "__topic_schemas", {schemaRecord(1, 1, 1, "t1", "d1")});
         appendRecords(d.path / "__views", {viewRecord(2, "v2", /*source*/ 0)});
-        ASSERT_TRUE(reg.markTopicCommitted(2));
+        ASSERT_TRUE(legacy.markTopicCommitted(2));
     }
     ASSERT_EQ(readMarker(d.path / "topics" / "t1"), "pending 1\n");
     {   // boot 2: the catalog claims t1 -> its marker is promoted; nothing else moves
@@ -563,7 +609,7 @@ TEST(RuntimeTopicRecoveryRegression, BootPromotesAClaimedPendingMarkerSoALaterCa
         EXPECT_TRUE(r.quarantined.empty());
         EXPECT_EQ(readMarker(d.path / "topics" / "t1"), "committed 1\n");
         EXPECT_EQ(readMarker(d.path / "topics" / "v2"), "committed 2\n") << "already committed: untouched";
-        EXPECT_FALSE(fs::exists(d.path / "topics" / "t1" / rune::gateway::kTopicIdMarkerTmpFile));
+        EXPECT_FALSE(fs::exists(d.path / "topics" / "t1" / rune::node::kTopicIdMarkerTmpFile));
     }
     fs::remove_all(d.path / "__topic_schemas");   // the record is later lost
     {   // boot 3: id 1 is a placeholder; t1's dir is QUARANTINED, never deleted
@@ -621,9 +667,10 @@ TEST(RuntimeTopicRecoveryRegression, MarkerWriterNeverFollowsASymlinkedTmpRegres
     touchFile(outside.path / "victim", "precious");
     {   // runtime: markTopicCommitted
         rune::gateway::TopicRegistry reg({}, d.path.string());
-        ASSERT_EQ(reg.createTopic(spec("t", -1)), 0);
+        LegacyRuntimeTopics legacy(reg, d.path.string());
+        ASSERT_EQ(legacy.createTopic(spec("t", -1)), 0);
         fs::create_symlink(outside.path / "victim", d.path / "topics" / "t" / "topic-id.tmp");
-        EXPECT_TRUE(reg.markTopicCommitted(0));
+        EXPECT_TRUE(legacy.markTopicCommitted(0));
         EXPECT_EQ(readAll(outside.path / "victim"), "precious") << "never written through the link";
         EXPECT_TRUE(fs::is_regular_file(fs::symlink_status(d.path / "topics" / "t" / "topic-id")));
         EXPECT_EQ(readMarker(d.path / "topics" / "t"), "committed 0\n");
@@ -649,19 +696,20 @@ TEST(RuntimeTopicRecoveryRegression, MarkerWriterRefusesASymlinkedMarkerOrDirReg
     touchFile(outside.path / "victim", "pending 0\n");
     touchFile(outside.path / "dir" / "topic-id", "pending 1\n");
     rune::gateway::TopicRegistry reg({}, d.path.string());
-    ASSERT_EQ(reg.createTopic(spec("m", -1)), 0);
-    ASSERT_EQ(reg.createTopic(spec("dirlink", -1)), 1);
+    LegacyRuntimeTopics legacy(reg, d.path.string());
+    ASSERT_EQ(legacy.createTopic(spec("m", -1)), 0);
+    ASSERT_EQ(legacy.createTopic(spec("dirlink", -1)), 1);
     // topic-id replaced by a symlink to a file outside dataDir
     fs::remove(d.path / "topics" / "m" / "topic-id");
     fs::create_symlink(outside.path / "victim", d.path / "topics" / "m" / "topic-id");
-    EXPECT_FALSE(reg.markTopicCommitted(0)) << "refused: the final marker path is a symlink";
+    EXPECT_FALSE(legacy.markTopicCommitted(0)) << "refused: the final marker path is a symlink";
     EXPECT_EQ(readAll(outside.path / "victim"), "pending 0\n");
     EXPECT_TRUE(fs::is_symlink(d.path / "topics" / "m" / "topic-id"));
     EXPECT_FALSE(fs::exists(fs::symlink_status(d.path / "topics" / "m" / "topic-id.tmp")));
     // the whole topic dir replaced by a symlink to a dir outside dataDir
     fs::rename(d.path / "topics" / "dirlink", d.path / "moved_away");
     fs::create_directory_symlink(outside.path / "dir", d.path / "topics" / "dirlink");
-    EXPECT_FALSE(reg.markTopicCommitted(1)) << "refused: the topic dir is a symlink";
+    EXPECT_FALSE(legacy.markTopicCommitted(1)) << "refused: the topic dir is a symlink";
     EXPECT_EQ(readAll(outside.path / "dir" / "topic-id"), "pending 1\n");
     EXPECT_FALSE(fs::exists(outside.path / "dir" / "topic-id.tmp"));
     // boot promotion: neither is touched
@@ -671,8 +719,8 @@ TEST(RuntimeTopicRecoveryRegression, MarkerWriterRefusesASymlinkedMarkerOrDirReg
     EXPECT_EQ(readAll(outside.path / "victim"), "pending 0\n");
     EXPECT_EQ(readAll(outside.path / "dir" / "topic-id"), "pending 1\n");
     // and the direct writer refuses both shapes
-    EXPECT_FALSE(rune::gateway::writeTopicIdMarker((d.path / "topics" / "m").string(), "committed", 0));
-    EXPECT_FALSE(rune::gateway::writeTopicIdMarker((d.path / "topics" / "dirlink").string(), "committed", 1));
+    EXPECT_FALSE(rune::node::writeTopicIdMarker((d.path / "topics" / "m").string(), "committed", 0));
+    EXPECT_FALSE(rune::node::writeTopicIdMarker((d.path / "topics" / "dirlink").string(), "committed", 1));
     EXPECT_EQ(readAll(outside.path / "victim"), "pending 0\n");
 }
 
@@ -750,15 +798,16 @@ namespace {
 // its record never committed); "t2" (2, committed); view sink "v3" (3, committed).
 void bootOneWithAnOrphan(const fs::path& dataDir) {
     rune::gateway::TopicRegistry reg({spec("src", 0)}, dataDir.string());
-    ASSERT_EQ(reg.createTopic(spec("orphan_o", -1)), 1);
-    ASSERT_EQ(reg.createTopic(spec("t2", -1)), 2);
-    ASSERT_EQ(reg.createTopic(spec("v3", -1)), 3);
+    LegacyRuntimeTopics legacy(reg, dataDir.string());
+    ASSERT_EQ(legacy.createTopic(spec("orphan_o", -1)), 1);
+    ASSERT_EQ(legacy.createTopic(spec("t2", -1)), 2);
+    ASSERT_EQ(legacy.createTopic(spec("v3", -1)), 3);
     // Final review C1: the orphan is unwritable (empty); deletes are about markers here.
     reg.log(2, 0)->append(oneRecordBatch("acked-t2"), 0);
     appendRecords(dataDir / "__topic_schemas", {schemaRecord(2, 1, 1, "t2", "d2")});
     appendRecords(dataDir / "__views", {viewRecord(3, "v3", /*source*/ 0)});
-    ASSERT_TRUE(reg.markTopicCommitted(2));
-    ASSERT_TRUE(reg.markTopicCommitted(3));
+    ASSERT_TRUE(legacy.markTopicCommitted(2));
+    ASSERT_TRUE(legacy.markTopicCommitted(3));
 }
 void flipByteNearEnd(const fs::path& seg) {
     std::fstream f(seg, std::ios::in | std::ios::out | std::ios::binary);
@@ -850,11 +899,12 @@ TEST(RuntimeTopicRecoveryRegression, StaticTopicNamedLikeAPlaceholderNeverArmsAD
     TempDataDir d("spoofed-placeholder");
     {   // boot 1: RUNE_TOPICS=a; runtime "x" (id 1) commits
         rune::gateway::TopicRegistry reg({spec("a", 0)}, d.path.string());
-        ASSERT_EQ(reg.createTopic(spec("x", -1)), 1);
+        LegacyRuntimeTopics legacy(reg, d.path.string());
+        ASSERT_EQ(legacy.createTopic(spec("x", -1)), 1);
         reg.log(1, 0)->append(oneRecordBatch("x-data"), 0);
         appendRecords(d.path / "__topic_schemas", {schemaRecord(1, 1, 1, "x", "x_desc")});
         fs::create_directories(d.path / "__views");   // healthy: both catalogs present
-        ASSERT_TRUE(reg.markTopicCommitted(1));
+        ASSERT_TRUE(legacy.markTopicCommitted(1));
     }
     // a second unclaimed dir whose marker is still PENDING id 1 (the stronger case)
     touchFile(d.path / "topics" / "y" / "topic-id", "pending 1\n");
@@ -877,11 +927,12 @@ TEST(RuntimeTopicRecoveryRegression, RemovedLastStaticTopicWithRuntimeTopicsIsQu
     TempDataDir d("static-gap");
     {   // boot 1: RUNE_TOPICS=a,b (ids 0,1); runtime "c" (id 2, recorded)
         rune::gateway::TopicRegistry reg({spec("a", 0), spec("b", 1)}, d.path.string());
-        ASSERT_EQ(reg.createTopic(spec("c", -1)), 2);
+        LegacyRuntimeTopics legacy(reg, d.path.string());
+        ASSERT_EQ(legacy.createTopic(spec("c", -1)), 2);
         reg.log(1, 0)->append(oneRecordBatch("static-b-data"), 0);
         appendRecords(d.path / "__topic_schemas", {schemaRecord(2, 1, 1, "c", "c_desc")});
         fs::create_directories(d.path / "__views");   // healthy: both catalogs present
-        ASSERT_TRUE(reg.markTopicCommitted(2));
+        ASSERT_TRUE(legacy.markTopicCommitted(2));
     }
     // boot 2: RUNE_TOPICS=a -> firstRuntimeId 1, id 1 is now a gap
     const Boot b = recoverBoot(d.path, {spec("a", 0)});
@@ -899,6 +950,7 @@ TEST(RuntimeTopicRecoveryRegression, RemovedStaticTopicIsQuarantinedIntactAndNot
     TempDataDir d("quarantine");
     {   // boot 1: RUNE_TOPICS=events:1 — one record written
         rune::gateway::TopicRegistry reg({spec("events", 0)}, d.path.string());
+        LegacyRuntimeTopics legacy(reg, d.path.string());
         rune::storage::Log* log = reg.log(0, 0);
         ASSERT_NE(log, nullptr);
         log->append(oneRecordBatch("kept-record"), 0);
@@ -923,6 +975,7 @@ TEST(RuntimeTopicRecoveryRegression, RemovedStaticTopicIsQuarantinedIntactAndNot
         EXPECT_TRUE(again.deleted.empty());
         EXPECT_TRUE(again.quarantined.empty());
         rune::gateway::TopicRegistry reg({spec("events", 0)}, d.path.string());
+        LegacyRuntimeTopics legacy(reg, d.path.string());
         EXPECT_EQ(reg.log(0, 0)->logEndOffset(), 0) << "re-adding a topic does NOT auto-restore it";
         EXPECT_TRUE(fs::exists(q / "0")) << "the quarantined copy stays until an operator restores it";
     }
@@ -1155,16 +1208,17 @@ TEST(ReconcileRegression, PendingOrphanWithRecordsIsQuarantinedNotDeletedRegress
     {   // boot 1: static "src" (0); orphans "orphan_w" (1, written) and "orphan_e" (3,
         // empty) never recorded; "kept" (2) and "kept2" (4) committed.
         rune::gateway::TopicRegistry reg({spec("src", 0)}, d.path.string());
-        ASSERT_EQ(reg.createTopic(spec("orphan_w", -1, 2)), 1);
-        ASSERT_EQ(reg.createTopic(spec("kept", -1)), 2);
-        ASSERT_EQ(reg.createTopic(spec("orphan_e", -1, 2)), 3);
-        ASSERT_EQ(reg.createTopic(spec("kept2", -1)), 4);
+        LegacyRuntimeTopics legacy(reg, d.path.string());
+        ASSERT_EQ(legacy.createTopic(spec("orphan_w", -1, 2)), 1);
+        ASSERT_EQ(legacy.createTopic(spec("kept", -1)), 2);
+        ASSERT_EQ(legacy.createTopic(spec("orphan_e", -1, 2)), 3);
+        ASSERT_EQ(legacy.createTopic(spec("kept2", -1)), 4);
         reg.log(1, 1)->append(oneRecordBatch("acked-into-orphan"), 0);   // partition 1 only
         appendRecords(d.path / "__topic_schemas",
                       {schemaRecord(2, 1, 1, "kept", "kept_d"), schemaRecord(4, 1, 1, "kept2", "kept2_d")});
         fs::create_directories(d.path / "__views");
-        ASSERT_TRUE(reg.markTopicCommitted(2));
-        ASSERT_TRUE(reg.markTopicCommitted(4));
+        ASSERT_TRUE(legacy.markTopicCommitted(2));
+        ASSERT_TRUE(legacy.markTopicCommitted(4));
     }
     const Boot b = recoverBoot(d.path, {spec("src", 0)});
     ASSERT_EQ(b.placeholderIds, (std::vector<int32_t>{1, 3}));
@@ -1208,12 +1262,13 @@ TEST(RuntimeTopicRecoveryRegression, CatalogDamageIsLatchedAcrossBootsRegression
     TempDataDir d("m1-latch");
     {   // static "src" (0); "orphan_e" (1, pending, EMPTY); "t2" (2, committed)
         rune::gateway::TopicRegistry reg({spec("src", 0)}, d.path.string());
-        ASSERT_EQ(reg.createTopic(spec("orphan_e", -1)), 1);
-        ASSERT_EQ(reg.createTopic(spec("t2", -1)), 2);
+        LegacyRuntimeTopics legacy(reg, d.path.string());
+        ASSERT_EQ(legacy.createTopic(spec("orphan_e", -1)), 1);
+        ASSERT_EQ(legacy.createTopic(spec("t2", -1)), 2);
         reg.log(2, 0)->append(oneRecordBatch("acked-t2"), 0);
         appendRecords(d.path / "__topic_schemas", {schemaRecord(2, 1, 1, "t2", "d2")});
         appendRecords(d.path / "__views", {viewRecord(3, "v3", /*source*/ 0)});
-        ASSERT_TRUE(reg.markTopicCommitted(2));
+        ASSERT_TRUE(legacy.markTopicCommitted(2));
     }
     flipByteNearEnd(onlySegment(d.path / "__views"));
     touchFile(d.path / "quarantine", "a file where the quarantine dir should be");
@@ -1277,10 +1332,11 @@ TEST(RuntimeTopicRecoveryRegression, StaticCaseVariantOfARecoveredTopicRefusesBo
     TempDataDir d("i3-e2e");
     {
         rune::gateway::TopicRegistry reg({}, d.path.string());
-        ASSERT_EQ(reg.createTopic(spec("orders", -1)), 0);
+        LegacyRuntimeTopics legacy(reg, d.path.string());
+        ASSERT_EQ(legacy.createTopic(spec("orders", -1)), 0);
         appendRecords(d.path / "__topic_schemas", {schemaRecord(0, 1, 1, "orders", "orders_d")});
         fs::create_directories(d.path / "__views");
-        ASSERT_TRUE(reg.commitTopic(0));
+        ASSERT_TRUE(legacy.markTopicCommitted(0));
     }
     const std::vector<TopicSpec> statics = {spec("Orders", 0)};
     // RUNE_TOPICS now has one entry, so the boundary moves to 1: the runtime topic's

@@ -101,6 +101,37 @@ inline constexpr const char* kCatalogDamagedSentinel = ".catalog-damaged";
 void refuseStaticNamesCollidingWithRecovered(const std::vector<TopicSpec>& statics,
                                              const std::vector<TopicSpec>& catalogTopics);
 
+/// The two-phase topic-id marker in dataDir/topics/<name>/ (B10 / D4) — written by
+/// the retired runtime create path; boot's reconcileTopicDirs still reads (and
+/// heals) markers that older builds left.  Moved here from TopicRegistry with its
+/// last writer (catalog history Task 9); Task 16 retires it with this module.
+/// One line, written atomically (temp file + rename):
+///   "pending <id>\n"   — a runtime create made this dir; its record never confirmed;
+///   "committed <id>\n" — its catalog record committed.
+inline constexpr const char*      kTopicIdMarkerFile      = "topic-id";
+inline constexpr const char*      kTopicIdMarkerTmpFile   = "topic-id.tmp";
+inline constexpr std::string_view kTopicIdMarkerPending   = "pending";
+inline constexpr std::string_view kTopicIdMarkerCommitted = "committed";
+
+/// Atomically (kTopicIdMarkerTmpFile + rename) writes "<state> <id>\n" as
+/// topicDir/kTopicIdMarkerFile.  Never follows a symlink: refuses when topicDir or
+/// the marker path is one (or not a dir / not a regular file); the temp is created
+/// O_CREAT|O_EXCL|O_NOFOLLOW.  false (logged, temp removed) on failure.
+bool writeTopicIdMarker(const std::string& topicDir, std::string_view state, int32_t id);
+/// Removes topicDir/topic-id and topic-id.tmp (unlink only).  Refuses (false) when
+/// topicDir is a symlink or not a directory.  true iff a marker entry was removed.
+bool clearTopicIdMarker(const std::string& topicDir);
+
+/// INTERIM (catalog history Task 9, until Task 16's reconcile against the booted
+/// catalog): the topics and view sinks LIVE in the local `dataDir/__catalog` at its
+/// applied checkpoint — the topic dirs boot's reconcile must claim (a dropped
+/// topic's dir is NOT claimed: it is quarantined, so a reused name starts empty).
+/// A read-only replay into a scratch state (no effects, nothing else touched); a
+/// replay error stops it at that event (the applier halts on the same one).  No
+/// checkpoint = nothing applied = {}.  Throws on an unreadable checkpoint (boot
+/// refuses, as buildCatalog_ would).
+[[nodiscard]] std::vector<TopicSpec> catalogLiveTopicSpecs(const std::string& dataDir);
+
 /// "__orphan.<topicId>" — the recovery placeholder name for a catalog-less id.
 [[nodiscard]] std::string orphanPlaceholderName(int32_t topicId);
 

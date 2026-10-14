@@ -1,5 +1,5 @@
 #include <rune/node/NodeConfig.h>
-#include <rune/node/TopicName.h>
+#include <rune/catalog/TopicName.h>
 #include <rune/consensus/PeerResolution.h>
 #include <rune/node/Worker.h>
 #include <rune/storage/Log.h>                       // Log::kMaxRollBytes                         // Worker::maxAcceptableBatchBytes (THE batch limit)
@@ -825,32 +825,32 @@ ConfigResult parseNodeConfig(
                 }
 
                 if (fields.size() < 2)
-                    return {{}, std::string("RUNE_TOPICS entry missing ':' in: ") + escapeNameForLog(entry)};
+                    return {{}, std::string("RUNE_TOPICS entry missing ':' in: ") + rune::catalog::escapeNameForLog(entry)};
 
                 std::string_view namePart  = fields[0];
                 std::string_view countPart = fields[1];
 
                 if (namePart.empty())
-                    return {{}, std::string("RUNE_TOPICS entry has empty name in: ") + escapeNameForLog(entry)};
+                    return {{}, std::string("RUNE_TOPICS entry has empty name in: ") + rune::catalog::escapeNameForLog(entry)};
 
                 std::string name(namePart);
                 // DDL conformance B7 / D2d: a static name obeys the DDL name rule — it is
                 // the directory dataDir/topics/<name>/ too.
-                if (const TopicNameError ne = checkTopicName(name); ne != TopicNameError::None)
-                    return {{}, "RUNE_TOPICS topic name '" + escapeNameForLog(name) + "' is invalid (" +
-                                std::string(topicNameErrorText(ne)) + ") in entry: " + escapeNameForLog(entry)};
+                if (const rune::catalog::TopicNameError ne = rune::catalog::checkTopicName(name); ne != rune::catalog::TopicNameError::None)
+                    return {{}, "RUNE_TOPICS topic name '" + rune::catalog::escapeNameForLog(name) + "' is invalid (" +
+                                std::string(rune::catalog::topicNameErrorText(ne)) + ") in entry: " + rune::catalog::escapeNameForLog(entry)};
                 if (!seenNames.insert(name).second)
-                    return {{}, "RUNE_TOPICS has duplicate topic name: " + escapeNameForLog(name)};
+                    return {{}, "RUNE_TOPICS has duplicate topic name: " + rune::catalog::escapeNameForLog(name)};
                 for (const std::string& seen : seenNames) {
-                    if (seen != name && topicNamesFoldEqual(seen, name))
-                        return {{}, "RUNE_TOPICS topic names '" + escapeNameForLog(seen) + "' and '" + escapeNameForLog(name) +
+                    if (seen != name && rune::catalog::topicNamesFoldEqual(seen, name))
+                        return {{}, "RUNE_TOPICS topic names '" + rune::catalog::escapeNameForLog(seen) + "' and '" + rune::catalog::escapeNameForLog(name) +
                                     "' differ only by letter case (they would share one data "
-                                    "directory) in entry: " + escapeNameForLog(entry)};
+                                    "directory) in entry: " + rune::catalog::escapeNameForLog(entry)};
                 }
 
                 int32_t partCount{};
                 if (!parseInt32(countPart, partCount) || partCount < 1)
-                    return {{}, std::string("RUNE_TOPICS partition count must be >= 1, got: ") + escapeNameForLog(countPart) + " in entry: " + escapeNameForLog(entry)};
+                    return {{}, std::string("RUNE_TOPICS partition count must be >= 1, got: ") + rune::catalog::escapeNameForLog(countPart) + " in entry: " + rune::catalog::escapeNameForLog(entry)};
 
                 TopicSpec ts;
                 ts.name           = std::move(name);
@@ -886,26 +886,26 @@ ConfigResult parseNodeConfig(
                     for (auto& ch : klower) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
 
                     if (klower == "group") {
-                        ts.coPartitionGroup = escapeNameForLog(kval);
+                        ts.coPartitionGroup = rune::catalog::escapeNameForLog(kval);
                     } else if (klower == "key") {
-                        ts.partitionKey = escapeNameForLog(kval);
+                        ts.partitionKey = rune::catalog::escapeNameForLog(kval);
                     } else if (klower == "rf") {
                         const std::string kv(kval);
                         char* endp = nullptr;
                         const long v = std::strtol(kv.c_str(), &endp, 10);
                         if (endp == kv.c_str() || *endp != '\0' || v < 1 || v > 255)
-                            return {{}, std::string("RUNE_TOPICS rf must be an integer 1..255, got: ") + escapeNameForLog(kval) + " in entry: " + escapeNameForLog(entry)};
+                            return {{}, std::string("RUNE_TOPICS rf must be an integer 1..255, got: ") + rune::catalog::escapeNameForLog(kval) + " in entry: " + rune::catalog::escapeNameForLog(entry)};
                         // E2 residual round 6 (F2): fail fast, naming the constraint —
                         // never silently clamp (Kafka INVALID_REPLICATION_FACTOR) or
                         // accept a factor no acks=All produce / offset commit can meet.
                         const long nodes = static_cast<long>(std::max<std::size_t>(1, cfg.peers.size()));
                         if (v > nodes)
                             return {{}, "RUNE_TOPICS rf (" + std::to_string(v) + ") must be <= the node count (" +
-                                            std::to_string(nodes) + ") in entry: " + escapeNameForLog(entry)};
+                                            std::to_string(nodes) + ") in entry: " + rune::catalog::escapeNameForLog(entry)};
                         if (v < cfg.gatewayMinIsr)
                             return {{}, "RUNE_TOPICS rf (" + std::to_string(v) + ") must be >= RUNE_MIN_ISR (" +
                                             std::to_string(cfg.gatewayMinIsr) + ") in entry: " +
-                                            escapeNameForLog(entry) + " — a smaller factor can never satisfy acks=all"};
+                                            rune::catalog::escapeNameForLog(entry) + " — a smaller factor can never satisfy acks=all"};
                         ts.replicationFactor = static_cast<int16_t>(v);
                     } else if (klower == "persistence") {
                         std::string vlow(kval);
@@ -921,7 +921,7 @@ ConfigResult parseNodeConfig(
                         } else if (vlow == "disk") {
                             ts.persistence = PersistenceMode::Disk;
                         } else {
-                            return {{}, std::string("RUNE_TOPICS persistence must be 'disk' or 'transient', got: ") + escapeNameForLog(kval) + " in entry: " + escapeNameForLog(entry)};
+                            return {{}, std::string("RUNE_TOPICS persistence must be 'disk' or 'transient', got: ") + rune::catalog::escapeNameForLog(kval) + " in entry: " + rune::catalog::escapeNameForLog(entry)};
                         }
                     } else if (klower == "durability") {
                         std::string vlow(kval);
@@ -931,7 +931,7 @@ ConfigResult parseNodeConfig(
                         } else if (vlow == "all-in-sync") {
                             ts.durability = 1;
                         } else {
-                            return {{}, std::string("RUNE_TOPICS durability must be 'majority' or 'all-in-sync', got: ") + escapeNameForLog(kval) + " in entry: " + escapeNameForLog(entry)};
+                            return {{}, std::string("RUNE_TOPICS durability must be 'majority' or 'all-in-sync', got: ") + rune::catalog::escapeNameForLog(kval) + " in entry: " + rune::catalog::escapeNameForLog(entry)};
                         }
                     } else if (klower == "tier") {
                         // Async-durability tier (see NodeConfig.h): controls WHEN the
@@ -946,10 +946,10 @@ ConfigResult parseNodeConfig(
                         } else if (vlow == "strict") {
                             ts.durabilityTier = 2;
                         } else {
-                            return {{}, std::string("RUNE_TOPICS tier must be 'leader', 'majority' or 'strict', got: ") + escapeNameForLog(kval) + " in entry: " + escapeNameForLog(entry)};
+                            return {{}, std::string("RUNE_TOPICS tier must be 'leader', 'majority' or 'strict', got: ") + rune::catalog::escapeNameForLog(kval) + " in entry: " + rune::catalog::escapeNameForLog(entry)};
                         }
                     } else {
-                        return {{}, std::string("RUNE_TOPICS unknown option '") + escapeNameForLog(kname) + "' in entry: " + escapeNameForLog(entry)};
+                        return {{}, std::string("RUNE_TOPICS unknown option '") + rune::catalog::escapeNameForLog(kname) + "' in entry: " + rune::catalog::escapeNameForLog(entry)};
                     }
                 }
 
@@ -972,7 +972,7 @@ ConfigResult parseNodeConfig(
                     } else if (pol == "compact_delete" || pol == "compactdelete") {
                         ts.cleanupPolicy = TopicSpec::CleanupPolicy::CompactDelete;
                     } else {
-                        return {{}, std::string("RUNE_TOPICS policy must be 'delete', 'compact', or 'compact_delete', got: ") + escapeNameForLog(pol) + " in entry: " + escapeNameForLog(entry)};
+                        return {{}, std::string("RUNE_TOPICS policy must be 'delete', 'compact', or 'compact_delete', got: ") + rune::catalog::escapeNameForLog(pol) + " in entry: " + rune::catalog::escapeNameForLog(entry)};
                     }
                 }
 
@@ -983,11 +983,11 @@ ConfigResult parseNodeConfig(
                     int64_t v{};
                     auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), v);
                     if (ec != std::errc{} || ptr != sv.data() + sv.size())
-                        return std::string("RUNE_TOPICS ") + fieldName + " must be an integer in: " + escapeNameForLog(entry);
+                        return std::string("RUNE_TOPICS ") + fieldName + " must be an integer in: " + rune::catalog::escapeNameForLog(entry);
                     if (!allowNeg1 && v < 1)
-                        return std::string("RUNE_TOPICS ") + fieldName + " must be a positive integer in: " + escapeNameForLog(entry);
+                        return std::string("RUNE_TOPICS ") + fieldName + " must be a positive integer in: " + rune::catalog::escapeNameForLog(entry);
                     if (allowNeg1 && v < -1)
-                        return std::string("RUNE_TOPICS ") + fieldName + " must be >= -1 in: " + escapeNameForLog(entry);
+                        return std::string("RUNE_TOPICS ") + fieldName + " must be >= -1 in: " + rune::catalog::escapeNameForLog(entry);
                     out = v;
                     return {};
                 };
@@ -999,7 +999,7 @@ ConfigResult parseNodeConfig(
                     // D19 L1: segment positions are 32-bit (Log::kMaxRollBytes).
                     if (ts.segmentRollBytes > rune::storage::Log::kMaxRollBytes)
                         return {{}, std::string("RUNE_TOPICS segmentRollBytes must be <= ") +
-                                        std::to_string(rune::storage::Log::kMaxRollBytes) + " in: " + escapeNameForLog(entry)};
+                                        std::to_string(rune::storage::Log::kMaxRollBytes) + " in: " + rune::catalog::escapeNameForLog(entry)};
                 }
 
                 // Positional[2] (optional): deleteRetentionMs (non-negative int64)
@@ -1042,9 +1042,9 @@ ConfigResult parseNodeConfig(
                     errno = 0;
                     double v = std::strtod(s.c_str(), &endp);
                     if (endp != s.c_str() + s.size() || errno != 0)
-                        return {{}, std::string("RUNE_TOPICS minCleanableDirtyRatio must be a number in: ") + escapeNameForLog(entry)};
+                        return {{}, std::string("RUNE_TOPICS minCleanableDirtyRatio must be a number in: ") + rune::catalog::escapeNameForLog(entry)};
                     if (v < 0.0 || v > 1.0)
-                        return {{}, std::string("RUNE_TOPICS minCleanableDirtyRatio must be in [0.0, 1.0] in: ") + escapeNameForLog(entry)};
+                        return {{}, std::string("RUNE_TOPICS minCleanableDirtyRatio must be in [0.0, 1.0] in: ") + rune::catalog::escapeNameForLog(entry)};
                     ts.minCleanableDirtyRatio = v;
                 }
 

@@ -2,64 +2,64 @@
 // name (TopicName.h).  A name becomes the directory dataDir/topics/<name>/, so it
 // must be ONE safe path segment; "__" names are internal.
 #include <gtest/gtest.h>
-#include <rune/node/TopicName.h>
+#include <rune/catalog/TopicName.h>
 
 #include <cctype>
 #include <string>
 #include <vector>
 
-using rune::node::checkTopicName;
-using rune::node::isValidTopicName;
-using rune::node::topicNamesFoldEqual;
-using rune::node::TopicNameError;
+using rune::catalog::checkTopicName;
+using rune::catalog::isValidTopicName;
+using rune::catalog::topicNamesFoldEqual;
+using rune::catalog::TopicNameError;
 
-static_assert(isValidTopicName("orders"));
-static_assert(!isValidTopicName(""));
-static_assert(!isValidTopicName("__views"));
-static_assert(topicNamesFoldEqual("Orders", "oRDERS"));
+static_assert(rune::catalog::isValidTopicName("orders"));
+static_assert(!rune::catalog::isValidTopicName(""));
+static_assert(!rune::catalog::isValidTopicName("__views"));
+static_assert(rune::catalog::topicNamesFoldEqual("Orders", "oRDERS"));
 
 TEST(TopicNameRegression, AcceptsSafeSegments) {
     for (const char* n : {"orders", "Orders.v2", "a", "_x", "-", ".hidden", "a-b_c.D9"})
-        EXPECT_EQ(checkTopicName(n), TopicNameError::None) << n;
-    EXPECT_EQ(checkTopicName(std::string(249, 'x')), TopicNameError::None) << "249 bytes is the max";
+        EXPECT_EQ(rune::catalog::checkTopicName(n), rune::catalog::TopicNameError::None) << n;
+    EXPECT_EQ(rune::catalog::checkTopicName(std::string(249, 'x')), rune::catalog::TopicNameError::None) << "249 bytes is the max";
 }
 
 TEST(TopicNameRegression, RejectsEmptyTooLongAndDotSegments) {
-    EXPECT_EQ(checkTopicName(""), TopicNameError::Empty);
-    EXPECT_EQ(checkTopicName(std::string(250, 'x')), TopicNameError::TooLong);
-    EXPECT_EQ(checkTopicName("."), TopicNameError::DotSegment);
-    EXPECT_EQ(checkTopicName(".."), TopicNameError::DotSegment);
+    EXPECT_EQ(rune::catalog::checkTopicName(""), rune::catalog::TopicNameError::Empty);
+    EXPECT_EQ(rune::catalog::checkTopicName(std::string(250, 'x')), rune::catalog::TopicNameError::TooLong);
+    EXPECT_EQ(rune::catalog::checkTopicName("."), rune::catalog::TopicNameError::DotSegment);
+    EXPECT_EQ(rune::catalog::checkTopicName(".."), rune::catalog::TopicNameError::DotSegment);
 }
 
 TEST(TopicNameRegression, RejectsPathControlAndNonAsciiBytes) {
     for (const std::string n : {std::string("a/b"), std::string("../x"), std::string("/abs"),
                                 std::string("a\\b"), std::string("has space"), std::string("tab\tx"),
                                 std::string("caf\xC3\xA9"), std::string("nul\0b", 5), std::string("colon:x")})
-        EXPECT_EQ(checkTopicName(n), TopicNameError::BadChar) << n;
+        EXPECT_EQ(rune::catalog::checkTopicName(n), rune::catalog::TopicNameError::BadChar) << n;
 }
 
 TEST(TopicNameRegression, ReservesTheDoubleUnderscorePrefix) {
     for (const char* n : {"__topic_schemas", "__views", "__consumer_offsets", "__transaction_state",
                           "__cluster_metadata", "__view_snapshots", "__orphan.3", "__"})
-        EXPECT_EQ(checkTopicName(n), TopicNameError::Reserved) << n;
-    EXPECT_EQ(checkTopicName("_single"), TopicNameError::None);
+        EXPECT_EQ(rune::catalog::checkTopicName(n), rune::catalog::TopicNameError::Reserved) << n;
+    EXPECT_EQ(rune::catalog::checkTopicName("_single"), rune::catalog::TopicNameError::None);
 }
 
 TEST(TopicNameRegression, FoldEqualityIsAsciiCaseOnly) {
-    EXPECT_TRUE(topicNamesFoldEqual("Orders", "orders"));
-    EXPECT_FALSE(topicNamesFoldEqual("orders", "orders "));
-    EXPECT_FALSE(topicNamesFoldEqual("orders", "order"));
-    EXPECT_FALSE(topicNamesFoldEqual("caf\xC3\xA9", "CAF\xC3\x89")) << "non-ASCII bytes are never folded";
+    EXPECT_TRUE(rune::catalog::topicNamesFoldEqual("Orders", "orders"));
+    EXPECT_FALSE(rune::catalog::topicNamesFoldEqual("orders", "orders "));
+    EXPECT_FALSE(rune::catalog::topicNamesFoldEqual("orders", "order"));
+    EXPECT_FALSE(rune::catalog::topicNamesFoldEqual("caf\xC3\xA9", "CAF\xC3\x89")) << "non-ASCII bytes are never folded";
 }
 
 TEST(TopicNameRegression, EveryErrorHasAHumanReadableText) {
-    using rune::node::topicNameErrorText;
-    EXPECT_EQ(topicNameErrorText(TopicNameError::Empty), "empty");
-    EXPECT_EQ(topicNameErrorText(TopicNameError::TooLong), "longer than 249 bytes");
-    EXPECT_EQ(topicNameErrorText(TopicNameError::DotSegment), "'.' or '..'");
-    EXPECT_EQ(topicNameErrorText(TopicNameError::BadChar), "a byte outside [A-Za-z0-9._-]");
-    EXPECT_EQ(topicNameErrorText(TopicNameError::Reserved), "the '__' prefix is reserved for internal topics");
-    EXPECT_EQ(topicNameErrorText(TopicNameError::None), "ok");
+    using rune::catalog::topicNameErrorText;
+    EXPECT_EQ(rune::catalog::topicNameErrorText(rune::catalog::TopicNameError::Empty), "empty");
+    EXPECT_EQ(rune::catalog::topicNameErrorText(rune::catalog::TopicNameError::TooLong), "longer than 249 bytes");
+    EXPECT_EQ(rune::catalog::topicNameErrorText(rune::catalog::TopicNameError::DotSegment), "'.' or '..'");
+    EXPECT_EQ(rune::catalog::topicNameErrorText(rune::catalog::TopicNameError::BadChar), "a byte outside [A-Za-z0-9._-]");
+    EXPECT_EQ(rune::catalog::topicNameErrorText(rune::catalog::TopicNameError::Reserved), "the '__' prefix is reserved for internal topics");
+    EXPECT_EQ(rune::catalog::topicNameErrorText(rune::catalog::TopicNameError::None), "ok");
 }
 
 // ---- Fix round 1: every byte value, in every position -----------------------
@@ -97,13 +97,13 @@ class TopicNameByteRegression : public ::testing::TestWithParam<ByteCase> {};
 TEST_P(TopicNameByteRegression, ByteIsAcceptedExactlyWhenInTheAllowedSet) {
     const auto [b, pos] = GetParam();
     const std::string n = nameWithByte(b, pos);
-    const auto got = checkTopicName(n);
+    const auto got = rune::catalog::checkTopicName(n);
     if (!byteIsAllowed(b)) {
-        EXPECT_EQ(got, TopicNameError::BadChar) << "byte " << b;
+        EXPECT_EQ(got, rune::catalog::TopicNameError::BadChar) << "byte " << b;
     } else if (pos == Pos::Alone && b == '.') {
-        EXPECT_EQ(got, TopicNameError::DotSegment) << "a lone '.' is a dot segment";
+        EXPECT_EQ(got, rune::catalog::TopicNameError::DotSegment) << "a lone '.' is a dot segment";
     } else {
-        EXPECT_EQ(got, TopicNameError::None) << "byte " << b;
+        EXPECT_EQ(got, rune::catalog::TopicNameError::None) << "byte " << b;
     }
 }
 
@@ -115,38 +115,38 @@ std::string byteCaseName(const ::testing::TestParamInfo<ByteCase>& i) {
 INSTANTIATE_TEST_SUITE_P(AllBytes, TopicNameByteRegression, ::testing::ValuesIn(allByteCases()), byteCaseName);
 
 TEST(TopicNameRegression, RuleExceptionsStillApplyToAllowedBytes) {
-    EXPECT_EQ(checkTopicName("."), TopicNameError::DotSegment);
-    EXPECT_EQ(checkTopicName(".."), TopicNameError::DotSegment);
-    EXPECT_EQ(checkTopicName("..."), TopicNameError::None);
-    EXPECT_EQ(checkTopicName("__"), TopicNameError::Reserved);
-    EXPECT_EQ(checkTopicName("__x"), TopicNameError::Reserved);
-    EXPECT_EQ(checkTopicName("_"), TopicNameError::None);
-    EXPECT_EQ(checkTopicName("a__"), TopicNameError::None);
+    EXPECT_EQ(rune::catalog::checkTopicName("."), rune::catalog::TopicNameError::DotSegment);
+    EXPECT_EQ(rune::catalog::checkTopicName(".."), rune::catalog::TopicNameError::DotSegment);
+    EXPECT_EQ(rune::catalog::checkTopicName("..."), rune::catalog::TopicNameError::None);
+    EXPECT_EQ(rune::catalog::checkTopicName("__"), rune::catalog::TopicNameError::Reserved);
+    EXPECT_EQ(rune::catalog::checkTopicName("__x"), rune::catalog::TopicNameError::Reserved);
+    EXPECT_EQ(rune::catalog::checkTopicName("_"), rune::catalog::TopicNameError::None);
+    EXPECT_EQ(rune::catalog::checkTopicName("a__"), rune::catalog::TopicNameError::None);
 }
 
 TEST(TopicNameRegression, FoldDoesNotCrossTheAsciiLetterBoundaries) {
-    EXPECT_FALSE(topicNamesFoldEqual("@", "`"));   // '@' 0x40 is just below 'A', '`' 0x60 just below 'a'
-    EXPECT_FALSE(topicNamesFoldEqual("[", "{"));   // '[' 0x5B just above 'Z', '{' 0x7B just above 'z'
-    EXPECT_FALSE(topicNamesFoldEqual("@", "a"));
-    EXPECT_FALSE(topicNamesFoldEqual("[", "z"));
-    EXPECT_FALSE(topicNamesFoldEqual("`", "A"));
-    EXPECT_FALSE(topicNamesFoldEqual("{", "Z"));
+    EXPECT_FALSE(rune::catalog::topicNamesFoldEqual("@", "`"));   // '@' 0x40 is just below 'A', '`' 0x60 just below 'a'
+    EXPECT_FALSE(rune::catalog::topicNamesFoldEqual("[", "{"));   // '[' 0x5B just above 'Z', '{' 0x7B just above 'z'
+    EXPECT_FALSE(rune::catalog::topicNamesFoldEqual("@", "a"));
+    EXPECT_FALSE(rune::catalog::topicNamesFoldEqual("[", "z"));
+    EXPECT_FALSE(rune::catalog::topicNamesFoldEqual("`", "A"));
+    EXPECT_FALSE(rune::catalog::topicNamesFoldEqual("{", "Z"));
 }
 
 TEST(TopicNameRegression, FoldSweepsAllLettersPairwiseAndNothingElse) {
     for (int i = 0; i < 26; ++i) {
         const std::string up(1, static_cast<char>('A' + i)), lo(1, static_cast<char>('a' + i));
-        EXPECT_TRUE(topicNamesFoldEqual(up, lo)) << up;
-        EXPECT_TRUE(topicNamesFoldEqual(lo, up)) << up;
-        EXPECT_TRUE(topicNamesFoldEqual(up, up));
+        EXPECT_TRUE(rune::catalog::topicNamesFoldEqual(up, lo)) << up;
+        EXPECT_TRUE(rune::catalog::topicNamesFoldEqual(lo, up)) << up;
+        EXPECT_TRUE(rune::catalog::topicNamesFoldEqual(up, up));
         for (int j = 0; j < 26; ++j) {
             if (j == i) continue;
-            EXPECT_FALSE(topicNamesFoldEqual(up, std::string(1, static_cast<char>('a' + j))));
+            EXPECT_FALSE(rune::catalog::topicNamesFoldEqual(up, std::string(1, static_cast<char>('a' + j))));
         }
     }
     for (int a = 0; a < 256; ++a) {          // every non-letter byte folds only with itself
         if (std::isalpha(a) && a < 128) continue;
         for (int b = 0; b < 256; ++b)
-            EXPECT_EQ(topicNamesFoldEqual(std::string(1, static_cast<char>(a)), std::string(1, static_cast<char>(b))), a == b);
+            EXPECT_EQ(rune::catalog::topicNamesFoldEqual(std::string(1, static_cast<char>(a)), std::string(1, static_cast<char>(b))), a == b);
     }
 }

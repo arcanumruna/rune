@@ -33,7 +33,7 @@
 // minimal slice (the events on the failing name + leadership flaps + restarts).
 #include <gtest/gtest.h>
 #include "support/DdlHarness.h"
-#include <rune/node/TopicName.h>
+#include <rune/catalog/TopicName.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -139,10 +139,10 @@ struct Model {
     std::map<std::string, std::vector<InDoubt>> inDoubt;
 
     Occupant at(const std::string& n) const {
-        if (!isValidTopicName(n)) return Occupant::BadName;
+        if (!rune::catalog::isValidTopicName(n)) return Occupant::BadName;
         if (const auto it = occ.find(n); it != occ.end() && it->second != Occupant::Free) return it->second;
         for (const auto& [m, o] : occ)
-            if (m != n && o != Occupant::Free && topicNamesFoldEqual(m, n)) return Occupant::CaseVariant;
+            if (m != n && o != Occupant::Free && rune::catalog::topicNamesFoldEqual(m, n)) return Occupant::CaseVariant;
         return Occupant::Free;
     }
     Occupant exact(const std::string& n) const {
@@ -273,7 +273,7 @@ void expectCatalogMatchesModel(DdlHarness& h, const Model& m, const char* when) 
         SCOPED_TRACE(std::string(when) + " name='" + n + "'");
         const CatalogEntry* e = findEntry(cat, n);
         const auto it = m.occ.find(n);
-        const Occupant o = (it == m.occ.end() || !isValidTopicName(n)) ? Occupant::Free : it->second;
+        const Occupant o = (it == m.occ.end() || !rune::catalog::isValidTopicName(n)) ? Occupant::Free : it->second;
         switch (o) {
             case Occupant::Free:
                 EXPECT_EQ(e, nullptr);
@@ -388,7 +388,7 @@ void runSeed(uint64_t seed) {
         if (failed) {
             t += "minimal trace (events on '" + failName + "' + flaps/restarts):\n";
             for (std::size_t i = 0; i < trace.size(); ++i)
-                if (trace[i].global || (!trace[i].ticks && topicNamesFoldEqual(trace[i].name, failName)))
+                if (trace[i].global || (!trace[i].ticks && rune::catalog::topicNamesFoldEqual(trace[i].name, failName)))
                     t += "  " + std::to_string(i) + ": " + render(trace[i]) + "\n";
         }
         return t;

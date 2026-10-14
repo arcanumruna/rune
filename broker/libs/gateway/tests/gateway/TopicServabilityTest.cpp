@@ -1,10 +1,13 @@
-// TopicServabilityTest.cpp — DDL conformance final review C1 at the gateway.
+// TopicServabilityTest.cpp — DDL conformance final review C1 at the gateway,
+// catalog form (catalog history Task 9 port: the old runtime path's "uncommitted"
+// precondition is now "applied but not placed").
 //
-// A runtime topic whose catalog record has not committed (TopicRegistry::
-// awaitingCommit) is neither writable nor readable: Produce is answered NotLeader
-// (retriable; nothing appended), Subscribe is answered NotLeader (nothing
-// registered), Metadata does not list it.  Once committed (commitTopic) it serves
-// like any boot topic.  An unknown topic stays UnknownTopic.
+// A catalog topic applied here (TopicRegistry::createTopicAt) whose placement is
+// not committed yet is neither writable nor readable: Produce is answered
+// NotLeader (retriable; nothing appended), Subscribe is answered NotLeader
+// (nothing registered), Metadata does not list it.  Once placed (the committed
+// routing image names it) it serves like any boot topic.  An unknown topic stays
+// UnknownTopic.
 //
 // Deterministic: no Aeron, no sleeps — makeForTest + the apply*ForTest seams.
 #include <rune/gateway/ClientGateway.h>
@@ -64,16 +67,24 @@ struct Rig {
         boot.name = "events"; boot.partitionCount = 1; boot.topicId = 0;
         registry = std::make_unique<TopicRegistry>(std::vector<rune::node::TopicSpec>{boot}, dir.path.string());
         rune::node::TopicSpec rt;
-        rt.name = "runtime"; rt.partitionCount = 1; rt.topicId = -1;
-        runtimeId = registry->createTopic(rt);   // a runtime create: awaiting its record
+        rt.name = "runtime"; rt.partitionCount = 1; rt.topicId = 1;
+        runtimeId = registry->createTopicAt(1, rt);   // applied at its catalog id, not placed yet
         gw.setTopicRegistry(registry.get());
         gw.setCommittedMetadataReady(true);
-        std::vector<rune::metadata::RoutingImage::BuildEntry> img = {
-            {rune::metadata::gpidOf(0, 0), 1, 1}, {rune::metadata::gpidOf(runtimeId, 0), 1, 1}};
-        gw.setRoutingImageSnapshot(rune::metadata::RoutingImage::build(img));
+        std::vector<rune::metadata::RoutingImage::BuildEntry> img = {{rune::metadata::gpidOf(0, 0), 1, 1}};
+        gw.setRoutingImageSnapshot(
+            rune::metadata::RoutingImage::build(img, rune::metadata::RoutingImage::Source::Committed));
         gw.setNodeIdForTest(1);
         gw.setOnEgressFrame([this](int64_t, const uint8_t* b, std::size_t n) { onFrame(b, n); });
         sid = gw.injectTestSession();
+    }
+
+    /// The placement commits: the committed routing image names the topic's leader.
+    void place() {
+        std::vector<rune::metadata::RoutingImage::BuildEntry> img = {
+            {rune::metadata::gpidOf(0, 0), 1, 1}, {rune::metadata::gpidOf(runtimeId, 0), 1, 1}};
+        gw.setRoutingImageSnapshot(
+            rune::metadata::RoutingImage::build(img, rune::metadata::RoutingImage::Source::Committed));
     }
 
     void onFrame(const uint8_t* b, std::size_t n) {
@@ -144,17 +155,16 @@ constexpr int16_t kUnknownTopic = static_cast<int16_t>(pc::ErrorCode::UnknownTop
 
 } // namespace
 
-TEST(TopicServabilityRegression, UncommittedRuntimeTopicRefusesProduceRetriablyRegression) {
+TEST(TopicServabilityRegression, AppliedButNotPlacedTopicRefusesProduceRetriablyRegression) {
     Rig r;
-    ASSERT_TRUE(r.registry->awaitingCommit(r.runtimeId));
+    ASSERT_TRUE(r.registry->placementGated(r.runtimeId));
     const int64_t c = r.produce(r.runtimeId);
     ASSERT_TRUE(r.codeOf(c).has_value()) << "answered, never silent";
     EXPECT_EQ(*r.codeOf(c), kNotLeader) << "retriable";
     EXPECT_EQ(r.registry->log(r.runtimeId, 0)->logEndOffset(), 0) << "nothing appended";
-    EXPECT_EQ(r.registry->servableLog(r.runtimeId, 0), nullptr);
 }
 
-TEST(TopicServabilityRegression, UncommittedRuntimeTopicRefusesSubscribeRetriablyRegression) {
+TEST(TopicServabilityRegression, AppliedButNotPlacedTopicRefusesSubscribeRetriablyRegression) {
     Rig r;
     const int64_t c = r.subscribe(r.runtimeId);
     ASSERT_TRUE(r.codeOf(c).has_value()) << "answered, never silent";
@@ -162,17 +172,16 @@ TEST(TopicServabilityRegression, UncommittedRuntimeTopicRefusesSubscribeRetriabl
     EXPECT_TRUE(r.subscribeAnswers.empty()) << "no subscription was registered";
 }
 
-TEST(TopicServabilityRegression, UncommittedRuntimeTopicIsHiddenFromMetadataRegression) {
+TEST(TopicServabilityRegression, AppliedButNotPlacedTopicIsHiddenFromMetadataRegression) {
     Rig r;
     EXPECT_TRUE(r.listed(0)) << "a boot topic is listed";
-    EXPECT_FALSE(r.listed(r.runtimeId)) << "an uncommitted topic is not";
+    EXPECT_FALSE(r.listed(r.runtimeId)) << "a topic whose placement is not committed is not";
 }
 
-TEST(TopicServabilityRegression, CommittedRuntimeTopicServesLikeABootTopicRegression) {
+TEST(TopicServabilityRegression, PlacedCatalogTopicServesLikeABootTopicRegression) {
     Rig r;
-    ASSERT_TRUE(r.registry->commitTopic(r.runtimeId)) << "awaiting -> servable";
-    EXPECT_FALSE(r.registry->commitTopic(r.runtimeId)) << "idempotent";
-    EXPECT_FALSE(r.registry->awaitingCommit(r.runtimeId));
+    r.place();
+    EXPECT_EQ(r.registry->createTopicAt(r.runtimeId, *r.registry->topic(r.runtimeId)), r.runtimeId) << "idempotent";
     EXPECT_TRUE(r.listed(r.runtimeId));
     const int64_t p = r.produce(r.runtimeId);
     ASSERT_TRUE(r.codeOf(p).has_value());
@@ -183,11 +192,10 @@ TEST(TopicServabilityRegression, CommittedRuntimeTopicServesLikeABootTopicRegres
     EXPECT_EQ(*r.codeOf(s), 0);
 }
 
-TEST(TopicServabilityRegression, BootTopicsAreCommittedAndUnknownTopicsStayUnknownRegression) {
+TEST(TopicServabilityRegression, BootTopicsServeAndUnknownTopicsStayUnknownRegression) {
     Rig r;
-    EXPECT_FALSE(r.registry->awaitingCommit(0)) << "static / recovered topics serve from boot";
-    EXPECT_FALSE(r.registry->awaitingCommit(99)) << "unknown is not awaiting";
-    EXPECT_EQ(r.registry->commitTopic(0), false);
+    EXPECT_FALSE(r.registry->placementGated(0)) << "static topics serve from boot";
+    EXPECT_EQ(r.registry->state(99), TopicRegistry::TopicState::Unknown);
     const int64_t c = r.produce(99);
     ASSERT_TRUE(r.codeOf(c).has_value());
     EXPECT_EQ(*r.codeOf(c), kUnknownTopic) << "an unknown topic is not retriable";

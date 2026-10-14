@@ -1,40 +1,241 @@
+// AdminWorker.cpp — the catalog write path (catalog history spec §5.1, Task 9).
+// See AdminWorker.h.
 #include "rune/node/AdminWorker.h"
-#include <rune/node/TopicName.h>
-#include <rune/codec/Serialize.h>  // rune::codec::deserialize/serialize (throws on bad input)
-#include <rune/codec/Evolve.h>     // checkCompatibility / applyOps (Task 11)
-#include <rune/codec/AlterOps.h>   // decodeAlterOps
-#include <rune/view/AggState.h>     // rune::view::isAggregateView (Phase 2a)
-#include <rune/view/PlanCompiler.h> // rune::view::compileView (Task 19)
+
+#include <rune/node/CatalogEffectFrames.h>
+#include <rune/node/PersistenceMode.h>
+
+#include <rune/catalog/CatalogFingerprint.h>
+#include <rune/catalog/TopicName.h>
+#include <rune/codec/AlterOps.h>
+#include <rune/codec/Evolve.h>
+#include <rune/codec/Fingerprint.h>
+#include <rune/codec/Serialize.h>
+#include <rune/protocol/RecordBatch.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/replication/WorkerReplicationTransport.h>   // the __catalog plane (Task 6)
-#include <rune/protocol/RecordBatch.h>
+#include <rune/view/AggState.h>      // rune::view::isAggregateView (Phase 2a)
+#include <rune/view/PlanCompiler.h>  // rune::view::compileView
+#include <rune/view/ViewPlan.h>
+
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <exception>
+#include <stdexcept>
 #include <type_traits>
-#include <variant>
 
 namespace rune::node {
 
-// Error code constants (protocol-agnostic integers fixed by Task 1 ErrorCode enum):
-static constexpr uint16_t kOK             =  0;
-static constexpr uint16_t kInternal       =  6;
-static constexpr uint16_t kUnknownTopic   =  7;
-static constexpr uint16_t kInvalidSchema  = 23;
-static constexpr uint16_t kTopicExists    = 25;
-static constexpr uint16_t kSchemaIncompatible = 30;  // ALTER compat gate reject
-static constexpr uint16_t kSchemaConflict     = 31;  // ALTER stale expectedVersion (CAS)
-// Task 19 view-engine error codes (rune::protocol::client::ErrorCode).
-static constexpr uint16_t kViewExists         = 32;  // CreateView on an existing name
-static constexpr uint16_t kViewSourceNotFound = 33;  // plan references a missing source topic
-static constexpr uint16_t kViewFieldUnresolved= 34;  // plan references an unresolved field
-static constexpr uint16_t kViewKeyInvalid     = 35;  // key field invalid under the source schema
-static constexpr uint16_t kViewNotCoPartitioned = 36;  // aggregate group-by not co-partitioned
-static constexpr uint16_t kViewNotAlterable     = 38;  // AlterTopic on a view's output topic
-static constexpr uint16_t kInvalidTopicName     = 40;  // DefineTopic/CreateView: name fails TopicName.h (B1/B2)
-static constexpr uint16_t kViewSourceIsView     = 41;  // CreateView: a source is another view's output (B9)
-static constexpr uint16_t kViewSourceTransient  = 37;  // persisted view over a transient source (Phase 2b E)
+namespace cat = rune::catalog;
+
+namespace {
+
+// Error codes (rune::protocol::client::ErrorCode values).
+constexpr uint16_t kOK                   =  0;
+constexpr uint16_t kNotLeader            =  2;
+constexpr uint16_t kInternal             =  6;
+constexpr uint16_t kUnknownTopic         =  7;
+constexpr uint16_t kInvalidSchema        = 23;
+constexpr uint16_t kTopicExists          = 25;
+constexpr uint16_t kSchemaIncompatible   = 30;
+constexpr uint16_t kSchemaConflict       = 31;
+constexpr uint16_t kViewExists           = 32;
+constexpr uint16_t kViewSourceNotFound   = 33;
+constexpr uint16_t kViewFieldUnresolved  = 34;
+constexpr uint16_t kViewKeyInvalid       = 35;
+constexpr uint16_t kViewNotCoPartitioned = 36;
+constexpr uint16_t kViewSourceTransient  = 37;
+constexpr uint16_t kViewNotAlterable     = 38;
+constexpr uint16_t kInvalidRequest       = 39;
+constexpr uint16_t kInvalidTopicName     = 40;
+constexpr uint16_t kViewSourceIsView     = 41;
+
+// Client-protocol template ids (rune::protocol::client::TemplateId) — the
+// request kind a fingerprint covers.
+constexpr uint16_t kTidDefineTopic      = 64;
+constexpr uint16_t kTidAlterTopic       = 68;
+constexpr uint16_t kTidCreateView       = 70;
+constexpr uint16_t kTidDropTopic        = 74;
+constexpr uint16_t kTidAlterTopicConfig = 75;
+constexpr uint16_t kTidDropView         = 76;
+constexpr uint16_t kTidAlterView        = 77;
+
+/// The largest encoded event the leader writes.  A catalog record must reach
+/// every follower in one fetch (kDefaultMaxFetchBytes) and the applier's first
+/// read; half of it leaves the batch framing ample room.  Every request the admin
+/// ring can carry (<= 128 KiB) yields far less, so this is a backstop.
+constexpr std::size_t kMaxCatalogEventBytes = static_cast<std::size_t>(rune::replication::kDefaultMaxFetchBytes) / 2;
+
+std::string quotedName(std::string_view s) { return "'" + cat::escapeNameForLog(s) + "'"; }
+
+DdlRejection reject(uint16_t code, std::string detail = {}, int32_t topicId = -1, uint16_t version = 0) {
+    return DdlRejection{code, std::move(detail), topicId, version};
+}
+
+/// The wire limits of the frozen v1 layout (kMaxStr16Bytes / kMaxStr32Bytes /
+/// kMaxListCount): an over-long client field is refused, naming it, BEFORE the
+/// event is encoded (binding 4).  nullopt = within every limit.
+std::optional<std::string> wireLimitError(const cat::CatalogEvent& e) {
+    auto s16 = [](std::string_view what, std::size_t n) -> std::optional<std::string> {
+        if (n <= cat::kMaxStr16Bytes) return std::nullopt;
+        return std::string{what} + " is " + std::to_string(n) + " bytes, longer than the " +
+               std::to_string(cat::kMaxStr16Bytes) + "-byte catalog limit";
+    };
+    auto s32 = [](std::string_view what, std::size_t n) -> std::optional<std::string> {
+        if (n <= cat::kMaxStr32Bytes) return std::nullopt;
+        return std::string{what} + " is " + std::to_string(n) + " bytes, longer than the catalog limit";
+    };
+    auto list = [](std::string_view what, std::size_t n) -> std::optional<std::string> {
+        if (n <= cat::kMaxListCount) return std::nullopt;
+        return std::string{what} + " has " + std::to_string(n) + " entries, more than the " +
+               std::to_string(cat::kMaxListCount) + " a catalog event holds";
+    };
+    if (auto r = s16("the object name", e.objectName.size())) return r;
+    if (auto r = s32("the statement", e.statement.size())) return r;
+    if (auto r = s16("the client name", e.principal.clientName.size())) return r;
+    if (auto r = s16("the source address", e.principal.sourceAddress.size())) return r;
+    if (auto r = s16("the authenticated principal", e.principal.authenticated.size())) return r;
+    if (e.replayedFrom) {
+        if (auto r = s16("replayedFrom's cluster id", e.replayedFrom->clusterId.size())) return r;
+        if (auto r = s16("replayedFrom's principal", e.replayedFrom->principal.size())) return r;
+    }
+    auto config = [&](const cat::TopicConfig& c) -> std::optional<std::string> {
+        if (auto r = s16("the co-partition group", c.coPartitionGroup.size())) return r;
+        return s16("the partition key", c.partitionKey.size());
+    };
+    auto schema = [&](const cat::SchemaDef& d) -> std::optional<std::string> {
+        if (auto r = s16("the key field", d.keyField.size())) return r;
+        return s32("the descriptor", d.descriptorBlob.size());
+    };
+    auto view = [&](const cat::ViewDef& v) -> std::optional<std::string> {
+        if (auto r = s16("the view key field", v.keyField.size())) return r;
+        if (auto r = list("the view's source list", v.sourceNames.size())) return r;
+        for (const auto& n : v.sourceNames)
+            if (auto r = s16("a source name", n.size())) return r;
+        if (auto r = s32("the normalized plan", v.normalizedPlanBlob.size())) return r;
+        if (auto r = s32("the compiled plan", v.compiledPlanBlob.size())) return r;
+        return s32("the output descriptor", v.outputDescriptorBlob.size());
+    };
+    return std::visit([&](const auto& o) -> std::optional<std::string> {
+        using T = std::decay_t<decltype(o)>;
+        if constexpr (std::is_same_v<T, cat::CreateTopicOps>) {
+            if (auto r = config(o.config)) return r;
+            if (o.schema) return schema(*o.schema);
+            return std::nullopt;
+        } else if constexpr (std::is_same_v<T, cat::CreateSchemaOps>) {
+            return schema(o.schema);
+        } else if constexpr (std::is_same_v<T, cat::AlterSchemaOps>) {
+            if (auto r = list("the ALTER operation list", o.ops.size())) return r;
+            for (const auto& op : o.ops)
+                if (auto r = s16("an ALTER field name", op.name.size())) return r;
+            return std::nullopt;
+        } else if constexpr (std::is_same_v<T, cat::AlterTopicConfigOps>) {
+            return list("the config change list", o.changes.size());
+        } else if constexpr (std::is_same_v<T, cat::CreateViewOps> || std::is_same_v<T, cat::AlterViewOps>) {
+            return view(o.view);
+        } else {
+            return std::nullopt;
+        }
+    }, e.ops);
+}
+
+int64_t wallClockMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+/// The fold-equal live name `n` lands on, and its answer (TopicExists with the
+/// object's topic id).
+std::optional<DdlRejection> foldCollision(const cat::CatalogState& s, std::string_view n) {
+    const std::string* other = s.liveNameFoldingOnto(n);
+    if (other == nullptr) return std::nullopt;
+    int32_t id = -1;
+    if (const cat::TopicObject* t = s.topicByName(*other)) id = t->topicId;
+    else if (const cat::ViewObject* v = s.viewByName(*other)) id = v->def.viewTopicId;
+    return reject(kTopicExists, "name " + quotedName(n) + " differs only in letter case from " + quotedName(*other), id);
+}
+
+// FNV-1a-64 helpers for requestFingerprint (rune::catalog's building blocks).
+struct Fnv {
+    uint64_t h = 0xcbf29ce484222325ull;
+    void u(uint64_t v) noexcept { h = cat::detail::fnvU64(h, v); }
+    void s(std::string_view v) noexcept { h = cat::detail::fnvBytes(h, v.data(), v.size()); }
+    void b(const std::vector<uint8_t>& v) noexcept { h = cat::detail::fnvBytes(h, v.data(), v.size()); }
+};
+
+} // namespace
+
+// ─── requestFingerprint (F14) ───────────────────────────────────────────────
+uint16_t requestTemplateId(const DdlRequest& req) noexcept {
+    return std::visit([](const auto& m) -> uint16_t {
+        using M = std::decay_t<decltype(m)>;
+        if constexpr (std::is_same_v<M, DefineTopicMsg>)      return kTidDefineTopic;
+        else if constexpr (std::is_same_v<M, AlterTopicMsg>)  return kTidAlterTopic;
+        else if constexpr (std::is_same_v<M, CreateViewMsg>)  return kTidCreateView;
+        else if constexpr (std::is_same_v<M, DropTopicMsg>)   return kTidDropTopic;
+        else if constexpr (std::is_same_v<M, DropViewMsg>)    return kTidDropView;
+        else if constexpr (std::is_same_v<M, AlterViewMsg>)   return kTidAlterView;
+        else                                                  return kTidAlterTopicConfig;
+    }, req);
+}
+
+uint64_t requestFingerprint(const DdlRequest& req) noexcept {
+    Fnv f;
+    f.u(requestTemplateId(req));
+    std::visit([&f](const auto& m) {
+        using M = std::decay_t<decltype(m)>;
+        f.s(m.meta.statement);
+        if constexpr (std::is_same_v<M, DefineTopicMsg>) {
+            f.s(m.name);
+            f.u(static_cast<uint32_t>(m.partitionCount)); f.u(m.validate ? 1 : 0); f.s(m.keyField); f.b(m.blob);
+            f.u(m.persistence); f.u(static_cast<uint16_t>(m.replicationFactor));
+            const auto& c = m.config;
+            f.u(c.cleanupPolicy); f.u(static_cast<uint64_t>(c.retentionMs)); f.u(static_cast<uint64_t>(c.retentionBytes));
+            f.u(static_cast<uint64_t>(c.deleteRetentionMs)); f.u(static_cast<uint32_t>(c.minCleanableDirtyRatioPpm));
+            f.u(static_cast<uint64_t>(c.segmentRollBytes)); f.u(static_cast<uint64_t>(c.minCompactionLagMs));
+            f.u(static_cast<uint64_t>(c.maxCompactionLagMs)); f.u(static_cast<uint64_t>(c.retentionCheckMs));
+            f.u(static_cast<uint64_t>(c.fileDeleteDelayMs)); f.u(c.durability); f.u(c.durabilityTier);
+            f.s(c.coPartitionGroup); f.s(c.partitionKey);
+        } else if constexpr (std::is_same_v<M, AlterTopicMsg>) {
+            f.s(m.topicName); f.u(m.expectedVersion); f.b(m.opsBlob);
+        } else if constexpr (std::is_same_v<M, CreateViewMsg>) {
+            f.s(m.viewName); f.u(m.persistence); f.s(m.keyField); f.b(m.planBlob);
+        } else if constexpr (std::is_same_v<M, DropTopicMsg> || std::is_same_v<M, DropViewMsg>) {
+            f.s(m.name);
+        } else if constexpr (std::is_same_v<M, AlterViewMsg>) {
+            f.s(m.name); f.s(m.keyField); f.u(m.persistence); f.u(m.expectedVersion); f.b(m.planBlob);
+        } else {
+            f.s(m.name); f.u(m.expectedVersion); f.u(m.changes.size());
+            for (const auto& c : m.changes) { f.u(static_cast<uint8_t>(c.key)); f.u(static_cast<uint64_t>(c.value)); }
+        }
+    }, req);
+    return f.h;
+}
+
+DdlRejection encodeErrorAnswer(cat::EncodeError e) {
+    switch (e) {
+    case cat::EncodeError::KindOpsMismatch:
+    case cat::EncodeError::UnknownKind:
+    case cat::EncodeError::UnknownFormatVer:
+        return reject(kInternal);
+    case cat::EncodeError::FieldTooLong:
+    case cat::EncodeError::TooManyElements:
+    case cat::EncodeError::ReservedKind:
+    case cat::EncodeError::BadEnum:
+        break;
+    }
+    return reject(kInvalidRequest, "the catalog event cannot be encoded: " + std::string{cat::encodeErrorName(e)});
+}
+
+// ─── construction ───────────────────────────────────────────────────────────
+namespace {
+std::string catalogDirOf(rune::replication::PartitionReplica* r) {
+    return (r != nullptr && r->log() != nullptr) ? r->log()->dir() : std::string{};
+}
+} // namespace
 
 AdminWorker::AdminWorker(SchemaRegistry& reg,
                          rune::replication::PartitionReplica* replica,
@@ -52,21 +253,62 @@ AdminWorker::AdminWorker(SchemaRegistry& reg,
     , replicaSet_(std::move(replicaSet))
     , deps_(std::move(deps))
     , viewsReplica_(viewsReplica)
-    , viewRegistry_(viewRegistry)
+    , ownViews_(viewRegistry == nullptr ? std::make_unique<ViewRegistry>() : nullptr)
+    , viewRegistry_(viewRegistry != nullptr ? viewRegistry : ownViews_.get())
     , catalogReplica_(catalogReplica)
-    , catalogPlane_(catalogPlane) {
+    , catalogPlane_(catalogPlane)
+    , applier_(catalogDirOf(catalogReplica), reg, *viewRegistry_) {
     if (catalogReplica_ != nullptr) {
         // One max fetch + the batch framing slack the worker's scratch carries.
         catalogReadScratch_.resize(static_cast<std::size_t>(rune::replication::kDefaultMaxFetchBytes) + 64u * 1024u);
         catalogReplica_->setReadScratch(catalogReadScratch_.data(), catalogReadScratch_.size());
     }
+    eventBuf_.reserve(64 * 1024);
 }
 
-// ─── __catalog role (control → admin; catalog history Task 6) ───────────────
+int AdminWorker::bootCatalog(BootEffects boot, LiveEffects live) {
+    int replayed = 0;
+    if (catalogReplica_ != nullptr) replayed = applier_.replayLocal(*catalogReplica_, std::move(boot));   // throws: refuse boot
+    if (!applier_.goLive(std::move(live)))
+        throw std::runtime_error("AdminWorker: the CatalogApplier refused to go live (phase " +
+                                 std::string{applier_.phaseName()} + ") — refusing to start");
+    return replayed;
+}
+
+std::string_view AdminWorker::roleName() const noexcept {
+    switch (role_.index()) {
+    case 0:  return "Follower";
+    case 1:  return "LeaderCatchingUp";
+    default: return "LeaderServing";
+    }
+}
+
+std::string_view AdminWorker::inFlightStateName() const noexcept {
+    return std::holds_alternative<Idle>(inFlight_) ? "Idle" : "AwaitingCommit";
+}
+
+// ─── roles ──────────────────────────────────────────────────────────────────
+// The retired __topic_schemas / __views replicas: their role is still driven so
+// they stay consistent until Task 16 deletes them; nothing reads or writes them
+// (the catalog is the only source — binding 8), and they carry no DDL effect.
+void AdminWorker::onRole(const AdminRoleMsg& role) {
+    namespace rr = rune::replication;
+    for (rr::PartitionReplica* r : {replica_, viewsReplica_}) {
+        if (r == nullptr) continue;
+        if (role.leader) {
+            std::vector<rr::NodeId> isr;
+            isr.reserve(replicaSet_.size());
+            for (int32_t id : replicaSet_) isr.push_back(static_cast<rr::NodeId>(id));
+            r->becomeLeader(static_cast<rr::Epoch>(role.epoch), std::move(isr));
+        } else {
+            r->becomeFollower(static_cast<rr::Epoch>(role.epoch), static_cast<rr::NodeId>(role.leaderId));
+        }
+    }
+}
+
 // The role is absolute and epoch-stamped (the committed assignment); the
-// replica's own role machine handles re-asserts (same-epoch leader = ISR-only
-// update; same-epoch same-leader follower = no-op) and refuses a leadership at
-// an epoch it already led at (restart fence → asks the controller for a bump).
+// replica's own role machine handles re-asserts and refuses a leadership at an
+// epoch it already led at (restart fence → asks the controller for a bump).
 void AdminWorker::onCatalogRole(const AdminRoleMsg& role) {
     if (catalogReplica_ == nullptr) return;
     namespace rr = rune::replication;
@@ -76,9 +318,29 @@ void AdminWorker::onCatalogRole(const AdminRoleMsg& role) {
         for (int i = 0; i < role.isrCount; ++i)
             isr.push_back(static_cast<rr::NodeId>(role.isr[static_cast<std::size_t>(i)]));
         catalogReplica_->becomeLeader(static_cast<rr::Epoch>(role.epoch), std::move(isr), role.partitionEpoch);
-    } else {
-        catalogReplica_->becomeFollower(static_cast<rr::Epoch>(role.epoch),
-                                        static_cast<rr::NodeId>(role.leaderId));
+        if (catalogReplica_->role() == rr::Role::Leader) {
+            // A promotion (or a leadership at a new epoch) starts catching up — the
+            // gate opens in updateRole_ once the whole log is applied; a same-epoch
+            // re-assert (an ISR update) keeps serving.
+            const auto* s = std::get_if<CatalogLeaderServing>(&role_);
+            if (s == nullptr || s->epoch != role.epoch) role_ = CatalogLeaderCatchingUp{role.epoch};
+            return;
+        }
+        demote_(-1, role.epoch);   // the replica refused the leadership (restart fence)
+        return;
+    }
+    catalogReplica_->becomeFollower(static_cast<rr::Epoch>(role.epoch), static_cast<rr::NodeId>(role.leaderId));
+    demote_(role.leaderId, role.epoch);
+}
+
+void AdminWorker::demote_(int32_t leaderId, int32_t epoch) {
+    role_ = CatalogFollower{leaderId, epoch};
+    // Spec §5.2: an in-flight DDL is answered at once — the retriable NotLeader
+    // (its event may still commit under the new leader; the retry dedupes).
+    if (auto* a = std::get_if<AwaitingCommit>(&inFlight_)) {
+        const DdlRequest req = std::move(a->req);
+        inFlight_ = Idle{};
+        answer_(req, kNotLeader, "the catalog leader changed while the DDL awaited its commit");
     }
 }
 
@@ -87,124 +349,54 @@ void AdminWorker::onCatalogAlterIsrResponse(const rune::replication::AlterIsrRes
     catalogReplica_->onAlterIsrResponse(r);
 }
 
-// ─── nextSchemaVersion_ — single source of truth for CONTIGUOUS versions ────
-// (Task 10). DefineTopic (create, this task) and ALTER (Task 11) both route
-// their commit's version through this one helper.
-uint16_t AdminWorker::nextSchemaVersion_(int32_t topicId) const {
-    const RegistryEntry* latest = reg_.latest(topicId);
-    return latest ? static_cast<uint16_t>(latest->version + 1) : kInitialSchemaVersion;
-}
-
-// ─── Role events (control → admin) ──────────────────────────────────────────
-//
-// RULING-2 A: the schema replica's role is driven ONLY here, on the admin thread.
-// C (rebuild-on-promotion): on a Follower→Leader edge, replay the log so a
-// promoted node re-materialises the registry from __topic_schemas before serving
-// DDL as leader.  Time-independent: fires exactly once on the edge, off the log.
-void AdminWorker::onRole(const AdminRoleMsg& role) {
-    epoch_ = role.epoch;
-    if (role.leader) {
-        if (replica_) {
-            std::vector<rune::replication::NodeId> isr;
-            isr.reserve(replicaSet_.size());
-            for (int32_t id : replicaSet_)
-                isr.push_back(static_cast<rune::replication::NodeId>(id));
-            replica_->becomeLeader(static_cast<rune::replication::Epoch>(role.epoch),
-                                   std::move(isr));
+// Follower ⇄ CatchingUp ⇄ Serving, from the replica's role and what the applier
+// has applied: a leader serves DDL only once every event in its log is applied
+// (so the state it validates against is the state its append will extend).
+bool AdminWorker::updateRole_() {
+    if (catalogReplica_ == nullptr) return false;
+    namespace rr = rune::replication;
+    const bool leads = catalogReplica_->role() == rr::Role::Leader;
+    if (!leads) {
+        if (!std::holds_alternative<CatalogFollower>(role_)) {
+            demote_(-1, static_cast<int32_t>(catalogReplica_->epoch()));
+            return true;
         }
-        // Task 19: the __views replica is admin-owned too — drive its role on the
-        // SAME edge (so CreateView's appendKeyed sees a leader replica).
-        if (viewsReplica_) {
-            std::vector<rune::replication::NodeId> visr;
-            visr.reserve(replicaSet_.size());
-            for (int32_t id : replicaSet_)
-                visr.push_back(static_cast<rune::replication::NodeId>(id));
-            viewsReplica_->becomeLeader(static_cast<rune::replication::Epoch>(role.epoch),
-                                        std::move(visr));
-        }
-        leader_ = true;
-        if (!wasLeader_) {
-            // Follower→Leader edge: rebuild registry from the replicated log.
-            rebuildFromLog_();
-            if (rebuildFailed_) [[unlikely]] {
-                // Surfaced loudly (see rebuildFromLog_ + rebuildFailed()):
-                // this node is now serving DDL as leader on top of a
-                // registry rebuild that detected and aborted on a corrupt
-                // __topic_schemas record — never silently treated as healthy.
-                spdlog::critical(
-                    "AdminWorker: promoted to LEADER (epoch={}) with a FAILED "
-                    "__topic_schemas rebuild — the SchemaRegistry may be "
-                    "missing versions past the corrupt record. See the prior "
-                    "CORRUPT __topic_schemas record log line.", role.epoch);
-            }
-            // Task 19b: now that reg_ is rebuilt (sources resolve), recover the
-            // durable view catalog from __views and fan out recovery installs.
-            recoverViewsOnPromotion_();
-            wasLeader_ = true;
-        }
-    } else {
-        if (replica_) {
-            replica_->becomeFollower(
-                static_cast<rune::replication::Epoch>(role.epoch),
-                static_cast<rune::replication::NodeId>(role.leaderId));
-        }
-        if (viewsReplica_) {
-            viewsReplica_->becomeFollower(
-                static_cast<rune::replication::Epoch>(role.epoch),
-                static_cast<rune::replication::NodeId>(role.leaderId));
-        }
-        leader_    = false;
-        wasLeader_ = false;  // next promotion re-triggers rebuild
-        // DDL conformance B4: a DDL op cannot commit on a follower — the HW it would
-        // poll is the new leader's, and its appended record may be truncated.
-        // Answer it now (Internal: outcome unknown, the client retries on the new
-        // leader) instead of riding the 30 s timeout or committing off a follower HW.
-        // An op demoted in AwaitingCommit is in doubt (KL2): never applied live, its
-        // record replays on a restart if it survives.
-        if (hasInFlight())
-            answerInFlight_(kInternal, inFlightAlterTopicId_());
+        return false;
     }
+    const bool caughtUp = !applier_.halted() && applier_.nextOffset() >= catalogReplica_->logEndOffset();
+    if (const auto* c = std::get_if<CatalogLeaderCatchingUp>(&role_); c && caughtUp && !hasInFlight()) {
+        role_ = CatalogLeaderServing{c->epoch};
+        spdlog::info("AdminWorker: catalog leader (epoch {}) caught up at offset {} — serving DDL", c->epoch,
+                     applier_.nextOffset());
+        return true;
+    }
+    if (const auto* s = std::get_if<CatalogLeaderServing>(&role_); s && !caughtUp && !hasInFlight()) {
+        // An appended event this broker has not applied (a commit that timed out):
+        // no new event may be built on a state that does not include it.
+        role_ = CatalogLeaderCatchingUp{s->epoch};
+        return true;
+    }
+    if (std::holds_alternative<CatalogFollower>(role_)) {
+        role_ = CatalogLeaderCatchingUp{static_cast<int32_t>(catalogReplica_->epoch())};
+        return true;
+    }
+    return false;
 }
 
-// ─── Ingress ────────────────────────────────────────────────────────────────
-// No-hang fix round 3 (fix-on-sight): the serialized DDL queue is BOUNDED
-// (kMaxPendingDdl).  A request beyond it is answered Internal at once — never
-// queued without bound (which could also overflow the bounded DDL-answer
-// backlog: AdminWorkerAgent::haltEgressBacklogFull_).
-void AdminWorker::submitDefineTopic(DefineTopicMsg msg) {
+// ─── ingress ────────────────────────────────────────────────────────────────
+void AdminWorker::submit(DdlRequest req) {
     if (pending_.size() >= kMaxPendingDdl) [[unlikely]] {
         ++pendingDdlRefused_;
-        deps_.respondDefine(msg.session, msg.corr, -1, 0, kInternal);
+        // Not started: answered directly (respond_), outside the started/answered pair.
+        respond_(req, kInternal, {}, -1, 0, 0, 0, -1, 0);
         return;
     }
-    pending_.emplace_back(std::in_place_type<DefineTopicMsg>, std::move(msg));
-}
-
-void AdminWorker::submitCreateView(CreateViewMsg msg) {
-    if (pending_.size() >= kMaxPendingDdl) [[unlikely]] {
-        ++pendingDdlRefused_;
-        deps_.respondCreateView(msg.session, msg.corr, -1, 0, kInternal);
-        return;
-    }
-    pending_.emplace_back(std::in_place_type<CreateViewMsg>, std::move(msg));
-}
-
-void AdminWorker::submitAlterTopic(AlterTopicMsg msg) {
-    if (pending_.size() >= kMaxPendingDdl) [[unlikely]] {
-        ++pendingDdlRefused_;
-        deps_.respondAlter(msg.session, msg.corr, -1, 0, kInternal);
-        return;
-    }
-    pending_.emplace_back(std::in_place_type<AlterTopicMsg>, std::move(msg));
+    pending_.push_back(std::move(req));
 }
 
 void AdminWorker::submitGetSchema(const GetSchemaMsg& msg) {
-    // GetSchema is a pure read of the admin-owned registry — no round-trip.
-    //
-    // Task 13: `msg.requestedFingerprint` selects WHICH version is returned —
-    // 0 means latest; non-zero resolves the exact historical version whose
-    // per-version (materialized-as-of) fingerprint matches, so a typed client
-    // compiled against an older schema can fetch the descriptor it needs.
+    // A pure read of the projected registry.  `requestedFingerprint` 0 = latest;
+    // non-zero = the exact historical version with that per-version fingerprint.
     const auto* named = reg_.byName(msg.name);
     if (!named) {
         deps_.respondGet(msg.session, msg.corr, -1, 0, /*partitionCount=*/0, {}, kUnknownTopic);
@@ -214,286 +406,19 @@ void AdminWorker::submitGetSchema(const GetSchemaMsg& msg) {
                                  ? named
                                  : reg_.byFingerprint(named->topicId, msg.requestedFingerprint);
     if (!e) {
-        // No version of this (known) topic has the requested fingerprint —
-        // same wire error as an unknown topic (no dedicated "stale fingerprint"
-        // code on the wire yet).
         deps_.respondGet(msg.session, msg.corr, -1, 0, /*partitionCount=*/0, {}, kUnknownTopic);
         return;
     }
-    // IMPORTANT: `e->descriptorBlob` is the raw EVOLVING blob (every field ever
-    // declared, live or retired) — NOT what a client should rehash. The client
-    // typed-gate recomputes fingerprint(deserialize(responseBlob)) and compares
-    // it to the fingerprint it compiled against, so the wire blob MUST
-    // deserialize to the MATERIALIZED-as-of-`e->version` descriptor (whose
-    // fingerprint is exactly `e->fingerprint`, by construction in
-    // SchemaRegistry::applyRecord). Serialize `e->descriptor` (materialized),
-    // never `e->descriptorBlob` (evolving).
-    // Phase 2b Part C: report the TOPIC's partition count (`named`, the latest
-    // entry — partition count is a topic property, carried unchanged by every
-    // ALTER), so a typed client bound to ANY version routes records by key
-    // across every partition instead of all to partition 0.
-    deps_.respondGet(msg.session, msg.corr,
-                     e->topicId, e->version, named->partitionCount,
+    // The wire blob is the MATERIALIZED-as-of-version descriptor (its fingerprint
+    // is e->fingerprint), never the evolving blob; the partition count is the
+    // topic's (the latest entry).
+    deps_.respondGet(msg.session, msg.corr, e->topicId, e->version, named->partitionCount,
                      rune::codec::serialize(e->descriptor), kOK);
-}
-
-// ─── control → admin reply ──────────────────────────────────────────────────
-void AdminWorker::onCreateTopicReply(const CreateTopicReplyMsg& reply) {
-    // Only an op in an AwaitingId state (DefineTopic / CreateView) takes a reply,
-    // and only the one whose ticket matches.
-    int64_t ticket = 0;
-    if (const auto* d = std::get_if<DefineAwaitingId>(&inFlight_))     ticket = d->ticket;
-    else if (const auto* v = std::get_if<ViewAwaitingId>(&inFlight_)) ticket = v->ticket;
-    else return;   // Stale/mismatched reply — ignore (the op may have timed out).
-    if (ticket != reply.ticket) return;
-
-    // DDL conformance B3: the name differs only in ASCII case from an existing topic
-    // (they would share one directory on a case-insensitive filesystem).  Nothing
-    // was created; answer TopicExists with the existing topic's id — for DefineTopic
-    // AND CreateView, before either branch could adopt that topic.
-    if (reply.caseConflict && reply.topicId >= 0) {
-        answerInFlight_(kTopicExists, reply.topicId);
-        return;
-    }
-    // ── CREATE VIEW branch (Task 19): the reply carries the view's SINK topicId,
-    //    which is ALSO the view's own topic id.  Append the durable ViewRecord to
-    //    __views and gate on viewsReplica_'s HW (not the schema replica's).
-    if (auto* v = std::get_if<ViewAwaitingId>(&inFlight_)) {
-        onCreateViewReply_(*v, reply);
-        return;
-    }
-
-    DefineAwaitingId& op = std::get<DefineAwaitingId>(inFlight_);
-    if (reply.topicId < 0) {
-        // Control thread failed to create the topic → Internal error.
-        deps_.respondDefine(op.msg.session, op.msg.corr, -1, 0, kInternal);
-        inFlight_ = Idle{};
-        return;
-    }
-    // Final review I1: the name already named a topic (createTopic is idempotent
-    // by name — a RUNE_TOPICS boot topic, a recovered runtime topic).  One that
-    // already has a schema (registered under an id this name lookup missed, e.g.
-    // a pre-name-trailer record indexed by its descriptor name) is TopicExists,
-    // exactly like the up-front byName check.  A schema-less one accepts this
-    // schema — with ITS real partition count (below), never the requested one.
-    if (reply.existed) {
-        if (const RegistryEntry* ex = reg_.byId(reply.topicId)) {
-            deps_.respondDefine(op.msg.session, op.msg.corr, ex->topicId, ex->version,
-                                kTopicExists);
-            inFlight_ = Idle{};
-            return;
-        }
-        // Final review I2 (KL1b closed): a runtime Compact topic is a CREATE VIEW
-        // sink — committed, in doubt (KL2) or an orphan.  Never adopted as a typed
-        // topic: its view record (if any) would then share an id with this schema
-        // record and the next boot would refuse the dual claim.  TopicExists.
-        if (reply.existingIsRuntimeCompact) {
-            deps_.respondDefine(op.msg.session, op.msg.corr, reply.topicId, 0, kTopicExists);
-            inFlight_ = Idle{};
-            return;
-        }
-    }
-    const int32_t partitionCount = reply.partitionCount > 0 ? reply.partitionCount
-                                                            : op.msg.partitionCount;
-    // Phase 2b E: AUTHORITATIVE mode from the control thread (same bug class as the
-    // partition count): a schema-less existing topic keeps its own log backend.
-    // No-hang wave (R1): an unknown mode byte is never defaulted to Disk — the
-    // define fails explicitly (Internal), nothing is recorded, the worker goes Idle.
-    const auto mode = reply.persistence != CreateTopicReplyMsg::kPersistenceNotReported
-                          ? persistenceFromWire(reply.persistence)
-                          : persistenceFromWire(op.msg.persistence);
-    if (!mode) {
-        deps_.respondDefine(op.msg.session, op.msg.corr, -1, 0, kInternal);
-        inFlight_ = Idle{};
-        return;
-    }
-    const PersistenceMode persistence = *mode;
-
-    // Final review I1: an EXPLICIT `transient topic` define over an existing
-    // schema-less DISK topic cannot be honoured (the topic keeps its log backend);
-    // answering OK would hand the client a topic that silently is not transient.
-    // TopicExists, nothing recorded.  The reverse (no byte / disk request over a
-    // transient topic) stays accepted and records Transient: old clients send no
-    // byte and must keep adopting static persistence=transient topics.
-    if (reply.existed &&
-        op.msg.persistence == static_cast<uint8_t>(PersistenceMode::Transient) &&
-        persistence == PersistenceMode::Disk) {
-        deps_.respondDefine(op.msg.session, op.msg.corr, reply.topicId, 0, kTopicExists);
-        inFlight_ = Idle{};
-        return;
-    }
-
-    // ── AWAITING_COMMIT ── append the durable TopicSchema record.
-    TopicSchema ts;
-    ts.topicId        = reply.topicId;
-    ts.version        = nextSchemaVersion_(reply.topicId);
-    ts.partitionCount = partitionCount;   // authoritative (I1)
-    ts.keyField       = op.msg.keyField;
-    ts.validate       = op.msg.validate;
-    ts.descriptorBlob = op.msg.blob;
-    // DefineTopic (create): nextTag starts past every field the fresh schema
-    // already declares, so the first ALTER ADD (Task 11) allocates a tag that
-    // doesn't collide with an existing one.
-    ts.nextTag        = op.fieldCount;
-    // Durable topic name (independent of the descriptor's name): boot recovery
-    // recreates the topic under it (RuntimeTopicRecovery).
-    ts.topicName      = op.msg.name;
-    ts.persistence    = persistence;   // authoritative (reply)
-
-    // D: leader guard.  If we are not the leader, DDL cannot be committed here.
-    if (!leader_ || !replica_) {
-        deps_.respondDefine(op.msg.session, op.msg.corr, -1, 0, kInternal);
-        inFlight_ = Idle{};
-        return;
-    }
-
-    const std::vector<uint8_t> payload = ts.serialize();
-    // Task 15b: the __topic_schemas log is CleanupPolicy::Compact, and the
-    // Kafka-style LogCleaner compacts on EXACTLY the key stored here via
-    // appendKeyed (it has no separate key-extractor for this log) — so a
-    // topicId-only key would make every version of a topic collide on the
-    // SAME compaction key and the cleaner would physically delete all but the
-    // latest version.  Key by the COMPOSITE (topicId:i32 LE, version:u16 LE)
-    // = 6 bytes instead, so every version is its own distinct compaction key
-    // and survives compaction (old-fingerprint client binding + multi-version
-    // replay depend on every version staying durable).
-    uint8_t keyBuf[6];
-    const uint32_t u = static_cast<uint32_t>(reply.topicId);
-    keyBuf[0] = static_cast<uint8_t>(u & 0xff);
-    keyBuf[1] = static_cast<uint8_t>((u >> 8) & 0xff);
-    keyBuf[2] = static_cast<uint8_t>((u >> 16) & 0xff);
-    keyBuf[3] = static_cast<uint8_t>((u >> 24) & 0xff);
-    const uint16_t v = ts.version;
-    keyBuf[4] = static_cast<uint8_t>(v & 0xff);
-    keyBuf[5] = static_cast<uint8_t>((v >> 8) & 0xff);
-
-    const rune::replication::Offset base =
-        replica_->appendKeyed(std::span<const uint8_t>(keyBuf, 6),
-                              std::span<const uint8_t>(payload.data(), payload.size()),
-                              /*acksAll=*/true);
-    if (base < 0) {
-        // Gated (minIsr not met) → Internal error to the client.
-        deps_.respondDefine(op.msg.session, op.msg.corr, -1, 0, kInternal);
-        inFlight_ = Idle{};
-        return;
-    }
-    // D: acksAll → wait until HW covers the appended offset (majority-durable).
-    // Single-record keyed batch → last == base.
-    DefineAwaitingCommit next{
-        .msg            = std::move(op.msg),
-        .startedNs      = op.startedNs,
-        .fieldCount     = op.fieldCount,
-        .topicId        = reply.topicId,
-        .partitionCount = partitionCount,
-        .persistence    = persistence,
-        .appendedLast   = base,
-    };
-    replica_->onLeaderLogAppended();  // reconcile LEO/HW + push to followers
-    inFlight_ = std::move(next);
-}
-
-// ─── onCreateViewReply_ — CREATE VIEW sink id came back; append the ViewRecord ─
-void AdminWorker::onCreateViewReply_(ViewAwaitingId& op, const CreateTopicReplyMsg& reply) {
-    if (reply.topicId < 0) {
-        deps_.respondCreateView(op.view.session, op.view.corr, -1, 0, kInternal);
-        inFlight_ = Idle{};
-        return;
-    }
-    // The view name already named a topic the schema registry does not know (an
-    // untyped boot topic): createTopic handed back THAT topic, not a fresh sink.
-    // Adopting it would fold the view's output into an unrelated (or its own
-    // source) topic — reject; nothing was created, so nothing to undo.
-    // Task 14 (KL1 follow-up): EXCEPT a retry's own orphan sink — a runtime topic
-    // with exactly this sink's spec (sinkSpecMatches, decided by the control thread)
-    // that no TopicSchema / ViewRecord claims.  It is adopted: the ViewRecord below
-    // claims it, and its commit promotes the dir marker (topicCommitted).
-    const bool adoptOrphanSink = reply.existed && reply.sinkSpecMatches &&
-                                 reg_.byId(reply.topicId) == nullptr &&
-                                 viewRegistry_ != nullptr &&
-                                 viewRegistry_->byViewTopicId(reply.topicId) == nullptr;
-    if (reply.existed && !adoptOrphanSink) {
-        deps_.respondCreateView(op.view.session, op.view.corr, reply.topicId, 0, kTopicExists);
-        inFlight_ = Idle{};
-        return;
-    }
-    // D: leader guard + views catalog wired.
-    if (!leader_ || !viewsReplica_ || !viewRegistry_) {
-        deps_.respondCreateView(op.view.session, op.view.corr, -1, 0, kInternal);
-        inFlight_ = Idle{};
-        return;
-    }
-
-    // Stamp the authoritative sink id onto the compiled plan (it is the view's
-    // own topic id) BEFORE serializing it into the durable ViewRecord.
-    op.compiledPlan.viewTopicId = reply.topicId;
-
-    ViewRecord rec;
-    rec.viewTopicId     = reply.topicId;
-    rec.viewName        = op.view.viewName;
-    rec.compiledPlanBlob = rune::view::serialize(op.compiledPlan);
-    rec.persistence     = op.view.persistence;
-    // Task 19b: persist the OUTPUT descriptor so a cold restart can re-register
-    // the view's typed output topic (GetTopicSchema / openView) EXACTLY as
-    // created — its field names + FixedStr widths (hence its fingerprint) are
-    // NOT reconstructable from the compiled plan alone.
-    rec.outputDescriptorBlob = rune::codec::serialize(op.viewOutDesc);
-
-    const std::vector<uint8_t> payload = rec.serialize();
-    // __views is CleanupPolicy::Compact and keyed by the viewTopicId (4-byte LE
-    // int32) — the compaction key the cleaner uses — so the latest record per
-    // view survives compaction (views are not versioned: one record per view id).
-    uint8_t keyBuf[4];
-    const uint32_t u = static_cast<uint32_t>(reply.topicId);
-    keyBuf[0] = static_cast<uint8_t>(u & 0xff);
-    keyBuf[1] = static_cast<uint8_t>((u >> 8) & 0xff);
-    keyBuf[2] = static_cast<uint8_t>((u >> 16) & 0xff);
-    keyBuf[3] = static_cast<uint8_t>((u >> 24) & 0xff);
-
-    const rune::replication::Offset base =
-        viewsReplica_->appendKeyed(std::span<const uint8_t>(keyBuf, 4),
-                                   std::span<const uint8_t>(payload.data(), payload.size()),
-                                   /*acksAll=*/true);
-    if (base < 0) {
-        deps_.respondCreateView(op.view.session, op.view.corr, -1, 0, kInternal);
-        inFlight_ = Idle{};
-        return;
-    }
-    // The sink's partition count: the AUTHORITATIVE one the control thread
-    // reported (final review I1); a reply that did not report one falls back to
-    // the source's (the sink is requested co-partitioned with it).
-    int32_t sinkPartitions = reply.partitionCount;
-    if (sinkPartitions <= 0) {
-        sinkPartitions = 1;
-        if (!op.compiledPlan.sourceTopicId.empty()) {
-            if (const RegistryEntry* se = reg_.byId(op.compiledPlan.sourceTopicId[0]))
-                sinkPartitions = se->partitionCount;
-        }
-    }
-    ViewAwaitingCommit next{
-        .view              = std::move(op.view),
-        .startedNs         = op.startedNs,
-        .outputFingerprint = op.compiledPlan.outputFingerprint,
-        .viewOutDesc       = std::move(op.viewOutDesc),
-        .viewSrcDesc       = std::move(op.viewSrcDesc),
-        .partitionCount    = sinkPartitions,
-        .viewRecord        = std::move(rec),         // applied on the HW gate (advance_)
-        .appendedLast      = base,
-    };
-    viewsReplica_->onLeaderLogAppended();
-    inFlight_ = std::move(next);
 }
 
 // ─── doWork ─────────────────────────────────────────────────────────────────
 int AdminWorker::doWork(int64_t nowNs) {
     int work = 0;
-
-    // 1. Drive the replica(s) (RULING-2 A: admin thread SOLELY drives doWork).
-    if (replica_)      work += replica_->doWork(nowNs);
-    if (viewsReplica_) work += viewsReplica_->doWork(nowNs);   // Task 19: __views
-
-    // 1b. Catalog history Task 6: the __catalog plane (inbound frames applied
-    //     inline, zero-copy) and then the replica (push / fetch / ISR / HW).
-    //     DR-15: a peer publication unresolved at startup is re-added here.
     if (catalogPlane_ && catalogReplica_) {
         work += catalogPlane_->drivePeerResolve();
         work += catalogPlane_->poll(kCatalogFragmentLimit,
@@ -503,789 +428,583 @@ int AdminWorker::doWork(int64_t nowNs) {
                                      nowNs, catalogFrameStats_);
             });
     }
-    if (catalogReplica_) work += catalogReplica_->doWork(nowNs);
-
-    // 2. Advance the in-flight DDL (HW check / commit).
+    if (replica_)      work += replica_->doWork(nowNs);        // retired (Task 16 deletes)
+    if (viewsReplica_) work += viewsReplica_->doWork(nowNs);   // retired (Task 16 deletes)
+    if (catalogReplica_) {
+        work += catalogReplica_->doWork(nowNs);
+        work += applier_.applyCommitted(*catalogReplica_);
+    }
     if (advance_(nowNs)) ++work;
-
-    // 3. Start the next queued DefineTopic if idle.
-    if (!hasInFlight() && !pending_.empty()) {
+    if (updateRole_()) ++work;
+    // Rejections answer at once (nothing in flight): take up to a bounded batch
+    // per pass; an accepted DDL goes in flight and ends the batch.
+    for (int i = 0; i < 16 && !hasInFlight() && !pending_.empty(); ++i) {
         startNext_(nowNs);
         ++work;
     }
     return work;
 }
 
-// ─── startNext_ — PARSING → name-lookup → CREATING (request id) ──────────────
+// ─── startNext_ — gate, dedupe, build, dry-run, append ──────────────────────
 void AdminWorker::startNext_(int64_t nowNs) {
     ++started_;
-    PendingDdl pd = std::move(pending_.front());
+    DdlRequest req = std::move(pending_.front());
     pending_.pop_front();
+    const DdlMeta& meta = std::visit([](const auto& m) -> const DdlMeta& { return m.meta; }, req);
 
-    // Final review M2: the last promotion's catalog rebuild failed — the registries
-    // may miss records past the corrupt one (a create could adopt a committed
-    // topic's sink, a define re-use a recorded name).  Serve no DDL: Internal.
-    if ((rebuildFailed_ || viewsRebuildFailed_) && leader_) [[unlikely]] {
-        ++refusedForFailedRebuild_;
-        std::visit([&](const auto& m) {
-            using M = std::decay_t<decltype(m)>;
-            if constexpr (std::is_same_v<M, DefineTopicMsg>)
-                deps_.respondDefine(m.session, m.corr, -1, 0, kInternal);
-            else if constexpr (std::is_same_v<M, CreateViewMsg>)
-                deps_.respondCreateView(m.session, m.corr, -1, 0, kInternal);
-            else
-                deps_.respondAlter(m.session, m.corr, -1, 0, kInternal);
-        }, pd);
+    // 1. The role gate.  A halted applier accepts no catalog change (spec §5.3).
+    if (catalogReplica_ == nullptr) {
+        answer_(req, kInternal, "this broker has no __catalog");
+        return;
+    }
+    if (applier_.halted()) {
+        answer_(req, kInternal, "catalog apply is halted on this broker");
+        return;
+    }
+    if (const auto* f = std::get_if<CatalogFollower>(&role_)) {
+        if (meta.requestId.none() && f->leaderId >= 0 && f->leaderId != selfId_) {
+            // F37: a pre-v8 client cannot follow a Redirect to the known leader — an
+            // explicit InvalidRequest in its own DDL reply, never a wait-out.  (No
+            // known leader — an election, a broker starting — is the retriable
+            // NotLeader for every client: there is nowhere to route it yet.)
+            ++preV8Refused_;
+            spdlog::warn("AdminWorker: a pre-v8 client's DDL (session {}) reached a broker that is not the catalog "
+                         "leader — answered InvalidRequest: client too old for cluster DDL routing; upgrade "
+                         "(refused so far: {})", meta.sessionId, preV8Refused_);
+            answer_(req, kInvalidRequest);
+            return;
+        }
+        answer_(req, kNotLeader);
+        return;
+    }
+    if (std::holds_alternative<CatalogLeaderCatchingUp>(role_)) {
+        answer_(req, kNotLeader);
         return;
     }
 
-    if (auto* alter = std::get_if<AlterTopicMsg>(&pd)) {
-        startAlter_(std::move(*alter), nowNs);
-        return;
-    }
-    if (auto* view = std::get_if<CreateViewMsg>(&pd)) {
-        startCreateView_(std::move(*view), nowNs);
-        return;
-    }
-
-    DefineTopicMsg msg = std::move(std::get<DefineTopicMsg>(pd));
-
-    // ── malformed ── No-hang wave (R1): an unknown persistence byte on a
-    // directly submitted request is rejected InvalidSchema, nothing started —
-    // never cast, never defaulted to Disk.  (The ring decode drops the blob for
-    // the same byte, which the PARSING step below also answers InvalidSchema.)
-    if (!persistenceFromWire(msg.persistence)) {
-        deps_.respondDefine(msg.session, msg.corr, -1, 0, kInvalidSchema);
-        return;
+    const cat::CatalogState& state = applier_.state();
+    // 2. Dedupe (F14) on (requestId, statement fingerprint).
+    const uint64_t fp = requestFingerprint(req);
+    if (!meta.requestId.none()) {
+        if (const auto rec = state.request(meta.requestId)) {
+            if (rec->requestFingerprint == fp) {
+                answerOk_(req, *rec);   // a retry of a committed DDL: its ORIGINAL result
+            } else {
+                answer_(req, kInvalidRequest, "requestId reused for a different statement");
+            }
+            return;
+        }
     }
 
-    // ── DDL conformance B1/B2 ── the name becomes dataDir/topics/<name>/: one safe
-    //    path segment, never an internal "__" name.  Nothing is created.
-    if (!isValidTopicName(msg.name)) {
-        deps_.respondDefine(msg.session, msg.corr, -1, 0, kInvalidTopicName);
+    // 3. Build the event against the applied catalog (the dry run is its gate).
+    Built built = buildEvent_(req, state);
+    if (!built) {
+        answerRejection_(req, built.error());
         return;
     }
-    // ── DDL conformance B6 ── a topic has at least one partition.
-    if (msg.partitionCount < 1) {
-        deps_.respondDefine(msg.session, msg.corr, -1, 0, kInvalidSchema);
-        return;
-    }
-
-    // ── PARSING ── validate the descriptor blob is well-formed, and capture
-    // its field count in the same pass (seeds nextTag for the create path —
-    // see DefineAwaitingId::fieldCount — avoiding a second deserialize of the same blob
-    // later).
-    std::size_t fieldCount = 0;
-    try {
-        const rune::codec::Descriptor parsed = rune::codec::deserialize(
-            std::span<const uint8_t>(msg.blob.data(), msg.blob.size()));
-        fieldCount = parsed.fields.size();
-    } catch (...) {
-        deps_.respondDefine(msg.session, msg.corr, -1, 0, kInvalidSchema);
-        return;
-    }
-
-    // ── name-lookup ── already exists → TopicExists.
-    if (const auto* ex = reg_.byName(msg.name)) {
-        deps_.respondDefine(msg.session, msg.corr, ex->topicId, ex->version,
-                            kTopicExists);
-        return;
-    }
-
-    // ── leader guard (D) ── DDL is leader-only.
-    if (!leader_) {
-        deps_.respondDefine(msg.session, msg.corr, -1, 0, kInternal);
-        return;
-    }
-
-    // ── CREATING ── post a create-topic request to the control thread (ring).
-    DefineAwaitingId op{
-        .msg        = std::move(msg),
-        .ticket     = nextTicket_++,
-        .startedNs  = nowNs,
-        .fieldCount = static_cast<uint16_t>(fieldCount),
-    };
-
-    if (!deps_.requestCreateTopic(op.ticket, op.msg.partitionCount, op.msg.name,
-                                  /*keyField=*/"", /*cleanupPolicy=*/0,
-                                  op.msg.persistence)) {
-        // Ring full (should not happen for rare DDL) → Internal; requeue would risk
-        // reordering, so fail fast and let the client retry.
-        deps_.respondDefine(op.msg.session, op.msg.corr, -1, 0, kInternal);
-        return;
-    }
-    inFlight_ = std::move(op);
+    built->principal.requestFingerprint = fp;
+    (void)appendEvent_(req, std::move(*built), nowNs);
 }
 
-// ─── startCreateView_ — serialized CREATE VIEW (compile + validate + sink) ────
-//
-// Runs on the admin thread, reusing the DDL state machine so a CREATE VIEW is
-// serialized with every other DDL op (single inFlight_).  Like DefineTopic it
-// goes through the createTopic id round-trip (the view's keyed+Compact SINK
-// topic) → AwaitingId; the durable ViewRecord is appended when the sink id comes
-// back (onCreateTopicReply), and commit (advance_) applies it to the registry,
-// registers the view's output descriptor and fans the compiled plan to workers.
-void AdminWorker::startCreateView_(CreateViewMsg msg, int64_t nowNs) {
-    namespace rv = rune::view;
-
-    // ── malformed ── the ring decode rejected an unknown persistence byte, or
-    // (no-hang wave R1) a directly submitted request carries one: rejected
-    // InvalidSchema, never treated as "not disk" / recorded as-is.
-    if (msg.malformed || msg.persistence > 1) {
-        deps_.respondCreateView(msg.session, msg.corr, -1, 0, kInvalidSchema);
-        return;
+bool AdminWorker::appendEvent_(const DdlRequest& req, cat::CatalogEvent e, int64_t nowNs) {
+    const cat::CatalogState& state = applier_.state();
+    if (auto err = wireLimitError(e)) {
+        answer_(req, kInvalidRequest, *err);
+        return false;
+    }
+    // Task 7 C1: every effect frame of the event — and of every view whose source
+    // it changes — must fit the admin→control ring, or it is never written.
+    const std::size_t maxFrame = deps_.effectMaxFrameBytes != 0 ? deps_.effectMaxFrameBytes : catalogEffectMaxFrame();
+    if (auto refusal = catalogEventEffectsRefusal(state, e, maxFrame)) {
+        answer_(req, kInvalidRequest, *refusal);
+        return false;
+    }
+    if (auto enc = cat::encodeInto(e, eventBuf_); !enc) {
+        const DdlRejection r = encodeErrorAnswer(enc.error());
+        if (r.code == kInternal)
+            spdlog::error("AdminWorker: {} '{}' does not encode ({}) — a leader bug; answered Internal, nothing "
+                          "appended", cat::kindName(e.kind), cat::escapeNameForLog(e.objectName),
+                          cat::encodeErrorName(enc.error()));
+        answerRejection_(req, r);
+        return false;
+    }
+    if (eventBuf_.size() > kMaxCatalogEventBytes) {
+        answer_(req, kInvalidRequest, "the catalog event is " + std::to_string(eventBuf_.size()) +
+                                          " bytes, larger than the " + std::to_string(kMaxCatalogEventBytes) +
+                                          "-byte catalog record limit");
+        return false;
     }
 
-    // ── DDL conformance B1/B2 ── the view name is its sink topic's directory name.
-    if (!isValidTopicName(msg.viewName)) {
-        deps_.respondCreateView(msg.session, msg.corr, -1, 0, kInvalidTopicName);
-        return;
-    }
-
-    // ── leader guard (D) ── DDL is leader-only; views catalog must be wired.
-    if (!leader_ || !viewsReplica_ || !viewRegistry_) {
-        deps_.respondCreateView(msg.session, msg.corr, -1, 0, kInternal);
-        return;
-    }
-
-    // ── ViewExists ── a view with this name already committed.
-    if (const ViewRecord* ex = viewRegistry_->byName(msg.viewName)) {
-        deps_.respondCreateView(msg.session, msg.corr, ex->viewTopicId, 0, kViewExists);
-        return;
-    }
-
-    // ── TopicExists ── the view name already names a TYPED topic (a source, or
-    //    any DefineTopic'd topic).  The view's sink IS a topic of that name, so
-    //    the control thread's idempotent createTopic would hand back the
-    //    existing topic as the sink (`CREATE VIEW characters ... FROM
-    //    characters` → feedback loop + the source's schema overwritten).  An
-    //    UNTYPED existing topic is caught on the reply (`existed`).
-    if (const RegistryEntry* ex = reg_.byName(msg.viewName)) {
-        deps_.respondCreateView(msg.session, msg.corr, ex->topicId, 0, kTopicExists);
-        return;
-    }
-
-    // ── deserialize the authored plan ──
-    std::optional<rv::ViewPlan> authored =
-        rv::deserializeAuthored(std::span<const uint8_t>(msg.planBlob.data(), msg.planBlob.size()));
-    if (!authored || authored->sources.empty()) {
-        deps_.respondCreateView(msg.session, msg.corr, -1, 0, kViewFieldUnresolved);
-        return;
-    }
-
-    // ── resolve each source topic's current descriptor from the schema registry ──
-    // A missing source => ViewSourceNotFound (resolved HERE, not via CompileError,
-    // so the wire code is exact — compileView only sees descriptors that exist).
-    std::vector<const rune::codec::Descriptor*> srcDescs;
-    srcDescs.reserve(authored->sources.size());
-    for (const auto& s : authored->sources) {
-        // DDL conformance B9 / D3b: a view's output carries no change events (its
-        // sink is a materialised table, not a changelog) until Phase 3 — a view over
-        // it would stay silently empty.  Reject; nothing is created.
-        if (viewRegistry_->byViewTopicId(s.topicId) != nullptr) {
-            deps_.respondCreateView(msg.session, msg.corr, -1, 0, kViewSourceIsView);
-            return;
-        }
-        const RegistryEntry* e = reg_.byId(s.topicId);
-        if (!e) {
-            deps_.respondCreateView(msg.session, msg.corr, -1, 0, kViewSourceNotFound);
-            return;
-        }
-        // Phase 2b E: a view that reads a transient topic must itself be transient
-        // (msg.persistence == 1) — a persisted view would checkpoint rows whose
-        // source data is gone after a restart.  The error path carries a code
-        // only: "<source> is transient; a view over it must be transient too
-        // (use: create transient view ...)".
-        if (e->persistence == PersistenceMode::Transient && msg.persistence == 0) {
-            deps_.respondCreateView(msg.session, msg.corr, -1, 0, kViewSourceTransient);
-            return;
-        }
-        srcDescs.push_back(&e->descriptor);
-    }
-
-    // ── compile + validate ── (viewTopicId stamped later, on the sink reply) ──
-    std::expected<rv::CompileResult, rv::CompileError> compiled =
-        rv::compileView(*authored,
-                        std::span<const rune::codec::Descriptor* const>(srcDescs.data(), srcDescs.size()),
-                        /*viewTopicId=*/-1);
-    if (!compiled) {
-        // CompileError is a human-readable message, not an enum — classify the
-        // common categories to the right wire error code (key-related → KeyInvalid,
-        // otherwise field/column resolution → FieldUnresolved).
-        std::string lc = compiled.error().message;
-        std::transform(lc.begin(), lc.end(), lc.begin(),
-                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        const uint16_t code = (lc.find("key") != std::string::npos)
-                                  ? kViewKeyInvalid : kViewFieldUnresolved;
-        deps_.respondCreateView(msg.session, msg.corr, -1, 0, code);
-        return;
-    }
-
-    // Phase 2a co-partitioning: an aggregate view groups by a VALUE field, but
-    // records are partitioned by their 8-byte wire key, and under table semantics
-    // a contributor IS its wire key. The broker never enforces wire key ==
-    // declared keyField, so even "group-by == source keyField" does not keep a
-    // group's contributors on one partition (it either makes every group
-    // single-contributor or silently splits groups). Every aggregate view over
-    // a source with more than one partition is therefore rejected.
-    if (rv::isAggregateView(compiled->plan)) {
-        const RegistryEntry* coSrc = reg_.byId(authored->sources[0].topicId);
-        if (coSrc != nullptr && coSrc->partitionCount > 1) {
-            deps_.respondCreateView(msg.session, msg.corr, -1, 0, kViewNotCoPartitioned);
-            return;
-        }
-    }
-
-    // ── CREATING ── post a keyed+Compact SINK create request to the control
-    // thread; the view sink is co-partitioned with its (single) source (spec §11.2).
-    ViewAwaitingId op{
-        .view         = std::move(msg),
-        .ticket       = nextTicket_++,
-        .startedNs    = nowNs,
-        .compiledPlan = std::move(compiled->plan),
-        .viewOutDesc  = std::move(compiled->outputDescriptor),
-        .viewSrcDesc  = *srcDescs[0],   // single-source (co-partition-trivial)
-    };
-
-    const RegistryEntry* srcEntry = reg_.byId(authored->sources[0].topicId);
-    const int32_t sinkPartitions  = srcEntry ? srcEntry->partitionCount : 1;
-
-    if (!deps_.requestCreateTopic(op.ticket, sinkPartitions, op.view.viewName,
-                                  op.view.keyField, /*cleanupPolicy=*/1 /*Compact*/,
-                                  /*persistence=*/0 /*Disk in Part E; follows the view's persistence once sinks carry change events (parked)*/)) {
-        deps_.respondCreateView(op.view.session, op.view.corr, -1, 0, kInternal);
-        return;
-    }
-    inFlight_ = std::move(op);
-}
-
-// ─── startAlter_ — serialized ALTER TOPIC (CAS + compat gate + atomic apply) ──
-//
-// Runs on the admin thread, reusing the DDL state machine so an ALTER is
-// serialized with CREATE and other ALTERs (single inFlight_).  Unlike CREATE it
-// SKIPS AwaitingId — the topic already exists, so there is no id round-trip to
-// the control thread; it commits synchronously to the append/AwaitingCommit path.
-void AdminWorker::startAlter_(AlterTopicMsg msg, int64_t nowNs) {
-    // ── leader guard (D) ── DDL is leader-only.
-    if (!leader_ || !replica_) {
-        deps_.respondAlter(msg.session, msg.corr, -1, 0, kInternal);
-        return;
-    }
-
-    // U1: a view's output schema is registered in reg_ under the view's name but is
-    //     derived from its plan — never altered directly.  Nothing appended.
-    if (viewRegistry_ && viewRegistry_->byName(msg.topicName)) {
-        deps_.respondAlter(msg.session, msg.corr, -1, 0, kViewNotAlterable);
-        return;
-    }
-
-    // a. resolve the topic's LATEST applied schema.
-    const RegistryEntry* latest = reg_.byName(msg.topicName);
-    if (!latest) {
-        deps_.respondAlter(msg.session, msg.corr, -1, 0, kUnknownTopic);
-        return;
-    }
-    const int32_t  topicId    = latest->topicId;
-    const uint16_t curVersion = latest->version;
-
-    // b. optimistic CAS — a non-zero expectedVersion that no longer matches the
-    //    latest version means another ALTER landed first; reject (NO lost update).
-    if (msg.expectedVersion != 0 && msg.expectedVersion != curVersion) {
-        deps_.respondAlter(msg.session, msg.corr, topicId, curVersion, kSchemaConflict);
-        return;
-    }
-
-    // c. decode the ops blob (bounds-checked; nullopt on any truncation).
-    auto ops = rune::codec::decodeAlterOps(
-        std::span<const uint8_t>(msg.opsBlob.data(), msg.opsBlob.size()));
-    if (!ops) {
-        deps_.respondAlter(msg.session, msg.corr, topicId, curVersion, kInvalidSchema);
-        return;
-    }
-
-    // d. effective compatibility mode: a SET_COMPATIBILITY op (if present) sets
-    //    both the mode the gate checks AND the mode persisted on the new record;
-    //    otherwise the current mode carries forward.
-    rune::codec::CompatMode mode = latest->compatMode;
-    for (const auto& op : *ops)
-        if (op.type == rune::codec::AlterOpType::SetCompatibility) mode = op.mode;
-
-    // e. compatibility gate (e.g. DROP is rejected under Forward).
-    if (!rune::codec::checkCompatibility(*ops, mode)) {
-        deps_.respondAlter(msg.session, msg.corr, topicId, curVersion, kSchemaIncompatible);
-        return;
-    }
-
-    // f. apply the ops to the CURRENT EVOLVING descriptor (all fields incl.
-    //    retired), bumping a fresh contiguous version.  applyOps is atomic: on
-    //    any failed op it returns an error and leaves `nextTag` untouched, so a
-    //    rejected ALTER appends nothing and does not bump the version.
-    rune::codec::Descriptor evolving;
-    try {
-        evolving = rune::codec::deserialize(std::span<const uint8_t>(
-            latest->descriptorBlob.data(), latest->descriptorBlob.size()));
-    } catch (...) {
-        // The stored evolving blob must be well-formed (it was validated on the
-        // way in); a throw here is an internal invariant breach, not client error.
-        deps_.respondAlter(msg.session, msg.corr, topicId, curVersion, kInternal);
-        return;
-    }
-    uint16_t       nextTag    = latest->nextTag;
-    const uint16_t newVersion = static_cast<uint16_t>(curVersion + 1);  // contiguous, computed ONCE
-    auto res = rune::codec::applyOps(evolving, *ops, nextTag, newVersion);
-    if (!res) {
-        // Surface the EvolveError as InvalidSchema (message available in res.error()).
-        deps_.respondAlter(msg.session, msg.corr, topicId, curVersion, kInvalidSchema);
-        return;
-    }
-
-    // DDL conformance B8 / D3a: a RENAME of the key field moves keyField with it.
-    // Ops apply in order, so a chain (id -> a, a -> b) ends at b.  Only reached when
-    // applyOps succeeded (a rejected ALTER changes nothing).
-    std::string keyField = latest->keyField;
-    for (const auto& op : *ops) {
-        if (op.type == rune::codec::AlterOpType::Rename && !keyField.empty() && op.name == keyField)
-            keyField = op.newName;
-    }
-
-    // g. build the new durable TopicSchema (same id/partitions/validate; keyField
-    //    follows a key-field RENAME (B8);
-    //    NEW evolving descriptor + post-applyOps nextTag + effective compatMode).
-    TopicSchema ts;
-    ts.topicId        = topicId;
-    ts.version        = newVersion;
-    ts.partitionCount = latest->partitionCount;
-    ts.keyField       = keyField;                          // follows a key-field RENAME (B8)
-    ts.validate       = latest->validator.has_value();   // same as current
-    ts.descriptorBlob = rune::codec::serialize(*res);     // the NEW evolving descriptor
-    ts.nextTag        = nextTag;                           // advanced by applyOps
-    ts.compatMode     = mode;
-    ts.topicName      = latest->topicName;                 // carried forward unchanged
-    ts.persistence    = latest->persistence;               // carried forward unchanged (Phase 2b E)
-
-    const std::vector<uint8_t> payload = ts.serialize();
-    // Task 15b: composite (topicId, version) compaction key — see the matching
-    // comment at the DefineTopic append site in onCreateTopicReply above.
-    uint8_t keyBuf[6];
-    const uint32_t u = static_cast<uint32_t>(topicId);
-    keyBuf[0] = static_cast<uint8_t>(u & 0xff);
-    keyBuf[1] = static_cast<uint8_t>((u >> 8) & 0xff);
-    keyBuf[2] = static_cast<uint8_t>((u >> 16) & 0xff);
-    keyBuf[3] = static_cast<uint8_t>((u >> 24) & 0xff);
-    const uint16_t v = ts.version;
-    keyBuf[4] = static_cast<uint8_t>(v & 0xff);
-    keyBuf[5] = static_cast<uint8_t>((v >> 8) & 0xff);
-
-    const rune::replication::Offset base =
-        replica_->appendKeyed(std::span<const uint8_t>(keyBuf, 6),
-                              std::span<const uint8_t>(payload.data(), payload.size()),
-                              /*acksAll=*/true);
+    uint8_t key[8];
+    for (int i = 0; i < 8; ++i) key[i] = static_cast<uint8_t>((e.objectId >> (8 * i)) & 0xff);
+    const rune::replication::Offset base = catalogReplica_->appendKeyed(
+        std::span<const uint8_t>(key, 8), std::span<const uint8_t>(eventBuf_.data(), eventBuf_.size()),
+        /*acksAll=*/true);
     if (base < 0) {
-        // Gated (minIsr not met) → Internal; nothing committed, version unchanged.
-        deps_.respondAlter(msg.session, msg.corr, topicId, curVersion, kInternal);
-        return;
+        // Spec §5.5: below minIsr the catalog accepts no change — retriable.
+        answer_(req, kNotLeader, "the catalog is below its minIsr");
+        return false;
     }
-
-    // ts.topicId == topicId and ts.version == newVersion (computed ONCE above).
-    AlterAwaitingCommit op{
-        .alter        = std::move(msg),
-        .startedNs    = nowNs,
-        .alterSchema  = std::move(ts),
-        .appendedLast = base,   // single-record keyed batch → last == base
-    };
-    replica_->onLeaderLogAppended();  // reconcile LEO/HW + push to followers
-    inFlight_ = std::move(op);
+    ++eventsAppended_;
+    catalogReplica_->onLeaderLogAppended();   // reconcile LEO / HW, push to followers
+    inFlight_ = AwaitingCommit{req, std::move(e), base, nowNs};
+    return true;
 }
 
-// ─── answerInFlight_ — end the in-flight op without committing ──────────────
-void AdminWorker::answerInFlight_(uint16_t code, int32_t topicId) {
-    std::visit([&](const auto& st) {
-        using S = std::decay_t<decltype(st)>;
-        if constexpr (std::is_same_v<S, AlterAwaitingCommit>) {
-            deps_.respondAlter(st.alter.session, st.alter.corr, topicId, 0, code);
-        } else if constexpr (std::is_same_v<S, ViewAwaitingId> ||
-                             std::is_same_v<S, ViewAwaitingCommit>) {
-            deps_.respondCreateView(st.view.session, st.view.corr, topicId, 0, code);
-        } else if constexpr (std::is_same_v<S, DefineAwaitingId> ||
-                             std::is_same_v<S, DefineAwaitingCommit>) {
-            deps_.respondDefine(st.msg.session, st.msg.corr, topicId, 0, code);
-        }
-        // Idle: nothing in flight, nothing to answer.
-    }, inFlight_);
-    inFlight_ = Idle{};
-}
-
-int32_t AdminWorker::inFlightAlterTopicId_() const noexcept {
-    const auto* alter = std::get_if<AlterAwaitingCommit>(&inFlight_);
-    return alter ? alter->alterSchema.topicId : -1;
-}
-
-std::string_view AdminWorker::inFlightStateName() const noexcept {
-    return std::visit([](const auto& st) -> std::string_view {
-        using S = std::decay_t<decltype(st)>;
-        if constexpr (std::is_same_v<S, Idle>)                      return "Idle";
-        else if constexpr (std::is_same_v<S, DefineAwaitingId>)     return "DefineAwaitingId";
-        else if constexpr (std::is_same_v<S, DefineAwaitingCommit>) return "DefineAwaitingCommit";
-        else if constexpr (std::is_same_v<S, AlterAwaitingCommit>)  return "AlterAwaitingCommit";
-        else if constexpr (std::is_same_v<S, ViewAwaitingId>)       return "ViewAwaitingId";
-        else                                                         return "ViewAwaitingCommit";
-    }, inFlight_);
-}
-
-// ─── answerMissingCommitReplica_ — AwaitingCommit with no replica to gate on ──
-// B4 fix round 1: never a silent drop (the client would hang).  Unreachable in
-// production — an op reaches AwaitingCommit only after appending to that very
-// replica — so it is loud: logged, counted, answered Internal (outcome unknown).
-void AdminWorker::answerMissingCommitReplica_(const char* catalog) {
-    ++commitReplicaMissing_;
-    // The client's correlation id identifies the op (M3: no ticket kept past the reply).
-    const int64_t corr = std::visit([](const auto& st) -> int64_t {
-        using S = std::decay_t<decltype(st)>;
-        if constexpr (std::is_same_v<S, DefineAwaitingCommit>) return st.msg.corr;
-        else if constexpr (std::is_same_v<S, ViewAwaitingCommit>) return st.view.corr;
-        else if constexpr (std::is_same_v<S, AlterAwaitingCommit>) return st.alter.corr;
-        else return 0;
-    }, inFlight_);
-    spdlog::error("AdminWorker: in-flight DDL op (corr={}) in AwaitingCommit has no {} "
-                  "replica / catalog to commit on; answering Internal (count={})",
-                  corr, catalog, commitReplicaMissing_);
-    answerInFlight_(kInternal, inFlightAlterTopicId_());
-}
-
-// ─── advance_ — AWAITING_COMMIT (HW gate) + timeout ──────────────────────────
+// ─── advance_ — commit + local apply, timeout, halt ─────────────────────────
 bool AdminWorker::advance_(int64_t nowNs) {
-    if (!hasInFlight()) return false;
-
-    // Timeout guard (error path only — not a convergence gate).
-    const int64_t startedNs = std::visit([](const auto& st) -> int64_t {
-        if constexpr (requires { st.startedNs; }) return st.startedNs;
-        else return 0;
-    }, inFlight_);
-    if (nowNs - startedNs > kDdlTimeoutNs) {
-        answerInFlight_(kInternal, inFlightAlterTopicId_());
-        return true;
-    }
-
-    // Task 19: CREATE VIEW's durable record lives on the __views replica, so its
-    // HW gate (and commit) use viewsReplica_, not the schema replica_.
-    if (const auto* view = std::get_if<ViewAwaitingCommit>(&inFlight_)) {
-        if (!viewsReplica_ || !viewRegistry_) [[unlikely]] {
-            answerMissingCommitReplica_("__views");
+    auto* a = std::get_if<AwaitingCommit>(&inFlight_);
+    if (a == nullptr) return false;
+    // Committed AND applied locally — its effects posted (lastApplied is the
+    // EFFECTED prefix: an event staged by a halt never counts).  Checked before
+    // the halt: an event applied before a later halt still gets its OK.
+    if (applier_.lastApplied().offset >= a->offset) {
+        // The answer is what the applied event recorded.
+        const DdlMeta& meta = std::visit([](const auto& m) -> const DdlMeta& { return m.meta; }, a->req);
+        std::optional<cat::RequestRecord> rec =
+            meta.requestId.none() ? recordOfLastApplied_(a->offset) : applier_.state().request(meta.requestId);
+        DdlRequest req = std::move(a->req);
+        const int64_t offset = a->offset;
+        inFlight_ = Idle{};
+        if (!rec || rec->offset != offset) {
+            spdlog::error("AdminWorker: the event at offset {} applied but its result is not the in-flight DDL's "
+                          "(a leader bug) — answered Internal", offset);
+            answer_(req, kInternal);
             return true;
         }
-        if (viewsReplica_->highWatermark() <= view->appendedLast) return false;
-        commitCreateView_(*view);
-        inFlight_ = Idle{};
+        answerOk_(req, *rec);
         return true;
     }
-
-    // ── ALTER on-commit ── apply the (pre-built, version computed ONCE in
-    //    startAlter_) record to the registry and respond OK.
-    if (const auto* alter = std::get_if<AlterAwaitingCommit>(&inFlight_)) {
-        if (!replica_) [[unlikely]] {
-            answerMissingCommitReplica_("__topic_schemas");
-            return true;
-        }
-        // D: true majority-durable — HW must cover the appended offset.
-        if (replica_->highWatermark() <= alter->appendedLast) return false;
-
-        const int32_t  topicId    = alter->alterSchema.topicId;
-        const uint16_t newVersion = alter->alterSchema.version;
-        reg_.applyRecord(alter->alterSchema);
-        // Task 12: fan out the evolved schema to the produce/consume workers
-        // (validator refresh for the new version) now that the worker side
-        // keys validators_ by (topicId, version) — each writer version gets
-        // its own Validator, so this never clobbers the still-live older
-        // version's validator.  byIdVersion (not byId/latest) pins exactly
-        // the version this ALTER just committed, independent of any later
-        // concurrent commit (single-threaded admin worker, but explicit).
-        if (alter->alterSchema.validate) {
-            if (const RegistryEntry* entry = reg_.byIdVersion(topicId, newVersion))
-                deps_.pushValidators(*entry, topicId);
-        }
-        deps_.respondAlter(alter->alter.session, alter->alter.corr, topicId, newVersion, kOK);
+    if (applier_.halted()) {   // halted at or before the event: it will never be applied here
+        DdlRequest req = std::move(a->req);
         inFlight_ = Idle{};
+        answer_(req, kInternal, "catalog apply halted");
         return true;
     }
-
-    // ── CREATE on-commit ── apply to registry, push validators, respond OK.
-    if (const auto* def = std::get_if<DefineAwaitingCommit>(&inFlight_)) {
-        if (!replica_) [[unlikely]] {
-            answerMissingCommitReplica_("__topic_schemas");
-            return true;
-        }
-        // D: true majority-durable — HW must cover the appended offset.
-        if (replica_->highWatermark() <= def->appendedLast) return false;
-
-        TopicSchema ts;
-        ts.topicId        = def->topicId;
-        ts.version        = nextSchemaVersion_(def->topicId);
-        ts.partitionCount = def->partitionCount;   // authoritative (I1)
-        ts.keyField       = def->msg.keyField;
-        ts.validate       = def->msg.validate;
-        ts.descriptorBlob = def->msg.blob;
-        ts.nextTag        = def->fieldCount;
-        ts.topicName      = def->msg.name;      // same as the durable record
-        ts.persistence    = def->persistence;   // same as the durable record
-        reg_.applyRecord(ts);
-        // B10 / D4 fix round 1: the record is committed -> mark the topic dir.
-        if (deps_.topicCommitted) deps_.topicCommitted(def->topicId);
-        if (def->msg.validate) {
-            if (const RegistryEntry* entry = reg_.byId(def->topicId))
-                deps_.pushValidators(*entry, def->topicId);
-        }
-        deps_.respondDefine(def->msg.session, def->msg.corr, def->topicId, ts.version, kOK);
+    if (nowNs - a->startedNs > kDdlTimeoutNs) {
+        // F13: the event may still commit — the retriable NotLeader, never
+        // Internal.  updateRole_ holds the leader in CatchingUp until it applied it.
+        DdlRequest req = std::move(a->req);
+        const int64_t offset = a->offset;
         inFlight_ = Idle{};
+        spdlog::warn("AdminWorker: the event at offset {} did not commit within {} s — answered NotLeader "
+                     "(retriable; a retry with the same requestId gets its result if it commits)",
+                     offset, kDdlTimeoutNs / 1'000'000'000LL);
+        answer_(req, kNotLeader, "the catalog event did not commit in time");
         return true;
     }
-    return false;   // an AwaitingId state: waiting for the create-topic reply
+    return false;
 }
 
-// ─── commitCreateView_ — CREATE VIEW on-commit (HW gate passed) ──────────────
-void AdminWorker::commitCreateView_(const ViewAwaitingCommit& op) {
-    const int32_t viewTopicId = op.viewRecord.viewTopicId;
-
-    // 1. Apply the durable ViewRecord to the in-memory catalog.
-    viewRegistry_->applyRecord(op.viewRecord);
-    // B10 / D4 fix round 1: the view record is committed -> mark the sink's dir.
-    if (deps_.topicCommitted) deps_.topicCommitted(viewTopicId);
-
-    // 2. Register the view's OUTPUT descriptor in the SchemaRegistry so the view
-    //    is a typed topic (GetTopicSchema / openView handshake).  In-memory only
-    //    here (create-and-run); restart recovery (Task 19b) re-registers it from
-    //    the ViewRecord's compiled plan.  op.partitionCount was resolved on the
-    //    reply (authoritative, or the source's).
-    TopicSchema ts;
-    ts.topicId        = viewTopicId;
-    ts.version        = kInitialSchemaVersion;
-    ts.partitionCount = op.partitionCount;
-    ts.keyField       = op.view.keyField;
-    ts.validate       = false;
-    ts.descriptorBlob = rune::codec::serialize(op.viewOutDesc);
-    ts.nextTag        = static_cast<uint16_t>(op.viewOutDesc.fields.size());
-    // Index the view's typed output topic by the VIEW name (GetTopicSchema /
-    // openView pass it), never by the output descriptor's name.
-    ts.topicName      = op.view.viewName;
-    reg_.applyRecord(ts);
-
-    // 3. Respond OK with the view's topic id + output fingerprint.
-    deps_.respondCreateView(op.view.session, op.view.corr,
-                            viewTopicId, op.outputFingerprint, kOK);
-
-    // 4. Fan the compiled plan out to the workers (installView on each worker's
-    //    OWN thread, via the control thread — never cross-thread here).  The
-    //    durable record's blob IS the serialized plan (M3: one copy).
-    if (deps_.pushViewPlan) {
-        ViewPlanUpdateMsg vp;
-        vp.viewTopicId = viewTopicId;
-        vp.persistence = op.view.persistence;
-        vp.planBlob    = op.viewRecord.compiledPlanBlob;
-        vp.outDescBlob = rune::codec::serialize(op.viewOutDesc);
-        vp.srcDescBlob = rune::codec::serialize(op.viewSrcDesc);
-        deps_.pushViewPlan(vp);
+std::optional<cat::RequestRecord> AdminWorker::recordOfLastApplied_(int64_t offset) const {
+    const CatalogApplier::AppliedAt& la = applier_.lastApplied();
+    if (la.offset != offset) return std::nullopt;
+    const cat::CatalogState& s = applier_.state();
+    cat::RequestRecord r{.offset = la.offset, .kind = la.applied.kind, .objectId = la.applied.objectId,
+                         .newVersion = la.applied.newVersion, .topicId = -1, .schemaVersion = 0,
+                         .requestFingerprint = 0};
+    switch (la.applied.kind) {
+    case cat::EventKind::CreateTopic:
+    case cat::EventKind::CreateView:
+    case cat::EventKind::AlterView:
+        r.topicId = la.applied.createdTopicId;
+        break;
+    case cat::EventKind::DropTopic:
+    case cat::EventKind::DropView:
+        r.topicId = la.applied.droppedTopicId;
+        break;
+    default:
+        if (const cat::TopicObject* t = s.topicByObjectId(la.applied.objectId)) r.topicId = t->topicId;
+        break;
     }
+    if (const cat::TopicObject* t = s.topicByObjectId(la.applied.objectId); t && t->schema)
+        r.schemaVersion = t->schema->schemaVersion;
+    return r;
 }
 
-// ─── rebuildFromLog_ — C: replay [0, HW) into the registry on promotion ──────
-void AdminWorker::rebuildFromLog_() {
-    rebuildFailed_ = false;  // fresh attempt on every Follower→Leader edge
-    if (!replica_) return;
-    const rune::replication::Offset hw = replica_->highWatermark();
-    if (hw <= 0) return;
-
-    static constexpr int32_t kChunk = 64 * 1024 * 1024;
-    // C1 x KL2: every topic this replay applies is a committed catalog entry and
-    // must serve — an in-doubt record (its op answered Internal, never applied
-    // live) becomes servable here, not only at the next restart.  Cold path.
-    std::vector<int32_t> replayed;
-    rune::replication::Offset fetchOffset = 0;
-    while (fetchOffset < hw) {
-        std::vector<uint8_t> data = replica_->read(fetchOffset, kChunk);
-        if (data.empty()) break;
-
-        std::size_t pos = 0;
-        rune::replication::Offset lastBatchEnd = fetchOffset;
-        while (pos < data.size()) {
-            const uint8_t*    bs  = data.data() + pos;
-            const std::size_t rem = data.size() - pos;
-            if (rem < static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead))
-                break;
-            rune::protocol::RecordBatchReader reader(bs, rem);
-            if (!reader.ensureValid()) break;
-            const int32_t tl = reader.totalLength();
-            if (tl <= 0 || static_cast<std::size_t>(tl) > rem) break;
-            const rune::replication::Offset batchBase = reader.baseOffset();
-            reader.forEachRecord([this, batchBase, &replayed](std::string_view /*key*/, std::string_view val,
-                                  int64_t /*offset*/, int64_t /*ts*/) {
-                auto ts = TopicSchema::deserialize(std::span<const uint8_t>(
-                    reinterpret_cast<const uint8_t*>(val.data()), val.size()));
-                if (ts) {
-                    reg_.applyRecord(*ts);
-                    if (ts->topicId >= 0 &&
-                        std::find(replayed.begin(), replayed.end(), ts->topicId) == replayed.end())
-                        replayed.push_back(ts->topicId);
-                    return;
-                }
-                // FAIL LOUD (never a silent skip): SchemaRegistry stores
-                // versions in a per-topic deque indexed by (version-1); a
-                // silently-dropped record here would leave an UNDETECTED gap
-                // and serve wrong/missing schema versions after recovery.
-                rebuildFailed_ = true;
-                spdlog::critical(
-                    "AdminWorker: CORRUPT __topic_schemas record at batch "
-                    "baseOffset={} — TopicSchema::deserialize failed "
-                    "(truncated/corrupt payload). ABORTING rebuildFromLog_ "
-                    "rather than silently skipping it (would leave an "
-                    "undetected schema-version gap).",
-                    batchBase);
-            });
-            if (rebuildFailed_) return;  // abort: no further batches applied
-            const rune::replication::Offset bne =
-                reader.baseOffset() + reader.lastOffsetDelta() + 1;
-            if (bne > lastBatchEnd) lastBatchEnd = bne;
-            pos += static_cast<std::size_t>(tl);
+uint64_t AdminWorker::viewOutputFingerprint_(const cat::RequestRecord& r) const {
+    auto fpOf = [](const std::vector<uint8_t>& blob) -> uint64_t {
+        try {
+            return rune::codec::fingerprint(rune::codec::deserialize(std::span<const uint8_t>(blob.data(), blob.size())));
+        } catch (const std::exception&) {
+            return 0;
         }
-        if (lastBatchEnd <= fetchOffset) break;
-        fetchOffset = lastBatchEnd;
+    };
+    if (const cat::ViewObject* v = applier_.state().viewByObjectId(r.objectId); v && v->version == r.newVersion)
+        return fpOf(v->def.outputDescriptorBlob);
+    // The view changed since (a retry answered after a later DDL): the event at
+    // the record's offset holds the original definition.
+    if (catalogReplica_ == nullptr) return 0;
+    const std::vector<uint8_t> data = catalogReplica_->read(r.offset, rune::replication::kDefaultMaxFetchBytes);
+    uint64_t out = 0;
+    std::size_t pos = 0;
+    while (pos < data.size() && out == 0) {
+        rune::protocol::RecordBatchReader reader(data.data() + pos, data.size() - pos);
+        if (!reader.ensureValid()) break;
+        const auto tl = static_cast<std::size_t>(reader.totalLength());
+        reader.forEachRecord([&](std::string_view, std::string_view val, int64_t off, int64_t) {
+            if (off != r.offset) return;
+            auto ev = cat::decode(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(val.data()), val.size()));
+            if (!ev) return;
+            if (const auto* c = std::get_if<cat::CreateViewOps>(&ev->ops)) out = fpOf(c->view.outputDescriptorBlob);
+            if (const auto* c = std::get_if<cat::AlterViewOps>(&ev->ops)) out = fpOf(c->view.outputDescriptorBlob);
+        });
+        if (tl == 0) break;
+        pos += tl;
     }
-    // kA2cTopicCommitted for each replayed topic (a no-op on the control thread for
-    // one that already serves — boot-built topics, earlier commits).
-    if (deps_.topicCommitted)
-        for (const int32_t id : replayed) deps_.topicCommitted(id);
-    spdlog::info("AdminWorker: rebuilt SchemaRegistry from __topic_schemas log (hw={})", hw);
+    return out;
 }
 
-// ─── recoverViewsOnPromotion_ — rebuild ViewRegistry + fan out recovery ───────
-// The view counterpart of rebuildFromLog_, on the SAME Follower->Leader edge.
-void AdminWorker::recoverViewsOnPromotion_() {
-    viewsRebuildFailed_ = false;   // fresh attempt on every Follower->Leader edge
-    if (!viewsReplica_ || !viewRegistry_) return;
+// ─── answers ────────────────────────────────────────────────────────────────
+void AdminWorker::answer_(const DdlRequest& req, uint16_t code, std::string_view detail, int32_t topicId,
+                          uint16_t version) {
+    ++answered_;
+    respond_(req, code, detail, topicId, version, 0, version, -1, 0);
+}
 
-    // 1. Rebuild the ViewRegistry from the committed __views log [0, HW).
-    //    HW is now > 0 (the views replica was promoted on this same edge, just
-    //    above in onRole), unlike at construction where a fresh Follower is 0.
-    const rune::replication::Offset hw = viewsReplica_->highWatermark();
-    if (hw > 0) {
-        static constexpr int32_t kChunk = 64 * 1024 * 1024;
-        rune::replication::Offset fetchOffset = 0;
-        bool failed = false;
-        while (fetchOffset < hw && !failed) {
-            std::vector<uint8_t> data = viewsReplica_->read(fetchOffset, kChunk);
-            if (data.empty()) break;
-            std::size_t pos = 0;
-            rune::replication::Offset lastBatchEnd = fetchOffset;
-            while (pos < data.size()) {
-                const uint8_t*    bs  = data.data() + pos;
-                const std::size_t rem = data.size() - pos;
-                if (rem < static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead))
-                    break;
-                rune::protocol::RecordBatchReader reader(bs, rem);
-                if (!reader.ensureValid()) break;
-                const int32_t tl = reader.totalLength();
-                if (tl <= 0 || static_cast<std::size_t>(tl) > rem) break;
-                const rune::replication::Offset batchBase = reader.baseOffset();
-                reader.forEachRecord([this, batchBase, &failed](std::string_view /*key*/,
-                                      std::string_view val, int64_t /*off*/, int64_t /*ts*/) {
-                    auto vr = ViewRecord::deserialize(std::span<const uint8_t>(
-                        reinterpret_cast<const uint8_t*>(val.data()), val.size()));
-                    if (vr) { viewRegistry_->applyRecord(*vr); return; }
-                    // FAIL LOUD (mirrors rebuildFromLog_): a corrupt __views record
-                    // would otherwise leave an undetected catalog gap.
-                    failed = true;
-                    spdlog::critical(
-                        "AdminWorker: CORRUPT __views record at batch baseOffset={} — "
-                        "ViewRecord::deserialize failed; ABORTING __views rebuild "
-                        "rather than silently skipping (would leave a view-catalog gap).",
-                        batchBase);
-                });
-                if (failed) break;
-                const rune::replication::Offset bne =
-                    reader.baseOffset() + reader.lastOffsetDelta() + 1;
-                if (bne > lastBatchEnd) lastBatchEnd = bne;
-                pos += static_cast<std::size_t>(tl);
-            }
-            if (lastBatchEnd <= fetchOffset) break;
-            fetchOffset = lastBatchEnd;
+void AdminWorker::answerRejection_(const DdlRequest& req, const DdlRejection& r) {
+    answer_(req, r.code, r.detail, r.topicId, r.version);
+}
+
+void AdminWorker::answerOk_(const DdlRequest& req, const cat::RequestRecord& r) {
+    ++answered_;
+    const bool isView = std::holds_alternative<CreateViewMsg>(req);
+    const int32_t gate = r.kind == cat::EventKind::AlterView ? r.topicId : -1;
+    respond_(req, kOK, {}, r.topicId, r.schemaVersion, r.objectId, r.newVersion, gate,
+             isView ? viewOutputFingerprint_(r) : 0);
+}
+
+void AdminWorker::respond_(const DdlRequest& req, uint16_t code, std::string_view detail, int32_t topicId,
+                           uint16_t version, uint64_t objectId, uint32_t newVersion, int32_t gateTopicId,
+                           uint64_t viewFingerprint) {
+    std::visit([&](const auto& m) {
+        using M = std::decay_t<decltype(m)>;
+        // A detail rides an ErrorResponse for the pre-v8 response types (their
+        // own frames have no detail field) — InvalidRequest only (spec §9).
+        const bool viaError = code == kInvalidRequest && !detail.empty() && deps_.respondError;
+        if constexpr (std::is_same_v<M, DefineTopicMsg>) {
+            if (viaError) deps_.respondError(m.session, m.corr, code, detail);
+            else if (deps_.respondDefine) deps_.respondDefine(m.session, m.corr, topicId, version, code);
+        } else if constexpr (std::is_same_v<M, AlterTopicMsg>) {
+            if (viaError) deps_.respondError(m.session, m.corr, code, detail);
+            else if (deps_.respondAlter) deps_.respondAlter(m.session, m.corr, topicId, version, code);
+        } else if constexpr (std::is_same_v<M, CreateViewMsg>) {
+            if (viaError) deps_.respondError(m.session, m.corr, code, detail);
+            else if (deps_.respondCreateView) deps_.respondCreateView(m.session, m.corr, topicId, viewFingerprint, code);
+        } else {
+            if (deps_.respondDdl) deps_.respondDdl(m.session, m.corr, code, objectId, newVersion, gateTopicId, detail);
         }
-        if (failed) {   // surfaced loudly above; do not fan out a partial catalog
-            viewsRebuildFailed_ = true;   // M2: no DDL is served on a partial view catalog
-            return;
+    }, req);
+}
+
+// ─── event building ─────────────────────────────────────────────────────────
+std::optional<DdlRejection> AdminWorker::staticIdCollision_(int32_t topicId) const {
+    if (topicId < 0 || static_cast<std::size_t>(topicId) >= deps_.staticTopicNames.size()) return std::nullopt;
+    return reject(kInvalidRequest,
+                  "topic id " + std::to_string(topicId) + " is held by the static RUNE_TOPICS topic " +
+                      quotedName(deps_.staticTopicNames[static_cast<std::size_t>(topicId)]) +
+                      " — DDL-created and static topics cannot share a broker (create every topic by DDL)");
+}
+
+AdminWorker::Built AdminWorker::buildEvent_(const DdlRequest& req, const cat::CatalogState& s) const {
+    Built b = std::visit([&](const auto& m) -> Built {
+        using M = std::decay_t<decltype(m)>;
+        if constexpr (std::is_same_v<M, DefineTopicMsg>)      return buildDefine_(m, s);
+        else if constexpr (std::is_same_v<M, AlterTopicMsg>)  return buildAlter_(m, s);
+        else if constexpr (std::is_same_v<M, CreateViewMsg>)  return buildCreateView_(m, s);
+        else if constexpr (std::is_same_v<M, AlterViewMsg>)   return buildAlterView_(m, s);
+        else if constexpr (std::is_same_v<M, DropViewMsg>)    return buildDropView_(m, s);
+        else if constexpr (std::is_same_v<M, DropTopicMsg>)   return buildDropTopic_(m, s);
+        else                                                  return buildAlterConfig_(m, s);
+    }, req);
+    if (!b) return b;
+
+    // The principal, statement and time (spec §4; F22: timestampMs is the
+    // leader's wall clock when the event is built for its append).
+    const DdlMeta& meta = std::visit([](const auto& m) -> const DdlMeta& { return m.meta; }, req);
+    const int64_t session = std::visit([](const auto& m) { return m.session; }, req);
+    b->formatVer                 = cat::kCurrentFormatVer;
+    b->statement                 = meta.statement;
+    b->principal.sessionId       = meta.sessionId != 0 ? meta.sessionId : session;
+    b->principal.clientName      = meta.clientName;
+    b->principal.sourceAddress   = meta.sourceAddress;
+    b->principal.requestId       = meta.requestId;
+    if (meta.hasReplayedFrom)
+        b->replayedFrom = cat::ReplayedFrom{meta.replayedClusterId, meta.replayedOffset, meta.replayedPrincipal};
+    b->timestampMs = wallClockMs();
+    b->kind        = cat::kindOf(b->ops);
+
+    // The gate (binding 1): the SAME frozen rules every broker applies, dry-run on
+    // this state.  The checks above chose the answer's code; anything they did not
+    // anticipate is refused here with the library's own reason.
+    auto preview = cat::previewFingerprint(s, *b);
+    if (!preview) {
+        const std::string& why = preview.error().detail;
+        switch (b->kind) {
+        case cat::EventKind::CreateSchema:
+        case cat::EventKind::AlterSchema:
+        case cat::EventKind::SetCompatibility:
+            return Rejected(reject(kInvalidSchema, why));
+        case cat::EventKind::CreateTopic:
+            if (std::get<cat::CreateTopicOps>(b->ops).schema) return Rejected(reject(kInvalidSchema, why));
+            return Rejected(reject(kInvalidRequest, why));
+        default:
+            return Rejected(reject(kInvalidRequest, why));
+        }
+    }
+    b->fingerprint = *preview;
+    return b;
+}
+
+AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat::CatalogState& s) const {
+    if (m.malformed || !persistenceFromWire(m.persistence)) return Rejected(reject(kInvalidSchema));
+    if (!cat::isValidTopicName(m.name)) return Rejected(reject(kInvalidTopicName));
+    if (m.partitionCount < 1) return Rejected(reject(kInvalidSchema));
+
+    // A non-empty descriptor must be well-formed; nextTag starts past every tag.
+    uint16_t nextTag = 0;
+    if (!m.blob.empty()) {
+        try {
+            const rune::codec::Descriptor d =
+                rune::codec::deserialize(std::span<const uint8_t>(m.blob.data(), m.blob.size()));
+            uint32_t past = static_cast<uint32_t>(d.fields.size());
+            for (const auto& f : d.fields) past = std::max<uint32_t>(past, uint32_t{f.id} + 1);
+            if (past > 0xFFFF) return Rejected(reject(kInvalidSchema));
+            nextTag = static_cast<uint16_t>(past);
+        } catch (...) {
+            return Rejected(reject(kInvalidSchema));
         }
     }
 
-    // 2. For each recovered durable view: re-register its OUTPUT schema in reg_
-    //    (so GetTopicSchema / openView keep working after restart) and fan out a
-    //    RECOVERY install (recovery=true) via the SAME path CreateView uses.
-    int recovered = 0;
-    for (const ViewRecord* rec : viewRegistry_->all()) {
-        if (rec == nullptr) continue;
-
-        auto plan = rune::view::deserializeCompiledViewPlan(
-            std::span<const uint8_t>(rec->compiledPlanBlob.data(), rec->compiledPlanBlob.size()));
-        if (!plan || plan->sourceTopicId.empty()) {
-            spdlog::error("AdminWorker: view '{}' (id={}) skipped on recovery — compiled "
-                          "plan missing/un-deserializable", rec->viewName, rec->viewTopicId);
-            continue;
-        }
-        const int32_t sourceTopicId = plan->sourceTopicId[0];
-        const RegistryEntry* srcEntry = reg_.byId(sourceTopicId);
-        if (srcEntry == nullptr) {
-            spdlog::error("AdminWorker: view '{}' (id={}) skipped on recovery — source topic "
-                          "{} not found in SchemaRegistry", rec->viewName, rec->viewTopicId,
-                          sourceTopicId);
-            continue;
-        }
-
-        // Re-register the view's typed OUTPUT topic from the durable blob (exact
-        // bytes -> exact fingerprint), mirroring commitCreateView_.
-        if (!rec->outputDescriptorBlob.empty() && reg_.byId(rec->viewTopicId) == nullptr) {
-            try {
-                const rune::codec::Descriptor outDesc = rune::codec::deserialize(
-                    std::span<const uint8_t>(rec->outputDescriptorBlob.data(),
-                                             rec->outputDescriptorBlob.size()));
-                TopicSchema ts;
-                ts.topicId        = rec->viewTopicId;
-                ts.version        = kInitialSchemaVersion;
-                ts.partitionCount = srcEntry->partitionCount;
-                ts.validate       = false;
-                ts.descriptorBlob = rec->outputDescriptorBlob;
-                ts.nextTag        = static_cast<uint16_t>(outDesc.fields.size());
-                ts.topicName      = rec->viewName;   // resolve by the view name (as at create)
-                for (const auto& f : outDesc.fields) {
-                    if (f.isKey) { ts.keyField = f.name; break; }
-                }
-                reg_.applyRecord(ts);
-            } catch (const std::exception& ex) {
-                spdlog::error("AdminWorker: view '{}' (id={}) output descriptor failed to "
-                              "re-register on recovery: {}", rec->viewName, rec->viewTopicId,
-                              ex.what());
-                // Continue: the worker still serves rows (fingerprint + layout come
-                // from the plan); only GetTopicSchema is affected.
-            }
-        }
-
-        // C1 x KL2: the view's record is committed — its sink serves (a no-op on the
-        // control thread unless it was in doubt).  Posted before the plan: the same
-        // FIFO ring.
-        if (deps_.topicCommitted) deps_.topicCommitted(rec->viewTopicId);
-
-        // Fan out a RECOVERY install — installViewForRecovery on each worker's own
-        // thread, which loads the checkpoint + rebuilds to the committed tail.
-        if (deps_.pushViewPlan) {
-            ViewPlanUpdateMsg vp;
-            vp.viewTopicId = rec->viewTopicId;
-            vp.persistence = rec->persistence;
-            vp.recovery    = true;
-            vp.planBlob    = rec->compiledPlanBlob;
-            vp.outDescBlob = rec->outputDescriptorBlob;
-            vp.srcDescBlob = rune::codec::serialize(srcEntry->descriptor);
-            deps_.pushViewPlan(vp);
-        }
-        ++recovered;
+    cat::CatalogEvent e;
+    e.objectName = m.name;
+    if (const cat::TopicObject* t = s.topicByName(m.name)) {
+        if (t->schema) return Rejected(reject(kTopicExists, {}, t->topicId, t->schema->schemaVersion));
+        if (m.blob.empty()) return Rejected(reject(kTopicExists, {}, t->topicId, 0));   // untyped, nothing to adopt
+        // Final review I1: an EXPLICIT transient define over an untyped DISK topic
+        // cannot be honoured (the topic keeps its log backend).
+        if (m.persistence == static_cast<uint8_t>(PersistenceMode::Transient) &&
+            t->persistence == cat::Persistence::Disk)
+            return Rejected(reject(kTopicExists, {}, t->topicId, 0));
+        // Schema-less adoption (ruling 3): the untyped topic gains its schema.
+        e.objectId    = t->objectId;
+        e.prevVersion = t->version;
+        e.newVersion  = t->version + 1;
+        e.ops = cat::CreateSchemaOps{cat::SchemaDef{m.keyField, m.validate, m.blob, nextTag}};
+        return e;
     }
-    if (recovered > 0)
-        spdlog::info("AdminWorker: recovered {} durable view(s) on promotion "
-                     "(ViewRegistry rebuild + recovery fanout)", recovered);
+    if (const cat::ViewObject* v = s.viewByName(m.name)) {
+        const RegistryEntry* out = reg_.byId(v->def.viewTopicId);
+        return Rejected(reject(kTopicExists, {}, v->def.viewTopicId, out ? out->version : uint16_t{0}));
+    }
+    if (auto fold = foldCollision(s, m.name)) return Rejected(std::move(*fold));
+
+    // Spec §8: the replication factor is bounded by the brokers and the minIsr.
+    const int32_t rf = m.replicationFactor;
+    if (rf < 0) return Rejected(reject(kInvalidRequest, "replicationFactor " + std::to_string(rf) + " < 0"));
+    if (rf > deps_.brokerCount)
+        return Rejected(reject(kInvalidRequest, "replicationFactor " + std::to_string(rf) + " > broker count " +
+                                                    std::to_string(deps_.brokerCount)));
+    if (rf > 0 && rf < deps_.topicMinIsr)
+        return Rejected(reject(kInvalidRequest, "replicationFactor " + std::to_string(rf) + " < minIsr " +
+                                                    std::to_string(deps_.topicMinIsr)));
+    // THE config rule (one validator, the library's — Task 2).
+    if (auto err = cat::topicConfigError(m.config)) return Rejected(reject(kInvalidRequest, *err));
+    if (auto c = staticIdCollision_(s.nextTopicId())) return Rejected(std::move(*c));
+
+    e.objectId    = s.nextObjectId();
+    e.prevVersion = 0;
+    e.newVersion  = 1;
+    cat::CreateTopicOps op;
+    op.topicId           = s.nextTopicId();
+    op.partitions        = m.partitionCount;
+    op.replicationFactor = m.replicationFactor;
+    op.persistence       = m.persistence == 1 ? cat::Persistence::Transient : cat::Persistence::Disk;
+    op.config            = m.config;
+    if (!m.blob.empty()) op.schema = cat::SchemaDef{m.keyField, m.validate, m.blob, nextTag};
+    e.ops = std::move(op);
+    return e;
+}
+
+AdminWorker::Built AdminWorker::buildAlter_(const AlterTopicMsg& m, const cat::CatalogState& s) const {
+    if (m.malformed) return Rejected(reject(kInvalidSchema));
+    // U1: a view's output is derived from its plan — never altered directly.
+    if (s.viewByName(m.topicName)) return Rejected(reject(kViewNotAlterable));
+    const cat::TopicObject* t = s.topicByName(m.topicName);
+    // F3: an untyped topic has no schema to alter — UnknownTopic, as today.
+    if (t == nullptr || !t->schema) return Rejected(reject(kUnknownTopic));
+    const int32_t  topicId = t->topicId;
+    const uint16_t cur     = t->schema->schemaVersion;
+    // Optimistic CAS on the schema version: a lost update is never possible.
+    if (m.expectedVersion != 0 && m.expectedVersion != cur) return Rejected(reject(kSchemaConflict, {}, topicId, cur));
+    auto ops = rune::codec::decodeAlterOps(std::span<const uint8_t>(m.opsBlob.data(), m.opsBlob.size()));
+    if (!ops || ops->empty()) return Rejected(reject(kInvalidSchema, {}, topicId, cur));
+
+    cat::CatalogEvent e;
+    e.objectName  = t->name;
+    e.objectId    = t->objectId;
+    e.prevVersion = t->version;
+    e.newVersion  = t->version + 1;
+    bool onlySetCompat = true;
+    rune::codec::CompatMode mode = t->schema->compat;
+    for (const auto& op : *ops) {
+        onlySetCompat = onlySetCompat && op.type == rune::codec::AlterOpType::SetCompatibility;
+        if (op.type == rune::codec::AlterOpType::SetCompatibility) mode = op.mode;
+    }
+    if (onlySetCompat) {   // ruling 3: an ALTER of only SET COMPATIBILITY is SetCompatibility
+        e.ops = cat::SetCompatibilityOps{mode};
+        return e;
+    }
+    // The compatibility gate (the engine apply runs): SchemaIncompatible.
+    if (!rune::codec::checkCompatibility(*ops, mode)) return Rejected(reject(kSchemaIncompatible, {}, topicId, cur));
+    // F20: stored resolved to durable tags.
+    auto resolved = cat::resolveAlterOps(*t->schema, std::span<const rune::codec::AlterOp>(ops->data(), ops->size()));
+    if (!resolved) return Rejected(reject(kInvalidSchema, resolved.error(), topicId, cur));
+    e.ops = cat::AlterSchemaOps{std::move(*resolved)};
+    return e;
+}
+
+std::expected<cat::ViewDef, DdlRejection>
+AdminWorker::viewDef_(const std::string& name, const std::string& keyField, uint8_t persistence,
+                      const std::vector<uint8_t>& planBlob, int32_t viewTopicId, const cat::CatalogState& s) const {
+    namespace rv = rune::view;
+    std::optional<rv::ViewPlan> authored =
+        rv::deserializeAuthored(std::span<const uint8_t>(planBlob.data(), planBlob.size()));
+    if (!authored || authored->sources.empty()) return Rejected(reject(kViewFieldUnresolved));
+
+    // Resolve each source against the applied catalog (descriptors from the
+    // registry the applier projects).
+    std::vector<const rune::codec::Descriptor*> srcDescs;
+    std::vector<std::string> sourceNames;
+    srcDescs.reserve(authored->sources.size());
+    for (const auto& src : authored->sources) {
+        // B9 / D3b: a view's output carries no change events — a view over it
+        // would stay silently empty.
+        if (s.viewByViewTopicId(src.topicId) != nullptr) return Rejected(reject(kViewSourceIsView));
+        const cat::TopicObject* t = s.topicByTopicId(src.topicId);
+        const RegistryEntry* e = t != nullptr && t->schema ? reg_.byId(src.topicId) : nullptr;
+        if (e == nullptr) return Rejected(reject(kViewSourceNotFound));
+        // Phase 2b E: a view that reads a transient topic must itself be transient.
+        if (t->persistence == cat::Persistence::Transient && persistence == 0)
+            return Rejected(reject(kViewSourceTransient));
+        srcDescs.push_back(&e->descriptor);
+        sourceNames.push_back(t->name);
+    }
+    auto compiled = rv::compileView(*authored,
+                                    std::span<const rune::codec::Descriptor* const>(srcDescs.data(), srcDescs.size()),
+                                    viewTopicId);
+    if (!compiled) {
+        // CompileError is a message, not an enum: key-related → KeyInvalid, else FieldUnresolved.
+        std::string lc = compiled.error().message;
+        std::transform(lc.begin(), lc.end(), lc.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return Rejected(reject(lc.find("key") != std::string::npos ? kViewKeyInvalid : kViewFieldUnresolved));
+    }
+    // Phase 2a co-partitioning: an aggregate view over a multi-partition source is refused.
+    const cat::TopicObject* first = s.topicByTopicId(authored->sources[0].topicId);
+    if (rv::isAggregateView(compiled->plan) && first->partitions > 1) return Rejected(reject(kViewNotCoPartitioned));
+
+    cat::ViewDef def;
+    def.viewTopicId    = viewTopicId;
+    def.sinkPartitions = first->partitions;   // co-partitioned with its (first) source
+    def.persistence    = persistence == 1 ? cat::Persistence::Transient : cat::Persistence::Disk;
+    def.keyField       = keyField;
+    def.sourceNames    = std::move(sourceNames);
+    // Ruling 11: the fingerprinted plan names its sources by ordinal, never by id.
+    rv::ViewPlan normalized = *authored;
+    for (std::size_t i = 0; i < normalized.sources.size(); ++i) normalized.sources[i].topicId = static_cast<int32_t>(i);
+    def.normalizedPlanBlob   = rv::serializeAuthored(normalized);
+    compiled->plan.viewTopicId = viewTopicId;
+    def.compiledPlanBlob     = rv::serialize(compiled->plan);
+    def.outputDescriptorBlob = rune::codec::serialize(compiled->outputDescriptor);
+    (void)name;
+    return def;
+}
+
+AdminWorker::Built AdminWorker::buildCreateView_(const CreateViewMsg& m, const cat::CatalogState& s) const {
+    if (m.malformed || m.persistence > 1) return Rejected(reject(kInvalidSchema));
+    if (!cat::isValidTopicName(m.viewName)) return Rejected(reject(kInvalidTopicName));
+    if (const cat::ViewObject* v = s.viewByName(m.viewName))
+        return Rejected(reject(kViewExists, {}, v->def.viewTopicId));
+    if (const cat::TopicObject* t = s.topicByName(m.viewName)) return Rejected(reject(kTopicExists, {}, t->topicId));
+    if (auto fold = foldCollision(s, m.viewName)) return Rejected(std::move(*fold));
+    auto def = viewDef_(m.viewName, m.keyField, m.persistence, m.planBlob, s.nextTopicId(), s);
+    if (!def) return Rejected(std::move(def.error()));
+    if (auto c = staticIdCollision_(s.nextTopicId())) return Rejected(std::move(*c));
+    cat::CatalogEvent e;
+    e.objectName  = m.viewName;
+    e.objectId    = s.nextObjectId();
+    e.prevVersion = 0;
+    e.newVersion  = 1;
+    e.ops         = cat::CreateViewOps{std::move(*def)};
+    return e;
+}
+
+AdminWorker::Built AdminWorker::buildAlterView_(const AlterViewMsg& m, const cat::CatalogState& s) const {
+    if (m.malformed || m.persistence > 1) return Rejected(reject(kInvalidSchema));
+    const cat::ViewObject* v = s.viewByName(m.name);
+    if (v == nullptr) return Rejected(reject(kUnknownTopic, "no view named " + quotedName(m.name)));
+    if (m.expectedVersion != 0 && m.expectedVersion != v->version)
+        return Rejected(reject(kSchemaConflict, "view " + quotedName(m.name) + " is at version " + std::to_string(v->version),
+                               v->def.viewTopicId, static_cast<uint16_t>(std::min<uint32_t>(v->version, 0xFFFF))));
+    // Ruling 4: a FRESH sink under the same objectId.
+    auto def = viewDef_(m.name, m.keyField, m.persistence, m.planBlob, s.nextTopicId(), s);
+    if (!def) return Rejected(std::move(def.error()));
+    if (auto c = staticIdCollision_(s.nextTopicId())) return Rejected(std::move(*c));
+    cat::CatalogEvent e;
+    e.objectName  = v->name;
+    e.objectId    = v->objectId;
+    e.prevVersion = v->version;
+    e.newVersion  = v->version + 1;
+    e.ops         = cat::AlterViewOps{std::move(*def)};
+    return e;
+}
+
+AdminWorker::Built AdminWorker::buildDropView_(const DropViewMsg& m, const cat::CatalogState& s) const {
+    if (m.malformed) return Rejected(reject(kInvalidRequest, "the DropView request is malformed"));
+    const cat::ViewObject* v = s.viewByName(m.name);
+    if (v == nullptr) return Rejected(reject(kUnknownTopic, "no view named " + quotedName(m.name)));
+    cat::CatalogEvent e;
+    e.objectName  = v->name;
+    e.objectId    = v->objectId;
+    e.prevVersion = v->version;
+    e.newVersion  = v->version + 1;
+    e.ops         = cat::DropViewOps{v->def.viewTopicId};
+    return e;
+}
+
+AdminWorker::Built AdminWorker::buildDropTopic_(const DropTopicMsg& m, const cat::CatalogState& s) const {
+    if (m.malformed) return Rejected(reject(kInvalidRequest, "the DropTopic request is malformed"));
+    if (s.viewByName(m.name)) return Rejected(reject(kInvalidRequest, quotedName(m.name) + " is a view; use DROP VIEW"));
+    const cat::TopicObject* t = s.topicByName(m.name);
+    if (t == nullptr) return Rejected(reject(kUnknownTopic, "no topic named " + quotedName(m.name)));
+    if (const cat::ViewObject* v = s.viewReading(m.name))
+        return Rejected(reject(kInvalidRequest, "topic " + quotedName(m.name) + " is the source of view " + quotedName(v->name)));
+    cat::CatalogEvent e;
+    e.objectName  = t->name;
+    e.objectId    = t->objectId;
+    e.prevVersion = t->version;
+    e.newVersion  = t->version + 1;
+    e.ops         = cat::DropTopicOps{t->topicId};
+    return e;
+}
+
+AdminWorker::Built AdminWorker::buildAlterConfig_(const AlterTopicConfigMsg& m, const cat::CatalogState& s) const {
+    if (m.malformed) return Rejected(reject(kInvalidRequest, "the AlterTopicConfig request is malformed"));
+    if (s.viewByName(m.name)) return Rejected(reject(kViewNotAlterable));
+    const cat::TopicObject* t = s.topicByName(m.name);
+    if (t == nullptr) return Rejected(reject(kUnknownTopic, "no topic named " + quotedName(m.name)));
+    if (m.expectedVersion != 0 && m.expectedVersion != t->version)
+        return Rejected(reject(kSchemaConflict, "topic " + quotedName(m.name) + " is at version " + std::to_string(t->version),
+                               t->topicId));
+    // Empty / duplicate keys / out-of-range values: the dry run answers with the
+    // library's reason (one validator — the resulting config's topicConfigError).
+    cat::CatalogEvent e;
+    e.objectName  = t->name;
+    e.objectId    = t->objectId;
+    e.prevVersion = t->version;
+    e.newVersion  = t->version + 1;
+    e.ops         = cat::AlterTopicConfigOps{m.changes};
+    return e;
 }
 
 } // namespace rune::node

@@ -199,12 +199,10 @@ using NullSink = rune::consensus::NullSink;   // moved to rune/consensus/NullSin
 // owns the __topic_schemas replica).  Every cross-thread hop is an SPSC ring
 // (Rule #2, Aeron-style):
 //
-//   requestRing_ (gateway/control → admin) : DefineTopic / GetSchema ops.
-//   controlToAdminRing_ (control → admin)   : authoritative topicId back
-//                                             (kMsgCreateTopicReply) and dropped-dir
-//                                             purges (kMsgPurgeDroppedDir, Task 8).
-//   roleRing_    (control → admin)           : Follower/Leader role events.
-//   createReqRing_ (admin → control)         : "create this physical topic".
+//   requestRing_ (gateway/control → admin) : every DDL request + GetSchema.
+//   controlToAdminRing_ (control → admin)   : dropped-dir purges (kMsgPurgeDroppedDir, Task 8).
+//   roleRing_    (control → admin)           : the role events (+ the catalog's AlterIsr answers).
+//   failureRing_ / egressRing_ (admin → control): the applier's effects / DDL answers.
 //
 // The dead unsynchronized linked-list enqueue path (Task 6) is REMOVED.
 // ---------------------------------------------------------------------------
@@ -224,19 +222,21 @@ public:
                   viewsReplica, viewRegistry, catalogReplica, catalogPlane)
         , catalogSchemas_(&reg)
         , requestRing_(kAdminRequestRingBytes)
-        , controlToAdminRing_(kCreateTopicRingBytes)
+        , controlToAdminRing_(kControlToAdminRingBytes)
         , roleRing_(kAdminRoleRingBytes) {}
 
     const char* name() const noexcept override { return "rune-admin"; }
 
     // ── IAdminRequestSink (gateway → admin ring adapter; RULING-2 F) ──────────
     // Called on the gateway/control thread; encodes onto requestRing_ (SPSC).
-    bool submitDefineTopic(int64_t sessionId, int64_t correlationId,
-                           std::string_view name, uint32_t partitionCount,
-                           std::string_view keyField, bool validate,
-                           const uint8_t* descriptorBlob,
-                           uint32_t descriptorLen,
-                           uint8_t persistence) override {
+    // Every view is copied into the ring frame before return.
+    rune::gateway::AdminSubmit submitDefineTopic(int64_t sessionId, int64_t correlationId,
+                                                 std::string_view name, uint32_t partitionCount,
+                                                 std::string_view keyField, bool validate,
+                                                 const uint8_t* descriptorBlob, uint32_t descriptorLen,
+                                                 uint8_t persistence, int16_t replicationFactor,
+                                                 const rune::protocol::TopicConfigView& config,
+                                                 const rune::gateway::DdlMetaView& meta) override {
         DefineTopicMsg m;
         m.session        = sessionId;
         m.corr           = correlationId;
@@ -244,10 +244,12 @@ public:
         m.validate       = validate;
         m.name.assign(name);
         m.keyField.assign(keyField);
-        if (descriptorBlob && descriptorLen)
-            m.blob.assign(descriptorBlob, descriptorBlob + descriptorLen);
-        m.persistence = persistence;
-        return encodeDefineTopic(requestRing_, m);
+        if (descriptorBlob && descriptorLen) m.blob.assign(descriptorBlob, descriptorBlob + descriptorLen);
+        m.persistence       = persistence;
+        m.replicationFactor = replicationFactor;
+        m.config = rune::protocol::convertTopicConfig<rune::protocol::TopicConfig>(config);
+        m.meta   = ownMeta_(meta);
+        return submitDdl_(m);
     }
 
     bool submitGetSchema(int64_t sessionId, int64_t correlationId,
@@ -261,38 +263,89 @@ public:
         return encodeGetSchema(requestRing_, m);
     }
 
-    // Task 14: AlterTopic (templateId 68) — gateway → admin ring hand-off,
-    // same discipline as submitDefineTopic/submitGetSchema above.
-    bool submitAlterTopic(int64_t sessionId, int64_t correlationId,
-                          std::string_view topicName,
-                          uint16_t expectedVersion,
-                          const uint8_t* opsBlob,
-                          uint32_t opsLen) override {
+    rune::gateway::AdminSubmit submitAlterTopic(int64_t sessionId, int64_t correlationId,
+                                                std::string_view topicName, uint16_t expectedVersion,
+                                                const uint8_t* opsBlob, uint32_t opsLen,
+                                                const rune::gateway::DdlMetaView& meta) override {
         AlterTopicMsg m;
         m.session         = sessionId;
         m.corr            = correlationId;
         m.expectedVersion = expectedVersion;
         m.topicName.assign(topicName);
-        if (opsBlob && opsLen)
-            m.opsBlob.assign(opsBlob, opsBlob + opsLen);
-        return encodeAlterTopic(requestRing_, m);
+        if (opsBlob && opsLen) m.opsBlob.assign(opsBlob, opsBlob + opsLen);
+        m.meta = ownMeta_(meta);
+        return submitDdl_(m);
     }
 
-    // Task 19: CreateView (templateId 70) — gateway → admin ring hand-off, same
-    // discipline as the other DDL submits above.
-    bool submitCreateView(int64_t sessionId, int64_t correlationId,
-                          std::string_view viewName, std::string_view keyField,
-                          uint8_t persistence, const uint8_t* planBlob,
-                          uint32_t planLen) override {
+    rune::gateway::AdminSubmit submitCreateView(int64_t sessionId, int64_t correlationId,
+                                                std::string_view viewName, std::string_view keyField,
+                                                uint8_t persistence, const uint8_t* planBlob, uint32_t planLen,
+                                                const rune::gateway::DdlMetaView& meta) override {
         CreateViewMsg m;
         m.session     = sessionId;
         m.corr        = correlationId;
         m.persistence = persistence;
         m.viewName.assign(viewName);
         m.keyField.assign(keyField);
-        if (planBlob && planLen)
-            m.planBlob.assign(planBlob, planBlob + planLen);
-        return encodeCreateView(requestRing_, m);
+        if (planBlob && planLen) m.planBlob.assign(planBlob, planBlob + planLen);
+        m.meta = ownMeta_(meta);
+        return submitDdl_(m);
+    }
+
+    rune::gateway::AdminSubmit submitDropTopic(int64_t sessionId, int64_t correlationId, std::string_view name,
+                                               const rune::gateway::DdlMetaView& meta) override {
+        DropTopicMsg m;
+        m.session = sessionId;
+        m.corr    = correlationId;
+        m.name.assign(name);
+        m.meta = ownMeta_(meta);
+        return submitDdl_(m);
+    }
+
+    rune::gateway::AdminSubmit submitAlterTopicConfig(int64_t sessionId, int64_t correlationId,
+                                                      std::string_view name, uint32_t expectedVersion,
+                                                      std::span<const uint8_t> changes,
+                                                      const rune::gateway::DdlMetaView& meta) override {
+        namespace pc = rune::protocol::client;
+        AlterTopicConfigMsg m;
+        m.session         = sessionId;
+        m.corr            = correlationId;
+        m.expectedVersion = expectedVersion;
+        m.name.assign(name);
+        const uint16_t n = pc::configChangeCount(changes);
+        m.changes.reserve(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            const pc::ConfigChangeWire c = pc::configChangeAt(changes, i);
+            m.changes.push_back(rune::catalog::ConfigChange{static_cast<rune::catalog::ConfigKey>(c.key), c.value});
+        }
+        m.meta = ownMeta_(meta);
+        return submitDdl_(m);
+    }
+
+    rune::gateway::AdminSubmit submitDropView(int64_t sessionId, int64_t correlationId, std::string_view name,
+                                              const rune::gateway::DdlMetaView& meta) override {
+        DropViewMsg m;
+        m.session = sessionId;
+        m.corr    = correlationId;
+        m.name.assign(name);
+        m.meta = ownMeta_(meta);
+        return submitDdl_(m);
+    }
+
+    rune::gateway::AdminSubmit submitAlterView(int64_t sessionId, int64_t correlationId, std::string_view name,
+                                               std::string_view keyField, uint8_t persistence,
+                                               uint32_t expectedVersion, const uint8_t* planBlob, uint32_t planLen,
+                                               const rune::gateway::DdlMetaView& meta) override {
+        AlterViewMsg m;
+        m.session         = sessionId;
+        m.corr            = correlationId;
+        m.persistence     = persistence;
+        m.expectedVersion = expectedVersion;
+        m.name.assign(name);
+        m.keyField.assign(keyField);
+        if (planBlob && planLen) m.planBlob.assign(planBlob, planBlob + planLen);
+        m.meta = ownMeta_(meta);
+        return submitDdl_(m);
     }
 
     int doWork(int64_t nowNs) noexcept override {
@@ -340,8 +393,8 @@ public:
             runOwnerThreadTestTask(reinterpret_cast<void*>(static_cast<std::uintptr_t>(a)), nullptr);
         }, 16);
 
-        // 2. Drain the control → admin ring: create-topic replies, and (catalog
-        //    history Task 8) dropped-dir purges — explicit per-type dispatch.
+        // 2. Drain the control → admin ring: dropped-dir purges (catalog history
+        //    Task 8) — explicit per-type dispatch.
         work += controlToAdminRing_.drain([this](int32_t tid,
                                                  aeron::concurrent::AtomicBuffer& b,
                                                  aeron::util::index_t off,
@@ -352,17 +405,13 @@ public:
                 onPurgeDroppedDir_(std::string_view(reinterpret_cast<const char*>(p), n));
                 return;
             }
-            if (tid == kMsgCreateTopicReply) {
-                worker_.onCreateTopicReply(decodeCreateTopicReply(p, n));
-                return;
-            }
             if (badControlFrames_++ % 1024 == 0)
                 spdlog::error("AdminWorkerAgent: control→admin frame type={} len={} refused (unknown; refused "
                               "so far: {})", tid, n, badControlFrames_);
         }, 16);
         if (!holdDroppedDirPurge_ && !heldPurgeEnds_.empty()) [[unlikely]] work += releaseHeldPurges_();
 
-        // 3. Drain gateway requests (DefineTopic / GetSchema).
+        // 3. Drain gateway requests (every DDL + GetSchema).
         //    Fix round 2: while DDL answers wait in the egress backlog, NO new
         //    request is taken — the request ring fills and the gateway answers
         //    the next DDL Internal (an explicit answer) instead of the backlog
@@ -375,14 +424,20 @@ public:
                                           aeron::util::index_t len) {
             const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
             const auto  n = static_cast<std::size_t>(len);
-            if (tid == kMsgDefineTopic) {
-                worker_.submitDefineTopic(decodeDefineTopic(p, n));
-            } else if (tid == kMsgGetSchema) {
-                worker_.submitGetSchema(decodeGetSchema(p, n));
-            } else if (tid == kMsgAlterTopic) {
-                worker_.submitAlterTopic(decodeAlterTopic(p, n));
-            } else if (tid == kMsgCreateView) {
-                worker_.submitCreateView(decodeCreateView(p, n));
+            switch (tid) {
+            case kMsgDefineTopic:      worker_.submit(decodeDefineTopic(p, n)); break;
+            case kMsgGetSchema:        worker_.submitGetSchema(decodeGetSchema(p, n)); break;
+            case kMsgAlterTopic:       worker_.submit(decodeAlterTopic(p, n)); break;
+            case kMsgCreateView:       worker_.submit(decodeCreateView(p, n)); break;
+            case kMsgDropTopic:        worker_.submit(decodeDropTopic(p, n)); break;
+            case kMsgDropView:         worker_.submit(decodeDropView(p, n)); break;
+            case kMsgAlterView:        worker_.submit(decodeAlterView(p, n)); break;
+            case kMsgAlterTopicConfig: worker_.submit(decodeAlterTopicConfig(p, n)); break;
+            default:
+                if (badRequestFrames_++ % 1024 == 0)
+                    spdlog::error("AdminWorkerAgent: request-ring frame type={} len={} refused (unknown; refused so "
+                                  "far: {})", tid, n, badRequestFrames_);
+                break;
             }
         }, 16);
 
@@ -392,11 +447,6 @@ public:
         // 4b. F3 round 6, item 3: retry SchemaUpdates the admin→control ring
         //     could not take (full) — retry-on-full, never a drop.
         if (!schemaBacklog_.empty()) [[unlikely]] work += flushSchemaBacklog_();
-        // C1: commits before plans — a view plan never overtakes its sink's commit
-        // (the control thread builds the sink's replicas on kA2cTopicCommitted).
-        if (!topicCommittedBacklog_.empty()) [[unlikely]] work += flushTopicCommittedBacklog_();  // B10
-        if (!viewPlanBacklog_.empty() && topicCommittedBacklog_.empty()) [[unlikely]]
-            work += flushViewPlanBacklog_();  // Task 19
         if (!egressBacklog_.empty()) [[unlikely]] work += flushEgressBacklog_();       // no-hang R2 / fix round 2
         // Catalog history Task 7: the CatalogApplier's effects that found the ring full.
         if (!catalogBacklog_.empty()) [[unlikely]] work += flushCatalogBacklog_();
@@ -433,8 +483,7 @@ public:
     /// ([errno:i32][dir]) and kA2cSchemaUpdate ([topicId:i32][version:u16][blob]).
     OneToOneByteRing& failureRing() noexcept { return failureRing_; }
 
-    /// F3 round 6, item 3 — ADMIN thread only (called from deps.pushValidators
-    /// inside AdminWorker::doWork).  The admin thread must NEVER enqueue into a
+    /// F3 round 6, item 3 — ADMIN thread only.  The admin thread must NEVER enqueue into a
     /// worker's SPSC ingress ring (the control thread is its single producer):
     /// post the update on the admin→control ring; the control thread fans it
     /// out (SchemaFanout).  Ring full → admin-owned backlog, retried every
@@ -511,6 +560,40 @@ public:
         egressRing_.commit(idx);
     }
 
+    /// Catalog history Task 9 — ADMIN thread only (deps.respondDdl).  A DdlResponse
+    /// (78) for DropTopic / AlterTopicConfig / DropView / AlterView.  The detail is
+    /// informational: cut to what one frame holds (never a refused answer).
+    void postDdlResponse(int64_t session, int64_t corr, uint16_t code, uint64_t objectId, uint32_t newVersion,
+                         int32_t gateTopicId, std::string_view detail) {
+        namespace pc = rune::protocol::client;
+        pc::DdlResponse r;
+        r.sessionId   = session;
+        r.correlationId = corr;
+        r.errorCode   = code;
+        r.objectId    = objectId;
+        r.newVersion  = newVersion;
+        r.gateTopicId = gateTopicId;
+        const std::size_t fixed = pc::MessageHeader::ENCODED_SIZE + pc::DdlResponse::BODY_FIXED + 2u;
+        r.detail = detail.substr(0, std::min<std::size_t>({detail.size(), 0xFFFFu, maxEgressFrameBytes() - fixed}));
+        const std::size_t n = r.encode(egressStage_.data());
+        [[maybe_unused]] const bool posted = n > 0 && postEgressFrame(session, egressStage_.data(), n);
+        assert(posted && "a clamped DdlResponse always fits one admin egress message");
+    }
+    /// Catalog history Task 9 — ADMIN thread only (deps.respondError).  An
+    /// ErrorResponse (5) carrying a DDL rejection's detail (InvalidRequest).
+    void postErrorResponse(int64_t session, int64_t corr, uint16_t code, std::string_view message) {
+        namespace pc = rune::protocol::client;
+        pc::ErrorResponse r;
+        r.sessionId     = session;
+        r.correlationId = corr;
+        r.code          = static_cast<int16_t>(code);
+        const std::size_t fixed = pc::MessageHeader::ENCODED_SIZE + pc::ErrorResponse::BODY_FIXED + 2u;
+        r.message = message.substr(0, std::min<std::size_t>({message.size(), 0xFFFFu, maxEgressFrameBytes() - fixed}));
+        const std::size_t n = r.encode(egressStage_.data());
+        [[maybe_unused]] const bool posted = postEgressFrame(session, egressStage_.data(), n);
+        assert(posted && "a clamped ErrorResponse always fits one admin egress message");
+    }
+
     /// Admin-thread scratch for an answer encoded off-ring (preallocated to one
     /// ring message; sz <= maxEgressFrameBytes()).
     [[nodiscard]] uint8_t* egressStage(std::size_t /*sz*/) noexcept { return egressStage_.data(); }
@@ -522,49 +605,14 @@ public:
     int flushEgressBacklogForTest() { return flushEgressBacklog_(); }
     int flushSchemaBacklogForTest() { return flushSchemaBacklog_(); }
 
-    /// Task 19 — ADMIN thread only (called from deps.pushViewPlan inside
-    /// AdminWorker::commitCreateView_).  Post a compiled view plan on the
-    /// admin→control ring (kA2cViewPlanUpdate); the control thread fans it out to
-    /// every worker's install ring.  Ring full → admin-owned backlog, retried
-    /// every doWork (FIFO, never dropped).
-    void postViewPlan(const ViewPlanUpdateMsg& vp) {
-        if (viewPlanUpdateWireLen(vp) > static_cast<std::size_t>(failureRing_.maxMsgLength()))
-            [[unlikely]] {
-            spdlog::error("AdminWorkerAgent: ViewPlanUpdate for viewTopicId={} ({} B) exceeds "
-                          "the admin→control ring max message ({} B); view NOT installed",
-                          vp.viewTopicId, viewPlanUpdateWireLen(vp), failureRing_.maxMsgLength());
-            return;
-        }
-        // C1: behind any backlogged commit too — a plan never overtakes its sink's
-        // kA2cTopicCommitted on the ring (the commits flush first, see doWork).
-        if (!viewPlanBacklog_.empty() || !topicCommittedBacklog_.empty() ||
-            !encodeViewPlanUpdate(failureRing_, kA2cViewPlanUpdate, vp))
-            viewPlanBacklog_.push_back(vp);   // keep FIFO order
-    }
-
-    /// B10 / D4 fix round 1 — ADMIN thread only (deps.topicCommitted).  Post
-    /// kA2cTopicCommitted on the admin→control ring; the control thread rewrites
-    /// the topic's dir marker pending -> committed.  Ring full → admin-owned
-    /// backlog, retried every doWork (FIFO, never dropped).
-    void postTopicCommitted(int32_t topicId) {
-        if (!topicCommittedBacklog_.empty() || !encodeTopicCommitted(failureRing_, topicId))
-            topicCommittedBacklog_.push_back(topicId);
-    }
-    [[nodiscard]] std::size_t topicCommittedBacklogForTest() const noexcept {
-        return topicCommittedBacklog_.size();
-    }
-    int flushTopicCommittedBacklogForTest() { return flushTopicCommittedBacklog_(); }
-
     // -----------------------------------------------------------------------
     // Producer-side accessors — the gateway/control thread enqueues here.
     // requestRing_ producer = gateway/control duty-cycle thread.
     // controlToAdminRing_ / roleRing_ producer = control thread.
-    // createReqRing_ consumer = control thread; producer = admin (via deps).
     // -----------------------------------------------------------------------
     OneToOneByteRing& requestRing()   noexcept { return requestRing_; }
     OneToOneByteRing& controlToAdminRing() noexcept { return controlToAdminRing_; }
     OneToOneByteRing& roleRing()      noexcept { return roleRing_;    }
-    OneToOneByteRing& createReqRing() noexcept { return createReqRing_; }
     OneToOneByteRing& egressRing()    noexcept { return egressRing_;   } // admin → control (response frames)
 
     AdminWorker& worker() noexcept { return worker_; }
@@ -623,6 +671,31 @@ public:
     }
 
 private:
+    /// The owning copy of a gateway DdlMetaView (cold: one DDL).
+    static DdlMeta ownMeta_(const rune::gateway::DdlMetaView& v) {
+        DdlMeta m;
+        m.statement.assign(v.statement);
+        m.clientName.assign(v.clientName);
+        m.sourceAddress.assign(v.sourceAddress);
+        m.sessionId       = v.sessionId;
+        m.requestId       = v.requestId;
+        m.hasReplayedFrom = v.hasReplayedFrom;
+        if (v.hasReplayedFrom) {
+            m.replayedClusterId.assign(v.replayedClusterId);
+            m.replayedOffset = v.replayedOffset;
+            m.replayedPrincipal.assign(v.replayedPrincipal);
+        }
+        return m;
+    }
+    /// Encode a DDL on the request ring: TooLarge when it can never fit one ring
+    /// message (an explicit, permanent answer), RingFull on back-pressure.
+    template <class M>
+    rune::gateway::AdminSubmit submitDdl_(const M& m) {
+        const std::size_t len = ddlWireLen(m);
+        if (len == 0 || len > static_cast<std::size_t>(requestRing_.maxMsgLength()))
+            return rune::gateway::AdminSubmit::TooLarge;
+        return encodeDdl(requestRing_, m) ? rune::gateway::AdminSubmit::Accepted : rune::gateway::AdminSubmit::RingFull;
+    }
     [[gnu::cold]] [[gnu::noinline]] void reportBadRoleFrame_(int32_t tid, std::size_t n) noexcept {
         if (badRoleFrames_++ % 1024 == 0)
             spdlog::error("AdminWorkerAgent: role-ring frame type={} len={} refused (malformed or unknown; "
@@ -632,7 +705,7 @@ private:
     AdminWorker      worker_;
     SchemaRegistry*  catalogSchemas_;  // admin-owned (the AdminWorker's registry): validator / view-source descriptors
     OneToOneByteRing requestRing_;     // gateway/control → admin (DefineTopic/GetSchema)
-    OneToOneByteRing controlToAdminRing_;   // control → admin (createTopic reply; Task 8: dropped-dir purges)
+    OneToOneByteRing controlToAdminRing_;   // control → admin (Task 8: dropped-dir purges)
     // Catalog history Task 8 (F23): an admin-thread-owned hold under which purge
     // paths queue (preallocated) instead of being removed; releasing it purges
     // them on the next admin pass.
@@ -675,7 +748,6 @@ private:
                      static_cast<uint64_t>(removed));
     }
     OneToOneByteRing roleRing_;        // control → admin (role events)
-    OneToOneByteRing createReqRing_{kCreateTopicRingBytes}; // admin → control (createTopic req)
     OneToOneByteRing egressRing_{kAdminEgressRingBytes};   // admin → control (response frames: [sessionId:i64][frame])
     // Fix round 5: an admin answer (at most the ring's max message, capacity/8)
     // always fits the gateway spill's staging buffer.
@@ -693,8 +765,7 @@ private:
     uint64_t         badRoleFrames_ = 0;
     bool             storageFailureSignalled_ = false;
     std::vector<SchemaUpdateMsg> schemaBacklog_;   // admin-thread-owned (ring-full retry)
-    std::vector<ViewPlanUpdateMsg> viewPlanBacklog_; // Task 19: admin-owned (ring-full retry)
-    std::vector<int32_t> topicCommittedBacklog_;     // B10 fix round 1: admin-owned (ring-full retry)
+    uint64_t         badRequestFrames_ = 0;        // request-ring frames of an unknown type
     // Fix round 2: preallocated, bounded (was an unbounded vector<vector> with
     // O(n) front erase).  4x the ring: one tick's answers fit by construction.
     static constexpr std::size_t kEgressBacklogBytes = 4u * static_cast<std::size_t>(kAdminEgressRingBytes);
@@ -796,7 +867,7 @@ private:
     }
 
     /// The validator fan-out of a typed topic's CURRENT schema version (the
-    /// materialized descriptor, exactly as deps.pushValidators posts it).
+    /// materialized descriptor of that version).
     void postCatalogValidator_(const rune::catalog::TopicObject& t) {
         if (!t.schema || !t.schema->validate) return;
         const RegistryEntry* e = catalogSchemas_->byIdVersion(t.topicId, t.schema->schemaVersion);
@@ -919,25 +990,6 @@ private:
         return static_cast<int>(sent);
     }
 
-    int flushTopicCommittedBacklog_() {
-        std::size_t sent = 0;
-        while (sent < topicCommittedBacklog_.size() &&
-               encodeTopicCommitted(failureRing_, topicCommittedBacklog_[sent]))
-            ++sent;
-        topicCommittedBacklog_.erase(topicCommittedBacklog_.begin(),
-                                     topicCommittedBacklog_.begin() + static_cast<std::ptrdiff_t>(sent));
-        return static_cast<int>(sent);
-    }
-
-    int flushViewPlanBacklog_() {
-        std::size_t sent = 0;
-        while (sent < viewPlanBacklog_.size() &&
-               encodeViewPlanUpdate(failureRing_, kA2cViewPlanUpdate, viewPlanBacklog_[sent]))
-            ++sent;
-        viewPlanBacklog_.erase(viewPlanBacklog_.begin(),
-                               viewPlanBacklog_.begin() + static_cast<std::ptrdiff_t>(sent));
-        return static_cast<int>(sent);
-    }
 };
 
 // ---------------------------------------------------------------------------
@@ -1021,17 +1073,9 @@ public:
     void skipProvisionerRunnerForTest() noexcept { skipProvisionerRunnerForTest_ = true; }
     /// Test-only: during start(), re-run the SCHEMA log's recovery with this msync errno.
     void setSchemaRecoveryFaultForTest(int err) noexcept { schemaRecoveryFaultForTest_ = err; }
-    /// Test-only (DDL conformance): the control thread answers the FIRST admin
-    /// create-topic request for `name` with a failure.  afterCreate=false fails
-    /// before creating; true creates the topic first (the reply is lost after the
-    /// work — an orphan).  Set before start(); afterwards only the control thread
-    /// reads/writes it (single owner).
-    void setAdminCreateFaultForTest(std::string name, bool afterCreate) {
-        adminCreateFault_ = AdminCreateFaultForTest{std::move(name), afterCreate};
-    }
-    /// Test-only (concern 4): building the replicas of the runtime topic `name`
-    /// fails when its record commits (kA2cTopicCommitted) — the topic never serves,
-    /// so its held DDL OK must be answered Internal (in doubt).  Set before start();
+    /// Test-only (concern 4): building the catalog topic `name` (its applied
+    /// kA2cCatalogTopicApplied effect) fails — the topic never serves, so its held
+    /// DDL OK must be answered Internal (in doubt).  Set before start();
     /// afterwards only the control thread reads it.
     void setCommitReplicaFaultForTest(std::string name) { commitReplicaFault_ = std::move(name); }
 
@@ -1876,13 +1920,10 @@ private:
     CleanerViewChannel*                                   cleanerViewChannel_ = nullptr;   // owned by runtimeAgent_
     void fanoutViewPlan_(ViewPlanUpdateMsg msg);   // control thread
     int  pumpViewFanout_();                        // control thread (every cycle)
-    // Task 19b (restart recovery): a restarted broker's durable view catalog is
-    // recovered on the AdminWorker's Follower->Leader promotion edge
-    // (AdminWorker::recoverViewsOnPromotion_), NOT at buildGateway — a fresh
-    // __views Follower has highWatermark()==0 until promotion, so the catalog is
-    // not replayable earlier.  The AdminWorker rebuilds the ViewRegistry and
-    // fans out a RECOVERY install per view via deps_.pushViewPlan, which reaches
-    // the same fanoutViewPlan_/pumpViewFanout_ path (co-locate + installForRecovery).
+    // Restart recovery (catalog history Task 9): every live view is reinstalled
+    // by the __catalog boot replay (AdminWorker::bootCatalog, the boot sink's
+    // RECOVERY installs), through the same fanoutViewPlan_/pumpViewFanout_ path
+    // (co-locate + installForRecovery).
 
     // Runtime-cycle DDL control plane (direct call; see AdminControlPlane.h).
     friend class AdminControlPlane;
@@ -1893,11 +1934,6 @@ private:
     // Task 8a: last leadership state posted to the admin role ring (control thread).
     bool                                                  adminLastLeader_ = false;
     int32_t                                               adminLastEpoch_  = -1;
-    // Task 14: the static RUNE_TOPICS count, set once on the startup thread before the
-    // recovery append (ids >= it are runtime topics); read by the control thread's
-    // create drain (createTopicForAdmin's firstRuntimeId).  Immutable after start.
-    // Defaults to "never matches" (fail-closed) until start() sets it.
-    int32_t                                               firstRuntimeTopicId_ = std::numeric_limits<int32_t>::max();
     std::unique_ptr<rune::consensus::BackoffIdleStrategy> adminWorkerIdleStrategy_;   // NodeConfig::adminIdleShape
     rune::consensus::MonotonicNanoClock                   adminWorkerClock_;
     std::unique_ptr<rune::consensus::AgentRunner>         adminWorkerRunner_;
@@ -1936,12 +1972,6 @@ private:
     int  recoveryFaultForTest_ = 0;
     bool skipProvisionerRunnerForTest_ = false;
     int  schemaRecoveryFaultForTest_ = 0;
-    // Final review M4: ONE armed test fault (no loose flags) — disarmed when it fires.
-    struct AdminCreateFaultForTest {
-        std::string name;          // the first create request for this name fails
-        bool        afterCreate;   // true: the topic is created first (an orphan)
-    };
-    std::optional<AdminCreateFaultForTest> adminCreateFault_;   // control thread after start()
     std::optional<std::string>             commitReplicaFault_; // control thread after start()
     // C1 / M7: a DefineTopic / CreateView OK leaves only once its topic serves
     // (see DdlAnswerGate.h).  Control-thread-owned; one drain of the admin egress

@@ -108,7 +108,7 @@ TEST(TransientDataPathRegression, FullRingMarkerIsRefusedRetriablyRegression) {
 }
 
 // C1 at the worker: a transient topic whose catalog record has not committed has
-// NO replica on any worker (BrokerNode builds it on kA2cTopicCommitted), so a
+// NO replica on any worker (BrokerNode builds it on kA2cCatalogTopicApplied), so a
 // shard-ingress produce for it is "not owned" — retriable NotLeader, nothing
 // appended anywhere.  Pins that the transient branch (replica->memoryLog())
 // never turns "no replica" into an append.
