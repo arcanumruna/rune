@@ -321,6 +321,8 @@ public:
     [[nodiscard]] std::size_t lateFetchUnsubscribes() const noexcept { return late_.size(); }
     /// Test/observer: batches dropped by the identity / contiguity rules (C1).
     [[nodiscard]] uint64_t droppedRecordBatches() const noexcept { return droppedBatches_; }
+    /// 8-byte notes (lineage / catalog epoch) that reached the group path: ignored.
+    [[nodiscard]] uint64_t notesIgnored() const noexcept { return notesIgnored_; }
 
     /// fix1 C1: onAssigned/onRevoked/onRecords run inside the noexcept
     /// ClientAgent::doWork chain (or, for closeAll's final onRevoked, inside
@@ -374,6 +376,7 @@ private:
     int64_t     nextFetchCorr_ = 1;
     bool        metadataWanted_ = false;
     uint64_t    droppedBatches_ = 0;
+    uint64_t    notesIgnored_   = 0;
     struct LateSub {  // a Subscribe dropped before its answer
         int64_t        corrId;
         uint32_t       session;

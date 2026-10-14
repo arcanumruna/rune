@@ -2511,3 +2511,117 @@ TEST_F(GroupConsumerHubTest, SessionEventResendsOnlyThatSessionsUnansweredRegres
     EXPECT_EQ(fr.subscribes(1).size(), 1u) << "session 1's in-flight Subscribe was abandoned";
     EXPECT_EQ(fr.subscribes(2).size(), 2u) << "session 2's unanswered Subscribe is re-sent";
 }
+
+// ---------------------------------------------------------------------------
+// Task 13 fix round 2 (M1-r1, the whole class): a Records frame may carry SEVERAL
+// whole batches (DataMessages.h).  RecordsView spans the whole frame and
+// forEachRecord walks every batch (never a control batch), so a member delivers
+// every record once and moves its position to the frame's end.  RED (before):
+// only the first batch was decoded — its end became the position and the next
+// frame's higher base looked like a legitimate hole: records silently lost.
+// ---------------------------------------------------------------------------
+namespace {
+std::vector<uint8_t> batchAt(int64_t base, int32_t n, bool control = false) {
+    rune::protocol::RecordBatchBuilder b(base, 0LL);
+    if (control) b.setControl(true);
+    for (int32_t i = 0; i < n; ++i) b.append("", "v", 0LL);
+    return b.build();
+}
+/// One Records frame of the given whole batches back to back.
+std::vector<uint8_t> framesOf(std::initializer_list<std::vector<uint8_t>> batches, int64_t base) {
+    std::vector<uint8_t> all;
+    for (const auto& b : batches) all.insert(all.end(), b.begin(), b.end());
+    rune::protocol::client::Records msg;
+    msg.sessionId   = kSessionId;
+    msg.topicId     = kTopicId;
+    msg.partition   = kPartition;
+    msg.baseOffset  = base;
+    msg.recordBatch = std::span<const uint8_t>(all.data(), all.size());
+    std::vector<uint8_t> buf(msg.encodedSize());
+    msg.encode(buf.data());
+    return buf;
+}
+}   // namespace
+
+TEST_F(GroupConsumerHubTest, AMultiBatchFrameDeliversEveryBatchAndMovesToItsEndRegression) {
+    std::vector<int64_t> seen;
+    impl_->cbRecords = [&](const RecordSet& rs) {
+        rs.forEachRecord([&](std::string_view, std::string_view, int64_t off, int64_t) { seen.push_back(off); });
+    };
+    bringToStable(*hub_, sink_, kTopicId, kPartition);
+    seedPosition(*hub_, 10);
+    const auto frame = framesOf({batchAt(10, 3), batchAt(13, 2), batchAt(15, 1)}, 10);
+    auto rv = codec::decodeRecords(frame.data(), frame.size());
+    ASSERT_TRUE(rv.has_value());
+    EXPECT_EQ(rv->recordCount, 6);
+    EXPECT_EQ(rv->nextOffset(), 16) << "the frame spans to its last batch";
+    hub_->onRecords(*rv);
+    EXPECT_EQ(seen, (std::vector<int64_t>{10, 11, 12, 13, 14, 15}));
+    EXPECT_EQ(impl_->assignment.at(TopicPartition{kTopicId, kPartition}), 16);
+}
+
+TEST_F(GroupConsumerHubTest, AMultiBatchFrameStraddlingThePositionDeliversOnlyNewRecordsRegression) {
+    std::vector<int64_t> seen;
+    impl_->cbRecords = [&](const RecordSet& rs) {
+        rs.forEachRecord([&](std::string_view, std::string_view, int64_t off, int64_t) { seen.push_back(off); });
+    };
+    bringToStable(*hub_, sink_, kTopicId, kPartition);
+    seedPosition(*hub_, 12);   // a resume floor inside the first batch
+    const auto frame = framesOf({batchAt(10, 3), batchAt(13, 2)}, 10);
+    auto rv = codec::decodeRecords(frame.data(), frame.size());
+    ASSERT_TRUE(rv.has_value());
+    hub_->onRecords(*rv);
+    EXPECT_EQ(seen, (std::vector<int64_t>{12, 13, 14})) << "deliverFrom holds across batches";
+    EXPECT_EQ(impl_->assignment.at(TopicPartition{kTopicId, kPartition}), 15);
+    // A frame wholly below the position is a duplicate: dropped, the position kept.
+    seen.clear();
+    const auto old = framesOf({batchAt(10, 2), batchAt(12, 3)}, 10);
+    auto rv2 = codec::decodeRecords(old.data(), old.size());
+    hub_->onRecords(*rv2);
+    EXPECT_TRUE(seen.empty());
+    EXPECT_EQ(impl_->assignment.at(TopicPartition{kTopicId, kPartition}), 15);
+}
+
+TEST_F(GroupConsumerHubTest, AControlBatchInAFrameIsConsumedNeverDeliveredRegression) {
+    std::vector<int64_t> seen;
+    impl_->cbRecords = [&](const RecordSet& rs) {
+        rs.forEachRecord([&](std::string_view, std::string_view, int64_t off, int64_t) { seen.push_back(off); });
+    };
+    bringToStable(*hub_, sink_, kTopicId, kPartition);
+    seedPosition(*hub_, 10);
+    const auto frame = framesOf({batchAt(10, 2), batchAt(12, 1, /*control=*/true), batchAt(13, 2)}, 10);
+    auto rv = codec::decodeRecords(frame.data(), frame.size());
+    hub_->onRecords(*rv);
+    EXPECT_EQ(seen, (std::vector<int64_t>{10, 11, 13, 14})) << "the transaction marker at 12 is never a record";
+    EXPECT_EQ(impl_->assignment.at(TopicPartition{kTopicId, kPartition}), 15);
+    seen.clear();
+    const auto onlyMarker = framesOf({batchAt(15, 1, /*control=*/true)}, 15);
+    auto rv2 = codec::decodeRecords(onlyMarker.data(), onlyMarker.size());
+    hub_->onRecords(*rv2);
+    EXPECT_TRUE(seen.empty());
+    EXPECT_EQ(impl_->assignment.at(TopicPartition{kTopicId, kPartition}), 16) << "its offset is consumed";
+}
+
+// An 8-byte note (the transient lineage note / a catalog epoch frame) is never a
+// batch: it must not move a member's position (it did: as a one-record stub).
+TEST_F(GroupConsumerHubTest, AnEightByteNoteNeverMovesAMembersPositionRegression) {
+    int calls = 0;
+    impl_->cbRecords = [&](const RecordSet&) { ++calls; };
+    bringToStable(*hub_, sink_, kTopicId, kPartition);
+    seedPosition(*hub_, 10);
+    const std::vector<uint8_t> token{1, 2, 3, 4, 5, 6, 7, 8};
+    rune::protocol::client::Records msg;
+    msg.sessionId   = kSessionId;
+    msg.topicId     = kTopicId;
+    msg.partition   = kPartition;
+    msg.baseOffset  = 10;   // even at the position
+    msg.recordBatch = std::span<const uint8_t>(token.data(), token.size());
+    std::vector<uint8_t> buf(msg.encodedSize());
+    msg.encode(buf.data());
+    auto rv = codec::decodeRecords(buf.data(), buf.size());
+    ASSERT_TRUE(rv.has_value());
+    hub_->onRecords(*rv);
+    EXPECT_EQ(calls, 0);
+    EXPECT_EQ(impl_->assignment.at(TopicPartition{kTopicId, kPartition}), 10);
+    EXPECT_EQ(hub_->notesIgnored(), 1u);
+}

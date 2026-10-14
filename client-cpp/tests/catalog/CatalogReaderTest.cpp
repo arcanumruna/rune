@@ -1,8 +1,9 @@
 // Catalog history (Task 13): the client's CatalogReader — Subscribe(-6) from the
-// cache end, one record per Records frame, the caught-up marker, the verifying
-// replay with the shared library, the bounded marker wait (Task 12 F1), and the
-// cached prefix re-validated after a truncation ended the reads (Task 12: the
-// retriable NotLeader on the Subscribe correlation id).
+// cache end, the stream's history-epoch note, one record per Records frame, the
+// caught-up marker (with the epoch), the verifying replay with the shared
+// library, the bounded marker wait (Task 12 F1), and the cache (prefix, epoch):
+// continued only under an unchanged epoch, else dropped and re-read from 0 (fix
+// round 2 — a truncation below a served HW changes the broker's epoch).
 // Non-blocking on the single-threaded fake (F7): the test thread drives
 // client.doWork() + gw.pump() and the reader's beginRefresh / pollRefresh; the
 // blocking catalogHistory / catalogAsOf / catalogDiff run against a real
@@ -18,7 +19,9 @@
 #include <rune/protocol/client/Protocol.h>
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -65,11 +68,13 @@ struct Rig {   // Task 5's Rig: client + fake on the client's embedded driver
 };
 
 /// Serves `__catalog` like a broker's CatalogReadServer: a Subscribe on topic −6
-/// is answered SubscribeResponse{OK}, then every event from the requested offset —
-/// one record per Records frame — then the empty-payload caught-up marker at the
-/// end.  Records each fromOffset; can withhold the marker, end the reads with the
-/// retriable NotLeader (a truncation below a served HW), refuse, or lose the
-/// session after N records.
+/// is answered SubscribeResponse{OK}, then the stream's history-epoch note
+/// (Records{-1, epoch}), then every event from the requested offset — one record
+/// per Records frame — then the caught-up marker (Records{HW, epoch}).  Records
+/// each fromOffset; can withhold the marker, end the reads with the retriable
+/// NotLeader (a truncation below a served HW), refuse, or lose the session after
+/// N records.  replaceHistory() is a truncation below a served HW: it changes the
+/// epoch (what CatalogReadServer does).
 class CatalogFeed {
 public:
     CatalogFeed(test_support::InvokerGateway& gw, std::vector<rcat::CatalogEvent> log) : gw_(gw), log_(std::move(log)) {
@@ -80,8 +85,24 @@ public:
     void append(std::vector<rcat::CatalogEvent> more) {
         for (auto& e : more) log_.push_back(std::move(e));
     }
-    /// The committed history changed under the cache (an unclean leader upstream).
-    void replaceHistory(std::vector<rcat::CatalogEvent> log) { log_ = std::move(log); }
+    /// The committed history changed under the cache (an unclean leader upstream):
+    /// the broker's history epoch changes with it.
+    void replaceHistory(std::vector<rcat::CatalogEvent> log) { log_ = std::move(log); ++epoch_; }
+    /// Fix round 2: the epoch changes with no visible byte change (an identical-bytes regrow).
+    void bumpEpoch() { ++epoch_; }
+    /// Fix round 2: another broker (its own epoch) serves the same log.
+    void setEpoch(uint64_t e) { epoch_ = e; }
+    [[nodiscard]] uint64_t epoch() const noexcept { return epoch_; }
+    /// Fix round 2: the history is replaced (epoch changed) right before the `k`-th
+    /// Subscribe (0-based, counted over the whole feed) is served.
+    void replaceHistoryAtSubscribe(std::size_t k, std::vector<rcat::CatalogEvent> log) {
+        replaceAt_ = k;
+        replaceWith_ = std::move(log);
+    }
+    /// Fix round 2: the next Subscribe's marker names this epoch (a lying broker).
+    void overrideNextMarkerEpoch(uint64_t e) { markerEpochOverride_ = e; }
+    /// Fix round 2: no epoch note (a broker older than the epoch).
+    void omitNotes(bool on = true) { noNote_ = on; }
     void suppressCaughtUpMarker(bool on = true) { noMarker_ = on; }
     /// The next Subscribe is bound, then ended NotLeader (Task 12's truncation end).
     void endReadsOnNextSubscribe() { endNext_ = true; }
@@ -120,6 +141,10 @@ private:
         ASSERT_EQ(sv->topicId, pc::kCatalogTopicId);
         ASSERT_EQ(sv->partition, 0);
         ASSERT_EQ(sv->partitionKnown, 1);
+        if (replaceAt_ && *replaceAt_ == froms_.size()) {
+            replaceAt_.reset();
+            replaceHistory(std::move(replaceWith_));
+        }
         froms_.push_back(sv->fromOffset);
         const int64_t sid = sv->sessionId, corr = sv->correlationId;
         uint8_t out[64];
@@ -136,6 +161,7 @@ private:
             gw_.sendError(ep, static_cast<int16_t>(pc::ErrorCode::NotLeader), "", sid, corr);
             return;
         }
+        if (!noNote_) pushEpochFrame(ep, subId, sid, corr, -1, epoch_);   // every stream opens with it
         const int64_t from = sv->fromOffset < 0 ? 0 : std::min<int64_t>(sv->fromOffset, std::ssize(log_));
         if (coalesce_ && from < std::ssize(log_) && !loseAfter_ && !stallAfter_) {
             std::vector<uint8_t> frame;
@@ -201,10 +227,17 @@ private:
         gw_.send(ep, out.data(), n);
     }
     void pushMarker(int ep, int64_t subId, int64_t sid, int64_t corr, int64_t hw) {
+        const uint64_t e = markerEpochOverride_.value_or(epoch_);
+        markerEpochOverride_.reset();
+        pushEpochFrame(ep, subId, sid, corr, hw, e);
+    }
+    void pushEpochFrame(int ep, int64_t subId, int64_t sid, int64_t corr, int64_t base, uint64_t e) {
         namespace rcc = rune::client::codec;
+        uint8_t epochBytes[8];
+        for (int i = 0; i < 8; ++i) epochBytes[i] = static_cast<uint8_t>(e >> (8 * i));
         uint8_t out[256];
-        const std::size_t n = rcc::encodeRecords(out, sizeof out, subId, pc::kCatalogTopicId, 0, hw,
-                                                 std::span<const uint8_t>(), sid, corr);
+        const std::size_t n = rcc::encodeRecords(out, sizeof out, subId, pc::kCatalogTopicId, 0, base,
+                                                 std::span<const uint8_t>(epochBytes, 8), sid, corr);
         ASSERT_GT(n, 0u);
         gw_.send(ep, out, n);
     }
@@ -225,6 +258,11 @@ private:
     std::optional<std::size_t>      loseAfter_;
     std::optional<std::size_t>      stallAfter_;
     int64_t                         nextSubId_ = (int64_t{1} << 62) | 1;
+    uint64_t                        epoch_ = 0x5eed0000'00000001ULL;
+    std::optional<uint64_t>         markerEpochOverride_;
+    std::optional<std::size_t>      replaceAt_;
+    std::vector<rcat::CatalogEvent> replaceWith_;
+    bool                            noNote_ = false;
 };
 
 /// Drive one non-blocking refresh to completion (or the 10 s hang guard).
@@ -271,6 +309,7 @@ void expectCacheIs(const rc::CatalogReader& reader, const std::vector<rcat::Cata
 }
 } // namespace
 
+
 // ---- The brief's four (golden log: 23 events, offsets 0..22) ------------------------
 
 TEST(CatalogReaderRegression, RefreshReplaysEveryEventAndStopsAtTheMarker) {
@@ -287,6 +326,7 @@ TEST(CatalogReaderRegression, RefreshReplaysEveryEventAndStopsAtTheMarker) {
     EXPECT_EQ(reader.state().digest(), lib.state().digest()) << "the reader replays with the shared library";
     EXPECT_EQ(reader.state().digest(), libraryDigest(golden));
     EXPECT_EQ(feed.subscribeFromOffsets(), (std::vector<int64_t>{0}));
+    EXPECT_EQ(reader.historyEpoch(), feed.epoch()) << "the cache is (prefix, the broker's epoch)";
 }
 
 TEST(CatalogReaderRegression, SecondRefreshFetchesOnlyTheNewTail) {
@@ -297,10 +337,10 @@ TEST(CatalogReaderRegression, SecondRefreshFetchesOnlyTheNewTail) {
     ASSERT_TRUE(refreshOnce(r, reader, 5'000'000'000).value().has_value());
     feed.append({log.begin() + 10, log.end()});
     ASSERT_TRUE(refreshOnce(r, reader, 5'000'000'000).value().has_value());
-    EXPECT_EQ(feed.subscribeFromOffsets(), (std::vector<int64_t>{0, 9}))
-        << "the replayed prefix is cached; the one-event overlap at the cache end is verified";
-    EXPECT_EQ(reader.events().size(), log.size());
+    EXPECT_EQ(feed.subscribeFromOffsets(), (std::vector<int64_t>{0, 10}))
+        << "the replayed prefix is cached: the epoch is unchanged, so the read continues at the cache end";
     expectCacheIs(reader, log);
+    EXPECT_EQ(reader.stats().epochChanges, 0u);
 }
 
 TEST(CatalogReaderRegression, TamperedEventIsAReplayErrorNamingItsOffset) {
@@ -322,7 +362,7 @@ TEST(CatalogReaderRegression, TamperedEventIsAReplayErrorNamingItsOffset) {
     ASSERT_TRUE(again.has_value());
     ASSERT_FALSE(again->has_value());
     EXPECT_EQ(again->error().offset, 4);
-    EXPECT_EQ(feed.subscribeFromOffsets(), (std::vector<int64_t>{0, 3}));
+    EXPECT_EQ(feed.subscribeFromOffsets(), (std::vector<int64_t>{0, 4}));
     EXPECT_EQ(reader.events().size(), 4u);
 }
 
@@ -342,9 +382,9 @@ TEST(CatalogReaderRegression, NoCaughtUpMarkerIsATimeoutNotAHang) {
     EXPECT_TRUE(next->has_value()) << next->error().detail;
 }
 
-// ---- Binding 2: a truncation ended the reads — the cached prefix is re-validated ----
+// ---- A truncation below a served HW: the broker's epoch changes -------------------
 
-TEST(CatalogReaderRegression, TruncationEndOfReadsRevalidatesTheCacheAndDropsTheDivergedTailRegression) {
+TEST(CatalogReaderRegression, TruncationEndOfReadsRereadsUnderTheNewEpochAndServesOnlyTheNewHistoryRegression) {
     Rig r(invokerCfg(3988, 3989)); r.connect();
     const auto a = topicsScript(10);
     const auto b = topicsScript(10, /*divergeFrom=*/6);   // equal 0..5, different 6..9
@@ -360,12 +400,12 @@ TEST(CatalogReaderRegression, TruncationEndOfReadsRevalidatesTheCacheAndDropsThe
     auto done = refreshOnce(r, reader, 5'000'000'000);
     ASSERT_TRUE(done.has_value());
     ASSERT_TRUE(done->has_value()) << done->error().detail;
-    EXPECT_EQ(feed.subscribeFromOffsets(), (std::vector<int64_t>{0, 9, 0}))
-        << "the reads ended: re-read from 0, never resumed from the cache end";
+    EXPECT_EQ(feed.subscribeFromOffsets(), (std::vector<int64_t>{0, 10, 10, 0}))
+        << "ended: resubscribed at the cache end, whose note named a new epoch — dropped and re-read from 0";
     expectCacheIs(reader, b);   // never a stale event served
     EXPECT_EQ(reader.stats().readsEnded, 1u);
-    EXPECT_EQ(reader.stats().prefixDivergences, 1u);
-    EXPECT_FALSE(reader.needsRevalidation());
+    EXPECT_EQ(reader.stats().epochChanges, 1u);
+    EXPECT_EQ(reader.historyEpoch(), feed.epoch());
 }
 
 TEST(CatalogReaderRegression, TruncationToAShorterHistoryDropsTheTailNoLongerCommittedRegression) {
@@ -384,7 +424,8 @@ TEST(CatalogReaderRegression, TruncationToAShorterHistoryDropsTheTailNoLongerCom
     EXPECT_EQ(reader.nextOffset(), 6);
 }
 
-TEST(CatalogReaderRegression, TruncationWithAnEqualPrefixKeepsTheCacheAndReadsOnlyNewEventsRegression) {
+// An equal prefix under a new epoch is still re-read: the epoch, not the bytes, vouches.
+TEST(CatalogReaderRegression, TruncationWithAnEqualPrefixStillRereadsUnderTheNewEpochRegression) {
     Rig r(invokerCfg(3992, 3993)); r.connect();
     const auto all = topicsScript(12);
     CatalogFeed feed(r.gw, {all.begin(), all.begin() + 10});
@@ -394,28 +435,32 @@ TEST(CatalogReaderRegression, TruncationWithAnEqualPrefixKeepsTheCacheAndReadsOn
     feed.endReadsOnNextSubscribe();
     ASSERT_TRUE(refreshOnce(r, reader, 5'000'000'000).value().has_value());
     expectCacheIs(reader, all);
-    EXPECT_EQ(reader.stats().revalidations, 1u);
-    EXPECT_EQ(reader.stats().prefixDivergences, 0u) << "every cached event re-validated equal";
+    EXPECT_EQ(reader.stats().epochChanges, 1u);
+    EXPECT_EQ(feed.subscribeFromOffsets(), (std::vector<int64_t>{0, 10, 10, 0}));
 }
 
-TEST(CatalogReaderRegression, RevalidationCutShortByTheDeadlineIsRevalidatedNextTimeRegression) {
+// A re-read cut short by the deadline keeps what it read under the NEW epoch: the
+// next refresh continues it (same epoch), never from 0 again, never stale.
+TEST(CatalogReaderRegression, AReReadCutShortByTheDeadlineContinuesUnderItsEpochRegression) {
     Rig r(invokerCfg(3994, 3995)); r.connect();
     const auto a = topicsScript(8);
+    const auto b = topicsScript(8, /*divergeFrom=*/2);
     CatalogFeed feed(r.gw, a);
     rc::CatalogReader reader(r.client);
     ASSERT_TRUE(refreshOnce(r, reader, 5'000'000'000).value().has_value());
+    feed.replaceHistory(b);
     feed.endReadsOnNextSubscribe();
     feed.stallAfter(3);   // the re-read stops mid-prefix: the marker is withheld (no catalog leader)
     auto cut = refreshOnce(r, reader, 500'000'000);
     ASSERT_TRUE(cut.has_value());
     ASSERT_FALSE(cut->has_value());
     EXPECT_EQ(cut->error().kind, rc::CatalogReadError::Kind::Timeout);
-    EXPECT_TRUE(reader.needsRevalidation()) << "an unfinished re-validation is never taken as done";
+    EXPECT_EQ(reader.events().size(), 3u) << "only what was read under the new epoch";
+    EXPECT_EQ(reader.historyEpoch(), feed.epoch());
     ASSERT_TRUE(refreshOnce(r, reader, 5'000'000'000).value().has_value());
-    EXPECT_EQ(feed.subscribeFromOffsets(), (std::vector<int64_t>{0, 7, 0, 3}))
-        << "the next refresh resumes the re-validation at the last VERIFIED offset (3), never from 0 or the cache end";
-    EXPECT_FALSE(reader.needsRevalidation());
-    expectCacheIs(reader, a);
+    EXPECT_EQ(feed.subscribeFromOffsets(), (std::vector<int64_t>{0, 8, 8, 0, 3}))
+        << "the next refresh continues at the cache end (3): the epoch is unchanged";
+    expectCacheIs(reader, b);
 }
 
 // ---- Every other way a read can end: explicit, never a hang -------------------------
@@ -442,7 +487,7 @@ TEST(CatalogReaderRegression, LostSessionMidReadResubscribesFromTheCacheEnd) {
     ASSERT_TRUE(done.has_value());
     ASSERT_TRUE(done->has_value()) << done->error().detail;
     ASSERT_EQ(feed.subscribeFromOffsets().size(), 2u);
-    EXPECT_EQ(feed.subscribeFromOffsets()[1], 4) << "resumed from the replayed prefix's last event (overlap verified)";
+    EXPECT_EQ(feed.subscribeFromOffsets()[1], 5) << "resumed at the cache end: the epoch is unchanged";
     EXPECT_GE(reader.stats().resubscribes, 1u);
     expectCacheIs(reader, log);
 }
@@ -470,6 +515,9 @@ TEST(CatalogReaderRegression, AFullRingResubscribesFromTheCacheEndAndLosesNothin
     ASSERT_TRUE(done->has_value()) << done->error().detail;
     EXPECT_GT(reader.stats().ringOverflows, 0u) << "the ring really was full";
     expectCacheIs(reader, log);   // every event once, in order
+    const auto& froms = feed.subscribeFromOffsets();
+    for (std::size_t i = 1; i < froms.size(); ++i)
+        EXPECT_GT(froms[i], froms[i - 1]) << "every continuation progresses (" << i << ")";
 }
 
 TEST(CatalogReaderRegression, AClosedClientEndsTheRefreshClosed) {
@@ -520,11 +568,12 @@ TEST(CatalogReaderRegression, BlockingRefreshOffTheInvokerOwnerThreadIsRefused) 
     EXPECT_TRUE(done->has_value()) << (done->has_value() ? "" : done->error().detail);
 }
 
-// ---- Fix round 1 -------------------------------------------------------------------------
+// ---- Fix round 1 (C1), under the epoch -----------------------------------------------
 
-// C1: the reader holds no subscription between refreshes, so a truncation that regrew
-// past the cache end is invisible to a tail-only read.  Every refresh re-reads the
-// cache's last event and verifies it.
+// REQUIRED (fix round 2): a truncation between two refreshes that regrew past the
+// cache.  The reader holds no subscription between refreshes; the next stream's
+// epoch note tells the history changed.  RED (the epoch ignored): u10, u11 were
+// appended onto the stale t0..t9 and served.
 TEST(CatalogReaderRegression, ATruncationBetweenRefreshesThatRegrewPastTheCacheIsNeverServedStaleRegression) {
     Rig r(invokerCfg(4012, 4013)); r.connect();
     const auto a = topicsScript(10);
@@ -536,10 +585,10 @@ TEST(CatalogReaderRegression, ATruncationBetweenRefreshesThatRegrewPastTheCacheI
     auto done = refreshOnce(r, reader, 5'000'000'000);
     ASSERT_TRUE(done.has_value());
     ASSERT_TRUE(done->has_value()) << done->error().detail;
-    EXPECT_EQ(feed.subscribeFromOffsets(), (std::vector<int64_t>{0, 9, 0}))
-        << "overlap at the cache end mismatched: the cache is dropped and the catalog re-read from 0";
+    EXPECT_EQ(feed.subscribeFromOffsets(), (std::vector<int64_t>{0, 10, 0}))
+        << "the stream at the cache end named a new epoch: the cache is dropped and the catalog re-read from 0";
     expectCacheIs(reader, b);
-    EXPECT_EQ(reader.stats().prefixDivergences, 1u);
+    EXPECT_EQ(reader.stats().epochChanges, 1u);
 }
 
 TEST(CatalogReaderRegression, ATruncationBetweenRefreshesThatShrankBelowTheCacheIsNeverServedStaleRegression) {
@@ -553,71 +602,149 @@ TEST(CatalogReaderRegression, ATruncationBetweenRefreshesThatShrankBelowTheCache
     auto done = refreshOnce(r, reader, 5'000'000'000);
     ASSERT_TRUE(done.has_value());
     ASSERT_TRUE(done->has_value()) << done->error().detail;
-    EXPECT_EQ(feed.subscribeFromOffsets(), (std::vector<int64_t>{0, 9, 0}))
-        << "a marker below the cache end proves nothing about the cached prefix: re-read from 0";
+    EXPECT_EQ(feed.subscribeFromOffsets(), (std::vector<int64_t>{0, 10, 0}));
     expectCacheIs(reader, b);
 }
 
-TEST(CatalogReaderRegression, AnUnchangedHistoryCostsOneOverlapEventAndKeepsTheCacheRegression) {
+TEST(CatalogReaderRegression, AnUnchangedEpochContinuesAtTheCacheEndRegression) {
     Rig r(invokerCfg(4016, 4017)); r.connect();
     const auto a = topicsScript(10);
     CatalogFeed feed(r.gw, a);
     rc::CatalogReader reader(r.client);
     ASSERT_TRUE(refreshOnce(r, reader, 5'000'000'000).value().has_value());
     ASSERT_TRUE(refreshOnce(r, reader, 5'000'000'000).value().has_value());
-    EXPECT_EQ(feed.subscribeFromOffsets(), (std::vector<int64_t>{0, 9}));
+    EXPECT_EQ(feed.subscribeFromOffsets(), (std::vector<int64_t>{0, 10})) << "no overlap event, no re-read";
     expectCacheIs(reader, a);
-    EXPECT_EQ(reader.stats().prefixDivergences, 0u);
+    EXPECT_EQ(reader.stats().epochChanges, 0u);
 }
 
-// I1: a re-validation resumes at the last verified offset after an overflow / marker gap.
-TEST(CatalogReaderRegression, ARevalidationOverflowResumesFromTheVerifiedOffsetAndAlwaysProgressesRegression) {
+// REQUIRED (fix round 2): the identical-bytes regrow.  The prefix is rewritten
+// (offsets 2..8) while the event at the cache end (9) is re-committed byte for
+// byte.  Event fingerprints are per object, not chained, so nothing in the bytes
+// at the cache end tells; the epoch does.  RED (round 1's overlap check / the
+// epoch ignored): the overlap matched and t2..t8 — no longer committed — were served.
+TEST(CatalogReaderRegression, AnIdenticalBytesRegrowStillRereadsBecauseTheEpochChangedRegression) {
     Rig r(invokerCfg(4018, 4019)); r.connect();
-    const auto log = topicsScript(60);
-    CatalogFeed feed(r.gw, log);
+    const auto a = topicsScript(10);
+    auto b = topicsScript(10, /*divergeFrom=*/2);
+    b[9] = a[9];   // the cache-end event, byte-identical
+    ASSERT_NE(libraryDigest(b), 0u) << "precondition: b is a valid history";
+    ASSERT_EQ(rcat::encode(a[9]).value(), rcat::encode(b[9]).value());
+    ASSERT_NE(a[5], b[5]);
+    CatalogFeed feed(r.gw, a);
+    rc::CatalogReader reader(r.client);
+    ASSERT_TRUE(refreshOnce(r, reader, 5'000'000'000).value().has_value());
+    feed.replaceHistory(b);
+    auto done = refreshOnce(r, reader, 5'000'000'000);
+    ASSERT_TRUE(done.has_value());
+    ASSERT_TRUE(done->has_value()) << done->error().detail;
+    expectCacheIs(reader, b);
+    EXPECT_EQ(reader.stats().epochChanges, 1u);
+    EXPECT_EQ(feed.subscribeFromOffsets(), (std::vector<int64_t>{0, 10, 0}));
+}
+
+// REQUIRED (fix round 2): a truncation between an Append CONTINUATION (a ring
+// overflow restarted the stream) and the next stream of the same refresh.  RED
+// (the epoch ignored): the continuation appended the new history's tail onto the
+// first stream's stale prefix.
+TEST(CatalogReaderRegression, ATruncationBetweenAContinuationAndItsNextStreamIsNeverServedStaleRegression) {
+    Rig r(invokerCfg(4020, 4021)); r.connect();
+    const auto a = topicsScript(60);
+    const auto b = topicsScript(64, /*divergeFrom=*/3);
+    CatalogFeed feed(r.gw, a);
+    feed.replaceHistoryAtSubscribe(1, b);   // right before the first continuation is served
     rc::CatalogReader reader(r.client, rc::CatalogReaderConfig{.ringBytes = 2048});
-    ASSERT_TRUE(refreshOnce(r, reader, 8'000'000'000).value().has_value());
-    const std::size_t first = feed.subscribeFromOffsets().size();
-    feed.endReadsOnNextSubscribe();   // a truncation end: Full re-validation of 60 events through a 2 KiB ring
     auto done = refreshOnce(r, reader, 8'000'000'000);
     ASSERT_TRUE(done.has_value());
     ASSERT_TRUE(done->has_value()) << done->error().detail;
+    ASSERT_GE(reader.stats().ringOverflows, 1u) << "precondition: the first stream overflowed (a continuation)";
+    expectCacheIs(reader, b);
+    EXPECT_EQ(reader.stats().epochChanges, 1u);
     const auto& froms = feed.subscribeFromOffsets();
-    ASSERT_GT(froms.size(), first + 3) << "the re-validation really overflowed the ring";
-    EXPECT_EQ(froms[first], 59);       // the overlap read, ended NotLeader
-    EXPECT_EQ(froms[first + 1], 0);    // the Full re-read
-    for (std::size_t i = first + 2; i < froms.size(); ++i)
-        EXPECT_GT(froms[i], froms[i - 1]) << "restart " << i << " must resume past the verified offset, never from 0";
+    ASSERT_GE(froms.size(), 3u);
+    EXPECT_GT(froms[1], 0) << "the continuation started at the cache end";
+    EXPECT_EQ(froms[2], 0) << "its note named a new epoch: re-read from 0";
+}
+
+// REQUIRED (fix round 2): ... and between a continuation cut short (the deadline)
+// and the next refresh's RESUME.  RED (the epoch ignored): the resume appended the
+// new history's tail onto the stale prefix the continuation had kept.
+TEST(CatalogReaderRegression, ATruncationBetweenACutShortContinuationAndItsResumeIsNeverServedStaleRegression) {
+    Rig r(invokerCfg(4022, 4023)); r.connect();
+    const auto a = topicsScript(60);
+    const auto b = topicsScript(66, /*divergeFrom=*/1);
+    CatalogFeed feed(r.gw, a);
+    feed.suppressCaughtUpMarker();   // the refresh never ends on its own: the deadline cuts it
+    rc::CatalogReader reader(r.client, rc::CatalogReaderConfig{.ringBytes = 2048});
+    auto cut = refreshOnce(r, reader, 1'000'000'000);
+    ASSERT_TRUE(cut.has_value());
+    ASSERT_FALSE(cut->has_value());
+    ASSERT_EQ(cut->error().kind, rc::CatalogReadError::Kind::Timeout);
+    const std::size_t kept = reader.events().size();
+    ASSERT_GT(kept, 0u) << "precondition: the cut-short read kept a prefix";
+    feed.suppressCaughtUpMarker(false);
+    feed.replaceHistory(b);
+    auto done = refreshOnce(r, reader, 8'000'000'000);
+    ASSERT_TRUE(done.has_value());
+    ASSERT_TRUE(done->has_value()) << done->error().detail;
+    expectCacheIs(reader, b);
+    EXPECT_GE(reader.stats().epochChanges, 1u);
+}
+
+// A read from ANOTHER broker (another epoch value) never continues this cache.
+TEST(CatalogReaderRegression, AStreamFromAnotherBrokersEpochDropsTheCacheRegression) {
+    Rig r(invokerCfg(4024, 4025)); r.connect();
+    const auto a = topicsScript(6);
+    CatalogFeed feed(r.gw, a);
+    rc::CatalogReader reader(r.client);
+    ASSERT_TRUE(refreshOnce(r, reader, 5'000'000'000).value().has_value());
+    feed.setEpoch(0xb0b);
+    ASSERT_TRUE(refreshOnce(r, reader, 5'000'000'000).value().has_value());
+    EXPECT_EQ(feed.subscribeFromOffsets(), (std::vector<int64_t>{0, 6, 0}));
+    expectCacheIs(reader, a);
+    EXPECT_EQ(reader.historyEpoch(), 0xb0bu);
+}
+
+// A marker whose epoch differs from its own stream's note, or whose HW lies below
+// what the stream delivered, vouches for nothing: dropped, re-read.
+TEST(CatalogReaderRegression, AMarkerContradictingItsStreamDropsTheCacheAndRereadsRegression) {
+    Rig r(invokerCfg(4026, 4027)); r.connect();
+    const auto log = topicsScript(5);
+    CatalogFeed feed(r.gw, log);
+    feed.overrideNextMarker(2);   // contradicts the 5 records just delivered
+    rc::CatalogReader reader(r.client);
+    auto done = refreshOnce(r, reader, 5'000'000'000);
+    ASSERT_TRUE(done.has_value());
+    ASSERT_TRUE(done->has_value()) << done->error().detail;
+    EXPECT_EQ(feed.subscribeFromOffsets(), (std::vector<int64_t>{0, 0})) << "never taken as 'caught up'";
+    expectCacheIs(reader, log);
+    EXPECT_EQ(reader.stats().contradictions, 1u);
+
+    feed.overrideNextMarkerEpoch(feed.epoch() + 7);
+    ASSERT_TRUE(refreshOnce(r, reader, 5'000'000'000).value().has_value());
+    EXPECT_EQ(feed.subscribeFromOffsets(), (std::vector<int64_t>{0, 0, 5, 0}));
+    EXPECT_EQ(reader.stats().contradictions, 2u);
     expectCacheIs(reader, log);
 }
 
-// I2: the reader is built eagerly on the Client's owning thread: no lazy creation, no
-// first-caller claim.  Two foreign threads' first catalog calls both refuse; the owner
-// still reads.
-TEST(CatalogReaderRegression, TwoForeignThreadsFirstCatalogCallsRefuseAndTheOwnerStillReadsRegression) {
-    Rig r(invokerCfg(4020, 4021)); r.connect();
+// A broker that sends records with no epoch note is refused explicitly — never
+// cached under an unknown history, never a hang.
+TEST(CatalogReaderRegression, RecordsWithoutAnEpochNoteAreAnExplicitRejectedRegression) {
+    Rig r(invokerCfg(4028, 4029)); r.connect();
     CatalogFeed feed(r.gw, topicsScript(3));
-    bool threw[2] = {false, false};
-    std::thread t0([&] {
-        try { (void)r.client.catalogHistory(rcat::HistoryFilter{}, std::chrono::milliseconds(10)); }
-        catch (const std::logic_error&) { threw[0] = true; }
-    });
-    std::thread t1([&] {
-        try { (void)r.client.catalogHistory(rcat::HistoryFilter{}, std::chrono::milliseconds(10)); }
-        catch (const std::logic_error&) { threw[1] = true; }
-    });
-    t0.join(); t1.join();
-    EXPECT_TRUE(threw[0]);
-    EXPECT_TRUE(threw[1]);
-    auto done = refreshOnce(r, r.client.catalogReader(), 5'000'000'000);
+    feed.omitNotes();
+    rc::CatalogReader reader(r.client);
+    auto done = refreshOnce(r, reader, 5'000'000'000);
     ASSERT_TRUE(done.has_value());
-    EXPECT_TRUE(done->has_value()) << (done->has_value() ? "" : done->error().detail);
-    EXPECT_EQ(r.client.catalogReader().events().size(), 3u);
+    ASSERT_FALSE(done->has_value());
+    EXPECT_EQ(done->error().kind, rc::CatalogReadError::Kind::Rejected) << done->error().detail;
+    EXPECT_TRUE(reader.events().empty());
+    EXPECT_FALSE(reader.historyEpoch().has_value());
 }
 
-// I3: the NotLeader refusal (the broker's intake is busy) and the Append-mode low marker.
+// I3: the NotLeader refusal (the broker's intake is busy).
 TEST(CatalogReaderRegression, ANotLeaderRefusalBacksOffAndResubscribesWithinTheDeadlineRegression) {
-    Rig r(invokerCfg(4022, 4023)); r.connect();
+    Rig r(invokerCfg(4030, 4031)); r.connect();
     const auto log = topicsScript(4);
     CatalogFeed feed(r.gw, log);
     feed.refuseNextSubscribe(pc::ErrorCode::NotLeader);
@@ -631,7 +758,7 @@ TEST(CatalogReaderRegression, ANotLeaderRefusalBacksOffAndResubscribesWithinTheD
 }
 
 TEST(CatalogReaderRegression, APersistentNotLeaderRefusalEndsTimeoutNotRejectedNotAHangRegression) {
-    Rig r(invokerCfg(4024, 4025)); r.connect();
+    Rig r(invokerCfg(4032, 4033)); r.connect();
     CatalogFeed feed(r.gw, topicsScript(4));
     feed.refuseAllSubscribes(pc::ErrorCode::NotLeader);
     rc::CatalogReader reader(r.client);
@@ -643,23 +770,9 @@ TEST(CatalogReaderRegression, APersistentNotLeaderRefusalEndsTimeoutNotRejectedN
     EXPECT_TRUE(reader.events().empty());
 }
 
-TEST(CatalogReaderRegression, AMarkerBelowTheReplayedPrefixWhileAppendingRereadsFromZeroRegression) {
-    Rig r(invokerCfg(4026, 4027)); r.connect();
-    const auto log = topicsScript(5);
-    CatalogFeed feed(r.gw, log);
-    feed.overrideNextMarker(2);   // contradicts the 5 records just delivered
-    rc::CatalogReader reader(r.client);
-    auto done = refreshOnce(r, reader, 5'000'000'000);
-    ASSERT_TRUE(done.has_value());
-    ASSERT_TRUE(done->has_value()) << done->error().detail;
-    EXPECT_EQ(feed.subscribeFromOffsets(), (std::vector<int64_t>{0, 0})) << "never taken as 'caught up': re-read and re-validated";
-    expectCacheIs(reader, log);
-    EXPECT_EQ(reader.stats().revalidations, 1u);
-}
-
 // M2 / M3 / M4.
 TEST(CatalogReaderRegression, ARecordThatCanNeverCrossTheRingIsAnExplicitErrorNotATimeoutRegression) {
-    Rig r(invokerCfg(4028, 4029)); r.connect();
+    Rig r(invokerCfg(4034, 4035)); r.connect();
     CatalogFeed feed(r.gw, topicsScript(2, -1, /*statementBytes=*/20'000));
     rc::CatalogReader reader(r.client, rc::CatalogReaderConfig{.ringBytes = 1024});
     auto done = refreshOnce(r, reader, 5'000'000'000);
@@ -670,7 +783,7 @@ TEST(CatalogReaderRegression, ARecordThatCanNeverCrossTheRingIsAnExplicitErrorNo
 }
 
 TEST(CatalogReaderRegression, ACacheBeyondMaxBytesIsAnExplicitCacheFullRegression) {
-    Rig r(invokerCfg(4030, 4031)); r.connect();
+    Rig r(invokerCfg(4036, 4037)); r.connect();
     CatalogFeed feed(r.gw, topicsScript(6, -1, /*statementBytes=*/2000));
     rc::CatalogReader reader(r.client, rc::CatalogReaderConfig{.maxBytes = 5000});
     auto done = refreshOnce(r, reader, 5'000'000'000);
@@ -680,40 +793,39 @@ TEST(CatalogReaderRegression, ACacheBeyondMaxBytesIsAnExplicitCacheFullRegressio
     EXPECT_LT(reader.events().size(), 6u);
 }
 
-TEST(CatalogReaderRegression, AnUndecodableRecordDuringRevalidationReportsDecodeAndKeepsTheCacheRegression) {
-    Rig r(invokerCfg(4032, 4033)); r.connect();
+TEST(CatalogReaderRegression, AnUndecodableRecordIsADecodeErrorAndKeepsTheVerifiedPrefixRegression) {
+    Rig r(invokerCfg(4038, 4039)); r.connect();
     const auto a = topicsScript(10);
     CatalogFeed feed(r.gw, a);
-    rc::CatalogReader reader(r.client);
-    ASSERT_TRUE(refreshOnce(r, reader, 5'000'000'000).value().has_value());
-    feed.endReadsOnNextSubscribe();
     feed.corruptNextSubscribeAt(5);
+    rc::CatalogReader reader(r.client);
     auto done = refreshOnce(r, reader, 5'000'000'000);
     ASSERT_TRUE(done.has_value());
     ASSERT_FALSE(done->has_value());
     EXPECT_EQ(done->error().kind, rc::CatalogReadError::Kind::Replay);
     EXPECT_EQ(done->error().offset, 5);
-    EXPECT_EQ(reader.events().size(), 10u) << "a corrupt record is an error, not a divergence: nothing dropped";
-    EXPECT_EQ(reader.stats().prefixDivergences, 0u);
-    EXPECT_TRUE(reader.needsRevalidation());
+    EXPECT_EQ(reader.events().size(), 5u) << "a corrupt record is an error: the verified prefix stays";
+    ASSERT_TRUE(refreshOnce(r, reader, 5'000'000'000).value().has_value()) << "the next read continues past it";
+    expectCacheIs(reader, a);
+    EXPECT_EQ(feed.subscribeFromOffsets(), (std::vector<int64_t>{0, 5}));
 }
 
 // Edge-case checklist: duplicate / stale / late answers, close and session loss mid-op, back-pressure.
 TEST(CatalogReaderRegression, DuplicatedRecordsAreSkippedNotReappliedRegression) {
-    Rig r(invokerCfg(4034, 4035)); r.connect();
+    Rig r(invokerCfg(4040, 4041)); r.connect();
     const auto a = topicsScript(8);
     CatalogFeed feed(r.gw, a);
     feed.duplicateEveryRecord();
     rc::CatalogReader reader(r.client);
     ASSERT_TRUE(refreshOnce(r, reader, 5'000'000'000).value().has_value());
     expectCacheIs(reader, a);
-    feed.endReadsOnNextSubscribe();   // and through a Full re-validation
+    feed.bumpEpoch();   // and through a re-read under a new epoch
     ASSERT_TRUE(refreshOnce(r, reader, 5'000'000'000).value().has_value());
     expectCacheIs(reader, a);
 }
 
 TEST(CatalogReaderRegression, AnAnswerArrivingAfterTheTimeoutNeverCorruptsTheNextRefreshRegression) {
-    Rig r(invokerCfg(4036, 4037)); r.connect();
+    Rig r(invokerCfg(4042, 4043)); r.connect();
     const auto a = topicsScript(8);
     CatalogFeed feed(r.gw, a);
     feed.stallAfter(3);
@@ -729,27 +841,25 @@ TEST(CatalogReaderRegression, AnAnswerArrivingAfterTheTimeoutNeverCorruptsTheNex
     expectCacheIs(reader, a);
 }
 
-TEST(CatalogReaderRegression, SessionLossDuringAFullRevalidationResumesFromTheVerifiedOffsetRegression) {
-    Rig r(invokerCfg(4038, 4039)); r.connect();
+TEST(CatalogReaderRegression, SessionLossDuringAReReadResumesAtTheCacheEndUnderTheNewEpochRegression) {
+    Rig r(invokerCfg(4044, 4045)); r.connect();
     const auto a = topicsScript(10);
+    const auto b = topicsScript(10, /*divergeFrom=*/7);
     CatalogFeed feed(r.gw, a);
     rc::CatalogReader reader(r.client);
     ASSERT_TRUE(refreshOnce(r, reader, 5'000'000'000).value().has_value());
-    feed.endReadsOnNextSubscribe();
-    feed.loseSessionAfter(4);   // the Full re-read verifies 0..3, then the session expires
+    feed.replaceHistory(b);
+    feed.loseSessionAfter(4);   // the re-read from 0 gets 0..3, then the session expires
     auto done = refreshOnce(r, reader, 8'000'000'000);
     ASSERT_TRUE(done.has_value());
     ASSERT_TRUE(done->has_value()) << done->error().detail;
-    const auto& f = feed.subscribeFromOffsets();
-    ASSERT_EQ(f.size(), 4u);
-    EXPECT_EQ(f[1], 9);
-    EXPECT_EQ(f[2], 0);
-    EXPECT_EQ(f[3], 4) << "resumed at the verified offset";
-    expectCacheIs(reader, a);
+    EXPECT_EQ(feed.subscribeFromOffsets(), (std::vector<int64_t>{0, 10, 0, 4}))
+        << "resumed at the cache end (4): the same epoch";
+    expectCacheIs(reader, b);
 }
 
 TEST(CatalogReaderRegression, ClosingTheClientMidRefreshEndsClosedAndBeginIsBackPressuredWhileInFlightRegression) {
-    Rig r(invokerCfg(4040, 4041)); r.connect();
+    Rig r(invokerCfg(4046, 4047)); r.connect();
     CatalogFeed feed(r.gw, topicsScript(8));
     feed.stallAfter(2);
     rc::CatalogReader reader(r.client);
@@ -769,10 +879,9 @@ TEST(CatalogReaderRegression, ClosingTheClientMidRefreshEndsClosedAndBeginIsBack
 }
 
 // A Records frame of SEVERAL whole batches (the broker's catalog server coalesces) must deliver every
-// record: the hub decoded only the first batch and the rest vanished (the reader healed it by
-// re-subscribing — a silent loss on any other consumer).
+// record: the hub decoded only the first batch and the rest vanished.
 TEST(CatalogReaderRegression, ACoalescedMultiBatchFrameDeliversEveryRecordRegression) {
-    Rig r(invokerCfg(4042, 4043)); r.connect();
+    Rig r(invokerCfg(4048, 4049)); r.connect();
     const auto a = topicsScript(8);
     CatalogFeed feed(r.gw, a);
     feed.coalesceBacklog();
@@ -781,11 +890,96 @@ TEST(CatalogReaderRegression, ACoalescedMultiBatchFrameDeliversEveryRecordRegres
     expectCacheIs(reader, a);
     EXPECT_EQ(feed.subscribeFromOffsets(), (std::vector<int64_t>{0})) << "no gap re-read: nothing was dropped";
     EXPECT_EQ(reader.stats().markerGaps, 0u);
-    // ... and through the cache-end overlap of the next refresh.
     auto more = topicsScript(11);
-    feed.replaceHistory(more);
+    feed.append({more.begin() + 8, more.end()});
     ASSERT_TRUE(refreshOnce(r, reader, 5'000'000'000).value().has_value());
     expectCacheIs(reader, more);
-    EXPECT_EQ(feed.subscribeFromOffsets(), (std::vector<int64_t>{0, 7}));
+    EXPECT_EQ(feed.subscribeFromOffsets(), (std::vector<int64_t>{0, 8}));
     EXPECT_EQ(reader.stats().markerGaps, 0u);
+}
+
+// ---- Fix round 2: every reader accessor is owner-thread only, in every mode -----------
+
+namespace {
+/// Calls every owner-only member from the current thread; how many threw logic_error.
+int foreignCalls(rc::Client& client, rc::CatalogReader& reader) {
+    int threw = 0;
+    auto expectThrow = [&](auto&& f) {
+        try { f(); } catch (const std::logic_error&) { ++threw; }
+    };
+    expectThrow([&] { (void)client.catalogReader(); });
+    expectThrow([&] { (void)reader.events(); });
+    expectThrow([&] { (void)reader.state(); });
+    expectThrow([&] { (void)reader.stats(); });
+    expectThrow([&] { (void)reader.nextOffset(); });
+    expectThrow([&] { (void)reader.historyEpoch(); });
+    expectThrow([&] { (void)reader.beginRefresh(); });
+    expectThrow([&] { (void)reader.pollRefresh(0, 0); });
+    expectThrow([&] { (void)client.catalogHistory(rcat::HistoryFilter{}, std::chrono::milliseconds(10)); });
+    return threw;
+}
+constexpr int kOwnerOnlyCalls = 9;
+}   // namespace
+
+// RED (round 1): client.catalogReader(), events(), state(), stats() ran on any thread
+// — a foreign thread iterated events_ while the owner's refresh reallocated it.
+TEST(CatalogReaderRegression, EveryAccessorRefusesAForeignThreadInInvokerModeRegression) {
+    Rig r(invokerCfg(4050, 4051)); r.connect();
+    CatalogFeed feed(r.gw, topicsScript(3));
+    rc::CatalogReader& reader = r.client.catalogReader();
+    ASSERT_TRUE(refreshOnce(r, reader, 5'000'000'000).value().has_value());
+    int threw = 0;
+    std::thread([&] { threw = foreignCalls(r.client, reader); }).join();
+    EXPECT_EQ(threw, kOwnerOnlyCalls) << "every owner-only member refused the foreign thread";
+    EXPECT_EQ(reader.events().size(), 3u) << "the owner still reads";
+}
+
+TEST(CatalogReaderRegression, TwoForeignThreadsFirstCatalogCallsRefuseAndTheOwnerStillReadsRegression) {
+    Rig r(invokerCfg(4052, 4053)); r.connect();
+    CatalogFeed feed(r.gw, topicsScript(3));
+    bool threw[2] = {false, false};
+    std::thread t0([&] {
+        try { (void)r.client.catalogHistory(rcat::HistoryFilter{}, std::chrono::milliseconds(10)); }
+        catch (const std::logic_error&) { threw[0] = true; }
+    });
+    std::thread t1([&] {
+        try { (void)r.client.catalogReader(); }
+        catch (const std::logic_error&) { threw[1] = true; }
+    });
+    t0.join(); t1.join();
+    EXPECT_TRUE(threw[0]);
+    EXPECT_TRUE(threw[1]);
+    auto done = refreshOnce(r, r.client.catalogReader(), 5'000'000'000);
+    ASSERT_TRUE(done.has_value());
+    EXPECT_TRUE(done->has_value()) << (done->has_value() ? "" : done->error().detail);
+    EXPECT_EQ(r.client.catalogReader().events().size(), 3u);
+}
+
+// The same rule in THREAD mode (a background runner; app threads may block): the
+// foreign thread is refused before anything reaches the cache; the owner reads
+// with the blocking refresh / catalogHistory.
+TEST(CatalogReaderRegression, EveryAccessorRefusesAForeignThreadInThreadModeRegression) {
+    rc::ClientConfig c = invokerCfg(4054, 4055);
+    c.runnerMode = rc::RunnerMode::Thread;
+    c.nanoClock  = nullptr;   // the runner thread reads the clock: the real one
+    rc::Client client(c);
+    test_support::InvokerGateway gw(c.dataDir + "/aeron", c.gatewayChannel, c.gatewayStreamId, c.egressChannel,
+                                    c.egressStreamId);
+    const auto log = topicsScript(4);
+    CatalogFeed feed(gw, log);
+    std::atomic<bool> stop{false};   // test-only: the fake broker's pump thread (owns gw from here on)
+    std::thread broker([&] { while (!stop.load()) gw.pump(); });
+    struct Join { std::atomic<bool>& s; std::thread& t; ~Join() { s = true; t.join(); } } join{stop, broker};
+
+    client.connectAndWait(std::chrono::seconds(5));
+    rc::CatalogReader& reader = client.catalogReader();
+    auto h = client.catalogHistory(rcat::HistoryFilter{}, std::chrono::seconds(5));
+    ASSERT_TRUE(h.has_value()) << h.error().detail;
+    EXPECT_EQ(h->size(), log.size());
+    int threw = 0;
+    std::thread([&] { threw = foreignCalls(client, reader); }).join();
+    EXPECT_EQ(threw, kOwnerOnlyCalls) << "Thread mode: every owner-only member refused the foreign thread";
+    expectCacheIs(reader, log);
+    auto again = reader.refresh(std::chrono::seconds(5));
+    EXPECT_TRUE(again.has_value()) << (again.has_value() ? "" : again.error().detail);
 }

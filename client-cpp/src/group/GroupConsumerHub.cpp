@@ -1254,6 +1254,12 @@ void GroupConsumerHub::onSessionDown()
 
 void GroupConsumerHub::onRecords(const codec::RecordsView& rv)
 {
+    // Task 13 fix round 2 (whole class): an 8-byte recordBatch is a NOTE (the
+    // transient lineage note, a catalog epoch note / marker), never a batch — it
+    // must not move a member's position (the empty position note never reaches
+    // here: Client.cpp routes it to plain subscriptions only).  A frame of
+    // several whole batches spans to its last batch (RecordsView fields).
+    if (rv.recordBatch.size() == 8) [[unlikely]] { ++notesIgnored_; return; }
     const TP key{rv.topicId, rv.partition};
     for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
         GroupConsumerImpl* const impl = impls_[ix];

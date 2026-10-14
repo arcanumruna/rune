@@ -31,13 +31,14 @@ enum FrameType : int32_t {
     kWhole    = 1,   // one whole record: offset, value bytes
     kFirst    = 2,   // the first chunk of a record too large for one message (total = its size)
     kMore     = 3,   // a following chunk (the record is complete when `total` bytes arrived)
-    kMarker   = 4,   // the caught-up marker: offset = the broker's high watermark
+    kMarker   = 4,   // the caught-up marker: offset = the broker's high watermark; payload = the 8-byte epoch
     kOverflow = 5,   // the ring could not take the record / marker at offset: nothing from there was copied
     kTooLarge = 6,   // the record at offset (total = its size) can NEVER cross this ring, even empty
+    kNote     = 7,   // the stream's history-epoch note: payload = the 8-byte epoch
 };
 constexpr index_t kHead = 16;
-// Room always left for one control frame (kOverflow / kMarker: 8 header + 16, aligned 32),
-// even across an end-of-buffer wrap (padding < one frame): 64 bytes.
+// Room always left for one control frame (kOverflow / kMarker / kNote: 8 header + 16 +
+// 8, aligned 32), even across an end-of-buffer wrap (padding < one frame): 64 bytes.
 constexpr index_t kControlReserve = 64;
 
 constexpr index_t aligned(index_t n) noexcept {
@@ -98,9 +99,14 @@ void dutyRecord(detail::OneToOneRingBuffer& ring, uint32_t gen, int64_t offset, 
     }
 }
 
-void dutyMarker(detail::OneToOneRingBuffer& ring, uint32_t gen, int64_t hw) {
-    if (!ring.hasCapacityFor(aligned(kHead) + kControlReserve) || !writeFrame(ring, kMarker, gen, 0, hw, {}))
-        dutyOverflow(ring, gen, hw);
+/// The note / marker: the epoch's 8 bytes (an Overflow if the ring cannot take it —
+/// the app re-subscribes; nothing is decided on a frame that did not arrive).
+void dutyEpochFrame(detail::OneToOneRingBuffer& ring, int32_t type, uint32_t gen, int64_t offset, uint64_t epoch) {
+    uint8_t e[8];
+    std::memcpy(e, &epoch, 8);
+    if (!ring.hasCapacityFor(aligned(kHead + 8) + kControlReserve) ||
+        !writeFrame(ring, type, gen, 0, offset, std::span<const uint8_t>(e, 8)))
+        dutyOverflow(ring, gen, offset);
 }
 
 CatalogReadError replayError(const rcat::ReplayError& e) {
@@ -128,7 +134,7 @@ CatalogReader::~CatalogReader() {
     // No runner callback may touch the ring once it is freed: unsubscribe what is
     // live, then wait until every subscription this reader created is finished.
     if (Stream* st = stream_()) retire_(std::move(st->sub));
-    phase_ = Idle{Resume{Begin::Tail, 0}};
+    phase_ = Idle{};
     for (;;) {
         pruneRetired_();
         if (retired_.empty()) break;
@@ -137,40 +143,44 @@ CatalogReader::~CatalogReader() {
     }
 }
 
-void CatalogReader::checkOwner_() {
+void CatalogReader::checkOwner_() const {
     // owner_ is immutable (the constructing thread): there is no claim to race for.
     if (owner_ != std::this_thread::get_id())
         throw std::logic_error("CatalogReader: used from a thread other than its owner (the thread that "
                                "constructed it — for a Client's reader, the Client's constructing thread)");
 }
 
+std::span<const rcat::RecordedEvent> CatalogReader::events() const {
+    checkOwner_();
+    return events_;
+}
+const rcat::CatalogState& CatalogReader::state() const {
+    checkOwner_();
+    return replayer_.state();
+}
+int64_t CatalogReader::nextOffset() const {
+    checkOwner_();
+    return replayer_.nextOffset();
+}
+std::optional<uint64_t> CatalogReader::historyEpoch() const {
+    checkOwner_();
+    return cacheEpoch_;
+}
+const CatalogReader::Stats& CatalogReader::stats() const {
+    checkOwner_();
+    return stats_;
+}
+
 CatalogReader::Stream* CatalogReader::stream_() noexcept {
-    if (auto* a = std::get_if<Appending>(&phase_)) return a;
-    if (auto* v = std::get_if<Revalidating>(&phase_)) return v;
+    if (auto* o = std::get_if<Opening>(&phase_)) return o;
+    if (auto* st = std::get_if<Streaming>(&phase_)) return st;
     return nullptr;
 }
 
 uint32_t CatalogReader::currentGen_() const noexcept {
-    if (const auto* a = std::get_if<Appending>(&phase_)) return a->gen;
-    if (const auto* v = std::get_if<Revalidating>(&phase_)) return v->gen;
+    if (const auto* o = std::get_if<Opening>(&phase_)) return o->gen;
+    if (const auto* st = std::get_if<Streaming>(&phase_)) return st->gen;
     return 0;   // never a subscription's generation
-}
-
-bool CatalogReader::needsRevalidation() const noexcept {
-    if (const auto* i = std::get_if<Idle>(&phase_)) return i->next.begin == Begin::Full;
-    if (const auto* b = std::get_if<Backoff>(&phase_)) return b->resume.begin == Begin::Full;
-    if (const auto* v = std::get_if<Revalidating>(&phase_)) return v->begin == Begin::Full;
-    return false;
-}
-
-CatalogReader::Resume CatalogReader::continueOf_() const noexcept {
-    if (const auto* v = std::get_if<Revalidating>(&phase_)) return Resume{v->begin, v->verified};
-    return Resume{Begin::Append, 0};
-}
-
-CatalogReader::Resume CatalogReader::reopenOf_() const noexcept {
-    if (const auto* v = std::get_if<Revalidating>(&phase_)) return Resume{v->begin, v->verified};
-    return Resume{Begin::Tail, 0};   // re-verify the overlap event: the cache may have grown, the peer may differ
 }
 
 void CatalogReader::retire_(std::unique_ptr<Subscription> sub) {
@@ -183,38 +193,26 @@ void CatalogReader::pruneRetired_() {
     std::erase_if(retired_, [](const std::unique_ptr<Subscription>& s) { return s->finished(); });
 }
 
-void CatalogReader::subscribe_(Resume r) {
-    const auto cacheEnd = static_cast<int64_t>(events_.size());
-    if (cacheEnd == 0) r = Resume{Begin::Append, 0};   // nothing cached: nothing to verify
-    if (r.begin == Begin::Tail) r.verified = cacheEnd - 1;
-    else if (r.begin == Begin::Full) r.verified = std::clamp<int64_t>(r.verified, 0, cacheEnd - 1);
+// Every subscription starts at the cache end: its epoch note decides whether the
+// cache continues (same epoch) or is dropped and re-read from 0.
+void CatalogReader::subscribe_() {
     if (++nextGen_ == 0) ++nextGen_;
     const uint32_t gen = nextGen_;
-    const int64_t from = r.begin == Begin::Append ? replayer_.nextOffset() : r.verified;
     detail::OneToOneRingBuffer* ring = ring_.get();
     SubscribeOptions o;
-    o.from       = From::offset(from);
-    o.onCaughtUp = [ring, gen](int64_t hw) { dutyMarker(*ring, gen, hw); };
+    o.from           = From::offset(replayer_.nextOffset());
+    o.onHistoryEpoch = [ring, gen](uint64_t epoch) { dutyEpochFrame(*ring, kNote, gen, -1, epoch); };
+    o.onCaughtUp     = [ring, gen](int64_t hw, uint64_t epoch) { dutyEpochFrame(*ring, kMarker, gen, hw, epoch); };
     auto sub = std::make_unique<Subscription>(client_.subscribe(
         TopicHandle::catalog(), 0, std::move(o),
         [ring, gen](const Record& r) { dutyRecord(*ring, gen, r.offset, r.value); }));
     ++stats_.subscribes;
-    if (r.begin == Begin::Append) phase_ = Appending{{gen, std::move(sub), std::nullopt}};
-    else phase_ = Revalidating{{gen, std::move(sub), std::nullopt}, r.begin, cacheEnd, r.verified};
+    phase_ = Opening{{gen, std::move(sub), std::nullopt}};
 }
 
 void CatalogReader::finishIdle_() {
-    // Where the next refresh starts if this one ended without a verdict (the caller sets
-    // phase_ itself when it has a better answer).
-    const Resume next = reopenOf_();
     if (Stream* st = stream_()) retire_(std::move(st->sub));
-    phase_ = Idle{next};
-}
-
-void CatalogReader::toAppending_() noexcept {
-    auto* v = std::get_if<Revalidating>(&phase_);
-    if (v == nullptr) return;
-    phase_ = Appending{{v->gen, std::move(v->sub), std::nullopt}};
+    phase_ = Idle{};
 }
 
 void CatalogReader::truncateCache_(std::size_t keep) {
@@ -232,15 +230,20 @@ void CatalogReader::truncateCache_(std::size_t keep) {
     }
 }
 
+void CatalogReader::dropCache_() {
+    truncateCache_(0);
+    cacheEpoch_.reset();
+}
+
 OpResult CatalogReader::beginRefresh() {
     checkOwner_();
     pruneRetired_();
     if (!std::holds_alternative<Idle>(phase_) || retired_.size() >= kMaxRetired) return OpResult::BackPressured;
-    subscribe_(std::get<Idle>(phase_).next);
+    subscribe_();
     return OpResult::Accepted;
 }
 
-// ---- App-thread side: drain, replay, re-validate ------------------------------------
+// ---- App-thread side: drain, check the epoch, replay ----------------------------------
 CatalogReader::Step CatalogReader::append_(int64_t offset, std::span<const uint8_t> bytes,
                                            std::optional<CatalogResult<void>>& result) {
     if (events_.size() >= cfg_.maxEvents) {
@@ -276,100 +279,69 @@ CatalogReader::Step CatalogReader::append_(int64_t offset, std::span<const uint8
     return Step::Continue;
 }
 
-CatalogReader::Step CatalogReader::onRecord_(int64_t offset, std::span<const uint8_t> bytes,
-                                             std::optional<CatalogResult<void>>& result) {
-    if (std::holds_alternative<Appending>(phase_)) {
-        if (offset < replayer_.nextOffset()) return Step::Continue;   // a batch straddling the cache end: replayed already
-        return append_(offset, bytes, result);   // a gap is the replayer's explicit Gap error
-    }
-    auto* v = std::get_if<Revalidating>(&phase_);
-    if (v == nullptr) return Step::Continue;
-    if (offset < v->verified) return Step::Continue;   // a duplicate / straddling batch: compared already
-    if (offset > v->verified) {
-        rcat::ReplayError e;
-        e.offset = v->verified;
-        e.code   = rcat::ReplayError::Code::Gap;
-        e.detail = "re-validation: the next record is at offset " + std::to_string(offset);
-        result   = std::unexpected(replayError(e));
-        return Step::Done;   // the cache is not served until re-validated
-    }
-    // offset == verified < cacheEnd: the new history's event must equal the cached one.
-    const auto ev = rcat::decode(bytes);
-    if (!ev) {
-        // A record that does not decode is an error, not evidence of a divergence: the
-        // cache is left alone (a corrupt record from a broker bug must not discard it).
-        rcat::ReplayError e;
-        e.offset = offset;
-        e.code   = rcat::ReplayError::Code::Decode;
-        e.decode = ev.error();
-        result   = std::unexpected(replayError(e));
-        return Step::Done;
-    }
-    if (*ev == events_[static_cast<std::size_t>(offset)].event) {
-        if (++v->verified < v->cacheEnd) return Step::Continue;
-        // The whole cached prefix (Full) / the cache-end overlap event (Tail) is the
-        // committed history: append from here on.
-        if (v->begin == Begin::Full) ++stats_.revalidations;
-        else ++stats_.overlapChecks;
-        toAppending_();
-        return Step::Continue;
-    }
-    // The history differs at `offset`.  Full: [0, offset) was verified, keep it and drop
-    // the rest.  Tail: only this one event was compared — nothing below it is vouched
-    // for (the history may have been rewritten from any earlier offset): drop everything.
-    const std::size_t keep = v->begin == Begin::Full ? static_cast<std::size_t>(offset) : 0;
-    if (v->begin == Begin::Full) ++stats_.revalidations;
-    ++stats_.prefixDivergences;
-    truncateCache_(keep);
-    toAppending_();
-    if (keep == static_cast<std::size_t>(offset)) return append_(offset, bytes, result);   // this very record
-    return Step::Restart;   // an empty cache: re-read the catalog from 0
+CatalogReader::Step CatalogReader::protocolError_(const char* what, int64_t offset,
+                                                  std::optional<CatalogResult<void>>& result) {
+    result = std::unexpected(CatalogReadError{
+        CatalogReadError::Kind::Rejected,
+        std::string("catalog read: ") + what + " (a broker that sends no catalog history epoch — older "
+                                               "than this client's catalog reads)",
+        offset, 0});
+    return Step::Done;
 }
 
-CatalogReader::Step CatalogReader::onMarker_(int64_t hw, std::optional<CatalogResult<void>>& result) {
-    if (std::holds_alternative<Appending>(phase_)) {
-        if (hw == replayer_.nextOffset()) {
-            result = CatalogResult<void>{};
-            return Step::Done;
-        }
-        if (hw > replayer_.nextOffset()) {
-            ++stats_.markerGaps;   // records below the marker never reached the ring: read them again
-            return Step::Restart;
-        }
-        // hw < what this refresh replayed: the broker's committed end contradicts the
-        // records it just delivered (or the cache): nothing is vouched for — re-read and
-        // re-validate the whole cache against it.
-        ++stats_.markerGaps;
-        return Step::RestartFull;
-    }
-    auto* v = std::get_if<Revalidating>(&phase_);
-    if (v == nullptr) return Step::Continue;
-    if (hw > v->verified) {
-        ++stats_.markerGaps;
+CatalogReader::Step CatalogReader::onNote_(uint64_t epoch) {
+    if (auto* st = std::get_if<Streaming>(&phase_)) {
+        if (epoch == st->epoch) return Step::Continue;   // a repeated note of the same stream: idempotent
+        // A stream never changes its history (a change ends it): a broker that says
+        // otherwise vouches for nothing — drop the cache, re-read.
+        ++stats_.contradictions;
+        dropCache_();
         return Step::Restart;
     }
-    // The committed history ends at hw, inside the cache: the cached tail beyond it is
-    // not (any longer) committed.
-    ++stats_.prefixDivergences;
-    if (v->begin == Begin::Full) {
-        // [0, verified) was compared equal and hw <= verified: keep [0, hw).
-        ++stats_.revalidations;
-        truncateCache_(static_cast<std::size_t>(std::max<int64_t>(hw, 0)));
-        toAppending_();
+    auto* o = std::get_if<Opening>(&phase_);
+    if (o == nullptr) return Step::Continue;
+    if (cacheEpoch_ && *cacheEpoch_ != epoch && !events_.empty()) {
+        // Another committed history (a truncation below a served HW, another broker,
+        // a broker that lost its epoch): nothing cached is vouched for.
+        ++stats_.epochChanges;
+        dropCache_();
+        return Step::Restart;   // re-read from 0: its note adopts the epoch
+    }
+    cacheEpoch_ = epoch;   // the cache (possibly empty) continues under it
+    phase_ = Streaming{{o->gen, std::move(o->sub), std::move(o->assembly)}, epoch};
+    return Step::Continue;
+}
+
+CatalogReader::Step CatalogReader::onRecord_(int64_t offset, std::span<const uint8_t> bytes,
+                                             std::optional<CatalogResult<void>>& result) {
+    if (std::holds_alternative<Opening>(phase_)) return protocolError_("a record before the history-epoch note", offset, result);
+    if (!std::holds_alternative<Streaming>(phase_)) return Step::Continue;
+    if (offset < replayer_.nextOffset()) return Step::Continue;   // a duplicate / a batch straddling the cache end
+    return append_(offset, bytes, result);   // a gap is the replayer's explicit Gap error
+}
+
+CatalogReader::Step CatalogReader::onMarker_(int64_t hw, uint64_t epoch, std::optional<CatalogResult<void>>& result) {
+    if (std::holds_alternative<Opening>(phase_)) return protocolError_("a caught-up marker before the history-epoch note", hw, result);
+    auto* st = std::get_if<Streaming>(&phase_);
+    if (st == nullptr) return Step::Continue;
+    if (epoch != st->epoch || hw < replayer_.nextOffset()) {
+        // The marker contradicts its own stream (another epoch, or a committed end
+        // below what this history already delivered): nothing is vouched for.
+        ++stats_.contradictions;
+        dropCache_();
+        return Step::Restart;
+    }
+    if (hw == replayer_.nextOffset()) {
         result = CatalogResult<void>{};
         return Step::Done;
     }
-    // Tail: only the overlap offset was due — nothing below hw is vouched for. Drop all, re-read.
-    truncateCache_(0);
-    toAppending_();
+    ++stats_.markerGaps;   // records below the marker never reached the ring: continue from the cache end
     return Step::Restart;
 }
 
 CatalogReader::Step CatalogReader::drain_(std::optional<CatalogResult<void>>& result) {
     const uint32_t gen = currentGen_();
-    Stream* st = stream_();
-    if (st == nullptr) return Step::Continue;
-    std::optional<Assembly>& assembly = st->assembly;
+    if (stream_() == nullptr) return Step::Continue;
     Step step = Step::Continue;
     auto handler = [&](int32_t type, aeron::concurrent::AtomicBuffer& buf, index_t at, index_t len) {
         if (step != Step::Continue || len < kHead) return;
@@ -381,6 +353,15 @@ CatalogReader::Step CatalogReader::drain_(std::optional<CatalogResult<void>>& re
         std::memcpy(&offset, p + 8, 8);
         if (g != gen) return;   // an earlier subscription's frame
         const std::span<const uint8_t> payload(p + kHead, static_cast<std::size_t>(len - kHead));
+        // The stream may have moved Opening -> Streaming: its assembly moves with it.
+        Stream* st = stream_();
+        if (st == nullptr) return;
+        std::optional<Assembly>& assembly = st->assembly;
+        auto epochOf = [&] {
+            uint64_t e = 0;
+            if (payload.size() >= 8) std::memcpy(&e, payload.data(), 8);
+            return e;
+        };
         switch (type) {
         case kWhole:
             assembly.reset();
@@ -399,9 +380,13 @@ CatalogReader::Step CatalogReader::drain_(std::optional<CatalogResult<void>>& re
                 step = onRecord_(offset, assemblyBuf_, result);
             }
             return;
+        case kNote:
+            assembly.reset();
+            step = onNote_(epochOf());
+            return;
         case kMarker:
             assembly.reset();
-            step = onMarker_(offset, result);
+            step = onMarker_(offset, epochOf(), result);
             return;
         case kTooLarge:
             assembly.reset();
@@ -416,7 +401,7 @@ CatalogReader::Step CatalogReader::drain_(std::optional<CatalogResult<void>>& re
         case kOverflow:
             assembly.reset();
             ++stats_.ringOverflows;
-            step = Step::Restart;   // re-read from where the copy stopped
+            step = Step::Restart;   // continue from the cache end (what was copied is kept)
             return;
         default:
             return;
@@ -441,12 +426,12 @@ std::optional<CatalogResult<void>> CatalogReader::pollRefresh(int64_t nowNs, int
     std::optional<CatalogResult<void>> result;
     if (auto* b = std::get_if<Backoff>(&phase_)) {
         if (nowNs >= deadlineNs) {
-            phase_ = Idle{b->resume};
+            phase_ = Idle{};
             return timeout("catalog read: no caught-up marker before the deadline "
                            "(re-subscribing after a lost / refused subscription)");
         }
         if (nowNs < b->retryAtNs) return std::nullopt;
-        subscribe_(b->resume);
+        subscribe_();
         return std::nullopt;
     }
 
@@ -456,38 +441,32 @@ std::optional<CatalogResult<void>> CatalogReader::pollRefresh(int64_t nowNs, int
     const bool finished = sub.finished();
     const Step step = drain_(result);
     if (step == Step::Done) {
-        // OK, or an explicit error: where the NEXT refresh starts (the verified prefix is
-        // kept; an unfinished re-validation resumes at its verified offset).
-        finishIdle_();
+        finishIdle_();   // OK, or an explicit error (the verified prefix and its epoch are kept)
         return result;
     }
-    if (step == Step::Restart || step == Step::RestartFull) {
-        const Resume again = step == Step::RestartFull ? Resume{Begin::Full, 0} : continueOf_();
+    if (step == Step::Restart) {
         finishIdle_();
-        if (nowNs >= deadlineNs) {
-            if (step == Step::RestartFull) phase_ = Idle{again};   // the contradiction is not forgotten
-            return timeout("catalog read: no caught-up marker before the deadline");
-        }
-        subscribe_(again);   // a Revalidating restart resumes at its verified offset: always progress
+        if (nowNs >= deadlineNs) return timeout("catalog read: no caught-up marker before the deadline");
+        subscribe_();   // from the cache end (0 after a drop): the new stream's note decides
         return std::nullopt;
     }
     if (finished) {
-        const Resume reopen = reopenOf_();
         const SubscriptionFailReason why = sub.failReason();
         const uint16_t code = sub.brokerErrorCode();
         finishIdle_();
         namespace pc = rune::protocol::client;
         auto backoff = [&] {
             ++stats_.resubscribes;
-            phase_ = Backoff{nowNs + cfg_.resubscribeBackoffNs, reopen};
+            phase_ = Backoff{nowNs + cfg_.resubscribeBackoffNs};
             return std::nullopt;
         };
         switch (why) {
         case SubscriptionFailReason::CatalogReadEnded:
-            // A truncation below a served HW: the cached prefix may be stale — re-read
-            // from 0 and re-validate it (binding: never served silently).
+            // A truncation below a served HW ended the read: resubscribe from the cache
+            // end — the broker's new epoch (its note) drops the cache (binding: a stale
+            // prefix is never served).
             ++stats_.readsEnded;
-            subscribe_(Resume{Begin::Full, 0});
+            subscribe_();
             return std::nullopt;
         case SubscriptionFailReason::SessionLost:
         case SubscriptionFailReason::TimedOut:
@@ -509,7 +488,7 @@ std::optional<CatalogResult<void>> CatalogReader::pollRefresh(int64_t nowNs, int
         }
     }
     if (nowNs >= deadlineNs) {
-        finishIdle_();   // a re-validation cut short resumes at its verified offset next time
+        finishIdle_();   // the prefix read so far (all under the cache's epoch) is kept
         return timeout("catalog read: no caught-up marker before the deadline (the serving "
                        "broker's committed prefix is not current — e.g. no catalog leader)");
     }

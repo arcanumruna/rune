@@ -1243,6 +1243,8 @@ if(BUILD_TESTING)
         add_executable(rune_subscriber_tests
             tests/subscriber/SubscriberTest.cpp
             tests/subscriber/SubscriberHubCommandTest.cpp
+            tests/subscriber/SubscriberHubRecordsRegressionTest.cpp   # catalog history Task 13 fix round 2
+            tests/support/AllocCounter.cpp                             # zero-alloc onRecords gate
         )
         target_include_directories(rune_subscriber_tests PRIVATE
             ${RUNE_PROTOCOL_INCLUDE}

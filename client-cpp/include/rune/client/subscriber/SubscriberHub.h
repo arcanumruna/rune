@@ -297,6 +297,11 @@ public:
     /// E2 final fix wave (I1): batches wholly below a moved subscription's
     /// resume floor (re-deliveries from a new leader whose HW lagged), dropped.
     [[nodiscard]] uint64_t movedDuplicateBatchesDropped() const noexcept { return movedDuplicateBatchesDropped_; }
+    /// Task 13 fix round 2 (M2): Records frames whose batch (the first, or one
+    /// after decoded ones) was malformed — the rest of the frame was dropped.
+    [[nodiscard]] uint64_t malformedBatches() const noexcept { return malformedBatches_; }
+    /// Control batches (transaction markers) in a Records frame: offsets consumed, never delivered.
+    [[nodiscard]] uint64_t controlBatchesSkipped() const noexcept { return controlBatchesSkipped_; }
 
     /// Spend one bare-NotLeader retry of the pending Subscribe `correlationId`.
     /// True while within `maxRetries` (re-send it); false when the budget is
@@ -476,6 +481,9 @@ private:
     uint64_t    subscriptionsMoved_    = 0;  // E2 Task 13: rearmMovedAway
     uint64_t    catalogReadsEnded_     = 0;  // catalog history Task 13: endCatalogRead
     uint64_t    movedDuplicateBatchesDropped_ = 0;  // E2 final fix wave (I1)
+    uint64_t    malformedBatches_      = 0;  // Task 13 fix round 2 (M2): counted + rate-limited log
+    uint64_t    controlBatchesSkipped_ = 0;
+    void noteMalformed_() noexcept;
     // E2 final fix wave (I2): moved subscriptions homed on leader node sessions.
     NodeRouter  router_{};
     std::size_t homedCount_        = 0;

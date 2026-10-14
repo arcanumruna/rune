@@ -18,6 +18,8 @@
 
 #pragma once
 
+#include <algorithm>
+#include <climits>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -263,16 +265,19 @@ struct RecordsView {
     int32_t                  topicId        = 0;
     int32_t                  partition      = 0;
     int64_t                  baseOffset     = 0;
-    std::span<const uint8_t> recordBatch;  // zero-copy view into the original buffer
+    // Zero-copy view into the original buffer.  ONE whole batch, or — Task 13 fix
+    // round 2, the whole class (DataMessages.h) — SEVERAL whole batches back to
+    // back.  Code that walks it itself must walk every batch (forEachRecord does).
+    std::span<const uint8_t> recordBatch;
 
-    // Number of records in this batch: parsed from recordBatch header using
-    // RecordBatchReader.  Correct advance = baseOffset + recordCount.
-    // Defaults to 1 for backward compatibility when recordBatch is empty/missing.
+    // Number of records in the frame (every batch): parsed from the batch headers
+    // using RecordBatchReader.  Defaults to 1 for backward compatibility when
+    // recordBatch is empty/missing (test stubs).
     int32_t                  recordCount    = 1;
-    // The batch's lastOffsetDelta (header): its last offset is baseOffset +
-    // lastOffsetDelta — compaction can leave holes INSIDE a batch, so the next
-    // offset is baseOffset + lastOffsetDelta + 1, not baseOffset + recordCount.
-    // Defaults to recordCount - 1 (no batch header).
+    // The frame's last offset minus baseOffset: the last batch's last offset is
+    // baseOffset + lastOffsetDelta — compaction can leave holes INSIDE a batch, so
+    // the next offset is baseOffset + lastOffsetDelta + 1, not baseOffset +
+    // recordCount.  Defaults to recordCount - 1 (no batch header).
     int32_t                  lastOffsetDelta = 0;
     [[nodiscard]] int64_t nextOffset() const noexcept {
         return baseOffset + static_cast<int64_t>(lastOffsetDelta) + 1;
@@ -286,22 +291,29 @@ struct RecordsView {
     // itself (raw-batch access) must honour deliverFrom.
     int64_t                  deliverFrom     = 0;
 
-    /// Visit every NEW record of the batch: fn(key, value, offset, timestamp)
+    /// Visit every NEW record of every batch: fn(key, value, offset, timestamp)
     /// for each record with offset >= deliverFrom — the records a straddling
     /// re-delivery carries below the consumer's position are never handed over
-    /// (E2 final fix wave, I4).  A malformed or empty batch visits nothing.
-    /// Templated (the visitor inlines; no allocation).  The spans are valid
-    /// only for the duration of the callback that received this view.
+    /// (E2 final fix wave, I4).  A control batch (transaction marker) is never
+    /// visited; the walk stops at the first malformed batch (an empty or
+    /// malformed frame visits nothing).  Templated (the visitor inlines; no
+    /// allocation).  The spans are valid only for the duration of the callback
+    /// that received this view.
     template <class Fn>
     void forEachRecord(Fn&& fn) const {
-        if (recordBatch.size() < static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead)) return;
-        rune::protocol::RecordBatchReader reader(recordBatch.data(), recordBatch.size());
-        if (!reader.ensureValid()) return;
         const int64_t from = deliverFrom;
-        reader.forEachRecord([&](std::string_view key, std::string_view value, int64_t offset, int64_t ts) {
-            if (offset < from) [[unlikely]] return;   // already consumed (straddling re-delivery)
-            fn(key, value, offset, ts);
-        });
+        std::span<const uint8_t> rest = recordBatch;
+        while (rest.size() >= static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead)) {
+            rune::protocol::RecordBatchReader reader(rest.data(), rest.size());
+            if (!reader.ensureValid()) return;
+            if (!reader.isControl()) {
+                reader.forEachRecord([&](std::string_view key, std::string_view value, int64_t offset, int64_t ts) {
+                    if (offset < from) [[unlikely]] return;   // already consumed (straddling re-delivery)
+                    fn(key, value, offset, ts);
+                });
+            }
+            rest = rest.subspan(static_cast<std::size_t>(reader.totalLength()));
+        }
     }
 };
 
@@ -347,16 +359,36 @@ inline std::optional<RecordsView> decodeRecords(const uint8_t* buf,
     v.partition      = opt->partition;
     v.baseOffset     = opt->baseOffset;
     v.recordBatch    = opt->recordBatch;
-    // Parse record count from RecordBatch header (little-endian at offset 57).
-    // RecordBatchReader requires at least kRecordBatchOverhead (61) bytes.
-    if (v.recordBatch.size() >= static_cast<std::size_t>(
-            rune::protocol::batch::kRecordBatchOverhead)) {
-        rune::protocol::RecordBatchReader reader(v.recordBatch.data(),
-                                                  v.recordBatch.size());
+    // Parse the record count / last offset from the batch headers (little-endian;
+    // RecordBatchReader requires at least kRecordBatchOverhead (61) bytes).  Every
+    // whole batch of the frame counts (Task 13 fix round 2): a frame of several
+    // batches spans to its LAST batch's last offset.  The walk stops at a batch
+    // whose length does not fit the frame (a stub / torn tail).
+    namespace pb = rune::protocol::batch;
+    std::span<const uint8_t> rest = v.recordBatch;
+    bool any = false;
+    int64_t count = 0, lastAbs = 0;
+    while (rest.size() >= static_cast<std::size_t>(pb::kRecordBatchOverhead)) {
+        rune::protocol::RecordBatchReader reader(rest.data(), rest.size());
         const int32_t cnt = reader.recordCount();
-        v.recordCount = (cnt > 0) ? cnt : 1;
         const int32_t lod = reader.lastOffsetDelta();
-        v.lastOffsetDelta = lod >= v.recordCount - 1 ? lod : v.recordCount - 1;
+        const int64_t c   = cnt > 0 ? cnt : 1;
+        const int64_t abs = reader.baseOffset() + std::max<int64_t>(lod, c - 1);
+        if (!any) {
+            // The first batch: as before (a stub keeps its own header fields).
+            v.recordCount     = static_cast<int32_t>(c);
+            v.lastOffsetDelta = static_cast<int32_t>(std::max<int64_t>(lod, c - 1));
+        }
+        const int32_t tl = reader.totalLength();
+        if (tl < pb::kRecordBatchOverhead || static_cast<std::size_t>(tl) > rest.size()) break;
+        any = true;
+        count += c;
+        lastAbs = abs;
+        rest = rest.subspan(static_cast<std::size_t>(tl));
+    }
+    if (any && count > v.recordCount) {   // several batches: the frame-wide fields
+        v.recordCount     = static_cast<int32_t>(std::min<int64_t>(count, INT32_MAX));
+        v.lastOffsetDelta = static_cast<int32_t>(std::clamp<int64_t>(lastAbs - v.baseOffset, 0, INT32_MAX));
     }
     // else: recordCount stays 1 (default — empty/stub batch in tests)
     return v;

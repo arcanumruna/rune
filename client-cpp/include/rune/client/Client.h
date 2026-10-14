@@ -22,6 +22,12 @@
 //   - *AndWait() are cold-path blocking conveniences: pump-until-done on the
 //     Invoker owner, an idle-strategy poll on a Thread-mode app thread; they
 //     throw on any non-Ok outcome.  Never call them from a duty-cycle callback.
+//   - EXCEPT the catalog reads (catalogHistory / catalogAsOf / catalogDiff /
+//     catalogReader()): the Client's CatalogReader belongs to the thread that
+//     CONSTRUCTED the Client, in every runner mode — any other thread gets
+//     std::logic_error (its cache is owner-thread state, shared with no one).
+//     Another app thread reads the catalog through its OWN reader:
+//     `rune::client::CatalogReader mine(client);` constructed on that thread.
 //   - Callbacks (onConnected / onError) fire on the duty thread, onDisconnected
 //     on the thread that runs close().  Do not block inside them.
 //
@@ -832,17 +838,20 @@ public:
 
     // ---- Catalog history (Task 13, spec §7): reads of `__catalog` ----------------
     // Each call refreshes this Client's CatalogReader (catalogReader()): it reads
-    // the committed tail from the cache end minus one (the overlap event is
-    // verified; from 0 the first time) on the seed broker — any broker serves it — until the caught-up marker, replaying every
+    // the committed tail from its cache end (from 0 the first time) on the seed
+    // broker — any broker serves it — until the caught-up marker, replaying every
     // event with the shared verifying library, then answers from the cached,
-    // replayed prefix with that library's history / stateAsOf / diff.  Blocking
-    // like the *AndWait sugar (the Invoker owner pumps doWork()); callable ONLY
-    // from the Client's constructing thread (the reader's owner, bound in the
-    // constructor): any other thread gets std::logic_error.  Never a hang: no marker before `timeout`
-    // is CatalogReadError::Kind::Timeout (a long-leaderless catalog withholds the
-    // marker); a fingerprint / decode / gap failure is Kind::Replay naming its
-    // offset (the verified prefix stays cached); a stale prefix (a truncation
-    // below a served high watermark) is re-validated before anything is served.
+    // replayed prefix with that library's history / stateAsOf / diff.  The cache
+    // is (prefix, the broker's history epoch): a stream whose epoch differs (a
+    // truncation below a served high watermark, another broker) drops it and
+    // re-reads from 0 — a stale history is never served.  Blocking like the
+    // *AndWait sugar (the Invoker owner pumps doWork()); callable ONLY from the
+    // Client's constructing thread (the reader's owner, bound in the
+    // constructor): any other thread gets std::logic_error, in every runner mode
+    // (another thread constructs its own CatalogReader).  Never a hang: no marker
+    // before `timeout` is CatalogReadError::Kind::Timeout (a long-leaderless
+    // catalog withholds the marker); a fingerprint / decode / gap failure is
+    // Kind::Replay naming its offset (the verified prefix stays cached).
     /// SHOW HISTORY: the matching events, in offset order.
     CatalogResult<std::vector<rune::catalog::RecordedEvent>> catalogHistory(const rune::catalog::HistoryFilter& filter,
                                                                             std::chrono::milliseconds timeout);
@@ -855,6 +864,7 @@ public:
                                                                      std::chrono::milliseconds timeout);
     /// The Client's own reader (built in the constructor; owned by the Client's
     /// constructing thread) — e.g. for its non-blocking beginRefresh / pollRefresh.
+    /// Any other thread: std::logic_error (every runner mode).
     CatalogReader& catalogReader();
 
     /// Topics successfully defined through this Client (Task 9 CLI), in

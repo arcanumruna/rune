@@ -1956,8 +1956,10 @@ void Client::andWait_(const char* what, std::chrono::nanoseconds timeout, uint32
 CatalogReader& Client::catalogReader() {
     // Hard rule 1: the reader is built in the constructor and the pointer never changes
     // (const) — no lazy creation, no first-caller race.  Its owner thread is the
-    // constructing thread; any other thread's call throws std::logic_error.
+    // constructing thread; any other thread's call throws std::logic_error HERE, in
+    // every runner mode (fix round 2: the reference itself is never handed out).
     static_assert(std::is_const_v<decltype(catalogReader_)>, "the catalog reader must be created eagerly and never reassigned");
+    catalogReader_->checkOwner_();
     return *catalogReader_;
 }
 
@@ -4227,8 +4229,11 @@ Subscription Client::subscribeImpl(TopicHandle              topic,
     impl->fromWire      = opts.from.toWire();
     impl->isolation     = static_cast<uint8_t>(opts.isolation);
     impl->handler       = std::move(handler);
-    // Catalog history (Task 13): the caught-up marker callback (TopicHandle::catalog()).
-    if (topic.topicId == rune::protocol::client::kCatalogTopicId) impl->onCaughtUp = std::move(opts.onCaughtUp);
+    // Catalog history (Task 13): the epoch note / caught-up marker callbacks (TopicHandle::catalog()).
+    if (topic.topicId == rune::protocol::client::kCatalogTopicId) {
+        impl->onCaughtUp     = std::move(opts.onCaughtUp);
+        impl->onHistoryEpoch = std::move(opts.onHistoryEpoch);
+    }
 
     // M2 FIX: a deadline so sweepTimedOut() can fail this subscribe if
     // SubscribeResponse never arrives (mirrors produce-ack timeout sweep).

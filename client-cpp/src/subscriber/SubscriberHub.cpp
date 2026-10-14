@@ -487,40 +487,43 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv, int64_t currentSessi
     // The spans are views into the Aeron fragment buffer, which is valid for
     // the duration of this call (i.e. during the RecordHandler callback).
     const auto& rb = rv.recordBatch;
-    if (rb.size() == 8) {
-        // E2 round 6: the TRANSIENT LINEAGE NOTE (client version 7) — the data
-        // lineage this subscription's records belong to (claimed on a resume).
+    if (rb.size() == 8) [[unlikely]] {
         uint64_t l = 0;
         for (int i = 0; i < 8; ++i) l |= static_cast<uint64_t>(rb[static_cast<std::size_t>(i)]) << (8 * i);
-        impl.lineage = l;
-        return;
-    }
-    if (rb.empty() && impl.topicId == rune::protocol::client::kCatalogTopicId) [[unlikely]] {
-        // Catalog history (Task 13): the CAUGHT-UP MARKER (client version 8) —
-        // the serving broker's high watermark, after the committed backlog.
-        // Never a position note (a catalog subscription is never moved).
-        if (impl.onCaughtUp) {
+        if (impl.topicId == rune::protocol::client::kCatalogTopicId) {
+            // Catalog history (client version 8, Task 13 fix round 2): the stream's
+            // HISTORY-EPOCH NOTE (baseOffset −1, before any record) or the CAUGHT-UP
+            // MARKER (baseOffset = the broker's HW, the same epoch).  Never a
+            // lineage note (catalog subscriptions are never transient).
             dispatching_ = &impl;
             try {
-                impl.onCaughtUp(rv.baseOffset);
+                if (rv.baseOffset < 0) { if (impl.onHistoryEpoch) impl.onHistoryEpoch(l); }
+                else if (impl.onCaughtUp) impl.onCaughtUp(rv.baseOffset, l);
             } catch (const std::exception& e) {
                 ++callbackExceptions_;
-                std::fprintf(stderr, "rune-client: catalog onCaughtUp threw: %s (caught; the duty cycle continues)\n",
-                             e.what());
+                std::fprintf(stderr, "rune-client: catalog epoch/caught-up callback threw: %s (caught; the duty "
+                                     "cycle continues)\n", e.what());
             } catch (...) {
                 ++callbackExceptions_;
-                std::fprintf(stderr, "rune-client: catalog onCaughtUp threw a non-std::exception (caught; the "
-                                     "duty cycle continues)\n");
+                std::fprintf(stderr, "rune-client: catalog epoch/caught-up callback threw a non-std::exception "
+                                     "(caught; the duty cycle continues)\n");
             }
             dispatching_ = nullptr;
             if (!impl.active) {   // finished from inside the callback (as for a record handler)
                 closeStatus_(impl);
                 if (!impl.unsubPending) activeById_.erase(it);
             }
+            return;
         }
+        // E2 round 6: the TRANSIENT LINEAGE NOTE (client version 7) — the data
+        // lineage this subscription's records belong to (claimed on a resume).
+        impl.lineage = l;
         return;
     }
     if (rb.empty()) {
+        // A catalog frame with no epoch is not a version-8 marker: never taken as
+        // "caught up" (the reader's deadline ends a read that never gets one).
+        if (impl.topicId == rune::protocol::client::kCatalogTopicId) [[unlikely]] { noteMalformed_(); return; }
         // A POSITION NOTE (client version 6): the broker's cursor for this
         // subscription, sent right before it answers NotLeader (moved).  Kept
         // only while nothing was delivered (rearmMovedAway resumes there).
@@ -528,34 +531,36 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv, int64_t currentSessi
         return;
     }
 
-    // A frame carries ONE batch, or — from the catalog read server, which coalesces —
-    // SEVERAL whole batches back to back: decode every one (a batch after the first
-    // was silently dropped before: the catalog reader only healed it by re-reading).
+    // A frame carries ONE batch, or SEVERAL whole batches back to back (the catalog
+    // read server coalesces; DataMessages.h): every one is decoded.  A control
+    // batch's offsets are consumed, never delivered.  No allocation: the visitor is
+    // a template (RecordBatchReader::forEachRecord), never a std::function.
     const int64_t before = impl.nextOffset;
     dispatching_ = &impl;
     std::span<const uint8_t> rest(rb.data(), rb.size());
     bool first = true;
     while (!rest.empty() && impl.active) {
         rune::protocol::RecordBatchReader reader(rest.data(), rest.size());
-        if (!reader.ensureValid()) {
+        if (!reader.ensureValid()) {   // also: shorter than a batch header
+            noteMalformed_();          // counted + logged (rate-limited), never silent
             if (first) { dispatching_ = nullptr; return; }   // Malformed batch — drop (never crash).
             break;                                           // a malformed tail: what was decoded stands
         }
         first = false;
         const auto batchLen = static_cast<std::size_t>(reader.totalLength());
+        const int64_t last  = reader.baseOffset() + static_cast<int64_t>(reader.lastOffsetDelta());
         // E2 final fix wave (I1): a moved subscription resumes at its position,
         // but the new leader may push from BELOW it — a batch straddling it
         // (brokers push whole batches), or whole batches below it while the new
         // leader's HW still lags the old one's (the gateway clamps the resume
         // offset to its HW).  Every record below the position was delivered
-        // before the move: never twice.  The floor is STICKY until a record at or
-        // above it is delivered (a re-armed subscription never meets a restarted
+        // before the move: never twice.  The floor is STICKY until a batch at or
+        // above it arrives (a re-armed subscription never meets a restarted
         // log: a restart ends the session, so the move fails explicitly).  No
         // allocation; one predicted compare per batch while no floor is set.
         int64_t dropBelow = -1;
         bool skip = false;
         if (impl.resumeFloor >= 0) [[unlikely]] {
-            const int64_t last = reader.baseOffset() + static_cast<int64_t>(reader.lastOffsetDelta());
             if (last < impl.resumeFloor) {   // wholly below: duplicates only
                 ++movedDuplicateBatchesDropped_;
                 skip = true;
@@ -564,11 +569,17 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv, int64_t currentSessi
                 impl.resumeFloor = -1;
             }
         }
+        if (!skip && reader.isControl()) [[unlikely]] {
+            // A control batch (a transaction marker): its offsets are consumed.
+            ++controlBatchesSkipped_;
+            if (last + 1 > impl.nextOffset) impl.nextOffset = last + 1;
+            skip = true;
+        }
         if (!skip) {
-            reader.forEach([&](std::string_view keyView,
-                               std::string_view valView,
-                               int64_t          absOffset,
-                               int64_t          timestamp)
+            reader.forEachRecord([&](std::string_view keyView,
+                                     std::string_view valView,
+                                     int64_t          absOffset,
+                                     int64_t          timestamp)
             {
                 // The handler may have unsubscribed this subscription (directly, on
                 // this thread): deliver nothing more of the batch.
@@ -603,7 +614,7 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv, int64_t currentSessi
                 impl.nextOffset = absOffset + 1;
             });
         }
-        if (batchLen == 0 || batchLen >= rest.size()) break;
+        if (batchLen >= rest.size()) break;
         rest = rest.subspan(batchLen);
     }
     dispatching_ = nullptr;
@@ -618,6 +629,15 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv, int64_t currentSessi
     }
     // One status snapshot per Records frame (not per record).
     if (impl.nextOffset != before || impl.statusDirty) publishStatus_(impl);
+}
+
+// A Records frame whose batch (the first, or one after decoded ones) is not a
+// valid RecordBatch: counted, and logged at most once per 1024 (duty thread).
+void SubscriberHub::noteMalformed_() noexcept
+{
+    if (malformedBatches_++ % 1024 == 0)
+        std::fprintf(stderr, "rune-client: a Records frame carried a malformed batch — dropped from there "
+                             "(malformed so far: %llu)\n", static_cast<unsigned long long>(malformedBatches_));
 }
 
 // ---------------------------------------------------------------------------

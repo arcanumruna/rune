@@ -90,9 +90,12 @@ struct TopicPartition {
 // it hands over every record exactly once across leader moves and resumes.
 // Brokers push WHOLE batches, so a batch straddling the member's position (a
 // resume after a leader move, a mid-batch committed offset) carries records
-// already consumed; forEachRecord skips them (offset < deliverFrom).  Code that
-// walks `recordBatch` itself (RecordBatchReader — raw-batch access) MUST skip
-// records with offset < deliverFrom, or it sees those records twice.
+// already consumed; forEachRecord skips them (offset < deliverFrom).  A frame
+// may carry SEVERAL whole batches (DataMessages.h); forEachRecord walks every one
+// and never visits a control batch.  Code that walks `recordBatch` itself
+// (RecordBatchReader — raw-batch access) MUST walk every batch, skip control
+// batches and skip records with offset < deliverFrom, or it loses or repeats
+// records.
 // ---------------------------------------------------------------------------
 using RecordSet = codec::RecordsView;
 
