@@ -37,6 +37,7 @@
 #include <rune/node/AdminWorker.h>
 #include <rune/node/SchemaRegistry.h>
 #include <rune/node/CatalogEffectFrames.h>
+#include <rune/gateway/TopicDirMarker.h>
 #include <rune/node/TopicDirReconcile.h>
 #include <rune/codec/Serialize.h>
 #include <rune/view/ViewPlan.h>   // Task 20: deserializeCompiledViewPlan (view->source co-location)
@@ -406,9 +407,14 @@ void BrokerNode::start() {
     for (std::size_t i = config_.topics.size(); i < bootTopics_.size(); ++i) {   // [0, n) are the static topics
         const TopicSpec& t = bootTopics_[i];
         if (topicRegistry_->createTopicAt(t.topicId, t) >= 0) continue;
-        if (bootApplier_ && bootApplier_->halted()) {
-            spdlog::critical("BrokerNode[{}]: catalog topic '{}' (id {}) not built on this halted boot (see the "
-                             "TopicRegistry error above)", config_.nodeId, t.name, t.topicId);
+        // Fix round 2 (F1): a boot whose dirs step 0 did NOT settle (halted, or the reconcile deferred) never turns
+        // a marker mismatch into a refusal to start: the topic stays unbuilt, never opened over the wrong dir.
+        const bool untrustedPrefix = (bootApplier_ && bootApplier_->halted()) || bootReconcileDeferred_;
+        if (untrustedPrefix) {
+            spdlog::critical("BrokerNode[{}]: catalog topic '{}' (id {}) not built at boot — its dir belongs to another "
+                             "incarnation and the local catalog is {} (see the TopicRegistry error above); the topic "
+                             "is not served by this broker until the catalog settles", config_.nodeId, t.name,
+                             t.topicId, bootApplier_ && bootApplier_->halted() ? "halted" : "still catching up");
             unbuilt.push_back(t.topicId);
             continue;
         }
@@ -4476,6 +4482,14 @@ void BrokerNode::dropRuntimeTopic_(int32_t topicId, const std::string& name) {
     if (spec == nullptr) {   // unknown / gap / already dropped: the same effect again (idempotent)
         if (topicRegistry_->state(topicId) == rune::gateway::TopicRegistry::TopicState::Unknown)
             (void)topicRegistry_->dropTopic(topicId);   // a Gap id: seen now — dropped, never refilled
+        // Fix round 2 (F4): a dir marked with THIS dropped id never stays under topics/<name> (a re-create of
+        // the name would be refused for a dir no topic uses): the retire sequence renames and purges it.
+        const auto m = rune::gateway::readTopicIdMarker(fs::path(config_.dataDir) / "topics" / name);
+        if (m.kind == rune::gateway::TopicIdMarker::Kind::Valid && m.id == topicId) {
+            DroppedTopic d;
+            d.id = topicId; d.name = name; d.diskBacked = true; d.step = AwaitingRename{};
+            droppedAwaitingRetire_.push_back(std::move(d));
+        }
         return;
     }
     DroppedTopic d;

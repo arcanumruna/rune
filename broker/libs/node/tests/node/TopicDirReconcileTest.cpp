@@ -123,6 +123,19 @@ TEST(TopicDirReconcileRegression, OlderIncarnationMarkerGoesToDroppedAndIsPurged
     EXPECT_FALSE(fs::exists(d.path / "quarantine"));
 }
 
+// F4 (fix round 2): a dir carrying a Valid marker is a catalog topic dir even without a partition dir.
+TEST(TopicDirReconcileRegression, MarkerOnlyDirOfADroppedIdIsRetiredRegression) {
+    TempDataDir d("markeronly");
+    mark(d.path / "topics" / "t", 2);   // no partition dir
+    const std::vector<int32_t> dropped = {2};
+    const auto r = rune::node::reconcileTopicDirs(d.path.string(), {spec("t", 4)}, dropped, kNow);
+    ASSERT_EQ(r.retired.size(), 1u);
+    EXPECT_EQ(r.retired[0], d.path / "dropped" / "2.t");
+    ASSERT_EQ(r.purged.size(), 1u);
+    EXPECT_FALSE(fs::exists(d.path / "topics" / "t"));
+    EXPECT_FALSE(fs::exists(d.path / "quarantine"));
+}
+
 TEST(TopicDirReconcileRegression, MarkerNamingANonDroppedIdOrUnattributedDataIsQuarantinedRegression) {
     TempDataDir d("unattributed");
     // a marker naming an id that is neither the claim nor dropped

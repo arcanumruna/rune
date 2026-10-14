@@ -23,6 +23,7 @@
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/node/BrokerNode.h>
+#include <rune/gateway/TopicDirMarker.h>
 #include <rune/node/CatalogCheckpoint.h>
 #include <rune/node/TopicDirReconcile.h>
 #include <rune/node/NodeConfig.h>
@@ -1010,4 +1011,76 @@ TEST(CatalogBootRegression, WipedCatalogLeaderNeverReconcilesAgainstAnEmptyCatal
     EXPECT_FALSE(fs::exists(r.dataDir() / "quarantine"));
     EXPECT_EQ(r.node().bootReconcileStateForTest(), "AwaitingCatchUp");
     EXPECT_EQ(sentinelOf(r.dataDir()).kind, rune::node::CatchUpSentinel::Kind::Pending);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Fix round 2
+// ═════════════════════════════════════════════════════════════════════════════
+// F1: a deferred boot (the sentinel is Pending) whose prefix topic's dir carries another incarnation's marker
+// leaves that topic unbuilt and STARTS — it never refuses to start, at this boot or any later one.
+TEST(CatalogBootRegression, DeferredBootWithAnotherIncarnationsDirLeavesTheTopicUnbuiltAndStartsRegression) {
+    BootRig r("boot_f1");
+    ASSERT_TRUE(r.start());
+    ASSERT_EQ(r.define({.name = "t", .typed = true}).code, kOk);   // id 0
+    ASSERT_TRUE(r.awaitServes(0));
+    ASSERT_TRUE(r.produce(0, 0, "x"));
+    r.stop();
+    { std::ofstream(r.dataDir() / "topics" / "t" / "topic-id", std::ios::trunc) << "5\n"; }   // another incarnation
+    ASSERT_TRUE(rune::node::writeCatchUpSentinel(r.dataDir().string(), -1));   // a crash in the middle of catch-up
+    const auto before = treeOf(r.dataDir() / "topics" / "t");
+    ASSERT_TRUE(r.start()) << "a deferred boot never refuses to start over a refused topic";
+    EXPECT_EQ(r.node().bootReconcileStateForTest(), "AwaitingCatchUp");
+    std::this_thread::sleep_for(1s);
+    EXPECT_FALSE(r.node().catalogTopicServesForTest(0)) << "never opened over the wrong dir";
+    EXPECT_EQ(treeOf(r.dataDir() / "topics" / "t"), before) << "byte-identical";
+    EXPECT_FALSE(fs::exists(r.dataDir() / "quarantine"));
+}
+
+// F2: a wiped broker that LEADS the catalog accepts no DDL — an explicit Internal — so it never extends an
+// untrusted history (the ids would restart at 0 and re-open an older history's dir).
+TEST(CatalogBootRegression, WipedCatalogLeaderRefusesDdlExplicitlyAndNeverOpensAnOlderHistorysDirRegression) {
+    BootRig r("boot_f2");
+    ASSERT_TRUE(r.start());
+    ASSERT_EQ(r.define({.name = "a"}).code, kOk);   // id 0
+    ASSERT_TRUE(r.awaitServes(0));
+    ASSERT_TRUE(r.produce(0, 0, "r1"));
+    ASSERT_TRUE(r.produce(0, 0, "r2"));
+    r.stop();
+    fs::remove_all(r.dataDir() / "__catalog");
+    ASSERT_TRUE(r.start());
+    EXPECT_EQ(r.define({.name = "a"}).code, kInternal) << "explicit, non-retriable";
+    EXPECT_FALSE(r.node().catalogTopicServesForTest(0));
+    const uint64_t refused = r.node().onAdminThreadForTest(
+        [&] { return r.node().adminWorkerAgentForTest()->worker().ddlRefusedUntrustedLeader(); });
+    EXPECT_GE(refused, 1u);
+    EXPECT_EQ(slurp(r.dataDir() / "topics" / "a" / "topic-id"), "0\n");
+    std::uintmax_t bytes = 0;
+    for (const auto& e : fs::recursive_directory_iterator(r.dataDir() / "topics" / "a"))
+        if (e.path().extension() == ".log") bytes += fs::file_size(e.path());
+    EXPECT_GT(bytes, 0u) << "the old history's records are untouched";
+    r.stop();
+    ASSERT_TRUE(r.start()) << "the next boot still starts";
+    EXPECT_EQ(r.node().bootReconcileStateForTest(), "AwaitingCatchUp");
+}
+
+// F4(b): a drop of a never-built id retires the dir it marked; a dir marked with ANOTHER id is never retired.
+TEST(CatalogBootRegression, DropOfANeverBuiltIdRetiresTheDirItMarkedRegression) {
+    BootRig r("boot_f4");
+    ASSERT_TRUE(r.start());
+    fs::create_directories(r.dataDir() / "topics" / "u");
+    ASSERT_TRUE(rune::gateway::writeTopicIdMarker(r.dataDir() / "topics" / "u", 3));
+    fs::create_directories(r.dataDir() / "topics" / "v");
+    ASSERT_TRUE(rune::gateway::writeTopicIdMarker(r.dataDir() / "topics" / "v", 4));
+    auto postDrop = [&](int32_t id, const std::string& name) {
+        std::vector<uint8_t> p(rune::node::catalogTopicDroppedWireLen(name));
+        rune::node::writeCatalogTopicDropped(p.data(), id, name);
+        r.node().postCatalogEffectForTest(rune::node::kA2cCatalogTopicDropped, std::move(p));
+    };
+    postDrop(3, "u");
+    postDrop(3, "v");   // the control: v is marked 4, not 3
+    EXPECT_TRUE(awaitTrue([&] { return !fs::exists(r.dataDir() / "topics" / "u"); }, 5s));
+    EXPECT_TRUE(awaitTrue([&] { return !fs::exists(r.dataDir() / "dropped" / "3.u"); }, 5s)) << "purged";
+    EXPECT_FALSE(fs::exists(r.dataDir() / "quarantine"));
+    std::this_thread::sleep_for(1s);
+    EXPECT_TRUE(fs::exists(r.dataDir() / "topics" / "v")) << "a marker naming another id is never retired";
 }

@@ -105,16 +105,31 @@ read and never changed (there is no migration); a warning names them if they hol
 - **A boot whose catalog replay halts moves, renames, deletes and quarantines nothing.** The
   broker boots with the catalog it had already applied, accepts no catalog change, and logs the
   halt at critical level. Repair the catalog, then restart.
-- **A broker whose local `__catalog` is empty or missing while `dataDir/topics/` holds topics**
-  (an operator deleted it, or the disk is new) does not reconcile at boot. It first catches up
-  to the catalog leader's committed history, serves the topics that history names over their
-  existing directories, and only then quarantines the directories no topic claims.
+- **A broker whose local `__catalog` is empty or missing while `dataDir/topics/` holds
+  catalog-made topics** (a topic directory with a `topic-id` marker; the catalog was lost, or the
+  disk is new) touches no topic directory at boot. It writes `dataDir/.catalog-catchup` (`pending`).
+  - As a **follower** of a multi-broker cluster it catches up to the catalog leader's committed
+    history, serves the topics that history names over their existing directories, and writes
+    `caughtup <offset>` into the file. The directories no topic claims are quarantined at the
+    **next boot**, after which the file is removed. A crash during catch-up leaves `pending`: the
+    next boot touches nothing.
+  - A **single-node broker, or any broker that leads `__catalog` before it caught up,** has no
+    history to catch up to. It keeps every topic directory in place and serves none of those topics
+    (they answer `UnknownTopic`). It refuses every DDL with error 6 (`Internal`), counted by
+    `ddlRefusedUntrustedLeader` and logged at critical level, until `__catalog` is restored from a
+    backup. Do not delete `dataDir/__catalog` to repair a broker: restore it.
+- **A catalog topic whose directory belongs to another incarnation is never opened.** Each catalog
+  topic directory holds `topic-id`, the id of the topic that made it. If it names another id, the
+  topic is not built: on a halted or still-catching-up boot this is logged at critical level and the
+  broker keeps starting without that topic. The next healthy boot moves a directory marked with a
+  dropped id to `dataDir/dropped/` and purges it, and quarantines any other mismatch.
+- **Upgrade:** a catalog topic directory that holds records but has no `topic-id` marker (made by a
+  build before markers) is quarantined at the first boot. Its data is never deleted.
 - A boot refuses to start, with an error that names both offsets, when `dataDir/__catalog/applied`
   (the last applied offset) is at or past the end of the local `__catalog` log: events this broker
   already applied are missing, and replaying a shorter history would fork its catalog. Restore the
-  data directory, or delete `dataDir/__catalog` entirely (including `applied`) so the broker
-  refetches the catalog from its peers. A corrupt `applied` file refuses to start too. A missing
-  one means nothing was applied yet.
+  data directory from a backup. A corrupt `applied` file refuses to start too. A missing one means
+  nothing was applied yet.
 - Delete quarantined directories yourself once you no longer need them; the broker never
   deletes from `dataDir/quarantine/`.
 - **A `RUNE_TOPICS` name may not collide with a runtime topic.** If a `RUNE_TOPICS` entry has

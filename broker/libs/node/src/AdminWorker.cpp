@@ -601,6 +601,19 @@ void AdminWorker::startNext_(int64_t nowNs) {
         answer_(req, kInternal, "catalog apply halted at offset " + std::to_string(h->offset));
         return;
     }
+    // Fix round 2 (F2): a broker that LEADS __catalog while its boot reconcile awaits catch-up has an untrusted
+    // (wiped) history — it appends nothing to it.  Explicit and non-retriable, never NotLeader.
+    if (std::holds_alternative<AwaitingCatchUp>(bootReconcile_) &&
+        catalogReplica_->role() == rune::replication::Role::Leader) {
+        ++ddlRefusedUntrustedLeader_;
+        if (ddlRefusedUntrustedLeader_ % 1024 == 1)
+            spdlog::critical("AdminWorker: DDL refused — this broker leads __catalog without its history (the local "
+                             "catalog was wiped while catalog-made topic dirs exist); restore dataDir/__catalog, or "
+                             "let this broker catch up as a follower (refused so far: {})", ddlRefusedUntrustedLeader_);
+        answer_(req, kInternal, "this broker leads __catalog without its history (local catalog wiped) — no catalog "
+                                "change is accepted until __catalog is restored");
+        return;
+    }
     if (const auto* f = std::get_if<CatalogFollower>(&role_)) {
         if (meta.requestId.none() && f->leaderId >= 0 && f->leaderId != selfId_) {
             // F37: a pre-v8 client cannot follow a Redirect to the known leader — an

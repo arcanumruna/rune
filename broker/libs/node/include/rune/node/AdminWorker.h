@@ -308,6 +308,8 @@ public:
     [[nodiscard]] uint64_t eventsAppended() const noexcept { return eventsAppended_; }
     /// Pre-v8 DDLs refused on a non-leader (F37).
     [[nodiscard]] uint64_t preV8Refused() const noexcept { return preV8Refused_; }
+    /// DDLs refused because this broker leads __catalog without its (wiped) history (fix round 2, F2).
+    [[nodiscard]] uint64_t ddlRefusedUntrustedLeader() const noexcept { return ddlRefusedUntrustedLeader_; }
     [[nodiscard]] static constexpr int64_t ddlTimeoutNs() noexcept { return kDdlTimeoutNs; }
 
     // ── The in-flight DDL (rule 3) ──────────────────────────────────────────
@@ -414,6 +416,7 @@ private:
     uint64_t answered_          = 0;
     uint64_t eventsAppended_    = 0;
     uint64_t preV8Refused_      = 0;
+    uint64_t ddlRefusedUntrustedLeader_ = 0;
     bool     applyHeldForTest_  = false;   // holdApplyForTest (test seam only)
 
     // The booted applier's goLive, owed to the admin thread's first pass (Task 16).

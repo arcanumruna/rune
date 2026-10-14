@@ -165,8 +165,9 @@ void settleClaimedDirs(const fs::path& dataDir, const fs::path& topicsRoot, cons
         const TopicSpec* t = nullptr;
         for (const TopicSpec& cand : catalogTopics)
             if (cand.name == fname || topicNamesFoldEqual(cand.name, fname)) { t = &cand; break; }
-        if (t == nullptr || !isTopicDirLayout(c)) continue;
+        if (t == nullptr) continue;
         const gw::TopicIdMarker m = gw::readTopicIdMarker(c);
+        if (!isTopicDirLayout(c) && m.kind != gw::TopicIdMarker::Kind::Valid) continue;   // not a topic dir: left alone
         const bool valid     = m.kind == gw::TopicIdMarker::Kind::Valid;
         const bool transient = t->persistence == PersistenceMode::Transient;
         if (valid && m.id == t->topicId && !transient) continue;                 // keep: this incarnation's own dir
