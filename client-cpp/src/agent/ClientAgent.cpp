@@ -999,14 +999,36 @@ bool SessionEndpointIo::sendFrame(const uint8_t* buf, std::size_t len) {
     return agent->offerControlTo(*owner, buf, len);
 }
 
-bool SessionEndpointIo::retarget(const std::string& /*newIngressChannel*/) noexcept {
-    // Multi-node addresses each leader endpoint explicitly (offerTo), so a per-node
-    // session never retargets the shared default pub.  A ConnectResponse-based
-    // redirect on a leader session is a no-op here (the leader endpoint is already
-    // the correct target); the Client-level redirect handler drives re-routing via
-    // the metadata cache + routing table.  Report success so the SessionMachine
-    // proceeds to resend its ConnectRequest on the same (correct) endpoint.
+bool SessionEndpointIo::retarget(const std::string& newIngressChannel) noexcept {
+    // Follower-connect hang fix: the SEED's connect-time Redirect (its
+    // SessionMachine, in Connecting, calls this before resending the Connect)
+    // moves the seed's control path — the default publication — to the named
+    // endpoint.  This used to be a no-op for every session, the seed included,
+    // while Client::onEgressFrame deliberately leaves a connect-time Redirect to
+    // the SessionMachine: nobody followed it, every resend went back to the
+    // redirecting broker, the redirect budget ran out and the connect hung to
+    // its deadline.  D4 r2: the seed by identity.
+    if (owner == &agent->seedSession()) return agent->retargetSeedOnConnectRedirect_(newIngressChannel);
+    // A leader session: multi-node addresses each leader endpoint explicitly
+    // (offerTo), so it never retargets the shared default pub; the Client-level
+    // redirect handler re-routes via the metadata cache + routing table.  Report
+    // success so the SessionMachine resends on the same (correct) endpoint.
     return true;
+}
+
+bool ClientAgent::retargetSeedOnConnectRedirect_(const std::string& endpoint) noexcept {
+    try {
+        // "host:port" or a full Aeron channel (the broker sends the channel).
+        const std::string channel = endpoint.rfind("aeron:", 0) == 0 ? endpoint : "aeron:udp?endpoint=" + endpoint;
+        if (transport_.ingressChannel() == channel) return true;
+        if (!transport_.retarget(channel)) return false;   // old pub intact; the resend is budget-bounded
+        Session& seed            = seedSession();
+        seed.currentLeaderChannel = channel;
+        seed.currentLeaderNode    = -1;   // the node id is learnt from the metadata answer
+        return true;
+    } catch (...) {
+        return false;   // allocation failure (cold path): keep the old pub
+    }
 }
 
 bool SessionEndpointIo::retargetToBootstrap() noexcept {

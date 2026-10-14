@@ -1856,6 +1856,19 @@ int Client::retryUnsentControl_() {
 }
 
 void Client::sweepControl_(int64_t nowNs) {
+    // Follower-connect hang fix (whole class): a pending connect whose seed
+    // machine GAVE UP — back in Disconnected after its redirect budget ran out,
+    // a connect error, or its own connect timeout — can never be answered.  It
+    // ends now, explicitly NotConnected, never by waiting out its deadline.
+    // (connect() moves the machine out of Disconnected before the op is pending;
+    // Backoff — reconnect-forever — keeps trying and stays deadline-bounded.)
+    if (hasPendingConnect_ &&
+        agent_.seedMachine().state() == session::SessionState::Disconnected) [[unlikely]] {
+        static constexpr std::string_view kGaveUp =
+            "connect() gave up (redirect budget exhausted or connect refused): not connected";
+        completeConnect_(OpStatus::NotConnected, 0, 0, kGaveUp);
+        if (cbError_) invokeUserCallback_("onError", [&] { cbError_(std::string(kGaveUp)); });
+    }
     if (hasPendingConnect_ && nowNs >= pendingConnect_.deadlineNs) {
         completeConnect_(OpStatus::Timeout, 0, 0, {});
         if (cbError_) {

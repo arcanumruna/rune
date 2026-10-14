@@ -89,9 +89,12 @@ class ClientAgent;
 // (offerTo(channel, ...)), instead of the legacy single retarget()ed ingress
 // pub.  The seed session's endpoint == the transport's default ingress channel,
 // so its offerTo() fast-paths straight back to the byte-identical default offer.
-// Multi-node: each leader session offers to its own channel.  Retarget on this
-// adapter is a NO-OP (multi-node addresses endpoints explicitly — it never
-// retargets the shared default pub).  Agent-thread only.
+// Multi-node: each leader session offers to its own channel.  Retarget on a
+// LEADER session's adapter is a NO-OP (multi-node addresses endpoints
+// explicitly).  On the SEED's adapter it follows the connect-time Redirect: the
+// seed's control path IS the default pub, so it is retargeted (follower-connect
+// hang fix — a no-op here re-sent every Connect to the redirecting broker until
+// the redirect budget ran out).  Agent-thread only.
 // ---------------------------------------------------------------------------
 struct Session;
 
@@ -936,6 +939,13 @@ private:
     /// T15a fix2 A-B1: the inverse — back to seed.lastKnownLeaderChannel (no-op
     /// when none is known or already there).  Agent thread only (cold path).
     bool retargetSeedToLastKnownLeader_() noexcept;
+    /// Follower-connect hang fix: the seed's CONNECT-TIME Redirect — point the
+    /// default ingress publication (the seed's control path) at the endpoint the
+    /// redirecting gateway named ("host:port" or a full Aeron channel), so the
+    /// SessionMachine's resent ConnectRequest reaches it.  False = the new
+    /// publication did not resolve (the old one stays; the resend is bounded by
+    /// the redirect budget).  Agent thread only (cold path).
+    bool retargetSeedOnConnectRedirect_(const std::string& endpoint) noexcept;
 
     // ---- Task 1.4: shared produce→leader routing (drain path + redirect resend) --
     // Probe the route slot, resolve its session / pub once, hold if the session is not

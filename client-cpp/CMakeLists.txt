@@ -1069,6 +1069,7 @@ if(BUILD_TESTING)
     if(aeron_FOUND)
         add_executable(rune_redirect_tests
             tests/client/RedirectTest.cpp
+            tests/client/ConnectRedirectRegressionTest.cpp
         )
         target_include_directories(rune_redirect_tests PRIVATE
             ${RUNE_PROTOCOL_INCLUDE}
