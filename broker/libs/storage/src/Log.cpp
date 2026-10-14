@@ -613,8 +613,11 @@ int Log::provisionReady(std::size_t depth, bool preallocate) {
             // D19 N6d: never silent — counted, logged (rate-limited) and
             // reported as a failed build.  The queued records each end an
             // owner hold, so no demand is left without an answer.
-            if ((++readyDrops_ & (readyDrops_ - 1)) == 0)
-                spdlog::warn("Log {}: ready ring full — a built segment was discarded (drops={})", dir_, readyDrops_);
+            // Sanitizer triage 2026-10-14: `(++readyDrops_ & (readyDrops_ - 1))` was an
+            // unsequenced modify+read (UB, -Wunsequenced) — the first drop could go unlogged.
+            const uint64_t drops = ++readyDrops_;
+            if ((drops & (drops - 1)) == 0)
+                spdlog::warn("Log {}: ready ring full — a built segment was discarded (drops={})", dir_, drops);
             return built > 0 ? built : -ENOBUFS;
         }
         ++built;

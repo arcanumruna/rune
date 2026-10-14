@@ -17,6 +17,8 @@
 //
 // Every test here is a regression test (name contains "Regression").
 #include <gtest/gtest.h>
+#include <spdlog/sinks/ringbuffer_sink.h>
+#include <spdlog/spdlog.h>
 #include <rune/storage/testing/DemandChannelForTest.h>
 #include <rune/storage/testing/ScopedNoDacOverride.h>
 #include <rune/storage/Log.h>
@@ -35,6 +37,7 @@
 #include <thread>
 #include <vector>
 #include <unistd.h>
+#include <sys/mman.h>
 
 using namespace rune::storage;
 using namespace rune::protocol;
@@ -1070,6 +1073,58 @@ TEST(SegmentLifecycleRegression, ReadyRingFullAfterABuildIsReportedRegression) {
         EXPECT_EQ(countSuffix(dir, ".stlog"), 0u) << "its staging files are removed";
         EXPECT_EQ(log.readyDropsForTest(), 1u);
     }
+    fs::remove_all(dir);
+}
+
+// Sanitizer triage 2026-10-14: the drop counter's rate-limited warning was
+// `(++readyDrops_ & (readyDrops_ - 1)) == 0` — an unsequenced modify + read (UB).
+// The FIRST drop must be logged (power-of-two rate limit: drops 1, 2, 4, ...).
+TEST(SegmentLifecycleRegression, FirstReadyRingDropIsLoggedRegression) {
+    const auto dir = freshDir("rune_slh_n6d_log");
+    {
+        Log log(dir.string(), 512);
+        log.recover();
+        log.setProvisioning(nullptr);
+        log.setProvisionFaultForTest(EIO, 1 << 20);
+        for (int i = 0; i < 64; ++i) (void)log.provisionReady(1);
+        log.setProvisionFaultForTest(0, 0);
+        auto sink = std::make_shared<spdlog::sinks::ringbuffer_sink_mt>(64);
+        const std::shared_ptr<spdlog::logger> previous = spdlog::default_logger();
+        spdlog::set_default_logger(std::make_shared<spdlog::logger>("n6d-capture", sink));
+        const int rc = log.provisionReady(1);
+        spdlog::set_default_logger(previous);
+        EXPECT_LT(rc, 0);
+        ASSERT_EQ(log.readyDropsForTest(), 1u);
+        int warned = 0;
+        for (const std::string& l : sink->last_formatted())
+            if (l.find("ready ring full") != std::string::npos && l.find("drops=1") != std::string::npos) ++warned;
+        EXPECT_EQ(warned, 1) << "the first discarded segment is logged with drops=1";
+    }
+    fs::remove_all(dir);
+}
+
+// Sanitizer triage C1 (2026-10-14, macOS `leaks` on this binary): a retired
+// read mapping posted for off-owner disposal is owned by its ring record.  A
+// channel destroyed with that record still queued (provisioner stopped first /
+// never running) leaked the MappedFile and its mmap.  The channel's destructor
+// now frees queued dispose records: the mapping is gone afterwards.
+TEST(SegmentLifecycleRegression, QueuedReadMapDisposalIsFreedWithTheChannelRegression) {
+    const auto dir = freshDir("rune_slh_dispose_leak");
+    const auto path = (dir / "f.bin").string();
+    { std::ofstream(path) << std::string(8192, 'x'); }
+    void* addr = nullptr;
+    {
+        ProvisionChannel ch;
+        auto* m = new MappedFile(path, 8192, /*writable=*/false);
+        addr = m->data();
+        ASSERT_NE(addr, nullptr);
+        ASSERT_EQ(::msync(addr, 4096, MS_ASYNC), 0) << "mapped while queued";
+        ASSERT_TRUE(ch.post(ProvisionChannel::kDisposeMsgType,
+                            static_cast<int64_t>(reinterpret_cast<std::uintptr_t>(m)), 0));
+    }   // nobody served the channel
+    errno = 0;
+    EXPECT_EQ(::msync(addr, 4096, MS_ASYNC), -1) << "the queued mapping was never unmapped (leaked)";
+    EXPECT_EQ(errno, ENOMEM);
     fs::remove_all(dir);
 }
 

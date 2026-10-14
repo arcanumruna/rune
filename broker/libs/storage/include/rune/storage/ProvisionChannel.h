@@ -11,6 +11,7 @@
 // (ring-implementation internals); no lock, no allocation after construction.
 #include <rune/consensus/ControlRing.h>
 #include <rune/consensus/detail/RingDoorbell.h>
+#include <rune/storage/MappedFile.h>
 
 #include <cstdint>
 
@@ -28,6 +29,17 @@ public:
         const auto w = ring_.watchInfo();
         (void)bell_.addWatch(rune::consensus::detail::RingWatch{w.buffer, w.length, w.capacity,
                                                                   w.headPositionIndex});
+    }
+    /// Sanitizer triage C1 (2026-10-14, macOS `leaks`): a dispose record OWNS its
+    /// retired read mapping (the poster released it).  Every thread is stopped
+    /// when the channel is destroyed — this thread is the ring's only consumer —
+    /// so mappings the provisioner never reached (stopped first, or no
+    /// provisioner) are freed here instead of leaking with the ring.
+    ~ProvisionChannel() {
+        (void)ring_.poll([](int32_t type, int64_t a, int64_t) noexcept {
+            if (type == kDisposeMsgType)
+                delete reinterpret_cast<MappedFile*>(static_cast<std::uintptr_t>(a));
+        });
     }
     ProvisionChannel(const ProvisionChannel&)            = delete;
     ProvisionChannel& operator=(const ProvisionChannel&) = delete;
