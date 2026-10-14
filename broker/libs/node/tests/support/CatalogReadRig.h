@@ -93,6 +93,12 @@ public:
         if (replica_->logEndOffset() != source_->logEndOffset())
             throw std::logic_error("ReadRig: the follower did not apply the source's records");
     }
+    /// Follower rig, Task 13 fix round 2: the SOURCE leader's history is cut to `n`
+    /// (a different lineage from there on: its next appends carry other bytes).
+    void sourceTruncate(int64_t n) {
+        source_->truncateLogForTest(n);
+        if (source_->logEndOffset() != n) throw std::logic_error("ReadRig: the source did not truncate");
+    }
     /// Follower: an HW-only update from the leader (the committed prefix it knows).
     void followerSetHighWatermark(int64_t hw) {
         followerHw_ = hw;
@@ -148,12 +154,32 @@ public:
         });
         return out;
     }
-    /// The baseOffset of every caught-up marker (an empty Records) sent to `session`.
+    /// The baseOffset of every caught-up marker (Records{baseOffset = HW, the 8-byte
+    /// history epoch}) sent to `session`.
     [[nodiscard]] std::vector<int64_t> markers(int64_t session) const {
         std::vector<int64_t> out;
         forEachRecords_(session, [&](const rune::protocol::client::Records& r) {
-            if (r.recordBatch.empty()) out.push_back(r.baseOffset);
+            if (r.recordBatch.size() == 8 && r.baseOffset >= 0) out.push_back(r.baseOffset);
         });
+        return out;
+    }
+    /// Task 13 fix round 2: the history epoch of every note (baseOffset −1) and
+    /// every marker sent to `session`, in order: {baseOffset, epoch}.
+    [[nodiscard]] std::vector<std::pair<int64_t, uint64_t>> epochFrames(int64_t session) const {
+        std::vector<std::pair<int64_t, uint64_t>> out;
+        forEachRecords_(session, [&](const rune::protocol::client::Records& r) {
+            if (r.recordBatch.size() != 8) return;
+            uint64_t e = 0;
+            for (int i = 0; i < 8; ++i) e |= static_cast<uint64_t>(r.recordBatch[static_cast<std::size_t>(i)]) << (8 * i);
+            out.emplace_back(r.baseOffset, e);
+        });
+        return out;
+    }
+    /// The epochs of the notes only.
+    [[nodiscard]] std::vector<uint64_t> notes(int64_t session) const {
+        std::vector<uint64_t> out;
+        for (const auto& [base, e] : epochFrames(session))
+            if (base < 0) out.push_back(e);
         return out;
     }
     /// Every Records frame of `session`: topicId / partition / subscriptionId / correlationId checks.

@@ -12,6 +12,7 @@
 //                      RENAME and SET COMPATIBILITY through the client's *AndWait;
 //   catalogSubscribeFromOffsets — (Task 13) the fromOffset of every catalog
 //                      Subscribe the node's CatalogReadServer accepted;
+//   catalogHistoryEpoch — (Task 13 fix round 2) the epoch it serves;
 //   idDescriptor / addColumnOps / viewPlanOver — DDL payload builders.
 //
 // Every wait is bounded (the deadline is the failure, never a hang).
@@ -160,6 +161,14 @@ public:
 
     /// Task 13: the requested fromOffset of each catalog Subscribe the node's
     /// CatalogReadServer accepted, in order (read on the admin thread).
+    /// Task 13 fix round 2: the history epoch the node's CatalogReadServer serves.
+    uint64_t catalogHistoryEpoch() {
+        BrokerNode& n = *node_;
+        return n.onAdminThreadForTest([&n]() {
+            const auto* rs = n.adminWorkerAgentForTest()->worker().readServer();
+            return rs != nullptr ? rs->historyEpoch() : uint64_t{0};
+        });
+    }
     std::vector<int64_t> catalogSubscribeFromOffsets() {
         BrokerNode& n = *node_;
         return n.onAdminThreadForTest([&n]() {

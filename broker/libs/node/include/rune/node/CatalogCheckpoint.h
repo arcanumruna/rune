@@ -53,4 +53,45 @@ inline constexpr const char* kCatalogCheckpointFile = "applied";
                                                                     int64_t logEndOffset,
                                                                     const std::string& catalogDir);
 
+// ─── The catalog HISTORY EPOCH (Task 13 fix round 2) ────────────────────────────
+// `dataDir/__catalog/history_epoch` — what a catalog reader's cache is checked
+// against (CatalogReadServer: every catalog stream opens with an epoch note and
+// every caught-up marker carries it).  The epoch names one committed history of
+// THIS broker's `__catalog`: it changes on every truncation below a served high
+// watermark, and a fresh one (random 64-bit start, so two brokers never share a
+// value) is drawn whenever the file is absent or damaged — a client whose cache
+// carries another value re-reads from 0.
+//
+// Persisted with what was served under it: `servedFloor` (every offset below it
+// may have been served under `epoch`) and the ANCHOR — the batch holding
+// servedFloor-1 (base offset, partition leader epoch, CRC).  Boot re-reads that
+// batch: a log that lost it or holds a different one (lost unsynced bytes, a
+// truncate-and-regrow the read server never saw before a crash) bumps the epoch.
+//
+// File layout (little-endian, 48 bytes, fixed):
+//   magic "RCATHEP1" (8) | epoch u64 | servedFloor i64 | anchorBase i64 |
+//   anchorLeaderEpoch i32 | anchorCrc u32 | check u64 (FNV-1a-64 of the 40 before)
+// Written like the checkpoint (tmp + fsync + rename + directory fsync).  Owned by
+// the admin thread (the CatalogReadServer).
+struct CatalogHistoryEpoch {
+    uint64_t epoch             = 0;
+    int64_t  servedFloor       = 0;
+    int64_t  anchorBase        = -1;   // -1: no anchor (servedFloor 0)
+    int32_t  anchorLeaderEpoch = -1;
+    uint32_t anchorCrc         = 0;
+    bool operator==(const CatalogHistoryEpoch&) const = default;
+};
+
+inline constexpr const char* kCatalogHistoryEpochFile = "history_epoch";
+
+/// nullopt = absent, short, foreign or corrupt — the caller starts a fresh epoch
+/// (always safe: every cached prefix is re-read).  `path` = dir/history_epoch.
+[[nodiscard]] std::optional<CatalogHistoryEpoch> readCatalogHistoryEpoch(const std::string& path) noexcept;
+
+/// tmp + fsync + rename + directory fsync over PRECOMPUTED paths (no allocation:
+/// the read server writes it on its pass).  false = not durable (errno set); the
+/// previous file, if any, is intact.
+[[nodiscard]] bool writeCatalogHistoryEpoch(const std::string& path, const std::string& tmpPath,
+                                            const std::string& dir, const CatalogHistoryEpoch& e) noexcept;
+
 } // namespace rune::node

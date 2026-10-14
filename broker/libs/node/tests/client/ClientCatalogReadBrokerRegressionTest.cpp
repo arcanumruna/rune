@@ -71,19 +71,22 @@ TEST(ClientCatalogReadBrokerRegression, ASecondReadSeesNewDdlFromTheCachedPrefix
     ASSERT_EQ(client->defineTopicAndWait("b", 1, "", {}, false, rune::client::Persistence::Disk, {}, {}, 10s).errorCode,
               0);
     ASSERT_EQ(client->catalogHistory({}, 10s)->size(), 2u);
-    EXPECT_EQ(b.catalogSubscribeFromOffsets(), (std::vector<int64_t>{0, 0}))
-        << "the client resumed from its cache end minus one (the overlap event is verified); the "
-           "coalesced two-batch frame lost nothing (no gap re-read)";
+    EXPECT_EQ(b.catalogSubscribeFromOffsets(), (std::vector<int64_t>{0, 1}))
+        << "the client resumed from its cache end (fix round 2: the history epoch is unchanged, so "
+           "no overlap event is re-read); nothing was lost (no gap re-read)";
     EXPECT_EQ(client->catalogReader().stats().markerGaps, 0u);
-    ASSERT_EQ(client->catalogHistory({}, 10s)->size(), 2u);   // nothing new: one overlap event, same cache
-    EXPECT_EQ(b.catalogSubscribeFromOffsets(), (std::vector<int64_t>{0, 0, 1}));
+    EXPECT_EQ(client->catalogReader().stats().epochChanges, 0u);
+    EXPECT_EQ(client->catalogReader().historyEpoch(), b.catalogHistoryEpoch())
+        << "the cache is (prefix, the broker's epoch)";
+    ASSERT_EQ(client->catalogHistory({}, 10s)->size(), 2u);   // nothing new: same cache, same epoch
+    EXPECT_EQ(b.catalogSubscribeFromOffsets(), (std::vector<int64_t>{0, 1, 2}));
 }
 
 // An as-of point the log does not reach is the library's explicit refusal
 // (Kind::Replay with its detail), never an empty or partial state.  (The
 // withheld marker — a leaderless catalog, Task 12 F1 — is pinned on the fake:
 // CatalogReaderRegression.NoCaughtUpMarkerIsATimeoutNotAHang and
-// RevalidationCutShortByTheDeadlineIsRevalidatedNextTimeRegression.)
+// AReReadCutShortByTheDeadlineContinuesUnderItsEpochRegression.)
 TEST(ClientCatalogReadBrokerRegression, AnAsOfPastTheLogIsAnExplicitErrorNotAHang) {
     OneBroker b("cr_err");
     auto client = b.connectClient();

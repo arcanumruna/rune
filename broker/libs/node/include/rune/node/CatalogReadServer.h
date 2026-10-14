@@ -15,10 +15,13 @@
 //
 // One subscription = one explicit phase (hard rule 3, F29 — no caughtUpSent flag):
 //   Answering — accepted; its SubscribeResponse{OK} is not on the egress yet;
+//   Opening   — answered (or resumed after a pause); its HISTORY-EPOCH NOTE
+//               Records{baseOffset −1, recordBatch = the 8-byte epoch LE} is not
+//               on the egress yet — every Records frame of the stream follows it;
 //   Backlog   — pushing [nextOffset, HW); on reaching the HW it sends the
 //               caught-up marker Records{baseOffset = nextOffset (== the HW it
-//               reached), empty payload} and becomes Live (the transition is the
-//               "once");
+//               reached), recordBatch = the 8-byte epoch LE} and becomes Live (the
+//               transition is the "once");
 //   Live      — the marker was sent; pushes new commits as they arrive.
 //   PausePending / Paused — the SESSION's egress is back-pressured (fix round 0):
 //               the control thread could not offer one of its Records frames
@@ -27,8 +30,8 @@
 //               the egress ring (PausePending until the ack is on it — every
 //               frame of it still in flight precedes the ack, so the control
 //               thread drops exactly those) and sends nothing until onResume
-//               (the session's window has room again), then continues from its
-//               own cursor.  The log IS the per-subscription buffer: a paused
+//               (the session's window has room again), then re-opens (Opening: the
+//               note again) and continues from its own cursor.  The log IS the per-subscription buffer: a paused
 //               reader holds no bytes anywhere, never grows the session's spill,
 //               and is never expired for being slow; other readers and the DDL
 //               answers (their own ring) never wait for it.
@@ -41,16 +44,29 @@
 // egress frame (MessageTooLarge: the leader bounds every event below it,
 // kCatalogMaxEventBytes).  Never a silent stall.
 //
+// HISTORY EPOCH (Task 13 fix round 2): the client caches (prefix, epoch).  The
+// epoch changes on every truncation below a served high watermark — the same
+// point that ends every read once — so every record of one stream belongs to the
+// history its note names; a fresh random epoch is drawn when none is durable.
+// It is persisted (CatalogCheckpoint.h: `history_epoch`, with the served floor
+// and that floor's anchor batch) BEFORE anything is served under it or above the
+// recorded floor: a restart never re-uses a value for another history.  Until it
+// is durable nothing is pushed (an I/O failure delays reads, never mislabels them).
+//
 // Zero steady-state allocation (hard rule 4): the subscription table, the read
-// buffer and the frame buffer are preallocated; an idle pass reads nothing.
+// buffer, the frame buffer and the epoch file's paths are preallocated; an idle
+// pass reads nothing.
 
 #include <rune/gateway/IAdminRequestSink.h>   // kCatalogSubscriptionIdBase
+#include <rune/node/CatalogCheckpoint.h>         // CatalogHistoryEpoch
 
 #include <cstddef>
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <span>
+#include <string>
 #include <variant>
 #include <vector>
 
@@ -83,11 +99,22 @@ inline constexpr std::size_t kCatalogReadHeadBytes = 24;
 /// An empty frame with this baseOffset is a session-liveness PROBE (fix round 3);
 /// an empty frame with baseOffset -1 is a pause ack.
 inline constexpr int64_t kProbeOffset = -2;
+/// Task 13 fix round 2: the head baseOffset of a history-epoch NOTE sent at cursor
+/// `at` is kNoteHeadBase - at (<= -3): a pause reporting it names both "the note
+/// was dropped" and where the stream resumes.
+inline constexpr int64_t kNoteHeadBase = -3;
 /// The largest frame the server emits (SubscribeResponse / Records / ErrorResponse).
 inline constexpr std::size_t kCatalogReadMaxFrameBytes =
     static_cast<std::size_t>(kCatalogReadRingBytes) / 8 - kCatalogReadHeadBytes;
 /// Records framing: the 24-byte header + 24-byte body + the u32 batch-length prefix.
 inline constexpr std::size_t kCatalogRecordsOverhead = 24 + 24 + 4;
+/// The history epoch's bytes in a note / marker (u64 LE).  No valid RecordBatch is
+/// 8 bytes, so a note / marker is never mistaken for data.
+inline constexpr std::size_t kCatalogHistoryEpochBytes = 8;
+/// A note / marker client frame's size, and the byte offset of the Records
+/// baseOffset inside it (−1: a note; >= 0: a marker at that HW).
+inline constexpr std::size_t kCatalogNoteFrameBytes      = kCatalogRecordsOverhead + kCatalogHistoryEpochBytes;
+inline constexpr std::size_t kCatalogRecordsBaseOffsetAt = 24 + 16;
 /// The largest stored batch one Records frame can carry.
 inline constexpr std::size_t kCatalogReadMaxBatchBytes = kCatalogReadMaxFrameBytes - kCatalogRecordsOverhead;
 /// The largest ENCODED event the catalog leader may append: one event is one
@@ -111,10 +138,15 @@ public:
     struct Backlog   { int64_t nextOffset = 0; };   // pushing [nextOffset, HW); the marker on leaving
     struct Live      { int64_t nextOffset = 0; int64_t markedAt = 0; };   // marker sent (at markedAt); live
     using Resumable = std::variant<Backlog, Live>;
-    struct PausePending { Resumable resumeAs; };   // paused; its ack is not on the ring yet
-    struct Paused       { Resumable resumeAs; };   // paused + acked: nothing sent until onResume
+    struct Opening      { Resumable then; };       // the history-epoch note is owed, then `then`
+    /// What a paused stream becomes on its resume: Opening only when the dropped
+    /// frame WAS its note (every later frame was dropped with it); otherwise the
+    /// client holds the note already.
+    using Resumption = std::variant<Backlog, Live, Opening>;
+    struct PausePending { Resumption resumeAs; };  // paused; its ack is not on the ring yet
+    struct Paused       { Resumption resumeAs; };  // paused + acked: nothing sent until onResume
     struct Ending       {};                        // ended this pass (its answer is owed / sent); removed after it
-    using Phase = std::variant<Answering, Backlog, Live, PausePending, Paused, Ending>;
+    using Phase = std::variant<Answering, Opening, Backlog, Live, PausePending, Paused, Ending>;
     struct Sub {
         int64_t session        = 0;
         int64_t corr           = 0;   // the creating Subscribe's correlation id (every frame carries it)
@@ -171,6 +203,14 @@ public:
     /// tagged with the epoch it restarted in (floorEpoch()).
     [[nodiscard]] int64_t servedHighWatermark() const noexcept { return servedHw_; }
     [[nodiscard]] int32_t floorEpoch() const noexcept { return floorEpoch_; }
+    /// Task 13 fix round 2: the HISTORY EPOCH every note / marker carries now.
+    [[nodiscard]] uint64_t historyEpoch() const noexcept { return historyEpoch_; }
+    /// What the epoch file holds (nullopt: nothing durable yet — nothing served).
+    [[nodiscard]] const std::optional<CatalogHistoryEpoch>& durableEpoch() const noexcept { return durable_; }
+    /// History-epoch changes: truncations below a served floor + boot anchors that no longer match.
+    [[nodiscard]] uint64_t epochBumps() const noexcept { return epochBumps_; }
+    /// Epoch-file writes that failed (serving waits for the next one to succeed).
+    [[nodiscard]] uint64_t epochWriteFailures() const noexcept { return epochWriteFailures_; }
     /// Fix round 1 (M3): while true the admin takes no catalog request off the
     /// request ring (the gateway answers the retriable NotLeader) — the owed
     /// answers stay within their preallocated capacity.
@@ -182,7 +222,7 @@ public:
     /// Subscribes refused beyond maxSubs / subscriptions ended by a read failure.
     [[nodiscard]] uint64_t refusedSubscribes() const noexcept { return refused_; }
     [[nodiscard]] uint64_t endedSubscriptions() const noexcept { return ended_; }
-    /// "Answering" | "Backlog" | "Live" | "PausePending" | "Paused"; "" = none.
+    /// "Answering" | "Opening" | "Backlog" | "Live" | "PausePending" | "Paused"; "" = none.
     [[nodiscard]] const char* phaseName(int64_t subscriptionId) const noexcept;
     /// Catalog history Task 13 (tests): the requested fromOffset of each catalog
     /// Subscribe this server ACCEPTED (beyond the cap: not recorded), oldest
@@ -212,6 +252,17 @@ private:
     bool sendSubscribeResponse_(int64_t session, int64_t corr, int16_t code, int64_t subId);
     bool sendError_(const OwedError& e);
     bool sendRecords_(const Sub& s, int64_t baseOffset, std::span<const uint8_t> batches);
+    /// The note (baseOffset −1) / the marker (baseOffset = hw): the epoch's 8 bytes.
+    /// `rewindTo` = the head's baseOffset (where the subscription resumes if dropped).
+    bool sendEpochFrame_(const Sub& s, int64_t recordsBaseOffset, int64_t rewindTo);
+    /// The epoch is durable and covers [0, floor) (written now if not): false =
+    /// it could not be made so — nothing may be served this pass.
+    bool ensureDurable_(int64_t floor);
+    /// The batch holding `offset` (its base, leader epoch, CRC) into `e`; false = unreadable.
+    bool readAnchor_(int64_t offset, CatalogHistoryEpoch& e);
+    /// Boot: load the epoch file and check its anchor against the log.
+    void loadEpoch_();
+    void bumpEpoch_(const char* why);
     bool sendPauseAck_(int64_t session, int64_t subId);
     int  probe_(int64_t nowNs);
     int64_t nowNs_ = 0;
@@ -240,6 +291,13 @@ private:
     uint64_t                             seenLogGen_ = 0;    // N2: the replica's log generation already checked
     std::size_t                          rr_ = 0;          // round-robin start (M2)
     uint64_t                             truncationEnds_ = 0;
+    uint64_t                             historyEpoch_ = 0;
+    std::optional<CatalogHistoryEpoch>   durable_;          // the epoch file's content (written by this server)
+    std::string                          epochDir_;         // the catalog dir ("" = no persistence: no log)
+    std::string                          epochPath_;        // preallocated: no allocation on a write
+    std::string                          epochTmp_;
+    uint64_t                             epochBumps_ = 0;
+    uint64_t                             epochWriteFailures_ = 0;
     std::array<int64_t, kAcceptedFromKept> acceptedFrom_{};   // a ring of the last accepted fromOffsets (tests)
     uint64_t                             acceptedCount_ = 0;
     uint64_t                             refused_ = 0;

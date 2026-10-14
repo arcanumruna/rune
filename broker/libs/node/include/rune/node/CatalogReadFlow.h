@@ -65,6 +65,14 @@ public:
 
     explicit CatalogReadFlow(std::size_t capacity) : capacity_(capacity) { entries_.reserve(capacity); }
 
+    /// A client frame that is the caught-up marker (not the epoch note, not data).
+    [[nodiscard]] static bool isCaughtUpMarker(const uint8_t* frame, std::size_t len) noexcept {
+        if (len != kCatalogNoteFrameBytes) return false;
+        int64_t base = 0;
+        std::memcpy(&base, frame + kCatalogRecordsBaseOffsetAt, 8);   // little-endian hosts (the wire order)
+        return base >= 0;
+    }
+
     /// One catalog-read ring frame: [CatalogReadFrameHead (24 B)][client frame].
     template <class Sink>
     void onFrame(const uint8_t* p, std::size_t n, Sink& sink) {
@@ -113,8 +121,10 @@ public:
             sink.sendReliable(h.session, frame, len);
             return;
         }
-        // I1: the caught-up marker is the one Records with an empty batch.
-        const bool marker = len == kCatalogRecordsOverhead;
+        // I1: the caught-up marker is the one Records whose batch is the 8-byte
+        // history epoch at a baseOffset >= 0 (Task 13 fix round 2: the stream's
+        // epoch NOTE has the same size at baseOffset -1 — never a marker).
+        const bool marker = isCaughtUpMarker(frame, len);
         Entry e{h.session, h.subscriptionId, PauseOwed{h.baseOffset, marker}};
         if (sink.postPaused(h.session, h.subscriptionId, h.baseOffset, marker)) e.state = AwaitingAck{};
         entries_.push_back(e);   // reserved: never allocates

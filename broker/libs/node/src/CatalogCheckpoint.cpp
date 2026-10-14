@@ -51,7 +51,92 @@ bool fsyncDir(const std::string& dir) noexcept {
     return ok;
 }
 
+constexpr std::array<char, 8> kEpochMagic{'R', 'C', 'A', 'T', 'H', 'E', 'P', '1'};
+constexpr std::size_t kEpochFileBytes = 48;
+
+void putU32(uint8_t* p, uint32_t v) noexcept { for (int i = 0; i < 4; ++i) p[i] = static_cast<uint8_t>(v >> (8 * i)); }
+uint32_t getU32(const uint8_t* p) noexcept {
+    uint32_t v = 0;
+    for (int i = 0; i < 4; ++i) v |= static_cast<uint32_t>(p[i]) << (8 * i);
+    return v;
+}
+
+/// tmp + fsync + rename + directory fsync.  false = not durable (errno set).
+bool replaceDurably(const char* path, const char* tmp, const char* dir, const uint8_t* bytes, std::size_t n) noexcept {
+    const int fd = ::open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return false;
+    if (!writeAllAndSync(fd, bytes, n)) {
+        const int saved = errno;
+        ::close(fd);
+        ::unlink(tmp);
+        errno = saved;
+        return false;
+    }
+    if (::close(fd) != 0) {
+        const int saved = errno;
+        ::unlink(tmp);
+        errno = saved;
+        return false;
+    }
+    if (::rename(tmp, path) != 0) {
+        const int saved = errno;
+        ::unlink(tmp);
+        errno = saved;
+        return false;
+    }
+    const int dfd = ::open(dir, O_RDONLY);
+    if (dfd < 0) return false;
+    const bool ok = ::fsync(dfd) == 0;
+    const int saved = errno;
+    ::close(dfd);
+    errno = saved;
+    return ok;
+}
+
 } // namespace
+
+std::optional<CatalogHistoryEpoch> readCatalogHistoryEpoch(const std::string& path) noexcept {
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) return std::nullopt;
+    std::array<uint8_t, kEpochFileBytes + 1> buf{};
+    std::size_t got = 0;
+    while (got < buf.size()) {
+        const ssize_t r = ::read(fd, buf.data() + got, buf.size() - got);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            ::close(fd);
+            return std::nullopt;
+        }
+        if (r == 0) break;
+        got += static_cast<std::size_t>(r);
+    }
+    ::close(fd);
+    if (got != kEpochFileBytes) return std::nullopt;
+    if (std::memcmp(buf.data(), kEpochMagic.data(), kEpochMagic.size()) != 0) return std::nullopt;
+    if (fnv1a64(buf.data(), 40) != getU64(buf.data() + 40)) return std::nullopt;
+    CatalogHistoryEpoch e;
+    e.epoch             = getU64(buf.data() + 8);
+    e.servedFloor       = static_cast<int64_t>(getU64(buf.data() + 16));
+    e.anchorBase        = static_cast<int64_t>(getU64(buf.data() + 24));
+    e.anchorLeaderEpoch = static_cast<int32_t>(getU32(buf.data() + 32));
+    e.anchorCrc         = getU32(buf.data() + 36);
+    if (e.servedFloor < 0 || (e.servedFloor > 0 && (e.anchorBase < 0 || e.anchorBase >= e.servedFloor)))
+        return std::nullopt;
+    return e;
+}
+
+bool writeCatalogHistoryEpoch(const std::string& path, const std::string& tmpPath, const std::string& dir,
+                              const CatalogHistoryEpoch& e) noexcept {
+    std::array<uint8_t, kEpochFileBytes> buf{};
+    std::memcpy(buf.data(), kEpochMagic.data(), kEpochMagic.size());
+    putU64(buf.data() + 8, e.epoch);
+    putU64(buf.data() + 16, static_cast<uint64_t>(e.servedFloor));
+    putU64(buf.data() + 24, static_cast<uint64_t>(e.anchorBase));
+    putU32(buf.data() + 32, static_cast<uint32_t>(e.anchorLeaderEpoch));
+    putU32(buf.data() + 36, e.anchorCrc);
+    putU64(buf.data() + 40, fnv1a64(buf.data(), 40));
+    return replaceDurably(path.c_str(), tmpPath.c_str(), dir.c_str(), buf.data(), buf.size());
+}
 
 std::optional<CatalogCheckpoint> readCatalogCheckpoint(const std::string& catalogDir) {
     const std::string path = (std::filesystem::path{catalogDir} / kCatalogCheckpointFile).string();

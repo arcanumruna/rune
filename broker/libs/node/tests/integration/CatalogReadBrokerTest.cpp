@@ -2,7 +2,7 @@
 // BrokerNodes over REAL Aeron UDP, driven by the wire client ShardTestClient:
 // a Subscribe on `__catalog` (topic id −6) is served by EVERY broker — the
 // catalog leader, a follower, a broker whose apply halted — from its own replica
-// up to its own HW: the committed backlog, then ONE caught-up marker (an empty
+// up to its own HW: the committed backlog, then ONE caught-up marker (an 8-byte epoch
 // Records at the HW), then the live events; a session's close ends its catalog
 // subscriptions on the admin thread.
 #include "support/CatalogBrokerCluster.h"
@@ -59,13 +59,18 @@ int16_t defineSettled(ShardTestClient& cl, const std::string& ch, int64_t sid, c
 struct Seen {
     std::vector<int64_t> offsets;
     std::vector<int64_t> markers;
+    int                  notes = 0;   // history-epoch notes (one per stream opening)
 };
 Seen seenBy(const ShardTestClient& cl, int64_t subId) {
     namespace b = rune::protocol::batch;
     Seen s;
     for (const auto& r : cl.records()) {
         if (r.subscriptionId != subId) continue;
-        if (r.bytes.empty()) { s.markers.push_back(r.baseOffset); continue; }
+        if (r.bytes.size() == 8) {   // Task 13 fix round 2: the epoch note (−1) / the caught-up marker (the HW)
+            if (r.baseOffset >= 0) s.markers.push_back(r.baseOffset);
+            else                   ++s.notes;
+            continue;
+        }
         std::size_t pos = 0;
         while (pos + static_cast<std::size_t>(b::kRecordBatchOverhead) <= r.bytes.size()) {
             rune::protocol::RecordBatchReader rd(r.bytes.data() + pos, r.bytes.size() - pos);

@@ -8,7 +8,9 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <map>
 #include <numeric>
 #include <span>
@@ -359,7 +361,10 @@ struct FlowHarness {
         for (const auto& f : delivered[s]) {
             auto r = pc::Records::decode(f.data(), f.size());
             if (!r) continue;
-            if (r->recordBatch.empty()) { marks.push_back(r->baseOffset); continue; }
+            if (r->recordBatch.size() == 8) {   // the epoch note (−1) / the caught-up marker (the HW)
+                if (r->baseOffset >= 0) marks.push_back(r->baseOffset);
+                continue;
+            }
             std::size_t pos = 0;
             while (pos + 61 <= r->recordBatch.size()) {
                 rune::protocol::RecordBatchReader rd(r->recordBatch.data() + pos, r->recordBatch.size() - pos);
@@ -494,7 +499,7 @@ TEST(CatalogReadServerRegression, LeaderChangeMidBacklogNeverSendsAFalseCaughtUp
     r.commitEvents(6);
     r.server.subscribe(9, 1, -1);                      // another reader: the server learns HW 6
     r.server.pump();
-    r.egressBudget = 1;                                // only the SubscribeResponse goes out
+    r.egressBudget = 2;                                // only the SubscribeResponse + the epoch note go out
     r.server.subscribe(7, 1, -2);
     r.server.pump();
     ASSERT_TRUE(r.subscribeAnswered(7, 1));
@@ -604,11 +609,23 @@ TEST(CatalogReadServerRegression, DataFrameDroppedRightAfterTheMarkerNeverRepeat
 
 // I1 (the other side): a dropped MARKER is re-sent once.
 TEST(CatalogReadServerRegression, DroppedMarkerThroughTheFlowIsSentOnceAgainRegression) {
-    // Drop exactly the marker: the window holds the records frame only.
+    // The frame sizes of this scenario (a wide window): note, records, marker.
+    std::size_t window = 0;
+    {
+        ReadRig r1("rd_i1_marker1");
+        r1.commitEvents(2);
+        FlowHarness h1(r1);
+        h1.sessions[7] = {1 << 20, 0, 0};
+        r1.server.subscribe(7, 1, -2);
+        h1.pass();
+        ASSERT_EQ(h1.delivered[7].size(), 4u) << "SubscribeResponse, note, records, marker";
+        window = h1.delivered[7][1].size() + h1.delivered[7][2].size() + 8;
+    }
+    // Drop exactly the marker: the window holds the note and the records frame only.
     ReadRig r2("rd_i1_marker2");
     r2.commitEvents(2);
     FlowHarness h2(r2);
-    h2.sessions[7] = {/*window=*/200, 0, 0};           // the records frame fits, the marker does not
+    h2.sessions[7] = {window, 0, 0};                   // the note + records frame fit, the marker does not
     r2.server.subscribe(7, 1, -2);
     h2.pass();
     ASSERT_EQ(h2.flow.pauses(), 1u);
@@ -793,4 +810,267 @@ TEST(CatalogReadServerRegression, ClosesBeyondTheGatewayQueueAreReclaimedByTheLi
     h.pass();
     EXPECT_EQ(r.server.subscriptions(), 2u) << "slots are free again";
     EXPECT_EQ(r.server.refusedSubscribes(), 0u);
+}
+
+// ─── Task 13 fix round 2: the HISTORY EPOCH ─────────────────────────────────────
+// A client caches (prefix, epoch).  Every catalog stream opens with the epoch
+// note (Records{-1, epoch}) before any record, every caught-up marker carries the
+// same epoch, and the epoch changes — durably — on every truncation below a
+// served high watermark.  A restart keeps it unless the log no longer holds the
+// batch it was anchored at.
+
+namespace {
+/// A second server over the same replica (what a broker restart reads back).
+struct Restarted {
+    std::vector<ReadRig::Frame> frames;
+    rune::node::CatalogReadServer server;
+    explicit Restarted(ReadRig& r)
+        : server(r.replica(),
+                 [this](const rune::node::CatalogReadFrameHead& h, std::span<const uint8_t> f) {
+                     frames.push_back(ReadRig::Frame{h.session, std::vector<uint8_t>(f.begin(), f.end()),
+                                                     h.subscriptionId, h.baseOffset});
+                     return true;
+                 },
+                 64, int64_t{ReadRig::kSelf + 1} << 40) {}
+};
+std::string epochFileOf(ReadRig& r) {
+    return (std::filesystem::path{r.replica().log()->dir()} / rune::node::kCatalogHistoryEpochFile).string();
+}
+}   // namespace
+
+// RED (before fix round 2): the marker was an empty Records — no epoch anywhere;
+// a client could not tell one committed history from another.
+TEST(CatalogReadServerRegression, EveryStreamOpensWithItsEpochNoteAndTheMarkerCarriesTheSameEpochRegression) {
+    ReadRig r("rd_ep_note");
+    r.commitEvents(4);
+    r.server.subscribe(7, 1, -2);
+    r.server.pump();
+    const uint64_t e = r.server.historyEpoch();
+    const auto ef = r.epochFrames(7);
+    ASSERT_EQ(ef.size(), 2u) << "one note, one marker";
+    EXPECT_EQ(ef[0], (std::pair<int64_t, uint64_t>{-1, e})) << "the note: baseOffset -1, the epoch";
+    EXPECT_EQ(ef[1], (std::pair<int64_t, uint64_t>{4, e})) << "the marker: the HW, the same epoch";
+    // The note precedes every record of the stream.
+    const auto t = r.records(7);
+    ASSERT_GE(t.size(), 3u);
+    EXPECT_EQ(t.front().recordBatch.size(), 8u);
+    EXPECT_EQ(t.front().baseOffset, -1);
+    // Durable before served: the file names this epoch and the served floor.
+    const auto d = rune::node::readCatalogHistoryEpoch(epochFileOf(r));
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(d->epoch, e);
+    EXPECT_EQ(d->servedFloor, 4);
+    EXPECT_EQ(d->anchorBase, 3);
+    EXPECT_EQ(r.server.epochBumps(), 0u);
+}
+
+// RED: after a truncation below a served HW and a regrow, a resubscribe was served
+// the new history under nothing that told the client it changed.
+TEST(CatalogReadServerRegression, ATruncationBelowAServedHwChangesTheEpochDurablyRegression) {
+    ReadRig r("rd_ep_trunc", /*asFollower=*/true);
+    r.followerAppend(6);
+    r.followerSetHighWatermark(6);
+    r.server.subscribe(7, 1, -2);
+    r.server.pump();
+    const uint64_t e0 = r.server.historyEpoch();
+    ASSERT_EQ(r.markers(7), (std::vector<int64_t>{6}));
+    r.sourceTruncate(3);
+    r.replica().truncateLogForTest(3);
+    r.followerAppendWithHighWatermark(4, /*hw=*/7);    // a different lineage 3..6, regrown past the old HW
+    r.server.pump();
+    ASSERT_EQ(r.errors(7).size(), 1u) << "the read ended once (NotLeader)";
+    EXPECT_EQ(r.server.epochBumps(), 1u);
+    EXPECT_NE(r.server.historyEpoch(), e0);
+    const auto d = rune::node::readCatalogHistoryEpoch(epochFileOf(r));
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(d->epoch, r.server.historyEpoch()) << "the new epoch is durable at once";
+    r.server.subscribe(7, 2, -2);
+    for (int i = 0; i < 3; ++i) r.server.pump();
+    const auto ef = r.epochFrames(7);
+    ASSERT_GE(ef.size(), 4u);
+    EXPECT_EQ(ef[ef.size() - 2], (std::pair<int64_t, uint64_t>{-1, r.server.historyEpoch()}));
+    EXPECT_EQ(ef.back(), (std::pair<int64_t, uint64_t>{7, r.server.historyEpoch()}));
+}
+
+// The identical-bytes regrow: the replica re-fetches the very same bytes after the
+// cut.  The history may still differ below (nothing at the cut proves the prefix):
+// the epoch changes all the same.
+TEST(CatalogReadServerRegression, AnIdenticalBytesRegrowStillChangesTheEpochRegression) {
+    ReadRig r("rd_ep_same", /*asFollower=*/true);
+    r.followerAppend(6);
+    r.followerSetHighWatermark(6);
+    r.server.subscribe(7, 1, -2);
+    r.server.pump();
+    const uint64_t e0 = r.server.historyEpoch();
+    r.replica().truncateLogForTest(3);
+    r.followerAppendWithHighWatermark(0, /*hw=*/6);    // the source's own 3..5 again: identical bytes
+    ASSERT_EQ(r.replica().logEndOffset(), 6);
+    r.server.pump();
+    EXPECT_EQ(r.server.epochBumps(), 1u);
+    EXPECT_NE(r.server.historyEpoch(), e0);
+}
+
+// Only a cut below what was SERVED changes the epoch: a follower dropping its
+// uncommitted tail (the normal case) keeps it.
+TEST(CatalogReadServerRegression, ACutOfTheUncommittedTailKeepsTheEpochRegression) {
+    ReadRig r("rd_ep_tail", /*asFollower=*/true);
+    r.followerAppend(6);
+    r.followerSetHighWatermark(4);
+    r.server.subscribe(7, 1, -2);
+    r.server.pump();
+    const uint64_t e0 = r.server.historyEpoch();
+    r.replica().truncateLogForTest(5);
+    r.server.pump();
+    EXPECT_EQ(r.server.epochBumps(), 0u);
+    EXPECT_EQ(r.server.historyEpoch(), e0);
+    EXPECT_TRUE(r.errors(7).empty());
+}
+
+// With no subscription at all the cut still changes the epoch (durably): a crash
+// later must not serve the regrown log under the old one.
+TEST(CatalogReadServerRegression, ACutWithNoSubscriberStillChangesTheEpochDurablyRegression) {
+    ReadRig r("rd_ep_nosub", /*asFollower=*/true);
+    r.followerAppend(6);
+    r.followerSetHighWatermark(6);
+    r.server.subscribe(7, 1, -2);
+    r.server.pump();
+    r.server.unsubscribe(7, -1);
+    const uint64_t e0 = r.server.historyEpoch();
+    r.replica().truncateLogForTest(2);
+    r.server.pump();
+    EXPECT_EQ(r.server.epochBumps(), 1u);
+    const auto d = rune::node::readCatalogHistoryEpoch(epochFileOf(r));
+    ASSERT_TRUE(d.has_value());
+    EXPECT_NE(d->epoch, e0);
+    EXPECT_EQ(d->epoch, r.server.historyEpoch());
+}
+
+// A restart reads the epoch back (no re-read forced on every client), and a cut
+// that happened while the old server could not see it — truncate-and-regrow
+// with other bytes, then a crash before its pass — is caught by the anchor.
+TEST(CatalogReadServerRegression, TheEpochSurvivesARestartUnlessItsAnchorBatchChangedRegression) {
+    ReadRig r("rd_ep_restart", /*asFollower=*/true);
+    r.followerAppend(6);
+    r.followerSetHighWatermark(6);
+    r.server.subscribe(7, 1, -2);
+    r.server.pump();
+    const uint64_t e0 = r.server.historyEpoch();
+    {
+        Restarted b(r);
+        EXPECT_EQ(b.server.historyEpoch(), e0) << "kept across a restart";
+        EXPECT_EQ(b.server.epochBumps(), 0u);
+    }
+    // The old server never pumps again: the cut is visible only to a restart.
+    r.sourceTruncate(3);
+    r.replica().truncateLogForTest(3);
+    r.followerAppendWithHighWatermark(4, /*hw=*/7);
+    Restarted b(r);
+    EXPECT_EQ(b.server.epochBumps(), 1u) << "the anchor batch at offset 5 holds other bytes now";
+    EXPECT_NE(b.server.historyEpoch(), e0);
+    b.server.subscribe(9, 1, -2);
+    b.server.pump();
+    const auto d = rune::node::readCatalogHistoryEpoch(epochFileOf(r));
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(d->epoch, b.server.historyEpoch()) << "durable before anything is served under it";
+}
+
+// A log that LOST the anchored batch (unsynced bytes gone in a crash) changes it too.
+TEST(CatalogReadServerRegression, ALogShorterThanTheServedFloorAtBootChangesTheEpochRegression) {
+    ReadRig r("rd_ep_lost");
+    r.commitEvents(6);
+    r.server.subscribe(7, 1, -2);
+    r.server.pump();
+    const uint64_t e0 = r.server.historyEpoch();
+    r.replica().becomeFollower(ReadRig::kEpoch + 1, -1);
+    ASSERT_TRUE(r.replica().log()->truncateTo(4));
+    Restarted b(r);
+    EXPECT_EQ(b.server.epochBumps(), 1u);
+    EXPECT_NE(b.server.historyEpoch(), e0);
+}
+
+// An absent or damaged epoch file is never trusted: a fresh epoch (every client re-reads).
+TEST(CatalogReadServerRegression, ADamagedEpochFileStartsAFreshEpochRegression) {
+    ReadRig r("rd_ep_damaged");
+    r.commitEvents(2);
+    r.server.subscribe(7, 1, -2);
+    r.server.pump();
+    const uint64_t e0 = r.server.historyEpoch();
+    {
+        std::FILE* f = std::fopen(epochFileOf(r).c_str(), "r+b");
+        ASSERT_NE(f, nullptr);
+        std::fseek(f, 12, SEEK_SET);
+        std::fputc(0x5a, f);
+        std::fclose(f);
+    }
+    ASSERT_FALSE(rune::node::readCatalogHistoryEpoch(epochFileOf(r)).has_value()) << "the checksum fails";
+    Restarted b(r);
+    EXPECT_NE(b.server.historyEpoch(), e0);
+    std::filesystem::remove(epochFileOf(r));
+    Restarted c(r);
+    EXPECT_NE(c.server.historyEpoch(), e0);
+    EXPECT_NE(c.server.historyEpoch(), b.server.historyEpoch()) << "never a re-used value";
+}
+
+// The epoch cannot be made durable (a read-only catalog dir): nothing is served —
+// no note, no record, no marker — until it can; then the stream starts normally.
+TEST(CatalogReadServerRegression, AnEpochThatCannotBeMadeDurableServesNothingUntilItIsRegression) {
+    ReadRig r("rd_ep_ro");
+    r.commitEvents(3);
+    const std::filesystem::path dir = r.replica().log()->dir();
+    std::filesystem::permissions(dir, std::filesystem::perms::owner_read | std::filesystem::perms::owner_exec);
+    r.server.subscribe(7, 1, -2);
+    for (int i = 0; i < 3; ++i) r.server.pump();
+    EXPECT_TRUE(r.subscribeAnswered(7, 1)) << "the Subscribe is answered";
+    EXPECT_TRUE(r.epochFrames(7).empty()) << "but nothing is served under a non-durable epoch";
+    EXPECT_TRUE(r.deliveredOffsets(7).empty());
+    EXPECT_GT(r.server.epochWriteFailures(), 0u);
+    std::filesystem::permissions(dir, std::filesystem::perms::owner_all);
+    r.server.pump();
+    EXPECT_EQ(r.deliveredOffsets(7), range(0, 3));
+    EXPECT_EQ(r.markers(7), (std::vector<int64_t>{3}));
+}
+
+// Flow control: a dropped NOTE is sent again (it is never a marker to the control
+// thread), and only then the stream; a dropped data frame never repeats the note.
+TEST(CatalogReadServerRegression, ADroppedNoteIsSentAgainAndADroppedDataFrameNeverRepeatsItRegression) {
+    {
+        ReadRig r("rd_ep_flow_note");
+        r.commitEvents(2);
+        FlowHarness h(r);
+        h.sessions[7] = {/*window=*/1 << 20, /*inFlight=*/1 << 20, /*drainPerPass=*/0};   // full: the note drops
+        r.server.subscribe(7, 1, -2);
+        h.pass();
+        ASSERT_EQ(h.flow.pauses(), 1u);
+        h.sessions[7].drainPerPass = 1 << 20;
+        for (int i = 0; i < 10; ++i) h.pass();
+        int notes = 0, marks = 0;
+        for (const auto& f : h.delivered[7])
+            if (auto rec = pc::Records::decode(f.data(), f.size()); rec && rec->recordBatch.size() == 8)
+                (rec->baseOffset < 0 ? notes : marks) += 1;
+        EXPECT_EQ(notes, 1) << "the dropped note, once more";
+        EXPECT_EQ(marks, 1);
+        EXPECT_EQ(h.seen(7).first, range(0, 2));
+        EXPECT_FALSE(rune::node::CatalogReadFlow::isCaughtUpMarker(h.delivered[7][1].data(), h.delivered[7][1].size()));
+    }
+    {
+        ReadRig r("rd_ep_flow_data");
+        r.commitEvents(2);
+        FlowHarness h(r);
+        h.sessions[7] = {/*window=*/1 << 20, 0, 1 << 20};
+        r.server.subscribe(7, 1, -2);
+        h.pass();
+        h.sessions[7].inFlight = h.sessions[7].window;     // the next data frame drops
+        h.sessions[7].drainPerPass = 0;
+        r.commitEvents(1);
+        h.pass();
+        ASSERT_EQ(h.flow.pauses(), 1u);
+        h.sessions[7].drainPerPass = 1 << 20;
+        for (int i = 0; i < 10; ++i) h.pass();
+        int notes = 0;
+        for (const auto& f : h.delivered[7])
+            if (auto rec = pc::Records::decode(f.data(), f.size()); rec && rec->recordBatch.size() == 8 && rec->baseOffset < 0)
+                ++notes;
+        EXPECT_EQ(notes, 1) << "the client holds the note: a data-frame resume never repeats it";
+        EXPECT_EQ(h.seen(7).first, range(0, 3));
+    }
 }
