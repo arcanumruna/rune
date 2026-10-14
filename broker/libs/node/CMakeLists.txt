@@ -1511,7 +1511,8 @@ if(BUILD_TESTING)
         # Catalog history Task 11 (F7): the REAL client (rune-client-cpp, embedded by
         # the root CMakeLists) against a REAL in-process single-node BrokerNode.
         # Task 15 adds rune_cli_lib.
-        add_executable(rune_client_broker_tests tests/client/ClientDdlBrokerRegressionTest.cpp)
+        add_executable(rune_client_broker_tests tests/client/ClientDdlBrokerRegressionTest.cpp
+                       tests/client/ClientCatalogReadBrokerRegressionTest.cpp)
         target_include_directories(rune_client_broker_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_client_broker_tests PRIVATE rune_node rune_view rune_codec rune_catalog
                               rune_client_api aeron::aeron GTest::gtest_main)

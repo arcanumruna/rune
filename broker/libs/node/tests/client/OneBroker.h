@@ -8,6 +8,10 @@
 //   catalogEvents()  — the node's __catalog log, read on the admin thread and
 //                      decoded with rune_catalog (every event, offset order);
 //   endpoint()       — "host:port" of the client endpoint (the CLI's --broker);
+//   runSchemaLifecycle — (Task 13) a typed topic's define, ALTER ADD, ALTER
+//                      RENAME and SET COMPATIBILITY through the client's *AndWait;
+//   catalogSubscribeFromOffsets — (Task 13) the fromOffset of every catalog
+//                      Subscribe the node's CatalogReadServer accepted;
 //   idDescriptor / addColumnOps / viewPlanOver — DDL payload builders.
 //
 // Every wait is bounded (the deadline is the failure, never a hang).
@@ -128,6 +132,39 @@ public:
                 if (next == before) break;
             }
             return out;
+        });
+    }
+
+    /// Task 13: four schema events on `name` through the real client — a typed
+    /// CreateTopic {id, hp}, ALTER ADD mana, ALTER RENAME hp → health, SET
+    /// COMPATIBILITY FORWARD.  Throws on any refusal (a test precondition).
+    void runSchemaLifecycle(rune::client::Client& client, const std::string& name) {
+        using namespace std::chrono_literals;
+        const auto created = client.defineTopicAndWait(name, 1, "id", idDescriptor(name), false,
+                                                       rune::client::Persistence::Disk, {}, {}, 10s);
+        if (created.errorCode != 0) throw std::runtime_error("runSchemaLifecycle: define: " + created.detail);
+        rune::codec::AlterOp rename{};
+        rename.type    = rune::codec::AlterOpType::Rename;
+        rename.name    = "hp";
+        rename.newName = "health";
+        rune::codec::AlterOp compat{};
+        compat.type = rune::codec::AlterOpType::SetCompatibility;
+        compat.mode = rune::codec::CompatMode::Forward;
+        const std::vector<std::vector<uint8_t>> alters = {addColumnOps("mana"), rune::codec::encodeAlterOps({rename}),
+                                                          rune::codec::encodeAlterOps({compat})};
+        for (const auto& ops : alters) {
+            const auto r = client.alterTopicAndWait(name, 0, ops, {}, 10s);
+            if (r.errorCode != 0) throw std::runtime_error("runSchemaLifecycle: alter: " + r.detail);
+        }
+    }
+
+    /// Task 13: the requested fromOffset of each catalog Subscribe the node's
+    /// CatalogReadServer accepted, in order (read on the admin thread).
+    std::vector<int64_t> catalogSubscribeFromOffsets() {
+        BrokerNode& n = *node_;
+        return n.onAdminThreadForTest([&n]() {
+            const auto* rs = n.adminWorkerAgentForTest()->worker().readServer();
+            return rs != nullptr ? rs->acceptedFromOffsetsForTest() : std::vector<int64_t>{};
         });
     }
 

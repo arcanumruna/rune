@@ -82,12 +82,20 @@ void CatalogReadServer::subscribe(int64_t session, int64_t corr, int64_t fromOff
     if (fromOffset == kFromEarliest) next = 0;
     else if (fromOffset < 0)         next = hw;                       // latest (−1) / any other sentinel
     else                             next = std::min(fromOffset, hw); // never ahead of the committed prefix
+    acceptedFrom_[acceptedCount_++ % kAcceptedFromKept] = fromOffset;
     const int64_t id = kCatalogSubscriptionIdBase | idPrefix_ | ++nextId_;
     Sub s{session, corr, id, Answering{next}, nowNs_ + kProbeIntervalNs};
     if (owed_.empty() && sendSubscribeResponse_(session, corr, kOk, id)) s.phase = Backlog{next};
     subs_.push_back(s);   // reserved: never allocates
     spdlog::debug("CatalogReadServer: catalog Subscribe session={} corr={} subId={:#x} from={} (HW {})", session,
                   corr, id, next, hw);
+}
+
+std::vector<int64_t> CatalogReadServer::acceptedFromOffsetsForTest() const {
+    std::vector<int64_t> out;
+    const uint64_t kept = std::min<uint64_t>(acceptedCount_, kAcceptedFromKept);
+    for (uint64_t i = acceptedCount_ - kept; i < acceptedCount_; ++i) out.push_back(acceptedFrom_[i % kAcceptedFromKept]);
+    return out;
 }
 
 void CatalogReadServer::unsubscribe(int64_t session, int64_t subscriptionId) {

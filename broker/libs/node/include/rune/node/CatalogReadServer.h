@@ -47,6 +47,7 @@
 #include <rune/gateway/IAdminRequestSink.h>   // kCatalogSubscriptionIdBase
 
 #include <cstddef>
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <span>
@@ -183,6 +184,11 @@ public:
     [[nodiscard]] uint64_t endedSubscriptions() const noexcept { return ended_; }
     /// "Answering" | "Backlog" | "Live" | "PausePending" | "Paused"; "" = none.
     [[nodiscard]] const char* phaseName(int64_t subscriptionId) const noexcept;
+    /// Catalog history Task 13 (tests): the requested fromOffset of each catalog
+    /// Subscribe this server ACCEPTED (beyond the cap: not recorded), oldest
+    /// first — the last kAcceptedFromKept of them (a fixed array: no growth).
+    static constexpr std::size_t kAcceptedFromKept = 32;
+    [[nodiscard]] std::vector<int64_t> acceptedFromOffsetsForTest() const;
 
 private:
     /// A refusal / an ended subscription's answer the egress could not take yet.
@@ -234,6 +240,8 @@ private:
     uint64_t                             seenLogGen_ = 0;    // N2: the replica's log generation already checked
     std::size_t                          rr_ = 0;          // round-robin start (M2)
     uint64_t                             truncationEnds_ = 0;
+    std::array<int64_t, kAcceptedFromKept> acceptedFrom_{};   // a ring of the last accepted fromOffsets (tests)
+    uint64_t                             acceptedCount_ = 0;
     uint64_t                             refused_ = 0;
     uint64_t                             ended_   = 0;
 };
