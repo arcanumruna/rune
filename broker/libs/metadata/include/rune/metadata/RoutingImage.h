@@ -84,11 +84,17 @@ public:
     ///
     /// Entries with the same gpid: last write wins (undefined order).
     /// Gaps in [0, maxGpid] are filled with the NO_LEADER sentinel.
+    /// Catalog history Task 8 (C1 generalized): where the image came from.
+    /// Committed = built from the COMMITTED assignment map (buildFromMap) — an
+    /// entry is a committed placement; Static = the bootstrap / static-balancer
+    /// image — a routing hint only, never a committed placement.
+    enum class Source : uint8_t { Static, Committed };
+
     static std::shared_ptr<const RoutingImage>
-    build(const std::vector<BuildEntry>& entries)
+    build(const std::vector<BuildEntry>& entries, Source source = Source::Static)
     {
         // Control-plane allocation — shared_ptr construction is fine here.
-        return std::shared_ptr<RoutingImage>(new RoutingImage(entries));
+        return std::shared_ptr<RoutingImage>(new RoutingImage(entries, source));
     }
 
     // ── Factory: build from AssignmentMap ────────────────────────────────────
@@ -117,7 +123,7 @@ public:
             if (gpid < 0) return;  // release-safe: skip rather than corrupt
             entries.push_back(BuildEntry{gpid, pa.leaderNode, pa.leaderEpoch});
         });
-        return build(entries);
+        return build(entries, Source::Committed);
     }
 
     // ── Hot-path lookup ───────────────────────────────────────────────────────
@@ -144,6 +150,9 @@ public:
         return static_cast<int32_t>(entries_.size());
     }
 
+    /// True iff every entry is a COMMITTED placement (buildFromMap).
+    [[nodiscard]] bool committed() const noexcept { return source_ == Source::Committed; }
+
     // ── Non-copyable, non-movable (immutable value object) ───────────────────
 
     RoutingImage(const RoutingImage&)            = delete;
@@ -153,7 +162,7 @@ public:
 
 private:
     // Private constructor — use build() factory.
-    explicit RoutingImage(const std::vector<BuildEntry>& entries)
+    RoutingImage(const std::vector<BuildEntry>& entries, Source source) : source_(source)
     {
         if (entries.empty()) return;
 
@@ -180,6 +189,7 @@ private:
         }
     }
 
+    Source source_ = Source::Static;
     // Contiguous flat array: entries_[gpid] = {leaderNodeId, leaderEpoch}.
     std::vector<Entry> entries_;
 

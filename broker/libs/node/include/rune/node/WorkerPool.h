@@ -238,6 +238,10 @@ public:
     void coLocateViewWithSource(int32_t viewTopicId, int32_t sourceTopicId) noexcept {
         router_.mapTopicToGroupKey(viewTopicId, router_.groupKeyForTopic(sourceTopicId));
     }
+    /// Catalog history Task 8 (M5): the catalog dropped the topic (a view sink
+    /// among them, after its uninstall) and its replicas are retired — forget
+    /// its routing group.  Control thread.
+    void forgetTopicRoute(int32_t topicId) noexcept { router_.unmapTopic(topicId); }
 
     /// F18: does an op with a `tailLen`-byte tail fit ONE frame of the owning
     /// worker's ingress ring?  (See Worker::opTailFits.)  Called once per follower

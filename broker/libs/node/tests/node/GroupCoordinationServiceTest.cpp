@@ -1608,3 +1608,46 @@ TEST_F(CG3ServiceTest, GroupConsumingAPartitionWithoutACommitIsFencedOnANewLinea
     tick();
     EXPECT_EQ(service_->supersededMarkGroupsForTest(), 0u) << "an Empty group's superseded marks were never pruned";
 }
+
+// Catalog history Task 8 fix round 1 (I3): the catalog DROPS a topic a group
+// consumes — the group rebalances it away EXPLICITLY (revoke + a new assignment
+// without the dropped partitions), never silently keeping dead partitions.
+// RED: onTopicDropped a no-op — the group stays Stable, assigned to a topic
+// that no longer exists (its member's push just stops).
+TEST_F(CG3ServiceTest, DroppedTopicIsRebalancedAwayFromItsGroupsRegression) {
+    const std::string groupId = "g-drop";
+    auto join = [&](const std::string& member, int64_t corr) {
+        pc::JoinGroup msg;   // subscribed to the test topic (by id)
+        msg.sessionId = 1; msg.correlationId = corr; msg.sessionTimeoutMs = 5000;
+        msg.groupId  = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(groupId.data()), groupId.size());
+        msg.memberId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(member.data()), member.size());
+        const std::array<int32_t, 1> topics{kTestTopicId};
+        auto n = msg.encode(req_, std::span<const int32_t>(topics));
+        auto o = service_->handleJoinGroup(req_, n, clock_, out_, kBufSize);
+        auto r = pc::JoinGroupResponse::decode(out_, o);
+        EXPECT_TRUE(r.has_value());
+        return r ? std::string(reinterpret_cast<const char*>(r->memberId.data()), r->memberId.size()) : std::string{};
+    };
+    const std::string memberId = join("", 201);
+    clock_ += kStep;
+    (void)join(memberId, 202);
+    ASSERT_TRUE(driveUntil([&] { return service_->coordinator(groupId).state() == GroupState::Stable; }, 10));
+    auto holdsTopic = [&] {
+        for (const auto& m : service_->coordinator(groupId).members())
+            for (const auto& tp : m.assignment) if (tp.topic == kTestTopic) return true;
+        return false;
+    };
+    ASSERT_TRUE(holdsTopic()) << "non-vacuous: the group consumes the topic";
+    const int32_t genBefore = service_->coordinator(groupId).generationId();
+
+    ASSERT_TRUE(registry_->dropTopic(kTestTopicId));
+    EXPECT_EQ(service_->onTopicDropped(kTestTopic, clock_), 1u);
+    EXPECT_EQ(service_->coordinator(groupId).state(), GroupState::PreparingRebalance)
+        << "the group learns the drop explicitly (a rebalance)";
+    EXPECT_EQ(service_->onTopicDropped(kTestTopic, clock_), 0u) << "idempotent: already rebalancing it away";
+    clock_ += kStep;
+    (void)join(memberId, 203);
+    ASSERT_TRUE(driveUntil([&] { return service_->coordinator(groupId).state() == GroupState::Stable; }, 10));
+    EXPECT_GT(service_->coordinator(groupId).generationId(), genBefore);
+    EXPECT_FALSE(holdsTopic()) << "the dropped topic's partitions are no longer assigned";
+}

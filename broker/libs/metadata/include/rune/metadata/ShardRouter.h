@@ -59,6 +59,10 @@ public:
         topicGroup_[topicId] = groupKey;
     }
 
+    /// Catalog history Task 8 (M5): a dropped topic's group entry (its id is
+    /// never reused — this only frees the entry).
+    void unmapTopic(int32_t topicId) noexcept { topicGroup_.erase(topicId); }
+
     [[nodiscard]] int32_t groupKeyForTopic(int32_t topicId) const noexcept {
         const auto it = topicGroup_.find(topicId);
         return (it != topicGroup_.end()) ? it->second : topicId;

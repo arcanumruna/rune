@@ -360,7 +360,7 @@ public:
                 spdlog::error("AdminWorkerAgent: control→admin frame type={} len={} refused (unknown; refused "
                               "so far: {})", tid, n, badControlFrames_);
         }, 16);
-        if (!holdDroppedDirPurge_ && !heldDroppedDirPurges_.empty()) [[unlikely]] work += releaseHeldPurges_();
+        if (!holdDroppedDirPurge_ && !heldPurgeEnds_.empty()) [[unlikely]] work += releaseHeldPurges_();
 
         // 3. Drain gateway requests (DefineTopic / GetSchema).
         //    Fix round 2: while DDL answers wait in the egress backlog, NO new
@@ -597,7 +597,7 @@ public:
         });
     }
     void setHoldDroppedDirPurgeForTest(bool on) noexcept { holdDroppedDirPurge_ = on; }
-    [[nodiscard]] std::size_t heldDroppedDirPurgesForTest() const noexcept { return heldDroppedDirPurges_.size(); }
+    [[nodiscard]] std::size_t heldDroppedDirPurgesForTest() const noexcept { return heldPurgeEnds_.size(); }
     [[nodiscard]] uint64_t droppedDirsPurgedForTest() const noexcept { return droppedDirsPurged_; }
 
     /// Catalog history Task 6: the __catalog replica's ISR channel (admin →
@@ -637,17 +637,29 @@ private:
     // paths queue (preallocated) instead of being removed; releasing it purges
     // them on the next admin pass.
     bool                     holdDroppedDirPurge_ = false;
-    std::vector<std::string> heldDroppedDirPurges_ = [] { std::vector<std::string> v; v.reserve(64); return v; }();
+    // Held paths, packed (fix round 1, M8): one preallocated byte buffer + the
+    // end offset of each path (capacity kept; no per-path allocation).
+    std::vector<char>        heldPurgeBytes_ = [] { std::vector<char> v; v.reserve(64 * 1024); return v; }();
+    std::vector<std::size_t> heldPurgeEnds_  = [] { std::vector<std::size_t> v; v.reserve(256); return v; }();
     uint64_t                 droppedDirsPurged_ = 0;   // admin-owned (test observability via onAdminThreadForTest)
     uint64_t                 badControlFrames_  = 0;
     void onPurgeDroppedDir_(std::string_view path) {
-        if (holdDroppedDirPurge_) { heldDroppedDirPurges_.emplace_back(path); return; }
+        if (holdDroppedDirPurge_) {
+            heldPurgeBytes_.insert(heldPurgeBytes_.end(), path.begin(), path.end());
+            heldPurgeEnds_.push_back(heldPurgeBytes_.size());
+            return;
+        }
         purgeDroppedDir_(path);
     }
     int releaseHeldPurges_() {
-        int n = 0;
-        for (const std::string& path : heldDroppedDirPurges_) { purgeDroppedDir_(path); ++n; }
-        heldDroppedDirPurges_.clear();   // capacity kept
+        std::size_t begin = 0;
+        for (const std::size_t end : heldPurgeEnds_) {
+            purgeDroppedDir_(std::string_view(heldPurgeBytes_.data() + begin, end - begin));
+            begin = end;
+        }
+        const int n = static_cast<int>(heldPurgeEnds_.size());
+        heldPurgeBytes_.clear();   // capacity kept
+        heldPurgeEnds_.clear();
         return n;
     }
     void purgeDroppedDir_(std::string_view path) {
@@ -1180,6 +1192,25 @@ public:
     void postCatalogEffectForTest(int32_t typeId, std::vector<uint8_t> payload);   // defined in BrokerNode.cpp
     bool catalogTopicServesForTest(int32_t topicId);
     void holdDroppedDirPurgeForTest(bool on);
+    /// Fix round 1 (I2): the cleaner keeps swapping replica views but holds its
+    /// ACK — the retire gate (a dropped topic's Logs, collectRetired) must hold.
+    void holdCleanerViewAckForTest(bool on);
+    /// Fix round 1 (M6): run `f()` on the CLEANER (LogCleanerAgent) thread —
+    /// test reads of cleaner-owned state (its policy overrides).  Same contract
+    /// as onAdminThreadForTest.
+    template <class F>
+    auto onCleanerThreadForTest(F&& f, std::chrono::milliseconds timeout = std::chrono::seconds{10}) {
+        using Impl = detail::OwnerThreadTestTaskImpl<std::decay_t<F>, OwnerThreadTestTask::Target::CleanerThread>;
+        if (!started_ || stopped_ || !cleanerAgent_ || !cleanerRunner_)
+            throw std::logic_error("onCleanerThreadForTest: node is not running or has no cleaner");
+        auto task = std::make_shared<Impl>(-1, -1, std::forward<F>(f), OwnerThreadTestTask::Clock::now() + timeout);
+        auto* ref = new OwnerThreadTestTaskRef(task);
+        if (!cleanerAgent_->offerCleanerThreadTestTask(ref)) {
+            delete ref;
+            throw std::runtime_error("onCleanerThreadForTest: cleaner test-task ring full");
+        }
+        return awaitOwnerThreadTestTask(*task, timeout);
+    }
 
 
     /// E2 residual round 5 (R2), TEST-ONLY: a controller answers this node's
@@ -1313,9 +1344,8 @@ public:
     MetadataService* metadataServiceForTest() const noexcept {
         return metadataService_.get();
     }
-    /// Test-only (catalog history Task 8): the cleaner (cleaner-thread-owned) —
-    /// read its policy override only after LogCleanerAgent::policyUpdatesForTest()
-    /// (acquire) showed the update.
+    /// Test-only (catalog history Task 8): the cleaner — CLEANER-thread-owned:
+    /// read it only inside onCleanerThreadForTest.
     const LogCleanerAgent* cleanerForTest() const noexcept { return cleanerAgent_.get(); }
 
     /// Test-only: return the SchemaRegistry (for byName/byId queries in tests).
@@ -1821,15 +1851,22 @@ private:
     // Catalog history Task 8 (control-thread-owned): the drop sequence's states
     // (see dropRuntimeTopic_), the creates waiting behind a drop of their name,
     // and the frames a full ring could not take yet (retried, never dropped).
-    struct AwaitingRetire { uint64_t retireGen = 0; };   // step 2: holders still ack the removal
-    struct AwaitingRename {};                            // step 2: logs closed; the dir rename (retried)
+    struct AwaitingRetire {                              // step 2: holders still ack the removal
+        uint64_t                                 retireGen = 0;
+        std::vector<rune::storage::InMemoryLog*> memLogs;   // transient rings, freed with the replicas
+    };
+    struct AwaitingRename {                              // step 2: logs closed; the dir rename
+        int64_t  retryAtNs = 0;                          // a failed rename backs off (never every pass)
+        int64_t  backoffNs = 0;
+        uint64_t failures  = 0;
+    };
+    static constexpr int64_t kRenameRetryMinNs = 100'000'000;     // 100 ms
+    static constexpr int64_t kRenameRetryMaxNs = 10'000'000'000;  // 10 s
     struct DroppedTopic {
-        int32_t                                    id = -1;
-        std::string                                name;
-        bool                                       diskBacked = true;
-        std::vector<rune::storage::InMemoryLog*>   memLogs;   // transient rings, freed with the replicas
+        int32_t                                      id = -1;
+        std::string                                  name;
+        bool                                         diskBacked = true;
         std::variant<AwaitingRetire, AwaitingRename> step;
-        uint64_t                                   renameFailures = 0;
     };
     std::vector<DroppedTopic>                             droppedAwaitingRetire_;
     struct PendingCreateBehindDrop { TopicSpec spec; };

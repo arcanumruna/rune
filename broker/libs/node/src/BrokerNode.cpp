@@ -1,4 +1,5 @@
 #include <rune/node/BrokerNode.h>
+#include <rune/node/TopicName.h>
 #include <rune/node/CatalogCheckpoint.h>
 #include <rune/node/HostDefaults.h>
 #include <rune/node/ThreadAffinity.h>
@@ -3821,6 +3822,7 @@ void BrokerNode::stop() {
     if (cleanerRunner_) {
         cleanerRunner_->stopAndJoin();
     }
+    if (cleanerAgent_) cleanerAgent_->skipQueuedCleanerThreadTestTasks();   // no test thread waits forever
     cleanerAgent_.reset();
     // hotpath-A F2: the provisioner too (workers are joined: no demand is
     // posted any more; the logs it serves outlive it — the registry is torn
@@ -4369,12 +4371,18 @@ void BrokerNode::postCatalogEffectForTest(int32_t typeId, std::vector<uint8_t> p
 bool BrokerNode::catalogTopicServesForTest(int32_t topicId) {
     return onControlThreadForTest([this, topicId]() { return catalogTopicServes_(topicId); });
 }
+void BrokerNode::holdCleanerViewAckForTest(bool on) {
+    onCleanerThreadForTest([this, on]() { cleanerAgent_->setHoldViewAckForTest(on); });
+}
 void BrokerNode::holdDroppedDirPurgeForTest(bool on) {
     onAdminThreadForTest([this, on]() { adminWorkerAgent_->setHoldDroppedDirPurgeForTest(on); });
 }
 
 bool BrokerNode::catalogNameHeldByDrop_(const std::string& name) const noexcept {
-    for (const auto& d : droppedAwaitingRetire_) if (d.name == name) return true;
+    // Fix round 1 (M4): ASCII-folded — on a case-insensitive filesystem a
+    // case-variant name shares dataDir/topics/<name>/ with the dropped one.
+    for (const auto& d : droppedAwaitingRetire_)
+        if (d.name == name || rune::node::topicNamesFoldEqual(d.name, name)) return true;
     return false;
 }
 
@@ -4390,13 +4398,15 @@ void BrokerNode::onCatalogTopicApplied_(const uint8_t* p, std::size_t n) {
     // away yet) waits — FIFO per name, behind any create of that name already waiting.
     bool behind = catalogNameHeldByDrop_(spec.name);
     for (const auto& pc : pendingCreatesBehindDrop_) {
-        if (pc.spec.name != spec.name) continue;
         if (pc.spec.topicId == spec.topicId) return;   // the same effect again: already queued (idempotent)
-        behind = true;
+        behind = behind || pc.spec.name == spec.name || rune::node::topicNamesFoldEqual(pc.spec.name, spec.name);
     }
     if (behind) {
         spdlog::info("BrokerNode[{}]: catalog topic '{}' (id={}) waits behind the drop of its name "
                      "(PendingCreateBehindDrop)", config_.nodeId, spec.name, spec.topicId);
+        // Fix round 1 (C1): the id is SEEN — reserved Pending, never a Gap a later
+        // create could tombstone; answered the retriable NotLeader meanwhile.
+        if (topicRegistry_) (void)topicRegistry_->reserveTopicAt(spec.topicId, spec.name);
         pendingCreatesBehindDrop_.push_back(PendingCreateBehindDrop{std::move(spec)});
         return;
     }
@@ -4421,15 +4431,24 @@ void BrokerNode::runCatalogCreate_(const TopicSpec& spec) {
 }
 
 void BrokerNode::dropRuntimeTopic_(int32_t topicId, const std::string& name) {
-    // A create of this id still waiting behind an older drop never ran: forget it.
+    // A create of this id still waiting behind an older drop never ran: forget
+    // it — its Pending slot becomes Dropped (it was seen: created, then dropped).
     const auto before = pendingCreatesBehindDrop_.size();
     std::erase_if(pendingCreatesBehindDrop_,
                   [topicId](const PendingCreateBehindDrop& pc) { return pc.spec.topicId == topicId; });
     if (metadataService_) metadataService_->removeRuntimeTopic(topicId);   // idempotent
-    if (pendingCreatesBehindDrop_.size() != before || !topicRegistry_) return;
+    if (pendingCreatesBehindDrop_.size() != before) {
+        if (topicRegistry_) (void)topicRegistry_->dropTopic(topicId);
+        return;
+    }
+    if (!topicRegistry_) return;
 
     const TopicSpec* spec = topicRegistry_->topic(topicId);
-    if (spec == nullptr) return;   // unknown or already dropped: the same effect again (idempotent)
+    if (spec == nullptr) {   // unknown / gap / already dropped: the same effect again (idempotent)
+        if (topicRegistry_->state(topicId) == rune::gateway::TopicRegistry::TopicState::Unknown)
+            (void)topicRegistry_->dropTopic(topicId);   // a Gap id: seen now — dropped, never refilled
+        return;
+    }
     DroppedTopic d;
     d.id         = topicId;
     d.name       = spec->name;
@@ -4438,25 +4457,36 @@ void BrokerNode::dropRuntimeTopic_(int32_t topicId, const std::string& name) {
     if (d.name != name)
         spdlog::warn("BrokerNode[{}]: catalog drop of id={} names '{}' but the topic is '{}' — dropping by id",
                      config_.nodeId, topicId, name, d.name);
+    std::vector<rune::storage::Log*> logs;   // cold: the gateway forgets their addresses (M5)
+    for (int32_t part = 0; part < partitions; ++part) logs.push_back(topicRegistry_->log(topicId, part));
     (void)topicRegistry_->dropTopic(topicId);   // serves nothing from now on (`spec` is not used after)
-    if (gateway_) (void)gateway_->endTopicSubscriptions(topicId);   // explicit UnknownTopic, never silent
+    const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (gateway_) {
+        (void)gateway_->endTopicSubscriptions(topicId);   // explicit UnknownTopic, never silent
+        gateway_->forgetDroppedTopic(topicId, partitions, logs);
+    }
+    if (groupCoordService_) (void)groupCoordService_->onTopicDropped(d.name, nowNs);   // groups rebalance it away
+    AwaitingRetire retire;
     for (int32_t part = 0; part < partitions; ++part) {
         rune::replication::PartitionReplica* r = replicaRegistry_ ? replicaRegistry_->lookup(topicId, part) : nullptr;
         if (r == nullptr) continue;
-        if (!r->isDiskBacked()) d.memLogs.push_back(r->memoryLog());
-        if (replTransport_) replTransport_->unregisterReplica(topicId, part);   // never a dangling route
+        if (!r->isDiskBacked()) retire.memLogs.push_back(r->memoryLog());
         // Fence (routed to the owning worker, FIFO before the SetOwnership that drops
-        // it) + retire: freed only once every holder acked the generation.
+        // it) + retire: freed only once every holder acked the generation.  The
+        // replication transport resolves through the registry: no route remains.
         if (replBridge_) replBridge_->removePartition(topicId, part);
         else             replicaRegistry_->remove(topicId, part);
     }
+    if (workerPool_) workerPool_->forgetTopicRoute(topicId);   // M5: the router's group entry (view sinks)
     if (cleanerViewChannel_) {   // clear the cleaner's override (count 0)
         std::vector<uint8_t> clear(CleanerViewChannel::kPolicyHeaderBytes, 0);
         std::memcpy(clear.data(), &topicId, 4);
         cleanerPolicyOutbox_.push_back(std::move(clear));
         (void)pumpCatalogOutboxes_();
     }
-    d.step = AwaitingRetire{replicaRegistry_ ? replicaRegistry_->generation() : 0};
+    retire.retireGen = replicaRegistry_ ? replicaRegistry_->generation() : 0;
+    d.step = std::move(retire);
     spdlog::info("BrokerNode[{}]: catalog dropped topic '{}' (id={}): not served; {} partition(s) retiring",
                  config_.nodeId, d.name, topicId, partitions);
     droppedAwaitingRetire_.push_back(std::move(d));
@@ -4467,21 +4497,24 @@ int BrokerNode::serviceDroppedTopics_() {
     int work = 0;
     const uint64_t safeGen = runtimeAgent_ ? runtimeAgent_->retireSafeGeneration()
                                            : (replicaRegistry_ ? replicaRegistry_->generation() : 0);
+    const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
     bool renamed = false;
     for (std::size_t i = 0; i < droppedAwaitingRetire_.size();) {
         DroppedTopic& d = droppedAwaitingRetire_[i];
-        if (const auto* w = std::get_if<AwaitingRetire>(&d.step)) {
+        if (auto* w = std::get_if<AwaitingRetire>(&d.step)) {
             if (w->retireGen > safeGen) { ++i; continue; }   // a holder may still reference its Logs
             if (topicRegistry_) (void)topicRegistry_->releaseDroppedLogs(d.id);
-            for (auto* ml : d.memLogs)
+            for (auto* ml : w->memLogs)
                 std::erase_if(memoryLogs_, [ml](const std::unique_ptr<rune::storage::InMemoryLog>& l) {
                     return l.get() == ml;
                 });
-            d.memLogs.clear();
             d.step = AwaitingRename{};
             ++work;
         }
         // AwaitingRename: move the data away atomically, then hand it to the admin purge.
+        auto& rn = std::get<AwaitingRename>(d.step);
+        if (nowNs < rn.retryAtNs) { ++i; continue; }   // M2: a failed rename backs off
         const fs::path from = fs::path(config_.dataDir) / "topics" / d.name;
         std::error_code ec;
         if (d.diskBacked && fs::exists(fs::symlink_status(from, ec))) {
@@ -4490,10 +4523,12 @@ int BrokerNode::serviceDroppedTopics_() {
             fs::create_directories(droppedRoot, ec);
             if (!ec) fs::rename(from, to, ec);
             if (ec) {
-                if (d.renameFailures++ % 1024 == 0)
+                rn.backoffNs = rn.backoffNs == 0 ? kRenameRetryMinNs : std::min(rn.backoffNs * 2, kRenameRetryMaxNs);
+                rn.retryAtNs = nowNs + rn.backoffNs;
+                if (rn.failures++ % 64 == 0)
                     spdlog::error("BrokerNode[{}]: renaming the dropped topic dir '{}' -> '{}' failed: {} — "
-                                  "retried next pass (never deleted in place; failures {})", config_.nodeId,
-                                  from.string(), to.string(), ec.message(), d.renameFailures);
+                                  "retried in {} ms (never deleted in place; failures {})", config_.nodeId,
+                                  from.string(), to.string(), ec.message(), rn.backoffNs / 1'000'000, rn.failures);
                 ++i;
                 continue;
             }
@@ -4512,7 +4547,8 @@ int BrokerNode::serviceDroppedTopics_() {
         waiting.swap(pendingCreatesBehindDrop_);
         for (auto& pc : waiting) {
             bool held = catalogNameHeldByDrop_(pc.spec.name);
-            for (const auto& q : pendingCreatesBehindDrop_) held = held || q.spec.name == pc.spec.name;
+            for (const auto& q : pendingCreatesBehindDrop_)
+                held = held || q.spec.name == pc.spec.name || rune::node::topicNamesFoldEqual(q.spec.name, pc.spec.name);
             if (held) pendingCreatesBehindDrop_.push_back(std::move(pc));
             else      runCatalogCreate_(pc.spec);
         }

@@ -212,6 +212,17 @@ public:
     void evictMember(std::string_view groupId, std::string_view memberId, int64_t sessionId,
                      int64_t nowNs) override;
 
+    // -----------------------------------------------------------------------
+    // Catalog history Task 8 fix round 1 (I3): the catalog DROPPED the topic
+    // `topicName` (control thread, the broker's drop effect).  Every group whose
+    // current assignment holds a partition of it rebalances NOW (explicit for
+    // the group: its members get the revoke + a new Assign without the dropped
+    // partitions — buildTopicPartitionCounts no longer lists the topic).
+    // Coordinator only; idempotent (a group already rebalancing is left as is).
+    // Returns the number of groups rebalanced.  Cold.
+    // -----------------------------------------------------------------------
+    std::size_t onTopicDropped(std::string_view topicName, int64_t nowNs);
+
 private:
     // -----------------------------------------------------------------------
     // Internal helpers

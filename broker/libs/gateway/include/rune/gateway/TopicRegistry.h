@@ -166,29 +166,52 @@ public:
     // -----------------------------------------------------------------------
     // Catalog history Task 8: topics created and dropped BY THE CATALOG.
     //
-    // createTopicAt — creates the entry at EXACTLY `topicId` (the catalog's id;
-    // spec.topicId is ignored).  A gap below it is filled with Dropped
-    // tombstones: an id whose create this broker never saw (it was created AND
-    // dropped before this broker's checkpoint) is a Dropped slot.  Creates
+    // A catalog id's slot is one of (rule 3, one state per slot):
+    //   Gap     — an id below a created one that this broker has not seen
+    //             (created-and-dropped before its checkpoint, OR not applied
+    //             yet): no partitions, never serves, FILLABLE by a later create;
+    //   Pending — a create this broker applied that waits behind the drop of its
+    //             name (reserveTopicAt): no partitions, never serves (answered
+    //             the retriable NotLeader), filled by createTopicAt with the
+    //             same id + name;
+    //   Serving — created (createTopicAt): serves once its placement is committed
+    //             too (placementGated(), spec §5.4);
+    //   Dropped — dropped: never serves, NEVER refilled (catalog ids are never
+    //             reused).
+    //
+    // createTopicAt — creates the entry at EXACTLY `topicId` (spec.topicId is
+    // ignored), filling a gap below it with Gap slots.  Creates
     // dataDir/topics/<name>/<p>/ for a disk topic and opens + recovers each Log
     // (an existing dir is recovered, never wiped: a restart re-runs the effect).
-    // No topic-id marker (the catalog is the record of truth).  The entry
-    // serves at once — C1 is structural: an entry exists only once applied —
-    // but is PLACEMENT-GATED (placementGated(): the gateway also requires its
-    // committed placement, spec §5.4).
+    // No topic-id marker (the catalog is the record of truth).
     // Idempotent for the same id + name (returns topicId, nothing rebuilt).
-    // Returns -1 (logged) when the id is a Dropped slot (catalog ids are never
-    // re-created), holds another name, or the name is held by another live id.
+    // Returns -1 (logged) when the id is Dropped, holds another name, or the
+    // name is held by another live id.
     // Throws std::runtime_error if a directory cannot be created.
     // SINGLE-WRITER: control thread only.
     int32_t createTopicAt(int32_t topicId, const rune::node::TopicSpec& spec);
 
+    // reserveTopicAt — the create of (topicId, name) was applied but waits
+    // behind the drop of its name: the slot becomes Pending (a Gap below it is
+    // filled with Gap slots).  Idempotent; false (logged) when the slot is
+    // Serving or Dropped, or Pending under another name.
+    bool reserveTopicAt(int32_t topicId, const std::string& name);
+
     // dropTopic — the entry becomes Dropped: it serves nothing from now on
     // (topic() / log() / servableLog() answer nullptr) and its name is freed
     // from the name index.  The Logs stay owned until releaseDroppedLogs(): a
-    // retired replica may still reference them until every holder acked.
-    // Returns true iff the entry moved to Dropped (idempotent: false again).
+    // retired replica may still reference them until every holder acked.  A
+    // Pending or Gap slot is dropped too (seen: dropped).  Returns true iff the
+    // entry moved to Dropped (idempotent: false again).
     bool dropTopic(int32_t topicId);
+
+    /// Test-only: Logs still owned by the (Dropped) entry (0 once released).
+    [[nodiscard]] std::size_t heldLogCountForTest(int32_t topicId) const noexcept {
+        if (topicId < 0 || static_cast<std::size_t>(topicId) >= topics_.size()) return 0;
+        std::size_t n = 0;
+        for (const auto& pe : topics_[static_cast<std::size_t>(topicId)].partitions) n += pe.log ? 1 : 0;
+        return n;
+    }
 
     // releaseDroppedLogs — closes (destroys) a Dropped entry's Logs.  The
     // caller guarantees nothing references them any more.  Returns true iff
@@ -197,13 +220,17 @@ public:
 
     // The catalog view of an id.  Serving = registered and not dropped (the old
     // runtime path's uncommitted entries are told apart by awaitingCommit()
-    // until Task 9 removes that path); Dropped = a dropped (or never-seen gap)
-    // catalog id; Unknown = never registered here.
-    enum class TopicState : uint8_t { Unknown, Serving, Dropped };
+    // until Task 9 removes that path); Pending = applied, waiting behind a drop;
+    // Dropped = dropped here; Unknown = never registered here, or a Gap.
+    enum class TopicState : uint8_t { Unknown, Serving, Pending, Dropped };
     [[nodiscard]] TopicState state(int32_t topicId) const noexcept {
         if (topicId < 0 || static_cast<std::size_t>(topicId) >= topics_.size()) return TopicState::Unknown;
-        return topics_[static_cast<std::size_t>(topicId)].lifecycle == Lifecycle::Dropped ? TopicState::Dropped
-                                                                                          : TopicState::Serving;
+        switch (topics_[static_cast<std::size_t>(topicId)].lifecycle) {
+            case Lifecycle::Dropped: return TopicState::Dropped;
+            case Lifecycle::Pending: return TopicState::Pending;
+            case Lifecycle::Gap:     return TopicState::Unknown;
+            default:                 return TopicState::Serving;
+        }
     }
 
     /// A catalog-applied topic (createTopicAt) that serves only once its
@@ -285,9 +312,15 @@ private:
     // (createTopicAt: placement-gated, no marker).
     enum class CreateOrigin : uint8_t { Boot, Runtime, Catalog };
     // One state per entry (rule 3): AwaitingCommit = the old runtime path's create
-    // before its record committed (C1); Serving; Dropped = a dropped catalog id
-    // (or a gap slot) — its Logs held until releaseDroppedLogs.
-    enum class Lifecycle : uint8_t { AwaitingCommit, Serving, Dropped };
+    // before its record committed (C1); Serving; Pending / Gap / Dropped = the
+    // catalog slot states (see createTopicAt) — a Dropped entry's Logs are held
+    // until releaseDroppedLogs.
+    enum class Lifecycle : uint8_t { AwaitingCommit, Serving, Pending, Gap, Dropped };
+    /// Not a serving entry: the accessors answer as for an unknown id.
+    [[nodiscard]] static bool absent_(Lifecycle l) noexcept {
+        return l == Lifecycle::Dropped || l == Lifecycle::Gap || l == Lifecycle::Pending;
+    }
+    void fillGapsBelow_(std::size_t slot);
     int32_t createTopicImpl(const rune::node::TopicSpec& spec, CreateOrigin origin);
     // Builds dirs + Logs for `spec` at `id` (shared by createTopicImpl / createTopicAt).
     struct TopicEntry;

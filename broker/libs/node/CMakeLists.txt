@@ -1506,7 +1506,7 @@ if(BUILD_TESTING)
         # override, view uninstall; every effect idempotent) on a real BrokerNode.
         add_executable(rune_catalog_effects_tests tests/node/CatalogEffectsTest.cpp)
         target_include_directories(rune_catalog_effects_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-        target_link_libraries(rune_catalog_effects_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
+        target_link_libraries(rune_catalog_effects_tests PRIVATE rune_node rune_view rune_codec aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_catalog_effects_tests PROPERTIES TIMEOUT 360 RESOURCE_LOCK rune_udp_ports)
 
         # Leader-epoch monotonicity across restarts (Kafka parity): full cold

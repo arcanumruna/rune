@@ -256,6 +256,25 @@ bool GroupCoordinationService::rebalanceForSupersededLineage_(const GroupId& gro
     return true;
 }
 
+std::size_t GroupCoordinationService::onTopicDropped(std::string_view topicName, int64_t nowNs) {
+    if (!isLocalCoordinator()) return 0;
+    std::size_t n = 0;
+    for (auto& [groupId, coord] : coordinators_) {
+        bool holds = false;
+        for (const auto& m : coord.members())
+            for (const auto& tp : m.assignment) holds = holds || tp.topic == topicName;
+        // Already rebalancing: its next assignment is computed from the
+        // registry, which no longer lists the topic (idempotent).
+        if (!holds || coord.state() == coord::GroupState::PreparingRebalance) continue;
+        if (!coord.forceRebalance(nowNs)) continue;
+        onEnterPreparingRebalance(groupId, coord);
+        spdlog::info("GroupCoordinationService: topic '{}' dropped — group '{}' rebalances it away (generation {})",
+                     topicName, groupId, coord.generationId());
+        ++n;
+    }
+    return n;
+}
+
 GroupCoordinationService::GenLineage* GroupCoordinationService::genLineageOf_(const std::string& groupId,
                                                                              int32_t topicId, int32_t partition) {
     const auto it = genLineages_.find(groupId);

@@ -17,6 +17,10 @@
 //   - BINDING (Task 7 review): every effect applied TWICE leaves the same final
 //     state — never a duplicate, an error or a double placement.
 #include <rune/aeronutil/testing/FreePort.h>
+#include <rune/codec/Descriptor.h>
+#include <rune/codec/Serialize.h>
+#include <rune/view/PlanCompiler.h>
+#include <rune/view/ViewPlan.h>
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/node/AdminChannels.h>
@@ -39,6 +43,7 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <optional>
 #include <string>
 #include <thread>
@@ -209,13 +214,40 @@ public:
     bool awaitPathGone(const fs::path& p, std::chrono::milliseconds timeout) {
         return awaitTrue([&] { return !fs::exists(p); }, timeout);
     }
+    /// Fix round 1 (M6): read on the CLEANER thread (owner-thread hook), never cross-thread.
     bool awaitCleanerOverride(int32_t topicId, int64_t retentionMs, std::chrono::milliseconds timeout,
                               uint64_t minUpdates = 1) {
-        const LogCleanerAgent* c = node_->cleanerForTest();
-        if (c == nullptr) return false;
-        if (!awaitTrue([&] { return c->policyUpdatesForTest() >= minUpdates; }, timeout)) return false;
-        const auto* ov = c->policyOverrideForTest(topicId);   // published (acquire above), no update after
-        return ov != nullptr && ov->retentionMs == std::optional<int64_t>{retentionMs};
+        return awaitTrue([&] {
+            return node_->onCleanerThreadForTest([&] {
+                const LogCleanerAgent* c = node_->cleanerForTest();
+                const auto* ov = c->policyOverrideForTest(topicId);
+                return c->policyUpdatesForTest() >= minUpdates && ov != nullptr &&
+                       ov->retentionMs == std::optional<int64_t>{retentionMs};
+            });
+        }, timeout);
+    }
+    std::size_t heldDroppedLogs(int32_t topicId) {
+        return node_->onControlThreadForTest(
+            [&] { return node_->gatewayForTest()->topicRegistry()->heldLogCountForTest(topicId); });
+    }
+    /// A raw admin→control catalog frame (the view install the applier's viewInstalled posts).
+    void postRaw(int32_t typeId, std::vector<uint8_t> f) { node_->postCatalogEffectForTest(typeId, std::move(f)); }
+    std::optional<uint16_t> viewRowStatus(int32_t viewTopicId, uint64_t key) {
+        ShardTestClient& c = client();
+        const int64_t corr = c.sendGetViewRow(gwChannel_, gwStream_, sid_, viewTopicId, key);
+        if (corr == 0) return std::nullopt;
+        return c.awaitViewRow(corr, Clock::now() + 5s);
+    }
+    bool subscribeFrom0(int32_t topicId, int32_t partition) {
+        return client().subscribe(gwChannel_, gwStream_, sid_, topicId, partition, 0);
+    }
+    bool awaitErrorCode(int16_t code, std::chrono::milliseconds timeout) {
+        ShardTestClient& c = client();
+        const auto deadline = Clock::now() + timeout;
+        return c.pollUntil([&] {
+            for (const auto& e : c.errors()) if (e.code == code) return true;
+            return Clock::now() >= deadline;
+        }) && [&] { for (const auto& e : c.errors()) if (e.code == code) return true; return false; }();
     }
 
     // ── the real data path: a wire client over Aeron ─────────────────────────
@@ -271,6 +303,7 @@ private:
 };
 
 constexpr int16_t kUnknownTopic = static_cast<int16_t>(pc::ErrorCode::UnknownTopic);
+constexpr int16_t kNotLeader    = static_cast<int16_t>(pc::ErrorCode::NotLeader);
 
 class CatalogEffectsRegression : public ::testing::TestWithParam<Mode> {};
 
@@ -288,7 +321,7 @@ TEST_P(CatalogEffectsRegression, AppliedTopicIsCreatedAtItsCatalogIdAndPlaced) {
     n.applyCreateTopic(5, "later", 1);
     ASSERT_TRUE(n.awaitServes(5, 10s));
     EXPECT_EQ(n.topicIdForName("later"), 5);
-    EXPECT_EQ(n.topicState(3), rune::gateway::TopicRegistry::TopicState::Dropped);
+    EXPECT_EQ(n.topicState(3), rune::gateway::TopicRegistry::TopicState::Unknown) << "a never-seen id: a Gap";
     EXPECT_EQ(n.produceErrorCode(3, 0), kUnknownTopic);
 }
 
@@ -406,6 +439,142 @@ TEST_P(CatalogEffectsRegression, EveryEffectKindAppliedTwiceLeavesTheSameFinalSt
     n.node()->holdDroppedDirPurgeForTest(false);
     EXPECT_TRUE(n.awaitPathGone(n.dataDir() / "dropped" / "0.a", 10s));
     EXPECT_FALSE(fs::exists(n.dataDir() / "topics" / "a")) << "renamed once, never re-created";
+}
+
+// Fix round 1 (C1) + review I2 (the retire gate).  The cleaner HOLDS its view
+// ack: the dropped topic's replica is retired but not yet freed, so its Logs stay
+// owned, topics/t is not renamed and the create of t behind it waits.  Meanwhile
+// a HIGHER id (u) is created and serves — it must not tombstone t's queued id.
+// RED (C1): t's id 1 became a Dropped tombstone when u (id 2) was created —
+// createTopicAt(1) refused forever, id 1 answered the non-retriable UnknownTopic.
+// RED (I2): the gate released at once — the dir renamed / the Logs freed while
+// a holder had not acked.
+TEST_P(CatalogEffectsRegression, CreateBehindDropSurvivesAHigherIdAndWaitsForTheRetireGateRegression) {
+    SingleNode n("eff_gate", GetParam());
+    n.applyCreateTopic(0, "t", 1);
+    ASSERT_TRUE(n.awaitServes(0, 10s));
+    ASSERT_TRUE(n.produceSync(0, 0, "old-record"));
+    n.node()->holdCleanerViewAckForTest(true);
+    n.applyDropTopic(0, "t");
+    n.applyCreateTopic(1, "t", 1);   // waits behind the drop
+    n.applyCreateTopic(2, "u", 1);   // a higher id, created at once
+    ASSERT_TRUE(n.awaitServes(2, 10s));
+    // The gate holds while the cleaner has not acked the generation dropping t.
+    for (int i = 0; i < 20; ++i) {
+        std::this_thread::sleep_for(20ms);
+        ASSERT_TRUE(fs::exists(n.dataDir() / "topics" / "t" / "0")) << "renamed before every holder acked";
+        ASSERT_FALSE(fs::exists(n.dataDir() / "dropped" / "0.t"));
+        ASSERT_EQ(n.heldDroppedLogs(0), 1u) << "the dropped topic's Log was freed before every holder acked";
+        ASSERT_FALSE(n.node()->catalogTopicServesForTest(1)) << "the queued create ran before the rename";
+    }
+    EXPECT_EQ(n.topicState(1), rune::gateway::TopicRegistry::TopicState::Pending);
+    EXPECT_EQ(n.produceErrorCode(1, 0), kNotLeader) << "a queued id answers the retriable NotLeader";
+    n.node()->holdCleanerViewAckForTest(false);
+    ASSERT_TRUE(n.awaitServes(1, 10s)) << "t serves under its NEW id once the gate opened";
+    EXPECT_EQ(n.topicIdForName("t"), 1);
+    EXPECT_EQ(n.heldDroppedLogs(0), 0u) << "released after the ack";
+    EXPECT_EQ(n.logEndOffset(1, 0), 0) << "the reused name starts EMPTY";
+    EXPECT_TRUE(n.awaitPathGone(n.dataDir() / "dropped" / "0.t", 10s));
+}
+
+// Fix round 1 (M4): on a case-insensitive filesystem (the macOS dev boxes) a
+// case-variant name shares dataDir/topics/<name>/ — its create waits behind the
+// drop exactly like the same name.  RED (macOS): CREATE t ran at once and
+// RECOVERED topics/T's old record under the new id.
+TEST_P(CatalogEffectsRegression, CaseVariantCreateWaitsBehindTheDropRegression) {
+    SingleNode n("eff_case", GetParam());
+    n.applyCreateTopic(0, "T", 1);
+    ASSERT_TRUE(n.awaitServes(0, 10s));
+    ASSERT_TRUE(n.produceSync(0, 0, "old-record"));
+    n.node()->holdCleanerViewAckForTest(true);
+    n.applyDropTopic(0, "T");
+    n.applyCreateTopic(1, "t", 1);
+    std::this_thread::sleep_for(200ms);
+    EXPECT_EQ(n.topicState(1), rune::gateway::TopicRegistry::TopicState::Pending) << "waits behind the drop";
+    n.node()->holdCleanerViewAckForTest(false);
+    ASSERT_TRUE(n.awaitServes(1, 10s));
+    EXPECT_EQ(n.logEndOffset(1, 0), 0) << "the case-variant name starts EMPTY";
+}
+
+// Review M7: a live subscription of a dropped topic ends with an explicit
+// UnknownTopic over the wire — in every worker mode (Shard: the owning worker
+// pushes it).  RED: endTopicSubscriptions a no-op — the subscription stays
+// silently registered and pushes nothing, forever.
+TEST_P(CatalogEffectsRegression, LiveSubscriptionOfADroppedTopicEndsWithUnknownTopicRegression) {
+    SingleNode n("eff_subend", GetParam());
+    n.applyCreateTopic(0, "t", 1);
+    ASSERT_TRUE(n.awaitServes(0, 10s));
+    ASSERT_TRUE(n.produceSync(0, 0, "r"));
+    ASSERT_EQ(n.consumeFromEarliest(0, 0, 500ms).size(), 1u) << "non-vacuous: the subscription is live";
+    n.applyDropTopic(0, "t");
+    EXPECT_TRUE(n.awaitErrorCode(kUnknownTopic, 10s)) << "the live subscription ended explicitly";
+}
+
+// Review M7: a view installed through the catalog effect path, then uninstalled
+// (DropView's viewUninstalled → the control thread → every worker's install
+// ring): reads of it end in UnknownView over the wire.  RED: onViewUninstall_ /
+// the install-ring fan-out a no-op — the dropped view keeps answering.
+TEST_P(CatalogEffectsRegression, InstalledViewUninstalledThroughTheCatalogAnswersUnknownViewRegression) {
+    SingleNode n("eff_view", GetParam());
+    const auto src = rune::codec::DescriptorBuilder("character", 1)
+                         .add("characterId", rune::codec::PrimType::Int64, 1, /*isKey*/ true)
+                         .add("hp", rune::codec::PrimType::Int32)
+                         .build();
+    n.applyCreateTopic(0, "character", 1);
+    ASSERT_TRUE(n.awaitServes(0, 10s));
+    rune::view::ViewPlan v;
+    v.viewName = "char_hp";
+    v.key      = "characterId";
+    v.sources  = {{0, "characterId"}};
+    v.output   = {{"characterId", rune::codec::PrimType::Int64, 0, "characterId", rune::view::MergeRule::Replace},
+                  {"hp", rune::codec::PrimType::Int32, 0, "hp", rune::view::MergeRule::Replace}};
+    v.persistence = 1;   // transient: no checkpoint files
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(v, srcs, /*viewTopicId=*/1);
+    ASSERT_TRUE(comp.has_value());
+    {   // the sink (sinkApplied: a keyed compacted table) and the plan (viewInstalled)
+        rune::protocol::TopicConfig c;
+        c.cleanupPolicy = 1;
+        c.partitionKey  = "characterId";
+        std::vector<uint8_t> f(catalogTopicAppliedWireLen("char_hp", c));
+        writeCatalogTopicApplied(f.data(), 1, "char_hp", 1, 0, /*persistence=*/1, c);
+        n.postRaw(kA2cCatalogTopicApplied, std::move(f));
+    }
+    ASSERT_TRUE(n.awaitServes(1, 10s));
+    const auto plan = rune::view::serialize(comp->plan);
+    const auto out  = rune::codec::serialize(comp->outputDescriptor);
+    const auto sd   = rune::codec::serialize(src);
+    std::vector<uint8_t> f(viewPlanUpdateWireLen(plan, out, sd));
+    writeViewPlanUpdate(f.data(), 1, /*persistence=*/1, /*recovery=*/0, plan, out, sd);
+    n.postRaw(kA2cViewPlanUpdate, std::move(f));
+    std::optional<uint16_t> st;
+    ASSERT_TRUE(SingleNode::awaitTrue([&] {
+        st = n.viewRowStatus(1, 7);
+        return st && *st != pc::ViewRowResponse::kUnknownView;
+    }, 10s)) << "non-vacuous: the installed view answers (status " << (st ? int(*st) : -1) << ")";
+    n.applyViewUninstall(1);
+    EXPECT_TRUE(SingleNode::awaitTrue([&] {
+        st = n.viewRowStatus(1, 7);
+        return st && *st == pc::ViewRowResponse::kUnknownView;
+    }, 10s)) << "the uninstalled view still answers (status " << (st ? int(*st) : -1) << ")";
+}
+
+// Fix round 1 (M2): a dropped topic's dir rename that FAILS is retried (with a
+// backoff — never every duty pass) and the data is never deleted in place; once
+// the cause is gone the rename completes.  RED: a failed rename given up (the
+// dir stays forever) or the data deleted in place.
+TEST_P(CatalogEffectsRegression, FailedDirRenameIsRetriedAndNeverDeletesInPlaceRegression) {
+    SingleNode n("eff_rename", GetParam());
+    n.applyCreateTopic(0, "t", 1);
+    ASSERT_TRUE(n.awaitServes(0, 10s));
+    ASSERT_TRUE(n.produceSync(0, 0, "r"));
+    { std::ofstream block(n.dataDir() / "dropped"); block << "x"; }   // dropped/ is a FILE: the rename fails
+    n.applyDropTopic(0, "t");
+    ASSERT_TRUE(n.awaitTopicState(0, rune::gateway::TopicRegistry::TopicState::Dropped, 10s));
+    std::this_thread::sleep_for(300ms);
+    EXPECT_TRUE(fs::exists(n.dataDir() / "topics" / "t" / "0")) << "never deleted in place";
+    fs::remove(n.dataDir() / "dropped");
+    EXPECT_TRUE(n.awaitPathGone(n.dataDir() / "topics" / "t", 15s)) << "the retried rename completed";
 }
 
 INSTANTIATE_TEST_SUITE_P(Modes, CatalogEffectsRegression,

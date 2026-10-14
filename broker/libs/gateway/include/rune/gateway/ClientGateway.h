@@ -568,6 +568,7 @@ public:
     void addWorkerOwnedLog(rune::storage::Log* log) {
         if (log) workerOwnedLogs_.insert(log);
     }
+    [[nodiscard]] std::size_t workerOwnedLogCountForTest() const noexcept { return workerOwnedLogs_.size(); }
 
     // -----------------------------------------------------------------------
     // E5.1: setWorkerIngressBaseStreamId — configure the base Aeron stream id
@@ -875,6 +876,13 @@ public:
     // the number of subscriptions ended.
     // -----------------------------------------------------------------------
     std::size_t endTopicSubscriptions(int32_t topicId);
+
+    /// Catalog history Task 8 fix round 1 (M5): forget every per-partition
+    /// state the gateway keeps for the dropped topic — its txn / LSO state, its
+    /// inline producer-state proofs, and its Logs in the worker-owned / dirty
+    /// sets (a freed Log's address can be reused by a new Log).  `logs` are the
+    /// topic's Logs, taken before the registry dropped it.  Cold.
+    void forgetDroppedTopic(int32_t topicId, int32_t partitions, std::span<rune::storage::Log* const> logs);
 
     // sendControlFrame — send an already-encoded frame (e.g. Assign) on a
     // session's egress.  Reuses the same sendTo path as all other responses.
@@ -2137,17 +2145,25 @@ private:
         Kind                kind = Kind::Unknown;
         rune::storage::Log* log  = nullptr;   ///< Kind::Disk only
     };
-    [[nodiscard]] ServedPartition servedPartition_(int32_t topicId, int32_t partition) const noexcept;
+    using RoutedEntry = rune::metadata::RoutingImage::Entry;
+    /// `routed`: the routing-image entry the caller already looked up for this
+    /// (topic, partition) in the CURRENT image (step 3b), or nullptr.
+    [[nodiscard]] ServedPartition servedPartition_(int32_t topicId, int32_t partition,
+                                                   const RoutedEntry* routed = nullptr) const noexcept;
     /// Catalog history Task 8 (C1 generalized): the MSM holds a COMMITTED
-    /// placement for (topicId, partition) — the steady-state routing image
-    /// (built from the committed assignment map only once committed metadata is
-    /// ready; the bootstrap image is the static balancer's, never "committed")
-    /// names a leader for it.  Cold (only off the servable fast path).
-    [[nodiscard]] bool placementCommitted_(int32_t topicId, int32_t partition) const noexcept;
+    /// placement for (topicId, partition) — the current routing image was built
+    /// from the committed assignment map (RoutingImage::committed(); the
+    /// static-balancer image never is) and names a leader for it.
+    [[nodiscard]] bool placementCommitted_(int32_t topicId, int32_t partition,
+                                           const RoutedEntry* routed = nullptr) const noexcept;
     /// C1 generalized: the code for a topic id this broker has not applied —
     /// NotLeader (retriable) when its placement is already committed (a producer
     /// learned it from another broker, this one applies it next), UnknownTopic
     /// otherwise and always for a Dropped id.
+    /// Fix round 1 (I5): the C1 gate on a view read — a ViewRowResponse status
+    /// to answer, or kViewRowNoGate (forward to the worker).
+    static constexpr uint16_t kViewRowNoGate = 0xFFFF;
+    [[nodiscard]] uint16_t viewRowGate_(int32_t viewTopicId, int32_t partition) const noexcept;
     [[nodiscard]] rune::protocol::client::ErrorCode unappliedTopicCode_(int32_t topicId, int32_t partition) const noexcept;
     /// E2 Task 11 ruling: may a read_committed subscription to (topicId,
     /// partition) be accepted HERE?  read_committed is served from a LEADER's RC

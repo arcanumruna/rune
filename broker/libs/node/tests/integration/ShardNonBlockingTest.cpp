@@ -1971,6 +1971,54 @@ TEST(ReplicaLifetimeRegression, TransportHoldsNoReplicaPointerAndDropsFramesForA
     EXPECT_EQ(pool.worker(0).opsRefusedNotOwnedForTest(), 0u);
 }
 
+// Catalog history Task 8 fix round 1 (I4, fix-on-sight): a committed PLACEMENT
+// DELETE (ReplicationMetadataBridge::applyDeleteForKey — a partition moved away,
+// or a catalog drop through removePartition) must leave NO reachable transport
+// route to the replica it frees.  The legacy transport resolves every frame
+// through the registry (it holds no replica pointer: setReplicaRegistry), so the
+// delete's registry removal IS the unregistration.  Pinned through the bridge
+// path itself: after the delete + free, every replication frame for the
+// partition is dropped at the transport — nothing routed, nothing dereferenced.
+// RED: a transport holding a registered pointer past the delete (the review's
+// use-after-free) — heldReplicaPointersForTest() > 0 / a frame routed.
+TEST(ReplicaLifetimeRegression, PlacementDeleteThroughTheBridgeLeavesNoReachableRouteRegression) {
+    TmpDir ad;
+    EmbeddedDriverConfig dc; dc.dir = ad.path.string(); dc.termBufferBytes = 64 * 1024;
+    EmbeddedDriver drv(dc, DriverMode::Threaded);
+    aeron::Context ctx; ctx.aeronDir(ad.path.string());
+    auto client = aeron::Aeron::connect(ctx);
+    rune::replication::AeronPartitionTransport tr(client, "aeron:ipc", 7304, /*self*/1, 1 << 20);
+    Reg R;
+    WorkerPool pool(1, rune::metadata::ShardRouter(1), 1 << 16, 1 << 16, 16, 16);
+    pool.assignFromRegistry(R.reg);
+    pool.setRegistry(&R.reg);
+    pool.setRunnersStartedForTest(true);
+    tr.setReplicaRegistry(&R.reg);
+    tr.setWorkerPool(&pool);
+    rune::node::ReplicationMetadataBridge bridge(1, {1}, R.reg);
+    bridge.setWorkerPool(&pool);
+    PartitionReplica* r = R.add(5, 0);
+    tr.registerReplica(5, 0, r);   // the production call — ignored with the registry wired
+    pool.reconcile(R.reg);
+    ackAll(pool);
+    const auto live = encodeFetchReq(5, 0);
+    tr.deliverFrameForTest(live.data(), live.size(), 1);
+    pool.worker(0).doWork(2);
+    EXPECT_EQ(pool.worker(0).opsRefusedNotOwnedForTest(), 0u) << "non-vacuous: the live route reaches the owner";
+
+    bridge.removePartition(5, 0);   // the delete path (fence + retire)
+    EXPECT_EQ(R.reg.lookup(5, 0), nullptr);
+    (void)bridge.flushPendingRoleOpsForTest();
+    pool.reconcile(R.reg);
+    ackAll(pool, 3);
+    ASSERT_EQ(R.reg.collectRetired(pool.minAckedOwnershipGen()), 1u) << "the replica is freed";
+    EXPECT_EQ(tr.heldReplicaPointersForTest(), 0u) << "no route survives the delete";
+    for (const auto& f : everyReplicationFrame(5, 0)) tr.deliverFrameForTest(f.data(), f.size(), 4);
+    pool.worker(0).doWork(5);
+    EXPECT_EQ(pool.staleOpsRoutedForTest(), 0u) << "dropped at the transport: nothing routed";
+    EXPECT_EQ(pool.worker(0).opsRefusedNotOwnedForTest(), 0u);
+}
+
 TEST(ReplicaLifetimeRegression, FollowerOleResponseAndReconcileRequestRunOnTheOwningWorker) {
     // Pre-existing race fixed on sight: OLE responses and reconcile requests for
     // a USER replica were executed inline on the control thread.  They are now

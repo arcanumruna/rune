@@ -150,6 +150,19 @@ if(ENABLE_COVERAGE)
     add_link_options(--coverage)
 endif()
 
+# Catalog history Task 8 fix round 1 (M8): Apple's ld warns "ignoring duplicate
+# libraries" whenever CMake repeats a static library on a link line (it does so
+# on purpose for the mutually-dependent rune_* static libraries).  The repeat is
+# required on other linkers and harmless here; silence the noise so a real
+# warning in the build output stands out.
+if(APPLE)
+    include(CheckLinkerFlag)
+    check_linker_flag(CXX "LINKER:-no_warn_duplicate_libraries" RUNE_LD_NO_WARN_DUP_LIBS)
+    if(RUNE_LD_NO_WARN_DUP_LIBS)
+        add_link_options("LINKER:-no_warn_duplicate_libraries")
+    endif()
+endif()
+
 option(BUILD_TESTING "Build tests" OFF)
 if(BUILD_TESTING)
     enable_testing()

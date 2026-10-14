@@ -2973,15 +2973,19 @@ void ClientGateway::noteUnanswerable_(const uint8_t* buf, std::size_t len, const
 // same single servableLog() probe every site made before; the C1 / topic /
 // replica probes run only when there is no servable disk Log.  Control thread.
 // ---------------------------------------------------------------------------
-ClientGateway::ServedPartition ClientGateway::servedPartition_(int32_t topicId, int32_t partition) const noexcept
+ClientGateway::ServedPartition ClientGateway::servedPartition_(int32_t topicId, int32_t partition,
+                                                               const RoutedEntry* routed) const noexcept
 {
     using Kind = ServedPartition::Kind;
     ServedPartition s;
     if (topicRegistry_ == nullptr) return s;
     if (rune::storage::Log* log = topicRegistry_->servableLog(topicId, partition)) [[likely]] {
         // Task 8 (C1 generalized): a catalog-applied topic serves only once its
-        // placement is committed too.  One byte compare for every other topic.
-        if (topicRegistry_->placementGated(topicId) && !placementCommitted_(topicId, partition)) [[unlikely]] {
+        // placement is committed too.  After Task 9 every user topic is a catalog
+        // topic: this runs on every produce / subscribe — two byte reads on the
+        // entry servableLog loaded, plus the routing entry step 3b already looked
+        // up (`routed`: never a second lookup on the data path).
+        if (topicRegistry_->placementGated(topicId) && !placementCommitted_(topicId, partition, routed)) {
             s.kind = Kind::NotPlaced;
             return s;
         }
@@ -2993,7 +2997,7 @@ ClientGateway::ServedPartition ClientGateway::servedPartition_(int32_t topicId, 
     const rune::node::TopicSpec* spec = topicRegistry_->topic(topicId);
     if (spec == nullptr || spec->persistence != rune::node::PersistenceMode::Transient) return s;
     if (partition < 0 || partition >= spec->partitionCount) return s;
-    if (topicRegistry_->placementGated(topicId) && !placementCommitted_(topicId, partition)) {
+    if (topicRegistry_->placementGated(topicId) && !placementCommitted_(topicId, partition, routed)) {
         s.kind = Kind::NotPlaced;   // Task 8 (C1 generalized), transient too
         return s;
     }
@@ -3002,18 +3006,23 @@ ClientGateway::ServedPartition ClientGateway::servedPartition_(int32_t topicId, 
     return s;
 }
 
-bool ClientGateway::placementCommitted_(int32_t topicId, int32_t partition) const noexcept
+bool ClientGateway::placementCommitted_(int32_t topicId, int32_t partition, const RoutedEntry* routed) const noexcept
 {
-    if (!committedMetadataReady_ || !routingImage_) return false;
-    return routingImage_->lookup(rune::metadata::gpidOf(topicId, partition)).leaderNodeId !=
-           rune::metadata::RoutingImage::NO_LEADER_NODE_ID;
+    // Fix round 1 (I1): only an image built from the COMMITTED assignment map
+    // names committed placements — never the static-balancer image (bootstrap,
+    // or after the last user assignment was removed), whatever
+    // committedMetadataReady_ latched.
+    if (!routingImage_ || !routingImage_->committed()) return false;
+    const RoutedEntry& e = routed != nullptr ? *routed : routingImage_->lookup(rune::metadata::gpidOf(topicId, partition));
+    return e.leaderNodeId != rune::metadata::RoutingImage::NO_LEADER_NODE_ID;
 }
 
 pc::ErrorCode ClientGateway::unappliedTopicCode_(int32_t topicId, int32_t partition) const noexcept
 {
-    if (topicRegistry_ != nullptr &&
-        topicRegistry_->state(topicId) == rune::gateway::TopicRegistry::TopicState::Dropped)
-        return pc::ErrorCode::UnknownTopic;
+    using St = rune::gateway::TopicRegistry::TopicState;
+    const St st = topicRegistry_ != nullptr ? topicRegistry_->state(topicId) : St::Unknown;
+    if (st == St::Dropped) return pc::ErrorCode::UnknownTopic;
+    if (st == St::Pending) return pc::ErrorCode::NotLeader;   // applied, waits behind a drop (fix round 1, C1)
     return placementCommitted_(topicId, partition < 0 ? 0 : partition) ? pc::ErrorCode::NotLeader
                                                                        : pc::ErrorCode::UnknownTopic;
 }
@@ -3026,7 +3035,17 @@ std::size_t ClientGateway::endTopicSubscriptions(int32_t topicId)
         const int64_t subId = it->first;
         Subscription& sub   = it->second;
         if (sub.topicId != topicId) { ++it; continue; }
-        if (Session* session = sessions_.find(sub.sessionId)) {
+        if (sub.isGroup) {
+            // Fix round 1 (I3): a group-created subscription has no Subscribe of
+            // its own (correlation id 0) — its member learns the drop from its
+            // GROUP: the coordinator rebalances the dropped partitions away
+            // (GroupCoordinationService::onTopicDropped, revoke + new Assign).
+            // Here only the subscription and its member tracking go.
+            if (auto ms = groupMemberSubs_.find(sub.sessionId); ms != groupMemberSubs_.end()) {
+                std::erase(ms->second, subId);
+                if (ms->second.empty()) groupMemberSubs_.erase(ms);
+            }
+        } else if (Session* session = sessions_.find(sub.sessionId)) {
             pc::ErrorResponse err;
             err.sessionId     = sub.sessionId;
             err.correlationId = sub.subscribeCorrId;
@@ -3048,6 +3067,23 @@ std::size_t ClientGateway::endTopicSubscriptions(int32_t topicId)
         spdlog::info("ClientGateway: topic id={} dropped — {} subscription(s) ended with UnknownTopic",
                      topicId, ended);
     return ended;
+}
+
+void ClientGateway::forgetDroppedTopic(int32_t topicId, int32_t partitions,
+                                       std::span<rune::storage::Log* const> logs)
+{
+    for (int32_t p = 0; p < partitions; ++p) {
+        partitionTxnStates_.erase(partitionKey(topicId, p));
+        if (const auto it = inlinePsm_.find(inlinePsmKey_(topicId, p)); it != inlinePsm_.end()) {
+            if (std::holds_alternative<InlinePsmScanning>(it->second)) --inlinePsmScanning_;
+            inlinePsm_.erase(it);
+        }
+    }
+    for (rune::storage::Log* l : logs) {
+        if (l == nullptr) continue;
+        workerOwnedLogs_.erase(l);
+        dirtyLogs_.erase(l);
+    }
 }
 
 bool ClientGateway::readCommittedServableHere_(int32_t topicId, int32_t partition) const noexcept
@@ -3328,12 +3364,14 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     //   returning NotLeader — this avoids redirect-exhaustion for genuinely
     //   bootstrap-window produces.  A steady-state unassigned partition (where the
     //   Raft leader cannot serve it either) will still reject via Path B.
+    const RoutedEntry* routed = nullptr;   // Task 8 (M1): reused by servedPartition_ (no 2nd lookup)
     if (routingImage_) {
         // Capture the snapshot once (the shared_ptr was already stored in routingImage_
         // on the duty-cycle thread — no cross-thread atomic_load needed here).
         const rune::metadata::RoutingImage* img = routingImage_.get();
         const int32_t gpid = rune::metadata::gpidOf(msg.topicId, partition);
         const auto& entry = img->lookup(gpid);
+        routed = &entry;
 
         if (entry.leaderNodeId == rune::metadata::RoutingImage::NO_LEADER_NODE_ID) {
             // Partition not yet assigned in the routing image — bootstrap window or
@@ -3405,7 +3443,7 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     // topic boot may later reclaim as an orphan never holds an acknowledged record.
     // Phase 2b E2: a TRANSIENT partition has no disk Log — routed to its owning
     // worker below (op.logPtr = nullptr: the worker appends to the replica's ring).
-    const ServedPartition served = servedPartition_(msg.topicId, partition);
+    const ServedPartition served = servedPartition_(msg.topicId, partition, routed);
     if (served.kind == ServedPartition::Kind::AwaitingCommit ||
         served.kind == ServedPartition::Kind::NotPlaced) [[unlikely]] {
         spdlog::debug("ClientGateway: Produce to topicId={} awaiting its DDL commit / committed placement — "
@@ -4387,10 +4425,12 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     // BOOTSTRAP FIX — defense-in-depth (MD1-13): same as handleProduce.
     // When the image is set but this partition is NO_LEADER (not yet assigned),
     // fall back to Path B (cluster-leader) rather than returning NotLeader.
+    const RoutedEntry* routed = nullptr;   // Task 8 (M1): reused by servedPartition_
     if (routingImage_) {
         const rune::metadata::RoutingImage* img = routingImage_.get();
         const int32_t gpid = rune::metadata::gpidOf(msg.topicId, partition);
         const auto& entry = img->lookup(gpid);
+        routed = &entry;
 
         if (entry.leaderNodeId == rune::metadata::RoutingImage::NO_LEADER_NODE_ID) {
             // Partition not yet assigned — fall back to cluster-leader path.
@@ -4452,7 +4492,7 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     // C1: a runtime topic awaiting its DDL commit is not readable — the bare
     // ErrorResponse{NotLeader} every unservable-here subscribe gets (retriable:
     // refresh metadata, retry); no subscription is registered.
-    const ServedPartition served = servedPartition_(msg.topicId, partition);
+    const ServedPartition served = servedPartition_(msg.topicId, partition, routed);
     if (served.kind == ServedPartition::Kind::AwaitingCommit ||
         served.kind == ServedPartition::Kind::NotPlaced) {
         spdlog::debug("ClientGateway: Subscribe to topicId={} awaiting its DDL commit / committed placement — "
@@ -6923,9 +6963,36 @@ void ClientGateway::handleCreateView(const uint8_t* buf, std::size_t len)
 // canonical fixed-width (8-byte little-endian) key bytes — the same form the
 // source rows were produced with.
 // ---------------------------------------------------------------------------
+uint16_t ClientGateway::viewRowGate_(int32_t viewTopicId, int32_t partition) const noexcept
+{
+    // Catalog history Task 8 fix round 1 (I5): the C1 gate on view reads (the
+    // view's sink topic, spec §5.4).  Dropped → UnknownView (permanent); applied
+    // but waiting behind a drop, placed but not applied here yet, or applied but
+    // not placed → NotReady (retriable: a client that learned the view from
+    // another broker retries).  Never applied here and never placed: no gate —
+    // the worker answers (UnknownView: no plan).
+    if (topicRegistry_ == nullptr) return kViewRowNoGate;
+    using St = TopicRegistry::TopicState;
+    const St st = topicRegistry_->state(viewTopicId);
+    if (st == St::Dropped) return pc::ViewRowResponse::kUnknownView;
+    if (st == St::Pending || (st == St::Unknown && placementCommitted_(viewTopicId, 0)) ||
+        (st == St::Serving && topicRegistry_->placementGated(viewTopicId) &&
+         !placementCommitted_(viewTopicId, partition)))
+        return pc::ViewRowResponse::kNotReady;
+    return kViewRowNoGate;
+}
+
 void ClientGateway::handleGetViewRow(const uint8_t* buf, std::size_t len)
 {
     if (!workerPool_) {
+        // Task 8 fix round 1 (I5): a gated view answers its C1 code first.
+        if (const auto mo = pc::GetViewRow::decode(buf, len)) {
+            const uint16_t gate = viewRowGate_(mo->viewTopicId, 0);
+            if (gate != kViewRowNoGate) {
+                (void)rejectRequest_(buf, len, gate, "GetViewRow: view not served here (C1)");
+                return;
+            }
+        }
         // No-hang (R2): no workers on this gateway — no view is servable here, a
         // permanent condition: UnknownView (4), not the retriable NotReady.
         (void)rejectRequest_(buf, len, pc::ViewRowResponse::kUnknownView, "GetViewRow: no worker pool");
@@ -6955,6 +7022,10 @@ void ClientGateway::handleGetViewRow(const uint8_t* buf, std::size_t len)
         const int32_t p = topicRegistry_->partitionForKey(
             m.viewTopicId, std::span<const uint8_t>(keyLe, sizeof keyLe));
         if (p >= 0) partition = p;
+    }
+    if (const uint16_t gate = viewRowGate_(m.viewTopicId, partition); gate != kViewRowNoGate) {
+        (void)rejectRequest_(buf, len, gate, "GetViewRow: view not served here (C1)");
+        return;
     }
 
     rune::node::WorkerOp op;
@@ -7563,7 +7634,7 @@ void ClientGateway::handleMetadata(const uint8_t* buf, std::size_t len)
                 if (topicRegistry_->awaitingCommit(topicId)) continue;
                 // Task 8 (C1 generalized): a catalog topic is listed once its
                 // placement is committed (the bootstrap image is not committed).
-                if (topicRegistry_->placementGated(topicId) && !committedMetadataReady_) continue;
+                if (topicRegistry_->placementGated(topicId) && !img->committed()) continue;
             }
 
             // Filter: requested topics only (when non-empty topic list in request).

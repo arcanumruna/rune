@@ -80,6 +80,8 @@
 #include <atomic>
 #include <rune/consensus/ConsensusAgent.h>
 #include <rune/node/CleanerViewChannel.h>
+#include <rune/node/OwnerThreadTestTask.h>
+#include <rune/consensus/ControlRing.h>
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/replication/Types.h>
@@ -202,7 +204,6 @@ public:
         if (count == 0) {   // the topic was dropped: clear
             overrides_.erase(topicId);
             ++policyUpdates_;
-            policyUpdatesForTest_.store(policyUpdates_, std::memory_order_release);
             return true;
         }
         PolicyOverride next = [&] {
@@ -225,19 +226,31 @@ public:
         }
         overrides_[topicId] = next;
         ++policyUpdates_;
-        policyUpdatesForTest_.store(policyUpdates_, std::memory_order_release);
         return true;
     }
-    /// Test-only: the override of `topicId` (nullptr = none).  Read it on the
-    /// cleaner thread, or from a test thread after policyUpdatesForTest()
-    /// (acquire) shows the update and no further one is sent.
+    /// Test-only, CLEANER thread only (a unit test driving doWork itself, or
+    /// BrokerNode::onCleanerThreadForTest): the override of `topicId` (nullptr = none).
     [[nodiscard]] const PolicyOverride* policyOverrideForTest(int32_t topicId) const noexcept {
         const auto it = overrides_.find(topicId);
         return it == overrides_.end() ? nullptr : &it->second;
     }
-    /// Test-only (any thread): policy messages applied so far (release-published).
-    [[nodiscard]] uint64_t policyUpdatesForTest() const noexcept {
-        return policyUpdatesForTest_.load(std::memory_order_acquire);
+    /// Test-only, cleaner thread only: policy messages applied so far.
+    [[nodiscard]] uint64_t policyUpdatesForTest() const noexcept { return policyUpdates_; }
+    /// Test-only, cleaner thread only (fix round 1, I2): while held, the cleaner
+    /// keeps swapping views but does NOT ack them — the control thread's retire
+    /// gate (collectRetired / a dropped topic's Logs) must then hold.
+    void setHoldViewAckForTest(bool on) noexcept { holdViewAckForTest_ = on; }
+    /// Test-only (any thread): offer an OwnerThreadTestTask ref to THIS thread
+    /// (many-to-one ring, no lock).  false = ring full.
+    [[nodiscard]] bool offerCleanerThreadTestTask(void* ref) noexcept {
+        return testTaskRing_.offer(kCleanerTestTaskMsgTypeId,
+                                   static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(ref)));
+    }
+    /// Shutdown (after the cleaner runner was joined): skip every queued test task.
+    void skipQueuedCleanerThreadTestTasks() noexcept {
+        (void)testTaskRing_.poll([](int32_t, std::int64_t a, std::int64_t) noexcept {
+            skipOwnerThreadTestTask(reinterpret_cast<void*>(static_cast<std::uintptr_t>(a)));
+        });
     }
     /// Test-only: CP-7 checkpoint entries held (one per compacted Log).
     [[nodiscard]] std::size_t checkpointCountForTest() const noexcept { return checkpoints_.size(); }
@@ -277,6 +290,11 @@ public:
 
     int doWork(int64_t nowNs) override {
         struct CycleDone { LogCleanerAgent& a; ~CycleDone() { a.cyclesDone_.fetch_add(1, std::memory_order_release); } } cycleDone{*this};
+        // Task 8 fix round 1: test-only tasks to run on THIS (cleaner) thread
+        // (BrokerNode::onCleanerThreadForTest).  Empty in production: one acquire load.
+        (void)testTaskRing_.poll([](int32_t, std::int64_t a, std::int64_t) noexcept {
+            runOwnerThreadTestTask(reinterpret_cast<void*>(static_cast<std::uintptr_t>(a)), nullptr);
+        }, 16);
         if (channel_) applyViewUpdates_();
         if (!registry_ && !channel_) return 0;
 
@@ -982,7 +1000,9 @@ private:
     std::unordered_map<int32_t, PolicyOverride> overrides_;
     uint64_t                                    policyUpdates_ = 0;
     uint64_t                                    policyRefused_ = 0;
-    std::atomic<uint64_t>                       policyUpdatesForTest_{0};   // test observability only
+    bool                                        holdViewAckForTest_ = false;   // test-only (fix round 1, I2)
+    static constexpr int32_t kCleanerTestTaskMsgTypeId = 0x7E59;
+    rune::consensus::ControlRing<4096>          testTaskRing_;   // test threads → cleaner (test-only)
     [[nodiscard]] const PolicyOverride* overrideFor_(int32_t topicId) const noexcept {
         if (overrides_.empty()) [[likely]] return nullptr;
         const auto it = overrides_.find(topicId);
@@ -1051,7 +1071,7 @@ private:
                 if (!checkpoints_.empty()) pruneCheckpoints_();   // Task 8 (cold)
             }
         }, 64);
-        if (ackPending_ && channel_->ack.write(reinterpret_cast<const uint8_t*>(&viewGen_), 8,
+        if (ackPending_ && !holdViewAckForTest_ && channel_->ack.write(reinterpret_cast<const uint8_t*>(&viewGen_), 8,
                                                CleanerViewChannel::kAckMsgType))
             ackPending_ = false;   // a full ring is retried next pass (never lost)
     }

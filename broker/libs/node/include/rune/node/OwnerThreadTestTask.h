@@ -73,6 +73,7 @@ public:
         Replica,        ///< the thread that owns (topicId, partition)
         ControlThread,  ///< the control (NodeRuntimeAgent) thread
         AdminThread,    ///< the admin (AdminWorkerAgent) thread — catalog history Task 6
+        CleanerThread,  ///< the LogCleanerAgent thread — catalog history Task 8 fix round 1
     };
 
     using ExecFn = void (*)(OwnerThreadTestTask&,
@@ -177,6 +178,11 @@ struct OwnerTaskResult<F, OwnerThreadTestTask::Target::AdminThread> {
 };
 
 template <class F>
+struct OwnerTaskResult<F, OwnerThreadTestTask::Target::CleanerThread> {
+    using type = std::invoke_result_t<F&>;
+};
+
+template <class F>
 struct OwnerTaskResult<F, OwnerThreadTestTask::Target::Replica> {
     using type = typename std::conditional_t<
         std::is_invocable_v<F&, rune::replication::PartitionReplica&>,
@@ -201,7 +207,7 @@ public:
 
 private:
     R invoke_(rune::replication::PartitionReplica* replica) {
-        if constexpr (T == Target::ControlThread || T == Target::AdminThread) {
+        if constexpr (T == Target::ControlThread || T == Target::AdminThread || T == Target::CleanerThread) {
             (void)replica;
             return f_();
         } else if constexpr (std::is_invocable_v<F&, rune::replication::PartitionReplica&>) {

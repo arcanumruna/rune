@@ -459,6 +459,18 @@ public:
         const std::size_t len = m.encode(buf.data());
         return send(ch, stream, buf.data(), len) ? m.correlationId : 0;
     }
+    /// Catalog history Task 8 fix round 1: a GetViewRow point read; the answer's
+    /// ViewRowResponse status by correlation id (awaitViewRow).
+    int64_t sendGetViewRow(const std::string& ch, int32_t stream, int64_t sid, int32_t viewTopicId, uint64_t key) {
+        pc::GetViewRow m;
+        m.sessionId = sid; m.correlationId = ++corr_; m.viewTopicId = viewTopicId; m.keyU64 = key;
+        std::vector<uint8_t> buf(pc::GetViewRow::ENCODED_SIZE);
+        const std::size_t len = m.encode(buf.data());
+        return send(ch, stream, buf.data(), len) ? m.correlationId : 0;
+    }
+    std::optional<uint16_t> awaitViewRow(int64_t corr, Clock::time_point deadline) {
+        return awaitIn_(viewRows_, corr, deadline);
+    }
     std::optional<pc::DefineTopicResponse> awaitDefine(int64_t corr, Clock::time_point deadline) {
         return awaitIn_(defines_, corr, deadline);
     }
@@ -654,6 +666,9 @@ private:
             case pc::TemplateId::CreateViewResponse:
                 if (auto r = pc::CreateViewResponse::decode(p, n)) views_[r->correlationId] = *r;
                 break;
+            case pc::TemplateId::ViewRowResponse:
+                if (auto r = pc::ViewRowResponse::decode(p, n)) viewRows_[r->correlationId] = r->status;
+                break;
             case pc::TemplateId::AlterTopicResponse:
                 if (auto r = pc::AlterTopicResponse::decode(p, n)) alters_[r->correlationId] = *r;
                 break;
@@ -730,6 +745,7 @@ private:
     std::map<int64_t, pc::DefineTopicResponse>      defines_;
     std::map<int64_t, pc::CreateViewResponse>       views_;
     std::map<int64_t, pc::AlterTopicResponse>       alters_;
+    std::map<int64_t, uint16_t>                     viewRows_;   // ViewRowResponse status by corr
     std::map<int64_t, SchemaAnswer>                 schemas_;
     std::map<int64_t, int16_t>                      subscribes_;   // SubscribeResponse errorCode by corr
     int32_t                                         clientVersion_ = 1;
