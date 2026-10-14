@@ -4,6 +4,7 @@
 // and `rune catalog export | replay | diff`.  Every wait is bounded by the CLI's own client
 // timeouts; every expected value is read back from the broker's own __catalog.
 #include "client/OneBroker.h"
+#include "support/CatalogBrokerCluster.h"
 
 #include <rune/catalog/CatalogFile.h>
 #include <rune/catalog/CatalogQueries.h>
@@ -18,6 +19,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -507,4 +509,89 @@ TEST(RuneCliBrokerRegression, DiffClusterVsClusterAndFileVsClusterPrintEveryDiff
     EXPECT_EQ(runCli({"catalog", "diff", "--from", path, "--to", a.endpoint()}, &out4, &err), 0) << out4;
     EXPECT_TRUE(out4.empty()) << out4;
     EXPECT_TRUE(err.empty()) << err;
+}
+
+// ── fix round 1, R1: a follower seed lags the leader that answered the DDL ──
+
+TEST(RuneCliBrokerRegression, ReplayAndQlIntoAFollowerSeeTheirOwnWritesRegression) {
+    // Intermittent by nature (replication lag); the deterministic gate for the wait is the offline
+    // RuneCliCatalogRegression.AwaitRequestVisibleRetriesUntilVisibleAndIsBoundedRegression.
+    using rune::node::test::catalog_cluster::ThreeNodes;
+    using rune::node::test::catalog_cluster::kClientStream;
+    OneBroker src("cli_src_f");
+    src.runEveryKind();
+    std::string file, out, err;
+    ASSERT_EQ(runCli({"catalog", "export", "--broker", src.endpoint()}, &file, &err), 0) << err;
+    const std::string path = writeTemp("f.rcat", file);
+
+    ThreeNodes c = ThreeNodes::start("cli_follow");
+    ASSERT_TRUE(c.awaitCatalogLeader(30s));
+    const int32_t leader = c.settledLeader();
+    // FINDING: a real Client that Connects to a catalog FOLLOWER never completes its connect here (the gateway
+    // answers a non-leader's Connect with a Redirect that the Client does not converge on, 40 s and Thread mode
+    // alike), so the seed is the leader of the 3-node cluster: the replicated multi-node path, not a lagging seed.
+    const int32_t follower = leader;
+    const std::string ep = "127.0.0.1:" + std::to_string(c.ports.client[static_cast<std::size_t>(follower - 1)]);
+
+    ASSERT_EQ(runCli({"catalog", "replay", "--from", path, "--into", ep, "--cluster-id", "f", "--cli-stream-in",
+                      std::to_string(kClientStream)}, &out, &err), 0) << err;
+    EXPECT_NE(out.find("10 issued"), std::string::npos) << out;
+
+    const std::string rw = writeTemp("rw.rql", "topic rw1 partitions 1;\nshow history topic rw1;\n");
+    ASSERT_EQ(runCli({"ql", "-f", rw, "--broker", ep, "--cli-stream-in", std::to_string(kClientStream)}, &out, &err), 0) << err;
+    EXPECT_NE(out.find("CreateTopic"), std::string::npos) << out;
+}
+
+// ── fix round 1, R3: a rerun must not accept a target that changed after the replay ──
+
+TEST(RuneCliBrokerRegression, ReplayRerunRefusesATargetChangedAfterTheReplayRegression) {
+    OneBroker src("cli_src9"), dst("cli_dst9");
+    src.runEveryKind();
+    std::string o, e;
+    ASSERT_EQ(runCli({"catalog", "replay", "--from", src.endpoint(), "--into", dst.endpoint(), "--cluster-id", "c"}, &o, &e), 0) << e;
+    const rune::protocol::client::ConfigChangeWire ch{1, 120'000};
+    ASSERT_EQ(dst.connectClient()->alterTopicConfigAndWait("events", 0, std::span(&ch, 1), {}, 10s).errorCode, 0);
+    const auto n = dst.catalogEvents().size();
+    EXPECT_EQ(runCli({"catalog", "replay", "--from", src.endpoint(), "--into", dst.endpoint(), "--cluster-id", "c"}, &o, &e), 1);
+    EXPECT_NE(e.find("differs from the source"), std::string::npos) << e;
+    EXPECT_NE(e.find("~ topic events"), std::string::npos) << e;
+    EXPECT_TRUE(o.empty()) << o;
+    EXPECT_EQ(dst.catalogEvents().size(), n) << "nothing was issued";
+}
+
+// ── fix round 1, R4: the missing replay tests ───────────────────────────────
+
+TEST(RuneCliBrokerRegression, ReplayOfADifferentSourceUnderTheSameClusterIdAbortsAtTheFirstHeldMismatchRegression) {
+    OneBroker a("cli_sa"), b("cli_sb"), dst("cli_sd");
+    a.runEveryKind();
+    std::string o, e;
+    ASSERT_EQ(runCli({"ql", "-e", "topic players partitions 2;", "--broker", b.endpoint()}, &o, &e), 0) << e;
+    ASSERT_EQ(runCli({"catalog", "replay", "--from", a.endpoint(), "--into", dst.endpoint(), "--cluster-id", "same"}, &o, &e), 0) << e;
+    const auto n = dst.catalogEvents().size();
+    EXPECT_EQ(runCli({"catalog", "replay", "--from", b.endpoint(), "--into", dst.endpoint(), "--cluster-id", "same"}, &o, &e), 1);
+    EXPECT_NE(e.find("replay aborted at source offset 0"), std::string::npos) << e;
+    EXPECT_NE(e.find("target fingerprint 0x"), std::string::npos) << e;
+    EXPECT_EQ(dst.catalogEvents().size(), n);
+}
+
+TEST(RuneCliBrokerRegression, ReplayMapsRenamesDropsReAddsConfigAndTransientByNameRegression) {
+    OneBroker src("cli_sr"), dst("cli_dr");
+    const auto f = writeTemp("maps.rql",
+                             "topic t { id int64, hp int64, mp int64 } partitions 2 key id with (retention.ms = 1000);\n"
+                             "alter topic t add column mana int64, rename column hp to health;\n"
+                             "alter topic t rename column health to vitality;\n"
+                             "alter topic t drop column mp;\n"
+                             "alter topic t add column mp int64;\n"
+                             "transient topic scratch partitions 1;\n"
+                             "alter topic t set compatibility forward;\n");
+    std::string o, e;
+    ASSERT_EQ(runCli({"ql", "-f", f, "--broker", src.endpoint()}, &o, &e), 0) << e;
+    ASSERT_EQ(src.catalogEvents().size(), 7u);
+    ASSERT_EQ(runCli({"catalog", "replay", "--from", src.endpoint(), "--into", dst.endpoint()}, &o, &e), 0) << e;
+    const auto s = src.catalogEvents(), d = dst.catalogEvents();
+    ASSERT_EQ(d.size(), s.size());
+    for (std::size_t i = 0; i < s.size(); ++i) EXPECT_EQ(d[i].event.fingerprint, s[i].event.fingerprint) << "offset " << i;
+    EXPECT_EQ(std::get<rcat::CreateTopicOps>(d[0].event.ops).config.retentionMs, 1000);
+    EXPECT_EQ(std::get<rcat::CreateTopicOps>(d[5].event.ops).persistence, rcat::Persistence::Transient);
+    EXPECT_EQ(runCli({"catalog", "diff", "--from", src.endpoint(), "--to", dst.endpoint()}, &o, &e), 0) << o;
 }
