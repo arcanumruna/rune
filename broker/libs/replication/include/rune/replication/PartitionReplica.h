@@ -691,6 +691,9 @@ public:
     /// worker's read_committed state is valid only within one leadership.
     /// Owner thread only (plain member, no atomic).
     [[nodiscard]] uint64_t    leadershipGeneration() const noexcept { return leadershipGeneration_; }
+    /// This leadership's LEO at becomeLeader (Kafka's leader-epoch start offset): every record committed before the
+    /// election lies below it, so once highWatermark() >= it the leader knows its whole pre-election committed prefix.
+    [[nodiscard]] Offset      leadershipStartOffset() const noexcept { return electionLeo_; }
     [[nodiscard]] Offset      logEndOffset()   const noexcept { return logEndOffset_(); }
     [[nodiscard]] Offset      highWatermark()  const noexcept;
     /// Catalog Task 12 fix round 1: highWatermark() is this partition's committed

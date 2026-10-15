@@ -552,6 +552,50 @@ TEST(ClientGatewayEgressRegression, OversizedViewRowIsAnsweredRowTooLargeRegress
     EXPECT_EQ(v->rowBytesLen, 0u);
 }
 
+// Task 22 fix round 2 (N-M3): the worker's internal not-leader sentinel (kViewRowNotLeaderInternal) is turned into an
+// ErrorResponse - Redirect to the image's source leader, or the bare NotLeader when none is known / it is this node - and
+// is NEVER encoded as a ViewRowResponse status (it would surface as status 32513).
+// RED (conversion removed): a ViewRowResponse{32513} is sent, no ErrorResponse.
+TEST(ClientGatewayEgressRegression, ViewRowNotLeaderSentinelBecomesRedirectOrNotLeaderNeverAStatusRegression)
+{
+    constexpr int32_t kView = 0x40000011, kSrc = 9, kSelf = 1, kLeader = 2;
+    CaptureAll cap;
+    ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
+    gw.setNodeIdForTest(kSelf);
+    gw.setNodeEndpointMap({{kLeader, "aeron:udp?endpoint=10.0.0.2:9000"}});
+    gw.noteViewSource(kView, kSrc);
+    const int64_t sid = gw.injectReliableTestSessionForTest(0);
+    auto sentinel = [&](int64_t corr) {
+        rune::node::WorkerReturn ret;
+        ret.type          = rune::node::WorkerReturn::Type::ViewRowResult;
+        ret.sessionId     = sid;
+        ret.correlationId = corr;
+        ret.readTopicId   = kView;
+        ret.readPartition = 0;
+        ret.errorCode     = rune::node::kViewRowNotLeaderInternal;
+        gw.handleWorkerReturnForTest(ret);
+    };
+    // The image names another node as the source leader: Redirect to its client endpoint.
+    gw.setRoutingImageSnapshot(rune::metadata::RoutingImage::build(
+        std::vector<rune::metadata::RoutingImage::BuildEntry>{{rune::metadata::gpidOf(kSrc, 0), kLeader, 1}}));
+    sentinel(801);
+    auto e = cap.last<pc::ErrorResponse>();
+    ASSERT_TRUE(e.has_value()) << "the sentinel was not turned into an ErrorResponse";
+    EXPECT_EQ(e->correlationId, 801);
+    EXPECT_EQ(e->code, static_cast<int16_t>(pc::ErrorCode::Redirect));
+    EXPECT_EQ(e->message, "aeron:udp?endpoint=10.0.0.2:9000");
+    // No leader known: the bare NotLeader.
+    gw.setRoutingImageSnapshot(rune::metadata::RoutingImage::build(
+        std::vector<rune::metadata::RoutingImage::BuildEntry>{}));
+    sentinel(802);
+    e = cap.last<pc::ErrorResponse>();
+    ASSERT_TRUE(e.has_value());
+    EXPECT_EQ(e->correlationId, 802);
+    EXPECT_EQ(e->code, static_cast<int16_t>(pc::ErrorCode::NotLeader));
+    EXPECT_TRUE(e->message.empty());
+    EXPECT_FALSE(cap.last<pc::ViewRowResponse>().has_value()) << "the sentinel leaked out as a ViewRowResponse status";
+}
+
 // Fix round 2 (I5): a HandshakeContinue whose body does not decode fails the
 // handshake in progress (HandshakeFailed on its correlationId, pending connect
 // closed) instead of leaving the client waiting out its connect deadline.

@@ -1301,10 +1301,11 @@ public:
     /// controlled-shutdown protocol (no halt, no consensus hand-off, no goodbye to the members): the
     /// threads are joined and the transport torn down, nothing is answered or flushed on purpose.
     /// Test-thread only, like stop().  Production never calls it.
-    /// NOT a transport-level crash (Task 22 fix round 1, M9): the Aeron publications are closed normally, so peers and
-    /// clients see end-of-stream at once rather than waiting out their liveness timeouts, and the logs are destructed
-    /// with a flush (the page cache survives, as it does for a killed process).  The liveness-timeout path belongs to
-    /// the docker e2e.
+    /// NOT a transport-level crash (Task 22 fix rounds 1-2, M9/N-M5): the Aeron publications are closed normally, so
+    /// PEERS see end-of-stream at once, but a CLIENT session still detects a dead broker only through its own stale-session
+    /// threshold (SessionConfig::responseTimeoutNs, 10 s; measured ~13 s end to end by the seed-crash test).  The logs are
+    /// destructed with a flush (the page cache survives, as it does for a killed process).  The liveness-timeout path of
+    /// peers belongs to the docker e2e.
     void crashForTest() { crashForTest_ = true; stop(); }
     /// Task 22 seam (ADMIN thread via onAdminThreadForTest): hold / release this broker's DDL answers
     /// (AdminWorker::holdAnswersForTest).

@@ -500,6 +500,7 @@ public:
         }
         return r;
     }
+    /// (UnknownView counts as retriable only until the broker has applied the CreateView and its plan.)
     /// GetViewRow through `n` until the read is no longer retriable (a NotReady / a bare NotLeader / UnknownView while the
     /// view's plan reaches this broker), or `within`; the last read.
     ViewRead viewRowSettled(int n, int32_t viewTopicId, uint64_t key, std::chrono::seconds within) {
@@ -1104,6 +1105,16 @@ TEST(CatalogClusterRegression, NewTopicAfterLastUserTopicDroppedWaitsForCommitte
     // UnknownTopic, never silence (R-I2) - on every broker, for produce and Subscribe alike.  No "placed before and after"
     // filter: the hold covers every placement path (MetadataService::holdPlacementForTest), so there is no placement.
     // (the DDL's OK is held by the answer gate for at most 5 s: probe for ~2 s, then release the placement)
+    // Warm-up (N-M1): each broker's control thread applies the topic a hop after the admin thread; until it does a probe answers
+    // UnknownTopic (7).  Wait for the first retriable refusal on every broker.
+    for (int n : c.runningNodes()) {
+        const auto upTo = Clock::now() + 20s;
+        while (Clock::now() < upTo) {
+            const int code = rig.produceOnce(n, info->id, 0, batchFor(true, 1, "warm"));
+            if (code == cNotLeader || code == cRedirect) break;
+            std::this_thread::sleep_for(20ms);
+        }
+    }
     int probes = 0;
     const auto windowEnd = Clock::now() + 2000ms;
     while (Clock::now() < windowEnd) {
@@ -1112,7 +1123,8 @@ TEST(CatalogClusterRegression, NewTopicAfterLastUserTopicDroppedWaitsForCommitte
                 probes += rig.expectRetriableRefusal(n, info->id, p, "b1");
         std::this_thread::sleep_for(20ms);
     }
-    EXPECT_GT(probes, 0) << "the no-placement window was probed";
+    // Vacuity guard: at least one full sweep (a produce + a Subscribe per broker per partition).
+    EXPECT_GE(probes, 2 * static_cast<int>(c.runningNodes().size()) * info->partitions) << "the no-placement window was probed";
     rig.holdPlacementEverywhere(false);   // the placement is emitted and commits; the DDL's OK (held until the topic serves) arrives
     const Answer a = rig.await(corr, 30s);
     ASSERT_TRUE(a.got);

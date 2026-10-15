@@ -3185,12 +3185,7 @@ private:
         //     row or a wrong AbsentKey.  A linear scan of the worker-owned vector.
         {
             const int32_t src = viewSet_->viewSourceTopic(viewTopicId);
-            const rune::replication::PartitionReplica* srcRep = nullptr;
-            for (auto* r : owned_)
-                if (r != nullptr && r->topicId() == src && static_cast<int32_t>(r->partitionId()) == partition) {
-                    srcRep = r;
-                    break;
-                }
+            const rune::replication::PartitionReplica* srcRep = findOwnedReplica_(src, partition);
             if (srcRep == nullptr || srcRep->role() != rune::replication::Role::Leader) {
                 ret.errorCode = kViewRowNotLeaderInternal;
                 enqueueReturn_(std::move(ret));
@@ -5364,6 +5359,9 @@ private:
             const int64_t liveHw = replica->highWatermark();
             const int64_t bound  = rcState->lso(liveHw);
             const int32_t partition = static_cast<int32_t>(replica->partitionId());
+            // N-C1: right after an election the HW floor can lag what the old leader had committed; a table is
+            // Ready under this leadership only once HW has reached the leadership's start offset.
+            const bool hwConfirmed = liveHw >= replica->leadershipStartOffset();
             if (replica->isDiskBacked()) {
                 rune::storage::Log* log = replica->log();
                 if (log == nullptr) continue;
@@ -5371,7 +5369,7 @@ private:
                     return readNoFault_(log, from, kPushMaxChunkBytes, to);
                 };
                 work += driveViewsOf_(topicId, partition, readRange, bound, nowNs, nullptr,
-                                      replica->leadershipGeneration());
+                                      replica->leadershipGeneration(), hwConfirmed);
             } else {
                 // Phase 2b E: a TRANSIENT source — zero-copy view into the
                 // replica's own ring (same thread).  The fold itself stops at its
@@ -5382,7 +5380,7 @@ private:
                     return mem->readView(from, kPushMaxChunkBytes);
                 };
                 work += driveViewsOf_(topicId, partition, readRange, bound, nowNs, replica,
-                                      replica->leadershipGeneration());
+                                      replica->leadershipGeneration(), hwConfirmed);
             }
         }
         return work;
@@ -5400,7 +5398,7 @@ private:
     int driveViewsOf_(int32_t topicId, int32_t partition, ReadRangeFn& readRange,
                       int64_t bound, int64_t nowNs,
                       const rune::replication::PartitionReplica* transientRep,
-                      uint64_t leaderGen) {
+                      uint64_t leaderGen, bool leaderHwConfirmed) {
         int work = 0;
         TransientBounds tb;
         const TransientBounds* tbp = nullptr;
@@ -5415,9 +5413,9 @@ private:
         }
         if (viewSet_->hasRecovery()) [[unlikely]] {
             viewSet_->materializeRecoveryInstancesFor(topicId, partition, bound);
-            work += viewSet_->driveRebuild(topicId, partition, readRange, bound, nowNs, tbp, leaderGen);
+            work += viewSet_->driveRebuild(topicId, partition, readRange, bound, nowNs, tbp, leaderGen, leaderHwConfirmed);
         }
-        work += viewSet_->driveFolds(topicId, partition, readRange, bound, nowNs, tbp, leaderGen);
+        work += viewSet_->driveFolds(topicId, partition, readRange, bound, nowNs, tbp, leaderGen, leaderHwConfirmed);
         return work;
     }
 

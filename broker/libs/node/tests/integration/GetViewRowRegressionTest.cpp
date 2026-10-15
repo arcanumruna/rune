@@ -461,7 +461,8 @@ TEST(GetViewRowRegression, MultiWorkerRoutesToSourceOwnerViaCoLocation) {
 // moved away.  The worker's view table is frozen at the old leadership's last
 // fold, but the broker is now a FOLLOWER of the source — it must answer the
 // not-leader sentinel (the gateway redirects), never the stale row.
-//   RED (role check deleted): OK with the stale hp 1.
+//   RED (role check deleted): the generation check still answers NotReady (becomeFollower bumps the generation), so the
+//   assertion of the sentinel fails; RED (role AND generation checks deleted): OK with the stale hp 1.
 // ---------------------------------------------------------------------------
 TEST(GetViewRowRegression, ViewReadOnANonLeaderSourceReplicaAnswersNotLeaderNeverAStaleRowRegression) {
     auto src = charSourceV1();
@@ -557,6 +558,187 @@ TEST(GetViewRowRegression, ANewLeaderAnswersNotReadyUntilItsReFoldCaughtUpRegres
 }
 
 // ---------------------------------------------------------------------------
+// Task 22 fix round 2 (N-C1): the HW floor of a fresh leader can lag what the old leader had already committed, acked and
+// served.  A view table is Ready under a leadership only once HW >= leadershipStartOffset() (the log end at election): before
+// that it is CatchingUp (NotReady), never a stale row or an AbsentKey for an existing key - and election eligibility is
+// unchanged (viewsReady stays true).  Both tests need HW < log end at promotion, so two replicas: a "truth" leader T appends
+// keyed character records; the replica under test F is a Follower fed T's bytes with a chosen high watermark (the NB1 pattern,
+// PartitionReplicaTest NB1_BecomeLeaderUncommittedTail), on a DISK log so the worker's disk fold path is used.
+// ---------------------------------------------------------------------------
+namespace {
+
+constexpr rune::replication::NodeId kNodeF = 2, kNodeT = 1;
+
+PartitionConfig lagConfig(rune::replication::NodeId self) {
+    PartitionConfig cfg{};
+    cfg.topicId             = kSrcTopicId;
+    cfg.partitionId         = 0;
+    cfg.selfId              = self;
+    cfg.minIsr              = 1;
+    cfg.replicaLagMaxMs     = 10'000;
+    cfg.replicaLagMaxOffset = 10'000;
+    cfg.fetchIntervalNs     = 1'000'000LL;
+    cfg.isrCheckIntervalNs  = 1'000'000LL;
+    cfg.maxFetchBytes       = 1 << 20;
+    cfg.pushOnAppend        = false;
+    return cfg;
+}
+
+struct DiskReplica {
+    std::string                           dir;
+    std::unique_ptr<rune::storage::Log>   log;
+    rune::replication::InMemoryTransport  transport;
+    std::unique_ptr<PartitionReplica>     replica;
+    DiskReplica(const std::string& tag, rune::replication::NodeId self, Role role) {
+        dir = tmpDir("rune-gvr-" + tag);
+        std::filesystem::create_directories(dir);
+        log = std::make_unique<rune::storage::Log>(dir);
+        replica = std::make_unique<PartitionReplica>(lagConfig(self), role, /*epoch=*/1,
+                                                     std::vector<rune::replication::NodeId>{kNodeT, kNodeF},
+                                                     std::vector<rune::replication::NodeId>{kNodeT, kNodeF},
+                                                     log.get(), &transport);
+    }
+};
+
+/// The truth leader's records: offsets 0..4 = ids 1..5 with hp 10*id; offset 5 = id 1 with hp 99.
+void appendTruth(DiskReplica& t, int upTo, int from = 0) {
+    const std::pair<int64_t, int32_t> recs[] = {{1, 10}, {2, 20}, {3, 30}, {4, 40}, {5, 50}, {1, 99}};
+    for (int i = from; i < upTo; ++i) {
+        const auto k = keyBytes(recs[i].first);
+        const auto v = encodeCharacter(recs[i].first, recs[i].second, 1);
+        ASSERT_GE(t.replica->appendKeyed(std::span<const uint8_t>(k.data(), k.size()),
+                                         std::span<const uint8_t>(v.data(), v.size()), false), 0);
+    }
+}
+
+/// Feed `f` the truth's bytes from `from` with the given high watermark (as a fetch response of `epoch`).
+void feed(DiskReplica& t, DiskReplica& f, int64_t from, int64_t hw, int32_t epoch) {
+    const auto bytes = t.log->read(from, 1 << 20);
+    ASSERT_FALSE(bytes.empty());
+    rune::replication::FetchResponseMsg resp{};
+    resp.leaderEpoch    = epoch;
+    resp.partition      = 0;
+    resp.highWatermark  = hw;
+    resp.logStartOffset = 0;
+    resp.errorCode      = rune::replication::kErrNone;
+    resp.records        = std::span<const uint8_t>(bytes.data(), bytes.size());
+    f.replica->applyReplicated(resp);
+}
+
+struct LagHarness {
+    DiskReplica t{"truth", kNodeT, Role::Leader};
+    DiskReplica f{"under-test", kNodeF, Role::Follower};
+    ViewSnapshotChannel channel;
+    std::unique_ptr<WorkerViewSet> vs;
+    std::unique_ptr<Worker> w;
+    rv::RowLayout layout;
+    Descriptor src = charSourceV1();
+    int pass = 0;
+
+    LagHarness(bool persisted, const std::string& tag) {
+        const Descriptor* srcs[] = {&src};
+        auto comp = rv::compileView(hpView(persisted ? 0 : 1), srcs, kViewTopicId).value();
+        layout = comp.rowLayout;
+        vs = std::make_unique<WorkerViewSet>(channel, tmpDir("rune-views-gvr-lag-" + tag));
+        vs->installView(comp.plan, comp.rowLayout, src, persisted);
+        w = std::make_unique<Worker>(/*workerId*/ 0);
+        w->setOwnedDirect(Worker::OwnedSet{f.replica.get()});
+        w->setViewSet(vs.get());
+        t.replica->becomeLeader(1, {kNodeT});   // the truth leader of a one-member ISR (appends commit alone)
+    }
+    void passes(int n) {
+        for (int i = 0; i < n; ++i) {
+            w->doWork(1'000'000LL * (++pass));
+            channel.deltas.drain([](int32_t, aeron::concurrent::AtomicBuffer&, aeron::util::index_t, aeron::util::index_t) {},
+                                 1 << 20);
+            EXPECT_TRUE(w->viewsReady()) << "CatchingUp must never gate election eligibility (pass " << pass << ")";
+        }
+    }
+    /// {status, hp}: hp is meaningful for OK only.
+    std::pair<int, int64_t> read(uint64_t key) {
+        const WorkerReturn r = runGetViewRow(*w, kViewTopicId, 0, key, 0);
+        if (r.errorCode != static_cast<int16_t>(pc::ViewRowResponse::kOk)) return {r.errorCode, -1};
+        return {0, rv::readSlot(r.chunk.data(), layout, 1).i};
+    }
+    /// Passes until `key` reads OK (bounded); the hp.
+    int64_t awaitOk(uint64_t key, int bound = 50) {
+        for (int i = 0; i < bound; ++i) {
+            passes(1);
+            const auto [st, hp] = read(key);
+            if (st == 0) return hp;
+        }
+        return -1;
+    }
+};
+
+constexpr int kNotReady = static_cast<int>(pc::ViewRowResponse::kNotReady);
+
+}  // namespace
+
+// A fresh leader whose HW (3) lags its start offset (6): the records the old leader committed and served are above the floor.
+// RED (every -> Ready flip made unconditional): AbsentKey for key 5, or OK hp 10 for key 1 (older than the 99 the cluster served).
+TEST(GetViewRowRegression, ANewLeaderWhoseHighWatermarkLagsItsStartOffsetNeverServesAStaleOrAbsentRowRegression) {
+    for (const bool persisted : {false, true}) {
+        SCOPED_TRACE(persisted ? "persisted view" : "transient view");
+        LagHarness h(persisted, persisted ? "p" : "t");
+        ASSERT_NO_FATAL_FAILURE(appendTruth(h.t, 6));
+        ASSERT_NO_FATAL_FAILURE(feed(h.t, h.f, 0, /*hw=*/3, /*epoch=*/1));
+        const uint64_t genBefore = h.f.replica->leadershipGeneration();
+        h.f.replica->becomeLeader(/*epoch=*/2, {kNodeF, kNodeT});
+        ASSERT_EQ(h.f.replica->highWatermark(), 3);
+        ASSERT_EQ(h.f.replica->leadershipStartOffset(), 6);
+        const uint64_t gen = h.f.replica->leadershipGeneration();
+        ASSERT_GT(gen, genBefore);
+
+        h.passes(20);
+        ASSERT_TRUE(h.vs->instanceLeadership(kViewTopicId, 0).has_value()) << "the fold ran (vacuity guard)";
+        EXPECT_EQ(h.read(5).first, kNotReady) << "key 5 is committed above the HW floor: NotReady, never AbsentKey";
+        EXPECT_EQ(h.read(1).first, kNotReady) << "key 1 would read hp 10, older than the 99 already served: NotReady";
+
+        // The HW is confirmed (a one-member ISR commits alone; same role => same generation).
+        h.f.replica->becomeLeader(/*epoch=*/3, {kNodeF});
+        ASSERT_EQ(h.f.replica->leadershipGeneration(), gen);
+        ASSERT_GE(h.f.replica->highWatermark(), 6);
+        EXPECT_EQ(h.awaitOk(1), 99);
+        const auto five = h.read(5);
+        EXPECT_EQ(five.first, 0);
+        EXPECT_EQ(five.second, 50);
+    }
+}
+
+// An ex-leader promoted again with its OLD table (cursor 3 >= the lagging floor 3): the unconditional CatchingUp on a new
+// generation, not "cursor < bound", is what keeps the frozen table from being served.
+// RED (`&& inst.foldCursor < bound` restored in step 0b): OK hp 10 for key 1 (stale).
+TEST(GetViewRowRegression, AnExLeaderPromotedAgainNeverServesItsFrozenTableBelowItsStartOffsetRegression) {
+    for (const bool persisted : {false, true}) {
+        SCOPED_TRACE(persisted ? "persisted view" : "transient view");
+        LagHarness h(persisted, persisted ? "xp" : "xt");
+        ASSERT_NO_FATAL_FAILURE(appendTruth(h.t, 3));                       // offsets 0..2 (ids 1..3)
+        ASSERT_NO_FATAL_FAILURE(feed(h.t, h.f, 0, /*hw=*/3, 1));
+        h.f.replica->becomeLeader(/*epoch=*/2, {kNodeF});                   // gen1: a one-member ISR commits alone
+        const uint64_t gen1 = h.f.replica->leadershipGeneration();
+        EXPECT_EQ(h.awaitOk(1), 10) << "first leadership: the whole log is committed and folded (cursor 3)";
+
+        h.f.replica->becomeFollower(/*leaderEpoch=*/3, kNodeT);             // demoted (gen2): the HW floor is forgotten
+        ASSERT_NE(h.f.replica->role(), Role::Leader);
+        ASSERT_NO_FATAL_FAILURE(appendTruth(h.t, 6, 3));                    // the interim leader commits 3..5 (id 1 -> 99)
+        ASSERT_NO_FATAL_FAILURE(feed(h.t, h.f, 3, /*hw=*/2, 3));            // F holds them but learns only HW 2 (its floor stays 3)
+        h.f.replica->becomeLeader(/*epoch=*/4, {kNodeF, kNodeT});           // gen3
+        ASSERT_GT(h.f.replica->leadershipGeneration(), gen1);
+        // (the replica's HW never regresses below what it already reported - the frozen table's cursor 3 equals the floor)
+        ASSERT_EQ(h.f.replica->highWatermark(), 3);
+        ASSERT_EQ(h.f.replica->leadershipStartOffset(), 6);
+
+        h.passes(10);
+        EXPECT_EQ(h.read(1).first, kNotReady) << "the frozen table (hp 10, cursor 3) is not served below the start offset";
+        EXPECT_EQ(h.read(5).first, kNotReady);
+        h.f.replica->becomeLeader(/*epoch=*/5, {kNodeF});          // the HW confirms
+        ASSERT_GE(h.f.replica->highWatermark(), 6);
+        EXPECT_EQ(h.awaitOk(1), 99);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // openView handshake: DefineTopic + CreateView register the view's typed output
 // topic; openView with a STALE pinned fingerprint is rejected (SchemaMismatch)
 // up front, while the current fingerprint (and 0 = latest) resolve OK.
@@ -564,11 +746,11 @@ TEST(GetViewRowRegression, ANewLeaderAnswersNotReadyUntilItsReFoldCaughtUpRegres
 namespace {
 
 std::string uniqSuffix() {
-    static std::atomic<uint64_t> seq{0};
+    static uint64_t seq = 0;
     const auto ts = std::chrono::steady_clock::now().time_since_epoch().count();
     // The pid keeps ctest -j parallel PROCESSES apart (each starts seq at 0 and the
     // clock can tick identically in two of them; a shared dir was removed under a peer).
-    return std::to_string(::getpid()) + "_" + std::to_string(seq.fetch_add(1, std::memory_order_relaxed)) + "_" + std::to_string(ts);
+    return std::to_string(::getpid()) + "_" + std::to_string(seq++) + "_" + std::to_string(ts);
 }
 
 struct TmpDir {

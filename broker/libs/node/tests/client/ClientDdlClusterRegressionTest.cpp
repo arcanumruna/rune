@@ -11,6 +11,7 @@
 #include "support/ShardTestClient.h"
 
 #include <rune/node/AdminWorker.h>
+#include <rune/client/session/SessionMachine.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/catalog/CatalogQueries.h>
 #include <rune/catalog/CatalogReplayer.h>
@@ -154,9 +155,10 @@ TEST(ClientDdlClusterRegression, SeedLeaderCrashedMidDdlFailsExplicitlyAndTheRet
     ASSERT_EQ(killed, leader) << "the leader was crashed after the DDL's append";
     EXPECT_TRUE((threw && detail.find("session") != std::string::npos) || code == 2)
         << "an explicit failure (SessionLost, or NotLeader), threw=" << threw << " code=" << code << ": " << detail;
-    // The client notices a dead seed by its session going stale (SessionMachine responseTimeoutNs, 10 s of silence), THEN its
+    // The client notices a dead seed by its session going stale (SessionConfig::responseTimeoutNs of silence), THEN its
     // retry budget runs: the explicit failure comes at ~13 s, never at the 30 s operation timeout.
-    EXPECT_LT(took, 10s + cfg.ddlRetryBudget + 2s) << "ends inside the stale-session threshold + the retry budget, never at the 30 s operation timeout";
+    const auto staleSession = std::chrono::nanoseconds(rune::client::session::SessionConfig{}.responseTimeoutNs);
+    EXPECT_LT(took, staleSession + cfg.ddlRetryBudget + 2s) << "ends inside the stale-session threshold + the retry budget, never at the 30 s operation timeout";
 
     ASSERT_TRUE(c.awaitCatalogLeader(60s));
     int32_t survivor = -1;
