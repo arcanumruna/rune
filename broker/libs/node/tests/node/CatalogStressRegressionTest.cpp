@@ -52,6 +52,9 @@ struct SeedReport {
     std::vector<uint64_t> traces;          // one per step
     std::map<int, int>    codes;           // terminal answer code -> count
     int                   okDdls = 0, inDoubtResolved = 0, skippedSteps = 0;
+    std::map<int, int>    inDoubtByKind;   // StressAction::Kind -> DDLs of such steps that ended in doubt and were resolved
+    int                   inDoubtFromCut = 0;   // ... summed over the three *MidDdl kinds
+    uint64_t              crashedUnanswered = 0;   // DDLs crashed leaders had started and never answered
     std::size_t           events = 0;
     uint64_t              finalDigest = 0;
     double                seconds = 0;
@@ -77,6 +80,13 @@ std::string codesOf(const std::vector<const StressAnswer*>& v) {
     return o.str();
 }
 
+/// The 400-step seeds this process already ran (single-threaded binary): the cut-fault test reuses them instead of
+/// replaying seeds 1-8 when the whole binary runs.
+std::map<uint32_t, SeedReport>& completedSeeds() {
+    static std::map<uint32_t, SeedReport> m;
+    return m;
+}
+
 void runSeed(uint32_t seed, int steps, SeedReport& rep) {
     const auto t0 = std::chrono::steady_clock::now();
     std::mt19937 rng(seed);
@@ -100,6 +110,13 @@ void runSeed(uint32_t seed, int steps, SeedReport& rep) {
                 std::cerr << o.str() << "\n";
             }
             if (res.skipped) ++rep.skippedSteps;
+            for (const StressAnswer& a : res.answers) {
+                if (!a.resolvedInDoubt) continue;
+                ++rep.inDoubtByKind[static_cast<int>(action.kind)];
+                if (action.kind == StressAction::Kind::LeaderMoveMidDdl || action.kind == StressAction::Kind::LeaderCrashMidDdl ||
+                    action.kind == StressAction::Kind::FollowerStopMidDdl)
+                    ++rep.inDoubtFromCut;
+            }
 
             // ── answers vs the model ─────────────────────────────────────────────────────────────────
             std::vector<const StressAnswer*> judged;
@@ -163,8 +180,14 @@ void runSeed(uint32_t seed, int steps, SeedReport& rep) {
         d.healAll();
         ASSERT_TRUE(h.awaitDigestsEqual(/*excludeHalted=*/false)) << where << ": the brokers never converged after healing";
         // Invariant: every DDL answered.
-        for (int b = 1; b <= 3; ++b)
-            EXPECT_EQ(h.startedTotal(b), h.answeredTotal(b)) << where << ": broker " << b << " started DDLs it never answered";
+        // (a crashed catalog leader started DDLs it could never answer: those are accounted, and each is resolved)
+        uint64_t crashed = 0;
+        for (int b = 1; b <= 3; ++b) {
+            EXPECT_EQ(h.startedTotal(b), h.answeredTotal(b) + d.crashedUnanswered(b)) << where << ": broker " << b << " started DDLs it never answered";
+            crashed += d.crashedUnanswered(b);
+        }
+        rep.crashedUnanswered = crashed;
+        EXPECT_LE(crashed, static_cast<uint64_t>(d.inDoubtResolved())) << where << ": a crashed leader's unanswered DDL was never resolved";
         // Invariant: no DDL lost or duplicated - the ledger of every log agrees, an OK'd request has exactly one
         // event, a refused one none, and the log holds nothing else.
         const auto ledger = d.requestLedger();
@@ -198,7 +221,7 @@ void runSeed(uint32_t seed, int steps, SeedReport& rep) {
     if (std::getenv("RUNE_STRESS_STATS") != nullptr) {
         std::ostringstream o;
         o << "[stress] seed " << seed << " steps " << steps << " events " << rep.events << " okDdls " << rep.okDdls << " inDoubt "
-          << rep.inDoubtResolved << " skipped " << rep.skippedSteps << " secs " << rep.seconds << " codes";
+          << rep.inDoubtResolved << " cutInDoubt " << rep.inDoubtFromCut << " crashedUnanswered " << rep.crashedUnanswered << " skipped " << rep.skippedSteps << " secs " << rep.seconds << " codes";
         for (const auto& [c, n] : rep.codes) o << " " << c << "x" << n;
         std::cerr << o.str() << "\n";
     }
@@ -226,6 +249,7 @@ class CatalogStressRegression : public testing::TestWithParam<uint32_t> {};
 TEST_P(CatalogStressRegression, RandomDdlUnderChurnMatchesTheModel) {
     SeedReport rep;
     runSeed(GetParam(), kSteps, rep);
+    completedSeeds()[GetParam()] = rep;
     RecordProperty("seconds", std::to_string(rep.seconds));
     RecordProperty("events", std::to_string(rep.events));
     RecordProperty("inDoubtResolved", std::to_string(rep.inDoubtResolved));
@@ -245,6 +269,27 @@ TEST(CatalogStressRegression, SameSeedSameTrace) {
     EXPECT_EQ(a.finalDigest, b.finalDigest);
     EXPECT_EQ(a.codes, b.codes);
     EXPECT_GT(a.okDdls, 0);
+}
+
+// I2: a DDL cut mid-flight by a leader move, a leader crash or a follower stop leaves in-doubt answers (the cut point
+// is the seed's: 0..40 passes after the send).  Seeds 1-8 x 400 steps must resolve at least one.
+TEST(CatalogStressRegression, CutFaultsProduceInDoubtAnswers) {
+    int fromCut = 0;
+    std::map<int, int> byKind;
+    for (uint32_t seed = 1; seed <= 8; ++seed) {
+        auto it = completedSeeds().find(seed);
+        if (it == completedSeeds().end()) {
+            SeedReport rep;
+            runSeed(seed, kSteps, rep);
+            it = completedSeeds().emplace(seed, std::move(rep)).first;
+        }
+        fromCut += it->second.inDoubtFromCut;
+        for (const auto& [k, n] : it->second.inDoubtByKind) byKind[k] += n;
+    }
+    EXPECT_GT(fromCut, 0) << "no *MidDdl step ended in doubt over seeds 1-8";
+    std::ostringstream o;
+    for (const auto& [k, n] : byKind) o << " kind" << k << "x" << n;
+    RecordProperty("inDoubtByKind", o.str());
 }
 
 // Fix-on-sight in the harness's fake control side: the stress (seed 2, step 99 of the final weights) found that a create whose name differs only

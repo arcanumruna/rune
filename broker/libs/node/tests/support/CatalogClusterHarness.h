@@ -591,9 +591,11 @@ public:
     void restartBroker(int32_t b) {
         if (broker_(b).alive) return;
         const uint64_t startedBefore = broker_(b).startedTotal, answeredBefore = broker_(b).answeredTotal;   // M5: kept
+        const uint64_t crashedBefore = broker_(b).crashedUnanswered;
         brokers_[static_cast<std::size_t>(b - 1)] = open_(b);
         broker_(b).startedTotal  = startedBefore;
         broker_(b).answeredTotal = answeredBefore;
+        broker_(b).crashedUnanswered = crashedBefore;
         ft_.deisolate(b);
         commitAssignment_();   // its role (follower of the current leader)
         admitWhenCaughtUp_(b);
@@ -854,6 +856,7 @@ private:
         std::deque<std::size_t>               held;               // gated answers (indices into recs_), FIFO
         rune::node::TopicDirReconciliation    lastReconcile;      // the boot reconcile's result (open_)
         uint64_t                              startedTotal = 0, answeredTotal = 0;   // of the workers torn down so far
+        uint64_t                              crashedUnanswered = 0;   // started by a crashed leader, never answered (kept across restarts)
         void tearDown() {
             if (admin) { startedTotal += admin->startedCount(); answeredTotal += admin->answeredCount(); }
             admin.reset();
