@@ -18,7 +18,7 @@
 //   RUNE_TARGET / RUNE_TARGET_STREAM   gateway ingress channel (required)
 //   RUNE_EGRESS / RUNE_EGRESS_STREAM   this client's egress channel (required)
 //   RUNE_DATA_DIR                      Aeron client dir (required)
-//   RUNE_TOPICS                        "name:id:partitions" (first topic used)
+//   RUNE_CLIENT_TOPIC_TABLE                        "name:id:partitions" (first topic used)
 //   RUNE_BENCH_MODE                    catchup | tail   (default catchup)
 //   RUNE_BENCH_RECORDS                 catchup: records to drain (default 1000000)
 //   RUNE_BENCH_DURATION_S              tail: seconds to run (default 10)
@@ -69,10 +69,14 @@ static std::vector<TopicSpec> parseTopics(const std::string& s) {
 }
 
 int main() {
+    if (std::getenv("RUNE_TOPICS") != nullptr) {
+        std::cerr << "CLIENT: RUNE_TOPICS was renamed to RUNE_CLIENT_TOPIC_TABLE (the client's name:topicId:partitions table)\n";
+        return 2;
+    }
     const std::string target  = envStr("RUNE_TARGET");
     const std::string egress  = envStr("RUNE_EGRESS");
     const std::string dataDir = envStr("RUNE_DATA_DIR");
-    const std::string topics  = envStr("RUNE_TOPICS", "bench:0:8");
+    const std::string topics  = envStr("RUNE_CLIENT_TOPIC_TABLE", "bench:0:8");
     if (target.empty() || egress.empty() || dataDir.empty()) {
         std::cerr << "RUNE_TARGET, RUNE_EGRESS, RUNE_DATA_DIR are required\n";
         return 2;

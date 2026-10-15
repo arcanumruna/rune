@@ -46,6 +46,7 @@ RUN conan install . --output-folder=conan-release --build=missing -s build_type=
 
 # rune-protocol sibling headers.
 COPY --from=rune-protocol include /rune-protocol/include
+COPY --from=rune-protocol src     /rune-protocol/src
 
 # rune-fr / rune-codec / rune-ql siblings (C9 fix round 1, the 5aaff86 recipe):
 # the client's CMakeLists always builds rune_fr and defines rune_codec / rune_ql

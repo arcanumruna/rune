@@ -35,7 +35,8 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLIENT_REPO="$(cd "${SCRIPT_DIR}/.." && pwd)"
-BROKER_COMPOSE="${CLIENT_REPO}/../rune-broker/docker/docker-compose.yml"
+BROKER_DOCKER_DIR="${CLIENT_REPO}/../rune-broker/docker"
+BROKER_COMPOSE="${BROKER_DOCKER_DIR}/docker-compose.yml"
 
 if [ ! -f "${BROKER_COMPOSE}" ]; then
     echo "[e2e-data] FAIL: broker compose not found: ${BROKER_COMPOSE}" >&2
@@ -58,11 +59,10 @@ RUNE_PRODUCE_M="${RUNE_PRODUCE_M:-10}"
 RUNE_TIMEOUT_MS="${RUNE_TIMEOUT_MS:-10000}"
 RUNE_RECOVERY_WAIT_MS="${RUNE_RECOVERY_WAIT_MS:-5000}"
 
-# Topics spec: "events:0:1" (name:id:partitionCount).
-# topicId 0 matches the broker's RUNE_TOPICS bootstrap (rune-broker
-# docker-compose.yml), which assigns topicIds sequentially from 0 in
-# declaration order → "events" = topicId 0.
-RUNE_TOPICS="${RUNE_TOPICS:-events:0:1}"
+# The client's topic table: "events:0:1" (name:id:partitionCount).
+# topicId 0 = `events`, the first statement of rune-broker docker/topics/e2e.rql, created by
+# create-topics.sh (Step 3b) once the cluster has a leader.
+RUNE_CLIENT_TOPIC_TABLE="${RUNE_CLIENT_TOPIC_TABLE:-events:0:1}"
 
 LEADER_WAIT_S=90
 CLIENT_WAIT_S=180   # Phase 1 + kill + Phase 2 may take up to 3 min
@@ -99,8 +99,13 @@ trap teardown EXIT
 # Step 1: Build broker images
 # ---------------------------------------------------------------------------
 log "Step 1: Building broker images..."
-docker compose -f "${BROKER_COMPOSE}" build 2>&1 \
-    | grep -E "^( Image|ERROR|#[0-9]+ (DONE|ERROR))" || true
+set +e
+out=$(docker compose -f "${BROKER_COMPOSE}" build rune-1 2>&1); rc=$?
+set -e
+echo "${out}" | grep -E "^( Image|ERROR|#[0-9]+ (DONE|ERROR))" || true
+[ "${rc}" -eq 0 ] || { echo "${out}" | tail -60 >&2; fail "broker image build failed (exit ${rc})"; }
+docker image inspect "rune-broker-node:${RUNE_IMAGE_TAG:-latest}" >/dev/null 2>&1 || fail "broker image not built: rune-broker-node:${RUNE_IMAGE_TAG:-latest}"
+bash "${BROKER_DOCKER_DIR}/create-topics.sh" --build-image || fail "could not build the rune CLI image"
 log "Broker build complete."
 
 # ---------------------------------------------------------------------------
@@ -159,19 +164,30 @@ leader_svc=$(node_id_to_service "${leader_id}")
 log "Initial leader: node ID=${leader_id} → service=${leader_svc}"
 
 # ---------------------------------------------------------------------------
+# Step 3b: Create the data-plane topics by DDL (the brokers take no topic list)
+# ---------------------------------------------------------------------------
+log "Step 3b: creating the data-plane topics by DDL (create-topics.sh e2e)..."
+COMPOSE_NETWORK="${BROKER_NETWORK}" bash "${BROKER_DOCKER_DIR}/create-topics.sh" e2e || fail "create-topics.sh e2e failed"
+
+# ---------------------------------------------------------------------------
 # Step 4: Build the rune-client-data image
 # ---------------------------------------------------------------------------
 log "Step 4: Building rune-client-data image (${DATA_IMAGE})..."
-docker build \
+set +e
+out=$(docker build \
     --platform linux/amd64 \
     --build-context rune-protocol="${CLIENT_REPO}/../rune-protocol" \
     --build-context rune-fr="${CLIENT_REPO}/../rune-fr" \
     --build-context rune-codec="${CLIENT_REPO}/../rune-codec" \
     --build-context rune-ql="${CLIENT_REPO}/../rune-ql" \
+    --build-context rune-crypto="${CLIENT_REPO}/../rune-crypto" \
     -f "${CLIENT_REPO}/docker/Dockerfile.data" \
     -t "${DATA_IMAGE}" \
-    "${CLIENT_REPO}" 2>&1 \
-    | grep -E "^( Image|ERROR|#[0-9]+ (DONE|ERROR))" || true
+    "${CLIENT_REPO}" 2>&1); rc=$?
+set -e
+echo "${out}" | grep -E "^( Image|ERROR|#[0-9]+ (DONE|ERROR))" || true
+[ "${rc}" -eq 0 ] || { echo "${out}" | tail -60 >&2; fail "data image build failed (exit ${rc})"; }
+docker image inspect "${DATA_IMAGE}" >/dev/null 2>&1 || fail "data image not built: ${DATA_IMAGE}"
 log "Data image built: ${DATA_IMAGE}"
 
 # ---------------------------------------------------------------------------
@@ -179,7 +195,7 @@ log "Data image built: ${DATA_IMAGE}"
 # ---------------------------------------------------------------------------
 log "Step 5: Running rune_produce_subscribe container..."
 log "  target=${CLIENT_TARGET_SVC}:${CLIENT_TARGET_PORT}"
-log "  topics=${RUNE_TOPICS}"
+log "  topics=${RUNE_CLIENT_TOPIC_TABLE}"
 log "  produceN=${RUNE_PRODUCE_N} produceM=${RUNE_PRODUCE_M}"
 log "  timeoutMs=${RUNE_TIMEOUT_MS} recoveryWaitMs=${RUNE_RECOVERY_WAIT_MS}"
 
@@ -204,7 +220,7 @@ docker run \
     -e RUNE_EGRESS="aeron:udp?endpoint=${CLIENT_HOSTNAME}:${CLIENT_EGRESS_PORT}" \
     -e RUNE_EGRESS_STREAM=2 \
     -e RUNE_DATA_DIR="/var/lib/rune-client" \
-    -e RUNE_TOPICS="${RUNE_TOPICS}" \
+    -e RUNE_CLIENT_TOPIC_TABLE="${RUNE_CLIENT_TOPIC_TABLE}" \
     -e RUNE_PRODUCE_N="${RUNE_PRODUCE_N}" \
     -e RUNE_PRODUCE_M=0 \
     -e RUNE_TIMEOUT_MS="${RUNE_TIMEOUT_MS}" \
@@ -277,7 +293,7 @@ docker run \
     -e RUNE_EGRESS="aeron:udp?endpoint=${CLIENT_HOSTNAME}:${CLIENT_EGRESS_PORT}" \
     -e RUNE_EGRESS_STREAM=2 \
     -e RUNE_DATA_DIR="/var/lib/rune-client" \
-    -e RUNE_TOPICS="${RUNE_TOPICS}" \
+    -e RUNE_CLIENT_TOPIC_TABLE="${RUNE_CLIENT_TOPIC_TABLE}" \
     -e RUNE_PRODUCE_N="${RUNE_PRODUCE_M}" \
     -e RUNE_PRODUCE_M=0 \
     -e RUNE_TIMEOUT_MS=$(( RUNE_TIMEOUT_MS * 3 )) \

@@ -24,15 +24,13 @@ conan-release/
 benchmark/
 bench/
 
-# Tests — exclude everything EXCEPT the checked-in descriptor blob.
+# Tests: keep tests/e2e/ and tests/generated/ WHOLE.  CMake configure (BUILD_EXAMPLES=ON) declares
+# every EXCLUDE_FROM_ALL probe target (rune_ql_probe, evo_probe_v1..4, evo_probe_multi, ...) and
+# needs their sources; a per-file allowlist goes stale whenever a probe is added (it did:
+# evo_probe_multi.cpp, CMakeLists.txt:697).
 tests/*
-!tests/generated
-tests/generated/*
-!tests/generated/characters.blob
-# C9 fix 1: configure needs the EXCLUDE_FROM_ALL rune_ql_probe source.
 !tests/e2e
-tests/e2e/*
-!tests/e2e/rune_ql_probe.cpp
+!tests/generated
 
 # Editor / OS
 .vscode/

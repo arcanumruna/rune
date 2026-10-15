@@ -18,7 +18,7 @@
 //                            e.g. "aeron:udp?endpoint=dr-client-0:40400"
 //     RUNE_EGRESS_STREAM   int, default 2
 //     RUNE_DATA_DIR        Aeron driver dir (required)
-//     RUNE_TOPICS          "name:id:partitions,..." default "events:0:1"
+//     RUNE_CLIENT_TOPIC_TABLE          "name:id:partitions,..." default "events:0:1"
 //     RUNE_TIMEOUT_MS      per-op timeout ms, default 10000
 //     RUNE_ACKS            "leader" | "all", default "leader".
 //                            "all" → ProducerConfig::acks = Acks::All so the
@@ -693,12 +693,16 @@ static int doTxnConsume(Client& c,
 // main
 // ---------------------------------------------------------------------------
 int main() {
+    if (std::getenv("RUNE_TOPICS") != nullptr) {
+        std::cerr << "CLIENT: RUNE_TOPICS was renamed to RUNE_CLIENT_TOPIC_TABLE (the client's name:topicId:partitions table)\n";
+        return 2;
+    }
     const std::string target       = getEnvStr("RUNE_TARGET");
     const int         targetStream = getEnvInt("RUNE_TARGET_STREAM", 1);
     const std::string egress       = getEnvStr("RUNE_EGRESS");
     const int         egressStream = getEnvInt("RUNE_EGRESS_STREAM", 2);
     const std::string dataDir      = getEnvStr("RUNE_DATA_DIR");
-    const std::string topicsStr    = getEnvStr("RUNE_TOPICS", "events:0:1");
+    const std::string topicsStr    = getEnvStr("RUNE_CLIENT_TOPIC_TABLE", "events:0:1");
     const int         timeoutMs    = getEnvInt("RUNE_TIMEOUT_MS", 10000);
 
     const std::string mode         = getEnvStr("RUNE_MODE", "produce_subscribe");
@@ -719,7 +723,7 @@ int main() {
     const int         expectCidExact = getEnvInt("RUNE_EXPECT_CID_EXACT", -1);
     // RUNE_SUB_PARTITIONS: number of partitions to subscribe.
     // Default 1 = partition 0 only (backward-compatible).  Set to the topic's
-    // partitionCount (from RUNE_TOPICS) to cover ALL partitions end-to-end.
+    // partitionCount (from RUNE_CLIENT_TOPIC_TABLE) to cover ALL partitions end-to-end.
     const int         subPartitions     = getEnvInt("RUNE_SUB_PARTITIONS", 1);
     // RUNE_SUB_PARTITION_BASE: first partition index to subscribe, default 0.
     // Combined with RUNE_SUB_PARTITIONS=K subscribes partitions [base..base+K-1].
@@ -789,7 +793,7 @@ int main() {
     cfg.idleMode         = IdleMode::LowLatency;
     cfg.topics           = parseTopics(topicsStr);
     if (cfg.topics.empty()) {
-        std::cerr << "CLIENT: no valid topics parsed from RUNE_TOPICS='" << topicsStr << "'\n";
+        std::cerr << "CLIENT: no valid topics parsed from RUNE_CLIENT_TOPIC_TABLE='" << topicsStr << "'\n";
         return 1;
     }
 

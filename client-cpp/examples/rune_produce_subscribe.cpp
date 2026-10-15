@@ -13,7 +13,7 @@
 //                          e.g. "aeron:udp?endpoint=rune-client:40400"
 //   RUNE_EGRESS_STREAM   — int, default 2
 //   RUNE_DATA_DIR        — Aeron driver dir (required)
-//   RUNE_TOPICS          — comma-separated "name:id:partitions" entries
+//   RUNE_CLIENT_TOPIC_TABLE          — comma-separated "name:id:partitions" entries
 //                          e.g. "events:1:1,orders:2:4"
 //                          default: "events:1:1"
 //   RUNE_PRODUCE_N       — records to produce in phase 1, default 20
@@ -208,12 +208,16 @@ static std::vector<int64_t> collectRecords(Client& c, const TopicHandle& th,
 // ---------------------------------------------------------------------------
 
 int main() {
+    if (std::getenv("RUNE_TOPICS") != nullptr) {
+        std::cerr << "CLIENT: RUNE_TOPICS was renamed to RUNE_CLIENT_TOPIC_TABLE (the client's name:topicId:partitions table)\n";
+        return 2;
+    }
     const std::string target        = getEnvStr("RUNE_TARGET");
     const int         targetStream  = getEnvInt("RUNE_TARGET_STREAM",   1);
     const std::string egress        = getEnvStr("RUNE_EGRESS");
     const int         egressStream  = getEnvInt("RUNE_EGRESS_STREAM",   2);
     const std::string dataDir       = getEnvStr("RUNE_DATA_DIR");
-    const std::string topicsStr     = getEnvStr("RUNE_TOPICS",          "events:1:1");
+    const std::string topicsStr     = getEnvStr("RUNE_CLIENT_TOPIC_TABLE",          "events:1:1");
     const int         produceN      = getEnvInt("RUNE_PRODUCE_N",       20);
     const int         produceM      = getEnvInt("RUNE_PRODUCE_M",       10);
     const int         timeoutMs     = getEnvInt("RUNE_TIMEOUT_MS",      10000);
@@ -253,7 +257,7 @@ int main() {
 
     cfg.topics = parseTopics(topicsStr);
     if (cfg.topics.empty()) {
-        std::cerr << "CLIENT: no valid topics parsed from RUNE_TOPICS='"
+        std::cerr << "CLIENT: no valid topics parsed from RUNE_CLIENT_TOPIC_TABLE='"
                   << topicsStr << "'\n";
         return 1;
     }

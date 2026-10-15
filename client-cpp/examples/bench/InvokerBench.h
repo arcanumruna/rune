@@ -49,7 +49,7 @@ inline constexpr const char* kBenchUsage =
     "         [--records N] [--acks none|leader|all] [--max-in-flight N]\n"
     "         [--gate-p99-us U] [--gate-rps R] [--idle-check-cores 0,1,..] [--idle-check-only]\n"
     "         [--mtu BYTES] [--linger-us U] [--batch-bytes B]\n"
-    "  env: RUNE_TARGET RUNE_TARGET_STREAM RUNE_EGRESS RUNE_EGRESS_STREAM RUNE_DATA_DIR RUNE_TOPICS\n"
+    "  env: RUNE_TARGET RUNE_TARGET_STREAM RUNE_EGRESS RUNE_EGRESS_STREAM RUNE_DATA_DIR RUNE_CLIENT_TOPIC_TABLE\n"
     "  (no arguments = legacy env-driven agent-mode bench)\n";
 
 [[nodiscard]] inline std::optional<BenchArgs> parseBenchArgs(int argc, char** argv, std::string& error) {

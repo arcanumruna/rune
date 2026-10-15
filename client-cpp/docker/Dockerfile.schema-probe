@@ -48,6 +48,7 @@ RUN conan install . --output-folder=conan-release --build=missing -s build_type=
 # ── Sibling build contexts ────────────────────────────────────────────────────
 # rune-protocol (0b): header-only.  CMake resolves RUNE_PROTOCOL_INCLUDE below.
 COPY --from=rune-protocol include /rune-protocol/include
+COPY --from=rune-protocol src     /rune-protocol/src
 # rune-codec (0a): compiled sibling (src + include) + the rune_codec_gen tool source.
 COPY --from=rune-codec src     /rune-codec/src
 COPY --from=rune-codec include /rune-codec/include
@@ -57,6 +58,8 @@ COPY --from=rune-fr src     /rune-fr/src
 COPY --from=rune-fr include /rune-fr/include
 COPY --from=rune-ql src     /rune-ql/src
 COPY --from=rune-ql include /rune-ql/include
+COPY --from=rune-crypto src     /rune-crypto/src
+COPY --from=rune-crypto include /rune-crypto/include
 
 # ── Application sources (last; edits do not bust the conan cache) ─────────────
 COPY . .

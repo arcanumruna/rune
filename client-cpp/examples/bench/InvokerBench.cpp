@@ -296,6 +296,10 @@ int idleCheck(const BenchArgs& a) {  // 0 = idle (or not checked), 3 = busy
 } // namespace
 
 int invokerBenchMain(int argc, char** argv) {
+    if (std::getenv("RUNE_TOPICS") != nullptr) {
+        std::cerr << "CLIENT: RUNE_TOPICS was renamed to RUNE_CLIENT_TOPIC_TABLE (the client's name:topicId:partitions table)\n";
+        return 2;
+    }
     std::string err;
     const auto parsed = parseBenchArgs(argc, argv, err);
     if (!parsed) {
@@ -318,10 +322,10 @@ int invokerBenchMain(int argc, char** argv) {
     g.base.egressChannel   = egress;
     g.base.egressStreamId  = static_cast<int32_t>(envI64("RUNE_EGRESS_STREAM", 2));
     g.base.dataDir         = dataDir;
-    g.base.topics          = parseTopics(envStr("RUNE_TOPICS", "bench:0:8"));
+    g.base.topics          = parseTopics(envStr("RUNE_CLIENT_TOPIC_TABLE", "bench:0:8"));
     g.base.mtuBytes        = a.mtu;
     if (g.base.topics.empty()) {
-        std::cerr << "no topics parsed from RUNE_TOPICS\n";
+        std::cerr << "no topics parsed from RUNE_CLIENT_TOPIC_TABLE\n";
         return 2;
     }
     g.shardCount           = a.shards;

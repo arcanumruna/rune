@@ -4,7 +4,7 @@
 # SINGLE-NODE real-Aeron typed round-trip through the `rune` CLI against a REAL
 # broker (default config), exercising a `string(N)` FixedStr field end to end:
 #   1. Build the single-node broker image (broker CODE unchanged; compiled against
-#      rune-codec-0c so its validator/readField handle FixedStr) + the client
+#      rune-codec so its validator/readField handle FixedStr) + the client
 #      rune-ql image (the `rune` CLI + client libs + retained toolchain).
 #   2. Start ONE broker node (self-elects).
 #   3. Wait (bounded) for the node to become LEADER.
@@ -20,7 +20,7 @@
 #
 # Usage:  bash docker/rune-ql-e2e.sh
 # Run from the rune-client-cpp-0c repo root.  Requires the sibling repos:
-#   ../rune-broker  ../rune-protocol  ../rune-codec-0c  ../rune-ql  ../rune-fr
+#   ../rune-broker  ../rune-protocol  ../rune-codec  ../rune-ql  ../rune-fr
 #
 # Constraints (engineering philosophy #11/#16):
 #   - Real client↔broker over real Aeron (NOT in-process); the DEFAULT path.
@@ -55,7 +55,8 @@ fail() { echo "[rune-ql-e2e] FAIL: $*" >&2; exit 1; }
 # ---------------------------------------------------------------------------
 [ -d "${PROJECTS}/rune-broker" ]    || fail "missing ../rune-broker"
 [ -d "${PROJECTS}/rune-protocol" ]  || fail "missing ../rune-protocol"
-[ -d "${PROJECTS}/rune-codec-0c" ]  || fail "missing ../rune-codec-0c"
+[ -d "${PROJECTS}/rune-codec" ]     || fail "missing ../rune-codec"
+[ -d "${PROJECTS}/rune-crypto" ]    || fail "missing ../rune-crypto"
 [ -d "${PROJECTS}/rune-ql" ]        || fail "missing ../rune-ql"
 [ -d "${PROJECTS}/rune-fr" ]        || fail "missing ../rune-fr"
 [ -f "${CLIENT_DOCKERFILE}" ]       || fail "missing ${CLIENT_DOCKERFILE}"
@@ -72,23 +73,31 @@ teardown() {
 trap teardown EXIT
 
 # ---------------------------------------------------------------------------
-# Step 1: Build broker image (rune-codec-0c) + client rune-ql image.
+# Step 1: Build broker image (rune-codec) + client rune-ql image.
 # ---------------------------------------------------------------------------
-log "Step 1a: Building single-node broker image against rune-codec-0c (tag=${RUNE_IMAGE_TAG})..."
-docker compose -f "${COMPOSE_FILE}" build 2>&1 \
-    | grep -E "^( Image|ERROR|#[0-9]+ (DONE|ERROR))" || true
+log "Step 1a: Building single-node broker image against rune-codec (tag=${RUNE_IMAGE_TAG})..."
+set +e
+out=$(docker compose -f "${COMPOSE_FILE}" build 2>&1); rc=$?
+set -e
+echo "${out}" | grep -E "^( Image|ERROR|#[0-9]+ (DONE|ERROR))" || true
+[ "${rc}" -eq 0 ] || { echo "${out}" | tail -60 >&2; fail "broker image build failed (exit ${rc})"; }
+docker image inspect "rune-broker-0c-node:${RUNE_IMAGE_TAG}" >/dev/null 2>&1 || fail "broker image not built: rune-broker-0c-node:${RUNE_IMAGE_TAG}"
 
 log "Step 1b: Building client rune-ql image (${CLIENT_IMAGE})..."
-docker build \
+set +e
+out=$(docker build \
     --platform linux/amd64 \
     -f "${CLIENT_DOCKERFILE}" \
     --build-context rune-protocol="${PROJECTS}/rune-protocol" \
-    --build-context rune-codec="${PROJECTS}/rune-codec-0c" \
+    --build-context rune-codec="${PROJECTS}/rune-codec" \
     --build-context rune-ql="${PROJECTS}/rune-ql" \
     --build-context rune-fr="${PROJECTS}/rune-fr" \
+    --build-context rune-crypto="${PROJECTS}/rune-crypto" \
     -t "${CLIENT_IMAGE}" \
-    "${CLIENT_REPO}" 2>&1 \
-    | grep -E "^( Image|ERROR|#[0-9]+ (DONE|ERROR))" || true
+    "${CLIENT_REPO}" 2>&1); rc=$?
+set -e
+echo "${out}" | grep -E "^( Image|ERROR|#[0-9]+ (DONE|ERROR))" || true
+[ "${rc}" -eq 0 ] || { echo "${out}" | tail -60 >&2; fail "client image build failed (exit ${rc})"; }
 docker image inspect "${CLIENT_IMAGE}" >/dev/null 2>&1 || fail "client image not built: ${CLIENT_IMAGE}"
 log "Build complete."
 
@@ -196,7 +205,7 @@ log ""
 log "========================================"
 log "  TASK 10 (0c #11 GATE) CLI-DRIVEN E2E PASSED"
 log "  Single node self-elected: ${leader}"
-log "  Broker compiled against rune-codec-0c (FixedStr)"
+log "  Broker compiled against rune-codec (FixedStr)"
 log "  rune schema apply --validate -> generate -> compile probe -> run"
 log "  Probe: openTopic<Characters> -> send×${PROBE_RECORDS} -> consume -> decode"
 log "         round-trip incl. code[8] FixedStr + var name"

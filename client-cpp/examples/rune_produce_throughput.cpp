@@ -22,7 +22,7 @@
 //   RUNE_EGRESS          this client's egress channel, e.g. aeron:udp?endpoint=127.0.0.1:40400 (required)
 //   RUNE_EGRESS_STREAM   default 2
 //   RUNE_DATA_DIR        Aeron client dir (required)
-//   RUNE_TOPICS          "name:id:partitions" (first topic is used), e.g. bench:0:8
+//   RUNE_CLIENT_TOPIC_TABLE          "name:id:partitions" (first topic is used), e.g. bench:0:8
 //   RUNE_BENCH_RECORDS   total records to produce (default 2000000)
 //   RUNE_BENCH_VALUE_BYTES  payload size (default 256)
 //   RUNE_BENCH_KEYS      distinct keys (spreads across partitions; default = partitions)
@@ -65,6 +65,10 @@ using rune::bench::envStr;
 using rune::bench::parseTopics;
 
 int main(int argc, char** argv) {
+    if (std::getenv("RUNE_TOPICS") != nullptr) {
+        std::cerr << "CLIENT: RUNE_TOPICS was renamed to RUNE_CLIENT_TOPIC_TABLE (the client's name:topicId:partitions table)\n";
+        return 2;
+    }
     // rune-fr: armed by RUNE_FR_ENABLE before any client thread starts; the
     // report is written to RUNE_FR_OUT on every exit path, in EVERY mode
     // (legacy void/acked AND the invoker open/saturate bench).
@@ -75,7 +79,7 @@ int main(int argc, char** argv) {
     const std::string target  = envStr("RUNE_TARGET");
     const std::string egress  = envStr("RUNE_EGRESS");
     const std::string dataDir = envStr("RUNE_DATA_DIR");
-    const std::string topics  = envStr("RUNE_TOPICS", "bench:0:8");
+    const std::string topics  = envStr("RUNE_CLIENT_TOPIC_TABLE", "bench:0:8");
     if (target.empty() || egress.empty() || dataDir.empty()) {
         std::cerr << "RUNE_TARGET, RUNE_EGRESS, RUNE_DATA_DIR are required\n";
         return 2;

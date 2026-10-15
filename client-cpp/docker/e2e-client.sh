@@ -115,8 +115,12 @@ trap teardown EXIT
 # Step 1: Build broker images
 # ---------------------------------------------------------------------------
 log "Step 1: Building broker images..."
-docker compose -f "${BROKER_COMPOSE}" build 2>&1 \
-    | grep -E "^( Image|ERROR|#[0-9]+ (DONE|ERROR))" || true
+set +e
+out=$(docker compose -f "${BROKER_COMPOSE}" build rune-1 2>&1); rc=$?
+set -e
+echo "${out}" | grep -E "^( Image|ERROR|#[0-9]+ (DONE|ERROR))" || true
+[ "${rc}" -eq 0 ] || { echo "${out}" | tail -60 >&2; fail "broker image build failed (exit ${rc})"; }
+docker image inspect "rune-broker-node:${RUNE_IMAGE_TAG:-latest}" >/dev/null 2>&1 || fail "broker image not built: rune-broker-node:${RUNE_IMAGE_TAG:-latest}"
 log "Broker build complete."
 
 # ---------------------------------------------------------------------------
@@ -173,16 +177,21 @@ log "Initial leader: node ID=${leader_id} → service=${leader_svc}"
 # Step 4: Build the rune-client-ping image
 # ---------------------------------------------------------------------------
 log "Step 4: Building rune-client-ping image (${CLIENT_IMAGE})..."
-docker build \
+set +e
+out=$(docker build \
     --platform linux/amd64 \
     --build-context rune-protocol="${CLIENT_REPO}/../rune-protocol" \
     --build-context rune-fr="${CLIENT_REPO}/../rune-fr" \
     --build-context rune-codec="${CLIENT_REPO}/../rune-codec" \
     --build-context rune-ql="${CLIENT_REPO}/../rune-ql" \
+    --build-context rune-crypto="${CLIENT_REPO}/../rune-crypto" \
     -f "${CLIENT_REPO}/docker/Dockerfile.client" \
     -t "${CLIENT_IMAGE}" \
-    "${CLIENT_REPO}" 2>&1 \
-    | grep -E "^( Image|ERROR|#[0-9]+ (DONE|ERROR))" || true
+    "${CLIENT_REPO}" 2>&1); rc=$?
+set -e
+echo "${out}" | grep -E "^( Image|ERROR|#[0-9]+ (DONE|ERROR))" || true
+[ "${rc}" -eq 0 ] || { echo "${out}" | tail -60 >&2; fail "client image build failed (exit ${rc})"; }
+docker image inspect "${CLIENT_IMAGE}" >/dev/null 2>&1 || fail "client image not built: ${CLIENT_IMAGE}"
 log "Client image built: ${CLIENT_IMAGE}"
 
 # ---------------------------------------------------------------------------

@@ -324,7 +324,7 @@ struct ClientConfig {
     uint32_t shardIndex  = 0;
 
     // CB-2: Static topic configuration for the producer.
-    // Mirrors the broker's RUNE_TOPICS environment variable.
+    // The client's static topic table (env RUNE_CLIENT_TOPIC_TABLE in the examples); broker topics are created by DDL.
     // TODO(dynamic): fetch topic metadata from the broker on connect.
     std::vector<TopicSpec> topics;
 

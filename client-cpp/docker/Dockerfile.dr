@@ -108,6 +108,11 @@ COPY --from=builder /build/build/dr_client /usr/local/bin/dr_client
 COPY --from=builder /build/libstdc++.so.6 /tmp/libstdc++.so.6.0.32
 RUN mv /tmp/libstdc++.so.6.0.32 /usr/lib/$(uname -m)-linux-gnu/libstdc++.so.6.0.32 && ldconfig
 
+# The client checkout this image was built from; the dr-e2e harness refuses an image whose label differs from the
+# client HEAD (a stale image once ran against a current broker and failed produce with SchemaValidationFailed).
+ARG RUNE_CLIENT_SHA=unknown
+LABEL rune.client.sha=$RUNE_CLIENT_SHA
+
 # Aeron embedded driver needs /dev/shm — use --shm-size=256m at runtime.
 RUN mkdir -p /var/lib/rune-client
 ENV RUNE_DATA_DIR=/var/lib/rune-client

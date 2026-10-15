@@ -4,17 +4,17 @@
 # the 0c CLI-driven typed round-trip (docker/rune-ql-e2e.sh + rune_ql_probe).
 #
 # WHY THIS COMPOSE (vs the broker repo's docker-compose.single.yml):
-#   The broker CODE is UNCHANGED, but for 0c it must COMPILE against rune-codec-0c
+#   The broker CODE is UNCHANGED, but for 0c it must COMPILE against rune-codec
 #   (which adds FixedStr) so the broker's validator/readField handle a
 #   `string(N)` field.  This file therefore points the broker's build contexts at:
 #       rune-protocol -> ../../rune-protocol      (main; has SchemaMessages.h)
-#       rune-codec    -> ../../rune-codec-0c      (0c codec: adds FixedStr)
+#       rune-codec    -> ../../rune-codec      (0c codec: adds FixedStr)
 #       rune-fr       -> ../../rune-fr
 #   and the broker Dockerfile passes -DRUNE_CODEC_ROOT=/rune-codec.
 #
 #   The build `context` is the rune-broker repo; `dockerfile` is the broker's
 #   docker/Dockerfile.  NO rune-broker source change — only the codec source it
-#   compiles is swapped via the build context (rune-codec -> rune-codec-0c).
+#   compiles is swapped via the build context (rune-codec -> rune-codec).
 #
 # additional_contexts are resolved relative to THIS compose file's directory
 # (rune-client-cpp-0c/docker/), hence the ../../<repo> paths.
@@ -30,11 +30,14 @@ services:
       # The broker repo root (contains docker/Dockerfile, conanfile.py, src/).
       context: ../../rune-broker
       dockerfile: docker/Dockerfile
+      args:
+        - CMAKE_BUILD_PARALLEL_LEVEL   # from the environment when set (small Docker VMs)
       additional_contexts:
         # relative to THIS compose file's dir (rune-client-cpp-0c/docker/):
         rune-protocol: ../../rune-protocol      # main — has SchemaMessages.h
         rune-fr: ../../rune-fr                  # flight recorder (compiled sibling)
-        rune-codec: ../../rune-codec-0c         # 0c codec — adds FixedStr
+        rune-codec: ../../rune-codec            # sibling checkout (same set as the broker's x-broker-build)
+        rune-crypto: ../../rune-crypto
     image: rune-broker-0c-node:${RUNE_IMAGE_TAG:-single}
     platform: linux/amd64
     hostname: rune-1

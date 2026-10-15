@@ -533,6 +533,26 @@ if(BUILD_EXAMPLES AND aeron_FOUND)
         endif()
     endif()
 
+    # The client topic table env var was renamed RUNE_TOPICS -> RUNE_CLIENT_TOPIC_TABLE: an old script that still sets
+    # the old name must be refused, never silently run on the default table.
+    if(BUILD_TESTING)
+        foreach(_prog IN ITEMS dr_client rune_produce_throughput rune_consume_throughput rune_produce_subscribe)
+            if(TARGET ${_prog})
+                add_test(NAME ClientTopicTableEnvRegression.${_prog}RefusesOldName
+                    COMMAND ${CMAKE_COMMAND} -E env RUNE_TOPICS=events:0:1 $<TARGET_FILE:${_prog}>)
+                set_tests_properties(ClientTopicTableEnvRegression.${_prog}RefusesOldName PROPERTIES
+                    PASS_REGULAR_EXPRESSION "renamed to RUNE_CLIENT_TOPIC_TABLE" TIMEOUT 20)
+            endif()
+        endforeach()
+        # the invoker-shard bench (rune_produce_throughput with arguments) is the fifth reader
+        if(TARGET rune_produce_throughput)
+            add_test(NAME ClientTopicTableEnvRegression.InvokerBenchRefusesOldName
+                COMMAND ${CMAKE_COMMAND} -E env RUNE_TOPICS=bench:0:8 $<TARGET_FILE:rune_produce_throughput> --idle-check-only)
+            set_tests_properties(ClientTopicTableEnvRegression.InvokerBenchRefusesOldName PROPERTIES
+                PASS_REGULAR_EXPRESSION "renamed to RUNE_CLIENT_TOPIC_TABLE" TIMEOUT 20)
+        endif()
+    endif()
+
     # ── Task 13 — headline typed round-trip probe (define→open→send→consume) ──
     #
     # Build-time schema codegen (mirrors rune-codec's generate_characters_header):

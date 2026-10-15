@@ -18,14 +18,13 @@ conan-release/
 # Superpowers / internal docs
 .superpowers/
 
-# Tests and benchmarks (not built in the client image)
-# Tests (not built in this image) — EXCEPT the e2e probe source: configure
-# (BUILD_EXAMPLES=ON) declares the EXCLUDE_FROM_ALL rune_ql_probe target and
-# needs its source file to exist.
+# Tests: keep tests/e2e/ and tests/generated/ WHOLE.  CMake configure (BUILD_EXAMPLES=ON) declares
+# every EXCLUDE_FROM_ALL probe target (rune_ql_probe, evo_probe_v1..4, evo_probe_multi, ...) and
+# needs their sources; a per-file allowlist goes stale whenever a probe is added (it did:
+# evo_probe_multi.cpp, CMakeLists.txt:697).
 tests/*
 !tests/e2e
-tests/e2e/*
-!tests/e2e/rune_ql_probe.cpp
+!tests/generated
 benchmark/
 bench/
 

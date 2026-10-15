@@ -677,11 +677,7 @@ static int transientFailoverMode(Client& c, std::chrono::milliseconds wait, int 
     constexpr int     kMaxOff   = 4096;   // per-offset delivery counters
     const int         moveBoundMs = getEnvInt("RUNE_MOVE_BOUND_MS", 180000);
 
-    // A STATIC transient topic (RUNE_TOPICS presence_failover:1:persistence=
-    // transient, id from the script): runtime DDL is single-node today — the
-    // __topic_schemas replica has no multi-node transport (the deferred
-    // multi-node catalog follow-on, DDL-conformance KL4), so a 3-node
-    // DefineTopic answers Internal.  The data path under test is the same.
+    // A transient topic created by DDL (rune-broker docker/topics/transient-failover.rql, id from the script).
     (void)wait;
     struct { int32_t topicId; } tt{static_cast<int32_t>(getEnvI64("RUNE_FAILOVER_TOPIC_ID", -1))};
     if (tt.topicId < 0) { std::cerr << "PROBE: FAIL transient_failover needs RUNE_FAILOVER_TOPIC_ID\n"; return 100; }
