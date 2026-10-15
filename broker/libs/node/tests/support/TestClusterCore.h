@@ -112,6 +112,17 @@ public:
                     last = "Redirect to " + ans->message;
                     continue;
                 }
+                // The broker's DDL answer gate (a committed DDL is answered only once its topic serves) gives up
+                // after its own budget with Internal "... (placement pending)" - on a loaded host (ctest -j) the
+                // placement can take longer.  The DDL is committed: re-asking with the SAME requestId is answered
+                // from the dedupe (the original result once it serves), never a second event - wait for it within
+                // this call's deadline, as a real client retrying would.
+                if (ans->code == static_cast<int16_t>(pc::ErrorCode::Internal) &&
+                    ans->message.find("placement pending") != std::string::npos) {
+                    last = ans->message;
+                    sleep_();
+                    continue;
+                }
                 return fail_(ans->code, ans->message);
             }
             if (ans->code != 0) return fail_(ans->code, "the DefineTopicResponse carries no detail");
