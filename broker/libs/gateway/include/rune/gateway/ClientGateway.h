@@ -1,4 +1,5 @@
 #pragma once
+#include <rune/storage/ZeroedBytes.h>
 #include <rune/consensus/PeerResolution.h>
 
 #include <cstdio>
@@ -2953,7 +2954,7 @@ private:
     // No-hang fix round 2 (I1): the egress spill (see kEgressSpillBytes).
     // Single-writer: duty-cycle thread only.  Allocated once at construction.
     rune::gateway::SpillPool egressSpill_{kEgressSpillPoolBytes};
-    std::vector<uint8_t>     spillStage_ = std::vector<uint8_t>(kMaxSpillRecordBytes);   // multi-block gather
+    rune::storage::ZeroedBytes spillStage_{kMaxSpillRecordBytes};   // multi-block gather (ZeroedBytes: memset, not a per-byte vector fill)
     Session*    spillReadyHead_     = nullptr;   // fix round 4: Spilled sessions (intrusive, Session::spill)
     Session*    spillReadyTail_     = nullptr;
     std::size_t spillReadySessions_ = 0;

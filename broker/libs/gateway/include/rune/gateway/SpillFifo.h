@@ -19,6 +19,8 @@
 #include <cstring>
 #include <vector>
 
+#include <rune/storage/ZeroedBytes.h>
+
 namespace rune::gateway {
 
 class SpillFifo {
@@ -153,7 +155,7 @@ private:
         if (records_ == 0) { head_ = 0; tail_ = 0; used_ = 0; }
     }
 
-    std::vector<uint8_t> buf_;
+    rune::storage::ZeroedBytes buf_;   // fixed at construction (memset, not a per-byte vector fill — Debug-build cost)
     std::size_t head_    = 0;
     std::size_t tail_    = 0;
     std::size_t used_    = 0;

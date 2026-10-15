@@ -22,6 +22,7 @@
 // (Idle | AwaitingCommit).  Cold path: DDL allocates per request; an idle pass
 // allocates nothing.
 
+#include <rune/storage/ZeroedBytes.h>
 #include <cstdint>
 #include <deque>
 #include <expected>
@@ -383,7 +384,7 @@ private:
     CatalogFrameStats                     catalogFrameStats_;
     // D26 (mirrors the worker's replScratch_): the catalog replica's disk reads
     // pread into this preallocated buffer, never through the segment mmap.
-    std::vector<uint8_t>                  catalogReadScratch_;
+    rune::storage::ZeroedBytes          catalogReadScratch_;   // ZeroedBytes: memset, not a per-byte vector fill (Debug-build cost)
     static constexpr int kCatalogFragmentLimit = 16;
 
     CatalogApplier                        applier_;

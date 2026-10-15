@@ -38,6 +38,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string_view>
@@ -159,7 +160,8 @@ public:
 
         capacity_ = cap;
         mask_     = cap - 1;
-        table_.assign(cap, Entry{kEmpty, -1});
+        table_.reset(new Entry[cap]);   // trivial Entry: no per-slot construction; resetTable_ writes each once
+        resetTable_();
         // I1: the producer tails share the dedupe budget — at most a quarter
         // of it (kEntryBytes per key slot vs ProducerTails::kBytesPerProducer).
         tails_.setCapacity(std::max<std::size_t>(
@@ -232,7 +234,7 @@ public:
 
     /// Clear all entries (reuse without reallocating).
     void clear() noexcept {
-        for (auto& e : table_) { e.hash = kEmpty; e.offset = -1; }
+        resetTable_();
         size_          = 0;
         latestOffset_  = -1;
         tails_.clear();
@@ -262,9 +264,9 @@ public:
     }
 
 private:
-    struct Entry {
-        uint64_t hash   = 0;
-        int64_t  offset = -1;
+    struct Entry {   // trivial: the table is allocated uninitialized and written once by resetTable_
+        uint64_t hash;
+        int64_t  offset;
     };
     static constexpr uint64_t kEmpty = 0; // hash==0 means empty slot
 
@@ -279,7 +281,16 @@ private:
     std::size_t          mask_         = 0;
     std::size_t          size_         = 0;
     Offset               latestOffset_ = -1;
-    std::vector<Entry>   table_;
+    /// Every slot {kEmpty, -1}.  A raw loop over the array, not std::vector::assign: an unoptimized (Debug /
+    /// sanitizer) build constructed and destroyed a multi-million-slot vector element by element through the
+    /// allocator — seconds per broker start for the cleaner's default dedupe budget.
+    void resetTable_() noexcept {
+        if (!table_) return;   // moved-from
+        Entry* const end = table_.get() + capacity_;
+        for (Entry* e = table_.get(); e != end; ++e) { e->hash = kEmpty; e->offset = -1; }
+    }
+
+    std::unique_ptr<Entry[]> table_;
     ProducerTails        tails_;
     TxnCleanState        txn_;
 };

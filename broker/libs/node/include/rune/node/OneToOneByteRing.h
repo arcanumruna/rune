@@ -20,7 +20,8 @@
 
 #include <cstdint>
 #include <cstddef>
-#include <vector>
+#include <cstring>
+#include <memory>
 
 namespace rune::node {
 
@@ -39,11 +40,10 @@ public:
 
     /// Construct with payload capacity in bytes (must be power-of-two; >= 256).
     explicit OneToOneByteRing(int payloadCapacity = kDefaultWorkerRingCapacity)
-        : bufferStorage_(
-              static_cast<std::size_t>(payloadCapacity) +
-              static_cast<std::size_t>(detail::O2ORingBuffer::trailerLength()),
-              std::byte{0})
-        , ring_(reinterpret_cast<uint8_t*>(bufferStorage_.data()), bufferStorage_.size())
+        : bufferBytes_(static_cast<std::size_t>(payloadCapacity) +
+                       static_cast<std::size_t>(detail::O2ORingBuffer::trailerLength()))
+        , bufferStorage_(zeroedStorage_(bufferBytes_))
+        , ring_(reinterpret_cast<uint8_t*>(bufferStorage_.get()), bufferBytes_)
     {}
 
     OneToOneByteRing(const OneToOneByteRing&)            = delete;
@@ -179,8 +179,18 @@ public:
     }
 
 private:
+    /// Zeroed storage, every page written once at construction (as a value-filled vector did).  One memset,
+    /// not a per-element construct: an unoptimized (Debug / sanitizer) build constructed a std::vector's
+    /// bytes one by one — ~0.6 s for one worker's rings, paid by every test that builds a Worker.
+    static std::unique_ptr<std::byte[]> zeroedStorage_(std::size_t n) {
+        std::unique_ptr<std::byte[]> p(new std::byte[n]);
+        std::memset(p.get(), 0, n);
+        return p;
+    }
+
+    std::size_t bufferBytes_;
     // Raw storage — zero-initialised so the ring descriptor fields start at 0.
-    std::vector<std::byte> bufferStorage_;
+    std::unique_ptr<std::byte[]> bufferStorage_;
     // The underlying SPSC ring (internal O2O port with tryClaim/commit/abort).
     detail::O2ORingBuffer ring_;
 };

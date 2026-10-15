@@ -62,6 +62,7 @@
 //   // TODO(R4): thread NodeConfig.*ByteCapacity to the ctor for runtime
 //   //            configurability.
 
+#include <rune/storage/ZeroedBytes.h>
 #include <rune/consensus/ConsensusAgent.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune_fr/FlightRecorder.h>
@@ -4795,7 +4796,7 @@ private:
     /// pass's push budget + the sparse-index skip slack + room for a first
     /// batch past the budget (a fresh pass always takes one).  Larger first
     /// batches fall back to the mapped view (pushReadMapFallbacks_).
-    std::vector<uint8_t>                  pushScratch_ = std::vector<uint8_t>(2 * kPushPassBudgetBytes + 64 * 1024);
+    rune::storage::ZeroedBytes          pushScratch_{2 * kPushPassBudgetBytes + 64 * 1024};   // ZeroedBytes: memset, not a per-byte vector fill (Debug-build cost)
     uint64_t transientFullRefusals_   = 0;   ///< E2: ring refused a produce / marker (full or too large)
     uint64_t transientCursorSkips_    = 0;   ///< E2: reads whose cursor was below the ring start
     uint64_t transientRecordsSkipped_ = 0;   ///< E2: records those reads skipped (evicted unread)
@@ -4806,12 +4807,12 @@ private:
     /// an owned replica preads into it (PartitionReplica::setReadScratch), never
     /// faulting through the segment read map.  maxFetchBytes (1 MiB) + the
     /// sparse-index skip slack; larger reads fall back to the mapped view.
-    std::vector<uint8_t>                  replScratch_ = std::vector<uint8_t>((1u << 20) + 64 * 1024);
+    rune::storage::ZeroedBytes          replScratch_{(1u << 20) + 64 * 1024};
     /// Sets the replica's read scratch for one call from this thread, cleared
     /// after: a replica handed to another owner never keeps this worker's buffer.
     struct ReplReadScope {
         rune::replication::PartitionReplica& r;
-        ReplReadScope(rune::replication::PartitionReplica& rep, std::vector<uint8_t>& buf) noexcept : r(rep) {
+        ReplReadScope(rune::replication::PartitionReplica& rep, rune::storage::ZeroedBytes& buf) noexcept : r(rep) {
             r.setReadScratch(buf.data(), buf.size());
         }
         ~ReplReadScope() { r.setReadScratch(nullptr, 0); }

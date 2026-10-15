@@ -24,6 +24,8 @@
 #include <utility>
 #include <cstdint>
 #include <cstddef>
+#include <cstring>
+#include <memory>
 #include <vector>
 
 namespace rune::consensus {
@@ -54,11 +56,10 @@ public:
 
     /// Construct with payload capacity in bytes (must be power-of-two; ≥256).
     explicit IngressRing(int payloadCapacity = kDefaultIngressCapacity)
-        : bufferStorage_(
-              static_cast<std::size_t>(payloadCapacity) +
-              static_cast<std::size_t>(detail::M2ORingBuffer::trailerLength()),
-              std::byte{0})
-        , ring_(reinterpret_cast<uint8_t*>(bufferStorage_.data()), bufferStorage_.size())
+        : bufferBytes_(static_cast<std::size_t>(payloadCapacity) +
+                       static_cast<std::size_t>(detail::M2ORingBuffer::trailerLength()))
+        , bufferStorage_(zeroedStorage_(bufferBytes_))
+        , ring_(reinterpret_cast<uint8_t*>(bufferStorage_.get()), bufferBytes_)
     {}
 
     // Not copyable or movable (the ring holds a view into owned storage).
@@ -131,7 +132,17 @@ public:
 private:
     // Raw storage — owned by IngressRing; zero-initialised so ring descriptor
     // fields start at 0 (tail=0, head=0, etc.).
-    std::vector<std::byte> bufferStorage_;
+    /// Zeroed storage, every page written once at construction (as a value-filled vector did).  One memset,
+    /// not a per-element construct / destroy: an unoptimized (Debug / sanitizer) build walked a std::vector's
+    /// bytes one by one at every ring's construction and destruction.
+    static std::unique_ptr<std::byte[]> zeroedStorage_(std::size_t n) {
+        std::unique_ptr<std::byte[]> p(new std::byte[n]);
+        std::memset(p.get(), 0, n);
+        return p;
+    }
+
+    std::size_t                  bufferBytes_;
+    std::unique_ptr<std::byte[]> bufferStorage_;
 
     // The ring buffer (holds a non-owning AtomicBuffer view into bufferStorage_).
     detail::M2ORingBuffer ring_;
