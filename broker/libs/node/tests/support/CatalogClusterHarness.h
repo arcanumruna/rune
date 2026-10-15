@@ -254,8 +254,12 @@ public:
           root_(std::filesystem::temp_directory_path() /
                 ("rune_cluster_" + std::to_string(::getpid()) + "_" + std::to_string(cluster_detail::gSeq++))) {
         if (brokers != kBrokers) fail_("ctor", "the matrix harness is 3 brokers");
-        std::filesystem::remove_all(root_);
+        {
+            std::error_code ec;
+            std::filesystem::remove_all(root_, ec);   // a stale tree of a crashed run with the same pid
+        }
         for (int32_t b = 1; b <= kBrokers; ++b) brokers_.push_back(open_(b));
+        if (failAfterOpenForTest) fail_("ctor", "test seam: failAfterOpenForTest");
         // The controller forms __catalog exactly as MetadataService does for a fresh cluster.
         const std::vector<int32_t> replicas{1, 2, 3};
         const auto first = MetadataService::decideCoordinatorPartition(
@@ -265,12 +269,13 @@ public:
         commitAssignment_();
         awaitRole(1, "LeaderServing");
     }
-    ~CatalogClusterHarness() {
+    ~CatalogClusterHarness() {   // rootGuard_ removes the tree after the brokers are gone
         clients_.clear();
         brokers_.clear();
-        std::error_code ec;
-        std::filesystem::remove_all(root_, ec);
     }
+    /// Test seam (TempDirHygieneRegression): the ctor throws after the brokers' directories exist, so the
+    /// exception-safety of the root guard is observable.  Single-threaded test binaries.
+    inline static bool failAfterOpenForTest = false;
     CatalogClusterHarness(const CatalogClusterHarness&)            = delete;
     CatalogClusterHarness& operator=(const CatalogClusterHarness&) = delete;
 
@@ -1740,6 +1745,15 @@ private:
     std::deque<rr::AlterIsrMsg>          alterIsrQ_;   // the catalog leader's AlterIsr proposals (first: brokers hold a channel to it)
     std::string                          tag_;
     std::filesystem::path                root_;
+    /// Owns the harness's directory tree: declared BEFORE brokers_, so it is destroyed AFTER them, and it also
+    /// runs when the ctor body throws (the destructor of a half-built object never runs).
+    struct RootGuard {
+        std::filesystem::path p;
+        explicit RootGuard(std::filesystem::path path) : p(std::move(path)) {}
+        RootGuard(const RootGuard&)            = delete;
+        RootGuard& operator=(const RootGuard&) = delete;
+        ~RootGuard() { std::error_code ec; std::filesystem::remove_all(p, ec); }
+    } rootGuard_{root_};
     rr::test::FilteringTransport         ft_;
     ClusterHold                          hold_;
     std::vector<std::unique_ptr<Broker>> brokers_;

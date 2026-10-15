@@ -53,7 +53,8 @@ if(BUILD_INTEGRATION_TESTING)
     endif()
     set(CLUSTER_INTEGRATION_TEST_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/integration)
     add_executable(rune_consensus_integration_tests
-        ${CLUSTER_INTEGRATION_TEST_DIR}/ClusterDisasterRecoveryIntegrationTest.cpp)
+        ${CLUSTER_INTEGRATION_TEST_DIR}/ClusterDisasterRecoveryIntegrationTest.cpp
+        ${CLUSTER_INTEGRATION_TEST_DIR}/TempDirHygieneRegressionTest.cpp)
     target_include_directories(rune_consensus_integration_tests PRIVATE
         ${CLUSTER_INTEGRATION_TEST_DIR})
     target_link_libraries(rune_consensus_integration_tests PRIVATE

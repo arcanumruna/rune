@@ -193,7 +193,8 @@ if(BUILD_TESTING)
     # appliers, a fake control side and gateway, the client rules of Task 5) and the
     # 324-cell parameterized unit matrix.  Task 21 (stress) and Task 22 append to it.
     add_executable(rune_catalog_matrix_tests
-        tests/node/CatalogInteractionMatrixRegressionTest.cpp)
+        tests/node/CatalogInteractionMatrixRegressionTest.cpp
+        tests/node/TempDirHygieneRegressionTest.cpp)
     target_include_directories(rune_catalog_matrix_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     target_link_libraries(rune_catalog_matrix_tests PRIVATE
         rune_node

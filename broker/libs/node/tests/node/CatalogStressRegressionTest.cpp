@@ -22,6 +22,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <filesystem>
 #include <cstdlib>
 #include <iostream>
 #include <map>
@@ -30,6 +31,8 @@
 #include <sstream>
 #include <string>
 #include <vector>
+
+#include <unistd.h>
 
 namespace {
 
@@ -198,6 +201,19 @@ void runSeed(uint32_t seed, int steps, SeedReport& rep) {
         std::cerr << o.str() << "\n";
     }
 }
+
+/// I5 leak check: after the whole binary ran, no rune_cluster_<pid>_* tree of this process remains.  The harness
+/// owns its tree through RAII, so even a seed that failed an ASSERT (unwinding through runSeed) must leave none.
+class NoLeakedClusterTreesEnvironment : public testing::Environment {
+public:
+    void TearDown() override {
+        const std::string prefix = "rune_cluster_" + std::to_string(::getpid()) + "_";
+        for (const auto& e : std::filesystem::directory_iterator(std::filesystem::temp_directory_path()))
+            if (e.path().filename().string().rfind(prefix, 0) == 0)
+                ADD_FAILURE() << "a CatalogClusterHarness left its tree behind: " << e.path();
+    }
+};
+[[maybe_unused]] testing::Environment* const kLeakCheck = testing::AddGlobalTestEnvironment(new NoLeakedClusterTreesEnvironment);
 
 } // namespace
 

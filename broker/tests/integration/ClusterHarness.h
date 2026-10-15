@@ -28,6 +28,7 @@
 #include <rune/consensus/Types.h>
 
 #include <cassert>
+#include <cstddef>
 #include <chrono>
 #include <climits>
 #include <deque>
@@ -42,6 +43,8 @@
 #include <utility>
 #include <vector>
 
+#include <unistd.h>
+
 namespace rune::consensus::test {
 
 namespace fs = std::filesystem;
@@ -52,30 +55,46 @@ namespace fs = std::filesystem;
 struct TempDir {
     fs::path dir;
 
+    /// A placeholder that owns nothing (never touches the disk): a later move-assign gives it a real directory.
+    explicit TempDir(std::nullptr_t) noexcept {}
+
     explicit TempDir(std::string_view prefix = "rune_cluster_") {
-        static std::atomic<int> ctr{0};
+        static int ctr = 0;   // single-threaded harness: no atomic (shared-nothing)
         auto ts = std::chrono::steady_clock::now().time_since_epoch().count();
         dir     = fs::temp_directory_path() /
-                  (std::string(prefix) + std::to_string(ts) + "_" +
-                   std::to_string(ctr.fetch_add(1)));
+                  (std::string(prefix) + std::to_string(::getpid()) + "_" + std::to_string(ts) + "_" +
+                   std::to_string(ctr++));
         fs::create_directories(dir);
     }
 
-    ~TempDir() {
-        std::error_code ec;
-        fs::remove_all(dir, ec);
-    }
+    ~TempDir() { removeNow_(); }
 
     // NOT copyable — unique ownership.
     TempDir(const TempDir&)            = delete;
     TempDir& operator=(const TempDir&) = delete;
 
-    // movable
-    TempDir(TempDir&&) noexcept            = default;
-    TempDir& operator=(TempDir&&) noexcept = default;
+    // Movable.  Invariant: every directory a TempDir created is owned by exactly one live TempDir and is removed
+    // when that object dies or is overwritten; a moved-from TempDir owns nothing.
+    TempDir(TempDir&& o) noexcept : dir(std::exchange(o.dir, {})) {}
+    TempDir& operator=(TempDir&& o) noexcept {
+        if (this != &o) {
+            removeNow_();
+            dir = std::exchange(o.dir, {});
+        }
+        return *this;
+    }
 
     std::string nsfPath()  const { return (dir / "nodestate.nsf").string(); }
     std::string termPath() const { return (dir / "termlog.tl").string(); }
+
+private:
+    void removeNow_() noexcept {
+        if (!dir.empty()) {
+            std::error_code ec;
+            fs::remove_all(dir, ec);
+        }
+        dir.clear();
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -117,7 +136,7 @@ struct NodeBundle {
     NodeId id;
 
     // Persistent temp paths (survive restartNode).
-    TempDir tempDir;
+    TempDir tempDir{nullptr};   // a placeholder; the harness ctor assigns the real directory once
 
     // Owned persistence objects — recreated on restart.
     std::unique_ptr<NodeStateFile>      nsf;
