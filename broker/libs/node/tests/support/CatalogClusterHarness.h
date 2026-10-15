@@ -140,6 +140,7 @@ struct ClientOp {
     int64_t                   backoffNs = 0;
     int64_t                   deadlineNs = 0;
     int                       firstCode = -1;
+    CatalogDdlRig::Answer::Kind firstKind = CatalogDdlRig::Answer::Kind::Error;
     std::string               firstMessage;
     int                       afterRedirectCode = -1;
     bool                      captureNext = false;   // the first answer was a Redirect: record the next
@@ -153,7 +154,7 @@ struct ClientOp {
 };
 
 /// What a cell recorded (see CatalogInteractionMatrixRegressionTest.cpp).
-struct CellAnswerFirst { int code = -1; std::string message; };
+struct CellAnswerFirst { int code = -1; std::string message; CatalogDdlRig::Answer::Kind kind = CatalogDdlRig::Answer::Kind::Error; };
 struct CellRun {
     CellAnswerFirst first;
     int afterRedirectCode = -1, finalCode = -1, otherFinalCode = -1, viaLeaderCode = -1, retriedCode = -1;
@@ -164,6 +165,11 @@ struct CellRun {
     int      produceInWindowCode = -1;
     bool     okReleasedOnlyAfterServing = false;
     bool     haltedBrokerStillServesAppliedTopics = false;
+    bool     haltOffsetIsTheTamperedEvent = false;   // R2: the halt names the offset of the event the victim refused
+    bool     appliedEverywhereBeforePlacement = false;   // R7: every live broker's catalog holds the topic, no placement yet
+    int      produceAfterPlacementCode = -1;         // R7 (CreateTopic): a produce on the placed topic
+    bool     historyKeepsBothObjects = false;        // R6: history(name) holds events of the old AND the new objectId
+    bool     transientEmptyAfterRestart = false;     // RestartMidApply x Transient
     bool     everyRequestHadOneTerminalResult = false;
     std::vector<rune::protocol::RequestId> okRequestIds, refusedRequestIds;
     std::string statement;
@@ -207,6 +213,20 @@ private:
     rr::test::FilteringTransport& ft_;
     ClusterHold&                  hold_;
     rr::NodeId                    self_;
+};
+
+/// The AdminIsrChannel stand-in (production: BrokerNode.cpp setIsrChannel(&catalogIsrChannel()); the proposal
+/// travels admin -> control ring -> controller).  The harness's controller step drains the queue.
+class HarnessIsrChannel final : public rr::PartitionTransport {
+public:
+    explicit HarnessIsrChannel(std::deque<rr::AlterIsrMsg>& q) : q_(q) {}
+    bool sendAlterIsr(const rr::AlterIsrMsg& m) override { q_.push_back(m); return true; }
+    // Every other PartitionTransport method is unused on an ISR channel.
+    bool sendFetchRequest(const rr::FetchRequestMsg&) override { return true; }
+    bool sendFetchResponse(rr::NodeId, const rr::FetchResponseMsg&) override { return true; }
+
+private:
+    std::deque<rr::AlterIsrMsg>& q_;
 };
 
 class CatalogClusterHarness {
@@ -287,8 +307,18 @@ public:
             runOps_({&op}, "restart: the op");
             const int64_t offset = eventOffsetOf_(op.rid);
             until_([&] { return checkpointReaches_(otherFollower, offset); }, "restart: broker never persisted the checkpoint");
+            if (ent.persist == cm::Persist::Transient) (void)produce(placementLeader_, kTopic, {1, 2, 3});   // data to lose
             stopBroker(otherFollower);
             restartBroker(otherFollower);
+            // I3: the reconcile at this boot quarantined nothing (a dropped incarnation's dir is retired, never
+            // quarantined; a live topic's dir is kept).
+            if (!broker_(otherFollower).lastReconcile.quarantined.empty())
+                fail_("restart", "the boot reconcile quarantined a topic dir: " +
+                                     broker_(otherFollower).lastReconcile.quarantined.front().string());
+            if (ent.persist == cm::Persist::Transient) {
+                settleControl_();
+                run.transientEmptyAfterRestart = transientEmptyAfterRestart_(otherFollower);
+            }
             all = {&op};
             fillCommon_(run, op);
             break;
@@ -304,16 +334,28 @@ public:
             break;
         }
         case cm::Timing::LeaderChangeMidDdl: {
-            const int next = followerOf_(leader, 0);
+            const int next  = followerOf_(leader, 0);
+            const int third = followerOf_(leader, 1);
             holdHighWatermark(leader);
             const int64_t before = replica(leader).logEndOffset();
             ClientOp& op = cellOp(via);
             until_([&] { return replica(leader).logEndOffset() > before; }, "leader change: the leader never appended");
-            replicateTo({next, followerOf_(leader, 1)});   // the event reaches 2 and 3 ...
+            const int64_t appendedAt = replica(leader).logEndOffset() - 1;
+            replicateTo({next, third});                    // the event reaches 2 and 3 ...
+            if (replica(next).logEndOffset() <= appendedAt)
+                fail_("leader change", "the event never reached the next leader before the move");
             moveCatalogLeadership(next);                   // ... then the leader loses leadership before answering
             releaseHighWatermark();
+            holdHighWatermark(next);                       // the new leader cannot commit its inherited tail yet
+            // Drive the client until its retry reached `next` AND `next` answered NotLeader (the catch-up gate).
+            until_([&] { return answeredByWith_(op, next, kCodeNotLeader); },
+                   "leader change: the retry never met the catch-up gate");
+            if (admin(next).roleName() != "LeaderCatchingUp")
+                fail_("leader change", "the new leader served before catching up");
+            releaseHighWatermark();                        // now the tail commits
             runOps_({&op}, "leader change: the retry");
             if (!okAnswerMatchesLog_(op)) fail_("leader change", "the retry's OK is not the original event's result");
+            if (eventOffsetOf_(op.rid) != appendedAt) fail_("leader change", "the OK'd event is not the original append");
             all = {&op};
             fillCommon_(run, op);
             break;
@@ -334,7 +376,13 @@ public:
                 op->beforeFollowRedirect = stopFollowers;
             }
             runOps_({op}, "below minIsr: the op until the client budget ends");
-            run.produceOnExistingTopicSucceeded = produce(leader, kBase, {1, 2, 3}).code == 0;
+            {   // data-plane isolation from the catalog: the base topic's data replica on the placement leader
+                // appends, and the same pass leaves the __catalog log end untouched.  (The real data path is T22's.)
+                const int64_t catalogLeoBefore = replica(leader).logEndOffset();
+                const ProduceResult pr = produce(placementLeader_, kBase, {1, 2, 3});
+                run.produceOnExistingTopicSucceeded =
+                    pr.code == 0 && pr.offset >= 0 && replica(leader).logEndOffset() == catalogLeoBefore;
+            }
             if (replica(leader).logEndOffset() != logEndBefore)
                 fail_("below minIsr", "an event was appended below minIsr (log end " + std::to_string(logEndBefore) + " -> " +
                                           std::to_string(replica(leader).logEndOffset()) + ") codes=" + [&] {
@@ -382,6 +430,8 @@ public:
             fillCommon_(run, op);
             run.firstVersionOfNewObject = isCreationKind_(kind) ? 1u : versionBeforeOp + 1u;
             if (!isCreationKind_(kind) && versionBeforeOp != 1u) fail_("reuse", "the new object's version chain did not restart at 1");
+            run.objectIdAfter = objectIdOfOp_(op);
+            run.historyKeepsBothObjects = historyHoldsObjects_(targetNameOf_(kind), run.objectIdBefore, run.objectIdAfter);
             break;
         }
         case cm::Timing::CreateRacesPlacement: {
@@ -395,12 +445,20 @@ public:
             }, "placement: the topic was never applied on the leader's broker");
             const int32_t id = *appliedTopicId_(leader, probeName);
             run.produceInWindowCode = probe(leader, id);
+            // Every live broker's catalog holds the topic while no placement committed (applied != placed).
+            until_([&] {
+                for (const auto& br : brokers_)
+                    if (br->alive && !appliedTopicId_(br->id, probeName).has_value()) return false;
+                return !placed_.contains(id);
+            }, "placement: not every broker applied the topic before its placement");
+            run.appliedEverywhereBeforePlacement = !placed_.contains(id);
             if (op.done()) fail_("placement", "the DDL answered before the topic's placement committed");
             const bool visibleInWindow = anyVisibleAnswerFor_(op);
             holdPlacement(false);
             runOps_({&op}, "placement: the op after the placement commits");
             run.okReleasedOnlyAfterServing = !visibleInWindow && okServedAtRelease_(op);
             if (probe(leader, id) != 0) fail_("placement", "the topic does not serve after its placement committed");
+            if (kind == cm::Kind::CreateTopic) run.produceAfterPlacementCode = produce(placementLeader_, kTopic, {1}).code;
             all = {&op};
             fillCommon_(run, op);
             break;
@@ -417,13 +475,74 @@ public:
             run.viaLeaderCode = viaLeaderOp.finalCode();
             all = {&viaLeaderOp, &toHalted};
             fillCommon_(run, toHalted);
-            run.haltedBrokerStillServesAppliedTopics = serving(victim, kBase);
+            {   // the halted broker keeps serving what it applied: the catalog state, the registry AND the placement
+                const auto* base = admin(victim).applier().state().topicByName(kBase);
+                run.haltedBrokerStillServesAppliedTopics =
+                    serving(victim, kBase) && base != nullptr && registryHolds_(victim, base->topicId);
+                const auto* he = admin(victim).applier().haltError();
+                run.haltOffsetIsTheTamperedEvent = he != nullptr && he->offset == eventOffsetOf_(viaLeaderOp.rid);
+            }
             // The objectId / okRequestIds come from the op that succeeded.
             run.objectIdAfter = objectIdOfOp_(viaLeaderOp);
             break;
         }
         }
         finish_(run, all);
+        return run;
+    }
+
+    /// Task 20 fix round 1 (I2): the catalog falls below its minIsr AFTER the leader appended the DDL and BEFORE
+    /// it committed.  Both followers die with the event only in the leader's log; the controller fences the
+    /// ISR.  The client must get the retriable NotLeader (never a Timeout) until its budget ends; once one
+    /// broker returns the same requestId is answered by the ORIGINAL event, never a second one.
+    struct AfterAppendRun {
+        std::vector<int> codes;
+        int      finalCode = -1, retriedCode = -1;
+        int64_t  appendedAt = -1, leaderLogEndAtFence = -1, leaderLogEndAfterBudget = -1;
+        int64_t  firstNotLeaderAfterNs = -1;   // virtual time from the fence to the first NotLeader the client saw
+        uint64_t leaderStarted = 0, leaderAnswered = 0;
+        bool     retryMatchesLog = false;
+        std::size_t eventsWithRid = 0;
+        int64_t  eventOffset = -1;
+    };
+    AfterAppendRun runBelowMinIsrAfterAppend(cm::Kind kind, cm::Via via) {
+        kind_ = kind;
+        const bool typedCreate = (static_cast<int>(via) + static_cast<int>(persist_)) % 2 == 0;
+        const int leader = cur_.leaderNode;
+        const int returning = followerOf_(leader, 0);
+        const int staying   = followerOf_(leader, 1);
+        const std::string statement = std::string(cm::name(kind)) + " " + targetNameOf_(kind);
+        AfterAppendRun run;
+        holdHighWatermark(leader);   // the event cannot commit before the fence
+        const int64_t before = replica(leader).logEndOffset();
+        ClientOp& op = startOp_(makeRequest_(specOf_(kind, typedCreate), freshRid_(), statement),
+                                via == cm::Via::Leader ? leader : returning, statement);
+        until_([&] { return replica(leader).logEndOffset() > before; }, "after-append: the leader never appended");
+        run.appendedAt = replica(leader).logEndOffset() - 1;
+        releaseHighWatermark();      // the followers never saw the event: nothing was parked for them
+        stopBroker(returning);
+        stopBroker(staying);         // the ISR is the leader alone: below minIsr with the event in flight
+        run.leaderLogEndAtFence = replica(leader).logEndOffset();
+        const int64_t fenceAtNs = now_;
+        until_([&] { return std::find(op.codes.begin(), op.codes.end(), static_cast<int>(kCodeNotLeader)) != op.codes.end(); },
+               "after-append: the in-flight DDL was never answered NotLeader");
+        run.firstNotLeaderAfterNs = now_ - fenceAtNs;
+        runOps_({&op}, "after-append: the op until the client budget ends");
+        run.codes = op.codes;
+        run.finalCode = op.finalCode();
+        run.leaderLogEndAfterBudget = replica(leader).logEndOffset();
+        run.leaderStarted = admin(leader).startedCount();
+        run.leaderAnswered = admin(leader).answeredCount();
+        restartBroker(returning);    // one broker returns: the event commits and applies
+        ClientOp& retried = startOp_(op.base, leader, statement);   // the same request, the same requestId
+        retried.rid = op.rid;
+        runOps_({&retried}, "after-append: the retry");
+        run.retriedCode = retried.finalCode();
+        run.retryMatchesLog = okAnswerMatchesLog_(retried);
+        run.eventsWithRid = countEventsWithRequestId(op.rid);
+        run.eventOffset = eventOffsetOf_(op.rid);
+        restartBroker(staying);
+        (void)awaitDigestsEqual(/*excludeHalted=*/true);
         return run;
     }
 
@@ -457,7 +576,10 @@ public:
     /// catches up live; once caught up the controller admits it to the ISR (AlterIsr).
     void restartBroker(int32_t b) {
         if (broker_(b).alive) return;
+        const uint64_t startedBefore = broker_(b).startedTotal, answeredBefore = broker_(b).answeredTotal;   // M5: kept
         brokers_[static_cast<std::size_t>(b - 1)] = open_(b);
+        broker_(b).startedTotal  = startedBefore;
+        broker_(b).answeredTotal = answeredBefore;
         ft_.deisolate(b);
         commitAssignment_();   // its role (follower of the current leader)
         admitWhenCaughtUp_(b);
@@ -601,6 +723,7 @@ public:
         now_ += 1'000'000;
         for (auto& br : brokers_) if (br->alive) (void)br->admin->doWork(now_);
         (void)ft_.pump(now_);
+        controllerStep_();
         controlStep_();
         for (std::size_t k = 0; k < clients_.size(); ++k) stepClient_(*clients_[k]);
     }
@@ -616,6 +739,44 @@ public:
         pump();
     }
     [[nodiscard]] int64_t now() const noexcept { return now_; }
+
+    /// DDLs a broker started / answered over its whole life (the workers torn down by stop / restart included).
+    [[nodiscard]] uint64_t startedTotal(int32_t b) { return broker_(b).startedTotal + (broker_(b).admin ? broker_(b).admin->startedCount() : 0); }
+    [[nodiscard]] uint64_t answeredTotal(int32_t b) { return broker_(b).answeredTotal + (broker_(b).admin ? broker_(b).admin->answeredCount() : 0); }
+
+    /// I4: the persistence the DDL asked for is what every live non-halted broker APPLIED and what its
+    /// TopicRegistry holds.  Topic kinds: topic `t`; view kinds: view `v`, its sink and the source `s`; drop
+    /// kinds: the object is absent.
+    [[nodiscard]] bool persistenceMatches(cm::Kind kind, cm::Persist persist) {
+        settleControl_();
+        const auto want = persist == cm::Persist::Transient ? rune::catalog::Persistence::Transient : rune::catalog::Persistence::Disk;
+        const auto wantMode = persist == cm::Persist::Transient ? PersistenceMode::Transient : PersistenceMode::Disk;
+        for (const auto& br : brokers_) {
+            if (!br->alive || br->admin->applier().halted()) continue;
+            const auto& st = br->admin->applier().state();
+            auto topicOk = [&](const char* name) {
+                const auto* t = st.topicByName(name);
+                if (t == nullptr || t->persistence != want) return false;
+                const rune::node::TopicSpec* spec = br->ctl.reg->topic(t->topicId);
+                return spec != nullptr && spec->persistence == wantMode;
+            };
+            auto viewOk = [&] {
+                const auto* v = st.viewByName(kView);
+                if (v == nullptr || v->def.persistence != want) return false;
+                const rune::node::TopicSpec* spec = br->ctl.reg->topic(v->def.viewTopicId);
+                return spec != nullptr && spec->persistence == wantMode;
+            };
+            switch (kind) {
+            case cm::Kind::DropTopic: if (st.topicByName(kTopic) != nullptr) return false; break;
+            case cm::Kind::DropView:  if (st.viewByName(kView) != nullptr) return false; break;
+            case cm::Kind::CreateView: case cm::Kind::AlterView:
+                if (!viewOk() || !topicOk(kSource)) return false;
+                break;
+            default: if (!topicOk(kTopic)) return false; break;
+            }
+        }
+        return true;
+    }
 
     // ── for the harness's own unit tests ─────────────────────────────────────
     ClientOp& newOpForTest(DdlRequest req, int target) { return startOp_(std::move(req), target, "test"); }
@@ -664,6 +825,7 @@ private:
         int                                   halts = 0;
         std::unique_ptr<rune::storage::Log>   log;
         std::unique_ptr<HoldingLink>          link;
+        std::unique_ptr<HarnessIsrChannel>    isrChannel;
         std::unique_ptr<rr::PartitionReplica> replica;
         SchemaRegistry                        schemas;
         ViewRegistry                          views;
@@ -672,10 +834,14 @@ private:
         rr::NullPartitionTransport            dataLink;
         std::map<int32_t, std::unique_ptr<DataPartition>> data;   // topicId -> partition 0's data replica
         std::deque<std::size_t>               held;               // gated answers (indices into recs_), FIFO
+        rune::node::TopicDirReconciliation    lastReconcile;      // the boot reconcile's result (open_)
+        uint64_t                              startedTotal = 0, answeredTotal = 0;   // of the workers torn down so far
         void tearDown() {
+            if (admin) { startedTotal += admin->startedCount(); answeredTotal += admin->answeredCount(); }
             admin.reset();
             data.clear();
             replica.reset();
+            isrChannel.reset();
             log.reset();
             ctl.reg.reset();
             ctl.queue.clear(); ctl.pending.clear(); ctl.retiring.clear();
@@ -744,31 +910,68 @@ private:
         ++cur_.partitionEpoch;
         commitAssignment_();
     }
+    /// The controller's fencing pass (MetadataService::fenceIsrs_): the dead replica leaves the COMMITTED ISR.
+    /// The catalog leader learns it as a committed assignment (same leader epoch, a new partitionEpoch) - it
+    /// is never told by the harness directly.
     void shrinkIsr_(int32_t b) {
         if (std::find(cur_.isr.begin(), cur_.isr.end(), b) == cur_.isr.end()) return;
         if (b == cur_.leaderNode) fail_("isr", "the leader's own death: the cell moves the leadership first");
         std::vector<int32_t> isr;
         for (int32_t x : cur_.isr) if (x != b) isr.push_back(x);
-        // The fencing pass: a dead replica must prove a validated position again before it can re-enter the
-        // ISR (the leader's own lag clock is an hour here — ISR changes are the controller's).
-        if (broker_(cur_.leaderNode).alive) {
-            std::vector<int32_t> live;
-            for (const auto& br : brokers_) if (br->alive && br->id != b) live.push_back(br->id);
-            broker_(cur_.leaderNode).replica->shrinkIsrToLive(live, now_);
-        }
         alterIsr_(std::move(isr));
     }
+    /// The controller's AlterIsr handler (MetadataService::onAlterIsr, MetadataService.h "onAlterIsr"): the
+    /// proposals the catalog leader queued are validated against the committed assignment and committed or
+    /// answered with the production reject codes.  Bump / report requests never occur in the matrix (every
+    /// role the harness commits is at a fresh epoch or a follower of a known leader) - they fail the cell.
+    void controllerStep_() {
+        while (!alterIsrQ_.empty()) {
+            const rr::AlterIsrMsg m = alterIsrQ_.front();
+            alterIsrQ_.pop_front();
+            if (m.topicId != kCatalogTopicId || m.partition != kCatalogPartition) continue;
+            if (m.leaderId < 1 || m.leaderId > kBrokers || !broker_(m.leaderId).alive) continue;   // its sender is gone
+            if (m.isrCount == rr::AlterIsrMsg::kLeaderEpochBump)
+                fail_("controller", "unexpected epoch-bump / report request from broker " + std::to_string(m.leaderId));
+            auto reply = [&](int16_t code) {
+                rr::AlterIsrResponseMsg r;
+                r.topicId = m.topicId; r.partition = m.partition; r.leaderId = m.leaderId; r.leaderEpoch = m.leaderEpoch;
+                r.partitionEpoch = cur_.partitionEpoch; r.errorCode = code;
+                broker_(m.leaderId).admin->onCatalogAlterIsrResponse(r);
+            };
+            if (cur_.leaderNode != m.leaderId || cur_.leaderEpoch != static_cast<int32_t>(m.leaderEpoch)) {
+                reply(rr::kAlterIsrFencedLeaderEpoch);
+                continue;
+            }
+            if (m.partitionEpoch != cur_.partitionEpoch) { reply(rr::kAlterIsrInvalidUpdateVersion); continue; }
+            std::vector<int32_t> isr;
+            bool hasLeader = false, droppedIneligible = false, malformed = false;
+            for (int i = 0; i < m.isrCount; ++i) {
+                const int32_t n = m.isr[static_cast<std::size_t>(i)];
+                if (n < 1 || n > kBrokers) { malformed = true; break; }
+                if (n == m.leaderId) hasLeader = true;
+                const bool added = std::find(cur_.isr.begin(), cur_.isr.end(), n) == cur_.isr.end();
+                if (added && n != m.leaderId && !broker_(n).alive) { droppedIneligible = true; continue; }   // KIP-841
+                isr.push_back(n);
+            }
+            if (malformed || !hasLeader) { reply(rr::kAlterIsrInvalidRequest); continue; }
+            bool same = isr.size() == cur_.isr.size();
+            for (int32_t n : isr) same = same && std::find(cur_.isr.begin(), cur_.isr.end(), n) != cur_.isr.end();
+            if (same) { reply(droppedIneligible ? rr::kAlterIsrIneligibleReplica : rr::kAlterIsrOk); continue; }
+            alterIsr_(std::move(isr));   // committed: every broker's role message carries the new ISR
+        }
+    }
+    /// A returning broker re-enters the ISR the production way: it fetches until it holds the leader's log,
+    /// the LEADER proposes it (validated in this leadership at >= the join floor), the controller commits the
+    /// AlterIsr - the harness never commits the admission itself.  Only then can the committed prefix (which
+    /// needs the ISR >= minIsr) reach it and its applier catch up.
     void admitWhenCaughtUp_(int32_t b) {
         const int32_t leader = cur_.leaderNode;
-        until_([&] {
-            return broker_(b).replica->logEndOffset() >= broker_(leader).replica->logEndOffset() &&
-                   broker_(b).admin->applier().nextOffset() >= broker_(leader).replica->logEndOffset();
-        }, "broker " + std::to_string(b) + " never caught up with the catalog leader");
-        if (std::find(cur_.isr.begin(), cur_.isr.end(), b) == cur_.isr.end()) {
-            std::vector<int32_t> isr = cur_.isr;
-            isr.push_back(b);
-            alterIsr_(std::move(isr));
-        }
+        until_([&] { return broker_(b).replica->logEndOffset() >= broker_(leader).replica->logEndOffset(); },
+               "broker " + std::to_string(b) + " never fetched up to the catalog leader's log end");
+        until_([&] { return std::find(cur_.isr.begin(), cur_.isr.end(), b) != cur_.isr.end(); },
+               "the leader never proposed the returning broker " + std::to_string(b) + " into the ISR");
+        until_([&] { return broker_(b).admin->applier().nextOffset() >= broker_(leader).replica->logEndOffset(); },
+               "broker " + std::to_string(b) + " never applied the catalog leader's log");
     }
 
     // ── the fake gateway ─────────────────────────────────────────────────────
@@ -863,17 +1066,18 @@ private:
                 for (std::size_t idx : it->second) {
                     if (!recs_[idx].visible || recs_[idx].consumed) continue;
                     recs_[idx].consumed = true;
-                    onAnswer_(op, recs_[idx].a.code, recs_[idx].a.detail);
+                    onAnswer_(op, recs_[idx].a.code, recs_[idx].a.detail, recs_[idx].a.kind);
                     return;
                 }
             }
             if (now_ >= op.deadlineNs) { op.st = ClientOp::Finished{kClientTimeout}; ++op.terminalResults; }
         }
     }
-    void onAnswer_(ClientOp& op, int code, const std::string& message) {
+    void onAnswer_(ClientOp& op, int code, const std::string& message, Answer::Kind kind) {
         op.codes.push_back(code);
         if (op.firstCode == -1) {
             op.firstCode = code;
+            op.firstKind = kind;
             op.firstMessage = message;
             op.captureNext = code == kCodeRedirect;
         } else if (op.captureNext) {
@@ -1132,7 +1336,7 @@ private:
         return e ? e->event.objectId : 0;
     }
     void fillCommon_(CellRun& run, ClientOp& op) {
-        run.first = CellAnswerFirst{op.firstCode, op.firstMessage};
+        run.first = CellAnswerFirst{op.firstCode, op.firstMessage, op.firstKind};
         run.afterRedirectCode = op.afterRedirectCode;
         run.finalCode = op.finalCode();
     }
@@ -1169,6 +1373,49 @@ private:
                 break;
             }
         }
+    }
+    /// RestartMidApply x Transient, for the restarted broker `b`: every transient topic / view sink of its applied
+    /// catalog is registered and serving, holds no data (a transient log is rebuilt empty after a restart), and a
+    /// transient view's definition is back in its ViewRegistry (the re-fold source).  The restarted broker is never
+    /// the placement leader here, so its data partition is absent (nothing was produced to it) or empty.
+    [[nodiscard]] bool transientEmptyAfterRestart_(int32_t b) {
+        Broker& br = broker_(b);
+        const auto& st = br.admin->applier().state();
+        auto emptyServing = [&](int32_t id) {
+            if (!serves_(br, id)) return false;
+            const auto it = br.data.find(id);
+            return it == br.data.end() || it->second->replica->logEndOffset() == 0;
+        };
+        for (const auto* t : st.topics())
+            if (t->persistence == rune::catalog::Persistence::Transient && !emptyServing(t->topicId)) return false;
+        for (const auto* v : st.views()) {
+            if (v->def.persistence != rune::catalog::Persistence::Transient) continue;
+            if (!emptyServing(v->def.viewTopicId) || br.views.byName(v->name) == nullptr) return false;
+        }
+        return true;
+    }
+    /// R6: over the leader's log, history(name) holds events of BOTH objectIds.
+    [[nodiscard]] bool historyHoldsObjects_(const std::string& name, uint64_t before, uint64_t after) {
+        const auto log = readLog_(*broker_(cur_.leaderNode).log);
+        rune::catalog::HistoryFilter f;
+        f.name = name;
+        bool sawBefore = false, sawAfter = false;
+        for (const auto* h : rune::catalog::history(std::span<const rune::catalog::RecordedEvent>(log), f)) {
+            sawBefore = sawBefore || h->event.objectId == before;
+            sawAfter  = sawAfter  || h->event.objectId == after;
+        }
+        return before != after && sawBefore && sawAfter;
+    }
+    /// `broker` answered one of `op`'s sends with `code` (a visible answer).
+    [[nodiscard]] bool answeredByWith_(const ClientOp& op, int broker, int code) {
+        for (const Submission& s : subs_) {
+            if (s.op != op.id || s.broker != broker || s.corr < 0) continue;
+            const auto it = byCorr_.find(s.corr);
+            if (it == byCorr_.end()) continue;
+            for (std::size_t idx : it->second)
+                if (recs_[idx].visible && recs_[idx].a.code == code) return true;
+        }
+        return false;
     }
     [[nodiscard]] bool anyVisibleAnswerFor_(const ClientOp& op) {
         for (const Submission& s : subs_) {
@@ -1416,12 +1663,17 @@ private:
         br->link = std::make_unique<HoldingLink>(ft_, hold_, id);
         NodeConfig nc;
         nc.nodeId = id;
-        // ISR changes are the controller's (the harness's), never a lag across the clock jumps.
+        // ISR changes are the controller's (controllerStep_), never a lag shrink across the clock jumps (the
+        // lag rule is out of scope here: the fencing commit is the controller's, see shrinkIsr_).
         nc.replicaLagMaxMs = 3'600'000;
         nc.fetchIntervalNs = 2'000'000;
         const std::vector<rr::NodeId> all{1, 2, 3};
         br->replica = std::make_unique<rr::PartitionReplica>(makeCatalogPartitionConfig(nc, kBrokers), rr::Role::Follower, 0,
                                                              all, all, br->log.get(), br->link.get());
+        // Controller-managed ISR exactly like production (BrokerNode.cpp: setIsrChannel before any drive): the
+        // replica PROPOSES ISR changes; the harness's controller step commits them (controllerStep_).
+        br->isrChannel = std::make_unique<HarnessIsrChannel>(alterIsrQ_);
+        br->replica->setIsrChannel(br->isrChannel.get());
         ft_.registerReplica(id, br->replica.get());
 
         br->ctl.dataDir = brokerDir.string();
@@ -1460,7 +1712,7 @@ private:
         for (const auto* t : booted.topics()) catalogTopics.push_back(specFrom_(t->name, t->topicId, t->partitions, t->persistence));
         for (const auto* v : booted.views())
             catalogTopics.push_back(specFrom_(v->name, v->def.viewTopicId, v->def.sinkPartitions, v->def.persistence));
-        (void)reconcileTopicDirs(brokerDir.string(), catalogTopics, droppedIds, /*nowUnixSeconds=*/1);
+        br->lastReconcile = reconcileTopicDirs(brokerDir.string(), catalogTopics, droppedIds, /*nowUnixSeconds=*/1);
         br->ctl.reg = std::make_unique<rune::gateway::TopicRegistry>(std::vector<rune::node::TopicSpec>{}, brokerDir.string());
         for (const int32_t dropped : droppedIds) {
             Effect e; e.kind = Effect::Kind::Drop; e.id = dropped;
@@ -1471,6 +1723,7 @@ private:
 
     struct Submission { int op; int broker; int64_t corr; };
 
+    std::deque<rr::AlterIsrMsg>          alterIsrQ_;   // the catalog leader's AlterIsr proposals (first: brokers hold a channel to it)
     std::string                          tag_;
     std::filesystem::path                root_;
     rr::test::FilteringTransport         ft_;

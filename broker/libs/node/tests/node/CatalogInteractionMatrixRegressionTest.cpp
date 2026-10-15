@@ -4,6 +4,7 @@
 #include "support/CatalogMatrixExpectations.h"
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <string>
 #include <vector>
@@ -74,6 +75,21 @@ std::string cellName(const testing::TestParamInfo<Cell>& i) {
            "_" + (i.param.entity.persist == cm::Persist::Disk ? "Disk" : "Transient") + "_" + std::string(cm::name(i.param.timing));
 }
 
+namespace {
+// The matrix's template names are the rig's answer kinds (CatalogMatrixExpectations.h, M4).
+rune::node::test::CatalogDdlRig::Answer::Kind kindOf(cm::Template t) {
+    using K = rune::node::test::CatalogDdlRig::Answer::Kind;
+    switch (t) {
+    case cm::Template::Define:     return K::Define;
+    case cm::Template::Alter:      return K::Alter;
+    case cm::Template::CreateView: return K::CreateView;
+    case cm::Template::Ddl:        return K::Ddl;
+    case cm::Template::Error:      return K::Error;
+    }
+    return K::Error;
+}
+} // namespace
+
 class CatalogInteractionMatrixRegression : public testing::TestWithParam<Cell> {};
 
 TEST_P(CatalogInteractionMatrixRegression, Cell) {
@@ -88,6 +104,8 @@ TEST_P(CatalogInteractionMatrixRegression, Cell) {
     // 1. every answer code, all from cmatrix::expectedCodes (F15/F16 — no code is hard-coded here)
     const cm::ExpectedCodes ec = cm::expectedCodes(c.kind, c.entity, c.timing);
     EXPECT_EQ(run.first.code, ec.first);
+    EXPECT_EQ(run.first.kind, kindOf(cm::expectedFirstTemplate(c.kind, c.entity, c.timing)))   // M4: the first answer's template
+        << "the first answer's response template";
     if (ec.first == 3) EXPECT_EQ(run.first.message, h.leaderClientEndpoint());
     EXPECT_EQ(run.afterRedirectCode, ec.afterRedirect);
     EXPECT_EQ(run.finalCode, ec.final);
@@ -99,16 +117,24 @@ TEST_P(CatalogInteractionMatrixRegression, Cell) {
     case cm::Outcome::NotLeaderUntilBudgetThenOk: EXPECT_TRUE(run.produceOnExistingTopicSucceeded); break;
     case cm::Outcome::OneWinsOneConflict:         EXPECT_EQ(run.okCount, 1); break;
     case cm::Outcome::OkNewObjectId:              EXPECT_NE(run.objectIdAfter, run.objectIdBefore);
-                                                  EXPECT_EQ(run.newVersionAfter, run.firstVersionOfNewObject); break;
-    case cm::Outcome::OkAfterPlacement:           EXPECT_EQ(run.produceInWindowCode, 2);
-                                                  EXPECT_TRUE(run.okReleasedOnlyAfterServing); break;
+                                                  EXPECT_EQ(run.newVersionAfter, run.firstVersionOfNewObject);
+                                                  EXPECT_TRUE(run.historyKeepsBothObjects) << "the history of the name keeps both objects distinct"; break;
+    case cm::Outcome::OkAfterPlacement:           // The window itself is the harness's (applied everywhere, not placed, the probe
+                                                  // answers NotLeader by construction); what production decides: the OK carries the
+                                                  // gate topic id, so it leaves only after the placement, and the topic then serves.
+                                                  EXPECT_EQ(run.produceInWindowCode, 2);
+                                                  EXPECT_TRUE(run.appliedEverywhereBeforePlacement);
+                                                  EXPECT_TRUE(run.okReleasedOnlyAfterServing);
+                                                  if (c.kind == cm::Kind::CreateTopic) EXPECT_EQ(run.produceAfterPlacementCode, 0);
+                                                  break;
     case cm::Outcome::HaltedBrokerInternalOthersOk:
         EXPECT_TRUE(h.applierHalted(3)); EXPECT_EQ(h.haltCounter(3), 1);
-        EXPECT_TRUE(run.haltedBrokerStillServesAppliedTopics); break;
+        EXPECT_TRUE(run.haltedBrokerStillServesAppliedTopics);
+        EXPECT_TRUE(run.haltOffsetIsTheTamperedEvent) << "the halt names the offset of the event the victim refused"; break;
     default: break;
     }
     // 2. every DDL answered exactly once
-    for (int b = 1; b <= 3; ++b) EXPECT_EQ(h.admin(b).startedCount(), h.admin(b).answeredCount()) << "broker " << b;
+    for (int b = 1; b <= 3; ++b) EXPECT_EQ(h.startedTotal(b), h.answeredTotal(b)) << "broker " << b;   // torn-down workers counted
     EXPECT_TRUE(run.everyRequestHadOneTerminalResult);
     // 3. identical catalogs on every running non-halted broker
     EXPECT_TRUE(h.awaitDigestsEqual(/*excludeHalted=*/true));
@@ -119,7 +145,49 @@ TEST_P(CatalogInteractionMatrixRegression, Cell) {
     EXPECT_TRUE(h.historyShows(c.kind, run.objectIdAfter, run.statement, run.okRequestIds));
     // 6. serving iff applied + placed
     EXPECT_TRUE(h.servingMatchesAppliedAndPlaced());
+    // 7. (I4) the persistence asked for is what every broker applied and registered ("Persist changes no outcome")
+    EXPECT_TRUE(h.persistenceMatches(c.kind, c.entity.persist));
+    // 8. (I4) a restarted broker holds its transient objects empty and its transient view's definition
+    if (c.timing == cm::Timing::RestartMidApply && c.entity.persist == cm::Persist::Transient)
+        EXPECT_TRUE(run.transientEmptyAfterRestart);
 }
+
+// ── I2: the catalog falls below its minIsr AFTER the append, BEFORE the commit ─────────────────────────────
+// The leader appended the DDL; both followers die with the event only in the leader's log; the controller
+// fences the ISR.  The in-flight DDL must be answered the retriable NotLeader at once (never a client Timeout),
+// the leader appends nothing more, and after one broker returns the SAME requestId is answered by the ORIGINAL
+// event - never a second one.
+struct AfterAppendCell { cm::Kind kind; cm::Via via; };
+std::vector<AfterAppendCell> afterAppendCells() {
+    std::vector<AfterAppendCell> out;
+    for (int k = 0; k < cm::kKinds; ++k)
+        for (int v = 0; v < 2; ++v) out.push_back({static_cast<cm::Kind>(k), static_cast<cm::Via>(v)});
+    return out;
+}
+std::string afterAppendName(const testing::TestParamInfo<AfterAppendCell>& i) {
+    return std::string(cm::name(i.param.kind)) + "_" + (i.param.via == cm::Via::Leader ? "Leader" : "Follower");
+}
+class CatalogMatrixBelowMinIsrAfterAppendRegression : public testing::TestWithParam<AfterAppendCell> {};
+
+TEST_P(CatalogMatrixBelowMinIsrAfterAppendRegression, InFlightDdlIsAnsweredNotLeaderAndTheRetryIsTheOriginalEventRegression) {
+    const AfterAppendCell c = GetParam();
+    CatalogClusterHarness h(afterAppendName({c, 0}), 3);
+    h.buildPrecondition(c.kind, cm::Persist::Disk);
+    const auto run = h.runBelowMinIsrAfterAppend(c.kind, c.via);
+    EXPECT_NE(std::find(run.codes.begin(), run.codes.end(), 2), run.codes.end()) << "a NotLeader reached the client";
+    EXPECT_EQ(std::count(run.codes.begin(), run.codes.end(), rune::node::test::kClientTimeout), 0) << "never a client Timeout";
+    EXPECT_LT(run.firstNotLeaderAfterNs, 1'000'000'000) << "NotLeader at once after the fence, not after the DDL timeout";
+    EXPECT_EQ(run.finalCode, 2) << "the retry budget ends with an explicit NotLeader";
+    EXPECT_EQ(run.leaderStarted, run.leaderAnswered) << "the in-flight DDL was answered";
+    EXPECT_EQ(run.leaderLogEndAfterBudget, run.leaderLogEndAtFence) << "nothing more was appended below minIsr";
+    EXPECT_EQ(run.retriedCode, 0) << "the retry after one broker returned";
+    EXPECT_TRUE(run.retryMatchesLog);
+    EXPECT_EQ(run.eventsWithRid, 1u) << "exactly one event for the requestId";
+    EXPECT_EQ(run.eventOffset, run.appendedAt) << "the OK is the ORIGINAL append";
+    for (int b = 1; b <= 3; ++b) EXPECT_EQ(h.startedTotal(b), h.answeredTotal(b)) << "broker " << b;
+}
+
+INSTANTIATE_TEST_SUITE_P(AllKinds, CatalogMatrixBelowMinIsrAfterAppendRegression, testing::ValuesIn(afterAppendCells()), afterAppendName);
 
 INSTANTIATE_TEST_SUITE_P(AllCells, CatalogInteractionMatrixRegression, testing::ValuesIn(allCells()), cellName);
 

@@ -162,6 +162,37 @@ TEST(TopicDirReconcileRegression, MarkerNamingANonDroppedIdOrUnattributedDataIsQ
     EXPECT_EQ(r.retired[0], d.path / "dropped" / "3.T");
 }
 
+// Task 20 fix round 1 (I3): a crash between applying a DROP and retiring its dir leaves an UNCLAIMED dir whose
+// marker names the dropped id.  It is retired and purged like a claimed one - never quarantined forever.
+TEST(TopicDirReconcileRegression, UnclaimedDirOfADroppedIdIsRetiredAndPurgedNeverQuarantinedRegression) {
+    TempDataDir d("unclaimeddropped");
+    touch(d.path / "topics" / "t" / "0" / "seg.log", "dropped life");
+    mark(d.path / "topics" / "t", 3);
+    touch(d.path / "topics" / "m" / "topic-id.placeholder");   // not a topic dir at all: left alone
+    mark(d.path / "topics" / "marker", 3);                      // marker only, no partition dir
+    const std::vector<int32_t> dropped = {3};
+    const auto r = rune::node::reconcileTopicDirs(d.path.string(), {}, dropped, kNow);
+    ASSERT_EQ(r.retired.size(), 2u);
+    EXPECT_TRUE(r.quarantined.empty());
+    EXPECT_EQ(r.purged.size(), 2u) << "the retires of this run are purged in it";
+    EXPECT_FALSE(fs::exists(d.path / "topics" / "t"));
+    EXPECT_FALSE(fs::exists(d.path / "topics" / "marker"));
+    EXPECT_FALSE(fs::exists(d.path / "dropped" / "3.t"));
+    EXPECT_FALSE(fs::exists(d.path / "quarantine"));
+}
+
+TEST(TopicDirReconcileRegression, UnclaimedDirWithANonDroppedMarkerIdIsStillQuarantinedRegression) {
+    TempDataDir d("unclaimedlive");
+    touch(d.path / "topics" / "t" / "0" / "seg.log", "unknown life");
+    mark(d.path / "topics" / "t", 9);   // 9 is not dropped, nobody claims "t"
+    const std::vector<int32_t> dropped = {3};
+    const auto r = rune::node::reconcileTopicDirs(d.path.string(), {}, dropped, kNow);
+    EXPECT_TRUE(r.retired.empty());
+    ASSERT_EQ(r.quarantined.size(), 1u);
+    EXPECT_TRUE(quarantineHas(d.path, "t-"));
+    EXPECT_FALSE(fs::exists(d.path / "topics" / "t"));
+}
+
 // B8 + the dropped/ rules: only the entries the catalog marks dropped are purged.
 TEST(TopicDirReconcileRegression, DroppedDirIsPurgedOnlyWhenTheCatalogMarksItsIdDroppedRegression) {
     TempDataDir d("dropped");

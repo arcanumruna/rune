@@ -414,8 +414,10 @@ private:
 
     // An appended event that has not committed within this bound is answered the
     // retriable NotLeader (F13: it may still commit; the retry with the same
-    // requestId dedupes to its result).  An error-path bound, never a convergence gate.
-    static constexpr int64_t kDdlTimeoutNs = 30LL * 1'000'000'000LL;
+    // requestId dedupes to its result).  An error-path bound, never a convergence gate.  It MUST stay below
+    // the client's default DDL deadline (ClientConfig::ddlTimeoutMs = 15 s), or the client times out
+    // (no answer, no retry budget) before this NotLeader can reach it.
+    static constexpr int64_t kDdlTimeoutNs = 10LL * 1'000'000'000LL;
 };
 
 } // namespace rune::node

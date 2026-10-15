@@ -726,6 +726,22 @@ bool AdminWorker::advance_(int64_t nowNs) {
                                     "its result");
         return true;
     }
+    // Spec §5.5 / §9: the catalog fell below its minIsr while this DDL awaited its commit.  The event
+    // cannot commit until a broker returns - answer the retriable NotLeader now (never wait out the
+    // client's 15 s deadline).  updateRole_ then holds the leader in CatchingUp (LEO > HW) until the
+    // event commits and applies, so a retry with the same requestId gets NotLeader until then, and the
+    // original result (dedupe) after - never a second event.
+    if (static_cast<int32_t>(catalogReplica_->isr().size()) <
+        catalogMinIsr(static_cast<std::size_t>(deps_.brokerCount))) {
+        DdlRequest req = std::move(a->req);
+        const int64_t offset = a->offset;
+        inFlight_ = Idle{};
+        spdlog::warn("AdminWorker: the catalog fell below its minIsr while the event at offset {} awaited its "
+                     "commit - answered NotLeader (retriable; a retry with the same requestId gets its result "
+                     "once it commits)", offset);
+        answer_(req, kNotLeader, "the catalog fell below its minIsr while the DDL awaited its commit");
+        return true;
+    }
     if (nowNs - a->startedNs > kDdlTimeoutNs) {
         // F13: the event may still commit — the retriable NotLeader, never
         // Internal.  updateRole_ holds the leader in CatchingUp until it applied it.

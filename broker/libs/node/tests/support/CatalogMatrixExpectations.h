@@ -81,6 +81,27 @@ struct ExpectedCodes { int first, afterRedirect, final, other, viaLeader, retrie
     }
     return {-1, -1, -1, -1, -1, -1};
 }
+/// M4: the response TEMPLATE of a cell's first answer (named like CatalogDdlRig::Answer::Kind; the test maps them).
+/// AdminWorker::respond_ keys on the REQUEST's template id: DefineTopic -> Define, AlterTopic -> Alter,
+/// CreateView -> CreateView, every other kind -> Ddl.  The gateway's own answers (Redirect, the halted broker's
+/// Internal) are plain ErrorResponses.
+enum class Template : uint8_t { Define, Alter, CreateView, Ddl, Error };
+[[nodiscard]] constexpr Template adminTemplate(Kind k) noexcept {
+    switch (k) {
+    case Kind::CreateTopic: case Kind::CreateSchema:      return Template::Define;
+    case Kind::AlterSchema: case Kind::SetCompatibility:  return Template::Alter;
+    case Kind::CreateView:                                return Template::CreateView;
+    case Kind::DropTopic: case Kind::AlterTopicConfig: case Kind::AlterView: case Kind::DropView: return Template::Ddl;
+    }
+    return Template::Ddl;
+}
+[[nodiscard]] constexpr Template expectedFirstTemplate(Kind k, Entity e, Timing t) noexcept {
+    if (expect(k, e, t) == Outcome::NotApplicable) return Template::Error;
+    // A follower answers Redirect (gateway); the halted broker of R2 answers Internal (gateway).  Every other
+    // first answer is the admin worker's, in the request's template.
+    if (t == Timing::FingerprintMismatch || e.via == Via::Follower) return Template::Error;
+    return adminTemplate(k);
+}
 [[nodiscard]] constexpr std::string_view name(Kind k) noexcept {
     constexpr std::string_view n[] = {"CreateTopic", "DropTopic", "AlterTopicConfig", "CreateSchema", "AlterSchema",
                                       "SetCompatibility", "CreateView", "AlterView", "DropView"};

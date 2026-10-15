@@ -113,6 +113,37 @@ TEST(CatalogWritePathRegression, CommitTimeoutAnswersRetriableNotLeaderAndTheRet
     EXPECT_EQ(rig.countEventsWithRequestId(rid), 1u);
 }
 
+// Task 20 fix round 1 (I2): the catalog falls below its minIsr while a DDL awaits its commit.  The event cannot
+// commit until a broker returns, so the answer is the retriable NotLeader AT ONCE (within one pass, never after the
+// DDL timeout - the client's 15 s deadline would pass first); the retry with the same requestId gets the original
+// result once the event committed, never a second event.
+TEST(CatalogWritePathRegression, CatalogBelowMinIsrWhileAwaitingCommitAnswersNotLeaderAtOnceRegression) {
+    CatalogDdlRig rig("wp_below_isr", 3);
+    rig.becomeServingLeader(/*isr=*/{1, 2});              // follower 2 silent: the event stays uncommitted
+    const rune::protocol::RequestId rid{.hi = 0xC11E, .lo = 9};
+    const int64_t corr = rig.submitDefineNoWait({.name = "t", .partitions = 1, .requestId = rid});
+    ASSERT_FALSE(rig.answerFor(corr).has_value()) << "AwaitingCommit";
+    ASSERT_EQ(rig.recordedLog().size(), 1u) << "appended";
+    rig.updateIsr({1});                                    // a committed AlterIsr: the ISR is the leader alone (< minIsr 2)
+    rig.pump();                                            // ONE pass
+    const auto a = rig.answerFor(corr);
+    ASSERT_TRUE(a.has_value()) << "answered within one pass, not after kDdlTimeoutNs";
+    EXPECT_EQ(a->code, 2) << "NotLeader (retriable)";
+    EXPECT_EQ(rig.admin().startedCount(), rig.admin().answeredCount());
+    EXPECT_EQ(rig.recordedLog().size(), 1u) << "nothing more was appended";
+    rig.updateIsr({1, 2});                                 // the follower is back in the ISR ...
+    rig.resumeFollower(2);                                 // ... and fetches: the event commits
+    const auto retry = rig.define({.name = "t", .partitions = 1, .requestId = rid});
+    EXPECT_EQ(retry.code, 0) << "the retry is the original success, not TopicExists";
+    EXPECT_EQ(rig.countEventsWithRequestId(rid), 1u);
+}
+
+// The DDL timeout is below the client's default DDL deadline (ClientConfig::ddlTimeoutMs = 15 s), so the F13
+// NotLeader reaches a default client instead of a Timeout.
+TEST(CatalogWritePathRegression, DdlTimeoutIsBelowTheClientDefaultDeadlineRegression) {
+    EXPECT_LT(rune::node::AdminWorker::ddlTimeoutNs(), 15'000'000'000LL);
+}
+
 // Task 9 fix round 1 (Minor 3): the applier HALTS while a DDL is AwaitingCommit
 // (its event commits, the local apply refuses it): the in-flight DDL is answered
 // Internal — never OK, never left unanswered — and the next DDL is refused too.

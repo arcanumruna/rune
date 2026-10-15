@@ -147,6 +147,25 @@ bool quarantineOne(const fs::path& p, const fs::path& dataDir, const fs::path& c
     return true;
 }
 
+/// Moves a topic dir `c` whose marker names the dropped id `id` to dataDir/dropped/<id>.<name> (purged right
+/// after by purgeDroppedEntries).  false (nothing moved, logged) when the destination is taken or the rename
+/// fails - the caller quarantines instead.  Never deletes.
+bool retireToDropped(const fs::path& c, const fs::path& dataDir, int32_t id, TopicDirReconciliation& result) {
+    const fs::path droppedRoot = dataDir / "dropped";
+    const fs::path dest        = droppedRoot / (std::to_string(id) + "." + c.filename().string());
+    std::error_code dec;
+    fs::create_directories(droppedRoot, dec);
+    const bool free = !dec && !fs::exists(fs::symlink_status(dest, dec));
+    std::error_code mec;
+    if (free) fs::rename(c, dest, mec);
+    if (free && !mec) {
+        spdlog::info("topic-dir reconcile: dir of dropped topic id {} moved to {} (purged below)", id, dest.string());
+        result.retired.push_back(dest);
+        return true;
+    }
+    return false;
+}
+
 /// R1.3 step 0: a dir claimed by a CATALOG topic is opened only by the incarnation that made it.
 void settleClaimedDirs(const fs::path& dataDir, const fs::path& topicsRoot, const fs::path& canonicalRoot,
                        const std::vector<TopicSpec>& catalogTopics, std::span<const int32_t> droppedIds,
@@ -173,20 +192,10 @@ void settleClaimedDirs(const fs::path& dataDir, const fs::path& topicsRoot, cons
         if (valid && m.id == t->topicId && !transient) continue;                 // keep: this incarnation's own dir
         if (!valid && !gw::topicDirHoldsRecords(c)) continue;                    // keep: holds nothing; createTopicAt adopts it
         const bool dropped = valid && std::find(droppedIds.begin(), droppedIds.end(), m.id) != droppedIds.end();
-        if (valid && (m.id != t->topicId || transient) && dropped) {
-            const fs::path droppedRoot = dataDir / "dropped";
-            const fs::path dest        = droppedRoot / (std::to_string(m.id) + "." + fname);
-            std::error_code dec;
-            fs::create_directories(droppedRoot, dec);
-            const bool free = !dec && !fs::exists(fs::symlink_status(dest, dec));
-            std::error_code mec;
-            if (free) fs::rename(c, dest, mec);
-            if (free && !mec) {
-                spdlog::warn("topic-dir reconcile: older incarnation id {} of '{}' moved to {} — the live topic id {} "
-                             "starts empty", m.id, fname, dest.string(), t->topicId);
-                result.retired.push_back(dest);
-                continue;
-            }
+        if (valid && (m.id != t->topicId || transient) && dropped && retireToDropped(c, dataDir, m.id, result)) {
+            spdlog::warn("topic-dir reconcile: older incarnation id {} of '{}' retired — the live topic id {} "
+                         "starts empty", m.id, fname, t->topicId);
+            continue;
         }
         (void)quarantineOne(c, dataDir, canonicalRoot, now, result);
     }
@@ -208,8 +217,7 @@ TopicDirReconciliation reconcileTopicDirs(const std::string& dataDirStr, const s
         if (ec) { purgeDroppedEntries(dataDirStr, droppedIds, result); return result; }
         settleClaimedDirs(dataDir, topicsRoot, canonicalRoot, catalogTopics, droppedIds, nowUnixSeconds, result);
     }
-    purgeDroppedEntries(dataDirStr, droppedIds, result);
-    if (!haveTopics) return result;
+    if (!haveTopics) { purgeDroppedEntries(dataDirStr, droppedIds, result); return result; }
 
     auto claimed = [&](const std::string& n) {
         for (const TopicSpec& t : catalogTopics)
@@ -223,7 +231,8 @@ TopicDirReconciliation reconcileTopicDirs(const std::string& dataDirStr, const s
         const fs::file_status st = it->symlink_status(sec);
         if (sec || fs::is_symlink(st) || !fs::is_directory(st)) continue;   // not a topic dir: left alone
         if (claimed(it->path().filename().string())) continue;
-        if (!isTopicDirLayout(it->path())) {
+        if (!isTopicDirLayout(it->path()) &&
+            rune::gateway::readTopicIdMarker(it->path()).kind != rune::gateway::TopicIdMarker::Kind::Valid) {
             spdlog::info("topic-dir reconcile: leaving '{}' alone (not a recognised topic dir layout)",
                          it->path().string());
             continue;
@@ -233,7 +242,16 @@ TopicDirReconciliation reconcileTopicDirs(const std::string& dataDirStr, const s
     if (ec)
         spdlog::error("topic-dir reconcile: listing '{}' failed: {} — no further dirs considered",
                       topicsRoot.string(), ec.message());
-    for (const fs::path& p : candidates) (void)quarantineOne(p, dataDir, canonicalRoot, nowUnixSeconds, result);
+    for (const fs::path& p : candidates) {
+        const rune::gateway::TopicIdMarker m = rune::gateway::readTopicIdMarker(p);
+        const bool dropped = m.kind == rune::gateway::TopicIdMarker::Kind::Valid &&
+                             std::find(droppedIds.begin(), droppedIds.end(), m.id) != droppedIds.end();
+        // An unclaimed dir of a committed DROP (a crash between the apply and the retire): retired, purged
+        // below - never quarantined.  Anything else unattributed is quarantined.
+        if (dropped && retireToDropped(p, dataDir, m.id, result)) continue;
+        (void)quarantineOne(p, dataDir, canonicalRoot, nowUnixSeconds, result);
+    }
+    purgeDroppedEntries(dataDirStr, droppedIds, result);   // AFTER both loops: this run's retires are purged here
     return result;
 }
 
