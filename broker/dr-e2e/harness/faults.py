@@ -33,6 +33,7 @@ from __future__ import annotations
 import signal
 
 from .dockerutil import run
+from .timing import timed
 
 import hashlib
 
@@ -42,6 +43,7 @@ NETEM_IMAGE = "rune-netem:" + hashlib.sha256(_NETEM_DOCKERFILE.encode()).hexdige
 _NETEM_BUILT = False
 
 
+@timed("image.netem")
 def ensure_netem_image() -> None:
     """Build the tiny alpine+iproute2 sidecar image once per session."""
     global _NETEM_BUILT
@@ -87,6 +89,7 @@ def _netns_exec(broker_cid: str, cmd: list[str], timeout: int = 30):
 # Process / lifecycle faults
 # ---------------------------------------------------------------------------
 
+@timed("fault.kill", 1)
 def kill_node(cluster, service: str, sig=signal.SIGKILL) -> None:
     """Kill a broker container with SIGKILL (crash) or SIGTERM (graceful)."""
     signame = {signal.SIGKILL: "KILL", signal.SIGTERM: "TERM"}.get(sig, str(int(sig)))
@@ -96,6 +99,7 @@ def kill_node(cluster, service: str, sig=signal.SIGKILL) -> None:
     run(["docker", "kill", "--signal", signame, cid], timeout=30, check=True)
 
 
+@timed("fault.pause", 1)
 def pause(cluster, service: str) -> None:
     """Freeze the process (docker pause -> SIGSTOP-equivalent cgroup freeze)."""
     cid = cluster.container_id(service)
@@ -104,6 +108,7 @@ def pause(cluster, service: str) -> None:
     run(["docker", "pause", cid], timeout=30, check=True)
 
 
+@timed("fault.unpause", 1)
 def unpause(cluster, service: str) -> None:
     cid = cluster.container_id(service)
     if not cid:
@@ -111,6 +116,7 @@ def unpause(cluster, service: str) -> None:
     run(["docker", "unpause", cid], timeout=30, check=True)
 
 
+@timed("fault.restart", 1)
 def restart(cluster, service: str) -> None:
     """Stop+start the container (returns after start; leader re-election is the
     caller's concern via cluster.wait_for_leader)."""
@@ -137,12 +143,20 @@ def _netem_spec(loss=None, delay=None, reorder=None, duplicate=None, iface="eth0
     return spec
 
 
+# The services of each compose project that got a qdisc from this harness process (netem / partition): heal_all
+# clears exactly those instead of starting a sidecar for every broker after every test.  Only the harness installs
+# qdiscs, and a recreated container starts without one, so the record is exact.
+_NETEM_DIRTY: dict[str, set[str]] = {}
+
+
+@timed("fault.netem", 1)
 def netem(cluster, service: str, *, loss=None, delay=None, reorder=None,
           duplicate=None, iface="eth0") -> None:
     """Install a netem qdisc on the broker's eth0. Reversible via clear_netem()."""
     cid = cluster.container_id(service)
     if not cid:
         raise RuntimeError(f"no container for {service}")
+    _NETEM_DIRTY.setdefault(cluster.project, set()).add(service)   # before the install: a half-applied one is cleared
     spec = _netem_spec(loss=loss, delay=delay, reorder=reorder,
                        duplicate=duplicate, iface=iface)
     res = _netns_exec(cid, spec)
@@ -150,12 +164,14 @@ def netem(cluster, service: str, *, loss=None, delay=None, reorder=None,
         raise RuntimeError(f"netem failed on {service}: {res.stderr or res.stdout}")
 
 
+@timed("fault.clear_netem", 1)
 def clear_netem(cluster, service: str, iface="eth0") -> None:
     """Remove any netem qdisc from the broker's eth0 (best-effort, reversible)."""
     cid = cluster.container_id(service)
     if not cid:
         return
     _netns_exec(cid, ["tc", "qdisc", "del", "dev", iface, "root"])
+    _NETEM_DIRTY.get(cluster.project, set()).discard(service)
 
 
 def show_netem(cluster, service: str, iface="eth0") -> str:
@@ -184,10 +200,11 @@ def heal(cluster, service: str) -> None:
     clear_netem(cluster, service)
 
 
+@timed("fault.heal_all")
 def heal_all(cluster) -> None:
-    """Best-effort clear of every broker's netem (teardown safety)."""
+    """Best-effort clear of every broker netem this harness installed and has not cleared (teardown safety)."""
     from .cluster import SERVICES
-    for s in SERVICES:
+    for s in [x for x in SERVICES if x in _NETEM_DIRTY.get(cluster.project, set())]:
         try:
             clear_netem(cluster, s)
         except Exception:
@@ -216,6 +233,7 @@ def heal_all(cluster) -> None:
 # SIGKILL via `docker kill`.
 # ---------------------------------------------------------------------------
 
+@timed("fault.kill_client", 0)
 def kill_client_container(name_substr: str, sig: str = "KILL") -> str:
     """Find a running dr-client container matching ``name_substr`` and kill it.
 
@@ -229,8 +247,11 @@ def kill_client_container(name_substr: str, sig: str = "KILL") -> str:
     # docker ps -q --filter name=<substr> returns container ids whose NAME
     # contains the substring (anchored at the start by Docker's filter, so we
     # use the full name prefix where possible).
+    # Only THIS harness process's containers (owner label): a parallel xdist worker's clients are never touched.
+    from .dockerutil import LABEL_OWNER
+    import os
     res = run(
-        ["docker", "ps", "-q", "--filter", f"name={name_substr}"],
+        ["docker", "ps", "-q", "--filter", f"name={name_substr}", "--filter", f"label={LABEL_OWNER}={os.getpid()}"],
         timeout=30,
     )
     ids = res.stdout.strip().splitlines()
@@ -244,6 +265,7 @@ def kill_client_container(name_substr: str, sig: str = "KILL") -> str:
     return target
 
 
+@timed("fault.mtu", 1)
 def set_mtu(cluster, service: str, mtu: int, iface: str = "eth0") -> None:
     """Set the interface MTU inside the broker's network namespace.
 
@@ -332,6 +354,7 @@ def _find_log_files_cmd() -> str:
     return r"find /data -type f \( -name '*.log' -o -name '*.seg' \) | sort"
 
 
+@timed("fault.storage")
 def truncate_log_tail(project: str, service_idx: int, tail_bytes: int = 128) -> None:
     """Remove the last `tail_bytes` bytes from the active log segment of the
     broker node identified by `service_idx` (1-based).
@@ -377,6 +400,7 @@ def truncate_log_tail(project: str, service_idx: int, tail_bytes: int = 128) -> 
         )
 
 
+@timed("fault.storage")
 def corrupt_log_tail(project: str, service_idx: int,
                      corrupt_offset: int = 0, corrupt_length: int = 16) -> None:
     """Overwrite `corrupt_length` bytes at `corrupt_offset` from the END of the
@@ -417,6 +441,7 @@ def corrupt_log_tail(project: str, service_idx: int,
         )
 
 
+@timed("fault.storage")
 def corrupt_log_mid(project: str, service_idx: int,
                     corrupt_offset: int = 64, corrupt_length: int = 16) -> None:
     """Overwrite `corrupt_length` bytes at `corrupt_offset` bytes from the

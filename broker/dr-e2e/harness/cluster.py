@@ -10,6 +10,7 @@ Node id <-> service mapping is fixed by the compose file:
 
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import os
 import re
@@ -17,6 +18,8 @@ import time
 from typing import Sequence
 
 from .dockerutil import Compose, _git_sha, run
+from . import timing
+from .timing import timed
 from .driver import ensure_dr_client_image
 
 # Repo layout: dr-e2e/ lives inside rune-broker/, compose is at ../docker/.
@@ -39,6 +42,33 @@ _QL_RETRY_PAUSE_S = 0.5
 _QL_RETRIABLE_RE = re.compile(r"NotLeader|Redirect|timed out|connection refused|not connected|unreachable", re.I)
 _QL_CREATED_RE = re.compile(r"created topic '([^']*)' topicId=(\d+)")
 _QL_STATEMENT_RE = re.compile(r"^statement (\d+):", re.M)
+
+
+def ql_image() -> str:
+    image = os.environ.get("DR_QL_IMAGE")
+    if image:
+        return image
+    client_repo = os.path.join(_SIBLINGS, "rune-client-cpp")
+    return f"rune-ql-probe:{_git_sha(client_repo)}"
+
+
+_QL_IMAGE_READY: set[str] = set()
+
+
+def ensure_ql_image() -> None:
+    """Build the rune CLI image once per process (session start: harness.images.prepare_all).
+
+    Built from the working tree (the layer cache makes an unchanged tree cheap), so a dirty client tree never runs
+    on a stale image that happens to carry the HEAD sha tag - but no longer once per Cluster.up(): that rebuild-check
+    of the multi-GB builder image cost every test seconds inside its timeout.  DR_QL_IMAGE only names the tag."""
+    from .images import prepared
+    image = ql_image()
+    if image in _QL_IMAGE_READY or prepared():
+        return
+    res = run(["bash", _CREATE_TOPICS_SH, "--build-image"], timeout=1800, env={**os.environ, "QL_IMAGE": image})
+    if not res.ok:
+        raise RuntimeError(f"cannot build the rune CLI image {image}:\n{res.stdout}{res.stderr}")
+    _QL_IMAGE_READY.add(image)
 
 
 class TopicCreationError(RuntimeError):
@@ -170,6 +200,11 @@ class Cluster:
         """
         if isinstance(topics, str):
             raise TypeError("topics is a sequence of 'name:partitions[:options]' specs, not a str")
+        # pytest-xdist: every worker gets its own compose projects (containers, network, volumes), so parallel
+        # workers never share a cluster.  Nothing is published on the host, so there are no port clashes.
+        worker = os.environ.get("PYTEST_XDIST_WORKER")
+        if worker and not project.endswith(f"-{worker}"):
+            project = f"{project}-{worker}"
         self.project = project
         self.topics: tuple[str, ...] = tuple(DEFAULT_TOPICS if topics is None else topics)
         # RUNE_IMAGE_TAG: use the git HEAD SHA so every commit's broker image is
@@ -196,6 +231,7 @@ class Cluster:
 
     # ---- lifecycle --------------------------------------------------------
 
+    @timed("cluster.up")
     def up(self, build: bool = False, leader_timeout: int = 90,
            clean: bool = True) -> "Cluster":
         # Every e2e test brings a Cluster up before any dr client runs: refuse (or build) a stale client image here.
@@ -214,7 +250,8 @@ class Cluster:
         # independent of how the previous run ended.  clean=False opts out.
         if clean:
             self.compose.down()  # `down -v --remove-orphans` — wipes stale volumes
-        if build:
+        from .images import prepared
+        if build and not prepared():   # DR_E2E_BUILD: built once at session start when the session hook ran
             self.compose.build(*SERVICES)
         self.compose.up(*SERVICES, timeout=180)
         self._up = True
@@ -226,12 +263,9 @@ class Cluster:
     # ---- topics (DDL) -----------------------------------------------------
 
     def _ql_image(self) -> str:
-        image = os.environ.get("DR_QL_IMAGE")
-        if image:
-            return image
-        client_repo = os.path.join(_SIBLINGS, "rune-client-cpp")
-        return f"rune-ql-probe:{_git_sha(client_repo)}"
+        return ql_image()
 
+    @timed("topics.create")
     def create_topics(self, specs: Sequence[str], *, deadline_s: float | None = None) -> list[tuple[str, int]]:
         """Create topics by DDL through the `rune ql -f` CLI container on the cluster network.
 
@@ -251,13 +285,11 @@ class Cluster:
         request_id = _request_id(script)
         if deadline_s is None:
             deadline_s = float(os.environ.get("DR_CREATE_TOPICS_DEADLINE_S", "60"))
-        image = self._ql_image()
-        # Always (re)build: the layer cache makes an unchanged tree a few seconds, and a dirty client tree must never
-        # run on a stale image that happens to carry the HEAD sha tag.
-        res = run(["bash", _CREATE_TOPICS_SH, "--build-image"], timeout=1800,
-                  env={**os.environ, "QL_IMAGE": image})
-        if not res.ok:
-            raise TopicCreationError(f"cannot build the rune CLI image {image}:\n{res.stdout}{res.stderr}")
+        image = ql_image()
+        try:
+            ensure_ql_image()
+        except RuntimeError as e:
+            raise TopicCreationError(str(e)) from e
         network = self.compose.network_name()
         seed = f"{SERVICES[0]}:{CLIENT_PORT}"
         deadline = time.time() + deadline_s
@@ -303,6 +335,7 @@ class Cluster:
         raise TopicCreationError(
             f"topics not created within {deadline_s:.0f}s ({attempt} attempts): {statements}\nlast error: {last}")
 
+    @timed("cluster.down")
     def down(self) -> None:
         # Idempotent, best-effort, bounded. Safe to call multiple times.
         self.compose.down()
@@ -326,7 +359,9 @@ class Cluster:
         rather than stalling the loop.  rune_role itself is a fast point read.
         """
         try:
-            res = self.compose.exec(service, "rune_role", timeout=5)
+            # `docker exec` on the compose container name: the same exec as `docker compose exec -T`, without the
+            # compose CLI's ~0.15 s of project parsing per call (a role read is the harness's hottest call).
+            res = run(["docker", "exec", self.container_name(service), "rune_role"], timeout=5)
         except Exception:
             return None
         m = _ROLE_RE.search(res.stdout or "")
@@ -336,6 +371,17 @@ class Cluster:
         node_id = int(m.group(1))
         term = int(m.group(3))
         return role, node_id, term
+
+    def container_name(self, service: str) -> str:
+        """Compose v2's container name for a service of this project (no container_name/scale in the compose file)."""
+        return f"{self.project}-{service}-1"
+
+    def read_roles(self, services: list[str]) -> list[tuple[str, int, int] | None]:
+        """`_read_role` of every service at once (concurrent execs): one poll costs one exec, not three."""
+        if len(services) <= 1:
+            return [self._read_role(s) for s in services]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(services)) as pool:
+            return list(pool.map(self._read_role, services))
 
     def _scan_leader(self, services: list[str]) -> int | None:
         """Return the current leader node id across `services`, or None.
@@ -349,8 +395,7 @@ class Cluster:
         best_leader: int | None = None
         best_term = -1
         any_reading = False
-        for svc in services:
-            reading = self._read_role(svc)
+        for reading in self.read_roles(services):
             if reading is None:
                 continue
             any_reading = True
@@ -374,6 +419,7 @@ class Cluster:
     # only how fast the harness OBSERVES the outcome.)
     _LEADER_POLL_S = 0.2
 
+    @timed("leader.wait")
     def wait_for_leader(self, timeout_s: int = 90, exclude: list[str] | None = None) -> int:
         """Poll the role counters until a leader appears. Returns the leader node id.
 
@@ -392,6 +438,7 @@ class Cluster:
             f"last logs:\n{self.compose.logs(*services, tail=40)}"
         )
 
+    @timed("leader.wait_new")
     def wait_for_new_leader(self, old_leader_svc: str, timeout_s: int = 90) -> int:
         """After killing `old_leader_svc`, wait for a DIFFERENT node to lead.
 
@@ -423,8 +470,69 @@ class Cluster:
                 return s
         raise RuntimeError("no follower found")  # pragma: no cover
 
+    # ---- settling ----------------------------------------------------------
+
+    def converged(self, running: list[str] | None = None) -> int | None:
+        """The leader id when the cluster has settled, else None.
+
+        Settled = every running node reports a role, exactly ONE reports LEADER, and every node reports the leader's
+        term (the followers learned it; a zombie / partitioned ex-leader has stepped down).  `running` (a service
+        list) also requires exactly those services to be running."""
+        actual = self.running_services()
+        if running is not None and sorted(actual) != sorted(running):
+            return None
+        readings = self.read_roles(actual)
+        if not readings or any(r is None for r in readings):
+            return None
+        leaders = [(nid, term) for role, nid, term in readings if role == "LEADER"]
+        if len(leaders) != 1:
+            return None
+        lid, lterm = leaders[0]
+        if any(term != lterm for _, _, term in readings):
+            return None
+        return lid
+
+    def settle(self, max_s: float, *, running: list[str] | None = None, stable_reads: int = 2) -> int | None:
+        """Wait until `converged()` holds for `stable_reads` consecutive polls, at most `max_s` seconds.
+
+        Replaces a fixed `time.sleep(max_s)` that only gave the cluster time to settle before POSITIVE checks (a
+        produce / subscribe must succeed, a single leader must be found): the checks that follow are unchanged, and
+        when the cluster does not converge in time this returns after exactly the old sleep, so the worst case is the
+        old behaviour.  Never use it for an observation window (a sleep during which a fault must NOT happen) - those
+        stay fixed sleeps.  Returns the converged leader id, or None after `max_s`."""
+        with timing.phase("settle", f"max={max_s:g}s") as ph:
+            deadline = time.time() + max_s
+            streak, last = 0, None
+            while True:
+                lid = self.converged(running)
+                streak = streak + 1 if (lid is not None and lid == last) else (1 if lid is not None else 0)
+                last = lid
+                if streak >= stable_reads:
+                    ph.exit = "converged"
+                    return lid
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    ph.exit = "max"
+                    return None
+                time.sleep(min(self._LEADER_POLL_S, remaining))
+
+    def wait_running(self, services: list[str], max_s: float) -> bool:
+        """Poll until exactly `services` are running (at most `max_s`; replaces a fixed sleep before a
+        running-set assertion, which still runs after this).  True when reached."""
+        with timing.phase("wait_running", ",".join(services) or "none") as ph:
+            deadline = time.time() + max_s
+            while True:
+                if sorted(self.running_services()) == sorted(services):
+                    ph.exit = "reached"
+                    return True
+                if time.time() >= deadline:
+                    ph.exit = "max"
+                    return False
+                time.sleep(self._LEADER_POLL_S)
+
     # ---- data-plane readiness --------------------------------------------
 
+    @timed("dataplane.ready")
     def wait_data_plane_ready(self, max_attempts: int = 5, timeout_s: int = 60,
                               topics: str = "events:0:1") -> str:
         """Block until the data plane (Aeron media driver + broker ingress) is
@@ -492,6 +600,7 @@ class Cluster:
             f"last output:\n{last_err}"
         )
 
+    @timed("serving_node")
     def serving_node(self, timeout_s: int = 60) -> str:
         """Return a node that actually SERVES produce (data-plane ready).
 
@@ -534,12 +643,14 @@ class Cluster:
     # ---- introspection ----------------------------------------------------
 
     def running_services(self) -> list[str]:
+        # The compose labels directly (what `docker compose ps --services --filter status=running` reads), without
+        # the compose CLI start-up per call.
         out = run(
-            ["docker", "compose", "-f", COMPOSE_FILE, "-p", self.project, "ps",
-             "--services", "--filter", "status=running"],
+            ["docker", "ps", "--filter", f"label=com.docker.compose.project={self.project}",
+             "--filter", "status=running", "--format", '{{.Label "com.docker.compose.service"}}'],
             timeout=30,
         ).stdout
-        return [s for s in out.split() if s in SERVICES]
+        return sorted(s for s in set(out.split()) if s in SERVICES)
 
     def container_id(self, service: str) -> str | None:
         return self.compose.container_id(service)

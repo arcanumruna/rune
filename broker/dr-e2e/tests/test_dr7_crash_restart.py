@@ -52,7 +52,7 @@ import pytest
 
 from harness import faults
 from harness.cluster import SERVICES, node_id_to_service
-from harness.driver import Results, run_clients
+from harness.driver import DRAIN_QUIET_MS, Results, run_clients
 from harness.invariants import (
     assert_exactly_once,
     assert_no_committed_loss,
@@ -108,7 +108,7 @@ def _produce(cluster, target_svc: str, n: int, cid_base: int, records: int,
 
 
 def _subscribe_all(cluster, target_svc: str, cid_base: int, keys: int,
-                   window_ms: int = 60000) -> Results:
+                   window_ms: int = 60000, drain_quiet_ms: int = DRAIN_QUIET_MS) -> Results:
     """Subscribe-from-earliest on `target_svc` and drain the whole partition set.
 
     Used to assert the committed set survived: a single subscriber reads every
@@ -127,6 +127,7 @@ def _subscribe_all(cluster, target_svc: str, cid_base: int, keys: int,
         expect=0,                  # drain window; don't require a fixed count
         from_="earliest",
         subscribe_ms=window_ms,
+        drain_quiet_ms=drain_quiet_ms,   # stop once the static log is fully read (driver._drain_complete)
         timeout_ms=_CONNECT_MS,
         start_stagger_ms=_STAGGER_MS,
     )
@@ -226,6 +227,7 @@ def test_dr7_follower_crash_restart_catchup(fresh_cluster, follower_idx, rep):
     faults.kill_node(cluster, crash_svc, signal.SIGKILL)
 
     # Brief wait for the leader to detect ISR shrinkage (ISR -> leader + other follower).
+    # KEPT fixed: the "leader unexpectedly went down" check below is an observation window after the kill.
     time.sleep(3.0)
 
     running = cluster.running_services()
@@ -252,9 +254,9 @@ def test_dr7_follower_crash_restart_catchup(fresh_cluster, follower_idx, rep):
     faults.restart(cluster, crash_svc)
 
     # Give the rejoined follower time to fetch missed segments and advance its HW.
-    # Generous sleep: the crash_svc must replicate `records_during` records over
-    # the Aeron IPC/UDP replication channel before re-entering the ISR.
-    time.sleep(10.0)
+    # Was a fixed 10 s sleep: now until all 3 run and agree on one leader + term, at most 10 s.  Every check below
+    # (running set, single leader, full delivery, ISR-healed produce) is unchanged.
+    cluster.settle(10.0, running=list(SERVICES))
 
     # All 3 nodes must now be running.
     running = cluster.running_services()
@@ -341,6 +343,8 @@ def test_dr7_leader_crash_restart_rejoins_follower(fresh_cluster, rep):
     # Give it time to catch up (replicate pre-kill segments + new records from
     # new leader).  The new leader must remain the SINGLE leader — the restarted
     # old node must NOT re-declare itself leader.
+    # KEPT fixed: an observation window - the restarted old leader gets the full 10 s to (wrongly) re-elect itself
+    # before the "current leader == new leader" check.
     time.sleep(10.0)
 
     running = cluster.running_services()
@@ -427,6 +431,7 @@ def test_dr7_sigterm_vs_sigkill_parity(fresh_cluster, sig, label):
     faults.kill_node(cluster, follower_svc, sig)
 
     # Brief wait for leader to recognise ISR shrinkage.
+    # KEPT fixed: the "leader unexpectedly went down" check below is an observation window after the signal.
     time.sleep(3.0)
 
     running = cluster.running_services()
@@ -440,7 +445,7 @@ def test_dr7_sigterm_vs_sigkill_parity(fresh_cluster, sig, label):
 
     # ── Restart the stopped follower ──────────────────────────────────────────
     faults.restart(cluster, follower_svc)
-    time.sleep(8.0)
+    cluster.settle(8.0, running=list(SERVICES))   # was a fixed 8 s sleep before the positive checks below
 
     running = cluster.running_services()
     assert follower_svc in running, (
@@ -522,10 +527,10 @@ def test_dr7_full_cluster_cold_restart(fresh_cluster):
     # last surviving node panics / tries to flush to a non-existent quorum.
     for svc in SERVICES:
         faults.kill_node(cluster, svc, signal.SIGKILL)
-        time.sleep(0.5)
+        time.sleep(0.5)   # KEPT: the inter-kill gap is part of the scenario (sequential crash of all 3)
 
-    # Verify all nodes are down.
-    time.sleep(3.0)
+    # Verify all nodes are down (`docker kill` returns once the container is dead; was a fixed 3 s sleep).
+    cluster.wait_running([], 3.0)
     running = cluster.running_services()
     assert len(running) == 0, (
         f"expected 0 running nodes after killing all 3, got {running}"
@@ -537,7 +542,7 @@ def test_dr7_full_cluster_cold_restart(fresh_cluster):
     # proceed as soon as a quorum is up.
     for svc in SERVICES:
         cluster.compose.start(svc)
-        time.sleep(0.3)   # stagger slightly to avoid thundering-herd on startup
+        time.sleep(0.3)   # KEPT: stagger slightly to avoid thundering-herd on startup (scenario shape)
 
     # Wait for a new leader — generous timeout for cold-start (disk replay + election).
     new_lid = cluster.wait_for_leader(timeout_s=120)

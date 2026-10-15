@@ -88,13 +88,13 @@ The suite uses a **single compose project** (`rune-dr` for session-cluster, `run
 
 - **acks=All** — majority-durable: every acked record is flushed to a quorum of ISR nodes before the `ProduceResponse` is sent (GR-9 / Milestone C).
 - **acks=Leader** — leader-page-cache-durable: records are acknowledged after a group-commit (~10 ms window) on the leader only; a small tail may be un-replicated at hard crash.
-- **CID window** — each ticket uses a disjoint integer range for client IDs (cid) so that records from different test runs never intermingle on the session-scoped cluster log.
+- **CID window** — each ticket uses a disjoint integer range for client IDs (cid) so that records from different test runs never intermingle on the shared (module-scoped) cluster log.
 
 ---
 
 ### DR-1 — Baseline parametric matrix
 
-**Fixture:** `cluster` (session-scoped)  
+**Fixture:** `cluster` (module-scoped)  
 **Markers:** `baseline`  
 **CID window:** `n * 1000` (n = run counter, max ~16 000)
 
@@ -113,7 +113,7 @@ The suite uses a **single compose project** (`rune-dr` for session-cluster, `run
 
 ### DR-2 — Multi-client concurrent baseline
 
-**Fixture:** `cluster` (session-scoped)  
+**Fixture:** `cluster` (module-scoped)  
 **Markers:** `baseline` (quick matrix), `soak` (heavy matrix)  
 **CID window:** `100 000 + n * 2000`
 
@@ -436,7 +436,7 @@ This is the **primary durability invariant**. For `acks=All` it is iron-clad (GR
 
 > For each `(subscribing client, source key)` pair, delivered records arrive in strictly increasing `seq` order.
 
-- Scoped to the current run's records only (filtered by `run_rids` membership, which uses per-run disjoint CID windows to exclude records from earlier cases on the session-scoped cluster).
+- Scoped to the current run's records only (filtered by `run_rids` membership, which uses per-run disjoint CID windows to exclude records from earlier cases on the shared (module-scoped) cluster).
 - Checks each subscribing client's own delivered stream independently.
 - Fails immediately on the first out-of-order `seq` with context.
 

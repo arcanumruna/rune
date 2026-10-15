@@ -70,7 +70,7 @@ import pytest
 
 from harness import faults
 from harness.cluster import node_id_to_service
-from harness.driver import Results, run_clients
+from harness.driver import DRAIN_QUIET_MS, Results, run_clients
 from harness.invariants import (
     assert_exactly_once,
     assert_no_committed_loss,
@@ -127,7 +127,7 @@ def _produce(cluster, target_svc: str, n: int, cid_base: int, records: int,
 
 
 def _subscribe_all(cluster, target_svc: str, cid_base: int, keys: int,
-                   window_ms: int = 90_000, timeout_s: int = 240) -> Results:
+                   window_ms: int = 90_000, drain_quiet_ms: int = DRAIN_QUIET_MS, timeout_s: int = 240) -> Results:
     """Subscribe-from-earliest and drain the whole partition set."""
     return run_clients(
         1,
@@ -142,6 +142,7 @@ def _subscribe_all(cluster, target_svc: str, cid_base: int, keys: int,
         expect=0,                  # drain; don't require a fixed count
         **{"from": "earliest"},
         subscribe_ms=window_ms,
+        drain_quiet_ms=drain_quiet_ms,   # stop once the static log is fully read (driver._drain_complete)
         timeout_ms=_CONNECT_MS,
         start_stagger_ms=_STAGGER_MS,
     )
@@ -338,7 +339,7 @@ def test_dr13_reconnect_storm(fresh_cluster, n_storm_clients):
     t.start()
 
     # Let production get going, then kill the leader mid-flight.
-    time.sleep(3.0)
+    time.sleep(3.0)   # KEPT: the kill must land mid-produce (scenario timing)
     faults.kill_node(cluster, leader_svc)
 
     # Wait for re-election on the majority (exclude the dead leader's logs).
@@ -623,7 +624,7 @@ def test_dr13_client_crash_mid_produce(fresh_cluster):
     t.start()
 
     # Wait for the client to start and be visible in `docker ps`.
-    time.sleep(4.0)
+    time.sleep(4.0)   # KEPT: the client must be mid-produce when it is killed (scenario timing)
 
     # Kill the client container.  The container name prefix is "dr-client-" —
     # kill_client_container will find the first matching running container.

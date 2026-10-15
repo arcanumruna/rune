@@ -213,7 +213,7 @@ def test_cg_rebalance_member_leave(fresh_cluster, members):
     )
 
     # Brief gap so phase-1 members fully exit (triggers session expiry / rebalance).
-    time.sleep(3.0)
+    time.sleep(3.0)   # KEPT: scenario - phase-1 members must have exited (session expiry) before phase 2
 
     # Phase 2: (M-1) surviving members re-join — coordinator rebalances all
     # partitions to the smaller group.

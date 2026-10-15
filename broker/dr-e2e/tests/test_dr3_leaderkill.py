@@ -35,7 +35,7 @@ import threading
 import pytest
 
 from harness import faults
-from harness.driver import Results, run_clients
+from harness.driver import DRAIN_QUIET_MS, Results, run_clients
 from harness.invariants import (
     assert_exactly_once,
     assert_no_committed_loss,
@@ -61,7 +61,7 @@ _STAGGER_MS = 400
 
 
 def _subscribe_all(cluster, target_svc: str, cid_base: int, keys: int,
-                   window_ms: int = 60000) -> Results:
+                   window_ms: int = 60000, drain_quiet_ms: int = DRAIN_QUIET_MS) -> Results:
     """Subscribe-from-earliest on `target_svc` and drain the whole partition set.
 
     Used to verify the committed set survived: a single subscriber reads every
@@ -80,6 +80,7 @@ def _subscribe_all(cluster, target_svc: str, cid_base: int, keys: int,
         expect=0,                 # drain the window; don't require a fixed count
         from_="earliest",
         subscribe_ms=window_ms,
+        drain_quiet_ms=drain_quiet_ms,   # stop once the static log is fully read (driver._drain_complete)
         timeout_ms=_CONNECT_MS,
         start_stagger_ms=_STAGGER_MS,
     )

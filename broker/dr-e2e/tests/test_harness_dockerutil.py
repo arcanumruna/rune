@@ -107,7 +107,7 @@ def drv(monkeypatch):
     monkeypatch.setattr(dockerutil, "_git_sha", lambda repo: _SHA)
 
     def load(**env):
-        for k in ("DR_CLIENT_IMAGE", "DR_ALLOW_STALE_CLIENT_IMAGE"):
+        for k in ("DR_CLIENT_IMAGE", "DR_ALLOW_STALE_CLIENT_IMAGE", "DR_IMAGES_PREPARED"):
             monkeypatch.delenv(k, raising=False)
         for k, v in env.items():
             monkeypatch.setenv(k, v)
@@ -187,3 +187,114 @@ def test_a_failed_client_image_build_raises(drv, monkeypatch):
     monkeypatch.setattr(d, "run", _Runs(build_rc=1))
     with pytest.raises(RuntimeError):
         d.ensure_dr_client_image()
+
+
+def test_the_client_image_is_built_once_per_process_not_per_cluster_up(drv, monkeypatch):
+    d = drv()
+    r = _Runs()
+    monkeypatch.setattr(d, "run", r)
+    d.ensure_dr_client_image()
+    d.ensure_dr_client_image()
+    assert len(r.builds()) == 1
+
+
+def test_the_client_image_build_is_skipped_when_the_session_prepared_it(drv, monkeypatch):
+    d = drv(DR_IMAGES_PREPARED="1")
+    r = _Runs()
+    monkeypatch.setattr(d, "run", r)
+    d.ensure_dr_client_image()
+    assert not r.calls
+
+
+# ---- drain stop: a verification read of a static log ends once it is complete ---------------------------------
+
+def test_drain_stops_only_after_every_partition_delivered_and_the_quiet_period():
+    stop = driver._drain_complete(5.0, 0, 3)
+    lines = ["CLIENT: connected\n"]
+    assert not stop(lines, 0.0)
+    assert not stop(lines, 100.0), "nothing delivered: the full window is kept"
+    lines += ["DELIVERED cid=1 key=1 seq=0 part=0 offset=0\n", "DELIVERED cid=1 key=2 seq=0 part=1 offset=0\n"]
+    assert not stop(lines, 101.0)
+    assert not stop(lines, 200.0), "partition 2 never delivered: the full window is kept"
+    lines += ["DELIVERED cid=1 key=3 seq=0 part=2 offset=0\n"]
+    assert not stop(lines, 201.0)
+    assert not stop(lines, 205.9)
+    assert stop(lines, 206.0)
+
+
+def test_drain_quiet_period_restarts_on_every_record():
+    stop = driver._drain_complete(5.0, 0, 1)
+    lines = ["DELIVERED cid=1 key=1 seq=0 part=0 offset=0\n"]
+    assert not stop(lines, 0.0)
+    lines.append("DELIVERED cid=1 key=1 seq=1 part=0 offset=1\n")
+    assert not stop(lines, 4.0)
+    assert not stop(lines, 8.9)
+    assert stop(lines, 9.0)
+
+
+def test_run_until_stops_the_container_and_reports_it(monkeypatch):
+    removed = []
+    monkeypatch.setattr(dockerutil, "_remove_labelled", lambda label, timeout=60: removed.append(label) or [])
+    seen = []
+
+    def stop_when(lines, now):
+        seen.extend(lines[len(seen):])
+        return any("tick 3" in l for l in seen)
+
+    res = dockerutil.run_until(["bash", "-c", "for i in 1 2 3 4 5 6 7 8 9; do echo tick $i; sleep 1; done"],
+                               timeout=30, stop_when=stop_when)
+    assert "tick 3" in res.stdout and "tick 9" not in res.stdout
+    assert res.ok   # bash is not a `docker run`: no label to remove, but the process is stopped
+
+
+# ---- a hung client keeps its acked records (never an empty, vacuously-passing result) -------------------------
+
+def test_a_hung_client_returns_its_partial_acks_as_a_failed_result(monkeypatch):
+    out = ("PRODUCED cid=7 key=1 seq=0 part=0 offset=0\nPRODUCED cid=7 key=1 seq=1 part=0 offset=1\n")
+
+    def hang(args, *, timeout=120, check=False, env=None):
+        raise dockerutil.CommandTimeout("timed out", stdout=out, stderr="", timeout=timeout)
+
+    monkeypatch.setattr(driver, "run", hang)
+    monkeypatch.setattr(driver, "run_until", lambda args, *, timeout, stop_when, **kw: hang(args, timeout=timeout))
+    with pytest.warns(driver.ClientHangWarning):
+        res = driver.run_clients(1, network="n", target_service="rune-1", cid_base=7, mode="produce", timeout_s=5)
+    assert not res.ok
+    assert [m.seq for m in res.all_produced] == [0, 1]
+    assert res.clients[0].exit_code == 124 and "HANG" in res.clients[0].raw
+
+
+def test_run_raises_command_timeout_with_the_partial_output():
+    with pytest.raises(dockerutil.CommandTimeout) as ei:
+        dockerutil.run(["bash", "-c", "echo before; sleep 5"], timeout=1)
+    assert "before" in ei.value.stdout
+    assert isinstance(ei.value, TimeoutError)
+
+
+def test_producer_stall_needs_two_deadlines_without_an_ack():
+    stop = driver._producer_stalled(90.0)
+    lines = ["CLIENT: connecting...\n"]
+    assert not stop(lines, 0.0)
+    assert not stop(lines, 89.0)
+    lines.append("PRODUCED cid=1 key=0 seq=0 part=0 offset=0\n")
+    assert not stop(lines, 89.5), "an ack restarts the stall clock"
+    lines.append("CLIENT: FAIL produce cid=1 seq=1 TIMEOUT\n")
+    assert not stop(lines, 150.0), "a failure line is not progress, but the clock started at the last ack"
+    assert stop(lines, 179.5)
+
+
+def test_a_stalled_producer_is_a_failed_result_with_its_acks(monkeypatch):
+    out = "PRODUCED cid=3 key=0 seq=0 part=0 offset=0\nCLIENT: FAIL produce cid=3 seq=1 TIMEOUT\n"
+    monkeypatch.setattr(driver, "run_until", lambda args, *, timeout, stop_when, **kw: dockerutil.StreamResult(
+        args=args, returncode=0, stdout=out, stderr="", stopped_by_harness=True))
+    with pytest.warns(driver.ClientHangWarning):
+        res = driver.run_clients(1, network="n", target_service="rune-1", cid_base=3, mode="produce", timeout_s=5)
+    assert not res.ok and res.clients[0].exit_code == 124 and "STALL" in res.clients[0].raw
+    assert [m.seq for m in res.all_produced] == [0]
+
+
+def test_a_rate_limited_producer_gets_a_rate_derived_envelope():
+    env = {"RUNE_RATE_HZ": "40", "RUNE_RECORDS": "200", "RUNE_TIMEOUT_MS": "40000"}
+    assert driver._producer_envelope(env, 240) == int(200 / 40 + 40 + driver.RATE_ENVELOPE_GRACE_S) + 1
+    assert driver._producer_envelope(env, 60) == 61, "the caller's timeout_s still caps it"
+    assert driver._producer_envelope({**env, "RUNE_RATE_HZ": "0"}, 240) == 240, "unlimited producers keep timeout_s"

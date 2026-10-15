@@ -29,6 +29,7 @@ from collections import defaultdict
 from typing import TYPE_CHECKING
 
 from .driver import GroupResults, Msg, Results
+from .timing import timed
 
 if TYPE_CHECKING:
     from .driver import TxnResult
@@ -123,6 +124,7 @@ def assert_exactly_once(results: Results) -> None:
         )
 
 
+@timed("assert.single_leader")
 def assert_single_leader(cluster, timeout_s: int = 30) -> int:
     """At most one node claims leadership at the current (highest) term.
 
@@ -154,8 +156,7 @@ def assert_single_leader(cluster, timeout_s: int = 30) -> int:
     while True:
         leader_claims = {}
         any_reading = False
-        for svc in running:
-            reading = cluster._read_role(svc)
+        for reading in cluster.read_roles(running):
             if reading is None:
                 continue
             any_reading = True

@@ -50,7 +50,7 @@ import pytest
 
 from harness import faults
 from harness.cluster import SERVICES, node_id_to_service
-from harness.driver import Results, run_clients
+from harness.driver import DRAIN_QUIET_MS, Results, run_clients
 from harness.invariants import (
     assert_exactly_once,
     assert_no_committed_loss,
@@ -102,7 +102,7 @@ def _produce(cluster, target_svc: str, n: int, cid_base: int, records: int,
 
 
 def _subscribe_all(cluster, target_svc: str, cid_base: int, keys: int,
-                   window_ms: int = 90000) -> Results:
+                   window_ms: int = 90000, drain_quiet_ms: int = DRAIN_QUIET_MS) -> Results:
     """Subscribe-from-earliest and drain the whole partition set.
 
     window_ms is intentionally generous (default 90s) because netem loss +
@@ -121,6 +121,7 @@ def _subscribe_all(cluster, target_svc: str, cid_base: int, keys: int,
         expect=0,                  # drain; don't require a fixed count
         from_="earliest",
         subscribe_ms=window_ms,
+        drain_quiet_ms=drain_quiet_ms,   # stop once the static log is fully read (driver._drain_complete)
         timeout_ms=_CONNECT_MS,
         start_stagger_ms=_STAGGER_MS,
     )
@@ -221,6 +222,7 @@ def test_dr6_follower_lossy(fresh_cluster, netem_ready, loss_pct, delay_ms, rep)
         faults.netem(cluster, follower_svc, **netem_kwargs)  # type: ignore[arg-type]
 
         # Brief settle — give Aeron's loss-detection a moment to observe the link.
+        # KEPT fixed: the produce must run on an already-degraded link (part of the scenario).
         time.sleep(2.0)
 
         # ── Sustained produce during follower loss ────────────────────────────
@@ -271,8 +273,9 @@ def test_dr6_follower_lossy(fresh_cluster, netem_ready, loss_pct, delay_ms, rep)
         faults.heal_all(cluster)
 
     # ── Convergence: give the follower time to catch up ───────────────────────
-    # After netem clear the follower will reconnect and fetch missed records.
-    time.sleep(10.0)
+    # After netem clear the follower will reconnect and fetch missed records (was a fixed 10 s sleep; the checks
+    # below are unchanged and only require a single leader + delivery).
+    cluster.settle(10.0, running=list(SERVICES))
     assert_single_leader(cluster)
 
     # ── Delivery invariants — the hard guarantees regardless of election ───────
@@ -399,7 +402,7 @@ def test_dr6_leader_lossy(fresh_cluster, netem_ready, loss_pct, delay_ms, rep):
         # ── Inject netem on the LEADER's link ────────────────────────────────
         faults.netem(cluster, leader_svc, loss=loss_pct, delay=delay_ms)
 
-        # Brief settle.
+        # Brief settle.  KEPT fixed: the produce must run on an already-degraded link (part of the scenario).
         time.sleep(2.0)
 
         # ── Sustained produce while leader link is lossy ──────────────────────
@@ -458,8 +461,8 @@ def test_dr6_leader_lossy(fresh_cluster, netem_ready, loss_pct, delay_ms, rep):
         # Always heal.
         faults.heal_all(cluster)
 
-    # ── Convergence after heal ────────────────────────────────────────────────
-    time.sleep(10.0)
+    # ── Convergence after heal (was a fixed 10 s sleep) ─────────────────────────
+    cluster.settle(10.0, running=list(SERVICES))
     assert_single_leader(cluster)
 
     # ── Delivery invariants — HARD guarantees ─────────────────────────────────

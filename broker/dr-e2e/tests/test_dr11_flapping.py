@@ -70,7 +70,7 @@ import pytest
 
 from harness import faults
 from harness.cluster import SERVICES, node_id_to_service
-from harness.driver import Results, run_clients
+from harness.driver import DRAIN_QUIET_MS, Results, run_clients
 from harness.invariants import (
     assert_exactly_once,
     assert_no_committed_loss,
@@ -130,7 +130,7 @@ def _produce(cluster, target_svc: str, n: int, cid_base: int,
 
 
 def _subscribe_all(cluster, target_svc: str, cid_base: int, keys: int,
-                   window_ms: int = 90000) -> Results:
+                   window_ms: int = 90000, drain_quiet_ms: int = DRAIN_QUIET_MS) -> Results:
     """Subscribe-from-earliest and drain the full partition set."""
     return run_clients(
         1,
@@ -145,6 +145,7 @@ def _subscribe_all(cluster, target_svc: str, cid_base: int, keys: int,
         expect=0,                  # drain; don't require a fixed count
         from_="earliest",
         subscribe_ms=window_ms,
+        drain_quiet_ms=drain_quiet_ms,   # stop once the static log is fully read (driver._drain_complete)
         timeout_ms=_CONNECT_MS,
         start_stagger_ms=_STAGGER_MS,
     )
@@ -306,7 +307,7 @@ def test_dr11_flapping_leader(fresh_cluster, netem_ready):
 
             # Wait for the majority to detect the silent leader and re-elect.
             # electionTimeoutMs = 150 ms; 1.5 s = 10× → election definitely completes.
-            time.sleep(_FLAP_PARTITION_S)
+            time.sleep(_FLAP_PARTITION_S)   # KEPT: fault duration (partition length of a flap)
 
             # Invariant A: the isolated ex-leader MUST NOT serve writes.
             _assert_isolated_leader_cannot_serve(cluster, leader_svc, majority_svcs)
@@ -315,7 +316,7 @@ def test_dr11_flapping_leader(fresh_cluster, netem_ready):
             faults.heal(cluster, leader_svc)
 
             # Give the rejoining node time to step down via higher-term heartbeat.
-            time.sleep(_FLAP_HEAL_SETTLE_S)
+            time.sleep(_FLAP_HEAL_SETTLE_S)   # KEPT: flap rhythm (heal time between flaps)
 
             # Identify the CURRENT leader (may have changed during the partition).
             new_lid = cluster.wait_for_leader(timeout_s=int(_POST_FLAP_CONVERGE_S))
@@ -340,7 +341,7 @@ def test_dr11_flapping_leader(fresh_cluster, netem_ready):
                                          records_inter, keys)
                 if inter_produce.ok and len(inter_produce.all_produced) > 0:
                     break
-                time.sleep(3.0)  # let the election/ISR settle, then retry
+                time.sleep(3.0)  # let the election/ISR settle, then retry  [KEPT: back-off of a bounded retry loop]
             assert inter_produce is not None and inter_produce.ok and len(
                 inter_produce.all_produced) > 0, (
                 f"inter-flap produce (flap {flap_i + 1}/{_FLAP_ROUNDS}) failed after "
@@ -367,7 +368,7 @@ def test_dr11_flapping_leader(fresh_cluster, netem_ready):
     assert_single_leader(cluster)
 
     # Stability: sleep then re-confirm no additional churn.
-    time.sleep(_STABILITY_SETTLE_S)
+    time.sleep(_STABILITY_SETTLE_S)   # KEPT: observation window (no further churn may appear)
     assert_single_leader(cluster)
 
     # ── Durability: all committed records must survive (Invariants B/D) ────────
@@ -452,7 +453,7 @@ def test_dr11_flapping_follower(fresh_cluster, netem_ready):
             # but acks=All will gate on the ISR gate — we give a shorter window here
             # since we don't wait for ISR expiry but just for the produce to proceed
             # with the 2-node majority).
-            time.sleep(_FLAP_PARTITION_S)
+            time.sleep(_FLAP_PARTITION_S)   # KEPT: fault duration (partition length of a flap)
 
             # ISR = {leader, third_svc} (2 nodes) >= minIsr(2): MUST keep serving.
             # Single-leader check on the reachable nodes only.
@@ -479,7 +480,7 @@ def test_dr11_flapping_follower(fresh_cluster, netem_ready):
             faults.heal(cluster, follower_svc)
 
             # Give the follower time to fetch missed records and rejoin ISR.
-            time.sleep(_FLAP_HEAL_SETTLE_S)
+            time.sleep(_FLAP_HEAL_SETTLE_S)   # KEPT: flap rhythm
 
     finally:
         faults.heal_all(cluster)
@@ -499,7 +500,7 @@ def test_dr11_flapping_follower(fresh_cluster, netem_ready):
     assert_single_leader(cluster)
 
     # Stability check.
-    time.sleep(_STABILITY_SETTLE_S)
+    time.sleep(_STABILITY_SETTLE_S)   # KEPT: observation window (no further churn)
     assert_single_leader(cluster)
 
     # ── Durability ────────────────────────────────────────────────────────────
@@ -568,14 +569,14 @@ def test_dr11_rapid_flap_livelock_guard(fresh_cluster, netem_ready):
 
             # ── Fast partition ─────────────────────────────────────────────────
             faults.partition(cluster, leader_svc)
-            time.sleep(_FAST_FLAP_PARTITION_S)
+            time.sleep(_FAST_FLAP_PARTITION_S)   # KEPT: fault duration (fast flap)
 
             # Safety: isolated node must not serve (no split-brain during the window).
             _assert_isolated_leader_cannot_serve(cluster, leader_svc, majority_svcs)
 
             # ── Fast heal ─────────────────────────────────────────────────────
             faults.heal(cluster, leader_svc)
-            time.sleep(_FAST_FLAP_HEAL_SETTLE_S)
+            time.sleep(_FAST_FLAP_HEAL_SETTLE_S)   # KEPT: flap rhythm (fast flap)
 
             # Find whoever is leading now (may not have a stable leader yet —
             # that is intentional pressure; we just need to aim produces somewhere).
@@ -613,7 +614,7 @@ def test_dr11_rapid_flap_livelock_guard(fresh_cluster, netem_ready):
     assert_single_leader(cluster)
 
     # Stability: wait then re-confirm leader is stable (no continued churn).
-    time.sleep(_STABILITY_SETTLE_S)
+    time.sleep(_STABILITY_SETTLE_S)   # KEPT: observation window (no further churn)
     stable_lid = cluster.wait_for_leader(timeout_s=30)
     stable_leader_svc = node_id_to_service(stable_lid)
     assert stable_leader_svc == conv_leader_svc, (

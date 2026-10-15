@@ -7,3 +7,4 @@
 # is intentionally tiny.
 pytest>=7.4
 pytest-timeout>=2.2   # hard per-test timeouts (bounded — no infinite waits)
+pytest-xdist>=3.5    # parallel workers (-n 2): each worker gets its own compose projects (Cluster.__init__)

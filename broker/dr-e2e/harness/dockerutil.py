@@ -29,6 +29,8 @@ import subprocess
 import uuid
 from dataclasses import dataclass
 
+from . import timing
+
 
 def _git_sha(repo_root: str) -> str:
     """Return the short HEAD SHA of the repo at *repo_root* (7 hex chars).
@@ -113,6 +115,14 @@ def sweep_orphaned_containers(timeout: int = 60) -> list[str]:
     return removed
 
 
+class CommandTimeout(TimeoutError):
+    """A command ran past its hard timeout (its container is removed); carries the output it printed so far."""
+
+    def __init__(self, msg: str, *, stdout: str, stderr: str, timeout: float):
+        super().__init__(msg)
+        self.stdout, self.stderr, self.timeout = stdout, stderr, timeout
+
+
 @dataclass
 class CmdResult:
     args: list[str]
@@ -137,6 +147,44 @@ def _run_container_name(args: list[str]) -> str | None:
     return None
 
 
+def _classify(args: list[str]) -> tuple[str, str]:
+    """(timing kind, detail) of a command line — every docker call is timed under one kind."""
+    if len(args) >= 2 and args[0] == "bash":
+        return ("image.ql" if "--build-image" in args else "bash"), os.path.basename(args[1])
+    if not args or args[0] != "docker":
+        return "cmd", args[0] if args else ""
+    if len(args) >= 2 and args[1] == "compose":
+        verbs = ("up", "down", "exec", "restart", "stop", "start", "logs", "ps", "build", "kill", "pause", "unpause")
+        verb = next((a for a in args[2:] if a in verbs), "other")
+        tail = args[args.index(verb) + 1:] if verb in args else []
+        return f"compose.{verb}", " ".join(tail[:4])
+    if len(args) >= 2 and args[1] == "run":
+        image = ""
+        skip_next = False
+        rest = args[2:]
+        opts_with_arg = {"--name", "--network", "--hostname", "-e", "-v", "--label", "--platform",
+                         "--security-opt", "--shm-size", "--entrypoint", "-w", "--user", "--cap-add"}
+        for a in rest:
+            if skip_next:
+                skip_next = False
+                continue
+            if a in opts_with_arg:
+                skip_next = True
+                continue
+            if a.startswith("-"):
+                continue
+            image = a
+            break
+        repo = image.split(":")[0]
+        kind = {"rune-dr-client": "container.client", "rune-ql-probe": "container.ql",
+                "rune-netem": "container.netem", "alpine": "container.volume"}.get(repo, "container.other")
+        return kind, image
+    if len(args) >= 2 and args[1] == "build":
+        tag = args[args.index("-t") + 1] if "-t" in args else ""
+        return "image.build", tag
+    return f"docker.{args[1] if len(args) > 1 else ''}", " ".join(args[2:4])
+
+
 def run(args: list[str], *, timeout: int = DEFAULT_TIMEOUT, check: bool = False,
         env: dict[str, str] | None = None) -> CmdResult:
     """Run a command with a hard timeout. Never blocks forever.
@@ -145,6 +193,14 @@ def run(args: list[str], *, timeout: int = DEFAULT_TIMEOUT, check: bool = False,
     the current process environment.  Pass ``os.environ.copy()`` with mutations
     to extend the current environment rather than replace it.
     """
+    kind, detail = _classify(args)
+    with timing.phase(kind, detail) as ph:
+        res = _run(args, timeout=timeout, check=check, env=env)
+        ph.exit = f"rc={res.returncode}"
+        return res
+
+
+def _run(args: list[str], *, timeout: int, check: bool, env: dict[str, str] | None) -> CmdResult:
     args, run_tag = _with_labels(args)
     try:
         proc = subprocess.run(
@@ -171,9 +227,12 @@ def run(args: list[str], *, timeout: int = DEFAULT_TIMEOUT, check: bool = False,
                 _remove_labelled(f"{LABEL_RUN}={run_tag}")
             except (OSError, subprocess.SubprocessError):
                 pass                   # best effort; the next session's sweep catches it
-        raise TimeoutError(
+        def _text(part):
+            return (part.decode(errors="replace") if isinstance(part, bytes) else part) or ""
+        raise CommandTimeout(
             f"command timed out after {timeout}s: {' '.join(args)}\n"
-            f"stdout so far:\n{exc.stdout}\nstderr so far:\n{exc.stderr}"
+            f"stdout so far:\n{exc.stdout}\nstderr so far:\n{exc.stderr}",
+            stdout=_text(exc.stdout), stderr=_text(exc.stderr), timeout=timeout,
         ) from exc
 
     res = CmdResult(args=args, returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
@@ -183,6 +242,69 @@ def run(args: list[str], *, timeout: int = DEFAULT_TIMEOUT, check: bool = False,
             f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}"
         )
     return res
+
+
+@dataclass
+class StreamResult(CmdResult):
+    stopped_by_harness: bool = False   # the stop predicate fired and the container was removed
+
+
+def run_until(args: list[str], *, timeout: int, stop_when, tick_s: float = 0.25) -> StreamResult:
+    """`docker run ...` with its output streamed: `stop_when(lines, now)` is called on every new
+    line and every `tick_s`; when it returns True the container is removed (`docker rm -f`) and
+    the result has stopped_by_harness=True with every line read so far.  The command exiting on
+    its own is an ordinary result; running past `timeout` raises TimeoutError exactly like
+    `run()` (the container is removed first).  stdout and stderr are merged."""
+    import threading
+    import time as _time
+
+    kind, detail = _classify(args)
+    with timing.phase(kind, detail) as ph:
+        args, run_tag = _with_labels(args)
+        proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        lines: list[str] = []
+        new_line = threading.Event()
+
+        def _reader():
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                lines.append(line)
+                new_line.set()
+
+        reader = threading.Thread(target=_reader, daemon=True)
+        reader.start()
+        deadline = _time.time() + timeout
+        stopped = False
+        while proc.poll() is None:
+            now = _time.time()
+            if now >= deadline:
+                if run_tag:
+                    try:
+                        _remove_labelled(f"{LABEL_RUN}={run_tag}")
+                    except (OSError, subprocess.SubprocessError):
+                        pass
+                proc.kill()
+                ph.exit = "timeout"
+                raise CommandTimeout(f"command timed out after {timeout}s: {' '.join(args)}\n"
+                                     f"output so far:\n{''.join(lines)}",
+                                     stdout="".join(lines), stderr="", timeout=timeout)
+            if stop_when(lines, now):
+                stopped = True
+                if run_tag:
+                    _remove_labelled(f"{LABEL_RUN}={run_tag}")   # the container first: killing the CLI does not stop it
+                proc.kill()
+                break
+            new_line.wait(tick_s)
+            new_line.clear()
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=30)
+        reader.join(timeout=30)
+        ph.exit = "stopped" if stopped else f"rc={proc.returncode}"
+        return StreamResult(args=args, returncode=0 if stopped else proc.returncode,
+                            stdout="".join(lines), stderr="", stopped_by_harness=stopped)
 
 
 class Compose:
@@ -236,7 +358,9 @@ class Compose:
     def down(self, timeout: int = 120, keep_volumes: bool = False) -> CmdResult:
         # -v removes named volumes (fresh state), --remove-orphans cleans stragglers.
         # keep_volumes: the containers go, the logs stay (DR_STALE_DATA restarts on them).
-        args = ["down", "--remove-orphans"] if keep_volumes else ["down", "-v", "--remove-orphans"]
+        # -t 1 when the volumes go too: nothing of a discarded cluster needs a graceful 10 s stop (it cost every
+        # test ~5 s of teardown); kept volumes (DR_STALE_DATA) keep the default graceful stop.
+        args = ["down", "--remove-orphans"] if keep_volumes else ["down", "-v", "--remove-orphans", "-t", "1"]
         return run(self._base() + args, timeout=timeout)
 
     def stop(self, service: str, timeout: int = 60) -> CmdResult:

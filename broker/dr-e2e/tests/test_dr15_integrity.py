@@ -74,7 +74,7 @@ import pytest
 
 from harness import faults
 from harness.cluster import SERVICES, node_id_to_service
-from harness.driver import Results, run_clients
+from harness.driver import DRAIN_QUIET_MS, Results, run_clients
 from harness.invariants import (
     assert_exactly_once,
     assert_no_committed_loss,
@@ -139,7 +139,7 @@ def _produce(cluster, target_svc: str, n: int, cid_base: int, records: int,
 
 
 def _subscribe_all(cluster, target_svc: str, cid_base: int, keys: int,
-                   window_ms: int = 60000) -> Results:
+                   window_ms: int = 60000, drain_quiet_ms: int = DRAIN_QUIET_MS) -> Results:
     """Subscribe-from-earliest on `target_svc` and drain the whole partition set.
 
     Used to verify the committed set survived failover or to check divergence:
@@ -159,6 +159,7 @@ def _subscribe_all(cluster, target_svc: str, cid_base: int, keys: int,
         expect=0,                 # drain window; don't require a fixed count
         from_="earliest",
         subscribe_ms=window_ms,
+        drain_quiet_ms=drain_quiet_ms,   # stop once the static log is fully read (driver._drain_complete)
         timeout_ms=_CONNECT_MS,
         start_stagger_ms=_STAGGER_MS,
     )
@@ -215,7 +216,7 @@ def test_dr15_tail_loss_quantification(fresh_cluster, acks, expect_zero_loss):
     # Minimal delay: let the producer connect + send at least a few records,
     # then kill immediately to maximise the chance of an un-replicated tail.
     # 1.5 s at 40 Hz ≈ 60 records in flight before the crash.
-    time.sleep(1.5)
+    time.sleep(1.5)   # KEPT: the kill must land mid-produce (scenario timing)
     faults.kill_node(cluster, leader_svc, signal.SIGKILL)
 
     t.join(timeout=300)
@@ -321,8 +322,10 @@ def test_dr15_no_phantom_read(fresh_cluster):
     bg_holder: dict[str, Results] = {}
 
     def _bg_subscribe():
+        # Runs WHILE records are produced and the leader is killed: the log is not static, so this read keeps its
+        # full fixed window (no drain stop).
         bg_holder["r"] = _subscribe_all(
-            cluster, leader_svc, _next_cid_base(), keys, window_ms=30000
+            cluster, leader_svc, _next_cid_base(), keys, window_ms=30000, drain_quiet_ms=0
         )
 
     bg_t = threading.Thread(target=_bg_subscribe, daemon=True)
@@ -343,7 +346,7 @@ def test_dr15_no_phantom_read(fresh_cluster):
     prod_t.start()
 
     # Let production get going, then kill immediately (small tail un-replicated).
-    time.sleep(1.5)
+    time.sleep(1.5)   # KEPT: the kill must land mid-produce (scenario timing)
     faults.kill_node(cluster, leader_svc, signal.SIGKILL)
 
     prod_t.join(timeout=300)
@@ -480,7 +483,8 @@ def test_dr15_log_divergence_guard(fresh_cluster):
     cluster.compose.start(old_leader_svc)
     # Generous catch-up window: the old leader must replicate pre-kill +
     # post-kill records from the new leader before re-entering ISR.
-    time.sleep(15.0)
+    # Was a fixed 15 s sleep; the running / single-leader / delivery checks below are unchanged.
+    cluster.settle(15.0, running=list(SERVICES))
 
     running = cluster.running_services()
     assert old_leader_svc in running, (
@@ -617,7 +621,7 @@ def test_dr15_sigterm_vs_sigkill_acks_all_parity(fresh_cluster, sig, label):
     # Restart the killed leader so the cluster heals for teardown.
     try:
         cluster.compose.start(leader_svc)
-        time.sleep(5.0)
+        cluster.settle(5.0, running=list(SERVICES))   # best-effort heal before teardown (was a fixed 5 s sleep)
     except Exception:
         pass   # best-effort; fresh_cluster teardown (down -v) handles cleanup
 
@@ -667,10 +671,10 @@ def test_dr15_all_nodes_crash_cold_restart_consistent(fresh_cluster):
     # ── SIGKILL all 3 nodes (short inter-kill gap to avoid panic on last node) ─
     for svc in SERVICES:
         faults.kill_node(cluster, svc, signal.SIGKILL)
-        time.sleep(0.5)
+        time.sleep(0.5)   # KEPT: the inter-kill gap is part of the scenario
 
-    # Verify all nodes are down.
-    time.sleep(3.0)
+    # Verify all nodes are down (was a fixed 3 s sleep).
+    cluster.wait_running([], 3.0)
     running = cluster.running_services()
     assert len(running) == 0, (
         f"expected 0 running nodes after killing all 3, got {running}"
@@ -679,7 +683,7 @@ def test_dr15_all_nodes_crash_cold_restart_consistent(fresh_cluster):
     # ── Restart all 3 nodes (staggered to avoid thundering-herd on Raft) ──────
     for svc in SERVICES:
         cluster.compose.start(svc)
-        time.sleep(0.3)
+        time.sleep(0.3)   # KEPT: startup stagger (scenario shape)
 
     # Wait for election — generous: cold-start requires disk replay + Raft.
     new_lid = cluster.wait_for_leader(timeout_s=120)
@@ -706,8 +710,9 @@ def test_dr15_all_nodes_crash_cold_restart_consistent(fresh_cluster):
     # ── Convergence: each follower's log must also match the leader's ─────────
     follower_svcs = [s for s in SERVICES if s != new_leader_svc]
     for fsvc in follower_svcs:
-        # Brief catch-up window before subscribing from a follower.
-        time.sleep(5.0)
+        # Brief catch-up window before subscribing from a follower (was a fixed 5 s sleep; the delivery checks on
+        # the follower read are unchanged).
+        cluster.settle(5.0, running=list(SERVICES))
         cid_sub_f = _next_cid_base()
         sub_f = _subscribe_all(cluster, fsvc, cid_sub_f, keys, window_ms=120000)
 

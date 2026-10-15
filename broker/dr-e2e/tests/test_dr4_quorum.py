@@ -35,7 +35,7 @@ import pytest
 
 from harness import faults
 from harness.cluster import SERVICES, node_id_to_service
-from harness.driver import Results, run_clients
+from harness.driver import DRAIN_QUIET_MS, Results, run_clients
 from harness.invariants import (
     assert_exactly_once,
     assert_no_committed_loss,
@@ -85,7 +85,7 @@ def _produce(cluster, target_svc: str, n: int, cid_base: int, records: int,
 
 
 def _subscribe_all(cluster, target_svc: str, cid_base: int, keys: int,
-                   window_ms: int = 60000) -> Results:
+                   window_ms: int = 60000, drain_quiet_ms: int = DRAIN_QUIET_MS) -> Results:
     """Subscribe-from-earliest and drain the whole partition set."""
     return run_clients(
         1,
@@ -100,6 +100,7 @@ def _subscribe_all(cluster, target_svc: str, cid_base: int, keys: int,
         expect=0,                  # drain the window; don't require a fixed count
         from_="earliest",
         subscribe_ms=window_ms,
+        drain_quiet_ms=drain_quiet_ms,   # stop once the static log is fully read (driver._drain_complete)
         timeout_ms=_CONNECT_MS,
         start_stagger_ms=_STAGGER_MS,
     )
@@ -148,6 +149,14 @@ def assert_no_serving_leader_in_minority(cluster, running_services: list[str]) -
             # The probe never finished: the write was not acknowledged — unless
             # an ack (PRODUCED line) is already in its partial output.
             assert "PRODUCED cid=" not in str(exc), (
+                f"SPLIT-BRAIN / MIN-ISR VIOLATION [BLOCKER]: minority survivor {svc!r} "
+                f"acknowledged an acks=All produce before the probe timed out"
+            )
+            continue
+        # A probe that HUNG past timeout_s now comes back as a failed result carrying its partial output
+        # (driver: exit 124) instead of a TimeoutError - the same rule as the except branch above applies to it.
+        if any(c.exit_code == 124 for c in probe.clients):
+            assert not probe.all_produced, (
                 f"SPLIT-BRAIN / MIN-ISR VIOLATION [BLOCKER]: minority survivor {svc!r} "
                 f"acknowledged an acks=All produce before the probe timed out"
             )
@@ -215,6 +224,7 @@ def test_dr4_quorum_holds_kill_follower(fresh_cluster, n_clients):
 
     # Cluster still has 2/3 = majority.  The leader must keep serving.
     # Brief wait for leader to detect ISR shrinkage.
+    # KEPT fixed: "no spurious re-election" below is checked after an observation window.
     time.sleep(3.0)
 
     # Verify the leader is still the same (no spurious re-election).
@@ -292,10 +302,11 @@ def test_dr4_quorum_lost_safety_and_recovery(fresh_cluster):
 
     # Kill leader first, then follower — 2/3 dead.
     faults.kill_node(cluster, leader_svc, signal.SIGKILL)
-    time.sleep(1.0)
+    time.sleep(1.0)   # KEPT: the gap between the two kills is part of the scenario
     faults.kill_node(cluster, follower_svc, signal.SIGKILL)
 
     # Give the survivor a moment to recognise quorum loss.
+    # KEPT fixed: the quorum-loss window the minority-safety checks below observe (no serving leader).
     time.sleep(5.0)
 
     running = cluster.running_services()

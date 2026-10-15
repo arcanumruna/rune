@@ -63,7 +63,7 @@ import pytest
 
 from harness import faults
 from harness.cluster import SERVICES, node_id_to_service, service_to_node_id
-from harness.driver import Results, run_clients
+from harness.driver import DRAIN_QUIET_MS, Results, run_clients
 from harness.invariants import (
     assert_exactly_once,
     assert_no_committed_loss,
@@ -119,7 +119,7 @@ def _produce(cluster, target_svc: str, n: int, cid_base: int, records: int,
 
 
 def _subscribe_all(cluster, target_svc: str, cid_base: int, keys: int,
-                   window_ms: int = 60_000) -> Results:
+                   window_ms: int = 60_000, drain_quiet_ms: int = DRAIN_QUIET_MS) -> Results:
     """Subscribe-from-earliest and drain the entire partition set."""
     return run_clients(
         1,
@@ -134,6 +134,7 @@ def _subscribe_all(cluster, target_svc: str, cid_base: int, keys: int,
         expect=0,
         from_="earliest",
         subscribe_ms=window_ms,
+        drain_quiet_ms=drain_quiet_ms,   # stop once the static log is fully read (driver._drain_complete)
         timeout_ms=_CONNECT_MS,
         start_stagger_ms=_STAGGER_MS,
     )
@@ -254,14 +255,14 @@ def assert_no_concurrent_leaders(cluster, majority_services: list[str],
     # docker compose logs may interleave a follower's slightly-older log line
     # AFTER it on the first read.  One 1-second settle is enough for the follower
     # to also poll and log the new leader, after which the combined log is stable.
-    time.sleep(1.0)
+    time.sleep(1.0)   # KEPT: log-interleave settle of a log-scrape read (1 s, bounded)
     all_ids: list[str] = []
     for _ in range(3):
         combined_logs = cluster.compose.logs(*majority_services, timeout=30)
         all_ids = leader_re.findall(combined_logs)
         if all_ids and int(all_ids[-1]) != zombie_node_id:
             break
-        time.sleep(2.0)
+        time.sleep(2.0)   # KEPT: poll back-off inside a bounded retry loop
 
     if not all_ids:
         raise AssertionError(
@@ -331,7 +332,7 @@ def _wait_for_settled_leader(cluster, deadline_s: float = _SETTLE_DEADLINE_S) ->
         last_obs = obs
         if stable >= _SETTLE_STABLE_READS:
             return node_id_to_service(obs[0])
-        time.sleep(cluster._LEADER_POLL_S)
+        time.sleep(cluster._LEADER_POLL_S)   # KEPT: poll interval of a condition poll
     raise AssertionError(
         f"cluster did not settle on a single followed leader within {deadline_s}s "
         f"(running={running}, last role readings={readings})"
@@ -356,7 +357,7 @@ def _identify_leader_with_container(cluster, timeout_s: int = 30) -> tuple[int, 
         if cid is not None:
             return lid, svc
         last_svc = svc
-        time.sleep(1.0)
+        time.sleep(1.0)   # KEPT: poll interval of a condition poll
     raise RuntimeError(
         f"_identify_leader_with_container: leader container id remained None "
         f"for {timeout_s}s (last resolved service: {last_svc!r})"
@@ -517,7 +518,8 @@ def test_dr10_pause_idle_leader_zombie_fencing(fresh_cluster, n_clients):
     # Allow a generous settle window: the zombie needs to receive at least one
     # heartbeat from the new leader (20 ms electionStatusIntervalMs), recognise
     # the higher term, and update its follower state.
-    time.sleep(8.0)
+    # Was a fixed 8 s sleep: now until the zombie reports FOLLOWER at the leader's term (cluster.settle), at most 8 s.
+    cluster.settle(8.0, running=list(SERVICES))
 
     # Full convergence assertions (single-leader, zombie fenced, no loss, etc.).
     all_committed = Results(clients=committed.clients + mid_produce.clients)
@@ -566,7 +568,7 @@ def test_dr10_pause_during_produce_zombie_fencing(fresh_cluster, n_clients):
     t.start()
 
     # Let production get going before pausing.
-    time.sleep(2.5)
+    time.sleep(2.5)   # KEPT: scenario: the pause lands mid-produce
 
     faults.pause(cluster, zombie_svc)
 
@@ -595,8 +597,8 @@ def test_dr10_pause_during_produce_zombie_fencing(fresh_cluster, n_clients):
     t.join(timeout=300)
     committed = holder.get("r", Results())
 
-    # Post-unpause settle: zombie detects higher term and steps down.
-    time.sleep(8.0)
+    # Post-unpause settle: zombie detects higher term and steps down (was a fixed 8 s sleep; at most 8 s now).
+    cluster.settle(8.0, running=list(SERVICES))
 
     _full_convergence_assertions(
         cluster, committed, keys, new_leader_svc, zombie_svc
@@ -652,7 +654,7 @@ def test_dr10_short_vs_long_pause(fresh_cluster, pause_case):
     faults.pause(cluster, zombie_svc)
 
     try:
-        time.sleep(pause_s)
+        time.sleep(pause_s)   # KEPT: fault duration (the pause IS the scenario)
 
         # Check whether a re-election happened while paused.
         # Use wait_for_leader with exclude=[zombie_svc] to see if the majority
@@ -885,8 +887,8 @@ def test_dr10_repeated_flap_zombie(fresh_cluster, flap_rounds):
         finally:
             faults.unpause(cluster, zombie_svc)
 
-        # Settle: zombie detects higher term and steps down to follower.
-        time.sleep(8.0)
+        # Settle: zombie detects higher term and steps down to follower (was a fixed 8 s sleep; at most 8 s now).
+        cluster.settle(8.0, running=list(SERVICES))
 
         # Assert single leader across ALL nodes before the next round.
         # The zombie must have stepped down — it should not be the current leader.

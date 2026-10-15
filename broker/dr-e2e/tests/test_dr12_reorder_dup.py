@@ -76,7 +76,7 @@ import pytest
 
 from harness import faults
 from harness.cluster import SERVICES, node_id_to_service
-from harness.driver import Results, run_clients
+from harness.driver import DRAIN_QUIET_MS, Results, run_clients
 from harness.invariants import (
     assert_exactly_once,
     assert_no_committed_loss,
@@ -127,7 +127,7 @@ def _produce(cluster, target_svc: str, n: int, cid_base: int, records: int,
 
 
 def _subscribe_all(cluster, target_svc: str, cid_base: int, keys: int,
-                   window_ms: int = 120000) -> Results:
+                   window_ms: int = 120000, drain_quiet_ms: int = DRAIN_QUIET_MS) -> Results:
     """Subscribe-from-earliest and drain the whole partition set.
 
     window_ms is intentionally generous (default 120s) because netem reorder +
@@ -146,6 +146,7 @@ def _subscribe_all(cluster, target_svc: str, cid_base: int, keys: int,
         expect=0,                  # drain; don't require a fixed count
         from_="earliest",
         subscribe_ms=window_ms,
+        drain_quiet_ms=drain_quiet_ms,   # stop once the static log is fully read (driver._drain_complete)
         timeout_ms=_CONNECT_MS,
         start_stagger_ms=_STAGGER_MS,
     )
@@ -255,7 +256,7 @@ def test_dr12_follower_reorder(fresh_cluster, netem_ready, reorder_pct, rep):
         # _netem_spec order: delay first, then reorder (tc-netem requirement).
         faults.netem(cluster, follower_svc, reorder=reorder_pct, delay=20)
 
-        time.sleep(2.0)
+        time.sleep(2.0)   # KEPT: the produce must start on an already-degraded link (scenario)
 
         # ── Sustained produce while follower link is reordered ────────────────
         # Leader + healthy third form 2/3 quorum; acks=All must still succeed.
@@ -300,7 +301,7 @@ def test_dr12_follower_reorder(fresh_cluster, netem_ready, reorder_pct, rep):
         faults.heal_all(cluster)
 
     # ── Convergence: give the follower time to catch up ───────────────────────
-    time.sleep(10.0)
+    cluster.settle(10.0, running=list(SERVICES))   # was a fixed 10 s sleep before the positive checks below
     assert_single_leader(cluster)
 
     # ── Delivery invariants — HARD guarantees ─────────────────────────────────
@@ -420,7 +421,7 @@ def test_dr12_follower_dup(fresh_cluster, netem_ready, dup_pct, rep):
         # ── Inject packet duplication on the follower link ────────────────────
         faults.netem(cluster, follower_svc, duplicate=dup_pct)
 
-        time.sleep(2.0)
+        time.sleep(2.0)   # KEPT: the produce must start on an already-degraded link (scenario)
 
         # ── Sustained produce while duplication is active ─────────────────────
         cid_mid = _next_cid_base()
@@ -456,7 +457,7 @@ def test_dr12_follower_dup(fresh_cluster, netem_ready, dup_pct, rep):
         faults.heal_all(cluster)
 
     # ── Convergence ───────────────────────────────────────────────────────────
-    time.sleep(10.0)
+    cluster.settle(10.0, running=list(SERVICES))   # was a fixed 10 s sleep before the positive checks below
     assert_single_leader(cluster)
 
     # ── Delivery invariants — HARD guarantees ─────────────────────────────────
@@ -571,7 +572,7 @@ def test_dr12_leader_dup(fresh_cluster, netem_ready, dup_pct, rep):
         # ── Inject packet duplication on the LEADER's link ────────────────────
         faults.netem(cluster, leader_svc, duplicate=dup_pct)
 
-        time.sleep(2.0)
+        time.sleep(2.0)   # KEPT: the produce must start on an already-degraded link (scenario)
 
         # ── Sustained produce while leader link is duplicating ────────────────
         cid_mid = _next_cid_base()
@@ -622,7 +623,7 @@ def test_dr12_leader_dup(fresh_cluster, netem_ready, dup_pct, rep):
         faults.heal_all(cluster)
 
     # ── Convergence after heal ────────────────────────────────────────────────
-    time.sleep(10.0)
+    cluster.settle(10.0, running=list(SERVICES))   # was a fixed 10 s sleep before the positive checks below
     assert_single_leader(cluster)
 
     # ── Delivery invariants — HARD guarantees ─────────────────────────────────
@@ -757,7 +758,7 @@ def test_dr12_follower_reorder_and_dup(fresh_cluster, netem_ready, param, rep):
             delay=delay_ms,
         )
 
-        time.sleep(2.0)
+        time.sleep(2.0)   # KEPT: the produce must start on an already-degraded link (scenario)
 
         # ── Sustained produce during combined chaos ───────────────────────────
         cid_mid = _next_cid_base()
@@ -802,7 +803,7 @@ def test_dr12_follower_reorder_and_dup(fresh_cluster, netem_ready, param, rep):
         faults.heal_all(cluster)
 
     # ── Convergence ───────────────────────────────────────────────────────────
-    time.sleep(10.0)
+    cluster.settle(10.0, running=list(SERVICES))   # was a fixed 10 s sleep before the positive checks below
     assert_single_leader(cluster)
 
     # ── Delivery invariants — HARD guarantees ─────────────────────────────────
@@ -937,7 +938,7 @@ def test_dr12_large_batch_fragmentation(fresh_cluster, netem_ready, rep):
         # retransmit churn that would make 500 records intractable under netem.
         faults.netem(cluster, follower_svc, reorder=30, duplicate=8, delay=20)
 
-        time.sleep(2.0)
+        time.sleep(2.0)   # KEPT: the produce must start on an already-degraded link (scenario)
 
         # ── Large-volume produce ──────────────────────────────────────────────
         # 500 records × 18 keys → sizeable RecordBatch payloads that exercise
@@ -968,7 +969,7 @@ def test_dr12_large_batch_fragmentation(fresh_cluster, netem_ready, rep):
         faults.heal_all(cluster)
 
     # ── Convergence ───────────────────────────────────────────────────────────
-    time.sleep(10.0)
+    cluster.settle(10.0, running=list(SERVICES))   # was a fixed 10 s sleep before the positive checks below
     assert_single_leader(cluster)
 
     # ── Delivery invariants — HARD guarantees ─────────────────────────────────

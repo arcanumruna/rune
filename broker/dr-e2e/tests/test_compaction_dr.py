@@ -29,6 +29,7 @@ from harness.cluster import (
     BROKER_REPO, COMPOSE_FILE, SERVICES,
     Cluster, node_id_to_service, service_to_node_id,
 )
+from harness.cluster import SERVICES as _ALL_SERVICES
 from harness.driver import Results, run_clients
 from harness.invariants import assert_single_leader
 
@@ -172,7 +173,7 @@ def test_drcp1_follower_kill_during_compaction(compaction_dr_cluster):
 
     # ── Kill follower while compaction runs ──────────────────────────────────
     # Give the leader ~5s to start the first compaction pass, then kill the follower.
-    time.sleep(5.0)
+    time.sleep(5.0)   # KEPT: the kill must land while the first compaction pass runs (scenario timing)
     faults.kill_node(cluster, follower_svc, signal.SIGKILL)
 
     # Wait for the leader to fully compact (stable minimum).
@@ -181,12 +182,14 @@ def test_drcp1_follower_kill_during_compaction(compaction_dr_cluster):
                               initial_count=initial_file_count,
                               timeout_s=45.0)
     else:
-        time.sleep(12.0)
+        time.sleep(12.0)   # KEPT: fallback when segment files cannot be counted - no condition to poll
 
     # ── Subscribe from leader ─────────────────────────────────────────────────
-    cid_sub_leader = _next_dr_cid_base()
-    sub_leader = _subscribe_compact(cluster, leader_svc, cid_sub_leader,
-                                    window_ms=60_000)
+    # Poll until the cleaner converged to one record per key (the file-count wait above is no signal - see
+    # _wait_for_compaction); the strict assertions below are unchanged.
+    sub_leader = _wait_for_latest_per_key(
+        lambda: _subscribe_compact(cluster, leader_svc, _next_dr_cid_base(), window_ms=60_000),
+        expected_keys=keys, timeout_s=45.0)
 
     # Assertions on leader.
     assert_latest_per_key(produce_result, sub_leader)
@@ -203,7 +206,7 @@ def test_drcp1_follower_kill_during_compaction(compaction_dr_cluster):
     # Wait for the revived node to rejoin the cluster (it needs to fetch missing
     # segments from the leader — both the original replicated bytes AND any
     # compacted segments that were swapped while it was down).
-    time.sleep(15.0)
+    cluster.settle(15.0, running=list(_ALL_SERVICES))   # was a fixed 15 s sleep before the positive checks below
     assert_single_leader(cluster)
 
     # ── Subscribe from the revived follower ───────────────────────────────────
@@ -301,7 +304,7 @@ def test_drcp2_leader_kill_during_active_compaction(compaction_dr_cluster):
 
     # ── Let compaction start, then kill the leader ────────────────────────────
     # Give the cleaner a few seconds to start (possibly mid-segment rewrite).
-    time.sleep(8.0)
+    time.sleep(8.0)   # KEPT: the kill must land while the cleaner runs (scenario timing)
     faults.kill_node(cluster, leader_svc, signal.SIGKILL)
 
     # ── Wait for new leader election ──────────────────────────────────────────
@@ -318,15 +321,17 @@ def test_drcp2_leader_kill_during_active_compaction(compaction_dr_cluster):
                               initial_count=new_initial_count,
                               timeout_s=45.0)
     else:
-        time.sleep(12.0)
+        time.sleep(12.0)   # KEPT: fallback when segment files cannot be counted - no condition to poll
 
     # Wait for data plane ready before subscribing.
     cluster.wait_data_plane_ready(max_attempts=8, timeout_s=120)
 
     # ── Subscribe from new leader ─────────────────────────────────────────────
-    cid_sub = _next_dr_cid_base()
-    sub_result = _subscribe_compact(cluster, new_leader_svc, cid_sub,
-                                    window_ms=60_000)
+    # Poll until the new leader's cleaner converged to one record per key (as every other compaction scenario does:
+    # _wait_for_compaction's file-count signal never moves, so it no longer stands in for that wait).
+    sub_result = _wait_for_latest_per_key(
+        lambda: _subscribe_compact(cluster, new_leader_svc, _next_dr_cid_base(), window_ms=60_000),
+        expected_keys=keys, timeout_s=45.0)
 
     # ── Assertions ────────────────────────────────────────────────────────────
     assert_no_resurrection(produce_result, sub_result)
@@ -397,17 +402,17 @@ def test_drcp3_truncation_interplay_with_compaction(compaction_dr_cluster):
                               initial_count=initial_count,
                               timeout_s=45.0)
     else:
-        time.sleep(12.0)
+        time.sleep(12.0)   # KEPT: fallback when segment files cannot be counted - no condition to poll
 
     # ── Kill follower, truncate its log, restart ──────────────────────────────
     faults.kill_node(cluster, follower_svc, signal.SIGKILL)
-    time.sleep(2.0)  # ensure container is stopped before volume access
+    cluster.wait_running([s for s in _ALL_SERVICES if s != follower_svc], 2.0)  # stopped before volume access (was a fixed 2 s sleep)
 
     faults.truncate_log_tail(cluster.project, follower_idx, tail_bytes=128)
 
     cluster.compose.start(follower_svc)
     # Give the follower time to recover and catch up.
-    time.sleep(20.0)
+    cluster.settle(20.0, running=list(_ALL_SERVICES))   # was a fixed 20 s sleep before the positive checks below
     assert_single_leader(cluster)
 
     # Wait for data plane to be serving.
@@ -504,12 +509,12 @@ def test_drcp4_network_partition_during_compaction(compaction_dr_cluster):
                               initial_count=initial_count,
                               timeout_s=45.0)
     else:
-        time.sleep(12.0)
+        time.sleep(12.0)   # KEPT: fallback when segment files cannot be counted - no condition to poll
 
     # ── Heal the partition and wait for re-sync ────────────────────────────────
     faults.heal(cluster, follower_svc)
     # Give the follower time to re-sync from the leader.
-    time.sleep(20.0)
+    cluster.settle(20.0, running=list(_ALL_SERVICES))   # was a fixed 20 s sleep before the positive checks below
     assert_single_leader(cluster)
 
     cluster.wait_data_plane_ready(max_attempts=8, timeout_s=120)

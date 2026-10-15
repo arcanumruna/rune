@@ -30,10 +30,12 @@ import os
 import re
 import time
 import uuid
+import warnings
 from dataclasses import dataclass, field
 from typing import Optional
 
-from .dockerutil import _git_sha, run
+from .dockerutil import CommandTimeout, _git_sha, run, run_until
+from .timing import timed
 
 # The dr client image is tied to the rune-client-cpp checkout: `rune-dr-client:<client HEAD sha>`, built by
 # `ensure_dr_client_image()` (called from `Cluster.up()`).  DR_CLIENT_IMAGE names a prebuilt image instead; it must
@@ -43,9 +45,19 @@ _BROKER_REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 CLIENT_REPO = os.environ.get("DR_CLIENT_REPO", os.path.join(os.path.dirname(_BROKER_REPO), "rune-client-cpp"))
 _CLIENT_SHA = _git_sha(CLIENT_REPO)
 DR_IMAGE = os.environ.get("DR_CLIENT_IMAGE", f"rune-dr-client:{_CLIENT_SHA}")
+class ClientHangWarning(UserWarning):
+    """A dr client ran past its harness timeout (a hang, not a clean failure)."""
+
+
+# Quiet period that ends a drain read (mode=subscribe, expect=0) of a static log once every subscribed partition
+# has delivered: see _drain_complete.  DR_DRAIN_QUIET_MS=0 restores the full fixed windows.
+# 3 s: a static backlog streams at millisecond gaps (dr_client prints every record as it lands), so 3 s of silence
+# after every partition delivered is > 1000x the stream's own gap.
+DRAIN_QUIET_MS = int(os.environ.get("DR_DRAIN_QUIET_MS", "3000"))
 _DR_BUILD_CONTEXTS = ("rune-protocol", "rune-fr", "rune-codec", "rune-ql", "rune-crypto")
 
 
+@timed("image.dr_client")
 def ensure_dr_client_image() -> None:
     """Make sure DR_IMAGE was built from the current client checkout, or raise.
 
@@ -53,6 +65,17 @@ def ensure_dr_client_image() -> None:
     (DR_ALLOW_STALE_CLIENT_IMAGE=1 explicitly accepts a mismatch).  Unset: build it (five sibling build
     contexts; a layer-cache hit when nothing changed); a failed build raises.
     """
+    from .images import prepared
+    if prepared() or DR_IMAGE in _DR_IMAGE_READY:
+        return                       # built/verified once at session start (harness.images.prepare_all)
+    _ensure_dr_client_image()
+    _DR_IMAGE_READY.add(DR_IMAGE)
+
+
+_DR_IMAGE_READY: set[str] = set()
+
+
+def _ensure_dr_client_image() -> None:
     if os.environ.get("DR_CLIENT_IMAGE"):
         label = run(["docker", "image", "inspect", "-f", '{{ index .Config.Labels "rune.client.sha" }}', DR_IMAGE],
                     timeout=30)
@@ -277,6 +300,7 @@ def _parse_txn_output(cid: int, exit_code: int, out: str) -> TxnResult:
     return res
 
 
+@timed("clients.txn")
 def run_txn(
     *,
     network: str,
@@ -327,6 +351,7 @@ def run_txn(
     return _parse_txn_output(cid, res.returncode, res.stdout + "\n" + res.stderr)
 
 
+@timed("clients.txn_consume")
 def run_txn_consume(
     *,
     network: str,
@@ -458,6 +483,7 @@ def _run_one_group_member(
     return _parse_group_member_output(cid, res.returncode, res.stdout + "\n" + res.stderr)
 
 
+@timed("clients.group")
 def run_group(
     members: int,
     *,
@@ -614,6 +640,70 @@ def _parse_client_output(cid: int, exit_code: int, out: str) -> ClientResult:
     return res
 
 
+_DELIVERED_PART_RE = re.compile(r"^DELIVERED cid=-?\d+ key=-?\d+ seq=-?\d+ part=(-?\d+) ")
+
+
+def _drain_complete(quiet_s: float, part_base: int, parts: int):
+    """Stop predicate of a drain subscriber (mode=subscribe, expect=0): the subscriber has read the whole STATIC log
+    once every subscribed partition delivered at least one record and no record arrived for `quiet_s`.
+
+    Only for verification reads taken after the workload stopped (nothing produces concurrently), so the log is
+    fixed for the read: the broker streams a partition's backlog contiguously from `earliest`, and a quiet gap after
+    every partition started delivering is the end of that backlog.  A partition that never delivers keeps the full
+    window (the old behaviour), so an empty or slow partition is never cut short; a cut that did leave a committed
+    record unread fails assert_no_committed_loss loudly - it cannot pass silently."""
+    want = set(range(part_base, part_base + max(1, parts)))
+    state = {"n": 0, "last": None, "seen": set()}
+
+    def stop_when(lines: list[str], now: float) -> bool:
+        while state["n"] < len(lines):
+            m = _DELIVERED_PART_RE.match(lines[state["n"]])
+            state["n"] += 1
+            if m:
+                state["seen"].add(int(m.group(1)))
+                state["last"] = now
+        return (state["last"] is not None and want <= state["seen"] and now - state["last"] >= quiet_s)
+    return stop_when
+
+
+STALL_GRACE_S = 10.0
+RATE_ENVELOPE_GRACE_S = 30.0
+
+
+def _producer_envelope(env: dict, timeout_s: int) -> int:
+    """The time a produce-mode client may run.  A RATE-LIMITED producer (RUNE_RATE_HZ > 0 - the producers that span a
+    fault window: kill / pause / netem mid-produce) needs records/rate seconds to send, plus at most one per-record
+    deadline (RUNE_TIMEOUT_MS) for the records in flight when the fault lands, plus 30 s for connect + failover:
+    records/rate + RUNE_TIMEOUT_MS + 30 s.  Past that it is not failing over (measured 2026-10-15: after a mid-produce leader
+    SIGKILL the client never re-routes the partition the dead node led, so every later record for it waits out its
+    30 s delivery timeout - the old 240-480 s envelopes were always used up).  The caller's timeout_s still caps it;
+    acks printed before the cut are kept (exit 124 + ClientHangWarning, see _run_one_client)."""
+    rate = int(env.get("RUNE_RATE_HZ", "0") or 0)
+    if rate <= 0:
+        return timeout_s
+    budget = int(env["RUNE_RECORDS"]) / rate + int(env["RUNE_TIMEOUT_MS"]) / 1000.0 + RATE_ENVELOPE_GRACE_S
+    return int(min(timeout_s, budget)) + 1
+
+
+def _producer_stalled(stall_s: float):
+    """Stop predicate of a produce-mode client: no PRODUCED line (no ack) for `stall_s` = 2 x RUNE_TIMEOUT_MS + 10 s,
+    counted from the start or the last ack.  dr_client gives every record its own RUNE_TIMEOUT_MS deadline (and
+    connect the same budget), so two whole deadlines without one ack is a wedged producer: after a mid-produce leader
+    kill the old harness waited out the full timeout_s envelope (240-480 s) for it and then threw the acks away.
+    Every ack printed before the stall is kept and checked."""
+    state = {"n": 0, "last": None}
+
+    def stop_when(lines: list[str], now: float) -> bool:
+        if state["last"] is None:
+            state["last"] = now
+        while state["n"] < len(lines):
+            if lines[state["n"]].startswith("PRODUCED "):
+                state["last"] = now
+            state["n"] += 1
+        return now - state["last"] >= stall_s
+    return stop_when
+
+
 def _run_one_client(
     *,
     network: str,
@@ -689,8 +779,46 @@ def _run_one_client(
             args += ["-e", f"{k}={v}"]
         args.append(DR_IMAGE)
 
-        res = run(args, timeout=timeout_s)
+        quiet_ms = int(cfg.get("drain_quiet_ms", 0))
+        try:
+            if quiet_ms > 0 and env["RUNE_MODE"] == "subscribe":
+                res = run_until(args, timeout=timeout_s,
+                                stop_when=_drain_complete(quiet_ms / 1000.0,
+                                                          int(env["RUNE_SUB_PARTITION_BASE"]),
+                                                          int(env["RUNE_SUB_PARTITIONS"])))
+            elif env["RUNE_MODE"] == "produce":
+                stall_s = 2 * int(env["RUNE_TIMEOUT_MS"]) / 1000.0 + STALL_GRACE_S
+                res = run_until(args, timeout=_producer_envelope(env, timeout_s),
+                                stop_when=_producer_stalled(stall_s))
+            else:
+                res = run(args, timeout=timeout_s)
+        except CommandTimeout as e:
+            # The client HUNG past the harness envelope (it is removed).  Before: the TimeoutError escaped, and a
+            # caller running the clients on a thread (mid-produce kill scenarios) silently lost every PRODUCED line -
+            # its no-committed-loss check then ran over an EMPTY acked set and passed vacuously.  Now the acked
+            # records printed before the hang are kept, the result is a failure (exit 124, not ok) and the hang is
+            # named in the output and as a warning.
+            cr = _parse_client_output(cid, 124, e.stdout + "\n" + e.stderr)
+            cr.raw += f"\nHARNESS: client {run_name} still running after its {e.timeout}s envelope - removed (HANG)\n"
+            warnings.warn(f"dr client {run_name} (cid={cid}, mode={env['RUNE_MODE']}) ran past its {e.timeout}s envelope; "
+                          f"{len(cr.produced)} acked / {len(cr.delivered)} delivered records kept", ClientHangWarning)
+            return cr
         cr = _parse_client_output(cid, res.returncode, res.stdout + "\n" + res.stderr)
+        if getattr(res, "stopped_by_harness", False) and env["RUNE_MODE"] == "produce":
+            # Stalled producer: no ack for two of its own per-record deadlines.  Same treatment as a hang past
+            # timeout_s (a failure, exit 124, acks kept, warned) - only detected without waiting out the envelope.
+            cr.exit_code, cr.rc = 124, 1
+            cr.raw += (f"\nHARNESS: producer {run_name} made no progress (no ack) for 2 x RUNE_TIMEOUT_MS + "
+                       f"{STALL_GRACE_S:g} s - removed (STALL)\n")
+            warnings.warn(f"dr producer {run_name} (cid={cid}) stalled: no ack for 2 x {env['RUNE_TIMEOUT_MS']} ms; "
+                          f"{len(cr.produced)} acked records kept", ClientHangWarning)
+            return cr
+        if getattr(res, "stopped_by_harness", False):
+            # The drain is complete (see _drain_complete); the client was still inside its subscribe window, so it
+            # printed no SUMMARY.  A FATAL line would have ended the process on its own - none can be pending here.
+            cr.rc = 0
+            cr.raw += (f"\nHARNESS: drain complete - every subscribed partition delivered and {quiet_ms} ms without "
+                       f"a new record; subscriber stopped before its {env['RUNE_SUBSCRIBE_MS']} ms window\n")
         last = cr
         # Retry on transient startup failures with no produced records:
         #   * connect-timeout ("connect() timed out") — broker not yet ready
@@ -712,6 +840,7 @@ def _run_one_client(
     return last  # exhausted retries — return the last (still-failed) result
 
 
+@timed("clients.run")
 def run_clients(
     n: int,
     *,

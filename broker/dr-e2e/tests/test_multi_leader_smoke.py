@@ -47,6 +47,7 @@ import time
 from typing import Iterator, Optional
 
 import pytest
+from harness.driver import DRAIN_QUIET_MS
 
 from harness import faults
 from harness.cluster import (
@@ -345,6 +346,7 @@ def _subscribe_multi(cluster: Cluster, target_svc: str,
         from_="earliest",
         expect=0,
         subscribe_ms=window_ms,
+        drain_quiet_ms=DRAIN_QUIET_MS,   # post-workload read of a static log: stop once complete (driver._drain_complete)
         timeout_ms=_CONNECT_MS,
         start_stagger_ms=_STAGGER_MS,
     )
@@ -724,6 +726,7 @@ def test_md1_availability_partition_failover(md1_cluster: Cluster) -> None:
             from_="earliest",
             expect=0,
             subscribe_ms=_SUBSCRIBE_MS,
+            drain_quiet_ms=DRAIN_QUIET_MS,   # post-workload read of a static log: stop once complete (driver._drain_complete)
             timeout_ms=_CONNECT_MS,
             start_stagger_ms=_STAGGER_MS,
         )

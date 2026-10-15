@@ -45,6 +45,7 @@ import textwrap
 from typing import Iterator
 
 import pytest
+from harness.driver import DRAIN_QUIET_MS
 
 from harness import faults
 from harness.cluster import Cluster
@@ -296,6 +297,7 @@ def _produce_and_assert_all_delivered(
         expect=0,   # drain window; let assert_no_committed_loss do the count
         from_="earliest",
         subscribe_ms=60_000,
+        drain_quiet_ms=DRAIN_QUIET_MS,   # post-workload read of a static log: stop once complete (driver._drain_complete)
         timeout_ms=_CONNECT_MS,
         start_stagger_ms=_STAGGER_MS,
     )

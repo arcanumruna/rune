@@ -57,6 +57,8 @@ class _Script:
         self.calls: list[list[str]] = []
         self.now = [0.0]
         monkeypatch.setenv("DR_QL_IMAGE", "rune-ql-probe:test")
+        monkeypatch.delenv("DR_IMAGES_PREPARED", raising=False)   # the session hook may have prepared the real images
+        monkeypatch.setattr(hc, "_QL_IMAGE_READY", set())
         monkeypatch.setattr(hc, "run", self._run)
         monkeypatch.setattr(hc, "time", types.SimpleNamespace(time=lambda: self.now[0], sleep=lambda s: None))
 
@@ -121,11 +123,27 @@ def test_create_topics_refuses_a_missing_created_line(monkeypatch):
         hc.Cluster(project="t-ct").create_topics(hc.DEFAULT_TOPICS)
 
 
-def test_create_topics_always_rebuilds_the_cli_image(monkeypatch):
-    s = _Script(monkeypatch, [_res(0, OK3)])
+def test_create_topics_builds_the_cli_image_once_per_process(monkeypatch):
+    s = _Script(monkeypatch, [_res(0, OK3), _res(0, OK3)])
+    hc.Cluster(project="t-ct").create_topics(hc.DEFAULT_TOPICS)
     hc.Cluster(project="t-ct").create_topics(hc.DEFAULT_TOPICS)
     builds = [c for c in s.calls if c[0] == "bash" and "--build-image" in c]
-    assert len(builds) == 1, "the CLI image is rebuilt on every create_topics (a stale sha-tagged image must never run)"
+    assert len(builds) == 1, "the CLI image is (re)built from the working tree once per process, not per create_topics"
+
+
+def test_create_topics_skips_the_build_when_the_session_prepared_the_images(monkeypatch):
+    s = _Script(monkeypatch, [_res(0, OK3)])
+    monkeypatch.setenv("DR_IMAGES_PREPARED", "1")
+    hc.Cluster(project="t-ct").create_topics(hc.DEFAULT_TOPICS)
+    assert not [c for c in s.calls if c[0] == "bash"]
+
+
+def test_a_failed_cli_image_build_is_a_topic_creation_error(monkeypatch):
+    s = _Script(monkeypatch, [])
+    monkeypatch.setattr(hc, "run", lambda args, **kw: CmdResult(args, 1, "", "build broke"))
+    with pytest.raises(hc.TopicCreationError, match="cannot build the rune CLI image"):
+        hc.Cluster(project="t-ct").create_topics(hc.DEFAULT_TOPICS)
+    _ = s
 
 
 def test_a_str_topics_argument_is_a_type_error_not_a_tuple_of_characters():

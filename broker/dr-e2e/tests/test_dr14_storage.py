@@ -94,7 +94,7 @@ import pytest
 
 from harness import faults
 from harness.cluster import SERVICES, node_id_to_service
-from harness.driver import Results, run_clients
+from harness.driver import DRAIN_QUIET_MS, Results, run_clients
 from harness.invariants import (
     assert_exactly_once,
     assert_no_committed_loss,
@@ -143,7 +143,7 @@ def _produce(cluster, target_svc: str, n: int, cid_base: int, records: int,
 
 
 def _subscribe_all(cluster, target_svc: str, cid_base: int, keys: int,
-                   window_ms: int = 90_000) -> Results:
+                   window_ms: int = 90_000, drain_quiet_ms: int = DRAIN_QUIET_MS) -> Results:
     """Subscribe-from-earliest on target_svc and drain the whole partition set."""
     return run_clients(
         1,
@@ -158,6 +158,7 @@ def _subscribe_all(cluster, target_svc: str, cid_base: int, keys: int,
         expect=0,                  # drain window; don't require a fixed count
         from_="earliest",
         subscribe_ms=window_ms,
+        drain_quiet_ms=drain_quiet_ms,   # stop once the static log is fully read (driver._drain_complete)
         timeout_ms=_CONNECT_MS,
         start_stagger_ms=_STAGGER_MS,
     )
@@ -271,7 +272,7 @@ def test_dr14_torn_log_tail_recovery(fresh_cluster, target_role):
 
     # ── SIGKILL the target node ───────────────────────────────────────────────
     faults.kill_node(cluster, target_svc, signal.SIGKILL)
-    time.sleep(3.0)
+    cluster.wait_running([x for x in SERVICES if x != target_svc], 3.0)   # was a fixed 3 s sleep
 
     running = cluster.running_services()
     assert target_svc not in running, (
@@ -316,6 +317,8 @@ def test_dr14_torn_log_tail_recovery(fresh_cluster, target_role):
     # ── Restart the damaged node ──────────────────────────────────────────────
     # compose.start() restarts a stopped (exited) container.
     cluster.compose.start(target_svc)
+    # KEPT fixed: the outcome below branches on recover-and-heal vs clean refusal - the damaged node needs the full
+    # window to either crash on the corruption or rejoin, or the branch would be picked on a half-started node.
     time.sleep(12.0)  # generous: recovery + replication catch-up + ISR re-join
 
     # ── Outcome assertion: recover-and-heal OR clean-refusal ─────────────────
@@ -442,7 +445,7 @@ def test_dr14_mid_log_corruption_detection(fresh_cluster):
 
     # ── SIGKILL the follower ──────────────────────────────────────────────────
     faults.kill_node(cluster, follower_svc, signal.SIGKILL)
-    time.sleep(3.0)
+    cluster.wait_running([x for x in SERVICES if x != follower_svc], 3.0)   # was a fixed 3 s sleep
 
     running = cluster.running_services()
     assert follower_svc not in running, (
@@ -460,7 +463,7 @@ def test_dr14_mid_log_corruption_detection(fresh_cluster):
 
     # ── Restart the follower ──────────────────────────────────────────────────
     cluster.compose.start(follower_svc)
-    time.sleep(12.0)
+    time.sleep(12.0)   # KEPT fixed: same recover-or-refuse branch as above needs the full window
 
     # ── Outcome: recover + re-fetch OR clean refusal ──────────────────────────
     running_after = cluster.running_services()

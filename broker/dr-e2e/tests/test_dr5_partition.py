@@ -64,7 +64,7 @@ import pytest
 
 from harness import faults
 from harness.cluster import SERVICES, node_id_to_service
-from harness.driver import Results, run_clients
+from harness.driver import DRAIN_QUIET_MS, Results, run_clients
 from harness.invariants import (
     assert_exactly_once,
     assert_no_committed_loss,
@@ -114,7 +114,7 @@ def _produce(cluster, target_svc: str, n: int, cid_base: int, records: int,
 
 
 def _subscribe_all(cluster, target_svc: str, cid_base: int, keys: int,
-                   window_ms: int = 60000) -> Results:
+                   window_ms: int = 60000, drain_quiet_ms: int = DRAIN_QUIET_MS) -> Results:
     """Subscribe-from-earliest and drain the whole partition set."""
     return run_clients(
         1,
@@ -129,6 +129,7 @@ def _subscribe_all(cluster, target_svc: str, cid_base: int, keys: int,
         expect=0,                  # drain; don't require a fixed count
         from_="earliest",
         subscribe_ms=window_ms,
+        drain_quiet_ms=drain_quiet_ms,   # stop once the static log is fully read (driver._drain_complete)
         timeout_ms=_CONNECT_MS,
         start_stagger_ms=_STAGGER_MS,
     )
@@ -261,6 +262,8 @@ def test_dr5_leader_isolation(fresh_cluster, netem_ready, rep):
         faults.partition(cluster, leader_svc)
 
         # Give the majority side time to detect heartbeat loss + trigger election.
+        # KEPT fixed: the leader stays isolated >= 8 s before the isolated-leader-cannot-serve probe below - the
+        # isolation length is part of the scenario (the ex-leader has long passed its election timeout).
         time.sleep(8.0)
 
         # ── Majority side must elect a new leader ─────────────────────────────
@@ -300,8 +303,8 @@ def test_dr5_leader_isolation(fresh_cluster, netem_ready, rep):
         faults.heal_all(cluster)
 
     # ── Convergence: wait for ex-leader to rejoin ─────────────────────────────
-    # After heal, give the ex-leader time to reconnect and catch up.
-    time.sleep(8.0)
+    # After heal, give the ex-leader time to reconnect and step down (was a fixed 8 s sleep; at most 8 s now).
+    cluster.settle(8.0, running=list(SERVICES))
 
     # Full single-leader check across all three nodes (ex-leader is back).
     assert_single_leader(cluster)
@@ -397,6 +400,8 @@ def test_dr5_follower_isolation(fresh_cluster, netem_ready, rep):
         faults.partition(cluster, follower_svc)
 
         # Give the leader a moment to detect ISR shrinkage.
+        # KEPT fixed: an observation window - the "leader must NOT change" checks below need the partition to
+        # have lasted long enough for a spurious election to show.
         time.sleep(5.0)
 
         # The leader and third_svc still form a majority (2/3 = minIsr(2)).
@@ -432,8 +437,8 @@ def test_dr5_follower_isolation(fresh_cluster, netem_ready, rep):
         # Always heal — belt-and-suspenders.
         faults.heal_all(cluster)
 
-    # ── Catch-up: give the follower time to fetch missed records ──────────────
-    time.sleep(10.0)
+    # ── Catch-up: give the follower time to rejoin (was a fixed 10 s sleep; the checks below are unchanged) ──
+    cluster.settle(10.0, running=list(SERVICES))
 
     # Full single-leader check — follower is back, leader should not have changed.
     assert_single_leader(cluster)

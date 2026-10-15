@@ -37,8 +37,23 @@ dr-e2e/
 * Docker (Docker Desktop on macOS is fine — netem proven, see caveat below).
 * The broker + client images built once:
   * `rune-broker-rune-{1,2,3}` — `cd rune-broker && docker compose -f docker/docker-compose.yml build`
-  * `rune-dr-client:<client sha>` — built by the harness itself on every `Cluster.up()` (`harness.driver.ensure_dr_client_image`: `docker build -f docker/Dockerfile.dr` with the five build contexts rune-protocol, rune-fr, rune-codec, rune-ql, rune-crypto; a cache hit when nothing changed). A prebuilt `DR_CLIENT_IMAGE` must carry a matching `rune.client.sha` label (`--build-arg RUNE_CLIENT_SHA=<client HEAD>`) or the harness refuses it; `DR_ALLOW_STALE_CLIENT_IMAGE=1` accepts a mismatch explicitly.
-  * `rune-netem:dev` — built automatically on first network-fault use.
+  * `rune-dr-client:<client sha>` — built by the harness ONCE per session, before any test (`harness.images.prepare_all`, from `pytest_sessionstart`: `docker build -f docker/Dockerfile.dr` with the five build contexts rune-protocol, rune-fr, rune-codec, rune-ql, rune-crypto). A prebuilt `DR_CLIENT_IMAGE` must carry a matching `rune.client.sha` label (`--build-arg RUNE_CLIENT_SHA=<client HEAD>`) or the harness refuses it; `DR_ALLOW_STALE_CLIENT_IMAGE=1` accepts a mismatch explicitly.
+  * the rune CLI image (`rune-ql-probe:<client sha>`, topic DDL), `rune-netem:<hash>` and `alpine:latest` — prepared in the same session step.
+  * The broker image `rune-broker-node:<RUNE_IMAGE_TAG or broker HEAD>` must exist (or `DR_E2E_BUILD=1` builds it in that step).
+  A failed build/check ends the session before the first test (exit 3) - never inside a test's timeout.
+  `DR_SKIP_IMAGE_PREP=1` skips the step (the images are then built lazily, once per process).
+
+## Speed (2026-10-15)
+
+* `DR_TIMING_LOG=<file>` writes one JSON line per harness phase; `python3 tools/timing_report.py <file>` prints
+  exclusive seconds per phase.
+* Verification reads (`mode=subscribe`, `expect=0`, taken after the workload stopped) end once every subscribed
+  partition delivered and no record arrived for `DR_DRAIN_QUIET_MS` (default 3000; 0 = the old fixed windows) -
+  `driver._drain_complete`.  Reads that run concurrently with production keep their fixed window.
+* Fixed settle sleeps before positive checks are `cluster.settle(max_s)` (until one leader + one term on every
+  running node, at most the old sleep); observation windows and fault durations stay fixed sleeps (`# KEPT:`).
+* Parallel: `pytest -n 2 --dist load` (pytest-xdist); every worker gets its own compose projects
+  (`<project>-gwN`: containers, network, volumes); nothing is published on the host.
 
 ## Run
 
@@ -49,8 +64,8 @@ pytest -v                 # baseline matrix (16 cases) against the live cluster
 DR_E2E_BUILD=1 pytest -v  # also (re)build the compose images on bring-up
 ```
 
-The session-scoped `cluster` fixture brings the 3 nodes up once, waits for a
-leader, and tears down (`down -v --remove-orphans`) at the end — even on failure.
+The module-scoped `cluster` fixture brings the 3 nodes up once per module, waits for a
+leader, and tears down (`down -v --remove-orphans`) when the module ends — even on failure.
 Fault tests that need pristine state per case request the function-scoped
 `fresh_cluster` fixture instead.
 

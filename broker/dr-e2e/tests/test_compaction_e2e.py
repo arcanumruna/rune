@@ -46,8 +46,9 @@ from collections import defaultdict
 from typing import Iterator
 
 import pytest
+from harness.driver import DRAIN_QUIET_MS
 
-from harness import faults
+from harness import faults, timing
 from harness.cluster import BROKER_REPO, COMPOSE_FILE, SERVICES, Cluster, node_id_to_service
 from harness.driver import Results, run_clients
 from harness.invariants import assert_single_leader
@@ -268,6 +269,7 @@ def _subscribe_compact(cluster: Cluster, target_svc: str, cid_base: int,
         expect=0,           # drain window; don't require a fixed count
         from_="earliest",
         subscribe_ms=window_ms,
+        drain_quiet_ms=DRAIN_QUIET_MS,   # post-workload read of a static log: stop once complete (driver._drain_complete)
         timeout_ms=_CONNECT_MS,
         start_stagger_ms=_STAGGER_MS,
     )
@@ -309,6 +311,7 @@ def _subscribe_delete(cluster: Cluster, target_svc: str, cid_base: int,
         expect=0,
         from_="earliest",
         subscribe_ms=window_ms,
+        drain_quiet_ms=DRAIN_QUIET_MS,   # post-workload read of a static log: stop once complete (driver._drain_complete)
         timeout_ms=_CONNECT_MS,
         start_stagger_ms=_STAGGER_MS,
     )
@@ -334,6 +337,16 @@ def _count_log_files(project: str, service_idx: int) -> int:
 def _wait_for_compaction(cluster: Cluster, leader_svc: str, *,
                          initial_count: int, timeout_s: float = 45.0,
                          poll_s: float = 2.0, stable_polls: int = 3) -> bool:
+    with timing.phase("poll.compaction", f"initial={initial_count}") as ph:
+        counts: list[int] = []
+        ok = _wait_for_compaction_impl(cluster, leader_svc, initial_count=initial_count, timeout_s=timeout_s,
+                                       poll_s=poll_s, stable_polls=stable_polls, counts=counts)
+        ph.exit = f"{'stable' if ok is True else 'deadline'} counts={counts}"
+        return ok
+
+
+def _wait_for_compaction_impl(cluster: Cluster, leader_svc: str, *, initial_count: int, timeout_s: float,
+                              poll_s: float, stable_polls: int, counts: list[int]) -> bool:
     """Poll until the log file count on the leader node STABILISES below initial_count.
 
     Compaction reduces the number of sealed .log files (by dropping superseded
@@ -358,6 +371,7 @@ def _wait_for_compaction(cluster: Cluster, leader_svc: str, *,
 
     while time.time() < deadline:
         count = _count_log_files(cluster.project, node_idx)
+        counts.append(count)
         if count == -1:
             time.sleep(poll_s)
             continue
@@ -365,14 +379,17 @@ def _wait_for_compaction(cluster: Cluster, leader_svc: str, *,
         if count < initial_count:
             dropped_once = True
 
-        if dropped_once:
-            if count == prev_count:
-                stable_streak += 1
-                if stable_streak >= stable_polls:
-                    return True
-            else:
-                # Still decreasing — reset streak (compaction is still running).
-                stable_streak = 0
+        if count == prev_count:
+            stable_streak += 1
+            if stable_streak >= stable_polls:
+                # Dropped and stable: the passes are done.  Stable WITHOUT a drop (measured 2026-10-15: the
+                # leader's .log count never moves - 12 on every poll of every run - so this wait always ran to its
+                # 45 s deadline): the file count is no signal here; return False at once.  Every caller follows
+                # with _wait_for_latest_per_key, which polls the real convergence before the strict assertions.
+                return dropped_once
+        else:
+            # Still changing — reset streak (compaction is still running).
+            stable_streak = 0
         prev_count = count
         time.sleep(poll_s)
     return dropped_once  # partial progress is better than False
@@ -402,8 +419,15 @@ def _wait_for_latest_per_key(subscribe_fn, expected_keys: int, *,
     proves the cleaner DOES converge to latest-per-key; this helper waits for that
     same convergence end-to-end.
     """
+    with timing.phase("poll.latest_per_key") as ph:
+        last = _wait_for_latest_per_key_impl(subscribe_fn, expected_keys, timeout_s, poll_s, ph)
+        return last
+
+
+def _wait_for_latest_per_key_impl(subscribe_fn, expected_keys, timeout_s, poll_s, ph):
     deadline = time.time() + timeout_s
     last = None
+    ph.exit = "deadline"
     while time.time() < deadline:
         last = subscribe_fn()
         n_test = sum(1 for m in last.all_delivered if _is_test_cid(m.cid))
@@ -412,6 +436,7 @@ def _wait_for_latest_per_key(subscribe_fn, expected_keys: int, *,
                         if _is_test_cid(m.cid)})
         # Converged iff exactly one record per key (n_test == distinct == keys).
         if n_test == expected_keys and distinct == expected_keys:
+            ph.exit = "converged"
             return last
         time.sleep(poll_s)
     return last  # timed out — return the last observation for the assertion to report
@@ -657,7 +682,7 @@ def test_cp5_compaction_survives_restart(compaction_cluster):
         )
     else:
         # Can't observe file count — fixed wait for cleaner to cycle.
-        time.sleep(12.0)
+        time.sleep(12.0)   # KEPT: fallback, no observable condition
         compaction_observed = None  # unknown
 
     # ── Restart the broker (container restart, not full cluster) ──────────────
@@ -684,7 +709,7 @@ def test_cp5_compaction_survives_restart(compaction_cluster):
         _wait_for_compaction(cluster, new_leader_svc,
                              initial_count=new_initial_count, timeout_s=45.0)
     else:
-        time.sleep(30.0)
+        time.sleep(30.0)   # KEPT: fallback when segment files cannot be counted - no condition to poll
 
     # ── Subscribe-from-earliest, waiting for compaction convergence ────────────
     cid_sub = _next_cid_base()
@@ -782,7 +807,7 @@ def test_cp5_compaction_survives_failover(compaction_cluster):
                               initial_count=initial_file_count,
                               timeout_s=45.0)
     else:
-        time.sleep(12.0)
+        time.sleep(12.0)   # KEPT: fallback when segment files cannot be counted - no condition to poll
 
     # ── Kill the current leader → trigger re-election ─────────────────────────
     faults.kill_node(cluster, leader_svc, signal.SIGKILL)
@@ -806,7 +831,7 @@ def test_cp5_compaction_survives_failover(compaction_cluster):
                               initial_count=new_initial_file_count,
                               timeout_s=45.0)
     else:
-        time.sleep(12.0)
+        time.sleep(12.0)   # KEPT: fallback when segment files cannot be counted - no condition to poll
 
     # ── Wait for data plane ready on new leader before subscribing ────────────
     cluster.wait_data_plane_ready(max_attempts=8, timeout_s=120,
@@ -929,12 +954,12 @@ def test_cp5_retention_e2e(compaction_cluster):
     # ── Wait briefly for the retention cleaner to run at least one pass ────────
     # retentionCheckMs=1 means the cleaner checks retention very frequently.
     # The data is ~5 KiB, the cap is 32 KiB, so NO deletion should occur.
-    time.sleep(5.0)
+    time.sleep(5.0)   # KEPT: observation window - retention must NOT delete fresh data
 
     # ── Restart the broker (the key CP-5.1 stress: does recover() compute
     #    correct largestTimestamp so that retention does NOT delete fresh data?) ──
     faults.restart(cluster, leader_svc)
-    time.sleep(10.0)
+    time.sleep(10.0)   # KEPT: observation window - the restarted cleaner must NOT delete fresh data
 
     new_lid = cluster.wait_for_leader(timeout_s=60)
     new_leader_svc = node_id_to_service(new_lid)
@@ -1070,15 +1095,15 @@ def test_cp5_consumer_offsets_compaction(fresh_cluster):
     from harness.cluster import SERVICES as ALL_SERVICES
     for svc in ALL_SERVICES:
         faults.kill_node(cluster, svc, signal.SIGKILL)
-        time.sleep(0.3)
+        time.sleep(0.3)   # KEPT: inter-kill gap (scenario)
 
-    time.sleep(3.0)
+    cluster.wait_running([], 3.0)   # was a fixed 3 s sleep
     running_before = cluster.running_services()
     assert len(running_before) == 0, f"not all nodes down: {running_before}"
 
     for svc in ALL_SERVICES:
         cluster.compose.start(svc)
-        time.sleep(0.3)
+        time.sleep(0.3)   # KEPT: startup stagger (scenario)
 
     new_lid = cluster.wait_for_leader(timeout_s=120)
     new_leader_svc = node_id_to_service(new_lid)

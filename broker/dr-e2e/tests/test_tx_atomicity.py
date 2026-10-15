@@ -19,6 +19,7 @@ import time
 import uuid
 
 import pytest
+from harness.driver import DRAIN_QUIET_MS
 
 from harness import faults
 from harness.driver import run_clients, run_txn, run_txn_consume
@@ -279,6 +280,7 @@ def test_tx_producer_retry_after_failover_no_dup(fresh_cluster):
         from_="earliest",
         expect=0,
         subscribe_ms=20000,
+        drain_quiet_ms=DRAIN_QUIET_MS,   # post-workload read of a static log: stop once complete (driver._drain_complete)
         timeout_ms=_CONNECT_MS,
         timeout_s=120,
     )
@@ -373,6 +375,7 @@ def test_tx_multi_topic_partition_dedup_isolation(fresh_cluster):
         from_="earliest",
         expect=0,
         subscribe_ms=20000,
+        drain_quiet_ms=DRAIN_QUIET_MS,   # post-workload read of a static log: stop once complete (driver._drain_complete)
         timeout_ms=_CONNECT_MS,
         timeout_s=120,
     )
@@ -387,6 +390,7 @@ def test_tx_multi_topic_partition_dedup_isolation(fresh_cluster):
         from_="earliest",
         expect=0,
         subscribe_ms=20000,
+        drain_quiet_ms=DRAIN_QUIET_MS,   # post-workload read of a static log: stop once complete (driver._drain_complete)
         timeout_ms=_CONNECT_MS,
         timeout_s=120,
     )

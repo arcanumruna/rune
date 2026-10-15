@@ -35,7 +35,7 @@ import time
 import pytest
 
 from harness import faults
-from harness.cluster import node_id_to_service
+from harness.cluster import SERVICES, node_id_to_service
 from harness.driver import (
     GroupResults,
     GroupMemberResult,
@@ -177,7 +177,7 @@ def test_cg_failover_leader_kill(fresh_cluster):
     assert new_leader_svc != leader_svc, "leader did not change after kill"
 
     # Brief settle for the new coordinator to be ready.
-    time.sleep(3.0)
+    time.sleep(3.0)   # KEPT: group-coordinator readiness on the new leader is not observable from the harness
 
     # Phase 2b: produce a SECOND batch against the NEW leader.
     # This exercises the real durability path: the new leader serves these records
@@ -315,7 +315,7 @@ def test_cg_failover_leader_kill_netem(fresh_cluster, netem_ready):
     new_leader_svc = node_id_to_service(new_lid)
     faults.clear_netem(cluster, follower_svc)
 
-    time.sleep(3.0)
+    time.sleep(3.0)   # KEPT: group-coordinator readiness on the new leader is not observable from the harness
 
     # Produce a second batch after failover (same as the non-netem variant):
     # exercises the committed-offset replication path for the netem case.

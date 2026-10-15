@@ -81,7 +81,7 @@ import pytest
 
 from harness import faults
 from harness.cluster import SERVICES, node_id_to_service
-from harness.driver import Results, run_clients
+from harness.driver import DRAIN_QUIET_MS, Results, run_clients
 from harness.invariants import (
     assert_exactly_once,
     assert_no_committed_loss,
@@ -134,7 +134,7 @@ def _produce(cluster, target_svc: str, n: int, cid_base: int, records: int,
 
 
 def _subscribe_all(cluster, target_svc: str, cid_base: int, keys: int,
-                   window_ms: int = 90000) -> Results:
+                   window_ms: int = 90000, drain_quiet_ms: int = DRAIN_QUIET_MS) -> Results:
     """Subscribe-from-earliest and drain the whole partition set.
 
     window_ms default is 90 s — generous for chaos / netem-inflated delivery.
@@ -152,6 +152,7 @@ def _subscribe_all(cluster, target_svc: str, cid_base: int, keys: int,
         expect=0,                  # drain; don't require a fixed count
         from_="earliest",
         subscribe_ms=window_ms,
+        drain_quiet_ms=drain_quiet_ms,   # stop once the static log is fully read (driver._drain_complete)
         timeout_ms=_CONNECT_MS,
         start_stagger_ms=_STAGGER_MS,
     )
@@ -336,7 +337,7 @@ def test_dr8_leader_kill_netem(fresh_cluster, netem_ready, loss_pct):
         # ── Inject netem loss on one follower ─────────────────────────────────
         # The cluster is still 2/3 majority (leader + clean_follower); ISR ≥ 2.
         faults.netem(cluster, netem_follower, loss=loss_pct)
-        time.sleep(2.0)  # let Aeron observe the loss before starting mid-produce
+        time.sleep(2.0)  # let Aeron observe the loss before starting mid-produce  [KEPT: scenario: produce starts on a degraded link]
 
         # ── Start background producers (rate-limited) ─────────────────────────
         cid_mid = _next_cid_base()
@@ -352,7 +353,7 @@ def test_dr8_leader_kill_netem(fresh_cluster, netem_ready, loss_pct):
         t.start()
 
         # Let production get going, then SIGKILL the leader mid-flight.
-        time.sleep(2.5)
+        time.sleep(2.5)   # KEPT: scenario: the kill lands mid-produce
         faults.kill_node(cluster, leader_svc, signal.SIGKILL)
 
         # ── Wait for re-election on the majority side ─────────────────────────
@@ -377,8 +378,8 @@ def test_dr8_leader_kill_netem(fresh_cluster, netem_ready, loss_pct):
         faults.heal_all(cluster)
 
     # ── Convergence after heal ────────────────────────────────────────────────
-    # Give the cluster time to settle and the killed leader's slot to be noted.
-    time.sleep(8.0)
+    # Give the cluster time to settle and the killed leader's slot to be noted (was a fixed 8 s sleep).
+    cluster.settle(8.0, running=[s for s in SERVICES if s != leader_svc])
 
     # Full single-leader check on the 2 running nodes (killed leader still down).
     running = cluster.running_services()
@@ -405,7 +406,7 @@ def test_dr8_leader_kill_netem(fresh_cluster, netem_ready, loss_pct):
     # can never see 3 running nodes because this scenario SIGKILLs the leader and
     # never brings it back.
     cluster.compose.start(leader_svc)
-    time.sleep(8.0)  # cold-start + log-replay + ISR rejoin
+    cluster.settle(8.0, running=list(SERVICES))  # cold-start + log-replay + ISR rejoin (was a fixed 8 s sleep)
     running = cluster.running_services()
     assert len(running) == 3, (
         f"expected 3 running after ex-leader restart, got {running}"
@@ -474,7 +475,7 @@ def test_dr8_rolling_restart_churn(fresh_cluster, restart_rounds):
     wt.start()
 
     # Let the workload get going before we start churning.
-    time.sleep(3.0)
+    time.sleep(3.0)   # KEPT: scenario: workload running before the churn starts
 
     try:
         for round_i in range(restart_rounds):
@@ -511,7 +512,7 @@ def test_dr8_rolling_restart_churn(fresh_cluster, restart_rounds):
 
             # Restart the killed leader so it rejoins before the next round.
             cluster.compose.start(current_leader)
-            time.sleep(8.0)  # allow the rejoined node to catch up and re-enter ISR
+            time.sleep(8.0)  # allow the rejoined node to catch up and re-enter ISR  [KEPT: chaos round rhythm (rejoin time between kills is part of the churn)]
 
             # Full 3-node single-leader check (rejoined node must NOT re-declare itself).
             running = cluster.running_services()
@@ -611,7 +612,7 @@ def test_dr8_chaos_soak(fresh_cluster, netem_ready):
     producer_thread.start()
 
     # Let production warm up before the first fault.
-    time.sleep(3.0)
+    time.sleep(3.0)   # KEPT: scenario: production warm before the first fault
 
     # ── Chaos-monkey loop ─────────────────────────────────────────────────────
     rng = random.Random(CHAOS_SEED)
@@ -644,7 +645,7 @@ def test_dr8_chaos_soak(fresh_cluster, netem_ready):
                 faults.kill_node(cluster, target_follower, signal.SIGKILL)
 
                 # Give the leader time to detect ISR shrinkage.
-                time.sleep(3.0)
+                time.sleep(3.0)   # KEPT: chaos round rhythm
 
                 # Majority (leader + other follower) must still serve.
                 majority = [s for s in SERVICES if s != target_follower]
@@ -652,7 +653,7 @@ def test_dr8_chaos_soak(fresh_cluster, netem_ready):
 
                 # Restart the follower; wait for it to rejoin.
                 cluster.compose.start(target_follower)
-                time.sleep(5.0)
+                time.sleep(5.0)   # KEPT: chaos round rhythm
 
                 running = cluster.running_services()
                 assert len(running) == 3, (
@@ -672,11 +673,11 @@ def test_dr8_chaos_soak(fresh_cluster, netem_ready):
                 faults.netem(cluster, netem_target, loss=loss_pct)
 
                 # Sustained brief window under loss.
-                time.sleep(4.0)
+                time.sleep(4.0)   # KEPT: fault duration (loss window)
 
                 # Clear the loss and let Aeron retransmit settle.
                 faults.clear_netem(cluster, netem_target)
-                time.sleep(2.0)
+                time.sleep(2.0)   # KEPT: chaos round rhythm
 
                 # All nodes should still be running; check single leader.
                 assert_single_leader(cluster)
@@ -694,7 +695,7 @@ def test_dr8_chaos_soak(fresh_cluster, netem_ready):
                 # Pause window: long enough that the cluster may re-elect
                 # (to stress fencing) but short enough to keep the soak bounded.
                 pause_s = rng.uniform(1.5, 3.0)
-                time.sleep(pause_s)
+                time.sleep(pause_s)   # KEPT: fault duration (pause window)
 
                 # Majority-side leader check while follower is paused.
                 majority = [s for s in SERVICES if s != target_follower]
@@ -702,7 +703,7 @@ def test_dr8_chaos_soak(fresh_cluster, netem_ready):
 
                 # Unpause; the follower rejoins (may step down if re-elected).
                 faults.unpause(cluster, target_follower)
-                time.sleep(3.0)
+                time.sleep(3.0)   # KEPT: chaos round rhythm
 
                 # Full cluster: single leader, all 3 running.
                 running = cluster.running_services()
@@ -734,7 +735,7 @@ def test_dr8_chaos_soak(fresh_cluster, netem_ready):
 
                 # Restart the killed leader so the next round starts 3-healthy.
                 cluster.compose.start(old_leader)
-                time.sleep(8.0)  # generous: cold-start + log-replay + ISR rejoin
+                time.sleep(8.0)  # generous: cold-start + log-replay + ISR rejoin  [KEPT: chaos round rhythm]
 
                 running = cluster.running_services()
                 assert len(running) == 3, (
@@ -747,8 +748,8 @@ def test_dr8_chaos_soak(fresh_cluster, netem_ready):
         # Belt-and-suspenders: heal_all clears any lingering netem qdiscs.
         faults.heal_all(cluster)
 
-    # ── Post-soak convergence ─────────────────────────────────────────────────
-    time.sleep(5.0)
+    # ── Post-soak convergence (was a fixed 5 s sleep) ───────────────────────────
+    cluster.settle(5.0, running=list(SERVICES))
 
     # Wait for the background producer to drain (it may have timed out / bailed
     # during a leader-kill round — that is acceptable; only ACKED records count).
