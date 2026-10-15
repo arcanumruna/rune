@@ -204,7 +204,27 @@ Result runOnce() {
 #endif
 constexpr bool kSanitized = RUNE_TFG_SANITIZED != 0;
 
+/// The attempt the gate judges.  An attempt within BOTH budgets wins outright (the gate retries until one
+/// is); among failing attempts the lowest p99 (then the lowest max) is the one reported.
+/// Regression (2026-10-15): it used to pick by p99 alone, so attempt 1 (max 3095 us, p99 77 us) stayed
+/// "best" over attempts 2 and 3 (max ~200 us, p99 ~80 us — both within budget) and the gate failed a run
+/// whose retries had passed it.
+bool withinBudget(const Result& r) { return r.maxPassUs <= kMaxPassUs && r.p99PassUs <= kP99PassUs; }
+bool judgedOver(const Result& r, const Result& best) {
+    if (withinBudget(r) != withinBudget(best)) return withinBudget(r);
+    return r.p99PassUs < best.p99PassUs || (r.p99PassUs == best.p99PassUs && r.maxPassUs < best.maxPassUs);
+}
+
 }  // namespace
+
+TEST(TransientFailoverLatencyGateRegression, AnAttemptWithinBothBudgetsIsJudgedOverALowerP99OneThatStalled) {
+    Result stalled; stalled.maxPassUs = kMaxPassUs + 1095; stalled.p99PassUs = 77;
+    Result fine;    fine.maxPassUs = 214;                 fine.p99PassUs = 80;
+    EXPECT_TRUE(judgedOver(fine, stalled));
+    EXPECT_FALSE(judgedOver(stalled, fine));
+    Result worse = stalled; worse.p99PassUs = 90;
+    EXPECT_TRUE(judgedOver(stalled, worse)) << "among failing attempts: the lowest p99";
+}
 
 TEST(TransientFailoverLatencyGateRegression, KTransientPartitionsBecomingLeaderNeverStallAWorkerPass) {
     Result best;
@@ -218,9 +238,9 @@ TEST(TransientFailoverLatencyGateRegression, KTransientPartitionsBecomingLeaderN
                     a + 1, kK, kRingB >> 20, static_cast<long long>(r.maxPassUs),
                     static_cast<long long>(r.p99PassUs), r.passes, static_cast<long long>(r.allReadyUs),
                     static_cast<long long>(kMaxPassUs), static_cast<long long>(kP99PassUs));
-        if (r.p99PassUs < best.p99PassUs || (r.p99PassUs == best.p99PassUs && r.maxPassUs < best.maxPassUs)) best = r;
+        if (a == 0 || judgedOver(r, best)) best = r;
         if (kSanitized && !benchMode()) break;   // one functional attempt
-        if (best.maxPassUs <= kMaxPassUs && best.p99PassUs <= kP99PassUs && !benchMode()) break;
+        if (withinBudget(best) && !benchMode()) break;
     }
     if (benchMode()) return;
     EXPECT_GT(best.passes, kK) << "the K rebuilds were not spread over passes";

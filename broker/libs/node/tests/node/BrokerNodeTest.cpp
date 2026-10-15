@@ -45,6 +45,7 @@
 #include <map>
 #include <stdexcept>
 #include <limits>
+#include <random>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -67,10 +68,10 @@ static constexpr std::size_t kWorkerOpFramingFromCodec =
     rune::protocol::internal::sbe::WorkerOp::tailHeaderLength();
 
 static fs::path makeTempDataDir(std::string_view tag = "") {
-    static std::atomic<uint32_t> g_seq{0};
-    auto seq  = g_seq.fetch_add(1, std::memory_order_relaxed);
+    // pid + a per-call random nonce (no shared counter: no static / atomic state).
+    const uint64_t nonce = (static_cast<uint64_t>(std::random_device{}()) << 32) ^ std::random_device{}();
     auto name = std::string("rune_bn_") + std::string(tag) +
-                std::to_string(::getpid()) + "_" + std::to_string(seq);
+                std::to_string(::getpid()) + "_" + std::to_string(nonce);
     return fs::temp_directory_path() / name;
 }
 
@@ -1038,9 +1039,9 @@ TEST(BrokerNodeTest, PerWorkerEgressWiredWithContiguousStreams) {
     NodeConfig cfg = makeSingleNodeConfig(tmp.path);
     cfg.workerCount             = 2;
     cfg.perWorkerEgressEnabled  = true;   // read-rework: gates egress creation
-    // Distinct control ports/streams to avoid collision with other tests' endpoints.
+    // Control ports owned by this process (FreePort.h): never a fixed port a concurrent test could bind.
     cfg.workerEgressControlHost     = "127.0.0.1";
-    cfg.workerEgressControlBasePort = 40360;
+    cfg.workerEgressControlBasePort = rune::aeronutil::testing::allocFreeUdpPortRange(2);
     // workerIngressBaseStreamId resolves to clientStreamId+1 = 2; egressBase auto =
     // ingressBase + workerCount = 2 + 2 = 4.
     cfg.workerIngressBaseStreamId   = 2;

@@ -40,29 +40,16 @@ namespace rune::node::test {
 
 namespace pc = rune::protocol::client;
 
-inline bool udpPortFree(uint16_t port) {
-    const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-    sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); a.sin_port = htons(port);
-    const bool ok = ::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0;
-    ::close(fd);
-    return ok;
-}
-
 inline uint16_t freeUdpPort() {
     return rune::aeronutil::testing::allocFreeUdpPort();   // D8: never an ephemeral port
 }
 
-/// n disjoint blocks of `width` consecutive free UDP ports (per-worker base ranges).
+/// n disjoint blocks of `width` consecutive free UDP ports (per-worker base ranges), each reserved for this
+/// process by the collision-proof allocator (FreePort.h) — every port of a block, not just its first.
 inline std::vector<uint16_t> freeUdpPortBlocks(int n, int width) {
     std::vector<uint16_t> out;
-    for (int attempt = 0; attempt < 2000 && static_cast<int>(out.size()) < n; ++attempt) {
-        const uint16_t p = freeUdpPort();
-        if (p == 0 || static_cast<int>(p) + width > 65535) continue;
-        bool ok = true;
-        for (int k = 0; k < width && ok; ++k) ok = udpPortFree(static_cast<uint16_t>(p + k));
-        for (uint16_t q : out) if (p < q + width && q < p + width) ok = false;
-        if (ok) out.push_back(p);
-    }
+    for (int i = 0; i < n; ++i)
+        out.push_back(rune::aeronutil::testing::allocFreeUdpPortRange(static_cast<uint32_t>(width)));
     return out;
 }
 
@@ -268,6 +255,15 @@ public:
     /// Poll the egress until `pred()` holds (bounded: kMaxIters × 100 µs).
     template <class Pred> bool pollUntil(Pred pred) {
         for (int i = 0; i < kMaxIters; ++i) { poll_(); if (pred()) return true; pause_(); }
+        return pred();
+    }
+    /// Poll the egress until `pred()` holds or `budget` elapses — for a retry loop whose every attempt
+    /// re-sends its stimulus (e.g. produce until a Latest subscription delivers): a short per-attempt window,
+    /// never pollUntil's whole 5 s cap spent on an attempt that cannot succeed.
+    template <class Pred> bool pollFor(std::chrono::milliseconds budget, Pred pred) {
+        const auto deadline = std::chrono::steady_clock::now() + budget;
+        while (std::chrono::steady_clock::now() < deadline) { poll_(); if (pred()) return true; pause_(); }
+        poll_();
         return pred();
     }
     const std::vector<PushedRecords>& records() const noexcept { return records_; }

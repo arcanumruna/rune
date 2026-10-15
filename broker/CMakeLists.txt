@@ -339,11 +339,14 @@ if(BUILD_TESTING)
     find_package(GTest REQUIRED)
     add_executable(rune_broker_process_tests tests/process/BrokerProcessSignalTest.cpp)
     target_link_libraries(rune_broker_process_tests PRIVATE GTest::gtest_main)
+    target_include_directories(rune_broker_process_tests PRIVATE ${CMAKE_SOURCE_DIR}/libs/aeronutil/include)
     target_compile_definitions(rune_broker_process_tests PRIVATE
         RUNE_BROKER_BIN="$<TARGET_FILE:rune_broker>")
     add_dependencies(rune_broker_process_tests rune_broker)
     include(GoogleTest)
-    gtest_discover_tests(rune_broker_process_tests PROPERTIES RUN_SERIAL TRUE)
+    # Not RUN_SERIAL (2026-10-15): every port the spawned broker binds comes from the collision-proof
+    # allocator (FreePort.h) and its dirs are pid-scoped, so it runs in parallel with everything else.
+    gtest_discover_tests(rune_broker_process_tests)
 endif()
 
 # ── rune_role — standalone Aeron node-role counter reader ────────────────────

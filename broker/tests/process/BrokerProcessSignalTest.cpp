@@ -3,6 +3,8 @@
 // SIGUSR2 in every thread and a sigwait thread turns them into control-ring
 // events; this spawns the actual binary, sends kill(pid, sig) and expects a
 // clean stop with exit status 0 (never a default-action death, never a hang).
+#include <rune/aeronutil/testing/FreePort.h>
+
 #include <gtest/gtest.h>
 
 #include <chrono>
@@ -40,10 +42,6 @@ struct Broker {
     }
 };
 
-int basePort(int slot) {
-    return 31000 + static_cast<int>(::getpid() % 400) * 10 + slot * 2;
-}
-
 // Spawn rune_broker (single node).  ignoreSigint: start it the way a shell
 // starts a background job — SIGINT inherited as SIG_IGN across exec.
 Broker spawnBroker(int slot, bool ignoreSigint) {
@@ -53,7 +51,12 @@ Broker spawnBroker(int slot, bool ignoreSigint) {
     fs::remove_all(b.dir);
     fs::create_directories(b.dir);
     b.logPath = (b.dir / "broker.log").string();
-    const int port = basePort(slot);
+    // Every port the broker binds is explicit and owned by this process (FreePort.h: flock-owned port blocks),
+    // so concurrently running test processes never collide: consensus, client, replication and the 1-worker
+    // shard bases (ingress / repl / egress control), advertised in RUNE_PEERS (id@host:cons:client:repl:
+    // replBase:ingressBase:egressControlBase) so nothing is derived from the node id (fixed 41000+ ports).
+    auto port = [] { return std::to_string(rune::aeronutil::testing::allocFreeUdpPort()); };
+    const std::string cons = port(), client = port(), repl = port(), rb = port(), ib = port(), eg = port();
 
     std::vector<std::string> env;
     for (char** e = environ; *e; ++e) {
@@ -61,8 +64,11 @@ Broker spawnBroker(int slot, bool ignoreSigint) {
         env.emplace_back(*e);
     }
     env.push_back("RUNE_NODE_ID=0");
-    env.push_back("RUNE_PEERS=0@127.0.0.1:" + std::to_string(port));
-    env.push_back("RUNE_CLIENT_ENDPOINT=aeron:udp?endpoint=127.0.0.1:" + std::to_string(port + 1));
+    env.push_back("RUNE_PEERS=0@127.0.0.1:" + cons + ":" + client + ":" + repl + ":" + rb + ":" + ib + ":" + eg);
+    env.push_back("RUNE_CLIENT_ENDPOINT=aeron:udp?endpoint=127.0.0.1:" + client);
+    env.push_back("RUNE_WORKER_INGRESS_BASE_PORT=" + ib);
+    env.push_back("RUNE_WORKER_REPL_BASE_PORT=" + rb);
+    env.push_back("RUNE_WORKER_EGRESS_CONTROL_BASE_PORT=" + eg);
     env.push_back("RUNE_DATA_DIR=" + (b.dir / "data").string());
     env.push_back("RUNE_AERON_DIR=" + (b.dir / "aeron").string());
     std::vector<char*> envp;
