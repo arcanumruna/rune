@@ -2333,8 +2333,12 @@ TEST(UnresolvedPeerStartupRegression, LegacyAddBrokersAreReleasedInStopRegressio
 // Catalog history Task 17 fix round 1 (C1): co-partition group keys are a pure function of the group NAME, so brokers
 // whose boot sets differ (node 0 booted with no topic, node 2 with {b1}, node 1 with {b1, a1, b2}) still place every
 // partition on the same worker -- the per-worker replication planes (worker w <-> peer worker w) then carry it.
-// RED 1: revert buildReplication/buildWorkerPool to sorted-order numbering -> the worker maps disagree, node 1 never
-// receives its records.  RED 2: delete the mapCoPartitionGroup call in runCatalogCreate_ -> a1/b2 disagree.
+// Every step fails fast and names the (node, t, p) it fails on:
+//   (f)  the worker maps agree across brokers  -- RED: sorted boot numbering (node 2 numbers "b" as -1), or the
+//        mapCoPartitionGroup call deleted from runCatalogCreate_;
+//   (f2) on every broker each replica is driven on its owner worker's replication plane -- RED: the boot or the
+//        runtime replica build derives the plane from a different key than the WorkerPool router;
+//   (g)/(h) end to end: acks=all commits and every broker reaches LEO 1, under one shared deadline per step.
 TEST(ShardModeRegression, CoPartitionedTopicsReplicateAcrossBrokersWithDifferentBootHistoriesRegression) {
     using rune::metadata::coPartitionGroupKey;
     using rune::metadata::workerIdForShard;
@@ -2344,6 +2348,12 @@ TEST(ShardModeRegression, CoPartitionedTopicsReplicateAcrossBrokersWithDifferent
         for (int32_t p = 0; p < 4; ++p)
             differs = differs || workerIdForShard({0, p}, 4) != workerIdForShard({coPartitionGroupKey("b"), p}, 4);
         ASSERT_TRUE(differs) << "pick other group names: the placement assertion would be vacuous";
+        // Node 2's boot set {b1} would number "b" as -1 under sorted numbering; that must be detectable.
+        bool bDiffersFromSortedMinus1 = false;
+        for (int32_t p = 0; p < 4; ++p)
+            bDiffersFromSortedMinus1 = bDiffersFromSortedMinus1 ||
+                workerIdForShard({coPartitionGroupKey("b"), p}, 4) != workerIdForShard({-1, p}, 4);
+        ASSERT_TRUE(bDiffersFromSortedMinus1) << "pick other group names: a boot-numbering regression would be invisible";
     }
     TmpDir d0{"cph0"}, d1{"cph1"}, d2{"cph2"}, cdir{"cphc"};
     const fs::path dirs[3] = {d0.path, d1.path, d2.path};
@@ -2389,15 +2399,32 @@ TEST(ShardModeRegression, CoPartitionedTopicsReplicateAcrossBrokersWithDifferent
     for (int32_t t = 0; t < 3; ++t)
         for (int32_t p = 0; p < 4; ++p) {
             const int32_t w0 = n[0]->workerForPartitionForTest(t, p);
-            EXPECT_EQ(w0, n[1]->workerForPartitionForTest(t, p)) << "t " << t << " p " << p << " node 1";
-            EXPECT_EQ(w0, n[2]->workerForPartitionForTest(t, p)) << "t " << t << " p " << p << " node 2";
+            ASSERT_EQ(w0, n[1]->workerForPartitionForTest(t, p)) << "t " << t << " p " << p << " node 1";
+            ASSERT_EQ(w0, n[2]->workerForPartitionForTest(t, p)) << "t " << t << " p " << p << " node 2";
         }
+
+    // (f2) on every node, every replica is driven on its owner worker's replication plane (owner worker == plane
+    // index).  Node 0: every topic is runtime-built.  Nodes 1/2: boot topics come from buildReplication, the rest are
+    // runtime-built.
+    for (int i = 0; i < 3; ++i)
+        for (int32_t t = 0; t < 3; ++t)
+            for (int32_t p = 0; p < 4; ++p) {
+                const int32_t w = n[i]->workerForPartitionForTest(t, p);
+                const auto* want =
+                    static_cast<const rune::replication::PartitionTransport*>(n[i]->perWorkerPlaneForTest(w));
+                ASSERT_NE(want, nullptr) << "node " << i << " has no plane " << w;
+                const auto* got = n[i]->onOwnerThreadForTest(
+                    t, p, [](rune::replication::PartitionReplica& r) { return r.transportForTest(); });
+                ASSERT_EQ(got, want) << "node " << i << " t " << t << " p " << p
+                                     << ": replica driven on a plane other than its owner worker " << w;
+            }
 
     // (g) one acks=all record per (t, p), produced to its leader.
     {
         ShardTestClient c(cdir.path);
         const int64_t sid0 = c.connect(gatewayChannel(ports, 0), kClientStream);
         ASSERT_GT(sid0, 0);
+        const auto gDeadline = std::chrono::steady_clock::now() + 30s;
         for (int32_t t = 0; t < 3; ++t)
             for (int32_t p = 0; p < 4; ++p) {
                 int32_t leader = -1;
@@ -2410,16 +2437,31 @@ TEST(ShardModeRegression, CoPartitionedTopicsReplicateAcrossBrokersWithDifferent
                 ASSERT_GT(sid, 0);
                 const int32_t w = n[leader]->workerForPartitionForTest(t, p);
                 auto ack = c.produceUntilOk(workerIngressChannel(ports, leader, w), kClientStream, sid, t, p,
-                                            /*acks=all*/1, makeBatch(1));
+                                            /*acks=all*/1, makeBatch(1), /*maxAttempts=*/10);
                 ASSERT_TRUE(ack.has_value()) << "acks=all not committed for t " << t << " p " << p;
+                ASSERT_LT(std::chrono::steady_clock::now(), gDeadline) << "producing 12 records took > 30 s";
             }
     }
 
-    // (h) rf 0 = every broker holds every partition: each must reach LEO 1 everywhere.
-    for (int i = 0; i < 3; ++i)
-        for (int32_t t = 0; t < 3; ++t)
-            for (int32_t p = 0; p < 4; ++p)
-                EXPECT_TRUE(eventually([&] { return rune::node::test::leoOrMinusOne(*n[i], t, p) == 1; }, 4000))
-                    << "node " << i << " t " << t << " p " << p << " LEO " << rune::node::test::leoOrMinusOne(*n[i], t, p);
+    // (h) rf 0 = every broker holds every partition: each must reach LEO 1 everywhere.  One shared deadline; every
+    // laggard is reported at once.
+    {
+        const auto hDeadline = std::chrono::steady_clock::now() + 20s;
+        std::string lagging;
+        for (;;) {
+            lagging.clear();
+            for (int i = 0; i < 3; ++i)
+                for (int32_t t = 0; t < 3; ++t)
+                    for (int32_t p = 0; p < 4; ++p) {
+                        const auto leo = rune::node::test::leoOrMinusOne(*n[i], t, p);
+                        if (leo != 1)
+                            lagging += "node " + std::to_string(i) + " t " + std::to_string(t) + " p " +
+                                       std::to_string(p) + " LEO " + std::to_string(leo) + "; ";
+                    }
+            if (lagging.empty() || std::chrono::steady_clock::now() >= hDeadline) break;
+            std::this_thread::sleep_for(20ms);
+        }
+        EXPECT_TRUE(lagging.empty()) << "not replicated everywhere within 20 s: " << lagging;
+    }
     for (int i = 2; i >= 0; --i) n[i]->stop();
 }

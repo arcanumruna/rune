@@ -66,6 +66,14 @@ TEST(ShardRouter, DifferentIndexMayDifferButIsStable) {
 // RED mutation: make the key depend on creation order (e.g. -1 - number of distinct names seen so far): X and Y disagree.
 TEST(ShardRouterRegression, CoPartitionGroupKeyIsAPureFunctionOfTheNameRegression) {
     using rune::metadata::coPartitionGroupKey;
+    // Golden values: the key is a wire-level contract -- every broker AND every build in one cluster must derive it
+    // identically, or grouped partitions are routed to different workers (and planes) on different brokers.
+    static_assert(rune::metadata::coPartitionGroupKey("") == -18652614);
+    static_assert(rune::metadata::coPartitionGroupKey("a") == -604776749);   // "" alone never runs the multiply
+    EXPECT_EQ(coPartitionGroupKey(""), -18652614);
+    EXPECT_EQ(coPartitionGroupKey("a"), -604776749);
+    EXPECT_EQ(coPartitionGroupKey("b"), -655109606);
+    EXPECT_EQ(coPartitionGroupKey("grp"), -372738949);
     EXPECT_EQ(coPartitionGroupKey("grp"), coPartitionGroupKey("grp"));
     for (const char* g : {"grp", "a", "b", ""}) {
         EXPECT_LT(coPartitionGroupKey(g), 0) << g;

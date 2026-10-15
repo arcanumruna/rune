@@ -322,6 +322,8 @@ class PartitionReplica {
 public:
     /// Transport arm chosen at construction (spec §3.5a.1).
     [[nodiscard]] TransportKind transportKindForTest() const noexcept { return tkind_; }
+    /// Test-only: the transport this replica was built with (non-owning; set once in the ctor).
+    [[nodiscard]] const PartitionTransport* transportForTest() const noexcept { return transport_; }
 
     // -----------------------------------------------------------------------
     // Construction

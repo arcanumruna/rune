@@ -1177,8 +1177,9 @@ void BrokerNode::buildReplication() {
                                            /*userPartitions=*/perWorkerReplTransports_.empty());
 
     // E5 Task 5: build a local ShardRouter for per-worker transport selection
-    // when per-worker planes are available.  Mirrors buildWorkerPool() exactly
-    // so the transport assignment matches the worker's owned shard set.
+    // when per-worker planes are available.  Uses shardRouterFor (group key =
+    // coPartitionGroupKey(name)), the same function as buildWorkerPool and
+    // createRuntimeUserReplicas, so the plane is the owner worker's.
     // Only constructed when we have planes to route to.
     std::optional<rune::metadata::ShardRouter> replRouter;
     if (!perWorkerReplTransports_.empty()) {
@@ -1391,8 +1392,10 @@ int32_t BrokerNode::createRuntimeUserReplicas(const TopicSpec& spec) {
     // mirrors buildReplication().  Without this a runtime topic would land on the
     // legacy transport (a different stream) while peers place it on a per-worker
     // plane → it would silently fail to replicate on a multi-node cluster.
-    // Internal (topicId<0) always stays on legacy.  (ShardRouter build mirrors
-    // buildReplication + buildWorkerPool; tech-debt: extract a shared helper.)
+    // Internal (topicId<0) always stays on legacy.  The plane index is
+    // workerIdForShard({key, p}, wc) with key = coPartitionGroupKey(group) or
+    // topicId — the WorkerPool router's formula (runCatalogCreate_ installs the
+    // group before this call).
     const int32_t rtWc = static_cast<int32_t>(perWorkerReplTransports_.size());
     const int32_t rtGk = spec.coPartitionGroup.empty() ? topicId : rune::metadata::coPartitionGroupKey(spec.coPartitionGroup);
 
@@ -1521,10 +1524,10 @@ int32_t BrokerNode::createRuntimeUserReplicas(const TopicSpec& spec) {
 // Must be called AFTER replicaRegistry_ is fully populated (i.e. AFTER
 // buildGateway() has added all user, offset, txn, and metadata replicas).
 //
-// Grouping rule: distinct non-empty TopicSpec::coPartitionGroup strings are
-// sorted and mapped to negative group keys (-1, -2, …) in sorted order. This
-// mirrors StaticBalancer's sorted-group-name determinism so all nodes derive
-// identical shard identities. Ungrouped topics fall back to their topicId.
+// Grouping rule: a topic with a non-empty TopicSpec::coPartitionGroup maps to
+// coPartitionGroupKey(group) — a pure function of the group NAME (shardRouterFor),
+// so every broker derives identical shard identities whatever its boot set.
+// Ungrouped topics fall back to their topicId.
 //
 // Ordinal invariant: partitionId() == partition ordinal (pcfg.partitionId = part
 // at BrokerNode.cpp:434). ShardRouter uses the ordinal as the partition index.

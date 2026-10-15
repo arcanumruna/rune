@@ -118,21 +118,23 @@ static NodeConfig makeSingleNodeConfig4W(const std::filesystem::path& dataDir,
     return cfg;
 }
 
-/// Two co-partitioned topics (coPartitionGroup="grp", 4 partitions each) + one standalone topic (2 partitions),
+/// Two co-partitioned topics (coPartitionGroup="shop", 4 partitions each) + one standalone topic (2 partitions),
 /// in topic-id order 0, 1, 2 — created through the catalog once the node is up (topics exist only through DDL).
 /// These exercise the co-group affinity assertion: for all idx in [0,4),
 ///   workerForPartitionForTest(topicId=0, idx) == workerForPartitionForTest(topicId=1, idx).
+/// The group is named "shop" because coPartitionGroupKey("shop") places differently from the sorted-numbering key -1
+/// at 4 workers, so the reboot-stability arm sees a boot-numbering regression ("grp" places exactly like -1).
 std::vector<rune::node::TopicSpec> parityTopics() {
     rune::node::TopicSpec a;
     a.name             = "orders";
     a.partitionCount   = 4;
-    a.coPartitionGroup = "grp";
+    a.coPartitionGroup = "shop";
     a.partitionKey     = "user";
 
     rune::node::TopicSpec b;
     b.name             = "shipments";
     b.partitionCount   = 4;
-    b.coPartitionGroup = "grp";
+    b.coPartitionGroup = "shop";
     b.partitionKey     = "user";
 
     rune::node::TopicSpec c;
@@ -182,6 +184,14 @@ TEST(WorkerPoolParity, MultiWorkerBrokerReachesLeaderAndServes) {
         for (int32_t p = 0; p < 4; ++p)
             differs = differs || rune::metadata::workerIdForShard({0, p}, 4) != rune::metadata::workerIdForShard({1, p}, 4);
         ASSERT_TRUE(differs) << "the affinity assertion would be vacuous";
+        // The boot build (after the reboot below) must not collapse to sorted numbering (-1): "shop" places
+        // differently from -1 for some p, so the reboot-stability arm catches that regression.
+        bool differsFromSorted = false;
+        for (int32_t p = 0; p < 4; ++p)
+            differsFromSorted = differsFromSorted ||
+                rune::metadata::workerIdForShard({rune::metadata::coPartitionGroupKey("shop"), p}, 4) !=
+                    rune::metadata::workerIdForShard({-1, p}, 4);
+        ASSERT_TRUE(differsFromSorted) << "the reboot-stability arm would not see a boot-numbering regression";
     }
 
     BrokerNode node{cfg};
@@ -216,7 +226,7 @@ TEST(WorkerPoolParity, MultiWorkerBrokerReachesLeaderAndServes) {
         allWorkerIds.insert(w0);
     }
 
-    // topic 1 ("shipments"), 4 partitions — co-group "grp" with topic 0
+    // topic 1 ("shipments"), 4 partitions — co-group "shop" with topic 0
     for (int32_t p = 0; p < 4; ++p) {
         const int32_t w1 = node.workerForPartitionForTest(1, p);
         EXPECT_GE(w1, 0)  << "topic1 partition " << p << ": worker id must be >= 0";
@@ -243,7 +253,7 @@ TEST(WorkerPoolParity, MultiWorkerBrokerReachesLeaderAndServes) {
             << "Co-partition affinity: (topic0,partition=" << p
             << ") worker=" << w0 << " != (topic1,partition=" << p
             << ") worker=" << w1
-            << " — co-group 'grp' same-index partitions MUST share a worker";
+            << " — co-group 'shop' same-index partitions MUST share a worker";
     }
 
     // ---- DISTINCT WORKER ASSERTION ----

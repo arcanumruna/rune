@@ -257,7 +257,9 @@ TEST(TestClusterRegression, ThreeNodeTopicWithRfBelowTheClusterWaitsOnlyForItsRe
     for (int id = 1; id <= 3; ++id) {
         BrokerNode& n = c3.node(id);
         const std::size_t replicas = n.onControlThreadForTest([&n] {
-            const auto* a = n.metadataServiceForTest()->assignment(0, 0);
+            const auto* ms = n.metadataServiceForTest();
+            if (ms == nullptr) return std::size_t{0};   // the EXPECT below then fails explicitly
+            const auto* a = ms->assignment(0, 0);
             return a == nullptr ? std::size_t{0} : a->replicas.size();
         });
         EXPECT_EQ(replicas, 2u) << "node " << id;
@@ -265,7 +267,9 @@ TEST(TestClusterRegression, ThreeNodeTopicWithRfBelowTheClusterWaitsOnlyForItsRe
     // R7 (M4): defineTopic already WAITED for the replica holders -- no extra wait here.
     BrokerNode& any = c3.node(1);
     const std::vector<int32_t> holders = any.onControlThreadForTest([&any] {
-        const auto* a = any.metadataServiceForTest()->assignment(0, 0);
+        const auto* ms = any.metadataServiceForTest();
+        if (ms == nullptr) return std::vector<int32_t>{};   // the size ASSERT below then fails explicitly
+        const auto* a = ms->assignment(0, 0);
         return a == nullptr ? std::vector<int32_t>{} : std::vector<int32_t>(a->replicas.begin(), a->replicas.end());
     });
     ASSERT_EQ(holders.size(), 2u);
@@ -299,7 +303,9 @@ TEST(TestClusterRegression, ALeaderHoldingNoPartitionAnswersOkRegression) {
         EXPECT_LT(TestCluster::Clock::now() - t0, 10s) << s.name << " must be answered promptly";
         BrokerNode& ln = c3.node(leader);
         const bool leaderHolds = ln.onControlThreadForTest([&ln, &r] {
-            const auto* a = ln.metadataServiceForTest()->assignment(r.topicId, 0);
+            const auto* ms = ln.metadataServiceForTest();
+            if (ms == nullptr) return true;   // "holds" = not found: the loop goes on and the final ASSERT fails
+            const auto* a = ms->assignment(r.topicId, 0);
             if (a == nullptr) return true;
             for (int32_t h : a->replicas)
                 if (h == ln.nodeIdForTest()) return true;
@@ -308,6 +314,7 @@ TEST(TestClusterRegression, ALeaderHoldingNoPartitionAnswersOkRegression) {
         found = !leaderHolds;
     }
     ASSERT_TRUE(found) << "no rf-1 topic landed away from the catalog leader in 6 tries";
+    ASSERT_EQ(c3.catalogLeaderId(), leader) << "the catalog leader moved during the test; the holds-none check is stale";
 }
 
 // Task 17 fix-on-sight (the C1 gate): a topic with replicationFactor BELOW the broker count is not held on every

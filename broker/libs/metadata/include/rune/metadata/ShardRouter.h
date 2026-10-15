@@ -54,6 +54,8 @@ inline int32_t workerIdForShard(const ShardId& s, int32_t workerCount) noexcept 
 /// it booted with or the order groups were created -- so worker w on every broker owns the same shards, which the
 /// per-worker replication planes (worker w <-> peer worker w) require.  Range [-2^30, -1]: never a user topicId
 /// (>= 0).  Two names that hash alike share workers (placement only, never correctness).
+/// Changing this function changes the placement of every grouped topic on every broker; a mixed-build cluster would
+/// mis-route -- never change it without a cluster-wide upgrade rule (golden values: ShardRouterTest).
 [[nodiscard]] constexpr int32_t coPartitionGroupKey(std::string_view group) noexcept {
     uint32_t h = 2166136261u;
     for (const char ch : group) { h ^= static_cast<uint8_t>(ch); h *= 16777619u; }

@@ -2,7 +2,8 @@
 // ---------------------------------------------------------------------------
 // Throttler.h — CP-8: Token-bucket I/O throttler for the compaction cleaner.
 //
-// Bounds aggregate cleaner read+write bytes/sec to `ioMaxBytesPerSecond`.
+// Bounds aggregate cleaner read+write bytes/sec to
+// `NodeConfig::cleanerIoMaxBytesPerSecond` (RUNE_CLEANER_IO_MAX_BYTES_PER_SECOND).
 // Kafka equivalent: Throttler (kafka.utils.Throttler) with a token-bucket
 // model.  Default: unlimited (-1), matching Kafka's default.
 //
