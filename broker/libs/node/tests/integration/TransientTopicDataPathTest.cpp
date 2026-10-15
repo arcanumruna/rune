@@ -852,7 +852,8 @@ TEST(TransientLineageClusterRegression, FullClusterRestartAnswersAGroupsOffsetAs
     ASSERT_TRUE(first.has_value());
     EXPECT_EQ(first->baseOffset, 0) << "precondition: the ring restarted empty";
     ASSERT_TRUE(c.subscribe(gatewayChannel(g.ports, leader2), kClientStream, sid2, 0, 0, /*from (reset)=*/0));
-    ASSERT_TRUE(c.pollUntil([&] { return pushedAt(c, 0) >= 1; })) << "the post-restart record was not delivered";
+    // Post-restart delivery: a 30 s deadline, not pollUntil's ~5 s cap (a loaded host, ctest -j: 2026-10-15).
+    ASSERT_TRUE(c.pollFor(std::chrono::seconds(30), [&] { return pushedAt(c, 0) >= 1; })) << "the post-restart record was not delivered";
 }
 
 TEST(TransientLineageClusterRegression, RollingRestartKeepsAGroupsOffsetValidRegression) {
@@ -1137,7 +1138,9 @@ TEST(TransientLineageClusterRegression, Rf1CrashedLeaderMemberRejoiningBeforeDet
     const std::size_t before = c.records().size();
     ASSERT_TRUE(c.subscribe(gatewayChannel(g.ports, L), kClientStream, sidL2, 0, P, /*log start=*/0));
     std::map<int64_t, int> seen;
-    ASSERT_TRUE(c.pollUntil([&] {
+    // Deadline 30 s, not pollUntil's ~5 s cap (2026-10-15, failed once under ctest -j10 on a loaded host: the
+    // restarted node's first push took longer).  The delivered set is still checked exactly once below.
+    ASSERT_TRUE(c.pollFor(std::chrono::seconds(30), [&] {
         seen.clear();
         for (std::size_t i = before; i < c.records().size(); ++i)
             if (!c.records()[i].bytes.empty()) ++seen[c.records()[i].baseOffset];
@@ -1347,7 +1350,8 @@ TEST(TransientLineageClusterRegression, Rf1GroupWithoutACommitIsRebalancedOnANew
     const std::size_t before = c.records().size();
     ASSERT_TRUE(c.subscribe(gatewayChannel(g.ports, L), kClientStream, sidL2, 0, P, 0));
     std::map<int64_t, int> seen;
-    ASSERT_TRUE(c.pollUntil([&] {
+    // Post-restart delivery: a 30 s deadline, not pollUntil's ~5 s cap (a loaded host, ctest -j: 2026-10-15).
+    ASSERT_TRUE(c.pollFor(std::chrono::seconds(30), [&] {
         seen.clear();
         for (std::size_t i = before; i < c.records().size(); ++i)
             if (!c.records()[i].bytes.empty()) ++seen[c.records()[i].baseOffset];
@@ -1434,7 +1438,8 @@ TEST(TransientLineageClusterRegression, Rf1PlainSubscriptionResumeAcrossANewLine
     const std::size_t before = c.records().size();
     ASSERT_TRUE(c.subscribe(gwL2, kClientStream, sid2, 0, P, /*Earliest=*/-2));
     std::map<int64_t, int> seen;
-    ASSERT_TRUE(c.pollUntil([&] {
+    // Post-restart delivery: a 30 s deadline, not pollUntil's ~5 s cap (a loaded host, ctest -j: 2026-10-15).
+    ASSERT_TRUE(c.pollFor(std::chrono::seconds(30), [&] {
         seen.clear();
         for (std::size_t i = before; i < c.records().size(); ++i)
             if (c.records()[i].bytes.size() > 8) ++seen[c.records()[i].baseOffset];
