@@ -2,6 +2,8 @@
 // plan Review Focus 1-5.  Each rig = one embedded driver (SHARED threading, own dir) + an Aeron C client.
 #include <gtest/gtest.h>
 
+#include <limits>
+
 #include <cstddef>   // aeronmd.h uses size_t without including <stddef.h>
 extern "C" {
 #include <aeronmd/aeronmd.h>
@@ -261,6 +263,34 @@ TEST(UdpGsoBindings, UnsupportedGsoFallsBackPerTransport) {
     roundTrip(r, r, udp(24606, 1408), mixedSizes(1408, 70));
     r.close();
     EXPECT_GE(r.totals.gso_fallbacks, 1u);
+}
+
+// DR-BUG-MTU (dr-e2e test_dr12_mtu_reduction_large_batch): after `ip link set mtu 1200` under the 1472-byte
+// Aeron MTU the broker derived at boot, the kernel answers every sendmsg(UDP_SEGMENT) whose segment exceeds the
+// path MTU with EMSGSIZE (measured, 5.15) — persistently, while a plain send of the same datagram is
+// IP-fragmented and delivered.  EMSGSIZE was a send error: Aeron re-sent the identical GSO batch forever, every
+// multi-fragment burst stalled, heartbeats kept the session connected, nothing was reported.  Persistent
+// injection = the real condition.  RED before the fix: the round trip never completed (20 s deadline).
+TEST(UdpGsoBindings, GsoSegmentAbovePathMtuFallsBackAndDeliversRegression) {
+    Rig r;
+    ASSERT_TRUE(r.start(2, 1408, EMSGSIZE, std::numeric_limits<int>::max())) << aeron_errmsg();
+    roundTrip(r, r, udp(24617, 1408), mixedSizes(1408, 70));
+    r.close();
+    EXPECT_GE(r.totals.gso_fallbacks, 1u) << "the transport must stop using GSO";
+    EXPECT_EQ(r.totals.gso_path_mtu_fallbacks, r.totals.gso_fallbacks) << "counted as a path-MTU fallback";
+}
+
+// Sibling: the broker's egress shape (MDC dynamic control) under the same persistent EMSGSIZE.
+TEST(UdpGsoBindings, MdcGsoSegmentAbovePathMtuFallsBackAndDeliversRegression) {
+    Rig pub, sub;
+    ASSERT_TRUE(pub.start(2, 1408, EMSGSIZE, std::numeric_limits<int>::max())) << aeron_errmsg();
+    ASSERT_TRUE(sub.start(1, 1408)) << aeron_errmsg();
+    const std::string pubCh = "aeron:udp?control=localhost:24618|control-mode=dynamic|mtu=1408";
+    const std::string subCh = "aeron:udp?endpoint=localhost:24619|control=localhost:24618|control-mode=dynamic";
+    roundTrip(pub, sub, pubCh, mixedSizes(1408, 70), subCh);
+    pub.close();
+    sub.close();
+    EXPECT_GE(pub.totals.gso_path_mtu_fallbacks, 1u);
 }
 
 TEST(UdpGsoBindings, DataLossRecoversWithGroOn) {

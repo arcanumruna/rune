@@ -1082,8 +1082,8 @@ def test_dr12_mtu_reduction_large_batch(fresh_cluster, netem_ready):
     assert_per_key_ordering(sub_post)
     assert_exactly_once(sub_post)
 
-    # DR-BUG-MTU (see the speed report): the live read gets nothing from the partition led by the MTU-reduced
-    # node.  Kept strict: the gate shows it until the broker handles a link MTU below its Aeron MTU.
+    # DR-BUG-MTU regression (fixed: rune_gso_bindings falls back to IP fragmentation on a GSO EMSGSIZE): the live
+    # read must deliver every acked partition, the one the MTU-reduced node leads included.
     live_parts = {m.partition for m in sub_live.all_delivered}
     acked_parts = {m.partition for m in committed.all_produced}
     assert acked_parts <= live_parts, (
