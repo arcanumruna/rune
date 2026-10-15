@@ -7,10 +7,12 @@
 #
 # Two stages, BOTH mandatory at every checkpoint (a checkpoint is green only when both are):
 #   (a) every *Regression* test EXCEPT the latency gates, in parallel:
-#         ctest -R Regression -LE latency -j<jobs>
+#         ctest -R "Regression|^batch:" -LE "latency|small" -j<jobs>
 #       Every real-BrokerNode / UDP suite runs here concurrently: each process binds only ports it owns
 #       (libs/aeronutil/include/rune/aeronutil/testing/FreePort.h — flock-owned port blocks) and pid-scoped
-#       dirs, so there is no RESOURCE_LOCK serializing them.
+#       dirs, so there is no RESOURCE_LOCK serializing them.  The binaries made of thousands of millisecond
+#       tests (label `small`) run as gtest-sharded batches "batch:<binary>:<k>of<n>" (label `batch`) — the
+#       same *Regression* tests, a few processes instead of one per test (rune_regression_batches, root CMakeLists.txt).
 #   (b) the latency gates (ctest label `latency`, RUN_SERIAL in libs/node/CMakeLists.txt), serially, on an
 #       otherwise idle host — a latency measurement must not share the CPU with other test processes:
 #         ctest -R Regression -L latency
@@ -26,7 +28,7 @@ el()  { perl -e "printf '%.1f', $2 - $1"; }
 
 t0=$(now)
 echo "== stage a: *Regression* without the latency gates (-j$J)"
-ctest --test-dir "$B" -R Regression -LE latency -j "$J" --output-on-failure "$@"; rcA=$?
+ctest --test-dir "$B" -R "Regression|^batch:" -LE "latency|small" -j "$J" --output-on-failure "$@"; rcA=$?
 t1=$(now)
 echo "== stage b: *Regression* latency gates (serial)"
 ctest --test-dir "$B" -R Regression -L latency --output-on-failure "$@"; rcB=$?

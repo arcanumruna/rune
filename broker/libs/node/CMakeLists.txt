@@ -174,7 +174,8 @@ if(BUILD_TESTING)
         rune_view
         GTest::gtest_main)
     include(GoogleTest)
-    gtest_discover_tests(rune_node_tests)
+    gtest_discover_tests(rune_node_tests PROPERTIES LABELS small)
+    rune_regression_batches(rune_node_tests 4)   # defined in the root CMakeLists.txt
 
     # Catalog history Task 7 (F12): the admin thread's catalog steady state never
     # allocates.  Replaces the global operator new (binary-wide) — own binary, like
@@ -201,7 +202,8 @@ if(BUILD_TESTING)
         rune_codec
         rune_view
         GTest::gtest_main)
-    gtest_discover_tests(rune_catalog_matrix_tests PROPERTIES TIMEOUT 600)
+    gtest_discover_tests(rune_catalog_matrix_tests PROPERTIES TIMEOUT 600 LABELS small)
+    rune_regression_batches(rune_catalog_matrix_tests 2)
 
     # Catalog history Task 21: the seeded, model-checked stress (64 seeds x 400 steps against the independent
     # CatalogModel).  Its own binary: long-running (each seed is one ctest case).
@@ -622,7 +624,8 @@ if(BUILD_TESTING)
         GTest::gtest_main)
     gtest_discover_tests(rune_ddl_conformance_tests
         DISCOVERY_TIMEOUT 120
-        PROPERTIES TIMEOUT 120)
+        PROPERTIES TIMEOUT 120 LABELS small)
+    rune_regression_batches(rune_ddl_conformance_tests 3)
 
     # DDL conformance plan Task 10: seeded model-checked DDL stress + the admin
     # steady-state zero-alloc gate.  Own executable (replaces global operator new).
@@ -1150,13 +1153,15 @@ if(BUILD_TESTING)
             # go through the worker's io backend; background-token routing.
             add_executable(rune_shard_nonblocking_tests tests/integration/ShardNonBlockingTest.cpp)
             target_link_libraries(rune_shard_nonblocking_tests PRIVATE rune_node rune_replication aeron::aeron GTest::gtest_main)
-            gtest_discover_tests(rune_shard_nonblocking_tests PROPERTIES TIMEOUT 120 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+            gtest_discover_tests(rune_shard_nonblocking_tests PROPERTIES TIMEOUT 120 LABELS small ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+            rune_regression_batches(rune_shard_nonblocking_tests 1 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
             # F15 (EOS marker / LSO correctness): S0 failing *Regression* tests
             # (design note 2026-10-01-f15-eos-marker-lso-design.md).
             add_executable(rune_f15_eos_regression_tests tests/integration/F15EosRegressionTest.cpp)
             target_link_libraries(rune_f15_eos_regression_tests PRIVATE rune_node rune_replication aeron::aeron GTest::gtest_main)
-            gtest_discover_tests(rune_f15_eos_regression_tests PROPERTIES TIMEOUT 120 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+            gtest_discover_tests(rune_f15_eos_regression_tests PROPERTIES TIMEOUT 120 LABELS small ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+            rune_regression_batches(rune_f15_eos_regression_tests 3 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
             # D9 (cross-node transaction markers): gateway unit + 3-node
             # in-process integration over the real cluster-plane transport.

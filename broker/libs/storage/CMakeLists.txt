@@ -32,7 +32,8 @@ if(BUILD_TESTING)
     # (rune::transaction::ControlMarker::build) — a cross-library contract.
     target_link_libraries(rune_storage_tests PRIVATE rune_storage rune_transaction GTest::gtest_main)
     include(GoogleTest)
-    gtest_discover_tests(rune_storage_tests)
+    gtest_discover_tests(rune_storage_tests PROPERTIES LABELS small)
+    rune_regression_batches(rune_storage_tests 2)   # defined in the root CMakeLists.txt
 endif()
 
 option(BUILD_INTEGRATION_TESTING "Build storage integration tests (no external deps — real filesystem only)" ON)

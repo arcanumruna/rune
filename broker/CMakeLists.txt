@@ -235,6 +235,38 @@ endif()
 # explicitly), so machine load at build time can never fail the build.
 set(CMAKE_GTEST_DISCOVER_TESTS_DISCOVERY_MODE PRE_TEST)
 
+# rune_regression_batches() — batched *Regression* runs of binaries made of many tiny tests.
+#
+# gtest_discover_tests() makes one ctest test (one process) per gtest test.  For a binary of thousands of
+# millisecond tests the process — exec under Rosetta, dyld, gtest registering every parameterized test of
+# the binary — costs 50-150 ms, 10-40x the test itself: rune_ddl_conformance_tests' 1901 *Regression*
+# tests took ~300 ctest slot-seconds and run in ~10 s in one process.
+#
+# rune_regression_batches(<target> <shards> [TIMEOUT <s>] [ENVIRONMENT <env>...]) adds <shards> ctest
+# tests "batch:<target>:<k>of<shards>", each running the binary once over its gtest shard k
+# (GTEST_TOTAL_SHARDS / GTEST_SHARD_INDEX) of --gtest_filter=*Regression* — exactly the tests
+# `ctest -R Regression` selects from that binary — labelled `batch`.  The binary's individual discovered
+# tests stay (per-task `ctest -R <filter>` runs keep working) and carry LABELS small; the regression gate
+# (scripts/run-regression.sh) runs the batches instead of them: -R "Regression|^batch:" -LE "latency|small".
+# A plain `ctest -R Regression` still runs every test individually (the batches do not match it).
+function(rune_regression_batches target shards)
+    cmake_parse_arguments(RB "" "TIMEOUT" "ENVIRONMENT" ${ARGN})
+    if(NOT RB_TIMEOUT)
+        set(RB_TIMEOUT 900)
+    endif()
+    math(EXPR last "${shards} - 1")
+    foreach(i RANGE 0 ${last})
+        math(EXPR n "${i} + 1")
+        set(name "batch:${target}:${n}of${shards}")
+        add_test(NAME "${name}" COMMAND $<TARGET_FILE:${target}> "--gtest_filter=*Regression*")
+        set_tests_properties("${name}" PROPERTIES
+            LABELS batch
+            TIMEOUT ${RB_TIMEOUT}
+            ENVIRONMENT "GTEST_TOTAL_SHARDS=${shards};GTEST_SHARD_INDEX=${i};${RB_ENVIRONMENT}")
+    endforeach()
+endfunction()
+
+
 option(BUILD_BENCHMARKS "Build benchmarks" OFF)
 if(BUILD_BENCHMARKS)
     find_package(benchmark REQUIRED)

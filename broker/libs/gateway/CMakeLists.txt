@@ -234,7 +234,8 @@ if(BUILD_TESTING)
     target_include_directories(rune_gateway_transient_matrix_tests PRIVATE ${CMAKE_SOURCE_DIR}/libs/node/tests)
     target_link_libraries(rune_gateway_transient_matrix_tests PRIVATE rune_gateway rune_node rune_replication
                           rune_storage rune_transaction spdlog::spdlog GTest::gtest_main)
-    gtest_discover_tests(rune_gateway_transient_matrix_tests DISCOVERY_TIMEOUT 120)
+    gtest_discover_tests(rune_gateway_transient_matrix_tests DISCOVERY_TIMEOUT 120 PROPERTIES LABELS small)
+    rune_regression_batches(rune_gateway_transient_matrix_tests 1)
 
     # D4: a follower redirects group / txn coordinator requests to the leader — no Aeron.
     add_executable(rune_gateway_coordinator_redirect_tests tests/gateway/CoordinatorRedirectTest.cpp)
