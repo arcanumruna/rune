@@ -27,6 +27,7 @@
 #include <optional>
 #include <set>
 #include <stdexcept>
+#include <random>
 #include <string>
 #include <thread>
 #include <utility>
@@ -43,9 +44,10 @@ namespace {
 struct TmpDir {
     fs::path path;
     explicit TmpDir(const char* tag) {
-        static std::atomic<int> seq{0};
+        // pid + a per-dir random nonce (no shared counter: no static / atomic state).
+        const uint64_t nonce = (static_cast<uint64_t>(std::random_device{}()) << 32) ^ std::random_device{}();
         path = fs::temp_directory_path() /
-               (std::string("rune_tt_") + tag + "_" + std::to_string(::getpid()) + "_" + std::to_string(seq++));
+               (std::string("rune_tt_") + tag + "_" + std::to_string(::getpid()) + "_" + std::to_string(nonce));
         fs::create_directories(path);
     }
     ~TmpDir() { std::error_code ec; fs::remove_all(path, ec); }
@@ -192,10 +194,13 @@ TEST(TransientTopicDataPathRegression, ShardProduceAndSubscribeEarliestLatestOff
         ASSERT_EQ(before.size(), 2u);
         ASSERT_TRUE(c.subscribe(gatewayChannel(ports, 0), kClientStream, sid, 0, 0, /*Latest=*/-1));
         int64_t latestFirstBase = -1;
-        for (int i = 0; i < 20 && latestFirstBase < 0; ++i) {
+        // Until the Subscribe registers, a produce is not delivered to it: re-produce with a short per-attempt
+        // window (the overall budget stays the old 20 x 5 s), never a whole 5 s wait on a lost attempt.
+        const auto latestDeadline = std::chrono::steady_clock::now() + 100s;
+        while (latestFirstBase < 0 && std::chrono::steady_clock::now() < latestDeadline) {
             ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(ports, 0), kClientStream, sid, 0, 0, 1,
                                          makeBatch(3)).has_value());
-            (void)c.pollUntil([&] {
+            (void)c.pollFor(250ms, [&] {
                 for (const auto& r : c.records())
                     if (!before.count(r.subscriptionId)) { latestFirstBase = r.baseOffset; return true; }
                 return false;
@@ -365,13 +370,16 @@ std::string sliceName(const testing::TestParamInfo<SliceParam>& i) {
 }
 
 /// The first base a subscription created after `known` delivered (polls; -1 = none).
-int64_t firstOfNewSubscription(ShardTestClient& c, const std::set<int64_t>& known, int64_t* subOut = nullptr) {
+int64_t firstOfNewSubscription(ShardTestClient& c, const std::set<int64_t>& known, int64_t* subOut = nullptr,
+                               std::optional<std::chrono::milliseconds> budget = std::nullopt) {
     int64_t first = -1;
-    (void)c.pollUntil([&] {
+    const auto pred = [&] {
         for (const auto& r : c.records())
             if (!known.count(r.subscriptionId)) { first = r.baseOffset; if (subOut) *subOut = r.subscriptionId; return true; }
         return false;
-    });
+    };
+    if (budget) (void)c.pollFor(*budget, pred);
+    else (void)c.pollUntil(pred);
     return first;
 }
 std::set<int64_t> knownSubscriptions(const ShardTestClient& c) {
@@ -455,9 +463,12 @@ TEST_P(TransientSliceRegression, ProduceAndSubscribeCells) {
         if (op == mx::Op::SubLatest) {
             // Latest never replays: produce until the new subscription delivers; its FIRST batch is new.
             int64_t first = -1;
-            for (int i = 0; i < 20 && first < 0; ++i) {
+            // Until the Subscribe registers, a produce is not delivered to it: re-produce with a short
+            // per-attempt window (overall budget = the old 20 x 5 s), never a whole 5 s wait per lost attempt.
+            const auto latestDeadline = std::chrono::steady_clock::now() + 100s;
+            while (first < 0 && std::chrono::steady_clock::now() < latestDeadline) {
                 ASSERT_TRUE(produce(1, 8).has_value());
-                first = firstOfNewSubscription(*client, known);
+                first = firstOfNewSubscription(*client, known, nullptr, 250ms);
             }
             ASSERT_GE(first, 0) << "the latest subscription never delivered";
             EXPECT_GE(first, hwBefore) << "Latest replayed an old record";
@@ -823,10 +834,21 @@ TEST(TransientLineageClusterRegression, FullClusterRestartAnswersAGroupsOffsetAs
     std::printf("[lineage full restart] settled after %d retriable NotLeader answer(s)\n", pending);
 
     // The member's reset policy (the log start) sees every post-restart record.
-    const int leader2 = g.partitionLeader(c);
-    ASSERT_GE(leader2, 0);
-    const int64_t sid2 = c.connect(gatewayChannel(g.ports, leader2), kClientStream);
-    auto first = c.produceUntilOk(workerIngressChannel(g.ports, leader2), kClientStream, sid2, 0, 0, 1, makeBatch(2));
+    // Isolation fix (2026-10-15, found once the suite ran in parallel): right after a full restart the
+    // advertised leader may still be settling (retriable answers); produceUntilOk's 100 quick retries were a
+    // ~2 s budget that a loaded host (ctest -j) outlasts.  Re-resolve the leader and retry until a deadline.
+    int leader2 = -1;
+    int64_t sid2 = 0;
+    std::optional<rune::protocol::client::ProduceResponse> first;
+    const auto produceDeadline = std::chrono::steady_clock::now() + 30s;
+    while (!first && std::chrono::steady_clock::now() < produceDeadline) {
+        leader2 = g.partitionLeader(c);
+        ASSERT_GE(leader2, 0);
+        sid2 = c.connect(gatewayChannel(g.ports, leader2), kClientStream);
+        if (sid2 <= 0) continue;
+        first = c.produceUntilOk(workerIngressChannel(g.ports, leader2), kClientStream, sid2, 0, 0, 1, makeBatch(2),
+                                 /*maxAttempts=*/25);
+    }
     ASSERT_TRUE(first.has_value());
     EXPECT_EQ(first->baseOffset, 0) << "precondition: the ring restarted empty";
     ASSERT_TRUE(c.subscribe(gatewayChannel(g.ports, leader2), kClientStream, sid2, 0, 0, /*from (reset)=*/0));
@@ -954,17 +976,26 @@ TEST(TransientLineageClusterRegression, StaggeredFullRestartWithTheOldLeaderLast
     // The restarted controller decides no USER partition for a while (test
     // hold): P's committed leadership stays the dead (L, E), exactly as when
     // its failover / bump is decided on a later tick.
-    g.holdMs = 6'000;
+    // Isolation fix (2026-10-15, found once the suite ran in parallel): the hold starts when each restarted
+    // controller boots, so it lasts until at least holdStart + holdMs.  The sampling below must stay inside
+    // that window — before, a loaded host (ctest -j) took longer than the 6 s hold to collect 150 answers and
+    // the last few, served after the hold legitimately decided P, read as "an answer other than NotLeader".
+    // The window is now explicit (sampling ends 500 ms before the earliest possible hold end) and 10 s wide
+    // so >= 100 answers fit even under load.
+    g.holdMs = 10'000;
+    const auto holdStart = std::chrono::steady_clock::now();
+    const auto sampleUntil = holdStart + std::chrono::milliseconds{g.holdMs} - 500ms;
     for (int i = 0; i < 3; ++i) if (i != leader) g.start(i);   // the old partition leader stays down
     // The window: P's committed leadership is still the dead (L, E) — no clean
     // leader exists while L is down.  Ask repeatedly (as a rejoining member does).
     std::vector<std::pair<int64_t, int16_t>> answers;   // the coordinator's served answers (OK / NotLeader)
-    for (int k = 0; k < 4000 && answers.size() < 150; ++k) {
+    for (int k = 0; k < 4000 && answers.size() < 150 && std::chrono::steady_clock::now() < sampleUntil; ++k) {
         const int coord = g.coordinator();
         if (coord < 0) continue;
         const int64_t sid = c.connect(gatewayChannel(g.ports, coord), kClientStream);
         if (sid <= 0) { std::this_thread::sleep_for(25ms); continue; }
         const auto r = c.offsetFetch(gatewayChannel(g.ports, coord), kClientStream, sid, "lg-stagger", 0, 0);
+        if (std::chrono::steady_clock::now() >= sampleUntil) break;   // answered past the guaranteed window
         // NotCoordinator: the coordinator is not ready yet (it does not answer offsets).
         if (r && (r->second == kOffsetOk || r->second == kOffsetNotLeader)) answers.push_back(*r);
         std::this_thread::sleep_for(25ms);   // the client's retry pacing (poll interval)
