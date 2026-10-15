@@ -295,6 +295,11 @@ public:
     [[nodiscard]] uint64_t answeredCount() const noexcept { return answered_; }
     /// Events appended to __catalog by this broker.
     [[nodiscard]] uint64_t eventsAppended() const noexcept { return eventsAppended_; }
+    /// Task 23 fix round 2 (slice Recipe 3): in-flight DDLs answered with the retriable NotLeader, by CAUSE
+    /// (admin-thread-owned plain counters; read ON the admin thread via BrokerNode::catalogNotLeaderCountsForTest).
+    [[nodiscard]] uint64_t notLeaderBelowMinIsr() const noexcept { return notLeaderBelowMinIsr_; }
+    [[nodiscard]] uint64_t notLeaderCommitTimeout() const noexcept { return notLeaderCommitTimeout_; }
+    [[nodiscard]] uint64_t notLeaderDemoted() const noexcept { return notLeaderDemoted_; }
     /// Pre-v8 DDLs refused on a non-leader (F37).
     [[nodiscard]] uint64_t preV8Refused() const noexcept { return preV8Refused_; }
     /// DDLs refused because this broker leads __catalog without its (wiped) history (fix round 2, F2).
@@ -398,6 +403,7 @@ private:
     uint64_t started_           = 0;
     uint64_t answered_          = 0;
     uint64_t eventsAppended_    = 0;
+    uint64_t notLeaderBelowMinIsr_ = 0, notLeaderCommitTimeout_ = 0, notLeaderDemoted_ = 0;   // by cause
     uint64_t preV8Refused_      = 0;
     uint64_t ddlRefusedUntrustedLeader_ = 0;
     bool     applyHeldForTest_  = false;   // holdApplyForTest (test seam only)

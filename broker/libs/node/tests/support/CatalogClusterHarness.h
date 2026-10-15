@@ -46,6 +46,7 @@
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/node/AdminChannels.h>
 #include <rune/node/AdminWorker.h>
+#include <rune/node/BrokerNode.h>
 #include <rune/node/CatalogApplier.h>
 #include <rune/node/CatalogCheckpoint.h>
 #include <rune/node/CatalogPartition.h>
@@ -172,6 +173,12 @@ struct CellRun {
     uint64_t objectIdBefore = 0, objectIdAfter = 0;
     uint32_t newVersionAfter = 0, firstVersionOfNewObject = 0;
     int      produceInWindowCode = -1;
+    // R10 (DropTopic / DropView x CreateRacesPlacement): the target is created with its placement held, then dropped.
+    bool     createAnsweredOkBeforePlacement = false;   // the create's OK was released (as a tombstone) with the placement still held
+    int64_t  createAnswerMs = -1;                       // virtual ms from the drop's OK to the create's answer
+    bool     neverPlaced = false;                       // after the hold was released, the dropped topic was not placed
+    bool     unknownEverywhere = false;                 // every live broker answers UnknownTopic (7) for its id
+    std::vector<rune::protocol::RequestId> extraOkRequestIds;   // OK'd requests that are not the cell's op (the create)
     bool     okReleasedOnlyAfterServing = false;
     bool     haltedBrokerStillServesAppliedTopics = false;
     bool     haltOffsetIsTheTamperedEvent = false;   // R2: the halt names the offset of the event the victim refused
@@ -290,10 +297,17 @@ public:
     /// The "Precondition" column of the plan's ops table, built through the
     /// leader by DDL (the client model, no faults).  Every cell also gets the
     /// baseline topic `base` (untyped, disk) that produce/consume run on.
-    void buildPrecondition(cm::Kind kind, cm::Persist persist) {
+    void buildPrecondition(cm::Kind kind, cm::Persist persist, cm::Timing timing = cm::Timing::Steady) {
         persist_ = persist;
         doDdl_(makeRequest_(DdlSpec{DdlWhat::DefineTopic, kBase, false, cm::Persist::Disk}, freshRid_()), "precondition base");
-        buildTarget_(kind, persist, /*typed=*/true);
+        if (timing == cm::Timing::CreateRacesPlacement && cm::dropsATopic(kind)) {
+            // R10: the cell itself CREATES the target (its placement held) and then drops it: the precondition builds only the
+            // baseline - and, for a view, its typed source.
+            if (kind == cm::Kind::DropView)
+                doDdl_(makeRequest_(DdlSpec{DdlWhat::DefineTopic, kSource, true, persist}, freshRid_()), "precondition source");
+        } else {
+            buildTarget_(kind, persist, /*typed=*/true);
+        }
         awaitServing_(kBase);
     }
 
@@ -454,6 +468,55 @@ public:
             break;
         }
         case cm::Timing::CreateRacesPlacement: {
+            if (cm::dropsATopic(kind)) {
+                // R10: a DROP of a topic whose create is applied but whose placement is not committed yet.  The create's OK is held
+                // by the answer gate (the topic does not serve); the drop applies; the held OK must be released as a TOMBSTONE
+                // (BrokerNode::ddlGatedTopicServes: Dropped -> true) promptly - never held to the in-doubt cap, never behind the
+                // drop's own OK - and the placement, released afterwards, must find nothing to place.
+                holdPlacement(true);
+                const bool isView = kind == cm::Kind::DropView;
+                const std::string name = isView ? kView : kTopic;
+                const DdlSpec createSpec = isView ? DdlSpec{DdlWhat::CreateView, kView, true, ent.persist}
+                                                  : DdlSpec{DdlWhat::DefineTopic, kTopic, typedCreate, ent.persist};
+                const rune::protocol::RequestId createRid = freshRid_();
+                ClientOp& create = startOp_(makeRequest_(createSpec, createRid, "create " + name), leader, "create " + name);
+                until_([&] {
+                    const auto id = appliedTopicId_(leader, name);
+                    return id.has_value() && registryHolds_(leader, *id) && !placed_.contains(*id);
+                }, "drop-before-placement: the create was never applied on the leader's broker");
+                const int32_t id = *appliedTopicId_(leader, name);
+                run.produceInWindowCode = probe(leader, id);
+                until_([&] {
+                    for (const auto& br : brokers_)
+                        if (br->alive && !appliedTopicId_(br->id, name).has_value()) return false;
+                    return !placed_.contains(id);
+                }, "drop-before-placement: not every broker applied the create before its placement");
+                if (create.done()) fail_("drop-before-placement", "the create answered before the topic's placement committed");
+                ClientOp& op = cellOp(via);   // the DROP: the cell's op
+                runOps_({&op}, "drop-before-placement: the drop (the placement is still held)");
+                const int64_t dropOkAt = now_;
+                // the create's held OK is released as a tombstone, promptly
+                for (int i = 0; i < 2000 && !create.done(); ++i) pump();
+                run.createAnsweredOkBeforePlacement = create.done() && create.finalCode() == 0 && placementHeld_;
+                run.createAnswerMs = std::max<int64_t>(0, (now_ - dropOkAt) / 1'000'000);
+                // the drop reached every live broker (its registry tombstoned the id) while the placement is STILL held
+                until_([&] {
+                    for (const auto& br : brokers_)
+                        if (br->alive && (appliedTopicId_(br->id, name).has_value() ||
+                                          br->ctl.reg->state(id) != rune::gateway::TopicRegistry::TopicState::Dropped)) return false;
+                    return true;
+                }, "drop-before-placement: the drop never reached every broker");
+                holdPlacement(false);
+                for (int i = 0; i < 64; ++i) pump();   // give a stray placement every chance
+                run.neverPlaced = !placed_.contains(id);
+                run.unknownEverywhere = true;
+                for (const auto& br : brokers_)
+                    if (br->alive && probe(br->id, id) != 7) run.unknownEverywhere = false;
+                if (create.finalCode() == 0) run.extraOkRequestIds.push_back(createRid);
+                all = {&op};
+                fillCommon_(run, op);
+                break;
+            }
             holdPlacement(true);
             ClientOp& op = cellOp(via);
             const std::string probeName = kind == cm::Kind::CreateTopic ? kTopic : kView;
@@ -1090,7 +1153,7 @@ private:
         const std::size_t idx = recs_.size() - 1;
         byCorr_[corr].push_back(idx);
         Broker& br = broker_(b);
-        if (br.held.empty() && (recs_[idx].gateTopic < 0 || serves_(br, recs_[idx].gateTopic))) {
+        if (br.held.empty() && (recs_[idx].gateTopic < 0 || gateServes_(br, recs_[idx].gateTopic))) {
             recs_[idx].visible = true;
             recs_[idx].servedAtRelease = recs_[idx].gateTopic < 0 || serves_(br, recs_[idx].gateTopic);
         } else {
@@ -1100,7 +1163,7 @@ private:
     void releaseGated_(Broker& br) {
         while (!br.held.empty()) {
             ClusterAnswer& r = recs_[br.held.front()];
-            if (r.gateTopic >= 0 && !serves_(br, r.gateTopic)) break;
+            if (r.gateTopic >= 0 && !gateServes_(br, r.gateTopic)) break;
             r.visible = true;
             r.servedAtRelease = r.gateTopic < 0 || serves_(br, r.gateTopic);
             br.held.pop_front();
@@ -1667,6 +1730,12 @@ private:
                placed_.contains(topicId);
     }
     [[nodiscard]] bool regServes_(int32_t b, int32_t topicId) const { return serves_(broker_(b), topicId); }
+    /// The DDL answer gate's release test, PRODUCTION's own (BrokerNode::ddlGatedTopicServes): the topic serves, or it is a
+    /// tombstone (dropped before it ever served - the held create OK is released, not held to the in-doubt cap).
+    [[nodiscard]] bool gateServes_(const Broker& br, int32_t topicId) const {
+        return rune::node::BrokerNode::ddlGatedTopicServes(br.ctl.reg.get(), topicId,
+                                                           [&](int32_t id) { return serves_(br, id); });
+    }
     [[nodiscard]] bool registryHolds_(int32_t b, int32_t topicId) const {
         const Broker& br = broker_(b);
         return br.ctl.reg && br.ctl.reg->state(topicId) == rune::gateway::TopicRegistry::TopicState::Serving;

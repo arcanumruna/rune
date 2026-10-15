@@ -16,14 +16,18 @@ enum class Timing : uint8_t { Steady, LeaderChangeMidDdl, RestartMidApply, NewBr
                               ConcurrentDdlDifferentBrokers, DropAndReuseName, CreateRacesPlacement,
                               FingerprintMismatch };
 enum class Outcome : uint8_t { NotApplicable, Ok, RedirectThenOk, NotLeaderThenOkOnce, NotLeaderUntilBudgetThenOk,
-                               OneWinsOneConflict, OkNewObjectId, OkAfterPlacement, HaltedBrokerInternalOthersOk };
+                               OneWinsOneConflict, OkNewObjectId, OkAfterPlacement, HaltedBrokerInternalOthersOk,
+                               OkDroppedBeforePlacement };
 inline constexpr int kKinds = 9, kEntities = 4, kTimings = 9;
 
 [[nodiscard]] constexpr bool createsATopic(Kind k) noexcept {
     return k == Kind::CreateTopic || k == Kind::CreateView || k == Kind::AlterView;
 }
+/// R1: a kind that neither creates a topic nor drops one has no creation / placement to race (AlterTopicConfig, CreateSchema,
+/// AlterSchema, SetCompatibility).  A DROP races the placement of the topic it removes (R10) - those cells apply.
+[[nodiscard]] constexpr bool dropsATopic(Kind k) noexcept { return k == Kind::DropTopic || k == Kind::DropView; }
 [[nodiscard]] constexpr int naRule(Kind k, Entity, Timing t) noexcept {
-    return (t == Timing::CreateRacesPlacement && !createsATopic(k)) ? 1 : 0;   // R1
+    return (t == Timing::CreateRacesPlacement && !createsATopic(k) && !dropsATopic(k)) ? 1 : 0;   // R1
 }
 [[nodiscard]] constexpr Outcome expect(Kind k, Entity e, Timing t) noexcept {
     if (naRule(k, e, t) != 0) return Outcome::NotApplicable;                          // R1
@@ -33,7 +37,8 @@ inline constexpr int kKinds = 9, kEntities = 4, kTimings = 9;
     case Timing::LeaderChangeMidDdl:            return Outcome::NotLeaderThenOkOnce;            // R4
     case Timing::ConcurrentDdlDifferentBrokers: return Outcome::OneWinsOneConflict;             // R5
     case Timing::DropAndReuseName:              return Outcome::OkNewObjectId;                  // R6
-    case Timing::CreateRacesPlacement:          return Outcome::OkAfterPlacement;               // R7
+    case Timing::CreateRacesPlacement:          return dropsATopic(k) ? Outcome::OkDroppedBeforePlacement   // R10
+                                                                     : Outcome::OkAfterPlacement;         // R7
     case Timing::Steady: case Timing::RestartMidApply: case Timing::NewBrokerJoins:
         return e.via == Via::Follower ? Outcome::RedirectThenOk : Outcome::Ok;                  // R8 / R9
     }
@@ -75,7 +80,7 @@ struct ExpectedCodes { int first, afterRedirect, final, other, viaLeader, retrie
         const int conflict = conflictCode(k);
         return viaF ? ExpectedCodes{3, conflict, conflict, 0, -1, -1} : ExpectedCodes{0, -1, 0, conflict, -1, -1};
     }
-    case Outcome::OkNewObjectId: case Outcome::OkAfterPlacement:                                   // R6 / R7
+    case Outcome::OkNewObjectId: case Outcome::OkAfterPlacement: case Outcome::OkDroppedBeforePlacement:   // R6 / R7 / R10
     case Outcome::RedirectThenOk: case Outcome::Ok:                                                // R8 / R9
         return viaLeaderThen(0, 0);
     }
@@ -116,7 +121,7 @@ enum class Template : uint8_t { Define, Alter, CreateView, Ddl, Error };
 [[nodiscard]] constexpr std::string_view name(Outcome o) noexcept {
     constexpr std::string_view n[] = {"NotApplicable", "Ok", "RedirectThenOk", "NotLeaderThenOkOnce",
                                       "NotLeaderUntilBudgetThenOk", "OneWinsOneConflict", "OkNewObjectId",
-                                      "OkAfterPlacement", "HaltedBrokerInternalOthersOk"};
+                                      "OkAfterPlacement", "HaltedBrokerInternalOthersOk", "OkDroppedBeforePlacement"};
     return n[static_cast<int>(o)];
 }
 

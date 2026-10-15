@@ -436,6 +436,7 @@ void AdminWorker::demote_(int32_t leaderId, int32_t epoch) {
     if (auto* a = std::get_if<AwaitingCommit>(&inFlight_)) {
         const DdlRequest req = std::move(a->req);
         inFlight_ = Idle{};
+        ++notLeaderDemoted_;
         answer_(req, kNotLeader, "the catalog leader changed while the DDL awaited its commit");
     }
 }
@@ -740,6 +741,7 @@ bool AdminWorker::advance_(int64_t nowNs) {
         spdlog::warn("AdminWorker: the catalog fell below its minIsr while the event at offset {} awaited its "
                      "commit - answered NotLeader (retriable; a retry with the same requestId gets its result "
                      "once it commits)", offset);
+        ++notLeaderBelowMinIsr_;
         answer_(req, kNotLeader, "the catalog fell below its minIsr while the DDL awaited its commit");
         return true;
     }
@@ -752,6 +754,7 @@ bool AdminWorker::advance_(int64_t nowNs) {
         spdlog::warn("AdminWorker: the event at offset {} did not commit within {} s — answered NotLeader "
                      "(retriable; a retry with the same requestId gets its result if it commits)",
                      offset, kDdlTimeoutNs / 1'000'000'000LL);
+        ++notLeaderCommitTimeout_;
         answer_(req, kNotLeader, "the catalog event did not commit in time");
         return true;
     }

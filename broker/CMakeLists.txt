@@ -412,6 +412,36 @@ if(BUILD_PING_PROBE)
     endif()
 endif()
 
+# ── Task 23 fix rounds 1+2 (R-I2, R-N1, R-N2): the BenchGate.h self-tests ────────────────────────────────
+# Registered in EVERY test tree (BUILD_TESTING alone: Debug, ASan, TSan), not only where the benchmarks are built, so the gate
+# tests exist at every checkpoint.  Google Benchmark is a hard requirement of a test tree: without it the gate self-tests would
+# silently disappear.  `ctest -N -R BenchGateRegression` must list exactly 4 tests (checkpoint check).
+if(BUILD_TESTING)
+    find_package(benchmark CONFIG)
+    if(NOT benchmark_FOUND)
+        message(FATAL_ERROR "BenchGateRegression needs google-benchmark (conan): a test tree without it would silently drop the gate self-tests")
+    endif()
+    if(NOT TARGET rune_bench_gate_selftest)
+        add_executable(rune_bench_gate_selftest
+            benchmark/BenchmarkMain.cpp
+            benchmark/BenchGateRegressionBench.cpp)
+        target_link_libraries(rune_bench_gate_selftest PRIVATE benchmark::benchmark)
+    endif()
+    set(_gate_bin "$<TARGET_FILE:rune_bench_gate_selftest>")
+    add_test(NAME BenchGateRegression.PassingGateExitsZeroWithAggregates
+        COMMAND sh -c "out=$(${_gate_bin} --benchmark_filter=BM_GatePassesRegression --benchmark_repetitions=3 --benchmark_report_aggregates_only=true 2>&1); rc=$?; echo \"$out\"; test $rc -eq 0 && echo \"$out\" | grep -q _median")
+    # A gate that fails on repetition 0 only: no crash (exit exactly 1, not a signal), the aggregates are printed.
+    add_test(NAME BenchGateRegression.GateFailedOnFirstRepetitionExitsOneWithoutCrashing
+        COMMAND sh -c "out=$(${_gate_bin} --benchmark_filter=BM_GateFirstRepetitionFailsRegression --benchmark_repetitions=3 --benchmark_report_aggregates_only=true 2>&1); rc=$?; echo \"$out\"; test $rc -eq 1 && echo \"$out\" | grep -q _median && echo \"$out\" | grep -q 'BENCH GATE FAILED'")
+    # R-N1: a skipped (errored) run - a setup failure or an in-loop abort - fails the process too: exit exactly 2.
+    add_test(NAME BenchGateRegression.SkippedRunExitsTwo
+        COMMAND sh -c "out=$(${_gate_bin} --benchmark_filter=BM_GateSkippedRunRegression --benchmark_repetitions=3 2>&1); rc=$?; echo \"$out\"; test $rc -eq 2 && echo \"$out\" | grep -q 'BENCH SKIPPED'")
+    # A tripped gate turns into a nonzero exit code.
+    add_test(NAME BenchGateRegression.AlwaysFailingGateIsNonzero
+        COMMAND ${_gate_bin} --benchmark_filter=BM_GateAlwaysFailsRegression)
+    set_tests_properties(BenchGateRegression.AlwaysFailingGateIsNonzero PROPERTIES WILL_FAIL TRUE)
+endif()
+
 if(BUILD_BENCHMARKS)
     # ── RoutingImageBench — standalone (header-only dep, fast to build) ─────────
     add_executable(RoutingImageBench
@@ -419,24 +449,6 @@ if(BUILD_BENCHMARKS)
     target_link_libraries(RoutingImageBench PRIVATE
         rune_metadata
         benchmark::benchmark_main)
-
-    # Task 23 fix round 1 (R-I2): BenchGate.h self-test (small: the shared main + the gate benchmarks only).
-    add_executable(rune_bench_gate_selftest
-        benchmark/BenchmarkMain.cpp
-        benchmark/BenchGateRegressionBench.cpp)
-    target_link_libraries(rune_bench_gate_selftest PRIVATE benchmark::benchmark)
-    if(BUILD_TESTING)
-        set(_gate_bin "$<TARGET_FILE:rune_bench_gate_selftest>")
-        add_test(NAME BenchGateRegression.PassingGateExitsZeroWithAggregates
-            COMMAND sh -c "out=$(${_gate_bin} --benchmark_filter=BM_GatePassesRegression --benchmark_repetitions=3 --benchmark_report_aggregates_only=true 2>&1); rc=$?; echo \"$out\"; test $rc -eq 0 && echo \"$out\" | grep -q _median")
-        # A gate that fails on repetition 0 only: no crash (exit exactly 1, not a signal), the aggregates are printed.
-        add_test(NAME BenchGateRegression.GateFailedOnFirstRepetitionExitsOneWithoutCrashing
-            COMMAND sh -c "out=$(${_gate_bin} --benchmark_filter=BM_GateFirstRepetitionFailsRegression --benchmark_repetitions=3 --benchmark_report_aggregates_only=true 2>&1); rc=$?; echo \"$out\"; test $rc -eq 1 && echo \"$out\" | grep -q _median && echo \"$out\" | grep -q 'BENCH GATE FAILED'")
-        # A tripped gate turns into a nonzero exit code.
-        add_test(NAME BenchGateRegression.AlwaysFailingGateIsNonzero
-            COMMAND ${_gate_bin} --benchmark_filter=BM_GateAlwaysFailsRegression)
-        set_tests_properties(BenchGateRegression.AlwaysFailingGateIsNonzero PROPERTIES WILL_FAIL TRUE)
-    endif()
 
     add_executable(rune_broker_benchmark
         benchmark/BenchmarkMain.cpp

@@ -43,4 +43,26 @@ inline bool gateCheck(benchmark::State& state, bool ok, const char* msg) {
     return ok;
 }
 
+/// Round 2 (R-N1): a display-reporter wrapper that records every SKIPPED (errored) run - a SkipWithError that left the loop
+/// (a setup failure, an in-loop abort such as an unanswered request) - so main() can fail the process.  Everything is forwarded
+/// to the inner (default) display reporter, so --benchmark_format etc. keep working.  Main thread only.
+class SkipTrackingReporter final : public benchmark::BenchmarkReporter {
+public:
+    explicit SkipTrackingReporter(benchmark::BenchmarkReporter* inner) : inner_(inner) {}
+    bool ReportContext(const Context& c) override { return inner_->ReportContext(c); }
+    void ReportRunsConfig(double minTime, bool hasExplicitIters, benchmark::IterationCount iters) override {
+        inner_->ReportRunsConfig(minTime, hasExplicitIters, iters);
+    }
+    void ReportRuns(const std::vector<Run>& runs) override {
+        for (const Run& r : runs)
+            if (r.skipped != benchmark::internal::NotSkipped) skipped_.push_back(r.benchmark_name() + ": " + r.skip_message);
+        inner_->ReportRuns(runs);
+    }
+    void Finalize() override { inner_->Finalize(); }
+    [[nodiscard]] const std::vector<std::string>& skipped() const { return skipped_; }
+private:
+    benchmark::BenchmarkReporter* inner_;
+    std::vector<std::string>      skipped_;
+};
+
 }  // namespace rune::bench

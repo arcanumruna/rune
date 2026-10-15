@@ -6,6 +6,8 @@
 #include <rune/node/WorkerOp.h>
 #include <rune/node/WorkerPool.h>
 
+#include <spdlog/spdlog.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -30,6 +32,12 @@ public:
                 const EnqueueResult r = pool.worker(p.nextWorker).enqueueOp(std::move(op));
                 if (r == EnqueueResult::Full) break;   // back-pressure: retry next cycle
                 if (r == EnqueueResult::Enqueued) { ++enqueued_; ++work; }
+                else if (r == EnqueueResult::TooLarge) [[unlikely]] {   // impossible for a scalar op: loud, never silent
+                    ++tooLargeDrops_;
+                    spdlog::error("TopicDroppedFanout: TopicDropped for topicId={} cannot be enqueued on worker {} "
+                                  "(TooLarge) - that worker keeps answering NotLeader instead of UnknownTopic",
+                                  p.topicId, p.nextWorker);
+                }
                 ++p.nextWorker;
             }
             if (p.nextWorker < n) break;               // FIFO
@@ -41,11 +49,13 @@ public:
 
     [[nodiscard]] std::size_t pendingForTest() const noexcept { return pending_.size(); }
     [[nodiscard]] uint64_t    enqueuedForTest() const noexcept { return enqueued_; }
+    [[nodiscard]] uint64_t    tooLargeDropsForTest() const noexcept { return tooLargeDrops_; }
 
 private:
     struct Pending { int32_t topicId; int32_t nextWorker; };
     std::vector<Pending> pending_;
     uint64_t             enqueued_ = 0;
+    uint64_t             tooLargeDrops_ = 0;
 };
 
 }  // namespace rune::node

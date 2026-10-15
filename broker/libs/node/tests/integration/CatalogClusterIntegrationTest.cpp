@@ -9,6 +9,8 @@
 // LeaderChangeMidDdl, RestartMidApply, NewBrokerJoins, DropAndReuseName, CreateRacesPlacement}; every
 // expected answer is read from cmatrix::expectedCodes (F16) - no hard-coded outcome.
 //
+// DropTopic x CreateRacesPlacement (R10): the topic is dropped after its create applied everywhere and before its placement committed.
+//
 // CreateRacesPlacement (CreateTopic / CreateView) really races placement (fix round 1, R7 OkAfterPlacement): the initial
 // placement is HELD on every broker, the DDL commits + applies, every broker is probed for 1.5 s (a produce + Subscribe per
 // partition / a GetViewRow: retriable refusal only), no DDL answer may arrive in the window; then the placement is released.
@@ -42,6 +44,7 @@
 #include <functional>
 #include <iostream>
 #include <map>
+#include <set>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -59,7 +62,7 @@ using rune::protocol::RequestId;
 
 namespace {
 
-constexpr int cOk = 0, cNotLeader = 2, cRedirect = 3, cUnknown = 7;
+constexpr int cOk = 0, cNotLeader = 2, cInternal = 6, cRedirect = 3, cUnknown = 7;
 constexpr int cNoAnswer = -2;   // R-I1: a broker that never answered (NOT the in-doubt NotLeader of a crashed session)
 
 [[nodiscard]] std::vector<uint8_t> keyBytes(int64_t id) {
@@ -137,6 +140,7 @@ struct CellResult {
     int         firstCode = -100, afterRedirectCode = -1, finalCode = -100;
     std::string trace;
     RequestId   rid{};
+    std::vector<int> codes;   ///< every NON-final answer (Redirect / NotLeader / the gate's in-doubt Internal), in order
 };
 
 /// Cell wall times, printed once at the end of the run.
@@ -145,6 +149,7 @@ struct CellTimes {
         static std::vector<std::pair<std::string, double>> r;
         return r;
     }
+    static int& perturbed() { static int n = 0; return n; }   ///< cells whose exact codes were relaxed on product evidence
 };
 class CellTimesPrinter : public ::testing::Environment {
 public:
@@ -152,6 +157,7 @@ public:
         double total = 0;
         for (const auto& [n, s] : CellTimes::rows()) { total += s; std::fprintf(stderr, "[ cell time ] %-60s %7.1f s\n", n.c_str(), s); }
         if (!CellTimes::rows().empty()) std::fprintf(stderr, "[ cell time ] %-60s %7.1f s\n", "TOTAL", total);
+        std::fprintf(stderr, "[ cell time ] perturbed cells: %d\n", CellTimes::perturbed());
     }
 };
 [[maybe_unused]] ::testing::Environment* const kCellTimesPrinter = ::testing::AddGlobalTestEnvironment(new CellTimesPrinter);
@@ -239,6 +245,15 @@ public:
             if (sendNo == 0) r.firstCode = code;
             else if (sendNo == 1 && r.firstCode == cRedirect) r.afterRedirectCode = code;
             ++sendNo;
+            // Slice Recipe 2 step 4: the DdlAnswerGate's overdue answer ("placement pending") is the IN-DOUBT Internal - the
+            // event committed, the topic does not serve yet: retried with the SAME rid on the same broker, like NotLeader.
+            // Any other Internal stays terminal.
+            if (code == cInternal && a.msg.find("placement pending") != std::string::npos) {
+                r.codes.push_back(cInternal);
+                std::this_thread::sleep_for(100ms);
+                continue;
+            }
+            if (code == cRedirect || code == cNotLeader) r.codes.push_back(code);
             if (code == cRedirect) {
                 const int target = hooks.followRedirects ? nodeOf(a.msg) : -1;
                 if (target < 0) { r.finalCode = cRedirect; r.trace += " (redirect not followed)"; return r; }
@@ -267,6 +282,7 @@ public:
     RequestId freshRid_() { return RequestId{0xCE11'0022ull, ++rid_}; }
     /// The correlation id of the last DDL frame `drive` / `sendOnly` sent (0: none).
     [[nodiscard]] int64_t lastCorr() const noexcept { return lastCorr_; }
+    [[nodiscard]] bool placementHeld() const noexcept { return placementHeld_; }
 
     // ── reads: a topic as a broker's applied catalog states it ───────────────────────────────────
     std::optional<TopicInfo> topicInfo(int node, const std::string& name, std::chrono::milliseconds wait, int* code = nullptr) {
@@ -518,6 +534,7 @@ public:
 
     /// Hold / release the initial placement of runtime topics on every running broker (only the controller places).
     void holdPlacementEverywhere(bool on) {
+        placementHeld_ = on;
         for (int n : c_.runningNodes())
             c_.node(n).onControlThreadForTest([this, n, on] { c_.node(n).metadataServiceForTest()->holdPlacementForTest(on); return 0; });
     }
@@ -581,6 +598,7 @@ private:
     std::map<int, int64_t>    sid_;
     uint64_t                  rid_ = 0;
     int64_t                   lastCorr_ = 0;
+    bool                      placementHeld_ = false;
 };
 
 // ── senders ─────────────────────────────────────────────────────────────────────────────────────
@@ -645,60 +663,132 @@ std::vector<CellParam> allCells() {
 
 class CatalogClusterSliceRegression : public ::testing::TestWithParam<CellParam> {};
 
-} // namespace
+// ===========================================================================
+// Perturbation evidence (slice Recipe 3).  A host stall can move the catalog topology DURING a cell (re-election at
+// 150 ms of heartbeat silence, false fencing at 450 ms).  The cell detects it from PRODUCT evidence independent of the
+// client's answers - the leader epoch, the by-cause NotLeader counters of every broker, the gate's overdue counter -
+// and then asserts the contract of THAT event; with no evidence the matrix's exact codes apply.
+// ===========================================================================
+struct Perturbation {
+    int32_t                                     catalogLeaderEpoch = -1;
+    std::map<int, BrokerNode::CatalogNotLeaderCounts> nl;   // per running broker
+    std::map<int, uint64_t>                     overdue;    // per running broker
+    bool                                        leaderMovedInCell = false, gateOverdueObserved = false;
+    static Perturbation snapshot(ThreeNodes& c) {
+        Perturbation p;
+        for (int n : c.runningNodes()) {
+            if (p.catalogLeaderEpoch < 0)
+                if (const auto pa = catalogAssignmentOf(c.node(n))) p.catalogLeaderEpoch = pa->leaderEpoch;
+            p.nl[n] = c.node(n).catalogNotLeaderCountsForTest();
+            p.overdue[n] = c.node(n).ddlAnswersOverdueForTest();
+        }
+        return p;
+    }
+    /// What changed since `p0` ("" = unperturbed).  Brokers the cell's own timing stops / restarts (`excluded`) are not
+    /// compared (a restarted broker's counters restart); only brokers present in both snapshots are.  `useEpoch` false:
+    /// the timing moves the leader itself (LeaderChangeMidDdl).
+    [[nodiscard]] std::string since(const Perturbation& p0, const std::set<int>& excluded, bool useEpoch) const {
+        std::ostringstream o;
+        if (useEpoch && catalogLeaderEpoch != p0.catalogLeaderEpoch)
+            o << " leader-epoch " << p0.catalogLeaderEpoch << "->" << catalogLeaderEpoch;
+        for (const auto& [id, now] : nl) {
+            const auto it = p0.nl.find(id);
+            if (it == p0.nl.end() || excluded.count(id) != 0) continue;
+            const auto& was = it->second;
+            if (now.belowMinIsr > was.belowMinIsr) o << " n" << id << ":notLeader(belowMinIsr)+" << now.belowMinIsr - was.belowMinIsr;
+            if (now.commitTimeout > was.commitTimeout) o << " n" << id << ":notLeader(commitTimeout)+" << now.commitTimeout - was.commitTimeout;
+            if (now.demoted > was.demoted) o << " n" << id << ":notLeader(demoted)+" << now.demoted - was.demoted;
+        }
+        for (const auto& [id, now] : overdue) {
+            const auto it = p0.overdue.find(id);
+            if (it != p0.overdue.end() && excluded.count(id) == 0 && now > it->second) o << " n" << id << ":gate-overdue+" << now - it->second;
+        }
+        return o.str();
+    }
+};
 
-TEST_P(CatalogClusterSliceRegression, RuntimeDdlThroughEveryBrokerThenDataThroughEveryBroker) {
-    const auto [kind, timing, viaParam] = GetParam();
-    const std::string cell = cellName(GetParam());
-    if (cm::naRule(kind, {cm::Via::Leader, cm::Persist::Disk}, timing) != 0) GTEST_SKIP() << "R1";   // DropTopic x CreateRacesPlacement
+/// The roles a cell resolved (after its precondition).
+struct CellRoles { int preLeader = -1, leader = -1, via = -1; };
+/// What a cell observed (for the seam tests).
+struct CellOutcome {
+    CellResult  res;
+    CellRoles   roles;
+    std::string perturbedWhy;   ///< "" = the exact codes were asserted
+    uint64_t    belowMinIsrOnLeader = 0;
+};
+/// Test seams of runCell (all optional).
+struct CellSeams {
+    std::function<void(NodeConfig&)>                   configTweak;
+    std::function<void(ThreeNodes&, Rig&)>             afterPrecondition;
+    std::function<void(ThreeNodes&, Rig&, int)>        onLeaderSend;
+    std::function<void(ThreeNodes&, Rig&)>             afterAnswerRelease;
+    bool                                               answerHoldInWindow = true;   ///< false: the RED of Recipe 2 step 2
+};
+
+/// The settled catalog leader, polled (a stalled host can leave the topology unsettled for a moment between two reads): -1 after `within`.
+int resolveLeader(ThreeNodes& c, std::chrono::seconds within) {
+    for (const auto deadline = Clock::now() + within; Clock::now() < deadline;) {
+        if (const int l = c.settledLeader(); l > 0) return l;
+        std::this_thread::sleep_for(20ms);
+    }
+    return -1;
+}
+
+/// One cell of the slice (also the unit the seam tests drive).
+void runCell(const CellParam& param, const CellSeams& seams = {}, CellOutcome* outcome = nullptr) {
+    const auto [kind, timing, viaParam] = param;
+    const std::string cell = cellName(param);
+    if (cm::naRule(kind, {cm::Via::Leader, cm::Persist::Disk}, timing) != 0) { GTEST_SKIP() << "R1"; return; }   // AlterSchema x CreateRacesPlacement
     const auto t0 = Clock::now();
     struct TimeRecorder { std::string n; Clock::time_point t0; ~TimeRecorder() {
         CellTimes::rows().emplace_back(n, std::chrono::duration<double>(Clock::now() - t0).count()); } } recorder{cell, t0};
 
-    ThreeNodes c = ThreeNodes::start("sl" + std::to_string(static_cast<int>(kind)) + std::to_string(static_cast<int>(timing)) + std::to_string(viaParam),
-                                     timing == cm::Timing::NewBrokerJoins ? std::vector<int>{1, 2} : std::vector<int>{1, 2, 3});
+    ThreeNodes c("sl" + std::to_string(static_cast<int>(kind)) + std::to_string(static_cast<int>(timing)) + std::to_string(viaParam), Mode::Shard);
+    c.configTweak = seams.configTweak;
+    for (int id : (timing == cm::Timing::NewBrokerJoins ? std::vector<int>{1, 2} : std::vector<int>{1, 2, 3})) c.startNode(id);
     ASSERT_TRUE(c.awaitCatalogLeader(60s)) << cell;
     Rig rig(c);
-    const int leader = c.settledLeader();
-    ASSERT_GT(leader, 0);
+    const int preLeader = resolveLeader(c, 60s);   // for the PRECONDITION sends only
+    ASSERT_GT(preLeader, 0);
 
-    // ── precondition (through the leader, with the settle of a young cluster) ─────────────────────
+    // ── precondition (through the preLeader, with the settle of a young cluster) ─────────────────────
     const bool reuse = timing == cm::Timing::DropAndReuseName;
     Expected tHave, readyHave, srcHave;
     int32_t srcId = -1, droppedId = -1;
-    ASSERT_NO_FATAL_FAILURE(rig.must(defineSender("ready", 1, true), "define ready", leader));
+    ASSERT_NO_FATAL_FAILURE(rig.must(defineSender("ready", 1, true), "define ready", preLeader));
     switch (kind) {
     case cm::Kind::CreateTopic:
         if (reuse) {
-            ASSERT_NO_FATAL_FAILURE(rig.must(defineSender("t", 3, true), "define t (to be dropped)", leader));
+            ASSERT_NO_FATAL_FAILURE(rig.must(defineSender("t", 3, true), "define t (to be dropped)", preLeader));
             TopicInfo old;
             Expected oldHave;   // the dropped topic's data: must never reappear in the reused name
             ASSERT_NO_FATAL_FAILURE(rig.dataCheck("t", true, oldHave, cell + "/old", &old));
-            ASSERT_NO_FATAL_FAILURE(rig.must(dropSender("t"), "drop t", leader));
+            ASSERT_NO_FATAL_FAILURE(rig.must(dropSender("t"), "drop t", preLeader));
         }
         break;
     case cm::Kind::CreateView:
-        ASSERT_NO_FATAL_FAILURE(rig.must(defineSender("src", 1, true), "define src", leader));
+        ASSERT_NO_FATAL_FAILURE(rig.must(defineSender("src", 1, true), "define src", preLeader));
         {
-            const auto si = rig.topicInfo(leader, "src", 30s);
+            const auto si = rig.topicInfo(preLeader, "src", 30s);
             ASSERT_TRUE(si.has_value());
             srcId = si->id;
         }
         if (reuse) {
-            ASSERT_NO_FATAL_FAILURE(rig.must(createViewSender("v", srcId), "create v (to be dropped)", leader));
-            ASSERT_NO_FATAL_FAILURE(rig.must(dropViewSender("v"), "drop v", leader));
+            ASSERT_NO_FATAL_FAILURE(rig.must(createViewSender("v", srcId), "create v (to be dropped)", preLeader));
+            ASSERT_NO_FATAL_FAILURE(rig.must(dropViewSender("v"), "drop v", preLeader));
         }
         break;
     case cm::Kind::DropTopic:
-        ASSERT_NO_FATAL_FAILURE(rig.must(defineSender("t", 3, true), "define t", leader));
+        if (timing == cm::Timing::CreateRacesPlacement) break;   // R10: the cell itself creates t (placement held), then drops it
+        ASSERT_NO_FATAL_FAILURE(rig.must(defineSender("t", 3, true), "define t", preLeader));
         { TopicInfo di; ASSERT_NO_FATAL_FAILURE(rig.dataCheck("t", true, tHave, cell + "/pre", &di)); droppedId = di.id; }   // data in the topic about to be dropped
         break;
     case cm::Kind::AlterSchema:
         if (reuse) {
-            ASSERT_NO_FATAL_FAILURE(rig.must(defineSender("t", 3, true), "define t (to be dropped)", leader));
-            ASSERT_NO_FATAL_FAILURE(rig.must(dropSender("t"), "drop t", leader));
+            ASSERT_NO_FATAL_FAILURE(rig.must(defineSender("t", 3, true), "define t (to be dropped)", preLeader));
+            ASSERT_NO_FATAL_FAILURE(rig.must(dropSender("t"), "drop t", preLeader));
         }
-        ASSERT_NO_FATAL_FAILURE(rig.must(defineSender("t", 3, true), "define t", leader));
+        ASSERT_NO_FATAL_FAILURE(rig.must(defineSender("t", 3, true), "define t", preLeader));
         break;
     default: FAIL() << "kind not in the slice";
     }
@@ -707,6 +797,14 @@ TEST_P(CatalogClusterSliceRegression, RuntimeDdlThroughEveryBrokerThenDataThroug
         std::string why;
         ASSERT_TRUE(c.awaitCatalogDigestsEqual(60s, &why)) << cell << " precondition: " << why;
     }
+    if (seams.afterPrecondition) seams.afterPrecondition(c, rig);
+
+    // Slice Recipe 1: THE cell's leader is resolved NOW, after the precondition (under load the catalog leadership can move
+    // during it); every role the cell acts on (via, victim, the hooks) derives from this value.
+    const int leader = resolveLeader(c, 60s);
+    ASSERT_GT(leader, 0);
+    Perturbation pert;
+    const Perturbation pert0 = Perturbation::snapshot(c);
 
     // ── the cell's DDL ─────────────────────────────────────────────────────────────────────────────
     Sender op;
@@ -745,20 +843,25 @@ TEST_P(CatalogClusterSliceRegression, RuntimeDdlThroughEveryBrokerThenDataThroug
     const RequestId rid = rig.freshRid_();
     Hooks hooks;
     int victim = -1;
-    bool crashedLeader = false;
+    int crashedNode = -1;
     bool placementReleased = false;
+    int answersHeldOn = -1;
     uint64_t baseline = 0;
+    std::function<void()> afterDrive;   // R10: the checks that run after the drop's answer, before the placement is released
+    int64_t dropCreateCorr = 0;
+    Clock::time_point tRelease{};
     switch (timing) {
     case cm::Timing::LeaderChangeMidDdl:
         c.node(leader).holdCatalogAnswersForTest(true);                 // the leader commits the DDL and never answers it
         baseline = c.node(leader).catalogEventsAppendedForTest();
         hooks.afterSend = [&](int, int node) {
-            if (node != leader || crashedLeader) return false;
-            crashedLeader = true;
+            if (node != c.catalogLeaderId() || crashedNode > 0) return false;   // keyed on whoever leads when the frame is sent
+            if (node != leader) { pert.leaderMovedInCell = true; return false; }   // the held / baselined broker is not the leader any more
+            crashedNode = node;
             bool ok = false;
-            rig.pumping([&] { ok = c.crashAfterNextAppend(leader, baseline, /*waitCommit=*/true, 30s); });
+            rig.pumping([&] { ok = c.crashAfterNextAppend(node, baseline, /*waitCommit=*/true, 30s); });
             EXPECT_TRUE(ok) << cell << ": the leader never appended + committed the DDL";
-            rig.forget(leader);
+            rig.forget(node);
             return true;                                               // in doubt: the crash ate the answer
         };
         break;
@@ -767,9 +870,13 @@ TEST_P(CatalogClusterSliceRegression, RuntimeDdlThroughEveryBrokerThenDataThroug
         ASSERT_GT(victim, 0) << cell;
         rig.pumping([&] { c.stop(victim); });
         rig.forget(victim);
-        ASSERT_TRUE(c.awaitCatalogIsrSizeOn(leader, 2, 60s)) << cell << ": the leader's ISR never shrank to the 2 running brokers";
+        {
+            int isrLeader = -1;
+            ASSERT_TRUE(c.awaitCatalogIsrSize(2, 60s, &isrLeader)) << cell << ": the catalog leader's ISR never shrank to the 2 running brokers";
+            if (isrLeader != leader) pert.leaderMovedInCell = true;     // the topology moved between resolution and the shrink
+        }
         hooks.afterSend = [&](int, int node) {
-            if (node != leader || victim < 0) return false;
+            if (node != c.catalogLeaderId() || victim < 0) return false;
             const int v = victim;
             victim = -1;
             rig.pumping([&] { c.startNode(v); });                       // restarted while the DDL commits / applies
@@ -780,19 +887,35 @@ TEST_P(CatalogClusterSliceRegression, RuntimeDdlThroughEveryBrokerThenDataThroug
         if (kind == cm::Kind::CreateTopic || kind == cm::Kind::CreateView) {
             // R7 (OkAfterPlacement): the DDL commits and applies everywhere while the initial placement is HELD; the
             // object must refuse retriably through every broker, and the DDL's OK must not arrive, until the
-            // placement is released.  (The DdlAnswerGate holds a DDL OK for at most 5 s: the 1.5 s window below is
-            // well inside it.)  The hold covers every placement path (MetadataService::holdPlacementForTest).
+            // placement is released.  The hold covers every placement path (MetadataService::holdPlacementForTest).
+            // Slice Recipe 2: the leader's DDL ANSWERS are held too until the warm-up is done (the event still commits and
+            // applies), so no answer - not the OK, not a below-minIsr NotLeader - can reach the gate before the window, however
+            // long the warm-up takes; the window (1.5 s) is then bounded inside the gate's hold cap (kDdlAnswerMaxHoldNs).
             rig.holdPlacementEverywhere(true);
+            if (seams.answerHoldInWindow) { c.node(leader).holdCatalogAnswersForTest(true); answersHeldOn = leader; }
             hooks.afterSend = [&](int, int node) {
-                if (node != leader || placementReleased) return false;
+                const int lead = c.catalogLeaderId();
+                if (node != lead || placementReleased) return false;
+                if (lead != leader) pert.leaderMovedInCell = true;
+                if (seams.onLeaderSend) seams.onLeaderSend(c, rig, lead);
                 const int64_t ddlCorr = rig.lastCorr();
                 const std::string what = cell + " (placement held)";
-                // The object is applied (read through a NON-leader broker: the leader's session queues behind its held DDL
-                // answer), then every broker's control thread applies it a hop later: until it does, a probe answers
-                // UnknownTopic / UnknownView - the warm-up waits for the first retriable refusal on each broker.
-                const auto info = rig.topicInfo(via, target, 20s);
-                EXPECT_TRUE(info.has_value()) << what << ": '" << target << "' never applied on node " << via;
+                // The object is applied (read through a broker that is NOT the leader: the leader's session queues behind
+                // its held DDL answer), then every broker's control thread applies it a hop later: until it does, a probe
+                // answers UnknownTopic / UnknownView - the warm-up waits for the first retriable refusal on each broker.
+                int reader = -1;
+                for (int n : c.runningNodes()) if (n != lead) { reader = n; break; }
+                const auto info = rig.topicInfo(reader, target, 20s);
+                EXPECT_TRUE(info.has_value()) << what << ": '" << target << "' never applied on node " << reader;
                 int probes = 0;
+                bool released = false;
+                auto release = [&] {
+                    if (released) return;
+                    released = true;
+                    if (answersHeldOn > 0 && c.running(answersHeldOn)) c.node(answersHeldOn).holdCatalogAnswersForTest(false);
+                    if (answersHeldOn != lead && c.running(lead)) c.node(lead).holdCatalogAnswersForTest(false);
+                    tRelease = Clock::now();
+                };
                 if (info) {
                     auto refusing = [&](int n) {
                         if (kind == cm::Kind::CreateTopic) {
@@ -806,6 +929,8 @@ TEST_P(CatalogClusterSliceRegression, RuntimeDdlThroughEveryBrokerThenDataThroug
                         const auto upTo = Clock::now() + 20s;
                         while (Clock::now() < upTo && !refusing(n)) std::this_thread::sleep_for(20ms);
                     }
+                    release();   // the event is applied: the OK enters the gate NOW (headSince starts), the window is inside its cap
+                    if (seams.afterAnswerRelease) seams.afterAnswerRelease(c, rig);
                     for (const auto windowEnd = Clock::now() + 1500ms; Clock::now() < windowEnd;) {
                         for (int n : c.runningNodes()) {
                             if (kind == cm::Kind::CreateTopic) {
@@ -822,36 +947,131 @@ TEST_P(CatalogClusterSliceRegression, RuntimeDdlThroughEveryBrokerThenDataThroug
                         }
                     }
                 }
+                release();
                 EXPECT_GE(probes, 6) << what << ": the no-placement window was observed (vacuity guard)";
-                EXPECT_FALSE(rig.await(ddlCorr, 20ms).got) << what << ": the DDL was answered before its placement committed (R7)";
+                // The R7 check (slice Recipe 2): an OK while the placement is held is the breach; the ONLY legitimate early
+                // answer is the gate's in-doubt Internal, and only once the hold really exceeded its cap (a host stall).
+                const Answer early = rig.await(ddlCorr, 20ms);
+                const auto held = Clock::now() - tRelease;
+                const auto gateCap = std::chrono::nanoseconds(BrokerNode::kDdlAnswerMaxHoldNs);
+                if (early.got) {
+                    EXPECT_NE(early.code, cOk) << what << ": the DDL's OK arrived while its placement was HELD (R7)";
+                    EXPECT_TRUE(early.code == cInternal && held >= gateCap - 250ms)
+                        << what << ": early answer " << early.code << " after "
+                        << std::chrono::duration_cast<std::chrono::milliseconds>(held).count()
+                        << " ms (only Internal past the " << std::chrono::duration_cast<std::chrono::milliseconds>(gateCap).count()
+                        << " ms gate cap is legitimate)";
+                    if (early.code == cInternal) pert.gateOverdueObserved = true;
+                }
                 rig.holdPlacementEverywhere(false);
                 placementReleased = true;
                 return false;
             };
         }
+        else if (kind == cm::Kind::DropTopic) {
+            // R10: DROP of a topic whose create is applied on every broker but whose placement is HELD.  The create's OK (held by the
+            // DdlAnswerGate: the topic does not serve) must be released as a tombstone once the drop applied - never Internal "in doubt",
+            // never behind the drop's own OK - and the placement, released afterwards, must find nothing to place on any broker.
+            rig.holdPlacementEverywhere(true);
+            const RequestId createRid = rig.freshRid_();
+            dropCreateCorr = rig.sendOnly(leader, defineSender("t", 3, true), createRid);
+            ASSERT_NE(dropCreateCorr, 0) << cell << ": the create could not be sent";
+            for (int n : c.runningNodes()) {
+                if (n == leader) continue;   // the leader's admin answers queue behind its held create OK (the DdlAnswerGate is FIFO)
+                const auto ti = rig.topicInfo(n, "t", 30s);
+                ASSERT_TRUE(ti.has_value()) << cell << ": the create never applied on node " << n;
+                droppedId = ti->id;
+            }
+            int refused = 0;
+            for (int n : c.runningNodes()) refused += rig.expectRetriableRefusal(n, droppedId, 0, cell + " (create applied, placement held)");
+            EXPECT_GE(refused, 6) << cell << ": the no-placement window was observed (vacuity guard)";
+            EXPECT_FALSE(rig.await(dropCreateCorr, 20ms).got) << cell << ": the create answered before its placement committed (R7)";
+            const int32_t createdId = droppedId;
+            afterDrive = [&, createdId] {
+                const auto t0 = Clock::now();
+                const Answer created = rig.await(dropCreateCorr, 10s);
+                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count();
+                ASSERT_TRUE(created.got) << cell << ": the create was never answered";
+                EXPECT_EQ(created.code, cOk) << cell << ": the create's held OK is released as a tombstone, not Internal (in doubt): " << created.msg;
+                EXPECT_LT(ms, 2000) << cell << ": ... promptly (the gate's in-doubt cap is " << BrokerNode::kDdlAnswerMaxHoldNs / 1'000'000 << " ms)";
+                for (int n : c.runningNodes())
+                    EXPECT_EQ(c.node(n).ddlAnswersOverdueForTest(), 0u) << cell << ": node " << n << " answered an in-doubt Internal";
+                rig.holdPlacementEverywhere(false);
+                rig.pumping([] { std::this_thread::sleep_for(1500ms); });   // a stray placement has every chance to commit
+                for (int n : c.runningNodes()) {
+                    bool placed = false;
+                    for (int p = 0; p < 3; ++p)
+                        placed = placed || c.node(n).onControlThreadForTest([&c, n, createdId, p] {
+                            return c.node(n).metadataServiceForTest()->assignment(createdId, p) != nullptr;
+                        });
+                    EXPECT_FALSE(placed) << cell << ": the dropped topic id " << createdId << " was placed (node " << n << "'s committed map)";
+                    EXPECT_EQ(rig.produceTerminal(n, createdId, 0, batchFor(true, 1, "late"), cUnknown, 30s), cUnknown) << cell << ": node " << n;
+                }
+            };
+        }
         break;
     default: break;
     }
+    // The generic onLeaderSend seam for the timings without a hook of their own (T5/T6): fires once, at the first frame that
+    // reaches whoever leads when it is sent.
+    bool leaderSeamFired = false;
+    if (seams.onLeaderSend && !hooks.afterSend) {
+        hooks.afterSend = [&](int, int node) {
+            if (leaderSeamFired || node != c.catalogLeaderId()) return false;
+            leaderSeamFired = true;
+            seams.onLeaderSend(c, rig, node);
+            return false;
+        };
+    }
     CellResult res = rig.drive(op, via, rid, hooks);
+    if (afterDrive) afterDrive();
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    // A hook that never fired (a perturbed run) must not leave the placement / the answers held: the gate would answer Internal.
+    if (rig.placementHeld()) rig.holdPlacementEverywhere(false);
+    if (answersHeldOn > 0 && c.running(answersHeldOn)) c.node(answersHeldOn).holdCatalogAnswersForTest(false);
+    if (timing == cm::Timing::LeaderChangeMidDdl && crashedNode <= 0 && c.running(leader)) c.node(leader).holdCatalogAnswersForTest(false);
     res.viaWasLeader = via == leader;
     const cm::ExpectedCodes ec = cm::expectedCodes(kind, {res.viaWasLeader ? cm::Via::Leader : cm::Via::Follower, cm::Persist::Disk}, timing);
-    EXPECT_EQ(res.firstCode, ec.first) << cell << res.trace;
-    EXPECT_EQ(res.afterRedirectCode, ec.afterRedirect) << cell << res.trace;
-    EXPECT_EQ(res.finalCode, ec.final) << cell << res.trace;
-    ASSERT_EQ(res.finalCode, cOk) << cell << res.trace;
+    // The by-cause NotLeader counters + the leader epoch, compared against the snapshot taken when the roles were resolved.
+    // Excluded: brokers the cell's own timing stops / restarts; the epoch is not used where the timing moves the leader itself.
+    std::set<int> excluded;
+    if (crashedNode > 0) excluded.insert(crashedNode);
+    if (timing == cm::Timing::RestartMidApply) for (int n = 1; n <= 3; ++n) if (n != leader && n != via) excluded.insert(n);
+    const std::string why = Perturbation::snapshot(c).since(pert0, excluded, timing != cm::Timing::LeaderChangeMidDdl) +
+                            (pert.leaderMovedInCell ? " leader-moved" : "") +
+                            (pert.gateOverdueObserved ? " gate-overdue(stall observed)" : "");
+    if (why.empty()) {            // the cell's own timing only: the matrix's exact codes
+        EXPECT_EQ(res.firstCode, ec.first) << cell << res.trace;
+        EXPECT_EQ(res.afterRedirectCode, ec.afterRedirect) << cell << res.trace;
+        EXPECT_EQ(res.finalCode, ec.final) << cell << res.trace;
+    } else {                       // a host stall moved the topology: the contract of THAT event (spec 5.5 / 9, F13)
+        std::fprintf(stderr, "[ perturbed ] %s:%s %s\n", cell.c_str(), why.c_str(), res.trace.c_str());
+        ++CellTimes::perturbed();
+        for (int code : res.codes)   // every non-final answer is a retriable redirect / refusal / in-doubt: never another error
+            EXPECT_TRUE(code == cRedirect || code == cNotLeader || code == cInternal) << cell << res.trace;
+    }
+    if (outcome) {
+        outcome->res = res; outcome->roles = CellRoles{preLeader, leader, via}; outcome->perturbedWhy = why;
+        const auto cnt = Perturbation::snapshot(c).nl;
+        if (cnt.count(leader) && pert0.nl.count(leader)) outcome->belowMinIsrOnLeader = cnt.at(leader).belowMinIsr - pert0.nl.at(leader).belowMinIsr;
+    }
+    ASSERT_EQ(res.finalCode, cOk) << cell << res.trace;    // ALWAYS
 
     // ── the timing's after-effects, then the identical-catalogs gate ───────────────────────────────
     if (timing == cm::Timing::LeaderChangeMidDdl) {
-        ASSERT_TRUE(crashedLeader) << cell;
-        ASSERT_TRUE(c.awaitCatalogLeader(60s)) << cell << ": no catalog leader after the crash";
-        rig.pumping([&] { c.startNode(leader); });                      // the crashed leader rejoins as a follower
-        rig.forget(leader);
+        if (crashedNode <= 0) {
+            ASSERT_TRUE(pert.leaderMovedInCell) << cell << ": the leader never crashed and no move was observed";
+        } else {
+            ASSERT_TRUE(c.awaitCatalogLeader(60s)) << cell << ": no catalog leader after the crash";
+            rig.pumping([&] { c.startNode(crashedNode); });             // the crashed leader rejoins as a follower
+            rig.forget(crashedNode);
+        }
     }
     if (timing == cm::Timing::NewBrokerJoins) { rig.pumping([&] { c.startNode(3); }); rig.forget(3); }
     if (timing == cm::Timing::RestartMidApply && victim > 0) { rig.pumping([&] { c.startNode(victim); }); rig.forget(victim); }
     {
-        std::string why;
-        ASSERT_TRUE(c.awaitCatalogDigestsEqual(90s, &why)) << cell << ": identical catalogs on every broker: " << why;
+        std::string why2;
+        ASSERT_TRUE(c.awaitCatalogDigestsEqual(90s, &why2)) << cell << ": identical catalogs on every broker: " << why2;
     }
     EXPECT_EQ(c.countEventsWithRequestId(res.rid), 1u) << cell << ": exactly one event per requestId, on every broker";
 
@@ -942,8 +1162,165 @@ TEST_P(CatalogClusterSliceRegression, RuntimeDdlThroughEveryBrokerThenDataThroug
     }
 }
 
+} // namespace
+
+TEST_P(CatalogClusterSliceRegression, RuntimeDdlThroughEveryBrokerThenDataThroughEveryBroker) { runCell(GetParam()); }
+
 INSTANTIATE_TEST_SUITE_P(Slice, CatalogClusterSliceRegression, ::testing::ValuesIn(allCells()),
                          [](const ::testing::TestParamInfo<CellParam>& i) { return cellName(i.param); });
+
+// ===========================================================================
+// Task 23 fix round 2: the slice cells resolve their roles AFTER the precondition, bound the R7 window inside the answer
+// gate, and assert the contract of a perturbing event only on product evidence (slice-races-diagnosis Recipes 1-3).
+// ===========================================================================
+namespace {
+/// A move of the catalog leadership in the precondition: stop the leader, wait for another, restart it as a follower.
+struct MovedLeader { int old = -1, moved = -1; };
+void moveLeader(ThreeNodes& c, Rig& rig, MovedLeader& m) {
+    m.old = c.settledLeader();
+    ASSERT_GT(m.old, 0);
+    rig.pumping([&] { c.stop(m.old); });
+    rig.forget(m.old);
+    ASSERT_TRUE(c.awaitCatalogLeaderOtherThan(m.old, 60s));
+    rig.pumping([&] { c.startNode(m.old); });
+    rig.forget(m.old);
+    std::string why;
+    ASSERT_TRUE(c.awaitCatalogDigestsEqual(60s, &why)) << why;
+    ASSERT_TRUE(c.awaitCatalogLeader(60s));
+    m.moved = c.settledLeader();
+}
+}  // namespace
+
+// T1: DropTopic x RestartMidApply and CreateTopic x CreateRacesPlacement with the catalog leadership moved during the precondition.
+// RED (runCell: `leader = preLeader` instead of re-resolving): the ISR wait polls a follower / the hook never fires.
+TEST(CatalogClusterRegression, SliceCellResolvesItsRolesAfterALeaderMoveInThePreconditionRegression) {
+    for (const CellParam& param : {CellParam{cm::Kind::DropTopic, cm::Timing::RestartMidApply, 0},
+                                   CellParam{cm::Kind::CreateTopic, cm::Timing::CreateRacesPlacement, 0}}) {
+        SCOPED_TRACE(cellName(param));
+        MovedLeader m;
+        CellSeams seams;
+        seams.afterPrecondition = [&](ThreeNodes& c, Rig& rig) { moveLeader(c, rig, m); };
+        CellOutcome out;
+        runCell(param, seams, &out);
+        ASSERT_FALSE(::testing::Test::HasFatalFailure());
+        EXPECT_NE(m.moved, m.old) << "vacuity guard: the leadership really moved";
+        EXPECT_EQ(out.roles.leader, m.moved) << "the cell's leader is the one that leads AFTER the precondition";
+        if (param.timing == cm::Timing::CreateRacesPlacement)
+            EXPECT_EQ(out.res.trace.find(": 6]"), std::string::npos) << "no Internal (sibling B)" << out.res.trace;
+    }
+}
+
+// T1b: awaitCatalogIsrSize follows the CURRENT leader (a follower's isr() is always empty).
+// RED (poll a fixed id captured before the move): times out.
+TEST(ThreeNodesRegression, AwaitCatalogIsrSizeFollowsTheCurrentLeaderRegression) {
+    ThreeNodes c = ThreeNodes::start("isrfollow");
+    ASSERT_TRUE(c.awaitCatalogLeader(60s));
+    Rig rig(c);
+    MovedLeader m;
+    ASSERT_NO_FATAL_FAILURE(moveLeader(c, rig, m));
+    ASSERT_NE(m.moved, m.old);
+    int follower = -1;
+    for (int n : c.runningNodes()) if (n != m.moved) { follower = n; break; }
+    ASSERT_GT(follower, 0);
+    rig.pumping([&] { c.stop(follower); });
+    int l = -1;
+    EXPECT_TRUE(c.awaitCatalogIsrSize(2, 30s, &l));
+    EXPECT_EQ(l, m.moved);
+    if (follower != m.old) EXPECT_EQ(c.catalogIsrSizeOn(m.old), 0u) << "a follower's isr() is empty";
+}
+
+namespace {
+void racesPlacementBelowMinIsr(cm::Kind kind, bool holdAnswers) {
+    const CellParam param{kind, cm::Timing::CreateRacesPlacement, 0};
+    CellSeams seams;
+    seams.configTweak = [](NodeConfig& cfg) { cfg.replicaLagMaxMs = 1000; };
+    seams.answerHoldInWindow = holdAnswers;
+    seams.onLeaderSend = [](ThreeNodes& c, Rig& rig, int lead) {
+        std::vector<std::thread> th;
+        for (int f : c.runningNodes())
+            if (f != lead) th.emplace_back([&c, f] { try { c.node(f).onAdminThreadForTest([] { std::this_thread::sleep_for(4s); return 0; }, 15s); } catch (...) {} });
+        bool shrunk = false;
+        rig.pumping([&] {
+            for (const auto until = Clock::now() + 10s; Clock::now() < until && !shrunk;) {
+                shrunk = c.catalogIsrSizeOn(lead) == 1;
+                if (!shrunk) std::this_thread::sleep_for(50ms);
+            }
+        });
+        EXPECT_TRUE(shrunk) << "vacuity guard: the catalog really is below minIsr while the DDL awaits its commit";
+        rig.pumping([&] { for (auto& t : th) t.join(); });
+    };
+    CellOutcome out;
+    runCell(param, seams, &out);
+    if (::testing::Test::HasFatalFailure()) return;
+    EXPECT_EQ(out.res.trace.find(": 2]"), std::string::npos) << "no NotLeader: " << out.res.trace;
+    EXPECT_EQ(out.res.trace.find(": 6]"), std::string::npos) << "no Internal: " << out.res.trace;
+    EXPECT_EQ(out.belowMinIsrOnLeader, 0u) << "the answer hold suppressed the pre-commit below-minIsr NotLeader";
+}
+}  // namespace
+
+// T2 (failure 1, deterministic): the catalog is below minIsr before the event commits; with the answers held until the event
+// applied, no pre-commit NotLeader exists, so R7 sees only the real OK path.
+// RED (a): holdAnswers=false -> the below-minIsr NotLeader reaches the hook window -> the early-answer check fails.
+// RED (b): DdlAnswerGate::offer passes a gated frame -> the OK arrives in the window -> EXPECT_NE(code, cOk) fails.
+TEST(CatalogClusterRegression, RacesPlacementWithTheCatalogBelowMinIsrBeforeCommitNeverAnswersEarlyRegression) {
+    racesPlacementBelowMinIsr(cm::Kind::CreateTopic, /*holdAnswers=*/true);
+}
+// T3b: the CreateView sibling.
+TEST(CatalogClusterRegression, RacesPlacementCreateViewWithTheCatalogBelowMinIsrNeverAnswersEarlyRegression) {
+    racesPlacementBelowMinIsr(cm::Kind::CreateView, /*holdAnswers=*/true);
+}
+
+// T3 (sibling A, deterministic): the hold exceeds the gate's 5 s cap -> the gate answers the in-doubt Internal ("placement pending"),
+// never the OK; the cell recognises it as an observed stall, the same-rid retry gets the result after the placement release.
+// RED: (a) R7 check back to EXPECT_FALSE(early.got); (b) DdlAnswerGate::release sends the OK on overdue; (c) no in-doubt retry in drive.
+TEST(CatalogClusterRegression, RacesPlacementGateOverdueIsInDoubtNeverOkAndTheRetryGetsTheResultRegression) {
+    CellSeams seams;
+    seams.afterAnswerRelease = [](ThreeNodes&, Rig& rig) { rig.pumping([] { std::this_thread::sleep_for(6s); }); };
+    CellOutcome out;
+    runCell({cm::Kind::CreateTopic, cm::Timing::CreateRacesPlacement, 0}, seams, &out);
+    if (::testing::Test::HasFatalFailure()) return;
+    EXPECT_NE(out.perturbedWhy.find("gate-overdue"), std::string::npos) << out.perturbedWhy;
+    const auto six = out.res.trace.find(": 6]");
+    ASSERT_NE(six, std::string::npos) << out.res.trace;
+    EXPECT_NE(out.res.trace.find(": 0]", six), std::string::npos) << "the retry ends OK: " << out.res.trace;
+    EXPECT_EQ(out.res.finalCode, cOk);
+}
+
+// T5: a fenced catalog ISR (both followers frozen > replicaLagMaxMs) before the commit: the leader answers the retriable NotLeader; the
+// cell names it from the product counter, relaxes ONLY to the retriable contract, and the final result is still OK, one event.
+// RED: Perturbation::since() always "" (no evidence) -> the exact afterRedirect expectation (0) fails against 2.
+TEST(CatalogClusterRegression, SliceCellUnderAFencedIsrAssertsTheRetriableContractRegression) {
+    CellSeams seams;
+    seams.configTweak = [](NodeConfig& cfg) { cfg.replicaLagMaxMs = 1000; };
+    seams.onLeaderSend = [](ThreeNodes& c, Rig& rig, int lead) {
+        std::vector<std::thread> th;
+        for (int f : c.runningNodes())
+            if (f != lead) th.emplace_back([&c, f] { try { c.node(f).onAdminThreadForTest([] { std::this_thread::sleep_for(4s); return 0; }, 15s); } catch (...) {} });
+        bool shrunk = false;
+        rig.pumping([&] {
+            for (const auto until = Clock::now() + 10s; Clock::now() < until && !shrunk;) {
+                shrunk = c.catalogIsrSizeOn(lead) == 1;
+                if (!shrunk) std::this_thread::sleep_for(50ms);
+            }
+        });
+        EXPECT_TRUE(shrunk) << "vacuity guard";
+        rig.pumping([&] { for (auto& t : th) t.join(); });
+    };
+    CellOutcome out;
+    runCell({cm::Kind::DropTopic, cm::Timing::Steady, 2}, seams, &out);
+    if (::testing::Test::HasFatalFailure()) return;
+    EXPECT_NE(out.perturbedWhy.find("belowMinIsr"), std::string::npos) << "the cause is named by the product counter: " << out.perturbedWhy;
+    EXPECT_EQ(out.res.finalCode, cOk);
+}
+
+// T6 (negative): an unperturbed cell reports no perturbation.
+// RED (count a NotLeader on every answer): the cell reports perturbed and this fails.
+TEST(CatalogClusterRegression, UnperturbedSliceCellReportsNoPerturbationRegression) {
+    CellOutcome out;
+    runCell({cm::Kind::CreateTopic, cm::Timing::Steady, 1}, {}, &out);
+    if (::testing::Test::HasFatalFailure()) return;
+    EXPECT_TRUE(out.perturbedWhy.empty()) << out.perturbedWhy;
+}
 
 // ===========================================================================
 // The carry-over, pinned by its old symptom (E2 "multi-node runtime DDL fails")

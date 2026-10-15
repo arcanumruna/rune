@@ -396,6 +396,17 @@ public:
         }
         return catalogIsrSizeOn(id) == want;
     }
+    /// Slice Recipe 1: the CURRENT settled catalog leader's committed-ISR size reaches `want` (re-resolved every poll: a
+    /// follower's isr() is always empty, so polling a node that lost the leadership could never succeed).  *leaderOut = it.
+    bool awaitCatalogIsrSize(std::size_t want, std::chrono::milliseconds within, int* leaderOut = nullptr) {
+        const auto deadline = std::chrono::steady_clock::now() + within;
+        do {
+            const int l = settledLeader();
+            if (l > 0 && catalogIsrSizeOn(l) == want) { if (leaderOut) *leaderOut = l; return true; }
+            std::this_thread::sleep_for(50ms);
+        } while (std::chrono::steady_clock::now() < deadline);
+        return false;
+    }
     /// Broker `id`'s whole __catalog log (committed or not), decoded, in offset order (ON its admin thread).
     std::vector<rune::catalog::RecordedEvent> catalogEventsOn(int id) {
         BrokerNode& n = node(id);

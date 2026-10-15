@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 #include <new>
 
 // ---------------------------------------------------------------------------
@@ -52,16 +53,21 @@ void operator delete[](void* p) noexcept { std::free(p); }
 void operator delete(void* p, std::size_t) noexcept  { std::free(p); }
 void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
 
-// Task 23 fix round 1 (R-I2): BENCHMARK_MAIN() plus the gate verdict — any rune::bench::gateFail() makes the
-// process exit 1 (the failures are listed on stderr), so a tripped gate is never recorded as a pass.
+// Task 23 fix rounds 1+2 (R-I2, R-N1): BENCHMARK_MAIN() plus the verdict.  Exit code: 1 when any rune::bench::gateFail() fired (the
+// failures are listed on stderr), else 2 when any repetition was skipped (SkipWithError: a setup failure or an in-loop abort - a gate
+// that cannot run is not a pass), else 0.
 int main(int argc, char** argv)
 {
     ::benchmark::Initialize(&argc, argv);
     if (::benchmark::ReportUnrecognizedArguments(argc, argv)) return 1;
-    ::benchmark::RunSpecifiedBenchmarks();
+    std::unique_ptr<::benchmark::BenchmarkReporter> display(::benchmark::CreateDefaultDisplayReporter());
+    rune::bench::SkipTrackingReporter reporter(display.get());
+    ::benchmark::RunSpecifiedBenchmarks(&reporter);
     ::benchmark::Shutdown();
     const auto& failures = rune::bench::gateFailures();
     for (const auto& f : failures)
         std::fprintf(stderr, "BENCH GATE FAILED: %s: %s\n", f.benchmark.c_str(), f.message.c_str());
-    return failures.empty() ? 0 : 1;
+    for (const auto& sk : reporter.skipped()) std::fprintf(stderr, "BENCH SKIPPED: %s\n", sk.c_str());
+    if (!failures.empty()) return 1;
+    return reporter.skipped().empty() ? 0 : 2;
 }

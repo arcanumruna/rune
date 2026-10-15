@@ -4,6 +4,8 @@
 // statement fingerprint).
 #include "support/CatalogDdlRig.h"
 
+#include <array>
+
 #include <rune/node/CatalogEffectFrames.h>
 #include <rune/node/DdlAnswerGate.h>
 
@@ -136,6 +138,43 @@ TEST(CatalogWritePathRegression, CatalogBelowMinIsrWhileAwaitingCommitAnswersNot
     const auto retry = rig.define({.name = "t", .partitions = 1, .requestId = rid});
     EXPECT_EQ(retry.code, 0) << "the retry is the original success, not TopicExists";
     EXPECT_EQ(rig.countEventsWithRequestId(rid), 1u);
+}
+
+// Task 23 fix round 2 (slice Recipe 3): every NotLeader answer of an in-flight DDL is counted BY CAUSE, so a cluster test can tell a
+// stall-induced NotLeader (below minIsr, commit timeout, demotion) from a spurious one.  Each cause moves only its own counter.
+TEST(AdminWorkerRegression, NotLeaderAnswersAreCountedByCauseRegression) {
+    using Counts = std::array<uint64_t, 3>;
+    auto countsOf = [](CatalogDdlRig& rig) {
+        return Counts{rig.admin().notLeaderBelowMinIsr(), rig.admin().notLeaderCommitTimeout(), rig.admin().notLeaderDemoted()};
+    };
+    {   // below minIsr
+        CatalogDdlRig rig("wp_cnt_isr", 3);
+        rig.becomeServingLeader(/*isr=*/{1, 2});
+        ASSERT_EQ(countsOf(rig), (Counts{0, 0, 0}));
+        const int64_t corr = rig.submitDefineNoWait({.name = "t", .partitions = 1, .requestId = {.hi = 0xC11E, .lo = 21}});
+        ASSERT_FALSE(rig.answerFor(corr).has_value());
+        rig.updateIsr({1});
+        rig.pump();
+        ASSERT_TRUE(rig.answerFor(corr).has_value());
+        EXPECT_EQ(countsOf(rig), (Counts{1, 0, 0}));
+    }
+    {   // commit timeout
+        CatalogDdlRig rig("wp_cnt_to", 3);
+        rig.becomeServingLeader(/*isr=*/{1, 2});
+        const int64_t corr = rig.submitDefineNoWait({.name = "t", .partitions = 1, .requestId = {.hi = 0xC11E, .lo = 22}});
+        rig.advanceClockPast(rune::node::AdminWorker::ddlTimeoutNs());
+        ASSERT_TRUE(rig.answerFor(corr).has_value());
+        EXPECT_EQ(countsOf(rig), (Counts{0, 1, 0}));
+    }
+    {   // demotion while the DDL awaits its commit
+        CatalogDdlRig rig("wp_cnt_dem", 3);
+        rig.becomeServingLeader(/*isr=*/{1, 2});
+        const int64_t corr = rig.submitDefineNoWait({.name = "t", .partitions = 1, .requestId = {.hi = 0xC11E, .lo = 23}});
+        ASSERT_FALSE(rig.answerFor(corr).has_value());
+        rig.becomeFollower(/*leaderId=*/2);
+        ASSERT_TRUE(rig.answerFor(corr).has_value());
+        EXPECT_EQ(countsOf(rig), (Counts{0, 0, 1}));
+    }
 }
 
 // The DDL timeout is below the client's default DDL deadline (ClientConfig::ddlTimeoutMs = 15 s), so the F13

@@ -5,6 +5,7 @@
 //   BM_GateFirstRepetitionFailsRegression    gate fails on repetition 0 only, passes on 1..n
 //                                            -> no crash, aggregates printed, exit 1
 //   BM_GateAlwaysFailsRegression             -> exit 1 (ctest WILL_FAIL)
+//   BM_GateSkippedRunRegression              every repetition skipped -> exit 2 + "BENCH SKIPPED"
 //   BM_GateLibrarySkipFirstRepetition        documents the library bug the gates avoid: SkipWithError on repetition 0
 //                                            with >= 2 later passing repetitions crashes benchmark 1.8.2 .. 1.9.5
 //                                            in ComputeStats (exit 139).  NOT a ctest (a crash is the expected result).
@@ -42,5 +43,12 @@ void BM_GateLibrarySkipFirstRepetition(benchmark::State& state) {
     if (first) state.SkipWithError("repetition 0 skipped (library crash reproducer)");
 }
 BENCHMARK(BM_GateLibrarySkipFirstRepetition)->Iterations(1)->UseManualTime();
+
+// R-N1: SkipWithError on EVERY repetition (a setup failure / an in-loop abort): no crash (ComputeStats returns early), exit 2.
+void BM_GateSkippedRunRegression(benchmark::State& state) {
+    state.SkipWithError("this benchmark cannot run");
+    for (auto _ : state) {}
+}
+BENCHMARK(BM_GateSkippedRunRegression)->Iterations(1);
 
 }  // namespace

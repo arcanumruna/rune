@@ -1330,6 +1330,21 @@ public:
     void holdCatalogApplyForTest(bool on) {
         onAdminThreadForTest([this, on]() { adminWorkerAgent_->worker().holdApplyForTest(on); return 0; });
     }
+    /// Task 23 fix round 2 (slice Recipe 3): the NotLeader answers this broker's admin thread gave an in-flight DDL, by cause.
+    struct CatalogNotLeaderCounts { uint64_t belowMinIsr = 0, commitTimeout = 0, demoted = 0; };
+    [[nodiscard]] CatalogNotLeaderCounts catalogNotLeaderCountsForTest() {
+        return onAdminThreadForTest([this]() -> CatalogNotLeaderCounts {
+            const auto& w = adminWorkerAgent_->worker();
+            return CatalogNotLeaderCounts{w.notLeaderBelowMinIsr(), w.notLeaderCommitTimeout(), w.notLeaderDemoted()};
+        });
+    }
+    /// Held DDL OKs answered Internal (in doubt) by the DdlAnswerGate (read ON the control thread).
+    template <class = void>   // instantiated after onControlThreadForTest is defined
+    [[nodiscard]] uint64_t ddlAnswersOverdueForTest() {
+        return onControlThreadForTest([this]() -> uint64_t { return ddlAnswersOverdue_; });
+    }
+    /// The DdlAnswerGate's hold cap (a DDL OK for a not-yet-serving topic is answered Internal "in doubt" after it).
+    static constexpr int64_t kDdlAnswerMaxHoldNs = 5'000'000'000LL;
     /// Task 22: DDL events this broker's admin thread appended (read ON the admin thread).
     [[nodiscard]] uint64_t catalogEventsAppendedForTest() {
         return onAdminThreadForTest([this]() -> uint64_t { return adminWorkerAgent_->worker().eventsAppended(); });
@@ -2131,7 +2146,6 @@ private:
     // C1 / M7: a DefineTopic / CreateView OK leaves only once its topic serves
     // (see DdlAnswerGate.h).  Control-thread-owned; one drain of the admin egress
     // ring (16 frames of at most a ring message each) always fits.
-    static constexpr int64_t kDdlAnswerMaxHoldNs = 5'000'000'000LL;
     // Catalog history Task 12 fix round 0: catalog-read flow control (control
     // thread) — one entry per paused catalog subscription, preallocated.
     CatalogReadFlow catalogReadFlow_{2u * AdminWorker::kMaxCatalogSubscriptions};

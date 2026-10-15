@@ -14,7 +14,7 @@ using rune::node::test::CatalogClusterHarness;
 
 TEST(CatalogMatrixCountRegression, CellCountsArePinned) {
     int total = 0, applicable = 0;
-    std::array<int, 9> byOutcome{};
+    std::array<int, 10> byOutcome{};
     for (int k = 0; k < cm::kKinds; ++k)
         for (int v = 0; v < 2; ++v)
             for (int p = 0; p < 2; ++p)
@@ -26,14 +26,15 @@ TEST(CatalogMatrixCountRegression, CellCountsArePinned) {
                     if (o != cm::Outcome::NotApplicable) ++applicable;
                 }
     EXPECT_EQ(total, 324);
-    EXPECT_EQ(applicable, 300);
-    EXPECT_EQ(byOutcome[static_cast<int>(cm::Outcome::NotApplicable)], 24);
+    EXPECT_EQ(applicable, 308);
+    EXPECT_EQ(byOutcome[static_cast<int>(cm::Outcome::NotApplicable)], 16);
     EXPECT_EQ(byOutcome[static_cast<int>(cm::Outcome::HaltedBrokerInternalOthersOk)], 36);
     EXPECT_EQ(byOutcome[static_cast<int>(cm::Outcome::NotLeaderUntilBudgetThenOk)], 36);
     EXPECT_EQ(byOutcome[static_cast<int>(cm::Outcome::NotLeaderThenOkOnce)], 36);
     EXPECT_EQ(byOutcome[static_cast<int>(cm::Outcome::OneWinsOneConflict)], 36);
     EXPECT_EQ(byOutcome[static_cast<int>(cm::Outcome::OkNewObjectId)], 36);
     EXPECT_EQ(byOutcome[static_cast<int>(cm::Outcome::OkAfterPlacement)], 12);
+    EXPECT_EQ(byOutcome[static_cast<int>(cm::Outcome::OkDroppedBeforePlacement)], 8);   // R10: DropTopic / DropView x CreateRacesPlacement
     EXPECT_EQ(byOutcome[static_cast<int>(cm::Outcome::RedirectThenOk)], 54);
     EXPECT_EQ(byOutcome[static_cast<int>(cm::Outcome::Ok)], 54);
 }
@@ -98,7 +99,7 @@ TEST_P(CatalogInteractionMatrixRegression, Cell) {
     if (want == cm::Outcome::NotApplicable) GTEST_SKIP() << "R" << cm::naRule(c.kind, c.entity, c.timing);
 
     CatalogClusterHarness h(cellName({c, 0}), /*brokers=*/3);
-    h.buildPrecondition(c.kind, c.entity.persist);            // the "Precondition" column of the plan's ops table
+    h.buildPrecondition(c.kind, c.entity.persist, c.timing);  // the "Precondition" column of the plan's ops table
     const auto run = h.runCell(c.kind, c.entity, c.timing);   // drives the timing, records every answer
 
     // 1. every answer code, all from cmatrix::expectedCodes (F15/F16 — no code is hard-coded here)
@@ -126,6 +127,15 @@ TEST_P(CatalogInteractionMatrixRegression, Cell) {
                                                   EXPECT_TRUE(run.appliedEverywhereBeforePlacement);
                                                   EXPECT_TRUE(run.okReleasedOnlyAfterServing);
                                                   if (c.kind == cm::Kind::CreateTopic) EXPECT_EQ(run.produceAfterPlacementCode, 0);
+                                                  break;
+    case cm::Outcome::OkDroppedBeforePlacement:   // R10: the topic is dropped between its create being applied and its placement committing
+                                                  EXPECT_EQ(run.produceInWindowCode, 2) << "applied, not placed: retriable";
+                                                  EXPECT_TRUE(run.createAnsweredOkBeforePlacement)
+                                                      << "the create's held OK is released as a tombstone once the drop applied, not held";
+                                                  EXPECT_LT(run.createAnswerMs, 1000) << "promptly (never the in-doubt cap)";
+                                                  EXPECT_TRUE(run.neverPlaced) << "released placement finds no topic to place";
+                                                  EXPECT_TRUE(run.unknownEverywhere) << "UnknownTopic through every live broker";
+                                                  for (const auto& rid : run.extraOkRequestIds) EXPECT_EQ(h.countEventsWithRequestId(rid), 1u);
                                                   break;
     case cm::Outcome::HaltedBrokerInternalOthersOk:
         EXPECT_TRUE(h.applierHalted(3)); EXPECT_EQ(h.haltCounter(3), 1);
