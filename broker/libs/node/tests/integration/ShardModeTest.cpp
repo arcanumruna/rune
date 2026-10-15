@@ -250,11 +250,12 @@ using CatalogNodes = std::vector<std::unique_ptr<BrokerNode>>;
 /// One record to every (topic, partition) through its CURRENT leader (re-read each attempt: the restart fence
 /// moves leadership after boot).  One deadline bounds the whole pass.
 void produceToEveryPartition(CatalogNodes& nodes, const ShardPorts& ports, ShardTestClient& c,
-                             const std::map<std::string, int32_t>& ids, const char* phase) {
+                             const std::map<std::string, int32_t>& ids, const char* phase, int64_t minBaseOffset = 0) {
     const auto deadline = std::chrono::steady_clock::now() + 20s;
     for (const CatalogDef& d : kCatalogDefs)
         for (int32_t p = 0; p < d.parts; ++p) {
             bool acked = false;
+            int64_t baseOffset = -1;
             int32_t leader = -1;
             while (!acked && std::chrono::steady_clock::now() < deadline) {
                 const auto a = assignmentOn(*nodes[0], ids.at(d.name), p);
@@ -262,12 +263,16 @@ void produceToEveryPartition(CatalogNodes& nodes, const ShardPorts& ports, Shard
                 if (leader < 0 || leader >= kCatalogNodes) { std::this_thread::sleep_for(50ms); continue; }
                 const int64_t sid = c.connect(gatewayChannel(ports, leader), kClientStream);
                 if (sid <= 0) { std::this_thread::sleep_for(50ms); continue; }
-                acked = c.produceUntilOk(workerIngressChannel(ports, leader, 0), kClientStream, sid, ids.at(d.name), p,
-                                         /*acks=all*/1, makeBatch(1), /*maxAttempts=*/1).has_value();
+                const auto ack = c.produceUntilOk(workerIngressChannel(ports, leader, 0), kClientStream, sid, ids.at(d.name), p,
+                                                  /*acks=all*/1, makeBatch(1), /*maxAttempts=*/1);
+                acked = ack.has_value();
+                if (acked) baseOffset = ack->baseOffset;
                 if (!acked) std::this_thread::sleep_for(50ms);
             }
             EXPECT_TRUE(acked) << phase << ": produce to " << d.name << "/" << p << " (last leader " << leader
                                << ") never acked";
+            // The pre-restart record must have survived: the new record lands after it.
+            if (acked) EXPECT_GE(baseOffset, minBaseOffset) << phase << ": log of " << d.name << "/" << p << " lost across the restart";
         }
 }
 
@@ -402,7 +407,7 @@ void runCatalogRestart(bool wipePlacementLog) {
                 }
         }
         ShardTestClient c(cdir.path);
-        produceToEveryPartition(nodes, ports, c, ids, "incarnation 2");
+        produceToEveryPartition(nodes, ports, c, ids, "incarnation 2", /*minBaseOffset=*/1);
     }
     for (auto& n : nodes) n->stop();
 }
