@@ -1039,13 +1039,6 @@ def test_dr12_large_batch_fragmentation(fresh_cluster, netem_ready, rep):
 @pytest.mark.fault
 @pytest.mark.netem
 @pytest.mark.timeout(900)
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
-    "BROKER FINDING (2026-10-15, first run of this scenario): a partition leader whose eth0 MTU drops to 1200 "
-    "keeps ACKING acks=All produces for its partition, but a subscriber receives NOTHING from that partition for "
-    "a whole 180 s live read (0 of 196 acked records of multi/0, led by the MTU-reduced node; partitions 1-2 "
-    "complete) - the broker's derived 1472-byte Aeron MTU exceeds the link MTU and the oversized delivery frames "
-    "are dropped silently: no error, no re-route, no MTU adaptation.  strict: an XPASS (fixed) fails the run so "
-    "this marker gets removed."))
 def test_dr12_mtu_reduction_large_batch(fresh_cluster, netem_ready):
     """Follower MTU 1200 (< the 1472-byte Aeron MTU the broker derived) + reorder 30 % + dup 8 % + 20 ms delay,
     while 500 acks=All records are produced.  Hard invariants: committed-loss = 0, per-key ordering,
@@ -1080,13 +1073,25 @@ def test_dr12_mtu_reduction_large_batch(fresh_cluster, netem_ready):
 
     cluster.settle(10.0, running=list(SERVICES))
     assert_single_leader(cluster)
-    _assert_delivery_invariants(committed, sub_live)
 
+    # Durability first (after the MTU is restored), then availability during the fault: a failure names which
+    # one broke - committed data LOST vs committed data not DELIVERED while the MTU was reduced.
     _, current_leader = cluster.identify_leader()
     sub_post = _subscribe_all(cluster, current_leader, _next_cid_base(), keys, window_ms=180000)
     assert_no_committed_loss(Results(clients=pre.clients + committed.clients + sub_post.clients))
     assert_per_key_ordering(sub_post)
     assert_exactly_once(sub_post)
+
+    # DR-BUG-MTU (see the speed report): the live read gets nothing from the partition led by the MTU-reduced
+    # node.  Kept strict: the gate shows it until the broker handles a link MTU below its Aeron MTU.
+    live_parts = {m.partition for m in sub_live.all_delivered}
+    acked_parts = {m.partition for m in committed.all_produced}
+    assert acked_parts <= live_parts, (
+        f"DR-BUG-MTU: with {follower_svc} at MTU 1200 (Aeron MTU 1472) the live read delivered partitions "
+        f"{sorted(live_parts)} but records were acked on {sorted(acked_parts)}: acked records of partitions "
+        f"{sorted(acked_parts - live_parts)} were not delivered for the whole read (they ARE durable: the "
+        f"post-restore read above delivered every one)")
+    _assert_delivery_invariants(committed, sub_live)
 
     post = run_clients(
         1, network=cluster.compose.network_name(), target_service=current_leader, cid_base=_next_cid_base(),

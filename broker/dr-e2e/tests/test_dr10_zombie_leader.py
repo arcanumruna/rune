@@ -53,7 +53,6 @@ CID window: 800_000+ (disjoint from DR-1/2/3/4/5/6/7).
 
 from __future__ import annotations
 
-import sys
 
 import re
 import threading
@@ -753,19 +752,6 @@ def test_dr10_short_vs_long_pause(fresh_cluster, pause_case):
 
 @pytest.mark.fault
 @pytest.mark.timeout(1200)
-@pytest.mark.xfail(
-    sys.platform == "darwin",   # Docker Desktop only — strict, real test on Linux (the box)
-    reason="HARNESS-DETERMINISM, not a broker bug: under sub-second repeated "
-    "pause/unpause of the leader, Docker Desktop's embedded DNS transiently drops "
-    "container names and a just-paused ex-leader remains the highest-term log "
-    "claimant before the majority re-elects, so the test's leader/container "
-    "resolution helper times out. Both observed failures are test-helper "
-    "RuntimeErrors (leader container id None), NEVER a split-brain or committed-loss "
-    "assertion. The CRITICAL zombie-leader split-brain safety is proven by the 6 "
-    "deterministic DR-10 cases (idle / during-produce / short+long pause fencing). "
-    "Enable on Linux CI where DNS + pause/unpause timing is deterministic.",
-    strict=False,
-)
 @pytest.mark.parametrize("flap_rounds", [3, 5])
 def test_dr10_repeated_flap_zombie(fresh_cluster, flap_rounds):
     """Pause → unpause the leader repeatedly (flap) in succession.

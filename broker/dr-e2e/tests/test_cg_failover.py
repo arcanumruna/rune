@@ -364,9 +364,14 @@ def test_cg_failover_leader_kill_netem(fresh_cluster, netem_ready):
         produce_results=prod_combined_n,
         member_results=gr_before.member_results + members_after,
     )
+    # DR-BUG-6 xfail, STRICT (controller ruling 2026-10-15): the known loss xfails; a run WITHOUT the loss is an
+    # unexpected pass and fails, so a fix (or a scenario that stopped reproducing it) is noticed.  Only the
+    # DR-BUG-6 assertion is covered - every hard invariant above still fails normally.
     try:
         assert_group_no_committed_loss(gr_combined_netem)
     except AssertionError as exc:
         pytest.xfail(
             f"group-no-committed-loss under combined kill+netem (DR-BUG-6): {exc}"
         )
+    pytest.fail("[XPASS(strict)] DR-BUG-6 did not reproduce: no group committed loss under leader-kill + netem. "
+                "If DR-BUG-6 is fixed, remove this xfail; otherwise the scenario no longer reproduces it.")

@@ -497,6 +497,9 @@ def test_dr13_slow_subscriber_isolation(fresh_cluster):
         expect=0,                  # drain; don't require a fixed count
         **{"from": "earliest"},
         subscribe_ms=120_000,      # generous: 60 records * 80 ms + back-pressure
+        # Post-production read of a static log: ends once complete (driver._drain_complete).  The slow handler's
+        # own gap is 80 ms per record, far below the quiet period; the 120 s window remains the ceiling.
+        drain_quiet_ms=DRAIN_QUIET_MS,
         slow_subscriber_ms=slow_ms,
         timeout_ms=_CONNECT_MS,
         start_stagger_ms=_STAGGER_MS,

@@ -224,6 +224,10 @@ _LONG_FIRST = ("test_dr8_", "test_dr13_", "test_dr15_", "test_dr3_", "test_compa
 
 def pytest_collection_modifyitems(session, config, items):
     def rank(item):
+        # `exclusive` tests first: at session start no other worker holds the host lock yet, so taking it costs
+        # no drain wait (mid-run, an exclusive test waits for every other worker's running test to end).
+        if item.get_closest_marker("exclusive") is not None:
+            return -1
         name = os.path.basename(str(item.fspath))
         for i, prefix in enumerate(_LONG_FIRST):
             if name.startswith(prefix):

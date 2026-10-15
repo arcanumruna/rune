@@ -160,4 +160,5 @@ def test_container_ip_template_survives_dashed_network_names_regression(monkeypa
     c = hc.Cluster(project="rune-dr-fault-a")
     assert c.container_ip("rune-1") == "10.0.0.7"
     fmt = seen[0][seen[0].index("--format") + 1]
-    assert fmt.startswith("{{(index .NetworkSettings.Networks ") and '"rune-dr-fault-a_default"' in fmt
+    assert fmt.startswith("{{(index .NetworkSettings.Networks ") and f'"{c.project}_default"' in fmt
+    assert "-" in c.project
