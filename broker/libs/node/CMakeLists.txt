@@ -755,7 +755,7 @@ if(BUILD_TESTING)
         PROPERTIES TIMEOUT 60)
 
     # ---------------------------------------------------------------------------
-    # MD1-13 Round-2 (catalog-history Task 18: CatalogBootstrapRoutingImage) tests.
+    # MD1-13 Round-2: bootstrap routing image tests (renamed CatalogBootstrapRoutingImage by catalog-history Task 18).
     #
     # Tests 1-3 (no Aeron): buildStaticRoutingImage() correctness when
     #   committedMap() is empty — non-null, deterministic, balanced assignment.

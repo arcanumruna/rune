@@ -4,7 +4,8 @@
 //
 // The input topics are catalog-recovered boot topics (BrokerNode feeds MetadataService::configure from
 // bootTopics_, which come from __catalog); the broker-level restart regression lives in ShardModeTest.cpp
-// (CatalogBootstrapRoutingImageRegression).
+// (CatalogBootstrapRoutingImageRegression: two variants, placement log kept
+// and placement log wiped).
 //
 // PRIMARY FIX COVERAGE (NodeRuntimeAgent-level, mirrors MetadataReplication
 // integration harness):

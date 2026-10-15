@@ -4842,7 +4842,7 @@ TEST(InternalIsrRegression, DirectoryFsyncFailureIsNotAcked) {
 // failover, no AlterIsr: one offsets partition took the whole control plane
 // down.  After: only __cluster_metadata decides (A is elected); the offsets
 // partition follows the user-partition rules on the controller path
-// (CoordinatorPartitionRegression.* in rune_static_assignment_emit_tests).
+// (CoordinatorPartitionRegression.* in rune_catalog_assignment_emit_tests).
 TEST(InternalIsrRegression, NoNodeInEveryInternalIsr_ConsensusStillElects_OnlyMetadataDecides) {
     constexpr NodeId kL = 1, kA = 2, kB = 3;
     auto state = [](int32_t topic, std::initializer_list<int32_t> m) {

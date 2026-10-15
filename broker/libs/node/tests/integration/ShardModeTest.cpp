@@ -29,6 +29,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string_view>
 #include <thread>
@@ -225,98 +226,195 @@ TEST(ShardMode, ThreeNodeAcksAllCommitsOverShardReplicationPlanes) {
 }
 
 // Catalog history Task 18 (R2): topics defined by DDL are RECOVERED from __catalog on a full restart and are
-// assigned + routable without any DDL being re-sent.  3 brokers, 1 worker each; every broker is destroyed and
-// rebuilt on the SAME data dirs; nothing is defined the second time.
-TEST(CatalogBootstrapRoutingImageRegression, CatalogRecoveredTopicsAreAssignedAndRoutableAfterFullRestartRegression) {
-    struct Def { const char* name; int32_t parts; const char* group; };
-    const Def defs[] = {{"orders", 3, "shop"}, {"payments", 3, "shop"}, {"chat", 2, ""}};
-    constexpr int kNodes = 3;
+// assigned, served and routable without any DDL being re-sent.  3 brokers, 1 worker each; every broker is
+// destroyed and rebuilt on the SAME data dirs; nothing is defined the second time.  Two variants:
+//   metadata KEPT   - the realistic restart: placement is preserved and every topic serves again;
+//   metadata WIPED  - stands in for spec §5.4's crash window (CreateTopic applied in __catalog, placement not yet
+//                     committed): boot must place the catalog's topics from bootTopics_ (configure).
+namespace {
+
+/// A copy of (topic, p)'s assignment, taken ON the control thread that owns the MetadataService.
+std::optional<rune::metadata::PartitionAssignment> assignmentOn(BrokerNode& n, int32_t topicId, int32_t p) {
+    return n.onControlThreadForTest([&n, topicId, p]() -> std::optional<rune::metadata::PartitionAssignment> {
+        const auto* ms = n.metadataServiceForTest();
+        const auto* pa = ms ? ms->assignment(topicId, p) : nullptr;
+        return pa ? std::optional(*pa) : std::nullopt;
+    });
+}
+
+struct CatalogDef { const char* name; int32_t parts; const char* group; };
+constexpr CatalogDef kCatalogDefs[] = {{"orders", 3, "shop"}, {"payments", 3, "shop"}, {"chat", 2, ""}};
+constexpr int kCatalogNodes = 3;
+using CatalogNodes = std::vector<std::unique_ptr<BrokerNode>>;
+
+/// One record to every (topic, partition) through its CURRENT leader (re-read each attempt: the restart fence
+/// moves leadership after boot).  One deadline bounds the whole pass.
+void produceToEveryPartition(CatalogNodes& nodes, const ShardPorts& ports, ShardTestClient& c,
+                             const std::map<std::string, int32_t>& ids, const char* phase) {
+    const auto deadline = std::chrono::steady_clock::now() + 20s;
+    for (const CatalogDef& d : kCatalogDefs)
+        for (int32_t p = 0; p < d.parts; ++p) {
+            bool acked = false;
+            int32_t leader = -1;
+            while (!acked && std::chrono::steady_clock::now() < deadline) {
+                const auto a = assignmentOn(*nodes[0], ids.at(d.name), p);
+                leader = a ? a->leaderNode : -1;
+                if (leader < 0 || leader >= kCatalogNodes) { std::this_thread::sleep_for(50ms); continue; }
+                const int64_t sid = c.connect(gatewayChannel(ports, leader), kClientStream);
+                if (sid <= 0) { std::this_thread::sleep_for(50ms); continue; }
+                acked = c.produceUntilOk(workerIngressChannel(ports, leader, 0), kClientStream, sid, ids.at(d.name), p,
+                                         /*acks=all*/1, makeBatch(1), /*maxAttempts=*/1).has_value();
+                if (!acked) std::this_thread::sleep_for(50ms);
+            }
+            EXPECT_TRUE(acked) << phase << ": produce to " << d.name << "/" << p << " (last leader " << leader
+                               << ") never acked";
+        }
+}
+
+/// Bounded wait: every node serves every topic (applied AND placed AND routed).  Names node/topic on expiry.
+bool awaitAllServe(CatalogNodes& nodes, const std::map<std::string, int32_t>& ids, const char* phase) {
+    const auto deadline = std::chrono::steady_clock::now() + 20s;
+    bool ok = true;
+    for (int i = 0; i < kCatalogNodes; ++i)
+        for (const CatalogDef& d : kCatalogDefs) {
+            while (!nodes[i]->catalogTopicServesForTest(ids.at(d.name)) && std::chrono::steady_clock::now() < deadline)
+                std::this_thread::sleep_for(20ms);
+            if (!nodes[i]->catalogTopicServesForTest(ids.at(d.name))) {
+                ADD_FAILURE() << phase << ": node " << i << " does not serve topic " << d.name;
+                ok = false;
+            }
+        }
+    return ok;
+}
+
+void runCatalogRestart(bool wipePlacementLog) {
     TmpDir d0{"cb0"}, d1{"cb1"}, d2{"cb2"}, cdir{"cbc"};
-    const fs::path dirs[kNodes] = {d0.path, d1.path, d2.path};
-    const auto ports = ShardPorts::discover(kNodes, 1);
+    const fs::path dirs[kCatalogNodes] = {d0.path, d1.path, d2.path};
+    const auto ports = ShardPorts::discover(kCatalogNodes, 1);
+    auto build = [&] {
+        CatalogNodes v;
+        for (int i = 0; i < kCatalogNodes; ++i)
+            v.push_back(std::make_unique<BrokerNode>(makeShardConfig(i, dirs[i], ports, kCatalogNodes, 1, false)));
+        return v;
+    };
 
     std::map<std::string, int32_t> ids;
-    {   // incarnation 1: define by DDL
-        std::vector<std::unique_ptr<BrokerNode>> nodes;
-        for (int i = 0; i < kNodes; ++i) nodes.push_back(std::make_unique<BrokerNode>(makeShardConfig(i, dirs[i], ports, kNodes, 1, false)));
+    std::map<std::pair<std::string, int32_t>, std::vector<int32_t>> before;   // sorted replicas per (topic, p)
+    {   // incarnation 1: define by DDL, serve, write data
+        CatalogNodes nodes = build();
         for (auto& n : nodes) n->start();
         ASSERT_TRUE(nodes[0]->awaitLeader(15'000ms));
         TestCluster cluster({nodes[0].get(), nodes[1].get(), nodes[2].get()});
-        for (const Def& d : defs) {
+        for (const CatalogDef& d : kCatalogDefs) {
             TopicSpec t; t.name = d.name; t.partitionCount = d.parts; t.coPartitionGroup = d.group;
             const int32_t id = cluster.defineTopic(t);
             ASSERT_GE(id, 0) << "define " << d.name;
             ids[d.name] = id;
         }
+        if (awaitAllServe(nodes, ids, "incarnation 1")) {
+            for (const CatalogDef& d : kCatalogDefs)
+                for (int32_t p = 0; p < d.parts; ++p) {
+                    const auto a = assignmentOn(*nodes[0], ids[d.name], p);
+                    if (!a) { ADD_FAILURE() << "incarnation 1: no assignment for " << d.name << "/" << p; continue; }
+                    auto r = a->replicas;
+                    std::sort(r.begin(), r.end());
+                    before[{d.name, p}] = std::move(r);
+                }
+            ShardTestClient c(cdir.path);
+            produceToEveryPartition(nodes, ports, c, ids, "incarnation 1");
+        }
         for (auto& n : nodes) n->stop();
     }   // every broker destroyed
-    // Forget the replicated metadata log (committed assignments): the ONLY thing left to place these topics
-    // is the catalog recovered at boot.  Without this the persisted assignments would mask a boot that
-    // forgot to configure the catalog's topics.
-    for (const auto& d : dirs) {
-        std::error_code ec;
-        fs::remove_all(d / "__cluster_metadata", ec);
-        EXPECT_FALSE(ec) << "removing the metadata log of " << d << ": " << ec.message();
+    if (::testing::Test::HasFailure()) return;
+
+    if (wipePlacementLog) {
+        // Stands in for spec §5.4's crash window: CreateTopic applied in __catalog, placement not yet committed.
+        // Boot must place the catalog's topics from bootTopics_ (configure); this is not an operator procedure.
+        for (const auto& d : dirs) {
+            std::error_code ec;
+            const auto removed = fs::remove_all(d / "__cluster_metadata", ec);
+            EXPECT_FALSE(ec) << "removing the metadata log of " << d << ": " << ec.message();
+            EXPECT_GT(removed, 0u) << "no metadata log at " << d;
+        }
     }
 
     // incarnation 2: same data dirs, same ports, NO define
-    std::vector<std::unique_ptr<BrokerNode>> nodes;
-    for (int i = 0; i < kNodes; ++i) nodes.push_back(std::make_unique<BrokerNode>(makeShardConfig(i, dirs[i], ports, kNodes, 1, false)));
+    CatalogNodes nodes = build();
     for (auto& n : nodes) n->start();
     ASSERT_TRUE(nodes[0]->awaitLeader(15'000ms));
 
     // (a) every node holds an assignment for every (topic, partition), within a bounded wait
     const auto deadline = std::chrono::steady_clock::now() + 20s;
-    for (int i = 0; i < kNodes; ++i) {
-        auto* ms = nodes[i]->metadataServiceForTest();
-        if (ms == nullptr) { ADD_FAILURE() << "node " << i << " has no MetadataService"; continue; }
-        for (const Def& d : defs)
+    for (int i = 0; i < kCatalogNodes; ++i) {
+        if (nodes[i]->metadataServiceForTest() == nullptr) { ADD_FAILURE() << "node " << i << " has no MetadataService"; continue; }
+        for (const CatalogDef& d : kCatalogDefs)
             for (int32_t p = 0; p < d.parts; ++p) {
-                while (ms->assignment(ids[d.name], p) == nullptr && std::chrono::steady_clock::now() < deadline)
+                while (!assignmentOn(*nodes[i], ids[d.name], p) && std::chrono::steady_clock::now() < deadline)
                     std::this_thread::sleep_for(20ms);
-                if (ms->assignment(ids[d.name], p) == nullptr)
+                if (!assignmentOn(*nodes[i], ids[d.name], p))
                     ADD_FAILURE() << "node " << i << " has no assignment for " << d.name << "/" << p << " after restart";
             }
     }
     if (::testing::Test::HasFailure()) { for (auto& n : nodes) n->stop(); return; }
 
-    // (b) co-partition: orders p and payments p share a leader; (c) identical assignment on all nodes
-    for (const Def& d : defs)
-        for (int32_t p = 0; p < d.parts; ++p) {
-            const auto* ref = nodes[0]->metadataServiceForTest()->assignment(ids[d.name], p);
-            for (int i = 1; i < kNodes; ++i) {
-                const auto* o = nodes[i]->metadataServiceForTest()->assignment(ids[d.name], p);
-                EXPECT_TRUE(o->leaderNode == ref->leaderNode && o->replicas == ref->replicas)
-                    << "node " << i << " disagrees on " << d.name << "/" << p;
-            }
-        }
-    for (int32_t p = 0; p < 3; ++p)
-        EXPECT_EQ(nodes[0]->metadataServiceForTest()->assignment(ids["orders"], p)->leaderNode,
-                  nodes[0]->metadataServiceForTest()->assignment(ids["payments"], p)->leaderNode)
-            << "co-partition group 'shop' split at partition " << p;
-
-    // (d) a produce to every (topic, partition) through its leader succeeds.  The restart fence bumps the
-    // epoch (leadership moves) after boot, so the leader is re-read on every attempt; bounded by one deadline.
-    {
-        ShardTestClient c(cdir.path);
-        const auto produceDeadline = std::chrono::steady_clock::now() + 20s;
-        for (const Def& d : defs)
+    // (b) co-partition (orders p / payments p share a leader) and (c) identical assignment on all nodes:
+    // converges once the restart fence's leader changes have applied everywhere — a bounded wait.
+    auto check = [&](std::vector<std::string>* diag) {
+        bool converged = true;
+        auto note = [&](std::string m) { converged = false; if (diag) diag->push_back(std::move(m)); };
+        for (const CatalogDef& d : kCatalogDefs)
             for (int32_t p = 0; p < d.parts; ++p) {
-                bool acked = false;
-                int32_t leader = -1;
-                while (!acked && std::chrono::steady_clock::now() < produceDeadline) {
-                    leader = nodes[0]->metadataServiceForTest()->assignment(ids[d.name], p)->leaderNode;
-                    if (leader < 0 || leader >= kNodes) { std::this_thread::sleep_for(50ms); continue; }
-                    const int64_t sid = c.connect(gatewayChannel(ports, leader), kClientStream);
-                    if (sid <= 0) continue;
-                    acked = c.produceUntilOk(workerIngressChannel(ports, leader, 0), kClientStream, sid, ids[d.name], p,
-                                             /*acks=all*/1, makeBatch(1), /*maxAttempts=*/20).has_value();
+                const auto ref = assignmentOn(*nodes[0], ids[d.name], p);
+                for (int i = 1; i < kCatalogNodes; ++i) {
+                    const auto o = assignmentOn(*nodes[i], ids[d.name], p);
+                    if (!ref || !o) { note("node " + std::to_string(i) + " lost the assignment of " + d.name + "/" + std::to_string(p)); continue; }
+                    if (o->leaderNode != ref->leaderNode || o->replicas != ref->replicas)
+                        note("node " + std::to_string(i) + " disagrees on " + d.name + "/" + std::to_string(p) + ": leader " +
+                             std::to_string(o->leaderNode) + " vs " + std::to_string(ref->leaderNode));
                 }
-                EXPECT_TRUE(acked) << "produce to " << d.name << "/" << p << " (last leader " << leader
-                                   << ") never acked after the restart";
             }
+        for (int32_t p = 0; p < 3; ++p) {
+            const auto o = assignmentOn(*nodes[0], ids["orders"], p);
+            const auto y = assignmentOn(*nodes[0], ids["payments"], p);
+            if (!o || !y) { note("co-partition: missing assignment at partition " + std::to_string(p)); continue; }
+            if (o->leaderNode != y->leaderNode)
+                note("co-partition group 'shop' split at partition " + std::to_string(p) + ": orders leader " +
+                     std::to_string(o->leaderNode) + ", payments leader " + std::to_string(y->leaderNode));
+        }
+        return converged;
+    };
+    const auto convergeDeadline = std::chrono::steady_clock::now() + 20s;
+    while (!check(nullptr) && std::chrono::steady_clock::now() < convergeDeadline)
+        std::this_thread::sleep_for(50ms);
+    std::vector<std::string> diag;
+    if (!check(&diag)) for (const auto& m : diag) ADD_FAILURE() << m;
+
+    // every topic serves on every node (applied AND placed AND routed), then data flows
+    if (awaitAllServe(nodes, ids, "incarnation 2")) {
+        if (!wipePlacementLog) {
+            for (const CatalogDef& d : kCatalogDefs)
+                for (int32_t p = 0; p < d.parts; ++p) {
+                    const auto a = assignmentOn(*nodes[0], ids[d.name], p);
+                    if (!a) continue;   // reported by (a)/(c)
+                    auto r = a->replicas;
+                    std::sort(r.begin(), r.end());
+                    EXPECT_EQ(r, before.at({d.name, p})) << "placement of " << d.name << "/" << p << " changed across the restart";
+                }
+        }
+        ShardTestClient c(cdir.path);
+        produceToEveryPartition(nodes, ports, c, ids, "incarnation 2");
     }
     for (auto& n : nodes) n->stop();
+}
+
+} // namespace
+
+TEST(CatalogBootstrapRoutingImageRegression, CatalogTopicsServeWithPreservedPlacementAfterFullRestartRegression) {
+    runCatalogRestart(/*wipePlacementLog=*/false);
+}
+
+TEST(CatalogBootstrapRoutingImageRegression, CatalogAlonePlacesTopicsWhenPlacementLogIsLostRegression) {
+    runCatalogRestart(/*wipePlacementLog=*/true);
 }
 
 // A4: in fused placement the runtime (control plane) runs on worker 0's thread
