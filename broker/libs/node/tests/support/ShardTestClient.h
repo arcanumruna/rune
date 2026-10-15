@@ -125,7 +125,10 @@ public:
         return it == ackImages_.end() ? 0 : it->second;
     }
 
-    int64_t connect(const std::string& gatewayChannel, int32_t stream) {
+    /// `deadline`: a caller with its own deadline (TestCluster) bounds the send + answer waits by it instead
+    /// of the per-wait 5 s cap (a dead gateway costs the remaining budget, not 2 x ~6 s).
+    int64_t connect(const std::string& gatewayChannel, int32_t stream,
+                    std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) {
         connect_.reset();                                  // each connect waits for ITS response
         pc::ConnectRequest req;
         req.correlationId  = ++corr_;
@@ -135,8 +138,8 @@ public:
         std::vector<uint8_t> buf(pc::MessageHeader::ENCODED_SIZE + pc::ConnectRequest::BODY_FIXED + 2 +
                                  req.egressChannel.size());
         const std::size_t len = req.encode(buf.data());
-        if (!send(gatewayChannel, stream, buf.data(), len)) return -1;
-        for (int i = 0; i < kMaxIters && !connect_; ++i) { poll_(); pause_(); }
+        if (!send(gatewayChannel, stream, buf.data(), len, deadline)) return -1;
+        for (int i = 0; i < kMaxIters && !connect_ && std::chrono::steady_clock::now() < deadline; ++i) { poll_(); pause_(); }
         if (!connect_ || connect_->code != 0) return -1;
         sessions_.push_back({gatewayChannel, stream, connect_->assignedSessionId});
         return connect_->assignedSessionId;
@@ -704,7 +707,8 @@ public:
         return accepted;
     }
 
-    bool send(const std::string& channel, int32_t stream, const uint8_t* buf, std::size_t len) {
+    bool send(const std::string& channel, int32_t stream, const uint8_t* buf, std::size_t len,
+              std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) {
         // Catalog history Task 9 (Task 4 M3): an encoder that returns 0 refused the
         // frame (a field over its wire width) — never send a zero-length frame: an
         // explicit failure for the caller (a DDL helper answers 0 / nullopt).
@@ -716,7 +720,7 @@ public:
             if (!pub) return false;
         }
         aeron::concurrent::AtomicBuffer ab(const_cast<uint8_t*>(buf), static_cast<aeron::util::index_t>(len));
-        for (int i = 0; i < kMaxIters; ++i) {
+        for (int i = 0; i < kMaxIters && std::chrono::steady_clock::now() < deadline; ++i) {
             if (pub->offer(ab, 0, static_cast<aeron::util::index_t>(len)) > 0) return true;
             pause_();
         }

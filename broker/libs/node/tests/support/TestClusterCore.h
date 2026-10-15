@@ -76,7 +76,7 @@ public:
             const NodeConfig& nc = nodes_[target]->effectiveConfigForTest();
             const std::string& channel = nc.clientEndpoint.channel;
             const int32_t      stream  = nc.clientEndpoint.streamId;
-            const int64_t sid = sessionOn_(channel, stream);
+            const int64_t sid = sessionOn_(channel, stream, deadline);
             if (sid <= 0) { last = "cannot connect to " + channel; sleep_(); continue; }
 
             const int64_t corr = client_->sendDefineTopic(channel, stream, sid, spec.name,
@@ -173,10 +173,10 @@ private:
     }
 
     /// One session per gateway channel, reused by every DDL of this cluster.
-    int64_t sessionOn_(const std::string& channel, int32_t stream) {
+    int64_t sessionOn_(const std::string& channel, int32_t stream, Clock::time_point deadline) {
         for (const auto& s : sessions_)
             if (s.first == channel) return s.second;
-        const int64_t sid = client_->connect(channel, stream);
+        const int64_t sid = client_->connect(channel, stream, deadline);   // bounded by the DDL's own deadline
         if (sid > 0) sessions_.emplace_back(channel, sid);
         return sid;
     }
