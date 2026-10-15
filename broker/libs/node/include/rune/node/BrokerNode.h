@@ -1276,6 +1276,18 @@ public:
     /// returned >= 0) since construction — exactly 1 after every start(): the ONE boot replay,
     /// on the startup thread (F4).  Immutable once start() returned.
     [[nodiscard]] int bootReplaysForTest() const noexcept { return bootReplays_; }
+    /// Test / bench only (catalog history Task 23, spec §10 gate): the BOOT STEP alone.  Builds a
+    /// never-started BrokerNode over `dataDir` (nodeId 1, no peers) and runs bootFromCatalog_() —
+    /// the exact function start() step 1b runs — timing that call only (not the node's construction
+    /// or destruction).  Startup-thread semantics: no broker thread exists; nothing is shared.
+    struct BootReplayForBench {
+        int64_t     appliedEvents = 0;   ///< bootApplier_->lastApplied().offset + 1
+        bool        halted        = false;
+        std::size_t bootTopics    = 0;   ///< bootTopics_.size()  (live topics + live view sinks)
+        std::size_t droppedIds    = 0;   ///< bootDroppedIds_.size()
+        int64_t     bootNs        = 0;   ///< steady_clock around bootFromCatalog_() only
+    };
+    [[nodiscard]] static BootReplayForBench bootFromCatalogForBench(const std::string& dataDir);
     /// Test-only (Task 16): true iff the TopicRegistry served topic `topicId` when replication
     /// was built — the catalog's topics are in the registry BEFORE any boot builder runs.
     [[nodiscard]] bool registryHadTopicBeforeReplicationBuildForTest(int32_t topicId) const noexcept {

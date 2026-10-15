@@ -166,6 +166,7 @@ if(BUILD_TESTING)
         tests/node/CatalogWritePathTest.cpp
         tests/node/CatalogLeadershipTest.cpp
         tests/node/CatalogReadServerTest.cpp
+        tests/node/CatalogGatesRegressionTest.cpp
         )
     target_include_directories(rune_node_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     target_link_libraries(rune_node_tests PRIVATE
@@ -178,13 +179,15 @@ if(BUILD_TESTING)
 
     # Catalog history Task 7 (F12): the admin thread's catalog steady state never
     # allocates.  Replaces the global operator new (binary-wide) — own binary, like
-    # rune_ddl_stress_tests / rune_transient_alloc_regression_tests.  Tasks 12 and
-    # 23 append to it.
+    # rune_ddl_stress_tests / rune_transient_alloc_regression_tests.  Task 23: + the
+    # idle-admin, produce placement-gate and GetViewRow gates.
     add_executable(rune_catalog_alloc_regression_tests
         tests/node/CatalogAllocRegressionTest.cpp)
     target_include_directories(rune_catalog_alloc_regression_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     target_link_libraries(rune_catalog_alloc_regression_tests PRIVATE
         rune_node
+        rune_codec
+        rune_view
         GTest::gtest_main)
     gtest_discover_tests(rune_catalog_alloc_regression_tests)
 

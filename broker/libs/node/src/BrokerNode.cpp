@@ -3175,6 +3175,24 @@ void BrokerNode::bootFromCatalog_() {
     }
 }
 
+// Task 23 (spec §10 gate): the boot step alone, for the 10 000-event gate test and benchmark.
+BrokerNode::BootReplayForBench BrokerNode::bootFromCatalogForBench(const std::string& dataDir) {
+    NodeConfig cfg;
+    cfg.nodeId  = 1;
+    cfg.dataDir = dataDir;
+    BrokerNode node{std::move(cfg)};
+    const auto t0 = std::chrono::steady_clock::now();
+    node.bootFromCatalog_();
+    const auto t1 = std::chrono::steady_clock::now();
+    BootReplayForBench r;
+    r.appliedEvents = node.bootApplier_ ? node.bootApplier_->lastApplied().offset + 1 : -1;
+    r.halted        = node.bootApplier_ && node.bootApplier_->halted();
+    r.bootTopics    = node.bootTopics_.size();
+    r.droppedIds    = node.bootDroppedIds_.size();
+    r.bootNs        = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+    return r;
+}
+
 // ---------------------------------------------------------------------------
 // BrokerNode::buildCatalog_ — catalog history Task 6 (spec §3, §5.6, ruling 7).
 //

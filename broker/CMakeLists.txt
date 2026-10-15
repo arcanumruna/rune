@@ -428,7 +428,9 @@ if(BUILD_BENCHMARKS)
         benchmark/ViewTableBench.cpp
         benchmark/ViewFoldBench.cpp
         benchmark/ViewCheckpointBench.cpp
-        benchmark/ViewFoldSourceBench.cpp)
+        benchmark/ViewFoldSourceBench.cpp
+        benchmark/CatalogBootReplayBench.cpp
+        benchmark/CatalogHotPathBench.cpp)
     target_include_directories(rune_broker_benchmark PRIVATE ${RUNE_PROTOCOL_INCLUDE})
     # FusedRuntimePassBench drives a real broker with the shard tests' wire client.
     target_include_directories(rune_broker_benchmark PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/libs/node/tests/support)

@@ -31,6 +31,7 @@
 #include <rune/codec/Descriptor.h>
 #include <rune/codec/Serialize.h>
 #include <rune/protocol/RecordBatch.h>
+#include <rune/protocol/client/DataMessages.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/Log.h>
 #include <rune/view/ViewPlan.h>
@@ -42,6 +43,8 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <span>
+#include <string_view>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -280,6 +283,16 @@ public:
     }
 
     // ── observation ──────────────────────────────────────────────────────────
+    /// Task 23: a catalog Subscribe on `session` (fromOffset -2 = earliest) — no pump.
+    void subscribeCatalog(int64_t session, int64_t fromOffset = -2) {
+        admin_->catalogSubscribe(CatalogSubscribeMsg{session, ++corr_, fromOffset});
+    }
+    [[nodiscard]] bool catalogReaderLive() const {
+        const CatalogReadServer* s = admin_->readServer();
+        return s != nullptr && catalogSubId_ != 0 && std::string_view(s->phaseName(catalogSubId_)) == "Live";
+    }
+    [[nodiscard]] uint64_t catalogProbes() const noexcept { return catalogProbes_; }
+    [[nodiscard]] uint64_t catalogFrames() const noexcept { return catalogFrames_; }
     [[nodiscard]] std::optional<Answer> answerFor(int64_t corr) const {
         const auto it = answers_.find(corr);
         if (it == answers_.end()) return std::nullopt;
@@ -354,6 +367,7 @@ public:
         schemas_ = SchemaRegistry{};
         views_   = ViewRegistry{};
         effects_.clear();
+        catalogSubId_ = 0;
         bootEffects_.clear();
         isr_.clear();
         silent_.clear();
@@ -484,6 +498,16 @@ private:
                                  const std::vector<uint8_t>& blob, uint16_t code) {
             gets_[corr] = SchemaAnswer{code, topicId, version, partitions, blob};
         };
+        // Task 23: the catalog read egress (counts only — zero-alloc, so the idle-reader gate
+        // measures the admin pass, never the rig).
+        deps.catalogRead = [this](const CatalogReadFrameHead& h, std::span<const uint8_t> f) {
+            ++catalogFrames_;
+            if (f.empty() && h.baseOffset == kProbeOffset) { ++catalogProbes_; return true; }
+            if (catalogSubId_ == 0)
+                if (const auto s = rune::protocol::client::SubscribeResponse::decode(f.data(), f.size()))
+                    catalogSubId_ = s->subscriptionId;
+            return true;
+        };
         admin_ = std::make_unique<AdminWorker>(schemas_, kSelf, std::move(deps), &views_, replica_.get(), nullptr);
         CatalogEffects fx;
         fx.topicApplied  = [this](const rune::catalog::TopicObject& t) { effects_.push_back("topicApplied:" + std::to_string(t.topicId)); };
@@ -528,6 +552,7 @@ private:
     int64_t                                              now_   = 1'000'000'000;
     int64_t                                              corr_  = 0;
     uint64_t                                             ridCounter_ = 0;
+    uint64_t catalogFrames_ = 0;  uint64_t catalogProbes_ = 0;  int64_t catalogSubId_ = 0;
 };
 
 } // namespace rune::node::test
