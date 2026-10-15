@@ -292,13 +292,92 @@ TEST(CatalogStressRegression, CutFaultsProduceInDoubtAnswers) {
     RecordProperty("inDoubtByKind", o.str());
 }
 
-// Fix-on-sight in the harness's fake control side: the stress (seed 2, step 99 of the final weights) found that a create whose name differs only
-// in ASCII case from a dropped topic still retiring ('B0' behind the dropped 'b0') ran at once, as the harness
-// compared names exactly; BrokerNode::catalogNameHeldByDrop_ folds (Task 8 fix round 1, M4) because on a
-// case-insensitive filesystem the two share one directory and the registry refuses to open it as another
-// incarnation - the topic never served on that broker.  The harness now mirrors the folded rule; this pins the
-// seed and the step that exposed it (the first 100 steps of seed 2; 30 of the 64 seeds failed before the fix).
-TEST(CatalogStressRegression, Seed2CaseVariantCreateBehindADropServesRegression) {
+// R4 (I4): the directed regression for the case-fold fix-on-sight in the harness's fake control side.  The stress (seed 2,
+// step 99 of the weights of the day) found that a create whose name differs only in ASCII case from a dropped topic still
+// retiring ('B0' behind the dropped 'b0') ran at once, as the harness compared names exactly; BrokerNode::catalogNameHeldByDrop_
+// folds (Task 8 fix round 1, M4) because on a case-insensitive filesystem the two share one directory.  This test does not
+// depend on a random trajectory or on the filesystem: it holds the retire of 'b0', creates 'B0' (a topic, or a view over a
+// typed topic: the sink path) and requires every broker to park it PENDING behind the folded name, and then to serve it.
+class CaseVariantBehindRetiringDrop : public testing::TestWithParam<bool> {};   // true: the create is a view
+
+TEST_P(CaseVariantBehindRetiringDrop, CaseVariantCreateWaitsBehindRetiringDropRegression) {
+    const bool view = GetParam();
+    CatalogClusterHarness h("case_variant_" + std::string(view ? "view" : "topic"), 3);
+    CatalogStressDriver d(h);
+    cmodel::CatalogModel model;
+    auto ddl = [&](cmodel::Request r, int broker) {
+        r.requestId = d.freshRequestId();
+        StressAction a;
+        a.kind = StressAction::Kind::Ddl;
+        a.brokerA = broker;
+        a.reqA = r;
+        const StepResult res = d.perform(a);
+        EXPECT_EQ(res.answers.size(), 1u);
+        const int answered = res.answers.empty() ? -1 : res.answers.front().code;
+        const cmodel::ModelAnswer m = model.accept(r);
+        EXPECT_TRUE(m.accepted) << cmodel::toString(r);
+        model.apply(m);
+        return answered;
+    };
+    auto define = [&](const char* name) {
+        cmodel::Request r;
+        r.op = cmodel::Op::DefineTopic; r.name = name; r.typed = true; r.transient = false;
+        return r;
+    };
+    ASSERT_EQ(ddl(define("s"), 1), 0);                 // a typed source for the view case
+    ASSERT_EQ(ddl(define("b0"), 1), 0);
+    h.holdRetireForTest(true);
+    cmodel::Request drop;
+    drop.op = cmodel::Op::DropTopic; drop.name = "b0";
+    ASSERT_EQ(ddl(drop, 1), 0);
+    ASSERT_TRUE(h.awaitDigestsEqual(/*excludeHalted=*/false));
+    for (int i = 0; i < 20; ++i) h.pump();
+    for (int b = 1; b <= 3; ++b) EXPECT_GE(h.retiringCountForTest(b), 1u) << "broker " << b << " is not retiring the dropped 'b0'";
+
+    cmodel::Request create;
+    if (view) { create.op = cmodel::Op::CreateView; create.name = "B0"; create.source = "s"; }
+    else      { create = define("B0"); }
+    create.requestId = d.freshRequestId();
+    rune::node::test::ClientOp* second = nullptr;
+    cmodel::Request twin = define("B0");
+    twin.requestId = d.freshRequestId();
+    auto& op = d.startStressOpForTest(create, h.leader());
+    if (!view) second = &d.startStressOpForTest(twin, h.leader() % 3 + 1);   // 4b: the same case-variant create from another broker
+    for (int i = 0; i < 200; ++i) h.pump();
+    for (int b = 1; b <= 3; ++b)
+        EXPECT_EQ(h.pendingCountForTest(b), 1u) << "broker " << b << ": 'B0' must wait behind the folded retiring name, not run at once";
+    EXPECT_FALSE(op.done()) << "the create's OK left before the topic could serve";
+
+    h.holdRetireForTest(false);
+    std::vector<rune::node::test::ClientOp*> ops{&op};
+    if (second != nullptr) ops.push_back(second);
+    d.runStressOpsForTest(ops);
+    if (second != nullptr) {
+        // exactly one of the pair is OK, the other TopicExists (25): the catalog serializes them
+        const int a = op.finalCode(), b = second->finalCode();
+        EXPECT_TRUE((a == 0 && b == code(ErrorCode::TopicExists)) || (b == 0 && a == code(ErrorCode::TopicExists)))
+            << "pair of B0 creates answered " << a << " and " << b;
+        cmodel::Request ok = (a == 0) ? create : twin;
+        const cmodel::ModelAnswer m = model.accept(ok);
+        ASSERT_TRUE(m.accepted);
+        model.apply(m);
+    } else {
+        EXPECT_EQ(op.finalCode(), 0);
+        const cmodel::ModelAnswer m = model.accept(create);
+        ASSERT_TRUE(m.accepted);
+        model.apply(m);
+    }
+    model.calibrateTopicIds(d.catalogAsModelSnapshot());
+    ASSERT_TRUE(d.catalogAsModelSnapshot() == model.snapshot());
+    const auto diff = d.servingDiffersFromModel(model.snapshot());
+    EXPECT_FALSE(diff.has_value()) << diff.value_or("");
+}
+
+INSTANTIATE_TEST_SUITE_P(Kinds, CaseVariantBehindRetiringDrop, testing::Bool(),
+                         [](const testing::TestParamInfo<bool>& info) { return info.param ? std::string("View") : std::string("Topic"); });
+
+// Not a regression: the first 100 steps of seed 2 (where the case-variant create was first seen) still run clean.
+TEST(CatalogStressSmoke, Seed2First100Steps) {
     SeedReport rep;
     runSeed(2, 100, rep);
     EXPECT_GT(rep.okDdls, 0);

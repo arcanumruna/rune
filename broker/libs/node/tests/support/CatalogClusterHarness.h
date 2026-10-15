@@ -795,6 +795,11 @@ public:
     }
 
     // ── for the harness's own unit tests ─────────────────────────────────────
+    /// While held, a dropped topic's dir is not renamed away, so a create of its (case-folded) name waits behind it.
+    void holdRetireForTest(bool on) noexcept { holdRetire_ = on; }
+    [[nodiscard]] bool retireHeldForTest() const noexcept { return holdRetire_; }
+    [[nodiscard]] std::size_t pendingCountForTest(int b) const { return broker_(b).ctl.pending.size(); }
+    [[nodiscard]] std::size_t retiringCountForTest(int b) const { return broker_(b).ctl.retiring.size(); }
     ClientOp& newOpForTest(DdlRequest req, int target) { return startOp_(std::move(req), target, "test"); }
     void runOpsForTest(std::vector<ClientOp*> ops) { runOps_(std::move(ops), "test"); }
     [[nodiscard]] DdlRequest requestForTest(cm::Kind k, cm::Persist p, bool typed) {
@@ -1567,7 +1572,7 @@ private:
         }
         // The retire sequence: the dropped topic's dir is renamed away (after the replicas let go), then
         // the creates that waited on its name run — FIFO.
-        for (auto& r : c.retiring) if (r.passesLeft > 0) --r.passesLeft;
+        if (!holdRetire_) for (auto& r : c.retiring) if (r.passesLeft > 0) --r.passesLeft;   // held: the dir is never renamed away
         for (auto it = c.retiring.begin(); it != c.retiring.end();) {
             if (it->passesLeft > 0) { ++it; continue; }
             (void)c.reg->releaseDroppedLogs(it->id);
@@ -1787,6 +1792,7 @@ private:
     rune::metadata::PartitionAssignment  cur_;
     std::set<int32_t>                    placed_;
     bool                                 placementHeld_ = false;
+    bool                                 holdRetire_ = false;   // test seam (like BrokerNode::holdDroppedDirPurgeForTest): retiring dirs stay
     int32_t                              placementLeader_ = 1;
     int64_t                              now_ = 1'000'000'000;
     int64_t                              corr_ = 0;

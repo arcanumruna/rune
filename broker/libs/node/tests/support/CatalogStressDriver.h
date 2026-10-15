@@ -282,6 +282,7 @@ public:
     void healAll() {
         h_.releaseHighWatermark();
         h_.holdPlacement(false);
+        if (h_.retireHeldForTest()) h_.fail_("heal", "a test left the retire hold on: release it before healAll");
         healIsolation_();
         for (int b = 1; b <= kBrokers; ++b) if (!h_.broker_(b).alive) restartS_(b);
         for (int b = 1; b <= kBrokers; ++b) {
@@ -474,6 +475,9 @@ public:
     /// How many DDLs ended in a terminal in-doubt answer (and were resolved) so far.
     [[nodiscard]] int inDoubtResolved() const noexcept { return inDoubtResolved_; }
     [[nodiscard]] int stepsDone() const noexcept { return step_; }
+    /// A stress DDL as a client op (no fault, no resolution): for the directed tests.
+    ClientOp& startStressOpForTest(const cmodel::Request& r, int target) { return h_.startOp_(toDdl_(r), target, cmodel::toString(r)); }
+    void runStressOpsForTest(const std::vector<ClientOp*>& ops) { runStressOps_(ops, "stress test: the ops"); }
     /// DDLs a crashed catalog leader had started and never answered (summed over restarts).
     [[nodiscard]] uint64_t crashedUnanswered(int b) { return h_.broker_(b).crashedUnanswered; }
     /// True: a terminal in-doubt answer is resolved inside the step (C1).  The stress asserts none remains.
