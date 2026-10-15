@@ -204,11 +204,64 @@ def heal(cluster, service: str) -> None:
 def heal_all(cluster) -> None:
     """Best-effort clear of every broker netem this harness installed and has not cleared (teardown safety)."""
     from .cluster import SERVICES
+    for s in [x for x in SERVICES if x in _IPT_DIRTY.get(cluster.project, set())]:
+        try:
+            heal_peers(cluster, s)
+        except Exception:
+            pass
     for s in [x for x in SERVICES if x in _NETEM_DIRTY.get(cluster.project, set())]:
         try:
             clear_netem(cluster, s)
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Per-peer (directional) drops — iptables in the broker netns via the sidecar.
+#
+# Reliable on a Linux docker host (the dr-e2e VM); the Docker-Desktop caveat above is about the LinuxKit kernel.
+# drop_from(svc, peer): svc no longer RECEIVES anything from peer (INPUT -s peer); drop_to(svc, peer): svc no
+# longer SENDS anything to peer (OUTPUT -d peer).  heal_peers / heal_all flush them.
+# ---------------------------------------------------------------------------
+
+_IPT_DIRTY: dict[str, set[str]] = {}
+
+
+def _peer_ip(cluster, peer: str) -> str:
+    ip = cluster.container_ip(peer)
+    if not ip:
+        raise RuntimeError(f"no IP for {peer} on {cluster.compose.network_name()}")
+    return ip
+
+
+def _iptables(cluster, service: str, *rule: str) -> None:
+    cid = cluster.container_id(service)
+    if not cid:
+        raise RuntimeError(f"no container for {service}")
+    _IPT_DIRTY.setdefault(cluster.project, set()).add(service)
+    res = _netns_exec(cid, ["iptables", *rule])
+    if not res.ok:
+        raise RuntimeError(f"iptables {' '.join(rule)} failed on {service}: {res.stderr or res.stdout}")
+
+
+@timed("fault.drop_from", 1)
+def drop_from(cluster, service: str, peer: str) -> None:
+    """`service` drops every packet coming FROM `peer` (one-way: `service` still sends to `peer`)."""
+    _iptables(cluster, service, "-A", "INPUT", "-s", _peer_ip(cluster, peer), "-j", "DROP")
+
+
+@timed("fault.drop_to", 1)
+def drop_to(cluster, service: str, peer: str) -> None:
+    """`service` drops every packet it sends TO `peer`."""
+    _iptables(cluster, service, "-A", "OUTPUT", "-d", _peer_ip(cluster, peer), "-j", "DROP")
+
+
+@timed("fault.heal_peers", 1)
+def heal_peers(cluster, service: str) -> None:
+    cid = cluster.container_id(service)
+    if cid:
+        _netns_exec(cid, ["sh", "-c", "iptables -F INPUT; iptables -F OUTPUT"])
+    _IPT_DIRTY.get(cluster.project, set()).discard(service)
 
 
 # ---------------------------------------------------------------------------

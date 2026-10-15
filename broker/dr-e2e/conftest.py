@@ -45,6 +45,8 @@ def pytest_sessionstart(session):
         return
     if config.getoption("collectonly", False) or _only_harness_unit_tests(config):
         return
+    # The host-wide test lock the xdist workers share (see _host_test_lock); created before the workers spawn.
+    os.environ.setdefault("DR_HOST_LOCK", os.path.join(str(config.rootpath), f".dr-host-{os.getpid()}.lock"))
     from harness import images
     try:
         images.prepare_all()
@@ -76,6 +78,35 @@ def pytest_runtest_teardown(item, nextitem):
     yield from _timed_runtest(item, "teardown")
 
 
+_FAILED_NOW = {"nodeid": None}
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    outcome = yield
+    rep = outcome.get_result()
+    if rep.failed and rep.when in ("setup", "call"):
+        _FAILED_NOW["nodeid"] = item.nodeid
+
+
+def _save_broker_logs_on_failure(c: Cluster, request) -> None:
+    """A failed test's broker logs go to DR_CLIENT_LOG_DIR/brokers/<test>/ before the cluster is removed, so a
+    failure can be classified (harness vs broker vs client) after the fact."""
+    log_dir = os.environ.get("DR_CLIENT_LOG_DIR")
+    if not log_dir or _FAILED_NOW["nodeid"] != request.node.nodeid:
+        return
+    import re as _re
+    d = os.path.join(log_dir, "brokers", _re.sub(r"[^A-Za-z0-9_.-]+", "_", request.node.nodeid)[-150:])
+    os.makedirs(d, exist_ok=True)
+    from harness.cluster import SERVICES
+    for svc in SERVICES:
+        try:
+            with open(os.path.join(d, f"{svc}.log"), "w") as fh:
+                fh.write(c.compose.logs(svc, timeout=60))
+        except Exception as e:  # noqa: BLE001 - diagnostics only
+            print(f"[dr-e2e] could not save {svc} logs: {e}")
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _sweep_orphaned_containers():
     """D10-L (D2-10): containers left by a harness process that died without cleanup
@@ -92,7 +123,7 @@ def _build_flag() -> bool:
 
 
 @pytest.fixture(scope="module")
-def cluster():
+def cluster(request):
     c = Cluster(project="rune-dr")
     try:
         c.up(build=_build_flag(), leader_timeout=120)
@@ -101,6 +132,14 @@ def cluster():
     finally:
         faults.heal_all(c)
         c.down()
+
+
+@pytest.fixture(autouse=True)
+def _module_cluster_logs_on_failure(request):
+    """The module-scoped `cluster` outlives a failed test: save its logs right after the failing test."""
+    yield
+    if "cluster" in request.fixturenames:
+        _save_broker_logs_on_failure(request.getfixturevalue("cluster"), request)
 
 
 # fresh_cluster teardown runs `down -v` in the background while the next test brings ITS cluster up: consecutive
@@ -127,10 +166,17 @@ def _background_down(c: Cluster) -> None:
 def pytest_sessionfinish(session, exitstatus):
     for project in list(_BG_DOWNS):
         _await_down(project)
+    lock = os.environ.get("DR_HOST_LOCK")
+    if lock and not hasattr(session.config, "workerinput") and str(os.getpid()) in lock:
+        for f in (lock, lock + ".gate"):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
 
 
 @pytest.fixture
-def fresh_cluster():
+def fresh_cluster(request):
     stale = bool(os.environ.get("DR_STALE_DATA"))
     keep = bool(os.environ.get("DR_KEEP_CLUSTER"))
     if stale or keep:
@@ -148,6 +194,7 @@ def fresh_cluster():
         c.wait_data_plane_ready(max_attempts=5, timeout_s=60)
         yield c
     finally:
+        _save_broker_logs_on_failure(c, request)
         # A container that is removed takes its qdisc with it: heal only a cluster that stays up / is restarted on.
         if stale or keep:
             faults.heal_all(c)
@@ -183,3 +230,34 @@ def pytest_collection_modifyitems(session, config, items):
                 return i
         return len(_LONG_FIRST)
     items.sort(key=rank)
+
+
+@pytest.fixture(autouse=True)
+def _host_test_lock(request):
+    """xdist isolation for CPU-heavy scenarios.  Every test holds a SHARED flock on DR_HOST_LOCK; a test marked
+    `exclusive` holds it EXCLUSIVELY, so it never shares the 4-core host with another worker's cluster (measured
+    2026-10-15: under -n 3 the 15-client reconnect storm saw no re-election within 90 s at load ~28; alone it
+    passes).  A gate lock gives the exclusive taker priority: it holds the gate while it waits, and shared takers
+    pass the gate first, so a stream of short tests cannot starve it.  Autouse + function scope: taken before the
+    test's own cluster comes up.  A no-op outside xdist."""
+    path = os.environ.get("DR_HOST_LOCK")
+    if not path or not os.environ.get("PYTEST_XDIST_WORKER"):
+        yield
+        return
+    import fcntl
+    exclusive = request.node.get_closest_marker("exclusive") is not None
+    gate = open(path + ".gate", "a")
+    main = open(path, "a")
+    try:
+        with timing.phase("host_lock.wait", "exclusive" if exclusive else "shared"):
+            fcntl.flock(gate, fcntl.LOCK_EX)
+            if exclusive:
+                fcntl.flock(main, fcntl.LOCK_EX)
+            else:
+                fcntl.flock(main, fcntl.LOCK_SH)
+            fcntl.flock(gate, fcntl.LOCK_UN)
+        yield
+    finally:
+        fcntl.flock(main, fcntl.LOCK_UN)
+        main.close()
+        gate.close()

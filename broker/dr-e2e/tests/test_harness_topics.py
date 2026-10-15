@@ -149,3 +149,15 @@ def test_a_failed_cli_image_build_is_a_topic_creation_error(monkeypatch):
 def test_a_str_topics_argument_is_a_type_error_not_a_tuple_of_characters():
     with pytest.raises(TypeError):
         hc.Cluster(project="t", topics="events:1")
+
+
+def test_container_ip_template_survives_dashed_network_names_regression(monkeypatch):
+    """`.NetworkSettings.Networks.rune-dr-x_default.IPAddress` does not parse (dash in a field name): the
+    template must index the network map."""
+    seen = []
+    monkeypatch.setattr(hc.Cluster, "container_id", lambda self, svc: "cid123")
+    monkeypatch.setattr(hc, "run", lambda args, **kw: seen.append(args) or CmdResult(args, 0, "10.0.0.7\n", ""))
+    c = hc.Cluster(project="rune-dr-fault-a")
+    assert c.container_ip("rune-1") == "10.0.0.7"
+    fmt = seen[0][seen[0].index("--format") + 1]
+    assert fmt.startswith("{{(index .NetworkSettings.Networks ") and '"rune-dr-fault-a_default"' in fmt

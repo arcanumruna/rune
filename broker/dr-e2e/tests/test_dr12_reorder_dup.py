@@ -1028,74 +1028,71 @@ def test_dr12_large_batch_fragmentation(fresh_cluster, netem_ready, rep):
     )
 
 
-# ── Scenario 5: MTU reduction + large batches (documented skip) ───────────────
+# ── Scenario 5: MTU reduction + large batches ─────────────────────────────────
 #
-# Intent: use faults.set_mtu() to reduce the broker interface MTU to 1200 bytes,
-# then produce large batches — forcing lower-layer IP fragmentation in addition
-# to Aeron's own fragment reassembly, creating a two-level fragmentation path.
-# Combined with reorder+dup, this is the most aggressive fragmentation test.
-#
-# Implementation note: set_mtu() is implemented in harness/faults.py using the
-# netem sidecar with NET_ADMIN.  It mirrors _netns_exec with the command:
-#   ip link set dev <iface> mtu <mtu>
-# This is portable on Linux where the netem sidecar has full NET_ADMIN in the
-# broker's netns.
-#
-# Skip rationale: On Docker Desktop (macOS LinuxKit VM) the eth0 interface inside
-# the container netns is a virtual veth pair whose MTU is managed by the VM
-# hypervisor layer.  `ip link set dev eth0 mtu 1200` may succeed in the sidecar
-# but silently have no effect, or may cause Aeron's media driver to stall if the
-# MTU change races with in-flight sends.  The result is unreliable enough to
-# warrant skipping on Docker Desktop.  On Linux CI where container netns MTU
-# changes are reliable, this scenario can be enabled.
-#
-# set_mtu() is added to harness/faults.py below (see faults.py update).
+# faults.set_mtu() lowers the follower's eth0 MTU to 1200 bytes AFTER the broker derived its Aeron MTU from the
+# 1500-byte interface (1472): every full-size replication datagram to / from that follower now exceeds the link
+# MTU, combined with reorder + duplication on the same link.  The broker must either get the data through (IP
+# fragmentation / Aeron retransmit) or keep the follower out of the ISR — never lose or duplicate a committed
+# record.  Runs on the Linux docker host (veth MTU changes are honoured there).
 
-@pytest.mark.skip(
-    reason=(
-        "MTU reduction via `ip link set dev eth0 mtu` is unreliable on Docker "
-        "Desktop (macOS LinuxKit VM): the veth pair MTU may not be honoured by "
-        "the hypervisor, or the change may race with Aeron media driver "
-        "in-flight sends and stall the cluster.  Enable on Linux CI where "
-        "container-netns MTU changes are reliable and deterministic.  "
-        "harness/faults.py provides set_mtu(cluster, svc, mtu, iface) via the "
-        "netem sidecar (NET_ADMIN + ip link set).  "
-        "See DR-12 module docstring, scenario 5."
-    )
-)
 @pytest.mark.fault
 @pytest.mark.netem
-@pytest.mark.timeout(1200)
-def test_dr12_mtu_reduction_large_batch_placeholder(fresh_cluster, netem_ready):
-    """LINUX-CI-ONLY PLACEHOLDER: MTU reduction + large batches.
+@pytest.mark.timeout(900)
+@pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
+    "BROKER FINDING (2026-10-15, first run of this scenario): a partition leader whose eth0 MTU drops to 1200 "
+    "keeps ACKING acks=All produces for its partition, but a subscriber receives NOTHING from that partition for "
+    "a whole 180 s live read (0 of 196 acked records of multi/0, led by the MTU-reduced node; partitions 1-2 "
+    "complete) - the broker's derived 1472-byte Aeron MTU exceeds the link MTU and the oversized delivery frames "
+    "are dropped silently: no error, no re-route, no MTU adaptation.  strict: an XPASS (fixed) fails the run so "
+    "this marker gets removed."))
+def test_dr12_mtu_reduction_large_batch(fresh_cluster, netem_ready):
+    """Follower MTU 1200 (< the 1472-byte Aeron MTU the broker derived) + reorder 30 % + dup 8 % + 20 ms delay,
+    while 500 acks=All records are produced.  Hard invariants: committed-loss = 0, per-key ordering,
+    exactly-once, single leader; after restoring MTU 1500 and healing, the follower converges and the
+    cluster serves a fresh round trip."""
+    cluster = fresh_cluster
+    keys, records = 18, 500
+    lid, leader_svc = cluster.identify_leader()
+    assert_single_leader(cluster)
+    follower_svc = cluster.follower_service()
 
-    Intent: call faults.set_mtu(cluster, follower_svc, mtu=1200) to reduce the
-    broker interface MTU to 1200 bytes, then produce 500 records × 18 keys with
-    reorder=30% + dup=8% active on the same link.  The reduced MTU forces IP-level
-    fragmentation in addition to Aeron's own fragment reassembly, exercising the
-    two-level fragmentation path:
-      1. Aeron breaks RecordBatches into Aeron frames (FRAME_MAX_LENGTH).
-      2. IP breaks Aeron UDP frames into IP fragments (new MTU limit).
-    Aeron's FragmentAssembler + Aeron's term-buffer gap detection must together
-    deliver all records in order, exactly once, without committed loss.
+    pre = _produce(cluster, leader_svc, 1, _next_cid_base(), 50, keys)
+    assert pre.ok and len(pre.all_produced) == 50, "pre-fault produce failed:\n" + pre.clients[0].raw[-1200:]
 
-    Hard invariants (when enabled):
-      * committed-loss = 0
-      * per-key ordering (Aeron + IP reassembly both must restore order)
-      * exactly-once (no dup from IP fragment duplication + Aeron dedup)
-
-    Uses harness.faults.set_mtu(cluster, svc, mtu, iface="eth0"):
-        faults.set_mtu(cluster, follower_svc, mtu=1200)
-        # ... produce + subscribe ...
+    committed: Results = Results()
+    sub_live: Results = Results()
+    try:
+        faults.set_mtu(cluster, follower_svc, 1200)
+        faults.netem(cluster, follower_svc, reorder=30, duplicate=8, delay=20)
+        time.sleep(2.0)   # KEPT: the produce must start on an already-degraded link (scenario)
+        committed = _produce(cluster, leader_svc, 1, _next_cid_base(), records, keys)
+        assert committed.ok and len(committed.all_produced) == records, (
+            "large-batch produce with follower MTU 1200 + reorder/dup failed (leader + healthy third node are a "
+            "majority):\n" + "\n\n".join(c.raw[-1200:] for c in committed.clients))
+        # 60 s: 500 records stream in seconds on a healthy path (the full 180 s window, measured, adds nothing).
+        sub_live = _subscribe_all(cluster, leader_svc, _next_cid_base(), keys, window_ms=60000)
     finally:
-        faults.heal_all(cluster)   # clear_netem; MTU restored on container restart
-        # NOTE: set_mtu does NOT auto-restore MTU; the cluster teardown in
-        # fresh_cluster's finally block (c.down()) destroys + recreates the
-        # container, which resets the veth MTU automatically.
+        try:
+            faults.set_mtu(cluster, follower_svc, 1500)
+        finally:
+            faults.heal_all(cluster)
 
-    Requires: Linux CI host with iptables-in-netns + reliable veth MTU control.
-    """
-    pytest.skip(
-        "MTU reduction needs reliable container-netns ip-link — Linux-CI only; "
-        "see DR-12 module docstring and harness/faults.py set_mtu."
-    )
+    cluster.settle(10.0, running=list(SERVICES))
+    assert_single_leader(cluster)
+    _assert_delivery_invariants(committed, sub_live)
+
+    _, current_leader = cluster.identify_leader()
+    sub_post = _subscribe_all(cluster, current_leader, _next_cid_base(), keys, window_ms=180000)
+    assert_no_committed_loss(Results(clients=pre.clients + committed.clients + sub_post.clients))
+    assert_per_key_ordering(sub_post)
+    assert_exactly_once(sub_post)
+
+    post = run_clients(
+        1, network=cluster.compose.network_name(), target_service=current_leader, cid_base=_next_cid_base(),
+        timeout_s=180, mode="produce_subscribe", topics="multi:1:3", sub_partitions=3, records=30, keys=18,
+        expect=30, acks="all", expect_own=True, timeout_ms=_CONNECT_MS, connect_retries=0, subscribe_ms=60000,
+        start_stagger_ms=_STAGGER_MS, **{"from": "earliest"})
+    assert post.ok and len(post.all_produced) == 30, "post-heal round trip failed:\n" + "\n".join(
+        c.raw[-1200:] for c in post.clients)
+    assert_single_leader(cluster)

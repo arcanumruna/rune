@@ -190,6 +190,7 @@ def _post_recovery_round_trip(cluster, leader_svc: str, keys: int = 18) -> None:
 
 @pytest.mark.fault
 @pytest.mark.timeout(900)
+@pytest.mark.exclusive   # dozens of client media drivers: runs alone on the host (conftest)
 @pytest.mark.parametrize("n_clients", [50])
 def test_dr13_scale(fresh_cluster, n_clients):
     """50 concurrent produce_subscribe clients all exiting cleanly.
@@ -279,6 +280,7 @@ def test_dr13_scale(fresh_cluster, n_clients):
 
 @pytest.mark.fault
 @pytest.mark.timeout(720)
+@pytest.mark.exclusive   # dozens of client media drivers: runs alone on the host (conftest)
 @pytest.mark.parametrize("n_storm_clients", [15])
 def test_dr13_reconnect_storm(fresh_cluster, n_storm_clients):
     """Kill the leader while K clients are connected (producing acks=All).
@@ -524,29 +526,65 @@ def test_dr13_slow_subscriber_isolation(fresh_cluster):
 
 @pytest.mark.fault
 @pytest.mark.timeout(600)
-@pytest.mark.skip(
-    reason=(
-        "Three-concurrent variant (producer + fast sub + slow sub simultaneously) "
-        "requires timing individual clients independently — the current run_clients "
-        "API returns after ALL clients finish, so the fast-client completion time "
-        "is masked by the slow subscriber's wall clock.  "
-        "Harness extension needed: run_clients should expose per-client timestamps "
-        "or support a callback on completion.  "
-        "The two-phase variant (test_dr13_slow_subscriber_isolation) provides the "
-        "core isolation guarantee via construction: the slow subscriber cannot "
-        "affect phase 1 because it is not running.  "
-        "Enable this variant once the harness exposes per-client timing."
-    )
-)
 def test_dr13_slow_subscriber_isolation_concurrent(fresh_cluster):
-    """SKIPPED (harness extension needed): producer + fast + slow all concurrent.
+    """Producer + fast subscriber + slow subscriber ALL concurrently, each timed on its own thread.
 
-    This variant would run all three concurrently and assert that the fast
-    subscriber + producer complete within a bounded wall-clock slice WHILE the
-    slow subscriber is still in flight.  Requires per-client timing from
-    run_clients (not currently available).  See skip reason above.
+    The slow subscriber (slow_subscriber_ms=150 per record, 150 records => >= 22.5 s of handler time) starts
+    FIRST and stays in flight; the fast path (acks=All producer, then a fast subscriber) runs meanwhile.
+    Isolation: the fast path finishes within a bounded wall-clock slice AND before the slow subscriber does —
+    a broker whose delivery to everyone were gated by its slowest consumer could not finish the fast path
+    first.  Both subscribers must then deliver every committed record, in per-key order, exactly once.
     """
-    pytest.skip("harness extension needed: per-client timing API")
+    cluster = fresh_cluster
+    keys, records, slow_ms = 18, 150, 150
+    assert_single_leader(cluster)
+    _, leader_svc = cluster.identify_leader()
+    net = cluster.compose.network_name()
+    cid_prod = _next_cid_base()
+    done: dict[str, float] = {}
+    out: dict[str, Results] = {}
+    t0 = time.monotonic()
+
+    def _sub(tag: str, slow: int, window_ms: int) -> None:
+        out[tag] = run_clients(
+            1, network=net, target_service=leader_svc, cid_base=_next_cid_base(), timeout_s=240,
+            mode="subscribe", topics="multi:1:3", sub_partitions=3, keys=keys, expect=records,
+            expect_cid_min=cid_prod,          # only this test's producer counts toward `expect`
+            slow_subscriber_ms=slow, subscribe_ms=window_ms, timeout_ms=_CONNECT_MS,
+            start_stagger_ms=0, **{"from": "earliest"})
+        done[tag] = time.monotonic() - t0
+
+    slow_t = threading.Thread(target=_sub, args=("slow", slow_ms, 150_000), daemon=True)
+    slow_t.start()
+
+    committed = _produce(cluster, leader_svc, 1, cid_prod, records, keys)
+    done["produce"] = time.monotonic() - t0
+    _sub("fast", 0, 60_000)
+    fast_elapsed = done["fast"]
+    slow_still_running = slow_t.is_alive()
+    slow_t.join(timeout=300)
+    assert not slow_t.is_alive(), "slow subscriber thread did not finish"
+
+    assert committed.ok and len(committed.all_produced) == records, (
+        "concurrent slow-subscriber: produce failed:\n" + "\n".join(c.raw[-1200:] for c in committed.clients))
+    fast, slow = out["fast"], out["slow"]
+    assert fast.ok, "fast subscriber failed:\n" + "\n".join(c.raw[-1500:] for c in fast.clients)
+    assert slow.ok, "slow subscriber failed:\n" + "\n".join(c.raw[-1500:] for c in slow.clients)
+
+    assert fast_elapsed < 120.0, (
+        f"producer + fast subscriber took {fast_elapsed:.1f}s with a slow subscriber in flight (> 120 s)")
+    assert done["fast"] < done["slow"], (
+        f"fast path finished at {done['fast']:.1f}s, slow subscriber at {done['slow']:.1f}s - the fast path did "
+        f"not finish while the slow subscriber was still delivering (isolation not shown)")
+    assert slow_still_running or done["fast"] < done["slow"]
+
+    for sub in (fast, slow):
+        assert_no_committed_loss(Results(clients=committed.clients + sub.clients))
+        assert_per_key_ordering(sub)
+        assert_exactly_once(sub)
+    assert_single_leader(cluster)
+    print(f"\n[DR-13 slow-sub concurrent] produce {done['produce']:.1f}s, fast {done['fast']:.1f}s, "
+          f"slow {done['slow']:.1f}s")
 
 
 # ── Scenario 4: Client crash mid-produce → cluster health check ───────────────

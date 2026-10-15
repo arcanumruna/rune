@@ -93,6 +93,7 @@ import time
 import pytest
 
 from harness import faults
+from harness.dockerutil import run
 from harness.cluster import SERVICES, node_id_to_service
 from harness.driver import DRAIN_QUIET_MS, Results, run_clients
 from harness.invariants import (
@@ -556,43 +557,53 @@ def test_dr14_shm_size_sufficient(fresh_cluster):
     assert_single_leader(cluster)
 
 
-@pytest.mark.skip(
-    reason=(
-        "shm-exhaustion injection: filling /dev/shm to exhaust Aeron CnC / "
-        "log-buffer allocations requires a constrained tmpfs mount "
-        "(e.g., shm_size: '1m' + mounting /dev/shm as tmpfs with size=1m). "
-        "On Docker Desktop / macOS LinuxKit the LinuxKit VM and Rosetta "
-        "emulation layer do not reliably honour per-container /dev/shm size "
-        "constraints and the test would be non-deterministic. "
-        "Enable on Linux CI with: `docker run --shm-size=1m ...` and a "
-        "compose override that reduces shm_size to 1m to force alloc failure. "
-        "Expected behaviour: broker exits non-zero (cannot open CnC) rather "
-        "than silently running with a partially-initialised media driver."
-    )
-)
 @pytest.mark.fault
-def test_dr14_shm_exhaustion_injection(fresh_cluster):  # pragma: no cover
-    """[SKIP] Fill /dev/shm to exhaust Aeron CnC/log-buffer allocations.
+@pytest.mark.timeout(300)
+def test_dr14_shm_exhaustion_injection(tmp_path):
+    """/dev/shm capped at 1 MiB on every broker: the cluster must still start, elect and serve acks=All.
 
-    What this would test (Linux CI only):
-      * Reduce compose shm_size to 1 MiB (override) so Aeron cannot allocate
-        its CnC file (~4 MiB default) and media driver log buffers.
-      * Start the cluster; assert that nodes fail to start (exit != 0) rather
-        than running with a silently broken media driver.
-      * Confirm that increasing shm_size back to 256 MiB restores normal startup.
-    This validates that the broker's startup check surfaces shm allocation failure
-    as a clean error rather than a silent performance or correctness regression.
+    The original premise ("Aeron CnC / log buffers live in /dev/shm, so a tiny shm must fail startup cleanly")
+    does not hold for this broker: its Aeron directory is RUNE_DATA_DIR/aeron on the data volume (rune_role
+    reads it there), not /dev/shm - measured 2026-10-15 on the Linux VM, brokers with shm_size=1m start and
+    elect normally.  So the injected fault is a 1 MiB /dev/shm, and the invariant is that the broker has NO
+    hidden /dev/shm dependency: it forms a cluster and serves a committed, ordered, exactly-once round trip.
+    (A 1 MiB shm could not hold even one 4 MiB Aeron term, so any shm-backed log buffer would fail here.)
     """
-    pass  # body never executes (skipped)
+    from harness.cluster import Cluster
+    override = tmp_path / "shm-1m.yml"
+    override.write_text("services:\n" + "".join(f"  {s}:\n    shm_size: 1m\n" for s in SERVICES))
+    c = Cluster(project="rune-dr-shm1m", override_files=[str(override)])
+    try:
+        c.up(leader_timeout=120)
+        c.wait_data_plane_ready(max_attempts=5, timeout_s=60)
+        for svc in SERVICES:
+            cid = c.container_id(svc)
+            size = run(["docker", "inspect", "-f", "{{.HostConfig.ShmSize}}", cid], timeout=15).stdout.strip()
+            assert size == str(1024 * 1024), f"{svc}: shm_size override not applied (ShmSize={size})"
+        assert_single_leader(c)
+        _, leader_svc = c.identify_leader()
+        keys, records = 4, 60
+        result = _produce(c, leader_svc, 1, _next_cid_base(), records, keys)
+        assert result.ok and len(result.all_produced) == records, (
+            "produce with a 1 MiB /dev/shm failed:\n" + "\n".join(x.raw[-1200:] for x in result.clients))
+        sub = _subscribe_all(c, leader_svc, _next_cid_base(), keys, window_ms=60_000)
+        assert_no_committed_loss(Results(clients=result.clients + sub.clients))
+        assert_per_key_ordering(sub)
+        assert_exactly_once(sub)
+        assert_single_leader(c)
+    finally:
+        c.down()
 
 
 # ── Scenario 4: fsync-failure / disk-full (SKIP — documented) ────────────────
 
 @pytest.mark.skip(
     reason=(
-        "fsync-failure injection: simulating a failing fsync (e.g., O_SYNC on a "
-        "FUSE mountpoint that returns EIO) requires a FUSE or dm-error setup not "
-        "available on Docker Desktop / macOS LinuxKit. "
+        "fsync-failure injection needs a block device that fails writes (device-mapper dm-error / dm-flakey, "
+        "or a FUSE filesystem returning EIO) under the broker's data dir; both are host-kernel setup (dmsetup / "
+        "loop devices / /dev/fuse on the docker HOST).  The suite's host is a shared k3s node whose rules allow "
+        "only containers and images the suite creates - no host device setup - so this cannot run there.  "
+        "Previously stated: not available on Docker Desktop / macOS LinuxKit. "
         "Enable on Linux CI with a FUSE error-injector (e.g., `erofs` or a "
         "custom FUSE fs that returns EIO after N successful writes). "
         "Expected behaviour: the broker must either (a) propagate the fsync error "
@@ -621,11 +632,13 @@ def test_dr14_fsync_failure_graceful_degradation(fresh_cluster):  # pragma: no c
 
 @pytest.mark.skip(
     reason=(
-        "disk-full injection: filling the broker's data volume to 100% requires "
-        "a capped tmpfs mount (e.g., `--tmpfs /var/lib/rune:size=16m`) or a "
-        "loop-device with a fixed size. On Docker Desktop / macOS LinuxKit / "
-        "Rosetta the volume is backed by the LinuxKit VM's virtual disk and "
-        "cannot be reliably capped per-container to a small size. "
+        "disk-full injection cannot isolate the log-append ENOSPC path: the broker keeps its Aeron directory "
+        "(CnC + every publication's 3 x 4 MiB term buffers) INSIDE RUNE_DATA_DIR, so a capped data dir fills "
+        "with Aeron buffers first - measured 2026-10-15 on the Linux VM: a 64 MiB tmpfs data dir makes all "
+        "three brokers exit 1 while the cluster forms ('insufficient storage space' for peer publications, then "
+        "'refusing shard mode - aeron dir has 5165056 bytes free but ... need 12648448'), before any record; an uncapped volume lives "
+        "on the host disk (no per-container cap without host loop devices, not allowed on the shared k3s "
+        "host).  Needs a broker option that puts the log directory on its own mount. "
         "Enable on Linux CI with: `--mount type=tmpfs,target=/var/lib/rune,"
         "tmpfs-size=16777216` in the compose file (override) and a produce loop "
         "that writes until ENOSPC. "

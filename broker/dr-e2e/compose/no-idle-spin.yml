@@ -1,0 +1,15 @@
+# Optional dr-e2e overlay (RUNE_DR_COMPOSE_OVERRIDES=$PWD/compose/no-idle-spin.yml): brokers park without the
+# Aeron 10-spin / 20-yield phase before each idle park (RUNE_IDLE_SPINS=0 RUNE_IDLE_YIELDS=0, a documented broker
+# knob - NodeConfig.h: "+~100 us p50, -6 pts worker CPU").  Measured 2026-10-15 on the 4-core VM: an idle 3-node
+# cluster 82 % -> 53 % of a core.  The DR suite checks correctness (loss / order / dups / leadership), not latency,
+# and is CPU-bound with 3 clusters on 4 cores; default-config arms (global_overlays=False) never get it.
+x-no-idle-spin: &no-idle-spin
+  RUNE_IDLE_SPINS: "0"
+  RUNE_IDLE_YIELDS: "0"
+services:
+  rune-1:
+    environment: *no-idle-spin
+  rune-2:
+    environment: *no-idle-spin
+  rune-3:
+    environment: *no-idle-spin

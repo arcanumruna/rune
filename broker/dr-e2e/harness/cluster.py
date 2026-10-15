@@ -248,7 +248,7 @@ class Cluster:
         # bogus "phantom"/resurrection failures (records not in THIS run's produced
         # set).  A pre-up `down -v` makes every cluster start deterministic and
         # independent of how the previous run ended.  clean=False opts out.
-        if clean:
+        if clean and self._project_has_leftovers():
             self.compose.down()  # `down -v --remove-orphans` — wipes stale volumes
         from .images import prepared
         if build and not prepared():   # DR_E2E_BUILD: built once at session start when the session hook ran
@@ -259,6 +259,17 @@ class Cluster:
         if self.topics:
             self.create_topics(self.topics)
         return self
+
+    def _project_has_leftovers(self) -> bool:
+        """Any container, volume or network of this compose project left (by an interrupted run)?  The pre-up
+        `down -v` is only needed then; on a clean host it cost every bring-up ~1 s of compose start-up."""
+        label = f"label=com.docker.compose.project={self.project}"
+        for cmd in (["docker", "ps", "-aq", "--filter", label], ["docker", "volume", "ls", "-q", "--filter", label],
+                    ["docker", "network", "ls", "-q", "--filter", label]):
+            res = run(cmd, timeout=30)
+            if not res.ok or res.stdout.strip():
+                return True       # leftovers, or docker could not tell: clean as before
+        return False
 
     # ---- topics (DDL) -----------------------------------------------------
 
@@ -663,7 +674,9 @@ class Cluster:
         net = network or self.compose.network_name()
         res = run(
             ["docker", "inspect", "--format",
-             f"{{{{.NetworkSettings.Networks.{net}.IPAddress}}}}", cid],
+             # `index`: a network name with '-' (every compose project here) is not a valid template field name
+             # - `.Networks.<net>.IPAddress` failed to parse and this returned None for every project.
+             f'{{{{(index .NetworkSettings.Networks "{net}").IPAddress}}}}', cid],
             timeout=15,
         )
         ip = res.stdout.strip()

@@ -876,7 +876,10 @@ def test_cp5_compaction_survives_failover(compaction_cluster):
 
 @pytest.mark.skip(
     reason=(
-        "CP-5.2-tombstone: dr_client does not support null-value tombstone records "
+        "CP-5.2-tombstone: rune-client-cpp has no API to produce a tombstone (null-value) record - "
+        "Producer::trySend takes a value span and there is no null/tombstone flag (checked 2026-10-15: no "
+        "'tombstone' in the client's public headers), so no client - dr_client included - can emit one; "
+        "this holds on every host.  Previously stated: dr_client does not support null-value tombstone records "
         "(value payload is always 'cid=...;key=...;seq=...' — never empty). "
         "The tombstone path is fully covered by the in-process integration suite "
         "(Compaction_TombstoneDeletesKey, Compaction_TombstoneRetainedBeforeRetentionExpires, "

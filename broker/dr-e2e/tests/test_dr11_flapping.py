@@ -654,74 +654,127 @@ def test_dr11_rapid_flap_livelock_guard(fresh_cluster, netem_ready):
     assert_exactly_once(sub)
 
 
-# ── Placeholders: Linux-CI-only (directional/partial-quorum partitions) ───────
-#
-# These scenarios require per-peer ``iptables`` DROP rules (directional traffic
-# shaping), which are unreliable on Docker Desktop's LinuxKit kernel due to
-# potentially missing nf modules.  The portable ``partition()`` helper uses
-# netem 100% loss on eth0 (ALL traffic) and cannot model:
-#   - One-way A→B ok / B→A dropped (asymmetric partition).
-#   - Leader reaches ONE follower but not the other (partial quorum).
-# They are skipped here so the test ids are recorded in the suite and can be
-# enabled on a Linux CI runner where iptables-in-netns is reliable.
-#
-# See harness/faults.py module docstring for the Docker-Desktop caveat.
 
-@pytest.mark.skip(
-    reason=(
-        "directional/asymmetric partition needs per-peer iptables rules — "
-        "unreliable on Docker Desktop's LinuxKit kernel (nf modules may be absent); "
-        "enable on Linux CI where iptables-in-netns is reliable. "
-        "See harness/faults.py module docstring."
-    )
-)
+# ── Scenarios 4-5: directional / partial partitions (per-peer iptables) ──────
+#
+# ``faults.partition()`` isolates a node from everyone (netem 100 % loss on eth0).  These two cut single
+# peer-to-peer directions with iptables in the broker netns (``faults.drop_from`` / ``drop_to``), which is
+# reliable on the Linux docker host the suite runs on.
+#
+# Hard invariants (both scenarios, every variant): at most ONE leader at the highest term at every check;
+# every acks=All record acknowledged during the fault is delivered after heal (no committed loss), in per-key
+# order, exactly once; the cluster serves a fresh round trip after heal.
+
+
+def _produce_until_acked(cluster, records: int, keys: int, deadline_s: float = 90.0) -> tuple[Results, str]:
+    """acks=All produce through the CURRENT leader, retried (leadership may move under a directional fault)
+    until one batch is fully acknowledged.  Every attempt's acks count as committed.  Returns (all attempts, the
+    leader that took the full batch)."""
+    deadline = time.time() + deadline_s
+    attempts: list = []
+    last = ""
+    while time.time() < deadline:
+        lid = cluster.wait_for_leader(timeout_s=30)
+        svc = node_id_to_service(lid)
+        res = _produce(cluster, svc, 1, _next_cid_base(), records, keys)
+        attempts.extend(res.clients)
+        if res.ok and len(res.all_produced) == records:
+            return Results(clients=attempts), svc
+        last = res.clients[0].raw[-800:] if res.clients else "no result"
+        time.sleep(2.0)   # back-off of a bounded retry loop
+    raise AssertionError(f"no acks=All batch fully acknowledged within {deadline_s:.0f}s under the "
+                         f"directional fault (a 2-node majority stayed connected); last:\n{last}")
+
+
+def _verify_after_heal(cluster, committed: Results, keys: int) -> None:
+    cluster.settle(15.0, running=list(SERVICES))   # rejoin + one term everywhere, at most 15 s
+    assert_single_leader(cluster)
+    _, leader_svc = cluster.identify_leader()
+    sub = _subscribe_all(cluster, leader_svc, _next_cid_base(), keys, window_ms=120000)
+    assert_no_committed_loss(Results(clients=committed.clients + sub.clients))
+    assert_per_key_ordering(sub)
+    assert_exactly_once(sub)
+    post = run_clients(
+        1, network=cluster.compose.network_name(), target_service=leader_svc, cid_base=_next_cid_base(),
+        timeout_s=180, mode="produce_subscribe", topics="multi:1:3", sub_partitions=3, records=30, keys=18,
+        expect=30, acks="all", expect_own=True, timeout_ms=_CONNECT_MS, connect_retries=0,
+        subscribe_ms=60000, start_stagger_ms=_STAGGER_MS, **{"from": "earliest"})
+    assert post.ok and len(post.all_produced) == 30, "post-heal round trip failed:\n" + "\n".join(
+        c.raw[-1200:] for c in post.clients)
+    assert_single_leader(cluster)
+
+
 @pytest.mark.fault
 @pytest.mark.netem
-def test_dr11_asymmetric_one_way_partition_placeholder(fresh_cluster, netem_ready):
-    """LINUX-CI-ONLY PLACEHOLDER: one-way asymmetric partition.
+@pytest.mark.timeout(600)
+@pytest.mark.parametrize("direction", ["leader_deaf_to_follower", "follower_deaf_to_leader"])
+def test_dr11_asymmetric_one_way_partition(fresh_cluster, netem_ready, direction):
+    """One-way partition between the leader L and one follower F; the third node G stays fully connected.
 
-    Intent: install iptables DROP rules so A→B packets are delivered but B→A
-    packets are dropped.  The leader can send to the follower but receives no
-    ACKs back; the follower receives heartbeats but its replication ACKs are lost.
-    This exercises a scenario where the leader's view of the ISR is inconsistent
-    with the follower's view — a subtle split-brain risk.
+    * ``leader_deaf_to_follower``: L drops everything FROM F (F still receives L's heartbeats and data, its
+      acks / fetches never reach L) — L's view of F's progress freezes while F believes it is in sync.
+    * ``follower_deaf_to_leader``: F drops everything FROM L (F hears no heartbeat and may campaign; L and G
+      still receive F's vote requests at a higher term) — the classic disruptive-follower case.
 
-    Not implemented as a full-isolation netem partition because that would
-    conflate this with DR-5's portable follower-isolation scenario.
-
-    Requires: per-peer iptables DROP on a Linux host where iptables-in-netns is
-    available and reliable (not Docker Desktop / macOS).
+    L + G (or a re-elected majority) must keep serving acks=All; split-brain is never allowed; after heal F
+    converges and every acknowledged record is delivered exactly once, in order.
     """
-    pytest.skip("asymmetric partition needs iptables — Linux-CI only; see faults.py caveat")
+    cluster = fresh_cluster
+    keys = 4
+    lid, leader_svc = cluster.identify_leader()
+    assert_single_leader(cluster)
+    follower_svc = next(x for x in SERVICES if x != leader_svc)
+
+    pre = _produce(cluster, leader_svc, 1, _next_cid_base(), 50, keys)
+    assert pre.ok and len(pre.all_produced) == 50, "pre-fault produce failed:\n" + pre.clients[0].raw[-1200:]
+
+    try:
+        if direction == "leader_deaf_to_follower":
+            faults.drop_from(cluster, leader_svc, follower_svc)
+        else:
+            faults.drop_from(cluster, follower_svc, leader_svc)
+        # KEPT fixed: the one-way cut must have lasted well past the 300 ms election timeout before the
+        # leadership checks below (observation window: a disruptive election shows here).
+        time.sleep(3.0)
+        assert_single_leader(cluster)   # never two leaders at the highest term, even under the one-way cut
+        mid, served_by = _produce_until_acked(cluster, 100, keys)
+        assert_single_leader(cluster)
+        print(f"\n[DR-11 asym {direction}] initial leader {leader_svc}, batch acked by {served_by}")
+    finally:
+        faults.heal_all(cluster)
+
+    _verify_after_heal(cluster, Results(clients=pre.clients + mid.clients), keys)
 
 
-@pytest.mark.skip(
-    reason=(
-        "partial-quorum partition (leader reaches ONE follower, not the other) "
-        "requires per-peer netem or iptables rules not achievable portably via "
-        "the current eth0-scoped netem helper on Docker Desktop. "
-        "Enable on Linux CI with per-peer traffic shaping. "
-        "See harness/faults.py module docstring."
-    )
-)
 @pytest.mark.fault
 @pytest.mark.netem
-def test_dr11_partial_quorum_partition_placeholder(fresh_cluster, netem_ready):
-    """LINUX-CI-ONLY PLACEHOLDER: partial-quorum partition.
+@pytest.mark.timeout(600)
+def test_dr11_partial_quorum_partition(fresh_cluster, netem_ready):
+    """The leader L loses follower B in BOTH directions; follower A still reaches both L and B.
 
-    Intent: partition traffic so the leader can reach follower-A but not
-    follower-B.  ISR = {leader, follower-A} (2/3, above minIsr); follower-B is
-    isolated.  Tests that:
-      * The leader KEEPS SERVING (2-node majority intact, even though it cannot
-        reach follower-B).
-      * follower-B must NOT see itself as leader (it has no quorum either).
-      * On full heal, follower-B catches up with no committed loss.
-
-    The ``netem()`` helper applies to ALL of eth0, so a node is either fully
-    isolated or fully connected — per-peer granularity is unavailable on Docker
-    Desktop without iptables.
-
-    Requires: per-peer iptables DROP or per-peer-address netem matchall on a
-    Linux host.
+    L + A remain a connected majority, so acks=All must keep being served (by L, or by a leader the majority
+    re-elects if B's campaigns through A move leadership); B alone never leads at the highest term; after heal B
+    catches up with no committed loss.
     """
-    pytest.skip("partial-quorum partition needs per-peer control — Linux-CI only; see faults.py caveat")
+    cluster = fresh_cluster
+    keys = 4
+    lid, leader_svc = cluster.identify_leader()
+    assert_single_leader(cluster)
+    follower_a, follower_b = [x for x in SERVICES if x != leader_svc]
+
+    pre = _produce(cluster, leader_svc, 1, _next_cid_base(), 50, keys)
+    assert pre.ok and len(pre.all_produced) == 50, "pre-fault produce failed:\n" + pre.clients[0].raw[-1200:]
+
+    try:
+        faults.drop_from(cluster, leader_svc, follower_b)
+        faults.drop_to(cluster, leader_svc, follower_b)
+        # KEPT fixed: observation window past the election timeout before the leadership checks.
+        time.sleep(3.0)
+        assert_single_leader(cluster)
+        mid, served_by = _produce_until_acked(cluster, 100, keys)
+        assert_single_leader(cluster)
+        print(f"\n[DR-11 partial-quorum] initial leader {leader_svc}, B={follower_b}, batch acked by {served_by}")
+    finally:
+        faults.heal_all(cluster)
+
+    _verify_after_heal(cluster, Results(clients=pre.clients + mid.clients), keys)
