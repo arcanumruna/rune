@@ -131,7 +131,7 @@ using Snapshot = std::map<std::string, ModelObject>;
     std::ostringstream o;
     o << opName(r.op) << " '" << r.name << "'";
     switch (r.op) {
-    case Op::DefineTopic:  o << (r.typed ? " typed" : " untyped") << (r.transient ? " transient" : " disk"); break;
+    case Op::DefineTopic:  o << (r.typed ? " typed" : " untyped") << (r.transient ? " transient" : " disk") << " rf=" << r.replicationFactor; break;
     case Op::AlterConfig:  o << " key=" << static_cast<int>(r.configKey) << " value=" << r.configValue << " expect=" << r.expectedVersion; break;
     case Op::AlterSchema:  o << (r.schemaOp == SchemaOp::AddField ? " add " : " drop ") << r.field << " expect=" << r.expectedVersion; break;
     case Op::SetCompat:    o << (r.mode == Compat::Forward ? " forward" : " backward") << " expect=" << r.expectedVersion; break;
@@ -281,6 +281,13 @@ public:
         case Op::DefineTopic:
             r.typed = rng() % 100 < 55;
             r.transient = rng() % 100 < 25;
+            {
+                // Spec §5.1/§8: replicationFactor is bounded by 0 (every broker) .. the broker count (3).  rf=3 is NEVER
+                // drawn: the leader also refuses rf > placeable brokers (AdminWorker.cpp, a leader-only rule) while a
+                // broker is catalog-halted, and that knowledge lags, so the model could not predict it.
+                const int16_t rfs[] = {0, 0, 0, 1, 2, -1, 4};   // -1 and 4 are out of range
+                r.replicationFactor = rfs[rng() % 7];
+            }
             break;
         case Op::AlterConfig: {
             r.expectedVersion = versionExpectation_(rng, obj != nullptr ? obj->version : 0);
@@ -331,8 +338,13 @@ public:
             else r.source = kPool[rng() % kPool.size()];
             // A concurrent pair (forceName) builds both plans before either applies: a plan that reads the
             // contended name itself would carry an id the other DDL may retire (a client-side race, not a
-            // catalog rule), so a pair never reads its own name.
-            while (forceName != nullptr && r.source == r.name) r.source = kPool[rng() % kPool.size()];
+            // catalog rule), so a pair never reads its own name: redraw once from the pool minus that name (M6: no
+            // unbounded resample loop).
+            if (forceName != nullptr && r.source == r.name) {
+                std::vector<std::string> pool;
+                for (const auto& n : kPool) if (n != r.name) pool.push_back(n);
+                r.source = pool[rng() % pool.size()];
+            }
             break;
         }
         case Op::DropTopic: case Op::DropView: break;
@@ -420,6 +432,11 @@ private:
                 return std::nullopt;                                            // adoption: the topic gains its schema
             }
             if (foldsOntoLive_(r.name)) return Code::TopicExists;
+            // Spec §5.1/§8: "replicationFactor <= broker count and >= minIsr, explicit errors" (InvalidRequest + detail).
+            // The harness's minIsr is 1, so 0 (every broker) .. 3 pass.  An ADOPTION (an existing untyped topic) never
+            // reaches this check: the existing-topic rules above answer first (production contract AdminWorker.cpp
+            // buildDefine_: the rf check follows the adoption branch).
+            if (r.replicationFactor < 0 || r.replicationFactor > 3) return Code::InvalidRequest;
             return std::nullopt;
         case Op::DropTopic:
             if (obj != nullptr && obj->isView) return Code::InvalidRequest;     // "is a view; use DROP VIEW"

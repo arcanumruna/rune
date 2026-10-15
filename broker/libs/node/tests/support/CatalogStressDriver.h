@@ -551,6 +551,7 @@ private:
             m.keyField = r.typed ? "id" : "";
             if (r.typed) m.blob = CatalogDdlRig::descriptor(r.name);
             m.persistence = persistence;
+            m.replicationFactor = r.replicationFactor;
             m.meta = meta;
             return DdlRequest{std::move(m)};
         }
