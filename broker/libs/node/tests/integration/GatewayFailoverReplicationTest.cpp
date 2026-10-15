@@ -84,6 +84,7 @@
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/node/BrokerNode.h>
+#include "support/TestCluster.h"
 #include "../support/OwnerThreadTestHelpers.h"  // F1: owner-thread replica probes
 #include <rune/node/NodeConfig.h>
 #include <rune/node/ReplicaRegistry.h>
@@ -860,6 +861,14 @@ static std::vector<uint16_t> gr7DiscoverFreePorts(int n) {
     return ports;
 }
 
+/// The test topic (topics exist only through DDL: created through the catalog once the nodes are up).
+inline rune::node::TopicSpec gr7Topic() {
+    rune::node::TopicSpec topic;
+    topic.name           = "gr7topic";
+    topic.partitionCount = 1;
+    return topic;
+}
+
 static rune::node::NodeConfig makeGr7Config(
     int nodeId,
     const fs::path& dataDir,
@@ -893,11 +902,6 @@ static rune::node::NodeConfig makeGr7Config(
         std::to_string(kPorts[static_cast<std::size_t>(nodeId)]);
     cfg.clientEndpoint.streamId = 80;
 
-    rune::node::TopicSpec topic;
-    topic.name           = "gr7topic";
-    topic.partitionCount = 1;
-    topic.topicId        = 0;
-    cfg.topics.push_back(topic);
 
     return cfg;
 }
@@ -941,6 +945,7 @@ TEST(GR7_Integration, LeaderFailover_NoCommittedLoss_GroupCommitReconcile) {
     ASSERT_TRUE(node0->awaitLeader(8s)) << "node0 must converge to a leader";
     ASSERT_TRUE(node1->awaitLeader(8s)) << "node1 must converge to a leader";
     ASSERT_TRUE(node2->awaitLeader(8s)) << "node2 must converge to a leader";
+    ASSERT_EQ(rune::node::test::TestCluster({node0.get(), node1.get(), node2.get()}).defineTopic(gr7Topic()), 0);
 
     std::this_thread::sleep_for(300ms);
 
@@ -1108,6 +1113,7 @@ TEST(GR7_Integration, Rejoin_CatchesUp_NoGap) {
     ASSERT_TRUE(node0->awaitLeader(8s));
     ASSERT_TRUE(node1->awaitLeader(8s));
     ASSERT_TRUE(node2->awaitLeader(8s));
+    ASSERT_EQ(rune::node::test::TestCluster({node0.get(), node1.get(), node2.get()}).defineTopic(gr7Topic()), 0);
 
     std::this_thread::sleep_for(300ms);
 

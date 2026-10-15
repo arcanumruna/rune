@@ -400,7 +400,7 @@ std::vector<int32_t> typesOf(const std::vector<Frame>& f) {
 TEST(CatalogApplierRegression, ProductionSinkEncodesEveryEffectOnTheAdminToControlRingInApplyOrder) {
     using namespace rune::node;
     CatalogRig rig("ap_prod");
-    AdminWorkerAgent agent(rig.schemas, /*replica=*/nullptr, /*selfId=*/1, {1}, AdminDeps{});
+    AdminWorkerAgent agent(rig.schemas, /*selfId=*/1, AdminDeps{});
     rig.restart();
     ASSERT_EQ(rig.applier.replayLocal(rig.replica(), agent.catalogBootEffects()), 0);
     rig.applier.goLive(agent.catalogLiveEffects());
@@ -467,7 +467,7 @@ TEST(CatalogApplierRegression, ProductionSinkEncodesEveryEffectOnTheAdminToContr
 
     // The BOOT sink of the same history posts RECOVERY installs.
     rig.restart();
-    AdminWorkerAgent agent2(rig.schemas, nullptr, 1, {1}, AdminDeps{});
+    AdminWorkerAgent agent2(rig.schemas, 1, AdminDeps{});
     ASSERT_EQ(rig.applier.replayLocal(rig.replica(), agent2.catalogBootEffects()), 11);
     int recoveryInstalls = 0;
     for (const auto& f : drainFailureRing(agent2)) {
@@ -481,7 +481,7 @@ TEST(CatalogApplierRegression, ProductionSinkEncodesEveryEffectOnTheAdminToContr
 TEST(CatalogApplierRegression, ProductionSinkHaltAndRingFullAreNeverDroppedRegression) {
     using namespace rune::node;
     CatalogRig rig("ap_prodfull");
-    AdminWorkerAgent agent(rig.schemas, nullptr, 1, {1}, AdminDeps{});
+    AdminWorkerAgent agent(rig.schemas, 1, AdminDeps{});
     rig.restart();
     ASSERT_EQ(rig.applier.replayLocal(rig.replica(), agent.catalogBootEffects()), 0);
     rig.applier.goLive(agent.catalogLiveEffects());
@@ -699,7 +699,7 @@ TEST(CatalogApplierRegression, OversizeViewEffectHaltsAtItsOffsetAndNeverAbortsR
     // plan carries the output AND the source descriptor: ~190 KB > 128 KiB.
     const auto events = wideScript(2000, /*validate=*/false, /*withView=*/true);
     CatalogRig rig("ap_bigview");
-    AdminWorkerAgent agent(rig.schemas, nullptr, 1, {1}, AdminDeps{});
+    AdminWorkerAgent agent(rig.schemas, 1, AdminDeps{});
     rig.restart();
     ASSERT_EQ(rig.applier.replayLocal(rig.replica(), agent.catalogBootEffects()), 0);
     ASSERT_TRUE(rig.applier.goLive(agent.catalogLiveEffects()));
@@ -725,7 +725,7 @@ TEST(CatalogApplierRegression, OversizeViewEffectHaltsAtItsOffsetAndNeverAbortsR
     EXPECT_EQ(h.offset, 1);
     // A restart halts at the same offset again (never checkpointed → re-applied live → halts).
     rig.restart();
-    AdminWorkerAgent agent2(rig.schemas, nullptr, 1, {1}, AdminDeps{});
+    AdminWorkerAgent agent2(rig.schemas, 1, AdminDeps{});
     ASSERT_EQ(rig.applier.replayLocal(rig.replica(), agent2.catalogBootEffects()), 1);
     ASSERT_TRUE(rig.applier.goLive(agent2.catalogLiveEffects()));
     EXPECT_EQ(rig.applier.applyCommitted(rig.replica()), 0);
@@ -738,7 +738,7 @@ TEST(CatalogApplierRegression, OversizeValidatorHaltsAtItsOffsetAndNeverAbortsRe
     // ~3000 fields x ~46 B ≈ 140 KB materialized: its validator frame exceeds 128 KiB.
     const auto events = wideScript(3000, /*validate=*/true, /*withView=*/false);
     CatalogRig rig("ap_bigval");
-    AdminWorkerAgent agent(rig.schemas, nullptr, 1, {1}, AdminDeps{});
+    AdminWorkerAgent agent(rig.schemas, 1, AdminDeps{});
     rig.restart();
     ASSERT_EQ(rig.applier.replayLocal(rig.replica(), agent.catalogBootEffects()), 0);
     ASSERT_TRUE(rig.applier.goLive(agent.catalogLiveEffects()));
@@ -760,7 +760,7 @@ TEST(CatalogApplierRegression, LeaderDryRunRefusesAnEventWhoseEffectsCannotBePos
     using namespace rune::node;
     {
         SchemaRegistry reg;
-        AdminWorkerAgent agent(reg, nullptr, 1, {1}, AdminDeps{});
+        AdminWorkerAgent agent(reg, 1, AdminDeps{});
         EXPECT_EQ(catalogEffectMaxFrame(), static_cast<std::size_t>(agent.failureRing().maxMsgLength()))
             << "the leader's gate and the follower's sink use one frame limit";
     }
@@ -817,7 +817,7 @@ TEST(CatalogApplierRegression, CoalescedBootSurvivesAHistoryLargerThanTheBacklog
     for (const auto& e : events) rig.appendEventCommitted(e);
     ASSERT_EQ(rig.applier.applyCommitted(rig.replica()), static_cast<int>(events.size()));   // checkpoint at the end
     rig.restart();
-    AdminWorkerAgent agent(rig.schemas, nullptr, 1, {1}, AdminDeps{});
+    AdminWorkerAgent agent(rig.schemas, 1, AdminDeps{});
     // Nothing drains the ring during the boot replay (it runs before the admin thread).
     ASSERT_EQ(rig.applier.replayLocal(rig.replica(), agent.catalogBootEffects()), static_cast<int>(events.size()));
     EXPECT_FALSE(rig.applier.halted());
@@ -831,7 +831,7 @@ TEST(CatalogApplierRegression, CoalescedBootSurvivesAHistoryLargerThanTheBacklog
 TEST(CatalogApplierRegression, EffectBacklogGrowsInsteadOfAbortingAndDrainsInOrderRegression) {
     using namespace rune::node;
     CatalogRig rig("ap_backlog");
-    AdminWorkerAgent agent(rig.schemas, nullptr, 1, {1}, AdminDeps{});
+    AdminWorkerAgent agent(rig.schemas, 1, AdminDeps{});
     rig.restart();
     ASSERT_EQ(rig.applier.replayLocal(rig.replica(), agent.catalogBootEffects()), 0);
     ASSERT_TRUE(rig.applier.goLive(agent.catalogLiveEffects()));
@@ -1113,7 +1113,7 @@ TEST(CatalogApplierRegression, AdminWorkerAdoptsOnlyABootedApplierAndGoesLiveOnI
     rune::node::SchemaRegistry schemas;
     rune::node::ViewRegistry views;
     rune::node::AdminDeps deps;
-    rune::node::AdminWorker worker(schemas, nullptr, 0, {}, deps, nullptr, &views);
+    rune::node::AdminWorker worker(schemas, 0, deps, &views);
 
     rune::node::CatalogApplier unbooted(rig.catalogDir(), schemas, views);
     EXPECT_THROW(worker.adoptBootedApplier(std::move(unbooted), rune::node::LiveEffects{}), std::runtime_error)

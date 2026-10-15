@@ -21,7 +21,7 @@ uint64_t openSegmentsFor(const TopicSpec& t) noexcept {
 }
 } // namespace
 
-uint64_t estimateFdNeed(const std::vector<TopicSpec>& topics, uint64_t readySegmentsPerPartition) noexcept {
+uint64_t estimateFdNeed(std::span<const TopicSpec> topics, uint64_t readySegmentsPerPartition) noexcept {
     uint64_t need = kBaseFds + kInternalPartitionsReserve * fdsPerPartition(kDefaultOpenSegments);
     for (const auto& t : topics) {
         const uint64_t parts = t.partitionCount > 0 ? static_cast<uint64_t>(t.partitionCount) : 0;
@@ -64,7 +64,7 @@ FdLimitDecision decideFdLimit(uint64_t soft, uint64_t hard, bool unlimited, uint
     return d;
 }
 
-bool applyFdLimitAtStartup(const NodeConfig& cfg, std::string& error) {
+bool applyFdLimitAtStartup(const NodeConfig& cfg, std::span<const TopicSpec> topics, std::string& error) {
     struct ::rlimit rl{};
     if (::getrlimit(RLIMIT_NOFILE, &rl) != 0) {
         spdlog::warn("rune-broker: getrlimit(RLIMIT_NOFILE) failed: {} — open-file budget not checked",
@@ -72,7 +72,7 @@ bool applyFdLimitAtStartup(const NodeConfig& cfg, std::string& error) {
         return true;
     }
     const bool unlimited = rl.rlim_max == RLIM_INFINITY;
-    const uint64_t need = estimateFdNeed(cfg.topics, static_cast<uint64_t>(cfg.segmentProvisionDepth));
+    const uint64_t need = estimateFdNeed(topics, static_cast<uint64_t>(cfg.segmentProvisionDepth));
     const FdLimitDecision d = decideFdLimit(static_cast<uint64_t>(rl.rlim_cur),
                                             static_cast<uint64_t>(rl.rlim_max), unlimited, need);
     if (d.verdict == FdLimitVerdict::Refuse) {

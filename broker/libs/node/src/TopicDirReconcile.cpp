@@ -195,8 +195,7 @@ void settleClaimedDirs(const fs::path& dataDir, const fs::path& topicsRoot, cons
 } // namespace
 
 TopicDirReconciliation reconcileTopicDirs(const std::string& dataDirStr, const std::vector<TopicSpec>& catalogTopics,
-                                          std::span<const int32_t> droppedIds, int64_t nowUnixSeconds,
-                                          const std::vector<TopicSpec>& staticTopics) {
+                                          std::span<const int32_t> droppedIds, int64_t nowUnixSeconds) {
     TopicDirReconciliation result;
     const fs::path dataDir{dataDirStr};
     std::error_code ec;
@@ -213,9 +212,8 @@ TopicDirReconciliation reconcileTopicDirs(const std::string& dataDirStr, const s
     if (!haveTopics) return result;
 
     auto claimed = [&](const std::string& n) {
-        for (const auto* list : {&catalogTopics, &staticTopics})
-            for (const TopicSpec& t : *list)
-                if (t.name == n || topicNamesFoldEqual(t.name, n)) return true;
+        for (const TopicSpec& t : catalogTopics)
+            if (t.name == n || topicNamesFoldEqual(t.name, n)) return true;
         return false;
     };
 
@@ -359,35 +357,6 @@ void warnRetiredCatalogDirs(const std::string& dataDir) {
             spdlog::warn("retired catalog dir {} ignored — __catalog is the catalog (no migration); topics "
                          "recorded only there are not recovered", rdir.string());
     }
-}
-
-std::optional<std::string> staticCatalogCollision(const std::vector<TopicSpec>& statics,
-                                                  const std::vector<TopicSpec>& catalogTopics,
-                                                  std::span<const int32_t> catalogDroppedIds) {
-    auto staticId = [&](std::size_t i) {
-        return statics[i].topicId >= 0 ? statics[i].topicId : static_cast<int32_t>(i);
-    };
-    auto refusal = [](const TopicSpec& s, int32_t sid, const TopicSpec& c, const char* how) {
-        return "static RUNE_TOPICS topic '" + rune::catalog::escapeNameForLog(s.name) + "' (id " + std::to_string(sid) +
-               ") collides " + how + " with the catalog topic '" + rune::catalog::escapeNameForLog(c.name) +
-               "' (id " + std::to_string(c.topicId) +
-               ") — a static topic would take the catalog topic's directory or id; refusing to start (remove it "
-               "from RUNE_TOPICS: create every topic by DDL)";
-    };
-    for (std::size_t i = 0; i < statics.size(); ++i)
-        for (const TopicSpec& c : catalogTopics)
-            if (statics[i].name == c.name || topicNamesFoldEqual(statics[i].name, c.name))
-                return refusal(statics[i], staticId(i), c, "by name");
-    for (std::size_t i = 0; i < statics.size(); ++i)
-        for (const TopicSpec& c : catalogTopics)
-            if (staticId(i) == c.topicId) return refusal(statics[i], staticId(i), c, "by topic id");
-    for (std::size_t i = 0; i < statics.size(); ++i)
-        if (std::find(catalogDroppedIds.begin(), catalogDroppedIds.end(), staticId(i)) != catalogDroppedIds.end())
-            return "static RUNE_TOPICS topic '" + rune::catalog::escapeNameForLog(statics[i].name) + "' (id " +
-                   std::to_string(staticId(i)) + ") collides by topic id with a topic the catalog dropped (id " +
-                   std::to_string(staticId(i)) + ") — the boot would drop the static topic; refusing to start "
-                   "(remove it from RUNE_TOPICS: create every topic by DDL)";
-    return std::nullopt;
 }
 
 } // namespace rune::node

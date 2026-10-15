@@ -24,6 +24,7 @@
 // Regression): with RF = cluster size, an in-process sole-ISR partition needs
 // every follower down, which in a 3-node cluster also loses the consensus
 // quorum the hand-off itself needs.
+#include "support/TestCluster.h"
 #include "support/OwnerThreadTestHelpers.h"
 #include "support/ShardTestClient.h"
 
@@ -133,9 +134,13 @@ NodeConfig makeConfig(int nodeId, const fs::path& dataDir, const Ports& p) {
     }
     cfg.clientEndpoint.channel  = gatewayChannel(p, nodeId);
     cfg.clientEndpoint.streamId = kClientStream;
-    TopicSpec t; t.name = "cs"; t.partitionCount = kParts; t.topicId = 0;
-    cfg.topics.push_back(t);
     return cfg;
+}
+
+/// The test topic, created by DDL once every node is up (topics exist only through the catalog).
+int32_t defineTestTopic(const std::array<std::unique_ptr<BrokerNode>, 3>& ns) {
+    TopicSpec t; t.name = "cs"; t.partitionCount = kParts;
+    return rune::node::test::TestCluster({ns[0].get(), ns[1].get(), ns[2].get()}).defineTopic(t);
 }
 
 template <typename F>
@@ -306,6 +311,7 @@ TEST(ControlledShutdownRegression, NonControllerGracefulStopHandsEveryPartitionO
         ns[static_cast<std::size_t>(i)]->start();
     }
     for (auto& n : ns) ASSERT_TRUE(n->awaitLeader(30s));
+    ASSERT_EQ(defineTestTopic(ns), 0);
     ASSERT_TRUE(eventually([&] { return spreadAndSettled(ns); }, 60'000ms)) << "leadership never spread";
 
     const int controller = consensusLeaderOnControl(*ns[0]);
@@ -383,6 +389,7 @@ TEST(ControlledShutdownRegression, ControllerGracefulStopHandsConsensusAndPartit
         ns[static_cast<std::size_t>(i)]->start();
     }
     for (auto& n : ns) ASSERT_TRUE(n->awaitLeader(30s));
+    ASSERT_EQ(defineTestTopic(ns), 0);
     ASSERT_TRUE(eventually([&] { return spreadAndSettled(ns); }, 60'000ms)) << "leadership never spread";
 
     const int victim = consensusLeaderOnControl(*ns[0]);
@@ -462,6 +469,7 @@ TEST(ControlledShutdownRegression, GracefullyStoppedNodeRestartsAndLeadsAgainReg
         ns[static_cast<std::size_t>(i)]->start();
     }
     for (auto& n : ns) ASSERT_TRUE(n->awaitLeader(30s));
+    ASSERT_EQ(defineTestTopic(ns), 0);
     ASSERT_TRUE(eventually([&] { return spreadAndSettled(ns); }, 60'000ms)) << "leadership never spread";
     const int controller = consensusLeaderOnControl(*ns[0]);
     const int victim = (controller + 1) % 3;
@@ -498,6 +506,7 @@ TEST(ControlledShutdownRegression, WipedDataDirRestartRejoinsRegression) {
         ns[static_cast<std::size_t>(i)]->start();
     }
     for (auto& n : ns) ASSERT_TRUE(n->awaitLeader(30s));
+    ASSERT_EQ(defineTestTopic(ns), 0);
     ASSERT_TRUE(eventually([&] { return spreadAndSettled(ns); }, 60'000ms)) << "leadership never spread";
     const int controller = consensusLeaderOnControl(*ns[0]);
     const int victim = (controller + 1) % 3;
@@ -527,6 +536,7 @@ TEST(ControlledShutdownRegression, ControllerCrashMidHandOffRegression) {
         ns[static_cast<std::size_t>(i)]->start();
     }
     for (auto& n : ns) ASSERT_TRUE(n->awaitLeader(30s));
+    ASSERT_EQ(defineTestTopic(ns), 0);
     ASSERT_TRUE(eventually([&] { return spreadAndSettled(ns); }, 60'000ms)) << "leadership never spread";
     const int controller = consensusLeaderOnControl(*ns[0]);
     const int victim = (controller + 1) % 3;
@@ -566,6 +576,7 @@ TEST(ControlledShutdownRegression, TwoNodesStoppingAtOnceRegression) {
         ns[static_cast<std::size_t>(i)]->start();
     }
     for (auto& n : ns) ASSERT_TRUE(n->awaitLeader(30s));
+    ASSERT_EQ(defineTestTopic(ns), 0);
     ASSERT_TRUE(eventually([&] { return spreadAndSettled(ns); }, 60'000ms)) << "leadership never spread";
     const int controller = consensusLeaderOnControl(*ns[0]);
     const int a = (controller + 1) % 3, b = (controller + 2) % 3;
@@ -605,6 +616,7 @@ TEST(ControlledShutdownRegression, ControllerPlainStopHaltsDecisionsAndHandsOffR
         ns[static_cast<std::size_t>(i)]->start();
     }
     for (auto& n : ns) ASSERT_TRUE(n->awaitLeader(30s));
+    ASSERT_EQ(defineTestTopic(ns), 0);
     ASSERT_TRUE(eventually([&] { return spreadAndSettled(ns); }, 60'000ms)) << "leadership never spread";
     const int c = consensusLeaderOnControl(*ns[0]);
     const int s1 = (c + 1) % 3, s2 = (c + 2) % 3;
@@ -652,6 +664,7 @@ TEST(ControlledShutdownRegression, TestClientIdleBeyondTheSessionLeaseKeepsItsSe
         ns[static_cast<std::size_t>(i)]->start();
     }
     for (auto& n : ns) ASSERT_TRUE(n->awaitLeader(30s));
+    ASSERT_EQ(defineTestTopic(ns), 0);
 
     ShardTestClient c(cd.path);
     c.keepSessionsAlive(true);

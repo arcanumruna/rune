@@ -675,8 +675,7 @@ TEST(ProduceValidationRegression, SchemaUpdateEnqueuedOnlyByControlThreadRegress
     const std::vector<uint8_t> blob = rune::codec::serialize(desc);
 
     SchemaRegistry sreg;
-    rune::node::AdminWorkerAgent agent(sreg, /*replica=*/nullptr, /*selfId=*/1, {1},
-                                       rune::node::AdminDeps{});
+    rune::node::AdminWorkerAgent agent(sreg, /*selfId=*/1, rune::node::AdminDeps{});
     rune::metadata::ShardRouter router(2);
     rune::node::WorkerPool pool(2, router, /*ingressRingBytes=*/1 << 20);
     rune::node::SchemaFanout fanout;

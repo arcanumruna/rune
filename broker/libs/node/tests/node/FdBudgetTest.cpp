@@ -3,6 +3,8 @@
 #include <gtest/gtest.h>
 #include <rune/node/FdBudget.h>
 
+#include <vector>
+
 using namespace rune::node;
 
 namespace {
@@ -14,26 +16,28 @@ TopicSpec topic(int32_t partitions, int64_t retentionBytes = -1, int64_t roll = 
     t.segmentRollBytes = roll;
     return t;
 }
+// estimateFdNeed takes a span (F6): the catalog boot's topics; a braced list is spelled as a vector here.
+uint64_t needOf(const std::vector<TopicSpec>& t, uint64_t ready = 0) { return estimateFdNeed(t, ready); }
 constexpr uint64_t kInternal = kInternalPartitionsReserve * (kDefaultOpenSegments * kFdsPerSegment + kE1dFdsPerLog);
 } // namespace
 
 TEST(FdBudgetRegression, EstimateCountsSegmentsAndE1dFdsPerPartition) {
     // Unbounded retention: the default open-segment floor.
-    EXPECT_EQ(estimateFdNeed({topic(300)}),
+    EXPECT_EQ(needOf({topic(300)}),
               kBaseFds + kInternal + 300 * (kDefaultOpenSegments * kFdsPerSegment + kE1dFdsPerLog));
     // Bounded retention: ceil(retention / roll) retained + the active segment.
-    EXPECT_EQ(estimateFdNeed({topic(10, 10 * 64LL * 1024 * 1024 + 1)}),
+    EXPECT_EQ(needOf({topic(10, 10 * 64LL * 1024 * 1024 + 1)}),
               kBaseFds + kInternal + 10 * ((11 + 1) * kFdsPerSegment + kE1dFdsPerLog));
-    EXPECT_EQ(estimateFdNeed({topic(2), topic(3)}),
+    EXPECT_EQ(needOf({topic(2), topic(3)}),
               kBaseFds + kInternal + 5 * (kDefaultOpenSegments * kFdsPerSegment + kE1dFdsPerLog));
-    EXPECT_EQ(estimateFdNeed({}), kBaseFds + kInternal);
+    EXPECT_EQ(needOf({}), kBaseFds + kInternal);
 }
 
 // hotpath-A review M3: the provisioner's READY segments are budgeted too.
 TEST(FdBudgetRegression, EstimateCountsProvisionerReadySegmentsRegression) {
-    EXPECT_EQ(estimateFdNeed({topic(300)}, /*ready=*/2),
+    EXPECT_EQ(needOf({topic(300)}, /*ready=*/2),
               kBaseFds + kInternal + 300 * ((kDefaultOpenSegments + 2) * kFdsPerSegment + kE1dFdsPerLog));
-    EXPECT_EQ(estimateFdNeed({topic(300)}, 0), estimateFdNeed({topic(300)}));
+    EXPECT_EQ(needOf({topic(300)}, 0), needOf({topic(300)}));
 }
 
 TEST(FdBudgetRegression, SoftIsRaisedToHard) {
@@ -46,7 +50,7 @@ TEST(FdBudgetRegression, SoftIsRaisedToHard) {
 
 TEST(FdBudgetRegression, RefusesWhenHardLimitBelowNeed) {
     // systemd's old default hard limit (4096) cannot hold ~300 partitions.
-    const uint64_t need = estimateFdNeed({topic(300)});
+    const uint64_t need = needOf({topic(300)});
     const auto d = decideFdLimit(1024, 4096, false, need);
     EXPECT_EQ(d.verdict, FdLimitVerdict::Refuse);
     EXPECT_NE(d.message.find("LimitNOFILE"), std::string::npos) << "the error must say how to fix it: " << d.message;

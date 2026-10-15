@@ -18,12 +18,6 @@
 //   RUNE_CATALOG_REPL_STREAM_ID — int32, default 30. Stream of the __catalog replication plane
 //                            (distinct from the replication stream and the per-worker range).
 //   RUNE_DATA_DIR          — filesystem path for durable data. Required, non-empty.
-//   RUNE_TOPICS            — comma-separated name:partitionCount topic declarations (GB-1).
-//                            Optional (absent or empty → no topics; produce/subscribe
-//                            will return UnknownTopic).
-//                            Example: "inventory:8,entities:4,chat:1"
-//                            Names must be unique, non-empty; partitionCount >= 1.
-//                            topicId is the 0-based index in declaration order.
 //
 // Election timing (all optional; defaults are fast-but-safe for co-located clusters):
 //   RUNE_ELECTION_TIMEOUT_MS        — int64 ms, default 150. Max wait per election round.
@@ -58,14 +52,14 @@
 namespace rune::node {
 
 // ---------------------------------------------------------------------------
-// TopicSpec — one declared topic (GB-1).
-// topicId is the 0-based declaration index assigned by parseNodeConfig.
+// TopicSpec — the internal description of one topic (what TopicRegistry and the catalog boot build from).
+// Topics are created by DDL; topicId is the catalog's topic id.
 // ---------------------------------------------------------------------------
 struct TopicSpec {
     std::string name;
     int32_t     partitionCount = 1;
     int32_t     topicId        = -1;
-    /// Replicas per partition (RUNE_TOPICS `rf=N`); 0 = every node (the
+    /// Replicas per partition (DDL replicationFactor); 0 = every node (the
     /// default).  Clamped to the cluster size.
     int16_t     replicationFactor = 0;
     enum class CleanupPolicy : uint8_t { Delete = 0, Compact = 1, CompactDelete = 2 };
@@ -253,11 +247,6 @@ struct NodeConfig {
     }
     [[nodiscard]] bool shardMode() const noexcept { return workerMode == WorkerMode::Shard; }
     [[nodiscard]] bool fused() const noexcept { return runtimePlacement == RuntimePlacement::Fused; }
-
-    // Topics declared via RUNE_TOPICS (GB-1).
-    // Empty when RUNE_TOPICS is absent or empty — valid state (no topics).
-    // topicId == index in this vector.
-    std::vector<TopicSpec> topics;
 
     // Election timing — configurable via env (BR-3b).
     // Defaults are fast-but-safe for co-located / test clusters.
@@ -963,7 +952,7 @@ struct ConfigResult {
     std::optional<NodeConfig> config;
     std::string               error;
     // Non-fatal, one line each, logged by the caller (main) at startup — e.g. a
-    // deprecated RUNE_TOPICS spelling (Phase 2b E: persistence=memory).
+    // a deprecated spelling.
     std::vector<std::string>  warnings;
 };
 

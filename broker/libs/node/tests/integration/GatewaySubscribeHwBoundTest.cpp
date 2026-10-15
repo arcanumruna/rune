@@ -59,6 +59,7 @@
 #include <rune/node/EmbeddedDriver.h>
 #include "../support/OwnerThreadTestHelpers.h"  // F1: owner-thread replica probes
 #include <rune/node/NodeConfig.h>
+#include "support/TestCluster.h"
 #include "support/TestWorkerCount.h"
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/node/ReplicationMetadataBridge.h>
@@ -670,6 +671,14 @@ static std::vector<uint16_t> gr6DiscoverFreePorts(int n) {
     return ports;
 }
 
+/// The test topic (topics exist only through DDL: created through the catalog once the nodes are up).
+inline rune::node::TopicSpec gr6Topic() {
+    rune::node::TopicSpec topic;
+    topic.name           = "gr6topic";
+    topic.partitionCount = 1;
+    return topic;
+}
+
 static rune::node::NodeConfig makeGr6Config(
     int nodeId, const fs::path& dataDir,
     const std::vector<uint16_t>& cPorts,
@@ -701,11 +710,6 @@ static rune::node::NodeConfig makeGr6Config(
         std::to_string(kPorts[static_cast<std::size_t>(nodeId)]);
     cfg.clientEndpoint.streamId = 51;
 
-    rune::node::TopicSpec topic;
-    topic.name           = "gr6topic";
-    topic.partitionCount = 1;
-    topic.topicId        = 0;
-    cfg.topics.push_back(topic);
 
     cfg.workerCount = rune::node::test::workerCountFromEnv();
 
@@ -791,6 +795,7 @@ TEST(GR6_Integration, SubscriberBoundedByHW_FullyReplicated) {
     ASSERT_TRUE(node0.awaitLeader(8s)) << "node0 did not find a leader";
     ASSERT_TRUE(node1.awaitLeader(8s)) << "node1 did not find a leader";
     ASSERT_TRUE(node2.awaitLeader(8s)) << "node2 did not find a leader";
+    ASSERT_EQ(rune::node::test::TestCluster({&node0, &node1, &node2}).defineTopic(gr6Topic()), 0);
     std::this_thread::sleep_for(300ms);
 
     const rune::consensus::NodeId lid = node0.leaderId();

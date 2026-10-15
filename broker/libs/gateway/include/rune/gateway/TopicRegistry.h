@@ -226,7 +226,7 @@ private:
         std::vector<PartitionEntry> partitions;   // size == spec.partitionCount
     };
     // One state per slot (hard rule 3), each holding exactly what it needs:
-    //   Static  — a static RUNE_TOPICS topic, built by the constructor (until Task 17);
+    //   Static  — a topic handed to the constructor (library tests; the broker builds none: topics are created by DDL);
     //   Serving — a catalog topic (createTopicAt): serves once its placement commits;
     //   Pending — applied, waiting behind the drop of its name: the name only;
     //   Gap     — an id this broker has not seen: nothing;

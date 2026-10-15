@@ -2,6 +2,7 @@
 // → gateway (Connect) → worker shard ingress (Produce) → worker replication plane
 // → ProduceResponse.  Legacy default must build no shard runtime.
 #include <algorithm>
+#include "support/TestCluster.h"
 #include "support/OwnerThreadTestHelpers.h"
 #include "support/ShardTestClient.h"
 
@@ -116,9 +117,16 @@ NodeConfig makeShardConfig(int nodeId, const fs::path& dataDir, const ShardPorts
     }
     cfg.clientEndpoint.channel  = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(p.client[nodeId]);
     cfg.clientEndpoint.streamId = kClientStream;
-    TopicSpec t; t.name = "st"; t.partitionCount = 1; t.topicId = 0;
-    cfg.topics.push_back(t);
     return cfg;
+}
+
+/// The test topic "st" (topics exist only through DDL: defined through the catalog once the nodes are up).
+TopicSpec shardTopic(int32_t partitions = 1) {
+    TopicSpec t; t.name = "st"; t.partitionCount = partitions;
+    return t;
+}
+int32_t defineShardTopic(std::vector<BrokerNode*> nodes, int32_t partitions = 1) {
+    return rune::node::test::TestCluster(std::move(nodes)).defineTopic(shardTopic(partitions));
 }
 
 std::string gatewayChannel(const ShardPorts& p, int node) {
@@ -165,6 +173,7 @@ TEST(ShardMode, SingleNodeProduceRoundTripOnWorkerShard) {
     BrokerNode node{cfg};
     node.start();
     ASSERT_TRUE(node.awaitLeader(10'000ms));
+    ASSERT_EQ(defineShardTopic({&node}), 0);
     EXPECT_EQ(node.shardDriverCountForTest(), 1u);
     EXPECT_TRUE(fs::exists(fs::path(cfg.effectiveAeronDir()) / "w0" / "cnc.dat"));
     {
@@ -188,6 +197,7 @@ TEST(ShardMode, ThreeNodeAcksAllCommitsOverShardReplicationPlanes) {
     BrokerNode n2{makeShardConfig(2, d2.path, ports, 3, 1, false)};
     n0.start(); n1.start(); n2.start();
     ASSERT_TRUE(n0.awaitLeader(15'000ms));
+    ASSERT_EQ(defineShardTopic({&n0, &n1, &n2}), 0);
     int32_t leader = -1;
     {
         ShardTestClient c(cdir.path);
@@ -223,6 +233,7 @@ TEST(ShardModeRegression, FusedWorkerZeroSharesTheRuntimeDriverRegression) {
     BrokerNode node{cfg};
     node.start();
     ASSERT_TRUE(node.awaitLeader(10'000ms));
+    ASSERT_EQ(defineShardTopic({&node}), 0);
     EXPECT_EQ(node.shardDriverCountForTest(), 0u)
         << "worker 0 must not own a second driver: it shares the runtime's";
     EXPECT_FALSE(fs::exists(fs::path(cfg.effectiveAeronDir()) / "w0" / "cnc.dat"));
@@ -245,6 +256,7 @@ TEST(ShardModeRegression, FusedTwoWorkersOwnOneExtraDriverRegression) {
     BrokerNode node{cfg};
     node.start();
     ASSERT_TRUE(node.awaitLeader(10'000ms));
+    ASSERT_EQ(defineShardTopic({&node}), 0);
     EXPECT_EQ(node.shardDriverCountForTest(), 1u) << "worker 1 owns its driver; worker 0 shares the runtime's";
     node.stop();
     EXPECT_EQ(node.shardDriverCountForTest(), 0u);
@@ -258,6 +270,7 @@ TEST(ShardModeRegression, FusedThreeNodeAcksAllCommitsRegression) {
     BrokerNode n2{makeShardConfig(2, d2.path, ports, 3, 1, true)};
     n0.start(); n1.start(); n2.start();
     ASSERT_TRUE(n0.awaitLeader(15'000ms));
+    ASSERT_EQ(defineShardTopic({&n0, &n1, &n2}), 0);
     EXPECT_EQ(n0.shardDriverCountForTest() + n1.shardDriverCountForTest() + n2.shardDriverCountForTest(), 0u);
     int32_t leader = -1;
     {
@@ -340,6 +353,7 @@ TEST(ShardModeRegression, NonWorkerThreadsPinnedOffTheWorkerCoresRegression) {
     node.start();
     EXPECT_EQ(currentThreadCpus(), allowed) << "start() must restore the caller's mask";
     ASSERT_TRUE(node.awaitLeader(10'000ms));
+    ASSERT_EQ(defineShardTopic({&node}), 0);
     // Runs on worker 0 (owner of st/0) after its pass prologue re-pinned it.
     // D34: the box saw the full mask here once (1 of 4 -j3 runs, not reproduced locally) — name the
     // executing thread so the next failure says WHERE the task ran.
@@ -384,6 +398,7 @@ TEST(ShardModeRegression, ControlPlaneThreadsUseTheParkShapeRegression) {
     BrokerNode node{cfg};
     node.start();
     ASSERT_TRUE(node.awaitLeader(10'000ms));
+    ASSERT_EQ(defineShardTopic({&node}), 0);
     const auto shapeOf = [](const rune::consensus::IdleStrategy* i) {
         const auto* b = dynamic_cast<const rune::consensus::BackoffIdleStrategy*>(i);
         EXPECT_NE(b, nullptr) << "a backoff idle (never busy-spin by default)";
@@ -409,6 +424,7 @@ TEST(ShardModeRegression, LegacyDefaultBuildsNoShardRuntime) {
     BrokerNode node{cfg};
     node.start();
     ASSERT_TRUE(node.awaitLeader(10'000ms));
+    ASSERT_EQ(defineShardTopic({&node}), 0);
     EXPECT_EQ(node.shardDriverCountForTest(), 0u);
     EXPECT_FALSE(fs::exists(fs::path(cfg.effectiveAeronDir()) / "w0"));
     node.stop();
@@ -425,6 +441,7 @@ TEST(ShardModeRegression, StopFromAnotherThreadClosesEveryShardDriver) {
     BrokerNode node{cfg};
     node.start();
     ASSERT_TRUE(node.awaitLeader(10'000ms));
+    ASSERT_EQ(defineShardTopic({&node}), 0);
     ASSERT_EQ(node.shardDriverCountForTest(), 2u);
     std::thread stopper([&] { node.stop(); });
     stopper.join();
@@ -500,7 +517,6 @@ bool leaderBecomes(ShardTestClient& c, const ShardPorts& ports, int64_t sid, int
 NodeConfig asymConfig(int32_t nodeId, const fs::path& dir, const ShardPorts& ports, int nodes,
                       int32_t workers) {
     auto c = makeShardConfig(nodeId, dir, ports, nodes, workers, false);
-    c.topics[0].partitionCount = kAsymPartitions;
     for (auto& p : c.peers) p.workerCount = (p.id == nodeId) ? workers : 0;   // peers unknown at parse
     return c;
 }
@@ -515,6 +531,7 @@ TEST(ShardModeRegression, AsymmetricWorkerCountRefusedAtRuntime) {
     ASSERT_FALSE(c1.validateShardConfig().has_value());
     BrokerNode n0{c0}, n1{c1};
     n0.start(); n1.start();
+    ASSERT_EQ(defineShardTopic({&n0, &n1}, kAsymPartitions), 0);
     ASSERT_TRUE(eventually([&] { return peerState(n0, 0, 1) == PS::Refused; }))
         << "node 0 never refused the 2-worker peer on plane 0";
     ASSERT_TRUE(eventually([&] { return peerState(n1, 0, 0) == PS::Refused; }))
@@ -533,6 +550,7 @@ TEST(ShardModeRegression, PeerRestartStillMismatchedStaysRefused) {
     {
         BrokerNode n1{c1};
         n1.start();
+        ASSERT_EQ(defineShardTopic({&n0, &n1}, kAsymPartitions), 0);
         ASSERT_TRUE(eventually([&] { return peerState(n0, 0, 1) == PS::Refused; }));
         n1.stop();
     }
@@ -594,6 +612,7 @@ TEST(ShardModeRegression, PeerFixedAndRestartedHeals) {
     ASSERT_TRUE(eventually([&] { return peerState(n1, 0, 0) == PS::Verified; }));
     ASSERT_TRUE(eventually([&] { return peerState(n1, 0, 2) == PS::Verified; }));
     ASSERT_TRUE(n0.awaitLeader(15'000ms) || n2.awaitLeader(15'000ms) || n1.awaitLeader(15'000ms));
+    ASSERT_EQ(defineShardTopic({&n0, &n1, &n2}, kAsymPartitions), 0);
     {
         ShardTestClient c(cdir.path);
         const int64_t sid0 = c.connect(gatewayChannel(ports, 0), kClientStream);
@@ -623,6 +642,7 @@ TEST(ShardModeRegression, LargerWorkerCountExtraShardsDoNotSplit) {
     c0.replicaLagMaxMs = c1.replicaLagMaxMs = 500;          // unreachable follower leaves the ISR fast
     BrokerNode n1{c1}, n0{c0};
     n1.start(); n0.start();
+    ASSERT_EQ(defineShardTopic({&n0, &n1}, kAsymPartitions), 0);
     // Pin the scenario: a partition whose static (preferred) leader is node 1 and
     // which node 1 routes to shard 1 — a shard index the 1-worker peer lacks.
     int32_t part = -1;
@@ -660,7 +680,7 @@ TEST(ShardModeRegression, SlowStartupPhaseDoesNotKillShardClient) {
     constexpr int32_t kWorkers = 2;
     const auto ports = ShardPorts::discover(1, kWorkers);
     auto cfg = makeShardConfig(0, dir.path, ports, 1, kWorkers, /*fused=*/false);
-    cfg.topics[0].partitionCount = 8;
+    constexpr int32_t kTopicParts = 8;
     constexpr int64_t kLivenessNs = 2'000'000'000;           // > driver timer interval (1 s)
     cfg.shardClientLivenessTimeoutNs = kLivenessNs;
     BrokerNode node{cfg};
@@ -670,12 +690,13 @@ TEST(ShardModeRegression, SlowStartupPhaseDoesNotKillShardClient) {
     });
     node.start();
     ASSERT_TRUE(node.awaitLeader(10'000ms));
+    ASSERT_EQ(defineShardTopic({&node}, kTopicParts), 0);
     ShardTestClient c(cdir.path);
     const int64_t sid = c.connect(gatewayChannel(ports, 0), kClientStream);
     ASSERT_GT(sid, 0);
     for (int32_t w = 0; w < kWorkers; ++w) {
         int32_t part = -1;
-        for (int32_t p = 0; p < cfg.topics[0].partitionCount && part < 0; ++p)
+        for (int32_t p = 0; p < kTopicParts && part < 0; ++p)
             if (node.workerForPartitionForTest(0, p) == w) part = p;
         ASSERT_GE(part, 0) << "no partition routed to worker " << w;
         EXPECT_FALSE(node.onOwnerThreadForTest(0, part, [&node, w](rune::replication::PartitionReplica*) {
@@ -697,19 +718,20 @@ TEST(ShardModeRegression, SequentialShardResolveKeepsEarlierShardsAlive) {
     constexpr int32_t kWorkers = 3;
     const auto ports = ShardPorts::discover(1, kWorkers);
     auto cfg = makeShardConfig(0, dir.path, ports, 1, kWorkers, /*fused=*/false);
-    cfg.topics[0].partitionCount = 12;
+    constexpr int32_t kTopicParts = 12;
     constexpr int64_t kLivenessNs = 2'000'000'000;           // > driver timer interval (1 s)
     cfg.shardClientLivenessTimeoutNs = kLivenessNs;
     BrokerNode node{cfg};
     node.setShardResolveStallForTest(kWorkers - 1, std::chrono::milliseconds{2 * kLivenessNs / 1'000'000});
     node.start();
     ASSERT_TRUE(node.awaitLeader(10'000ms));
+    ASSERT_EQ(defineShardTopic({&node}, kTopicParts), 0);
     ShardTestClient c(cdir.path);
     const int64_t sid = c.connect(gatewayChannel(ports, 0), kClientStream);
     ASSERT_GT(sid, 0);
     for (int32_t w = 0; w < kWorkers; ++w) {
         int32_t part = -1;
-        for (int32_t p = 0; p < cfg.topics[0].partitionCount && part < 0; ++p)
+        for (int32_t p = 0; p < kTopicParts && part < 0; ++p)
             if (node.workerForPartitionForTest(0, p) == w) part = p;
         ASSERT_GE(part, 0) << "no partition routed to worker " << w;
         EXPECT_FALSE(node.onOwnerThreadForTest(0, part, [&node, w](rune::replication::PartitionReplica*) {
@@ -757,6 +779,7 @@ TEST(ShardModeRegression, StorageFailureHaltsBrokerWithExitCode) {
     node.setHaltHandler(&HaltCapture::handler, &halt);
     node.start();
     ASSERT_TRUE(node.awaitLeader(10'000ms));
+    ASSERT_EQ(defineShardTopic({&node}), 0);
     ShardTestClient c(cdir.path);
     const int64_t sid = c.connect(gatewayChannel(ports, 0), kClientStream);
     ASSERT_GT(sid, 0);
@@ -807,7 +830,15 @@ TEST(ShardModeRegression, NoHaltHandlerExitsWithStorageFailureCode) {
 TEST(ShardModeRegression, StartRefusesWhenALogFailedRecovery) {
     TmpDir dir{"recfail"};
     const auto ports = ShardPorts::discover(1, 1);
-    BrokerNode node{makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/false)};
+    const auto cfg = makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/false);
+    {   // Topics exist only through DDL: a first boot creates the topic whose log then fails recovery.
+        BrokerNode creator{cfg};
+        creator.start();
+        ASSERT_TRUE(creator.awaitLeader(10'000ms));
+        ASSERT_EQ(defineShardTopic({&creator}), 0);
+        creator.stop();
+    }
+    BrokerNode node{cfg};
     HaltCapture halt;
     node.setHaltHandler(&HaltCapture::handler, &halt);
     node.setRecoveryFaultForTest(EIO);
@@ -847,6 +878,7 @@ TEST(ShardMode, MetadataAdvertisesTheLeaderWorkerEndpoint) {
     BrokerNode node{makeShardConfig(0, dir.path, ports, 1, 1, false)};
     node.start();
     ASSERT_TRUE(node.awaitLeader(10'000ms));
+    ASSERT_EQ(defineShardTopic({&node}), 0);
     ShardTestClient c(cdir.path);
     const int64_t sid = c.connect(gatewayChannel(ports, 0), kClientStream);
     ASSERT_GT(sid, 0);
@@ -881,6 +913,7 @@ TEST(ShardModeFusedRegression, ThreadPlacementStillStartsTheRuntimeThread) {
     BrokerNode node{makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/false)};
     node.start();
     ASSERT_TRUE(node.awaitLeader(10'000ms));
+    ASSERT_EQ(defineShardTopic({&node}), 0);
     EXPECT_TRUE(node.runtimeThreadStartedForTest()) << "thread placement = today's behaviour";
     node.stop();
 }
@@ -892,6 +925,7 @@ TEST(ShardModeFusedRegression, SingleNodeRunsRuntimeOnWorkerZero) {
     BrokerNode node{cfg};
     node.start();
     ASSERT_TRUE(node.awaitLeader(10'000ms)) << "consensus must run inside worker 0's loop";
+    ASSERT_EQ(defineShardTopic({&node}), 0);
     EXPECT_FALSE(node.runtimeThreadStartedForTest());
     EXPECT_EQ(node.runtimeConsensusKindForTest(), NodeRuntimeAgent::ConsensusKind::Single)
         << "worker 0's pass must call the concrete consensus agent (no virtual dispatch)";
@@ -926,6 +960,7 @@ TEST(ShardModeFusedRegression, ReturnRingPressureNeverDeadlocksTheFusedLoop) {
     BrokerNode node{cfg};
     node.start();
     ASSERT_TRUE(node.awaitLeader(10'000ms));
+    ASSERT_EQ(defineShardTopic({&node}), 0);
     ShardTestClient c(cdir.path);
     const int64_t sid = c.connect(gatewayChannel(ports, 0), kClientStream);
     ASSERT_GT(sid, 0);
@@ -950,6 +985,7 @@ TEST(ShardModeFusedRegression, ThreeNodeAcksAllCommitsWithFusedRuntimes) {
     BrokerNode n2{makeShardConfig(2, d2.path, ports, 3, 1, /*fused=*/true)};
     n0.start(); n1.start(); n2.start();
     ASSERT_TRUE(n0.awaitLeader(15'000ms)) << "consensus over UDP between three fused runtimes";
+    ASSERT_EQ(defineShardTopic({&n0, &n1, &n2}), 0);
     EXPECT_FALSE(n0.runtimeThreadStartedForTest());
     EXPECT_EQ(n0.runtimeConsensusKindForTest(), NodeRuntimeAgent::ConsensusKind::Multi)
         << "worker 0's pass must call the concrete consensus agent (no virtual dispatch)";
@@ -997,6 +1033,7 @@ TEST(ShardModeFusedRegression, SlowStartupPhaseDoesNotKillTheRuntimeClient) {
     });
     node.start();
     ASSERT_TRUE(node.awaitLeader(10'000ms));
+    ASSERT_EQ(defineShardTopic({&node}), 0);
     ShardTestClient c(cdir.path);
     const int64_t sid = c.connect(gatewayChannel(ports, 0), kClientStream);
     ASSERT_GT(sid, 0) << "the runtime client died during startup (gateway no longer serves)";
@@ -1011,6 +1048,7 @@ TEST(ShardModeFusedRegression, StopFromAnotherThreadClosesTheRuntimeDriver) {
     BrokerNode node{cfg};
     node.start();
     ASSERT_TRUE(node.awaitLeader(10'000ms));
+    ASSERT_EQ(defineShardTopic({&node}), 0);
     std::thread stopper([&] { node.stop(); });
     stopper.join();
     EXPECT_TRUE(runtimeDriverClosed(cfg)) << "runtime driver leaked (debug builds abort)";
@@ -1021,6 +1059,13 @@ TEST(ShardModeFusedRegression, StartFailureStillClosesTheRuntimeDriver) {
     TmpDir dir{"fstartfail"};
     const auto ports = ShardPorts::discover(1, 1);
     const auto cfg = makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/true);
+    {   // Topics exist only through DDL: a first boot creates the topic whose log then fails recovery.
+        BrokerNode creator{cfg};
+        creator.start();
+        ASSERT_TRUE(creator.awaitLeader(10'000ms));
+        ASSERT_EQ(defineShardTopic({&creator}), 0);
+        creator.stop();
+    }
     BrokerNode node{cfg};
     HaltCapture halt;
     node.setHaltHandler(&HaltCapture::handler, &halt);
@@ -1044,6 +1089,7 @@ TEST(ShardModeFusedRegression, RoutingImageIsRepublishedOnlyWhenItsInputsChange)
         BrokerNode node{makeShardConfig(0, dir.path, ports, 1, 1, fused)};
         node.start();
         ASSERT_TRUE(node.awaitLeader(10'000ms));
+    ASSERT_EQ(defineShardTopic({&node}), 0);
         // Condition wait: the committed assignment map has landed and the steady-
         // state image is published (publish count stops moving across a cycle).
         uint64_t before = 0;
@@ -1076,6 +1122,7 @@ TEST(ShardModeFusedRegression, PartitionLeaderFailsOverBetweenFusedRuntimes) {
             makeShardConfig(i, (i == 0 ? d0 : i == 1 ? d1 : d2).path, ports, 3, 1, /*fused=*/true)));
     for (auto& n : nodes) n->start();
     ASSERT_TRUE(nodes[0]->awaitLeader(15'000ms));
+    ASSERT_EQ(defineShardTopic({nodes[0].get(), nodes[1].get(), nodes[2].get()}), 0);
     ShardTestClient c(cdir.path);
     auto leaderSeenBy = [&](int via, int64_t sid) {
         int32_t l = -1;
@@ -1169,8 +1216,6 @@ NodeConfig makeDefaultConfig(int nodeId, const fs::path& dataDir, const ShardPor
     cfg.workerCoreBase              = -1;   // tests never auto-pin busy-spinning workers (ctest -j)
     cfg.clientEndpoint.channel  = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(p.client[nodeId]);
     cfg.clientEndpoint.streamId = kClientStream;
-    TopicSpec t; t.name = "st"; t.partitionCount = 1; t.topicId = 0;
-    cfg.topics.push_back(t);
     return cfg;
 }
 // A record batch of EXACTLY n wire bytes (one record; value length searched).
@@ -1218,6 +1263,11 @@ void runBatchAtExactLimitAcceptedReplicatedAndPushed(int nodes) {
     }
     for (auto& n : ns) n->start();
     ASSERT_TRUE(ns[0]->awaitLeader(15'000ms));
+    {
+        std::vector<BrokerNode*> raw;
+        for (auto& n : ns) raw.push_back(n.get());
+        ASSERT_EQ(defineShardTopic(std::move(raw)), 0);
+    }
     for (auto& n : ns)
         EXPECT_EQ(n->gatewayForTest()->maxProduceBatchBytes(), limit) << "one limit on every node";
 
@@ -1332,6 +1382,7 @@ TEST(ShardModeRegression, WorkerSideAcksEndToEndAndSessionReconnect) {
     BrokerNode node{makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/true)};
     node.start();
     ASSERT_TRUE(node.awaitLeader(10'000ms));
+    ASSERT_EQ(defineShardTopic({&node}), 0);
     {
         ShardTestClient c(cdir.path);
         const int64_t sid1 = c.connect(gatewayChannel(ports, 0), kClientStream);
@@ -1360,6 +1411,7 @@ TEST(ShardModeRegression, WorkerSideAcksEndToEndThreadPlacement) {
     BrokerNode node{makeShardConfig(0, dir.path, ports, 1, 2, /*fused=*/false)};
     node.start();
     ASSERT_TRUE(node.awaitLeader(10'000ms));
+    ASSERT_EQ(defineShardTopic({&node}), 0);
     {
         ShardTestClient c(cdir.path);
         const int64_t sid = c.connect(gatewayChannel(ports, 0), kClientStream);
@@ -1390,11 +1442,11 @@ TEST(ShardModeRegression, AdvertisedIngressRoutesAreLiveForEndpointUnawareAndAwa
     std::vector<std::unique_ptr<BrokerNode>> nodes;
     for (int i = 0; i < kNodes; ++i) {
         auto cfg = makeShardConfig(i, *dirs[i], ports, kNodes, kWorkers, /*fused=*/true);
-        cfg.topics[0].partitionCount = kParts;
         nodes.push_back(std::make_unique<BrokerNode>(cfg));
     }
     for (auto& n : nodes) n->start();
     ASSERT_TRUE(nodes[0]->awaitLeader(15'000ms));
+    ASSERT_EQ(defineShardTopic({nodes[0].get(), nodes[1].get(), nodes[2].get()}, kParts), 0);
     // A9 review M-2 / L-1 (wiring, fused, 2 workers): where worker 0 parks on its doorbell (Linux wake fds),
     // the runtime on worker 0 is woken by worker 1 freeing op / session ring space and by worker 1's returns;
     // worker 0's own ret_ (same thread) gets no space doorbell.  Elsewhere nothing is wired (review M-1).
@@ -1485,6 +1537,7 @@ TEST(ShardModeRegression, SlowEndpointUnawareClientCannotStarveTheShard) {
     BrokerNode node{makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/false)};
     node.start();
     ASSERT_TRUE(node.awaitLeader(10'000ms));
+    ASSERT_EQ(defineShardTopic({&node}), 0);
     const std::string gw = gatewayChannel(ports, 0);
     auto gatewayPauses = [&] {
         return node.onControlThreadForTest([&] { return node.gatewayForTest()->heldProduceAbortsForTest(); });
@@ -1566,6 +1619,7 @@ TEST(ShardModeRegression, KilledPausedClientsSessionAndAcksAreFreedRegression) {
     BrokerNode node{makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/false)};
     node.start();
     ASSERT_TRUE(node.awaitLeader(10'000ms));
+    ASSERT_EQ(defineShardTopic({&node}), 0);
     const std::string gw = gatewayChannel(ports, 0);
     // D11: aborts because a WORKER HOLDS this session's acks — not credit / worker-cap pauses (D8c), which also
     // count in heldProduceAborts but hold nothing: their acks fit the client's egress window.
@@ -1635,6 +1689,7 @@ void runPausedInvokerClientSurvivesNotConnected(uint32_t gatewayProduceCredits) 
     BrokerNode node{cfg};
     node.start();
     ASSERT_TRUE(node.awaitLeader(10'000ms));
+    ASSERT_EQ(defineShardTopic({&node}), 0);
     const std::string gw = gatewayChannel(ports, 0);
     // D11: aborts because a WORKER HOLDS this session's acks — not credit / worker-cap pauses (D8c), which also
     // count in heldProduceAborts but hold nothing: their acks fit the client's egress window.
@@ -1706,6 +1761,7 @@ TEST(ShardModeRegression, PausedInvokerClientResumingWithoutReadingIsFoundNotRea
     BrokerNode node{makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/false)};
     node.start();
     ASSERT_TRUE(node.awaitLeader(10'000ms));
+    ASSERT_EQ(defineShardTopic({&node}), 0);
     const std::string gw = gatewayChannel(ports, 0);
     auto onGw = [&](auto&& f) { return node.onControlThreadForTest([&] { return f(*node.gatewayForTest()); }); };
     auto gatewayPauses = [&] {   // D11: HOLD aborts only (not credit / worker-cap pauses)
@@ -1763,6 +1819,7 @@ TEST(ShardModeRegression, HeldDirectClientRecoveringAfterTheLeaseIsNotReapedOnRe
     BrokerNode node{makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/false)};
     node.start();
     ASSERT_TRUE(node.awaitLeader(10'000ms));
+    ASSERT_EQ(defineShardTopic({&node}), 0);
     const std::string gw = gatewayChannel(ports, 0), direct = workerIngressChannel(ports, 0, 0);
     auto onGw = [&](auto&& f) { return node.onControlThreadForTest([&] { return f(*node.gatewayForTest()); }); };
     auto acksPending = [&] {
@@ -1841,6 +1898,7 @@ void runWorkerPsmDedupEndToEnd(PsmE2eMode mode) {
     BrokerNode node{cfg};
     node.start();
     ASSERT_TRUE(node.awaitLeader(10'000ms));
+    ASSERT_EQ(defineShardTopic({&node}), 0);
     constexpr int64_t kPid = 4242;
     {
         ShardTestClient c(cdir.path);
@@ -1924,6 +1982,7 @@ TEST(WorkerPsmEndToEndRegression, DefaultLegacyConfigDedupsARetryAfterRestart) {
         BrokerNode node{cfg};
         node.start();
         ASSERT_TRUE(node.awaitLeader(10'000ms));
+        ASSERT_EQ(defineShardTopic({&node}), 0);
         {
             ShardTestClient c(cdir1.path);
             const int64_t sid = c.connect(gw, kClientStream);
@@ -1941,7 +2000,7 @@ TEST(WorkerPsmEndToEndRegression, DefaultLegacyConfigDedupsARetryAfterRestart) {
     {
         BrokerNode node{cfg};                                  // a new process image, same data dir
         node.start();
-        ASSERT_TRUE(node.awaitLeader(10'000ms));
+        ASSERT_TRUE(node.awaitLeader(10'000ms));   // the topic comes back from __catalog: nothing is defined again
         {
             ShardTestClient c(cdir2.path);
             const int64_t sid = c.connect(gw, kClientStream);
@@ -1976,6 +2035,7 @@ TEST(ShardModeRegression, StalledDirectClientsCannotStopAnotherDirectClientsInta
     BrokerNode node{cfg};
     node.start();
     ASSERT_TRUE(node.awaitLeader(10'000ms));
+    ASSERT_EQ(defineShardTopic({&node}), 0);
     const std::string gw = gatewayChannel(ports, 0), direct = workerIngressChannel(ports, 0, 0);
     auto onWorker = [&](auto&& f) {
         return node.onOwnerThreadForTest(0, 0, [&](rune::replication::PartitionReplica&) { return f(*node.workerForTest(0)); });
@@ -2098,6 +2158,7 @@ TEST(UnresolvedPeerStartupRegression, NodesStartAndServeWhileAPeerHostnameIsUnre
     ASSERT_NO_THROW(n0.start()) << "a node must start while a peer hostname is unresolvable";
     ASSERT_NO_THROW(n1.start()) << "a node must start while a peer hostname is unresolvable";
     ASSERT_TRUE(n0.awaitLeader(15'000ms) || n1.awaitLeader(15'000ms)) << "no consensus with the resolvable peer";
+    ASSERT_EQ(defineShardTopic({&n0, &n1}, kAsymPartitions), 0);
     // The shard planes of the two live nodes verify each other; node 2 stays
     // unverified (its publication is still Resolving, re-added on each node's passes).
     ASSERT_TRUE(eventually([&] { return peerState(n0, 0, 1) == PS::Verified; }));
@@ -2161,6 +2222,7 @@ TEST(UnresolvedPeerStartupRegression, LatePeerJoinsAfterItsHostnameResolvesRegre
     ASSERT_NO_THROW(n0.start());
     ASSERT_NO_THROW(n1.start());
     ASSERT_TRUE(n0.awaitLeader(15'000ms) || n1.awaitLeader(15'000ms));
+    ASSERT_EQ(defineShardTopic({&n0, &n1}, kAsymPartitions), 0);
 
     int32_t part = -1;
     for (int32_t p = 0; p < kAsymPartitions && part < 0; ++p)
@@ -2222,6 +2284,7 @@ TEST(UnresolvedPeerStartupRegression, ClientReplyHostnameResolvesOffThreadRegres
     });
     node.start();
     ASSERT_TRUE(node.awaitLeader(10'000ms));
+    ASSERT_EQ(defineShardTopic({&node}), 0);
     {
         ShardTestClient c(cdir.path);
         c.advertiseEgressHost("rune-client.test");

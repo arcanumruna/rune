@@ -354,8 +354,7 @@ struct CatalogRig {
         replica = std::make_unique<rr::PartitionReplica>(makeCatalogPartitionConfig(nc, 3), rr::Role::Follower, 0,
                                                          std::vector<rr::NodeId>{1, 2, 3},
                                                          std::vector<rr::NodeId>{1, 2, 3}, &log, &transport);
-        agent = std::make_unique<AdminWorkerAgent>(reg, nullptr, 1, std::vector<int32_t>{1, 2, 3}, AdminDeps{},
-                                                   nullptr, nullptr, replica.get(), nullptr);
+        agent = std::make_unique<AdminWorkerAgent>(reg, 1, AdminDeps{}, nullptr, replica.get(), nullptr);
         replica->setIsrChannel(&agent->catalogIsrChannel());
     }
     std::vector<rr::AlterIsrMsg> drainAlterIsr() {
@@ -687,15 +686,28 @@ TEST(CatalogAlterIsrRelayRegression, AnswerNeverOvertakesAHeldRoleAndIsDroppedOn
     EXPECT_EQ(relayCatalogAlterIsrResponse(&full, false, r), CatalogAnswerRelay::Held) << "ring full: re-delivered";
 }
 
-// Fix round 1 (M4, fix-on-sight): a malformed __topic_schemas role frame is
+// Fix round 1 (M4, fix-on-sight): a malformed __catalog role frame is
 // reported, never applied as a default Follower@0 role.
-TEST(CatalogAlterIsrRelayRegression, MalformedSchemaRoleFrameIsReportedNotAppliedRegression) {
+TEST(CatalogAlterIsrRelayRegression, MalformedCatalogRoleFrameIsReportedNotAppliedRegression) {
     CatalogRig rig;
     const uint8_t junk[3] = {1, 9, 9};
-    const auto idx = rig.agent->roleRing().tryClaim(kMsgAdminRole, sizeof junk);
+    const auto idx = rig.agent->roleRing().tryClaim(kMsgCatalogRole, sizeof junk);
     ASSERT_GE(idx, 0);
     std::memcpy(rig.agent->roleRing().base() + idx, junk, sizeof junk);
     rig.agent->roleRing().commit(idx);
     (void)rig.agent->doWork(1'000'000);
     EXPECT_EQ(rig.agent->badRoleFramesForTest(), 1u);
+}
+
+// Task 17: the retired __topic_schemas / __views role (kMsgAdminRole) is no longer a message type: a
+// WELL-FORMED one is refused and counted like any unknown frame — never applied to the catalog replica.
+TEST(CatalogAlterIsrRelayRegression, ARetiredSchemaRoleFrameIsRefusedNotAppliedRegression) {
+    CatalogRig rig;
+    AdminRoleMsg role;
+    role.leader = true;
+    role.epoch  = 7;
+    ASSERT_TRUE(encodeAdminRole(rig.agent->roleRing(), role));   // kMsgAdminRole (the retired default type)
+    (void)rig.agent->doWork(1'000'000);
+    EXPECT_EQ(rig.agent->badRoleFramesForTest(), 1u);
+    EXPECT_NE(rig.replica->role(), rr::Role::Leader) << "the retired role must not make the catalog replica lead";
 }

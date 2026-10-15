@@ -477,148 +477,6 @@ TEST(NodeConfigTest, StartupCanvassTimeoutNegativeIsError) {
 }
 
 // ---------------------------------------------------------------------------
-// RUNE_TOPICS parse/validate tests (GB-1)
-// ---------------------------------------------------------------------------
-
-TEST(NodeConfigTest, TopicsAbsentYieldsEmpty) {
-    // No RUNE_TOPICS → cfg.topics is empty (valid — no topics configured).
-    auto r = parseNodeConfig(fakeEnv(base1node()));
-    ASSERT_TRUE(r.error.empty()) << r.error;
-    EXPECT_TRUE(r.config->topics.empty());
-}
-
-TEST(NodeConfigTest, TopicsEmptyStringYieldsEmpty) {
-    auto env = base1node();
-    env["RUNE_TOPICS"] = "";
-    auto r = parseNodeConfig(fakeEnv(env));
-    ASSERT_TRUE(r.error.empty()) << r.error;
-    EXPECT_TRUE(r.config->topics.empty());
-}
-
-TEST(NodeConfigTest, TopicsSingleTopic) {
-    auto env = base1node();
-    env["RUNE_TOPICS"] = "chat:1";
-    auto r = parseNodeConfig(fakeEnv(env));
-    ASSERT_TRUE(r.error.empty()) << r.error;
-    ASSERT_EQ(r.config->topics.size(), 1u);
-    EXPECT_EQ(r.config->topics[0].name,           "chat");
-    EXPECT_EQ(r.config->topics[0].partitionCount, 1);
-    EXPECT_EQ(r.config->topics[0].topicId,        0);
-}
-
-TEST(NodeConfigTest, TopicsMultiTopic) {
-    auto env = base1node();
-    env["RUNE_TOPICS"] = "inventory:8,entities:4,chat:1";
-    auto r = parseNodeConfig(fakeEnv(env));
-    ASSERT_TRUE(r.error.empty()) << r.error;
-    ASSERT_EQ(r.config->topics.size(), 3u);
-
-    EXPECT_EQ(r.config->topics[0].name,           "inventory");
-    EXPECT_EQ(r.config->topics[0].partitionCount, 8);
-    EXPECT_EQ(r.config->topics[0].topicId,        0);
-
-    EXPECT_EQ(r.config->topics[1].name,           "entities");
-    EXPECT_EQ(r.config->topics[1].partitionCount, 4);
-    EXPECT_EQ(r.config->topics[1].topicId,        1);
-
-    EXPECT_EQ(r.config->topics[2].name,           "chat");
-    EXPECT_EQ(r.config->topics[2].partitionCount, 1);
-    EXPECT_EQ(r.config->topics[2].topicId,        2);
-}
-
-TEST(NodeConfigTest, TopicsTopicIdIsDeclarationIndex) {
-    // topicId must be 0-based declaration index regardless of name ordering.
-    auto env = base1node();
-    env["RUNE_TOPICS"] = "z:2,a:4,m:1";
-    auto r = parseNodeConfig(fakeEnv(env));
-    ASSERT_TRUE(r.error.empty()) << r.error;
-    ASSERT_EQ(r.config->topics.size(), 3u);
-    EXPECT_EQ(r.config->topics[0].topicId, 0);
-    EXPECT_EQ(r.config->topics[1].topicId, 1);
-    EXPECT_EQ(r.config->topics[2].topicId, 2);
-}
-
-TEST(NodeConfigTest, TopicsZeroPartitionCountIsError) {
-    auto env = base1node();
-    env["RUNE_TOPICS"] = "chat:0";
-    auto r = parseNodeConfig(fakeEnv(env));
-    EXPECT_FALSE(r.error.empty());
-    EXPECT_FALSE(r.config.has_value());
-}
-
-TEST(NodeConfigTest, TopicsNegativePartitionCountIsError) {
-    auto env = base1node();
-    env["RUNE_TOPICS"] = "chat:-1";
-    auto r = parseNodeConfig(fakeEnv(env));
-    EXPECT_FALSE(r.error.empty());
-    EXPECT_FALSE(r.config.has_value());
-}
-
-TEST(NodeConfigTest, TopicsNonIntPartitionCountIsError) {
-    auto env = base1node();
-    env["RUNE_TOPICS"] = "chat:abc";
-    auto r = parseNodeConfig(fakeEnv(env));
-    EXPECT_FALSE(r.error.empty());
-    EXPECT_FALSE(r.config.has_value());
-}
-
-TEST(NodeConfigTest, TopicsDuplicateNameIsError) {
-    auto env = base1node();
-    env["RUNE_TOPICS"] = "chat:1,entities:4,chat:2";
-    auto r = parseNodeConfig(fakeEnv(env));
-    EXPECT_FALSE(r.error.empty());
-    EXPECT_NE(r.error.find("chat"), std::string::npos);
-    EXPECT_FALSE(r.config.has_value());
-}
-
-TEST(NodeConfigTest, TopicsMissingColonIsError) {
-    auto env = base1node();
-    env["RUNE_TOPICS"] = "chat";
-    auto r = parseNodeConfig(fakeEnv(env));
-    EXPECT_FALSE(r.error.empty());
-    EXPECT_FALSE(r.config.has_value());
-}
-
-TEST(NodeConfigTest, TopicsEmptyNameIsError) {
-    auto env = base1node();
-    env["RUNE_TOPICS"] = ":4";
-    auto r = parseNodeConfig(fakeEnv(env));
-    EXPECT_FALSE(r.error.empty());
-    EXPECT_FALSE(r.config.has_value());
-}
-
-TEST(NodeConfigTest, TopicsWhitespaceTrimmed) {
-    // Whitespace around commas and entries is trimmed.
-    auto env = base1node();
-    env["RUNE_TOPICS"] = " inventory : 8 , chat : 1 ";
-    auto r = parseNodeConfig(fakeEnv(env));
-    ASSERT_TRUE(r.error.empty()) << r.error;
-    ASSERT_EQ(r.config->topics.size(), 2u);
-    EXPECT_EQ(r.config->topics[0].name,           "inventory");
-    EXPECT_EQ(r.config->topics[0].partitionCount, 8);
-    EXPECT_EQ(r.config->topics[1].name,           "chat");
-    EXPECT_EQ(r.config->topics[1].partitionCount, 1);
-}
-
-TEST(NodeConfigTest, TopicsDoubleCommaIsError) {
-    auto env = base1node();
-    env["RUNE_TOPICS"] = "chat:1,,entities:4";
-    auto r = parseNodeConfig(fakeEnv(env));
-    EXPECT_FALSE(r.error.empty());
-    EXPECT_FALSE(r.config.has_value());
-}
-
-TEST(NodeConfigTest, TopicsLargePartitionCount) {
-    // Large partition count (e.g. 64) is valid.
-    auto env = base1node();
-    env["RUNE_TOPICS"] = "big:64";
-    auto r = parseNodeConfig(fakeEnv(env));
-    ASSERT_TRUE(r.error.empty()) << r.error;
-    ASSERT_EQ(r.config->topics.size(), 1u);
-    EXPECT_EQ(r.config->topics[0].partitionCount, 64);
-}
-
-// ---------------------------------------------------------------------------
 // Per-peer client ports (GB-4)
 // ---------------------------------------------------------------------------
 
@@ -792,9 +650,7 @@ TEST(NodeConfigTest, CP1_TopicSpecDefaultsToDeletePolicy) {
 
 TEST(NodeConfigTest, CP1_TopicSpecFieldsHoldValues) {
     // TopicSpec with Compact policy must preserve all field values when set
-    // programmatically (RUNE_TOPICS only carries name:partitionCount; cleanup
-    // policy is set directly on the struct — this test verifies the struct holds
-    // the values it is given, not that parseNodeConfig threads them through).
+    // programmatically — this test verifies the struct holds the values it is given.
     TopicSpec ts;
     ts.name                   = "events";
     ts.partitionCount         = 4;
@@ -817,303 +673,6 @@ TEST(NodeConfigTest, CP1_CleanupPolicyEnumValues) {
     EXPECT_EQ(static_cast<uint8_t>(TopicSpec::CleanupPolicy::Delete),        0u);
     EXPECT_EQ(static_cast<uint8_t>(TopicSpec::CleanupPolicy::Compact),       1u);
     EXPECT_EQ(static_cast<uint8_t>(TopicSpec::CleanupPolicy::CompactDelete), 2u);
-}
-
-// ---------------------------------------------------------------------------
-// CP-5.2: Extended RUNE_TOPICS format tests
-// (name:partitions[:policy[:segmentRollBytes[:deleteRetentionMs[:retentionMs[:retentionBytes[:retentionCheckMs[:fileDeleteDelayMs]]]]]]]])
-// ---------------------------------------------------------------------------
-
-TEST(NodeConfigTest, CP52_ExtendedTopics_BackwardCompatible_TwoFields) {
-    // "name:N" (2-field) still works exactly as before: Delete policy, defaults.
-    auto env = base3node();
-    env["RUNE_TOPICS"] = "events:1";
-    auto r = parseNodeConfig(fakeEnv(env));
-    auto& err = r.error;
-    auto& cfg = r.config;
-    ASSERT_TRUE(err.empty()) << "unexpected error: " << err;
-    ASSERT_EQ(cfg->topics.size(), 1u);
-    EXPECT_EQ(cfg->topics[0].name,          "events");
-    EXPECT_EQ(cfg->topics[0].partitionCount, 1);
-    EXPECT_EQ(cfg->topics[0].cleanupPolicy,  TopicSpec::CleanupPolicy::Delete);
-    // Default retentionMs and retentionBytes are -1 (unbounded).
-    EXPECT_EQ(cfg->topics[0].retentionMs,   -1LL);
-    EXPECT_EQ(cfg->topics[0].retentionBytes,-1LL);
-}
-
-TEST(NodeConfigTest, CP52_ExtendedTopics_CompactPolicy) {
-    auto env = base3node();
-    env["RUNE_TOPICS"] = "compact_log:2:compact";
-    auto r = parseNodeConfig(fakeEnv(env));
-    auto& err = r.error;
-    auto& cfg = r.config;
-    ASSERT_TRUE(err.empty()) << err;
-    ASSERT_EQ(cfg->topics.size(), 1u);
-    EXPECT_EQ(cfg->topics[0].name,          "compact_log");
-    EXPECT_EQ(cfg->topics[0].partitionCount, 2);
-    EXPECT_EQ(cfg->topics[0].cleanupPolicy,  TopicSpec::CleanupPolicy::Compact);
-    // Other fields default.
-    EXPECT_EQ(cfg->topics[0].segmentRollBytes, 64LL * 1024 * 1024);
-    EXPECT_EQ(cfg->topics[0].retentionMs,   -1LL);
-    EXPECT_EQ(cfg->topics[0].retentionBytes,-1LL);
-}
-
-TEST(NodeConfigTest, CP52_ExtendedTopics_DeletePolicy_Explicit) {
-    auto env = base3node();
-    env["RUNE_TOPICS"] = "log:1:delete";
-    auto r = parseNodeConfig(fakeEnv(env));
-    auto& err = r.error;
-    auto& cfg = r.config;
-    ASSERT_TRUE(err.empty()) << err;
-    ASSERT_EQ(cfg->topics.size(), 1u);
-    EXPECT_EQ(cfg->topics[0].cleanupPolicy, TopicSpec::CleanupPolicy::Delete);
-}
-
-TEST(NodeConfigTest, CP52_ExtendedTopics_CompactDeletePolicy) {
-    auto env = base3node();
-    env["RUNE_TOPICS"] = "mixed:3:compact_delete";
-    auto r = parseNodeConfig(fakeEnv(env));
-    auto& err = r.error;
-    auto& cfg = r.config;
-    ASSERT_TRUE(err.empty()) << err;
-    ASSERT_EQ(cfg->topics.size(), 1u);
-    EXPECT_EQ(cfg->topics[0].cleanupPolicy, TopicSpec::CleanupPolicy::CompactDelete);
-}
-
-TEST(NodeConfigTest, CP52_ExtendedTopics_PolicyCaseInsensitive) {
-    auto env = base3node();
-    env["RUNE_TOPICS"] = "a:1:Compact";
-    auto r = parseNodeConfig(fakeEnv(env));
-    auto& err = r.error;
-    auto& cfg = r.config;
-    ASSERT_TRUE(err.empty()) << err;
-    EXPECT_EQ(cfg->topics[0].cleanupPolicy, TopicSpec::CleanupPolicy::Compact);
-}
-
-TEST(NodeConfigTest, CP52_ExtendedTopics_WithSegmentRollBytes) {
-    auto env = base3node();
-    // Set 4 KiB segment roll to force quick sealing in tests.
-    env["RUNE_TOPICS"] = "compact_log:1:compact:4096";
-    auto r = parseNodeConfig(fakeEnv(env));
-    auto& err = r.error;
-    auto& cfg = r.config;
-    ASSERT_TRUE(err.empty()) << err;
-    ASSERT_EQ(cfg->topics.size(), 1u);
-    EXPECT_EQ(cfg->topics[0].cleanupPolicy,    TopicSpec::CleanupPolicy::Compact);
-    EXPECT_EQ(cfg->topics[0].segmentRollBytes, 4096LL);
-    EXPECT_EQ(cfg->topics[0].deleteRetentionMs, 86'400'000LL);  // default
-}
-
-TEST(NodeConfigTest, CP52_ExtendedTopics_WithDeleteRetentionMs) {
-    auto env = base3node();
-    env["RUNE_TOPICS"] = "compact_log:1:compact:4096:100";
-    auto r = parseNodeConfig(fakeEnv(env));
-    auto& err = r.error;
-    auto& cfg = r.config;
-    ASSERT_TRUE(err.empty()) << err;
-    EXPECT_EQ(cfg->topics[0].segmentRollBytes,   4096LL);
-    EXPECT_EQ(cfg->topics[0].deleteRetentionMs,  100LL);
-}
-
-TEST(NodeConfigTest, CP52_ExtendedTopics_WithRetentionMs) {
-    auto env = base3node();
-    // retentionMs = -1 means unbounded.
-    env["RUNE_TOPICS"] = "delete_log:1:delete:4096:1:-1";
-    auto r = parseNodeConfig(fakeEnv(env));
-    auto& err = r.error;
-    auto& cfg = r.config;
-    ASSERT_TRUE(err.empty()) << err;
-    EXPECT_EQ(cfg->topics[0].cleanupPolicy,    TopicSpec::CleanupPolicy::Delete);
-    EXPECT_EQ(cfg->topics[0].segmentRollBytes, 4096LL);
-    EXPECT_EQ(cfg->topics[0].retentionMs,      -1LL);
-}
-
-TEST(NodeConfigTest, CP52_ExtendedTopics_WithRetentionBytes) {
-    auto env = base3node();
-    env["RUNE_TOPICS"] = "delete_log:1:delete:4096:1:-1:32768";
-    auto r = parseNodeConfig(fakeEnv(env));
-    auto& err = r.error;
-    auto& cfg = r.config;
-    ASSERT_TRUE(err.empty()) << err;
-    EXPECT_EQ(cfg->topics[0].retentionBytes,  32768LL);
-}
-
-TEST(NodeConfigTest, CP52_ExtendedTopics_WithRetentionCheckMs) {
-    auto env = base3node();
-    env["RUNE_TOPICS"] = "delete_log:1:delete:4096:1:-1:32768:1";
-    auto r = parseNodeConfig(fakeEnv(env));
-    auto& err = r.error;
-    auto& cfg = r.config;
-    ASSERT_TRUE(err.empty()) << err;
-    EXPECT_EQ(cfg->topics[0].retentionCheckMs, 1LL);
-}
-
-TEST(NodeConfigTest, CP52_ExtendedTopics_WithFileDeleteDelayMs) {
-    auto env = base3node();
-    env["RUNE_TOPICS"] = "delete_log:1:delete:4096:1:-1:32768:1:1";
-    auto r = parseNodeConfig(fakeEnv(env));
-    auto& err = r.error;
-    auto& cfg = r.config;
-    ASSERT_TRUE(err.empty()) << err;
-    EXPECT_EQ(cfg->topics[0].fileDeleteDelayMs, 1LL);
-}
-
-TEST(NodeConfigTest, CP52_ExtendedTopics_FullSpec_Compact) {
-    // Full extended spec as used by compaction e2e tests.
-    auto env = base3node();
-    env["RUNE_TOPICS"] = "compact_log:1:compact:4096:100:-1:-1:1:1";
-    auto r = parseNodeConfig(fakeEnv(env));
-    auto& err = r.error;
-    auto& cfg = r.config;
-    ASSERT_TRUE(err.empty()) << err;
-    const auto& ts = cfg->topics[0];
-    EXPECT_EQ(ts.name,             "compact_log");
-    EXPECT_EQ(ts.partitionCount,   1);
-    EXPECT_EQ(ts.cleanupPolicy,    TopicSpec::CleanupPolicy::Compact);
-    EXPECT_EQ(ts.segmentRollBytes, 4096LL);
-    EXPECT_EQ(ts.deleteRetentionMs, 100LL);
-    EXPECT_EQ(ts.retentionMs,      -1LL);
-    EXPECT_EQ(ts.retentionBytes,   -1LL);
-    EXPECT_EQ(ts.retentionCheckMs, 1LL);
-    EXPECT_EQ(ts.fileDeleteDelayMs, 1LL);
-}
-
-TEST(NodeConfigTest, CCC_ExtendedTopics_WithMinCleanableDirtyRatio) {
-    // Field 9: minCleanableDirtyRatio (double).  0.0 = compact every pass.
-    auto env = base3node();
-    env["RUNE_TOPICS"] = "compact_log:1:compact:4096:100:-1:-1:1:1:0.0";
-    auto r = parseNodeConfig(fakeEnv(env));
-    ASSERT_TRUE(r.error.empty()) << r.error;
-    EXPECT_DOUBLE_EQ(r.config->topics[0].minCleanableDirtyRatio, 0.0);
-}
-
-TEST(NodeConfigTest, CCC_ExtendedTopics_MinCleanableDirtyRatio_Midpoint) {
-    auto env = base3node();
-    env["RUNE_TOPICS"] = "compact_log:1:compact:4096:100:-1:-1:1:1:0.75";
-    auto r = parseNodeConfig(fakeEnv(env));
-    ASSERT_TRUE(r.error.empty()) << r.error;
-    EXPECT_DOUBLE_EQ(r.config->topics[0].minCleanableDirtyRatio, 0.75);
-}
-
-TEST(NodeConfigTest, CCC_ExtendedTopics_MinCleanableDirtyRatio_OutOfRange_Rejected) {
-    auto env = base3node();
-    env["RUNE_TOPICS"] = "compact_log:1:compact:4096:100:-1:-1:1:1:1.5";
-    auto r = parseNodeConfig(fakeEnv(env));
-    EXPECT_FALSE(r.error.empty()) << "should reject minCleanableDirtyRatio > 1.0";
-}
-
-TEST(NodeConfigTest, CCC_ExtendedTopics_MinCleanableDirtyRatio_NonNumber_Rejected) {
-    auto env = base3node();
-    env["RUNE_TOPICS"] = "compact_log:1:compact:4096:100:-1:-1:1:1:abc";
-    auto r = parseNodeConfig(fakeEnv(env));
-    EXPECT_FALSE(r.error.empty()) << "should reject non-numeric minCleanableDirtyRatio";
-}
-
-TEST(NodeConfigTest, CCC_ExtendedTopics_WithMaxCompactionLagMs) {
-    // Field 10: maxCompactionLagMs (-1 = disabled, or positive ms).
-    auto env = base3node();
-    env["RUNE_TOPICS"] = "compact_log:1:compact:4096:100:-1:-1:1:1:0.0:5000";
-    auto r = parseNodeConfig(fakeEnv(env));
-    ASSERT_TRUE(r.error.empty()) << r.error;
-    EXPECT_DOUBLE_EQ(r.config->topics[0].minCleanableDirtyRatio, 0.0);
-    EXPECT_EQ(r.config->topics[0].maxCompactionLagMs, 5000LL);
-}
-
-TEST(NodeConfigTest, CCC_ExtendedTopics_NewFieldsDefaultWhenAbsent) {
-    // Omitting fields 9/10 keeps the Kafka defaults (0.5 / -1).
-    auto env = base3node();
-    env["RUNE_TOPICS"] = "compact_log:1:compact:4096:100";
-    auto r = parseNodeConfig(fakeEnv(env));
-    ASSERT_TRUE(r.error.empty()) << r.error;
-    EXPECT_DOUBLE_EQ(r.config->topics[0].minCleanableDirtyRatio, 0.5);
-    EXPECT_EQ(r.config->topics[0].maxCompactionLagMs, -1LL);
-}
-
-TEST(NodeConfigTest, CP52_ExtendedTopics_FullSpec_Delete) {
-    // Full extended spec as used by retention e2e tests.
-    auto env = base3node();
-    env["RUNE_TOPICS"] = "delete_log:1:delete:4096:1:-1:32768:1:1";
-    auto r = parseNodeConfig(fakeEnv(env));
-    auto& err = r.error;
-    auto& cfg = r.config;
-    ASSERT_TRUE(err.empty()) << err;
-    const auto& ts = cfg->topics[0];
-    EXPECT_EQ(ts.cleanupPolicy,    TopicSpec::CleanupPolicy::Delete);
-    EXPECT_EQ(ts.segmentRollBytes, 4096LL);
-    EXPECT_EQ(ts.deleteRetentionMs, 1LL);
-    EXPECT_EQ(ts.retentionMs,      -1LL);
-    EXPECT_EQ(ts.retentionBytes,   32768LL);
-    EXPECT_EQ(ts.retentionCheckMs, 1LL);
-    EXPECT_EQ(ts.fileDeleteDelayMs, 1LL);
-}
-
-TEST(NodeConfigTest, CP52_ExtendedTopics_MultipleTopics_MixedPolicies) {
-    // Two topics: one compact, one delete — as used by compaction e2e overlay.
-    auto env = base3node();
-    env["RUNE_TOPICS"] =
-        "compact_log:1:compact:4096:100:-1:-1:1:1,"
-        "delete_log:1:delete:4096:1:-1:32768:1:1";
-    auto r = parseNodeConfig(fakeEnv(env));
-    auto& err = r.error;
-    auto& cfg = r.config;
-    ASSERT_TRUE(err.empty()) << err;
-    ASSERT_EQ(cfg->topics.size(), 2u);
-    EXPECT_EQ(cfg->topics[0].name,          "compact_log");
-    EXPECT_EQ(cfg->topics[0].cleanupPolicy, TopicSpec::CleanupPolicy::Compact);
-    EXPECT_EQ(cfg->topics[1].name,          "delete_log");
-    EXPECT_EQ(cfg->topics[1].cleanupPolicy, TopicSpec::CleanupPolicy::Delete);
-    // TopicId is 0-based declaration order.
-    EXPECT_EQ(cfg->topics[0].topicId, 0);
-    EXPECT_EQ(cfg->topics[1].topicId, 1);
-}
-
-TEST(NodeConfigTest, CP52_ExtendedTopics_InvalidPolicy) {
-    auto env = base3node();
-    env["RUNE_TOPICS"] = "log:1:bad_policy";
-    auto r = parseNodeConfig(fakeEnv(env));
-    auto& err = r.error;
-    auto& cfg = r.config;
-    EXPECT_FALSE(err.empty()) << "should reject unknown policy 'bad_policy'";
-    EXPECT_NE(err.find("bad_policy"), std::string::npos);
-}
-
-TEST(NodeConfigTest, CP52_ExtendedTopics_InvalidSegmentRollBytes_Zero) {
-    auto env = base3node();
-    env["RUNE_TOPICS"] = "log:1:compact:0";   // 0 is not a positive integer
-    auto r = parseNodeConfig(fakeEnv(env));
-    auto& err = r.error;
-    auto& cfg = r.config;
-    EXPECT_FALSE(err.empty()) << "should reject segmentRollBytes=0";
-}
-
-TEST(NodeConfigTest, CP52_ExtendedTopics_InvalidSegmentRollBytes_Negative) {
-    auto env = base3node();
-    env["RUNE_TOPICS"] = "log:1:compact:-1";  // negative is invalid for roll bytes
-    auto r = parseNodeConfig(fakeEnv(env));
-    auto& err = r.error;
-    auto& cfg = r.config;
-    EXPECT_FALSE(err.empty()) << "should reject negative segmentRollBytes";
-}
-
-TEST(NodeConfigTest, CP52_ExtendedTopics_RetentionBytes_MinusOneAllowed) {
-    // retentionBytes = -1 means unbounded — this is a valid configuration.
-    auto env = base3node();
-    env["RUNE_TOPICS"] = "log:1:delete:4096:1:-1:-1";
-    auto r = parseNodeConfig(fakeEnv(env));
-    auto& err = r.error;
-    auto& cfg = r.config;
-    ASSERT_TRUE(err.empty()) << err;
-    EXPECT_EQ(cfg->topics[0].retentionBytes, -1LL);
-}
-
-TEST(NodeConfigTest, CP52_ExtendedTopics_RetentionBytes_BelowMinusOne_Rejected) {
-    // retentionBytes < -1 is invalid.
-    auto env = base3node();
-    env["RUNE_TOPICS"] = "log:1:delete:4096:1:-1:-2";
-    auto r = parseNodeConfig(fakeEnv(env));
-    auto& err = r.error;
-    auto& cfg = r.config;
-    EXPECT_FALSE(err.empty()) << "should reject retentionBytes=-2";
 }
 
 // ===========================================================================
@@ -1183,82 +742,12 @@ TEST(NodeConfigTest, CP10_EnableCoalescing_True_KeepsTrue) {
 }
 
 // ===========================================================================
-// CP-10 Fix 1: ioMaxBytesPerSecond — parsed from TopicSpec, threaded to cleaner
-//
-// The parsing of TopicSpec::ioMaxBytesPerSecond is outside NodeConfig (it lives
-// in TopicSpec directly from RUNE_TOPICS fields).  These tests verify that:
-//   - TopicSpec::ioMaxBytesPerSecond retains its default of -1 when not set in
-//     RUNE_TOPICS (no extra field).
-//   - The BrokerNode wiring picks it up (integration: tested via BrokerNodeTest).
+// CP-10 Fix 1: ioMaxBytesPerSecond — a TopicSpec field (not a DDL option), threaded to the cleaner.
 // ===========================================================================
 
 TEST(NodeConfigTest, CP10_IoMaxBytesPerSecond_DefaultMinusOne) {
-    // With the standard "name:N" topic format the field stays at -1.
-    auto env = base1node();
-    env["RUNE_TOPICS"] = "events:2";
-    auto r = parseNodeConfig(fakeEnv(env));
-    ASSERT_TRUE(r.error.empty()) << r.error;
-    ASSERT_EQ(r.config->topics.size(), 1u);
-    EXPECT_EQ(r.config->topics[0].ioMaxBytesPerSecond, -1LL)
-        << "ioMaxBytesPerSecond must default to -1 (unlimited)";
-}
-
-// ===========================================================================
-// Task M1: co-partition group, partition key, persistence, durability
-// ===========================================================================
-
-TEST(NodeConfig, ParsesCoPartitionGroupKeyAndPersistence) {
-    auto env = [](const char* k)->const char*{
-        std::string s=k;
-        if (s=="RUNE_NODE_ID") return "0";
-        if (s=="RUNE_PEERS") return "0@h:1";
-        if (s=="RUNE_CLIENT_ENDPOINT") return "h:2";
-        if (s=="RUNE_DATA_DIR") return "/tmp/x";
-        if (s=="RUNE_TOPICS") return "wallet:4:group=acct:key=userId:durability=all-in-sync,presence:2:persistence=memory";
-        return nullptr;
-    };
-    auto res = rune::node::parseNodeConfig(env);
-    ASSERT_TRUE(res.config.has_value()) << res.error;
-    const auto& ts = res.config->topics;
-    ASSERT_EQ(ts.size(), 2u);
-    EXPECT_EQ(ts[0].coPartitionGroup, "acct");
-    EXPECT_EQ(ts[0].partitionKey, "userId");
-    EXPECT_EQ(ts[0].durability, 1);
-    EXPECT_EQ(ts[1].persistence, rune::node::PersistenceMode::Transient);
-}
-
-TEST(NodeConfig, LegacyTopicGrammarStillParses) {
-    auto env=[](const char* k)->const char*{ std::string s=k;
-        if (s=="RUNE_NODE_ID") return "0"; if (s=="RUNE_PEERS") return "0@h:1";
-        if (s=="RUNE_CLIENT_ENDPOINT") return "h:2"; if (s=="RUNE_DATA_DIR") return "/tmp/x";
-        if (s=="RUNE_TOPICS") return "inventory:8,chat:1"; return nullptr; };
-    auto res=rune::node::parseNodeConfig(env);
-    ASSERT_TRUE(res.config.has_value());
-    EXPECT_EQ(res.config->topics[0].coPartitionGroup, "");
-    EXPECT_EQ(res.config->topics[0].persistence, rune::node::PersistenceMode::Disk);
-}
-
-TEST(NodeConfig, PersistenceMemoryDurabilityAllInSync) {
-    // Memory topic + AllInSync durability is a valid configuration.
-    // It means: every write must be acked by ALL replicas (but stored in RAM).
-    auto env=[](const char* k)->const char*{ std::string s=k;
-        if (s=="RUNE_NODE_ID") return "0"; if (s=="RUNE_PEERS") return "0@h:1";
-        if (s=="RUNE_CLIENT_ENDPOINT") return "h:2"; if (s=="RUNE_DATA_DIR") return "/tmp/x";
-        if (s=="RUNE_TOPICS") return "ephemeral:2:persistence=memory:durability=all-in-sync"; return nullptr; };
-    auto res=rune::node::parseNodeConfig(env);
-    ASSERT_TRUE(res.config.has_value()) << res.error;
-    EXPECT_EQ(res.config->topics[0].persistence, rune::node::PersistenceMode::Transient);
-    EXPECT_EQ(res.config->topics[0].durability, 1u);
-}
-
-TEST(NodeConfig, UnknownKeyValueOptionRejected) {
-    auto env=[](const char* k)->const char*{ std::string s=k;
-        if (s=="RUNE_NODE_ID") return "0"; if (s=="RUNE_PEERS") return "0@h:1";
-        if (s=="RUNE_CLIENT_ENDPOINT") return "h:2"; if (s=="RUNE_DATA_DIR") return "/tmp/x";
-        if (s=="RUNE_TOPICS") return "t:2:badkey=badval"; return nullptr; };
-    auto res=rune::node::parseNodeConfig(env);
-    EXPECT_FALSE(res.config.has_value()) << "unknown key=value option must be rejected";
-    EXPECT_NE(res.error.find("badkey"), std::string::npos);
+    TopicSpec ts;
+    EXPECT_EQ(ts.ioMaxBytesPerSecond, -1LL) << "ioMaxBytesPerSecond must default to -1 (unlimited)";
 }
 
 // ===========================================================================
@@ -1626,13 +1115,8 @@ TEST(NodeConfig, WorkerRingBytesNegativeKeepsDefault) {
 
 TEST(NodeConfig, TopicSpecDurabilityTierDefaultIsMajority) {
     // durabilityTier defaults to 1 (Majority) so existing tests are parity-unchanged.
-    auto base = base1node();
-    base["RUNE_TOPICS"] = "events:2";
-    auto res = rune::node::parseNodeConfig(fakeEnv(base));
-    ASSERT_TRUE(res.config.has_value()) << res.error;
-    ASSERT_EQ(res.config->topics.size(), 1u);
-    EXPECT_EQ(res.config->topics[0].durabilityTier, 1u)
-        << "default durabilityTier must be 1 (Majority)";
+    TopicSpec ts;
+    EXPECT_EQ(ts.durabilityTier, 1u) << "default durabilityTier must be 1 (Majority)";
 }
 
 // ---------------------------------------------------------------------------
@@ -2759,22 +2243,6 @@ TEST(NodeConfigRegression, UncleanConsensusElection_DefaultOffEnvOptIn) {
 } // namespace rune::node
 
 namespace rune::node {
-// D19 review L1: a segment's positions are 32-bit — a segmentRollBytes past the
-// segment position limit (INT32_MAX minus one maximal batch of headroom) is
-// refused at config time instead of being clamped silently at roll time.
-TEST(NodeConfigTest, SegmentRollBytesPastPositionLimitRefusedRegression) {
-    auto env = base3node();
-    env["RUNE_TOPICS"] = "big:1:delete:" + std::to_string(int64_t{2} << 30);   // 2 GiB
-    auto r = parseNodeConfig(fakeEnv(env));
-    EXPECT_FALSE(r.error.empty());
-    EXPECT_NE(r.error.find("segmentRollBytes"), std::string::npos) << r.error;
-
-    env["RUNE_TOPICS"] = "big:1:delete:" + std::to_string(int64_t{1} << 30);   // 1 GiB: fine
-    auto ok = parseNodeConfig(fakeEnv(env));
-    ASSERT_TRUE(ok.error.empty()) << ok.error;
-    EXPECT_EQ(ok.config->topics[0].segmentRollBytes, int64_t{1} << 30);
-}
-
 // D19 review L5: the provision depth is clamped to [1, 8] (same as the agent).
 TEST(NodeConfigTest, SegmentProvisionDepthClampedToOneEight) {
     for (const auto& [raw, want] : std::vector<std::pair<const char*, int32_t>>{
@@ -2805,99 +2273,6 @@ TEST(NodeConfigRegression, IdleMaxParkUsIsBoundedAndStrictRegression) {
         EXPECT_FALSE(r.config.has_value()) << "RUNE_IDLE_MAX_PARK_US=" << bad << " was accepted";
         if (!r.config.has_value()) EXPECT_NE(r.error.find("RUNE_IDLE_MAX_PARK_US"), std::string::npos) << r.error;
     }
-}
-
-// ===========================================================================
-// Phase 2b E: transient topics (rename of memory topics)
-// ===========================================================================
-namespace {
-rune::node::ConfigResult parseWithTopics(const char* topics) {
-    return rune::node::parseNodeConfig([topics](const char* k) -> const char* {
-        std::string s = k;
-        if (s == "RUNE_NODE_ID") return "0";
-        if (s == "RUNE_PEERS") return "0@h:1";
-        if (s == "RUNE_CLIENT_ENDPOINT") return "h:2";
-        if (s == "RUNE_DATA_DIR") return "/tmp/x";
-        if (s == "RUNE_TOPICS") return topics;
-        return nullptr;
-    });
-}
-} // namespace
-
-TEST(NodeConfig, PersistenceTransientParses) {
-    auto res = parseWithTopics("presence:2:persistence=transient,orders:4:persistence=disk");
-    ASSERT_TRUE(res.config.has_value()) << res.error;
-    EXPECT_EQ(res.config->topics[0].persistence, rune::node::PersistenceMode::Transient);
-    EXPECT_EQ(res.config->topics[1].persistence, rune::node::PersistenceMode::Disk);
-    EXPECT_TRUE(res.warnings.empty()) << "the canonical spelling never warns";
-}
-
-// Existing compose files say persistence=memory: they must keep booting, as
-// TRANSIENT topics, with exactly one deprecation warning per such entry.
-TEST(NodeConfigRegression, PersistenceMemoryIsDeprecatedAliasForTransient) {
-    auto res = parseWithTopics("presence:2:persistence=MEMORY,chat:1:persistence=memory");
-    ASSERT_TRUE(res.config.has_value()) << res.error;
-    EXPECT_EQ(res.config->topics[0].persistence, rune::node::PersistenceMode::Transient);
-    EXPECT_EQ(res.config->topics[1].persistence, rune::node::PersistenceMode::Transient);
-    ASSERT_EQ(res.warnings.size(), 2u);
-    EXPECT_NE(res.warnings[0].find("deprecated"), std::string::npos) << res.warnings[0];
-    EXPECT_NE(res.warnings[0].find("persistence=transient"), std::string::npos) << res.warnings[0];
-    EXPECT_NE(res.warnings[0].find("presence"), std::string::npos) << res.warnings[0];
-    EXPECT_NE(res.warnings[1].find("chat"), std::string::npos) << res.warnings[1];
-}
-
-// E2 residual round 5: a per-topic replication factor (RUNE_TOPICS `rf=N`);
-// absent = every node (0).  Out of range / not a number is a config error.
-TEST(NodeConfig, TopicReplicationFactorParses) {
-    auto res = parseWithTopics("presence:3:persistence=transient:rf=1,orders:4");
-    ASSERT_TRUE(res.config.has_value()) << res.error;
-    EXPECT_EQ(res.config->topics[0].replicationFactor, 1);
-    EXPECT_EQ(res.config->topics[1].replicationFactor, 0) << "absent rf must mean every node";
-    for (const char* bad : {"t:1:rf=0", "t:1:rf=x", "t:1:rf=256", "t:1:rf=2x"}) {
-        auto r = parseWithTopics(bad);
-        EXPECT_FALSE(r.config.has_value()) << bad;
-        EXPECT_NE(r.error.find("rf must be an integer"), std::string::npos) << bad << ": " << r.error;
-    }
-}
-
-// E2 residual round 6 (F2): rf is checked against the cluster — rf <= nodes
-// (never silently clamped) and rf >= RUNE_MIN_ISR (else acks=all / offset
-// commits can never succeed); each error names its constraint.  RED (no
-// checks): rf=1 under the 3-node default minIsr and rf=4 on 3 nodes parsed.
-namespace {
-rune::node::ConfigResult parse3Nodes(const char* topics, const char* minIsr = nullptr) {
-    return rune::node::parseNodeConfig([topics, minIsr](const char* k) -> const char* {
-        std::string s = k;
-        if (s == "RUNE_NODE_ID") return "0";
-        if (s == "RUNE_PEERS") return "0@h0:1,1@h1:1,2@h2:1";
-        if (s == "RUNE_CLIENT_ENDPOINT") return "h0:2";
-        if (s == "RUNE_DATA_DIR") return "/tmp/x";
-        if (s == "RUNE_TOPICS") return topics;
-        if (s == "RUNE_MIN_ISR") return minIsr;
-        return nullptr;
-    });
-}
-}  // namespace
-
-TEST(NodeConfigRegression, TopicReplicationFactorIsCheckedAgainstTheClusterRegression) {
-    auto below = parse3Nodes("presence:3:persistence=transient:rf=1");   // default minIsr = 2
-    ASSERT_FALSE(below.config.has_value()) << "rf below the default minIsr was accepted";
-    EXPECT_NE(below.error.find("must be >= RUNE_MIN_ISR (2)"), std::string::npos) << below.error;
-    auto above = parse3Nodes("presence:3:rf=4");
-    ASSERT_FALSE(above.config.has_value()) << "rf above the node count was accepted (silently clamped)";
-    EXPECT_NE(above.error.find("must be <= the node count (3)"), std::string::npos) << above.error;
-    auto ok = parse3Nodes("presence:3:persistence=transient:rf=1", "1");
-    ASSERT_TRUE(ok.config.has_value()) << ok.error;
-    EXPECT_EQ(ok.config->topics[0].replicationFactor, 1);
-    auto ok3 = parse3Nodes("presence:3:rf=3");
-    ASSERT_TRUE(ok3.config.has_value()) << ok3.error;
-    EXPECT_EQ(ok3.config->topics[0].replicationFactor, 3);
-}
-
-TEST(NodeConfig, PersistenceBadValueNamesTransient) {
-    auto res = parseWithTopics("t:1:persistence=ram");
-    ASSERT_FALSE(res.config.has_value());
-    EXPECT_NE(res.error.find("'disk' or 'transient'"), std::string::npos) << res.error;
 }
 
 TEST(NodeConfig, PersistenceModeWireMapping) {
@@ -2947,148 +2322,6 @@ TEST(NodeConfigRegression, TransientLogRingBytesWinsOverAlias) {
     ASSERT_TRUE(res.config.has_value()) << res.error;
     EXPECT_EQ(res.config->memoryLogRingBytes, 16 * 1024 * 1024);
     EXPECT_EQ(res.warnings.size(), 1u) << "the alias still warns";
-}
-
-// ── DDL conformance B7 / user decision D2d: static RUNE_TOPICS names obey the DDL
-//    name rule (TopicName.h) — a bad name is a boot config error naming the entry.
-namespace {
-struct BadStaticName { std::string name; rune::catalog::TopicNameError kind; const char* label; };
-std::vector<BadStaticName> badStaticNames() {
-    using rune::catalog::TopicNameError;
-    return {
-        {std::string(250, 'x'), rune::catalog::TopicNameError::TooLong, "len250"},
-        {std::string(600, 'y'), rune::catalog::TopicNameError::TooLong, "len600"},
-        {".", rune::catalog::TopicNameError::DotSegment, "dot"},
-        {"..", rune::catalog::TopicNameError::DotSegment, "dotdot"},
-        {"../escape", rune::catalog::TopicNameError::BadChar, "traversal"},
-        {"a/b", rune::catalog::TopicNameError::BadChar, "slash"},
-        {"/abs", rune::catalog::TopicNameError::BadChar, "absolute"},
-        {"a\\b", rune::catalog::TopicNameError::BadChar, "backslash"},
-        {"has space", rune::catalog::TopicNameError::BadChar, "space"},
-        {"tab\tname", rune::catalog::TopicNameError::BadChar, "tab"},
-        {"caf\xc3\xa9", rune::catalog::TopicNameError::BadChar, "nonascii"},
-        {"__topic_schemas", rune::catalog::TopicNameError::Reserved, "topic_schemas"},
-        {"__views", rune::catalog::TopicNameError::Reserved, "views"},
-        {"__consumer_offsets", rune::catalog::TopicNameError::Reserved, "consumer_offsets"},
-        {"__transaction_state", rune::catalog::TopicNameError::Reserved, "transaction_state"},
-        {"__cluster_metadata", rune::catalog::TopicNameError::Reserved, "cluster_metadata"},
-        {"__view_snapshots", rune::catalog::TopicNameError::Reserved, "view_snapshots"},
-        {"__orphan.1", rune::catalog::TopicNameError::Reserved, "orphan"},
-        {"__x", rune::catalog::TopicNameError::Reserved, "x"},
-    };
-}
-} // namespace
-
-class RuneTopicsNameRegression : public ::testing::TestWithParam<BadStaticName> {};
-
-TEST_P(RuneTopicsNameRegression, InvalidNameIsAConfigErrorNamingTheEntry) {
-    const BadStaticName& b = GetParam();
-    ASSERT_EQ(rune::catalog::checkTopicName(b.name), b.kind) << "table sanity";
-    const std::string reason(rune::catalog::topicNameErrorText(b.kind));
-    // First, in the middle (after a valid entry), and last.
-    for (const std::string& list : {b.name + ":1", "ok:1," + b.name + ":2", b.name + ":1,ok:2"}) {
-        SCOPED_TRACE(list);
-        const auto res = parseWithTopics(list.c_str());
-        ASSERT_FALSE(res.config.has_value()) << "must refuse to boot";
-        // The name and entry are escaped (fix-on-sight: no raw control bytes in the error).
-        const std::string shown = rune::catalog::escapeNameForLog(b.name);
-        EXPECT_NE(res.error.find("RUNE_TOPICS topic name '" + shown + "' is invalid"), std::string::npos) << res.error;
-        EXPECT_NE(res.error.find(reason), std::string::npos) << res.error;
-        EXPECT_NE(res.error.find("in entry: " + shown + ":"), std::string::npos) << "names the entry: " << res.error;
-    }
-}
-
-INSTANTIATE_TEST_SUITE_P(EveryKind, RuneTopicsNameRegression, ::testing::ValuesIn(badStaticNames()),
-                         [](const ::testing::TestParamInfo<BadStaticName>& i) { return std::string(i.param.label); });
-
-TEST(NodeConfigRegression, RuneTopicsInvalidNameIsEscapedInTheConfigErrorRegression) {
-    struct Case { const char* list; const char* shown; };
-    const Case cases[] = {
-        {"bad\nname:1",       "'bad\\x0aname'"},
-        {"ok:1,esc\x1b[2J:2",  "'esc\\x1b[2J'"},
-        {"back\\slash:1",     "'back\\\\slash'"},
-    };
-    for (const Case& c : cases) {
-        SCOPED_TRACE(c.shown);
-        const auto res = parseWithTopics(c.list);
-        ASSERT_FALSE(res.config.has_value());
-        EXPECT_NE(res.error.find(c.shown), std::string::npos) << res.error;
-        for (const char ch : res.error) {
-            const auto u = static_cast<unsigned char>(ch);
-            EXPECT_TRUE(u >= 0x20 && u < 0x7f) << "raw byte " << static_cast<int>(u);
-        }
-    }
-    // A name-less / colon-less entry is echoed escaped too.
-    const auto noColon = parseWithTopics("ok:1,x\ny");
-    ASSERT_FALSE(noColon.config.has_value());
-    EXPECT_NE(noColon.error.find("x\\x0ay"), std::string::npos) << noColon.error;
-}
-
-TEST(NodeConfigRegression, RuneTopicsEmptyNameStillAConfigErrorNamingTheEntryRegression) {
-    const auto res = parseWithTopics("ok:1,:2");
-    ASSERT_FALSE(res.config.has_value());
-    EXPECT_NE(res.error.find("empty name"), std::string::npos) << res.error;
-    EXPECT_NE(res.error.find(":2"), std::string::npos) << res.error;
-}
-
-TEST(NodeConfigRegression, RuneTopicsInvalidNameWithExtendedFieldsIsStillRefusedRegression) {
-    const auto res = parseWithTopics("__views:1:persistence=transient");
-    ASSERT_FALSE(res.config.has_value());
-    EXPECT_NE(res.error.find("topic name '__views' is invalid"), std::string::npos) << res.error;
-}
-
-TEST(NodeConfigRegression, RuneTopicsCaseOnlyDuplicateIsAConfigErrorRegression) {
-    struct Case { const char* list; const char* a; const char* b; };
-    const Case cases[] = {
-        {"Orders:1,orders:4",               "Orders", "orders"},
-        {"Orders:1,chat:2,orders:4",        "Orders", "orders"},
-        {"chat:1,CHAT:1",                   "chat",   "CHAT"},
-        {"aB:1,x:1,Ab:1",                   "aB",     "Ab"},
-        {"orders.V2:1,ORDERS.v2:1",         "orders.V2", "ORDERS.v2"},
-    };
-    for (const Case& c : cases) {
-        SCOPED_TRACE(c.list);
-        const auto res = parseWithTopics(c.list);
-        ASSERT_FALSE(res.config.has_value());
-        EXPECT_NE(res.error.find(std::string("'") + c.a + "'"), std::string::npos) << res.error;
-        EXPECT_NE(res.error.find(std::string("'") + c.b + "'"), std::string::npos) << res.error;
-        EXPECT_NE(res.error.find("differ only by letter case"), std::string::npos) << res.error;
-        EXPECT_NE(res.error.find("in entry:"), std::string::npos) << res.error;
-    }
-}
-
-TEST(NodeConfigRegression, RuneTopicsExactDuplicateKeepsItsOwnMessageRegression) {
-    const auto res = parseWithTopics("orders:1,orders:2");
-    ASSERT_FALSE(res.config.has_value());
-    EXPECT_NE(res.error.find("duplicate topic name: orders"), std::string::npos) << res.error;
-}
-
-TEST(NodeConfigRegression, RuneTopicsValidNamesStillParseRegression) {
-    const std::string maxLen(249, 'x');
-    const std::string topics = "orders.v2:1,_private:1,a-b_c:2,Orders2:1,x__y:1," + maxLen + ":1";
-    const auto res = parseWithTopics(topics.c_str());
-    ASSERT_TRUE(res.config.has_value()) << res.error;
-    ASSERT_EQ(res.config->topics.size(), 6u);
-    EXPECT_EQ(res.config->topics[5].name, maxLen);
-}
-
-// Final review M5: every RUNE_TOPICS error message escapes the raw env entry (a
-// control byte in an env var must never reach the log / terminal raw).
-TEST(NodeConfigRegression, TopicsErrorMessagesEscapeTheRawEntryRegression) {
-    const std::string esc = "\x1b[31m";
-    const std::vector<std::string> entries = {
-        "orders:1,Orders:1:delete" + esc,            // fold duplicate (B3)
-        "orders:x" + esc,                             // partition count
-        "orders:1:policy" + esc,                      // positional policy
-        "orders:1:persistence=disk" + esc,            // key=value option
-        "orders:1:nosuch" + esc + "=1",               // unknown option
-        "orders:1:delete:12" + esc,                   // integer field
-    };
-    for (const std::string& e : entries) {
-        const auto r = parseWithTopics(e.c_str());
-        ASSERT_FALSE(r.error.empty()) << e;
-        EXPECT_EQ(r.error.find('\x1b'), std::string::npos) << "raw control byte in: " << r.error;
-    }
 }
 
 // ===========================================================================
@@ -3143,3 +2376,35 @@ TEST(NodeConfigCatalogStreamRegression, InsideThePerWorkerReplicationRangeIsRefu
     nc.catalogReplStreamId = 32;
     EXPECT_TRUE(nc.validateCatalogStream().has_value());
 }
+
+// ===========================================================================
+// Catalog history Task 17 (spec §8, F5): topics exist only through DDL.  The retired RUNE_TOPICS setting is an
+// explicit refusal that points at the DDL docs — never silently ignored (a broker that "starts" with no topics
+// and a stale compose file is the failure this pins).
+// ===========================================================================
+namespace rune::node {
+TEST(NodeConfigRegression, RuneTopicsIsRefusedWithAPointerToDdl) {
+    auto env = base1node();
+    env["RUNE_TOPICS"] = "events:1";
+    auto r = parseNodeConfig(fakeEnv(env));
+    EXPECT_FALSE(r.config.has_value());
+    EXPECT_NE(r.error.find("topics are created by DDL"), std::string::npos) << r.error;
+    EXPECT_NE(r.error.find("RUNE_TOPICS"), std::string::npos) << "the error names the variable: " << r.error;
+    EXPECT_NE(r.error.find("docs/SELF-HOSTING.md#topics-are-created-by-ddl"), std::string::npos) << r.error;
+}
+
+TEST(NodeConfigRegression, RuneTopicsSetToTheEmptyStringIsStillRefusedRegression) {
+    // The old parser treated an empty value as "no topics"; presence alone is the refusal now.
+    auto env = base1node();
+    env["RUNE_TOPICS"] = "";
+    auto r = parseNodeConfig(fakeEnv(env));
+    EXPECT_FALSE(r.config.has_value());
+    EXPECT_NE(r.error.find("topics are created by DDL"), std::string::npos) << r.error;
+}
+
+TEST(NodeConfigRegression, UnsetRuneTopicsBootsWithNoTopicsFieldRegression) {
+    auto r = parseNodeConfig(fakeEnv(base1node()));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    EXPECT_TRUE(r.warnings.empty());
+}
+}  // namespace rune::node

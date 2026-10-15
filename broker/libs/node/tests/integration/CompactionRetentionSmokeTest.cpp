@@ -50,6 +50,7 @@
 #include <rune/node/BrokerNode.h>
 #include "../support/OwnerThreadTestHelpers.h"  // F1: owner-thread replica probes
 #include <rune/node/NodeConfig.h>
+#include "support/TestCluster.h"
 #include "support/TestWorkerCount.h"
 #include <rune/storage/Log.h>
 #include <rune/storage/ProducerStateManager.h>
@@ -339,7 +340,6 @@ TEST(CompactionRetentionSmoke, CompactHappyPath_LatestPerKey) {
     ts.minCleanableDirtyRatio = 0.0;
     ts.deleteRetentionMs      = 86'400'000LL;
     ts.segmentRollBytes       = kRoll;
-    cfg.topics                = {ts};
     cfg.enableCompactionCoalescing = true;
 
     // -----------------------------------------------------------------------
@@ -347,6 +347,9 @@ TEST(CompactionRetentionSmoke, CompactHappyPath_LatestPerKey) {
     // using a standalone Log object.  No BrokerNode / duty-cycle thread is
     // running — all segments_ mutations are on this (test) thread only.
     // -----------------------------------------------------------------------
+    // Topics exist only through DDL: boot once to create the topic in the catalog; the data below is written
+    // into its partition dir while no node runs, and the test's own boot recovers both.
+    ASSERT_NO_FATAL_FAILURE(rune::node::test::defineTopicsThenStop(makeSmokeConfig(tmp.path), {ts}));
     const fs::path partDir = makePartitionDir(tmp.path, ts.name);
     const std::string logDir = partDir.string();
 
@@ -459,6 +462,20 @@ TEST(CompactionRetentionSmoke, TombstoneLifecycle_KIP534) {
     SmokeDir tmp{"smoke2_tombstone_"};
 
     constexpr int64_t kRoll = 128;
+    // Short delete-retention: the stamped horizon expires between Phase A and Phase C (see below).
+    constexpr int64_t kTombRetentionMs = 3'000LL;
+
+    // Topics exist only through DDL: boot once to create the topic in the catalog (the same properties in every
+    // phase).  segment.bytes is immutable in the catalog, so Phase C keeps kRoll (it ran with 64 MiB when the
+    // topic was a per-boot setting; see the Task 17 report).
+    rune::node::TopicSpec tombTopic;
+    tombTopic.name                   = "tomb-topic";
+    tombTopic.partitionCount         = 1;
+    tombTopic.cleanupPolicy          = rune::node::TopicSpec::CleanupPolicy::Compact;
+    tombTopic.minCleanableDirtyRatio = 0.0;
+    tombTopic.deleteRetentionMs      = kTombRetentionMs;
+    tombTopic.segmentRollBytes       = kRoll;
+    ASSERT_NO_FATAL_FAILURE(rune::node::test::defineTopicsThenStop(makeSmokeConfig(tmp.path), {tombTopic}));
 
     // -----------------------------------------------------------------------
     // Pre-start: write data via standalone Log (no BrokerNode running).
@@ -517,7 +534,7 @@ TEST(CompactionRetentionSmoke, TombstoneLifecycle_KIP534) {
     // tombstone's segment in Phase A; with the watermark fix the cleaner now
     // correctly reaches and stamps it, so a 1-day horizon would never expire and
     // Phase C could never drop it.)
-    constexpr int64_t kTombRetentionMs = 3'000LL; // short: expires between A and C (D25: room for slow cleaners)
+    // (kTombRetentionMs: short — expires between A and C; D25: room for slow cleaners)
     // D25: Phase A runs until the cleaner has STAMPED the tombstone's delete
     // horizon (KIP-534 attribute bit, verified on disk after a clean stop) —
     // a cleaner cycle is not necessarily a compaction pass over that segment,
@@ -528,15 +545,6 @@ TEST(CompactionRetentionSmoke, TombstoneLifecycle_KIP534) {
     for (int attempt = 0; attempt < 5 && stampedHorizonMs < 0; ++attempt) {
         {
             auto cfg2 = makeSmokeConfig(tmp.path);
-            rune::node::TopicSpec ts;
-            ts.name                   = "tomb-topic";
-            ts.partitionCount         = 1;
-            ts.topicId                = 0;
-            ts.cleanupPolicy          = rune::node::TopicSpec::CleanupPolicy::Compact;
-            ts.minCleanableDirtyRatio = 0.0;
-            ts.deleteRetentionMs      = kTombRetentionMs;
-            ts.segmentRollBytes       = kRoll;
-            cfg2.topics               = {ts};
             // Coalescing ON so the cleaner coalesces the small segments and reaches
             // the tombstone's segment (the converged, production-default behavior).
             cfg2.enableCompactionCoalescing = true;
@@ -608,15 +616,6 @@ TEST(CompactionRetentionSmoke, TombstoneLifecycle_KIP534) {
     }
     {
         auto cfg4 = makeSmokeConfig(tmp.path);
-        rune::node::TopicSpec ts3;
-        ts3.name                   = "tomb-topic";
-        ts3.partitionCount         = 1;
-        ts3.topicId                = 0;
-        ts3.cleanupPolicy          = rune::node::TopicSpec::CleanupPolicy::Compact;
-        ts3.minCleanableDirtyRatio = 0.0;
-        ts3.deleteRetentionMs      = kTombRetentionMs;
-        ts3.segmentRollBytes       = 64LL * 1024 * 1024;
-        cfg4.topics                = {ts3};
         cfg4.enableCompactionCoalescing = true;
 
         rune::node::BrokerNode node3{cfg4};
@@ -692,6 +691,9 @@ TEST(CompactionRetentionSmoke, DeleteRetention_TimeAndSize) {
     ts.fileDeleteDelayMs      = 1LL;
     ts.segmentRollBytes       = kRoll;
 
+    // Topics exist only through DDL: boot once to create the topic in the catalog; the data below is written
+    // into its partition dir while no node runs, and the test's own boot recovers both.
+    ASSERT_NO_FATAL_FAILURE(rune::node::test::defineTopicsThenStop(makeSmokeConfig(tmp.path), {ts}));
     const fs::path partDir = makePartitionDir(tmp.path, ts.name);
     const std::string logDir = partDir.string();
 
@@ -719,7 +721,6 @@ TEST(CompactionRetentionSmoke, DeleteRetention_TimeAndSize) {
     }
 
     auto cfg = makeSmokeConfig(tmp.path);
-    cfg.topics = {ts};
 
     rune::node::BrokerNode node{cfg};
     node.start();
@@ -774,6 +775,9 @@ TEST(CompactionRetentionSmoke, CompactDelete_BothRun_NoDoubleDelete) {
     ts.fileDeleteDelayMs      = 1LL;
     ts.segmentRollBytes       = kRoll;
 
+    // Topics exist only through DDL: boot once to create the topic in the catalog; the data below is written
+    // into its partition dir while no node runs, and the test's own boot recovers both.
+    ASSERT_NO_FATAL_FAILURE(rune::node::test::defineTopicsThenStop(makeSmokeConfig(tmp.path), {ts}));
     const fs::path partDir = makePartitionDir(tmp.path, ts.name);
     const std::string logDir = partDir.string();
 
@@ -808,7 +812,6 @@ TEST(CompactionRetentionSmoke, CompactDelete_BothRun_NoDoubleDelete) {
     }
 
     auto cfg = makeSmokeConfig(tmp.path);
-    cfg.topics = {ts};
     cfg.enableCompactionCoalescing = true;
 
     rune::node::BrokerNode node{cfg};
@@ -901,7 +904,6 @@ TEST(CompactionRetentionSmoke, InternalTopic_Recovery_CompactedLog) {
     } // rawLog closed; BrokerNode will recover
 
     auto cfg = makeSmokeConfig(tmp.path);
-    cfg.topics = {};
     cfg.enableCompactionCoalescing = true;
     cfg.offsetLogSegmentRollBytes  = kRoll;
 
@@ -964,6 +966,9 @@ TEST(CompactionRetentionSmoke, IdempotentDedup_SurvivesRetention) {
     ts.fileDeleteDelayMs      = 1LL;
     ts.segmentRollBytes       = kRoll;
 
+    // Topics exist only through DDL: boot once to create the topic in the catalog; the data below is written
+    // into its partition dir while no node runs, and the test's own boot recovers both.
+    ASSERT_NO_FATAL_FAILURE(rune::node::test::defineTopicsThenStop(makeSmokeConfig(tmp.path), {ts}));
     const fs::path partDir = makePartitionDir(tmp.path, ts.name);
     const std::string logDir = partDir.string();
 
@@ -1002,7 +1007,6 @@ TEST(CompactionRetentionSmoke, IdempotentDedup_SurvivesRetention) {
     }
 
     auto cfg = makeSmokeConfig(tmp.path);
-    cfg.topics = {ts};
 
     rune::node::BrokerNode node{cfg};
     node.start();
@@ -1066,6 +1070,9 @@ TEST(CompactionRetentionSmoke, RestartResume_Checkpoint) {
     ts.deleteRetentionMs      = 86'400'000LL;
     ts.segmentRollBytes       = kRoll;
 
+    // Topics exist only through DDL: boot once to create the topic in the catalog; the data below is written
+    // into its partition dir while no node runs, and the test's own boot recovers both.
+    ASSERT_NO_FATAL_FAILURE(rune::node::test::defineTopicsThenStop(makeSmokeConfig(tmp.path), {ts}));
     const fs::path partDir = makePartitionDir(tmp.path, ts.name);
     const std::string logDir = partDir.string();
 
@@ -1082,7 +1089,6 @@ TEST(CompactionRetentionSmoke, RestartResume_Checkpoint) {
     }
 
     auto cfg = makeSmokeConfig(tmp.path);
-    cfg.topics = {ts};
     cfg.enableCompactionCoalescing = false;
 
     // Phase 1: run first node, let cleaner partially compact.
@@ -1178,6 +1184,9 @@ TEST(CompactionRetentionSmoke, HwLeo_NonPerturbation) {
     ts.deleteRetentionMs      = 1LL;
     ts.segmentRollBytes       = kRoll;
 
+    // Topics exist only through DDL: boot once to create the topic in the catalog; the data below is written
+    // into its partition dir while no node runs, and the test's own boot recovers both.
+    ASSERT_NO_FATAL_FAILURE(rune::node::test::defineTopicsThenStop(makeSmokeConfig(tmp.path), {ts}));
     const fs::path partDir = makePartitionDir(tmp.path, ts.name);
     const std::string logDir = partDir.string();
 
@@ -1197,7 +1206,6 @@ TEST(CompactionRetentionSmoke, HwLeo_NonPerturbation) {
     ASSERT_GT(leoBefore, 0) << "Smoke8: LEO must be > 0 after appends";
 
     auto cfg = makeSmokeConfig(tmp.path);
-    cfg.topics = {ts};
     cfg.enableCompactionCoalescing = true;
 
     rune::node::BrokerNode node{cfg};
@@ -1269,6 +1277,9 @@ TEST(CompactionRetentionSmoke, AppendDuringCompaction_Correctness) {
     ts.deleteRetentionMs      = 86'400'000LL;
     ts.segmentRollBytes       = kRoll;
 
+    // Topics exist only through DDL: boot once to create the topic in the catalog; the data below is written
+    // into its partition dir while no node runs, and the test's own boot recovers both.
+    ASSERT_NO_FATAL_FAILURE(rune::node::test::defineTopicsThenStop(makeSmokeConfig(tmp.path), {ts}));
     const fs::path partDir = makePartitionDir(tmp.path, ts.name);
     const std::string logDir = partDir.string();
 
@@ -1287,7 +1298,6 @@ TEST(CompactionRetentionSmoke, AppendDuringCompaction_Correctness) {
     }
 
     auto cfg = makeSmokeConfig(tmp.path);
-    cfg.topics = {ts};
     cfg.enableCompactionCoalescing = true;
 
     // Phase B: let cleaner work on the initial segments.
@@ -1389,6 +1399,9 @@ TEST(CompactionRetentionSmoke, Failover_HwBounded_NoResurrection) {
     ts.deleteRetentionMs      = 86'400'000LL;
     ts.segmentRollBytes       = kRoll;
 
+    // Topics exist only through DDL: boot once to create the topic in the catalog; the data below is written
+    // into its partition dir while no node runs, and the test's own boot recovers both.
+    ASSERT_NO_FATAL_FAILURE(rune::node::test::defineTopicsThenStop(makeSmokeConfig(tmp.path), {ts}));
     const fs::path partDir = makePartitionDir(tmp.path, ts.name);
     const std::string logDir = partDir.string();
 
@@ -1409,7 +1422,6 @@ TEST(CompactionRetentionSmoke, Failover_HwBounded_NoResurrection) {
     ASSERT_GT(leoBefore, 0) << "Smoke10: LEO must be > 0";
 
     auto cfg = makeSmokeConfig(tmp.path);
-    cfg.topics = {ts};
     cfg.enableCompactionCoalescing = true;
 
     rune::node::BrokerNode node{cfg};
@@ -1521,6 +1533,9 @@ TEST(CompactionRetentionSmoke, RetentionAfterRestart) {
     ts.fileDeleteDelayMs      = 1LL;
     ts.segmentRollBytes       = kRoll;
 
+    // Topics exist only through DDL: boot once to create the topic in the catalog; the data below is written
+    // into its partition dir while no node runs, and the test's own boot recovers both.
+    ASSERT_NO_FATAL_FAILURE(rune::node::test::defineTopicsThenStop(makeSmokeConfig(tmp.path), {ts}));
     const fs::path partDir = makePartitionDir(tmp.path, ts.name);
     const std::string logDir = partDir.string();
 
@@ -1603,7 +1618,6 @@ TEST(CompactionRetentionSmoke, RetentionAfterRestart) {
     // Start BrokerNode → recover → run retention.
     // -----------------------------------------------------------------------
     auto cfg = makeSmokeConfig(tmp.path);
-    cfg.topics = {ts};
 
     rune::node::BrokerNode node{cfg};
     node.start();
@@ -1759,6 +1773,9 @@ TEST(CompactionRetentionSmoke, NewLeaderRecompactsAndServesTail) {
     ts.deleteRetentionMs      = 86'400'000LL;
     ts.segmentRollBytes       = kRoll;
 
+    // Topics exist only through DDL: boot once to create the topic in the catalog; the data below is written
+    // into its partition dir while no node runs, and the test's own boot recovers both.
+    ASSERT_NO_FATAL_FAILURE(rune::node::test::defineTopicsThenStop(makeSmokeConfig(tmp.path), {ts}));
     const fs::path partDir = makePartitionDir(tmp.path, ts.name);
     const std::string logDir = partDir.string();
 
@@ -1807,7 +1824,6 @@ TEST(CompactionRetentionSmoke, NewLeaderRecompactsAndServesTail) {
     }
 
     auto cfg = makeSmokeConfig(tmp.path);
-    cfg.topics = {ts};
     cfg.enableCompactionCoalescing = true;
 
     // Phase 2: node #1 leader — compact the sealed prefix; persist checkpoint.

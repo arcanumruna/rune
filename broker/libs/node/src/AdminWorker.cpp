@@ -248,21 +248,15 @@ std::string catalogDirOf(rune::replication::PartitionReplica* r) {
 } // namespace
 
 AdminWorker::AdminWorker(SchemaRegistry& reg,
-                         rune::replication::PartitionReplica* replica,
                          int32_t selfId,
-                         std::vector<int32_t> replicaSet,
                          AdminDeps deps,
-                         rune::replication::PartitionReplica* viewsReplica,
                          ViewRegistry* viewRegistry,
                          rune::replication::PartitionReplica* catalogReplica,
                          rune::replication::WorkerReplicationTransportImpl<rune::replication::AeronPubRegistry>*
                              catalogPlane)
     : reg_(reg)
-    , replica_(replica)
     , selfId_(selfId)
-    , replicaSet_(std::move(replicaSet))
     , deps_(std::move(deps))
-    , viewsReplica_(viewsReplica)
     , ownViews_(viewRegistry == nullptr ? std::make_unique<ViewRegistry>() : nullptr)
     , viewRegistry_(viewRegistry != nullptr ? viewRegistry : ownViews_.get())
     , catalogReplica_(catalogReplica)
@@ -405,24 +399,6 @@ std::string_view AdminWorker::inFlightStateName() const noexcept {
 }
 
 // ─── roles ──────────────────────────────────────────────────────────────────
-// The retired replica parameters (null in a broker since Task 16; the rigs may still pass
-// one): their role is driven so they stay consistent; nothing reads or writes them
-// (the catalog is the only source — binding 8), and they carry no DDL effect.
-void AdminWorker::onRole(const AdminRoleMsg& role) {
-    namespace rr = rune::replication;
-    for (rr::PartitionReplica* r : {replica_, viewsReplica_}) {
-        if (r == nullptr) continue;
-        if (role.leader) {
-            std::vector<rr::NodeId> isr;
-            isr.reserve(replicaSet_.size());
-            for (int32_t id : replicaSet_) isr.push_back(static_cast<rr::NodeId>(id));
-            r->becomeLeader(static_cast<rr::Epoch>(role.epoch), std::move(isr));
-        } else {
-            r->becomeFollower(static_cast<rr::Epoch>(role.epoch), static_cast<rr::NodeId>(role.leaderId));
-        }
-    }
-}
-
 // The role is absolute and epoch-stamped (the committed assignment); the
 // replica's own role machine handles re-asserts and refuses a leadership at an
 // epoch it already led at (restart fence → asks the controller for a bump).
@@ -562,8 +538,6 @@ int AdminWorker::doWork(int64_t nowNs) {
                                      nowNs, catalogFrameStats_);
             });
     }
-    if (replica_)      work += replica_->doWork(nowNs);        // retired parameter (null in a broker)
-    if (viewsReplica_) work += viewsReplica_->doWork(nowNs);   // retired parameter (null in a broker)
     if (catalogReplica_) {
         work += catalogReplica_->doWork(nowNs);
         if (!applyHeldForTest_) [[likely]] work += applier_.applyCommitted(*catalogReplica_);
@@ -888,14 +862,6 @@ void AdminWorker::respond_(const DdlRequest& req, const Response& r) {
 }
 
 // ─── event building ─────────────────────────────────────────────────────────
-std::optional<DdlRejection> AdminWorker::staticIdCollision_(int32_t topicId) const {
-    if (topicId < 0 || static_cast<std::size_t>(topicId) >= deps_.staticTopicNames.size()) return std::nullopt;
-    return reject(kInvalidRequest,
-                  "topic id " + std::to_string(topicId) + " is held by the static RUNE_TOPICS topic " +
-                      quotedName(deps_.staticTopicNames[static_cast<std::size_t>(topicId)]) +
-                      " — DDL-created and static topics cannot share a broker (create every topic by DDL)");
-}
-
 AdminWorker::Built AdminWorker::buildEvent_(const DdlRequest& req, const cat::CatalogState& s) const {
     Built b = std::visit([&](const auto& m) -> Built {
         using M = std::decay_t<decltype(m)>;
@@ -1012,7 +978,6 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
                                                     std::to_string(deps_.topicMinIsr)));
     // THE config rule (one validator, the library's — Task 2).
     if (auto err = cat::topicConfigError(m.config)) return Rejected(reject(kInvalidRequest, *err));
-    if (auto c = staticIdCollision_(s.nextTopicId())) return Rejected(std::move(*c));
 
     e.objectId    = s.nextObjectId();
     e.prevVersion = 0;
@@ -1130,7 +1095,6 @@ AdminWorker::Built AdminWorker::buildCreateView_(const CreateViewMsg& m, const c
     if (auto fold = foldCollision(s, m.viewName)) return Rejected(std::move(*fold));
     auto def = viewDef_(m.viewName, m.keyField, m.persistence, m.planBlob, s.nextTopicId(), s);
     if (!def) return Rejected(std::move(def.error()));
-    if (auto c = staticIdCollision_(s.nextTopicId())) return Rejected(std::move(*c));
     cat::CatalogEvent e;
     e.objectName  = m.viewName;
     e.objectId    = s.nextObjectId();
@@ -1150,7 +1114,6 @@ AdminWorker::Built AdminWorker::buildAlterView_(const AlterViewMsg& m, const cat
     // Ruling 4: a FRESH sink under the same objectId.
     auto def = viewDef_(m.name, m.keyField, m.persistence, m.planBlob, s.nextTopicId(), s);
     if (!def) return Rejected(std::move(def.error()));
-    if (auto c = staticIdCollision_(s.nextTopicId())) return Rejected(std::move(*c));
     cat::CatalogEvent e;
     e.objectName  = v->name;
     e.objectId    = v->objectId;

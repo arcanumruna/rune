@@ -26,6 +26,7 @@
 #include <rune/protocol/RecordBatch.h>
 #include "support/TestWorkerCount.h"
 #include "support/ShardTestClient.h"
+#include "support/TestCluster.h"
 #include <rune/codec/Descriptor.h>
 #include <rune/codec/Serialize.h>
 #include <rune/metadata/ShardRouter.h>
@@ -532,7 +533,7 @@ TEST(BrokerNodeTest, LogCleanerAgent_CompactsViaBrokerNode) {
     ts.minCleanableDirtyRatio = 0.0;    // compact immediately (no threshold)
     ts.deleteRetentionMs     = 86'400'000LL;
     ts.segmentRollBytes      = 128;     // tiny roll → many sealed segments fast
-    cfg.topics               = {ts};
+    ASSERT_NO_FATAL_FAILURE(rune::node::test::defineTopicsThenStop(cfg, {ts}));
 
     // -----------------------------------------------------------------------
     // Phase A (pre-start): write all data via a STANDALONE Log.
@@ -645,7 +646,8 @@ TEST(BrokerNodeTest, CoalescingEndToEndViaBrokerNode) {
     // Helper: build a NodeConfig for the test with a compact topic and a
     // configurable coalescing flag.
     // -------------------------------------------------------------------------
-    auto makeCoalescingConfig = [](const fs::path& dataDir, bool coalesce) -> NodeConfig {
+    TopicSpec coalesceTopic;   // set by makeCoalescingConfig; defined through the catalog by each arm
+    auto makeCoalescingConfig = [&coalesceTopic](const fs::path& dataDir, bool coalesce) -> NodeConfig {
         NodeConfig cfg;
         rune::node::test::pinLegacyRuntime(cfg);   // orthogonal to the worker runtime
         cfg.nodeId            = 0;
@@ -670,7 +672,7 @@ TEST(BrokerNodeTest, CoalescingEndToEndViaBrokerNode) {
         ts.deleteRetentionMs      = 86'400'000LL;
         ts.segmentRollBytes       = 128;
 
-        cfg.topics = {ts};
+        coalesceTopic = ts;
         cfg.enableCompactionCoalescing = coalesce;
         cfg.workerCount = rune::node::test::workerCountFromEnv();
         return cfg;
@@ -715,6 +717,7 @@ TEST(BrokerNodeTest, CoalescingEndToEndViaBrokerNode) {
     {
         TempDir tmp{"cp8_coal_on_"};
         NodeConfig cfg = makeCoalescingConfig(tmp.path, /*coalesce=*/true);
+        ASSERT_NO_FATAL_FAILURE(rune::node::test::defineTopicsThenStop(cfg, {coalesceTopic}));
 
         // --- Phase A (pre-start) ---
         const fs::path partDir = makePartitionDir(tmp.path, "coalesce-test");
@@ -808,6 +811,7 @@ TEST(BrokerNodeTest, CoalescingEndToEndViaBrokerNode) {
     {
         TempDir tmp{"cp8_coal_off_"};
         NodeConfig cfg = makeCoalescingConfig(tmp.path, /*coalesce=*/false);
+        ASSERT_NO_FATAL_FAILURE(rune::node::test::defineTopicsThenStop(cfg, {coalesceTopic}));
 
         // --- Phase A (pre-start) ---
         const fs::path partDir = makePartitionDir(tmp.path, "coalesce-test");
@@ -876,10 +880,8 @@ TEST(BrokerNodeTest, CoalescingEndToEndViaBrokerNode) {
 // ===========================================================================
 // CP-10 Fix 1: ioMaxBytesPerSecond wiring — proves a set value reaches the Throttler
 //
-// Two arms:
-//   A: All topics have ioMaxBytesPerSecond = -1 (default) → throttle rate = -1.
-//   B: One topic has ioMaxBytesPerSecond = 1048576 (1 MiB/s) → throttle rate = 1048576.
-//      A second topic with ioMaxBytesPerSecond = 2097152 → min wins → 1048576.
+// One arm remains:
+//   A: no topic sets ioMaxBytesPerSecond (the only value a catalog topic can carry) → throttle rate = -1.
 //
 // The test calls BrokerNode::cleanerThrottleRateForTest() which reads the
 // LogCleanerAgent's throttler_ rate.  No Aeron needed — the cleaner agent is
@@ -890,8 +892,7 @@ TEST(BrokerNodeTest, CP10_IoMaxBytesPerSecond_ReachesThrottler) {
     {
         TempDir tmp{"cp10_thr_a_"};
         fs::create_directories(tmp.path);
-        NodeConfig cfg = makeSingleNodeConfig(tmp.path);
-        cfg.topics.clear(); // no topics
+        NodeConfig cfg = makeSingleNodeConfig(tmp.path);   // no topics: a fresh catalog is empty
 
         BrokerNode node{cfg};
         // cleanerAgent_ is created in buildGateway() during start().
@@ -905,50 +906,9 @@ TEST(BrokerNodeTest, CP10_IoMaxBytesPerSecond_ReachesThrottler) {
         // Note: node not started — cleanerAgent_ constructed in start(); skip start for speed.
     }
 
-    // Arm B: topic with ioMaxBytesPerSecond = 1 MiB/s.
-    // BrokerNode::start() creates cleanerAgent_ (via buildGateway) with the
-    // min ioMaxBytesPerSecond across all topics = 1 MiB/s.
-    {
-        TempDir tmp{"cp10_thr_b_"};
-        fs::create_directories(tmp.path);
-        NodeConfig cfg = makeSingleNodeConfig(tmp.path);
-
-        constexpr int64_t kRate1 = 1LL * 1024 * 1024;   // 1 MiB/s
-        constexpr int64_t kRate2 = 2LL * 1024 * 1024;   // 2 MiB/s
-
-        TopicSpec ts1;
-        ts1.name                 = "topic-a";
-        ts1.partitionCount       = 1;
-        ts1.topicId              = 0;
-        ts1.cleanupPolicy        = TopicSpec::CleanupPolicy::Compact;
-        ts1.ioMaxBytesPerSecond  = kRate1;
-        ts1.segmentRollBytes     = 128;
-
-        TopicSpec ts2;
-        ts2.name                 = "topic-b";
-        ts2.partitionCount       = 1;
-        ts2.topicId              = 1;
-        ts2.cleanupPolicy        = TopicSpec::CleanupPolicy::Compact;
-        ts2.ioMaxBytesPerSecond  = kRate2;
-        ts2.segmentRollBytes     = 128;
-
-        cfg.topics = {ts1, ts2};
-
-        BrokerNode node{cfg};
-        node.start();
-        ASSERT_TRUE(node.awaitLeader(std::chrono::milliseconds{2000}))
-            << "CP-10 Fix-1 test node must self-elect";
-
-        // The minimum of kRate1 and kRate2 is kRate1.
-        EXPECT_EQ(node.cleanerThrottleRateForTest(), kRate1)
-            << "With two topics (1MiB/s and 2MiB/s), the cleaner throttle must be "
-               "min(1MiB/s, 2MiB/s) = 1MiB/s.  Got: "
-            << node.cleanerThrottleRateForTest()
-            << ".  Fix-1 wiring: BrokerNode::start() must compute min(topic.ioMaxBytesPerSecond) "
-               "and pass it to LogCleanerAgent.";
-
-        node.stop();
-    }
+    // Arm B (a topic with ioMaxBytesPerSecond = 1 MiB/s, a second with 2 MiB/s -> min wins) is GONE with
+    // NodeConfig::topics: ioMaxBytesPerSecond is not a DDL option, so no catalog topic can carry a value
+    // other than the default -1 (see the Task 17 report).
 }
 
 // ===========================================================================
@@ -970,12 +930,11 @@ TEST(BrokerNodeTest, M1_AllInSyncDurabilityWiresEndToEnd) {
     ts.topicId        = 0;
     ts.durability     = 1; // AllInSync
 
-    cfg.topics = {ts};
-
     BrokerNode node{cfg};
     node.start();
 
     ASSERT_TRUE(node.awaitLeader(2s)) << "single-node must self-elect within 2 s";
+    ASSERT_EQ(rune::node::test::TestCluster({&node}).defineTopic(ts), 0);
 
     ASSERT_TRUE(rune::node::test::hasReplica(node)) << "replica must exist for topic 0 partition 0";
 
@@ -1013,12 +972,11 @@ TEST(BrokerNodeTest, M1_TransientPartitionSkipsCleaner) {
     ts.minCleanableDirtyRatio = 0.0;  // would fire immediately on disk topics
     ts.persistence           = PersistenceMode::Transient;
 
-    cfg.topics = {ts};
-
     BrokerNode node{cfg};
     node.start();
 
     ASSERT_TRUE(node.awaitLeader(2s)) << "single-node must self-elect within 2 s";
+    ASSERT_EQ(rune::node::test::TestCluster({&node}).defineTopic(ts), 0);
     ASSERT_TRUE(waitFor([&] { return node.replicationIsLeaderForTest(); }, 2s))
         << "replication bridge must propagate leadership";
 
@@ -1093,11 +1051,11 @@ TEST(BrokerNodeTest, PerWorkerEgressWiredWithContiguousStreams) {
     ts.name           = "egress-topic";
     ts.partitionCount = 4;      // spread across the 2 workers
     ts.topicId        = 0;
-    cfg.topics        = {ts};
 
     BrokerNode node{cfg};
     ASSERT_NO_THROW(node.start());
     ASSERT_TRUE(node.awaitLeader(3s));
+    ASSERT_EQ(rune::node::test::TestCluster({&node}).defineTopic(ts), 0);
 
     const auto& egresses = node.workerEgressesForTest();
     ASSERT_EQ(egresses.size(), 2u) << "one WorkerEgress per worker";
@@ -1698,7 +1656,6 @@ TEST(BrokerNodeTest, OwnerThreadHookRunsOnTrueOwnerThreadRegression) {
     ts.name           = "f1";
     ts.partitionCount = 8;
     ts.topicId        = 0;
-    cfg.topics = {ts};
 
     BrokerNode node{cfg};
     auto threadOf = [](PartitionReplica&) { return std::this_thread::get_id(); };
@@ -1708,6 +1665,7 @@ TEST(BrokerNodeTest, OwnerThreadHookRunsOnTrueOwnerThreadRegression) {
 
     node.start();
     ASSERT_TRUE(node.awaitLeader(2s));
+    ASSERT_EQ(rune::node::test::TestCluster({&node}).defineTopic(ts), 0);
     ASSERT_TRUE(waitFor([&] { return node.replicationIsLeaderForTest(); }, 2s));
 
     const auto testTid    = std::this_thread::get_id();
@@ -1776,11 +1734,11 @@ TEST(BrokerNodeTest, OwnerThreadHookTimeoutCancelsTaskRegression) {
     ts.name           = "f1c";
     ts.partitionCount = 1;
     ts.topicId        = 0;
-    cfg.topics = {ts};
 
     BrokerNode node{cfg};
     node.start();
     ASSERT_TRUE(node.awaitLeader(2s));
+    ASSERT_EQ(rune::node::test::TestCluster({&node}).defineTopic(ts), 0);
 
     // Occupy the control thread with a task that blocks until released (hard cap).
     std::promise<void> started, release;
@@ -1845,7 +1803,6 @@ TEST(BrokerNodeRegression, GatewayAndEveryWorkerShareTheOneBatchLimit) {
     ts.name           = "wave2-limit";
     ts.partitionCount = 4;
     ts.topicId        = 0;
-    cfg.topics        = {ts};
 
     const std::size_t formula = Worker::maxAcceptableBatchBytes(
         static_cast<std::size_t>(cfg.workerIngressRingBytes),
@@ -1858,6 +1815,8 @@ TEST(BrokerNodeRegression, GatewayAndEveryWorkerShareTheOneBatchLimit) {
 
     BrokerNode node{cfg};
     node.start();
+    ASSERT_TRUE(node.awaitLeader(10s));
+    ASSERT_EQ(rune::node::test::TestCluster({&node}).defineTopic(ts), 0);
     ASSERT_NE(node.gatewayForTest(), nullptr);
     EXPECT_EQ(node.gatewayForTest()->maxProduceBatchBytes(), formula);
     int workers = 0;
@@ -1924,8 +1883,8 @@ TEST(BrokerNodeRegression, GatewayConstructionFailureRefusesToStartNotHeadless) 
 // ---------------------------------------------------------------------------
 // Catalog history Task 9: a DISK topic created by DDL comes back after a restart
 // from the __catalog boot replay — at its catalog id, WITH its data: boot's topic
-// dir reconcile claims the catalog's live topics (the interim scan until Task
-// 16), so the dir is never quarantined and the topic never restarts empty.
+// dir reconcile claims the catalog's live topics (topic dirs are claimed by the
+// catalog), so the dir is never quarantined and the topic never restarts empty.
 TEST(BrokerNodeRegression, CatalogDiskTopicKeepsItsDataAcrossARestartRegression) {
     using Clock = std::chrono::steady_clock;
     using rune::replication::PartitionReplica;
@@ -2184,8 +2143,7 @@ TEST(BrokerNodeRegression, CatalogDefineTopicOkIsNeverSentForATopicNotBuiltRegre
 TEST(BrokerNodeRegression, CaseVariantDefineTopicIsTopicExistsEndToEndRegression) {
     const fs::path dir = makeTempDataDir("case_fold_e2e_");
     NodeConfig cfg = makeSingleNodeConfig(dir);
-    // Catalog history Task 9: DDL-created and static topics never share a broker
-    // (the catalog's ids would collide) — the case rule is the catalog's own.
+    // The case rule is the catalog's own.
     BrokerNode node{cfg};
     node.start();
     ASSERT_TRUE(node.awaitLeader(30s));

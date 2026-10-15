@@ -15,6 +15,7 @@
 //   1. FullClusterColdRestartBumpsEveryUserPartitionEpochRegression
 //   2. StaleSameEpochTailTruncatedAfterRestartRegression
 //   3. SingleNodeRestartBumpsLeaderEpochRegression
+#include "support/TestCluster.h"
 #include "support/OwnerThreadTestHelpers.h"
 #include "support/ShardTestClient.h"
 
@@ -88,7 +89,7 @@ struct Ports {
 };
 
 // Default runtime (shard mode, one worker, thread placement), 3 nodes.
-NodeConfig makeConfig(int nodeId, const fs::path& dataDir, const Ports& p, int32_t partitions,
+NodeConfig makeConfig(int nodeId, const fs::path& dataDir, const Ports& p,
                       int32_t minIsr = 2, int64_t electionMs = 150) {
     NodeConfig cfg;
     cfg.nodeId = nodeId;
@@ -120,8 +121,6 @@ NodeConfig makeConfig(int nodeId, const fs::path& dataDir, const Ports& p, int32
     }
     cfg.clientEndpoint.channel  = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(p.client[nodeId]);
     cfg.clientEndpoint.streamId = kClientStream;
-    TopicSpec t; t.name = kTopic; t.partitionCount = partitions; t.topicId = 0;
-    cfg.topics.push_back(t);
     return cfg;
 }
 
@@ -207,6 +206,13 @@ void startAll(std::array<std::unique_ptr<BrokerNode>, 3>& ns, const std::array<N
         ns[static_cast<std::size_t>(i)] = std::make_unique<BrokerNode>(cfg[static_cast<std::size_t>(i)]);
         ns[static_cast<std::size_t>(i)]->start();
     }
+}
+
+/// Topics exist only through DDL: the test topic (`partitions` partitions), defined through the catalog once
+/// every node is up.  A restart recovers it from __catalog.
+int32_t defineTestTopic(const std::array<std::unique_ptr<BrokerNode>, 3>& ns, int32_t partitions) {
+    TopicSpec t; t.name = kTopic; t.partitionCount = partitions;
+    return rune::node::test::TestCluster({ns[0].get(), ns[1].get(), ns[2].get()}).defineTopic(t);
 }
 
 std::vector<uint8_t> payload(uint8_t fill) { return std::vector<uint8_t>(16, fill); }
@@ -303,14 +309,15 @@ TEST(EpochRestartRegression, FullClusterColdRestartBumpsEveryUserPartitionEpochR
     constexpr int32_t kParts = 3;
     TmpDir d0{"c0"}, d1{"c1"}, d2{"c2"};
     const auto ports = Ports::discover(3);
-    std::array<NodeConfig, 3> cfg{makeConfig(0, d0.path, ports, kParts),
-                                  makeConfig(1, d1.path, ports, kParts),
-                                  makeConfig(2, d2.path, ports, kParts)};
+    std::array<NodeConfig, 3> cfg{makeConfig(0, d0.path, ports),
+                                  makeConfig(1, d1.path, ports),
+                                  makeConfig(2, d2.path, ports)};
     std::array<Epoch, kParts> oldEpoch{};
     {
         std::array<std::unique_ptr<BrokerNode>, 3> ns;
         startAll(ns, cfg, {0, 1, 2});
         for (auto& n : ns) ASSERT_TRUE(n->awaitLeader(30s));
+        ASSERT_EQ(defineTestTopic(ns, kParts), 0);
         for (int32_t p = 0; p < kParts; ++p) {
             ASSERT_TRUE(produceAny(raw(ns), p, static_cast<uint8_t>(0xA0 + p), 3));
             ASSERT_TRUE(eventually([&] { return settledWith(raw(ns), p, 3) >= 0; }))
@@ -379,8 +386,8 @@ TEST(EpochRestartRegression, FullClusterColdRestartBumpsEveryUserPartitionEpochR
 TEST(EpochRestartRegression, StaleSameEpochTailTruncatedAfterRestartRegression) {
     TmpDir d0{"s0"}, d1{"s1"}, d2{"s2"};
     const auto ports = Ports::discover(3);
-    std::array<NodeConfig, 3> cfg{makeConfig(0, d0.path, ports, 1), makeConfig(1, d1.path, ports, 1),
-                                  makeConfig(2, d2.path, ports, 1)};
+    std::array<NodeConfig, 3> cfg{makeConfig(0, d0.path, ports), makeConfig(1, d1.path, ports),
+                                  makeConfig(2, d2.path, ports)};
     const std::array<fs::path, 3> dirs{d0.path, d1.path, d2.path};
     constexpr int kK = 4;      // committed before the restart
     constexpr int kStale = 3;  // fabricated stale tail on the follower
@@ -391,6 +398,7 @@ TEST(EpochRestartRegression, StaleSameEpochTailTruncatedAfterRestartRegression) 
         std::array<std::unique_ptr<BrokerNode>, 3> ns;
         startAll(ns, cfg, {0, 1, 2});
         for (auto& n : ns) ASSERT_TRUE(n->awaitLeader(30s));
+        ASSERT_EQ(defineTestTopic(ns, 1), 0);
         ASSERT_TRUE(produceAny(raw(ns), 0, 0xC0, kK));
         ASSERT_TRUE(eventually([&] { leader = settledWith(raw(ns), 0, kK); return leader >= 0; }))
             << "the K records never settled on every replica";
@@ -455,12 +463,13 @@ TEST(EpochRestartRegression, SingleNodeRestartBumpsLeaderEpochRegression) {
     // the restarted node finds itself the committed leader at its old epoch
     // (the docker DR window: a fast container restart).
     constexpr int64_t kSlowLivenessMs = 3000;
-    std::array<NodeConfig, 3> cfg{makeConfig(0, d0.path, ports, kParts, 2, kSlowLivenessMs),
-                                  makeConfig(1, d1.path, ports, kParts, 2, kSlowLivenessMs),
-                                  makeConfig(2, d2.path, ports, kParts, 2, kSlowLivenessMs)};
+    std::array<NodeConfig, 3> cfg{makeConfig(0, d0.path, ports, 2, kSlowLivenessMs),
+                                  makeConfig(1, d1.path, ports, 2, kSlowLivenessMs),
+                                  makeConfig(2, d2.path, ports, 2, kSlowLivenessMs)};
     std::array<std::unique_ptr<BrokerNode>, 3> ns;
     startAll(ns, cfg, {0, 1, 2});
     for (auto& n : ns) ASSERT_TRUE(n->awaitLeader(30s));
+    ASSERT_EQ(defineTestTopic(ns, kParts), 0);
     // Produce on every partition, then pick a settled partition led by a node
     // other than the controller (the controller survives the restart).
     for (int32_t p = 0; p < kParts; ++p) {
@@ -524,12 +533,13 @@ TEST(EpochRestartRegression, QuorumLossKillControllerAndFollowerRecoversCommitte
     constexpr int kK = 5;
     TmpDir d0{"q0"}, d1{"q1"}, d2{"q2"};
     const auto ports = Ports::discover(3);
-    std::array<NodeConfig, 3> cfg{makeConfig(0, d0.path, ports, kParts), makeConfig(1, d1.path, ports, kParts),
-                                  makeConfig(2, d2.path, ports, kParts)};
+    std::array<NodeConfig, 3> cfg{makeConfig(0, d0.path, ports), makeConfig(1, d1.path, ports),
+                                  makeConfig(2, d2.path, ports)};
     for (auto& c : cfg) c.controlledShutdownMs = 0;   // SIGKILL parity: no hand-off
     std::array<std::unique_ptr<BrokerNode>, 3> ns;
     startAll(ns, cfg, {0, 1, 2});
     for (auto& n : ns) ASSERT_TRUE(n->awaitLeader(30s));
+    ASSERT_EQ(defineTestTopic(ns, kParts), 0);
     for (int32_t p = 0; p < kParts; ++p) {
         ASSERT_TRUE(produceAny(raw(ns), p, static_cast<uint8_t>(0xA0 + p), kK));
         ASSERT_TRUE(eventually([&] { return settledWith(raw(ns), p, kK) >= 0; })) << "partition " << p;

@@ -91,6 +91,7 @@
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/node/BrokerNode.h>
+#include "support/TestCluster.h"
 #include "../support/OwnerThreadTestHelpers.h"
 #include <rune/node/NodeConfig.h>
 #include <rune/node/ReplicaRegistry.h>
@@ -174,6 +175,14 @@ static std::vector<uint8_t> makePwPayload(uint8_t fill = 0xAB, std::size_t size 
     return std::vector<uint8_t>(size, fill);
 }
 
+/// The test topic (topics exist only through DDL: created through the catalog once the nodes are up).
+inline rune::node::TopicSpec pwTopic() {
+    rune::node::TopicSpec topic;
+    topic.name           = "pwtopic";
+    topic.partitionCount = 1;
+    return topic;
+}
+
 // ---------------------------------------------------------------------------
 // makePwConfig — build a 3-node NodeConfig with:
 //   perWorkerReplication = true
@@ -236,11 +245,6 @@ static rune::node::NodeConfig makePwConfig(
         std::to_string(kPorts[static_cast<std::size_t>(nodeId)]);
     cfg.clientEndpoint.streamId = 110;
 
-    rune::node::TopicSpec topic;
-    topic.name           = "pwtopic";
-    topic.partitionCount = 1;
-    topic.topicId        = 0;
-    cfg.topics.push_back(topic);
 
     return cfg;
 }
@@ -351,6 +355,7 @@ TEST(PerWorkerReplication, AcksAllThreeNodeReplicatesAndCommits) {
     ASSERT_TRUE(node0->awaitLeader(30s)) << "node0 must converge to a leader";
     ASSERT_TRUE(node1->awaitLeader(30s)) << "node1 must converge to a leader";
     ASSERT_TRUE(node2->awaitLeader(30s)) << "node2 must converge to a leader";
+    ASSERT_EQ(rune::node::test::TestCluster({node0.get(), node1.get(), node2.get()}).defineTopic(pwTopic()), 0);
 
     // F17: resolve the PARTITION leader (not node0->leaderId(), the consensus leader).
     std::array<rune::node::BrokerNode*, 3> nodes = {node0.get(), node1.get(), node2.get()};
@@ -491,6 +496,7 @@ TEST(PerWorkerReplication, RollingLeaderKillNoCommittedLossRegression) {
     ASSERT_TRUE(node0->awaitLeader(30s)) << "node0 must converge to a leader";
     ASSERT_TRUE(node1->awaitLeader(30s)) << "node1 must converge to a leader";
     ASSERT_TRUE(node2->awaitLeader(30s)) << "node2 must converge to a leader";
+    ASSERT_EQ(rune::node::test::TestCluster({node0.get(), node1.get(), node2.get()}).defineTopic(pwTopic()), 0);
 
     // F17: resolve the PARTITION leader (not node0->leaderId(), the consensus leader).
     std::array<rune::node::BrokerNode*, 3> nodes = {node0.get(), node1.get(), node2.get()};
@@ -772,6 +778,7 @@ TEST(PerWorkerReplication, EpochChangeNoCommittedLossAndConverges) {
     ASSERT_TRUE(node0->awaitLeader(30s));
     ASSERT_TRUE(node1->awaitLeader(30s));
     ASSERT_TRUE(node2->awaitLeader(30s));
+    ASSERT_EQ(rune::node::test::TestCluster({node0.get(), node1.get(), node2.get()}).defineTopic(pwTopic()), 0);
 
     // F17: resolve the PARTITION leader (not node0->leaderId(), the consensus leader).
     std::array<rune::node::BrokerNode*, 3> nodes = {node0.get(), node1.get(), node2.get()};
@@ -1120,6 +1127,7 @@ void runLargeBatchAcksAllCommits(bool perWorkerReplication, std::string_view tag
     for (int i = 0; i < 3; ++i) nodes[i] = std::make_unique<rune::node::BrokerNode>(cfgs[i]);
     for (auto& n : nodes) n->start();
     for (auto& n : nodes) ASSERT_TRUE(n->awaitLeader(30s));
+    ASSERT_EQ(rune::node::test::TestCluster({nodes[0].get(), nodes[1].get(), nodes[2].get()}).defineTopic(pwTopic()), 0);
 
     // The PARTITION leader (the replica whose owner-thread role is Leader) — not
     // assumed to be the consensus leader, which may lag/differ under slow
@@ -1227,6 +1235,7 @@ void runUnservableBatchEvictsFollowers(bool perWorkerReplication, std::string_vi
     for (int i = 0; i < 3; ++i) nodes[i] = std::make_unique<rune::node::BrokerNode>(cfgs[i]);
     for (auto& n : nodes) n->start();
     for (auto& n : nodes) ASSERT_TRUE(n->awaitLeader(30s));
+    ASSERT_EQ(rune::node::test::TestCluster({nodes[0].get(), nodes[1].get(), nodes[2].get()}).defineTopic(pwTopic()), 0);
 
     rune::node::BrokerNode* leaderPtr = nullptr;
     {
@@ -1328,6 +1337,7 @@ TEST(LargeBatchReplicationRegression, MultiBatchPushAboveFollowerFrameNeverWedge
     for (int i = 0; i < 3; ++i) nodes[i] = std::make_unique<rune::node::BrokerNode>(cfgs[i]);
     for (auto& n : nodes) n->start();
     for (auto& n : nodes) ASSERT_TRUE(n->awaitLeader(30s));
+    ASSERT_EQ(rune::node::test::TestCluster({nodes[0].get(), nodes[1].get(), nodes[2].get()}).defineTopic(pwTopic()), 0);
     std::array<rune::node::BrokerNode*, 3> raw{nodes[0].get(), nodes[1].get(), nodes[2].get()};
     const int lid = resolvePartitionLeader({raw.begin(), raw.end()});
     ASSERT_GE(lid, 0);
@@ -1425,6 +1435,7 @@ void runExactEffectiveMaxReplicates(bool perWorker) {
     for (int i = 0; i < 3; ++i) nodes[i] = std::make_unique<rune::node::BrokerNode>(cfgs[i]);
     for (auto& n : nodes) n->start();
     for (auto& n : nodes) ASSERT_TRUE(n->awaitLeader(30s));
+    ASSERT_EQ(rune::node::test::TestCluster({nodes[0].get(), nodes[1].get(), nodes[2].get()}).defineTopic(pwTopic()), 0);
 
     // D8: follow the CURRENT leader — under CPU contention leadership can move between the first leaderId()
     // read and the partition role settling; pinning the first answer waited 30 s on a node that never led.

@@ -19,7 +19,7 @@
 //
 // Estimate (documented, deliberately conservative):
 //   need = kBaseFds
-//        + sum over configured topics of
+//        + sum over the catalog's topics of
 //            partitionCount * (openSegments(topic) * kFdsPerSegment + kE1dFdsPerLog)
 //        + kInternalPartitionsReserve * (kDefaultOpenSegments * kFdsPerSegment + kE1dFdsPerLog)
 //   openSegments(topic) = retentionBytes > 0
@@ -39,6 +39,7 @@
 // Kubernetes inherits the container runtime's limit.  See docs/operations.
 #include <rune/node/NodeConfig.h>
 #include <cstdint>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -55,7 +56,7 @@ inline constexpr uint64_t kInternalPartitionsReserve = 64;
 /// may hold up to NodeConfig::segmentProvisionDepth READY segments per user
 /// partition (kFdsPerSegment fds each) — counted so the startup check never
 /// passes while the provisioner later hits EMFILE.
-[[nodiscard]] uint64_t estimateFdNeed(const std::vector<TopicSpec>& topics,
+[[nodiscard]] uint64_t estimateFdNeed(std::span<const TopicSpec> topics,
                                       uint64_t readySegmentsPerPartition = 0) noexcept;
 
 enum class FdLimitVerdict : uint8_t { Ok, Warn, Refuse };
@@ -68,8 +69,9 @@ struct FdLimitDecision {
 /// hard < need * 1.25.  `unlimited` = the hard limit is RLIM_INFINITY.
 [[nodiscard]] FdLimitDecision decideFdLimit(uint64_t soft, uint64_t hard, bool unlimited, uint64_t need);
 
-/// Startup: getrlimit, decide, setrlimit(soft = hard), log both values.
+/// Startup: getrlimit, decide, setrlimit(soft = hard), log both values.  `topics` are the topics the
+/// __catalog boot replay produced (BrokerNode::start passes bootTopics_) — topics exist only through DDL.
 /// Returns false (and sets `error`) when the broker must refuse to start.
-bool applyFdLimitAtStartup(const NodeConfig& cfg, std::string& error);
+bool applyFdLimitAtStartup(const NodeConfig& cfg, std::span<const TopicSpec> topics, std::string& error);
 
 } // namespace rune::node

@@ -18,7 +18,7 @@ inline void createOk(DdlHarness& h, Op op, const std::string& name, const std::s
     ASSERT_EQ(h.response(c)->err, kOk) << opName(op) << " '" << name << "'";
 }
 /// An UNTYPED topic (an empty descriptor) created by DDL — the former static
-/// schema-less RUNE_TOPICS topic.
+/// schema-less static topic.
 inline int64_t submitUntyped(DdlHarness& h, const std::string& name, uint8_t persistence = 0) {
     DefineTopicMsg m;
     m.name = name; m.partitionCount = 1; m.persistence = persistence;

@@ -72,6 +72,7 @@
 // Integration-only headers (require Aeron)
 #include <rune/replication/PartitionReplica.h>
 #include <rune/node/BrokerNode.h>
+#include "support/TestCluster.h"
 #include <rune/node/EmbeddedDriver.h>
 #include "../support/OwnerThreadTestHelpers.h"  // F1: owner-thread replica probes
 #include <rune/node/NodeConfig.h>
@@ -294,6 +295,14 @@ static std::vector<uint16_t> tx2bFreePorts(int n) {
     return ports;
 }
 
+/// The test topic (topics exist only through DDL: created through the catalog once the nodes are up).
+inline rune::node::TopicSpec psmTopic() {
+    rune::node::TopicSpec topic;
+    topic.name           = "psmtopic";
+    topic.partitionCount = 1;
+    return topic;
+}
+
 // NodeConfig for a 3-node cluster.
 static rune::node::NodeConfig makeTx2bConfig(
     int nodeId,
@@ -328,11 +337,6 @@ static rune::node::NodeConfig makeTx2bConfig(
         std::to_string(kPorts[static_cast<std::size_t>(nodeId)]);
     cfg.clientEndpoint.streamId = 73;
 
-    rune::node::TopicSpec topic;
-    topic.name           = "psmtopic";
-    topic.partitionCount = 1;
-    topic.topicId        = 0;
-    cfg.topics.push_back(topic);
 
     return cfg;
 }
@@ -541,6 +545,7 @@ TEST(TX2b_GatewayDriven, FailoverDedup_HandleProducePath) {
     ASSERT_TRUE(node0->awaitLeader(8s));
     ASSERT_TRUE(node1->awaitLeader(8s));
     ASSERT_TRUE(node2->awaitLeader(8s));
+    ASSERT_EQ(rune::node::test::TestCluster({node0.get(), node1.get(), node2.get()}).defineTopic(psmTopic()), 0);
     std::array<rune::node::BrokerNode*, 3> allNodes{
         node0.get(), node1.get(), node2.get()};
     // D11: the PARTITION leader (owner-thread role, settled) — not the consensus leader.

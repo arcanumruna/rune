@@ -1,5 +1,5 @@
 // TransientTopicDataPathTest.cpp — Phase 2b E2, in-process BrokerNodes over
-// REAL Aeron UDP: a TRANSIENT topic (static RUNE_TOPICS persistence=transient,
+// REAL Aeron UDP: a TRANSIENT topic (created by DDL with persistence=transient,
 // topic 0 "tt") produces and is consumed in shard mode (the default: produce on
 // the worker's ingress, Records pushed by the worker) and in legacy mode
 // (produce + PushRead through the gateway); acks=all is replicated to a
@@ -7,6 +7,7 @@
 // a transient topic DEFINED AT RUNTIME (DefineTopic persistence=1) is served
 // once its DDL OK arrives (C1: the OK is held until the topic serves) — through
 // the legacy gateway this answered UnknownPartition (8) before E2.
+#include "support/TestCluster.h"
 #include "support/OwnerThreadTestHelpers.h"
 #include "support/ShardTestClient.h"
 #include "support/TransientMatrixExpectations.h"
@@ -78,8 +79,7 @@ struct Ports {
 };
 
 NodeConfig makeConfig(int nodeId, const fs::path& dataDir, const Ports& p, int nodes, bool shard,
-                      int32_t ringBytes = 0 /* 0 = the default 8 MiB */,
-                      PersistenceMode persistence = PersistenceMode::Transient) {
+                      int32_t ringBytes = 0 /* 0 = the default 8 MiB */) {
     NodeConfig cfg;
     cfg.nodeId = nodeId;
     cfg.dataDir = dataDir.string();
@@ -111,11 +111,17 @@ NodeConfig makeConfig(int nodeId, const fs::path& dataDir, const Ports& p, int n
     }
     cfg.clientEndpoint.channel  = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(p.client[nodeId]);
     cfg.clientEndpoint.streamId = kClientStream;
-    TopicSpec t;
-    t.name = "tt"; t.partitionCount = 1; t.topicId = 0;
-    t.persistence = persistence;   // topic 0 "tt": transient unless a cell asks for its disk twin
-    cfg.topics.push_back(t);
     return cfg;
+}
+
+/// Topic 0 "tt": transient unless a cell asks for its disk twin — created through the catalog (topics exist
+/// only through DDL) once the nodes are up.
+int32_t defineTt(std::vector<BrokerNode*> nodes, PersistenceMode persistence = PersistenceMode::Transient,
+                 int16_t rf = 0, int32_t partitions = 1) {
+    TopicSpec t;
+    t.name = "tt"; t.partitionCount = partitions; t.replicationFactor = rf;
+    t.persistence = persistence;
+    return rune::node::test::TestCluster(std::move(nodes)).defineTopic(t);
 }
 
 std::string gatewayChannel(const Ports& p, int node) {
@@ -160,6 +166,7 @@ TEST(TransientTopicDataPathRegression, ShardProduceAndSubscribeEarliestLatestOff
     BrokerNode node{makeConfig(0, dir.path, ports, 1, /*shard=*/true)};
     node.start();
     ASSERT_TRUE(node.awaitLeader(10'000ms));
+    ASSERT_EQ(defineTt({&node}), 0);
     {
         ShardTestClient c(cdir.path);
         const int64_t sid = c.connect(gatewayChannel(ports, 0), kClientStream);
@@ -206,6 +213,7 @@ TEST(TransientTopicDataPathRegression, LegacyModeProduceAndSubscribeRegression) 
     BrokerNode node{makeConfig(0, dir.path, ports, 1, /*shard=*/false)};
     node.start();
     ASSERT_TRUE(node.awaitLeader(10'000ms));
+    ASSERT_EQ(defineTt({&node}), 0);
     EXPECT_EQ(node.shardDriverCountForTest(), 0u);
     {
         ShardTestClient c(cdir.path);
@@ -231,6 +239,7 @@ TEST(TransientTopicDataPathRegression, ThreeNodeAcksAllIsOnAMajorityBeforeTheAck
     BrokerNode n2{makeConfig(2, d2.path, ports, 3, true)};
     n0.start(); n1.start(); n2.start();
     ASSERT_TRUE(n0.awaitLeader(15'000ms));
+    ASSERT_EQ(defineTt({&n0, &n1, &n2}), 0);
     int32_t leader = -1;
     {
         ShardTestClient c(cdir.path);
@@ -266,6 +275,7 @@ TEST(TransientTopicDataPathRegression, RestartKeepsTheTopicAndEmptiesItRegressio
         BrokerNode node{cfg};
         node.start();
         ASSERT_TRUE(node.awaitLeader(10'000ms));
+        ASSERT_EQ(defineTt({&node}), 0);
         {
             ShardTestClient c(c1.path);
             const int64_t sid = c.connect(gatewayChannel(ports, 0), kClientStream);
@@ -304,10 +314,7 @@ TEST(TransientTopicDataPathRegression, RestartKeepsTheTopicAndEmptiesItRegressio
 TEST(TransientTopicDataPathRegression, LegacyRuntimeTransientDefineThenProduceAndSubscribeRegression) {
     TmpDir dir{"rt_legacy"}, cdir{"rt_legacy_c"};
     const auto ports = Ports::discover(1);
-    // Catalog history Task 9: a DDL topic never shares a broker with static
-    // RUNE_TOPICS topics (their ids would collide with the catalog's).
     NodeConfig cfg = makeConfig(0, dir.path, ports, 1, /*shard=*/false);
-    cfg.topics.clear();
     BrokerNode node{cfg};
     node.start();
     ASSERT_TRUE(node.awaitLeader(10'000ms));
@@ -385,16 +392,16 @@ TEST_P(TransientSliceRegression, ProduceAndSubscribeCells) {
     TmpDir dir{"slice"}, c1{"slice_c1"}, c2{"slice_c2"};
     const auto ports = Ports::discover(1);
     NodeConfig cfg = makeConfig(0, dir.path, ports, 1, shard, /*ringBytes=*/evict ? 16 * 1024 : 0);
-    // Catalog history Task 9: a DDL topic never shares a broker with static
-    // RUNE_TOPICS topics (their ids would collide with the catalog's).
-    if (commit == mx::Commit::Uncommitted) cfg.topics.clear();
     auto node = std::make_unique<BrokerNode>(cfg);
     node->start();
     ASSERT_TRUE(node->awaitLeader(10'000ms));
+    // The committed cells run on topic 0 "tt" (created here through the catalog); the CommitLandsMidOp cell
+    // defines its own topic below, over the wire.
+    if (commit != mx::Commit::Uncommitted) ASSERT_EQ(defineTt({node.get()}), 0);
     auto client = std::make_unique<ShardTestClient>(c1.path);
     int64_t sid = client->connect(gatewayChannel(ports, 0), kClientStream);
     ASSERT_GT(sid, 0);
-    int32_t tid = 0;   // the static "tt" (makeConfig)
+    int32_t tid = 0;   // "tt" (defineTt)
     if (commit == mx::Commit::Uncommitted) {
         // CommitLandsMidOp over a real node: the uncommitted window is internal (the DDL OK
         // is held until the topic serves — DdlAnswerGate, C1); the cell asserts the first op
@@ -496,6 +503,7 @@ TEST(TransientSliceRegression, ThreeNodeLeaderMovesMidOpLosesNoAckedRecordRegres
     for (int i = 0; i < 3; ++i) nodes[i] = std::make_unique<BrokerNode>(makeConfig(i, dirs[i]->path, ports, 3, true));
     for (auto& n : nodes) n->start();
     ASSERT_TRUE(nodes[0]->awaitLeader(15'000ms));
+    ASSERT_EQ(defineTt({nodes[0].get(), nodes[1].get(), nodes[2].get()}), 0);
     ShardTestClient c(cdir.path);
     auto leaderVia = [&](int gwNode, int notThis) {
         const int64_t s = c.connect(gatewayChannel(ports, gwNode), kClientStream);
@@ -586,9 +594,10 @@ TEST_P(DemotedLeaderReadCommittedRegression, SubscriptionMovesToTheNewLeaderRegr
     std::unique_ptr<BrokerNode> nodes[3];
     const TmpDir* dirs[3] = {&d0, &d1, &d2};
     for (int i = 0; i < 3; ++i)
-        nodes[i] = std::make_unique<BrokerNode>(makeConfig(i, dirs[i]->path, ports, 3, shard, 0, pm));
+        nodes[i] = std::make_unique<BrokerNode>(makeConfig(i, dirs[i]->path, ports, 3, shard));
     for (auto& n : nodes) n->start();
     for (auto& n : nodes) ASSERT_TRUE(n->awaitLeader(30'000ms));
+    ASSERT_EQ(defineTt({nodes[0].get(), nodes[1].get(), nodes[2].get()}, pm), 0);
     ShardTestClient c(cdir.path);
     c.keepSessionsAlive(true);   // a real client keeps its sessions alive (1 s keepalive)
     auto leaderVia = [&](int gwNode, int notThis) {
@@ -713,8 +722,6 @@ struct GroupCluster {
     int32_t electionTimeoutMs = 0;   // > 0: overrides (the failure detector runs at 3x the heartbeat timeout)
     NodeConfig cfg(int i) {
         NodeConfig c = makeConfig(i, (i == 0 ? d0 : i == 1 ? d1 : d2).path, ports, 3, true);
-        c.topics[0].replicationFactor = rf;
-        c.topics[0].partitionCount    = partitions;
         if (rf == 1) c.gatewayMinIsr = 1;   // an RF=1 partition can never satisfy minIsr 2
         if (electionTimeoutMs > 0) c.electionTimeoutMs = electionTimeoutMs;
         if (crashStops) c.controlledShutdownMs = 0;
@@ -722,6 +729,12 @@ struct GroupCluster {
         return c;
     }
     void start(int i) { nodes[i] = std::make_unique<BrokerNode>(cfg(i)); nodes[i]->start(); }
+    /// Topic "tt" (rf / partitions as configured), defined through the catalog on the nodes that are up.
+    int32_t defineTopic() {
+        std::vector<BrokerNode*> up;
+        for (auto& n : nodes) if (n) up.push_back(n.get());
+        return defineTt(std::move(up), PersistenceMode::Transient, rf, partitions);
+    }
     void stop(int i) { if (nodes[i]) { nodes[i]->stop(); nodes[i].reset(); } }
     int liveNode() const { for (int i = 0; i < 3; ++i) if (nodes[i]) return i; return -1; }
     /// The consensus leader (the group coordinator) as a live node sees it.
@@ -788,6 +801,7 @@ TEST(TransientLineageClusterRegression, FullClusterRestartAnswersAGroupsOffsetAs
     GroupCluster g;
     for (int i = 0; i < 3; ++i) g.start(i);
     ASSERT_TRUE(g.nodes[0]->awaitLeader(15'000ms));
+    ASSERT_EQ(g.defineTopic(), 0);
     ShardTestClient c(g.cdir.path);
     c.setClientVersion(rune::protocol::client::kClientVersion);
     const int leader = g.partitionLeader(c);
@@ -823,6 +837,7 @@ TEST(TransientLineageClusterRegression, RollingRestartKeepsAGroupsOffsetValidReg
     GroupCluster g;
     for (int i = 0; i < 3; ++i) g.start(i);
     ASSERT_TRUE(g.nodes[0]->awaitLeader(15'000ms));
+    ASSERT_EQ(g.defineTopic(), 0);
     ShardTestClient c(g.cdir.path);
     c.setClientVersion(rune::protocol::client::kClientVersion);
     const int leader = g.partitionLeader(c);
@@ -876,6 +891,7 @@ TEST(TransientLineageClusterRegression, SingleNodeRestartAnswersAGroupsOffsetAsN
         BrokerNode node{cfg};
         node.start();
         ASSERT_TRUE(node.awaitLeader(10'000ms));
+        ASSERT_EQ(defineTt({&node}), 0);
         const int64_t sid = c.connect(gw, kClientStream);
         for (int b = 0; b < 3; ++b)
             ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(ports, 0), kClientStream, sid, 0, 0, 1, makeBatch(4)));
@@ -920,6 +936,7 @@ TEST(TransientLineageClusterRegression, StaggeredFullRestartWithTheOldLeaderLast
     g.crashStops = true;   // ISRs stay full: nothing is handed off on the stops
     for (int i = 0; i < 3; ++i) g.start(i);
     ASSERT_TRUE(g.nodes[0]->awaitLeader(15'000ms));
+    ASSERT_EQ(g.defineTopic(), 0);
     ShardTestClient c(g.cdir.path);
     c.setClientVersion(rune::protocol::client::kClientVersion);
     const int leader = g.partitionLeader(c);
@@ -995,6 +1012,7 @@ TEST(TransientLineageClusterRegression, Rf1CrashedLeaderMemberRejoiningBeforeDet
     g.electionTimeoutMs = 1'500;   // the failure detector finds a crashed node dead after ~4.5 s: the window
     for (int i = 0; i < 3; ++i) g.start(i);
     ASSERT_TRUE(g.nodes[0]->awaitLeader(15'000ms));
+    ASSERT_EQ(g.defineTopic(), 0);
     ShardTestClient c(g.cdir.path);
     c.setClientVersion(rune::protocol::client::kClientVersion);
     const int coord = g.coordinator();
@@ -1111,6 +1129,7 @@ TEST(TransientLineageClusterRegression, IdentityRotationReconfirmsTheLineageWith
     GroupCluster g;
     for (int i = 0; i < 3; ++i) g.start(i);
     ASSERT_TRUE(g.nodes[0]->awaitLeader(15'000ms));
+    ASSERT_EQ(g.defineTopic(), 0);
     ShardTestClient c(g.cdir.path);
     c.setClientVersion(rune::protocol::client::kClientVersion);
     const int leader = g.partitionLeader(c);
@@ -1163,6 +1182,7 @@ TEST(TransientLineageClusterRegression, ShardModeLeaderSeesItsLineageConfirmatio
     GroupCluster g;
     for (int i = 0; i < 3; ++i) g.start(i);
     ASSERT_TRUE(g.nodes[0]->awaitLeader(15'000ms));
+    ASSERT_EQ(g.defineTopic(), 0);
     ShardTestClient c(g.cdir.path);
     c.setClientVersion(rune::protocol::client::kClientVersion);
     const int leader = g.partitionLeader(c);
@@ -1196,6 +1216,7 @@ TEST(TransientLineageClusterRegression, Rf1GroupWithoutACommitIsRebalancedOnANew
     g.partitions = 3;
     for (int i = 0; i < 3; ++i) g.start(i);
     ASSERT_TRUE(g.nodes[0]->awaitLeader(15'000ms));
+    ASSERT_EQ(g.defineTopic(), 0);
     ShardTestClient c(g.cdir.path);
     c.setClientVersion(rune::protocol::client::kClientVersion);
     const int coord = g.coordinator();
@@ -1321,6 +1342,7 @@ TEST(TransientLineageClusterRegression, Rf1PlainSubscriptionResumeAcrossANewLine
     g.partitions = 3;
     for (int i = 0; i < 3; ++i) g.start(i);
     ASSERT_TRUE(g.nodes[0]->awaitLeader(15'000ms));
+    ASSERT_EQ(g.defineTopic(), 0);
     ShardTestClient c(g.cdir.path);
     c.setClientVersion(rune::protocol::client::kClientVersion);
     ASSERT_GE(rune::protocol::client::kClientVersion, rune::protocol::client::kClientVersionLineageNote);

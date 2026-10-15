@@ -163,7 +163,7 @@ struct SgHarness {
     // Declared LAST so egressFnFrames is alive when the egress fn captures it.
     rune::gateway::ClientGateway gw;
 
-    explicit SgHarness(std::vector<rune::node::TopicSpec> staticTopics = {})
+    SgHarness()
         : dataDir(uniqDir("catalog")), catalogLog(madeDir((fs::path(dataDir) / "__catalog").string())),
           topicDirPath(uniqDir("topics")),
           gw(rune::gateway::ClientGateway::makeForTest(
@@ -181,7 +181,6 @@ struct SgHarness {
         AdminDeps deps;
         deps.brokerCount = 1;
         deps.topicMinIsr = 1;
-        for (const auto& t : staticTopics) deps.staticTopicNames.push_back(t.name);
         deps.respondDefine = [this](int64_t session, int64_t corr, int32_t tid, uint16_t ver, uint16_t err) {
             pc::DefineTopicResponse r; r.sessionId=session; r.correlationId=corr;
             r.topicId=tid; r.version=ver; r.errorCode=err;
@@ -211,15 +210,14 @@ struct SgHarness {
         deps.respondError = [this](int64_t session, int64_t corr, uint16_t code, std::string_view message) {
             agent->postErrorResponse(session, corr, code, message);
         };
-        agent = std::make_unique<AdminWorkerAgent>(schemaReg, nullptr, 1, std::vector<int32_t>{1}, std::move(deps),
-                                                   nullptr, &viewReg, catalogReplica.get(), nullptr);
+        agent = std::make_unique<AdminWorkerAgent>(schemaReg, 1, std::move(deps), &viewReg, catalogReplica.get(), nullptr);
         (void)agent->worker().bootCatalog(agent->catalogBootEffects(), agent->catalogLiveEffects());
         AdminRoleMsg role;
         role.leader = true; role.epoch = 1; role.leaderId = 1; role.partitionEpoch = 0;
         role.isrCount = 1; role.isr[0] = 1;
         agent->worker().onCatalogRole(role);
 
-        topicReg = std::make_unique<rune::gateway::TopicRegistry>(staticTopics, topicDirPath);
+        topicReg = std::make_unique<rune::gateway::TopicRegistry>(std::vector<rune::node::TopicSpec>{}, topicDirPath);
         gw.setTopicRegistry(topicReg.get());
         gw.setAdminSink(agent.get());
         gw.setOnControlFrame([this](int64_t sid, const uint8_t* b, std::size_t n) {
@@ -283,7 +281,7 @@ struct SgHarness {
     }
 
     /// An UNTYPED topic created by DDL (ruling 3: the catalog's schema-less topic)
-    /// — what a static schema-less RUNE_TOPICS topic was; returns its catalog id.
+    /// — what a static schema-less topic was; returns its catalog id.
     int32_t defineUntyped(const std::string& name, uint32_t partitions,
                           PersistenceMode persistence = PersistenceMode::Disk);
 };
@@ -1020,8 +1018,9 @@ TEST(SchemaGatewayRegression, GetTopicSchemaByFingerprintAcrossLongLineage) {
 // ack must be produced on the gateway egress WITHOUT any admin progress.
 // ---------------------------------------------------------------------------
 TEST(SchemaGatewayRegression, DdlDoesNotBlockProduce) {
-    rune::node::TopicSpec events; events.name = "events"; events.partitionCount = 1; events.topicId = 0;
-    SgHarness h({events});   // a produce target independent of the (stalled) admin plane
+    SgHarness h;
+    // A produce target independent of the (stalled) admin plane: created by DDL BEFORE the stall.
+    ASSERT_EQ(h.defineUntyped("events", 1, PersistenceMode::Disk), 0);
 
     // Stall the admin plane entirely: enqueue a DefineTopic but never pump admin.
     auto blob = charsBlob();
@@ -1164,8 +1163,7 @@ TEST(SchemaGatewayRegression, DdlWithoutAnAdminSinkIsAnsweredInternalRegression)
 // callbacks used to `return` on a failed tryClaim (answer lost, client hung).
 TEST(SchemaGatewayRegression, DdlAnswerOnAFullEgressRingIsBackloggedNotDroppedRegression) {
     SchemaRegistry sreg;
-    rune::node::AdminWorkerAgent agent(sreg, /*replica=*/nullptr, /*selfId=*/1, {1},
-                                       rune::node::AdminDeps{});
+    rune::node::AdminWorkerAgent agent(sreg, /*selfId=*/1, rune::node::AdminDeps{});
     pc::DefineTopicResponse resp;
     resp.sessionId = 1; resp.topicId = 3; resp.version = 1;
     uint8_t frame[pc::MessageHeader::ENCODED_SIZE + pc::DefineTopicResponse::BODY_FIXED];
@@ -1205,8 +1203,7 @@ TEST(SchemaGatewayRegression, DdlAnswerOnAFullEgressRingIsBackloggedNotDroppedRe
 // refused (the caller answers MessageTooLarge) instead of parking forever.
 TEST(SchemaGatewayRegression, AdminEgressBacklogPausesIntakeAndRefusesUnfittableFramesRegression) {
     SchemaRegistry sreg;
-    rune::node::AdminWorkerAgent agent(sreg, /*replica=*/nullptr, /*selfId=*/1, {1},
-                                       rune::node::AdminDeps{});
+    rune::node::AdminWorkerAgent agent(sreg, /*selfId=*/1, rune::node::AdminDeps{});
     std::vector<uint8_t> huge(agent.maxEgressFrameBytes() + 1, 0);
     EXPECT_FALSE(agent.postEgressFrame(1, huge.data(), huge.size()));
     EXPECT_EQ(agent.egressBacklogForTest(), 0u);
@@ -1234,8 +1231,7 @@ TEST(SchemaGatewayRegression, AdminEgressBacklogPausesIntakeAndRefusesUnfittable
 // the ring and through the backlog — never parked forever, never dropped.
 TEST(SchemaGatewayRegression, OversizedTopicSchemaAnswerIsMessageTooLargeRegression) {
     SchemaRegistry sreg;
-    rune::node::AdminWorkerAgent agent(sreg, /*replica=*/nullptr, /*selfId=*/1, {1},
-                                       rune::node::AdminDeps{});
+    rune::node::AdminWorkerAgent agent(sreg, /*selfId=*/1, rune::node::AdminDeps{});
     const std::vector<uint8_t> huge(agent.maxEgressFrameBytes() + 1, 0x7A);
     agent.postTopicSchemaResponse(/*session=*/1, /*corr=*/55, /*topicId=*/3, /*version=*/1, /*parts=*/2,
                                   huge, /*errorCode=*/0);

@@ -140,7 +140,7 @@ public:
     void applyCreateTopic(int32_t topicId, const std::string& name, int32_t partitions) {
         const rune::protocol::TopicConfig c;   // the catalog's defaults (Delete, retention off)
         std::vector<uint8_t> f(catalogTopicAppliedWireLen(name, c));
-        writeCatalogTopicApplied(f.data(), topicId, name, partitions, /*rf=*/0, /*persistence=*/0, c);
+        writeCatalogTopicApplied(f.data(), topicId, name, partitions, /*rf*/0, /*persistence=*/0, c);
         node_->postCatalogEffectForTest(kA2cCatalogTopicApplied, std::move(f));
     }
     void applyDropTopic(int32_t topicId, const std::string& name) {

@@ -340,7 +340,7 @@ void runSeed(uint64_t seed) {
     o.holdCommits = true;   // replica set {1,2} for the whole run, restarts included
     DdlHarness h(o);        // pre-defines src, src2 (typed disk v1)
     {
-        DefineTopicMsg s; s.name = "s"; s.partitionCount = 1;   // untyped (was a static RUNE_TOPICS topic)
+        DefineTopicMsg s; s.name = "s"; s.partitionCount = 1;   // untyped (was a static topic)
         const int64_t c = h.submitRawDefine(std::move(s));
         h.settle();
         ASSERT_TRUE(h.response(c).has_value() && h.response(c)->err == kOk) << "setup s";

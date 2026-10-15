@@ -579,8 +579,7 @@ private:
             record(corr, Answer{code, -1, 0, std::string(message), 0, -1, 0, Answer::Kind::Error});
         };
         deps.respondGet = [](int64_t, int64_t, int32_t, uint16_t, int32_t, const std::vector<uint8_t>&, uint16_t) {};
-        br->admin = std::make_unique<AdminWorker>(br->schemas, nullptr, id, std::vector<int32_t>{}, std::move(deps),
-                                                  nullptr, &br->views, br->replica.get(), nullptr);
+        br->admin = std::make_unique<AdminWorker>(br->schemas, id, std::move(deps), &br->views, br->replica.get(), nullptr);
         CatalogEffects fx;
         fx.topicApplied = [this, self](const rune::catalog::TopicObject& t) { onTopicApplied_(*self, t); };
         (void)br->admin->bootCatalog(BootEffects{CatalogEffects{}}, LiveEffects{std::move(fx)});

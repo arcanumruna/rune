@@ -62,6 +62,7 @@
 #include <rune/node/EmbeddedDriver.h>
 #include "../support/OwnerThreadTestHelpers.h"  // F1: owner-thread replica probes
 #include <rune/node/NodeConfig.h>
+#include "support/TestCluster.h"
 #include "support/TestWorkerCount.h"
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/node/ReplicationMetadataBridge.h>
@@ -127,7 +128,7 @@ struct Gr5TempDir {
 };
 
 // Build a simple RecordBatch with K records.
-static std::vector<uint8_t> makeBatch(int32_t recordCount,
+static std::vector<uint8_t> gr5MakeBatch(int32_t recordCount,
                                       int64_t baseOffsetPlaceholder = 0) {
     rune::protocol::RecordBatchBuilder b(baseOffsetPlaceholder, /*baseTimestamp=*/1000LL);
     for (int32_t i = 0; i < recordCount; ++i) {
@@ -150,6 +151,14 @@ static std::vector<uint16_t> gr5DiscoverFreePorts(int n) {
         if (!dup) ports.push_back(p);
     }
     return ports;
+}
+
+/// The test topic (topics exist only through DDL: created through the catalog once the nodes are up).
+inline rune::node::TopicSpec gr5Topic() {
+    rune::node::TopicSpec topic;
+    topic.name           = "gr5topic";
+    topic.partitionCount = 1;
+    return topic;
 }
 
 // Build a 3-node config (mirrors GR-4 helper).
@@ -186,11 +195,6 @@ static rune::node::NodeConfig makeGr5Config(
         std::to_string(kPorts[static_cast<std::size_t>(nodeId)]);
     cfg.clientEndpoint.streamId = 50;
 
-    rune::node::TopicSpec topic;
-    topic.name           = "gr5topic";
-    topic.partitionCount = 1;
-    topic.topicId        = 0;
-    cfg.topics.push_back(topic);
 
     cfg.workerCount = rune::node::test::workerCountFromEnv();
 
@@ -256,7 +260,7 @@ TEST(GR5_Unit, AcksLeader_ImmediateAck) {
 
     // Simulate gateway acks=Leader produce.
     constexpr int32_t kRecords = 3;
-    auto batch = makeBatch(kRecords);
+    auto batch = gr5MakeBatch(kRecords);
     const int64_t base        = log.logEndOffset();
     const int64_t lastOffset  = base + kRecords - 1;
     log.appendNoSync(batch.data(), batch.size(), lastOffset);
@@ -315,7 +319,7 @@ TEST(GR5_Unit, AcksAll_DeferredUntilHW) {
 
     // Append a batch.
     constexpr int32_t kRecords = 5;
-    auto batch = makeBatch(kRecords);
+    auto batch = gr5MakeBatch(kRecords);
     const int64_t base       = leaderLog.logEndOffset();
     const int64_t lastOffset = base + kRecords - 1;
     leaderLog.appendNoSync(batch.data(), batch.size(), lastOffset);
@@ -400,7 +404,7 @@ TEST(GR5_Unit, AcksAll_NotBeforeHW) {
 
     // Append 7 records.
     constexpr int32_t kRecords = 7;
-    auto batch = makeBatch(kRecords);
+    auto batch = gr5MakeBatch(kRecords);
     const int64_t base       = leaderLog.logEndOffset();
     const int64_t lastOffset = base + kRecords - 1;
     leaderLog.appendNoSync(batch.data(), batch.size(), lastOffset);
@@ -560,7 +564,7 @@ TEST(DRBUG3_Unit, DrainTimeMinIsr_DoesNotAckOnShrinkToMinority) {
     // does this restamp on the produce hot path).
     constexpr int32_t kSafeRecords = 4;
     const int64_t safeBase       = leaderLog.logEndOffset();
-    auto safeBatch = makeBatch(kSafeRecords, safeBase);
+    auto safeBatch = gr5MakeBatch(kSafeRecords, safeBase);
     const int64_t safeLastOffset = safeBase + kSafeRecords - 1;
     leaderLog.appendNoSync(safeBatch.data(), safeBatch.size(), safeLastOffset);
     leader->onLeaderLogAppended();
@@ -594,7 +598,7 @@ TEST(DRBUG3_Unit, DrainTimeMinIsr_DoesNotAckOnShrinkToMinority) {
     // --- Step 4: append a MINORITY tail (only the lone survivor holds it). ---
     constexpr int32_t kTailRecords = 5;
     const int64_t tailBase       = leaderLog.logEndOffset();
-    auto tailBatch = makeBatch(kTailRecords, tailBase);
+    auto tailBatch = gr5MakeBatch(kTailRecords, tailBase);
     const int64_t tailLastOffset = tailBase + kTailRecords - 1;
     leaderLog.appendNoSync(tailBatch.data(), tailBatch.size(), tailLastOffset);
     leader->onLeaderLogAppended();
@@ -851,6 +855,7 @@ TEST(GR5_Integration, AcksAll_Deferred_HWGate) {
     ASSERT_TRUE(node0.awaitLeader(8s));
     ASSERT_TRUE(node1.awaitLeader(8s));
     ASSERT_TRUE(node2.awaitLeader(8s));
+    ASSERT_EQ(rune::node::test::TestCluster({&node0, &node1, &node2}).defineTopic(gr5Topic()), 0);
 
     std::array<rune::node::BrokerNode*, 3> allNodes{&node0, &node1, &node2};
     const int lid = settledPartitionLeader(allNodes);   // D11: the partition leader, not the consensus leader
@@ -878,7 +883,7 @@ TEST(GR5_Integration, AcksAll_Deferred_HWGate) {
 
     // --- Send acks=All produce ---
     constexpr int kNumRecords = 5;
-    auto batch = makeBatch(kNumRecords);
+    auto batch = gr5MakeBatch(kNumRecords);
     std::span<const uint8_t> emptyKey{};
 
     pc::Produce prod;
@@ -990,6 +995,7 @@ TEST(GR5_Integration, MinIsr_FollowerKilled_Refuses) {
     ASSERT_TRUE(node0p->awaitLeader(8s));
     ASSERT_TRUE(node1p->awaitLeader(8s));
     ASSERT_TRUE(node2p->awaitLeader(8s));
+    ASSERT_EQ(rune::node::test::TestCluster({node0p.get(), node1p.get(), node2p.get()}).defineTopic(gr5Topic()), 0);
     std::array<rune::node::BrokerNode*, 3> allNodes{node0p.get(), node1p.get(), node2p.get()};
     std::array<std::unique_ptr<rune::node::BrokerNode>*, 3>
         owners{&node0p, &node1p, &node2p};
@@ -1077,7 +1083,7 @@ TEST(GR5_Integration, MinIsr_FollowerKilled_Refuses) {
 
         while (std::chrono::steady_clock::now() < loopDeadline && !rejResp.has_value()) {
             // Send one acks=All produce.
-            auto batchN = makeBatch(1);  // 1 record; small batch for fast cycle
+            auto batchN = gr5MakeBatch(1);  // 1 record; small batch for fast cycle
             pc::Produce prodN;
             prodN.sessionId      = conn.assignedSessionId;
             prodN.correlationId  = corrId++;
@@ -1201,6 +1207,7 @@ TEST(GR5_Integration, AcksAll_SingleRecord_NotAckedAtHwZero_GR9) {
     ASSERT_TRUE(node0p->awaitLeader(8s));
     ASSERT_TRUE(node1p->awaitLeader(8s));
     ASSERT_TRUE(node2p->awaitLeader(8s));
+    ASSERT_EQ(rune::node::test::TestCluster({node0p.get(), node1p.get(), node2p.get()}).defineTopic(gr5Topic()), 0);
     std::array<rune::node::BrokerNode*, 3> allNodes{
         node0p.get(), node1p.get(), node2p.get()};
     std::array<std::unique_ptr<rune::node::BrokerNode>*, 3>
@@ -1237,7 +1244,7 @@ TEST(GR5_Integration, AcksAll_SingleRecord_NotAckedAtHwZero_GR9) {
     }
 
     // --- Produce ONE record, acks=All ---
-    auto batch = makeBatch(/*recordCount=*/1);
+    auto batch = gr5MakeBatch(/*recordCount=*/1);
     pc::Produce prod;
     prod.sessionId      = conn.assignedSessionId;
     prod.correlationId  = 900;

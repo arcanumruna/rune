@@ -42,6 +42,7 @@
 #include <rune/node/EmbeddedDriver.h>
 #include "../support/OwnerThreadTestHelpers.h"  // F1: owner-thread replica probes
 #include <rune/node/NodeConfig.h>
+#include "support/TestCluster.h"
 #include "support/TestWorkerCount.h"
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/node/ReplicationMetadataBridge.h>
@@ -107,7 +108,7 @@ struct Gr4TempDir {
 };
 
 // Build a simple RecordBatch with K records.
-static std::vector<uint8_t> makeBatch(int32_t recordCount, int64_t baseOffsetPlaceholder = 0) {
+static std::vector<uint8_t> gr4MakeBatch(int32_t recordCount, int64_t baseOffsetPlaceholder = 0) {
     rune::protocol::RecordBatchBuilder b(baseOffsetPlaceholder, /*baseTimestamp=*/1000LL);
     for (int32_t i = 0; i < recordCount; ++i) {
         b.append("k", "v", 1000LL + i);
@@ -129,6 +130,14 @@ static std::vector<uint16_t> gr4DiscoverFreePorts(int n) {
         if (!dup) ports.push_back(p);
     }
     return ports;
+}
+
+/// The test topic (topics exist only through DDL: created through the catalog once the nodes are up).
+inline rune::node::TopicSpec gr4Topic() {
+    rune::node::TopicSpec topic;
+    topic.name           = "gr4topic";
+    topic.partitionCount = 1;
+    return topic;
 }
 
 // Build a 3-node config with replication ports (mirrors GR-3 helper).
@@ -165,11 +174,6 @@ static rune::node::NodeConfig makeGr4Config(
         std::to_string(kPorts[static_cast<std::size_t>(nodeId)]);
     cfg.clientEndpoint.streamId = 50;
 
-    rune::node::TopicSpec topic;
-    topic.name           = "gr4topic";
-    topic.partitionCount = 1;
-    topic.topicId        = 0;
-    cfg.topics.push_back(topic);
 
     cfg.workerCount = rune::node::test::workerCountFromEnv();
 
@@ -226,7 +230,7 @@ TEST(GR4_Unit, ProduceAdvancesLeaderLEO) {
     // Simulate what the gateway does: append DIRECTLY to the Log (appendNoSync)
     // then call onLeaderLogAppended() to reconcile the replica.
     constexpr int32_t kRecords = 3;
-    auto batch = makeBatch(kRecords);
+    auto batch = gr4MakeBatch(kRecords);
 
     // Derive lastOffset (same logic as ClientGateway::handleProduce).
     const int64_t base = log.logEndOffset();  // = 0
@@ -266,7 +270,7 @@ TEST(GR4_Unit, ProduceAdvancesLeaderLEO) {
 
     // Produce a second batch and repeat to confirm accumulation works.
     constexpr int32_t kRecords2 = 2;
-    auto batch2 = makeBatch(kRecords2);
+    auto batch2 = gr4MakeBatch(kRecords2);
     const int64_t base2 = log.logEndOffset();
     const int64_t lastOffset2 = base2 + static_cast<int64_t>(kRecords2 - 1);
     log.appendNoSync(batch2.data(), batch2.size(), lastOffset2);
@@ -428,6 +432,7 @@ TEST(GR4_Integration, ProduceViaGateway_FollowersConverge_HWAdvances) {
     ASSERT_TRUE(node0.awaitLeader(8s)) << "node0 did not converge to a leader";
     ASSERT_TRUE(node1.awaitLeader(8s)) << "node1 did not converge to a leader";
     ASSERT_TRUE(node2.awaitLeader(8s)) << "node2 did not converge to a leader";
+    ASSERT_EQ(rune::node::test::TestCluster({&node0, &node1, &node2}).defineTopic(gr4Topic()), 0);
 
     // Give the metadata bridge time to apply the initial becomeLeader transition.
     std::this_thread::sleep_for(300ms);
@@ -548,7 +553,7 @@ TEST(GR4_Integration, ProduceViaGateway_FollowersConverge_HWAdvances) {
     // -----------------------------------------------------------------------
     constexpr int kNumRecords = 7;  // one batch of 7 records
 
-    auto batch = makeBatch(kNumRecords);
+    auto batch = gr4MakeBatch(kNumRecords);
     std::span<const uint8_t> emptyKey{};
 
     pc::Produce prod;

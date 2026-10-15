@@ -22,6 +22,7 @@
 #include <rune/node/NodeConfig.h>
 
 #include "ShardTestClient.h"
+#include "TestClusterCore.h"
 
 #include <rune_fr/FlightRecorder.h>
 
@@ -89,8 +90,6 @@ NodeConfig benchConfig(const fs::path& dataDir, bool fused, uint16_t clientPort,
     cfg.peers.push_back(pc);
     cfg.clientEndpoint.channel = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(clientPort);
     cfg.clientEndpoint.streamId = kClientStream;
-    TopicSpec t; t.name = "bt"; t.partitionCount = kPartitions; t.topicId = 0;
-    cfg.topics.push_back(t);
     return cfg;
 }
 
@@ -123,6 +122,12 @@ void BM_ShardPassRuntimePlacement(benchmark::State& state) {
     if (fused) node.setSlowTickIntervalForTest(tickNs);
     node.start();
     if (!node.awaitLeader(std::chrono::seconds{10})) { state.SkipWithError("no leader"); return; }
+    {   // Topics exist only through DDL: the bench topic is defined through the catalog (topic id 0).
+        TopicSpec t; t.name = "bt"; t.partitionCount = kPartitions;
+        rune::node::test::TestClusterCore cluster({&node});
+        const auto r = cluster.tryDefineTopic(t, std::chrono::seconds{30});
+        if (!r.ok() || r.topicId != 0) { state.SkipWithError("DefineTopic failed"); return; }
+    }
     ShardTestClient c(cdir.path);
     const std::string gateway = cfg.clientEndpoint.channel;
     const std::string ingress = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(blocks.at(0));

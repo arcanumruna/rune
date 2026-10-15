@@ -34,6 +34,7 @@
 #include <rune/consensus/SbeConsensusPublisher.h>
 #include <rune/consensus/UdpMessageSink.h>
 #include <rune/node/BrokerNode.h>
+#include "support/TestCluster.h"
 #include <rune/node/EmbeddedDriver.h>
 #include <rune/node/NodeConfig.h>
 #include <rune/replication/InternalIsrKnowledge.h>
@@ -161,12 +162,21 @@ public:
         }
         cfg.clientEndpoint.channel  = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(client_[static_cast<std::size_t>(id)]);
         cfg.clientEndpoint.streamId = 80;
+        return cfg;
+    }
+    /// The test topic (created by DDL once the cluster settled): every node leads a partition, so a death
+    /// moves one (metadata records).
+    [[nodiscard]] rune::node::TopicSpec topic() const {
         rune::node::TopicSpec t;
         t.name           = "cce";
-        t.partitionCount = n_;          // every node leads a partition: a death moves one (metadata records)
-        t.topicId        = 0;
-        cfg.topics.push_back(t);
-        return cfg;
+        t.partitionCount = n_;
+        return t;
+    }
+    /// Define the test topic through the catalog, on the nodes that are up.
+    [[nodiscard]] int32_t defineTopic() {
+        std::vector<BrokerNode*> up;
+        for (auto& n : nodes_) if (n) up.push_back(n.get());
+        return rune::node::test::TestCluster(std::move(up)).defineTopic(topic());
     }
 
     void start(int id) {
@@ -290,6 +300,7 @@ TEST(ConsensusCandidacyElectionRegression, ExcludedMemberNeverConsensusLeader_Co
     for (int i = 0; i < 3; ++i) c.start(i);
     const int32_t L = settledLeader(c, {0, 1, 2}, 20s);
     ASSERT_GE(L, 0) << "no settled consensus/metadata leader";
+    ASSERT_EQ(c.defineTopic(), 0);
     const int X = (L + 1) % 3, Y = (L + 2) % 3;
     const int64_t xLeo = c.meta(X).leo;
 
@@ -353,6 +364,7 @@ TEST(ConsensusCandidacyElectionRegression, StaleKnowledgeLearnedThroughExchange_
     for (int i = 0; i < 3; ++i) c.start(i);
     const int32_t L = settledLeader(c, {0, 1, 2}, 20s);
     ASSERT_GE(L, 0) << "no settled consensus/metadata leader";
+    ASSERT_EQ(c.defineTopic(), 0);
     const int X = (L + 1) % 3, Y = (L + 2) % 3;
 
     c.stop(Y);
@@ -413,6 +425,7 @@ TEST(ConsensusCandidacyElectionRegression, DeniedCandidacyNeverFreezesLiveLeader
     for (int i = 0; i < kN; ++i) if (i != X) c.start(i);
     const int32_t L = settledLeader(c, {0, 1, 2, 3}, 30s);
     ASSERT_GE(L, 0) << "no settled consensus/metadata leader";
+    ASSERT_EQ(c.defineTopic(), 0);
     std::vector<int> others;
     for (int i = 0; i < kN; ++i) if (i != X && i != L) others.push_back(i);
     const int A = others[0], B = others[1], C = others[2];

@@ -10,7 +10,7 @@
 // Every disk-backed CATALOG topic dir carries a topic-id marker (rune/gateway/
 // TopicDirMarker.h): "<id>\n", written before any partition dir exists.  A dir whose
 // marker names id X holds only X's data; a markerless dir with no record bytes holds
-// nothing.  Static RUNE_TOPICS topics are not marked (interim until Task 17).
+// nothing. 
 //
 //   0. every dataDir/topics/<name> claimed (exactly or by ASCII case fold) by a CATALOG
 //      topic t is judged by its marker:
@@ -25,7 +25,7 @@
 //   1. dataDir/dropped/<id>.<name> — a dropped topic's data, left there by a purge the
 //      admin thread could not finish — is REMOVED, but only when <id> is a topic id the
 //      catalog marks dropped; any other entry is left alone and logged.
-//   2. every dataDir/topics/<name> that no catalog or static topic claims is
+//   2. every dataDir/topics/<name> that no catalog topic claims is
 //      QUARANTINED: moved, atomically, to dataDir/quarantine/<name>-<nowUnixSeconds>[-N].
 //      A topic dir is NEVER deleted.  Symlinks are never followed; a directory that does
 //      not have the layout of a topic dir (<digits>/<regular files>) is left alone.
@@ -58,12 +58,10 @@ struct TopicDirReconciliation {
 };
 
 /// `catalogTopics`: every topic the catalog holds live (view sinks included): name, id, persistence.
-/// `droppedIds`: the topic ids the catalog dropped.  `staticTopics`: the interim RUNE_TOPICS topics
-/// (claims only).  Never throws (every failure is logged and leaves the entry in place).
+/// `droppedIds`: the topic ids the catalog dropped.  Never throws (every failure is logged and leaves the entry in place).
 [[nodiscard]] TopicDirReconciliation
 reconcileTopicDirs(const std::string& dataDir, const std::vector<TopicSpec>& catalogTopics,
-                   std::span<const int32_t> droppedIds, int64_t nowUnixSeconds,
-                   const std::vector<TopicSpec>& staticTopics = {});
+                   std::span<const int32_t> droppedIds, int64_t nowUnixSeconds);
 
 // ─── The catch-up sentinel (fix round 1, R2) ──────────────────────────────────
 // `dataDir/.catalog-catchup`: "pending\n" = a broker booted with a local catalog it could not trust
@@ -100,17 +98,5 @@ enum class BootReconcile : uint8_t { Skip, RunNow, RunNowAndClearSentinel, Defer
 /// Logs, once, a retired `__topic_schemas` / `__views` dir that holds data: it is
 /// ignored (never read, never modified) — `__catalog` is the catalog.
 void warnRetiredCatalogDirs(const std::string& dataDir);
-
-/// INTERIM (until Task 17 removes RUNE_TOPICS): a static RUNE_TOPICS topic and a
-/// catalog topic / view sink can never share a broker — the static topic would
-/// open (or quarantine) the catalog topic's dir, or take its id: silent data loss.
-/// Returns the boot refusal naming the first collision — by name (exact or an
-/// ASCII case variant: one directory) first, then by topic id (a static topic's id
-/// is its RUNE_TOPICS position) — or nullopt.  BrokerNode::start throws it.
-/// Also refused: a static topic whose id is one the catalog DROPPED (`catalogDroppedIds`) — the boot
-/// would silently drop it.
-[[nodiscard]] std::optional<std::string> staticCatalogCollision(const std::vector<TopicSpec>& statics,
-                                                                const std::vector<TopicSpec>& catalogTopics,
-                                                                std::span<const int32_t> catalogDroppedIds = {});
 
 } // namespace rune::node

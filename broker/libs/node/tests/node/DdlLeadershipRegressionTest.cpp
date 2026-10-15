@@ -515,7 +515,7 @@ TEST(DdlFixRegression, B4_NoCatalogReplicaAnswersEveryDdlInternal) {
     d.respondCreateView = [&](int64_t, int64_t, int32_t, uint64_t, uint16_t e) { codes.push_back(e); };
     d.respondDdl = [&](int64_t, int64_t, uint16_t e, uint64_t, uint32_t, int32_t, std::string_view) { codes.push_back(e); };
     d.respondError = [&](int64_t, int64_t, uint16_t e, std::string_view) { codes.push_back(e); };
-    AdminWorker w(reg, nullptr, 1, {1}, std::move(d), nullptr, &views, /*catalogReplica=*/nullptr);
+    AdminWorker w(reg, 1, std::move(d), &views, /*catalogReplica=*/nullptr);
     (void)w.bootCatalog(BootEffects{}, LiveEffects{});
     w.submit(DdlRequest{DefineTopicMsg{1, 1, 1, false, "t", "id", charBlob(), 0, 0, {}, {}}});
     w.submit(DdlRequest{AlterTopicMsg{1, 2, 0, "t", alterOpsFor(Op::AlterAdd, 1), {}}});

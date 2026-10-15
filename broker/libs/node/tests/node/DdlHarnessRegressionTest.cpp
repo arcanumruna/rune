@@ -531,7 +531,7 @@ TEST_P(DdlExactNameRegression, ExactSameNameKeepsItsExistingOutcome) {
 INSTANTIATE_TEST_SUITE_P(EveryKindPair, DdlExactNameRegression, ::testing::ValuesIn(exactCases()),
                          [](const ::testing::TestParamInfo<ExactCase>& i) { return std::string(i.param.label); });
 
-// Was DdlStaticCaseFoldRegression (a schema-less static RUNE_TOPICS topic): the
+// Was DdlStaticCaseFoldRegression (a schema-less static topic): the
 // occupant is now an UNTYPED topic created by DDL.  The exact name adopts it
 // (DefineTopic disk) / is TopicExists (anything else); any case variant is
 // TopicExists and never gets its own topic.

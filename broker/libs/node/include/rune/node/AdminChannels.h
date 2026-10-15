@@ -47,7 +47,7 @@ enum : int32_t {
     kMsgDefineTopic       = 1,
     kMsgGetSchema         = 2,
     // 3, 4: the retired create-topic request / reply (Task 9) — never reused.
-    kMsgAdminRole         = 5,
+    kMsgAdminRole         = 5,   // RETIRED (Task 17): the __topic_schemas / __views role; nothing posts it, the admin thread refuses it
     kMsgEgressFrame       = 6,   // admin → control: [sessionId:i64][response frame]
     kMsgAlterTopic        = 7,   // gateway → admin: ALTER TOPIC (Task 11)
     kMsgCreateView        = 8,   // gateway → admin: CREATE VIEW (Task 19)
@@ -305,7 +305,7 @@ struct GetSchemaMsg {
 
 // ---------------------------------------------------------------------------
 // AdminRole event (control → admin).  The bridge posts a Leader/Follower role
-// transition for the schema replica; the admin thread applies it on its OWN
+// transition for the __catalog replica (kMsgCatalogRole); the admin thread applies it on its OWN
 // thread (becomeLeader/becomeFollower) — no cross-thread role_ write.
 // ---------------------------------------------------------------------------
 struct AdminRoleMsg {
@@ -315,10 +315,8 @@ struct AdminRoleMsg {
     int32_t  epoch    = 0;       // the leader epoch (the committed assignment's leaderEpoch)
     int32_t  leaderId = 0;       // used when leader==false (follower); -1 = no leader
     // Catalog history Task 6 (kMsgCatalogRole only): the committed assignment's
-    // ISR and partitionEpoch (the AlterIsr compare-and-set version).  The
-    // __topic_schemas role (kMsgAdminRole) leaves them empty / -1: its ISR is the
-    // full replica set, rebuilt by the admin thread from its own immutable
-    // replica-set knowledge.  Fixed-capacity (no allocation on the ring path).
+    // ISR and partitionEpoch (the AlterIsr compare-and-set version).
+    // Fixed-capacity (no allocation on the ring path).
     int32_t  partitionEpoch = -1;
     int32_t  isrCount       = 0;
     std::array<int32_t, kMaxIsr> isr{};
@@ -793,8 +791,7 @@ inline constexpr std::size_t kAdminRoleFixedBytes = 1 + 4 + 4 + 4 + 4;
     return kAdminRoleFixedBytes + 4u * static_cast<std::size_t>(isrCount < 0 ? 0 : isrCount);
 }
 
-/// `msgType` = kMsgAdminRole (the __topic_schemas / __views role) or
-/// kMsgCatalogRole (the __catalog role).  false = ring full (the caller keeps
+/// `msgType` = kMsgCatalogRole (the __catalog role; kMsgAdminRole is retired).  false = ring full (the caller keeps
 /// the role and retries) or an ISR beyond kMaxIsr (never encoded).
 inline bool encodeAdminRole(OneToOneByteRing& ring, const AdminRoleMsg& m,
                             int32_t msgType = kMsgAdminRole) {

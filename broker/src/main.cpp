@@ -5,7 +5,6 @@
 // handles SIGINT/SIGTERM for clean shutdown.
 
 #include <rune/node/BrokerNode.h>
-#include <rune/node/FdBudget.h>
 #include <rune/node/NodeConfig.h>
 #include <rune/node/SignalControl.h>
 #include <rune/node/ThreadAffinity.h>
@@ -155,17 +154,7 @@ int main() {
                      self.host, self.consensusPort);
     }
 
-    // FD-1: raise the soft open-file limit to the hard limit (logged), and
-    // refuse to start when the hard limit cannot hold the configured
-    // partitions (a mid-run EMFILE would fail-stop logs and halt the broker).
-    {
-        std::string fdErr;
-        if (!rune::node::applyFdLimitAtStartup(*cfg, fdErr)) {
-            spdlog::error("rune-broker: {}", fdErr);
-            std::cerr << "rune-broker: " << fdErr << "\n";
-            return 2;
-        }
-    }
+    // (FD-1, the open-file budget, runs inside BrokerNode::start from the catalog's boot topics.)
 
     // Flight recorder: size per-thread rings + arm recording BEFORE start()
     // spawns the duty-cycle/worker threads that register their rings.

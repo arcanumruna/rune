@@ -146,20 +146,17 @@ TEST(TopicDirReconcileRegression, MarkerNamingANonDroppedIdOrUnattributedDataIsQ
     // markerless + empty: kept (createTopicAt adopts it)
     fs::create_directories(d.path / "topics" / "c" / "0");
     touch(d.path / "topics" / "c" / "0" / "seg.log", "");
-    // markerless + data claimed only as a STATIC topic: kept
-    touch(d.path / "topics" / "s" / "0" / "seg.log", "x");
     // a fold-claimed dir carrying a dropped id's marker
     touch(d.path / "topics" / "T" / "0" / "seg.log", "x");
     mark(d.path / "topics" / "T", 3);
     const std::vector<int32_t> dropped = {3};
     const auto r = rune::node::reconcileTopicDirs(d.path.string(),
                                                   {spec("a", 5), spec("b", 6), spec("c", 7), spec("t", 8)}, dropped,
-                                                  kNow, {spec("s", 0)});
+                                                  kNow);
     EXPECT_TRUE(quarantineHas(d.path, "a-")) << "marker 9 is neither the claim (5) nor dropped";
     EXPECT_TRUE(quarantineHas(d.path, "b-")) << "unattributed data";
     EXPECT_FALSE(quarantineHas(d.path, "c-"));
     EXPECT_TRUE(fs::exists(d.path / "topics" / "c"));
-    EXPECT_TRUE(fs::exists(d.path / "topics" / "s" / "0" / "seg.log")) << "statics are not marked, not checked";
     EXPECT_FALSE(fs::exists(d.path / "topics" / "T"));
     ASSERT_EQ(r.retired.size(), 1u);
     EXPECT_EQ(r.retired[0], d.path / "dropped" / "3.T");
@@ -358,43 +355,6 @@ TEST(TopicDirReconcileRegression, SymlinkedTopicsOrQuarantineRootIsNeverFollowed
         EXPECT_TRUE(r.quarantined.empty()) << "never moves data through a symlinked quarantine";
         EXPECT_TRUE(fs::exists(d.path / "topics" / "gone" / "0" / "seg.log"));
         EXPECT_TRUE(fs::is_empty(outside.path));
-    }
-}
-
-// INTERIM (until Task 17): a static RUNE_TOPICS topic never shares a broker with a catalog topic.
-TEST(StaticCatalogCollisionRegression, NameIdAndCaseVariantCollisionsRefuseBootNamingBoth) {
-    using rune::node::staticCatalogCollision;
-    const std::vector<TopicSpec> catalog = {spec("ddl_ready", 0), spec("orders", 1)};
-    {
-        const auto r = staticCatalogCollision({spec("orders", 0)}, catalog);
-        ASSERT_TRUE(r.has_value());
-        EXPECT_NE(r->find("'orders' (id 0) collides by name with the catalog topic 'orders' (id 1)"), std::string::npos) << *r;
-    }
-    {
-        const auto r = staticCatalogCollision({spec("ORDERS", 5)}, catalog);
-        ASSERT_TRUE(r.has_value()) << "a case variant shares the directory";
-        EXPECT_NE(r->find("by name"), std::string::npos) << *r;
-    }
-    {
-        const auto r = staticCatalogCollision({spec("extra", 0)}, catalog);
-        ASSERT_TRUE(r.has_value()) << "static id 0 is catalog topic ddl_ready's";
-        EXPECT_NE(r->find("'extra' (id 0) collides by topic id with the catalog topic 'ddl_ready' (id 0)"),
-                  std::string::npos) << *r;
-    }
-    {
-        const auto r = staticCatalogCollision({spec("extra", -1)}, catalog);   // id = its position (0)
-        ASSERT_TRUE(r.has_value());
-        EXPECT_NE(r->find("by topic id"), std::string::npos) << *r;
-    }
-    EXPECT_FALSE(staticCatalogCollision({spec("extra", 7)}, catalog).has_value()) << "no shared name or id";
-    EXPECT_FALSE(staticCatalogCollision({spec("events", 0)}, {}).has_value()) << "static topics alone boot";
-    EXPECT_FALSE(staticCatalogCollision({}, catalog).has_value()) << "catalog topics alone boot";
-    {   // R6: a static topic whose id the catalog DROPPED would be silently dropped at boot
-        const std::vector<int32_t> dropped = {0};
-        const auto r = staticCatalogCollision({spec("s", 0)}, {}, dropped);
-        ASSERT_TRUE(r.has_value());
-        EXPECT_NE(r->find("dropped (id 0)"), std::string::npos) << *r;
-        EXPECT_FALSE(staticCatalogCollision({spec("s", 1)}, {}, dropped).has_value());
     }
 }
 

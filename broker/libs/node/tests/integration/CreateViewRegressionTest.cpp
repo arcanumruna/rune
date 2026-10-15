@@ -156,9 +156,8 @@ protected:
             lastViewError_    = err;
             viewResults_.push_back(err);
         };
-        agent_ = std::make_unique<AdminWorkerAgent>(*schemaRegistry_, nullptr, 1, std::vector<int32_t>{1},
-                                                    std::move(deps), nullptr, viewRegistry_.get(), replica_.get(),
-                                                    nullptr);
+        agent_ = std::make_unique<AdminWorkerAgent>(*schemaRegistry_, 1, std::move(deps), viewRegistry_.get(),
+                                                    replica_.get(), nullptr);
         adminWorker_ = &agent_->worker();
         (void)adminWorker_->bootCatalog(agent_->catalogBootEffects(), agent_->catalogLiveEffects());
         AdminRoleMsg role;

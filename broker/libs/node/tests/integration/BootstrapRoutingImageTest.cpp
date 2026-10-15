@@ -137,7 +137,7 @@ TEST(BootstrapRoutingImage, BootstrapImage_NonNull) {
 
     // Configure one topic (rune::metadata::TopicSpec).
     std::vector<rune::metadata::TopicSpec> topics = {
-        rune::metadata::TopicSpec{/*topicId=*/0, /*partitionCount=*/1, /*rf=*/1,
+        rune::metadata::TopicSpec{/*topicId=*/0, /*partitionCount=*/1, /*rf*/1,
                                   /*coGroup=*/"", /*key=*/"events"},
     };
 
@@ -187,7 +187,7 @@ TEST(BootstrapRoutingImage, BootstrapImage_DeterministicPartitionAssignment) {
     constexpr int32_t kPartitions = 3;
 
     std::vector<rune::metadata::TopicSpec> topics = {
-        rune::metadata::TopicSpec{kTopicId, kPartitions, /*rf=*/1, /*coGroup=*/"", "multi"},
+        rune::metadata::TopicSpec{kTopicId, kPartitions, /*rf*/1, /*coGroup=*/"", "multi"},
     };
 
     MetadataService svc(metaReplica.get(), kNode1);

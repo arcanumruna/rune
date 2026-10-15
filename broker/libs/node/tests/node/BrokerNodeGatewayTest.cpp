@@ -23,6 +23,7 @@
 #include "../support/TestNodeConfig.h"
 #include <rune/node/BrokerNode.h>
 #include <rune/node/NodeConfig.h>
+#include "support/TestCluster.h"
 #include "support/TestWorkerCount.h"
 #include <rune/protocol/client/ControlMessages.h>
 #include <rune/protocol/client/DataMessages.h>
@@ -836,11 +837,11 @@ TEST(TxSmoke, EndToEnd_TxnProduce_Commit_ReadCommitted) {
     topic.name           = "smoke-topic";
     topic.partitionCount = 2;
     topic.topicId        = 0;
-    cfg.topics.push_back(topic);
 
     BrokerNode node{cfg};
     node.start();
     ASSERT_TRUE(node.awaitLeader(5s)) << "Smoke node must elect within 5 s";
+    ASSERT_EQ(rune::node::test::TestCluster({&node}).defineTopic(topic), 0);
 
     const std::string aeronDir = (tmp.path / "aeron").string();
     aeron::Context aeronCtx;

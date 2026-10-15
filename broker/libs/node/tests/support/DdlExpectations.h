@@ -101,8 +101,8 @@ struct Cell { uint16_t code; uint8_t events; };
 
 // Columns: DefD DefT ViewP ViewT Add Drop Rename RenameKey SetCompat CasCur CasStale Get
 //          | DropTopic DropView AlterView AlterTopicConfig   (Task 9's table)
-// SchemaLess* are UNTYPED topics created by DDL (an empty descriptor — were static
-// RUNE_TOPICS topics).  SchemaLess* x every Alter* stays 7 (F3: an untyped topic has
+// SchemaLess* are UNTYPED topics created by DDL (an empty descriptor — formerly
+// static topics).  SchemaLess* x every Alter* stays 7 (F3: an untyped topic has
 // no schema to alter).  DropTopic of a typed / untyped topic assumes no live view
 // reads it (a view reader is 39 with a detail — pinned apart); DropTopic of a view
 // name is 39 ("is a view; use DROP VIEW").

@@ -90,11 +90,11 @@ public:
     };
 
     explicit CatalogDdlRig(const char* tag, int32_t brokers = 3, int32_t topicMinIsr = 1,
-                           std::vector<std::string> staticTopics = {}, std::size_t effectMaxFrame = 0)
+                           std::size_t effectMaxFrame = 0)
         : effectMaxFrame_(effectMaxFrame), root_(std::filesystem::temp_directory_path() /
                 (std::string("rune_ddlrig_") + tag + "_" + std::to_string(::getpid()) + "_" +
                  std::to_string(ddl_rig_detail::gSeq++))),
-          brokers_(brokers), topicMinIsr_(topicMinIsr), staticTopics_(std::move(staticTopics)) {
+          brokers_(brokers), topicMinIsr_(topicMinIsr) {
         std::filesystem::remove_all(root_);
         std::filesystem::create_directories(root_ / "__catalog");
         open_();
@@ -463,7 +463,6 @@ private:
         AdminDeps deps;
         deps.brokerCount = brokers_;
         deps.topicMinIsr = topicMinIsr_;
-        deps.staticTopicNames = staticTopics_;
         deps.effectMaxFrameBytes = effectMaxFrame_;
         deps.respondDefine = [this](int64_t, int64_t corr, int32_t topicId, uint16_t version, uint16_t code) {
             record_(corr, Answer{code, topicId, version, {}, 0, -1, 0, Answer::Kind::Define});
@@ -485,8 +484,7 @@ private:
                                  const std::vector<uint8_t>& blob, uint16_t code) {
             gets_[corr] = SchemaAnswer{code, topicId, version, partitions, blob};
         };
-        admin_ = std::make_unique<AdminWorker>(schemas_, nullptr, kSelf, std::vector<int32_t>{}, std::move(deps),
-                                               nullptr, &views_, replica_.get(), nullptr);
+        admin_ = std::make_unique<AdminWorker>(schemas_, kSelf, std::move(deps), &views_, replica_.get(), nullptr);
         CatalogEffects fx;
         fx.topicApplied  = [this](const rune::catalog::TopicObject& t) { effects_.push_back("topicApplied:" + std::to_string(t.topicId)); };
         fx.sinkApplied   = [this](const SinkSpec& s) { effects_.push_back("sinkApplied:" + std::to_string(s.topicId)); };
@@ -511,7 +509,6 @@ private:
     std::filesystem::path                                root_;
     int32_t                                              brokers_;
     int32_t                                              topicMinIsr_;
-    std::vector<std::string>                             staticTopics_;
     std::unique_ptr<rune::storage::Log>                  log_;
     rune::replication::NullPartitionTransport            transport_;
     std::unique_ptr<rune::replication::PartitionReplica> replica_;

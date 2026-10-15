@@ -214,16 +214,12 @@ class AdminWorkerAgent final : public rune::consensus::Agent,
                                public rune::gateway::IAdminRequestSink {
 public:
     AdminWorkerAgent(SchemaRegistry& reg,
-                     rune::replication::PartitionReplica* replica,
                      int32_t selfId,
-                     std::vector<int32_t> replicaSet,
                      AdminDeps deps,
-                     rune::replication::PartitionReplica* viewsReplica = nullptr,
                      ViewRegistry* viewRegistry = nullptr,
                      rune::replication::PartitionReplica* catalogReplica = nullptr,
                      rune::replication::WorkerReplicationTransport* catalogPlane = nullptr)
-        : worker_(reg, replica, selfId, std::move(replicaSet), std::move(deps),
-                  viewsReplica, viewRegistry, catalogReplica, catalogPlane)
+        : worker_(reg, selfId, std::move(deps), viewRegistry, catalogReplica, catalogPlane)
         , catalogSchemas_(&reg)
         , requestRing_(kAdminRequestRingBytes)
         , controlToAdminRing_(kControlToAdminRingBytes)
@@ -375,15 +371,9 @@ public:
                                        aeron::util::index_t len) {
             const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
             const auto  n = static_cast<std::size_t>(len);
-            if (tid == kMsgAdminRole) {
+            if (tid == kMsgCatalogRole) {
                 // Fix round 1 (M4, fix-on-sight): checked decode — a bad frame is
                 // reported, never applied as a default Follower@0 role.
-                AdminRoleMsg m;
-                if (decodeAdminRole(p, n, m)) worker_.onRole(m);
-                else reportBadRoleFrame_(tid, n);
-                return;
-            }
-            if (tid == kMsgCatalogRole) {
                 AdminRoleMsg m;
                 if (decodeAdminRole(p, n, m)) worker_.onCatalogRole(m);
                 else reportBadRoleFrame_(tid, n);
@@ -510,8 +500,7 @@ public:
         //    ring is full).
         if (!storageFailureSignalled_) {
             // Catalog history Task 6: the __catalog log is admin-driven too.
-            auto* r = worker_.replica();
-            if (!(r && r->isDiskBacked() && r->log()->storageFailed())) r = worker_.catalogReplica();
+            auto* r = worker_.catalogReplica();
             if (r && r->isDiskBacked() && r->log()->storageFailed()) [[unlikely]] {
                 // M3 (Task 10 round 4): the ring's max message is capacity/8;
                 // an over-long path would make write() THROW on this thread.
@@ -952,7 +941,7 @@ private:
             rune::protocol::TopicConfig c;
             c.cleanupPolicy = 1;   // Compact
             c.partitionKey  = s.keyField;
-            postCatalogTopicApplied_(s.topicId, s.name, s.partitions, /*rf=*/0, s.persistence, c,
+            postCatalogTopicApplied_(s.topicId, s.name, s.partitions, /*rf*/0, s.persistence, c,
                                      kA2cCatalogSinkApplied);   // Task 12 (N5)
         };
         fx.topicDropped = [this](int32_t topicId, const std::string& name) {
@@ -1277,6 +1266,8 @@ public:
     /// Test-only (Task 16): the topics / dropped ids the boot replay produced (immutable after start()).
     [[nodiscard]] const std::vector<TopicSpec>& bootTopicsForTest() const noexcept { return bootTopics_; }
     [[nodiscard]] const std::vector<int32_t>& bootDroppedIdsForTest() const noexcept { return bootDroppedIds_; }
+    /// Test-only (F6): the open-file need the boot budget estimated from bootTopics_ (immutable after start()).
+    [[nodiscard]] uint64_t fdNeedAtBootForTest() const noexcept { return fdNeedAtBoot_; }
     /// Test-only (Task 16): the applier's effects phase ("Live" once the admin thread ran),
     /// read ON the admin thread.
     [[nodiscard]] std::string catalogApplierPhaseForTest() {
@@ -1806,7 +1797,7 @@ private:
     std::unique_ptr<rune::consensus::ConsensusAgent> agent_;
 
     // -----------------------------------------------------------------------
-    // Topic registry (GB-1) — per-partition Logs, bootstrapped from RUNE_TOPICS.
+    // Topic registry (GB-1) — per-partition Logs, built from the catalog at boot and by DDL.
     // Constructed in start() after dataDir creation; outlives the gateway.
     // Logs are single-writer: accessed only on the AgentRunner duty-cycle thread.
     // -----------------------------------------------------------------------
@@ -1917,9 +1908,10 @@ private:
     // Catalog history Task 16 — the boot from __catalog (startup thread; immutable after start()).
     /// Opens/replays the local __catalog on the startup thread and fills the members below.
     void bootFromCatalog_();
-    std::vector<TopicSpec>                                bootTopics_;           // static topics, then the catalog's live topics + view sinks (topic-id order)
+    std::vector<TopicSpec>                                bootTopics_;           // the catalog's live topics + view sinks (topic-id order)
     std::vector<int32_t>                                  bootDroppedIds_;       // every topic id the catalog dropped
     std::optional<CatalogApplier>                         bootApplier_;          // Booted; handed to the AdminWorker by buildAdminWorker
+    uint64_t                                              fdNeedAtBoot_ = 0;     // estimateFdNeed(bootTopics_) at start()
     int                                                   bootReplays_ = 0;      // replayLocal calls that returned >= 0
     bool                                                  bootReconcileDeferred_ = false;   // B6: the admin thread reconciles after catch-up
     bool                                                  holdCatalogApplyAtBootForTest_ = false;
@@ -2047,9 +2039,6 @@ private:
     int serviceAdminControl_();
     AdminControlPlane                                     adminControl_{*this};
     int64_t                                               slowTickIntervalOverrideNs_ = -1;
-    // Task 8a: last leadership state posted to the admin role ring (control thread).
-    bool                                                  adminLastLeader_ = false;
-    int32_t                                               adminLastEpoch_  = -1;
     std::unique_ptr<rune::consensus::BackoffIdleStrategy> adminWorkerIdleStrategy_;   // NodeConfig::adminIdleShape
     rune::consensus::MonotonicNanoClock                   adminWorkerClock_;
     std::unique_ptr<rune::consensus::AgentRunner>         adminWorkerRunner_;

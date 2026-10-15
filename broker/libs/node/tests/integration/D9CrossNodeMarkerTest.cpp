@@ -39,6 +39,7 @@
 
 #include <rune/node/EmbeddedDriver.h>
 #include <rune/node/BrokerNode.h>
+#include "support/TestCluster.h"
 #include <rune/node/NodeConfig.h>
 #include <rune/node/RoleCounter.h>
 #include <CncFileReader.h>
@@ -1351,9 +1352,6 @@ NodeConfig d9NodeConfig(int nodeId, const fs::path& dataDir, const std::array<ui
     cfg.workerReplBasePort          = ports[static_cast<std::size_t>(12 + nodeId)];
     cfg.workerEgressControlHost     = "127.0.0.1";
     cfg.workerEgressControlBasePort = ports[static_cast<std::size_t>(15 + nodeId)];
-    TopicSpec topic;
-    topic.name = "d9"; topic.partitionCount = 3; topic.topicId = 0;
-    cfg.topics.push_back(topic);
     return cfg;
 }
 } // namespace
@@ -1375,6 +1373,11 @@ TEST(D9BrokerNodeWiringRegression, MarkerForARemotelyLedPartitionLandsThroughThe
     // Progress-driven waits (round-3 ruling): no test-side wall-clock bound —
     // each wait loops on observed progress; the ctest timeout is the bound.
     for (auto& n : nodes) while (!n->awaitLeader(std::chrono::seconds{5})) {}
+    {   // Topics exist only through DDL: the 3-partition test topic, defined through the catalog (topic id 0).
+        TopicSpec topic;
+        topic.name = "d9"; topic.partitionCount = 3;
+        ASSERT_EQ(rune::node::test::TestCluster({nodes[0].get(), nodes[1].get(), nodes[2].get()}).defineTopic(topic), 0);
+    }
 
     // Find (coordinator c, partition p, leader L != c) from c's own routing image,
     // with L's replica of p Leader there.

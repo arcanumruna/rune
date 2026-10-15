@@ -1635,7 +1635,7 @@ TEST(StorageFailStopRegression, WorkerPoolPathInternalReplicaFailureReachesHalt)
 }
 
 TEST(StorageFailStopRegression, SchemaFollowerFlushFailureSignalsTheControlThread) {
-    // I1: the admin thread's schema log → admin→control failure ring.
+    // I1: the admin thread's log (the __catalog replica since Task 16) → admin→control failure ring.
     TmpDir d;
     Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
     NullTransport t;
@@ -1645,7 +1645,7 @@ TEST(StorageFailStopRegression, SchemaFollowerFlushFailureSignalsTheControlThrea
     rune::replication::FetchResponseMsg resp{1, 0, 0, 0, rune::replication::kErrNone, -4, std::span<const uint8_t>(b)};
     schema.applyReplicated(resp);
     SchemaRegistry sreg;
-    AdminWorkerAgent agent(sreg, &schema, 2, {1, 2}, AdminDeps{});
+    AdminWorkerAgent agent(sreg, 2, AdminDeps{}, nullptr, &schema, nullptr);   // the admin-driven log is the catalog replica
     log.setSyncFaultForTest(EIO);
     EXPECT_NO_THROW(agent.doWork(25 * kMs));
     int msgs = 0; int32_t e = 0; std::string dir;
@@ -2400,7 +2400,7 @@ TEST(ReplicaLifetimeRegression, SchemaFailureWithAnOverlongPathNeverThrowsOnTheA
     rune::replication::FetchResponseMsg resp{1, 0, 0, 0, rune::replication::kErrNone, -4, std::span<const uint8_t>(b)};
     schema.applyReplicated(resp);
     SchemaRegistry sreg;
-    AdminWorkerAgent agent(sreg, &schema, 2, {1, 2}, AdminDeps{});
+    AdminWorkerAgent agent(sreg, 2, AdminDeps{}, nullptr, &schema, nullptr);   // the admin-driven log is the catalog replica
     log.setSyncFaultForTest(EIO);
     EXPECT_NO_THROW(agent.doWork(25 * kMs));
     int msgs = 0; std::string dir;

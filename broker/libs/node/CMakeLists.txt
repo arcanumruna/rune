@@ -441,6 +441,8 @@ if(BUILD_TESTING)
     if(aeron_FOUND)
         add_executable(rune_worker_pool_parity_tests
             tests/integration/WorkerPoolParityTest.cpp)
+        # Catalog history Task 17: the tests define their topics through TestCluster (tests/support).
+        target_include_directories(rune_worker_pool_parity_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests ${RUNE_PROTOCOL_INCLUDE})
         target_include_directories(rune_worker_pool_parity_tests PRIVATE
             ${RUNE_PROTOCOL_INCLUDE})
         target_link_libraries(rune_worker_pool_parity_tests PRIVATE
@@ -1120,6 +1122,7 @@ if(BUILD_TESTING)
             # D9 (cross-node transaction markers): gateway unit + 3-node
             # in-process integration over the real cluster-plane transport.
             add_executable(rune_d9_cross_node_marker_tests tests/integration/D9CrossNodeMarkerTest.cpp)
+            target_include_directories(rune_d9_cross_node_marker_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
             target_link_libraries(rune_d9_cross_node_marker_tests PRIVATE rune_node rune_replication aeron::aeron GTest::gtest_main)
             gtest_discover_tests(rune_d9_cross_node_marker_tests PROPERTIES TIMEOUT 120 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
@@ -1437,6 +1440,8 @@ if(BUILD_TESTING)
     if(BUILD_NODE_UDP_TESTS AND aeron_FOUND)
         add_executable(rune_gateway_failover_replication_tests
             tests/integration/GatewayFailoverReplicationTest.cpp)
+        # Catalog history Task 17: the tests define their topics through TestCluster (tests/support).
+        target_include_directories(rune_gateway_failover_replication_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests ${RUNE_PROTOCOL_INCLUDE})
         target_link_libraries(rune_gateway_failover_replication_tests PRIVATE
             rune_node
             aeron::aeron
@@ -1485,6 +1490,8 @@ if(BUILD_TESTING)
     if(BUILD_NODE_UDP_TESTS AND aeron_FOUND)
         add_executable(rune_per_worker_replication_integration_tests
             tests/integration/PerWorkerReplicationTest.cpp)
+        # Catalog history Task 17: the tests define their topics through TestCluster (tests/support).
+        target_include_directories(rune_per_worker_replication_integration_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests ${RUNE_PROTOCOL_INCLUDE})
         target_link_libraries(rune_per_worker_replication_integration_tests PRIVATE
             rune_node
             aeron::aeron
@@ -1560,6 +1567,14 @@ if(BUILD_TESTING)
         target_link_libraries(rune_catalog_boot_tests PRIVATE rune_node rune_view rune_codec aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_catalog_boot_tests PROPERTIES TIMEOUT 360 RESOURCE_LOCK rune_udp_ports)
 
+        # Catalog history Task 17: TestCluster::defineTopic — the in-process way to create a
+        # topic now that the static topic list / NodeConfig::topics are gone (DDL over the wire on real
+        # single-node and 3-node brokers), and the FD budget counted from the catalog's topics.
+        add_executable(rune_test_cluster_tests tests/node/TestClusterTest.cpp)
+        target_include_directories(rune_test_cluster_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_test_cluster_tests PRIVATE rune_node rune_view rune_codec aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_test_cluster_tests PROPERTIES TIMEOUT 360 RESOURCE_LOCK rune_udp_ports)
+
         # Leader-epoch monotonicity across restarts (Kafka parity): full cold
         # restart, single-node restart, stale same-epoch tail on a follower.
         add_executable(rune_epoch_restart_tests tests/integration/EpochRestartRegressionTest.cpp)
@@ -1613,6 +1628,8 @@ if(BUILD_TESTING)
     if(BUILD_NODE_UDP_TESTS AND aeron_FOUND)
         add_executable(rune_gateway_psm_failover_tests
             tests/integration/GatewayPsmFailoverTest.cpp)
+        # Catalog history Task 17: the tests define their topics through TestCluster (tests/support).
+        target_include_directories(rune_gateway_psm_failover_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests ${RUNE_PROTOCOL_INCLUDE})
         target_link_libraries(rune_gateway_psm_failover_tests PRIVATE
             rune_node
             rune_storage

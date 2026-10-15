@@ -5,7 +5,7 @@
 // "<topicId>\n", written durably BEFORE any partition dir or Log exists.  So a dir whose marker
 // names id X holds only X's data, and a dir with no marker and no record bytes holds nothing.
 // Every open (TopicRegistry::createTopicAt) and every boot reconcile compares the marker with
-// the claiming catalog id.  Static RUNE_TOPICS topics are not marked (interim until Task 17).
+// the claiming catalog id. 
 #include <cstdint>
 #include <filesystem>
 

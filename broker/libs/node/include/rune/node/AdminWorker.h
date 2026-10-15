@@ -92,12 +92,6 @@ struct AdminDeps {
     int32_t brokerCount = 1;   // config_.peers.size() (spec §8: rf <= broker count)
     int32_t topicMinIsr = 1;   // config_.gatewayMinIsr  (spec §8: rf >= minIsr, 0 = every broker)
 
-    /// INTERIM (until Task 17 removes RUNE_TOPICS): the static topics of this
-    /// broker, in id order.  They hold ids [0, n) in the TopicRegistry, so a catalog
-    /// create whose id falls below n is refused explicitly (the two id spaces never
-    /// share a process — binding 8).
-    std::vector<std::string> staticTopicNames;
-
     /// The largest admin→control effect frame (0 = catalogEffectMaxFrame(), the
     /// production ring).  The leader refuses an event any of whose effect frames
     /// would not fit (Task 7 C1).  Tests shrink it together with the applier sink's.
@@ -164,21 +158,14 @@ struct DdlRejection {
 class AdminWorker {
 public:
     /// \param reg            the SchemaRegistry the applier projects (admin-owned).
-    /// \param replica        the retired __topic_schemas replica (null since Task 16; kept for the rigs):
-    ///                       its role is still driven by onRole, nothing reads or writes it.
     /// \param selfId         this node's id.
-    /// \param replicaSet     every broker (onRole's ISR seed for the retired replicas).
     /// \param deps           the answers.
-    /// \param viewsReplica   the retired __views replica (as `replica`).
     /// \param viewRegistry   the ViewRegistry the applier projects (null: one is owned here).
     /// \param catalogReplica the __catalog replica (null: no catalog — every DDL answers Internal).
     /// \param catalogPlane   its replication plane (null: single node / no peers).
     AdminWorker(SchemaRegistry& reg,
-                rune::replication::PartitionReplica* replica,
                 int32_t selfId,
-                std::vector<int32_t> replicaSet,
                 AdminDeps deps,
-                rune::replication::PartitionReplica* viewsReplica = nullptr,
                 ViewRegistry* viewRegistry = nullptr,
                 rune::replication::PartitionReplica* catalogReplica = nullptr,
                 rune::replication::WorkerReplicationTransportImpl<rune::replication::AeronPubRegistry>*
@@ -255,8 +242,6 @@ public:
     [[nodiscard]] std::string_view bootReconcileStateName() const noexcept;
 
     // ── Roles (control → admin, admin thread) ───────────────────────────────
-    /// The retired __topic_schemas / __views replicas' role (null in a broker since Task 16).
-    void onRole(const AdminRoleMsg& role);
     /// The __catalog replica's role (multi-node: the committed (-6, 0) assignment;
     /// single node: the consensus leader).  Demotion answers an in-flight DDL the
     /// retriable NotLeader (spec §5.2): the retry dedupes on the new leader if the
@@ -278,7 +263,6 @@ public:
 
     // ── Introspection ───────────────────────────────────────────────────────
     [[nodiscard]] rune::replication::PartitionReplica* catalogReplica() const noexcept { return catalogReplica_; }
-    [[nodiscard]] rune::replication::PartitionReplica* replica() const noexcept { return replica_; }
     [[nodiscard]] const CatalogFrameStats& catalogFrameStats() const noexcept { return catalogFrameStats_; }
     [[nodiscard]] const CatalogApplier& applier() const noexcept { return applier_; }
     [[nodiscard]] CatalogApplier& applierForTest() noexcept { return applier_; }
@@ -355,9 +339,6 @@ private:
         viewDef_(const std::string& name, const std::string& keyField, uint8_t persistence,
                  const std::vector<uint8_t>& planBlob, int32_t viewTopicId,
                  const rune::catalog::CatalogState& s) const;
-    /// INTERIM (binding 8): a create at `topicId` below the static topics' ids.
-    [[nodiscard]] std::optional<DdlRejection> staticIdCollision_(int32_t topicId) const;
-
     /// Encode + append `e` (key = objectId LE) — false: answered already.
     bool appendEvent_(const DdlRequest& req, rune::catalog::CatalogEvent e, int64_t nowNs);
 
@@ -388,11 +369,8 @@ private:
     [[nodiscard]] std::optional<uint64_t> viewOutputFingerprint_(const rune::catalog::RequestRecord& r) const;
 
     SchemaRegistry&                       reg_;
-    rune::replication::PartitionReplica*  replica_;          // retired __topic_schemas (role only)
     int32_t                               selfId_;
-    std::vector<int32_t>                  replicaSet_;
     AdminDeps                             deps_;
-    rune::replication::PartitionReplica*  viewsReplica_  = nullptr;   // retired __views (role only)
     std::unique_ptr<ViewRegistry>         ownViews_;                  // when the caller passed none
     ViewRegistry*                         viewRegistry_  = nullptr;
     rune::replication::PartitionReplica*  catalogReplica_ = nullptr;

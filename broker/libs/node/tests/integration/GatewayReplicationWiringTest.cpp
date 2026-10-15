@@ -34,6 +34,7 @@
 #include <rune/node/EmbeddedDriver.h>
 #include "../support/OwnerThreadTestHelpers.h"  // F1: owner-thread replica probes
 #include <rune/node/NodeConfig.h>
+#include "support/TestCluster.h"
 #include "support/TestWorkerCount.h"
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/node/ReplicationMetadataBridge.h>
@@ -171,6 +172,14 @@ static bool grOfferBounded(aeron::Publication& pub,
     return false;
 }
 
+/// The test topic (topics exist only through DDL: created through the catalog once the nodes are up).
+inline rune::node::TopicSpec replTopic() {
+    rune::node::TopicSpec topic;
+    topic.name           = "repl";
+    topic.partitionCount = 1;
+    return topic;
+}
+
 // Build a 3-node config with consensus + client + replication ports.
 // Topic "repl:1" gives each node 1 partition (partitionId=0).
 static rune::node::NodeConfig makeGrConfig(
@@ -208,11 +217,6 @@ static rune::node::NodeConfig makeGrConfig(
     cfg.clientEndpoint.streamId = 1;
 
     // Single topic: "repl" with 1 partition.
-    rune::node::TopicSpec topic;
-    topic.name           = "repl";
-    topic.partitionCount = 1;
-    topic.topicId        = 0;
-    cfg.topics.push_back(topic);
 
     cfg.workerCount = rune::node::test::workerCountFromEnv();
 
@@ -259,6 +263,7 @@ TEST(GatewayReplicationWiring, ThreeNode_FollowersConverge_HWAdvances) {
     ASSERT_TRUE(node0.awaitLeader(8s)) << "node0 did not converge to a leader";
     ASSERT_TRUE(node1.awaitLeader(8s)) << "node1 did not converge to a leader";
     ASSERT_TRUE(node2.awaitLeader(8s)) << "node2 did not converge to a leader";
+    ASSERT_EQ(rune::node::test::TestCluster({&node0, &node1, &node2}).defineTopic(replTopic()), 0);
 
     // D11: the PARTITION leader of (topic 0, partition 0) — not the consensus
     // leader, which differs whenever another node wins the election under load
@@ -488,6 +493,7 @@ TEST(GatewayReplicationWiring, LeadershipChange_EpochBumped_StaleEpochFenced) {
     ASSERT_TRUE(node0->awaitLeader(8s));
     ASSERT_TRUE(node1->awaitLeader(8s));
     ASSERT_TRUE(node2->awaitLeader(8s));
+    ASSERT_EQ(rune::node::test::TestCluster({node0.get(), node1.get(), node2.get()}).defineTopic(replTopic()), 0);
 
     std::this_thread::sleep_for(300ms);
 
@@ -739,6 +745,7 @@ TEST(GatewayReplicationWiring, ThreeNode_CoordinatorPartitionsOnControllerPath_F
     ASSERT_TRUE(node0->awaitLeader(8s));
     ASSERT_TRUE(node1->awaitLeader(8s));
     ASSERT_TRUE(node2->awaitLeader(8s));
+    ASSERT_EQ(rune::node::test::TestCluster({node0.get(), node1.get(), node2.get()}).defineTopic(replTopic()), 0);
     std::array<std::unique_ptr<rune::node::BrokerNode>*, 3> owners{&node0, &node1, &node2};
 
     struct View { int32_t mapLeader = -9; int32_t mapEpoch = -1; bool replicaLeads = false; };

@@ -35,6 +35,7 @@
 #include <rune/aeronutil/testing/FreePort.h>
 #include "../support/TestNodeConfig.h"
 #include <rune/node/BrokerNode.h>
+#include "support/TestCluster.h"
 #include <rune/node/NodeConfig.h>
 
 // For the DynamicReassignment harness (mirrors RebalanceFailoverIntegrationTest)
@@ -113,33 +114,31 @@ static NodeConfig makeSingleNodeConfig4W(const std::filesystem::path& dataDir,
     cfg.clientEndpoint.streamId = 1;
 
     cfg.workerCount = (workerCount >= 1) ? workerCount : 1;
+    return cfg;
+}
 
-    // Two co-partitioned topics (coPartitionGroup="grp", 4 partitions each)
-    // + one standalone topic (2 partitions).
-    // These exercise the co-group affinity assertion: for all idx in [0,4),
-    //   workerForPartitionForTest(topicId=0, idx) == workerForPartitionForTest(topicId=1, idx).
+/// Two co-partitioned topics (coPartitionGroup="grp", 4 partitions each) + one standalone topic (2 partitions),
+/// in topic-id order 0, 1, 2 — created through the catalog once the node is up (topics exist only through DDL).
+/// These exercise the co-group affinity assertion: for all idx in [0,4),
+///   workerForPartitionForTest(topicId=0, idx) == workerForPartitionForTest(topicId=1, idx).
+std::vector<rune::node::TopicSpec> parityTopics() {
     rune::node::TopicSpec a;
     a.name             = "orders";
     a.partitionCount   = 4;
-    a.topicId          = 0;
     a.coPartitionGroup = "grp";
     a.partitionKey     = "user";
 
     rune::node::TopicSpec b;
     b.name             = "shipments";
     b.partitionCount   = 4;
-    b.topicId          = 1;
     b.coPartitionGroup = "grp";
     b.partitionKey     = "user";
 
     rune::node::TopicSpec c;
     c.name             = "chat";
     c.partitionCount   = 2;
-    c.topicId          = 2;
     // coPartitionGroup and partitionKey left empty (defaults)
-
-    cfg.topics = {a, b, c};
-    return cfg;
+    return {a, b, c};
 }
 
 // ---------------------------------------------------------------------------
@@ -172,6 +171,12 @@ TEST(WorkerPoolParity, MultiWorkerBrokerReachesLeaderAndServes) {
     E1TempDir tmp{"multi4_"};
 
     NodeConfig cfg = makeSingleNodeConfig4W(tmp.path, /*workerCount=*/4);
+
+    // Topics exist only through DDL: boot once to create them in the catalog, stop, and boot again.  The worker
+    // router's co-partition groups (ShardRouter::mapTopicToGroupKey, sorted group-name keys) are built from the
+    // topics the broker BOOTS with — a co-grouped topic created at runtime gets no shared worker until the next
+    // boot (a pre-existing gap, see the Task 17 report) — so the affinity assertions below run on the second boot.
+    ASSERT_NO_FATAL_FAILURE(rune::node::test::defineTopicsThenStop(cfg, parityTopics()));
 
     BrokerNode node{cfg};
     node.start();

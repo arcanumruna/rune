@@ -253,7 +253,7 @@ TEST(CatalogWritePathRegression, TopicNameRuleIsTheLibrarysRegression) {
 // written, and an AlterSchema that would push a DEPENDENT view's frame past the
 // limit is refused too (else every broker would halt at its next boot).
 TEST(CatalogWritePathRegression, EffectTooLargeForADependentViewIsRefusedBeforeAppendRegression) {
-    CatalogDdlRig rig("wp_effects", 3, 1, {}, /*effectMaxFrame=*/1024);
+    CatalogDdlRig rig("wp_effects", 3, 1, /*effectMaxFrame=*/1024);
     rig.becomeServingLeader();
     ASSERT_EQ(rig.define({.name = "s", .partitions = 1, .typed = true}).code, 0);
     ASSERT_EQ(rig.createView("v", "s").code, 0);
@@ -278,7 +278,7 @@ TEST(CatalogWritePathRegression, EffectTooLargeForADependentViewIsRefusedBeforeA
 }
 
 TEST(CatalogWritePathRegression, ViewPlanTooLargeForTheFrameIsRefusedBeforeAppendRegression) {
-    CatalogDdlRig rig("wp_effects_view", 3, 1, {}, /*effectMaxFrame=*/120);   // the topic frames fit, the plan does not
+    CatalogDdlRig rig("wp_effects_view", 3, 1, /*effectMaxFrame=*/120);   // the topic frames fit, the plan does not
     rig.becomeServingLeader();
     ASSERT_EQ(rig.define({.name = "s", .partitions = 1, .typed = true}).code, 0);
     const auto v = rig.createView("v", "s");
@@ -373,18 +373,6 @@ TEST(DdlAnswerGateRegression, DdlResponseOkIsGatedOnItsGateTopicIdOnlyRegression
     ASSERT_TRUE(d.has_value());
     EXPECT_EQ(d->errorCode, static_cast<uint16_t>(pc::ErrorCode::Internal));
     EXPECT_EQ(d->correlationId, 9);
-}
-
-// Binding 8: the old id path and the catalog never share a process — a create whose
-// catalog id a static RUNE_TOPICS topic holds is refused explicitly (interim until
-// Task 17), never a silent collision in the TopicRegistry.
-TEST(CatalogWritePathRegression, CatalogIdHeldByAStaticTopicIsRefusedExplicitlyRegression) {
-    CatalogDdlRig rig("wp_static", 3, 1, {"orders"});
-    rig.becomeServingLeader();
-    const auto a = rig.define({.name = "t", .partitions = 1});
-    EXPECT_EQ(a.code, 39);
-    EXPECT_NE(a.detail.find("static RUNE_TOPICS topic 'orders'"), std::string::npos) << a.detail;
-    EXPECT_EQ(rig.recordedLog().size(), 0u);
 }
 
 // The answer is the applied event's: an AlterSchema's new schema version, an

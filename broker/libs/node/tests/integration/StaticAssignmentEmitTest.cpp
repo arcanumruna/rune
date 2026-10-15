@@ -143,9 +143,9 @@ TEST(StaticAssignmentEmitTest, SingleLeader_EmitsBalancedAssignmentOnLeaderClaim
     // Configure topics: two user topics in a co-partition group + one standalone.
     // Topics are filtered: only user (non-negative topicId) topics are assigned.
     std::vector<TopicSpec> topics = {
-        TopicSpec{/*topicId=*/0, /*partitionCount=*/3, /*rf=*/1, /*coPartitionGroup=*/"grp", "orders"},
-        TopicSpec{/*topicId=*/1, /*partitionCount=*/3, /*rf=*/1, /*coPartitionGroup=*/"grp", "orders"},
-        TopicSpec{/*topicId=*/2, /*partitionCount=*/2, /*rf=*/1, /*coPartitionGroup=*/"",    "chat"},
+        TopicSpec{/*topicId=*/0, /*partitionCount=*/3, /*rf*/1, /*coPartitionGroup=*/"grp", "orders"},
+        TopicSpec{/*topicId=*/1, /*partitionCount=*/3, /*rf*/1, /*coPartitionGroup=*/"grp", "orders"},
+        TopicSpec{/*topicId=*/2, /*partitionCount=*/2, /*rf*/1, /*coPartitionGroup=*/"",    "chat"},
     };
 
     // Build MetadataService for the leader (node1).
@@ -381,7 +381,7 @@ TEST(StaticAssignmentEmitTest, OneRecordPerAppend_LargeTopicSetNeverMegaAppend) 
     std::vector<TopicSpec> topics;
     topics.reserve(kTopicCount);
     for (int i = 0; i < kTopicCount; ++i) {
-        topics.push_back(TopicSpec{i, /*partitionCount=*/1, /*rf=*/1, /*coPartitionGroup=*/"", "key"});
+        topics.push_back(TopicSpec{i, /*partitionCount=*/1, /*rf*/1, /*coPartitionGroup=*/"", "key"});
     }
 
     MetadataService svc(replica.get(), selfId);
@@ -498,9 +498,9 @@ TEST(StaticAssignmentEmitTest, BalancerError_IncrementCounterEmitsNothing) {
         makeMetaCfg(selfId, 1), Role::Leader, 1, nodes, nodes, &log, &transport);
     transport.setLeader(replica.get());
 
-    // rf=3 but only 1 live node → StaticBalancer must throw BalancerError.
+    // rf 3 but only 1 live node → StaticBalancer must throw BalancerError.
     std::vector<TopicSpec> topics = {
-        TopicSpec{0, 2, /*rf=*/3, "", "key"},  // RF=3 > 1 node: invalid
+        TopicSpec{0, 2, /*rf*/3, "", "key"},  // RF 3 > 1 node: invalid
     };
 
     MetadataService svc(replica.get(), selfId);

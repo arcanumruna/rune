@@ -20,7 +20,7 @@ using namespace rune::node::test;
 namespace {
 
 // Former rows, mapped (catalog history Task 10):
-//   StaticSchemaLess*  -> SchemaLess* : untyped topics created by DDL (no RUNE_TOPICS).
+//   StaticSchemaLess*  -> SchemaLess* : untyped topics created by DDL (static topics are gone).
 //   OrphanDefine* / OrphanSink* / CaseVariantOfOrphan -> Uncommitted* : the create's
 //     append is refused (the ISR is below the catalog's minIsr) — answered NotLeader,
 //     nothing appended: the name is Free (no orphan, no placeholder, no id used).
@@ -457,7 +457,7 @@ class DdlViewSourceRegression : public ::testing::TestWithParam<SourceCase> {};
 TEST_P(DdlViewSourceRegression, ViewOverSource) {
     const SourceCase& c = GetParam();
     DdlHarness h;
-    createUntyped(h, "ssrc", 0);                 // was a static RUNE_TOPICS topic
+    createUntyped(h, "ssrc", 0);                 // was a static topic
     create(h, Op::DefineTransient, "tsrc");
     create(h, Op::ViewPersisted, "vsrc");    // over "src"
     create(h, Op::ViewTransient, "tvsrc");   // over "src"
