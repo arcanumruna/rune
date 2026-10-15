@@ -10,6 +10,7 @@
 #include "support/CatalogModel.h"
 
 #include <random>
+#include <span>
 
 namespace rune::node::test {
 
@@ -282,6 +283,11 @@ public:
             o.objectId = t->objectId;
             o.version = t->version;
             o.transient = t->persistence == rune::catalog::Persistence::Transient;
+            o.config = t->config;
+            o.topicId = t->topicId;
+            o.replicationFactor = t->replicationFactor;
+            o.partitions = t->partitions;
+            o.keyField = t->schema ? t->schema->keyField : std::string{};
             if (t->schema) {
                 o.typed = true;
                 o.schemaVersion = t->schema->schemaVersion;
@@ -299,6 +305,13 @@ public:
             o.version = v->version;
             o.transient = v->def.persistence == rune::catalog::Persistence::Transient;
             o.source = v->def.sourceNames.empty() ? std::string{} : v->def.sourceNames.front();
+            o.topicId = v->def.viewTopicId;
+            o.keyField = v->def.keyField;
+            {
+                const rune::codec::Descriptor d = rune::codec::deserialize(
+                    std::span<const uint8_t>(v->def.outputDescriptorBlob.data(), v->def.outputDescriptorBlob.size()));
+                for (const auto& f : d.fields) o.viewColumns.push_back(f.name);
+            }
             out.emplace(v->name, std::move(o));
         }
         return out;
@@ -331,12 +344,54 @@ public:
                     return d;
                 }
                 if (it->second != o.transient) return "broker " + std::to_string(br->id) + " serves '" + name + "' with the wrong persistence";
+                if (auto why = projectionDiffers_(*br, name, o)) return why;
             }
+            std::size_t modelViews = 0;
+            for (const auto& [name, o] : want) { (void)name; modelViews += o.isView ? 1u : 0u; }
+            if (br->views.all().size() != modelViews)
+                return "broker " + std::to_string(br->id) + " holds " + std::to_string(br->views.all().size()) +
+                       " view records, the model has " + std::to_string(modelViews);
             for (const auto& [name, transient] : got) {
                 (void)transient;
                 if (!want.contains(name)) return "broker " + std::to_string(br->id) + " still serves the dropped '" + name + "'";
             }
         }
+        return std::nullopt;
+    }
+
+    /// The broker's PROJECTIONS of one model object (what the control side and the registries hold, not the applied
+    /// state): a topic's config and (typed) schema version / compatibility; a view's sink id, output columns and
+    /// persistence.  nullopt = they equal the model.
+    [[nodiscard]] std::optional<std::string> projectionDiffers_(CatalogClusterHarness::Broker& br, const std::string& name,
+                                                               const cmodel::ModelObject& o) {
+        const std::string who = "broker " + std::to_string(br.id) + " '" + name + "': ";
+        if (!o.isView) {
+            const auto cfg = br.ctl.configs.find(o.topicId);
+            if (cfg == br.ctl.configs.end()) return who + "holds no config for topic id " + std::to_string(o.topicId);
+            if (!(cfg->second == o.config))
+                return who + "holds config retention.ms=" + std::to_string(cfg->second.retentionMs) + " delete.retention.ms=" +
+                       std::to_string(cfg->second.deleteRetentionMs) + ", the model has retention.ms=" + std::to_string(o.config.retentionMs) +
+                       " delete.retention.ms=" + std::to_string(o.config.deleteRetentionMs);
+            if (o.typed) {
+                const auto* e = br.schemas.latest(o.topicId);
+                if (e == nullptr) return who + "the schema registry holds no schema";
+                if (e->version != o.schemaVersion)
+                    return who + "schema registry version " + std::to_string(e->version) + ", the model has " + std::to_string(o.schemaVersion);
+                const bool fwd = e->compatMode == rune::codec::CompatMode::Forward;
+                if (fwd != (o.compat == cmodel::Compat::Forward)) return who + "schema registry compatibility differs";
+            }
+            return std::nullopt;
+        }
+        const auto* rec = br.views.byName(name);
+        if (rec == nullptr) return who + "the view registry holds no record";
+        if (rec->viewTopicId != o.topicId)
+            return who + "view sink id " + std::to_string(rec->viewTopicId) + ", the model has " + std::to_string(o.topicId);
+        std::vector<std::string> cols;
+        const rune::codec::Descriptor d = rune::codec::deserialize(
+            std::span<const uint8_t>(rec->outputDescriptorBlob.data(), rec->outputDescriptorBlob.size()));
+        for (const auto& f : d.fields) cols.push_back(f.name);
+        if (cols != o.viewColumns) return who + "view output columns differ from the model";
+        if (rec->persistence != (o.transient ? 1 : 0)) return who + "view persistence differs from the model";
         return std::nullopt;
     }
 

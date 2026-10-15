@@ -51,6 +51,7 @@ struct Request {
     std::string name;
     // DefineTopic
     bool typed = false;                 // a non-empty descriptor {id (key), hp}; false = an untyped topic
+    int16_t replicationFactor = 0;      // 0 = every broker (the wire default)
     // DefineTopic / CreateView / AlterView: persistence
     bool transient = false;
     // AlterConfig / AlterView: the OBJECT version the client expects (0 = no check);
@@ -83,6 +84,18 @@ struct ModelObject {
     std::set<std::string> fields;                 // live field names of a typed topic
     // views
     std::string source;
+    // Fix round 1 (I1): every field the stress varies, so "the catalog equals the model" is not vacuous.
+    //  - config: the protocol's ONE definition of the TopicConfig defaults (rune/protocol/CatalogTypes.h, a protocol type);
+    //  - topicId: a topic's id or a view's sink id.  The model counts ORDINALS (0, 1, 2 ...) in take order: every
+    //    CreateTopic, CreateView and AlterView takes a fresh id from one dense counter (catalog ruling 4 / ApplyV1
+    //    "fresh sink"; not spec prose).  snapshot() shifts them by the calibrated base (see calibrateTopicIds);
+    //  - viewColumns: a view's output column names, in order.
+    rune::protocol::TopicConfig config{};
+    int32_t                     topicId = -1;
+    int16_t                     replicationFactor = 0;
+    int32_t                     partitions = 1;
+    std::string                 keyField;
+    std::vector<std::string>    viewColumns;
     bool operator==(const ModelObject&) const = default;
 };
 using Snapshot = std::map<std::string, ModelObject>;
@@ -91,9 +104,14 @@ using Snapshot = std::map<std::string, ModelObject>;
     std::ostringstream o;
     for (const auto& [name, x] : s) {
         o << "\n  " << name << ": " << (x.isView ? "view" : "topic") << " obj=" << x.objectId << " v=" << x.version
-          << (x.transient ? " transient" : " disk");
+          << (x.transient ? " transient" : " disk") << " topicId=" << x.topicId << " key='" << x.keyField << "'";
+        if (!x.isView)
+            o << " rf=" << x.replicationFactor << " parts=" << x.partitions << " retention.ms=" << x.config.retentionMs
+              << " delete.retention.ms=" << x.config.deleteRetentionMs;
         if (x.isView) {
-            o << " source=" << x.source;
+            o << " source=" << x.source << " columns={";
+            for (const auto& c : x.viewColumns) o << c << ",";
+            o << "}";
         } else if (x.typed) {
             o << " schema=" << x.schemaVersion << (x.compat == Compat::Forward ? " forward" : " backward") << " fields={";
             for (const auto& f : x.fields) o << f << ",";
@@ -160,6 +178,7 @@ public:
             if (it != live_.end()) {   // schema-less adoption: the untyped topic gains its schema
                 ModelObject& t = it->second;
                 t.typed = true; t.schemaVersion = 1; t.compat = Compat::Backward; t.fields = {"id", "hp"};
+                t.keyField = "id";   // the adopting DefineTopic carries key "id"; the topic id is unchanged
                 ++t.version;
                 return;
             }
@@ -167,12 +186,21 @@ public:
             t.objectId = nextObjectId_++;
             t.version = 1;
             t.transient = r.transient;
-            if (r.typed) { t.typed = true; t.schemaVersion = 1; t.compat = Compat::Backward; t.fields = {"id", "hp"}; }
+            t.topicId = take_();
+            t.replicationFactor = r.replicationFactor;
+            t.partitions = 1;
+            if (r.typed) { t.typed = true; t.schemaVersion = 1; t.compat = Compat::Backward; t.fields = {"id", "hp"}; t.keyField = "id"; }
             live_.emplace(r.name, std::move(t));
             return;
         }
         case Op::DropTopic: case Op::DropView: live_.erase(r.name); return;
-        case Op::AlterConfig: ++live_.at(r.name).version; return;
+        case Op::AlterConfig: {
+            ModelObject& t = live_.at(r.name);
+            if (r.configKey == ConfigKey::RetentionMs) t.config.retentionMs = r.configValue;
+            else t.config.deleteRetentionMs = r.configValue;
+            ++t.version;
+            return;
+        }
         case Op::AlterSchema: {
             ModelObject& t = live_.at(r.name);
             if (r.schemaOp == SchemaOp::AddField) t.fields.insert(r.field); else t.fields.erase(r.field);
@@ -188,19 +216,42 @@ public:
         case Op::CreateView: {
             ModelObject v;
             v.isView = true; v.objectId = nextObjectId_++; v.version = 1; v.transient = r.transient; v.source = r.source;
+            v.topicId = take_(); v.keyField = "id"; v.viewColumns = columnsOf_(r);
             live_.emplace(r.name, std::move(v));
             return;
         }
         case Op::AlterView: {
             ModelObject& v = live_.at(r.name);
             v.source = r.source; v.transient = r.transient; ++v.version;
+            v.topicId = take_();   // a fresh sink (catalog ruling 4); the old one is retired
+            v.viewColumns = columnsOf_(r);
             return;
         }
         }
     }
 
-    [[nodiscard]] Snapshot snapshot() const { return live_; }
+    /// The live objects, with topic ids shifted to the broker's numbering once calibrated (else -1: unknown).
+    [[nodiscard]] Snapshot snapshot() const {
+        Snapshot out = live_;
+        for (auto& [name, o] : out) {
+            (void)name;
+            o.topicId = idBase_ ? o.topicId + *idBase_ : -1;
+        }
+        return out;
+    }
     [[nodiscard]] const Snapshot& live() const noexcept { return live_; }
+    /// The spec says nothing about the first topic id (the internal topics come first), so the model learns the
+    /// base ONCE from the first object both the broker and the model hold: base = broker id - ordinal.  From then on
+    /// every create and every AlterView must land on base + ordinal (dense, never reused).
+    void calibrateTopicIds(const Snapshot& observed) {
+        if (idBase_) return;
+        for (const auto& [name, o] : observed) {
+            const auto it = live_.find(name);
+            if (it == live_.end() || it->second.isView != o.isView) continue;
+            idBase_ = o.topicId - it->second.topicId;
+            return;
+        }
+    }
 
     // ── the generator (model-driven: it reads the model's versions and live names) ────────────────────
     /// A random DDL.  `forceName` pins the contended name of a concurrent pair.
@@ -408,8 +459,15 @@ private:
         return Code::Internal;
     }
 
+    [[nodiscard]] int32_t take_() noexcept { return nextTopicOrdinal_++; }
+    [[nodiscard]] static std::vector<std::string> columnsOf_(const Request& r) {
+        return r.extraColumn ? std::vector<std::string>{"id", "hp", "hp2"} : std::vector<std::string>{"id", "hp"};
+    }
+
     Snapshot live_;
     uint64_t nextObjectId_ = 1;
+    int32_t  nextTopicOrdinal_ = 0;
+    std::optional<int32_t> idBase_;
 };
 
 } // namespace rune::node::test::cmodel

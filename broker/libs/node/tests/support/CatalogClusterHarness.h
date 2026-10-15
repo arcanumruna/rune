@@ -818,10 +818,12 @@ private:
         std::unique_ptr<rr::PartitionReplica>       replica;
     };
     struct Effect {
-        enum class Kind : uint8_t { Create, Drop } kind = Kind::Create;
+        enum class Kind : uint8_t { Create, Drop, Config } kind = Kind::Create;
         rune::node::TopicSpec spec;     // Create
-        int32_t               id = -1;  // Drop
+        rune::catalog::TopicConfig config;   // Create: the topic's full config (a view sink: the defaults)
+        int32_t               id = -1;  // Drop, Config
         std::string           name;     // Drop
+        std::vector<rune::catalog::ConfigChange> changes;   // Config
     };
     /// The fake control side of one broker (the control thread's TopicRegistry + its create / drop rules).
     struct Control {
@@ -831,6 +833,8 @@ private:
         struct Retiring { int32_t id; std::string name; int passesLeft; };
         std::vector<Retiring>                         retiring;  // dropped topics whose dir is not renamed away yet
         std::string                                   dataDir;
+        /// The control side's view of every topic's config (built from Create effects, changed by Config effects).
+        std::map<int32_t, rune::catalog::TopicConfig> configs;
     };
     struct Broker {
         int32_t                               id = 0;
@@ -858,7 +862,7 @@ private:
             isrChannel.reset();
             log.reset();
             ctl.reg.reset();
-            ctl.queue.clear(); ctl.pending.clear(); ctl.retiring.clear();
+            ctl.queue.clear(); ctl.pending.clear(); ctl.retiring.clear(); ctl.configs.clear();
             held.clear();
         }
         ~Broker() { tearDown(); }
@@ -1472,6 +1476,12 @@ private:
         fx.topicApplied = [this, self, live](const rune::catalog::TopicObject& t) {
             Effect e; e.kind = Effect::Kind::Create;
             e.spec = specFrom_(t.name, t.topicId, t.partitions, t.persistence);
+            e.config = t.config;
+            post_(*self, live, std::move(e));
+        };
+        fx.topicConfig = [this, self, live](int32_t id, std::span<const rune::catalog::ConfigChange> changes) {
+            Effect e; e.kind = Effect::Kind::Config; e.id = id;
+            e.changes.assign(changes.begin(), changes.end());
             post_(*self, live, std::move(e));
         };
         fx.sinkApplied = [this, self, live](const SinkSpec& s) {
@@ -1505,7 +1515,20 @@ private:
         while (!c.queue.empty()) {
             Effect e = std::move(c.queue.front());
             c.queue.pop_front();
+            if (e.kind == Effect::Kind::Config) {
+                const auto cfg = c.configs.find(e.id);
+                if (cfg == c.configs.end()) fail_("control", "a config effect for topic id " + std::to_string(e.id) + " the control side never created");
+                for (const auto& ch : e.changes) {
+                    switch (ch.key) {
+                    case rune::catalog::ConfigKey::RetentionMs:       cfg->second.retentionMs = ch.value; break;
+                    case rune::catalog::ConfigKey::DeleteRetentionMs: cfg->second.deleteRetentionMs = ch.value; break;
+                    default: fail_("control", "the stress never sends config key " + std::to_string(static_cast<int>(ch.key)));
+                    }
+                }
+                continue;
+            }
             if (e.kind == Effect::Kind::Create) {
+                c.configs[e.spec.topicId] = e.config;   // also for a create that waits behind a drop
                 // Step 3 of the real handler: a create whose name a dropped topic still holds (its dir not
                 // renamed away yet) waits — FIFO per name, behind any create of that name already waiting.
                 bool behind = nameHeldByRetiring_(c, e.spec.name);
@@ -1527,6 +1550,7 @@ private:
                     runCreate_(br, e.spec);
                 }
             } else {
+                c.configs.erase(e.id);
                 const auto before = c.pending.size();
                 std::erase_if(c.pending, [&](const rune::node::TopicSpec& p) { return p.topicId == e.id; });
                 if (c.pending.size() != before) { (void)c.reg->dropTopic(e.id); continue; }

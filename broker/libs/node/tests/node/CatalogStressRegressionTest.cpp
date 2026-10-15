@@ -151,6 +151,7 @@ void runSeed(uint32_t seed, int steps, SeedReport& rep) {
             // ── invariants after the step ────────────────────────────────────────────────────────────
             ASSERT_TRUE(d.digestsEqualAtEqualOffsets()) << at << ": two brokers at one applied offset hold different digests [" << res.what << "]";
             const cmodel::Snapshot got = d.catalogAsModelSnapshot();
+            model.calibrateTopicIds(got);   // the first topic id is not spec'd: learned once from the first shared object
             ASSERT_TRUE(got == model.snapshot()) << at << ": the leader's catalog differs from the model [" << res.what << "]\nbroker:"
                                                  << cmodel::describe(got) << "\nmodel:" << cmodel::describe(model.snapshot());
             if (step % 20 == 19) {
@@ -182,6 +183,7 @@ void runSeed(uint32_t seed, int steps, SeedReport& rep) {
         EXPECT_TRUE(d.noNameHadTwoConcurrentLiveObjects(&why)) << where << ": " << why;
         // The broker catalog equals the independent model, on the leader and on what every broker serves.
         const cmodel::Snapshot got = d.catalogAsModelSnapshot();
+        model.calibrateTopicIds(got);
         EXPECT_TRUE(got == model.snapshot()) << where << ": final catalog differs from the model\nbroker:" << cmodel::describe(got)
                                              << "\nmodel:" << cmodel::describe(model.snapshot());
         const auto diff = d.servingDiffersFromModel(model.snapshot());
