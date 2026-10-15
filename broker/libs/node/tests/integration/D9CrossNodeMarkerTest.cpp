@@ -1320,7 +1320,7 @@ namespace {
 // Ports: [0..2] consensus, [3..5] client, [6..8] replication, and the per-worker
 // shard bases — [9..11] worker ingress, [12..14] worker replication, [15..17]
 // worker egress control (one worker).  All discovered: the DEFAULT runtime is
-// shard mode, whose DERIVED base ports are fixed (41000 / 41064 / 41128) and
+// shard mode, whose DERIVED base ports are fixed (8200 / 8264 / 8328) and
 // collide across concurrently running test processes ("replication plane did
 // not resolve — Address already in use": the round-3 flake's root cause).
 NodeConfig d9NodeConfig(int nodeId, const fs::path& dataDir, const std::array<uint16_t, 18>& ports) {

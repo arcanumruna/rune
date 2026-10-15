@@ -38,15 +38,23 @@
 // on a disk-backed dir, pre-allocating 3 × 16 MiB per publication would zero-fill
 // to disk on the (fused: hot) conductor thread, so they stay sparse there.
 //
-// Derived ports/cores carry the usual caveat: 41000–65383 lie inside the Linux and
-// macOS ephemeral ranges (as do Rune's other default ports), so a rare ephemeral
-// socket can win a bind; production deployments pin explicit ports.
+// Derived shard ports lie OUTSIDE every default ephemeral (auto-bind) range —
+// [8200, 32583] < 32768 (Linux ip_local_port_range default 32768–60999; macOS /
+// IANA 49152–65535): the kernel never hands an auto-bound socket a port outside
+// its range, so no ephemeral socket (another process, or this broker's own Aeron
+// publications, which bind ephemeral ports while the node starts) can take one
+// before the node binds it (DR-BUG-RESTART-BIND: the former 41000 base lay inside
+// the Linux range and a restart refused to start with "Address already in use").
+// Every port this node binds that still lies inside the PROBED range (an explicit
+// port, or a host whose range covers the derived block) is a loud startup WARN
+// naming the sysctl that reserves it (ephemeralPortConflicts).
 #include <rune/node/NodeConfig.h>
 
 #include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace rune::node {
@@ -96,6 +104,14 @@ struct HostNetFacts {
     int64_t      defaultRcvBuf = 0;
     bool         udpGso        = false;   ///< kernel accepts UDP_SEGMENT (rune_gso bindings: GSO send)
     bool         udpGro        = false;   ///< kernel accepts UDP_GRO (rune_gso bindings: GRO receive)
+    /// The kernel's ephemeral (auto-bind) port range, inclusive (Linux
+    /// net.ipv4.ip_local_port_range, macOS net.inet.ip.portrange.first/last).
+    /// 0 / 0 = unknown (no conflict check).
+    int32_t      ephemeralPortLow  = 0;
+    int32_t      ephemeralPortHigh = 0;
+    /// Linux net.ipv4.ip_local_reserved_ports: inclusive [lo, hi] ranges the kernel
+    /// never auto-binds even inside the ephemeral range.  Empty = none / unknown.
+    std::vector<std::pair<int32_t, int32_t>> reservedPorts;
 };
 
 struct AeronTransportRequest {
@@ -126,14 +142,37 @@ struct AeronTransportDerived {
 [[nodiscard]] bool isWildcardHost(std::string_view host) noexcept;
 
 /// Per-node shard base ports when the deployment sets none (shard mode is the
-/// default): node n gets the block [41000 + 192n, 41000 + 192n + 191] —
+/// default): node n gets the block [8200 + 192n, 8200 + 192n + 191] —
 /// ingress = base, repl = base + 64, egress control = base + 128 (64 =
 /// NodeConfig::kMaxShardWorkers, so co-located nodes never collide).  nullopt when
 /// the node id is outside [0, 126] or workers > 64 (explicit ports required).
 struct ShardBasePorts { int32_t ingress = 0; int32_t repl = 0; int32_t egressControl = 0; };
-inline constexpr int32_t kDerivedShardPortBase   = 41000;
+inline constexpr int32_t kDerivedShardPortBase   = 8200;
 inline constexpr int32_t kDerivedShardPortStride = 3 * NodeConfig::kMaxShardWorkers;
+/// The lowest default ephemeral port of any supported platform (Linux 32768; macOS
+/// and IANA 49152): every derived block ends below it (static_assert below).
+inline constexpr int32_t kLowestDefaultEphemeralPort = 32768;
+inline constexpr int32_t kMaxDerivedShardNodeId      = 126;
+static_assert(kDerivedShardPortBase > 1023, "derived shard ports must not be privileged");
+static_assert(kDerivedShardPortBase + (kMaxDerivedShardNodeId + 1) * kDerivedShardPortStride - 1 <
+                  kLowestDefaultEphemeralPort,
+              "every derived shard port must lie below every default ephemeral port range");
 [[nodiscard]] std::optional<ShardBasePorts> deriveShardBasePorts(int32_t nodeId, int32_t workers) noexcept;
+
+/// Every UDP port this node BINDS (sorted, unique): its consensus, client and
+/// replication ports, and every shard worker's ingress / replication / egress
+/// control port.  PURE; call after applyHostDerivedDefaults (shard bases set).
+[[nodiscard]] std::vector<int32_t> nodeBoundPorts(const NodeConfig& cfg);
+
+/// The ports of `bound` an ephemeral (auto-bound) socket could take before this
+/// node binds them: inside [facts.ephemeralPortLow, facts.ephemeralPortHigh] and
+/// not in facts.reservedPorts.  Empty when the range is unknown.  PURE.
+[[nodiscard]] std::vector<int32_t> ephemeralPortConflicts(const std::vector<int32_t>& bound,
+                                                          const HostNetFacts& facts);
+
+/// Parses Linux ip_local_reserved_ports ("8000-8100,9092"; "" = none) into
+/// inclusive ranges; malformed items are skipped.  PURE.
+[[nodiscard]] std::vector<std::pair<int32_t, int32_t>> parseReservedPorts(std::string_view text);
 
 /// Worker affinity (cache locality; idle = backoff unless opted in): the bench layout as a host-derived
 /// default.  Only where every node is VISIBLE on this host — all peers loopback

@@ -23,6 +23,10 @@
 #include <sched.h>
 #include <sys/vfs.h>
 #endif
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#include <sys/types.h>
+#endif
 
 namespace rune::node {
 
@@ -188,11 +192,87 @@ std::vector<std::string> nodeEndpointHosts(const NodeConfig& cfg) {
 // Shard ports + affinity (PURE)
 // ---------------------------------------------------------------------------
 std::optional<ShardBasePorts> deriveShardBasePorts(int32_t nodeId, int32_t workers) noexcept {
-    if (workers < 1 || workers > NodeConfig::kMaxShardWorkers || nodeId < 0) return std::nullopt;
-    const int64_t base = kDerivedShardPortBase + static_cast<int64_t>(nodeId) * kDerivedShardPortStride;
-    if (base + kDerivedShardPortStride - 1 > 65535) return std::nullopt;
-    const auto b = static_cast<int32_t>(base);
+    if (workers < 1 || workers > NodeConfig::kMaxShardWorkers || nodeId < 0 || nodeId > kMaxDerivedShardNodeId)
+        return std::nullopt;
+    const auto b = static_cast<int32_t>(kDerivedShardPortBase + static_cast<int64_t>(nodeId) * kDerivedShardPortStride);
     return ShardBasePorts{b, b + NodeConfig::kMaxShardWorkers, b + 2 * NodeConfig::kMaxShardWorkers};
+}
+
+namespace {
+/// The port of an "aeron:udp?endpoint=<host>:<port>[|...]" channel; 0 when absent / malformed.
+int32_t channelPort(std::string_view ch) noexcept {
+    const auto ep = ch.find("endpoint=");
+    if (ep == std::string_view::npos) return 0;
+    std::string_view hp = ch.substr(ep + 9);
+    if (const auto bar = hp.find('|'); bar != std::string_view::npos) hp = hp.substr(0, bar);
+    const auto colon = hp.rfind(':');
+    if (colon == std::string_view::npos) return 0;
+    int32_t v = 0;
+    for (const char c : hp.substr(colon + 1)) {
+        if (c < '0' || c > '9') return 0;
+        v = v * 10 + (c - '0');
+        if (v > 65535) return 0;
+    }
+    return v;
+}
+} // namespace
+
+std::vector<int32_t> nodeBoundPorts(const NodeConfig& cfg) {
+    std::vector<int32_t> ports;
+    auto add = [&](int64_t p) { if (p > 0 && p <= 65535) ports.push_back(static_cast<int32_t>(p)); };
+    for (const auto& p : cfg.peers) {
+        if (p.id != cfg.nodeId) continue;
+        add(p.consensusPort);
+        add(p.replicationPort);
+    }
+    add(channelPort(cfg.clientEndpoint.channel));
+    if (cfg.shardMode()) {
+        const int32_t W = cfg.workerCount >= 1 ? cfg.workerCount : 1;
+        for (int32_t w = 0; w < W; ++w) {
+            if (cfg.workerIngressBasePort) add(static_cast<int64_t>(*cfg.workerIngressBasePort) + w);
+            if (cfg.workerReplBasePort)    add(static_cast<int64_t>(*cfg.workerReplBasePort) + w);
+            if (const int32_t e = cfg.effectiveWorkerEgressControlBasePort(); e > 0) add(static_cast<int64_t>(e) + w);
+        }
+    }
+    std::sort(ports.begin(), ports.end());
+    ports.erase(std::unique(ports.begin(), ports.end()), ports.end());
+    return ports;
+}
+
+std::vector<int32_t> ephemeralPortConflicts(const std::vector<int32_t>& bound, const HostNetFacts& f) {
+    std::vector<int32_t> out;
+    if (f.ephemeralPortLow <= 0 || f.ephemeralPortHigh < f.ephemeralPortLow) return out;
+    for (const int32_t p : bound) {
+        if (p < f.ephemeralPortLow || p > f.ephemeralPortHigh) continue;
+        bool reserved = false;
+        for (const auto& [lo, hi] : f.reservedPorts) reserved = reserved || (p >= lo && p <= hi);
+        if (!reserved) out.push_back(p);
+    }
+    return out;
+}
+
+std::vector<std::pair<int32_t, int32_t>> parseReservedPorts(std::string_view text) {
+    std::vector<std::pair<int32_t, int32_t>> out;
+    auto num = [](std::string_view t, int32_t& v) {
+        while (!t.empty() && (t.front() == ' ' || t.front() == '\t' || t.front() == '\n')) t.remove_prefix(1);
+        while (!t.empty() && (t.back() == ' ' || t.back() == '\t' || t.back() == '\n')) t.remove_suffix(1);
+        if (t.empty() || t.size() > 5) return false;
+        v = 0;
+        for (const char c : t) { if (c < '0' || c > '9') return false; v = v * 10 + (c - '0'); }
+        return v <= 65535;
+    };
+    while (!text.empty()) {
+        const auto comma = text.find(',');
+        const std::string_view item = text.substr(0, comma);
+        text = comma == std::string_view::npos ? std::string_view{} : text.substr(comma + 1);
+        int32_t lo = 0, hi = 0;
+        if (const auto dash = item.find('-'); dash != std::string_view::npos) {
+            if (num(item.substr(0, dash), lo) && num(item.substr(dash + 1), hi) && lo <= hi) out.emplace_back(lo, hi);
+        } else if (num(item, lo)) {
+            out.emplace_back(lo, lo);
+        }
+    }
+    return out;
 }
 
 int32_t deriveWorkerCoreBase(HostPlatform platform, bool allLoopback, int32_t selfIndex, int32_t nodes,
@@ -330,6 +410,22 @@ HostDerivation applyHostDerivedDefaults(NodeConfig& cfg, const HostNetFacts& fac
             if (p.id == cfg.nodeId && p.workerCount == 0) p.workerCount = W;
         }
         if (portsDerived) mark("shardPorts");
+    }
+
+    // DR-BUG-RESTART-BIND: a port this node binds inside the kernel's ephemeral range can be taken by any socket
+    // auto-bound first — this broker's own Aeron publications bind ephemeral ports while the node starts — and the
+    // start then fails "Address already in use".  The derived shard ports never lie there; anything else is loud.
+    if (const auto conflicts = ephemeralPortConflicts(nodeBoundPorts(cfg), facts); !conflicts.empty()) {
+        std::string list;
+        for (const int32_t p : conflicts) { if (!list.empty()) list += ','; list += std::to_string(p); }
+        appendWarn(out.warnings, "UDP port(s) " + list + " this node binds lie inside the kernel's ephemeral port "
+                   "range [" + std::to_string(facts.ephemeralPortLow) + ", " + std::to_string(facts.ephemeralPortHigh) +
+                   "]: a socket auto-bound before the node binds one (another process, or this broker's own Aeron "
+                   "publications) takes it and the start fails with 'Address already in use' — " +
+                   (facts.platform == HostPlatform::Linux
+                        ? "reserve them (sysctl net.ipv4.ip_local_reserved_ports=" + list + ", a per-network-namespace "
+                          "sysctl: docker run --sysctl / compose sysctls) or move them below the range"
+                        : std::string("move them below the range (sysctl net.inet.ip.portrange.first)")));
     }
 
     // Worker affinity (shard mode only: pinned for cache locality; idle = backoff unless opted in).
@@ -601,6 +697,38 @@ bool onTmpfs(const std::string& path) {
 #endif
 }
 
+void probeEphemeralPorts(HostNetFacts& f) {
+#if defined(__linux__)
+    {
+        std::ifstream in("/proc/sys/net/ipv4/ip_local_port_range");
+        long long lo = 0, hi = 0;
+        if (in >> lo >> hi && lo > 0 && hi >= lo && hi <= 65535) {
+            f.ephemeralPortLow  = static_cast<int32_t>(lo);
+            f.ephemeralPortHigh = static_cast<int32_t>(hi);
+        }
+    }
+    {
+        std::ifstream in("/proc/sys/net/ipv4/ip_local_reserved_ports");
+        std::string text;
+        std::getline(in, text);
+        f.reservedPorts = parseReservedPorts(text);
+    }
+#elif defined(__APPLE__)
+    int first = 0, last = 0;
+    std::size_t len = sizeof first;
+    if (sysctlbyname("net.inet.ip.portrange.first", &first, &len, nullptr, 0) == 0) {
+        len = sizeof last;
+        if (sysctlbyname("net.inet.ip.portrange.last", &last, &len, nullptr, 0) == 0 && first > 0 &&
+            last >= first && last <= 65535) {
+            f.ephemeralPortLow  = first;
+            f.ephemeralPortHigh = last;
+        }
+    }
+#else
+    (void)f;
+#endif
+}
+
 } // namespace
 
 HostNetFacts probeHostNetFacts(const std::vector<std::string>& endpointHosts, const std::string& aeronDir) {
@@ -631,6 +759,7 @@ HostNetFacts probeHostNetFacts(const std::vector<std::string>& endpointHosts, co
     const int64_t div = f.platform == HostPlatform::Linux ? 2 : 1;
     if (f.rmemMax <= 0) f.rmemMax = probeSockCap(SO_RCVBUF, 64LL * 1024 * 1024) / div;
     if (f.wmemMax <= 0) f.wmemMax = probeSockCap(SO_SNDBUF, 64LL * 1024 * 1024) / div;
+    probeEphemeralPorts(f);
     f.allowedCpus   = allowedCpus();
     f.aeronDirTmpfs = !aeronDir.empty() && onTmpfs(aeronDir);
     f.defaultSndBuf = probeSockDefault(SO_SNDBUF);
