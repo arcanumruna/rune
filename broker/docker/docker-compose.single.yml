@@ -27,6 +27,8 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+      args:
+        - CMAKE_BUILD_PARALLEL_LEVEL   # from the environment when set (small Docker VMs); unset = ninja default
       additional_contexts:
         # relative to this compose file's dir (docker/):
         #   ../../rune-protocol = the sibling worktree (has SchemaMessages.h on
@@ -69,7 +71,7 @@ services:
       # side too, so a DR client container (--shm-size=64m) could not hold one broker
       # image.  Explicit 4 MiB terms (the pre-2026-10-02 size) for the containers.
       RUNE_AERON_TERM_BUFFER_BYTES: "4194304"
-      # NOTE: NO RUNE_TOPICS here — the typed topic "characters" is created at
+      # NOTE: no topics are declared here — the typed topic "characters" is created at
       # RUNTIME by the probe via defineTopic() (the whole point of Task 13).
       # io_uring portability under Rosetta amd64 emulation (see docker-compose.yml).
       RUNE_IO_BACKEND: "portable"

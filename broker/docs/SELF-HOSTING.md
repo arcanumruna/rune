@@ -43,7 +43,6 @@ or malformed.
 | `RUNE_ELECTION_TIMEOUT_MS` | no | `150` | int64 ms | Max wait per election round. Raise for slow / cross-datacenter links. |
 | `RUNE_ELECTION_STATUS_INTERVAL_MS` | no | `20` | int64 ms | Canvass / heartbeat cadence. |
 | `RUNE_STARTUP_CANVASS_TIMEOUT_MS` | no | `100` | int64 ms | Extended canvass window on first boot (peer discovery). |
-| `RUNE_TOPICS` | no | — | list | Boot topics, comma-separated `name:partitions[:policy][:key=value…]`. Options: `persistence=disk\|transient` (default `disk`; `memory` is a **deprecated** alias for `transient` and logs one warning line per entry), `durability=majority\|all-in-sync`, `tier=leader\|majority\|strict`, `group=<co-partition group>`, `key=<partition key field>`. Topics can also be defined at runtime (Rune QL `topic …;` / `transient topic …;`, or the client's `defineTopic`). |
 | `RUNE_TRANSIENT_LOG_RING_BYTES` | no | `8388608` (8 MiB) | int32 bytes | Node-wide ring size of every transient partition. Must be a power of two; any other value keeps the default. `RUNE_MEMORY_LOG_RING_BYTES` is a **deprecated** alias that logs one warning; when both are set, the canonical name wins. |
 
 > Not env-configurable (yet): dynamic membership.
@@ -57,16 +56,31 @@ or malformed.
 > The default container 64 MB is too small — always pass `--shm-size=256m` (or set
 > `shm_size` in compose).
 
+### Topics are created by DDL
+
+A broker starts with no topics. Every topic is created through the catalog, with Rune QL DDL, once a
+catalog leader is up and before anything produces or subscribes:
+
+```bash
+rune ql -e "topic events partitions 3;" --broker rune-1:40200
+rune ql -e "transient topic presence partitions 1;" --broker rune-1:40200
+rune ql -f topics.rql --request-id 0123456789abcdef0123456789abcd00 --broker rune-1:40200
+```
+
+`-f` runs the statements in order and stops at the first error, naming its statement. A fixed
+`--request-id` makes a re-run return the original results instead of `TopicExists`. A topic's id is
+assigned in creation order, from 0. Settings go in a `with (...)` clause (for example
+`with (tier = leader)`), and `replicas N` sets the replication factor. The client's `defineTopic`
+does the same from code. The docker e2e scripts create their topics with `docker/create-topics.sh`.
+
 ### Topic and view names
 
-One rule applies to `RUNE_TOPICS` entries, the client's `defineTopic` and `createView`:
+One rule applies to topic and view names in Rune QL, the client's `defineTopic` and `createView`:
 
 - 1 to 249 bytes of ASCII letters, digits, `.`, `_` and `-`, and not `.` or `..`.
 - Names starting with `__` are reserved for internal topics.
 - Names are case-sensitive, but two names that differ only by ASCII letter case are not allowed,
   because they would share one data directory on a case-insensitive filesystem.
-- A bad name in `RUNE_TOPICS` is a boot configuration error that names the entry. Two
-  `RUNE_TOPICS` names that differ only by case are a configuration error too.
 - A bad name in DDL is rejected with error 40 (`InvalidTopicName`). A name that differs from an
   existing topic or view only by case is rejected with error 25 (`TopicExists`). A partition count
   below 1 is rejected with error 23 (`InvalidSchema`).
@@ -95,7 +109,7 @@ read and never changed (there is no migration); a warning names them if they hol
 - At boot the broker reconciles `dataDir/topics/` with the catalog. A directory no live topic
   claims is **moved, never deleted**, to `dataDir/quarantine/<name>-<unix-timestamp>/`, and a
   warning names both paths. A name matches exactly or ignoring ASCII letter case. This covers a
-  topic removed from `RUNE_TOPICS`, a misspelt name, and a directory left by another build.
+  dropped topic whose directory was not purged, a misspelt name, and a directory left by another build.
 - `dataDir/dropped/<id>.<name>` holds the data of a dropped topic until its purge finishes. At boot
   the broker finishes any purge that a crash interrupted, but only for a topic id the catalog marks
   dropped. Any other entry is left alone and a warning names it.
@@ -132,20 +146,10 @@ read and never changed (there is no migration); a warning names them if they hol
   nothing was applied yet.
 - Delete quarantined directories yourself once you no longer need them; the broker never
   deletes from `dataDir/quarantine/`.
-- **A `RUNE_TOPICS` name may not collide with a runtime topic.** If a `RUNE_TOPICS` entry has
-  the same name as a topic or view created at runtime (`defineTopic` / `createView`), or differs
-  from it only by case, boot fails with an error that names both and the runtime topic's id.
-  Nothing on disk is changed. Remove or rename the entry.
-- **Adding or removing `RUNE_TOPICS` entries while runtime topics exist shifts their ids.** A
-  `RUNE_TOPICS` topic's id is its position in the list, and runtime topics are numbered after the
-  last one. A change in the number of entries makes the runtime topic at the boundary lose its
-  identity: its schema attaches to the wrong topic and its directory is quarantined at boot (never
-  deleted). Keep the `RUNE_TOPICS` list fixed once runtime topics exist, or append new static
-  topics only on a fresh data directory.
 
 ### Transient topics
 
-A **transient** topic (`persistence=transient` in `RUNE_TOPICS`, `transient topic …;` in Rune QL,
+A **transient** topic (`transient topic …;` in Rune QL,
 or `Persistence::Transient` on the client's `defineTopic`) is replicated to the in-sync replicas
 before a produce is acknowledged but is **never written to disk**.
 
@@ -153,10 +157,8 @@ before a produce is acknowledged but is **never written to disk**.
 - Its *data* does not: a restarted node rejoins with the topic empty; after a **full-cluster**
   restart the topic is empty. Offsets restart from 0.
 - Persistence is fixed at definition: `alter topic` cannot change it.
-- An explicit `transient topic X` over an existing disk `RUNE_TOPICS` topic `X` answers
+- An explicit `transient topic X` over an existing disk topic `X` answers
   `TopicExists` (error 25); the topic stays a disk topic.
-- Changing a `RUNE_TOPICS` topic's `persistence=` between restarts is unsupported: the schema and
-  view checks keep the mode recorded when the topic was defined.
 - A view that reads from a transient topic must itself be transient. `Client::createView(...,
   persistence)` (the `CreateView` persistence byte) with a persisted view over a transient source is
   rejected with error 37 (`ViewSourceTransient`); use a transient view. Rune QL `create view`
@@ -203,10 +205,10 @@ before a produce is acknowledged but is **never written to disk**.
     that rebalance is refused with `IllegalGeneration`, and the client re-joins. This holds even if
     a member fetched the old offset in the moment between a crash and its detection. A node that the
     failure detector finds dead no longer vouches for a lineage.
-  - Topics take an optional replication factor: `RUNE_TOPICS=name:partitions:rf=N` (default: every
-    node). A transient topic with `rf=1` loses its data whenever its node stops. `rf` must be at most
-    the node count and at least `RUNE_MIN_ISR`; anything else is a startup error that names the
-    constraint.
+  - Topics take an optional replication factor: `topic name partitions N replicas R;` (default: every
+    node). A transient topic with `rf=1` loses its data whenever its node stops. `replicas` must be at most
+    the node count and at least `RUNE_MIN_ISR`; anything else is answered `InvalidRequest` with a
+    detail that names the constraint.
   - **Subscriptions follow a leader move.** When a node stops serving a subscription (it lost
     leadership of a `read_committed` partition, or the partition's replica moved off it), it answers
     the subscription instead of going silent. A client of this release resumes from its position on
@@ -241,8 +243,6 @@ before a produce is acknowledged but is **never written to disk**.
   `transientSourceResets`): from the point where the ring's content changed, when it changed once since
   the view last folded; from the oldest held record when the ring was recreated or changed more than
   once. Records evicted before the view folded them are counted as `transientRecordsEvicted`.
-- `persistence=memory` in `RUNE_TOPICS` is a deprecated alias of `persistence=transient` and logs
-  one warning per entry.
 - **Upgrade brokers before clients.** A new client defining a transient topic against an older
   broker silently gets a disk topic, because the older broker ignores the persistence byte.
 

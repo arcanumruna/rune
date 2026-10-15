@@ -11,6 +11,9 @@
 #      "node <id> is LEADER", hard cap 90 s — message logged once per node on
 #      initial boot). Parse the numeric leader node ID from the log line; map
 #      id→service (node 0→rune-1, 1→rune-2, 2→rune-3); assert id is 0/1/2.
+#   3b. Create the data-plane topics by DDL (docker/create-topics.sh e2e: events 0,
+#      multi 1, cg 2) — run twice: the fixed request id makes the second run return
+#      the original results (no duplicates, no TopicExists).
 #   4. Run probe against rune-1 (any node accepts Ping) → assert exit 0 + "PROBE: OK".
 #   5. Stop the ACTUAL leader service (mapped from parsed leader node ID).
 #   6. Assert a DIFFERENT node ID becomes the new leader (probe a survivor with
@@ -26,7 +29,9 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPOSE_FILE="docker/docker-compose.yml"
+COMPOSE_NETWORK="rune-broker_default"   # docker-compose.yml: `name: rune-broker`
 LEADER_WAIT_S=90          # max seconds to wait for initial leader (log polling)
 SURVIVOR_PROBE_WAIT_S=90  # max seconds to probe a survivor after leader-kill
 PROBE_TIMEOUT_MS=8000     # ms per individual probe attempt
@@ -62,8 +67,16 @@ trap teardown EXIT
 # Step 1: Build
 # ---------------------------------------------------------------------------
 log "Step 1: Building images..."
-docker compose -f "${COMPOSE_FILE}" build 2>&1 | grep -E "^( Image|ERROR|#[0-9]+ DONE|#[0-9]+ ERROR)" || true
+# A failed build must never fall through to a stale image (it did: the whole e2e once ran against an
+# old broker image while the current source did not compile under gcc 13).
+set +e
+# rune-1/2/3 share one image tag: build it once (three concurrent builds of the same image OOM a small Docker VM).
+out=$(docker compose -f "${COMPOSE_FILE}" build rune-1 2>&1); rc=$?
+set -e
+echo "${out}" | grep -E "^( Image|ERROR|#[0-9]+ DONE|#[0-9]+ ERROR)" || true
+[ "${rc}" -eq 0 ] || { echo "${out}" | tail -40 >&2; fail "broker image build failed (exit ${rc})"; }
 docker compose -f "${COMPOSE_FILE}" --profile tools build 2>&1 | grep -E "^( Image|ERROR|#[0-9]+ DONE|#[0-9]+ ERROR)" || true
+bash "${SCRIPT_DIR}/create-topics.sh" --build-image || fail "could not build the rune CLI image"
 log "Build complete."
 
 # ---------------------------------------------------------------------------
@@ -181,6 +194,17 @@ log "Step 3: Awaiting initial leader (up to ${LEADER_WAIT_S}s)..."
 leader_id=$(await_leader_id "${LEADER_WAIT_S}")
 leader_svc=$(node_id_to_service "${leader_id}")
 log "Initial leader: node ID=${leader_id} → service=${leader_svc}"
+
+# ---------------------------------------------------------------------------
+# Step 3b: Create the topics by DDL (the brokers boot with an empty catalog).  Twice:
+# the second run must exit 0 and create nothing new (fixed request id -> the
+# original results come back, same topic ids).
+# ---------------------------------------------------------------------------
+log "Step 3b: Creating topics by DDL (docker/create-topics.sh e2e)..."
+export COMPOSE_NETWORK
+bash "${SCRIPT_DIR}/create-topics.sh" e2e || fail "create-topics.sh e2e failed"
+log "Step 3b: re-running create-topics.sh (must be idempotent)..."
+bash "${SCRIPT_DIR}/create-topics.sh" e2e || fail "create-topics.sh e2e re-run failed (not idempotent)"
 
 # ---------------------------------------------------------------------------
 # Step 4: Probe before leader-kill (any node accepts Ping, no leader required)

@@ -65,7 +65,9 @@ The header version and block length are unchanged.
 
 The reported count is the topic's real partition count. If DefineTopic is
 called on a topic that already exists without a schema, such as a
-`RUNE_TOPICS` boot topic, the schema is registered with that topic's existing
+boot topic (at the time of this release, boot topics were declared with an
+environment variable, since removed - see SELF-HOSTING.md, "Topics are created
+by DDL"), the schema is registered with that topic's existing
 partition count. The count in the request is ignored, and the topic is not
 resized.
 

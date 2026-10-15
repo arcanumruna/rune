@@ -31,6 +31,51 @@ PY
 }
 
 # --------------------------------------------------------------------------
+# Topics by DDL.  The brokers take no topic list: once a broker (or the cluster's
+# leader) is up, the bench topic is created through the rune CLI ($RUNE_CLI).
+# --------------------------------------------------------------------------
+# rune_topic_ddl <name:partitions[:key=value...]> -> one Rune QL statement on stdout.
+#   Options: tier=leader|majority|strict, durability=majority|all-in-sync, rf=N (replicas N).
+#   e.g. "bench:8:tier=leader" -> "topic bench partitions 8 with (tier = leader);"
+#   Anything else is refused (never silently dropped).
+rune_topic_ddl() {
+  local -a f; IFS=: read -ra f <<<"$1"
+  [ "${#f[@]}" -ge 2 ] || { echo "bad topic spec '$1' (want name:partitions[:key=value...])" >&2; return 1; }
+  local stmt="topic ${f[0]} partitions ${f[1]}" with="" replicas="" i kv
+  for ((i = 2; i < ${#f[@]}; i++)); do
+    kv="${f[$i]}"
+    case "$kv" in
+      tier=*|durability=*) with="${with:+$with, }${kv%%=*} = ${kv#*=}" ;;
+      rf=*)                replicas=" replicas ${kv#rf=}" ;;
+      *) echo "topic spec '$1': option '$kv' has no DDL mapping" >&2; return 1 ;;
+    esac
+  done
+  echo "${stmt}${replicas}${with:+ with ($with)};"
+}
+# rune_create_topics <client_port> <spec>[,<spec>...] -> creates the topics through the broker at
+#   127.0.0.1:<client_port>.  One fixed request id per call, so a retried run returns the original
+#   results.  Retries (0.5 s) on NotLeader / Redirect / connect timeouts while the catalog leader
+#   forms, bounded by RUNE_CREATE_TOPICS_DEADLINE_S (default 60); any other error fails at once.
+rune_create_topics() {
+  local port="$1" specs="$2" ddl="" spec s
+  [ -x "$RUNE_CLI" ] || { log "rune CLI not found at RUNE_CLI=$RUNE_CLI (build rune-client-cpp)"; return 1; }
+  local -a list; IFS=, read -ra list <<<"$specs"
+  for spec in "${list[@]}"; do s="$(rune_topic_ddl "$spec")" || return 1; ddl="$ddl$s"$'\n'; done
+  local rid; rid="$(od -An -N14 -tx1 /dev/urandom | tr -d ' \n')0000"
+  local deadline=$((SECONDS + ${RUNE_CREATE_TOPICS_DEADLINE_S:-60})) out
+  while :; do
+    if out="$("$RUNE_CLI" ql -f - --request-id "$rid" --broker "127.0.0.1:${port}" <<<"$ddl" 2>&1)"; then
+      log "topics created: ${specs}"; return 0
+    fi
+    if ! grep -qiE 'NotLeader|Redirect|timed out|connection refused|not connected|unreachable' <<<"$out"; then
+      log "creating topics '${specs}' failed: $out"; return 1
+    fi
+    [ "$SECONDS" -lt "$deadline" ] || { log "topics '${specs}' not created within ${RUNE_CREATE_TOPICS_DEADLINE_S:-60}s: $out"; return 1; }
+    sleep 0.5
+  done
+}
+
+# --------------------------------------------------------------------------
 # Rune broker lifecycle
 # --------------------------------------------------------------------------
 # rune_start_broker <workers> <topics_spec> [io_backend] [persistence]
@@ -47,7 +92,7 @@ rune_start_broker() {
   env RUNE_NODE_ID=1 RUNE_PEERS="1@127.0.0.1:${RUNE_CONSENSUS_PORT}:${RUNE_CLIENT_PORT}" \
       RUNE_CLIENT_ENDPOINT="0.0.0.0:${RUNE_CLIENT_PORT}" \
       RUNE_DATA_DIR="$logdir" RUNE_AERON_DIR="$d/a" RUNE_WORKERS="$workers" \
-      RUNE_PER_WORKER_INGRESS=true RUNE_PER_WORKER_EGRESS=true RUNE_TOPICS="$topics" \
+      RUNE_PER_WORKER_INGRESS=true RUNE_PER_WORKER_EGRESS=true \
       RUNE_IO_BACKEND="$io" RUNE_AERON_TERM_BUFFER_BYTES=33554432 \
       RUNE_WORKER_INGRESS_RING_BYTES=33554432 RUNE_WORKER_RETURN_RING_BYTES=33554432 \
       RUNE_WORKER_EGRESS_CONTROL_BASE_PORT="$RUNE_WORKER_EGRESS_BASE" \
@@ -61,7 +106,9 @@ rune_start_broker() {
     # Ready when the workerpool is built (info log) OR the client endpoint is bound.
     if grep -qiE "WorkerPool built|is LEADER" "$d/broker.log" 2>/dev/null \
        || ss -lun 2>/dev/null | grep -q ":${RUNE_CLIENT_PORT} "; then
-      sleep 1; log "rune broker ready"; return 0
+      sleep 1
+      rune_create_topics "$RUNE_CLIENT_PORT" "$topics" || return 1
+      log "rune broker ready"; return 0
     fi
     kill -0 "$RUNE_BPID" 2>/dev/null || { log "BROKER DIED"; tail -20 "$d/broker.log" >&2; return 1; }
     sleep 0.25

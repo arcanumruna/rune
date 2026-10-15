@@ -19,8 +19,6 @@ from __future__ import annotations
 
 import os
 import signal
-import tempfile
-import textwrap
 import time
 from typing import Iterator
 
@@ -55,7 +53,7 @@ from tests.test_compaction_e2e import (
     _DELETE_TOPIC_RETENTION_BYTES,
     _CLIENT_COMPACT_TOPICS,
     _CLIENT_DELETE_TOPICS,
-    _write_compose_override,
+    COMPACTION_TOPICS,
     _count_log_files,
     _wait_for_compaction,
     _wait_for_latest_per_key,
@@ -93,16 +91,13 @@ def _next_dr_cid_base() -> int:
 
 @pytest.fixture
 def compaction_dr_cluster() -> Iterator[Cluster]:
-    """Function-scoped cluster with compact + delete topic overrides.
+    """Function-scoped cluster with the compact + delete topics (COMPACTION_TOPICS).
 
     Uses project "rune-dr-compact-dr" (distinct from the CP-5.2 fixture's
     "rune-dr-compact") so both suites can coexist in the same Docker host.
     """
-    tmp = tempfile.mkdtemp(prefix="rune_compaction_dr_e2e_")
-    override = _write_compose_override(tmp)
-
     build = os.environ.get("DR_E2E_BUILD", "0") == "1"
-    c = Cluster(project="rune-dr-compact-dr", override_files=[override])
+    c = Cluster(project="rune-dr-compact-dr", topics=COMPACTION_TOPICS)
     try:
         c.up(build=build, leader_timeout=120)
         # Probe via delete_log (topicId=1) so the harness warm-up records do NOT
@@ -115,11 +110,6 @@ def compaction_dr_cluster() -> Iterator[Cluster]:
     finally:
         faults.heal_all(c)
         c.down()
-        try:
-            os.remove(override)
-            os.rmdir(tmp)
-        except OSError:
-            pass
 
 
 # ---------------------------------------------------------------------------

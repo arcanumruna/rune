@@ -1,0 +1,8 @@
+-- docker/topics/transient-failover.rql: the topics of docker/transient-failover-e2e.sh.
+-- The data-plane topics of e2e.rql, in the same order, plus one transient topic:
+--   events = 0, multi = 1, cg = 2, presence_failover = 3
+-- Created by docker/create-topics.sh (request id fixed per file, so a re-run is idempotent).
+topic events partitions 1;
+topic multi partitions 3;
+topic cg partitions 4;
+transient topic presence_failover partitions 1;

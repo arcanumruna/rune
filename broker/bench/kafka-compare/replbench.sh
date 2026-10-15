@@ -72,7 +72,7 @@ sleep 6   # let startup churn settle to ISR=3
 port=$((40200+LEADER)); d=/dev/shm/kbench/cP; rm -rf "$d"; mkdir -p "$d"
 echo -n "RESULT: "
 env RUNE_TARGET="aeron:udp?endpoint=127.0.0.1:${port}" RUNE_EGRESS="aeron:udp?endpoint=127.0.0.1:40900" \
-  RUNE_DATA_DIR="$d" RUNE_TOPICS="bench:0:${PARTS}" RUNE_BENCH_RECORDS="$RECS" RUNE_BENCH_VALUE_BYTES="$VBYTES" \
+  RUNE_DATA_DIR="$d" "${RUNE_CLIENT_TOPICS_ENV}=bench:0:${PARTS}" RUNE_BENCH_RECORDS="$RECS" RUNE_BENCH_VALUE_BYTES="$VBYTES" \
   RUNE_BENCH_WARMUP="$WARMUP_N" RUNE_BENCH_MODE=acked RUNE_BENCH_ACKS=${REPL_ACKS:-all} \
   RUNE_BENCH_WINDOW="$WIN" RUNE_BENCH_MAX_IN_FLIGHT="$WIN" \
   RUNE_LINGER_US="$LINGER_US" RUNE_BATCH_BYTES="$BATCH_BYTES" RUNE_IDLE_MODE=backoff \

@@ -42,6 +42,11 @@ DR_IMAGE = os.environ.get("DR_CLIENT_IMAGE", "rune-dr-client:dev")
 # DR_CLIENT_PLATFORM=linux/amd64 forces emulation for an amd64-only image.
 _PLATFORM_ARGS = (["--platform", os.environ["DR_CLIENT_PLATFORM"]] if os.environ.get("DR_CLIENT_PLATFORM") else [])
 
+# The env var of the dr_client IMAGE (rune-client-cpp/examples/dr_client.cpp) that carries ITS topic table
+# "name:topicId:partitions,...".  That is the client's own setting - the brokers take no topic list; their
+# topics are created by DDL (Cluster.create_topics).  The one spelling lives here, for every harness caller.
+CLIENT_TOPICS_ENV = "RUNE_TOPICS"
+
 _PRODUCED_RE = re.compile(r"PRODUCED cid=(-?\d+) key=(-?\d+) seq=(-?\d+) part=(-?\d+) offset=(-?\d+)")
 _DELIVERED_RE = re.compile(r"DELIVERED cid=(-?\d+) key=(-?\d+) seq=(-?\d+) part=(-?\d+) offset=(-?\d+)")
 _SUMMARY_RE = re.compile(r"SUMMARY produced=(\d+) delivered=(\d+) mode=(\S+) rc=(\d+)")
@@ -259,7 +264,7 @@ def run_txn(
         "RUNE_EGRESS": f"aeron:udp?endpoint={name}:{egress_port}",
         "RUNE_EGRESS_STREAM": "2",
         "RUNE_DATA_DIR": "/var/lib/rune-client",
-        "RUNE_TOPICS": topics,
+        CLIENT_TOPICS_ENV: topics,
         "RUNE_CLIENT_ID": str(cid),
         "RUNE_MODE": "txn_produce",
         "RUNE_TXN_ID": txn_id,
@@ -309,7 +314,7 @@ def run_txn_consume(
         "RUNE_EGRESS": f"aeron:udp?endpoint={name}:{egress_port}",
         "RUNE_EGRESS_STREAM": "2",
         "RUNE_DATA_DIR": "/var/lib/rune-client",
-        "RUNE_TOPICS": topics,
+        CLIENT_TOPICS_ENV: topics,
         "RUNE_CLIENT_ID": str(cid),
         "RUNE_MODE": "txn_consume",
         "RUNE_GROUP_ID": group_id,
@@ -389,7 +394,7 @@ def _run_one_group_member(
         "RUNE_EGRESS": f"aeron:udp?endpoint={name}:{egress_port}",
         "RUNE_EGRESS_STREAM": "2",
         "RUNE_DATA_DIR": "/var/lib/rune-client",
-        "RUNE_TOPICS": topics,
+        CLIENT_TOPICS_ENV: topics,
         "RUNE_CLIENT_ID": str(cid),
         "RUNE_MODE": "group",
         "RUNE_GROUP_ID": group_id,
@@ -588,7 +593,7 @@ def _run_one_client(
         "RUNE_EGRESS": f"aeron:udp?endpoint={name}:{egress_port}",  # overridden per-attempt
         "RUNE_EGRESS_STREAM": "2",
         "RUNE_DATA_DIR": "/var/lib/rune-client",
-        "RUNE_TOPICS": cfg.get("topics", "events:0:1"),
+        CLIENT_TOPICS_ENV: cfg.get("topics", "events:0:1"),
         "RUNE_CLIENT_ID": str(cid),
         "RUNE_MODE": cfg.get("mode", "produce_subscribe"),
         "RUNE_RECORDS": str(cfg.get("records", 20)),

@@ -66,7 +66,7 @@ _RECORDS_PHASE2 = 40     # additional records produced AFTER the leader kill
 _SHORT_MS = 12000        # consume window before kill (let offsets get committed)
 _LONG_MS = 50000         # consume window after failover (must drain the post-kill tail)
 _TIMEOUT_MS = 20000
-# "cg" topic: topicId=2, 4 partitions.  Must match broker RUNE_TOPICS="events:1,multi:3,cg:4".
+# "cg" topic: topicId=2, 4 partitions.  Created by Cluster.up (DEFAULT_TOPICS: events:1, multi:3, cg:4 -> ids 0, 1, 2).
 _TOPIC = "cg:2:4"
 _GROUP_ID = "cg-failover-group"
 

@@ -192,8 +192,8 @@ class Compose:
     ``override_files``.  Each override is appended as a second ``-f`` argument
     so Docker Compose merges them in order (later files override earlier ones).
     This is used by the compaction/retention e2e tests, which need to inject
-    RUNE_TOPICS with compact/delete policy and small segment sizes via a
-    compose override — without touching the canonical docker-compose.yml.
+    broker environment overrides via a compose override — without touching the
+    canonical docker-compose.yml.
 
     ``image_tag``: injected as ``RUNE_IMAGE_TAG`` into every ``build``/``up``
     call so the broker image is tagged ``rune-broker-node:<tag>`` rather than

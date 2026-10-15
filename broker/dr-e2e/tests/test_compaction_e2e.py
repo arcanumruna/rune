@@ -18,12 +18,13 @@ Scenarios:
      committed offsets are intact (compacted topic checkpointed correctly).
 
 Harness requirements:
-  - Scenarios 1–4 use a compose override that injects extended RUNE_TOPICS
-    with compact policy + small segment roll so that the log cleaner can seal
-    multiple segments quickly in a Docker e2e window.  The override uses the
-    new RUNE_TOPICS field format added in CP-5.2:
+  - Scenarios 1–4 create their own topics by DDL (Cluster(topics=COMPACTION_TOPICS)):
+    compact policy + small segment roll so that the log cleaner can seal
+    multiple segments quickly in a Docker e2e window.  The specs use the
+    old positional format, mapped to `with (...)` settings by
+    harness.cluster.topic_statement:
       name:partitions:policy[:segmentRollBytes[:deleteRetentionMs[...]]]
-  - Scenario 5 uses the standard cluster fixture (no topic override needed)
+  - Scenario 5 uses the standard cluster fixture (no topic specs needed)
     because __consumer_offsets is always compact and uses
     offsetLogSegmentRollBytes from the broker's NodeConfig.
   - All scenarios require Docker to be running with a pre-built broker image
@@ -40,8 +41,6 @@ from __future__ import annotations
 
 import os
 import signal
-import tempfile
-import textwrap
 import time
 from collections import defaultdict
 from typing import Iterator
@@ -79,10 +78,10 @@ _STAGGER_MS = 400
 
 # Topic names used by the compaction e2e tests.
 # These are the ONLY topics configured on the compaction cluster (no events/multi/cg).
-# They MUST match the RUNE_TOPICS in the compose override AND the client RUNE_TOPICS.
+# They MUST match COMPACTION_TOPICS below (created by DDL, ids in list order) AND the client topic tables.
 #
-# Client RUNE_TOPICS format: "name:topicId:partitions"
-# Broker RUNE_TOPICS format (extended): "name:partitions:policy[:segmentRollBytes[:deleteRetentionMs[:retentionMs[:retentionBytes[:retentionCheckMs[:fileDeleteDelayMs[:minCleanableDirtyRatio[:maxCompactionLagMs]]]]]]]]"
+# Client topic-table format: "name:topicId:partitions"
+# Spec format (old positional, see harness.cluster.topic_statement): "name:partitions:policy[:segmentRollBytes[:deleteRetentionMs[:retentionMs[:retentionBytes[:retentionCheckMs[:fileDeleteDelayMs[:minCleanableDirtyRatio[:maxCompactionLagMs]]]]]]]]"
 #
 # compact_log (topicId=0, 1 partition): compact policy; tiny 4 KiB segments so
 #   the cleaner seals multiple segments quickly; 100 ms deleteRetentionMs so
@@ -104,83 +103,49 @@ _DELETE_TOPIC_PARTS = 1
 _DELETE_TOPIC_SEGMENT_BYTES = 4096   # 4 KiB
 _DELETE_TOPIC_RETENTION_BYTES = 32768  # 32 KiB = keep 8 newest segments
 
-# Client RUNE_TOPICS strings for each topic.
+# Client topic tables for each topic.
 _CLIENT_COMPACT_TOPICS = f"{_COMPACT_TOPIC_NAME}:{_COMPACT_TOPIC_ID}:{_COMPACT_TOPIC_PARTS}"
 _CLIENT_DELETE_TOPICS  = f"{_DELETE_TOPIC_NAME}:{_DELETE_TOPIC_ID}:{_DELETE_TOPIC_PARTS}"
 
 
 # ---------------------------------------------------------------------------
-# Compose override YAML factory.
+# The compaction cluster's topics (created by DDL in Cluster.up, ids in list order).
+# Only the two test topics exist (no events/multi/cg); the __consumer_offsets topic
+# is always created internally by the broker.
 #
-# The override replaces RUNE_TOPICS on ALL THREE broker nodes so the
-# compaction-oriented topic layout takes effect.  Only the two test topics
-# are declared (no events/multi/cg); the __consumer_offsets topic is always
-# created internally by the broker.
-#
-# The file is written to a temporary path and returned as a string.  The
-# caller is responsible for deleting it (done automatically by tmp_dir cleanup).
+# compact_log: compact policy, 4 KiB segments, 100 ms delete-retention,
+#              retentionMs=-1 (unbounded), retentionBytes=-1 (unbounded),
+#              retentionCheckMs=1 (immediate), fileDeleteDelayMs=1 (immediate),
+#              minCleanableDirtyRatio=0.0: compact to latest-per-key every pass so
+#              the tests can assert full convergence (no threshold gating).
+# delete_log:  delete policy, 4 KiB segments, deleteRetentionMs=1 (unused for delete),
+#              retentionMs=-1 (no time-retention), retentionBytes=32768 (32 KiB),
+#              retentionCheckMs=1, fileDeleteDelayMs=1.
 # ---------------------------------------------------------------------------
 
-def _write_compose_override(tmp_dir: str) -> str:
-    """Write a compose override YAML to tmp_dir and return its path."""
-    # Broker RUNE_TOPICS extended format:
-    #   name:partitions:policy[:segmentRollBytes[:deleteRetentionMs[:retentionMs[:retentionBytes[:retentionCheckMs[:fileDeleteDelayMs]]]]]]
-    #
-    # compact_log: compact policy, 4 KiB segments, 100 ms delete-retention,
-    #              retentionMs=-1 (unbounded), retentionBytes=-1 (unbounded),
-    #              retentionCheckMs=1 (immediate), fileDeleteDelayMs=1 (immediate).
-    # delete_log:  delete policy, 4 KiB segments, deleteRetentionMs=1 (unused for delete),
-    #              retentionMs=-1 (no time-retention), retentionBytes=32768 (32 KiB),
-    #              retentionCheckMs=1, fileDeleteDelayMs=1.
-    compact_topic_spec = (
-        f"{_COMPACT_TOPIC_NAME}:{_COMPACT_TOPIC_PARTS}:compact"
-        f":{_COMPACT_TOPIC_SEGMENT_BYTES}"         # segmentRollBytes
-        f":{_COMPACT_TOPIC_DELETE_RETENTION_MS}"   # deleteRetentionMs
-        f":-1"                                      # retentionMs = unbounded
-        f":-1"                                      # retentionBytes = unbounded
-        f":1"                                       # retentionCheckMs = 1 ms
-        f":1"                                       # fileDeleteDelayMs = 1 ms
-        f":0.0"                                     # minCleanableDirtyRatio = 0.0:
-                                                    #   compact to latest-per-key every
-                                                    #   pass so the tests can assert full
-                                                    #   convergence (no threshold gating).
-    )
-    delete_topic_spec = (
-        f"{_DELETE_TOPIC_NAME}:{_DELETE_TOPIC_PARTS}:delete"
-        f":{_DELETE_TOPIC_SEGMENT_BYTES}"           # segmentRollBytes
-        f":1"                                       # deleteRetentionMs (unused for delete, set to 1)
-        f":-1"                                      # retentionMs = unbounded
-        f":{_DELETE_TOPIC_RETENTION_BYTES}"         # retentionBytes = 32 KiB
-        f":1"                                       # retentionCheckMs = 1 ms
-        f":1"                                       # fileDeleteDelayMs = 1 ms
-    )
-    rune_topics = f"{compact_topic_spec},{delete_topic_spec}"
-
-    override = textwrap.dedent(f"""\
-        # CP-5.2: Compose override injecting compaction/retention topic config.
-        # Generated by test_compaction_e2e.py — do not commit.
-        services:
-          rune-1:
-            environment:
-              RUNE_TOPICS: "{rune_topics}"
-          rune-2:
-            environment:
-              RUNE_TOPICS: "{rune_topics}"
-          rune-3:
-            environment:
-              RUNE_TOPICS: "{rune_topics}"
-    """)
-
-    path = os.path.join(tmp_dir, "docker-compose.compaction-override.yml")
-    with open(path, "w") as f:
-        f.write(override)
-    return path
+COMPACTION_TOPICS = [
+    f"{_COMPACT_TOPIC_NAME}:{_COMPACT_TOPIC_PARTS}:compact"
+    f":{_COMPACT_TOPIC_SEGMENT_BYTES}"         # segmentRollBytes
+    f":{_COMPACT_TOPIC_DELETE_RETENTION_MS}"   # deleteRetentionMs
+    f":-1"                                      # retentionMs = unbounded
+    f":-1"                                      # retentionBytes = unbounded
+    f":1"                                       # retentionCheckMs = 1 ms
+    f":1"                                       # fileDeleteDelayMs = 1 ms
+    f":0.0",                                    # minCleanableDirtyRatio
+    f"{_DELETE_TOPIC_NAME}:{_DELETE_TOPIC_PARTS}:delete"
+    f":{_DELETE_TOPIC_SEGMENT_BYTES}"           # segmentRollBytes
+    f":1"                                       # deleteRetentionMs (unused for delete, set to 1)
+    f":-1"                                      # retentionMs = unbounded
+    f":{_DELETE_TOPIC_RETENTION_BYTES}"         # retentionBytes = 32 KiB
+    f":1"                                       # retentionCheckMs = 1 ms
+    f":1",                                      # fileDeleteDelayMs = 1 ms
+]
 
 
 # ---------------------------------------------------------------------------
 # compaction_cluster fixture.
 #
-# A function-scoped cluster that uses a compose override to inject compact-
+# A function-scoped cluster whose topics (COMPACTION_TOPICS) are compact-
 # policy topics with tiny segment sizes.  Uses the "rune-dr-compact" project
 # name so it never clashes with the standard "rune-dr" / "rune-dr-fault"
 # projects used by the DR-1..15 suite.
@@ -188,12 +153,9 @@ def _write_compose_override(tmp_dir: str) -> str:
 
 @pytest.fixture
 def compaction_cluster() -> Iterator[Cluster]:
-    """Function-scoped cluster with compact + delete topic overrides."""
-    tmp = tempfile.mkdtemp(prefix="rune_compaction_e2e_")
-    override = _write_compose_override(tmp)
-
+    """Function-scoped cluster with the compact + delete topics (COMPACTION_TOPICS)."""
     build = os.environ.get("DR_E2E_BUILD", "0") == "1"
-    c = Cluster(project="rune-dr-compact", override_files=[override])
+    c = Cluster(project="rune-dr-compact", topics=COMPACTION_TOPICS)
     try:
         c.up(build=build, leader_timeout=120)
         # CP-5.2: probe via delete_log (topicId=1, delete policy) so the warm-up
@@ -206,12 +168,6 @@ def compaction_cluster() -> Iterator[Cluster]:
     finally:
         faults.heal_all(c)
         c.down()
-        # Clean up the temporary override file.
-        try:
-            os.remove(override)
-            os.rmdir(tmp)
-        except OSError:
-            pass
 
 
 # ---------------------------------------------------------------------------

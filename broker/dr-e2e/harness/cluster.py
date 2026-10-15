@@ -10,9 +10,11 @@ Node id <-> service mapping is fixed by the compose file:
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import time
+from typing import Sequence
 
 from .dockerutil import Compose, _git_sha, run
 
@@ -24,6 +26,109 @@ COMPOSE_FILE = os.path.join(BROKER_REPO, "docker", "docker-compose.yml")
 
 SERVICES = ["rune-1", "rune-2", "rune-3"]
 CLIENT_PORT = 40200
+
+# The topics the brokers used to be started with (compose env, now removed): ids follow creation
+# order, so events = 0, multi = 1, cg = 2 — the ids the dr_client topic tables hard-code.
+DEFAULT_TOPICS = ("events:1", "multi:3", "cg:4")
+
+_SIBLINGS = os.path.dirname(BROKER_REPO)
+_CREATE_TOPICS_SH = os.path.join(BROKER_REPO, "docker", "create-topics.sh")
+_QL_ATTEMPT_CAP_S = 45          # one `rune ql` container run (connect + DDL budget)
+_QL_RETRY_PAUSE_S = 0.5
+_QL_RETRIABLE_RE = re.compile(r"NotLeader|Redirect|timed out|connection refused|not connected|unreachable", re.I)
+_QL_CREATED_RE = re.compile(r"created topic '([^']*)' topicId=(\d+)")
+_QL_STATEMENT_RE = re.compile(r"^statement (\d+):", re.M)
+
+
+class TopicCreationError(RuntimeError):
+    """A topic DDL did not succeed; the message names the statement and the CLI's last output."""
+
+
+# Old `name:partitions[:policy[:segmentRollBytes[:deleteRetentionMs[:retentionMs[:retentionBytes[
+#  :retentionCheckMs[:fileDeleteDelayMs[:minCleanableDirtyRatio[:maxCompactionLagMs]]]]]]]]][:key=value...]`
+# positional fields -> the DDL `with (...)` setting each one became.
+_POSITIONAL_SETTINGS = (
+    "cleanup.policy", "segment.bytes", "delete.retention.ms", "retention.ms", "retention.bytes",
+    "retention.check.ms", "file.delete.delay.ms", "min.cleanable.dirty.ratio", "max.compaction.lag.ms",
+)
+_POLICIES = {"delete": "delete", "compact": "compact", "compact_delete": "compact_delete", "compactdelete": "compact_delete"}
+_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.\-]+$")
+
+
+def topic_statement(spec: str) -> str:
+    """One Rune QL `topic ...;` statement for an old-style `name:partitions[:options]` spec.
+
+    Mapping (every option has a DDL equivalent or the spec is refused - nothing is dropped silently):
+
+      name:partitions                    topic NAME partitions P
+      positional policy                  with (cleanup.policy = delete|compact|compact_delete)
+      positional 2..9, in order          segment.bytes, delete.retention.ms, retention.ms, retention.bytes,
+                                         retention.check.ms, file.delete.delay.ms, min.cleanable.dirty.ratio,
+                                         max.compaction.lag.ms   (an empty field is skipped)
+      rf=N                               replicas N
+      persistence=transient|memory       transient topic NAME ...   (disk = the default)
+      durability=majority|all-in-sync    with (durability = ...)
+      tier=leader|majority|strict        with (tier = ...)
+      group=G                            with (copartition.group = 'G')
+      key=K                              with (partition.key = 'K')
+
+    Anything else (an unknown option, a 10th positional field, a bad value) raises ValueError.
+    """
+    fields = spec.split(":")
+    if len(fields) < 2 or not _TOKEN_RE.match(fields[0]) or not fields[1].isdigit():
+        raise ValueError(f"topic spec {spec!r}: want name:partitions[:options]")
+    name, parts = fields[0], int(fields[1])
+    settings: list[str] = []
+    replicas = None
+    transient = False
+    positional: list[str] = []
+    for f in fields[2:]:
+        if "=" in f:
+            k, v = (x.strip() for x in f.split("=", 1))
+            k = k.lower()
+            if not _TOKEN_RE.match(v or "!"):
+                raise ValueError(f"topic spec {spec!r}: bad value for {k}")
+            if k == "rf":
+                replicas = int(v)
+            elif k == "persistence":
+                if v.lower() in ("transient", "memory"):
+                    transient = True
+                elif v.lower() != "disk":
+                    raise ValueError(f"topic spec {spec!r}: persistence must be disk or transient")
+            elif k in ("durability", "tier"):
+                settings.append(f"{k} = {v.lower()}")
+            elif k == "group":
+                settings.append(f"copartition.group = '{v}'")
+            elif k == "key":
+                settings.append(f"partition.key = '{v}'")
+            else:
+                raise ValueError(f"topic spec {spec!r}: unknown option {k!r} (no DDL equivalent)")
+        else:
+            positional.append(f.strip())
+    if len(positional) > len(_POSITIONAL_SETTINGS):
+        raise ValueError(f"topic spec {spec!r}: more than {len(_POSITIONAL_SETTINGS)} positional options")
+    for key, val in zip(_POSITIONAL_SETTINGS, positional):
+        if not val:
+            continue
+        if key == "cleanup.policy":
+            if val.lower() not in _POLICIES:
+                raise ValueError(f"topic spec {spec!r}: policy must be delete, compact or compact_delete")
+            val = _POLICIES[val.lower()]
+        elif not re.fullmatch(r"-?\d+(\.\d+)?", val):
+            raise ValueError(f"topic spec {spec!r}: {key} must be a number")
+        settings.append(f"{key} = {val}")
+    stmt = ("transient " if transient else "") + f"topic {name} partitions {parts}"
+    if replicas is not None:
+        stmt += f" replicas {replicas}"
+    if settings:
+        stmt += " with (" + ", ".join(settings) + ")"
+    return stmt + ";"
+
+
+def _request_id(script: str) -> str:
+    """A stable non-zero 32-hex request id for a script: a re-run returns the original results.
+    The low 16 bits are zero so statement N (id lo + N - 1) never overflows."""
+    return hashlib.sha256(script.encode()).hexdigest()[:28] + "0000"
 
 # Legacy log-scrape pattern — kept ONLY as a fallback for images that predate
 # the Aeron role counter (see _read_role below).  Primary detection is
@@ -45,27 +150,25 @@ def service_to_node_id(service: str) -> int:
 
 
 class Cluster:
-    def __init__(self, project: str = "rune-dr", topics: str = "events:1",
+    def __init__(self, project: str = "rune-dr", topics: Sequence[str] | None = None,
                  override_files: list[str] | None = None,
                  global_overlays: bool = True):
         """Initialise a Cluster.
 
         Args:
             project:        Docker Compose project name.
-            topics:         Legacy/informational field (unused by the harness;
-                            the actual RUNE_TOPICS value comes from the compose
-                            file or a compose override file in override_files).
+            topics:         The topics `up()` creates by DDL once a leader exists
+                            (`name:partitions[:options]` specs, see `topic_statement`;
+                            ids follow list order).  Default: DEFAULT_TOPICS.
             global_overlays: Apply RUNE_DR_COMPOSE_OVERRIDES (e.g. the shard
                             overlay).  Default-config baseline arms pass False so
                             they keep measuring the true default config.
             override_files: Optional list of additional docker-compose YAML
-                            files to merge on top of the canonical compose file.
-                            Used by compaction/retention e2e tests to inject
-                            custom RUNE_TOPICS with compact policy + small
-                            segment sizes without modifying docker-compose.yml.
+                            files to merge on top of the canonical compose file
+                            (broker environment overrides).
         """
         self.project = project
-        self.topics = topics
+        self.topics: tuple[str, ...] = tuple(DEFAULT_TOPICS if topics is None else topics)
         # RUNE_IMAGE_TAG: use the git HEAD SHA so every commit's broker image is
         # tagged rune-broker-node:<sha> instead of <project>-rune-{1,2,3}:latest.
         # This prevents layer-store collisions between builds from different commits
@@ -92,9 +195,8 @@ class Cluster:
 
     def up(self, build: bool = False, leader_timeout: int = 90,
            clean: bool = True) -> "Cluster":
-        env_topics = os.environ.get("RUNE_TOPICS")
-        # RUNE_TOPICS is baked into the compose file's x-broker-env; we honour any
-        # override the caller exported, otherwise the compose default applies.
+        # The brokers boot with an empty catalog: once a leader exists the topics are
+        # created by DDL (create_topics below).
         #
         # HERMETIC START: wipe any named data volumes from a PRIOR run of this
         # project name BEFORE bringing the cluster up.  The fixture teardown calls
@@ -112,8 +214,88 @@ class Cluster:
         self.compose.up(*SERVICES, timeout=180)
         self._up = True
         self.wait_for_leader(leader_timeout)
-        _ = env_topics  # documented pass-through; compose owns the actual value
+        if self.topics:
+            self.create_topics(self.topics)
         return self
+
+    # ---- topics (DDL) -----------------------------------------------------
+
+    def _ql_image(self) -> str:
+        image = os.environ.get("DR_QL_IMAGE")
+        if image:
+            return image
+        client_repo = os.path.join(_SIBLINGS, "rune-client-cpp")
+        return f"rune-ql-probe:{_git_sha(client_repo)}"
+
+    def create_topics(self, specs: Sequence[str], *, deadline_s: float | None = None) -> list[tuple[str, int]]:
+        """Create topics by DDL through the `rune ql -f` CLI container on the cluster network.
+
+        `specs` are old-style `name:partitions[:options]` strings (see `topic_statement` for the
+        option mapping); topic ids follow list order (checked: a surprise id raises).  One script,
+        one fixed request id (derived from the script), so a retry after a partial run - or a
+        second call with the same specs - returns the original results and never duplicates.
+
+        Retries (every 0.5 s) while the cluster forms: connect timed out / refused, NotLeader,
+        Redirect, a per-attempt timeout.  Any other failure (parse error, TopicExists with other
+        options, ...) raises at once.  Total budget DR_CREATE_TOPICS_DEADLINE_S (default 60).
+        Raises TopicCreationError naming the failing statement and the last CLI output.
+        Returns [(name, topicId)].
+        """
+        statements = [topic_statement(s) for s in specs]
+        script = "\n".join(statements) + "\n"
+        request_id = _request_id(script)
+        if deadline_s is None:
+            deadline_s = float(os.environ.get("DR_CREATE_TOPICS_DEADLINE_S", "60"))
+        image = self._ql_image()
+        if run(["docker", "image", "inspect", image], timeout=30).returncode != 0:
+            res = run(["bash", _CREATE_TOPICS_SH, "--build-image"], timeout=1800,
+                      env={**os.environ, "QL_IMAGE": image})
+            if not res.ok:
+                raise TopicCreationError(f"cannot build the rune CLI image {image}:\n{res.stdout}{res.stderr}")
+        network = self.compose.network_name()
+        seed = f"{SERVICES[0]}:{CLIENT_PORT}"
+        deadline = time.time() + deadline_s
+        last = "(no attempt ran)"
+        attempt = 0
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            attempt += 1
+            cap = int(min(remaining, _QL_ATTEMPT_CAP_S)) + 1
+            try:
+                res = run(
+                    ["docker", "run", "--rm", "--network", network, "--shm-size=256m",
+                     "--security-opt", "seccomp=unconfined", "--platform", "linux/amd64",
+                     "-e", f"RQL={script}", image,
+                     "bash", "-c",
+                     f'printf "%s" "$RQL" > /tmp/topics.rql && '
+                     f'exec rune ql -f /tmp/topics.rql --request-id {request_id} --broker {seed}'],
+                    timeout=cap)
+            except TimeoutError:
+                last = f"attempt {attempt} ran longer than {cap}s and was stopped"
+                time.sleep(_QL_RETRY_PAUSE_S)
+                continue
+            out = (res.stdout or "") + (res.stderr or "")
+            if res.ok:
+                created = _QL_CREATED_RE.findall(out)
+                if len(created) != len(statements):
+                    raise TopicCreationError(
+                        f"{len(created)} of {len(statements)} topics reported created; output:\n{out}")
+                for want, (name, tid) in enumerate(created):
+                    if int(tid) != want:
+                        raise TopicCreationError(
+                            f"topic {name!r} got topicId={tid}, expected {want} (is the cluster fresh?)")
+                return [(n, int(t)) for n, t in created]
+            last = out.strip()[-800:]
+            if not _QL_RETRIABLE_RE.search(out):
+                m = _QL_STATEMENT_RE.search(out)
+                idx = int(m.group(1)) - 1 if m else -1
+                stmt = statements[idx] if 0 <= idx < len(statements) else "(unknown statement)"
+                raise TopicCreationError(f"not retriable: {stmt}\n{last}")
+            time.sleep(_QL_RETRY_PAUSE_S)
+        raise TopicCreationError(
+            f"topics not created within {deadline_s:.0f}s ({attempt} attempts): {statements}\nlast error: {last}")
 
     def down(self) -> None:
         # Idempotent, best-effort, bounded. Safe to call multiple times.

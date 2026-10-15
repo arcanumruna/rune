@@ -37,7 +37,7 @@ import pytest
 
 from harness import faults
 from harness.cluster import node_id_to_service
-from harness.driver import _PLATFORM_ARGS
+from harness.driver import _PLATFORM_ARGS, CLIENT_TOPICS_ENV
 from harness.driver import (
     GroupMemberResult,
     GroupResults,
@@ -68,7 +68,7 @@ _RECORDS = 80
 _KILL_DELAY_S = 8.0     # seconds after member start before SIGKILL (mid-consume)
 _LONG_MS = 70000        # survive window: long enough for session timeout + rebalance + drain
 _TIMEOUT_MS = 20000
-# "cg" topic: topicId=2, 4 partitions.  Must match broker RUNE_TOPICS="events:1,multi:3,cg:4".
+# "cg" topic: topicId=2, 4 partitions.  Created by Cluster.up (DEFAULT_TOPICS: events:1, multi:3, cg:4 -> ids 0, 1, 2).
 _TOPIC = "cg:2:4"
 _GROUP_ID = "cg-alo-group"
 
@@ -102,7 +102,7 @@ def _run_group_member_named(
         "RUNE_EGRESS": f"aeron:udp?endpoint={name}:{egress_port}",
         "RUNE_EGRESS_STREAM": "2",
         "RUNE_DATA_DIR": "/var/lib/rune-client",
-        "RUNE_TOPICS": topics,
+        CLIENT_TOPICS_ENV: topics,
         "RUNE_CLIENT_ID": str(cid),
         "RUNE_MODE": "group",
         "RUNE_GROUP_ID": group_id,

@@ -11,8 +11,8 @@
 #      docker/Dockerfile.view-probe, examples/view_probe.cpp).
 #   2. Start rune-1..3, await a consensus leader (bounded log poll).
 #   3. Start the probe detached (RUNE_MODE=transient_failover).  On the STATIC
-#      transient topic "presence_failover" (docker-compose.transient-failover.yml;
-#      runtime DDL is single-node today, see that file) it produces offsets 0..4
+#      transient topic "presence_failover" (created by DDL, docker/create-topics.sh
+#      transient-failover: docker/topics/transient-failover.rql) it produces offsets 0..4
 #      (acks=all), binds a read_committed subscription from earliest (delivers
 #      0..4) and a Latest read_committed subscription (bind-time position 5),
 #      then flushes an OPEN transaction (offsets 5..9: replicated, past the HW,
@@ -38,11 +38,12 @@
 # full-restart-group (E2 final fix wave C1): a consumer group commits, every node
 # restarts — staggered, the partition's old leader stopped and started LAST
 # (residual N1) — and the group must deliver every refilled record exactly once.
-# The partition leader is deterministic (StaticBalancer: node 2 = rune-3):
-#   seed-follows-redirect  the probe's seed is rune-1: its Subscribe is
-#                          redirected to rune-3 and the seed session follows;
-#   seed-is-leader         the probe's seed is rune-3 itself.
-# Each variant also asserts: the leader is node 2; the seed did / did not
+# The partition leader is placed by the catalog when the topic is created and is
+# discovered from the controller's log (see discover_partition_leader):
+#   seed-follows-redirect  the probe's seed is another node: its Subscribe is
+#                          redirected to the leader and the seed session follows;
+#   seed-is-leader         the probe's seed is the leader itself.
+# Each variant also asserts: the probe's leader is the placed one; the seed did / did not
 # redirect; the demoted node logged the moved-away summary and answered both
 # subscriptions Redirect; the probe saw acked=200 inDoubt=0 and a new leader.
 #
@@ -60,8 +61,7 @@ PROJECTS="$(cd "${BROKER_REPO}/.." && pwd)"
 CLIENT_REPO="${PROJECTS}/rune-client-cpp"
 
 COMPOSE_FILE="${BROKER_REPO}/docker/docker-compose.yml"
-COMPOSE_OVERRIDE="${BROKER_REPO}/docker/docker-compose.transient-failover.yml"
-TOPIC_ID=3   # presence_failover: the 4th RUNE_TOPICS entry of the override
+TOPIC_ID=3   # presence_failover: the 4th topic of docker/topics/transient-failover.rql (ids follow creation order)
 CLIENT_DOCKERFILE="${CLIENT_REPO}/docker/Dockerfile.view-probe"
 
 LEADER_WAIT_S=180          # consensus leader after `up`
@@ -97,7 +97,12 @@ export RUNE_LOG_LEVEL=debug
 
 log()  { echo "[transient-failover-e2e] $*" >&2; }
 fail() { echo "[transient-failover-e2e] FAIL: $*" >&2; exit 1; }
-dc()   { docker compose -p "${COMPOSE_PROJECT}" -f "${COMPOSE_FILE}" -f "${COMPOSE_OVERRIDE}" "$@"; }
+dc()   { docker compose -p "${COMPOSE_PROJECT}" -f "${COMPOSE_FILE}" "$@"; }
+
+# The brokers boot with an empty catalog: create the topics by DDL once a consensus leader is up and
+# before any producer.  Aborts the script when the creation fails.
+create_topics() { COMPOSE_NETWORK="${BROKER_NETWORK}" bash "${SCRIPT_DIR}/create-topics.sh" transient-failover \
+                      || fail "create-topics.sh transient-failover failed"; }
 
 [ -d "${PROJECTS}/rune-protocol" ] || fail "missing ../rune-protocol"
 [ -d "${PROJECTS}/rune-codec" ]    || fail "missing ../rune-codec"
@@ -141,6 +146,8 @@ echo "${out}" | grep -E "^( Image|ERROR|#[0-9]+ (DONE|ERROR))" || true
 docker image inspect "rune-broker-node:${RUNE_IMAGE_TAG}" >/dev/null 2>&1 \
     || fail "broker image not built: rune-broker-node:${RUNE_IMAGE_TAG}"
 
+bash "${SCRIPT_DIR}/create-topics.sh" --build-image || fail "could not build the rune CLI image"
+
 log "Step 1b: Building the client probe image (${CLIENT_IMAGE})..."
 set +e
 out=$(docker build \
@@ -161,24 +168,37 @@ docker image inspect "${CLIENT_IMAGE}" >/dev/null 2>&1 || fail "client image not
 # ---------------------------------------------------------------------------
 # One variant = a fresh cluster (Steps 2-5), torn down afterwards.
 #   $1 label   $2 the probe's seed service
-# The partition leader is DETERMINISTIC: StaticBalancer stripes partition
-# leaders over the nodes in RUNE_TOPICS declaration order (events 1 + multi 3 +
-# cg 4 partitions before it) -> presence_failover:0 -> node (8 % 3) = 2 =
-# rune-3 (the dr-e2e harness relies on the same rule).  The seed choice gives
-# the two client paths:
-#   seed-is-leader         seed rune-3: plain subscriptions bind on the seed
-#                          session directly;
-#   seed-follows-redirect  seed rune-1: the Subscribe is redirected to rune-3
-#                          and the seed session follows it there.
+# The partition leader is chosen by the catalog's placement when the topic is
+# created (no longer a fixed stripe over declaration order), so it is DISCOVERED:
+# the controller logs "transient topicId=<id> partition=0 leader <node>" when it
+# mints the partition's lineage.  The seed is then chosen from the leader, which
+# gives the two client paths:
+#   seed-is-leader         seed = the leader's service: plain subscriptions bind
+#                          on the seed session directly;
+#   seed-follows-redirect  seed = another service: the Subscribe is redirected
+#                          to the leader and the seed session follows it there.
+# The probe's own FAILOVER_LEADER must then agree with the discovered leader.
 # ---------------------------------------------------------------------------
-EXPECTED_LEADER=2
+EXPECTED_LEADER=-1
+# Sets EXPECTED_LEADER from the controller's lineage-mint log line (bounded poll).
+discover_partition_leader() {
+    local deadline=$(( $(date +%s) + 60 )) found=""
+    while [ "$(date +%s)" -lt "${deadline}" ]; do
+        found=$(dc logs --no-log-prefix rune-1 rune-2 rune-3 2>/dev/null \
+            | grep -oE "transient topicId=${TOPIC_ID} partition=0 leader [0-9]+" | grep -oE '[0-9]+$' | tail -1) || true
+        [ -n "${found}" ] && break
+        sleep 1
+    done
+    [ -n "${found}" ] || fail "no partition leader for topicId=${TOPIC_ID} in the controller log within 60s"
+    EXPECTED_LEADER="${found}"
+}
 probe_running() { [ "$(docker inspect -f '{{.State.Running}}' "${PROBE_NAME}" 2>/dev/null)" = "true" ]; }
 dump_probe() { echo "----- probe output -----" >&2; docker logs "${PROBE_NAME}" >&2 2>&1 || true; echo "------------------------" >&2; }
 
 run_variant() {
-    local label="$1" seed_svc="$2"
+    local label="$1" seed_policy="$2" seed_svc=""   # seed_policy: leader | other
     VARIANT="${label}"
-    log "======== variant ${label} (probe seed ${seed_svc}) ========"
+    log "======== variant ${label} (probe seed: ${seed_policy}) ========"
 
     # ---- Step 2: the 3-node cluster + a consensus leader.
     log "Step 2: Starting rune-1, rune-2, rune-3..."
@@ -196,6 +216,13 @@ run_variant() {
         fail "[${label}] no consensus leader within ${LEADER_WAIT_S}s"
     fi
     log "Consensus leader: node ${consensus_leader}"
+    create_topics
+    discover_partition_leader
+    local expected_svc other_svc s
+    expected_svc="$(node_id_to_service "${EXPECTED_LEADER}")"
+    for s in rune-1 rune-2 rune-3; do [ "${s}" = "${expected_svc}" ] || { other_svc="${s}"; break; }; done
+    if [ "${seed_policy}" = leader ]; then seed_svc="${expected_svc}"; else seed_svc="${other_svc}"; fi
+    log "presence_failover partition 0 is placed on node ${EXPECTED_LEADER} (${expected_svc}); probe seed ${seed_svc}"
 
     # ---- Step 3: the probe — bound subscriptions, an open txn, then READY.
     log "Step 3: Starting the probe (RUNE_MODE=transient_failover, seed ${seed_svc})..."
@@ -225,7 +252,7 @@ run_variant() {
     leader_id=$(docker logs "${PROBE_NAME}" 2>/dev/null | grep -oE '^FAILOVER_LEADER=-?[0-9]+' | tail -1 | cut -d= -f2) || true
     [ -n "${leader_id}" ] || { dump_probe; fail "[${label}] the probe did not report the partition leader"; }
     [ "${leader_id}" = "${EXPECTED_LEADER}" ] \
-        || { dump_probe; fail "[${label}] partition leader is node ${leader_id}, not the deterministic node ${EXPECTED_LEADER}"; }
+        || { dump_probe; fail "[${label}] partition leader is node ${leader_id}, not the placed node ${EXPECTED_LEADER}"; }
     leader_svc=$(node_id_to_service "${leader_id}")
     log "presence_failover partition 0 is led by node ${leader_id} (${leader_svc}); consensus leader node ${consensus_leader}"
     # The variant's client path really happened (gateway debug log of the seed).
@@ -330,6 +357,11 @@ run_full_restart_group() {
         [ "$(date +%s)" -lt "${deadline}" ] || fail "[${label}] no consensus leader within ${LEADER_WAIT_S}s"
         sleep 2
     done
+    create_topics
+    discover_partition_leader
+    local gl_svc gl_others=() gs
+    gl_svc="$(node_id_to_service "${EXPECTED_LEADER}")"
+    for gs in rune-1 rune-2 rune-3; do [ "${gs}" = "${gl_svc}" ] || gl_others+=("${gs}"); done
     log "Step G1: a group commits presence_failover's end (20 records produced first)..."
     local out rc
     set +e
@@ -338,12 +370,12 @@ run_full_restart_group() {
     echo "${out}" >&2
     [ "${rc}" -eq 0 ] || fail "[${label}] group_commit exited ${rc}"
     echo "${out}" | grep -q "^GROUP-COMMIT: OK committed=20" || fail "[${label}] the group did not commit 20"
-    log "Step G2: FULL restart, STAGGERED: the partition's old leader (rune-3) stops last and starts last..."
+    log "Step G2: FULL restart, STAGGERED: the partition's old leader (${gl_svc}) stops last and starts last..."
     n0="$(leader_lines)"
     mint0="$(dc logs --no-log-prefix rune-1 rune-2 rune-3 2>/dev/null | grep -cE "topicId=${TOPIC_ID} partition=0 .*data lineage MINTED" || true)"
-    dc stop -t "${STOP_TIMEOUT_S}" rune-1 rune-2
-    dc stop -t "${STOP_TIMEOUT_S}" rune-3
-    dc start rune-1 rune-2
+    dc stop -t "${STOP_TIMEOUT_S}" "${gl_others[@]}"
+    dc stop -t "${STOP_TIMEOUT_S}" "${gl_svc}"
+    dc start "${gl_others[@]}"
     deadline=$(( $(date +%s) + LEADER_WAIT_S ))
     until [ "$(leader_lines)" -gt "${n0}" ]; do
         [ "$(date +%s)" -lt "${deadline}" ] || fail "[${label}] no fresh consensus leader after the restart"
@@ -351,7 +383,7 @@ run_full_restart_group() {
     done
     # The old leader comes back last (the coordinator ran without it meanwhile).
     sleep "${STAGGER_S:-8}"
-    dc start rune-3
+    dc start "${gl_svc}"
     # Readiness: the partition's new leadership has confirmed its (new) lineage —
     # until then a produce is redirected / refused while leadership settles and
     # the probe's producer fails explicitly once its redirect budget is spent.
@@ -380,8 +412,8 @@ RESULTS=()
 VARIANTS="${FAILOVER_VARIANTS:-seed-follows-redirect seed-is-leader full-restart-group}"
 for v in ${VARIANTS}; do
     case "${v}" in
-        seed-follows-redirect) run_variant "${v}" rune-1 ;;
-        seed-is-leader)        run_variant "${v}" rune-3 ;;
+        seed-follows-redirect) run_variant "${v}" other ;;
+        seed-is-leader)        run_variant "${v}" leader ;;
         full-restart-group)    run_full_restart_group ;;
         *) fail "unknown variant '${v}'" ;;
     esac

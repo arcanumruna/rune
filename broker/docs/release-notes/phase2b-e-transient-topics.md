@@ -14,7 +14,7 @@ Upgrade brokers before clients.
 
 | Old name                          | New name                            | Old name still works? |
 |-----------------------------------|-------------------------------------|-----------------------|
-| `persistence=memory` (`RUNE_TOPICS`) | `persistence=transient`          | Yes, one warning per entry |
+| `persistence=memory` (boot topic option, since removed) | `persistence=transient` | Yes, one warning per entry |
 | `RUNE_MEMORY_LOG_RING_BYTES`      | `RUNE_TRANSIENT_LOG_RING_BYTES`     | Yes, one warning      |
 
 `RUNE_TRANSIENT_LOG_RING_BYTES` must be a power of two. The default is 8 MiB.
@@ -52,7 +52,7 @@ transient topic.
   a full-cluster restart the topic is empty and offsets restart from 0.
 - Persistence is fixed at definition. `alter topic` carries it forward and
   cannot change it.
-- An explicit `transient topic X` over an existing disk `RUNE_TOPICS` topic
+- An explicit `transient topic X` over an existing disk topic
   `X` answers `TopicExists` (error 25); the topic stays a disk topic.
 
 ## 5. A view over a transient topic must be transient
@@ -63,8 +63,8 @@ transient view. Rune QL `create view` arrives later.
 
 `alter topic` naming a view is rejected with error 38 (`ViewNotAlterable`).
 
-Changing a `RUNE_TOPICS` topic's `persistence=` between restarts is unsupported: the schema and
-view checks keep the mode recorded when the topic was defined.
+Persistence is fixed when a topic is defined; the schema and view checks keep the mode recorded
+at that point.
 
 ## 6. Upgrade order
 
@@ -92,10 +92,10 @@ waits for its timeout.
 - Topic and view names must be 1–249 bytes of `[A-Za-z0-9._-]`, must not be `.` or `..`, and must
   not start with `__`.
   - DDL answers error 40 (`InvalidTopicName`).
-  - A `RUNE_TOPICS` entry with a bad name now refuses to boot and names the entry. **Check
-    your `RUNE_TOPICS` before upgrading.**
-- Two names that differ only by ASCII letter case are rejected: DDL answers 25 (`TopicExists`),
-  and `RUNE_TOPICS` refuses to boot.
+  - At the time of this release a boot topic (declared with an environment variable, since
+    removed - see SELF-HOSTING.md, "Topics are created by DDL") with a bad name refused to boot
+    and named the entry.
+- Two names that differ only by ASCII letter case are rejected: DDL answers 25 (`TopicExists`).
 - `createView` over another view's output answers 41 (`ViewSourceIsView`) instead of creating a
   view that stays empty.
 - `alter topic … rename` of the key field now moves the topic's key with it.
@@ -115,9 +115,10 @@ waits for its timeout.
 - A failed definition can no longer stop the broker from booting. Its topic id becomes a hidden,
   zero-partition placeholder `__orphan.<id>`: not listed in metadata, produce and subscribe
   refused.
-- **A `RUNE_TOPICS` name equal to a runtime topic's name, or differing only by case, refuses to
-  boot** and names both entries. **Check your `RUNE_TOPICS` before upgrading.** Adding or removing
-  `RUNE_TOPICS` entries while runtime topics exist shifts their ids (see SELF-HOSTING.md).
+- At the time of this release, a boot topic whose name equalled a runtime topic's name (or differed
+  only by case) refused to boot, and changing the boot topic list shifted the runtime topics' ids.
+  Boot topics were declared with an environment variable that has since been removed: every topic
+  is now created by DDL, in creation order (see SELF-HOSTING.md, "Topics are created by DDL").
 - Runtime-defined disk topic directories carry a `topic-id` marker: `pending <id>` at create,
   `committed <id>` after the catalog commit (or at boot, when the catalog claims the directory).
 - Boot deletes a topic directory only when it belongs to a boot-created `__orphan.<id>` placeholder,
@@ -126,5 +127,5 @@ waits for its timeout.
   remembers the damage). **Any
   other topic directory no longer in the catalog is moved to
   `dataDir/quarantine/<name>-<unix-timestamp>/`, never deleted.** That includes a topic removed
-  from `RUNE_TOPICS`. With a damaged catalog nothing is deleted that boot. Re-adding the topic
+  from the boot topic list. With a damaged catalog nothing is deleted that boot. Re-adding the topic
   starts it empty; see SELF-HOSTING.md, "Data directory clean-up at boot", for the manual restore.

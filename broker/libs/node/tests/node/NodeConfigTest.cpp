@@ -2399,7 +2399,7 @@ TEST(NodeConfigCatalogStreamRegression, InsideThePerWorkerReplicationRangeIsRefu
 }
 
 // ===========================================================================
-// Catalog history Task 17 (spec §8, F5): topics exist only through DDL.  The retired RUNE_TOPICS setting is an
+// Catalog history Task 17 (spec §8, F5): topics exist only through DDL.  The retired topics environment variable is an
 // explicit refusal that points at the DDL docs — never silently ignored (a broker that "starts" with no topics
 // and a stale compose file is the failure this pins).
 // ===========================================================================

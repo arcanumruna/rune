@@ -35,10 +35,10 @@ Per-case record counts (aggregate = n_clients * records):
 Topic wiring
 ────────────
 partitions=1: topic "events" (topicId 0, 1 partition) — same as DR-1 baseline.
-              client RUNE_TOPICS = "events:0:1"
+              client topic table = "events:0:1"
 partitions=3: topic "multi"  (topicId 1, 3 partitions) — added in DR-2 compose.
-              Broker RUNE_TOPICS = "events:1,multi:3"
-              client RUNE_TOPICS = "multi:1:3"
+              Broker topics (Cluster.up, DDL) = events:1, multi:3
+              client topic table = "multi:1:3"
               RUNE_SUB_PARTITIONS = 3 so every subscriber covers partitions 0-2.
 
 Multi-partition coverage (DR-2 fix)

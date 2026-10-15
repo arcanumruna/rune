@@ -49,6 +49,7 @@ CLUSTER_PERSISTENCE="nvme"
 _rune_node_aeron() { echo "$WORK/rune-c$1/a"; }
 
 # rune_start_cluster <workers> <topics_spec> [io] [persistence]
+#   topics_spec: see rune_create_topics (created by DDL once the cluster has a leader).
 # 2026-10-02: the broker's DEFAULTS are the measured 110k config (shard + fused,
 # 16 MiB non-sparse terms, 32 MiB rings, derived MTU / socket buffer / window,
 # uring, derived shard ports + core layout).  This harness therefore passes a
@@ -95,7 +96,7 @@ rune_start_cluster() {
     # wildcard bind accepts remote clients, so the broker would derive the NIC MTU
     # instead of the 64 KiB loopback MTU).
     env RUNE_NODE_ID=$i RUNE_PEERS="$peers" RUNE_CLIENT_ENDPOINT="${RUNE_CLIENT_BIND:-127.0.0.1}:$cport" \
-        RUNE_DATA_DIR="$logdir" RUNE_AERON_DIR="$d/a" RUNE_TOPICS="$topics" \
+        RUNE_DATA_DIR="$logdir" RUNE_AERON_DIR="$d/a" \
         $knobs $eg \
         $(rune_shard_env "$i" "${workers:-1}") \
         RUNE_ELECTION_TIMEOUT_MS="${RUNE_ELECTION_TIMEOUT_MS:-300}" \
@@ -108,6 +109,8 @@ rune_start_cluster() {
   # Wait for a leader via rune_role (reliable — reads the Aeron role counter).
   local leader; leader="$(rune_wait_leader 60)"
   [ -z "$leader" ] && { log "CLUSTER: no leader elected"; for i in 0 1 2; do tail -5 "$WORK/rune-c$i/broker.log"; done; return 1; }
+  # The brokers boot with an empty catalog: create the topics by DDL (retries while the catalog leader forms).
+  rune_create_topics "$((40200+leader))" "$topics" || return 1
   log "rune cluster ready: leader=node$leader (client port $((40200+leader)))"
   echo "$leader"
 }

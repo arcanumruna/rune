@@ -16,6 +16,8 @@ name: rune-broker
 x-broker-build: &broker-build
   context: ..
   dockerfile: docker/Dockerfile
+  args:
+    - CMAKE_BUILD_PARALLEL_LEVEL   # from the environment when set (small Docker VMs); unset = ninja default
   additional_contexts:
     # relative to this compose file's dir (docker/), so ../../rune-protocol = the sibling repo
     # RUNE_PROTOCOL_DIR overrides it (e.g. a rune-protocol worktree on main when the
@@ -63,13 +65,9 @@ x-broker-env: &broker-env
   # side too, so a DR client container (--shm-size=64m) could not hold one broker
   # image.  Explicit 4 MiB terms (the pre-2026-10-02 size) for the containers.
   RUNE_AERON_TERM_BUFFER_BYTES: "4194304"
-  # GB-1/CB-5: bootstrap the data-plane topics on every node so the leader (and
-  # any post-kill leader) can serve produce/subscribe.  Broker assigns topicIds
-  # sequentially from 0 in declaration order → "events" = topicId 0.  The client
-  # E2E (docker/e2e-data.sh, rune_produce_subscribe) uses topicId 0 to match.
-  # "multi" (topicId 1, 3 partitions) is used by the DR-2 multi-partition matrix.
-  # "cg"    (topicId 2, 4 partitions) is used by the CG-6 consumer-group matrix.
-  RUNE_TOPICS: "events:1,multi:3,cg:4"
+  # NO topics are declared here: the brokers boot with an empty catalog and the data-plane topics
+  # (events = 0, multi = 1, cg = 2, ids in creation order) are created by DDL once a leader is up:
+  # docker/create-topics.sh e2e  (docker/topics/e2e.rql; the dr-e2e harness does the same).
   # E3 io_uring portability: Docker Desktop on Apple Silicon / Rosetta x86_64
   # emulation does NOT translate the io_uring_setup(2) syscall (NR 425), causing
   # the broker to crash on startup.  Setting RUNE_IO_BACKEND=portable activates

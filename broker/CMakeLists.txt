@@ -208,6 +208,15 @@ if(BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_no_atomics.py
             ${CMAKE_CURRENT_SOURCE_DIR})
+
+    # Catalog history spec §8 / F5: topics exist only through DDL.  No mention of the retired topics env var may remain
+    # in a tracked file (docs/superpowers/** excepted) beyond the explicit, counted allowlist in
+    # scripts/rune_topics_allowlist.txt; a tracked binary containing the string (committed build
+    # output) is a hit too.
+    add_test(NAME NoRuneTopicsGateRegression.RepositoryHasNoRuneTopicsMention
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_no_rune_topics.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
 
 # gtest_discover_tests() defaults to running each test binary with

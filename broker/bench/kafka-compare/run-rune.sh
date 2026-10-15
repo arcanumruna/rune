@@ -31,7 +31,7 @@ rune_produce() {
   # shellcheck disable=SC2086
   out="$(env RUNE_TARGET="aeron:udp?endpoint=127.0.0.1:${RUNE_CLIENT_PORT}" \
       RUNE_EGRESS="aeron:udp?endpoint=127.0.0.1:${RUNE_EGRESS_PORT}" \
-      RUNE_DATA_DIR="$cdir" RUNE_TOPICS="bench:0:${parts}" \
+      RUNE_DATA_DIR="$cdir" "${RUNE_CLIENT_TOPICS_ENV}=bench:0:${parts}" \
       RUNE_BENCH_RECORDS="$records" RUNE_BENCH_VALUE_BYTES="$vbytes" \
       RUNE_BENCH_WARMUP="$WARMUP" RUNE_BENCH_MODE=acked RUNE_BENCH_ACKS="$acks" \
       RUNE_BENCH_WINDOW="$window" RUNE_BENCH_MAX_IN_FLIGHT="$window" \
@@ -62,7 +62,7 @@ rune_consume() {
     # shellcheck disable=SC2086
     env RUNE_TARGET="aeron:udp?endpoint=127.0.0.1:${RUNE_CLIENT_PORT}" \
         RUNE_EGRESS="aeron:udp?endpoint=127.0.0.1:${port}" \
-        RUNE_DATA_DIR="$dd" RUNE_TOPICS="bench:0:${parts}" RUNE_BENCH_MODE=catchup \
+        RUNE_DATA_DIR="$dd" "${RUNE_CLIENT_TOPICS_ENV}=bench:0:${parts}" RUNE_BENCH_MODE=catchup \
         RUNE_BENCH_FROM=earliest RUNE_BENCH_RECORDS="$records" RUNE_BENCH_IDLE_MS="${RUNE_CONS_IDLE_MS:-10000}" \
         $(pin "$CORES_CLIENT") "$RUNE_CONS_BIN" >"$WORK/rune/rc$c.log" 2>&1 &
     pids+=($!)

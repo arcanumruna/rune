@@ -1,0 +1,7 @@
+-- docker/topics/e2e.rql: the data-plane topics of the 3-node docker e2e (docker/e2e.sh, the
+-- dr-e2e matrix and the client e2e probes).  Ids are assigned in creation order from 0:
+--   events = 0, multi = 1, cg = 2   (the ids the e2e clients hard-code)
+-- Created by docker/create-topics.sh (request id fixed per file, so a re-run is idempotent).
+topic events partitions 1;
+topic multi partitions 3;
+topic cg partitions 4;

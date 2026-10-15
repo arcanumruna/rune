@@ -1,5 +1,6 @@
 # --- Conan and build artifacts ---
 /build/
+/build-*/
 /cmake-build-*/
 .conan/
 /conan-release/

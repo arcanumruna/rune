@@ -22,7 +22,7 @@ Proves two things that are ALREADY proven by unit+integration (MD1-1..12):
 
 Phase-1 boundary contract (documented here for clarity):
   * StaticBalancer: for ``multi:3`` on nodes 0,1,2 with stripe offset 1 (events:1
-    precedes multi in RUNE_TOPICS) → partition p → node (p+1)%3.
+    precedes multi in creation order) → partition p → node (p+1)%3.
       partition 0 → node 1 (rune-2), partition 1 → node 2 (rune-3),
       partition 2 → node 0 (rune-1).
   * If node 0 (Raft-follower, partition-2 leader) is killed:
@@ -84,15 +84,15 @@ def _next_cid_base() -> int:
 
 
 # ---------------------------------------------------------------------------
-# Topic constants — must match the compose-file RUNE_TOPICS declaration.
-#   "events:1,multi:3,cg:4"
-# Client RUNE_TOPICS format: "name:topicId:partitions"
+# Topic constants — must match the topics Cluster.up creates by DDL (DEFAULT_TOPICS).
+#   events:1, multi:3, cg:4
+# Client topic-table format: "name:topicId:partitions"
 # ---------------------------------------------------------------------------
 _MULTI_TOPIC        = "multi"
 _MULTI_TOPIC_ID     = 1
 _MULTI_PARTITIONS   = 3   # 3 partitions → StaticBalancer assigns one per node
 
-# Client RUNE_TOPICS string for the multi topic.
+# Client topic table for the multi topic.
 _CLIENT_MULTI_TOPICS = f"{_MULTI_TOPIC}:{_MULTI_TOPIC_ID}:{_MULTI_PARTITIONS}"
 
 # Keys ≥ partitions ensures every partition receives at least one record.
@@ -108,7 +108,7 @@ _SUBSCRIBE_MS = 60_000
 # ---------------------------------------------------------------------------
 # StaticBalancer determinism — stripe offset correction for the ``multi`` topic.
 #
-# The cluster is configured with RUNE_TOPICS = "events:1,multi:3,cg:4".
+# The cluster's topics are created by DDL in this order: events:1, multi:3, cg:4.
 # StaticBalancer assigns partitions in topic-declaration order using a global
 # leader counter (stripe).  Each topic advances the stripe by its partitionCount:
 #
@@ -127,8 +127,8 @@ _SUBSCRIBE_MS = 60_000
 # ---------------------------------------------------------------------------
 
 # Stripe offset for the ``multi`` topic = sum of partitionCounts of all topics
-# declared before it in RUNE_TOPICS = events (1 partition) = 1.
-_MULTI_STRIPE_OFFSET = 1   # events:1 precedes multi in RUNE_TOPICS
+# created before it = events (1 partition) = 1.
+_MULTI_STRIPE_OFFSET = 1   # events:1 is created before multi
 
 
 def _expected_partition_leader(partition: int) -> int:
@@ -164,8 +164,7 @@ def _service_of_partition_leader(partition: int) -> str:
 # the gateway logs per-partition REDIRECT decisions, giving us a direct audit
 # trail that different nodes are serving different partitions.
 #
-# The override also carries ``RUNE_TOPICS`` unchanged (the base compose file
-# already has it) but sets debug logging for this test cluster only.
+# The override only sets debug logging for this test cluster.
 # ---------------------------------------------------------------------------
 
 def _write_debug_override(tmp_dir: str) -> str:

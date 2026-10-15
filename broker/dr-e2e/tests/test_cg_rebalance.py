@@ -10,7 +10,7 @@ single_owner and no_committed_loss invariants hold across the full lifecycle:
                      partitions are handed to the surviving members).
 
 All tests use the "cg" topic (topicId=2, 4 partitions) configured in the
-broker's docker-compose.yml (RUNE_TOPICS="events:1,multi:3,cg:4").
+topics Cluster.up creates by DDL (DEFAULT_TOPICS: events:1, multi:3, cg:4).
 
 Parametrized matrix (per the brief: members ∈ {2, 3, 4}):
   - test_cg_rebalance_stable:      members ∈ {2, 3, 4}
@@ -50,7 +50,7 @@ def _next_cid_base() -> int:
     return 2_000_000 + _run_counter["n"] * _CID_STRIDE
 
 
-# "cg" topic: topicId=2, 4 partitions.  Must match broker RUNE_TOPICS.
+# "cg" topic: topicId=2, 4 partitions.  Must match the topics Cluster.up creates (DEFAULT_TOPICS).
 _TOPIC = "cg:2:4"
 _RECORDS = 80          # records to produce per test case
 _SUBSCRIBE_MS = 40000  # member consume window (ms)

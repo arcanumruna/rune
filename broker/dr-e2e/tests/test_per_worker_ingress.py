@@ -79,9 +79,9 @@ def _next_cid_base() -> int:
 _CONNECT_MS = 40_000
 _STAGGER_MS  = 400
 
-# Client-side RUNE_TOPICS strings (name:topicId:partitions).
-# Must match the broker's RUNE_TOPICS ("events:1,multi:3,cg:4") in the
-# canonical docker-compose.yml → topicId is the zero-based declaration order.
+# Client-side topic tables (name:topicId:partitions).
+# Must match the topics Cluster.up creates by DDL (DEFAULT_TOPICS: events:1,
+# multi:3, cg:4) → topicId is the zero-based creation order.
 _TOPICS_EVENTS = "events:0:1"   # topicId=0, 1 partition
 _TOPICS_CG     = "cg:2:4"      # topicId=2, 4 partitions
 
