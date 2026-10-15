@@ -18,7 +18,7 @@ typedef struct rune_gso_totals_stct
 {
     uint64_t gso_sends;        /* successful sendmsg(UDP_SEGMENT) calls */
     uint64_t gso_datagrams;    /* wire datagrams carried by them */
-    uint64_t gso_fallbacks;    /* transports that turned GSO off (EIO/EINVAL/EOPNOTSUPP/ENOPROTOOPT) */
+    uint64_t gso_fallbacks;    /* transports that turned GSO off (EIO/EINVAL/EOPNOTSUPP/ENOPROTOOPT/EMSGSIZE) */
     uint64_t gro_buffers;      /* received buffers that held > 1 coalesced datagram */
     uint64_t gro_datagrams;    /* datagrams split out of them */
     uint64_t gro_ctrunc_drops; /* received buffers dropped: control data truncated (cannot split safely) */
@@ -26,6 +26,8 @@ typedef struct rune_gso_totals_stct
     uint64_t gro_disabled;     /* always 0: GRO is never turned off (a MSG_TRUNC drops only the damaged tail) */
     uint64_t transports;       /* transports created through these bindings */
     uint64_t gro_transports;   /* of which GRO was enabled on (receiver-affinity sockets only) */
+    uint64_t gso_path_mtu_fallbacks; /* of gso_fallbacks: EMSGSIZE — a segment exceeds the path MTU (the link MTU
+                                      * dropped below the Aeron MTU); that transport IP-fragments from then on */
 }
 rune_gso_totals_t;
 

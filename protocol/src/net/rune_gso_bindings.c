@@ -47,6 +47,7 @@
 #endif
 
 #define RUNE_GSO_UNSUPPORTED (-2)
+#define RUNE_GSO_PATH_MTU    (-3)   /* EMSGSIZE: a segment exceeds the path MTU (see rune_gso_sendmsg) */
 
 struct rune_gso_bindings_stct
 {
@@ -94,6 +95,7 @@ static void rune_gso_totals_add(rune_gso_totals_t *dst, const rune_gso_totals_t 
     dst->gro_disabled += src->gro_disabled;
     dst->transports += src->transports;
     dst->gro_transports += src->gro_transports;
+    dst->gso_path_mtu_fallbacks += src->gso_path_mtu_fallbacks;
 }
 
 static int rune_gso_init(
@@ -160,7 +162,8 @@ static int rune_gso_close(aeron_udp_channel_transport_t *transport)
 }
 
 /* One sendmsg(UDP_SEGMENT) carrying `count` datagrams of iov[0].iov_len bytes (last may be shorter).
- * Returns count, 0 (transient: Aeron re-sends the whole batch), RUNE_GSO_UNSUPPORTED, or -1 (error set). */
+ * Returns count, 0 (transient: Aeron re-sends the whole batch), RUNE_GSO_UNSUPPORTED, RUNE_GSO_PATH_MTU, or -1
+ * (error set). */
 static int rune_gso_sendmsg(
     rune_gso_transport_state_t *st,
     aeron_udp_channel_transport_t *transport,
@@ -221,6 +224,15 @@ static int rune_gso_sendmsg(
         {
             return RUNE_GSO_UNSUPPORTED;
         }
+        /* DR-BUG-MTU: the kernel refuses a GSO segment larger than the route's MTU (EMSGSIZE; measured on 5.15
+         * after `ip link set mtu 1200` under a 1472-byte Aeron MTU), while the same datagram sent plainly is
+         * IP-fragmented and delivered.  As a send error Aeron re-sent the identical batch forever: every
+         * multi-fragment burst on this transport stalled while its heartbeats kept the session alive (acks flowed,
+         * subscribers got nothing, no error).  It is a per-path condition, not a hard failure: fall back. */
+        if (EMSGSIZE == err)
+        {
+            return RUNE_GSO_PATH_MTU;
+        }
         AERON_SET_ERR(err, "rune-gso: sendmsg(UDP_SEGMENT) failed, segments=%zu seg=%u", count, (unsigned)seg);
         return -1;
     }
@@ -266,12 +278,23 @@ static int rune_gso_send(
         }
 
         r = rune_gso_sendmsg(st, transport, address, iov + done, k, bytes_sent);
-        if (RUNE_GSO_UNSUPPORTED == r)
+        if (RUNE_GSO_UNSUPPORTED == r || RUNE_GSO_PATH_MTU == r)
         {
             st->gso_on = 0;
             st->t.gso_fallbacks++;
-            fprintf(stderr, "rune-gso: WARN UDP GSO refused on fd=%d; this transport falls back to sendmmsg\n",
-                (int)transport->fd);
+            if (RUNE_GSO_PATH_MTU == r)
+            {
+                st->t.gso_path_mtu_fallbacks++;
+                fprintf(stderr, "rune-gso: WARN UDP GSO segment of %zu bytes exceeds the path MTU on fd=%d (EMSGSIZE: "
+                    "the link MTU is below the Aeron MTU); this transport falls back to sendmmsg and its datagrams "
+                    "are IP-fragmented — lower RUNE_AERON_MTU to the link MTU minus 28\n",
+                    iov[done].iov_len, (int)transport->fd);
+            }
+            else
+            {
+                fprintf(stderr, "rune-gso: WARN UDP GSO refused on fd=%d; this transport falls back to sendmmsg\n",
+                    (int)transport->fd);
+            }
             r = st->owner->defaults.send_func(
                 data_paths, transport, address, iov + done, iov_length - done, bytes_sent);
             return r < 0 ? r : (int)(done + (size_t)r);
