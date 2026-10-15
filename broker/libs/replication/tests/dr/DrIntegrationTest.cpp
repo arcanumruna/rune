@@ -1856,3 +1856,103 @@ TEST(DrIntegrationRegression, ColdRestart_StaleSameEpochTail_TruncatedNeverServe
     for (uint64_t x : c.ids(2)) EXPECT_LT(x, 900001u) << "the stale tail survived on node 2";
     EXPECT_EQ(c.ids(2).size(), 25u);
 }
+
+// ---------------------------------------------------------------------------
+// DR-BUG-6 reassessment (2026-10-15), the residual leader-completeness hole:
+// the leader's HW is min LEO over its MAXIMAL ISR (committed ∪ pending
+// proposal).  Every replica the controller can elect is in it ONLY while a
+// proposal the controller may already have committed stays pending until the
+// committed assignment REACHES the leader.  onAlterIsrResponse dropped the
+// pending proposal on InvalidUpdateVersion (a newer partitionEpoch is
+// committed — here the proposal itself, its answer lost and its re-send
+// answered) and on FencedLeaderEpoch, while the leader's own committed view was
+// still the old one (the assignment travels __cluster_metadata, the answer the
+// controller's direct channel: either can arrive first).  The maximal ISR
+// collapsed to the stale committed {1,2}; with node 3 (committed ISR member)
+// cut, the leader committed past 3's LEO; it died, the controller elected 3,
+// the acked records were gone.  Kafka keeps the pending state until the
+// metadata arrives (Partition.handleAlterPartitionError).
+// RED before the fix: 5 records acked past node 3's LEO and lost on failover.
+// ---------------------------------------------------------------------------
+TEST(DrIntegrationRegression, AnsweredButUnappliedExpansionStillHoldsTheHwRegression) {
+    DrCluster c(3);
+    c.start();
+    ASSERT_EQ(c.produceAcked(10), 10);
+    ASSERT_TRUE(c.driveUntil([&] { return c.converged(); }, kCap));
+    // Node 3 lags and is shrunk out of the committed ISR (commits continue on {1,2}).
+    c.cutBoth(1, 3);
+    ASSERT_EQ(c.produceAcked(5), 5) << c.dump();
+    ASSERT_TRUE(c.driveUntil([&] { return !c.controllerIsrContains(3); }, kCap)) << c.dump();
+    ASSERT_TRUE(c.driveUntil([&] { return !c.rep(1).isrProposalPendingForTest(); }, kCap)) << c.dump();
+    // Node 1's metadata replica lags from here; node 3 catches up and the leader proposes it back.
+    c.holdMetadata(1);
+    const uint64_t staleBefore = c.alterIsrStale();
+    c.heal(1, 3);
+    ASSERT_TRUE(c.driveUntil([&] { return c.controllerIsrContains(3); }, kCap)) << "expansion never committed\n" << c.dump();
+    // The proposal is committed but node 1 has not applied it; its re-send is answered InvalidUpdateVersion.
+    ASSERT_TRUE(c.driveUntil([&] { return c.alterIsrStale() > staleBefore; }, kCap)) << c.dump();
+    // Across several re-send / answer cycles, every step: the electable member stays in the maximal ISR.
+    for (int i = 0; i < 200; ++i) {
+        c.step();
+        const auto& maximal = c.rep(1).maximalIsrForTest();
+        ASSERT_NE(std::find(maximal.begin(), maximal.end(), 3), maximal.end())
+            << "step " << i << ": an answer dropped a proposal the controller committed — the maximal ISR lost "
+               "an electable member\n" << c.dump();
+    }
+    // Node 3 (a member of the controller's committed ISR) is cut again; records produced now must not commit.
+    const std::size_t ackedBefore = c.acked().size();
+    c.cutBoth(1, 3);
+    ASSERT_EQ(c.produce(5), 5);
+    c.run(300);   // far past replicaLagMaxMs
+    EXPECT_TRUE(c.controllerIsrContains(3));
+    EXPECT_EQ(c.acked().size(), ackedBefore) << "HW passed the LEO of a member the controller can elect";
+    // The leader dies; the controller elects node 3 (an ISR member): nothing acked may be missing there.
+    c.crash(1, CrashKind::ProcessKill);
+    c.healAll();
+    ASSERT_EQ(c.failover({}, /*positionsFrom=*/3), 3) << c.dump();
+    ASSERT_TRUE(c.waitWritable(kCap)) << c.dump();
+    EXPECT_EQ(c.produceAcked(5), 5);
+    c.restart(1);
+    c.releaseMetadata(1);
+    expectAllConvergedAndAcked(c, "answered-but-unapplied expansion");
+}
+
+// Sibling: FencedLeaderEpoch — the controller already moved leadership while
+// the leader's committed view lags.  Until the new assignment demotes it, the
+// (zombie) leader must keep counting its pending expansion: the controller may
+// have committed it before the move and elected the added member, and a
+// follower that lags the same metadata still fetches from the zombie.
+// RED before the fix: the Fenced answer dropped the pending proposal.
+TEST(DrIntegrationRegression, FencedAnswerKeepsThePendingProposalUntilTheAssignmentArrivesRegression) {
+    DrCluster c(3);
+    c.start();
+    ASSERT_EQ(c.produceAcked(10), 10);
+    ASSERT_TRUE(c.driveUntil([&] { return c.converged(); }, kCap));
+    c.cutBoth(1, 3);
+    ASSERT_EQ(c.produceAcked(5), 5) << c.dump();
+    ASSERT_TRUE(c.driveUntil([&] { return !c.controllerIsrContains(3); }, kCap)) << c.dump();
+    ASSERT_TRUE(c.driveUntil([&] { return !c.rep(1).isrProposalPendingForTest(); }, kCap)) << c.dump();
+    c.holdMetadata(1);
+    c.holdMetadata(2);
+    c.heal(1, 3);
+    ASSERT_TRUE(c.driveUntil([&] { return c.controllerIsrContains(3); }, kCap)) << c.dump();
+    ASSERT_TRUE(c.rep(1).isrProposalPendingForTest()) << "the expansion was never proposed";
+    ASSERT_TRUE(c.moveLeader(3));            // node 1 and node 2 have not applied it
+    const uint64_t sentBefore = c.sentBy(1, Kind::AlterIsr);
+    ASSERT_TRUE(c.driveUntil([&] { return c.sentBy(1, Kind::AlterIsr) > sentBefore; }, kCap)) << c.dump();
+    for (int i = 0; i < 200; ++i) {          // several re-sends, each answered FencedLeaderEpoch
+        c.step();
+        const auto& maximal = c.rep(1).maximalIsrForTest();
+        ASSERT_NE(std::find(maximal.begin(), maximal.end(), 3), maximal.end())
+            << "step " << i << ": a FencedLeaderEpoch answer dropped a proposal the controller may have committed\n"
+            << c.dump();
+    }
+    EXPECT_EQ(c.rep(1).role(), Role::Leader) << "node 1 has not learned the move (held metadata)";
+    c.releaseMetadata(1);
+    c.releaseMetadata(2);
+    EXPECT_EQ(c.rep(1).role(), Role::Follower);
+    EXPECT_FALSE(c.rep(1).isrProposalPendingForTest()) << "the new assignment resolves it";
+    ASSERT_TRUE(c.waitWritable(kCap)) << c.dump();
+    EXPECT_EQ(c.produceAcked(5), 5);
+    expectAllConvergedAndAcked(c, "fenced answer");
+}

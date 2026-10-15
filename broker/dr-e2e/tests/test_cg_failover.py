@@ -19,9 +19,7 @@ Invariants checked:
 Parametrized:
   - test_cg_failover_leader_kill: baseline (no netem).
   - test_cg_failover_leader_kill_netem: leader-kill + 10% follower packet loss
-    (mirrors DR-8 S1 test; marked xfail on the same DR-BUG-6 grounds if it
-    fails the committed-loss check under combined fault, but offset_resume and
-    single_owner are still asserted).
+    (mirrors DR-8 S1 test; every invariant hard-asserted - DR-BUG-6 is fixed).
 
 CID window: 2_100_000+ — within CG-6's 2_000_000+ window.
 """
@@ -267,11 +265,9 @@ def test_cg_failover_leader_kill_netem(fresh_cluster, netem_ready):
     """Leader-kill + follower 10% packet loss: offset_resume and single_owner hold.
 
     Mirrors DR-8 S1 pattern: apply netem loss to one follower, then SIGKILL the
-    leader.  The combined fault (kill + loss) is the known DR-BUG-6 condition
-    for committed-loss on acks=All in the base subscribe path.  For group
-    consumers the assert_group_no_committed_loss check is marked xfail via the
-    strict=False marker so a single combined-fault failure does not block the
-    full CG-6 suite.  offset_resume and single_owner are always hard-asserted.
+    leader.  The combined fault (kill + loss) was the DR-BUG-6 condition for
+    committed loss on acks=All; DR-BUG-6 is closed (DR_SUITE.md), so every
+    invariant - group committed-loss included - is hard-asserted.
     """
     cluster = fresh_cluster
     assert_single_leader(cluster)
@@ -356,22 +352,12 @@ def test_cg_failover_leader_kill_netem(fresh_cluster, netem_ready):
     assert_group_bounded_duplicates(gr_after)
     assert_group_offset_resume(gr_before, gr_after)
 
-    # Soft invariant — may fail on DR-BUG-6 (combined kill+loss can lose
-    # committed tail on the base replication path).  Mark xfail consistent
-    # with the existing test_dr8_leader_kill_netem xfail.
-    # Union of both phases must cover all produced records (prod1 + prod2).
+    # Union of both phases must cover all produced records (prod1 + prod2).  HARD (DR-BUG-6 closed 2026-10-15):
+    # the leader's HW counts its maximal ISR (committed + pending AlterIsr) until the committed assignment
+    # reaches it, so every replica the controller can elect holds every acked record - pinned in-process by
+    # DrIntegrationRegression.AnsweredButUnappliedExpansionStillHoldsTheHwRegression (see DR_SUITE.md).
     gr_combined_netem = GroupResults(
         produce_results=prod_combined_n,
         member_results=gr_before.member_results + members_after,
     )
-    # DR-BUG-6 xfail, STRICT (controller ruling 2026-10-15): the known loss xfails; a run WITHOUT the loss is an
-    # unexpected pass and fails, so a fix (or a scenario that stopped reproducing it) is noticed.  Only the
-    # DR-BUG-6 assertion is covered - every hard invariant above still fails normally.
-    try:
-        assert_group_no_committed_loss(gr_combined_netem)
-    except AssertionError as exc:
-        pytest.xfail(
-            f"group-no-committed-loss under combined kill+netem (DR-BUG-6): {exc}"
-        )
-    pytest.fail("[XPASS(strict)] DR-BUG-6 did not reproduce: no group committed loss under leader-kill + netem. "
-                "If DR-BUG-6 is fixed, remove this xfail; otherwise the scenario no longer reproduces it.")
+    assert_group_no_committed_loss(gr_combined_netem)

@@ -512,6 +512,13 @@ void PartitionReplica::becomeFollower(Epoch leaderEpoch, NodeId leaderId)
     if (role_ != Role::Follower) ++leadershipGeneration_;   // F15 S4
     role_     = Role::Follower;
     leaderId_ = leaderId;
+    // A follower proposes nothing: the demoting assignment resolves the leadership's
+    // pending AlterIsr (an answer never does — see onAlterIsrResponse).  Fields are
+    // reset in place (the member vector keeps its capacity for the next leadership).
+    isrProposal_.pending = false;
+    isrProposal_.isr.clear();
+    isrProposal_.sentNs = 0;
+    isrProposal_.basePartitionEpoch = -1;
     followerHw_ = 0;
     hwLearnedEpoch_ = -1;     // catalog Task 12 re-review F2: a new leader (even same epoch) must answer first
     followerSync_.reset();    // new leadership epoch → bootstrap fetch state afresh
@@ -2775,13 +2782,25 @@ void PartitionReplica::onAlterIsrResponse(const AlterIsrResponseMsg& r)
             if (clear) expandBackoffUntilNs_ = lastKnownNowNs_ + kAlterIsrResendNs;
             break;
         case kAlterIsrInvalidUpdateVersion:
-            // Our base is not the committed partitionEpoch: the proposal can never
-            // commit; the newer assignment (already applied, or on its way) is
-            // what the next proposal derives from.
-            clear = (r.partitionEpoch != isrProposal_.basePartitionEpoch);
-            break;
         case kAlterIsrFencedLeaderEpoch:
+            // DR-BUG-6 residual (2026-10-15): NEVER resolved by the answer.  A newer
+            // partitionEpoch / leader epoch is committed that this replica has not
+            // applied yet (once applied, applyCommittedIsr_ / the role change has
+            // already resolved the proposal) — and it may be THIS proposal, committed
+            // with its answer lost (a re-send is then answered InvalidUpdateVersion),
+            // or committed before the controller moved leadership (FencedLeaderEpoch).
+            // Dropping it here collapsed the maximal ISR to the stale committed view
+            // while the controller could already elect the added member: the HW
+            // passed that member's LEO, and its election lost acked records.  Kafka
+            // keeps the pending state until the metadata arrives
+            // (Partition.handleAlterPartitionError); so do we — the committed
+            // assignment that must follow (it is committed) resolves it.
+            break;
         case kAlterIsrInvalidRequest:
+            // Answered only for a proposal derived from the CURRENT committed state
+            // (leader epoch and partitionEpoch checked first, MetadataService::
+            // onAlterIsr): nothing newer is committed, so this replica's committed
+            // view is the controller's — collapsing to it is safe.
             clear = true;
             break;
         default:   // kAlterIsrOk: resolved by the applied assignment

@@ -267,6 +267,7 @@ public:
     void applyMetadata(NodeId id) {
         DrNode& n = node(id);
         if (!n.up) return;
+        if (heldMeta_.count(id) != 0) return;   // its metadata replica lags (holdMetadata): applied on release
         if (meta_.leader == id) {
             n.rep->becomeLeader(meta_.epoch, meta_.isr, cfg_.topicId >= 0 ? meta_.partitionEpoch : -1);
         } else if (meta_.leader >= 0) {
@@ -437,6 +438,12 @@ public:
         cutBoth(a, kControllerAddr);   // its AlterIsr / metadata are lost too
     }
     void healAll()          { cut_.clear(); }
+    /// Production's two controller → node paths are SEPARATE: committed assignments reach a node through its
+    /// __cluster_metadata replica + metadata bridge, AlterIsr answers through the controller's direct answer
+    /// channel.  holdMetadata(id) models node `id`'s metadata replica lagging (the committed record not yet
+    /// applied there) while AlterIsr answers still arrive; releaseMetadata(id) applies the current assignment.
+    void holdMetadata(NodeId id)    { heldMeta_.insert(id); }
+    void releaseMetadata(NodeId id) { heldMeta_.erase(id); applyMetadata(id); }
     void dropNext(Kind k, int count) { dropNext_[static_cast<int>(k)] += count; }
     uint64_t framesLost() const noexcept { return framesLost_; }
 
@@ -922,6 +929,7 @@ private:
     Meta                    meta_;
     std::deque<Frame>       wire_;
     std::set<std::pair<NodeId, NodeId>> cut_;
+    std::set<NodeId> heldMeta_;   ///< nodes whose metadata replica lags (holdMetadata)
     int                     dropNext_[kKinds] = {};
     uint64_t                framesLost_ = 0;
     uint64_t                sent_[8][kKinds] = {};
