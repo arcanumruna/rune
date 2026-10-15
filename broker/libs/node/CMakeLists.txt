@@ -202,6 +202,18 @@ if(BUILD_TESTING)
         GTest::gtest_main)
     gtest_discover_tests(rune_catalog_matrix_tests PROPERTIES TIMEOUT 600)
 
+    # Catalog history Task 21: the seeded, model-checked stress (64 seeds x 400 steps against the independent
+    # CatalogModel).  Its own binary: long-running (each seed is one ctest case).
+    add_executable(rune_catalog_stress_tests
+        tests/node/CatalogStressRegressionTest.cpp)
+    target_include_directories(rune_catalog_stress_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(rune_catalog_stress_tests PRIVATE
+        rune_node
+        rune_codec
+        rune_view
+        GTest::gtest_main)
+    gtest_discover_tests(rune_catalog_stress_tests PROPERTIES TIMEOUT 900)
+
     # ---------------------------------------------------------------------------
     # E5 Task 2: WorkerReplicationValidator unit tests — pure symmetric-worker-count
     # validator (header-only, no Aeron required).
