@@ -691,6 +691,11 @@ constexpr int64_t kStallEvidenceNs = 100'000'000;
 inline long long msOf(int64_t ns) { return static_cast<long long>(ns / 1'000'000); }
 /// The harness-observed stall: any of the three signals - the brokers' admin pass gap, their control pass gap (both folded into
 /// `maxPassGapNs`) and the test process's SchedulerWatchdog overshoot - reached kStallEvidenceNs.
+/// A stall takes effect after it ends: heartbeat silence (150 ms) -> fencing (3 x 150 = 450 ms) -> an election and the
+/// controller's AlterIsr commit (a few 20 ms status intervals).  A process stall that ended up to 1 s before the cell's
+/// baseline can still move the topology inside it; the watchdog runs from the start of the cell and is asked for the stalls
+/// that ended since (baseline - kStallLookbackNs).
+constexpr int64_t kStallLookbackNs = 1'000'000'000;
 inline bool stallObservedFrom(int64_t maxPassGapNs, int64_t watchdogGapNs) {
     return maxPassGapNs >= kStallEvidenceNs || watchdogGapNs >= kStallEvidenceNs;
 }
@@ -771,7 +776,24 @@ struct CellSeams {
     bool                                               answerHoldInWindow = true;   ///< false: the RED of Recipe 2 step 2
     bool                                               injectsStall = false;  ///< the seams stall a broker / the harness themselves
     bool                                               suppressTimingHook = false;   ///< T9: RestartMidApply's hook never acts
+    std::function<void()>                              beforeBaseline;   ///< T10: runs right before the baseline snapshot
 };
+
+/// SIGSTOP this whole process for `ms` from a forked child (async-signal-safe calls only), then wait for the child.
+inline void stopThisProcessFor(long ms) {
+    const pid_t parent = ::getpid();
+    const pid_t child = ::fork();
+    if (child < 0) throw std::runtime_error("fork failed");
+    if (child == 0) {
+        ::kill(parent, SIGSTOP);
+        const timespec ts{ms / 1000, (ms % 1000) * 1'000'000};
+        ::nanosleep(&ts, nullptr);
+        ::kill(parent, SIGCONT);
+        ::_exit(0);
+    }
+    int st = 0;
+    while (::waitpid(child, &st, 0) < 0 && errno == EINTR) {}
+}
 
 /// The settled catalog leader, polled (a stalled host can leave the topology unsettled for a moment between two reads): -1 after `within`.
 int resolveLeader(ThreeNodes& c, std::chrono::seconds within) {
@@ -791,6 +813,10 @@ void runCell(const CellParam& param, const CellSeams& seams = {}, CellOutcome* o
     struct TimeRecorder { std::string n; Clock::time_point t0; ~TimeRecorder() {
         CellTimes::rows().emplace_back(n, std::chrono::duration<double>(Clock::now() - t0).count()); } } recorder{cell, t0};
 
+    // The third stall signal (see runCell's baseline): runs from the start of the cell, asked for the stalls that ended since
+    // (baseline - kStallLookbackNs); destroyed (joined) on every exit.
+    rune::node::testing::SchedulerWatchdog watchdog;
+    watchdog.start();
     ThreeNodes c("sl" + std::to_string(static_cast<int>(kind)) + std::to_string(static_cast<int>(timing)) + std::to_string(viaParam), Mode::Shard);
     c.configTweak = seams.configTweak;
     for (int id : (timing == cm::Timing::NewBrokerJoins ? std::vector<int>{1, 2} : std::vector<int>{1, 2, 3})) c.startNode(id);
@@ -853,11 +879,11 @@ void runCell(const CellParam& param, const CellSeams& seams = {}, CellOutcome* o
     ASSERT_GT(leader, 0);
     Perturbation pert;
     pert.injectedStall = seams.injectsStall;
-    // The third stall signal (controller ruling on round-3 concern 1): a watchdog thread of THIS process measures how long the
-    // scheduler kept it off the CPU - process-wide starvation that also delays the media-driver heartbeat threads, which the
-    // brokers' admin / control pass gaps cannot see.  Stopped (joined) right before the after-drive reading.
-    rune::node::testing::SchedulerWatchdog watchdog;
-    watchdog.start();
+    // The third stall signal (controller ruling on round-3 concern 1): the watchdog thread of THIS process (started with the
+    // cell) measures how long the scheduler kept it off the CPU - process-wide starvation that also delays the media-driver
+    // heartbeat threads, which the brokers' admin / control pass gaps cannot see.  Joined right before the after-drive reading.
+    if (seams.beforeBaseline) seams.beforeBaseline();
+    const auto tBaseline = Clock::now();
     const Perturbation pert0 = Perturbation::snapshot(c);
 
     // ── the cell's DDL ─────────────────────────────────────────────────────────────────────────────
@@ -1099,7 +1125,7 @@ void runCell(const CellParam& param, const CellSeams& seams = {}, CellOutcome* o
     if (victimId > 0) excluded.insert(victimId);
     const Perturbation after = Perturbation::read(c);
     watchdog.stop();   // the join hands over its result
-    const int64_t watchdogGap = watchdog.maxOvershootNs();
+    const int64_t watchdogGap = watchdog.maxOvershootEndingSince(tBaseline - std::chrono::nanoseconds(kStallLookbackNs));
     const std::string why = after.since(pert0, excluded, timing != cm::Timing::LeaderChangeMidDdl) +
                             (pert.leaderMovedInCell ? " leader-moved" : "") +
                             (pert.gateOverdueObserved ? " gate-overdue" : "");
@@ -1466,6 +1492,20 @@ TEST(CatalogClusterRegression, TimingThatNeverRanFailsTheCellRegression) {
     EXPECT_EQ(neverRan, 1) << "an un-exercised timing must fail the cell";
 }
 
+// T10 (controller ruling, lookback): a whole-process stop that ENDS right before the cell's baseline still explains product
+// evidence inside the cell (a stall takes effect after it ends: heartbeat timeout -> fencing -> election).  The broker pass gaps
+// are reset after it (the brokers ran 50 ms since), so only the watchdog's lookback sees it.  The evidence is fabricated (as T7).
+// RED: no lookback (stalls ending since the baseline only) -> watchdog 0 -> the "NO stall" failure.
+TEST(CatalogClusterRegression, StallEndingBeforeTheBaselineExplainsLaterEvidenceRegression) {
+    CellSeams seams;
+    seams.beforeBaseline = [] { stopThisProcessFor(300); std::this_thread::sleep_for(50ms); };
+    seams.onLeaderSend = [](ThreeNodes& c, Rig&, int lead) { c.node(lead).bumpCatalogNotLeaderDemotedForTest(); };
+    CellOutcome out;
+    runCell({cm::Kind::CreateTopic, cm::Timing::Steady, 1}, seams, &out);
+    EXPECT_GE(out.watchdogGapNs, 250'000'000) << "the watchdog saw the 300 ms stop through its lookback";
+    EXPECT_TRUE(out.stallObserved);
+}
+
 // Controller ruling (round-3 concern 1): every one of the three signals is a harness-observed stall on its own; none below the bound is.
 // RED: drop the watchdog term in stallObservedFrom -> (0, 150 ms) is not a stall.
 TEST(ThreeNodesRegression, StallEvidenceCountsEveryHarnessSignalRegression) {
@@ -1482,21 +1522,12 @@ TEST(ThreeNodesRegression, SchedulerWatchdogDetectsAWholeProcessStopRegression) 
     rune::node::testing::SchedulerWatchdog w;
     w.start();
     std::this_thread::sleep_for(50ms);
-    const pid_t parent = ::getpid();
-    const pid_t child = ::fork();
-    ASSERT_GE(child, 0);
-    if (child == 0) {
-        ::kill(parent, SIGSTOP);
-        const timespec ts{0, 300'000'000};
-        ::nanosleep(&ts, nullptr);
-        ::kill(parent, SIGCONT);
-        ::_exit(0);
-    }
-    int st = 0;
-    while (::waitpid(child, &st, 0) < 0 && errno == EINTR) {}
+    stopThisProcessFor(300);
     std::this_thread::sleep_for(50ms);   // the watchdog's next tick observes the stop
     w.stop();
     EXPECT_GE(w.maxOvershootNs(), 250'000'000) << "the 300 ms stop of the whole process (watchdog " << msOf(w.maxOvershootNs()) << " ms)";
+    EXPECT_GE(w.maxOvershootEndingSince(Clock::now() - 1s), 250'000'000) << "the stop ended inside the last second";
+    EXPECT_EQ(w.maxOvershootEndingSince(Clock::now() + 1s), 0) << "no stop ends in the future";
     // A second run starts from 0 (the result of a run is its own).
     w.start();
     std::this_thread::sleep_for(30ms);
