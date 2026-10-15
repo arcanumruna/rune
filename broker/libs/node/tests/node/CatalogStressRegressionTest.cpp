@@ -67,7 +67,7 @@ bool matches(cmodel::CatalogModel& model, const std::vector<const StressAnswer*>
         if (a->code == 0) {
             if (!m.accepted) return false;
             model.apply(m);
-        } else if (m.accepted || a->code != static_cast<int>(m.refusalCode)) {
+        } else if (m.accepted || !m.refusesWith(a->code)) {
             return false;
         }
     }
@@ -142,7 +142,7 @@ void runSeed(uint32_t seed, int steps, SeedReport& rep) {
                 cmodel::CatalogModel next = model;
                 ASSERT_TRUE(matches(next, judged))
                     << at << ": broker answer differs from the model:" << codesOf(judged) << " model says "
-                    << (model.accept(judged[0]->request).accepted ? std::string("OK") : std::to_string(model.accept(judged[0]->request).refusalCode))
+                    << model.accept(judged[0]->request).refusalText()
                     << " [" << res.what << "]" << cmodel::describe(model.snapshot());
                 model = next;
             } else if (judged.size() == 2) {

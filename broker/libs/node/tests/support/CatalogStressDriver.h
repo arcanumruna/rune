@@ -313,6 +313,7 @@ public:
         using K = rune::catalog::EventKind;
         std::map<std::string, uint64_t> liveId;
         std::set<uint64_t> usedIds;
+        std::set<int32_t>  usedTopicIds;   // a topic id (a topic's, a view's sink) is never reused (M2)
         for (const auto& r : h_.readLog_(*h_.broker_(h_.cur_.leaderNode).log)) {
             const auto& e = r.event;
             auto bad = [&](const std::string& m) { if (why) *why = "offset " + std::to_string(r.offset) + " '" + e.objectName + "': " + m; return false; };
@@ -320,8 +321,21 @@ public:
             switch (e.kind) {
             case K::CreateTopic: case K::CreateView:
                 if (it != liveId.end()) return bad("created while object " + std::to_string(it->second) + " is live");
+                for (const auto& [name, id] : liveId)   // M2: a case variant of a live name (one directory on a case-insensitive filesystem)
+                    if (rune::catalog::topicNamesFoldEqual(name, e.objectName))
+                        return bad("created while its case variant '" + name + "' (object " + std::to_string(id) + ") is live");
                 if (!usedIds.insert(e.objectId).second) return bad("objectId " + std::to_string(e.objectId) + " reused");
+                if (const auto* t = std::get_if<rune::catalog::CreateTopicOps>(&e.ops)) {
+                    if (!usedTopicIds.insert(t->topicId).second) return bad("topic id " + std::to_string(t->topicId) + " reused");
+                } else if (const auto* v = std::get_if<rune::catalog::CreateViewOps>(&e.ops)) {
+                    if (!usedTopicIds.insert(v->view.viewTopicId).second) return bad("sink topic id " + std::to_string(v->view.viewTopicId) + " reused");
+                }
                 liveId[e.objectName] = e.objectId;
+                break;
+            case K::AlterView:
+                if (it == liveId.end() || it->second != e.objectId) return bad("altered an object that is not the live one");
+                if (const auto* v = std::get_if<rune::catalog::AlterViewOps>(&e.ops))
+                    if (!usedTopicIds.insert(v->view.viewTopicId).second) return bad("sink topic id " + std::to_string(v->view.viewTopicId) + " reused");
                 break;
             case K::DropTopic: case K::DropView:
                 if (it == liveId.end() || it->second != e.objectId) return bad("dropped an object that is not the live one");

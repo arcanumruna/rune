@@ -7,6 +7,13 @@
 // a copy of them could not be seen by a test that reuses them (C4).  Its only includes are the standard
 // library, the 128-bit RequestId and the client ErrorCode enum.
 //
+// CITATIONS.  A rule is labelled with where it comes from, so a rule copied from production is never passed off as
+// the spec's: "Spec §n" = the spec text; "production contract <file:line>" = the existing specific codes of §9 ("the
+// existing specific codes"), which the spec does not enumerate, taken from the code that answers them; "frozen
+// formatVer-1 catalog rule" = a rule of rune-codec's frozen ApplyV1 that the spec is silent on.  Where TWO refusals hold at
+// once the spec does not order them, so the model answers with EVERY applicable code (refusalCodes) and the stress accepts
+// any of them: the precedence is production's, not part of the contract the model checks.
+//
 // The model is SEQUENTIAL: accept(request) says what a DDL sent now must answer (OK, or the refusal code);
 // apply(answer) moves the model on when it was accepted.  The stress feeds it the DDLs in the order their
 // answers prove (a concurrent pair is tried in both orders, see the test).  Every rule cites its spec text.
@@ -142,17 +149,29 @@ using Snapshot = std::map<std::string, ModelObject>;
     return o.str();
 }
 
-/// What the model says a DDL sent now must answer.
+/// What the model says a DDL sent now must answer.  A refused DDL may be refused for several reasons at once; the
+/// spec does not order them, so ANY of `refusalCodes` is a correct answer.
 struct ModelAnswer {
-    Request  request;
-    bool     accepted = false;
-    uint16_t refusalCode = 0;     // the ErrorCode when !accepted
+    Request               request;
+    bool                  accepted = false;
+    std::vector<uint16_t> refusalCodes;   // every ErrorCode that applies when !accepted (never empty then)
+    [[nodiscard]] bool refusesWith(int code) const noexcept {
+        return std::find(refusalCodes.begin(), refusalCodes.end(), static_cast<uint16_t>(code)) != refusalCodes.end();
+    }
+    [[nodiscard]] std::string refusalText() const {
+        if (accepted) return "OK";
+        std::string t;
+        for (const uint16_t c : refusalCodes) t += (t.empty() ? "" : "|") + std::to_string(c);
+        return t;
+    }
 };
 
 class CatalogModel {
 public:
-    /// The name pool: 12 names; "B0"/"b0" and "D1"/"d1" fold onto each other (Spec: a create whose name
-    /// differs only in ASCII case from a live name is refused TopicExists), "__rsv" is reserved (40).
+    /// The name pool: 12 names; "B0"/"b0" and "D1"/"d1" fold onto each other (Spec §5.1 "Name case": a create whose
+    /// ASCII-case-folded name equals a live object's folded name is refused with the duplicate-name code; the rule is
+    /// frozen formatVer-1, rune-codec TopicName.h:19-21 / ApplyV1.cpp:9), "__rsv" is reserved (40: Spec §2/§8
+    /// internal-topic prefix).
     static inline const std::vector<std::string> kPool = {"a0", "a1", "a2", "a3", "a4", "b0", "B0", "d1", "D1", "c.x-y_z", "e-9", "__rsv"};
     static inline const std::vector<std::string> kFields = {"f0", "f1", "f2"};
 
@@ -160,12 +179,8 @@ public:
     [[nodiscard]] ModelAnswer accept(const Request& r) const {
         ModelAnswer a;
         a.request = r;
-        if (const auto code = refusal_(r)) {
-            a.accepted = false;
-            a.refusalCode = num(*code);
-        } else {
-            a.accepted = true;
-        }
+        for (const Code c : refusals_(r)) a.refusalCodes.push_back(num(c));
+        a.accepted = a.refusalCodes.empty();
         return a;
     }
 
@@ -407,73 +422,86 @@ private:
         return current + 1;                      // stale / from the future: a conflict
     }
 
-    /// The source rules of CreateView / AlterView ("view validity", §5.1): a source is a live typed TOPIC; a
-    /// view's sink carries no change events (41); a persisted view over a transient source is refused (37).
-    [[nodiscard]] std::optional<Code> sourceRefusal_(const Request& r) const {
+    /// The source rules of CreateView / AlterView ("view validity", Spec §5.1) - EVERY one that applies.  The specific
+    /// codes are production contract AdminWorker.cpp:1065 / :1068 / :1070 (viewDef_: 41 / 33 / 37) and the untyped-source rule
+    /// (an untyped topic has no schema to read: 33).  A source is a live typed TOPIC; a view's sink carries no change
+    /// events (41); a persisted view over a transient source is refused (37).
+    void sourceRefusals_(const Request& r, std::vector<Code>& out) const {
         const auto it = live_.find(r.source);
-        if (it == live_.end()) return Code::ViewSourceNotFound;
-        if (it->second.isView) return Code::ViewSourceIsView;
-        if (!it->second.typed) return Code::ViewSourceNotFound;   // an untyped topic has no schema to read
-        if (it->second.transient && !r.transient) return Code::ViewSourceTransient;
-        return std::nullopt;
+        if (it == live_.end()) { out.push_back(Code::ViewSourceNotFound); return; }
+        if (it->second.isView) { out.push_back(Code::ViewSourceIsView); return; }
+        if (!it->second.typed) out.push_back(Code::ViewSourceNotFound);
+        if (it->second.transient && !r.transient) out.push_back(Code::ViewSourceTransient);
     }
 
-    [[nodiscard]] std::optional<Code> refusal_(const Request& r) const {
+    /// EVERY refusal that applies to `r` (empty = accepted).  Codes: Spec §9 "name collision -> TopicExists (25)", "the
+    /// existing specific codes, otherwise InvalidRequest (39)"; the specific ones are production contract
+    /// AdminWorker.cpp (buildDefine_ :931, buildAlter_ :1012, buildCreateView_ :1105, buildAlterView_ :1123,
+    /// buildDropView_ :1142, buildDropTopic_ :1154, buildAlterConfig_ :1169) and rune-codec ApplyV1.cpp.
+    [[nodiscard]] std::vector<Code> refusals_(const Request& r) const {
+        std::vector<Code> out;
         const auto it = live_.find(r.name);
         const ModelObject* obj = it == live_.end() ? nullptr : &it->second;
         switch (r.op) {
         case Op::DefineTopic:
-            if (!validName_(r.name)) return Code::InvalidTopicName;
+            if (!validName_(r.name)) out.push_back(Code::InvalidTopicName);   // Spec §2/§8 via Protocol.h
             if (obj != nullptr) {
-                if (obj->isView) return Code::TopicExists;
-                if (obj->typed) return Code::TopicExists;                       // a schema already
-                if (!r.typed) return Code::TopicExists;                         // untyped over untyped: nothing to adopt
-                if (r.transient && !obj->transient) return Code::TopicExists;   // cannot turn a disk topic transient
-                return std::nullopt;                                            // adoption: the topic gains its schema
+                // production contract AdminWorker.cpp:953-966 (the existing-topic branch) + the adoption rules.
+                if (obj->isView) out.push_back(Code::TopicExists);
+                else if (obj->typed) out.push_back(Code::TopicExists);                       // a schema already
+                else if (!r.typed) out.push_back(Code::TopicExists);                         // untyped over untyped: nothing to adopt
+                else if (r.transient && !obj->transient) out.push_back(Code::TopicExists);   // cannot turn a disk topic transient
+                // else: adoption - the topic gains its schema (the rf is not looked at: AdminWorker.cpp:953 returns first)
+                return out;
             }
-            if (foldsOntoLive_(r.name)) return Code::TopicExists;
+            if (foldsOntoLive_(r.name)) out.push_back(Code::TopicExists);   // Spec §5.1 "Name case"
             // Spec §5.1/§8: "replicationFactor <= broker count and >= minIsr, explicit errors" (InvalidRequest + detail).
-            // The harness's minIsr is 1, so 0 (every broker) .. 3 pass.  An ADOPTION (an existing untyped topic) never
-            // reaches this check: the existing-topic rules above answer first (production contract AdminWorker.cpp
-            // buildDefine_: the rf check follows the adoption branch).
-            if (r.replicationFactor < 0 || r.replicationFactor > 3) return Code::InvalidRequest;
-            return std::nullopt;
+            // The harness's minIsr is 1, so 0 (every broker) .. 3 pass.
+            if (r.replicationFactor < 0 || r.replicationFactor > 3) out.push_back(Code::InvalidRequest);
+            return out;
         case Op::DropTopic:
-            if (obj != nullptr && obj->isView) return Code::InvalidRequest;     // "is a view; use DROP VIEW"
-            if (obj == nullptr) return Code::UnknownTopic;
-            if (readByAView_(r.name)) return Code::InvalidRequest;              // the source of a view
-            return std::nullopt;
+            // Spec §6 ruling 6 (plan): a view name -> InvalidRequest, unknown -> UnknownTopic (7), a view's source -> InvalidRequest.
+            if (obj != nullptr && obj->isView) out.push_back(Code::InvalidRequest);
+            if (obj == nullptr) out.push_back(Code::UnknownTopic);
+            if (readByAView_(r.name)) out.push_back(Code::InvalidRequest);
+            return out;
         case Op::AlterConfig:
-            if (obj != nullptr && obj->isView) return Code::ViewNotAlterable;
-            if (obj == nullptr) return Code::UnknownTopic;
-            if (r.expectedVersion != 0 && r.expectedVersion != obj->version) return Code::SchemaConflict;
-            if (r.configKey == ConfigKey::RetentionMs && r.configValue < -1) return Code::InvalidRequest;
-            if (r.configKey == ConfigKey::DeleteRetentionMs && r.configValue < 0) return Code::InvalidRequest;
-            return std::nullopt;
-        case Op::AlterSchema: case Op::SetCompat:
-            if (obj != nullptr && obj->isView) return Code::ViewNotAlterable;
-            if (obj == nullptr || !obj->typed) return Code::UnknownTopic;       // an untyped topic has no schema to alter
-            if (r.expectedVersion != 0 && r.expectedVersion != obj->schemaVersion) return Code::SchemaConflict;
-            if (r.op == Op::SetCompat) return std::nullopt;
-            // Forward compatibility forbids dropping a field; the gate runs before the field itself is looked at.
-            if (r.schemaOp == SchemaOp::DropField && obj->compat == Compat::Forward) return Code::SchemaIncompatible;
-            if (r.schemaOp == SchemaOp::AddField && obj->fields.contains(r.field)) return Code::InvalidSchema;
-            if (r.schemaOp == SchemaOp::DropField && !obj->fields.contains(r.field)) return Code::InvalidSchema;
-            return std::nullopt;
-        case Op::CreateView:
-            if (!validName_(r.name)) return Code::InvalidTopicName;
-            if (obj != nullptr) return obj->isView ? Code::ViewExists : Code::TopicExists;
-            if (foldsOntoLive_(r.name)) return Code::TopicExists;
-            return sourceRefusal_(r);
-        case Op::AlterView:
-            if (obj == nullptr || !obj->isView) return Code::UnknownTopic;      // there is no UnknownView code
-            if (r.expectedVersion != 0 && r.expectedVersion != obj->version) return Code::SchemaConflict;
-            return sourceRefusal_(r);
-        case Op::DropView:
-            if (obj == nullptr || !obj->isView) return Code::UnknownTopic;
-            return std::nullopt;
+            // production contract AdminWorker.cpp:1169-1180 (38 / 7 / 31) + the config ranges of rune-codec ApplyV1.cpp
+            // topicConfigError (retention.ms >= -1, delete.retention.ms >= 0: frozen formatVer-1 rules).
+            if (obj != nullptr && obj->isView) out.push_back(Code::ViewNotAlterable);
+            if (obj == nullptr) out.push_back(Code::UnknownTopic);
+            if (obj != nullptr && !obj->isView && r.expectedVersion != 0 && r.expectedVersion != obj->version) out.push_back(Code::SchemaConflict);
+            if (r.configKey == ConfigKey::RetentionMs && r.configValue < -1) out.push_back(Code::InvalidRequest);
+            if (r.configKey == ConfigKey::DeleteRetentionMs && r.configValue < 0) out.push_back(Code::InvalidRequest);
+            return out;
+        case Op::AlterSchema: case Op::SetCompat: {
+            // production contract AdminWorker.cpp:1014 (38), :1017 (7), :1021 (31), :1041 (30: the Forward gate), :1043+ (InvalidSchema).
+            if (obj != nullptr && obj->isView) out.push_back(Code::ViewNotAlterable);
+            if (obj == nullptr || !obj->typed) { if (obj == nullptr || !obj->isView) out.push_back(Code::UnknownTopic); return out; }   // untyped: no schema
+            if (r.expectedVersion != 0 && r.expectedVersion != obj->schemaVersion) out.push_back(Code::SchemaConflict);
+            if (r.op == Op::SetCompat) return out;
+            if (r.schemaOp == SchemaOp::DropField && obj->compat == Compat::Forward) out.push_back(Code::SchemaIncompatible);   // Forward forbids dropping
+            if (r.schemaOp == SchemaOp::AddField && obj->fields.contains(r.field)) out.push_back(Code::InvalidSchema);
+            if (r.schemaOp == SchemaOp::DropField && !obj->fields.contains(r.field)) out.push_back(Code::InvalidSchema);
+            return out;
         }
-        return Code::Internal;
+        case Op::CreateView:
+            if (!validName_(r.name)) out.push_back(Code::InvalidTopicName);
+            if (obj != nullptr) out.push_back(obj->isView ? Code::ViewExists : Code::TopicExists);   // AdminWorker.cpp:1109
+            else if (foldsOntoLive_(r.name)) out.push_back(Code::TopicExists);                       // Spec §5.1 "Name case"
+            sourceRefusals_(r, out);
+            return out;
+        case Op::AlterView:
+            if (obj == nullptr || !obj->isView) out.push_back(Code::UnknownTopic);   // there is no UnknownView code (AdminWorker.cpp:1126)
+            else if (r.expectedVersion != 0 && r.expectedVersion != obj->version) out.push_back(Code::SchemaConflict);
+            sourceRefusals_(r, out);
+            return out;
+        case Op::DropView:
+            if (obj == nullptr || !obj->isView) out.push_back(Code::UnknownTopic);
+            return out;
+        }
+        out.push_back(Code::Internal);
+        return out;
     }
 
     [[nodiscard]] int32_t take_() noexcept { return nextTopicOrdinal_++; }

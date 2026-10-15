@@ -84,6 +84,8 @@ Each event is one record in `__catalog`. Its encoding is fixed-layout and versio
 
 The result is **cluster-wide serialization**: one leader and one AdminWorker, so concurrent DDL and name collisions are impossible across brokers.
 
+**Name case.** Names are case-sensitive, but a CREATE whose ASCII-case-folded name equals a live object's folded name is refused (same code as a duplicate name), because topic directories share a case-insensitive filesystem on macOS; BrokerNode.cpp folds at every name lookup. (Amendment, catalog-history Task 21 fix round 1, controller ruling; the rule is frozen with `formatVer` 1 in rune-codec `TopicName.h` / `ApplyV1.cpp`.)
+
 ### 5.2 A `__catalog` leader change
 
 - The old leader answers every in-flight DDL explicitly with the retriable `NotLeader`. It is never silent.
