@@ -1356,7 +1356,7 @@ TEST(TransientLineageClusterRegression, Rf1GroupWithoutACommitIsRebalancedOnANew
         for (std::size_t i = before; i < c.records().size(); ++i)
             if (!c.records()[i].bytes.empty()) ++seen[c.records()[i].baseOffset];
         return seen.size() >= 6;
-    }));
+    })) << [&] { std::string d = "DIAG recs:"; for (std::size_t i = before; i < c.records().size(); ++i) d += " (" + std::to_string(c.records()[i].subscriptionId) + "," + std::to_string(c.records()[i].baseOffset) + "," + std::to_string(c.records()[i].bytes.size()) + ")"; d += " errs:"; for (const auto& e : c.errors()) d += " (" + std::to_string(e.correlationId) + "," + std::to_string(e.code) + "," + e.message + ")"; return d; }();
     for (int64_t o = 0; o < 6; ++o) EXPECT_EQ(seen[o], 1) << "post-restart record " << o;
     std::printf("[F1] stale commit answered %d\n", *stale);
 }
