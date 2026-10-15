@@ -1,6 +1,10 @@
 // ---------------------------------------------------------------------------
-// BootstrapRoutingImageTest.cpp — MD1-13 Round-2: bootstrap routing image
+// CatalogBootstrapRoutingImageTest.cpp — MD1-13 Round-2 (renamed by catalog-history Task 18): bootstrap routing image
 // correctness + acks=All bootstrap rejection.
+//
+// The input topics are catalog-recovered boot topics (BrokerNode feeds MetadataService::configure from
+// bootTopics_, which come from __catalog); the broker-level restart regression lives in ShardModeTest.cpp
+// (CatalogBootstrapRoutingImageRegression).
 //
 // PRIMARY FIX COVERAGE (NodeRuntimeAgent-level, mirrors MetadataReplication
 // integration harness):
@@ -121,7 +125,7 @@ static PartitionConfig makeMetaCfg(NodeId selfId, int minIsr = 1) {
 // Test 1: buildStaticRoutingImage returns non-null when topics are configured
 //         and committedMap() is empty (bootstrap window).
 // ===========================================================================
-TEST(BootstrapRoutingImage, BootstrapImage_NonNull) {
+TEST(CatalogBootstrapRoutingImage, BootstrapImage_NonNull) {
     BrtTempDir metaDir("t1m");
     rune::storage::Log metaLog(metaDir.path);
     metaLog.recover();
@@ -169,7 +173,7 @@ TEST(BootstrapRoutingImage, BootstrapImage_NonNull) {
 //   c) Partition 0 routes to node 1 (the smallest nodeId) — a produce from
 //      node 1 to partition 0 is served locally, not redirect-looped.
 // ===========================================================================
-TEST(BootstrapRoutingImage, BootstrapImage_DeterministicPartitionAssignment) {
+TEST(CatalogBootstrapRoutingImage, BootstrapImage_DeterministicPartitionAssignment) {
     BrtTempDir metaDir("t2m");
     rune::storage::Log metaLog(metaDir.path);
     metaLog.recover();
@@ -239,7 +243,7 @@ TEST(BootstrapRoutingImage, BootstrapImage_DeterministicPartitionAssignment) {
 // Test 3: buildStaticRoutingImage returns null when no topics are configured.
 //         (Gateway falls back to Path B — cluster-leader routing.)
 // ===========================================================================
-TEST(BootstrapRoutingImage, BootstrapImage_NullWhenNoTopicsConfigured) {
+TEST(CatalogBootstrapRoutingImage, BootstrapImage_NullWhenNoTopicsConfigured) {
     BrtTempDir metaDir("t3m");
     rune::storage::Log metaLog(metaDir.path);
     metaLog.recover();
@@ -357,7 +361,7 @@ static std::vector<uint8_t> makeProdBatch(int32_t records = 1, int64_t base = 0)
 // Test 4: acks=All (msg.acks=1) + committedMetadataReady_=false
 //         → ErrorCode::NotLeader (retriable, code=2), log untouched.
 // ===========================================================================
-TEST(BootstrapRoutingImage, AcksAll_Bootstrap_NotLeader) {
+TEST(CatalogBootstrapRoutingImage, AcksAll_Bootstrap_NotLeader) {
     BrtTempDir dataDir("t4data"), aeronDir("t4aeron");
 
     BrtAeronDriver drv(aeronDir.path);  // starts driver + Aeron client (drv.aeron)
@@ -478,7 +482,7 @@ TEST(BootstrapRoutingImage, AcksAll_Bootstrap_NotLeader) {
 // Test 5: acks=Leader (msg.acks=0) + committedMetadataReady_=false
 //         → ProduceResponse{OK, baseOffset=0} (immediate local ack).
 // ===========================================================================
-TEST(BootstrapRoutingImage, AcksLeader_Bootstrap_ServesLocally) {
+TEST(CatalogBootstrapRoutingImage, AcksLeader_Bootstrap_ServesLocally) {
     BrtTempDir dataDir("t5data"), aeronDir("t5aeron");
 
     BrtAeronDriver drv(aeronDir.path);  // starts driver + Aeron client (drv.aeron)

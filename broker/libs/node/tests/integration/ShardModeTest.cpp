@@ -224,6 +224,101 @@ TEST(ShardMode, ThreeNodeAcksAllCommitsOverShardReplicationPlanes) {
     EXPECT_GE(atLeast20, 2) << "every acked record must be on a majority";
 }
 
+// Catalog history Task 18 (R2): topics defined by DDL are RECOVERED from __catalog on a full restart and are
+// assigned + routable without any DDL being re-sent.  3 brokers, 1 worker each; every broker is destroyed and
+// rebuilt on the SAME data dirs; nothing is defined the second time.
+TEST(CatalogBootstrapRoutingImageRegression, CatalogRecoveredTopicsAreAssignedAndRoutableAfterFullRestartRegression) {
+    struct Def { const char* name; int32_t parts; const char* group; };
+    const Def defs[] = {{"orders", 3, "shop"}, {"payments", 3, "shop"}, {"chat", 2, ""}};
+    constexpr int kNodes = 3;
+    TmpDir d0{"cb0"}, d1{"cb1"}, d2{"cb2"}, cdir{"cbc"};
+    const fs::path dirs[kNodes] = {d0.path, d1.path, d2.path};
+    const auto ports = ShardPorts::discover(kNodes, 1);
+
+    std::map<std::string, int32_t> ids;
+    {   // incarnation 1: define by DDL
+        std::vector<std::unique_ptr<BrokerNode>> nodes;
+        for (int i = 0; i < kNodes; ++i) nodes.push_back(std::make_unique<BrokerNode>(makeShardConfig(i, dirs[i], ports, kNodes, 1, false)));
+        for (auto& n : nodes) n->start();
+        ASSERT_TRUE(nodes[0]->awaitLeader(15'000ms));
+        TestCluster cluster({nodes[0].get(), nodes[1].get(), nodes[2].get()});
+        for (const Def& d : defs) {
+            TopicSpec t; t.name = d.name; t.partitionCount = d.parts; t.coPartitionGroup = d.group;
+            const int32_t id = cluster.defineTopic(t);
+            ASSERT_GE(id, 0) << "define " << d.name;
+            ids[d.name] = id;
+        }
+        for (auto& n : nodes) n->stop();
+    }   // every broker destroyed
+    // Forget the replicated metadata log (committed assignments): the ONLY thing left to place these topics
+    // is the catalog recovered at boot.  Without this the persisted assignments would mask a boot that
+    // forgot to configure the catalog's topics.
+    for (const auto& d : dirs) {
+        std::error_code ec;
+        fs::remove_all(d / "__cluster_metadata", ec);
+        EXPECT_FALSE(ec) << "removing the metadata log of " << d << ": " << ec.message();
+    }
+
+    // incarnation 2: same data dirs, same ports, NO define
+    std::vector<std::unique_ptr<BrokerNode>> nodes;
+    for (int i = 0; i < kNodes; ++i) nodes.push_back(std::make_unique<BrokerNode>(makeShardConfig(i, dirs[i], ports, kNodes, 1, false)));
+    for (auto& n : nodes) n->start();
+    ASSERT_TRUE(nodes[0]->awaitLeader(15'000ms));
+
+    // (a) every node holds an assignment for every (topic, partition), within a bounded wait
+    const auto deadline = std::chrono::steady_clock::now() + 20s;
+    for (int i = 0; i < kNodes; ++i) {
+        auto* ms = nodes[i]->metadataServiceForTest();
+        if (ms == nullptr) { ADD_FAILURE() << "node " << i << " has no MetadataService"; continue; }
+        for (const Def& d : defs)
+            for (int32_t p = 0; p < d.parts; ++p) {
+                while (ms->assignment(ids[d.name], p) == nullptr && std::chrono::steady_clock::now() < deadline)
+                    std::this_thread::sleep_for(20ms);
+                if (ms->assignment(ids[d.name], p) == nullptr)
+                    ADD_FAILURE() << "node " << i << " has no assignment for " << d.name << "/" << p << " after restart";
+            }
+    }
+    if (::testing::Test::HasFailure()) { for (auto& n : nodes) n->stop(); return; }
+
+    // (b) co-partition: orders p and payments p share a leader; (c) identical assignment on all nodes
+    for (const Def& d : defs)
+        for (int32_t p = 0; p < d.parts; ++p) {
+            const auto* ref = nodes[0]->metadataServiceForTest()->assignment(ids[d.name], p);
+            for (int i = 1; i < kNodes; ++i) {
+                const auto* o = nodes[i]->metadataServiceForTest()->assignment(ids[d.name], p);
+                EXPECT_TRUE(o->leaderNode == ref->leaderNode && o->replicas == ref->replicas)
+                    << "node " << i << " disagrees on " << d.name << "/" << p;
+            }
+        }
+    for (int32_t p = 0; p < 3; ++p)
+        EXPECT_EQ(nodes[0]->metadataServiceForTest()->assignment(ids["orders"], p)->leaderNode,
+                  nodes[0]->metadataServiceForTest()->assignment(ids["payments"], p)->leaderNode)
+            << "co-partition group 'shop' split at partition " << p;
+
+    // (d) a produce to every (topic, partition) through its leader succeeds.  The restart fence bumps the
+    // epoch (leadership moves) after boot, so the leader is re-read on every attempt; bounded by one deadline.
+    {
+        ShardTestClient c(cdir.path);
+        const auto produceDeadline = std::chrono::steady_clock::now() + 20s;
+        for (const Def& d : defs)
+            for (int32_t p = 0; p < d.parts; ++p) {
+                bool acked = false;
+                int32_t leader = -1;
+                while (!acked && std::chrono::steady_clock::now() < produceDeadline) {
+                    leader = nodes[0]->metadataServiceForTest()->assignment(ids[d.name], p)->leaderNode;
+                    if (leader < 0 || leader >= kNodes) { std::this_thread::sleep_for(50ms); continue; }
+                    const int64_t sid = c.connect(gatewayChannel(ports, leader), kClientStream);
+                    if (sid <= 0) continue;
+                    acked = c.produceUntilOk(workerIngressChannel(ports, leader, 0), kClientStream, sid, ids[d.name], p,
+                                             /*acks=all*/1, makeBatch(1), /*maxAttempts=*/20).has_value();
+                }
+                EXPECT_TRUE(acked) << "produce to " << d.name << "/" << p << " (last leader " << leader
+                                   << ") never acked after the restart";
+            }
+    }
+    for (auto& n : nodes) n->stop();
+}
+
 // A4: in fused placement the runtime (control plane) runs on worker 0's thread
 // and rides worker 0's OWN driver + client — exactly one Aeron driver per worker,
 // no extra runtime driver (the extra one cost ~15 us of polling every pass).

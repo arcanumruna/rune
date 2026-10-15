@@ -708,7 +708,7 @@ if(BUILD_TESTING)
         PROPERTIES TIMEOUT 120)
 
     # ---------------------------------------------------------------------------
-    # MD1 Task 6: StaticAssignmentEmit integration tests — on becoming the
+    # MD1 Task 6 (catalog-history Task 18: CatalogAssignmentEmit): assignment-emit integration tests — on becoming the
     # metadata-consensus leader, MetadataService runs StaticBalancer::assign()
     # over configured topics and appends the resulting assignment records to
     # the metadata replica in bounded batches.
@@ -718,17 +718,17 @@ if(BUILD_TESTING)
     #
     # Uses InMemoryTransport (no Aeron required).
     # ---------------------------------------------------------------------------
-    add_executable(rune_static_assignment_emit_tests
-        tests/integration/StaticAssignmentEmitTest.cpp)
-    target_include_directories(rune_static_assignment_emit_tests PRIVATE
+    add_executable(rune_catalog_assignment_emit_tests
+        tests/integration/CatalogAssignmentEmitTest.cpp)
+    target_include_directories(rune_catalog_assignment_emit_tests PRIVATE
         ${RUNE_PROTOCOL_INCLUDE})
-    target_link_libraries(rune_static_assignment_emit_tests PRIVATE
+    target_link_libraries(rune_catalog_assignment_emit_tests PRIVATE
         rune_node
         rune_metadata_msm
         rune_static_balancer
         rune_replication
         GTest::gtest_main)
-    gtest_discover_tests(rune_static_assignment_emit_tests
+    gtest_discover_tests(rune_catalog_assignment_emit_tests
         PROPERTIES TIMEOUT 60)
 
     # ---------------------------------------------------------------------------
@@ -755,7 +755,7 @@ if(BUILD_TESTING)
         PROPERTIES TIMEOUT 60)
 
     # ---------------------------------------------------------------------------
-    # MD1-13 Round-2: BootstrapRoutingImage tests.
+    # MD1-13 Round-2 (catalog-history Task 18: CatalogBootstrapRoutingImage) tests.
     #
     # Tests 1-3 (no Aeron): buildStaticRoutingImage() correctness when
     #   committedMap() is empty — non-null, deterministic, balanced assignment.
@@ -765,23 +765,23 @@ if(BUILD_TESTING)
     #   acks=Leader during bootstrap → OK (local append).  Uses the
     #   applyProduceForTest seam + injectTestSession + setOnEgressFrame.
     # ---------------------------------------------------------------------------
-    add_executable(rune_bootstrap_routing_image_tests
-        tests/integration/BootstrapRoutingImageTest.cpp)
-    target_include_directories(rune_bootstrap_routing_image_tests PRIVATE
+    add_executable(rune_catalog_bootstrap_routing_image_tests
+        tests/integration/CatalogBootstrapRoutingImageTest.cpp)
+    target_include_directories(rune_catalog_bootstrap_routing_image_tests PRIVATE
         ${RUNE_PROTOCOL_INCLUDE})
-    target_link_libraries(rune_bootstrap_routing_image_tests PRIVATE
+    target_link_libraries(rune_catalog_bootstrap_routing_image_tests PRIVATE
         rune_node
         rune_metadata_msm
         rune_static_balancer
         rune_replication
         GTest::gtest_main)
     if(aeron_FOUND)
-        target_compile_definitions(rune_bootstrap_routing_image_tests PRIVATE
+        target_compile_definitions(rune_catalog_bootstrap_routing_image_tests PRIVATE
             RUNE_AERON_AVAILABLE=1)
-        target_link_libraries(rune_bootstrap_routing_image_tests PRIVATE
+        target_link_libraries(rune_catalog_bootstrap_routing_image_tests PRIVATE
             aeron::aeron)
     endif()
-    gtest_discover_tests(rune_bootstrap_routing_image_tests
+    gtest_discover_tests(rune_catalog_bootstrap_routing_image_tests
         PROPERTIES TIMEOUT 120)
 
     # ---------------------------------------------------------------------------

@@ -20,7 +20,7 @@
 //
 // The sole-ISR rule (a partition with no other in-sync replica stays with the
 // stopping leader — no data loss, it goes offline as before) is proven at the
-// controller level (StaticAssignmentEmitTest.cpp, ControlledShutdownController-
+// controller level (CatalogAssignmentEmitTest.cpp, ControlledShutdownController-
 // Regression): with RF = cluster size, an in-process sole-ISR partition needs
 // every follower down, which in a 3-node cluster also loses the consensus
 // quorum the hand-off itself needs.

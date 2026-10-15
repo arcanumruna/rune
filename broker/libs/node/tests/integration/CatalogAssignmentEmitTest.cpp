@@ -1,6 +1,7 @@
 // ---------------------------------------------------------------------------
-// StaticAssignmentEmitTest.cpp — MD1 Task 6: on becoming the metadata-consensus
-// leader, run StaticBalancer::assign() over configured topics and append the
+// CatalogAssignmentEmitTest.cpp — MD1 Task 6 (renamed by catalog-history Task 18): on becoming the metadata-consensus
+// leader, run StaticBalancer::assign() over the boot topics — the catalog-recovered topics
+// BrokerNode feeds MetadataService::configure from bootTopics_, which come from __catalog — and append the
 // resulting assignment records to the replicated metadata log.
 //
 // Test cases:
@@ -120,7 +121,7 @@ static PartitionConfig makeMetaCfg(NodeId selfId, int minIsr = 1) {
 // Test 1: 3-node fresh cluster → metadata leader emits → all MSMs show
 //         balanced + co-located assignment.
 // ===========================================================================
-TEST(StaticAssignmentEmitTest, SingleLeader_EmitsBalancedAssignmentOnLeaderClaim) {
+TEST(CatalogAssignmentEmitTest, SingleLeader_EmitsBalancedAssignmentOnLeaderClaim) {
     SaeTempDir dir1("t1n1"), dir2("t1n2"), dir3("t1n3");
     rune::storage::Log log1(dir1.path), log2(dir2.path), log3(dir3.path);
     log1.recover(); log2.recover(); log3.recover();
@@ -257,7 +258,7 @@ TEST(StaticAssignmentEmitTest, SingleLeader_EmitsBalancedAssignmentOnLeaderClaim
 // Failure mode: if the guard is broken, logEndOffset() advances after the
 // second promotion and this test fails.
 // ===========================================================================
-TEST(StaticAssignmentEmitTest, Idempotent_NoDoubleEmitOnRePromotion) {
+TEST(CatalogAssignmentEmitTest, Idempotent_NoDoubleEmitOnRePromotion) {
     SaeTempDir dir("t2");
     rune::storage::Log log(dir.path);
     log.recover();
@@ -363,7 +364,7 @@ TEST(StaticAssignmentEmitTest, Idempotent_NoDoubleEmitOnRePromotion) {
 // logEndOffset() would advance by 1 (not 64) and this test would fail.
 // This is the discriminating test for the "one append per record" invariant.
 // ===========================================================================
-TEST(StaticAssignmentEmitTest, OneRecordPerAppend_LargeTopicSetNeverMegaAppend) {
+TEST(CatalogAssignmentEmitTest, OneRecordPerAppend_LargeTopicSetNeverMegaAppend) {
     SaeTempDir dir("t3");
     rune::storage::Log log(dir.path);
     log.recover();
@@ -428,7 +429,7 @@ TEST(StaticAssignmentEmitTest, OneRecordPerAppend_LargeTopicSetNeverMegaAppend) 
 // ===========================================================================
 // Test 4: Follower does NOT emit.
 // ===========================================================================
-TEST(StaticAssignmentEmitTest, FollowerDoesNotEmit) {
+TEST(CatalogAssignmentEmitTest, FollowerDoesNotEmit) {
     SaeTempDir dir("t4");
     rune::storage::Log log(dir.path);
     log.recover();
@@ -485,7 +486,7 @@ TEST(StaticAssignmentEmitTest, FollowerDoesNotEmit) {
 // Failure mode: if the error is swallowed silently without incrementing the
 // counter, balancerErrorCount() returns 0 and this test fails.
 // ===========================================================================
-TEST(StaticAssignmentEmitTest, BalancerError_IncrementCounterEmitsNothing) {
+TEST(CatalogAssignmentEmitTest, BalancerError_IncrementCounterEmitsNothing) {
     SaeTempDir dir("t5");
     rune::storage::Log log(dir.path);
     log.recover();
