@@ -232,6 +232,7 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
                                 m.state() == session::SessionState::Connected ? 1 : 0,
                                 static_cast<unsigned long long>(staleFramesDropped_));
                         }
+                        sendHeadRefusedSinceNs_ = 0;  // the head record is consumed
                         break;
                     }
                     switch (offerIngress_(p, n)) {
@@ -239,11 +240,33 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
                         break;
                     case transport::AeronTransport::OfferResult::Retry:
                         ++ingressOfferRefused_;
-                        return CA::ABORT;  // stays at the head; retried next cycle
+                        // DR client bug 2: the head is held while the transport
+                        // refuses it — but never for longer than the session's own
+                        // stale threshold (responseTimeoutNs).  Every command
+                        // behind it (a Completions registration, close()'s drain,
+                        // handle releases, hub commands) waits on this one frame;
+                        // a frame the transport refused that long is as dead as one
+                        // of a lost session: dropped, counted, logged (rate-
+                        // limited).  Its owner's own timer recovers it (a control
+                        // op / Subscribe / group request times out or is re-sent;
+                        // a MetadataRequest is asked again).
+                        if (sendHeadRefusedSinceNs_ == 0) sendHeadRefusedSinceNs_ = nowNs != 0 ? nowNs : 1;
+                        if (nowNs - sendHeadRefusedSinceNs_ < cfg_.session.responseTimeoutNs) {
+                            return CA::ABORT;  // stays at the head; retried next cycle
+                        }
+                        if ((sendHeadExpired_++ & 1023u) == 0) {
+                            std::fprintf(stderr,
+                                "rune-client: dropped a control frame the transport refused for %lld ms "
+                                "(the response timeout) at the command ring's head; %llu so far\n",
+                                static_cast<long long>((nowNs - sendHeadRefusedSinceNs_) / 1'000'000),
+                                static_cast<unsigned long long>(sendHeadExpired_));
+                        }
+                        break;
                     case transport::AeronTransport::OfferResult::Fatal:
                         noteFatalDrop_(n);  // fix4 M2: rate-limited log, every drop counted
                         break;
                     }
+                    sendHeadRefusedSinceNs_ = 0;  // the head record is consumed
                 }
                 break;
 
@@ -694,7 +717,28 @@ bool ClientAgent::sendFrame(const uint8_t* buf, std::size_t len) {
 
 bool ClientAgent::retarget(const std::string& newIngressChannel) noexcept {
     // FIX F8: forward to the transport's noexcept, non-throwing retarget.
-    return transport_.retarget(newIngressChannel);
+    const bool moved = transport_.retarget(newIngressChannel);
+    if (moved) invalidateRouteSessions_();  // DR client bug 1: the seed moved
+    return moved;
+}
+
+bool ClientAgent::failoverSeedTo(const std::string& channel, int64_t nowNs) noexcept {
+    if (failed_ || channel.empty()) return false;
+    try {
+        if (transport_.ingressChannel() != channel) {
+            if (!transport_.retarget(channel)) return false;  // old pub intact: the owner tries the next one
+            Session& seed             = seedSession();
+            seed.currentLeaderChannel = channel;
+            seed.currentLeaderNode    = -1;   // learnt from the next metadata answer
+            invalidateRouteSessions_();
+        }
+    } catch (...) {
+        return false;  // allocation failure (cold path): the next candidate / pass retries
+    }
+    // A fresh session there (resetting the old broker session id: that broker
+    // is gone, a resume hint would only cost the new one a SessionExpired).
+    seedSession().machine.forceReconnect(nowNs);
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1025,6 +1069,7 @@ bool ClientAgent::retargetSeedOnConnectRedirect_(const std::string& endpoint) no
         Session& seed            = seedSession();
         seed.currentLeaderChannel = channel;
         seed.currentLeaderNode    = -1;   // the node id is learnt from the metadata answer
+        invalidateRouteSessions_();       // DR client bug 1: the seed moved
         return true;
     } catch (...) {
         return false;   // allocation failure (cold path): keep the old pub
@@ -1058,6 +1103,7 @@ bool ClientAgent::retargetSeedToBootstrap_() noexcept {
     seed.lastKnownLeaderNode    = seed.currentLeaderNode;
     seed.currentLeaderChannel   = bootstrap;
     seed.currentLeaderNode      = -1;  // unknown until the gateway redirects us again
+    invalidateRouteSessions_();        // DR client bug 1: the seed moved
     return true;
 }
 
@@ -1072,6 +1118,7 @@ bool ClientAgent::retargetSeedToLastKnownLeader_() noexcept {
     if (!transport_.retarget(seed.lastKnownLeaderChannel)) return false;  // next odd attempt retries
     seed.currentLeaderChannel = seed.lastKnownLeaderChannel;
     seed.currentLeaderNode    = seed.lastKnownLeaderNode;
+    invalidateRouteSessions_();  // DR client bug 1: the seed moved
     return true;
 }
 
@@ -1125,14 +1172,20 @@ Session& ClientAgent::openSession_(const std::string& endpoint) noexcept {
 }
 
 Session& ClientAgent::sessionForEndpoint(const std::string& endpoint) noexcept {
-    // Empty / seed endpoint → the seed session (single-node hot path, no scan cost
-    // when there is only one session).
-    if (endpoint.empty() || sameEndpoint(endpoint, seedSession().endpoint)) {
-        return seedSession();
+    // Empty endpoint → the seed.  The seed still on its bootstrap (it never
+    // moved): its endpoint → the seed (single-node hot path, no scan).
+    if (endpoint.empty()) return seedSession();
+    const std::string& physical = transport_.ingressChannel();
+    const bool seedHome = physical == cfg_.transport.ingressChannel;
+    if (seedHome && sameEndpoint(endpoint, seedSession().endpoint)) return seedSession();
+    for (std::size_t i = 1; i < sessions_.size(); ++i) {
+        if (sameEndpoint(sessions_[i]->endpoint, endpoint)) return *sessions_[i];  // M6: one session per node
     }
-    for (auto& s : sessions_) {
-        if (sameEndpoint(s->endpoint, endpoint)) return *s;  // M6: one session per node
-    }
+    // DR client bug 1: the seed is the session of the node it PHYSICALLY sits on
+    // (its default publication) — never of the bootstrap node it left (a failover
+    // / redirect moved it): a route to that node gets that node's own session,
+    // so no frame stamped with the seed's new session id reaches the old node.
+    if (sameEndpoint(endpoint, physical)) return seedSession();
     return openSession_(endpoint);
 }
 

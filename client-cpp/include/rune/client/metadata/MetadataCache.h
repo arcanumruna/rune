@@ -251,6 +251,13 @@ public:
         return table_.size();
     }
 
+    /// DR client bug 1: every known broker's "host:port", in node id order is NOT
+    /// guaranteed (hash order) — callers that need a stable order sort.  Cold.
+    template <class F>
+    void forEachBrokerEndpoint(F&& f) const {
+        for (const auto& [nodeId, ep] : endpoints_) f(nodeId, ep);
+    }
+
     /// Number of known brokers in the cache.
     [[nodiscard]] std::size_t brokerCount() const noexcept {
         return endpoints_.size();

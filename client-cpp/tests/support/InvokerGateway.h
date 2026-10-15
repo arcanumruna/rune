@@ -113,6 +113,7 @@ struct InvokerGateway {
     // in one poll.  Element: (subscription, baseOffset).
     int connects = 0;
     int metadataRequests = 0;
+    std::vector<int> metadataEndpoints;   // the endpoint each MetadataRequest arrived on
     // F8a: direct subscriptions (Subscribe -> SubscribeResponse; Records pushes).
     struct Subscribed {
         int64_t subscriptionId;
@@ -1005,6 +1006,7 @@ private:
             if (!m) return;
             ++metadataRequests;
             metadataCorrIds.push_back(m->correlationId);
+            metadataEndpoints.push_back(endpoint);   // DR client bug 1: which node was asked
             if (holdMetadata) return;
             sendMetadata(m->sessionId, m->correlationId);
             return;

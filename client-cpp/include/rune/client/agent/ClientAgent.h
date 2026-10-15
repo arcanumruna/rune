@@ -511,6 +511,21 @@ public:
     transport::AeronTransport::OfferResult offerToEndpoint(const std::string& channel, uint8_t* buf,
                                                            std::size_t len, int64_t nowNs,
                                                            uint32_t& sessionIndex) noexcept;
+    /// DR client bug 1 (seed failover): the seed's broker is presumed dead (its
+    /// session went silent, or it gave up reconnecting there) — point the seed's
+    /// default publication (its control path) at `channel` (a live broker) and
+    /// connect FRESH there (a new broker session; every route's cached session is
+    /// re-resolved against where the seed now physically is).  False when the new
+    /// publication did not resolve (the old one stays; the owner tries the next
+    /// candidate).  Agent thread only; cold path.
+    bool failoverSeedTo(const std::string& channel, int64_t nowNs) noexcept;
+    /// Session `index`'s node ingress channel (its endpoint; for the seed, where
+    /// its default publication physically points).  "" when out of range.
+    [[nodiscard]] const std::string& sessionChannelAt(uint32_t index) const noexcept {
+        static const std::string kNone;
+        if (index == 0) return transport_.ingressChannel();
+        return index < sessions_.size() ? sessions_[index]->endpoint : kNone;
+    }
     /// D4: session `index`'s machine (read-only; the seed when out of range).
     [[nodiscard]] const session::SessionMachine& sessionMachineAt(uint32_t index) const noexcept {
         return (index < sessions_.size() ? *sessions_[index] : *sessions_[0]).machine;
@@ -682,6 +697,9 @@ public:
     [[nodiscard]] uint64_t staleFramesDropped() const noexcept { return staleFramesDropped_; }
     [[nodiscard]] uint64_t ingressOfferRefused() const noexcept { return ingressOfferRefused_; }
     [[nodiscard]] uint64_t ingressFatalDropped() const noexcept { return ingressFatalDropped_; }
+    /// DR client bug 2: ring-drained control frames dropped because the transport
+    /// refused them at the command ring's head for the whole response timeout.
+    [[nodiscard]] uint64_t sendHeadExpired() const noexcept { return sendHeadExpired_; }
     /// F8a fix3: the transport's max frame length (immutable; any thread).
     [[nodiscard]] std::size_t maxFrameLength() const noexcept {
         const std::size_t m = transport_.maxMessageLength();
@@ -916,6 +934,12 @@ private:
     /// cryptoSealScratch_ on the encrypt side.
     std::vector<uint8_t>        egressDecryptScratch_;
     uint32_t sessionIndexFor_(const std::string& endpoint) noexcept;
+    /// DR client bug 1: the seed moved (any retarget of its default publication) —
+    /// every route re-resolves its session on its next offer (a route to the node
+    /// the seed LEFT must not ride the seed's new session).  Cold.
+    void invalidateRouteSessions_() noexcept {
+        for (PartitionRoute& r : routes_) r.sessionIndex = kNoSession;
+    }
     void releaseRoutePub_(transport::AeronTransport::PubHandle h) noexcept;  // M4
 
     // Pack (topicId, partition) into the routing-table key.  partition is masked to
@@ -1009,6 +1033,11 @@ private:
     uint64_t staleFramesDropped_  = 0;
     uint64_t ingressOfferRefused_ = 0;
     uint64_t ingressFatalDropped_ = 0;
+    // DR client bug 2: the duty-clock time the transport first refused the
+    // kMsgSend now at the command ring's head (0 = none refused); a head refused
+    // for responseTimeoutNs is dropped (sendHeadExpired_).  Duty thread only.
+    int64_t  sendHeadRefusedSinceNs_ = 0;
+    uint64_t sendHeadExpired_        = 0;
     // fix3 test seam: force the next N ring-drained offers' verdicts.
     int testForcedOffers_ = 0;
     transport::AeronTransport::OfferResult testForcedOffer_ = transport::AeronTransport::OfferResult::Accepted;

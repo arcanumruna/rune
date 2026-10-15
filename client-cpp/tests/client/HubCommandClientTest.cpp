@@ -229,11 +229,12 @@ TEST(HubCommandClient, HubCommandFromCallbackWithFullRingFailsFastRegression) {
 // ===========================================================================
 namespace {
 
-rc::ClientConfig withOpts(rc::ClientConfig c, std::size_t termBytes, rc::NanoClock clock) {
+rc::ClientConfig withOpts(rc::ClientConfig c, std::size_t termBytes, rc::NanoClock clock, int64_t closeTimeoutMs = 0) {
     // IPC publications take their term length from the channel (the driver's
     // IPC default is 64 MiB): a small term makes back-pressure reachable.
     if (termBytes != 0) c.gatewayChannel = "aeron:ipc?term-length=" + std::to_string(termBytes);
     c.nanoClock = clock;
+    if (closeTimeoutMs > 0) c.closeTimeoutMs = closeTimeoutMs;
     return c;
 }
 
@@ -241,8 +242,8 @@ struct HubRig {
     rc::ClientConfig             cfg;
     rc::Client                   client;
     test_support::InvokerGateway gw;
-    explicit HubRig(int32_t in, std::size_t termBytes = 0, rc::NanoClock clock = nullptr)
-        : cfg(withOpts(hubCfg(in, in + 1, rc::RunnerMode::Invoker), termBytes, clock)), client(cfg),
+    explicit HubRig(int32_t in, std::size_t termBytes = 0, rc::NanoClock clock = nullptr, int64_t closeTimeoutMs = 0)
+        : cfg(withOpts(hubCfg(in, in + 1, rc::RunnerMode::Invoker), termBytes, clock, closeTimeoutMs)), client(cfg),
           gw(cfg.dataDir + "/aeron", cfg.gatewayChannel, cfg.gatewayStreamId,
              cfg.egressChannel, cfg.egressStreamId) {}
 
@@ -1132,4 +1133,118 @@ TEST(HubCommandClient, TxnUnknownProducerIdAfterRetentionRestartsSequencesAndCom
         }
         EXPECT_EQ(r.cq.timesCompleted(c2.token()), 1);
     }
+}
+
+
+// ===========================================================================
+// DR client bugs (2026-10-15, dr2 multiclient): a client printed a successful
+// summary, then hung in Client::close() for > 200 s.  close() waited on its
+// drain (Client.cpp: andWait_(..., 100 years, ...)) and on its own queue's
+// registration (registerCq_: "never a time bound"), and both need the duty
+// thread to READ the command ring — while a kMsgSend the transport refuses is
+// held at the ring's head with "no time bound of its own" (ClientAgent::doWork),
+// every command behind it (the queue's CqAdd, the ClientDrain) waits with it.
+// Fixed: (a) the whole drain phase is bounded by ClientConfig::closeTimeoutMs,
+// after which the teardown completes everything Closed exactly once; (b) a
+// refused head frame never holds the ring past the session's response timeout.
+// ===========================================================================
+namespace {
+int64_t g_drNow = 1'000'000'000;  // test thread only
+int64_t drNow() noexcept { return g_drNow; }
+
+/// Runs `f` on THIS thread; a watchdog ends the process (a hung close() cannot
+/// be joined) with an explicit failure if it has not returned within `bound`.
+template <class F>
+std::chrono::milliseconds runOrDie(const char* what, std::chrono::milliseconds bound, F&& f) {
+    std::atomic<bool> done{false};
+    std::thread dog([&] {
+        const auto deadline = std::chrono::steady_clock::now() + bound;
+        while (!done.load() && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(5ms);
+        if (!done.load()) {
+            std::fprintf(stderr, "[  HANG    ] %s did not return within %lld ms\n", what,
+                         static_cast<long long>(bound.count()));
+            std::fflush(stderr);
+            std::_Exit(3);
+        }
+    });
+    const auto t0 = std::chrono::steady_clock::now();
+    f();
+    const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0);
+    done.store(true);
+    dog.join();
+    return took;
+}
+} // namespace
+
+// (a) RED (before the fix): close() never returns — the watchdog ends the run
+// ("[  HANG    ] Client::close() did not return").
+TEST(HubCommandClient, CloseIsBoundedWhenItsDrainIsStuckBehindARefusedFrameRegression) {
+    HubRig r(4600, 0, &drNow, /*closeTimeoutMs=*/400);
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return r.gw.metadataRequests > 0; }));
+    r.settle(200);
+    // A producer record in flight that the broker never answers.
+    r.gw.replyAcks = false;
+    rc::ProducerConfig pc;
+    pc.acks = rc::Acks::Leader;
+    pc.lingerUs = 1;
+    pc.batchBytes = 1;   // the duty clock stands still: a size-full batch flushes, linger never expires
+    auto p = r.client.producer(pc);
+    const uint8_t v[1] = {7};
+    auto rec = r.cq.send(p, r.client.topic("t"), rc::Key(uint64_t{1}), std::span<const uint8_t>(v, 1));
+    ASSERT_TRUE(rec.accepted());
+    ASSERT_TRUE(r.drive([&] { return !r.gw.held.empty(); })) << "precondition: the record is in flight (its ack held)";
+    // The transport refuses every default-publication offer from now on (the
+    // session itself stays alive: keepalives are not refused), and the duty
+    // clock stands still: a ring-drained frame is held at the head for good.
+    r.client.testForceIngressOffers(rc::transport::AeronTransport::OfferResult::Retry, 1'000'000'000);
+    r.client.testSubmitMetadataRequest();
+    auto ping = r.pingOp(rc::Bytes(4, 1));   // a control op that cannot go out either
+    r.settle(200);
+    ASSERT_FALSE(rec.ready());
+    ASSERT_FALSE(ping.ready());
+
+    const auto took = runOrDie("Client::close()", 10s, [&] { r.client.close(); });
+    EXPECT_GE(took, 350ms) << "the drain waited for the record until the close deadline";
+    EXPECT_LT(took, 3s) << "close() is bounded by closeTimeoutMs (400 ms)";
+    EXPECT_EQ(r.client.testCloseDeadlineHits(), 1u);
+    // Every pending operation answered exactly once, Closed.
+    EXPECT_EQ(r.cq.timesCompleted(rec.token()), 1);
+    EXPECT_EQ(rec.status(), rc::OpStatus::Closed);
+    EXPECT_EQ(r.cq.timesCompleted(ping.token()), 1);
+    EXPECT_EQ(ping.status(), rc::OpStatus::Closed);
+}
+
+// (b) RED (before the fix): the refused MetadataRequest stays at the command
+// ring's head however long the transport refuses it, so close()'s drain command
+// behind it is never read — close() hangs (the watchdog) / is cut by its deadline.
+TEST(HubCommandClient, ARefusedHeadFrameNeverHoldsTheCommandRingPastTheResponseTimeoutRegression) {
+    HubRig r(4602, 0, &drNow, /*closeTimeoutMs=*/5'000);
+    r.gw.replyPongs = true;   // keepalives answered: the session stays alive throughout
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return r.gw.metadataRequests > 0; }));
+    r.settle(200);
+    const int before = r.gw.metadataRequests;
+    r.client.testForceIngressOffers(rc::transport::AeronTransport::OfferResult::Retry, 1'000'000'000);
+    r.client.testSubmitMetadataRequest();
+    r.settle(500);
+    ASSERT_EQ(r.gw.metadataRequests, before) << "precondition: refused, held at the head";
+    // The duty clock advances in keepalive-sized steps (the session stays Connected:
+    // pings / pongs are not refused) to just under the response timeout: still held.
+    const int64_t timeout = rc::session::SessionConfig{}.responseTimeoutNs;
+    for (int64_t t = 0; t + 500'000'000LL < timeout; t += 500'000'000LL) {
+        g_drNow += 500'000'000LL;
+        r.settle(50);
+    }
+    ASSERT_EQ(r.client.state(), rc::session::SessionState::Connected) << "precondition: the session is alive";
+    EXPECT_EQ(r.client.testSendHeadExpired(), 0u) << "never dropped before the response timeout";
+    // Past it: the head frame is dropped (counted) — the ring moves on.
+    g_drNow += 1'000'000'000LL;
+    r.settle(50);
+    ASSERT_EQ(r.client.state(), rc::session::SessionState::Connected);
+    EXPECT_EQ(r.client.testSendHeadExpired(), 1u);
+    // close()'s drain command is read at once: the drain completes, never cut by the deadline.
+    const auto took = runOrDie("Client::close()", 20s, [&] { r.client.close(); });
+    EXPECT_EQ(r.client.testCloseDeadlineHits(), 0u) << "the drain finished on its own";
+    EXPECT_LT(took, 2s);
 }

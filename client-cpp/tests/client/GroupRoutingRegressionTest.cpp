@@ -2742,3 +2742,48 @@ TEST(GroupRoutingRegression, SeedBoundPlainSubscriptionEndsExplicitlyWhenTheSeed
     ASSERT_TRUE(r.drive([&] { return r.gw.connects > connectsBefore; }, 20'000'000)) << "the seed reconnects";
     s2.unsubscribe();
 }
+
+// DR client bug 1 (dr3 / dr13: no re-route after a leader SIGKILL): every
+// MetadataRequest rode the SEED session — when the seed's broker is the one that
+// died, nothing could ever learn the new leaders (Client::requestMetadataNow_ /
+// tickMetadataRefresh asked only while the seed was Connected).  The new leader
+// must be learnt from ANY live broker.  Isolated from the seed failover: the seed's
+// node goes dead AND the live node never answers a new Connect (so the seed's
+// failover attempt to it cannot complete) — yet that node's EXISTING session must
+// carry the MetadataRequest.
+// RED (before the fix): no MetadataRequest ever reaches node 1 after the seed died.
+TEST(GroupRoutingRegression, MetadataIsAskedThroughALiveNodeSessionWhileTheSeedIsDownRegression) {
+    RigOptions o;
+    o.keepaliveNs       = 50'000'000LL;    // 50 ms
+    o.responseTimeoutNs = 400'000'000LL;   // the seed goes stale 400 ms after its node died
+    GroupRig r(4261, 4262, o);
+    const auto [n1, p1port] = r.addNode(4261);
+    r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions      = {{1, 0, 0, 1, 4261, ""}, {1, 1, 1, 1, 4261, ""}};
+    r.gw.subscribeLeader = {{0, 0}, {1, n1}};
+    r.gw.groupProtocol   = false;
+    r.connect();
+    PlainLedger led;
+    auto s1 = r.client.subscribe(r.client.topic("t"), 1, rc::SubscribeOptions{rc::From::earliest()}, led.handler(1));
+    ASSERT_TRUE(r.drive([&] { return r.subAt(1, n1) != nullptr && s1.subscriptionId() == r.subAt(1, n1)->subscriptionId; }))
+        << "precondition: node 1 has its own Connected session (p1 homed there)";
+    const auto askedAt = [&](int ep) {
+        int n = 0;
+        for (int e : r.gw.metadataEndpoints) n += e == ep ? 1 : 0;
+        return n;
+    };
+    const int beforeN1 = askedAt(n1);
+    r.gw.deadEndpoints.insert(0);      // the seed's broker dies (hears nothing more)
+    r.gw.silentEndpoints.insert(n1);   // node 1 answers no NEW connect (the seed cannot fail over to it)
+    const auto t0 = std::chrono::steady_clock::now();
+    bool asked = false;
+    for (const auto deadline = t0 + std::chrono::seconds(5); std::chrono::steady_clock::now() < deadline && !asked;) {
+        r.client.doWork();
+        r.gw.pump();
+        asked = askedAt(n1) > beforeN1;
+    }
+    EXPECT_TRUE(asked) << "the new leader must be learnt from a live broker's session while the seed is down";
+    EXPECT_NE(r.client.testSessionStateAt(0), rc::session::SessionState::Connected) << "the seed is down";
+    EXPECT_GE(r.client.testMetadataViaOtherSession(), 1u);
+    s1.unsubscribe();
+}

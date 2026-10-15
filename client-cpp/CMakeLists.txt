@@ -1592,3 +1592,18 @@ if(BUILD_TESTING AND aeron_FOUND)
     endif()
     gtest_discover_tests(rune_cli_live_tests)
 endif()
+
+# ── DR client bugs (2026-10-15): the REAL client against REAL in-process BrokerNodes ──
+# Built only when this repo is EMBEDDED by a rune-broker build (rune_node exists) and only on
+# request (EXCLUDE_FROM_ALL, no ctest registration — the embedding build's ctest never sees an
+# unbuilt binary).  Build it from a broker build dir with
+#   cmake --build <broker-build> --target rune_client_failover_broker_tests
+# and run the binary directly.  Uses the broker's test rigs (libs/node/tests/support).
+if(TARGET rune_node AND TARGET rune_client_api)
+    find_package(GTest REQUIRED)
+    add_executable(rune_client_failover_broker_tests EXCLUDE_FROM_ALL
+                   tests/broker/ClientFailoverBrokerRegressionTest.cpp)
+    target_include_directories(rune_client_failover_broker_tests PRIVATE ${CMAKE_SOURCE_DIR}/libs/node/tests)
+    target_link_libraries(rune_client_failover_broker_tests PRIVATE rune_node rune_view rune_codec rune_catalog
+                          rune_client_api aeron::aeron GTest::gtest_main)
+endif()

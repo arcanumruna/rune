@@ -376,6 +376,15 @@ struct ClientConfig {
     // Timeout.  Independent of pingTimeoutMs: a catalog leader holds a
     // CreateTopic OK until the topic serves (up to 5 s).
     int64_t ddlTimeoutMs = 15'000;
+
+    // DR client bug 2: the deadline of Client::close()'s drain phase (every
+    // producer flushed, every transactional producer closed).  At the deadline
+    // close() tears down anyway: everything still pending completes exactly
+    // once (Closed) and close() returns — it never waits forever on a peer, a
+    // ring drain or a stuck duty step.  <= 0 = the default (65 s: above the
+    // default deliveryTimeoutMs 30 s and transactionOpTimeoutMs 60 s, so a
+    // normal drain is never cut short).
+    int64_t closeTimeoutMs = 65'000;
     // traceDdlRetries: record every FOLLOWED Redirect and every scheduled NotLeader
     // retry of a DDL (`rune ql --verbose`); read them with Client::takeDdlRetryNotes().
     // Requires RunnerMode::Invoker (the constructor throws std::invalid_argument otherwise).
@@ -532,6 +541,12 @@ public:
     [[nodiscard]] uint64_t testStaleFramesDropped() const noexcept { return agent_.staleFramesDropped(); }
     [[nodiscard]] std::size_t testPendingUnsubscribes() const noexcept { return subscriberHub_.pendingUnsubscribes(); }
     [[nodiscard]] uint64_t testIngressFatalDropped() const noexcept { return agent_.ingressFatalDropped(); }
+    /// DR client bug 2: ring-drained frames dropped after the transport refused
+    /// them at the command ring's head for the response timeout.
+    [[nodiscard]] uint64_t testSendHeadExpired() const noexcept { return agent_.sendHeadExpired(); }
+    /// DR client bug 2 test seam (duty thread / Invoker owner): a MetadataRequest
+    /// through the command ring (kMsgSend), exactly as the connect path sends one.
+    void testSubmitMetadataRequest() noexcept { sendMetadataRequest(agent_.sessionId()); }
     [[nodiscard]] bool testGroupHubEmpty() const noexcept { return groupConsumerHub_.empty(); }
     [[nodiscard]] std::size_t testUnsentSubscribes() const noexcept { return subscriberHub_.unsentSubscribes(); }
     [[nodiscard]] std::size_t testMaxFrameLength() const noexcept { return agent_.maxFrameLength(); }
@@ -589,6 +604,14 @@ public:
     [[nodiscard]] uint32_t testCoordinatorSessionIndex() const noexcept { return coordIdx_; }
     [[nodiscard]] uint64_t testCoordinatorRedirects() const noexcept { return coordinatorRedirects_; }
     [[nodiscard]] uint64_t testCoordinatorFallbacks() const noexcept { return coordinatorFallbacks_; }
+    /// DR client bug 1 (duty thread / after close): seed failovers started (each a
+    /// move of the seed to another broker), and the MetadataRequests sent on a
+    /// non-seed session because the seed was not Connected.
+    [[nodiscard]] uint64_t testSeedFailovers() const noexcept { return seedFailovers_; }
+    /// DR client bug 2 (after close): close() drains cut short by closeTimeoutMs.
+    [[nodiscard]] uint64_t testCloseDeadlineHits() const noexcept { return closeDeadlineHits_; }
+    [[nodiscard]] uint64_t testMetadataViaOtherSession() const noexcept { return metadataViaOtherSession_; }
+    [[nodiscard]] const std::string& testSeedChannel() const noexcept { return agent_.seedChannel(); }
     /// Test hook (duty-cycle thread only): agent session `i`'s state.
     [[nodiscard]] session::SessionState testSessionStateAt(uint32_t i) const noexcept { return agent_.sessionStateAt(i); }
     [[nodiscard]] uint64_t testSessionConnectFailuresAt(uint32_t i) const noexcept { return agent_.sessionConnectFailuresAt(i); }
@@ -1216,6 +1239,14 @@ private:
 
     // ---- F8c C2: completion-queue registry (duty-thread owned) --------------
     void registerCq_(Completions& q);
+    /// DR client bug 2: registration bounded by `deadline` (close()'s own queue).
+    /// InDoubt = the CqAdd is still unread in the command ring at the deadline:
+    /// the caller keeps `q` alive across closeImpl_() (which applies the CqAdd
+    /// and hands the queue back).  Throws as the unbounded form does.
+    enum class CqRegistration : uint8_t { Registered, BornFinished, InDoubt };
+    CqRegistration registerCq_(Completions& q, std::chrono::steady_clock::time_point deadline);
+    static constexpr int64_t kDefaultCloseTimeoutMs = 65'000;
+    uint64_t closeDeadlineHits_ = 0;   ///< close() drains cut short by closeTimeoutMs (test hook)
     void releaseCq_(Completions& q) noexcept;
     void applyCqAdd_(detail::CompletionRing* ring);
     void applyCqRelease_(CqRef ref, detail::CompletionRing* ring, uint64_t prodIssued);
@@ -1456,6 +1487,33 @@ private:
     /// transitions of the agent's sessions, no clock.
     int watchGroupSessions_(int64_t nowNs);
     int watchProduceRoutes_(int64_t nowNs) noexcept;
+    // ---- DR client bug 1: seed failover (duty thread) -------------------------
+    // The seed's broker died: its session went silent (stale loss) or it gave up
+    // reconnecting there.  Every seed-bound path (metadata, DDL, new Subscribes,
+    // GetViewRow, the default group / txn coordinator) would otherwise wait on a
+    // dead broker for good.  The seed moves to another broker — first one a live
+    // session is Connected to, then the metadata's brokers, then the bootstrap —
+    // one candidate per attempt, each bounded by kSeedFailoverAttemptMaxNs (or the
+    // connect timeout, if shorter).  Per-state data (hard rule 3):
+    struct SeedSteady {};                  ///< Connected, never Live, closed: nothing to do
+    struct SeedFailingOver {
+        uint32_t attempt           = 0;    ///< candidates tried this episode
+        int64_t  attemptDeadlineNs = 0;    ///< the current candidate's connect deadline (duty clock)
+        int64_t  notBeforeNs       = 0;    ///< the next attempt never starts earlier (pacing)
+    };
+    std::variant<SeedSteady, SeedFailingOver> seedFailover_;
+    uint64_t seedFailoverLossesSeen_ = 0;  ///< the seed machine's staleSessionLosses() last seen
+    uint64_t seedFailovers_          = 0;  ///< moves started (test hook)
+    uint64_t metadataViaOtherSession_ = 0; ///< MetadataRequests sent on a non-seed session
+    std::vector<std::string> seedCandidates_;  ///< cold scratch (capacity persists)
+    static constexpr int64_t kSeedFailoverAttemptMaxNs = 10'000'000'000LL;  // 10 s per candidate
+    static constexpr int64_t kSeedFailoverMinGapNs     = 100'000'000LL;     // >= 100 ms between attempts
+    int  driveSeedFailover_(int64_t nowNs) noexcept;
+    bool startSeedFailoverAttempt_(SeedFailingOver& f, int64_t nowNs) noexcept;
+    /// A MetadataRequest on the seed when it is Connected, else on any Connected
+    /// node session (the new leader is learnt from any live broker).  False when
+    /// no session is Connected (the caller arms the backoff refresh).
+    bool sendMetadataRequestAnywhere_() noexcept;
     std::vector<uint64_t> routeConnectFailuresSeen_;  // DR-7: per session, last seen connectFailures()
     std::vector<uint8_t>  routeSessionUp_;            // DR-7 review M1: per session, Connected last pass
     uint64_t              heldOffersSeen_ = 0;        // DR-7: last seen agent_.heldOffers()
