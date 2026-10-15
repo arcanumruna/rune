@@ -37,6 +37,7 @@
 #include <rune/protocol/client/Protocol.h>
 
 #include <gtest/gtest.h>
+#include <gtest/gtest-spi.h>
 
 #include <algorithm>
 #include <chrono>
@@ -149,7 +150,8 @@ struct CellTimes {
         static std::vector<std::pair<std::string, double>> r;
         return r;
     }
-    static int& perturbed() { static int n = 0; return n; }   ///< cells whose exact codes were relaxed on product evidence
+    static int& perturbed() { static int n = 0; return n; }   ///< cells whose exact codes were relaxed (product evidence + a stall)
+    static int& notExercised() { static int n = 0; return n; }   ///< cells whose timing never ran (a stall explains it)
 };
 class CellTimesPrinter : public ::testing::Environment {
 public:
@@ -157,7 +159,8 @@ public:
         double total = 0;
         for (const auto& [n, s] : CellTimes::rows()) { total += s; std::fprintf(stderr, "[ cell time ] %-60s %7.1f s\n", n.c_str(), s); }
         if (!CellTimes::rows().empty()) std::fprintf(stderr, "[ cell time ] %-60s %7.1f s\n", "TOTAL", total);
-        std::fprintf(stderr, "[ cell time ] perturbed cells: %d\n", CellTimes::perturbed());
+        std::fprintf(stderr, "[ cell time ] perturbed cells: %d, not-exercised cells: %d\n", CellTimes::perturbed(),
+                     CellTimes::notExercised());
     }
 };
 [[maybe_unused]] ::testing::Environment* const kCellTimesPrinter = ::testing::AddGlobalTestEnvironment(new CellTimesPrinter);
@@ -669,20 +672,49 @@ class CatalogClusterSliceRegression : public ::testing::TestWithParam<CellParam>
 // client's answers - the leader epoch, the by-cause NotLeader counters of every broker, the gate's overdue counter -
 // and then asserts the contract of THAT event; with no evidence the matrix's exact codes apply.
 // ===========================================================================
+//
+// Task 23 fix round 3 (R2-I1): that product evidence relaxes the exact codes ONLY when the harness also sees a cause for it -
+// a broker admin / control thread that was demonstrably not scheduled for >= kStallEvidenceNs (its max inter-pass gap,
+// measured by the broker thread itself, independent of every protocol decision), or a stall the test injected (CellSeams::
+// injectsStall).  Product evidence with every thread scheduled is a spurious fencing / demotion / re-election: a FAILURE.
+// ===========================================================================
+/// The stall that can legitimately move the catalog topology: the election timeout is 150 ms (CatalogBrokerCluster's
+/// electionTimeoutMs, the production default) and a broker is fenced after 3 x 150 = 450 ms of heartbeat silence; a thread
+/// unscheduled for two-thirds of the election timeout (100 ms) can lose a heartbeat.  Anything shorter cannot explain a move.
+constexpr int64_t kStallEvidenceNs = 100'000'000;
+inline long long msOf(int64_t ns) { return static_cast<long long>(ns / 1'000'000); }
+
 struct Perturbation {
     int32_t                                     catalogLeaderEpoch = -1;
     std::map<int, BrokerNode::CatalogNotLeaderCounts> nl;   // per running broker
     std::map<int, uint64_t>                     overdue;    // per running broker
+    std::map<int, BrokerNode::PassGaps>         gaps;       // per running broker: max inter-pass gaps since the reset
     bool                                        leaderMovedInCell = false, gateOverdueObserved = false;
+    bool                                        injectedStall = false;   ///< the test's own seam stalled a broker / the harness
+    /// The baseline: resets every running broker's pass-gap maxima (on their owner threads), then reads the counters.
     static Perturbation snapshot(ThreeNodes& c) {
+        for (int n : c.runningNodes()) c.node(n).resetPassGapsForTest();
+        return read(c);
+    }
+    /// The after-drive reading (no reset): the counters and every running broker's max pass gaps since the baseline.
+    static Perturbation read(ThreeNodes& c) {
         Perturbation p;
         for (int n : c.runningNodes()) {
             if (p.catalogLeaderEpoch < 0)
                 if (const auto pa = catalogAssignmentOf(c.node(n))) p.catalogLeaderEpoch = pa->leaderEpoch;
             p.nl[n] = c.node(n).catalogNotLeaderCountsForTest();
             p.overdue[n] = c.node(n).ddlAnswersOverdueForTest();
+            p.gaps[n] = c.node(n).passGapsForTest();
         }
         return p;
+    }
+    /// The largest admin / control pass gap of the brokers present in both readings and not `excluded` (a broker the
+    /// timing stops / restarts measures from its restart; it is excluded exactly like its counters).
+    [[nodiscard]] int64_t maxGapNs(const Perturbation& p0, const std::set<int>& excluded) const {
+        int64_t m = 0;
+        for (const auto& [id, g] : gaps)
+            if (p0.gaps.count(id) != 0 && excluded.count(id) == 0) m = std::max({m, g.adminMaxGapNs, g.controlMaxGapNs});
+        return m;
     }
     /// What changed since `p0` ("" = unperturbed).  Brokers the cell's own timing stops / restarts (`excluded`) are not
     /// compared (a restarted broker's counters restart); only brokers present in both snapshots are.  `useEpoch` false:
@@ -713,8 +745,10 @@ struct CellRoles { int preLeader = -1, leader = -1, via = -1; };
 struct CellOutcome {
     CellResult  res;
     CellRoles   roles;
-    std::string perturbedWhy;   ///< "" = the exact codes were asserted
+    std::string perturbedWhy;   ///< "" = no product evidence (the exact codes were asserted)
     uint64_t    belowMinIsrOnLeader = 0;
+    bool        stallObserved = false;   ///< some non-excluded broker thread's pass gap >= kStallEvidenceNs
+    int64_t     maxGapNs = 0;            ///< that max gap
 };
 /// Test seams of runCell (all optional).
 struct CellSeams {
@@ -723,6 +757,8 @@ struct CellSeams {
     std::function<void(ThreeNodes&, Rig&, int)>        onLeaderSend;
     std::function<void(ThreeNodes&, Rig&)>             afterAnswerRelease;
     bool                                               answerHoldInWindow = true;   ///< false: the RED of Recipe 2 step 2
+    bool                                               injectsStall = false;  ///< the seams stall a broker / the harness themselves
+    bool                                               suppressTimingHook = false;   ///< T9: RestartMidApply's hook never acts
 };
 
 /// The settled catalog leader, polled (a stalled host can leave the topology unsettled for a moment between two reads): -1 after `within`.
@@ -804,6 +840,7 @@ void runCell(const CellParam& param, const CellSeams& seams = {}, CellOutcome* o
     const int leader = resolveLeader(c, 60s);
     ASSERT_GT(leader, 0);
     Perturbation pert;
+    pert.injectedStall = seams.injectsStall;
     const Perturbation pert0 = Perturbation::snapshot(c);
 
     // ── the cell's DDL ─────────────────────────────────────────────────────────────────────────────
@@ -843,6 +880,8 @@ void runCell(const CellParam& param, const CellSeams& seams = {}, CellOutcome* o
     const RequestId rid = rig.freshRid_();
     Hooks hooks;
     int victim = -1;
+    int victimId = -1;               // RestartMidApply: the stopped follower (victim is cleared once the hook restarted it)
+    bool restartedInHook = false;    // RestartMidApply: the hook restarted the victim while the DDL committed / applied
     int crashedNode = -1;
     bool placementReleased = false;
     int answersHeldOn = -1;
@@ -867,6 +906,7 @@ void runCell(const CellParam& param, const CellSeams& seams = {}, CellOutcome* o
         break;
     case cm::Timing::RestartMidApply:
         victim = aRunningFollower(via);
+        victimId = victim;
         ASSERT_GT(victim, 0) << cell;
         rig.pumping([&] { c.stop(victim); });
         rig.forget(victim);
@@ -876,9 +916,11 @@ void runCell(const CellParam& param, const CellSeams& seams = {}, CellOutcome* o
             if (isrLeader != leader) pert.leaderMovedInCell = true;     // the topology moved between resolution and the shrink
         }
         hooks.afterSend = [&](int, int node) {
+            if (seams.suppressTimingHook) return false;   // T9: the timing never runs (the victim restarts after the drive)
             if (node != c.catalogLeaderId() || victim < 0) return false;
             const int v = victim;
             victim = -1;
+            restartedInHook = true;
             rig.pumping([&] { c.startNode(v); });                       // restarted while the DDL commits / applies
             return false;
         };
@@ -1033,35 +1075,56 @@ void runCell(const CellParam& param, const CellSeams& seams = {}, CellOutcome* o
     res.viaWasLeader = via == leader;
     const cm::ExpectedCodes ec = cm::expectedCodes(kind, {res.viaWasLeader ? cm::Via::Leader : cm::Via::Follower, cm::Persist::Disk}, timing);
     // The by-cause NotLeader counters + the leader epoch, compared against the snapshot taken when the roles were resolved.
-    // Excluded: brokers the cell's own timing stops / restarts; the epoch is not used where the timing moves the leader itself.
+    // Excluded: exactly the brokers the cell's own timing stops / restarts (the crashed leader, the RestartMidApply victim);
+    // the epoch is not used where the timing moves the leader itself.
     std::set<int> excluded;
     if (crashedNode > 0) excluded.insert(crashedNode);
-    if (timing == cm::Timing::RestartMidApply) for (int n = 1; n <= 3; ++n) if (n != leader && n != via) excluded.insert(n);
-    const std::string why = Perturbation::snapshot(c).since(pert0, excluded, timing != cm::Timing::LeaderChangeMidDdl) +
+    if (victimId > 0) excluded.insert(victimId);
+    const Perturbation after = Perturbation::read(c);
+    const std::string why = after.since(pert0, excluded, timing != cm::Timing::LeaderChangeMidDdl) +
                             (pert.leaderMovedInCell ? " leader-moved" : "") +
-                            (pert.gateOverdueObserved ? " gate-overdue(stall observed)" : "");
+                            (pert.gateOverdueObserved ? " gate-overdue" : "");
+    // R2-I1: the harness-side cause - a broker thread unscheduled for >= kStallEvidenceNs, or a stall the seams injected.
+    const int64_t maxGap = after.maxGapNs(pert0, excluded);
+    const bool stallObserved = maxGap >= kStallEvidenceNs;
+    const bool stall = stallObserved || pert.injectedStall;
+    const std::string stallWhat = "stall(max gap " + std::to_string(msOf(maxGap)) + " ms" + (pert.injectedStall ? ", injected" : "") + ")";
     if (why.empty()) {            // the cell's own timing only: the matrix's exact codes
         EXPECT_EQ(res.firstCode, ec.first) << cell << res.trace;
         EXPECT_EQ(res.afterRedirectCode, ec.afterRedirect) << cell << res.trace;
         EXPECT_EQ(res.finalCode, ec.final) << cell << res.trace;
-    } else {                       // a host stall moved the topology: the contract of THAT event (spec 5.5 / 9, F13)
-        std::fprintf(stderr, "[ perturbed ] %s:%s %s\n", cell.c_str(), why.c_str(), res.trace.c_str());
+    } else if (stall) {           // a host / injected stall moved the topology: the contract of THAT event (spec 5.5 / 9, F13)
+        std::fprintf(stderr, "[ perturbed ] %s:%s %s %s\n", cell.c_str(), why.c_str(), stallWhat.c_str(), res.trace.c_str());
         ++CellTimes::perturbed();
-        for (int code : res.codes)   // every non-final answer is a retriable redirect / refusal / in-doubt: never another error
-            EXPECT_TRUE(code == cRedirect || code == cNotLeader || code == cInternal) << cell << res.trace;
+    } else {
+        ADD_FAILURE() << cell << ": product evidence of a topology change (" << why << ") with NO stall (max pass gap "
+                      << msOf(maxGap) << " ms < " << msOf(kStallEvidenceNs)
+                      << " ms) - a spurious fencing / demotion / re-election: product bug" << res.trace;
+    }
+    // R2-I1 step 5: a cell whose timing never ran is a failure unless the leader moved under a stall.
+    const bool timingRan = (timing != cm::Timing::LeaderChangeMidDdl || crashedNode > 0) &&
+                           (timing != cm::Timing::RestartMidApply || restartedInHook) &&
+                           (timing != cm::Timing::CreateRacesPlacement ||
+                            (kind != cm::Kind::CreateTopic && kind != cm::Kind::CreateView) || placementReleased);
+    if (!timingRan) {
+        if (pert.leaderMovedInCell && stall) {
+            std::fprintf(stderr, "[ not exercised ] %s: the leader moved under a %s\n", cell.c_str(), stallWhat.c_str());
+            ++CellTimes::notExercised();
+        } else {
+            ADD_FAILURE() << cell << ": the timing never ran and no stall explains it (leader moved: " << pert.leaderMovedInCell
+                          << ", " << stallWhat << ")" << res.trace;
+        }
     }
     if (outcome) {
         outcome->res = res; outcome->roles = CellRoles{preLeader, leader, via}; outcome->perturbedWhy = why;
-        const auto cnt = Perturbation::snapshot(c).nl;
-        if (cnt.count(leader) && pert0.nl.count(leader)) outcome->belowMinIsrOnLeader = cnt.at(leader).belowMinIsr - pert0.nl.at(leader).belowMinIsr;
+        outcome->stallObserved = stallObserved; outcome->maxGapNs = maxGap;
+        if (after.nl.count(leader) && pert0.nl.count(leader)) outcome->belowMinIsrOnLeader = after.nl.at(leader).belowMinIsr - pert0.nl.at(leader).belowMinIsr;
     }
     ASSERT_EQ(res.finalCode, cOk) << cell << res.trace;    // ALWAYS
 
     // ── the timing's after-effects, then the identical-catalogs gate ───────────────────────────────
     if (timing == cm::Timing::LeaderChangeMidDdl) {
-        if (crashedNode <= 0) {
-            ASSERT_TRUE(pert.leaderMovedInCell) << cell << ": the leader never crashed and no move was observed";
-        } else {
+        if (crashedNode > 0) {   // (crashedNode <= 0: the timing never ran - judged above, a failure without a stall)
             ASSERT_TRUE(c.awaitCatalogLeader(60s)) << cell << ": no catalog leader after the crash";
             rig.pumping([&] { c.startNode(crashedNode); });             // the crashed leader rejoins as a follower
             rig.forget(crashedNode);
@@ -1235,6 +1298,7 @@ void racesPlacementBelowMinIsr(cm::Kind kind, bool holdAnswers) {
     CellSeams seams;
     seams.configTweak = [](NodeConfig& cfg) { cfg.replicaLagMaxMs = 1000; };
     seams.answerHoldInWindow = holdAnswers;
+    seams.injectsStall = true;   // both followers' admin threads are frozen 4 s
     seams.onLeaderSend = [](ThreeNodes& c, Rig& rig, int lead) {
         std::vector<std::thread> th;
         for (int f : c.runningNodes())
@@ -1276,6 +1340,7 @@ TEST(CatalogClusterRegression, RacesPlacementCreateViewWithTheCatalogBelowMinIsr
 TEST(CatalogClusterRegression, RacesPlacementGateOverdueIsInDoubtNeverOkAndTheRetryGetsTheResultRegression) {
     CellSeams seams;
     seams.afterAnswerRelease = [](ThreeNodes&, Rig& rig) { rig.pumping([] { std::this_thread::sleep_for(6s); }); };
+    seams.injectsStall = true;   // the harness sleeps past the gate's cap (no broker thread is frozen)
     CellOutcome out;
     runCell({cm::Kind::CreateTopic, cm::Timing::CreateRacesPlacement, 0}, seams, &out);
     if (::testing::Test::HasFatalFailure()) return;
@@ -1292,6 +1357,7 @@ TEST(CatalogClusterRegression, RacesPlacementGateOverdueIsInDoubtNeverOkAndTheRe
 TEST(CatalogClusterRegression, SliceCellUnderAFencedIsrAssertsTheRetriableContractRegression) {
     CellSeams seams;
     seams.configTweak = [](NodeConfig& cfg) { cfg.replicaLagMaxMs = 1000; };
+    seams.injectsStall = true;   // both followers' admin threads are frozen 4 s
     seams.onLeaderSend = [](ThreeNodes& c, Rig& rig, int lead) {
         std::vector<std::thread> th;
         for (int f : c.runningNodes())
@@ -1313,13 +1379,102 @@ TEST(CatalogClusterRegression, SliceCellUnderAFencedIsrAssertsTheRetriableContra
     EXPECT_EQ(out.res.finalCode, cOk);
 }
 
-// T6 (negative): an unperturbed cell reports no perturbation.
-// RED (count a NotLeader on every answer): the cell reports perturbed and this fails.
+// T6 (negative): an unperturbed cell reports no product evidence without a stall behind it (on a loaded host a genuine stall
+// may produce evidence - then the measured pass gap explains it).
+// RED (count a NotLeader on every answer): evidence with no stall -> runCell's "NO stall" failure and this assertion fail.
 TEST(CatalogClusterRegression, UnperturbedSliceCellReportsNoPerturbationRegression) {
     CellOutcome out;
     runCell({cm::Kind::CreateTopic, cm::Timing::Steady, 1}, {}, &out);
     if (::testing::Test::HasFatalFailure()) return;
-    EXPECT_TRUE(out.perturbedWhy.empty()) << out.perturbedWhy;
+    EXPECT_TRUE(out.perturbedWhy.empty() || out.stallObserved)
+        << out.perturbedWhy << " (max pass gap " << msOf(out.maxGapNs) << " ms)";
+}
+
+// T7 (Task 23 fix round 3, R2-I1): product evidence with NO stall behind it fails the cell as a product bug.  The seam fabricates
+// one "demoted" NotLeader count on the leader's admin thread at the first frame the leader receives (after the baseline; the
+// recipe's afterPrecondition runs BEFORE the baseline, which would absorb the bump) - no thread is frozen.  The failures of the
+// cell are intercepted: with no measured stall exactly the "NO stall ... product bug" failure must be reported; were a genuine
+// host stall measured in this run, the relaxation is legitimate and no such failure may appear.
+// RED: treat `stall` as always true in runCell -> no failure is reported although no stall was measured.
+TEST(CatalogClusterRegression, ProductEvidenceWithoutAStallFailsTheCellRegression) {
+    CellSeams seams;
+    bool bumped = false;
+    seams.onLeaderSend = [&bumped](ThreeNodes& c, Rig&, int lead) {
+        c.node(lead).bumpCatalogNotLeaderDemotedForTest();
+        bumped = true;
+    };
+    CellOutcome out;
+    ::testing::TestPartResultArray failures;
+    {
+        ::testing::ScopedFakeTestPartResultReporter intercept(::testing::ScopedFakeTestPartResultReporter::INTERCEPT_ONLY_CURRENT_THREAD,
+                                                              &failures);
+        runCell({cm::Kind::CreateTopic, cm::Timing::Steady, 1}, seams, &out);
+    }
+    ASSERT_TRUE(bumped) << "vacuity guard: the fabricated evidence was planted";
+    EXPECT_NE(out.perturbedWhy.find("notLeader(demoted)+1"), std::string::npos) << "the cell saw the evidence: " << out.perturbedWhy;
+    int noStall = 0;
+    for (int i = 0; i < failures.size(); ++i) {
+        const auto& f = failures.GetTestPartResult(i);
+        if (std::string(f.message()).find("with NO stall") != std::string::npos && f.nonfatally_failed()) { ++noStall; continue; }
+        ADD_FAILURE() << "unexpected cell failure: " << f.message();   // anything else is a real failure of the cell
+    }
+    if (!out.stallObserved) EXPECT_EQ(noStall, 1) << "product evidence without a stall must fail the cell (max pass gap "
+                                                  << msOf(out.maxGapNs) << " ms)";
+    else EXPECT_EQ(noStall, 0) << "a measured " << msOf(out.maxGapNs) << " ms stall explains the evidence";
+}
+
+// T9 (Task 23 fix round 3, R2-I1 step 5): a cell whose timing never ran - here RestartMidApply's hook is suppressed, the victim
+// is only restarted after the drive - fails, because neither a leader move nor a stall explains it.  Deterministic: without
+// a leader move the failure is due whatever the measured gap.
+// RED: drop the `timingRan` check in runCell -> the cell passes without exercising its timing.
+TEST(CatalogClusterRegression, TimingThatNeverRanFailsTheCellRegression) {
+    CellSeams seams;
+    seams.suppressTimingHook = true;
+    CellOutcome out;
+    ::testing::TestPartResultArray failures;
+    {
+        ::testing::ScopedFakeTestPartResultReporter intercept(::testing::ScopedFakeTestPartResultReporter::INTERCEPT_ONLY_CURRENT_THREAD,
+                                                              &failures);
+        runCell({cm::Kind::CreateTopic, cm::Timing::RestartMidApply, 0}, seams, &out);
+    }
+    int neverRan = 0;
+    for (int i = 0; i < failures.size(); ++i) {
+        const auto& f = failures.GetTestPartResult(i);
+        if (std::string(f.message()).find("the timing never ran and no stall explains it") != std::string::npos) { ++neverRan; continue; }
+        ADD_FAILURE() << "unexpected cell failure: " << f.message();   // the cell is otherwise correct (exact codes, data)
+    }
+    EXPECT_EQ(neverRan, 1) << "an un-exercised timing must fail the cell";
+}
+
+// R2-I1 step 1 on real brokers: each broker's admin and control threads record their own max inter-pass gap, read and reset ON
+// the owner threads.  A test task that occupies the owner thread for 300 ms is a 300 ms gap of exactly that thread.
+// RED: remove the update in AdminControlPlane::doWork -> controlMaxGapNs stays below 300 ms (likewise AdminWorker::doWork).
+TEST(ThreeNodesRegression, PassGapsMeasureAnOwnerThreadThatWasNotScheduledRegression) {
+    ThreeNodes c = ThreeNodes::start("passgaps");
+    ASSERT_TRUE(c.awaitCatalogLeader(60s));
+    BrokerNode& n = c.node(1);
+    n.resetPassGapsForTest();
+    const auto idle = n.passGapsForTest();
+    EXPECT_LT(idle.adminMaxGapNs, kStallEvidenceNs) << "an idle broker is scheduled (backoff park <= a few ms)";
+    EXPECT_LT(idle.controlMaxGapNs, kStallEvidenceNs);
+    // A pass records the gap at its own start, so the pass AFTER the occupied one records it: the read is polled briefly.
+    auto readUntil = [&n](bool admin) {
+        BrokerNode::PassGaps g;
+        for (const auto until = Clock::now() + 2s; Clock::now() < until; std::this_thread::sleep_for(5ms)) {
+            g = n.passGapsForTest();
+            if ((admin ? g.adminMaxGapNs : g.controlMaxGapNs) >= 300'000'000) break;
+        }
+        return g;
+    };
+    n.onControlThreadForTest([] { std::this_thread::sleep_for(300ms); return 0; });
+    const auto ctl = readUntil(false);
+    EXPECT_GE(ctl.controlMaxGapNs, 300'000'000) << "the control thread was occupied 300 ms";
+    EXPECT_LT(ctl.adminMaxGapNs, 300'000'000) << "only the occupied thread shows the gap";
+    n.resetPassGapsForTest();
+    n.onAdminThreadForTest([] { std::this_thread::sleep_for(300ms); return 0; });
+    const auto adm = readUntil(true);
+    EXPECT_GE(adm.adminMaxGapNs, 300'000'000) << "the admin thread was occupied 300 ms";
+    EXPECT_LT(adm.controlMaxGapNs, 300'000'000) << "only the occupied thread shows the gap";
 }
 
 // ===========================================================================

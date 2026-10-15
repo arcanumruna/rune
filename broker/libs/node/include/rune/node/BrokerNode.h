@@ -1338,6 +1338,25 @@ public:
             return CatalogNotLeaderCounts{w.notLeaderBelowMinIsr(), w.notLeaderCommitTimeout(), w.notLeaderDemoted()};
         });
     }
+    /// Task 23 fix round 3 (T7): fabricate one "demoted" NotLeader count on the admin thread (no demotion happened).
+    void bumpCatalogNotLeaderDemotedForTest() {
+        onAdminThreadForTest([this]() { adminWorkerAgent_->worker().bumpNotLeaderDemotedForTest(); return 0; });
+    }
+    /// Task 23 fix round 3 (R2-I1): the admin and control threads' max inter-pass gaps since the last reset, each read
+    /// ON its owner thread — a harness-side stall signal (a thread unscheduled that long can lose a heartbeat).
+    struct PassGaps { int64_t adminMaxGapNs = 0, controlMaxGapNs = 0; };
+    template <class = void>   // instantiated after onControlThreadForTest is defined
+    [[nodiscard]] PassGaps passGapsForTest() {
+        PassGaps g;
+        g.adminMaxGapNs   = onAdminThreadForTest([this]() -> int64_t { return adminWorkerAgent_->worker().maxPassGapNs(); });
+        g.controlMaxGapNs = onControlThreadForTest([this]() -> int64_t { return adminControl_.maxPassGapNs(); });
+        return g;
+    }
+    template <class = void>
+    void resetPassGapsForTest() {
+        onAdminThreadForTest([this]() { adminWorkerAgent_->worker().resetMaxPassGapForTest(); return 0; });
+        onControlThreadForTest([this]() { adminControl_.resetMaxPassGapForTest(); return 0; });
+    }
     /// Held DDL OKs answered Internal (in doubt) by the DdlAnswerGate (read ON the control thread).
     template <class = void>   // instantiated after onControlThreadForTest is defined
     [[nodiscard]] uint64_t ddlAnswersOverdueForTest() {

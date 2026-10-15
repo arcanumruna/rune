@@ -522,6 +522,10 @@ void AdminWorker::submitGetSchema(const GetSchemaMsg& msg) {
 
 // ─── doWork ─────────────────────────────────────────────────────────────────
 int AdminWorker::doWork(int64_t nowNs) {
+    // Task 23 fix round 3 (R2-I1): the max inter-pass gap — a cold-path stall signal independent of every protocol
+    // decision (no allocation, no atomics; admin-thread-owned).
+    if (lastPassNs_ != 0 && nowNs - lastPassNs_ > maxPassGapNs_) maxPassGapNs_ = nowNs - lastPassNs_;
+    lastPassNs_ = nowNs;
     int work = 0;
     if (pendingLive_) [[unlikely]] {   // Task 16: the booted applier goes live, once, on this thread
         if (!applier_.goLive(std::move(*pendingLive_)))

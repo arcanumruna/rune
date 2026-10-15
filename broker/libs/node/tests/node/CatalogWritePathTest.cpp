@@ -177,6 +177,26 @@ TEST(AdminWorkerRegression, NotLeaderAnswersAreCountedByCauseRegression) {
     }
 }
 
+// Task 23 fix round 3 (R2-I1, T8): the admin thread records its own largest inter-pass gap (the slice's stall signal, independent of
+// every protocol decision); a reset clears the maximum but keeps the last pass time, so a gap spanning the reset still counts.
+// RED: remove the update in AdminWorker::doWork -> 0 != 249 ms.
+TEST(AdminWorkerRegression, MaxPassGapRecordsTheLargestSchedulingGapRegression) {
+    CatalogDdlRig rig("wp_passgap", 3);
+    rig.pump();
+    rig.admin().resetMaxPassGapForTest();
+    EXPECT_EQ(rig.admin().maxPassGapNs(), 0);
+    // pump() itself advances the virtual clock 1 ms before its pass.
+    rig.pump();                                   // t
+    rig.pump();                                   // t + 1 ms
+    rig.advanceClock(248'000'000); rig.pump();    // t + 250 ms
+    rig.pump();                                   // t + 251 ms
+    EXPECT_EQ(rig.admin().maxPassGapNs(), 249'000'000);
+    rig.admin().resetMaxPassGapForTest();
+    EXPECT_EQ(rig.admin().maxPassGapNs(), 0);
+    rig.advanceClock(6'000'000); rig.pump();      // + 7 ms: the first pass after the reset measures from the last pass before it
+    EXPECT_EQ(rig.admin().maxPassGapNs(), 7'000'000);
+}
+
 // The DDL timeout is below the client's default DDL deadline (ClientConfig::ddlTimeoutMs = 15 s), so the F13
 // NotLeader reaches a default client instead of a Timeout.
 TEST(CatalogWritePathRegression, DdlTimeoutIsBelowTheClientDefaultDeadlineRegression) {

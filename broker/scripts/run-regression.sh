@@ -26,6 +26,10 @@ J="${1:-10}"; shift || true
 now() { perl -MTime::HiRes=time -e 'printf "%.1f\n", time'; }
 el()  { perl -e "printf '%.1f', $2 - $1"; }
 
+# R-N2 / R2-M2: the 4 BenchGateRegression gate self-tests must be registered in this tree (a tree configured without
+# them would pass the checkpoint silently).
+ctest --test-dir "$B" -N -R BenchGateRegression | grep -q 'Total Tests: 4$' || { echo "BenchGateRegression missing (want exactly 4 registered in $B)"; exit 1; }
+
 t0=$(now)
 echo "== stage a: *Regression* without the latency gates (-j$J)"
 ctest --test-dir "$B" -R "Regression|^batch:" -LE "latency|small" -j "$J" --output-on-failure "$@"; rcA=$?

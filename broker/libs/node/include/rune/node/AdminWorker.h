@@ -300,6 +300,14 @@ public:
     [[nodiscard]] uint64_t notLeaderBelowMinIsr() const noexcept { return notLeaderBelowMinIsr_; }
     [[nodiscard]] uint64_t notLeaderCommitTimeout() const noexcept { return notLeaderCommitTimeout_; }
     [[nodiscard]] uint64_t notLeaderDemoted() const noexcept { return notLeaderDemoted_; }
+    /// Test seam (Task 23 fix round 3, T7): fabricate one "demoted" NotLeader count WITHOUT a demotion (product
+    /// evidence with no stall behind it).  Admin thread only (BrokerNode::bumpCatalogNotLeaderDemotedForTest).
+    void bumpNotLeaderDemotedForTest() noexcept { ++notLeaderDemoted_; }
+    /// Task 23 fix round 3 (R2-I1): the largest gap between two consecutive doWork passes (ns) since the last
+    /// reset: "this thread was not scheduled".  Admin-thread-owned plain value, read ON the admin thread
+    /// (BrokerNode::passGapsForTest).  The reset keeps the last pass time, so a gap spanning it still counts.
+    [[nodiscard]] int64_t maxPassGapNs() const noexcept { return maxPassGapNs_; }
+    void resetMaxPassGapForTest() noexcept { maxPassGapNs_ = 0; }
     /// Pre-v8 DDLs refused on a non-leader (F37).
     [[nodiscard]] uint64_t preV8Refused() const noexcept { return preV8Refused_; }
     /// DDLs refused because this broker leads __catalog without its (wiped) history (fix round 2, F2).
@@ -404,6 +412,7 @@ private:
     uint64_t answered_          = 0;
     uint64_t eventsAppended_    = 0;
     uint64_t notLeaderBelowMinIsr_ = 0, notLeaderCommitTimeout_ = 0, notLeaderDemoted_ = 0;   // by cause
+    int64_t  lastPassNs_ = 0, maxPassGapNs_ = 0;   // R2-I1: the scheduling-gap signal (one subtract + compare per pass)
     uint64_t preV8Refused_      = 0;
     uint64_t ddlRefusedUntrustedLeader_ = 0;
     bool     applyHeldForTest_  = false;   // holdApplyForTest (test seam only)

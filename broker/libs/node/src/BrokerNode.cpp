@@ -4114,7 +4114,12 @@ int BrokerNode::serviceAdminControl_() {
     return work;
 }
 
-int AdminControlPlane::doWork(int64_t /*nowNs*/) { return node_.serviceAdminControl_(); }
+int AdminControlPlane::doWork(int64_t nowNs) {
+    // Task 23 fix round 3 (R2-I1): the control pass's scheduling-gap signal (cold path: one subtract + compare).
+    if (lastPassNs_ != 0 && nowNs - lastPassNs_ > maxPassGapNs_) maxPassGapNs_ = nowNs - lastPassNs_;
+    lastPassNs_ = nowNs;
+    return node_.serviceAdminControl_();
+}
 
 // ---------------------------------------------------------------------------
 // Catalog history Task 11: the DDL route (CatalogRoute.h), control thread.
