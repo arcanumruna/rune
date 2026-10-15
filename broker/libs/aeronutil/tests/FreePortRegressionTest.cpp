@@ -7,10 +7,12 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <set>
 #include <vector>
 
+#include <poll.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -23,17 +25,40 @@ constexpr int kSingles  = 40;
 constexpr int kRanges   = 6;
 constexpr int kWidth    = 4;
 
+/// Read exactly n bytes from fd within the deadline (poll); false on EOF / timeout.
+bool readAll(int fd, void* buf, std::size_t n, std::chrono::steady_clock::time_point deadline) {
+    auto* p = static_cast<char*>(buf);
+    std::size_t got = 0;
+    while (got < n) {
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
+        if (left.count() <= 0) return false;
+        pollfd pf{fd, POLLIN, 0};
+        if (::poll(&pf, 1, static_cast<int>(left.count())) <= 0) return false;
+        const ssize_t r = ::read(fd, p + got, n - got);
+        if (r <= 0) return false;
+        got += static_cast<std::size_t>(r);
+    }
+    return true;
+}
+
 /// Fork `kChildren` processes that allocate AT THE SAME TIME (they start together on a pipe barrier and stay
-/// alive until every one has allocated, so no block is released mid-test); returns every child's ports.
+/// alive until the parent read every one, so no block is released mid-test); returns every child's ports.
+/// Each child answers on its own pipe and every read is bounded: a child that dies (or aborts in the
+/// allocator) is a failure of this test, never a hang (2026-10-15: one shared answer pipe hung the gate
+/// when a child aborted — the other children held its write end open).
 std::vector<std::vector<uint16_t>> allocateConcurrently() {
-    int go[2], out[2];
-    if (::pipe(go) != 0 || ::pipe(out) != 0) return {};
+    int go[2];
+    if (::pipe(go) != 0) return {};
     std::vector<pid_t> kids;
+    std::vector<int>   answers;
     for (int k = 0; k < kChildren; ++k) {
+        int out[2];
+        if (::pipe(out) != 0) break;
         const pid_t pid = ::fork();
         if (pid == 0) {
             ::close(go[1]);
             ::close(out[0]);
+            for (int a : answers) ::close(a);
             char c;
             (void)::read(go[0], &c, 1);   // barrier: every child allocates concurrently
             std::vector<uint16_t> mine;
@@ -45,30 +70,28 @@ std::vector<std::vector<uint16_t>> allocateConcurrently() {
             uint32_t n = static_cast<uint32_t>(mine.size());
             (void)::write(out[1], &n, sizeof n);
             (void)::write(out[1], mine.data(), n * sizeof(uint16_t));
-            (void)::read(go[0], &c, 1);   // hold the blocks until the parent read everyone (EOF on exit)
+            pollfd pf{go[0], POLLIN, 0};
+            (void)::poll(&pf, 1, 30'000);   // hold the blocks until the parent read everyone (EOF), bounded
             ::_exit(0);
         }
+        ::close(out[1]);
         kids.push_back(pid);
+        answers.push_back(out[0]);
     }
     ::close(go[0]);
-    ::close(out[1]);
     const char start[kChildren] = {};
     (void)::write(go[1], start, kChildren);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
     std::vector<std::vector<uint16_t>> all;
-    for (int k = 0; k < kChildren; ++k) {
+    for (int fd : answers) {
         uint32_t n = 0;
-        if (::read(out[0], &n, sizeof n) != static_cast<ssize_t>(sizeof n)) break;
+        if (!readAll(fd, &n, sizeof n, deadline) || n > 4096) break;
         std::vector<uint16_t> v(n);
-        std::size_t got = 0;
-        while (got < n * sizeof(uint16_t)) {
-            const ssize_t r = ::read(out[0], reinterpret_cast<char*>(v.data()) + got, n * sizeof(uint16_t) - got);
-            if (r <= 0) break;
-            got += static_cast<std::size_t>(r);
-        }
+        if (!readAll(fd, v.data(), n * sizeof(uint16_t), deadline)) break;
         all.push_back(std::move(v));
     }
     ::close(go[1]);   // release the children
-    ::close(out[0]);
+    for (int fd : answers) ::close(fd);
     for (pid_t p : kids) { int st = 0; ::waitpid(p, &st, 0); }
     return all;
 }
@@ -94,7 +117,9 @@ TEST(FreePortRegression, ConcurrentProcessesAreNeverHandedTheSamePort) {
 
 TEST(FreePortRegression, ARangeIsConsecutiveAndDisjointFromEverySinglePort) {
     std::set<uint16_t> seen;
-    for (int i = 0; i < 50; ++i) {
+    // 30 x 9 ports stays inside one owned window (kMaxOwnedBlocks * kBlockPorts), so no port may repeat.
+    static_assert(30 * 9 <= fp::kMaxOwnedBlocks * fp::kBlockPorts);
+    for (int i = 0; i < 30; ++i) {
         const uint16_t b = fp::allocFreeUdpPortRange(8);
         for (uint16_t w = 0; w < 8; ++w) EXPECT_TRUE(seen.insert(static_cast<uint16_t>(b + w)).second);
         EXPECT_TRUE(seen.insert(fp::allocFreeUdpPort()).second);

@@ -47,9 +47,9 @@ namespace rune::aeronutil::testing {
 
 inline constexpr uint32_t kPortRangeBase = 10000;
 inline constexpr uint32_t kPortRangeSpan = 10000;   // 10000..19999
-inline constexpr uint32_t kBlockPorts    = 200;
-inline constexpr uint32_t kBlocks        = kPortRangeSpan / kBlockPorts;   // 50
-inline constexpr const char* kLockDir    = "/tmp/rune-test-ports-10000x200";   // geometry in the name: another layout never shares it
+inline constexpr uint32_t kBlockPorts    = 100;
+inline constexpr uint32_t kBlocks        = kPortRangeSpan / kBlockPorts;   // 100
+inline constexpr const char* kLockDir    = "/tmp/rune-test-ports-10000x100";   // geometry in the name: another layout never shares it
 
 inline bool udpPortBindable(uint16_t port) {
     const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);

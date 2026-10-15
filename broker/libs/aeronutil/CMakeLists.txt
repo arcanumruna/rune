@@ -12,5 +12,5 @@ if(BUILD_TESTING)
         tests/FreePortRegressionTest.cpp)   # 2026-10-15: the parallel-safe test port allocator
     target_link_libraries(rune_aeronutil_tests PRIVATE rune_aeron_util GTest::gtest_main)
     include(GoogleTest)
-    gtest_discover_tests(rune_aeronutil_tests)
+    gtest_discover_tests(rune_aeronutil_tests PROPERTIES TIMEOUT 120)
 endif()
