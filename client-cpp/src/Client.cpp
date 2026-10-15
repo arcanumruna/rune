@@ -60,7 +60,7 @@ constexpr std::int32_t  kStartLatchMsgType  = 1;
 // (topicId / viewTopicId) report -1 as before; the new ops' objectId is 0.
 int64_t ddlNoValue(rune::client::OpKind op) noexcept {
     using rune::client::OpKind;
-    return op == OpKind::DefineTopic || op == OpKind::AlterTopic || op == OpKind::CreateView ? -1 : 0;
+    return op == OpKind::DefineTopic || op == OpKind::AlterTopic || op == OpKind::CreateView ? -1 : 0;   // GetViewRow: 0
 }
 // Task 16: "host:port" (or a full Aeron channel) -> an Aeron UDP channel.
 std::string toChannel(const std::string& endpoint) {
@@ -1491,7 +1491,7 @@ void Client::applyControlOp_(const ControlOpHeader& h, std::span<const uint8_t> 
     ctlScratch_.assign(frame.begin(), frame.end());
     rpc::detail::putLE64(ctlScratch_.data(), 8, machine.sessionId());
     rpc::detail::putLE64(ctlScratch_.data(), 16, p.corrId);
-    if (isDdlOp(h.op)) {
+    if (isRoutedCtlOp(h.op)) {
         // Catalog history (F14): the requestId is stamped HERE, by the duty
         // thread that owns the counter, then kept with the frame — every resend
         // (Redirect / NotLeader / a lost session) re-offers these exact bytes.
@@ -1602,6 +1602,10 @@ transport::AeronTransport::OfferResult Client::offerDdl_(DdlPending& d, int64_t 
 
 void Client::failDdl_(std::size_t i, uint16_t code, std::string_view detail, int64_t value, int64_t aux) {
     PendingCtl p = takeCtl_(i);   // removed first: the delivery may issue a new op
+    // GetViewRow's errorCode namespace is the ViewRowResponse status, where 2 is
+    // NotReady and 3 SchemaMismatch: a routing failure (NotLeader 2 / Redirect 3)
+    // is the client-side kNotLeader, never mistaken for either.
+    if (p.op == OpKind::GetViewRow && (code == 2 || code == 3)) code = ViewRowResult::kNotLeader;
     completeCtl_(p, OpStatus::BrokerError, value, aux, code,
                  std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(detail.data()), detail.size()));
 }
@@ -2866,7 +2870,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
         if (opt->correlationId != 0 && ec != rpc::ErrorCode::SessionExpired &&
             ec != rpc::ErrorCode::UnknownSession) {
             if (const std::size_t i = findCtl_(opt->correlationId);
-                i < pendingCtl_.size() && isDdlOp(pendingCtl_[i].op)) {
+                i < pendingCtl_.size() && isRoutedCtlOp(pendingCtl_[i].op)) {
                 if (ec == rpc::ErrorCode::Redirect) {
                     onDdlRedirect_(i, opt->message, now());
                 } else if (ec == rpc::ErrorCode::NotLeader) {

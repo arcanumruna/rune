@@ -788,3 +788,97 @@ TEST(ClientDdlRedirectRegression, TraceRecordsNoRedirectWhoseOfferIsFatalRegress
     (void)r.client.takeDdlRetryNotes(notes);
     for (const auto& n : notes) EXPECT_NE(n.kind, rc::Client::DdlRetryNote::Kind::Redirect) << "an unfollowed redirect is not reported";
 }
+
+// ── Task 22 fix round 1 (C1): GetViewRow follows the source leader's Redirect / NotLeader ──
+//
+// A view row is served only by the broker that leads the view's source partition; every
+// other broker answers ErrorResponse{Redirect, leader endpoint} (bare NotLeader when
+// leaderless).  The client re-sends the read on the named node's session inside its
+// budget, exactly as a DDL (isRoutedCtlOp), and never lets the broker's routing code
+// (2 = NotLeader, 3 = Redirect) pass for the ViewRowResponse statuses 2 / 3.
+
+namespace {
+void answerViewRow(Rig& r, int ep, const pc::GetViewRow& m, uint16_t status, const std::vector<uint8_t>& row) {
+    pc::ViewRowResponse resp;
+    resp.sessionId = m.sessionId; resp.correlationId = m.correlationId;
+    resp.status = status; resp.rowLen = static_cast<uint32_t>(row.size());
+    resp.rowBytes = row.empty() ? nullptr : row.data(); resp.rowBytesLen = static_cast<uint32_t>(row.size());
+    std::vector<uint8_t> out(resp.encodedSize());
+    const std::size_t n = resp.encode(out.data());
+    r.gw.send(ep, out.data(), n);
+}
+}  // namespace
+
+TEST(ClientDdlRedirectRegression, GetViewRowRedirectIsFollowedToTheSourceLeaderAndAnswersTheRowRegression) {
+    Rig r(invokerCfg(4450, 4451));
+    const std::string leaderCh = udp(freePort());
+    const int leader = r.gw.addEndpoint(leaderCh, 4450);
+    r.connect();
+    std::vector<int> arrivedOn;
+    const std::vector<uint8_t> row{1, 2, 3, 4, 5, 6, 7, 8};
+    r.gw.templateHandlers[pc::GetViewRow::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
+        auto m = pc::GetViewRow::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        arrivedOn.push_back(ep);
+        if (ep != leader) { r.answerError(ep, pc::ErrorCode::Redirect, leaderCh, m->sessionId, m->correlationId); return; }
+        answerViewRow(r, ep, *m, pc::ViewRowResponse::kOk, row);
+    };
+    test_support::TestCq cq(r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.getViewRow(0x40000007, 101, 0, q, t); });
+    ASSERT_TRUE(f.accepted());
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }, /*stepNs=*/1'000'000));
+    ASSERT_TRUE(f.ok()) << f.describe();
+    const auto res = f.getViewRowResult();
+    EXPECT_EQ(res.status, rc::ViewRowResult::kOk);
+    EXPECT_EQ(res.rowBytes, row);
+    ASSERT_EQ(arrivedOn.size(), 2u);
+    EXPECT_NE(arrivedOn[0], leader) << "the read starts on the seed";
+    EXPECT_EQ(arrivedOn[1], leader) << "and is re-sent on the named leader's session";
+
+    // The Redirect with no data op in flight must not retarget the seed (redirectBySeed_): the
+    // next read still starts on the seed.
+    arrivedOn.clear();
+    auto g = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.getViewRow(0x40000007, 102, 0, q, t); });
+    ASSERT_TRUE(r.drive([&] { return g.ready(); }, /*stepNs=*/1'000'000));
+    ASSERT_TRUE(g.ok()) << g.describe();
+    ASSERT_FALSE(arrivedOn.empty());
+    EXPECT_NE(arrivedOn.front(), leader) << "the seed was not retargeted by a GetViewRow Redirect";
+}
+
+TEST(ClientDdlRedirectRegression, GetViewRowNotLeaderIsRetriedInsideTheBudgetThenAnswersRegression) {
+    Rig r(invokerCfg(4452, 4453));
+    r.connect();
+    int n = 0;
+    r.gw.templateHandlers[pc::GetViewRow::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
+        auto m = pc::GetViewRow::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        if (n++ < 3) { r.answerError(ep, pc::ErrorCode::NotLeader, "", m->sessionId, m->correlationId); return; }
+        answerViewRow(r, ep, *m, pc::ViewRowResponse::kAbsentKey, {});
+    };
+    test_support::TestCq cq(r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.getViewRow(0x40000007, 999, 0, q, t); });
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }, /*stepNs=*/50'000'000));
+    ASSERT_TRUE(f.failed() || f.ok());
+    EXPECT_EQ(f.getViewRowResult().status, rc::ViewRowResult::kAbsentKey) << "the real status after three NotLeader answers";
+    EXPECT_EQ(n, 4);
+}
+
+TEST(ClientDdlRedirectRegression, GetViewRowNotLeaderPastTheBudgetIsKNotLeaderNeverNotReadyRegression) {
+    rc::ClientConfig cfg = invokerCfg(4454, 4455);
+    cfg.ddlRetryBudget = std::chrono::milliseconds(400);
+    Rig r(cfg);
+    r.connect();
+    r.gw.templateHandlers[pc::GetViewRow::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
+        auto m = pc::GetViewRow::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        r.answerError(ep, pc::ErrorCode::NotLeader, "", m->sessionId, m->correlationId);
+    };
+    test_support::TestCq cq(r.client);
+    const int64_t t0 = g_now;
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.getViewRow(0x40000007, 101, 0, q, t); });
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }, /*stepNs=*/20'000'000));
+    EXPECT_EQ(f.outcome().c.status, rc::OpStatus::BrokerError);
+    EXPECT_EQ(f.getViewRowResult().status, rc::ViewRowResult::kNotLeader)
+        << "the routing failure is the client-side kNotLeader (8), not NotReady (2) / SchemaMismatch (3)";
+    EXPECT_LE(g_now - t0, int64_t{400'000'000} + int64_t{200'000'000}) << "within the budget + 200 ms";
+}

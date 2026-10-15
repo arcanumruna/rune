@@ -212,6 +212,9 @@ struct ViewRowResult {
     static constexpr uint16_t kInvalidRequest  = 5;
     static constexpr uint16_t kBusy            = 6;
     static constexpr uint16_t kRowTooLarge     = 7;   ///< the row exceeds the broker's egress frame (no bytes)
+    /// Client-side only: the view's source-partition leader was not reached within
+    /// the retry budget; never sent by a broker.
+    static constexpr uint16_t kNotLeader       = 8;
 
     uint16_t              status = kUnknownView;
     std::vector<uint8_t>  rowBytes;
@@ -1109,6 +1112,12 @@ private:
         return op == OpKind::DefineTopic || op == OpKind::AlterTopic || op == OpKind::CreateView ||
                op == OpKind::DropTopic || op == OpKind::DropView || op == OpKind::AlterView ||
                op == OpKind::AlterTopicConfig;
+    }
+    /// Task 22 fix round 1 (C1): the ops answered by a Redirect / NotLeader and so
+    /// re-sent on the named node's session within the retry budget: the DDLs and
+    /// GetViewRow (a view row is served only by its source partition's leader).
+    [[nodiscard]] static constexpr bool isRoutedCtlOp(OpKind op) noexcept {
+        return isDdlOp(op) || op == OpKind::GetViewRow;
     }
     /// A DDL that is not in flight (its frame waits for the resend pump).
     [[nodiscard]] static bool ddlWaitsForResend(const DdlRetry& r) noexcept {
