@@ -788,6 +788,14 @@ ConfigResult parseNodeConfig(
         // Absent or empty → keep the default (true, set in NodeConfig initializers).
     }
 
+    // --- RUNE_CLEANER_IO_MAX_BYTES_PER_SECOND (optional; absent/empty = -1 = unlimited) ---
+    if (const char* raw = getenv_fn("RUNE_CLEANER_IO_MAX_BYTES_PER_SECOND"); raw && *raw) {
+        int64_t v = 0;
+        if (!parseInt64Positive(raw, v))
+            return {{}, std::string("RUNE_CLEANER_IO_MAX_BYTES_PER_SECOND must be a positive integer (bytes/s), got: ") + raw};
+        cfg.cleanerIoMaxBytesPerSecond = v;
+    }
+
     // --- RUNE_PRODUCER_ID_EXPIRATION_MS (optional, >= 0) — PSM fix round 1 (I1). ---
     if (const char* raw = getenv_fn("RUNE_PRODUCER_ID_EXPIRATION_MS"); raw && *raw) {
         char* end = nullptr;

@@ -167,6 +167,7 @@ int main() {
         node.start();
     } catch (const std::exception& ex) {
         spdlog::error("rune-broker: failed to start: {}", ex.what());
+        std::cerr << "rune-broker: failed to start: " << ex.what() << "\n";
         // A storage failure found during startup (failed log recovery) exits
         // through the halt path's code (74, EX_IOERR).
         drainControlEvents(events, ctl);

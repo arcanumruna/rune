@@ -878,37 +878,35 @@ TEST(BrokerNodeTest, CoalescingEndToEndViaBrokerNode) {
 }
 
 // ===========================================================================
-// CP-10 Fix 1: ioMaxBytesPerSecond wiring — proves a set value reaches the Throttler
-//
-// One arm remains:
-//   A: no topic sets ioMaxBytesPerSecond (the only value a catalog topic can carry) → throttle rate = -1.
-//
-// The test calls BrokerNode::cleanerThrottleRateForTest() which reads the
-// LogCleanerAgent's throttler_ rate.  No Aeron needed — the cleaner agent is
-// constructed in BrokerNode::buildGateway(), which runs during start().
+// CP-10: the cleaner's I/O throttle is a BROKER setting (NodeConfig::cleanerIoMaxBytesPerSecond,
+// RUNE_CLEANER_IO_MAX_BYTES_PER_SECOND) -- Task 17 fix round 1 (R2).  Arm A: the default is unlimited and a cleaner
+// exists.  Arm B: a set value reaches the Throttler.  The cleaner is built in start().
 // ===========================================================================
 TEST(BrokerNodeTest, CP10_IoMaxBytesPerSecond_ReachesThrottler) {
-    // Arm A: no topics → default throttle rate = -1 (unlimited).
+    // Arm A: default config -> a cleaner exists and its throttle is unlimited.
     {
         TempDir tmp{"cp10_thr_a_"};
         fs::create_directories(tmp.path);
-        NodeConfig cfg = makeSingleNodeConfig(tmp.path);   // no topics: a fresh catalog is empty
-
+        NodeConfig cfg = makeSingleNodeConfig(tmp.path);
         BrokerNode node{cfg};
-        // cleanerAgent_ is created in buildGateway() during start().
-        // With no replica registry (no topics, no replication topics in single-node
-        // path), cleanerAgent_ may be null — that returns -2.  Either way,
-        // with no topics the throttle is unlimited or there is no cleaner.
-        // We check that the rate is NOT a positive value (not mistakenly wired).
-        // (The node does not need to fully elect for this structural test.)
-        EXPECT_LE(node.cleanerThrottleRateForTest(), 0)
-            << "With no throttle configured, rate must be -1 (unlimited) or -2 (no cleaner)";
-        // Note: node not started — cleanerAgent_ constructed in start(); skip start for speed.
+        node.start();
+        ASSERT_TRUE(node.awaitLeader(10s));
+        ASSERT_NE(node.cleanerThrottleRateForTest(), -2) << "a started broker must have a cleaner";
+        EXPECT_EQ(node.cleanerThrottleRateForTest(), -1);
+        node.stop();
     }
-
-    // Arm B (a topic with ioMaxBytesPerSecond = 1 MiB/s, a second with 2 MiB/s -> min wins) is GONE with
-    // NodeConfig::topics: ioMaxBytesPerSecond is not a DDL option, so no catalog topic can carry a value
-    // other than the default -1 (see the Task 17 report).
+    // Arm B: a configured value reaches the Throttler.
+    {
+        TempDir tmp{"cp10_thr_b_"};
+        fs::create_directories(tmp.path);
+        NodeConfig cfg = makeSingleNodeConfig(tmp.path);
+        cfg.cleanerIoMaxBytesPerSecond = 1 << 20;
+        BrokerNode node{cfg};
+        node.start();
+        ASSERT_TRUE(node.awaitLeader(10s));
+        EXPECT_EQ(node.cleanerThrottleRateForTest(), 1 << 20);
+        node.stop();
+    }
 }
 
 // ===========================================================================

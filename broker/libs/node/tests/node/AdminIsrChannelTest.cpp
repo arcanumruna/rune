@@ -149,10 +149,10 @@ TEST(AdminIsrChannel, SchemaRoleStillDecodesWithAnEmptyIsr) {
     OneToOneByteRing ring(1 << 12);
     AdminRoleMsg m;
     m.leader = false; m.epoch = 5; m.leaderId = 2;
-    ASSERT_TRUE(encodeAdminRole(ring, m));   // kMsgAdminRole
+    ASSERT_TRUE(encodeAdminRole(ring, m, kMsgCatalogRole));
     const auto frames = drainAll(ring);
     ASSERT_EQ(frames.size(), 1u);
-    EXPECT_EQ(frames[0].type, kMsgAdminRole);
+    EXPECT_EQ(frames[0].type, kMsgCatalogRole);
     const AdminRoleMsg d = decodeAdminRole(frames[0].bytes.data(), frames[0].bytes.size());
     EXPECT_FALSE(d.leader);
     EXPECT_EQ(d.epoch, 5);

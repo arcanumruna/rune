@@ -238,6 +238,12 @@ public:
     void coLocateViewWithSource(int32_t viewTopicId, int32_t sourceTopicId) noexcept {
         router_.mapTopicToGroupKey(viewTopicId, router_.groupKeyForTopic(sourceTopicId));
     }
+    /// Catalog history Task 17 (C1): a catalog topic's co-partition group, installed when the catalog APPLIES the
+    /// topic and BEFORE its replicas are registered (an owner never moves -- computeAssignment_ throws on a move).
+    /// Idempotent: the key is a function of the name, the group is immutable (AlterTopicConfig refuses it).
+    void mapCoPartitionGroup(int32_t topicId, std::string_view group) noexcept {
+        if (!group.empty()) router_.mapTopicToGroupKey(topicId, rune::metadata::coPartitionGroupKey(group));
+    }
     /// Catalog history Task 8 (M5): the catalog dropped the topic (a view sink
     /// among them, after its uninstall) and its replicas are retired — forget
     /// its routing group.  Control thread.

@@ -60,3 +60,27 @@ TEST(ShardRouter, DifferentIndexMayDifferButIsStable) {
     const ShardId b = r.shardForPartition(0, 1);
     EXPECT_FALSE(a == b);
 }
+
+// Catalog history Task 17 fix round 1 (C1): the group key is a pure function of the group NAME, so two brokers with
+// different boot histories (different sets / orders of groups known) agree on every worker.
+// RED mutation: make the key depend on creation order (e.g. -1 - number of distinct names seen so far): X and Y disagree.
+TEST(ShardRouterRegression, CoPartitionGroupKeyIsAPureFunctionOfTheNameRegression) {
+    using rune::metadata::coPartitionGroupKey;
+    EXPECT_EQ(coPartitionGroupKey("grp"), coPartitionGroupKey("grp"));
+    for (const char* g : {"grp", "a", "b", ""}) {
+        EXPECT_LT(coPartitionGroupKey(g), 0) << g;
+        EXPECT_GE(coPartitionGroupKey(g), -(1 << 30)) << g;
+    }
+    EXPECT_NE(coPartitionGroupKey("a"), coPartitionGroupKey("b"));
+
+    for (int32_t wc : {2, 4, 7}) {
+        ShardRouter xx(wc), y(wc);   // X: "b" then "a"; Y: the opposite order
+        xx.mapTopicToGroupKey(0, coPartitionGroupKey("b"));
+        xx.mapTopicToGroupKey(1, coPartitionGroupKey("a"));
+        y.mapTopicToGroupKey(1, coPartitionGroupKey("a"));      // "a" known first ...
+        y.mapTopicToGroupKey(0, coPartitionGroupKey("b"));      // ... then "b" (the opposite order)
+        for (int32_t t : {0, 1})
+            for (int32_t p = 0; p < 16; ++p)
+                EXPECT_EQ(xx.workerForPartition(t, p), y.workerForPartition(t, p)) << "wc " << wc << " t " << t << " p " << p;
+    }
+}

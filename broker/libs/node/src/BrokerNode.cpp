@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <optional>
 #include <set>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <random>
@@ -143,6 +144,16 @@ void applyWorkerDrivenDurability(rune::replication::PartitionReplica& replica, i
     replica.setExternalFollowerFlush(true);
     if (provision != nullptr && replica.isDiskBacked() && replica.log() != nullptr)
         replica.log()->setProvisioning(provision, thresholdPct);
+}
+
+// Catalog history Task 17 (C1): the shard router of a topic list -- grouped topics map to the key that is a PURE
+// function of their group NAME (coPartitionGroupKey), so every broker agrees however its boot set differs.
+rune::metadata::ShardRouter shardRouterFor(int32_t workerCount, std::span<const TopicSpec> topics) {
+    rune::metadata::ShardRouter r(workerCount);
+    for (const TopicSpec& ts : topics)
+        if (!ts.coPartitionGroup.empty())
+            r.mapTopicToGroupKey(ts.topicId, rune::metadata::coPartitionGroupKey(ts.coPartitionGroup));
+    return r;
 }
 
 int32_t clampI32(int64_t v) noexcept {
@@ -397,11 +408,13 @@ void BrokerNode::start() {
     // the boot replay produced (a mid-run EMFILE would fail-stop logs and halt the broker).
     {
         std::string fdErr;
-        if (!applyFdLimitAtStartup(config_, bootTopics_, fdErr)) {
+        uint64_t need = 0;
+        const bool fdOk = applyFdLimitAtStartup(config_, bootTopics_, fdErr, &need);
+        fdNeedAtBoot_ = need;                       // the budget actually applied (no second estimate)
+        if (!fdOk) {
             spdlog::error("BrokerNode[{}]: {}", config_.nodeId, fdErr);
             throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: " + fdErr);
         }
-        fdNeedAtBoot_ = estimateFdNeed(bootTopics_, static_cast<uint64_t>(config_.segmentProvisionDepth));
     }
 
     // 2. Build the TopicRegistry (after dataDir creation, before the gateway).
@@ -1169,19 +1182,7 @@ void BrokerNode::buildReplication() {
     // Only constructed when we have planes to route to.
     std::optional<rune::metadata::ShardRouter> replRouter;
     if (!perWorkerReplTransports_.empty()) {
-        const int32_t wc = static_cast<int32_t>(perWorkerReplTransports_.size());
-        std::set<std::string> groups;
-        for (const auto& ts : bootTopics_)
-            if (!ts.coPartitionGroup.empty()) groups.insert(ts.coPartitionGroup);
-        std::unordered_map<std::string, int32_t> groupKey;
-        int32_t nextGk = -1;
-        for (const auto& g : groups) groupKey[g] = nextGk--;
-        rune::metadata::ShardRouter sr(wc);
-        for (const auto& ts : bootTopics_) {
-            if (!ts.coPartitionGroup.empty())
-                sr.mapTopicToGroupKey(ts.topicId, groupKey[ts.coPartitionGroup]);
-        }
-        replRouter = std::move(sr);
+        replRouter = shardRouterFor(static_cast<int32_t>(perWorkerReplTransports_.size()), bootTopics_);
     }
 
     const int32_t topicCount = topicRegistry_->topicCount();
@@ -1392,21 +1393,8 @@ int32_t BrokerNode::createRuntimeUserReplicas(const TopicSpec& spec) {
     // plane → it would silently fail to replicate on a multi-node cluster.
     // Internal (topicId<0) always stays on legacy.  (ShardRouter build mirrors
     // buildReplication + buildWorkerPool; tech-debt: extract a shared helper.)
-    std::optional<rune::metadata::ShardRouter> rtReplRouter;
-    if (!perWorkerReplTransports_.empty()) {
-        const int32_t wc = static_cast<int32_t>(perWorkerReplTransports_.size());
-        std::set<std::string> groups;
-        for (const auto& ts : bootTopics_)
-            if (!ts.coPartitionGroup.empty()) groups.insert(ts.coPartitionGroup);
-        std::unordered_map<std::string, int32_t> groupKey;
-        int32_t nextGk = -1;
-        for (const auto& g : groups) groupKey[g] = nextGk--;
-        rune::metadata::ShardRouter sr(wc);
-        for (const auto& ts : bootTopics_)
-            if (!ts.coPartitionGroup.empty())
-                sr.mapTopicToGroupKey(ts.topicId, groupKey[ts.coPartitionGroup]);
-        rtReplRouter = std::move(sr);
-    }
+    const int32_t rtWc = static_cast<int32_t>(perWorkerReplTransports_.size());
+    const int32_t rtGk = spec.coPartitionGroup.empty() ? topicId : rune::metadata::coPartitionGroupKey(spec.coPartitionGroup);
 
     for (int32_t part = 0; part < spec.partitionCount; ++part) {
         // Skip if this partition replica already exists (idempotent re-invoke).
@@ -1463,10 +1451,10 @@ int32_t BrokerNode::createRuntimeUserReplicas(const TopicSpec& spec) {
         pcfg.durabilityTier = spec.durabilityTier;
 
         const bool onPerWorkerPlane =
-            (topicId >= 0 && !perWorkerReplTransports_.empty() && rtReplRouter);
+            (topicId >= 0 && !perWorkerReplTransports_.empty());
         PartitionTransport* transport = nullptr;
         if (onPerWorkerPlane) {
-            const int32_t workerIdx = rtReplRouter->workerForPartition(topicId, part);
+            const int32_t workerIdx = rune::metadata::workerIdForShard(rune::metadata::ShardId{rtGk, part}, rtWc);
             transport = perWorkerReplTransports_[static_cast<std::size_t>(workerIdx)].get();
         } else {
             transport = replTransport_.get();
@@ -1546,22 +1534,8 @@ int32_t BrokerNode::createRuntimeUserReplicas(const TopicSpec& spec) {
 void BrokerNode::buildWorkerPool() {
     const int32_t wc = config_.workerCount >= 1 ? config_.workerCount : 1;
 
-    // Assign a stable negative group key to each distinct non-empty
-    // coPartitionGroup, in sorted group-name order (matches StaticBalancer
-    // determinism so every node derives identical shard identities).
-    std::set<std::string> groups;
-    for (const auto& ts : bootTopics_)
-        if (!ts.coPartitionGroup.empty()) groups.insert(ts.coPartitionGroup);
-    std::unordered_map<std::string, int32_t> groupKey;
-    int32_t next = -1;
-    for (const auto& g : groups) groupKey[g] = next--;
-
-    rune::metadata::ShardRouter router(wc);
-    for (const auto& ts : bootTopics_) {
-        if (!ts.coPartitionGroup.empty())
-            router.mapTopicToGroupKey(ts.topicId, groupKey[ts.coPartitionGroup]);
-        // ungrouped topics: router uses topicId as-is (ShardRouter default).
-    }
+    // Group keys are a pure function of the group name (coPartitionGroupKey): every broker agrees.
+    rune::metadata::ShardRouter router = shardRouterFor(wc, bootTopics_);
 
     workerPool_ = std::make_unique<WorkerPool>(
         wc, std::move(router),
@@ -2777,20 +2751,9 @@ void BrokerNode::buildGateway() {
         // as a fallback default (64 MiB); per-topic roll is read from each replica's
         // segmentRollBytes() at compaction time inside LogCleanerAgent::doWork.
 
-        // CP-10 Fix 1: thread ioMaxBytesPerSecond from TopicSpec into the Throttler.
-        // The LogCleanerAgent uses a single shared Throttler across all topics; we
-        // derive the effective rate as the MINIMUM positive ioMaxBytesPerSecond across
-        // all configured topics (so the strictest topic limit governs the cleaner).
-        // If no topic sets a limit (all -1), the throttle remains unlimited (-1).
-        int64_t cleanerIoMaxBytesPerSec = -1; // -1 = unlimited (Kafka default)
-        for (const auto& ts : bootTopics_) {
-            if (ts.ioMaxBytesPerSecond > 0) {
-                if (cleanerIoMaxBytesPerSec < 0 ||
-                    ts.ioMaxBytesPerSecond < cleanerIoMaxBytesPerSec) {
-                    cleanerIoMaxBytesPerSec = ts.ioMaxBytesPerSecond;
-                }
-            }
-        }
+        // CP-10: the cleaner's ONE shared Throttler -- a broker setting (topics exist only through DDL; the throttle was
+        // never per-topic: it was the minimum over topics).
+        const int64_t cleanerIoMaxBytesPerSec = config_.cleanerIoMaxBytesPerSecond;   // -1 = unlimited
 
         cleanerAgent_ = std::make_unique<LogCleanerAgent>(
             replicaRegistry_.get(),
@@ -4437,8 +4400,13 @@ void BrokerNode::runCatalogCreate_(const TopicSpec& spec) {
             throw std::runtime_error("injected replica-build fault (test)");
         const int32_t id = topicRegistry_->createTopicAt(spec.topicId, spec);   // idempotent (same id + name)
         if (id < 0) return;                                                      // refused (logged)
-        if (const TopicSpec* built = topicRegistry_->topic(id))
+        if (const TopicSpec* built = topicRegistry_->topic(id)) {
+            // C1: install the group key BEFORE the replicas register (an owner never moves).  Catalog effects are
+            // drained by the control loop only after buildWorkerPool() in start(), so workerPool_ is set here.
+            if (workerPool_) workerPool_->mapCoPartitionGroup(id, built->coPartitionGroup);
+            else spdlog::error("BrokerNode[{}]: catalog topic '{}' (id={}) applied with no worker pool", config_.nodeId, built->name, id);
             (void)createRuntimeUserReplicas(*built);   // idempotent: skips existing replicas; addRuntimeTopic
+        }
     } catch (const std::exception& ex) {
         // The topic does not serve (produce answers NotLeader / UnknownTopic) — as
         // commitReplicaFault_ on the old path; the next boot rebuilds it.

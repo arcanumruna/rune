@@ -2,7 +2,7 @@
 // TestClusterCore.h — catalog history Task 17: the gtest-free engine behind TestCluster (TestCluster.h), also used
 // by the benchmarks.  See TestCluster.h for the contract.
 //
-// Topics exist only through DDL (spec §8: RUNE_TOPICS / NodeConfig::topics are gone).  A test starts
+// Topics exist only through DDL (spec §8: the static topic list / NodeConfig::topics are gone).  A test starts
 // its BrokerNode(s) and then defines each topic here:
 //
 //     auto node = std::make_unique<BrokerNode>(cfg);
@@ -17,7 +17,7 @@
 // After the OK the call waits until the topic serves on every node that holds a replica of it (C1
 // generalized: applied at its catalog id AND placed with its roles routed).
 //
-// Topic ids follow creation order from 0, so a test that defines its topics in its old RUNE_TOPICS
+// Topic ids follow creation order from 0, so a test that defines its topics in its old static-list
 // order keeps its ids.  A failure is `ADD_FAILURE()` + -1 — a deadline is a failure, never a hang.
 #include "ShardTestClient.h"
 
@@ -25,7 +25,7 @@
 #include <rune/node/NodeConfig.h>
 #include <rune/protocol/CatalogTypes.h>
 
-#include <atomic>
+#include <cstdio>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -70,6 +70,7 @@ public:
         const rune::protocol::TopicConfigView cfg = wireConfig_(spec);
 
         std::size_t target = 0;   // any node; a Redirect names the leader
+        int notLeaderStreak = 0;  // consecutive NotLeader answers from `target` (a stuck target is rotated away from)
         std::string last = "no attempt completed";
         while (Clock::now() < deadline) {
             const NodeConfig& nc = nodes_[target]->effectiveConfigForTest();
@@ -91,6 +92,10 @@ public:
                 if (ans->code == static_cast<int16_t>(pc::ErrorCode::NotLeader)) {
                     ++notLeaderRetries_;
                     last = "NotLeader from " + channel;
+                    if (++notLeaderStreak >= 20) {   // this node cannot name a leader: try the next one
+                        target = (target + 1) % nodes_.size();
+                        notLeaderStreak = 0;
+                    }
                     sleep_();
                     continue;
                 }
@@ -103,6 +108,7 @@ public:
                         }
                     if (!known) return fail_(ans->code, "Redirect to an endpoint that is not one of the cluster's: " + ans->message);
                     ++redirectsFollowed_;
+                    notLeaderStreak = 0;
                     last = "Redirect to " + ans->message;
                     continue;
                 }
@@ -154,14 +160,16 @@ private:
 
     void ensureClient_() {
         if (client_) return;
-        static std::atomic<int> seq{0};
+        nonce_ = (static_cast<uint64_t>(std::random_device{}()) << 16 ^ std::random_device{}()) & 0x0000'FFFF'FFFF'FFFFull;
+        char hex[32];
+        std::snprintf(hex, sizeof hex, "%llx", static_cast<unsigned long long>(nonce_));
         dir_ = std::filesystem::temp_directory_path() /
-               ("rune_tc_" + std::to_string(::getpid()) + "_" + std::to_string(seq++));
+               ("rune_tc_" + std::to_string(::getpid()) + "_" + hex + "_" +
+                std::to_string(reinterpret_cast<std::uintptr_t>(this)));
         std::filesystem::create_directories(dir_);
         client_ = std::make_unique<ShardTestClient>(dir_ / "client-aeron");
         client_->keepSessionsAlive(true);
         client_->setClientVersion(rune::protocol::client::kClientVersion);   // a pre-v8 session is refused by a follower
-        nonce_ = (static_cast<uint64_t>(std::random_device{}()) << 16 ^ std::random_device{}()) & 0x0000'FFFF'FFFF'FFFFull;
     }
 
     /// One session per gateway channel, reused by every DDL of this cluster.
@@ -189,8 +197,10 @@ private:
     static bool holdsNoReplica_(BrokerNode& n, int32_t topicId, int32_t partitions) {
         return n.onControlThreadForTest([&n, topicId, partitions] {
             const int32_t self = n.nodeIdForTest();
+            const auto* ms = n.metadataServiceForTest();
+            if (ms == nullptr) return false;   // no placement service: still not serving (awaitServes_ times out)
             for (int32_t p = 0; p < partitions; ++p) {
-                const auto* a = n.metadataServiceForTest()->assignment(topicId, p);
+                const auto* a = ms->assignment(topicId, p);
                 if (a == nullptr) return false;   // the placement has not reached this node yet
                 for (int32_t r : a->replicas)
                     if (r == self) return false;

@@ -16,6 +16,7 @@
 
 #include <cassert>
 #include <cstdint>
+#include <string_view>
 #include <unordered_map>
 
 namespace rune::metadata {
@@ -46,6 +47,17 @@ inline int32_t workerIdForShard(const ShardId& s, int32_t workerCount) noexcept 
          static_cast<uint64_t>(static_cast<uint32_t>(s.partitionIndex));
     const uint64_t h = k * UINT64_C(11400714819323198485);
     return static_cast<int32_t>((h >> 32) % static_cast<uint64_t>(workerCount));
+}
+
+/// Catalog history Task 17 (C1): a co-partition group's shard key, a PURE function of the group NAME
+/// (FNV-1a 32 over its bytes).  Every broker derives the same key for the same group regardless of which topics
+/// it booted with or the order groups were created -- so worker w on every broker owns the same shards, which the
+/// per-worker replication planes (worker w <-> peer worker w) require.  Range [-2^30, -1]: never a user topicId
+/// (>= 0).  Two names that hash alike share workers (placement only, never correctness).
+[[nodiscard]] constexpr int32_t coPartitionGroupKey(std::string_view group) noexcept {
+    uint32_t h = 2166136261u;
+    for (const char ch : group) { h ^= static_cast<uint8_t>(ch); h *= 16777619u; }
+    return -1 - static_cast<int32_t>(h & 0x3FFF'FFFFu);
 }
 
 class ShardRouter {

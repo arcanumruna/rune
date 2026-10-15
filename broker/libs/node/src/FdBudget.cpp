@@ -49,7 +49,7 @@ FdLimitDecision decideFdLimit(uint64_t soft, uint64_t hard, bool unlimited, uint
                                " + " + std::to_string(kE1dFdsPerLog) + ") + base)";
     if (hard < need) {
         d.verdict = FdLimitVerdict::Refuse;
-        d.message = values + ": the hard open-file limit is below what the configured partitions need — "
+        d.message = values + ": the hard open-file limit is below what the catalog's partitions need — "
                     "refusing to start (a roll / recovery would fail with EMFILE and halt the broker). "
                     "Raise it: systemd LimitNOFILE=1048576, docker --ulimit nofile=1048576:1048576, "
                     "or ulimit -Hn.";
@@ -64,7 +64,10 @@ FdLimitDecision decideFdLimit(uint64_t soft, uint64_t hard, bool unlimited, uint
     return d;
 }
 
-bool applyFdLimitAtStartup(const NodeConfig& cfg, std::span<const TopicSpec> topics, std::string& error) {
+bool applyFdLimitAtStartup(const NodeConfig& cfg, std::span<const TopicSpec> topics, std::string& error,
+                           uint64_t* needOut) {
+    const uint64_t need = estimateFdNeed(topics, static_cast<uint64_t>(cfg.segmentProvisionDepth));
+    if (needOut) *needOut = need;
     struct ::rlimit rl{};
     if (::getrlimit(RLIMIT_NOFILE, &rl) != 0) {
         spdlog::warn("rune-broker: getrlimit(RLIMIT_NOFILE) failed: {} — open-file budget not checked",
@@ -72,7 +75,6 @@ bool applyFdLimitAtStartup(const NodeConfig& cfg, std::span<const TopicSpec> top
         return true;
     }
     const bool unlimited = rl.rlim_max == RLIM_INFINITY;
-    const uint64_t need = estimateFdNeed(topics, static_cast<uint64_t>(cfg.segmentProvisionDepth));
     const FdLimitDecision d = decideFdLimit(static_cast<uint64_t>(rl.rlim_cur),
                                             static_cast<uint64_t>(rl.rlim_max), unlimited, need);
     if (d.verdict == FdLimitVerdict::Refuse) {

@@ -794,7 +794,7 @@ inline constexpr std::size_t kAdminRoleFixedBytes = 1 + 4 + 4 + 4 + 4;
 /// `msgType` = kMsgCatalogRole (the __catalog role; kMsgAdminRole is retired).  false = ring full (the caller keeps
 /// the role and retries) or an ISR beyond kMaxIsr (never encoded).
 inline bool encodeAdminRole(OneToOneByteRing& ring, const AdminRoleMsg& m,
-                            int32_t msgType = kMsgAdminRole) {
+                            int32_t msgType) {
     using namespace admin_wire;
     if (m.isrCount < 0 || m.isrCount > AdminRoleMsg::kMaxIsr) return false;
     // tryClaim throws beyond the ring's max message (capacity / 8); the 4 KiB

@@ -72,6 +72,8 @@ struct FdLimitDecision {
 /// Startup: getrlimit, decide, setrlimit(soft = hard), log both values.  `topics` are the topics the
 /// __catalog boot replay produced (BrokerNode::start passes bootTopics_) — topics exist only through DDL.
 /// Returns false (and sets `error`) when the broker must refuse to start.
-bool applyFdLimitAtStartup(const NodeConfig& cfg, std::span<const TopicSpec> topics, std::string& error);
+/// `needOut` (optional): the estimate this call decided on -- set before anything else, also when getrlimit fails.
+bool applyFdLimitAtStartup(const NodeConfig& cfg, std::span<const TopicSpec> topics, std::string& error,
+                           uint64_t* needOut = nullptr);
 
 } // namespace rune::node

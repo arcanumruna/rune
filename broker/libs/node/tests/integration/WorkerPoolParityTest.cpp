@@ -37,6 +37,7 @@
 #include <rune/node/BrokerNode.h>
 #include "support/TestCluster.h"
 #include <rune/node/NodeConfig.h>
+#include <rune/metadata/ShardRouter.h>
 
 // For the DynamicReassignment harness (mirrors RebalanceFailoverIntegrationTest)
 #include <rune/node/MetadataService.h>
@@ -172,17 +173,28 @@ TEST(WorkerPoolParity, MultiWorkerBrokerReachesLeaderAndServes) {
 
     NodeConfig cfg = makeSingleNodeConfig4W(tmp.path, /*workerCount=*/4);
 
-    // Topics exist only through DDL: boot once to create them in the catalog, stop, and boot again.  The worker
-    // router's co-partition groups (ShardRouter::mapTopicToGroupKey, sorted group-name keys) are built from the
-    // topics the broker BOOTS with — a co-grouped topic created at runtime gets no shared worker until the next
-    // boot (a pre-existing gap, see the Task 17 report) — so the affinity assertions below run on the second boot.
-    ASSERT_NO_FATAL_FAILURE(rune::node::test::defineTopicsThenStop(cfg, parityTopics()));
+    // Topics exist only through DDL, created at RUNTIME on this boot (Task 17 fix round 1, C1): the catalog's apply
+    // installs each topic's co-partition group key (a pure function of the group NAME) before its replicas register,
+    // so the affinity below holds on the SAME boot and again after a restart.
+    // Non-vacuity: WITHOUT the group mapping the ungrouped topics 0 and 1 land on different workers for some p.
+    {
+        bool differs = false;
+        for (int32_t p = 0; p < 4; ++p)
+            differs = differs || rune::metadata::workerIdForShard({0, p}, 4) != rune::metadata::workerIdForShard({1, p}, 4);
+        ASSERT_TRUE(differs) << "the affinity assertion would be vacuous";
+    }
 
     BrokerNode node{cfg};
     node.start();
 
     ASSERT_TRUE(node.awaitLeader(5s))
         << "multi-worker (N=4) single-node broker must reach leadership within 5s";
+    {
+        const auto specs = parityTopics();
+        rune::node::test::TestCluster cluster({&node});
+        for (std::size_t t = 0; t < specs.size(); ++t)
+            ASSERT_EQ(cluster.defineTopic(specs[t]), static_cast<int32_t>(t));
+    }
     EXPECT_TRUE(node.isLeader())
         << "node must report isLeader() after awaitLeader returns true";
 
@@ -243,7 +255,20 @@ TEST(WorkerPoolParity, MultiWorkerBrokerReachesLeaderAndServes) {
         << "At least 2 distinct worker ids must be used across all partitions; "
            "got " << allWorkerIds.size() << " (collapsed to 1 means N>1 is hollow)";
 
+    // ---- STABLE ACROSS A REBOOT ----
+    const int32_t partsOf[3] = {4, 4, 2};
+    int32_t before[3][4];
+    for (int32_t t = 0; t < 3; ++t)
+        for (int32_t p = 0; p < partsOf[t]; ++p) before[t][p] = node.workerForPartitionForTest(t, p);
     node.stop();
+
+    BrokerNode again{cfg};
+    again.start();
+    ASSERT_TRUE(again.awaitLeader(10s));
+    for (int32_t t = 0; t < 3; ++t)
+        for (int32_t p = 0; p < partsOf[t]; ++p)
+            EXPECT_EQ(again.workerForPartitionForTest(t, p), before[t][p]) << "topic " << t << " partition " << p;
+    again.stop();
 }
 
 // ===========================================================================

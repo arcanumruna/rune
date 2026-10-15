@@ -26,6 +26,8 @@
 //   RUNE_MIN_ISR                    — int32, minimum ISR size for acks=All gate. Default:
 //                                     majority = |peers|/2+1 (e.g. 2 for 3 nodes, 1 for 1 node).
 //
+//   RUNE_CLEANER_IO_MAX_BYTES_PER_SECOND — int64 > 0, the log cleaner's shared I/O throttle. Default unlimited.
+//
 // For cross-datacenter deployments set these higher (e.g. 1000/200/2000 ms).
 //
 // E5.2: Aeron media-driver threading mode (optional):
@@ -82,10 +84,6 @@ struct TopicSpec {
     //   force needCompactionNow (eligible even below minCleanableDirtyRatio).
     //   Default -1 = disabled — same as Kafka's Long.MAX_VALUE.
     int64_t       maxCompactionLagMs      = -1;
-
-    // CP-8: shared I/O throttler budget (bytes/sec across all cleaner threads).
-    //   Default -1 = unlimited — same as Kafka.
-    int64_t       ioMaxBytesPerSecond     = -1;
 
     // CP-9: retention scheduler cadence + async-delete delay.
     // retentionCheckMs: how often the cleaner runs retention (ms).
@@ -833,6 +831,10 @@ struct NodeConfig {
     // individually (prior behavior — useful for diagnostics or rollback).
     // Overridable via RUNE_ENABLE_COALESCING env var ("0" or "false" → off).
     bool enableCompactionCoalescing = true;
+
+    /// RUNE_CLEANER_IO_MAX_BYTES_PER_SECOND — the log cleaner's shared I/O throttle (bytes/s across all cleaner work;
+    /// Kafka log.cleaner.io.max.bytes.per.second). Absent/empty = -1 = unlimited.
+    int64_t cleanerIoMaxBytesPerSecond = -1;
 
     // PSM fix round 1 (I1, Kafka producer.id.expiration.ms): compaction keeps the
     // last batch METADATA of every producer active within this window (a

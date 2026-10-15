@@ -11,6 +11,7 @@
 #include <rune/node/EmbeddedDriver.h>
 #include <rune/node/NodeConfig.h>
 #include <rune/node/ThreadAffinity.h>
+#include <rune/metadata/ShardRouter.h>
 #include <rune/metadata/StaticBalancer.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/Log.h>
@@ -2327,4 +2328,98 @@ TEST(UnresolvedPeerStartupRegression, LegacyAddBrokersAreReleasedInStopRegressio
     n0.stop();
     EXPECT_EQ(n0.legacyPlaneBrokerCountForTest(), 0u)
         << "add brokers (and any undelivered publication) must be released before the client closes";
+}
+
+// Catalog history Task 17 fix round 1 (C1): co-partition group keys are a pure function of the group NAME, so brokers
+// whose boot sets differ (node 0 booted with no topic, node 2 with {b1}, node 1 with {b1, a1, b2}) still place every
+// partition on the same worker -- the per-worker replication planes (worker w <-> peer worker w) then carry it.
+// RED 1: revert buildReplication/buildWorkerPool to sorted-order numbering -> the worker maps disagree, node 1 never
+// receives its records.  RED 2: delete the mapCoPartitionGroup call in runCatalogCreate_ -> a1/b2 disagree.
+TEST(ShardModeRegression, CoPartitionedTopicsReplicateAcrossBrokersWithDifferentBootHistoriesRegression) {
+    using rune::metadata::coPartitionGroupKey;
+    using rune::metadata::workerIdForShard;
+    // Non-vacuity: grouped "b" differs from the ungrouped topic 0 for some p.
+    {
+        bool differs = false;
+        for (int32_t p = 0; p < 4; ++p)
+            differs = differs || workerIdForShard({0, p}, 4) != workerIdForShard({coPartitionGroupKey("b"), p}, 4);
+        ASSERT_TRUE(differs) << "pick other group names: the placement assertion would be vacuous";
+    }
+    TmpDir d0{"cph0"}, d1{"cph1"}, d2{"cph2"}, cdir{"cphc"};
+    const fs::path dirs[3] = {d0.path, d1.path, d2.path};
+    const auto ports = ShardPorts::discover(3, 4);
+    std::unique_ptr<BrokerNode> n[3];
+    auto boot = [&](int i) {
+        n[i] = std::make_unique<BrokerNode>(makeShardConfig(i, dirs[i], ports, 3, 4, /*fused=*/false));
+        n[i]->start();
+    };
+    auto all = [&] { return std::vector<BrokerNode*>{n[0].get(), n[1].get(), n[2].get()}; };
+    auto awaitAnyLeader = [&] {
+        return eventually([&] { return n[0]->awaitLeader(1ms) || n[1]->awaitLeader(1ms) || n[2]->awaitLeader(1ms); }, 3000);
+    };
+    auto grouped = [](const char* name, const char* group) {
+        TopicSpec t; t.name = name; t.partitionCount = 4; t.coPartitionGroup = group; t.partitionKey = "k";
+        return t;
+    };
+    auto restart = [&](int i) {
+        n[i]->stop();
+        n[i].reset();
+        boot(i);
+        ASSERT_TRUE(awaitAnyLeader());
+    };
+
+    for (int i = 0; i < 3; ++i) boot(i);
+    ASSERT_TRUE(awaitAnyLeader());
+    ASSERT_EQ(rune::node::test::TestCluster(all()).defineTopic(grouped("b1", "b")), 0);
+    ASSERT_NO_FATAL_FAILURE(restart(2));
+    {
+        rune::node::test::TestCluster c(all());
+        ASSERT_EQ(c.defineTopic(grouped("a1", "a")), 1);
+        ASSERT_EQ(c.defineTopic(grouped("b2", "b")), 2);
+    }
+    ASSERT_NO_FATAL_FAILURE(restart(1));
+    ASSERT_TRUE(eventually([&] {
+        for (int i = 0; i < 3; ++i)
+            for (int32_t t = 0; t < 3; ++t)
+                if (!n[i]->catalogTopicServesForTest(t)) return false;
+        return true;
+    }, 4000)) << "the restarted brokers never served every topic";
+
+    // (f) every node places every partition on the same worker.
+    for (int32_t t = 0; t < 3; ++t)
+        for (int32_t p = 0; p < 4; ++p) {
+            const int32_t w0 = n[0]->workerForPartitionForTest(t, p);
+            EXPECT_EQ(w0, n[1]->workerForPartitionForTest(t, p)) << "t " << t << " p " << p << " node 1";
+            EXPECT_EQ(w0, n[2]->workerForPartitionForTest(t, p)) << "t " << t << " p " << p << " node 2";
+        }
+
+    // (g) one acks=all record per (t, p), produced to its leader.
+    {
+        ShardTestClient c(cdir.path);
+        const int64_t sid0 = c.connect(gatewayChannel(ports, 0), kClientStream);
+        ASSERT_GT(sid0, 0);
+        for (int32_t t = 0; t < 3; ++t)
+            for (int32_t p = 0; p < 4; ++p) {
+                int32_t leader = -1;
+                ASSERT_TRUE(eventually([&] {
+                    for (const auto& pi : c.metadata(gatewayChannel(ports, 0), kClientStream, sid0))
+                        if (pi.topicId == t && pi.partition == p) leader = pi.leaderId;
+                    return leader >= 0;
+                }, 400)) << "no leader for t " << t << " p " << p;
+                const int64_t sid = c.connect(gatewayChannel(ports, leader), kClientStream);
+                ASSERT_GT(sid, 0);
+                const int32_t w = n[leader]->workerForPartitionForTest(t, p);
+                auto ack = c.produceUntilOk(workerIngressChannel(ports, leader, w), kClientStream, sid, t, p,
+                                            /*acks=all*/1, makeBatch(1));
+                ASSERT_TRUE(ack.has_value()) << "acks=all not committed for t " << t << " p " << p;
+            }
+    }
+
+    // (h) rf 0 = every broker holds every partition: each must reach LEO 1 everywhere.
+    for (int i = 0; i < 3; ++i)
+        for (int32_t t = 0; t < 3; ++t)
+            for (int32_t p = 0; p < 4; ++p)
+                EXPECT_TRUE(eventually([&] { return rune::node::test::leoOrMinusOne(*n[i], t, p) == 1; }, 4000))
+                    << "node " << i << " t " << t << " p " << p << " LEO " << rune::node::test::leoOrMinusOne(*n[i], t, p);
+    for (int i = 2; i >= 0; --i) n[i]->stop();
 }

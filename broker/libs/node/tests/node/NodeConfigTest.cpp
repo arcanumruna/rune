@@ -742,15 +742,6 @@ TEST(NodeConfigTest, CP10_EnableCoalescing_True_KeepsTrue) {
 }
 
 // ===========================================================================
-// CP-10 Fix 1: ioMaxBytesPerSecond — a TopicSpec field (not a DDL option), threaded to the cleaner.
-// ===========================================================================
-
-TEST(NodeConfigTest, CP10_IoMaxBytesPerSecond_DefaultMinusOne) {
-    TopicSpec ts;
-    EXPECT_EQ(ts.ioMaxBytesPerSecond, -1LL) << "ioMaxBytesPerSecond must default to -1 (unlimited)";
-}
-
-// ===========================================================================
 // E1 Task 4: NodeConfig.workerCount + RUNE_WORKERS parsing
 // ===========================================================================
 
@@ -864,6 +855,36 @@ TEST(NodeConfigRegression, IdleWakeGarbageRefusesStartupRegression) {
         auto res = rune::node::parseNodeConfig(fakeEnv(base));
         EXPECT_FALSE(res.config.has_value()) << v;
         EXPECT_NE(res.error.find("RUNE_IDLE_WAKE must be 0/1/false/true"), std::string::npos) << res.error;
+    }
+}
+
+// Catalog history Task 17 fix round 1 (R2/I1): the cleaner's I/O throttle is a broker setting.
+TEST(NodeConfigRegression, CleanerIoMaxBytesPerSecondParsesAndRefusesGarbageRegression) {
+    {
+        auto r = rune::node::parseNodeConfig(fakeEnv(base1node()));
+        ASSERT_TRUE(r.config.has_value()) << r.error;
+        EXPECT_EQ(r.config->cleanerIoMaxBytesPerSecond, -1) << "absent = unlimited";
+    }
+    {
+        auto base = base1node();
+        base["RUNE_CLEANER_IO_MAX_BYTES_PER_SECOND"] = "";
+        auto r = rune::node::parseNodeConfig(fakeEnv(base));
+        ASSERT_TRUE(r.config.has_value()) << r.error;
+        EXPECT_EQ(r.config->cleanerIoMaxBytesPerSecond, -1) << "empty = unlimited";
+    }
+    {
+        auto base = base1node();
+        base["RUNE_CLEANER_IO_MAX_BYTES_PER_SECOND"] = "1048576";
+        auto r = rune::node::parseNodeConfig(fakeEnv(base));
+        ASSERT_TRUE(r.config.has_value()) << r.error;
+        EXPECT_EQ(r.config->cleanerIoMaxBytesPerSecond, 1048576);
+    }
+    for (const char* v : {"0", "-5", "12x"}) {
+        auto base = base1node();
+        base["RUNE_CLEANER_IO_MAX_BYTES_PER_SECOND"] = v;
+        auto r = rune::node::parseNodeConfig(fakeEnv(base));
+        EXPECT_FALSE(r.config.has_value()) << v;
+        EXPECT_NE(r.error.find("RUNE_CLEANER_IO_MAX_BYTES_PER_SECOND"), std::string::npos) << r.error;
     }
 }
 

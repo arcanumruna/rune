@@ -706,7 +706,7 @@ TEST(CatalogAlterIsrRelayRegression, ARetiredSchemaRoleFrameIsRefusedNotAppliedR
     AdminRoleMsg role;
     role.leader = true;
     role.epoch  = 7;
-    ASSERT_TRUE(encodeAdminRole(rig.agent->roleRing(), role));   // kMsgAdminRole (the retired default type)
+    ASSERT_TRUE(encodeAdminRole(rig.agent->roleRing(), role, kMsgAdminRole));   // the retired type, explicit
     (void)rig.agent->doWork(1'000'000);
     EXPECT_EQ(rig.agent->badRoleFramesForTest(), 1u);
     EXPECT_NE(rig.replica->role(), rr::Role::Leader) << "the retired role must not make the catalog replica lead";
