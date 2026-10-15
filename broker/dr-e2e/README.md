@@ -37,7 +37,7 @@ dr-e2e/
 * Docker (Docker Desktop on macOS is fine — netem proven, see caveat below).
 * The broker + client images built once:
   * `rune-broker-rune-{1,2,3}` — `cd rune-broker && docker compose -f docker/docker-compose.yml build`
-  * `rune-dr-client:dev` — `cd rune-client-cpp && docker build --platform linux/amd64 --build-context rune-protocol=../rune-protocol -f docker/Dockerfile.dr -t rune-dr-client:dev .`
+  * `rune-dr-client:<client sha>` — built by the harness itself on every `Cluster.up()` (`harness.driver.ensure_dr_client_image`: `docker build -f docker/Dockerfile.dr` with the five build contexts rune-protocol, rune-fr, rune-codec, rune-ql, rune-crypto; a cache hit when nothing changed). A prebuilt `DR_CLIENT_IMAGE` must carry a matching `rune.client.sha` label (`--build-arg RUNE_CLIENT_SHA=<client HEAD>`) or the harness refuses it; `DR_ALLOW_STALE_CLIENT_IMAGE=1` accepts a mismatch explicitly.
   * `rune-netem:dev` — built automatically on first network-fault use.
 
 ## Run
@@ -93,7 +93,7 @@ matrices stay small and large ones are one edit away.
 ## Multi-client driver
 
 `harness/driver.run_clients(n, network=..., target_service=..., **cfg)` launches
-`n` `rune-dr-client:dev` containers concurrently and parses their output into a
+`n` `rune-dr-client` containers concurrently and parses their output into a
 `Results` object. cfg knobs: `mode` (produce/subscribe/produce_subscribe),
 `records`, `keys`, `rate_hz`, `from` (earliest/latest/offset:N), `slow_subscriber_ms`,
 `expect`, `cid_base`, `timeout_ms`, `subscribe_ms`.

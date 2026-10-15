@@ -14,7 +14,7 @@ Upgrade brokers before clients.
 
 | Old name                          | New name                            | Old name still works? |
 |-----------------------------------|-------------------------------------|-----------------------|
-| `persistence=memory` (boot topic option, since removed) | `persistence=transient` | Yes, one warning per entry |
+| `persistence=memory` (boot topic option, since removed) | `persistence=transient` | Yes at the time; the boot option has since been removed |
 | `RUNE_MEMORY_LOG_RING_BYTES`      | `RUNE_TRANSIENT_LOG_RING_BYTES`     | Yes, one warning      |
 
 `RUNE_TRANSIENT_LOG_RING_BYTES` must be a power of two. The default is 8 MiB.

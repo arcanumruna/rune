@@ -24,7 +24,7 @@ It is generated from the actual test source files and is accurate to the code.
 - **Docker Desktop** (macOS) or Docker Engine (Linux). netem is proven on Docker Desktop's LinuxKit VM; iptables-in-netns is unreliable there (Linux CI only).
 - **Images built once before running:**
   - Broker images: `cd rune-broker && docker compose -f docker/docker-compose.yml build`
-  - Client image: `rune-dr-client:dev` — built in the `rune-client-cpp` repo
+  - Client image: `rune-dr-client:<client sha>` — the harness builds it itself (five build contexts); `DR_CLIENT_IMAGE` must carry a matching `rune.client.sha` label
   - Netem sidecar (`rune-netem:dev`): built automatically on first network-fault test
 
 ### Install and run

@@ -1,9 +1,7 @@
-# The ONLY files that may mention RUNE_TOPICS (catalog history F5), each with its exact
-# maximum number of mentions.  Anything else — or more mentions — fails
+# The ONLY files that may mention RUNE_TOPICS (catalog history F5), each with its EXACT
+# number of mentions (more or fewer fails).  Anything else — or more mentions — fails
 # NoRuneTopicsGateRegression.RepositoryHasNoRuneTopicsMention.
-# <path>                                   <max>  # why
+# <path>                                   <exact>  # why
 libs/node/src/NodeConfig.cpp               2      # the presence refusal (Task 17): the lookup + its message
 libs/node/tests/node/NodeConfigTest.cpp    3      # NodeConfigRegression.RuneTopicsIsRefusedWithAPointerToDdl (+ ...EmptyString...): the variable set to a value / "" and named in the error
 docs/release-notes/catalog-history.md      2      # the release note that names the removal (Task 25)
-dr-e2e/harness/driver.py                   1      # CLIENT_TOPICS_ENV: the dr_client image's OWN topic-table env var (rune-client-cpp examples/dr_client.cpp), not a broker setting
-bench/kafka-compare/env.sh                 1      # RUNE_CLIENT_TOPICS_ENV: the rune_produce/consume_throughput clients' OWN topic-table env var, not a broker setting

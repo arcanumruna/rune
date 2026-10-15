@@ -1,7 +1,7 @@
 """Multi-client driver: launch N rune-dr-client containers + parse their output.
 
 The dr_client binary (rune-client-cpp/examples/dr_client.cpp, image
-`rune-dr-client:dev`) is fully env-driven and emits machine-parseable lines:
+`rune-dr-client:<client sha>`, built by `ensure_dr_client_image`) is fully env-driven and emits machine-parseable lines:
 
     PRODUCED  cid=<c> key=<k> seq=<s> part=<p> offset=<o>
     DELIVERED cid=<c> key=<k> seq=<s> part=<p> offset=<o>
@@ -33,11 +33,50 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 
-from .dockerutil import run
+from .dockerutil import _git_sha, run
 
-# Client image tag is overridable so each work-context uses a UNIQUE tag (never a
-# generic :dev/:latest that silently overwrites a baseline).  Set DR_CLIENT_IMAGE.
-DR_IMAGE = os.environ.get("DR_CLIENT_IMAGE", "rune-dr-client:dev")
+# The dr client image is tied to the rune-client-cpp checkout: `rune-dr-client:<client HEAD sha>`, built by
+# `ensure_dr_client_image()` (called from `Cluster.up()`).  DR_CLIENT_IMAGE names a prebuilt image instead; it must
+# carry a matching `rune.client.sha` label (Dockerfile.dr) or the harness refuses it - a stale image once ran
+# against a current broker and failed every produce with SchemaValidationFailed (24).
+_BROKER_REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+CLIENT_REPO = os.environ.get("DR_CLIENT_REPO", os.path.join(os.path.dirname(_BROKER_REPO), "rune-client-cpp"))
+_CLIENT_SHA = _git_sha(CLIENT_REPO)
+DR_IMAGE = os.environ.get("DR_CLIENT_IMAGE", f"rune-dr-client:{_CLIENT_SHA}")
+_DR_BUILD_CONTEXTS = ("rune-protocol", "rune-fr", "rune-codec", "rune-ql", "rune-crypto")
+
+
+def ensure_dr_client_image() -> None:
+    """Make sure DR_IMAGE was built from the current client checkout, or raise.
+
+    DR_CLIENT_IMAGE set: the image must exist and carry `rune.client.sha == client HEAD`
+    (DR_ALLOW_STALE_CLIENT_IMAGE=1 explicitly accepts a mismatch).  Unset: build it (five sibling build
+    contexts; a layer-cache hit when nothing changed); a failed build raises.
+    """
+    if os.environ.get("DR_CLIENT_IMAGE"):
+        label = run(["docker", "image", "inspect", "-f", '{{ index .Config.Labels "rune.client.sha" }}', DR_IMAGE],
+                    timeout=30)
+        if label.returncode != 0:
+            raise RuntimeError(f"DR_CLIENT_IMAGE {DR_IMAGE} does not exist")
+        built_from = label.stdout.strip()
+        if built_from != _CLIENT_SHA:
+            if os.environ.get("DR_ALLOW_STALE_CLIENT_IMAGE") != "1":
+                raise RuntimeError(
+                    f"stale dr client image {DR_IMAGE}: built from {built_from or 'unknown'}, "
+                    f"client HEAD is {_CLIENT_SHA}; unset DR_CLIENT_IMAGE (the harness builds it) "
+                    f"or set DR_ALLOW_STALE_CLIENT_IMAGE=1 explicitly")
+            print(f"[dr-e2e] WARNING: DR_ALLOW_STALE_CLIENT_IMAGE=1 - using {DR_IMAGE} built from "
+                  f"{built_from or 'unknown'}, client HEAD is {_CLIENT_SHA}")
+        return
+    sib = os.path.dirname(CLIENT_REPO)
+    ctx: list[str] = []
+    for d in _DR_BUILD_CONTEXTS:
+        ctx += ["--build-context", f"{d}={os.path.join(sib, d)}"]
+    run(["docker", "build", "--platform", "linux/amd64", "-f", os.path.join(CLIENT_REPO, "docker", "Dockerfile.dr"),
+         *ctx, "--build-arg", f"RUNE_CLIENT_SHA={_CLIENT_SHA}", "-t", DR_IMAGE, CLIENT_REPO],
+        timeout=3600, check=True)
+
+
 # The client image's platform: unset = the image's own (native arm64 on Apple Silicon, amd64 on the bench box);
 # DR_CLIENT_PLATFORM=linux/amd64 forces emulation for an amd64-only image.
 _PLATFORM_ARGS = (["--platform", os.environ["DR_CLIENT_PLATFORM"]] if os.environ.get("DR_CLIENT_PLATFORM") else [])
@@ -45,7 +84,7 @@ _PLATFORM_ARGS = (["--platform", os.environ["DR_CLIENT_PLATFORM"]] if os.environ
 # The env var of the dr_client IMAGE (rune-client-cpp/examples/dr_client.cpp) that carries ITS topic table
 # "name:topicId:partitions,...".  That is the client's own setting - the brokers take no topic list; their
 # topics are created by DDL (Cluster.create_topics).  The one spelling lives here, for every harness caller.
-CLIENT_TOPICS_ENV = "RUNE_TOPICS"
+CLIENT_TOPICS_ENV = "RUNE_CLIENT_TOPIC_TABLE"
 
 _PRODUCED_RE = re.compile(r"PRODUCED cid=(-?\d+) key=(-?\d+) seq=(-?\d+) part=(-?\d+) offset=(-?\d+)")
 _DELIVERED_RE = re.compile(r"DELIVERED cid=(-?\d+) key=(-?\d+) seq=(-?\d+) part=(-?\d+) offset=(-?\d+)")

@@ -24,7 +24,7 @@ Spec: `../../docs/superpowers/specs/2026-09-26-rune-vs-kafka-benchmark-design.md
 | D2 | `tier=strict` (fdatasync), acks=all | acks=all, flush.messages=1 |
 
 `tier` is a `with (...)` setting of `topic` DDL. The harness creates the bench topic with the rune CLI
-(`$RUNE_CLI`, default `../rune-client-cpp/build/rune`) right after the broker/cluster is up
+(`$RUNE_CLI`, default `rune` next to `$RUNE_PROD_BIN`) right after the broker/cluster is up
 (`rune_create_topics` in `lib.sh`), e.g. `rune ql -e "topic bench partitions 8 with (tier = leader);" --broker 127.0.0.1:40200`.
 
 ## Prototype (build-agent-01)

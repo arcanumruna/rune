@@ -78,11 +78,20 @@ rune_create_topics() {
 # --------------------------------------------------------------------------
 # Rune broker lifecycle
 # --------------------------------------------------------------------------
+# The throughput clients read their topic table from RUNE_CLIENT_TOPIC_TABLE (renamed from the broker-era
+# variable); a binary built before the rename would silently run on its default table.
+rune_check_client_bins() {
+  local b; for b in "$RUNE_PROD_BIN" "$RUNE_CONS_BIN"; do
+    grep -qa RUNE_CLIENT_TOPIC_TABLE "$b" || { log "client binary $b predates RUNE_CLIENT_TOPIC_TABLE: rebuild rune-client-cpp"; return 1; }
+  done
+}
+
 # rune_start_broker <workers> <topics_spec> [io_backend] [persistence]
 #   topics_spec e.g. "bench:8:tier=strict"; persistence nvme|tmpfs selects the
 #   LOG storage root (aeron IPC always lives on tmpfs scratch).
 RUNE_BPID=""
 rune_start_broker() {
+  rune_check_client_bins || return 1
   local workers="$1" topics="$2" io="${3:-uring}" persistence="${4:-nvme}"
   local logdir; logdir="$(data_root "$persistence" rune-log)"
   local d="$WORK/rune"; rm -rf "$d" "$logdir"; mkdir -p "$d/a" "$logdir"

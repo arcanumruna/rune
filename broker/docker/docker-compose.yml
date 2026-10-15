@@ -152,12 +152,17 @@ services:
   # open a UDP publication back to "probe:40300".
   probe:
     profiles: ["tools"]
+    image: rune-broker-probe:${RUNE_IMAGE_TAG:-latest}
     build:
       context: ..
       dockerfile: docker/Dockerfile.probe
       additional_contexts:
         # relative to this compose file's dir (docker/), so ../../rune-protocol = the sibling repo
         rune-protocol: ${RUNE_PROTOCOL_DIR:-../../rune-protocol}
+        # the same sibling set as x-broker-build: the root CMakeLists builds these libraries unconditionally
+        rune-fr: ../../rune-fr
+        rune-codec: ../../rune-codec
+        rune-crypto: ../../rune-crypto
     platform: linux/amd64
     hostname: probe
     shm_size: "256m"

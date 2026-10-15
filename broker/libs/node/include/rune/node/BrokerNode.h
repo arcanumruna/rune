@@ -1034,6 +1034,7 @@ private:
 // scope on purpose: GCC cannot default-construct a class nested in BrokerNode that has default member
 // initializers while BrokerNode is still incomplete, which made `DroppedTopic`'s default constructor
 // (a std::variant of the two) ill-formed and the docker (gcc 13) build fail.
+namespace drop_step {   // nested: the generic state names stay out of rune::node
 struct AwaitingRetire {                              // step 2: holders still ack the removal
     uint64_t                                 retireGen = 0;
     std::vector<rune::storage::InMemoryLog*> memLogs;   // transient rings, freed with the replicas
@@ -1043,8 +1044,9 @@ struct AwaitingRename {                              // step 2: logs closed; the
     int64_t  backoffNs = 0;
     uint64_t failures  = 0;
 };
+}  // namespace drop_step
 // Regression pin (docker gcc 13 build): the drop sequence's variant of these two must stay default-constructible.
-static_assert(std::is_default_constructible_v<std::variant<AwaitingRetire, AwaitingRename>>,
+static_assert(std::is_default_constructible_v<std::variant<drop_step::AwaitingRetire, drop_step::AwaitingRename>>,
               "BrokerNode::DroppedTopic default-constructs its step; keep the states at namespace scope");
 
 // ---------------------------------------------------------------------------
@@ -2026,7 +2028,7 @@ private:
         int32_t                                      id = -1;
         std::string                                  name;
         bool                                         diskBacked = true;
-        std::variant<AwaitingRetire, AwaitingRename> step;
+        std::variant<drop_step::AwaitingRetire, drop_step::AwaitingRename> step;
     };
     std::vector<DroppedTopic>                             droppedAwaitingRetire_;
     struct PendingCreateBehindDrop { TopicSpec spec; };

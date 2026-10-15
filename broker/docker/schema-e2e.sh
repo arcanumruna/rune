@@ -15,7 +15,7 @@
 #
 # Usage:  bash docker/schema-e2e.sh
 # Run from the rune-broker repo root.  Requires the sibling repos:
-#   ../../rune-protocol-0b, ../../rune-codec, ../../rune-fr, ../rune-client-cpp-0b
+#   ../rune-protocol, ../rune-codec, ../rune-fr, ../rune-ql, ../rune-crypto, ../rune-client-cpp
 #
 # Constraints (engineering philosophy #11/#16):
 #   - Real client↔broker over real Aeron (NOT in-process).
@@ -26,7 +26,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BROKER_REPO="$(cd "${SCRIPT_DIR}/.." && pwd)"
-CLIENT_REPO="$(cd "${BROKER_REPO}/../rune-client-cpp-0b" && pwd)"
+PROJECTS="$(cd "${BROKER_REPO}/.." && pwd)"
+CLIENT_REPO="${CLIENT_REPO:-${PROJECTS}/rune-client-cpp}"
 
 COMPOSE_FILE="${BROKER_REPO}/docker/docker-compose.single.yml"
 PROBE_DOCKERFILE="${CLIENT_REPO}/docker/Dockerfile.schema-probe"
@@ -51,10 +52,11 @@ fail() { echo "[schema-e2e] FAIL: $*" >&2; exit 1; }
 # Sibling repos live next to the broker repo (../<repo>).  NB: the compose
 # additional_contexts use ../../<repo> because they resolve relative to the
 # compose file's dir (docker/), not the repo root.
-[ -d "${BROKER_REPO}/../rune-protocol-0b" ] || fail "missing ../rune-protocol-0b"
-[ -d "${BROKER_REPO}/../rune-codec" ]       || fail "missing ../rune-codec"
-[ -d "${BROKER_REPO}/../rune-fr" ]          || fail "missing ../rune-fr"
-[ -f "${PROBE_DOCKERFILE}" ]                || fail "missing ${PROBE_DOCKERFILE}"
+for d in rune-protocol rune-codec rune-fr rune-ql rune-crypto; do
+    [ -d "${PROJECTS}/${d}" ] || fail "missing ../${d}"
+done
+[ -d "${CLIENT_REPO}" ]      || fail "missing ${CLIENT_REPO}"
+[ -f "${PROBE_DOCKERFILE}" ] || fail "missing ${PROBE_DOCKERFILE}"
 
 # ---------------------------------------------------------------------------
 # Teardown — always runs.
@@ -70,19 +72,29 @@ trap teardown EXIT
 # Step 1: Build broker image (0b protocol + rune-codec) + probe image.
 # ---------------------------------------------------------------------------
 log "Step 1a: Building single-node broker image (tag=${RUNE_IMAGE_TAG})..."
-docker compose -f "${COMPOSE_FILE}" build 2>&1 \
-    | grep -E "^( Image|ERROR|#[0-9]+ (DONE|ERROR))" || true
+# A failed build must never fall through to a stale image.
+set +e
+out=$(docker compose -f "${COMPOSE_FILE}" build 2>&1); rc=$?
+set -e
+echo "${out}" | grep -E "^( Image|ERROR|#[0-9]+ (DONE|ERROR))" || true
+[ "${rc}" -eq 0 ] || { echo "${out}" | tail -60 >&2; fail "broker image build failed (exit ${rc})"; }
+docker image inspect "rune-broker-node:${RUNE_IMAGE_TAG}" >/dev/null 2>&1 || fail "broker image not built: rune-broker-node:${RUNE_IMAGE_TAG}"
 
 log "Step 1b: Building probe image (${PROBE_IMAGE})..."
-docker build \
+set +e
+out=$(docker build \
     --platform linux/amd64 \
     -f "${PROBE_DOCKERFILE}" \
-    --build-context rune-protocol="${CLIENT_REPO}/../rune-protocol-0b" \
-    --build-context rune-codec="${CLIENT_REPO}/../rune-codec" \
-    --build-context rune-fr="${CLIENT_REPO}/../rune-fr" \
+    --build-context rune-protocol="${PROJECTS}/rune-protocol" \
+    --build-context rune-codec="${PROJECTS}/rune-codec" \
+    --build-context rune-fr="${PROJECTS}/rune-fr" \
+    --build-context rune-ql="${PROJECTS}/rune-ql" \
+    --build-context rune-crypto="${PROJECTS}/rune-crypto" \
     -t "${PROBE_IMAGE}" \
-    "${CLIENT_REPO}" 2>&1 \
-    | grep -E "^( Image|ERROR|#[0-9]+ (DONE|ERROR))" || true
+    "${CLIENT_REPO}" 2>&1); rc=$?
+set -e
+echo "${out}" | grep -E "^( Image|ERROR|#[0-9]+ (DONE|ERROR))" || true
+[ "${rc}" -eq 0 ] || { echo "${out}" | tail -60 >&2; fail "probe image build failed (exit ${rc})"; }
 docker image inspect "${PROBE_IMAGE}" >/dev/null 2>&1 || fail "probe image not built: ${PROBE_IMAGE}"
 log "Build complete."
 

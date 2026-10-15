@@ -4440,7 +4440,7 @@ void BrokerNode::dropRuntimeTopic_(int32_t topicId, const std::string& name) {
         const auto m = rune::gateway::readTopicIdMarker(fs::path(config_.dataDir) / "topics" / name);
         if (m.kind == rune::gateway::TopicIdMarker::Kind::Valid && m.id == topicId) {
             DroppedTopic d;
-            d.id = topicId; d.name = name; d.diskBacked = true; d.step = AwaitingRename{};
+            d.id = topicId; d.name = name; d.diskBacked = true; d.step = drop_step::AwaitingRename{};
             droppedAwaitingRetire_.push_back(std::move(d));
         }
         return;
@@ -4463,7 +4463,7 @@ void BrokerNode::dropRuntimeTopic_(int32_t topicId, const std::string& name) {
         gateway_->forgetDroppedTopic(topicId, partitions, logs);
     }
     if (groupCoordService_) (void)groupCoordService_->onTopicDropped(d.name, nowNs);   // groups rebalance it away
-    AwaitingRetire retire;
+    drop_step::AwaitingRetire retire;
     for (int32_t part = 0; part < partitions; ++part) {
         rune::replication::PartitionReplica* r = replicaRegistry_ ? replicaRegistry_->lookup(topicId, part) : nullptr;
         if (r == nullptr) continue;
@@ -4498,18 +4498,18 @@ int BrokerNode::serviceDroppedTopics_() {
     bool renamed = false;
     for (std::size_t i = 0; i < droppedAwaitingRetire_.size();) {
         DroppedTopic& d = droppedAwaitingRetire_[i];
-        if (auto* w = std::get_if<AwaitingRetire>(&d.step)) {
+        if (auto* w = std::get_if<drop_step::AwaitingRetire>(&d.step)) {
             if (w->retireGen > safeGen) { ++i; continue; }   // a holder may still reference its Logs
             if (topicRegistry_) (void)topicRegistry_->releaseDroppedLogs(d.id);
             for (auto* ml : w->memLogs)
                 std::erase_if(memoryLogs_, [ml](const std::unique_ptr<rune::storage::InMemoryLog>& l) {
                     return l.get() == ml;
                 });
-            d.step = AwaitingRename{};
+            d.step = drop_step::AwaitingRename{};
             ++work;
         }
         // AwaitingRename: move the data away atomically, then hand it to the admin purge.
-        auto& rn = std::get<AwaitingRename>(d.step);
+        auto& rn = std::get<drop_step::AwaitingRename>(d.step);
         if (nowNs < rn.retryAtNs) { ++i; continue; }   // M2: a failed rename backs off
         const fs::path from = fs::path(config_.dataDir) / "topics" / d.name;
         std::error_code ec;

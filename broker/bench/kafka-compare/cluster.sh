@@ -56,6 +56,7 @@ _rune_node_aeron() { echo "$WORK/rune-c$1/a"; }
 # sizing / io / worker knob ONLY when the caller set it (env or a non-empty arg):
 # an unset knob means "the broker default".  workers="" / io="" = default.
 rune_start_cluster() {
+  rune_check_client_bins || return 1
   local workers="$1" topics="$2" io="${3-}" persistence="${4:-nvme}"
   CLUSTER_PERSISTENCE="$persistence"
   local peers; peers="$(rune_cluster_peers)"

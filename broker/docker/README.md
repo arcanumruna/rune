@@ -25,15 +25,20 @@ keeping the runtime image slim.
 docker build \
   --platform linux/amd64 \
   --build-context rune-protocol=../rune-protocol \
+  --build-context rune-fr=../rune-fr \
+  --build-context rune-codec=../rune-codec \
+  --build-context rune-crypto=../rune-crypto \
   -f docker/Dockerfile \
   -t rune-broker:dev \
   .
 ```
 
-Run from the `rune-broker` repo root. The `--build-context rune-protocol=...`
-supplies the header-only sibling repo (`libs/storage` includes
-`<rune/protocol/RecordBatch.h>`); it is consumed via sibling-include in Phase 1
-and will become a conan `requires` once CI publishes `rune-protocol`.
+Run from the `rune-broker` repo root. The four `--build-context` entries supply the
+sibling repos the root `CMakeLists.txt` compiles unconditionally: `rune-protocol`
+(headers + `src/net`), `rune-fr`, `rune-codec` (incl. the catalog library) and
+`rune-crypto`. `docker compose` passes the same four contexts for the broker
+image and for the `probe` image (`docker/Dockerfile.probe`), so prefer
+`docker compose -f docker/docker-compose.yml build`.
 
 No credentials or private remote required: all dependencies (aeron, spdlog)
 come from public ConanCenter. `--build=missing` builds any dep lacking a

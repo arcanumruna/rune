@@ -21,13 +21,14 @@ Proves two things that are ALREADY proven by unit+integration (MD1-1..12):
    leader's partition to recover (which would be a Phase-2 feature).
 
 Phase-1 boundary contract (documented here for clarity):
-  * StaticBalancer: for ``multi:3`` on nodes 0,1,2 with stripe offset 1 (events:1
-    precedes multi in creation order) → partition p → node (p+1)%3.
-      partition 0 → node 1 (rune-2), partition 1 → node 2 (rune-3),
-      partition 2 → node 0 (rune-1).
-  * If node 0 (Raft-follower, partition-2 leader) is killed:
-      - partition 2 is UNAVAILABLE until Phase-2 re-election.
-      - partitions 0+1 (led by nodes 1+2) KEEP SERVING.
+  * Placement: the catalog places each created topic as its own unit
+    (MetadataService::placeUnit_ -> StaticBalancer::assign(unit, placementNodes());
+    the stripe starts at 0 for every topic), so for ``multi:3`` on nodes 0,1,2
+    partition p -> node p: 0 -> rune-1, 1 -> rune-2, 2 -> rune-3.  The tests CHECK this
+    against the leaders' becomeLeader log lines (``_assert_placement``) before they rely on it.
+  * If node 0 (Raft-follower, partition-0 leader) is killed:
+      - partition 0's leader is re-elected on a survivor (Milestone D failover).
+      - partitions 1+2 (led by nodes 1+2) KEEP SERVING.
   * No split-brain: only ONE Raft consensus leader at any time
     (assert_single_leader, counter-based per DR-HARNESS convention).
 
@@ -106,40 +107,40 @@ _STAGGER_MS   = 400
 _SUBSCRIBE_MS = 60_000
 
 # ---------------------------------------------------------------------------
-# StaticBalancer determinism — stripe offset correction for the ``multi`` topic.
+# Placement - per-topic, from stripe 0.
 #
 # The cluster's topics are created by DDL in this order: events:1, multi:3, cg:4.
-# StaticBalancer assigns partitions in topic-declaration order using a global
-# leader counter (stripe).  Each topic advances the stripe by its partitionCount:
+# The catalog places each created topic as its own unit
+# (MetadataService::placeUnit_ -> StaticBalancer::assign(unit, placementNodes());
+# the stripe offset starts at 0 for EVERY topic - StaticBalancer.cpp globalLeaderOffset),
+# so earlier topics do not shift later ones:
 #
-#   events (1 partition):  stripe_offset=0 → events:0 → node 0
-#   multi  (3 partitions): stripe_offset=1 → multi:p  → node (1+p) % 3
-#   cg     (4 partitions): stripe_offset=4 → ...
+#    multi:0 -> node 0 (rune-1)
+#    multi:1 -> node 1 (rune-2)
+#    multi:2 -> node 2 (rune-3)
 #
-# So for multi:3 on nodes [0,1,2]:
-#    partition 0 → node 1 (rune-2)   [(1+0)%3 = 1]
-#    partition 1 → node 2 (rune-3)   [(1+1)%3 = 2]
-#    partition 2 → node 0 (rune-1)   [(1+2)%3 = 0]
+# Inverse: node n leads partition n.
 #
-# Inverse: node n leads partition (n - 1 + 3) % 3.
-#
-# This is the actual StaticBalancer output (verified by MD1-5 unit tests).
+# This constant is NOT trusted: `_assert_placement` compares it with the leaders the
+# brokers actually log (becomeLeader), and the tests fail on a mismatch.
 # ---------------------------------------------------------------------------
 
-# Stripe offset for the ``multi`` topic = sum of partitionCounts of all topics
-# created before it = events (1 partition) = 1.
-_MULTI_STRIPE_OFFSET = 1   # events:1 is created before multi
+_MULTI_STRIPE_OFFSET = 0   # the catalog starts every topic's stripe at node 0
+_MULTI_TOPIC_ID = 1        # events=0, multi=1, cg=2 (creation order; checked by Cluster.create_topics)
+
+# Each partition's leader logs (info level) when it becomes leader:
+#   "PartitionReplica[node=<n>] becomeLeader topic=<topicId> part=<p> epoch=<e> ..."
+# (The gateways' per-partition redirect debug lines are NOT usable: the client routes straight to each
+# partition's leader from its metadata, so a healthy run produces no redirects at all.)
+_LEADER_RE = re.compile(
+    r"PartitionReplica\[node=(\d+)\] becomeLeader topic=" + str(_MULTI_TOPIC_ID) + r" part=(\d+) epoch=\d+")
 
 
 def _expected_partition_leader(partition: int) -> int:
     """Return the node ID expected to lead ``partition`` of the ``multi`` topic.
 
-    StaticBalancer with stripe offset ``_MULTI_STRIPE_OFFSET``:
-        multi:p → node (_MULTI_STRIPE_OFFSET + p) % N  where N=3.
-    For the current topic config (events:1 before multi:3):
-       partition 0 → node 1 (rune-2)
-       partition 1 → node 2 (rune-3)
-       partition 2 → node 0 (rune-1)
+    multi:p -> node (_MULTI_STRIPE_OFFSET + p) % N  where N=3, i.e. p -> p
+    (partition 0 -> rune-1, 1 -> rune-2, 2 -> rune-3).
     """
     n = len(SERVICES)
     return (_MULTI_STRIPE_OFFSET + partition) % n
@@ -149,7 +150,7 @@ def _partition_led_by_node(node_id: int) -> int:
     """Return the ``multi`` partition led by ``node_id``.
 
     Inverse of _expected_partition_leader:
-        node n → partition (n - _MULTI_STRIPE_OFFSET + N) % N.
+        node n -> partition (n - _MULTI_STRIPE_OFFSET + N) % N  (= n).
     """
     n = len(SERVICES)
     return (node_id - _MULTI_STRIPE_OFFSET + n) % n
@@ -157,6 +158,29 @@ def _partition_led_by_node(node_id: int) -> int:
 
 def _service_of_partition_leader(partition: int) -> str:
     return node_id_to_service(_expected_partition_leader(partition))
+
+
+def _observed_multi_leaders(cluster: Cluster) -> dict[int, set[int]]:
+    """{partition -> leader node ids} as the leaders themselves logged them (becomeLeader)."""
+    logs = cluster.compose.logs(*SERVICES, timeout=60)
+    out: dict[int, set[int]] = {}
+    for m in _LEADER_RE.finditer(logs):
+        out.setdefault(int(m.group(2)), set()).add(int(m.group(1)))
+    return out
+
+
+def _assert_placement(cluster: Cluster) -> None:
+    """The placement the tests rely on, checked against what the brokers actually decided.
+
+    Every one of the topic's partitions must have a logged leader, and it must be exactly
+    `_expected_partition_leader` (called before any kill, so only initial-epoch leaders exist).
+    """
+    obs = _observed_multi_leaders(cluster)
+    assert set(obs) == set(range(_MULTI_PARTITIONS)), (
+        f"expected becomeLeader lines for all {_MULTI_PARTITIONS} multi partitions, got {obs}")
+    for p, leaders in obs.items():
+        assert leaders == {_expected_partition_leader(p)}, (
+            f"multi:{p} led by {leaders}, expected {_expected_partition_leader(p)}")
 
 
 # ---------------------------------------------------------------------------
@@ -430,6 +454,7 @@ def test_md1_smoke_distributed_leadership(md1_cluster: Cluster) -> None:
     # Step 3: All 3 partitions must appear in the produced output.
     # This is the primary evidence of distributed partition leadership.
     _assert_all_partitions_produced(produce_res)
+    _assert_placement(cluster)
 
     # Step 4: Subscribe and verify round-trip.
     cid_sub = _next_cid_base()
@@ -481,8 +506,8 @@ def test_md1_availability_partition_failover(md1_cluster: Cluster) -> None:
       1. Pre-kill produce: 30 records across all 3 partitions (acks=all).
       2. Identify the current Raft consensus leader.
       3. Kill one NON-Raft-leader node.  In Phase-1, each node is the partition
-         leader for one partition of ``multi:3`` (StaticBalancer: partition p →
-         node (p+1)%3 with stripe offset 1 from events:1 topic).  Killing a
+         leader for one partition of ``multi:3`` (the catalog places each topic from
+         stripe 0: partition p -> node p, verified by _assert_placement).  Killing a
          Raft-follower node kills the partition leader for one partition without
          disrupting Raft consensus.
       4. Wait for the surviving 2-node Raft quorum to stabilise.
@@ -516,6 +541,8 @@ def test_md1_availability_partition_failover(md1_cluster: Cluster) -> None:
         f"pre-kill: produced {len(pre_res.all_produced)} != 30"
     )
     _assert_all_partitions_produced(pre_res)
+    # The placement the kill below relies on, checked BEFORE the kill (only initial-epoch logs exist).
+    _assert_placement(cluster)
 
     # Step 2: Identify Raft consensus leader.
     raft_leader_id, raft_leader_svc = cluster.identify_leader()
@@ -529,7 +556,7 @@ def test_md1_availability_partition_failover(md1_cluster: Cluster) -> None:
     #   a) Keep the Raft consensus on the surviving 2 nodes uninterrupted.
     #   b) Kill the partition leader for the partition assigned to that node.
     #
-    # StaticBalancer: partition p → node (p+1)%3 (stripe offset = 1 for events:1).
+    # Placement: partition p -> node p (stripe 0 per topic; checked by _assert_placement).
     # Each Raft-follower node is the partition leader for one multi partition.
     # We pick the first Raft follower.
     killed_svc: Optional[str] = None
@@ -541,7 +568,7 @@ def test_md1_availability_partition_failover(md1_cluster: Cluster) -> None:
 
     killed_node_id = service_to_node_id(killed_svc)
     # The partition whose leader was just killed.
-    # StaticBalancer assigns multi:p → node (stripe+p)%N (stripe=_MULTI_STRIPE_OFFSET=1).
+    # The catalog places multi:p -> node (stripe+p)%N (stripe=_MULTI_STRIPE_OFFSET=0).
     # Inverse: node n leads partition (n - stripe + N) % N = _partition_led_by_node(n).
     dead_partition = _partition_led_by_node(killed_node_id)
 
@@ -672,7 +699,7 @@ def test_md1_availability_partition_failover(md1_cluster: Cluster) -> None:
     # all redirects and each subscribe delivers its records cleanly.
     #
     # Each per-partition subscribe uses RUNE_SUB_PARTITION_BASE=p + SUB_PARTITIONS=1
-    # so dr_client subscribes ONLY partition p from node (p+stripe_offset)%3.
+    # so dr_client subscribes ONLY partition p from its leader node.
     pre_alive_produced = [
         m for m in pre_res.all_produced if m.partition in alive_partitions
     ]

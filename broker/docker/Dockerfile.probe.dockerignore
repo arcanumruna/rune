@@ -6,6 +6,8 @@ build/
 cov/
 cmake-build-debug/
 cmake-build-release/
+build-*/
+cmake-build-*/
 
 # Version control
 .git/

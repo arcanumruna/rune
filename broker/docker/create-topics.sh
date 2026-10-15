@@ -15,7 +15,7 @@
 #   SEED                       broker the CLI connects to (default rune-1:40200); it follows a Redirect
 #                              to the catalog leader by itself
 #   CREATE_TOPICS_DEADLINE_S   total budget in seconds (default 60)
-#   QL_IMAGE                   the CLI image (default rune-ql-probe:<rune-client-cpp HEAD>, built if missing)
+#   QL_IMAGE                   the CLI image (default rune-ql-probe:<rune-client-cpp HEAD>, always rebuilt)
 #
 # Behaviour:
 #   * `rune ql -f` runs the statements in order and stops at the first error, naming its statement.
@@ -50,7 +50,8 @@ fail() { echo "[create-topics] FAIL: $*" >&2; exit 1; }
 QL_IMAGE="${QL_IMAGE:-rune-ql-probe:$(git -C "${CLIENT_REPO}" rev-parse --short HEAD 2>/dev/null || echo unknown)}"
 
 ensure_image() {
-    docker image inspect "${QL_IMAGE}" >/dev/null 2>&1 && return 0
+    # Always build (the layer cache makes an unchanged tree a few seconds): a dirty client tree must never run on a
+    # stale image that happens to carry the HEAD sha tag.
     local dockerfile="${CLIENT_REPO}/docker/Dockerfile.rune-ql-probe" d
     [ -f "${dockerfile}" ] || fail "missing ${dockerfile} (the rune CLI image)"
     for d in rune-protocol rune-codec rune-ql rune-fr rune-crypto; do
@@ -133,9 +134,9 @@ last_err="(no attempt ran)"
 last_cli_err=""
 attempt=0
 while :; do
-    attempt=$(( attempt + 1 ))
     remaining=$(( deadline - $(date +%s) ))
     [ "${remaining}" -gt 0 ] || break
+    attempt=$(( attempt + 1 ))
     cap=$(( remaining < ATTEMPT_CAP_S ? remaining : ATTEMPT_CAP_S ))
     run_attempt "${cap}"
     if [ "${ATTEMPT_RC}" -eq 0 ]; then

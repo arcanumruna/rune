@@ -9,12 +9,10 @@
 : "${RUNE_BROKER_BIN:=/root/rune-e5/rune-broker/build/Release/build/Release/rune_broker}"
 : "${RUNE_PROD_BIN:=/root/rune-e5/rune-client-cpp/build/Release/build/Release/rune_produce_throughput}"
 : "${RUNE_CONS_BIN:=/root/rune-e5/rune-client-cpp/build/Release/build/Release/rune_consume_throughput}"
-# The rune CLI creates the bench topics by DDL once the broker is up (the brokers take no topic list).
-: "${RUNE_CLI:=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)/rune-client-cpp/build/rune}"   # ../rune-client-cpp/build/rune
+# The rune CLI creates the bench topics by DDL once the broker is up (the brokers take no topic list).  It is built
+# next to the client binaries by default.
+: "${RUNE_CLI:=$(dirname "$RUNE_PROD_BIN")/rune}"
 : "${KAFKA_HOME:=/root/kafka}"
-# The env var of the rune_produce/consume_throughput CLIENT binaries that carries THEIR topic table
-# "name:topicId:partitions" (a client setting, unrelated to the brokers).
-RUNE_CLIENT_TOPICS_ENV="RUNE_TOPICS"
 
 # ---- scratch + results ----------------------------------------------------
 : "${WORK:=/dev/shm/kbench}"                 # tmpfs scratch: broker/kafka LOGS, client data

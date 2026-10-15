@@ -182,14 +182,21 @@ docker image inspect "${CLIENT_IMAGE}" >/dev/null 2>&1 || fail "client image not
 EXPECTED_LEADER=-1
 # Sets EXPECTED_LEADER from the controller's lineage-mint log line (bounded poll).
 discover_partition_leader() {
-    local deadline=$(( $(date +%s) + 60 )) found=""
+    local deadline=$(( $(date +%s) + 60 )) found="" lines="" distinct=0
     while [ "$(date +%s)" -lt "${deadline}" ]; do
-        found=$(dc logs --no-log-prefix rune-1 rune-2 rune-3 2>/dev/null \
-            | grep -oE "transient topicId=${TOPIC_ID} partition=0 leader [0-9]+" | grep -oE '[0-9]+$' | tail -1) || true
+        # Three containers' logs are not in time order: sort by the docker timestamp, the latest decision wins.
+        lines=$(dc logs --no-log-prefix --timestamps rune-1 rune-2 rune-3 2>/dev/null \
+            | grep -E "transient topicId=${TOPIC_ID} partition=0 leader [0-9]+" | sort) || true
+        found=$(printf '%s\n' "${lines}" | tail -1 | grep -oE 'partition=0 leader [0-9]+' | grep -oE '[0-9]+$') || true
         [ -n "${found}" ] && break
         sleep 1
     done
     [ -n "${found}" ] || fail "no partition leader for topicId=${TOPIC_ID} in the controller log within 60s"
+    distinct=$(printf '%s\n' "${lines}" | grep -oE 'partition=0 leader [0-9]+' | sort -u | wc -l | tr -d ' ')
+    if [ "${distinct}" -gt 1 ]; then
+        log "WARNING: ${distinct} distinct leaders were decided for topicId=${TOPIC_ID} partition=0; the latest wins:"
+        printf '%s\n' "${lines}" >&2
+    fi
     EXPECTED_LEADER="${found}"
 }
 probe_running() { [ "$(docker inspect -f '{{.State.Running}}' "${PROBE_NAME}" 2>/dev/null)" = "true" ]; }

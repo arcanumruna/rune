@@ -90,3 +90,100 @@ def test_sweep_tolerates_docker_being_down(monkeypatch):
 ])
 def test_run_container_name(args, name):
     assert dockerutil._run_container_name(args) == name
+
+
+# ---- ensure_dr_client_image: the dr client image is tied to the client checkout (no Docker) -------------------------
+import importlib
+
+from harness import driver
+from harness.dockerutil import CmdResult
+
+_SHA = "def4567"
+
+
+@pytest.fixture
+def drv(monkeypatch):
+    """driver reloaded under a controlled environment and a fixed client sha; reloaded again afterwards."""
+    monkeypatch.setattr(dockerutil, "_git_sha", lambda repo: _SHA)
+
+    def load(**env):
+        for k in ("DR_CLIENT_IMAGE", "DR_ALLOW_STALE_CLIENT_IMAGE"):
+            monkeypatch.delenv(k, raising=False)
+        for k, v in env.items():
+            monkeypatch.setenv(k, v)
+        return importlib.reload(driver)
+
+    yield load
+    monkeypatch.undo()
+    importlib.reload(driver)
+
+
+class _Runs:
+    def __init__(self, label=None, build_rc=0):
+        self.label, self.build_rc, self.calls, self.kw = label, build_rc, [], []
+
+    def __call__(self, args, *, timeout=120, check=False, env=None):
+        self.calls.append(list(args))
+        self.kw.append({"check": check, "timeout": timeout})
+        if args[:3] == ["docker", "image", "inspect"]:
+            return CmdResult(args, 0 if self.label is not None else 1, (self.label or "") + "\n", "")
+        res = CmdResult(args, self.build_rc, "", "boom")
+        if check and not res.ok:
+            raise RuntimeError(f"command failed (rc={res.returncode})")
+        return res
+
+    def builds(self):
+        return [c for c in self.calls if c[:2] == ["docker", "build"]]
+
+
+def test_a_prebuilt_client_image_from_another_sha_is_refused(drv, monkeypatch):
+    d = drv(DR_CLIENT_IMAGE="my-dr:x")
+    r = _Runs(label="abc1234")
+    monkeypatch.setattr(d, "run", r)
+    with pytest.raises(RuntimeError, match="stale dr client image"):
+        d.ensure_dr_client_image()
+    assert not r.builds()
+
+
+def test_a_prebuilt_client_image_with_the_current_sha_is_accepted_without_a_build(drv, monkeypatch):
+    d = drv(DR_CLIENT_IMAGE="my-dr:x")
+    r = _Runs(label=_SHA)
+    monkeypatch.setattr(d, "run", r)
+    d.ensure_dr_client_image()
+    assert not r.builds()
+
+
+def test_a_stale_prebuilt_image_is_accepted_only_by_explicit_opt_in(drv, monkeypatch, capsys):
+    d = drv(DR_CLIENT_IMAGE="my-dr:x", DR_ALLOW_STALE_CLIENT_IMAGE="1")
+    monkeypatch.setattr(d, "run", _Runs(label=""))
+    d.ensure_dr_client_image()
+    assert "DR_ALLOW_STALE_CLIENT_IMAGE=1" in capsys.readouterr().out
+
+
+def test_a_missing_prebuilt_image_is_an_error(drv, monkeypatch):
+    d = drv(DR_CLIENT_IMAGE="my-dr:x")
+    monkeypatch.setattr(d, "run", _Runs(label=None))
+    with pytest.raises(RuntimeError, match="does not exist"):
+        d.ensure_dr_client_image()
+
+
+def test_without_an_image_override_the_harness_builds_it_with_all_five_contexts(drv, monkeypatch):
+    d = drv()
+    r = _Runs()
+    monkeypatch.setattr(d, "run", r)
+    d.ensure_dr_client_image()
+    (build,) = r.builds()
+    sib = os.path.dirname(d.CLIENT_REPO)
+    for name in ("rune-protocol", "rune-fr", "rune-codec", "rune-ql", "rune-crypto"):
+        i = build.index(f"{name}={os.path.join(sib, name)}")
+        assert build[i - 1] == "--build-context"
+    assert ["--build-arg", f"RUNE_CLIENT_SHA={_SHA}"] == build[build.index("--build-arg"):build.index("--build-arg") + 2]
+    assert build[build.index("-t") + 1] == f"rune-dr-client:{_SHA}" == d.DR_IMAGE
+    assert r.kw[r.calls.index(build)]["check"] is True
+
+
+def test_a_failed_client_image_build_raises(drv, monkeypatch):
+    d = drv()
+    monkeypatch.setattr(d, "run", _Runs(build_rc=1))
+    with pytest.raises(RuntimeError):
+        d.ensure_dr_client_image()

@@ -75,7 +75,13 @@ out=$(docker compose -f "${COMPOSE_FILE}" build rune-1 2>&1); rc=$?
 set -e
 echo "${out}" | grep -E "^( Image|ERROR|#[0-9]+ DONE|#[0-9]+ ERROR)" || true
 [ "${rc}" -eq 0 ] || { echo "${out}" | tail -40 >&2; fail "broker image build failed (exit ${rc})"; }
-docker compose -f "${COMPOSE_FILE}" --profile tools build 2>&1 | grep -E "^( Image|ERROR|#[0-9]+ DONE|#[0-9]+ ERROR)" || true
+# The probe image is built strictly too: a failed build must never run the stale image.
+set +e
+out=$(docker compose -f "${COMPOSE_FILE}" --profile tools build probe 2>&1); rc=$?
+set -e
+echo "${out}" | grep -E "^( Image|ERROR|#[0-9]+ DONE|#[0-9]+ ERROR)" || true
+[ "${rc}" -eq 0 ] || { echo "${out}" | tail -60 >&2; fail "probe image build failed (exit ${rc})"; }
+docker image inspect "rune-broker-probe:${RUNE_IMAGE_TAG:-latest}" >/dev/null 2>&1 || fail "probe image not built: rune-broker-probe:${RUNE_IMAGE_TAG:-latest}"
 bash "${SCRIPT_DIR}/create-topics.sh" --build-image || fail "could not build the rune CLI image"
 log "Build complete."
 

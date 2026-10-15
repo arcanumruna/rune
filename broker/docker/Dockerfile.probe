@@ -30,7 +30,17 @@ COPY conanfile.py conandata.yml VERSION.txt ./
 RUN conan install . --output-folder=conan-release --build=missing -s build_type=Release
 
 # rune-protocol headers
+# The root CMakeLists.txt builds rune_fr (:49-53), rune_crypto (:84-90), rune_gso from rune-protocol/src/net (:98) and
+# rune_codec + the catalog glob (:112-131) unconditionally, so every sibling's src/ AND include/ must be present
+# (the CMake defaults resolve /build/../<repo> to /<repo>).
 COPY --from=rune-protocol include /rune-protocol/include
+COPY --from=rune-protocol src     /rune-protocol/src
+COPY --from=rune-fr src     /rune-fr/src
+COPY --from=rune-fr include /rune-fr/include
+COPY --from=rune-codec src     /rune-codec/src
+COPY --from=rune-codec include /rune-codec/include
+COPY --from=rune-crypto src     /rune-crypto/src
+COPY --from=rune-crypto include /rune-crypto/include
 
 # Copy application sources (only what ping_probe needs).
 COPY . .
@@ -41,6 +51,7 @@ RUN cmake -S . -B build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_TESTING=OFF \
         -DBUILD_BENCHMARKS=OFF \
+        -DBUILD_INTEGRATION_TESTING=OFF \
         -DBUILD_PING_PROBE=ON \
     && cmake --build build --target ping_probe -j2
 

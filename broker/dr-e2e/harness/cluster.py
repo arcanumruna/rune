@@ -17,6 +17,7 @@ import time
 from typing import Sequence
 
 from .dockerutil import Compose, _git_sha, run
+from .driver import ensure_dr_client_image
 
 # Repo layout: dr-e2e/ lives inside rune-broker/, compose is at ../docker/.
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -167,6 +168,8 @@ class Cluster:
                             files to merge on top of the canonical compose file
                             (broker environment overrides).
         """
+        if isinstance(topics, str):
+            raise TypeError("topics is a sequence of 'name:partitions[:options]' specs, not a str")
         self.project = project
         self.topics: tuple[str, ...] = tuple(DEFAULT_TOPICS if topics is None else topics)
         # RUNE_IMAGE_TAG: use the git HEAD SHA so every commit's broker image is
@@ -195,6 +198,8 @@ class Cluster:
 
     def up(self, build: bool = False, leader_timeout: int = 90,
            clean: bool = True) -> "Cluster":
+        # Every e2e test brings a Cluster up before any dr client runs: refuse (or build) a stale client image here.
+        ensure_dr_client_image()
         # The brokers boot with an empty catalog: once a leader exists the topics are
         # created by DDL (create_topics below).
         #
@@ -247,11 +252,12 @@ class Cluster:
         if deadline_s is None:
             deadline_s = float(os.environ.get("DR_CREATE_TOPICS_DEADLINE_S", "60"))
         image = self._ql_image()
-        if run(["docker", "image", "inspect", image], timeout=30).returncode != 0:
-            res = run(["bash", _CREATE_TOPICS_SH, "--build-image"], timeout=1800,
-                      env={**os.environ, "QL_IMAGE": image})
-            if not res.ok:
-                raise TopicCreationError(f"cannot build the rune CLI image {image}:\n{res.stdout}{res.stderr}")
+        # Always (re)build: the layer cache makes an unchanged tree a few seconds, and a dirty client tree must never
+        # run on a stale image that happens to carry the HEAD sha tag.
+        res = run(["bash", _CREATE_TOPICS_SH, "--build-image"], timeout=1800,
+                  env={**os.environ, "QL_IMAGE": image})
+        if not res.ok:
+            raise TopicCreationError(f"cannot build the rune CLI image {image}:\n{res.stdout}{res.stderr}")
         network = self.compose.network_name()
         seed = f"{SERVICES[0]}:{CLIENT_PORT}"
         deadline = time.time() + deadline_s
