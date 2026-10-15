@@ -91,6 +91,11 @@ COPY --from=rune-crypto include /rune-crypto/include
 # ── Application sources (copied last so edits don't bust the conan cache) ─────
 COPY . .
 
+# Optional cap on the build's parallelism (`--build-arg CMAKE_BUILD_PARALLEL_LEVEL=4`, or the same
+# variable exported before `docker compose build`).  Unset = ninja's default of cores+2 jobs, which
+# OOM-kills cc1plus (each big translation unit needs ~1.5 GB) in a small Docker VM.
+ARG CMAKE_BUILD_PARALLEL_LEVEL
+
 # ── Configure + build (rune_broker target only; no tests, no benchmarks) ──────
 RUN cmake -S . -B build -G Ninja \
         -DCMAKE_TOOLCHAIN_FILE=conan-release/build/Release/generators/conan_toolchain.cmake \

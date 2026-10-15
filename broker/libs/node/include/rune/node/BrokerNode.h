@@ -1030,6 +1030,23 @@ private:
 
 };
 
+// The drop sequence's two states (catalog history Task 8; BrokerNode::dropRuntimeTopic_).  Namespace
+// scope on purpose: GCC cannot default-construct a class nested in BrokerNode that has default member
+// initializers while BrokerNode is still incomplete, which made `DroppedTopic`'s default constructor
+// (a std::variant of the two) ill-formed and the docker (gcc 13) build fail.
+struct AwaitingRetire {                              // step 2: holders still ack the removal
+    uint64_t                                 retireGen = 0;
+    std::vector<rune::storage::InMemoryLog*> memLogs;   // transient rings, freed with the replicas
+};
+struct AwaitingRename {                              // step 2: logs closed; the dir rename
+    int64_t  retryAtNs = 0;                          // a failed rename backs off (never every pass)
+    int64_t  backoffNs = 0;
+    uint64_t failures  = 0;
+};
+// Regression pin (docker gcc 13 build): the drop sequence's variant of these two must stay default-constructible.
+static_assert(std::is_default_constructible_v<std::variant<AwaitingRetire, AwaitingRename>>,
+              "BrokerNode::DroppedTopic default-constructs its step; keep the states at namespace scope");
+
 // ---------------------------------------------------------------------------
 // BrokerNode
 // ---------------------------------------------------------------------------
@@ -2003,15 +2020,6 @@ private:
     // Catalog history Task 8 (control-thread-owned): the drop sequence's states
     // (see dropRuntimeTopic_), the creates waiting behind a drop of their name,
     // and the frames a full ring could not take yet (retried, never dropped).
-    struct AwaitingRetire {                              // step 2: holders still ack the removal
-        uint64_t                                 retireGen = 0;
-        std::vector<rune::storage::InMemoryLog*> memLogs;   // transient rings, freed with the replicas
-    };
-    struct AwaitingRename {                              // step 2: logs closed; the dir rename
-        int64_t  retryAtNs = 0;                          // a failed rename backs off (never every pass)
-        int64_t  backoffNs = 0;
-        uint64_t failures  = 0;
-    };
     static constexpr int64_t kRenameRetryMinNs = 100'000'000;     // 100 ms
     static constexpr int64_t kRenameRetryMaxNs = 10'000'000'000;  // 10 s
     struct DroppedTopic {
