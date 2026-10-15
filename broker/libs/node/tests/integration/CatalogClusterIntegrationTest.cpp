@@ -9,14 +9,21 @@
 // LeaderChangeMidDdl, RestartMidApply, NewBrokerJoins, DropAndReuseName, CreateRacesPlacement}; every
 // expected answer is read from cmatrix::expectedCodes (F16) - no hard-coded outcome.
 //
+// CreateRacesPlacement (CreateTopic / CreateView) really races placement (fix round 1, R7 OkAfterPlacement): the initial
+// placement is HELD on every broker, the DDL commits + applies, every broker is probed for 1.5 s (a produce + Subscribe per
+// partition / a GetViewRow: retriable refusal only), no DDL answer may arrive in the window; then the placement is released.
+// Views are read through EVERY broker (a non-source broker redirects to the source leader, C1) and the hp checked.
+//
 // Test-only seams (the Task 22 report lists them): BrokerNode::crashForTest (a REAL crash: no controlled
 // shutdown), BrokerNode::holdCatalogAnswersForTest (the leader's DDL commits but is never answered),
 // BrokerNode::holdCatalogApplyForTest (a promoted leader stays CatchingUp), MetadataService::
 // holdPlacementForTest (the initial placement of a runtime topic held), ThreeNodes::{crash, crashAfterNextAppend}.
 //
-// An answer lost to a crashed leader is IN DOUBT (the session died with the DDL in flight): the cell maps
-// it to the retriable NotLeader (2) - the code every client treats it as - exactly like the stress driver's
-// R2c ("answers lost to it are in doubt"); the retry carries the same requestId.
+// An answer lost to a crashed leader is IN DOUBT (the session died with the DDL in flight, the cell crashed it
+// itself - Hooks::afterSend returned true): the cell maps it to the retriable NotLeader (2) - the code every
+// client treats it as - exactly like the stress driver's R2c ("answers lost to it are in doubt"); the retry
+// carries the same requestId.  ANY OTHER missing answer is a failure (cNoAnswer): a broker that never answers
+// a DDL must not be masked by the retry + the requestId dedupe (R-I1).
 #include "support/CatalogBrokerCluster.h"
 #include "support/CatalogMatrixExpectations.h"
 #include "support/DdlHarness.h"          // charBlob / viewPlanBlob / alterOpsFor
@@ -53,6 +60,7 @@ using rune::protocol::RequestId;
 namespace {
 
 constexpr int cOk = 0, cNotLeader = 2, cRedirect = 3, cUnknown = 7;
+constexpr int cNoAnswer = -2;   // R-I1: a broker that never answered (NOT the in-doubt NotLeader of a crashed session)
 
 [[nodiscard]] std::vector<uint8_t> keyBytes(int64_t id) {
     std::vector<uint8_t> b(8);
@@ -72,6 +80,18 @@ constexpr int cOk = 0, cNotLeader = 2, cRedirect = 3, cUnknown = 7;
     rune::protocol::RecordBatchBuilder b(0, 0);
     b.append(key, value, 0);
     return b.build();
+}
+
+/// The hp dataCheck writes into the character it produces through node `n` into topic `name` (so a view row can be checked).
+[[nodiscard]] int64_t hpFor(int n, const std::string& name) {
+    return 1000 * n + static_cast<int64_t>(std::hash<std::string>{}(name) % 997);
+}
+/// A view row of the "id, hp" view (viewPlanBlob): [null bitmap 1 B][id i64][hp i64] - its hp, or -1 when malformed.
+[[nodiscard]] int64_t rowHp(const std::vector<uint8_t>& row) {
+    if (row.size() != 17) return -1;
+    int64_t v = 0;
+    for (int i = 0; i < 8; ++i) v |= static_cast<int64_t>(row[9 + static_cast<std::size_t>(i)]) << (8 * i);
+    return v;
 }
 
 /// The batch of one record: a typed topic's carries the 8-byte LE key; an untyped one a text key.
@@ -181,7 +201,8 @@ public:
     int64_t sendOnly(int node, const Sender& s, RequestId rid) {
         const int64_t sid = session(node);
         if (sid <= 0) return 0;
-        return s(cl_, c_.clientChannel(node), sid, rid);
+        lastCorr_ = s(cl_, c_.clientChannel(node), sid, rid);
+        return lastCorr_;
     }
     Answer await(int64_t corr, std::chrono::milliseconds wait) {
         if (corr == 0) return {};
@@ -203,11 +224,18 @@ public:
             bool inDoubt = false;
             Answer a;
             if (hooks.afterSend) inDoubt = hooks.afterSend(sendNo, cur);
-            a = await(corr, inDoubt ? 3s : 25s);
+            if (!inDoubt) a = await(corr, 25s);   // in doubt: the test crashed the session itself - nothing can arrive
             std::ostringstream t;
             t << " [send " << sendNo << " -> n" << cur << ": " << (a.got ? std::to_string(a.code) : std::string("no answer")) << "]";
             r.trace += t.str();
-            const int code = a.got ? a.code : cNotLeader;   // in doubt = the retriable NotLeader
+            // in doubt, or a stale Redirect naming a broker the test crashed (nothing to send to) = the retriable NotLeader;
+            // silence from a RUNNING broker is the failure
+            const int code = a.got ? a.code : ((inDoubt || !c_.running(cur)) ? cNotLeader : cNoAnswer);
+            if (code == cNoAnswer) {
+                ADD_FAILURE() << "node " << cur << (corr == 0 ? " could not be sent the DDL" : " never answered the DDL (25 s)") << r.trace;
+                r.finalCode = cNoAnswer;
+                return r;
+            }
             if (sendNo == 0) r.firstCode = code;
             else if (sendNo == 1 && r.firstCode == cRedirect) r.afterRedirectCode = code;
             ++sendNo;
@@ -237,6 +265,8 @@ public:
         ASSERT_EQ(r.finalCode, cOk) << what << r.trace;
     }
     RequestId freshRid_() { return RequestId{0xCE11'0022ull, ++rid_}; }
+    /// The correlation id of the last DDL frame `drive` / `sendOnly` sent (0: none).
+    [[nodiscard]] int64_t lastCorr() const noexcept { return lastCorr_; }
 
     // ── reads: a topic as a broker's applied catalog states it ───────────────────────────────────
     std::optional<TopicInfo> topicInfo(int node, const std::string& name, std::chrono::milliseconds wait, int* code = nullptr) {
@@ -300,13 +330,14 @@ public:
     /// The TERMINAL answer to a produce through `node`: a Redirect is followed, the retriable codes (NotLeader) retried
     /// until `want` (or `within`); returns the last code seen.
     int produceTerminal(int node, int32_t topicId, int p, const std::vector<uint8_t>& batch, int want,
-                        std::chrono::seconds within) {
+                        std::chrono::seconds within, std::vector<int>* seen = nullptr) {
         int last = -1;
         for (const auto deadline = Clock::now() + within; Clock::now() < deadline;) {
             int cur = node;
             for (int hop = 0; hop < 3; ++hop) {
                 std::string redirect;
                 last = produceOnce(cur, topicId, p, batch, &redirect);
+                if (seen) seen->push_back(last);
                 if (last != cRedirect || nodeOf(redirect) < 0) break;
                 cur = nodeOf(redirect);
             }
@@ -315,22 +346,19 @@ public:
         }
         return last;
     }
-    /// Everything pushed on a Subscribe(topic, p) from the earliest offset, through `node`: collected until
-    /// `want` values arrived (or `within`), then 300 ms more (a duplicate would show).
-    std::vector<std::string> readAll(int node, int32_t topicId, int p, std::size_t want, std::chrono::seconds within,
-                                     std::string* why = nullptr) {
-        int64_t subId = 0;
-        // Subscription ids derive from the (restart-reset) session counter and repeat after a broker restart: only the
-        // records pushed from here on belong to this subscription.
-        const std::size_t firstRecord = cl_.records().size();
-        for (const auto deadline = Clock::now() + within; Clock::now() < deadline && subId == 0;) {
+    /// An open Subscribe(topic, p) from the earliest offset (id 0: none could be opened).
+    struct OpenSub { int node = 0; int p = 0; int64_t id = 0; };
+    /// Open Subscribe(topic, p) from the earliest offset through `node` (a Redirect is followed, up to `within`).
+    OpenSub openSubscription(int node, int32_t topicId, int p, std::chrono::seconds within, std::string* why = nullptr) {
+        OpenSub sub{node, p, 0};
+        for (const auto deadline = Clock::now() + within; Clock::now() < deadline && sub.id == 0;) {
             int cur = node;
             for (int hop = 0; hop < 3; ++hop) {
                 const int64_t sid = session(cur);
                 if (sid <= 0) break;
                 const int64_t corr = cl_.sendSubscribe(c_.clientChannel(cur), kClientStream, sid, topicId, p);
                 const auto code = cl_.awaitSubscribeCode(corr, Clock::now() + 10s);
-                if (code && *code == cOk) { if (const auto id = cl_.subscriptionIdOf(corr)) { subId = *id; break; } }
+                if (code && *code == cOk) { if (const auto id = cl_.subscriptionIdOf(corr)) { sub.id = *id; break; } }
                 if (code && *code == cRedirect) {
                     const auto* e = errorFor_(corr);
                     if (e != nullptr && nodeOf(e->message) > 0) { cur = nodeOf(e->message); continue; }
@@ -338,30 +366,41 @@ public:
                 if (why) *why = "subscribe answered " + (code ? std::to_string(*code) : std::string("nothing"));
                 break;
             }
-            if (subId == 0) std::this_thread::sleep_for(50ms);
+            if (sub.id == 0) std::this_thread::sleep_for(50ms);
         }
+        return sub;
+    }
+    /// Every value pushed on subscription `id` since record index `firstRecord`, in arrival order; `frames` (optional)
+    /// is filled with the frame trail for a failure message.
+    std::vector<std::string> collected(int64_t id, std::size_t firstRecord, std::string* frames = nullptr) const {
         std::vector<std::string> got;
-        if (subId == 0) return got;
-        std::string lastFrames;
-        auto collect = [&] {
-            got.clear();
-            std::ostringstream frames;
-            const auto& all = cl_.records();
-            for (std::size_t i = firstRecord; i < all.size(); ++i) {
-                const auto& rec = all[i];
-                if (rec.subscriptionId == subId) {
-                    frames << " @" << rec.baseOffset << "x" << valuesOf(rec.bytes).size();
-                    for (auto& v : valuesOf(rec.bytes)) got.push_back(std::move(v));
-                }
-            }
-            lastFrames = " sub=" + std::to_string(subId) + frames.str();
-        };
+        std::ostringstream trail;
+        const auto& all = cl_.records();
+        for (std::size_t i = firstRecord; i < all.size(); ++i) {
+            const auto& rec = all[i];
+            if (rec.subscriptionId != id) continue;
+            trail << " @" << rec.baseOffset << "x" << valuesOf(rec.bytes).size();
+            for (auto& v : valuesOf(rec.bytes)) got.push_back(std::move(v));
+        }
+        if (frames) *frames = " sub=" + std::to_string(id) + trail.str();
+        return got;
+    }
+    /// Everything pushed on a Subscribe(topic, p) from the earliest offset, through `node`: collected until
+    /// `want` values arrived (or `within`), then 300 ms more (a duplicate would show).
+    std::vector<std::string> readAll(int node, int32_t topicId, int p, std::size_t want, std::chrono::seconds within,
+                                     std::string* why = nullptr) {
+        // Subscription ids derive from the (restart-reset) session counter and repeat after a broker restart: only the
+        // records pushed from here on belong to this subscription.
+        const std::size_t firstRecord = cl_.records().size();
+        const OpenSub sub = openSubscription(node, topicId, p, within, why);
+        if (sub.id == 0) return {};
         const auto deadline = Clock::now() + within;
-        cl_.pollUntil([&] { collect(); return got.size() >= want || Clock::now() >= deadline; });
+        cl_.pollUntil([&] { return collected(sub.id, firstRecord).size() >= want || Clock::now() >= deadline; });
         const auto settle = Clock::now() + 300ms;
         cl_.pollUntil([&] { return Clock::now() >= settle; });
-        collect();
-        if (why) *why += " frames:" + lastFrames;
+        std::string frames;
+        auto got = collected(sub.id, firstRecord, &frames);
+        if (why) *why += " frames:" + frames;
         return got;
     }
 
@@ -385,7 +424,7 @@ public:
         for (int n : c_.runningNodes()) {
             for (int p = 0; p < info->partitions; ++p) {
                 const int64_t id = 100 * n + 10 * p + 1;
-                const std::string value = typed ? asString(characterValue(id, 1000 * n + static_cast<int64_t>(std::hash<std::string>{}(name) % 997)))
+                const std::string value = typed ? asString(characterValue(id, hpFor(n, name)))
                                                 : "v:" + cell + ":n" + std::to_string(n) + ":p" + std::to_string(p);
                 std::vector<int> seenCodes;
                 const bool accepted = produceFollowing(n, info->id, p, batchFor(typed, id, value), 60s, &seenCodes);
@@ -398,26 +437,120 @@ public:
                 have[p].push_back(value);
             }
         }
+        // M2: subscribe EVERY (broker, partition) first, then one wait until every count is reached, one 300 ms settle
+        // (a duplicate would show), then compare each pair.  Subscription ids are unique per broker incarnation, and
+        // only records pushed from here on belong to these subscriptions.
+        struct Check { OpenSub sub; std::string why; };
+        std::vector<Check> checks;
+        const std::size_t firstRecord = cl_.records().size();
         for (int n : c_.runningNodes()) {
             for (int p = 0; p < info->partitions; ++p) {
-                std::string why;
-                auto got = readAll(n, info->id, p, have[p].size(), 30s, &why);
-                auto want = have[p];
-                std::sort(got.begin(), got.end());
-                std::sort(want.begin(), want.end());
-                EXPECT_EQ(got.size(), want.size()) << cell << ": subscribe from earliest through node " << n << " '" << name << "' p" << p << " " << why
-                    << " (produce answers:" << produced.str() << ")";
-                EXPECT_EQ(got, want) << cell << ": delivery through node " << n << " '" << name << "' p" << p << " (exactly once, same content)";
+                Check ck;
+                ck.sub = openSubscription(n, info->id, p, 30s, &ck.why);
+                checks.push_back(std::move(ck));
             }
+        }
+        const auto allIn = [&] {
+            for (const Check& ck : checks)
+                if (ck.sub.id == 0 || collected(ck.sub.id, firstRecord).size() < have[ck.sub.p].size()) return false;
+            return true;
+        };
+        const auto waitEnd = Clock::now() + 30s;
+        cl_.pollUntil([&] { return allIn() || Clock::now() >= waitEnd; });
+        const auto settle = Clock::now() + 300ms;
+        cl_.pollUntil([&] { return Clock::now() >= settle; });
+        for (Check& ck : checks) {
+            std::string frames;
+            auto got = ck.sub.id == 0 ? std::vector<std::string>{} : collected(ck.sub.id, firstRecord, &frames);
+            auto want = have[ck.sub.p];
+            std::sort(got.begin(), got.end());
+            std::sort(want.begin(), want.end());
+            EXPECT_EQ(got.size(), want.size()) << cell << ": subscribe from earliest through node " << ck.sub.node << " '" << name << "' p" << ck.sub.p
+                << " " << ck.why << " frames:" << frames << " (produce answers:" << produced.str() << ")";
+            EXPECT_EQ(got, want) << cell << ": delivery through node " << ck.sub.node << " '" << name << "' p" << ck.sub.p << " (exactly once, same content)";
         }
     }
 
-    /// A GetViewRow for `key` on `viewTopicId` through node `n`: the status, or nullopt.
-    std::optional<uint16_t> viewRow(int n, int32_t viewTopicId, uint64_t key) {
-        const int64_t sid = session(n);
-        if (sid <= 0) return std::nullopt;
-        const int64_t corr = cl_.sendGetViewRow(c_.clientChannel(n), kClientStream, sid, viewTopicId, key);
-        return corr == 0 ? std::nullopt : cl_.awaitViewRow(corr, Clock::now() + 5s);
+    /// One GetViewRow read through `n`, a Redirect followed (at most 2 hops): the FIRST answer and the FINAL one.
+    struct ViewRead {
+        bool                 answered = false;
+        bool                 firstIsError = false;
+        int                  firstCode = -1;        // the first answer's ErrorResponse code, or its ViewRowResponse status
+        std::string          firstMessage;          // ... and its message (the Redirect's leader endpoint)
+        bool                 finalIsError = false;
+        int                  finalCode = -1;        // the final answer's ErrorResponse code, or its ViewRowResponse status
+        std::vector<uint8_t> row;                   // the final answer's row bytes (status OK)
+        int                  finalNode = -1;
+        [[nodiscard]] bool ok() const { return answered && !finalIsError && finalCode == pc::ViewRowResponse::kOk; }
+    };
+    ViewRead viewRowFollowing(int n, int32_t viewTopicId, uint64_t key) {
+        ViewRead r;
+        int cur = n;
+        for (int hop = 0; hop < 3; ++hop) {
+            const int64_t sid = session(cur);
+            if (sid <= 0) return r;
+            const int64_t corr = cl_.sendGetViewRow(c_.clientChannel(cur), kClientStream, sid, viewTopicId, key);
+            const auto a = cl_.awaitViewRowOrError(corr, Clock::now() + 10s);
+            if (!a) return r;
+            const int code = a->isError ? a->errorCode : a->status;
+            if (hop == 0) { r.firstIsError = a->isError; r.firstCode = code; r.firstMessage = a->message; }
+            r.answered = true; r.finalIsError = a->isError; r.finalCode = code; r.row = a->row; r.finalNode = cur;
+            if (a->isError && code == cRedirect && nodeOf(a->message) > 0) { cur = nodeOf(a->message); continue; }
+            return r;
+        }
+        return r;
+    }
+    /// GetViewRow through `n` until the read is no longer retriable (a NotReady / a bare NotLeader / UnknownView while the
+    /// view's plan reaches this broker), or `within`; the last read.
+    ViewRead viewRowSettled(int n, int32_t viewTopicId, uint64_t key, std::chrono::seconds within) {
+        ViewRead r;
+        for (const auto deadline = Clock::now() + within; Clock::now() < deadline;) {
+            r = viewRowFollowing(n, viewTopicId, key);
+            const bool retriable = !r.answered ||
+                (r.finalIsError ? (r.finalCode == cNotLeader || r.finalCode == cRedirect)
+                                : (r.finalCode == pc::ViewRowResponse::kNotReady || r.finalCode == pc::ViewRowResponse::kUnknownView));
+            if (!retriable) return r;
+            std::this_thread::sleep_for(50ms);
+        }
+        return r;
+    }
+
+    /// Hold / release the initial placement of runtime topics on every running broker (only the controller places).
+    void holdPlacementEverywhere(bool on) {
+        for (int n : c_.runningNodes())
+            c_.node(n).onControlThreadForTest([this, n, on] { c_.node(n).metadataServiceForTest()->holdPlacementForTest(on); return 0; });
+    }
+
+    /// Probe partition `p` of `topicId` through broker `n` with a produce and a Subscribe: each must be REFUSED RETRIABLY -
+    /// a Redirect (3) or NotLeader (2), one Redirect hop followed - never served, never UnknownTopic, never silence (-1).
+    /// Returns the number of probes made (2).
+    int expectRetriableRefusal(int n, int32_t topicId, int p, const std::string& what) {
+        int made = 0;
+        int target = n;
+        for (int hop = 0; hop < 2; ++hop) {
+            std::string redirect;
+            const int code = produceOnce(target, topicId, p, batchFor(true, 1, "probe"), &redirect);
+            if (hop == 1 || code != cRedirect || nodeOf(redirect) < 0) {
+                EXPECT_TRUE(code == cRedirect || code == cNotLeader)
+                    << what << ": node " << n << " p" << p << " answered " << code << " to a PRODUCE (-1 = no answer)";
+                ++made;
+                break;
+            }
+            target = nodeOf(redirect);
+        }
+        target = n;
+        for (int hop = 0; hop < 2; ++hop) {
+            std::string redirect;
+            const int code = subscribeOnce(target, topicId, p, &redirect);
+            if (hop == 1 || code != cRedirect || nodeOf(redirect) < 0) {
+                EXPECT_TRUE(code == cRedirect || code == cNotLeader)
+                    << what << ": node " << n << " p" << p << " answered " << code << " to a SUBSCRIBE (-1 = no answer)";
+                ++made;
+                break;
+            }
+            target = nodeOf(redirect);
+        }
+        return made;
     }
 
     /// The broker that leads (topicId, p) per the metadata `node` serves (-1: unknown).
@@ -446,6 +579,7 @@ private:
     ShardTestClient           cl_;
     std::map<int, int64_t>    sid_;
     uint64_t                  rid_ = 0;
+    int64_t                   lastCorr_ = 0;
 };
 
 // ── senders ─────────────────────────────────────────────────────────────────────────────────────
@@ -611,6 +745,7 @@ TEST_P(CatalogClusterSliceRegression, RuntimeDdlThroughEveryBrokerThenDataThroug
     Hooks hooks;
     int victim = -1;
     bool crashedLeader = false;
+    bool placementReleased = false;
     uint64_t baseline = 0;
     switch (timing) {
     case cm::Timing::LeaderChangeMidDdl:
@@ -639,6 +774,60 @@ TEST_P(CatalogClusterSliceRegression, RuntimeDdlThroughEveryBrokerThenDataThroug
             rig.pumping([&] { c.startNode(v); });                       // restarted while the DDL commits / applies
             return false;
         };
+        break;
+    case cm::Timing::CreateRacesPlacement:
+        if (kind == cm::Kind::CreateTopic || kind == cm::Kind::CreateView) {
+            // R7 (OkAfterPlacement): the DDL commits and applies everywhere while the initial placement is HELD; the
+            // object must refuse retriably through every broker, and the DDL's OK must not arrive, until the
+            // placement is released.  (The DdlAnswerGate holds a DDL OK for at most 5 s: the 1.5 s window below is
+            // well inside it.)  The hold covers every placement path (MetadataService::holdPlacementForTest).
+            rig.holdPlacementEverywhere(true);
+            hooks.afterSend = [&](int, int node) {
+                if (node != leader || placementReleased) return false;
+                const int64_t ddlCorr = rig.lastCorr();
+                const std::string what = cell + " (placement held)";
+                // The object is applied (read through a NON-leader broker: the leader's session queues behind its held DDL
+                // answer), then every broker's control thread applies it a hop later: until it does, a probe answers
+                // UnknownTopic / UnknownView - the warm-up waits for the first retriable refusal on each broker.
+                const auto info = rig.topicInfo(via, target, 20s);
+                EXPECT_TRUE(info.has_value()) << what << ": '" << target << "' never applied on node " << via;
+                int probes = 0;
+                if (info) {
+                    auto refusing = [&](int n) {
+                        if (kind == cm::Kind::CreateTopic) {
+                            const int code = rig.produceOnce(n, info->id, 0, batchFor(true, 1, "warm"));
+                            return code == cNotLeader || code == cRedirect;
+                        }
+                        const auto r = rig.viewRowFollowing(n, info->id, 101);
+                        return r.answered && !r.finalIsError && r.finalCode == pc::ViewRowResponse::kNotReady;
+                    };
+                    for (int n : c.runningNodes()) {
+                        const auto upTo = Clock::now() + 20s;
+                        while (Clock::now() < upTo && !refusing(n)) std::this_thread::sleep_for(20ms);
+                    }
+                    for (const auto windowEnd = Clock::now() + 1500ms; Clock::now() < windowEnd;) {
+                        for (int n : c.runningNodes()) {
+                            if (kind == cm::Kind::CreateTopic) {
+                                for (int p = 0; p < info->partitions; ++p) probes += rig.expectRetriableRefusal(n, info->id, p, what);
+                            } else {
+                                const auto r = rig.viewRowFollowing(n, info->id, 101);
+                                ++probes;
+                                EXPECT_TRUE(r.answered && !r.finalIsError && r.finalCode == pc::ViewRowResponse::kNotReady)
+                                    << what << ": GetViewRow through node " << n << " answered "
+                                    << (r.answered ? std::string(r.finalIsError ? "error " : "status ") + std::to_string(r.finalCode)
+                                                   : std::string("nothing"))
+                                    << " (want NotReady: never AbsentKey / UnknownView / OK before the placement commits)";
+                            }
+                        }
+                    }
+                }
+                EXPECT_GE(probes, 6) << what << ": the no-placement window was observed (vacuity guard)";
+                EXPECT_FALSE(rig.await(ddlCorr, 20ms).got) << what << ": the DDL was answered before its placement committed (R7)";
+                rig.holdPlacementEverywhere(false);
+                placementReleased = true;
+                return false;
+            };
+        }
         break;
     default: break;
     }
@@ -670,21 +859,6 @@ TEST_P(CatalogClusterSliceRegression, RuntimeDdlThroughEveryBrokerThenDataThroug
     case cm::Kind::CreateTopic: {
         TopicInfo ti;
         std::vector<int> codes;
-        if (timing == cm::Timing::CreateRacesPlacement) {
-            // A producer that learned the topic from one broker produces to a partition leader that may not have applied /
-            // placed it yet: a retriable answer, never UnknownTopic while it converges (review focus #4).
-            const auto info = rig.topicInfo(via, "t", 30s);
-            ASSERT_TRUE(info.has_value());
-            for (int n : c.runningNodes()) {
-                std::vector<int> seen;
-                EXPECT_TRUE(rig.produceFollowing(n, info->id, 0, oneRecord("race", "race-" + std::to_string(n)), 60s, &seen));
-                tHave[0].push_back("race-" + std::to_string(n));
-                for (int code : seen) EXPECT_TRUE(code == cOk || code == cNotLeader || code == cRedirect)
-                    << cell << ": node " << n << " answered " << code << " to a produce for a topic created through node " << via;
-            }
-            // (the race records are raw strings on the typed topic - validation is off - and stay in tHave: the
-            //  exactly-once comparison below reads them back with everything else)
-        }
         ASSERT_NO_FATAL_FAILURE(rig.dataCheck("t", true, tHave, cell, &ti, &codes));
         if (reuse) {
             // A fresh, EMPTY topic: the exactly-once check above saw only this cell's records (none of the dropped topic's).
@@ -697,28 +871,19 @@ TEST_P(CatalogClusterSliceRegression, RuntimeDdlThroughEveryBrokerThenDataThroug
     case cm::Kind::CreateView: {
         TopicInfo si;
         ASSERT_NO_FATAL_FAILURE(rig.dataCheck("src", true, srcHave, cell, &si));
-        // The view folds on the broker that leads the source's partition (the owner of its log); a GetViewRow is
-        // answered from the answering broker's OWN folded state, so it is asked of that broker.
+        // C1 / I5: a GetViewRow is answered by the broker that leads the source's partition (the view folds there); every
+        // other broker redirects to it.  So the row of EVERY record every broker produced is read through EVERY running
+        // broker and its hp is the value dataCheck produced (not merely "present", not only on the folder).
         const auto vi = rig.topicInfo(leader, "v", 30s);
         ASSERT_TRUE(vi.has_value()) << cell << ": view v is in no broker's catalog";
-        int folder = -1;
-        for (const auto deadline = Clock::now() + 30s; Clock::now() < deadline && folder < 0;) {
-            folder = rig.partitionLeader(c.runningNodes().front(), si.id, 0);
-            if (folder < 0) std::this_thread::sleep_for(50ms);
-        }
-        ASSERT_GT(folder, 0) << cell << ": the source partition has a leader";
         for (int n : c.runningNodes()) {
-            const int64_t key = 100 * n + 1;   // the record node n produced through its own endpoint into p0
-            const auto deadline = Clock::now() + 30s;
-            std::optional<uint16_t> st;
-            while (Clock::now() < deadline) {
-                st = rig.viewRow(folder, vi->id, static_cast<uint64_t>(key));
-                if (st && *st == pc::ViewRowResponse::kOk) break;
-                std::this_thread::sleep_for(100ms);
+            for (int m : c.runningNodes()) {
+                const int64_t key = 100 * m + 1;   // the record node m produced through its own endpoint into p0
+                const auto r = rig.viewRowSettled(n, vi->id, static_cast<uint64_t>(key), 30s);
+                ASSERT_TRUE(r.ok()) << cell << ": GetViewRow(" << key << ") through node " << n << " ended "
+                                    << (r.answered ? std::string(r.finalIsError ? "error " : "status ") + std::to_string(r.finalCode) : std::string("nothing"));
+                EXPECT_EQ(rowHp(r.row), hpFor(m, "src")) << cell << ": the row of key " << key << " read through node " << n;
             }
-            EXPECT_TRUE(st && *st == pc::ViewRowResponse::kOk)
-                << cell << ": GetViewRow(" << key << ") on the folding broker " << folder << " never OK (last "
-                << (st ? std::to_string(*st) : "none") << ")";
         }
         if (reuse) {
             const auto ids = createdObjectIds(c, leader, "v");
@@ -738,8 +903,13 @@ TEST_P(CatalogClusterSliceRegression, RuntimeDdlThroughEveryBrokerThenDataThroug
                 std::this_thread::sleep_for(50ms);
             }
             EXPECT_EQ(code, cUnknown) << cell << ": the dropped topic is still known on node " << n;
-            const int produceCode = rig.produceTerminal(n, droppedId, 0, batchFor(true, 1, "late"), cUnknown, 30s);
+            std::vector<int> seenCodes;
+            const int produceCode = rig.produceTerminal(n, droppedId, 0, batchFor(true, 1, "late"), cUnknown, 30s, &seenCodes);
             EXPECT_EQ(produceCode, cUnknown) << cell << ": a produce to the dropped id through node " << n;
+            // M1: every answer on the way is a retriable refusal or the final UnknownTopic - a record accepted into the dropped topic (0)
+            // or silence is never one of them.
+            for (int sc : seenCodes) EXPECT_TRUE(sc == cNotLeader || sc == cRedirect || sc == cUnknown)
+                << cell << ": a produce to the dropped id through node " << n << " answered " << sc << " (0 = accepted into a dropped topic)";
         }
         ASSERT_NO_FATAL_FAILURE(rig.dataCheck("ready", true, readyHave, cell));   // the survivor still serves everywhere
         if (reuse) {
@@ -812,21 +982,78 @@ TEST(CatalogClusterRegression, MultiNodeRuntimeCreateViewFoldsOnTheSourceLeaderR
     ASSERT_NO_FATAL_FAILURE(rig.dataCheck("src", true, have, "co_view", &src));
     const auto vi = rig.topicInfo(leader, "v", 30s);
     ASSERT_TRUE(vi.has_value());
-    // The source partition's leader folds it: ask the broker that leads (src, 0).
-    const int64_t sid = rig.session(leader);
-    ASSERT_GT(sid, 0);
-    int32_t folder = -1;
-    for (const auto& pi : rig.cl().metadata(c.clientChannel(leader), kClientStream, sid))
-        if (pi.topicId == src.id && pi.partition == 0) folder = pi.leaderId;
-    ASSERT_GT(folder, 0) << "the metadata names the source partition's leader";
-    std::optional<uint16_t> st;
-    for (const auto deadline = Clock::now() + 30s; Clock::now() < deadline;) {
-        st = rig.viewRow(folder, vi->id, 100 * folder + 1);
-        if (st && *st == pc::ViewRowResponse::kOk) break;
-        std::this_thread::sleep_for(100ms);
+    // C1 / I5: the source partition's leader folds it; the row of every record every broker produced is read through
+    // EVERY broker (a non-folder redirects to the folder) and its hp is the value dataCheck produced.
+    for (int n = 1; n <= 3; ++n) {
+        for (int m = 1; m <= 3; ++m) {
+            const auto r = rig.viewRowSettled(n, vi->id, static_cast<uint64_t>(100 * m + 1), 30s);
+            ASSERT_TRUE(r.ok()) << "GetViewRow(" << 100 * m + 1 << ") through node " << n << " ended "
+                                << (r.answered ? std::string(r.finalIsError ? "error " : "status ") + std::to_string(r.finalCode) : std::string("nothing"));
+            EXPECT_EQ(rowHp(r.row), hpFor(m, "src")) << "the row of node " << m << "'s record, read through node " << n;
+        }
     }
-    ASSERT_TRUE(st.has_value());
-    EXPECT_EQ(*st, pc::ViewRowResponse::kOk) << "the row the folder broker's own produce wrote is folded";
+}
+
+// ===========================================================================
+// Task 22 fix round 1 (C1): a view row is served ONLY by the caught-up leader of its source partition.  Every other
+// broker redirects to that leader (ErrorResponse{Redirect, the leader's client endpoint}); a read through ANY broker
+// ends with the row of the key asked, never an AbsentKey for an existing key.
+// RED (gateway Part A and the worker-return sentinel reverted): the non-folder brokers answer AbsentKey (1).
+// RED (the worker's role check reverted, gateway kept): see GetViewRowRegression.ViewReadOnANonLeaderSourceReplica...
+// ===========================================================================
+TEST(CatalogClusterRegression, GetViewRowThroughEveryBrokerAnswersTheRowNeverAbsentKeyRegression) {
+    ThreeNodes c = ThreeNodes::start("gvr_all");
+    ASSERT_TRUE(c.awaitCatalogLeader(60s));
+    Rig rig(c);
+    const int leader = c.settledLeader();
+    ASSERT_NO_FATAL_FAILURE(rig.must(defineSender("src", 1, true), "define src", leader));
+    const auto si = rig.topicInfo(leader, "src", 30s);
+    ASSERT_TRUE(si.has_value());
+    ASSERT_NO_FATAL_FAILURE(rig.must(createViewSender("v", si->id), "create v", leader));
+    const auto vi = rig.topicInfo(leader, "v", 30s);
+    ASSERT_TRUE(vi.has_value());
+    const std::pair<int64_t, int64_t> rows[] = {{101, 7}, {201, 8}, {301, 9}};
+    for (const auto& [id, hp] : rows)
+        ASSERT_TRUE(rig.produceFollowing(leader, si->id, 0, batchFor(true, id, asString(characterValue(id, hp))), 60s))
+            << "record " << id << " was never acked";
+    int folder = -1;
+    for (const auto deadline = Clock::now() + 30s; Clock::now() < deadline && folder < 0;) {
+        folder = rig.partitionLeader(leader, si->id, 0);
+        if (folder < 0) std::this_thread::sleep_for(50ms);
+    }
+    ASSERT_GT(folder, 0) << "the source partition has a leader";
+
+    // Warm-up: the folder folds the three records; a non-folder broker's plan may still be on its way (NotReady / a bare
+    // NotLeader / UnknownView while it is).  NotReady (2) is allowed only HERE, before the first OK of each broker.
+    for (int n = 1; n <= 3; ++n) {
+        for (const auto& [id, hp] : rows) {
+            const auto r = rig.viewRowSettled(n, vi->id, static_cast<uint64_t>(id), 30s);
+            ASSERT_TRUE(r.ok()) << "GetViewRow(" << id << ") through node " << n << " never reached OK: "
+                                << (r.answered ? std::string(r.finalIsError ? "error " : "status ") + std::to_string(r.finalCode) : std::string("nothing"));
+            EXPECT_EQ(rowHp(r.row), hp) << "node " << n << " key " << id;
+        }
+    }
+    // Strict, from here on: one read per (broker, key) - the first answer is OK on the folder, the Redirect to the folder
+    // everywhere else, and the final answer is the row (the hp asked for); AbsentKey / NotReady never.
+    for (int n = 1; n <= 3; ++n) {
+        for (const auto& [id, hp] : rows) {
+            const auto r = rig.viewRowFollowing(n, vi->id, static_cast<uint64_t>(id));
+            ASSERT_TRUE(r.ok()) << "node " << n << " key " << id << ": final " << r.finalCode << (r.finalIsError ? " (error)" : "");
+            EXPECT_EQ(rowHp(r.row), hp) << "node " << n << " key " << id;
+            if (n == folder) {
+                EXPECT_FALSE(r.firstIsError) << "the source leader answers the row itself";
+                EXPECT_EQ(r.finalNode, n);
+            } else {
+                EXPECT_TRUE(r.firstIsError && r.firstCode == cRedirect) << "node " << n << " is not the source leader: Redirect (first " << r.firstCode << ")";
+                EXPECT_EQ(r.firstMessage, c.clientChannel(folder)) << "...to the source partition's leader";
+                EXPECT_EQ(r.finalNode, folder);
+            }
+        }
+        const auto absent = rig.viewRowFollowing(n, vi->id, 999);
+        ASSERT_TRUE(absent.answered);
+        EXPECT_TRUE(!absent.finalIsError && absent.finalCode == pc::ViewRowResponse::kAbsentKey)
+            << "node " << n << ": a key that does not exist is AbsentKey after the redirect (got " << absent.finalCode << ")";
+    }
 }
 
 // ===========================================================================
@@ -836,7 +1063,11 @@ TEST(CatalogClusterRegression, MultiNodeRuntimeCreateViewFoldsOnTheSourceLeaderR
 // new topic is held (MetadataService::holdPlacementForTest) so the window is observable:
 // every produce probe through every broker, while no placement exists for the partition, is refused
 // retriably; once the placement is released the topic serves everywhere and holds exactly the records produced after.
-// RED (remove the gate): the probes are served (OK) on the static image.
+// RED (remove the Subscribe gate: ClientGateway::handleSubscribe's NotPlaced branch answers nothing): the Subscribe probes see
+// -1 (silence) and the test fails.  The PRODUCE probe is defense in depth with NO single-gate RED: besides servedPartition_'s
+// NotPlaced answer, a partition with no committed placement has no replica anywhere (so the intended-role hint is Unknown and
+// the owning worker has no replica to lead - its role gate refuses), and the routing image names no placed leader; removing
+// only the NotPlaced answer leaves those layers refusing it.  (M3: recorded, not a gap.)
 // ===========================================================================
 TEST(CatalogClusterRegression, NewTopicAfterLastUserTopicDroppedWaitsForCommittedPlacementRegression) {
     ThreeNodes c = ThreeNodes::start("b1");
@@ -862,59 +1093,27 @@ TEST(CatalogClusterRegression, NewTopicAfterLastUserTopicDroppedWaitsForCommitte
         ASSERT_EQ(userAssignments(n), 0) << "node " << n << ": the dropped topic's placements are still committed";
     }
     // Hold the initial placement of runtime topics (every broker; only the controller places).
-    auto holdPlacement = [&](bool on) {
-        for (int n : c.runningNodes())
-            c.node(n).onControlThreadForTest([&c, n, on] { c.node(n).metadataServiceForTest()->holdPlacementForTest(on); return 0; });
-    };
-    holdPlacement(true);
+    rig.holdPlacementEverywhere(true);
     const RequestId rid = rig.freshRid_();
     const int64_t corr = rig.sendOnly(leader, defineSender("b", 3, true), rid);
     ASSERT_GT(corr, 0);
     // (read through ANOTHER broker's session: the leader's session queues behind the held DDL answer, FIFO)
     const auto info = rig.topicInfo(leader == 1 ? 2 : 1, "b", 20s);
     ASSERT_TRUE(info.has_value()) << "the create applied";
-    auto placed = [&](int n, int p) {
-        return c.node(n).onControlThreadForTest([&c, n, id = info->id, p]() -> bool {
-            return c.node(n).metadataServiceForTest()->assignment(id, p) != nullptr;
-        });
-    };
-    int checked = 0, subscribeChecked = 0;
+    // Every probe is refused RETRIABLY (Redirect / NotLeader, one Redirect hop followed) - never served, never
+    // UnknownTopic, never silence (R-I2) - on every broker, for produce and Subscribe alike.  No "placed before and after"
+    // filter: the hold covers every placement path (MetadataService::holdPlacementForTest), so there is no placement.
     // (the DDL's OK is held by the answer gate for at most 5 s: probe for ~2 s, then release the placement)
+    int probes = 0;
     const auto windowEnd = Clock::now() + 2000ms;
     while (Clock::now() < windowEnd) {
-        for (int n : c.runningNodes()) {
-            for (int p = 0; p < info->partitions && Clock::now() < windowEnd; ++p) {
-                int target = n;
-                int code = -1;
-                for (int hop = 0; hop < 2; ++hop) {
-                    const bool tAbsent = !placed(target, p);
-                    std::string redirect;
-                    code = rig.produceOnce(target, info->id, p, batchFor(true, 1, "probe"), &redirect);
-                    const bool tStillAbsent = !placed(target, p);
-                    if (tAbsent && tStillAbsent) {
-                        ++checked;
-                        EXPECT_NE(code, cOk) << "node " << target << " served a produce to partition " << p
-                                             << " of a topic whose placement is not committed (static image)";
-                    }
-                    // The same for a Subscribe: refused retriably, never accepted (an accepted subscription would be served).
-                    std::string sredirect;
-                    const bool sAbsent = !placed(target, p);
-                    const int scode = rig.subscribeOnce(target, info->id, p, &sredirect);
-                    if (sAbsent && !placed(target, p)) {
-                        ++subscribeChecked;
-                        EXPECT_NE(scode, cOk) << "node " << target << " accepted a subscribe to partition " << p
-                                              << " of a topic whose placement is not committed (static image)";
-                    }
-                    if (code != cRedirect || rig.nodeOf(redirect) < 0) break;
-                    target = rig.nodeOf(redirect);
-                }
-            }
-        }
+        for (int n : c.runningNodes())
+            for (int p = 0; p < info->partitions && Clock::now() < windowEnd; ++p)
+                probes += rig.expectRetriableRefusal(n, info->id, p, "b1");
         std::this_thread::sleep_for(20ms);
     }
-    EXPECT_GE(checked, 9) << "the no-placement window was observed on every broker";
-    EXPECT_GE(subscribeChecked, 9) << "...for Subscribe too";
-    holdPlacement(false);   // the placement is emitted and commits; the DDL's OK (held until the topic serves) arrives
+    EXPECT_GT(probes, 0) << "the no-placement window was probed";
+    rig.holdPlacementEverywhere(false);   // the placement is emitted and commits; the DDL's OK (held until the topic serves) arrives
     const Answer a = rig.await(corr, 30s);
     ASSERT_TRUE(a.got);
     EXPECT_EQ(a.code, cOk);
@@ -1033,7 +1232,18 @@ TEST(CatalogClusterRegression, NewCatalogLeaderRefusesDdlUntilCaughtUpRegression
     for (int f : followers) c.node(f).holdCatalogApplyForTest(false);   // the applier runs
     const CellResult y = rig.drive(defineSender("y", 1, true), N, Ry);
     ASSERT_EQ(y.finalCode, cOk) << y.trace;
-    EXPECT_TRUE(rig.topicInfo(N, "x", 30s).has_value()) << "x applied before y was accepted";
+    EXPECT_TRUE(rig.topicInfo(N, "x", 30s).has_value()) << "x is applied on the new leader";
+    {   // M7: x is before y in the log, and the applier is past y (x was applied before y was accepted - not merely "eventually")
+        int64_t xOff = -1, yOff = -1;
+        for (const auto& re : c.catalogEventsOn(N)) {
+            if (re.event.objectName == "x" && re.event.kind == rune::catalog::EventKind::CreateTopic) xOff = static_cast<int64_t>(re.offset);
+            if (re.event.principal.requestId == Ry) yOff = static_cast<int64_t>(re.offset);
+        }
+        ASSERT_GE(xOff, 0);
+        ASSERT_GE(yOff, 0);
+        EXPECT_LT(xOff, yOff) << "x precedes y in the catalog log";
+        EXPECT_GT(ThreeNodes::snapOf(c.node(N)).applied, yOff) << "the applier is past y";
+    }
     rig.pumping([&] { c.startNode(L); });
     ASSERT_TRUE(c.awaitCatalogDigestsEqual(90s, &why)) << why;
     EXPECT_EQ(c.countEventsWithRequestId(Ry), 1u);

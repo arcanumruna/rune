@@ -849,7 +849,7 @@ TEST(CatalogBootRegression, WipedCatalogBrokerQuarantinesNothingBeforeCatchUpAnd
     EXPECT_TRUE(fs::exists(vdir / "topics" / "orphan" / "0" / "00000000000000000000.log"))
         << "NO topic dir is touched before the applier caught up";
     EXPECT_FALSE(fs::exists(vdir / "quarantine"));
-    v.releaseCatalogApplyForTest();
+    v.holdCatalogApplyForTest(false);
     ASSERT_TRUE(v.awaitBootReconcileSettledForTest(30s));
     EXPECT_EQ(v.bootReconcileStateForTest(), "Done");
     const auto s = sentinelOf(vdir);

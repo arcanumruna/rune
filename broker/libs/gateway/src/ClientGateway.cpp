@@ -3114,6 +3114,7 @@ void ClientGateway::forgetDroppedTopic(int32_t topicId, int32_t partitions,
                                        std::span<rune::storage::Log* const> logs)
 {
     std::erase(viewSinksAwaitingPlan_, topicId);   // Task 12 (N5): a dropped sink waits for nothing
+    forgetViewSource(topicId);                     // Task 22 fix round 1 (C1): no source to route a read to
     for (int32_t p = 0; p < partitions; ++p) {
         partitionTxnStates_.erase(partitionKey(topicId, p));
         if (const auto it = inlinePsm_.find(inlinePsmKey_(topicId, p)); it != inlinePsm_.end()) {
@@ -4397,30 +4398,7 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     //
     // Helper: send redirect/notleader error response for subscribe.
     auto sendSubRedirect = [&](const std::string& endpoint, int64_t corrId) {
-        pc::ErrorResponse errResp;
-        errResp.sessionId     = msg.sessionId;
-        errResp.correlationId = corrId;
-        if (!endpoint.empty()) {
-            errResp.code    = static_cast<int16_t>(pc::ErrorCode::Redirect);
-            errResp.message = endpoint;
-            spdlog::debug("ClientGateway: Subscribe per-partition redirect sessionId={} → {}",
-                          msg.sessionId, endpoint);
-        } else {
-            errResp.code    = static_cast<int16_t>(pc::ErrorCode::NotLeader);
-            spdlog::debug("ClientGateway: Subscribe per-partition NotLeader (endpoint unknown) sessionId={}",
-                          msg.sessionId);
-        }
-        const std::size_t needed = pc::MessageHeader::ENCODED_SIZE +
-                                   pc::ErrorResponse::BODY_FIXED + 2 +
-                                   errResp.message.size();
-        if (needed > scratch_.size()) [[unlikely]] {
-            // Fix round 2: an endpoint too long for the frame is never dropped —
-            // the client gets the bare NotLeader (it refreshes metadata, retries).
-            errResp.code    = static_cast<int16_t>(pc::ErrorCode::NotLeader);
-            errResp.message = {};
-        }
-        const std::size_t encoded = errResp.encode(scratch_.data());
-        sendAnswer_(*session, scratch_.data(), encoded);  // CG round 3: queued, not best-effort
+        sendRouteRefusal_(*session, msg.sessionId, corrId, endpoint);
     };
 
     // Cluster-level fallback: only when routingImage_ is null.
@@ -4930,6 +4908,72 @@ ClientGateway::CatalogRoom ClientGateway::catalogEgressRoom(int64_t sessionId)
     s->catalogWindowSeen = std::max(s->catalogWindowSeen, w);
     const int64_t need = catalogResumeThreshold(s->egress->termBufferLength(), s->catalogWindowSeen);
     return w >= need ? CatalogRoom::Ready : CatalogRoom::NotYet;
+}
+
+// Task 22 fix round 1 (C1): the shared Redirect / NotLeader refusal (the body of
+// handleSubscribe's former sendSubRedirect lambda, DRY with GetViewRow).
+void ClientGateway::sendRouteRefusal_(Session& s, int64_t sessionId, int64_t corr, std::string_view endpoint)
+{
+    pc::ErrorResponse errResp;
+    errResp.sessionId     = sessionId;
+    errResp.correlationId = corr;
+    if (!endpoint.empty()) {
+        errResp.code    = static_cast<int16_t>(pc::ErrorCode::Redirect);
+        errResp.message = endpoint;
+        spdlog::debug("ClientGateway: per-partition redirect sessionId={} → {}", sessionId, endpoint);
+    } else {
+        errResp.code    = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+        spdlog::debug("ClientGateway: per-partition NotLeader (endpoint unknown) sessionId={}", sessionId);
+    }
+    const std::size_t needed = pc::MessageHeader::ENCODED_SIZE +
+                               pc::ErrorResponse::BODY_FIXED + 2 +
+                               errResp.message.size();
+    if (needed > scratch_.size()) [[unlikely]] {
+        // Fix round 2: an endpoint too long for the frame is never dropped —
+        // the client gets the bare NotLeader (it refreshes metadata, retries).
+        errResp.code    = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+        errResp.message = {};
+    }
+    const std::size_t encoded = errResp.encode(scratch_.data());
+    sendAnswer_(s, scratch_.data(), encoded);  // CG round 3: queued, not best-effort
+}
+
+// Task 22 fix round 1 (C1) — view -> source topic (control thread, cold writes).
+void ClientGateway::noteViewSource(int32_t viewTopicId, int32_t sourceTopicId)
+{
+    const auto it = std::lower_bound(viewSources_.begin(), viewSources_.end(), viewTopicId,
+                                     [](const auto& e, int32_t id) { return e.first < id; });
+    if (it != viewSources_.end() && it->first == viewTopicId) it->second = sourceTopicId;
+    else viewSources_.insert(it, {viewTopicId, sourceTopicId});
+}
+
+void ClientGateway::forgetViewSource(int32_t viewTopicId)
+{
+    const auto it = std::lower_bound(viewSources_.begin(), viewSources_.end(), viewTopicId,
+                                     [](const auto& e, int32_t id) { return e.first < id; });
+    if (it != viewSources_.end() && it->first == viewTopicId) viewSources_.erase(it);
+}
+
+int32_t ClientGateway::viewSourceOf_(int32_t viewTopicId) const noexcept
+{
+    const auto it = std::lower_bound(viewSources_.begin(), viewSources_.end(), viewTopicId,
+                                     [](const auto& e, int32_t id) { return e.first < id; });
+    return (it != viewSources_.end() && it->first == viewTopicId) ? it->second : -1;
+}
+
+bool ClientGateway::viewSourceLedElsewhere_(int32_t viewTopicId, int32_t partition,
+                                            std::string_view& endpoint) const noexcept
+{
+    endpoint = {};
+    if (!routingImage_) return false;
+    const int32_t src = viewSourceOf_(viewTopicId);
+    if (src < 0) return false;
+    const auto& e = routingImage_.get()->lookup(rune::metadata::gpidOf(src, partition));
+    if (e.leaderNodeId == thisNodeId_) return false;
+    if (e.leaderNodeId != rune::metadata::RoutingImage::NO_LEADER_NODE_ID)
+        if (const auto it = nodeEndpointMap_.find(e.leaderNodeId); it != nodeEndpointMap_.end())
+            endpoint = it->second;
+    return true;
 }
 
 void ClientGateway::noteViewSinkAwaitingPlan(int32_t viewTopicId)
@@ -6132,6 +6176,15 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
         if (ret.type == rune::node::WorkerReturn::Type::ViewRowResult) {
             Session* session = sessions_.find(ret.sessionId);
             if (!session) return;   // session gone — drop (point read is idempotent)
+            // C1: the worker does not lead the view's source partition (the image
+            // lagged, or this is an ex-leader): redirect to the image's leader —
+            // never encode the internal sentinel as a ViewRowResponse status.
+            if (ret.errorCode == rune::node::kViewRowNotLeaderInternal) [[unlikely]] {
+                std::string_view ep;
+                (void)viewSourceLedElsewhere_(ret.readTopicId, ret.readPartition, ep);   // this node: bare NotLeader
+                sendRouteRefusal_(*session, ret.sessionId, ret.correlationId, ep);
+                return;
+            }
             const std::span<const uint8_t> rowBytes = ret.chunkBytes();
             pc::ViewRowResponse resp;
             resp.sessionId     = ret.sessionId;
@@ -7391,6 +7444,15 @@ void ClientGateway::handleGetViewRow(const uint8_t* buf, std::size_t len)
     }
     if (const uint16_t gate = viewRowGate_(m.viewTopicId, partition); gate != kViewRowNoGate) {
         (void)rejectRequest_(buf, len, gate, "GetViewRow: view not served here (C1)");
+        return;
+    }
+    // Task 22 fix round 1 (C1): a view row is served only by the broker that leads
+    // its source partition (the view partition IS the source partition).  Anyone
+    // else redirects to that leader (bare NotLeader when leaderless).  The gate
+    // above stays first (Dropped -> UnknownView).  The worker re-checks its own
+    // role + catch-up (the image may lag a leadership change).
+    if (std::string_view ep; viewSourceLedElsewhere_(m.viewTopicId, partition, ep)) {
+        sendRouteRefusal_(*session, m.sessionId, m.correlationId, ep);
         return;
     }
 

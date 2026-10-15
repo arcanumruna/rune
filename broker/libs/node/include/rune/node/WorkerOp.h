@@ -52,6 +52,12 @@ namespace rune::replication { class PartitionReplica; }
 
 namespace rune::node {
 
+/// Task 22 fix round 1 (C1): a worker's INTERNAL GetViewRow answer code (never on
+/// the wire, never a ViewRowResponse status): this worker does not hold the view's
+/// source partition as LEADER.  The gateway turns it into the Redirect to the
+/// source-partition leader (or the bare NotLeader when none is known).
+inline constexpr int16_t kViewRowNotLeaderInternal = 0x7F01;
+
 // ---------------------------------------------------------------------------
 // WorkerOp — ingress op sent from the control thread to a Worker.
 // ---------------------------------------------------------------------------

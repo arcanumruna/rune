@@ -1051,6 +1051,14 @@ public:
     /// plan reached every worker's install ring (or the view was dropped).
     void noteViewSinkAwaitingPlan(int32_t viewTopicId);
     void noteViewPlanDelivered(int32_t viewTopicId);
+    /// Task 22 fix round 1 (C1) — control thread (cold): a view's sink topic id →
+    /// its source topic (plan.sourceTopicId[0]).  GetViewRow is answered only on
+    /// the broker that leads (source, partition); the view partition IS the source
+    /// partition (spec §11.2, coLocateViewWithSource).  Insert-or-replace / erase
+    /// keep the vector sorted by view id; the read is a lower_bound (zero-alloc).
+    void noteViewSource(int32_t viewTopicId, int32_t sourceTopicId);
+    void forgetViewSource(int32_t viewTopicId);
+    [[nodiscard]] int32_t viewSourceOf_(int32_t viewTopicId) const noexcept;   // -1 = unknown
     [[nodiscard]] bool viewSinkAwaitingPlan(int32_t viewTopicId) const noexcept {
         for (const int32_t id : viewSinksAwaitingPlan_) if (id == viewTopicId) return true;
         return false;
@@ -2062,6 +2070,18 @@ private:
     // the retriable NotReady, never the worker's permanent UnknownView.  Cold
     // (one entry per view in creation); usually empty — one size check per read.
     std::vector<int32_t> viewSinksAwaitingPlan_;
+    /// C1: sorted by view topic id — (view, its source topic).  Control thread only.
+    std::vector<std::pair<int32_t, int32_t>> viewSources_;
+    /// Answer a data/read op that reached a broker which does not lead its
+    /// partition: ErrorResponse{Redirect, endpoint}, or the bare NotLeader when the
+    /// endpoint is empty or too long for the frame.  Queued (sendAnswer_), never dropped.
+    void sendRouteRefusal_(Session& s, int64_t sessionId, int64_t corr, std::string_view endpoint);
+    /// C1: true iff the routing image names a leader of (the view's source, partition)
+    /// other than this node, or none at all; `endpoint` is then that leader's client
+    /// endpoint (empty when leaderless / unknown).  False: this node leads it, the
+    /// view's source is unknown here, or there is no image — the worker decides.
+    [[nodiscard]] bool viewSourceLedElsewhere_(int32_t viewTopicId, int32_t partition,
+                                               std::string_view& endpoint) const noexcept;
     int64_t catalogBackPressureForTest_ = 0;   // setCatalogBackPressureForTest (0 = none)
 
     // E5.1.3 (e): per-worker ingress active flag.

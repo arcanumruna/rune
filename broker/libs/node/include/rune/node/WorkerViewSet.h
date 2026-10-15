@@ -71,6 +71,12 @@ namespace rune::node {
 //                      committed source tail (foldCursor, committedTail] still
 //                      has to be folded.  A GetViewRow here is a RETRIABLE
 //                      not-ready — NEVER a half-built row (Review-focus #5).
+//   CatchingUp       — (catalog history Task 22 fix round 1, C1) a LEADER-LOCAL
+//                      (re)fold: the source replica became leader (a new
+//                      leadership generation) while this table was behind its
+//                      committed tail.  Not restart recovery; a GetViewRow here
+//                      is the retriable NotReady, and the state does NOT gate
+//                      election eligibility (allViewsReady ignores it).
 //   Ready            — foldCursor >= committedTail; the table is fully caught up
 //                      and may be served.
 //
@@ -79,7 +85,7 @@ namespace rune::node {
 // dependency, no cross-thread coordination.  It is bounded by the checkpoint
 // cadence (each rebuild pass folds a bounded committed range), deadlock-free,
 // and monotone (Recovering -> RebuildingViews -> Ready, never backwards).
-enum class ViewReadiness : uint8_t { Recovering, RebuildingViews, Ready };
+enum class ViewReadiness : uint8_t { Recovering, RebuildingViews, CatchingUp, Ready };
 
 // Task 19b: split an on-disk view checkpoint file into its individual Task-12
 // records.  The file a ViewSnapshotIoAgent writes is a BARE concatenation of
@@ -203,6 +209,12 @@ struct ViewInstance {
     // path.  installViewForRecovery is the ONLY writer that lowers it to
     // RebuildingViews; driveRebuild is the only one that raises it back to Ready.
     ViewReadiness                      readiness       = ViewReadiness::Ready;
+
+    // C1 (Task 22 fix round 1): the source replica's leadershipGeneration() this
+    // table is caught up under; 0 = never driven by a leader.  A read is served
+    // only while it equals the replica's CURRENT generation (an ex-leader's frozen
+    // table, or a new leader's not-yet-folded one, is never served).
+    uint64_t                           foldLeadership  = 0;
 
     // Cumulative fold-anomaly counters (see ViewFoldCounters).
     ViewFoldCounters                   counters;
@@ -330,7 +342,9 @@ public:
     // a pure read over worker-owned state.
     [[nodiscard]] bool allViewsReady() const noexcept {
         for (const auto& kv : views_) {
-            if (kv.second.readiness != ViewReadiness::Ready) return false;
+            // CatchingUp (leader-local re-fold) never gates election eligibility.
+            if (kv.second.readiness == ViewReadiness::Recovering ||
+                kv.second.readiness == ViewReadiness::RebuildingViews) return false;
         }
         return true;
     }
@@ -348,7 +362,7 @@ public:
     template <class ReadRangeFn>
     int driveRebuild(int32_t srcTopicId, int32_t partition, ReadRangeFn&& readRange,
                      int64_t committedTail, int64_t nowNs,
-                     const TransientBounds* transientSrc = nullptr) {
+                     const TransientBounds* transientSrc = nullptr, uint64_t leaderGen = 0) {
         (void)nowNs;  // reserved for checkpoint cadence (Phase 1: every batch boundary)
         auto it = subscriptionIndex_.find(srcTopicId);
         if (it == subscriptionIndex_.end()) return 0;
@@ -358,7 +372,7 @@ public:
             if (vit == views_.end()) continue;  // not hosted-for-recovery here
             ViewInstance& inst = vit->second;
             if (inst.readiness == ViewReadiness::Ready) continue;  // already caught up
-            work += driveView_(inst, readRange, committedTail, transientSrc);
+            work += driveView_(inst, readRange, committedTail, transientSrc, leaderGen);
             if (inst.foldCursor >= committedTail) {
                 inst.readiness = ViewReadiness::Ready;
                 // Task 19b: once EVERY hosted instance of this view is Ready, drop
@@ -389,7 +403,7 @@ public:
     template <class ReadRangeFn>
     int driveFolds(int32_t srcTopicId, int32_t partition, ReadRangeFn&& readRange,
                    int64_t bound, int64_t nowNs,
-                   const TransientBounds* transientSrc = nullptr) {
+                   const TransientBounds* transientSrc = nullptr, uint64_t leaderGen = 0) {
         (void)nowNs;  // reserved for checkpoint cadence (Phase 1: every batch boundary)
         auto it = subscriptionIndex_.find(srcTopicId);
         if (it == subscriptionIndex_.end()) return 0;
@@ -400,7 +414,7 @@ public:
             // driveRebuild/materializeRecoveryInstancesFor already use.
             ViewInstance* inst = getOrCreate_(viewTopicId, partition, bound);
             if (inst == nullptr) continue;  // defensive: template must exist
-            work += driveView_(*inst, readRange, bound, transientSrc);
+            work += driveView_(*inst, readRange, bound, transientSrc, leaderGen);
         }
         return work;
     }
@@ -426,6 +440,21 @@ public:
     // on the partition-independent plan template).  Returns false when no view
     // plan is installed here for that id — the GetViewRow serve path maps that to
     // UnknownView.  A pure read of worker-owned state (no allocation).
+    /// C1: the view's first source topic (plan.sourceTopicId[0]), or -1 when no
+    /// plan is installed here.  Pure read of worker-owned state.
+    [[nodiscard]] int32_t viewSourceTopic(int32_t viewTopicId) const noexcept {
+        const auto it = templates_.find(viewTopicId);
+        if (it == templates_.end() || it->second.plan.sourceTopicId.empty()) return -1;
+        return it->second.plan.sourceTopicId[0];
+    }
+    /// C1: the source leadership generation the (view, partition) table is caught
+    /// up under; nullopt when no instance is hosted (never folded here).
+    [[nodiscard]] std::optional<uint64_t> instanceLeadership(int32_t viewTopicId,
+                                                             int32_t partition) const noexcept {
+        const auto it = views_.find(instKey(viewTopicId, partition));
+        if (it == views_.end()) return std::nullopt;
+        return it->second.foldLeadership;
+    }
     [[nodiscard]] bool viewOutputFingerprint(int32_t viewTopicId, uint64_t& out) const {
         const auto it = templates_.find(viewTopicId);
         if (it == templates_.end()) return false;
@@ -537,12 +566,21 @@ private:
     // progress count for the instance.
     template <class ReadRangeFn>
     int driveView_(ViewInstance& inst, ReadRangeFn&& readRange, int64_t bound,
-                   const TransientBounds* transientSrc) {
+                   const TransientBounds* transientSrc, uint64_t leaderGen) {
         int work = 0;
         // 0. Phase 2b E: a TRANSIENT source — reconcile THIS instance's cursor
         //    against the source's live range (no extra hash lookups: the caller
         //    already holds the instance).  Disk sources pass nullptr.
         if (transientSrc != nullptr) work += reconcileTransient_(inst, *transientSrc);
+        // 0b. C1 (Task 22 fix round 1): a NEW leadership of the source partition —
+        //     this table was folded under an older one (or never).  Until it has
+        //     folded the committed tail under THIS leadership it is CatchingUp
+        //     (NotReady to readers); the two Ready flips below return it to Ready.
+        if (inst.foldLeadership != leaderGen) {
+            inst.foldLeadership = leaderGen;
+            if (inst.readiness == ViewReadiness::Ready && inst.foldCursor < bound)
+                inst.readiness = ViewReadiness::CatchingUp;
+        }
         // 1. A delta held from a back-pressured prior pass flushes first.  Held
         //    view work counts as progress (keep the worker hot so it retries the
         //    ring); if it still cannot be pushed, hold and do not fold further.

@@ -3176,6 +3176,34 @@ private:
             return;
         }
 
+        // 2b. C1 (Task 22 fix round 1): a view row is served only by the LEADER of
+        //     its source partition, and only once the table is caught up under
+        //     THIS leadership.  An ex-leader's frozen table, a follower (no table)
+        //     or a broker that does not hold the partition answer the internal
+        //     not-leader sentinel (the gateway redirects); a new leader that has
+        //     not folded its committed tail yet answers NotReady — never a stale
+        //     row or a wrong AbsentKey.  A linear scan of the worker-owned vector.
+        {
+            const int32_t src = viewSet_->viewSourceTopic(viewTopicId);
+            const rune::replication::PartitionReplica* srcRep = nullptr;
+            for (auto* r : owned_)
+                if (r != nullptr && r->topicId() == src && static_cast<int32_t>(r->partitionId()) == partition) {
+                    srcRep = r;
+                    break;
+                }
+            if (srcRep == nullptr || srcRep->role() != rune::replication::Role::Leader) {
+                ret.errorCode = kViewRowNotLeaderInternal;
+                enqueueReturn_(std::move(ret));
+                return;
+            }
+            const auto gen = viewSet_->instanceLeadership(viewTopicId, partition);
+            if (!gen || *gen != srcRep->leadershipGeneration()) {   // not folded under THIS leadership yet
+                ret.errorCode = static_cast<int16_t>(RS::kNotReady);
+                enqueueReturn_(std::move(ret));
+                return;
+            }
+        }
+
         // 3. Probe the view table.  getRow applies the Task 16 serve-guard
         //    (NotReady while rebuilding) and distinguishes a genuinely absent key.
         const rune::view::RowLayout*  layout = nullptr;
@@ -5342,7 +5370,8 @@ private:
                 auto readRange = [this, log](int64_t from, int64_t to) -> rune::storage::LogReadView {
                     return readNoFault_(log, from, kPushMaxChunkBytes, to);
                 };
-                work += driveViewsOf_(topicId, partition, readRange, bound, nowNs, nullptr);
+                work += driveViewsOf_(topicId, partition, readRange, bound, nowNs, nullptr,
+                                      replica->leadershipGeneration());
             } else {
                 // Phase 2b E: a TRANSIENT source — zero-copy view into the
                 // replica's own ring (same thread).  The fold itself stops at its
@@ -5352,7 +5381,8 @@ private:
                 auto readRange = [mem](int64_t from, int64_t /*to*/) -> rune::storage::LogReadView {
                     return mem->readView(from, kPushMaxChunkBytes);
                 };
-                work += driveViewsOf_(topicId, partition, readRange, bound, nowNs, replica);
+                work += driveViewsOf_(topicId, partition, readRange, bound, nowNs, replica,
+                                      replica->leadershipGeneration());
             }
         }
         return work;
@@ -5369,7 +5399,8 @@ private:
     template <class ReadRangeFn>
     int driveViewsOf_(int32_t topicId, int32_t partition, ReadRangeFn& readRange,
                       int64_t bound, int64_t nowNs,
-                      const rune::replication::PartitionReplica* transientRep) {
+                      const rune::replication::PartitionReplica* transientRep,
+                      uint64_t leaderGen) {
         int work = 0;
         TransientBounds tb;
         const TransientBounds* tbp = nullptr;
@@ -5384,9 +5415,9 @@ private:
         }
         if (viewSet_->hasRecovery()) [[unlikely]] {
             viewSet_->materializeRecoveryInstancesFor(topicId, partition, bound);
-            work += viewSet_->driveRebuild(topicId, partition, readRange, bound, nowNs, tbp);
+            work += viewSet_->driveRebuild(topicId, partition, readRange, bound, nowNs, tbp, leaderGen);
         }
-        work += viewSet_->driveFolds(topicId, partition, readRange, bound, nowNs, tbp);
+        work += viewSet_->driveFolds(topicId, partition, readRange, bound, nowNs, tbp, leaderGen);
         return work;
     }
 

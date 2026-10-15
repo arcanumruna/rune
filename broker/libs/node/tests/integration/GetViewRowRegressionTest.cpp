@@ -43,6 +43,7 @@
 #include <rune/replication/Types.h>
 #include <rune/storage/Log.h>
 #include <rune/storage/LogReadView.h>
+#include <rune/storage/InMemoryLog.h>
 
 #include <rune/view/PlanCompiler.h>
 #include <rune/view/ViewPlan.h>
@@ -150,6 +151,35 @@ std::vector<uint8_t> oneUpsert(int64_t key, int32_t hp) {
     return b.build();
 }
 
+// Task 22 fix round 1 (C1): a view row is served only by the LEADER of its source
+// partition, so every Worker here owns the source partition's replica.  A
+// memory-backed single-node replica promoted through becomeLeader (a real
+// leadership generation, >= 1, exactly as production).
+struct SrcReplica {
+    rune::storage::InMemoryLog            log{/*maxBytes=*/1 << 20, /*maxRecords=*/1000};
+    rune::replication::InMemoryTransport  transport;
+    std::unique_ptr<PartitionReplica>     replica;
+
+    explicit SrcReplica(int32_t topicId = kSrcTopicId, int32_t partition = 0) {
+        PartitionConfig cfg{};
+        cfg.topicId             = topicId;
+        cfg.partitionId         = static_cast<rune::replication::PartitionId>(partition);
+        cfg.selfId              = 1;
+        cfg.minIsr              = 1;
+        cfg.replicaLagMaxMs     = 10'000;
+        cfg.replicaLagMaxOffset = 10'000;
+        cfg.fetchIntervalNs     = 1'000'000LL;
+        cfg.isrCheckIntervalNs  = 1'000'000LL;
+        cfg.maxFetchBytes       = 1 << 20;
+        cfg.pushOnAppend        = false;
+        replica = std::make_unique<PartitionReplica>(cfg, rune::replication::Role::Follower, /*epoch=*/0,
+                                                     std::vector<rune::replication::NodeId>{1},
+                                                     std::vector<rune::replication::NodeId>{1}, &log, &transport);
+        replica->becomeLeader(/*epoch=*/1, {1});
+    }
+    [[nodiscard]] uint64_t gen() const { return replica->leadershipGeneration(); }
+};
+
 // Enqueue a GetViewRow op, drive one worker duty cycle, and drain the single
 // ViewRowResult back off the return ring.
 WorkerReturn runGetViewRow(Worker& w, int32_t viewTopicId, int32_t partition,
@@ -193,9 +223,11 @@ TEST(GetViewRowRegression, GetViewRowAbsentKeyReturnsTypedAbsent) {
     auto readRange = [&](int64_t, int64_t) -> rune::storage::LogReadView {
         return rune::storage::LogReadView{batch.data(), batch.size(), 0, 1};
     };
-    vs.driveFolds(kSrcTopicId, /*partition*/ 0, readRange, /*bound*/ 1, 0);
+    SrcReplica srcRep;
+    vs.driveFolds(kSrcTopicId, /*partition*/ 0, readRange, /*bound*/ 1, 0, nullptr, srcRep.gen());
 
     Worker w(/*workerId*/ 0);
+    w.setOwnedDirect(Worker::OwnedSet{srcRep.replica.get()});
     w.setViewSet(&vs);
 
     const WorkerReturn ret = runGetViewRow(w, kViewTopicId, /*partition*/ 0,
@@ -223,9 +255,11 @@ TEST(GetViewRowRegression, GetViewRowReturnsCurrentRowAfterFold) {
     auto readRange = [&](int64_t, int64_t) -> rune::storage::LogReadView {
         return rune::storage::LogReadView{batch.data(), batch.size(), 0, 1};
     };
-    vs.driveFolds(kSrcTopicId, /*partition*/ 0, readRange, /*bound*/ 1, 0);
+    SrcReplica srcRep;
+    vs.driveFolds(kSrcTopicId, /*partition*/ 0, readRange, /*bound*/ 1, 0, nullptr, srcRep.gen());
 
     Worker w(/*workerId*/ 0);
+    w.setOwnedDirect(Worker::OwnedSet{srcRep.replica.get()});
     w.setViewSet(&vs);
 
     const WorkerReturn ret = runGetViewRow(w, kViewTopicId, /*partition*/ 0,
@@ -316,8 +350,10 @@ TEST(GetViewRowRegression, PlanOnTheInstallRingAheadOfTheReadIsNeverUnknownViewR
         vp.srcDescBlob = rune::codec::serialize(src);
         ASSERT_TRUE(encodeViewPlanUpdate(channel.install, ViewSnapshotChannel::kInstallMsgType, vp));
 
+        SrcReplica srcRep;   // C1: the read reaches the plan check only on the source leader
         Worker w(/*workerId*/ 0);
         w.setShardMode(shard);
+        w.setOwnedDirect(Worker::OwnedSet{srcRep.replica.get()});
         w.setViewSet(&vs);
         ASSERT_EQ(vs.viewCount(), 0u) << "precondition: the plan is still on the ring";
         const WorkerReturn ret = runGetViewRow(w, kViewTopicId, 0, /*key=*/7, /*fp=*/0);
@@ -375,8 +411,11 @@ TEST(GetViewRowRegression, MultiWorkerRoutesToSourceOwnerViaCoLocation) {
     auto readRange = [&](int64_t, int64_t) -> rune::storage::LogReadView {
         return rune::storage::LogReadView{batch.data(), batch.size(), 0, 1};
     };
-    vsByWorker[srcOwner]->driveFolds(kSrcTopicId, /*partition*/ 0, readRange, /*bound*/ 1, 0);
+    SrcReplica srcRep;
+    vsByWorker[srcOwner]->driveFolds(kSrcTopicId, /*partition*/ 0, readRange, /*bound*/ 1, 0, nullptr,
+                                     srcRep.gen());
 
+    pool.worker(srcOwner).setOwnedDirect(Worker::OwnedSet{srcRep.replica.get()});
     pool.worker(0).setViewSet(&vs0);
     pool.worker(1).setViewSet(&vs1);
 
@@ -401,8 +440,10 @@ TEST(GetViewRowRegression, MultiWorkerRoutesToSourceOwnerViaCoLocation) {
 
     // RED: without co-location, viewTopicId routes to the wrong worker.
     const WorkerReturn pre = query();
-    EXPECT_EQ(pre.errorCode, static_cast<int16_t>(pc::ViewRowResponse::kAbsentKey))
-        << "pre-fix: a GetViewRow mis-routed to a non-folding worker answers AbsentKey";
+    // C1 (Task 22 fix round 1): a worker that does not lead the source partition no longer
+    // answers a SILENT AbsentKey for a live key — it answers the not-leader sentinel.
+    EXPECT_EQ(pre.errorCode, kViewRowNotLeaderInternal)
+        << "a GetViewRow mis-routed to a non-source-owner worker is never a silent AbsentKey";
 
     // GREEN: co-locate the view's shard group with its source; routing agrees.
     pool.coLocateViewWithSource(viewTopicId, kSrcTopicId);
@@ -413,6 +454,106 @@ TEST(GetViewRowRegression, MultiWorkerRoutesToSourceOwnerViaCoLocation) {
         << "post-fix: GetViewRow lands on the source owner (which folded the row)";
     ASSERT_EQ(post.chunk.size(), comp.rowLayout.rowLen);
     EXPECT_EQ(rv::readSlot(post.chunk.data(), comp.rowLayout, 1).i, 50);
+}
+
+// ---------------------------------------------------------------------------
+// BINDING (Task 22 fix round 1, C1, ex-leader): the source partition's leadership
+// moved away.  The worker's view table is frozen at the old leadership's last
+// fold, but the broker is now a FOLLOWER of the source — it must answer the
+// not-leader sentinel (the gateway redirects), never the stale row.
+//   RED (role check deleted): OK with the stale hp 1.
+// ---------------------------------------------------------------------------
+TEST(GetViewRowRegression, ViewReadOnANonLeaderSourceReplicaAnswersNotLeaderNeverAStaleRowRegression) {
+    auto src = charSourceV1();
+    const Descriptor* srcs[] = {&src};
+    auto comp = rv::compileView(hpView(), srcs, kViewTopicId).value();
+
+    ViewSnapshotChannel channel;
+    WorkerViewSet vs(channel, tmpDir("rune-views-gvr-exleader"));
+    vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ false);
+
+    const auto batch = oneUpsert(7, 1);   // key 7, hp 1
+    auto readRange = [&](int64_t, int64_t) -> rune::storage::LogReadView {
+        return rune::storage::LogReadView{batch.data(), batch.size(), 0, 1};
+    };
+    SrcReplica srcRep;
+    vs.driveFolds(kSrcTopicId, /*partition*/ 0, readRange, /*bound*/ 1, 0, nullptr, srcRep.gen());
+
+    Worker w(/*workerId*/ 0);
+    w.setOwnedDirect(Worker::OwnedSet{srcRep.replica.get()});
+    w.setViewSet(&vs);
+
+    const WorkerReturn before = runGetViewRow(w, kViewTopicId, 0, /*key*/ 7, /*fp*/ 0);
+    ASSERT_EQ(before.errorCode, static_cast<int16_t>(pc::ViewRowResponse::kOk));
+    EXPECT_EQ(rv::readSlot(before.chunk.data(), comp.rowLayout, 1).i, 1);
+
+    srcRep.replica->becomeFollower(/*leaderEpoch=*/2, /*leaderId=*/2);   // the ex-leader
+    ASSERT_NE(srcRep.replica->role(), rune::replication::Role::Leader);
+
+    const WorkerReturn after = runGetViewRow(w, kViewTopicId, 0, /*key*/ 7, /*fp*/ 0);
+    EXPECT_EQ(after.errorCode, kViewRowNotLeaderInternal)
+        << "an ex-leader never serves its frozen table (stale hp 1)";
+    EXPECT_TRUE(after.chunk.empty());
+}
+
+// ---------------------------------------------------------------------------
+// BINDING (Task 22 fix round 1, C1, new leader): a replica promoted with more
+// committed records than one fold pass covers (maxRecordsPerPass = 1) must
+// answer NotReady until its fold caught up under THIS leadership — never an
+// AbsentKey for a key it has not folded yet — and the catch-up must not make the
+// worker election-ineligible (viewsReady stays true).
+//   RED (CatchingUp transition removed): AbsentKey for key 5 after the first pass.
+//   RED (allViewsReady counts CatchingUp): the viewsReady assertion fails.
+// ---------------------------------------------------------------------------
+TEST(GetViewRowRegression, ANewLeaderAnswersNotReadyUntilItsReFoldCaughtUpRegression) {
+    auto src = charSourceV1();
+    const Descriptor* srcs[] = {&src};
+    auto comp = rv::compileView(hpView(/*persistence*/ 0), srcs, kViewTopicId).value();
+
+    // A tiny delta ring: its max message (capacity / 8 = 64 B) fits ONE record's checkpoint delta.
+    ViewSnapshotChannel channel{OneToOneByteRing{512}, OneToOneByteRing{4096}, OneToOneByteRing{1 << 20}};
+    WorkerViewSet vs(channel, tmpDir("rune-views-gvr-newleader"));
+    vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true);
+
+    SrcReplica srcRep;
+    // Five committed source records while leader at generation G.
+    for (int64_t id = 1; id <= 5; ++id) {
+        const auto k = keyBytes(id);
+        const auto v = encodeCharacter(id, static_cast<int32_t>(10 * id), 1);
+        ASSERT_GE(srcRep.replica->appendKeyed(std::span<const uint8_t>(k.data(), k.size()),
+                                              std::span<const uint8_t>(v.data(), v.size()), false), 0);
+    }
+    // The promotion: this replica leads under a NEW generation; the view has folded nothing of it.
+    const uint64_t genBefore = srcRep.gen();
+    srcRep.replica->becomeFollower(/*leaderEpoch=*/2, /*leaderId=*/2);
+    srcRep.replica->becomeLeader(/*epoch=*/3, {1});
+    ASSERT_GT(srcRep.gen(), genBefore);
+
+    Worker w(/*workerId*/ 0);
+    w.setOwnedDirect(Worker::OwnedSet{srcRep.replica.get()});
+    w.setViewSet(&vs);
+
+    int notReady = 0;
+    bool served = false;
+    for (int i = 0; i < 400 && !served; ++i) {
+        w.doWork(1'000'000LL * (i + 1));
+        channel.deltas.drain([](int32_t, aeron::concurrent::AtomicBuffer&, aeron::util::index_t, aeron::util::index_t) {},
+                             1 << 20);   // nobody else consumes the checkpoint deltas here
+        EXPECT_TRUE(w.viewsReady()) << "CatchingUp must never gate election eligibility (pass " << i << ")";
+        if (!vs.instanceLeadership(kViewTopicId, 0)) continue;   // the RC state is still building
+        const WorkerReturn r = runGetViewRow(w, kViewTopicId, 0, /*key*/ 5, /*fp*/ 0);
+        ASSERT_NE(r.errorCode, static_cast<int16_t>(pc::ViewRowResponse::kAbsentKey))
+            << "pass " << i << ": a key not folded yet is NotReady, never AbsentKey";
+        if (r.errorCode == static_cast<int16_t>(pc::ViewRowResponse::kOk)) {
+            served = true;
+            EXPECT_EQ(rv::readSlot(r.chunk.data(), comp.rowLayout, 1).i, 50);
+        } else {
+            ASSERT_EQ(r.errorCode, static_cast<int16_t>(pc::ViewRowResponse::kNotReady));
+            ++notReady;
+        }
+    }
+    EXPECT_TRUE(served) << "the re-fold must catch up";
+    EXPECT_GE(notReady, 2) << "maxRecordsPerPass = 1 over 5 records: several NotReady passes (the vacuity guard)";
 }
 
 // ---------------------------------------------------------------------------

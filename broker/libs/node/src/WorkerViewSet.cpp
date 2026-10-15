@@ -582,7 +582,8 @@ void WorkerViewSet::pruneRecoveryIfAllReady_(int32_t viewTopicId) {
     for (const auto& kv : views_) {
         // instKey packs viewTopicId in the high 32 bits (see instKey()).
         if (static_cast<int32_t>(static_cast<uint32_t>(kv.first >> 32)) != viewTopicId) continue;
-        if (kv.second.readiness != ViewReadiness::Ready) return;  // still rebuilding somewhere
+        if (kv.second.readiness == ViewReadiness::Recovering ||
+            kv.second.readiness == ViewReadiness::RebuildingViews) return;  // still rebuilding somewhere
     }
     recoveryViews_.erase(viewTopicId);
 }

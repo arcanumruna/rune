@@ -1167,6 +1167,9 @@ public:
     /// Catalog history Task 22 seam (CONTROL thread, via onControlThreadForTest): while held a runtime topic is
     /// recorded but its initial placement is not emitted (the window between "applied" and "placement committed" of
     /// the 3-node slice's B1 test); releasing it places every unplaced unit at once.  Never set in production.
+    /// Scope (Task 22 fix round 1, M8): the hold covers EVERY initial-placement path - addRuntimeTopic,
+    /// placeEveryUnassignedUnit_ (controller catch-up) and retryUnplaceable_ - so a held topic is never placed by
+    /// another route; it does not touch re-placement of an already-placed topic.
     void holdPlacementForTest(bool on) {
         placementHeldForTest_ = on;
         if (!on && controllerReady_() && !liveNodes_.empty() && !catalogHalted(selfId_)) {
@@ -2514,6 +2517,7 @@ private:
     }
     /// Every configured unit with an unassigned partition, each on its own.
     void placeEveryUnassignedUnit_() {
+        if (placementHeldForTest_) [[unlikely]] return;   // Task 22 seam covers EVERY placement path (M8)
         std::vector<rune::metadata::TopicSpec> unit;
         std::vector<std::string> groupsDone;
         for (const auto& ts : configuredTopics_) {
@@ -2528,7 +2532,7 @@ private:
     /// Controller: re-try the Unplaceable units once per placement-input change.
     void retryUnplaceable_() {
         if (unplaceable_.empty() || routingInputsEpoch_ == unplaceableTriedEpoch_) return;
-        if (!controllerReady_() || catalogHalted(selfId_)) return;
+        if (!controllerReady_() || catalogHalted(selfId_) || placementHeldForTest_) return;   // seam: M8
         unplaceableTriedEpoch_ = routingInputsEpoch_;
         // Forget topics no longer configured (dropped).
         for (auto it = unplaceable_.begin(); it != unplaceable_.end();) {

@@ -19,7 +19,7 @@
 namespace rune::node::test::catalog_cluster {
 
 inline rune::client::ClientConfig clientConfigFor(ThreeNodes& c, int id) {
-    static std::atomic<int> seq{0};
+    static int seq = 0;
     rune::client::ClientConfig cfg;
     cfg.gatewayChannel  = c.clientChannel(id);
     cfg.gatewayStreamId = kClientStream;

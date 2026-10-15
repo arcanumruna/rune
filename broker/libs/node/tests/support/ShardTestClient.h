@@ -567,7 +567,33 @@ public:
         return send(ch, stream, buf.data(), len) ? m.correlationId : 0;
     }
     std::optional<uint16_t> awaitViewRow(int64_t corr, Clock::time_point deadline) {
-        return awaitIn_(viewRows_, corr, deadline);
+        const auto r = awaitIn_(viewRows_, corr, deadline);
+        return r ? std::optional<uint16_t>(r->status) : std::nullopt;
+    }
+    /// Task 22 fix round 1 (C1): the answer to a GetViewRow, whichever kind arrived: a ViewRowResponse (status +
+    /// the row bytes) or an ErrorResponse (a Redirect to the source leader / NotLeader: errorCode + message).
+    struct ViewRowAnswer {
+        bool                 isError = false;
+        uint16_t             status  = 0;      // ViewRowResponse status (isError == false)
+        std::vector<uint8_t> row;              // its row bytes (status == OK)
+        int16_t              errorCode = 0;    // ErrorResponse code (isError == true)
+        std::string          message;          // ... and message (the Redirect's leader endpoint)
+    };
+    std::optional<ViewRowAnswer> awaitViewRowOrError(int64_t corr, Clock::time_point deadline) {
+        if (corr == 0) return std::nullopt;
+        auto answer = [&]() -> std::optional<ViewRowAnswer> {
+            if (auto it = viewRows_.find(corr); it != viewRows_.end())
+                return ViewRowAnswer{false, it->second.status, it->second.row, 0, {}};
+            for (const ErrorSeen& e : errors_)
+                if (e.correlationId == corr) return ViewRowAnswer{true, 0, {}, e.code, e.message};
+            return std::nullopt;
+        };
+        while (Clock::now() < deadline) {
+            poll_();
+            if (auto a = answer()) return a;
+            pause_();
+        }
+        return answer();
     }
     std::optional<pc::DefineTopicResponse> awaitDefine(int64_t corr, Clock::time_point deadline) {
         return awaitIn_(defines_, corr, deadline);
@@ -833,7 +859,10 @@ private:
                 if (auto r = pc::CreateViewResponse::decode(p, n)) views_[r->correlationId] = *r;
                 break;
             case pc::TemplateId::ViewRowResponse:
-                if (auto r = pc::ViewRowResponse::decode(p, n)) viewRows_[r->correlationId] = r->status;
+                if (auto r = pc::ViewRowResponse::decode(p, n))
+                    viewRows_[r->correlationId] = ViewRowSeen{
+                        r->status, r->rowBytes != nullptr ? std::vector<uint8_t>(r->rowBytes, r->rowBytes + r->rowBytesLen)
+                                                          : std::vector<uint8_t>{}};
                 break;
             case pc::TemplateId::AlterTopicResponse:
                 if (auto r = pc::AlterTopicResponse::decode(p, n)) alters_[r->correlationId] = *r;
@@ -917,7 +946,8 @@ private:
     std::map<int64_t, pc::CreateViewResponse>       views_;
     std::map<int64_t, pc::AlterTopicResponse>       alters_;
     std::map<int64_t, DdlAnswer>                    ddls_;      // DdlResponse (78) by corr (Task 11)
-    std::map<int64_t, uint16_t>                     viewRows_;   // ViewRowResponse status by corr
+    struct ViewRowSeen { uint16_t status = 0; std::vector<uint8_t> row; };
+    std::map<int64_t, ViewRowSeen>                  viewRows_;   // ViewRowResponse (status + row bytes) by corr
     std::map<int64_t, SchemaAnswer>                 schemas_;
     std::map<int64_t, int16_t>                      subscribes_;   // SubscribeResponse errorCode by corr
     std::map<int64_t, int64_t>                      subscribeIds_; // SubscribeResponse subscriptionId by corr

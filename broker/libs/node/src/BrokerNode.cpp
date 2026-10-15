@@ -3759,11 +3759,17 @@ void BrokerNode::fanoutViewPlan_(ViewPlanUpdateMsg msg) {
     // on this same thread.  Decode the compiled plan's first source once (cold,
     // per view creation); an unresolvable plan leaves the view a singleton group
     // (correct for a single-worker broker).
-    if (workerPool_) {
-        if (auto plan = rune::view::deserializeCompiledViewPlan(msg.planBlob);
-            plan && !plan->sourceTopicId.empty()) {
-            workerPool_->coLocateViewWithSource(msg.viewTopicId, plan->sourceTopicId[0]);
-        }
+    //
+    // Task 22 fix round 1 (C1): the same decode feeds the gateway's view -> source
+    // map (a GetViewRow is served only by the source-partition leader), and an
+    // uninstall forgets it.  Every plan install (boot replay included) arrives
+    // through here (kA2cViewPlanUpdate), so no install bypasses the map.
+    if (msg.uninstall) {
+        if (gateway_) gateway_->forgetViewSource(msg.viewTopicId);
+    } else if (auto plan = rune::view::deserializeCompiledViewPlan(msg.planBlob);
+               plan && !plan->sourceTopicId.empty()) {
+        if (gateway_) gateway_->noteViewSource(msg.viewTopicId, plan->sourceTopicId[0]);
+        if (workerPool_) workerPool_->coLocateViewWithSource(msg.viewTopicId, plan->sourceTopicId[0]);
     }
     viewFanoutBacklog_.push_back(ViewFanoutPending{std::move(msg), 0});
     (void)pumpViewFanout_();
@@ -4607,6 +4613,7 @@ void BrokerNode::onCatalogTopicConfig_(const uint8_t* p, std::size_t n) {
 }
 
 void BrokerNode::onViewUninstall_(int32_t viewTopicId) {
+    if (gateway_) gateway_->forgetViewSource(viewTopicId);   // C1: control thread, same as noteViewSource
     // Every worker drops the view's instances on its own thread (the install ring).
     ViewPlanUpdateMsg msg;
     msg.viewTopicId = viewTopicId;
