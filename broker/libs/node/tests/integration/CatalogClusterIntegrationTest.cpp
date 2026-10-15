@@ -735,6 +735,7 @@ struct Perturbation {
     std::map<int, BrokerNode::PassGaps>         gaps;       // per running broker: max inter-pass gaps since the reset
     bool                                        leaderMovedInCell = false, gateOverdueObserved = false;
     bool                                        injectedStall = false;   ///< the test's own seam stalled a broker / the harness
+    bool                                        earlyNotLeader = false;  ///< a NotLeader reached the R7 window (evidence)
     std::map<int, BrokerNode::EvidenceTimes>    ev;         // per running broker: when it produced evidence since the reset
     int64_t                                     harnessFirstNs = 0, harnessLastNs = 0;   // leader-moved / early in-doubt seen
     void stampHarness() {
@@ -1082,18 +1083,21 @@ void runCell(const CellParam& param, const CellSeams& seams = {}, CellOutcome* o
                 }
                 release();
                 EXPECT_GE(probes, 6) << what << ": the no-placement window was observed (vacuity guard)";
-                // The R7 check (slice Recipe 2): an OK while the placement is held is the breach; the ONLY legitimate early
-                // answer is the gate's in-doubt Internal, and only once the hold really exceeded its cap (a host stall).
+                // The R7 check (slice Recipe 2): an OK while the placement is held is the breach.  Legitimate early answers: the
+                // gate's in-doubt Internal once the hold really exceeded its cap, and (fix round 4, found by the stall injector) the
+                // retriable NotLeader of a leader demoted / fenced in the window - recorded as evidence, so the cell's verdict
+                // requires a scheduler stall (or an injected one) before it; without one it fails as a product bug.
                 const Answer early = rig.await(ddlCorr, 20ms);
                 const auto held = Clock::now() - tRelease;
                 const auto gateCap = std::chrono::nanoseconds(BrokerNode::kDdlAnswerMaxHoldNs);
                 if (early.got) {
                     EXPECT_NE(early.code, cOk) << what << ": the DDL's OK arrived while its placement was HELD (R7)";
-                    EXPECT_TRUE(early.code == cInternal && held >= gateCap - 250ms)
+                    if (early.code == cNotLeader) { pert.earlyNotLeader = true; pert.stampHarness(); }
+                    else EXPECT_TRUE(early.code == cInternal && held >= gateCap - 250ms)
                         << what << ": early answer " << early.code << " after "
                         << std::chrono::duration_cast<std::chrono::milliseconds>(held).count()
                         << " ms (only Internal past the " << std::chrono::duration_cast<std::chrono::milliseconds>(gateCap).count()
-                        << " ms gate cap is legitimate)";
+                        << " ms gate cap, or a retriable NotLeader, are legitimate)";
                     if (early.code == cInternal) { pert.gateOverdueObserved = true; pert.stampHarness(); }
                 }
                 rig.holdPlacementEverywhere(false);
@@ -1176,7 +1180,8 @@ void runCell(const CellParam& param, const CellSeams& seams = {}, CellOutcome* o
     watchdog.stop();   // the join hands over its result
     const std::string why = after.since(pert0, excluded, timing != cm::Timing::LeaderChangeMidDdl) +
                             (pert.leaderMovedInCell ? " leader-moved" : "") +
-                            (pert.gateOverdueObserved ? " gate-overdue" : "");
+                            (pert.gateOverdueObserved ? " gate-overdue" : "") +
+                            (pert.earlyNotLeader ? " early-notLeader(R7 window)" : "");
     // R3-I1 / R3-M1: the excuse is the scheduler watchdog only (or an injected stall), and only a watchdog stall that overlaps
     // [t - 1 s, t] for the FIRST and the LAST evidence time t (stamped by the brokers' owner threads / the harness).  With no
     // stamp at all (cannot happen for the counters, kept for safety) the evidence is placed at [baseline, read].
@@ -1654,6 +1659,46 @@ TEST(CatalogClusterRegression, StallLongBeforeTheEvidenceDoesNotExcuseItRegressi
     EXPECT_GE(out.watchdogGapNs, 250'000'000) << "vacuity guard: the stop is inside the cell's window";
     EXPECT_FALSE(out.stallObserved) << "... but it does not precede the evidence";
     EXPECT_EQ(noStall, 1);
+}
+
+// T13 (fix round 4, found by the stall injector): a retriable NotLeader that reaches the R7 window (the catalog fenced below
+// minIsr while the DDL awaits its commit; answers NOT held, so it is answered at once) is never an OK and is legitimate under a
+// stall - injected here (both followers' admin threads frozen 4 s): no failure.  The same block NOT marked injected is a broker's
+// own blocked pass with the watchdog quiet: the cell fails (blocking pass / no stall), never excused.
+// RED: the round-2 R7 check (only Internal past the cap is legitimate) -> the injected run fails "early answer 2".
+TEST(CatalogClusterRegression, EarlyNotLeaderInThePlacementWindowNeedsAStallRegression) {
+    for (const bool injected : {true, false}) {
+        SCOPED_TRACE(injected ? "injected" : "not injected");
+        CellSeams seams;
+        seams.configTweak = [](NodeConfig& cfg) { cfg.replicaLagMaxMs = 1000; };
+        seams.answerHoldInWindow = false;
+        seams.injectsStall = injected;
+        seams.onLeaderSend = [](ThreeNodes& c, Rig& rig, int lead) {
+            std::vector<std::thread> th;
+            for (int f : c.runningNodes())
+                if (f != lead) th.emplace_back([&c, f] { try { c.node(f).onAdminThreadForTest([] { std::this_thread::sleep_for(4s); return 0; }, 15s); } catch (...) {} });
+            rig.pumping([&] {
+                for (const auto until = Clock::now() + 10s; Clock::now() < until && c.catalogIsrSizeOn(lead) != 1;) std::this_thread::sleep_for(50ms);
+            });
+            rig.pumping([&] { for (auto& t : th) t.join(); });
+        };
+        CellOutcome out;
+        ::testing::TestPartResultArray failures;
+        {
+            ::testing::ScopedFakeTestPartResultReporter intercept(::testing::ScopedFakeTestPartResultReporter::INTERCEPT_ONLY_CURRENT_THREAD,
+                                                                  &failures);
+            runCell({cm::Kind::CreateTopic, cm::Timing::CreateRacesPlacement, 0}, seams, &out);
+        }
+        int notExcused = 0;
+        for (int i = 0; i < failures.size(); ++i) {
+            const std::string m = failures.GetTestPartResult(i).message();
+            if (!injected && (m.find("blocking pass, product liveness bug") != std::string::npos ||
+                              m.find("with NO stall preceding it") != std::string::npos)) { ++notExcused; continue; }
+            ADD_FAILURE() << "unexpected cell failure: " << m;
+        }
+        EXPECT_NE(out.perturbedWhy.find("notLeader(belowMinIsr)"), std::string::npos) << "vacuity guard: " << out.perturbedWhy;
+        if (!injected && !schedulerStall(out.watchdogGapNs)) EXPECT_EQ(notExcused, 1) << "a broker's own block is never an excuse";
+    }
 }
 
 // R3-M2: a watchdog whose thread cannot start (after pipe()) leaks no fd.
