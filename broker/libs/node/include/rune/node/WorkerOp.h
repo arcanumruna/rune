@@ -119,6 +119,10 @@ struct WorkerOp {
         // ReplicaRegistry): incarnation stays 0, so executeFromWire_'s guard is
         // inert and WorkerPool routing never stamps a replica identity.
         GetViewRow                = 19, ///< gateway → worker: point read of a view row
+        // Task 23 fix round 1 (R-M1): control → EVERY worker (cold): the catalog dropped `topicId`.
+        // The worker remembers it so a produce for a topic it does not own answers UnknownTopic
+        // (matching the gateway) instead of the retriable NotLeader.  Not ownership-gated.
+        TopicDropped              = 20, ///< control → worker: topicId was dropped by the catalog
         // F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
         // control → owning worker: run a test-owned OwnerThreadTestTask against
         // `replica` on the worker's OWN thread.  The opaque task ref travels in the

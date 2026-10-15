@@ -13,6 +13,7 @@
 // Batch shape matches LogBenchmark / LogSegmentBenchmark: ~48-byte single-record
 // MMORPG entity-position event (key="pos", value="x:1234,y:5678,z:9012").
 
+#include "BenchGate.h"
 #include <benchmark/benchmark.h>
 #include <rune/storage/InMemoryLog.h>
 #include <rune/protocol/RecordBatch.h>
@@ -207,7 +208,7 @@ static void BM_InMemoryLog_AppendRefusedFloor(benchmark::State& state) {
         int64_t r = log.appendNoSyncRestamp(big.data(), big.size(), 0, base);
         benchmark::DoNotOptimize(r);
     }
-    if (log.logEndOffset() != leo) state.SkipWithError("an append landed: the setup is not a refusal");
+    if (log.logEndOffset() != leo) rune::bench::gateFail(state, "an append landed: the setup is not a refusal");
     state.SetItemsProcessed(state.iterations());
 }
 BENCHMARK(BM_InMemoryLog_AppendRefusedFloor)->Arg(1)->Arg(64)->Unit(benchmark::kNanosecond);

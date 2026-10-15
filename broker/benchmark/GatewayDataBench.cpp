@@ -31,6 +31,7 @@
 // sleep-ns idle strategy, sparse term buffers, 64 KiB term length for low
 // memory footprint during testing).
 
+#include "BenchGate.h"
 #include <benchmark/benchmark.h>
 
 #include <rune/gateway/ClientGateway.h>
@@ -563,7 +564,7 @@ BENCHMARK_DEFINE_F(GatewayDataFixture, Produce)(benchmark::State& state)
         const double p99 = pct(0.99);
         state.counters["produce_p99_gate_pass"] = (p99 < 100.0) ? 1.0 : 0.0;
         if (p99 >= 100.0) {
-            state.SkipWithError("LATENCY GATE FAILED: produce p99 >= 100 µs");
+            rune::bench::gateFail(state, "LATENCY GATE FAILED: produce p99 >= 100 µs");
             return;
         }
     }
@@ -728,7 +729,7 @@ BENCHMARK_DEFINE_F(GatewayDataFixture, SubscribeDelivery)(benchmark::State& stat
         const double p99sub = pct(0.99);
         state.counters["subdeliv_p99_gate_pass"] = (p99sub < 100.0) ? 1.0 : 0.0;
         if (p99sub >= 100.0) {
-            state.SkipWithError("LATENCY GATE FAILED: subdeliv p99 >= 100 µs");
+            rune::bench::gateFail(state, "LATENCY GATE FAILED: subdeliv p99 >= 100 µs");
             return;
         }
     }
@@ -1007,7 +1008,7 @@ BENCHMARK_DEFINE_F(GatewayDataFixture, ProduceWithRouting)(benchmark::State& sta
         const double p99r = pct(0.99);
         state.counters["routing_p99_gate_pass"] = (p99r < 100.0) ? 1.0 : 0.0;
         if (p99r >= 100.0) {
-            state.SkipWithError("LATENCY GATE FAILED: routing p99 >= 100 µs");
+            rune::bench::gateFail(state, "LATENCY GATE FAILED: routing p99 >= 100 µs");
             return;
         }
     }
@@ -1153,7 +1154,7 @@ BENCHMARK_DEFINE_F(GatewayStalledSpillFixture, ProduceStalled)(benchmark::State&
         samples.push_back(static_cast<double>(elapsed) / 1'000.0);
     }
     if (gw_->pendingResponseCount() != spilled) {
-        state.SkipWithError("the stalled sessions' spill changed during the run (expired / reaped?)");
+        rune::bench::gateFail(state, "the stalled sessions' spill changed during the run (expired / reaped?)");
         return;
     }
     if (!samples.empty()) {
@@ -1181,7 +1182,7 @@ BENCHMARK_DEFINE_F(GatewayStalledSpillFixture, IdleDutyPass)(benchmark::State& s
         state.SetIterationTime(static_cast<double>(nowNs() - t0) / 1e9);
     }
     if (gw_->pendingResponseCount() != spilled)
-        state.SkipWithError("the stalled sessions' spill changed during the run (expired / reaped?)");
+        rune::bench::gateFail(state, "the stalled sessions' spill changed during the run (expired / reaped?)");
     state.counters["spilled"] = static_cast<double>(spilled);
 }
 BENCHMARK_REGISTER_F(GatewayStalledSpillFixture, IdleDutyPass)

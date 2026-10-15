@@ -57,6 +57,7 @@
 //   (2) Capacity: distinct leader nodeIds that advanced == N configured leaders.
 //       scale_ratio counter (~1.0× serial) is informational only — NOT a gate.
 
+#include "BenchGate.h"
 #include <benchmark/benchmark.h>
 
 #include <rune/node/MetadataService.h>
@@ -387,7 +388,7 @@ static void BM_MultiLeader_ThreeNode_Throughput(benchmark::State& state)
     // sequentially with doWork ≈ 1.2ms/iter → ~2.5k records/s aggregate.)
     const double kFloor = 1'000.0;
     if (multiRate < kFloor) {
-        state.SkipWithError(
+        rune::bench::gateFail(state, 
             "THROUGHPUT GATE FAILED: multi-leader aggregate < 1k records/s floor");
         return;
     }
@@ -410,7 +411,7 @@ static void BM_MultiLeader_ThreeNode_Throughput(benchmark::State& state)
     state.counters["expected_leaders"]          = static_cast<double>(kExpectedLeaders);
 
     if (distinctLeadersAdvanced != kExpectedLeaders) {
-        state.SkipWithError(
+        rune::bench::gateFail(state, 
             "CAPACITY GATE FAILED: distinct leader nodes that advanced HW != "
             "kExpectedLeaders (produce was funnelled, not spread across N leaders)");
         return;
@@ -534,7 +535,7 @@ static void BM_MultiLeader_AllocationCheck(benchmark::State& state)
     const bool stable = (lastIterAllocs <= kStableFloor)
         || (firstIterAllocs > 0 && lastIterAllocs <= firstIterAllocs * 2);
     if (!stable) {
-        state.SkipWithError(
+        rune::bench::gateFail(state, 
             "ALLOC GATE FAILED: per-iteration alloc count grew >2x from first to last iter "
             "(memory leak on produce hot path)");
         return;

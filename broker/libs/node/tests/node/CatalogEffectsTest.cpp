@@ -367,6 +367,24 @@ TEST_P(CatalogEffectsRegression, AlterViewFreshSinkPostedBeforeTheOldSinkDropWai
     EXPECT_EQ(n.logEndOffset(1, 0), 0) << "the fresh sink starts empty";
 }
 
+// R-M1: a catalog drop reaches EVERY worker as a TopicDropped op (the worker then answers a shard-mode produce
+// to the dropped id UnknownTopic, WorkerDroppedTopicRegression).  RED: dropRuntimeTopic_ not posting the fan-out.
+TEST_P(CatalogEffectsRegression, DropFansOutTopicDroppedToEveryWorkerRegression) {
+    SingleNode n("eff_dropfan", GetParam());
+    n.applyCreateTopic(0, "t", 1);
+    ASSERT_TRUE(n.awaitServes(0, 10s));
+    const int32_t workers = n.node()->workerCountForTest();
+    ASSERT_GT(workers, 0);
+    n.applyDropTopic(0, "t");
+    ASSERT_TRUE(n.awaitTopicState(0, rune::gateway::TopicRegistry::TopicState::Dropped, 10s));
+    EXPECT_TRUE(SingleNode::awaitTrue([&] {
+        return n.node()->onControlThreadForTest([&] {
+            return n.node()->topicDroppedEnqueuedForTest() == static_cast<uint64_t>(workers) &&
+                   n.node()->topicDroppedPendingForTest() == 0;
+        });
+    }, 10s)) << "one TopicDropped op per worker, none pending";
+}
+
 TEST_P(CatalogEffectsRegression, DroppedTopicAnswersUnknownTopicAtOnce) {
     SingleNode n("eff_drop", GetParam());
     n.applyCreateTopic(0, "t", 1);

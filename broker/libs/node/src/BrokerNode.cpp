@@ -1561,6 +1561,8 @@ void BrokerNode::buildWorkerPool() {
                    "partitionId() must be a non-negative ordinal (pcfg.partitionId = part)");
         }
         workerPool_->assignFromRegistry(*replicaRegistry_);
+        // R-M1: boot (runners not started): every worker knows the ids the catalog already dropped.
+        for (int32_t w = 0; w < workerPool_->workerCount(); ++w) workerPool_->worker(w).setDroppedTopicsDirect(bootDroppedIds_);
         // Task 10 fix 3 (I2): ops are only routed after an inline reconcile, so
         // the SetOwnership that governs them is always ahead of them.
         workerPool_->setRegistry(replicaRegistry_.get());
@@ -3993,6 +3995,7 @@ int BrokerNode::serviceAdminControl_() {
     if (catalogMetricsPending_()) [[unlikely]] publishCatalogMetrics_();   // a counter resolved late
     // Control (runtime) thread = the single producer of every worker ring.
     if (workerPool_) work += schemaFanout_.pump(*workerPool_);
+    if (workerPool_) work += topicDroppedFanout_.pump(*workerPool_);   // R-M1
     // Task 19: retry any view-plan install frames a worker ring could not take.
     if (!viewFanoutBacklog_.empty()) work += pumpViewFanout_();
     // Catalog history Task 8: the drop sequence's later steps + ring-full retries.
@@ -4443,6 +4446,9 @@ void BrokerNode::runCatalogCreate_(const TopicSpec& spec) {
 }
 
 void BrokerNode::dropRuntimeTopic_(int32_t topicId, const std::string& name) {
+    // R-M1: every worker answers UnknownTopic (not the retriable NotLeader) for this id once the op runs —
+    // posted on every path below (pending create, gap id, live topic): the id is dropped on this broker.
+    if (workerPool_) topicDroppedFanout_.post(topicId);
     // A create of this id still waiting behind an older drop never ran: forget
     // it — its Pending slot becomes Dropped (it was seen: created, then dropped).
     const auto before = pendingCreatesBehindDrop_.size();

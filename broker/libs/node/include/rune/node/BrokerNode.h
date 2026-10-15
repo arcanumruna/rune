@@ -63,6 +63,7 @@
 #include <rune/node/AdminControlPlane.h>
 #include <rune/node/DdlAnswerGate.h>
 #include <rune/node/SchemaFanout.h>
+#include <rune/node/TopicDroppedFanout.h>
 #include <rune/node/ViewSnapshotChannel.h>
 #include <rune/node/ViewSnapshotIoAgent.h>
 #include <rune/node/OwnerThreadTestTask.h>
@@ -1605,6 +1606,11 @@ public:
         for (const auto& d : shardDrivers_) n += d ? 1u : 0u;
         return n;
     }
+    /// Test-only (R-M1): TopicDropped ops the control thread delivered to worker rings (one per worker per
+    /// drop) / still pending.  Control-thread state: read inside onControlThreadForTest.
+    [[nodiscard]] uint64_t topicDroppedEnqueuedForTest() const noexcept { return topicDroppedFanout_.enqueuedForTest(); }
+    [[nodiscard]] std::size_t topicDroppedPendingForTest() const noexcept { return topicDroppedFanout_.pendingForTest(); }
+    [[nodiscard]] int32_t workerCountForTest() const noexcept { return workerPool_ ? workerPool_->workerCount() : 0; }
     /// Worker w (owned by its own thread — touch only inside onOwnerThreadForTest).
     [[nodiscard]] Worker* workerForTest(int32_t w) const noexcept {
         return workerPool_ && w >= 0 && w < workerPool_->workerCount() ? &workerPool_->worker(w) : nullptr;
@@ -2108,6 +2114,7 @@ private:
     // F3 round 6, item 3: control-thread-owned SchemaUpdate fan-out (the
     // control thread is the single producer of every worker ingress ring).
     SchemaFanout                                 schemaFanout_;
+    TopicDroppedFanout                           topicDroppedFanout_;   // R-M1: drop -> every worker (control thread)
     uint64_t                                     adminToControlRejects_ = 0;   // control thread only
     std::function<void(std::string_view)>        startupPhaseHookForTest_;
     HaltHandler                                  haltHandler_ = nullptr;

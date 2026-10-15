@@ -27,6 +27,7 @@
 //
 // Build: Release (-O2/-O3), cppstd=23. Linked from rune_broker_benchmark target.
 
+#include "BenchGate.h"
 #include <benchmark/benchmark.h>
 
 #include <rune/node/GroupCoordinationService.h>
@@ -378,13 +379,13 @@ static void BM_GCS_Heartbeat(benchmark::State& state)
 
     // Zero-alloc assertion: any allocation on the heartbeat hot path is a regression.
     if (totalAllocs > 0) {
-        state.SkipWithError("Heartbeat hot path allocated heap memory (zero-alloc violated)");
+        rune::bench::gateFail(state, "Heartbeat hot path allocated heap memory (zero-alloc violated)");
     }
     // Gate: p99 < 100µs.
     if (!samples.empty()) {
         std::sort(samples.begin(), samples.end());
         if (pct(samples, 0.99) >= 100.0) {
-            state.SkipWithError("Heartbeat p99 >= 100µs (hot-path gate FAIL)");
+            rune::bench::gateFail(state, "Heartbeat p99 >= 100µs (hot-path gate FAIL)");
         }
     }
 }
@@ -474,7 +475,7 @@ static void BM_GCS_OffsetCommit(benchmark::State& state)
     if (!samples.empty()) {
         std::sort(samples.begin(), samples.end());
         if (pct(samples, 0.99) >= 100.0) {
-            state.SkipWithError("OffsetCommit p99 >= 100µs (hot-path gate FAIL)");
+            rune::bench::gateFail(state, "OffsetCommit p99 >= 100µs (hot-path gate FAIL)");
         }
     }
 }
@@ -550,7 +551,7 @@ static void BM_GCS_OffsetFetch_Single(benchmark::State& state)
     if (!samples.empty()) {
         std::sort(samples.begin(), samples.end());
         if (pct(samples, 0.99) >= 100.0) {
-            state.SkipWithError("OffsetFetch/single p99 >= 100µs (gate FAIL)");
+            rune::bench::gateFail(state, "OffsetFetch/single p99 >= 100µs (gate FAIL)");
         }
     }
 }
@@ -625,7 +626,7 @@ static void BM_GCS_OffsetFetch_All(benchmark::State& state)
     if (!samples.empty()) {
         std::sort(samples.begin(), samples.end());
         if (pct(samples, 0.99) >= 100.0) {
-            state.SkipWithError("OffsetFetch/all p99 >= 100µs (gate FAIL)");
+            rune::bench::gateFail(state, "OffsetFetch/all p99 >= 100µs (gate FAIL)");
         }
     }
 }
@@ -807,7 +808,7 @@ static void BM_GCS_DoWork_Idle(benchmark::State& state)
 
     // Zero-alloc assertion.
     if (totalAllocs > 0) {
-        state.SkipWithError("doWork steady-state allocated heap (zero-alloc violated)");
+        rune::bench::gateFail(state, "doWork steady-state allocated heap (zero-alloc violated)");
     }
 }
 

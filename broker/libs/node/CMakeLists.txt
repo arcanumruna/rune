@@ -167,6 +167,8 @@ if(BUILD_TESTING)
         tests/node/CatalogLeadershipTest.cpp
         tests/node/CatalogReadServerTest.cpp
         tests/node/CatalogGatesRegressionTest.cpp
+        tests/node/WorkerOwnedIndexRegressionTest.cpp
+        tests/node/WorkerDroppedTopicRegressionTest.cpp
         )
     target_include_directories(rune_node_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     target_link_libraries(rune_node_tests PRIVATE

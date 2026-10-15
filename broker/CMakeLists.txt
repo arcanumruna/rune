@@ -385,6 +385,24 @@ if(BUILD_BENCHMARKS)
         rune_metadata
         benchmark::benchmark_main)
 
+    # Task 23 fix round 1 (R-I2): BenchGate.h self-test (small: the shared main + the gate benchmarks only).
+    add_executable(rune_bench_gate_selftest
+        benchmark/BenchmarkMain.cpp
+        benchmark/BenchGateRegressionBench.cpp)
+    target_link_libraries(rune_bench_gate_selftest PRIVATE benchmark::benchmark)
+    if(BUILD_TESTING)
+        set(_gate_bin "$<TARGET_FILE:rune_bench_gate_selftest>")
+        add_test(NAME BenchGateRegression.PassingGateExitsZeroWithAggregates
+            COMMAND sh -c "out=$(${_gate_bin} --benchmark_filter=BM_GatePassesRegression --benchmark_repetitions=3 --benchmark_report_aggregates_only=true 2>&1); rc=$?; echo \"$out\"; test $rc -eq 0 && echo \"$out\" | grep -q _median")
+        # A gate that fails on repetition 0 only: no crash (exit exactly 1, not a signal), the aggregates are printed.
+        add_test(NAME BenchGateRegression.GateFailedOnFirstRepetitionExitsOneWithoutCrashing
+            COMMAND sh -c "out=$(${_gate_bin} --benchmark_filter=BM_GateFirstRepetitionFailsRegression --benchmark_repetitions=3 --benchmark_report_aggregates_only=true 2>&1); rc=$?; echo \"$out\"; test $rc -eq 1 && echo \"$out\" | grep -q _median && echo \"$out\" | grep -q 'BENCH GATE FAILED'")
+        # A tripped gate turns into a nonzero exit code.
+        add_test(NAME BenchGateRegression.AlwaysFailingGateIsNonzero
+            COMMAND ${_gate_bin} --benchmark_filter=BM_GateAlwaysFailsRegression)
+        set_tests_properties(BenchGateRegression.AlwaysFailingGateIsNonzero PROPERTIES WILL_FAIL TRUE)
+    endif()
+
     add_executable(rune_broker_benchmark
         benchmark/BenchmarkMain.cpp
         benchmark/StorageBenchmark.cpp

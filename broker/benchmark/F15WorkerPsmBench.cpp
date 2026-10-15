@@ -19,6 +19,7 @@
 // Everything allocated before the timed loop (batches / frames pre-built);
 // no sleeps.  Run base vs head interleaved (ABAB) on k3s-node-01.
 
+#include "BenchGate.h"
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/metadata/ShardRouter.h>
@@ -185,9 +186,9 @@ void BM_GatewayPathProduce(benchmark::State& state) {
         for (int k = 0; k < 1024 && R.answers == before; ++k) R.pass();
     }
     if (R.answers < static_cast<int64_t>(state.iterations()))
-        state.SkipWithError("a produce was not answered");
+        rune::bench::gateFail(state, "a produce was not answered");
     else if (R.errors != 0)
-        state.SkipWithError(("produces answered with an error: first code " + std::to_string(R.firstErr) +
+        rune::bench::gateFail(state, ("produces answered with an error: first code " + std::to_string(R.firstErr) +
                              " at answer " + std::to_string(R.firstErrAt) + ", last code " +
                              std::to_string(R.lastErr) + ", errors " + std::to_string(R.errors)).c_str());
     state.SetItemsProcessed(state.iterations());
@@ -249,9 +250,9 @@ void BM_FlushOwedAcksAll(benchmark::State& state) {
         R.pass();                                             // fire them (front of the queue)
     }
     if (R.answers - answered0 != static_cast<int64_t>(state.iterations()) * kFire)
-        state.SkipWithError("fired count mismatch");
+        rune::bench::gateFail(state, "fired count mismatch");
     else if (R.errors != 0)
-        state.SkipWithError(("waiters answered with an error: first code " + std::to_string(R.firstErr) +
+        rune::bench::gateFail(state, ("waiters answered with an error: first code " + std::to_string(R.firstErr) +
                              " at answer " + std::to_string(R.firstErrAt) + ", errors " +
                              std::to_string(R.errors)).c_str());
     state.SetItemsProcessed(state.iterations() * kFire);
@@ -322,7 +323,7 @@ void BM_StrictPipelined(benchmark::State& state) {
     const std::size_t latTimed = latNs.size();
     for (int i = 0; i < 50'000'000 && acked + errors < corr; ++i) { w.doWork(++now); drain(); }   // settle (bounded)
     latNs.resize(latTimed);
-    if (errors != 0) state.SkipWithError("Strict produces answered with an error");
+    if (errors != 0) rune::bench::gateFail(state, "Strict produces answered with an error");
     std::sort(latNs.begin(), latNs.end());
     if (!latNs.empty()) {
         state.counters["p50us"] = static_cast<double>(latNs[latNs.size() / 2]) / 1000.0;

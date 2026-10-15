@@ -49,7 +49,10 @@ TEST(CatalogGatesRegression, BootReplayOfTenThousandEventsIsUnderOneSecondRegres
 #ifdef NDEBUG
     EXPECT_LT(ms, 1000) << "spec §10 gate";
 #else
-    EXPECT_LT(ms, 8000) << "Debug build: the Release gate is BM_CatalogBootReplay10k";
+    // M4: 3 x the median of 3 local Debug runs of r.bootNs (1760 / 2056 / 2076 ms -> median 2056 ms; the Mac
+    // was loaded).  The Release gate (1 s) is BM_CatalogBootReplay10k: no ctest tree defines NDEBUG.
+    constexpr int64_t kDebugBootBoundMs = 6200;
+    EXPECT_LT(ms, kDebugBootBoundMs) << "Debug build: the Release gate is BM_CatalogBootReplay10k";
 #endif
     std::printf("[catalog gate] boot replay of 10000 events: %lld ms\n", (long long)ms);
 }

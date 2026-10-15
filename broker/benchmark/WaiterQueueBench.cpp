@@ -14,6 +14,7 @@
 //            follower's partition), then n live waiters of another partition
 //            behave as in mode 0.
 // Per pass: p50 / p99 / max (ns) reported as counters, so compaction spikes show.
+#include "BenchGate.h"
 #include <rune/node/OrderedWaitQueue.h>
 #include <rune/node/Worker.h>
 #include <rune/node/WorkerOp.h>
@@ -228,8 +229,8 @@ void runWaiterQueue(benchmark::State& state) {
         if (ns.size() < ns.capacity())
             ns.push_back(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
     }
-    if (fired != static_cast<int64_t>(state.iterations()) * kFire) state.SkipWithError("fired count mismatch");
-    if (static_cast<int64_t>(q.size()) != n + (stalled ? 1 : 0)) state.SkipWithError("live count drifted");
+    if (fired != static_cast<int64_t>(state.iterations()) * kFire) rune::bench::gateFail(state, "fired count mismatch");
+    if (static_cast<int64_t>(q.size()) != n + (stalled ? 1 : 0)) rune::bench::gateFail(state, "live count drifted");
     std::sort(ns.begin(), ns.end());
     if (!ns.empty()) {
         state.counters["p50ns"] = static_cast<double>(ns[ns.size() / 2]);

@@ -1,6 +1,7 @@
 // CatalogBootReplayBench.cpp — catalog history Task 23, spec §10 gate: BrokerNode's boot step
 // (bootFromCatalog_, via the bootFromCatalogForBench seam) over a 10 000-event __catalog.  Gate:
-// every iteration < 1 s (SkipWithError otherwise); median recorded in the Task 23 commit.
+// every iteration < 1 s (gateFail -> nonzero exit otherwise; R-I2); median recorded in the Task 23 commit.
+#include "BenchGate.h"
 #include "CatalogBootLog.h"
 #include <rune/node/BrokerNode.h>
 #include <benchmark/benchmark.h>
@@ -22,15 +23,21 @@ struct BootBenchDir {
 void BM_CatalogBootReplay10k(benchmark::State& state) {
     spdlog::set_level(spdlog::level::warn);
     static const BootBenchDir dir;
+    bool failed = false;
     for (auto _ : state) {
         const auto r = rune::node::BrokerNode::bootFromCatalogForBench(dir.path.string());
-        if (r.appliedEvents != 10'000 || r.halted || r.bootTopics != dir.shape.bootTopics ||
-            r.droppedIds != dir.shape.droppedIds) {
-            state.SkipWithError("the boot step did not apply the 10 000-event catalog exactly"); return;
+        if (!failed && (r.appliedEvents != 10'000 || r.halted || r.bootTopics != dir.shape.bootTopics ||
+                        r.droppedIds != dir.shape.droppedIds)) {
+            failed = true;
+            rune::bench::gateFail(state, "the boot step did not apply the 10 000-event catalog exactly");
         }
-        if (r.bootNs >= 1'000'000'000) { state.SkipWithError("GATE FAILED: 10k-event boot replay >= 1 s"); return; }
+        if (!failed && r.bootNs >= 1'000'000'000) {
+            failed = true;
+            rune::bench::gateFail(state, "GATE FAILED: 10k-event boot replay >= 1 s");
+        }
         state.SetIterationTime(static_cast<double>(r.bootNs) / 1e9);
     }
+    if (!failed) rune::bench::gatePass(state);
     state.counters["events"] = 10'000;
 }
 }  // namespace

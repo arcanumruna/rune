@@ -204,9 +204,11 @@ TEST(CatalogAllocRegression, IdleCatalogFollowerAdminPassAllocatesNothingRegress
     int64_t t = rig.now();
     for (int i = 0; i < 64; ++i) (void)rig.admin().doWork(t += 1'000'000);      // warm-up, disarmed
     gArmedAllocs = 0;
+    int64_t followerWork = 0;
     gArmed = true;
-    for (int i = 0; i < 10'000; ++i) (void)rig.admin().doWork(t += 1'000'000);
+    for (int i = 0; i < 10'000; ++i) followerWork += rig.admin().doWork(t += 1'000'000);
     gArmed = false;
+    EXPECT_GT(followerWork, 0) << "non-vacuous: the follower pass did work in the armed window";
     EXPECT_EQ(gArmedAllocs, 0u) << "the idle catalog follower's admin pass allocated (backtraces above)";
     EXPECT_EQ(rig.admin().roleName(), "Follower");
     EXPECT_EQ(rig.admin().applier().lastApplied().offset, 50);
@@ -284,5 +286,25 @@ TEST(CatalogAllocRegression, RedirectedGetViewRowAllocatesNothingRegression) {
     EXPECT_EQ(gArmedAllocs, 0u) << "the GetViewRow Redirect path allocated (backtraces above)";
     EXPECT_EQ(rig.redirects, 576u);
     EXPECT_EQ(rig.viewOk, 0u);
-    EXPECT_EQ(rig.viewOther + rig.errOther + rig.otherFrames, 0u) << "nothing was forwarded to the worker";
+    EXPECT_EQ(rig.viewOther + rig.errOther + rig.otherFrames, 0u);
+    EXPECT_EQ(rig.pool.worker(0).getViewRowsForTest(), 0u) << "nothing was forwarded to the worker";
+}
+
+// R-I1: with 1024 owned replicas (the source LAST) the serve path is still allocation-free (the
+// (topicId, partition) lookup is an O(1) index, not a scan).
+TEST(CatalogAllocRegression, ServedGetViewRowWith1024OwnedAllocatesNothingRegression) {
+    using rune::node::test::GatewayViewReadRig;
+    GatewayViewReadRig rig(GatewayViewReadRig::Mode::ServedHere, /*fillers=*/1023);
+    std::vector<std::vector<uint8_t>> frames;
+    for (int i = 0; i < 576; ++i) frames.push_back(rig.getViewRowFrame(i + 1, /*key=*/7));
+    for (int i = 0; i < 64; ++i) ASSERT_TRUE(rig.readAndAwait(frames[i]));
+    gArmedAllocs = 0;
+    gArmed = true;
+    bool all = true;
+    for (int i = 64; i < 576; ++i) all = rig.readAndAwait(frames[i]) && all;
+    gArmed = false;
+    EXPECT_EQ(gArmedAllocs, 0u) << "the 1024-owned GetViewRow serve path allocated (backtraces above)";
+    EXPECT_TRUE(all);
+    EXPECT_EQ(rig.viewOk, 576u);  EXPECT_EQ(rig.viewOther, 0u);  EXPECT_EQ(rig.redirects, 0u);
+    EXPECT_EQ(rig.lastHp, 70);
 }

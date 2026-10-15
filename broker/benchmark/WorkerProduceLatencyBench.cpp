@@ -28,6 +28,7 @@
 #include <rune/storage/InMemoryLog.h>
 #include <rune/protocol/RecordBatch.h>
 
+#include "BenchGate.h"
 #include <benchmark/benchmark.h>
 
 #include <algorithm>
@@ -335,6 +336,46 @@ static void BM_WorkerProduceToPushRead_Transient_1KiB(benchmark::State& s) {
 BENCHMARK(BM_WorkerRoleGate)->Arg(1)->Arg(64)->Arg(1024)->Unit(benchmark::kNanosecond);
 BENCHMARK(BM_WorkerRoleGate_Baseline)->Arg(1)->Arg(64)->Arg(1024)->Unit(benchmark::kNanosecond);
 BENCHMARK(BM_WorkerOwnershipCheck)->Arg(1)->Arg(64)->Arg(1024)->Unit(benchmark::kNanosecond);
+
+// Task 23 fix round 1 (R-I1): the (topicId, partition) -> owned replica lookup (GetViewRow, shard-mode
+// produce, inbound replication frames, rcFor_).  O(1) index vs the linear oracle: rotating keys over the
+// whole owned set (stride coprime to n), so the LAST entries are hit as often as the first.
+static void benchFindOwned(benchmark::State& state, bool linear) {
+    const auto n = static_cast<std::size_t>(state.range(0));
+    NullTransport t;
+    std::vector<std::unique_ptr<rune::storage::InMemoryLog>> logs;
+    std::vector<std::unique_ptr<PartitionReplica>> reps;
+    Worker::OwnedSet owned;
+    for (std::size_t i = 0; i < n; ++i) {
+        logs.push_back(std::make_unique<rune::storage::InMemoryLog>(1 << 12, 16));
+        PartitionConfig cfg{};
+        cfg.topicId = static_cast<int32_t>(100 + i / 4); cfg.partitionId = static_cast<int32_t>(i % 4);
+        cfg.selfId = 1; cfg.minIsr = 1;
+        reps.push_back(std::make_unique<PartitionReplica>(
+            cfg, rune::replication::Role::Leader, 1, std::vector<rune::replication::NodeId>{1},
+            std::vector<rune::replication::NodeId>{1}, logs.back().get(), &t));
+        owned.push_back(reps.back().get());
+    }
+    Worker w(0, 1 << 16, 1 << 16, 16, 16);
+    w.setOwnedDirect(owned);
+    const std::size_t stride = 7919 % n == 0 ? 1 : 7919;   // 7919 is prime
+    std::size_t k = 0;
+    std::size_t misses = 0;
+    for (auto _ : state) {
+        const std::size_t i = k % n;
+        const int32_t topic = static_cast<int32_t>(100 + i / 4), part = static_cast<int32_t>(i % 4);
+        auto* r = linear ? w.findOwnedReplicaLinearForTest(topic, part) : w.findOwnedReplicaForTest(topic, part);
+        misses += (r == nullptr);
+        benchmark::DoNotOptimize(r);
+        k += stride;
+    }
+    if (misses != 0) rune::bench::gateFail(state, "a lookup of an owned key missed");
+    state.SetItemsProcessed(state.iterations());
+}
+static void BM_WorkerFindOwnedReplica(benchmark::State& state) { benchFindOwned(state, false); }
+static void BM_WorkerFindOwnedReplica_Linear(benchmark::State& state) { benchFindOwned(state, true); }
+BENCHMARK(BM_WorkerFindOwnedReplica)->Arg(1)->Arg(64)->Arg(1024)->Arg(4096)->Unit(benchmark::kNanosecond);
+BENCHMARK(BM_WorkerFindOwnedReplica_Linear)->Arg(1)->Arg(64)->Arg(1024)->Arg(4096)->Unit(benchmark::kNanosecond);
 BENCHMARK(BM_WorkerOwnershipCheck_Baseline)->Arg(1)->Arg(64)->Arg(1024)->Unit(benchmark::kNanosecond);
 BENCHMARK(BM_WorkerProduce_Majority_1KiB)->Unit(benchmark::kNanosecond)->MinTime(0.2);
 BENCHMARK(BM_WorkerProduce_Majority_256B)->Unit(benchmark::kNanosecond)->MinTime(0.2);

@@ -9,6 +9,7 @@
 //   BM_GatewayViewRowRedirect                                      the source-led-elsewhere Redirect
 //
 // allocs_per_op uses BenchmarkMain's shared operator-new counter (no second operator new here).
+#include "BenchGate.h"
 #include "GatewayProduceRig.h"
 #if RUNE_T23_HAS_CATALOG
 #include "ViewReadRig.h"
@@ -69,8 +70,9 @@ void BM_GatewayProducePlacementGate(benchmark::State& state) {
         for (int k = 0; k < 1024 && rig.produceOk + rig.produceErr + rig.produceNotLeader == before; ++k) rig.pass();
     }
     allocsOff(state);
-    if (rig.produceOk != static_cast<uint64_t>(state.iterations()) || rig.produceErr + rig.produceNotLeader != 0)
-        state.SkipWithError("a produce was not answered OK");
+    rune::bench::gateCheck(state, rig.produceOk == static_cast<uint64_t>(state.iterations()) &&
+                                      rig.produceErr + rig.produceNotLeader == 0,
+                           "a produce was not answered OK");
     state.SetItemsProcessed(state.iterations());
 }
 BENCHMARK(BM_GatewayProducePlacementGate)
@@ -112,8 +114,10 @@ void BM_GatewaySubscribePlacementGate(benchmark::State& state) {
         rig.pass();
     }
     allocsOff(state);   // reported only: a subscription registration allocates by design
-    if (rig.subscribeOk != static_cast<uint64_t>(state.iterations()))
-        state.SkipWithError("a subscribe was not answered OK");
+    rune::bench::gateCheck(state, rig.subscribeOk == static_cast<uint64_t>(state.iterations()),
+                           "a subscribe was not answered OK");
+    // M7: every Unsubscribe was answered: no subscription leaked into the state being measured.
+    rune::bench::gateCheck(state, rig.gw.subscriptionCount() == 0, "a subscription leaked (subscriptionCount != 0)");
     state.SetItemsProcessed(state.iterations());
 }
 BENCHMARK(BM_GatewaySubscribePlacementGate)
@@ -153,8 +157,9 @@ void BM_GatewayRefusedUnplaced(benchmark::State& state) {
     }
     allocsOff(state);
     const auto it = static_cast<uint64_t>(state.iterations());
-    if (rig.produceNotLeader != it || rig.errNotLeader != it || rig.produceOk != 0 || rig.subscribeOk != 0)
-        state.SkipWithError("a refusal was not answered NotLeader exactly once");
+    rune::bench::gateCheck(state, rig.produceNotLeader == it && rig.errNotLeader == it && rig.produceOk == 0 &&
+                                      rig.subscribeOk == 0,
+                           "a refusal was not answered NotLeader exactly once");
     state.SetItemsProcessed(state.iterations());
 }
 BENCHMARK(BM_GatewayRefusedUnplaced)->Unit(benchmark::kNanosecond)->MinTime(0.5);
@@ -189,8 +194,8 @@ void BM_GatewayViewRowServed(benchmark::State& state) {
         for (int k = 0; k < 1024 && rig.viewOk + rig.viewOther + rig.redirects + rig.errOther == before; ++k) rig.pass();
     }
     allocsOff(state);
-    if (rig.viewOk != static_cast<uint64_t>(state.iterations()))
-        state.SkipWithError("a GetViewRow was not served OK");
+    rune::bench::gateCheck(state, rig.viewOk == static_cast<uint64_t>(state.iterations()),
+                           "a GetViewRow was not served OK");
     state.SetItemsProcessed(state.iterations());
 }
 BENCHMARK(BM_GatewayViewRowServed)->ArgName("fillers")->Arg(0)->Arg(63)->Arg(1023)
@@ -234,8 +239,8 @@ void BM_GatewayViewRowRedirect(benchmark::State& state) {
         rig.gw.applyGetViewRowForTest(f.data(), f.size());
     }
     allocsOff(state);
-    if (rig.redirects != static_cast<uint64_t>(state.iterations()) || rig.viewOk != 0)
-        state.SkipWithError("a GetViewRow was not Redirected exactly once");
+    rune::bench::gateCheck(state, rig.redirects == static_cast<uint64_t>(state.iterations()) && rig.viewOk == 0,
+                           "a GetViewRow was not Redirected exactly once");
     state.SetItemsProcessed(state.iterations());
 }
 BENCHMARK(BM_GatewayViewRowRedirect)->Unit(benchmark::kNanosecond)->MinTime(0.5);

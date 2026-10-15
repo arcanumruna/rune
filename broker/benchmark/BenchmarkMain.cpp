@@ -1,6 +1,9 @@
+#include "BenchGate.h"
+
 #include <benchmark/benchmark.h>
 
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <new>
 
@@ -49,4 +52,16 @@ void operator delete[](void* p) noexcept { std::free(p); }
 void operator delete(void* p, std::size_t) noexcept  { std::free(p); }
 void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
 
-BENCHMARK_MAIN();
+// Task 23 fix round 1 (R-I2): BENCHMARK_MAIN() plus the gate verdict — any rune::bench::gateFail() makes the
+// process exit 1 (the failures are listed on stderr), so a tripped gate is never recorded as a pass.
+int main(int argc, char** argv)
+{
+    ::benchmark::Initialize(&argc, argv);
+    if (::benchmark::ReportUnrecognizedArguments(argc, argv)) return 1;
+    ::benchmark::RunSpecifiedBenchmarks();
+    ::benchmark::Shutdown();
+    const auto& failures = rune::bench::gateFailures();
+    for (const auto& f : failures)
+        std::fprintf(stderr, "BENCH GATE FAILED: %s: %s\n", f.benchmark.c_str(), f.message.c_str());
+    return failures.empty() ? 0 : 1;
+}

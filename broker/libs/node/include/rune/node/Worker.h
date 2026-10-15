@@ -1456,6 +1456,16 @@ public:
     [[nodiscard]] const char* ioBackendNameForTest() const noexcept { return io_.name(); }
     [[nodiscard]] uint64_t opsRefusedNotOwnedForTest() const noexcept { return opsRefusedNotOwned_; }
     [[nodiscard]] uint64_t ownershipAcksForTest() const noexcept { return ownershipAcks_; }
+    /// Boot (before the runners start, like setOwnedDirect): the topic ids the catalog dropped.
+    void setDroppedTopicsDirect(const std::vector<int32_t>& ids) { for (const int32_t id : ids) markTopicDropped_(id); }
+    [[nodiscard]] bool topicDroppedForTest(int32_t topicId) const noexcept { return topicDropped_(topicId); }
+    /// Test seams (R-I1): the O(1) index vs the linear oracle.
+    [[nodiscard]] rune::replication::PartitionReplica* findOwnedReplicaForTest(int32_t t, int32_t p) const noexcept {
+        return findOwnedReplica_(t, p);
+    }
+    [[nodiscard]] rune::replication::PartitionReplica* findOwnedReplicaLinearForTest(int32_t t, int32_t p) const noexcept {
+        return findOwnedReplicaLinearForTest_(t, p);
+    }
     [[nodiscard]] uint64_t followerSideOpsForTest() const noexcept { return followerSideOps_; }
     /// Bench / test: the per-op ownership check.
     [[nodiscard]] bool ownsReplicaForTest(const rune::replication::PartitionReplica* r) const noexcept {
@@ -2456,6 +2466,9 @@ private:
         // Task 13 (spec §3.4): session lifecycle from the runtime (cold).
         case WorkerOp::Type::SessionAnnounce:
             executeSessionAnnounceWire_(op);
+            break;
+        case WorkerOp::Type::TopicDropped:
+            markTopicDropped_(op.topicId());
             break;
         case WorkerOp::Type::SessionClose:
             ++sessionClosesSeen_;
@@ -4173,23 +4186,34 @@ private:
     }
 
     // -------------------------------------------------------------------
-    // findOwnedReplica_ — scan owned_ for a replica matching (topicId, partition).
+    // findOwnedReplica_ — the owned replica for (topicId, partition), or nullptr.
     //
-    // Returns the first match or nullptr if not found.  O(n) over owned_ —
-    // acceptable: owned_ has O(partitions-per-worker) entries (typically small,
-    // ≤ tens); a hot-path map is overkill and would add per-tick lookup cost.
+    // O(1): an open-addressing index (tpIndex_) rebuilt COLD on every ownership
+    // change (setOwnedDirect / SetOwnership op -> rebuildFlushSlots_ ->
+    // rebuildOwnedIndex_).  Maps the key to the FIRST non-null replica of owned_
+    // with that key (the linear-scan semantics).  Role is NOT in the index: callers
+    // read role()/acceptsProduce() live after the lookup.  Zero allocation.
     //
     // Worker-thread only (owned_ is single-writer on the worker thread).
     // -------------------------------------------------------------------
     rune::replication::PartitionReplica*
     findOwnedReplica_(int32_t topicId, int32_t partition) const noexcept
     {
-        for (auto* r : owned_) {
-            if (r && r->topicId() == topicId &&
-                static_cast<int32_t>(r->partitionId()) == partition) {
-                return r;
-            }
+        if (tpIndex_.empty()) return nullptr;
+        const uint64_t k = tpKey_(topicId, partition);
+        if (k == kTpEmpty) return nullptr;
+        for (uint64_t i = tpHash_(k) & tpMask_;; i = (i + 1) & tpMask_) {
+            const TpSlot& sl = tpIndex_[i];
+            if (sl.key == k) return sl.r;
+            if (sl.key == kTpEmpty) return nullptr;
         }
+    }
+    /// Test oracle: the old linear scan (first non-null match in owned_).
+    rune::replication::PartitionReplica*
+    findOwnedReplicaLinearForTest_(int32_t topicId, int32_t partition) const noexcept
+    {
+        for (auto* r : owned_)
+            if (r && r->topicId() == topicId && static_cast<int32_t>(r->partitionId()) == partition) return r;
         return nullptr;
     }
 
@@ -5083,7 +5107,33 @@ private:
     // ---- Ownership table: ownedInc_[registryId] = the incarnation this worker
     // owns (0 = not owned).  Dense, indexed by the registry id carried in the op.
     std::vector<uint32_t> ownedInc_;
+    // ---- Dropped topic ids (R-M1): worker-thread only.  One bit per topic id (ids are never
+    // reused); grows only inside the cold TopicDropped op / the boot setter.
+    std::vector<uint64_t> droppedTopicBits_;
+    void markTopicDropped_(int32_t topicId) {
+        if (topicId < 0) return;
+        const std::size_t w = static_cast<std::size_t>(topicId) >> 6;
+        if (w >= droppedTopicBits_.size()) droppedTopicBits_.resize(w + 1, 0);
+        droppedTopicBits_[w] |= (1ULL << (static_cast<unsigned>(topicId) & 63u));
+    }
+    [[nodiscard]] bool topicDropped_(int32_t topicId) const noexcept {
+        if (topicId < 0) return false;
+        const std::size_t w = static_cast<std::size_t>(topicId) >> 6;
+        return w < droppedTopicBits_.size() && (droppedTopicBits_[w] >> (static_cast<unsigned>(topicId) & 63u) & 1ULL) != 0;
+    }
     std::vector<rune::replication::PartitionReplica*> ownedPtr_;   // ownedPtr_[id] valid iff ownedInc_[id] != 0
+    // ---- (topicId, partition) -> owned replica index (R-I1): worker-thread only,
+    // rebuilt cold with ownedInc_/ownedPtr_; open addressing, linear probe, power-of-two.
+    struct TpSlot { uint64_t key; rune::replication::PartitionReplica* r; };
+    static constexpr uint64_t kTpEmpty = ~0ULL;   // (topic -1, partition -1): never a real key
+    std::vector<TpSlot> tpIndex_;
+    uint64_t            tpMask_ = 0;
+    [[nodiscard]] static uint64_t tpKey_(int32_t t, int32_t p) noexcept {
+        return (uint64_t(uint32_t(t)) << 32) | uint32_t(p);
+    }
+    [[nodiscard]] static uint64_t tpHash_(uint64_t k) noexcept {   // splitmix64 finaliser
+        k ^= k >> 30; k *= 0xbf58476d1ce4e5b9ULL; k ^= k >> 27; k *= 0x94d049bb133111ebULL; return k ^ (k >> 31);
+    }
     uint64_t    opsRefusedNotOwned_ = 0;
     uint64_t    ownershipAcks_      = 0;
     uint64_t    followerSideOps_    = 0;   // OLE responses + reconcile requests executed here
@@ -5551,6 +5601,20 @@ private:
             if (r && r->incarnation() != 0) {
                 ownedInc_[r->registryId()] = r->incarnation();
                 ownedPtr_[r->registryId()] = r;
+            }
+        }
+        {   // (topicId, partition) index: load factor <= 0.5; capacity persists (no alloc unless it grows)
+            std::size_t cap = 2;
+            while (cap < 2 * owned_.size()) cap <<= 1;
+            tpIndex_.assign(cap, TpSlot{kTpEmpty, nullptr});
+            tpMask_ = cap - 1;
+            for (auto* r : owned_) {
+                if (r == nullptr) continue;
+                const uint64_t k = tpKey_(r->topicId(), static_cast<int32_t>(r->partitionId()));
+                for (uint64_t i = tpHash_(k) & tpMask_;; i = (i + 1) & tpMask_) {
+                    if (tpIndex_[i].key == k) break;   // duplicate: keep the FIRST (linear-scan semantics)
+                    if (tpIndex_[i].key == kTpEmpty) { tpIndex_[i] = TpSlot{k, r}; break; }
+                }
             }
         }
         // Parked / active push subscriptions follow ownership by id + incarnation
@@ -6426,25 +6490,16 @@ private:
     // getLogAndReplicaForPartition_ — look up the Log* and PartitionReplica*
     //                                  for (topicId, partition) from owned_.
     //
-    // Worker-thread only. O(N) over owned_ — acceptable for the produce path
-    // (produce frame rate >> per-batch O(N) owned-set scan, and N is small).
+    // Worker-thread only.  O(1) via findOwnedReplica_ (index rebuilt cold on every
+    // ownership change).  A TRANSIENT (InMemoryLog) replica returns {nullptr,
+    // replica}: produceCore_ appends to replica->memoryLog() (Phase 2b E2).
     // Returns {nullptr, nullptr} if the partition is not owned by this worker.
     // -----------------------------------------------------------------------
     std::pair<rune::storage::Log*, rune::replication::PartitionReplica*>
     getLogAndReplicaForPartition_(int32_t topicId, int32_t partition) const noexcept {
-        for (auto* replica : owned_) {
-            if (!replica) continue;
-            if (replica->topicId() == topicId &&
-                static_cast<int32_t>(replica->partitionId()) == partition) {
-                // Only disk-backed replicas expose a rune::storage::Log*.  A
-                // TRANSIENT (InMemoryLog) replica returns {nullptr, replica}:
-                // produceCore_ appends to replica->memoryLog() (Phase 2b E2).
-                rune::storage::Log* log =
-                    replica->isDiskBacked() ? replica->log() : nullptr;
-                return {log, replica};
-            }
-        }
-        return {nullptr, nullptr};
+        auto* r = findOwnedReplica_(topicId, partition);
+        if (!r) return {nullptr, nullptr};
+        return {r->isDiskBacked() ? r->log() : nullptr, r};
     }
 
     // -----------------------------------------------------------------------
@@ -6795,7 +6850,9 @@ private:
             spdlog::debug("Worker {}: produce for a partition this worker does not own (topicId={} "
                           "partition={}); returning NotLeader (retriable)",
                           workerId_, f.topicId, f.partition);
-            ret.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+            // R-M1: a topic the catalog dropped answers UnknownTopic, like the gateway.
+            ret.errorCode = static_cast<int16_t>(topicDropped_(f.topicId) ? pc::ErrorCode::UnknownTopic
+                                                                          : pc::ErrorCode::NotLeader);
             enqueueReturn_(ret);
             return 1;
         }
