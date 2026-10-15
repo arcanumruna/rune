@@ -1352,10 +1352,28 @@ public:
         g.controlMaxGapNs = onControlThreadForTest([this]() -> int64_t { return adminControl_.maxPassGapNs(); });
         return g;
     }
+    /// Resets the pass-gap maxima AND the evidence stamps (evidenceTimesForTest), each on its owner thread.
     template <class = void>
     void resetPassGapsForTest() {
-        onAdminThreadForTest([this]() { adminWorkerAgent_->worker().resetMaxPassGapForTest(); return 0; });
-        onControlThreadForTest([this]() { adminControl_.resetMaxPassGapForTest(); return 0; });
+        onAdminThreadForTest([this]() {
+            adminWorkerAgent_->worker().resetMaxPassGapForTest();
+            adminWorkerAgent_->worker().resetEvidenceTimesForTest();
+            return 0;
+        });
+        onControlThreadForTest([this]() { adminControl_.resetMaxPassGapForTest(); ddlOverdueFirstNs_ = ddlOverdueLastNs_ = 0; return 0; });
+    }
+    /// Task 23 fix round 4 (R3-M1): when this broker produced topology evidence since the last reset (first / last, ns of the
+    /// brokers' MonotonicNanoClock; 0 = none) - the admin thread's by-cause NotLeaders and role-epoch changes, the control
+    /// thread's in-doubt gate answers - each read ON its owner thread.
+    struct EvidenceTimes { int64_t firstNs = 0, lastNs = 0; };
+    template <class = void>
+    [[nodiscard]] EvidenceTimes evidenceTimesForTest() {
+        const auto a = onAdminThreadForTest([this]() { return adminWorkerAgent_->worker().evidenceTimes(); });
+        const auto c = onControlThreadForTest([this]() { return EvidenceTimes{ddlOverdueFirstNs_, ddlOverdueLastNs_}; });
+        EvidenceTimes e{a.firstNs, a.lastNs};
+        if (c.firstNs != 0 && (e.firstNs == 0 || c.firstNs < e.firstNs)) e.firstNs = c.firstNs;
+        if (c.lastNs > e.lastNs) e.lastNs = c.lastNs;
+        return e;
     }
     /// Held DDL OKs answered Internal (in doubt) by the DdlAnswerGate (read ON the control thread).
     template <class = void>   // instantiated after onControlThreadForTest is defined
@@ -2171,6 +2189,7 @@ private:
     DdlAnswerGate ddlAnswerGate_{2u * static_cast<std::size_t>(kAdminRequestRingBytes) + 4096u,
                                  kDdlAnswerMaxHoldNs};
     uint64_t      ddlAnswersOverdue_ = 0;   // control thread only: held OKs answered Internal (in doubt)
+    int64_t       ddlOverdueFirstNs_ = 0, ddlOverdueLastNs_ = 0;   // control thread only: R3-M1 evidence stamps
     [[nodiscard]] bool ddlTopicServes_(int32_t topicId) const noexcept;
     int32_t                                      shardResolveStallWorkerForTest_ = -1;
     std::chrono::milliseconds                    shardResolveStallForTest_{0};

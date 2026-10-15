@@ -40,11 +40,13 @@
 #include <gtest/gtest.h>
 #include <gtest/gtest-spi.h>
 
+#include <fcntl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdlib>
 #include <csignal>
 #include <chrono>
 #include <cstdio>
@@ -158,6 +160,7 @@ struct CellTimes {
     }
     static int& perturbed() { static int n = 0; return n; }   ///< cells whose exact codes were relaxed (product evidence + a stall)
     static int& notExercised() { static int n = 0; return n; }   ///< cells whose timing never ran (a stall explains it)
+    static int& slowPasses() { static int n = 0; return n; }     ///< cells with a >= 100 ms broker pass, watchdog quiet, no evidence
 };
 class CellTimesPrinter : public ::testing::Environment {
 public:
@@ -165,8 +168,8 @@ public:
         double total = 0;
         for (const auto& [n, s] : CellTimes::rows()) { total += s; std::fprintf(stderr, "[ cell time ] %-60s %7.1f s\n", n.c_str(), s); }
         if (!CellTimes::rows().empty()) std::fprintf(stderr, "[ cell time ] %-60s %7.1f s\n", "TOTAL", total);
-        std::fprintf(stderr, "[ cell time ] perturbed cells: %d, not-exercised cells: %d\n", CellTimes::perturbed(),
-                     CellTimes::notExercised());
+        std::fprintf(stderr, "[ cell time ] perturbed cells: %d, not-exercised cells: %d, slow-pass cells: %d\n",
+                     CellTimes::perturbed(), CellTimes::notExercised(), CellTimes::slowPasses());
     }
 };
 [[maybe_unused]] ::testing::Environment* const kCellTimesPrinter = ::testing::AddGlobalTestEnvironment(new CellTimesPrinter);
@@ -651,6 +654,18 @@ std::vector<uint64_t> createdObjectIds(ThreeNodes& c, int id, const std::string&
 // ===========================================================================
 // The 32-cell slice
 // ===========================================================================
+/// R3-M1: a non-injected perturbed cell is appended to $RUNE_PERTURBED_LOG (scripts/run-regression.sh prints it after the run
+/// for a human look; it does not fail the run).  One O_APPEND write per line (concurrent test processes do not interleave).
+inline void reportPerturbedForCheckpoint(const std::string& cell, const std::string& why, const std::string& stall) {
+    const char* path = std::getenv("RUNE_PERTURBED_LOG");
+    if (path == nullptr || *path == 0) return;
+    const std::string line = "[ perturbed ] " + cell + ":" + why + " " + stall + "\n";
+    const int fd = ::open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return;
+    (void)!::write(fd, line.data(), line.size());
+    ::close(fd);
+}
+
 struct CellParam { cm::Kind kind; cm::Timing timing; int viaNode; };   // viaNode: Steady only (1..3)
 
 std::string cellName(const CellParam& p) {
@@ -692,12 +707,25 @@ inline long long msOf(int64_t ns) { return static_cast<long long>(ns / 1'000'000
 /// The harness-observed stall: any of the three signals - the brokers' admin pass gap, their control pass gap (both folded into
 /// `maxPassGapNs`) and the test process's SchedulerWatchdog overshoot - reached kStallEvidenceNs.
 /// A stall takes effect after it ends: heartbeat silence (150 ms) -> fencing (3 x 150 = 450 ms) -> an election and the
-/// controller's AlterIsr commit (a few 20 ms status intervals).  A process stall that ended up to 1 s before the cell's
-/// baseline can still move the topology inside it; the watchdog runs from the start of the cell and is asked for the stalls
-/// that ended since (baseline - kStallLookbackNs).
+/// controller's AlterIsr commit (a few 20 ms status intervals).  So a stall excuses a piece of evidence at time t only if it
+/// overlaps [t - kStallLookbackNs, t]: it PRECEDES the evidence by at most 1 s (Task 23 fix round 4, R3-M1).
 constexpr int64_t kStallLookbackNs = 1'000'000'000;
-inline bool stallObservedFrom(int64_t maxPassGapNs, int64_t watchdogGapNs) {
-    return maxPassGapNs >= kStallEvidenceNs || watchdogGapNs >= kStallEvidenceNs;
+
+/// Task 23 fix round 4 (R3-I1): ONLY the scheduler watchdog - a test-process thread doing no product work - measures a stall.
+/// A broker's own pass gap is produced by the very regression this test must catch (a blocking runtime / admin pass misses
+/// heartbeats -> re-election / fencing), so it never excuses evidence; it is a product signal of its own.
+inline bool schedulerStall(int64_t watchdogGapNs) { return watchdogGapNs >= kStallEvidenceNs; }
+
+/// How a cell's codes are judged.
+enum class CellVerdict { Exact, SlowPass, Perturbed, BlockingPass, NoStall };
+/// evidence: product evidence of a topology change; excused: a watchdog stall precedes it within the lookback, or the test
+/// injected the stall; watchdogAnyNs: the largest watchdog overshoot anywhere in the cell's window; maxPassGapNs: the
+/// largest broker admin / control pass gap.
+inline CellVerdict classifyCell(bool evidence, bool excused, int64_t watchdogAnyNs, int64_t maxPassGapNs, bool injected) {
+    const bool passBlocked = maxPassGapNs >= kStallEvidenceNs && !schedulerStall(watchdogAnyNs) && !injected;
+    if (!evidence) return passBlocked ? CellVerdict::SlowPass : CellVerdict::Exact;
+    if (excused) return CellVerdict::Perturbed;
+    return passBlocked ? CellVerdict::BlockingPass : CellVerdict::NoStall;
 }
 
 struct Perturbation {
@@ -707,6 +735,24 @@ struct Perturbation {
     std::map<int, BrokerNode::PassGaps>         gaps;       // per running broker: max inter-pass gaps since the reset
     bool                                        leaderMovedInCell = false, gateOverdueObserved = false;
     bool                                        injectedStall = false;   ///< the test's own seam stalled a broker / the harness
+    std::map<int, BrokerNode::EvidenceTimes>    ev;         // per running broker: when it produced evidence since the reset
+    int64_t                                     harnessFirstNs = 0, harnessLastNs = 0;   // leader-moved / early in-doubt seen
+    void stampHarness() {
+        const int64_t t = rune::node::testing::SchedulerWatchdog::nowNs();
+        if (harnessFirstNs == 0) harnessFirstNs = t;
+        harnessLastNs = t;
+    }
+    /// The first and last evidence time over the brokers present in both readings and not `excluded`, and the harness's.
+    [[nodiscard]] std::pair<int64_t, int64_t> evidenceSpan(const Perturbation& p0, const std::set<int>& excluded,
+                                                           const Perturbation& harness) const {
+        int64_t first = harness.harnessFirstNs, last = harness.harnessLastNs;
+        for (const auto& [id, e] : ev) {
+            if (p0.ev.count(id) == 0 || excluded.count(id) != 0 || e.firstNs == 0) continue;
+            if (first == 0 || e.firstNs < first) first = e.firstNs;
+            if (e.lastNs > last) last = e.lastNs;
+        }
+        return {first, last};
+    }
     /// The baseline: resets every running broker's pass-gap maxima (on their owner threads), then reads the counters.
     static Perturbation snapshot(ThreeNodes& c) {
         for (int n : c.runningNodes()) c.node(n).resetPassGapsForTest();
@@ -721,6 +767,7 @@ struct Perturbation {
             p.nl[n] = c.node(n).catalogNotLeaderCountsForTest();
             p.overdue[n] = c.node(n).ddlAnswersOverdueForTest();
             p.gaps[n] = c.node(n).passGapsForTest();
+            p.ev[n] = c.node(n).evidenceTimesForTest();
         }
         return p;
     }
@@ -763,9 +810,10 @@ struct CellOutcome {
     CellRoles   roles;
     std::string perturbedWhy;   ///< "" = no product evidence (the exact codes were asserted)
     uint64_t    belowMinIsrOnLeader = 0;
-    bool        stallObserved = false;   ///< a non-excluded broker pass gap or the watchdog overshoot >= kStallEvidenceNs
+    bool        stallObserved = false;   ///< a watchdog stall precedes the evidence within kStallLookbackNs (the excuse)
+    bool        passBlocked = false;     ///< a broker pass gap >= kStallEvidenceNs with the watchdog quiet (not injected)
     int64_t     maxGapNs = 0;            ///< the max admin / control pass gap
-    int64_t     watchdogGapNs = 0;       ///< the test process's SchedulerWatchdog overshoot
+    int64_t     watchdogGapNs = 0;       ///< the test process's SchedulerWatchdog overshoot, anywhere in [baseline - 1 s, end]
 };
 /// Test seams of runCell (all optional).
 struct CellSeams {
@@ -883,7 +931,7 @@ void runCell(const CellParam& param, const CellSeams& seams = {}, CellOutcome* o
     // cell) measures how long the scheduler kept it off the CPU - process-wide starvation that also delays the media-driver
     // heartbeat threads, which the brokers' admin / control pass gaps cannot see.  Joined right before the after-drive reading.
     if (seams.beforeBaseline) seams.beforeBaseline();
-    const auto tBaseline = Clock::now();
+    const int64_t tBaselineNs = rune::node::testing::SchedulerWatchdog::nowNs();
     const Perturbation pert0 = Perturbation::snapshot(c);
 
     // ── the cell's DDL ─────────────────────────────────────────────────────────────────────────────
@@ -938,7 +986,7 @@ void runCell(const CellParam& param, const CellSeams& seams = {}, CellOutcome* o
         baseline = c.node(leader).catalogEventsAppendedForTest();
         hooks.afterSend = [&](int, int node) {
             if (node != c.catalogLeaderId() || crashedNode > 0) return false;   // keyed on whoever leads when the frame is sent
-            if (node != leader) { pert.leaderMovedInCell = true; return false; }   // the held / baselined broker is not the leader any more
+            if (node != leader) { pert.leaderMovedInCell = true; pert.stampHarness(); return false; }   // the held / baselined broker is not the leader any more
             crashedNode = node;
             bool ok = false;
             rig.pumping([&] { ok = c.crashAfterNextAppend(node, baseline, /*waitCommit=*/true, 30s); });
@@ -956,7 +1004,7 @@ void runCell(const CellParam& param, const CellSeams& seams = {}, CellOutcome* o
         {
             int isrLeader = -1;
             ASSERT_TRUE(c.awaitCatalogIsrSize(2, 60s, &isrLeader)) << cell << ": the catalog leader's ISR never shrank to the 2 running brokers";
-            if (isrLeader != leader) pert.leaderMovedInCell = true;     // the topology moved between resolution and the shrink
+            if (isrLeader != leader) { pert.leaderMovedInCell = true; pert.stampHarness(); }   // the topology moved between resolution and the shrink
         }
         hooks.afterSend = [&](int, int node) {
             if (seams.suppressTimingHook) return false;   // T9: the timing never runs (the victim restarts after the drive)
@@ -981,7 +1029,7 @@ void runCell(const CellParam& param, const CellSeams& seams = {}, CellOutcome* o
             hooks.afterSend = [&](int, int node) {
                 const int lead = c.catalogLeaderId();
                 if (node != lead || placementReleased) return false;
-                if (lead != leader) pert.leaderMovedInCell = true;
+                if (lead != leader) { pert.leaderMovedInCell = true; pert.stampHarness(); }
                 if (seams.onLeaderSend) seams.onLeaderSend(c, rig, lead);
                 const int64_t ddlCorr = rig.lastCorr();
                 const std::string what = cell + " (placement held)";
@@ -1046,7 +1094,7 @@ void runCell(const CellParam& param, const CellSeams& seams = {}, CellOutcome* o
                         << std::chrono::duration_cast<std::chrono::milliseconds>(held).count()
                         << " ms (only Internal past the " << std::chrono::duration_cast<std::chrono::milliseconds>(gateCap).count()
                         << " ms gate cap is legitimate)";
-                    if (early.code == cInternal) pert.gateOverdueObserved = true;
+                    if (early.code == cInternal) { pert.gateOverdueObserved = true; pert.stampHarness(); }
                 }
                 rig.holdPlacementEverywhere(false);
                 placementReleased = true;
@@ -1124,36 +1172,63 @@ void runCell(const CellParam& param, const CellSeams& seams = {}, CellOutcome* o
     if (crashedNode > 0) excluded.insert(crashedNode);
     if (victimId > 0) excluded.insert(victimId);
     const Perturbation after = Perturbation::read(c);
+    const int64_t tReadNs = rune::node::testing::SchedulerWatchdog::nowNs();
     watchdog.stop();   // the join hands over its result
-    const int64_t watchdogGap = watchdog.maxOvershootEndingSince(tBaseline - std::chrono::nanoseconds(kStallLookbackNs));
     const std::string why = after.since(pert0, excluded, timing != cm::Timing::LeaderChangeMidDdl) +
                             (pert.leaderMovedInCell ? " leader-moved" : "") +
                             (pert.gateOverdueObserved ? " gate-overdue" : "");
-    // R2-I1: the harness-side cause - a broker thread unscheduled for >= kStallEvidenceNs, or a stall the seams injected.
-    const int64_t maxGap = after.maxGapNs(pert0, excluded);
-    const bool stallObserved = stallObservedFrom(maxGap, watchdogGap);
-    const bool stall = stallObserved || pert.injectedStall;
-    const std::string stallWhat = "stall(max gap " + std::to_string(msOf(maxGap)) + " ms, watchdog " + std::to_string(msOf(watchdogGap)) +
-                                  " ms" + (pert.injectedStall ? ", injected" : "") + ")";
-    if (why.empty()) {            // the cell's own timing only: the matrix's exact codes
+    // R3-I1 / R3-M1: the excuse is the scheduler watchdog only (or an injected stall), and only a watchdog stall that overlaps
+    // [t - 1 s, t] for the FIRST and the LAST evidence time t (stamped by the brokers' owner threads / the harness).  With no
+    // stamp at all (cannot happen for the counters, kept for safety) the evidence is placed at [baseline, read].
+    auto [evFirst, evLast] = after.evidenceSpan(pert0, excluded, pert);
+    if (evFirst == 0) { evFirst = tBaselineNs; evLast = tReadNs; }
+    const auto watchdogBefore = [&](int64_t t) { return watchdog.maxOvershootOverlapping(t - kStallLookbackNs, t); };
+    const int64_t watchdogAtFirst = watchdogBefore(evFirst), watchdogAtLast = watchdogBefore(evLast);
+    const int64_t watchdogAny = watchdog.maxOvershootOverlapping(tBaselineNs - kStallLookbackNs, tReadNs);
+    const bool excusedByWatchdog = schedulerStall(watchdogAtFirst) && schedulerStall(watchdogAtLast);
+    const int64_t maxGap = after.maxGapNs(pert0, excluded);   // diagnostic + the blocking-pass product signal, never an excuse
+    const bool stall = excusedByWatchdog || pert.injectedStall;
+    const CellVerdict verdict = classifyCell(!why.empty(), stall, watchdogAny, maxGap, pert.injectedStall);
+    const std::string stallWhat = "stall(watchdog " + std::to_string(msOf(watchdogAtFirst)) + " ms before the first evidence, " +
+                                  std::to_string(msOf(watchdogAtLast)) + " ms before the last, " + std::to_string(msOf(watchdogAny)) +
+                                  " ms in the cell; max pass gap " + std::to_string(msOf(maxGap)) + " ms" +
+                                  (pert.injectedStall ? ", injected" : "") + ")";
+    switch (verdict) {
+    case CellVerdict::Exact:
+    case CellVerdict::SlowPass:   // the cell's own timing only: the matrix's exact codes
+        if (verdict == CellVerdict::SlowPass) {   // a slow pass that moved nothing: not this test's subject, but visible
+            std::fprintf(stderr, "[ slow pass ] %s: %lld ms (watchdog %lld ms)\n", cell.c_str(), msOf(maxGap), msOf(watchdogAny));
+            ++CellTimes::slowPasses();
+        }
         EXPECT_EQ(res.firstCode, ec.first) << cell << res.trace;
         EXPECT_EQ(res.afterRedirectCode, ec.afterRedirect) << cell << res.trace;
         EXPECT_EQ(res.finalCode, ec.final) << cell << res.trace;
-    } else if (stall) {           // a host / injected stall moved the topology: the contract of THAT event (spec 5.5 / 9, F13)
+        break;
+    case CellVerdict::Perturbed:   // a host / injected stall moved the topology: the contract of THAT event (spec 5.5 / 9, F13)
         std::fprintf(stderr, "[ perturbed ] %s:%s %s %s\n", cell.c_str(), why.c_str(), stallWhat.c_str(), res.trace.c_str());
         ++CellTimes::perturbed();
-    } else {
-        ADD_FAILURE() << cell << ": product evidence of a topology change (" << why << ") with NO stall (max pass gap "
-                      << msOf(maxGap) << " ms, watchdog " << msOf(watchdogGap) << " ms, both < " << msOf(kStallEvidenceNs)
-                      << " ms) - a spurious fencing / demotion / re-election: product bug" << res.trace;
+        if (!pert.injectedStall) reportPerturbedForCheckpoint(cell, why, stallWhat);
+        break;
+    case CellVerdict::BlockingPass:
+        ADD_FAILURE() << cell << ": product evidence (" << why << ") while a broker owner thread's pass took " << msOf(maxGap)
+                      << " ms with the scheduler watchdog quiet (" << msOf(watchdogAny)
+                      << " ms): blocking pass, product liveness bug (a blocking runtime/admin pass)" << res.trace;
+        break;
+    case CellVerdict::NoStall:
+        ADD_FAILURE() << cell << ": product evidence of a topology change (" << why << ") with NO stall preceding it ("
+                      << stallWhat << ", the bound is " << msOf(kStallEvidenceNs)
+                      << " ms within 1 s before the evidence) - a spurious fencing / demotion / re-election: product bug" << res.trace;
+        break;
     }
-    // R2-I1 step 5: a cell whose timing never ran is a failure unless the leader moved under a stall.
+    // R2-I1 step 5: a cell whose timing never ran is a failure unless the leader moved under a stall (watchdog / injected).
     const bool timingRan = (timing != cm::Timing::LeaderChangeMidDdl || crashedNode > 0) &&
                            (timing != cm::Timing::RestartMidApply || restartedInHook) &&
                            (timing != cm::Timing::CreateRacesPlacement ||
                             (kind != cm::Kind::CreateTopic && kind != cm::Kind::CreateView) || placementReleased);
     if (!timingRan) {
-        if (pert.leaderMovedInCell && stall) {
+        const bool moveExcused = pert.injectedStall ||
+                                 (pert.harnessFirstNs != 0 && schedulerStall(watchdogBefore(pert.harnessFirstNs)));
+        if (pert.leaderMovedInCell && moveExcused) {
             std::fprintf(stderr, "[ not exercised ] %s: the leader moved under a %s\n", cell.c_str(), stallWhat.c_str());
             ++CellTimes::notExercised();
         } else {
@@ -1163,7 +1238,8 @@ void runCell(const CellParam& param, const CellSeams& seams = {}, CellOutcome* o
     }
     if (outcome) {
         outcome->res = res; outcome->roles = CellRoles{preLeader, leader, via}; outcome->perturbedWhy = why;
-        outcome->stallObserved = stallObserved; outcome->maxGapNs = maxGap; outcome->watchdogGapNs = watchdogGap;
+        outcome->stallObserved = excusedByWatchdog; outcome->maxGapNs = maxGap; outcome->watchdogGapNs = watchdogAny;
+        outcome->passBlocked = verdict == CellVerdict::SlowPass || verdict == CellVerdict::BlockingPass;
         if (after.nl.count(leader) && pert0.nl.count(leader)) outcome->belowMinIsrOnLeader = after.nl.at(leader).belowMinIsr - pert0.nl.at(leader).belowMinIsr;
     }
     ASSERT_EQ(res.finalCode, cOk) << cell << res.trace;    // ALWAYS
@@ -1461,7 +1537,9 @@ TEST(CatalogClusterRegression, ProductEvidenceWithoutAStallFailsTheCellRegressio
     int noStall = 0;
     for (int i = 0; i < failures.size(); ++i) {
         const auto& f = failures.GetTestPartResult(i);
-        if (std::string(f.message()).find("with NO stall") != std::string::npos && f.nonfatally_failed()) { ++noStall; continue; }
+        const std::string m = f.message();   // a coincidental >= 100 ms broker pass reports the same evidence as a blocking pass
+        if ((m.find("with NO stall") != std::string::npos || m.find("blocking pass, product liveness bug") != std::string::npos) &&
+            f.nonfatally_failed()) { ++noStall; continue; }
         ADD_FAILURE() << "unexpected cell failure: " << f.message();   // anything else is a real failure of the cell
     }
     if (!out.stallObserved) EXPECT_EQ(noStall, 1) << "product evidence without a stall must fail the cell (max pass gap "
@@ -1506,13 +1584,107 @@ TEST(CatalogClusterRegression, StallEndingBeforeTheBaselineExplainsLaterEvidence
     EXPECT_TRUE(out.stallObserved);
 }
 
-// Controller ruling (round-3 concern 1): every one of the three signals is a harness-observed stall on its own; none below the bound is.
-// RED: drop the watchdog term in stallObservedFrom -> (0, 150 ms) is not a stall.
+// T11 (Task 23 fix round 4, R3-I1): a blocking runtime pass is the regression, never its own excuse.  At the first frame the leader
+// receives, its CONTROL (runtime) thread - the one that drives consensus heartbeats - is blocked 1 s by a test task, NOT marked
+// injectsStall: a product-shaped block.  1 s, not the recipe's 400 ms: a follower fails over only after 3 x 150 = 450 ms of
+// heartbeat silence (NodeRuntimeAgent failoverTimeoutNs), so a 400 ms block moved nothing (observed: "[ slow pass ] 404 ms", no
+// evidence).  With the scheduler watchdog quiet the cell must report exactly the "blocking pass, product
+// liveness bug" failure if the block moved anything; if it moved nothing, the long pass is a [ slow pass ] (passBlocked) and the
+// exact codes hold.  If the watchdog itself saw a stall, nothing may fail.
+// RED: restore the pass-gap excuse (stall = ... || maxGap >= kStallEvidenceNs) -> the cell passes as [ perturbed ], no failure.
+TEST(CatalogClusterRegression, BlockedRuntimePassDoesNotExcuseItsOwnEvidenceRegression) {
+    CellSeams seams;
+    bool blocked = false;
+    seams.onLeaderSend = [&blocked](ThreeNodes& c, Rig& rig, int lead) {
+        rig.pumping([&] { c.node(lead).onControlThreadForTest([] { std::this_thread::sleep_for(1000ms); return 0; }, 15s); });
+        blocked = true;
+    };
+    CellOutcome out;
+    ::testing::TestPartResultArray failures;
+    {
+        ::testing::ScopedFakeTestPartResultReporter intercept(::testing::ScopedFakeTestPartResultReporter::INTERCEPT_ONLY_CURRENT_THREAD,
+                                                              &failures);
+        runCell({cm::Kind::CreateTopic, cm::Timing::Steady, 1}, seams, &out);
+    }
+    ASSERT_TRUE(blocked) << "vacuity guard: the leader's runtime pass was blocked";
+    int blockingPass = 0;
+    for (int i = 0; i < failures.size(); ++i) {
+        const auto& f = failures.GetTestPartResult(i);
+        if (std::string(f.message()).find("blocking pass, product liveness bug") != std::string::npos) { ++blockingPass; continue; }
+        ADD_FAILURE() << "unexpected cell failure: " << f.message();
+    }
+    std::fprintf(stderr, "T11: evidence '%s', max pass gap %lld ms, watchdog %lld ms, blocking-pass failures %d\n",
+                 out.perturbedWhy.c_str(), msOf(out.maxGapNs), msOf(out.watchdogGapNs), blockingPass);
+    if (schedulerStall(out.watchdogGapNs)) {
+        EXPECT_EQ(blockingPass, 0) << "a measured scheduler stall: no blocking-pass verdict";
+    } else if (!out.perturbedWhy.empty()) {
+        EXPECT_EQ(blockingPass, 1) << "the block moved the topology: a product liveness bug, never excused by its own pass gap";
+    } else {
+        EXPECT_EQ(blockingPass, 0);
+        EXPECT_TRUE(out.passBlocked) << "the 1 s pass is reported as a [ slow pass ]";
+    }
+    EXPECT_GE(out.maxGapNs, 900'000'000) << "the pass gap measured the block";
+    EXPECT_FALSE(out.perturbedWhy.empty()) << "vacuity guard: a 1 s heartbeat silence (> the 450 ms failover) moved the topology";
+}
+
+// T12 (Task 23 fix round 4, R3-M1): a watchdog stall excuses only evidence it PRECEDES by at most 1 s.  A 300 ms whole-process stop
+// right before the baseline, then the fabricated evidence 1.5 s later (the harness waits before the bump; no broker is frozen): the
+// stall is in the cell but not before the evidence -> the "NO stall preceding it" failure.
+// RED: the whole-cell window (excused = schedulerStall(watchdogAny)) -> the late evidence is excused -> no failure.
+TEST(CatalogClusterRegression, StallLongBeforeTheEvidenceDoesNotExcuseItRegression) {
+    CellSeams seams;
+    seams.beforeBaseline = [] { stopThisProcessFor(300); std::this_thread::sleep_for(50ms); };
+    seams.onLeaderSend = [](ThreeNodes& c, Rig& rig, int lead) {
+        rig.pumping([] { std::this_thread::sleep_for(1500ms); });
+        c.node(lead).bumpCatalogNotLeaderDemotedForTest();
+    };
+    CellOutcome out;
+    ::testing::TestPartResultArray failures;
+    {
+        ::testing::ScopedFakeTestPartResultReporter intercept(::testing::ScopedFakeTestPartResultReporter::INTERCEPT_ONLY_CURRENT_THREAD,
+                                                              &failures);
+        runCell({cm::Kind::CreateTopic, cm::Timing::Steady, 1}, seams, &out);
+    }
+    int noStall = 0;
+    for (int i = 0; i < failures.size(); ++i) {
+        const std::string m = failures.GetTestPartResult(i).message();
+        if (m.find("with NO stall preceding it") != std::string::npos) { ++noStall; continue; }
+        ADD_FAILURE() << "unexpected cell failure: " << m;
+    }
+    EXPECT_GE(out.watchdogGapNs, 250'000'000) << "vacuity guard: the stop is inside the cell's window";
+    EXPECT_FALSE(out.stallObserved) << "... but it does not precede the evidence";
+    EXPECT_EQ(noStall, 1);
+}
+
+// R3-M2: a watchdog whose thread cannot start (after pipe()) leaks no fd.
+// RED: drop the catch in start() -> the two pipe fds stay open (the next free fd number moves by 2).
+TEST(ThreeNodesRegression, SchedulerWatchdogFailedStartLeaksNoFdRegression) {
+    auto lowestFreeFd = [] { const int fd = ::open("/dev/null", O_RDONLY); ::close(fd); return fd; };
+    const int before = lowestFreeFd();
+    {
+        rune::node::testing::SchedulerWatchdog w;
+        rune::node::testing::SchedulerWatchdog::failNextStartForTest = true;
+        EXPECT_THROW(w.start(), std::system_error);
+    }
+    EXPECT_EQ(lowestFreeFd(), before);
+}
+
+// Task 23 fix round 4 (R3-I1): only the scheduler watchdog is a stall; a broker's own long pass never excuses evidence - with
+// evidence it is a blocking-pass product bug, without it a [ slow pass ]; an injected stall excuses and is never "blocked".
+// RED: restore the pass-gap excuse (excused = excused || maxPassGap >= bound) -> BlockingPass becomes Perturbed.
 TEST(ThreeNodesRegression, StallEvidenceCountsEveryHarnessSignalRegression) {
-    EXPECT_FALSE(stallObservedFrom(0, 0));
-    EXPECT_FALSE(stallObservedFrom(kStallEvidenceNs - 1, kStallEvidenceNs - 1));
-    EXPECT_TRUE(stallObservedFrom(kStallEvidenceNs, 0)) << "a broker admin / control pass gap";
-    EXPECT_TRUE(stallObservedFrom(0, kStallEvidenceNs)) << "the test process's watchdog (media-driver starvation)";
+    constexpr int64_t k = kStallEvidenceNs;
+    EXPECT_TRUE(schedulerStall(k));
+    EXPECT_FALSE(schedulerStall(k - 1));
+    using V = CellVerdict;
+    EXPECT_EQ(classifyCell(false, false, 0, 0, false), V::Exact);
+    EXPECT_EQ(classifyCell(false, false, 0, k, false), V::SlowPass) << "a long pass that moved nothing";
+    EXPECT_EQ(classifyCell(false, false, k, k, false), V::Exact) << "the watchdog explains the long pass";
+    EXPECT_EQ(classifyCell(true, true, k, 0, false), V::Perturbed) << "a watchdog stall precedes the evidence";
+    EXPECT_EQ(classifyCell(true, false, 0, k, false), V::BlockingPass) << "a pass gap alone is not a stall";
+    EXPECT_EQ(classifyCell(true, false, 0, k - 1, false), V::NoStall);
+    EXPECT_EQ(classifyCell(true, false, k, 0, false), V::NoStall) << "a watchdog stall that does not precede the evidence";
+    EXPECT_EQ(classifyCell(true, true, 0, k, true), V::Perturbed) << "an injected stall (frozen admin threads) excuses";
 }
 
 // Controller ruling (round-3 concern 1): the SchedulerWatchdog detects a SIGSTOP of the whole test process - the starvation that
@@ -1526,8 +1698,11 @@ TEST(ThreeNodesRegression, SchedulerWatchdogDetectsAWholeProcessStopRegression) 
     std::this_thread::sleep_for(50ms);   // the watchdog's next tick observes the stop
     w.stop();
     EXPECT_GE(w.maxOvershootNs(), 250'000'000) << "the 300 ms stop of the whole process (watchdog " << msOf(w.maxOvershootNs()) << " ms)";
-    EXPECT_GE(w.maxOvershootEndingSince(Clock::now() - 1s), 250'000'000) << "the stop ended inside the last second";
-    EXPECT_EQ(w.maxOvershootEndingSince(Clock::now() + 1s), 0) << "no stop ends in the future";
+    using WD = rune::node::testing::SchedulerWatchdog;
+    const int64_t now = WD::nowNs();
+    EXPECT_GE(w.maxOvershootOverlapping(now - 1'000'000'000, now), 250'000'000) << "the stop overlaps the last second";
+    EXPECT_EQ(w.maxOvershootOverlapping(now + 1'000'000'000, now + 2'000'000'000), 0) << "no stop in the future";
+    EXPECT_EQ(w.maxOvershootOverlapping(now - 60'000'000'000LL, now - 50'000'000'000LL), 0) << "none a minute ago";
     // A second run starts from 0 (the result of a run is its own).
     w.start();
     std::this_thread::sleep_for(30ms);

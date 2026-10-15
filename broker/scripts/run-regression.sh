@@ -30,6 +30,11 @@ el()  { perl -e "printf '%.1f', $2 - $1"; }
 # them would pass the checkpoint silently).
 ctest --test-dir "$B" -N -R BenchGateRegression | grep -q 'Total Tests: 4$' || { echo "BenchGateRegression missing (want exactly 4 registered in $B)"; exit 1; }
 
+# R3-M1: every non-injected slice / cluster cell whose exact codes were relaxed ([ perturbed ]: product evidence that a scheduler
+# stall preceded) is appended here by the test processes and listed after the run for a human look (it does not fail the run).
+export RUNE_PERTURBED_LOG="$(cd "$B" && pwd)/perturbed-cells.log"
+: > "$RUNE_PERTURBED_LOG"
+
 t0=$(now)
 echo "== stage a: *Regression* without the latency gates (-j$J)"
 ctest --test-dir "$B" -R "Regression|^batch:" -LE "latency|small" -j "$J" --output-on-failure "$@"; rcA=$?
@@ -38,6 +43,12 @@ echo "== stage b: *Regression* latency gates (serial)"
 ctest --test-dir "$B" -R Regression -L latency --output-on-failure "$@"; rcB=$?
 t2=$(now)
 
+if [ -s "$RUNE_PERTURBED_LOG" ]; then
+  echo "== NOTE: $(wc -l < "$RUNE_PERTURBED_LOG" | tr -d ' ') non-injected perturbed cell(s) - look at them ($RUNE_PERTURBED_LOG):"
+  cat "$RUNE_PERTURBED_LOG"
+else
+  echo "== perturbed cells (non-injected): 0"
+fi
 a=$(el "$t0" "$t1"); b=$(el "$t1" "$t2"); tot=$(el "$t0" "$t2")
 echo "== wall: stage a ${a} s (rc $rcA), stage b ${b} s (rc $rcB), total ${tot} s"
 if perl -e "exit !($b > 60)"; then echo "== NOTE: the latency stage took ${b} s (> 60 s)"; fi

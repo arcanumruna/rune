@@ -383,6 +383,7 @@ int32_t epochOf(const CatalogRole& r) noexcept {
 
 void AdminWorker::setRole_(CatalogRole next) {
     const bool changed = next.index() != role_.index() || epochOf(next) != epochOf(role_);
+    if (epochOf(next) != epochOf(role_)) stampEvidence_();   // R3-M1: a catalog leadership epoch change, stamped
     role_ = std::move(next);
     if (changed) spdlog::info("AdminWorker: __catalog role -> {} (epoch {})", roleName(), epochOf(role_));
 }
@@ -437,6 +438,7 @@ void AdminWorker::demote_(int32_t leaderId, int32_t epoch) {
         const DdlRequest req = std::move(a->req);
         inFlight_ = Idle{};
         ++notLeaderDemoted_;
+        stampEvidence_();
         answer_(req, kNotLeader, "the catalog leader changed while the DDL awaited its commit");
     }
 }
@@ -746,6 +748,7 @@ bool AdminWorker::advance_(int64_t nowNs) {
                      "commit - answered NotLeader (retriable; a retry with the same requestId gets its result "
                      "once it commits)", offset);
         ++notLeaderBelowMinIsr_;
+        stampEvidence_();
         answer_(req, kNotLeader, "the catalog fell below its minIsr while the DDL awaited its commit");
         return true;
     }
@@ -759,6 +762,7 @@ bool AdminWorker::advance_(int64_t nowNs) {
                      "(retriable; a retry with the same requestId gets its result if it commits)",
                      offset, kDdlTimeoutNs / 1'000'000'000LL);
         ++notLeaderCommitTimeout_;
+        stampEvidence_();
         answer_(req, kNotLeader, "the catalog event did not commit in time");
         return true;
     }

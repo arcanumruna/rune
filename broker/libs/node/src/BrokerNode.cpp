@@ -4018,6 +4018,11 @@ int BrokerNode::serviceAdminControl_() {
         work += ddlAnswerGate_.release(nowNs, serves, send,
             [this](int64_t session, int32_t topicId) {
                 ++ddlAnswersOverdue_;
+                {   // R3-M1: stamp the evidence (cold: an overdue answer only), the runtime's clock
+                    const int64_t t = clock_.nowNs();
+                    if (ddlOverdueFirstNs_ == 0) ddlOverdueFirstNs_ = t;
+                    ddlOverdueLastNs_ = t;
+                }
                 spdlog::error("BrokerNode[{}]: DDL OK for topic id={} (session {}) held {} ms and the topic still "
                               "does not serve — answered Internal (in doubt), not OK (in-doubt answers: {})",
                               config_.nodeId, topicId, session, kDdlAnswerMaxHoldNs / 1'000'000, ddlAnswersOverdue_);

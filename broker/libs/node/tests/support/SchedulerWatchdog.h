@@ -12,9 +12,12 @@
 // into the product.
 //
 // A stall takes effect LATER than it ends (a heartbeat timeout, then fencing, then an election), so the cell asks for the
-// largest overshoot that ENDED since a point before its measured window (maxOvershootEndingSince): every overshoot of at
-// least kRecordNs is kept with its end time in a fixed, preallocated ring (the oldest overwritten).
+// largest overshoot whose interval [end - overshoot, end] overlaps a window that reaches back before its evidence
+// (maxOvershootOverlapping): every overshoot of at least kRecordNs is kept with its end time in a fixed, preallocated ring
+// (the oldest overwritten).  Times are nowNs(): CLOCK_MONOTONIC_RAW, the brokers' MonotonicNanoClock, so they compare
+// with the evidence stamps the brokers record (Task 23 fix round 4, R3-M1).
 #include <poll.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <array>
@@ -22,6 +25,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
+#include <system_error>
 #include <thread>
 
 namespace rune::node::testing {
@@ -31,7 +35,12 @@ public:
     static constexpr int64_t kTickNs = 5'000'000;     // 5 ms
     static constexpr int64_t kRecordNs = 10'000'000;  // overshoots kept with their end time (>= 10 ms)
     static constexpr std::size_t kRing = 4096;
-    using Clock = std::chrono::steady_clock;
+    /// CLOCK_MONOTONIC_RAW ns - the same clock as rune::consensus::MonotonicNanoClock (the brokers' pass clocks).
+    static int64_t nowNs() noexcept {
+        timespec ts{};
+        ::clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+        return static_cast<int64_t>(ts.tv_sec) * 1'000'000'000LL + ts.tv_nsec;
+    }
 
     SchedulerWatchdog() = default;
     SchedulerWatchdog(const SchedulerWatchdog&) = delete;
@@ -44,8 +53,18 @@ public:
         if (::pipe(fds_) != 0) throw std::runtime_error("SchedulerWatchdog: pipe() failed");
         maxOvershootNs_ = 0;
         count_ = 0;
-        thread_ = std::thread([this] { run_(); });
+        try {
+            if (failNextStartForTest) { failNextStartForTest = false; throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again)); }
+            thread_ = std::thread([this] { run_(); });
+        } catch (...) {   // R3-M2: never leak the pipe when the thread cannot start
+            ::close(fds_[0]);
+            ::close(fds_[1]);
+            fds_[0] = fds_[1] = -1;
+            throw;
+        }
     }
+    /// Test seam (R3-M2): the next start() fails as a std::thread constructor would (after pipe()).
+    inline static bool failNextStartForTest = false;
     /// Stops and joins the thread; afterwards maxOvershootNs() holds the run's largest overshoot.  Idempotent.
     void stop() {
         if (!thread_.joinable()) return;
@@ -58,12 +77,15 @@ public:
     }
     /// The largest overshoot of one kTickNs sleep (ns) of the last run.  Read only after stop() (the join hands it over).
     [[nodiscard]] int64_t maxOvershootNs() const noexcept { return maxOvershootNs_; }
-    /// The largest recorded overshoot (>= kRecordNs, else 0) that ENDED at or after `since`.  Read only after stop().
-    [[nodiscard]] int64_t maxOvershootEndingSince(Clock::time_point since) const noexcept {
+    /// The largest recorded overshoot (>= kRecordNs, else 0) whose interval [end - overshoot, end] overlaps [fromNs, toNs]
+    /// (nowNs() times).  Read only after stop().
+    [[nodiscard]] int64_t maxOvershootOverlapping(int64_t fromNs, int64_t toNs) const noexcept {
         int64_t m = 0;
         const std::size_t n = count_ < kRing ? count_ : kRing;
-        for (std::size_t i = 0; i < n; ++i)
-            if (ring_[i].end >= since && ring_[i].overshootNs > m) m = ring_[i].overshootNs;
+        for (std::size_t i = 0; i < n; ++i) {
+            const Stall& st = ring_[i];
+            if (st.endNs >= fromNs && st.endNs - st.overshootNs <= toNs && st.overshootNs > m) m = st.overshootNs;
+        }
         return m;
     }
 
@@ -72,11 +94,11 @@ private:
         pollfd p{fds_[0], POLLIN, 0};
         constexpr int kTickMs = static_cast<int>(kTickNs / 1'000'000);
         for (;;) {
-            const auto t0 = Clock::now();
+            const int64_t t0 = nowNs();
             const int r = ::poll(&p, 1, kTickMs);
             if (r > 0) return;   // stop()
-            const auto t1 = Clock::now();
-            const int64_t over = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count() - kTickNs;
+            const int64_t t1 = nowNs();
+            const int64_t over = t1 - t0 - kTickNs;
             if (over > maxOvershootNs_) maxOvershootNs_ = over;
             if (over >= kRecordNs) ring_[count_++ % kRing] = Stall{t1, over};
         }
@@ -84,7 +106,7 @@ private:
 
     std::thread thread_;
     int         fds_[2] = {-1, -1};
-    struct Stall { Clock::time_point end{}; int64_t overshootNs = 0; };
+    struct Stall { int64_t endNs = 0; int64_t overshootNs = 0; };
     int64_t                    maxOvershootNs_ = 0;
     std::array<Stall, kRing>   ring_{};   // preallocated; no allocation while running
     std::size_t                count_ = 0;
