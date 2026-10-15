@@ -46,6 +46,7 @@
 #include <string>
 #include <thread>
 #include <unistd.h>
+#include <random>
 #include <vector>
 
 using namespace rune::node;
@@ -62,9 +63,10 @@ namespace {
 struct TmpDir {
     fs::path path;
     explicit TmpDir(const char* tag) {
-        static std::atomic<int> seq{0};
+        // pid + a per-dir random nonce (no shared counter: no static / atomic state).
+        const uint64_t nonce = (static_cast<uint64_t>(std::random_device{}()) << 32) ^ std::random_device{}();
         path = fs::temp_directory_path() /
-               (std::string("rune_cs_") + tag + "_" + std::to_string(::getpid()) + "_" + std::to_string(seq++));
+               (std::string("rune_cs_") + tag + "_" + std::to_string(::getpid()) + "_" + std::to_string(nonce));
         fs::create_directories(path);
     }
     ~TmpDir() { std::error_code ec; fs::remove_all(path, ec); }
@@ -266,6 +268,7 @@ void expectNeverSentToVictim(ShardTestClient& c, const Ports& ports, std::map<in
     SCOPED_TRACE(when);
     const std::string victimEp = "127.0.0.1:" + std::to_string(ports.client[static_cast<std::size_t>(victim)]);
     const std::size_t errorsBefore = c.errors().size();
+    std::vector<int64_t> subscribeCorrs;
     for (int i = 0; i < 3; ++i) {
         if (i == victim) continue;
         if (!sid.count(i)) sid[i] = c.connect(gatewayChannel(ports, i), kClientStream);
@@ -282,10 +285,17 @@ void expectNeverSentToVictim(ShardTestClient& c, const Ports& ports, std::map<in
             else
                 EXPECT_EQ(o.code, static_cast<int16_t>(rune::protocol::client::ErrorCode::Redirect))
                     << "node " << i << " partition " << p << ": produce failed with code " << o.code;
-            ASSERT_TRUE(c.subscribe(gatewayChannel(ports, i), kClientStream, sid[i], 0, p, 0));
+            const int64_t corr = c.subscribeIsolated(gatewayChannel(ports, i), kClientStream, sid[i], 0, p, 0,
+                                                     /*read_uncommitted=*/0);
+            ASSERT_NE(corr, 0);
+            subscribeCorrs.push_back(corr);
         }
     }
-    (void)c.pollUntil([] { return false; });   // drain the subscribe answers (bounded)
+    // Drain the subscribe answers: wait until every subscribe is answered (a SubscribeResponse or an
+    // ErrorResponse on its correlation id — a Redirect would be one), bounded by the same budget the old
+    // fixed drain spent unconditionally (pollUntil's 50k x 100 us cap).
+    const auto drainDeadline = std::chrono::steady_clock::now() + 5s;
+    for (const int64_t corr : subscribeCorrs) (void)c.awaitSubscribeCode(corr, drainDeadline);
     for (std::size_t k = errorsBefore; k < c.errors().size(); ++k)
         EXPECT_EQ(c.errors()[k].message.find(victimEp), std::string::npos)
             << "a survivor redirected the client to the stopping node (code " << c.errors()[k].code << ")";

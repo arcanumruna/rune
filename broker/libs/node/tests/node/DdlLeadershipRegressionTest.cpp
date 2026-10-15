@@ -170,31 +170,51 @@ TEST(DdlFixRegression, KL2_RetryAfterATimeoutIsNotLeaderWhileCatchingUpThenTheOr
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
 
-// Review M7: an ISR SHRINK at the same leader epoch (follower 2 leaves the ISR)
-// while an op awaits its commit is not a leadership change: the op stays in
-// flight, the role keeps serving, and new appends are refused below minIsr.
+// Review M7, updated to the Task 20 fix round 1 (I2) contract (spec §5.5 / §9; cba20b92 changed the
+// broker, this test was left asserting the old "stays in flight" behaviour and failed deterministically):
+// an ISR SHRINK below minIsr at the same leader epoch while an op awaits its commit is still NOT a
+// leadership change (no new epoch, never demoted), but the op is answered the retriable NotLeader at once
+// (it cannot commit until a broker returns - never a wait for the client's deadline).  The leader holds
+// CatchingUp (LEO > HW); when the follower rejoins and the event commits, a retry with the same requestId
+// gets the ORIGINAL result, applied once.  Shrunk again, a NEW append is refused below minIsr.
 TEST(DdlFixRegression, IsrShrinkAtTheSameEpochWhileAwaitingCommitIsNotALeadershipChange) {
     DdlHarnessOptions o;
     o.holdCommits = true;
     DdlHarness h(o);
-    const int64_t a = h.submit(Op::AlterAdd, "src");
+    AlterTopicMsg m;
+    m.topicName = "src";
+    m.opsBlob = alterOpsFor(Op::AlterAdd, 78);
+    m.meta = h.rig().meta("ALTER TOPIC src ADD extra78 INT64");
+    const AlterTopicMsg retry = m;
+    const int64_t a = h.submitRawAlter(std::move(m));
     ASSERT_TRUE(h.tickUntilAppended());
     const int32_t epoch = static_cast<int32_t>(h.rig().replica().epoch());
+    const uint64_t eventsAfterAppend = h.eventsAppended();
     h.setIsrInPlace({1});
-    for (int i = 0; i < 3; ++i) h.tick();
+    h.tick();
+    ASSERT_TRUE(h.response(a).has_value()) << "answered at once below minIsr, not at the DDL deadline";
+    EXPECT_EQ(h.response(a)->err, kNotLeader) << "retriable: the event may still commit";
+    EXPECT_FALSE(h.worker().hasInFlight());
     EXPECT_EQ(static_cast<int32_t>(h.rig().replica().epoch()), epoch) << "no new epoch";
-    EXPECT_EQ(h.worker().roleName(), "LeaderServing") << "the role keeps serving";
-    EXPECT_TRUE(h.worker().hasInFlight()) << "the op stays in flight";
-    EXPECT_FALSE(h.response(a).has_value()) << "never acked by the leader alone (acks=all, minIsr = a majority)";
+    EXPECT_NE(h.worker().roleName(), "Follower") << "an ISR shrink is not a demotion";
     EXPECT_TRUE(h.commitHeld()) << "the HW did not advance past the event";
-    EXPECT_EQ(h.schemas().byName("src")->version, 1u);
-    // Follower 2 rejoins at the same epoch and fetches: the event commits once.
+    EXPECT_EQ(h.schemas().byName("src")->version, 1u) << "not applied before it commits";
+    const int64_t early = h.submitRawAlter(AlterTopicMsg(retry));
+    h.tick();
+    ASSERT_TRUE(h.response(early).has_value());
+    EXPECT_EQ(h.response(early)->err, kNotLeader) << "the retry while the event is uncommitted";
+    // Follower 2 rejoins at the same epoch and fetches: the event commits once; the retry gets its result.
     h.setIsrInPlace({1, DdlHarness::kFollower});
     h.releaseCommits();
-    for (int i = 0; i < 3 && !h.response(a).has_value(); ++i) h.tick();
-    ASSERT_TRUE(h.response(a).has_value());
-    EXPECT_EQ(h.response(a)->err, kOk);
-    EXPECT_EQ(h.response(a)->version, 2u);
+    for (int i = 0; i < 5; ++i) h.tick();
+    ASSERT_TRUE(h.worker().isLeader()) << "caught up: serving again";
+    const int64_t late = h.submitRawAlter(AlterTopicMsg(retry));
+    h.settle();
+    ASSERT_TRUE(h.response(late).has_value());
+    EXPECT_EQ(h.response(late)->err, kOk) << "the retry gets the original result";
+    EXPECT_EQ(h.response(late)->version, 2u);
+    EXPECT_EQ(h.eventsAppended(), eventsAfterAppend) << "deduped: applied once, never a second event";
+    EXPECT_EQ(h.schemas().byName("src")->version, 2u);
     // Shrunk again at the same epoch, a NEW append is refused below minIsr.
     h.setIsrInPlace({1});
     const uint64_t events = h.eventsAppended();

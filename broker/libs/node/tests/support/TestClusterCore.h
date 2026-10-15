@@ -76,7 +76,7 @@ public:
             const NodeConfig& nc = nodes_[target]->effectiveConfigForTest();
             const std::string& channel = nc.clientEndpoint.channel;
             const int32_t      stream  = nc.clientEndpoint.streamId;
-            const int64_t sid = sessionOn_(channel, stream);
+            const int64_t sid = sessionOn_(channel, stream, deadline);
             if (sid <= 0) { last = "cannot connect to " + channel; sleep_(); continue; }
 
             const int64_t corr = client_->sendDefineTopic(channel, stream, sid, spec.name,
@@ -110,6 +110,17 @@ public:
                     ++redirectsFollowed_;
                     notLeaderStreak = 0;
                     last = "Redirect to " + ans->message;
+                    continue;
+                }
+                // The broker's DDL answer gate (a committed DDL is answered only once its topic serves) gives up
+                // after its own budget with Internal "... (placement pending)" - on a loaded host (ctest -j) the
+                // placement can take longer.  The DDL is committed: re-asking with the SAME requestId is answered
+                // from the dedupe (the original result once it serves), never a second event - wait for it within
+                // this call's deadline, as a real client retrying would.
+                if (ans->code == static_cast<int16_t>(pc::ErrorCode::Internal) &&
+                    ans->message.find("placement pending") != std::string::npos) {
+                    last = ans->message;
+                    sleep_();
                     continue;
                 }
                 return fail_(ans->code, ans->message);
@@ -173,10 +184,10 @@ private:
     }
 
     /// One session per gateway channel, reused by every DDL of this cluster.
-    int64_t sessionOn_(const std::string& channel, int32_t stream) {
+    int64_t sessionOn_(const std::string& channel, int32_t stream, Clock::time_point deadline) {
         for (const auto& s : sessions_)
             if (s.first == channel) return s.second;
-        const int64_t sid = client_->connect(channel, stream);
+        const int64_t sid = client_->connect(channel, stream, deadline);   // bounded by the DDL's own deadline
         if (sid > 0) sessions_.emplace_back(channel, sid);
         return sid;
     }

@@ -52,6 +52,7 @@
 // Namespace: rune::storage   C++23
 // ---------------------------------------------------------------------------
 
+#include <rune/storage/ZeroedBytes.h>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -91,7 +92,7 @@ public:
         assert(maxBytes  > 0 && "InMemoryLog: maxBytes must be > 0");
         assert(maxRecords > 0 && "InMemoryLog: maxRecords must be > 0");
         // Allocate the fixed-size circular byte buffer exactly once.
-        ring_.resize(maxBytes);
+        ring_.reset(maxBytes);   // ZeroedBytes: one memset, not a per-byte vector fill (Debug-build cost)
         // Allocate the fixed-capacity circular ENTRY ring exactly once.  Unlike a
         // std::vector, evicting the oldest entry advances a head index in O(1)
         // (no front-erase memmove of the surviving descriptors).
@@ -590,7 +591,7 @@ private:
     std::size_t           maxBytes_;
     std::size_t           maxRecords_;
     FullPolicy            policy_;
-    std::vector<uint8_t>  ring_;             ///< fixed-capacity circular byte buffer
+    ZeroedBytes           ring_;             ///< fixed-capacity circular byte buffer
     std::vector<Entry>    entries_;          ///< fixed-capacity circular entry ring (size == maxRecords_)
     std::size_t           entryHead_  = 0;   ///< physical index of oldest live entry in entries_
     std::size_t           entryCount_ = 0;   ///< number of live entries in the ring

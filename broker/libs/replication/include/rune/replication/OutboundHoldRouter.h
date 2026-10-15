@@ -44,6 +44,7 @@
 // no std::function): int64_t offer(NodeId peer, const uint8_t* buf, size_t len),
 // > 0 accepted, kOfferOversized permanent refusal, any other value refused.
 // ---------------------------------------------------------------------------
+#include <rune/storage/ZeroedBytes.h>
 #include <rune/replication/Types.h>
 
 #include <cstddef>
@@ -75,7 +76,7 @@ public:
     /// Cold: allocate the fixed capacity (bytes, rounded down to a multiple of 4).
     void init(std::size_t capacityBytes) {
         cap_ = capacityBytes & ~static_cast<std::size_t>(3);
-        buf_.assign(cap_, 0);
+        buf_.reset(cap_);   // ZeroedBytes: one memset, not a per-byte vector fill (Debug-build cost)
         head_ = tail_ = 0;
         count_ = 0;
     }
@@ -135,7 +136,7 @@ private:
     void     putU32_(std::size_t i, uint32_t v) noexcept { std::memcpy(buf_.data() + i, &v, 4); }
     uint32_t getU32_(std::size_t i) const noexcept { uint32_t v; std::memcpy(&v, buf_.data() + i, 4); return v; }
 
-    std::vector<uint8_t> buf_;
+    rune::storage::ZeroedBytes buf_;
     std::size_t          cap_   = 0;
     uint64_t             head_  = 0;   // monotonic byte positions (mod cap_)
     uint64_t             tail_  = 0;

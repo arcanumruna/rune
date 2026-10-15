@@ -2,6 +2,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <vector>
 #include <rune/view/ViewRow.h>
@@ -262,12 +263,12 @@ private:
     uint8_t* rowAddr(uint32_t rid) noexcept {
         auto& chunk = chunks_[static_cast<size_t>(rid) >> chunkShift_];
         const size_t inChunk = static_cast<size_t>(rid) & chunkMask_;
-        return chunk.data() + inChunk * layout_.rowLen;
+        return chunk.get() + inChunk * layout_.rowLen;
     }
     const uint8_t* rowAddr(uint32_t rid) const noexcept {
         const auto& chunk = chunks_[static_cast<size_t>(rid) >> chunkShift_];
         const size_t inChunk = static_cast<size_t>(rid) & chunkMask_;
-        return chunk.data() + inChunk * layout_.rowLen;
+        return chunk.get() + inChunk * layout_.rowLen;
     }
 
     RowLayout layout_;
@@ -275,7 +276,10 @@ private:
     std::vector<uint8_t>  tags_;   // 1-byte Swiss/F14-style tag per index slot
     std::vector<uint64_t> keys_;   // exact 8-byte key per index slot
     std::vector<uint32_t> rid_;    // dense row-id per index slot
-    std::vector<std::vector<uint8_t>> chunks_; // row-payload chunked arena; rows never move
+    // Row-payload chunked arena; rows never move.  Each chunk is a zeroed array (one memset in appendChunk),
+    // not a std::vector<uint8_t>: an unoptimized (Debug / sanitizer) build constructed and destroyed a
+    // vector chunk byte by byte — ~0.1 s per view table in every test that installs a view.
+    std::vector<std::unique_ptr<uint8_t[]>> chunks_;
     std::vector<uint32_t> free_;   // row-id free-list (LIFO; reused before nextRid_)
 
     uint32_t nextRid_ = 0;  // next never-used row-id, bumped when free_ is empty

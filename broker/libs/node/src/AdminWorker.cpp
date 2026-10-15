@@ -264,7 +264,7 @@ AdminWorker::AdminWorker(SchemaRegistry& reg,
     , applier_(catalogDirOf(catalogReplica), reg, *viewRegistry_) {
     if (catalogReplica_ != nullptr) {
         // One max fetch + the batch framing slack the worker's scratch carries.
-        catalogReadScratch_.resize(static_cast<std::size_t>(rune::replication::kDefaultMaxFetchBytes) + 64u * 1024u);
+        catalogReadScratch_.reset(static_cast<std::size_t>(rune::replication::kDefaultMaxFetchBytes) + 64u * 1024u);
         catalogReplica_->setReadScratch(catalogReadScratch_.data(), catalogReadScratch_.size());
         // Task 12: catalog reads.  Ids carry the node prefix the gateway's do
         // ((nodeId + 1) << 40), so they stay cluster-unique.

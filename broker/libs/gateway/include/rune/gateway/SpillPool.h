@@ -29,6 +29,8 @@
 #include <cstring>
 #include <vector>
 
+#include <rune/storage/ZeroedBytes.h>
+
 namespace rune::gateway {
 
 class SpillPool {
@@ -166,7 +168,7 @@ private:
     void setLen_(uint32_t b, uint32_t v) noexcept { std::memcpy(block_(b) + 4, &v, 4); }
 
     uint32_t             blocks_;
-    std::vector<uint8_t> mem_;
+    rune::storage::ZeroedBytes mem_;   // fixed at construction (memset, not a per-byte vector fill — Debug-build cost)
     uint32_t             freeHead_   = kNil;
     std::size_t          freeBlocks_ = 0;
     std::size_t          records_    = 0;

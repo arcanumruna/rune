@@ -12,6 +12,8 @@
 #include "HotPathBRig.h"
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <chrono>
+#include <thread>
 
 
 // F5: N concurrent PushReads, each with 512 KiB of data available, must not be
@@ -1175,7 +1177,14 @@ TEST(HotPathBRegression, EpochStateFsyncFdOutlivesItsReplicaUntilTheCompletionRe
     ASSERT_EQ(rig.reg.collectRetired(UINT64_MAX), 1u);
     EXPECT_NE(::fcntl(syncFd, F_GETFD), -1) << "the in-flight fsync's fd was closed under it";
     rig.worker().setReapPausedForTest(false);
-    for (int i = 0; i < 2000 && ::fcntl(syncFd, F_GETFD) != -1; ++i) { rig.pass(); std::this_thread::yield(); }
+    // Bounded by a deadline, not a pass count (2026-10-15, found once the suite ran in parallel): the fsync
+    // completes on the io backend's own thread; on a loaded host (ctest -j) 2000 yielding passes ended before it
+    // did and the still-in-flight fd read as a leak.
+    const auto reapDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (::fcntl(syncFd, F_GETFD) != -1 && std::chrono::steady_clock::now() < reapDeadline) {
+        rig.pass();
+        std::this_thread::yield();
+    }
     EXPECT_EQ(::fcntl(syncFd, F_GETFD), -1) << "the fsync's fd leaked after its completion";
 }
 

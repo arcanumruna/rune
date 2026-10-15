@@ -20,6 +20,7 @@
 // Multi-node: real per-peer UDP publications + ingress subscription.
 // Both paths now serve clients via ClientGateway (single-writer duty-cycle).
 
+#include <rune/storage/ZeroedBytes.h>
 #include <algorithm>
 #include <cstring>
 #include <cassert>
@@ -817,7 +818,7 @@ private:
     // O(n) front erase).  4x the ring: one tick's answers fit by construction.
     static constexpr std::size_t kEgressBacklogBytes = 4u * static_cast<std::size_t>(kAdminEgressRingBytes);
     rune::gateway::SpillFifo egressBacklog_{kEgressBacklogBytes};
-    std::vector<uint8_t> egressStage_ = std::vector<uint8_t>(static_cast<std::size_t>(kAdminEgressRingBytes) / 8);
+    rune::storage::ZeroedBytes egressStage_{static_cast<std::size_t>(kAdminEgressRingBytes) / 8};   // ZeroedBytes: memset, not a per-byte vector fill (Debug-build cost)
 
     // Catalog history Task 7: catalog effects the ring could not take, FIFO.
     // GROWABLE (fix round 1, C1/I1): its volume is input-derived (a boot posts the

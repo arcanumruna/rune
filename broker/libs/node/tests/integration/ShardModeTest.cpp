@@ -388,7 +388,7 @@ void runCatalogRestart(bool wipePlacementLog) {
         }
         return converged;
     };
-    const auto convergeDeadline = std::chrono::steady_clock::now() + 20s;
+    const auto convergeDeadline = std::chrono::steady_clock::now() + 60s;   // a condition poll; 20 s was outlasted on a loaded host (ctest -j)
     while (!check(nullptr) && std::chrono::steady_clock::now() < convergeDeadline)
         std::this_thread::sleep_for(50ms);
     std::vector<std::string> diag;

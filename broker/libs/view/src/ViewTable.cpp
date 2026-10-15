@@ -1,4 +1,5 @@
 // libs/view/src/ViewTable.cpp
+#include <cstring>
 #include <rune/view/ViewTable.h>
 #include <algorithm>
 #include <bit>
@@ -72,7 +73,12 @@ ViewTable::ViewTable(RowLayout layout, size_t initialIndexSlots, size_t chunkByt
 }
 
 void ViewTable::appendChunk() {
-    chunks_.emplace_back(rowsPerChunk_ * static_cast<size_t>(layout_.rowLen), uint8_t{0});
+    {
+        const size_t bytes = rowsPerChunk_ * static_cast<size_t>(layout_.rowLen);
+        std::unique_ptr<uint8_t[]> chunk(new uint8_t[bytes]);
+        std::memset(chunk.get(), 0, bytes);
+        chunks_.push_back(std::move(chunk));
+    }
     // dirty_/dirtyKeys_ are indexed by rid and must cover every valid rid.
     // Grown here (alongside the row slab) rather than on index rehash:
     // rehash relocates (tag,key,rid) index entries but never changes a

@@ -8,8 +8,9 @@ target_compile_features(rune_aeron_util INTERFACE cxx_std_23)
 if(BUILD_TESTING)
     # Task 11 fix 2 (B3): templated fragment assembler — reassembly regression.
     find_package(GTest REQUIRED)
-    add_executable(rune_aeronutil_tests tests/FragmentAssemblerTest.cpp)
+    add_executable(rune_aeronutil_tests tests/FragmentAssemblerTest.cpp
+        tests/FreePortRegressionTest.cpp)   # 2026-10-15: the parallel-safe test port allocator
     target_link_libraries(rune_aeronutil_tests PRIVATE rune_aeron_util GTest::gtest_main)
     include(GoogleTest)
-    gtest_discover_tests(rune_aeronutil_tests)
+    gtest_discover_tests(rune_aeronutil_tests PROPERTIES TIMEOUT 120)
 endif()

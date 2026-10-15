@@ -79,6 +79,12 @@ Outcome connectTo(ThreeNodes& c, int32_t id, const std::string& tag,
         o.failure = e.what();
     }
     o.took      = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0);
+    // Isolation fix (2026-10-15, found once the suite ran in parallel): onConnected runs on the client's duty
+    // thread and is not ordered before connectAndWait() returns — on a loaded host (ctest -j) the session id
+    // was read as 0 (host -1) before the callback stored it.  Wait for it (bounded) after a successful connect.
+    for (const auto dl = std::chrono::steady_clock::now() + 5s; o.ok && sid->load() == 0 &&
+                                                                std::chrono::steady_clock::now() < dl;)
+        std::this_thread::sleep_for(1ms);
     o.sessionId = sid->load();
     if (keep) *keep = std::move(client);
     return o;

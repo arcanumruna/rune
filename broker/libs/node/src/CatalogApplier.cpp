@@ -315,7 +315,7 @@ int CatalogApplier::applyRange_(rune::storage::Log* log, int64_t bound) {
             }
             spdlog::warn("CatalogApplier: the batch at offset {} exceeds the {} B read buffer — growing it", from,
                          readBuf_.size());
-            readBuf_.resize(std::min(readBuf_.size() * 2, kCatalogReadMaxBuffer));
+            readBuf_.reset(std::min(readBuf_.size() * 2, kCatalogReadMaxBuffer));   // the retry re-reads into it
             continue;
         case st::ReadIntoStatus::Absent:
             cannotRead(from, "Absent — the log holds no batch at or after it");

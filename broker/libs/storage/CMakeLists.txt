@@ -19,7 +19,7 @@ endif()
 
 if(BUILD_TESTING)
     find_package(GTest REQUIRED)
-    add_executable(rune_storage_tests tests/storage/SmokeTest.cpp tests/storage/MappedFileTest.cpp tests/storage/OffsetIndexTest.cpp tests/storage/LogSegmentTest.cpp tests/storage/LogTest.cpp tests/storage/RetentionTest.cpp tests/storage/LeaderEpochCacheTest.cpp tests/storage/LeaderEpochCachePersistTest.cpp tests/storage/ProducerStateManagerTest.cpp tests/storage/PartitionApiTest.cpp tests/storage/OffsetMapTest.cpp tests/storage/LogCleanerTest.cpp tests/storage/SkimpyOffsetMapTest.cpp tests/storage/LogReadViewTest.cpp tests/storage/ThrottlerTest.cpp tests/storage/CleanerOffsetCheckpointTest.cpp tests/storage/ProducerIdScanTest.cpp tests/storage/RecoveryPointTest.cpp tests/storage/SegmentLifecycleHotpathTest.cpp tests/storage/SegmentFdScaleTest.cpp)
+    add_executable(rune_storage_tests tests/storage/SmokeTest.cpp tests/storage/MappedFileTest.cpp tests/storage/OffsetIndexTest.cpp tests/storage/LogSegmentTest.cpp tests/storage/LogTest.cpp tests/storage/RetentionTest.cpp tests/storage/LeaderEpochCacheTest.cpp tests/storage/LeaderEpochCachePersistTest.cpp tests/storage/ProducerStateManagerTest.cpp tests/storage/PartitionApiTest.cpp tests/storage/OffsetMapTest.cpp tests/storage/LogCleanerTest.cpp tests/storage/SkimpyOffsetMapTest.cpp tests/storage/LogReadViewTest.cpp tests/storage/ThrottlerTest.cpp tests/storage/CleanerOffsetCheckpointTest.cpp tests/storage/ProducerIdScanTest.cpp tests/storage/RecoveryPointTest.cpp tests/storage/SegmentLifecycleHotpathTest.cpp tests/storage/SegmentFdScaleTest.cpp tests/storage/ZeroedBytesRegressionTest.cpp)
     add_executable(rune_in_memory_log_tests tests/storage/InMemoryLogTest.cpp
         tests/storage/InMemoryLogReadViewTest.cpp
         tests/storage/InMemoryLogTransientTest.cpp)
@@ -32,7 +32,8 @@ if(BUILD_TESTING)
     # (rune::transaction::ControlMarker::build) — a cross-library contract.
     target_link_libraries(rune_storage_tests PRIVATE rune_storage rune_transaction GTest::gtest_main)
     include(GoogleTest)
-    gtest_discover_tests(rune_storage_tests)
+    gtest_discover_tests(rune_storage_tests PROPERTIES LABELS small)
+    rune_regression_batches(rune_storage_tests 2)   # defined in the root CMakeLists.txt
 endif()
 
 option(BUILD_INTEGRATION_TESTING "Build storage integration tests (no external deps — real filesystem only)" ON)

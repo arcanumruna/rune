@@ -52,6 +52,7 @@
 // std::variant<AwaitingBoot, Booted, Live> — boot vs live effects are selected by
 // the PHASE, never by a flag (F4); an idle applyCommitted allocates nothing.
 
+#include <rune/storage/ZeroedBytes.h>
 #include <rune/catalog/CatalogEvent.h>
 #include <rune/catalog/CatalogState.h>
 
@@ -205,7 +206,7 @@ private:
     std::variant<Applying, Halted>               st_;
     std::variant<AwaitingBoot, Booted, Live>     phase_;
     AppliedAt                                    lastApplied_;
-    std::vector<uint8_t>                         readBuf_;      // kCatalogReadChunk, capacity kept
+    rune::storage::ZeroedBytes                 readBuf_;      // kCatalogReadChunk, grown (reset) only on FirstTooLarge
     uint64_t                                     tamperXor_ = 0;
     struct ReadFault { int status = 0; std::vector<uint8_t> bytes; int count = 0; };
     ReadFault                                    readFault_;   // count 0 = none (test seam)

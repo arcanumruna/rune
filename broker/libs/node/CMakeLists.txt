@@ -177,7 +177,8 @@ if(BUILD_TESTING)
         rune_view
         GTest::gtest_main)
     include(GoogleTest)
-    gtest_discover_tests(rune_node_tests)
+    gtest_discover_tests(rune_node_tests PROPERTIES LABELS small)
+    rune_regression_batches(rune_node_tests 4)   # defined in the root CMakeLists.txt
 
     # Catalog history Task 7 (F12): the admin thread's catalog steady state never
     # allocates.  Replaces the global operator new (binary-wide) — own binary, like
@@ -206,7 +207,8 @@ if(BUILD_TESTING)
         rune_codec
         rune_view
         GTest::gtest_main)
-    gtest_discover_tests(rune_catalog_matrix_tests PROPERTIES TIMEOUT 600)
+    gtest_discover_tests(rune_catalog_matrix_tests PROPERTIES TIMEOUT 600 LABELS small)
+    rune_regression_batches(rune_catalog_matrix_tests 2)
 
     # Catalog history Task 21: the seeded, model-checked stress (64 seeds x 400 steps against the independent
     # CatalogModel).  Its own binary: long-running (each seed is one ctest case).
@@ -627,7 +629,8 @@ if(BUILD_TESTING)
         GTest::gtest_main)
     gtest_discover_tests(rune_ddl_conformance_tests
         DISCOVERY_TIMEOUT 120
-        PROPERTIES TIMEOUT 120)
+        PROPERTIES TIMEOUT 120 LABELS small)
+    rune_regression_batches(rune_ddl_conformance_tests 3)
 
     # DDL conformance plan Task 10: seeded model-checked DDL stress + the admin
     # steady-state zero-alloc gate.  Own executable (replaces global operator new).
@@ -930,14 +933,20 @@ if(BUILD_TESTING)
         rune_replication
         rune_storage
         GTest::gtest_main)
-    # RUN_SERIAL: this binary contains latency assertions (e.g.
-    # AppendP99UnperturbedByCompaction) that measure append p99 while compaction
-    # runs.  Under `ctest -jN` on a small host, concurrent test processes steal CPU
-    # and perturb the p99, causing a false failure (the test passes standalone).
-    # Serialising it guarantees the measurement reflects compaction interference
-    # only, not ambient scheduler contention.
+    # RUN_SERIAL + LABELS latency: AppendP99UnperturbedByCompaction measures append
+    # p99 while compaction runs.  Under `ctest -jN` on a small host, concurrent test
+    # processes steal CPU and perturb the p99, causing a false failure (the test
+    # passes standalone).  Serialising it guarantees the measurement reflects
+    # compaction interference only, not ambient scheduler contention.  Only that
+    # latency test is serial (scripts/run-regression.sh stage b); the rest of the
+    # binary is functional and runs in parallel (2026-10-15).
+    set(RUNE_CLEANER_LATENCY_TESTS "CompactionCleanerAgent.AppendP99UnperturbedByCompaction")
     gtest_discover_tests(rune_compaction_cleaner_agent_tests
-        PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
+        TEST_FILTER "${RUNE_CLEANER_LATENCY_TESTS}"
+        PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE LABELS latency)
+    gtest_discover_tests(rune_compaction_cleaner_agent_tests
+        TEST_FILTER "-${RUNE_CLEANER_LATENCY_TESTS}"
+        PROPERTIES TIMEOUT 120)
 
     # ---------------------------------------------------------------------------
     # Duty-pass latency gate (*LatencyGate* + *Regression*): drives the REAL
@@ -958,7 +967,7 @@ if(BUILD_TESTING)
         rune_transaction
         GTest::gtest_main)
     gtest_discover_tests(rune_duty_pass_latency_gate_tests
-        PROPERTIES TIMEOUT 1800 RUN_SERIAL TRUE)
+        PROPERTIES TIMEOUT 1800 RUN_SERIAL TRUE LABELS latency)
 
     # Hot-path B (2026-10-05): deterministic regressions behind the latency-gate
     # findings F5 / F7 / F8 (PushRead zero-copy + per-pass bound, async epoch
@@ -1007,8 +1016,16 @@ if(BUILD_TESTING)
         rune_storage
         rune_transaction
         GTest::gtest_main)
+    # Only the gate itself is serial (stage b of scripts/run-regression.sh); the
+    # binary's functional fairness / skip-walk / judging tests run in parallel.
+    set(RUNE_TRANSIENT_FAILOVER_GATE
+        "TransientFailoverLatencyGateRegression.KTransientPartitionsBecomingLeaderNeverStallAWorkerPass")
     gtest_discover_tests(rune_transient_failover_latency_gate_tests
-        PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
+        TEST_FILTER "${RUNE_TRANSIENT_FAILOVER_GATE}"
+        PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE LABELS latency)
+    gtest_discover_tests(rune_transient_failover_latency_gate_tests
+        TEST_FILTER "-${RUNE_TRANSIENT_FAILOVER_GATE}"
+        PROPERTIES TIMEOUT 600)
 
     # Phase 2b E2: replaces the global operator new (binary-wide) — own binary.
     add_executable(rune_transient_alloc_regression_tests
@@ -1080,13 +1097,11 @@ if(BUILD_TESTING)
                 rune_node
                 aeron::aeron
                 GTest::gtest_main)
-            # RESOURCE_LOCK rune_udp_ports: these tests start real BrokerNodes /
-            # transports binding UDP ports (incl. discovered ephemeral ports for
-            # the F3 e2e client) — the same TOCTOU port race as the other UDP
-            # suites (seen under ctest -j2: a shard suite's discovered gateway
-            # port was taken concurrently → "Address already in use").
+            # No RESOURCE_LOCK (2026-10-15): every UDP port a real-BrokerNode suite binds
+            # comes from the collision-proof allocator (aeronutil/testing/FreePort.h —
+            # flock-owned per-process port blocks), so these suites run in parallel.
             gtest_discover_tests(rune_broker_node_tests
-                PROPERTIES TIMEOUT 60 RESOURCE_LOCK rune_udp_ports
+                PROPERTIES TIMEOUT 60
                 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
             # DDL conformance plan Task 12: DDL serialization + name collisions over
@@ -1103,7 +1118,7 @@ if(BUILD_TESTING)
                 aeron::aeron
                 GTest::gtest_main)
             gtest_discover_tests(rune_ddl_broker_tests
-                PROPERTIES TIMEOUT 180 RESOURCE_LOCK rune_udp_ports
+                PROPERTIES TIMEOUT 180
                 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
             # EmbeddedDriver: one driver, one pumping thread (spec §3.6).
@@ -1143,13 +1158,15 @@ if(BUILD_TESTING)
             # go through the worker's io backend; background-token routing.
             add_executable(rune_shard_nonblocking_tests tests/integration/ShardNonBlockingTest.cpp)
             target_link_libraries(rune_shard_nonblocking_tests PRIVATE rune_node rune_replication aeron::aeron GTest::gtest_main)
-            gtest_discover_tests(rune_shard_nonblocking_tests PROPERTIES TIMEOUT 120 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+            gtest_discover_tests(rune_shard_nonblocking_tests PROPERTIES TIMEOUT 120 LABELS small ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+            rune_regression_batches(rune_shard_nonblocking_tests 1 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
             # F15 (EOS marker / LSO correctness): S0 failing *Regression* tests
             # (design note 2026-10-01-f15-eos-marker-lso-design.md).
             add_executable(rune_f15_eos_regression_tests tests/integration/F15EosRegressionTest.cpp)
             target_link_libraries(rune_f15_eos_regression_tests PRIVATE rune_node rune_replication aeron::aeron GTest::gtest_main)
-            gtest_discover_tests(rune_f15_eos_regression_tests PROPERTIES TIMEOUT 120 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+            gtest_discover_tests(rune_f15_eos_regression_tests PROPERTIES TIMEOUT 120 LABELS small ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+            rune_regression_batches(rune_f15_eos_regression_tests 3 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
             # D9 (cross-node transaction markers): gateway unit + 3-node
             # in-process integration over the real cluster-plane transport.
@@ -1197,8 +1214,7 @@ if(BUILD_TESTING)
                 GTest::gtest_main)
             gtest_discover_tests(rune_udp_cluster_tests
                 PROPERTIES TIMEOUT 120
-                ENVIRONMENT "${RUNE_AERON_TSAN_ENV}"
-                RESOURCE_LOCK rune_udp_ports)  # serialize ephemeral-UDP-port suites
+                ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
         endif()
     endif()
 
@@ -1478,13 +1494,9 @@ if(BUILD_TESTING)
             rune_node
             aeron::aeron
             GTest::gtest_main)
-        # RESOURCE_LOCK: these tests bind ephemeral UDP ports discovered via a
-        # bind/close/return-number probe (inherent TOCTOU).  Running two such
-        # real-BrokerNode UDP suites concurrently races for the same freed port
-        # → intermittent "bind: Address already in use".  Serialize all UDP
-        # failover suites on a shared lock so ctest -jN never overlaps them.
+        # Ports from the collision-proof allocator (FreePort.h): runs in parallel.
         gtest_discover_tests(rune_gateway_failover_replication_tests
-            PROPERTIES TIMEOUT 300 RESOURCE_LOCK rune_udp_ports)
+            PROPERTIES TIMEOUT 300)
     endif()
 
     # ---------------------------------------------------------------------------
@@ -1502,7 +1514,7 @@ if(BUILD_TESTING)
             aeron::aeron
             GTest::gtest_main)
         gtest_discover_tests(rune_consensus_candidacy_tests
-            PROPERTIES TIMEOUT 180 RESOURCE_LOCK rune_udp_ports)
+            PROPERTIES TIMEOUT 180)
     endif()
 
     # ---------------------------------------------------------------------------
@@ -1517,7 +1529,7 @@ if(BUILD_TESTING)
     #   RollingLeaderKillNoCommittedLossRegression (*Regression*) — OLE+reconcile(3-6).
     #   EpochChangeTruncatesDivergentTailOnly — divergent-tail truncation path.
     #
-    # RESOURCE_LOCK rune_udp_ports: same ephemeral-port TOCTOU concern as GR-7.
+    # Ports from the collision-proof allocator (FreePort.h): runs in parallel.
     # ---------------------------------------------------------------------------
     if(BUILD_NODE_UDP_TESTS AND aeron_FOUND)
         add_executable(rune_per_worker_replication_integration_tests
@@ -1529,14 +1541,14 @@ if(BUILD_TESTING)
             aeron::aeron
             GTest::gtest_main)
         gtest_discover_tests(rune_per_worker_replication_integration_tests
-            PROPERTIES TIMEOUT 360 RESOURCE_LOCK rune_udp_ports)
+            PROPERTIES TIMEOUT 360)
 
         # Self-contained worker shards (spec §3.1): per-worker invoker driver +
         # client, ShardAgent pass, shard replication planes over real UDP.
         add_executable(rune_shard_mode_tests tests/integration/ShardModeTest.cpp)
         target_include_directories(rune_shard_mode_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_shard_mode_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
-        gtest_discover_tests(rune_shard_mode_tests PROPERTIES TIMEOUT 360 RESOURCE_LOCK rune_udp_ports)
+        gtest_discover_tests(rune_shard_mode_tests PROPERTIES TIMEOUT 360)
 
         # Phase 2b E2: TRANSIENT topics end to end in-process over real Aeron —
         # shard + legacy produce/subscribe, 3-node acks=all, restart (empty).
@@ -1544,7 +1556,7 @@ if(BUILD_TESTING)
         target_include_directories(rune_transient_topic_data_path_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_transient_topic_data_path_tests PRIVATE rune_node rune_view aeron::aeron
                               GTest::gtest_main)
-        gtest_discover_tests(rune_transient_topic_data_path_tests PROPERTIES TIMEOUT 360 RESOURCE_LOCK rune_udp_ports)
+        gtest_discover_tests(rune_transient_topic_data_path_tests PROPERTIES TIMEOUT 360)
 
         # Catalog history Task 11 (F7): the REAL client (rune-client-cpp, embedded by
         # the root CMakeLists) against a REAL in-process single-node BrokerNode.
@@ -1557,7 +1569,7 @@ if(BUILD_TESTING)
         target_include_directories(rune_client_broker_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_client_broker_tests PRIVATE rune_node rune_view rune_codec rune_catalog
                               rune_client_api rune_cli_lib aeron::aeron GTest::gtest_main)
-        gtest_discover_tests(rune_client_broker_tests PROPERTIES TIMEOUT 600 RESOURCE_LOCK rune_udp_ports)
+        gtest_discover_tests(rune_client_broker_tests PROPERTIES TIMEOUT 600)
 
         # Catalog history Task 11: the DDL route (Redirect / NotLeader / Internal when
         # halted) and the halted controller's resignation, 3 brokers over real Aeron.
@@ -1565,7 +1577,7 @@ if(BUILD_TESTING)
         target_include_directories(rune_catalog_leadership_broker_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_catalog_leadership_broker_tests PRIVATE rune_node rune_view rune_codec aeron::aeron
                               GTest::gtest_main)
-        gtest_discover_tests(rune_catalog_leadership_broker_tests PROPERTIES TIMEOUT 360 RESOURCE_LOCK rune_udp_ports)
+        gtest_discover_tests(rune_catalog_leadership_broker_tests PROPERTIES TIMEOUT 360)
 
         # Catalog history Task 12: a Subscribe on __catalog served by every broker
         # (leader, follower, halted) over real Aeron — backlog, marker, live, close.
@@ -1573,7 +1585,7 @@ if(BUILD_TESTING)
         target_include_directories(rune_catalog_read_broker_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_catalog_read_broker_tests PRIVATE rune_node rune_view rune_codec aeron::aeron
                               GTest::gtest_main)
-        gtest_discover_tests(rune_catalog_read_broker_tests PROPERTIES TIMEOUT 360 RESOURCE_LOCK rune_udp_ports)
+        gtest_discover_tests(rune_catalog_read_broker_tests PROPERTIES TIMEOUT 360)
 
         # Catalog history Task 6: the __catalog partition on every broker —
         # real replication on its admin-thread plane, controller-ISR leader
@@ -1582,7 +1594,7 @@ if(BUILD_TESTING)
         add_executable(rune_catalog_replication_tests tests/integration/CatalogReplicationTest.cpp)
         target_include_directories(rune_catalog_replication_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_catalog_replication_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
-        gtest_discover_tests(rune_catalog_replication_tests PROPERTIES TIMEOUT 360 RESOURCE_LOCK rune_udp_ports)
+        gtest_discover_tests(rune_catalog_replication_tests PROPERTIES TIMEOUT 360)
 
         # Catalog history Task 22: the interaction matrix's 3-node slice (32 cells: runtime DDL through every
         # broker, a catalog-leader crash mid-DDL, data through every broker) + the binding regressions B1/B3/B4,
@@ -1591,7 +1603,7 @@ if(BUILD_TESTING)
         target_include_directories(rune_catalog_integration_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_catalog_integration_tests PRIVATE rune_node rune_view rune_codec rune_catalog
                               aeron::aeron GTest::gtest_main)
-        gtest_discover_tests(rune_catalog_integration_tests PROPERTIES TIMEOUT 600 RESOURCE_LOCK rune_udp_ports)
+        gtest_discover_tests(rune_catalog_integration_tests PROPERTIES TIMEOUT 600)
 
         # Catalog history Task 8: the control thread executes the catalog's effects
         # (topics created / dropped at catalog ids, placement add / remove, config
@@ -1599,7 +1611,7 @@ if(BUILD_TESTING)
         add_executable(rune_catalog_effects_tests tests/node/CatalogEffectsTest.cpp)
         target_include_directories(rune_catalog_effects_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_catalog_effects_tests PRIVATE rune_node rune_view rune_codec aeron::aeron GTest::gtest_main)
-        gtest_discover_tests(rune_catalog_effects_tests PROPERTIES TIMEOUT 360 RESOURCE_LOCK rune_udp_ports)
+        gtest_discover_tests(rune_catalog_effects_tests PROPERTIES TIMEOUT 360)
 
         # Catalog history Task 16: the broker boots from __catalog (the one boot
         # replay on the startup thread, topics built from the catalog, dropped ids
@@ -1607,7 +1619,7 @@ if(BUILD_TESTING)
         add_executable(rune_catalog_boot_tests tests/node/CatalogBootTest.cpp)
         target_include_directories(rune_catalog_boot_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_catalog_boot_tests PRIVATE rune_node rune_view rune_codec aeron::aeron GTest::gtest_main)
-        gtest_discover_tests(rune_catalog_boot_tests PROPERTIES TIMEOUT 360 RESOURCE_LOCK rune_udp_ports)
+        gtest_discover_tests(rune_catalog_boot_tests PROPERTIES TIMEOUT 360)
 
         # Catalog history Task 17: TestCluster::defineTopic — the in-process way to create a
         # topic now that the static topic list / NodeConfig::topics are gone (DDL over the wire on real
@@ -1615,14 +1627,14 @@ if(BUILD_TESTING)
         add_executable(rune_test_cluster_tests tests/node/TestClusterTest.cpp)
         target_include_directories(rune_test_cluster_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_test_cluster_tests PRIVATE rune_node rune_view rune_codec aeron::aeron GTest::gtest_main)
-        gtest_discover_tests(rune_test_cluster_tests PROPERTIES TIMEOUT 360 RESOURCE_LOCK rune_udp_ports)
+        gtest_discover_tests(rune_test_cluster_tests PROPERTIES TIMEOUT 360)
 
         # Leader-epoch monotonicity across restarts (Kafka parity): full cold
         # restart, single-node restart, stale same-epoch tail on a follower.
         add_executable(rune_epoch_restart_tests tests/integration/EpochRestartRegressionTest.cpp)
         target_include_directories(rune_epoch_restart_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_epoch_restart_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
-        gtest_discover_tests(rune_epoch_restart_tests PROPERTIES TIMEOUT 360 RESOURCE_LOCK rune_udp_ports)
+        gtest_discover_tests(rune_epoch_restart_tests PROPERTIES TIMEOUT 360)
 
         # Controlled shutdown (Kafka parity): a gracefully stopping node hands
         # its partitions (and the controller its consensus leadership) off
@@ -1630,7 +1642,7 @@ if(BUILD_TESTING)
         add_executable(rune_controlled_shutdown_e2e_tests tests/integration/ControlledShutdownRegressionTest.cpp)
         target_include_directories(rune_controlled_shutdown_e2e_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_controlled_shutdown_e2e_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
-        gtest_discover_tests(rune_controlled_shutdown_e2e_tests PROPERTIES TIMEOUT 360 RESOURCE_LOCK rune_udp_ports)
+        gtest_discover_tests(rune_controlled_shutdown_e2e_tests PROPERTIES TIMEOUT 360)
     endif()
 
     # ---------------------------------------------------------------------------
@@ -1679,7 +1691,7 @@ if(BUILD_TESTING)
             aeron::aeron
             GTest::gtest_main)
         gtest_discover_tests(rune_gateway_psm_failover_tests
-            PROPERTIES TIMEOUT 300 RESOURCE_LOCK rune_udp_ports)
+            PROPERTIES TIMEOUT 300)
     endif()
 
     # ---------------------------------------------------------------------------

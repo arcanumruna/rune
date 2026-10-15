@@ -57,6 +57,7 @@
 // buffer, the frame buffer and the epoch file's paths are preallocated; an idle
 // pass reads nothing.
 
+#include <rune/storage/ZeroedBytes.h>
 #include <rune/gateway/IAdminRequestSink.h>   // kCatalogSubscriptionIdBase
 #include <rune/node/CatalogCheckpoint.h>         // CatalogHistoryEpoch
 
@@ -283,8 +284,8 @@ private:
     int64_t                              nextId_ = 0;
     std::vector<Sub>                     subs_;       // reserved maxSubs_
     std::vector<OwedError>               owed_;       // reserved; grows only past maxSubs_ refusals in one burst
-    std::vector<uint8_t>                 readBuf_;    // kCatalogReadBufferBytes
-    std::vector<uint8_t>                 frameBuf_;   // kCatalogReadMaxFrameBytes
+    rune::storage::ZeroedBytes         readBuf_;    // kCatalogReadBufferBytes (ZeroedBytes: memset, not a per-byte vector fill)
+    rune::storage::ZeroedBytes         frameBuf_;   // kCatalogReadMaxFrameBytes
     std::size_t                          owedCapacity_ = 0;
     int64_t                              servedHw_ = 0;   // the committed floor (C1, N1)
     int32_t                              floorEpoch_ = -1;   // the replica epoch the floor (re)started in
