@@ -69,57 +69,60 @@ public:
     /// A DDL requestId, stable across the retries of that DDL.
     [[nodiscard]] rune::protocol::RequestId freshRequestId() { return h_.freshRid_(); }
 
-    /// Draws the next action (weights: DDL 55, concurrent pair 10, move leadership 8, restart 8, isolate 8,
-    /// fresh broker 3 3, tamper broker 3 2, pump 6).  The model supplies the DDL contents (versions, live names).
+    /// Draws the next action (weights below).  The model supplies the DDL contents (versions, live names).
     [[nodiscard]] StressAction randomAction(std::mt19937& rng, const cmodel::CatalogModel& model) {
         StressAction a;
         const uint32_t roll = rng() % 100;
         auto entry = [&] { return static_cast<int>(1 + rng() % static_cast<uint32_t>(kBrokers)); };
         auto withRid = [&](cmodel::Request r) { r.requestId = h_.freshRid_(); return r; };
-        // Weights (of 100): Ddl 47, pair 10, move leadership 8, restart 8, isolate 8, fresh broker 3, tamper 2,
-        // leader move mid-DDL 4, leader crash mid-DDL 2, follower stop mid-DDL 2, pump 6.
+        // Weights (of 100): Ddl 45, pair 10, move leadership 8, restart 8, isolate 8, fresh broker 3, tamper 2,
+        // leader move mid-DDL 4, leader crash mid-DDL 4, follower stop mid-DDL 2, pump 6.
         auto cutDdl = [&](StressAction::Kind k) {
             a.kind = k;
             a.brokerA = entry();
             a.reqA = withRid(model.generate(rng));
             a.roll = rng();
-            a.cut = rng() % 41;
+            // The cut point: 3 draws in 4 land in the first 8 passes (a DDL commits within a few passes, so that is
+            // where "appended, not replicated / replicated, not committed / committed, not answered" lie), the rest
+            // anywhere in 0..40.  One rng() draw either way.
+            const uint32_t c = rng();
+            a.cut = (c & 3u) != 0 ? (c >> 2) % 9 : (c >> 2) % 41;
         };
-        if (roll < 47) {
+        if (roll < 45) {
             a.kind = StressAction::Kind::Ddl;
             a.brokerA = entry();
             a.reqA = withRid(model.generate(rng));
-        } else if (roll < 57) {
+        } else if (roll < 55) {
             a.kind = StressAction::Kind::PairDdl;
             a.brokerA = entry();
             a.brokerB = 1 + (a.brokerA - 1 + 1 + static_cast<int>(rng() % 2)) % kBrokers;   // a different broker
             a.reqA = withRid(model.generate(rng));
             a.reqB = withRid(model.generate(rng, &a.reqA.name));
-        } else if (roll < 65) {
+        } else if (roll < 63) {
             a.kind = StressAction::Kind::MoveLeadership;
             a.roll = rng();
-        } else if (roll < 73) {
+        } else if (roll < 71) {
             a.kind = StressAction::Kind::RestartBroker;
             a.roll = rng();
             a.flag = rng() % 2 == 0;
             a.withDdl = rng() % 100 < 60;
             a.reqA = withRid(model.generate(rng));
-        } else if (roll < 81) {
+        } else if (roll < 79) {
             a.kind = StressAction::Kind::IsolateBroker;
             a.roll = rng();
             a.flag = rng() % 2 == 0;
             a.withDdl = rng() % 100 < 70;
             a.brokerA = entry();
             a.reqA = withRid(model.generate(rng));
-        } else if (roll < 84) {
+        } else if (roll < 82) {
             a.kind = StressAction::Kind::FreshBroker3;
             a.withDdl = rng() % 100 < 60;
             a.reqA = withRid(model.generate(rng));
-        } else if (roll < 86) {
+        } else if (roll < 84) {
             a.kind = StressAction::Kind::TamperBroker3;
             a.reqA = withRid(model.generateAccepted(rng));
             a.reqB = withRid(model.generate(rng));
-        } else if (roll < 90) {
+        } else if (roll < 88) {
             cutDdl(StressAction::Kind::LeaderMoveMidDdl);
         } else if (roll < 92) {
             cutDdl(StressAction::Kind::LeaderCrashMidDdl);
@@ -239,14 +242,12 @@ public:
                 runDdls_(out, {{a.reqA, a.brokerA}});
                 break;
             }
-            // The leadership moves and the old leader dies with NO pass between: it never answers what it had
-            // in flight (those DDLs are counted in crashedUnanswered and resolved by the in-doubt path).
-            runDdlsCut_(out, a,
-                        [&] {
-                            h_.moveCatalogLeadership(cands[a.roll % cands.size()]);
-                            stopS_(old, /*crash=*/true);
-                        },
-                        [&] { restartS_(old); });
+            // R2(c): the leader's PROCESS dies after `cut` passes - no demotion, no NotLeader: what it started and had
+            // not answered is never answered (crashedUnanswered), the client ops in flight on it lose their session
+            // (in doubt), and a live ISR member chosen by the roll, as the controller, re-elects from the ISR.  The
+            // in-doubt path resolves each lost answer by the same-requestId resend (C1); the old leader then
+            // recovers from its dirs.
+            runDdlsCut_(out, a, [&] { crashS_(old, cands[a.roll % cands.size()]); }, [&] { restartS_(old); });
             break;
         }
         case StressAction::Kind::FollowerStopMidDdl: {
@@ -488,6 +489,8 @@ public:
     [[nodiscard]] std::size_t leaderEventCount() { return h_.readLog_(*h_.broker_(h_.cur_.leaderNode).log).size(); }
     /// How many DDLs ended in a terminal in-doubt answer (and were resolved) so far.
     [[nodiscard]] int inDoubtResolved() const noexcept { return inDoubtResolved_; }
+    /// How many of those were answers lost to a crashed broker (the session dropped with the DDL in flight).
+    [[nodiscard]] int sessionLostResolved() const noexcept { return sessionLostResolved_; }
     [[nodiscard]] int stepsDone() const noexcept { return step_; }
     /// A stress DDL as a client op (no fault, no resolution): for the directed tests.
     ClientOp& startStressOpForTest(const cmodel::Request& r, int target) { return h_.startOp_(toDdl_(r), target, cmodel::toString(r)); }
@@ -501,7 +504,8 @@ private:
     // ── Task 21 helpers ──────────────────────────────────────────────────────
     [[nodiscard]] static bool inDoubtCode_(int code) noexcept {
         return code == static_cast<int>(rune::protocol::client::ErrorCode::NotLeader) ||
-               code == static_cast<int>(rune::protocol::client::ErrorCode::Redirect) || code == kClientTimeout;
+               code == static_cast<int>(rune::protocol::client::ErrorCode::Redirect) || code == kClientTimeout ||
+               code == kClientSessionLost;
     }
     [[nodiscard]] std::string describeAction_(const StressAction& a) const {
         static constexpr const char* n[] = {"Ddl", "PairDdl", "MoveLeadership", "RestartBroker", "IsolateBroker", "FreshBroker3",
@@ -550,18 +554,23 @@ private:
         h_.until_([&] { return h_.broker_(h_.cur_.leaderNode).admin->roleName() == "LeaderServing"; },
                "the catalog leader never served DDL (applied up to its high watermark)");
     }
-    /// `crash`: the catalog leader dies with DDLs in flight - what it started and never answered is recorded in
-    /// crashedUnanswered (the final started == answered + crashedUnanswered).  Every other stop is QUIESCENT.
-    void stopS_(int b, bool crash = false) {
+    /// A QUIESCENT stop (a follower, nothing it started is unanswered): anything else fails the step.
+    void stopS_(int b) {
         CatalogClusterHarness::Broker& br = h_.broker_(b);
         if (br.alive && br.admin) {
             const uint64_t pending = br.admin->startedCount() - br.admin->answeredCount();
-            if (crash) br.crashedUnanswered += pending;
-            else if (pending != 0)
+            if (pending != 0)
                 h_.fail_("stress", "broker " + std::to_string(b) + " is stopped with " + std::to_string(pending) + " unanswered DDL(s) (not a crash)");
         }
         touched_[static_cast<std::size_t>(b - 1)] = true;
         h_.stopBroker(b);
+        if (b == 3) tamperArmed_ = false;
+        haltedSinceStep_[static_cast<std::size_t>(b - 1)] = -1;
+    }
+    /// Broker `b`'s process dies (CatalogClusterHarness::crashBroker); `controller` re-elects when `b` led.
+    void crashS_(int b, int controller) {
+        touched_[static_cast<std::size_t>(b - 1)] = true;
+        h_.crashBroker(b, controller);
         if (b == 3) tamperArmed_ = false;
         haltedSinceStep_[static_cast<std::size_t>(b - 1)] = -1;
     }
@@ -723,7 +732,7 @@ private:
         std::vector<ClientOp*> ops;
         for (const auto& [r, b] : reqs) ops.push_back(&h_.startOp_(toDdl_(r), b, cmodel::toString(r)));
         runStressOps_(ops, "stress: the DDLs");
-        finishDdls_(out, reqs, ops, haltedTargets_(ops));
+        finishDdls_(out, reqs, ops);
     }
 
     /// One DDL cut by a fault: sent, `a.cut` passes run, `fault` fires, the client model runs to its terminal
@@ -733,41 +742,30 @@ private:
         awaitLeaderServing_();
         std::vector<ClientOp*> ops{&h_.startOp_(toDdl_(a.reqA), a.brokerA, cmodel::toString(a.reqA))};
         for (uint32_t i = 0; i < a.cut; ++i) h_.pump();
-        // A halted flag is read when the answer ARRIVES: an op already answered before the fault is sampled now (the fault
-        // may stop the halted broker), the others once they finish (`after` may restart - and so clear - a halted one).
-        std::vector<char> halted = haltedTargets_(ops);
-        std::vector<char> answered;
-        for (const ClientOp* op : ops) answered.push_back(op->done() ? 1 : 0);
         fault();
         runStressOps_(ops, "stress: the cut DDL");
-        const std::vector<char> late = haltedTargets_(ops);
-        for (std::size_t i = 0; i < ops.size(); ++i) if (answered[i] == 0) halted[i] = late[i];
         after();
-        finishDdls_(out, {{a.reqA, a.brokerA}}, ops, halted);
-    }
-
-    /// Whether each op's last target had a halted applier (read when the answers arrived).
-    [[nodiscard]] std::vector<char> haltedTargets_(const std::vector<ClientOp*>& ops) {
-        std::vector<char> out;
-        for (const ClientOp* op : ops) out.push_back(h_.applierHalted(op->target) ? 1 : 0);
-        return out;
+        finishDdls_(out, {{a.reqA, a.brokerA}}, ops);
     }
 
     /// The terminal answers of `ops` (one per request); an in-doubt one is resolved (C1) and appended to `out`.
-    void finishDdls_(StepResult& out, const std::vector<std::pair<cmodel::Request, int>>& reqs, const std::vector<ClientOp*>& ops,
-                     const std::vector<char>& haltedAtAnswer) {
+    /// Whether an answer came from a halted broker is the flag the harness sampled when that answer LEFT the broker
+    /// (ClusterAnswer::brokerHalted -> ClientOp::lastAnswerFromHalted): never re-read later, when a fault or a restart
+    /// may have changed the broker.
+    void finishDdls_(StepResult& out, const std::vector<std::pair<cmodel::Request, int>>& reqs, const std::vector<ClientOp*>& ops) {
         std::vector<StressAnswer> res(reqs.size());
         std::vector<std::size_t> doubt;
         for (std::size_t i = 0; i < reqs.size(); ++i) {
             res[i].request = reqs[i].first;
             res[i].code = ops[i]->finalCode();
             res[i].broker = ops[i]->target;
-            res[i].brokerHalted = haltedAtAnswer[i] != 0;
+            res[i].brokerHalted = ops[i]->lastAnswerFromHalted;
             if (inDoubtCode_(res[i].code)) doubt.push_back(i);
-            // M7: a Timeout is explained only by a fault on the op's last target in this step (stopped, isolated or
-            // crashed); from a healthy broker it is a DDL answered later than its deadline - a failure.
-            if (res[i].code == kClientTimeout && !touched_[static_cast<std::size_t>(ops[i]->target - 1)])
-                h_.fail_("stress", "Timeout from a healthy broker " + std::to_string(ops[i]->target) + " for '" +
+            // M7: a Timeout (or a lost session) is explained only by a fault on the op's last target in this step
+            // (stopped, isolated or crashed); from a healthy broker it is a DDL answered later than its deadline - a failure.
+            if ((res[i].code == kClientTimeout || res[i].code == kClientSessionLost) &&
+                !touched_[static_cast<std::size_t>(ops[i]->target - 1)])
+                h_.fail_("stress", "Timeout / lost session from a healthy broker " + std::to_string(ops[i]->target) + " for '" +
                                        cmodel::toString(reqs[i].first) + "': no fault touched it in this step");
         }
         if (!doubt.empty() && resolveInDoubt_) {
@@ -777,9 +775,10 @@ private:
                 awaitLeaderServing_();
                 ClientOp& retry = h_.startOp_(DdlRequest(ops[i]->base), h_.cur_.leaderNode, cmodel::toString(reqs[i].first) + " (resolve)");
                 runStressOps_({&retry}, "stress: resolving an in-doubt DDL");
+                if (res[i].code == kClientSessionLost) ++sessionLostResolved_;
                 res[i].code = retry.finalCode();
                 res[i].broker = retry.target;
-                res[i].brokerHalted = h_.applierHalted(retry.target);
+                res[i].brokerHalted = retry.lastAnswerFromHalted;
                 res[i].resolvedInDoubt = true;
                 ++inDoubtResolved_;
                 if (inDoubtCode_(res[i].code))
@@ -797,6 +796,7 @@ private:
     std::array<bool, 3>   touched_{false, false, false};   // brokers stopped / isolated / crashed in the current step (M7)
     int                   step_ = 0;
     int                   inDoubtResolved_ = 0;
+    int                   sessionLostResolved_ = 0;   // in-doubt answers lost to a crash (kClientSessionLost), resolved
     bool                  tamperArmed_ = false;
     std::map<int, bool>   isolated_;                         // broker -> fenced from the ISR by the controller
     std::array<int, 3>    haltedSinceStep_{-1, -1, -1};

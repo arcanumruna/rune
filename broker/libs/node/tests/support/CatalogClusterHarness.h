@@ -113,6 +113,9 @@ inline constexpr int     kMaxDdlRedirects     = 3;               // Client::kMax
 /// The code a client op ends with when its DDL deadline passes with no answer
 /// (OpStatus::Timeout) — not a protocol code; no cell expects it.
 inline constexpr int     kClientTimeout       = 1000;
+/// The code a client op ends with when the broker it was in flight on DIES (crashBroker): the session drops after
+/// the request was sent, no answer is possible (rune-client-cpp OpStatus::SessionLost) - not a protocol code.
+inline constexpr int     kClientSessionLost   = 1001;
 
 /// One answer as a client sees it (a broker's reply or the gateway's route answer).
 struct ClusterAnswer {
@@ -122,6 +125,7 @@ struct ClusterAnswer {
     bool                  visible = false;
     bool                  servedAtRelease = false;
     bool                  consumed = false;   // the client model read it
+    bool                  brokerHalted = false;   // the answering broker's applier was halted when the answer left it
 };
 
 /// The error code (kErrorRedirect...) names the matrix uses.
@@ -152,6 +156,7 @@ struct ClientOp {
     std::function<void()>     beforeFollowRedirect;  // a hook: runs before EVERY Redirect hop is followed
     std::variant<Unsent, InFlight, AwaitingResend, Finished> st{Unsent{}};
     int                       terminalResults = 0;   // must end at exactly 1
+    bool                      lastAnswerFromHalted = false;   // the last answer read came from a halted broker (sampled when it left)
 
     [[nodiscard]] bool done() const noexcept { return std::holds_alternative<Finished>(st); }
     [[nodiscard]] int finalCode() const noexcept { return done() ? std::get<Finished>(st).code : -1; }
@@ -585,6 +590,48 @@ public:
         brokers_[static_cast<std::size_t>(b - 1)]->alive = false;
         brokers_[static_cast<std::size_t>(b - 1)]->tearDown();
         shrinkIsr_(b);
+    }
+    /// The PROCESS of broker `b` dies (Task 21 fix round 1, R2(c)): its components are destroyed with NO role change,
+    /// no demotion and no answer reaching it first - unlike stopBroker, which only ever stops a follower.  So:
+    ///   - a DDL its AdminWorker started and had not answered stays unanswered (counted in crashedUnanswered);
+    ///   - an answer still held in its DDL answer gate dies with it (never visible);
+    ///   - every client op in flight on it loses its session (kClientSessionLost), unless its answer had already
+    ///     left the process (visible: the client reads it);
+    ///   - when it led __catalog, the controller (`controller`, a live broker) re-elects with the PRODUCTION
+    ///     decision (MetadataService::decideCoordinatorPartition: ISR ∩ live, never unclean), then its fencing pass
+    ///     drops the dead replica from the committed ISR.
+    /// Its dirs are kept: restartBroker recovers it from them (log recovery, boot replay, truncation on rejoin).
+    void crashBroker(int32_t b, int32_t controller) {
+        Broker& br = broker_(b);
+        if (!br.alive) return;
+        if (br.admin) br.crashedUnanswered += br.admin->startedCount() - br.admin->answeredCount();
+        for (auto& op : clients_) {
+            const auto* f = std::get_if<ClientOp::InFlight>(&op->st);
+            if (f == nullptr || f->broker != b || f->corr < 0) continue;
+            bool left = false;   // an answer already visible to the client left before the death
+            if (const auto it = byCorr_.find(f->corr); it != byCorr_.end())
+                for (std::size_t idx : it->second) left = left || (recs_[idx].visible && !recs_[idx].consumed);
+            if (left) continue;
+            op->st = ClientOp::Finished{kClientSessionLost};
+            ++op->terminalResults;
+        }
+        ft_.registerReplica(b, nullptr);
+        ft_.isolate(b);
+        br.alive = false;
+        br.tearDown();
+        if (cur_.leaderNode == b) {
+            if (controller == b || !broker_(controller).alive) fail_("crash", "the controller must be a live broker");
+            std::vector<int32_t> eligible;
+            for (const auto& x : brokers_) if (x->alive) eligible.push_back(x->id);
+            const auto next = MetadataService::decideCoordinatorPartition(
+                kCatalogTopicId, kCatalogPartition, /*self=*/controller, &cur_, eligible, nullptr,
+                /*bootstrapEpoch=*/cur_.leaderEpoch + 1, {1, 2, 3});
+            if (!next || next->leaderNode == b || next->leaderNode < 1)
+                fail_("crash", "the controller elected no live catalog leader after broker " + std::to_string(b) + " died");
+            cur_ = *next;
+            commitAssignment_();   // only the live brokers hear it
+        }
+        shrinkIsr_(b);   // the controller's fencing pass
     }
     /// A broker whose dir survived: the log recovers, the applier boot-replays [0, checkpoint], the rest
     /// catches up live; once caught up the controller admits it to the ISR (AlterIsr).
@@ -1030,6 +1077,7 @@ private:
     void record_(int32_t b, int64_t corr, Answer a) {
         ClusterAnswer r;
         r.broker = b;
+        r.brokerHalted = broker_(b).alive && broker_(b).admin && broker_(b).admin->applier().halted();
         if (a.code == 0) {
             switch (a.kind) {
             case Answer::Kind::Define: case Answer::Kind::CreateView: r.gateTopic = a.topicId; break;
@@ -1093,6 +1141,7 @@ private:
                 for (std::size_t idx : it->second) {
                     if (!recs_[idx].visible || recs_[idx].consumed) continue;
                     recs_[idx].consumed = true;
+                    op.lastAnswerFromHalted = recs_[idx].brokerHalted;
                     onAnswer_(op, recs_[idx].a.code, recs_[idx].a.detail, recs_[idx].a.kind);
                     return;
                 }

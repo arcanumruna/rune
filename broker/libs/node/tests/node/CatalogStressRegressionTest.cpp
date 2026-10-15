@@ -3,11 +3,13 @@
 // 64 seeds x 400 steps over the 3-broker CatalogClusterHarness (Task 20).  Each step is a random DDL (via a
 // random broker), a concurrent pair of DDLs on one name, a catalog-leader move, a broker stop+restart (also
 // mid-apply), a broker isolation, a fresh broker 3 on an empty dir, a tampered fingerprint on broker 3 (it
-// halts; the operator restarts it later) or idle passes.  Every DDL's terminal answer is checked against an
+// halts; the operator restarts it later), a DDL cut mid-flight by a leader move, a follower stop or a REAL crash of
+// the catalog leader (its process dies: no demotion, no answer; the controller re-elects from the ISR; the
+// client's session drops and the lost answer is in doubt), or idle passes.  Every DDL's terminal answer is checked against an
 // INDEPENDENT catalog model (support/CatalogModel.h: it never calls rune::catalog::apply).
 //
 // In-doubt answers (a terminal NotLeader / Redirect / Timeout: the DDL MAY have committed) are resolved in the
-// same step by the harness (CatalogClusterHarness::runDdls_, controller ruling C1): the cluster heals and the
+// same step by the driver (CatalogStressDriver::finishDdls_, controller ruling C1): the cluster heals and the
 // SAME request (same requestId) is re-sent through the leader until it gets a definitive answer - the dedupe
 // returns the original result when the event committed - so the model stays sequential.
 //
@@ -55,6 +57,7 @@ struct SeedReport {
     std::map<int, int>    inDoubtByKind;   // StressAction::Kind -> DDLs of such steps that ended in doubt and were resolved
     int                   inDoubtFromCut = 0;   // ... summed over the three *MidDdl kinds
     uint64_t              crashedUnanswered = 0;   // DDLs crashed leaders had started and never answered
+    int                   sessionLostResolved = 0;  // in-doubt answers lost to a crashed broker, resolved by the resend
     std::size_t           events = 0;
     uint64_t              finalDigest = 0;
     double                seconds = 0;
@@ -78,13 +81,6 @@ std::string codesOf(const std::vector<const StressAnswer*>& v) {
     std::ostringstream o;
     for (const StressAnswer* a : v) o << " [" << cmodel::toString(a->request) << " -> " << a->code << " via broker " << a->broker << "]";
     return o.str();
-}
-
-/// The 400-step seeds this process already ran (single-threaded binary): the cut-fault test reuses them instead of
-/// replaying seeds 1-8 when the whole binary runs.
-std::map<uint32_t, SeedReport>& completedSeeds() {
-    static std::map<uint32_t, SeedReport> m;
-    return m;
 }
 
 void runSeed(uint32_t seed, int steps, SeedReport& rep) {
@@ -131,7 +127,7 @@ void runSeed(uint32_t seed, int steps, SeedReport& rep) {
                     continue;
                 }
                 if (a.code == code(ErrorCode::NotLeader) || a.code == code(ErrorCode::Redirect) ||
-                    a.code == rune::node::test::kClientTimeout) {
+                    a.code == rune::node::test::kClientTimeout || a.code == rune::node::test::kClientSessionLost) {
                     ASSERT_FALSE(d.resolvesInDoubt()) << at << ": code " << a.code << " is still in doubt after the resolution: "
                                                       << cmodel::toString(a.request) << " [" << res.what << "]";
                     continue;   // unresolved (RED d only): nothing known about the DDL
@@ -187,7 +183,10 @@ void runSeed(uint32_t seed, int steps, SeedReport& rep) {
             crashed += d.crashedUnanswered(b);
         }
         rep.crashedUnanswered = crashed;
-        EXPECT_LE(crashed, static_cast<uint64_t>(d.inDoubtResolved())) << where << ": a crashed leader's unanswered DDL was never resolved";
+        rep.sessionLostResolved = d.sessionLostResolved();
+        // each DDL a crash left unanswered was in flight on the crashed broker: its client lost the session and the
+        // in-doubt path resolved it by the same-requestId resend
+        EXPECT_LE(crashed, static_cast<uint64_t>(d.sessionLostResolved())) << where << ": a crashed leader's unanswered DDL was never resolved";
         // Invariant: no DDL lost or duplicated - the ledger of every log agrees, an OK'd request has exactly one
         // event, a refused one none, and the log holds nothing else.
         const auto ledger = d.requestLedger();
@@ -221,7 +220,7 @@ void runSeed(uint32_t seed, int steps, SeedReport& rep) {
     if (std::getenv("RUNE_STRESS_STATS") != nullptr) {
         std::ostringstream o;
         o << "[stress] seed " << seed << " steps " << steps << " events " << rep.events << " okDdls " << rep.okDdls << " inDoubt "
-          << rep.inDoubtResolved << " cutInDoubt " << rep.inDoubtFromCut << " crashedUnanswered " << rep.crashedUnanswered << " skipped " << rep.skippedSteps << " secs " << rep.seconds << " codes";
+          << rep.inDoubtResolved << " cutInDoubt " << rep.inDoubtFromCut << " crashedUnanswered " << rep.crashedUnanswered << " sessionLost " << rep.sessionLostResolved << " skipped " << rep.skippedSteps << " secs " << rep.seconds << " codes";
         for (const auto& [c, n] : rep.codes) o << " " << c << "x" << n;
         std::cerr << o.str() << "\n";
     }
@@ -249,7 +248,6 @@ class CatalogStressRegression : public testing::TestWithParam<uint32_t> {};
 TEST_P(CatalogStressRegression, RandomDdlUnderChurnMatchesTheModel) {
     SeedReport rep;
     runSeed(GetParam(), kSteps, rep);
-    completedSeeds()[GetParam()] = rep;
     RecordProperty("seconds", std::to_string(rep.seconds));
     RecordProperty("events", std::to_string(rep.events));
     RecordProperty("inDoubtResolved", std::to_string(rep.inDoubtResolved));
@@ -259,6 +257,9 @@ INSTANTIATE_TEST_SUITE_P(Seeds, CatalogStressRegression, testing::Range(1u, 65u)
                          [](const testing::TestParamInfo<uint32_t>& info) { return "Seed" + std::to_string(info.param); });
 
 // C5: the same seed is the same run - the action sequence, every answer, the leader and the final digest.
+// Note (Task 21 fix round 1, R2(c)): the real leader crash, the crash weight 2 -> 4 (Ddl 47 -> 45) and the cut
+// distribution changed seed 7's trajectory deliberately; this test compares two runs of the same seed, so it pins no
+// trajectory and needed no new expected value.
 TEST(CatalogStressRegression, SameSeedSameTrace) {
     SeedReport a, b;
     runSeed(7, 150, a);
@@ -272,21 +273,27 @@ TEST(CatalogStressRegression, SameSeedSameTrace) {
 }
 
 // I2: a DDL cut mid-flight by a leader move, a leader crash or a follower stop leaves in-doubt answers (the cut point
-// is the seed's: 0..40 passes after the send).  Seeds 1-8 x 400 steps must resolve at least one.
+// is the seed's: 0..40 passes after the send).  Seeds 1-8 x 400 steps, each run in full here (no reuse of another
+// test's run), must resolve at least one; and a REAL crash (R2(c): the leader's process dies, no demotion) must have
+// left at least one started DDL unanswered and at least one client session lost - else the crash fault is vacuous.
 TEST(CatalogStressRegression, CutFaultsProduceInDoubtAnswers) {
-    int fromCut = 0;
+    int fromCut = 0, sessionLost = 0;
+    uint64_t crashed = 0;
     std::map<int, int> byKind;
     for (uint32_t seed = 1; seed <= 8; ++seed) {
-        auto it = completedSeeds().find(seed);
-        if (it == completedSeeds().end()) {
-            SeedReport rep;
-            runSeed(seed, kSteps, rep);
-            it = completedSeeds().emplace(seed, std::move(rep)).first;
-        }
-        fromCut += it->second.inDoubtFromCut;
-        for (const auto& [k, n] : it->second.inDoubtByKind) byKind[k] += n;
+        SeedReport rep;
+        runSeed(seed, kSteps, rep);
+        fromCut += rep.inDoubtFromCut;
+        sessionLost += rep.sessionLostResolved;
+        crashed += rep.crashedUnanswered;
+        for (const auto& [k, n] : rep.inDoubtByKind) byKind[k] += n;
     }
     EXPECT_GT(fromCut, 0) << "no *MidDdl step ended in doubt over seeds 1-8";
+    EXPECT_GT(byKind[static_cast<int>(StressAction::Kind::LeaderCrashMidDdl)], 0) << "no leader crash left an answer in doubt";
+    EXPECT_GT(sessionLost, 0) << "no client lost its session to a crashed leader";
+    EXPECT_GT(crashed, 0u) << "no crashed leader had started a DDL it never answered";
+    RecordProperty("crashedUnanswered", std::to_string(crashed));
+    RecordProperty("sessionLost", std::to_string(sessionLost));
     std::ostringstream o;
     for (const auto& [k, n] : byKind) o << " kind" << k << "x" << n;
     RecordProperty("inDoubtByKind", o.str());
