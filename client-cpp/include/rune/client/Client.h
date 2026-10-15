@@ -213,7 +213,10 @@ struct ViewRowResult {
     static constexpr uint16_t kBusy            = 6;
     static constexpr uint16_t kRowTooLarge     = 7;   ///< the row exceeds the broker's egress frame (no bytes)
     /// Client-side only: the view's source-partition leader was not reached within
-    /// the retry budget; never sent by a broker.
+    /// the retry budget; never sent by a broker.  NB: a GetViewRow's deadline is
+    /// pingTimeoutMs (not ddlTimeoutMs); when that is shorter than ddlRetryBudget
+    /// (the defaults: 5 s < 10 s) a read that is never routed ends as a Timeout
+    /// (the *AndWait form throws), not as kNotLeader.
     static constexpr uint16_t kNotLeader       = 8;
 
     uint16_t              status = kUnknownView;
@@ -826,6 +829,9 @@ public:
     CreateViewResult createViewAndWait(std::string_view viewName, std::string_view keyField,
                                        uint8_t persistence, std::span<const uint8_t> planBlob,
                                        std::chrono::nanoseconds timeout = kDefaultWaitTimeout);
+    /// Routing (Task 22 fix round 1): only the source partition's leader serves a row; a Redirect / NotLeader is followed
+    /// within min(pingTimeoutMs, ddlRetryBudget) and ends as ViewRowResult::kNotLeader, or as a Timeout (throws) when
+    /// pingTimeoutMs is the shorter of the two (the defaults).
     /// Task 21: getViewRow(), blocking. A non-OK ViewRowResponse status (e.g.
     /// AbsentKey, NotReady) is returned in the result (not thrown) — only a
     /// transport-level failure (Timeout, NotConnected, SessionLost, Closed)
@@ -1649,7 +1655,7 @@ private:
     static uint64_t         drawClientInstanceId_();   // std::random_device, 2 x 32 bits, redrawn while 0
     const uint64_t          clientInstanceId_ = drawClientInstanceId_();
     uint32_t                requestCounter_ = 0;       // duty thread only: the requestId's lo (32-bit, never 0)
-    int                     ddlPending_ = 0;           // pendingCtl_ entries that are DDLs
+    int                     ddlPending_ = 0;           // pendingCtl_ entries that are DDLs or routed control ops (GetViewRow)
     int                     ddlAwaitingResend_ = 0;    // pending DDLs in a ddlWaitsForResend() state
     std::vector<DdlRetryNote> ddlRetryNotes_;          // duty thread; filled only under cfg_.traceDdlRetries
     std::size_t             ddlRetryNotesDropped_ = 0;
