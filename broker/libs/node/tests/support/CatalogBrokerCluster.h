@@ -6,10 +6,12 @@
 #include "support/ShardTestClient.h"
 
 #include <rune/catalog/CatalogEvent.h>
+#include <rune/catalog/CatalogReplayer.h>
 #include <rune/catalog/testing/GoldenScript.h>
 #include <rune/node/BrokerNode.h>
 #include <rune/node/CatalogPartition.h>
 #include <rune/node/NodeConfig.h>
+#include <rune/protocol/RecordBatch.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/Log.h>
 
@@ -157,13 +159,17 @@ struct ThreeNodes {
     Ports       ports;
     std::vector<std::unique_ptr<TmpDir>>     dirs;
     std::vector<std::unique_ptr<BrokerNode>> nodes;
+    /// Task 22: the real clients' data dirs live OUTSIDE the brokers' (wipe(id) must not take them along).
+    std::unique_ptr<TmpDir>                  clientsDir;
 
     ThreeNodes(std::string t, Mode m) : tag(std::move(t)), mode(m), ports(Ports::discover(3)) {
         for (int i = 0; i < 3; ++i) dirs.push_back(std::make_unique<TmpDir>(tag + "_n" + std::to_string(i + 1)));
         nodes.resize(3);
+        clientsDir = std::make_unique<TmpDir>(tag + "_clients");
     }
     ThreeNodes(ThreeNodes&&) = default;
     ~ThreeNodes() {
+        joinKillWatcher_();
         for (auto it = nodes.rbegin(); it != nodes.rend(); ++it)
             if (*it) (*it)->stop();
     }
@@ -259,6 +265,10 @@ struct ThreeNodes {
     }
 
 private:
+    std::thread killWatcher_;
+    int32_t     killWatcherNode_   = -1;
+    int32_t     killWatcherResult_ = -1;   // written by the watcher, read after its join
+    void joinKillWatcher_() { if (killWatcher_.joinable()) killWatcher_.join(); }
     std::vector<rune::catalog::CatalogEvent> golden_ = rune::catalog::testing::goldenScriptV1();
     std::size_t                              nextGolden_ = 0;
     int64_t appendRaw_(std::vector<uint8_t> bytes, std::chrono::milliseconds within) {
@@ -304,6 +314,215 @@ public:
         return false;
     }
     int64_t catalogHighWatermark(BrokerNode& n) { return catalogOf(n).hw; }
+
+    // ── Catalog history Task 22: the 3-node slice's cluster-level observations / actions ──────────────
+    /// The client endpoint of broker `id` (the channel a wire client / the real client connects to).
+    [[nodiscard]] std::string clientChannel(int id) const {
+        return "aeron:udp?endpoint=127.0.0.1:" + std::to_string(ports.client[static_cast<std::size_t>(id - 1)]);
+    }
+    [[nodiscard]] std::vector<int> runningNodes() const {
+        std::vector<int> v;
+        for (int id = 1; id <= 3; ++id) if (running(id)) v.push_back(id);
+        return v;
+    }
+    /// A REAL crash (BrokerNode::crashForTest: no controlled shutdown, no goodbye).  Test thread.
+    void crash(int id) {
+        joinKillWatcher_();
+        auto& n = nodes[static_cast<std::size_t>(id - 1)];
+        if (n) { n->crashForTest(); n.reset(); }
+    }
+
+    /// What broker `n`'s admin thread holds of the catalog (read ON the admin thread).
+    struct CatalogSnap {
+        bool        ok = false;
+        int64_t     applied = -1;     ///< the applier's next offset (-1: halted)
+        uint64_t    digest = 0;       ///< CatalogState::digest() (definitions + counters + request records)
+        int64_t     leo = -1, hw = -1;
+        std::string role;
+    };
+    static CatalogSnap snapOf(BrokerNode& n) {
+        return n.onAdminThreadForTest([&n]() -> CatalogSnap {
+            CatalogSnap v;
+            rr::PartitionReplica* r = n.catalogReplicaForTest();
+            if (r == nullptr) return v;
+            auto& w = n.adminWorkerAgentForTest()->worker();
+            v.ok = true;
+            v.applied = w.applier().nextOffset();
+            v.digest = w.applier().state().digest();
+            v.leo = r->logEndOffset();
+            v.hw = r->highWatermark();
+            v.role = std::string(w.roleName());
+            return v;
+        });
+    }
+    /// Every running broker holds the SAME committed catalog and has applied all of it: equal digests,
+    /// applied == LEO == HW everywhere (so an uncommitted tail has been truncated, none is pending).
+    bool awaitCatalogDigestsEqual(std::chrono::milliseconds within, std::string* why = nullptr) {
+        const auto deadline = std::chrono::steady_clock::now() + within;
+        std::string last = "no broker running";
+        while (true) {
+            bool ok = !runningNodes().empty();
+            last.clear();
+            std::optional<CatalogSnap> first;
+            for (int id : runningNodes()) {
+                const CatalogSnap v = snapOf(node(id));
+                last += " n" + std::to_string(id) + "{" + v.role + " applied=" + std::to_string(v.applied) +
+                        " leo=" + std::to_string(v.leo) + " hw=" + std::to_string(v.hw) + " digest=" +
+                        std::to_string(v.digest) + "}";
+                if (!v.ok || v.applied < 0 || v.applied != v.leo || v.leo != v.hw) ok = false;
+                if (!first) first = v;
+                else if (v.digest != first->digest || v.leo != first->leo) ok = false;
+            }
+            if (ok) return true;
+            if (std::chrono::steady_clock::now() >= deadline) break;
+            std::this_thread::sleep_for(20ms);
+        }
+        if (why != nullptr) *why = last;
+        return false;
+    }
+    /// Broker `id`'s catalog replica ISR size (read ON its admin thread).
+    std::size_t catalogIsrSizeOn(int id) {
+        BrokerNode& n = node(id);
+        return n.onAdminThreadForTest([&n]() -> std::size_t {
+            rr::PartitionReplica* r = n.catalogReplicaForTest();
+            return r == nullptr ? 0 : r->isr().size();
+        });
+    }
+    bool awaitCatalogIsrSizeOn(int id, std::size_t want, std::chrono::milliseconds within) {
+        const auto deadline = std::chrono::steady_clock::now() + within;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (catalogIsrSizeOn(id) == want) return true;
+            std::this_thread::sleep_for(50ms);
+        }
+        return catalogIsrSizeOn(id) == want;
+    }
+    /// Broker `id`'s whole __catalog log (committed or not), decoded, in offset order (ON its admin thread).
+    std::vector<rune::catalog::RecordedEvent> catalogEventsOn(int id) {
+        BrokerNode& n = node(id);
+        return n.onAdminThreadForTest([&n]() {
+            std::vector<rune::catalog::RecordedEvent> out;
+            rr::PartitionReplica* r = n.catalogReplicaForTest();
+            if (r == nullptr) return out;
+            int64_t next = 0;
+            const int64_t leo = r->log()->logEndOffset();
+            while (next < leo) {
+                const std::vector<uint8_t> data = r->log()->read(next, 1 << 22);
+                if (data.empty()) break;
+                const int64_t before = next;
+                std::size_t pos = 0;
+                while (pos < data.size()) {
+                    rune::protocol::RecordBatchReader reader(data.data() + pos, data.size() - pos);
+                    if (!reader.ensureValid()) break;
+                    reader.forEachRecord([&](std::string_view, std::string_view val, int64_t off, int64_t) {
+                        if (off < next) return;
+                        auto ev = rune::catalog::decode(
+                            std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(val.data()), val.size()));
+                        if (!ev) throw std::logic_error("ThreeNodes: a __catalog record does not decode");
+                        out.push_back(rune::catalog::RecordedEvent{off, std::move(*ev)});
+                        next = off + 1;
+                    });
+                    if (reader.totalLength() == 0) break;
+                    pos += static_cast<std::size_t>(reader.totalLength());
+                }
+                if (next == before) break;
+            }
+            return out;
+        });
+    }
+    /// Events carrying `rid` in broker `id`'s whole __catalog log (committed or not), read ON its admin thread.
+    std::size_t eventsWithRequestIdOn(int id, const rune::protocol::RequestId& rid) {
+        BrokerNode& n = node(id);
+        return n.onAdminThreadForTest([&n, &rid]() -> std::size_t {
+            rr::PartitionReplica* r = n.catalogReplicaForTest();
+            if (r == nullptr) return 0;
+            std::size_t count = 0;
+            int64_t next = 0;
+            const int64_t leo = r->log()->logEndOffset();
+            while (next < leo) {
+                const std::vector<uint8_t> data = r->log()->read(next, 1 << 22);
+                if (data.empty()) break;
+                const int64_t before = next;
+                std::size_t pos = 0;
+                while (pos < data.size()) {
+                    rune::protocol::RecordBatchReader reader(data.data() + pos, data.size() - pos);
+                    if (!reader.ensureValid()) break;
+                    reader.forEachRecord([&](std::string_view, std::string_view val, int64_t off, int64_t) {
+                        if (off < next) return;
+                        const auto ev = rune::catalog::decode(
+                            std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(val.data()), val.size()));
+                        if (ev && ev->principal.requestId == rid) ++count;
+                        next = off + 1;
+                    });
+                    if (reader.totalLength() == 0) break;
+                    pos += static_cast<std::size_t>(reader.totalLength());
+                }
+                if (next == before) break;
+            }
+            return count;
+        });
+    }
+    /// Events carrying `rid`, asserted equal on every running broker (the catalogs are identical once
+    /// awaitCatalogDigestsEqual held); returns the count on the first one, SIZE_MAX if brokers disagree.
+    std::size_t countEventsWithRequestId(const rune::protocol::RequestId& rid) {
+        std::optional<std::size_t> n;
+        for (int id : runningNodes()) {
+            const std::size_t c = eventsWithRequestIdOn(id, rid);
+            if (n && *n != c) return SIZE_MAX;
+            n = c;
+        }
+        return n.value_or(0);
+    }
+
+    /// Hold broker `id`'s DDL answers, then (on THIS thread) wait until its admin thread appended an event
+    /// beyond `baseline` [and, with `waitCommit`, until that event is committed on the leader's HW], and
+    /// crash it.  false: the append (or commit) never showed within `within`.  Test thread.
+    bool crashAfterNextAppend(int id, uint64_t baseline, bool waitCommit, std::chrono::milliseconds within) {
+        const auto deadline = std::chrono::steady_clock::now() + within;
+        BrokerNode& n = node(id);
+        bool ready = false;
+        while (std::chrono::steady_clock::now() < deadline && !ready) {
+            ready = n.catalogEventsAppendedForTest() > baseline;
+            if (ready && waitCommit) {
+                const CatalogView v = catalogOf(n);
+                ready = v.hw >= v.leo;
+            }
+            if (!ready) std::this_thread::sleep_for(1ms);
+        }
+        if (!ready) return false;
+        crash(id);
+        return true;
+    }
+    /// The Task 22 seam the client tests use while their test thread is blocked in a blocking client call:
+    /// arm the catalog leader (its answers held), and crash it from a watcher thread right after its next
+    /// APPENDED + COMMITTED catalog event.  reapKilledLeader() joins the watcher and returns the crashed id
+    /// (-1: nothing happened within `within`).
+    void killCatalogLeaderAfterNextAppend(std::chrono::milliseconds within = 60s) {
+        joinKillWatcher_();
+        const int32_t leader = settledLeader();
+        if (leader < 1) throw std::logic_error("killCatalogLeaderAfterNextAppend: no settled catalog leader");
+        BrokerNode& n = node(leader);
+        n.holdCatalogAnswersForTest(true);
+        const uint64_t baseline = n.catalogEventsAppendedForTest();
+        killWatcherNode_ = leader;
+        killWatcher_ = std::thread([this, leader, baseline, within] {
+            BrokerNode& l = *nodes[static_cast<std::size_t>(leader - 1)];
+            const auto deadline = std::chrono::steady_clock::now() + within;
+            while (std::chrono::steady_clock::now() < deadline) {
+                if (l.catalogEventsAppendedForTest() > baseline) {
+                    const CatalogView v = catalogOf(l);
+                    if (v.hw >= v.leo) { l.crashForTest(); killWatcherResult_ = leader; return; }
+                }
+                std::this_thread::sleep_for(1ms);
+            }
+        });
+    }
+    int32_t reapKilledLeader() {
+        joinKillWatcher_();
+        const int32_t id = killWatcherResult_;
+        killWatcherResult_ = -1;
+        if (id > 0) nodes[static_cast<std::size_t>(id - 1)].reset();   // crashed already; release the husk
+        return id;
+    }
     /// `id` is in the COMMITTED catalog ISR (the controller accepted the
     /// leader's AlterIsr) on every running broker.
     bool awaitInCatalogIsr(int32_t id, std::chrono::milliseconds within) {

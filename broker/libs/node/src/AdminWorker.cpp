@@ -693,6 +693,7 @@ bool AdminWorker::appendEvent_(const DdlRequest& req, cat::CatalogEvent e, int64
 bool AdminWorker::advance_(int64_t nowNs) {
     auto* a = std::get_if<AwaitingCommit>(&inFlight_);
     if (a == nullptr) return false;
+    if (answersHeldForTest_) [[unlikely]] return false;   // Task 22 seam: the DDL is never answered
     // Committed AND applied locally — its effects posted (lastApplied is the
     // EFFECTED prefix: an event staged by a halt never counts).  Checked before
     // the halt: an event applied before a later halt still gets its OK.

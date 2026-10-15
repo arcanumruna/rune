@@ -273,6 +273,10 @@ public:
     /// not run the applier — a new leader stays CatchingUp with records it holds
     /// committed but unapplied.  Never set in production.
     void holdApplyForTest(bool on) noexcept { applyHeldForTest_ = on; }
+    /// Test seam (Task 22, the 3-node slice): while held, an in-flight DDL is never ANSWERED (nor timed
+    /// out) although its event commits and applies normally — the leader that is crashed meanwhile dies
+    /// with a committed, unanswered DDL (the in-doubt client).  Never set in production.
+    void holdAnswersForTest(bool on) noexcept { answersHeldForTest_ = on; }
     /// The catalog leader serving DDL.
     [[nodiscard]] bool isLeader() const noexcept { return std::holds_alternative<CatalogLeaderServing>(role_); }
     [[nodiscard]] std::size_t pendingCount() const noexcept { return pending_.size(); }
@@ -396,6 +400,7 @@ private:
     uint64_t preV8Refused_      = 0;
     uint64_t ddlRefusedUntrustedLeader_ = 0;
     bool     applyHeldForTest_  = false;   // holdApplyForTest (test seam only)
+    bool     answersHeldForTest_ = false;  // holdAnswersForTest (test seam only)
 
     // The booted applier's goLive, owed to the admin thread's first pass (Task 16).
     std::optional<LiveEffects> pendingLive_;

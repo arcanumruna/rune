@@ -3493,7 +3493,7 @@ void BrokerNode::stop() {
     // consensus off at once if it leads, and tells the members it is going.
     // Event: wait for the runtime's ring-published Halted ack (bounded — a
     // runtime that is not running never acks).
-    if (runtimeAgent_ && runtimeAgent_->controlledShutdown().active()) {
+    if (!crashForTest_ && runtimeAgent_ && runtimeAgent_->controlledShutdown().active()) {
         auto& cs = runtimeAgent_->controlledShutdown();
         if (cs.halt()) {
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{1};

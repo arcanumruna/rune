@@ -1547,11 +1547,12 @@ if(BUILD_TESTING)
         add_executable(rune_client_broker_tests tests/client/ClientDdlBrokerRegressionTest.cpp
                        tests/client/ClientCatalogReadBrokerRegressionTest.cpp
                        tests/client/RuneCliBrokerRegressionTest.cpp
-                       tests/client/ClientConnectRoleRegressionTest.cpp)
+                       tests/client/ClientConnectRoleRegressionTest.cpp
+                       tests/client/ClientDdlClusterRegressionTest.cpp)
         target_include_directories(rune_client_broker_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_client_broker_tests PRIVATE rune_node rune_view rune_codec rune_catalog
                               rune_client_api rune_cli_lib aeron::aeron GTest::gtest_main)
-        gtest_discover_tests(rune_client_broker_tests PROPERTIES TIMEOUT 240 RESOURCE_LOCK rune_udp_ports)
+        gtest_discover_tests(rune_client_broker_tests PROPERTIES TIMEOUT 600 RESOURCE_LOCK rune_udp_ports)
 
         # Catalog history Task 11: the DDL route (Redirect / NotLeader / Internal when
         # halted) and the halted controller's resignation, 3 brokers over real Aeron.
@@ -1577,6 +1578,15 @@ if(BUILD_TESTING)
         target_include_directories(rune_catalog_replication_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_catalog_replication_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_catalog_replication_tests PROPERTIES TIMEOUT 360 RESOURCE_LOCK rune_udp_ports)
+
+        # Catalog history Task 22: the interaction matrix's 3-node slice (32 cells: runtime DDL through every
+        # broker, a catalog-leader crash mid-DDL, data through every broker) + the binding regressions B1/B3/B4,
+        # 3 BrokerNodes over real Aeron.  Closes the E2 multi-node DDL carry-over.
+        add_executable(rune_catalog_integration_tests tests/integration/CatalogClusterIntegrationTest.cpp)
+        target_include_directories(rune_catalog_integration_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_catalog_integration_tests PRIVATE rune_node rune_view rune_codec rune_catalog
+                              aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_catalog_integration_tests PROPERTIES TIMEOUT 600 RESOURCE_LOCK rune_udp_ports)
 
         # Catalog history Task 8: the control thread executes the catalog's effects
         # (topics created / dropped at catalog ids, placement add / remove, config

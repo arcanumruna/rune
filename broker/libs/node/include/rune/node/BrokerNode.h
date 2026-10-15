@@ -1297,6 +1297,24 @@ public:
     /// the leader's prefix but not applied it has NOT caught up, so a deferred boot reconcile
     /// must keep waiting.
     void holdCatalogApplyAtBootForTest(bool on) noexcept { holdCatalogApplyAtBootForTest_ = on; }
+    /// Catalog history Task 22 (checklist 1): a REAL crash for the 3-node slice - stop() without the
+    /// controlled-shutdown protocol (no halt, no consensus hand-off, no goodbye to the members): the
+    /// threads are joined and the transport torn down, nothing is answered or flushed on purpose.
+    /// Test-thread only, like stop().  Production never calls it.
+    void crashForTest() { crashForTest_ = true; stop(); }
+    /// Task 22 seam (ADMIN thread via onAdminThreadForTest): hold / release this broker's DDL answers
+    /// (AdminWorker::holdAnswersForTest).
+    void holdCatalogAnswersForTest(bool on) {
+        onAdminThreadForTest([this, on]() { adminWorkerAgent_->worker().holdAnswersForTest(on); return 0; });
+    }
+    /// Task 22: hold / release this broker's catalog applier (a promoted leader stays CatchingUp).
+    void holdCatalogApplyForTest(bool on) {
+        onAdminThreadForTest([this, on]() { adminWorkerAgent_->worker().holdApplyForTest(on); return 0; });
+    }
+    /// Task 22: DDL events this broker's admin thread appended (read ON the admin thread).
+    [[nodiscard]] uint64_t catalogEventsAppendedForTest() {
+        return onAdminThreadForTest([this]() -> uint64_t { return adminWorkerAgent_->worker().eventsAppended(); });
+    }
     void releaseCatalogApplyForTest() {
         onAdminThreadForTest([this]() { adminWorkerAgent_->worker().holdApplyForTest(false); return 0; });
     }
@@ -2221,6 +2239,7 @@ private:
     // -----------------------------------------------------------------------
     bool started_ = false;
     bool stopped_ = false;
+    bool crashForTest_ = false;   // crashForTest(): stop() skips the controlled-shutdown protocol
 
     // F9a: control thread → observer thread leadership ring (see Observers).
     // mutable: the const observer accessors drain it.

@@ -379,6 +379,7 @@ public:
             if (ts.topicId == spec.topicId) { present = true; break; }
         }
         if (!present) { configuredTopics_.push_back(spec); ++routingInputsEpoch_; }
+        if (placementHeldForTest_) [[unlikely]] return;   // Task 22 seam: recorded, not placed (holdPlacementForTest)
 
         // (2) Emit the initial assignment for this topic (leader only).
         if (!controllerReady_()) return;
@@ -1163,6 +1164,16 @@ public:
     }
     /// TEST-ONLY: see NodeConfig::testUserDecisionHoldMs.
     void setUserDecisionHoldForTest(int64_t ns) noexcept { userDecisionHoldNs_ = ns; }
+    /// Catalog history Task 22 seam (CONTROL thread, via onControlThreadForTest): while held a runtime topic is
+    /// recorded but its initial placement is not emitted (the window between "applied" and "placement committed" of
+    /// the 3-node slice's B1 test); releasing it places every unplaced unit at once.  Never set in production.
+    void holdPlacementForTest(bool on) {
+        placementHeldForTest_ = on;
+        if (!on && controllerReady_() && !liveNodes_.empty() && !catalogHalted(selfId_)) {
+            placeEveryUnassignedUnit_();
+            drainDynamicQueue();
+        }
+    }
     /// E2 C1 residual N1: the process identity this node currently knows for
     /// `node` (its node-control registration nonce; every node registers with
     /// every new controller) — 0 when unknown.
@@ -2840,6 +2851,7 @@ private:
     uint64_t                                           removedReconciledVersion_ = UINT64_MAX;
     std::deque<int32_t>                                pendingRemovalRecords_;
     std::unordered_map<int32_t, rune::replication::Offset> removalInflight_;
+    bool    placementHeldForTest_ = false;   ///< Task 22 seam (holdPlacementForTest)
     int64_t userDecisionHoldNs_ = 0, readySinceNs_ = 0, lastNowNs_ = 0;   ///< TEST-ONLY hold
     bool    holdWasReady_       = false;
     std::unordered_map<int64_t, rune::replication::Offset> lineageInflight_;
