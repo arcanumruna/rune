@@ -17,6 +17,7 @@
 // answered; two creates on one name never both live; Internal (6) only from a halted broker.
 #include "support/CatalogClusterHarness.h"
 #include "support/CatalogModel.h"
+#include "support/CatalogStressDriver.h"
 
 #include <gtest/gtest.h>
 
@@ -33,6 +34,7 @@
 namespace {
 
 using rune::node::test::CatalogClusterHarness;
+using rune::node::test::CatalogStressDriver;
 using rune::node::test::StepResult;
 using rune::node::test::StressAction;
 using rune::node::test::StressAnswer;
@@ -76,6 +78,7 @@ void runSeed(uint32_t seed, int steps, SeedReport& rep) {
     const auto t0 = std::chrono::steady_clock::now();
     std::mt19937 rng(seed);
     CatalogClusterHarness h("stress_" + std::to_string(seed), 3);
+    CatalogStressDriver d(h);
     cmodel::CatalogModel model;
     std::set<rune::protocol::RequestId> okRequests, otherRequests;
     int step = -1;
@@ -84,8 +87,8 @@ void runSeed(uint32_t seed, int steps, SeedReport& rep) {
     try {
         for (step = 0; step < steps; ++step) {
             const std::string at = where + " step " + std::to_string(step);
-            const StressAction action = h.randomAction(rng, model);
-            const StepResult res = h.perform(action);
+            const StressAction action = d.randomAction(rng, model);
+            const StepResult res = d.perform(action);
             rep.traces.push_back(res.trace);
             if (trace) {
                 std::ostringstream o;
@@ -109,7 +112,7 @@ void runSeed(uint32_t seed, int steps, SeedReport& rep) {
                 }
                 if (a.code == code(ErrorCode::NotLeader) || a.code == code(ErrorCode::Redirect) ||
                     a.code == rune::node::test::kClientTimeout) {
-                    ASSERT_FALSE(h.resolvesInDoubt()) << at << ": code " << a.code << " is still in doubt after the resolution: "
+                    ASSERT_FALSE(d.resolvesInDoubt()) << at << ": code " << a.code << " is still in doubt after the resolution: "
                                                       << cmodel::toString(a.request) << " [" << res.what << "]";
                     continue;   // unresolved (RED d only): nothing known about the DDL
                 }
@@ -143,24 +146,24 @@ void runSeed(uint32_t seed, int steps, SeedReport& rep) {
             }
 
             // ── invariants after the step ────────────────────────────────────────────────────────────
-            ASSERT_TRUE(h.digestsEqualAtEqualOffsets()) << at << ": two brokers at one applied offset hold different digests [" << res.what << "]";
-            const cmodel::Snapshot got = h.catalogAsModelSnapshot();
+            ASSERT_TRUE(d.digestsEqualAtEqualOffsets()) << at << ": two brokers at one applied offset hold different digests [" << res.what << "]";
+            const cmodel::Snapshot got = d.catalogAsModelSnapshot();
             ASSERT_TRUE(got == model.snapshot()) << at << ": the leader's catalog differs from the model [" << res.what << "]\nbroker:"
                                                  << cmodel::describe(got) << "\nmodel:" << cmodel::describe(model.snapshot());
             if (step % 20 == 19) {
-                const auto diff = h.servingDiffersFromModel(model.snapshot());
+                const auto diff = d.servingDiffersFromModel(model.snapshot());
                 ASSERT_FALSE(diff.has_value()) << at << ": " << diff.value_or("") << " [" << res.what << "]";
             }
         }
         step = steps;
-        h.healAll();
+        d.healAll();
         ASSERT_TRUE(h.awaitDigestsEqual(/*excludeHalted=*/false)) << where << ": the brokers never converged after healing";
         // Invariant: every DDL answered.
         for (int b = 1; b <= 3; ++b)
             EXPECT_EQ(h.startedTotal(b), h.answeredTotal(b)) << where << ": broker " << b << " started DDLs it never answered";
         // Invariant: no DDL lost or duplicated - the ledger of every log agrees, an OK'd request has exactly one
         // event, a refused one none, and the log holds nothing else.
-        const auto ledger = h.requestLedger();
+        const auto ledger = d.requestLedger();
         ASSERT_TRUE(ledger.has_value()) << where << ": the brokers' logs hold different events";
         for (const auto& rid : okRequests) {
             const auto it = ledger->find(rid);
@@ -170,18 +173,18 @@ void runSeed(uint32_t seed, int steps, SeedReport& rep) {
         for (const auto& rid : otherRequests)
             if (!okRequests.contains(rid))
                 EXPECT_EQ(ledger->count(rid), 0u) << where << ": a refused request " << rid.lo << " left an event in the log";
-        EXPECT_EQ(h.leaderEventCount(), okRequests.size()) << where << ": the log holds events no OK'd request explains";
+        EXPECT_EQ(d.leaderEventCount(), okRequests.size()) << where << ": the log holds events no OK'd request explains";
         // Invariant: two creates on one name never both live.
         std::string why;
-        EXPECT_TRUE(h.noNameHadTwoConcurrentLiveObjects(&why)) << where << ": " << why;
+        EXPECT_TRUE(d.noNameHadTwoConcurrentLiveObjects(&why)) << where << ": " << why;
         // The broker catalog equals the independent model, on the leader and on what every broker serves.
-        const cmodel::Snapshot got = h.catalogAsModelSnapshot();
+        const cmodel::Snapshot got = d.catalogAsModelSnapshot();
         EXPECT_TRUE(got == model.snapshot()) << where << ": final catalog differs from the model\nbroker:" << cmodel::describe(got)
                                              << "\nmodel:" << cmodel::describe(model.snapshot());
-        const auto diff = h.servingDiffersFromModel(model.snapshot());
+        const auto diff = d.servingDiffersFromModel(model.snapshot());
         EXPECT_FALSE(diff.has_value()) << where << ": " << diff.value_or("");
-        rep.events = h.leaderEventCount();
-        rep.inDoubtResolved = h.inDoubtResolved();
+        rep.events = d.leaderEventCount();
+        rep.inDoubtResolved = d.inDoubtResolved();
         rep.finalDigest = h.stateOf(h.leader()).digest();
     } catch (const std::exception& e) {
         FAIL() << where << " step " << step << ": " << e.what();
