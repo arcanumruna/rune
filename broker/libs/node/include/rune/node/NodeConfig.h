@@ -18,6 +18,9 @@
 //   RUNE_CATALOG_REPL_STREAM_ID — int32, default 30. Stream of the __catalog replication plane
 //                            (distinct from the replication stream and the per-worker range).
 //   RUNE_DATA_DIR          — filesystem path for durable data. Required, non-empty.
+//   RUNE_STORAGE_FORMAT    — new | join | auto; read ONLY when RUNE_DATA_DIR is empty and not formatted.
+//                            Unset / "" = never format: an empty data dir refuses to start (exit 78).
+//   RUNE_STORAGE_RECOVERY_VOTE — bool, default off.  Unsafe, disaster recovery only.
 //
 // Election timing (all optional; defaults are fast-but-safe for co-located clusters):
 //   RUNE_ELECTION_TIMEOUT_MS        — int64 ms, default 150. Max wait per election round.
@@ -38,6 +41,7 @@
 //
 // All Aeron channels use the aeron:udp transport (container transport).
 
+#include <rune/node/StorageFormat.h>
 #include <rune/node/IdleShape.h>
 #include <rune/node/PersistenceMode.h>
 #include <rune/node/PemFile.h>   // Task 9: loadPemFile() — re-exported here for config callers
@@ -404,6 +408,14 @@ struct NodeConfig {
     // opt-in position-proven survivor election for a partition whose committed
     // ISR has no live member (Kafka unclean.leader.election.enable analog).
     bool survivorLeaderElection = false;
+
+    // ISR design v3 §3.2 (Step 5): how an EMPTY, not yet formatted data dir is formatted at boot.
+    // In-process default (rigs): an empty dir formats as founder; the env parser defaults to Required
+    // (RUNE_STORAGE_FORMAT unset / "": an empty dir refuses to start).  Ignored once storage.meta exists.
+    StorageFormat storageFormat = StorageFormat::TestFounder;
+    // RUNE_STORAGE_RECOVERY_VOTE (default false): unsafe, disaster recovery only — lets an unconfirmed
+    // (replaced-disk) node vote (read by the storage gate, Step 9).
+    bool storageRecoveryVote = false;
 
     // Re-review 2026-10-04 MEDIUM-B (RUNE_UNCLEAN_CONSENSUS_ELECTION, default
     // false): operator escape hatch for the consensus candidacy gate.  Normally

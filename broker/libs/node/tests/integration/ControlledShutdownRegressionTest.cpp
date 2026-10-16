@@ -31,6 +31,7 @@
 #include <rune/gateway/ClientGateway.h>
 #include <rune/node/BrokerNode.h>
 #include <rune/node/NodeConfig.h>
+#include <rune/node/StorageIdentity.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/Protocol.h>
 #include <rune/replication/PartitionReplica.h>
@@ -526,6 +527,10 @@ TEST(ControlledShutdownRegression, WipedDataDirRestartRejoinsRegression) {
     std::error_code ec;
     fs::remove_all(dirs[static_cast<std::size_t>(victim)], ec);
     fs::create_directories(dirs[static_cast<std::size_t>(victim)]);
+    // ISR design v3 Step 5: the replaced disk is formatted the production way (`storage format --join`).
+    ASSERT_EQ(rune::node::StorageIdentity::format(dirs[static_cast<std::size_t>(victim)].string(),
+                                                  rune::node::StorageIdentity::Origin::Joiner,
+                                                  rune::node::StorageIdentity::Mode::None, false).code, 0);
     ns[static_cast<std::size_t>(victim)] = std::make_unique<BrokerNode>(cfg[static_cast<std::size_t>(victim)]);
     ns[static_cast<std::size_t>(victim)]->start();
     EXPECT_TRUE(eventually([&] { return spreadAndSettled(ns); }, 60'000ms))

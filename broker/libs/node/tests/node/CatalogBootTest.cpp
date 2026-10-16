@@ -369,6 +369,9 @@ TEST(CatalogBootRegression, LeftoverDroppedDirIsPurgedAtBootButOnlyForIdsTheCata
 // B7
 TEST(CatalogBootRegression, RetiredCatalogDirsAreIgnoredNotRead) {
     BootRig r("boot_retired");
+    // ISR design v3 Step 5: the dir is formatted before it is seeded (the subject is only that retired dirs
+    // are never read; seeded state alone would be a partly deleted pre-storage-id dir, R-3).
+    rune::node::test::formatFounderForTest(r.dataDir());
     fs::create_directories(r.dataDir() / "__topic_schemas");
     { std::ofstream(r.dataDir() / "__topic_schemas" / "00000000000000000000.log") << "garbage"; }
     fs::create_directories(r.dataDir() / "__views" / "0");

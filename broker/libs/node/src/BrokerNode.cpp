@@ -387,6 +387,11 @@ void BrokerNode::start() {
         throw std::runtime_error("BrokerNode: cannot create dataDir '" +
                                  config_.dataDir + "': " + ec.message());
     }
+    // 1a. ISR design v3 §3.2 (Step 5): the storage identity.  NOTHING writes into dataDir before this line
+    //     (an empty dir that refuses must stay empty).  Throws StorageRefusal (main: exit 78).
+    storage_ = StorageIdentity::resolve(config_.dataDir, config_.storageFormat, config_.peers.size() <= 1, config_.nodeId);
+    spdlog::info("storage: dataDir={} storageId={} origin={} state=CONFIRMED", config_.dataDir,
+                 StorageIdentity::idHex(storage_.id), StorageIdentity::originName(storage_.origin));
     // The embedded driver creates (and deletes) the Aeron dir itself but not its
     // parents: a RUNE_AERON_DIR under a not-yet-existing parent fails driver init
     // with a bare EINVAL.  Create the parent chain up front.

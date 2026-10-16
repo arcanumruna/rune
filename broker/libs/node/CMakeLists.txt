@@ -1,5 +1,6 @@
 add_library(rune_node
     src/NodeConfig.cpp
+    src/StorageIdentity.cpp
     src/PemFile.cpp
     src/BrokerNode.cpp
     src/EmbeddedDriver.cpp
@@ -141,6 +142,7 @@ if(BUILD_TESTING)
     # Unit tests (NodeConfig + PortableFlushBackend + OneToOneByteRing + SchemaCodecSmoke + SchemaRegistry + AdminWorker)
     add_executable(rune_node_tests
         tests/node/NodeConfigTest.cpp
+        tests/node/StorageIdentityTest.cpp
         tests/node/HostDefaultsTest.cpp
         tests/node/FdBudgetTest.cpp
         tests/node/PortableFlushBackendTest.cpp

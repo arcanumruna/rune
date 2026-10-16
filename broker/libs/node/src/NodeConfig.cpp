@@ -771,6 +771,25 @@ ConfigResult parseNodeConfig(
             cfg.survivorLeaderElection = (sv == "1" || sv == "true" || sv == "TRUE");
         }
     }
+    // ISR design v3 §3.2 (Step 5): RUNE_STORAGE_FORMAT — the ONE place it is read.  Unset / "" → Required
+    // (an empty data dir refuses to start); new / join / auto; anything else (TestFounder included: the env
+    // never yields it) is R-6.  The in-process NodeConfig default (TestFounder) never reaches a parsed config.
+    {
+        const char* raw = getenv_fn("RUNE_STORAGE_FORMAT");
+        const std::string_view sv = raw ? std::string_view(raw) : std::string_view{};
+        const auto f = parseStorageFormat(sv);
+        if (!f.has_value())
+            return {{}, "RUNE_STORAGE_FORMAT='" + std::string(sv) + "' is not one of new, join, auto\n"
+                        "(unset = never format an empty data dir)"};
+        cfg.storageFormat = *f;
+    }
+    {
+        const char* raw = getenv_fn("RUNE_STORAGE_RECOVERY_VOTE");
+        if (raw) {
+            const std::string_view sv(raw);
+            cfg.storageRecoveryVote = (sv == "1" || sv == "true" || sv == "TRUE");
+        }
+    }
     // Re-review 2026-10-04 MEDIUM-B: unclean consensus election (default OFF) —
     // see NodeConfig::uncleanConsensusElection.
     {

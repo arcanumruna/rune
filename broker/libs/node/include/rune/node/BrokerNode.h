@@ -31,6 +31,7 @@
 #include <limits>
 #include <rune/gateway/SpillFifo.h>
 #include <rune/node/NodeConfig.h>
+#include <rune/node/StorageIdentity.h>
 #include <rune/node/HostDefaults.h>
 #include <rune/consensus/ControlRing.h>   // Task 9: tlsReloadRing_ (SIGHUP trigger)
 #include <rune/node/EmbeddedDriver.h>
@@ -1854,6 +1855,10 @@ private:
     // Configuration (immutable after construction)
     // -----------------------------------------------------------------------
     NodeConfig config_;
+    /// ISR design v3 §3.2 (Step 5): this data dir's storage identity, resolved in start() before anything
+    /// writes into the data dir.  Owned by the starting thread until the threads exist; later steps hand it
+    /// to its one owner (the storage gate).
+    StorageIdentity::Loaded storage_;
     /// E2 final fix wave (C1, USER DECISION option b): a transient partition's
     /// data lineage is COMMITTED METADATA (TransientLineageRecord) — the
     /// coordinator answers from the lineage confirmed for the partition's

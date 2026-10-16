@@ -53,6 +53,7 @@
 #include <rune/node/MetadataService.h>
 #include <rune/node/NodeConfig.h>
 #include <rune/node/SchemaRegistry.h>
+#include <rune/node/StorageIdentity.h>
 #include <rune/node/TopicDirReconcile.h>
 #include <rune/node/ViewRegistry.h>
 
@@ -716,6 +717,14 @@ public:
         if (broker_(b).alive) fail_("wipe", "a running broker's dir is not wiped");
         std::error_code ec;
         std::filesystem::remove_all(root_ / ("b" + std::to_string(b)), ec);
+        // ISR design v3 Step 5: the operator's `storage format --join` on the replaced disk.  This harness drives
+        // CatalogPartition directly and builds no BrokerNode, so nothing reads storage.meta here (v3-check V3-M4):
+        // the line only models the production step, so the dir looks like a real replaced disk.
+        const auto dir = root_ / ("b" + std::to_string(b));
+        std::filesystem::create_directories(dir);
+        if (rune::node::StorageIdentity::format(dir.string(), rune::node::StorageIdentity::Origin::Joiner,
+                                                rune::node::StorageIdentity::Mode::None, false).code != 0)
+            fail_("wipe", "format");
     }
     /// The broker's next live effects are dropped (the process dies after the checkpoint and before the side
     /// effects run: stopBroker + restartBroker then re-runs them through the BOOT sink).

@@ -7,6 +7,7 @@
 #include <rune/node/BrokerNode.h>
 #include <rune/node/NodeConfig.h>
 #include <rune/node/SignalControl.h>
+#include <rune/node/StorageIdentity.h>
 #include <rune/node/ThreadAffinity.h>
 
 #include <rune_fr/FlightRecorder.h>
@@ -19,6 +20,7 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unistd.h>
 
@@ -115,11 +117,18 @@ static void frReport(const std::string& tag) {
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
-int main() {
+int main(int argc, char** argv) {
+    // ISR design v3 §3.2: `rune_broker storage format …` formats a data dir and exits.  This path creates no
+    // thread (it runs before blockControlSignals() and never constructs a BrokerNode or a SignalThread).
+    if (argc >= 3 && std::string_view(argv[1]) == "storage" && std::string_view(argv[2]) == "format")
+        return rune::node::runStorageFormatCli(argc - 3, argv + 3);
+    if (argc > 1) { std::cerr << "usage: rune_broker [storage format (--new|--join|--reassign-join) [--data-dir D] [--ignore-formatted]]\n"; return 64; }
+
     // F9a: block the control signals BEFORE any thread exists (every thread
     // inherits the mask), then hand them to the one sigwait thread.
     //
-    // WARNING: blockControlSignals() MUST stay the first thing main() does.  Any
+    // WARNING: blockControlSignals() MUST stay the first thing main() does on the broker path (the argv
+    // dispatch above creates no thread and returns).  Any
     // thread created BEFORE it (or any thread that later unblocks SIGINT/SIGTERM/
     // SIGUSR1/SIGUSR2) can receive a process-directed signal with the default
     // action — killing the broker without a clean stop — or swallow it, so the
@@ -165,6 +174,10 @@ int main() {
     node.setHaltHandler(&haltHandler, &events);
     try {
         node.start();
+    } catch (const rune::node::StorageRefusal& ex) {
+        std::cerr << "rune-broker: refusing to start — " << ex.what() << "\n";
+        spdlog::critical("rune-broker: refusing to start — {}", ex.what());
+        return 78;
     } catch (const std::exception& ex) {
         spdlog::error("rune-broker: failed to start: {}", ex.what());
         std::cerr << "rune-broker: failed to start: " << ex.what() << "\n";
