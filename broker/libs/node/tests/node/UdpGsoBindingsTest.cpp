@@ -397,6 +397,43 @@ TEST(UdpGsoBindings, EinvalAboveTheRouteMtuIsAPathMtuFallbackRegression) {
     EXPECT_EQ(r.totals.gso_fallbacks, 0u);
 }
 
+// Re-check M3: the same EINVAL diagnosis on an UNCONNECTED transport — the broker's egress shape (MDC dynamic
+// control: one socket, many destinations, sendmsg with msg_name).  getsockopt(IP_MTU) needs a connected socket,
+// so the diagnosis connects a temporary socket to the destination (cold, stack only).  Linux gate (lowers the
+// loopback MTU).  RED: the diagnosis on the transport's own unconnected fd (ENOTCONN -> UNSUPPORTED:
+// gso_fallbacks 1, gso_path_mtu_fallbacks 0).
+TEST(UdpGsoBindings, EinvalAboveTheRouteMtuOnAnMdcTransportIsAPathMtuFallbackRegression) {
+    const char* gate = std::getenv("RUNE_LINUX_GATE");
+    if (gate == nullptr || std::string(gate) != "1") GTEST_SKIP() << "Linux gate only (needs CAP_NET_ADMIN)";
+    LoopbackMtu lo(1300);
+    ASSERT_TRUE(lo.ok) << "RUNE_LINUX_GATE=1 but the loopback MTU could not be lowered (CAP_NET_ADMIN?)";
+    Rig pub, sub;
+    ASSERT_TRUE(pub.start(2, 1408, EINVAL, std::numeric_limits<int>::max())) << aeron_errmsg();
+    ASSERT_TRUE(sub.start(1, 1408)) << aeron_errmsg();
+    const std::string pubCh = "aeron:udp?control=localhost:24623|control-mode=dynamic|mtu=1408";
+    const std::string subCh = "aeron:udp?endpoint=localhost:24624|control=localhost:24623|control-mode=dynamic";
+    roundTrip(pub, sub, pubCh, mixedSizes(1408, 40), subCh);
+    pub.close();
+    sub.close();
+    EXPECT_GE(pub.totals.gso_path_mtu_fallbacks, 1u);
+    EXPECT_EQ(pub.totals.gso_fallbacks, 0u) << "EINVAL above the route MTU on an MDC transport is a path-MTU case";
+}
+
+// Re-check M4: the per-destination hold — once a destination's GSO segment is refused (EMSGSIZE), every later
+// group to it inside the 10 s hold goes plain without another GSO attempt.  Persistent injection: each GSO
+// attempt consumes one injected refusal, so exactly one is consumed.  RED: no hold (one attempt per group).
+TEST(UdpGsoBindings, HeldDestinationCostsOneGsoAttemptPerHoldRegression) {
+    Rig r;
+    ASSERT_TRUE(r.start(2, 1408, EMSGSIZE, std::numeric_limits<int>::max())) << aeron_errmsg();
+    const auto t0 = Clock::now();
+    roundTrip(r, r, udp(24625, 1408), mixedSizes(1408, 70));
+    ASSERT_LT(Clock::now() - t0, std::chrono::seconds(9)) << "the round trip must fit inside one hold period";
+    const int remaining = rune_gso_bindings_test_inject_remaining(r.gso);
+    r.close();
+    EXPECT_EQ(std::numeric_limits<int>::max() - remaining, 1) << "GSO attempts to the held destination";
+    EXPECT_EQ(r.totals.gso_fallbacks, 0u);
+}
+
 TEST(UdpGsoBindings, DataLossRecoversWithGroOn) {
     // Aeron's loss interceptor drops ~5% of DATA frames (type 0x01 -> mask bit 0x2) on receive; NAKs recover.
     ::setenv("AERON_UDP_CHANNEL_INCOMING_INTERCEPTORS", "loss", 1);
