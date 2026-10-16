@@ -18,7 +18,7 @@ typedef struct rune_gso_totals_stct
 {
     uint64_t gso_sends;        /* successful sendmsg(UDP_SEGMENT) calls */
     uint64_t gso_datagrams;    /* wire datagrams carried by them */
-    uint64_t gso_fallbacks;    /* transports that turned GSO off (EIO/EINVAL/EOPNOTSUPP/ENOPROTOOPT) */
+    uint64_t gso_fallbacks;    /* transports that turned GSO off for good: the kernel refused it (EIO/EINVAL/EOPNOTSUPP/ENOPROTOOPT) */
     uint64_t gro_buffers;      /* received buffers that held > 1 coalesced datagram */
     uint64_t gro_datagrams;    /* datagrams split out of them */
     uint64_t gro_ctrunc_drops; /* received buffers dropped: control data truncated (cannot split safely) */
@@ -26,6 +26,9 @@ typedef struct rune_gso_totals_stct
     uint64_t gro_disabled;     /* always 0: GRO is never turned off (a MSG_TRUNC drops only the damaged tail) */
     uint64_t transports;       /* transports created through these bindings */
     uint64_t gro_transports;   /* of which GRO was enabled on (receiver-affinity sockets only) */
+    uint64_t gso_path_mtu_fallbacks; /* GSO GROUPS sent plainly because a segment exceeded the destination's path MTU
+                                      * (EMSGSIZE, or EINVAL above IP_MTU): per destination, re-probed after a hold;
+                                      * GSO stays on for the transport.  Live: Aeron counter rune_gso_path_mtu_fallbacks */
 }
 rune_gso_totals_t;
 
@@ -51,8 +54,13 @@ void rune_gso_bindings_delete(rune_gso_bindings_t *b);
 /* TEST SEAM — call before aeron_driver_start: the next `count` GSO sendmsg attempts fail with errno `err`. */
 void rune_gso_bindings_test_inject(rune_gso_bindings_t *b, int err, int count);
 
+/* TEST SEAM — like rune_gso_bindings_test_inject, after letting the first `skip` GSO calls through. */
+void rune_gso_bindings_test_inject_after(rune_gso_bindings_t *b, int err, int count, int skip);
+
 /* TEST SEAM — call before aeron_driver_start: the next `count` received GRO buffers are flagged MSG_TRUNC. */
 void rune_gso_bindings_test_inject_recv_trunc(rune_gso_bindings_t *b, int count);
+/* Test seam (re-check M4): the injected refusals not yet consumed — each GSO sendmsg attempt consumes one. */
+int rune_gso_bindings_test_inject_remaining(const rune_gso_bindings_t *b);
 
 #ifdef __cplusplus
 }
