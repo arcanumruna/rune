@@ -269,8 +269,30 @@ static int rune_gso_sendmsg(
             int pmtu = 0;
             socklen_t l = sizeof(pmtu);
             const int v6 = NULL != dst && AF_INET6 == dst->ss_family;
-            const int got = v6 ? getsockopt(transport->fd, IPPROTO_IPV6, IPV6_MTU, &pmtu, &l)
-                               : getsockopt(transport->fd, IPPROTO_IP, IP_MTU, &pmtu, &l);
+            /* Re-check M3: IP_MTU / IPV6_MTU answer only on a CONNECTED socket.  An unconnected transport (MDC
+             * dynamic control: one socket, many destinations) gets the route MTU from a temporary socket connected
+             * to this destination — cold (EINVAL happens at most once per destination per hold), stack only. */
+            int probe_fd = transport->fd;
+            int temp_fd = -1;
+            if (NULL == transport->connected_address && NULL != address)
+            {
+                temp_fd = socket(address->ss_family, SOCK_DGRAM, 0);
+                if (temp_fd >= 0 && 0 == connect(temp_fd, (const struct sockaddr *)address, (socklen_t)AERON_ADDR_LEN(address)))
+                {
+                    probe_fd = temp_fd;
+                }
+                else
+                {
+                    probe_fd = -1;
+                }
+            }
+            const int got = probe_fd < 0 ? -1
+                : (v6 ? getsockopt(probe_fd, IPPROTO_IPV6, IPV6_MTU, &pmtu, &l)
+                      : getsockopt(probe_fd, IPPROTO_IP, IP_MTU, &pmtu, &l));
+            if (temp_fd >= 0)
+            {
+                close(temp_fd);
+            }
             if (0 == got && pmtu > 0 && (int)seg + (v6 ? 48 : 28) > pmtu)
             {
                 return RUNE_GSO_PATH_MTU;
@@ -704,6 +726,11 @@ void rune_gso_bindings_test_inject_after(rune_gso_bindings_t *b, int err, int co
     }
 }
 
+int rune_gso_bindings_test_inject_remaining(const rune_gso_bindings_t *b)
+{
+    return NULL != b ? b->inject_count : 0;
+}
+
 void rune_gso_bindings_test_inject_recv_trunc(rune_gso_bindings_t *b, int count)
 {
     if (NULL != b)
@@ -743,6 +770,7 @@ void rune_gso_bindings_test_inject(rune_gso_bindings_t *b, int err, int count) {
 void rune_gso_bindings_test_inject_after(rune_gso_bindings_t *b, int err, int count, int skip)
 { (void)b; (void)err; (void)count; (void)skip; }
 void rune_gso_bindings_test_inject_recv_trunc(rune_gso_bindings_t *b, int count) { (void)b; (void)count; }
+int rune_gso_bindings_test_inject_remaining(const rune_gso_bindings_t *b) { (void)b; return 0; }
 int rune_gso_bindings_active(const rune_gso_bindings_t *b) { (void)b; return 0; }
 void rune_gso_bindings_delete(rune_gso_bindings_t *b) { free(b); }
 

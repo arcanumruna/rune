@@ -59,6 +59,8 @@ void rune_gso_bindings_test_inject_after(rune_gso_bindings_t *b, int err, int co
 
 /* TEST SEAM — call before aeron_driver_start: the next `count` received GRO buffers are flagged MSG_TRUNC. */
 void rune_gso_bindings_test_inject_recv_trunc(rune_gso_bindings_t *b, int count);
+/* Test seam (re-check M4): the injected refusals not yet consumed — each GSO sendmsg attempt consumes one. */
+int rune_gso_bindings_test_inject_remaining(const rune_gso_bindings_t *b);
 
 #ifdef __cplusplus
 }
