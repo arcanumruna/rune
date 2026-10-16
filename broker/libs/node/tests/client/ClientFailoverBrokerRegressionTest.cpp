@@ -814,7 +814,8 @@ TEST(ClientFailoverBrokerRegression, SeedCoordinatorCrashedMidTransactionEndsCom
 
 // GetViewRow rides the seed (isRoutedCtlOp follows the source leader's Redirect).  The seed's broker — the
 // view source partition's leader — dies; a read issued after the crash ends Ok (or a retriable kNotLeader /
-// kNotReady / an explicit session-lost failure, retried) within the bound — never a Timeout.
+// kNotReady / an explicit session-lost failure, retried) within the bound — never a Timeout, never "not connected"
+// (fix round 2 I-1: a read issued while the seed fails over waits for it).
 // RED (no seed failover): every retried read fails "not connected" on the dead seed; no Ok within the bound.
 TEST(ClientFailoverBrokerRegression, SeedCrashedGetViewRowFollowsTheNewSeedRegression) {
     ThreeNodes c = ThreeNodes::start("fo_gvr");
@@ -865,11 +866,13 @@ TEST(ClientFailoverBrokerRegression, SeedCrashedGetViewRowFollowsTheNewSeedRegre
     auto rcfg = clientConfigFor(c, victim);
     rcfg.connectTimeoutMs = 30'000; rcfg.pingTimeoutMs = 30'000;
     auto reader = connectClient(c, rcfg);
+    rc::ViewRowResult r0;
     for (const auto deadline = Clock::now() + 60s; Clock::now() < deadline;) {   // precondition: served
-        const auto r = reader->getViewRowAndWait(view.viewTopicId, 101, 0, 10s);
-        if (r.status == rc::ViewRowResult::kOk) break;
+        r0 = reader->getViewRowAndWait(view.viewTopicId, 101, 0, 10s);
+        if (r0.status == rc::ViewRowResult::kOk) break;
         std::this_thread::sleep_for(50ms);
     }
+    ASSERT_EQ(r0.status, rc::ViewRowResult::kOk) << "precondition: the row is served before the crash";   // fix round 2 (M-4)
     c.crash(victim);
     std::this_thread::sleep_for(1s);
     const auto t0 = Clock::now();
@@ -888,6 +891,8 @@ TEST(ClientFailoverBrokerRegression, SeedCrashedGetViewRowFollowsTheNewSeedRegre
     EXPECT_TRUE(ok) << "a view row read through the failed-over seed (" << errors.size() << " errors, last: "
                     << (errors.empty() ? std::string() : errors.back()) << ")";
     for (const auto& e : errors) EXPECT_EQ(e.find("timed out"), std::string::npos) << "never a Timeout: " << e;
+    // Fix round 2 (I-1 / M-4): a read issued while the seed fails over WAITS for it — never "not connected".
+    for (const auto& e : errors) EXPECT_EQ(e.find("not connected"), std::string::npos) << e;
     std::fprintf(stderr, "[gvr] ok=%d after %lld ms, %zu explicit errors\n", ok ? 1 : 0,
                  static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count()),
                  errors.size());
