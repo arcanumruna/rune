@@ -32,6 +32,7 @@
 #include "support/SchedulerWatchdog.h"   // the harness-side process-starvation signal
 #include "support/ShardTestClient.h"
 
+#include <rune/gateway/ClientGateway.h>
 #include <rune/node/BrokerNode.h>
 #include <rune/node/MetadataService.h>
 #include <rune/protocol/RecordBatch.h>
@@ -118,6 +119,29 @@ constexpr int cNoAnswer = -2;   // R-I1: a broker that never answered (NOT the i
     return b.build();
 }
 
+/// diag-duplicate F1: an idempotent identity - one per LOGICAL record (seq 0, epoch 0); every retry of that record reuses it,
+/// so an in-doubt NotLeader (the batch may already be in the log and commit when leadership comes back) retried is
+/// deduplicated by the broker instead of stored twice.  A fresh pid per record: no sequence bookkeeping, a first send is
+/// always Accept (an unknown pid at seq 0), a retry is always a Duplicate, and topic-id reuse is irrelevant.
+struct ProduceIdentity { int64_t pid = -1; int16_t epoch = 0; int32_t seq = 0; };
+/// Test-thread only (the Rig is single-threaded); unique within the process, so within every cluster a test builds.
+inline int64_t gNextTestPid = 7'000'000;
+[[nodiscard]] ProduceIdentity freshIdentity() { return ProduceIdentity{gNextTestPid++, 0, 0}; }
+/// batchFor with the identity in the batch header (it must equal the frame's: ProducePath refuses a mismatch).
+[[nodiscard]] std::vector<uint8_t> batchFor(bool typed, int64_t id, const std::string& value, const ProduceIdentity& ident) {
+    rune::protocol::RecordBatchBuilder b(0, 0);
+    b.setProducerId(ident.pid);
+    b.setProducerEpoch(ident.epoch);
+    b.setBaseSequence(ident.seq);
+    if (typed) {
+        const auto k = keyBytes(id);
+        b.append(std::string_view(reinterpret_cast<const char*>(k.data()), k.size()), value, 0);
+    } else {
+        b.append("k" + std::to_string(id), value, 0);
+    }
+    return b.build();
+}
+
 /// Every record value in a pushed Records payload (one or more batches).
 [[nodiscard]] std::vector<std::string> valuesOf(const std::vector<uint8_t>& bytes) {
     std::vector<std::string> out;
@@ -189,8 +213,9 @@ struct Hooks {
 // ===========================================================================
 class Rig {
 public:
-    explicit Rig(ThreeNodes& c)
-        : c_(c), cl_(c.clientsDir->path / "wire") {
+    /// reconnectSilent = false: the F-A guard is off (T-P2 only: it must see the broker's own expiry notice).
+    explicit Rig(ThreeNodes& c, bool reconnectSilent = true)
+        : c_(c), cl_(c.clientsDir->path / "wire"), reconnectSilent_(reconnectSilent) {
         cl_.keepSessionsAlive(true);
         cl_.setClientVersion(pc::kClientVersion);   // a v8 session: DDL Redirects are followed
     }
@@ -198,7 +223,22 @@ public:
 
     /// A session on broker `n` (connected once, retried while its client endpoint warms up).
     int64_t session(int n) {
-        if (auto it = sid_.find(n); it != sid_.end()) return it->second;
+        // F-A: the gateway reaps a session silent for kDefaultSessionTimeoutNs (10 s).  A sid THIS harness left silent
+        // for half of that (a harness-observed cause, never product evidence) or that the broker said expired is
+        // reconnected - like the real client's stale-session Resuming - and counted.
+        constexpr auto kLeaseMargin = std::chrono::nanoseconds(rune::gateway::ClientGateway::kDefaultSessionTimeoutNs / 2);
+        if (auto it = sid_.find(n); it != sid_.end()) {
+            if (!reconnectSilent_ || (cl_.silentFor(it->second) < kLeaseMargin && !cl_.sessionExpired(it->second)))
+                return it->second;
+            std::fprintf(stderr, "[ rig ] n%d session %lld silent %lld ms%s: reconnecting\n", n,
+                         static_cast<long long>(it->second),
+                         static_cast<long long>(
+                             std::chrono::duration_cast<std::chrono::milliseconds>(cl_.silentFor(it->second)).count()),
+                         cl_.sessionExpired(it->second) ? " (broker: expired)" : "");
+            cl_.dropSession(it->second);
+            sid_.erase(it);
+            ++silentReconnects_;
+        }
         if (!c_.running(n)) return -1;
         for (const auto deadline = Clock::now() + 30s; Clock::now() < deadline;) {
             const int64_t s = cl_.connect(c_.clientChannel(n), kClientStream);
@@ -207,7 +247,11 @@ public:
         }
         return -1;
     }
-    void forget(int n) { sid_.erase(n); }
+    void forget(int n) {
+        if (auto it = sid_.find(n); it != sid_.end()) { cl_.dropSession(it->second); sid_.erase(it); }
+    }
+    /// F-A: how many cached sessions this Rig found silent past half the lease (or broker-expired) and reconnected.
+    [[nodiscard]] int silentReconnects() const noexcept { return silentReconnects_; }
     [[nodiscard]] int nodeOf(const std::string& channel) const {
         for (int n = 1; n <= 3; ++n) if (c_.clientChannel(n) == channel) return n;
         return -1;
@@ -219,6 +263,7 @@ public:
     int64_t sendOnly(int node, const Sender& s, RequestId rid) {
         const int64_t sid = session(node);
         if (sid <= 0) return 0;
+        silentAtSend_ = cl_.silentFor(sid);   // F-A: always < half the lease after session(); the no-answer message shows it
         lastCorr_ = s(cl_, c_.clientChannel(node), sid, rid);
         return lastCorr_;
     }
@@ -250,7 +295,10 @@ public:
             // silence from a RUNNING broker is the failure
             const int code = a.got ? a.code : ((inDoubt || !c_.running(cur)) ? cNotLeader : cNoAnswer);
             if (code == cNoAnswer) {
-                ADD_FAILURE() << "node " << cur << (corr == 0 ? " could not be sent the DDL" : " never answered the DDL (25 s)") << r.trace;
+                ADD_FAILURE() << "node " << cur << (corr == 0 ? " could not be sent the DDL" : " never answered the DDL (25 s)")
+                              << " (session silent before send: "
+                              << std::chrono::duration_cast<std::chrono::milliseconds>(silentAtSend_).count() << " ms)"
+                              << r.trace;
                 r.finalCode = cNoAnswer;
                 return r;
             }
@@ -316,13 +364,23 @@ public:
 
     // ── data: produce acks=all / subscribe from earliest THROUGH broker `node`'s client endpoint ──
     /// One produce attempt through `node`; the answer's code, or -1 (none); `redirect` = the Redirect's endpoint.
-    int produceOnce(int node, int32_t topicId, int p, const std::vector<uint8_t>& batch, std::string* redirect = nullptr) {
+    /// `ident` (diag-duplicate F1): sent idempotently with that identity (the batch must carry it too); null = pid -1
+    /// (the probes / warm-ups / late produces, which no exactly-once check reads).  `offset`: the OK ack's base offset.
+    int produceOnce(int node, int32_t topicId, int p, const std::vector<uint8_t>& batch, std::string* redirect = nullptr,
+                    const ProduceIdentity* ident = nullptr, int64_t* offset = nullptr) {
         const int64_t sid = session(node);
         if (sid <= 0) return -1;
         const int64_t corr = cl_.nextCorrelationId();
-        if (!cl_.produce(c_.clientChannel(node), kClientStream, sid, corr, topicId, p, /*acks=All*/1, batch)) return -1;
+        const bool sent = ident != nullptr
+            ? cl_.produceIdempotent(c_.clientChannel(node), kClientStream, sid, corr, topicId, p, /*acks=All*/1, ident->pid,
+                                    ident->epoch, ident->seq, batch)
+            : cl_.produce(c_.clientChannel(node), kClientStream, sid, corr, topicId, p, /*acks=All*/1, batch);
+        if (!sent) return -1;
         cl_.pollUntil([&] { return cl_.ackFor(corr).has_value() || errorFor_(corr) != nullptr; });
-        if (const auto ack = cl_.ackFor(corr)) return ack->errorCode;
+        if (const auto ack = cl_.ackFor(corr)) {
+            if (offset && ack->errorCode == 0) *offset = ack->baseOffset;
+            return ack->errorCode;
+        }
         if (const auto* e = errorFor_(corr)) { if (redirect) *redirect = e->message; return e->code; }
         return -1;
     }
@@ -338,13 +396,15 @@ public:
     }
     /// Produce through `node` until OK (a Redirect is followed one hop; the retriable answers are retried);
     /// `seen` collects every answer code.  false: not OK by `within` (or an answer never came).
+    /// diag-duplicate F1: every send of the record - the first, each Redirect hop, each retry after NotLeader / Internal -
+    /// carries the SAME bytes and identity (an in-doubt answer's retry is then a broker Duplicate, never a second record).
     bool produceFollowing(int node, int32_t topicId, int p, const std::vector<uint8_t>& batch, std::chrono::seconds within,
-                          std::vector<int>* seen = nullptr) {
+                          const ProduceIdentity& ident, std::vector<int>* seen = nullptr, int64_t* offset = nullptr) {
         for (const auto deadline = Clock::now() + within; Clock::now() < deadline;) {
             int cur = node;
             for (int hop = 0; hop < 3; ++hop) {
                 std::string redirect;
-                const int code = produceOnce(cur, topicId, p, batch, &redirect);
+                const int code = produceOnce(cur, topicId, p, batch, &redirect, &ident, offset);
                 if (seen) seen->push_back(code);
                 if (code == cOk) return true;
                 if (code == -1) { ADD_FAILURE() << "produce through node " << node << " topic " << topicId << " p" << p << ": no answer"; return false; }
@@ -455,7 +515,8 @@ public:
                 const std::string value = typed ? asString(characterValue(id, hpFor(n, name)))
                                                 : "v:" + cell + ":n" + std::to_string(n) + ":p" + std::to_string(p);
                 std::vector<int> seenCodes;
-                const bool accepted = produceFollowing(n, info->id, p, batchFor(typed, id, value), 60s, &seenCodes);
+                const ProduceIdentity ident = freshIdentity();   // diag-duplicate F1: one identity per logical record
+                const bool accepted = produceFollowing(n, info->id, p, batchFor(typed, id, value, ident), 60s, ident, &seenCodes);
                 produced << " n" << n << "p" << p << ":[";
                 for (int sc : seenCodes) produced << sc << ' ';
                 produced << ']';
@@ -611,6 +672,9 @@ private:
     uint64_t                  rid_ = 0;
     int64_t                   lastCorr_ = 0;
     bool                      placementHeld_ = false;
+    bool                      reconnectSilent_ = true;   ///< F-A guard (Rig::session)
+    int                       silentReconnects_ = 0;
+    std::chrono::nanoseconds  silentAtSend_{0};
 };
 
 // ── senders ─────────────────────────────────────────────────────────────────────────────────────
@@ -804,7 +868,7 @@ struct Perturbation {
 };
 
 /// The roles a cell resolved (after its precondition).
-struct CellRoles { int preLeader = -1, leader = -1, via = -1; };
+struct CellRoles { int preLeader = -1, leader = -1, via = -1; int silentReconnects = 0; };   ///< silentReconnects: F-A
 /// What a cell observed (for the seam tests).
 struct CellOutcome {
     CellResult  res;
@@ -826,6 +890,7 @@ struct CellSeams {
     bool                                               injectsStall = false;  ///< the seams stall a broker / the harness themselves
     bool                                               suppressTimingHook = false;   ///< T9: RestartMidApply's hook never acts
     std::function<void()>                              beforeBaseline;   ///< T10: runs right before the baseline snapshot
+    std::function<void(ThreeNodes&)>                   afterIsrShrink;   ///< F-A T-H3: runs inside the ISR wait's pump
 };
 
 /// SIGSTOP this whole process for `ms` from a forked child (async-signal-safe calls only), then wait for the child.
@@ -871,6 +936,10 @@ void runCell(const CellParam& param, const CellSeams& seams = {}, CellOutcome* o
     for (int id : (timing == cm::Timing::NewBrokerJoins ? std::vector<int>{1, 2} : std::vector<int>{1, 2, 3})) c.startNode(id);
     ASSERT_TRUE(c.awaitCatalogLeader(60s)) << cell;
     Rig rig(c);
+    // F-A: the reconnect count of the WHOLE cell reaches the outcome on every exit (a T-H3 zero means the cell itself kept
+    // every session alive - never the Rig's guard rescuing an unpumped wait).
+    struct ReconnectsOut { CellOutcome* o; Rig& r; ~ReconnectsOut() { if (o) o->roles.silentReconnects = r.silentReconnects(); } }
+        reconnectsOut{outcome, rig};
     const int preLeader = resolveLeader(c, 60s);   // for the PRECONDITION sends only
     ASSERT_GT(preLeader, 0);
 
@@ -918,13 +987,16 @@ void runCell(const CellParam& param, const CellSeams& seams = {}, CellOutcome* o
     // Every running broker has applied the precondition and publishes its DDL route before the cell starts.
     {
         std::string why;
-        ASSERT_TRUE(c.awaitCatalogDigestsEqual(60s, &why)) << cell << " precondition: " << why;
+        bool equal = false;
+        rig.pumping([&] { equal = c.awaitCatalogDigestsEqual(60s, &why); });   // F-A: the Rig's sessions stay alive
+        ASSERT_TRUE(equal) << cell << " precondition: " << why;
     }
     if (seams.afterPrecondition) seams.afterPrecondition(c, rig);
 
     // Slice Recipe 1: THE cell's leader is resolved NOW, after the precondition (under load the catalog leadership can move
     // during it); every role the cell acts on (via, victim, the hooks) derives from this value.
-    const int leader = resolveLeader(c, 60s);
+    int leader = -1;
+    rig.pumping([&] { leader = resolveLeader(c, 60s); });   // F-A: the Rig's sessions stay alive
     ASSERT_GT(leader, 0);
     Perturbation pert;
     pert.injectedStall = seams.injectsStall;
@@ -1004,7 +1076,12 @@ void runCell(const CellParam& param, const CellSeams& seams = {}, CellOutcome* o
         rig.forget(victim);
         {
             int isrLeader = -1;
-            ASSERT_TRUE(c.awaitCatalogIsrSize(2, 60s, &isrLeader)) << cell << ": the catalog leader's ISR never shrank to the 2 running brokers";
+            bool shrank = false;
+            // F-A: the ISR wait can take many seconds under a flapping leadership - the Rig's sessions stay alive through it
+            // (an unpumped 13 s wait let n2 reap the Rig's session; the next DDL on the dead sid had no reply channel).
+            rig.pumping([&] { shrank = c.awaitCatalogIsrSize(2, 60s, &isrLeader); });
+            if (seams.afterIsrShrink) rig.pumping([&] { seams.afterIsrShrink(c); });   // test seam (T-H3), inside the pump
+            ASSERT_TRUE(shrank) << cell << ": the catalog leader's ISR never shrank to the 2 running brokers";
             if (isrLeader != leader) { pert.leaderMovedInCell = true; pert.stampHarness(); }   // the topology moved between resolution and the shrink
         }
         hooks.afterSend = [&](int, int node) {
@@ -1242,7 +1319,7 @@ void runCell(const CellParam& param, const CellSeams& seams = {}, CellOutcome* o
         }
     }
     if (outcome) {
-        outcome->res = res; outcome->roles = CellRoles{preLeader, leader, via}; outcome->perturbedWhy = why;
+        outcome->res = res; outcome->roles = CellRoles{preLeader, leader, via, rig.silentReconnects()}; outcome->perturbedWhy = why;
         outcome->stallObserved = excusedByWatchdog; outcome->maxGapNs = maxGap; outcome->watchdogGapNs = watchdogAny;
         outcome->passBlocked = verdict == CellVerdict::SlowPass || verdict == CellVerdict::BlockingPass;
         if (after.nl.count(leader) && pert0.nl.count(leader)) outcome->belowMinIsrOnLeader = after.nl.at(leader).belowMinIsr - pert0.nl.at(leader).belowMinIsr;
@@ -1252,7 +1329,9 @@ void runCell(const CellParam& param, const CellSeams& seams = {}, CellOutcome* o
     // ── the timing's after-effects, then the identical-catalogs gate ───────────────────────────────
     if (timing == cm::Timing::LeaderChangeMidDdl) {
         if (crashedNode > 0) {   // (crashedNode <= 0: the timing never ran - judged above, a failure without a stall)
-            ASSERT_TRUE(c.awaitCatalogLeader(60s)) << cell << ": no catalog leader after the crash";
+            bool led = false;
+            rig.pumping([&] { led = c.awaitCatalogLeader(60s); });   // F-A: the Rig's sessions stay alive
+            ASSERT_TRUE(led) << cell << ": no catalog leader after the crash";
             rig.pumping([&] { c.startNode(crashedNode); });             // the crashed leader rejoins as a follower
             rig.forget(crashedNode);
         }
@@ -1261,7 +1340,9 @@ void runCell(const CellParam& param, const CellSeams& seams = {}, CellOutcome* o
     if (timing == cm::Timing::RestartMidApply && victim > 0) { rig.pumping([&] { c.startNode(victim); }); rig.forget(victim); }
     {
         std::string why2;
-        ASSERT_TRUE(c.awaitCatalogDigestsEqual(90s, &why2)) << cell << ": identical catalogs on every broker: " << why2;
+        bool equal = false;
+        rig.pumping([&] { equal = c.awaitCatalogDigestsEqual(90s, &why2); });   // F-A: the Rig's sessions stay alive
+        ASSERT_TRUE(equal) << cell << ": identical catalogs on every broker: " << why2;
     }
     EXPECT_EQ(c.countEventsWithRequestId(res.rid), 1u) << cell << ": exactly one event per requestId, on every broker";
 
@@ -1371,12 +1452,16 @@ void moveLeader(ThreeNodes& c, Rig& rig, MovedLeader& m) {
     ASSERT_GT(m.old, 0);
     rig.pumping([&] { c.stop(m.old); });
     rig.forget(m.old);
-    ASSERT_TRUE(c.awaitCatalogLeaderOtherThan(m.old, 60s));
+    bool ok = false;
+    rig.pumping([&] { ok = c.awaitCatalogLeaderOtherThan(m.old, 60s); });   // F-A: every wait keeps the Rig's sessions alive
+    ASSERT_TRUE(ok);
     rig.pumping([&] { c.startNode(m.old); });
     rig.forget(m.old);
     std::string why;
-    ASSERT_TRUE(c.awaitCatalogDigestsEqual(60s, &why)) << why;
-    ASSERT_TRUE(c.awaitCatalogLeader(60s));
+    rig.pumping([&] { ok = c.awaitCatalogDigestsEqual(60s, &why); });
+    ASSERT_TRUE(ok) << why;
+    rig.pumping([&] { ok = c.awaitCatalogLeader(60s); });
+    ASSERT_TRUE(ok);
     m.moved = c.settledLeader();
 }
 }  // namespace
@@ -1855,9 +1940,11 @@ TEST(CatalogClusterRegression, GetViewRowThroughEveryBrokerAnswersTheRowNeverAbs
     const auto vi = rig.topicInfo(leader, "v", 30s);
     ASSERT_TRUE(vi.has_value());
     const std::pair<int64_t, int64_t> rows[] = {{101, 7}, {201, 8}, {301, 9}};
-    for (const auto& [id, hp] : rows)
-        ASSERT_TRUE(rig.produceFollowing(leader, si->id, 0, batchFor(true, id, asString(characterValue(id, hp))), 60s))
+    for (const auto& [id, hp] : rows) {
+        const ProduceIdentity ident = freshIdentity();   // diag-duplicate F1
+        ASSERT_TRUE(rig.produceFollowing(leader, si->id, 0, batchFor(true, id, asString(characterValue(id, hp)), ident), 60s, ident))
             << "record " << id << " was never acked";
+    }
     int folder = -1;
     for (const auto deadline = Clock::now() + 30s; Clock::now() < deadline && folder < 0;) {
         folder = rig.partitionLeader(leader, si->id, 0);
@@ -2100,4 +2187,137 @@ TEST(CatalogClusterRegression, NewCatalogLeaderRefusesDdlUntilCaughtUpRegression
     rig.pumping([&] { c.startNode(L); });
     ASSERT_TRUE(c.awaitCatalogDigestsEqual(90s, &why)) << why;
     EXPECT_EQ(c.countEventsWithRequestId(Ry), 1u);
+}
+
+// ===========================================================================
+// F-A (2026-10-16): "node 2 never answered the DDL (25 s)" was the HARNESS - an unpumped test-thread wait longer than the
+// gateway lease (10 s) let the broker reap the Rig's session, and the Rig then sent the DDL on the dead sid (no reply
+// channel: the frame could only be dropped).  The Rig now reconnects a session IT left silent past half the lease (a
+// harness-observed cause), the cell's waits keep the sessions alive, and the broker's reap tells the client.
+// ===========================================================================
+namespace {
+/// The lease-test setup: a settled cluster, a ready topic, a warm session on a follower whose probe DDL is answered.
+struct LeaseRig {
+    ThreeNodes c;
+    std::unique_ptr<Rig> rig;
+    int via = -1;
+    int64_t sid0 = 0;
+    explicit LeaseRig(const std::string& tag) : c(ThreeNodes::start(tag)) {}
+    void setUp(bool reconnectSilent = true) {
+        ASSERT_TRUE(c.awaitCatalogLeader(60s));
+        rig = std::make_unique<Rig>(c, reconnectSilent);
+        const int L = c.settledLeader();
+        ASSERT_GT(L, 0);
+        ASSERT_NO_FATAL_FAILURE(rig->must(defineSender("ready", 1, true), "define", L));
+        for (int n : c.runningNodes()) if (n != L) { via = n; break; }
+        ASSERT_GT(via, 0);
+        bool answered = false;
+        for (const auto deadline = Clock::now() + 60s; Clock::now() < deadline && !answered;) {
+            const Answer a = rig->await(rig->sendOnly(via, dropSender("no_such"), rig->freshRid_()), 10s);
+            answered = a.got && (a.code == cRedirect || a.code == cUnknown);
+            if (!answered) std::this_thread::sleep_for(100ms);
+        }
+        ASSERT_TRUE(answered) << "precondition: the via broker answers the probe";
+        sid0 = rig->session(via);
+        ASSERT_GT(sid0, 0);
+    }
+    uint64_t unanswerable() {
+        return c.node(via).onControlThreadForTest([this] { return c.node(via).gatewayForTest()->unanswerableFramesForTest(); });
+    }
+};
+}  // namespace
+
+// T-H1 (Recipe 2): the repro.  RED (Rig::session returns the cached sid unconditionally): no answer, unanswerable +1.
+TEST(CatalogClusterRegression, RigReconnectsASessionItLeftSilentPastTheLeaseRegression) {
+    LeaseRig g("silentlease");
+    ASSERT_NO_FATAL_FAILURE(g.setUp());
+    const uint64_t u0 = g.unanswerable();
+    std::this_thread::sleep_for(11s);   // like an unpumped ISR wait: no Keepalive leaves this client
+    const Answer a = g.rig->await(g.rig->sendOnly(g.via, dropSender("no_such"), g.rig->freshRid_()), 10s);
+    ASSERT_TRUE(a.got) << "the probe after a silent wait was never answered (sent on the reaped session)";
+    EXPECT_TRUE(a.code == cRedirect || a.code == cUnknown) << a.code;
+    EXPECT_EQ(g.rig->silentReconnects(), 1);
+    EXPECT_NE(g.rig->session(g.via), g.sid0);
+    EXPECT_EQ(g.unanswerable(), u0) << "a frame was sent on the dead session";
+}
+
+// T-H2 (Recipe 2, negative): a session kept alive across a long wait is never churned.  RED (kLeaseMargin = 0).
+TEST(CatalogClusterRegression, RigKeepsAPumpedSessionAcrossALongWaitRegression) {
+    LeaseRig g("pumpedlease");
+    ASSERT_NO_FATAL_FAILURE(g.setUp());
+    g.rig->pumping([] { std::this_thread::sleep_for(11s); });
+    const Answer a = g.rig->await(g.rig->sendOnly(g.via, dropSender("no_such"), g.rig->freshRid_()), 10s);
+    ASSERT_TRUE(a.got);
+    EXPECT_TRUE(a.code == cRedirect || a.code == cUnknown) << a.code;
+    EXPECT_EQ(g.rig->silentReconnects(), 0);
+    EXPECT_EQ(g.rig->session(g.via), g.sid0);
+}
+
+// T-P2 (Recipe 3, end to end): a reachable client that went quiet (its runtime runs, it sends nothing) is TOLD its session
+// expired.  The Rig's guard is off (it must see the broker's own notice).  RED (reapExpired closes silently): never told.
+TEST(CatalogClusterRegression, ReapedSessionIsToldSessionExpiredOnTheWireRegression) {
+    LeaseRig g("toldexpired");
+    ASSERT_NO_FATAL_FAILURE(g.setUp(/*reconnectSilent=*/false));
+    g.rig->cl().keepSessionsAlive(false);   // quiet: no Keepalive - the Aeron runtime and the egress poll keep running
+    g.rig->pumping([] { std::this_thread::sleep_for(12s); });
+    EXPECT_TRUE(g.rig->cl().pollUntil([&] { return g.rig->cl().sessionExpired(g.sid0); }))
+        << "the lease reap closed the session silently";
+}
+
+// T-H3 (Recipe 1): RestartMidApply's ISR wait (13 s in F-A, modelled by an 11 s seam inside it) keeps the cell's sessions
+// alive by itself - zero reconnects proves it was not the Rig's guard rescuing it.  RED (the ISR wait + seam outside
+// rig.pumping): silentReconnects == 1 (with the guard also reverted: "never answered", exactly as in F-A).
+TEST(CatalogClusterRegression, RestartMidApplyIsrWaitKeepsTheCellSessionsAliveRegression) {
+    CellSeams seams;
+    seams.afterIsrShrink = [](ThreeNodes&) { std::this_thread::sleep_for(11s); };
+    CellOutcome out;
+    runCell(CellParam{cm::Kind::DropTopic, cm::Timing::RestartMidApply, 0}, seams, &out);
+    ASSERT_FALSE(::testing::Test::HasFailure());
+    EXPECT_EQ(out.res.trace.find("no answer"), std::string::npos) << out.res.trace;
+    EXPECT_EQ(out.roles.silentReconnects, 0) << "an unpumped wait in the cell let a session go silent past half the lease";
+}
+
+// ===========================================================================
+// diag-duplicate F1 (2026-10-16): an acks=all NotLeader is IN DOUBT (the batch may be in the log and commit when leadership
+// comes back); the slice's data-check records are produced idempotently, so the retry of an in-doubt answer is the broker's
+// Duplicate (the original offset), never a second record.  RED (produceOnce ignores the identity: pid -1): two records.
+// ===========================================================================
+TEST(CatalogClusterRegression, SliceDataCheckRetryOfAnInDoubtProduceIsDeduplicatedRegression) {
+    ThreeNodes c = ThreeNodes::start("dupretry");
+    ASSERT_TRUE(c.awaitCatalogLeader(60s));
+    Rig rig(c);
+    const int L = c.settledLeader();
+    ASSERT_GT(L, 0);
+    for (const uint8_t persistence : {uint8_t{0}, uint8_t{1}}) {   // disk, transient
+        const std::string name = persistence == 0 ? "dup" : "dup_t";
+        SCOPED_TRACE(name);
+        const Sender define = [=](ShardTestClient& cl, const std::string& ch, int64_t sid, RequestId rid) {
+            return cl.sendDefineTopic(ch, kClientStream, sid, name, 1, charBlob(), persistence, rid);
+        };
+        ASSERT_NO_FATAL_FAILURE(rig.must(define, "define", L));
+        const auto ti = rig.topicInfo(L, name, 60s);
+        ASSERT_TRUE(ti.has_value());
+        const ProduceIdentity ident = freshIdentity();
+        const auto b = batchFor(true, 1, "x", ident);
+        int64_t o1 = -1, o2 = -1;
+        int leaderOfP0 = -1;
+        for (const auto deadline = Clock::now() + 30s; Clock::now() < deadline && leaderOfP0 < 0;) {
+            leaderOfP0 = rig.partitionLeader(L, ti->id, 0);
+            if (leaderOfP0 < 0) std::this_thread::sleep_for(50ms);
+        }
+        ASSERT_GT(leaderOfP0, 0);
+        ASSERT_TRUE(rig.produceFollowing(leaderOfP0, ti->id, 0, b, 30s, ident, nullptr, &o1));
+        // The in-doubt retry: the same bytes and identity again (as after a NotLeader whose batch had been appended).
+        int code = -1;
+        for (const auto deadline = Clock::now() + 30s; Clock::now() < deadline;) {
+            code = rig.produceOnce(leaderOfP0, ti->id, 0, b, nullptr, &ident, &o2);
+            if (code == cOk) break;
+            std::this_thread::sleep_for(50ms);
+        }
+        EXPECT_EQ(code, cOk);
+        EXPECT_EQ(o2, o1) << "the retry was stored as a new record, not answered with the original offset";
+        std::string why;
+        const auto got = rig.readAll(L, ti->id, 0, 1, 10s, &why);
+        EXPECT_EQ(got.size(), 1u) << "the retried record is stored " << got.size() << " times" << why;
+    }
 }

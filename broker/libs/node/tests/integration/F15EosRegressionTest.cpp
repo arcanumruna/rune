@@ -4374,6 +4374,134 @@ TEST(WorkerPsmRegression, AcksAllDuplicateOfTruncatedOriginalNeverOk) {
     EXPECT_EQ(R.r->log()->logEndOffset(), 2);
 }
 
+// diag-duplicate F2 (2026-10-16): an acks=all NotLeader is IN DOUBT, never "not committed" - the parked batch is already
+// in the log and commits if leadership comes back to a replica holding it.  Kafka parity: the retry with the same
+// pid / epoch / seq is the broker's Duplicate with the ORIGINAL offset, on every path that keeps the record.
+TEST(WorkerPsmRegression, AcksAllNotLeaderThenLeadershipBackRetryIsDuplicateWithOriginalOffsetRegression) {
+    LegacyAcksRig R({1, 2});
+    produceLegacy(R, 1, /*acks=all*/1, 7, 0, 0);
+    R.runWorker();
+    ASSERT_EQ(R.r->log()->logEndOffset(), 1);
+    const int32_t e0 = R.r->epoch();
+    R.r->becomeFollower(e0 + 1, 2);
+    for (int i = 0; i < 4 && R.answers.empty(); ++i) R.runWorker();
+    ASSERT_EQ(R.answers.size(), 1u);
+    ASSERT_EQ(R.answers[0].code, kNotLeader) << "precondition: the parked original is answered in doubt";
+    R.r->becomeLeader(e0 + 2, {1});                           // leadership back, the log intact
+    ASSERT_TRUE(runUntilRcReady(R));
+    produceLegacy(R, 2, 1, 7, 0, 0);                          // the client's retry, same identity
+    for (int i = 0; i < 16 && R.answers.size() < 2; ++i) R.runWorker();
+    ASSERT_EQ(R.answers.size(), 2u);
+    EXPECT_EQ(R.answers[1].code, 0);
+    EXPECT_EQ(R.answers[1].base, 0) << "the retry was not answered with the original offset";
+    EXPECT_EQ(R.r->log()->logEndOffset(), 1) << "the in-doubt retry was stored twice";
+}
+
+// The contract's other side: a retry WITHOUT a producer id after an in-doubt NotLeader is stored twice - the broker
+// cannot know it is a retry.  Pins the layer: "fixing" the NotLeader answer instead (e.g. truncating on demotion) turns
+// this RED.  (diag-duplicate: the slice's data check sent exactly this and saw two records.)
+TEST(WorkerPsmRegression, NonIdempotentRetryAfterAnInDoubtNotLeaderIsStoredTwiceRegression) {
+    LegacyAcksRig R({1, 2});
+    R.produceAll(1);
+    R.runWorker();
+    ASSERT_EQ(R.r->log()->logEndOffset(), 1);
+    const int32_t e0 = R.r->epoch();
+    R.r->becomeFollower(e0 + 1, 2);
+    for (int i = 0; i < 4 && R.answers.empty(); ++i) R.runWorker();
+    ASSERT_EQ(R.answers.size(), 1u);
+    ASSERT_EQ(R.answers[0].code, kNotLeader);
+    R.r->becomeLeader(e0 + 2, {1});
+    ASSERT_TRUE(runUntilRcReady(R));
+    R.produceAll(2);
+    for (int i = 0; i < 16 && R.answers.size() < 2; ++i) R.runWorker();
+    ASSERT_EQ(R.answers.size(), 2u);
+    EXPECT_EQ(R.answers[1].code, 0);
+    EXPECT_EQ(R.r->log()->logEndOffset(), 2) << "the in-doubt original was not kept (NotLeader is in doubt, not 'not appended')";
+}
+
+TEST(WorkerPsmRegression, RetryOnAPromotedReplicaHoldingTheOriginalIsDuplicateRegression) {
+    LegacyAcksRig R({1});
+    const int32_t e0 = R.r->epoch();
+    R.r->becomeFollower(e0 + 1, 2);
+    refetch(*R.r, rebased(idemBatch(7, 0, 0), 0), /*leaderHw=*/0);   // replicated from the old leader, not committed
+    ASSERT_EQ(R.r->log()->logEndOffset(), 1);
+    R.r->becomeLeader(e0 + 2, {1});                                  // failover to this replica
+    ASSERT_TRUE(runUntilRcReady(R));
+    produceLegacy(R, 2, 1, 7, 0, 0);                                 // the client's retry after its in-doubt answer
+    for (int i = 0; i < 16 && R.answers.empty(); ++i) R.runWorker();
+    ASSERT_EQ(R.answers.size(), 1u);
+    EXPECT_EQ(R.answers[0].code, 0);
+    EXPECT_EQ(R.answers[0].base, 0);
+    EXPECT_EQ(R.r->log()->logEndOffset(), 1) << "the retry on the promoted replica was stored twice";
+}
+
+TEST(WorkerPsmRegression, TransientNotLeaderThenBackRetryIsDuplicateRegression) {
+    rune::storage::InMemoryLog mlog(1 << 20, 10000);
+    NullTransport t;
+    PartitionReplica rep(cfg(1), Role::Leader, 1, {1, 2}, {1, 2}, &mlog, &t);
+    Worker w(0, 1 << 16, 1 << 16, 64, 64);
+    w.setOwnedDirect(Worker::OwnedSet{&rep});
+    w.setWorkerIngress(nullptr, true);
+    int64_t now = 1;
+    for (int i = 0; i < 256 && w.rcStatusForTest(1, 0) != Worker::kRcReady; ++i) w.doWork(++now);
+    ASSERT_EQ(w.rcStatusForTest(1, 0), Worker::kRcReady);
+    const auto f1 = produceFrame(1, 9, idemBatch(7, 0, 0), /*acks=all*/1, 1, 0, 7, 0, 0);
+    ASSERT_EQ(w.handleIngressFrameForTest(f1.data(), f1.size(), ++now), 1);
+    ASSERT_EQ(mlog.logEndOffset(), 1);
+    rep.becomeFollower(2, 2);
+    std::vector<WorkerReturn> rets;
+    for (int i = 0; i < 4 && rets.empty(); ++i) { w.doWork(++now); for (auto& r : drainAll(w)) rets.push_back(r); }
+    ASSERT_EQ(rets.size(), 1u);
+    ASSERT_EQ(rets[0].errorCode, kNotLeader) << "precondition: the parked original is answered in doubt";
+    rep.becomeLeader(3, {1});
+    for (int i = 0; i < 256 && w.rcStatusForTest(1, 0) != Worker::kRcReady; ++i) w.doWork(++now);
+    ASSERT_EQ(w.rcStatusForTest(1, 0), Worker::kRcReady);
+    const auto f2 = produceFrame(1, 10, idemBatch(7, 0, 0), 1, 1, 0, 7, 0, 0);
+    (void)w.handleIngressFrameForTest(f2.data(), f2.size(), ++now);
+    rets.clear();
+    for (int i = 0; i < 16 && rets.empty(); ++i) { w.doWork(++now); for (auto& r : drainAll(w)) rets.push_back(r); }
+    ASSERT_EQ(rets.size(), 1u);
+    EXPECT_EQ(rets[0].errorCode, 0);
+    EXPECT_EQ(rets[0].baseOffset, 0);
+    EXPECT_EQ(mlog.logEndOffset(), 1) << "the transient in-doubt retry was stored twice";
+}
+
+TEST(WorkerPsmRegression, RetryAfterRestartIsDuplicateRegression) {
+    TmpDir d;
+    {
+        Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+        NullTransport t;
+        PartitionReplica rep(cfg(1), Role::Leader, 1, {1, 2}, {1, 2}, &log, &t);
+        Worker w(0, 1 << 16, 1 << 16, 64, 64);
+        w.setOwnedDirect(Worker::OwnedSet{&rep});
+        w.setWorkerIngress(nullptr, true);
+        int64_t now = 1;
+        for (int i = 0; i < 256 && w.rcStatusForTest(1, 0) != Worker::kRcReady; ++i) w.doWork(++now);
+        ASSERT_EQ(w.rcStatusForTest(1, 0), Worker::kRcReady);
+        const auto f = produceFrame(1, 9, idemBatch(7, 0, 0), /*acks=all*/1, 1, 0, 7, 0, 0);
+        ASSERT_EQ(w.handleIngressFrameForTest(f.data(), f.size(), ++now), 1);
+        ASSERT_EQ(log.logEndOffset(), 1);
+    }   // the broker dies with the answer owed (in doubt)
+    Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+    ASSERT_EQ(log.logEndOffset(), 1) << "precondition: the original survived the restart";
+    NullTransport t;
+    PartitionReplica rep(cfg(1), Role::Leader, 2, {1}, {1}, &log, &t);
+    Worker w(0, 1 << 16, 1 << 16, 64, 64);
+    w.setOwnedDirect(Worker::OwnedSet{&rep});
+    w.setWorkerIngress(nullptr, true);
+    int64_t now = 1;
+    for (int i = 0; i < 256 && w.rcStatusForTest(1, 0) != Worker::kRcReady; ++i) w.doWork(++now);
+    ASSERT_EQ(w.rcStatusForTest(1, 0), Worker::kRcReady);
+    const auto f = produceFrame(1, 10, idemBatch(7, 0, 0), 1, 1, 0, 7, 0, 0);
+    (void)w.handleIngressFrameForTest(f.data(), f.size(), ++now);
+    std::vector<WorkerReturn> rets;
+    for (int i = 0; i < 16 && rets.empty(); ++i) { w.doWork(++now); for (auto& r : drainAll(w)) rets.push_back(r); }
+    ASSERT_EQ(rets.size(), 1u);
+    EXPECT_EQ(rets[0].errorCode, 0);
+    EXPECT_EQ(rets[0].baseOffset, 0);
+    EXPECT_EQ(log.logEndOffset(), 1) << "the retry after a restart was stored twice";
+}
+
 TEST(WorkerPsmRegression, StrictRetryAfterDemotionMidFsyncIsNeverDuplicateOk) {
     // Re-review 2: a Strict batch whose fsync completes after the leader was
     // demoted is failed NotLeader; its retry must not be answered

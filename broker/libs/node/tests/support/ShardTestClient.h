@@ -28,6 +28,7 @@
 #include <filesystem>
 #include <future>
 #include <map>
+#include <set>
 #include <memory>
 #include <optional>
 #include <random>
@@ -101,6 +102,21 @@ public:
     /// rely on the gateway's lease.
     void keepSessionsAlive(bool on) noexcept { keepalive_ = on; }
 
+    /// F-A: how long THIS client has sent nothing on `sid` (since its connect / its last offered Keepalive);
+    /// max() if this client does not keep `sid`.  A harness-observed cause, never product evidence.
+    [[nodiscard]] std::chrono::nanoseconds silentFor(int64_t sid) const {
+        for (const auto& cs : sessions_)
+            if (cs.sessionId == sid) return std::chrono::steady_clock::now() - cs.lastSent;
+        return std::chrono::nanoseconds::max();
+    }
+    /// F-A: the broker told this client that `sid` expired (SessionExpired / UnknownSession).
+    [[nodiscard]] bool sessionExpired(int64_t sid) const { return expired_.count(sid) != 0; }
+    /// F-A: stop keeping `sid` alive (the caller reconnects / forgot it).
+    void dropSession(int64_t sid) {
+        std::erase_if(sessions_, [sid](const ConnectedSession& cs) { return cs.sessionId == sid; });
+        expired_.erase(sid);
+    }
+
     /// Run a blocking call (a node's controlledShutdown / stop) on another
     /// thread while THIS thread keeps pumping the client (keepalives, egress):
     /// a real client's runtime keeps running while the broker does work.
@@ -141,7 +157,7 @@ public:
         if (!send(gatewayChannel, stream, buf.data(), len, deadline)) return -1;
         for (int i = 0; i < kMaxIters && !connect_ && std::chrono::steady_clock::now() < deadline; ++i) { poll_(); pause_(); }
         if (!connect_ || connect_->code != 0) return -1;
-        sessions_.push_back({gatewayChannel, stream, connect_->assignedSessionId});
+        sessions_.push_back({gatewayChannel, stream, connect_->assignedSessionId, std::chrono::steady_clock::now()});
         return connect_->assignedSessionId;
     }
 
@@ -818,14 +834,14 @@ private:
         const auto now = std::chrono::steady_clock::now();
         if (now < nextKeepalive_) return;
         nextKeepalive_ = now + std::chrono::seconds{1};
-        for (const auto& [channel, stream, sid] : sessions_) {
-            auto it = pubs_.find({channel, stream});
+        for (auto& cs : sessions_) {
+            auto it = pubs_.find({cs.channel, cs.stream});
             if (it == pubs_.end() || !it->second) continue;
-            pc::Keepalive k; k.sessionId = sid; k.correlationId = ++corr_;
+            pc::Keepalive k; k.sessionId = cs.sessionId; k.correlationId = ++corr_;
             uint8_t buf[pc::Keepalive::ENCODED_SIZE];
             const std::size_t len = k.encode(buf);
             aeron::concurrent::AtomicBuffer ab(buf, static_cast<aeron::util::index_t>(len));
-            (void)it->second->offer(ab, 0, static_cast<aeron::util::index_t>(len));
+            if (it->second->offer(ab, 0, static_cast<aeron::util::index_t>(len)) > 0) cs.lastSent = now;   // F-A
         }
     }
 
@@ -906,8 +922,13 @@ private:
                         fetches_[r->correlationId] = {r->results[0].offset, r->results[0].errorCode};
                 break;
             case pc::TemplateId::ErrorResponse:
-                if (auto e = pc::ErrorResponse::decode(p, n))
+                if (auto e = pc::ErrorResponse::decode(p, n)) {
                     errors_.push_back({e->correlationId, e->code, std::string(e->message)});
+                    // F-A: the broker said this session is gone (the reap's notice / an UnknownSession answer).
+                    if (e->code == static_cast<int16_t>(pc::ErrorCode::SessionExpired) ||
+                        e->code == static_cast<int16_t>(pc::ErrorCode::UnknownSession))
+                        expired_.insert(e->sessionId);
+                }
                 break;
             case pc::TemplateId::DdlResponse:
                 if (auto r = pc::DdlResponse::decode(p, n))
@@ -926,7 +947,9 @@ private:
     std::shared_ptr<aeron::Aeron>                    aeron_;
     std::string                                      egressChannel_;
     bool                                             keepalive_ = false;   // keepSessionsAlive
-    struct ConnectedSession { std::string channel; int32_t stream; int64_t sessionId; };
+    /// lastSent (F-A): connect, or the last Keepalive whose offer was accepted - THIS client's own send gap.
+    struct ConnectedSession { std::string channel; int32_t stream; int64_t sessionId;
+                              std::chrono::steady_clock::time_point lastSent; };
     std::vector<ConnectedSession>                    sessions_;
     std::chrono::steady_clock::time_point            nextKeepalive_{};
     std::shared_ptr<aeron::Subscription>             egress_;
@@ -959,6 +982,7 @@ private:
     std::optional<std::vector<PartitionInfo>>       metadata_;
     std::vector<PushedRecords>                      records_;
     std::vector<ErrorSeen>                          errors_;
+    std::set<int64_t>                               expired_;   // F-A: sessions the broker declared expired
     int64_t                                         corr_ = 0;
 };
 
