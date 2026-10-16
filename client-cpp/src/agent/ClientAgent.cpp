@@ -722,7 +722,7 @@ bool ClientAgent::retarget(const std::string& newIngressChannel) noexcept {
     return moved;
 }
 
-bool ClientAgent::failoverSeedTo(const std::string& channel, int64_t nowNs) noexcept {
+bool ClientAgent::failoverSeedTo(const std::string& channel, int64_t nowNs, bool connectNow) noexcept {
     if (failed_ || channel.empty()) return false;
     try {
         if (transport_.ingressChannel() != channel) {
@@ -737,7 +737,7 @@ bool ClientAgent::failoverSeedTo(const std::string& channel, int64_t nowNs) noex
     }
     // A fresh session there (resetting the old broker session id: that broker
     // is gone, a resume hint would only cost the new one a SessionExpired).
-    seedSession().machine.forceReconnect(nowNs);
+    if (connectNow) seedSession().machine.forceReconnect(nowNs);
     return true;
 }
 
@@ -1266,7 +1266,11 @@ bool ClientAgent::setRoute(int32_t topicId, int32_t partition, const std::string
                            const std::string& dataChannel) noexcept {
     const int64_t  key  = routeKey(topicId, partition);
     const uint32_t idx  = routeIndex_.find(key);
-    const std::string& seed = seedSession().endpoint;
+    // Fix round 1 (C1): where the seed's default publication PHYSICALLY points —
+    // never its bootstrap identity.  Invariant: a partition has no route entry iff
+    // its leader is the broker every no-route offer reaches (offerProduceToLeader_'s
+    // default branch, leaderSessionIndex -> 0, hasRoute false -> the seed).
+    const std::string& seed = transport_.ingressChannel();
     const bool isDefault = (sessionEndpoint.empty() || sameEndpoint(sessionEndpoint, seed)) &&
                            (dataChannel.empty() || sameEndpoint(dataChannel, seed));
     if (isDefault) {

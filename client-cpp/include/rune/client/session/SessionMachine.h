@@ -293,6 +293,17 @@ public:
     /// client's own liveness check (response timeout / own stall) — the session
     /// is treated as lost, exactly as if the broker had sent SessionExpired.
     [[nodiscard]] uint64_t staleSessionLosses() const noexcept { return staleSessionLosses_; }
+    /// DR client bugs fix round 1 (M1): the subset of staleSessionLosses() caused
+    /// by the CLIENT's own stall (a tick gap > responseTimeoutNs) — the broker
+    /// was not shown dead.
+    [[nodiscard]] uint64_t ownStallLosses() const noexcept { return ownStallLosses_; }
+    /// DR client bugs fix round 1 (I2): the error code of the latest connect
+    /// attempt refused by the broker (0 = none since the last ConnectResponse{OK}).
+    [[nodiscard]] int16_t lastConnectError() const noexcept { return lastConnectError_; }
+    /// Retrying cannot change these answers (public for the owner's failover).
+    [[nodiscard]] static bool nonRetriableConnectError(int16_t code) noexcept {
+        return isNonRetriable_(static_cast<rune::protocol::client::ErrorCode>(static_cast<uint16_t>(code)));
+    }
     /// Backoff state: injected-clock time of the next attempt.
     [[nodiscard]] int64_t nextAttemptNs()  const noexcept { return backoff_.nextAttemptNs; }
     /// Rejected state: the non-retriable error code (0 otherwise).
@@ -631,6 +642,7 @@ public:
         lastTickNs_ = nowNs;
         if (ownStall && state_ == SessionState::Connected) [[unlikely]] {
             ++staleSessionLosses_;
+            ++ownStallLosses_;   // M1: the client stalled, not the broker
             transitionTo(SessionState::Resuming);
             resumeEntryNs_ = nowNs;
             return;
@@ -857,6 +869,7 @@ private:
         resumeRetryCount_    = 0;
         everLive_            = true;   // T15a R1 latch
         backoff_             = {};
+        lastConnectError_    = 0;      // I2: refused attempts are history now
         transitionTo(SessionState::Connected);
     }
 
@@ -869,6 +882,7 @@ private:
         hsBytes_.clear();
         rejectCode_ = static_cast<int16_t>(
             static_cast<uint16_t>(rune::protocol::client::ErrorCode::HandshakeFailed));
+        lastConnectError_ = rejectCode_;   // I2
         transitionTo(SessionState::Rejected);
     }
 
@@ -971,6 +985,7 @@ private:
     /// OK nor a redirect.
     void onConnectError_(rune::protocol::client::ErrorCode ec, int64_t nowNs) noexcept {
         namespace rpc = rune::protocol::client;
+        lastConnectError_ = static_cast<int16_t>(static_cast<uint16_t>(ec));   // I2
         ++connectFailures_;
         if (!cfg_.reconnectForeverAfterLive) {
             transitionTo(SessionState::Disconnected);  // today's behaviour, unchanged
@@ -1095,7 +1110,9 @@ private:
     int64_t resumeEntryNs_       = 0;  // FIX D: timestamp when Resuming was entered
     // DR-BUG-2: fast-retry state for the connect path.
     uint64_t connectFailures_ = 0;   // DR-7: see connectFailures()
-    uint64_t staleSessionLosses_ = 0;   // fix round 4: see staleSessionLosses()
+    uint64_t staleSessionLosses_ = 0;
+    uint64_t ownStallLosses_     = 0;   // M1: see ownStallLosses()
+    int16_t  lastConnectError_   = 0;   // I2: see lastConnectError()   // fix round 4: see staleSessionLosses()
     int64_t lastConnectSentNs_   = 0;  // when the last ConnectRequest was offered
     bool    connectSentOk_       = false; // true if the last offer() succeeded
 

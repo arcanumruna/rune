@@ -178,14 +178,7 @@ Client::Client(ClientConfig cfg)
     // Task 1.4 (multi-node redirect convergence): fired on the agent thread when a
     // partition-leader session reaches Connected.  Re-offer every in-flight frame
     // through its partition route.  Cold path (connect event), unchanged.
-    agent_.setProduceResendFn([this]() {
-        (void)routeBufferedAcks_();  // acks earlier in this poll first: never resend an acked batch
-        producer::ProducerImpl::SendFn sendFn =
-            [this](int32_t t, int32_t p, int32_t sid, const uint8_t* fb, std::size_t fl) -> bool {
-                return agent_.offerToPartition(t, p, sid, fb, fl);
-            };
-        producerHub_.resendAllViaRoute(sendFn);
-    });
+    agent_.setProduceResendFn([this]() { resendAllInFlightViaRoute_(); });
 
     // Shared-nothing producer registration: the duty-cycle thread drains a
     // kMsgRegisterProducer command and lands here, adopting the producer into the
@@ -409,17 +402,22 @@ void Client::close() {
     // run): the WHOLE drain phase — this queue's registration, the drain
     // command's issue, the wait for its answer — is bounded by ONE deadline,
     // ClientConfig::closeTimeoutMs.  Each of those steps needs the duty thread
-    // to read the command ring; anything that keeps a command from being read
-    // (a refused frame held at the ring head, a wedged duty step, a producer
-    // drain that never settles) used to wait 100 years here.  At the deadline
-    // the teardown below runs anyway: every pending operation — each producer's
-    // unsent / unacknowledged record, the drain token, every control op —
-    // completes exactly once (Closed), and close() returns.
+    // to read the command ring and settle the drain; anything that keeps a
+    // command unread (a refused frame held at the ring head) or the drain
+    // unsettled (a producer drain that never completes) used to wait 100 years
+    // here.  At the deadline the teardown below runs anyway: every pending
+    // operation — each producer's unsent / unacknowledged record, the drain
+    // token, every control op — completes exactly once (Closed), and close()
+    // returns.  (Not bounded: a duty cycle that never RETURNS — e.g. a user
+    // callback blocking the runner — still holds the runner join below.)
     if (agent_.commandRingClosed()) {
         closeImpl_();
         return;
     }
-    const int64_t closeMs  = cfg_.closeTimeoutMs > 0 ? cfg_.closeTimeoutMs : kDefaultCloseTimeoutMs;
+    // Fix round 1 (I5): <= 0 = the default; clamped to one year (never "forever":
+    // now + an int64-overflowing duration would be a deadline in the PAST).
+    const int64_t closeMs  = cfg_.closeTimeoutMs <= 0 ? kDefaultCloseTimeoutMs
+                                                      : std::min<int64_t>(cfg_.closeTimeoutMs, kMaxCloseTimeoutMs);
     const auto    deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(closeMs);
     CompletionsConfig qc;                       // as andWait_'s queue
     qc.maxResultBytes = qc.maxErrorText;
@@ -461,14 +459,14 @@ void Client::close() {
         // teardown below completes everything, as before.)
         drained = agent_.commandRingClosed();
     }
-    if (!drained && !agent_.commandRingClosed()) {
+    const bool deadlineHit = !drained && !agent_.commandRingClosed();
+    if (deadlineHit) {
         std::fprintf(stderr,
                      "rune-client: close(): the drain did not finish within closeTimeoutMs=%lld — tearing "
                      "down now (every pending operation completes Closed)\n",
                      static_cast<long long>(closeMs));
-        ++closeDeadlineHits_;
     }
-    closeImpl_();
+    closeImpl_(deadlineHit);   // M3: counted by the single winning closer
     // `q` is destroyed here, after the teardown handed it back (or it was never
     // adopted): its destructor never waits.
 }
@@ -478,7 +476,7 @@ void Client::closeImmediately() {
     closeImpl_();
 }
 
-void Client::closeImpl_() {
+void Client::closeImpl_(bool drainDeadlineHit) {
     // F8c C2: closing the agent command ring IS the stop signal (no stopped_
     // atomic).  The closed bit lives in the ring's tail word, so every submit
     // is linearized against this one RMW: a command accepted before it is
@@ -486,6 +484,9 @@ void Client::closeImpl_() {
     // — no ClosedAfterSubmit window, no accepted leak.  Only the first caller
     // (the one that closed the ring) does the work.
     if (!agent_.closeCommandRing()) return;
+    // Fix round 1 (M3): only the closer that closed the ring gets here — the one
+    // writer of the counter (a concurrent loser returned above).
+    if (drainDeadlineHit) ++closeDeadlineHits_;
 
     // Join the runner thread (it loops until it sees the closed ring).
     // CONTRACT: close() must NOT be called from within a Client callback
@@ -3130,8 +3131,11 @@ void Client::onEgressFrame(codec::TemplateId tid,
                             rTopicId, rPartition, newNodeId, newEpoch, nextCorrId_);
                         // IMPORTANT-2: we now KNOW which node the session is
                         // following — record it so proactive routing can avoid
-                        // re-sending to the wrong node.
-                        currentLeaderNode() = newNodeId;
+                        // re-sending to the wrong node.  Fix round 1 (M7): only
+                        // when the SEED follows it (the single-node retarget path
+                        // below); a per-partition follow never moves the seed.
+                        if (!((agent_.multiNodeRouting() || groupActive) && !newEndpoint.empty()))
+                            currentLeaderNode() = newNodeId;
                     }
                 }
                 // Reconcile with the authoritative map NOW (M5): the provisional
@@ -4538,6 +4542,14 @@ int Client::watchProduceRoutes_(int64_t nowNs) noexcept {
         // route converges whenever the failover completes, however long it takes.
         if (st == session::SessionState::Disconnected) (void)agent_.reviveSession(i, nowNs);
     }
+    // Fix round 1 (C1): the seed moved (failover / redirect / bootstrap fallback):
+    // "no route entry" now means its NEW broker — every partition must be
+    // re-routed by fresh metadata (those led by the old location get explicit
+    // entries, those led by the new one lose theirs).
+    if (const uint64_t sm = agent_.seedMoves(); sm != seedMovesSeen_) [[unlikely]] {
+        seedMovesSeen_ = sm;
+        ask = true;
+    }
     if (!ask) return 0;
     requestMetadataNow_();
     return 1;
@@ -5030,7 +5042,7 @@ TransactionalProducer Client::transactionalProducer(const std::string& transacti
 // MD1 Task 10: sendMetadataRequest() — request all-topic metadata from the broker
 // ---------------------------------------------------------------------------
 
-void Client::sendMetadataRequest(int64_t sessionId) noexcept {
+bool Client::sendMetadataRequest(int64_t sessionId) noexcept {
     // Allocate a fresh correlationId (duty-owned counter).
     const int64_t corrId = nextCorrId_++;
     pendingMetadataCorrId_ = corrId;
@@ -5043,10 +5055,13 @@ void Client::sendMetadataRequest(int64_t sessionId) noexcept {
         emptyTopics,
         sessionId,
         corrId);
-    if (n == 0) return;  // encoding failed — silently ignore
+    if (n == 0) return false;  // encoding failed
 
     // Submit to the agent ring (thread-safe, non-blocking).
-    agent_.submitSend(buf.data(), n);
+    // Fix round 1 (M2): the verdict reaches the caller (a full ring is not "asked").
+    if (!agent_.submitSend(buf.data(), n)) return false;
+    noteMetadataSent_();
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -5081,6 +5096,7 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
 
     // NEW-1: the answered request's correlationId orders it against redirects.
     metadataCache_.updateFromResponse(brokers, partitions, resp.correlationId);
+    metadataAnswerByNs_ = 0;   // fix round 1 (M2): answered
 
     // Task 1.3: (re)build the agent-owned partition routing table IN PLACE.  For
     // each partition with a known leader + per-worker ingressStreamId, map the
@@ -5408,8 +5424,11 @@ void Client::requestMetadataNow_() noexcept {
     const int64_t t = now();
     const bool due = lastUrgentMetadataNs_ == INT64_MIN || t - lastUrgentMetadataNs_ >= kUrgentMetadataMinGapNs;
     // DR client bug 1: any Connected session asks (the seed's broker may be the
-    // one that died) — never "only while the seed is Connected".
-    if (!due || !sendMetadataRequestAnywhere_()) {
+    // one that died).  Fix round 1 (I4): an URGENT ask is a route failure — it
+    // fans out to EVERY Connected session, so one lagging / minority broker that
+    // keeps naming the dead ex-leader cannot pin the route: the per-partition
+    // epoch gate (MetadataCache::applyPartitionUpdate) keeps the newest answer.
+    if (!due || sendMetadataRequestEverywhere_() == 0) {
         scheduleMetadataRefresh();
         return;
     }
@@ -5417,6 +5436,14 @@ void Client::requestMetadataNow_() noexcept {
 }
 
 void Client::tickMetadataRefresh() noexcept {
+    // Fix round 1 (M2): a MetadataRequest gets no answer timer of its own on the
+    // wire (it can be lost, or head-expired at the command ring) — one that is
+    // still unanswered a response timeout after it was sent arms the backoff
+    // refresh, so the client always asks again.
+    if (metadataAnswerByNs_ != 0 && now() >= metadataAnswerByNs_) [[unlikely]] {
+        metadataAnswerByNs_ = 0;
+        scheduleMetadataRefresh();
+    }
     if (nextMetadataRefreshAt_ == std::chrono::steady_clock::time_point::max()) {
         return; // not armed
     }
@@ -5427,31 +5454,50 @@ void Client::tickMetadataRefresh() noexcept {
     nextMetadataRefreshAt_ = std::chrono::steady_clock::time_point::max(); // disarm
 }
 
+void Client::noteMetadataSent_() noexcept {
+    const int64_t timeoutNs = cfg_.responseTimeoutNs > 0 ? cfg_.responseTimeoutNs
+                                                         : session::SessionConfig{}.responseTimeoutNs;
+    metadataAnswerByNs_ = now() + timeoutNs;
+}
+
+bool Client::offerMetadataOnNode_(uint32_t i) noexcept {
+    const int64_t sid = agent_.connectedSessionId(i);
+    if (sid == 0) return false;
+    const int64_t corrId = nextCorrId_++;   // its own corrId (NEW-1 provisional ordering per request)
+    std::array<uint8_t, 256> buf{};
+    const std::size_t len = codec::encodeMetadataRequest(buf.data(), buf.size(), std::span<const int32_t>{}, sid,
+                                                         corrId);
+    if (len == 0) return false;
+    if (agent_.offerOnSession(i, buf.data(), len) != transport::AeronTransport::OfferResult::Accepted) return false;
+    pendingMetadataCorrId_ = corrId;
+    ++metadataViaOtherSession_;
+    noteMetadataSent_();
+    return true;
+}
+
 bool Client::sendMetadataRequestAnywhere_() noexcept {
     const auto snap = agent_.stateAndSessionId();
-    if (snap.state == session::SessionState::Connected && snap.sessionId != 0) {
-        sendMetadataRequest(snap.sessionId);
+    // M2: a refused submit (command ring full) is not "asked".
+    if (snap.state == session::SessionState::Connected && snap.sessionId != 0 && sendMetadataRequest(snap.sessionId))
         return true;
-    }
     // The seed is down: the first Connected node session asks (duty-thread direct
     // send on that node's ingress, stamped with ITS session id, sealed under its
     // crypto state).  The answer is applied like any other (any session's
     // MetadataResponse reaches onMetadataResponse).
     const auto n = static_cast<uint32_t>(agent_.sessionCount());
-    for (uint32_t i = 1; i < n; ++i) {
-        const int64_t sid = agent_.connectedSessionId(i);
-        if (sid == 0) continue;
-        const int64_t corrId = nextCorrId_++;
-        std::array<uint8_t, 256> buf{};
-        const std::size_t len = codec::encodeMetadataRequest(buf.data(), buf.size(), std::span<const int32_t>{},
-                                                             sid, corrId);
-        if (len == 0) return false;
-        if (agent_.offerOnSession(i, buf.data(), len) != transport::AeronTransport::OfferResult::Accepted) continue;
-        pendingMetadataCorrId_ = corrId;
-        ++metadataViaOtherSession_;
-        return true;
-    }
+    for (uint32_t i = 1; i < n; ++i)
+        if (offerMetadataOnNode_(i)) return true;
     return false;
+}
+
+int Client::sendMetadataRequestEverywhere_() noexcept {
+    int sent = 0;
+    const auto snap = agent_.stateAndSessionId();
+    if (snap.state == session::SessionState::Connected && snap.sessionId != 0 && sendMetadataRequest(snap.sessionId))
+        ++sent;
+    const auto n = static_cast<uint32_t>(agent_.sessionCount());
+    for (uint32_t i = 1; i < n; ++i) sent += offerMetadataOnNode_(i) ? 1 : 0;
+    return sent;
 }
 
 // ---------------------------------------------------------------------------
@@ -5459,30 +5505,65 @@ bool Client::sendMetadataRequestAnywhere_() noexcept {
 // ---------------------------------------------------------------------------
 //
 // SeedSteady -> SeedFailingOver when the seed, after having been Live, lost its
-// session to silence (staleSessionLosses() moved: no answer within the response
-// timeout — its broker is presumed dead) or gave up reconnecting (Disconnected /
-// Backoff).  Each attempt moves the seed to ONE candidate and connects fresh
-// there; it ends Connected (-> SeedSteady), or fails (Disconnected / Backoff) or
-// runs out its deadline (min(connect timeout, kSeedFailoverAttemptMaxNs)) -> the
-// next candidate.  Closed / Rejected -> SeedSteady (terminal; nothing to move).
+// session to silence (a stale loss NOT caused by the client's own stall — M1:
+// its broker is presumed dead) or gave up reconnecting (Disconnected / Backoff).
+// Each attempt moves the seed to ONE candidate and connects fresh there; it ends
+// Connected (-> SeedSteady, every in-flight batch re-offered — I1), or fails
+// (Disconnected / Backoff) or runs out its deadline (min(connect timeout,
+// kSeedFailoverAttemptMaxNs)) -> the next candidate, never before an
+// exponentially growing, jittered gap (I2) nor before the machine's own Backoff
+// delay (reconnectForeverAfterLive).  A non-retriable connect answer
+// (ProtocolVersion / HandshakeFailed) ends the episode: the seed stays down,
+// explicitly (I2).  Closed / Rejected -> SeedSteady (terminal; nothing to move).
 int Client::driveSeedFailover_(int64_t nowNs) noexcept {
     const session::SessionMachine& m = agent_.seedMachine();
     const session::SessionState    st = m.state();
-    const uint64_t losses  = m.staleSessionLosses();
+    // M1: only a loss the CLIENT did not cause by stalling is evidence of a dead broker.
+    const uint64_t losses  = m.staleSessionLosses() - m.ownStallLosses();
     const bool     newLoss = losses != seedFailoverLossesSeen_;
     seedFailoverLossesSeen_ = losses;
     if (auto* f = std::get_if<SeedFailingOver>(&seedFailover_)) [[unlikely]] {
-        if (st == session::SessionState::Connected || st == session::SessionState::Closed ||
-            st == session::SessionState::Rejected) {
-            if (st == session::SessionState::Connected)
-                std::fprintf(stderr, "rune-client: seed reconnected on %s after %u failover attempt(s)\n",
-                             agent_.seedChannel().c_str(), f->attempt);
+        if (st == session::SessionState::Connected) {
+            std::fprintf(stderr, "rune-client: seed reconnected on %s after %u failover attempt(s)\n",
+                         agent_.seedChannel().c_str(), f->attempt);
+            seedFailover_ = SeedSteady{};
+            // I1: the seed's broker changed — every in-flight batch is re-offered
+            // once on its current route now (same identity: deduplicated), never
+            // left to its attempt timer (default-routed partitions get no connect
+            // event of their own).
+            resendAllInFlightViaRoute_();
+            return 1;
+        }
+        if (st == session::SessionState::Closed || st == session::SessionState::Rejected) {
             seedFailover_ = SeedSteady{};
             return 1;
         }
         const bool gaveUp = st == session::SessionState::Disconnected || st == session::SessionState::Backoff;
+        if (gaveUp && session::SessionMachine::nonRetriableConnectError(m.lastConnectError())) {
+            std::fprintf(stderr, "rune-client: seed failover stopped: %s answered a non-retriable error %d — the "
+                         "seed stays down\n", agent_.seedChannel().c_str(), static_cast<int>(m.lastConnectError()));
+            seedFailover_ = SeedFailoverStopped{};
+            return 1;
+        }
+        // I2: a reconnectForeverAfterLive machine owns its attempt schedule (its
+        // capped-exponential Backoff): the failover never connects by itself — it
+        // only re-points the seed's publication at the next candidate while the
+        // machine waits in Backoff, once per Backoff entry, so the machine's own
+        // next attempt goes there.  Connect rate == the machine's Backoff schedule.
+        if (cfg_.reconnectForeverAfterLive) {
+            if (st != session::SessionState::Backoff || f->backoffAttemptMoved == m.backoffAttempt()) return 0;
+            f->backoffAttemptMoved = m.backoffAttempt();
+            return startSeedFailoverAttempt_(*f, nowNs, /*connectNow=*/false) ? 1 : 0;
+        }
         if (nowNs < f->notBeforeNs || (!gaveUp && nowNs < f->attemptDeadlineNs)) return 0;
         return startSeedFailoverAttempt_(*f, nowNs) ? 1 : 0;
+    }
+    if (std::holds_alternative<SeedFailoverStopped>(seedFailover_)) [[unlikely]] {
+        // I2: a non-retriable answer ended the episode (explicit; the seed stays
+        // down) — until the seed is Live again (an app connect), when a later
+        // loss may fail over anew.
+        if (st == session::SessionState::Connected) seedFailover_ = SeedSteady{};
+        return 0;
     }
     if (st == session::SessionState::Connected) [[likely]] return 0;
     if (!m.everLive() || st == session::SessionState::Closed || st == session::SessionState::Rejected) return 0;
@@ -5494,56 +5575,84 @@ int Client::driveSeedFailover_(int64_t nowNs) noexcept {
     const bool gaveUp = st == session::SessionState::Disconnected || st == session::SessionState::Backoff;
     if (!newLoss && !gaveUp) return 0;
     seedFailover_ = SeedFailingOver{};
+    if (cfg_.reconnectForeverAfterLive) return 1;   // I2: acts at the machine's Backoff entries (above)
     return startSeedFailoverAttempt_(std::get<SeedFailingOver>(seedFailover_), nowNs) ? 1 : 0;
 }
 
-bool Client::startSeedFailoverAttempt_(SeedFailingOver& f, int64_t nowNs) noexcept {
-    const std::string here = agent_.seedChannel();
+namespace {
+/// I2 jitter: a pure mix (no allocation, no shared state).
+constexpr uint64_t splitmix64(uint64_t x) noexcept {
+    x += 0x9E3779B97F4A7C15ULL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    return x ^ (x >> 31);
+}
+}  // namespace
+
+bool Client::startSeedFailoverAttempt_(SeedFailingOver& f, int64_t nowNs, bool connectNow) noexcept {
     std::string target;
     try {
-        // 1. a broker a node session is Connected to RIGHT NOW (proven alive).
+        const std::string here = agent_.seedChannel();   // M4: inside the try (it allocates)
+        // I3: ONE ordered candidate list, rotated per attempt — brokers a node
+        // session is Connected to (proven alive) first, then the metadata's
+        // brokers in node-id order, then the bootstrap; duplicates and the
+        // seed's current broker excluded.  Within `size` attempts every known
+        // broker is tried once: one that keeps an old session but refuses new
+        // connects can never pin the seed.
+        seedCandidates_.clear();
+        auto add = [&](const std::string& ch) {
+            if (ch.empty() || agent::ClientAgent::sameEndpoint(ch, here)) return;
+            for (const std::string& c : seedCandidates_)
+                if (agent::ClientAgent::sameEndpoint(c, ch)) return;
+            seedCandidates_.push_back(ch);
+        };
         const auto n = static_cast<uint32_t>(agent_.sessionCount());
-        for (uint32_t i = 1; i < n && target.empty(); ++i) {
-            if (agent_.connectedSessionId(i) == 0) continue;
-            const std::string& ch = agent_.sessionChannelAt(i);
-            if (!ch.empty() && !agent::ClientAgent::sameEndpoint(ch, here)) target = ch;
-        }
-        // 2. else rotate over the metadata's brokers and the bootstrap (node id
-        //    order, the seed's current broker excluded; it alone when nothing else).
-        if (target.empty()) {
-            seedCandidates_.clear();
-            std::vector<std::pair<int32_t, std::string>> brokers;   // cold: once per attempt
-            metadataCache_.forEachBrokerEndpoint(
-                [&](int32_t id, const std::string& ep) { brokers.emplace_back(id, ep); });
-            std::sort(brokers.begin(), brokers.end());
-            auto add = [&](const std::string& ch) {
-                if (ch.empty() || agent::ClientAgent::sameEndpoint(ch, here)) return;
-                for (const std::string& c : seedCandidates_)
-                    if (agent::ClientAgent::sameEndpoint(c, ch)) return;
-                seedCandidates_.push_back(ch);
-            };
-            for (const auto& [id, ep] : brokers) add(toChannel(ep));
-            add(cfg_.gatewayChannel);
-            target = seedCandidates_.empty() ? here : seedCandidates_[f.attempt % seedCandidates_.size()];
-        }
+        for (uint32_t i = 1; i < n; ++i)
+            if (agent_.connectedSessionId(i) != 0) add(agent_.sessionChannelAt(i));
+        std::vector<std::pair<int32_t, std::string>> brokers;   // cold: once per attempt
+        metadataCache_.forEachBrokerEndpoint(
+            [&](int32_t id, const std::string& ep) { brokers.emplace_back(id, ep); });
+        std::sort(brokers.begin(), brokers.end());
+        for (const auto& [id, ep] : brokers) add(toChannel(ep));
+        add(cfg_.gatewayChannel);
+        target = seedCandidates_.empty() ? here : seedCandidates_[f.attempt % seedCandidates_.size()];
     } catch (...) {
-        target = here;  // allocation failure (cold path): reconnect where it is
+        // allocation failure (cold path): no target this pass; the next one retries
     }
     ++f.attempt;
-    f.notBeforeNs = nowNs + kSeedFailoverMinGapNs;   // never a tight loop over refusing brokers
+    // I2: exponential, jittered pacing (100 ms doubling to 10 s).
+    const uint64_t jitter = splitmix64(reinterpret_cast<uintptr_t>(this) ^ f.attempt) %
+                            static_cast<uint64_t>(f.gapNs / 4 + 1);
+    f.notBeforeNs = nowNs + f.gapNs + static_cast<int64_t>(jitter);
+    f.gapNs       = std::min(f.gapNs * 2, kSeedFailoverMaxGapNs);
     const int64_t connectNs = cfg_.connectTimeoutMs > 0 ? cfg_.connectTimeoutMs * 1'000'000LL : kSeedFailoverAttemptMaxNs;
     f.attemptDeadlineNs = nowNs + std::min(connectNs, kSeedFailoverAttemptMaxNs);
-    if (!agent_.failoverSeedTo(target, nowNs)) {
-        f.attemptDeadlineNs = f.notBeforeNs;  // did not resolve: the next candidate shortly
+    if (target.empty() || !agent_.failoverSeedTo(target, nowNs, connectNow)) {
+        f.attemptDeadlineNs = f.notBeforeNs;  // did not resolve: the next candidate after the gap
         return false;
     }
+    if (connectNow) ++seedFailoverConnects_;
     if ((seedFailovers_++ & 63u) == 0)
-        std::fprintf(stderr, "rune-client: seed broker %s presumed dead (no answer / gave up) — seed moved to %s "
-                     "(attempt %u, %llu so far)\n", here.c_str(), target.c_str(), f.attempt,
+        std::fprintf(stderr, "rune-client: seed broker presumed dead (no answer / gave up) — seed moved to %s "
+                     "(attempt %u, %llu so far)\n", target.c_str(), f.attempt,
                      static_cast<unsigned long long>(seedFailovers_));
-    // The leader of what the seed's broker led must be learnt from a live broker now.
+    // The leader of what the seed's broker led must be learnt from a live broker
+    // now (C1: the seed moved — fan out).
     requestMetadataNow_();
     return true;
+}
+
+void Client::resendAllInFlightViaRoute_() noexcept {
+    (void)routeBufferedAcks_();  // acks earlier in this poll first: never resend an acked batch
+    try {
+        producer::ProducerImpl::SendFn sendFn =   // cold edge (a connect / a failover): built once
+            [this](int32_t t, int32_t p, int32_t sid, const uint8_t* fb, std::size_t fl) -> bool {
+                return agent_.offerToPartition(t, p, sid, fb, fl);
+            };
+        producerHub_.resendAllViaRoute(sendFn);
+    } catch (...) {
+        // allocation failure (cold path): the attempt timers re-offer them
+    }
 }
 
 } // namespace rune::client

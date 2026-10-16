@@ -229,12 +229,12 @@ TEST(HubCommandClient, HubCommandFromCallbackWithFullRingFailsFastRegression) {
 // ===========================================================================
 namespace {
 
-rc::ClientConfig withOpts(rc::ClientConfig c, std::size_t termBytes, rc::NanoClock clock, int64_t closeTimeoutMs = 0) {
+rc::ClientConfig withOpts(rc::ClientConfig c, std::size_t termBytes, rc::NanoClock clock, int64_t closeTimeoutMs = 1) {
     // IPC publications take their term length from the channel (the driver's
     // IPC default is 64 MiB): a small term makes back-pressure reachable.
     if (termBytes != 0) c.gatewayChannel = "aeron:ipc?term-length=" + std::to_string(termBytes);
     c.nanoClock = clock;
-    if (closeTimeoutMs > 0) c.closeTimeoutMs = closeTimeoutMs;
+    if (closeTimeoutMs != 1) c.closeTimeoutMs = closeTimeoutMs;   // 1 = leave the config default
     return c;
 }
 
@@ -242,7 +242,7 @@ struct HubRig {
     rc::ClientConfig             cfg;
     rc::Client                   client;
     test_support::InvokerGateway gw;
-    explicit HubRig(int32_t in, std::size_t termBytes = 0, rc::NanoClock clock = nullptr, int64_t closeTimeoutMs = 0)
+    explicit HubRig(int32_t in, std::size_t termBytes = 0, rc::NanoClock clock = nullptr, int64_t closeTimeoutMs = 1)
         : cfg(withOpts(hubCfg(in, in + 1, rc::RunnerMode::Invoker), termBytes, clock, closeTimeoutMs)), client(cfg),
           gw(cfg.dataDir + "/aeron", cfg.gatewayChannel, cfg.gatewayStreamId,
              cfg.egressChannel, cfg.egressStreamId) {}
@@ -1247,4 +1247,88 @@ TEST(HubCommandClient, ARefusedHeadFrameNeverHoldsTheCommandRingPastTheResponseT
     const auto took = runOrDie("Client::close()", 20s, [&] { r.client.close(); });
     EXPECT_EQ(r.client.testCloseDeadlineHits(), 0u) << "the drain finished on its own";
     EXPECT_LT(took, 2s);
+}
+
+// Fix round 1 (I5): closeTimeoutMs = INT64_MAX must mean "a very long drain", never
+// an int64-overflowed deadline in the past.  RED (no clamp): the drain is cut at
+// once — the in-flight record completes Closed and the deadline counter is 1.
+TEST(HubCommandClient, CloseTimeoutHugeIsClampedNotOverflowedRegression) {
+    HubRig r(4604, 0, nullptr, /*closeTimeoutMs=*/INT64_MAX);
+    r.connect();
+    r.gw.replyAcks = false;
+    rc::ProducerConfig pc;
+    pc.acks = rc::Acks::Leader; pc.lingerUs = 1; pc.batchBytes = 1;
+    auto p = r.client.producer(pc);
+    const uint8_t v[1] = {7};
+    auto rec = r.cq.send(p, r.client.topic("t"), rc::Key(uint64_t{1}), std::span<const uint8_t>(v, 1));
+    ASSERT_TRUE(rec.accepted());
+    ASSERT_TRUE(r.drive([&] { return !r.gw.held.empty(); }));
+    // The broker answers 200 ms into close() (another thread pumps the fake broker).
+    std::atomic<bool> stop{false};
+    std::thread broker([&] {
+        const auto release = std::chrono::steady_clock::now() + 200ms;
+        while (!stop.load()) {
+            if (std::chrono::steady_clock::now() >= release && !r.gw.held.empty()) r.gw.releaseHeld();
+            std::this_thread::sleep_for(1ms);
+        }
+    });
+    (void)runOrDie("Client::close()", 10s, [&] { r.client.close(); });
+    stop.store(true);
+    broker.join();
+    EXPECT_EQ(r.client.testCloseDeadlineHits(), 0u);
+    ASSERT_TRUE(rec.ready());
+    EXPECT_EQ(rec.status(), rc::OpStatus::Ok) << "the drain waited for the ack";
+}
+
+// Fix round 1 (I5): 0 and negative closeTimeoutMs mean the default — a drain that
+// completes promptly completes Ok, never cut.  GUARD (no RED): the pre-round-1 code
+// already mapped <= 0 to the default, and an Invoker close completes a nothing-to-
+// flush drain within its first pump even against a past deadline.
+TEST(HubCommandClient, CloseTimeoutZeroAndNegativeMeanTheDefaultRegression) {
+    for (const int64_t ms : {int64_t{0}, int64_t{-5}}) {
+        HubRig r(ms == 0 ? 4606 : 4608, 0, nullptr, ms);   // withOpts keeps <= 0 as is (the default)
+        r.connect();
+        rc::ProducerConfig pc;
+        pc.acks = rc::Acks::Leader; pc.lingerUs = 1; pc.batchBytes = 1;
+        auto p = r.client.producer(pc);
+        const uint8_t v[1] = {7};
+        auto rec = r.cq.send(p, r.client.topic("t"), rc::Key(uint64_t{1}), std::span<const uint8_t>(v, 1));
+        ASSERT_TRUE(rec.accepted());
+        ASSERT_TRUE(r.drive([&] { return rec.ready(); }));
+        EXPECT_EQ(rec.status(), rc::OpStatus::Ok);
+        // Nothing left to flush: the drain is one duty round trip — never cut by a
+        // deadline (a negative one taken literally would be in the past).
+        const auto took = runOrDie("Client::close()", 10s, [&] { r.client.close(); });
+        EXPECT_EQ(r.client.testCloseDeadlineHits(), 0u) << "closeTimeoutMs " << ms;
+        EXPECT_LT(took, 2s);
+    }
+}
+
+// Fix round 1 (M2): a MetadataRequest that is lost (here: head-expired at the
+// command ring) is asked again — it has an answer timer of its own.
+// RED (no answer timer): no MetadataRequest after the drop, ever.
+TEST(HubCommandClient, ALostMetadataRequestIsAskedAgainRegression) {
+    HubRig r(4610, 0, &drNow, 5'000);
+    r.gw.replyPongs = true;
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return r.gw.metadataRequests > 0; }));
+    r.settle(200);
+    const int before = r.gw.metadataRequests;
+    r.client.testForceIngressOffers(rc::transport::AeronTransport::OfferResult::Retry, 1'000'000'000);
+    r.client.testSubmitMetadataRequest();
+    const int64_t timeout = rc::session::SessionConfig{}.responseTimeoutNs;
+    for (int64_t t = 0; t < timeout + 1'000'000'000LL; t += 500'000'000LL) {
+        g_drNow += 500'000'000LL;
+        r.settle(50);
+    }
+    ASSERT_EQ(r.client.testSendHeadExpired(), 1u) << "precondition: the request was dropped unsent";
+    r.client.testForceIngressOffers(rc::transport::AeronTransport::OfferResult::Accepted, 0);
+    // The duty clock moves on (sweeps run on it); the backoff refresh is on the wall clock.
+    bool asked = false;
+    for (const auto deadline = std::chrono::steady_clock::now() + 3s; std::chrono::steady_clock::now() < deadline && !asked;) {
+        g_drNow += 100'000'000LL;
+        r.settle(20);
+        asked = r.gw.metadataRequests > before;
+    }
+    EXPECT_TRUE(asked) << "the lost MetadataRequest was never asked again";
 }

@@ -2787,3 +2787,327 @@ TEST(GroupRoutingRegression, MetadataIsAskedThroughALiveNodeSessionWhileTheSeedI
     EXPECT_GE(r.client.testMetadataViaOtherSession(), 1u);
     s1.unsubscribe();
 }
+
+// ===========================================================================
+// DR client bugs — fix round 1 (client-dr-bugs-review.md recipes C1, I1-I4, M1)
+// ===========================================================================
+using namespace std::chrono_literals;
+namespace {
+/// Send one acked record and drive until it completes (bounded); the status, or
+/// Closed when it never completed within `cycles`.
+rc::OpStatus sendOne(GroupRig& r, rc::Producer& p, const std::string& topic, uint64_t key, int cycles = 4'000'000) {
+    const std::vector<uint8_t> val{1};
+    const rc::Token t = r.nextToken++;
+    if (p.trySend(r.client.topic(topic), rc::Key(key), std::span<const uint8_t>(val), r.cq, t) != rc::SendResult::Ok)
+        return rc::OpStatus::Closed;
+    rc::OpStatus st = rc::OpStatus::Closed;
+    bool done = false;
+    (void)r.drive([&] {
+        r.cq.poll([&](const rc::Completion& cc, std::span<const uint8_t>) {
+            if (cc.token == t) { done = true; st = cc.status; }
+        });
+        return done;
+    }, cycles);
+    return done ? st : rc::OpStatus::Closed;
+}
+template <class P>
+bool driveFor(GroupRig& r, std::chrono::milliseconds budget, P&& pred) {
+    for (const auto deadline = std::chrono::steady_clock::now() + budget; std::chrono::steady_clock::now() < deadline;) {
+        r.client.doWork();
+        r.gw.pump();
+        if (pred()) return true;
+    }
+    return false;
+}
+RigOptions failoverOpts() {
+    RigOptions o;
+    o.keepaliveNs       = 50'000'000LL;    // 50 ms
+    o.responseTimeoutNs = 400'000'000LL;   // a dead node is noticed 400 ms later
+    o.connectTimeoutMs  = 300;
+    return o;
+}
+}  // namespace
+
+// C1: after the seed moved off its bootstrap node, "no route entry = the seed's
+// broker" must mean where the seed PHYSICALLY is.  The bootstrap node regains the
+// partition's leadership; its records must reach it.
+// RED (setRoute compares with the seed's bootstrap identity): the metadata naming
+// node 0 ERASES the route — the records ride the seed (now on node 1), which
+// answers NotLeader, forever; none reaches node 0.
+TEST(GroupRoutingRegression, SeedMovedThenTheBootstrapLeadsAgainRoutesToTheBootstrapRegression) {
+    GroupRig r(4301, 4302, failoverOpts());
+    const auto [n1, p1port] = r.addNode(4301);
+    r.gw.moreBrokers = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions  = {{2, 0, 0, 1, 4301, ""}};   // b/0 led by node 0 (the seed's bootstrap)
+    r.gw.groupProtocol = false;
+    r.connect();
+    rc::ProducerConfig pc;
+    pc.lingerUs = 0;
+    pc.deliveryTimeoutMs = 600'000;
+    auto p = r.client.producer(pc);
+    ASSERT_EQ(sendOne(r, p, "b", 1), rc::OpStatus::Ok);
+    ASSERT_EQ(r.gw.produced.back().endpoint, 0);
+
+    // Node 0 dies; the cluster moves b/0 to node 1; the seed fails over to node 1.
+    r.gw.deadEndpoints.insert(0);
+    r.gw.partitions = {{2, 0, 1, 2, 4301, ""}};
+    ASSERT_TRUE(driveFor(r, 10s, [&] {
+        return r.client.testSeedFailovers() >= 1 && r.client.testSessionStateAt(0) == rc::session::SessionState::Connected;
+    })) << "precondition: the seed failed over";
+    ASSERT_TRUE(rc::agent::ClientAgent::sameEndpoint(r.client.testSeedChannel(), udp(p1port)));
+    ASSERT_EQ(sendOne(r, p, "b", 1), rc::OpStatus::Ok);
+    ASSERT_EQ(r.gw.produced.back().endpoint, n1) << "precondition: b/0 served by node 1";
+
+    // Node 0 is back and leads b/0 again; node 1 no longer owns it.
+    r.gw.deadEndpoints.erase(0);
+    r.gw.partitions = {{2, 0, 0, 3, 4301, ""}};
+    r.gw.notLeaderEndpoints = {n1};
+    int okOnNode0 = 0;
+    for (int i = 0; i < 10; ++i) {
+        const auto st = sendOne(r, p, "b", 1, 2'000'000);
+        if (st == rc::OpStatus::Ok && r.gw.produced.back().endpoint == 0) ++okOnNode0;
+    }
+    EXPECT_EQ(okOnNode0, 10) << "every b/0 record reaches its leader (node 0, the seed's old bootstrap)";
+    EXPECT_TRUE(rc::agent::ClientAgent::sameEndpoint(r.client.testSeedChannel(), udp(p1port)))
+        << "the seed stays where it is (it is not moved 'home')";
+}
+
+// C1, the group-fetch sibling: a member's fetch of a partition led by the seed's
+// old bootstrap node must reach that node.  RED: the route is erased and the
+// fetch stays on the seed (node 1).
+TEST(GroupRoutingRegression, SeedMovedGroupFetchOfABootstrapLedPartitionIsServedRegression) {
+    GroupRig r(4303, 4304, failoverOpts());
+    const auto [n1, p1port] = r.addNode(4303);
+    r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions      = {{1, 0, 0, 1, 4303, ""}, {1, 1, 1, 1, 4303, ""}};
+    r.gw.subscribeLeader = {{0, 0}, {1, n1}};
+    r.gw.groupAssignment = {{1, 0}, {1, 1}};
+    r.gw.holdJoins       = false;
+    auto gc = r.client.subscribeGroup("g", {"t"});
+    Consumed led;
+    wire(gc, led);
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return r.subAt(0, 0) != nullptr && r.subAt(1, n1) != nullptr; }));
+
+    r.gw.deadEndpoints.insert(0);   // node 0 (seed + coordinator) dies; t/0 moves to node 1
+    r.gw.partitions      = {{1, 0, 1, 2, 4303, ""}, {1, 1, 1, 1, 4303, ""}};
+    r.gw.subscribeLeader = {{0, n1}, {1, n1}};
+    ASSERT_TRUE(driveFor(r, 15s, [&] { return r.client.testSeedFailovers() >= 1 && r.subAt(0, n1) != nullptr; }))
+        << "precondition: the member fetches t/0 from node 1 after the failover";
+
+    r.gw.deadEndpoints.erase(0);    // node 0 is back and leads t/0 again
+    r.gw.partitions      = {{1, 0, 0, 3, 4303, ""}, {1, 1, 1, 1, 4303, ""}};
+    r.gw.subscribeLeader = {{0, 0}, {1, n1}};
+    r.client.testRequestMetadataNow();
+    EXPECT_TRUE(driveFor(r, 5s, [&] { return r.subAt(0, 0) != nullptr; }))
+        << "the t/0 fetch reaches its leader (node 0), not the seed's broker";
+    gc.close();
+}
+
+// I1: every partition is led by the seed's broker (the route table is EMPTY), so
+// the seed's reconnect raises no per-partition connect event.  After the failover
+// the in-flight batches must be re-offered at once.
+// RED (no re-offer on the failover's Connected edge): they wait for the 30 s attempt timer.
+TEST(GroupRoutingRegression, SingleRouteTopologySeedFailoverReOffersInFlightAtOnceRegression) {
+    GroupRig r(4305, 4306, failoverOpts());
+    const auto [n1, p1port] = r.addNode(4305);
+    r.gw.moreBrokers = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions  = {{2, 0, 0, 1, 4305, ""}};
+    r.gw.groupProtocol = false;
+    r.connect();
+    rc::ProducerConfig pc;
+    pc.lingerUs = 0; pc.batchBytes = 1;
+    pc.produceTimeoutMs = 30'000; pc.deliveryTimeoutMs = 40'000;
+    auto p = r.client.producer(pc);
+    r.gw.holdPartitions = {0};   // node 0 takes them, never answers
+    const std::vector<uint8_t> val{1};
+    std::vector<rc::Token> toks;
+    for (int i = 0; i < 3; ++i) {
+        toks.push_back(r.nextToken++);
+        ASSERT_TRUE(r.drive([&] {
+            return p.trySend(r.client.topic("b"), rc::Key(uint64_t{1}), std::span<const uint8_t>(val), r.cq,
+                             toks.back()) == rc::SendResult::Ok;
+        }));
+    }
+    ASSERT_TRUE(r.drive([&] { return r.gw.held.size() >= 3; })) << "precondition: 3 batches in flight on node 0";
+    r.gw.deadEndpoints.insert(0);
+    r.gw.partitions = {{2, 0, 1, 2, 4305, ""}};   // b/0 moved to node 1 (where the seed fails over)
+    r.gw.holdPartitions.clear();
+    ASSERT_TRUE(driveFor(r, 10s, [&] { return r.client.testSeedFailovers() >= 1; }));
+    std::map<rc::Token, rc::OpStatus> done;
+    EXPECT_TRUE(driveFor(r, 3s, [&] {
+        r.cq.poll([&](const rc::Completion& cc, std::span<const uint8_t>) { done[cc.token] = cc.status; });
+        return done.size() == 3;
+    })) << "the in-flight batches were not re-offered after the failover (only " << done.size() << "/3)";
+    for (const rc::Token t : toks) EXPECT_EQ(done[t], rc::OpStatus::Ok);
+    int onN1 = 0;
+    for (const auto& pr : r.gw.produced) onN1 += pr.endpoint == n1 ? 1 : 0;
+    EXPECT_EQ(onN1, 3) << "each batch reached the new leader exactly once";
+}
+
+// I2(a): the seed's node died and the only other broker refuses every Connect
+// (retriable code): attempts back off exponentially.
+// RED (a fixed 100 ms gap): a refusal every ~200 ms.
+TEST(GroupRoutingRegression, SeedFailoverBacksOffExponentiallyAgainstRefusingBrokersRegression) {
+    GroupRig r(4307, 4308, failoverOpts());
+    const auto [n1, p1port] = r.addNode(4307);
+    r.gw.moreBrokers = {{1, "127.0.0.1", p1port}};
+    r.gw.groupProtocol = false;
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return r.client.testMetadataResponses() > 0; }));
+    r.gw.deadEndpoints.insert(0);
+    r.gw.refuseConnectsWith[n1] = static_cast<int16_t>(rune::protocol::client::ErrorCode::Internal);
+    ASSERT_TRUE(driveFor(r, 5s, [&] { return r.gw.connectsAt[n1] >= 1; })) << "precondition: the first attempt";
+    const int first = r.gw.connectsAt[n1];
+    (void)driveFor(r, 3s, [] { return false; });
+    const int refused = r.gw.connectsAt[n1] - first;
+    EXPECT_LE(refused, 3) << "refused Connects at node 1 in 3 s (exponential gaps 100 ms .. 10 s; fixed 100 ms: >= 5)";
+    std::fprintf(stderr, "[I2a] refused connects in 3 s: %d\n", refused);
+}
+
+// I2(b): a non-retriable connect answer ends the failover — the seed stays down,
+// explicitly; no further attempts.  RED: attempts continue forever.
+TEST(GroupRoutingRegression, SeedFailoverStopsOnANonRetriableConnectErrorRegression) {
+    GroupRig r(4309, 4310, failoverOpts());
+    const auto [n1, p1port] = r.addNode(4309);
+    r.gw.moreBrokers = {{1, "127.0.0.1", p1port}};
+    r.gw.groupProtocol = false;
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return r.client.testMetadataResponses() > 0; }));
+    r.gw.deadEndpoints.insert(0);
+    r.gw.refuseConnectsWith[n1] = static_cast<int16_t>(rune::protocol::client::ErrorCode::ProtocolVersion);
+    ASSERT_TRUE(driveFor(r, 5s, [&] { return r.gw.connectsAt[n1] >= 1; }));
+    (void)driveFor(r, 200ms, [] { return false; });
+    const int after = r.gw.connectsAt[n1];
+    (void)driveFor(r, 2s, [] { return false; });
+    EXPECT_EQ(r.gw.connectsAt[n1], after) << "no Connect after a non-retriable refusal";
+    EXPECT_EQ(r.client.testSeedFailovers(), 1u);
+    EXPECT_NE(r.client.testSessionStateAt(0), rc::session::SessionState::Connected);
+}
+
+// I2(c): a reconnectForeverAfterLive (shard) client — every broker dead: the
+// failover never connects by itself, it only re-points the seed between the
+// machine's own Backoff attempts (connect rate == the Backoff schedule).
+// RED (the failover forceReconnects on its own deadlines): 16-18 Connects in 4 s vs 10, and
+// testSeedFailoverConnects() > 0.
+TEST(GroupRoutingRegression, ShardClientSeedFailoverNeverUndercutsBackoffRegression) {
+    RigOptions o = failoverOpts();
+    o.reconnectForever = true;
+    GroupRig r(4311, 4312, o);
+    const auto [n1, p1port] = r.addNode(4311);
+    r.gw.moreBrokers = {{1, "127.0.0.1", p1port}};
+    r.gw.groupProtocol = false;
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return r.client.testMetadataResponses() > 0; }));
+    r.gw.deadEndpoints = {0, n1};   // every broker dead (their Connects still counted: connectsArrived)
+    ASSERT_TRUE(driveFor(r, 5s, [&] { return r.client.testSessionStateAt(0) != rc::session::SessionState::Connected; }));
+    const int c0 = r.gw.connectsArrived;
+    (void)driveFor(r, 4s, [] { return false; });
+    const int c = r.gw.connectsArrived - c0;
+    std::fprintf(stderr, "[I2c] connects in 4 s: %d (failovers %llu)\n", c,
+                 static_cast<unsigned long long>(r.client.testSeedFailovers()));
+    // Every Connect is the machine's own Backoff attempt: the failover only re-points the publication.
+    // (Measured on an idle box: 10 Connects in these 4 s with the failover off, 10 with it, 16-18 RED.)
+    EXPECT_EQ(r.client.testSeedFailoverConnects(), 0u) << "the failover issued Connects of its own";
+    EXPECT_GE(r.client.testSeedFailovers(), 1u) << "the failover still re-points the seed between attempts";
+}
+
+// I3: candidates rotate.  Node 1 keeps an old Connected session but answers no new
+// Connect; node 2 is healthy.  RED ("a live session's broker always wins"): the
+// seed retries node 1 forever.
+TEST(GroupRoutingRegression, SeedFailoverTriesTheNextBrokerWhenALiveSessionsBrokerRefusesConnectsRegression) {
+    GroupRig r(4313, 4314, failoverOpts());
+    const auto [n1, p1port] = r.addNode(4313);
+    const auto [n2, p2port] = r.addNode(4313);
+    r.gw.moreBrokers = {{1, "127.0.0.1", p1port}, {2, "127.0.0.1", p2port}};
+    r.gw.partitions  = {{2, 0, 1, 1, 4313, ""}};   // b/0 on node 1: its session is Connected
+    r.gw.groupProtocol = false;
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return !r.client.testDataChannelFor(2, 0).empty(); }));
+    rc::ProducerConfig pc;
+    pc.lingerUs = 0;
+    pc.deliveryTimeoutMs = 600'000;
+    auto p = r.client.producer(pc);
+    ASSERT_EQ(sendOne(r, p, "b", 1), rc::OpStatus::Ok);
+    ASSERT_EQ(r.gw.produced.back().endpoint, n1);
+    r.gw.silentEndpoints.insert(n1);   // node 1 answers no NEW Connect (its old session lives)
+    r.gw.deadEndpoints.insert(0);      // the seed's node dies
+    EXPECT_TRUE(driveFor(r, 6s, [&] {
+        return r.client.testSessionStateAt(0) == rc::session::SessionState::Connected &&
+               rc::agent::ClientAgent::sameEndpoint(r.client.testSeedChannel(), udp(p2port));
+    })) << "the seed must reach the healthy node 2 (seed on " << r.client.testSeedChannel() << ")";
+    (void)n2;
+}
+
+// I4: a route failure asks EVERY Connected broker.  The seed's broker (alive) lags
+// and keeps naming the dead node 2 as b/0's leader; node 1 knows the new leader.
+// RED (one broker asked): the route stays on the dead node forever.
+TEST(GroupRoutingRegression, StaleMetadataFromOneBrokerDoesNotPinTheRouteToTheDeadLeaderRegression) {
+    GroupRig r(4315, 4316, failoverOpts());
+    const auto [n1, p1port] = r.addNode(4315);
+    const auto [n2, p2port] = r.addNode(4315);
+    r.gw.moreBrokers = {{1, "127.0.0.1", p1port}, {2, "127.0.0.1", p2port}};
+    r.gw.partitions  = {{1, 1, 1, 1, 4315, ""}, {2, 0, 2, 1, 4315, ""}};   // t/1 on node 1, b/0 on node 2
+    r.gw.groupProtocol = false;
+    r.connect();
+    ASSERT_TRUE(r.drive([&] {
+        return !r.client.testDataChannelFor(2, 0).empty() && !r.client.testDataChannelFor(1, 1).empty();
+    }));
+    rc::ProducerConfig pc;
+    pc.lingerUs = 0;
+    pc.deliveryTimeoutMs = 600'000;
+    auto p = r.client.producer(pc);
+    ASSERT_EQ(sendOne(r, p, "b", 1), rc::OpStatus::Ok);
+    ASSERT_EQ(r.gw.produced.back().endpoint, n2);
+    uint64_t k1 = 0;   // a key of t/1, so node 1's session is Connected
+    while (rc::Key(k1).partition(2) != 1) ++k1;
+    ASSERT_EQ(sendOne(r, p, "t", k1), rc::OpStatus::Ok);
+    ASSERT_EQ(r.gw.produced.back().endpoint, n1);
+
+    r.gw.deadEndpoints.insert(n2);   // b/0's leader dies; node 1 leads it now (epoch 2)
+    r.gw.partitionsAt[0]  = {{1, 1, 1, 1, 4315, ""}, {2, 0, 2, 1, 4315, ""}};   // the seed's broker lags
+    r.gw.partitionsAt[n1] = {{1, 1, 1, 1, 4315, ""}, {2, 0, 1, 2, 4315, ""}};
+    const auto st = sendOne(r, p, "b", 1, 6'000'000);
+    EXPECT_EQ(st, rc::OpStatus::Ok) << "b/0's record never reached its new leader";
+    EXPECT_EQ(r.gw.produced.back().endpoint, n1);
+}
+
+// M1: the CLIENT stalls past its response timeout (no doWork for 600 ms) while its
+// broker is healthy: the seed resumes there — never a failover away from it.
+// RED (an own-stall loss counts as a dead broker): the seed moves to node 1.
+TEST(GroupRoutingRegression, ClientStallDoesNotMoveTheSeedRegression) {
+    GroupRig r(4317, 4318, failoverOpts());
+    const auto [n1, p1port] = r.addNode(4317);
+    r.gw.moreBrokers = {{1, "127.0.0.1", p1port}};
+    r.gw.groupProtocol = false;
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return r.client.testMetadataResponses() > 0; }));
+    std::this_thread::sleep_for(600ms);   // the client stalls (nothing pumped)
+    EXPECT_TRUE(driveFor(r, 5s, [&] {
+        return r.client.testSessionStateAt(0) == rc::session::SessionState::Connected;
+    }));
+    (void)driveFor(r, 300ms, [] { return false; });
+    EXPECT_EQ(r.client.testSeedFailovers(), 0u) << "a client stall is not a dead broker";
+    EXPECT_FALSE(rc::agent::ClientAgent::sameEndpoint(r.client.testSeedChannel(), udp(p1port)));
+}
+
+// I7 (shard sibling): a reconnectForeverAfterLive client whose seed broker dies
+// reaches a live broker — the failover re-points the machine's own Backoff
+// attempts at the other broker.  RED (no failover): the machine alternates its
+// bootstrap and last-known leader — both the dead node — forever.
+TEST(GroupRoutingRegression, ShardClientSeedFailsOverToALiveBrokerRegression) {
+    RigOptions o = failoverOpts();
+    o.reconnectForever = true;
+    GroupRig r(4319, 4320, o);
+    const auto [n1, p1port] = r.addNode(4319);
+    r.gw.moreBrokers = {{1, "127.0.0.1", p1port}};
+    r.gw.groupProtocol = false;
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return r.client.testMetadataResponses() > 0; }));
+    r.gw.deadEndpoints.insert(0);
+    EXPECT_TRUE(driveFor(r, 10s, [&] {
+        return r.client.testSessionStateAt(0) == rc::session::SessionState::Connected &&
+               rc::agent::ClientAgent::sameEndpoint(r.client.testSeedChannel(), udp(p1port));
+    })) << "the shard client's seed never reached the live broker (seed on " << r.client.testSeedChannel() << ")";
+    (void)n1;
+}

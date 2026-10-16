@@ -114,6 +114,11 @@ struct InvokerGateway {
     int connects = 0;
     int metadataRequests = 0;
     std::vector<int> metadataEndpoints;   // the endpoint each MetadataRequest arrived on
+    // DR fix round 1: per-endpoint routing image (I4: a lagging node keeps naming the
+    // dead leader) and per-endpoint Connect refusal (I2: ConnectResponse{code}).
+    std::map<int, std::vector<PartitionAd>> partitionsAt;
+    std::map<int, int16_t>                  refuseConnectsWith;
+    int connectsArrived = 0;   // every ConnectRequest that arrived anywhere, dead endpoints included
     // F8a: direct subscriptions (Subscribe -> SubscribeResponse; Records pushes).
     struct Subscribed {
         int64_t subscriptionId;
@@ -576,7 +581,7 @@ struct InvokerGateway {
     }
 
     /// Unsolicited or solicited MetadataResponse from the node endpoint.
-    void sendMetadata(int64_t sessionId, int64_t correlationId) {
+    void sendMetadata(int64_t sessionId, int64_t correlationId, int endpoint = -1) {
         namespace rp = rune::protocol::client;
         std::vector<rp::BrokerEntry> brokers;
         if (!brokerHost.empty()) {
@@ -594,7 +599,8 @@ struct InvokerGateway {
             brokers.push_back(b);
         }
         std::vector<rp::PartitionEntry> parts;
-        for (const PartitionAd& ad : partitions) {
+        const auto over = partitionsAt.find(endpoint);   // DR fix round 1 (I4): a per-node routing image
+        for (const PartitionAd& ad : over != partitionsAt.end() ? over->second : partitions) {
             rp::PartitionEntry p;
             p.topicId         = ad.topicId;
             p.partition       = ad.partition;
@@ -952,6 +958,7 @@ private:
         namespace rp  = rune::protocol::client;
         const auto tid = rcc::peekTemplate(buf, len);
         if (!tid) return;
+        if (static_cast<rcc::TemplateId>(*tid) == rcc::TemplateId::Connect) ++connectsArrived;   // dead or not
         if (deadEndpoints.count(endpoint) != 0) return;  // a dead node hears nothing
         if (!replay) ++framesReceived;
         // Catalog history (Task 5, F7): a test-installed handler for this template
@@ -974,6 +981,14 @@ private:
             ++connectsAt[endpoint];
             connectCorrIds.push_back(c->correlationId);
             if (!replyConnects || silentEndpoints.count(endpoint) != 0) return;
+            if (const auto rf = refuseConnectsWith.find(endpoint); rf != refuseConnectsWith.end()) {
+                // DR fix round 1 (I2): this node refuses every Connect with a code.
+                uint8_t ro[64];
+                const std::size_t rn = rcc::encodeConnectResponse(ro, sizeof ro, rf->second, 0, 0, c->sessionId,
+                                                                  c->correlationId, advertisedBrokerVersion);
+                send(endpoint, ro, rn);
+                return;
+            }
             for (const Produced& pr : ackBeforeNextConnect) ack(pr);
             ackBeforeNextConnect.clear();
             int64_t sid = assignedSessionId;
@@ -1008,7 +1023,7 @@ private:
             metadataCorrIds.push_back(m->correlationId);
             metadataEndpoints.push_back(endpoint);   // DR client bug 1: which node was asked
             if (holdMetadata) return;
-            sendMetadata(m->sessionId, m->correlationId);
+            sendMetadata(m->sessionId, m->correlationId, endpoint);
             return;
         }
         case rcc::TemplateId::Produce: {

@@ -380,10 +380,13 @@ struct ClientConfig {
     // DR client bug 2: the deadline of Client::close()'s drain phase (every
     // producer flushed, every transactional producer closed).  At the deadline
     // close() tears down anyway: everything still pending completes exactly
-    // once (Closed) and close() returns — it never waits forever on a peer, a
-    // ring drain or a stuck duty step.  <= 0 = the default (65 s: above the
-    // default deliveryTimeoutMs 30 s and transactionOpTimeoutMs 60 s, so a
-    // normal drain is never cut short).
+    // once (Closed) and close() returns — it never waits forever on a peer or a
+    // command-ring drain.  <= 0 = the default, 65 s: above the DEFAULT
+    // deliveryTimeoutMs (30 s) and transactionOpTimeoutMs (60 s), so a normal
+    // drain is never cut short.  A producer configured with a larger
+    // deliveryTimeoutMs / transactionOpTimeoutMs has its drain cut at
+    // closeTimeoutMs — raise this to match.  Values above one year are clamped
+    // (never "forever"); closeImmediately() is the no-drain form.
     int64_t closeTimeoutMs = 65'000;
     // traceDdlRetries: record every FOLLOWED Redirect and every scheduled NotLeader
     // retry of a DDL (`rune ql --verbose`); read them with Client::takeDdlRetryNotes().
@@ -608,10 +611,14 @@ public:
     /// move of the seed to another broker), and the MetadataRequests sent on a
     /// non-seed session because the seed was not Connected.
     [[nodiscard]] uint64_t testSeedFailovers() const noexcept { return seedFailovers_; }
+    /// Fix round 1 (I2): failover moves that issued their own Connect (never, with reconnectForeverAfterLive).
+    [[nodiscard]] uint64_t testSeedFailoverConnects() const noexcept { return seedFailoverConnects_; }
     /// DR client bug 2 (after close): close() drains cut short by closeTimeoutMs.
     [[nodiscard]] uint64_t testCloseDeadlineHits() const noexcept { return closeDeadlineHits_; }
     [[nodiscard]] uint64_t testMetadataViaOtherSession() const noexcept { return metadataViaOtherSession_; }
     [[nodiscard]] const std::string& testSeedChannel() const noexcept { return agent_.seedChannel(); }
+    /// Fix round 1 test seam (duty thread / Invoker owner): an urgent metadata ask.
+    void testRequestMetadataNow() noexcept { lastUrgentMetadataNs_ = INT64_MIN; requestMetadataNow_(); }
     /// Test hook (duty-cycle thread only): agent session `i`'s state.
     [[nodiscard]] session::SessionState testSessionStateAt(uint32_t i) const noexcept { return agent_.sessionStateAt(i); }
     [[nodiscard]] uint64_t testSessionConnectFailuresAt(uint32_t i) const noexcept { return agent_.sessionConnectFailuresAt(i); }
@@ -1201,7 +1208,7 @@ private:
     // -------------------------------------------------------------------------
 
     /// Teardown shared by close() and ~Client (no contract checks; idempotent).
-    void closeImpl_();
+    void closeImpl_(bool drainDeadlineHit = false);
     /// The contract checks of close() / closeImmediately().
     void checkCloseCaller_(const char* what) const;
 
@@ -1246,6 +1253,7 @@ private:
     enum class CqRegistration : uint8_t { Registered, BornFinished, InDoubt };
     CqRegistration registerCq_(Completions& q, std::chrono::steady_clock::time_point deadline);
     static constexpr int64_t kDefaultCloseTimeoutMs = 65'000;
+    static constexpr int64_t kMaxCloseTimeoutMs     = 365LL * 24 * 3600 * 1000;   // fix round 1 (I5): one year
     uint64_t closeDeadlineHits_ = 0;   ///< close() drains cut short by closeTimeoutMs (test hook)
     void releaseCq_(Completions& q) noexcept;
     void applyCqAdd_(detail::CompletionRing* ring);
@@ -1500,16 +1508,32 @@ private:
         uint32_t attempt           = 0;    ///< candidates tried this episode
         int64_t  attemptDeadlineNs = 0;    ///< the current candidate's connect deadline (duty clock)
         int64_t  notBeforeNs       = 0;    ///< the next attempt never starts earlier (pacing)
+        int64_t  gapNs             = kSeedFailoverMinGapNs;  ///< fix round 1 (I2): doubles per attempt
+        int      backoffAttemptMoved = -1; ///< I2 (reconnectForever): the Backoff entry already re-pointed
     };
-    std::variant<SeedSteady, SeedFailingOver> seedFailover_;
+    /// Fix round 1 (I2): a non-retriable connect answer ended the episode — the
+    /// seed stays down (explicit) until it is Live again.
+    struct SeedFailoverStopped {};
+    std::variant<SeedSteady, SeedFailingOver, SeedFailoverStopped> seedFailover_;
     uint64_t seedFailoverLossesSeen_ = 0;  ///< the seed machine's staleSessionLosses() last seen
     uint64_t seedFailovers_          = 0;  ///< moves started (test hook)
+    uint64_t seedFailoverConnects_   = 0;  ///< fix round 1 (I2): moves that connected by themselves
     uint64_t metadataViaOtherSession_ = 0; ///< MetadataRequests sent on a non-seed session
     std::vector<std::string> seedCandidates_;  ///< cold scratch (capacity persists)
     static constexpr int64_t kSeedFailoverAttemptMaxNs = 10'000'000'000LL;  // 10 s per candidate
-    static constexpr int64_t kSeedFailoverMinGapNs     = 100'000'000LL;     // >= 100 ms between attempts
+    static constexpr int64_t kSeedFailoverMinGapNs     = 100'000'000LL;     // first gap 100 ms ...
+    static constexpr int64_t kSeedFailoverMaxGapNs     = 10'000'000'000LL;  // ... doubling, capped at 10 s
+    uint64_t seedMovesSeen_ = 0;           ///< fix round 1 (C1): agent_.seedMoves() last seen
+    int64_t  metadataAnswerByNs_ = 0;      ///< fix round 1 (M2): an unanswered MetadataRequest's due time (0 = none)
+    void noteMetadataSent_() noexcept;
+    bool offerMetadataOnNode_(uint32_t index) noexcept;
+    /// Fix round 1 (I4): one MetadataRequest on EVERY Connected session (route
+    /// failures); returns how many were sent.
+    int  sendMetadataRequestEverywhere_() noexcept;
+    /// Fix round 1 (I1): re-offer every in-flight batch on its current route.
+    void resendAllInFlightViaRoute_() noexcept;
     int  driveSeedFailover_(int64_t nowNs) noexcept;
-    bool startSeedFailoverAttempt_(SeedFailingOver& f, int64_t nowNs) noexcept;
+    bool startSeedFailoverAttempt_(SeedFailingOver& f, int64_t nowNs, bool connectNow = true) noexcept;
     /// A MetadataRequest on the seed when it is Connected, else on any Connected
     /// node session (the new leader is learnt from any live broker).  False when
     /// no session is Connected (the caller arms the backoff refresh).
@@ -1882,7 +1906,7 @@ private:
     // sendMetadataRequest() — encodes and submits a MetadataRequest for all
     // topics to the agent ring.  Called on the runner thread after
     // ConnectResponse{OK} and by the backoff refresh sweep.
-    void sendMetadataRequest(int64_t sessionId) noexcept;
+    bool sendMetadataRequest(int64_t sessionId) noexcept;   // false: not submitted (fix round 1 M2)
 
     // scheduleMetadataRefresh() — arm a background metadata refresh with
     // exponential backoff (IMPORTANT-3).  Called on no-progress.  The backoff

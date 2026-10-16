@@ -251,8 +251,8 @@ public:
         return table_.size();
     }
 
-    /// DR client bug 1: every known broker's "host:port", in node id order is NOT
-    /// guaranteed (hash order) — callers that need a stable order sort.  Cold.
+    /// DR client bug 1: every known broker's (nodeId, "host:port"), in hash order,
+    /// not node-id order — callers that need a stable order sort.  Cold.
     template <class F>
     void forEachBrokerEndpoint(F&& f) const {
         for (const auto& [nodeId, ep] : endpoints_) f(nodeId, ep);
