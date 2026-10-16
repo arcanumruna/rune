@@ -21,22 +21,17 @@
 FROM gcc:13 AS builder
 
 ARG CMAKE_VERSION=3.31.5
-ARG TARGETARCH
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-pip python3-venv git curl ninja-build pkg-config \
-        default-jdk-headless uuid-dev zlib1g-dev ccache \
+        default-jdk-headless uuid-dev zlib1g-dev \
     && rm -rf /var/lib/apt/lists/* \
     && pip3 install --no-cache-dir --break-system-packages "conan~=2.0"
 
 ENV JAVA_HOME=/usr/lib/jvm/default-java
 
-# ccache: compiler launcher for the app build (cache lives in a BuildKit cache mount, so it
-# survives source edits).  Source path is always /build (+ fixed /rune-* siblings), so no
-# CCACHE_BASEDIR is needed; COMPILERCHECK=content keys on the compiler binary, not mtime.
-ENV CCACHE_DIR=/root/.ccache CCACHE_MAXSIZE=5G CCACHE_COMPILERCHECK=content
-
 # Multi-arch (native arm64 on Apple Silicon Docker Desktop): pick the CMake build for the target arch.
+ARG TARGETARCH
 RUN case "${TARGETARCH}" in arm64) CMAKE_ARCH=aarch64 ;; *) CMAKE_ARCH=x86_64 ;; esac \
     && curl -LO https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-${CMAKE_ARCH}.tar.gz \
     && tar -xzf cmake-${CMAKE_VERSION}-linux-${CMAKE_ARCH}.tar.gz --strip-components=1 -C /usr/local \
@@ -48,15 +43,7 @@ RUN conan profile detect --force
 
 # Conan install (cached independently of source edits).
 COPY conanfile.py conandata.yml VERSION.txt ./
-# The conan cache (/root/.conan2/p: packages + build dirs + sqlite db) is a BuildKit cache mount, so a
-# conanfile change does not rebuild aeron from scratch.  Mount contents are NOT part of the layer, but
-# conan-release/ (the generated toolchain) points into /root/.conan2/p/... -- so copy the cache into the
-# layer at /opt/conan-p and symlink /root/.conan2/p to it in the next step.
-# Requires BuildKit (--mount is a hard error on the legacy builder).
-RUN --mount=type=cache,target=/root/.conan2/p,id=rune-conan-${TARGETARCH} \
-    conan install . --output-folder=conan-release --build=missing -s build_type=Release \
-    && cp -a /root/.conan2/p /opt/conan-p
-RUN rmdir /root/.conan2/p && ln -s /opt/conan-p /root/.conan2/p
+RUN conan install . --output-folder=conan-release --build=missing -s build_type=Release
 
 # rune-protocol sibling headers.
 COPY --from=rune-protocol include /rune-protocol/include
@@ -91,13 +78,9 @@ COPY --from=rune-crypto include /rune-crypto/include
 COPY . .
 
 # Build dr_client only.
-RUN --mount=type=cache,target=/root/.ccache,id=rune-ccache-${TARGETARCH} \
-    --mount=type=cache,target=/build/build,id=rune-build-drclient-${TARGETARCH},sharing=locked \
-    cmake -S . -B build -G Ninja \
+RUN cmake -S . -B build -G Ninja \
         -DCMAKE_TOOLCHAIN_FILE=conan-release/build/Release/generators/conan_toolchain.cmake \
         -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-        -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
         -DBUILD_TESTING=OFF \
         -DBUILD_BENCHMARKS=OFF \
         -DBUILD_EXAMPLES=ON \
@@ -106,9 +89,7 @@ RUN --mount=type=cache,target=/root/.ccache,id=rune-ccache-${TARGETARCH} \
         -DRUNE_QL_ROOT=/rune-ql \
         -DRUNE_FR_DIR=/rune-fr \
         -DRUNE_CRYPTO_ROOT=/rune-crypto \
-    && cmake --build build --target dr_client -j2 \
-    && mkdir -p /build/out && cp build/dr_client /build/out/ \
-    && ccache -s
+    && cmake --build build --target dr_client -j2
 
 RUN cp -L /usr/local/lib64/libstdc++.so.6 /build/libstdc++.so.6
 
@@ -122,7 +103,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libuuid1 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /build/out/dr_client /usr/local/bin/dr_client
+COPY --from=builder /build/build/dr_client /usr/local/bin/dr_client
 # Multi-arch: the multiarch lib dir is x86_64-linux-gnu or aarch64-linux-gnu (= uname -m).
 COPY --from=builder /build/libstdc++.so.6 /tmp/libstdc++.so.6.0.32
 RUN mv /tmp/libstdc++.so.6.0.32 /usr/lib/$(uname -m)-linux-gnu/libstdc++.so.6.0.32 && ldconfig
