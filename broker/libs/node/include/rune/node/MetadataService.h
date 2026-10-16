@@ -983,7 +983,16 @@ public:
     /// `node`).  `userOnly`: a stopping controller, before it resigns.
     bool shutdownComplete_(int32_t node, NodeLifecycle& st, bool userOnly) {
         namespace rr = rune::replication;
+        // The user-only scope is the STOPPING CONTROLLER's pre-resign view: only this controller judging its own
+        // shutdown uses it.  A successor holds the mark the old controller's Draining broadcasts left (userOnly)
+        // — judged on user partitions alone it confirmed COMPLETE while members still routed the coordinator
+        // partitions to the stopping node.  Another node's shutdown is always judged on the full scope.
+        userOnly = userOnly && node == selfId_;
         if (controlledShutdownBlocking(msm_.committedMap(), node, userOnly) != 0) return false;
+        // A controller that has not learnt the live set yet (no rebalance tick since it became controller — a
+        // successor right after the old controller resigned) cannot know whom to wait for: an empty eligible_
+        // would confirm COMPLETE before any member routes around the node.  The first tick re-checks (below).
+        if (!eligibleKnown_) return false;
         const int32_t need = userOnly ? rr::AlterIsrMsg::kConfirmUserClear : rr::AlterIsrMsg::kConfirmAllClear;
         for (int32_t n : eligible_) {
             if (n == selfId_ || n == node || isShutting_(n)) continue;
@@ -1753,7 +1762,10 @@ public:
         // (a stopping node is never admitted either — checked live there).
         const std::vector<int32_t>& shutting = shuttingNodes_();
         eligible_.assign(eligibleNodes.begin(), eligibleNodes.end());
+        const bool firstLiveSet = !eligibleKnown_;
         eligibleKnown_ = true;
+        if (firstLiveSet && !shutting.empty())   // a pending COMPLETE waited for the live set: an event, not a re-send
+            for (auto& [n, st] : nodeLifecycle_) maybePushComplete_(n, st);
         revokeDeadLineageIdentities_();   // R1 (round 5)
 
         // MEDIUM-B: coordinator partitions (controller-ISR path).

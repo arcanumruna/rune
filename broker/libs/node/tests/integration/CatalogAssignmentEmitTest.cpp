@@ -1593,6 +1593,75 @@ TEST(ControlledShutdownControllerRegression, StoppingLeaderHandsOffToAnIsrMember
     EXPECT_EQ(c.pa().leaderEpoch, le + 1);
 }
 
+// Merge fix (fix/dr-bugs -> feat/catalog-history, 2026-10-16): a controller that has not yet learnt the live set
+// (no rebalance tick since it became controller: a successor right after the old controller resigned) must not
+// push COMPLETE.  With the eligible set unknown, shutdownComplete_ waited for NOBODY: COMPLETE went out before a
+// single member confirmed that its own map routes around the stopping node, and the stopping node exited while a
+// survivor still routed the coordinator partitions to it (ControlledShutdownRegression.ControllerGraceful...
+// failed about 1 run in 10).  RED: the gate removed (COMPLETE at once, no confirmation).
+TEST(ControlledShutdownControllerRegression, ControllerWithAnUnknownLiveSetNeverConfirmsAShutdownRegression) {
+    CtlRig c;
+    const int32_t L = c.pa().leaderNode;
+    const int32_t F = L == 1 ? 2 : 1;
+    const int32_t O = 6 - L - F;
+    for (int32_t n : {1, 2, 3}) (void)c.svc->onAlterIsr(nodeControl(n, 20 + n, false));   // every member speaks the protocol
+    ASSERT_TRUE(proposeIsr(c, {L, O}));   // F already left every ISR: its map is clear with no controller tick
+    ASSERT_EQ(std::count(c.pa().isr.begin(), c.pa().isr.end(), F), 0);
+    rune::replication::AlterIsrResponseMsg resp{};
+    bool answer = false;
+    (void)c.svc->onAlterIsr(nodeControl(F, 7, /*shutdown=*/true), &resp, &answer);
+    ASSERT_TRUE(answer);
+    EXPECT_EQ(resp.errorCode, rune::replication::AlterIsrMsg::kNodeShutdownPending)
+        << "COMPLETE from a controller that does not know the live set yet (no member confirmed)";
+    c.tick();   // the live set is known now: still the members' confirmations to wait for
+    resp = {}; answer = false;
+    (void)c.svc->onAlterIsr(nodeControl(F, 7, true), &resp, &answer);
+    EXPECT_EQ(resp.errorCode, rune::replication::AlterIsrMsg::kNodeShutdownPending) << "COMPLETE before the members confirmed";
+    for (int32_t member : {L, O}) {
+        if (member == 1) continue;   // the controller itself
+        auto conf = nodeControl(F, 7, false);
+        conf.isr[1] = rune::replication::AlterIsrMsg::kNodeShutdownConfirm;
+        conf.isr[2] = member;
+        conf.isr[5] = rune::replication::AlterIsrMsg::kConfirmUserClear | rune::replication::AlterIsrMsg::kConfirmAllClear;
+        (void)c.svc->onAlterIsr(conf);
+    }
+    resp = {}; answer = false;
+    (void)c.svc->onAlterIsr(nodeControl(F, 7, true), &resp, &answer);
+    EXPECT_EQ(resp.errorCode, rune::replication::kAlterIsrOk) << "never COMPLETE once the live set is known and confirmed";
+}
+
+// Merge fix (2): the user-only scope belongs to a stopping node that IS the controller (its pre-resign view).  Its
+// successor still held the mark the old controller's Draining broadcasts left (userOnly), and pushed COMPLETE on
+// the members' USER-clear confirmations alone — the stopping node exited while a survivor still routed the
+// coordinator partitions to it.  A controller judging ANOTHER node's shutdown always uses the full scope.
+// RED: the scope taken from the mark (COMPLETE on user-clear confirmations).
+TEST(ControlledShutdownControllerRegression, SuccessorNeverConfirmsAFormerControllersShutdownOnUserPartitionsAloneRegression) {
+    CtlRig c(/*userTopics=*/false);   // the coordinator partition (-1, 0) only
+    for (int32_t n : {1, 2, 3}) (void)c.svc->onAlterIsr(nodeControl(n, 20 + n, false));
+    c.tick();
+    const int32_t F = 2, O = 3;   // this controller is node 1
+    auto req = nodeControl(F, 7, /*shutdown=*/true);
+    req.isr[1] |= rune::replication::AlterIsrMsg::kNodeShutdownUserOnly;   // the mark of F's pre-resign Draining
+    (void)c.svc->onAlterIsr(req);
+    for (int i = 0; i < 3; ++i) c.tick();
+    auto conf = nodeControl(F, 7, false);
+    conf.isr[1] = rune::replication::AlterIsrMsg::kNodeShutdownConfirm;
+    conf.isr[2] = O;
+    conf.isr[5] = rune::replication::AlterIsrMsg::kConfirmUserClear;   // O still routes a coordinator partition to F
+    (void)c.svc->onAlterIsr(conf);
+    rune::replication::AlterIsrResponseMsg resp{};
+    bool answer = false;
+    (void)c.svc->onAlterIsr(req, &resp, &answer);
+    ASSERT_TRUE(answer);
+    EXPECT_EQ(resp.errorCode, rune::replication::AlterIsrMsg::kNodeShutdownPending)
+        << "COMPLETE for another node's shutdown on user-partition confirmations alone";
+    conf.isr[5] = rune::replication::AlterIsrMsg::kConfirmUserClear | rune::replication::AlterIsrMsg::kConfirmAllClear;
+    (void)c.svc->onAlterIsr(conf);
+    resp = {}; answer = false;
+    (void)c.svc->onAlterIsr(req, &resp, &answer);
+    EXPECT_EQ(resp.errorCode, rune::replication::kAlterIsrOk) << "never COMPLETE once every member routes around F";
+}
+
 TEST(ControlledShutdownControllerRegression, SoleIsrPartitionStaysWithTheStoppingLeaderRegression) {
     CtlRig c;
     c.soleIsr();
