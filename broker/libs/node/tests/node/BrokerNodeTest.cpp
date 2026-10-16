@@ -2315,9 +2315,10 @@ TEST(BrokerNodeRegression, StartupWarnsAboutAnEphemeralBoundPortRegression) {
     std::error_code ec; fs::remove_all(dir, ec);
 }
 
-// Review B-M1: in legacy mode a per-worker egress whose control port cannot be bound refuses to start — never a
-// WARN-and-disable that silently drops that worker to legacy egress.  RED: the old WARN (start() succeeds).
-TEST(BrokerNodeRegression, LegacyPerWorkerEgressBindFailureRefusesToStartRegression) {
+// Review B-M1 / re-check I4: in legacy mode a per-worker egress whose control port is TAKEN refuses to start at the
+// bind ANCHOR (start(), before any publication) — naming the endpoint and the reserving sysctl.  RED: no anchor (the
+// buildWorkerPool backstop then fires with a different message).
+TEST(BrokerNodeRegression, LegacyPerWorkerEgressControlPortTakenRefusesAtTheBindAnchorRegression) {
     const fs::path dir = makeTempDataDir("legegress_");
     NodeConfig cfg = makeSingleNodeConfig(dir);
     cfg.workerMode = NodeConfig::WorkerMode::Legacy;
@@ -2342,7 +2343,8 @@ TEST(BrokerNodeRegression, LegacyPerWorkerEgressBindFailureRefusesToStartRegress
     }
     ::close(squat);
     EXPECT_TRUE(refused) << "a taken per-worker egress control port must refuse the start";
-    EXPECT_NE(what.find("refusing to start"), std::string::npos) << what;
+    EXPECT_NE(what.find("fixed endpoint"), std::string::npos) << what;
+    EXPECT_NE(what.find("ip_local_reserved_ports"), std::string::npos) << what;
     std::error_code ec; fs::remove_all(dir, ec);
 }
 } // namespace rune::node
@@ -2377,6 +2379,55 @@ TEST(BrokerNodeRegression, UnbindableAdvertisedAddressWithPeerBindOverrideStarts
         EXPECT_EQ(node.bindAnchorsForTest(), 6u);
         node.stop();
     }
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+} // namespace rune::node
+
+namespace rune::node {
+namespace {
+std::string startAndCatch(NodeConfig cfg, int32_t forceUnresolved) {
+    std::string what;
+    BrokerNode node{cfg};
+    node.forceWorkerEgressUnresolvedForTest(forceUnresolved);
+    try { node.start(); } catch (const std::exception& e) { what = e.what(); }
+    if (what.empty()) node.stop();
+    return what;
+}
+} // namespace
+
+// Re-check I4: the B-M1 BACKSTOP — a legacy WorkerEgress that does not resolve AFTER its anchor bound (a driver
+// timeout, a channel-parameter clash) refuses to start; never the old WARN-and-disable (that worker would silently
+// serve legacy egress).  RED: the old WARN-and-continue in buildWorkerPool (start succeeds).
+TEST(BrokerNodeRegression, LegacyPerWorkerEgressUnresolvedAfterItsAnchorRefusesToStartRegression) {
+    const fs::path dir = makeTempDataDir("legunres_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    cfg.workerMode = NodeConfig::WorkerMode::Legacy;
+    cfg.runtimePlacement = NodeConfig::RuntimePlacement::Thread;
+    cfg.perWorkerEgressEnabled = true;
+    cfg.workerCount = 1;
+    cfg.workerEgressControlBasePort = rune::node::test::freeUdpPort();
+    const std::string what = startAndCatch(cfg, /*forceUnresolved=*/0);
+    EXPECT_NE(what.find("per-worker egress for worker 0"), std::string::npos) << what;
+    EXPECT_NE(what.find("would silently fall back"), std::string::npos) << what;
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+
+// Re-check I4 (shard twin): a shard's egress that does not resolve after its anchor refuses at attachShardRuntimes_.
+// RED: the forced-unresolved check removed from the shard path (start succeeds).
+TEST(BrokerNodeRegression, ShardEgressUnresolvedAfterItsAnchorRefusesToStartRegression) {
+    const fs::path dir = makeTempDataDir("shardunres_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    cfg.workerMode = NodeConfig::WorkerMode::Shard;
+    cfg.runtimePlacement = NodeConfig::RuntimePlacement::Thread;
+    cfg.workerCount = 1;
+    cfg.peers[0].ingressBasePort = rune::node::test::freeUdpPort();
+    cfg.peers[0].replBasePort = rune::node::test::freeUdpPort();
+    cfg.peers[0].egressControlBasePort = rune::node::test::freeUdpPort();
+    cfg.workerIngressBasePort = cfg.peers[0].ingressBasePort;
+    cfg.workerReplBasePort = cfg.peers[0].replBasePort;
+    cfg.workerEgressControlBasePort = cfg.peers[0].egressControlBasePort;
+    const std::string what = startAndCatch(cfg, /*forceUnresolved=*/0);
+    EXPECT_NE(what.find("shard 0 ingress/egress did not resolve"), std::string::npos) << what;
     std::error_code ec; fs::remove_all(dir, ec);
 }
 } // namespace rune::node

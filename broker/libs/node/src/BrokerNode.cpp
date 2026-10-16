@@ -556,11 +556,11 @@ void BrokerNode::start() {
             subs.push_back(config_.shardIngressBindChannel(0));
             subs.push_back(config_.shardReplBindChannel(0));
             pubs.push_back("aeron:udp?control-mode=dynamic|control=" + egHost + ":" +
-                           std::to_string(config_.effectiveWorkerEgressControlBasePort()));
+                           std::to_string(config_.effectiveWorkerEgressControlBasePort()) + kAnchorPubTerm);
         } else if (!config_.shardMode() && config_.perWorkerEgressEnabled) {
             for (int32_t w = 0; w < W; ++w)
                 pubs.push_back("aeron:udp?control-mode=dynamic|control=" + egHost + ":" +
-                               std::to_string(config_.effectiveWorkerEgressControlBasePort() + w));
+                               std::to_string(config_.effectiveWorkerEgressControlBasePort() + w) + kAnchorPubTerm);
         }
         rune::aeronutil::AeronPump threadedPump;   // the node driver runs its own threads / the startup pump here
         anchorFixedEndpoints_(aeron_, subs, pubs, threadedPump, "node driver");
@@ -1750,7 +1750,7 @@ void BrokerNode::buildWorkerPool() {
                 const std::string control  = config_.effectiveWorkerEgressControlHost() + ":" +
                     std::to_string(config_.effectiveWorkerEgressControlBasePort() + i);
                 auto eg = std::make_unique<WorkerEgress>(aeron_, control, egStream);
-                if (!eg->resolved()) {
+                if (!eg->resolved() || i == forceEgressUnresolvedForTest_) {
                     // Review B-M1: never a silent WARN-and-disable (that worker would quietly drop to legacy
                     // egress) — the same rule as the shard path: refuse to start, naming the control endpoint.
                     throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: per-worker "
@@ -4250,6 +4250,10 @@ int BrokerNode::checkLinkMtu_(int64_t nowNs, bool force) {
 
 // Review A-I5: see BrokerNode.h (bindAnchorSubs_).  A fixed port that cannot be bound is a refusal naming the
 // port's channel and the sysctl that reserves it (Aeron's own error says only "Address already in use").
+// Re-check M2: an anchor publication never carries data — the minimum term (64 KiB) keeps its 3-term log buffer
+// out of the /dev/shm budget (exclusive publications on one send endpoint may differ in term length).
+const char* const BrokerNode::kAnchorPubTerm = "|term-length=65536";
+
 void BrokerNode::anchorFixedEndpoints_(const std::shared_ptr<aeron::Aeron>& client,
                                        const std::vector<std::string>& subs, const std::vector<std::string>& pubs,
                                        rune::aeronutil::AeronPump& pump, const char* where) {
@@ -4272,6 +4276,7 @@ void BrokerNode::anchorFixedEndpoints_(const std::shared_ptr<aeron::Aeron>& clie
         } catch (const std::exception& e) { err = e.what(); }
         if (!s) refuse(ch, err.empty() ? std::string("not resolved") : err);
         bindAnchorSubs_.push_back(std::move(s));
+        bindAnchorChannels_.push_back(ch);
     }
     for (const auto& ch : pubs) {
         bool failed = false;
@@ -4286,7 +4291,12 @@ void BrokerNode::anchorFixedEndpoints_(const std::shared_ptr<aeron::Aeron>& clie
         } catch (const std::exception& e) { err = e.what(); }
         if (!p) refuse(ch, err.empty() ? std::string("not resolved") : err);
         bindAnchorPubs_.push_back(std::move(p));
+        bindAnchorChannels_.push_back(ch);
     }
+}
+
+void BrokerNode::holdTransientLineageForTest(bool hold) {
+    (void)onControlThreadForTest([this, hold]() -> int64_t { holdTransientLineageForTest_ = hold; return 0; });
 }
 
 int32_t BrokerNode::runMtuWatchdogForTest() {
@@ -4997,7 +5007,7 @@ void BrokerNode::attachShardRuntimes_() {
             std::vector<std::string> subs{config_.shardIngressBindChannel(w), config_.shardReplBindChannel(w)};
             std::vector<std::string> pubs{"aeron:udp?control-mode=dynamic|control=" +
                                           config_.effectiveWorkerEgressControlHost() + ":" +
-                                          std::to_string(egressControlBase + w)};
+                                          std::to_string(egressControlBase + w) + kAnchorPubTerm};
             anchorFixedEndpoints_(shardClients_[idx], subs, pubs, pump, "shard driver");
         }
         if (!perWorkerReplTransports_.empty()) {
@@ -5040,7 +5050,7 @@ void BrokerNode::attachShardRuntimes_() {
                                                    config_.clientEndpoint.streamId, pump);
         const std::string control = config_.effectiveWorkerEgressControlHost() + ":" + std::to_string(egressControlBase + w);
         auto eg = std::make_unique<WorkerEgress>(shardClients_[idx], control, egressBase + w, pump);
-        if (!ing->resolved() || !eg->resolved())
+        if (!ing->resolved() || !eg->resolved() || w == forceEgressUnresolvedForTest_)
             throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: shard " +
                                      std::to_string(w) + " ingress/egress did not resolve — refusing to start");
         Worker& wk = workerPool_->worker(w);
@@ -5124,7 +5134,8 @@ uint64_t BrokerNode::transientLineageTrampoline_(void* ctx, int32_t topicId, int
     // the gateway and the MetadataService all run on the NodeRuntimeAgent.
     auto* self = static_cast<BrokerNode*>(ctx);
     if (!isTransientTopicTrampoline_(ctx, topicId)) return 0;   // a disk partition: no lineage
-    if (self->metadataService_ == nullptr) return GroupCoordinationService::kLineagePending;
+    if (self->metadataService_ == nullptr || self->holdTransientLineageForTest_) [[unlikely]]
+        return GroupCoordinationService::kLineagePending;
     static_assert(GroupCoordinationService::kLineagePending == rune::metadata::kLineageUntrusted);
     return self->metadataService_->trustedTransientLineage(topicId, partition);   // residual N1
 }

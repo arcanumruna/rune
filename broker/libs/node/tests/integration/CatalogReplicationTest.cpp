@@ -811,3 +811,30 @@ TEST(CatalogAlterIsrRelayRegression, StaleAnswerThroughTheCatalogRelayKeepsThePr
     EXPECT_FALSE(rig.replica->isrProposalPendingForTest()) << "the relay lost partitionEpoch: its own InvalidRequest "
                                                               "no longer clears the proposal";
 }
+
+// Re-check M1 + M2: the anchors in thread placement (node driver 3 subscriptions; shard driver 2 subscriptions + 1
+// MDC publication) and legacy per-worker egress (3 + W), every anchor publication at the minimum term.
+// RED: delete the attachShardRuntimes_ anchor call (3), the legacy `pubs` loop (3), the term-length suffix.
+namespace {
+void expectAnchorPubsAtMinimumTerm(BrokerNode& n) {
+    int pubs = 0;
+    for (const auto& ch : n.bindAnchorChannelsForTest()) {
+        if (ch.find("control-mode=dynamic") == std::string::npos) continue;
+        ++pubs;
+        EXPECT_NE(ch.find("term-length=65536"), std::string::npos) << "an anchor publication at the default term: " << ch;
+    }
+    EXPECT_GE(pubs, 1);
+}
+} // namespace
+TEST(BindOrderRegression, ThreadPlacementShardDriverIsAnchoredRegression) {
+    ThreeNodes c = ThreeNodes::start("anchors-t", {1}, Mode::Shard);
+    EXPECT_EQ(c.node(1).bindAnchorsForTest(), 6u) << "node driver 3 + shard driver 2 subscriptions + 1 publication";
+    expectAnchorPubsAtMinimumTerm(c.node(1));
+}
+TEST(BindOrderRegression, LegacyPerWorkerEgressIsAnchoredRegression) {
+    ThreeNodes c = ThreeNodes::start("anchors-l", {}, Mode::Legacy);
+    c.configTweak = [](NodeConfig& cfg) { cfg.perWorkerEgressEnabled = true; };
+    c.startNode(1);
+    EXPECT_EQ(c.node(1).bindAnchorsForTest(), 4u) << "consensus + replication + client + one per-worker egress (W=1)";
+    expectAnchorPubsAtMinimumTerm(c.node(1));
+}

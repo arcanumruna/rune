@@ -1609,6 +1609,14 @@ public:
     void setMtuProbeForTest(std::function<int32_t()> f) { mtuProbeForTest_ = std::move(f); }
     /// Review B-M5 test seam (cold, before start()): edits the probed host facts before they are applied.
     void setHostNetFactsOverrideForTest(std::function<void(HostNetFacts&)> f) { hostFactsOverrideForTest_ = std::move(f); }
+    /// Re-check I5 test seam (cold): while held, this node's transient lineage reads UNKNOWN (as right after a
+    /// restart, before its metadata replica applied the new lineage).  Written on the control thread (hop).
+    void holdTransientLineageForTest(bool hold);
+    /// Re-check I4 test seam (cold, before start()): worker `w`'s egress is treated as unresolved AFTER its bind
+    /// anchor bound (a driver timeout / channel clash) — reaches the buildWorkerPool / attachShardRuntimes_ backstops.
+    void forceWorkerEgressUnresolvedForTest(int32_t w) noexcept { forceEgressUnresolvedForTest_ = w; }
+    /// Re-check M2: the anchor channels resolved at start (subscriptions, then publications).
+    [[nodiscard]] const std::vector<std::string>& bindAnchorChannelsForTest() const noexcept { return bindAnchorChannels_; }
     /// Review A-I5: the bind anchors resolved at start (subscriptions + MDC publications).
     [[nodiscard]] std::size_t bindAnchorsForTest() const noexcept { return bindAnchorSubs_.size() + bindAnchorPubs_.size(); }
     int32_t runMtuWatchdogForTest();
@@ -2048,12 +2056,16 @@ private:
     std::shared_ptr<aeron::Counter> linkMtuCounter_;
     std::function<int32_t()> mtuProbeForTest_;   ///< cold test seam (setMtuProbeForTest)
     std::function<void(HostNetFacts&)> hostFactsOverrideForTest_;   ///< cold test seam (B-M5)
+    bool holdTransientLineageForTest_ = false;   ///< control thread only (holdTransientLineageForTest)
+    int32_t forceEgressUnresolvedForTest_ = -1;  ///< startup thread only (forceWorkerEgressUnresolvedForTest)
+    std::vector<std::string> bindAnchorChannels_;   ///< startup thread only (bindAnchorChannelsForTest)
     int checkLinkMtu_(int64_t nowNs, bool force);
     // Review A-I5 (fix round 1): bind anchors — every fixed-port receive endpoint (and per-worker MDC egress
     // control endpoint) of a driver is BOUND before that driver's first publication auto-binds an ephemeral
     // port.  An anchor shares the component's exact channel (so its endpoint) on a reserved stream no
     // publisher ever uses: no image, no back-pressure.  Held until stop().
     static constexpr int32_t kBindAnchorStreamId = 0x7E5E0A7E;
+    static const char* const kAnchorPubTerm;
     std::vector<std::shared_ptr<aeron::Subscription>>         bindAnchorSubs_;
     std::vector<std::shared_ptr<aeron::ExclusivePublication>> bindAnchorPubs_;
     void anchorFixedEndpoints_(const std::shared_ptr<aeron::Aeron>& client, const std::vector<std::string>& subs,
