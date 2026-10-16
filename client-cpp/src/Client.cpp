@@ -2980,15 +2980,21 @@ void Client::onEgressFrame(codec::TemplateId tid,
                 // does not forward streamId.  As a pragmatic safe fallback we use
                 // stream 0 (default) for the resend after redirect; per-worker routing
                 // resumes on the next fresh produce cycle via flushBatches.
-                std::function<bool(int32_t, int32_t, int32_t, const uint8_t*, std::size_t)> sendFn =
-                    [this](int32_t /*topicId*/, int32_t /*partition*/,
-                           int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
-                        return agent_.submitSend(fb, fl);
-                    };
-                producerHub_.resendAllRedirected(newSessionId, sendFn);
-                // Fix round 2 (C-1 / M-1): this Connected edge's in-flight re-offer is done —
-                // the dutyCycle edge handler must not re-offer them a second time.
-                seedConnectEpochSeen_ = agent_.connectedEpoch(0);
+                // Fix round 3 (N-M1): under TLS this OK arrives while the seed is still
+                // Handshaking — a ring resend now is dropped at the drain (no Connected
+                // session) or races the handshake's completion into a second send.  Then
+                // the seed's Connected edge (dutyCycle) re-offers the in-flight batches
+                // ONCE, restamped; only a plaintext (already Connected) answer resends here
+                // and marks that edge handled.
+                if (agent_.seedMachine().state() == session::SessionState::Connected) {
+                    std::function<bool(int32_t, int32_t, int32_t, const uint8_t*, std::size_t)> sendFn =
+                        [this](int32_t /*topicId*/, int32_t /*partition*/,
+                               int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
+                            return agent_.submitSend(fb, fl);
+                        };
+                    producerHub_.resendAllRedirected(newSessionId, sendFn);
+                    seedConnectEpochSeen_ = agent_.connectedEpoch(0);   // C-1 / M-1: this edge's re-offer is done
+                }
                 subscriber::SubscriberHub::SendFn subSendFn =
                     [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
                         return agent_.submitSend(fb, fl);

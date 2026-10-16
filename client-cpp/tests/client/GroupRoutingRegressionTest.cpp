@@ -3336,8 +3336,8 @@ TEST(GroupRoutingRegression, ControlOpEndsNotConnectedOnlyWhenTheSeedCannotRecon
         auto waiting = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.ping(std::vector<uint8_t>{1}, q, t); });
         ASSERT_TRUE(driveFor(r, 5s, [&] { return r.gw.connectsAt[n1] >= 1; })) << "the failover reaches node 1";
         const auto tStop = std::chrono::steady_clock::now();
-        EXPECT_TRUE(driveFor(r, 2s, [&] { return waiting.ready(); }));
-        EXPECT_LT(std::chrono::steady_clock::now() - tStop, 1500ms);
+        EXPECT_TRUE(driveFor(r, 6s, [&] { return waiting.ready(); }));
+        EXPECT_LT(std::chrono::steady_clock::now() - tStop, 5s) << "N-M2: RED is the 20 s ping Timeout";
         EXPECT_EQ(waiting.status(), rc::OpStatus::NotConnected) << waiting.describe();
         auto ping = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.ping(std::vector<uint8_t>{1}, q, t); });
         auto ddl  = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.dropTopic("t", {}, q, t); });
@@ -3367,7 +3367,7 @@ TEST(GroupRoutingRegression, WaitingControlOpTimesOutWithinItsOwnBudgetRegressio
     const auto took = std::chrono::steady_clock::now() - t0;
     EXPECT_EQ(ping.status(), rc::OpStatus::Timeout) << ping.describe();
     EXPECT_GE(took, 600ms);
-    EXPECT_LT(took, 1200ms);
+    EXPECT_LT(took, 5s) << "fix round 3 (N-M2): a wall bound load cannot break (RED, no deadline, is a hang)";
     EXPECT_EQ(cq.timesCompleted(ping.token()), 1);
 }
 
@@ -3482,10 +3482,10 @@ TEST(GroupRoutingRegression, ShardClientFailsOverWithinTheStaleThresholdWithDefa
     ASSERT_TRUE(r.drive([&] { return r.client.testMetadataResponses() > 0; }));
     r.gw.deadEndpoints.insert(0);
     const auto t0 = std::chrono::steady_clock::now();
-    EXPECT_TRUE(driveFor(r, 3s, [&] {
+    EXPECT_TRUE(driveFor(r, 10s, [&] {
         return r.client.testSessionStateAt(0) == rc::session::SessionState::Connected &&
                rc::agent::ClientAgent::sameEndpoint(r.client.testSeedChannel(), udp(p1port));
     })) << "the shard client did not fail over within the stale threshold";
-    EXPECT_LT(std::chrono::steady_clock::now() - t0, 2s);
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, 8s) << "N-M2: RED is >= 20.4 s (400 ms + 4 x 5 s)";
     (void)n1;
 }

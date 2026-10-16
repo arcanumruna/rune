@@ -1100,6 +1100,9 @@ if(BUILD_TESTING)
             rune_client_subscriber
             GTest::gtest_main
         )
+        # DR client bugs fix round 3 (N-M1): the TLS redirect gateway's test certificates.
+        target_compile_definitions(rune_redirect_tests PRIVATE
+            RUNE_CRYPTO_TESTDATA_DIR="${RUNE_CRYPTO_ROOT}/tests/testdata")
 
         gtest_discover_tests(rune_redirect_tests)
 

@@ -298,8 +298,11 @@ public:
     /// was not shown dead.
     [[nodiscard]] uint64_t ownStallLosses() const noexcept { return ownStallLosses_; }
     /// DR client bugs fix round 1 (I2): the error code of the latest connect
-    /// attempt refused by the broker (0 = none since the last ConnectResponse{OK}).
+    /// attempt refused by the broker (0 = none since the last ConnectResponse{OK}),
+    /// or kHandshakeTimedOut (fix round 3, M-2: client-local, never on the wire,
+    /// retriable).
     [[nodiscard]] int16_t lastConnectError() const noexcept { return lastConnectError_; }
+    static constexpr int16_t kHandshakeTimedOut = -2;   ///< client-local lastConnectError(): never on the wire
     /// Retrying cannot change these answers (public for the owner's failover).
     [[nodiscard]] static bool nonRetriableConnectError(int16_t code) noexcept {
         return isNonRetriable_(static_cast<rune::protocol::client::ErrorCode>(static_cast<uint16_t>(code)));
@@ -320,12 +323,28 @@ public:
     // External API — called by the application / CC-5 agent.
     // ------------------------------------------------------------------------
 
+    /// Fix round 3 (N-I1): the seed's publication moved to ANOTHER broker while this
+    /// session is not Connected — a resume hint (and its keys) is meaningless there: a
+    /// resume is valid only on the broker that holds the session (another broker
+    /// answers SessionExpired, or — require_tls — rejects the plaintext resume as
+    /// HandshakeFailed, terminally).  The next request is a fresh connect, with a
+    /// fresh TLS episode.  No-op while Connected / Handshaking / terminal.
+    void abandonResumeHint() noexcept {
+        if (state_ == SessionState::Connected || state_ == SessionState::Handshaking ||
+            state_ == SessionState::Closed || state_ == SessionState::Rejected) return;
+        sessionId_   = 0;
+        cryptoState_ = CryptoState{};
+        tls_.reset();
+        hsBytes_.clear();
+    }
+
     /// Transition Disconnected → Connecting (or re-try from Resuming).
     /// Encodes and sends a ConnectRequest, seeds the connect timer.
     /// No-op from any other state.
     void connect(int64_t nowNs) noexcept {
         if (state_ != SessionState::Disconnected) return;
-        beginCryptoHandshake_();  // Task 5: fresh TlsSession + ClientHello for this episode
+        // Task 5: fresh TlsSession + ClientHello for this episode — begun by doConnect
+        // (fix round 3 N-I1: every connect with no session to resume negotiates afresh).
         doConnect(nowNs, /*resetSessionId=*/true, /*freshEpisode=*/true);
     }
 
@@ -346,7 +365,7 @@ public:
         // Force to Disconnected first so doConnect's Connecting transition is
         // a clean fresh episode (reset sessionId + all retry/redirect counters).
         state_ = SessionState::Disconnected;
-        beginCryptoHandshake_();  // Task 5: fresh TlsSession (any prior one is abandoned)
+        // Task 5: a fresh TlsSession (any prior one is abandoned) — begun by doConnect.
         doConnect(nowNs, /*resetSessionId=*/true, /*freshEpisode=*/true);
     }
 
@@ -719,6 +738,12 @@ private:
         if (resetSessionId) {
             sessionId_ = 0;
         }
+        // Fix round 3 (N-I1): a connect that cannot resume on the same broker (no
+        // session id to resume) negotiates crypto AFRESH — never a plaintext request
+        // carrying, or a Connected session keeping, the OLD session's keys (a
+        // Backoff attempt's SessionExpired -> fresh connect, a shard failover move,
+        // a connect-time redirect of a fresh connect).  No-op when !offerCrypto.
+        if (sessionId_ == 0) beginCryptoHandshake_();
         if (freshEpisode) {
             // FIX A + FIX C: reset all counters only on a fresh external connect().
             redirectCount_     = 0;
@@ -763,6 +788,11 @@ private:
     /// without crypto, the original fixed-scratch encode (byte-identical to
     /// pre-Task-5 behaviour).  Sets connectSentOk_ either way.
     void sendConnectRequest_() noexcept {
+        // Fix round 3 (N-I1): ANY connect request with no session to resume (a resume
+        // hint abandoned by a move to another broker, a timeout retry after the
+        // handshake state was dropped) carries a fresh ClientHello — never plaintext
+        // under offerCrypto.
+        if (cfg_.offerCrypto && sessionId_ == 0 && !tls_) beginCryptoHandshake_();
         if (tls_) {
             const uint8_t cipherByte = static_cast<uint8_t>(rune::crypto::bestLocalCipher());
             const std::string_view hs(reinterpret_cast<const char*>(hsBytes_.data()), hsBytes_.size());
@@ -801,6 +831,7 @@ private:
     /// offer — degrade, don't hard-fail a connect attempt over local TLS init.
     void beginCryptoHandshake_() noexcept {
         if (!cfg_.offerCrypto) return;  // toggle off — byte-identical pre-Task-5 connect
+        cryptoState_ = CryptoState{};   // N-I1: no key of an earlier session survives a fresh episode
         tls_.emplace(rune::crypto::TlsSession::makeClient(
             cfg_.tlsTrustPem ? cfg_.tlsTrustPem->c_str() : nullptr,
             cfg_.tlsExpectHost.c_str()));
@@ -954,8 +985,24 @@ private:
     /// verify failure: non-retriable.
     void tickHandshaking_(int64_t nowNs) noexcept {
         if (nowNs - connectStartNs_ > cfg_.connectTimeoutNs) {
-            onHandshakeFailed_(nowNs);
+            onHandshakeTimedOut_(nowNs);   // fix round 3 (M-2): transient, not a verdict
         }
+    }
+
+    /// Fix round 3 (M-2, ruling): the broker never finished the handshake in time —
+    /// transient (a slow / recovering broker), never a verdict on its certificate.
+    /// A connect failure: retried with backoff (Backoff once Live with
+    /// reconnectForeverAfterLive; Disconnected otherwise — the seed failover moves to
+    /// its next candidate).  A broker-sent HandshakeFailed / a verify failure stays
+    /// terminal Rejected (onHandshakeFailed_).
+    void onHandshakeTimedOut_(int64_t nowNs) noexcept {
+        tls_.reset();
+        hsBytes_.clear();
+        cryptoState_      = CryptoState{};
+        sessionId_        = 0;                 // the half-made broker session is abandoned: the retry is fresh
+        lastConnectError_ = kHandshakeTimedOut;
+        ++connectFailures_;
+        onRetryBudgetExhausted_(nowNs);        // Backoff (forever & Live) / Disconnected
     }
 
     // ------------------------------------------------------------------------

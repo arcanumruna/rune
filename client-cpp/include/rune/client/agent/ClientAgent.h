@@ -948,6 +948,9 @@ private:
     void invalidateRouteSessions_() noexcept {
         for (PartitionRoute& r : routes_) r.sessionIndex = kNoSession;
         ++seedMoves_;   // fix round 1 (C1): the owner re-asks metadata (the no-route set changed meaning)
+        // Fix round 3 (N-I1): a resume is valid only on the broker holding the session —
+        // a seed that is not Connected connects FRESH (fresh TLS) at its new broker.
+        seedSession().machine.abandonResumeHint();
     }
     uint64_t seedMoves_ = 0;   // duty thread only
     void releaseRoutePub_(transport::AeronTransport::PubHandle h) noexcept;  // M4

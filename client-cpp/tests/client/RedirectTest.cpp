@@ -28,6 +28,11 @@
 #include <rune/client/producer/ProducerImpl.h>
 #include <rune/client/codec/Codec.h>
 #include <rune/client/codec/DataCodec.h>
+#include <rune/client/codec/CryptoFrame.h>
+#include <rune/crypto/TlsSession.h>
+#include <fstream>
+#include <optional>
+#include <sstream>
 
 #include <rune/protocol/RecordBatch.h>
 
@@ -425,6 +430,173 @@ TEST(Redirect, RedirectReconnectDoesNotDoubleReOfferRegression) {
     for (int i = 0; i < 100; ++i) { gw->poll(16); std::this_thread::sleep_for(kPumpSleep); }   // any late extra re-offer
     EXPECT_EQ(gw->producesSeen, 2) << "1 redirected + exactly 1 re-offer on the new session";
     EXPECT_EQ(gw->lastProduceSessionId, RedirectGateway::kLeaderSessionId);
+    client->close();
+    try { std::filesystem::remove_all(agentDir); } catch (...) {}
+}
+
+// ---------------------------------------------------------------------------
+// Fix round 3 (N-M1): the redirect follow with TLS ON.  The gateway completes a real
+// TLS 1.3 handshake on every Connect (ConnectResponse{OK, cipher, flight} then
+// HandshakeContinue legs) and seals every reply under the session's keys.  The
+// redirect reconnect's ConnectResponse{OK} then arrives while the seed is still
+// HANDSHAKING: the in-flight batch must be re-offered exactly ONCE (on the seed's
+// Connected edge), never twice.
+// ---------------------------------------------------------------------------
+namespace {
+std::string slurpFile(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
+struct TlsRedirectGateway {
+    int producesSeen = 0, connectsSeen = 0;
+    int64_t lastProduceSessionId = -1;
+    std::string serverPem, serverKey;
+    std::optional<rune::crypto::TlsSession> srv;
+    rune::crypto::Cipher cipher{};
+    int64_t sid = 0;
+    rcs::CryptoState broker;
+    std::shared_ptr<aeron::Aeron> gwAeron;
+    std::shared_ptr<aeron::Subscription> gwSub;
+    std::shared_ptr<aeron::ExclusivePublication> gwPub;
+    std::unique_ptr<aeron::FragmentAssembler> gwAsm;
+
+    TlsRedirectGateway(const std::string& aeronDir, int32_t in, int32_t eg) {
+        serverPem = slurpFile(std::string(RUNE_CRYPTO_TESTDATA_DIR) + "/server.pem");
+        serverKey = slurpFile(std::string(RUNE_CRYPTO_TESTDATA_DIR) + "/server.key");
+        aeron::Context ctx;
+        ctx.errorHandler(test_support::countAeronError);
+        ctx.aeronDir(aeronDir);
+        gwAeron = aeron::Aeron::connect(ctx);
+        const int64_t subId = gwAeron->addSubscription("aeron:ipc", in);
+        const int64_t pubId = gwAeron->addExclusivePublication("aeron:ipc", eg);
+        for (const auto dl = std::chrono::steady_clock::now() + 5s; std::chrono::steady_clock::now() < dl;) {
+            if (!gwSub) gwSub = gwAeron->findSubscription(subId);
+            if (!gwPub) gwPub = gwAeron->findExclusivePublication(pubId);
+            if (gwSub && gwPub) break;
+            std::this_thread::sleep_for(kPumpSleep);
+        }
+        gwAsm = std::make_unique<aeron::FragmentAssembler>(
+            [this](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off, aeron::util::index_t len, aeron::Header&) {
+                onFrame(reinterpret_cast<const uint8_t*>(b.buffer() + off), static_cast<std::size_t>(len));
+            });
+    }
+    ~TlsRedirectGateway() { gwAsm.reset(); gwPub.reset(); gwSub.reset(); gwAeron.reset(); }
+    int poll(int limit = 16) { return gwSub && gwAsm ? gwSub->poll(gwAsm->handler(), limit) : 0; }
+    void sendRaw(const uint8_t* b, std::size_t n) {
+        aeron::concurrent::AtomicBuffer ab(const_cast<uint8_t*>(b), static_cast<aeron::util::index_t>(n));
+        for (int i = 0; i < 500 && gwPub->offer(ab, 0, static_cast<aeron::util::index_t>(n)) <= 0; ++i)
+            std::this_thread::sleep_for(1ms);
+    }
+    void sendSealed(const uint8_t* plain, std::size_t n) {
+        uint8_t sealed[1024];
+        const std::size_t sn = rcc::sealFrame(broker, plain, n, sealed, sizeof sealed);
+        if (sn > 0) sendRaw(sealed, sn);
+    }
+    void onFrame(const uint8_t* buf, std::size_t len) {
+        const auto tid = rcc::peekTemplate(buf, len);
+        if (!tid) return;
+        uint8_t out[16384];
+        switch (static_cast<rcc::TemplateId>(*tid)) {
+        case rcc::TemplateId::Connect: {
+            auto c = rcc::decodeConnectRequest(buf, len);
+            if (!c || c->cipherList.empty() || c->handshakeBytes.empty()) return;
+            ++connectsSeen;
+            sid = connectsSeen == 1 ? 42 : 99;
+            srv.emplace(rune::crypto::TlsSession::makeServer(serverPem.c_str(), serverKey.c_str()));
+            cipher = static_cast<rune::crypto::Cipher>(c->cipherList[0]);
+            broker = rcs::CryptoState{};
+            const auto& hb = c->handshakeBytes;
+            (void)srv->readInbound(reinterpret_cast<const uint8_t*>(hb.data()), hb.size());
+            const std::size_t n = srv->writeOutbound(out, sizeof out);
+            uint8_t resp[16384 + 128];
+            const std::size_t rn = rcc::encodeConnectResponse(resp, sizeof resp, 0, 0, sid, c->sessionId,
+                                                              c->correlationId, rune::protocol::client::kBrokerVersion,
+                                                              c->cipherList[0],
+                                                              std::string_view(reinterpret_cast<const char*>(out), n));
+            sendRaw(resp, rn);
+            return;
+        }
+        case rcc::TemplateId::HandshakeContinue: {
+            auto hc = rcc::decodeHandshakeContinue(buf, len);
+            if (!hc || !srv) return;
+            (void)srv->readInbound(reinterpret_cast<const uint8_t*>(hc->handshakeBytes.data()), hc->handshakeBytes.size());
+            const std::size_t n = srv->writeOutbound(out, sizeof out);
+            std::vector<uint8_t> resp;
+            const std::size_t rn = rcc::encodeHandshakeContinueResponse(
+                resp, 0, std::string_view(reinterpret_cast<const char*>(out), n), sid, hc->correlationId);
+            if (srv->done() && !broker.encrypted) {
+                const auto keys = srv->exportKeys(cipher, sid);
+                broker.encrypted = true;
+                broker.cipher    = keys.cipher;
+                broker.send.emplace(keys.cipher, keys.b2c, keys.b2cPrefix);
+                broker.recv.emplace(keys.cipher, keys.c2b, keys.c2bPrefix);
+            }
+            sendRaw(resp.data(), rn);
+            return;
+        }
+        case rcc::TemplateId::Produce: {
+            ++producesSeen;
+            lastProduceSessionId = static_cast<int64_t>(rune::protocol::client::detail::getLE64(buf, 8));
+            const int64_t corr   = static_cast<int64_t>(rune::protocol::client::detail::getLE64(buf, 16));
+            uint8_t plain[512];
+            std::size_t pn = 0;
+            if (producesSeen == 1) {
+                pn = rcc::encodeErrorResponse(plain, sizeof plain,
+                                              static_cast<int16_t>(rcc::ErrorCode::Redirect), "aeron:ipc",
+                                              lastProduceSessionId, corr);
+            } else {
+                pn = rcc::encodeProduceResponse(plain, sizeof plain, 0, 0, 200, lastProduceSessionId, corr);
+            }
+            if (pn > 0) sendSealed(plain, pn);
+            return;
+        }
+        default:
+            return;   // keepalives / metadata: not answered (the test is short)
+        }
+    }
+};
+}  // namespace
+
+// N-M1: RED (round 2's marking: connectedEpoch(0) read while Handshaking = 0): the
+// redirected batch is re-offered twice (3 Produces).
+TEST(Redirect, TlsRedirectReconnectDoesNotDoubleReOfferRegression) {
+    static constexpr int32_t kInStr = 4014, kEgStr = 4015;
+    const std::string agentDir = uniqueDir();
+    const std::string aeronDir = agentDir + "/aeron";
+    ClientConfig cfg;
+    cfg.gatewayChannel = "aeron:ipc"; cfg.gatewayStreamId = kInStr;
+    cfg.egressChannel  = "aeron:ipc"; cfg.egressStreamId  = kEgStr;
+    cfg.dataDir = agentDir; cfg.connectTimeoutMs = 8000; cfg.pingTimeoutMs = 8000;
+    cfg.idleMode = IdleMode::LowLatency;
+    cfg.offerCrypto = true; cfg.requireCrypto = true;
+    cfg.tlsTrustPem = slurpFile(std::string(RUNE_CRYPTO_TESTDATA_DIR) + "/ca.pem");
+    cfg.tlsExpectHost = "localhost";
+    TopicSpec ts; ts.name = "inventory"; ts.topicId = 1; ts.partitionCount = 1;
+    cfg.topics.push_back(ts);
+    auto client = std::make_unique<Client>(cfg);
+    std::this_thread::sleep_for(150ms);
+    auto gw = std::make_unique<TlsRedirectGateway>(aeronDir, kInStr, kEgStr);
+    test_support::TestCq connCq(*client);
+    auto conn = connCq.issue([&](rune::client::Completions& q, rune::client::Token t) { return client->connect(q, t); });
+    for (int i = 0; i < kPumpMax && !conn.ready(); ++i) { gw->poll(16); std::this_thread::sleep_for(kPumpSleep); }
+    ASSERT_NO_THROW(conn.check()) << "precondition: an encrypted session";
+    ProducerConfig pcfg;
+    pcfg.acks = Acks::Leader; pcfg.lingerUs = 1; pcfg.batchBytes = 1; pcfg.maxInFlight = 4;
+    pcfg.produceTimeoutMs = 12'000;
+    auto p = client->producer(pcfg);
+    test_support::TestCq cqP(*client);
+    const std::vector<uint8_t> val = {1, 2, 3};
+    auto fut = cqP.send(p, client->topic("inventory"), Key(uint64_t{42}), std::span<const uint8_t>(val));
+    for (int i = 0; i < kPumpMax && !fut.ready(); ++i) { gw->poll(16); std::this_thread::sleep_for(kPumpSleep); }
+    ASSERT_TRUE(fut.ready()) << "the redirected batch never completed (" << gw->producesSeen << " Produces, "
+                             << gw->connectsSeen << " Connects)";
+    EXPECT_TRUE(fut.ok()) << fut.describe();
+    for (int i = 0; i < 100; ++i) { gw->poll(16); std::this_thread::sleep_for(kPumpSleep); }
+    EXPECT_EQ(gw->connectsSeen, 2) << "one reconnect after the redirect, a fresh TLS handshake";
+    EXPECT_EQ(gw->producesSeen, 2) << "1 redirected + exactly 1 re-offer on the new (encrypted) session";
+    EXPECT_EQ(gw->lastProduceSessionId, 99);
     client->close();
     try { std::filesystem::remove_all(agentDir); } catch (...) {}
 }

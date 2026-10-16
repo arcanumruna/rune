@@ -59,3 +59,4 @@ Thumbs.db
 *.wmv
 /build_broker/
 /build_broker_tsan/
+/build_asan/

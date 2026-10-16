@@ -669,3 +669,188 @@ TEST(ClientCryptoRegression, HandshakeContinueHandshakeFailedStaysTerminalRegres
                                     corr, 1'000'000'010LL);
     EXPECT_EQ(f.m.state(), sm::SessionState::Rejected);
 }
+
+// ===========================================================================
+// DR client bugs fix round 3 (client-failover-review.md "Fix round 2 check":
+// N-I1 + M-2).
+// ===========================================================================
+
+// M-2 (ruling): a handshake the broker never finishes in time is a TRANSIENT
+// connect failure (a slow / recovering broker) — never a terminal verdict on its
+// certificate.  Plain config: Disconnected (the seed failover moves on); a Live
+// reconnectForever session: Backoff.  RED (before): terminal Rejected(HandshakeFailed).
+TEST(ClientCryptoRegression, HandshakeTimeoutIsATransientConnectFailureRegression) {
+    {
+        FrameFixture f;
+        ASSERT_TRUE(f.srv.valid());
+        (void)intoHandshaking(f, 1'000'000'000LL);
+        ASSERT_EQ(f.m.state(), sm::SessionState::Handshaking);
+        f.m.tick(1'000'000'000LL + sm::SessionConfig{}.connectTimeoutNs + 2);
+        EXPECT_EQ(f.m.state(), sm::SessionState::Disconnected);
+        EXPECT_EQ(f.m.rejectCode(), 0);
+        EXPECT_EQ(f.m.lastConnectError(), sm::SessionMachine::kHandshakeTimedOut);
+        EXPECT_FALSE(sm::SessionMachine::nonRetriableConnectError(f.m.lastConnectError()));
+        EXPECT_FALSE(f.m.cryptoState().encrypted);
+        EXPECT_EQ(f.m.sessionId(), 0) << "the half-made broker session is abandoned";
+    }
+    {
+        // A Live reconnectForever session: its fresh reconnect's handshake times out -> Backoff.
+        FakeIo io;
+        const std::string serverPem = slurp(testdataPath("server.pem"));
+        const std::string serverKey = slurp(testdataPath("server.key"));
+        const std::string caPem     = slurp(testdataPath("ca.pem"));
+        auto srv1 = cr::TlsSession::makeServer(serverPem.c_str(), serverKey.c_str());
+        sm::SessionConfig c;
+        c.egressChannel = "aeron:udp?endpoint=client:40456";
+        c.offerCrypto = true; c.tlsTrustPem = caPem; c.tlsExpectHost = "localhost";
+        c.reconnectForeverAfterLive = true;
+        sm::SessionMachine m(io, c);
+        int64_t now = 1'000'000'000LL;
+        m.connect(now);
+        ASSERT_TRUE(driveHandshake(m, io, srv1, /*sessionId=*/42, now + 1));
+        ASSERT_TRUE(m.everLive());
+        m.forceReconnect(now += 1'000'000);   // a fresh connect (a failover move)
+        auto req = cc::decodeConnectRequest(io.last().data(), io.last().size());
+        ASSERT_TRUE(req.has_value());
+        auto srv2 = cr::TlsSession::makeServer(serverPem.c_str(), serverKey.c_str());
+        const auto& hb = req->handshakeBytes;
+        ASSERT_FALSE(hb.empty());
+        ASSERT_NE(srv2.readInbound(reinterpret_cast<const uint8_t*>(hb.data()), hb.size()), cr::HsState::Failed);
+        uint8_t out[16384];
+        const std::size_t n = srv2.writeOutbound(out, sizeof out);
+        m.onConnectResponse(0, -1, 43, req->correlationId, now + 1, req->cipherList[0],
+                            std::string_view(reinterpret_cast<const char*>(out), n / 2));
+        ASSERT_EQ(m.state(), sm::SessionState::Handshaking);
+        m.tick(now + c.connectTimeoutNs + 2);
+        EXPECT_EQ(m.state(), sm::SessionState::Backoff) << "a Live forever session backs off, never Rejected";
+        EXPECT_EQ(m.rejectCode(), 0);
+        EXPECT_EQ(m.lastConnectError(), sm::SessionMachine::kHandshakeTimedOut);
+    }
+}
+
+namespace {
+/// A Connected+encrypted reconnectForever session whose broker expired it; the resume (a
+/// plaintext hint-only request) is answered SessionExpired for THAT connect: the machine
+/// connects fresh — returns that request.
+std::vector<uint8_t> freshConnectAfterAResumeRefused(FakeIo& io, sm::SessionMachine& m, int64_t& now) {
+    namespace rpc = rune::protocol::client;
+    m.onErrorResponse(static_cast<int16_t>(rpc::ErrorCode::SessionExpired), "", 0, now += 1'000'000);
+    m.tick(now += 1'000'000);   // Resuming -> the resume ConnectRequest
+    auto resume = cc::decodeConnectRequest(io.last().data(), io.last().size());
+    EXPECT_TRUE(resume.has_value());
+    EXPECT_EQ(m.state(), sm::SessionState::Connecting);
+    const std::size_t before = io.sendCount();
+    m.onErrorResponse(static_cast<int16_t>(rpc::ErrorCode::SessionExpired), "", resume->correlationId,
+                      now += 1'000'000);
+    EXPECT_GT(io.sendCount(), before) << "a fresh ConnectRequest follows the refused resume";
+    return io.last();
+}
+}  // namespace
+
+// N-I1: a connect that cannot resume on the same broker (the refused resume -> fresh
+// connect; a shard failover move lands exactly here) negotiates crypto AFRESH: the
+// request carries a new ClientHello, the old session's keys are gone, and a new
+// handshake makes the session encrypted under NEW keys.  Both requireCrypto and
+// offered-not-required.  RED (before): the request is plaintext and the session keeps
+// the old keys; under requireCrypto the plaintext answer makes it Rejected.
+TEST(ClientCryptoRegression, NonResumeReconnectNegotiatesCryptoAfreshRegression) {
+    for (const bool require : {false, true}) {
+        SCOPED_TRACE(require ? "requireCrypto" : "offered, not required");
+        FakeIo io;
+        const std::string serverPem = slurp(testdataPath("server.pem"));
+        const std::string serverKey = slurp(testdataPath("server.key"));
+        const std::string caPem     = slurp(testdataPath("ca.pem"));
+        auto srv1 = cr::TlsSession::makeServer(serverPem.c_str(), serverKey.c_str());
+        sm::SessionConfig c;
+        c.egressChannel = "aeron:udp?endpoint=client:40456";
+        c.offerCrypto = true; c.requireCrypto = require; c.tlsTrustPem = caPem; c.tlsExpectHost = "localhost";
+        c.reconnectForeverAfterLive = true;
+        sm::SessionMachine m(io, c);
+        int64_t now = 1'000'000'000LL;
+        m.connect(now);
+        ASSERT_TRUE(driveHandshake(m, io, srv1, /*sessionId=*/42, now + 1));
+        ASSERT_TRUE(m.cryptoState().encrypted);
+
+        const auto fresh = freshConnectAfterAResumeRefused(io, m, now);
+        auto req = cc::decodeConnectRequest(fresh.data(), fresh.size());
+        ASSERT_TRUE(req.has_value());
+        EXPECT_FALSE(req->handshakeBytes.empty()) << "the fresh connect carries a new ClientHello";
+        EXPECT_FALSE(req->cipherList.empty());
+        EXPECT_FALSE(m.cryptoState().encrypted) << "the old session's keys survived the fresh connect";
+
+        // The new broker completes a NEW handshake: Connected, encrypted under the new keys.
+        auto srv2 = cr::TlsSession::makeServer(serverPem.c_str(), serverKey.c_str());
+        const std::size_t start = io.sendCount() - 1;
+        // Drive the legs manually: answer, then forward every new client leg.
+        bool done = false;
+        std::size_t deliveredFromIo = start;
+        for (int leg = 0; leg < 20 && !done; ++leg) {
+            if (deliveredFromIo >= io.sendCount()) break;
+            const auto& frame = io.sends[deliveredFromIo++];
+            std::string_view peer;
+            int64_t corr = 0;
+            uint8_t cipher = 0;
+            if (leg == 0) {
+                auto r0 = cc::decodeConnectRequest(frame.data(), frame.size());
+                ASSERT_TRUE(r0.has_value());
+                peer = r0->handshakeBytes; corr = r0->correlationId; cipher = r0->cipherList.empty() ? 0 : r0->cipherList[0];
+            } else {
+                auto hc = cc::decodeHandshakeContinue(frame.data(), frame.size());
+                ASSERT_TRUE(hc.has_value());
+                peer = hc->handshakeBytes; corr = hc->correlationId;
+            }
+            ASSERT_NE(srv2.readInbound(reinterpret_cast<const uint8_t*>(peer.data()), peer.size()), cr::HsState::Failed);
+            uint8_t out[16384];
+            const std::size_t n = srv2.writeOutbound(out, sizeof out);
+            const std::string_view ov(reinterpret_cast<const char*>(out), n);
+            if (leg == 0) m.onConnectResponse(0, -1, /*new id*/ 77, corr, now + 1, cipher, ov);
+            else if (m.state() == sm::SessionState::Handshaking) m.onHandshakeContinueResponse(0, ov, corr, now + 1);
+            done = m.state() == sm::SessionState::Connected && srv2.done();
+        }
+        ASSERT_TRUE(done) << "the fresh handshake completes";
+        ASSERT_TRUE(m.cryptoState().encrypted);
+        // The NEW broker can open what the client seals (the keys are the new session's).
+        sm::CryptoState broker = brokerSideCryptoStateFor(srv2, m, 77);
+        const auto frame = buildPlainProduceFrame(77, 9, "hello");
+        uint8_t sealed[256];
+        const std::size_t sn = cc::sealFrame(m.cryptoState(), frame.data(), frame.size(), sealed, sizeof sealed);
+        ASSERT_GT(sn, 0u);
+        uint8_t opened[256];
+        EXPECT_GT(cc::openEgressFrame(broker, sealed, sn, opened, sizeof opened), 0u)
+            << "the session is sealed under keys the new broker holds";
+    }
+}
+
+// N-I1 (the resume half): a session that went silent is moved to ANOTHER broker (a shard
+// failover re-point) — its resume hint and keys are meaningless there (a require_tls
+// broker rejects a plaintext resume as HandshakeFailed, terminally; another broker would
+// accept it plaintext while the client keeps the old keys).  After abandonResumeHint()
+// the next request is a fresh connect with a fresh ClientHello.  RED (no abandon): a
+// plaintext resume carrying the old session id.
+TEST(ClientCryptoRegression, AMoveToAnotherBrokerAbandonsTheResumeHintAndNegotiatesAfreshRegression) {
+    FakeIo io;
+    const std::string serverPem = slurp(testdataPath("server.pem"));
+    const std::string serverKey = slurp(testdataPath("server.key"));
+    const std::string caPem     = slurp(testdataPath("ca.pem"));
+    auto srv1 = cr::TlsSession::makeServer(serverPem.c_str(), serverKey.c_str());
+    sm::SessionConfig c;
+    c.egressChannel = "aeron:udp?endpoint=client:40456";
+    c.offerCrypto = true; c.requireCrypto = true; c.tlsTrustPem = caPem; c.tlsExpectHost = "localhost";
+    c.reconnectForeverAfterLive = true;
+    sm::SessionMachine m(io, c);
+    int64_t now = 1'000'000'000LL;
+    m.connect(now);
+    ASSERT_TRUE(driveHandshake(m, io, srv1, /*sessionId=*/42, now + 1));
+    m.tick(now += 1'000'000);
+    m.tick(now += c.responseTimeoutNs + 1);   // silent broker: stale -> Resuming
+    ASSERT_EQ(m.state(), sm::SessionState::Resuming);
+    m.abandonResumeHint();                    // the seed moved to another broker (ClientAgent seed move)
+    const std::size_t before = io.sendCount();
+    m.tick(now += 1'000'000);                 // the resume step: now a fresh connect
+    ASSERT_GT(io.sendCount(), before);
+    auto req = cc::decodeConnectRequest(io.last().data(), io.last().size());
+    ASSERT_TRUE(req.has_value());
+    EXPECT_EQ(req->sessionId, 0) << "no resume hint for another broker";
+    EXPECT_FALSE(req->handshakeBytes.empty()) << "a fresh ClientHello, never a plaintext request";
+    EXPECT_FALSE(m.cryptoState().encrypted) << "the old session's keys are gone";
+}
