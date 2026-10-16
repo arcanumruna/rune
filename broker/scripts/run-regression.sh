@@ -18,7 +18,8 @@
 #         ctest -R Regression -L latency
 #       Never skip (b): the gates are part of the regression suite, only scheduled apart.
 #   (c) the Linux-only tests (review B-I1): on the Mac, scripts/run-linux-regression-vm.sh runs them on the VM;
-#       RUNE_SKIP_LINUX_STAGE=1 skips it and the run is reported NOT GREEN (exit 3).
+#       RUNE_SKIP_LINUX_STAGE=1 skips it and the run is reported NOT GREEN (exit 3).  On Linux,
+#       scripts/linux-stage-c.sh runs them (needs CAP_NET_ADMIN + a configurable netns, else NOT GREEN, exit 3).
 # Prints each stage's wall time and the total; exits non-zero if any stage failed.  A latency stage over
 # 60 s is reported (it is the serial tail of every checkpoint).
 set -u
@@ -37,10 +38,12 @@ ctest --test-dir "$B" -R Regression -L latency --output-on-failure "$@"; rcB=$?
 t2=$(now)
 
 # (c) review B-I1: the Linux-only tests (UDP GSO / GRO incl. the DR-BUG-MTU regressions, the bind-order proof).
-#     On Linux they already ran in stage a (label linux-only); on the Mac they run on the VM.  Never green without.
+#     They are gated (RUNE_LINUX_GATE / RUNE_BIND_ORDER_GATE): stage a's plain run does not exercise them.  On
+#     Linux, scripts/linux-stage-c.sh runs both for real in private netns (re-check M5) — or, without
+#     CAP_NET_ADMIN and a configurable netns, says NOT GREEN (exit 3).  On the Mac they run on the VM.
 echo "== stage c: Linux-only tests"
 if [ "$(uname -s)" = "Linux" ]; then
-    ctest --test-dir "$B" -L linux-only -N | tail -1; rcC=0
+    "$(dirname "$0")/linux-stage-c.sh" "$B"; rcC=$?
 elif [ "${RUNE_SKIP_LINUX_STAGE:-0}" = "1" ]; then
     echo "== NOT GREEN: the Linux-only stage (UdpGsoBindings*, BindOrder) was skipped (RUNE_SKIP_LINUX_STAGE=1)"; rcC=3
 else
