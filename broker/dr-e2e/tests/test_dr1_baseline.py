@@ -26,6 +26,7 @@ from harness.invariants import (
     assert_exactly_once,
     assert_no_committed_loss,
     assert_per_key_ordering,
+    assert_per_worker_egress_connected,
     assert_single_leader,
 )
 
@@ -167,3 +168,10 @@ def test_dr1_baseline(cluster, case):
 
     # Leader is still singular after the workload.
     assert_single_leader(cluster)
+
+    # Re-check I6: the subscriptions above really went out on per-worker MDC egress.  The broker default is shard
+    # mode (every shard owns its egress), so the leader of the subscribed partition (dr_client's default topic
+    # events = topic 0, partition 0) must have logged a connected consumer — a missing line means every client
+    # fell back to legacy egress (B-I3), which no delivery assertion above would notice.
+    if from_mode == "earliest":
+        assert assert_per_worker_egress_connected(cluster, topic_id=0, partitions=[0], require_active=True)
