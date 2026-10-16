@@ -11,7 +11,6 @@
 FROM gcc:13 AS builder
 
 ARG CMAKE_VERSION=3.31.5
-ARG TARGETARCH
 
 # gcc:13 already provides gcc-13/g++-13 + build-essential + make. Add the rest:
 #   python3-pip           — conan
@@ -20,22 +19,18 @@ ARG TARGETARCH
 #   uuid-dev/zlib1g-dev   — aeron media-driver C dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-pip python3-venv git curl ninja-build pkg-config \
-        default-jdk-headless uuid-dev zlib1g-dev ccache \
+        default-jdk-headless uuid-dev zlib1g-dev \
     && rm -rf /var/lib/apt/lists/* \
     && pip3 install --no-cache-dir --break-system-packages "conan~=2.0"
 
 # aeron's SBE codegen locates the JDK via JAVA_HOME.
 ENV JAVA_HOME=/usr/lib/jvm/default-java
 
-# ccache: compiler launcher for the app build (cache lives in a BuildKit cache mount, so it
-# survives source edits).  Source path is always /build (+ fixed /rune-* siblings), so no
-# CCACHE_BASEDIR is needed; COMPILERCHECK=content keys on the compiler binary, not mtime.
-ENV CCACHE_DIR=/root/.ccache CCACHE_MAXSIZE=5G CCACHE_COMPILERCHECK=content
-
 # The project requires CMake >= 3.31; bookworm ships older.  Install the pinned
 # official Kitware release into /usr/local.  Auto-detect the host arch so the
 # image builds natively on both linux/amd64 and linux/arm64 (Docker Desktop on
 # Apple Silicon runs linux/arm64 natively — no Rosetta emulation needed).
+ARG TARGETARCH
 RUN case "${TARGETARCH}" in \
         arm64) CMAKE_ARCH=aarch64 ;; \
         *)     CMAKE_ARCH=x86_64  ;; \
@@ -54,15 +49,7 @@ RUN conan profile detect --force
 # --build=missing builds aeron/spdlog (+ gtest/benchmark) from source when no
 # prebuilt Linux binary matches the detected gcc-13 profile.
 COPY conanfile.py conandata.yml VERSION.txt ./
-# The conan cache (/root/.conan2/p: packages + build dirs + sqlite db) is a BuildKit cache mount, so a
-# conanfile change does not rebuild aeron from scratch.  Mount contents are NOT part of the layer, but
-# conan-release/ (the generated toolchain) points into /root/.conan2/p/... -- so copy the cache into the
-# layer at /opt/conan-p and symlink /root/.conan2/p to it in the next step.
-# Requires BuildKit (--mount is a hard error on the legacy builder).
-RUN --mount=type=cache,target=/root/.conan2/p,id=rune-conan-${TARGETARCH} \
-    conan install . --output-folder=conan-release --build=missing -s build_type=Release \
-    && cp -a /root/.conan2/p /opt/conan-p
-RUN rmdir /root/.conan2/p && ln -s /opt/conan-p /root/.conan2/p
+RUN conan install . --output-folder=conan-release --build=missing -s build_type=Release
 
 # ── rune-protocol sibling headers (Phase-1 sibling-include, not yet packaged) ─
 # libs/storage includes <rune/protocol/RecordBatch.h>. CMake resolves
@@ -110,13 +97,9 @@ COPY . .
 ARG CMAKE_BUILD_PARALLEL_LEVEL
 
 # ── Configure + build (rune_broker target only; no tests, no benchmarks) ──────
-RUN --mount=type=cache,target=/root/.ccache,id=rune-ccache-${TARGETARCH} \
-    --mount=type=cache,target=/build/build,id=rune-build-broker-${TARGETARCH},sharing=locked \
-    cmake -S . -B build -G Ninja \
+RUN cmake -S . -B build -G Ninja \
         -DCMAKE_TOOLCHAIN_FILE=conan-release/build/Release/generators/conan_toolchain.cmake \
         -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-        -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
         -DBUILD_TESTING=OFF \
         -DBUILD_BENCHMARKS=OFF \
         -DBUILD_INTEGRATION_TESTING=OFF \
@@ -124,9 +107,7 @@ RUN --mount=type=cache,target=/root/.ccache,id=rune-ccache-${TARGETARCH} \
         -DRUNE_CODEC_ROOT=/rune-codec \
         -DRUNE_CRYPTO_ROOT=/rune-crypto \
         -DRUNE_TLS=ON \
-    && cmake --build build --target rune_broker rune_role \
-    && mkdir -p /build/out && cp build/rune_broker build/rune_role /build/out/ \
-    && ccache -s
+    && cmake --build build --target rune_broker rune_role
 
 # gcc-13's libstdc++ is newer than bookworm-slim's; stage it for the runtime.
 RUN cp -L /usr/local/lib64/libstdc++.so.6 /build/libstdc++.so.6
@@ -149,10 +130,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # The broker binary + the newer libstdc++ from the builder (ldconfig repoints
 # the libstdc++.so.6 symlink to the higher 6.0.32 version).
-COPY --from=builder /build/out/rune_broker /usr/local/bin/rune_broker
+COPY --from=builder /build/build/rune_broker /usr/local/bin/rune_broker
 # rune_role: standalone Aeron role-counter reader — the dr-e2e harness runs it
 # via `docker exec` to detect leadership from counters (not log scraping).
-COPY --from=builder /build/out/rune_role /usr/local/bin/rune_role
+COPY --from=builder /build/build/rune_role /usr/local/bin/rune_role
 # Multi-arch: the multiarch lib dir is x86_64-linux-gnu or aarch64-linux-gnu (= uname -m).
 COPY --from=builder /build/libstdc++.so.6 /tmp/libstdc++.so.6.0.32
 RUN mv /tmp/libstdc++.so.6.0.32 /usr/lib/$(uname -m)-linux-gnu/libstdc++.so.6.0.32 && ldconfig

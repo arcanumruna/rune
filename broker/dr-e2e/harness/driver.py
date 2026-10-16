@@ -105,9 +105,7 @@ def _ensure_dr_client_image() -> None:
     run(["docker", "build", "--platform", "linux/amd64", "-f", os.path.join(CLIENT_REPO, "docker", "Dockerfile.dr"),
          *ctx, "--build-arg", f"RUNE_CLIENT_SHA={_CLIENT_SHA}", "--label", f"rune.protocol.sha={proto_sha}",
          "-t", DR_IMAGE, CLIENT_REPO],
-        timeout=3600, check=True,
-        # Dockerfile.dr uses BuildKit cache mounts (ccache/conan/build dir): BuildKit is mandatory.
-        env={**os.environ, "DOCKER_BUILDKIT": "1"})
+        timeout=3600, check=True)
 
 
 # The client image's platform: unset = the image's own (native arm64 on Apple Silicon, amd64 on the bench box);

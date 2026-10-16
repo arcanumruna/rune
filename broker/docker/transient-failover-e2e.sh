@@ -54,8 +54,6 @@
 # Bounded waits everywhere, clean teardown (compose down -v) even on failure.
 
 set -euo pipefail
-# The Dockerfiles use BuildKit cache mounts (ccache/conan/build dir): BuildKit is mandatory.
-export DOCKER_BUILDKIT=1
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BROKER_REPO="$(cd "${SCRIPT_DIR}/.." && pwd)"
