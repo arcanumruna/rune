@@ -62,7 +62,7 @@ COPY conanfile.py conandata.yml VERSION.txt ./
 RUN --mount=type=cache,target=/root/.conan2/p,id=rune-conan-${TARGETARCH} \
     conan install . --output-folder=conan-release --build=missing -s build_type=Release \
     && cp -a /root/.conan2/p /opt/conan-p
-RUN rmdir /root/.conan2/p && ln -s /opt/conan-p /root/.conan2/p
+RUN rm -rf /root/.conan2/p && ln -s /opt/conan-p /root/.conan2/p
 
 # ── rune-protocol sibling headers (Phase-1 sibling-include, not yet packaged) ─
 # libs/storage includes <rune/protocol/RecordBatch.h>. CMake resolves
