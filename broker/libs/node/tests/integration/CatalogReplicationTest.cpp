@@ -756,3 +756,39 @@ TEST(BindOrderRegression, FixedPortsBindBeforeAnyEphemeralPublicationRegression)
     EXPECT_EQ(refused, 0) << refused << " of 20 starts refused; last: " << lastWhat;
 #endif
 }
+
+// DR-bugs fix round 1, review B-I6 (catalog sibling): the controller's answer through the REAL catalog relay
+// (encodeCatalogAlterIsrResponse -> role ring -> AdminWorker -> the admin-owned replica) keeps a stale-answered
+// proposal pending and still clears its own InvalidRequest at the base.  RED: the relay loses partitionEpoch.
+TEST(CatalogAlterIsrRelayRegression, StaleAnswerThroughTheCatalogRelayKeepsTheProposalRegression) {
+    CatalogRig rig;
+    AdminRoleMsg lead;
+    lead.leader = true; lead.epoch = 2; lead.leaderId = 1; lead.partitionEpoch = 4;
+    lead.isrCount = 3; lead.isr[0] = 1; lead.isr[1] = 2; lead.isr[2] = 3;
+    ASSERT_TRUE(encodeAdminRole(rig.agent->roleRing(), lead, kMsgCatalogRole));
+    (void)rig.agent->doWork(1'000'000);
+    ASSERT_EQ(rig.replica->role(), rr::Role::Leader);
+    const int32_t live[] = {1, 2};
+    rig.replica->shrinkIsrToLive(std::span<const int32_t>(live, 2), 2'000'000);
+    ASSERT_TRUE(rig.replica->isrProposalPendingForTest());
+    rr::AlterIsrResponseMsg stale{};
+    stale.topicId = kCatalogTopicId; stale.partition = 0; stale.leaderId = 1; stale.leaderEpoch = 2;
+    stale.partitionEpoch = 5; stale.errorCode = rr::kAlterIsrInvalidUpdateVersion;
+    ASSERT_TRUE(encodeCatalogAlterIsrResponse(rig.agent->roleRing(), stale));
+    (void)rig.agent->doWork(3'000'000);
+    EXPECT_TRUE(rig.replica->isrProposalPendingForTest()) << "a stale answer through the catalog relay dropped it";
+    const auto& maximal = rig.replica->maximalIsrForTest();
+    EXPECT_NE(std::find(maximal.begin(), maximal.end(), 3), maximal.end());
+    lead.partitionEpoch = 5;   // the committed assignment resolves it
+    ASSERT_TRUE(encodeAdminRole(rig.agent->roleRing(), lead, kMsgCatalogRole));
+    (void)rig.agent->doWork(4'000'000);
+    EXPECT_FALSE(rig.replica->isrProposalPendingForTest());
+    rig.replica->shrinkIsrToLive(std::span<const int32_t>(live, 2), 5'000'000);
+    ASSERT_TRUE(rig.replica->isrProposalPendingForTest());
+    rr::AlterIsrResponseMsg own = stale;
+    own.errorCode = rr::kAlterIsrInvalidRequest;   // at its base (5)
+    ASSERT_TRUE(encodeCatalogAlterIsrResponse(rig.agent->roleRing(), own));
+    (void)rig.agent->doWork(6'000'000);
+    EXPECT_FALSE(rig.replica->isrProposalPendingForTest()) << "the relay lost partitionEpoch: its own InvalidRequest "
+                                                              "no longer clears the proposal";
+}

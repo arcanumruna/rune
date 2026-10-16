@@ -1103,5 +1103,66 @@ TEST(WorkerProduceRegression, WorkerLogsItsNoHangCountersPeriodicallyOnChangeReg
     EXPECT_NE(a, b);
 }
 
+
+// ===========================================================================
+// DR-bugs fix round 1, review B-I6: the controller's AlterIsr answer through the REAL worker relay (the WorkerOp
+// AeronPartitionTransport builds — topicId / partition / roleEpoch / rolePartitionEpoch / errorCode — executed by
+// Worker::doWork on its owner thread, here the test thread) keeps a stale-answered proposal pending
+// (InvalidUpdateVersion) and still clears its own on InvalidRequest at the base.  RED: Worker.h drops
+// `r.partitionEpoch = op.rolePartitionEpoch();` (the InvalidRequest clear never matches the base).
+// ===========================================================================
+TEST(AlterIsrRelayRegression, StaleAnswerThroughTheWorkerRelayKeepsTheProposalAndOwnInvalidRequestClearsRegression) {
+    TempDir logDir("relay_");
+    rune::storage::Log log(logDir.path.string());
+    log.recover();
+    NullTransport transport;
+    rune::replication::PartitionConfig cfg{};
+    cfg.topicId = 12; cfg.partitionId = 0; cfg.selfId = 1; cfg.minIsr = 1;
+    cfg.replicaLagMaxMs = 10'000; cfg.replicaLagMaxOffset = 10'000;
+    cfg.fetchIntervalNs = 1'000'000LL; cfg.isrCheckIntervalNs = 1'000'000LL; cfg.maxFetchBytes = 1 << 20;
+    const std::vector<rune::replication::NodeId> all{1, 2, 3};
+    auto replica = std::make_unique<rune::replication::PartitionReplica>(
+        cfg, rune::replication::Role::Follower, 0, all, all, &log, &transport);
+    replica->setIsrChannel(&transport);                      // controller-managed (as BrokerNode wires it)
+    replica->becomeLeader(1, all, /*partitionEpoch=*/4);
+    ASSERT_EQ(replica->role(), rune::replication::Role::Leader);
+    Worker worker(0);
+    worker.setOwnedDirect({replica.get()});
+    int64_t now = 1'000'000'000LL;
+    const int32_t live[] = {1, 2};
+    replica->shrinkIsrToLive(std::span<const int32_t>(live, 2), now);   // proposes {1,2} at base 4
+    ASSERT_TRUE(replica->isrProposalPendingForTest());
+    auto answer = [&](int16_t code, int32_t pe) {
+        WorkerOp op;   // exactly as AeronPartitionTransport builds it (+ the replica WorkerPool stamps at routing)
+        op.type = WorkerOp::Type::AlterIsrResponse;
+        op.replica = replica.get();
+        op.topicId = 12; op.partition = 0;
+        op.roleEpoch = 1; op.rolePartitionEpoch = pe;
+        op.replicatedPayload.errorCode = code;
+        ASSERT_TRUE(static_cast<bool>(worker.tryEnqueueOp(std::move(op))));
+        worker.doWork(now += 1'000'000);
+    };
+    answer(rune::replication::kAlterIsrInvalidUpdateVersion, 5);
+    EXPECT_TRUE(replica->isrProposalPendingForTest()) << "a stale answer through the relay dropped the proposal";
+    EXPECT_TRUE(replica->isrProposalAwaitingMetadataForTest());
+    const auto& maximal = replica->maximalIsrForTest();
+    EXPECT_NE(std::find(maximal.begin(), maximal.end(), 3), maximal.end()) << "the maximal ISR lost node 3";
+    // The committed assignment resolves it (same epoch, pe 5): a new committed state {1,2,3}.
+    WorkerOp lead;
+    lead.type = WorkerOp::Type::BecomeLeader;
+    lead.replica = replica.get();
+    lead.topicId = 12; lead.partition = 0; lead.roleEpoch = 1; lead.rolePartitionEpoch = 5;
+    lead.isr = {1, 2, 3};
+    ASSERT_TRUE(static_cast<bool>(worker.tryEnqueueOp(std::move(lead))));
+    worker.doWork(now += 1'000'000);
+    EXPECT_FALSE(replica->isrProposalPendingForTest()) << "the applied assignment resolves the proposal";
+    // A fresh proposal at base 5, answered InvalidRequest at ITS base through the relay: cleared.
+    replica->shrinkIsrToLive(std::span<const int32_t>(live, 2), now += 1'000'000);
+    ASSERT_TRUE(replica->isrProposalPendingForTest());
+    answer(rune::replication::kAlterIsrInvalidRequest, 5);
+    EXPECT_FALSE(replica->isrProposalPendingForTest()) << "the relay lost the partitionEpoch: its own InvalidRequest "
+                                                          "no longer clears it (ISR changes would freeze)";
+}
+
 } // namespace
 } // namespace rune::node
