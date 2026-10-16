@@ -1577,6 +1577,8 @@ if(BUILD_TESTING)
         target_include_directories(rune_client_failover_broker_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_client_failover_broker_tests PRIVATE rune_node rune_view rune_codec rune_catalog
                               rune_client_api aeron::aeron GTest::gtest_main)
+        target_compile_definitions(rune_client_failover_broker_tests PRIVATE
+            RUNE_CRYPTO_TESTDATA_DIR="${RUNE_CRYPTO_ROOT}/tests/testdata")   # fix round 3: TLS failover cells
         gtest_discover_tests(rune_client_failover_broker_tests PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
 
         # Catalog history Task 11: the DDL route (Redirect / NotLeader / Internal when

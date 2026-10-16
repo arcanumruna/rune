@@ -27,6 +27,8 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <unistd.h>
+#include <fstream>
+#include <sstream>
 #include <chrono>
 #include <cstdio>
 #include <map>
@@ -897,4 +899,114 @@ TEST(ClientFailoverBrokerRegression, SeedCrashedGetViewRowFollowsTheNewSeedRegre
                  static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count()),
                  errors.size());
     reader->close();
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Fix round 3 (client-failover-review.md "Fix round 2 check", N-I1 + M-2): failover with TLS ON.  Every
+// broker has a certificate; `require` makes the brokers require_tls and the client requireCrypto, otherwise
+// crypto is offered and negotiated but not required.  The seed's broker (it leads p0) is crashed; every
+// record produced after the crash must be acked — on a session negotiated AFRESH with the new broker.
+// RED (N-I1 reverted, a shard client): the failover move's fresh connect is PLAINTEXT and the session keeps
+// the old keys — requireCrypto: terminal Rejected (the client fails for good); offered: every frame sealed
+// under keys the new broker never had (dropped), records never acked.  The plain-client cells are GUARDS
+// (its failover always used forceReconnect, which already started a fresh TLS episode).
+// ---------------------------------------------------------------------------------------------------------
+namespace {
+std::string readFile(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
+void tlsFailover(const char* tag, bool shard, bool require) {
+    const std::string dir = RUNE_CRYPTO_TESTDATA_DIR;
+    ThreeNodes c = ThreeNodes::startWith(tag, [&](rune::node::NodeConfig& n) {
+        n.tlsCertFile = dir + "/server.pem";
+        n.tlsKeyFile  = dir + "/server.key";
+        n.requireTls  = require;
+    });
+    ASSERT_TRUE(c.awaitCatalogLeader(30s));
+    auto acfg = clientConfigFor(c, c.runningNodes().front());
+    acfg.offerCrypto = true; acfg.requireCrypto = require;
+    acfg.tlsTrustPem = readFile(dir + "/ca.pem"); acfg.tlsExpectHost = "localhost";
+    auto admin = connectClient(c, acfg);
+    rc::TopicOptions to;
+    to.replicationFactor = 3;
+    const auto def = admin->defineTopicAndWait("events", kPartitions, "", {}, false, kDisk, to, {}, 60s);
+    ASSERT_EQ(def.errorCode, 0) << def.detail;
+    admin->close();
+    const rc::TopicSpec spec{"events", def.topicId, kPartitions};
+    std::vector<int32_t> leaders;
+    ASSERT_TRUE(awaitLeaders(c, def.topicId, leaders, 30s));
+    const int32_t victim = leaders[0];
+
+    auto cfg = clientConfigFor(c, victim);
+    cfg.topics = {spec};
+    cfg.offerCrypto = true; cfg.requireCrypto = require;
+    cfg.tlsTrustPem = acfg.tlsTrustPem; cfg.tlsExpectHost = "localhost";
+    cfg.reconnectForeverAfterLive = shard;
+    cfg.connectTimeoutMs = 5'000; cfg.pingTimeoutMs = 30'000;
+    auto client = connectClient(c, cfg);
+    rc::ProducerConfig pcfg;
+    pcfg.acks = rc::Acks::All; pcfg.lingerUs = 1; pcfg.batchBytes = 1;
+    pcfg.produceTimeoutMs = 30'000; pcfg.deliveryTimeoutMs = 60'000;
+    auto producer = client->producer(pcfg);
+    rc::Completions cq(*client);
+    const rc::TopicHandle th = client->topic("events");
+    auto sendOne = [&](int seq) {
+        uint64_t k = static_cast<uint64_t>(seq) * 16;
+        while (rc::Key(k).partition(kPartitions) != seq % kPartitions) ++k;
+        const std::string v = valueOf(seq);
+        for (;;) {
+            const auto r = producer.trySend(th, rc::Key(k), std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(v.data()), v.size()),
+                                            cq, static_cast<rc::Token>(seq) + 1);
+            if (r == rc::SendResult::Ok) return true;
+            if (r != rc::SendResult::QueueFull && r != rc::SendResult::BackPressured) return false;
+            (void)cq.poll([](const rc::Completion&, std::span<const uint8_t>) {});
+        }
+    };
+    std::map<rc::Token, rc::OpStatus> done;
+    auto drain = [&] {
+        (void)cq.poll([&](const rc::Completion& d, std::span<const uint8_t>) { done[d.token] = d.status; });
+    };
+    for (int seq = 0; seq < 9; ++seq) ASSERT_TRUE(sendOne(seq));
+    for (const auto deadline = Clock::now() + 30s; Clock::now() < deadline && done.size() < 9; std::this_thread::sleep_for(5ms)) drain();
+    ASSERT_EQ(done.size(), 9u) << "precondition: encrypted produce works";
+    for (const auto& [t, st] : done) ASSERT_EQ(st, rc::OpStatus::Ok);
+
+    c.crash(victim);
+    const auto tCrash = Clock::now();
+    constexpr int kAfter = 30;
+    for (int seq = 9; seq < 9 + kAfter; ++seq) { ASSERT_TRUE(sendOne(seq)); std::this_thread::sleep_for(20ms); }
+    for (const auto deadline = tCrash + 45s; Clock::now() < deadline && done.size() < 9u + kAfter;) {
+        drain();
+        std::this_thread::sleep_for(5ms);
+    }
+    int ok = 0;
+    for (int seq = 9; seq < 9 + kAfter; ++seq) ok += done.count(seq + 1) != 0 && done[seq + 1] == rc::OpStatus::Ok ? 1 : 0;
+    EXPECT_EQ(ok, kAfter) << "records produced after the seed broker's crash, acked on the fresh TLS session";
+    // The SEED's own session (the failed-over one) carries the control plane: a DDL through it succeeds.
+    // (Records may ride node sessions that never failed over; this pins the seed's fresh TLS episode.)
+    rc::DefineTopicResult d2;
+    EXPECT_NO_THROW(d2 = client->defineTopicAndWait("after", 1, "", {}, false, kDisk, {}, {}, 30s));
+    EXPECT_EQ(d2.errorCode, 0) << d2.detail;
+    std::fprintf(stderr, "[tls-failover %s %s] acked %d/%d after %lld ms\n", shard ? "shard" : "plain",
+                 require ? "require" : "offered", ok, kAfter,
+                 static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - tCrash).count()));
+    producer.close();
+    client->close();
+}
+}  // namespace
+
+TEST(ClientFailoverBrokerRegression, ShardClientWithRequireCryptoFailsOverToALiveBrokerRegression) {
+    tlsFailover("fo_tls_sr", /*shard=*/true, /*require=*/true);
+}
+TEST(ClientFailoverBrokerRegression, ShardClientWithOfferedCryptoFailsOverToALiveBrokerRegression) {
+    tlsFailover("fo_tls_so", /*shard=*/true, /*require=*/false);
+}
+TEST(ClientFailoverBrokerRegression, PlainClientWithRequireCryptoFailsOverToALiveBrokerRegression) {
+    tlsFailover("fo_tls_pr", /*shard=*/false, /*require=*/true);   // GUARD
+}
+TEST(ClientFailoverBrokerRegression, PlainClientWithOfferedCryptoFailsOverToALiveBrokerRegression) {
+    tlsFailover("fo_tls_po", /*shard=*/false, /*require=*/false);   // GUARD
 }
