@@ -456,3 +456,34 @@ TEST(GatewayShardNotifyRegression, DirectShareExpireOfAPendingConnectIsCountedAn
     pool.worker(0).doWork(1);
     EXPECT_EQ(pool.worker(0).sessionClosesSeenForTest(), 1u) << "its workers forget it";
 }
+
+// F-A (2026-10-16): the lease reap tells a reachable client its session expired, before its publication goes
+// (every other broker-initiated close of a live session already did) - the rune client then resumes at once
+// instead of at its next stale-session timeout.  An Expiring session (a full spill) already owes its notice
+// (serviceSpillExpiring_): the reap never sends a second one.
+TEST(GatewayShardNotifyRegression, LeaseReapTellsTheClientItsSessionExpiredRegression) {
+    std::vector<std::vector<uint8_t>> frames;
+    ClientGateway gw = ClientGateway::makeForTest([](const uint8_t*, std::size_t) -> int64_t { return 1; }, 1);
+    gw.setOnEgressFrame([&](int64_t, const uint8_t* p, std::size_t n) { frames.emplace_back(p, p + n); });
+    const int64_t sid = gw.injectTestSession(0);
+    gw.reapExpiredForTest(ClientGateway::kDefaultSessionTimeoutNs + 1);
+    EXPECT_EQ(gw.sessionCount(), 0u);
+    ASSERT_EQ(frames.size(), 1u) << "exactly one frame: the expiry notice";
+    auto e = rune::protocol::client::ErrorResponse::decode(frames[0].data(), frames[0].size());
+    ASSERT_TRUE(e.has_value());
+    EXPECT_EQ(e->sessionId, sid);
+    EXPECT_EQ(e->code, static_cast<int16_t>(rune::protocol::client::ErrorCode::SessionExpired));
+}
+
+TEST(GatewayShardNotifyRegression, LeaseReapOfAnExpiringSessionSendsNoSecondNoticeRegression) {
+    std::vector<std::vector<uint8_t>> frames;
+    ClientGateway gw = ClientGateway::makeForTest([](const uint8_t*, std::size_t) -> int64_t { return 1; }, 1);
+    gw.setOnEgressFrame([&](int64_t, const uint8_t* p, std::size_t n) { frames.emplace_back(p, p + n); });
+    const int64_t sid = gw.injectTestSession(0);
+    gw.expireSessionForSpillForTest(sid);
+    ASSERT_EQ(gw.spillStateForTest(sid), rune::gateway::SpillState::Expiring) << "precondition";
+    const std::size_t before = frames.size();
+    gw.reapExpiredForTest(ClientGateway::kDefaultSessionTimeoutNs + 1);
+    EXPECT_EQ(gw.sessionCount(), 0u);
+    EXPECT_EQ(frames.size(), before) << "the reap sent a second expiry notice for an Expiring session";
+}

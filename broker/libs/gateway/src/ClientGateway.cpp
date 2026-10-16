@@ -1065,7 +1065,15 @@ void ClientGateway::reapExpired(int64_t nowNs) {
     // Fix round 2 (finding 4): ONE close path (closeSession_) for reap,
     // Disconnect and SessionFailed — table, workers, record-egress resolves,
     // subscriptions, group-member tracking, held state.
-    for (int64_t sid : reapScratch_) (void)closeSession_(sid);
+    for (int64_t sid : reapScratch_) {
+        const Session* s = sessions_.find(sid);
+        // F-A: tell the client before its publication goes (the rune client resumes at once on SessionExpired,
+        // instead of at its next stale-session timeout).  Best effort: a session lost on a worker has a dead
+        // egress and the offer just fails.  An EXPIRING session's notice is already owed by
+        // serviceSpillExpiring_ - never a second one.
+        const bool notify = s != nullptr && s->spill.state != SpillState::Expiring;
+        (void)closeSession_(sid, notify);
+    }
 }
 
 // ---------------------------------------------------------------------------
