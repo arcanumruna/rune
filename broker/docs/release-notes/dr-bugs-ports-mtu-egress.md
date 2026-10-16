@@ -26,7 +26,9 @@ its node id: node *n* uses the block `[8200 + 192n, 8200 + 192n + 191]`. The old
 
 `RUNE_WORKER_EGRESS_CONTROL_HOST` used to default to `127.0.0.1`, which silently turned per-worker egress off
 (clients fell back to the legacy egress path) in every multi-host or container deployment. It now defaults to
-the node's advertised `RUNE_PEERS` host when numeric, else the wildcard. An explicit loopback value on a node
+`RUNE_PEER_BIND_HOST` when it is set (a NAT / port-mapped node binds where its other peer-facing sockets bind),
+else the node's advertised `RUNE_PEERS` host when numeric, else the wildcard. A loopback `RUNE_PEER_BIND_HOST`
+supplying it on a non-loopback advertised node refuses to start too. An explicit loopback value on a node
 advertised at a non-loopback host refuses to start. In legacy worker mode, a per-worker egress whose control
 port cannot be bound now refuses to start (it used to WARN and disable that worker's egress).
 

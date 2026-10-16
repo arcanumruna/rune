@@ -166,6 +166,10 @@ std::string PeerConfig::replicationChannel() const {
 
 std::string NodeConfig::effectiveWorkerEgressControlHost() const {
     if (!workerEgressControlHost.empty()) return workerEgressControlHost;   // explicit
+    // Re-check I2: the operator's bind address for peer-facing sockets (RUNE_PEER_BIND_HOST — the NAT /
+    // port-mapped escape hatch, the advertised address being on no local interface): the control endpoint binds
+    // where this node's other peer-facing sockets bind; whatever delivers peer traffic there delivers this too.
+    if (!peerBindHostOverride.empty()) return peerBindHostOverride;
     const std::string adv = peers.empty() ? std::string{} : self().host;    // the advertised host (RUNE_PEERS)
     if (adv.empty()) {   // no peers: single box
         const std::string b = clientBindHost();
@@ -399,13 +403,18 @@ std::optional<std::string> NodeConfig::validateShardConfig() const {
     // Review B-I3: per-worker egress (shard mode always; legacy when enabled) bound on loopback is unreachable
     // from clients on other hosts — it would silently fall back to legacy egress.  Refuse an explicit loopback
     // control host on a node advertised at a non-loopback host.
-    if ((shardMode() || perWorkerEgressEnabled) && !workerEgressControlHost.empty() && !peers.empty()) {
+    // Re-check I2: the same rule for RUNE_PEER_BIND_HOST when it supplies the (derived) control host.
+    if ((shardMode() || perWorkerEgressEnabled) && !peers.empty() &&
+        (!workerEgressControlHost.empty() || !peerBindHostOverride.empty())) {
         auto loop = [](const std::string& h) {
             return h == "localhost" || h == "::1" || h == "[::1]" || h.rfind("127.", 0) == 0;
         };
+        const bool explicitHost = !workerEgressControlHost.empty();
+        const std::string& host = explicitHost ? workerEgressControlHost : peerBindHostOverride;
+        const char* env = explicitHost ? "RUNE_WORKER_EGRESS_CONTROL_HOST" : "RUNE_PEER_BIND_HOST";
         const std::string& adv = self().host;
-        if (loop(workerEgressControlHost) && !adv.empty() && !loop(adv))
-            return "RUNE_WORKER_EGRESS_CONTROL_HOST=" + workerEgressControlHost + " is loopback but this node is "
+        if (loop(host) && !adv.empty() && !loop(adv))
+            return std::string(env) + "=" + host + " is loopback but this node is "
                    "advertised as " + adv + ": clients on other hosts cannot reach per-worker egress (it would "
                    "silently fall back to legacy egress) — unset it (derived) or set a reachable address";
     }

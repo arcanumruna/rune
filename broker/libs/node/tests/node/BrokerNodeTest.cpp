@@ -2346,3 +2346,37 @@ TEST(BrokerNodeRegression, LegacyPerWorkerEgressBindFailureRefusesToStartRegress
     std::error_code ec; fs::remove_all(dir, ec);
 }
 } // namespace rune::node
+
+namespace rune::node {
+// Re-check I2: a node advertised at an address on NO local interface (NAT / port mapping, here TEST-NET-1) that
+// binds its peer-facing sockets on RUNE_PEER_BIND_HOST=0.0.0.0 must start — its derived egress control host is the
+// override, not the unbindable advertised address.  RED: without the override line the egress anchor binds
+// control=192.0.2.1:<port> and start() throws "fixed endpoint ... could not be bound".
+TEST(BrokerNodeRegression, UnbindableAdvertisedAddressWithPeerBindOverrideStartsRegression) {
+    const fs::path dir = makeTempDataDir("natbind_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    cfg.workerMode = NodeConfig::WorkerMode::Shard;
+    cfg.runtimePlacement = NodeConfig::RuntimePlacement::Fused;
+    cfg.workerCount = 1;
+    cfg.peers[0].host = "192.0.2.1";
+    cfg.peers[0].replicationPort = rune::aeronutil::testing::allocFreeUdpPort();
+    cfg.peers[0].ingressBasePort = rune::aeronutil::testing::allocFreeUdpPort();
+    cfg.peers[0].replBasePort = rune::aeronutil::testing::allocFreeUdpPort();
+    cfg.peers[0].egressControlBasePort = rune::aeronutil::testing::allocFreeUdpPort();
+    cfg.workerIngressBasePort = cfg.peers[0].ingressBasePort;
+    cfg.workerReplBasePort = cfg.peers[0].replBasePort;
+    cfg.workerEgressControlBasePort = cfg.peers[0].egressControlBasePort;
+    cfg.peerBindHostOverride = "0.0.0.0";
+    cfg.clientEndpoint.channel = "aeron:udp?endpoint=0.0.0.0:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());
+    ASSERT_EQ(cfg.effectiveWorkerEgressControlHost(), "0.0.0.0");
+    BrokerNode node{cfg};
+    std::string what;
+    try { node.start(); } catch (const std::exception& e) { what = e.what(); }
+    EXPECT_TRUE(what.empty()) << "a NAT node with RUNE_PEER_BIND_HOST must start: " << what;
+    if (what.empty()) {
+        EXPECT_EQ(node.bindAnchorsForTest(), 6u);
+        node.stop();
+    }
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+} // namespace rune::node

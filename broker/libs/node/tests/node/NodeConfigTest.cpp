@@ -211,6 +211,31 @@ TEST(NodeConfigRegression, EgressControlHostDefaultsToTheAdvertisedHostRegressio
     EXPECT_EQ(peersEnv("0@rune-1:40111,1@rune-2:40111,2@rune-3:40111", nullptr), "0.0.0.0");             // (b)
     EXPECT_EQ(peersEnv("0@127.0.0.1:40111,1@127.0.0.1:40112,2@127.0.0.1:40113", nullptr), "127.0.0.1");  // (c)
     EXPECT_EQ(peersEnv("0@10.0.0.5:40111,1@10.0.0.6:40111,2@10.0.0.7:40111", "10.0.0.9"), "10.0.0.9");    // (d)
+    // Re-check I2: RUNE_PEER_BIND_HOST (NAT / port-mapped: the advertised address is on no local interface).
+    auto natEnv = [](const char* host) {
+        auto env = base3node();
+        env["RUNE_PEERS"] = "0@203.0.113.5:40111,1@203.0.113.6:40111,2@203.0.113.7:40111";
+        env["RUNE_PEER_BIND_HOST"] = "0.0.0.0";
+        if (host) env["RUNE_WORKER_EGRESS_CONTROL_HOST"] = host;
+        auto r = parseNodeConfig(fakeEnv(env));
+        EXPECT_TRUE(r.error.empty()) << r.error;
+        return r.config ? r.config->effectiveWorkerEgressControlHost() : std::string("<none>");
+    };
+    EXPECT_EQ(natEnv(nullptr), "0.0.0.0") << "(e) the peer bind override, never the unbindable advertised address";
+    EXPECT_EQ(natEnv("10.0.0.9"), "10.0.0.9") << "(f) an explicit control host still wins";
+}
+
+// Re-check I2: a LOOPBACK RUNE_PEER_BIND_HOST supplying the control host of a node advertised at a non-loopback
+// host refuses, as the explicit host does.  RED: the refusal checks only an explicit control host.
+TEST(NodeConfigRegression, LoopbackPeerBindOverrideOnANonLoopbackNodeRefusesStartRegression) {
+    auto env = base3node();
+    env["RUNE_PEER_BIND_HOST"] = "127.0.0.1";
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    const auto err = r.config->validateShardConfig();
+    ASSERT_TRUE(err.has_value());
+    EXPECT_NE(err->find("silently fall back"), std::string::npos) << *err;
+    EXPECT_NE(err->find("RUNE_PEER_BIND_HOST"), std::string::npos) << *err;
 }
 
 // Review B-I3: an explicit LOOPBACK control host on a node advertised at a non-loopback host refuses to start
