@@ -1010,3 +1010,184 @@ TEST(ClientFailoverBrokerRegression, PlainClientWithRequireCryptoFailsOverToALiv
 TEST(ClientFailoverBrokerRegression, PlainClientWithOfferedCryptoFailsOverToALiveBrokerRegression) {
     tlsFailover("fo_tls_po", /*shard=*/false, /*require=*/false);   // GUARD
 }
+
+// ---------------------------------------------------------------------------------------------------------
+// DR client bugs fix round 4 (client-failover-review.md "Fix round 3 check", N3-I1 and the TLS handshake
+// class).  The broker never resumes (ClientGateway::handleConnect allocates a NEW session on every
+// connect), so under offerCrypto every ConnectRequest — a resume on the SAME broker included — must carry
+// a fresh ClientHello.  Before: a resume (the broker's lease reap notice after a client stall, an own-stall
+// loss) was a plaintext request keeping the old keys — a require_tls broker answers HandshakeFailed, and a
+// shard client (reconnectForeverAfterLive) went terminally Rejected; an offer-only broker accepted it as a
+// plaintext session the client kept sealing under the old keys.
+// ---------------------------------------------------------------------------------------------------------
+namespace {
+struct TlsCluster {
+    std::string dir = RUNE_CRYPTO_TESTDATA_DIR;
+    std::string ca;
+    rc::TopicSpec spec;
+    std::vector<int32_t> leaders;
+};
+rc::ClientConfig tlsClientConfig(ThreeNodes& c, int id, const std::string& ca, bool require) {
+    auto cfg = clientConfigFor(c, id);
+    cfg.offerCrypto = true; cfg.requireCrypto = require;
+    cfg.tlsTrustPem = ca; cfg.tlsExpectHost = "localhost";
+    return cfg;
+}
+/// A TLS cluster with topic "events" (3 partitions, RF 3) and its leaders.
+bool tlsTopic(ThreeNodes& c, TlsCluster& t, bool require) {
+    t.ca = readFile(t.dir + "/ca.pem");
+    if (!c.awaitCatalogLeader(30s)) return false;
+    auto admin = connectClient(c, tlsClientConfig(c, c.runningNodes().front(), t.ca, require));
+    rc::TopicOptions to;
+    to.replicationFactor = 3;
+    const auto def = admin->defineTopicAndWait("events", kPartitions, "", {}, false, kDisk, to, {}, 60s);
+    admin->close();
+    if (def.errorCode != 0) return false;
+    t.spec = rc::TopicSpec{"events", def.topicId, kPartitions};
+    return awaitLeaders(c, def.topicId, t.leaders, 30s);
+}
+ThreeNodes tlsNodes(const char* tag, bool require) {
+    const std::string dir = RUNE_CRYPTO_TESTDATA_DIR;
+    return ThreeNodes::startWith(tag, [&](rune::node::NodeConfig& n) {
+        n.tlsCertFile = dir + "/server.pem";
+        n.tlsKeyFile  = dir + "/server.key";
+        n.requireTls  = require;
+    });
+}
+
+void tlsShardStallPastTheLease(const char* tag, bool require) {
+    ThreeNodes c = tlsNodes(tag, require);
+    TlsCluster t;
+    ASSERT_TRUE(tlsTopic(c, t, require));
+    // An Invoker-mode shard client: its duty cycle runs only when this thread pumps it, so a
+    // "stall" is this thread not pumping it.
+    auto cfg = tlsClientConfig(c, t.leaders[0], t.ca, require);
+    cfg.topics = {t.spec};
+    cfg.runnerMode = rc::RunnerMode::Invoker;
+    cfg.reconnectForeverAfterLive = true;
+    cfg.aeronClientLivenessTimeoutNs = 60'000'000'000LL;   // a shard client's Aeron survives the stall (it runs 1 h)
+    cfg.connectTimeoutMs = 5'000; cfg.pingTimeoutMs = 3'000;
+    auto client = connectClient(c, cfg);
+    rc::ProducerConfig pcfg;
+    pcfg.acks = rc::Acks::All; pcfg.lingerUs = 1; pcfg.batchBytes = 1;
+    pcfg.produceTimeoutMs = 30'000; pcfg.deliveryTimeoutMs = 60'000;
+    auto producer = client->producer(pcfg);
+    rc::Completions cq(*client);
+    const rc::TopicHandle th = client->topic("events");
+    std::map<rc::Token, rc::OpStatus> done;
+    auto pump = [&] {
+        (void)client->doWork();
+        (void)cq.poll([&](const rc::Completion& d, std::span<const uint8_t>) { done[d.token] = d.status; });
+    };
+    rc::SendResult lastRefusal = rc::SendResult::Ok;
+    auto sendOne = [&](int seq) {
+        uint64_t k = static_cast<uint64_t>(seq) * 16;
+        while (rc::Key(k).partition(kPartitions) != seq % kPartitions) ++k;
+        const std::string v = valueOf(seq);
+        for (const auto deadline = Clock::now() + 30s; Clock::now() < deadline;) {
+            const auto r = producer.trySend(th, rc::Key(k), std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(v.data()), v.size()),
+                                            cq, static_cast<rc::Token>(seq) + 1);
+            if (r == rc::SendResult::Ok) return true;
+            lastRefusal = r;
+            if (r != rc::SendResult::QueueFull && r != rc::SendResult::BackPressured) return false;
+            pump();
+            std::this_thread::sleep_for(100us);
+        }
+        return false;
+    };
+    auto pumpUntilAcked = [&](std::size_t n, std::chrono::milliseconds within) {
+        for (const auto deadline = Clock::now() + within; Clock::now() < deadline && done.size() < n;) {
+            pump();
+            std::this_thread::sleep_for(1ms);
+        }
+    };
+    for (int seq = 0; seq < 9; ++seq) ASSERT_TRUE(sendOne(seq));
+    pumpUntilAcked(9, 30s);
+    ASSERT_EQ(done.size(), 9u) << "precondition: encrypted produce works";
+    for (const auto& [tk, st] : done) ASSERT_EQ(st, rc::OpStatus::Ok);
+
+    // The stall: no duty cycle for longer than the broker's session lease (10 s) — the broker reaps
+    // every session of this client and the client's own ping timeout fires on its next cycle.
+    std::this_thread::sleep_for(13s);
+    const auto tWake = Clock::now();
+
+    constexpr int kAfter = 30;
+    for (int seq = 9; seq < 9 + kAfter; ++seq) {
+        ASSERT_TRUE(sendOne(seq)) << "send refused (" << int(lastRefusal) << "), client state "
+                                  << int(client->state());
+        for (int i = 0; i < 20; ++i) { pump(); std::this_thread::sleep_for(1ms); }
+    }
+    pumpUntilAcked(9u + kAfter, 40s);
+    int ok = 0;
+    for (int seq = 9; seq < 9 + kAfter; ++seq) ok += done.count(seq + 1) != 0 && done[seq + 1] == rc::OpStatus::Ok ? 1 : 0;
+    EXPECT_NE(client->state(), rune::client::session::SessionState::Rejected)
+        << "the shard client died for good: a plaintext resume answered HandshakeFailed";
+    EXPECT_EQ(ok, kAfter) << "records produced after the stall, acked on the fresh TLS session";
+    // The SEED's own (re-established) session carries the control plane.
+    rc::DefineTopicResult d2;
+    EXPECT_NO_THROW(d2 = client->defineTopicAndWait("after", 1, "", {}, false, kDisk, {}, {}, 30s));
+    EXPECT_EQ(d2.errorCode, 0) << d2.detail;
+    std::fprintf(stderr, "[tls-stall %s] acked %d/%d after %lld ms\n", require ? "require" : "offered", ok, kAfter,
+                 static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - tWake).count()));
+    producer.close();
+    client->close();
+}
+
+/// A Subscribe the seed's broker does not lead is redirected (CB-5: the seed retargets to the leader
+/// and reconnects — a fresh TLS episode); the pending Subscribe is re-sent on the NEW session's
+/// Connected edge, sealed under its keys, and the subscription delivers.  Before: the re-send ran at
+/// ConnectResponse{OK} — under TLS possibly mid-handshake, where the ring drain drops it (subscribe
+/// TimedOut).
+void tlsSubscribeAfterRedirect(const char* tag, bool require) {
+    ThreeNodes c = tlsNodes(tag, require);
+    TlsCluster t;
+    ASSERT_TRUE(tlsTopic(c, t, require));
+    int32_t part = -1, seed = -1;
+    for (int32_t p = 0; p < kPartitions && part < 0; ++p)
+        for (int id : c.runningNodes())
+            if (id != t.leaders[static_cast<std::size_t>(p)]) { part = p; seed = id; break; }
+    ASSERT_GE(part, 0);
+    auto scfg = tlsClientConfig(c, seed, t.ca, require);
+    scfg.topics = {t.spec};
+    scfg.connectTimeoutMs = 10'000; scfg.pingTimeoutMs = 30'000;
+    auto sub = std::make_unique<rc::Client>(scfg);
+    SubLedger led;
+    rc::SubscribeOptions o; o.from = rc::From::earliest();
+    // Issued in the setup phase: it goes out on the seed's first Connected edge (before any metadata
+    // routes it), to a broker that does not lead the partition -> Redirect.
+    auto s = sub->subscribe(sub->topic("events"), part, o, led.handler(part));
+    sub->connectAndWait(30s);
+
+    auto pcfg0 = tlsClientConfig(c, t.leaders[static_cast<std::size_t>(part)], t.ca, require);
+    pcfg0.topics = {t.spec};
+    auto prod = connectClient(c, pcfg0);
+    rc::ProducerConfig pcfg; pcfg.acks = rc::Acks::All; pcfg.lingerUs = 1; pcfg.batchBytes = 1;
+    auto producer = prod->producer(pcfg);
+    const rc::TopicHandle pth = prod->topic("events");
+    constexpr int kN = 20;
+    for (int seq = 0; seq < kN; ++seq) {
+        uint64_t k = static_cast<uint64_t>(seq) * 16;
+        while (rc::Key(k).partition(kPartitions) != part) ++k;
+        const std::string v = valueOf(seq);
+        producer.send(pth, rc::Key(k), std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(v.data()), v.size()));
+    }
+    for (const auto deadline = Clock::now() + 30s; Clock::now() < deadline && led.count(part) < kN;)
+        std::this_thread::sleep_for(10ms);
+    EXPECT_EQ(led.count(part), static_cast<std::size_t>(kN)) << "the redirected subscription never delivered";
+    EXPECT_EQ(led.dupes, 0);
+    EXPECT_NE(s.subscriptionId(), 0) << "the redirected Subscribe was never answered";
+    producer.close();
+    prod->close();
+    sub->close();
+}
+}  // namespace
+
+TEST(ClientFailoverBrokerRegression, ShardClientWithRequireCryptoSurvivesAStallPastTheLeaseRegression) {
+    tlsShardStallPastTheLease("fo_tls_stall_r", /*require=*/true);
+}
+TEST(ClientFailoverBrokerRegression, ShardClientWithOfferedCryptoSurvivesAStallPastTheLeaseRegression) {
+    tlsShardStallPastTheLease("fo_tls_stall_o", /*require=*/false);
+}
+TEST(ClientFailoverBrokerRegression, SubscribeRedirectedToTheLeaderDeliversUnderRequiredCryptoRegression) {
+    tlsSubscribeAfterRedirect("fo_tls_subr", /*require=*/true);
+}
