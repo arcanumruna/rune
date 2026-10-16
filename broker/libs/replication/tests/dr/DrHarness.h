@@ -442,6 +442,10 @@ public:
     /// __cluster_metadata replica + metadata bridge, AlterIsr answers through the controller's direct answer
     /// channel.  holdMetadata(id) models node `id`'s metadata replica lagging (the committed record not yet
     /// applied there) while AlterIsr answers still arrive; releaseMetadata(id) applies the current assignment.
+    /// The harness controller answers the next `n` well-based ISR proposals INVALID_REQUEST (as MetadataService
+    /// does for a proposal naming a non-replica / missing the leader, after the epoch + CAS checks passed).
+    void forceInvalidRequestNext(int n) { forceInvalidRequest_ += n; }
+    [[nodiscard]] int forcedInvalidRequestsLeft() const noexcept { return forceInvalidRequest_; }
     void holdMetadata(NodeId id)    { heldMeta_.insert(id); }
     void releaseMetadata(NodeId id) { heldMeta_.erase(id); applyMetadata(id); }
     void dropNext(Kind k, int count) { dropNext_[static_cast<int>(k)] += count; }
@@ -765,6 +769,11 @@ private:
         // Leader-epoch restart fence (MetadataService::bumpLeaderEpoch_): the
         // committed leader refused its committed epoch (it led at it in an
         // earlier incarnation) — the same assignment at a NEW epoch.
+        if (m.isrCount != AlterIsrMsg::kLeaderEpochBump && forceInvalidRequest_ > 0) {
+            --forceInvalidRequest_;
+            reply(kAlterIsrInvalidRequest);
+            return;
+        }
         if (m.isrCount == AlterIsrMsg::kLeaderEpochBump) {
             // Fix round 1 MAJOR-1 (MetadataService::decideBumps_): another
             // live ISR member leads and the requester leaves the ISR; only a
@@ -929,7 +938,8 @@ private:
     Meta                    meta_;
     std::deque<Frame>       wire_;
     std::set<std::pair<NodeId, NodeId>> cut_;
-    std::set<NodeId> heldMeta_;   ///< nodes whose metadata replica lags (holdMetadata)
+    std::set<NodeId> heldMeta_;
+    int forceInvalidRequest_ = 0;   ///< forceInvalidRequestNext   ///< nodes whose metadata replica lags (holdMetadata)
     int                     dropNext_[kKinds] = {};
     uint64_t                framesLost_ = 0;
     uint64_t                sent_[8][kKinds] = {};

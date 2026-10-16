@@ -1956,3 +1956,147 @@ TEST(DrIntegrationRegression, FencedAnswerKeepsThePendingProposalUntilTheAssignm
     EXPECT_EQ(c.produceAcked(5), 5);
     expectAllConvergedAndAcked(c, "fenced answer");
 }
+
+// ---------------------------------------------------------------------------
+// DR-bugs fix round 1 (reviews A + B): the AlterIsr proposal state machine.
+// ---------------------------------------------------------------------------
+namespace {
+// Leader 1, node 3 shrunk out and committed (partitionEpoch 1), node 3 healed: node 1 proposes it back while
+// its metadata replica is held, the controller commits the expansion (pe 2) and answers the re-send
+// InvalidUpdateVersion.  Returns with that stale answer delivered.
+void staleAnsweredExpansion(DrCluster& c) {
+    c.start();
+    ASSERT_EQ(c.produceAcked(10), 10);
+    ASSERT_TRUE(c.driveUntil([&] { return c.converged(); }, kCap));
+    c.cutBoth(1, 3);
+    ASSERT_EQ(c.produceAcked(5), 5) << c.dump();
+    ASSERT_TRUE(c.driveUntil([&] { return !c.controllerIsrContains(3); }, kCap)) << c.dump();
+    ASSERT_TRUE(c.driveUntil([&] { return !c.rep(1).isrProposalPendingForTest(); }, kCap)) << c.dump();
+    c.holdMetadata(1);
+    const uint64_t staleBefore = c.alterIsrStale();
+    c.heal(1, 3);
+    ASSERT_TRUE(c.driveUntil([&] { return c.controllerIsrContains(3); }, kCap)) << c.dump();
+    ASSERT_TRUE(c.driveUntil([&] { return c.alterIsrStale() > staleBefore; }, kCap)) << c.dump();
+    c.run(2);
+}
+
+// A pending proposal the controller cannot see (node 1 cut from the controller): node 3 lags, node 1 proposes
+// the shrink and keeps re-sending it into the void.
+void unansweredShrink(DrCluster& c) {
+    c.start();
+    ASSERT_EQ(c.produceAcked(10), 10);
+    ASSERT_TRUE(c.driveUntil([&] { return c.converged(); }, kCap));
+    c.cutBoth(1, 3);
+    c.cutBoth(1, kControllerAddr);
+    ASSERT_EQ(c.produce(5), 5);
+    ASSERT_TRUE(c.driveUntil([&] { return c.rep(1).isrProposalPendingForTest(); }, kCap)) << c.dump();
+}
+} // namespace
+
+// A-M1: a stale-answered proposal is re-sent at the SLOW cadence (loss recovery only) and WARNs once if the
+// committed assignment never arrives.  RED before: re-sent every 50 ms (>= 10 sends in 500 ms), no WARN state.
+TEST(IsrProposalRegression, StaleAnsweredProposalAwaitsMetadataAndReSendsSlowlyRegression) {
+    DrCluster c(3);
+    staleAnsweredExpansion(c);
+    ASSERT_TRUE(c.rep(1).isrProposalAwaitingMetadataForTest()) << c.dump();
+    EXPECT_GE(c.rep(1).isrAwaitingMetadataForTest(), 1u);
+    const uint64_t sent0 = c.sentBy(1, Kind::AlterIsr);
+    c.run(500);
+    EXPECT_LE(c.sentBy(1, Kind::AlterIsr) - sent0, 1u) << "re-sent at the stale-answer rate, not 1 s";
+    EXPECT_FALSE(c.rep(1).isrAwaitingMetadataWarnedForTest());
+    c.run(10'000);
+    EXPECT_TRUE(c.rep(1).isrAwaitingMetadataWarnedForTest()) << "a wedged metadata replica must not be silent";
+    EXPECT_TRUE(c.rep(1).isrProposalPendingForTest()) << "only the committed assignment resolves it";
+    c.releaseMetadata(1);
+    EXPECT_FALSE(c.rep(1).isrProposalPendingForTest());
+    EXPECT_FALSE(c.rep(1).isrProposalAwaitingMetadataForTest());
+    expectAllConvergedAndAcked(c, "awaiting metadata");
+}
+
+// B-I6 (the retained clear) + A-M2: an InvalidRequest for THIS proposal (pe == base) clears it at once, and no
+// re-derived proposal goes out for kAlterIsrResendNs.  RED: `case kAlterIsrInvalidRequest: break;` (never
+// clears) or no backoff (re-proposed on the next ISR check, 1 ms).
+TEST(IsrProposalRegression, InvalidRequestClearsItsOwnProposalAndBacksOffRegression) {
+    DrCluster c(3);
+    c.start();
+    ASSERT_EQ(c.produceAcked(10), 10);
+    ASSERT_TRUE(c.driveUntil([&] { return c.converged(); }, kCap));
+    c.forceInvalidRequestNext(1);
+    c.cutBoth(1, 3);
+    ASSERT_EQ(c.produce(5), 5);
+    ASSERT_TRUE(c.driveUntil([&] { return c.forcedInvalidRequestsLeft() == 0; }, kCap)) << c.dump();
+    const uint64_t sentAtAnswer = c.sentBy(1, Kind::AlterIsr);
+    c.run(2);   // the answer is delivered
+    EXPECT_FALSE(c.rep(1).isrProposalPendingForTest()) << "an InvalidRequest for this proposal must clear it";
+    c.run(40);
+    EXPECT_EQ(c.sentBy(1, Kind::AlterIsr), sentAtAnswer) << "re-derived and re-sent inside the back-off";
+    ASSERT_TRUE(c.driveUntil([&] { return !c.controllerIsrContains(3); }, kCap)) << "the shrink must still commit\n"
+                                                                                << c.dump();
+    c.healAll();
+    expectAllConvergedAndAcked(c, "invalid request");
+}
+
+// A-I2 (the part safe without a proposal id): a late InvalidRequest answered at an OLDER partitionEpoch than the
+// pending proposal's base is for an earlier proposal and never clears this one.  RED: the unconditional clear.
+TEST(IsrProposalRegression, LateInvalidRequestForAnOlderBaseNeverClearsTheCurrentProposalRegression) {
+    DrCluster c(3);
+    c.start();
+    ASSERT_EQ(c.produceAcked(10), 10);
+    ASSERT_TRUE(c.driveUntil([&] { return c.converged(); }, kCap));
+    c.cutBoth(1, 3);
+    ASSERT_EQ(c.produceAcked(5), 5);
+    ASSERT_TRUE(c.driveUntil([&] { return !c.controllerIsrContains(3); }, kCap)) << c.dump();
+    ASSERT_TRUE(c.driveUntil([&] { return !c.rep(1).isrProposalPendingForTest(); }, kCap)) << c.dump();
+    c.cutBoth(1, kControllerAddr);   // the expansion stays pending (nothing reaches the controller)
+    c.heal(1, 3);
+    ASSERT_TRUE(c.driveUntil([&] { return c.rep(1).isrProposalPendingForTest(); }, kCap)) << c.dump();
+    AlterIsrResponseMsg late{};
+    late.topicId = kTopicId; late.partition = kPartId; late.leaderId = 1; late.leaderEpoch = c.rep(1).epoch();
+    late.partitionEpoch = 0;   // the base before the committed shrink (pe 1)
+    late.errorCode = kAlterIsrInvalidRequest;
+    c.rep(1).onAlterIsrResponse(late);
+    EXPECT_TRUE(c.rep(1).isrProposalPendingForTest()) << "a late answer for an older base cleared the proposal";
+    const auto& maximal = c.rep(1).maximalIsrForTest();
+    EXPECT_NE(std::find(maximal.begin(), maximal.end(), 3), maximal.end());
+    c.healAll();
+    expectAllConvergedAndAcked(c, "late invalid request");
+}
+
+// B-M2 / A-M3: the self-demotion path (a fetch at a higher epoch, onFetchRequest mustStepDown) drops the pending
+// proposal, and the controller's later same-epoch / same-leader becomeFollower (the early-return path) keeps it
+// dropped.  RED: no reset in the self-demotion block.
+TEST(IsrProposalRegression, SelfDemotionDropsThePendingProposalRegression) {
+    DrCluster c(3);
+    unansweredShrink(c);
+    const Epoch e = c.rep(1).epoch();
+    FetchRequestMsg req{};
+    req.leaderEpoch = e + 1; req.partition = kPartId; req.followerId = 2; req.fetchOffset = 0;
+    req.maxBytes = 1 << 20; req.topicId = kTopicId;
+    (void)c.rep(1).onFetchRequest(req, 1'000'000'000LL);
+    ASSERT_NE(c.rep(1).role(), Role::Leader) << "the fetch must self-demote";
+    EXPECT_FALSE(c.rep(1).isrProposalPendingForTest()) << "a follower owns no proposal";
+    c.rep(1).becomeFollower(e + 1, 2);   // same epoch, same guessed leader: the early-return path
+    EXPECT_FALSE(c.rep(1).isrProposalPendingForTest());
+}
+
+// A-M5: a committed assignment OLDER than the applied one never clears the proposal nor regresses the committed
+// ISR.  RED: no guard (pe != base clears it).
+TEST(IsrProposalRegression, OlderCommittedAssignmentIsIgnoredRegression) {
+    DrCluster c(3);
+    c.start();
+    ASSERT_EQ(c.produceAcked(10), 10);
+    ASSERT_TRUE(c.driveUntil([&] { return c.converged(); }, kCap));
+    c.cutBoth(1, 3);
+    ASSERT_EQ(c.produceAcked(5), 5);
+    ASSERT_TRUE(c.driveUntil([&] { return !c.controllerIsrContains(3); }, kCap)) << c.dump();   // pe 1, {1,2}
+    ASSERT_TRUE(c.driveUntil([&] { return !c.rep(1).isrProposalPendingForTest(); }, kCap)) << c.dump();
+    c.cutBoth(1, kControllerAddr);
+    c.heal(1, 3);
+    ASSERT_TRUE(c.driveUntil([&] { return c.rep(1).isrProposalPendingForTest(); }, kCap)) << c.dump();
+    const uint64_t stale0 = c.rep(1).staleAssignmentsForTest();
+    c.rep(1).becomeLeader(c.rep(1).epoch(), std::vector<NodeId>{1, 2, 3}, /*partitionEpoch=*/0);   // older than pe 1
+    EXPECT_TRUE(c.rep(1).isrProposalPendingForTest()) << "an older assignment resolved the proposal";
+    EXPECT_EQ(c.rep(1).staleAssignmentsForTest(), stale0 + 1);
+    c.healAll();
+    expectAllConvergedAndAcked(c, "older assignment");
+}
