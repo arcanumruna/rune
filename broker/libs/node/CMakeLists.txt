@@ -133,7 +133,7 @@ if(BUILD_TESTING)
         # Real-driver UDP GSO/GRO bindings tests (Linux kernels only: UDP_SEGMENT/UDP_GRO).
         add_executable(rune_udp_gso_tests tests/node/UdpGsoBindingsTest.cpp)
         target_link_libraries(rune_udp_gso_tests PRIVATE rune_gso rune_node aeron::aeron GTest::gtest_main)
-        gtest_discover_tests(rune_udp_gso_tests)
+        gtest_discover_tests(rune_udp_gso_tests PROPERTIES LABELS "linux-only")   # review B-I1: checkpoint stage c
     endif()
     set(RUNE_AERON_TSAN_ENV
         "TSAN_OPTIONS=halt_on_error=1 suppressions=${RUNE_TSAN_AERON_SUPP}")

@@ -376,8 +376,9 @@ void EmbeddedDriver::releaseGso_() noexcept {
     epollBindings_ = nullptr;
     if (gso_ == nullptr) return;
     rune_gso_bindings_totals(gso_, &gsoTotals_);
-    if (gsoTotals_.gso_fallbacks > 0 || gsoTotals_.gro_disabled > 0)
-        spdlog::warn("EmbeddedDriver[{}]: udp runtime fallbacks: gso_fallbacks={} (path MTU below the Aeron MTU: {}) "
+    if (gsoTotals_.gso_fallbacks > 0 || gsoTotals_.gro_disabled > 0 || gsoTotals_.gso_path_mtu_fallbacks > 0)
+        spdlog::warn("EmbeddedDriver[{}]: udp runtime fallbacks: gso_fallbacks={} (transports, GSO off) "
+                     "path MTU below the Aeron MTU: {} GSO groups sent plainly (per destination, re-probed) "
                      "gro_disabled={} gro_trunc_drops={}", cfg_.dir, gsoTotals_.gso_fallbacks,
                      gsoTotals_.gso_path_mtu_fallbacks, gsoTotals_.gro_disabled, gsoTotals_.gro_trunc_drops);
     rune_gso_bindings_delete(gso_);

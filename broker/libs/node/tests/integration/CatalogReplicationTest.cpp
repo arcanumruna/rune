@@ -743,11 +743,30 @@ TEST(BindOrderRegression, FixedPortsBindBeforeAnyEphemeralPublicationRegression)
     long lo = 0, hi = 0;
     ASSERT_TRUE(static_cast<bool>(in >> lo >> hi));
     ASSERT_LE(hi - lo + 1, 64) << "the gate needs a narrow range to make the race likely: " << lo << "-" << hi;
+    // The test allocator (FreePort.h) never hands out ephemeral ports — so node 1's six fixed ports are placed
+    // INSIDE the narrowed range explicitly: [lo, lo + 5], the rest of the range is what its own publications
+    // auto-bind from.
+    const auto p0 = static_cast<uint16_t>(lo);
+    auto tweak = [p0](NodeConfig& cfg) {
+        if (cfg.nodeId != 1) return;
+        for (auto& peer : cfg.peers) {
+            if (peer.id != 1) continue;
+            peer.consensusPort = p0; peer.clientPort = static_cast<uint16_t>(p0 + 1);
+            peer.replicationPort = static_cast<uint16_t>(p0 + 2); peer.ingressBasePort = static_cast<uint16_t>(p0 + 3);
+            peer.replBasePort = static_cast<uint16_t>(p0 + 4); peer.egressControlBasePort = static_cast<uint16_t>(p0 + 5);
+        }
+        cfg.clientEndpoint.channel = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(p0 + 1);
+        cfg.workerIngressBasePort = p0 + 3;
+        cfg.workerReplBasePort = p0 + 4;
+        cfg.workerEgressControlBasePort = p0 + 5;
+    };
     int refused = 0;
     std::string lastWhat;
     for (int i = 0; i < 20; ++i) {
         try {
-            ThreeNodes c = ThreeNodes::start("bindorder", {1}, Mode::ShardFused);
+            ThreeNodes c = ThreeNodes::start("bindorder", {}, Mode::ShardFused);
+            c.configTweak = tweak;
+            c.startNode(1);
         } catch (const std::exception& e) {
             ++refused;
             lastWhat = e.what();

@@ -13,6 +13,9 @@ extern "C" {
 
 #include "rune/node/EmbeddedDriver.h"
 
+#include <net/if.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <sched.h>
 #include <sys/utsname.h>
 #include <unistd.h>
@@ -24,6 +27,7 @@ extern "C" {
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -44,6 +48,7 @@ struct Rig {
 
     // gsoMode: 0 = stock Aeron, 1 = GSO+GRO, 2 = GSO+GRO with an injected sendmsg errno (inject before start),
     // 3 = GSO+GRO with `injectCount` received GRO buffers flagged MSG_TRUNC.
+    int injectSkip = 0;   // gsoMode 4: GSO calls let through before the injection (rune_gso_bindings_test_inject_after)
     bool start(int gsoMode, std::size_t mtu, int injectErr = 0, int injectCount = 0) {
         dir = "/dev/shm/rune-gso-test-" + std::to_string(::getpid()) + "-" + std::to_string(++g_rigSeq);
         if (aeron_driver_context_init(&dctx) < 0) return false;
@@ -59,6 +64,7 @@ struct Rig {
             gso = rune_gso_bindings_create(1, 1);
             if (gso == nullptr) return false;   // the VM kernel supports both: NULL here is a failure
             if (gsoMode == 2) rune_gso_bindings_test_inject(gso, injectErr, injectCount);
+            if (gsoMode == 4) rune_gso_bindings_test_inject_after(gso, injectErr, injectCount, injectSkip);
             if (gsoMode == 3) rune_gso_bindings_test_inject_recv_trunc(gso, injectCount);
             if (rune_gso_bindings_install(dctx, gso) < 0) return false;
         }
@@ -178,6 +184,46 @@ int64_t systemCounter(aeron_t* client, const char* label) {
         &f);
     return f.value;
 }
+constexpr int32_t kGsoPathMtuCounterTypeId = 1000222;   // rune_gso_bindings.c
+// Value of the (first) counter of `typeId` in the client's CnC.
+int64_t counterByType(aeron_t* client, int32_t typeId) {
+    struct Find { int32_t type; int64_t value; } f{typeId, -1};
+    aeron_counters_reader_foreach_counter(
+        aeron_counters_reader(client),
+        [](int64_t value, int32_t, int32_t t, const uint8_t*, size_t, const char*, size_t, void* d) {
+            auto* fd = static_cast<Find*>(d);
+            if (t == fd->type && fd->value < 0) fd->value = value;
+        },
+        &f);
+    return f.value;
+}
+// RAII: lowers the loopback MTU (SIOCSIFMTU) and restores it.
+struct LoopbackMtu {
+    bool ok = false;
+    int  old = 0;
+    explicit LoopbackMtu(int mtu) {
+        const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+        if (fd < 0) return;
+        ifreq ifr{};
+        std::strncpy(ifr.ifr_name, "lo", IFNAMSIZ - 1);
+        if (::ioctl(fd, SIOCGIFMTU, &ifr) == 0) {
+            old = ifr.ifr_mtu;
+            ifr.ifr_mtu = mtu;
+            ok = ::ioctl(fd, SIOCSIFMTU, &ifr) == 0;
+        }
+        ::close(fd);
+    }
+    ~LoopbackMtu() {
+        if (!ok) return;
+        const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+        if (fd < 0) return;
+        ifreq ifr{};
+        std::strncpy(ifr.ifr_name, "lo", IFNAMSIZ - 1);
+        ifr.ifr_mtu = old;
+        (void)::ioctl(fd, SIOCSIFMTU, &ifr);
+        ::close(fd);
+    }
+};
 std::string udp(int port, std::size_t mtu, const char* host = "localhost") {
     return "aeron:udp?endpoint=" + std::string(host) + ":" + std::to_string(port) + "|mtu=" + std::to_string(mtu);
 }
@@ -275,9 +321,11 @@ TEST(UdpGsoBindings, GsoSegmentAbovePathMtuFallsBackAndDeliversRegression) {
     Rig r;
     ASSERT_TRUE(r.start(2, 1408, EMSGSIZE, std::numeric_limits<int>::max())) << aeron_errmsg();
     roundTrip(r, r, udp(24617, 1408), mixedSizes(1408, 70));
+    // Review B-I2: the live counter (driver still running).
+    EXPECT_GE(counterByType(r.client, kGsoPathMtuCounterTypeId), 1) << "rune_gso_path_mtu_fallbacks must count live";
     r.close();
-    EXPECT_GE(r.totals.gso_fallbacks, 1u) << "the transport must stop using GSO";
-    EXPECT_EQ(r.totals.gso_path_mtu_fallbacks, r.totals.gso_fallbacks) << "counted as a path-MTU fallback";
+    EXPECT_GE(r.totals.gso_path_mtu_fallbacks, 1u) << "counted as path-MTU groups";
+    EXPECT_EQ(r.totals.gso_fallbacks, 0u) << "a path-MTU refusal never turns GSO off for the transport (A-I3)";
 }
 
 // Sibling: the broker's egress shape (MDC dynamic control) under the same persistent EMSGSIZE.
@@ -291,6 +339,62 @@ TEST(UdpGsoBindings, MdcGsoSegmentAbovePathMtuFallsBackAndDeliversRegression) {
     pub.close();
     sub.close();
     EXPECT_GE(pub.totals.gso_path_mtu_fallbacks, 1u);
+    EXPECT_EQ(pub.totals.gso_fallbacks, 0u) << "per destination, never per transport (A-I3)";
+}
+
+// Review A-I3: one EMSGSIZE (one destination's PMTU, or a transient MTU dip) must not turn GSO off for the
+// transport — after the hold the destination is re-probed and GSO resumes.  Here the injected refusal is single;
+// the next round trip after the hold period must use GSO again.  RED: the per-transport `gso_on = 0` (no GSO
+// sends after the refusal, gso_fallbacks 1).
+TEST(UdpGsoBindings, PathMtuFallbackKeepsGsoForLaterBatchesRegression) {
+    Rig r;
+    ASSERT_TRUE(r.start(2, 1408, EMSGSIZE, 1)) << aeron_errmsg();
+    aeron_subscription_t* sub = addSub(r.client, udp(24620, 1408).c_str(), 1001);   // one image for both rounds
+    ASSERT_NE(sub, nullptr) << aeron_errmsg();
+    roundTrip(r, r, udp(24620, 1408), mixedSizes(1408, 70), "", sub);
+    std::this_thread::sleep_for(std::chrono::milliseconds(10'500));   // past the 10 s per-destination hold
+    roundTrip(r, r, udp(24620, 1408), mixedSizes(1408, 70), "", sub);
+    r.close();
+    EXPECT_EQ(r.totals.gso_fallbacks, 0u);
+    EXPECT_EQ(r.totals.gso_path_mtu_fallbacks, 1u);
+    EXPECT_GE(r.totals.gso_sends, 1u) << "GSO must resume for the destination after the hold";
+}
+
+// Review B-M4: the fallback when part of the batch was already sent as GSO (`done > 0`): the plain re-send covers
+// exactly the rest — no short send, nothing re-sent.  skip = 1: the first GSO group goes through, then EMSGSIZE.
+// RED: `return r < 0 ? r : (int)r;` (drops `done`): a short send, the prefix re-sent ("Short sends" > 0).
+TEST(UdpGsoBindings, PathMtuFallbackAfterAPartlySentBatchDeliversExactlyOnceRegression) {
+    Rig r;
+    r.injectSkip = 1;
+    ASSERT_TRUE(r.start(4, 1408, EMSGSIZE, std::numeric_limits<int>::max())) << aeron_errmsg();
+    const std::size_t payload = 1408 - 32;
+    std::vector<std::size_t> sizes;
+    // 2 full frames + a short one: every message ends a GSO group, so a send call holding several messages
+    // holds several groups — the second one fails with the first already sent (done > 0).
+    for (int i = 0; i < 60; ++i) sizes.push_back(2 * payload + 500);
+    const int64_t shortBefore = systemCounter(r.client, "Short sends");
+    roundTrip(r, r, udp(24621, 1408), sizes);
+    EXPECT_EQ(systemCounter(r.client, "Short sends"), shortBefore) << "the plain re-send must cover exactly the rest";
+    r.close();
+    EXPECT_GE(r.totals.gso_sends, 1u);
+    EXPECT_GE(r.totals.gso_path_mtu_fallbacks, 1u);
+}
+
+// Review B-M3: a kernel that answers EINVAL for a GSO segment above the route MTU is diagnosed as a path-MTU
+// condition (getsockopt IP_MTU), not "GSO unsupported".  Lowers the loopback MTU (needs CAP_NET_ADMIN): runs in
+// the Linux gate (RUNE_LINUX_GATE=1, container with NET_ADMIN); never a silent skip there.  RED: EINVAL ->
+// UNSUPPORTED (gso_fallbacks 1, gso_path_mtu_fallbacks 0).
+TEST(UdpGsoBindings, EinvalAboveTheRouteMtuIsAPathMtuFallbackRegression) {
+    const char* gate = std::getenv("RUNE_LINUX_GATE");
+    if (gate == nullptr || std::string(gate) != "1") GTEST_SKIP() << "Linux gate only (needs CAP_NET_ADMIN)";
+    LoopbackMtu lo(1300);
+    ASSERT_TRUE(lo.ok) << "RUNE_LINUX_GATE=1 but the loopback MTU could not be lowered (CAP_NET_ADMIN?)";
+    Rig r;
+    ASSERT_TRUE(r.start(2, 1408, EINVAL, std::numeric_limits<int>::max())) << aeron_errmsg();
+    roundTrip(r, r, udp(24622, 1408), mixedSizes(1408, 40));
+    r.close();
+    EXPECT_GE(r.totals.gso_path_mtu_fallbacks, 1u);
+    EXPECT_EQ(r.totals.gso_fallbacks, 0u);
 }
 
 TEST(UdpGsoBindings, DataLossRecoversWithGroOn) {
