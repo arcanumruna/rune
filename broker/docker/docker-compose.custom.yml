@@ -35,6 +35,8 @@ services:
       RUNE_PEERS: "0@rune-1:${CONSENSUS_PORT:-40111}:${CLIENT_PORT:-40200}:${REPLICATION_PORT:-40222},1@rune-2:${CONSENSUS_PORT:-40111}:${CLIENT_PORT:-40200}:${REPLICATION_PORT:-40222},2@rune-3:${CONSENSUS_PORT:-40111}:${CLIENT_PORT:-40200}:${REPLICATION_PORT:-40222}"
       RUNE_CLIENT_ENDPOINT: "0.0.0.0:${CLIENT_PORT:-40200}"
       RUNE_DATA_DIR: /var/lib/rune
+      # Empty: an empty data dir refuses to start (format it first: see rune-cluster.env.example).
+      RUNE_STORAGE_FORMAT: "${RUNE_STORAGE_FORMAT:-}"
       # Container /dev/shm budget: 48 MiB per log at the 16 MiB default term.
       RUNE_AERON_TERM_BUFFER_BYTES: "${RUNE_AERON_TERM_BUFFER_BYTES:-4194304}"
       # --- optional (defaults shown) ---
@@ -70,6 +72,8 @@ services:
       RUNE_PEERS: "0@rune-1:${CONSENSUS_PORT:-40111}:${CLIENT_PORT:-40200}:${REPLICATION_PORT:-40222},1@rune-2:${CONSENSUS_PORT:-40111}:${CLIENT_PORT:-40200}:${REPLICATION_PORT:-40222},2@rune-3:${CONSENSUS_PORT:-40111}:${CLIENT_PORT:-40200}:${REPLICATION_PORT:-40222}"
       RUNE_CLIENT_ENDPOINT: "0.0.0.0:${CLIENT_PORT:-40200}"
       RUNE_DATA_DIR: /var/lib/rune
+      # Empty: an empty data dir refuses to start (format it first: see rune-cluster.env.example).
+      RUNE_STORAGE_FORMAT: "${RUNE_STORAGE_FORMAT:-}"
       RUNE_CLIENT_STREAM_ID: "${RUNE_CLIENT_STREAM_ID:-1}"
       RUNE_CONSENSUS_STREAM_ID: "${RUNE_CONSENSUS_STREAM_ID:-10}"
       RUNE_ELECTION_TIMEOUT_MS: "${RUNE_ELECTION_TIMEOUT_MS:-150}"
@@ -102,6 +106,8 @@ services:
       RUNE_PEERS: "0@rune-1:${CONSENSUS_PORT:-40111}:${CLIENT_PORT:-40200}:${REPLICATION_PORT:-40222},1@rune-2:${CONSENSUS_PORT:-40111}:${CLIENT_PORT:-40200}:${REPLICATION_PORT:-40222},2@rune-3:${CONSENSUS_PORT:-40111}:${CLIENT_PORT:-40200}:${REPLICATION_PORT:-40222}"
       RUNE_CLIENT_ENDPOINT: "0.0.0.0:${CLIENT_PORT:-40200}"
       RUNE_DATA_DIR: /var/lib/rune
+      # Empty: an empty data dir refuses to start (format it first: see rune-cluster.env.example).
+      RUNE_STORAGE_FORMAT: "${RUNE_STORAGE_FORMAT:-}"
       RUNE_CLIENT_STREAM_ID: "${RUNE_CLIENT_STREAM_ID:-1}"
       RUNE_CONSENSUS_STREAM_ID: "${RUNE_CONSENSUS_STREAM_ID:-10}"
       RUNE_ELECTION_TIMEOUT_MS: "${RUNE_ELECTION_TIMEOUT_MS:-150}"

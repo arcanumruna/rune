@@ -217,6 +217,7 @@ class Cluster:
         _env_tag = os.environ.get("RUNE_IMAGE_TAG")
         _sha = _env_tag or _git_sha(BROKER_REPO)   # review B-M6: "<sha>-dirty" for a dirty tree (never HEAD's tag)
         print(f"[harness] broker image tag {_sha} ({'RUNE_IMAGE_TAG' if _env_tag else 'git HEAD'})", flush=True)
+        self._image_sha = _sha   # broker_image(): the image `storage format` runs from (faults.format_storage)
         # RUNE_DR_COMPOSE_OVERRIDES: global overlays (e.g. docker/docker-compose.shard.yml)
         # that run the whole matrix in a mode.  They go FIRST so a test's own
         # override_files still win, and default-config baseline arms opt out entirely
@@ -228,6 +229,10 @@ class Cluster:
                                image_tag=_sha)
         self._up = False
         self._serving_cache: str | None = None
+
+    def broker_image(self) -> str:
+        """The broker image this cluster runs (``rune-broker-node:<sha>``, the compose image_tag)."""
+        return f"rune-broker-node:{self._image_sha}"
 
     # ---- lifecycle --------------------------------------------------------
 

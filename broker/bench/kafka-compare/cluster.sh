@@ -96,7 +96,7 @@ rune_start_cluster() {
     # Co-located loopback cluster: bind the client endpoint on 127.0.0.1 (a
     # wildcard bind accepts remote clients, so the broker would derive the NIC MTU
     # instead of the 64 KiB loopback MTU).
-    env RUNE_NODE_ID=$i RUNE_PEERS="$peers" RUNE_CLIENT_ENDPOINT="${RUNE_CLIENT_BIND:-127.0.0.1}:$cport" \
+    env RUNE_NODE_ID=$i RUNE_STORAGE_FORMAT=new RUNE_PEERS="$peers" RUNE_CLIENT_ENDPOINT="${RUNE_CLIENT_BIND:-127.0.0.1}:$cport" \
         RUNE_DATA_DIR="$logdir" RUNE_AERON_DIR="$d/a" \
         $knobs $eg \
         $(rune_shard_env "$i" "${workers:-1}") \
