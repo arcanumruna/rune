@@ -521,12 +521,12 @@ public:
     /// `connectNow` false (fix round 1 I2, reconnectForeverAfterLive): only re-point
     /// the publication — the machine's own Backoff attempt connects there.
     bool failoverSeedTo(const std::string& channel, int64_t nowNs, bool connectNow = true) noexcept;
-    /// Session `index`'s node ingress channel (its endpoint; for the seed, where
-    /// its default publication physically points).  "" when out of range.
     /// Fix round 1 (C1): how often the seed's default publication moved (any
     /// retarget / failover).  "No route entry" means "led by the broker the seed
     /// PHYSICALLY sits on", so every move must be followed by fresh metadata.
     [[nodiscard]] uint64_t seedMoves() const noexcept { return seedMoves_; }
+    /// Session `index`'s node ingress channel (its endpoint; for the seed, where
+    /// its default publication physically points).  "" when out of range.
     [[nodiscard]] const std::string& sessionChannelAt(uint32_t index) const noexcept {
         static const std::string kNone;
         if (index == 0) return transport_.ingressChannel();

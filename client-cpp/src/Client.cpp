@@ -1542,7 +1542,11 @@ void Client::applyControlOp_(const ControlOpHeader& h, std::span<const uint8_t> 
     }
 
     // Ping / DefineTopic / GetTopicSchema: decided HERE, on the duty thread.
-    if (machine.state() != session::SessionState::Connected) {
+    // Fix round 2 (I-1): a seed that is not Connected but WILL reconnect (resuming,
+    // connecting, backing off, mid-failover) makes the op WAIT for it inside the
+    // op's own deadline; NotConnected only when it never can.
+    const bool seedUp = machine.state() == session::SessionState::Connected;
+    if (!seedUp && seedCannotReconnect_()) {
         completeCtl_(p, OpStatus::NotConnected);
         return;
     }
@@ -1599,6 +1603,12 @@ void Client::applyControlOp_(const ControlOpHeader& h, std::span<const uint8_t> 
         pendingCtl_.push_back(std::move(p));
         return;
     }
+    if (!seedUp) {   // I-1: waits for a Connected seed (driveAwaitingSeed_ stamps and sends it)
+        p.ddl = PendingCtl::CtlAwaitingSeed{ctlScratch_};
+        ++ctlAwaitingSeed_;
+        pendingCtl_.push_back(std::move(p));
+        return;
+    }
     switch (agent_.offerDefault(ctlScratch_.data(), ctlScratch_.size())) {
     case transport::AeronTransport::OfferResult::Accepted:
         break;
@@ -1634,8 +1644,74 @@ Client::PendingCtl Client::takeCtl_(std::size_t i) {
     PendingCtl p = std::move(pendingCtl_[i]);
     pendingCtl_.erase(pendingCtl_.begin() + static_cast<std::ptrdiff_t>(i));
     if (!p.unsentFrame.empty()) --unsentCtl_;
+    if (std::holds_alternative<PendingCtl::CtlAwaitingSeed>(p.ddl)) --ctlAwaitingSeed_;   // I-1
     countDdl_(p, -1);
     return p;
+}
+
+bool Client::seedCannotReconnect_() const noexcept {
+    const auto& m = agent_.seedMachine();
+    switch (m.state()) {
+    case session::SessionState::Connected:
+    case session::SessionState::Connecting:
+    case session::SessionState::Handshaking:
+    case session::SessionState::Resuming:
+    case session::SessionState::Backoff:
+        return false;
+    case session::SessionState::Rejected:
+    case session::SessionState::Closed:
+        return true;
+    case session::SessionState::Disconnected:
+        // Never Live: no failover runs (connect() is the app's call).  A stopped
+        // failover: a non-retriable answer — the seed stays down.  Otherwise a
+        // failover episode starts or continues (driveSeedFailover_).
+        return !m.everLive() || std::holds_alternative<SeedFailoverStopped>(seedFailover_);
+    }
+    return true;
+}
+
+int Client::driveAwaitingSeed_() {
+    const auto& m = agent_.seedSession().machine;
+    const bool terminal = seedCannotReconnect_();
+    const bool up = m.state() == session::SessionState::Connected && m.sessionId() != 0;
+    if (!terminal && !up) return 0;
+    int work = 0;
+    for (std::size_t i = 0; i < pendingCtl_.size();) {
+        auto* a = std::get_if<PendingCtl::CtlAwaitingSeed>(&pendingCtl_[i].ddl);
+        if (a == nullptr) { ++i; continue; }
+        if (terminal) {
+            PendingCtl dead = takeCtl_(i);
+            completeCtl_(dead, OpStatus::NotConnected);
+            ++work;
+            continue;
+        }
+        rune::protocol::client::detail::putLE64(a->frame.data(), 8, m.sessionId());   // the seed's CURRENT session
+        PendingCtl& p = pendingCtl_[i];
+        switch (agent_.offerDefault(a->frame.data(), a->frame.size())) {
+        case transport::AeronTransport::OfferResult::Accepted:
+            p.ddl = std::monostate{};
+            --ctlAwaitingSeed_;
+            ++work;
+            ++i;
+            break;
+        case transport::AeronTransport::OfferResult::Retry: {   // the existing unsent path, already stamped
+            std::vector<uint8_t> f = std::move(a->frame);
+            p.ddl = std::monostate{};
+            p.unsentFrame = std::move(f);
+            --ctlAwaitingSeed_;
+            ++unsentCtl_;
+            ++i;
+            break;
+        }
+        case transport::AeronTransport::OfferResult::Fatal: {
+            PendingCtl dead = takeCtl_(i);
+            completeCtl_(dead, OpStatus::NotConnected);
+            ++work;
+            break;
+        }
+        }
+    }
+    return work;
 }
 
 // ---------------------------------------------------------------------------
@@ -1658,6 +1734,18 @@ void Client::countDdl_(const PendingCtl& p, int sign) noexcept {
 void Client::failControlOnSeedLoss_(uint16_t errorCode, std::span<const uint8_t> text) {
     for (std::size_t i = pendingCtl_.size(); i-- > 0;) {
         if (std::holds_alternative<DdlPending>(pendingCtl_[i].ddl)) continue;   // follows its own session (I1)
+        if (std::holds_alternative<PendingCtl::CtlAwaitingSeed>(pendingCtl_[i].ddl)) continue;   // on no session (I-1)
+        if (!pendingCtl_[i].unsentFrame.empty()) {
+            // Fix round 2 (I-1): never sent (the transport refused it) — it reached no
+            // broker, so the lost session owes it nothing: it waits for the seed.
+            PendingCtl& u = pendingCtl_[i];
+            std::vector<uint8_t> f = std::move(u.unsentFrame);
+            u.unsentFrame.clear();
+            --unsentCtl_;
+            u.ddl = PendingCtl::CtlAwaitingSeed{std::move(f)};
+            ++ctlAwaitingSeed_;
+            continue;
+        }
         PendingCtl p = takeCtl_(i);
         completeCtl_(p, OpStatus::SessionLost, 0, 0, errorCode, text);
     }
@@ -1823,6 +1911,23 @@ int Client::driveDdl_(int64_t nowNs) {
                 ++i;
                 break;
             case Offer::Retry:   // refused (its node's session is not up): every cycle, inside the budget
+                // Fix round 2 (I-1): toward a seed that can never reconnect: end now.
+                if (d->endpoint.empty() && seedCannotReconnect_()) {
+                    if (due.cause == DdlResendCause::SessionLost) {
+                        constexpr std::string_view kWhy =
+                            "session lost: the seed can never reconnect (it may have been applied; a retry with "
+                            "the same requestId is exact)";
+                        PendingCtl dead = takeCtl_(i);
+                        completeCtl_(dead, OpStatus::SessionLost, ddlNoValue(dead.op), 0, 0,
+                                     std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(kWhy.data()),
+                                                              kWhy.size()));
+                    } else {
+                        failDdl_(i, static_cast<uint16_t>(rune::protocol::client::ErrorCode::NotLeader),
+                                 "not leader: the seed can never reconnect", ddlNoValue(p.op));
+                    }
+                    ++work;
+                    break;
+                }
                 // A budget that ends at the DDL deadline itself is the deadline:
                 // the sweep ends it Timeout (the DDL timed out); a shorter
                 // budget ends it NotLeader here.
@@ -1867,6 +1972,13 @@ int Client::driveDdl_(int64_t nowNs) {
             ++i;
             break;
         case Offer::Retry:
+            // Fix round 2 (I-1): waiting for a seed that can never reconnect: end now.
+            if (d->endpoint.empty() && seedCannotReconnect_()) {
+                PendingCtl dead = takeCtl_(i);   // never sent (or held for a node that is the seed)
+                completeCtl_(dead, OpStatus::NotConnected);
+                ++work;
+                break;
+            }
             ++i;
             break;
         case Offer::Fatal: {
@@ -1903,9 +2015,15 @@ int Client::retryUnsentControl_() {
         if (p.unsentFrame.empty()) { ++i; continue; }
         const int64_t frameSid = rune::protocol::client::detail::getLE64(p.unsentFrame.data(), 8);
         if (m.state() != session::SessionState::Connected || frameSid != m.sessionId()) {
-            PendingCtl dead = takeCtl_(i);  // its session is gone: no answer possible
-            completeCtl_(dead, OpStatus::SessionLost);
+            // Fix round 2 (I-1): it never reached a broker (unsent): it waits for a
+            // Connected seed (driveAwaitingSeed_ restamps it), inside its deadline.
+            std::vector<uint8_t> f = std::move(p.unsentFrame);
+            p.unsentFrame.clear();
+            --unsentCtl_;
+            p.ddl = PendingCtl::CtlAwaitingSeed{std::move(f)};
+            ++ctlAwaitingSeed_;
             ++work;
+            ++i;
             continue;
         }
         switch (agent_.offerDefault(p.unsentFrame.data(), p.unsentFrame.size())) {
@@ -2405,6 +2523,15 @@ int Client::dutyCycle(int64_t nowNs) {
     if (!deferredReleases_.empty()) [[unlikely]] work += applyDeferredReleases_(false);
     // DR client bug 1: a seed whose broker died moves to a live broker.
     work += driveSeedFailover_(nowNs);
+    // Fix round 2 (C-1): every Connected edge of the seed (failover, a resume
+    // under a new id, a Backoff reconnect) re-offers the in-flight batches once,
+    // restamped by the default branch of offerProduceToLeader_.  With routes the
+    // agent's produceResendFn_ already did it on this edge; a CB-5 redirect
+    // reconnect re-sends via resendAllRedirected, which marks the edge handled.
+    if (const uint64_t e = agent_.connectedEpoch(0); e != 0 && e != seedConnectEpochSeen_) [[unlikely]] {
+        seedConnectEpochSeen_ = e;
+        if (!agent_.multiNodeRouting()) resendAllInFlightViaRoute_();
+    }
 
     // 2. ProduceResponses → hub with plain calls (O(1) ordinal routing).
     work += routeBufferedAcks_();
@@ -2456,6 +2583,7 @@ int Client::dutyCycle(int64_t nowNs) {
     }
 
     // 3b'. F8c C3: control frames the transport refused (Retry), in order.
+    if (ctlAwaitingSeed_ != 0) [[unlikely]] work += driveAwaitingSeed_();   // fix round 2 (I-1)
     if (unsentCtl_ != 0) [[unlikely]] work += retryUnsentControl_();
 
     // 3c. F8a fix2/fix3/fix4 (IM-2, I2, M5): session state is LEVEL-triggered
@@ -2858,6 +2986,9 @@ void Client::onEgressFrame(codec::TemplateId tid,
                         return agent_.submitSend(fb, fl);
                     };
                 producerHub_.resendAllRedirected(newSessionId, sendFn);
+                // Fix round 2 (C-1 / M-1): this Connected edge's in-flight re-offer is done —
+                // the dutyCycle edge handler must not re-offer them a second time.
+                seedConnectEpochSeen_ = agent_.connectedEpoch(0);
                 subscriber::SubscriberHub::SendFn subSendFn =
                     [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
                         return agent_.submitSend(fb, fl);
@@ -3375,8 +3506,12 @@ void Client::onEgressFrame(codec::TemplateId tid,
         // header sessionId) is not the seed's: the seed's pending connect /
         // control ops and the app's onError stay untouched.
         if (sessionFatal && opt->sessionId != 0) {
-            const int64_t seedSid = agent_.seedSession().machine.sessionId();
-            if (seedSid != 0 && opt->sessionId != seedSid) break;
+            const auto& sm = agent_.seedSession().machine;
+            const bool answersSeedConnect = opt->correlationId != 0 && opt->correlationId == sm.correlationId();
+            // F-A C1 / fix round 2 (I-2): only the seed's CURRENT session (or the answer
+            // to its own in-flight connect) — never an abandoned one, also while the
+            // seed's id is 0 (a fresh connect after a failover / forceReconnect).
+            if (opt->sessionId != sm.sessionId() && !answersSeedConnect) break;
         }
         const auto ecode = static_cast<uint16_t>(opt->code);
         const auto text  = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(msg.data()), msg.size());
@@ -5527,11 +5662,8 @@ int Client::driveSeedFailover_(int64_t nowNs) noexcept {
             std::fprintf(stderr, "rune-client: seed reconnected on %s after %u failover attempt(s)\n",
                          agent_.seedChannel().c_str(), f->attempt);
             seedFailover_ = SeedSteady{};
-            // I1: the seed's broker changed — every in-flight batch is re-offered
-            // once on its current route now (same identity: deduplicated), never
-            // left to its attempt timer (default-routed partitions get no connect
-            // event of their own).
-            resendAllInFlightViaRoute_();
+            // I1: the in-flight batches are re-offered by the seed's Connected-edge
+            // handler in dutyCycle (fix round 2 C-1 / M-1: once, never twice).
             return 1;
         }
         if (st == session::SessionState::Closed || st == session::SessionState::Rejected) {
@@ -5551,8 +5683,15 @@ int Client::driveSeedFailover_(int64_t nowNs) noexcept {
         // machine waits in Backoff, once per Backoff entry, so the machine's own
         // next attempt goes there.  Connect rate == the machine's Backoff schedule.
         if (cfg_.reconnectForeverAfterLive) {
+            // I-4: a further (non-own-stall) stale loss re-points once (losses are
+            // >= responseTimeoutNs apart: no storm).
+            if (newLoss) return startSeedFailoverAttempt_(*f, nowNs, /*connectNow=*/false) ? 1 : 0;
             if (st != session::SessionState::Backoff || f->backoffAttemptMoved == m.backoffAttempt()) return 0;
             f->backoffAttemptMoved = m.backoffAttempt();
+            // I-3: only on ODD Backoff attempts — on even ones tickBackoff_
+            // retargets to the bootstrap and would undo the re-point (on odd ones
+            // >= 3 its last-known-leader move acts only FROM the bootstrap).
+            if ((m.backoffAttempt() & 1) == 0) return 0;
             return startSeedFailoverAttempt_(*f, nowNs, /*connectNow=*/false) ? 1 : 0;
         }
         if (nowNs < f->notBeforeNs || (!gaveUp && nowNs < f->attemptDeadlineNs)) return 0;
@@ -5575,7 +5714,15 @@ int Client::driveSeedFailover_(int64_t nowNs) noexcept {
     const bool gaveUp = st == session::SessionState::Disconnected || st == session::SessionState::Backoff;
     if (!newLoss && !gaveUp) return 0;
     seedFailover_ = SeedFailingOver{};
-    if (cfg_.reconnectForeverAfterLive) return 1;   // I2: acts at the machine's Backoff entries (above)
+    if (cfg_.reconnectForeverAfterLive) {
+        // I-4: the stale-loss edge re-points at once — the machine's resume (next
+        // tick) goes to the candidate, which answers the resume hint SessionExpired
+        // / UnknownSession and the machine connects fresh there: the first move
+        // ~responseTimeoutNs after the broker died, not after the whole resume +
+        // connect budget.  A gave-up (Backoff) start waits for the odd-entry rule.
+        if (newLoss) (void)startSeedFailoverAttempt_(std::get<SeedFailingOver>(seedFailover_), nowNs, false);
+        return 1;
+    }
     return startSeedFailoverAttempt_(std::get<SeedFailingOver>(seedFailover_), nowNs) ? 1 : 0;
 }
 
@@ -5593,29 +5740,53 @@ bool Client::startSeedFailoverAttempt_(SeedFailingOver& f, int64_t nowNs, bool c
     std::string target;
     try {
         const std::string here = agent_.seedChannel();   // M4: inside the try (it allocates)
-        // I3: ONE ordered candidate list, rotated per attempt — brokers a node
-        // session is Connected to (proven alive) first, then the metadata's
-        // brokers in node-id order, then the bootstrap; duplicates and the
-        // seed's current broker excluded.  Within `size` attempts every known
-        // broker is tried once: one that keeps an old session but refuses new
-        // connects can never pin the seed.
+        // Fix round 2 (I-3): ONE stable list — every metadata broker (node-id
+        // order), then the bootstrap (unless it is one of them) — NOT excluding
+        // the seed's current broker, walked by a cyclic cursor (the node id of the
+        // last candidate tried).  Invariant: consecutive attempts visit every
+        // listed broker in cyclic id order, wherever the seed currently sits, so
+        // every known broker is tried within size + 1 attempts; brokers a later
+        // metadata answer adds join in id order.  The FIRST attempt of an episode
+        // prefers a broker a node session is Connected to (proven alive).  A
+        // reconnectForeverAfterLive machine reaches the bootstrap on its own even
+        // Backoff attempts (tickBackoff_), so its cursor skips the bootstrap.
         seedCandidates_.clear();
-        auto add = [&](const std::string& ch) {
-            if (ch.empty() || agent::ClientAgent::sameEndpoint(ch, here)) return;
-            for (const std::string& c : seedCandidates_)
-                if (agent::ClientAgent::sameEndpoint(c, ch)) return;
-            seedCandidates_.push_back(ch);
-        };
-        const auto n = static_cast<uint32_t>(agent_.sessionCount());
-        for (uint32_t i = 1; i < n; ++i)
-            if (agent_.connectedSessionId(i) != 0) add(agent_.sessionChannelAt(i));
         std::vector<std::pair<int32_t, std::string>> brokers;   // cold: once per attempt
         metadataCache_.forEachBrokerEndpoint(
             [&](int32_t id, const std::string& ep) { brokers.emplace_back(id, ep); });
         std::sort(brokers.begin(), brokers.end());
-        for (const auto& [id, ep] : brokers) add(toChannel(ep));
-        add(cfg_.gatewayChannel);
-        target = seedCandidates_.empty() ? here : seedCandidates_[f.attempt % seedCandidates_.size()];
+        for (auto& [id, ep] : brokers) seedCandidates_.emplace_back(id, toChannel(ep));
+        if (!cfg_.reconnectForeverAfterLive) {
+            bool listed = false;
+            for (const auto& [id, ch] : seedCandidates_)
+                listed = listed || agent::ClientAgent::sameEndpoint(ch, cfg_.gatewayChannel);
+            if (!listed) seedCandidates_.emplace_back(INT32_MAX, cfg_.gatewayChannel);
+        }
+        const std::pair<int32_t, std::string>* pick = nullptr;
+        if (f.attempt == 0) {
+            const auto n = static_cast<uint32_t>(agent_.sessionCount());
+            for (uint32_t i = 1; i < n && pick == nullptr; ++i) {
+                if (agent_.connectedSessionId(i) == 0) continue;
+                const std::string& ch = agent_.sessionChannelAt(i);
+                if (agent::ClientAgent::sameEndpoint(ch, here)) continue;
+                for (const auto& c : seedCandidates_)
+                    if (agent::ClientAgent::sameEndpoint(c.second, ch)) { pick = &c; break; }
+            }
+        }
+        for (int pass = 0; pass < 2 && pick == nullptr; ++pass) {   // the cursor, wrapping once
+            for (const auto& c : seedCandidates_) {
+                if (pass == 0 && c.first <= f.lastTriedNode) continue;
+                if (agent::ClientAgent::sameEndpoint(c.second, here)) continue;
+                pick = &c;
+                break;
+            }
+        }
+        if (pick != nullptr) {
+            f.lastTriedNode = pick->first;
+            target = pick->second;
+        } else {
+            target = here;   // a single broker: reconnect in place
+        }
     } catch (...) {
         // allocation failure (cold path): no target this pass; the next one retries
     }

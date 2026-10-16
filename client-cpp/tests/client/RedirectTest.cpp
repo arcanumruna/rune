@@ -391,6 +391,44 @@ TEST(Redirect, ProduceRedirectFollow) {
     try { std::filesystem::remove_all(agentDir); } catch (...) {}
 }
 
+// Fix round 2 (C-1 / M-1): the redirect reconnect's Connected edge re-offers the
+// redirected batch ONCE (resendAllRedirected) — the seed's generic Connected-edge
+// re-offer must not send it a second time.  RED (the edge not marked handled by
+// the redirect resend): the gateway sees 3 Produces.
+TEST(Redirect, RedirectReconnectDoesNotDoubleReOfferRegression) {
+    static constexpr int32_t kInStr = 4012, kEgStr = 4013;
+    const std::string agentDir = uniqueDir();
+    const std::string aeronDir = agentDir + "/aeron";
+    ClientConfig cfg;
+    cfg.gatewayChannel = "aeron:ipc"; cfg.gatewayStreamId = kInStr;
+    cfg.egressChannel  = "aeron:ipc"; cfg.egressStreamId  = kEgStr;
+    cfg.dataDir = agentDir; cfg.connectTimeoutMs = 8000; cfg.pingTimeoutMs = 8000;
+    cfg.idleMode = IdleMode::LowLatency;
+    TopicSpec ts; ts.name = "inventory"; ts.topicId = 1; ts.partitionCount = 1;
+    cfg.topics.push_back(ts);
+    auto client = std::make_unique<Client>(cfg);
+    std::this_thread::sleep_for(150ms);
+    auto gw = std::make_unique<RedirectGateway>(aeronDir, kInStr, kEgStr);
+    test_support::TestCq connCq(*client);
+    auto conn = connCq.issue([&](rune::client::Completions& q, rune::client::Token t) { return client->connect(q, t); });
+    for (int i = 0; i < kPumpMax && !conn.ready(); ++i) { gw->poll(16); std::this_thread::sleep_for(kPumpSleep); }
+    ASSERT_NO_THROW(conn.check());
+    ProducerConfig pcfg;
+    pcfg.acks = Acks::Leader; pcfg.lingerUs = 1; pcfg.batchBytes = 1; pcfg.maxInFlight = 4;
+    pcfg.produceTimeoutMs = 12'000;
+    auto p = client->producer(pcfg);
+    test_support::TestCq cqP(*client);
+    const std::vector<uint8_t> val = {1, 2, 3};
+    auto fut = cqP.send(p, client->topic("inventory"), Key(uint64_t{42}), std::span<const uint8_t>(val));
+    for (int i = 0; i < kPumpMax && !fut.ready(); ++i) { gw->poll(16); std::this_thread::sleep_for(kPumpSleep); }
+    ASSERT_TRUE(fut.ready());
+    for (int i = 0; i < 100; ++i) { gw->poll(16); std::this_thread::sleep_for(kPumpSleep); }   // any late extra re-offer
+    EXPECT_EQ(gw->producesSeen, 2) << "1 redirected + exactly 1 re-offer on the new session";
+    EXPECT_EQ(gw->lastProduceSessionId, RedirectGateway::kLeaderSessionId);
+    client->close();
+    try { std::filesystem::remove_all(agentDir); } catch (...) {}
+}
+
 // ===========================================================================
 // Test: SubscribeRedirectFollow (CB-5 B bug-1 + bug-2)
 //

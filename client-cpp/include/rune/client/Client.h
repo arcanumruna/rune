@@ -614,6 +614,8 @@ public:
     /// move of the seed to another broker), and the MetadataRequests sent on a
     /// non-seed session because the seed was not Connected.
     [[nodiscard]] uint64_t testSeedFailovers() const noexcept { return seedFailovers_; }
+    /// Fix round 2 (I-1): control ops waiting for a Connected seed (duty thread / Invoker owner).
+    [[nodiscard]] uint32_t testCtlAwaitingSeed() const noexcept { return ctlAwaitingSeed_; }
     /// Fix round 1 (I2): failover moves that issued their own Connect (never, with reconnectForeverAfterLive).
     [[nodiscard]] uint64_t testSeedFailoverConnects() const noexcept { return seedFailoverConnects_; }
     /// DR client bug 2 (after close): close() drains cut short by closeTimeoutMs.
@@ -1173,7 +1175,11 @@ private:
         DutyTarget           target{};
         std::string          topicName;       // DefineTopic: for listTopics()
         std::vector<uint8_t> unsentFrame;     // non-DDL: transport said Retry: re-offered each cycle
-        std::variant<std::monostate, DdlPending> ddl;   // catalog history: a DDL's own state
+        /// Fix round 2 (I-1): a non-routed op (Ping / GetTopicSchema) issued, or left unsent, while the
+        /// seed was not Connected — its frame waits (on no session) for a Connected seed, inside the op's
+        /// own deadline; it never reached a broker.
+        struct CtlAwaitingSeed { std::vector<uint8_t> frame; };
+        std::variant<std::monostate, DdlPending, CtlAwaitingSeed> ddl;   // catalog history: a DDL's own state
     };
 
     /// Header of a kMsgControlOp ring record (followed by the op's frame).
@@ -1513,6 +1519,7 @@ private:
         int64_t  notBeforeNs       = 0;    ///< the next attempt never starts earlier (pacing)
         int64_t  gapNs             = kSeedFailoverMinGapNs;  ///< fix round 1 (I2): doubles per attempt
         int      backoffAttemptMoved = -1; ///< I2 (reconnectForever): the Backoff entry already re-pointed
+        int32_t  lastTriedNode = INT32_MIN; ///< fix round 2 (I-3): the cyclic cursor (INT32_MAX = the bootstrap)
     };
     /// Fix round 1 (I2): a non-retriable connect answer ended the episode — the
     /// seed stays down (explicit) until it is Live again.
@@ -1522,11 +1529,12 @@ private:
     uint64_t seedFailovers_          = 0;  ///< moves started (test hook)
     uint64_t seedFailoverConnects_   = 0;  ///< fix round 1 (I2): moves that connected by themselves
     uint64_t metadataViaOtherSession_ = 0; ///< MetadataRequests sent on a non-seed session
-    std::vector<std::string> seedCandidates_;  ///< cold scratch (capacity persists)
+    std::vector<std::pair<int32_t, std::string>> seedCandidates_;  ///< (nodeId, channel); cold scratch (capacity persists)
     static constexpr int64_t kSeedFailoverAttemptMaxNs = 10'000'000'000LL;  // 10 s per candidate
     static constexpr int64_t kSeedFailoverMinGapNs     = 100'000'000LL;     // first gap 100 ms ...
     static constexpr int64_t kSeedFailoverMaxGapNs     = 10'000'000'000LL;  // ... doubling, capped at 10 s
     uint64_t seedMovesSeen_ = 0;           ///< fix round 1 (C1): agent_.seedMoves() last seen
+    uint64_t seedConnectEpochSeen_ = 0;    ///< fix round 2 (C-1): agent_.connectedEpoch(0) last seen
     int64_t  metadataAnswerByNs_ = 0;      ///< fix round 1 (M2): an unanswered MetadataRequest's due time (0 = none)
     void noteMetadataSent_() noexcept;
     bool offerMetadataOnNode_(uint32_t index) noexcept;
@@ -1748,6 +1756,11 @@ private:
     PendingCtl              pendingConnect_;           // at most one connect
     bool                    hasPendingConnect_ = false;
     uint32_t                unsentCtl_ = 0;            // entries holding an unsent frame
+    uint32_t                ctlAwaitingSeed_ = 0;      // fix round 2 (I-1): entries in CtlAwaitingSeed
+    /// Fix round 2 (I-1): no attempt to Connect the seed is pending or will start without app action
+    /// (never Live, Rejected, Closed, or a stopped failover) — a control op ends NotConnected only then.
+    [[nodiscard]] bool seedCannotReconnect_() const noexcept;
+    int driveAwaitingSeed_();
     std::vector<uint8_t>    ctlScratch_;               // frame patch buffer (reused)
     // closing_: written by the closing thread after the runner is joined (or
     // on the Invoker owner); read only on the duty / closing thread.

@@ -14,6 +14,7 @@
 // subscribeLeader.  Everything is single-threaded and condition-driven: no
 // sleeps; every wait is a bounded pump loop.
 #include "../support/InvokerGateway.h"
+#include "../support/TestCompletions.h"
 
 #include <rune/client/Client.h>
 #include <rune/protocol/RecordBatch.h>
@@ -64,6 +65,7 @@ struct RigOptions {
     int64_t responseTimeoutNs = 0;
     int64_t connectTimeoutMs  = 0;  // 0 = the client default
     bool    reconnectForever  = false;
+    int64_t pingTimeoutMs     = 0;  // 0 = the client default
 };
 
 struct GroupRig {
@@ -100,7 +102,9 @@ struct GroupRig {
     std::pair<int, int> addNode(int32_t stream) {
         const int port = freePort();
         gw.nextPubChannel = pubChannel();
-        return {gw.addEndpoint(udp(port), stream), port};
+        const int ep = gw.addEndpoint(udp(port), stream);
+        gw.nodeOfEndpoint[ep] = ep;   // a broker of its own: its own session table (strict sessions)
+        return {ep, port};
     }
     static rc::ClientConfig makeCfg(int32_t in, int32_t eg, const std::string& seed, const std::string& egress,
                                     const RigOptions& o) {
@@ -115,6 +119,7 @@ struct GroupRig {
         c.responseTimeoutNs   = o.responseTimeoutNs;
         if (o.connectTimeoutMs > 0) c.connectTimeoutMs = o.connectTimeoutMs;
         c.reconnectForeverAfterLive = o.reconnectForever;
+        if (o.pingTimeoutMs > 0) c.pingTimeoutMs = o.pingTimeoutMs;
         rc::TopicSpec ts;
         ts.name           = "t";
         ts.topicId        = 1;
@@ -2947,6 +2952,51 @@ TEST(GroupRoutingRegression, SingleRouteTopologySeedFailoverReOffersInFlightAtOn
     int onN1 = 0;
     for (const auto& pr : r.gw.produced) onN1 += pr.endpoint == n1 ? 1 : 0;
     EXPECT_EQ(onN1, 3) << "each batch reached the new leader exactly once";
+    // Fix round 2 (C-1): the re-offered frames carry the seed's NEW session id (the strict fake
+    // drops a Produce for an unknown session unanswered, as the broker does).
+    EXPECT_EQ(r.gw.droppedUnknownSessionProduce, 0);
+    for (const auto& pr : r.gw.produced)
+        if (pr.endpoint == n1) EXPECT_EQ(pr.sessionId, r.client.testSeedSessionId());
+}
+
+// Fix round 2 (C-1): a single node; the seed's session is expired and the resume is answered
+// with a NEW id.  The in-flight batches are re-offered at once on the seed's new session.
+// RED (no Connected-edge re-offer): they wait for the 30 s attempt timer; with the default
+// branch's restamp also gone they are dropped as unknown-session frames even then.
+TEST(GroupRoutingRegression, SeedResumedUnderANewSessionIdReOffersInFlightWithTheNewIdRegression) {
+    GroupRig r(4321, 4322, failoverOpts());
+    r.gw.newIdOnResume = true;
+    r.gw.partitions  = {{2, 0, 0, 1, 4321, ""}};
+    r.gw.groupProtocol = false;
+    r.connect();
+    rc::ProducerConfig pc;
+    pc.lingerUs = 0; pc.batchBytes = 1;
+    pc.produceTimeoutMs = 30'000; pc.deliveryTimeoutMs = 40'000;
+    auto p = r.client.producer(pc);
+    r.gw.holdPartitions = {0};
+    const std::vector<uint8_t> val{1};
+    std::vector<rc::Token> toks;
+    for (int i = 0; i < 2; ++i) {
+        toks.push_back(r.nextToken++);
+        ASSERT_TRUE(r.drive([&] {
+            return p.trySend(r.client.topic("b"), rc::Key(uint64_t{1}), std::span<const uint8_t>(val), r.cq,
+                             toks.back()) == rc::SendResult::Ok;
+        }));
+    }
+    ASSERT_TRUE(r.drive([&] { return r.gw.held.size() >= 2; }));
+    const int64_t s1 = r.client.testSeedSessionId();
+    r.gw.held.clear();          // the old session's in-flight frames are gone with it
+    r.gw.holdPartitions.clear();
+    r.gw.expireSession(s1);
+    std::map<rc::Token, rc::OpStatus> done;
+    EXPECT_TRUE(driveFor(r, 3s, [&] {
+        r.cq.poll([&](const rc::Completion& cc, std::span<const uint8_t>) { done[cc.token] = cc.status; });
+        return done.size() == 2;
+    })) << "the in-flight batches were not re-offered on the new session (" << done.size() << "/2)";
+    for (const rc::Token t : toks) EXPECT_EQ(done[t], rc::OpStatus::Ok);
+    EXPECT_NE(r.client.testSeedSessionId(), s1);
+    EXPECT_EQ(r.gw.droppedUnknownSessionProduce, 0);
+    EXPECT_EQ(r.client.testSeedFailovers(), 0u);
 }
 
 // I2(a): the seed's node died and the only other broker refuses every Connect
@@ -3013,6 +3063,7 @@ TEST(GroupRoutingRegression, ShardClientSeedFailoverNeverUndercutsBackoffRegress
     // Every Connect is the machine's own Backoff attempt: the failover only re-points the publication.
     // (Measured on an idle box: 10 Connects in these 4 s with the failover off, 10 with it, 16-18 RED.)
     EXPECT_EQ(r.client.testSeedFailoverConnects(), 0u) << "the failover issued Connects of its own";
+    EXPECT_LE(c, 12) << "connects in 4 s above the Backoff schedule (failover off: 10)";   // load only lowers it
     EXPECT_GE(r.client.testSeedFailovers(), 1u) << "the failover still re-points the seed between attempts";
 }
 
@@ -3134,10 +3185,307 @@ TEST(ClientSessionRegression, StaleNoticeAfterASeedFailoverLeavesTheNewSeedConne
     ASSERT_NE(r.gw.lastUniqueSessionId(), oldSid);
     r.gw.deadEndpoints.erase(0);   // node 0 is reachable again: its reap notifies the abandoned session
     const int connects = r.gw.connectsAt[n1];
+    int appErrors = 0;   // fix round 2 (M-7)
+    r.client.onError([&](const std::string&) { ++appErrors; });
+    test_support::TestCq cq(r.client);
+    // A pending op (an unanswered schema read: keepalive pongs must keep flowing).
+    auto ping = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.getTopicSchema("t", q, t); });
+    (void)driveFor(r, 100ms, [] { return false; });
     r.gw.sendError(0, static_cast<int16_t>(rune::protocol::client::ErrorCode::SessionExpired), "", oldSid, 0);
     ASSERT_TRUE(driveFor(r, 3s, [&] { return r.client.testStaleSessionNotices() == 1; }));
-    (void)driveFor(r, 1s, [] { return false; });
+    (void)driveFor(r, 300ms, [] { return false; });
     EXPECT_EQ(r.client.testSessionStateAt(0), rc::session::SessionState::Connected)
         << "the abandoned node-0 session's notice tore down the node-1 seed";
     EXPECT_EQ(r.gw.connectsAt[n1], connects);
+    EXPECT_FALSE(ping.ready()) << ping.describe();
+    EXPECT_EQ(appErrors, 0);
+}
+
+
+// ===========================================================================
+// DR client bugs — fix round 2 (client-failover-review.md recipes I-1 .. I-4)
+// ===========================================================================
+namespace pcl = rune::protocol::client;
+namespace {
+/// Two nodes; the seed's node dies and its failover connect to node 1 is held open
+/// (delayed connect replies): returns once the seed is mid-failover (not Connected).
+RigOptions slowConnectOpts() {   // the failover's connect is held open (delayed reply) but inside its timeout
+    RigOptions o = failoverOpts();
+    o.connectTimeoutMs = 3000;
+    return o;
+}
+void startFailoverWindow(GroupRig& r, std::chrono::milliseconds connectDelay) {
+    r.gw.groupProtocol = false;
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return r.client.testMetadataResponses() > 0; }));
+    r.gw.connectReplyDelay = connectDelay;
+    r.gw.deadEndpoints.insert(0);
+    ASSERT_TRUE(driveFor(r, 10s, [&] {
+        return r.client.testSeedFailovers() >= 1 &&
+               r.client.testSessionStateAt(0) != rc::session::SessionState::Connected;
+    })) << "precondition: the seed is failing over";
+}
+}  // namespace
+
+// I-1: a DDL issued while the seed fails over WAITS for it (inside ddlTimeoutMs) and succeeds on the
+// new session.  RED (the old gate): it completes NotConnected at once.
+TEST(GroupRoutingRegression, DdlIssuedWhileTheSeedFailsOverWaitsAndSucceedsRegression) {
+    GroupRig r(4323, 4324, slowConnectOpts());
+    const auto [n1, p1port] = r.addNode(4323);
+    r.gw.moreBrokers = {{1, "127.0.0.1", p1port}};
+    std::vector<std::pair<int, int64_t>> arrivals;
+    r.gw.templateHandlers[pcl::DropTopic::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
+        auto m = pcl::DropTopic::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        arrivals.emplace_back(ep, m->sessionId);
+        pcl::DdlResponse resp; resp.sessionId = m->sessionId; resp.correlationId = m->correlationId;
+        resp.objectId = 41; resp.newVersion = 1;
+        r.gw.sendDdlResponse(ep, resp);
+    };
+    startFailoverWindow(r, 600ms);
+    test_support::TestCq cq(r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.dropTopic("t", {}, q, t); });
+    ASSERT_TRUE(f.accepted());
+    (void)driveFor(r, 300ms, [] { return false; });
+    EXPECT_FALSE(f.ready()) << "the DDL waits for the seed (" << (f.ready() ? f.describe() : "") << ")";
+    EXPECT_TRUE(driveFor(r, 5s, [&] { return f.ready(); }));
+    ASSERT_TRUE(f.ok()) << f.describe();
+    EXPECT_EQ(f.outcome().c.value, 41);
+    ASSERT_EQ(arrivals.size(), 1u);
+    EXPECT_EQ(arrivals[0].first, n1);
+    EXPECT_EQ(arrivals[0].second, r.client.testSeedSessionId());
+    EXPECT_EQ(cq.timesCompleted(f.token()), 1);
+}
+
+// I-1: Ping and GetTopicSchema issued mid-failover wait and are answered on the new session.
+// RED (the old gate): NotConnected at once.
+TEST(GroupRoutingRegression, PingAndSchemaIssuedWhileTheSeedFailsOverWaitRegression) {
+    GroupRig r(4325, 4326, slowConnectOpts());
+    const auto [n1, p1port] = r.addNode(4325);
+    r.gw.moreBrokers = {{1, "127.0.0.1", p1port}};
+    r.gw.replySchemas = true;
+    r.gw.schemaBlob = {1, 2, 3, 4};
+    startFailoverWindow(r, 600ms);
+    test_support::TestCq cq(r.client);
+    const std::vector<uint8_t> echo{9, 9};
+    auto ping = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.ping(echo, q, t); });
+    auto sch  = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.getTopicSchema("t", q, t); });
+    ASSERT_TRUE(ping.accepted() && sch.accepted());
+    EXPECT_TRUE(driveFor(r, 5s, [&] { return ping.ready() && sch.ready(); }));
+    EXPECT_TRUE(ping.ok()) << ping.describe();
+    EXPECT_TRUE(sch.ok()) << sch.describe();
+    EXPECT_EQ(cq.timesCompleted(ping.token()), 1);
+    EXPECT_EQ(cq.timesCompleted(sch.token()), 1);
+    (void)n1;
+}
+
+// I-1: GetViewRow (routed like a DDL) issued mid-failover waits and is answered.  RED: NotConnected.
+TEST(GroupRoutingRegression, GetViewRowIssuedWhileTheSeedFailsOverWaitsRegression) {
+    GroupRig r(4327, 4328, slowConnectOpts());
+    const auto [n1, p1port] = r.addNode(4327);
+    r.gw.moreBrokers = {{1, "127.0.0.1", p1port}};
+    const std::vector<uint8_t> row{1, 2, 3, 4, 5, 6, 7, 8};
+    r.gw.templateHandlers[pcl::GetViewRow::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
+        auto m = pcl::GetViewRow::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        pcl::ViewRowResponse resp;
+        resp.sessionId = m->sessionId; resp.correlationId = m->correlationId;
+        resp.status = pcl::ViewRowResponse::kOk; resp.rowLen = static_cast<uint32_t>(row.size());
+        resp.rowBytes = row.data(); resp.rowBytesLen = static_cast<uint32_t>(row.size());
+        std::vector<uint8_t> out(resp.encodedSize());
+        const std::size_t n = resp.encode(out.data());
+        r.gw.send(ep, out.data(), n);
+    };
+    startFailoverWindow(r, 600ms);
+    test_support::TestCq cq(r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.getViewRow(0x40000007, 101, 0, q, t); });
+    ASSERT_TRUE(f.accepted());
+    EXPECT_TRUE(driveFor(r, 5s, [&] { return f.ready(); }));
+    EXPECT_TRUE(f.ok()) << f.describe();
+    EXPECT_EQ(cq.timesCompleted(f.token()), 1);
+    (void)n1;
+}
+
+// I-1: a control op ends NotConnected only when the seed can never reconnect.
+//  (a) never connected: at once;  (b) after a stopped failover: at once, never Timeout;
+//  (c) a ping waiting mid-failover when the failover stops: NotConnected promptly.
+// RED (the stopped failover not counted as "cannot reconnect"): (b) / (c) end Timeout at pingTimeoutMs.
+TEST(GroupRoutingRegression, ControlOpEndsNotConnectedOnlyWhenTheSeedCannotReconnectRegression) {
+    {   // (a)
+        GroupRig r(4329, 4330, failoverOpts());
+        ASSERT_TRUE(r.drive([&] { return r.gw.ready(); }));
+        test_support::TestCq cq(r.client);
+        auto ping = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.ping(std::vector<uint8_t>{1}, q, t); });
+        r.client.doWork();
+        ASSERT_TRUE(ping.ready());
+        EXPECT_EQ(ping.status(), rc::OpStatus::NotConnected);
+    }
+    {   // (c) then (b)
+        RigOptions o = failoverOpts();
+        o.pingTimeoutMs = 20'000;
+        GroupRig r(4331, 4332, o);
+        const auto [n1, p1port] = r.addNode(4331);
+        r.gw.moreBrokers = {{1, "127.0.0.1", p1port}};
+        r.gw.refuseConnectsWith[n1] = static_cast<int16_t>(rune::protocol::client::ErrorCode::ProtocolVersion);
+        r.gw.groupProtocol = false;
+        r.connect();
+        ASSERT_TRUE(r.drive([&] { return r.client.testMetadataResponses() > 0; }));
+        test_support::TestCq cq(r.client);
+        r.gw.deadEndpoints.insert(0);
+        ASSERT_TRUE(driveFor(r, 5s, [&] { return r.client.testSessionStateAt(0) != rc::session::SessionState::Connected; }));
+        auto waiting = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.ping(std::vector<uint8_t>{1}, q, t); });
+        ASSERT_TRUE(driveFor(r, 5s, [&] { return r.gw.connectsAt[n1] >= 1; })) << "the failover reaches node 1";
+        const auto tStop = std::chrono::steady_clock::now();
+        EXPECT_TRUE(driveFor(r, 2s, [&] { return waiting.ready(); }));
+        EXPECT_LT(std::chrono::steady_clock::now() - tStop, 1500ms);
+        EXPECT_EQ(waiting.status(), rc::OpStatus::NotConnected) << waiting.describe();
+        auto ping = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.ping(std::vector<uint8_t>{1}, q, t); });
+        auto ddl  = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.dropTopic("t", {}, q, t); });
+        EXPECT_TRUE(driveFor(r, 100ms, [&] { return ping.ready() && ddl.ready(); }));
+        EXPECT_EQ(ping.status(), rc::OpStatus::NotConnected);
+        EXPECT_EQ(ddl.status(), rc::OpStatus::NotConnected);
+    }
+}
+
+// I-1: a control op waiting for the seed ends at its OWN deadline (Timeout, exactly once) — every
+// broker dead, a failover that keeps trying.
+TEST(GroupRoutingRegression, WaitingControlOpTimesOutWithinItsOwnBudgetRegression) {
+    RigOptions o = failoverOpts();
+    o.pingTimeoutMs = 800;
+    GroupRig r(4333, 4334, o);
+    const auto [n1, p1port] = r.addNode(4333);
+    r.gw.moreBrokers = {{1, "127.0.0.1", p1port}};
+    r.gw.groupProtocol = false;
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return r.client.testMetadataResponses() > 0; }));
+    r.gw.deadEndpoints = {0, n1};
+    ASSERT_TRUE(driveFor(r, 5s, [&] { return r.client.testSessionStateAt(0) != rc::session::SessionState::Connected; }));
+    test_support::TestCq cq(r.client);
+    const auto t0 = std::chrono::steady_clock::now();
+    auto ping = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.ping(std::vector<uint8_t>{1}, q, t); });
+    ASSERT_TRUE(driveFor(r, 5s, [&] { return ping.ready(); }));
+    const auto took = std::chrono::steady_clock::now() - t0;
+    EXPECT_EQ(ping.status(), rc::OpStatus::Timeout) << ping.describe();
+    EXPECT_GE(took, 600ms);
+    EXPECT_LT(took, 1200ms);
+    EXPECT_EQ(cq.timesCompleted(ping.token()), 1);
+}
+
+// I-1: close() while a control op waits for the seed completes it Closed, exactly once.
+TEST(GroupRoutingRegression, CloseWhileAControlOpWaitsForTheSeedCompletesItClosedRegression) {
+    GroupRig r(4335, 4336, slowConnectOpts());
+    const auto [n1, p1port] = r.addNode(4335);
+    r.gw.moreBrokers = {{1, "127.0.0.1", p1port}};
+    startFailoverWindow(r, 2500ms);
+    test_support::TestCq cq(r.client);
+    auto ping = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.ping(std::vector<uint8_t>{1}, q, t); });
+    r.client.doWork();
+    ASSERT_EQ(r.client.testCtlAwaitingSeed(), 1u);
+    r.client.close();
+    ASSERT_TRUE(ping.ready());
+    EXPECT_EQ(ping.status(), rc::OpStatus::Closed);
+    EXPECT_EQ(cq.timesCompleted(ping.token()), 1);
+    EXPECT_EQ(r.client.testCtlAwaitingSeed(), 0u);
+    (void)n1;
+}
+
+// I-2: a late SessionExpired for the ABANDONED seed session arrives while the seed's id is 0 (its
+// failover connect pending): nothing of the seed's fails — no onError, the pending connect() and a
+// waiting ping stay pending, then both complete Ok.  RED (`seedSid != 0` guard): onError fires and
+// the connect completes BrokerError.
+TEST(GroupRoutingRegression, StaleNoticeWhileTheSeedReconnectsAfterAFailoverFailsNothingRegression) {
+    GroupRig r(4337, 4338, slowConnectOpts());
+    const auto [n1, p1port] = r.addNode(4337);
+    r.gw.moreBrokers = {{1, "127.0.0.1", p1port}};
+    r.gw.groupProtocol = false;
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return r.client.testMetadataResponses() > 0; }));
+    const int64_t oldSid = r.client.testSeedSessionId();
+    int appErrors = 0;
+    r.client.onError([&](const std::string&) { ++appErrors; });
+    r.client.doWork();
+    r.gw.connectReplyDelay = 800ms;
+    r.gw.deadEndpoints.insert(0);
+    ASSERT_TRUE(driveFor(r, 10s, [&] { return r.client.testSeedFailovers() >= 1 && r.client.testSeedSessionId() == 0; }));
+    test_support::TestCq cq(r.client);
+    auto conn = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.connect(q, t); });
+    auto ping = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.ping(std::vector<uint8_t>{1}, q, t); });
+    const uint64_t noticesBefore = r.client.testStaleSessionNotices();
+    r.gw.sendError(n1, static_cast<int16_t>(rune::protocol::client::ErrorCode::SessionExpired), "", oldSid, 0);
+    (void)driveFor(r, 200ms, [] { return false; });
+    EXPECT_EQ(appErrors, 0) << "onError fired for another session's expiry";
+    EXPECT_FALSE(conn.ready()) << conn.describe();
+    EXPECT_FALSE(ping.ready()) << ping.describe();
+    EXPECT_EQ(r.client.testStaleSessionNotices(), noticesBefore + 1);
+    EXPECT_TRUE(driveFor(r, 5s, [&] { return conn.ready() && ping.ready(); }));
+    EXPECT_TRUE(conn.ok()) << conn.describe();
+    EXPECT_TRUE(ping.ok()) << ping.describe();
+}
+
+// I-3: the plain failover retries every broker in turn.  n1 and n2 are silent at first; the first
+// attempt reaches n1; then n1 recovers — it must be retried.  RED (list[attempt % size] over a
+// list excluding the current broker): attempts go n2, n0, n2, n0 — n1 never again.
+TEST(GroupRoutingRegression, SeedFailoverRetriesEveryBrokerInTurnRegression) {
+    GroupRig r(4339, 4340, failoverOpts());
+    const auto [n1, p1port] = r.addNode(4339);
+    const auto [n2, p2port] = r.addNode(4339);
+    r.gw.moreBrokers = {{1, "127.0.0.1", p1port}, {2, "127.0.0.1", p2port}};
+    r.gw.groupProtocol = false;
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return r.client.testMetadataResponses() > 0; }));
+    r.gw.deadEndpoints = {0};
+    r.gw.silentEndpoints = {n1, n2};
+    ASSERT_TRUE(driveFor(r, 5s, [&] { return r.gw.connectsAt[n1] >= 1; })) << "the first attempt reaches node 1";
+    r.gw.silentEndpoints.erase(n1);
+    EXPECT_TRUE(driveFor(r, 6s, [&] {
+        return r.client.testSessionStateAt(0) == rc::session::SessionState::Connected &&
+               rc::agent::ClientAgent::sameEndpoint(r.client.testSeedChannel(), udp(p1port));
+    })) << "node 1 was never retried (seed on " << r.client.testSeedChannel() << ")";
+    (void)n2; (void)p2port;
+}
+
+// I-3: a shard (reconnectForever) client reaches EVERY broker — n1 refuses connects (retriable), n2
+// is healthy.  RED (re-points on even Backoff entries undone by tickBackoff_'s bootstrap retarget;
+// the old list): it alternates n1 and n0 forever, n2 never tried.
+TEST(GroupRoutingRegression, ShardSeedFailoverReachesEveryBrokerRegression) {
+    RigOptions o = failoverOpts();
+    o.reconnectForever = true;
+    GroupRig r(4341, 4342, o);
+    const auto [n1, p1port] = r.addNode(4341);
+    const auto [n2, p2port] = r.addNode(4341);
+    r.gw.moreBrokers = {{1, "127.0.0.1", p1port}, {2, "127.0.0.1", p2port}};
+    r.gw.groupProtocol = false;
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return r.client.testMetadataResponses() > 0; }));
+    r.gw.deadEndpoints = {0};
+    r.gw.refuseConnectsWith[n1] = static_cast<int16_t>(rune::protocol::client::ErrorCode::Internal);
+    EXPECT_TRUE(driveFor(r, 15s, [&] {
+        return r.client.testSessionStateAt(0) == rc::session::SessionState::Connected &&
+               rc::agent::ClientAgent::sameEndpoint(r.client.testSeedChannel(), udp(p2port));
+    })) << "node 2 was never reached (seed on " << r.client.testSeedChannel() << ")";
+    EXPECT_EQ(r.client.testSeedFailoverConnects(), 0u);
+    (void)n1; (void)n2;
+}
+
+// I-4: a shard client with the DEFAULT connect timeout moves at the stale-loss edge (~ the response
+// timeout), not after its resume + connect budget at the first Backoff entry.
+// RED (no stale-loss re-point): the first move waits ~400 ms + 4 x 5 s.
+TEST(GroupRoutingRegression, ShardClientFailsOverWithinTheStaleThresholdWithDefaultConnectTimeoutsRegression) {
+    RigOptions o = failoverOpts();
+    o.reconnectForever = true;
+    o.connectTimeoutMs = 5000;
+    GroupRig r(4343, 4344, o);
+    const auto [n1, p1port] = r.addNode(4343);
+    r.gw.moreBrokers = {{1, "127.0.0.1", p1port}};
+    r.gw.groupProtocol = false;
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return r.client.testMetadataResponses() > 0; }));
+    r.gw.deadEndpoints.insert(0);
+    const auto t0 = std::chrono::steady_clock::now();
+    EXPECT_TRUE(driveFor(r, 3s, [&] {
+        return r.client.testSessionStateAt(0) == rc::session::SessionState::Connected &&
+               rc::agent::ClientAgent::sameEndpoint(r.client.testSeedChannel(), udp(p1port));
+    })) << "the shard client did not fail over within the stale threshold";
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, 2s);
+    (void)n1;
 }

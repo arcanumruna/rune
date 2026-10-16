@@ -119,6 +119,18 @@ struct InvokerGateway {
     std::map<int, std::vector<PartitionAd>> partitionsAt;
     std::map<int, int16_t>                  refuseConnectsWith;
     int connectsArrived = 0;   // every ConnectRequest that arrived anywhere, dead endpoints included
+    // Fix round 2 (test vacuity): strict session ids (see onFrame).  A frame whose session id the
+    // receiving NODE does not hold is dropped unanswered, as the real broker does.  Endpoints are
+    // node 0's workers unless mapped to a node of their own (GroupRig::addNode does).
+    bool strictSessions = true;
+    std::map<int, int> nodeOfEndpoint;                      // endpoint -> node (default node 0)
+    std::map<int, std::set<int64_t>> sessionsAtNode;        // node -> session ids it assigned
+    int droppedUnknownSession        = 0;
+    int droppedUnknownSessionProduce = 0;
+    [[nodiscard]] int nodeOf(int endpoint) const {
+        const auto it = nodeOfEndpoint.find(endpoint);
+        return it == nodeOfEndpoint.end() ? 0 : it->second;
+    }
     // F8a: direct subscriptions (Subscribe -> SubscribeResponse; Records pushes).
     struct Subscribed {
         int64_t subscriptionId;
@@ -496,6 +508,13 @@ struct InvokerGateway {
         return index;
     }
 
+    /// Fix round 2: another BROKER (not a worker of node 0): its own session table.
+    int addNode(const std::string& channel, int32_t stream) {
+        const int ep = addEndpoint(channel, stream);
+        nodeOfEndpoint[ep] = ep;
+        return ep;
+    }
+
     [[nodiscard]] bool ready() const {
         for (const auto& ep : endpoints) {
             if (!ep->sub || !ep->pub) return false;
@@ -506,6 +525,7 @@ struct InvokerGateway {
     /// ErrorResponse{SessionExpired} to `sessionId` (the broker expired it).
     void expireSession(int64_t sessionId) {
         namespace rcc = rune::client::codec;
+        for (auto& [node, set] : sessionsAtNode) set.erase(sessionId);   // strict sessions: gone
         std::vector<uint8_t> out(128);
         const std::size_t    n = rcc::encodeErrorResponse(
             out.data(), out.size(),
@@ -526,10 +546,11 @@ struct InvokerGateway {
             if (!sp.pub) sp.pub = aeron->findExclusivePublication(sp.reg);
         }
         for (std::size_t i = 0; i < delayedConnects.size();) {
-            if (std::chrono::steady_clock::now() >= delayedConnects[i].first) {
-                const std::vector<uint8_t> f = std::move(delayedConnects[i].second);
+            if (std::chrono::steady_clock::now() >= delayedConnects[i].at) {
+                const std::vector<uint8_t> f = std::move(delayedConnects[i].frame);
+                const int ep = delayedConnects[i].endpoint;   // fix round 2: replayed where it ARRIVED
                 delayedConnects.erase(delayedConnects.begin() + static_cast<std::ptrdiff_t>(i));
-                onFrame(0, f.data(), f.size(), /*replay=*/true);
+                onFrame(ep, f.data(), f.size(), /*replay=*/true);
                 ++work;
             } else {
                 ++i;
@@ -763,7 +784,8 @@ private:
         std::shared_ptr<aeron::ExclusivePublication> pub;
     };
     std::map<int64_t, SessionPub>                     sessionPubs;
-    std::vector<std::pair<std::chrono::steady_clock::time_point, std::vector<uint8_t>>> delayedConnects;
+    struct DelayedConnect { std::chrono::steady_clock::time_point at; std::vector<uint8_t> frame; int endpoint = 0; };
+    std::vector<DelayedConnect> delayedConnects;
     std::vector<std::pair<int64_t, std::vector<uint8_t>>> sessionOutbox;
     int64_t                                           nextUniqueSessionId = 1000;
 
@@ -963,6 +985,22 @@ private:
         if (!tid) return;
         if (static_cast<rcc::TemplateId>(*tid) == rcc::TemplateId::Connect) ++connectsArrived;   // dead or not
         if (deadEndpoints.count(endpoint) != 0) return;  // a dead node hears nothing
+        // Fix round 2 (test vacuity): STRICT sessions, as the real ClientGateway — every frame but
+        // Connect / Disconnect must carry a session id this NODE assigned and has not expired; any
+        // other frame is dropped UNANSWERED ("<op> for unknown session", ClientGateway.cpp
+        // noteUnanswerable_).  A worker endpoint shares its node's session table (nodeOf).
+        if (strictSessions && len >= 16) {
+            const auto t = static_cast<rcc::TemplateId>(*tid);
+            if (t != rcc::TemplateId::Connect && t != rcc::TemplateId::Disconnect) {
+                const int64_t sid = static_cast<int64_t>(rp::detail::getLE64(buf, 8));
+                const auto it = sessionsAtNode.find(nodeOf(endpoint));
+                if (it == sessionsAtNode.end() || it->second.count(sid) == 0) {
+                    ++droppedUnknownSession;
+                    if (t == rcc::TemplateId::Produce) ++droppedUnknownSessionProduce;
+                    return;
+                }
+            }
+        }
         if (!replay) ++framesReceived;
         // Catalog history (Task 5, F7): a test-installed handler for this template
         // answers the frame itself (e.g. Redirect / NotLeader / DdlResponse) —
@@ -976,8 +1014,8 @@ private:
             const auto c = rcc::decodeConnectRequest(buf, len);
             if (!c) return;
             if (!replay && connectReplyDelay.count() > 0) {
-                delayedConnects.emplace_back(std::chrono::steady_clock::now() + connectReplyDelay,
-                                             std::vector<uint8_t>(buf, buf + len));
+                delayedConnects.push_back(DelayedConnect{std::chrono::steady_clock::now() + connectReplyDelay,
+                                                         std::vector<uint8_t>(buf, buf + len), endpoint});
                 return;
             }
             ++connects;
@@ -996,6 +1034,7 @@ private:
             ackBeforeNextConnect.clear();
             int64_t sid = assignedSessionId;
             if (uniqueSessionIds) sid = (c->sessionId != 0 && !newIdOnResume) ? c->sessionId : nextUniqueSessionId++;
+            if (connectErrorCode == 0) sessionsAtNode[nodeOf(endpoint)].insert(sid);   // strict sessions: known here
             clientVersions[sid]      = c->clientVersion;   // D6: the version gate's input
             lastConnectClientVersion = c->clientVersion;
             if (replyOnAnnouncedEgress && sessionPubs.count(sid) == 0) {

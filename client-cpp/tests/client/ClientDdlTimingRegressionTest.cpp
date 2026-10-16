@@ -201,8 +201,8 @@ TEST_P(ClientDdlTimingMatrixRegression, ExactlyOneCompletionAndNoLeftoverState) 
     r.gw.uniqueSessionIds = true;   // every node session its own id (a session-fatal answer names one)
     const std::string l1Ch = udp(freePort());
     const std::string l2Ch = udp(freePort());
-    const int l1 = r.gw.addEndpoint(l1Ch, 4440);
-    const int l2 = r.gw.addEndpoint(l2Ch, 4440);
+    const int l1 = r.gw.addNode(l1Ch, 4440);
+    const int l2 = r.gw.addNode(l2Ch, 4440);
     const std::string nowhere = udp(freePort());   // no node listens there
     r.connect();
 
@@ -383,8 +383,8 @@ TEST(ClientDdlRedirectRegression, LeaderSessionLostMidDdlIsResentWithTheSameRequ
     r.gw.uniqueSessionIds = true;
     const std::string aCh = udp(freePort());
     const std::string cCh = udp(freePort());
-    const int a = r.gw.addEndpoint(aCh, 4442);
-    const int cNode = r.gw.addEndpoint(cCh, 4442);
+    const int a = r.gw.addNode(aCh, 4442);
+    const int cNode = r.gw.addNode(cCh, 4442);
     r.connect();
     std::vector<Arrival> at;
     int seedAnswers = 0;
@@ -421,7 +421,7 @@ TEST(ClientDdlRedirectRegression, SeedLossDoesNotFailADdlInFlightOnTheLeaderSess
     Rig r(invokerCfg(4444, 4445));
     r.gw.uniqueSessionIds = true;
     const std::string aCh = udp(freePort());
-    const int a = r.gw.addEndpoint(aCh, 4444);
+    const int a = r.gw.addNode(aCh, 4444);
     r.connect();
     std::vector<Arrival> at;
     r.gw.templateHandlers[pc::DropView::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {

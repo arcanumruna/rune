@@ -2,6 +2,7 @@
 // endpoints (shard-mode brokers).  Invoker client + InvokerGateway on one thread;
 // the duty-cycle clock is frozen so no retransmit timer can mask a routing bug.
 #include "../support/InvokerGateway.h"
+#include "../support/TestCompletions.h"
 
 #include <rune/client/Client.h>
 #include <rune/client/Completions.h>
@@ -799,9 +800,16 @@ TEST(ClientSessionRegression, StaleSessionExpiredForAnAbandonedSessionLeavesTheS
         ASSERT_NO_FATAL_FAILURE(m.setUp());
         const int connects = m.r.gw.connects;
         const uint64_t stale = m.r.client.testStaleSessionNotices();
+        int appErrors = 0;   // fix round 2 (M-7): a pending op and onError stay untouched too
+        m.r.client.onError([&](const std::string&) { ++appErrors; });
+        test_support::TestCq cq(m.r.client);
+        auto ping = cq.issue([&](rc::Completions& q, rc::Token t) { return m.r.client.ping(std::vector<uint8_t>{1}, q, t); });
+        (void)m.r.drive([] { return false; }, 2'000);
         m.r.gw.sendError(0, static_cast<int16_t>(code), "", m.oldSid, 0);   // the abandoned session's reap notice
         ASSERT_TRUE(m.r.drive([&] { return m.r.client.testStaleSessionNotices() > stale; }));
         (void)m.r.drive([] { return false; }, 20'000);
+        EXPECT_FALSE(ping.ready()) << "a pending op was failed by another session's notice: " << ping.describe();
+        EXPECT_EQ(appErrors, 0) << "onError fired for another session's notice";
         EXPECT_EQ(m.r.client.testSessionStateAt(0), rc::session::SessionState::Connected)
             << "a notice for the abandoned session tore the healthy seed down";
         EXPECT_FALSE(m.sub->finished()) << "the live subscription was ended by another session's notice";
@@ -814,9 +822,15 @@ TEST(ClientSessionRegression, SessionExpiredForTheCurrentSessionStillResumesRegr
     MovedSeed m;
     ASSERT_NO_FATAL_FAILURE(m.setUp());
     const int connects = m.r.gw.connects;
+    test_support::TestCq cq(m.r.client);   // fix round 2 (M-7): the GENUINE notice fails the session's op, once
+    auto ping = cq.issue([&](rc::Completions& q, rc::Token t) { return m.r.client.ping(std::vector<uint8_t>{1}, q, t); });
+    (void)m.r.drive([] { return false; }, 2'000);
     m.r.gw.sendError(0, static_cast<int16_t>(rune::protocol::client::ErrorCode::SessionExpired), "", m.newSid, 0);
     ASSERT_TRUE(m.r.drive([&] { return m.r.gw.connects > connects; })) << "the current session's expiry never resumed";
     EXPECT_EQ(m.r.client.testStaleSessionNotices(), 0u);
+    ASSERT_TRUE(m.r.drive([&] { return ping.ready(); }));
+    EXPECT_EQ(ping.status(), rc::OpStatus::SessionLost);
+    EXPECT_EQ(cq.timesCompleted(ping.token()), 1);
 }
 
 // F-A C1, the resume route: the broker expired session A, the client resumed and the broker answered with a NEW id B.
@@ -835,9 +849,16 @@ TEST(ClientSessionRegression, StaleNoticeAfterAResumeToANewSessionIdLeavesTheSee
     const int64_t b = r.gw.lastUniqueSessionId();
     ASSERT_NE(a, b) << "precondition: the resume got a new id";
     const int c1 = r.gw.connects;
+    int appErrors = 0;   // fix round 2 (M-7)
+    r.client.onError([&](const std::string&) { ++appErrors; });
+    test_support::TestCq cq(r.client);
+    auto ping = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.ping(std::vector<uint8_t>{1}, q, t); });
+    (void)r.drive([] { return false; }, 2'000);
     r.gw.sendError(0, static_cast<int16_t>(rune::protocol::client::ErrorCode::SessionExpired), "", a, 0);
     ASSERT_TRUE(r.drive([&] { return r.client.testStaleSessionNotices() == 1; }));
     (void)r.drive([] { return false; }, 20'000);
     EXPECT_EQ(r.client.testSessionStateAt(0), rc::session::SessionState::Connected);
     EXPECT_EQ(r.gw.connects, c1) << "a notice for the abandoned session made the client reconnect";
+    EXPECT_FALSE(ping.ready()) << ping.describe();
+    EXPECT_EQ(appErrors, 0);
 }

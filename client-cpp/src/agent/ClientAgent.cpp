@@ -967,7 +967,8 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
                 s.machine.correlationId() == opt->correlationId &&
                 (s.machine.state() == session::SessionState::Connecting ||
                  s.machine.state() == session::SessionState::Handshaking);
-            if (fatal && opt->sessionId != 0 && mine != 0 && mine != opt->sessionId && !answersMyConnect) [[unlikely]] {
+            // Fix round 2 (I-2): also while `mine` is 0 (a fresh connect holds no session a notice could name).
+            if (fatal && opt->sessionId != 0 && mine != opt->sessionId && !answersMyConnect) [[unlikely]] {
                 ++staleSessionNotices_;
                 if (egressObserver_) egressObserver_(tid, buf, len);   // the Client's own guard drops it for its ops
                 break;                                                  // no machine transition, no activity credit
@@ -1534,11 +1535,25 @@ bool ClientAgent::offerProduceToLeader_(int32_t topicId, int32_t partition,
             return transport_.offerOn(r.pub, buf, len, crc);
         }
     }
-    // Single-node / no matching route: default offer.  The buf's sessionId was
-    // already stamped from the SEED session (doWork's producerDrainFn_ call
-    // passes seedSession().machine.sessionId() before reaching here), so the
-    // seed's CryptoState is the matching one to seal under.
+    // Single-node / no matching route: default offer, on the SEED's session (its
+    // CryptoState is the one to seal under).  Fix round 2 (C-1): a fresh encode
+    // carries the seed's id already, but a STORED frame re-offered after the seed
+    // got a new session (failover, redirect reconnect, a resume answered with a
+    // new id) still carries the OLD one — the broker drops a Produce for an
+    // unknown session unanswered, so every re-offer and retransmit would be lost
+    // until the delivery timeout.  Hold while the seed is not Connected (Resuming
+    // keeps the old id as a hint); restamp otherwise (a fresh frame: one load and
+    // two compares, nothing written).
     Session& seed = seedSession();
+    {
+        const int64_t sid = seed.machine.sessionId();
+        if (sid == 0 || seed.machine.state() != session::SessionState::Connected) [[unlikely]] {
+            ++heldOffers_;
+            return false;
+        }
+        if (len >= 16 && static_cast<int64_t>(::rune::protocol::client::detail::getLE64(buf, 8)) != sid) [[unlikely]]
+            ::rune::protocol::client::detail::putLE64(const_cast<uint8_t*>(buf), 8, sid);
+    }
     if (seed.machine.cryptoState().encrypted) {
         // Backlog B1 interaction — see the identical comment in the leader
         // branch above: finalize a pending CRC in the plaintext BEFORE

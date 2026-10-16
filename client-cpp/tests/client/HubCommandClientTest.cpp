@@ -1332,3 +1332,31 @@ TEST(HubCommandClient, ALostMetadataRequestIsAskedAgainRegression) {
     }
     EXPECT_TRUE(asked) << "the lost MetadataRequest was never asked again";
 }
+
+// Fix round 2 (I-1): a Ping left UNSENT (the transport refused it) whose session was lost never
+// reached any broker — it waits for the seed and is sent on the NEW session (the strict fake drops
+// a frame for an unknown session), exactly once.  RED (unsent + session changed = SessionLost):
+// it ends SessionLost.
+TEST(HubCommandClient, UnsentPingWhoseSessionWasLostIsSentOnTheNewSessionRegression) {
+    HubRig r(4612);
+    r.gw.uniqueSessionIds = true;
+    r.gw.newIdOnResume    = true;
+    r.gw.replyPongs       = true;
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return r.gw.metadataRequests > 0; }));
+    r.settle(200);
+    const int64_t s1 = r.gw.lastUniqueSessionId();
+    r.client.testForceIngressOffers(rc::transport::AeronTransport::OfferResult::Retry, 1'000'000'000);
+    auto ping = r.pingOp(rc::Bytes(4, 7));
+    r.settle(50);
+    ASSERT_FALSE(ping.ready()) << "precondition: unsent";
+    const int c0 = r.gw.connects;
+    r.gw.expireSession(s1);
+    ASSERT_TRUE(r.drive([&] { return r.gw.connects > c0 && r.client.state() == rc::session::SessionState::Connected; }));
+    ASSERT_NE(r.gw.lastUniqueSessionId(), s1) << "precondition: a new id on resume";
+    r.client.testForceIngressOffers(rc::transport::AeronTransport::OfferResult::Accepted, 0);
+    ASSERT_TRUE(r.drive([&] { return ping.ready(); }));
+    EXPECT_TRUE(ping.ok()) << ping.describe();
+    EXPECT_EQ(r.cq.timesCompleted(ping.token()), 1);
+    EXPECT_EQ(r.gw.droppedUnknownSession, 0) << "the ping went out stamped with the new session's id";
+}

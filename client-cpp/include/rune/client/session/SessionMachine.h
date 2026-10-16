@@ -1114,9 +1114,9 @@ private:
     int64_t resumeEntryNs_       = 0;  // FIX D: timestamp when Resuming was entered
     // DR-BUG-2: fast-retry state for the connect path.
     uint64_t connectFailures_ = 0;   // DR-7: see connectFailures()
-    uint64_t staleSessionLosses_ = 0;
+    uint64_t staleSessionLosses_ = 0;   // fix round 4: see staleSessionLosses()
     uint64_t ownStallLosses_     = 0;   // M1: see ownStallLosses()
-    int16_t  lastConnectError_   = 0;   // I2: see lastConnectError()   // fix round 4: see staleSessionLosses()
+    int16_t  lastConnectError_   = 0;   // I2: see lastConnectError()
     int64_t lastConnectSentNs_   = 0;  // when the last ConnectRequest was offered
     bool    connectSentOk_       = false; // true if the last offer() succeeded
 
