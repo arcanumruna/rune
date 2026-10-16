@@ -2274,12 +2274,12 @@ TEST(BrokerNodeRegression, LinkMtuWatchdogWarnsOnceOnEachEdgeRegression) {
     const fs::path dir = makeTempDataDir("mtuwd_");
     NodeConfig cfg = makeSingleNodeConfig(dir);
     cfg.aeronMtuBytes = 1472;   // explicit: needed = 1500 on IPv4
+    DrBugsLogCapture log;   // installed BEFORE any broker thread exists, and outlives the node (TSan)
     BrokerNode node{cfg};
     std::atomic<int32_t> linkMtu{1500};   // the probe runs on the control thread; the test thread sets it
     node.setMtuProbeForTest([&linkMtu] { return linkMtu.load(); });
     node.start();
     ASSERT_EQ(node.effectiveConfigForTest().aeronMtuBytes, 1472);
-    DrBugsLogCapture log;
     EXPECT_EQ(node.runMtuWatchdogForTest(), 0);
     linkMtu.store(1200);
     EXPECT_EQ(node.runMtuWatchdogForTest(), 300);
@@ -2304,11 +2304,11 @@ TEST(BrokerNodeRegression, StartupWarnsAboutAnEphemeralBoundPortRegression) {
     const uint16_t clientPort = rune::node::test::freeUdpPort();
     cfg.clientEndpoint.channel = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(clientPort);
     for (auto& p : cfg.peers) p.clientPort = clientPort;
+    DrBugsLogCapture log;   // before any broker thread exists, outlives the node (TSan)
     BrokerNode node{cfg};
     node.setHostNetFactsOverrideForTest([clientPort](HostNetFacts& f) {
         f.ephemeralPortLow = clientPort; f.ephemeralPortHigh = clientPort; f.reservedPorts.clear();
     });
-    DrBugsLogCapture log;
     node.start();
     EXPECT_GE(log.count("UDP port(s) " + std::to_string(clientPort)), 1) << "the startup line must name the port";
     node.stop();
