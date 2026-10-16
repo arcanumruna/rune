@@ -1072,6 +1072,8 @@ void ClientGateway::reapExpired(int64_t nowNs) {
         // egress and the offer just fails.  An EXPIRING session's notice is already owed by
         // serviceSpillExpiring_ - never a second one.
         const bool notify = s != nullptr && s->spill.state != SpillState::Expiring;
+        // Review M2: on a Spilled session the notice goes out directly, AHEAD of the spilled answers closeSession_ then
+        // frees - they are lost with the session either way (the client resends with the same requestId / pid+seq).
         (void)closeSession_(sid, notify);
     }
 }

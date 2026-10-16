@@ -3528,3 +3528,120 @@ TEST(ControllerReclaimRegression, DeposedControllerNeverDrainsQueuedRecordsRegre
         EXPECT_EQ(g.svc1->assignment(0, p)->partitionEpoch, epochs[p]) << "partition " << p << " placed twice";
     EXPECT_EQ(g.r1->logEndOffset(), leo) << "placement records kept being appended after the re-claim";
 }
+
+// ===========================================================================
+// F-A review I1 (2026-10-16): a coordinator partition (__catalog, __group, __txn) MOVED to a new controller or FAILED
+// OVER never keeps a member the controller knows is stopping.  Under the leader grace every peer reads live, so the
+// unfiltered ISR kept a cleanly stopped broker in the __catalog ISR (HW = min over the ISR) across every flip.
+// ===========================================================================
+TEST(CoordinatorPartitionRegression, MoveToNewControllerDropsAShuttingMemberRegression) {
+    const std::vector<int32_t> replicas = {1, 2, 3}, shutting = {3};
+    const auto cur = coordPa(2, {2, 1, 3});
+    const auto d = MetadataService::decideCoordinatorPartition(-6, 0, /*self=*/1, &cur, {1, 2, 3}, nullptr,
+                                                               /*bootstrapEpoch=*/4, replicas, false, nullptr, &shutting);
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(d->leaderNode, 1);
+    EXPECT_EQ(d->isr, (std::vector<int32_t>{1, 2})) << "the move kept the stopping member 3 in the ISR";
+}
+
+TEST(CoordinatorPartitionRegression, FailoverDropsAShuttingMemberRegression) {
+    const std::vector<int32_t> replicas = {1, 2, 3, 4}, shutting = {3};
+    rune::metadata::PartitionAssignment cur = coordPa(2, {2, 3, 4});
+    cur.replicas = replicas;
+    // leader 2 dead (not eligible), the controller (1) not in the ISR: fail over among the live ISR members.
+    const auto d = MetadataService::decideCoordinatorPartition(-6, 0, /*self=*/1, &cur, {1, 3, 4}, nullptr,
+                                                               4, replicas, false, nullptr, &shutting);
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(d->leaderNode, 4) << "the failover elected the stopping member";
+    EXPECT_EQ(std::count(d->isr.begin(), d->isr.end(), 3), 0) << "the failover kept the stopping member 3 in the ISR";
+    // The only in-sync survivor is stopping: it still leads (never NO_LEADER / unclean for want of a clean member).
+    const auto onlyStopping = coordPa(2, {2, 3});
+    const auto e = MetadataService::decideCoordinatorPartition(-6, 0, 1, &onlyStopping, {1, 3}, nullptr, 4, {1, 2, 3},
+                                                               false, nullptr, &shutting);
+    ASSERT_TRUE(e.has_value());
+    EXPECT_EQ(e->leaderNode, 3);
+}
+
+TEST(CoordinatorPartitionRegression, CatalogMovedBackAfterAFlipShedsTheStoppingMemberInOneRecordRegression) {
+    CtlRig c(/*userTopics=*/false);
+    const rune::metadata::PartitionKey cat{-6, 0};
+    c.svc->setCoordinatorPartitions({cat}, c.all);
+    (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
+    c.drive(50);
+    ASSERT_NE(c.svc->assignment(-6, 0), nullptr) << "precondition: __catalog bootstrapped";
+    // Consensus moves to node 2: its controller takes __catalog (ISR {2,1,3}).
+    {
+        Failover f(c);
+        f.svc2.setCoordinatorPartitions({cat}, c.all);
+        (void)f.svc2.runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
+        f.drive(50);
+        ASSERT_EQ(f.svc2.assignment(-6, 0)->leaderNode, 2) << "precondition: moved to node 2";
+        ASSERT_EQ(f.svc2.assignment(-6, 0)->isr.size(), 3u);
+    }
+    // ... and back to node 1 (a flip); node 3 is stopping (its controlled-shutdown notice reached node 1).
+    c.r2->becomeFollower(3, 1);
+    c.r3->becomeFollower(3, 1);
+    c.r1->becomeLeader(3, c.all);
+    c.transport.removeFollower(1);
+    c.transport.setLeader(c.r1.get());
+    c.transport.addFollower(2, c.r2.get());
+    c.drive(100);
+    ASSERT_TRUE(c.svc->controllerReady()) << "precondition: node 1 re-claimed";
+    (void)c.svc->onAlterIsr(nodeControl(3, 33, /*shutdown=*/true));
+    c.drive(20);
+    (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr);   // ONE tick: the move record itself
+    c.drive(50);
+    const auto* a = c.svc->assignment(-6, 0);
+    ASSERT_NE(a, nullptr);
+    EXPECT_EQ(a->leaderNode, 1);
+    EXPECT_EQ(std::count(a->isr.begin(), a->isr.end(), 3), 0)
+        << "the move record kept the stopping member: __catalog commits stall until a later fence round";
+}
+
+// Review M1: a consensus-only deposition (the replica still leads, the log unchanged) keeps the MSM's apply cursor -
+// re-applying the whole log onto the live map re-bumped its committed version (a routing rebuild) on every flap.
+TEST(ControllerReclaimRegression, ConsensusOnlyDepositionNeverReappliesTheLogRegression) {
+    ReclaimRig g;
+    g.svc1->configure({}, g.all);
+    g.drive(50);
+    g.svc1->addRuntimeTopic(TopicSpec{0, 3, 3, "", "t"});
+    g.drive(100);
+    ASSERT_NE(g.svc1->assignment(0, 2), nullptr);
+    const uint64_t v = g.svc1->msmForTest().committedVersion();
+    const uint64_t rr = g.svc1->msmForTest().regressionsRejected();
+    g.svc1->setConsensusLeads(false);
+    g.drive(30);
+    EXPECT_EQ(g.svc1->msmForTest().committedVersion(), v) << "the deposition re-applied the log onto the live map";
+    EXPECT_EQ(g.svc1->msmForTest().regressionsRejected(), rr);
+    g.rewin(3);
+    g.drive(100);
+    EXPECT_TRUE(g.svc1->controllerReady());
+    EXPECT_NE(g.svc1->assignment(0, 2), nullptr);
+}
+
+// Review M4: the control tick has the drain's gate - a consensus-deposed controller whose replica still leads
+// appends no tick.
+TEST(ControllerReclaimRegression, DeposedControllerAppendsNoControlTickRegression) {
+    ReclaimRig g;
+    g.svc1->configure({}, g.all);
+    g.drive(50);
+    g.svc1->armControlTick(/*deadlineNs=*/0);
+    g.svc1->setConsensusLeads(false);
+    g.drive(2);
+    const Offset leo = g.r1->logEndOffset();
+    EXPECT_FALSE(g.svc1->pollAndAppendControlTick(g.clock)) << "a deposed controller appended a control tick";
+    EXPECT_EQ(g.r1->logEndOffset(), leo);
+}
+
+// Review M5: before its first claim edge (no doWork yet) a controller decides nothing, even with its replica Leader
+// and no consensus layer - it has not rebuilt its map nor learned its claim LEO.
+TEST(ControllerReclaimRegression, NoDecisionBeforeTheFirstClaimEdgeRegression) {
+    ReclaimRig g;
+    g.svc1->configure({}, g.all);
+    EXPECT_FALSE(g.svc1->controllerReady()) << "ready before any claim (empty map)";
+    g.svc1->addRuntimeTopic(TopicSpec{0, 1, 3, "", "t"});
+    EXPECT_EQ(g.r1->logEndOffset(), 0) << "placed on an empty map before the claim";
+    g.drive(100);
+    EXPECT_TRUE(g.svc1->controllerReady());
+    EXPECT_NE(g.svc1->assignment(0, 0), nullptr) << "the claim places what was recorded before it";
+}

@@ -223,7 +223,8 @@ public:
         int32_t bootstrapEpoch,
         const std::vector<int32_t>& replicas,
         bool selfShutting = false,
-        const std::vector<int32_t>* avoid = nullptr)
+        const std::vector<int32_t>* avoid = nullptr,
+        const std::vector<int32_t>* shutting = nullptr)
     {
         namespace rm = rune::metadata;
         auto in = [](int32_t n, const std::vector<int32_t>& v) {
@@ -234,6 +235,10 @@ public:
         // exists — a halted catalog leader would answer every DDL Internal.  With
         // none, the rules below apply unchanged (a leader beats no leader).
         auto avoided = [&](int32_t n) { return avoid != nullptr && in(n, *avoid); };
+        // F-A I1: a member this controller knows is stopping (controlled shutdown) never stays in the ISR of a record
+        // that MOVES or FAILS OVER a coordinator partition.  Under the leader grace `live` holds every peer, so without
+        // this a cleanly stopped broker kept the __catalog ISR (HW = min over the ISR) across every consensus flip.
+        auto stopping = [&](int32_t n) { return shutting != nullptr && in(n, *shutting); };
         if (cur == nullptr) {
             // Bootstrap seeds the ISR with EVERY configured replica, including a
             // broker that never started (catalog history Task 6, review M6):
@@ -263,11 +268,17 @@ public:
         // ISR keeps every live member (a halted broker still replicates).
         std::vector<int32_t> candidates = live;
         if (steer) std::erase_if(candidates, [&](int32_t n) { return avoided(n); });
+        // I1: a stopping member is never ELECTED either while a live, non-stopping candidate in the ISR exists
+        // (otherwise it re-enters the ISR as the leader).  With none, the rules below apply unchanged (Kafka: a
+        // partition whose only in-sync replica is stopping stays with it, never unclean).
+        bool cleanNonStopping = false;
+        for (int32_t n : cur->isr) cleanNonStopping = cleanNonStopping || (in(n, candidates) && !stopping(n));
+        if (cleanNonStopping) std::erase_if(candidates, [&](int32_t n) { return stopping(n); });
         rm::AssignmentChange chg;
         if (in(selfId, cur->isr) && !selfShutting && in(selfId, candidates)) {   // a stopping controller never takes one
             chg.newLeader = selfId;
             chg.newIsr.push_back(selfId);
-            for (int32_t n : cur->isr) if (n != selfId) chg.newIsr.push_back(n);
+            for (int32_t n : cur->isr) if (n != selfId && in(n, live) && !stopping(n)) chg.newIsr.push_back(n);
         } else if (cur->leaderNode != rm::NO_LEADER && in(cur->leaderNode, candidates) &&
                    in(cur->leaderNode, cur->isr)) {
             return std::nullopt;   // (a halted leader is not a candidate when steering: replaced)
@@ -284,7 +295,7 @@ public:
             if (chg.newLeader != rm::NO_LEADER) {
                 chg.newIsr.push_back(chg.newLeader);
                 for (int32_t n : cur->isr)
-                    if (n != chg.newLeader && in(n, live)) chg.newIsr.push_back(n);
+                    if (n != chg.newLeader && in(n, live) && !stopping(n)) chg.newIsr.push_back(n);
             } else {
                 chg.newIsr = cur->isr;   // offline: keep the lineage (Kafka)
             }
@@ -317,7 +328,7 @@ public:
             const auto next = decideCoordinatorPartition(
                 k.topicId, k.partition, selfId_, msm_.assignment(k.topicId, k.partition),
                 eligibleNodes, &positions_, bootstrapEpoch, coordinatorReplicas_, isShutting_(selfId_),
-                k.topicId == -6 ? &haltedScratch_ : nullptr);
+                k.topicId == -6 ? &haltedScratch_ : nullptr, &shuttingNodes_());   // I1: every coordinator partition
             if (!next) continue;
             rune::metadata::BalancerRecord br;
             br.isr      = next->isr;
@@ -1688,7 +1699,9 @@ public:
     /// advances past it; the balancer decision is then driven by
     /// runDynamicRebalanceOnTick() on whichever node is the leader.
     bool pollAndAppendControlTick(int64_t clusterNowNs) {
-        if (!leaderReady_()) return false;
+        // Review M4 (fix on sight): the same gate as drainDynamicQueue - a consensus-deposed or halted controller whose
+        // replica still leads appends nothing.
+        if (!leaderReady_() || !consensusLeads_ || halted_) return false;
 
         int32_t firedId = 0;
         if (!controlTimer_.poll(clusterNowNs, firedId)) return false;
@@ -2341,8 +2354,12 @@ private:
         for (auto& [n, st] : nodeLifecycle_) { st.confirmed.clear(); st.pushedBits = -1; st.completePushed = false; }
         confirmCheckedVersion_ = 0;
         // Follower: reset lastApplied_ so we re-apply from scratch if we
-        // become leader again later.
-        lastApplied_ = -1;
+        // become leader again later.  Review M1: only when the replica really
+        // stopped leading - a consensus-only deposition (or halt) keeps the log
+        // as it is, so the live MSM keeps applying incrementally (re-applying the
+        // whole log onto it re-bumped the committed version on every flap); a
+        // re-claim's rebuildFromLog resets the cursor anyway.
+        if (!replica_->acceptsProduce()) lastApplied_ = -1;
         controllerCaughtUp_ = false;   // F-B: a later claim always runs a fresh catch-up
     }
 
@@ -2353,7 +2370,8 @@ private:
     /// This replica may DECIDE (emit assignments, answer AlterIsr, rebalance):
     /// it leads AND its MSM reflects its whole log as of the claim.
     [[nodiscard]] bool controllerReady_() const noexcept {
-        return leaderReady_() && consensusLeads_ && controllerCaughtUp_ && !halted_;
+        // Review M5: wasLeader_ = a claim edge ran (rebuild + claim LEO) - before it, nothing is decided on an empty MSM.
+        return wasLeader_ && leaderReady_() && consensusLeads_ && controllerCaughtUp_ && !halted_;
     }
     /// The catch-up edge: the HW (and the MSM apply cursor) reached the
     /// claim-time LEO — the map is complete; the deferred claim action runs.

@@ -228,8 +228,15 @@ public:
         // reconnected - like the real client's stale-session Resuming - and counted.
         constexpr auto kLeaseMargin = std::chrono::nanoseconds(rune::gateway::ClientGateway::kDefaultSessionTimeoutNs / 2);
         if (auto it = sid_.find(n); it != sid_.end()) {
-            if (!reconnectSilent_ || (cl_.silentFor(it->second) < kLeaseMargin && !cl_.sessionExpired(it->second)))
-                return it->second;
+            const auto silent  = cl_.silentFor(it->second);
+            const bool expired = cl_.sessionExpired(it->second);
+            if (!reconnectSilent_ || (silent < kLeaseMargin && !expired)) return it->second;
+            // F-A review I2: the broker's own expiry of a session THIS client kept alive (silent < half the lease) is
+            // product evidence with no harness-observed cause - a premature reap / a lost touch: the test fails.
+            if (expired && silent < kLeaseMargin)
+                ADD_FAILURE() << "broker n" << n << " expired session " << it->second << " that this client kept alive ("
+                              << std::chrono::duration_cast<std::chrono::milliseconds>(silent).count()
+                              << " ms silent < half the lease)";
             std::fprintf(stderr, "[ rig ] n%d session %lld silent %lld ms%s: reconnecting\n", n,
                          static_cast<long long>(it->second),
                          static_cast<long long>(
@@ -2241,6 +2248,18 @@ TEST(CatalogClusterRegression, RigReconnectsASessionItLeftSilentPastTheLeaseRegr
     EXPECT_EQ(g.unanswerable(), u0) << "a frame was sent on the dead session";
 }
 
+// I2 (review): the broker expires a session the Rig kept alive (a forced reap on the via broker's control thread):
+// Rig::session must FAIL the test, never reconnect silently.  RED: drop the ADD_FAILURE.
+TEST(CatalogClusterRegression, RigFailsWhenTheBrokerExpiresAKeptAliveSessionRegression) {
+    LeaseRig g("keptexpired");
+    ASSERT_NO_FATAL_FAILURE(g.setUp());
+    auto& node = g.c.node(g.via);
+    (void)node.onControlThreadForTest([&] { node.gatewayForTest()->reapExpiredForTest(INT64_MAX / 2); return 0; });
+    g.rig->pumping([] { std::this_thread::sleep_for(500ms); });   // the expiry notice arrives
+    ASSERT_TRUE(g.rig->cl().sessionExpired(g.sid0)) << "precondition: the broker told this client";
+    EXPECT_NONFATAL_FAILURE((void)g.rig->session(g.via), "kept alive");
+}
+
 // T-H2 (Recipe 2, negative): a session kept alive across a long wait is never churned.  RED (kLeaseMargin = 0).
 TEST(CatalogClusterRegression, RigKeepsAPumpedSessionAcrossALongWaitRegression) {
     LeaseRig g("pumpedlease");
@@ -2282,7 +2301,10 @@ TEST(CatalogClusterRegression, RestartMidApplyIsrWaitKeepsTheCellSessionsAliveRe
 // comes back); the slice's data-check records are produced idempotently, so the retry of an in-doubt answer is the broker's
 // Duplicate (the original offset), never a second record.  RED (produceOnce ignores the identity: pid -1): two records.
 // ===========================================================================
-TEST(CatalogClusterRegression, SliceDataCheckRetryOfAnInDoubtProduceIsDeduplicatedRegression) {
+// Review M6: this pins the HARNESS wiring (the data check's resend carries the same identity, so the broker dedupes
+// it) - the resend follows an OK, not an in-doubt NotLeader; the in-doubt edge itself is pinned by WorkerPsmRegression
+// P1-P4b (F15EosRegressionTest).
+TEST(CatalogClusterRegression, SliceDataCheckResendWithTheSameIdentityIsDeduplicatedRegression) {
     ThreeNodes c = ThreeNodes::start("dupretry");
     ASSERT_TRUE(c.awaitCatalogLeader(60s));
     Rig rig(c);

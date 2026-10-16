@@ -213,6 +213,10 @@ struct MetaCluster3 {
 
     // Emit the initial static assignment on the leader, replicate + apply on all.
     bool bootstrapStatic() {
+        // Review M5: the controller decides only after its claim edge (one pass: rebuild + claim LEO + catch-up, which
+        // emits the static assignment itself); the direct call stays an idempotent no-op then.
+        clock += 1'000'000LL;
+        (void)s1->doWork(clock);
         s1->emitStaticAssignmentIfNeeded();
         const Offset target = m1->logEndOffset();
         if (target <= 0) return false;

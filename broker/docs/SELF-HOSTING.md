@@ -332,12 +332,13 @@ Tear down (including volumes): `docker compose -f docker/docker-compose.yml down
   feature).
 - Clients connect to **any** node's client endpoint; killing the leader triggers automatic
   re-election among the survivors.
-- An `acks=all` produce answered `NotLeader` (2) or `Internal` (6), or not answered at all,
-  is *in doubt*: the batch may already be in the log and can still commit — for example
-  when leadership moves back to a replica that holds it.  Retry it with the same producer
-  id, epoch and sequence (the Rune client does); the broker answers the retry with the
-  original offset.  A produce without a producer id (`producerId -1`) retried after such an
-  answer can be stored twice.
+- An `acks=all` (or Strict / fsync) produce answered `NotLeader` (2) or `Internal` (6), or
+  not answered at all, is *in doubt*: the batch may already be in the log and can still
+  commit — for example when leadership moves back to a replica that holds it.  Retry it
+  with the same producer id, epoch and sequence (the Rune client does); the broker answers
+  the retry with the original offset if the batch is still in the log, and appends it once
+  otherwise (e.g. the original was truncated by a new leader).  A produce without a
+  producer id (`producerId -1`) retried after such an answer can be stored twice.
 
 ### Open-file limit (`RLIMIT_NOFILE`)
 
