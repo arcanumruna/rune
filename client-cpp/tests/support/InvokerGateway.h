@@ -310,6 +310,9 @@ struct InvokerGateway {
     int16_t       connectErrorCode = 0;  // != 0: every ConnectRequest -> ConnectResponse{code}
     int           framesReceived   = 0;  // every frame from the client, any template
     bool          uniqueSessionIds = false;  // each fresh connect (sessionId 0) gets its own id
+    bool          newIdOnResume    = false;  // F-A C1: a resume (sessionId hint) is answered with a NEW id
+    /// F-A C1: the id the last fresh connect got (uniqueSessionIds).
+    [[nodiscard]] int64_t lastUniqueSessionId() const noexcept { return nextUniqueSessionId - 1; }
     // A slow broker: ConnectResponses go out this long after the request (real
     // time — the stimulus of a test about the caller's own wait budget).
     std::chrono::milliseconds connectReplyDelay{0};
@@ -992,7 +995,7 @@ private:
             for (const Produced& pr : ackBeforeNextConnect) ack(pr);
             ackBeforeNextConnect.clear();
             int64_t sid = assignedSessionId;
-            if (uniqueSessionIds) sid = c->sessionId != 0 ? c->sessionId : nextUniqueSessionId++;
+            if (uniqueSessionIds) sid = (c->sessionId != 0 && !newIdOnResume) ? c->sessionId : nextUniqueSessionId++;
             clientVersions[sid]      = c->clientVersion;   // D6: the version gate's input
             lastConnectClientVersion = c->clientVersion;
             if (replyOnAnnouncedEgress && sessionPubs.count(sid) == 0) {

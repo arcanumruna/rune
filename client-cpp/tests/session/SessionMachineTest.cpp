@@ -2354,3 +2354,29 @@ TEST(SessionLivenessRegression, RegularTicksWithActivityStayConnected) {
         ASSERT_EQ(m.state(), sm::SessionState::Connected);
     }
 }
+
+// F-A C1 (2026-10-16): a session-fatal notice naming ANOTHER session (one this machine already left — the broker's
+// lease reap notifies the abandoned session ~10 s after a forceReconnect / seed failover / new-id resume) never moves
+// a Connected machine.  The notice for its own id, or one naming no session (0), still resumes it.
+TEST(SessionMachineRegression, ConnectedIgnoresAFatalNoticeForAnotherSessionRegression) {
+    for (const auto code : {rpc::ErrorCode::SessionExpired, rpc::ErrorCode::UnknownSession}) {
+        FakeIo io;
+        sm::SessionMachine m(io, testConfig());
+        m.connect(T0);
+        m.onConnectResponse(static_cast<int16_t>(rpc::ErrorCode::OK), 2, 9LL, m.correlationId(), T0);
+        ASSERT_EQ(m.state(), sm::SessionState::Connected);
+        m.onErrorResponse(static_cast<int16_t>(code), "", 0LL, T0, /*noticeSessionId=*/8);
+        EXPECT_EQ(m.state(), sm::SessionState::Connected) << "a notice for session 8 moved session 9";
+        m.onErrorResponse(static_cast<int16_t>(code), "", 0LL, T0, /*noticeSessionId=*/9);
+        EXPECT_EQ(m.state(), sm::SessionState::Resuming) << "the notice for its own session must resume it";
+    }
+}
+
+TEST(SessionMachineRegression, ConnectedResumesOnAFatalNoticeNamingNoSessionRegression) {
+    FakeIo io;
+    sm::SessionMachine m(io, testConfig());
+    m.connect(T0);
+    m.onConnectResponse(static_cast<int16_t>(rpc::ErrorCode::OK), 2, 9LL, m.correlationId(), T0);
+    m.onErrorResponse(static_cast<int16_t>(rpc::ErrorCode::SessionExpired), "", 0LL, T0, /*noticeSessionId=*/0);
+    EXPECT_EQ(m.state(), sm::SessionState::Resuming);
+}

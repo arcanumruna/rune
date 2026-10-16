@@ -542,6 +542,9 @@ public:
     /// F8a fix2 test hooks (duty thread / owner in Invoker mode only).
     [[nodiscard]] uint64_t testIngressOfferRefused() const noexcept { return agent_.ingressOfferRefused(); }
     [[nodiscard]] uint64_t testStaleFramesDropped() const noexcept { return agent_.staleFramesDropped(); }
+    [[nodiscard]] uint64_t testStaleSessionNotices() const noexcept { return agent_.staleSessionNotices(); }
+    /// Test hook (duty-cycle thread only): the seed session's current broker session id (0 = none).
+    [[nodiscard]] int64_t testSeedSessionId() const noexcept { return agent_.seedSession().machine.sessionId(); }
     [[nodiscard]] std::size_t testPendingUnsubscribes() const noexcept { return subscriberHub_.pendingUnsubscribes(); }
     [[nodiscard]] uint64_t testIngressFatalDropped() const noexcept { return agent_.ingressFatalDropped(); }
     /// DR client bug 2: ring-drained frames dropped after the transport refused

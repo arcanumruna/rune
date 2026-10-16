@@ -571,13 +571,17 @@ public:
     void onErrorResponse(int16_t          code,
                          std::string_view message,
                          int64_t          incomingCorrelationId,
-                         int64_t          nowNs) noexcept {
+                         int64_t          nowNs,
+                         int64_t          noticeSessionId = 0) noexcept {
         if (state_ == SessionState::Closed) return;
 
         namespace rpc = rune::protocol::client;
         const auto ec = static_cast<rpc::ErrorCode>(static_cast<uint16_t>(code));
 
         if (state_ == SessionState::Connected) {
+            // F-A C1 (defence in depth): a session-fatal notice naming ANOTHER session (one this machine already
+            // left) never moves this one.  0 = the notice names no session (kept: the old behaviour).
+            if (noticeSessionId != 0 && sessionId_ != 0 && noticeSessionId != sessionId_) return;
             if (ec == rpc::ErrorCode::SessionExpired || ec == rpc::ErrorCode::UnknownSession) {
                 transitionTo(SessionState::Resuming);
                 // doResume fires on the next tick (FIX D: Resuming is a real waiting state).

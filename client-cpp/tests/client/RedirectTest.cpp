@@ -718,8 +718,8 @@ TEST(Redirect, M1SendsDuringReconnectWindowHeldNotSessionId0) {
     ASSERT_TRUE(fut2Done) << "New-during-reconnect produce future must resolve";
     ASSERT_TRUE(subBound) << "New-during-reconnect subscribe must bind";
 
-    ASSERT_NO_THROW({ fut1.offset(); }) << "fut1 must not throw";
-    ASSERT_NO_THROW({ fut2.offset(); }) << "fut2 must not throw";
+    ASSERT_NO_THROW({ (void)fut1.offset(); }) << "fut1 must not throw";
+    ASSERT_NO_THROW({ (void)fut2.offset(); }) << "fut2 must not throw";
 
     // Key M1 assertion: no frame was emitted with sessionId==0
     // The gateway would have seen a Produce with sessionId=0 if the guard
@@ -945,7 +945,7 @@ TEST(Redirect, M2DeadEndpointProduceFutureFails_SubscribeDoesNotHang) {
 
     // Verify produce future threw (not resolved with a value)
     bool prodThrew = false;
-    try { prodFut.offset(); } catch (...) { prodThrew = true; }
+    try { (void)prodFut.offset(); } catch (...) { prodThrew = true; }
     EXPECT_TRUE(prodThrew) << "Produce future must throw on dead-endpoint redirect";
 
     client->close();
@@ -1105,7 +1105,7 @@ TEST(Redirect, M2bMaxRedirectsExhaustedFailsCleanly) {
 
     // The future must throw (redirect exhausted, not a valid offset).
     bool threw = false;
-    try { fut.offset(); } catch (...) { threw = true; }
+    try { (void)fut.offset(); } catch (...) { threw = true; }
     EXPECT_TRUE(threw) << "Produce future must throw when kMaxRedirects is exhausted";
 
     // The gateway must have seen > kMaxRedirects produce attempts

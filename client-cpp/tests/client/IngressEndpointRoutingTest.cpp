@@ -9,6 +9,7 @@
 #include <rune/client/producer/InFlightRing.h>
 
 #include <gtest/gtest.h>
+#include <optional>
 
 #include <chrono>
 #include <span>
@@ -764,4 +765,79 @@ TEST(IngressEndpointRouting, UnreachableRedirectNotResentAgainAfterAReconnectReg
     for (const int64_t c : r.gw.subscribeCorrIds) copiesOfB += c == corrB;
     EXPECT_EQ(copiesOfB, 2) << "the redirected Subscribe went out again after the reconnect's resend";
     EXPECT_FALSE(b.finished());
+}
+
+// F-A C1 (2026-10-16): after a data-op redirect (forceReconnect) the client's seed holds a NEW session; the broker
+// later reaps the ABANDONED one and tells it SessionExpired / UnknownSession on the client's single egress channel.
+// That notice names an id no machine holds: it must never tear the healthy seed down (Resuming, every plain
+// subscription ended SessionLost, DDLs resent) - only the notice for the CURRENT session does.
+namespace {
+struct MovedSeed {
+    Rig r{3940, 3941, "aeron:ipc", "aeron:ipc", /*realClock=*/true};
+    std::optional<rc::Subscription> sub;
+    int64_t oldSid = 0, newSid = 0;
+    void setUp() {
+        r.gw.uniqueSessionIds = true;
+        r.connect();
+        oldSid = r.gw.lastUniqueSessionId();
+        r.gw.subscribeRedirectNext = 1;
+        r.gw.subscribeRedirectTo   = "aeron:ipc";   // a reachable "leader": retarget + forceReconnect (fresh session)
+        sub.emplace(r.client.subscribe(r.client.topic("t"), 0, rc::SubscribeOptions{rc::From::earliest()},
+                                 [](const rc::Record&) {}));
+        ASSERT_TRUE(r.drive([&] { return r.gw.latestSubscription(1, 0) != nullptr || sub->finished(); }));
+        ASSERT_FALSE(sub->finished());
+        newSid = r.gw.lastUniqueSessionId();
+        ASSERT_NE(newSid, oldSid) << "precondition: the redirect moved the seed to a new session";
+        ASSERT_EQ(r.client.testSessionStateAt(0), rc::session::SessionState::Connected);
+    }
+};
+}  // namespace
+
+TEST(ClientSessionRegression, StaleSessionExpiredForAnAbandonedSessionLeavesTheSeedConnectedRegression) {
+    for (const auto code : {rune::protocol::client::ErrorCode::SessionExpired, rune::protocol::client::ErrorCode::UnknownSession}) {
+        MovedSeed m;
+        ASSERT_NO_FATAL_FAILURE(m.setUp());
+        const int connects = m.r.gw.connects;
+        const uint64_t stale = m.r.client.testStaleSessionNotices();
+        m.r.gw.sendError(0, static_cast<int16_t>(code), "", m.oldSid, 0);   // the abandoned session's reap notice
+        ASSERT_TRUE(m.r.drive([&] { return m.r.client.testStaleSessionNotices() > stale; }));
+        (void)m.r.drive([] { return false; }, 20'000);
+        EXPECT_EQ(m.r.client.testSessionStateAt(0), rc::session::SessionState::Connected)
+            << "a notice for the abandoned session tore the healthy seed down";
+        EXPECT_FALSE(m.sub->finished()) << "the live subscription was ended by another session's notice";
+        EXPECT_EQ(m.r.gw.connects, connects) << "the client reconnected for another session's notice";
+        EXPECT_EQ(m.r.client.testStaleSessionNotices(), stale + 1);
+    }
+}
+
+TEST(ClientSessionRegression, SessionExpiredForTheCurrentSessionStillResumesRegression) {
+    MovedSeed m;
+    ASSERT_NO_FATAL_FAILURE(m.setUp());
+    const int connects = m.r.gw.connects;
+    m.r.gw.sendError(0, static_cast<int16_t>(rune::protocol::client::ErrorCode::SessionExpired), "", m.newSid, 0);
+    ASSERT_TRUE(m.r.drive([&] { return m.r.gw.connects > connects; })) << "the current session's expiry never resumed";
+    EXPECT_EQ(m.r.client.testStaleSessionNotices(), 0u);
+}
+
+// F-A C1, the resume route: the broker expired session A, the client resumed and the broker answered with a NEW id B.
+// A late repeat of A's notice (both brokers' reap and expiry paths notify) must never tear B down.
+TEST(ClientSessionRegression, StaleNoticeAfterAResumeToANewSessionIdLeavesTheSeedConnectedRegression) {
+    Rig r{3942, 3943, "aeron:ipc", "aeron:ipc", /*realClock=*/true};
+    r.gw.uniqueSessionIds = true;
+    r.gw.newIdOnResume    = true;
+    r.connect();
+    const int64_t a = r.gw.lastUniqueSessionId();
+    const int c0 = r.gw.connects;
+    r.gw.expireSession(a);
+    ASSERT_TRUE(r.drive([&] {
+        return r.gw.connects > c0 && r.client.testSessionStateAt(0) == rc::session::SessionState::Connected;
+    })) << "precondition: resumed";
+    const int64_t b = r.gw.lastUniqueSessionId();
+    ASSERT_NE(a, b) << "precondition: the resume got a new id";
+    const int c1 = r.gw.connects;
+    r.gw.sendError(0, static_cast<int16_t>(rune::protocol::client::ErrorCode::SessionExpired), "", a, 0);
+    ASSERT_TRUE(r.drive([&] { return r.client.testStaleSessionNotices() == 1; }));
+    (void)r.drive([] { return false; }, 20'000);
+    EXPECT_EQ(r.client.testSessionStateAt(0), rc::session::SessionState::Connected);
+    EXPECT_EQ(r.gw.connects, c1) << "a notice for the abandoned session made the client reconnect";
 }

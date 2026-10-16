@@ -701,6 +701,8 @@ public:
     /// sends (each retried later).
     /// Duty thread only (or after the runner is joined).
     [[nodiscard]] uint64_t staleFramesDropped() const noexcept { return staleFramesDropped_; }
+    /// F-A C1: session-fatal notices for a session this client already left (dropped, never applied).
+    [[nodiscard]] uint64_t staleSessionNotices() const noexcept { return staleSessionNotices_; }
     [[nodiscard]] uint64_t ingressOfferRefused() const noexcept { return ingressOfferRefused_; }
     [[nodiscard]] uint64_t ingressFatalDropped() const noexcept { return ingressFatalDropped_; }
     /// DR client bug 2: ring-drained control frames dropped because the transport
@@ -1039,6 +1041,7 @@ private:
     // F8a fix2: duty-thread counters for the kMsgSend drain rule (plain; read
     // only on the duty thread / after the runner is joined).
     uint64_t staleFramesDropped_  = 0;
+    uint64_t staleSessionNotices_ = 0;   ///< F-A C1 (duty thread only)
     uint64_t ingressOfferRefused_ = 0;
     uint64_t ingressFatalDropped_ = 0;
     // DR client bug 2: the duty-clock time the transport first refused the

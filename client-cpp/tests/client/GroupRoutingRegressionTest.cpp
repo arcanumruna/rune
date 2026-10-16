@@ -2626,11 +2626,14 @@ TEST(GroupRoutingRegression, RedirectFromAnEarlierSessionNeverBindsASubscription
     auto s = r.client.subscribe(r.client.topic("t"), 0, rc::SubscribeOptions{rc::From::earliest()}, led.handler(0));
     ASSERT_TRUE(r.drive([&] { return r.gw.subscribeCorrIds.size() == 1; }));
     const int64_t corr = r.gw.subscribeCorrIds[0];
-    const int64_t s1   = r.gw.assignedSessionId;
-    r.gw.assignedSessionId = s1 + 100;   // the reconnect is assigned S2
+    // F-A C1: the rig hands out unique session ids, so the expiry names the seed's REAL session (a notice for any other
+    // id is stale and moves nothing), and the resume is answered with a NEW id (S2), as the scenario requires.
+    r.gw.newIdOnResume = true;
+    const int64_t s1   = r.client.testSeedSessionId();
     r.gw.expireSession(s1);   // reconnect: S2, the pending Subscribe re-sent there
-    ASSERT_TRUE(r.drive([&] { return r.gw.subscribeCorrIds.size() >= 2 && r.gw.assignedSessionId != s1; }))
-        << "precondition: re-sent on a new seed session";
+    ASSERT_TRUE(r.drive([&] {
+        return r.gw.subscribeCorrIds.size() >= 2 && r.client.testSeedSessionId() != s1 && r.client.testSeedSessionId() != 0;
+    })) << "precondition: re-sent on a new seed session";
     ASSERT_EQ(r.gw.subscribeCorrIds.back(), corr);
 
     // The late Redirect of the FIRST send, from S1.
@@ -2645,8 +2648,9 @@ TEST(GroupRoutingRegression, RedirectFromAnEarlierSessionNeverBindsASubscription
     EXPECT_FALSE(s.finished());
 
     // The copy outstanding on the seed binds (one more re-send after a reconnect): exactly once.
-    const int64_t s2 = r.gw.assignedSessionId;
-    r.gw.assignedSessionId = s2 + 100;
+    // F-A C1: the expiry must name the seed's CURRENT session (the rig hands out unique ids) - a notice for any other
+    // id is a stale one and, correctly, moves nothing.
+    const int64_t s2 = r.client.testSeedSessionId();
     r.gw.expireSession(s2);
     ASSERT_TRUE(r.drive([&] { return s.subscriptionId() != 0; })) << "the subscription never bound on the seed";
     EXPECT_EQ(r.subAt(0, n1), nullptr);
@@ -3110,4 +3114,30 @@ TEST(GroupRoutingRegression, ShardClientSeedFailsOverToALiveBrokerRegression) {
                rc::agent::ClientAgent::sameEndpoint(r.client.testSeedChannel(), udp(p1port));
     })) << "the shard client's seed never reached the live broker (seed on " << r.client.testSeedChannel() << ")";
     (void)n1;
+}
+
+// F-A C1, the seed-failover route: the seed failed over from node 0 to node 1 (a new session there).  When node 0 is
+// reachable again its lease reap tells the ABANDONED session SessionExpired on the client's single egress channel:
+// the healthy session on node 1 stays Connected.
+TEST(ClientSessionRegression, StaleNoticeAfterASeedFailoverLeavesTheNewSeedConnectedRegression) {
+    GroupRig r(4311, 4312, failoverOpts());
+    const auto [n1, p1port] = r.addNode(4311);
+    r.gw.moreBrokers = {{1, "127.0.0.1", p1port}};
+    r.gw.groupProtocol = false;
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return r.client.testMetadataResponses() > 0; }));
+    const int64_t oldSid = r.gw.lastUniqueSessionId();
+    r.gw.deadEndpoints.insert(0);
+    ASSERT_TRUE(driveFor(r, 10s, [&] {
+        return r.client.testSeedFailovers() >= 1 && r.client.testSessionStateAt(0) == rc::session::SessionState::Connected;
+    })) << "precondition: the seed failed over and is Connected on node 1";
+    ASSERT_NE(r.gw.lastUniqueSessionId(), oldSid);
+    r.gw.deadEndpoints.erase(0);   // node 0 is reachable again: its reap notifies the abandoned session
+    const int connects = r.gw.connectsAt[n1];
+    r.gw.sendError(0, static_cast<int16_t>(rune::protocol::client::ErrorCode::SessionExpired), "", oldSid, 0);
+    ASSERT_TRUE(driveFor(r, 3s, [&] { return r.client.testStaleSessionNotices() == 1; }));
+    (void)driveFor(r, 1s, [] { return false; });
+    EXPECT_EQ(r.client.testSessionStateAt(0), rc::session::SessionState::Connected)
+        << "the abandoned node-0 session's notice tore down the node-1 seed";
+    EXPECT_EQ(r.gw.connectsAt[n1], connects);
 }

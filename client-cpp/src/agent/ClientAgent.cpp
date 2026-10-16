@@ -953,6 +953,26 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
             }
         }
         Session& s = *sp;
+        // F-A C1: a session-fatal notice for a session this client already LEFT (a forceReconnect / seed failover /
+        // resume that got a new id abandoned it; the broker's lease reap now tells it SessionExpired ~10 s later)
+        // names an id no machine holds.  It must never tear down the session it was routed to.  Ids are cluster-unique
+        // ((node+1)<<40 | n); sessionId 0 = a session-less answer, and the answer to THIS session's own in-flight
+        // connect (matched by corrId while Connecting / Handshaking) is kept as before.
+        {
+            const bool fatal =
+                opt->code == static_cast<int16_t>(::rune::protocol::client::ErrorCode::SessionExpired) ||
+                opt->code == static_cast<int16_t>(::rune::protocol::client::ErrorCode::UnknownSession);
+            const int64_t mine = s.machine.sessionId();
+            const bool answersMyConnect =
+                s.machine.correlationId() == opt->correlationId &&
+                (s.machine.state() == session::SessionState::Connecting ||
+                 s.machine.state() == session::SessionState::Handshaking);
+            if (fatal && opt->sessionId != 0 && mine != 0 && mine != opt->sessionId && !answersMyConnect) [[unlikely]] {
+                ++staleSessionNotices_;
+                if (egressObserver_) egressObserver_(tid, buf, len);   // the Client's own guard drops it for its ops
+                break;                                                  // no machine transition, no activity credit
+            }
+        }
         if (mnDebug_) {
             std::fprintf(stderr, "[MNDBG err] ErrorResponse corrId=%lld code=%d msg='%.*s' -> session ep='%s' (isSeed=%d)\n",
                 (long long)opt->correlationId, (int)opt->code,
@@ -965,7 +985,7 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
         // session's in-flight connect corrId, which would fail that connect.  It
         // concerns only the Client (the coordinator route), never a machine.
         if (opt->code != static_cast<int16_t>(::rune::protocol::client::ErrorCode::NotCoordinator)) {
-            s.machine.onErrorResponse(opt->code, opt->message, opt->correlationId, nowNs);
+            s.machine.onErrorResponse(opt->code, opt->message, opt->correlationId, nowNs, opt->sessionId);
         }
         s.machine.onActivity(nowNs);
         if (egressObserver_) {

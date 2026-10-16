@@ -323,7 +323,7 @@ TEST(ClientNotLeaderRetry, PersistentNotLeaderFailsAfterBudgetExhausted) {
     ASSERT_TRUE(done) << "Produce future must resolve (fail) after retry budget exhausted";
 
     bool threw = false;
-    try { fut.offset(); } catch (...) { threw = true; }
+    try { (void)fut.offset(); } catch (...) { threw = true; }
     EXPECT_TRUE(threw)
         << "Produce future must throw once the bare-NotLeader retry budget is exhausted";
 

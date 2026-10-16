@@ -244,7 +244,7 @@ TEST(ProducerRace, ConnectThenImmediateFirstProduceSingleIteration) {
 
     ASSERT_TRUE(fut.waitReady(kFutureTimeout))
         << "first produce future timed out";
-    ASSERT_NO_THROW(fut.offset())
+    ASSERT_NO_THROW((void)fut.offset())
         << "first produce after connect failed";
 
     gwStop.store(true, std::memory_order_release);
@@ -339,7 +339,7 @@ TEST(ProducerRace, ConnectThenImmediateFirstProduceTightLoop) {
         // 3. Wait for the ack.
         ASSERT_TRUE(fut.waitReady(kFutureTimeout))
             << "first produce future timed out at iter " << iter;
-        ASSERT_NO_THROW(fut.offset())
+        ASSERT_NO_THROW((void)fut.offset())
             << "first produce after connect failed at iter " << iter;
 
         // Teardown.

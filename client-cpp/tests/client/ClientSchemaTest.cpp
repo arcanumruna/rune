@@ -538,7 +538,7 @@ struct SchemaHarness {
         });
         ASSERT_TRUE(fut.waitReady())
             << "connect() future did not resolve";
-        ASSERT_NO_THROW(fut.defineResult()) << "connect() threw";
+        ASSERT_NO_THROW((void)fut.defineResult()) << "connect() threw";
     }
 
     ~SchemaHarness() {
@@ -692,7 +692,7 @@ TEST(ClientSchema, DefineTopicTimeoutFailsPromise) {
     ASSERT_TRUE(fut.waitReady())
         << "defineTopic() future did not fail within timeout — potential hang";
 
-    EXPECT_THROW(fut.defineResult(), std::exception)
+    EXPECT_THROW((void)fut.defineResult(), std::exception)
         << "defineTopic() must throw on timeout, not return a value: " << fut.describe();
     EXPECT_EQ(fut.status(), OpStatus::Timeout) << fut.describe();
 }
@@ -714,7 +714,7 @@ TEST(ClientSchema, GetTopicSchemaTimeoutFailsPromise) {
     ASSERT_TRUE(fut.waitReady())
         << "getTopicSchema() future did not fail within timeout — potential hang";
 
-    EXPECT_THROW(fut.schemaResult(), std::exception)
+    EXPECT_THROW((void)fut.schemaResult(), std::exception)
         << "getTopicSchema() must throw on timeout, not return a value";
 }
 
@@ -732,7 +732,7 @@ TEST(ClientSchema, DefineTopicWithoutSessionRejected) {
 
     ASSERT_TRUE(fut.waitReady())
         << "defineTopic() without session was not rejected promptly";
-    EXPECT_THROW(fut.defineResult(), std::exception)
+    EXPECT_THROW((void)fut.defineResult(), std::exception)
         << "defineTopic() without session must throw";
 }
 
@@ -748,7 +748,7 @@ TEST(ClientSchema, GetTopicSchemaWithoutSessionRejected) {
 
     ASSERT_TRUE(fut.waitReady())
         << "getTopicSchema() without session was not rejected promptly";
-    EXPECT_THROW(fut.schemaResult(), std::exception)
+    EXPECT_THROW((void)fut.schemaResult(), std::exception)
         << "getTopicSchema() without session must throw";
 }
 
@@ -961,7 +961,7 @@ TEST(ClientSchema, GetTopicSchemaAndWaitThreadsRequestedFingerprintRegression) {
     auto fut = h.getTopicSchemaOp("characters", kFingerprint);
     h.pumpGwUntil([&]() { return fut.ready(); });
     ASSERT_TRUE(fut.waitReady()) << "getTopicSchemaAndWait(fp) future did not resolve";
-    ASSERT_NO_THROW(fut.schemaResult());
+    ASSERT_NO_THROW((void)fut.schemaResult());
     EXPECT_EQ(h.gw->lastRequestedFingerprint.load(), kFingerprint)
         << "regression: requestedFingerprint was not threaded onto the GetTopicSchema frame";
 
@@ -969,7 +969,7 @@ TEST(ClientSchema, GetTopicSchemaAndWaitThreadsRequestedFingerprintRegression) {
     auto fut2 = h.getTopicSchemaOp("characters", /*requestedFingerprint=*/0u);
     h.pumpGwUntil([&]() { return fut2.ready(); });
     ASSERT_TRUE(fut2.waitReady()) << "getTopicSchemaAndWait(0) future did not resolve";
-    ASSERT_NO_THROW(fut2.schemaResult());
+    ASSERT_NO_THROW((void)fut2.schemaResult());
     EXPECT_EQ(h.gw->lastRequestedFingerprint.load(), 0u)
         << "regression: fp=0 must mean latest on the wire";
 }
@@ -1124,7 +1124,7 @@ TEST(ClientSchema, GetViewRowTimeoutFailsPromise) {
 
     ASSERT_TRUE(fut.waitReady())
         << "getViewRow() future did not fail within timeout — potential hang";
-    EXPECT_THROW(fut.getViewRowResult(), std::exception)
+    EXPECT_THROW((void)fut.getViewRowResult(), std::exception)
         << "getViewRow() must throw on timeout, not return a value";
 }
 
