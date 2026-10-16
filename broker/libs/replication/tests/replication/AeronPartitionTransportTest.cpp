@@ -85,7 +85,7 @@ TEST(AeronTransportSbe, FetchRequestRoundTrip) {
     std::size_t written = FetchRequestMsg::encode(buf, 0, epoch, pid, fid, off, maxB);
     EXPECT_EQ(written, FetchRequestMsg::TOTAL_SIZE);
 
-    auto msg = FetchRequestMsg::decode(buf, 0);
+    auto msg = FetchRequestMsg::decode(buf, 0, sizeof(buf));
     EXPECT_EQ(msg.leaderEpoch, epoch);
     EXPECT_EQ(msg.partition,   pid);
     EXPECT_EQ(msg.followerId,  fid);
@@ -470,8 +470,8 @@ TEST(DR_BUG_5, FetchRequestTopicIdRouting_DifferentKeys) {
         /*leaderEpoch=*/1, /*partition=*/0, /*followerId=*/2,
         /*fetchOffset=*/0, /*maxBytes=*/1024, /*topicId=*/1);
 
-    auto m0 = FetchRequestMsg::decode(buf0, 0);
-    auto m1 = FetchRequestMsg::decode(buf1, 0);
+    auto m0 = FetchRequestMsg::decode(buf0, 0, sizeof(buf0));
+    auto m1 = FetchRequestMsg::decode(buf1, 0, sizeof(buf1));
 
     // Same partition, different topicId → routing keys must differ.
     EXPECT_EQ(m0.partition, m1.partition);

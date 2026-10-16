@@ -78,7 +78,7 @@ inline void dispatchCatalogFrame(rune::replication::PartitionReplica& replica,
     try {
         switch (templateId) {
         case static_cast<uint16_t>(rr::ReplicationTemplateId::FetchRequest):
-            replica.onFetchRequest(rr::FetchRequestMsg::decode(frame, 0), nowNs);
+            replica.onFetchRequest(rr::FetchRequestMsg::decode(frame, 0, len), nowNs);
             break;
         case static_cast<uint16_t>(rr::ReplicationTemplateId::FetchResponse):
             replica.applyReplicated(rr::FetchResponseMsg::decode(frame, 0, len));
@@ -90,7 +90,7 @@ inline void dispatchCatalogFrame(rune::replication::PartitionReplica& replica,
             replica.applyOffsetsForLeaderEpochResponse(rr::OffsetsForLeaderEpochRespMsg::decode(frame, 0));
             break;
         case rr::kReconcileFetchReqTemplateId:
-            replica.onReconcileRequest(rr::FetchRequestMsg::decode(frame, 0));
+            replica.onReconcileRequest(rr::FetchRequestMsg::decode(frame, 0, len));
             break;
         case rr::kReconcileFetchRespTemplateId:
             replica.applyReconcileResponse(rr::FetchResponseMsg::decode(frame, 0, len));

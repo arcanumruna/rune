@@ -291,7 +291,7 @@ TEST(WorkerReplicationTransport, SendFetchRequestBroadcastsToAllPeers)
     ASSERT_EQ(h.pubs.offersTo(3).size(), 1u) << "sendFetchRequest must broadcast to peer 3";
 
     const auto& frame2 = h.pubs.offersTo(2)[0];
-    const FetchRequestMsg decoded = FetchRequestMsg::decode(frame2.data(), 0);
+    const FetchRequestMsg decoded = FetchRequestMsg::decode(frame2.data(), 0, frame2.size());
     EXPECT_EQ(decoded.leaderEpoch, req.leaderEpoch);
     EXPECT_EQ(decoded.partition,   req.partition);
     EXPECT_EQ(decoded.followerId,  req.followerId);
@@ -415,7 +415,7 @@ TEST(WorkerReplicationTransport, SendReconcileRequestStampsReconcileTemplateId)
     EXPECT_NE(peekTemplateId(frame.data(), 0),
               static_cast<uint16_t>(FetchRequestMsg::TEMPLATE_ID));
 
-    const FetchRequestMsg decoded = FetchRequestMsg::decode(frame.data(), 0);
+    const FetchRequestMsg decoded = FetchRequestMsg::decode(frame.data(), 0, frame.size());
     EXPECT_EQ(decoded.leaderEpoch, req.leaderEpoch);
     EXPECT_EQ(decoded.partition,   req.partition);
     EXPECT_EQ(decoded.followerId,  req.followerId);
@@ -845,7 +845,7 @@ TEST(WorkerReplicationTransport, PollCapsFetchRequestMaxBytes)
     const int n = h.transport->poll(10,
         [&](int32_t, int32_t, uint16_t,
             const uint8_t* f, std::size_t len) {
-            const FetchRequestMsg decoded = FetchRequestMsg::decode(f, 0);
+            const FetchRequestMsg decoded = FetchRequestMsg::decode(f, 0, len);
             dispatchedMaxBytes = decoded.maxBytes;
         });
 
@@ -868,8 +868,8 @@ TEST(WorkerReplicationTransport, PollDoesNotCapFetchRequestMaxBytesWhenWithinBou
 
     int32_t dispatchedMaxBytes = -1;
     h.transport->poll(10,
-        [&](int32_t, int32_t, uint16_t, const uint8_t* f, std::size_t) {
-            dispatchedMaxBytes = FetchRequestMsg::decode(f, 0).maxBytes;
+        [&](int32_t, int32_t, uint16_t, const uint8_t* f, std::size_t len) {
+            dispatchedMaxBytes = FetchRequestMsg::decode(f, 0, len).maxBytes;
         });
 
     EXPECT_EQ(dispatchedMaxBytes, kSmallMaxBytes)
@@ -894,8 +894,8 @@ TEST(WorkerReplicationTransport, PollCapsReconcileFetchReqMaxBytes)
     int32_t dispatchedMaxBytes = -1;
     uint16_t dispatchedTemplate = 0;
     h.transport->poll(10,
-        [&](int32_t, int32_t, uint16_t tmpl, const uint8_t* f, std::size_t) {
-            dispatchedMaxBytes = FetchRequestMsg::decode(f, 0).maxBytes;
+        [&](int32_t, int32_t, uint16_t tmpl, const uint8_t* f, std::size_t len) {
+            dispatchedMaxBytes = FetchRequestMsg::decode(f, 0, len).maxBytes;
             dispatchedTemplate = tmpl;
         });
 

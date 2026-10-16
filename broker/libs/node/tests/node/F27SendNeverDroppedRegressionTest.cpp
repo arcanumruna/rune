@@ -139,7 +139,7 @@ Decoded decode(const std::vector<uint8_t>& f) {
     Decoded d{};
     d.templateId = peekTemplateId(f.data(), 0);
     if (d.templateId == static_cast<uint16_t>(ReplicationTemplateId::FetchRequest))
-        d.req = FetchRequestMsg::decode(f.data(), 0);
+        d.req = FetchRequestMsg::decode(f.data(), 0, f.size());
     else if (d.templateId == static_cast<uint16_t>(ReplicationTemplateId::FetchResponse))
         d.resp = FetchResponseMsg::decode(f.data(), 0, f.size());
     return d;

@@ -129,6 +129,10 @@ inline constexpr int16_t kErrDivergingEpoch = -7;
 // process incarnation of the follower than one already seen — dropped (no
 // answer, no credit).
 inline constexpr int16_t kErrStaleIncarnation = -10;
+// ISR protocol: the leader's start offset for the shared epoch differs from the follower's - a second
+// history under one epoch (a leader that lost its disk and re-led).  The answer's payload is
+// ErrorPayload{epoch, leaderStartOffset} (in `records`); the follower refuses to append and reports.
+inline constexpr int16_t kErrEpochHistoryMismatch = -11;
 // The default replication fetch-ceiling (requested chunk size) used for
 // every PartitionConfig across the broker (see BrokerNode.cpp).  This is
 // deliberately NOT required to cover the gateway's max accepted produce

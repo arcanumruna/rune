@@ -75,7 +75,7 @@ TEST(AdminIsrChannel, SendAlterIsrEncodesExactlyOneFrameThatDecodesToTheMessage)
 }
 
 TEST(AdminIsrChannel, FullRingRefusesAndCountsNeverAssumedDeliveredRegression) {
-    OneToOneByteRing ring(1024);   // max message 128 B: a handful of AlterIsr frames at most
+    OneToOneByteRing ring(4096);   // max message 512 B: a handful of AlterIsr frames (v4: 240 B each) at most
     AdminIsrChannel ch(ring);
     const rr::AlterIsrMsg m = sampleAlterIsr();
     int accepted = 0;
