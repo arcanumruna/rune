@@ -1561,6 +1561,10 @@ public:
         // pass and every mode — never behind data ops or any backlog.
         work += drainSessionOps_();
         work += beginPushPass_();   // F5: push budget + last pass's deferred reads first
+        // Re-check I6: one INFO line the first pass a consumer is connected to THIS
+        // worker's MDC egress (every mode); latched, so one branch per pass after it.
+        if (workerEgress_ && !workerEgress_->connectedLogged()) [[unlikely]]
+            workerEgress_->noteConnected(workerId_);
         if (shardMode_) return work + doWorkShard_(nowNs);
 
         // Step E3: reap async-durability completions from the IoBackend FIRST so

@@ -2477,4 +2477,55 @@ TEST(BrokerNodeRegression, LinkMtuWatchdogNeverResolvesOnTheControlThreadRegress
     setMtuProbeResolveHookForTest(nullptr);
     std::error_code ec; fs::remove_all(dir, ec);
 }
+
+// Re-check I6: a broker logs "per-worker MDC egress connected" exactly once for the worker a consumer
+// connected to, and never for a worker no consumer reached — legacy per-worker egress and shard mode alike.
+// The consumer is a raw dynamic-MDC subscription on worker 1's control endpoint (what the client's egress
+// subscribe builds).  RED: the Worker pass never calls noteConnected (0 lines).
+static void expectEgressConnectedLineOnlyForTheSubscribedWorker(bool shard) {
+    TempDir tmp{shard ? "egresslog_s_" : "egresslog_l_"};
+    NodeConfig cfg = makeSingleNodeConfig(tmp.path);
+    cfg.workerCount            = 2;
+    cfg.perWorkerEgressEnabled = true;
+    if (shard) cfg.workerMode = NodeConfig::WorkerMode::Shard;
+    cfg.aeronDir                    = (tmp.path / "aeron").string();
+    cfg.workerEgressControlHost     = "127.0.0.1";
+    cfg.workerEgressControlBasePort = rune::aeronutil::testing::allocFreeUdpPortRange(2);
+    DrBugsLogCapture log;   // before any broker thread exists; outlives the node (TSan)
+    {
+        BrokerNode node{cfg};
+        ASSERT_NO_THROW(node.start());
+        const auto& egresses = node.workerEgressesForTest();
+        ASSERT_EQ(egresses.size(), 2u);
+        ASSERT_NE(egresses[1], nullptr);
+        const std::string control = egresses[1]->controlEndpoint();
+        const int32_t stream = egresses[1]->streamId();
+        aeron::Context ctx;
+        ctx.aeronDir(cfg.aeronDir);
+        auto aeron = aeron::Aeron::connect(ctx);
+        const int64_t reg = aeron->addSubscription(
+            "aeron:udp?control=" + control + "|control-mode=dynamic|endpoint=127.0.0.1:" +
+                std::to_string(rune::aeronutil::testing::allocFreeUdpPort()), stream);
+        std::shared_ptr<aeron::Subscription> sub;
+        const std::string line1 = "WorkerEgress[w1] per-worker MDC egress connected (control " + control + ")";
+        const auto deadline = std::chrono::steady_clock::now() + 10s;
+        while (std::chrono::steady_clock::now() < deadline && log.count(line1) == 0) {
+            if (!sub) sub = aeron->findSubscription(reg);
+            std::this_thread::sleep_for(5ms);
+        }
+        EXPECT_EQ(log.count(line1), 1) << (shard ? "shard" : "legacy") << ": the connected worker logs once";
+        std::this_thread::sleep_for(300ms);   // hundreds of further passes, still connected
+        EXPECT_EQ(log.count("per-worker MDC egress connected"), 1)
+            << (shard ? "shard" : "legacy") << ": latched — and worker 0, never reached, logs nothing";
+        sub.reset();
+        aeron.reset();
+        node.stop();
+    }
+}
+TEST(WorkerEgressLogRegression, LegacyLogsConnectedOnceForTheSubscribedWorkerOnlyRegression) {
+    expectEgressConnectedLineOnlyForTheSubscribedWorker(false);
+}
+TEST(WorkerEgressLogRegression, ShardLogsConnectedOnceForTheSubscribedWorkerOnlyRegression) {
+    expectEgressConnectedLineOnlyForTheSubscribedWorker(true);
+}
 } // namespace rune::node

@@ -109,6 +109,21 @@ public:
         return pub_ && pub_->isConnected();
     }
 
+    // Re-check I6: the broker-side proof that per-worker MDC egress works.  Called by
+    // the owning worker once per pass while connectedLogged() is false (one predictable
+    // branch afterwards); on the FIRST pass a consumer is connected it logs one INFO
+    // line and latches.  Cold: one log line per process lifetime per worker, no alloc
+    // on the steady path.  dr-e2e asserts the line for every worker that leads a
+    // subscribed partition: a deployment whose clients all fell back to legacy egress
+    // (DR B-I3) is then a missing line, not a silent fallback.
+    [[nodiscard]] bool connectedLogged() const noexcept { return connectedLogged_; }
+    void noteConnected(int32_t workerId) noexcept {
+        if (connectedLogged_ || !isConnected()) return;
+        connectedLogged_ = true;
+        spdlog::info("WorkerEgress[w{}] per-worker MDC egress connected (control {})",
+                     workerId, controlEndpoint_);
+    }
+
     // Max single-fragment payload (frames <= this go via tryClaim).
     [[nodiscard]] std::int32_t maxPayloadLength() const noexcept {
         return pub_ ? pub_->maxPayloadLength() : 0;
@@ -152,6 +167,7 @@ private:
     int32_t                                      streamId_;
     std::string                                  channel_;
     std::shared_ptr<aeron::ExclusivePublication> pub_;
+    bool                                         connectedLogged_ = false;  // worker-thread only
 };
 
 } // namespace rune::node
