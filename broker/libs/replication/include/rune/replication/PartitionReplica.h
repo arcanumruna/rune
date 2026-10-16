@@ -46,6 +46,7 @@
 #include <mutex>
 #include <span>
 #include <unordered_map>
+#include <variant>
 #include <limits>
 #include <vector>
 #include <string>
@@ -488,12 +489,35 @@ public:
     /// Test view: a new internal leadership has not yet committed its first ISR.
     [[nodiscard]] bool internalSeedPendingForTest() const noexcept { return internalSeedPending_; }
     /// Test view: an AlterIsr proposal is in flight.
-    [[nodiscard]] bool isrProposalPendingForTest() const noexcept { return isrProposal_.pending(); }
-    [[nodiscard]] bool isrProposalAwaitingMetadataForTest() const noexcept {
-        return isrProposal_.phase == ProposalPhase::AwaitingMetadata;
+    [[nodiscard]] bool isrProposalPendingForTest() const noexcept {
+        return !std::holds_alternative<NoProposal>(ctrlProposal_) || isrProposal_.pending();
     }
+    /// True in AwaitingMetadata and AwaitingMetadataWarned (a stale answer was received).
+    [[nodiscard]] bool isrProposalAwaitingMetadataForTest() const noexcept {
+        return std::holds_alternative<AwaitingMetadata>(ctrlProposal_) ||
+               std::holds_alternative<AwaitingMetadataWarned>(ctrlProposal_);
+    }
+    /// "None" / "AwaitingCommit" / "AwaitingMetadata" / "AwaitingMetadataWarned" / "InternalPending".
+    [[nodiscard]] const char* isrProposalStateNameForTest() const noexcept {
+        if (std::holds_alternative<AwaitingCommit>(ctrlProposal_)) return "AwaitingCommit";
+        if (std::holds_alternative<AwaitingMetadata>(ctrlProposal_)) return "AwaitingMetadata";
+        if (std::holds_alternative<AwaitingMetadataWarned>(ctrlProposal_)) return "AwaitingMetadataWarned";
+        return isrProposal_.pending() ? "InternalPending" : "None";
+    }
+    [[nodiscard]] int64_t pendingProposalIdForTest() const noexcept { return bodyOf_(ctrlProposal_).id; }
+    [[nodiscard]] std::vector<int64_t> pendingProposalStoragesForTest() const {
+        const ProposalBody& b = bodyOf_(ctrlProposal_);
+        return std::vector<int64_t>(b.storages.begin(), b.storages.begin() + b.count);
+    }
+    [[nodiscard]] uint64_t olderSendAnswersForTest() const noexcept { return olderSendAnswers_; }
+    [[nodiscard]] uint64_t answersWhileAwaitingMetadataForTest() const noexcept { return answersWhileAwaitingMetadata_; }
+    [[nodiscard]] uint64_t staleAnswersForTest() const noexcept { return staleAnswers_; }
+    /// ISR protocol: this node's storage id, captured into every proposal it makes for itself.
+    void setStorageId(int64_t s) noexcept { storageId_ = s; }
     [[nodiscard]] uint64_t isrAwaitingMetadataForTest() const noexcept { return isrAwaitingMetadata_; }
-    [[nodiscard]] bool isrAwaitingMetadataWarnedForTest() const noexcept { return isrProposal_.awaitingWarned; }
+    [[nodiscard]] bool isrAwaitingMetadataWarnedForTest() const noexcept {
+        return std::holds_alternative<AwaitingMetadataWarned>(ctrlProposal_);
+    }
     [[nodiscard]] uint64_t staleAssignmentsForTest() const noexcept { return staleAssignments_; }
     /// Test view: the maximal ISR the HW is computed over (committed ∪ proposed).
     [[nodiscard]] const std::vector<NodeId>& maximalIsrForTest() const noexcept;
@@ -1695,15 +1719,50 @@ private:
     //                      recovery only: the answer may have come from a zombie controller); WARN once after
     //                      kAwaitingMetadataWarnNs (a wedged metadata replica is never silent).
     // Both non-None phases count the proposed members in the maximal ISR.
-    enum class ProposalPhase : uint8_t { None = 0, Sent = 1, AwaitingMetadata = 2 };
+    // ISR protocol (controller-managed mode): the proposal is a std::variant, each state holding exactly
+    // its own variables (hard rule 3).  The internal-quorum mode keeps the small IsrProposal below.
+    //   NoProposal              — nothing in flight.
+    //   AwaitingCommit          — sent; re-sent every kAlterIsrResendNs (and not before resendNotBeforeNs).
+    //   AwaitingMetadata        — a stale/fenced answer to the NEWEST send: only the committed assignment resolves it.
+    //   AwaitingMetadataWarned  — the same, WARNed after kAwaitingMetadataWarnNs.
+    struct ProposalBody {
+        int64_t id = 0;                        ///< ++proposalSeq_, stable across resends
+        int32_t base = -1;                     ///< the CAS partitionEpoch it was derived from
+        uint8_t count = 0;
+        std::array<NodeId, 16> members{};
+        std::array<int64_t, 16> storages{};    ///< storage id of each member, captured at creation
+    };
+    struct NoProposal {};
+    struct AwaitingCommit {
+        ProposalBody p; int32_t lastSeq = 0; int64_t sentNs = 0; int64_t resendNotBeforeNs = 0; int32_t olderAnswers = 0;
+    };
+    struct AwaitingMetadata       { ProposalBody p; int32_t lastSeq = 0; int64_t sinceNs = 0; int64_t sentNs = 0; };
+    struct AwaitingMetadataWarned { ProposalBody p; int32_t lastSeq = 0; int64_t sentNs = 0; };
+    using CtrlProposal = std::variant<NoProposal, AwaitingCommit, AwaitingMetadata, AwaitingMetadataWarned>;
+    [[nodiscard]] static const ProposalBody& bodyOf_(const CtrlProposal& v) noexcept {
+        static const ProposalBody kNone{};
+        if (const auto* a = std::get_if<AwaitingCommit>(&v)) return a->p;
+        if (const auto* a = std::get_if<AwaitingMetadata>(&v)) return a->p;
+        if (const auto* a = std::get_if<AwaitingMetadataWarned>(&v)) return a->p;
+        return kNone;
+    }
+    CtrlProposal ctrlProposal_{};
+    int64_t proposalSeq_ = 0;                  ///< never reset; id = ++proposalSeq_
+    int64_t storageId_ = 0;                    ///< this node's storage id (setStorageId)
+    uint64_t olderSendAnswers_ = 0;            ///< answers to an older send of the pending proposal
+    uint64_t answersWhileAwaitingMetadata_ = 0;///< answers received outside AwaitingCommit
+    uint64_t staleAnswers_ = 0;                ///< answers for another proposal id
+    /// The storage id of a ISR member, captured into a proposal (Step 6 makes it read the follower slot).
+    [[nodiscard]] int64_t slotStorage_(NodeId) const noexcept { return 0; }
+    static constexpr int64_t kAwaitNewestAnswerNs = 1'000'000'000LL;   ///< 1 s base of the older-send hold (1,2,4,8 s)
+
+    // Internal-quorum mode only.
+    enum class ProposalPhase : uint8_t { None = 0, Sent = 1 };
     struct IsrProposal {
         ProposalPhase       phase = ProposalPhase::None;
-        std::vector<NodeId> isr;          ///< proposed ISR (AlterIsr)
+        std::vector<NodeId> isr;          ///< proposed ISR (internal quorum)
         int64_t             sentNs  = 0;
-        int32_t             basePartitionEpoch = -1;   ///< MEDIUM-1: the CAS version it was derived from
         int64_t             version = 0;               ///< internal quorum mode: the published version
-        int64_t             awaitingSinceNs = 0;       ///< AwaitingMetadata only: when the stale answer arrived
-        bool                awaitingWarned  = false;   ///< AwaitingMetadata only: the 10 s WARN was emitted
         [[nodiscard]] bool pending() const noexcept { return phase != ProposalPhase::None; }
     };
     /// Resets the proposal IN PLACE (the member vector keeps its capacity): every exit from Leader and every
@@ -1712,15 +1771,11 @@ private:
         isrProposal_.phase = ProposalPhase::None;
         isrProposal_.isr.clear();
         isrProposal_.sentNs = 0;
-        isrProposal_.basePartitionEpoch = -1;
         isrProposal_.version = 0;
-        isrProposal_.awaitingSinceNs = 0;
-        isrProposal_.awaitingWarned = false;
+        ctrlProposal_ = NoProposal{};
     }
-    void clearIsrProposalPhase_() noexcept {   // resolved (committed / answered for THIS base): members kept for capacity
+    void clearIsrProposalPhase_() noexcept {   // internal-quorum / self-managed: resolved; members kept for capacity
         isrProposal_.phase = ProposalPhase::None;
-        isrProposal_.awaitingSinceNs = 0;
-        isrProposal_.awaitingWarned = false;
     }
     uint64_t isrAwaitingMetadata_   = 0;   ///< proposals that entered AwaitingMetadata (A-M1)
     uint64_t staleAssignments_      = 0;   ///< committed assignments older than the applied one, ignored (A-M5)

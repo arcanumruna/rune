@@ -1162,6 +1162,21 @@ TEST(AlterIsrRelayRegression, StaleAnswerThroughTheWorkerRelayKeepsTheProposalAn
     answer(rune::replication::kAlterIsrInvalidRequest, 5);
     EXPECT_FALSE(replica->isrProposalPendingForTest()) << "the relay lost the partitionEpoch: its own InvalidRequest "
                                                           "no longer clears it (ISR changes would freeze)";
+    // ISR protocol (Step 4): the proposal id and send ordinal ride through the relay too (op.nextOffset / roleLeaderId).
+    now += 100'000'000;   // past the InvalidRequest back-off of the previous proposal
+    replica->shrinkIsrToLive(std::span<const int32_t>(live, 2), now);   // a fresh proposal at base 5
+    ASSERT_TRUE(replica->isrProposalPendingForTest());
+    const int64_t id = replica->pendingProposalIdForTest();
+    auto answerId = [&](int16_t code, int32_t pe, int64_t pid, int32_t seq) {
+        WorkerOp op; op.type = WorkerOp::Type::AlterIsrResponse; op.replica = replica.get();
+        op.topicId = 12; op.partition = 0; op.roleEpoch = 1; op.rolePartitionEpoch = pe;
+        op.replicatedPayload.errorCode = code; op.nextOffset = pid; op.roleLeaderId = seq;
+        ASSERT_TRUE(static_cast<bool>(worker.tryEnqueueOp(std::move(op)))); worker.doWork(now += 1'000'000);
+    };
+    answerId(rune::replication::kAlterIsrIneligibleReplica, 5, id + 1, 1);
+    EXPECT_TRUE(replica->isrProposalPendingForTest()) << "an answer for another proposal id cleared this one";
+    answerId(rune::replication::kAlterIsrIneligibleReplica, 5, id, 1);
+    EXPECT_FALSE(replica->isrProposalPendingForTest()) << "its own answer through the relay no longer clears it";
 }
 
 } // namespace

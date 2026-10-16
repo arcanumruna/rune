@@ -449,6 +449,20 @@ public:
     void holdMetadata(NodeId id)    { heldMeta_.insert(id); }
     void releaseMetadata(NodeId id) { heldMeta_.erase(id); applyMetadata(id); }
     void dropNext(Kind k, int count) { dropNext_[static_cast<int>(k)] += count; }
+    void clearDropNext() { for (int& d : dropNext_) d = 0; }
+    /// The next frame of kind `k` is PARKED instead of queued (it is not lost); releaseHeld() re-queues every
+    /// parked frame for delivery on the next step.  Models one answer overtaken by a later send's commit.
+    void holdNext(Kind k) { holdNext_[static_cast<int>(k)] += 1; }
+    void releaseHeld() {
+        for (auto& f : held_) { f.due = step_ + 1; wire_.push_back(std::move(f)); }
+        held_.clear();
+    }
+    [[nodiscard]] std::size_t heldCountForTest() const noexcept { return held_.size(); }
+    /// The controller's eligibility of `n` for ISR ADMISSION (heartbeat/storage gate), independent of the wire:
+    /// an ineligible node is never added by an AlterIsr (the proposal is answered Ineligible).
+    void setControllerEligible(NodeId n, bool eligible) {
+        if (eligible) ineligible_.erase(n); else ineligible_.insert(n);
+    }
     uint64_t framesLost() const noexcept { return framesLost_; }
 
     // ---------------------------------------------------------------- produce
@@ -658,6 +672,7 @@ public:
         if (f.from >= 0 && f.from < 8) ++sent_[static_cast<std::size_t>(f.from)][k];
         if (dropNext_[k] > 0) { --dropNext_[k]; ++framesLost_; return true; }
         if (cut_.count({f.from, f.to}) != 0) { ++framesLost_; return true; }   // lost on the wire
+        if (holdNext_[k] > 0) { --holdNext_[k]; held_.push_back(std::move(f)); return true; }   // parked (holdNext)
         f.due = step_ + 1 + static_cast<uint64_t>(cfg_.deliveryDelaySteps);
         wire_.push_back(std::move(f));
         return true;
@@ -809,7 +824,7 @@ private:
         for (int i = 0; i < m.isrCount; ++i) {
             const NodeId n = m.isr[static_cast<std::size_t>(i)];
             const bool added = std::find(meta_.isr.begin(), meta_.isr.end(), n) == meta_.isr.end();
-            if (added && n != m.leaderId && !liveToController(n)) { dropped = true; continue; }
+            if (added && n != m.leaderId && (!liveToController(n) || ineligible_.count(n) != 0)) { dropped = true; continue; }
             isr.push_back(n);
         }
         if (std::find(isr.begin(), isr.end(), m.leaderId) == isr.end()) {
@@ -942,6 +957,9 @@ private:
     std::set<NodeId> heldMeta_;   ///< nodes whose metadata replica lags (holdMetadata)
     int forceInvalidRequest_ = 0;   ///< forceInvalidRequestNext: next n well-based proposals answered INVALID_REQUEST
     int                     dropNext_[kKinds] = {};
+    int                     holdNext_[kKinds] = {};   ///< holdNext: next n frames of a kind are parked
+    std::deque<Frame>       held_;                    ///< parked frames (releaseHeld re-queues them)
+    std::set<NodeId>        ineligible_;              ///< setControllerEligible(n, false)
     uint64_t                framesLost_ = 0;
     uint64_t                sent_[8][kKinds] = {};
     uint64_t                alterIsrCommitted_ = 0;

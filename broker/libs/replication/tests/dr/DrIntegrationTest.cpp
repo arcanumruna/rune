@@ -1917,6 +1917,59 @@ TEST(DrIntegrationRegression, AnsweredButUnappliedExpansionStillHoldsTheHwRegres
     expectAllConvergedAndAcked(c, "answered-but-unapplied expansion");
 }
 
+// ISR protocol (answer correlation, A-C1): an ELIGIBILITY flip between two sends of ONE proposal.  Send #1 is answered
+// Ineligible, but that answer is overtaken: send #2 (eligible by then) COMMITS the expansion, and #1's answer arrives
+// afterwards.  Without per-send correlation the late Ineligible clears the proposal at the same base, the leader's
+// maximal ISR collapses to the stale committed view while the controller already holds {1,2,3}, the HW passes node
+// 3's LEO and the records acked past it are lost when the controller elects node 3.
+// RED (drop the `sendSeq != lastSeq` check): the step-6 asserts fail; with them removed the 5 records are acked on
+// {1,2} and missing on node 3 after the failover.
+TEST(DrIntegrationRegression, EligibilityFlipBetweenTwoSendsNeverLosesAckedRecordsRegression) {
+    DrCluster c(3);
+    c.start();
+    ASSERT_EQ(c.produceAcked(10), 10);
+    ASSERT_TRUE(c.driveUntil([&] { return c.converged(); }, kCap));
+    // Shrink node 3 out (commits continue on {1,2}).
+    c.cutBoth(1, 3);
+    ASSERT_EQ(c.produceAcked(5), 5) << c.dump();
+    ASSERT_TRUE(c.driveUntil([&] { return !c.controllerIsrContains(3); }, kCap)) << c.dump();
+    ASSERT_TRUE(c.driveUntil([&] { return !c.rep(1).isrProposalPendingForTest(); }, kCap)) << c.dump();
+    // Node 3 is ineligible at the controller; the answer to send #1 (Ineligible) is parked.
+    c.setControllerEligible(3, false);
+    c.holdNext(Kind::AlterIsrResp);
+    c.heal(1, 3);
+    ASSERT_TRUE(c.driveUntil([&] { return c.heldCountForTest() == 1; }, kCap)) << c.dump();
+    // Node 3 turns eligible; send #2 commits {1,2,3}, which node 1 does not apply (its metadata replica lags),
+    // and no later resend reaches the controller.
+    c.holdMetadata(1);
+    c.setControllerEligible(3, true);
+    const uint64_t k0 = c.alterIsrCommitted();
+    ASSERT_TRUE(c.driveUntil([&] { return c.alterIsrCommitted() > k0; }, kCap)) << c.dump();
+    c.dropNext(Kind::AlterIsr, 1'000'000);
+    ASSERT_EQ(std::string(c.rep(1).isrProposalStateNameForTest()), "AwaitingCommit");
+    // Node 3 stops replicating.
+    c.cutBoth(1, 3);
+    // The old send's Ineligible answer arrives now.
+    c.releaseHeld();
+    c.run(5);
+    ASSERT_EQ(c.rep(1).olderSendAnswersForTest(), 1u);
+    ASSERT_EQ(std::string(c.rep(1).isrProposalStateNameForTest()), "AwaitingCommit");
+    // Records produced now must not commit: node 3 is a member the controller can elect.
+    const std::size_t ackedBefore = c.acked().size();
+    ASSERT_EQ(c.produce(5), 5);
+    c.run(300);
+    EXPECT_EQ(c.acked().size(), ackedBefore) << "HW passed the LEO of a member the controller can elect";
+    // The leader dies; the controller elects node 3: nothing acked may be missing there.
+    c.crash(1, CrashKind::ProcessKill);
+    c.healAll();
+    c.clearDropNext();
+    ASSERT_EQ(c.failover({}, /*positionsFrom=*/3), 3) << c.dump();
+    ASSERT_TRUE(c.waitWritable(kCap)) << c.dump();
+    c.restart(1);
+    c.releaseMetadata(1);
+    expectAllConvergedAndAcked(c, "older-send answer");
+}
+
 // Sibling: FencedLeaderEpoch — the controller already moved leadership while
 // the leader's committed view lags.  Until the new assignment demotes it, the
 // (zombie) leader must keep counting its pending expansion: the controller may
