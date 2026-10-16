@@ -271,28 +271,45 @@ private:
     void joinKillWatcher_() { if (killWatcher_.joinable()) killWatcher_.join(); }
     std::vector<rune::catalog::CatalogEvent> golden_ = rune::catalog::testing::goldenScriptV1();
     std::size_t                              nextGolden_ = 0;
+    // Review B-I7 (DR-bugs fix round 1): the helper follows a leadership change.  Invariant: it returns an
+    // HW >= the record's end offset on the leader of the CURRENT settled leadership, or -1 at the deadline; it
+    // never waits on a node that no longer leads.  A record appended on a leadership that was deposed before it
+    // committed is truncated there; when the new leader does not hold it, the same bytes are appended again.
     int64_t appendRaw_(std::vector<uint8_t> bytes, std::chrono::milliseconds within) {
         const auto deadline = std::chrono::steady_clock::now() + within;
-        int64_t leo = -1;
-        int32_t leader = -1;
-        while (leo < 0 && std::chrono::steady_clock::now() < deadline) {
-            leader = settledLeader();
-            if (leader > 0) {
-                BrokerNode& n = node(leader);
-                leo = n.onAdminThreadForTest([&n, &bytes]() -> int64_t {
-                    rr::PartitionReplica* r = n.catalogReplicaForTest();
-                    if (r == nullptr || r->role() != rr::Role::Leader) return -1;
-                    const rr::Offset base = r->append(std::span<const uint8_t>(bytes), /*acksAll=*/true);
-                    return base < 0 ? -1 : r->logEndOffset();   // < 0: min-ISR gate (ISR forming)
-                });
-            }
-            if (leo < 0) std::this_thread::sleep_for(20ms);
-        }
-        if (leo < 0) return -1;
         while (std::chrono::steady_clock::now() < deadline) {
-            const auto v = catalogOf(node(leader));
-            if (v.hw >= leo) return v.hw;
-            std::this_thread::sleep_for(10ms);
+            int64_t leo = -1, epoch = -1;
+            int32_t leader = -1;
+            while (leo < 0 && std::chrono::steady_clock::now() < deadline) {   // append phase
+                leader = settledLeader();
+                if (leader > 0) {
+                    BrokerNode& n = node(leader);
+                    const auto le = n.onAdminThreadForTest([&n, &bytes]() -> std::pair<int64_t, int64_t> {
+                        rr::PartitionReplica* r = n.catalogReplicaForTest();
+                        if (r == nullptr || r->role() != rr::Role::Leader) return {-1, -1};
+                        const rr::Offset base = r->append(std::span<const uint8_t>(bytes), /*acksAll=*/true);
+                        if (base < 0) return {-1, -1};   // min-ISR gate (ISR forming)
+                        return {r->logEndOffset(), static_cast<int64_t>(r->epoch())};
+                    });
+                    leo = le.first;
+                    epoch = le.second;
+                }
+                if (leo < 0) std::this_thread::sleep_for(20ms);
+            }
+            if (leo < 0) return -1;
+            bool reappend = false;
+            while (!reappend && std::chrono::steady_clock::now() < deadline) {   // HW phase
+                const int32_t now = settledLeader();
+                if (now > 0) {
+                    const auto pa = catalogAssignmentOf(node(now));
+                    const bool moved = now != leader || (pa && pa->leaderEpoch != epoch);
+                    const auto v = catalogOf(node(now));
+                    if (moved && v.leo < leo) { reappend = true; break; }   // truncated with the deposed leadership
+                    if (v.hw >= leo) return v.hw;
+                }
+                std::this_thread::sleep_for(10ms);
+            }
+            if (!reappend) return -1;
         }
         return -1;
     }
