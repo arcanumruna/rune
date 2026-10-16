@@ -29,6 +29,8 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -62,28 +64,48 @@ std::string slurpFile(const std::string& path) {
 struct TwoLegTlsGateway {
     // Observations.
     int connectsSeen = 0, plaintextConnects = 0;
-    int framesBeforeKeys = 0;     // a non-handshake frame before the broker side had keys
-    int unopenable = 0;           // a non-handshake frame that does not open under the keys (plaintext)
-    int subscribesSeen = 0, joinGroupsSeen = 0, metadataSeen = 0, initPidsSeen = 0;
+    int framesBeforeKeys = 0;     // a non-handshake frame before the broker side had keys for its session
+    int unopenable = 0;           // a non-handshake frame that does not open under its session's keys
+    int subscribesSeen = 0, joinGroupsSeen = 0, metadataSeen = 0, initPidsSeen = 0, pingsSeen = 0;
     std::vector<uint16_t> earlyTids;   // the templates of framesBeforeKeys (diagnostics)
+
+    // Knobs.
+    bool twoLeg = true;           // split the server's first flight; the test releases the second half
+    bool release = false;
+    /// Fix round 5 (N4-I1): fail the FINAL leg (answer the client's last HandshakeContinue with
+    /// HandshakeContinueResponse{HandshakeFailed}, re-offered `failRepeats` more times — the real
+    /// broker re-offers it reliably) for connects whose corrId is >= failFinalLegFromCorr.
+    bool failFinalLeg = false;
+    int64_t failFinalLegFromCorr = 0;
+    int failRepeats = 3;
+    int finalLegFailuresSent = 0;
 
     // The withheld second leg.
     bool secondLegPending = false;
-    bool release = false;
-    int64_t legCorr = 0;
+    int64_t legCorr = 0, legSid = 0;
     std::vector<uint8_t> secondLeg;
+    struct Failing { int64_t sid, corr; int left; };
+    std::vector<Failing> failing;
+
+    struct Conn {
+        std::optional<rune::crypto::TlsSession> srv;
+        rune::crypto::Cipher cipher{};
+        int64_t corr = 0;
+        rcs::CryptoState keys;
+        bool failed = false;
+    };
+    std::map<int64_t, Conn> conns;   // by assigned session id
+    int64_t seedSid = 0;             // the first connect's id (corr < the node-session stride)
 
     std::string serverPem, serverKey;
-    std::optional<rune::crypto::TlsSession> srv;
-    rune::crypto::Cipher cipher{};
-    int64_t sid = 0;
-    rcs::CryptoState broker;
     std::shared_ptr<aeron::Aeron> gwAeron;
     std::shared_ptr<aeron::Subscription> gwSub;
     std::shared_ptr<aeron::ExclusivePublication> gwPub;
     std::unique_ptr<aeron::FragmentAssembler> gwAsm;
 
-    TwoLegTlsGateway(const std::string& aeronDir, int32_t in, int32_t eg) {
+    /// `idle` runs while the gateway waits for its publications: an Invoker client's embedded
+    /// driver only works while its owner pumps it.
+    TwoLegTlsGateway(const std::string& aeronDir, int32_t in, int32_t eg, const std::function<void()>& idle = {}) {
         serverPem = slurpFile(std::string(RUNE_CRYPTO_TESTDATA_DIR) + "/server.pem");
         serverKey = slurpFile(std::string(RUNE_CRYPTO_TESTDATA_DIR) + "/server.key");
         aeron::Context ctx;
@@ -96,6 +118,7 @@ struct TwoLegTlsGateway {
             if (!gwSub) gwSub = gwAeron->findSubscription(subId);
             if (!gwPub) gwPub = gwAeron->findExclusivePublication(pubId);
             if (gwSub && gwPub) break;
+            if (idle) idle();
             std::this_thread::sleep_for(kPumpSleep);
         }
         gwAsm = std::make_unique<aeron::FragmentAssembler>(
@@ -106,18 +129,35 @@ struct TwoLegTlsGateway {
     }
     ~TwoLegTlsGateway() { gwAsm.reset(); gwPub.reset(); gwSub.reset(); gwAeron.reset(); }
 
+    bool seedEncrypted() const {
+        auto it = conns.find(seedSid);
+        return it != conns.end() && it->second.keys.encrypted;
+    }
     int poll(int limit = 16) {
         int w = gwSub && gwAsm ? gwSub->poll(gwAsm->handler(), limit) : 0;
         if (secondLegPending && release) {
             secondLegPending = false;
             std::vector<uint8_t> resp;
             const std::size_t rn = rcc::encodeHandshakeContinueResponse(
-                resp, 0, std::string_view(reinterpret_cast<const char*>(secondLeg.data()), secondLeg.size()), sid,
+                resp, 0, std::string_view(reinterpret_cast<const char*>(secondLeg.data()), secondLeg.size()), legSid,
                 legCorr);
             sendRaw(resp.data(), rn);
             ++w;
         }
+        for (auto& f : failing) {
+            if (f.left <= 0) continue;
+            --f.left;
+            sendFinalLegFailure(f.sid, f.corr);
+            ++w;
+        }
         return w;
+    }
+    void sendFinalLegFailure(int64_t sid, int64_t corr) {
+        std::vector<uint8_t> resp;
+        const std::size_t rn = rcc::encodeHandshakeContinueResponse(
+            resp, static_cast<int16_t>(rune::protocol::client::ErrorCode::HandshakeFailed), {}, sid, corr);
+        sendRaw(resp.data(), rn);
+        ++finalLegFailuresSent;
     }
     void sendRaw(const uint8_t* b, std::size_t n) {
         aeron::concurrent::AtomicBuffer ab(const_cast<uint8_t*>(b), static_cast<aeron::util::index_t>(n));
@@ -134,61 +174,87 @@ struct TwoLegTlsGateway {
             if (!c) return;
             ++connectsSeen;
             if (c->cipherList.empty() || c->handshakeBytes.empty()) { ++plaintextConnects; return; }
-            sid = 40 + connectsSeen;
-            srv.emplace(rune::crypto::TlsSession::makeServer(serverPem.c_str(), serverKey.c_str()));
-            cipher = static_cast<rune::crypto::Cipher>(c->cipherList[0]);
-            broker = rcs::CryptoState{};
+            const int64_t sid = 40 + connectsSeen;
+            if (seedSid == 0 && c->correlationId < 1'000'000'000'000LL) seedSid = sid;
+            Conn& cn = conns[sid];
+            cn.srv.emplace(rune::crypto::TlsSession::makeServer(serverPem.c_str(), serverKey.c_str()));
+            cn.cipher = static_cast<rune::crypto::Cipher>(c->cipherList[0]);
+            cn.corr = c->correlationId;
             const auto& hb = c->handshakeBytes;
-            (void)srv->readInbound(reinterpret_cast<const uint8_t*>(hb.data()), hb.size());
-            const std::size_t n = srv->writeOutbound(out, sizeof out);
-            // Leg 1: only the first half of the server's flight — the client's TLS needs more.
-            const std::size_t half = n / 2;
-            secondLeg.assign(out + half, out + n);
-            legCorr = c->correlationId;
-            secondLegPending = true;
+            (void)cn.srv->readInbound(reinterpret_cast<const uint8_t*>(hb.data()), hb.size());
+            const std::size_t n = cn.srv->writeOutbound(out, sizeof out);
+            // Leg 1: with twoLeg, only the first half of the server's flight — the client's TLS needs more.
+            const std::size_t first = twoLeg ? n / 2 : n;
+            if (twoLeg) {
+                secondLeg.assign(out + first, out + n);
+                legCorr = c->correlationId;
+                legSid = sid;
+                secondLegPending = true;
+            }
             uint8_t resp[16384 + 128];
             const std::size_t rn = rcc::encodeConnectResponse(
                 resp, sizeof resp, 0, 0, sid, c->sessionId, c->correlationId, rune::protocol::client::kBrokerVersion,
-                c->cipherList[0], std::string_view(reinterpret_cast<const char*>(out), half));
+                c->cipherList[0], std::string_view(reinterpret_cast<const char*>(out), first));
             sendRaw(resp, rn);
             return;
         }
         case rcc::TemplateId::HandshakeContinue: {
             auto hc = rcc::decodeHandshakeContinue(buf, len);
-            if (!hc || !srv) return;
-            (void)srv->readInbound(reinterpret_cast<const uint8_t*>(hc->handshakeBytes.data()),
-                                   hc->handshakeBytes.size());
-            const std::size_t n = srv->writeOutbound(out, sizeof out);
-            if (srv->done() && !broker.encrypted) {
-                const auto keys = srv->exportKeys(cipher, sid);
-                broker.encrypted = true;
-                broker.cipher    = keys.cipher;
-                broker.send.emplace(keys.cipher, keys.b2c, keys.b2cPrefix);
-                broker.recv.emplace(keys.cipher, keys.c2b, keys.c2bPrefix);
+            if (!hc) return;
+            auto it = conns.find(hc->sessionId);
+            if (it == conns.end() || !it->second.srv) return;
+            Conn& cn = it->second;
+            (void)cn.srv->readInbound(reinterpret_cast<const uint8_t*>(hc->handshakeBytes.data()),
+                                      hc->handshakeBytes.size());
+            const std::size_t n = cn.srv->writeOutbound(out, sizeof out);
+            if (cn.srv->done() && failFinalLeg && cn.corr >= failFinalLegFromCorr && !cn.failed) {
+                // The broker's failPendingHandshake_: the session is never promoted.
+                cn.failed = true;
+                sendFinalLegFailure(hc->sessionId, hc->correlationId);
+                failing.push_back({hc->sessionId, hc->correlationId, failRepeats});
+                return;
+            }
+            if (cn.srv->done() && !cn.keys.encrypted) {
+                const auto keys = cn.srv->exportKeys(cn.cipher, hc->sessionId);
+                cn.keys.encrypted = true;
+                cn.keys.cipher    = keys.cipher;
+                cn.keys.send.emplace(keys.cipher, keys.b2c, keys.b2cPrefix);
+                cn.keys.recv.emplace(keys.cipher, keys.c2b, keys.c2bPrefix);
             }
             if (n > 0) {
                 std::vector<uint8_t> resp;
                 const std::size_t rn = rcc::encodeHandshakeContinueResponse(
-                    resp, 0, std::string_view(reinterpret_cast<const char*>(out), n), sid, hc->correlationId);
+                    resp, 0, std::string_view(reinterpret_cast<const char*>(out), n), hc->sessionId, hc->correlationId);
                 sendRaw(resp.data(), rn);
             }
             return;
         }
         default: {
-            if (!broker.encrypted) {
+            const int64_t sid = len >= 16 ? static_cast<int64_t>(rune::protocol::client::detail::getLE64(buf, 8)) : 0;
+            auto it = conns.find(sid);
+            if (it == conns.end() || !it->second.keys.encrypted) {
                 ++framesBeforeKeys;
                 earlyTids.push_back(*tid);
                 return;
             }
             uint8_t opened[16384];
-            const std::size_t on = rcc::openEgressFrame(broker, buf, len, opened, sizeof opened);
+            const std::size_t on = rcc::openEgressFrame(it->second.keys, buf, len, opened, sizeof opened);
             if (on == 0) { ++unopenable; return; }
             const auto t = static_cast<rcc::TemplateId>(*tid);
             if (t == rcc::TemplateId::Subscribe) ++subscribesSeen;
             if (t == rcc::TemplateId::MetadataRequest) ++metadataSeen;
             if (*tid == static_cast<uint16_t>(rune::protocol::client::TemplateId::JoinGroup)) ++joinGroupsSeen;
             if (*tid == static_cast<uint16_t>(rune::protocol::client::TemplateId::InitProducerId)) ++initPidsSeen;
-            return;   // nothing answered: the assertions are about what the client sends
+            if (t == rcc::TemplateId::Ping) {
+                ++pingsSeen;
+                if (auto pg = rcc::decodePing(opened, on)) {
+                    uint8_t plain[512], sealed[1024];
+                    const std::size_t pn = rcc::encodePong(plain, sizeof plain, pg->echo, sid, pg->correlationId);
+                    const std::size_t sn = rcc::sealFrame(it->second.keys, plain, pn, sealed, sizeof sealed);
+                    if (sn > 0) sendRaw(sealed, sn);
+                }
+            }
+            return;   // nothing else answered: the assertions are about what the client sends
         }
         }
     }
@@ -197,9 +263,10 @@ struct TwoLegTlsGateway {
 struct Rig {
     static constexpr int32_t kInStr = 4114, kEgStr = 4115;
     std::string agentDir = uniqueDir();
+    bool invoker = false;
     std::unique_ptr<Client> client;
     std::unique_ptr<TwoLegTlsGateway> gw;
-    Rig() {
+    explicit Rig(bool invokerMode = false, bool twoLeg = true) : invoker(invokerMode) {
         ClientConfig cfg;
         cfg.gatewayChannel = "aeron:ipc"; cfg.gatewayStreamId = kInStr;
         cfg.egressChannel  = "aeron:ipc"; cfg.egressStreamId  = kEgStr;
@@ -208,11 +275,19 @@ struct Rig {
         cfg.offerCrypto = true; cfg.requireCrypto = true;
         cfg.tlsTrustPem = slurpFile(std::string(RUNE_CRYPTO_TESTDATA_DIR) + "/ca.pem");
         cfg.tlsExpectHost = "localhost";
+        if (invoker) cfg.runnerMode = RunnerMode::Invoker;
         TopicSpec ts; ts.name = "inventory"; ts.topicId = 1; ts.partitionCount = 1;
         cfg.topics.push_back(ts);
         client = std::make_unique<Client>(cfg);
-        std::this_thread::sleep_for(150ms);
-        gw = std::make_unique<TwoLegTlsGateway>(agentDir + "/aeron", kInStr, kEgStr);
+        if (invoker) {
+            for (int i = 0; i < 75; ++i) { (void)client->doWork(); std::this_thread::sleep_for(kPumpSleep); }
+        } else {
+            std::this_thread::sleep_for(150ms);
+        }
+        std::function<void()> idle;
+        if (invoker) idle = [this] { (void)client->doWork(); };
+        gw = std::make_unique<TwoLegTlsGateway>(agentDir + "/aeron", kInStr, kEgStr, idle);
+        gw->twoLeg = twoLeg;
     }
     ~Rig() {
         client->close();
@@ -220,25 +295,25 @@ struct Rig {
         client.reset();
         try { std::filesystem::remove_all(agentDir); } catch (...) {}
     }
+    void step() {
+        gw->poll(16);
+        if (invoker) (void)client->doWork();
+        std::this_thread::sleep_for(kPumpSleep);
+    }
     void pumpFor(std::chrono::milliseconds d) {
-        for (const auto dl = std::chrono::steady_clock::now() + d; std::chrono::steady_clock::now() < dl;) {
-            gw->poll(16);
-            std::this_thread::sleep_for(kPumpSleep);
-        }
+        for (const auto dl = std::chrono::steady_clock::now() + d; std::chrono::steady_clock::now() < dl;) step();
     }
     template <class Pred> bool pumpWithin(std::chrono::milliseconds d, Pred p) {
         for (const auto dl = std::chrono::steady_clock::now() + d; std::chrono::steady_clock::now() < dl;) {
             if (p()) return true;
-            gw->poll(16);
-            std::this_thread::sleep_for(kPumpSleep);
+            step();
         }
         return p();
     }
     template <class Pred> bool pumpUntil(Pred p) {
         for (int i = 0; i < kPumpMax; ++i) {
             if (p()) return true;
-            gw->poll(16);
-            std::this_thread::sleep_for(kPumpSleep);
+            step();
         }
         return p();
     }
@@ -260,7 +335,7 @@ TEST(TlsConnectEdgeRegression, ConnectIsOkOnlyAfterTheHandshakeCompletesRegressi
     r.gw->release = true;
     ASSERT_TRUE(r.pumpUntil([&] { return conn.ready(); })) << "connect() never completed after the handshake";
     EXPECT_NO_THROW(conn.check());
-    EXPECT_TRUE(r.pumpUntil([&] { return r.gw->broker.encrypted; })) << "the client's Finished never arrived";
+    EXPECT_TRUE(r.pumpUntil([&] { return r.gw->seedEncrypted(); })) << "the client's Finished never arrived";
     EXPECT_EQ(r.gw->plaintextConnects, 0);
 }
 
@@ -317,4 +392,72 @@ TEST(TlsConnectEdgeRegression, DirectSendsWaitForTheHandshakeRegression) {
     EXPECT_TRUE(r.pumpWithin(2s, [&] { return r.gw->initPidsSeen >= 1; })) << "InitProducerId never followed the handshake";
     EXPECT_EQ(r.gw->framesBeforeKeys, 0);
     EXPECT_EQ(r.gw->unopenable, 0);
+}
+
+// ===========================================================================
+// Fix round 5 (client-failover-review.md "Fix round 4 check", N4-I1): the broker fails
+// the handshake on its FINAL leg — the client's last flight did not verify, or its key
+// export failed — after the client already went Connected (a TLS 1.3 client is done
+// once it has SENT its Finished; on success the broker sends nothing more).  Ruling:
+// terminal Rejected(HandshakeFailed), the keys cleared, every pending op failed once,
+// onError once, connect() not re-answered.  Acting only on a frame naming the session's
+// current id AND its connect corrId.
+// ===========================================================================
+
+// RED (no final-leg verdict): the seed stays falsely Connected, the ping waits out its
+// deadline, onError never fires, and the client keeps "working" on a session the broker
+// never promoted.
+TEST(TlsConnectEdgeRegression, FinalLegHandshakeFailedFailsTheSeedExplicitlyRegression) {
+    Rig r(/*invokerMode=*/true, /*twoLeg=*/false);
+    r.gw->failFinalLeg = true;
+    std::vector<std::string> errors;
+    r.client->onError([&](const std::string& e) { errors.push_back(e); });
+    test_support::TestCq cq(*r.client);
+    auto conn = cq.issue([&](Completions& q, Token t) { return r.client->connect(q, t); });
+    ASSERT_TRUE(r.pumpUntil([&] { return conn.ready(); }));
+    EXPECT_NO_THROW(conn.check()) << "connect() completes when the client's TLS is done (optimistically)";
+    auto ping = cq.issue([&](Completions& q, Token t) { return r.client->ping(Bytes(4, 7), q, t); });
+    EXPECT_TRUE(r.pumpWithin(1s, [&] { return r.client->state() == rcs::SessionState::Rejected; }))
+        << "the seed stayed (falsely) Connected after the broker failed its final handshake leg";
+    EXPECT_TRUE(r.pumpWithin(1s, [&] { return ping.ready(); })) << "the pending ping was never failed";
+    if (ping.ready()) EXPECT_EQ(ping.status(), OpStatus::Closed) << ping.describe();   // enterFailed_'s status
+    const int connectsAtFailure = r.gw->connectsSeen;
+    r.pumpFor(2s);
+    EXPECT_EQ(r.gw->connectsSeen, connectsAtFailure) << "a terminal verdict, never a reconnect";
+    ASSERT_EQ(errors.size(), 1u) << "onError must fire exactly once";
+    EXPECT_NE(errors[0].find("HandshakeContinueResponse error code: 29"), std::string::npos) << errors[0];
+    EXPECT_EQ(r.gw->finalLegFailuresSent, 1 + r.gw->failRepeats) << "precondition: the failure was re-offered";
+    EXPECT_EQ(r.client->testHandshakeFinalLegFailures(), 1u) << "re-offered failures are applied once";
+    EXPECT_FALSE(conn.failed()) << "connect() is never re-answered";
+}
+
+// A node session (a partition route to another node) fails its final leg: only THAT
+// session is Rejected — the frame is resolved by (session id, connect corrId); the seed
+// stays Connected and keeps answering.  RED (no (sid, corr) resolution): the frame falls
+// back to the seed (sessionForConnectCorrId matches in-flight connects only) and the node
+// session stays falsely Connected.
+TEST(TlsConnectEdgeRegression, NodeSessionFinalLegHandshakeFailedRejectsOnlyThatSessionRegression) {
+    Rig r(/*invokerMode=*/true, /*twoLeg=*/false);
+    r.gw->failFinalLeg = true;
+    r.gw->failFinalLegFromCorr = 1'000'000'000'000LL;   // node sessions' corrId range only
+    test_support::TestCq cq(*r.client);
+    auto conn = cq.issue([&](Completions& q, Token t) { return r.client->connect(q, t); });
+    ASSERT_TRUE(r.pumpUntil([&] { return conn.ready(); }));
+    ASSERT_NO_THROW(conn.check());
+    ASSERT_TRUE(r.pumpUntil([&] { return r.gw->seedEncrypted(); }));
+    r.client->testSetRoute(1, 0, "aeron:ipc?alias=node1");   // p0 led by "node 1": its own session
+    ProducerConfig pcfg;
+    pcfg.acks = Acks::Leader; pcfg.lingerUs = 1; pcfg.batchBytes = 1;
+    auto p = r.client->producer(pcfg);
+    const std::vector<uint8_t> val = {1, 2, 3};
+    auto fut = cq.send(p, r.client->topic("inventory"), Key(uint64_t{42}), std::span<const uint8_t>(val));
+    ASSERT_TRUE(r.pumpUntil([&] { return r.client->testSessionStateAt(1) != rcs::SessionState::Disconnected; }))
+        << "precondition: the route opened a node session";
+    EXPECT_TRUE(r.pumpWithin(2s, [&] { return r.client->testSessionStateAt(1) == rcs::SessionState::Rejected; }))
+        << "the node session stayed (falsely) Connected (state " << int(r.client->testSessionStateAt(1)) << ")";
+    EXPECT_EQ(r.client->state(), rcs::SessionState::Connected) << "the seed was hit by the node's verdict";
+    auto ping = cq.issue([&](Completions& q, Token t) { return r.client->ping(Bytes(4, 7), q, t); });
+    EXPECT_TRUE(r.pumpWithin(2s, [&] { return ping.ready(); }));
+    EXPECT_TRUE(ping.ok()) << (ping.ready() ? ping.describe() : std::string("pending"));
+    EXPECT_EQ(r.client->testHandshakeFinalLegFailures(), 1u);
 }

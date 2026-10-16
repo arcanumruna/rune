@@ -431,6 +431,8 @@ public:
         const Session& s = *sessions_[index];
         return s.machine.state() == session::SessionState::Connected ? s.connectEpoch : 0;
     }
+    /// Fix round 5 (N4-I1): final-leg HandshakeFailed verdicts applied (duty thread).
+    [[nodiscard]] uint64_t handshakeFinalLegFailures() const noexcept { return handshakeFinalLegFailures_; }
     /// Session `index`'s node broker version (latest accepted connect; 0 = unknown).
     [[nodiscard]] int32_t sessionBrokerVersion(uint32_t index) const noexcept {
         return index < sessions_.size() ? sessions_[index]->brokerVersion : 0;
@@ -932,6 +934,7 @@ private:
     std::vector<ProduceAck>     produceAcks_;  // reserved in the ctor; owner clears
     bool                        forwardProduceResponses_ = true;
     bool                        mnDebug_ = false;  // RUNE_MN_DEBUG, read ONCE
+    uint64_t                    handshakeFinalLegFailures_ = 0;   // fix round 5 (N4-I1), duty thread
 
     /// client<->broker TLS/AEAD (Task 6): reusable decrypt scratch for
     /// dispatchEgressFrame's data-plane open path — holds the reconstructed

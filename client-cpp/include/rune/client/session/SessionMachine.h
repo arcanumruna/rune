@@ -321,6 +321,14 @@ public:
     /// Fix round 4: this session offers crypto — its negotiated mode is only known
     /// once Connected, so no non-handshake frame may leave it before then.
     [[nodiscard]] bool offersCrypto() const noexcept { return cfg_.offerCrypto; }
+    /// Fix round 5 (N4-I1): a HandshakeContinueResponse{HandshakeFailed} naming this Connected
+    /// session's current id and connect corrId — its final handshake leg failed broker-side.
+    [[nodiscard]] bool isFinalLegHandshakeFailure(int16_t code, int64_t corrId, int64_t noticeSessionId) const noexcept {
+        return state_ == SessionState::Connected &&
+               static_cast<rune::protocol::client::ErrorCode>(static_cast<uint16_t>(code)) ==
+                   rune::protocol::client::ErrorCode::HandshakeFailed &&
+               corrId == correlationId_ && noticeSessionId != 0 && noticeSessionId == sessionId_;
+    }
 
     // ------------------------------------------------------------------------
     // External API — called by the application / CC-5 agent.
@@ -337,7 +345,10 @@ public:
             state_ == SessionState::Closed || state_ == SessionState::Rejected) return;
         sessionId_   = 0;
         cryptoState_ = CryptoState{};
-        hs_.reset();
+        // Fix round 5 (N4-M1): Connecting keeps its episode — the next NEW request replaces
+        // it (a different requestCorrelationId); dropping it here would make tickConnecting's
+        // requireCrypto-without-TLS rule turn a transient move into a terminal Rejected.
+        if (state_ != SessionState::Connecting) hs_.reset();
     }
 
     /// Transition Disconnected → Connecting (or re-try from Resuming).
@@ -530,12 +541,22 @@ public:
     void onHandshakeContinueResponse(int16_t          code,
                                       std::string_view handshakeBytes,
                                       int64_t          incomingCorrelationId,
-                                      int64_t          nowNs) noexcept {
-        if (state_ != SessionState::Handshaking) return;
-        if (incomingCorrelationId != correlationId_) return;
-
+                                      int64_t          nowNs,
+                                      int64_t          noticeSessionId = 0) noexcept {
         namespace rpc = rune::protocol::client;
         const auto ec = static_cast<rpc::ErrorCode>(static_cast<uint16_t>(code));
+        // Fix round 5 (N4-I1, ruling): the broker failed the handshake on its FINAL leg (the
+        // client's last flight did not verify, or its key export failed) — after this machine
+        // already went Connected (a TLS 1.3 client is done once it has SENT its Finished; on
+        // success the broker sends nothing more).  The same verdict as on any leg: terminal.
+        // Only for THIS session's last handshake: its current id AND connect corrId.
+        if (isFinalLegHandshakeFailure(code, incomingCorrelationId, noticeSessionId)) {
+            cryptoState_ = CryptoState{};
+            onHandshakeFailed_(nowNs);    // Rejected(HandshakeFailed)
+            return;
+        }
+        if (state_ != SessionState::Handshaking) return;
+        if (incomingCorrelationId != correlationId_) return;
         if (ec == rpc::ErrorCode::HandshakeFailed) {
             onHandshakeFailed_(nowNs);   // a TLS failure: non-retriable
             return;

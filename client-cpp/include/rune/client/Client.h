@@ -542,6 +542,8 @@ public:
     /// F8a fix2 test hooks (duty thread / owner in Invoker mode only).
     [[nodiscard]] uint64_t testIngressOfferRefused() const noexcept { return agent_.ingressOfferRefused(); }
     [[nodiscard]] uint64_t testStaleFramesDropped() const noexcept { return agent_.staleFramesDropped(); }
+    /// Fix round 5 (N4-I1) test hook: final-leg HandshakeFailed verdicts the agent applied.
+    [[nodiscard]] uint64_t testHandshakeFinalLegFailures() const noexcept { return agent_.handshakeFinalLegFailures(); }
     [[nodiscard]] uint64_t testStaleSessionNotices() const noexcept { return agent_.staleSessionNotices(); }
     /// Test hook (duty-cycle thread only): the seed session's current broker session id (0 = none).
     [[nodiscard]] int64_t testSeedSessionId() const noexcept { return agent_.seedSession().machine.sessionId(); }

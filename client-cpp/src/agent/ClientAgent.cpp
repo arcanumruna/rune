@@ -907,14 +907,39 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
         // machine itself ignores it outside Handshaking / on a stale correlationId).
         auto opt = codec::decodeHandshakeContinueResponse(buf, len);
         if (!opt) break;
-        Session& s = sessionForConnectCorrId(opt->correlationId);
+        Session* sp = &sessionForConnectCorrId(opt->correlationId);
+        // Fix round 5 (N4-I1): a FINAL-leg HandshakeFailed arrives after its session went
+        // Connected — sessionForConnectCorrId (in-flight connects only) would fall back to the
+        // seed.  Resolve it by the (session id, connect corrId) pair — never by id alone.
+        if (!(sp->machine.correlationId() == opt->correlationId &&
+              (sp->machine.state() == session::SessionState::Connecting ||
+               sp->machine.state() == session::SessionState::Handshaking))) {
+            for (auto& cand : sessions_) {
+                if (cand->machine.state() == session::SessionState::Connected &&
+                    cand->machine.sessionId() == opt->sessionId &&
+                    cand->machine.correlationId() == opt->correlationId) { sp = cand.get(); break; }
+            }
+        }
+        Session& s = *sp;
         const bool awaited = s.machine.state() == session::SessionState::Handshaking &&
                              s.machine.correlationId() == opt->correlationId;
-        s.machine.onHandshakeContinueResponse(opt->code, opt->handshakeBytes, opt->correlationId, nowNs);
-        s.machine.onActivity(nowNs);
+        const bool finalLegFailure =
+            s.machine.isFinalLegHandshakeFailure(opt->code, opt->correlationId, opt->sessionId);
+        s.machine.onHandshakeContinueResponse(opt->code, opt->handshakeBytes, opt->correlationId, nowNs,
+                                              opt->sessionId);
+        if (!finalLegFailure) s.machine.onActivity(nowNs);
+        if (finalLegFailure) [[unlikely]] {
+            if ((handshakeFinalLegFailures_++ & 1023u) == 0)
+                std::fprintf(stderr,
+                    "rune-client: the broker failed the TLS handshake on its final leg (session %lld) — "
+                    "the session is Rejected (HandshakeFailed); %llu so far\n",
+                    static_cast<long long>(opt->sessionId),
+                    static_cast<unsigned long long>(handshakeFinalLegFailures_));
+        }
         // Fix round 4: the observer reads THIS leg's verdict — never one left over
         // from an earlier ConnectResponse (a non-final leg accepts nothing).
-        lastConnectAwaited_  = awaited;
+        // Fix round 5: a final-leg failure is this session's verdict too (onError once).
+        lastConnectAwaited_  = awaited || finalLegFailure;
         lastConnectAccepted_ = awaited && s.machine.state() == session::SessionState::Connected;
         lastConnectSession_  = 0;
         for (uint32_t i = 0; i < sessions_.size(); ++i) {

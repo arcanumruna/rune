@@ -1008,3 +1008,55 @@ TEST(ClientCryptoRegression, RequiredCryptoWithoutLocalTlsNeverSendsAPlaintextCo
     EXPECT_EQ(m.state(), sm::SessionState::Rejected);
     EXPECT_EQ(m.rejectCode(), static_cast<int16_t>(rune::protocol::client::ErrorCode::HandshakeFailed));
 }
+
+// ===========================================================================
+// DR client bugs fix round 5 (client-failover-review.md "Fix round 4 check").
+// ===========================================================================
+
+// N4-I1: the broker failed the handshake on its FINAL leg after this machine already went
+// Connected (a TLS 1.3 client is done once it has sent its Finished).  Ruling: terminal
+// Rejected(HandshakeFailed), keys cleared — only for a frame naming this session's current
+// id AND its connect corrId with code HandshakeFailed.  RED (before): the machine stays
+// Connected (onHandshakeContinueResponse returns at its Handshaking guard).
+TEST(ClientCryptoRegression, FinalLegHandshakeFailedAfterConnectedIsTerminalRegression) {
+    namespace rpc = rune::protocol::client;
+    const auto hf = static_cast<int16_t>(rpc::ErrorCode::HandshakeFailed);
+    {
+        FrameFixture f;
+        ASSERT_TRUE(f.established(1'000'000'000LL));
+        f.m.onHandshakeContinueResponse(hf, {}, f.m.correlationId(), 1'000'000'100LL, f.m.sessionId());
+        EXPECT_EQ(f.m.state(), sm::SessionState::Rejected) << "a final-leg HandshakeFailed left the session Connected";
+        EXPECT_EQ(f.m.rejectCode(), hf);
+        EXPECT_FALSE(f.m.cryptoState().encrypted) << "the keys of a session the broker never promoted survived";
+    }
+    struct Neg { const char* what; int16_t code; int64_t corrDelta; int64_t sid; };
+    const Neg negs[] = {
+        {"wrong corrId", hf, 1, FrameFixture::kSessionId},
+        {"wrong session id", hf, 0, FrameFixture::kSessionId + 1},
+        {"session id 0", hf, 0, 0},
+        {"code Internal", static_cast<int16_t>(rpc::ErrorCode::Internal), 0, FrameFixture::kSessionId},
+    };
+    for (const auto& n : negs) {
+        SCOPED_TRACE(n.what);
+        FrameFixture f;
+        ASSERT_TRUE(f.established(1'000'000'000LL));
+        f.m.onHandshakeContinueResponse(n.code, {}, f.m.correlationId() + n.corrDelta, 1'000'000'100LL, n.sid);
+        EXPECT_EQ(f.m.state(), sm::SessionState::Connected);
+        EXPECT_TRUE(f.m.cryptoState().encrypted);
+    }
+}
+
+// N4-M1: a seed move while CONNECTING (abandonResumeHint) keeps the in-flight episode — the
+// next new request replaces it.  RED (before): the episode is dropped, and with
+// requireCrypto tickConnecting turns "no TLS" into a terminal Rejected.
+TEST(ClientCryptoRegression, AbandonResumeHintWhileConnectingKeepsTheHandshakeRegression) {
+    TlsMachine t(/*require=*/true);
+    t.m->connect(t.now);
+    ASSERT_EQ(t.m->state(), sm::SessionState::Connecting);
+    t.m->abandonResumeHint();
+    t.m->tick(t.now + 1);
+    EXPECT_EQ(t.m->state(), sm::SessionState::Connecting) << "a transient move became a terminal Rejected";
+    EXPECT_EQ(t.m->rejectCode(), 0);
+    // The episode still completes the handshake for its request.
+    EXPECT_TRUE(t.completeFrom(t.io.sendCount() - 1, 42));
+}
