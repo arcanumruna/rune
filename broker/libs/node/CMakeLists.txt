@@ -1571,6 +1571,14 @@ if(BUILD_TESTING)
                               rune_client_api rune_cli_lib aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_client_broker_tests PROPERTIES TIMEOUT 600)
 
+        # DR client bugs (2026-10-15): the REAL client against 3 REAL in-process brokers, a leader SIGKILLed mid-op
+        # (seed failover, metadata from any live broker, re-route; produce / subscribe / group / txn / DDL / view row).
+        add_executable(rune_client_failover_broker_tests tests/client/ClientFailoverBrokerRegressionTest.cpp)
+        target_include_directories(rune_client_failover_broker_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_client_failover_broker_tests PRIVATE rune_node rune_view rune_codec rune_catalog
+                              rune_client_api aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_client_failover_broker_tests PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
+
         # Catalog history Task 11: the DDL route (Redirect / NotLeader / Internal when
         # halted) and the halted controller's resignation, 3 brokers over real Aeron.
         add_executable(rune_catalog_leadership_broker_tests tests/integration/CatalogLeadershipBrokerTest.cpp)

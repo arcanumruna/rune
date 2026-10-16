@@ -20,6 +20,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <map>
 #include <string>
 #include <thread>
 #include <vector>
@@ -123,8 +124,9 @@ TEST(ClientDdlClusterRegression, BelowMinIsrAndWaitFailsExplicitlyWithNotLeader)
 }
 
 // Task 22 fix round 1 (M5): the client whose SEED dies with its DDL in flight.  The catalog leader commits the DDL and never
-// answers it, then is crashed; the client is seeded on that very broker, so its re-send toward the seed has nowhere to go: it
-// ends EXPLICITLY (SessionLost, or NotLeader) inside its retry budget - never a hang to the operation timeout - and the same
+// answers it, then is crashed; the client is seeded on that very broker.  DR client bug 1: the client moves its seed off the
+// dead broker and re-sends to the failed-over seed - success via dedupe (the SAME requestId: the original result), or an
+// explicit retriable failure (SessionLost, NotLeader) - inside its retry budget, never a hang to the operation timeout; the same
 // requestId sent through a surviving broker gets the original result, exactly one event on every broker.
 TEST(ClientDdlClusterRegression, SeedLeaderCrashedMidDdlFailsExplicitlyAndTheRetryElsewhereGetsTheResultRegression) {
     ThreeNodes c = ThreeNodes::start("cc_seed");
@@ -144,19 +146,30 @@ TEST(ClientDdlClusterRegression, SeedLeaderCrashedMidDdlFailsExplicitlyAndTheRet
     bool threw = false;
     int code = -1;
     std::string detail;
+    rune::protocol::RequestId rid{};
+    int32_t topicId = -1;
     try {
         const auto r = a->defineTopicAndWait("t", 1, "", {}, false, kDisk, {}, o, 30s);
-        code = r.errorCode; detail = r.detail;
+        code = r.errorCode; detail = r.detail; rid = r.requestId; topicId = r.topicId;
     } catch (const std::exception& e) {
         threw = true; detail = e.what();
     }
     const auto took = std::chrono::steady_clock::now() - t0;
     const int32_t killed = c.reapKilledLeader();
     ASSERT_EQ(killed, leader) << "the leader was crashed after the DDL's append";
-    EXPECT_TRUE((threw && detail.find("session") != std::string::npos) || code == 2)
-        << "an explicit failure (SessionLost, or NotLeader), threw=" << threw << " code=" << code << ": " << detail;
-    // The client notices a dead seed by its session going stale (SessionConfig::responseTimeoutNs of silence), THEN its
-    // retry budget runs: the explicit failure comes at ~13 s, never at the 30 s operation timeout.
+    // DR client bug 1: the client moves its seed off the dead broker (stale session) and re-sends the DDL, with the SAME
+    // requestId, to the new catalog leader, whose dedupe answers the ORIGINAL result.  Contract: that success, OR an explicit
+    // retriable failure (SessionLost, NotLeader) - never a Timeout, never another code - inside stale threshold + retry budget.
+    const bool succeeded   = !threw && code == 0;
+    const bool sessionLost = threw && detail.find("session lost") != std::string::npos;
+    const bool notLeader   = !threw && code == 2;
+    EXPECT_TRUE(succeeded || sessionLost || notLeader)
+        << "success or an explicit retriable failure, threw=" << threw << " code=" << code << ": " << detail;
+    if (succeeded) {
+        EXPECT_EQ(rid, o.requestId) << "the success is THIS DDL's deduped original result";
+        EXPECT_GT(topicId, 0);
+        EXPECT_TRUE(detail.empty()) << detail;
+    }
     const auto staleSession = std::chrono::nanoseconds(rune::client::session::SessionConfig{}.responseTimeoutNs);
     EXPECT_LT(took, staleSession + cfg.ddlRetryBudget + 2s) << "ends inside the stale-session threshold + the retry budget, never at the 30 s operation timeout";
 
@@ -313,12 +326,30 @@ TEST(ClientDdlClusterRegression, CatalogHistoryTruncatedMidReadIsReReadNotServed
     EXPECT_EQ(reader->catalogReader().historyEpoch(), epoch0) << "F's history only grew: the same epoch";
     EXPECT_EQ(reader->catalogReader().stats().epochChanges, 0u);
 
-    // 3. F loses its disk: a new history epoch, the same committed history.
+    // 3. F loses its disk: a new history epoch, the same committed history.  DR client bug 1: the reader's seed fails over
+    //    while F is down, so its re-read may be served by another broker S - the anti-stale contract is asserted on S.
     c.startNode(killed);
     ASSERT_TRUE(c.awaitCatalogDigestsEqual(60s, &why)) << why;
+    auto readServerAccepted = [&](int id) {
+        return c.node(id).onAdminThreadForTest([&] {
+            const auto* rs = c.node(id).adminWorkerAgentForTest()->worker().readServer();
+            return rs != nullptr ? rs->acceptedFromOffsetsForTest() : std::vector<int64_t>{};
+        });
+    };
+    auto readServerEpoch = [&](int id) {
+        return c.node(id).onAdminThreadForTest([&] {
+            const auto* rs = c.node(id).adminWorkerAgentForTest()->worker().readServer();
+            return rs != nullptr ? rs->historyEpoch() : uint64_t{0};
+        });
+    };
+    const uint64_t fEpochBefore = readServerEpoch(F);
+    ASSERT_NE(fEpochBefore, 0u);
+    std::map<int, std::size_t> acceptedBefore;
+    for (int id : c.runningNodes()) acceptedBefore[id] = (id == F) ? 0 : readServerAccepted(id).size();
     c.stop(F);
     c.wipe(F);
     c.startNode(F);
+    acceptedBefore[F] = 0;   // F restarted empty: everything it accepts from here is this read
     ASSERT_TRUE(c.awaitCatalogDigestsEqual(60s, &why)) << why;
     std::optional<std::vector<rcat::RecordedEvent>> h3;
     std::string lastErr;
@@ -330,7 +361,7 @@ TEST(ClientDdlClusterRegression, CatalogHistoryTruncatedMidReadIsReReadNotServed
         } catch (const std::exception& e) { lastErr = e.what(); }
         if (!h3) std::this_thread::sleep_for(200ms);
     }
-    ASSERT_TRUE(h3.has_value()) << "the reader reconnects to the restarted F: " << lastErr;
+    ASSERT_TRUE(h3.has_value()) << "the reader re-reads after F's wipe: " << lastErr;
     const auto truth = c.catalogEventsOn(F);
     ASSERT_EQ(h3->size(), truth.size());
     for (std::size_t i = 0; i < truth.size(); ++i) {
@@ -339,13 +370,22 @@ TEST(ClientDdlClusterRegression, CatalogHistoryTruncatedMidReadIsReReadNotServed
     }
     EXPECT_GE(reader->catalogReader().stats().epochChanges, 1u) << "the cache was dropped, not continued";
     EXPECT_NE(reader->catalogReader().historyEpoch(), epoch0);
-    const auto offsets = c.node(F).onAdminThreadForTest([&] {
-        const auto* rs = c.node(F).adminWorkerAgentForTest()->worker().readServer();
-        return rs != nullptr ? rs->acceptedFromOffsetsForTest() : std::vector<int64_t>{};
-    });
-    // The client resumes from its cache end (3); the restarted broker's stream names a NEW epoch, so the
-    // client drops the cache and subscribes again from offset 0: a full re-read (never the stale prefix).
-    ASSERT_GE(offsets.size(), 2u);
-    EXPECT_EQ(offsets.front(), 3) << "resumed from the cache end first";
-    EXPECT_EQ(offsets.back(), 0) << "the restarted broker was then read from offset 0: a full re-read";
+    // F's history was truncated (wiped): F serves a NEW epoch - the truncation this test injects, asserted broker-side.
+    EXPECT_NE(readServerEpoch(F), fEpochBefore) << "the wipe gave F a new history epoch";
+    // Exactly one broker S served the reader's re-read (F after its restart, or the broker the seed failed over to).
+    int served = -1;
+    std::vector<int64_t> sOffsets;
+    for (int id : c.runningNodes()) {
+        const auto all = readServerAccepted(id);
+        if (all.size() <= acceptedBefore[id]) continue;
+        ASSERT_EQ(served, -1) << "one broker serves the re-read (also " << id << ")";
+        served = id;
+        sOffsets.assign(all.begin() + static_cast<std::ptrdiff_t>(acceptedBefore[id]), all.end());
+    }
+    ASSERT_GT(served, 0) << "some broker served the re-read";
+    // S's epoch is not the cached one: the client resumed from its cache end (3), was refused, and re-read from 0.
+    ASSERT_GE(sOffsets.size(), 2u);
+    EXPECT_EQ(sOffsets.front(), 3) << "resumed from the cache end first (on " << served << ")";
+    EXPECT_EQ(sOffsets.back(), 0) << "then a full re-read from offset 0 (on " << served << ")";
+    EXPECT_EQ(reader->catalogReader().historyEpoch(), readServerEpoch(served)) << "the cache is S's epoch, never a stale one";
 }
