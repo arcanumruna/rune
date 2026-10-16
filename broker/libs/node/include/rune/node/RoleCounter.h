@@ -138,6 +138,12 @@ inline constexpr std::int32_t kCatalogBlockedPartitionsCounterTypeId = 1'000'220
 inline std::string catalogBlockedPartitionsLabel(std::int32_t nodeId) {
     return "rune-catalog-blocked-partitions node=" + std::to_string(nodeId);
 }
+/// DR-bugs fix round 1 (review B-I2): link-MTU watchdog — (Aeron MTU + IP/UDP header) - link MTU while the
+/// link MTU on this node's path is below what one Aeron datagram needs, else 0.  Control thread only.
+inline constexpr std::int32_t kLinkMtuDeficitCounterTypeId = 1'000'221;
+inline std::string linkMtuDeficitLabel(std::int32_t nodeId) {
+    return "rune_link_mtu_deficit node=" + std::to_string(nodeId);
+}
 inline std::string catalogAppliedOffsetLabel(std::int32_t nodeId) {
     return "rune-catalog-applied-offset node=" + std::to_string(nodeId);
 }

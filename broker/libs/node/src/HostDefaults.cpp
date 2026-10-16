@@ -182,6 +182,12 @@ std::vector<std::string> nodeEndpointHosts(const NodeConfig& cfg) {
     // bind therefore adds nothing (k3s regression: 0.0.0.0 + 127.0.0.1 peers
     // derived the NIC's 1472 → 14-18k rec/s instead of 136k at 65504).  A
     // concrete non-wildcard bind host is where this node receives: included.
+    // Review B-I3: the per-worker egress control host when it is a concrete address (it receives there).
+    if (cfg.shardMode() || cfg.perWorkerEgressEnabled) {
+        const std::string eg = cfg.effectiveWorkerEgressControlHost();
+        if (!isWildcardHost(eg) && !isLoopbackHost(eg) && std::find(hosts.begin(), hosts.end(), eg) == hosts.end())
+            hosts.push_back(eg);
+    }
     const std::string client = cfg.clientEndpoint.channel.empty() ? std::string{} : cfg.clientBindHost();
     if (!isWildcardHost(client) && std::find(hosts.begin(), hosts.end(), client) == hosts.end())
         hosts.push_back(client);
@@ -191,6 +197,14 @@ std::vector<std::string> nodeEndpointHosts(const NodeConfig& cfg) {
 // ---------------------------------------------------------------------------
 // Shard ports + affinity (PURE)
 // ---------------------------------------------------------------------------
+MtuCheck checkLinkMtu(int32_t interfaceMtu, int32_t aeronMtu, bool ipv6) noexcept {
+    MtuCheck c;
+    c.linkMtu = interfaceMtu;
+    c.needed  = aeronMtu + (ipv6 ? kIpv6UdpHeaderBytes : kIpv4UdpHeaderBytes);
+    c.below   = interfaceMtu > 0 && aeronMtu > 0 && interfaceMtu < c.needed;
+    return c;
+}
+
 std::optional<ShardBasePorts> deriveShardBasePorts(int32_t nodeId, int32_t workers) noexcept {
     if (workers < 1 || workers > NodeConfig::kMaxShardWorkers || nodeId < 0 || nodeId > kMaxDerivedShardNodeId)
         return std::nullopt;
@@ -233,6 +247,11 @@ std::vector<int32_t> nodeBoundPorts(const NodeConfig& cfg) {
             if (cfg.workerReplBasePort)    add(static_cast<int64_t>(*cfg.workerReplBasePort) + w);
             if (const int32_t e = cfg.effectiveWorkerEgressControlBasePort(); e > 0) add(static_cast<int64_t>(e) + w);
         }
+    } else if (cfg.perWorkerEgressEnabled) {
+        // Review A-I5 / B-M1: legacy mode's per-worker egress control ports (BrokerNode binds them exactly when
+        // perWorkerEgressEnabled) — the default 40300+w lies inside Linux's ephemeral range.
+        const int32_t W = cfg.workerCount >= 1 ? cfg.workerCount : 1;
+        for (int32_t w = 0; w < W; ++w) add(static_cast<int64_t>(cfg.effectiveWorkerEgressControlBasePort()) + w);
     }
     std::sort(ports.begin(), ports.end());
     ports.erase(std::unique(ports.begin(), ports.end()), ports.end());
@@ -561,7 +580,7 @@ HostDerivation applyHostDerivedDefaults(NodeConfig& cfg, const HostNetFacts& fac
     char line[1536];
     std::snprintf(line, sizeof line,
         "mode=%s placement=%s workers=%d coreBase=%d(%s) idle=%s io=%s ioWq=%s nonWorker=%s drvIdle=%s ctlIdle=%s term=%d ctlTerm=%d fsyncMs{worker=%lld follower=%lld} sparse=%s mtu=%d socketBuffer=%d "
-        "rcvWindow=%d gso=%s gro=%s rings{replOut=%d ingress=%d return=%d} ports{ingress=%d repl=%d egressCtl=%d} "
+        "rcvWindow=%d gso=%s gro=%s rings{replOut=%d ingress=%d return=%d} ports{ingress=%d repl=%d egressCtl=%d derivedBase=%d} "
         "host{loopback=%s ifMtu=%d rmemMax=%lld wmemMax=%lld cpus=%d aeronTmpfs=%s} derived={%s}",
         cfg.shardMode() ? "shard" : "legacy", cfg.fused() ? "fused" : "thread", W, cfg.workerCoreBase,
         cfg.shardMode() ? (cfg.shardWorkersBusySpin() ? "busy-spin" : "backoff") : "idle-cfg", idle.c_str(), io.c_str(), ioWq.c_str(), nonWorker.c_str(), drvIdle.c_str(), ctlIdle.c_str(),
@@ -574,7 +593,7 @@ HostDerivation applyHostDerivedDefaults(NodeConfig& cfg, const HostNetFacts& fac
         cfg.aeronUdpGso ? (facts.udpGso ? "on" : "unsupported") : "off",
         cfg.aeronUdpGso ? (facts.udpGro ? "on" : "unsupported") : "off", cfg.replicationOutboundRingBytes,
         cfg.workerIngressRingBytes, cfg.workerReturnRingBytes, cfg.workerIngressBasePort.value_or(0),
-        cfg.workerReplBasePort.value_or(0), cfg.effectiveWorkerEgressControlBasePort(),
+        cfg.workerReplBasePort.value_or(0), cfg.effectiveWorkerEgressControlBasePort(), kDerivedShardPortBase,
         facts.loopback ? "true" : "false", facts.interfaceMtu, static_cast<long long>(facts.rmemMax),
         static_cast<long long>(facts.wmemMax), static_cast<int>(facts.allowedCpus.size()),
         facts.aeronDirTmpfs ? "true" : "false", derived.c_str());
@@ -730,6 +749,11 @@ void probeEphemeralPorts(HostNetFacts& f) {
 }
 
 } // namespace
+
+int32_t probeInterfaceMtu(const std::string& host, bool& ipv6) {
+    ipv6 = false;
+    return egressInterfaceMtu(isWildcardHost(host) ? std::string("1.1.1.1") : host, ipv6);
+}
 
 HostNetFacts probeHostNetFacts(const std::vector<std::string>& endpointHosts, const std::string& aeronDir) {
     HostNetFacts f;

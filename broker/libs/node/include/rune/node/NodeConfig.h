@@ -532,9 +532,13 @@ struct NodeConfig {
     // so the worker never manages the destination list and the control thread never
     // touches the publication (shared-nothing).
     //
-    //   - workerEgressControlHost: host the broker binds/advertises for MDC control.
-    //     Default "127.0.0.1" (single-box bench/tests); deployments override via
-    //     RUNE_WORKER_EGRESS_CONTROL_HOST with the broker's reachable address.
+    //   - workerEgressControlHost: host the broker binds for MDC control.  Empty (the
+    //     default) = DERIVED by effectiveWorkerEgressControlHost(): the address clients
+    //     reach it at (they send to <advertised RUNE_PEERS host>:<port>) — the advertised
+    //     host itself when numeric, else the wildcard.  RUNE_WORKER_EGRESS_CONTROL_HOST
+    //     overrides it; an explicit LOOPBACK host on a node advertised at a non-loopback
+    //     host refuses to start (review B-I3: the old "127.0.0.1" default silently turned
+    //     per-worker egress off in every multi-host / container deployment).
     //   - workerEgressControlBasePort: base UDP control port; worker W uses
     //     base + W.  RUNE_WORKER_EGRESS_CONTROL_BASE_PORT.  Must not collide with
     //     client/consensus/replication ports.  nullopt = not configured: legacy
@@ -545,7 +549,9 @@ struct NodeConfig {
     //   - workerEgressBaseStreamId: 0 = unset; resolved in buildWorkerPool to
     //     workerIngressBaseStreamId + workerCount (keeps ingress/egress stream
     //     ranges non-overlapping).  RUNE_WORKER_EGRESS_BASE_STREAM.
-    std::string workerEgressControlHost     = "127.0.0.1";
+    std::string workerEgressControlHost;   // empty = derived (effectiveWorkerEgressControlHost)
+    /// The MDC control host actually bound (see workerEgressControlHost).  The ONLY way readers obtain it.
+    [[nodiscard]] std::string effectiveWorkerEgressControlHost() const;
     static constexpr int32_t kDefaultWorkerEgressControlBasePort = 40300;
     std::optional<int32_t> workerEgressControlBasePort;
     /// The egress-control base port actually bound: the configured value, else the

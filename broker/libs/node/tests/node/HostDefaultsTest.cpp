@@ -1168,3 +1168,55 @@ TEST(HostDefaultsRegression, ProbedEphemeralRangeIsSaneOnThisHostRegression) {
     EXPECT_EQ(f.ephemeralPortLow, 0);
 #endif
 }
+
+// ---------------------------------------------------------------------------
+// DR-bugs fix round 1
+// ---------------------------------------------------------------------------
+// Review B-I2: the link MTU must carry one Aeron datagram (Aeron MTU + 28 IPv4 / 48 IPv6).  RED: `<=` for `<`
+// flips the 1500/1472 IPv4 case.
+TEST(HostDefaultsRegression, LinkMtuBelowAeronMtuIsDetectedRegression) {
+    const auto a = checkLinkMtu(1200, 1472, false);
+    EXPECT_TRUE(a.below); EXPECT_EQ(a.linkMtu, 1200); EXPECT_EQ(a.needed, 1500);
+    EXPECT_FALSE(checkLinkMtu(1500, 1472, false).below);
+    const auto v6 = checkLinkMtu(1500, 1472, true);
+    EXPECT_TRUE(v6.below); EXPECT_EQ(v6.needed, 1520);
+    EXPECT_FALSE(checkLinkMtu(0, 1472, false).below) << "unknown link MTU is never 'below'";
+}
+
+// Review A-I5 / B-M1: legacy mode with per-worker egress binds effectiveWorkerEgressControlBasePort()+w (default
+// 40300, inside Linux's range): listed and WARNed.  RED: no legacy branch in nodeBoundPorts.
+TEST(HostDefaultsRegression, LegacyPerWorkerEgressPortsAreListedAndWarnedRegression) {
+    NodeConfig c = threeNodeDefault(0);
+    c.workerMode = NodeConfig::WorkerMode::Legacy;
+    c.runtimePlacement = NodeConfig::RuntimePlacement::Thread;
+    c.perWorkerEgressEnabled = true;
+    c.workerCount = 2;
+    HostNetFacts f = k3sFacts();
+    f.ephemeralPortLow = 32768; f.ephemeralPortHigh = 60999;
+    const auto hd = applyHostDerivedDefaults(c, f);
+    const auto ports = nodeBoundPorts(c);
+    EXPECT_NE(std::find(ports.begin(), ports.end(), 40300), ports.end());
+    EXPECT_NE(std::find(ports.begin(), ports.end(), 40301), ports.end());
+    EXPECT_NE(hd.warnings.find("40300"), std::string::npos) << hd.warnings;
+    EXPECT_NE(hd.warnings.find("40301"), std::string::npos) << hd.warnings;
+}
+
+// Review A-M6: a co-located peer's egress-control ports are part of the collision check.  RED: omit them.
+TEST(HostDefaultsRegression, CoLocatedPeerEgressControlCollisionRefusesStartRegression) {
+    NodeConfig c = threeNodeDefault(1);
+    applyHostDerivedDefaults(c, k3sFacts());
+    ASSERT_FALSE(c.validateShardConfig().has_value()) << *c.validateShardConfig();
+    for (auto& p : c.peers)
+        if (p.id == 0) p.egressControlBasePort = static_cast<uint16_t>(*c.workerIngressBasePort);   // = node 1's ingress
+    const auto err = c.validateShardConfig();
+    ASSERT_TRUE(err.has_value()) << "a co-located peer's egress-control port collides with this node's ingress";
+    EXPECT_NE(err->find("co-located peer 0"), std::string::npos) << *err;
+}
+
+// Review A-I4 ruling (rolling upgrade across the 41000 -> 8200 move is not supported): the startup line names
+// the derived base so a mixed-version cluster is diagnosable.  RED: no derivedBase field.
+TEST(HostDefaultsRegression, StartupLineNamesTheDerivedShardPortBaseRegression) {
+    NodeConfig c = threeNodeDefault(0);
+    const auto hd = applyHostDerivedDefaults(c, k3sFacts());
+    EXPECT_NE(hd.summary.find("derivedBase=" + std::to_string(kDerivedShardPortBase)), std::string::npos) << hd.summary;
+}

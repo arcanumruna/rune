@@ -1067,7 +1067,7 @@ TEST(BrokerNodeTest, PerWorkerEgressWiredWithContiguousStreams) {
         EXPECT_EQ(egresses[i]->streamId(), egressBase + i)
             << "worker " << i << " egress stream id must be contiguous from egressBase";
         EXPECT_EQ(egresses[i]->controlEndpoint(),
-                  std::string("127.0.0.1:") + std::to_string(40360 + i))
+                  std::string("127.0.0.1:") + std::to_string(*cfg.workerEgressControlBasePort + i))
             << "worker " << i << " control endpoint must be host:(basePort+workerId)";
     }
 
@@ -2240,4 +2240,109 @@ TEST(BrokerNodeStopRegression, CatalogRegistriesReadableAfterStop) {
     std::error_code ec; fs::remove_all(dir, ec);
 }
 
+} // namespace rune::node
+
+// ===========================================================================
+// DR-bugs fix round 1 (reviews A + B)
+// ===========================================================================
+#include <spdlog/sinks/ringbuffer_sink.h>
+namespace rune::node {
+namespace {
+struct DrBugsLogCapture {   // RAII: never leaks the capture logger into later tests
+    std::shared_ptr<spdlog::sinks::ringbuffer_sink_mt> sink = std::make_shared<spdlog::sinks::ringbuffer_sink_mt>(1024);
+    std::shared_ptr<spdlog::logger> previous = spdlog::default_logger();
+    DrBugsLogCapture() {
+        auto capture = std::make_shared<spdlog::logger>("drbugs-capture", sink);
+        capture->set_level(spdlog::level::info);
+        spdlog::set_default_logger(capture);
+    }
+    ~DrBugsLogCapture() { spdlog::set_default_logger(previous); }
+    int count(const std::string& text) const {
+        int n = 0;
+        for (const std::string& l : sink->last_formatted()) n += l.find(text) != std::string::npos ? 1 : 0;
+        return n;
+    }
+    DrBugsLogCapture(const DrBugsLogCapture&) = delete;
+    DrBugsLogCapture& operator=(const DrBugsLogCapture&) = delete;
+};
+} // namespace
+
+// Review B-I2: the link-MTU watchdog — one ERROR on the below edge, one WARN on the restore edge, nothing between,
+// and the deficit counter follows.  Driven through the probe seam on the control thread.  RED: no edge check (the
+// three below ticks log three ERRORs).
+TEST(BrokerNodeRegression, LinkMtuWatchdogWarnsOnceOnEachEdgeRegression) {
+    const fs::path dir = makeTempDataDir("mtuwd_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    cfg.aeronMtuBytes = 1472;   // explicit: needed = 1500 on IPv4
+    BrokerNode node{cfg};
+    std::atomic<int32_t> linkMtu{1500};   // the probe runs on the control thread; the test thread sets it
+    node.setMtuProbeForTest([&linkMtu] { return linkMtu.load(); });
+    node.start();
+    ASSERT_EQ(node.effectiveConfigForTest().aeronMtuBytes, 1472);
+    DrBugsLogCapture log;
+    EXPECT_EQ(node.runMtuWatchdogForTest(), 0);
+    linkMtu.store(1200);
+    EXPECT_EQ(node.runMtuWatchdogForTest(), 300);
+    EXPECT_EQ(node.runMtuWatchdogForTest(), 300);
+    EXPECT_EQ(node.runMtuWatchdogForTest(), 300);
+    linkMtu.store(1500);
+    EXPECT_EQ(node.runMtuWatchdogForTest(), 0);
+    const auto edges = node.mtuWatchdogEdgesForTest();
+    EXPECT_EQ(edges.first, 1u);
+    EXPECT_EQ(edges.second, 1u);
+    EXPECT_EQ(log.count("is below the Aeron MTU"), 1) << "the below edge logs exactly once";
+    EXPECT_EQ(log.count("link MTU restored to 1500"), 1);
+    node.stop();
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+
+// Review B-M5: the startup ephemeral-range WARN is wired (probe -> applyHostDerivedDefaults -> log).  The client
+// port P is placed inside an overridden range [P, P].  RED: drop the conflict block in applyHostDerivedDefaults.
+TEST(BrokerNodeRegression, StartupWarnsAboutAnEphemeralBoundPortRegression) {
+    const fs::path dir = makeTempDataDir("ephwarn_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    const uint16_t clientPort = rune::node::test::freeUdpPort();
+    cfg.clientEndpoint.channel = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(clientPort);
+    for (auto& p : cfg.peers) p.clientPort = clientPort;
+    BrokerNode node{cfg};
+    node.setHostNetFactsOverrideForTest([clientPort](HostNetFacts& f) {
+        f.ephemeralPortLow = clientPort; f.ephemeralPortHigh = clientPort; f.reservedPorts.clear();
+    });
+    DrBugsLogCapture log;
+    node.start();
+    EXPECT_GE(log.count("UDP port(s) " + std::to_string(clientPort)), 1) << "the startup line must name the port";
+    node.stop();
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+
+// Review B-M1: in legacy mode a per-worker egress whose control port cannot be bound refuses to start — never a
+// WARN-and-disable that silently drops that worker to legacy egress.  RED: the old WARN (start() succeeds).
+TEST(BrokerNodeRegression, LegacyPerWorkerEgressBindFailureRefusesToStartRegression) {
+    const fs::path dir = makeTempDataDir("legegress_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    cfg.workerMode = NodeConfig::WorkerMode::Legacy;
+    cfg.runtimePlacement = NodeConfig::RuntimePlacement::Thread;
+    cfg.perWorkerEgressEnabled = true;
+    const uint16_t egressPort = rune::node::test::freeUdpPort();
+    cfg.workerEgressControlBasePort = egressPort;
+    ASSERT_EQ(cfg.effectiveWorkerEgressControlHost(), "127.0.0.1") << "single loopback node";
+    const int squat = ::socket(AF_INET, SOCK_DGRAM, 0);
+    ASSERT_GE(squat, 0);
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(egressPort);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ASSERT_EQ(::bind(squat, reinterpret_cast<sockaddr*>(&a), sizeof(a)), 0) << "test setup: occupy the control port";
+    bool refused = false;
+    std::string what;
+    {
+        BrokerNode node{cfg};
+        try { node.start(); } catch (const std::exception& e) { refused = true; what = e.what(); }
+        if (!refused) node.stop();
+    }
+    ::close(squat);
+    EXPECT_TRUE(refused) << "a taken per-worker egress control port must refuse the start";
+    EXPECT_NE(what.find("refusing to start"), std::string::npos) << what;
+    std::error_code ec; fs::remove_all(dir, ec);
+}
 } // namespace rune::node

@@ -170,6 +170,15 @@ static_assert(kDerivedShardPortBase + (kMaxDerivedShardNodeId + 1) * kDerivedSha
 [[nodiscard]] std::vector<int32_t> ephemeralPortConflicts(const std::vector<int32_t>& bound,
                                                           const HostNetFacts& facts);
 
+/// Review B-I2: is the link MTU below what one Aeron datagram needs (Aeron MTU + IPv4 28 / IPv6 48 B)?  An
+/// unknown link MTU (<= 0) is never "below".  PURE.
+struct MtuCheck { bool below = false; int32_t linkMtu = 0; int32_t needed = 0; };
+[[nodiscard]] MtuCheck checkLinkMtu(int32_t interfaceMtu, int32_t aeronMtu, bool ipv6) noexcept;
+
+/// IMPURE (cold: a few syscalls, no packet sent): the MTU of the interface the route to `host` uses; a wildcard
+/// host = the default route.  0 = unknown.  `ipv6` reports the route's family.
+[[nodiscard]] int32_t probeInterfaceMtu(const std::string& host, bool& ipv6);
+
 /// Parses Linux ip_local_reserved_ports ("8000-8100,9092"; "" = none) into
 /// inclusive ranges; malformed items are skipped.  PURE.
 [[nodiscard]] std::vector<std::pair<int32_t, int32_t>> parseReservedPorts(std::string_view text);

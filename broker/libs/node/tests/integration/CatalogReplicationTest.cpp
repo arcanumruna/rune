@@ -16,6 +16,9 @@
 #include "support/CatalogBrokerCluster.h"
 
 #include <rune/node/AdminIsrChannel.h>
+#include <cstdlib>
+#include <fstream>
+#include <string_view>
 #include <rune/node/BrokerNode.h>
 #include <rune/node/CatalogCheckpoint.h>
 #include <rune/node/CatalogPartition.h>
@@ -710,4 +713,46 @@ TEST(CatalogAlterIsrRelayRegression, ARetiredSchemaRoleFrameIsRefusedNotAppliedR
     (void)rig.agent->doWork(1'000'000);
     EXPECT_EQ(rig.agent->badRoleFramesForTest(), 1u);
     EXPECT_NE(rig.replica->role(), rr::Role::Leader) << "the retired role must not make the catalog replica lead";
+}
+
+// ===========================================================================
+// DR-bugs fix round 1, review A-I5: every fixed-port endpoint of the node driver (consensus, replication, client;
+// in fused shard mode worker 0's ingress / replication / egress control) is BOUND before the driver's first
+// publication auto-binds an ephemeral port.
+// ===========================================================================
+// Wiring (every platform): the anchors exist after start.  RED: no anchorFixedEndpoints_ call at start (0).
+TEST(BindOrderRegression, FixedEndpointsAreAnchoredAtStartRegression) {
+    ThreeNodes c = ThreeNodes::start("anchors", {1}, Mode::ShardFused);
+    EXPECT_EQ(c.node(1).bindAnchorsForTest(), 6u)
+        << "consensus + replication + client + shard ingress + shard replication subscriptions, egress control";
+}
+
+// The real proof (Linux gate, run in a container whose netns ephemeral range is NARROW — see
+// scripts/run-linux-regression-vm.sh): the node's fixed ports and its publications' ephemeral sockets come from
+// the same few dozen ports, so a fixed bind that happens after a publication loses its port most of the time.
+// Only node 1 runs (its peers are configured, so it publishes to them; one netns per node in production).
+// RED (anchors removed): most of the 20 starts refuse with "Address already in use".
+TEST(BindOrderRegression, FixedPortsBindBeforeAnyEphemeralPublicationRegression) {
+    const char* gate = std::getenv("RUNE_BIND_ORDER_GATE");
+    if (gate == nullptr || std::string_view(gate) != "1")
+        GTEST_SKIP() << "Linux gate only (RUNE_BIND_ORDER_GATE=1 inside a narrowed ip_local_port_range)";
+#if !defined(__linux__)
+    FAIL() << "RUNE_BIND_ORDER_GATE=1 off Linux";
+#else
+    std::ifstream in("/proc/sys/net/ipv4/ip_local_port_range");
+    long lo = 0, hi = 0;
+    ASSERT_TRUE(static_cast<bool>(in >> lo >> hi));
+    ASSERT_LE(hi - lo + 1, 64) << "the gate needs a narrow range to make the race likely: " << lo << "-" << hi;
+    int refused = 0;
+    std::string lastWhat;
+    for (int i = 0; i < 20; ++i) {
+        try {
+            ThreeNodes c = ThreeNodes::start("bindorder", {1}, Mode::ShardFused);
+        } catch (const std::exception& e) {
+            ++refused;
+            lastWhat = e.what();
+        }
+    }
+    EXPECT_EQ(refused, 0) << refused << " of 20 starts refused; last: " << lastWhat;
+#endif
 }

@@ -31,6 +31,7 @@
 #include <limits>
 #include <rune/gateway/SpillFifo.h>
 #include <rune/node/NodeConfig.h>
+#include <rune/node/HostDefaults.h>
 #include <rune/consensus/ControlRing.h>   // Task 9: tlsReloadRing_ (SIGHUP trigger)
 #include <rune/node/EmbeddedDriver.h>
 #include <rune/node/PeerResolverHub.h>
@@ -1602,6 +1603,16 @@ public:
     /// The config as resolved by start() (host-derived defaults applied).
     /// Start-thread / test use after start(); immutable afterwards.
     [[nodiscard]] const NodeConfig& effectiveConfigForTest() const noexcept { return config_; }
+    /// Review B-I2 test seams (cold).  setMtuProbeForTest before start(): the watchdog probes `f` instead of the
+    /// interface (and runs even on an all-loopback node).  runMtuWatchdogForTest: one forced probe ON the control
+    /// thread; returns the deficit after it.  mtuWatchdogEdgesForTest: {below edges, restored edges}.
+    void setMtuProbeForTest(std::function<int32_t()> f) { mtuProbeForTest_ = std::move(f); }
+    /// Review B-M5 test seam (cold, before start()): edits the probed host facts before they are applied.
+    void setHostNetFactsOverrideForTest(std::function<void(HostNetFacts&)> f) { hostFactsOverrideForTest_ = std::move(f); }
+    /// Review A-I5: the bind anchors resolved at start (subscriptions + MDC publications).
+    [[nodiscard]] std::size_t bindAnchorsForTest() const noexcept { return bindAnchorSubs_.size() + bindAnchorPubs_.size(); }
+    int32_t runMtuWatchdogForTest();
+    std::pair<uint64_t, uint64_t> mtuWatchdogEdgesForTest();
     [[nodiscard]] std::size_t shardDriverCountForTest() const noexcept {
         std::size_t n = 0;
         for (const auto& d : shardDrivers_) n += d ? 1u : 0u;
@@ -2021,6 +2032,34 @@ private:
     std::int64_t     unplaceablePublished_ = -1;
     std::int64_t     blockedCounterRegId_  = -1;   // Task 11 fix round 5 (M5)
     std::shared_ptr<aeron::Counter> blockedCounter_;
+    // DR-bugs fix round 1 (review B-I2): link-MTU watchdog — CONTROL thread only.  The probe host is resolved
+    // once at start (empty = every endpoint loopback: the watchdog is off); every kMtuProbePeriodNs the
+    // interface MTU of its route is compared with the Aeron MTU; an ERROR on the below edge, a WARN on the
+    // restore edge, never in between; the deficit is the live counter.
+    static constexpr int64_t kMtuProbePeriodNs = 5'000'000'000LL;
+    std::string      mtuProbeHost_;
+    int64_t          nextMtuProbeNs_       = 0;
+    bool             mtuBelow_             = false;
+    int32_t          lastLinkMtu_          = 0;
+    int32_t          linkMtuDeficit_       = 0;
+    uint64_t         mtuBelowEdges_        = 0;
+    uint64_t         mtuRestoredEdges_     = 0;
+    std::int64_t     linkMtuCounterRegId_  = -1;
+    std::shared_ptr<aeron::Counter> linkMtuCounter_;
+    std::function<int32_t()> mtuProbeForTest_;   ///< cold test seam (setMtuProbeForTest)
+    std::function<void(HostNetFacts&)> hostFactsOverrideForTest_;   ///< cold test seam (B-M5)
+    int checkLinkMtu_(int64_t nowNs, bool force);
+    // Review A-I5 (fix round 1): bind anchors — every fixed-port receive endpoint (and per-worker MDC egress
+    // control endpoint) of a driver is BOUND before that driver's first publication auto-binds an ephemeral
+    // port.  An anchor shares the component's exact channel (so its endpoint) on a reserved stream no
+    // publisher ever uses: no image, no back-pressure.  Held until stop().
+    static constexpr int32_t kBindAnchorStreamId = 0x7E5E0A7E;
+    std::vector<std::shared_ptr<aeron::Subscription>>         bindAnchorSubs_;
+    std::vector<std::shared_ptr<aeron::ExclusivePublication>> bindAnchorPubs_;
+    void anchorFixedEndpoints_(const std::shared_ptr<aeron::Aeron>& client, const std::vector<std::string>& subs,
+                               const std::vector<std::string>& pubs, rune::aeronutil::AeronPump& pump,
+                               const char* where);
+    void releaseBindAnchors_() noexcept { bindAnchorPubs_.clear(); bindAnchorSubs_.clear(); }
     std::int64_t     blockedPublished_     = -1;
     /// Control thread: a halted broker never drives catalog placement — it
     /// reports its halt to every member (never a placement target) and, while it

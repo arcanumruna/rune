@@ -297,13 +297,20 @@ void BrokerNode::start() {
     // one line.  The line is emitted at WARN so it is visible in perf runs too
     // (RUNE_LOG_LEVEL=warn) — it proves which config a measurement ran.
     {
-        const auto facts = probeHostNetFacts(nodeEndpointHosts(config_), config_.effectiveAeronDir());
+        auto facts = probeHostNetFacts(nodeEndpointHosts(config_), config_.effectiveAeronDir());
+        if (hostFactsOverrideForTest_) hostFactsOverrideForTest_(facts);   // B-M5 test seam (cold)
         const char* io   = std::getenv(kIoBackendEnv);
         const auto hd    = applyHostDerivedDefaults(config_, facts,
                                                     (io && *io) ? std::string_view(io) : std::string_view("auto"));
         spdlog::warn("BrokerNode[{}]: effective config: {}", config_.nodeId, hd.summary);
         if (!hd.warnings.empty())
             spdlog::warn("BrokerNode[{}]: !!! TRANSPORT CONFIG WARNING: {}", config_.nodeId, hd.warnings);
+        // Review B-I2: the link-MTU watchdog's probe host — the first endpoint datagrams leave through a real
+        // interface for (non-loopback); the wildcard maps to the default route in probeInterfaceMtu.  Computed
+        // once (no allocation on the periodic probe).
+        mtuProbeHost_.clear();
+        for (const auto& h : nodeEndpointHosts(config_))
+            if (!isLoopbackHost(h)) { mtuProbeHost_ = h; break; }
     }
 
     // Spec §3.3: shard-mode misconfiguration is a HARD startup refusal, before any
@@ -533,6 +540,30 @@ void BrokerNode::start() {
         blockedCounterRegId_ = aeron_->addCounter(
             kCatalogBlockedPartitionsCounterTypeId, roleKey, kRoleKeyLength,
             catalogBlockedPartitionsLabel(config_.nodeId));
+        linkMtuCounterRegId_ = aeron_->addCounter(
+            kLinkMtuDeficitCounterTypeId, roleKey, kRoleKeyLength, linkMtuDeficitLabel(config_.nodeId));
+
+        // Review A-I5: bind every fixed port of the NODE driver before its first publication (consensus /
+        // replication / gateway publications auto-bind ephemeral ports; one could take a later fixed bind).
+        // Fused shard mode runs worker 0 on this driver: its shard ports are anchored here too.
+        std::vector<std::string> subs, pubs;
+        subs.push_back(config_.selfConsensusBindChannel());
+        if (const std::string r = config_.selfReplicationBindChannel(); !r.empty()) subs.push_back(r);
+        if (!config_.clientEndpoint.channel.empty()) subs.push_back(config_.clientEndpoint.channel);
+        const int32_t W = config_.workerCount >= 1 ? config_.workerCount : 1;
+        const std::string egHost = config_.effectiveWorkerEgressControlHost();
+        if (config_.shardMode() && config_.fused()) {
+            subs.push_back(config_.shardIngressBindChannel(0));
+            subs.push_back(config_.shardReplBindChannel(0));
+            pubs.push_back("aeron:udp?control-mode=dynamic|control=" + egHost + ":" +
+                           std::to_string(config_.effectiveWorkerEgressControlBasePort()));
+        } else if (!config_.shardMode() && config_.perWorkerEgressEnabled) {
+            for (int32_t w = 0; w < W; ++w)
+                pubs.push_back("aeron:udp?control-mode=dynamic|control=" + egHost + ":" +
+                               std::to_string(config_.effectiveWorkerEgressControlBasePort() + w));
+        }
+        rune::aeronutil::AeronPump threadedPump;   // the node driver runs its own threads / the startup pump here
+        anchorFixedEndpoints_(aeron_, subs, pubs, threadedPump, "node driver");
     }
     const auto t2 = sclock::now();
 
@@ -1716,14 +1747,16 @@ void BrokerNode::buildWorkerPool() {
             workerEgresses_.reserve(static_cast<std::size_t>(wc));
             for (int32_t i = 0; i < wc; ++i) {
                 const int32_t     egStream = egressBase + i;
-                const std::string control  = config_.workerEgressControlHost + ":" +
+                const std::string control  = config_.effectiveWorkerEgressControlHost() + ":" +
                     std::to_string(config_.effectiveWorkerEgressControlBasePort() + i);
                 auto eg = std::make_unique<WorkerEgress>(aeron_, control, egStream);
                 if (!eg->resolved()) {
-                    spdlog::warn("BrokerNode[{}]: WorkerEgress for worker {} on stream {} "
-                                 "control {} did not resolve (Aeron registration error or driver timeout) — per-worker egress "
-                                 "disabled for this worker",
-                                 config_.nodeId, i, egStream, control);
+                    // Review B-M1: never a silent WARN-and-disable (that worker would quietly drop to legacy
+                    // egress) — the same rule as the shard path: refuse to start, naming the control endpoint.
+                    throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: per-worker "
+                        "egress for worker " + std::to_string(i) + " (stream " + std::to_string(egStream) +
+                        ", control " + control + ") did not resolve — refusing to start (would silently fall back "
+                        "to legacy egress; a taken control port: see the startup ephemeral-range WARN)");
                 } else {
                     spdlog::info("BrokerNode[{}]: WorkerEgress for worker {} wired on stream {} "
                                  "(dynamic-MDC control={})",
@@ -3640,6 +3673,7 @@ void BrokerNode::stop() {
     //         replTransport_ owns Aeron Subscription + ExclusivePublications
     //    BR-3b teardown ordering: AgentRunner stop → release gateway/nodeAgent/ingress/sink
     //    → close aeron → stop driver.
+    releaseBindAnchors_();    // A-I5: the anchors hold no state (released while every client is alive)
     runtimeAgent_.reset();    // composite agent (holds refs to inner agent + gateway + replication)
     workerPool_.reset();      // E1: holds non-owning replica ptrs; drop before replicaRegistry_ frees them
     // TX-3: destroy txn coordination service before gateway (holds gateway* + txnState*).
@@ -3731,6 +3765,7 @@ void BrokerNode::stop() {
     catalogHaltedCounter_.reset();  // catalog history Task 7: same rule
     unplaceableCounter_.reset();    // Task 11 fix round 1
     blockedCounter_.reset();        // Task 11 fix round 5 (M5)
+    linkMtuCounter_.reset();        // B-I2: released before aeron_
     catalogAppliedCounter_.reset();
     for (auto& c : provCounters_) c.reset();   // re-review N4: same rule (the provisioner is stopped)
 
@@ -3894,6 +3929,8 @@ int BrokerNode::serviceAdminControl_() {
     work += publishCatalogRoute_(leaderNow);
     work += publishPlacementView_();
     work += reportUnbuildableReplicas_();
+    work += checkLinkMtu_(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch()).count(), /*force=*/false);
 
     // (1b) admin → control ring (F3 round 6/7, ported into T11's direct-call
     //      control plane):
@@ -4169,6 +4206,100 @@ int BrokerNode::publishCatalogRoute_(bool consensusLeader) {
     gateway_->setCatalogRoute(std::move(route));
     catalogRoutePublished_ = PublishedCatalogRoute{kind, key};
     return 1;
+}
+
+// ---------------------------------------------------------------------------
+// Review B-I2: link-MTU watchdog (CONTROL thread).  A link MTU below the Aeron MTU + IP/UDP header is a silent
+// condition otherwise: outbound GSO batches fall back to IP fragmentation (rune_gso_bindings), and INBOUND
+// datagrams above the link MTU from peers / clients are dropped by the kernel with no signal (produces time out,
+// followers leave the ISR).  Edge-triggered: one ERROR when it goes below, one WARN when it is restored.
+// ---------------------------------------------------------------------------
+int BrokerNode::checkLinkMtu_(int64_t nowNs, bool force) {
+    if (mtuProbeHost_.empty() && !mtuProbeForTest_) return 0;   // every endpoint loopback: off
+    if (!force && nowNs < nextMtuProbeNs_) [[likely]] return 0;
+    nextMtuProbeNs_ = nowNs + kMtuProbePeriodNs;
+    bool v6 = false;
+    const int32_t m = mtuProbeForTest_ ? mtuProbeForTest_() : probeInterfaceMtu(mtuProbeHost_, v6);
+    if (m <= 0) return 0;   // unknown: no edge
+    lastLinkMtu_ = m;
+    const MtuCheck chk = checkLinkMtu(m, config_.aeronMtuBytes, v6);
+    if (chk.below && !mtuBelow_) {
+        mtuBelow_ = true;
+        ++mtuBelowEdges_;
+        const int32_t hdr = v6 ? kIpv6UdpHeaderBytes : kIpv4UdpHeaderBytes;
+        spdlog::error("BrokerNode[{}]: link MTU {} on the path to {} is below the Aeron MTU {} + {}: outbound GSO "
+                      "batches fall back to IP fragmentation, and INBOUND datagrams above {} from peers/clients "
+                      "are DROPPED by the kernel (produces time out, followers leave the ISR) — set "
+                      "RUNE_AERON_MTU={} on every node, or restore the link MTU",
+                      config_.nodeId, m, mtuProbeHost_.empty() ? std::string("<test probe>") : mtuProbeHost_,
+                      config_.aeronMtuBytes, hdr, m, m - hdr);
+    } else if (!chk.below && mtuBelow_) {
+        mtuBelow_ = false;
+        ++mtuRestoredEdges_;
+        spdlog::warn("BrokerNode[{}]: link MTU restored to {} (>= Aeron MTU {} + header) — transports whose UDP GSO "
+                     "fell back to plain sends recover per destination (rune-gso re-probes)",
+                     config_.nodeId, m, config_.aeronMtuBytes);
+    }
+    linkMtuDeficit_ = chk.below ? chk.needed - m : 0;
+    if (!linkMtuCounter_ && linkMtuCounterRegId_ >= 0 && aeron_) {
+        try { linkMtuCounter_ = aeron_->findCounter(linkMtuCounterRegId_); } catch (...) { linkMtuCounter_.reset(); }
+    }
+    if (linkMtuCounter_) linkMtuCounter_->set(linkMtuDeficit_);
+    return 1;
+}
+
+// Review A-I5: see BrokerNode.h (bindAnchorSubs_).  A fixed port that cannot be bound is a refusal naming the
+// port's channel and the sysctl that reserves it (Aeron's own error says only "Address already in use").
+void BrokerNode::anchorFixedEndpoints_(const std::shared_ptr<aeron::Aeron>& client,
+                                       const std::vector<std::string>& subs, const std::vector<std::string>& pubs,
+                                       rune::aeronutil::AeronPump& pump, const char* where) {
+    auto refuse = [&](const std::string& ch, const std::string& why) {
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: fixed endpoint " + ch +
+                                 " (" + where + ") could not be bound: " + why + " — refusing to start (a port "
+                                 "inside the kernel's ephemeral range can be taken first: see the startup WARN; "
+                                 "reserve it with sysctl net.ipv4.ip_local_reserved_ports)");
+    };
+    for (const auto& ch : subs) {
+        bool failed = false;
+        std::string err;
+        std::shared_ptr<aeron::Subscription> s;
+        try {
+            const int64_t reg = client->addSubscription(ch, kBindAnchorStreamId);
+            s = pump.resolve([&]() -> std::shared_ptr<aeron::Subscription> {
+                try { return client->findSubscription(reg); }
+                catch (const std::exception& e) { err = e.what(); failed = true; return nullptr; }
+            }, rune::aeronutil::AeronPump::kUntilAnswered, &failed);
+        } catch (const std::exception& e) { err = e.what(); }
+        if (!s) refuse(ch, err.empty() ? std::string("not resolved") : err);
+        bindAnchorSubs_.push_back(std::move(s));
+    }
+    for (const auto& ch : pubs) {
+        bool failed = false;
+        std::string err;
+        std::shared_ptr<aeron::ExclusivePublication> p;
+        try {
+            const int64_t reg = client->addExclusivePublication(ch, kBindAnchorStreamId);
+            p = pump.resolve([&]() -> std::shared_ptr<aeron::ExclusivePublication> {
+                try { return client->findExclusivePublication(reg); }
+                catch (const std::exception& e) { err = e.what(); failed = true; return nullptr; }
+            }, rune::aeronutil::AeronPump::kUntilAnswered, &failed);
+        } catch (const std::exception& e) { err = e.what(); }
+        if (!p) refuse(ch, err.empty() ? std::string("not resolved") : err);
+        bindAnchorPubs_.push_back(std::move(p));
+    }
+}
+
+int32_t BrokerNode::runMtuWatchdogForTest() {
+    return static_cast<int32_t>(onControlThreadForTest([this]() -> int64_t {
+        (void)checkLinkMtu_(0, /*force=*/true);
+        return linkMtuDeficit_;
+    }));
+}
+
+std::pair<uint64_t, uint64_t> BrokerNode::mtuWatchdogEdgesForTest() {
+    const int64_t b = onControlThreadForTest([this]() -> int64_t { return static_cast<int64_t>(mtuBelowEdges_); });
+    const int64_t r = onControlThreadForTest([this]() -> int64_t { return static_cast<int64_t>(mtuRestoredEdges_); });
+    return {static_cast<uint64_t>(b), static_cast<uint64_t>(r)};
 }
 
 int BrokerNode::reportUnbuildableReplicas_() {
@@ -4859,6 +4990,16 @@ void BrokerNode::attachShardRuntimes_() {
             // configured time (pumping exactly as a real slow resolve would).
             (void)pump.resolve([] { return false; }, shardResolveStallForTest_);
         }
+        // Review A-I5: a shard on its OWN driver (thread placement) binds its fixed ports before its first
+        // publication (the replication plane's peer publications below).  Fused worker 0 shares the node
+        // driver: anchored at start.
+        if (shardClients_[idx] != aeron_) {
+            std::vector<std::string> subs{config_.shardIngressBindChannel(w), config_.shardReplBindChannel(w)};
+            std::vector<std::string> pubs{"aeron:udp?control-mode=dynamic|control=" +
+                                          config_.effectiveWorkerEgressControlHost() + ":" +
+                                          std::to_string(egressControlBase + w)};
+            anchorFixedEndpoints_(shardClients_[idx], subs, pubs, pump, "shard driver");
+        }
         if (!perWorkerReplTransports_.empty()) {
             std::vector<std::pair<rune::replication::NodeId, std::string>> peersW;
             std::vector<rune::replication::NodeId> peerIds;
@@ -4897,7 +5038,7 @@ void BrokerNode::attachShardRuntimes_() {
         // client lands there).  Legacy per-worker ingress keeps base + w.
         auto ing = std::make_unique<WorkerIngress>(shardClients_[idx], config_.shardIngressBindChannel(w),
                                                    config_.clientEndpoint.streamId, pump);
-        const std::string control = config_.workerEgressControlHost + ":" + std::to_string(egressControlBase + w);
+        const std::string control = config_.effectiveWorkerEgressControlHost() + ":" + std::to_string(egressControlBase + w);
         auto eg = std::make_unique<WorkerEgress>(shardClients_[idx], control, egressBase + w, pump);
         if (!ing->resolved() || !eg->resolved())
             throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: shard " +
