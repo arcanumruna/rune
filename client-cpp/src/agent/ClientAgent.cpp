@@ -505,7 +505,7 @@ transport::AeronTransport::OfferResult ClientAgent::offerIngress_(const uint8_t*
     // transmitted, and the caller's own retry (ring record stays at head /
     // Client's unsent-frame park) re-offers the ORIGINAL plaintext buf next
     // cycle — a fresh seal attempt, not a replay of a stale ciphertext.
-    if (!sealForDestination_(seedSession().machine.cryptoState(), buf, len)) {
+    if (!sealForDestination_(seedSession().machine, buf, len)) {
         return transport::AeronTransport::OfferResult::Retry;  // seal failed — DROP, do not transmit
     }
     return transport_.offerResult(buf, len);
@@ -908,19 +908,22 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
         auto opt = codec::decodeHandshakeContinueResponse(buf, len);
         if (!opt) break;
         Session& s = sessionForConnectCorrId(opt->correlationId);
-        const bool wasHandshaking = s.machine.state() == session::SessionState::Handshaking;
+        const bool awaited = s.machine.state() == session::SessionState::Handshaking &&
+                             s.machine.correlationId() == opt->correlationId;
         s.machine.onHandshakeContinueResponse(opt->code, opt->handshakeBytes, opt->correlationId, nowNs);
         s.machine.onActivity(nowNs);
-        if (wasHandshaking && s.machine.state() == session::SessionState::Connected) {
+        // Fix round 4: the observer reads THIS leg's verdict — never one left over
+        // from an earlier ConnectResponse (a non-final leg accepts nothing).
+        lastConnectAwaited_  = awaited;
+        lastConnectAccepted_ = awaited && s.machine.state() == session::SessionState::Connected;
+        lastConnectSession_  = 0;
+        for (uint32_t i = 0; i < sessions_.size(); ++i) {
+            if (sessions_[i].get() == &s) { lastConnectSession_ = i; break; }
+        }
+        if (lastConnectAccepted_) {
             // The handshake just finished on this leg — mirror the ConnectResponse
             // case's "new connect episode" bookkeeping (brokerVersion was already
             // recorded on the first leg, above).
-            lastConnectAccepted_ = true;
-            lastConnectAwaited_  = true;
-            lastConnectSession_  = 0;
-            for (uint32_t i = 0; i < sessions_.size(); ++i) {
-                if (sessions_[i].get() == &s) { lastConnectSession_ = i; break; }
-            }
             ++s.connectEpoch;
             if (routeIndex_.size() != 0 && produceResendFn_) {
                 produceResendFn_();
@@ -1154,7 +1157,7 @@ bool ClientAgent::offerControlTo(Session& owner, const uint8_t* buf, std::size_t
     // while encrypted==false) and are defensively exempt by templateId too
     // (see sealForDestination_).  Plaintext path (crypto off) is byte-
     // identical to before Task 6b.
-    if (!sealForDestination_(owner.machine.cryptoState(), buf, len)) {
+    if (!sealForDestination_(owner.machine, buf, len)) {
         return false;  // seal failed — DROP, do not transmit
     }
     // The seed → the default publication (wherever it points: byte-identical
@@ -1358,7 +1361,7 @@ transport::AeronTransport::OfferResult ClientAgent::offerOnSession(uint32_t inde
     // e.g. GroupConsumerHub's fetch routing, stamps it from
     // router_.sessionId(target) before encoding, same as offerControlTo's
     // callers).  Plaintext path (crypto off) is byte-identical to before.
-    if (!sealForDestination_(sessions_[index]->machine.cryptoState(), buf, len)) {
+    if (!sealForDestination_(sessions_[index]->machine, buf, len)) {
         ++ingressOfferRefused_;
         return R::Retry;  // seal failed — DROP, do not transmit
     }
@@ -1463,16 +1466,24 @@ SealedFrame sealForOffer(transport::AeronTransport& transport, session::CryptoSt
 /// it to true — see finishHandshake_ in SessionMachine.h), then seals via the
 /// shared sealForOffer/sealScratch mechanics.  Returns false iff the frame
 /// must be DROPPED (seal failure) — callers must not transmit in that case.
-bool ClientAgent::sealForDestination_(session::CryptoState& crypto,
+bool ClientAgent::sealForDestination_(session::SessionMachine& m,
                                       const uint8_t*& buf, std::size_t& len) noexcept {
+    session::CryptoState& crypto = m.cryptoState();
+    const bool handshakeFrame =
+        len >= rune::protocol::client::MessageHeader::ENCODED_SIZE &&
+        [&] {
+            const auto tid = static_cast<codec::TemplateId>(
+                rune::protocol::client::detail::getLE16(buf, 2));
+            return tid == codec::TemplateId::Connect || tid == codec::TemplateId::HandshakeContinue;
+        }();
+    if (handshakeFrame) return true;  // handshake frame: never sealed
+    // Fix round 4 (TLS handshake class): under offerCrypto the session's mode is
+    // negotiated by its handshake — until it is Connected no frame may leave it
+    // (plaintext under require_tls is refused by the broker; under offered it
+    // would bypass the mode the handshake is about to choose).  The caller treats
+    // this like a refused offer: its own Connected-edge resend recovers it.
+    if (m.offersCrypto() && m.state() != session::SessionState::Connected) [[unlikely]] return false;
     if (!crypto.encrypted) return true;  // plaintext session: nothing to do
-    if (len >= rune::protocol::client::MessageHeader::ENCODED_SIZE) {
-        const auto tid = static_cast<codec::TemplateId>(
-            rune::protocol::client::detail::getLE16(buf, 2));
-        if (tid == codec::TemplateId::Connect || tid == codec::TemplateId::HandshakeContinue) {
-            return true;  // handshake frame: never sealed, defensively
-        }
-    }
     const SealedFrame sealed = sealForOffer(transport_, crypto, buf, len);
     if (sealed.len == 0) return false;  // seal failed — DROP, do not transmit
     buf = sealed.buf;

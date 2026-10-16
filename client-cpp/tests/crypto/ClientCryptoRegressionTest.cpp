@@ -43,6 +43,7 @@
 #include <rune/crypto/TlsSession.h>
 
 #include <cstring>
+#include <optional>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -853,4 +854,157 @@ TEST(ClientCryptoRegression, AMoveToAnotherBrokerAbandonsTheResumeHintAndNegotia
     EXPECT_EQ(req->sessionId, 0) << "no resume hint for another broker";
     EXPECT_FALSE(req->handshakeBytes.empty()) << "a fresh ClientHello, never a plaintext request";
     EXPECT_FALSE(m.cryptoState().encrypted) << "the old session's keys are gone";
+}
+
+// ===========================================================================
+// DR client bugs fix round 4 (client-failover-review.md "Fix round 3 check":
+// N3-I1 and the TLS handshake class).  The broker never resumes (handleConnect
+// allocates a NEW session on every connect), so under offerCrypto EVERY
+// ConnectRequest — a resume on the same broker included — negotiates afresh.
+// ===========================================================================
+namespace {
+struct TlsMachine {
+    FakeIo io;
+    std::string serverPem = slurp(testdataPath("server.pem"));
+    std::string serverKey = slurp(testdataPath("server.key"));
+    std::string caPem     = slurp(testdataPath("ca.pem"));
+    sm::SessionConfig c;
+    std::optional<sm::SessionMachine> m;
+    int64_t now = 1'000'000'000LL;
+    explicit TlsMachine(bool require) {
+        c.egressChannel = "aeron:udp?endpoint=client:40456";
+        c.offerCrypto = true; c.requireCrypto = require; c.tlsTrustPem = caPem; c.tlsExpectHost = "localhost";
+        c.reconnectForeverAfterLive = true;
+        m.emplace(io, c);
+    }
+    cr::TlsSession server() { return cr::TlsSession::makeServer(serverPem.c_str(), serverKey.c_str()); }
+    /// Drive a NEW broker's handshake from the request at io.sends[from]; true = Connected + encrypted
+    /// under keys that broker holds (a frame the client seals opens on that broker).
+    bool completeFrom(std::size_t from, int64_t sid) {
+        auto srv = server();
+        std::size_t next = from;
+        for (int leg = 0; leg < 20; ++leg) {
+            if (next >= io.sendCount()) break;
+            const auto& frame = io.sends[next++];
+            std::string_view peer; int64_t corr = 0; uint8_t cipher = 0;
+            if (leg == 0) {
+                auto r = cc::decodeConnectRequest(frame.data(), frame.size());
+                if (!r || r->handshakeBytes.empty() || r->cipherList.empty()) return false;
+                peer = r->handshakeBytes; corr = r->correlationId; cipher = r->cipherList[0];
+            } else {
+                auto hc = cc::decodeHandshakeContinue(frame.data(), frame.size());
+                if (!hc) return false;
+                peer = hc->handshakeBytes; corr = hc->correlationId;
+            }
+            if (srv.readInbound(reinterpret_cast<const uint8_t*>(peer.data()), peer.size()) == cr::HsState::Failed)
+                return false;
+            uint8_t out[16384];
+            const std::size_t n = srv.writeOutbound(out, sizeof out);
+            const std::string_view ov(reinterpret_cast<const char*>(out), n);
+            if (leg == 0) m->onConnectResponse(0, -1, sid, corr, now + 1, cipher, ov);
+            else if (m->state() == sm::SessionState::Handshaking) m->onHandshakeContinueResponse(0, ov, corr, now + 1);
+            if (m->state() == sm::SessionState::Connected && srv.done()) break;
+        }
+        if (m->state() != sm::SessionState::Connected || !srv.done() || !m->cryptoState().encrypted) return false;
+        sm::CryptoState broker = brokerSideCryptoStateFor(srv, *m, sid);
+        const auto plain = buildPlainProduceFrame(sid, 9, "hello");
+        uint8_t sealed[256], opened[256];
+        const std::size_t sn = cc::sealFrame(m->cryptoState(), plain.data(), plain.size(), sealed, sizeof sealed);
+        return sn > 0 && cc::openEgressFrame(broker, sealed, sn, opened, sizeof opened) > 0;
+    }
+    /// The resume request just sent: carries a fresh ClientHello + the resume hint, and the old keys are gone.
+    void expectFreshTlsResume(std::size_t before, int64_t oldSid) {
+        ASSERT_GT(io.sendCount(), before) << "a resume ConnectRequest";
+        auto req = cc::decodeConnectRequest(io.last().data(), io.last().size());
+        ASSERT_TRUE(req.has_value());
+        EXPECT_EQ(req->sessionId, oldSid) << "the resume hint stays in the request (the broker ignores it)";
+        EXPECT_FALSE(req->handshakeBytes.empty()) << "a plaintext resume: a require_tls broker answers HandshakeFailed";
+        EXPECT_FALSE(req->cipherList.empty());
+        EXPECT_FALSE(m->cryptoState().encrypted) << "the old session's keys survived into the new session";
+    }
+};
+}  // namespace
+
+// N3-I1: a broker-sent SessionExpired (the F-A lease-reap notice after a client stall) on
+// the SAME broker: the resume negotiates crypto afresh and the new session is encrypted
+// under the new broker session's keys.  Both requireCrypto and offered-not-required.
+// RED (round 3's `sessionId_ == 0` rule): a plaintext resume keeping the old keys.
+TEST(ClientCryptoRegression, SessionExpiredResumeOnTheSameBrokerNegotiatesCryptoAfreshRegression) {
+    for (const bool require : {true, false}) {
+        SCOPED_TRACE(require ? "requireCrypto" : "offered, not required");
+        TlsMachine t(require);
+        t.m->connect(t.now);
+        ASSERT_TRUE(t.completeFrom(0, 42));
+        namespace rpc = rune::protocol::client;
+        t.m->onErrorResponse(static_cast<int16_t>(rpc::ErrorCode::SessionExpired), "", 0, t.now += 1'000'000, 42);
+        ASSERT_EQ(t.m->state(), sm::SessionState::Resuming);
+        const std::size_t before = t.io.sendCount();
+        t.m->tick(t.now += 1'000'000);
+        ASSERT_EQ(t.m->state(), sm::SessionState::Connecting);
+        t.expectFreshTlsResume(before, 42);
+        EXPECT_TRUE(t.completeFrom(t.io.sendCount() - 1, 43)) << "the same broker's new session is encrypted";
+    }
+}
+
+// N3-I1: an own-stall loss (the broker went silent past responseTimeout; no failover move)
+// resumes on the same broker: fresh TLS, never plaintext / the old keys.
+TEST(ClientCryptoRegression, OwnStallResumeNegotiatesCryptoAfreshRegression) {
+    for (const bool require : {true, false}) {
+        SCOPED_TRACE(require ? "requireCrypto" : "offered, not required");
+        TlsMachine t(require);
+        t.m->connect(t.now);
+        ASSERT_TRUE(t.completeFrom(0, 42));
+        t.m->tick(t.now += 1'000'000);
+        t.m->tick(t.now += t.c.responseTimeoutNs + 1);
+        ASSERT_EQ(t.m->state(), sm::SessionState::Resuming);
+        const std::size_t before = t.io.sendCount();
+        t.m->tick(t.now += 1'000'000);
+        t.expectFreshTlsResume(before, 42);
+        EXPECT_TRUE(t.completeFrom(t.io.sendCount() - 1, 43));
+    }
+}
+
+// Fix round 4: one TLS episode per ConnectRequest — a new request (a timeout retry under
+// a new correlationId) carries a NEW ClientHello, while a fast retry of the SAME request
+// re-sends that request's own.  RED (an episode kept across requests): the timeout retry
+// replays the previous request's ClientHello.
+TEST(ClientCryptoRegression, EveryConnectRequestCarriesItsOwnTlsEpisodeRegression) {
+    TlsMachine t(/*require=*/true);
+    t.m->connect(t.now);
+    auto first = cc::decodeConnectRequest(t.io.last().data(), t.io.last().size());
+    ASSERT_TRUE(first.has_value());
+    const std::string hello1(first->handshakeBytes);
+    ASSERT_FALSE(hello1.empty());
+    t.m->tick(t.now + t.c.connectTimeoutNs + 1);   // no answer: a timeout retry (a new request)
+    auto second = cc::decodeConnectRequest(t.io.last().data(), t.io.last().size());
+    ASSERT_TRUE(second.has_value());
+    ASSERT_NE(second->correlationId, first->correlationId);
+    EXPECT_FALSE(second->handshakeBytes.empty());
+    EXPECT_NE(std::string(second->handshakeBytes), hello1) << "a new request replayed the old ClientHello";
+    // And the new request's handshake completes.
+    t.now += t.c.connectTimeoutNs + 2;
+    EXPECT_TRUE(t.completeFrom(t.io.sendCount() - 1, 42));
+}
+
+// Fix round 4: crypto REQUIRED and the local TLS cannot be built (a broken trust bundle):
+// never a plaintext ConnectRequest — terminal Rejected(HandshakeFailed).  RED (before):
+// a plaintext request is sent ("degrade" fallback) and the session waits for its answer.
+TEST(ClientCryptoRegression, RequiredCryptoWithoutLocalTlsNeverSendsAPlaintextConnectRegression) {
+    FakeIo io;
+    sm::SessionConfig c;
+    c.egressChannel = "aeron:udp?endpoint=client:40456";
+    c.offerCrypto = true; c.requireCrypto = true;
+    c.tlsTrustPem = std::string("-----BEGIN CERTIFICATE-----\nnot a certificate\n-----END CERTIFICATE-----\n");
+    c.tlsExpectHost = "localhost";
+    if (cr::TlsSession::makeClient(c.tlsTrustPem->c_str(), "localhost").valid())
+        GTEST_SKIP() << "this TLS build accepts the broken bundle";
+    sm::SessionMachine m(io, c);
+    m.connect(1'000'000'000LL);
+    for (std::size_t i = 0; i < io.sendCount(); ++i) {
+        auto r = cc::decodeConnectRequest(io.sends[i].data(), io.sends[i].size());
+        EXPECT_FALSE(r.has_value() && r->handshakeBytes.empty()) << "a plaintext ConnectRequest left";
+    }
+    m.tick(1'000'000'001LL);
+    EXPECT_EQ(m.state(), sm::SessionState::Rejected);
+    EXPECT_EQ(m.rejectCode(), static_cast<int16_t>(rune::protocol::client::ErrorCode::HandshakeFailed));
 }

@@ -1394,6 +1394,8 @@ private:
     void sweepControl_(int64_t nowNs);
     void failAllControl_(OpStatus st);
     void completeConnect_(OpStatus st, int64_t value, uint16_t errorCode, std::string_view text);
+    /// Fix round 4: the seed's Connected edge — every connect-time action, once.
+    void onSeedConnected_(int64_t sessionId, int32_t brokerVersion);
     /// A blocking call (`what`) must not run where it could never complete:
     /// Invoker mode — only the owner thread, outside a duty-cycle callback;
     /// Thread mode — never on the runner thread.  std::logic_error otherwise.

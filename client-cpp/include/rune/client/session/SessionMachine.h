@@ -318,6 +318,9 @@ public:
     /// reused EVP_CIPHER_CTX per call), so the Task 6 data-path seal/open seams
     /// (and this task's own round-trip test) need write access to send/recv.
     [[nodiscard]] CryptoState& cryptoState() noexcept { return cryptoState_; }
+    /// Fix round 4: this session offers crypto — its negotiated mode is only known
+    /// once Connected, so no non-handshake frame may leave it before then.
+    [[nodiscard]] bool offersCrypto() const noexcept { return cfg_.offerCrypto; }
 
     // ------------------------------------------------------------------------
     // External API — called by the application / CC-5 agent.
@@ -334,8 +337,7 @@ public:
             state_ == SessionState::Closed || state_ == SessionState::Rejected) return;
         sessionId_   = 0;
         cryptoState_ = CryptoState{};
-        tls_.reset();
-        hsBytes_.clear();
+        hs_.reset();
     }
 
     /// Transition Disconnected → Connecting (or re-try from Resuming).
@@ -393,7 +395,7 @@ public:
             if (sessionId_ != 0) {
                 sendDisconnect();
             }
-            tls_.reset();
+            hs_.reset();
             transitionTo(SessionState::Closed);
             return;
         }
@@ -435,16 +437,16 @@ public:
             lastActivityNs_ = nowNs;
 
             // Task 5: the broker chose a cipher -> crypto negotiated, continue the
-            // TLS handshake instead of completing the connect.  tls_ must be the
+            // TLS handshake instead of completing the connect.  hs_ must be the
             // live TlsSession this episode's ClientHello came from (beginCryptoHandshake_
             // in connect()/forceReconnect()); if it's missing (e.g. local TLS init
             // failed) a cipher-bearing answer can't be driven -> treat as a failure.
             if (chosenCipher != 0) {
-                if (!tls_) {
+                if (!hs_) {
                     onHandshakeFailed_(nowNs);
                     return;
                 }
-                chosenCipher_ = static_cast<rune::crypto::Cipher>(chosenCipher);
+                hs_->chosenCipher = static_cast<rune::crypto::Cipher>(chosenCipher);
                 transitionTo(SessionState::Handshaking);
                 onHandshakeBytes(reinterpret_cast<const uint8_t*>(handshakeBytes.data()),
                                   handshakeBytes.size(), nowNs);
@@ -463,7 +465,7 @@ public:
             }
 
             // Happy path — no crypto chosen (plaintext session, or a pre-v4 broker).
-            tls_.reset();
+            hs_.reset();
             finishConnected_(nowNs);
             return;
         }
@@ -544,8 +546,7 @@ public:
             // handshake) is a CONNECT failure, not a TLS one — the same path
             // as a ConnectResponse error in Connecting (retriable unless
             // ProtocolVersion), never a terminal mislabelled HandshakeFailed.
-            tls_.reset();
-            hsBytes_.clear();
+            hs_.reset();
             onConnectError_(ec, nowNs);
             return;
         }
@@ -563,20 +564,20 @@ public:
     /// onConnectResponse/onHandshakeContinueResponse already guard both before
     /// calling this).
     void onHandshakeBytes(const uint8_t* buf, std::size_t len, int64_t nowNs) noexcept {
-        if (state_ != SessionState::Handshaking || !tls_) return;
+        if (state_ != SessionState::Handshaking || !hs_) return;
 
-        const auto hs = tls_->readInbound(buf, len);
+        const auto hs = hs_->tls.readInbound(buf, len);
         if (hs == rune::crypto::HsState::Failed) {
             onHandshakeFailed_(nowNs);
             return;
         }
 
         drainHandshakeOutbound_();
-        if (!hsBytes_.empty()) {
+        if (!hs_->outbound.empty()) {
             sendHandshakeContinue_();
         }
 
-        if (tls_->done()) {
+        if (hs_->tls.done()) {
             finishHandshake_(nowNs);
         }
         // Else: waiting for more input from the broker (another
@@ -738,12 +739,8 @@ private:
         if (resetSessionId) {
             sessionId_ = 0;
         }
-        // Fix round 3 (N-I1): a connect that cannot resume on the same broker (no
-        // session id to resume) negotiates crypto AFRESH — never a plaintext request
-        // carrying, or a Connected session keeping, the OLD session's keys (a
-        // Backoff attempt's SessionExpired -> fresh connect, a shard failover move,
-        // a connect-time redirect of a fresh connect).  No-op when !offerCrypto.
-        if (sessionId_ == 0) beginCryptoHandshake_();
+        // Fix round 3 (N-I1) / round 4 (N3-I1): the request below negotiates crypto
+        // afresh under offerCrypto (sendConnectRequest_: one TLS episode per request).
         if (freshEpisode) {
             // FIX A + FIX C: reset all counters only on a fresh external connect().
             redirectCount_     = 0;
@@ -773,29 +770,40 @@ private:
         connectStartNs_      = nowNs;
         lastConnectSentNs_   = nowNs;   // DR-BUG-2: track send time for fast-retry
 
-        // Milestone-B scaffold: resume never carries crypto fields (tls_ is always
-        // empty here — it's reset once Connected, and Resuming is only reachable
-        // from Connected) — sendConnectRequest_() naturally takes the plain path.
+        // Fix round 4 (N3-I1): under offerCrypto the resume request begins a fresh TLS
+        // episode in sendConnectRequest_ (the broker allocates a new session anyway).
         sendConnectRequest_();
         transitionTo(SessionState::Connecting);
     }
 
     /// Encode + send the current ConnectRequest.  Branches on whether a crypto
-    /// handshake is in flight (tls_ engaged): with crypto, offers
-    /// cipherList={bestLocalCipher()} + the pending ClientHello bytes (hsBytes_,
+    /// handshake is in flight (hs_ engaged): with crypto, offers
+    /// cipherList={bestLocalCipher()} + the pending ClientHello bytes (hs_->outbound,
     /// drained by beginCryptoHandshake_()) + authToken, via the GROWABLE
     /// hsFrameBuf_ (kScratchCap=512 is not guaranteed to fit a TLS flight);
     /// without crypto, the original fixed-scratch encode (byte-identical to
     /// pre-Task-5 behaviour).  Sets connectSentOk_ either way.
     void sendConnectRequest_() noexcept {
-        // Fix round 3 (N-I1): ANY connect request with no session to resume (a resume
-        // hint abandoned by a move to another broker, a timeout retry after the
-        // handshake state was dropped) carries a fresh ClientHello — never plaintext
-        // under offerCrypto.
-        if (cfg_.offerCrypto && sessionId_ == 0 && !tls_) beginCryptoHandshake_();
-        if (tls_) {
+        // Fix round 4 (N3-I1): the broker never resumes — handleConnect allocates a
+        // NEW session on every connect, a resume too — so EVERY ConnectRequest under
+        // offerCrypto negotiates crypto afresh: never plaintext, never the old keys
+        // (the resume hint stays in the request; the broker ignores it).  A retry
+        // A fast retry of the SAME request (same correlationId: the broker may hold
+        // its pending connect) keeps its episode; every new request — a timeout
+        // retry, a redirect resend, a resume — begins its own.
+        if (cfg_.offerCrypto && (!hs_ || hs_->requestCorrelationId != correlationId_)) {
+            beginCryptoHandshake_();
+            if (hs_) hs_->requestCorrelationId = correlationId_;
+        }
+        if (cfg_.offerCrypto && cfg_.requireCrypto && !hs_) [[unlikely]] {
+            // Local TLS init failed while crypto is REQUIRED: never a plaintext
+            // request — tickConnecting turns this into terminal Rejected.
+            connectSentOk_ = false;
+            return;
+        }
+        if (hs_) {
             const uint8_t cipherByte = static_cast<uint8_t>(rune::crypto::bestLocalCipher());
-            const std::string_view hs(reinterpret_cast<const char*>(hsBytes_.data()), hsBytes_.size());
+            const std::string_view hs(reinterpret_cast<const char*>(hs_->outbound.data()), hs_->outbound.size());
             const std::size_t n = rune::client::codec::encodeConnectRequestCrypto(
                 hsFrameBuf_,
                 cfg_.egressChannel, cfg_.egressStreamId,
@@ -822,59 +830,54 @@ private:
     }
 
     /// client<->broker TLS/AEAD (Task 5): construct a fresh client-role TlsSession
-    /// for a new connect episode and pump its ClientHello into hsBytes_.  Cold
-    /// path (once per connect episode) — heap growth here (hsBytes_/hsFrameBuf_)
+    /// for a new connect episode and pump its ClientHello into hs_->outbound.  Cold
+    /// path (once per connect episode) — heap growth here (hs_->outbound/hsFrameBuf_)
     /// is explicitly out of the zero-alloc hot-path rule, which covers only the
     /// steady-state produce/subscribe path, not the once-per-connection handshake.
-    /// If local TLS construction fails (e.g. a misconfigured trust bundle), tls_
+    /// If local TLS construction fails (e.g. a misconfigured trust bundle), hs_
     /// stays empty and sendConnectRequest_() silently falls back to a plaintext
     /// offer — degrade, don't hard-fail a connect attempt over local TLS init.
     void beginCryptoHandshake_() noexcept {
         if (!cfg_.offerCrypto) return;  // toggle off — byte-identical pre-Task-5 connect
         cryptoState_ = CryptoState{};   // N-I1: no key of an earlier session survives a fresh episode
-        tls_.emplace(rune::crypto::TlsSession::makeClient(
-            cfg_.tlsTrustPem ? cfg_.tlsTrustPem->c_str() : nullptr,
-            cfg_.tlsExpectHost.c_str()));
-        if (!tls_->valid()) {
-            tls_.reset();
-            hsBytes_.clear();
-            return;
-        }
-        cryptoState_ = CryptoState{};
-        chosenCipher_ = rune::crypto::Cipher::None;
-        tls_->readInbound(nullptr, 0);  // kick off ClientHello generation
+        hs_.reset();
+        auto t = rune::crypto::TlsSession::makeClient(cfg_.tlsTrustPem ? cfg_.tlsTrustPem->c_str() : nullptr,
+                                                      cfg_.tlsExpectHost.c_str());
+        if (!t.valid()) return;
+        hs_.emplace(std::move(t));
+        hs_->tls.readInbound(nullptr, 0);  // kick off ClientHello generation
         drainHandshakeOutbound_();
     }
 
-    /// Pull every pending outbound handshake byte out of tls_ into hsBytes_
-    /// (growable — see beginCryptoHandshake_ comment).  Clears hsBytes_ first.
+    /// Pull every pending outbound handshake byte out of hs_->tls into hs_->outbound
+    /// (growable — see beginCryptoHandshake_ comment).  Clears hs_->outbound first.
     void drainHandshakeOutbound_() noexcept {
-        hsBytes_.clear();
+        hs_->outbound.clear();
         uint8_t chunk[4096];
         for (;;) {
-            const std::size_t n = tls_->writeOutbound(chunk, sizeof(chunk));
+            const std::size_t n = hs_->tls.writeOutbound(chunk, sizeof(chunk));
             if (n == 0) break;
-            hsBytes_.insert(hsBytes_.end(), chunk, chunk + n);
+            hs_->outbound.insert(hs_->outbound.end(), chunk, chunk + n);
         }
     }
 
-    /// Send hsBytes_ (already drained) as a HandshakeContinue frame, via the
+    /// Send hs_->outbound (already drained) as a HandshakeContinue frame, via the
     /// same growable hsFrameBuf_ used by sendConnectRequest_().
     void sendHandshakeContinue_() noexcept {
-        const std::string_view hs(reinterpret_cast<const char*>(hsBytes_.data()), hsBytes_.size());
+        const std::string_view hs(reinterpret_cast<const char*>(hs_->outbound.data()), hs_->outbound.size());
         const std::size_t n = rune::client::codec::encodeHandshakeContinue(
             hsFrameBuf_, hs, sessionId_, correlationId_);
         if (n > 0) {
             io_.sendFrame(hsFrameBuf_.data(), n);
         }
-        hsBytes_.clear();
+        hs_->outbound.clear();
     }
 
-    /// tls_->done(): export keys, build CryptoState.send/recv AeadCiphers, and
+    /// hs_->tls.done(): export keys, build CryptoState.send/recv AeadCiphers, and
     /// complete the connect episode.  A None cipher from exportKeys (TlsSession's
     /// documented fail-closed signal) is a handshake failure, not a connect.
     void finishHandshake_(int64_t nowNs) noexcept {
-        const rune::crypto::SessionKeys keys = tls_->exportKeys(chosenCipher_, sessionId_);
+        const rune::crypto::SessionKeys keys = hs_->tls.exportKeys(hs_->chosenCipher, sessionId_);
         if (keys.cipher == rune::crypto::Cipher::None) {
             onHandshakeFailed_(nowNs);
             return;
@@ -888,7 +891,7 @@ private:
         cryptoState_.b2cKey = keys.b2c;
         std::memcpy(cryptoState_.b2cPrefix, keys.b2cPrefix, sizeof(cryptoState_.b2cPrefix));
         cryptoState_.encrypted = true;
-        tls_.reset();  // handshake object no longer needed once keys are exported
+        hs_.reset();  // handshake object no longer needed once keys are exported
         finishConnected_(nowNs);
     }
 
@@ -913,8 +916,7 @@ private:
     /// Non-retriable — Rejected, mirroring onConnectError_'s ProtocolVersion path.
     void onHandshakeFailed_(int64_t nowNs) noexcept {
         (void)nowNs;
-        tls_.reset();
-        hsBytes_.clear();
+        hs_.reset();
         rejectCode_ = static_cast<int16_t>(
             static_cast<uint16_t>(rune::protocol::client::ErrorCode::HandshakeFailed));
         lastConnectError_ = rejectCode_;   // I2
@@ -933,6 +935,10 @@ private:
     }
 
     void tickConnecting(int64_t nowNs) noexcept {
+        if (cfg_.offerCrypto && cfg_.requireCrypto && !hs_) [[unlikely]] {
+            onHandshakeFailed_(nowNs);   // fix round 4: required crypto, no local TLS — a verdict
+            return;
+        }
         // Guard: only fast-retry if the full timeout has NOT elapsed yet.
         if (nowNs - connectStartNs_ <= cfg_.connectTimeoutNs) {
             // DR-BUG-2 FIX: fast-retry the ConnectRequest when the ingress
@@ -996,8 +1002,7 @@ private:
     /// its next candidate).  A broker-sent HandshakeFailed / a verify failure stays
     /// terminal Rejected (onHandshakeFailed_).
     void onHandshakeTimedOut_(int64_t nowNs) noexcept {
-        tls_.reset();
-        hsBytes_.clear();
+        hs_.reset();
         cryptoState_      = CryptoState{};
         sessionId_        = 0;                 // the half-made broker session is abandoned: the retry is fresh
         lastConnectError_ = kHandshakeTimedOut;
@@ -1191,16 +1196,25 @@ private:
     // ------------------------------------------------------------------------
     // client<->broker TLS/AEAD (Task 5) — cold-path handshake state.
     // Engaged only across one connect episode's Connecting->Handshaking->
-    // Connected run; empty (tls_ == nullopt) in every other state, including
+    // Connected run; empty (hs_ == nullopt) in every other state, including
     // the whole steady-state Connected/Resuming/Backoff path.
     // ------------------------------------------------------------------------
-    std::optional<rune::crypto::TlsSession> tls_;
-    rune::crypto::Cipher chosenCipher_ = rune::crypto::Cipher::None;  // from ConnectResponse.chosenCipher
-    // Growable (cold path only — see beginCryptoHandshake_ comment): pending
-    // outbound handshake bytes pulled from tls_, and the frame-encode scratch
-    // for any message that carries them (kScratchCap=512 is not sized for a
-    // TLS flight).
-    std::vector<uint8_t> hsBytes_;
+    // Fix round 4 (TLS class): ONE handshake episode's own data — the TLS
+    // transcript (the in-flight TlsSession), the cipher the broker chose, and the
+    // pending outbound handshake bytes — engaged from the ConnectRequest that
+    // starts the episode through Handshaking, and gone in every other state
+    // (Connected keeps only the derived keys, cryptoState_).  Rule 3: the
+    // Handshaking state's variables, never scattered members.
+    struct HandshakeEpisode {
+        rune::crypto::TlsSession tls;
+        rune::crypto::Cipher     chosenCipher = rune::crypto::Cipher::None;  // from ConnectResponse.chosenCipher
+        std::vector<uint8_t>     outbound;   // pending outbound handshake bytes (cold path, growable)
+        int64_t                  requestCorrelationId = 0;   // the ONE ConnectRequest this episode answers
+        explicit HandshakeEpisode(rune::crypto::TlsSession t) noexcept : tls(std::move(t)) {}
+    };
+    std::optional<HandshakeEpisode> hs_;
+    // Growable frame-encode scratch for any message carrying handshake bytes
+    // (kScratchCap=512 is not sized for a TLS flight); capacity persists.
     std::vector<uint8_t> hsFrameBuf_;
     CryptoState cryptoState_;
 };

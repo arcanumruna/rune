@@ -1090,6 +1090,7 @@ if(BUILD_TESTING)
         add_executable(rune_redirect_tests
             tests/client/RedirectTest.cpp
             tests/client/ConnectRedirectRegressionTest.cpp
+            tests/client/TlsConnectEdgeRegressionTest.cpp
         )
         target_include_directories(rune_redirect_tests PRIVATE
             ${RUNE_PROTOCOL_INCLUDE}

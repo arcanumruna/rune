@@ -1000,7 +1000,11 @@ private:
     // unchanged) when `crypto.encrypted` is false — byte-identical plaintext
     // path.  Reseats buf/len to the transport's reusable seal scratch on
     // success; returns false (DROP, never transmit) on seal failure.
-    [[nodiscard]] bool sealForDestination_(session::CryptoState& crypto,
+    // Fix round 4: takes the destination session's MACHINE — under offerCrypto a
+    // non-handshake frame of a session that is not Connected (its negotiated mode
+    // is not known yet: Connecting / Handshaking / Resuming / Backoff) is refused,
+    // never sent plaintext.
+    [[nodiscard]] bool sealForDestination_(session::SessionMachine& m,
                                            const uint8_t*& buf, std::size_t& len) noexcept;
 
     // ---- Ring buffer (MPSC: many app threads write, one agent thread reads) -

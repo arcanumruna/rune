@@ -1999,6 +1999,104 @@ std::size_t Client::findCtl_(int64_t corrId) const noexcept {
     return pendingCtl_.size();
 }
 
+// ---------------------------------------------------------------------------
+// Fix round 4 (TLS handshake class): the seed's Connected edge.  Every action
+// that once ran at ConnectResponse{OK} runs HERE, once per edge — reached from
+// the ConnectResponse case (plaintext OK, or a TLS handshake that finished on
+// the server's first flight) or the HandshakeContinueResponse case (a handshake
+// that finished on a later leg).  Never while the seed is Handshaking: under
+// offerCrypto nothing may leave the session before its mode is negotiated.
+// ---------------------------------------------------------------------------
+void Client::onSeedConnected_(int64_t sessionId, int32_t brokerVersion) {
+    // F8c C3: complete the pending connect (state() was published by the
+    // caller's syncSeedSession_, so a woken waiter reads Connected).
+    completeConnect_(OpStatus::Ok, sessionId, 0, {});
+
+    // CB-5 B: if this Connected edge completes a redirect-triggered
+    // reconnect, flush every pending redirected data op NOW, re-stamped
+    // with the leader's freshly assigned sessionId.  This is deferred to
+    // exactly here (rather than at redirect time) so the resent frames
+    // carry the NEW session — the leader drops unknown-session ops.
+    // Runs on the agent thread (single-writer): submitSend → agent ring.
+    if (redirectPending()) {
+        redirectPending() = false;
+        // Acks that arrived earlier in THIS poll reach the hub before the
+        // resend, so an already-acked batch is never resent (T12 I4).
+        (void)routeBufferedAcks_();
+        const int64_t newSessionId = sessionId;
+        // E5.1: resend uses per-worker streamId stored in BatchInfo.
+        // submitSend goes through the agent ring → transport_.offer(streamId, ...)
+        // but the ring kMsgSend path uses the default stream.  For correctness
+        // the resend needs to carry the ingressStreamId — however the ring path
+        // does not forward streamId.  As a pragmatic safe fallback we use
+        // stream 0 (default) for the resend after redirect; per-worker routing
+        // resumes on the next fresh produce cycle via flushBatches.
+        // Fix round 4: this runs on the seed's Connected edge only (plaintext OK
+        // or the handshake's completion), so the resend is always on a session
+        // that can carry it — and it marks that edge's re-offer done (C-1 / M-1).
+        {
+            std::function<bool(int32_t, int32_t, int32_t, const uint8_t*, std::size_t)> sendFn =
+                [this](int32_t /*topicId*/, int32_t /*partition*/,
+                       int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
+                    return agent_.submitSend(fb, fl);
+                };
+            producerHub_.resendAllRedirected(newSessionId, sendFn);
+            seedConnectEpochSeen_ = agent_.connectedEpoch(0);   // C-1 / M-1: this edge's re-offer is done
+        }
+        subscriber::SubscriberHub::SendFn subSendFn =
+            [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
+                return agent_.submitSend(fb, fl);
+            };
+        subscriberHub_.resendPending(newSessionId, subSendFn);
+        redirectedSubscribes_.clear();  // DR-15 re-review: re-sent here — never again on metadata
+        heldRedirectFollows_.clear();   // R3: likewise (a new Redirect decides it again)
+    } else if (subscriberHub_.hasPending()) {
+        // F8a fix2: a pending Subscribe sent before this session existed
+        // was dropped by the ring drain (stale session) — re-issue every
+        // pending one stamped with the new session.
+        subscriberHub_.resendPending(
+            sessionId,
+            [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
+                return agent_.submitSend(fb, fl);
+            });
+        redirectedSubscribes_.clear();  // DR-15 re-review: re-sent here — never again on metadata
+        heldRedirectFollows_.clear();   // R3: likewise (a new Redirect decides it again)
+    }
+
+    // MAJOR-2 (round 3): the broker's capability, for every group
+    // consumer — present or created later (joinIfConnected).
+    groupConsumerHub_.setBrokerVersion(brokerVersion);
+
+    // CG-5: Trigger group consumers to send JoinGroup on connect — only
+    // when the SEED (the coordinator's session) connected: a leader
+    // node's session (opened for produce / group fetch routing) must
+    // not send a JoinGroup stamped with its own id (the ring drops it
+    // as stale and the member would sit in Joining until the deadline).
+    // D4: only while the seed IS the coordinator — a coordinator
+    // session of its own joins its members on ITS connect
+    // (syncCoordinatorSession_).
+    if (!groupConsumerHub_.empty()) {
+        if (coordIdx_ == 0) groupConsumerHub_.onConnected(sessionId, coordSendFn_);
+        // A (leader or seed) session (re)connected: partitions waiting
+        // for it — or whose subscription died with its old session —
+        // subscribe now.
+        (void)groupConsumerHub_.reconcileFetch();
+    }
+
+    // MD1 Task 10: on each successful connect, request a full metadata
+    // refresh so the cache is populated for zero-RTT partition routing.
+    sendMetadataRequest(sessionId);
+
+    // Fire onConnected. fix1 C1: this runs inside the noexcept
+    // ClientAgent::doWork chain (dispatchEgressFrame -> egressObserver_ ->
+    // onEgressFrame) — a throwing callback (e.g. a blocking send() that
+    // throws because it is back-pressured inside this very callback) must
+    // never escape it and terminate the process.
+    if (cbConnected_) {
+        invokeUserCallback_("onConnected", [&] { cbConnected_(sessionId); });
+    }
+}
+
 void Client::completeConnect_(OpStatus st, int64_t value, uint16_t errorCode, std::string_view text) {
     if (!hasPendingConnect_) return;
     PendingCtl p = std::move(pendingConnect_);
@@ -2957,96 +3055,15 @@ void Client::onEgressFrame(codec::TemplateId tid,
         }
 
         if (ec == rpc::ErrorCode::OK) {
-            // F8c C3: complete the pending connect (state() was published by
-            // syncSeedSession_ above, so a woken waiter reads Connected).
-            completeConnect_(OpStatus::Ok, opt->assignedSessionId, 0, {});
-
-            // CB-5 B: if this ConnectResponse{OK} completes a redirect-triggered
-            // reconnect, flush every pending redirected data op NOW, re-stamped
-            // with the leader's freshly assigned sessionId.  This is deferred to
-            // exactly here (rather than at redirect time) so the resent frames
-            // carry the NEW session — the leader drops unknown-session ops.
-            // Runs on the agent thread (single-writer): submitSend → agent ring.
-            if (redirectPending()) {
-                redirectPending() = false;
-                // Acks that arrived earlier in THIS poll reach the hub before the
-                // resend, so an already-acked batch is never resent (T12 I4).
-                (void)routeBufferedAcks_();
-                const int64_t newSessionId = opt->assignedSessionId;
-                // E5.1: resend uses per-worker streamId stored in BatchInfo.
-                // submitSend goes through the agent ring → transport_.offer(streamId, ...)
-                // but the ring kMsgSend path uses the default stream.  For correctness
-                // the resend needs to carry the ingressStreamId — however the ring path
-                // does not forward streamId.  As a pragmatic safe fallback we use
-                // stream 0 (default) for the resend after redirect; per-worker routing
-                // resumes on the next fresh produce cycle via flushBatches.
-                // Fix round 3 (N-M1): under TLS this OK arrives while the seed is still
-                // Handshaking — a ring resend now is dropped at the drain (no Connected
-                // session) or races the handshake's completion into a second send.  Then
-                // the seed's Connected edge (dutyCycle) re-offers the in-flight batches
-                // ONCE, restamped; only a plaintext (already Connected) answer resends here
-                // and marks that edge handled.
-                if (agent_.seedMachine().state() == session::SessionState::Connected) {
-                    std::function<bool(int32_t, int32_t, int32_t, const uint8_t*, std::size_t)> sendFn =
-                        [this](int32_t /*topicId*/, int32_t /*partition*/,
-                               int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
-                            return agent_.submitSend(fb, fl);
-                        };
-                    producerHub_.resendAllRedirected(newSessionId, sendFn);
-                    seedConnectEpochSeen_ = agent_.connectedEpoch(0);   // C-1 / M-1: this edge's re-offer is done
-                }
-                subscriber::SubscriberHub::SendFn subSendFn =
-                    [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
-                        return agent_.submitSend(fb, fl);
-                    };
-                subscriberHub_.resendPending(newSessionId, subSendFn);
-                redirectedSubscribes_.clear();  // DR-15 re-review: re-sent here — never again on metadata
-                heldRedirectFollows_.clear();   // R3: likewise (a new Redirect decides it again)
-            } else if (subscriberHub_.hasPending()) {
-                // F8a fix2: a pending Subscribe sent before this session existed
-                // was dropped by the ring drain (stale session) — re-issue every
-                // pending one stamped with the new session.
-                subscriberHub_.resendPending(
-                    opt->assignedSessionId,
-                    [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
-                        return agent_.submitSend(fb, fl);
-                    });
-                redirectedSubscribes_.clear();  // DR-15 re-review: re-sent here — never again on metadata
-                heldRedirectFollows_.clear();   // R3: likewise (a new Redirect decides it again)
-            }
-
-            // MAJOR-2 (round 3): the broker's capability, for every group
-            // consumer — present or created later (joinIfConnected).
-            groupConsumerHub_.setBrokerVersion(opt->brokerVersion);
-
-            // CG-5: Trigger group consumers to send JoinGroup on connect — only
-            // when the SEED (the coordinator's session) connected: a leader
-            // node's session (opened for produce / group fetch routing) must
-            // not send a JoinGroup stamped with its own id (the ring drops it
-            // as stale and the member would sit in Joining until the deadline).
-            // D4: only while the seed IS the coordinator — a coordinator
-            // session of its own joins its members on ITS connect
-            // (syncCoordinatorSession_).
-            if (!groupConsumerHub_.empty()) {
-                if (coordIdx_ == 0) groupConsumerHub_.onConnected(opt->assignedSessionId, coordSendFn_);
-                // A (leader or seed) session (re)connected: partitions waiting
-                // for it — or whose subscription died with its old session —
-                // subscribe now.
-                (void)groupConsumerHub_.reconcileFetch();
-            }
-
-            // MD1 Task 10: on each successful connect, request a full metadata
-            // refresh so the cache is populated for zero-RTT partition routing.
-            sendMetadataRequest(opt->assignedSessionId);
-
-            // Fire onConnected. fix1 C1: this runs inside the noexcept
-            // ClientAgent::doWork chain (dispatchEgressFrame -> egressObserver_ ->
-            // onEgressFrame) — a throwing callback (e.g. a blocking send() that
-            // throws because it is back-pressured inside this very callback) must
-            // never escape it and terminate the process.
-            if (cbConnected_) {
-                invokeUserCallback_("onConnected", [&] { cbConnected_(opt->assignedSessionId); });
-            }
+            // Fix round 4 (TLS handshake class): the seed is CONNECTED only when its
+            // handshake is done — at once for plaintext, on this same answer when the
+            // client's TLS finished on the server's first flight, else on a later
+            // HandshakeContinueResponse leg (that case below).  Every connect-time
+            // action runs on that edge, once (onSeedConnected_).  An OK that left
+            // the seed Handshaking does nothing more here; one the machine refused
+            // (plaintext under requireCrypto -> Rejected) is failed by enterFailed_.
+            if (agent_.lastConnectAccepted())
+                onSeedConnected_(opt->assignedSessionId, opt->brokerVersion);
         } else {
             // Error response via ConnectResponse — fail the connect and fire onError.
             const std::string msg = "ConnectResponse error code: " +
@@ -3055,6 +3072,34 @@ void Client::onEgressFrame(codec::TemplateId tid,
             if (cbError_) {
                 invokeUserCallback_("onError", [&] { cbError_(msg); });
             }
+        }
+        break;
+    }
+
+    // ---- HandshakeContinueResponse (fix round 4) ----
+    case codec::TemplateId::HandshakeContinueResponse: {
+        // A later leg of a seed / node TLS handshake.  The agent already drove the
+        // session's machine; this leg's verdict is in lastConnect*().
+        syncSeedSession_();
+        auto opt = codec::decodeHandshakeContinueResponse(buf, len);
+        if (!opt) break;
+        if (!agent_.lastConnectAwaited()) break;   // stale / duplicate / after the handshake
+        namespace rpc = rune::protocol::client;
+        const auto ec = static_cast<rpc::ErrorCode>(static_cast<uint16_t>(opt->code));
+        if (agent_.lastConnectSession() != 0) {
+            if (agent_.lastConnectAccepted() && !groupConsumerHub_.empty())
+                (void)groupConsumerHub_.resendUnanswered(agent_.lastConnectSession());
+            break;
+        }
+        if (agent_.lastConnectAccepted()) {
+            onSeedConnected_(agent_.seedMachine().sessionId(), agent_.sessionBrokerVersion(0));
+        } else if (ec != rpc::ErrorCode::OK) {
+            // The broker ended the handshake (HandshakeFailed -> Rejected: enterFailed_
+            // fails every op; any other code -> a retriable connect failure).  The
+            // pending connect ends now, once — exactly like a ConnectResponse error.
+            const std::string msg = "HandshakeContinueResponse error code: " + std::to_string(opt->code);
+            completeConnect_(OpStatus::BrokerError, 0, static_cast<uint16_t>(opt->code), msg);
+            if (cbError_) invokeUserCallback_("onError", [&] { cbError_(msg); });
         }
         break;
     }
@@ -4762,10 +4807,10 @@ void Client::redirectBySeed_(int64_t corrId, const std::string& newEndpoint) {
         //       ConnectRequest even though we are still logically
         //       Connected to the follower), and
         //   (2) resend the affected op(s) — Produce AND Subscribe — but
-        //       only AFTER the new ConnectResponse{OK} arrives, so they
+        //       only AFTER the new session is Connected (round 4: its handshake done), so they
         //       carry the leader's freshly assigned sessionId (re-stamped
         //       into the frame header).  We defer the resend by setting
-        //       redirectPending_; the ConnectResponse{OK} handler flushes
+        //       redirectPending_; the seed's Connected edge (onSeedConnected_) flushes
         //       it (see above).  This fixes: subscribe never resent (1),
         //       stale sessionId (2), resend racing the reconnect (3).
         //
@@ -4777,7 +4822,7 @@ void Client::redirectBySeed_(int64_t corrId, const std::string& newEndpoint) {
         // Only initiate ONE reconnect per redirect episode: if a
         // reconnect is already pending (multiple in-flight ops each
         // redirected), coalesce — the single deferred resend on the next
-        // ConnectResponse{OK} flushes ALL pending ops.  This prevents
+        // Connected edge flushes ALL pending ops.  This prevents
         // session churn from a burst of redirects.
         // Coalesce: only initiate ONE reconnect per redirect episode.
         // Single-owner agent thread → a plain check-and-set (no CAS).
@@ -5489,7 +5534,7 @@ void Client::syncCoordinatorSession_() noexcept {
 void Client::rediscoverTrampoline_(void* ctx) noexcept {
     // F14: NotCoordinator -> re-discover the coordinator (== the consensus
     // leader today, F15 §5.1): ask for a fresh cluster view now.  Not
-    // connected: the MetadataRequest sent on the next ConnectResponse{OK}
+    // connected: the MetadataRequest sent on the next Connected edge
     // answers it instead.
     // DR client bug 1: through any Connected session (the seed may be the dead one).
     (void)static_cast<Client*>(ctx)->sendMetadataRequestAnywhere_();
