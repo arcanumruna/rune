@@ -205,3 +205,52 @@ TEST(IsrProposalRegression, RepeatedOlderSendAnswersBackOffExponentiallyRegressi
         EXPECT_NEAR(static_cast<double>(at[static_cast<std::size_t>(i) + 1] - at[static_cast<std::size_t>(i)]),
                     static_cast<double>(want[i]), 60'000'000.0) << "gap " << i;
 }
+
+// CP1 review M1: an Ok at the base clears a proposal only for the NEWEST send, only at the base, and only when our
+// committed view holds every proposed member (a shrink P = {1,2} of the committed {1,2,3}).
+// RED: drop the `atBase` test (the pe-8 Ok clears) / drop the newest-send rule (the seq-1 Ok clears).
+TEST(IsrProposalRegression, OkAtTheBaseClearsOnlyTheNewestSendRegression) {
+    Dir d;
+    rune::storage::InMemoryLog log(1 << 20, 10'000);
+    CapturingTransport t;
+    auto r = std::make_unique<PartitionReplica>(cfg(), Role::Follower, 0, kAll, kAll, &log, &t);
+    r->setIsrChannel(&t);
+    r->setLeaderEpochFenceFile((d.path / "fence-0-0").string());
+    r->becomeLeader(5, {1, 2, 3}, /*pe=*/7);
+    ASSERT_EQ(r->role(), Role::Leader);
+    int64_t now = 1'000'000'000;
+    const int32_t live[] = {1, 2};
+    r->shrinkIsrToLive(std::span<const int32_t>(live, 2), now);   // P = {1,2} at base 7 (send #1)
+    ASSERT_EQ(std::string(r->isrProposalStateNameForTest()), "AwaitingCommit");
+    const int64_t id = r->pendingProposalIdForTest();
+    r->doWork(now += 60'000'000);   // send #2
+    ASSERT_EQ(r->pendingLastSeqForTest(), 2);
+    r->onAlterIsrResponse(ans(kAlterIsrOk, 8, id, 2));   // not at our base
+    EXPECT_EQ(std::string(r->isrProposalStateNameForTest()), "AwaitingCommit");
+    r->onAlterIsrResponse(ans(kAlterIsrOk, 7, id, 1));   // an older send
+    EXPECT_EQ(std::string(r->isrProposalStateNameForTest()), "AwaitingCommit");
+    r->onAlterIsrResponse(ans(kAlterIsrOk, 7, id, 2));   // the newest send, at the base
+    EXPECT_EQ(std::string(r->isrProposalStateNameForTest()), "None");
+    EXPECT_EQ(r->okAnswersDisagreeingForTest(), 0u);
+}
+
+// CP1 review M1 (guard): an Ok at the base for a set naming a member our committed ISR lacks means the views disagree;
+// clearing would stop counting a member the controller can elect.  RED: no guard (the Ok clears, 3 leaves the maximal ISR).
+TEST(IsrProposalRegression, OkAtTheBaseThatNamesAnUncountedMemberKeepsItCountedRegression) {
+    Rig g;   // committed {1,2}, P = {1,2,3} at base 7, send #1
+    ASSERT_EQ(g.r->pendingLastSeqForTest(), 1);
+    g.r->onAlterIsrResponse(ans(kAlterIsrOk, 7, g.id1, 1));
+    EXPECT_EQ(g.state(), "AwaitingMetadata");
+    EXPECT_TRUE(g.maximalHas(3));
+    EXPECT_EQ(g.r->okAnswersDisagreeingForTest(), 1u);
+}
+
+// CP1 review M5: the send ordinal saturates instead of overflowing (signed overflow is UB; UBSan traps it).
+// RED: `++a->lastSeq` (INT32_MIN, or a UBSan trap).
+TEST(IsrProposalRegression, SendOrdinalSaturatesInsteadOfOverflowingRegression) {
+    Rig g;
+    g.r->setPendingLastSeqForTest(INT32_MAX);
+    g.r->doWork(g.now += 60'000'000);   // a resend
+    EXPECT_EQ(g.r->pendingLastSeqForTest(), INT32_MAX);
+    EXPECT_GE(lastProposal(g.t).sendSeq, 0);
+}

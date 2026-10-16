@@ -23,6 +23,9 @@
 #include <rune/node/CatalogCheckpoint.h>
 #include <rune/node/CatalogPartition.h>
 #include <rune/node/EmbeddedDriver.h>
+#include <rune/node/ReplicaRegistry.h>
+#include <rune/node/WorkerPool.h>
+#include <rune/metadata/ShardRouter.h>
 #include <rune/node/NodeConfig.h>
 #include <rune/replication/AeronPartitionTransport.h>
 #include <rune/replication/PartitionReplica.h>
@@ -926,4 +929,136 @@ TEST(AeronTransportRegression, NodeLocalCodeOnTheWireReachesNoReplicaRegression)
     EXPECT_TRUE(tr.deliverFrameForTest(c100.data(), c100.size(), 1));
     EXPECT_TRUE(rep.leaderlessReportPendingForTest());
     EXPECT_EQ(tr.localCodeOnWireForTest(), 2u);
+}
+
+// ISR protocol CP1 review I1: the PRODUCTION relay of the correlation ids, transport -> WorkerOp -> Worker.  Every user
+// partition has a worker pool; dropping `op.roleLeaderId = r.sendSeq;` (transport) or `r.sendSeq = op.roleLeaderId();`
+// (Worker) silently turns the A-C1 older-send rule off for all of them while every replica-level test stays green.
+// The replica is driven to send #2 (60 ms after #1), then answered Ineligible for send 1 (older: must keep the
+// proposal) and for send 2 (the newest: clears), through deliverFrameForTest -> WorkerPool -> Worker::doWork.
+// RED (each separately): delete `op.roleLeaderId = r.sendSeq;`; delete `op.nextOffset = r.proposalId;` (id 0 -> the
+// legacy rule clears on the seq-1 frame).
+TEST(AeronTransportRegression, WorkerRelayCarriesProposalIdAndSendSeqRegression) {
+    struct CapturingIsrChannel final : rr::InMemoryTransport {
+        std::vector<rr::AlterIsrMsg> sent;
+        bool sendAlterIsr(const rr::AlterIsrMsg& m) override { sent.push_back(m); return true; }
+    };
+    TmpDir ad{"isr_relay"};
+    EmbeddedDriverConfig dc;
+    dc.dir = ad.path.string();
+    dc.termBufferBytes = 64 * 1024;
+    EmbeddedDriver drv(dc, DriverMode::Threaded);
+    aeron::Context ctx;
+    ctx.aeronDir(ad.path.string());
+    auto client = aeron::Aeron::connect(ctx);
+    rr::AeronPartitionTransport tr(client, "aeron:ipc", 7323, /*self*/1, 1 << 20);
+
+    TmpDir fenceDir{"isr_relay_fence"};
+    rune::storage::InMemoryLog log(1 << 20, 10'000);
+    CapturingIsrChannel chan;
+    const std::vector<rr::NodeId> all{1, 2, 3};
+    rr::PartitionConfig cfg;
+    cfg.topicId = 0; cfg.partitionId = 0; cfg.selfId = 1;
+    cfg.replicaLagMaxMs = 10'000; cfg.replicaLagMaxOffset = 10'000; cfg.minIsr = 1;
+    cfg.fetchIntervalNs = 1'000'000; cfg.isrCheckIntervalNs = 1'000'000; cfg.maxFetchBytes = 1 << 20;
+    auto rep = std::make_unique<rr::PartitionReplica>(cfg, rr::Role::Follower, 0, all, all, &log, &chan);
+    rep->setIsrChannel(&chan);
+    rep->setLeaderEpochFenceFile((fenceDir.path / "fence-0-0").string());
+    rep->becomeLeader(5, {1, 2}, /*pe=*/7);
+    ASSERT_EQ(rep->role(), rr::Role::Leader);
+    for (int i = 0; i < 10; ++i) ASSERT_GE(rep->append(std::vector<uint8_t>(16, uint8_t(i))), 0);
+    int64_t now = 1'000'000'000;
+    rr::FetchRequestMsg f{};
+    f.leaderEpoch = 5; f.partition = 0; f.followerId = 3; f.fetchOffset = 10; f.maxBytes = 0;
+    f.topicId = 0; f.lastFetchedEpoch = 5; f.incarnation = 1;
+    (void)rep->onFetchRequest(f, now);
+    auto proposals = [&] { std::size_t n = 0; for (const auto& m : chan.sent) n += (m.isrCount > 0); return n; };
+    for (int i = 0; i < 50 && proposals() == 0; ++i) rep->doWork(now += 1'000'000);
+    ASSERT_EQ(proposals(), 1u);
+    rep->doWork(now += 60'000'000);   // the 50 ms resend: send #2
+    ASSERT_EQ(proposals(), 2u);
+    ASSERT_EQ(chan.sent.back().sendSeq, 2);
+    const int64_t id = rep->pendingProposalIdForTest();
+    ASSERT_NE(id, 0);
+
+    rune::node::ReplicaRegistry reg;
+    reg.add(0, 0, std::move(rep));
+    rune::node::WorkerPool pool{1, rune::metadata::ShardRouter(1), 1 << 20, 1 << 20, 16, 16};
+    pool.assignFromRegistry(reg);
+    pool.setRegistry(&reg);
+    pool.setRunnersStartedForTest(true);
+    tr.setReplicaRegistry(&reg);
+    tr.setWorkerPool(&pool);
+    tr.setControllerId(1, 7);
+
+    auto answer = [&](int32_t sendSeq) {
+        rr::AlterIsrResponseMsg r{};
+        r.topicId = 0; r.partition = 0; r.leaderId = 1; r.leaderEpoch = 5; r.partitionEpoch = 7;
+        r.errorCode = rr::kAlterIsrIneligibleReplica; r.proposalId = id; r.controllerEpoch = 7; r.sendSeq = sendSeq;
+        std::vector<uint8_t> wire(rr::AlterIsrResponseMsg::TOTAL_SIZE);
+        ASSERT_EQ(r.encode(wire.data(), wire.size()), wire.size());
+        ASSERT_TRUE(tr.deliverFrameForTest(wire.data(), wire.size(), now));
+        pool.worker(0).doWork(now += 1'000'000);
+    };
+    rr::PartitionReplica* owned = reg.lookup(0, 0);
+    ASSERT_NE(owned, nullptr);
+    answer(1);   // the answer to the OLDER send
+    EXPECT_TRUE(owned->isrProposalPendingForTest()) << "an older-send answer cleared the proposal through the relay";
+    EXPECT_EQ(owned->olderSendAnswersForTest(), 1u);
+    answer(2);   // the newest send's answer
+    EXPECT_FALSE(owned->isrProposalPendingForTest());
+}
+
+// CP1 review I1 (term wiring): the controller's term must reach every node's transport (setControllerId's 2nd
+// argument, NodeRuntimeAgent) and its MetadataService (setControllerEpoch), or the stale-term filter and the term
+// stamp are dead in production while the hand-wired unit tests stay green.
+// RED (each separately): the 1-argument setControllerId(lid) in NodeRuntimeAgent (known stays 0); delete the
+// setControllerEpoch call (stays 0).
+TEST(CatalogReplicationRegression, ControllerTermIsWiredIntoEveryTransportAndAnswerRegression) {
+    ThreeNodes c = ThreeNodes::start("cat_term");
+    ASSERT_TRUE(c.awaitCatalogLeader(30s));
+    BrokerNode* ctl = nullptr;
+    int64_t T = 0;
+    const auto deadline = std::chrono::steady_clock::now() + 30s;
+    while (std::chrono::steady_clock::now() < deadline && T <= 0) {
+        for (BrokerNode* n : c.live()) {
+            const bool leads = n->onControlThreadForTest([&] {
+                return n->electionForTest()->leaderMemberId() == n->nodeIdForTest();
+            });
+            if (!leads) continue;
+            ctl = n;
+            T = n->onControlThreadForTest([&] { return static_cast<int64_t>(n->electionForTest()->leadershipTermId()); });
+        }
+        if (T <= 0) std::this_thread::sleep_for(50ms);
+    }
+    ASSERT_NE(ctl, nullptr);
+    ASSERT_GT(T, 0);
+    auto wired = [&](BrokerNode* n) {
+        const int64_t known = n->onControlThreadForTest([&] { return n->replTransportForTest()->knownControllerTermForTest(); });
+        const int64_t stamp = n->onControlThreadForTest([&] { return n->metadataServiceForTest()->controllerEpochForTest(); });
+        return known == T && stamp == T;
+    };
+    const auto wireDeadline = std::chrono::steady_clock::now() + 30s;
+    bool all = false;
+    while (std::chrono::steady_clock::now() < wireDeadline && !all) {
+        all = true;
+        for (BrokerNode* n : c.live()) all = all && wired(n);
+        if (!all) std::this_thread::sleep_for(50ms);
+    }
+    for (BrokerNode* n : c.live()) {
+        EXPECT_EQ(n->onControlThreadForTest([&] { return n->replTransportForTest()->knownControllerTermForTest(); }), T)
+            << "node " << n->nodeIdForTest() << ": the transport never learned the controller term";
+        EXPECT_EQ(n->onControlThreadForTest([&] { return n->metadataServiceForTest()->controllerEpochForTest(); }), T)
+            << "node " << n->nodeIdForTest() << ": the metadata service never stamps the controller term";
+    }
+}
+
+// CP1 review M7: wipe() (a replaced disk, formatted --join) must clear a wipeRaw override, or the node would restart
+// under the stale Auto/New format of an earlier wipeRaw.  RED: drop the reset in ThreeNodes::wipe.
+TEST(CatalogReplicationRegression, WipeClearsAPriorWipeRawFormatOverrideRegression) {
+    ThreeNodes c("wipe_override", Mode::Shard);
+    c.wipeRaw(1, rune::node::StorageFormat::Auto);
+    ASSERT_TRUE(c.hasStorageFormatOverrideForTest(1));
+    c.wipe(1);
+    EXPECT_FALSE(c.hasStorageFormatOverrideForTest(1)) << "wipe() kept the earlier wipeRaw format override";
 }

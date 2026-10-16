@@ -133,3 +133,27 @@ TEST(StorageFormatProcessRegression, CliNewThenSingleNodeStartServesRegression) 
     std::error_code ec;
     fs::remove_all(dir, ec);
 }
+
+// CP1 review M4: a storage failure while reading the identity at boot exits 74 (EX_IOERR), like any storage failure at
+// startup, not 1 and not the R-2 "wipe the dir" refusal (78).  RED: no StorageIoError catch in main (exit 1).
+TEST(StorageFormatProcessRegression, UnreadableStorageMetaExits74Regression) {
+    if (::geteuid() == 0) GTEST_SKIP() << "root reads any file";
+    const fs::path dir = scratchDir("rune_storage_proc", 20);
+    fs::create_directories(dir / "data");
+    {
+        std::ofstream f(dir / "data" / "storage.meta", std::ios::binary);
+        f << "version=1\n";
+    }
+    fs::permissions(dir / "data" / "storage.meta", fs::perms::none);
+    SpawnOptions o;
+    Broker b = spawnBrokerIn(dir, 0, o);
+    ASSERT_GT(b.pid, 0);
+    const int st = awaitExit(b, 10s);
+    ASSERT_NE(st, -1) << "the broker did not exit within 10 s:\n" << b.log();
+    ASSERT_TRUE(WIFEXITED(st)) << b.log();
+    EXPECT_EQ(WEXITSTATUS(st), 74) << b.log();
+    EXPECT_NE(b.log().find("storage failure at startup"), std::string::npos) << b.log();
+    std::error_code ec;
+    fs::permissions(dir / "data" / "storage.meta", fs::perms::owner_all, ec);
+    fs::remove_all(dir, ec);
+}

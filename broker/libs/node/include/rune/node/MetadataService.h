@@ -1610,6 +1610,7 @@ public:
     /// ISR protocol: this node's consensus leadership term, pushed every cycle (NodeRuntimeAgent).
     /// Stamped on every AlterIsr answer so a follower can drop an answer of a deposed controller.
     void setControllerEpoch(int64_t t) noexcept { controllerEpoch_ = t; }
+    [[nodiscard]] int64_t controllerEpochForTest() const noexcept { return controllerEpoch_; }
     /// Fix round 2 (N2): this node is stopping (plain stop()) — it decides
     /// nothing any more (no rebalance, no AlterIsr answers, no emit).
     void halt() noexcept {
@@ -2376,6 +2377,10 @@ private:
         // them); confirmations were the old controller's — re-collected.
         for (auto& [n, st] : nodeLifecycle_) { st.confirmed.clear(); st.pushedBits = -1; st.completePushed = false; }
         confirmCheckedVersion_ = 0;
+        // e2118e83 sibling (re-claim): the live set was learnt under THAT leadership; a re-claiming controller
+        // must learn it again before it confirms any shutdown COMPLETE (or filters an ISR addition) on it.
+        eligible_.clear();
+        eligibleKnown_ = false;
         // Follower: reset lastApplied_ so we re-apply from scratch if we
         // become leader again later.  Review M1: only when the replica really
         // stopped leading - a consensus-only deposition (or halt) keeps the log

@@ -1489,6 +1489,8 @@ public:
     }
     /// Test-only, CONTROL thread only: the consensus Election (nullptr when none).
     [[nodiscard]] const rune::consensus::Election* electionForTest() const noexcept { return election_.get(); }
+    /// CP1-I1: the replication transport (control-thread state; read it through onControlThreadForTest).
+    [[nodiscard]] rune::replication::AeronPartitionTransport* replTransportForTest() const noexcept { return replTransport_.get(); }
 
     /// Test-only: true if the replication metadata bridge has propagated this
     /// node's leadership to its internal PartitionReplicas.  Read ON the control

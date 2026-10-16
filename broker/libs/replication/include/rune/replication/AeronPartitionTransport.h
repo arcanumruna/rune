@@ -303,6 +303,7 @@ public:
     }
     [[nodiscard]] uint64_t staleControllerAnswersForTest() const noexcept { return staleControllerAnswers_; }
     [[nodiscard]] uint64_t localCodeOnWireForTest() const noexcept { return localCodeOnWire_; }
+    [[nodiscard]] int64_t knownControllerTermForTest() const noexcept { return knownControllerTerm_; }
     /// CONTROL thread: the controller-side AlterIsr handler (MetadataService),
     /// called on the control thread for every AlterIsr this node receives.
     /// Returns true when `resp` must be sent back to the proposing leader

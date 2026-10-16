@@ -214,7 +214,11 @@ struct ThreeNodes {
     /// would otherwise re-found the empty dir).
     void wipe(int id) {
         removeContents_(id);
+        storageFormatFor_[static_cast<std::size_t>(id - 1)].reset();   // CP1 M7: a prior wipeRaw override must not outlive this wipe
         formatJoin(id);
+    }
+    [[nodiscard]] bool hasStorageFormatOverrideForTest(int id) const {
+        return storageFormatFor_[static_cast<std::size_t>(id - 1)].has_value();
     }
     void formatJoin(int id) {
         ASSERT_EQ(rune::node::StorageIdentity::format(dirs[static_cast<std::size_t>(id - 1)]->path.string(),

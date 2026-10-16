@@ -618,11 +618,14 @@ struct AlterIsrMsg {
         if (m.isrCount < 0 || m.isrCount > kMaxIsr) return false;
         for (int i = 0; i < kMaxIsr; ++i)
             m.isr[static_cast<std::size_t>(i)] = dec.isr(static_cast<std::uint64_t>(i));
-        m.proposalId = dec.proposalIdInActingVersion() ? dec.proposalId() : 0;
-        m.sendSeq    = dec.sendSeqInActingVersion() ? dec.sendSeq() : 0;
+        // A v4 field is read only when the sender's acting version has it AND its header block covers it: a
+        // header claiming version 4 with a v3-sized block would otherwise read past the frame.
+        const std::size_t bl = mh.blockLength();
+        m.proposalId = (dec.proposalIdInActingVersion() && bl >= 100) ? dec.proposalId() : 0;
+        m.sendSeq    = (dec.sendSeqInActingVersion() && bl >= 232) ? dec.sendSeq() : 0;
         for (int i = 0; i < kMaxIsr; ++i)
             m.isrStorage[static_cast<std::size_t>(i)] =
-                dec.isrStorageInActingVersion() ? dec.isrStorage(static_cast<std::uint64_t>(i)) : 0;
+                (dec.isrStorageInActingVersion() && bl >= 228) ? dec.isrStorage(static_cast<std::uint64_t>(i)) : 0;
         return true;
     }
 };
@@ -698,9 +701,10 @@ struct AlterIsrResponseMsg {
         m.leaderEpoch    = dec.leaderEpoch();
         m.partitionEpoch = dec.partitionEpoch();
         m.errorCode      = dec.errorCode();
-        m.proposalId      = dec.proposalIdInActingVersion() ? dec.proposalId() : 0;
-        m.controllerEpoch = dec.controllerEpochInActingVersion() ? dec.controllerEpoch() : 0;
-        m.sendSeq         = dec.sendSeqInActingVersion() ? dec.sendSeq() : 0;
+        const std::size_t bl = mh.blockLength();   // see AlterIsrMsg::decode: acting version AND block coverage
+        m.proposalId      = (dec.proposalIdInActingVersion() && bl >= 34) ? dec.proposalId() : 0;
+        m.controllerEpoch = (dec.controllerEpochInActingVersion() && bl >= 42) ? dec.controllerEpoch() : 0;
+        m.sendSeq         = (dec.sendSeqInActingVersion() && bl >= 46) ? dec.sendSeq() : 0;
         return true;
     }
 };

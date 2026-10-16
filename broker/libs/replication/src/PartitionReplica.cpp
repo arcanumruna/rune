@@ -2801,6 +2801,22 @@ void PartitionReplica::onAlterIsrResponse(const AlterIsrResponseMsg& r)
     switch (r.errorCode) {
         case kAlterIsrOk:
             if (!atBase) return;
+            // CP1 M1: an Ok at our base means "the proposed set IS the controller's committed ISR at this base".
+            // Our committed view at the same partitionEpoch must hold every proposed member; if it does not,
+            // the views disagree and clearing would stop counting a member the controller can elect.  Fail
+            // safe: keep the members counted (AwaitingMetadata) and say so.
+            for (int i = 0; i < P.count; ++i) {
+                const NodeId n = P.members[static_cast<std::size_t>(i)];
+                if (std::find(committedIsr_.begin(), committedIsr_.end(), n) != committedIsr_.end()) continue;
+                if (okAnswersDisagreeing_++ == 0)
+                    spdlog::warn("PartitionReplica[node={} topic={} part={}]: AlterIsr answered OK at partitionEpoch {} for a "
+                                 "set naming node {} that this replica's committed ISR lacks - the views disagree; keeping "
+                                 "the proposal counted until the committed assignment arrives",
+                                 cfg_.selfId, cfg_.topicId, cfg_.partitionId, P.base, n);
+                ctrlProposal_ = AwaitingMetadata{P, a->lastSeq, lastKnownNowNs_, a->sentNs};
+                ++isrAwaitingMetadata_;
+                return;
+            }
             break;
         case kAlterIsrIneligibleReplica:
             // Nothing committed: the controller dropped the fenced additions and the rest equals the committed
@@ -3390,9 +3406,11 @@ void PartitionReplica::sendIsrProposal_(int64_t nowNs)
 {
     // Visit the pending states: every send of ONE proposal carries its id and a fresh, increasing sendSeq.
     int32_t seq = 0;
-    if (auto* a = std::get_if<AwaitingCommit>(&ctrlProposal_))              { seq = ++a->lastSeq; a->sentNs = nowNs; }
-    else if (auto* w = std::get_if<AwaitingMetadata>(&ctrlProposal_))       { seq = ++w->lastSeq; w->sentNs = nowNs; }
-    else if (auto* x = std::get_if<AwaitingMetadataWarned>(&ctrlProposal_)) { seq = ++x->lastSeq; x->sentNs = nowNs; }
+    // CP1 M5: the ordinal saturates (an int32 overflow would be UB); a saturated ordinal only means "newest" forever.
+    const auto bump = [](int32_t& v) noexcept { if (v < INT32_MAX) ++v; return v; };
+    if (auto* a = std::get_if<AwaitingCommit>(&ctrlProposal_))              { seq = bump(a->lastSeq); a->sentNs = nowNs; }
+    else if (auto* w = std::get_if<AwaitingMetadata>(&ctrlProposal_))       { seq = bump(w->lastSeq); w->sentNs = nowNs; }
+    else if (auto* x = std::get_if<AwaitingMetadataWarned>(&ctrlProposal_)) { seq = bump(x->lastSeq); x->sentNs = nowNs; }
     else return;   // no proposal: nothing to send
     const ProposalBody& b = bodyOf_(ctrlProposal_);
     AlterIsrMsg m{};

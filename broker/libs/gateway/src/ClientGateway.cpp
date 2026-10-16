@@ -859,6 +859,8 @@ void ClientGateway::rebuildProducerStateFromLogs()
         for (int32_t partition = 0; partition < spec->partitionCount; ++partition) {
             rune::storage::Log* log = topicRegistry_->log(topicId, partition);
             if (!log) continue;
+            // CP1-I4: a worker-routed partition is rebuilt by its worker; its log (LEO included) is never read here.
+            if (routesToWorker_(topicId)) continue;
 
             // The read_committed rebuild below is bounded by the committed HW
             // (LEO when no replication is wired: passthrough, HW == LEO).
@@ -4639,7 +4641,7 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     // The clamp is the replica's published HW; the log start resolves on the
     // worker (Worker::raiseFreshDiskCursor_).  Only a gateway-owned Log
     // (inline / single-node pass-through) is read here.
-    const bool gatewayLog = gatewayOwnsLog_(log);
+    const bool gatewayLog = gatewayOwnsLog_(msg.topicId, log);
     const rune::replication::PartitionReplica* const clampReplica =
         replicaRegistry_ ? replicaRegistry_->lookup(msg.topicId, partition) : nullptr;
     if (log != nullptr && !gatewayLog && clampReplica == nullptr) [[unlikely]] {
@@ -5270,10 +5272,13 @@ void ClientGateway::pushSubscriptionsPass_()
         } else if (replicaRegistry_) {
             const rune::replication::PartitionReplica* replica =
                 replicaRegistry_->lookup(sub.topicId, sub.partition);
-            hw = replica ? replica->gatewayHighWatermark() : (log ? log->logEndOffset() : 0);
+            // CP1-I4: only a gateway-owned log has its LEO read here; a worker-owned one without a replica has no
+            // published HW yet (nothing to push).
+            hw = replica ? replica->gatewayHighWatermark()
+                         : (gatewayOwnsLog_(sub.topicId, log) ? log->logEndOffset() : 0);
         } else {
-            // No replication wired — single-node pass-through: HW == LEO.
-            hw = log ? log->logEndOffset() : 0;
+            // No replication wired — single-node pass-through: HW == LEO (gateway-owned logs only).
+            hw = gatewayOwnsLog_(sub.topicId, log) ? log->logEndOffset() : 0;
         }
 
         // TX-4 Task 9: Apply isolation-level bound.
@@ -7541,7 +7546,7 @@ int64_t ClientGateway::addGroupSubscription(int64_t memberSessionId,
     // wired (GR-6), else LEO.  Negative fromOffset is clamped to 0 (log start;
     // E2: a transient cursor below the ring start is moved up by the worker).
     // Sanitizer triage T2: never read a worker-owned Log from this thread.
-    const bool gatewayLog = gatewayOwnsLog_(log);
+    const bool gatewayLog = gatewayOwnsLog_(topicId, log);
     const rune::replication::PartitionReplica* const boundReplica =
         replicaRegistry_ ? replicaRegistry_->lookup(topicId, partition) : nullptr;
     if (log != nullptr && !gatewayLog && boundReplica == nullptr) [[unlikely]] {

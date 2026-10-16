@@ -410,3 +410,32 @@ TEST(StorageIdentityRegression, CliFormatRowsRegression) {
 }
 
 } // namespace
+
+// CP1 review M3: --reassign-join on a PRE-UPGRADE dir writes the new Joiner storage.meta BEFORE it unlinks the restored
+// knowledge file.  The old order left a window with no storage.meta, in which the next boot adopted the dir as Legacy
+// with a fresh id (and the stale knowledge).  The unlink is made to fail (the "file" is a non-empty directory), so the
+// state after the failure shows the order.  RED: unlink first (no storage.meta is left behind).
+TEST(StorageIdentityRegression, ReassignJoinOnAPreUpgradeDirWritesTheJoinerBeforeUnlinkingKnowledgeRegression) {
+    TmpDir t("preupgrade_order");
+    const std::string d = t.str();
+    makeLegacy(t.path);
+    fs::create_directories(t.path / "internal-isr.state");
+    touch(t.path / "internal-isr.state" / "x");
+    const auto res = StorageIdentity::reassignJoin(d);
+    EXPECT_EQ(res.code, 74) << "the unlink must have failed: " << res.out << res.err;
+    ASSERT_TRUE(fs::exists(t.path / "storage.meta")) << "no storage.meta: the crash window adopts the dir as Legacy";
+    const auto n = StorageIdentity::resolve(d, StorageFormat::Required, false);
+    EXPECT_EQ(n.origin, Origin::Joiner) << "a dir interrupted mid-command must already be a Joiner";
+}
+
+// CP1 review M4: an UNREADABLE storage.meta (EACCES/EIO) is an I/O fault, not a corrupt identity - R-2 would advise
+// wiping a healthy storage id.  RED: the old `if (!f) return Corrupt{"truncated"}` (a StorageRefusal is thrown).
+TEST(StorageIdentityRegression, UnreadableStorageMetaIsAnIoErrorNotACorruptIdentityRegression) {
+    if (::geteuid() == 0) GTEST_SKIP() << "root reads any file";
+    TmpDir t("unreadable");
+    const std::string d = t.str();
+    ASSERT_EQ(StorageIdentity::format(d, Origin::Joiner, Mode::None, false).code, 0);
+    fs::permissions(t.path / "storage.meta", fs::perms::none);
+    EXPECT_THROW((void)StorageIdentity::resolve(d, StorageFormat::Required, false), rune::node::StorageIoError);
+    fs::permissions(t.path / "storage.meta", fs::perms::owner_read | fs::perms::owner_write);
+}

@@ -156,12 +156,21 @@ Parsed parseText(const std::string& text) {
     return l;
 }
 
+[[noreturn]] void ioFail(const char* op, const fs::path& p, int err);
+
 Parsed parseFile(const fs::path& dir) {
     const fs::path p = dir / kMeta;
     std::error_code ec;
     if (!fs::exists(fs::symlink_status(p, ec))) return Absent{};
+    errno = 0;
     std::ifstream f(p, std::ios::binary);
-    if (!f) return Corrupt{"truncated"};
+    if (!f) {
+        // CP1 M4: an unreadable file (EACCES, EIO, ...) is an I/O fault, not a corrupt identity: advising "wipe the
+        // dir" there would discard a healthy storage id.  Only a vanished target keeps the old reading.
+        const int e = errno;
+        if (e == 0 || e == ENOENT) return Corrupt{"truncated"};
+        ioFail("open", p, e);
+    }
     std::stringstream ss;
     ss << f.rdbuf();
     return parseText(ss.str());
@@ -541,8 +550,17 @@ SI::FormatResult SI::reassignJoin(const std::string& d) {
         l.manifest = static_cast<uint8_t>(l.manifest & ~bit(Class::Knowledge));
         // The stale knowledge goes FIRST: a crash between the two steps leaves the old storage.meta with its
         // knowledge bit and no file (R-3b at boot; re-run the command), never a new identity voting on it.
-        unlinkDurably(dir, "internal-isr.state");
-        write_(d, l);
+        // Pre-upgrade dir (no storage.meta yet): the NEW identity is written FIRST (CP1 M3).  Unlinking first left a
+        // window with no storage.meta, in which the next boot adopts the dir as Legacy with a fresh id and the
+        // restored knowledge file still present.  A formatted dir keeps its storage.meta throughout, so there the
+        // knowledge goes first.
+        if (preUpgrade) {
+            write_(d, l);
+            unlinkDurably(dir, "internal-isr.state");
+        } else {
+            unlinkDurably(dir, "internal-isr.state");
+            write_(d, l);
+        }
         if (preUpgrade)
             return {0, "re-identified " + d + " (pre-storage-id data kept): storageId=" + idHex(l.id) +
                            " origin=joiner (it rejoins as a replaced disk)\n", {}};

@@ -1179,5 +1179,45 @@ TEST(AlterIsrRelayRegression, StaleAnswerThroughTheWorkerRelayKeepsTheProposalAn
     EXPECT_FALSE(replica->isrProposalPendingForTest()) << "its own answer through the relay no longer clears it";
 }
 
+// CP1 review I1 (Worker half): the send ordinal rides through the worker relay too.  An answer to an OLDER send of the
+// pending proposal must keep it; only the newest send's answer clears.  RED: delete `r.sendSeq = op.roleLeaderId();`
+// in Worker.h (the older answer then arrives with seq 0 and clears the proposal).
+TEST(AlterIsrRelayRegression, OlderSendAnswerThroughTheWorkerRelayNeverClearsRegression) {
+    TempDir logDir("relay_seq_");
+    rune::storage::Log log(logDir.path.string());
+    log.recover();
+    NullTransport transport;
+    rune::replication::PartitionConfig cfg{};
+    cfg.topicId = 12; cfg.partitionId = 0; cfg.selfId = 1; cfg.minIsr = 1;
+    cfg.replicaLagMaxMs = 10'000; cfg.replicaLagMaxOffset = 10'000;
+    cfg.fetchIntervalNs = 1'000'000LL; cfg.isrCheckIntervalNs = 1'000'000LL; cfg.maxFetchBytes = 1 << 20;
+    const std::vector<rune::replication::NodeId> all{1, 2, 3};
+    auto replica = std::make_unique<rune::replication::PartitionReplica>(
+        cfg, rune::replication::Role::Follower, 0, all, all, &log, &transport);
+    replica->setIsrChannel(&transport);
+    replica->becomeLeader(1, all, /*partitionEpoch=*/4);
+    ASSERT_EQ(replica->role(), rune::replication::Role::Leader);
+    Worker worker(0);
+    worker.setOwnedDirect({replica.get()});
+    int64_t now = 1'000'000'000LL;
+    const int32_t live[] = {1, 2};
+    replica->shrinkIsrToLive(std::span<const int32_t>(live, 2), now);   // proposes {1,2} at base 4 (send #1)
+    ASSERT_TRUE(replica->isrProposalPendingForTest());
+    const int64_t id = replica->pendingProposalIdForTest();
+    replica->doWork(now += 60'000'000);   // the 50 ms resend: send #2
+    ASSERT_EQ(replica->pendingLastSeqForTest(), 2);
+    auto answerId = [&](int16_t code, int32_t pe, int64_t pid, int32_t seq) {
+        WorkerOp op; op.type = WorkerOp::Type::AlterIsrResponse; op.replica = replica.get();
+        op.topicId = 12; op.partition = 0; op.roleEpoch = 1; op.rolePartitionEpoch = pe;
+        op.replicatedPayload.errorCode = code; op.nextOffset = pid; op.roleLeaderId = seq;
+        ASSERT_TRUE(static_cast<bool>(worker.tryEnqueueOp(std::move(op)))); worker.doWork(now += 1'000'000);
+    };
+    answerId(rune::replication::kAlterIsrIneligibleReplica, 4, id, 1);
+    EXPECT_TRUE(replica->isrProposalPendingForTest()) << "an older-send answer cleared the proposal through the relay";
+    EXPECT_EQ(replica->olderSendAnswersForTest(), 1u);
+    answerId(rune::replication::kAlterIsrIneligibleReplica, 4, id, 2);
+    EXPECT_FALSE(replica->isrProposalPendingForTest());
+}
+
 } // namespace
 } // namespace rune::node

@@ -948,3 +948,28 @@ TEST(ReplicationMessagesRegression, StaleControllerAnswerRuleRegression) {
     EXPECT_FALSE(isStaleControllerAnswer(8, 7));
     EXPECT_FALSE(isStaleControllerAnswer(0, 7)) << "a v3 controller sends no term";
 }
+
+// CP1 review M2: a v4 field is read only when the header's block covers it.  A peer that claims version 4 with a
+// v3-sized block (92 / 26) in an exactly sized HEAP frame must read as v3 (zeros), never past the frame.  Clean under
+// ASan.  RED: gate on the acting version alone (heap-buffer-overflow).
+TEST(ReplicationMessagesRegression, V4FieldsOfAV3SizedBlockAreNeverReadPastTheFrameRegression) {
+    {
+        auto f = std::make_unique<uint8_t[]>(100);
+        std::memset(f.get(), 0, 100);
+        putHeader(f.get(), 92, AlterIsrMsg::TEMPLATE_ID, 4);
+        detail::write_le<int32_t>(f.get() + 8 + 20, 2);   // isrCount
+        AlterIsrMsg m{};
+        m.proposalId = 9; m.sendSeq = 9; m.isrStorage[0] = 9;
+        ASSERT_TRUE(AlterIsrMsg::decode(f.get(), 100, m));
+        EXPECT_EQ(m.proposalId, 0); EXPECT_EQ(m.sendSeq, 0); EXPECT_EQ(m.isrStorage[0], 0);
+    }
+    {
+        auto f = std::make_unique<uint8_t[]>(34);
+        std::memset(f.get(), 0, 34);
+        putHeader(f.get(), 26, AlterIsrResponseMsg::TEMPLATE_ID, 4);
+        AlterIsrResponseMsg m{};
+        m.proposalId = 9; m.controllerEpoch = 9; m.sendSeq = 9;
+        ASSERT_TRUE(AlterIsrResponseMsg::decode(f.get(), 34, m));
+        EXPECT_EQ(m.proposalId, 0); EXPECT_EQ(m.controllerEpoch, 0); EXPECT_EQ(m.sendSeq, 0);
+    }
+}

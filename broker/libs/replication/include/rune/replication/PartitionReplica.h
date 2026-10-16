@@ -512,6 +512,15 @@ public:
     [[nodiscard]] uint64_t olderSendAnswersForTest() const noexcept { return olderSendAnswers_; }
     [[nodiscard]] uint64_t answersWhileAwaitingMetadataForTest() const noexcept { return answersWhileAwaitingMetadata_; }
     [[nodiscard]] uint64_t staleAnswersForTest() const noexcept { return staleAnswers_; }
+    [[nodiscard]] uint64_t okAnswersDisagreeingForTest() const noexcept { return okAnswersDisagreeing_; }
+    /// Test seam (CP1 M5): force the ordinal of the pending AwaitingCommit proposal.
+    void setPendingLastSeqForTest(int32_t v) noexcept {
+        if (auto* a = std::get_if<AwaitingCommit>(&ctrlProposal_)) a->lastSeq = v;
+    }
+    [[nodiscard]] int32_t pendingLastSeqForTest() const noexcept {
+        if (const auto* a = std::get_if<AwaitingCommit>(&ctrlProposal_)) return a->lastSeq;
+        return 0;
+    }
     /// ISR protocol: this node's storage id, captured into every proposal it makes for itself.
     void setStorageId(int64_t s) noexcept { storageId_ = s; }
     [[nodiscard]] uint64_t isrAwaitingMetadataForTest() const noexcept { return isrAwaitingMetadata_; }
@@ -1752,6 +1761,7 @@ private:
     uint64_t olderSendAnswers_ = 0;            ///< answers to an older send of the pending proposal
     uint64_t answersWhileAwaitingMetadata_ = 0;///< answers received outside AwaitingCommit
     uint64_t staleAnswers_ = 0;                ///< answers for another proposal id
+    uint64_t okAnswersDisagreeing_ = 0;        ///< CP1 M1: Ok at our base naming a member our committed ISR lacks
     /// The storage id of a ISR member, captured into a proposal (Step 6 makes it read the follower slot).
     [[nodiscard]] int64_t slotStorage_(NodeId) const noexcept { return 0; }
     static constexpr int64_t kAwaitNewestAnswerNs = 1'000'000'000LL;   ///< 1 s base of the older-send hold (1,2,4,8 s)
@@ -1780,6 +1790,8 @@ private:
     uint64_t isrAwaitingMetadata_   = 0;   ///< proposals that entered AwaitingMetadata (A-M1)
     uint64_t staleAssignments_      = 0;   ///< committed assignments older than the applied one, ignored (A-M5)
     int64_t  invalidRequestBackoffUntilNs_ = 0;   ///< A-M2: no new proposal before this after an InvalidRequest
+    // CP1 M6: a one-shot WARN latch (one bit, no per-state data), reset with the leadership; kept as a bool on purpose -
+    // a std::variant<NotWarned, Warned> would hold the same single bit.
     bool     invalidRequestWarned_  = false;      ///< A-M2: WARN once per leadership
     IsrProposal isrProposal_{};
     /// MEDIUM-1: partitionEpoch of the committed assignment (-1 = unknown /

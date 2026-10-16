@@ -178,6 +178,11 @@ int main(int argc, char** argv) {
         std::cerr << "rune-broker: refusing to start — " << ex.what() << "\n";
         spdlog::critical("rune-broker: refusing to start — {}", ex.what());
         return 78;
+    } catch (const rune::node::StorageIoError& ex) {
+        // CP1 M4: the storage identity could not be read or written (EX_IOERR), as for any storage failure at startup.
+        spdlog::critical("rune-broker: storage failure at startup: {}", ex.what());
+        std::cerr << "rune-broker: storage failure at startup: " << ex.what() << "\n";
+        return 74;
     } catch (const std::exception& ex) {
         spdlog::error("rune-broker: failed to start: {}", ex.what());
         std::cerr << "rune-broker: failed to start: " << ex.what() << "\n";

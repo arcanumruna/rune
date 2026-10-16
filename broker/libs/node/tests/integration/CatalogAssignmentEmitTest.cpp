@@ -1683,6 +1683,46 @@ TEST(ControlledShutdownControllerRegression, ControllerWithAnUnknownLiveSetNever
     EXPECT_EQ(resp.errorCode, rune::replication::kAlterIsrOk) << "never COMPLETE once the live set is known and confirmed";
 }
 
+// CP1 review I2 (sibling of the merge fix above): the live set is learnt per CLAIM.  A controller that re-claims
+// leadership kept the previous leadership's `eligible_` ({1,2} while node 3 was down) and pushed COMPLETE against
+// it: the loop skipped self and the stopping node and waited for nobody.  stepDownController_() now forgets the set.
+// RED: delete `eligible_.clear(); eligibleKnown_ = false;` in stepDownController_ (the first answer is COMPLETE).
+TEST(ControlledShutdownControllerRegression, ReclaimedControllerRelearnsTheLiveSetBeforeConfirmingRegression) {
+    CtlRig c;
+    ASSERT_EQ(c.pa().leaderNode, 1) << "the rig's controller must lead the partition for this scenario";
+    const int32_t F = 2, O = 3;
+    for (int32_t n : {1, 2, 3}) (void)c.svc->onAlterIsr(nodeControl(n, 20 + n, false));   // every member speaks the protocol
+    ASSERT_TRUE(proposeIsr(c, {1, O}));   // F already left every ISR: its map is clear with no further tick
+    ASSERT_EQ(std::count(c.pa().isr.begin(), c.pa().isr.end(), F), 0);
+    c.tick({1, F});   // node 3 is down at THIS leadership: eligible_ = {1, 2}
+    // The controller loses and regains the claim.
+    c.svc->setConsensusLeads(false);
+    c.drive(5);
+    ASSERT_FALSE(c.svc->controllerReady());
+    c.svc->setConsensusLeads(true);
+    for (int i = 0; i < 500 && !c.svc->controllerReady(); ++i) c.drive(1);
+    ASSERT_TRUE(c.svc->controllerReady());
+    // Node 2 stops.  No tick yet: this claim has not learnt the live set.
+    rune::replication::AlterIsrResponseMsg resp{};
+    bool answer = false;
+    (void)c.svc->onAlterIsr(nodeControl(F, 7, /*shutdown=*/true), &resp, &answer);
+    ASSERT_TRUE(answer);
+    EXPECT_EQ(resp.errorCode, rune::replication::AlterIsrMsg::kNodeShutdownPending)
+        << "COMPLETE on the previous leadership's live set";
+    c.tick({1, 2, 3});   // learnt now: node 3 is live and has not confirmed
+    resp = {}; answer = false;
+    (void)c.svc->onAlterIsr(nodeControl(F, 7, true), &resp, &answer);
+    EXPECT_EQ(resp.errorCode, rune::replication::AlterIsrMsg::kNodeShutdownPending) << "COMPLETE before node 3 confirmed";
+    auto conf = nodeControl(F, 7, false);
+    conf.isr[1] = rune::replication::AlterIsrMsg::kNodeShutdownConfirm;
+    conf.isr[2] = O;
+    conf.isr[5] = rune::replication::AlterIsrMsg::kConfirmUserClear | rune::replication::AlterIsrMsg::kConfirmAllClear;
+    (void)c.svc->onAlterIsr(conf);
+    resp = {}; answer = false;
+    (void)c.svc->onAlterIsr(nodeControl(F, 7, true), &resp, &answer);
+    EXPECT_EQ(resp.errorCode, rune::replication::kAlterIsrOk) << "never COMPLETE once the live set is known and confirmed";
+}
+
 // Merge fix (2): the user-only scope belongs to a stopping node that IS the controller (its pre-resign view).  Its
 // successor still held the mark the old controller's Draining broadcasts left (userOnly), and pushed COMPLETE on
 // the members' USER-clear confirmations alone — the stopping node exited while a survivor still routed the
