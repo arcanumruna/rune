@@ -938,8 +938,8 @@ private:
     Meta                    meta_;
     std::deque<Frame>       wire_;
     std::set<std::pair<NodeId, NodeId>> cut_;
-    std::set<NodeId> heldMeta_;
-    int forceInvalidRequest_ = 0;   ///< forceInvalidRequestNext   ///< nodes whose metadata replica lags (holdMetadata)
+    std::set<NodeId> heldMeta_;   ///< nodes whose metadata replica lags (holdMetadata)
+    int forceInvalidRequest_ = 0;   ///< forceInvalidRequestNext: next n well-based proposals answered INVALID_REQUEST
     int                     dropNext_[kKinds] = {};
     uint64_t                framesLost_ = 0;
     uint64_t                sent_[8][kKinds] = {};
