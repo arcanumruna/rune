@@ -16,6 +16,9 @@
 #include "support/CatalogBrokerCluster.h"
 
 #include <rune/node/AdminIsrChannel.h>
+#include <cstdlib>
+#include <fstream>
+#include <string_view>
 #include <rune/node/BrokerNode.h>
 #include <rune/node/CatalogCheckpoint.h>
 #include <rune/node/CatalogPartition.h>
@@ -710,4 +713,128 @@ TEST(CatalogAlterIsrRelayRegression, ARetiredSchemaRoleFrameIsRefusedNotAppliedR
     (void)rig.agent->doWork(1'000'000);
     EXPECT_EQ(rig.agent->badRoleFramesForTest(), 1u);
     EXPECT_NE(rig.replica->role(), rr::Role::Leader) << "the retired role must not make the catalog replica lead";
+}
+
+// ===========================================================================
+// DR-bugs fix round 1, review A-I5: every fixed-port endpoint of the node driver (consensus, replication, client;
+// in fused shard mode worker 0's ingress / replication / egress control) is BOUND before the driver's first
+// publication auto-binds an ephemeral port.
+// ===========================================================================
+// Wiring (every platform): the anchors exist after start.  RED: no anchorFixedEndpoints_ call at start (0).
+TEST(BindOrderRegression, FixedEndpointsAreAnchoredAtStartRegression) {
+    ThreeNodes c = ThreeNodes::start("anchors", {1}, Mode::ShardFused);
+    EXPECT_EQ(c.node(1).bindAnchorsForTest(), 6u)
+        << "consensus + replication + client + shard ingress + shard replication subscriptions, egress control";
+}
+
+// The real proof (Linux gate, run in a container whose netns ephemeral range is NARROW — see
+// scripts/run-linux-regression-vm.sh): the node's fixed ports and its publications' ephemeral sockets come from
+// the same few dozen ports, so a fixed bind that happens after a publication loses its port most of the time.
+// Only node 1 runs (its peers are configured, so it publishes to them; one netns per node in production).
+// RED (anchors removed): most of the 20 starts refuse with "Address already in use".
+TEST(BindOrderRegression, FixedPortsBindBeforeAnyEphemeralPublicationRegression) {
+    const char* gate = std::getenv("RUNE_BIND_ORDER_GATE");
+    if (gate == nullptr || std::string_view(gate) != "1")
+        GTEST_SKIP() << "Linux gate only (RUNE_BIND_ORDER_GATE=1 inside a narrowed ip_local_port_range)";
+#if !defined(__linux__)
+    FAIL() << "RUNE_BIND_ORDER_GATE=1 off Linux";
+#else
+    std::ifstream in("/proc/sys/net/ipv4/ip_local_port_range");
+    long lo = 0, hi = 0;
+    ASSERT_TRUE(static_cast<bool>(in >> lo >> hi));
+    ASSERT_LE(hi - lo + 1, 64) << "the gate needs a narrow range to make the race likely: " << lo << "-" << hi;
+    // The test allocator (FreePort.h) never hands out ephemeral ports — so node 1's six fixed ports are placed
+    // INSIDE the narrowed range explicitly: [lo, lo + 5], the rest of the range is what its own publications
+    // auto-bind from.
+    const auto p0 = static_cast<uint16_t>(lo);
+    auto tweak = [p0](NodeConfig& cfg) {
+        if (cfg.nodeId != 1) return;
+        for (auto& peer : cfg.peers) {
+            if (peer.id != 1) continue;
+            peer.consensusPort = p0; peer.clientPort = static_cast<uint16_t>(p0 + 1);
+            peer.replicationPort = static_cast<uint16_t>(p0 + 2); peer.ingressBasePort = static_cast<uint16_t>(p0 + 3);
+            peer.replBasePort = static_cast<uint16_t>(p0 + 4); peer.egressControlBasePort = static_cast<uint16_t>(p0 + 5);
+        }
+        cfg.clientEndpoint.channel = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(p0 + 1);
+        cfg.workerIngressBasePort = p0 + 3;
+        cfg.workerReplBasePort = p0 + 4;
+        cfg.workerEgressControlBasePort = p0 + 5;
+    };
+    int refused = 0;
+    std::string lastWhat;
+    for (int i = 0; i < 20; ++i) {
+        try {
+            ThreeNodes c = ThreeNodes::start("bindorder", {}, Mode::ShardFused);
+            c.configTweak = tweak;
+            c.startNode(1);
+        } catch (const std::exception& e) {
+            ++refused;
+            lastWhat = e.what();
+        }
+    }
+    EXPECT_EQ(refused, 0) << refused << " of 20 starts refused; last: " << lastWhat;
+#endif
+}
+
+// DR-bugs fix round 1, review B-I6 (catalog sibling): the controller's answer through the REAL catalog relay
+// (encodeCatalogAlterIsrResponse -> role ring -> AdminWorker -> the admin-owned replica) keeps a stale-answered
+// proposal pending and still clears its own InvalidRequest at the base.  RED: the relay loses partitionEpoch.
+TEST(CatalogAlterIsrRelayRegression, StaleAnswerThroughTheCatalogRelayKeepsTheProposalRegression) {
+    CatalogRig rig;
+    AdminRoleMsg lead;
+    lead.leader = true; lead.epoch = 2; lead.leaderId = 1; lead.partitionEpoch = 4;
+    lead.isrCount = 3; lead.isr[0] = 1; lead.isr[1] = 2; lead.isr[2] = 3;
+    ASSERT_TRUE(encodeAdminRole(rig.agent->roleRing(), lead, kMsgCatalogRole));
+    (void)rig.agent->doWork(1'000'000);
+    ASSERT_EQ(rig.replica->role(), rr::Role::Leader);
+    const int32_t live[] = {1, 2};
+    rig.replica->shrinkIsrToLive(std::span<const int32_t>(live, 2), 2'000'000);
+    ASSERT_TRUE(rig.replica->isrProposalPendingForTest());
+    rr::AlterIsrResponseMsg stale{};
+    stale.topicId = kCatalogTopicId; stale.partition = 0; stale.leaderId = 1; stale.leaderEpoch = 2;
+    stale.partitionEpoch = 5; stale.errorCode = rr::kAlterIsrInvalidUpdateVersion;
+    ASSERT_TRUE(encodeCatalogAlterIsrResponse(rig.agent->roleRing(), stale));
+    (void)rig.agent->doWork(3'000'000);
+    EXPECT_TRUE(rig.replica->isrProposalPendingForTest()) << "a stale answer through the catalog relay dropped it";
+    const auto& maximal = rig.replica->maximalIsrForTest();
+    EXPECT_NE(std::find(maximal.begin(), maximal.end(), 3), maximal.end());
+    lead.partitionEpoch = 5;   // the committed assignment resolves it
+    ASSERT_TRUE(encodeAdminRole(rig.agent->roleRing(), lead, kMsgCatalogRole));
+    (void)rig.agent->doWork(4'000'000);
+    EXPECT_FALSE(rig.replica->isrProposalPendingForTest());
+    rig.replica->shrinkIsrToLive(std::span<const int32_t>(live, 2), 5'000'000);
+    ASSERT_TRUE(rig.replica->isrProposalPendingForTest());
+    rr::AlterIsrResponseMsg own = stale;
+    own.errorCode = rr::kAlterIsrInvalidRequest;   // at its base (5)
+    ASSERT_TRUE(encodeCatalogAlterIsrResponse(rig.agent->roleRing(), own));
+    (void)rig.agent->doWork(6'000'000);
+    EXPECT_FALSE(rig.replica->isrProposalPendingForTest()) << "the relay lost partitionEpoch: its own InvalidRequest "
+                                                              "no longer clears the proposal";
+}
+
+// Re-check M1 + M2: the anchors in thread placement (node driver 3 subscriptions; shard driver 2 subscriptions + 1
+// MDC publication) and legacy per-worker egress (3 + W), every anchor publication at the minimum term.
+// RED: delete the attachShardRuntimes_ anchor call (3), the legacy `pubs` loop (3), the term-length suffix.
+namespace {
+void expectAnchorPubsAtMinimumTerm(BrokerNode& n) {
+    int pubs = 0;
+    for (const auto& ch : n.bindAnchorChannelsForTest()) {
+        if (ch.find("control-mode=dynamic") == std::string::npos) continue;
+        ++pubs;
+        EXPECT_NE(ch.find("term-length=65536"), std::string::npos) << "an anchor publication at the default term: " << ch;
+    }
+    EXPECT_GE(pubs, 1);
+}
+} // namespace
+TEST(BindOrderRegression, ThreadPlacementShardDriverIsAnchoredRegression) {
+    ThreeNodes c = ThreeNodes::start("anchors-t", {1}, Mode::Shard);
+    EXPECT_EQ(c.node(1).bindAnchorsForTest(), 6u) << "node driver 3 + shard driver 2 subscriptions + 1 publication";
+    expectAnchorPubsAtMinimumTerm(c.node(1));
+}
+TEST(BindOrderRegression, LegacyPerWorkerEgressIsAnchoredRegression) {
+    ThreeNodes c = ThreeNodes::start("anchors-l", {}, Mode::Legacy);
+    c.configTweak = [](NodeConfig& cfg) { cfg.perWorkerEgressEnabled = true; };
+    c.startNode(1);
+    EXPECT_EQ(c.node(1).bindAnchorsForTest(), 4u) << "consensus + replication + client + one per-worker egress (W=1)";
+    expectAnchorPubsAtMinimumTerm(c.node(1));
 }

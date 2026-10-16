@@ -164,6 +164,22 @@ std::string PeerConfig::replicationChannel() const {
 // NodeConfig
 // ---------------------------------------------------------------------------
 
+std::string NodeConfig::effectiveWorkerEgressControlHost() const {
+    if (!workerEgressControlHost.empty()) return workerEgressControlHost;   // explicit
+    // Re-check I2: the operator's bind address for peer-facing sockets (RUNE_PEER_BIND_HOST — the NAT /
+    // port-mapped escape hatch, the advertised address being on no local interface): the control endpoint binds
+    // where this node's other peer-facing sockets bind; whatever delivers peer traffic there delivers this too.
+    if (!peerBindHostOverride.empty()) return peerBindHostOverride;
+    const std::string adv = peers.empty() ? std::string{} : self().host;    // the advertised host (RUNE_PEERS)
+    if (adv.empty()) {   // no peers: single box
+        const std::string b = clientBindHost();
+        return (b.empty() || b == "0.0.0.0" || b == "::" || b == "[::]") ? std::string("127.0.0.1") : b;
+    }
+    // A numeric advertised host is bound exactly; a NAME binds the wildcard — reachable at whatever the name
+    // resolves to, never an /etc/hosts 127.0.1.1 self-alias (the peerBindHost() rule).
+    return rune::consensus::PeerHostTable::isNumericHost(adv) ? adv : std::string("0.0.0.0");
+}
+
 const PeerConfig& NodeConfig::self() const {
     for (auto& p : peers)
         if (p.id == nodeId) return p;
@@ -384,6 +400,24 @@ int32_t NodeConfig::produceIntakeLimit() const {
 std::optional<std::string> NodeConfig::validateShardConfig() const {
     if (fused() && !shardMode())
         return std::string("RUNE_RUNTIME_PLACEMENT=fused requires RUNE_WORKER_MODE=shard");
+    // Review B-I3: per-worker egress (shard mode always; legacy when enabled) bound on loopback is unreachable
+    // from clients on other hosts — it would silently fall back to legacy egress.  Refuse an explicit loopback
+    // control host on a node advertised at a non-loopback host.
+    // Re-check I2: the same rule for RUNE_PEER_BIND_HOST when it supplies the (derived) control host.
+    if ((shardMode() || perWorkerEgressEnabled) && !peers.empty() &&
+        (!workerEgressControlHost.empty() || !peerBindHostOverride.empty())) {
+        auto loop = [](const std::string& h) {
+            return h == "localhost" || h == "::1" || h == "[::1]" || h.rfind("127.", 0) == 0;
+        };
+        const bool explicitHost = !workerEgressControlHost.empty();
+        const std::string& host = explicitHost ? workerEgressControlHost : peerBindHostOverride;
+        const char* env = explicitHost ? "RUNE_WORKER_EGRESS_CONTROL_HOST" : "RUNE_PEER_BIND_HOST";
+        const std::string& adv = self().host;
+        if (loop(host) && !adv.empty() && !loop(adv))
+            return std::string(env) + "=" + host + " is loopback but this node is "
+                   "advertised as " + adv + ": clients on other hosts cannot reach per-worker egress (it would "
+                   "silently fall back to legacy egress) — unset it (derived) or set a reachable address";
+    }
     if (!shardMode()) return std::nullopt;
 
     const int32_t W = workerCount >= 1 ? workerCount : 1;
@@ -458,6 +492,9 @@ std::optional<std::string> NodeConfig::validateShardConfig() const {
         for (int32_t w = 0; w < W; ++w) {
             theirs.push_back({p.ingressBasePort + w, "workerIngress[w" + std::to_string(w) + "]"});
             theirs.push_back({p.replBasePort + w, "workerRepl[w" + std::to_string(w) + "]"});
+            // Review A-M6: the peer's egress-control ports collide too (found only as a bind failure before).
+            if (p.egressControlBasePort != 0)
+                theirs.push_back({p.egressControlBasePort + w, "workerEgressControl[w" + std::to_string(w) + "]"});
         }
         for (const auto& a : binds)
             for (const auto& b : theirs)

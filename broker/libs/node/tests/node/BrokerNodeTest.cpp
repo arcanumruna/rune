@@ -1067,7 +1067,7 @@ TEST(BrokerNodeTest, PerWorkerEgressWiredWithContiguousStreams) {
         EXPECT_EQ(egresses[i]->streamId(), egressBase + i)
             << "worker " << i << " egress stream id must be contiguous from egressBase";
         EXPECT_EQ(egresses[i]->controlEndpoint(),
-                  std::string("127.0.0.1:") + std::to_string(40360 + i))
+                  std::string("127.0.0.1:") + std::to_string(*cfg.workerEgressControlBasePort + i))
             << "worker " << i << " control endpoint must be host:(basePort+workerId)";
     }
 
@@ -2240,4 +2240,292 @@ TEST(BrokerNodeStopRegression, CatalogRegistriesReadableAfterStop) {
     std::error_code ec; fs::remove_all(dir, ec);
 }
 
+} // namespace rune::node
+
+// ===========================================================================
+// DR-bugs fix round 1 (reviews A + B)
+// ===========================================================================
+#include <spdlog/sinks/ringbuffer_sink.h>
+namespace rune::node {
+namespace {
+struct DrBugsLogCapture {   // RAII: never leaks the capture logger into later tests
+    std::shared_ptr<spdlog::sinks::ringbuffer_sink_mt> sink = std::make_shared<spdlog::sinks::ringbuffer_sink_mt>(1024);
+    std::shared_ptr<spdlog::logger> previous = spdlog::default_logger();
+    DrBugsLogCapture() {
+        auto capture = std::make_shared<spdlog::logger>("drbugs-capture", sink);
+        capture->set_level(spdlog::level::info);
+        spdlog::set_default_logger(capture);
+    }
+    ~DrBugsLogCapture() { spdlog::set_default_logger(previous); }
+    int count(const std::string& text) const {
+        int n = 0;
+        for (const std::string& l : sink->last_formatted()) n += l.find(text) != std::string::npos ? 1 : 0;
+        return n;
+    }
+    DrBugsLogCapture(const DrBugsLogCapture&) = delete;
+    DrBugsLogCapture& operator=(const DrBugsLogCapture&) = delete;
+};
+} // namespace
+
+// Review B-I2: the link-MTU watchdog — one ERROR on the below edge, one WARN on the restore edge, nothing between,
+// and the deficit counter follows.  Driven through the probe seam on the control thread.  RED: no edge check (the
+// three below ticks log three ERRORs).
+TEST(BrokerNodeRegression, LinkMtuWatchdogWarnsOnceOnEachEdgeRegression) {
+    const fs::path dir = makeTempDataDir("mtuwd_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    cfg.aeronMtuBytes = 1472;   // explicit: needed = 1500 on IPv4
+    DrBugsLogCapture log;   // installed BEFORE any broker thread exists, and outlives the node (TSan)
+    BrokerNode node{cfg};
+    std::atomic<int32_t> linkMtu{1500};   // the probe runs on the control thread; the test thread sets it
+    node.setMtuProbeForTest([&linkMtu] { return linkMtu.load(); });
+    node.start();
+    ASSERT_EQ(node.effectiveConfigForTest().aeronMtuBytes, 1472);
+    EXPECT_EQ(node.runMtuWatchdogForTest(), 0);
+    linkMtu.store(1200);
+    EXPECT_EQ(node.runMtuWatchdogForTest(), 300);
+    EXPECT_EQ(node.runMtuWatchdogForTest(), 300);
+    EXPECT_EQ(node.runMtuWatchdogForTest(), 300);
+    linkMtu.store(1500);
+    EXPECT_EQ(node.runMtuWatchdogForTest(), 0);
+    const auto edges = node.mtuWatchdogEdgesForTest();
+    EXPECT_EQ(edges.first, 1u);
+    EXPECT_EQ(edges.second, 1u);
+    EXPECT_EQ(log.count("is below the Aeron MTU"), 1) << "the below edge logs exactly once";
+    EXPECT_EQ(log.count("link MTU restored to 1500"), 1);
+    node.stop();
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+
+// Review B-M5: the startup ephemeral-range WARN is wired (probe -> applyHostDerivedDefaults -> log).  The client
+// port P is placed inside an overridden range [P, P].  RED: drop the conflict block in applyHostDerivedDefaults.
+TEST(BrokerNodeRegression, StartupWarnsAboutAnEphemeralBoundPortRegression) {
+    const fs::path dir = makeTempDataDir("ephwarn_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    const uint16_t clientPort = rune::node::test::freeUdpPort();
+    cfg.clientEndpoint.channel = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(clientPort);
+    for (auto& p : cfg.peers) p.clientPort = clientPort;
+    DrBugsLogCapture log;   // before any broker thread exists, outlives the node (TSan)
+    BrokerNode node{cfg};
+    node.setHostNetFactsOverrideForTest([clientPort](HostNetFacts& f) {
+        f.ephemeralPortLow = clientPort; f.ephemeralPortHigh = clientPort; f.reservedPorts.clear();
+    });
+    node.start();
+    EXPECT_GE(log.count("UDP port(s) " + std::to_string(clientPort)), 1) << "the startup line must name the port";
+    node.stop();
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+
+// Review B-M1 / re-check I4: in legacy mode a per-worker egress whose control port is TAKEN refuses to start at the
+// bind ANCHOR (start(), before any publication) — naming the endpoint and the reserving sysctl.  RED: no anchor (the
+// buildWorkerPool backstop then fires with a different message).
+TEST(BrokerNodeRegression, LegacyPerWorkerEgressControlPortTakenRefusesAtTheBindAnchorRegression) {
+    const fs::path dir = makeTempDataDir("legegress_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    cfg.workerMode = NodeConfig::WorkerMode::Legacy;
+    cfg.runtimePlacement = NodeConfig::RuntimePlacement::Thread;
+    cfg.perWorkerEgressEnabled = true;
+    const uint16_t egressPort = rune::node::test::freeUdpPort();
+    cfg.workerEgressControlBasePort = egressPort;
+    ASSERT_EQ(cfg.effectiveWorkerEgressControlHost(), "127.0.0.1") << "single loopback node";
+    const int squat = ::socket(AF_INET, SOCK_DGRAM, 0);
+    ASSERT_GE(squat, 0);
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(egressPort);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ASSERT_EQ(::bind(squat, reinterpret_cast<sockaddr*>(&a), sizeof(a)), 0) << "test setup: occupy the control port";
+    bool refused = false;
+    std::string what;
+    {
+        BrokerNode node{cfg};
+        try { node.start(); } catch (const std::exception& e) { refused = true; what = e.what(); }
+        if (!refused) node.stop();
+    }
+    ::close(squat);
+    EXPECT_TRUE(refused) << "a taken per-worker egress control port must refuse the start";
+    EXPECT_NE(what.find("fixed endpoint"), std::string::npos) << what;
+    EXPECT_NE(what.find("ip_local_reserved_ports"), std::string::npos) << what;
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+} // namespace rune::node
+
+namespace rune::node {
+// Re-check I2: a node advertised at an address on NO local interface (NAT / port mapping, here TEST-NET-1) that
+// binds its peer-facing sockets on RUNE_PEER_BIND_HOST=0.0.0.0 must start — its derived egress control host is the
+// override, not the unbindable advertised address.  RED: without the override line the egress anchor binds
+// control=192.0.2.1:<port> and start() throws "fixed endpoint ... could not be bound".
+TEST(BrokerNodeRegression, UnbindableAdvertisedAddressWithPeerBindOverrideStartsRegression) {
+    const fs::path dir = makeTempDataDir("natbind_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    cfg.workerMode = NodeConfig::WorkerMode::Shard;
+    cfg.runtimePlacement = NodeConfig::RuntimePlacement::Fused;
+    cfg.workerCount = 1;
+    cfg.peers[0].host = "192.0.2.1";
+    cfg.peers[0].replicationPort = rune::aeronutil::testing::allocFreeUdpPort();
+    cfg.peers[0].ingressBasePort = rune::aeronutil::testing::allocFreeUdpPort();
+    cfg.peers[0].replBasePort = rune::aeronutil::testing::allocFreeUdpPort();
+    cfg.peers[0].egressControlBasePort = rune::aeronutil::testing::allocFreeUdpPort();
+    cfg.workerIngressBasePort = cfg.peers[0].ingressBasePort;
+    cfg.workerReplBasePort = cfg.peers[0].replBasePort;
+    cfg.workerEgressControlBasePort = cfg.peers[0].egressControlBasePort;
+    cfg.peerBindHostOverride = "0.0.0.0";
+    cfg.clientEndpoint.channel = "aeron:udp?endpoint=0.0.0.0:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());
+    ASSERT_EQ(cfg.effectiveWorkerEgressControlHost(), "0.0.0.0");
+    BrokerNode node{cfg};
+    std::string what;
+    try { node.start(); } catch (const std::exception& e) { what = e.what(); }
+    EXPECT_TRUE(what.empty()) << "a NAT node with RUNE_PEER_BIND_HOST must start: " << what;
+    if (what.empty()) {
+        EXPECT_EQ(node.bindAnchorsForTest(), 6u);
+        node.stop();
+    }
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+} // namespace rune::node
+
+namespace rune::node {
+namespace {
+std::string startAndCatch(NodeConfig cfg, int32_t forceUnresolved) {
+    std::string what;
+    BrokerNode node{cfg};
+    node.forceWorkerEgressUnresolvedForTest(forceUnresolved);
+    try { node.start(); } catch (const std::exception& e) { what = e.what(); }
+    if (what.empty()) node.stop();
+    return what;
+}
+} // namespace
+
+// Re-check I4: the B-M1 BACKSTOP — a legacy WorkerEgress that does not resolve AFTER its anchor bound (a driver
+// timeout, a channel-parameter clash) refuses to start; never the old WARN-and-disable (that worker would silently
+// serve legacy egress).  RED: the old WARN-and-continue in buildWorkerPool (start succeeds).
+TEST(BrokerNodeRegression, LegacyPerWorkerEgressUnresolvedAfterItsAnchorRefusesToStartRegression) {
+    const fs::path dir = makeTempDataDir("legunres_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    cfg.workerMode = NodeConfig::WorkerMode::Legacy;
+    cfg.runtimePlacement = NodeConfig::RuntimePlacement::Thread;
+    cfg.perWorkerEgressEnabled = true;
+    cfg.workerCount = 1;
+    cfg.workerEgressControlBasePort = rune::node::test::freeUdpPort();
+    const std::string what = startAndCatch(cfg, /*forceUnresolved=*/0);
+    EXPECT_NE(what.find("per-worker egress for worker 0"), std::string::npos) << what;
+    EXPECT_NE(what.find("would silently fall back"), std::string::npos) << what;
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+
+// Re-check I4 (shard twin): a shard's egress that does not resolve after its anchor refuses at attachShardRuntimes_.
+// RED: the forced-unresolved check removed from the shard path (start succeeds).
+TEST(BrokerNodeRegression, ShardEgressUnresolvedAfterItsAnchorRefusesToStartRegression) {
+    const fs::path dir = makeTempDataDir("shardunres_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    cfg.workerMode = NodeConfig::WorkerMode::Shard;
+    cfg.runtimePlacement = NodeConfig::RuntimePlacement::Thread;
+    cfg.workerCount = 1;
+    cfg.peers[0].ingressBasePort = rune::node::test::freeUdpPort();
+    cfg.peers[0].replBasePort = rune::node::test::freeUdpPort();
+    cfg.peers[0].egressControlBasePort = rune::node::test::freeUdpPort();
+    cfg.workerIngressBasePort = cfg.peers[0].ingressBasePort;
+    cfg.workerReplBasePort = cfg.peers[0].replBasePort;
+    cfg.workerEgressControlBasePort = cfg.peers[0].egressControlBasePort;
+    const std::string what = startAndCatch(cfg, /*forceUnresolved=*/0);
+    EXPECT_NE(what.find("shard 0 ingress/egress did not resolve"), std::string::npos) << what;
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+} // namespace rune::node
+
+namespace rune::node {
+namespace {
+std::atomic<std::thread::id> gMtuControlTid{};
+std::atomic<int>             gMtuResolves{0};
+std::atomic<bool>            gMtuResolvedOnControl{false};
+void mtuResolveHook() {
+    gMtuResolves.fetch_add(1);
+    if (std::this_thread::get_id() == gMtuControlTid.load()) gMtuResolvedOnControl.store(true);
+}
+} // namespace
+
+// Re-check I1: the link-MTU watchdog never resolves a name (getaddrinfo / getifaddrs, blocking + allocating) on the
+// control thread — in fused placement that is worker 0's thread.  The probe target comes from the resolver hub's
+// cold thread over a ring.  RED: resolve inside checkLinkMtu_ (the hook sees the control thread).
+TEST(BrokerNodeRegression, LinkMtuWatchdogNeverResolvesOnTheControlThreadRegression) {
+    const fs::path dir = makeTempDataDir("mtunodns_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    cfg.workerMode = NodeConfig::WorkerMode::Shard;
+    cfg.runtimePlacement = NodeConfig::RuntimePlacement::Fused;
+    cfg.workerCount = 1;
+    cfg.peers[0].host = "192.0.2.1";   // a non-loopback probe host (TEST-NET-1), bound via the override
+    cfg.peers[0].replicationPort = rune::aeronutil::testing::allocFreeUdpPort();
+    cfg.peers[0].ingressBasePort = rune::aeronutil::testing::allocFreeUdpPort();
+    cfg.peers[0].replBasePort = rune::aeronutil::testing::allocFreeUdpPort();
+    cfg.peers[0].egressControlBasePort = rune::aeronutil::testing::allocFreeUdpPort();
+    cfg.workerIngressBasePort = cfg.peers[0].ingressBasePort;
+    cfg.workerReplBasePort = cfg.peers[0].replBasePort;
+    cfg.workerEgressControlBasePort = cfg.peers[0].egressControlBasePort;
+    cfg.peerBindHostOverride = "0.0.0.0";
+    cfg.clientEndpoint.channel = "aeron:udp?endpoint=0.0.0.0:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());
+    gMtuResolves.store(0);
+    gMtuResolvedOnControl.store(false);
+    setMtuProbeResolveHookForTest(&mtuResolveHook);   // before any thread exists
+    {
+        BrokerNode node{cfg};
+        node.start();
+        gMtuControlTid.store(node.onControlThreadForTest([] { return std::this_thread::get_id(); }));
+        for (int i = 0; i < 5; ++i) (void)node.runMtuWatchdogForTest();
+        EXPECT_GE(gMtuResolves.load(), 1) << "the start resolve (startup thread) must have run";
+        EXPECT_FALSE(gMtuResolvedOnControl.load()) << "the watchdog resolved a name ON the control thread";
+        node.stop();
+    }
+    setMtuProbeResolveHookForTest(nullptr);
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+
+// Re-check I6: a broker logs "per-worker MDC egress connected" exactly once for the worker a consumer
+// connected to, and never for a worker no consumer reached — legacy per-worker egress and shard mode alike.
+// The consumer is a raw dynamic-MDC subscription on worker 1's control endpoint (what the client's egress
+// subscribe builds).  RED: the Worker pass never calls noteConnected (0 lines).
+static void expectEgressConnectedLineOnlyForTheSubscribedWorker(bool shard) {
+    TempDir tmp{shard ? "egresslog_s_" : "egresslog_l_"};
+    NodeConfig cfg = makeSingleNodeConfig(tmp.path);
+    cfg.workerCount            = 2;
+    cfg.perWorkerEgressEnabled = true;
+    if (shard) cfg.workerMode = NodeConfig::WorkerMode::Shard;
+    cfg.aeronDir                    = (tmp.path / "aeron").string();
+    cfg.workerEgressControlHost     = "127.0.0.1";
+    cfg.workerEgressControlBasePort = rune::aeronutil::testing::allocFreeUdpPortRange(2);
+    DrBugsLogCapture log;   // before any broker thread exists; outlives the node (TSan)
+    {
+        BrokerNode node{cfg};
+        ASSERT_NO_THROW(node.start());
+        const auto& egresses = node.workerEgressesForTest();
+        ASSERT_EQ(egresses.size(), 2u);
+        ASSERT_NE(egresses[1], nullptr);
+        const std::string control = egresses[1]->controlEndpoint();
+        const int32_t stream = egresses[1]->streamId();
+        aeron::Context ctx;
+        ctx.aeronDir(cfg.aeronDir);
+        auto aeron = aeron::Aeron::connect(ctx);
+        const int64_t reg = aeron->addSubscription(
+            "aeron:udp?control=" + control + "|control-mode=dynamic|endpoint=127.0.0.1:" +
+                std::to_string(rune::aeronutil::testing::allocFreeUdpPort()), stream);
+        std::shared_ptr<aeron::Subscription> sub;
+        const std::string line1 = "WorkerEgress[w1] per-worker MDC egress connected (control " + control + ")";
+        const auto deadline = std::chrono::steady_clock::now() + 10s;
+        while (std::chrono::steady_clock::now() < deadline && log.count(line1) == 0) {
+            if (!sub) sub = aeron->findSubscription(reg);
+            std::this_thread::sleep_for(5ms);
+        }
+        EXPECT_EQ(log.count(line1), 1) << (shard ? "shard" : "legacy") << ": the connected worker logs once";
+        std::this_thread::sleep_for(300ms);   // hundreds of further passes, still connected
+        EXPECT_EQ(log.count("per-worker MDC egress connected"), 1)
+            << (shard ? "shard" : "legacy") << ": latched — and worker 0, never reached, logs nothing";
+        sub.reset();
+        aeron.reset();
+        node.stop();
+    }
+}
+TEST(WorkerEgressLogRegression, LegacyLogsConnectedOnceForTheSubscribedWorkerOnlyRegression) {
+    expectEgressConnectedLineOnlyForTheSubscribedWorker(false);
+}
+TEST(WorkerEgressLogRegression, ShardLogsConnectedOnceForTheSubscribedWorkerOnlyRegression) {
+    expectEgressConnectedLineOnlyForTheSubscribedWorker(true);
+}
 } // namespace rune::node

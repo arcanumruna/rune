@@ -841,6 +841,85 @@ TEST(AlterIsrControllerRegression, ControllerNeverAddsAFencedReplica) {
 }
 
 
+// DR-bugs fix round 1, review A-I1: while a record for the partition is in flight, the controller answers NO
+// content ("nothing to commit" / Ineligible / InvalidRequest) — such an answer describes a state the leader's
+// proposal is about to leave, and the leader would clear a proposal that then commits.  RED before the fix: the
+// re-send of an in-flight re-admission was answered Ineligible (the member had been fenced meanwhile) while the
+// first send went on to commit it.
+TEST(AlterIsrControllerRegression, IneligibleIsNeverAnsweredWhileTheProposalIsInFlightRegression) {
+    SaeTempDir dir1("inf1"), dir2("inf2"), dir3("inf3");
+    rune::storage::Log log1(dir1.path), log2(dir2.path), log3(dir3.path);
+    log1.recover(); log2.recover(); log3.recover();
+    constexpr NodeId kNode1 = 1, kNode2 = 2, kNode3 = 3;
+    const std::vector<NodeId> allNodes = {kNode1, kNode2, kNode3};
+    InMemoryTransport transport;
+    auto r1 = std::make_unique<PartitionReplica>(makeMetaCfg(kNode1), Role::Leader, 1, allNodes, allNodes, &log1, &transport);
+    auto r2 = std::make_unique<PartitionReplica>(makeMetaCfg(kNode2), Role::Follower, 1, allNodes, allNodes, &log2, &transport);
+    auto r3 = std::make_unique<PartitionReplica>(makeMetaCfg(kNode3), Role::Follower, 1, allNodes, allNodes, &log3, &transport);
+    transport.setLeader(r1.get());
+    transport.addFollower(kNode2, r2.get());
+    transport.addFollower(kNode3, r3.get());
+    MetadataService svc1(r1.get(), kNode1);
+    svc1.configure({TopicSpec{0, 1, 3, "", "t"}}, allNodes);
+    int64_t clock = 0;
+    auto drive = [&](int n) {
+        for (int i = 0; i < n; ++i) {
+            clock += 1'000'000LL;
+            r1->doWork(clock); r2->doWork(clock); r3->doWork(clock);
+            transport.pump(clock);
+            (void)svc1.doWork(clock);
+        }
+    };
+    drive(50);
+    const auto* pa = svc1.assignment(0, 0);
+    ASSERT_NE(pa, nullptr);
+    const int32_t L = pa->leaderNode, le = pa->leaderEpoch;
+    const int32_t dead = (L == 3) ? 2 : 3;
+    std::vector<rune::metadata::NodeId> live, all(allNodes.begin(), allNodes.end());
+    for (int32_t n : allNodes) if (n != dead) live.push_back(n);
+    ASSERT_GE(svc1.runDynamicRebalanceOnTick(live, nullptr), 1u);   // fence `dead`
+    drive(50);
+    pa = svc1.assignment(0, 0);
+    ASSERT_EQ(std::find(pa->isr.begin(), pa->isr.end(), dead), pa->isr.end());
+    (void)svc1.runDynamicRebalanceOnTick(all, nullptr);   // `dead` is eligible again
+    const int32_t pe0 = pa->partitionEpoch;
+    rune::replication::AlterIsrMsg m{};
+    m.topicId = 0; m.partition = 0; m.leaderId = L; m.leaderEpoch = le;
+    m.isrCount = static_cast<int32_t>(pa->isr.size()) + 1;
+    for (std::size_t i = 0; i < pa->isr.size(); ++i) m.isr[i] = pa->isr[i];
+    m.isr[pa->isr.size()] = dead;
+    m.partitionEpoch = pe0;
+    rune::replication::AlterIsrResponseMsg resp{};
+    bool answered = false;
+    ASSERT_TRUE(svc1.onAlterIsr(m, &resp, &answered)) << "the re-admission must be enqueued";
+    // Not driven: the record is in flight.  Case 2 first (guards the move): an identical re-send, `dead` still
+    // eligible — never answered.
+    rune::replication::AlterIsrResponseMsg resp2{};
+    bool answered2 = false;
+    EXPECT_FALSE(svc1.onAlterIsr(m, &resp2, &answered2));
+    EXPECT_FALSE(answered2) << "answered (code " << resp2.errorCode << ") while the proposal was in flight";
+    // Case 1: `dead` turns ineligible while the record is in flight; the re-send must NOT be answered Ineligible.
+    (void)svc1.runDynamicRebalanceOnTick(live, nullptr);
+    rune::replication::AlterIsrResponseMsg resp3{};
+    bool answered3 = false;
+    EXPECT_FALSE(svc1.onAlterIsr(m, &resp3, &answered3));
+    EXPECT_FALSE(answered3) << "answered (code " << resp3.errorCode << ") while the proposal was in flight — the "
+                            "leader would clear a proposal that commits";
+    // The first send commits at pe0 + 1 with `dead` in the ISR.
+    bool sawCommit = false;
+    for (int i = 0; i < 200 && !sawCommit; ++i) {
+        drive(1);
+        pa = svc1.assignment(0, 0);
+        if (pa != nullptr && pa->partitionEpoch == pe0 + 1) {
+            sawCommit = true;
+            EXPECT_NE(std::find(pa->isr.begin(), pa->isr.end(), dead), pa->isr.end())
+                << "the in-flight re-admission did not commit";
+        }
+    }
+    EXPECT_TRUE(sawCommit) << "no commit at pe0+1";
+}
+
+
 // ===========================================================================
 // Re-review 2026-10-04 (fix round 2) MEDIUM-B: the coordinator partitions
 // (__consumer_offsets -1, __transaction_state -2) moved from the internal-ISR /

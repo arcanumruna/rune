@@ -23,6 +23,10 @@
 #include <sched.h>
 #include <sys/vfs.h>
 #endif
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#include <sys/types.h>
+#endif
 
 namespace rune::node {
 
@@ -178,6 +182,12 @@ std::vector<std::string> nodeEndpointHosts(const NodeConfig& cfg) {
     // bind therefore adds nothing (k3s regression: 0.0.0.0 + 127.0.0.1 peers
     // derived the NIC's 1472 → 14-18k rec/s instead of 136k at 65504).  A
     // concrete non-wildcard bind host is where this node receives: included.
+    // Review B-I3: the per-worker egress control host when it is a concrete address (it receives there).
+    if (cfg.shardMode() || cfg.perWorkerEgressEnabled) {
+        const std::string eg = cfg.effectiveWorkerEgressControlHost();
+        if (!isWildcardHost(eg) && !isLoopbackHost(eg) && std::find(hosts.begin(), hosts.end(), eg) == hosts.end())
+            hosts.push_back(eg);
+    }
     const std::string client = cfg.clientEndpoint.channel.empty() ? std::string{} : cfg.clientBindHost();
     if (!isWildcardHost(client) && std::find(hosts.begin(), hosts.end(), client) == hosts.end())
         hosts.push_back(client);
@@ -187,12 +197,101 @@ std::vector<std::string> nodeEndpointHosts(const NodeConfig& cfg) {
 // ---------------------------------------------------------------------------
 // Shard ports + affinity (PURE)
 // ---------------------------------------------------------------------------
+MtuCheck checkLinkMtu(int32_t interfaceMtu, int32_t aeronMtu, bool ipv6) noexcept {
+    MtuCheck c;
+    c.linkMtu = interfaceMtu;
+    c.needed  = aeronMtu + (ipv6 ? kIpv6UdpHeaderBytes : kIpv4UdpHeaderBytes);
+    c.below   = interfaceMtu > 0 && aeronMtu > 0 && interfaceMtu < c.needed;
+    return c;
+}
+
 std::optional<ShardBasePorts> deriveShardBasePorts(int32_t nodeId, int32_t workers) noexcept {
-    if (workers < 1 || workers > NodeConfig::kMaxShardWorkers || nodeId < 0) return std::nullopt;
-    const int64_t base = kDerivedShardPortBase + static_cast<int64_t>(nodeId) * kDerivedShardPortStride;
-    if (base + kDerivedShardPortStride - 1 > 65535) return std::nullopt;
-    const auto b = static_cast<int32_t>(base);
+    if (workers < 1 || workers > NodeConfig::kMaxShardWorkers || nodeId < 0 || nodeId > kMaxDerivedShardNodeId)
+        return std::nullopt;
+    const auto b = static_cast<int32_t>(kDerivedShardPortBase + static_cast<int64_t>(nodeId) * kDerivedShardPortStride);
     return ShardBasePorts{b, b + NodeConfig::kMaxShardWorkers, b + 2 * NodeConfig::kMaxShardWorkers};
+}
+
+namespace {
+/// The port of an "aeron:udp?endpoint=<host>:<port>[|...]" channel; 0 when absent / malformed.
+int32_t channelPort(std::string_view ch) noexcept {
+    const auto ep = ch.find("endpoint=");
+    if (ep == std::string_view::npos) return 0;
+    std::string_view hp = ch.substr(ep + 9);
+    if (const auto bar = hp.find('|'); bar != std::string_view::npos) hp = hp.substr(0, bar);
+    const auto colon = hp.rfind(':');
+    if (colon == std::string_view::npos) return 0;
+    int32_t v = 0;
+    for (const char c : hp.substr(colon + 1)) {
+        if (c < '0' || c > '9') return 0;
+        v = v * 10 + (c - '0');
+        if (v > 65535) return 0;
+    }
+    return v;
+}
+} // namespace
+
+std::vector<int32_t> nodeBoundPorts(const NodeConfig& cfg) {
+    std::vector<int32_t> ports;
+    auto add = [&](int64_t p) { if (p > 0 && p <= 65535) ports.push_back(static_cast<int32_t>(p)); };
+    for (const auto& p : cfg.peers) {
+        if (p.id != cfg.nodeId) continue;
+        add(p.consensusPort);
+        add(p.replicationPort);
+    }
+    add(channelPort(cfg.clientEndpoint.channel));
+    if (cfg.shardMode()) {
+        const int32_t W = cfg.workerCount >= 1 ? cfg.workerCount : 1;
+        for (int32_t w = 0; w < W; ++w) {
+            if (cfg.workerIngressBasePort) add(static_cast<int64_t>(*cfg.workerIngressBasePort) + w);
+            if (cfg.workerReplBasePort)    add(static_cast<int64_t>(*cfg.workerReplBasePort) + w);
+            if (const int32_t e = cfg.effectiveWorkerEgressControlBasePort(); e > 0) add(static_cast<int64_t>(e) + w);
+        }
+    } else if (cfg.perWorkerEgressEnabled) {
+        // Review A-I5 / B-M1: legacy mode's per-worker egress control ports (BrokerNode binds them exactly when
+        // perWorkerEgressEnabled) — the default 40300+w lies inside Linux's ephemeral range.
+        const int32_t W = cfg.workerCount >= 1 ? cfg.workerCount : 1;
+        for (int32_t w = 0; w < W; ++w) add(static_cast<int64_t>(cfg.effectiveWorkerEgressControlBasePort()) + w);
+    }
+    std::sort(ports.begin(), ports.end());
+    ports.erase(std::unique(ports.begin(), ports.end()), ports.end());
+    return ports;
+}
+
+std::vector<int32_t> ephemeralPortConflicts(const std::vector<int32_t>& bound, const HostNetFacts& f) {
+    std::vector<int32_t> out;
+    if (f.ephemeralPortLow <= 0 || f.ephemeralPortHigh < f.ephemeralPortLow) return out;
+    for (const int32_t p : bound) {
+        if (p < f.ephemeralPortLow || p > f.ephemeralPortHigh) continue;
+        bool reserved = false;
+        for (const auto& [lo, hi] : f.reservedPorts) reserved = reserved || (p >= lo && p <= hi);
+        if (!reserved) out.push_back(p);
+    }
+    return out;
+}
+
+std::vector<std::pair<int32_t, int32_t>> parseReservedPorts(std::string_view text) {
+    std::vector<std::pair<int32_t, int32_t>> out;
+    auto num = [](std::string_view t, int32_t& v) {
+        while (!t.empty() && (t.front() == ' ' || t.front() == '\t' || t.front() == '\n')) t.remove_prefix(1);
+        while (!t.empty() && (t.back() == ' ' || t.back() == '\t' || t.back() == '\n')) t.remove_suffix(1);
+        if (t.empty() || t.size() > 5) return false;
+        v = 0;
+        for (const char c : t) { if (c < '0' || c > '9') return false; v = v * 10 + (c - '0'); }
+        return v <= 65535;
+    };
+    while (!text.empty()) {
+        const auto comma = text.find(',');
+        const std::string_view item = text.substr(0, comma);
+        text = comma == std::string_view::npos ? std::string_view{} : text.substr(comma + 1);
+        int32_t lo = 0, hi = 0;
+        if (const auto dash = item.find('-'); dash != std::string_view::npos) {
+            if (num(item.substr(0, dash), lo) && num(item.substr(dash + 1), hi) && lo <= hi) out.emplace_back(lo, hi);
+        } else if (num(item, lo)) {
+            out.emplace_back(lo, lo);
+        }
+    }
+    return out;
 }
 
 int32_t deriveWorkerCoreBase(HostPlatform platform, bool allLoopback, int32_t selfIndex, int32_t nodes,
@@ -332,6 +431,22 @@ HostDerivation applyHostDerivedDefaults(NodeConfig& cfg, const HostNetFacts& fac
         if (portsDerived) mark("shardPorts");
     }
 
+    // DR-BUG-RESTART-BIND: a port this node binds inside the kernel's ephemeral range can be taken by any socket
+    // auto-bound first — this broker's own Aeron publications bind ephemeral ports while the node starts — and the
+    // start then fails "Address already in use".  The derived shard ports never lie there; anything else is loud.
+    if (const auto conflicts = ephemeralPortConflicts(nodeBoundPorts(cfg), facts); !conflicts.empty()) {
+        std::string list;
+        for (const int32_t p : conflicts) { if (!list.empty()) list += ','; list += std::to_string(p); }
+        appendWarn(out.warnings, "UDP port(s) " + list + " this node binds lie inside the kernel's ephemeral port "
+                   "range [" + std::to_string(facts.ephemeralPortLow) + ", " + std::to_string(facts.ephemeralPortHigh) +
+                   "]: a socket auto-bound before the node binds one (another process, or this broker's own Aeron "
+                   "publications) takes it and the start fails with 'Address already in use' — " +
+                   (facts.platform == HostPlatform::Linux
+                        ? "reserve them (sysctl net.ipv4.ip_local_reserved_ports=" + list + ", a per-network-namespace "
+                          "sysctl: docker run --sysctl / compose sysctls) or move them below the range"
+                        : std::string("move them below the range (sysctl net.inet.ip.portrange.first)")));
+    }
+
     // Worker affinity (shard mode only: pinned for cache locality; idle = backoff unless opted in).
     bool allLoopback = !cfg.peers.empty();
     for (const auto& p : cfg.peers) allLoopback = allLoopback && isLoopbackHost(p.host);
@@ -465,7 +580,7 @@ HostDerivation applyHostDerivedDefaults(NodeConfig& cfg, const HostNetFacts& fac
     char line[1536];
     std::snprintf(line, sizeof line,
         "mode=%s placement=%s workers=%d coreBase=%d(%s) idle=%s io=%s ioWq=%s nonWorker=%s drvIdle=%s ctlIdle=%s term=%d ctlTerm=%d fsyncMs{worker=%lld follower=%lld} sparse=%s mtu=%d socketBuffer=%d "
-        "rcvWindow=%d gso=%s gro=%s rings{replOut=%d ingress=%d return=%d} ports{ingress=%d repl=%d egressCtl=%d} "
+        "rcvWindow=%d gso=%s gro=%s rings{replOut=%d ingress=%d return=%d} ports{ingress=%d repl=%d egressCtl=%d derivedBase=%d} "
         "host{loopback=%s ifMtu=%d rmemMax=%lld wmemMax=%lld cpus=%d aeronTmpfs=%s} derived={%s}",
         cfg.shardMode() ? "shard" : "legacy", cfg.fused() ? "fused" : "thread", W, cfg.workerCoreBase,
         cfg.shardMode() ? (cfg.shardWorkersBusySpin() ? "busy-spin" : "backoff") : "idle-cfg", idle.c_str(), io.c_str(), ioWq.c_str(), nonWorker.c_str(), drvIdle.c_str(), ctlIdle.c_str(),
@@ -478,7 +593,7 @@ HostDerivation applyHostDerivedDefaults(NodeConfig& cfg, const HostNetFacts& fac
         cfg.aeronUdpGso ? (facts.udpGso ? "on" : "unsupported") : "off",
         cfg.aeronUdpGso ? (facts.udpGro ? "on" : "unsupported") : "off", cfg.replicationOutboundRingBytes,
         cfg.workerIngressRingBytes, cfg.workerReturnRingBytes, cfg.workerIngressBasePort.value_or(0),
-        cfg.workerReplBasePort.value_or(0), cfg.effectiveWorkerEgressControlBasePort(),
+        cfg.workerReplBasePort.value_or(0), cfg.effectiveWorkerEgressControlBasePort(), kDerivedShardPortBase,
         facts.loopback ? "true" : "false", facts.interfaceMtu, static_cast<long long>(facts.rmemMax),
         static_cast<long long>(facts.wmemMax), static_cast<int>(facts.allowedCpus.size()),
         facts.aeronDirTmpfs ? "true" : "false", derived.c_str());
@@ -571,6 +686,8 @@ int32_t egressInterfaceMtu(const std::string& host, bool& ipv6) {
     return mtu;
 }
 
+void (*g_mtuResolveHook)() = nullptr;   // test only; written before any thread starts
+
 std::vector<int32_t> allowedCpus() {
     std::vector<int32_t> cpus;
 #if defined(__linux__)
@@ -601,7 +718,99 @@ bool onTmpfs(const std::string& path) {
 #endif
 }
 
+void probeEphemeralPorts(HostNetFacts& f) {
+#if defined(__linux__)
+    {
+        std::ifstream in("/proc/sys/net/ipv4/ip_local_port_range");
+        long long lo = 0, hi = 0;
+        if (in >> lo >> hi && lo > 0 && hi >= lo && hi <= 65535) {
+            f.ephemeralPortLow  = static_cast<int32_t>(lo);
+            f.ephemeralPortHigh = static_cast<int32_t>(hi);
+        }
+    }
+    {
+        std::ifstream in("/proc/sys/net/ipv4/ip_local_reserved_ports");
+        std::string text;
+        std::getline(in, text);
+        f.reservedPorts = parseReservedPorts(text);
+    }
+#elif defined(__APPLE__)
+    int first = 0, last = 0;
+    std::size_t len = sizeof first;
+    if (sysctlbyname("net.inet.ip.portrange.first", &first, &len, nullptr, 0) == 0) {
+        len = sizeof last;
+        if (sysctlbyname("net.inet.ip.portrange.last", &last, &len, nullptr, 0) == 0 && first > 0 &&
+            last >= first && last <= 65535) {
+            f.ephemeralPortLow  = first;
+            f.ephemeralPortHigh = last;
+        }
+    }
+#else
+    (void)f;
+#endif
+}
+
 } // namespace
+
+bool MtuProbeTarget::operator==(const MtuProbeTarget& o) const noexcept {
+    return valid == o.valid && ipv6 == o.ipv6 && std::memcmp(ifname, o.ifname, sizeof ifname) == 0;
+}
+
+void setMtuProbeResolveHookForTest(void (*hook)()) noexcept { g_mtuResolveHook = hook; }
+
+MtuProbeTarget resolveMtuProbeTarget(const std::string& hostIn) {
+    if (g_mtuResolveHook != nullptr) g_mtuResolveHook();
+    MtuProbeTarget t;
+    const std::string host = isWildcardHost(hostIn) ? std::string("1.1.1.1") : hostIn;
+    addrinfo hints{};
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_family   = AF_UNSPEC;
+    addrinfo* res = nullptr;
+    const std::string h(stripBrackets(host));
+    if (::getaddrinfo(h.c_str(), "9", &hints, &res) != 0 || res == nullptr) return t;
+    const int family = res->ai_family;
+    const int fd = ::socket(family, SOCK_DGRAM, 0);
+    sockaddr_storage local{};
+    socklen_t llen = sizeof local;
+    const bool ok = fd >= 0 && ::connect(fd, res->ai_addr, res->ai_addrlen) == 0 &&
+                    ::getsockname(fd, reinterpret_cast<sockaddr*>(&local), &llen) == 0;
+    if (fd >= 0) ::close(fd);
+    ::freeaddrinfo(res);
+    if (!ok) return t;
+    ifaddrs* ifs = nullptr;
+    if (::getifaddrs(&ifs) != 0) return t;
+    for (ifaddrs* i = ifs; i != nullptr && !t.valid; i = i->ifa_next) {
+        if (i->ifa_addr == nullptr || i->ifa_addr->sa_family != family || i->ifa_name == nullptr) continue;
+        bool match = false;
+        if (family == AF_INET) {
+            match = reinterpret_cast<const sockaddr_in*>(i->ifa_addr)->sin_addr.s_addr ==
+                    reinterpret_cast<const sockaddr_in*>(&local)->sin_addr.s_addr;
+        } else {
+            match = std::memcmp(&reinterpret_cast<const sockaddr_in6*>(i->ifa_addr)->sin6_addr,
+                                &reinterpret_cast<const sockaddr_in6*>(&local)->sin6_addr, sizeof(in6_addr)) == 0;
+        }
+        if (match && std::strlen(i->ifa_name) < sizeof t.ifname) {
+            std::memcpy(t.ifname, i->ifa_name, std::strlen(i->ifa_name) + 1);
+            t.ipv6  = family == AF_INET6;
+            t.valid = true;
+        }
+    }
+    ::freeifaddrs(ifs);
+    return t;
+}
+
+int32_t readInterfaceMtu(const MtuProbeTarget& t, int fd) noexcept {
+    if (!t.valid || fd < 0) return 0;
+    ifreq ifr{};
+    std::memcpy(ifr.ifr_name, t.ifname, std::min(sizeof ifr.ifr_name, sizeof t.ifname));
+    ifr.ifr_name[sizeof ifr.ifr_name - 1] = '\0';
+    return ::ioctl(fd, SIOCGIFMTU, &ifr) == 0 ? static_cast<int32_t>(ifr.ifr_mtu) : 0;
+}
+
+int32_t probeInterfaceMtu(const std::string& host, bool& ipv6) {
+    ipv6 = false;
+    return egressInterfaceMtu(isWildcardHost(host) ? std::string("1.1.1.1") : host, ipv6);
+}
 
 HostNetFacts probeHostNetFacts(const std::vector<std::string>& endpointHosts, const std::string& aeronDir) {
     HostNetFacts f;
@@ -631,6 +840,7 @@ HostNetFacts probeHostNetFacts(const std::vector<std::string>& endpointHosts, co
     const int64_t div = f.platform == HostPlatform::Linux ? 2 : 1;
     if (f.rmemMax <= 0) f.rmemMax = probeSockCap(SO_RCVBUF, 64LL * 1024 * 1024) / div;
     if (f.wmemMax <= 0) f.wmemMax = probeSockCap(SO_SNDBUF, 64LL * 1024 * 1024) / div;
+    probeEphemeralPorts(f);
     f.allowedCpus   = allowedCpus();
     f.aeronDirTmpfs = !aeronDir.empty() && onTmpfs(aeronDir);
     f.defaultSndBuf = probeSockDefault(SO_SNDBUF);

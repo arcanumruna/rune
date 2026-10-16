@@ -546,3 +546,34 @@ def assert_read_uncommitted_includes(
         f"read-uncommitted: {len(missing)} expected records not delivered: "
         f"{sorted(missing)[:20]}"
     )
+
+
+# ---- per-worker MDC egress is really used (DR re-check I6) ------------------------------------------------
+EGRESS_CONNECTED_LINE = "per-worker MDC egress connected"
+# Logged once at start by a broker whose subscriptions go out on per-worker egress (legacy per-worker egress,
+# or shard mode, where every shard owns its egress).
+_EGRESS_ACTIVE_LINES = ("per-worker EGRESS ACTIVE", "worker shard(s) attached")
+
+
+def assert_per_worker_egress_connected(cluster, topic_id: int, partitions, require_active: bool) -> list[str]:
+    """Every service that leads a subscribed partition (`partitions` of `topic_id`) and runs per-worker egress
+    logged that a consumer connected to its MDC egress — else the clients fell back to legacy egress (B-I3).
+    `require_active`: the run's mode has per-worker egress (the shard overlay), so a broker that never reports
+    it active fails too.  Returns the services checked; [] means no subscribed leader runs per-worker egress."""
+    leaders = cluster.partition_leaders(topic_id)
+    missing = [p for p in partitions if p not in leaders]
+    assert not missing, f"no becomeLeader logged for topic {topic_id} partition(s) {missing}"
+    checked = []
+    for svc in sorted({leaders[p] for p in partitions}):
+        logs = cluster.compose.logs(svc, timeout=30)
+        active = any(line in logs for line in _EGRESS_ACTIVE_LINES)
+        if not active:
+            assert not require_active, (
+                f"{svc} leads a subscribed partition of topic {topic_id} but never reported per-worker egress "
+                f"active in a per-worker-egress run")
+            continue
+        assert EGRESS_CONNECTED_LINE in logs, (
+            f"{svc} leads a subscribed partition of topic {topic_id} with per-worker egress active, but no consumer "
+            f"ever connected to its MDC egress: clients fell back to legacy egress (B-I3)")
+        checked.append(svc)
+    return checked

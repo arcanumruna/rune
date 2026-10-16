@@ -7,6 +7,10 @@
 
 #include <gtest/gtest.h>
 
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <algorithm>
 #include <array>
 #include <map>
 #include <set>
@@ -335,9 +339,9 @@ TEST(HostDefaults, ProbeOfLoopbackReportsLoopbackAndRealLimits) {
 TEST(HostDefaults, DerivedShardPortsAreDisjointAcrossCoLocatedNodes) {
     const auto p0 = deriveShardBasePorts(0, 1);
     ASSERT_TRUE(p0);
-    EXPECT_EQ(p0->ingress, 41000);
-    EXPECT_EQ(p0->repl, 41064);
-    EXPECT_EQ(p0->egressControl, 41128);
+    EXPECT_EQ(p0->ingress, 8200);
+    EXPECT_EQ(p0->repl, 8264);
+    EXPECT_EQ(p0->egressControl, 8328);
     std::set<int32_t> used;
     for (int32_t n = 0; n <= 126; ++n) {
         const auto p = deriveShardBasePorts(n, 64);
@@ -348,7 +352,7 @@ TEST(HostDefaults, DerivedShardPortsAreDisjointAcrossCoLocatedNodes) {
                 EXPECT_TRUE(used.insert(port).second) << "node " << n << " port " << port << " collides";
             }
     }
-    EXPECT_FALSE(deriveShardBasePorts(127, 1)) << "block would pass 65535";
+    EXPECT_FALSE(deriveShardBasePorts(127, 1)) << "block would reach the ephemeral range";
     EXPECT_FALSE(deriveShardBasePorts(-1, 1));
     EXPECT_FALSE(deriveShardBasePorts(0, 65)) << "> kMaxShardWorkers";
 }
@@ -656,7 +660,7 @@ TEST(HostDefaults, SelfPortsComeFromItsAdvertisedPeerEntry) {
 
 TEST(HostDefaults, ExplicitSelfBaseNotAdvertisedInPeersRefusesStart) {
     // Review I3: RUNE_WORKER_INGRESS_BASE_PORT set, RUNE_PEERS silent → every
-    // OTHER node derives 41000+192*id for this node; refuse instead of silently
+    // OTHER node derives 8200+192*id for this node; refuse instead of silently
     // routing peers / clients to a port nobody binds.
     NodeConfig c = threeNodeDefault(1);
     c.workerIngressBasePort = 40520;
@@ -1069,4 +1073,169 @@ TEST(HostDefaults, LongIdleMaxParkWarnsAtStartup) {
     EXPECT_NE(applyHostDerivedDefaults(c, k3sFacts()).warnings.find("up to that late"), std::string::npos);
     NodeConfig d = threeNodeDefault(0);   // the 200 us default: silent
     EXPECT_EQ(applyHostDerivedDefaults(d, k3sFacts()).warnings.find("up to that late"), std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// DR-BUG-RESTART-BIND (dr-e2e test_dr8_chaos_soak, run 4): a SIGKILLed follower restarted in a fresh netns
+// refused to start — "WorkerReplicationTransport[0]: inbound aeron:udp?endpoint=0.0.0.0:41064 ... (98) Address
+// already in use".  41064 (the derived shard repl base) lay inside Linux's ephemeral range 32768–60999, and the
+// broker's own Aeron publications bind ephemeral ports while the node starts, before the shard planes bind
+// theirs: a random one took 41064.  The kernel never auto-binds outside its range, so every derived port now
+// lies below every default range, and a bound port inside the probed range is a loud startup WARN.
+// ---------------------------------------------------------------------------
+TEST(HostDefaultsRegression, DerivedShardPortsLieBelowEveryDefaultEphemeralRangeRegression) {
+    // RED before the fix: node 0's block [41000, 41191] lay inside Linux's default 32768–60999.
+    constexpr int32_t kLinuxLow = 32768, kMacLow = 49152;
+    for (int32_t n = 0; n <= kMaxDerivedShardNodeId; ++n) {
+        const auto p = deriveShardBasePorts(n, NodeConfig::kMaxShardWorkers);
+        ASSERT_TRUE(p) << n;
+        for (int32_t w = 0; w < NodeConfig::kMaxShardWorkers; ++w)
+            for (const int32_t port : {p->ingress + w, p->repl + w, p->egressControl + w}) {
+                EXPECT_GT(port, 1023) << "node " << n << ": privileged port " << port;
+                EXPECT_LT(port, kLinuxLow) << "node " << n << ": port " << port << " inside the Linux ephemeral range";
+                EXPECT_LT(port, kMacLow) << "node " << n << ": port " << port << " inside the macOS ephemeral range";
+            }
+    }
+    // The Linux-default host derives a config with NO ephemeral conflict: a restart always binds.
+    NodeConfig c = threeNodeDefault(1);
+    for (auto& peer : c.peers) { peer.consensusPort = 7110; peer.clientPort = 7200; peer.replicationPort = 7222; }
+    c.clientEndpoint.channel = "aeron:udp?endpoint=0.0.0.0:7200";
+    HostNetFacts f = k3sFacts();
+    f.ephemeralPortLow = 32768; f.ephemeralPortHigh = 60999;
+    const auto hd = applyHostDerivedDefaults(c, f);
+    EXPECT_TRUE(ephemeralPortConflicts(nodeBoundPorts(c), f).empty());
+    EXPECT_EQ(hd.warnings.find("ephemeral"), std::string::npos) << hd.warnings;
+}
+
+TEST(HostDefaultsRegression, NodeBoundPortsListsEveryPortTheNodeBindsRegression) {
+    NodeConfig c = threeNodeDefault(2);
+    c.workerCount = 2;
+    applyHostDerivedDefaults(c, k3sFacts());
+    const auto d = deriveShardBasePorts(2, 2);
+    ASSERT_TRUE(d);
+    std::vector<int32_t> want = {40112, 40202, 40222, d->ingress, d->ingress + 1, d->repl, d->repl + 1,
+                                 d->egressControl, d->egressControl + 1};
+    std::sort(want.begin(), want.end());
+    EXPECT_EQ(nodeBoundPorts(c), want) << "consensus, client, replication + every worker's three shard ports";
+}
+
+TEST(HostDefaultsRegression, BoundPortInsideTheEphemeralRangeWarnsUnlessReservedRegression) {
+    // The dr-e2e / docker compose ports (40111 / 40200 / 40222) lie inside Linux's default range.
+    NodeConfig c = threeNodeDefault(0);
+    HostNetFacts f = k3sFacts();
+    f.ephemeralPortLow = 32768; f.ephemeralPortHigh = 60999;
+    const auto hd = applyHostDerivedDefaults(c, f);
+    EXPECT_EQ(ephemeralPortConflicts(nodeBoundPorts(c), f), (std::vector<int32_t>{40110, 40200, 40220}));
+    EXPECT_NE(hd.warnings.find("UDP port(s) 40110,40200,40220"), std::string::npos) << hd.warnings;
+    EXPECT_NE(hd.warnings.find("ip_local_reserved_ports=40110,40200,40220"), std::string::npos) << hd.warnings;
+    // Reserved (net.ipv4.ip_local_reserved_ports) → never auto-bound → no warning.
+    NodeConfig r = threeNodeDefault(0);
+    f.reservedPorts = parseReservedPorts("40110,40200-40220\n");
+    const auto hr = applyHostDerivedDefaults(r, f);
+    EXPECT_TRUE(ephemeralPortConflicts(nodeBoundPorts(r), f).empty());
+    EXPECT_EQ(hr.warnings.find("ephemeral"), std::string::npos) << hr.warnings;
+    // A host whose range covers the DERIVED block (e.g. 1024–65535) is loud about the shard ports too.
+    NodeConfig w = threeNodeDefault(0);
+    HostNetFacts wide = k3sFacts();
+    wide.ephemeralPortLow = 1024; wide.ephemeralPortHigh = 65535;
+    const auto hw = applyHostDerivedDefaults(w, wide);
+    const auto p0 = deriveShardBasePorts(0, 1);
+    EXPECT_NE(hw.warnings.find(std::to_string(p0->repl)), std::string::npos) << hw.warnings;
+    // Unknown range → no check, no warning.
+    NodeConfig u = threeNodeDefault(0);
+    const auto hu = applyHostDerivedDefaults(u, k3sFacts());
+    EXPECT_EQ(hu.warnings.find("ephemeral"), std::string::npos) << hu.warnings;
+}
+
+TEST(HostDefaultsRegression, ReservedPortsParseLinuxSyntaxRegression) {
+    using R = std::vector<std::pair<int32_t, int32_t>>;
+    EXPECT_EQ(parseReservedPorts(""), R{});
+    EXPECT_EQ(parseReservedPorts("\n"), R{});
+    EXPECT_EQ(parseReservedPorts("8000-8100,9092\n"), (R{{8000, 8100}, {9092, 9092}}));
+    EXPECT_EQ(parseReservedPorts("x,70000,5-3,40111"), (R{{40111, 40111}})) << "malformed items are skipped";
+}
+
+TEST(HostDefaultsRegression, ProbedEphemeralRangeIsSaneOnThisHostRegression) {
+    const HostNetFacts f = probeHostNetFacts({});
+#if defined(__linux__) || defined(__APPLE__)
+    ASSERT_GT(f.ephemeralPortLow, 0) << "the probe must read the kernel's ephemeral range";
+    EXPECT_GE(f.ephemeralPortHigh, f.ephemeralPortLow);
+    EXPECT_LE(f.ephemeralPortHigh, 65535);
+    // On a default-configured host no derived port is ever ephemeral.
+    if (f.ephemeralPortLow >= kLowestDefaultEphemeralPort) {
+        const auto p = deriveShardBasePorts(kMaxDerivedShardNodeId, NodeConfig::kMaxShardWorkers);
+        ASSERT_TRUE(p);
+        EXPECT_LT(p->egressControl + NodeConfig::kMaxShardWorkers - 1, f.ephemeralPortLow);
+    }
+#else
+    EXPECT_EQ(f.ephemeralPortLow, 0);
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// DR-bugs fix round 1
+// ---------------------------------------------------------------------------
+// Review B-I2: the link MTU must carry one Aeron datagram (Aeron MTU + 28 IPv4 / 48 IPv6).  RED: `<=` for `<`
+// flips the 1500/1472 IPv4 case.
+TEST(HostDefaultsRegression, LinkMtuBelowAeronMtuIsDetectedRegression) {
+    const auto a = checkLinkMtu(1200, 1472, false);
+    EXPECT_TRUE(a.below); EXPECT_EQ(a.linkMtu, 1200); EXPECT_EQ(a.needed, 1500);
+    EXPECT_FALSE(checkLinkMtu(1500, 1472, false).below);
+    const auto v6 = checkLinkMtu(1500, 1472, true);
+    EXPECT_TRUE(v6.below); EXPECT_EQ(v6.needed, 1520);
+    EXPECT_FALSE(checkLinkMtu(0, 1472, false).below) << "unknown link MTU is never 'below'";
+}
+
+// Review A-I5 / B-M1: legacy mode with per-worker egress binds effectiveWorkerEgressControlBasePort()+w (default
+// 40300, inside Linux's range): listed and WARNed.  RED: no legacy branch in nodeBoundPorts.
+TEST(HostDefaultsRegression, LegacyPerWorkerEgressPortsAreListedAndWarnedRegression) {
+    NodeConfig c = threeNodeDefault(0);
+    c.workerMode = NodeConfig::WorkerMode::Legacy;
+    c.runtimePlacement = NodeConfig::RuntimePlacement::Thread;
+    c.perWorkerEgressEnabled = true;
+    c.workerCount = 2;
+    HostNetFacts f = k3sFacts();
+    f.ephemeralPortLow = 32768; f.ephemeralPortHigh = 60999;
+    const auto hd = applyHostDerivedDefaults(c, f);
+    const auto ports = nodeBoundPorts(c);
+    EXPECT_NE(std::find(ports.begin(), ports.end(), 40300), ports.end());
+    EXPECT_NE(std::find(ports.begin(), ports.end(), 40301), ports.end());
+    EXPECT_NE(hd.warnings.find("40300"), std::string::npos) << hd.warnings;
+    EXPECT_NE(hd.warnings.find("40301"), std::string::npos) << hd.warnings;
+}
+
+// Review A-M6: a co-located peer's egress-control ports are part of the collision check.  RED: omit them.
+TEST(HostDefaultsRegression, CoLocatedPeerEgressControlCollisionRefusesStartRegression) {
+    NodeConfig c = threeNodeDefault(1);
+    applyHostDerivedDefaults(c, k3sFacts());
+    ASSERT_FALSE(c.validateShardConfig().has_value()) << *c.validateShardConfig();
+    for (auto& p : c.peers)
+        if (p.id == 0) p.egressControlBasePort = static_cast<uint16_t>(*c.workerIngressBasePort);   // = node 1's ingress
+    const auto err = c.validateShardConfig();
+    ASSERT_TRUE(err.has_value()) << "a co-located peer's egress-control port collides with this node's ingress";
+    EXPECT_NE(err->find("co-located peer 0"), std::string::npos) << *err;
+}
+
+// Review A-I4 ruling (rolling upgrade across the 41000 -> 8200 move is not supported): the startup line names
+// the derived base so a mixed-version cluster is diagnosable.  RED: no derivedBase field.
+TEST(HostDefaultsRegression, StartupLineNamesTheDerivedShardPortBaseRegression) {
+    NodeConfig c = threeNodeDefault(0);
+    const auto hd = applyHostDerivedDefaults(c, k3sFacts());
+    EXPECT_NE(hd.summary.find("derivedBase=" + std::to_string(kDerivedShardPortBase)), std::string::npos) << hd.summary;
+}
+
+// Re-check I1: the watchdog's target resolves on a cold thread; the control thread reads it by one ioctl.  RED:
+// resolveMtuProbeTarget always invalid (the watchdog would be off everywhere).
+TEST(HostDefaultsRegression, MtuProbeTargetResolvesOnceAndReadsByIoctlRegression) {
+    const MtuProbeTarget lo = resolveMtuProbeTarget("127.0.0.1");
+    ASSERT_TRUE(lo.valid);
+    const std::string name(lo.ifname);
+    EXPECT_TRUE(name == "lo0" || name == "lo") << name;
+    EXPECT_FALSE(lo.ipv6);
+    const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+    ASSERT_GE(fd, 0);
+    EXPECT_GT(readInterfaceMtu(lo, fd), 0);
+    EXPECT_EQ(readInterfaceMtu(MtuProbeTarget{}, fd), 0) << "an invalid target reads unknown";
+    ::close(fd);
+    EXPECT_FALSE(resolveMtuProbeTarget("no-such-host.invalid").valid);
 }

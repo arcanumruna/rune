@@ -27,6 +27,7 @@
 #include <rune/consensus/IdleStrategy.h>
 #include <rune/consensus/NanoClock.h>
 #include <rune/consensus/PeerResolution.h>
+#include <rune/node/HostDefaults.h>   // MtuProbeTarget (re-check I1)
 
 #include <cstdint>
 #include <functional>
@@ -73,6 +74,16 @@ public:
     /// Controller, before start(): an ad-hoc host-resolution port (the client
     /// gateway's reply-channel hostnames — fix round 2, LOW-4).
     [[nodiscard]] rune::consensus::HostResolvePort subscribeHostResolver();
+
+    /// Re-check I1 (DR-bugs fix round 2): the link-MTU watchdog's probe target (HostDefaults MtuProbeTarget) for
+    /// `host`, resolved on THIS cold thread (getaddrinfo / getifaddrs never on the control thread).  Controller,
+    /// before start(): resolved once now (startup thread), then re-resolved every kRecheckNs and posted on CHANGE
+    /// only (a full ring is retried next pass).  Messages: kMtuProbeTargetV4 / V6 {a, b = the 16 interface-name
+    /// bytes}, kMtuProbeTargetInvalid.  One probe per hub.
+    [[nodiscard]] rune::consensus::PeerResolutionRing* subscribeMtuProbe(const std::string& host);
+    static constexpr std::int32_t kMtuProbeTargetV4      = 101;
+    static constexpr std::int32_t kMtuProbeTargetV6      = 102;
+    static constexpr std::int32_t kMtuProbeTargetInvalid = 103;
 
     /// Start / stop (join) the hub thread (only when there is something to
     /// resolve: a managed host or a host-resolution port).  Idempotent.
@@ -129,6 +140,16 @@ private:
         std::vector<std::pair<std::int64_t, std::int64_t>> outbox;   // {reqId, ipv4 | -1} not yet posted
     };
     std::vector<Port>              ports_;   // fixed before start()
+    struct MtuProbe {
+        std::string                                          host;
+        std::unique_ptr<rune::consensus::PeerResolutionRing> ring;
+        MtuProbeTarget                                       last{};
+        bool                                                 dirty = false;   // last post failed: re-post
+        int64_t                                              nextNs = 0;
+    };
+    std::unique_ptr<MtuProbe>      mtu_;     // fixed before start(); hub-thread-owned once started
+    int  serveMtuProbe_(int64_t nowNs);
+    bool postMtu_() noexcept;
     Agent                          agent_{*this};
     rune::consensus::MonotonicNanoClock clock_;
     std::unique_ptr<rune::consensus::BackoffIdleStrategy> idle_;

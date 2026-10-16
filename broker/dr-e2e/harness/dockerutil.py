@@ -33,7 +33,8 @@ from . import timing
 
 
 def _git_sha(repo_root: str) -> str:
-    """Return the short HEAD SHA of the repo at *repo_root* (7 hex chars).
+    """Return the short HEAD SHA of the repo at *repo_root* (7 hex chars), with ``-dirty`` appended when tracked
+    files have uncommitted changes (review B-M6: an image built from a dirty tree is not HEAD's code).
 
     Falls back to ``"local"`` if git is unavailable or the directory is not a
     git repo — so the harness still works in bare-binary CI environments.
@@ -44,7 +45,13 @@ def _git_sha(repo_root: str) -> str:
             capture_output=True, text=True, timeout=10,
         )
         sha = result.stdout.strip()
-        return sha if sha else "local"
+        if not sha:
+            return "local"
+        st = subprocess.run(
+            ["git", "-C", repo_root, "status", "--porcelain", "--untracked-files=no"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return sha + "-dirty" if st.returncode == 0 and st.stdout.strip() else sha
     except Exception:
         return "local"
 

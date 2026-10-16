@@ -651,6 +651,15 @@ public:
             return false;
         }
         if (m.isrCount == rr::AlterIsrMsg::kLeaderEpochBump) return bumpLeaderEpoch_(m, *pa, reply);
+        // Review A-I1 (fix round 1): decide — and ANSWER — only on the committed state.  While a record for this
+        // partition is between the committed state and the log end (in flight, or queued), a content answer
+        // ("nothing to commit" / Ineligible / InvalidRequest) would describe a state the leader's proposal may be
+        // about to leave: the leader would clear a proposal that then commits (its HW passing an electable member's
+        // LEO).  Stay silent; the leader re-sends (ReplicationMessages.h contract) and gets the committed answer.
+        const int64_t key = partitionKey_(m.topicId, m.partition);
+        if (inflight_.count(key) != 0) return false;
+        for (const auto& q : pendingDynamicRecords_)
+            if (q.rec.topicId == m.topicId && q.rec.partition == m.partition) return false;
         std::vector<int32_t> isr;
         isr.reserve(static_cast<std::size_t>(m.isrCount));
         bool hasLeader = false, droppedIneligible = false;
@@ -692,10 +701,6 @@ public:
                 return false;
             }
         }
-        const int64_t key = partitionKey_(m.topicId, m.partition);
-        if (inflight_.count(key) != 0) return false;   // decide on the committed state only
-        for (const auto& q : pendingDynamicRecords_)
-            if (q.rec.topicId == m.topicId && q.rec.partition == m.partition) return false;
         rune::metadata::BalancerRecord br;
         br.isr      = std::move(isr);
         br.replicas = pa->replicas;

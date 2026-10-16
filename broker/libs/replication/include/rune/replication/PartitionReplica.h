@@ -484,7 +484,13 @@ public:
     /// Test view: a new internal leadership has not yet committed its first ISR.
     [[nodiscard]] bool internalSeedPendingForTest() const noexcept { return internalSeedPending_; }
     /// Test view: an AlterIsr proposal is in flight.
-    [[nodiscard]] bool isrProposalPendingForTest() const noexcept { return isrProposal_.pending; }
+    [[nodiscard]] bool isrProposalPendingForTest() const noexcept { return isrProposal_.pending(); }
+    [[nodiscard]] bool isrProposalAwaitingMetadataForTest() const noexcept {
+        return isrProposal_.phase == ProposalPhase::AwaitingMetadata;
+    }
+    [[nodiscard]] uint64_t isrAwaitingMetadataForTest() const noexcept { return isrAwaitingMetadata_; }
+    [[nodiscard]] bool isrAwaitingMetadataWarnedForTest() const noexcept { return isrProposal_.awaitingWarned; }
+    [[nodiscard]] uint64_t staleAssignmentsForTest() const noexcept { return staleAssignments_; }
     /// Test view: the maximal ISR the HW is computed over (committed ∪ proposed).
     [[nodiscard]] const std::vector<NodeId>& maximalIsrForTest() const noexcept;
 
@@ -1676,13 +1682,46 @@ private:
     // for good (only transiently: another change for the partition in flight),
     // so a pending proposal always resolves.  The HW counts committed ∪ pending
     // (KIP-497/841 maximal ISR).
+    // Review A-M1 (fix round 1): the proposal is a state machine, not a flag.
+    //   None             — no proposal.
+    //   Sent             — in flight: re-sent every kAlterIsrResendNs until committed or answered.
+    //   AwaitingMetadata — answered InvalidUpdateVersion / FencedLeaderEpoch: a newer committed assignment
+    //                      exists that this replica has not applied; ONLY that assignment resolves it (the
+    //                      answer never does — DR-BUG-6 residual).  Re-sent at kAwaitingMetadataResendNs (loss
+    //                      recovery only: the answer may have come from a zombie controller); WARN once after
+    //                      kAwaitingMetadataWarnNs (a wedged metadata replica is never silent).
+    // Both non-None phases count the proposed members in the maximal ISR.
+    enum class ProposalPhase : uint8_t { None = 0, Sent = 1, AwaitingMetadata = 2 };
     struct IsrProposal {
-        bool                pending = false;
+        ProposalPhase       phase = ProposalPhase::None;
         std::vector<NodeId> isr;          ///< proposed ISR (AlterIsr)
         int64_t             sentNs  = 0;
         int32_t             basePartitionEpoch = -1;   ///< MEDIUM-1: the CAS version it was derived from
         int64_t             version = 0;               ///< internal quorum mode: the published version
+        int64_t             awaitingSinceNs = 0;       ///< AwaitingMetadata only: when the stale answer arrived
+        bool                awaitingWarned  = false;   ///< AwaitingMetadata only: the 10 s WARN was emitted
+        [[nodiscard]] bool pending() const noexcept { return phase != ProposalPhase::None; }
     };
+    /// Resets the proposal IN PLACE (the member vector keeps its capacity): every exit from Leader and every
+    /// new leadership (review A-M3/A-M4, B-M2).  `version` (internal quorum mode) is reset too.
+    void resetIsrProposal_() noexcept {
+        isrProposal_.phase = ProposalPhase::None;
+        isrProposal_.isr.clear();
+        isrProposal_.sentNs = 0;
+        isrProposal_.basePartitionEpoch = -1;
+        isrProposal_.version = 0;
+        isrProposal_.awaitingSinceNs = 0;
+        isrProposal_.awaitingWarned = false;
+    }
+    void clearIsrProposalPhase_() noexcept {   // resolved (committed / answered for THIS base): members kept for capacity
+        isrProposal_.phase = ProposalPhase::None;
+        isrProposal_.awaitingSinceNs = 0;
+        isrProposal_.awaitingWarned = false;
+    }
+    uint64_t isrAwaitingMetadata_   = 0;   ///< proposals that entered AwaitingMetadata (A-M1)
+    uint64_t staleAssignments_      = 0;   ///< committed assignments older than the applied one, ignored (A-M5)
+    int64_t  invalidRequestBackoffUntilNs_ = 0;   ///< A-M2: no new proposal before this after an InvalidRequest
+    bool     invalidRequestWarned_  = false;      ///< A-M2: WARN once per leadership
     IsrProposal isrProposal_{};
     /// MEDIUM-1: partitionEpoch of the committed assignment (-1 = unknown /
     /// not controller-managed).  Set by every becomeLeader.
@@ -1775,6 +1814,8 @@ private:
     }
     bool fenceErrorLogged_ = false;
     static constexpr int64_t kAlterIsrResendNs = 50'000'000LL;   // 50 ms
+    static constexpr int64_t kAwaitingMetadataResendNs = 1'000'000'000LL;   // 1 s (A-M1: loss recovery only)
+    static constexpr int64_t kAwaitingMetadataWarnNs   = 10'000'000'000LL;  // 10 s (A-M1: a wedged metadata replica)
     std::array<uint8_t, ErrorPayload::SIZE> errPayload_{};      ///< DivergingEpoch / OOR answer payload
     uint64_t v2RefusalsLogged_ = 0;                             ///< mixed v2/v3: CRITICAL once
     [[nodiscard]] bool internalPartition_() const noexcept { return cfg_.topicId < 0; }

@@ -5,7 +5,7 @@
 #     build-dir  default build-fast
 #     jobs       default 10 (stage a's -j)
 #
-# Two stages, BOTH mandatory at every checkpoint (a checkpoint is green only when both are):
+# Three stages, ALL mandatory at every checkpoint (a checkpoint is green only when all are):
 #   (a) every *Regression* test EXCEPT the latency gates, in parallel:
 #         ctest -R "Regression|^batch:" -LE "latency|small" -j<jobs>
 #       Every real-BrokerNode / UDP suite runs here concurrently: each process binds only ports it owns
@@ -17,7 +17,10 @@
 #       otherwise idle host — a latency measurement must not share the CPU with other test processes:
 #         ctest -R Regression -L latency
 #       Never skip (b): the gates are part of the regression suite, only scheduled apart.
-# Prints each stage's wall time and the total; exits non-zero if either stage failed.  A latency stage over
+#   (c) the Linux-only tests (review B-I1): on the Mac, scripts/run-linux-regression-vm.sh runs them on the VM;
+#       RUNE_SKIP_LINUX_STAGE=1 skips it and the run is reported NOT GREEN (exit 3).  On Linux,
+#       scripts/linux-stage-c.sh runs them (needs CAP_NET_ADMIN + a configurable netns, else NOT GREEN, exit 3).
+# Prints each stage's wall time and the total; exits non-zero if any stage failed.  A latency stage over
 # 60 s is reported (it is the serial tail of every checkpoint).
 set -u
 B="${1:-build-fast}"; shift || true
@@ -43,13 +46,27 @@ echo "== stage b: *Regression* latency gates (serial)"
 ctest --test-dir "$B" -R Regression -L latency --output-on-failure "$@"; rcB=$?
 t2=$(now)
 
+# (c) review B-I1: the Linux-only tests (UDP GSO / GRO incl. the DR-BUG-MTU regressions, the bind-order proof).
+#     They are gated (RUNE_LINUX_GATE / RUNE_BIND_ORDER_GATE): stage a's plain run does not exercise them.  On
+#     Linux, scripts/linux-stage-c.sh runs both for real in private netns (re-check M5) — or, without
+#     CAP_NET_ADMIN and a configurable netns, says NOT GREEN (exit 3).  On the Mac they run on the VM.
+echo "== stage c: Linux-only tests"
+if [ "$(uname -s)" = "Linux" ]; then
+    "$(dirname "$0")/linux-stage-c.sh" "$B"; rcC=$?
+elif [ "${RUNE_SKIP_LINUX_STAGE:-0}" = "1" ]; then
+    echo "== NOT GREEN: the Linux-only stage (UdpGsoBindings*, BindOrder) was skipped (RUNE_SKIP_LINUX_STAGE=1)"; rcC=3
+else
+    "$(dirname "$0")/run-linux-regression-vm.sh" 3 "$B"; rcC=$?
+fi
+t3=$(now)
+
 if [ -s "$RUNE_PERTURBED_LOG" ]; then
   echo "== NOTE: $(wc -l < "$RUNE_PERTURBED_LOG" | tr -d ' ') non-injected perturbed cell(s) - look at them ($RUNE_PERTURBED_LOG):"
   cat "$RUNE_PERTURBED_LOG"
 else
   echo "== perturbed cells (non-injected): 0"
 fi
-a=$(el "$t0" "$t1"); b=$(el "$t1" "$t2"); tot=$(el "$t0" "$t2")
-echo "== wall: stage a ${a} s (rc $rcA), stage b ${b} s (rc $rcB), total ${tot} s"
+a=$(el "$t0" "$t1"); b=$(el "$t1" "$t2"); c=$(el "$t2" "$t3"); tot=$(el "$t0" "$t3")
+echo "== wall: stage a ${a} s (rc $rcA), stage b ${b} s (rc $rcB), stage c ${c} s (rc $rcC), total ${tot} s"
 if perl -e "exit !($b > 60)"; then echo "== NOTE: the latency stage took ${b} s (> 60 s)"; fi
-[ "$rcA" -eq 0 ] && [ "$rcB" -eq 0 ]
+[ "$rcA" -eq 0 ] && [ "$rcB" -eq 0 ] && [ "$rcC" -eq 0 ]

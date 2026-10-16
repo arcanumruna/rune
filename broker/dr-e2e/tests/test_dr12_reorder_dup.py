@@ -36,15 +36,13 @@ Scenarios (parametrized):
      knob would strengthen this by controlling per-record size directly; the
      controller can add it.  This scenario asserts that large-volume produce +
      subscribe with reorder+dup active preserves all delivery invariants.
-  5. MTU reduction (documented skip — see below).
-     Reducing interface MTU requires `ip link set dev eth0 mtu <N>` via the
-     netem sidecar (NET_ADMIN). set_mtu() is implemented in harness/faults.py
-     (mirrors _netns_exec).  The scenario applies a reduced MTU (1200 bytes)
-     combined with a large batch to force lower-layer fragmentation, then
-     asserts integrity.  On Docker Desktop (macOS LinuxKit VM) the eth0 interface
-     is virtual and MTU reduction below the standard 1500 may be silently ignored
-     or cause driver issues; if the MTU set command fails or the cluster becomes
-     unreachable the test skips automatically.  On Linux CI this should work.
+  5. MTU reduction (strict, Linux docker host; the DR-BUG-MTU regression).
+     set_mtu() (harness/faults.py, the netem sidecar with NET_ADMIN) lowers eth0
+     of a follower that LEADS a partition of `multi` to 1200 bytes (below the
+     1472-byte Aeron MTU derived at boot) and reads it back.  500 acks=All records,
+     then a live read: every acked partition — the reduced node's included — must
+     deliver, and the reduced node must have logged the GSO path-MTU fallback
+     (preconditions asserted, never skipped).  Docker Desktop: unreliable.
 
 Parametrized matrix:
   Scenario 1 — follower reorder:  reorder_pct in (25, 50) × rep in (0, 1) = 4 cases
@@ -52,7 +50,7 @@ Parametrized matrix:
   Scenario 2b — leader dup:       dup_pct in (5, 10) × rep in (0, 1)       = 4 cases
   Scenario 3 — combined:          param in ('light', 'heavy') × rep in (0,1)= 4 cases
   Scenario 4 — large batch:       rep in (0, 1)                             = 2 cases
-  Scenario 5 — MTU reduction:     (skipped placeholder — see skip reason)   = 1 case
+  Scenario 5 — MTU reduction:     strict (Linux docker host)                = 1 case
   ─────────────────────────────────────────────────────────────────────────────
   Total: 19 parametrized cases (4+4+4+4+2+1).
 
@@ -1048,7 +1046,13 @@ def test_dr12_mtu_reduction_large_batch(fresh_cluster, netem_ready):
     keys, records = 18, 500
     lid, leader_svc = cluster.identify_leader()
     assert_single_leader(cluster)
-    follower_svc = cluster.follower_service()
+    # Review B-I4 precondition 1: the MTU-reduced node must LEAD a partition of `multi` (topic 1), else the
+    # live-read check is vacuous.  Never a skip.
+    leaders = cluster.partition_leaders(1)
+    follower_svc = next((s for s in SERVICES if s != leader_svc and s in leaders.values()), None)
+    if follower_svc is None:
+        pytest.fail(f"no follower of the consensus leader {leader_svc} leads a partition of multi: {leaders}")
+    reduced_parts = sorted(p for p, s in leaders.items() if s == follower_svc)
 
     pre = _produce(cluster, leader_svc, 1, _next_cid_base(), 50, keys)
     assert pre.ok and len(pre.all_produced) == 50, "pre-fault produce failed:\n" + pre.clients[0].raw[-1200:]
@@ -1082,15 +1086,24 @@ def test_dr12_mtu_reduction_large_batch(fresh_cluster, netem_ready):
     assert_per_key_ordering(sub_post)
     assert_exactly_once(sub_post)
 
-    # DR-BUG-MTU (see the speed report): the live read gets nothing from the partition led by the MTU-reduced
-    # node.  Kept strict: the gate shows it until the broker handles a link MTU below its Aeron MTU.
+    # DR-BUG-MTU regression (fixed: rune_gso_bindings falls back to IP fragmentation on a GSO EMSGSIZE): the live
+    # read must deliver every acked partition, the one the MTU-reduced node leads included.
     live_parts = {m.partition for m in sub_live.all_delivered}
     acked_parts = {m.partition for m in committed.all_produced}
+    # Review B-I4 precondition 2: records were acked on the reduced node's partition(s).
+    assert set(reduced_parts) <= acked_parts, (
+        f"no record acked on {follower_svc}'s partitions {reduced_parts} (acked on {sorted(acked_parts)}): the "
+        f"live-read check would be vacuous")
     assert acked_parts <= live_parts, (
         f"DR-BUG-MTU: with {follower_svc} at MTU 1200 (Aeron MTU 1472) the live read delivered partitions "
         f"{sorted(live_parts)} but records were acked on {sorted(acked_parts)}: acked records of partitions "
         f"{sorted(acked_parts - live_parts)} were not delivered for the whole read (they ARE durable: the "
         f"post-restore read above delivered every one)")
+    # Review B-I4 precondition 3 (checked AFTER the live read: a missing fallback must not mask the DR-BUG-MTU failure itself): the fallback path ran on the reduced node (product self-evidence).
+    reduced_log = cluster.compose.logs(follower_svc, timeout=30)
+    assert "exceeds the path MTU" in reduced_log, (
+        f"{follower_svc} never logged the GSO path-MTU fallback: the scenario did not exercise the fix "
+        f"(GSO off on this host / image?)")
     _assert_delivery_invariants(committed, sub_live)
 
     post = run_clients(

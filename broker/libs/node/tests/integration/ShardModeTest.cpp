@@ -2408,6 +2408,9 @@ TEST(UnresolvedPeerStartupRegression, LatePeerJoinsAfterItsHostnameResolvesRegre
         c.replicaLagMaxMs = 500;                              // the absent peer leaves the ISR fast
         for (auto& p : c.peers)
             if (p.id == 2) p.host = kLate;
+        // Review B-I3: node 2 is ADVERTISED under a name — its egress control host is derived (the wildcard), as in
+        // production; an explicit loopback host there now refuses to start (clients elsewhere could not reach it).
+        c.workerEgressControlHost.clear();
         return c;
     };
     auto peerView = [&](const std::string& host, std::uint32_t& ip) {

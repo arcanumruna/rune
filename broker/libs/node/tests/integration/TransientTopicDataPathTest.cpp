@@ -851,9 +851,10 @@ TEST(TransientLineageClusterRegression, FullClusterRestartAnswersAGroupsOffsetAs
     }
     ASSERT_TRUE(first.has_value());
     EXPECT_EQ(first->baseOffset, 0) << "precondition: the ring restarted empty";
-    ASSERT_TRUE(c.subscribe(gatewayChannel(g.ports, leader2), kClientStream, sid2, 0, 0, /*from (reset)=*/0));
-    // Post-restart delivery: a 30 s deadline, not pollUntil's ~5 s cap (a loaded host, ctest -j: 2026-10-15).
-    ASSERT_TRUE(c.pollFor(std::chrono::seconds(30), [&] { return pushedAt(c, 0) >= 1; })) << "the post-restart record was not delivered";
+    ASSERT_TRUE(c.subscribeUntilBound(gatewayChannel(g.ports, leader2), kClientStream, sid2, 0, 0, /*from (reset)=*/0,
+                                      std::chrono::steady_clock::now() + 5s))
+        << "the Subscribe was never bound (re-check I5: a gated Subscribe is answered NotLeader, re-sent)";
+    ASSERT_TRUE(c.pollUntil([&] { return pushedAt(c, 0) >= 1; })) << "the post-restart record was not delivered";
 }
 
 TEST(TransientLineageClusterRegression, RollingRestartKeepsAGroupsOffsetValidRegression) {
@@ -894,6 +895,55 @@ TEST(TransientLineageClusterRegression, RollingRestartKeepsAGroupsOffsetValidReg
 // served while the process lives and answered "none" after a restart.  RED
 // (no single-node authority): the lineage never confirms — every answer stays
 // the retriable NotLeader (no settled answer).
+// Re-check I5 (DR-bugs fix round 2): the "restarted leader: subscribe answered OK, then 0/6 records" stall was the
+// TEST ignoring the gateway's answer.  Diagnosed (2 of 45 runs under 3-process load): the Subscribe on the restarted
+// RF=1 leader was answered ErrorResponse NotLeader — the FU1 gate: that broker had not yet learned the partition's
+// NEW lineage (its metadata replica applies the committed record a moment after the coordinator's does) — nothing
+// was registered, and the fire-and-forget subscribe waited 30 s for records that can never come.  The product
+// contract (an explicit, retriable answer; bound once the lineage is known) is pinned here deterministically: the
+// lineage is held unknown, the answer must be NotLeader (never silence), and the re-sent Subscribe — released on
+// the first NotLeader — binds and delivers every record within the original cap.
+// RED: (a) the gateway drops the gated Subscribe silently (no answer); (b) subscribeUntilBound treats NotLeader as
+// final (the old fire-and-forget behaviour: never bound, 0 records).
+TEST(TransientLineageClusterRegression, SubscribeWhileTheLineageIsUnknownIsAnsweredRetriableAndBindsOnceKnownRegression) {
+    TmpDir dir{"lgsub"}, cdir{"lgsubc"};
+    const auto ports = Ports::discover(1);
+    const auto cfg = makeConfig(0, dir.path, ports, 1, /*shard=*/true);
+    ShardTestClient c(cdir.path);
+    c.setClientVersion(rune::protocol::client::kClientVersion);
+    const std::string gw = gatewayChannel(ports, 0);
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(10'000ms));
+    ASSERT_EQ(defineTt({&node}), 0);
+    const int64_t sid = c.connect(gw, kClientStream);
+    for (int b = 0; b < 3; ++b)
+        ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(ports, 0), kClientStream, sid, 0, 0, 1, makeBatch(4)));
+    node.holdTransientLineageForTest(true);
+    const uint64_t awaiting0 =
+        node.onControlThreadForTest([&] { return node.gatewayForTest()->subscribesAwaitingLineageForTest(); });
+    const int64_t corr = c.subscribeIsolated(gw, kClientStream, sid, 0, 0, /*from=*/0, /*isolation=*/0);
+    const auto code = c.awaitSubscribeCode(corr, std::chrono::steady_clock::now() + 5s);
+    ASSERT_TRUE(code.has_value()) << "SILENT: a Subscribe the gateway cannot bind yet was not answered";
+    EXPECT_EQ(*code, static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader))
+        << "a lineage-unknown Subscribe must be answered the retriable NotLeader";
+    EXPECT_EQ(node.onControlThreadForTest([&] { return node.gatewayForTest()->subscribesAwaitingLineageForTest(); }),
+              awaiting0 + 1);
+    const std::size_t before = c.records().size();
+    bool released = false;
+    ASSERT_TRUE(c.subscribeUntilBound(gw, kClientStream, sid, 0, 0, /*from=*/0, std::chrono::steady_clock::now() + 5s,
+                                      [&] { if (!released) { node.holdTransientLineageForTest(false); released = true; } }))
+        << "the re-sent Subscribe was never bound once the lineage was known";
+    EXPECT_TRUE(released) << "the retry path (NotLeader -> re-send) did not run";
+    std::set<int64_t> seen;
+    ASSERT_TRUE(c.pollUntil([&] {
+        for (std::size_t i = before; i < c.records().size(); ++i)
+            if (!c.records()[i].bytes.empty()) seen.insert(c.records()[i].baseOffset);
+        return seen.size() >= 3;
+    })) << "the bound Subscribe delivered " << seen.size() << "/3 batches";
+    node.stop();
+}
+
 TEST(TransientLineageClusterRegression, SingleNodeRestartAnswersAGroupsOffsetAsNoneRegression) {
     TmpDir dir{"lg1n"}, cdir{"lg1nc"};
     const auto ports = Ports::discover(1);
@@ -1136,11 +1186,11 @@ TEST(TransientLineageClusterRegression, Rf1CrashedLeaderMemberRejoiningBeforeDet
         ASSERT_EQ(ack->baseOffset, want) << "precondition: the ring restarted empty";
     }
     const std::size_t before = c.records().size();
-    ASSERT_TRUE(c.subscribe(gatewayChannel(g.ports, L), kClientStream, sidL2, 0, P, /*log start=*/0));
+    ASSERT_TRUE(c.subscribeUntilBound(gatewayChannel(g.ports, L), kClientStream, sidL2, 0, P, /*log start=*/0,
+                                      std::chrono::steady_clock::now() + 5s))
+        << "the Subscribe on the restarted leader was never bound";
     std::map<int64_t, int> seen;
-    // Deadline 30 s, not pollUntil's ~5 s cap (2026-10-15, failed once under ctest -j10 on a loaded host: the
-    // restarted node's first push took longer).  The delivered set is still checked exactly once below.
-    ASSERT_TRUE(c.pollFor(std::chrono::seconds(30), [&] {
+    ASSERT_TRUE(c.pollUntil([&] {
         seen.clear();
         for (std::size_t i = before; i < c.records().size(); ++i)
             if (!c.records()[i].bytes.empty()) ++seen[c.records()[i].baseOffset];
@@ -1282,7 +1332,9 @@ TEST(TransientLineageClusterRegression, Rf1GroupWithoutACommitIsRebalancedOnANew
     const int64_t sidL = c.connect(gatewayChannel(g.ports, L), kClientStream);
     for (int b = 0; b < 5; ++b)
         ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(g.ports, L), kClientStream, sidL, 0, P, 1, makeBatch(4)));
-    ASSERT_TRUE(c.subscribe(gatewayChannel(g.ports, L), kClientStream, sidL, 0, P, 0));
+    ASSERT_TRUE(c.subscribeUntilBound(gatewayChannel(g.ports, L), kClientStream, sidL, 0, P, 0,
+                                      std::chrono::steady_clock::now() + 5s))
+        << "the Subscribe was never bound (re-check I5: a gated Subscribe is answered NotLeader, re-sent)";
     ASSERT_TRUE(c.pollUntil([&] { return pushedAt(c, 16) >= 1; })) << "precondition: the member consumed 0..19";
     // The group is Stable at `gen` (assigned): its generation consumes P.  As a
     // member does: RebalanceInProgress -> re-join (same member id).
@@ -1348,10 +1400,11 @@ TEST(TransientLineageClusterRegression, Rf1GroupWithoutACommitIsRebalancedOnANew
         ASSERT_EQ(ack->baseOffset, want) << "precondition: the ring restarted empty";
     }
     const std::size_t before = c.records().size();
-    ASSERT_TRUE(c.subscribe(gatewayChannel(g.ports, L), kClientStream, sidL2, 0, P, 0));
+    ASSERT_TRUE(c.subscribeUntilBound(gatewayChannel(g.ports, L), kClientStream, sidL2, 0, P, 0,
+                                      std::chrono::steady_clock::now() + 5s))
+        << "the Subscribe was never bound (re-check I5: a gated Subscribe is answered NotLeader, re-sent)";
     std::map<int64_t, int> seen;
-    // Post-restart delivery: a 30 s deadline, not pollUntil's ~5 s cap (a loaded host, ctest -j: 2026-10-15).
-    ASSERT_TRUE(c.pollFor(std::chrono::seconds(30), [&] {
+    ASSERT_TRUE(c.pollUntil([&] {
         seen.clear();
         for (std::size_t i = before; i < c.records().size(); ++i)
             if (!c.records()[i].bytes.empty()) ++seen[c.records()[i].baseOffset];
@@ -1397,7 +1450,9 @@ TEST(TransientLineageClusterRegression, Rf1PlainSubscriptionResumeAcrossANewLine
     const int64_t sidL = c.connect(gwL, kClientStream);
     for (int b = 0; b < 5; ++b)
         ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(g.ports, L), kClientStream, sidL, 0, P, 1, makeBatch(4)));
-    ASSERT_TRUE(c.subscribe(gwL, kClientStream, sidL, 0, P, 0));
+    ASSERT_TRUE(c.subscribeUntilBound(gwL, kClientStream, sidL, 0, P, 0,
+                                      std::chrono::steady_clock::now() + 5s))
+        << "the Subscribe was never bound (re-check I5: a gated Subscribe is answered NotLeader, re-sent)";
     uint64_t token = 0;
     ASSERT_TRUE(c.pollUntil([&] {
         for (const auto& r : c.records())
@@ -1436,10 +1491,11 @@ TEST(TransientLineageClusterRegression, Rf1PlainSubscriptionResumeAcrossANewLine
         ASSERT_EQ(ack->baseOffset, want);
     }
     const std::size_t before = c.records().size();
-    ASSERT_TRUE(c.subscribe(gwL2, kClientStream, sid2, 0, P, /*Earliest=*/-2));
+    ASSERT_TRUE(c.subscribeUntilBound(gwL2, kClientStream, sid2, 0, P, /*Earliest=*/-2,
+                                      std::chrono::steady_clock::now() + 5s))
+        << "the Subscribe was never bound (re-check I5: a gated Subscribe is answered NotLeader, re-sent)";
     std::map<int64_t, int> seen;
-    // Post-restart delivery: a 30 s deadline, not pollUntil's ~5 s cap (a loaded host, ctest -j: 2026-10-15).
-    ASSERT_TRUE(c.pollFor(std::chrono::seconds(30), [&] {
+    ASSERT_TRUE(c.pollUntil([&] {
         seen.clear();
         for (std::size_t i = before; i < c.records().size(); ++i)
             if (c.records()[i].bytes.size() > 8) ++seen[c.records()[i].baseOffset];

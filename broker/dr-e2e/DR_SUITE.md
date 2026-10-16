@@ -246,7 +246,7 @@ Total: **9 cases**
 **CID window:** `1 000 000 + n * 3000`
 
 **Cases:**
-- `test_dr8_leader_kill_netem`: **1 case** — `@pytest.mark.xfail` (DR-BUG-6, see below)
+- `test_dr8_leader_kill_netem`: **1 case** — hard-asserted (DR-BUG-6 fixed, see below)
 - `test_dr8_rolling_restart_churn`: `restart_rounds × {2,3}` = **2 cases**
 - `test_dr8_chaos_soak`: **1 case** — `@pytest.mark.netem`, `@pytest.mark.soak`
 
@@ -254,7 +254,7 @@ Total: **4 cases**
 
 | Scenario | Description | Key assertions |
 |----------|-------------|----------------|
-| S1: Leader-kill + follower packet loss (combined) | Apply netem 10% loss on one follower; start rate-limited producers; SIGKILL leader mid-produce | **xfail (DR-BUG-6).** Durability assertion: committed-loss=0 on acked set. Re-election + single-leader on majority side. Post-recovery round-trip. |
+| S1: Leader-kill + follower packet loss (combined) | Apply netem 10% loss on one follower; start rate-limited producers; SIGKILL leader mid-produce | Durability assertion (hard; DR-BUG-6 fixed): committed-loss=0 on acked set. Re-election + single-leader on majority side. Post-recovery round-trip. |
 | S2: Rolling restarts + client churn | 3 concurrent acks=All producers; kill/restart leader N times (quorum preserved); 30-record check to new leader each round | `assert_no_committed_loss` across all round committed sets; `assert_per_key_ordering`; `assert_exactly_once`; `assert_single_leader`; ISR healed after all rounds |
 | S3: Bounded chaos-monkey soak | 12 rounds (seed=42) of random faults: {kill-follower+restart, netem-loss+clear, pause+unpause-follower, kill-leader+restart}; background producer | One fault active at a time; quorum preserved throughout; post-soak: `assert_no_committed_loss`; `assert_per_key_ordering`; `assert_exactly_once`; `assert_single_leader`; final round-trip |
 
@@ -333,7 +333,7 @@ Total: **19 cases** (18 active, 1 skipped)
 | Leader dup (S2b) | netem duplicate 5/10% on leader's eth0 | Same hard invariants; at dup ≤ 5% leader stable; at 10% re-election tolerated |
 | Combined reorder+dup (S3) | light: reorder=20%, dup=5%, delay=15ms; heavy: reorder=40%, dup=10%, delay=20ms | Hard invariants hold for both; leader stable at light intensity |
 | Large batch fragmentation (S4) | 500 records × 18 keys + reorder=30%, dup=8%, delay=20ms on follower | Exercises Aeron FragmentAssembler; committed-loss=0; per-key ordering; exactly-once. NOTE: `dr_client.cpp` payload is fixed ~25 bytes/record — a `RUNE_RECORD_BYTES` knob is needed for true multi-fragment stress (controller TODO) |
-| MTU reduction (S5, skip) | `ip link set dev eth0 mtu 1200` via netem sidecar; two-level fragmentation | Enable on Linux CI where container-netns MTU changes are reliable. `faults.set_mtu()` is implemented in `harness/faults.py` |
+| MTU reduction (S5, Linux host) | `ip link set dev eth0 mtu 1200` via netem sidecar after the broker derived a 1472-byte Aeron MTU; reorder + dup | Runs on the Linux docker host (strict). Committed-loss = 0 and the live read delivers every acked partition (DR-BUG-MTU fixed) |
 
 ---
 
@@ -515,16 +515,16 @@ All fault tests in DR-3..15 use `acks=all` by default (GR-9 / Milestone C). DR-1
 | `iptables -j DROP` in `--net=container:` sidecar | LinuxKit kernel may lack required nf modules (`nf_tables`, `xt_*`) | Use netem 100% loss for full isolation (portable) |
 | Per-peer directional / asymmetric partition | Needs per-peer `iptables` DROP rules keyed on container IPs | Skip; enable on Linux CI |
 | Per-peer partial-quorum partition | Needs per-peer netem `matchall` or iptables — not achievable with eth0-scoped netem | Skip; enable on Linux CI |
-| MTU reduction via `ip link set dev eth0 mtu <N>` | macOS LinuxKit VM's veth pair MTU may be controlled by the hypervisor layer; `ip link set` may succeed silently with no effect, or race with Aeron media driver in-flight sends | Skip; enable on Linux CI |
+| MTU reduction via `ip link set dev eth0 mtu <N>` | macOS LinuxKit VM's veth pair MTU may be controlled by the hypervisor layer; `ip link set` may succeed silently with no effect | Runs on the Linux docker host (strict; `set_mtu` reads the MTU back and the test asserts the reduced node leads a partition and logged the GSO path-MTU fallback); Docker Desktop: unreliable |
 | fsync failure injection (FUSE/dm-error) | Not available on Docker Desktop / macOS Rosetta | Skip; enable on Linux CI with a FUSE error-injector |
 | Disk-full injection (capped tmpfs) | Docker Desktop's virtual disk cannot be reliably capped per-container | Skip; enable on Linux CI with `--mount type=tmpfs,target=/var/lib/rune,tmpfs-size=16777216` |
 | shm exhaustion (constrained shm mount) | `shm_size` constraints unreliable on Docker Desktop / macOS Rosetta | Skip; enable on Linux CI |
 
 ### Specific xfail cases and their reasons
 
-**`test_dr8_leader_kill_netem` — `@pytest.mark.xfail(strict=False)`**
+**`test_dr8_leader_kill_netem` and `test_cg_failover_leader_kill_netem` — no xfail (DR-BUG-6 fixed 2026-10-15)**
 
-Blocked on **DR-BUG-6** (leader completeness gap). The combined fault of leader-kill + packet-loss can elect a node that is lagging in partition data. The KIP-101 epoch-lineage fix (preventing log divergence) is implemented and unit-clean, but does not yet engage in the production E2E consensus/bridge path. An `acks=All`-committed record can therefore be lost across this specific failover. Leader-kill alone (DR-3) and loss alone (DR-6) both pass with zero committed loss. See DR-BUG-6 in the bug catalogue below.
+Both hard-assert committed-loss = 0 under leader-kill + follower netem loss. See DR-BUG-6 in the bug catalogue.
 
 **`test_dr10_repeated_flap_zombie` — `@pytest.mark.xfail(strict=False)`**
 
@@ -543,7 +543,9 @@ The following bugs were surfaced by the DR-E2E suite during development and are 
 | **DR-BUG-3** | Broker (ISR / HW gate) | `acks=All` acked with ISR shrunk below `minIsr` (minority commit) — the leader sent a `ProduceResponse` OK even when only 1 of 3 nodes was in the ISR, violating the `minIsr=2` gate and the majority-durable contract. | **FIXED** — drain-time min-ISR gate + HW clamp. Verified by DR-4 `test_dr4_quorum_lost_safety_and_recovery`. |
 | **DR-BUG-4** | Broker (`UdpMessageSink`) | Restarted nodes crash on startup — `UdpMessageSink` performed a synchronous `resolve` of its peer's address on the duty-cycle thread during co-restart. Under concurrent node restarts the resolve could throw (peer not yet up), crashing the restarting node. | **FIXED** — async resolve, matching the pending-connect machinery pattern used for the follower redirect fix. |
 | **DR-BUG-5** | Broker (replication routing) | Replication routing keyed by `partitionId` only (multi-topic collision) — when multiple topics were active (DR-2 `partitions=3` cases added the "multi" topic alongside "events"), the replication router dispatched based on `partitionId` alone. Partitions from different topics that share the same `partitionId` were misrouted. | **FIXED** — `topicId` added to wire format and routing key. Includes transport send-site `topicId` stamp and client `ProduceResponse` `errorCode` handling. |
-| **DR-BUG-6** | Broker (leader completeness / Raft log reconciliation) | Leader-completeness gap — combined leader-kill + packet-loss can elect a partition-data-lagging node whose committed tail has not been reconciled before it begins serving. An `acks=All`-committed record can then be absent from the new leader's log (lost). A KIP-101 epoch-lineage fix is implemented (no divergence, unit-clean) but does **not** yet engage in the production E2E consensus/bridge path. | **OPEN — Blocker / Deferred.** This is the one open durability gap in the suite. `test_dr8_leader_kill_netem` is `@pytest.mark.xfail` specifically for this reason. Leader-kill alone (DR-3) and loss alone (DR-6) both pass with zero committed loss; only the combination triggers this gap. Requires a focused fix before this xfail can be removed. |
+| **DR-BUG-6** | Broker (leader completeness / ISR / election) | Leader-completeness gap — combined leader-kill + packet-loss could elect a node missing `acks=All`-committed records. | **FIXED.** (1) Oct 3–5 (`0ff93227`, `e422e40d`, `a2d40921`, `498ec7c2`): the Kafka model replaced the completeness heuristics — HW = min LEO over the MAXIMAL ISR (committed ∪ pending AlterIsr, KIP-497/841), AlterIsr compare-and-set on partitionEpoch, elections only from the committed ISR (unclean off), KIP-320/279 fetch-path divergence truncation, internal-ISR knowledge gating consensus votes, strictly monotonic leader epochs. (2) 2026-10-15 residual (fix/dr-bugs): `PartitionReplica::onAlterIsrResponse` dropped a pending proposal on `InvalidUpdateVersion` / `FencedLeaderEpoch` before the newer committed assignment reached the leader — when that commit was the proposal itself (answer lost, re-send answered), the maximal ISR collapsed to the stale committed view, the HW passed the LEO of a member the controller could already elect, and electing it lost acked records (RED: 5 acked records missing on every node). The proposal now stays pending until the committed assignment resolves it (Kafka `handleAlterPartitionError`). Pinned by `DrIntegrationRegression.AnsweredButUnappliedExpansionStillHoldsTheHwRegression` and `...FencedAnswerKeepsThePendingProposalUntilTheAssignmentArrivesRegression`. `test_dr8_leader_kill_netem` and `test_cg_failover_leader_kill_netem` are hard. Scope: crashes that keep the page cache (SIGKILL) or the disk. **Open, separate:** a broker whose data dir is LOST and that rejoins while the committed assignment still names it leader re-leads at its old epoch with an empty log (its leader-epoch fence went with the disk); followers fetching from it before the controller re-elects truncate committed records (`ClientDdlClusterRegression.CatalogHistoryTruncatedMidReadIsReReadNotServedStaleRegression`, intermittent). Needs controller-side log-dir identity (Kafka KIP-858 / KIP-966). |
+| **DR-BUG-MTU** | Broker + client (`rune_gso_bindings.c`, rune-protocol) | Link MTU cut to 1200 below the 1472-byte Aeron MTU derived at boot: produces still acked, subscribers got nothing from the partitions that node leads, no error. The kernel answers `sendmsg(UDP_SEGMENT)` with a segment above the path MTU with `EMSGSIZE` (a plain send of the same datagram is IP-fragmented and delivered); the GSO bindings treated it as a send error, so Aeron re-sent the identical GSO batch forever while heartbeats kept the session alive. | **FIXED** (fix/dr-bugs): `EMSGSIZE` on a GSO send falls the transport back to stock `sendmmsg` (IP fragmentation) with a WARN naming the path MTU and a `gso_path_mtu_fallbacks` total. Pinned by `UdpGsoBindings.GsoSegmentAbovePathMtuFallsBackAndDeliversRegression` / `MdcGsoSegmentAbovePathMtuFallsBackAndDeliversRegression` (Linux). |
+| **DR-BUG-RESTART-BIND** | Broker (`HostDefaults`) | A follower restarted after SIGKILL refused to start: `Address already in use` on its derived shard replication port 41064 — inside Linux's ephemeral range, where the broker's own Aeron publications auto-bind while it starts. | **FIXED** (fix/dr-bugs): derived shard ports moved below every default ephemeral range (base 8200); a bound port inside the probed range is a startup WARN; the compose files reserve their fixed ports (`net.ipv4.ip_local_reserved_ports`). Pinned by `HostDefaultsRegression.*EphemeralRange*`. |
 
 ---
 
@@ -560,10 +562,10 @@ The following bugs were surfaced by the DR-E2E suite during development and are 
 | **DR-5** | `test_dr5_leader_isolation`, `test_dr5_follower_isolation` | 4 | **PASS** | netem 100% loss partition |
 | **DR-6** | `test_dr6_follower_lossy`, `test_dr6_leader_lossy` | 20 | **PASS** | Loss/delay; committed-loss=0; election-stability per intensity |
 | **DR-7** | `test_dr7_follower_crash_restart_catchup`, `test_dr7_leader_crash_restart_rejoins_follower`, `test_dr7_sigterm_vs_sigkill_parity`, `test_dr7_full_cluster_cold_restart` | 9 | **PASS** | Crash+restart; SIGTERM vs SIGKILL parity; cold restart |
-| **DR-8** | `test_dr8_leader_kill_netem` (xfail), `test_dr8_rolling_restart_churn`, `test_dr8_chaos_soak` | 4 | **PARTIAL** — 1 xfail (DR-BUG-6), 2 pass, 1 soak pass | Chaos capstone; S1 blocked on DR-BUG-6 |
+| **DR-8** | `test_dr8_leader_kill_netem`, `test_dr8_rolling_restart_churn`, `test_dr8_chaos_soak` | 4 | **PASS** | Chaos capstone (DR-BUG-6 and DR-BUG-RESTART-BIND fixed) |
 | **DR-10** | `test_dr10_pause_idle_leader_zombie_fencing`, `test_dr10_pause_during_produce_zombie_fencing`, `test_dr10_short_vs_long_pause`, `test_dr10_repeated_flap_zombie` (xfail) | 8 | **PARTIAL** — 6 pass, 2 xfail (harness DNS) | Zombie-leader split-brain fencing |
 | **DR-11** | `test_dr11_flapping_leader`, `test_dr11_flapping_follower`, `test_dr11_rapid_flap_livelock_guard`, 2 × skip | 5 | **PARTIAL** — 3 pass, 2 skip (Linux-CI) | Asymmetric/partial partitions need iptables |
-| **DR-12** | 5 × scenarios, 1 × skip | 19 | **PARTIAL** — 18 pass, 1 skip (Linux-CI MTU) | Reorder/dup/fragmentation; MTU needs Linux CI |
+| **DR-12** | 6 × scenarios | 19 | **PASS** on the Linux host (MTU scenario strict; DR-BUG-MTU fixed) | Reorder/dup/fragmentation/MTU |
 | **DR-13** | `test_dr13_scale`, `test_dr13_reconnect_storm`, `test_dr13_slow_subscriber_isolation`, concurrent (skip), `test_dr13_client_crash_mid_produce` | 5 | **PARTIAL** — 4 pass, 1 skip (harness API) | Client fault resilience |
 | **DR-14** | 4 active + 3 skip | 7 | **PARTIAL** — 4 pass, 3 skip (Linux-CI fsync/disk/shm) | Storage corruption, shm, disk-full |
 | **DR-15** | `test_dr15_tail_loss_quantification`, `test_dr15_no_phantom_read`, `test_dr15_log_divergence_guard`, `test_dr15_sigterm_vs_sigkill_acks_all_parity`, `test_dr15_all_nodes_crash_cold_restart_consistent` | 7 | **PASS** | Integrity deep-dive; acks=Leader tail-loss quantified |
@@ -577,4 +579,6 @@ The following bugs were surfaced by the DR-E2E suite during development and are 
 | DR-BUG-3 | **FIXED** (acks=All minority commit → min-ISR gate + HW clamp) |
 | DR-BUG-4 | **FIXED** (restarted node UdpMessageSink sync resolve → async) |
 | DR-BUG-5 | **FIXED** (replication routing partitionId-only → topicId+partitionId key) |
-| DR-BUG-6 | **OPEN — Blocker** (leader-completeness: combined kill+loss elects lagging node; KIP-101 epoch fix implemented but not yet on E2E path; `test_dr8_leader_kill_netem` xfail) |
+| DR-BUG-6 | **FIXED** (Kafka-model maximal ISR / committed-ISR election; 2026-10-15 residual: an AlterIsr answer never drops a proposal the controller may have committed) |
+| DR-BUG-MTU | **FIXED** (GSO `EMSGSIZE` above the path MTU falls back to IP fragmentation) |
+| DR-BUG-RESTART-BIND | **FIXED** (derived shard ports outside every ephemeral range; reserved compose ports) |

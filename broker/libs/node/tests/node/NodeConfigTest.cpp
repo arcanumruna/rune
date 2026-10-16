@@ -167,7 +167,8 @@ TEST(NodeConfigTest, NonIntConsensusStreamIdIsError) {
 TEST(NodeConfigTest, WorkerEgressDefaultsWhenUnset) {
     auto r = parseNodeConfig(fakeEnv(base3node()));
     ASSERT_TRUE(r.error.empty()) << r.error;
-    EXPECT_EQ(r.config->workerEgressControlHost,     "127.0.0.1");
+    EXPECT_EQ(r.config->workerEgressControlHost,     "") << "derived (review B-I3)";
+    EXPECT_EQ(r.config->effectiveWorkerEgressControlHost(), "0.0.0.0") << "named peers: the wildcard";
     EXPECT_FALSE(r.config->workerEgressControlBasePort.has_value());
     EXPECT_EQ(r.config->effectiveWorkerEgressControlBasePort(), 40300);
     EXPECT_EQ(r.config->workerEgressBaseStreamId,     0);  // 0 = resolved in buildWorkerPool
@@ -188,10 +189,73 @@ TEST(NodeConfigTest, WorkerEgressOverriddenWhenSet) {
 
 TEST(NodeConfigTest, WorkerEgressEmptyHostFallsBackToDefault) {
     auto env = base3node();
-    env["RUNE_WORKER_EGRESS_CONTROL_HOST"] = "";  // empty → keep default
+    env["RUNE_WORKER_EGRESS_CONTROL_HOST"] = "";  // empty → keep default (derived)
     auto r = parseNodeConfig(fakeEnv(env));
     ASSERT_TRUE(r.error.empty()) << r.error;
-    EXPECT_EQ(r.config->workerEgressControlHost, "127.0.0.1");
+    EXPECT_EQ(r.config->effectiveWorkerEgressControlHost(), "0.0.0.0");
+}
+
+// Review B-I3: the MDC control host defaults to the address clients reach this node at (they send to
+// <advertised RUNE_PEERS host>:<port>) — the numeric advertised host exactly, a name -> the wildcard; an all-loopback
+// cluster keeps 127.0.0.1; an explicit value wins.  RED: the old "127.0.0.1" default ((a) and (b) fail).
+TEST(NodeConfigRegression, EgressControlHostDefaultsToTheAdvertisedHostRegression) {
+    auto peersEnv = [](const std::string& peers, const char* host) {
+        auto env = base3node();
+        env["RUNE_PEERS"] = peers;
+        if (host) env["RUNE_WORKER_EGRESS_CONTROL_HOST"] = host;
+        auto r = parseNodeConfig(fakeEnv(env));
+        EXPECT_TRUE(r.error.empty()) << r.error;
+        return r.config ? r.config->effectiveWorkerEgressControlHost() : std::string("<none>");
+    };
+    EXPECT_EQ(peersEnv("0@10.0.0.5:40111,1@10.0.0.6:40111,2@10.0.0.7:40111", nullptr), "10.0.0.6");      // (a) self = node 1
+    EXPECT_EQ(peersEnv("0@rune-1:40111,1@rune-2:40111,2@rune-3:40111", nullptr), "0.0.0.0");             // (b)
+    EXPECT_EQ(peersEnv("0@127.0.0.1:40111,1@127.0.0.1:40112,2@127.0.0.1:40113", nullptr), "127.0.0.1");  // (c)
+    EXPECT_EQ(peersEnv("0@10.0.0.5:40111,1@10.0.0.6:40111,2@10.0.0.7:40111", "10.0.0.9"), "10.0.0.9");    // (d)
+    // Re-check I2: RUNE_PEER_BIND_HOST (NAT / port-mapped: the advertised address is on no local interface).
+    auto natEnv = [](const char* host) {
+        auto env = base3node();
+        env["RUNE_PEERS"] = "0@203.0.113.5:40111,1@203.0.113.6:40111,2@203.0.113.7:40111";
+        env["RUNE_PEER_BIND_HOST"] = "0.0.0.0";
+        if (host) env["RUNE_WORKER_EGRESS_CONTROL_HOST"] = host;
+        auto r = parseNodeConfig(fakeEnv(env));
+        EXPECT_TRUE(r.error.empty()) << r.error;
+        return r.config ? r.config->effectiveWorkerEgressControlHost() : std::string("<none>");
+    };
+    EXPECT_EQ(natEnv(nullptr), "0.0.0.0") << "(e) the peer bind override, never the unbindable advertised address";
+    EXPECT_EQ(natEnv("10.0.0.9"), "10.0.0.9") << "(f) an explicit control host still wins";
+}
+
+// Re-check I2: a LOOPBACK RUNE_PEER_BIND_HOST supplying the control host of a node advertised at a non-loopback
+// host refuses, as the explicit host does.  RED: the refusal checks only an explicit control host.
+TEST(NodeConfigRegression, LoopbackPeerBindOverrideOnANonLoopbackNodeRefusesStartRegression) {
+    auto env = base3node();
+    env["RUNE_PEER_BIND_HOST"] = "127.0.0.1";
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    const auto err = r.config->validateShardConfig();
+    ASSERT_TRUE(err.has_value());
+    EXPECT_NE(err->find("silently fall back"), std::string::npos) << *err;
+    EXPECT_NE(err->find("RUNE_PEER_BIND_HOST"), std::string::npos) << *err;
+}
+
+// Review B-I3: an explicit LOOPBACK control host on a node advertised at a non-loopback host refuses to start
+// (clients elsewhere could never reach per-worker egress; it would silently fall back).  RED: no check.
+TEST(NodeConfigRegression, LoopbackEgressControlHostOnANonLoopbackNodeRefusesStartRegression) {
+    auto env = base3node();
+    env["RUNE_WORKER_EGRESS_CONTROL_HOST"] = "127.0.0.1";
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    const auto err = r.config->validateShardConfig();
+    ASSERT_TRUE(err.has_value());
+    EXPECT_NE(err->find("silently fall back"), std::string::npos) << *err;
+    // An all-loopback cluster with an explicit loopback host is fine.
+    auto lo = base3node();
+    lo["RUNE_PEERS"] = "0@127.0.0.1:40111,1@127.0.0.1:40112,2@127.0.0.1:40113";
+    lo["RUNE_WORKER_EGRESS_CONTROL_HOST"] = "127.0.0.1";
+    auto rl = parseNodeConfig(fakeEnv(lo));
+    ASSERT_TRUE(rl.config.has_value()) << rl.error;
+    const auto el = rl.config->validateShardConfig();
+    EXPECT_TRUE(!el.has_value() || el->find("silently fall back") == std::string::npos) << *el;
 }
 
 TEST(NodeConfigTest, NonIntWorkerEgressControlBasePortIsError) {

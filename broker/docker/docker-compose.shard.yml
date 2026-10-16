@@ -9,10 +9,18 @@ x-shard-env: &shard-env
   RUNE_WORKER_REPL_BASE_PORT: "40600"
   RUNE_PEERS: "0@rune-1:40111:40200:40222:40600:40500,1@rune-2:40111:40200:40222:40600:40500,2@rune-3:40111:40200:40222:40600:40500"
 
+# The explicit worker bases lie inside Linux's ephemeral range: reserved with the node ports (every worker,
+# up to 64) so a restart always binds (DR-BUG-RESTART-BIND; replaces the base file's value for this key).
+x-shard-sysctls: &shard-sysctls
+  net.ipv4.ip_local_reserved_ports: "40111,40200,40222,40500-40563,40600-40663"
+
 services:
   rune-1:
     environment: *shard-env
+    sysctls: *shard-sysctls
   rune-2:
     environment: *shard-env
+    sysctls: *shard-sysctls
   rune-3:
     environment: *shard-env
+    sysctls: *shard-sysctls

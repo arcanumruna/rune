@@ -659,6 +659,28 @@ public:
         return std::nullopt;
     }
 
+    /// Re-check I5: a plain (read_uncommitted) Subscribe that honours the protocol's answer — the gateway answers a
+    /// Subscribe it cannot bind yet with the RETRIABLE NotLeader (e.g. a transient partition whose lineage this
+    /// broker has not learned yet, FU1); a client re-sends it.  Re-sends on NotLeader until bound (SubscribeResponse
+    /// OK) or `deadline`; any other answer is an explicit failure (false).  `onRetry` (optional) runs before each
+    /// re-send.  Never fire-and-forget on a gated partition: an unbound Subscribe delivers nothing, by contract.
+    template <class OnRetry = void (*)()>
+    bool subscribeUntilBound(const std::string& gatewayChannel, int32_t stream, int64_t sessionId, int32_t topicId,
+                             int32_t partition, int64_t fromOffset, Clock::time_point deadline,
+                             OnRetry onRetry = [] {}) {
+        constexpr int16_t kNotLeader = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+        while (Clock::now() < deadline) {
+            const int64_t corr = subscribeIsolated(gatewayChannel, stream, sessionId, topicId, partition, fromOffset, 0);
+            const auto code = awaitSubscribeCode(corr, deadline);
+            if (!code) return false;              // no answer by the deadline
+            if (*code == 0) return true;          // bound
+            if (*code != kNotLeader) return false;
+            onRetry();
+            for (int i = 0; i < 500 && Clock::now() < deadline; ++i) { poll_(); pause_(); }   // ~50 ms retry pacing
+        }
+        return false;
+    }
+
     bool disconnect(const std::string& gatewayChannel, int32_t stream, int64_t sessionId) {
         pc::Disconnect d; d.sessionId = sessionId; d.correlationId = ++corr_;
         std::vector<uint8_t> buf(pc::Disconnect::ENCODED_SIZE);

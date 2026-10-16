@@ -221,3 +221,48 @@ TEST_F(WorkerEgressFixture, LateSubscriberReceivesSubsequentSends) {
 }
 
 } // namespace
+
+// ===========================================================================
+// Re-check I6: the broker-side "per-worker MDC egress connected" line — none
+// while no consumer is connected, exactly one over 100 passes once one is.
+// RED: no latch (100 lines) or no isConnected check / no log (0 lines).
+// ===========================================================================
+#include <spdlog/sinks/ringbuffer_sink.h>
+namespace {
+struct EgressLogCapture {   // RAII; the egress is driven on this thread only
+    std::shared_ptr<spdlog::sinks::ringbuffer_sink_mt> sink = std::make_shared<spdlog::sinks::ringbuffer_sink_mt>(1024);
+    std::shared_ptr<spdlog::logger> previous = spdlog::default_logger();
+    EgressLogCapture() {
+        auto capture = std::make_shared<spdlog::logger>("egress-capture", sink);
+        capture->set_level(spdlog::level::info);
+        spdlog::set_default_logger(capture);
+    }
+    ~EgressLogCapture() { spdlog::set_default_logger(previous); }
+    int count(const std::string& text) const {
+        int n = 0;
+        for (const std::string& l : sink->last_formatted()) n += l.find(text) != std::string::npos ? 1 : 0;
+        return n;
+    }
+    EgressLogCapture(const EgressLogCapture&) = delete;
+    EgressLogCapture& operator=(const EgressLogCapture&) = delete;
+};
+} // namespace
+
+TEST_F(WorkerEgressFixture, ConnectedLineIsLoggedExactlyOnceRegression) {
+    EgressLogCapture log;
+    const std::string controlEp = freeEndpoint();
+    WorkerEgress eg(aeron_, controlEp, 2096);
+    ASSERT_TRUE(eg.resolved());
+    for (int i = 0; i < 100; ++i) eg.noteConnected(7);   // no consumer yet
+    EXPECT_FALSE(eg.connectedLogged());
+    EXPECT_EQ(log.count("per-worker MDC egress connected"), 0);
+
+    auto sub = resolveSub(std::string("aeron:udp?control=") + controlEp +
+                          "|control-mode=dynamic|endpoint=" + freeEndpoint(), 2096);
+    ASSERT_NE(sub, nullptr);
+    ASSERT_TRUE(waitFor([&]() { return eg.isConnected(); }));
+    for (int i = 0; i < 100; ++i) eg.noteConnected(7);
+    EXPECT_TRUE(eg.connectedLogged());
+    EXPECT_EQ(log.count("per-worker MDC egress connected"), 1);
+    EXPECT_EQ(log.count("WorkerEgress[w7] per-worker MDC egress connected (control " + controlEp + ")"), 1);
+}

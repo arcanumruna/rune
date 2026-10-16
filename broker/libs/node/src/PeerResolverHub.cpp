@@ -1,5 +1,7 @@
 #include <rune/node/PeerResolverHub.h>
 
+#include <cstring>
+
 #include <spdlog/spdlog.h>
 
 #include <netdb.h>
@@ -101,8 +103,43 @@ rune::consensus::PeerResolutionSource PeerResolverHub::subscribe_(bool driver) {
     return {&table_, subs_.back().ring.get()};
 }
 
+rune::consensus::PeerResolutionRing* PeerResolverHub::subscribeMtuProbe(const std::string& host) {
+    mtu_ = std::make_unique<MtuProbe>();
+    mtu_->host = host;
+    mtu_->ring = std::make_unique<rune::consensus::PeerResolutionRing>();
+    mtu_->last = resolveMtuProbeTarget(host);   // startup thread: the first target before any duty thread runs
+    mtu_->nextNs = 0;
+    mtu_->dirty = !postMtu_();
+    return mtu_->ring.get();
+}
+
+bool PeerResolverHub::postMtu_() noexcept {
+    std::int64_t a = 0, b = 0;
+    std::memcpy(&a, mtu_->last.ifname, 8);
+    std::memcpy(&b, mtu_->last.ifname + 8, 8);
+    const std::int32_t type = !mtu_->last.valid ? kMtuProbeTargetInvalid
+                            : mtu_->last.ipv6   ? kMtuProbeTargetV6 : kMtuProbeTargetV4;
+    return mtu_->ring->offer(type, a, b);
+}
+
+int PeerResolverHub::serveMtuProbe_(int64_t nowNs) {
+    if (!mtu_) return 0;
+    int work = 0;
+    if (mtu_->dirty) { mtu_->dirty = !postMtu_(); ++work; }
+    if (nowNs < mtu_->nextNs) return work;
+    mtu_->nextNs = nowNs + kRecheckNs;
+    const MtuProbeTarget t = resolveMtuProbeTarget(mtu_->host);   // cold thread: may block / allocate
+    if (!(t == mtu_->last)) {
+        mtu_->last = t;
+        mtu_->dirty = !postMtu_();
+        if (t.valid) spdlog::info("PeerResolverHub: link-MTU probe of {} via interface {}", mtu_->host, t.ifname);
+        else         spdlog::info("PeerResolverHub: link-MTU probe of {} has no route now (watchdog idle)", mtu_->host);
+    }
+    return work + 1;
+}
+
 void PeerResolverHub::start() {
-    if (runner_ || (table_.size() == 0 && ports_.empty())) return;   // nothing to resolve: no thread
+    if (runner_ || (table_.size() == 0 && ports_.empty() && !mtu_)) return;   // nothing to resolve: no thread
     // A cold thread: it parks between probes (never spins a core).
     idle_   = std::make_unique<rune::consensus::BackoffIdleStrategy>(
         1, 1, std::chrono::milliseconds{1}, std::chrono::milliseconds{10});
@@ -130,6 +167,7 @@ int PeerResolverHub::doWork_(int64_t nowNs) {
         if (s.dirty || driverResynced) resync_(s);
     }
     work += serveHostRequests_();
+    work += serveMtuProbe_(nowNs);
     for (std::size_t i = 0; i < hosts_.size(); ++i) {
         if (nowNs < hosts_[i].nextProbeNs) continue;
         ++work;

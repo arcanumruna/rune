@@ -22,6 +22,11 @@ services:
     image: ${RUNE_IMAGE:-rune-broker:latest}
     platform: linux/amd64
     hostname: rune-1
+    # DR-BUG-RESTART-BIND: these fixed ports lie inside Linux's ephemeral range (32768-60999); reserved (a
+    # per-netns sysctl) so no socket auto-bound first - e.g. the broker's own Aeron publications while it
+    # starts - can take one and fail a (re)start with 'Address already in use' (the broker WARNs otherwise).
+    sysctls:
+      net.ipv4.ip_local_reserved_ports: "${CONSENSUS_PORT:-40111},${CLIENT_PORT:-40200},${REPLICATION_PORT:-40222}"
     shm_size: ${SHM_SIZE:-256m}
     environment:
       # --- required ---
@@ -54,6 +59,11 @@ services:
     image: ${RUNE_IMAGE:-rune-broker:latest}
     platform: linux/amd64
     hostname: rune-2
+    # DR-BUG-RESTART-BIND: these fixed ports lie inside Linux's ephemeral range (32768-60999); reserved (a
+    # per-netns sysctl) so no socket auto-bound first - e.g. the broker's own Aeron publications while it
+    # starts - can take one and fail a (re)start with 'Address already in use' (the broker WARNs otherwise).
+    sysctls:
+      net.ipv4.ip_local_reserved_ports: "${CONSENSUS_PORT:-40111},${CLIENT_PORT:-40200},${REPLICATION_PORT:-40222}"
     shm_size: ${SHM_SIZE:-256m}
     environment:
       RUNE_NODE_ID: "1"
@@ -81,6 +91,11 @@ services:
     image: ${RUNE_IMAGE:-rune-broker:latest}
     platform: linux/amd64
     hostname: rune-3
+    # DR-BUG-RESTART-BIND: these fixed ports lie inside Linux's ephemeral range (32768-60999); reserved (a
+    # per-netns sysctl) so no socket auto-bound first - e.g. the broker's own Aeron publications while it
+    # starts - can take one and fail a (re)start with 'Address already in use' (the broker WARNs otherwise).
+    sysctls:
+      net.ipv4.ip_local_reserved_ports: "${CONSENSUS_PORT:-40111},${CLIENT_PORT:-40200},${REPLICATION_PORT:-40222}"
     shm_size: ${SHM_SIZE:-256m}
     environment:
       RUNE_NODE_ID: "2"
