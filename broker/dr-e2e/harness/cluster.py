@@ -215,7 +215,7 @@ class Cluster:
         # _git_sha falls back to "local" in bare-binary CI environments.
         # An explicit RUNE_IMAGE_TAG (e.g. a diagnostic build of this SHA) wins.
         _env_tag = os.environ.get("RUNE_IMAGE_TAG")
-        _sha = _env_tag or _git_sha(BROKER_REPO)
+        _sha = _env_tag or _git_sha(BROKER_REPO)   # review B-M6: "<sha>-dirty" for a dirty tree (never HEAD's tag)
         print(f"[harness] broker image tag {_sha} ({'RUNE_IMAGE_TAG' if _env_tag else 'git HEAD'})", flush=True)
         # RUNE_DR_COMPOSE_OVERRIDES: global overlays (e.g. docker/docker-compose.shard.yml)
         # that run the whole matrix in a mode.  They go FIRST so a test's own
@@ -472,6 +472,21 @@ class Cluster:
         """Return (leader_node_id, leader_service)."""
         lid = self.wait_for_leader(timeout_s)
         return lid, node_id_to_service(lid)
+
+    _BECOME_LEADER_RE = re.compile(r"PartitionReplica\[node=(\d+)\] becomeLeader topic=(-?\d+) part=(\d+) epoch=(\d+)")
+
+    def partition_leaders(self, topic_id: int) -> dict[int, str]:
+        """{partition: leader service} for `topic_id`, from the brokers' own logs (review B-I4): every
+        becomeLeader is logged at info; the highest epoch per partition wins.  `multi` is topic 1 (DEFAULT_TOPICS)."""
+        best: dict[int, tuple[int, int]] = {}
+        for svc in SERVICES:
+            for m in self._BECOME_LEADER_RE.finditer(self.compose.logs(svc, timeout=30)):
+                node, topic, part, epoch = (int(x) for x in m.groups())
+                if topic != topic_id:
+                    continue
+                if part not in best or epoch >= best[part][0]:
+                    best[part] = (epoch, node)
+        return {p: node_id_to_service(n) for p, (_, n) in best.items() if n in (0, 1, 2)}
 
     def follower_service(self, timeout_s: int = 90) -> str:
         """Return one service that is NOT the current leader."""

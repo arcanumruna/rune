@@ -340,6 +340,11 @@ def set_mtu(cluster, service: str, mtu: int, iface: str = "eth0") -> None:
             f"set_mtu({mtu}) failed on {service} ({iface}): "
             f"{res.stderr or res.stdout}"
         )
+    # Review B-I4: `ip link set` can succeed with no effect on some hosts — read the MTU back.
+    chk = _netns_exec(cid, ["cat", f"/sys/class/net/{iface}/mtu"])
+    got = (chk.stdout or "").strip()
+    if not chk.ok or got != str(mtu):
+        raise RuntimeError(f"set_mtu({mtu}) had no effect on {service}: mtu reads {got or chk.stderr!r}")
 
 
 # ---------------------------------------------------------------------------
