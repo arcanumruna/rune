@@ -116,11 +116,11 @@ private:
     }
 
 public:
-    static constexpr std::uint16_t SBE_BLOCK_LENGTH = static_cast<std::uint16_t>(92);
+    static constexpr std::uint16_t SBE_BLOCK_LENGTH = static_cast<std::uint16_t>(232);
     static constexpr std::uint16_t SBE_TEMPLATE_ID = static_cast<std::uint16_t>(7);
     static constexpr std::uint16_t SBE_SCHEMA_ID = static_cast<std::uint16_t>(112);
-    static constexpr std::uint16_t SBE_SCHEMA_VERSION = static_cast<std::uint16_t>(3);
-    static constexpr const char* SBE_SEMANTIC_VERSION = "1.1";
+    static constexpr std::uint16_t SBE_SCHEMA_VERSION = static_cast<std::uint16_t>(4);
+    static constexpr const char* SBE_SEMANTIC_VERSION = "1.2";
 
     enum MetaAttribute
     {
@@ -174,7 +174,7 @@ public:
 
     SBE_NODISCARD static SBE_CONSTEXPR std::uint16_t sbeBlockLength() SBE_NOEXCEPT
     {
-        return static_cast<std::uint16_t>(92);
+        return static_cast<std::uint16_t>(232);
     }
 
     SBE_NODISCARD static SBE_CONSTEXPR std::uint64_t sbeBlockAndHeaderLength() SBE_NOEXCEPT
@@ -194,12 +194,12 @@ public:
 
     SBE_NODISCARD static SBE_CONSTEXPR std::uint16_t sbeSchemaVersion() SBE_NOEXCEPT
     {
-        return static_cast<std::uint16_t>(3);
+        return static_cast<std::uint16_t>(4);
     }
 
     SBE_NODISCARD static const char *sbeSemanticVersion() SBE_NOEXCEPT
     {
-        return "1.1";
+        return "1.2";
     }
 
     SBE_NODISCARD static SBE_CONSTEXPR const char *sbeSemanticType() SBE_NOEXCEPT
@@ -856,6 +856,330 @@ public:
         return *this;
     }
 
+    SBE_NODISCARD static const char *proposalIdMetaAttribute(const MetaAttribute metaAttribute) SBE_NOEXCEPT
+    {
+        switch (metaAttribute)
+        {
+            case MetaAttribute::PRESENCE: return "required";
+            default: return "";
+        }
+    }
+
+    static SBE_CONSTEXPR std::uint16_t proposalIdId() SBE_NOEXCEPT
+    {
+        return 8;
+    }
+
+    SBE_NODISCARD static SBE_CONSTEXPR std::uint64_t proposalIdSinceVersion() SBE_NOEXCEPT
+    {
+        return 4;
+    }
+
+    SBE_NODISCARD bool proposalIdInActingVersion() SBE_NOEXCEPT
+    {
+        return m_actingVersion >= proposalIdSinceVersion();
+    }
+
+    SBE_NODISCARD static SBE_CONSTEXPR std::size_t proposalIdEncodingOffset() SBE_NOEXCEPT
+    {
+        return 92;
+    }
+
+    static SBE_CONSTEXPR std::int64_t proposalIdNullValue() SBE_NOEXCEPT
+    {
+        return SBE_NULLVALUE_INT64;
+    }
+
+    static SBE_CONSTEXPR std::int64_t proposalIdMinValue() SBE_NOEXCEPT
+    {
+        return INT64_C(-9223372036854775807);
+    }
+
+    static SBE_CONSTEXPR std::int64_t proposalIdMaxValue() SBE_NOEXCEPT
+    {
+        return INT64_C(9223372036854775807);
+    }
+
+    static SBE_CONSTEXPR std::size_t proposalIdEncodingLength() SBE_NOEXCEPT
+    {
+        return 8;
+    }
+
+    SBE_NODISCARD std::int64_t proposalId() const SBE_NOEXCEPT
+    {
+        if (m_actingVersion < 4)
+        {
+            return INT64_MIN;
+        }
+
+        std::int64_t val;
+        std::memcpy(&val, m_buffer + m_offset + 92, sizeof(std::int64_t));
+        return SBE_LITTLE_ENDIAN_ENCODE_64(val);
+    }
+
+    AlterIsr &proposalId(const std::int64_t value) SBE_NOEXCEPT
+    {
+        std::int64_t val = SBE_LITTLE_ENDIAN_ENCODE_64(value);
+        std::memcpy(m_buffer + m_offset + 92, &val, sizeof(std::int64_t));
+        return *this;
+    }
+
+    SBE_NODISCARD static const char *isrStorageMetaAttribute(const MetaAttribute metaAttribute) SBE_NOEXCEPT
+    {
+        switch (metaAttribute)
+        {
+            case MetaAttribute::PRESENCE: return "required";
+            default: return "";
+        }
+    }
+
+    static SBE_CONSTEXPR std::uint16_t isrStorageId() SBE_NOEXCEPT
+    {
+        return 9;
+    }
+
+    SBE_NODISCARD static SBE_CONSTEXPR std::uint64_t isrStorageSinceVersion() SBE_NOEXCEPT
+    {
+        return 4;
+    }
+
+    SBE_NODISCARD bool isrStorageInActingVersion() SBE_NOEXCEPT
+    {
+        return m_actingVersion >= isrStorageSinceVersion();
+    }
+
+    SBE_NODISCARD static SBE_CONSTEXPR std::size_t isrStorageEncodingOffset() SBE_NOEXCEPT
+    {
+        return 100;
+    }
+
+    static SBE_CONSTEXPR std::int64_t isrStorageNullValue() SBE_NOEXCEPT
+    {
+        return SBE_NULLVALUE_INT64;
+    }
+
+    static SBE_CONSTEXPR std::int64_t isrStorageMinValue() SBE_NOEXCEPT
+    {
+        return INT64_C(-9223372036854775807);
+    }
+
+    static SBE_CONSTEXPR std::int64_t isrStorageMaxValue() SBE_NOEXCEPT
+    {
+        return INT64_C(9223372036854775807);
+    }
+
+    static SBE_CONSTEXPR std::size_t isrStorageEncodingLength() SBE_NOEXCEPT
+    {
+        return 128;
+    }
+
+    static SBE_CONSTEXPR std::uint64_t isrStorageLength() SBE_NOEXCEPT
+    {
+        return 16;
+    }
+
+    SBE_NODISCARD const char *isrStorage() const SBE_NOEXCEPT
+    {
+        if (m_actingVersion < 4)
+        {
+            return nullptr;
+        }
+
+        return m_buffer + m_offset + 100;
+    }
+
+    SBE_NODISCARD char *isrStorage() SBE_NOEXCEPT
+    {
+        if (m_actingVersion < 4)
+        {
+            return nullptr;
+        }
+
+        return m_buffer + m_offset + 100;
+    }
+
+    SBE_NODISCARD std::int64_t isrStorage(const std::uint64_t index) const
+    {
+        if (index >= 16)
+        {
+            throw std::runtime_error("index out of range for isrStorage [E104]");
+        }
+
+        if (m_actingVersion < 4)
+        {
+            return INT64_MIN;
+        }
+
+        std::int64_t val;
+        std::memcpy(&val, m_buffer + m_offset + 100 + (index * 8), sizeof(std::int64_t));
+        return SBE_LITTLE_ENDIAN_ENCODE_64(val);
+    }
+
+    AlterIsr &isrStorage(const std::uint64_t index, const std::int64_t value)
+    {
+        if (index >= 16)
+        {
+            throw std::runtime_error("index out of range for isrStorage [E105]");
+        }
+
+        std::int64_t val = SBE_LITTLE_ENDIAN_ENCODE_64(value);
+        std::memcpy(m_buffer + m_offset + 100 + (index * 8), &val, sizeof(std::int64_t));
+        return *this;
+    }
+
+    std::uint64_t getIsrStorage(char *const dst, const std::uint64_t length) const
+    {
+        if (length > 16)
+        {
+            throw std::runtime_error("length too large for getIsrStorage [E106]");
+        }
+
+        if (m_actingVersion < 4)
+        {
+            return 0;
+        }
+
+        std::memcpy(dst, m_buffer + m_offset + 100, sizeof(std::int64_t) * static_cast<std::size_t>(length));
+        return length;
+    }
+
+    #ifdef SBE_USE_SPAN
+    SBE_NODISCARD std::span<const std::int64_t> getIsrStorageAsSpan() const SBE_NOEXCEPT
+    {
+        if (m_actingVersion < 4)
+        {
+            return std::span<const std::int64_t>();
+        }
+
+        const char *buffer = m_buffer + m_offset + 100;
+        return std::span<const std::int64_t>(reinterpret_cast<const std::int64_t*>(buffer), 16);
+    }
+    #endif
+
+    #ifdef SBE_USE_SPAN
+    template <std::size_t N>
+    AlterIsr &putIsrStorage(std::span<const std::int64_t, N> src) SBE_NOEXCEPT
+    {
+        static_assert(N <= 16, "array too large for putIsrStorage");
+
+        if (N > 0)
+        {
+            std::memcpy(m_buffer + m_offset + 100, src.data(), sizeof(std::int64_t) * N);
+        }
+
+        for (std::size_t start = N; start < 16; ++start)
+        {
+            m_buffer[m_offset + 100 + start] = 0;
+        }
+
+        return *this;
+    }
+    #endif
+
+    #ifdef SBE_USE_SPAN
+    AlterIsr &putIsrStorage(std::span<const std::int64_t> src)
+    {
+        const std::size_t srcLength = src.size();
+        if (srcLength > 16)
+        {
+            throw std::runtime_error("array too large for putIsrStorage [E106]");
+        }
+
+        if (srcLength > 0)
+        {
+            std::memcpy(m_buffer + m_offset + 100, src.data(), sizeof(std::int64_t) * srcLength);
+        }
+
+        for (std::size_t start = srcLength; start < 16; ++start)
+        {
+            m_buffer[m_offset + 100 + start] = 0;
+        }
+
+        return *this;
+    }
+    #endif
+
+    #ifdef SBE_USE_SPAN
+    template <typename T>
+    AlterIsr &putIsrStorage(T&& src)  SBE_NOEXCEPT requires
+        (std::is_pointer_v<std::remove_reference_t<T>> &&
+         !std::is_array_v<std::remove_reference_t<T>>)
+    #else
+    AlterIsr &putIsrStorage(const char *const src) SBE_NOEXCEPT
+    #endif
+    {
+        std::memcpy(m_buffer + m_offset + 100, src, sizeof(std::int64_t) * 16);
+        return *this;
+    }
+
+    SBE_NODISCARD static const char *sendSeqMetaAttribute(const MetaAttribute metaAttribute) SBE_NOEXCEPT
+    {
+        switch (metaAttribute)
+        {
+            case MetaAttribute::PRESENCE: return "required";
+            default: return "";
+        }
+    }
+
+    static SBE_CONSTEXPR std::uint16_t sendSeqId() SBE_NOEXCEPT
+    {
+        return 10;
+    }
+
+    SBE_NODISCARD static SBE_CONSTEXPR std::uint64_t sendSeqSinceVersion() SBE_NOEXCEPT
+    {
+        return 4;
+    }
+
+    SBE_NODISCARD bool sendSeqInActingVersion() SBE_NOEXCEPT
+    {
+        return m_actingVersion >= sendSeqSinceVersion();
+    }
+
+    SBE_NODISCARD static SBE_CONSTEXPR std::size_t sendSeqEncodingOffset() SBE_NOEXCEPT
+    {
+        return 228;
+    }
+
+    static SBE_CONSTEXPR std::int32_t sendSeqNullValue() SBE_NOEXCEPT
+    {
+        return SBE_NULLVALUE_INT32;
+    }
+
+    static SBE_CONSTEXPR std::int32_t sendSeqMinValue() SBE_NOEXCEPT
+    {
+        return INT32_C(-2147483647);
+    }
+
+    static SBE_CONSTEXPR std::int32_t sendSeqMaxValue() SBE_NOEXCEPT
+    {
+        return INT32_C(2147483647);
+    }
+
+    static SBE_CONSTEXPR std::size_t sendSeqEncodingLength() SBE_NOEXCEPT
+    {
+        return 4;
+    }
+
+    SBE_NODISCARD std::int32_t sendSeq() const SBE_NOEXCEPT
+    {
+        if (m_actingVersion < 4)
+        {
+            return INT32_MIN;
+        }
+
+        std::int32_t val;
+        std::memcpy(&val, m_buffer + m_offset + 228, sizeof(std::int32_t));
+        return SBE_LITTLE_ENDIAN_ENCODE_32(val);
+    }
+
+    AlterIsr &sendSeq(const std::int32_t value) SBE_NOEXCEPT
+    {
+        std::int32_t val = SBE_LITTLE_ENDIAN_ENCODE_32(value);
+        std::memcpy(m_buffer + m_offset + 228, &val, sizeof(std::int32_t));
+        return *this;
+    }
+
 template<typename CharT, typename Traits>
 friend std::basic_ostream<CharT, Traits> & operator << (
     std::basic_ostream<CharT, Traits> &builder, const AlterIsr &_writer)
@@ -908,6 +1232,27 @@ friend std::basic_ostream<CharT, Traits> & operator << (
     builder << ", ";
     builder << R"("partitionEpoch": )";
     builder << +writer.partitionEpoch();
+
+    builder << ", ";
+    builder << R"("proposalId": )";
+    builder << +writer.proposalId();
+
+    builder << ", ";
+    builder << R"("isrStorage": )";
+    builder << '[';
+    for (std::size_t i = 0, length = writer.isrStorageLength(); i < length; i++)
+    {
+        if (i)
+        {
+            builder << ',';
+        }
+        builder << +writer.isrStorage(i);
+    }
+    builder << ']';
+
+    builder << ", ";
+    builder << R"("sendSeq": )";
+    builder << +writer.sendSeq();
 
     builder << '}';
 

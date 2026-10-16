@@ -116,11 +116,11 @@ private:
     }
 
 public:
-    static constexpr std::uint16_t SBE_BLOCK_LENGTH = static_cast<std::uint16_t>(26);
+    static constexpr std::uint16_t SBE_BLOCK_LENGTH = static_cast<std::uint16_t>(46);
     static constexpr std::uint16_t SBE_TEMPLATE_ID = static_cast<std::uint16_t>(8);
     static constexpr std::uint16_t SBE_SCHEMA_ID = static_cast<std::uint16_t>(112);
-    static constexpr std::uint16_t SBE_SCHEMA_VERSION = static_cast<std::uint16_t>(3);
-    static constexpr const char* SBE_SEMANTIC_VERSION = "1.1";
+    static constexpr std::uint16_t SBE_SCHEMA_VERSION = static_cast<std::uint16_t>(4);
+    static constexpr const char* SBE_SEMANTIC_VERSION = "1.2";
 
     enum MetaAttribute
     {
@@ -174,7 +174,7 @@ public:
 
     SBE_NODISCARD static SBE_CONSTEXPR std::uint16_t sbeBlockLength() SBE_NOEXCEPT
     {
-        return static_cast<std::uint16_t>(26);
+        return static_cast<std::uint16_t>(46);
     }
 
     SBE_NODISCARD static SBE_CONSTEXPR std::uint64_t sbeBlockAndHeaderLength() SBE_NOEXCEPT
@@ -194,12 +194,12 @@ public:
 
     SBE_NODISCARD static SBE_CONSTEXPR std::uint16_t sbeSchemaVersion() SBE_NOEXCEPT
     {
-        return static_cast<std::uint16_t>(3);
+        return static_cast<std::uint16_t>(4);
     }
 
     SBE_NODISCARD static const char *sbeSemanticVersion() SBE_NOEXCEPT
     {
-        return "1.1";
+        return "1.2";
     }
 
     SBE_NODISCARD static SBE_CONSTEXPR const char *sbeSemanticType() SBE_NOEXCEPT
@@ -693,6 +693,210 @@ public:
         return *this;
     }
 
+    SBE_NODISCARD static const char *proposalIdMetaAttribute(const MetaAttribute metaAttribute) SBE_NOEXCEPT
+    {
+        switch (metaAttribute)
+        {
+            case MetaAttribute::PRESENCE: return "required";
+            default: return "";
+        }
+    }
+
+    static SBE_CONSTEXPR std::uint16_t proposalIdId() SBE_NOEXCEPT
+    {
+        return 7;
+    }
+
+    SBE_NODISCARD static SBE_CONSTEXPR std::uint64_t proposalIdSinceVersion() SBE_NOEXCEPT
+    {
+        return 4;
+    }
+
+    SBE_NODISCARD bool proposalIdInActingVersion() SBE_NOEXCEPT
+    {
+        return m_actingVersion >= proposalIdSinceVersion();
+    }
+
+    SBE_NODISCARD static SBE_CONSTEXPR std::size_t proposalIdEncodingOffset() SBE_NOEXCEPT
+    {
+        return 26;
+    }
+
+    static SBE_CONSTEXPR std::int64_t proposalIdNullValue() SBE_NOEXCEPT
+    {
+        return SBE_NULLVALUE_INT64;
+    }
+
+    static SBE_CONSTEXPR std::int64_t proposalIdMinValue() SBE_NOEXCEPT
+    {
+        return INT64_C(-9223372036854775807);
+    }
+
+    static SBE_CONSTEXPR std::int64_t proposalIdMaxValue() SBE_NOEXCEPT
+    {
+        return INT64_C(9223372036854775807);
+    }
+
+    static SBE_CONSTEXPR std::size_t proposalIdEncodingLength() SBE_NOEXCEPT
+    {
+        return 8;
+    }
+
+    SBE_NODISCARD std::int64_t proposalId() const SBE_NOEXCEPT
+    {
+        if (m_actingVersion < 4)
+        {
+            return INT64_MIN;
+        }
+
+        std::int64_t val;
+        std::memcpy(&val, m_buffer + m_offset + 26, sizeof(std::int64_t));
+        return SBE_LITTLE_ENDIAN_ENCODE_64(val);
+    }
+
+    AlterIsrResponse &proposalId(const std::int64_t value) SBE_NOEXCEPT
+    {
+        std::int64_t val = SBE_LITTLE_ENDIAN_ENCODE_64(value);
+        std::memcpy(m_buffer + m_offset + 26, &val, sizeof(std::int64_t));
+        return *this;
+    }
+
+    SBE_NODISCARD static const char *controllerEpochMetaAttribute(const MetaAttribute metaAttribute) SBE_NOEXCEPT
+    {
+        switch (metaAttribute)
+        {
+            case MetaAttribute::PRESENCE: return "required";
+            default: return "";
+        }
+    }
+
+    static SBE_CONSTEXPR std::uint16_t controllerEpochId() SBE_NOEXCEPT
+    {
+        return 8;
+    }
+
+    SBE_NODISCARD static SBE_CONSTEXPR std::uint64_t controllerEpochSinceVersion() SBE_NOEXCEPT
+    {
+        return 4;
+    }
+
+    SBE_NODISCARD bool controllerEpochInActingVersion() SBE_NOEXCEPT
+    {
+        return m_actingVersion >= controllerEpochSinceVersion();
+    }
+
+    SBE_NODISCARD static SBE_CONSTEXPR std::size_t controllerEpochEncodingOffset() SBE_NOEXCEPT
+    {
+        return 34;
+    }
+
+    static SBE_CONSTEXPR std::int64_t controllerEpochNullValue() SBE_NOEXCEPT
+    {
+        return SBE_NULLVALUE_INT64;
+    }
+
+    static SBE_CONSTEXPR std::int64_t controllerEpochMinValue() SBE_NOEXCEPT
+    {
+        return INT64_C(-9223372036854775807);
+    }
+
+    static SBE_CONSTEXPR std::int64_t controllerEpochMaxValue() SBE_NOEXCEPT
+    {
+        return INT64_C(9223372036854775807);
+    }
+
+    static SBE_CONSTEXPR std::size_t controllerEpochEncodingLength() SBE_NOEXCEPT
+    {
+        return 8;
+    }
+
+    SBE_NODISCARD std::int64_t controllerEpoch() const SBE_NOEXCEPT
+    {
+        if (m_actingVersion < 4)
+        {
+            return INT64_MIN;
+        }
+
+        std::int64_t val;
+        std::memcpy(&val, m_buffer + m_offset + 34, sizeof(std::int64_t));
+        return SBE_LITTLE_ENDIAN_ENCODE_64(val);
+    }
+
+    AlterIsrResponse &controllerEpoch(const std::int64_t value) SBE_NOEXCEPT
+    {
+        std::int64_t val = SBE_LITTLE_ENDIAN_ENCODE_64(value);
+        std::memcpy(m_buffer + m_offset + 34, &val, sizeof(std::int64_t));
+        return *this;
+    }
+
+    SBE_NODISCARD static const char *sendSeqMetaAttribute(const MetaAttribute metaAttribute) SBE_NOEXCEPT
+    {
+        switch (metaAttribute)
+        {
+            case MetaAttribute::PRESENCE: return "required";
+            default: return "";
+        }
+    }
+
+    static SBE_CONSTEXPR std::uint16_t sendSeqId() SBE_NOEXCEPT
+    {
+        return 9;
+    }
+
+    SBE_NODISCARD static SBE_CONSTEXPR std::uint64_t sendSeqSinceVersion() SBE_NOEXCEPT
+    {
+        return 4;
+    }
+
+    SBE_NODISCARD bool sendSeqInActingVersion() SBE_NOEXCEPT
+    {
+        return m_actingVersion >= sendSeqSinceVersion();
+    }
+
+    SBE_NODISCARD static SBE_CONSTEXPR std::size_t sendSeqEncodingOffset() SBE_NOEXCEPT
+    {
+        return 42;
+    }
+
+    static SBE_CONSTEXPR std::int32_t sendSeqNullValue() SBE_NOEXCEPT
+    {
+        return SBE_NULLVALUE_INT32;
+    }
+
+    static SBE_CONSTEXPR std::int32_t sendSeqMinValue() SBE_NOEXCEPT
+    {
+        return INT32_C(-2147483647);
+    }
+
+    static SBE_CONSTEXPR std::int32_t sendSeqMaxValue() SBE_NOEXCEPT
+    {
+        return INT32_C(2147483647);
+    }
+
+    static SBE_CONSTEXPR std::size_t sendSeqEncodingLength() SBE_NOEXCEPT
+    {
+        return 4;
+    }
+
+    SBE_NODISCARD std::int32_t sendSeq() const SBE_NOEXCEPT
+    {
+        if (m_actingVersion < 4)
+        {
+            return INT32_MIN;
+        }
+
+        std::int32_t val;
+        std::memcpy(&val, m_buffer + m_offset + 42, sizeof(std::int32_t));
+        return SBE_LITTLE_ENDIAN_ENCODE_32(val);
+    }
+
+    AlterIsrResponse &sendSeq(const std::int32_t value) SBE_NOEXCEPT
+    {
+        std::int32_t val = SBE_LITTLE_ENDIAN_ENCODE_32(value);
+        std::memcpy(m_buffer + m_offset + 42, &val, sizeof(std::int32_t));
+        return *this;
+    }
+
 template<typename CharT, typename Traits>
 friend std::basic_ostream<CharT, Traits> & operator << (
     std::basic_ostream<CharT, Traits> &builder, const AlterIsrResponse &_writer)
@@ -732,6 +936,18 @@ friend std::basic_ostream<CharT, Traits> & operator << (
     builder << ", ";
     builder << R"("errorCode": )";
     builder << +writer.errorCode();
+
+    builder << ", ";
+    builder << R"("proposalId": )";
+    builder << +writer.proposalId();
+
+    builder << ", ";
+    builder << R"("controllerEpoch": )";
+    builder << +writer.controllerEpoch();
+
+    builder << ", ";
+    builder << R"("sendSeq": )";
+    builder << +writer.sendSeq();
 
     builder << '}';
 

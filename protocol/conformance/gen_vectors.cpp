@@ -454,6 +454,44 @@ int main(int argc, char** argv) {
         write_vec(dir, "ddl_response.bin", buf, n);
     }
 
-    std::printf("Done. 25 vectors written to %s/\n", dir);
+    // -----------------------------------------------------------------------
+    // Replication schema 112, v3 vs v4 (ISR protocol) — ReplicationSchemaV4Test.cpp
+    // decodes these with the generated SBE codecs. Hand layout, little-endian.
+    // v3 frames carry the v3 block and version 3; v4 frames the v4 block and version 4.
+    // Field values: see manifest.md section "repl_*".
+    // -----------------------------------------------------------------------
+    {
+        struct Le {
+            std::vector<uint8_t> b;
+            void u16(uint16_t v) { for (int i = 0; i < 2; ++i) b.push_back(uint8_t(v >> (8 * i))); }
+            void i32(int32_t v)  { const uint32_t u = uint32_t(v); for (int i = 0; i < 4; ++i) b.push_back(uint8_t(u >> (8 * i))); }
+            void i64(int64_t v)  { const uint64_t u = uint64_t(v); for (int i = 0; i < 8; ++i) b.push_back(uint8_t(u >> (8 * i))); }
+            void hdr(uint16_t block, uint16_t tmpl, uint16_t ver) { u16(block); u16(tmpl); u16(112); u16(ver); }
+        };
+        auto isr16 = [](Le& w, std::initializer_list<int32_t> v) { int n = 0; for (int32_t x : v) { w.i32(x); ++n; } for (; n < 16; ++n) w.i32(0); };
+        auto sto16 = [](Le& w, std::initializer_list<int64_t> v) { int n = 0; for (int64_t x : v) { w.i64(x); ++n; } for (; n < 16; ++n) w.i64(0); };
+        for (const bool v4 : {false, true}) {
+            {   // repl_alter_isr_v3.bin / _v4.bin (template 7)
+                Le w; w.hdr(v4 ? 232 : 92, 7, v4 ? 4 : 3);
+                w.i32(1); w.i32(2); w.i32(3); w.i64(4); w.i32(2); isr16(w, {3, 5}); w.i32(9);
+                if (v4) { w.i64(77); sto16(w, {11, 22}); w.i32(3); }
+                write_vec(dir, v4 ? "repl_alter_isr_v4.bin" : "repl_alter_isr_v3.bin", w.b.data(), w.b.size());
+            }
+            {   // repl_alter_isr_response_v3.bin / _v4.bin (template 8)
+                Le w; w.hdr(v4 ? 46 : 26, 8, v4 ? 4 : 3);
+                w.i32(1); w.i32(2); w.i32(3); w.i64(4); w.i32(9); w.u16(2);
+                if (v4) { w.i64(77); w.i64(8); w.i32(3); }
+                write_vec(dir, v4 ? "repl_alter_isr_response_v4.bin" : "repl_alter_isr_response_v3.bin", w.b.data(), w.b.size());
+            }
+            {   // repl_fetch_request_v3.bin / _v4.bin (template 1)
+                Le w; w.hdr(v4 ? 60 : 44, 1, v4 ? 4 : 3);
+                w.i64(5); w.i32(1); w.i32(3); w.i64(100); w.i32(4096); w.i32(7); w.i32(4); w.i64(0x1122);
+                if (v4) { w.i64(0x1234); w.i64(90); }
+                write_vec(dir, v4 ? "repl_fetch_request_v4.bin" : "repl_fetch_request_v3.bin", w.b.data(), w.b.size());
+            }
+        }
+    }
+
+    std::printf("Done. 31 vectors written to %s/\n", dir);
     return 0;
 }

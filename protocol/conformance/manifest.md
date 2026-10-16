@@ -1045,3 +1045,51 @@ Body: `errorCode:u16, objectId:u64, newVersion:u32, gateTopicId:i32, detail(vars
 0048    69 63 61 74 69 6F 6E 46 61 63 74 6F 72 20 35 20
 0064    3E 20 62 72 6F 6B 65 72 20 63 6F 75 6E 74 20 33
 ```
+
+---
+
+## Replication schema 112 — ISR protocol v3 / v4 vectors
+
+Hand-layout frames (little-endian) decoded by `tests/protocol/ReplicationSchemaV4Test.cpp` with the generated
+SBE codecs. Header: `blockLength:u16, templateId:u16, schemaId:u16 (=112), version:u16`.
+
+### `repl_alter_isr_v3.bin` (100 bytes) / `repl_alter_isr_v4.bin` (240 bytes) — AlterIsr (template 7)
+
+| Field | Value |
+|-------|-------|
+| blockLength / version | v3: 92 / 3; v4: 232 / 4 |
+| topicId, partition, leaderId | 1, 2, 3 |
+| leaderEpoch | 4 |
+| isrCount, isr | 2, {3, 5, 0 x14} |
+| partitionEpoch | 9 |
+| proposalId (v4) | 77 |
+| isrStorage (v4) | {11, 22, 0 x14} |
+| sendSeq (v4) | 3 |
+
+### `repl_alter_isr_response_v3.bin` (34 bytes) / `repl_alter_isr_response_v4.bin` (54 bytes) — AlterIsrResponse (template 8)
+
+| Field | Value |
+|-------|-------|
+| blockLength / version | v3: 26 / 3; v4: 46 / 4 |
+| topicId, partition, leaderId | 1, 2, 3 |
+| leaderEpoch | 4 |
+| partitionEpoch | 9 |
+| errorCode | 2 |
+| proposalId (v4) | 77 |
+| controllerEpoch (v4) | 8 |
+| sendSeq (v4) | 3 |
+
+### `repl_fetch_request_v3.bin` (52 bytes) / `repl_fetch_request_v4.bin` (68 bytes) — FetchRequest (template 1)
+
+| Field | Value |
+|-------|-------|
+| blockLength / version | v3: 44 / 3; v4: 60 / 4 |
+| leaderEpoch | 5 |
+| partition, followerId | 1, 3 |
+| fetchOffset | 100 |
+| maxBytes | 4096 |
+| topicId | 7 |
+| lastFetchedEpoch | 4 |
+| incarnation | 0x1122 |
+| storageId (v4) | 0x1234 |
+| lastEpochStartOffset (v4) | 90 |

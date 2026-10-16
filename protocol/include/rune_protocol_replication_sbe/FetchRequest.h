@@ -116,11 +116,11 @@ private:
     }
 
 public:
-    static constexpr std::uint16_t SBE_BLOCK_LENGTH = static_cast<std::uint16_t>(44);
+    static constexpr std::uint16_t SBE_BLOCK_LENGTH = static_cast<std::uint16_t>(60);
     static constexpr std::uint16_t SBE_TEMPLATE_ID = static_cast<std::uint16_t>(1);
     static constexpr std::uint16_t SBE_SCHEMA_ID = static_cast<std::uint16_t>(112);
-    static constexpr std::uint16_t SBE_SCHEMA_VERSION = static_cast<std::uint16_t>(3);
-    static constexpr const char* SBE_SEMANTIC_VERSION = "1.1";
+    static constexpr std::uint16_t SBE_SCHEMA_VERSION = static_cast<std::uint16_t>(4);
+    static constexpr const char* SBE_SEMANTIC_VERSION = "1.2";
 
     enum MetaAttribute
     {
@@ -174,7 +174,7 @@ public:
 
     SBE_NODISCARD static SBE_CONSTEXPR std::uint16_t sbeBlockLength() SBE_NOEXCEPT
     {
-        return static_cast<std::uint16_t>(44);
+        return static_cast<std::uint16_t>(60);
     }
 
     SBE_NODISCARD static SBE_CONSTEXPR std::uint64_t sbeBlockAndHeaderLength() SBE_NOEXCEPT
@@ -194,12 +194,12 @@ public:
 
     SBE_NODISCARD static SBE_CONSTEXPR std::uint16_t sbeSchemaVersion() SBE_NOEXCEPT
     {
-        return static_cast<std::uint16_t>(3);
+        return static_cast<std::uint16_t>(4);
     }
 
     SBE_NODISCARD static const char *sbeSemanticVersion() SBE_NOEXCEPT
     {
-        return "1.1";
+        return "1.2";
     }
 
     SBE_NODISCARD static SBE_CONSTEXPR const char *sbeSemanticType() SBE_NOEXCEPT
@@ -829,6 +829,142 @@ public:
         return *this;
     }
 
+    SBE_NODISCARD static const char *storageIdMetaAttribute(const MetaAttribute metaAttribute) SBE_NOEXCEPT
+    {
+        switch (metaAttribute)
+        {
+            case MetaAttribute::PRESENCE: return "required";
+            default: return "";
+        }
+    }
+
+    static SBE_CONSTEXPR std::uint16_t storageIdId() SBE_NOEXCEPT
+    {
+        return 9;
+    }
+
+    SBE_NODISCARD static SBE_CONSTEXPR std::uint64_t storageIdSinceVersion() SBE_NOEXCEPT
+    {
+        return 4;
+    }
+
+    SBE_NODISCARD bool storageIdInActingVersion() SBE_NOEXCEPT
+    {
+        return m_actingVersion >= storageIdSinceVersion();
+    }
+
+    SBE_NODISCARD static SBE_CONSTEXPR std::size_t storageIdEncodingOffset() SBE_NOEXCEPT
+    {
+        return 44;
+    }
+
+    static SBE_CONSTEXPR std::int64_t storageIdNullValue() SBE_NOEXCEPT
+    {
+        return SBE_NULLVALUE_INT64;
+    }
+
+    static SBE_CONSTEXPR std::int64_t storageIdMinValue() SBE_NOEXCEPT
+    {
+        return INT64_C(-9223372036854775807);
+    }
+
+    static SBE_CONSTEXPR std::int64_t storageIdMaxValue() SBE_NOEXCEPT
+    {
+        return INT64_C(9223372036854775807);
+    }
+
+    static SBE_CONSTEXPR std::size_t storageIdEncodingLength() SBE_NOEXCEPT
+    {
+        return 8;
+    }
+
+    SBE_NODISCARD std::int64_t storageId() const SBE_NOEXCEPT
+    {
+        if (m_actingVersion < 4)
+        {
+            return INT64_MIN;
+        }
+
+        std::int64_t val;
+        std::memcpy(&val, m_buffer + m_offset + 44, sizeof(std::int64_t));
+        return SBE_LITTLE_ENDIAN_ENCODE_64(val);
+    }
+
+    FetchRequest &storageId(const std::int64_t value) SBE_NOEXCEPT
+    {
+        std::int64_t val = SBE_LITTLE_ENDIAN_ENCODE_64(value);
+        std::memcpy(m_buffer + m_offset + 44, &val, sizeof(std::int64_t));
+        return *this;
+    }
+
+    SBE_NODISCARD static const char *lastEpochStartOffsetMetaAttribute(const MetaAttribute metaAttribute) SBE_NOEXCEPT
+    {
+        switch (metaAttribute)
+        {
+            case MetaAttribute::PRESENCE: return "required";
+            default: return "";
+        }
+    }
+
+    static SBE_CONSTEXPR std::uint16_t lastEpochStartOffsetId() SBE_NOEXCEPT
+    {
+        return 10;
+    }
+
+    SBE_NODISCARD static SBE_CONSTEXPR std::uint64_t lastEpochStartOffsetSinceVersion() SBE_NOEXCEPT
+    {
+        return 4;
+    }
+
+    SBE_NODISCARD bool lastEpochStartOffsetInActingVersion() SBE_NOEXCEPT
+    {
+        return m_actingVersion >= lastEpochStartOffsetSinceVersion();
+    }
+
+    SBE_NODISCARD static SBE_CONSTEXPR std::size_t lastEpochStartOffsetEncodingOffset() SBE_NOEXCEPT
+    {
+        return 52;
+    }
+
+    static SBE_CONSTEXPR std::int64_t lastEpochStartOffsetNullValue() SBE_NOEXCEPT
+    {
+        return SBE_NULLVALUE_INT64;
+    }
+
+    static SBE_CONSTEXPR std::int64_t lastEpochStartOffsetMinValue() SBE_NOEXCEPT
+    {
+        return INT64_C(-9223372036854775807);
+    }
+
+    static SBE_CONSTEXPR std::int64_t lastEpochStartOffsetMaxValue() SBE_NOEXCEPT
+    {
+        return INT64_C(9223372036854775807);
+    }
+
+    static SBE_CONSTEXPR std::size_t lastEpochStartOffsetEncodingLength() SBE_NOEXCEPT
+    {
+        return 8;
+    }
+
+    SBE_NODISCARD std::int64_t lastEpochStartOffset() const SBE_NOEXCEPT
+    {
+        if (m_actingVersion < 4)
+        {
+            return INT64_MIN;
+        }
+
+        std::int64_t val;
+        std::memcpy(&val, m_buffer + m_offset + 52, sizeof(std::int64_t));
+        return SBE_LITTLE_ENDIAN_ENCODE_64(val);
+    }
+
+    FetchRequest &lastEpochStartOffset(const std::int64_t value) SBE_NOEXCEPT
+    {
+        std::int64_t val = SBE_LITTLE_ENDIAN_ENCODE_64(value);
+        std::memcpy(m_buffer + m_offset + 52, &val, sizeof(std::int64_t));
+        return *this;
+    }
+
 template<typename CharT, typename Traits>
 friend std::basic_ostream<CharT, Traits> & operator << (
     std::basic_ostream<CharT, Traits> &builder, const FetchRequest &_writer)
@@ -876,6 +1012,14 @@ friend std::basic_ostream<CharT, Traits> & operator << (
     builder << ", ";
     builder << R"("incarnation": )";
     builder << +writer.incarnation();
+
+    builder << ", ";
+    builder << R"("storageId": )";
+    builder << +writer.storageId();
+
+    builder << ", ";
+    builder << R"("lastEpochStartOffset": )";
+    builder << +writer.lastEpochStartOffset();
 
     builder << '}';
 
