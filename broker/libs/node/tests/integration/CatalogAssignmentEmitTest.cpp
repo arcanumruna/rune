@@ -3287,3 +3287,244 @@ TEST(CatalogUnservableRegression, ARestartedBrokersFirstReportFromItsNewProcessI
     (void)c.svc->onAlterIsr(old);
     EXPECT_FALSE(c.svc->reportedUnservable(0, 0, L)) << "a superseded process's late report";
 }
+
+// ===========================================================================
+// F-B (2026-10-16): the controller claim is replica leadership + consensus leadership + not halted, at ONE
+// replica epoch.  A consensus step-down with no known successor leaves the metadata replica Leader (the bridge
+// acts only on a known leader); a same-node re-win is then a Leader->Leader epoch bump with no role edge.  Before
+// the fix no claim-time action ran on that re-win, so every placement recorded in the gap was lost forever
+// (a committed CREATE answered "in doubt" every 5 s, without end).
+// ===========================================================================
+namespace {
+struct ReclaimRig {
+    SaeTempDir d1{"fb1"}, d2{"fb2"}, d3{"fb3"};
+    rune::storage::Log log1{d1.path}, log2{d2.path}, log3{d3.path};
+    const std::vector<NodeId> all{1, 2, 3};
+    InMemoryTransport transport;
+    std::unique_ptr<PartitionReplica> r1, r2, r3;
+    std::unique_ptr<MetadataService> svc1;
+    int64_t clock = 0;
+    explicit ReclaimRig(Role r1Role = Role::Leader, Epoch e = 1) {
+        log1.recover(); log2.recover(); log3.recover();
+        r1 = std::make_unique<PartitionReplica>(makeMetaCfg(1), r1Role, e, all, all, &log1, &transport);
+        r2 = std::make_unique<PartitionReplica>(makeMetaCfg(2), Role::Follower, e, all, all, &log2, &transport);
+        r3 = std::make_unique<PartitionReplica>(makeMetaCfg(3), Role::Follower, e, all, all, &log3, &transport);
+        transport.setLeader(r1.get());
+        transport.addFollower(2, r2.get());
+        transport.addFollower(3, r3.get());
+        svc1 = std::make_unique<MetadataService>(r1.get(), 1);
+    }
+    void drive(int n) {
+        for (int i = 0; i < n; ++i) {
+            clock += 1'000'000LL;
+            r1->doWork(clock); r2->doWork(clock); r3->doWork(clock);
+            transport.pump(clock);
+            (void)svc1->doWork(clock);
+        }
+    }
+    /// The same node wins consensus again: the bridge bumps the (still Leader) replica's epoch.
+    void rewin(Epoch e) {
+        svc1->setConsensusLeads(true);
+        r1->becomeLeader(e, all);
+        r2->becomeFollower(e, 1);
+        r3->becomeFollower(e, 1);
+    }
+};
+}   // namespace
+
+TEST(ControllerReclaimRegression, RuntimeTopicAppliedInConsensusGapIsPlacedOnSameNodeReclaimRegression) {
+    ReclaimRig g;
+    g.svc1->configure({}, g.all);
+    g.drive(50);
+    ASSERT_TRUE(g.svc1->controllerReady());
+    g.svc1->setConsensusLeads(false);
+    g.drive(5);
+    ASSERT_FALSE(g.svc1->controllerReady());
+    g.svc1->addRuntimeTopic(TopicSpec{0, 1, 3, "", "ready"});   // the committed CREATE applied in the gap
+    g.drive(5);
+    EXPECT_EQ(g.svc1->assignment(0, 0), nullptr) << "a deposed controller placed a topic";
+    g.rewin(3);
+    g.drive(200);
+    EXPECT_NE(g.svc1->assignment(0, 0), nullptr) << "a committed CREATE applied in the consensus gap is never placed";
+}
+
+TEST(ControllerReclaimRegression, CoPartitionGroupAppliedInConsensusGapIsPlacedWholeRegression) {
+    ReclaimRig g;
+    g.svc1->configure({}, g.all);
+    g.drive(50);
+    ASSERT_TRUE(g.svc1->controllerReady());
+    g.svc1->setConsensusLeads(false);
+    g.drive(5);
+    g.svc1->addRuntimeTopic(TopicSpec{0, 3, 1, "grp", "k"});
+    g.svc1->addRuntimeTopic(TopicSpec{1, 3, 1, "grp", "k"});
+    g.drive(5);
+    g.rewin(3);
+    g.drive(200);
+    for (int32_t p = 0; p < 3; ++p) {
+        const auto* a = g.svc1->assignment(0, p);
+        const auto* b = g.svc1->assignment(1, p);
+        ASSERT_NE(a, nullptr) << "partition " << p << " of the first member was never placed";
+        ASSERT_NE(b, nullptr) << "partition " << p << " of the second member was never placed";
+        EXPECT_EQ(a->replicas, b->replicas) << "the co-partition unit was not placed whole at partition " << p;
+        EXPECT_EQ(a->leaderNode, b->leaderNode);
+    }
+}
+
+TEST(ControllerReclaimRegression, DropInConsensusGapRemovesPlacementOnSameNodeReclaimRegression) {
+    ReclaimRig g;
+    g.svc1->configure({}, g.all);
+    g.drive(50);
+    g.svc1->addRuntimeTopic(TopicSpec{0, 1, 3, "", "t"});
+    g.svc1->addRuntimeTopic(TopicSpec{1, 1, 3, "", "u"});
+    g.drive(100);
+    ASSERT_NE(g.svc1->assignment(0, 0), nullptr) << "precondition: placed while ready";
+    ASSERT_NE(g.svc1->assignment(1, 0), nullptr) << "precondition: placed while ready";
+    // A drop reconciled while ready: the reconcile latches the committed map version it last ran at, so a later
+    // non-forced reconcile at an unchanged map does nothing - only the claim's forced reconcile can act.
+    g.svc1->removeRuntimeTopic(1);
+    g.drive(100);
+    ASSERT_EQ(g.svc1->assignment(1, 0), nullptr) << "precondition: a drop while ready is removed";
+    ASSERT_EQ(g.svc1->removalsInFlightForTest(), 0u);
+    g.svc1->setConsensusLeads(false);
+    g.drive(5);
+    g.svc1->removeRuntimeTopic(0);   // the committed DROP applied in the gap
+    g.drive(5);
+    EXPECT_NE(g.svc1->assignment(0, 0), nullptr) << "a deposed controller removed a placement";
+    g.rewin(3);
+    g.drive(200);
+    EXPECT_EQ(g.svc1->assignment(0, 0), nullptr) << "a DROP applied in the consensus gap never removes the placement";
+    EXPECT_EQ(g.svc1->removalsInFlightForTest(), 0u);
+}
+
+TEST(ControllerReclaimRegression, CatchUpReachedWhileConsensusDeposedStillPlacesRegression) {
+    SaeTempDir dir1("fbc1"), dir2("fbc2"), dir3("fbc3");
+    const std::vector<NodeId> all = {1, 2, 3};
+    {   // Incarnation 1: a committed log (topic 5 placed) so the restarted controller claims with its HW behind.
+        rune::storage::Log log1(dir1.path), log2(dir2.path), log3(dir3.path);
+        log1.recover(); log2.recover(); log3.recover();
+        InMemoryTransport transport;
+        auto r1 = std::make_unique<PartitionReplica>(makeMetaCfg(1), Role::Leader, 1, all, all, &log1, &transport);
+        auto r2 = std::make_unique<PartitionReplica>(makeMetaCfg(2), Role::Follower, 1, all, all, &log2, &transport);
+        auto r3 = std::make_unique<PartitionReplica>(makeMetaCfg(3), Role::Follower, 1, all, all, &log3, &transport);
+        transport.setLeader(r1.get());
+        transport.addFollower(2, r2.get());
+        transport.addFollower(3, r3.get());
+        MetadataService svc(r1.get(), 1);
+        svc.configure({TopicSpec{5, 1, 3, "", "old"}}, all);
+        int64_t clock = 0;
+        for (int i = 0; i < 100; ++i) {
+            clock += 1'000'000LL;
+            r1->doWork(clock); r2->doWork(clock); r3->doWork(clock);
+            transport.pump(clock);
+            (void)svc.doWork(clock);
+        }
+        ASSERT_NE(svc.assignment(5, 0), nullptr);
+    }
+    rune::storage::Log log1(dir1.path), log2(dir2.path), log3(dir3.path);
+    log1.recover(); log2.recover(); log3.recover();
+    InMemoryTransport transport;
+    auto r1 = std::make_unique<PartitionReplica>(makeMetaCfg(1), Role::Follower, 0, all, all, &log1, &transport);
+    auto r2 = std::make_unique<PartitionReplica>(makeMetaCfg(2), Role::Follower, 0, all, all, &log2, &transport);
+    auto r3 = std::make_unique<PartitionReplica>(makeMetaCfg(3), Role::Follower, 0, all, all, &log3, &transport);
+    r1->becomeLeader(2, all);
+    r2->becomeFollower(2, 1);
+    r3->becomeFollower(2, 1);
+    transport.setLeader(r1.get());
+    transport.addFollower(2, r2.get());
+    transport.addFollower(3, r3.get());
+    MetadataService svc1(r1.get(), 1);
+    svc1.configure({TopicSpec{5, 1, 3, "", "old"}, TopicSpec{0, 1, 3, "", "t"}}, all);
+    int64_t clock = 1'000'000LL;
+    (void)svc1.doWork(clock);   // the claim: HW behind the log
+    ASSERT_FALSE(svc1.controllerCaughtUpForTest()) << "precondition: claimed before catching up";
+    svc1.setConsensusLeads(false);   // deposed before the catch-up
+    auto drive = [&](int n) {
+        for (int i = 0; i < n; ++i) {
+            clock += 1'000'000LL;
+            r1->doWork(clock); r2->doWork(clock); r3->doWork(clock);
+            transport.pump(clock);
+            (void)svc1.doWork(clock);
+        }
+    };
+    drive(100);   // the HW reaches the claim LEO while consensus is elsewhere
+    ASSERT_EQ(r1->highWatermark(), r1->logEndOffset()) << "precondition: the claim LEO was committed in the gap";
+    EXPECT_EQ(svc1.assignment(0, 0), nullptr) << "a deposed controller placed a topic";
+    svc1.setConsensusLeads(true);
+    r1->becomeLeader(4, all);
+    r2->becomeFollower(4, 1);
+    r3->becomeFollower(4, 1);
+    drive(200);
+    EXPECT_NE(svc1.assignment(0, 0), nullptr) << "a catch-up spent while deposed lost the claim-time placement";
+}
+
+TEST(ControllerReclaimRegression, EpochJumpWithoutObservedGapIsANewClaimRegression) {
+    ReclaimRig g;
+    g.svc1->configure({}, g.all);
+    g.drive(50);
+    ASSERT_TRUE(g.svc1->controllerReady());
+    // A record appended but not yet committed (a frozen control thread: the term it never observed may have had
+    // another leader) - so the claim LEO is ahead of the HW at the re-claim.
+    g.svc1->addRuntimeTopic(TopicSpec{0, 1, 3, "", "t"});
+    ASSERT_LT(g.r1->highWatermark(), g.r1->logEndOffset()) << "precondition: an uncommitted record";
+    g.r1->becomeLeader(3, g.all);   // consensusLeads_ stays true throughout: no observed gap
+    g.r2->becomeFollower(3, 1);
+    g.r3->becomeFollower(3, 1);
+    g.clock += 1'000'000LL;
+    (void)g.svc1->doWork(g.clock);
+    EXPECT_FALSE(g.svc1->controllerCaughtUpForTest())
+        << "a new replica epoch was treated as a continuation of the old claim (no claim-LEO wait)";
+    EXPECT_FALSE(g.svc1->controllerReady());
+    g.drive(200);
+    EXPECT_TRUE(g.svc1->controllerCaughtUpForTest());
+    EXPECT_NE(g.svc1->assignment(0, 0), nullptr);
+}
+
+TEST(ControllerReclaimRegression, HoldReleasedInConsensusGapPlacesOnReclaimRegression) {
+    ReclaimRig g;
+    g.svc1->configure({}, g.all);
+    g.drive(50);
+    ASSERT_TRUE(g.svc1->controllerReady());
+    g.svc1->holdPlacementForTest(true);
+    g.svc1->addRuntimeTopic(TopicSpec{0, 1, 3, "", "t"});
+    g.drive(5);
+    ASSERT_EQ(g.svc1->assignment(0, 0), nullptr) << "precondition: held";
+    g.svc1->setConsensusLeads(false);
+    g.drive(5);
+    g.svc1->holdPlacementForTest(false);   // released in the gap
+    g.drive(5);
+    EXPECT_EQ(g.svc1->assignment(0, 0), nullptr) << "a deposed controller placed a topic";
+    g.rewin(3);
+    g.drive(200);
+    EXPECT_NE(g.svc1->assignment(0, 0), nullptr) << "a hold released in the consensus gap is never placed";
+}
+
+TEST(ControllerReclaimRegression, DeposedControllerNeverDrainsQueuedRecordsRegression) {
+    ReclaimRig g;
+    g.svc1->configure({}, g.all);
+    g.drive(50);
+    ASSERT_TRUE(g.svc1->controllerReady());
+    // 300 partitions: one drain appends kMaxRecordsPerBatch (256), the rest stays queued under this claim.
+    constexpr int32_t kParts = 300;
+    g.svc1->addRuntimeTopic(TopicSpec{0, kParts, 1, "", "t"});
+    ASSERT_GT(g.svc1->pendingDecisionsForTest(), 0u) << "precondition: decisions queued, not yet appended";
+    g.svc1->setConsensusLeads(false);
+    const Offset leoDeposed = g.r1->logEndOffset();
+    g.drive(50);
+    EXPECT_EQ(g.svc1->pendingDecisionsForTest(), 0u)
+        << "decisions taken under the lost claim survived the deposition (a zombie controller's queue)";
+    EXPECT_EQ(g.r1->logEndOffset(), leoDeposed) << "a deposed controller appended queued decisions";
+    // Re-win at the SAME replica epoch first (consensus is pushed every cycle, the bridge's epoch bump can lag a
+    // cycle): it is a NEW claim, never a continuation that drains the old queue.
+    g.svc1->setConsensusLeads(true);
+    g.drive(1);
+    g.rewin(3);
+    g.drive(300);
+    for (int32_t p = 0; p < kParts; ++p) ASSERT_NE(g.svc1->assignment(0, p), nullptr) << "partition " << p;
+    std::vector<int32_t> epochs;
+    for (int32_t p = 0; p < kParts; ++p) epochs.push_back(g.svc1->assignment(0, p)->partitionEpoch);
+    const Offset leo = g.r1->logEndOffset();
+    g.drive(50);
+    for (int32_t p = 0; p < kParts; ++p)
+        EXPECT_EQ(g.svc1->assignment(0, p)->partitionEpoch, epochs[p]) << "partition " << p << " placed twice";
+    EXPECT_EQ(g.r1->logEndOffset(), leo) << "placement records kept being appended after the re-claim";
+}

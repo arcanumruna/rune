@@ -1604,6 +1604,8 @@ public:
     /// The controller decides only once its map reflects its whole log as of
     /// the claim (see controllerReady_).
     [[nodiscard]] bool controllerCaughtUpForTest() const noexcept { return controllerCaughtUp_; }
+    /// F-B test-only: placement / ISR decisions queued under the current claim and not yet appended.
+    [[nodiscard]] std::size_t pendingDecisionsForTest() const noexcept { return pendingDynamicRecords_.size(); }
 
     /// AeronPartitionTransport handler: true = send `resp` to the proposer.
     static bool onAlterIsrThunk(void* self, const rune::replication::AlterIsrMsg& m,
@@ -1994,12 +1996,19 @@ public:
 
         // Detect the leader edge (same pattern as TCS::loadable_): rebuild the
         // controller state from the log, then emit.
-        const bool amLeader = leaderReady_();
+        // F-B: the controller edge is replica leadership + consensus leadership + not halted, at ONE replica
+        // epoch.  A consensus step-down with no known successor leaves the replica Leader (the bridge acts only
+        // on a known leader) and a same-node re-win is a Leader->Leader epoch bump: both are a leadership change,
+        // never a continuation - every claim-time action (rebuild, claim LEO, catch-up -> placement of every
+        // unassigned unit, forced removal reconcile, leaderless-mark restore) runs again on the re-claim.
+        const bool amLeader = leaderReady_() && consensusLeads_ && !halted_;
+        if (amLeader && wasLeader_ && replica_->epoch() != claimEpoch_) stepDownController_();   // re-claimed below
         if (amLeader && !wasLeader_) {
             // Became leader: rebuild the MSM from the committed log so we have
             // the full assignment map before serving requests.
             rebuildFromLog();
-            wasLeader_ = true;
+            wasLeader_  = true;
+            claimEpoch_ = replica_->epoch();
             // Epoch-restart fix (Raft/KRaft: a new leader decides nothing before
             // its whole log is committed): records past the HW at the claim
             // (e.g. a predecessor's failover, not yet committed after a cold
@@ -2016,26 +2025,7 @@ public:
             // Followers never emit.
             maybeCatchUp_();
         } else if (!amLeader && wasLeader_) {
-            wasLeader_ = false;
-            assigned_  = false;  // re-arm emit if we regain leadership later
-            // Records decided under this leadership but not appended: the next
-            // leader re-decides from the committed map.
-            pendingDynamicRecords_.clear();
-            inflight_.clear();
-            pendingLineageRecords_.clear();   // C1: the next controller re-decides (leaders re-send)
-            lineageInflight_.clear();
-            pendingRemovalRecords_.clear();   // Task 8: removedTopics_ is kept — the next controller removes
-            removalInflight_.clear();
-            removedReconciledVersion_ = UINT64_MAX;
-            pendingFeatureLevel_  = -1;   // D15: the next controller re-decides
-            featureInflightLevel_ = -1;
-            // Controlled-shutdown marks are kept (soft, every member holds
-            // them); confirmations were the old controller's — re-collected.
-            for (auto& [n, st] : nodeLifecycle_) { st.confirmed.clear(); st.pushedBits = -1; st.completePushed = false; }
-            confirmCheckedVersion_ = 0;
-            // Follower: reset lastApplied_ so we re-apply from scratch if we
-            // become leader again later.
-            lastApplied_ = -1;
+            stepDownController_();
         }
 
         const rune::replication::Offset hw = replica_->highWatermark();
@@ -2329,6 +2319,33 @@ private:
     // invariant).  Stops when the count OR byte budget for this cycle is
     // exhausted, leaving the remainder in the queue for the next cycle.
     // -----------------------------------------------------------------------
+    /// The controller-leadership step-down edge (replica demoted, consensus lost, halted, or a new replica
+    /// epoch about to be re-claimed - F-B): everything decided under the old claim is dropped and the next
+    /// claim starts a fresh catch-up.
+    void stepDownController_() {
+        wasLeader_ = false;
+        assigned_  = false;  // re-arm emit if we regain leadership later
+        // Records decided under this leadership but not appended: the next
+        // leader re-decides from the committed map.
+        pendingDynamicRecords_.clear();
+        inflight_.clear();
+        pendingLineageRecords_.clear();   // C1: the next controller re-decides (leaders re-send)
+        lineageInflight_.clear();
+        pendingRemovalRecords_.clear();   // Task 8: removedTopics_ is kept — the next controller removes
+        removalInflight_.clear();
+        removedReconciledVersion_ = UINT64_MAX;
+        pendingFeatureLevel_  = -1;   // D15: the next controller re-decides
+        featureInflightLevel_ = -1;
+        // Controlled-shutdown marks are kept (soft, every member holds
+        // them); confirmations were the old controller's — re-collected.
+        for (auto& [n, st] : nodeLifecycle_) { st.confirmed.clear(); st.pushedBits = -1; st.completePushed = false; }
+        confirmCheckedVersion_ = 0;
+        // Follower: reset lastApplied_ so we re-apply from scratch if we
+        // become leader again later.
+        lastApplied_ = -1;
+        controllerCaughtUp_ = false;   // F-B: a later claim always runs a fresh catch-up
+    }
+
     /// This replica may append to the metadata log (the replica's produce gate).
     [[nodiscard]] bool leaderReady_() const noexcept {
         return replica_ != nullptr && replica_->acceptsProduce();
@@ -2648,7 +2665,9 @@ private:
         if (pendingDynamicRecords_.empty() && pendingLineageRecords_.empty() && pendingRemovalRecords_.empty() &&
             pendingFeatureLevel_ <= msm_.featureLevel())
             return;
-        if (!leaderReady_()) return;   // kept queued until this replica may append
+        // kept queued until this replica may append; F-B / D17: a consensus-deposed or halted controller whose
+        // replica still leads never appends what it decided (the step-down edge also clears the queues).
+        if (!leaderReady_() || !consensusLeads_ || halted_) return;
 
         static constexpr std::size_t kEncBufSize = 16 * 1024;
         uint8_t encBuf[kEncBufSize];
@@ -2736,6 +2755,7 @@ private:
 
     // Follower→Leader transition gate (mirrors TCS / GCS patterns).
     bool wasLeader_ = false;
+    rune::replication::Epoch claimEpoch_ = -1;   ///< F-B: the replica epoch of the current controller claim
     /// partition key → metadata-log end offset of its last appended (not yet
     /// committed) assignment record.
     std::unordered_map<int64_t, rune::replication::Offset> inflight_;
