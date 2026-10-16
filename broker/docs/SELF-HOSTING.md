@@ -38,6 +38,8 @@ or malformed.
 | `RUNE_PEERS` | **yes** | — | list | Comma-separated `id@host:consensusPort` for **all** nodes incl. self. Ids unique; must contain `RUNE_NODE_ID`; `host:port` is **raw** (broker builds `aeron:udp?endpoint=…`). Whitespace trimmed; trailing/empty entries rejected. Single-node: just `0@127.0.0.1:40111`. |
 | `RUNE_CLIENT_ENDPOINT` | **yes** | — | host:port | **Raw `host:port`** the client gateway listens on (broker prepends `aeron:udp?endpoint=`). Use `0.0.0.0:40200` to bind all interfaces. Do **not** pass a full `aeron:udp?...` string. |
 | `RUNE_DATA_DIR` | **yes** | — | path | Writable dir for durable state (node-state, term log, partition logs). Mount a volume/bind-mount here. (Compose files set it to `/var/lib/rune`.) |
+| `RUNE_STORAGE_FORMAT` | no | *(unset: never format)* | `new` \| `join` \| `auto` | Read **only** when `RUNE_DATA_DIR` is empty and not formatted. Unset: the broker refuses to start and says what to run. `new`: format for a new cluster. `join`: format as a new or replaced disk of a running cluster. `auto`: development only — formats any empty dir. See "Formatting the data directory". |
+| `RUNE_STORAGE_RECOVERY_VOTE` | no | `0` | bool | **Unsafe, disaster recovery only.** Lets an unconfirmed (replaced-disk) node vote, so a cluster that lost the disks of a majority can elect its one intact node. May lose metadata committed only on the lost disks. Logged at critical level. |
 | `RUNE_CLIENT_STREAM_ID` | no | `1` | int32 | Aeron stream id for client traffic. |
 | `RUNE_CONSENSUS_STREAM_ID` | no | `10` | int32 | Aeron stream id for inter-node consensus traffic. |
 | `RUNE_ELECTION_TIMEOUT_MS` | no | `150` | int64 ms | Max wait per election round. Raise for slow / cross-datacenter links. |
@@ -55,6 +57,64 @@ or malformed.
 > **`/dev/shm`:** the embedded media driver maps its CnC + log buffers into shared memory.
 > The default container 64 MB is too small — always pass `--shm-size=256m` (or set
 > `shm_size` in compose).
+
+### Formatting the data directory
+
+Every data directory carries a storage identity in `RUNE_DATA_DIR/storage.meta`. The cluster uses it to tell a
+restarted broker from one whose disk was lost or replaced: a broker with a new disk never leads, votes or stands for
+election until the cluster has removed it from every in-sync replica set and confirmed its new storage, so a lost
+disk can never erase committed records on the other brokers.
+
+**A broker never formats an empty data directory on its own.** On an empty directory it refuses to start (exit
+code 78) and prints the command to run. Format once, before the first start:
+
+| Situation | Command (or one-shot env) |
+|---|---|
+| Creating a new cluster: every founding node | `rune_broker storage format --new` (or `RUNE_STORAGE_FORMAT=new` for that first start) |
+| Adding a node, or replacing a lost or new disk, in a running cluster | `rune_broker storage format --join` (or `RUNE_STORAGE_FORMAT=join`) |
+| A disposable development sandbox | `RUNE_STORAGE_FORMAT=auto` (the repo's `docker/docker-compose.yml` sets it) |
+
+With Docker, run the command against the volume before starting the broker:
+
+```sh
+docker run --rm -v rune-data:/var/lib/rune -e RUNE_DATA_DIR=/var/lib/rune rune-broker:latest \
+    rune_broker storage format --new
+```
+
+- A `--new` cluster forms once a **majority** of the nodes in `RUNE_PEERS` is up. A `--new` node that finds its
+  peers already formed the cluster (for example, it was started late) joins them as a new disk and logs a warning
+  (`joining it as a new disk`). If `RUNE_PEERS` should name a different cluster, stop that node.
+- A `--join` node catches up from the running cluster. It shows `storage UNCONFIRMED` in its log and in `rune_role`
+  (`STORAGE … state=UNCONFIRMED`) until the controller confirms it, usually within seconds. It serves client
+  sessions meanwhile, but leads nothing.
+- A single-node cluster cannot `--join`: there is no other copy. A lost single-node disk is recovered only from a
+  backup.
+- `RUNE_STORAGE_FORMAT` is ignored once the directory is formatted, and the broker warns while it is set.
+  **Remove `new` (and `auto`) after the first start.** A value left in a manifest re-applies silently the next time
+  that disk is empty. On a multi-node cluster, `RUNE_STORAGE_FORMAT=join` may stay set: a replaced disk then rejoins
+  by itself.
+- Never delete or copy `storage.meta` on its own. A damaged or missing one makes the broker refuse to start. Wipe
+  the whole directory and format `--join` instead.
+- **On a multi-node cluster, after restoring a whole directory from a backup (with or without `storage.meta`), run
+  `rune_broker storage format --reassign-join --data-dir <D>` before starting it:** the restored node then rejoins
+  like a replaced disk. Starting a restored directory without it is unsafe (the cluster cannot tell it from an intact
+  disk, and it would vote on stale state). **On a single-node cluster, start the restored directory as it is:**
+  there is no other copy for it to diverge from.
+- Upgrading from a build without storage ids needs nothing: an existing data directory is adopted as `legacy` on the
+  first start.
+
+| Refusal (exit 78) | Meaning | What to do |
+|---|---|---|
+| `data dir … is empty and not formatted` | first start, or the volume is not mounted | format (table above), or fix the mount |
+| `storage.meta is unreadable (…)` | the identity file is corrupt | restore it from a backup of this dir, or wipe the dir and `--join` |
+| `holds broker data but not node-state.dat and term.log` / `is damaged: … existed` | part of the dir was deleted | wipe the whole dir and `--join` |
+| `formatted to JOIN … single-node` | `--join` on a one-node cluster | restore from a backup, or wipe and `--new` for an empty cluster |
+| `re-identified with --reassign-join … single-node` | `--reassign-join` on a one-node cluster | restore again, start without `--reassign-join` |
+| `is not formatted; --reassign-join re-identifies` (CLI, exit 1) | `--reassign-join` on an empty dir | `--join` |
+
+**Losing more than one disk.** If a majority of the brokers lost their disks, the cluster stays unavailable with
+`storage UNCONFIRMED` on the replaced nodes: no metadata is invented. To recover from the one intact broker, set
+`RUNE_STORAGE_RECOVERY_VOTE=1` on the replaced nodes; this can lose what only the lost disks held.
 
 ### Topics are created by DDL
 
@@ -253,6 +313,14 @@ before a produce is acknowledged but is **never written to disk**.
 A single-node cluster **self-elects itself leader** on boot. Good for local dev and
 single-box deployments.
 
+Format the data volume once (see "Formatting the data directory"):
+
+```sh
+docker run --rm -v rune-data:/var/lib/rune -e RUNE_DATA_DIR=/var/lib/rune rune-broker:latest rune_broker storage format --new
+```
+
+Then start the broker:
+
 ```sh
 docker run --rm \
   --platform linux/amd64 \
@@ -293,6 +361,8 @@ docker compose -f docker/docker-compose.yml logs -f
 ```
 
 Watch for exactly one node to log `is LEADER` within ~10 s.
+
+The repo compose sets `RUNE_STORAGE_FORMAT=auto` (development).
 
 Each node in the compose is identical except `RUNE_NODE_ID`; they share one `RUNE_PEERS`
 membership list, `shm_size: 256m`, and a per-node named volume:
@@ -417,7 +487,13 @@ docker build --platform linux/amd64 --build-context rune-protocol=../rune-protoc
 cp docker/rune-cluster.env.example docker/rune-cluster.env
 $EDITOR docker/rune-cluster.env
 
-# 3. Up / logs / down
+# 3. Format each node's data dir once (an empty dir refuses to start; see "Formatting the data directory")
+for n in rune-1 rune-2 rune-3; do
+  docker compose --env-file docker/rune-cluster.env -f docker/docker-compose.custom.yml \
+      run --rm "$n" rune_broker storage format --new
+done
+
+# 4. Up / logs / down
 docker compose --env-file docker/rune-cluster.env -f docker/docker-compose.custom.yml up -d
 docker compose --env-file docker/rune-cluster.env -f docker/docker-compose.custom.yml logs -f
 docker compose --env-file docker/rune-cluster.env -f docker/docker-compose.custom.yml down
@@ -453,5 +529,7 @@ docker run -d --name rune-0 --platform linux/amd64 --shm-size=256m \
   rune-broker:latest
 ```
 
-Repeat on `hostB` (`RUNE_NODE_ID=1`) and `hostC` (`RUNE_NODE_ID=2`) with the **same**
+Before the first start, format `/srv/rune/node0` once on each host (`docker run --rm -v /srv/rune/node0:/var/lib/rune
+-e RUNE_DATA_DIR=/var/lib/rune rune-broker:latest rune_broker storage format --new`; see "Formatting the data
+directory"). Repeat on `hostB` (`RUNE_NODE_ID=1`) and `hostC` (`RUNE_NODE_ID=2`) with the **same**
 `RUNE_PEERS`. Raise the election timings for WAN latency (shown above).

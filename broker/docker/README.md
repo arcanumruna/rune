@@ -59,6 +59,8 @@ All config is read by `src/main.cpp` (`parseNodeConfigFromEnv`).
 | `RUNE_CLIENT_STREAM_ID`         | no       | `1`         | Aeron stream ID for client traffic               |
 | `RUNE_CONSENSUS_STREAM_ID`      | no       | `10`        | Aeron stream ID for consensus traffic            |
 | `RUNE_DATA_DIR`                 | no       | `/var/lib/rune` | Writable data directory (mount a volume here) |
+| `RUNE_STORAGE_FORMAT`           | no       | (unset: never format) | `new` / `join` / `auto`; read **only** when the data dir is empty and not formatted. Unset: an empty dir refuses to start (exit 78) and prints the command to run. `auto` is development only. See `docs/SELF-HOSTING.md` "Formatting the data directory" |
+| `RUNE_STORAGE_RECOVERY_VOTE`    | no       | `0`         | Unsafe, disaster recovery only (see `docs/SELF-HOSTING.md`) |
 | `RUNE_ELECTION_TIMEOUT_MIN_MS`  | no       | (default)   | Min election timeout in ms                       |
 | `RUNE_ELECTION_TIMEOUT_MAX_MS`  | no       | (default)   | Max election timeout in ms                       |
 
@@ -81,6 +83,15 @@ docker run --rm \
 ---
 
 ## Single-node run (self-elect verification)
+
+Format the data volume once (a broker never formats an empty data dir on its own; see
+`docs/SELF-HOSTING.md` "Formatting the data directory"):
+
+```sh
+docker run --rm -v rune-data:/var/lib/rune -e RUNE_DATA_DIR=/var/lib/rune rune-broker:dev rune_broker storage format --new
+```
+
+Then start it:
 
 ```sh
 docker run --rm \
@@ -148,6 +159,7 @@ volume for `/var/lib/rune` (durable consensus state).
 | `RUNE_PEERS`                    | `0@rune-1:40111,1@rune-2:40111,2@rune-3:40111`    |
 | `RUNE_CLIENT_ENDPOINT`          | `0.0.0.0:40200` (listens on all interfaces)       |
 | `RUNE_DATA_DIR`                 | `/var/lib/rune`                                   |
+| `RUNE_STORAGE_FORMAT`           | `auto` (development: empty volumes are formatted automatically) |
 | `RUNE_ELECTION_TIMEOUT_MS`      | `300` (relaxed for cross-container UDP)           |
 
 ### Raw-Aeron ping probe
