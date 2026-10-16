@@ -42,6 +42,7 @@
 #include <gtest/gtest-spi.h>
 
 #include <fcntl.h>
+#include <sys/sysctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -900,20 +901,51 @@ struct CellSeams {
     std::function<void(ThreeNodes&)>                   afterIsrShrink;   ///< F-A T-H3: runs inside the ISR wait's pump
 };
 
-/// SIGSTOP this whole process for `ms` from a forked child (async-signal-safe calls only), then wait for the child.
+/// SIGSTOP this whole process for `ms` from a forked child, and return only once the stop really took effect for `ms`.
+///
+/// T10 flake (root cause, measured): forking the 3-broker test process takes ~35-40 ms on macOS, during which the kernel holds
+/// every thread of the parent; the child runs ~35-40 ms after fork() started, while the parent's forking thread is still inside
+/// fork().  The child's SIGSTOP landed there.  In ~15% of runs only the forking thread stayed stopped (it returned from fork()
+/// ~340 ms later); the fork's own release resumed the other threads, so the watchdog thread saw only the 36-38 ms fork hold, not
+/// the 300 ms stop.  Fix: (1) the child waits on a pipe until the parent is back from fork() - the stop now always hits a fully
+/// running process; (2) it sends SIGSTOP and confirms the kernel's process state (sysctl KERN_PROC_PID, p_stat == SSTOP) before
+/// (3) holding it `ms` from that point, then SIGCONT.  The
+/// child's exit status reports whether the stop was confirmed; the parent throws if not (never a silent short stop).
+/// The child only makes plain syscalls (read, kill, sysctl, nanosleep, _exit).
 inline void stopThisProcessFor(long ms) {
+    int ready[2];
+    if (::pipe(ready) != 0) throw std::runtime_error("pipe failed");
+#ifdef F_SETNOSIGPIPE
+    (void)::fcntl(ready[1], F_SETNOSIGPIPE, 1);   // a child that died before reading never SIGPIPEs the test process
+#endif
     const pid_t parent = ::getpid();
     const pid_t child = ::fork();
-    if (child < 0) throw std::runtime_error("fork failed");
+    if (child < 0) { ::close(ready[0]); ::close(ready[1]); throw std::runtime_error("fork failed"); }
     if (child == 0) {
+        ::close(ready[1]);
+        char b = 0;
+        while (::read(ready[0], &b, 1) < 0 && errno == EINTR) {}   // the parent is back from fork()
         ::kill(parent, SIGSTOP);
+        bool stopped = false;
+        for (int i = 0; i < 2000 && !stopped; ++i) {   // <= 2 s: the stop takes effect (it is asynchronous)
+            int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, parent};
+            struct kinfo_proc kp{};
+            std::size_t len = sizeof kp;
+            if (::sysctl(mib, 4, &kp, &len, nullptr, 0) == 0 && len == sizeof kp) stopped = kp.kp_proc.p_stat == SSTOP;
+            if (!stopped) { const timespec t{0, 1'000'000}; ::nanosleep(&t, nullptr); }
+        }
         const timespec ts{ms / 1000, (ms % 1000) * 1'000'000};
         ::nanosleep(&ts, nullptr);
         ::kill(parent, SIGCONT);
-        ::_exit(0);
+        ::_exit(stopped ? 0 : 1);
     }
+    ::close(ready[0]);
+    const char go = 1;
+    (void)!::write(ready[1], &go, 1);
+    ::close(ready[1]);
     int st = 0;
     while (::waitpid(child, &st, 0) < 0 && errno == EINTR) {}
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) throw std::runtime_error("stopThisProcessFor: the stop never took effect");
 }
 
 /// The settled catalog leader, polled (a stalled host can leave the topology unsettled for a moment between two reads): -1 after `within`.
