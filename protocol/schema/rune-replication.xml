@@ -153,7 +153,10 @@
   <!-- Kafka AlterPartitionResponse: errorCode 0 = committed (or already the   -->
   <!-- committed state) at partitionEpoch; otherwise an explicit reject        -->
   <!-- (INELIGIBLE_REPLICA, FENCED_LEADER_EPOCH, INVALID_UPDATE_VERSION, ...). -->
-  <!-- The leader clears its pending proposal only on a commit or a reject.    -->
+  <!-- The leader clears its pending proposal on a commit (the applied        -->
+  <!-- assignment) or on INELIGIBLE_REPLICA / INVALID_REQUEST answered at its  -->
+  <!-- base partitionEpoch; NEVER on INVALID_UPDATE_VERSION / FENCED_LEADER_   -->
+  <!-- EPOCH (the committed assignment that must follow resolves those).       -->
   <!-- ====================================================================== -->
   <sbe:message name="AlterIsrResponse" id="8" description="ISR change answer" sinceVersion="3">
     <field name="topicId"        id="1" type="int32"/>

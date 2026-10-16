@@ -23,6 +23,7 @@
 
 #include <errno.h>
 #include <stdio.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -33,6 +34,7 @@
 #include "media/aeron_udp_channel_transport_bindings.h"
 #include "util/aeron_error.h"
 #include "util/aeron_netutil.h"
+#include "concurrent/aeron_counters_manager.h"
 
 #include "rune/protocol/net/rune_udp_gso.h"
 
@@ -49,6 +51,14 @@
 #define RUNE_GSO_UNSUPPORTED (-2)
 #define RUNE_GSO_PATH_MTU    (-3)   /* EMSGSIZE: a segment exceeds the path MTU (see rune_gso_sendmsg) */
 
+/* Review A-I3 (DR-bugs fix round 1): a path-MTU refusal is a per-DESTINATION condition (one client behind a
+ * smaller MTU, or a transient link-MTU dip), never per-transport: only that destination's groups go plain, for
+ * RUNE_GSO_PMTU_HOLD_NS, then GSO is re-probed (recovery after an MTU restore).  Fixed-size cache, no allocation;
+ * a full cache evicts the entry closest to expiry. */
+#define RUNE_GSO_PMTU_CACHE   8
+#define RUNE_GSO_PMTU_HOLD_NS (10LL * 1000 * 1000 * 1000)
+#define RUNE_GSO_PATH_MTU_COUNTER_TYPE_ID 1000222   /* Aeron counter "rune_gso_path_mtu_fallbacks" (review B-I2) */
+
 struct rune_gso_bindings_stct
 {
     aeron_udp_channel_transport_bindings_t bindings; /* FIRST: context->udp_channel_transport_bindings points here */
@@ -57,7 +67,13 @@ struct rune_gso_bindings_stct
     int gro_enabled;
     int inject_errno;            /* test seams: set before driver start, consumed by one agent */
     int inject_count;
+    int inject_skip;             /* test seam: GSO calls let through before the injection starts */
     int inject_trunc_count;
+    /* Review B-I2: live count of path-MTU groups, an Aeron counter in this driver's CnC.  Allocated on the
+     * conductor at the first transport init (rune_gso_init); a transport reaches the sender agent through the
+     * driver's command queue afterwards, which orders this store before any sender read.  NULL = none. */
+    volatile int64_t *path_mtu_counter;
+    int counter_tried;
     struct rune_gso_transport_state_stct *states; /* conductor-only list (init); freed at delete */
 };
 
@@ -78,6 +94,15 @@ typedef struct rune_gso_transport_state_stct
     int gso_logged;
     int gro_logged;
     int trunc_logged;
+    int pmtu_logged;
+    int pmtu_count;   /* live entries in pmtu[] (0 = the fast path skips the cache) */
+    struct
+    {
+        struct sockaddr_storage addr;
+        int64_t until_ns;
+        int used;
+    }
+    pmtu[RUNE_GSO_PMTU_CACHE];
     rune_gso_totals_t t;
     rune_gro_ctrl_t ctrl[AERON_DRIVER_RECEIVER_IO_VECTOR_LENGTH_MAX];
 }
@@ -112,6 +137,17 @@ static int rune_gso_init(
     aeron_udp_channel_transport_affinity_t affinity)
 {
     rune_gso_bindings_t *owner = (rune_gso_bindings_t *)context->udp_channel_transport_bindings;
+    if (!owner->counter_tried && NULL != context->counters_manager) /* conductor only */
+    {
+        owner->counter_tried = 1;
+        static const char label[] = "rune_gso_path_mtu_fallbacks";
+        const int32_t id = aeron_counters_manager_allocate(
+            context->counters_manager, RUNE_GSO_PATH_MTU_COUNTER_TYPE_ID, NULL, 0, label, sizeof(label) - 1);
+        if (id >= 0)
+        {
+            owner->path_mtu_counter = aeron_counters_manager_addr(context->counters_manager, id);
+        }
+    }
     if (owner->defaults.init_func(
         transport, bind_addr, multicast_if_addr, connect_addr, multicast_if_index, ttl, socket_rcvbuf, socket_sndbuf,
         is_media_timestamping, context, affinity) < 0)
@@ -199,7 +235,12 @@ static int rune_gso_sendmsg(
 
     ssize_t sent;
     rune_gso_bindings_t *owner = st->owner;
-    if (owner->inject_count > 0) /* test seam only: production never sets it */
+    if (owner->inject_skip > 0) /* test seam only */
+    {
+        owner->inject_skip--;
+        sent = sendmsg(transport->fd, &msg, 0);
+    }
+    else if (owner->inject_count > 0) /* test seam only: production never sets it */
     {
         owner->inject_count--;
         errno = owner->inject_errno;
@@ -220,6 +261,21 @@ static int rune_gso_sendmsg(
         {
             return 0;
         }
+        if (EINVAL == err)
+        {
+            /* Review B-M3: kernels whose udp_send_skb rejects gso_size > fragsize answer EINVAL, not EMSGSIZE —
+             * diagnose it against the route MTU (cold: GSO fails at most once per destination per hold period). */
+            const struct sockaddr_storage *dst = NULL != transport->connected_address ? transport->connected_address : address;
+            int pmtu = 0;
+            socklen_t l = sizeof(pmtu);
+            const int v6 = NULL != dst && AF_INET6 == dst->ss_family;
+            const int got = v6 ? getsockopt(transport->fd, IPPROTO_IPV6, IPV6_MTU, &pmtu, &l)
+                               : getsockopt(transport->fd, IPPROTO_IP, IP_MTU, &pmtu, &l);
+            if (0 == got && pmtu > 0 && (int)seg + (v6 ? 48 : 28) > pmtu)
+            {
+                return RUNE_GSO_PATH_MTU;
+            }
+        }
         if (EIO == err || EINVAL == err || EOPNOTSUPP == err || ENOPROTOOPT == err)
         {
             return RUNE_GSO_UNSUPPORTED;
@@ -238,6 +294,69 @@ static int rune_gso_sendmsg(
     }
     *bytes_sent += sent;
     return (int)count;
+}
+
+static int64_t rune_gso_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+static int rune_gso_same_addr(const struct sockaddr_storage *a, const struct sockaddr_storage *b)
+{
+    return a->ss_family == b->ss_family && 0 == memcmp(a, b, AERON_ADDR_LEN(a));
+}
+
+/* 1 when `dest` refused a GSO segment within the hold period (its groups go plain); an expired entry is
+ * dropped (GSO re-probed).  Called only while st->pmtu_count > 0. */
+static int rune_gso_pmtu_held(rune_gso_transport_state_t *st, const struct sockaddr_storage *dest, int64_t now)
+{
+    for (int i = 0; i < RUNE_GSO_PMTU_CACHE; i++)
+    {
+        if (!st->pmtu[i].used || !rune_gso_same_addr(&st->pmtu[i].addr, dest))
+        {
+            continue;
+        }
+        if (now < st->pmtu[i].until_ns)
+        {
+            return 1;
+        }
+        st->pmtu[i].used = 0;
+        st->pmtu_count--;
+        return 0;
+    }
+    return 0;
+}
+
+static void rune_gso_pmtu_hold(rune_gso_transport_state_t *st, const struct sockaddr_storage *dest, int64_t now)
+{
+    int slot = -1;
+    for (int i = 0; i < RUNE_GSO_PMTU_CACHE && slot < 0; i++)
+    {
+        if (st->pmtu[i].used && rune_gso_same_addr(&st->pmtu[i].addr, dest)) slot = i;
+    }
+    for (int i = 0; i < RUNE_GSO_PMTU_CACHE && slot < 0; i++)
+    {
+        if (!st->pmtu[i].used) slot = i;
+    }
+    if (slot < 0) /* full: evict the entry closest to expiry */
+    {
+        slot = 0;
+        for (int i = 1; i < RUNE_GSO_PMTU_CACHE; i++)
+        {
+            if (st->pmtu[i].until_ns < st->pmtu[slot].until_ns) slot = i;
+        }
+        st->pmtu[slot].used = 0;
+        st->pmtu_count--;
+    }
+    if (!st->pmtu[slot].used)
+    {
+        st->pmtu[slot].used = 1;
+        st->pmtu_count++;
+    }
+    memcpy(&st->pmtu[slot].addr, dest, sizeof(*dest));
+    st->pmtu[slot].until_ns = now + RUNE_GSO_PMTU_HOLD_NS;
 }
 
 /* Returns the number of iov datagrams sent; a value < iov_length is a short send: Aeron's network publication
@@ -277,27 +396,68 @@ static int rune_gso_send(
             continue;
         }
 
-        r = rune_gso_sendmsg(st, transport, address, iov + done, k, bytes_sent);
-        if (RUNE_GSO_UNSUPPORTED == r || RUNE_GSO_PATH_MTU == r)
+        const struct sockaddr_storage *dest = NULL != transport->connected_address ? transport->connected_address : address;
+        int plain = 0;
+        int64_t now = 0;
+        if (st->pmtu_count > 0) /* only while some destination is held: the steady state never reads the clock */
         {
-            st->gso_on = 0;
-            st->t.gso_fallbacks++;
-            if (RUNE_GSO_PATH_MTU == r)
+            now = rune_gso_now_ns();
+            plain = rune_gso_pmtu_held(st, dest, now);
+        }
+        if (!plain)
+        {
+            r = rune_gso_sendmsg(st, transport, address, iov + done, k, bytes_sent);
+            if (RUNE_GSO_UNSUPPORTED == r)
             {
-                st->t.gso_path_mtu_fallbacks++;
-                fprintf(stderr, "rune-gso: WARN UDP GSO segment of %zu bytes exceeds the path MTU on fd=%d (EMSGSIZE: "
-                    "the link MTU is below the Aeron MTU); this transport falls back to sendmmsg and its datagrams "
-                    "are IP-fragmented — lower RUNE_AERON_MTU to the link MTU minus 28\n",
-                    iov[done].iov_len, (int)transport->fd);
-            }
-            else
-            {
+                st->gso_on = 0; /* a kernel capability: per transport, for good */
+                st->t.gso_fallbacks++;
                 fprintf(stderr, "rune-gso: WARN UDP GSO refused on fd=%d; this transport falls back to sendmmsg\n",
                     (int)transport->fd);
+                r = st->owner->defaults.send_func(
+                    data_paths, transport, address, iov + done, iov_length - done, bytes_sent);
+                return r < 0 ? r : (int)(done + (size_t)r);
             }
-            r = st->owner->defaults.send_func(
-                data_paths, transport, address, iov + done, iov_length - done, bytes_sent);
-            return r < 0 ? r : (int)(done + (size_t)r);
+            if (RUNE_GSO_PATH_MTU == r)
+            {
+                /* DR-BUG-MTU + review A-I3: this destination's path is below the segment size.  This group goes
+                 * plain (IP-fragmented by the kernel); the destination is held plain for the hold period, then
+                 * re-probed; GSO stays on for every other destination. */
+                st->t.gso_path_mtu_fallbacks++;
+                if (NULL != st->owner->path_mtu_counter)
+                {
+                    aeron_counter_ordered_increment(st->owner->path_mtu_counter, 1);
+                }
+                if (0 == now)
+                {
+                    now = rune_gso_now_ns();
+                }
+                rune_gso_pmtu_hold(st, dest, now);
+                if (!st->pmtu_logged)
+                {
+                    st->pmtu_logged = 1;
+                    const int hdr = AF_INET6 == dest->ss_family ? 48 : 28;
+                    fprintf(stderr, "rune-gso: WARN UDP GSO segment of %zu bytes exceeds the path MTU on fd=%d "
+                        "(the link MTU is below the Aeron MTU); groups to that destination are sent plainly "
+                        "(IP-fragmented) and GSO is re-probed every %lld s — lower RUNE_AERON_MTU to the link MTU "
+                        "minus %d (counter rune_gso_path_mtu_fallbacks)\n",
+                        iov[done].iov_len, (int)transport->fd, (long long)(RUNE_GSO_PMTU_HOLD_NS / 1000000000LL), hdr);
+                }
+                plain = 1;
+            }
+        }
+        if (plain)
+        {
+            r = st->owner->defaults.send_func(data_paths, transport, address, iov + done, k, bytes_sent);
+            if (r <= 0)
+            {
+                return done > 0 ? (int)done : r;   /* partial batch = short send (stock sendmmsg semantics) */
+            }
+            done += (size_t)r;
+            if ((size_t)r < k)
+            {
+                return (int)done;
+            }
+            continue;
         }
         if (r <= 0)
         {
@@ -530,6 +690,17 @@ void rune_gso_bindings_test_inject(rune_gso_bindings_t *b, int err, int count)
     {
         b->inject_errno = err;
         b->inject_count = count;
+        b->inject_skip = 0;
+    }
+}
+
+void rune_gso_bindings_test_inject_after(rune_gso_bindings_t *b, int err, int count, int skip)
+{
+    if (NULL != b)
+    {
+        b->inject_errno = err;
+        b->inject_count = count;
+        b->inject_skip = skip;
     }
 }
 
@@ -569,6 +740,8 @@ rune_gso_bindings_t *rune_gso_bindings_create(int want_gso, int want_gro) { (voi
 int rune_gso_bindings_install(aeron_driver_context_t *ctx, rune_gso_bindings_t *b) { (void)ctx; (void)b; return -1; }
 void rune_gso_bindings_totals(const rune_gso_bindings_t *b, rune_gso_totals_t *out) { (void)b; memset(out, 0, sizeof(*out)); }
 void rune_gso_bindings_test_inject(rune_gso_bindings_t *b, int err, int count) { (void)b; (void)err; (void)count; }
+void rune_gso_bindings_test_inject_after(rune_gso_bindings_t *b, int err, int count, int skip)
+{ (void)b; (void)err; (void)count; (void)skip; }
 void rune_gso_bindings_test_inject_recv_trunc(rune_gso_bindings_t *b, int count) { (void)b; (void)count; }
 int rune_gso_bindings_active(const rune_gso_bindings_t *b) { (void)b; return 0; }
 void rune_gso_bindings_delete(rune_gso_bindings_t *b) { free(b); }
