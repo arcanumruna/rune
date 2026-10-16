@@ -515,7 +515,7 @@ All fault tests in DR-3..15 use `acks=all` by default (GR-9 / Milestone C). DR-1
 | `iptables -j DROP` in `--net=container:` sidecar | LinuxKit kernel may lack required nf modules (`nf_tables`, `xt_*`) | Use netem 100% loss for full isolation (portable) |
 | Per-peer directional / asymmetric partition | Needs per-peer `iptables` DROP rules keyed on container IPs | Skip; enable on Linux CI |
 | Per-peer partial-quorum partition | Needs per-peer netem `matchall` or iptables — not achievable with eth0-scoped netem | Skip; enable on Linux CI |
-| MTU reduction via `ip link set dev eth0 mtu <N>` | macOS LinuxKit VM's veth pair MTU may be controlled by the hypervisor layer; `ip link set` may succeed silently with no effect, or race with Aeron media driver in-flight sends | Skip; enable on Linux CI |
+| MTU reduction via `ip link set dev eth0 mtu <N>` | macOS LinuxKit VM's veth pair MTU may be controlled by the hypervisor layer; `ip link set` may succeed silently with no effect | Runs on the Linux docker host (strict; `set_mtu` reads the MTU back and the test asserts the reduced node leads a partition and logged the GSO path-MTU fallback); Docker Desktop: unreliable |
 | fsync failure injection (FUSE/dm-error) | Not available on Docker Desktop / macOS Rosetta | Skip; enable on Linux CI with a FUSE error-injector |
 | Disk-full injection (capped tmpfs) | Docker Desktop's virtual disk cannot be reliably capped per-container | Skip; enable on Linux CI with `--mount type=tmpfs,target=/var/lib/rune,tmpfs-size=16777216` |
 | shm exhaustion (constrained shm mount) | `shm_size` constraints unreliable on Docker Desktop / macOS Rosetta | Skip; enable on Linux CI |
