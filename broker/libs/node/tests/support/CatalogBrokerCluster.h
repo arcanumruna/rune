@@ -275,6 +275,7 @@ private:
     // HW >= the record's end offset on the leader of the CURRENT settled leadership, or -1 at the deadline; it
     // never waits on a node that no longer leads.  A record appended on a leadership that was deposed before it
     // committed is truncated there; when the new leader does not hold it, the same bytes are appended again.
+    // Re-check M8: "holds it" = its log reaches our end offset AND the batch at end-1 carries our epoch.
     int64_t appendRaw_(std::vector<uint8_t> bytes, std::chrono::milliseconds within) {
         const auto deadline = std::chrono::steady_clock::now() + within;
         while (std::chrono::steady_clock::now() < deadline) {
@@ -305,6 +306,18 @@ private:
                     const bool moved = now != leader || (pa && pa->leaderEpoch != epoch);
                     const auto v = catalogOf(node(now));
                     if (moved && v.leo < leo) { reappend = true; break; }   // truncated with the deposed leadership
+                    if (moved) {
+                        // Re-check M8: an end offset >= ours is not proof our record survived — the new leadership
+                        // may have written ITS records over the truncated range.  The batch at leo-1 must still
+                        // carry the epoch we appended under; read on the new leader's admin thread.
+                        BrokerNode& nn = node(now);
+                        const int32_t at = nn.onAdminThreadForTest([&nn, leo]() -> int32_t {
+                            rr::PartitionReplica* r = nn.catalogReplicaForTest();
+                            return r == nullptr ? -2 : r->lastFetchedEpochAtForTest(leo);
+                        });
+                        if (at == -2) { std::this_thread::sleep_for(10ms); continue; }   // replica not open yet
+                        if (at != static_cast<int32_t>(epoch)) { reappend = true; break; }   // another leadership's record
+                    }
                     if (v.hw >= leo) return v.hw;
                 }
                 std::this_thread::sleep_for(10ms);
