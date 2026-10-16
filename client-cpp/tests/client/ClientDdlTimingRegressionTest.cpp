@@ -480,3 +480,77 @@ TEST(ClientDdlRedirectRegression, GeneratedRequestIdIsReportedOnEveryCompletionR
     EXPECT_EQ(r.client.requestIdOf(bad.outcome().c), wire[1]);
     EXPECT_NE(wire[0], wire[1]);
 }
+
+// F-A (broker diag 2026-10-16), the composed client path: the broker SILENTLY forgot the session a DDL is in flight
+// on (its lease reaped a quiet session: no reply channel, so no answer and no Pong can ever come).  The client's own
+// stale-session detection (no inbound frame for responseTimeoutNs) resumes it; the DDL is re-sent on the NEW session
+// with the SAME requestId and its answer completes it exactly once.  Never silence: if the session never comes back,
+// exactly one explicit SessionLost / Timeout by the DDL budget.
+namespace {
+rc::ClientConfig silentForgetCfg(int32_t in, int32_t eg) {
+    rc::ClientConfig c = invokerCfg(in, eg);
+    c.responseTimeoutNs = 1'000'000'000LL;   // 1 s stale threshold (the default 10 s, scaled down)
+    c.ddlTimeoutMs = 5'000;
+    return c;
+}
+}  // namespace
+
+TEST(ClientDdlRedirectRegression, BrokerSilentlyForgetsTheSessionMidDdlEndsInOneExplicitOutcomeRegression) {
+    Rig r(silentForgetCfg(4448, 4449));
+    r.gw.uniqueSessionIds = true;
+    r.gw.replyPongs = false;   // the forgotten session: nothing ever comes back on it
+    r.connect();
+    const int connectsBefore = r.gw.connects;
+    std::vector<Arrival> at;
+    r.gw.templateHandlers[pc::DropTopic::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
+        auto m = pc::DropTopic::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        at.push_back(Arrival{ep, m->sessionId, m->correlationId, m->ext.requestId});
+        if (at.size() == 1) return;   // the broker reaped the session: the DDL is dropped unanswered
+        r.gw.replyPongs = true;       // the new session is healthy
+        pc::DdlResponse resp; resp.sessionId = m->sessionId; resp.correlationId = m->correlationId;
+        resp.objectId = 41; resp.newVersion = 2;
+        r.gw.sendDdlResponse(ep, resp);
+    };
+    test_support::TestCq cq(r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.dropTopic("t", {}, q, t); });
+    ASSERT_TRUE(f.accepted());
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }, /*stepNs=*/10'000'000));
+    ASSERT_TRUE(f.ok()) << f.describe();
+    EXPECT_EQ(f.outcome().c.value, 41);
+    ASSERT_EQ(at.size(), 2u) << "exactly one resend, after the client resumed its stale session";
+    EXPECT_NE(at[1].sid, at[0].sid) << "the resend went out on the NEW session";
+    EXPECT_EQ(at[1].id, at[0].id) << "the resend carries the SAME requestId (the broker dedupes it)";
+    EXPECT_GT(r.gw.connects, connectsBefore) << "the stale session was re-established";
+    r.passes(300, 10'000'000);
+    EXPECT_EQ(cq.timesCompleted(f.token()), 1);
+    EXPECT_EQ(r.client.testDdlAwaitingResend(), 0);
+    EXPECT_EQ(r.client.testPendingControlOps(), 0u);
+}
+
+TEST(ClientDdlRedirectRegression, BrokerSilentlyForgetsTheSessionAndNeverReacceptsEndsExplicitlyByTheBudgetRegression) {
+    Rig r(silentForgetCfg(4450, 4451));
+    r.gw.uniqueSessionIds = true;
+    r.gw.replyPongs = false;
+    r.connect();
+    std::vector<Arrival> at;
+    r.gw.templateHandlers[pc::DropTopic::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
+        auto m = pc::DropTopic::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        at.push_back(Arrival{ep, m->sessionId, m->correlationId, m->ext.requestId});
+        r.gw.replyConnects = false;   // reaped, and the broker never accepts this client again
+    };
+    test_support::TestCq cq(r.client);
+    const int64_t issuedNs = g_now;
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.dropTopic("t", {}, q, t); });
+    ASSERT_TRUE(f.accepted());
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }, /*stepNs=*/10'000'000)) << "the DDL hung past its budget";
+    const auto st = f.outcome().c.status;
+    EXPECT_TRUE(st == rc::OpStatus::SessionLost || st == rc::OpStatus::Timeout) << f.describe();
+    EXPECT_LE(g_now - issuedNs, 5'000'000'000LL + 200'000'000LL) << "ended after the DDL budget";
+    EXPECT_EQ(at.size(), 1u);
+    r.passes(300, 10'000'000);
+    EXPECT_EQ(cq.timesCompleted(f.token()), 1);
+    EXPECT_EQ(r.client.testDdlAwaitingResend(), 0);
+    EXPECT_EQ(r.client.testPendingControlOps(), 0u);
+}
