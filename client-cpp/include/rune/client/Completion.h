@@ -50,7 +50,9 @@ enum class OpStatus : uint8_t {
     BrokerError,     ///< errorCode = broker ErrorCode; payload = message text (truncated)
     Timeout,         ///< the op's own duty-side deadline expired
     Closed,          ///< Client closed or the owning handle closed before the result
-    NotConnected,    ///< session not Connected when the duty thread processed it
+    NotConnected,    ///< control ops: the seed can never reconnect (never connected, Rejected, Closed, or a
+                     ///< stopped failover).  While it can, an op waits for it inside its own deadline
+                     ///< (ddlTimeoutMs / pingTimeoutMs -> Timeout).  Other ops: not Connected when processed.
     Superseded,      ///< commitSync replaced by a newer commitSync
     Rejoined,        ///< group generation changed under a commitSync
     SessionLost,     ///< session dropped after the request was sent (no answer possible)
