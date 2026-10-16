@@ -91,12 +91,20 @@ def _ensure_dr_client_image() -> None:
             print(f"[dr-e2e] WARNING: DR_ALLOW_STALE_CLIENT_IMAGE=1 - using {DR_IMAGE} built from "
                   f"{built_from or 'unknown'}, client HEAD is {_CLIENT_SHA}")
         return
+    # Review B-M6: never label an image with a sha its code is not.
+    if _CLIENT_SHA.endswith("-dirty") and os.environ.get("DR_ALLOW_DIRTY_CLIENT") != "1":
+        raise RuntimeError(
+            f"rune-client-cpp at {CLIENT_REPO} has uncommitted changes — an image built from it is not "
+            f"{_CLIENT_SHA[:-6]}; commit/stash, point DR_CLIENT_REPO at a clean worktree, or set DR_ALLOW_DIRTY_CLIENT=1")
     sib = os.path.dirname(CLIENT_REPO)
     ctx: list[str] = []
     for d in _DR_BUILD_CONTEXTS:
         ctx += ["--build-context", f"{d}={os.path.join(sib, d)}"]
+    proto_sha = _git_sha(os.path.join(sib, "rune-protocol"))
+    print(f"[dr-e2e] dr client image {DR_IMAGE}: client {_CLIENT_SHA}, rune-protocol {proto_sha}", flush=True)
     run(["docker", "build", "--platform", "linux/amd64", "-f", os.path.join(CLIENT_REPO, "docker", "Dockerfile.dr"),
-         *ctx, "--build-arg", f"RUNE_CLIENT_SHA={_CLIENT_SHA}", "-t", DR_IMAGE, CLIENT_REPO],
+         *ctx, "--build-arg", f"RUNE_CLIENT_SHA={_CLIENT_SHA}", "--label", f"rune.protocol.sha={proto_sha}",
+         "-t", DR_IMAGE, CLIENT_REPO],
         timeout=3600, check=True)
 
 
