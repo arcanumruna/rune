@@ -295,7 +295,14 @@ public:
     bool sendAlterIsrResponse(NodeId toLeader, const AlterIsrResponseMsg& msg);
 
     /// CONTROL thread: the current controller (consensus leader) node, -1 unknown.
-    void setControllerId(int32_t id) noexcept { controllerId_ = id; }
+    /// `term` = the consensus leadership term of that controller; answers stamped with a lower
+    /// term come from a deposed controller and are dropped (isStaleControllerAnswer).
+    void setControllerId(int32_t id, int64_t term = 0) noexcept {
+        controllerId_ = id;
+        if (term > knownControllerTerm_) knownControllerTerm_ = term;
+    }
+    [[nodiscard]] uint64_t staleControllerAnswersForTest() const noexcept { return staleControllerAnswers_; }
+    [[nodiscard]] uint64_t localCodeOnWireForTest() const noexcept { return localCodeOnWire_; }
     /// CONTROL thread: the controller-side AlterIsr handler (MetadataService),
     /// called on the control thread for every AlterIsr this node receives.
     /// Returns true when `resp` must be sent back to the proposing leader
@@ -598,6 +605,9 @@ private:
 
     NodeId                                 selfId_;
     int32_t                                controllerId_    = -1;       ///< control thread
+    int64_t                                knownControllerTerm_ = 0;    ///< control thread: newest controller term learned
+    uint64_t                               staleControllerAnswers_ = 0; ///< control thread: answers dropped as stale
+    uint64_t                               localCodeOnWire_ = 0;        ///< control thread: node-local codes seen on the wire
     AlterIsrHandler                        alterIsrHandler_ = nullptr;  ///< control thread
     void*                                  alterIsrCtx_     = nullptr;
     NodeControlResponseHandler             nodeControlRespHandler_ = nullptr;  ///< control thread

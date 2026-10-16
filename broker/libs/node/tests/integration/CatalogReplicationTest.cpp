@@ -26,6 +26,7 @@
 #include <rune/node/NodeConfig.h>
 #include <rune/replication/AeronPartitionTransport.h>
 #include <rune/replication/PartitionReplica.h>
+#include <rune/storage/InMemoryLog.h>
 #include <rune/storage/Log.h>
 
 #include <gtest/gtest.h>
@@ -837,4 +838,92 @@ TEST(BindOrderRegression, LegacyPerWorkerEgressIsAnchoredRegression) {
     c.startNode(1);
     EXPECT_EQ(c.node(1).bindAnchorsForTest(), 4u) << "consensus + replication + client + one per-worker egress (W=1)";
     expectAnchorPubsAtMinimumTerm(c.node(1));
+}
+
+// ===========================================================================
+// ISR protocol, Step 3: the transport filters AlterIsr answers before any relay.
+// ===========================================================================
+namespace {
+struct IsrChannelStub final : rr::InMemoryTransport {
+    bool sendAlterIsr(const rr::AlterIsrMsg&) override { return true; }
+};
+rr::PartitionConfig isrFilterCfg() {
+    rr::PartitionConfig c;
+    c.topicId = 0; c.partitionId = 0; c.selfId = 1;
+    c.replicaLagMaxMs = 10'000; c.replicaLagMaxOffset = 10'000; c.minIsr = 1;
+    c.fetchIntervalNs = 1'000'000; c.isrCheckIntervalNs = 1'000'000; c.maxFetchBytes = 1 << 20;
+    return c;
+}
+std::vector<uint8_t> isrAnswerFrame(int16_t code, int64_t controllerEpoch) {
+    rr::AlterIsrResponseMsg r{};
+    r.topicId = 0; r.partition = 0; r.leaderId = 1; r.leaderEpoch = 4; r.partitionEpoch = 1;
+    r.errorCode = code; r.controllerEpoch = controllerEpoch;
+    std::vector<uint8_t> wire(rr::AlterIsrResponseMsg::TOTAL_SIZE);
+    EXPECT_EQ(r.encode(wire.data(), wire.size()), wire.size());
+    return wire;
+}
+}  // namespace
+
+TEST(AeronTransportRegression, StaleControllerAnswerIsDroppedBeforeAnyRelayRegression) {
+    TmpDir ad{"isr_stale"};
+    EmbeddedDriverConfig dc;
+    dc.dir = ad.path.string();
+    dc.termBufferBytes = 64 * 1024;
+    EmbeddedDriver drv(dc, DriverMode::Threaded);
+    aeron::Context ctx;
+    ctx.aeronDir(ad.path.string());
+    auto client = aeron::Aeron::connect(ctx);
+    rr::AeronPartitionTransport tr(client, "aeron:ipc", 7321, /*self*/1, 1 << 20);
+    rune::storage::InMemoryLog log(1 << 20, 10'000);
+    IsrChannelStub chan;
+    const std::vector<rr::NodeId> all{1, 2, 3};
+    rr::PartitionReplica rep(isrFilterCfg(), rr::Role::Follower, 0, all, all, &log, &chan);
+    rep.setIsrChannel(&chan);
+    rep.becomeFollower(4, rr::NodeId{-1});
+    ASSERT_TRUE(rep.leaderlessReportPendingForTest());
+    tr.registerReplica(0, 0, &rep);
+    tr.setControllerId(1, 7);
+
+    auto stale = isrAnswerFrame(rr::kAlterIsrOk, 6);
+    EXPECT_TRUE(tr.deliverFrameForTest(stale.data(), stale.size(), 1));
+    EXPECT_TRUE(rep.leaderlessReportPendingForTest()) << "an answer of a deposed controller term cleared the report";
+    EXPECT_EQ(tr.staleControllerAnswersForTest(), 1u);
+
+    auto fresh = isrAnswerFrame(rr::kAlterIsrOk, 7);
+    EXPECT_TRUE(tr.deliverFrameForTest(fresh.data(), fresh.size(), 1));
+    EXPECT_FALSE(rep.leaderlessReportPendingForTest()) << "the current controller's answer must be delivered";
+    EXPECT_EQ(tr.staleControllerAnswersForTest(), 1u);
+}
+
+TEST(AeronTransportRegression, NodeLocalCodeOnTheWireReachesNoReplicaRegression) {
+    TmpDir ad{"isr_local"};
+    EmbeddedDriverConfig dc;
+    dc.dir = ad.path.string();
+    dc.termBufferBytes = 64 * 1024;
+    EmbeddedDriver drv(dc, DriverMode::Threaded);
+    aeron::Context ctx;
+    ctx.aeronDir(ad.path.string());
+    auto client = aeron::Aeron::connect(ctx);
+    rr::AeronPartitionTransport tr(client, "aeron:ipc", 7322, /*self*/1, 1 << 20);
+    rune::storage::InMemoryLog log(1 << 20, 10'000);
+    IsrChannelStub chan;
+    const std::vector<rr::NodeId> all{1, 2, 3};
+    rr::PartitionReplica rep(isrFilterCfg(), rr::Role::Follower, 0, all, all, &log, &chan);
+    rep.setIsrChannel(&chan);
+    rep.becomeFollower(4, rr::NodeId{-1});
+    ASSERT_TRUE(rep.leaderlessReportPendingForTest());
+    tr.registerReplica(0, 0, &rep);
+    tr.setControllerId(1, 7);
+
+    // Code 101 / 100 with the CURRENT term (so the term filter passes them): only the code filter stops them,
+    // and its counter proves they were dropped at the transport, before any relay.
+    auto c101 = isrAnswerFrame(rr::kAlterIsrLocalHoldLeadership, 7);
+    EXPECT_TRUE(tr.deliverFrameForTest(c101.data(), c101.size(), 1));
+    EXPECT_TRUE(rep.leaderlessReportPendingForTest());
+    EXPECT_EQ(rep.role(), rr::Role::Follower);
+    EXPECT_EQ(tr.localCodeOnWireForTest(), 1u);
+    auto c100 = isrAnswerFrame(rr::kAlterIsrLocalLineageIdentity, 7);
+    EXPECT_TRUE(tr.deliverFrameForTest(c100.data(), c100.size(), 1));
+    EXPECT_TRUE(rep.leaderlessReportPendingForTest());
+    EXPECT_EQ(tr.localCodeOnWireForTest(), 2u);
 }

@@ -754,6 +754,7 @@ private:
             f.alterResp.topicId = m.topicId; f.alterResp.partition = m.partition;
             f.alterResp.leaderId = m.leaderId; f.alterResp.leaderEpoch = m.leaderEpoch;
             f.alterResp.partitionEpoch = meta_.partitionEpoch; f.alterResp.errorCode = code;
+            f.alterResp.proposalId = m.proposalId; f.alterResp.sendSeq = m.sendSeq;
             (void)send(std::move(f));
         };
         if (m.leaderId != meta_.leader || m.leaderEpoch != meta_.epoch) {

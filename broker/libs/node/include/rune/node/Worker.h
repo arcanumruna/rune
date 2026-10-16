@@ -2446,6 +2446,8 @@ private:
                 r.leaderEpoch    = static_cast<rune::replication::Epoch>(op.roleEpoch());
                 r.partitionEpoch = op.rolePartitionEpoch();
                 r.errorCode      = op.replErrorCode();
+                r.proposalId     = op.nextOffset();      // ISR protocol: correlation ids (R14)
+                r.sendSeq        = op.roleLeaderId();
                 rep->onAlterIsrResponse(r);
             }
             break;

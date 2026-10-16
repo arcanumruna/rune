@@ -610,6 +610,8 @@ public:
             resp->topicId = m.topicId; resp->partition = m.partition;
             resp->leaderId = m.leaderId; resp->leaderEpoch = m.leaderEpoch;
             resp->partitionEpoch = partitionEpoch; resp->errorCode = code;
+            resp->proposalId = m.proposalId; resp->sendSeq = m.sendSeq;   // ISR protocol: echo the correlation ids
+            resp->controllerEpoch = controllerEpoch_;
             if (answer) *answer = true;
         };
         // Controlled shutdown: a NODE-level request (no partition) — recorded
@@ -892,6 +894,7 @@ public:
         r.leaderEpoch    = static_cast<rr::Epoch>(static_cast<int32_t>(static_cast<uint32_t>(nonce)));
         r.partitionEpoch = static_cast<int32_t>(static_cast<uint32_t>(static_cast<uint64_t>(nonce) >> 32));
         r.errorCode      = complete ? rr::kAlterIsrOk : rr::AlterIsrMsg::kNodeShutdownPending;
+        r.controllerEpoch = controllerEpoch_;
     }
     /// Controller: push COMPLETE to stopping `node` the first time it holds.
     void maybePushComplete_(int32_t node, NodeLifecycle& st) {
@@ -1604,6 +1607,9 @@ public:
     /// stepped-down / resumed-zombie controller keep reassigning partitions.
     /// Default true: harnesses without a consensus layer decide on the role.
     void setConsensusLeads(bool leads) noexcept { consensusLeads_ = leads; }
+    /// ISR protocol: this node's consensus leadership term, pushed every cycle (NodeRuntimeAgent).
+    /// Stamped on every AlterIsr answer so a follower can drop an answer of a deposed controller.
+    void setControllerEpoch(int64_t t) noexcept { controllerEpoch_ = t; }
     /// Fix round 2 (N2): this node is stopping (plain stop()) — it decides
     /// nothing any more (no rebalance, no AlterIsr answers, no emit).
     void halt() noexcept {
@@ -2786,6 +2792,7 @@ private:
     // above the HW), so a rebuild after a truncation replays at least this far
     // (capped at the LEO) even while the freshly-demoted follower's HW reads 0.
     rune::replication::Offset committedEnd_ = 0;
+    int64_t controllerEpoch_ = 0;   ///< ISR protocol: stamped on every answer (setControllerEpoch)
     bool consensusLeads_ = true;   ///< D17 / review MAJOR-1 (setConsensusLeads)
 
     // Follower→Leader transition gate (mirrors TCS / GCS patterns).

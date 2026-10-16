@@ -745,8 +745,18 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
         // its owning thread (a USER replica's worker; inline otherwise).
         AlterIsrResponseMsg r{};
         if (!AlterIsrResponseMsg::decode(buf, len, r)) return Action::CONTINUE;
+        // Node-local codes (100, 101) are produced only by this node's own runtime and never travel:
+        // a peer frame carrying one is dropped before any relay.
+        if (r.errorCode >= kAlterIsrLocalLineageIdentity) { ++localCodeOnWire_; return Action::CONTINUE; }
         if (r.topicId == AlterIsrMsg::kNodeControlTopicId) {   // controlled shutdown / register ack
             if (nodeControlRespHandler_ != nullptr) nodeControlRespHandler_(nodeControlRespCtx_, r);
+            return Action::CONTINUE;
+        }
+        // An answer of a deposed controller (a term below the newest learned) is dropped before any relay.
+        if (isStaleControllerAnswer(r.controllerEpoch, knownControllerTerm_)) {
+            if (staleControllerAnswers_++ % 1024 == 0)
+                spdlog::warn("AeronPartitionTransport: AlterIsr answer from controller term {} < known term {} dropped (dropped so far: {})",
+                             r.controllerEpoch, knownControllerTerm_, staleControllerAnswers_);
             return Action::CONTINUE;
         }
         if (r.topicId < 0) {
@@ -770,6 +780,8 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
             op.roleEpoch          = r.leaderEpoch;
             op.rolePartitionEpoch = r.partitionEpoch;
             op.replicatedPayload.errorCode = r.errorCode;
+            op.nextOffset = r.proposalId;    // ISR protocol: correlation ids ride in nextOffset / roleLeaderId (R14)
+            op.roleLeaderId = r.sendSeq;
             if (!workerPool_->tryEnqueueOp(r.topicId, r.partition, std::move(op)))
                 return Action::ABORT;   // worker ring full → re-delivered next cycle
             return Action::CONTINUE;

@@ -303,7 +303,7 @@ private:
                 static_cast<rune::replication::Epoch>(election_->leadershipTermId());
             work += bridge_->doWork(lid, epoch);
             // AlterIsr proposals route to the CURRENT controller (consensus leader).
-            if (transport_) transport_->setControllerId(static_cast<int32_t>(lid));
+            if (transport_) transport_->setControllerId(static_cast<int32_t>(lid), static_cast<int64_t>(election_->leadershipTermId()));
             // M1: an invariant violation caught at the bridge's noexcept
             // boundary joins the uniform halt path below (exit 70).
             if (std::string what; bridge_->takeFatal(what)) throw std::logic_error(what);
@@ -327,6 +327,7 @@ private:
             // metadata replica keeps its Leader role after a consensus step-down
             // until the bridge learns the new leader; deciding on that role let a
             // stepped-down (or resumed-zombie) controller reassign partitions.
+            metadataService_->setControllerEpoch(election_ ? static_cast<int64_t>(election_->leadershipTermId()) : 0);
             metadataService_->setConsensusLeads(isLocalLeader_());
             const int metaWork = metadataService_->doWork(nowNs);
             work += metaWork;

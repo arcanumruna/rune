@@ -671,6 +671,59 @@ TEST(AlterIsrControllerRegression, ControllerCommitsOnlyValidProposalsFromTheCur
     EXPECT_TRUE(svc1.onAlterIsr(readd));
 }
 
+// ISR protocol (answer correlation): EVERY content answer echoes the request's proposalId and sendSeq and
+// carries the answering controller's term (setControllerEpoch).
+TEST(AlterIsrControllerRegression, EveryAnswerEchoesIdSeqAndControllerEpochRegression) {
+    SaeTempDir dir1("ec1"), dir2("ec2"), dir3("ec3");
+    rune::storage::Log log1(dir1.path), log2(dir2.path), log3(dir3.path);
+    log1.recover(); log2.recover(); log3.recover();
+    constexpr NodeId kNode1 = 1, kNode2 = 2, kNode3 = 3;
+    const std::vector<NodeId> allNodes = {kNode1, kNode2, kNode3};
+    InMemoryTransport transport;
+    auto r1 = std::make_unique<PartitionReplica>(makeMetaCfg(kNode1), Role::Leader, 1, allNodes, allNodes, &log1, &transport);
+    auto r2 = std::make_unique<PartitionReplica>(makeMetaCfg(kNode2), Role::Follower, 1, allNodes, allNodes, &log2, &transport);
+    auto r3 = std::make_unique<PartitionReplica>(makeMetaCfg(kNode3), Role::Follower, 1, allNodes, allNodes, &log3, &transport);
+    transport.setLeader(r1.get());
+    transport.addFollower(kNode2, r2.get());
+    transport.addFollower(kNode3, r3.get());
+    MetadataService svc1(r1.get(), kNode1);
+    svc1.configure({TopicSpec{0, 1, 3, "", "t"}}, allNodes);
+    svc1.setControllerEpoch(9);
+    int64_t clock = 0;
+    for (int i = 0; i < 50; ++i) {
+        clock += 1'000'000LL;
+        r1->doWork(clock); r2->doWork(clock); r3->doWork(clock);
+        transport.pump(clock);
+        (void)svc1.doWork(clock);
+    }
+    const auto* pa = svc1.assignment(0, 0);
+    ASSERT_NE(pa, nullptr);
+    ASSERT_EQ(pa->isr.size(), 3u);
+    rune::replication::AlterIsrMsg base{};
+    base.topicId = 0; base.partition = 0; base.leaderId = pa->leaderNode; base.leaderEpoch = pa->leaderEpoch;
+    base.partitionEpoch = pa->partitionEpoch;
+    base.isrCount = 3;
+    for (int i = 0; i < 3; ++i) base.isr[static_cast<std::size_t>(i)] = pa->isr[static_cast<std::size_t>(i)];
+    auto ask = [&](rune::replication::AlterIsrMsg m, int64_t id, int32_t seq, int16_t want) {
+        m.proposalId = id; m.sendSeq = seq;
+        rune::replication::AlterIsrResponseMsg resp{};
+        bool answered = false;
+        (void)svc1.onAlterIsr(m, &resp, &answered);
+        ASSERT_TRUE(answered) << "request " << id << " was not answered";
+        EXPECT_EQ(resp.errorCode, want) << "request " << id;
+        EXPECT_EQ(resp.proposalId, id) << "proposalId not echoed";
+        EXPECT_EQ(resp.sendSeq, seq) << "sendSeq not echoed";
+        EXPECT_EQ(resp.controllerEpoch, 9) << "controllerEpoch not stamped";
+    };
+    auto staleLeader = base; staleLeader.leaderEpoch = base.leaderEpoch - 1;
+    ask(staleLeader, 101, 1, rune::replication::kAlterIsrFencedLeaderEpoch);
+    auto stalePe = base; stalePe.partitionEpoch = base.partitionEpoch - 1;
+    ask(stalePe, 102, 2, rune::replication::kAlterIsrInvalidUpdateVersion);
+    auto alien = base; alien.isr[2] = 42;
+    ask(alien, 103, 3, rune::replication::kAlterIsrInvalidRequest);
+    ask(base, 104, 4, rune::replication::kAlterIsrOk);   // exactly the committed set
+}
+
 // Kafka broker fencing (controller side): a node the cluster considers dead
 // leaves the COMMITTED ISR of every partition whose leader is alive — with HW =
 // min over the ISR it would otherwise pin the HW (acks=all) until the leader's
