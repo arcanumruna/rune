@@ -686,6 +686,8 @@ int32_t egressInterfaceMtu(const std::string& host, bool& ipv6) {
     return mtu;
 }
 
+void (*g_mtuResolveHook)() = nullptr;   // test only; written before any thread starts
+
 std::vector<int32_t> allowedCpus() {
     std::vector<int32_t> cpus;
 #if defined(__linux__)
@@ -749,6 +751,61 @@ void probeEphemeralPorts(HostNetFacts& f) {
 }
 
 } // namespace
+
+bool MtuProbeTarget::operator==(const MtuProbeTarget& o) const noexcept {
+    return valid == o.valid && ipv6 == o.ipv6 && std::memcmp(ifname, o.ifname, sizeof ifname) == 0;
+}
+
+void setMtuProbeResolveHookForTest(void (*hook)()) noexcept { g_mtuResolveHook = hook; }
+
+MtuProbeTarget resolveMtuProbeTarget(const std::string& hostIn) {
+    if (g_mtuResolveHook != nullptr) g_mtuResolveHook();
+    MtuProbeTarget t;
+    const std::string host = isWildcardHost(hostIn) ? std::string("1.1.1.1") : hostIn;
+    addrinfo hints{};
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_family   = AF_UNSPEC;
+    addrinfo* res = nullptr;
+    const std::string h(stripBrackets(host));
+    if (::getaddrinfo(h.c_str(), "9", &hints, &res) != 0 || res == nullptr) return t;
+    const int family = res->ai_family;
+    const int fd = ::socket(family, SOCK_DGRAM, 0);
+    sockaddr_storage local{};
+    socklen_t llen = sizeof local;
+    const bool ok = fd >= 0 && ::connect(fd, res->ai_addr, res->ai_addrlen) == 0 &&
+                    ::getsockname(fd, reinterpret_cast<sockaddr*>(&local), &llen) == 0;
+    if (fd >= 0) ::close(fd);
+    ::freeaddrinfo(res);
+    if (!ok) return t;
+    ifaddrs* ifs = nullptr;
+    if (::getifaddrs(&ifs) != 0) return t;
+    for (ifaddrs* i = ifs; i != nullptr && !t.valid; i = i->ifa_next) {
+        if (i->ifa_addr == nullptr || i->ifa_addr->sa_family != family || i->ifa_name == nullptr) continue;
+        bool match = false;
+        if (family == AF_INET) {
+            match = reinterpret_cast<const sockaddr_in*>(i->ifa_addr)->sin_addr.s_addr ==
+                    reinterpret_cast<const sockaddr_in*>(&local)->sin_addr.s_addr;
+        } else {
+            match = std::memcmp(&reinterpret_cast<const sockaddr_in6*>(i->ifa_addr)->sin6_addr,
+                                &reinterpret_cast<const sockaddr_in6*>(&local)->sin6_addr, sizeof(in6_addr)) == 0;
+        }
+        if (match && std::strlen(i->ifa_name) < sizeof t.ifname) {
+            std::memcpy(t.ifname, i->ifa_name, std::strlen(i->ifa_name) + 1);
+            t.ipv6  = family == AF_INET6;
+            t.valid = true;
+        }
+    }
+    ::freeifaddrs(ifs);
+    return t;
+}
+
+int32_t readInterfaceMtu(const MtuProbeTarget& t, int fd) noexcept {
+    if (!t.valid || fd < 0) return 0;
+    ifreq ifr{};
+    std::memcpy(ifr.ifr_name, t.ifname, std::min(sizeof ifr.ifr_name, sizeof t.ifname));
+    ifr.ifr_name[sizeof ifr.ifr_name - 1] = '\0';
+    return ::ioctl(fd, SIOCGIFMTU, &ifr) == 0 ? static_cast<int32_t>(ifr.ifr_mtu) : 0;
+}
 
 int32_t probeInterfaceMtu(const std::string& host, bool& ipv6) {
     ipv6 = false;

@@ -2431,3 +2431,50 @@ TEST(BrokerNodeRegression, ShardEgressUnresolvedAfterItsAnchorRefusesToStartRegr
     std::error_code ec; fs::remove_all(dir, ec);
 }
 } // namespace rune::node
+
+namespace rune::node {
+namespace {
+std::atomic<std::thread::id> gMtuControlTid{};
+std::atomic<int>             gMtuResolves{0};
+std::atomic<bool>            gMtuResolvedOnControl{false};
+void mtuResolveHook() {
+    gMtuResolves.fetch_add(1);
+    if (std::this_thread::get_id() == gMtuControlTid.load()) gMtuResolvedOnControl.store(true);
+}
+} // namespace
+
+// Re-check I1: the link-MTU watchdog never resolves a name (getaddrinfo / getifaddrs, blocking + allocating) on the
+// control thread — in fused placement that is worker 0's thread.  The probe target comes from the resolver hub's
+// cold thread over a ring.  RED: resolve inside checkLinkMtu_ (the hook sees the control thread).
+TEST(BrokerNodeRegression, LinkMtuWatchdogNeverResolvesOnTheControlThreadRegression) {
+    const fs::path dir = makeTempDataDir("mtunodns_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    cfg.workerMode = NodeConfig::WorkerMode::Shard;
+    cfg.runtimePlacement = NodeConfig::RuntimePlacement::Fused;
+    cfg.workerCount = 1;
+    cfg.peers[0].host = "192.0.2.1";   // a non-loopback probe host (TEST-NET-1), bound via the override
+    cfg.peers[0].replicationPort = rune::aeronutil::testing::allocFreeUdpPort();
+    cfg.peers[0].ingressBasePort = rune::aeronutil::testing::allocFreeUdpPort();
+    cfg.peers[0].replBasePort = rune::aeronutil::testing::allocFreeUdpPort();
+    cfg.peers[0].egressControlBasePort = rune::aeronutil::testing::allocFreeUdpPort();
+    cfg.workerIngressBasePort = cfg.peers[0].ingressBasePort;
+    cfg.workerReplBasePort = cfg.peers[0].replBasePort;
+    cfg.workerEgressControlBasePort = cfg.peers[0].egressControlBasePort;
+    cfg.peerBindHostOverride = "0.0.0.0";
+    cfg.clientEndpoint.channel = "aeron:udp?endpoint=0.0.0.0:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());
+    gMtuResolves.store(0);
+    gMtuResolvedOnControl.store(false);
+    setMtuProbeResolveHookForTest(&mtuResolveHook);   // before any thread exists
+    {
+        BrokerNode node{cfg};
+        node.start();
+        gMtuControlTid.store(node.onControlThreadForTest([] { return std::this_thread::get_id(); }));
+        for (int i = 0; i < 5; ++i) (void)node.runMtuWatchdogForTest();
+        EXPECT_GE(gMtuResolves.load(), 1) << "the start resolve (startup thread) must have run";
+        EXPECT_FALSE(gMtuResolvedOnControl.load()) << "the watchdog resolved a name ON the control thread";
+        node.stop();
+    }
+    setMtuProbeResolveHookForTest(nullptr);
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+} // namespace rune::node

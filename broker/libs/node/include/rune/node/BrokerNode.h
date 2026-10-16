@@ -2045,7 +2045,12 @@ private:
     // interface MTU of its route is compared with the Aeron MTU; an ERROR on the below edge, a WARN on the
     // restore edge, never in between; the deficit is the live counter.
     static constexpr int64_t kMtuProbePeriodNs = 5'000'000'000LL;
-    std::string      mtuProbeHost_;
+    // Re-check I1: the probe target arrives from the resolver hub's cold thread over mtuProbeRing_ (drained here,
+    // control thread, no allocation); the MTU is one ioctl on mtuProbeFd_.  mtuProbeDesc_: the host, for logs only.
+    std::string      mtuProbeDesc_;
+    MtuProbeTarget   mtuProbe_{};
+    rune::consensus::PeerResolutionRing* mtuProbeRing_ = nullptr;
+    int              mtuProbeFd_           = -1;
     int64_t          nextMtuProbeNs_       = 0;
     bool             mtuBelow_             = false;
     int32_t          lastLinkMtu_          = 0;
@@ -2136,7 +2141,7 @@ private:
     // Runtime-cycle DDL control plane (direct call; see AdminControlPlane.h).
     friend class AdminControlPlane;
     void attachFusedRuntimeDoorbell_();   // A9: runtime's cross-thread rings → worker 0's doorbell (fused)
-    int serviceAdminControl_();
+    int serviceAdminControl_(int64_t nowNs);
     AdminControlPlane                                     adminControl_{*this};
     int64_t                                               slowTickIntervalOverrideNs_ = -1;
     std::unique_ptr<rune::consensus::BackoffIdleStrategy> adminWorkerIdleStrategy_;   // NodeConfig::adminIdleShape

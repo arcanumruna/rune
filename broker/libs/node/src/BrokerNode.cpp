@@ -308,9 +308,9 @@ void BrokerNode::start() {
         // Review B-I2: the link-MTU watchdog's probe host — the first endpoint datagrams leave through a real
         // interface for (non-loopback); the wildcard maps to the default route in probeInterfaceMtu.  Computed
         // once (no allocation on the periodic probe).
-        mtuProbeHost_.clear();
+        mtuProbeDesc_.clear();
         for (const auto& h : nodeEndpointHosts(config_))
-            if (!isLoopbackHost(h)) { mtuProbeHost_ = h; break; }
+            if (!isLoopbackHost(h)) { mtuProbeDesc_ = h; break; }
     }
 
     // Spec §3.3: shard-mode misconfiguration is a HARD startup refusal, before any
@@ -476,6 +476,12 @@ void BrokerNode::start() {
             for (const auto& peer : config_.peers) hosts.push_back(peer.host);
         resolverHub_ = std::make_unique<PeerResolverHub>(hosts, resolveFnForTest_);
         resolverHub_->resolveAllNow();
+        // Re-check I1: the link-MTU watchdog's target is resolved on the hub's cold thread (first time here, on the
+        // startup thread) — the control thread never resolves a name nor allocates for it.
+        if (!mtuProbeDesc_.empty()) {
+            mtuProbeRing_ = resolverHub_->subscribeMtuProbe(mtuProbeDesc_);
+            mtuProbeFd_   = ::socket(AF_INET, SOCK_DGRAM, 0);
+        }
     }
 
     // 3. Start embedded Aeron media driver.
@@ -3766,6 +3772,7 @@ void BrokerNode::stop() {
     unplaceableCounter_.reset();    // Task 11 fix round 1
     blockedCounter_.reset();        // Task 11 fix round 5 (M5)
     linkMtuCounter_.reset();        // B-I2: released before aeron_
+    if (mtuProbeFd_ >= 0) { ::close(mtuProbeFd_); mtuProbeFd_ = -1; }   // re-check I1
     catalogAppliedCounter_.reset();
     for (auto& c : provCounters_) c.reset();   // re-review N4: same rule (the provisioner is stopped)
 
@@ -3859,7 +3866,7 @@ int BrokerNode::pumpViewFanout_() {
 // duty cycle (Task 8a RULING-2 B).  Runs on the CONTROL (runtime) thread via
 // AdminControlPlane::doWork — a direct call, never std::function / virtual.
 // ---------------------------------------------------------------------------
-int BrokerNode::serviceAdminControl_() {
+int BrokerNode::serviceAdminControl_(int64_t nowNs) {
     int work = 0;
 
     // Task 9 (RUNE_TLS SIGHUP reload): polled FIRST, unconditionally — must
@@ -3929,8 +3936,7 @@ int BrokerNode::serviceAdminControl_() {
     work += publishCatalogRoute_(leaderNow);
     work += publishPlacementView_();
     work += reportUnbuildableReplicas_();
-    work += checkLinkMtu_(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                              std::chrono::steady_clock::now().time_since_epoch()).count(), /*force=*/false);
+    work += checkLinkMtu_(nowNs, /*force=*/false);   // re-check I1: the runtime's clock, no per-pass clock read
 
     // (1b) admin → control ring (F3 round 6/7, ported into T11's direct-call
     //      control plane):
@@ -4151,7 +4157,7 @@ int BrokerNode::serviceAdminControl_() {
     return work;
 }
 
-int AdminControlPlane::doWork(int64_t /*nowNs*/) { return node_.serviceAdminControl_(); }
+int AdminControlPlane::doWork(int64_t nowNs) { return node_.serviceAdminControl_(nowNs); }
 
 // ---------------------------------------------------------------------------
 // Catalog history Task 11: the DDL route (CatalogRoute.h), control thread.
@@ -4215,11 +4221,23 @@ int BrokerNode::publishCatalogRoute_(bool consensusLeader) {
 // followers leave the ISR).  Edge-triggered: one ERROR when it goes below, one WARN when it is restored.
 // ---------------------------------------------------------------------------
 int BrokerNode::checkLinkMtu_(int64_t nowNs, bool force) {
-    if (mtuProbeHost_.empty() && !mtuProbeForTest_) return 0;   // every endpoint loopback: off
+    if (mtuProbeRing_ == nullptr && !mtuProbeForTest_) return 0;   // every endpoint loopback: off
     if (!force && nowNs < nextMtuProbeNs_) [[likely]] return 0;
     nextMtuProbeNs_ = nowNs + kMtuProbePeriodNs;
-    bool v6 = false;
-    const int32_t m = mtuProbeForTest_ ? mtuProbeForTest_() : probeInterfaceMtu(mtuProbeHost_, v6);
+    if (mtuProbeRing_ != nullptr) {   // the latest target the hub resolved (no DNS / allocation here)
+        (void)mtuProbeRing_->poll([this](std::int32_t type, std::int64_t a, std::int64_t b) {
+            MtuProbeTarget t;
+            std::memcpy(t.ifname, &a, 8);
+            std::memcpy(t.ifname + 8, &b, 8);
+            t.ifname[sizeof t.ifname - 1] = '\0';
+            t.valid = type == PeerResolverHub::kMtuProbeTargetV4 || type == PeerResolverHub::kMtuProbeTargetV6;
+            t.ipv6  = type == PeerResolverHub::kMtuProbeTargetV6;
+            mtuProbe_ = t;
+        }, 8);
+    }
+    if (!mtuProbe_.valid && !mtuProbeForTest_) return 0;   // no route to the probe host (yet)
+    const bool v6 = mtuProbe_.ipv6;
+    const int32_t m = mtuProbeForTest_ ? mtuProbeForTest_() : readInterfaceMtu(mtuProbe_, mtuProbeFd_);
     if (m <= 0) return 0;   // unknown: no edge
     lastLinkMtu_ = m;
     const MtuCheck chk = checkLinkMtu(m, config_.aeronMtuBytes, v6);
@@ -4231,7 +4249,7 @@ int BrokerNode::checkLinkMtu_(int64_t nowNs, bool force) {
                       "batches fall back to IP fragmentation, and INBOUND datagrams above {} from peers/clients "
                       "are DROPPED by the kernel (produces time out, followers leave the ISR) — set "
                       "RUNE_AERON_MTU={} on every node, or restore the link MTU",
-                      config_.nodeId, m, mtuProbeHost_.empty() ? std::string("<test probe>") : mtuProbeHost_,
+                      config_.nodeId, m, mtuProbeDesc_.empty() ? std::string_view("<test probe>") : std::string_view(mtuProbeDesc_),
                       config_.aeronMtuBytes, hdr, m, m - hdr);
     } else if (!chk.below && mtuBelow_) {
         mtuBelow_ = false;

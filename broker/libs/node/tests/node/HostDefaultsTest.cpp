@@ -7,6 +7,9 @@
 
 #include <gtest/gtest.h>
 
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <array>
 #include <map>
@@ -1219,4 +1222,20 @@ TEST(HostDefaultsRegression, StartupLineNamesTheDerivedShardPortBaseRegression) 
     NodeConfig c = threeNodeDefault(0);
     const auto hd = applyHostDerivedDefaults(c, k3sFacts());
     EXPECT_NE(hd.summary.find("derivedBase=" + std::to_string(kDerivedShardPortBase)), std::string::npos) << hd.summary;
+}
+
+// Re-check I1: the watchdog's target resolves on a cold thread; the control thread reads it by one ioctl.  RED:
+// resolveMtuProbeTarget always invalid (the watchdog would be off everywhere).
+TEST(HostDefaultsRegression, MtuProbeTargetResolvesOnceAndReadsByIoctlRegression) {
+    const MtuProbeTarget lo = resolveMtuProbeTarget("127.0.0.1");
+    ASSERT_TRUE(lo.valid);
+    const std::string name(lo.ifname);
+    EXPECT_TRUE(name == "lo0" || name == "lo") << name;
+    EXPECT_FALSE(lo.ipv6);
+    const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+    ASSERT_GE(fd, 0);
+    EXPECT_GT(readInterfaceMtu(lo, fd), 0);
+    EXPECT_EQ(readInterfaceMtu(MtuProbeTarget{}, fd), 0) << "an invalid target reads unknown";
+    ::close(fd);
+    EXPECT_FALSE(resolveMtuProbeTarget("no-such-host.invalid").valid);
 }

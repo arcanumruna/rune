@@ -179,6 +179,22 @@ struct MtuCheck { bool below = false; int32_t linkMtu = 0; int32_t needed = 0; }
 /// host = the default route.  0 = unknown.  `ipv6` reports the route's family.
 [[nodiscard]] int32_t probeInterfaceMtu(const std::string& host, bool& ipv6);
 
+/// Re-check I1: the link-MTU watchdog's probe target — the interface the route to the probe host uses.  Resolved
+/// on a COLD thread (resolveMtuProbeTarget: getaddrinfo, connect, getsockname, getifaddrs — blocking, allocating);
+/// read on the control thread by readInterfaceMtu: one ioctl on a pre-opened fd, no DNS, no allocation.
+struct MtuProbeTarget {
+    char ifname[16] = {};   ///< IFNAMSIZ, NUL-terminated
+    bool ipv6  = false;
+    bool valid = false;
+    [[nodiscard]] bool operator==(const MtuProbeTarget& o) const noexcept;
+};
+/// IMPURE, cold threads only.  A wildcard host maps to the default route; an unresolvable host is invalid.
+[[nodiscard]] MtuProbeTarget resolveMtuProbeTarget(const std::string& host);
+/// One SIOCGIFMTU ioctl on `fd` (an AF_INET datagram socket); 0 = unknown / invalid target.  No allocation.
+[[nodiscard]] int32_t readInterfaceMtu(const MtuProbeTarget& t, int fd) noexcept;
+/// Test hook (cold, set before any thread starts): called at the top of every resolveMtuProbeTarget.
+void setMtuProbeResolveHookForTest(void (*hook)()) noexcept;
+
 /// Parses Linux ip_local_reserved_ports ("8000-8100,9092"; "" = none) into
 /// inclusive ranges; malformed items are skipped.  PURE.
 [[nodiscard]] std::vector<std::pair<int32_t, int32_t>> parseReservedPorts(std::string_view text);
