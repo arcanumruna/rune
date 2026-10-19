@@ -77,34 +77,6 @@ static constexpr int kIngressCapacity = 64 * 1024; //  64 KiB
 // ---------------------------------------------------------------------------
 namespace {
 
-// KIP-903 (review 2026-10-04 MEDIUM-4): this node's PROCESS incarnation —
-// a counter in the data dir bumped durably (tmp + fsync + rename) on every
-// start, stamped on every FetchRequest.  Cold (once per process).  Falls back
-// to the realtime clock (ns) when the data dir cannot be written.
-int64_t bumpProcessIncarnation(const std::string& dataDir) {
-    const auto fallback = [] {
-        return static_cast<int64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count());
-    };
-    if (dataDir.empty()) return fallback();
-    const std::string path = dataDir + "/process-incarnation";
-    int64_t prev = 0;
-    if (FILE* f = std::fopen(path.c_str(), "r")) {
-        long long v = 0;
-        if (std::fscanf(f, "%lld", &v) == 1 && v > 0) prev = static_cast<int64_t>(v);
-        std::fclose(f);
-    }
-    const int64_t next = prev + 1;
-    const std::string tmp = path + ".tmp";
-    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) return fallback();
-    char buf[32];
-    const int n = std::snprintf(buf, sizeof buf, "%lld\n", static_cast<long long>(next));
-    const bool ok = n > 0 && ::write(fd, buf, static_cast<std::size_t>(n)) == n && ::fsync(fd) == 0;
-    ::close(fd);
-    if (!ok || std::rename(tmp.c_str(), path.c_str()) != 0) return fallback();
-    return next;
-}
 // Controlled shutdown (review M1): a random, non-zero 64-bit identity of THIS
 // process — compared by identity, so a restart with a wiped data dir (whose
 // incarnation counter restarts low) is still a new process.  Cold (once).
@@ -580,6 +552,9 @@ void BrokerNode::start() {
 
     // 5. Build all consensus objects (NodeStateFile, TermLog, Election, …).
     buildConsensusObjects();
+    // ISR v3 Step 6: node-state.dat and term.log now exist - record the Consensus class in the manifest (R-3b).
+    // Cold boot path; a failed write is logged by markPresent and retried at the next boot.
+    (void)StorageIdentity::markPresent(config_.dataDir, storage_, StorageIdentity::Class::Consensus);
     const auto t3 = sclock::now();
 
     // 5b. hotpath-A F2: the segment provisioner exists BEFORE any replica is
@@ -768,6 +743,15 @@ void BrokerNode::buildConsensusObjects() {
     } else {
         buildMultiNodeConsensus();
     }
+}
+
+void BrokerNode::markKnowledgeThunk_(void* self) noexcept {
+    auto* n = static_cast<BrokerNode*>(self);
+    try { (void)StorageIdentity::markPresent(n->config_.dataDir, n->storage_, StorageIdentity::Class::Knowledge); } catch (...) {}
+}
+void BrokerNode::markMetadataLogThunk_(void* self) noexcept {
+    auto* n = static_cast<BrokerNode*>(self);
+    try { (void)StorageIdentity::markPresent(n->config_.dataDir, n->storage_, StorageIdentity::Class::MetadataLog); } catch (...) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -1135,7 +1119,10 @@ void BrokerNode::buildReplication() {
     // -----------------------------------------------------------------------
     replicaRegistry_ = std::make_unique<ReplicaRegistry>();
     // KIP-903: every replica of this process stamps the process incarnation.
-    replicaRegistry_->setProcessIncarnation(bumpProcessIncarnation(config_.dataDir));
+    replicaRegistry_->setProcessIncarnation(StorageIdentity::bumpProcessIncarnation(
+        config_.dataDir, std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::system_clock::now().time_since_epoch()).count()));
+    replicaRegistry_->setStorageId(storage_.id);   // ISR v3 Step 6: stamped next to the incarnation
     // E2 C1 residual N1: the node-control identity (the same nonce the node
     // registers with every controller) rides each transient lineage report.
     if (lifecycleNonce_ == 0) lifecycleNonce_ = processNonce();
@@ -1146,6 +1133,7 @@ void BrokerNode::buildReplication() {
     internalIsrKnowledge_ = std::make_unique<rune::replication::InternalIsrKnowledge>(
         config_.dataDir.empty() ? std::string{} : config_.dataDir + "/internal-isr.state");
     replicaRegistry_->setInternalIsrKnowledge(internalIsrKnowledge_.get());
+    internalIsrKnowledge_->setFirstPersistHook(&BrokerNode::markKnowledgeThunk_, this);   // ISR v3 Step 6
     {
         // LOW-R4-2: __cluster_metadata is replicated on every configured node.
         std::vector<int32_t> ids;
@@ -2522,6 +2510,9 @@ void BrokerNode::buildGateway() {
                 metaReplicaRaw, nodeId);
             if (config_.testUserDecisionHoldMs > 0)   // TEST-ONLY (see NodeConfig)
                 metadataService_->setUserDecisionHoldForTest(config_.testUserDecisionHoldMs * 1'000'000);
+            // ISR v3 Step 6: the first committed apply marks the MetadataLog class (set BEFORE the rebuild:
+            // a restart over an existing log marks it too).
+            metadataService_->setFirstApplyHook(&BrokerNode::markMetadataLogThunk_, this);
             // Rebuild any previously committed assignments from the local Log.
             metadataService_->rebuildFromLog();
             // Kafka AlterPartition: this node's transport hands every AlterIsr it
@@ -3336,6 +3327,7 @@ void BrokerNode::buildCatalog_() {
     // this process carries (ReplicaRegistry::add stamps registry replicas).
     if (replicaRegistry_ && replicaRegistry_->processIncarnation() != 0)
         catalogReplica_->setProcessIncarnation(replicaRegistry_->processIncarnation());
+    catalogReplica_->setStorageId(storage_.id);   // ISR v3 Step 6
     if (lifecycleNonce_ != 0) catalogReplica_->setLineageIdentity(lifecycleNonce_);
 
     spdlog::info("BrokerNode[{}]: __catalog built at {} (LEO={}, minIsr={}, {}, role from {})",

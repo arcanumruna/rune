@@ -509,6 +509,7 @@ public:
         const ProposalBody& b = bodyOf_(ctrlProposal_);
         return std::vector<int64_t>(b.storages.begin(), b.storages.begin() + b.count);
     }
+    [[nodiscard]] int64_t followerStorageForTest(NodeId n) const noexcept { return slotStorage_(n); }   // ISR v3 Step 6
     [[nodiscard]] uint64_t olderSendAnswersForTest() const noexcept { return olderSendAnswers_; }
     [[nodiscard]] uint64_t answersWhileAwaitingMetadataForTest() const noexcept { return answersWhileAwaitingMetadata_; }
     [[nodiscard]] uint64_t staleAnswersForTest() const noexcept { return staleAnswers_; }
@@ -1763,7 +1764,10 @@ private:
     uint64_t staleAnswers_ = 0;                ///< answers for another proposal id
     uint64_t okAnswersDisagreeing_ = 0;        ///< CP1 M1: Ok at our base naming a member our committed ISR lacks
     /// The storage id of a ISR member, captured into a proposal (Step 6 makes it read the follower slot).
-    [[nodiscard]] int64_t slotStorage_(NodeId) const noexcept { return 0; }
+    [[nodiscard]] int64_t slotStorage_(NodeId n) const noexcept {
+        const FollowerSlot* const s = followerSlots_.find(n);
+        return s != nullptr ? s->storageId : 0;
+    }
     static constexpr int64_t kAwaitNewestAnswerNs = 1'000'000'000LL;   ///< 1 s base of the older-send hold (1,2,4,8 s)
 
     // Internal-quorum mode only.

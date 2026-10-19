@@ -595,6 +595,27 @@ bool SI::persistOrigin(const std::string& d, Loaded& l, Origin to) {
     return true;
 }
 
+int64_t SI::bumpProcessIncarnation(const std::string& dataDir, int64_t realtimeNowNs) {
+    if (dataDir.empty()) return realtimeNowNs;
+    const std::string path = dataDir + "/process-incarnation";
+    int64_t prev = 0;
+    if (FILE* f = std::fopen(path.c_str(), "r")) {
+        long long v = 0;
+        if (std::fscanf(f, "%lld", &v) == 1 && v > 0) prev = static_cast<int64_t>(v);
+        std::fclose(f);
+    }
+    const int64_t next = prev + 1 > realtimeNowNs ? prev + 1 : realtimeNowNs;
+    const std::string tmp = path + ".tmp";
+    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return realtimeNowNs;
+    char buf[32];
+    const int n = std::snprintf(buf, sizeof buf, "%lld\n", static_cast<long long>(next));
+    const bool ok = n > 0 && ::write(fd, buf, static_cast<std::size_t>(n)) == n && ::fsync(fd) == 0;
+    ::close(fd);
+    if (!ok || std::rename(tmp.c_str(), path.c_str()) != 0) return realtimeNowNs;
+    return next;
+}
+
 bool SI::markPresent(const std::string& d, Loaded& l, Class c) {
     if (has(l.manifest, c)) return true;
     Loaded n = l;

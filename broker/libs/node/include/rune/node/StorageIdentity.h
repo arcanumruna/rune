@@ -75,6 +75,11 @@ public:
     /// Test only (ShardModeTest): clears one manifest class of the dir's storage.meta.
     static bool clearClassForTest(const std::string& dir, Class c);
 
+    /// KIP-903 process incarnation (R8): `max(prev + 1, realtimeNowNs)`, where `prev` is the counter in
+    /// <dir>/process-incarnation, bumped durably (tmp + fsync + rename).  The clock makes it monotonic across a
+    /// wiped data dir.  Falls back to `realtimeNowNs` when the dir is empty/unwritable.  Cold (once per process).
+    static int64_t bumpProcessIncarnation(const std::string& dataDir, int64_t realtimeNowNs);
+
     static const char* originName(Origin o) noexcept;
     /// 16 lower-case hex digits.
     static std::string idHex(int64_t id);

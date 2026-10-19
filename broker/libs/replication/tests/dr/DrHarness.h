@@ -164,6 +164,9 @@ struct DrNode {
     std::unique_ptr<InternalIsrKnowledge> isrKnowledge;
     bool                              up = false;
     uint32_t                          incarnation = 0;
+    /// ISR v3 Step 6: this node's storage id (a data dir's identity).  Assigned on the first open_; a restart keeps
+    /// it (same disk); a DiskLoss restart takes a fresh one (Step 11).
+    int64_t                           storageId = 0;
     /// The node's consensus terms (as its Election holds them): the highest
     /// candidate term seen (raised by ANY RequestVote, granted or denied), the
     /// highest term it GRANTED a vote in, and the term of the leader it
@@ -718,6 +721,8 @@ private:
         n.up = true;
         ++n.incarnation;
         n.rep->setProcessIncarnation(n.incarnation);   // KIP-903 (as ReplicaRegistry::add)
+        if (n.storageId == 0) n.storageId = ++storageSeq_;
+        n.rep->setStorageId(n.storageId);               // ISR v3 Step 6 (as ReplicaRegistry::add)
     }
 
     /// INTERNAL partition: NodeRuntimeAgent's Kafka broker fencing — the leader
@@ -951,6 +956,7 @@ private:
     std::string             root_;
     std::vector<NodeId>     replicas_;
     std::vector<DrNode>     nodes_;
+    int64_t                 storageSeq_ = 0;   // ISR v3 Step 6: the next storage id (see DrNode::storageId)
     Meta                    meta_;
     std::deque<Frame>       wire_;
     std::set<std::pair<NodeId, NodeId>> cut_;

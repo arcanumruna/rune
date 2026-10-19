@@ -1055,3 +1055,31 @@ TEST(CatalogReplicationRegression, WipeClearsAPriorWipeRawFormatOverrideRegressi
     c.wipe(1);
     EXPECT_FALSE(c.hasStorageFormatOverrideForTest(1)) << "wipe() kept the earlier wipeRaw format override";
 }
+
+// ISR v3 Step 6 (M10): each manifest class is recorded the first time it exists durably - consensus at boot, the
+// internal-ISR knowledge after its first persist, the metadata log at its first committed apply.  Reading the file
+// from the test thread is safe: nothing is shared in memory.
+// RED: drop the knowledge hook call (the manifest never gets `knowledge`).
+TEST(StorageIdentityRegression, MarkersSetOnFirstExistenceRegression) {
+    ThreeNodes c = ThreeNodes::start("markers");
+    ASSERT_TRUE(c.awaitCatalogLeader(30s));
+    const auto manifestOf = [&]() {
+        std::ifstream in(c.dirs[0]->path / "storage.meta");
+        std::string line;
+        while (std::getline(in, line)) if (line.rfind("manifest=", 0) == 0) return line;
+        return std::string{};
+    };
+    const auto deadline = std::chrono::steady_clock::now() + 30s;
+    std::string m = manifestOf();
+    const auto complete = [&] {
+        return m.find("consensus") != std::string::npos && m.find("knowledge") != std::string::npos &&
+               m.find("metadataLog") != std::string::npos;
+    };
+    while (!complete() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(50ms);
+        m = manifestOf();
+    }
+    EXPECT_NE(m.find("consensus"), std::string::npos) << m;
+    EXPECT_NE(m.find("knowledge"), std::string::npos) << m;
+    EXPECT_NE(m.find("metadataLog"), std::string::npos) << m;
+}

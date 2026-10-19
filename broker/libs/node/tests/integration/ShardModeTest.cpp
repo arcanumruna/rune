@@ -10,6 +10,7 @@
 #include <rune/node/BrokerNode.h>
 #include <rune/node/EmbeddedDriver.h>
 #include <rune/node/NodeConfig.h>
+#include <rune/node/StorageIdentity.h>
 #include <rune/node/ThreadAffinity.h>
 #include <rune/metadata/ShardRouter.h>
 #include <rune/metadata/StaticBalancer.h>
@@ -340,6 +341,10 @@ void runCatalogRestart(bool wipePlacementLog) {
             const auto removed = fs::remove_all(d / "__cluster_metadata", ec);
             EXPECT_FALSE(ec) << "removing the metadata log of " << d << ": " << ec.message();
             EXPECT_GT(removed, 0u) << "no metadata log at " << d;
+            // The crash window never wrote the manifest class either: without this, R-3b refuses the restart
+            // (and, from the bootstrap guard on, an empty log on a formed storage would too).
+            ASSERT_TRUE(rune::node::StorageIdentity::clearClassForTest(
+                d.string(), rune::node::StorageIdentity::Class::MetadataLog));
         }
     }
 

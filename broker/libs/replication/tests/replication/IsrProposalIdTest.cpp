@@ -68,11 +68,13 @@ struct Rig {
     std::unique_ptr<PartitionReplica> r;
     int64_t now = 1'000'000'000;
     int64_t id1 = 0;
-    Rig() {
+    int64_t storage3 = 0;   // the storage id follower 3 fetches with (0 = a v3 follower)
+    explicit Rig(int64_t selfStorage = 0, int64_t storage3_ = 0, std::vector<NodeId> committed = {1, 2}) : storage3(storage3_) {
         r = std::make_unique<PartitionReplica>(cfg(), Role::Follower, 0, kAll, kAll, &log, &t);
         r->setIsrChannel(&t);
         r->setLeaderEpochFenceFile((d.path / "fence-0-0").string());   // REQUIRED: no fence = first leadership refused
-        r->becomeLeader(5, {1, 2}, /*pe=*/7);
+        if (selfStorage != 0) r->setStorageId(selfStorage);
+        r->becomeLeader(5, committed, /*pe=*/7);
         EXPECT_EQ(r->role(), Role::Leader);
         for (int i = 0; i < 10; ++i) EXPECT_GE(r->append(std::vector<uint8_t>(16, uint8_t(i))), 0);
         fetch();
@@ -83,7 +85,7 @@ struct Rig {
     void fetch() {
         FetchRequestMsg f{};
         f.leaderEpoch = 5; f.partition = 0; f.followerId = 3; f.fetchOffset = 10; f.maxBytes = 0;
-        f.topicId = 0; f.lastFetchedEpoch = 5; f.incarnation = 1;
+        f.topicId = 0; f.lastFetchedEpoch = 5; f.incarnation = 1; f.storageId = storage3;
         (void)r->onFetchRequest(f, now);
     }
     void run(int64_t totalNs, int64_t stepNs, bool keepFetching = false) {
@@ -253,4 +255,64 @@ TEST(IsrProposalRegression, SendOrdinalSaturatesInsteadOfOverflowingRegression) 
     g.r->doWork(g.now += 60'000'000);   // a resend
     EXPECT_EQ(g.r->pendingLastSeqForTest(), INT32_MAX);
     EXPECT_GE(lastProposal(g.t).sendSeq, 0);
+}
+
+// ISR v3 Step 6 (A-I9): a NEW storage id is a new process whatever its incarnation (a wiped dir restarts the counter
+// low), and a storage the follower replaced is a dead process's.  RED: the WARN-only rule (the inc-5 fetch is
+// dropped as stale, so step 2's return value is kErrStaleIncarnation).
+TEST(FollowerSlotRegression, NewStorageWithAnOlderIncarnationIsANewProcessRegression) {
+    Rig g(0, 0, {1, 2, 3});   // 3 is a committed member
+    FetchRequestMsg f{};
+    f.leaderEpoch = 5; f.partition = 0; f.topicId = 0; f.maxBytes = 0;
+    const auto fetch = [&](NodeId id, Offset off, int32_t lastEpoch, int64_t inc, int64_t storage) {
+        f.followerId = id; f.fetchOffset = off; f.lastFetchedEpoch = lastEpoch; f.incarnation = inc; f.storageId = storage;
+        return g.r->onFetchRequest(f, g.now);
+    };
+    (void)fetch(2, 10, 5, 1, 0x2);
+    (void)fetch(3, 10, 5, 900, 0xA);
+    g.r->doWork(g.now += 1'000'000);
+    EXPECT_EQ(g.r->highWatermark(), 10);
+    EXPECT_EQ(g.r->followerStorageForTest(3), 0xA);
+    // The wiped disk of node 3: a new storage, a LOW incarnation, an empty log.
+    EXPECT_NE(fetch(3, 0, -1, 5, 0xB), kErrStaleIncarnation);
+    EXPECT_EQ(g.r->followerStorageForTest(3), 0xB);
+    const std::size_t before = proposals(g.t);
+    for (int i = 0; i < 200 && proposals(g.t) == before; ++i) {
+        (void)fetch(2, 10, 5, 1, 0x2);
+        g.r->doWork(g.now += 1'000'000);
+    }
+    ASSERT_GT(proposals(g.t), before) << "no proposal after the new process";
+    const AlterIsrMsg& p = lastProposal(g.t);
+    std::vector<int32_t> members(p.isr.begin(), p.isr.begin() + p.isrCount);
+    std::sort(members.begin(), members.end());
+    EXPECT_EQ(members, (std::vector<int32_t>{1, 2})) << "3 is unclean: below the HW with a new process";
+    // A late frame of the dead process (storage 0xA, a HIGHER incarnation than 5).
+    EXPECT_EQ(fetch(3, 10, 5, 901, 0xA), kErrStaleIncarnation);
+    EXPECT_EQ(g.r->followerStorageForTest(3), 0xB);
+}
+
+// ISR v3 Step 6 (R4): a proposal captures each member's storage ONCE, at creation; later fetches carrying another
+// storage change nothing in the resend.  RED: fill isrStorage from the slot at send time.
+TEST(IsrProposalRegression, ProposalCapturesEachMembersStorageAtCreationRegression) {
+    Rig g(0x5, 0xA);   // self storage 0x5; follower 3 fetches with 0xA
+    const auto storageOf = [](const AlterIsrMsg& m, int32_t node) {
+        for (int i = 0; i < m.isrCount; ++i) if (m.isr[static_cast<std::size_t>(i)] == node) return m.isrStorage[static_cast<std::size_t>(i)];
+        return int64_t{-1};
+    };
+    const AlterIsrMsg p1 = lastProposal(g.t);
+    ASSERT_EQ(p1.isrCount, 3);
+    EXPECT_EQ(storageOf(p1, 1), 0x5);
+    EXPECT_EQ(storageOf(p1, 3), 0xA);
+    // 3 fetches under a NEW storage, at the HW (so it is not unclean).
+    FetchRequestMsg f{};
+    f.leaderEpoch = 5; f.partition = 0; f.followerId = 3; f.fetchOffset = 10; f.maxBytes = 0;
+    f.topicId = 0; f.lastFetchedEpoch = 5; f.incarnation = 9; f.storageId = 0xB;
+    EXPECT_NE(g.r->onFetchRequest(f, g.now), kErrStaleIncarnation);
+    ASSERT_EQ(g.r->followerStorageForTest(3), 0xB);
+    const std::size_t before = proposals(g.t);
+    for (int i = 0; i < 400 && proposals(g.t) == before; ++i) g.r->doWork(g.now += 1'000'000);
+    ASSERT_GT(proposals(g.t), before) << "no resend";
+    const AlterIsrMsg& again = lastProposal(g.t);
+    EXPECT_EQ(again.proposalId, p1.proposalId);
+    EXPECT_EQ(storageOf(again, 3), 0xA) << "the resend re-read the slot instead of the capture";
 }

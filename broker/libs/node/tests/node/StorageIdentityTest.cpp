@@ -458,3 +458,21 @@ TEST(StorageIdentityRegression, JoinerBootDeletesAStaleInternalIsrStateRegressio
     EXPECT_EQ(n.origin, Origin::Joiner);
     EXPECT_FALSE(fs::exists(t.path / "internal-isr.state")) << "a Joiner booted with a restored knowledge file";
 }
+
+// B-M1 (ISR v3 Step 6): the process incarnation is max(prev + 1, realtime ns), so a WIPED data dir (counter back to
+// 0) still yields a value above every incarnation the dead process ever sent.
+// RED: `prev + 1` only (gives 1000 and then 1).
+TEST(StorageIdentityRegression, IncarnationIsMonotonicAcrossAWipedDataDirRegression) {
+    TmpDir t("incarnation");
+    const std::string d = t.str();
+    touch(t.path / "process-incarnation", "999\n");
+    EXPECT_EQ(StorageIdentity::bumpProcessIncarnation(d, 5000), 5000);
+    fs::remove(t.path / "process-incarnation");
+    EXPECT_EQ(StorageIdentity::bumpProcessIncarnation(d, 6000), 6000);
+    touch(t.path / "process-incarnation", "10000\n");
+    EXPECT_EQ(StorageIdentity::bumpProcessIncarnation(d, 5000), 10001);
+    // The counter is persisted: the next boot continues from it.
+    EXPECT_EQ(StorageIdentity::bumpProcessIncarnation(d, 5000), 10002);
+    // Unwritable / unnamed dir: the clock.
+    EXPECT_EQ(StorageIdentity::bumpProcessIncarnation("", 7777), 7777);
+}

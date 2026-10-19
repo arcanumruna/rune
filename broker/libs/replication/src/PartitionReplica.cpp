@@ -820,17 +820,31 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     bool incarnationChanged = false;
     if (req.incarnation != 0) {
         if (FollowerSlot* const s0 = followerSlots_.find(req.followerId)) {
-            if (req.incarnation < s0->incarnation) [[unlikely]] return kErrStaleIncarnation;
-            if (req.incarnation > s0->incarnation) {
-                incarnationChanged = s0->incarnation != 0;
-                s0->incarnation    = req.incarnation;
-                // Round-3 LOW-R3-1: a restarted replica may have lost (or failed
-                // closed on) its internal-ISR knowledge — forget its ack so the
-                // anti-entropy re-sends the latest state (cold: restarts only).
-                if (incarnationChanged && internalQuorum_()) {
-                    const int idx = slotIndex_(req.followerId);
-                    if (idx >= 0) internalIsrAcks_ &= ~(1u << idx);
+            // ISR v3 Step 6 (R8 / A-I9): a storage id is the identity of the follower's DISK.  A frame carrying a
+            // storage the follower has since replaced is a dead process's; a different non-zero storage is a new
+            // process whatever its incarnation (a wiped dir restarts the counter low).  storageId == 0 (a v3
+            // follower) keeps the KIP-903 rule below.
+            if (req.storageId != 0 && s0->isDeadStorage(req.storageId)) [[unlikely]] return kErrStaleIncarnation;
+            const bool newStorage = req.storageId != 0 && s0->storageId != 0 && req.storageId != s0->storageId;
+            if (newStorage) {
+                s0->pushDeadStorage(s0->storageId);
+                s0->storageId   = req.storageId;
+                s0->incarnation = req.incarnation;
+                incarnationChanged = true;
+            } else {
+                if (req.incarnation < s0->incarnation) [[unlikely]] return kErrStaleIncarnation;
+                if (req.incarnation > s0->incarnation) {
+                    incarnationChanged = s0->incarnation != 0;
+                    s0->incarnation    = req.incarnation;
                 }
+                if (req.storageId != 0) s0->storageId = req.storageId;
+            }
+            // Round-3 LOW-R3-1: a restarted replica may have lost (or failed
+            // closed on) its internal-ISR knowledge — forget its ack so the
+            // anti-entropy re-sends the latest state (cold: restarts only).
+            if (incarnationChanged && internalQuorum_()) {
+                const int idx = slotIndex_(req.followerId);
+                if (idx >= 0) internalIsrAcks_ &= ~(1u << idx);
             }
         }
     }
@@ -1557,6 +1571,7 @@ FetchRequestMsg PartitionReplica::nextFetch() const noexcept
     req.topicId     = cfg_.topicId;   // DR-BUG-5: stamp topicId for transport routing
     req.lastFetchedEpoch = lastFetchedEpoch();   // KIP-320/595
     req.incarnation      = processIncarnation_;  // KIP-903
+    req.storageId        = storageId_;           // ISR v3 Step 6 (lastEpochStartOffset stays -1 until Step 11)
     return req;
 }
 

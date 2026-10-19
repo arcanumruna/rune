@@ -95,6 +95,11 @@ public:
     /// operator action.
     explicit InternalIsrKnowledge(std::string path);
 
+    /// ISR v3 Step 6 (storage manifest): called ONCE, on the owning (control) thread, right after the FIRST
+    /// successful durable persist (file + directory fsynced).  Cold.  Never called for a memory-only store.
+    using PersistHook = void (*)(void*) noexcept;
+    void setFirstPersistHook(PersistHook hook, void* ctx) noexcept { firstPersistHook_ = hook; firstPersistCtx_ = ctx; }
+
     InternalIsrKnowledge(const InternalIsrKnowledge&)            = delete;
     InternalIsrKnowledge& operator=(const InternalIsrKnowledge&) = delete;
 
@@ -208,6 +213,8 @@ private:
     uint64_t                      staleTermRefusals_ = 0;
     bool                          votable_ = true;
     bool                          loadPending_ = false;   ///< LOW-R3-1: transient load failure
+    PersistHook                   firstPersistHook_ = nullptr;   ///< setFirstPersistHook (cleared once fired)
+    void*                         firstPersistCtx_  = nullptr;
 };
 
 } // namespace rune::replication

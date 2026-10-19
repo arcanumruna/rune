@@ -1568,6 +1568,17 @@ public:
         }
     }
 
+    /// ISR v3 Step 6 (storage manifest): called ONCE, on the control thread, the first time `lastApplied_`
+    /// becomes >= 0 on a COMMITTED apply (the metadata log now holds data on this storage).  Cold.
+    using FirstApplyHook = void (*)(void*) noexcept;
+    void setFirstApplyHook(FirstApplyHook hook, void* ctx) noexcept { firstApplyHook_ = hook; firstApplyCtx_ = ctx; }
+    void noteFirstApply_() noexcept {
+        if (firstApplyHook_ == nullptr || lastApplied_ < 0) return;
+        const FirstApplyHook h = firstApplyHook_;
+        firstApplyHook_ = nullptr;
+        h(firstApplyCtx_);
+    }
+
     /// Requests still matching the committed assignment and decidable now.
     void validBumpExclusions_(std::vector<rune::metadata::DynamicBalancerInputs::LeaderExclusion>& out) {
         out.clear();
@@ -2147,6 +2158,7 @@ public:
         // hw is the next-unwritten offset so the last committed is hw-1).
         msm_.commit(hw - 1);
         if (cursor > lastApplied_) lastApplied_ = cursor;
+        noteFirstApply_();
         if (hw > committedEnd_) committedEnd_ = hw;
         if (amLeader) maybeCatchUp_();
 
@@ -2236,6 +2248,7 @@ public:
         // Commit everything up to hw-1.
         msm_.commit(hw - 1);
         lastApplied_ = cursor;
+        noteFirstApply_();
         committedEnd_ = hw;
         return true;
     }
@@ -2792,6 +2805,8 @@ private:
 
     // Last log offset we have read batches from.  Initialized to -1 (nothing applied).
     rune::replication::Offset lastApplied_ = -1;
+    FirstApplyHook firstApplyHook_ = nullptr;
+    void*          firstApplyCtx_  = nullptr;
     // MetadataTruncationRebuildRegression: exclusive end of the log the MSM has
     // COMMITTED.  Committed records are never truncated (KIP-101/279 cut only
     // above the HW), so a rebuild after a truncation replays at least this far

@@ -1219,5 +1219,34 @@ TEST(AlterIsrRelayRegression, OlderSendAnswerThroughTheWorkerRelayNeverClearsReg
     EXPECT_FALSE(replica->isrProposalPendingForTest());
 }
 
+// ISR v3 Step 6 (R14, M11): a FetchRequest relayed through a worker carries the follower's storage id in
+// WorkerOp::hwBound and the leader slot records it.  RED: omit `req.storageId = op.hwBound();` in Worker.h.
+TEST(WorkerFetchRelayRegression, StorageIdAndEpochStartSurviveTheWorkerOpRegression) {
+    TempDir logDir("relay_storage_");
+    rune::storage::Log log(logDir.path.string());
+    log.recover();
+    NullTransport transport;
+    rune::replication::PartitionConfig cfg{};
+    cfg.topicId = 12; cfg.partitionId = 0; cfg.selfId = 1; cfg.minIsr = 1;
+    cfg.replicaLagMaxMs = 10'000; cfg.replicaLagMaxOffset = 10'000;
+    cfg.fetchIntervalNs = 1'000'000LL; cfg.isrCheckIntervalNs = 1'000'000LL; cfg.maxFetchBytes = 1 << 20;
+    const std::vector<rune::replication::NodeId> all{1, 2, 3};
+    auto replica = std::make_unique<rune::replication::PartitionReplica>(
+        cfg, rune::replication::Role::Follower, 0, all, all, &log, &transport);
+    replica->setIsrChannel(&transport);
+    replica->becomeLeader(1, all, /*partitionEpoch=*/4);
+    ASSERT_EQ(replica->role(), rune::replication::Role::Leader);
+    Worker worker(0);
+    worker.setOwnedDirect({replica.get()});
+    int64_t now = 1'000'000'000LL;
+    WorkerOp op; op.type = WorkerOp::Type::FetchRequest; op.replica = replica.get(); op.topicId = 12; op.partition = 0;
+    op.fetchRequestPayload.leaderEpoch = 1; op.fetchRequestPayload.partition = 0; op.fetchRequestPayload.followerId = 2;
+    op.fetchRequestPayload.fetchOffset = 0; op.fetchRequestPayload.maxBytes = 0; op.fetchRequestPayload.topicId = 12;
+    op.fetchRequestPayload.lastFetchedEpoch = -1; op.fetchRequestPayload.incarnation = 1; op.fetchRequestPayload.nowNs = now;
+    op.hwBound = 0xABCD; op.nextOffset = -1;
+    ASSERT_TRUE(static_cast<bool>(worker.tryEnqueueOp(std::move(op)))); worker.doWork(now += 1'000'000);
+    EXPECT_EQ(replica->followerStorageForTest(2), 0xABCD);
+}
+
 } // namespace
 } // namespace rune::node

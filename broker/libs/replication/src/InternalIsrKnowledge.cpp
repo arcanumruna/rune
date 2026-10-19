@@ -217,6 +217,12 @@ bool InternalIsrKnowledge::persist_()
                       path_);
         return false;
     }
+    // ISR v3 Step 6: the knowledge file now exists durably - tell the owner once (it marks the storage manifest).
+    if (firstPersistHook_ != nullptr) {
+        const PersistHook h = firstPersistHook_;
+        firstPersistHook_ = nullptr;
+        h(firstPersistCtx_);
+    }
     return true;
 }
 
