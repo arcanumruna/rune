@@ -24,6 +24,7 @@ uint64_t openSegmentsFor(const TopicSpec& t) noexcept {
 uint64_t estimateFdNeed(std::span<const TopicSpec> topics, uint64_t readySegmentsPerPartition) noexcept {
     uint64_t need = kBaseFds + (kInternalPartitionsReserve + kAdminLogs) * fdsPerPartition(kDefaultOpenSegments);
     for (const auto& t : topics) {
+        if (t.viewSink) continue;   // VLS B.2: a sink owns no log
         const uint64_t parts = t.partitionCount > 0 ? static_cast<uint64_t>(t.partitionCount) : 0;
         need += parts * (fdsPerPartition(openSegmentsFor(t)) + readySegmentsPerPartition * kFdsPerSegment);
     }

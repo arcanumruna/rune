@@ -67,6 +67,9 @@ struct TopicSpec {
     std::string name;
     int32_t     partitionCount = 1;
     int32_t     topicId        = -1;
+    /// VLS B.2: a view's sink -- a replica-less, catalog-only namespace (no log, no dir, no replica); its rows live
+    /// in the source owner's WorkerViewSet.  Set by the catalog sink effect (live and boot) only.
+    bool        viewSink       = false;
     /// Replicas per partition (DDL replicationFactor); 0 = every node (the
     /// default).  Clamped to the cluster size.
     int16_t     replicationFactor = 0;

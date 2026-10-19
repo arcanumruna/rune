@@ -7067,8 +7067,11 @@ private:
                           "partition={}); returning NotLeader (retriable)",
                           workerId_, f.topicId, f.partition);
             // R-M1: a topic the catalog dropped answers UnknownTopic, like the gateway.
+            // VLS B.3: a produce to a view SINK id (it has no replica anywhere) is permanently InvalidRequest.
             ret.errorCode = static_cast<int16_t>(topicDropped_(f.topicId) ? pc::ErrorCode::UnknownTopic
-                                                                          : pc::ErrorCode::NotLeader);
+                                                 : (viewSet_ != nullptr && viewSet_->isViewSink(f.topicId))
+                                                       ? pc::ErrorCode::InvalidRequest
+                                                       : pc::ErrorCode::NotLeader);
             enqueueReturn_(ret);
             return 1;
         }

@@ -203,12 +203,28 @@ void settleClaimedDirs(const fs::path& dataDir, const fs::path& topicsRoot, cons
 
 } // namespace
 
-TopicDirReconciliation reconcileTopicDirs(const std::string& dataDirStr, const std::vector<TopicSpec>& catalogTopics,
+TopicDirReconciliation reconcileTopicDirs(const std::string& dataDirStr, const std::vector<TopicSpec>& allTopics,
                                           std::span<const int32_t> droppedIds, int64_t nowUnixSeconds) {
     TopicDirReconciliation result;
     const fs::path dataDir{dataDirStr};
     std::error_code ec;
     const fs::path topicsRoot = dataDir / "topics";
+    // VLS B.2: a view sink is catalog-only -- it owns no dir.  An old sink dir (an earlier build made a replica for
+    // it) that holds no record is removed (logged); one holding records is left unclaimed, so it is quarantined.
+    std::vector<TopicSpec> catalogTopics;   // cold (boot): the topics that own a dir
+    for (const TopicSpec& t : allTopics) {
+        if (!t.viewSink) { catalogTopics.push_back(t); continue; }
+        const fs::path d = topicsRoot / t.name;
+        std::error_code sec;
+        const fs::file_status st = fs::symlink_status(d, sec);
+        if (sec || fs::is_symlink(st) || !fs::is_directory(st) || rune::gateway::topicDirHoldsRecords(d)) continue;
+        fs::remove_all(d, sec);
+        if (!sec) {
+            spdlog::info("topic-dir reconcile: removed the empty dir of view sink '{}' (id {}) -- a sink owns no log",
+                         rune::catalog::escapeNameForLog(t.name), t.topicId);
+            result.removedSinkDirs.push_back(d);
+        }
+    }
     const fs::file_status rootSt = fs::symlink_status(topicsRoot, ec);
     const bool haveTopics = !ec && fs::is_directory(rootSt);   // absent, or a symlink: never followed
     fs::path canonicalRoot;

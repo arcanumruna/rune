@@ -1143,11 +1143,12 @@ public:
     /// Task 22 fix round 1 (C1) — control thread (cold): a view's sink topic id →
     /// its source topic (plan.sourceTopicId[0]).  GetViewRow is answered only on
     /// the broker that leads (source, partition); the view partition IS the source
-    /// partition (spec §11.2, coLocateViewWithSource).  Insert-or-replace / erase
+    /// partition (spec §11.2; VLS B.2: the sink owns no replica).  Insert-or-replace / erase
     /// keep the vector sorted by view id; the read is a lower_bound (zero-alloc).
     void noteViewSource(int32_t viewTopicId, int32_t sourceTopicId);
     void forgetViewSource(int32_t viewTopicId);
     [[nodiscard]] int32_t viewSourceOf_(int32_t viewTopicId) const noexcept;   // -1 = unknown
+    [[nodiscard]] int32_t nthViewSinkOfSource_(int32_t sourceTopicId, std::size_t n) const noexcept;   // -1 = none
     [[nodiscard]] bool viewSinkAwaitingPlan(int32_t viewTopicId) const noexcept {
         for (const int32_t id : viewSinksAwaitingPlan_) if (id == viewTopicId) return true;
         return false;
@@ -1804,6 +1805,10 @@ private:
     // header does not decode, the session is unknown, or the request type has
     // no response (fire-and-forget).  Cold path; zero allocation.
     bool rejectRequest_(const uint8_t* buf, std::size_t len, uint16_t code, const char* why);
+    /// VLS B.3: true (and answered InvalidRequest) when `topicId` is a view sink.  Call AFTER authorization.
+    bool refuseViewSink_(const uint8_t* buf, std::size_t len, int32_t topicId, const char* what);
+    uint64_t viewSinkRefusals_ = 0;
+    mutable uint64_t viewSinkMismatchLogs_ = 0;   ///< I3: rate limit of the critical partition-mismatch log
     bool answerRejection_(Session& session, const rune::protocol::client::MessageHeader& hdr,
                           uint16_t code, const char* why, const uint8_t* buf, std::size_t len);
     // No-hang fix rounds 4-5 (item 8 / N23): make a pre-v5 client's

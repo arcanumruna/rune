@@ -2989,6 +2989,18 @@ void ClientGateway::sendErrorResponse_(Session& session, int64_t sessionId, int6
 // allocation: the answer is encoded into scratch_ (or by sendRespReliable_);
 // the log is rate-limited (first, then every 1024th) and formats integers only.
 // ---------------------------------------------------------------------------
+// VLS B.3: a view sink is a catalog-only namespace -- never a data-plane target.  The refusal is permanent
+// (InvalidRequest, non-retriable) and comes AFTER authorization (a hidden id still answers like a missing one).
+bool ClientGateway::refuseViewSink_(const uint8_t* buf, std::size_t len, int32_t topicId, const char* what)
+{
+    if (topicRegistry_ == nullptr || !topicRegistry_->isViewSink(topicId)) [[likely]] return false;
+    if (viewSinkRefusals_++ % 1024 == 0)
+        spdlog::warn("ClientGateway: {} on view sink id={} refused InvalidRequest (a view sink owns no log; "
+                     "refusals={})", what, topicId, viewSinkRefusals_);
+    (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), what);
+    return true;
+}
+
 bool ClientGateway::rejectRequest_(const uint8_t* buf, std::size_t len, uint16_t code,
                                    const char* why)
 {
@@ -3404,6 +3416,7 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
                                                                  objectIndex_), buf, len))
                 return true;
     }
+    if (refuseViewSink_(buf, len, msg.topicId, "Produce to a view sink")) [[unlikely]] return true;   // VLS B.3
     // G0.1: capture session id so the public sendRespReliable() test-seam knows
     // which session to target for the duration of this handleProduce() call.
     currentProduceSessionId_ = msg.sessionId;
@@ -4507,6 +4520,7 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
         else                                          d = rune::gateway::authorizeTopicId(perms, msg.topicId, rsec::Operation::Read, objectIndex_);
         if (deny_(*session, d, buf, len)) return;
     }
+    if (refuseViewSink_(buf, len, msg.topicId, "Subscribe to a view sink")) [[unlikely]] return;   // VLS B.3
 
     // Catalog history Task 12 (spec §7, F19): `__catalog` is readable from ANY
     // broker — never redirected, never routed by the data-plane image.  The
@@ -5146,6 +5160,13 @@ int32_t ClientGateway::viewSourceOf_(int32_t viewTopicId) const noexcept
     const auto it = std::lower_bound(viewSources_.begin(), viewSources_.end(), viewTopicId,
                                      [](const auto& e, int32_t id) { return e.first < id; });
     return (it != viewSources_.end() && it->first == viewTopicId) ? it->second : -1;
+}
+
+int32_t ClientGateway::nthViewSinkOfSource_(int32_t sourceTopicId, std::size_t n) const noexcept
+{
+    for (const auto& e : viewSources_)
+        if (e.second == sourceTopicId && n-- == 0) return e.first;
+    return -1;
 }
 
 bool ClientGateway::viewSourceLedElsewhere_(int32_t viewTopicId, int32_t partition,
@@ -8384,6 +8405,22 @@ uint16_t ClientGateway::viewRowGate_(int32_t viewTopicId, int32_t partition) con
     // has not reached every worker yet — retriable, never the worker's UnknownView.
     if (!viewSinksAwaitingPlan_.empty() && viewSinkAwaitingPlan(viewTopicId)) [[unlikely]]
         return pc::ViewRowResponse::kNotReady;
+    // VLS B.2: a sink owns no placement -- the view partition IS the source partition, so its gate is the source's.
+    if (st == St::ViewSink) {
+        const int32_t src = viewSourceOf_(viewTopicId);
+        // I3 (fail closed): the sink mirrors its source's partitioning; a catalog that says otherwise can never be
+        // routed (the view partition IS the source partition).  Permanent UnknownView, never a wrong-table read.
+        const rune::node::TopicSpec* sinkSpec = topicRegistry_->viewSinkSpec(viewTopicId);
+        const rune::node::TopicSpec* srcSpec  = src >= 0 ? topicRegistry_->topic(src) : nullptr;
+        if (sinkSpec != nullptr && srcSpec != nullptr && sinkSpec->partitionCount != srcSpec->partitionCount) [[unlikely]] {
+            if (viewSinkMismatchLogs_++ % 1024 == 0)
+                spdlog::critical("ClientGateway: view sink id={} has {} partition(s) but its source id={} has {} -- GetViewRow "
+                                 "answers UnknownView (a sink mirrors its source's partitioning; fix the catalog)",
+                                 viewTopicId, sinkSpec->partitionCount, src, srcSpec->partitionCount);
+            return pc::ViewRowResponse::kUnknownView;
+        }
+        return (src >= 0 && !placementCommitted_(src, partition)) ? pc::ViewRowResponse::kNotReady : kViewRowNoGate;
+    }
     if (st == St::Pending || (st == St::Unknown && placementCommitted_(viewTopicId, 0)) ||
         (st == St::Serving && topicRegistry_->placementGated(viewTopicId) &&
          !placementCommitted_(viewTopicId, partition)))
@@ -8461,7 +8498,10 @@ void ClientGateway::handleGetViewRow(const uint8_t* buf, std::size_t len)
     op.nextOffset    = static_cast<int64_t>(m.keyU64);               // keyU64 (reused field)
     op.hwBound       = static_cast<int64_t>(m.requestedFingerprint); // requestedFingerprint (reused field)
 
-    if (!workerPool_->tryEnqueueOp(m.viewTopicId, partition, std::move(op))) {
+    // VLS B.2: route by the SOURCE topic (the sink has no router entry); op.topicId stays the view id.
+    const int32_t viewSrc    = viewSourceOf_(m.viewTopicId);
+    const int32_t routeTopic = viewSrc >= 0 ? viewSrc : m.viewTopicId;
+    if (!workerPool_->tryEnqueueOp(routeTopic, partition, std::move(op))) {
         // Back-pressure: the worker ingress ring is full this cycle.  No-hang
         // (R2): answered ViewRowResponse{Busy (6)} — the read was not performed;
         // the client re-issues it (a point read is idempotent).  Nothing parked.
@@ -9046,8 +9086,16 @@ void ClientGateway::handleMetadata(const uint8_t* buf, std::size_t len)
             if (entry.leaderNodeId == rune::metadata::RoutingImage::NO_LEADER_NODE_ID) {
                 continue;  // unassigned — skip
             }
-            const int32_t topicId   = gpid / kMaxGpidPartitions;
-            const int32_t partition = gpid % kMaxGpidPartitions;
+            const int32_t srcTopicId = gpid / kMaxGpidPartitions;
+            const int32_t partition  = gpid % kMaxGpidPartitions;
+            // VLS B.2: alias 0 is the topic itself; alias n > 0 is its (n-1)-th view sink, whose per-partition leader
+            // is SYNTHESISED from the source's entry (the sink owns no assignment) -- GetViewRow routing is unchanged.
+            for (std::size_t alias = 0;; ++alias) {
+            int32_t topicId = srcTopicId;
+            if (alias > 0) {
+                topicId = nthViewSinkOfSource_(srcTopicId, alias - 1);
+                if (topicId < 0) break;
+            }
 
             // Filter: known topics only (when topicRegistry_ is wired) — and only
             // the partitions the registry has: the replicated image can still
@@ -9055,12 +9103,14 @@ void ClientGateway::handleMetadata(const uint8_t* buf, std::size_t len)
             // D1: a ZERO-partition __orphan.<id> placeholder recovered at boot
             // keeps its pre-restart assignment in __cluster_metadata).
             if (topicRegistry_) {
-                if (topicId >= topicRegistry_->topicCount()) continue;
-                const rune::node::TopicSpec* spec = topicRegistry_->topic(topicId);
-                if (spec == nullptr || partition >= spec->partitionCount) continue;
+                // M1: a source that fails a registry filter lists neither itself nor its sinks (alias 0 ends the loop).
+                if (topicId >= topicRegistry_->topicCount()) { if (alias == 0) break; continue; }
+                const rune::node::TopicSpec* spec = alias > 0 ? topicRegistry_->viewSinkSpec(topicId)
+                                                              : topicRegistry_->topic(topicId);
+                if (spec == nullptr || partition >= spec->partitionCount) { if (alias == 0) break; continue; }
                 // Task 8 (C1 generalized): a catalog topic is listed once its
                 // placement is committed (the bootstrap image is not committed).
-                if (topicRegistry_->placementGated(topicId) && !img->committed()) continue;
+                if (topicRegistry_->placementGated(topicId) && !img->committed()) { if (alias == 0) break; continue; }
             }
 
             // Filter: requested topics only (when non-empty topic list in request).
@@ -9107,7 +9157,7 @@ void ClientGateway::handleMetadata(const uint8_t* buf, std::size_t len)
                               : perWorkerIngressActive_
                               ? (workerIngressBaseStreamId_
                                  + (workerPool_
-                                    ? workerPool_->ownerWorkerId(topicId, partition)
+                                    ? workerPool_->ownerWorkerId(srcTopicId, partition)
                                     : 0))
                               : clientStreamId_;
             // read-rework T3/T4 (I4): advertise the per-worker dynamic-MDC egress
@@ -9116,7 +9166,7 @@ void ClientGateway::handleMetadata(const uint8_t* buf, std::size_t len)
             // host = the leader BrokerEntry.host (client-side).  0 when inactive →
             // client falls back to the legacy per-session egress.
             if (perWorkerEgressActive_ && workerPool_) {
-                const int32_t wid = workerPool_->ownerWorkerId(topicId, partition);
+                const int32_t wid = workerPool_->ownerWorkerId(srcTopicId, partition);
                 p.egressControlPort = workerEgressControlBasePort_ + wid;
                 p.egressStreamId    = workerEgressBaseStreamId_ + wid;
             }
@@ -9130,16 +9180,17 @@ void ClientGateway::handleMetadata(const uint8_t* buf, std::size_t len)
                     // advertise the LEADER's base, not this (answering) node's
                     // (per-node bases differ — review B1, 2026-10-02).
                     if (perWorkerEgressActive_ && ep.egressControlBasePort > 0)
-                        p.egressControlPort = ep.egressControlBasePort + workerPool_->ownerWorkerId(topicId, partition);
+                        p.egressControlPort = ep.egressControlBasePort + workerPool_->ownerWorkerId(srcTopicId, partition);
                     if (ep.basePort > 0 && !ep.host.empty()) {
                         endpointStore.push_back(ep.host + ":" +
-                            std::to_string(ep.basePort + workerPool_->ownerWorkerId(topicId, partition)));
+                            std::to_string(ep.basePort + workerPool_->ownerWorkerId(srcTopicId, partition)));
                         p.ingressEndpoint = endpointStore.back();
                     }
                     break;
                 }
             }
             parts.push_back(p);
+            }   // alias
         }
     }
 

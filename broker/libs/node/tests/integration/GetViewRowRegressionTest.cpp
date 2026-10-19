@@ -377,7 +377,7 @@ TEST(GetViewRowRegression, PlanOnTheInstallRingAheadOfTheReadIsNeverUnknownViewR
 //
 // RED (no co-location): routing by viewTopicId lands on a DIFFERENT worker than
 //   the source owner -> AbsentKey.
-// GREEN (after coLocateViewWithSource): routes to the source owner -> OK + row.
+// GREEN (routed by the source topic): routes to the source owner -> OK + row.
 // ---------------------------------------------------------------------------
 TEST(GetViewRowRegression, MultiWorkerRoutesToSourceOwnerViaCoLocation) {
     namespace rm = rune::metadata;
@@ -419,7 +419,7 @@ TEST(GetViewRowRegression, MultiWorkerRoutesToSourceOwnerViaCoLocation) {
     pool.worker(0).setViewSet(&vs0);
     pool.worker(1).setViewSet(&vs1);
 
-    // Route by viewTopicId (exactly as the gateway's handleGetViewRow does).
+    int32_t routeTopic = viewTopicId;   // the pre-fix routing key; the fix routes by the source
     auto query = [&]() -> WorkerReturn {
         WorkerOp op;
         op.type          = WorkerOp::Type::GetViewRow;
@@ -429,7 +429,7 @@ TEST(GetViewRowRegression, MultiWorkerRoutesToSourceOwnerViaCoLocation) {
         op.correlationId = 99;
         op.nextOffset    = 7;   // keyU64
         op.hwBound       = 0;   // requestedFingerprint = latest
-        EXPECT_TRUE(pool.tryEnqueueOp(viewTopicId, /*partition*/ 0, std::move(op)));
+        EXPECT_TRUE(pool.tryEnqueueOp(routeTopic, /*partition*/ 0, std::move(op)));
         for (int32_t i = 0; i < kWorkers; ++i) pool.worker(i).doWork(1'000'000LL);
         WorkerReturn captured{};
         int n = 0;
@@ -446,9 +446,8 @@ TEST(GetViewRowRegression, MultiWorkerRoutesToSourceOwnerViaCoLocation) {
         << "a GetViewRow mis-routed to a non-source-owner worker is never a silent AbsentKey";
 
     // GREEN: co-locate the view's shard group with its source; routing agrees.
-    pool.coLocateViewWithSource(viewTopicId, kSrcTopicId);
-    ASSERT_EQ(pool.ownerWorkerId(viewTopicId, 0), srcOwner)
-        << "co-location must route viewTopicId to the source owner";
+    routeTopic = kSrcTopicId;   // VLS B.2: the gateway routes by the SOURCE topic (the sink owns no router entry)
+    ASSERT_EQ(pool.ownerWorkerId(routeTopic, 0), srcOwner) << "the source topic routes to the source owner";
     const WorkerReturn post = query();
     ASSERT_EQ(post.errorCode, static_cast<int16_t>(pc::ViewRowResponse::kOk))
         << "post-fix: GetViewRow lands on the source owner (which folded the row)";

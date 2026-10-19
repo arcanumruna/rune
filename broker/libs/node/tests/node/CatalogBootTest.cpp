@@ -696,9 +696,9 @@ TEST(CatalogBootRegression, EveryEffectKindSurvivesTwoRealRestartsIdenticallyReg
     ASSERT_TRUE(r.produce(0, 1, "p1"));
     for (int i = 0; i < 2; ++i) ASSERT_TRUE(r.produce(1, 2, "e2-" + std::to_string(i)));
 
-    const std::vector<std::pair<std::string, int>> live = {{"players", 2}, {"events", 3}, {"late", 1}, {"top", 1}};
+    const std::vector<std::pair<std::string, int>> live = {{"players", 2}, {"events", 3}, {"late", 1}};   // VLS B.2: the sink "top" owns no log / replica -- not in the data snapshot
     const Snapshot s0 = snapshotOf(r, live);
-    ASSERT_EQ(s0.ids.size(), 4u);
+    ASSERT_EQ(s0.ids.size(), 3u);
 
     ASSERT_TRUE(r.restart());
     const Snapshot s1 = snapshotOf(r, live);

@@ -120,6 +120,12 @@ TopicRegistry::createTopicAt(int32_t topicId, const rune::node::TopicSpec& spec)
                           topicId, p->name, spec.name);
             return -1;
         }
+        if (const auto* vs = std::get_if<ViewSink>(&e)) {
+            if (spec.viewSink && vs->spec.name == spec.name) return topicId;   // the same effect again
+            spdlog::error("TopicRegistry::createTopicAt: id={} already holds the view sink '{}', refused for '{}'",
+                          topicId, vs->spec.name, spec.name);
+            return -1;
+        }
         if (const Live* l = live_(e)) {
             if (l->spec.name == spec.name && std::holds_alternative<Serving>(e)) return topicId;   // the same effect again
             spdlog::error("TopicRegistry::createTopicAt: id={} already holds {} '{}', refused for '{}'", topicId,
@@ -132,6 +138,17 @@ TopicRegistry::createTopicAt(int32_t topicId, const rune::node::TopicSpec& spec)
         spdlog::error("TopicRegistry::createTopicAt: name '{}' is held by live id={}, refused for id={}",
                       spec.name, it->second, topicId);
         return -1;
+    }
+
+    if (spec.viewSink) {   // VLS B.2: catalog-only -- no dir, no marker, no Log
+        fillGapsBelow_(slot);
+        if (slot < topics_.size()) topics_[slot].emplace<ViewSink>(ViewSink{spec});
+        else                       topics_.emplace_back(std::in_place_type<ViewSink>, ViewSink{spec});
+        nameIndex_.emplace(spec.name, topicId);
+        ++catalogGeneration_;
+        spdlog::info("TopicRegistry::createTopicAt: view sink='{}' id={} partitions={} (catalog-only, no replica)",
+                     spec.name, topicId, spec.partitionCount);
+        return topicId;
     }
 
     // Fix round 1 (R1): a disk topic dir is opened only by the incarnation that made it (the topic-id
@@ -222,6 +239,14 @@ TopicRegistry::dropTopic(int32_t topicId)
     }
     Slot& e = topics_[static_cast<std::size_t>(topicId)];
     if (std::holds_alternative<Dropped>(e)) return false;
+    if (auto* vs = std::get_if<ViewSink>(&e)) {   // no Logs to hold: Dropped at once
+        if (const auto it = nameIndex_.find(vs->spec.name); it != nameIndex_.end() && it->second == topicId)
+            nameIndex_.erase(it);
+        rune::node::TopicSpec sp = std::move(vs->spec);
+        e.emplace<Dropped>(Dropped{std::move(sp), {}});
+        ++catalogGeneration_;
+        return true;
+    }
     Live* l = live_(e);
     if (l == nullptr) {   // Pending / Gap: nothing indexed, no Logs — seen now, dropped
         rune::node::TopicSpec spec;
@@ -315,6 +340,7 @@ TopicRegistry::partitionForKey(int32_t topicId,
                                 std::span<const uint8_t> key) const noexcept
 {
     const rune::node::TopicSpec* spec = topic(topicId);
+    if (spec == nullptr) spec = viewSinkSpec(topicId);   // GetViewRow's key -> partition (VLS B.2)
     if (spec == nullptr) return -1;   // not served here
     return rune::protocol::partitionForKey(key, spec->partitionCount);
 }
