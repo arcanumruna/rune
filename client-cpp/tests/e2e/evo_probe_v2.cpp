@@ -17,6 +17,7 @@
 // Exit 0 AND prints "PROBE: OK" iff every leg passes; otherwise "PROBE: FAIL ..."
 // to stderr + non-zero exit.
 
+#include "../../examples/ExampleAuth.h"
 #include "chars_evo_v1.gen.h"   // rune::gen_v1::CharsEvo — the v1 shape (id,userId,name)
 #include "chars_evo_v2.gen.h"   // rune::gen_v2::CharsEvo — the v2 shape (+level)
 
@@ -90,6 +91,7 @@ int main() {
     cfg.egressChannel    = egress;
     cfg.egressStreamId   = egressStream;
     cfg.dataDir          = dataDir;
+    rune::examples::applyEnvCredentials(cfg);   // RUNE_USER / RUNE_PASSWORD_FILE
     cfg.connectTimeoutMs = static_cast<int64_t>(timeoutMs);
     cfg.pingTimeoutMs    = static_cast<int64_t>(timeoutMs);
     cfg.idleMode         = IdleMode::LowLatency;

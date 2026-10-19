@@ -106,6 +106,7 @@
 //
 // Exit code: 0 on success, 1 on workload assertion failure, 2 on exception.
 
+#include "ExampleAuth.h"
 #include <rune/client/Client.h>
 #include <rune/client/Completions.h>
 #include <rune/client/Key.h>
@@ -788,6 +789,7 @@ int main() {
     cfg.egressChannel    = egress;
     cfg.egressStreamId   = egressStream;
     cfg.dataDir          = dataDir;
+    rune::examples::applyEnvCredentials(cfg);   // RUNE_USER / RUNE_PASSWORD_FILE
     cfg.connectTimeoutMs = static_cast<int64_t>(timeoutMs);
     cfg.pingTimeoutMs    = static_cast<int64_t>(timeoutMs);
     cfg.idleMode         = IdleMode::LowLatency;

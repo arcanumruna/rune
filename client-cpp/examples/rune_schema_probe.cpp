@@ -39,6 +39,7 @@
 // Design: bounded/time-independent waits everywhere (poll to a deadline, never
 // a fixed sleep as a correctness gate).
 
+#include "ExampleAuth.h"
 #include "characters.gen.h"   // build-time generated from characters.blob
 
 #include <rune/client/Client.h>
@@ -149,6 +150,7 @@ int main() {
     cfg.egressChannel    = egress;
     cfg.egressStreamId   = egressStream;
     cfg.dataDir          = dataDir;
+    rune::examples::applyEnvCredentials(cfg);   // RUNE_USER / RUNE_PASSWORD_FILE
     cfg.connectTimeoutMs = static_cast<int64_t>(timeoutMs);
     cfg.pingTimeoutMs    = static_cast<int64_t>(timeoutMs);
     cfg.idleMode         = IdleMode::LowLatency;

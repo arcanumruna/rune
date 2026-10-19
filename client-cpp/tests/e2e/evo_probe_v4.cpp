@@ -17,6 +17,7 @@
 //
 // Environment: as evo_probe_v3.cpp, plus RUNE_RECORDS_V4 (default 5).
 
+#include "../../examples/ExampleAuth.h"
 #include "chars_evo_v1.gen.h"   // rune::gen_v1::CharsEvo — id,userId,name
 #include "chars_evo_v2.gen.h"   // rune::gen_v2::CharsEvo — id,userId,name,level
 #include "chars_evo_v3.gen.h"   // rune::gen_v3::CharsEvo — id,userId,level
@@ -99,6 +100,7 @@ int main() {
     cfg.egressChannel    = egress;
     cfg.egressStreamId   = egressStream;
     cfg.dataDir          = dataDir;
+    rune::examples::applyEnvCredentials(cfg);   // RUNE_USER / RUNE_PASSWORD_FILE
     cfg.connectTimeoutMs = static_cast<int64_t>(timeoutMs);
     cfg.pingTimeoutMs    = static_cast<int64_t>(timeoutMs);
     cfg.idleMode         = IdleMode::LowLatency;

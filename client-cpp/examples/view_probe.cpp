@@ -103,6 +103,7 @@
 // never a fixed sleep as a correctness gate) — CLAUDE.md engineering
 // philosophy #5/#7 (test everything; regression-grade e2e).
 
+#include "ExampleAuth.h"
 #include <rune/client/Client.h>
 #include <rune/client/Completions.h>
 #include <rune/client/Key.h>
@@ -1140,6 +1141,7 @@ int main(int argc, char** argv) {
     cfg.egressChannel    = egress;
     cfg.egressStreamId   = egressStream;
     cfg.dataDir          = dataDir;
+    rune::examples::applyEnvCredentials(cfg);   // RUNE_USER / RUNE_PASSWORD_FILE
     cfg.connectTimeoutMs = static_cast<int64_t>(timeoutMs);
     cfg.pingTimeoutMs    = static_cast<int64_t>(timeoutMs);
     cfg.idleMode         = IdleMode::LowLatency;

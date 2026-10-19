@@ -291,7 +291,7 @@ int cmdBootstrap(const std::vector<std::string>& args, std::ostream& out, std::o
         // Review B I5 / spec §7: a connection WITHOUT credentials refused with AuthenticationFailed means the cluster
         // requires a login — it already has a security admin.  Say so explicitly (never the bare "code 44").
         if (broker.lastFailure().find("AuthenticationFailed") != std::string::npos) {
-            err << "rune: bootstrap refused: this cluster already has a security admin (it requires a login); "
+            err << "rune: bootstrap refused: this cluster is already bootstrapped - it already has a security admin (it requires a login); "
                    "use `rune ql --user <admin> --password-file <file>` to manage it\n";
         } else {
             err << "rune error: " << broker.lastFailure() << "\n";

@@ -39,6 +39,7 @@
 //
 // Output: one `RESULT key=value ...` line (and `VERIFY ...` for --arm verify).
 // Exit code 0 = ran to completion (the gate scripts judge the numbers).
+#include "ExampleAuth.h"
 #include <rune/client/Client.h>
 #include <rune/client/detail/CpuAffinity.h>
 #include <rune/client/shard/ClientShard.h>
@@ -144,6 +145,7 @@ rc::ClientConfig baseConfig(const Args& a) {
     c.egressChannel   = udp(a.egress);
     c.egressStreamId  = a.egStream;
     c.dataDir         = a.dataDir + "_" + std::to_string(::getpid());
+    rune::examples::applyEnvCredentials(c);   // RUNE_USER / RUNE_PASSWORD_FILE
     c.mtuBytes        = a.mtu;
     c.idleMode        = a.busySpin ? rc::IdleMode::BusySpin : rc::IdleMode::Balanced;
     rc::TopicSpec t;

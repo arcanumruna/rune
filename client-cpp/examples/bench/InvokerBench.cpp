@@ -13,6 +13,7 @@
 // one-record OneToOneRingBuffers per shard (shard -> main "ready", main -> shard
 // "start" carrying the common schedule origin); each ShardResult is written
 // only by its shard thread and read by main after join().
+#include "../ExampleAuth.h"
 #include "BenchIdle.h"
 #include "InvokerBench.h"
 #include "BenchEnv.h"
@@ -322,6 +323,7 @@ int invokerBenchMain(int argc, char** argv) {
     g.base.egressChannel   = egress;
     g.base.egressStreamId  = static_cast<int32_t>(envI64("RUNE_EGRESS_STREAM", 2));
     g.base.dataDir         = dataDir;
+    rune::examples::applyEnvCredentials(g.base);   // RUNE_USER / RUNE_PASSWORD_FILE
     g.base.topics          = parseTopics(envStr("RUNE_CLIENT_TOPIC_TABLE", "bench:0:8"));
     g.base.mtuBytes        = a.mtu;
     if (g.base.topics.empty()) {

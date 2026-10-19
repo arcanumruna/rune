@@ -18,6 +18,33 @@ cmake --build build -j2
 cd build && ctest --output-on-failure
 ```
 
+## Authentication
+
+Version 9 of the client logs in with SCRAM-SHA-512 once per broker session. A cluster has authentication on by
+default, so a client without credentials is answered `AuthenticationFailed` (`ClientConfig::authToken` is removed;
+`username` / `password` replace it).
+
+```cpp
+rune::client::ClientConfig cfg;
+cfg.username     = "ws1";
+cfg.passwordFile = "/run/secrets/ws1.pw";   // read once at construction; or cfg.password (never logged or sent)
+// cfg.allowUnauthenticatedBroker = true;   // accept a dev-mode broker (RUNE_AUTH=disabled); default: refused
+```
+
+- `AuthenticationFailed` (44) ends the session; a rate-limited login (`retryAfterMs`) is retried after the hint.
+- `NotAuthorized` (45) fails exactly that request and is never re-sent; a subscription whose `READ` was revoked ends
+  with `SubscriptionFailReason::NotAuthorized` (a group consumer: `GroupFailReason::NotAuthorized`).
+- `SessionRevoked` (46) completes everything in flight and is terminal for the session (no reconnect).
+- Security DDL is a `rune ql` statement (`CREATE USER ... WITH PASSWORD`, `GRANT`, ...) or `Client::securityDdlAndWait(plan, ddl, timeout)`.
+  The client builds the SCRAM verifier locally (minimum 12 characters, `ClientConfig::minPasswordLength`); the plaintext
+  never reaches a broker.
+
+The `rune` CLI takes `--user <u> --password-file <path>` (or `RUNE_USER` / `RUNE_PASSWORD_FILE`) on every command that connects,
+`rune security bootstrap --admin <name> --cluster-key-file <path> --broker host:port [--password-file <path>]` for the first
+admin, and `rune security gen-cluster-key --out <path>`. The example binaries (`examples/`) read the same two variables;
+`rune_produce_subscribe` with `RUNE_MODE=ws` is the world-server-style producer / group consumer used by the broker's
+`docker/auth-e2e.sh`. See the broker repo's `docs/SECURITY.md`.
+
 ## Catalog DDL and history
 
 Topics exist only through DDL; the broker has no boot-topics setting. DDL is sent to any broker: a

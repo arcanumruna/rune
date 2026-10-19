@@ -270,6 +270,7 @@ TEST(RuneCliSecurityLiveRegression, BootstrapTwiceIsAnExplicitRefusal) {
                         {"security", "bootstrap", "--admin", "admin2", "--cluster-key-file", keyFile});
     EXPECT_EQ(r.code, 1);
     EXPECT_NE(r.err.find("already has a security admin"), std::string::npos) << r.err;
+    EXPECT_NE(r.err.find("already bootstrapped"), std::string::npos) << r.err;   // the docker e2e (Task 20) greps for it
     EXPECT_EQ(r.err.find("code 44"), std::string::npos) << "never the bare error code";
     EXPECT_TRUE(r.out.empty()) << "no one-time password is printed for a refused bootstrap: " << r.out;
 }

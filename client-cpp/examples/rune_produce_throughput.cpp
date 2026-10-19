@@ -37,6 +37,7 @@
 //   Producer knobs via ProducerConfig::fromEnv():
 //     RUNE_ACKS RUNE_LINGER_US RUNE_BATCH_BYTES RUNE_BATCH_RECORDS RUNE_MAX_IN_FLIGHT
 
+#include "ExampleAuth.h"
 #include <rune/client/Client.h>
 #include <rune/client/Key.h>
 #include <rune/client/TopicHandle.h>
@@ -96,6 +97,7 @@ int main(int argc, char** argv) {
     cfg.egressChannel   = egress;
     cfg.egressStreamId  = static_cast<int32_t>(envI64("RUNE_EGRESS_STREAM", 2));
     cfg.dataDir         = dataDir;
+    rune::examples::applyEnvCredentials(cfg);   // RUNE_USER / RUNE_PASSWORD_FILE
     // Backlog B5: perf numbers count at the real-network MTU (1408, the library
     // default); jumbo (8192) is opt-in via RUNE_BENCH_MTU.
     cfg.mtuBytes        = static_cast<std::size_t>(envI64("RUNE_BENCH_MTU", 1408));

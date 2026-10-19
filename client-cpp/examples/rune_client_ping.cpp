@@ -30,6 +30,7 @@
 //   - The E2E kills a node that is NOT the client's target, so the client's
 //     target keeps serving through re-election, proving cluster-churn survival.
 
+#include "ExampleAuth.h"
 #include <rune/client/Client.h>
 
 #include <chrono>
@@ -106,6 +107,7 @@ int main() {
     cfg.egressChannel   = egress;
     cfg.egressStreamId  = egressStream;
     cfg.dataDir         = dataDir;
+    rune::examples::applyEnvCredentials(cfg);   // RUNE_USER / RUNE_PASSWORD_FILE
     cfg.connectTimeoutMs = static_cast<int64_t>(timeoutMs);
     cfg.pingTimeoutMs    = static_cast<int64_t>(timeoutMs);
 

@@ -26,6 +26,7 @@
 //   RUNE_BENCH_FROM                    earliest | latest | offset:N (overrides mode default)
 //   RUNE_BENCH_IDLE_MS                 catchup: stop after this long with no new records (default 3000)
 
+#include "ExampleAuth.h"
 #include <rune/client/Client.h>
 #include <rune/client/Key.h>
 #include <rune/client/TopicHandle.h>
@@ -93,6 +94,7 @@ int main() {
     cfg.egressChannel   = egress;
     cfg.egressStreamId  = static_cast<int32_t>(envI64("RUNE_EGRESS_STREAM", 2));
     cfg.dataDir         = dataDir;
+    rune::examples::applyEnvCredentials(cfg);   // RUNE_USER / RUNE_PASSWORD_FILE
     {   // RUNE_IDLE_MODE: busyspin | lowlatency (default) | balanced
         const std::string im = envStr("RUNE_IDLE_MODE", "lowlatency");
         cfg.idleMode = (im == "busyspin") ? IdleMode::BusySpin
