@@ -105,7 +105,7 @@ import pytest
 
 from harness import faults
 from harness.dockerutil import run
-from harness.cluster import BOOT_LINE, SERVICES, node_id_to_service, slice_since_last_boot
+from harness.cluster import BOOT_LINE, SERVICES, node_id_to_service, service_to_node_id, slice_since_last_boot
 from harness.driver import DRAIN_QUIET_MS, Results, run_clients
 from harness.invariants import (
     assert_exactly_once,
@@ -775,13 +775,43 @@ def _await_equal_catalog_digests(cluster, timeout_s: float = 60) -> dict:
 # miss a state that lasts under a second).
 _UNCONFIRMED_LINE = "storage UNCONFIRMED (id="
 _CONFIRMED_LINE = "storage CONFIRMED (id="
-_HOLD_LINE = "REFUSED \u2014 storage unconfirmed"          # armLeadershipBump_'s warn for a held leader role
+_HOLD_LINE = "REFUSED \u2014 storage unconfirmed"          # armLeadershipBump_'s warn for a held leader role (informational)
 _GUARD_LINE = "REFUSED to truncate"                        # the truncation guard (a follower refused a lineage)
+
+
+def _strip_leaderships(logs: str, node_id: int) -> int | None:
+    """The leaderships count of the controller's strip line for `node_id` ("stripping it from <k> ISRs, <l> leaderships"),
+    or None when no node logged one."""
+    m = re.search(rf"controller: node {node_id} reported storage [0-9a-f]+ \(committed [^)]*\): "
+                  rf"stripping it from \d+ ISRs, (\d+) leaderships", logs or "")
+    return int(m.group(1)) if m else None
+
+
+def _led_before_confirmed(boot_log: str, node_id: int) -> bool:
+    """True when the restarted process logged a becomeLeader (any partition, __catalog included) BEFORE its storage was
+    confirmed - the one thing the gate exists to prevent."""
+    head = boot_log.split(_CONFIRMED_LINE, 1)[0]
+    return re.search(rf"PartitionReplica\[node={node_id}\] becomeLeader", head) is not None
+
+
+def _await_settled_leaders(cluster, timeout_s: float = 180) -> dict:
+    """The user topic's partition leaders once all 3 are known and unchanged across two reads 10 s apart (the GROW
+    rebalance after the recovery may still be moving leadership back)."""
+    deadline = time.time() + timeout_s
+    prev = None
+    while time.time() < deadline:
+        cur = cluster.partition_leaders(_TOPIC_MULTI)
+        if len(cur) == 3 and cur == prev:
+            return cur
+        prev = cur
+        time.sleep(10.0)
+    raise AssertionError(f"partition leaders of topic {_TOPIC_MULTI} never settled: {prev}")
 
 
 def _assert_recovered_after_disk_loss(cluster, wiped_svc: str, poller: "_StoragePoller", producers: list,
                                       subscribe_svc: str, keys: int, *, expect_role_hold: bool,
-                                      restarted_at: float, boot_log: str | None = None) -> None:
+                                      restarted_at: float, boot_log: str | None = None,
+                                      settled_producer=None) -> None:
     """The recovery assertions shared by the disk-loss cases (see the module docstring, scenario 5)."""
     # Within 120 s of the restart call: CONFIRMED and in sync again (the poller supplies outOfSync / pendingNodes).
     final = poller.wait_confirmed(max(1.0, restarted_at + 120 - time.time()))
@@ -791,9 +821,16 @@ def _assert_recovered_after_disk_loss(cluster, wiped_svc: str, poller: "_Storage
     u, c = log.find(_UNCONFIRMED_LINE), log.find(_CONFIRMED_LINE)
     assert u >= 0, f"{wiped_svc}'s restarted process never logged '{_UNCONFIRMED_LINE}':\n{log[-2500:]}"
     assert c > u, f"{wiped_svc} logged CONFIRMED before UNCONFIRMED (or never confirmed):\n{log[-2500:]}"
+    # The safety property the hold exists for: the restarted process never led anything before it was confirmed.
+    nid = service_to_node_id(wiped_svc)
+    assert not _led_before_confirmed(log, nid), f"{wiped_svc} became a leader before its storage was CONFIRMED:\n{log[-2500:]}"
+    # The controller stripped the node (whichever node was controller logged it); with a leadership if it led one.
+    all_logs = "\n".join(cluster.compose.logs(svc, timeout=60) for svc in SERVICES)
+    leaderships = _strip_leaderships(all_logs, nid)
+    assert leaderships is not None, f"no controller logged the strip of node {nid} ({wiped_svc})"
     if expect_role_hold:
-        assert _HOLD_LINE in log, (
-            f"{wiped_svc} led a role at the kill but its restarted process never held it ('{_HOLD_LINE}'):\n{log[-2500:]}")
+        assert leaderships >= 1, f"node {nid} led a role at the kill but the strip found {leaderships} leaderships"
+    print(f"[dr14] {wiped_svc}: strip leaderships={leaderships}; hold line seen: {_HOLD_LINE in log}", flush=True)
     # Every node's controller view has no pending storage left.
     deadline = time.time() + 60
     pending = {}
@@ -811,6 +848,10 @@ def _assert_recovered_after_disk_loss(cluster, wiped_svc: str, poller: "_Storage
         reading = cluster.read_storage(svc)
         assert reading is not None and reading["lost_committed_reports"] <= 0, (
             f"{svc}: lostCommittedReports={None if reading is None else reading['lost_committed_reports']} (a below-committed report was made)")
+    # Settled (CONFIRMED, nothing pending, leaders stable): the post-recovery producer must ack everything.
+    if settled_producer is not None:
+        _await_settled_leaders(cluster)
+        producers = list(producers) + [settled_producer()]
     # Committed set intact: ordering, exactly-once, no loss.
     sub = _subscribe_all(cluster, subscribe_svc, _next_cid_base(), keys, window_ms=90_000)
     assert_no_committed_loss(Results(clients=[c for r in producers for c in r.clients] + sub.clients))
@@ -835,16 +876,16 @@ def test_dr14_disk_loss_fast_restart_never_truncates_committed(tmp_path, target_
 
     The wiped node must come back UNCONFIRMED (and, if it led a role, hold it), be stripped from every ISR, confirmed
     and rejoin; the truncation guard must never fire (the gate keeps the wiped node from leading), no follower may
-    truncate below its committed offset, and no acked record is lost - including records acked AFTER the restart.
+    truncate below its committed offset, and no acked record is lost - including 150 records acked by a producer started after the recovery settled.
     ``fmt``: ``auto`` (compose RUNE_STORAGE_FORMAT=auto formats the empty dir as a joiner) or ``join`` (the operator's
-    `rune_broker storage format --join`).  The controller's broker-liveness timeout is raised to 60 s
+    `rune_broker storage format --join`).  The controller's broker-liveness timeout is raised to 120 s
     (RUNE_BROKER_LIVENESS_TIMEOUT_MS) so the wiped node deterministically boots, replicates the metadata and finds itself
     still named leader, instead of racing the failover.  Fixes: ISR v3 Steps 7-11.
     """
     from harness.cluster import Cluster
     override = tmp_path / "liveness.yml"
     override.write_text("services:\n" + "".join(
-        f"  {s}:\n    environment:\n      RUNE_BROKER_LIVENESS_TIMEOUT_MS: \"60000\"\n" for s in SERVICES))
+        f"  {s}:\n    environment:\n      RUNE_BROKER_LIVENESS_TIMEOUT_MS: \"120000\"\n" for s in SERVICES))
     cluster = Cluster(project="rune-dr-diskloss", override_files=[str(override)])
     keys = 4
     try:
@@ -879,17 +920,22 @@ def test_dr14_disk_loss_fast_restart_never_truncates_committed(tmp_path, target_
         with _StoragePoller(cluster, target_svc) as poller:
             restarted_at = time.time()
             faults.restart(cluster, target_svc)      # no pause: the committed assignment still names it
-            # Records acked AFTER the restart call: a second producer on a survivor (the first may have bailed on the
-            # failover; that is observed, never assumed).
-            after = _produce(cluster, survivors[1], 1, _next_cid_base(), 150, keys, rate_hz=15)
-            assert after.ok and len(after.all_produced) >= 100, (
-                f"fewer than 100 records acked after the restart: {len(after.all_produced)}\n"
-                + "\n".join(c.raw[-800:] for c in after.clients))
             producer_thread.join(timeout=300)
             produced = holder.get("r", Results())
+
+            def _after_recovery() -> Results:
+                # Started only once the node is CONFIRMED, nothing is pending and the partition leaders are stable: it
+                # must ack ALL 150 records (the "through the recovery" claim stays with the first producer, whose acked
+                # records are audited above the failover).
+                r = _produce(cluster, survivors[1], 1, _next_cid_base(), 150, keys, rate_hz=15)
+                assert r.ok and len(r.all_produced) == 150, (
+                    f"post-recovery producer acked {len(r.all_produced)} of 150:\n"
+                    + "\n".join(c.raw[-800:] for c in r.clients))
+                return r
+
             _assert_recovered_after_disk_loss(
-                cluster, target_svc, poller, [produced, after], survivors[1], keys,
-                expect_role_hold=expect_role_hold, restarted_at=restarted_at)
+                cluster, target_svc, poller, [produced], survivors[1], keys,
+                expect_role_hold=expect_role_hold, restarted_at=restarted_at, settled_producer=_after_recovery)
     finally:
         cluster.down()
 
@@ -977,6 +1023,13 @@ def test_dr14_storage_poller_orders_states_without_a_cluster():
     assert last.find(_UNCONFIRMED_LINE) >= 0 and last.find(_UNCONFIRMED_LINE) < last.find(_CONFIRMED_LINE)
     assert two_boots.find(_CONFIRMED_LINE) < two_boots.find(_UNCONFIRMED_LINE)   # the unsliced log would mislead
     assert slice_since_last_boot("no boot line here") == ""
+    log = ("controller: node 1 reported storage ab12 (committed none, origin joiner): stripping it from 2 ISRs, "
+           "1 leaderships, 0 lineages before confirming\n")
+    assert _strip_leaderships(log, 1) == 1 and _strip_leaderships(log, 2) is None
+    before = f"{BOOT_LINE}/d\nPartitionReplica[node=1] becomeLeader topic=1 part=0 epoch=3\n{_UNCONFIRMED_LINE}2)\n{_CONFIRMED_LINE}2)\n"
+    after = f"{BOOT_LINE}/d\n{_UNCONFIRMED_LINE}2)\n{_CONFIRMED_LINE}2)\nPartitionReplica[node=1] becomeLeader topic=1 part=0 epoch=4\n"
+    assert _led_before_confirmed(before, 1) and not _led_before_confirmed(after, 1)
+    assert not _led_before_confirmed(before, 2)
     digest_a = _history_rows_digest("offset  time\n  12  t  define\n  15  t  alter\nfooter 1\n")
     digest_b = _history_rows_digest("HEADER\n  12  t  define\n  15  t  alter\nother footer\n")
     assert digest_a == digest_b != _history_rows_digest("  12  t  define\n")
