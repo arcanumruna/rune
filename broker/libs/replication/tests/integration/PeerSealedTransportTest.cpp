@@ -427,7 +427,7 @@ bool abortSinkHandler(void* ctx, const rr::AlterIsrResponseMsg& r) noexcept {
 }
 }  // namespace
 
-TEST(PeerSealedAeronPartitionTransportRegression, AbortRedeliveryWithTwoImagesLosesNothingRegression) {
+TEST(PeerFrameRegression, AbortRedeliveryWithTwoImagesLosesNothingRegression) {
     MediaDriver driver;
     aeron::Context ctx; ctx.aeronDir(driver.dir());
     auto aeron = aeron::Aeron::connect(ctx);

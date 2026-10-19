@@ -41,12 +41,20 @@ struct ChallengeSent {
     std::array<uint8_t, 32> nonceA{}, nonceB{}; uint64_t keyId = 0; uint64_t peerIncarnation = 0; int64_t sentNs = 0;
     std::optional<Established> prior;
 };
+/// A Challenge the RESPONDER has sent and not yet seen proven.  Fixed table beside the link state: an unauthenticated
+/// Hello never changes the state (an Established responder stays Established).
+struct PendingChallenge {
+    bool used = false;
+    std::array<uint8_t, 32> nonceA{}, nonceB{}; uint64_t keyId = 0; uint64_t peerIncarnation = 0; int64_t sentNs = 0;
+};
 using LinkState = std::variant<LinkIdle, HelloSent, ChallengeSent, Established>;
 
 class PeerHandshake {
 public:
     static constexpr int64_t kRetryNs        = 200'000'000;     // Hello retry / refusal retry / NoLink poke
     static constexpr int64_t kAwaitNs        = 1'000'000'000;   // a Challenge / Proof awaiting its answer
+    static constexpr std::size_t kPending     = 8;               // responder: challenges awaiting their Proof
+    static constexpr int64_t kHintRekeyGapNs  = 30'000'000'000;  // unauthenticated hints rekey a link at most this often
     static constexpr int64_t kSilenceNs      = 1'000'000'000;   // no authenticated frame this long: an unauthenticated hint may rekey
 
     PeerHandshake(int32_t self, int32_t peer, uint64_t selfIncarnation, const ClusterKeys& keys);
@@ -104,6 +112,8 @@ private:
     uint64_t    incarnation_;
     ClusterKeys keys_;
     uint32_t    epochCounter_ = 0;      // the responder's link epochs (Accept{epoch = counter + 1})
+    std::array<PendingChallenge, kPending> pending_{};
+    int64_t     lastHintRekeyNs_ = -1'000'000'000'000;
     int64_t     lastExchangeNs_ = -1'000'000'000'000;   // start of the last NEW exchange (<= 1 per kRetryNs)
     LinkState   state_{LinkIdle{0}};
 };

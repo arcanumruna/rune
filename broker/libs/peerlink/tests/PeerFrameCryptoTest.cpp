@@ -111,8 +111,8 @@ TEST(PeerFrameRegression, AFrameReplayedOntoAnotherPlaneFailsRegression) {
     std::vector<uint8_t> w(8 + 32), out(32);
     const auto n = admin.seal(2, bytes("catalog"), 7, w.data(), w.size());
     std::size_t outLen = 0; int32_t from = -1; uint32_t epoch = 0;
-    EXPECT_NE(legacyRx.open(w.data(), n, out.data(), out.size(), outLen, from, epoch), pl::PeerFrameCrypto::OpenResult::Ok);
-    EXPECT_NE(workerRx.open(w.data(), n, out.data(), out.size(), outLen, from, epoch), pl::PeerFrameCrypto::OpenResult::Ok);
+    EXPECT_EQ(legacyRx.open(w.data(), n, out.data(), out.size(), outLen, from, epoch), pl::PeerFrameCrypto::OpenResult::BadSender);
+    EXPECT_EQ(workerRx.open(w.data(), n, out.data(), out.size(), outLen, from, epoch), pl::PeerFrameCrypto::OpenResult::BadSender);
     EXPECT_EQ(adminRx.open(w.data(), n, out.data(), out.size(), outLen, from, epoch), pl::PeerFrameCrypto::OpenResult::Ok);
 }
 

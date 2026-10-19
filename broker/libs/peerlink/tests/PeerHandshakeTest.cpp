@@ -254,7 +254,7 @@ TEST(PeerHandshakeRegression, ADuplicateHelloGetsTheSameChallengeAndAnUnanswered
     auto c2 = p.b.onHello(hello, 350 * kMs);
     ASSERT_TRUE(c1.frame && c2.frame);
     EXPECT_EQ(*c1.frame, *c2.frame) << "idempotent for a repeated Hello";
-    EXPECT_TRUE(std::holds_alternative<pl::ChallengeSent>(p.b.state()));
+    EXPECT_TRUE(std::holds_alternative<pl::Established>(p.b.state())) << "an unproven Hello never leaves Established";
     (void)p.b.tick(300 * kMs + pl::PeerHandshake::kAwaitNs + 1);   // nobody proved anything
     const auto* after = std::get_if<pl::Established>(&p.b.state());
     ASSERT_NE(after, nullptr) << "the live link is restored";
@@ -360,6 +360,12 @@ TEST(PeerLinkRegression, ForgedRefuseChallengeHelloNoLinkNeverDisruptALinkRegres
     pl::PeerHello bad; bad.from = 1; bad.to = 2; bad.keyId = 0xdead; bad.incarnation = 1;
     (void)p.b.onHello(bad, now);
     EXPECT_TRUE(std::holds_alternative<pl::Established>(p.b.state()));
+    // A forged Hello with the REAL public key id is answered with a Challenge but leaves the responder Established.
+    pl::PeerHello real; real.from = 1; real.to = 2; real.keyId = keys('k').current.keyId; real.incarnation = 1; real.nonceA.fill(7);
+    auto ans = p.b.onHello(real, now);
+    EXPECT_TRUE(ans.frame);
+    ASSERT_TRUE(std::holds_alternative<pl::Established>(p.b.state()));
+    EXPECT_EQ(std::get<pl::Established>(p.b.state()).keys, *p.kb) << "same keys, same epoch";
 }
 
 TEST(PeerLinkRegression, ARestartedPeerRelinksUnderAFloodRegression) {
@@ -376,6 +382,9 @@ TEST(PeerLinkRegression, ARestartedPeerRelinksUnderAFloodRegression) {
         (void)p.a.onRefuse(r, now);
         pl::PeerChallenge ch; ch.from = 2; ch.to = 1; ch.keyId = keys('k').current.keyId; ch.incarnation = 9;
         (void)p.a.onChallenge(ch, now);
+        pl::PeerHello f; f.from = 1; f.to = 2; f.keyId = keys('k').current.keyId; f.incarnation = 3;   // forged Hello at b
+        f.nonceA.fill(static_cast<uint8_t>(i + 1));
+        (void)p.b.onHello(f, now);
         p.run(now);   // b's NoLink poke (every 200 ms), a's Hello, the real handshake
         relinked = p.ka && p.kb;
     }
@@ -396,4 +405,44 @@ TEST(PeerLinkRegression, AFreshDataDirPeerRejoinsRegression) {
     p.ka.reset(); p.kb.reset();
     for (int i = 0; i < 3 && !(p.ka && p.kb); ++i) p.run((10'000 + i * 1'000) * kMs);
     EXPECT_TRUE(p.ka && p.kb) << "a lower incarnation at the responder is not refused";
+}
+
+TEST(PeerLinkRegression, AForgedHelloFloodAtTheResponderNeverHoldsARestartedPeerOutRegression) {
+    Pair p(keys('k'), keys('k')); p.run(1'000 * kMs);
+    ASSERT_TRUE(p.ka && p.kb);
+    p.a = pl::PeerHandshake(1, 2, 11, keys('k'));   // the initiator restarts: its Hello must get through the flood
+    p.ka.reset(); p.kb.reset(); p.q.clear();
+    for (int k = 0; k < 20; ++k) {   // the flood is already under way: every pending slot is taken by a forgery
+        pl::PeerHello f; f.from = 1; f.to = 2; f.keyId = keys('k').current.keyId; f.incarnation = 5;
+        f.nonceA.fill(static_cast<uint8_t>(100 + k));
+        (void)p.b.onHello(f, 2'999 * kMs);
+    }
+    bool relinked = false;
+    for (int i = 0; i < 400 && !relinked; ++i) {
+        const int64_t now = (3'000 + i) * kMs;
+        for (int k = 0; k < 3; ++k) {   // three forged Hellos with the real key id every millisecond
+            pl::PeerHello f; f.from = 1; f.to = 2; f.keyId = keys('k').current.keyId; f.incarnation = 5;
+            f.nonceA.fill(static_cast<uint8_t>(i * 3 + k + 1));
+            (void)p.b.onHello(f, now);
+            EXPECT_TRUE(std::holds_alternative<pl::LinkIdle>(p.b.state()) || std::holds_alternative<pl::Established>(p.b.state()));
+        }
+        p.run(now);
+        relinked = p.ka && p.kb;
+    }
+    EXPECT_TRUE(relinked) << "the real Hello is answered and its Proof matches its own pending slot";
+}
+
+TEST(PeerLinkRegression, ForgedHintsRekeyAnIdleLinkAtMostOncePer30sRegression) {
+    Pair p(keys('k'), keys('k')); p.run();
+    ASSERT_TRUE(p.ka);
+    pl::PeerRefuse poke; poke.from = 2; poke.to = 1; poke.reason = pl::RefuseReason::NoLink;
+    int rekeys = 0;
+    for (int i = 1; i <= 100; ++i) {   // 10 s of forged hints on a link with no authenticated traffic
+        const int64_t now = (2'000 + i * 100) * kMs;
+        auto o = p.a.onRefuse(poke, now);
+        if (!o.frame) o = p.a.onUnknownEpoch(500 + i, now);
+        if (o.frame) { ++rekeys; p.absorb(0, std::move(o)); }
+        p.run(now);   // the real responder answers: the exchange completes at once
+    }
+    EXPECT_EQ(rekeys, 1);
 }

@@ -120,11 +120,13 @@ void PeerHandshake::onAuthenticated(int64_t nowNs) noexcept {
 PeerHandshake::Out PeerHandshake::rekey_(int64_t nowNs) {
     if (!initiator()) return {};
     auto* e = std::get_if<Established>(&state_);
-    if (!e || nowNs - e->lastAuthNs < kSilenceNs || nowNs - lastExchangeNs_ < kRetryNs) return {};
+    if (!e || nowNs - e->lastAuthNs < kSilenceNs || nowNs - lastExchangeNs_ < kRetryNs ||
+        nowNs - lastHintRekeyNs_ < kHintRekeyGapNs) return {};
     HelloSent hs;
     if (!rune::crypto::randomBytes({hs.nonceA.data(), hs.nonceA.size()})) return {};
     hs.keyId = keys_.current.keyId; hs.sentNs = nowNs; hs.startNs = nowNs; hs.prior = *e;
     lastExchangeNs_ = nowNs;
+    lastHintRekeyNs_ = nowNs;
     PeerHello m; m.from = self_; m.to = peer_; m.keyId = hs.keyId; m.incarnation = incarnation_; m.nonceA = hs.nonceA;
     state_ = hs;
     return frameOut(m);
@@ -166,8 +168,6 @@ PeerHandshake::Out PeerHandshake::tick(int64_t nowNs) {
         PeerRefuse m; m.from = self_; m.to = peer_; m.reason = RefuseReason::NoLink;     // "start over": a poke, not a refusal
         return frameOut(m);
     }
-    if (auto* c = std::get_if<ChallengeSent>(&state_))
-        if (nowNs - c->sentNs >= kAwaitNs) restorePrior_(c->prior, nowNs);
     return {};
 }
 
@@ -176,28 +176,29 @@ PeerHandshake::Out PeerHandshake::onHello(const PeerHello& h, int64_t nowNs) {
     const ClusterKey* key = keys_.byId(h.keyId);
     if (!key) return refuseOut_(RefuseReason::NoCommonKey, h.keyId);           // D35
 
-    // The same Hello again (our Challenge may have been lost): the SAME Challenge.
-    std::optional<Established> prior;
-    if (auto* c = std::get_if<ChallengeSent>(&state_)) {
-        prior = c->prior;
-        if (c->nonceA == h.nonceA && c->peerIncarnation == h.incarnation && c->keyId == h.keyId) {
-            PeerChallenge m; m.from = self_; m.to = peer_; m.keyId = c->keyId; m.incarnation = incarnation_; m.nonceB = c->nonceB;
-            if (!transcriptMac(*key, true, peer_, self_, c->nonceA, c->nonceB, c->peerIncarnation, incarnation_, c->keyId, m.macB))
+    // The same Hello again (our Challenge may have been lost): the SAME Challenge from its pending slot.
+    for (auto& c : pending_) {
+        if (c.used && nowNs - c.sentNs < kAwaitNs && c.nonceA == h.nonceA && c.peerIncarnation == h.incarnation && c.keyId == h.keyId) {
+            PeerChallenge m; m.from = self_; m.to = peer_; m.keyId = c.keyId; m.incarnation = incarnation_; m.nonceB = c.nonceB;
+            if (!transcriptMac(*key, true, peer_, self_, c.nonceA, c.nonceB, c.peerIncarnation, incarnation_, c.keyId, m.macB))
                 return {};
             return frameOut(m);
         }
-    } else if (auto* e = std::get_if<Established>(&state_)) {
-        prior = *e;   // the live link stays valid until the re-handshake completes
     }
-    if (nowNs - lastExchangeNs_ < kRetryNs) return {};   // at most one NEW exchange per kRetryNs: a flood costs a compare
-    ChallengeSent cs;
-    cs.nonceA = h.nonceA; cs.keyId = h.keyId; cs.peerIncarnation = h.incarnation; cs.sentNs = nowNs; cs.prior = prior;
+    // A NEW nonce: nothing about the link state changes.  It takes a free (or expired) slot, else evicts the oldest.
+    // (No per-ms gate: a gate is a lottery a flooder wins.  The agent bounds Hellos per duty pass.)
+    PendingChallenge* slot = nullptr;
+    for (auto& c : pending_) {
+        if (!c.used || nowNs - c.sentNs >= kAwaitNs) { slot = &c; break; }
+        if (slot == nullptr || c.sentNs < slot->sentNs) slot = &c;
+    }
+    PendingChallenge cs;
+    cs.used = true; cs.nonceA = h.nonceA; cs.keyId = h.keyId; cs.peerIncarnation = h.incarnation; cs.sentNs = nowNs;
     if (!rune::crypto::randomBytes({cs.nonceB.data(), cs.nonceB.size()}))
         return errorOut(logLine("peer link from node %d: no random bytes available", peer_));
     PeerChallenge m; m.from = self_; m.to = peer_; m.keyId = h.keyId; m.incarnation = incarnation_; m.nonceB = cs.nonceB;
     if (!transcriptMac(*key, true, peer_, self_, cs.nonceA, cs.nonceB, cs.peerIncarnation, incarnation_, cs.keyId, m.macB)) return {};
-    lastExchangeNs_ = nowNs;
-    state_ = cs;
+    *slot = cs;
     return frameOut(m);
 }
 
@@ -223,24 +224,27 @@ PeerHandshake::Out PeerHandshake::onChallenge(const PeerChallenge& c, int64_t no
 
 PeerHandshake::Out PeerHandshake::onProof(const PeerProof& p, int64_t nowNs) {
     if (initiator() || p.from != peer_ || p.to != self_) return {};
-    auto* cs = std::get_if<ChallengeSent>(&state_);
-    if (!cs) return {};    // no Challenge outstanding: nothing to prove against
-    const ClusterKey* key = keys_.byId(cs->keyId);
-    if (!key) return {};
-    std::array<uint8_t, 64> want{};
-    if (!transcriptMac(*key, false, peer_, self_, cs->nonceA, cs->nonceB, cs->peerIncarnation, incarnation_, cs->keyId, want)) return {};
-    if (!macEq(want, p.macA))   // a forgery: logged, the Challenge stays pending (it expires on its own)
+    PendingChallenge* cs = nullptr;
+    const ClusterKey* key = nullptr;
+    for (auto& c : pending_) {
+        if (!c.used || nowNs - c.sentNs >= kAwaitNs) continue;
+        const ClusterKey* k = keys_.byId(c.keyId);
+        if (!k) continue;
+        std::array<uint8_t, 64> want{};
+        if (!transcriptMac(*k, false, peer_, self_, c.nonceA, c.nonceB, c.peerIncarnation, incarnation_, c.keyId, want)) continue;
+        if (macEq(want, p.macA)) { cs = &c; key = k; break; }
+    }
+    if (cs == nullptr)   // no pending challenge matches: a forgery or a stale Proof - logged, nothing changes
         return errorOut(logLine("peer link from node %d REFUSED: %s (key id %016llx)", peer_, refuseReasonText(RefuseReason::BadProof),
-                                static_cast<unsigned long long>(cs->keyId)));
+                                static_cast<unsigned long long>(keys_.current.keyId)));
     const uint32_t epoch = ++epochCounter_;
     auto keys = deriveLinkKeys(*key, self_, peer_, false, cs->nonceA, cs->nonceB, epoch);
     PeerAccept a; a.from = self_; a.to = peer_; a.linkEpoch = epoch;
-    if (!keys || !confirmMac(*key, peer_, self_, cs->nonceA, cs->nonceB, epoch, a.confirm)) {
-        restorePrior_(cs->prior, nowNs);
+    if (!keys || !confirmMac(*key, peer_, self_, cs->nonceA, cs->nonceB, epoch, a.confirm))
         return errorOut(logLine("peer link with node %d: key derivation failed", peer_));
-    }
     Established e{*keys, cs->peerIncarnation, nowNs, nowNs};
     const uint64_t id = cs->keyId;
+    for (auto& c : pending_) c.used = false;
     state_ = e;
     Out o = frameOut(a);
     o.established = *keys;
