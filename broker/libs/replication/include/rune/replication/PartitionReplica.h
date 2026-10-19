@@ -194,6 +194,10 @@ struct PartitionConfig {
     // E3 Task 5: async-durability tier (0=Leader, 1=Majority, 2=Strict).
     // Strict (2) = ack only after local fsync completion; others ack on append.
     uint8_t durabilityTier = 1;  // default Majority — parity-safe (existing tests unchanged)
+    /// ISR v3 Step 11: a disk-backed follower never truncates below the HW its own leader told it in this epoch
+    /// (it refuses and reports instead).  true restores the Kafka behaviour (log and truncate) - the broker sets
+    /// it from RUNE_SURVIVOR_LEADER_ELECTION for user topics, where an unclean election is a configured choice.
+    bool allowUncleanTruncation = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -470,6 +474,13 @@ public:
     /// role when the gate opens).  Runs on the replica's owning thread (worker, or control for internal partitions).
     void holdLeadershipForStorage(Epoch e, int32_t pe);
     [[nodiscard]] uint64_t storageHoldsForTest() const noexcept { return storageHolds_; }
+    /// ISR v3 Step 11 test views: the truncation guard (3.8).
+    [[nodiscard]] bool     truncationRefusedForTest() const noexcept { return std::holds_alternative<Refused>(divergenceGuard_); }
+    [[nodiscard]] uint64_t truncationsRefusedForTest() const noexcept { return truncationsRefused_; }
+    [[nodiscard]] uint64_t appliesDroppedRefusedForTest() const noexcept { return appliesDroppedRefused_; }
+    [[nodiscard]] uint64_t epochHistoryMismatchesForTest() const noexcept { return epochHistoryMismatches_; }
+    [[nodiscard]] uint64_t epochHistoryMismatchesSeenForTest() const noexcept { return epochHistoryMismatchesSeen_; }
+    [[nodiscard]] Offset   heldEpochStartForTest(int32_t e) const noexcept { return heldEpochStart_(e); }
     /// (follower) the leader this replica follows; -1 = none known (a held leader role follows nobody).
     [[nodiscard]] NodeId leaderId() const noexcept { return leaderId_; }
     [[nodiscard]] Epoch restartFenceEpochForTest() const noexcept { return restartFenceEpoch_; }
@@ -1547,6 +1558,42 @@ private:
     // follower its HW (-1 = none since the process started).  followerHw_ is 0
     // after every becomeFollower until then — not a committed prefix.
     int64_t hwLearnedEpoch_ = -1;
+
+    // ISR v3 Step 11 (3.8): the truncation guard.  NoRefusal, or Refused holding exactly what the refusal needs.
+    // Refused: the follower applies nothing and fetches nothing; it re-sends a below-committed report to the controller
+    // at cadenceNs (50 ms, 1 s once any answer arrived) until the role changes (becomeLeader, a refused/held
+    // leadership, or becomeFollower to another (epoch, leader)); the controller fails the leader over.
+    struct NoRefusal {};
+    struct Refused {
+        Epoch   epoch;
+        NodeId  leader;
+        Offset  truncTo;
+        Offset  floor;
+        int64_t reportId;
+        int64_t lastReportNs;
+        int64_t lastLogNs;
+        int64_t cadenceNs;
+    };
+    std::variant<NoRefusal, Refused> divergenceGuard_{};
+    uint64_t truncationsRefused_ = 0;
+    uint64_t appliesDroppedRefused_ = 0;
+    uint64_t epochHistoryMismatches_ = 0;       ///< leader side: mismatch answers sent
+    uint64_t epochHistoryMismatchesSeen_ = 0;   ///< follower side, refusal not applicable (memory / unclean): re-fetched
+    /// Log once per (follower, epoch): 16 inline entries, then the oldest is overwritten.
+    struct MismatchLogged { NodeId follower = -1; int32_t epoch = -1; };
+    std::array<MismatchLogged, 16> mismatchLogged_{};
+    uint8_t mismatchLoggedNext_ = 0;
+    void logMismatchOnce_(NodeId follower, int32_t epoch);
+    void enterRefused_(Offset truncTo, Offset leaderEndOffset);
+    void onEpochHistoryMismatch_(int32_t epoch, Offset leaderStart);
+    int  sendRefusedReport_(int64_t nowNs);
+    /// The epoch's start offset when this replica holds that epoch's FIRST record, else -1 (R16, v2-review C2): a start
+    /// equal to a log start above 0 (a transient ring reset, a retention cut, a cache rebuild) is never compared.
+    [[nodiscard]] Offset heldEpochStart_(int32_t e) const noexcept {
+        const Offset s  = epochCache_.startOffsetFor(e);
+        const Offset ls = onLog([](auto& L) { return L.logStartOffset(); });
+        return (s >= 0 && (s == 0 || s > ls)) ? s : -1;
+    }
 
     // ── Follower replication sync — SINGLE SOURCE OF TRUTH ──────────────────────
     // One explicit state machine (see FollowerSync.h) replaces the former scattered

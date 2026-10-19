@@ -100,6 +100,49 @@ TEST(TransientReplicaRegression, FollowerBehindTheLeaderRingStartResetsAndCatche
     // views over this source re-validate (Task 9 consumes this).
     EXPECT_EQ(r2.logGeneration(), genBefore + 1);
     EXPECT_EQ(r2.lastTruncationOffset(), 0);
+    // ISR v3 Step 11 (v2-review C2): a start equal to the reset ring start is a log start, not a first record - never sent.
+    EXPECT_EQ(r2.nextFetch().lastEpochStartOffset, -1) << "an epoch start equal to the reset ring start must not be sent";
+    for (int i = 0; i < 10; ++i) ASSERT_GE(r1.append(std::span<const uint8_t>(payload), false), 0);
+    for (int i = 0; i < kCap && r2.logEndOffset() < r1.logEndOffset(); ++i) {
+        clock += 1'000'000;
+        r1.doWork(clock); r2.doWork(clock); transport.pump(clock);
+    }
+    EXPECT_EQ(r2.logEndOffset(), r1.logEndOffset());
+    EXPECT_EQ(r1.epochHistoryMismatchesForTest(), 0u);
+}
+
+// ISR v3 Step 11 (A33): the same scenario under its guard name.  A transient follower reset to the leader's ring start
+// reports an epoch start the leader no longer holds (`s > logStart` fails on the follower; the leader's own start is not
+// the epoch's first record either): no comparison, never a mismatch, and the follower catches up and keeps following.
+// RED: send `epochCache_.startOffsetFor(...)` unconditionally (the follower stalls at the ring start, mismatches > 0).
+TEST(TruncationGuardRegression, TransientFollowerResetToTheRingStartIsNeverAMismatchRegression) {
+    rune::storage::InMemoryLog mem1(8 * 1024, 1000), mem2(1 << 20, 100'000);
+    InMemoryTransport transport;
+    const std::vector<NodeId> all = {1, 2};
+    const std::vector<NodeId> leaderOnly = {1};
+    PartitionReplica r1(tcfg(1), Role::Leader,   1, all, leaderOnly, &mem1, &transport);
+    PartitionReplica r2(tcfg(2), Role::Follower, 1, all, all,        &mem2, &transport);
+    const std::vector<uint8_t> payload(1024, 0x5A);
+    for (int i = 0; i < 40; ++i) ASSERT_GE(r1.append(std::span<const uint8_t>(payload), false), 0);
+    ASSERT_GT(mem1.logStartOffset(), 0) << "precondition: the leader's ring evicted its oldest records";
+    transport.setLeader(&r1);
+    transport.addFollower(2, &r2);
+    int64_t clock = 0;
+    for (int i = 0; i < kCap && r2.logEndOffset() < r1.logEndOffset(); ++i) {
+        clock += 1'000'000;
+        r1.doWork(clock); r2.doWork(clock); transport.pump(clock);
+    }
+    ASSERT_EQ(r2.logEndOffset(), r1.logEndOffset());
+    ASSERT_EQ(r2.transientLogResetsForTest(), 1u);
+    EXPECT_EQ(r2.nextFetch().lastEpochStartOffset, -1);
+    for (int i = 0; i < 10; ++i) ASSERT_GE(r1.append(std::span<const uint8_t>(payload), false), 0);
+    for (int i = 0; i < kCap && r2.logEndOffset() < r1.logEndOffset(); ++i) {
+        clock += 1'000'000;
+        r1.doWork(clock); r2.doWork(clock); transport.pump(clock);
+    }
+    EXPECT_EQ(r2.logEndOffset(), r1.logEndOffset());
+    EXPECT_EQ(r1.epochHistoryMismatchesForTest(), 0u);
+    EXPECT_FALSE(r2.truncationRefusedForTest());
 }
 
 TEST(TransientReplicaRegression, LeaderAppendStampsItsEpochIntoTheRing) {

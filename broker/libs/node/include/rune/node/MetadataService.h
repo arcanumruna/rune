@@ -627,6 +627,13 @@ public:
             noteUnservable_(m);
             return false;
         }
+        // ISR v3 Step 11 (3.8, B-I3): a follower refused to truncate below the committed offset - the leader's log is
+        // below what it told the followers is committed.  Decided at EVERY feature level (a report is not a storage
+        // record): the leader is failed over to another live ISR member, and (level 2) its storage is fenced.  A report
+        // for a stale leader/epoch is answered Fenced; a repeated one overwrites the request, which survives a
+        // partitionEpoch change (A-I4).  Only a ready controller answers.
+        if (m.isrCount == rr::AlterIsrMsg::kLeaderEpochBump && (m.isr[1] & rr::AlterIsrMsg::kBumpLeaderBelowCommitted) != 0)
+            return onBelowCommittedReport_(m, reply);
         if (!controllerReady_()) return false;
         // Internal topics: only the coordinator partitions on the controller
         // path (MEDIUM-B); __cluster_metadata uses the internal-ISR store.
@@ -727,6 +734,44 @@ public:
         ++alterIsrAccepted_;
         drainDynamicQueue();
         return true;
+    }
+    template <typename Reply>
+    bool onBelowCommittedReport_(const rune::replication::AlterIsrMsg& m, Reply& reply) {
+        namespace rr = rune::replication;
+        if (!controllerReady_()) return false;
+        if (m.topicId < 0 && !coordinatorKey_(m.topicId, m.partition)) return false;
+        const rune::metadata::PartitionAssignment* pa = msm_.assignment(m.topicId, m.partition);
+        if (pa == nullptr) { reply(rr::kAlterIsrFencedLeaderEpoch, -1); return false; }
+        if (pa->leaderNode >= 0 && pa->leaderNode != m.leaderId && pa->leaderEpoch == static_cast<int32_t>(m.leaderEpoch)) {
+            BumpRequest r;
+            r.requester      = pa->leaderNode;
+            r.leaderEpoch    = pa->leaderEpoch;
+            r.partitionEpoch = pa->partitionEpoch;
+            r.fence          = pa->leaderEpoch;
+            r.reason         = BumpReason::LostCommitted;
+            r.leo            = -1;
+            r.incarnation    = 0;
+            bumpRequests_[partitionKey_(m.topicId, m.partition)] = r;   // overwrite: the newest report names the newest pe
+            ++lostCommittedReports_;
+            if (msm_.featureLevel() >= rr::MetadataFeature::kStorageIdentity) fenceStorage_(pa->leaderNode);   // A-I4.4
+            reply(rr::kAlterIsrOk, pa->partitionEpoch);
+        } else {
+            reply(rr::kAlterIsrFencedLeaderEpoch, pa->partitionEpoch);
+        }
+        return false;
+    }
+    /// A-I4.4: the leader whose log fell below the committed offset lost its storage as far as the cluster can tell,
+    /// whatever its register says.  Fence it like a replaced disk: strip it from every ISR, leadership and lineage, then
+    /// re-confirm.  Nonce 0 belongs to no process, so no register erases the entry (section 3.3 row 1); an existing
+    /// entry (a strip already in progress) is kept.
+    void fenceStorage_(int32_t node) {
+        if (storageRegs_.find(node) != storageRegs_.end()) return;
+        const int64_t S = msm_.nodeStorage(node);
+        if (S == 0) return;   // nothing committed to re-confirm: the first registration decides it
+        spdlog::warn("controller: node {} led a partition whose log is below the committed offset: fencing its storage {:x}",
+                     node, static_cast<uint64_t>(S));
+        storageRegs_[node] = Stripping{S, rune::replication::AlterIsrMsg::kStorageOriginJoiner, 0, lastNowNs_, lastNowNs_};
+        std::erase(eligible_, node);
     }
     /// Leader-epoch restart fence (PartitionReplica::setLeaderEpochFenceFile):
     /// the committed leader `m.leaderId` refused leadership at the committed

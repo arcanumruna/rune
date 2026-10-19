@@ -1308,6 +1308,7 @@ void BrokerNode::buildReplication() {
             pcfg.isrCheckIntervalNs   = 10'000'000LL;
             pcfg.followerFlushIntervalNs = config_.followerFlushIntervalMs * 1'000'000LL;
             pcfg.maxFetchBytes        = userTopicMaxFetchBytes(config_);   // F3 r5 I1
+            pcfg.allowUncleanTruncation = topicId >= 0 && config_.survivorLeaderElection;   // ISR v3 Step 11
             // CP-2: thread TopicSpec.cleanupPolicy into PartitionConfig so that
             // runBoundedCompaction() reads the correct policy from every replica.
             // TopicSpec::CleanupPolicy and rune::replication::CleanupPolicy share
@@ -1509,6 +1510,7 @@ int32_t BrokerNode::createRuntimeUserReplicas(const TopicSpec& spec) {
         pcfg.isrCheckIntervalNs   = 10'000'000LL;
         pcfg.followerFlushIntervalNs = config_.followerFlushIntervalMs * 1'000'000LL;
         pcfg.maxFetchBytes        = userTopicMaxFetchBytes(config_);   // F3 r5 I1
+        pcfg.allowUncleanTruncation = topicId >= 0 && config_.survivorLeaderElection;   // ISR v3 Step 11
         pcfg.cleanupPolicy = static_cast<rune::replication::CleanupPolicy>(
             static_cast<uint8_t>(spec.cleanupPolicy));
         pcfg.minCleanableDirtyRatio = spec.minCleanableDirtyRatio;

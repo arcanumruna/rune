@@ -1412,6 +1412,222 @@ TEST(EpochChangeTruncationTest, FollowerTruncatesToExactEpochBoundaryOffset) {
     EXPECT_EQ(replica.lastFetchedEpoch(), 3);
 }
 
+// ===========================================================================
+// ISR v3 Step 11 (3.8): the truncation guard.  A disk-backed follower that learned HW 10 from its leader in THIS epoch
+// never truncates below it: it refuses, applies nothing, fetches nothing and reports to the controller.
+// ===========================================================================
+namespace {
+struct CapturingIsr final : InMemoryTransport {
+    std::vector<AlterIsrMsg> sent;
+    int fetches = 0;
+    bool sendAlterIsr(const AlterIsrMsg& m) override { sent.push_back(m); return true; }
+    bool sendFetchRequest(const FetchRequestMsg& r) override { ++fetches; return InMemoryTransport::sendFetchRequest(r); }
+    bool sendFetchRequestTo(NodeId to, const FetchRequestMsg& r) override { ++fetches; return InMemoryTransport::sendFetchRequestTo(to, r); }
+    [[nodiscard]] int reports() const {
+        int n = 0;
+        for (const auto& m : sent) n += (m.isr[1] & AlterIsrMsg::kBumpLeaderBelowCommitted) != 0 ? 1 : 0;
+        return n;
+    }
+};
+rune::storage::Log& recovered(rune::storage::Log& l) { l.recover(); return l; }
+
+/// Follower 2 of {1,2,3} at epoch 5 behind leader 1, 10 records applied and HW 10 learned.
+struct GuardRig {
+    TempDir dir{"guard"};
+    rune::storage::Log log{dir.path};
+    CapturingIsr t;
+    PartitionReplica r;
+    int64_t now = 1'000'000'000;
+    explicit GuardRig(bool unclean = false)
+        : r(withUnclean(unclean), Role::Follower, 0, {1, 2, 3}, {1, 2, 3}, &recovered(log), &t) {
+        r.setIsrChannel(&t);
+        r.becomeFollower(5, 1);
+        for (int i = 0; i < 10; ++i) {
+            auto p = makePayload(uint8_t(i), 8);
+            FetchResponseMsg d{};
+            d.leaderEpoch = 5; d.partition = 0; d.errorCode = kErrNone;
+            d.highWatermark = i + 1;
+            d.records = std::span<const uint8_t>(p.data(), p.size());
+            r.applyReplicated(d);
+        }
+    }
+    static PartitionConfig withUnclean(bool unclean) {
+        PartitionConfig c = makeConfig(2);
+        c.allowUncleanTruncation = unclean;
+        return c;
+    }
+    /// The leader answers DivergingEpoch (epoch, endOffset).
+    void diverge(int32_t epoch, Offset end, int64_t leaderEpoch = 5) {
+        FetchResponseMsg div{};
+        div.leaderEpoch = leaderEpoch; div.partition = 0; div.errorCode = kErrDivergingEpoch;
+        rune::replication::ErrorPayloadBuf b;
+        div.records = b.set(epoch, end);
+        r.applyReplicated(div);
+    }
+    /// Drive `ms` milliseconds in 10 ms ticks.
+    void run(int ms) { for (int i = 0; i < ms / 10; ++i) r.doWork(now += 10'000'000); }
+};
+}  // namespace
+
+// The headline: the leader's lineage ends at 3, below the 10 this follower knows are committed -> refused, nothing is
+// truncated, a below-committed report goes to the controller within 50 ms.  RED: remove the guard branch (the follower
+// truncates to 3).
+TEST(TruncationGuardRegression, DivergenceBelowTheLearnedHighWatermarkIsRefusedAndReportedRegression) {
+    GuardRig g;
+    ASSERT_EQ(g.r.logEndOffset(), 10);
+    ASSERT_EQ(g.r.highWatermark(), 10);
+    g.diverge(5, 3);
+    ASSERT_TRUE(g.r.truncationRefusedForTest());
+    ASSERT_EQ(g.r.logEndOffset(), 10);
+    EXPECT_EQ(g.r.truncationsRefusedForTest(), 1u);
+    const int fetches0 = g.t.fetches;
+    g.run(50);
+    ASSERT_GE(g.t.reports(), 1) << "no report within 50 ms";
+    EXPECT_EQ(g.t.fetches, fetches0) << "a refusing follower must not fetch";
+    const AlterIsrMsg& m = g.t.sent.back();
+    EXPECT_EQ(m.leaderId, 2);
+    EXPECT_EQ(m.leaderEpoch, 5);
+    EXPECT_EQ(m.isrCount, AlterIsrMsg::kLeaderEpochBump);
+    EXPECT_EQ(m.isr[2], 10) << "the floor";
+    EXPECT_NE(m.proposalId, 0);
+}
+
+// An answer (Ok, or Fenced by an old controller) slows the resend to 1 s.  RED: place the answer branch after the
+// `role_ != Leader` return (reports every 50 ms).
+TEST(TruncationGuardRegression, ReportAnswerReachesTheRefusingFollowerRegression) {
+    GuardRig g;
+    g.diverge(5, 3);
+    ASSERT_TRUE(g.r.truncationRefusedForTest());
+    g.run(50);
+    ASSERT_GE(g.t.reports(), 1);
+    AlterIsrResponseMsg ok{};
+    ok.topicId = 0; ok.partition = 0; ok.leaderId = 2; ok.leaderEpoch = 5; ok.errorCode = kAlterIsrOk;
+    ok.proposalId = g.t.sent.back().proposalId;
+    g.r.onAlterIsrResponse(ok);
+    const int n0 = g.t.reports();
+    g.run(900);
+    EXPECT_EQ(g.t.reports(), n0) << "reports kept coming at the fast cadence after the answer";
+    g.run(150);
+    EXPECT_EQ(g.t.reports(), n0 + 1) << "no report at +1 s";
+}
+
+// The report is re-sent after Ok until the role changes (the controller may have lost it).  RED: stop resending after Ok.
+TEST(TruncationGuardRegression, ReportIsResentAfterOkUntilTheRoleChangesRegression) {
+    GuardRig g;
+    g.diverge(5, 3);
+    g.run(50);
+    ASSERT_GE(g.t.reports(), 1);
+    AlterIsrResponseMsg ok{};
+    ok.topicId = 0; ok.partition = 0; ok.leaderId = 2; ok.leaderEpoch = 5; ok.errorCode = kAlterIsrOk;
+    ok.proposalId = g.t.sent.back().proposalId;
+    g.r.onAlterIsrResponse(ok);
+    int n = g.t.reports();
+    g.run(1050);
+    EXPECT_EQ(g.t.reports(), n + 1);
+    n = g.t.reports();
+    g.run(1000);
+    EXPECT_EQ(g.t.reports(), n + 1) << "the report stopped after the first resend";
+    g.r.becomeFollower(6, 3);
+    EXPECT_FALSE(g.r.truncationRefusedForTest());
+    n = g.t.reports();
+    g.run(2000);
+    EXPECT_EQ(g.t.reports(), n) << "a role change must end the report";
+}
+
+// A refused replica applies nothing.  RED: no drop.
+TEST(TruncationGuardRegression, RefusedReplicaAppliesNothingRegression) {
+    GuardRig g;
+    g.diverge(5, 3);
+    ASSERT_TRUE(g.r.truncationRefusedForTest());
+    ASSERT_EQ(g.r.logEndOffset(), 10);
+    auto p = makePayload(0x77, 8);
+    FetchResponseMsg d{};
+    d.leaderEpoch = 5; d.partition = 0; d.errorCode = kErrNone; d.highWatermark = 10;
+    d.records = std::span<const uint8_t>(p.data(), p.size());
+    g.r.applyReplicated(d);
+    EXPECT_EQ(g.r.logEndOffset(), 10);
+    EXPECT_EQ(g.r.appliesDroppedRefusedForTest(), 1u);
+}
+
+// RUNE_SURVIVOR_LEADER_ELECTION (allowUncleanTruncation) keeps the Kafka behaviour.  RED: an inverted condition.
+TEST(TruncationGuardRegression, UncleanAllowedStillTruncatesRegression) {
+    GuardRig g(/*unclean=*/true);
+    g.diverge(5, 3);
+    EXPECT_EQ(g.r.logEndOffset(), 3);
+    EXPECT_FALSE(g.r.truncationRefusedForTest());
+}
+
+// The scope: a divergence in ANOTHER epoch than the one the HW was learned in still truncates (the HW is per epoch; a
+// new leader's first answer sets it).  RED: guard on a floor carried across epochs.
+TEST(TruncationGuardRegression, DifferentEpochDivergenceStillTruncatesRegression) {
+    GuardRig g;
+    g.r.becomeFollower(6, 3);   // followerHw_ resets
+    g.diverge(5, 3, /*leaderEpoch=*/6);
+    EXPECT_EQ(g.r.logEndOffset(), 3);
+    EXPECT_FALSE(g.r.truncationRefusedForTest());
+}
+
+// A same-epoch re-assert of the same leader keeps the refusal (a metadata re-apply must not unblock it).
+// RED: reset the guard before the same-epoch early return.
+TEST(TruncationGuardRegression, SameEpochReassertKeepsTheRefusalRegression) {
+    GuardRig g;
+    g.diverge(5, 3);
+    ASSERT_TRUE(g.r.truncationRefusedForTest());
+    g.r.becomeFollower(5, 1);
+    EXPECT_TRUE(g.r.truncationRefusedForTest());
+    g.r.becomeFollower(5, 3);   // another leader at the same epoch ends it
+    EXPECT_FALSE(g.r.truncationRefusedForTest());
+}
+
+// A history-mismatch answer at our epoch refuses too, and NEVER truncates (R16).  RED: truncate on the mismatch.
+TEST(TruncationGuardRegression, EpochHistoryMismatchRefusesAndNeverTruncatesRegression) {
+    GuardRig g;
+    FetchResponseMsg mm{};
+    mm.leaderEpoch = 5; mm.partition = 0; mm.errorCode = kErrEpochHistoryMismatch;
+    rune::replication::ErrorPayloadBuf b;
+    mm.records = b.set(5, 20);
+    g.r.applyReplicated(mm);
+    EXPECT_TRUE(g.r.truncationRefusedForTest());
+    EXPECT_EQ(g.r.logEndOffset(), 10);
+    g.run(50);
+    EXPECT_GE(g.t.reports(), 1);
+}
+
+// A memory-backed or unclean-allowed replica counts a mismatch and carries on (re-fetches): never refused, never truncated.
+TEST(TruncationGuardRegression, EpochHistoryMismatchIsCountedWhereTheGuardDoesNotApplyRegression) {
+    GuardRig g(/*unclean=*/true);
+    FetchResponseMsg mm{};
+    mm.leaderEpoch = 5; mm.partition = 0; mm.errorCode = kErrEpochHistoryMismatch;
+    rune::replication::ErrorPayloadBuf b;
+    mm.records = b.set(5, 20);
+    g.r.applyReplicated(mm);
+    EXPECT_FALSE(g.r.truncationRefusedForTest());
+    EXPECT_EQ(g.r.logEndOffset(), 10);
+    EXPECT_EQ(g.r.epochHistoryMismatchesSeenForTest(), 1u);
+}
+
+// The leader side: a follower whose copy of the shared epoch starts elsewhere is answered kErrEpochHistoryMismatch and
+// credited nothing; -1 (a side that does not hold the first record) is never compared.  RED: no history check.
+TEST(TruncationGuardRegression, LeaderAnswersAHistoryMismatchAndCreditsNothingRegression) {
+    TempDir dir("guard_leader");
+    rune::storage::Log log(dir.path);
+    log.recover();
+    CapturingIsr t;
+    PartitionReplica L(makeConfig(1), Role::Leader, 5, {1, 2}, {1, 2}, &log, &t);
+    for (int i = 0; i < 4; ++i) (void)L.append(makePayload(uint8_t(i), 8), false);
+    ASSERT_EQ(L.heldEpochStartForTest(5), 0);
+    FetchRequestMsg req{};
+    req.leaderEpoch = 5; req.partition = 0; req.followerId = 2; req.fetchOffset = 2; req.maxBytes = 1 << 20;
+    req.topicId = 0; req.lastFetchedEpoch = 5; req.lastEpochStartOffset = 7;   // a different start
+    EXPECT_EQ(L.onFetchRequest(req, 1'000'000'000), kErrEpochHistoryMismatch);
+    EXPECT_EQ(L.epochHistoryMismatchesForTest(), 1u);
+    req.lastEpochStartOffset = -1;   // unknown: never compared
+    EXPECT_NE(L.onFetchRequest(req, 1'001'000'000), kErrEpochHistoryMismatch);
+    req.lastEpochStartOffset = 0;    // the same start
+    EXPECT_NE(L.onFetchRequest(req, 1'002'000'000), kErrEpochHistoryMismatch);
+    EXPECT_EQ(L.epochHistoryMismatchesForTest(), 1u);
+}
+
 // Stronger assertion: truncation landed at EXACT numeric boundary before re-append.
 // We verify this by truncating WITHOUT appending new records and checking LEO directly.
 TEST(EpochChangeTruncationTest, TruncationLandsAtExactNumericBoundary) {

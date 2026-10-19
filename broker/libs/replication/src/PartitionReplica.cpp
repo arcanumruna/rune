@@ -327,6 +327,7 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr, int
         publishCleanerState();
         return;
     }
+    divergenceGuard_ = NoRefusal{};   // ISR v3 Step 11 (3.8): a leader refuses nothing; the refusal ends with the role
 
     // Leader-epoch restart fence (see setLeaderEpochFenceFile): an epoch this
     // replica already led at (or holds records of) in an earlier incarnation is
@@ -509,6 +510,8 @@ void PartitionReplica::becomeFollower(Epoch leaderEpoch, NodeId leaderId)
         publishCleanerState();
         return;
     }
+    // ISR v3 Step 11 (3.8): another (epoch, leader) ends a refusal; the same-epoch re-assert above keeps it.
+    divergenceGuard_ = NoRefusal{};
 
     // Kafka makeFollower: no truncation here.  Divergence is found and resolved
     // on the fetch path: our first fetch carries lastFetchedEpoch, the leader
@@ -876,6 +879,22 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     if (vreq.lastFetchedEpoch >= 0) {
         const Offset leo = logEndOffset_();
         const auto ans = epochCache_.endOffsetForEpoch(vreq.lastFetchedEpoch, leo);
+        // ISR v3 Step 11 (A-I5, R16): the follower and this leader hold the FIRST record of the shared epoch yet disagree
+        // on where it starts - two histories under one epoch (a leader that lost its disk and re-led).  Credit nothing,
+        // never truncate the follower: it refuses and reports.  A side that does not hold the epoch's first record
+        // (a ring reset, a retention cut) sends / has -1 and is never compared.
+        if (ans.first == vreq.lastFetchedEpoch && req.lastEpochStartOffset >= 0) {
+            const Offset mine = heldEpochStart_(ans.first);
+            if (mine >= 0 && mine != req.lastEpochStartOffset) [[unlikely]] {
+                ErrorPayload{ans.first, mine}.encode(errPayload_.data());
+                auto mm = makeFetchResponse(highWatermark(), kErrEpochHistoryMismatch,
+                                            std::span<const uint8_t>(errPayload_.data(), ErrorPayload::SIZE));
+                if (!onTransport([&](auto& t) { return t.sendFetchResponse(req.followerId, mm); })) ++sendRefusals_;
+                ++epochHistoryMismatches_;
+                logMismatchOnce_(req.followerId, ans.first);
+                return kErrEpochHistoryMismatch;
+            }
+        }
         if (ans.first < vreq.lastFetchedEpoch || ans.second < req.fetchOffset) [[unlikely]] {
             // We hold every committed record (we were elected from the ISR):
             // whatever the follower holds past our lineage is uncommitted —
@@ -1264,6 +1283,11 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
             ep.endOffset >= 0 && ep.endOffset < logEndOffset_()) {
             onDivergingEpoch_(/*epoch=*/-1, ep.endOffset);
         }
+        // ISR v3 Step 11 (A-I5): the leader holds a different history under our epoch.  Never truncate on it (R16).
+        if (resp.errorCode == kErrEpochHistoryMismatch && role_ == Role::Follower && resp.leaderEpoch == epoch_ &&
+            ErrorPayload::decode(resp.records, ep)) {
+            onEpochHistoryMismatch_(ep.epoch, ep.endOffset);
+        }
         if (resp.errorCode == kErrUnsupportedWireVersion && v2RefusalsLogged_++ == 0) {
             spdlog::critical("PartitionReplica[node={} topic={} part={}]: dropped a v2 (pre-KIP-320) "
                              "replication frame from leader {} — mixed v2/v3 replication is "
@@ -1272,6 +1296,9 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
         // Other errors: ignored (the control plane drives role changes).
         return;
     }
+    // ISR v3 Step 11 (3.8): a refusing follower applies nothing - the lineage it was told to truncate to ends below
+    // what it knows is committed; the controller fails the leader over.
+    if (std::holds_alternative<Refused>(divergenceGuard_)) [[unlikely]] { ++appliesDroppedRefused_; return; }
     // Fix round 5: a decided divergence truncation is pending — appending now
     // would extend the diverged tail.  Drop; the post-truncation fetch re-pulls.
     if (followerSync_.truncatePending()) [[unlikely]] { ++appliesDroppedTruncatePending_; return; }
@@ -1546,6 +1573,8 @@ void PartitionReplica::onUnapplicableBatch(Offset batchBase, Epoch leaderEpoch)
 bool PartitionReplica::sendFetchToLeader_(const FetchRequestMsg& req)
 {
     // TEST seam (holdFetchesUntilForTest): a member that cannot catch up yet emits no fetch (nor ack).
+    // ISR v3 Step 11: a refusing follower fetches nothing (the lineage it was given is not one it will follow).
+    if (std::holds_alternative<Refused>(divergenceGuard_)) [[unlikely]] return true;
     if (fetchHoldUntilNs_ != 0 && std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count() < fetchHoldUntilNs_) [[unlikely]]
         return true;
@@ -1575,7 +1604,10 @@ FetchRequestMsg PartitionReplica::nextFetch() const noexcept
     req.topicId     = cfg_.topicId;   // DR-BUG-5: stamp topicId for transport routing
     req.lastFetchedEpoch = lastFetchedEpoch();   // KIP-320/595
     req.incarnation      = processIncarnation_;  // KIP-903
-    req.storageId        = storageId_;           // ISR v3 Step 6 (lastEpochStartOffset stays -1 until Step 11)
+    req.storageId        = storageId_;           // ISR v3 Step 6
+    // ISR v3 Step 11 (A-I5): where this replica's copy of lastFetchedEpoch STARTS, when it holds that epoch's first
+    // record; -1 (never compared) otherwise.
+    req.lastEpochStartOffset = req.lastFetchedEpoch >= 0 ? heldEpochStart_(req.lastFetchedEpoch) : -1;
     return req;
 }
 
@@ -1660,6 +1692,14 @@ void PartitionReplica::onDivergingEpoch_(int32_t divergingEpoch, Offset divergin
             : mine.second;
     if (truncTo > leo) truncTo = leo;
     if (truncTo < 0) truncTo = 0;
+    // ISR v3 Step 11 (3.8): a disk-backed follower whose own leader told it, in THIS epoch, that offsets up to followerHw_
+    // are committed never truncates below that.  Only a leader that lost data can answer so (it was wiped, or elected
+    // without the committed records): refuse, apply nothing, report to the controller.
+    if (truncTo < followerHw_ && hwLearnedEpoch_ == static_cast<int64_t>(epoch_) && !memoryBacked_ &&
+        !cfg_.allowUncleanTruncation) [[unlikely]] {
+        enterRefused_(truncTo, divergingEndOffset);
+        return;
+    }
     if (truncTo < followerHw_) [[unlikely]] {
         // Kafka logs and truncates: a complete leader's lineage ends below what
         // we were told is committed — only an election of a replica lacking
@@ -2403,6 +2443,7 @@ int PartitionReplica::doWork(int64_t nowNs)
     if (staleLead_.pending) [[unlikely]] work += requestLeaderEpochBump_(nowNs);
     if (report_.pending) [[unlikely]] work += sendLeaderlessReport_(nowNs);
     if (lineageReport_.pending) [[unlikely]] work += sendLineageReport_(nowNs);
+    if (std::holds_alternative<Refused>(divergenceGuard_)) [[unlikely]] work += sendRefusedReport_(nowNs);
 
     if (role_ == Role::Leader) {
         // DR-BUG-6: reset the follower-lag TIME clock on the first tick after
@@ -2517,7 +2558,8 @@ int PartitionReplica::doWork(int64_t nowNs)
             const int64_t keepaliveNs = std::clamp<int64_t>(
                 (cfg_.replicaLagMaxMs * 1'000'000LL) / 4,
                 cfg_.fetchIntervalNs, 20'000'000LL);
-            const bool wedged = wedgedAtOffset_ >= 0;   // (cleared above if LEO moved)
+            const bool wedged = wedgedAtOffset_ >= 0 ||
+                                std::holds_alternative<Refused>(divergenceGuard_);   // (wedge cleared above if LEO moved)
             const FollowerSync::State fsPrev = followerSync_.state();
             const bool fsWasArmed = followerSync_.fetchArmed();
             const FollowerSync::Action act = wedged
@@ -2781,6 +2823,15 @@ void PartitionReplica::applyCommittedIsr_(std::vector<NodeId> isr, int32_t parti
 
 void PartitionReplica::onAlterIsrResponse(const AlterIsrResponseMsg& r)
 {
+    // ISR v3 Step 11 (B-I3): ANY answer to our below-committed report (Ok, or Fenced by an old controller) slows the
+    // resend to 1 s; only a role change ends it.  First statement: the report must be answered even when this replica
+    // is not a leader and holds no proposal.
+    if (auto* g = std::get_if<Refused>(&divergenceGuard_);
+        g != nullptr && r.leaderId == cfg_.selfId && r.leaderEpoch == g->epoch && r.topicId == cfg_.topicId &&
+        r.partition == cfg_.partitionId && (r.proposalId == 0 || r.proposalId == g->reportId)) {
+        g->cadenceNs = 1'000'000'000LL;
+        return;
+    }
     // C1 multi-node: the controller committed our lineage report (or we no
     // longer lead at that epoch).  A FencedLeaderEpoch may also concern an ISR
     // proposal of the same leadership: fall through to it.
@@ -3312,6 +3363,84 @@ void PartitionReplica::refuseStaleLeadership_(Epoch newEpoch, int32_t partitionE
                        " (led by an earlier incarnation, or no durable fence)");
 }
 
+// ---------------------------------------------------------------------------
+// ISR v3 Step 11 (3.8): the truncation guard
+// ---------------------------------------------------------------------------
+void PartitionReplica::enterRefused_(Offset truncTo, Offset leaderEndOffset)
+{
+    const auto* g = std::get_if<Refused>(&divergenceGuard_);
+    if (g == nullptr || g->epoch != epoch_ || g->leader != leaderId_) {
+        divergenceGuard_ = Refused{epoch_, leaderId_, truncTo, followerHw_, ++proposalSeq_, 0, 0, kAlterIsrResendNs};
+        spdlog::critical("PartitionReplica[node={} topic={} part={}]: REFUSED to truncate below the committed offset {} "
+                         "(leader {} epoch {} lineage ends at {}; LEO {}) - reporting it to the controller, applying "
+                         "nothing until the leadership changes",
+                         cfg_.selfId, cfg_.topicId, cfg_.partitionId, followerHw_, leaderId_,
+                         static_cast<long long>(epoch_), leaderEndOffset, logEndOffset_());
+    }
+    ++truncationsRefused_;
+    followerSync_.reset();
+}
+
+void PartitionReplica::onEpochHistoryMismatch_(int32_t epoch, Offset leaderStart)
+{
+    // Memory-backed replicas and an enabled unclean mode keep today's behaviour: count it and fetch again (the leader
+    // credited nothing).  Never a truncation: a start offset says nothing about which history is right (R16).
+    if (memoryBacked_ || cfg_.allowUncleanTruncation) {
+        ++epochHistoryMismatchesSeen_;
+        return;
+    }
+    (void)epoch;
+    enterRefused_(followerHw_, leaderStart);
+}
+
+void PartitionReplica::logMismatchOnce_(NodeId follower, int32_t epoch)
+{
+    for (const MismatchLogged& m : mismatchLogged_)
+        if (m.follower == follower && m.epoch == epoch) return;
+    mismatchLogged_[mismatchLoggedNext_] = MismatchLogged{follower, epoch};
+    mismatchLoggedNext_ = static_cast<uint8_t>((mismatchLoggedNext_ + 1) % mismatchLogged_.size());
+    spdlog::critical("PartitionReplica[node={} topic={} part={}]: follower {} holds a different history under epoch {} "
+                     "(its start differs from ours {}) - nothing is served or credited to it; it must refuse and report "
+                     "(this leader's log may have been lost and re-created under the same epoch)",
+                     cfg_.selfId, cfg_.topicId, cfg_.partitionId, follower, epoch, heldEpochStart_(epoch));
+}
+
+int PartitionReplica::sendRefusedReport_(int64_t nowNs)
+{
+    auto* g = std::get_if<Refused>(&divergenceGuard_);
+    if (g == nullptr) return 0;
+    int work = 0;
+    // Every 30 s: the refusal is never silent.  lastLogNs 0 = just entered (the entry itself logged).
+    if (g->lastLogNs == 0) {
+        g->lastLogNs = std::max<int64_t>(nowNs, 1);
+    } else if (nowNs - g->lastLogNs >= 30'000'000'000LL) {
+        g->lastLogNs = nowNs;
+        spdlog::critical("PartitionReplica[node={} topic={} part={}]: still REFUSED to truncate below the committed "
+                         "offset {} (leader {} epoch {} lineage ends at {}; refusals {}; {})",
+                         cfg_.selfId, cfg_.topicId, cfg_.partitionId, g->floor, g->leader,
+                         static_cast<long long>(g->epoch), g->truncTo, truncationsRefused_,
+                         isrChannel_ == nullptr ? "no controller path" : "waiting for the controller");
+    }
+    if (isrChannel_ == nullptr) return 0;
+    if (g->lastReportNs != 0 && nowNs - g->lastReportNs < g->cadenceNs) return 0;
+    g->lastReportNs = std::max<int64_t>(nowNs, 1);
+    AlterIsrMsg m{};
+    m.topicId        = cfg_.topicId;
+    m.partition      = cfg_.partitionId;
+    m.leaderId       = cfg_.selfId;
+    m.leaderEpoch    = g->epoch;
+    m.isrCount       = AlterIsrMsg::kLeaderEpochBump;
+    m.partitionEpoch = -1;
+    m.isr[1] = AlterIsrMsg::kBumpLeaderBelowCommitted;
+    m.isr[2] = static_cast<int32_t>(std::min<Offset>(g->floor, std::numeric_limits<int32_t>::max()));
+    m.isr[3] = static_cast<int32_t>(static_cast<uint64_t>(processIncarnation_) & 0xffffffffu);
+    m.isr[4] = static_cast<int32_t>(static_cast<uint64_t>(processIncarnation_) >> 32);
+    m.proposalId = g->reportId;
+    if (!isrChannel_->sendAlterIsr(m)) ++sendRefusals_;
+    ++work;
+    return work;
+}
+
 void PartitionReplica::holdLeadershipForStorage(Epoch e, int32_t pe)
 {
     ++storageHolds_;
@@ -3331,6 +3460,7 @@ void PartitionReplica::armLeadershipBump_(Epoch newEpoch, int32_t partitionEpoch
     if (role_ == Role::Leader)
         becomeFollower(epoch_ > newEpoch ? epoch_ : newEpoch, NodeId{-1});
     report_.pending = false;   // the partition HAS a committed leader (us): a bump, not a report
+    divergenceGuard_ = NoRefusal{};   // ISR v3 Step 11 (3.8): a refused / held leadership ends a refusal
     staleLead_.pending        = true;
     staleLead_.epoch          = newEpoch;
     staleLead_.partitionEpoch = partitionEpoch;

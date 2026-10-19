@@ -4584,3 +4584,127 @@ TEST(StorageRegistrationRegression, HeldLeaderFailsOverBelowFeatureLevelTwoRegre
     EXPECT_EQ(c.pa().leaderEpoch, le + 1);
     EXPECT_FALSE(isrHasNode(c.pa(), 3));
 }
+
+// ===========================================================================
+// ISR v3 Step 11 - the controller side of the truncation guard (design section 3.8).
+// ===========================================================================
+namespace {
+/// A refusing follower `from`'s below-committed report for (topic, 0) at leader epoch `epoch`.
+rune::replication::AlterIsrMsg belowCommittedReport(int32_t from, int32_t epoch, int32_t topic = 0) {
+    using rune::replication::AlterIsrMsg;
+    AlterIsrMsg m{};
+    m.topicId = topic; m.partition = 0; m.leaderId = from; m.leaderEpoch = epoch;
+    m.isrCount = AlterIsrMsg::kLeaderEpochBump;
+    m.partitionEpoch = -1;
+    m.isr[1] = AlterIsrMsg::kBumpLeaderBelowCommitted;
+    m.isr[2] = 10;
+    return m;
+}
+struct ReportAnswer { bool recorded; bool answered; int16_t code; };
+ReportAnswer sendReport(CtlRig& c, int32_t from, int32_t epoch, int32_t topic = 0) {
+    rune::replication::AlterIsrResponseMsg resp{};
+    bool ans = false;
+    const bool rec = c.svc->onAlterIsr(belowCommittedReport(from, epoch, topic), &resp, &ans);
+    return {rec, ans, resp.errorCode};
+}
+/// Leader 2, ISR {2,1,3} for `topic`.
+void leaderTwoWithFullIsr(CtlRig& c, int32_t topic = 0) {
+    c.forceLeader(2, topic);
+    c.readmit(1, topic);
+    c.readmit(3, topic);
+    ASSERT_EQ(c.paOf(topic).leaderNode, 2);
+    ASSERT_EQ(c.paOf(topic).isr.size(), 3u);
+}
+}  // namespace
+
+// B-I3 / A-I4: a follower refused to truncate below the committed offset: the leader (2) is failed over to another live
+// ISR member and leaves the ISR; the report is answered Ok.  RED: route LostCommitted to the leaderless branch
+// (the leader becomes NO_LEADER).
+TEST(StorageRegistrationRegression, BelowCommittedReportFailsTheLeaderOverRegression) {
+    CtlRig c;
+    leaderTwoWithFullIsr(c);
+    const int32_t e = c.pa().leaderEpoch;
+    const auto a = sendReport(c, 1, e);
+    EXPECT_TRUE(a.answered);
+    EXPECT_EQ(a.code, rune::replication::kAlterIsrOk);
+    c.tick(); c.drive(50);
+    EXPECT_TRUE(c.pa().leaderNode == 1 || c.pa().leaderNode == 3) << "leader " << c.pa().leaderNode;
+    EXPECT_EQ(c.pa().leaderEpoch, e + 1);
+    EXPECT_FALSE(isrHasNode(c.pa(), 2));
+    EXPECT_EQ(c.svc->lostCommittedReports(), 1u);
+}
+
+// The report is decided at feature level 1 too (it is not a storage record).  RED: a level check on the report branch.
+TEST(StorageRegistrationRegression, BelowCommittedReportAtFeatureLevelOneIsDecidedTooRegression) {
+    CtlRig c(true, {}, rune::replication::MetadataFeature::kBase);
+    ASSERT_LT(c.svc->featureLevel(), 2);
+    leaderTwoWithFullIsr(c);
+    const int32_t e = c.pa().leaderEpoch;
+    const auto a = sendReport(c, 1, e);
+    EXPECT_TRUE(a.answered);
+    EXPECT_EQ(a.code, rune::replication::kAlterIsrOk);
+    c.tick(); c.drive(50);
+    EXPECT_TRUE(c.pa().leaderNode == 1 || c.pa().leaderNode == 3) << "leader " << c.pa().leaderNode;
+    EXPECT_EQ(c.pa().leaderEpoch, e + 1);
+    EXPECT_FALSE(isrHasNode(c.pa(), 2));
+    EXPECT_EQ(c.pa().mark.kind, rune::metadata::LeaderlessMark::Kind::None);
+}
+
+// A report for an older leader epoch is answered Fenced and decides nothing.  RED: always Ok and record.
+TEST(StorageRegistrationRegression, BelowCommittedReportForAStaleEpochIsAnsweredFencedRegression) {
+    CtlRig c;
+    leaderTwoWithFullIsr(c);
+    const int32_t e = c.pa().leaderEpoch;
+    const auto a = sendReport(c, 1, e - 1);
+    EXPECT_TRUE(a.answered);
+    EXPECT_EQ(a.code, rune::replication::kAlterIsrFencedLeaderEpoch);
+    c.tick(); c.drive(50);
+    EXPECT_EQ(c.pa().leaderNode, 2);
+    EXPECT_EQ(c.svc->lostCommittedReports(), 0u);
+}
+
+// A-I4: the request survives an unrelated partitionEpoch change: the refusing follower re-sends, the newer report
+// OVERWRITES the dropped one.  RED: record the request without overwriting it (the second report is ignored).
+TEST(StorageRegistrationRegression, BelowCommittedBumpSurvivesAPartitionEpochChangeRegression) {
+    CtlRig c;
+    leaderTwoWithFullIsr(c);
+    const int32_t e = c.pa().leaderEpoch;
+    ASSERT_TRUE(sendReport(c, 1, e).answered);
+    const int32_t pe0 = c.pa().partitionEpoch;
+    ASSERT_TRUE(proposeWithCapture(c, {2, 1}, {}).accepted);   // an unrelated shrink commits before any tick
+    ASSERT_EQ(c.pa().partitionEpoch, pe0 + 1);
+    ASSERT_EQ(c.pa().leaderNode, 2);
+    ASSERT_TRUE(sendReport(c, 1, e).answered);                  // the re-send
+    c.tick(); c.drive(50);
+    EXPECT_NE(c.pa().leaderNode, 2) << "the request was dropped with the old partitionEpoch";
+    EXPECT_FALSE(isrHasNode(c.pa(), 2));
+}
+
+// A-I4.4: at level 2 the report also fences the leader's STORAGE: it is stripped from every partition it is in and its
+// storage is re-confirmed (a second 0x8004).  A register with the same id must not cancel the fence (nonce 0).
+// RED: no fenceStorage_ call (topic 1 keeps node 2), or a fence entry carrying the node's nonce (the second register
+// erases it and there is no second 0x8004).
+TEST(StorageRegistrationRegression, BelowCommittedReportFencesTheLeadersStorageRegression) {
+    CtlRig c(true, {TopicSpec{0, 1, 3, "", "t0"}, TopicSpec{1, 1, 3, "", "t1"}});
+    leaderTwoWithFullIsr(c, 0);
+    leaderTwoWithFullIsr(c, 1);
+    (void)registerStorage(*c.svc, 2, 0xA, kStorageOriginLegacy, 5);
+    c.drive(100);
+    ASSERT_EQ(c.svc->msmForTest().nodeStorage(2), 0xA);
+    const auto n2 = [&] {
+        std::size_t n = 0;
+        for (const auto& r : storageRecordsInLog(c.log1)) n += (r.type == 0x8004 && r.a == 2) ? 1 : 0;
+        return n;
+    };
+    const std::size_t before = n2();
+    const int32_t e = c.paOf(0).leaderEpoch;
+    ASSERT_TRUE(sendReport(c, 1, e, 0).answered);
+    (void)registerStorage(*c.svc, 2, 0xA, kStorageOriginLegacy, 5);   // the same id again, at once
+    c.tick(); c.drive(100);   // the strips
+    c.tick(); c.drive(100);   // the confirmation (Ruling 7.1: one tick after the strips)
+    c.tick(); c.drive(100);   // the prune of the committed confirmation
+    EXPECT_FALSE(isrHasNode(c.paOf(0), 2));
+    EXPECT_FALSE(isrHasNode(c.paOf(1), 2)) << "the leader's other partition kept the fenced node";
+    EXPECT_STREQ(c.svc->storageRegStateForTest(2), "None");
+    EXPECT_GT(n2(), before) << "the storage was not re-confirmed";
+}
