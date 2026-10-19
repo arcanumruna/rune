@@ -92,6 +92,9 @@
 //     keep receiving, lose nothing produced around the move and never
 //     re-deliver.  Prints "TRANSIENT-FAILOVER-E2E: OK" (see transientFailoverMode).
 //
+// `view_probe --create-only` (catalog docker e2e, docker/catalog-e2e.sh): create the view RUNE_VIEW_NAME over
+// the existing topic RUNE_VIEW_SOURCE and exit (0 = Ok; 1 = code + detail on stderr), reading no rows.
+//
 // Environment (all modes):
 //   RUNE_TARGET / RUNE_TARGET_STREAM / RUNE_EGRESS / RUNE_EGRESS_STREAM /
 //   RUNE_DATA_DIR / RUNE_TIMEOUT_MS — same as rune_schema_probe.cpp.
@@ -1086,8 +1089,36 @@ static int groupRestartMode(ClientConfig cfg, int timeoutMs, int boundMs) {
     return 0;
 }
 
-int main() {
-    const std::string mode        = getEnvStr("RUNE_MODE", "setup");
+// --create-only (catalog docker e2e): connect, look up the source topic RUNE_VIEW_SOURCE (default
+// "character"; its fields must include Int64 "id" (the key) and "hp"), create the view
+// RUNE_VIEW_NAME (default "<source>_hp") over it through createViewAndWait and exit.  0 on Ok;
+// 1 printing the error code + the broker's detail otherwise.  No rows are read.
+static int createOnlyMode(Client& c, std::chrono::milliseconds wait) {
+    const std::string source = getEnvStr("RUNE_VIEW_SOURCE", "character");
+    const std::string name   = getEnvStr("RUNE_VIEW_NAME", source + "_hp");
+    const TopicSchemaResult src = c.getTopicSchemaAndWait(source, wait);
+    if (src.errorCode != 0) {
+        std::cerr << "PROBE: FAIL create-only getTopicSchema(" << source << ") errorCode=" << src.errorCode << "\n";
+        return 1;
+    }
+    const auto plan = rcv::serializeAuthored(charHpPlan(name, src.topicId, 0));
+    const CreateViewResult v = c.createViewAndWait(name, "id", /*persistence=*/0, std::span<const uint8_t>(plan), wait);
+    if (v.errorCode != 0) {
+        std::cerr << "PROBE: FAIL create-only createView(" << name << ") errorCode=" << v.errorCode
+                  << " detail=" << v.detail << "\n";
+        return 1;
+    }
+    std::cout << "CREATE-ONLY: OK view=" << name << " viewTopicId=" << v.viewTopicId << "\n";
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    bool createOnly = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::string_view(argv[i]) == "--create-only") createOnly = true;
+        else { std::cerr << "PROBE: FAIL unknown argument " << argv[i] << " (only --create-only)\n"; return 1; }
+    }
+    const std::string mode        = createOnly ? std::string("create_only") : getEnvStr("RUNE_MODE", "setup");
     const std::string target      = getEnvStr("RUNE_TARGET");
     const int targetStream        = getEnvInt("RUNE_TARGET_STREAM", 1);
     const std::string egress      = getEnvStr("RUNE_EGRESS");
@@ -1134,6 +1165,12 @@ int main() {
         std::cerr << "PROBE: connecting...\n";
         c.connectAndWait();
         std::cerr << "PROBE: connected\n";
+
+        if (mode == "create_only") {
+            const int rc = createOnlyMode(c, wait);
+            c.close();
+            return rc;
+        }
 
         if (mode == "setup") {
             // ---- 1. defineTopic "character" ------------------------------
