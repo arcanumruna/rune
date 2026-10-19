@@ -1,3 +1,5 @@
+#include <rune/protocol/SecurityTypes.h>
+#include <type_traits>
 #include <rune/ql/Backends.h>
 #include <rune/ql/Parser.h>
 #include <gtest/gtest.h>
@@ -185,4 +187,40 @@ TEST(SecurityStatementsTest, PlansCarryTheWireFields) {
     // SHOW statements and catalog statements are not plans
     EXPECT_FALSE(ql::applySecurityPlan(ql::parse("show users;").value()).has_value());
     EXPECT_FALSE(ql::applySecurityPlan(ql::parse("topic t partitions 1;").value()).has_value());
+}
+
+TEST(SecurityStatementsRegression, ParseErrorsNeverEchoAPasswordRegression) {
+    struct Case { const char* src; const char* secret; } cases[] = {
+        {"CREATE USER ws1 WITH PASSWORD hunter2hunter2;", "hunter2"},                // unquoted password
+        {"CREATE USER ws1 WITH PASSWORD 'abc'def123456';", "def123456"},             // a quote inside: the tail is junk after the password
+        {"ALTER USER u ADD PASSWORD secretsecret12;", "secretsecret12"},
+        {"ALTER USER u SET PASSWORD 'pw-long-enough' junk77secret;", "junk77secret"},
+        {"CREATE USER ws1 WITH PASSWORD 'abcdefghijklm' 9999secret;", "9999secret"},
+        {"CREATE USER ws1 WITH PASSWORD ;", "zzz"},
+    };
+    for (const auto& c : cases) {
+        auto r = ql::parse(c.src);
+        ASSERT_FALSE(r.has_value()) << c.src;
+        EXPECT_EQ(r.error().message.find(c.secret), std::string::npos) << c.src << " -> " << r.error().message;
+        EXPECT_EQ(r.error().message.find("abcdefghijklm"), std::string::npos) << r.error().message;
+        EXPECT_EQ(r.error().message.find("pw-long-enough"), std::string::npos) << r.error().message;
+        EXPECT_FALSE(r.error().message.empty());
+    }
+    // errors before the password keyword still name the offending token (the user's own text)
+    auto early = ql::parse("CREATE USER ws1 WITHOUT PASSWORD 'x';");
+    ASSERT_FALSE(early.has_value());
+    EXPECT_NE(early.error().message.find("WITHOUT"), std::string::npos) << early.error().message;
+}
+
+TEST(SecurityStatementsRegression, PlanBytesAreTheProtocolEnumsRegression) {
+    namespace rp = rune::protocol;
+    static_assert(std::is_same_v<ql::SecOp, rp::SecurityOperation>);
+    static_assert(std::is_same_v<ql::SecResource, rp::SecurityResourceType>);
+    static_assert(std::is_same_v<ql::Grantee, rp::SecurityGranteeKind>);
+    auto plan = ql::applySecurityPlan(ql::parse("GRANT WRITE ON TOPIC PREFIX 'world.' TO ROLE r;").value()).value();
+    EXPECT_EQ(plan.op, static_cast<uint8_t>(rp::SecurityOperation::Write));
+    EXPECT_EQ(plan.resourceType, static_cast<uint8_t>(rp::SecurityResourceType::Topic));
+    EXPECT_EQ(plan.patternKind, static_cast<uint8_t>(rp::SecurityPatternKind::Prefix));
+    EXPECT_EQ(plan.granteeKind, static_cast<uint8_t>(rp::SecurityGranteeKind::Role));
+    EXPECT_TRUE(rp::validSecurityOperation(plan.op) && rp::validSecurityResourceType(plan.resourceType));
 }

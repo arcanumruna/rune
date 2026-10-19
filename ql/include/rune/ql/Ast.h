@@ -1,4 +1,6 @@
 #pragma once
+#include <rune/protocol/SecurityTypes.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -56,13 +58,13 @@ struct DiffDef {
 };
 
 // ── Security statements (authentication phase, Task 6) ──────────────────────
-// The enum values are the wire / event bytes (= rune::security::Operation / ResourceType /
-// GranteeKind and the SecurityDdl `op` / `resourceType` / `granteeKind` bytes); rune-ql does not
-// depend on rune-codec's security library, so the mapping is pinned by value here.
-enum class SecOp : uint8_t { Read = 0, Write, Create, Alter, Drop, Describe, Admin };
-enum class SecResource : uint8_t { Cluster = 0, Topic, View, Group, TransactionalId };
+// The enum values are the wire / event bytes (the SecurityDdl `op` / `resourceType` / `granteeKind`
+// bytes and rune::security::Operation / ResourceType / GranteeKind): ONE definition, in rune-protocol
+// (SecurityTypes.h), aliased here, in rune-codec and on the wire.
+using SecOp       = rune::protocol::SecurityOperation;
+using SecResource = rune::protocol::SecurityResourceType;
 struct SecPattern { SecResource type = SecResource::Topic; bool prefix = false; std::string name; };
-enum class Grantee : uint8_t { User = 0, Role = 1 };
+using Grantee = rune::protocol::SecurityGranteeKind;
 struct CreateUserDef { std::string name; std::string password; };      // password: in memory only, never rendered
 struct AlterUserDef {
     enum class Change : uint8_t { AddPassword, DropPassword, SetPassword, Disable, Enable } change = Change::Disable;

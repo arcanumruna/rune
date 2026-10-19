@@ -184,6 +184,10 @@ struct Lexer {
 struct Parser {
     Lexer  lex;
     Token  cur;
+    // Set on reaching a PASSWORD keyword and kept for the rest of the statement: from then on an error
+    // names the KIND of the offending token, never its text (a mistyped, unquoted or quote-containing
+    // password must not reach the terminal or a CI log).
+    bool   redactTokens{false};
 
     explicit Parser(std::string_view src) noexcept : lex{src} {
         cur = lex.next();
@@ -216,6 +220,15 @@ struct Parser {
     [[nodiscard]] bool isKw(std::string_view kw) const noexcept { return cur.kind == TK::Ident && ieq(cur.text, kw); }
     [[nodiscard]] std::string got() const {
         if (cur.kind == TK::Eof) return "end of input";
+        if (redactTokens) {
+            switch (cur.kind) {
+            case TK::Ident: return "an identifier";
+            case TK::Int: return "a number";
+            case TK::String: return "a string";
+            case TK::BadString: return "an unterminated string";
+            default: return "a symbol";
+            }
+        }
         if (cur.kind == TK::Unknown && cur.text.size() == 1) {
             const auto c = static_cast<unsigned char>(cur.text[0]);
             if (c < 0x21 || c >= 0x7F) {
@@ -847,6 +860,7 @@ struct Parser {
         if (!w) return std::unexpected(std::move(w.error()));
         auto pw = expectKeyword("password");
         if (!pw) return std::unexpected(std::move(pw.error()));
+        redactTokens = true;
         auto p = parsePassword();
         if (!p) return std::unexpected(std::move(p.error()));
         auto semi = expect(TK::Semi, ";");
@@ -866,6 +880,7 @@ struct Parser {
             advance();
             auto pw = expectKeyword("password");
             if (!pw) return std::unexpected(std::move(pw.error()));
+            redactTokens = true;
             auto p = parsePassword();
             if (!p) return std::unexpected(std::move(p.error()));
             a.password = std::move(*p);
