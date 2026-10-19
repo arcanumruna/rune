@@ -34,6 +34,7 @@ import warnings
 from dataclasses import dataclass, field
 from typing import Optional
 
+from . import auth
 from .dockerutil import CommandTimeout, _git_sha, run, run_until
 from .timing import timed
 
@@ -354,6 +355,7 @@ def run_txn(
     ]
     for k, v in env.items():
         args += ["-e", f"{k}={v}"]
+    args += auth.docker_args()   # authentication: log in as the e2e user
     args.append(DR_IMAGE)
     res = run(args, timeout=timeout_s)
     return _parse_txn_output(cid, res.returncode, res.stdout + "\n" + res.stderr)
@@ -405,6 +407,7 @@ def run_txn_consume(
     ]
     for k, v in env.items():
         args += ["-e", f"{k}={v}"]
+    args += auth.docker_args()   # authentication: log in as the e2e user
     args.append(DR_IMAGE)
     res = run(args, timeout=timeout_s)
     return _parse_txn_output(cid, res.returncode, res.stdout + "\n" + res.stderr)
@@ -485,6 +488,7 @@ def _run_one_group_member(
     ]
     for k, v in env.items():
         args += ["-e", f"{k}={v}"]
+    args += auth.docker_args()   # authentication: log in as the e2e user
     args.append(DR_IMAGE)
 
     res = run(args, timeout=timeout_s)
@@ -785,6 +789,7 @@ def _run_one_client(
         ]
         for k, v in env.items():
             args += ["-e", f"{k}={v}"]
+        args += auth.docker_args()   # authentication: log in as the e2e user
         args.append(DR_IMAGE)
 
         quiet_ms = int(cfg.get("drain_quiet_ms", 0))

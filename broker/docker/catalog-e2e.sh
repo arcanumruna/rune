@@ -20,9 +20,17 @@
 #   E2E_LOG_DIR   when set, the brokers' and the client's logs are kept there at teardown
 #   E2E_WORK_DIR  scratch dir shared with the client container as /work (default <repo>/.catalog-e2e-work)
 
+# Authentication (Task 20): both clusters run with authentication ON.  One cluster key is generated before the first
+# `up`; each cluster is bootstrapped (first admin + the e2e user) once it has a leader; the client container logs in as
+# the e2e user (RUNE_USER / RUNE_PASSWORD_FILE in its environment, so every `rune ...`, view_probe and
+# rune_produce_subscribe run authenticated).  The e2e role grants CREATE/ALTER/DROP/READ/WRITE on everything and
+# DESCRIBE ON CLUSTER (catalog history, export, diff and replay need it).
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/auth.sh
+. "${SCRIPT_DIR}/lib/auth.sh"
 BROKER_REPO="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PROJECTS="$(cd "${BROKER_REPO}/.." && pwd)"
 CLIENT_REPO="${PROJECTS}/rune-client-cpp"
@@ -50,6 +58,9 @@ repo_tag() {
     if [ -e "${d}/.git" ]; then git -C "${d}" rev-parse --short HEAD; return; fi
     (cd "${d}" && find . -type f -not -path './.catalog-e2e-work/*' -print0 | LC_ALL=C sort -z | xargs -0 cat | sha256_stdin) | cut -c1-12
 }
+export RUNE_AUTH_WORK_DIR="${WORK_DIR}"   # the client container's /work is also where the passwords live
+export RUNE_AUTH_TOOLS="${TOOLS}"   # the CLI runs inside the long-lived client container
+rune_auth_init
 export RUNE_IMAGE_TAG="$(repo_tag "${BROKER_REPO}")-catalog-e2e"
 export QL_IMAGE="rune-ql-probe:$(repo_tag "${CLIENT_REPO}")"
 
@@ -78,6 +89,7 @@ teardown() {
     dc a down -v --remove-orphans >/dev/null 2>&1 || true
     dc b down -v --remove-orphans >/dev/null 2>&1 || true
     rm -rf "${WORK_DIR}" 2>/dev/null || true
+    rune_auth_cleanup
     return "${rc}"
 }
 trap teardown EXIT
@@ -109,6 +121,8 @@ await_cluster() {
     local c="$1"
     wait_until "${LEADER_WAIT_S}" "consensus leader of cluster ${c}" cluster_has_leader "${c}" \
         || { for n in 1 2 3; do docker logs --tail 40 "${c}-rune-${n}" >&2 || true; done; fail "cluster ${c}: no common consensus leader within ${LEADER_WAIT_S}s"; }
+    log "cluster ${c}: bootstrapping the first admin + the e2e user..."
+    rune_auth_prepare "catalog-${c}_default" "${c}-rune-1:${BROKER_PORT}" || fail "cluster ${c}: bootstrap / e2e user"
     wait_until "${LEADER_WAIT_S}" "show history on cluster ${c}" history_answers "${c}" \
         || fail "cluster ${c}: 'show history;' never succeeded against ${c}-rune-1 within ${LEADER_WAIT_S}s"
     log "cluster ${c}: consensus leader elected, catalog answering"
@@ -151,7 +165,8 @@ log "Step 1c: starting the client container; building view_probe + rune_produce_
 docker rm -f "${TOOLS}" >/dev/null 2>&1 || true
 docker run -d --name "${TOOLS}" --hostname "${TOOLS}" --platform linux/amd64 --shm-size=256m \
     --security-opt seccomp=unconfined \
-    -v "${WORK_DIR}:/work" -v "${SCRIPT_DIR}/topics:/topics:ro" \
+    -v "${WORK_DIR}:/work" -v "${SCRIPT_DIR}/topics:/topics:ro" -v "${RUNE_SECRETS_DIR}:/run/secrets:ro" \
+    -e RUNE_USER="${RUNE_AUTH_E2E_USER}" -e RUNE_PASSWORD_FILE=/work/e2e.pw \
     "${QL_IMAGE}" sleep infinity >/dev/null || fail "could not start the client container"
 set +e
 out=$(tx cmake --build /build/build --target view_probe rune_produce_subscribe -j2 2>&1); rc=$?
@@ -162,7 +177,8 @@ tx test -x /build/build/view_probe && tx test -x /build/build/rune_produce_subsc
 # ---------------------------------------------------------------------------
 # Step 2: cluster a up.
 # ---------------------------------------------------------------------------
-log "Step 2: cluster a up..."
+log "Step 2: generating the cluster key; cluster a up..."
+rune_gen_cluster_key "${RUNE_SECRETS_DIR}" || fail "could not generate the cluster key"
 dc a up -d --no-build rune-1 rune-2 rune-3
 docker network connect catalog-a_default "${TOOLS}" || fail "could not attach the client container to catalog-a_default"
 TOOLS_IP_A="$(tools_ip a)"; [ -n "${TOOLS_IP_A}" ] || fail "no IP for ${TOOLS} on catalog-a_default"

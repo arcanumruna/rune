@@ -82,8 +82,16 @@ services:
       # RUNTIME by the probe via defineTopic() (the whole point of Task 13).
       # io_uring portability under Rosetta amd64 emulation (see docker-compose.yml).
       RUNE_IO_BACKEND: "portable"
+      # Authentication stays ON for a single node (RUNE_AUTH=disabled is the explicit dev-only opt-out).
+      RUNE_CLUSTER_KEY_FILE: /run/secrets/cluster.key
     volumes:
       - rune-data-1:/var/lib/rune
+      - type: bind
+        source: ${RUNE_SECRETS_DIR:-./secrets}/cluster.key
+        target: /run/secrets/cluster.key
+        read_only: true
+        bind:
+          create_host_path: false   # a missing key file fails the start; never a directory
     healthcheck:
       test: ["CMD", "pgrep", "-x", "rune_broker"]
       interval: 5s

@@ -3564,8 +3564,10 @@ int64_t BrokerNode::foundingShortDwellNs() const noexcept {
 }
 int64_t BrokerNode::foundingLongDwellNs() const noexcept {
     const int64_t status = config_.electionStatusIntervalMs * 1'000'000LL;
-    return std::max({3 * status, config_.electionTimeoutMs * 1'000'000LL + status,
-                     PeerResolverHub::kRecheckNs + PeerResolverHub::kPendingMaxNs + 500'000'000LL});
+    // std::max<int64_t>: on Linux int64_t is `long` and the `LL` literals are `long long` - a bare initializer_list of
+    // them does not deduce (gcc 13 in docker/Dockerfile rejected it; Apple clang's int64_t is `long long`).
+    return std::max<int64_t>({3 * status, config_.electionTimeoutMs * 1'000'000LL + status,
+                              PeerResolverHub::kRecheckNs + PeerResolverHub::kPendingMaxNs + 500'000'000LL});
 }
 bool BrokerNode::abstainGateThunk_(void* self) noexcept {
     auto* n = static_cast<BrokerNode*>(self);

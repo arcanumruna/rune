@@ -14,6 +14,15 @@ disaster is never one test — it is a MATRIX across node × count × timing ×
 intensity × client-state × data-state × repetition × recovery. DR-2..15 declare
 dozens-to-hundreds of cases per fault type in one line.
 
+## Authentication
+
+The brokers run with authentication ON, so the harness (`harness/auth.py`) keeps a per-process temp directory with a
+cluster key (`rune security gen-cluster-key`, mounted by the compose file through `RUNE_SECRETS_DIR`) and the passwords.
+`Cluster.up()` bootstraps every fresh cluster (first admin, its password change, an `e2e` role + user holding every
+data-plane grant) before it creates the topics; `create_topics`, `Cluster.ql` and every client container the driver starts
+log in as that user (`RUNE_USER` / `RUNE_PASSWORD_FILE`).  Nothing is written outside the temp directory, which is removed
+at exit.  A test that wipes a node's volume and restarts a brand-new cluster must call `auth.bootstrap` again.
+
 ## Layout
 
 ```

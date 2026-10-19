@@ -1,0 +1,23 @@
+-- docker/topics/auth-e2e.rql: the topics, the role, the user and the grants of docker/auth-e2e.sh (step 3), run as the
+-- bootstrap admin through rune-2.  Ids in creation order: world_zone1 = 0, player_events = 1, world_rot = 2.
+--   world_zone1   typed (id is its key)
+--   player_events plain
+--   world_rot     plain; carries only the cluster-key rotation's producer / consumer pair (step 6), so its record
+--                 numbers cannot be confused with the 10 000 records of step 4
+-- ws1 (the world-server-style client) may READ player_events, WRITE + READ every world_* topic, and join any group
+-- named world-*.  It holds NO write grant on player_events: that produce must fail NotAuthorized.
+-- Topic names are identifiers (letters, digits, underscore), so the "world." family of the spec's example is world_*.
+-- The script replaces __WS1_PASSWORD__ with a generated password (a statement carrying a password literal is
+-- always read from a file; the CLI refuses one on the command line).
+-- ADMIN ON CLUSTER is the security admin only and implies no data access (D16): the admin grants itself CREATE to make the topics.
+GRANT CREATE ON CLUSTER TO USER admin;
+topic world_zone1 { id int64, hp int64 } partitions 1 replicas 3 key id;
+topic player_events partitions 1 replicas 3;
+topic world_rot partitions 1 replicas 3;
+CREATE ROLE world_server;
+GRANT READ ON TOPIC player_events TO ROLE world_server;
+GRANT WRITE ON TOPIC PREFIX 'world_' TO ROLE world_server;
+GRANT READ ON TOPIC PREFIX 'world_' TO ROLE world_server;
+GRANT READ ON GROUP PREFIX 'world-' TO ROLE world_server;
+CREATE USER ws1 WITH PASSWORD '__WS1_PASSWORD__';
+GRANT ROLE world_server TO USER ws1;

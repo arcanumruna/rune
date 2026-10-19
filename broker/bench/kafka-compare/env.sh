@@ -31,6 +31,15 @@ data_root() {
   echo "$base/$2"
 }
 
+# ---- authentication (the benchmarks run authenticated, as production does) -------------------------------
+# Every Rune broker has authentication ON (a cluster key file is mandatory): rune_start_broker / rune_start_cluster
+# generate a cluster key, bootstrap the first admin and create the `bench` user (lib.sh: rune_bench_auth_*).  The CLI and
+# the throughput clients log in as that user - RUNE_USER / RUNE_PASSWORD_FILE are read by all of them.
+: "${RUNE_BENCH_AUTH_DIR:=$WORK/auth}"
+: "${RUNE_USER:=bench}"
+: "${RUNE_PASSWORD_FILE:=$RUNE_BENCH_AUTH_DIR/bench.pw}"
+export RUNE_BENCH_AUTH_DIR RUNE_USER RUNE_PASSWORD_FILE
+
 # ---- core pinning (empty = no taskset; set on ccx43) ----------------------
 : "${CORES_BROKER:=}"                        # e.g. "0-7"
 : "${CORES_CLIENT:=}"                        # e.g. "8-11"

@@ -44,6 +44,8 @@ x-broker-env: &broker-env
   # Followers use clientPort to redirect Produce/Subscribe to the leader endpoint.
   RUNE_PEERS: "0@${CLUSTER}-rune-1:40111:40200:40222,1@${CLUSTER}-rune-2:40111:40200:40222,2@${CLUSTER}-rune-3:40111:40200:40222"
   RUNE_DATA_DIR: /var/lib/rune
+  # dev: auto-format empty volumes (a broker refuses to start on an unformatted data dir otherwise)
+  RUNE_STORAGE_FORMAT: "${RUNE_STORAGE_FORMAT:-auto}"
   # Client gateway listens on all interfaces inside the container.
   # RUNE_CLIENT_ENDPOINT is the raw "host:port" appended to "aeron:udp?endpoint=".
   RUNE_CLIENT_ENDPOINT: "0.0.0.0:40200"
@@ -77,6 +79,10 @@ x-broker-env: &broker-env
   # where io_uring IS available, this variable is still safe — tier-2 (Strict)
   # produces simply see the same back-pressure they would get with a full ring.
   RUNE_IO_BACKEND: "portable"
+  # Authentication is ON by default: every node needs the SAME cluster key file (`rune security gen-cluster-key
+  # --out docker/secrets/cluster.key`), mounted read-only at /run/secrets/cluster.key.  RUNE_SECRETS_DIR moves
+  # the directory (the e2e launchers generate a per-run one).  Without the file the broker refuses to start.
+  RUNE_CLUSTER_KEY_FILE: /run/secrets/cluster.key
   # The __catalog replication stream (default 30; the same on every node, outside the per-worker range).
   RUNE_CATALOG_REPL_STREAM_ID: "${RUNE_CATALOG_REPL_STREAM_ID:-30}"
 
@@ -101,6 +107,12 @@ services:
       RUNE_NODE_ID: "0"
     volumes:
       - rune-data-1:/var/lib/rune
+      - type: bind
+        source: ${RUNE_SECRETS_DIR:-./secrets}/cluster.key
+        target: /run/secrets/cluster.key
+        read_only: true
+        bind:
+          create_host_path: false   # a missing key file fails the start; never a directory
     healthcheck:
       test: ["CMD", "pgrep", "-x", "rune_broker"]
       interval: 5s
@@ -128,6 +140,12 @@ services:
       RUNE_NODE_ID: "1"
     volumes:
       - rune-data-2:/var/lib/rune
+      - type: bind
+        source: ${RUNE_SECRETS_DIR:-./secrets}/cluster.key
+        target: /run/secrets/cluster.key
+        read_only: true
+        bind:
+          create_host_path: false   # a missing key file fails the start; never a directory
     healthcheck:
       test: ["CMD", "pgrep", "-x", "rune_broker"]
       interval: 5s
@@ -155,6 +173,12 @@ services:
       RUNE_NODE_ID: "2"
     volumes:
       - rune-data-3:/var/lib/rune
+      - type: bind
+        source: ${RUNE_SECRETS_DIR:-./secrets}/cluster.key
+        target: /run/secrets/cluster.key
+        read_only: true
+        bind:
+          create_host_path: false   # a missing key file fails the start; never a directory
     healthcheck:
       test: ["CMD", "pgrep", "-x", "rune_broker"]
       interval: 5s

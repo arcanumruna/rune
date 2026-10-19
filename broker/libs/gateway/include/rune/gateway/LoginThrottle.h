@@ -17,10 +17,17 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <string_view>
 #include <vector>
 
 namespace rune::gateway {
+
+/// The throttle's source host from an Aeron image's `sourceIdentity()` ("1.2.3.4:5678", "[::1]:5678"); "" for an IPC image
+/// ("aeron:ipc...") or an empty identity (the caller then falls back to the client's reply endpoint host).  Returns an
+/// OWNED string: `Image::sourceIdentity()` returns a std::string BY VALUE, so a std::string_view bound to it dangles - this
+/// takes the view only for the duration of the call (a temporary lives to the end of the full expression) and copies out.
+[[nodiscard]] std::string hostOfSourceIdentity(std::string_view identity);
 
 class LoginThrottle {
 public:

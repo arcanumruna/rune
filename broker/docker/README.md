@@ -47,6 +47,25 @@ transiently; the first build is therefore slow but fully self-contained).
 
 ---
 
+## Authentication (on by default)
+
+A broker refuses to start without a cluster key file, and every client logs in. The compose files mount
+`./secrets/cluster.key` (or `$RUNE_SECRETS_DIR/cluster.key`) read-only at `/run/secrets/cluster.key` and set
+`RUNE_CLUSTER_KEY_FILE`; `entrypoint.sh` refuses a missing file with the broker's own message and never generates a key.
+Make one, then bootstrap the first admin once the cluster has a leader:
+
+```sh
+rune security gen-cluster-key --out docker/secrets/cluster.key      # mode 0600, never overwritten
+rune security bootstrap --admin admin --cluster-key-file docker/secrets/cluster.key --broker rune-1:40200
+```
+
+The e2e launchers (`e2e.sh`, `schema-e2e.sh`, `schema-evolution-e2e.sh`, `view-engine-e2e.sh`, `transient-failover-e2e.sh`,
+`catalog-e2e.sh`) do both through `docker/lib/auth.sh` (`rune_gen_cluster_key`, `rune_bootstrap`, `rune_create_e2e_user`,
+`rune_auth_prepare`), create an `e2e` role/user, and pass `RUNE_USER` / `RUNE_PASSWORD_FILE` to every probe container.
+`docker/auth-e2e.sh` is the authentication e2e itself (3 nodes, `docker-compose.auth.yml`): bootstrap, a role + user + grants,
+a world-server-style client producing and consuming 10 000 records, revoke -> explicit failure, and the cluster-key rotation
+across a rolling restart. Reference: [../docs/SECURITY.md](../docs/SECURITY.md).
+
 ## Environment variables
 
 All config is read by `src/main.cpp` (`parseNodeConfigFromEnv`).
@@ -54,6 +73,7 @@ All config is read by `src/main.cpp` (`parseNodeConfigFromEnv`).
 | Variable                        | Required | Default     | Description                                      |
 |---------------------------------|----------|-------------|--------------------------------------------------|
 | `RUNE_NODE_ID`                  | yes      | —           | Integer node ID (0-based)                        |
+| `RUNE_CLUSTER_KEY_FILE`         | yes (auth on, the default) | — | Shared cluster key file; the broker refuses to start without it. `RUNE_AUTH=disabled` is single-node development only |
 | `RUNE_PEERS`                    | yes      | —           | Comma-separated `id@host:port` list (all nodes)  |
 | `RUNE_CLIENT_ENDPOINT`          | yes      | —           | Aeron UDP endpoint for clients, e.g. `aeron:udp?endpoint=0.0.0.0:40200` |
 | `RUNE_CLIENT_STREAM_ID`         | no       | `1`         | Aeron stream ID for client traffic               |

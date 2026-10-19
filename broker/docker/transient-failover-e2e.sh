@@ -53,9 +53,15 @@
 #
 # Bounded waits everywhere, clean teardown (compose down -v) even on failure.
 
+# Authentication (Task 20): every cluster runs with authentication ON.  One cluster key is generated per script run;
+# each variant starts a FRESH cluster, which create_topics() bootstraps (first admin + the e2e user) before the
+# topics are created, and the probes log in as that user (RUNE_USER / RUNE_PASSWORD_FILE).
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/auth.sh
+. "${SCRIPT_DIR}/lib/auth.sh"
 BROKER_REPO="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PROJECTS="$(cd "${BROKER_REPO}/.." && pwd)"
 CLIENT_REPO="${PROJECTS}/rune-client-cpp"
@@ -101,8 +107,13 @@ dc()   { docker compose -p "${COMPOSE_PROJECT}" -f "${COMPOSE_FILE}" "$@"; }
 
 # The brokers boot with an empty catalog: create the topics by DDL once a consensus leader is up and
 # before any producer.  Aborts the script when the creation fails.
-create_topics() { COMPOSE_NETWORK="${BROKER_NETWORK}" bash "${SCRIPT_DIR}/create-topics.sh" transient-failover \
-                      || fail "create-topics.sh transient-failover failed"; }
+create_topics() {
+    rune_auth_prepare "${BROKER_NETWORK}" "rune-1:40200" || fail "bootstrap / e2e user"
+    COMPOSE_NETWORK="${BROKER_NETWORK}" bash "${SCRIPT_DIR}/create-topics.sh" transient-failover \
+        || fail "create-topics.sh transient-failover failed"
+}
+rune_auth_init   # RUNE_SECRETS_DIR (the compose mount of the cluster key) + RUNE_AUTH_WORK_DIR (passwords)
+read -r -a AUTH_ARGS <<< "$(rune_auth_probe_args)"
 
 [ -d "${PROJECTS}/rune-protocol" ] || fail "missing ../rune-protocol"
 [ -d "${PROJECTS}/rune-codec" ]    || fail "missing ../rune-codec"
@@ -122,7 +133,8 @@ teardown() {
     docker rm -f "${PROBE_NAME}" >/dev/null 2>&1 || true
     dc down -v --remove-orphans >/dev/null 2>&1 || true
 }
-trap teardown EXIT
+# The key + passwords outlive the per-variant teardown() (each variant is a fresh cluster on the same key).
+trap 'teardown; rune_auth_cleanup' EXIT
 
 node_id_to_service() {
     case "$1" in
@@ -147,6 +159,7 @@ docker image inspect "rune-broker-node:${RUNE_IMAGE_TAG}" >/dev/null 2>&1 \
     || fail "broker image not built: rune-broker-node:${RUNE_IMAGE_TAG}"
 
 bash "${SCRIPT_DIR}/create-topics.sh" --build-image || fail "could not build the rune CLI image"
+rune_gen_cluster_key "${RUNE_SECRETS_DIR}" || fail "could not generate the cluster key"
 
 log "Step 1b: Building the client probe image (${CLIENT_IMAGE})..."
 set +e
@@ -244,6 +257,7 @@ run_variant() {
         -e RUNE_TIMEOUT_MS="${PROBE_TIMEOUT_MS}" \
         -e RUNE_WAIT_BOUND_MS="${WAIT_BOUND_MS}" \
         -e RUNE_MOVE_BOUND_MS="${MOVE_BOUND_MS}" \
+        "${AUTH_ARGS[@]}" \
         -e RUNE_EXPECT_LEADER_CHANGE="$([ "${RESTART_DURING_MOVE:-0}" = 1 ] && echo 0 || echo 1)" \
         "${CLIENT_IMAGE}" >/dev/null
 
@@ -263,14 +277,17 @@ run_variant() {
     leader_svc=$(node_id_to_service "${leader_id}")
     log "presence_failover partition 0 is led by node ${leader_id} (${leader_svc}); consensus leader node ${consensus_leader}"
     # The variant's client path really happened (gateway debug log of the seed).
+    # NB: `echo "${big}" | grep -q` under `set -o pipefail` is a race - grep -q exits at the first match, echo of a log
+    # larger than the 64 KiB pipe buffer then dies of SIGPIPE and the pipeline reports 141 (a false "never redirected").
+    # The logs grew past 64 KiB with authentication (login / peer-link / security lines): here-strings, no pipe.
     local seed_log
     seed_log="$(dc logs --no-log-prefix "${seed_svc}" 2>/dev/null || true)"
     if [ "${seed_svc}" = "${leader_svc}" ]; then
-        if echo "${seed_log}" | grep -q "Subscribe per-partition redirect (topicId=${TOPIC_ID} part=0"; then
+        if grep -q "Subscribe per-partition redirect (topicId=${TOPIC_ID} part=0" <<<"${seed_log}"; then
             fail "[${label}] the seed is the leader but redirected the Subscribe"
         fi
     else
-        echo "${seed_log}" | grep -q "Subscribe per-partition redirect (topicId=${TOPIC_ID} part=0 leader=${EXPECTED_LEADER}" \
+        grep -q "Subscribe per-partition redirect (topicId=${TOPIC_ID} part=0 leader=${EXPECTED_LEADER}" <<<"${seed_log}" \
             || fail "[${label}] the seed ${seed_svc} never redirected the Subscribe to node ${EXPECTED_LEADER}"
         log "  seed ${seed_svc} redirected the Subscribe to node ${EXPECTED_LEADER} (the seed session followed it)"
     fi
@@ -282,7 +299,7 @@ run_variant() {
     dc stop -t "${STOP_TIMEOUT_S}" "${leader_svc}"
     log "${leader_svc} stopped after $(( $(date +%s) - t_stop ))s"
     stopped_log="$(dc logs --no-log-prefix "${leader_svc}" 2>/dev/null || true)"
-    echo "${stopped_log}" | grep -q "controlled shutdown — handing partition leadership off" \
+    grep -q "controlled shutdown — handing partition leadership off" <<<"${stopped_log}" \
         || { echo "${stopped_log}" | tail -60 >&2; fail "[${label}] ${leader_svc} did not run a controlled shutdown"; }
     shutdown_line="$(echo "${stopped_log}" | grep -E "controlled shutdown (complete|budget)" | tail -1 || true)"
     log "  ${shutdown_line:-<no completion line>}"
@@ -351,6 +368,7 @@ run_group_probe() {
         -e RUNE_EGRESS="aeron:udp?endpoint=${PROBE_NAME}:${PROBE_EGRESS_PORT}" -e RUNE_EGRESS_STREAM=2 \
         -e RUNE_DATA_DIR="/tmp/rune_tt_group" \
         -e RUNE_TIMEOUT_MS="${PROBE_TIMEOUT_MS}" -e RUNE_WAIT_BOUND_MS="${WAIT_BOUND_MS}" \
+        "${AUTH_ARGS[@]}" \
         "$@" "${CLIENT_IMAGE}" 2>&1
 }
 run_full_restart_group() {

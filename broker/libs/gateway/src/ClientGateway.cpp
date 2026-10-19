@@ -7651,12 +7651,10 @@ std::string ClientGateway::sourceHostOf_(std::string_view egressChannel) const
     // gateway has no subscription: fall back to the host of the client's reply endpoint.
     if (sub_ != nullptr && currentImageSessionId_ != 0) {
         if (const auto image = sub_->imageBySessionId(currentImageSessionId_)) {
-            std::string_view id = image->sourceIdentity();
-            if (!id.empty() && id.rfind("aeron:", 0) != 0) {
-                if (const auto colon = id.rfind(':'); colon != std::string_view::npos) id = id.substr(0, colon);
-                if (id.size() > 2 && id.front() == '[' && id.back() == ']') id = id.substr(1, id.size() - 2);
-                if (!id.empty()) return std::string(id);
-            }
+            // Image::sourceIdentity() returns a std::string BY VALUE: never bind a string_view to it (it dangled - the
+            // throttle keys and the login log lines carried freed memory); hostOfSourceIdentity copies out.
+            std::string host = rune::gateway::hostOfSourceIdentity(image->sourceIdentity());
+            if (!host.empty()) return host;
         }
     }
     return std::string(rune::consensus::PeerHostTable::endpointHost(egressChannel));

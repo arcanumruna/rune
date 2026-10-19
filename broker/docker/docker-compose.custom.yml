@@ -37,6 +37,8 @@ services:
       RUNE_DATA_DIR: /var/lib/rune
       # Empty: an empty data dir refuses to start (format it first: see rune-cluster.env.example).
       RUNE_STORAGE_FORMAT: "${RUNE_STORAGE_FORMAT:-}"
+      # Authentication is ON by default: the same cluster key file on every node (see CLUSTER_KEY_FILE).
+      RUNE_CLUSTER_KEY_FILE: /run/secrets/cluster.key
       # Container /dev/shm budget: 48 MiB per log at the 16 MiB default term.
       RUNE_AERON_TERM_BUFFER_BYTES: "${RUNE_AERON_TERM_BUFFER_BYTES:-4194304}"
       # --- optional (defaults shown) ---
@@ -47,6 +49,12 @@ services:
       RUNE_STARTUP_CANVASS_TIMEOUT_MS: "${RUNE_STARTUP_CANVASS_TIMEOUT_MS:-100}"
     volumes:
       - ${DATA_DIR_1:-./rune-data/node0}:/var/lib/rune
+      - type: bind
+        source: ${CLUSTER_KEY_FILE:-./secrets/cluster.key}
+        target: /run/secrets/cluster.key
+        read_only: true
+        bind:
+          create_host_path: false   # a missing key file fails the start; never a directory
     ports:
       - "${CLIENT_HOST_PORT_1:-40201}:${CLIENT_PORT:-40200}/udp"
     healthcheck:
@@ -74,6 +82,8 @@ services:
       RUNE_DATA_DIR: /var/lib/rune
       # Empty: an empty data dir refuses to start (format it first: see rune-cluster.env.example).
       RUNE_STORAGE_FORMAT: "${RUNE_STORAGE_FORMAT:-}"
+      # Authentication is ON by default: the same cluster key file on every node (see CLUSTER_KEY_FILE).
+      RUNE_CLUSTER_KEY_FILE: /run/secrets/cluster.key
       RUNE_CLIENT_STREAM_ID: "${RUNE_CLIENT_STREAM_ID:-1}"
       RUNE_CONSENSUS_STREAM_ID: "${RUNE_CONSENSUS_STREAM_ID:-10}"
       RUNE_ELECTION_TIMEOUT_MS: "${RUNE_ELECTION_TIMEOUT_MS:-150}"
@@ -81,6 +91,12 @@ services:
       RUNE_STARTUP_CANVASS_TIMEOUT_MS: "${RUNE_STARTUP_CANVASS_TIMEOUT_MS:-100}"
     volumes:
       - ${DATA_DIR_2:-./rune-data/node1}:/var/lib/rune
+      - type: bind
+        source: ${CLUSTER_KEY_FILE:-./secrets/cluster.key}
+        target: /run/secrets/cluster.key
+        read_only: true
+        bind:
+          create_host_path: false   # a missing key file fails the start; never a directory
     ports:
       - "${CLIENT_HOST_PORT_2:-40202}:${CLIENT_PORT:-40200}/udp"
     healthcheck:
@@ -108,6 +124,8 @@ services:
       RUNE_DATA_DIR: /var/lib/rune
       # Empty: an empty data dir refuses to start (format it first: see rune-cluster.env.example).
       RUNE_STORAGE_FORMAT: "${RUNE_STORAGE_FORMAT:-}"
+      # Authentication is ON by default: the same cluster key file on every node (see CLUSTER_KEY_FILE).
+      RUNE_CLUSTER_KEY_FILE: /run/secrets/cluster.key
       RUNE_CLIENT_STREAM_ID: "${RUNE_CLIENT_STREAM_ID:-1}"
       RUNE_CONSENSUS_STREAM_ID: "${RUNE_CONSENSUS_STREAM_ID:-10}"
       RUNE_ELECTION_TIMEOUT_MS: "${RUNE_ELECTION_TIMEOUT_MS:-150}"
@@ -115,6 +133,12 @@ services:
       RUNE_STARTUP_CANVASS_TIMEOUT_MS: "${RUNE_STARTUP_CANVASS_TIMEOUT_MS:-100}"
     volumes:
       - ${DATA_DIR_3:-./rune-data/node2}:/var/lib/rune
+      - type: bind
+        source: ${CLUSTER_KEY_FILE:-./secrets/cluster.key}
+        target: /run/secrets/cluster.key
+        read_only: true
+        bind:
+          create_host_path: false   # a missing key file fails the start; never a directory
     ports:
       - "${CLIENT_HOST_PORT_3:-40203}:${CLIENT_PORT:-40200}/udp"
     healthcheck:

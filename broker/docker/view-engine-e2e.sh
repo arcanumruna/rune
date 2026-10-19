@@ -74,9 +74,16 @@
 #   - Bounded waits, hard caps, clean teardown even on failure.
 #   - NEVER a fixed sleep as a correctness gate — poll to a deadline.
 
+# Authentication (Task 20): the broker runs with authentication ON.  The script generates a cluster key before `up`
+# (docker/lib/auth.sh), bootstraps the first admin and creates the e2e user once the node leads, and every probe
+# container logs in as that user (RUNE_USER / RUNE_PASSWORD_FILE).  The security state lives in the named volume,
+# so it survives the restart leg.
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/auth.sh
+. "${SCRIPT_DIR}/lib/auth.sh"
 BROKER_REPO="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PROJECTS="$(cd "${BROKER_REPO}/.." && pwd)"
 CLIENT_REPO="${PROJECTS}/rune-client-cpp"
@@ -138,12 +145,18 @@ fail() { echo "[view-engine-e2e] FAIL: $*" >&2; exit 1; }
 # Teardown — always runs.
 # ---------------------------------------------------------------------------
 teardown() {
+    if [ -n "${E2E_LOG_DIR:-}" ]; then   # keep the evidence (the broker's log) before the stack goes
+        mkdir -p "${E2E_LOG_DIR}"
+        docker compose -p "${COMPOSE_PROJECT}" -f "${COMPOSE_FILE}" logs --no-color --timestamps rune-1 > "${E2E_LOG_DIR}/view-engine-broker.log" 2>&1 || true
+    fi
     log "Tearing down (compose down -v + client rm)..."
     docker rm -f "${CLIENT_HOSTNAME}" 2>/dev/null || true
     docker rm -f rune-ddl-race-a rune-ddl-race-b 2>/dev/null || true
     [ -n "${RACE_DIR:-}" ] && rm -rf "${RACE_DIR}" || true
     docker compose -p "${COMPOSE_PROJECT}" -f "${COMPOSE_FILE}" down -v --remove-orphans 2>/dev/null || true
+    rune_auth_cleanup
 }
+rune_auth_init   # RUNE_SECRETS_DIR (the compose mount of the cluster key) + RUNE_AUTH_WORK_DIR (passwords)
 trap teardown EXIT
 
 # ---------------------------------------------------------------------------
@@ -206,6 +219,10 @@ log "Build complete."
 # ---------------------------------------------------------------------------
 # Step 2: Start the single broker node.
 # ---------------------------------------------------------------------------
+log "Step 1c: building the rune CLI image + generating the cluster key..."
+bash "${SCRIPT_DIR}/create-topics.sh" --build-image || fail "could not build the rune CLI image"
+rune_gen_cluster_key "${RUNE_SECRETS_DIR}" || fail "could not generate the cluster key"
+
 log "Step 2: Starting single broker node rune-1..."
 docker compose -p "${COMPOSE_PROJECT}" -f "${COMPOSE_FILE}" up -d rune-1
 
@@ -244,6 +261,10 @@ log "Step 3: Awaiting leader (up to ${LEADER_WAIT_S}s)..."
 leader1="$(await_leader 0)" || fail "Timed out (${LEADER_WAIT_S}s) waiting for initial leader"
 log "Leader elected: ${leader1}"
 
+log "Step 3a: bootstrapping the cluster + the e2e user..."
+rune_auth_prepare "${BROKER_NETWORK}" "rune-1:40200" || fail "bootstrap / e2e user"
+read -r -a AUTH_ARGS <<< "$(rune_auth_probe_args)"
+
 # ---------------------------------------------------------------------------
 # Step 4: RUN 1 (RUNE_MODE=setup) — define/createView x2/produce/getViewRow.
 # ---------------------------------------------------------------------------
@@ -268,6 +289,7 @@ run_client() {
         -e RUNE_DATA_DIR="/tmp/rune_view_probe" \
         -e RUNE_TIMEOUT_MS="${PROBE_TIMEOUT_MS}" \
         -e RUNE_WAIT_BOUND_MS="${WAIT_BOUND_MS}" \
+        "${AUTH_ARGS[@]}" \
         "$@" \
         "${CLIENT_IMAGE}"
 }
@@ -379,6 +401,7 @@ start_race_client() {
         -e RUNE_EGRESS="aeron:udp?endpoint=${host}:${CLIENT_EGRESS_PORT}" -e RUNE_EGRESS_STREAM=2 \
         -e RUNE_DATA_DIR="/tmp/rune_view_probe" \
         -e RUNE_TIMEOUT_MS="${PROBE_TIMEOUT_MS}" -e RUNE_WAIT_BOUND_MS="${WAIT_BOUND_MS}" \
+        "${AUTH_ARGS[@]}" \
         "${CLIENT_IMAGE}" >/dev/null
 }
 await_race_ready() {
@@ -535,7 +558,7 @@ log "Catalog identical after restart ($(echo "${catalog_after}" | wc -l | tr -d 
 # ---------------------------------------------------------------------------
 log "Step 8: Checking broker logs for user_totals' v2 checkpoint recovery..."
 recovered_lines="$(docker compose -p "${COMPOSE_PROJECT}" -f "${COMPOSE_FILE}" logs --no-log-prefix rune-1 2>/dev/null \
-    | grep -oE "VIEW-RECOVERED view=${VIEW_TOPIC_ID_AGG} partition=[0-9]+ O=-?[0-9]+ records=[0-9]+ format=v[12]" || true)"
+    | grep -aoE "VIEW-RECOVERED view=${VIEW_TOPIC_ID_AGG} partition=[0-9]+ O=-?[0-9]+ records=[0-9]+ format=v[12]" || true)"
 echo "----- VIEW-RECOVERED (user_totals) -----" >&2
 echo "${recovered_lines:-<none>}" >&2
 echo "----------------------------------------" >&2
