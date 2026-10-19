@@ -7909,7 +7909,7 @@ std::optional<rune::gateway::Denial> ClientGateway::authorizeViewSources_(const 
     const auto ids = rune::view::planSourceTopicIds(std::span<const uint8_t>(blob, len));
     if (!ids) return std::nullopt;
     for (const int32_t id : *ids)
-        if (auto d = rune::gateway::authorizeTopicId(perms, id, rune::security::Operation::Read, objectIndex_)) return d;
+        if (auto d = rune::gateway::authorizeViewSource(perms, id)) return d;   // no D22 pass-through for sources
     return std::nullopt;
 }
 

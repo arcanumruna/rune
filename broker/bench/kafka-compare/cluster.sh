@@ -83,13 +83,11 @@ rune_start_cluster() {
     local pinprefix; pinprefix="$(pin "$CORES_BROKER")"
     [ "${RUNE_SHARD:-0}" = "1" ] && pinprefix=""
     # Legacy (RUNE_WORKER_MODE=legacy) keeps its pre-2026-10-02 harness wiring:
-    # per-worker ingress/egress planes on, a fixed egress-control base per node.
+    # a fixed egress-control base per node (no per-worker ingress/egress: authentication refuses them outside shard mode).
     # Shard mode derives the base per node id unless RUNE_SHARD=1 sets the layout.
     local eg=""
     if [ "${RUNE_WORKER_MODE:-}" = "legacy" ]; then
       eg="RUNE_WORKER_EGRESS_CONTROL_BASE_PORT=$((40400+i*20))"
-      [ -z "${RUNE_PER_WORKER_INGRESS:-}" ] && eg="$eg RUNE_PER_WORKER_INGRESS=true"
-      [ -z "${RUNE_PER_WORKER_EGRESS:-}" ] && eg="$eg RUNE_PER_WORKER_EGRESS=true"
     fi
     # A taskset prefix owns placement: never let the broker auto-pin past it.
     [ -n "$pinprefix" ] && [ -z "${RUNE_WORKER_CORE_BASE:-}" ] && eg="$eg RUNE_WORKER_CORE_BASE=-1"

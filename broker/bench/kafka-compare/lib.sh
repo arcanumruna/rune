@@ -145,6 +145,8 @@ rune_start_broker() {
   local workers="$1" topics="$2" io="${3:-uring}" persistence="${4:-nvme}"
   local logdir; logdir="$(data_root "$persistence" rune-log)"
   local d="$WORK/rune"; rm -rf "$d" "$logdir"; mkdir -p "$d/a" "$logdir"
+  # Authentication refuses per-worker ingress/egress outside shard mode (validateAuthTopology): shard (the broker
+  # default) is the harness default, and the per-worker flags are not set.
   rune_bench_auth_key || return 1   # authentication is ON: the broker needs a cluster key file
   pkill -9 -f "$RUNE_BROKER_BIN" 2>/dev/null; sleep 0.4
   log "rune broker: workers=$workers topics='$topics' io=$io"
@@ -153,12 +155,11 @@ rune_start_broker() {
       RUNE_NODE_ID=1 RUNE_STORAGE_FORMAT=new RUNE_PEERS="1@127.0.0.1:${RUNE_CONSENSUS_PORT}:${RUNE_CLIENT_PORT}" \
       RUNE_CLIENT_ENDPOINT="0.0.0.0:${RUNE_CLIENT_PORT}" \
       RUNE_DATA_DIR="$logdir" RUNE_AERON_DIR="$d/a" RUNE_WORKERS="$workers" \
-      RUNE_PER_WORKER_INGRESS=true RUNE_PER_WORKER_EGRESS=true \
       RUNE_IO_BACKEND="$io" RUNE_AERON_TERM_BUFFER_BYTES=33554432 \
       RUNE_WORKER_INGRESS_RING_BYTES=33554432 RUNE_WORKER_RETURN_RING_BYTES=33554432 \
       RUNE_WORKER_EGRESS_CONTROL_BASE_PORT="$RUNE_WORKER_EGRESS_BASE" \
       RUNE_WORKER_IDLE="${RUNE_WORKER_IDLE:-backoff}" RUNE_RUNTIME_IDLE="${RUNE_RUNTIME_IDLE:-backoff}" \
-      RUNE_WORKER_MODE="${RUNE_WORKER_MODE:-legacy}" RUNE_RUNTIME_PLACEMENT="${RUNE_RUNTIME_PLACEMENT:-thread}" \
+      RUNE_WORKER_MODE="${RUNE_WORKER_MODE:-shard}" RUNE_RUNTIME_PLACEMENT="${RUNE_RUNTIME_PLACEMENT:-fused}" \
       RUNE_WORKER_CORE_BASE="${RUNE_WORKER_CORE_BASE:--1}" RUNE_LOG_LEVEL=info \
       $(pin "$CORES_BROKER") "$RUNE_BROKER_BIN" >"$d/broker.log" 2>&1 &
   RUNE_BPID=$!

@@ -26,6 +26,10 @@ struct Denial {
 [[nodiscard]] std::optional<Denial> authorizeTopicId(const PermissionTable&, int32_t topicId, rune::security::Operation,
                                                      const ObjectIndex&,
                                                      rune::security::ResourceType shownType = rune::security::ResourceType::Topic);
+/// A view plan's source: the caller must hold READ on the id, full stop.  Unlike authorizeTopicId there is NO D22 pass-through:
+/// the admin thread resolves the id later against a catalog that may be ahead of this thread's ObjectIndex, so a
+/// not-yet-indexed id (a CREATE TOPIC in flight) must not pass for a DESCRIBE ON CLUSTER holder.
+[[nodiscard]] std::optional<Denial> authorizeViewSource(const PermissionTable&, int32_t topicId);
 /// Name-addressed: `op` on (type, name) - matched against the requested name whether or not the object exists.
 [[nodiscard]] std::optional<Denial> authorizeName(const PermissionTable&, rune::security::ResourceType, std::string_view,
                                                   rune::security::Operation);

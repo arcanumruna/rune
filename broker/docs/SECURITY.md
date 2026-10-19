@@ -55,8 +55,10 @@ Rules that keep the model small (D15 to D17):
 
 **Visibility.** Objects the user cannot `DESCRIBE` do not appear in metadata or listings. Direct
 access to such an object answers `NotAuthorized`, whether or not the object exists, so the answer
-does not reveal existence. Requests that address an object by id (produce, subscribe, view reads)
-answer `NotAuthorized` unless the session holds `DESCRIBE ON CLUSTER` (D22). The detail text is
+does not reveal existence. A request that addresses an object by id (produce, subscribe, view reads)
+is checked against the grants on that object. Only when the id is not live (missing or dropped) does it
+answer `NotAuthorized`, unless the session holds `DESCRIBE ON CLUSTER`; then it gets the request's normal
+`UnknownTopic` answer (D22). A view plan's source ids never get this relaxation: they need `READ`. The detail text is
 always `not authorized: <OP> on <TYPE> <requested name or id>` (D23).
 
 ## Rune QL statements
@@ -239,8 +241,11 @@ A change takes effect on live sessions. Nothing is silent (D24 to D26).
 | `ALTER USER ... SET PASSWORD` (without `TERMINATE SESSIONS`) | Existing sessions keep running; the change lifts a pending `PasswordChangeRequired`. |
 | `ADD PASSWORD`, `DROP PASSWORD`, `CREATE *`, `ENABLE` | Nothing for live sessions. |
 
-A security DDL is answered OK only after every broker enforces it: the control thread releases the
-answer once its view applied the event and every refreshed permission table reached every worker (D24).
+A security DDL is answered OK once the broker that served the statement enforces it: its control thread
+releases the answer once its view applied the event and every refreshed permission table reached every
+worker of that broker (D24). The OK does not mean every broker enforces it. Other brokers apply the event
+asynchronously (typically within 100 ms on healthy brokers); a lagging or partitioned broker can keep
+enforcing the old grants until it catches up.
 A revoke ends the affected subscriptions within 100 ms on a 3-node cluster.
 
 On the hot path an authorization check is one bitmask load from the session's own table (at most 2 ns,
@@ -322,6 +327,14 @@ high-volume).
 
 SCRAM keeps the password off the wire, but it does not protect the data. TLS is optional in the
 broker: with authentication on and TLS not negotiated, the session is authenticated but its frames
-are not integrity-protected, and the broker logs that once per session. **In production, build with
-TLS and set `RUNE_REQUIRE_TLS=true`**, so a client that cannot negotiate TLS is refused.
+are not integrity-protected, and the broker logs that once per session. Without TLS, an authenticated
+session can be taken over by any UDP sender that can reach the broker (tracked issue #174).
+**In production, build with TLS and set `RUNE_REQUIRE_TLS=true`**, so a client that cannot negotiate TLS
+is refused.
+
+- TLS needs a broker built with `-DRUNE_TLS=ON` (the docker image is; source builds default to OFF).
+  Without it `RUNE_REQUIRE_TLS` and the `RUNE_TLS_*` settings are silently ignored.
+- The `rune` CLI has no TLS support yet (tracked issue #179), so it cannot connect to a broker with
+  `RUNE_REQUIRE_TLS=true`. Bootstrap and security statements through the CLI need a plaintext
+  listener until that is fixed.
 Inter-broker links are always encrypted when authentication is on.

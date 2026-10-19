@@ -157,6 +157,16 @@ TEST(AuthEnforcementRegression, CreateViewOverAnUnreadableSourceIsNotAuthorizedR
     EXPECT_EQ(r.alterViewCode(alterer, "board", r.secret), kNotAuthorized) << "AlterView likewise";
 }
 
+TEST(AuthEnforcementRegression, CreateAndAlterViewOverAnIdNotYetIndexedIsNotAuthorizedRegression) {
+    AuthRig r;
+    // The in-flight CREATE TOPIC window: the id is unknown to the gateway's index but may be live on the admin thread.
+    const int64_t u = r.newUser({cluster(SO::Describe), exact(SO::Create, ST::View, "leak2"),
+                                 exact(SO::Alter, ST::View, "board"), exact(SO::Read, ST::Topic, "orders")});
+    constexpr int32_t kNext = 99'999;
+    EXPECT_EQ(r.createViewCode(u, "leak2", kNext), kNotAuthorized) << "D22 must not apply to view sources";
+    EXPECT_EQ(r.alterViewCode(u, "board", kNext), kNotAuthorized);
+}
+
 TEST(AuthEnforcementRegression, AlterTopicAndAlterTopicConfigAllowedAndDenied) {
     AuthRig r;
     const int64_t may = r.newUser({exact(SO::Alter, ST::Topic, "orders")});

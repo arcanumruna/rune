@@ -42,9 +42,9 @@ export RUNE_FS_LOG=0   # explicit off; "0" (= unset) is also the default (RUNE_F
 if [ "${RUNE_SHARD:-0}" = "1" ]; then
   export RUNE_SHARD RUNE_RUNTIME_PLACEMENT="${RUNE_RUNTIME_PLACEMENT:-fused}"
 else
-  # Shard + fused is the broker DEFAULT since 2026-10-02: a non-shard run is
-  # legacy + thread placement, explicitly (comparable with earlier results).
-  export RUNE_WORKER_MODE=legacy RUNE_RUNTIME_PLACEMENT=thread
+  # Authentication (always on in the harness) refuses legacy mode in a multi-broker cluster, so a non-shard run
+  # is the broker default: shard mode with plain peers (the broker derives the layout), thread placement.
+  export RUNE_WORKER_MODE=shard RUNE_RUNTIME_PLACEMENT=thread
   export RUNE_WORKER_IDLE=backoff RUNE_RUNTIME_IDLE=backoff
 fi
 export RUNE_BROKER_BIN=/root/rune-e5/rune-broker/build-linux/rune_broker

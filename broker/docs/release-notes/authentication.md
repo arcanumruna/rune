@@ -25,7 +25,8 @@ rune security bootstrap --admin admin --cluster-key-file secrets/cluster.key --b
 - Every launcher in the repository now generates a key before it starts the brokers, bootstraps the cluster and
   creates an `e2e` user: `docker/e2e.sh`, `schema-e2e.sh`, `schema-evolution-e2e.sh`, `view-engine-e2e.sh`,
   `transient-failover-e2e.sh`, `catalog-e2e.sh`, the dr-e2e harness and the `bench/kafka-compare` scripts (the
-  benchmarks run authenticated, as production does). `docker/auth-e2e.sh` is the new 3-node authentication e2e.
+  benchmarks run authenticated, as production does, in shard mode: authentication refuses legacy mode with per-worker
+  ingress/egress, and legacy mode in a multi-broker cluster). `docker/auth-e2e.sh` is the new 3-node authentication e2e.
   The compose files mount `./secrets/cluster.key` read-only at `/run/secrets/cluster.key`.
 
 ## 2. Breaking: client version 9

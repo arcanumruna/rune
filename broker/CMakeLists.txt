@@ -207,6 +207,10 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_single_driver_pumper.py
             ${CMAKE_CURRENT_SOURCE_DIR})
 
+    # The bench launchers must use a topology authentication accepts (validateAuthTopology).
+    add_test(NAME BenchLaunchersAreAuthCompatibleRegression
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/bench/kafka-compare/check-auth-config.sh)
+
     # F9a guard (user law 2026-10-01): no std::atomic / mutex / lock /
     # thread_local in production code (libs/**, src/**; test code excluded)
     # outside scripts/atomics_allowlist.txt — ring-buffer internals, the

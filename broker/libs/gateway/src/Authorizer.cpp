@@ -50,6 +50,12 @@ std::optional<Denial> authorizeTopicId(const PermissionTable& t, int32_t topicId
     return deny(op, shownType, std::to_string(topicId));
 }
 
+std::optional<Denial> authorizeViewSource(const PermissionTable& t, int32_t topicId)
+{
+    if (t.allows(topicId, rsec::opBit(rsec::Operation::Read))) return std::nullopt;
+    return deny(rsec::Operation::Read, rsec::ResourceType::Topic, std::to_string(topicId));
+}
+
 std::optional<Denial> authorizeName(const PermissionTable& t, rsec::ResourceType type, std::string_view name, rsec::Operation op)
 {
     if (t.allowsName(type, name, rsec::opBit(op))) return std::nullopt;

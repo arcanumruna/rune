@@ -142,6 +142,16 @@ TEST(AuthorizerRegression, DescribeOnClusterTurnsAMissingIdIntoTheExistingUnknow
     EXPECT_TRUE(rg::authorizeTopicId(t, 0, Operation::Read, idx).has_value()) << "a live id it may not read is denied";
 }
 
+TEST(AuthorizerRegression, ViewSourceUnknownIdIsDeniedEvenWithDescribeOnClusterRegression) {
+    rg::ObjectIndex idx; idx.onTopic(0, "exists");
+    const std::vector<rune::security::GrantSpec> grants{g(Operation::Describe, ResourceType::Cluster, PatternKind::Exact, ""),
+                                                        g(Operation::Read, ResourceType::Topic, PatternKind::Exact, "exists")};
+    auto t = rg::PermissionTable::compile(grants, idx);
+    EXPECT_TRUE(rg::authorizeViewSource(t, 77).has_value()) << "no D22 for view sources: an unindexed id may be a CREATE TOPIC in flight";
+    EXPECT_FALSE(rg::authorizeTopicId(t, 77, Operation::Read, idx).has_value()) << "D22 unchanged for the other callers";
+    EXPECT_FALSE(rg::authorizeViewSource(t, 0).has_value());
+}
+
 TEST(AuthorizerRegression, GrantedRequestsAreNotDenied) {
     rg::ObjectIndex idx; idx.onTopic(0, "a");
     auto t = rg::PermissionTable::compile({{g(Operation::Write, ResourceType::Topic, PatternKind::Exact, "a")}}, idx);
