@@ -81,3 +81,24 @@ TEST(LoginThrottleRegression, AnAttemptInsideTheDelayReportsTheRemainingTime) {
     ASSERT_FALSE(v.allowed);
     EXPECT_EQ(v.retryAfterMs, 150u);
 }
+
+// Regression (Task 20, found by the docker e2e): the login log lines printed `source=<binary garbage>` - the gateway bound a
+// std::string_view to Aeron's by-value Image::sourceIdentity() and read freed memory, so the throttle's host key was random.
+TEST(LoginThrottleRegression, SourceHostOfAnAeronImageIsTheHostNeverGarbageRegression) {
+    using rune::gateway::hostOfSourceIdentity;
+    EXPECT_EQ(hostOfSourceIdentity("172.18.0.4:51234"), "172.18.0.4");
+    EXPECT_EQ(hostOfSourceIdentity("[::1]:5678"), "::1");
+    EXPECT_EQ(hostOfSourceIdentity("[fe80::1]:40200"), "fe80::1");
+    EXPECT_EQ(hostOfSourceIdentity("10.0.0.9"), "10.0.0.9");          // no port
+    EXPECT_EQ(hostOfSourceIdentity("aeron:ipc"), "");                 // IPC: the caller falls back to the reply endpoint
+    EXPECT_EQ(hostOfSourceIdentity(""), "");
+    // The result owns its bytes: it survives the source string (the by-value temporary the Aeron accessor returns).
+    std::string host;
+    {
+        std::string temporary = "192.168.7.7:9999";
+        host = hostOfSourceIdentity(temporary);
+        temporary.assign(temporary.size(), 'X');                       // clobber the source
+    }
+    EXPECT_EQ(host, "192.168.7.7");
+    EXPECT_EQ(hostOfSourceIdentity(std::string("203.0.113.5:1")), "203.0.113.5");   // a temporary argument
+}

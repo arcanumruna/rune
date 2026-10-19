@@ -1,8 +1,18 @@
 #include <rune/gateway/LoginThrottle.h>
 
 #include <algorithm>
+#include <string>
 
 namespace rune::gateway {
+
+std::string hostOfSourceIdentity(std::string_view id)
+{
+    if (id.empty() || id.rfind("aeron:", 0) == 0) return {};
+    if (const auto colon = id.rfind(':'); colon != std::string_view::npos) id = id.substr(0, colon);
+    if (id.size() > 2 && id.front() == '[' && id.back() == ']') id = id.substr(1, id.size() - 2);
+    return std::string(id);
+}
+
 
 namespace {
 
