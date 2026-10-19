@@ -21,6 +21,7 @@ extern "C" {
 #include <rune/storage/Log.h>
 
 #include <atomic>
+#include <set>
 #include <chrono>
 #include <filesystem>
 #include <memory>
@@ -409,4 +410,56 @@ TEST(PeerSealedAeronPartitionTransportRegression, UnsealedModeIsUnchanged) {
     ASSERT_TRUE(p.runUntilConverged(target, 10s));
     EXPECT_FALSE(p.ldr->peerSealed());
     EXPECT_EQ(p.ldr->peerFrameDrops(), 0u);
+}
+
+// X080: a back-pressured (ABORTed) fragment is redelivered after ANOTHER image's fragments were polled; the replay
+// window is committed only after a non-ABORT dispatch, so nothing is lost with two sending peers.
+namespace {
+struct AbortSink {
+    bool refuse = true;
+    std::multiset<int32_t> got;
+};
+bool abortSinkHandler(void* ctx, const rr::AlterIsrResponseMsg& r) noexcept {
+    auto* s = static_cast<AbortSink*>(ctx);
+    if (s->refuse) return false;
+    s->got.insert(r.sendSeq);
+    return true;
+}
+}  // namespace
+
+TEST(PeerSealedAeronPartitionTransportRegression, AbortRedeliveryWithTwoImagesLosesNothingRegression) {
+    MediaDriver driver;
+    aeron::Context ctx; ctx.aeronDir(driver.dir());
+    auto aeron = aeron::Aeron::connect(ctx);
+    auto url = [] { return "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort()); };
+    const std::string c1 = url(), c2 = url(), c3 = url();
+    constexpr int32_t kStream = 501;
+    rr::AeronPartitionTransport rx(aeron, c1, kStream, 1, 4 * 1024 * 1024, rune::aeronutil::AeronPump{}, sealed(1, 1));
+    rr::AeronPartitionTransport s2(aeron, c2, kStream, 2, 4 * 1024 * 1024, rune::aeronutil::AeronPump{}, sealed(2, 1));
+    rr::AeronPartitionTransport s3(aeron, c3, kStream, 3, 4 * 1024 * 1024, rune::aeronutil::AeronPump{}, sealed(3, 1));
+    s2.addPeer(1, c1, kStream); s3.addPeer(1, c1, kStream);
+    rx.addPeer(2, c2, kStream); rx.addPeer(3, c3, kStream);
+    ASSERT_TRUE(rx.installPeerLink(2, linkFor(false, 1, 1))); ASSERT_TRUE(rx.installPeerLink(3, linkFor(false, 1, 2)));
+    ASSERT_TRUE(s2.installPeerLink(1, linkFor(true, 1, 1))); ASSERT_TRUE(s3.installPeerLink(1, linkFor(true, 1, 2)));
+    AbortSink sink;
+    rx.setForeignAlterIsrResponseHandler(&abortSinkHandler, &sink);
+    constexpr int kEach = 5;
+    int64_t now = 0;
+    auto pump = [&](int ms) {
+        for (int i = 0; i < ms; ++i) { now += 1'000'000; rx.poll(now); s2.poll(now); s3.poll(now); std::this_thread::sleep_for(1ms); }
+    };
+    pump(300);   // let the images connect
+    for (int i = 0; i < kEach; ++i) {
+        rr::AlterIsrResponseMsg m; m.topicId = -1; m.partition = 0;
+        m.sendSeq = 100 + i; for (int t = 0; t < 50 && !s2.sendAlterIsrResponse(1, m); ++t) pump(5);
+        m.sendSeq = 200 + i; for (int t = 0; t < 50 && !s3.sendAlterIsrResponse(1, m); ++t) pump(5);
+    }
+    pump(300);   // every poll ABORTs: both images' fragments stay pending, redelivered each round
+    EXPECT_TRUE(sink.got.empty());
+    sink.refuse = false;
+    pump(500);
+    std::multiset<int32_t> want;
+    for (int i = 0; i < kEach; ++i) { want.insert(100 + i); want.insert(200 + i); }
+    EXPECT_EQ(sink.got, want) << "every refused frame is delivered exactly once";
+    EXPECT_EQ(rx.peerFrameDrops(), 0u);
 }

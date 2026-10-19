@@ -11,6 +11,7 @@ extern "C" {
 #include <Context.h>
 
 #include <rune/peerlink/PeerFrameCrypto.h>
+#include <rune/peerlink/PeerHandshake.h>
 #include <rune/replication/ReplicationMessages.h>
 #include <rune/replication/WorkerReplicationTransport.h>
 
@@ -165,6 +166,48 @@ TEST(PeerFrameAllocRegression, SealAndOpenAllocateNothing) {
             (void)a.seal(99, plain.data(), 100, wire.data(), wire.size());
         }
     }
+    EXPECT_EQ(gAllocs.load(), 0u);
+}
+
+// Handshake frame processing that needs no crypto - the frames an attacker can send at will - allocates nothing:
+// forged Refuse / unknown-epoch hints / bad-key Hello / idle ticks, and bogus sender ids at the frame layer.
+TEST(PeerFrameAllocRegression, HandshakeFrameProcessingNeverAllocatesRegression) {
+    ASSERT_TRUE(kHooked);
+    namespace pl = rune::peerlink;
+    std::string k(48, 'k');
+    auto m = rune::crypto::deriveClusterKey({reinterpret_cast<const uint8_t*>(k.data()), k.size()});
+    ASSERT_TRUE(m);
+    pl::ClusterKeys keys{*m, std::nullopt};
+    pl::PeerHandshake a(1, 2, 10, keys), b(2, 1, 20, keys);
+    (void)a.tick(0);   // an initiator in HelloSent (setup may allocate)
+    pl::PeerRefuse r; r.from = 2; r.to = 1;
+    pl::PeerHello bad; bad.from = 1; bad.to = 2; bad.keyId = 0xdead; bad.incarnation = 1;
+    pl::PeerChallenge ch; ch.from = 2; ch.to = 1; ch.keyId = 0xbeef;   // not our key id
+    pl::PeerAccept acc; acc.from = 2; acc.to = 1;
+    pl::PeerFrameCrypto fa(1, 3), fb(2, 3);
+    ASSERT_TRUE(fa.installLink(2, linkFor(true), 0)); ASSERT_TRUE(fb.installLink(1, linkFor(false), 0));
+    std::vector<uint8_t> wire(64), out(64);
+    const auto n = fa.seal(2, reinterpret_cast<const uint8_t*>("payload"), 7, wire.data(), wire.size());
+    std::size_t outLen = 0; int32_t from = -1; uint32_t epoch = 0;
+    uint64_t seen = 0;
+    {
+        Armed armed;
+        for (int i = 1; i <= 2000; ++i) {
+            const int64_t now = i * 1'000'000;
+            for (auto reason : {pl::RefuseReason::NoCommonKey, pl::RefuseReason::BadProof, pl::RefuseReason::NoLink}) {
+                r.reason = reason;
+                seen += a.onRefuse(r, now).log ? 1 : 0;
+            }
+            seen += a.onUnknownEpoch(static_cast<uint32_t>(i), now).frame ? 1 : 0;
+            seen += a.onChallenge(ch, now).frame ? 1 : 0;
+            seen += a.onAccept(acc, now).frame ? 1 : 0;
+            seen += b.onHello(bad, now).frame ? 1 : 0;     // a Refuse{NoCommonKey}: a fixed buffer, no heap
+            seen += a.tick(now).frame ? 1 : 0;              // the Hello repeat
+            wire[1] = static_cast<uint8_t>(10 + (i % 200));   // a bogus sender id
+            (void)fb.open(wire.data(), n, out.data(), out.size(), outLen, from, epoch);
+        }
+    }
+    EXPECT_GT(seen, 0u);
     EXPECT_EQ(gAllocs.load(), 0u);
 }
 
