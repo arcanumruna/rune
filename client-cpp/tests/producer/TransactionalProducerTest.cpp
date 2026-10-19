@@ -524,6 +524,29 @@ TEST(TransactionalProducerTest, AbortTransactionEmitsEndTxnAbort) {
     EXPECT_FALSE(r.tp.transactionActive());
 }
 
+// Authentication (Task 7): an EndTxn answered NotAuthorized (45) / PasswordChangeRequired (47) is NOT retried —
+// EndTxn used to retry everything but InvalidTxnState until the op deadline.  The commit fails with the code,
+// exactly one EndTxn was sent, and no retry is pending.
+TEST(TransactionalProducerTest, EndTxnNotAuthorizedFailsTheCommitWithoutRetryRegression) {
+    for (const auto code : {rpc::ErrorCode::NotAuthorized, rpc::ErrorCode::PasswordChangeRequired}) {
+        SCOPED_TRACE(static_cast<int>(code));
+        TxnRig r;
+        r.acquire(88, 1);
+        r.startTxn();
+        auto op = r.commit();
+        r.doWork();
+        const auto et = r.sink.last(rpc::TemplateId::EndTxn);
+        ASSERT_FALSE(et.empty());
+        auto resp = makeEndTxnResponse(corrIdOf(et), ecOf(code));
+        r.impl->onEndTxnResponse(resp.data(), resp.size());
+        ASSERT_TRUE(op.ready());
+        EXPECT_EQ(op.status(), OpStatus::BrokerError);
+        EXPECT_EQ(op.c().errorCode, static_cast<uint16_t>(code));
+        for (int i = 0; i < 50; ++i) r.doWork();
+        EXPECT_EQ(r.sink.count(rpc::TemplateId::EndTxn), 1) << "never re-sent";
+    }
+}
+
 // F8c C5 (was ProducerFencedSurfacesError) + fix round 1 (I-2):
 // InitProducerId{ProducerFenced} completes the init Fenced and the producer is
 // FatalError — terminal: misuse while Initializing is refused at once, and

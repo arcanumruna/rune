@@ -340,7 +340,8 @@ struct ClientConfig {
     // byte-identical ConnectRequest, pre-Task-5 shape).
     //
     // offerCrypto: true -> connect() offers a v(crypto) ConnectRequest
-    // (cipherList/handshakeBytes/authToken) and drives the TLS 1.3 handshake.
+    // (cipherList/handshakeBytes, plus the reserved — always empty — authToken) and
+    // drives the TLS 1.3 handshake.
     bool offerCrypto = false;
     // tlsTrustPem: nullopt = trust the system store (production default);
     // "" = trust nothing (deliberately untrusted — tests only); non-empty =
@@ -350,9 +351,26 @@ struct ClientConfig {
     // (hostname verification). "" installs NO hostname check — leave empty
     // only for loopback/tests; set this in production.
     std::string tlsExpectHost;
-    // authToken: client authZ token carried inside the (TLS-encrypted, once
-    // offerCrypto=true) Connect handshake payload. "" = none offered.
-    std::string authToken;
+    // (authToken, removed — fix-on-sight, authentication Task 7: it was documented as validated
+    // "by the broker's existing auth path", but no such path existed.  The wire field stays
+    // reserved and is always sent empty; see `username` / `password` below for real credentials.)
+    // ---- Authentication (spec §5, D5): SCRAM-SHA-512 inside the session.
+    // username / password: the principal this Client logs in as, once per broker session (every
+    // session of a multi-node client logs in).  "" = no credentials: the broker answers
+    // AuthenticationFailed (44) — the client never short-circuits, the broker enforces.  The
+    // password is never logged and never sent (only a proof derived from it).
+    std::string username;
+    std::string password;
+    // passwordFile: a file holding the password (read ONCE at construction; trailing newline
+    // stripped) — keeps it off the command line and out of the environment.  Setting both
+    // `password` and `passwordFile` throws std::invalid_argument; an unreadable file throws
+    // std::runtime_error.
+    std::string passwordFile;
+    // minPasswordLength / scramIterations: how this client builds a NEW verifier (ALTER USER ...
+    // SET PASSWORD, the CLI's bootstrap) — the broker never sees a password, so the minimum is the
+    // client's rule (D9).  Not used by the login itself, which follows the broker's salt and count.
+    uint32_t minPasswordLength = 12;
+    uint32_t scramIterations   = 4096;
     // requireCrypto (downgrade safety, spec §11 require_tls's client-side
     // mirror): when true, a ConnectResponse that negotiates NO cipher makes
     // connect() fail TERMINALLY (Rejected/HandshakeFailed) rather than
@@ -397,6 +415,18 @@ struct ClientConfig {
 
 /// Maps a ClientConfig to the agent/transport configuration (applies env overrides).
 [[nodiscard]] agent::AgentConfig toAgentConfig(const ClientConfig& c);
+
+/// Authentication (spec §5): who this Client is to its seed broker right now.
+///   Authenticated          the seed session is Connected and the broker authenticated `user`.
+///   PasswordChangeRequired Connected with a one-time (bootstrap) password: the broker answers every
+///                          request except a password change with PasswordChangeRequired (47).
+///   Anonymous              no login took place: the seed is not Connected, or the broker runs without
+///                          authentication (brokerMode DevDisabled / InProcess).
+struct AuthStatus {
+    enum class Kind : uint8_t { Authenticated, PasswordChangeRequired, Anonymous } kind = Kind::Anonymous;
+    std::string                      user;          ///< ClientConfig::username when authenticated, else ""
+    rune::protocol::client::AuthMode brokerMode = rune::protocol::client::AuthMode::InProcess;
+};
 
 // ---------------------------------------------------------------------------
 // Client
@@ -676,6 +706,9 @@ public:
     /// Connected state was published, so state() == Connected once
     /// connectAndWait() returns.
     [[nodiscard]] session::SessionState state() const;
+
+    /// Authentication: the seed session's login state (see AuthStatus).  Same threading rule as state().
+    [[nodiscard]] AuthStatus authStatus() const;
 
     // -------------------------------------------------------------------------
     // Control ops (F8c C3) — completion tokens, no futures
@@ -1211,7 +1244,9 @@ private:
     struct SeedStatus {
         int64_t sessionId = 0;
         uint8_t state     = 0;
-        uint8_t pad[7]{};
+        uint8_t authMode  = static_cast<uint8_t>(rune::protocol::client::AuthMode::InProcess);   // brokerAuthMode()
+        uint8_t passwordChangeRequired = 0;                                                      // one-time password
+        uint8_t pad[5]{};
     };
 
     // -------------------------------------------------------------------------
@@ -1395,7 +1430,16 @@ private:
     int  retryUnsentControl_();
     void sweepControl_(int64_t nowNs);
     void failAllControl_(OpStatus st);
-    void completeConnect_(OpStatus st, int64_t value, uint16_t errorCode, std::string_view text);
+    /// Authentication (44 / 46): every pending control op (and a pending connect) completes
+    /// BrokerError `errorCode` with `text` — the session is Rejected, nothing more can be answered.
+    void failAllControlWithCode_(uint16_t errorCode, std::string_view text);
+    /// Authentication: an ErrorResponse carrying codes 44..47 — true when it concerned a subscription, a
+    /// group fetch, a produce batch or the whole session and is fully handled here (see Client.cpp).
+    bool onAuthErrorResponse_(const codec::ErrorResponseView& e);
+    /// Authentication (D26): the seed session was revoked — every in-flight request and subscription
+    /// completes SessionRevoked; the Rejected seed then fails the Client for good (no reconnect).
+    void onSeedRevoked_(std::string_view text);
+    void completeConnect_(OpStatus st, int64_t value, uint16_t errorCode, std::string_view text, int64_t aux = 0);
     /// Fix round 4: the seed's Connected edge — every connect-time action, once.
     void onSeedConnected_(int64_t sessionId, int32_t brokerVersion);
     /// A blocking call (`what`) must not run where it could never complete:

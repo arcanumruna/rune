@@ -742,8 +742,12 @@ std::optional<Prepared> prepare(const ql::Statement& st, std::string& why) {
                         }
                     }
                     return Prepared{std::move(p)};
+                } else if constexpr (!std::is_same_v<T, ql::DiffDef>) {
+                    // Authentication: user / role / grant / SHOW statements arrive with the security DDL API
+                    // (Task 8).  Until then they are refused explicitly — never executed, never silently dropped.
+                    why = "security statements are not supported by this command yet";
+                    return std::nullopt;
                 } else {
-                    static_assert(std::is_same_v<T, ql::DiffDef>);
                     PDiff p;
                     if (s.scope == ql::DiffDef::Scope::Schema) {
                         if (!checkVersion(s.from, "schema", kMaxVersion) || !checkVersion(s.to, "schema", kMaxVersion)) return std::nullopt;

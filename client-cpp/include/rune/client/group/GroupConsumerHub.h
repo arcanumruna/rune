@@ -294,6 +294,12 @@ public:
     /// kMaxFetchRedirects).  True + its (topicId, partition) when it is a live
     /// one — the caller re-routes it and calls reconcileFetch().
     bool onFetchSubscribeRefused(int64_t corrId, bool park, int32_t& topicId, int32_t& partition);
+    /// Authentication (Task 7): an ErrorResponse{NotAuthorized | SessionRevoked | ...} on a group fetch
+    /// Subscribe's correlationId (unanswered, or a BOUND instance — a revoked READ): its consumer is finished
+    /// with the matching GroupFailReason, never re-armed.  False when not a live group fetch.
+    bool onFetchAuthRefused(int64_t corrId, int16_t errorCode);
+    /// Authentication (D26): the session was revoked — every active consumer is finished SessionRevoked.
+    int revokeAll();
     /// M2: Unsubscribes the transport refused, re-offered by the duty cycle
     /// (one branch when zero) until sent or moot (their session's epoch ended).
     [[nodiscard]] std::size_t pendingFetchUnsubscribes() const noexcept { return pendingUnsubs_.size(); }

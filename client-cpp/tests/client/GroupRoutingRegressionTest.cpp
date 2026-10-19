@@ -994,6 +994,31 @@ TEST(GroupRoutingRegression, JoinGroupInvalidRequestFinishesTheConsumerRegressio
     EXPECT_EQ(r.gw.joinGroups, 1);
 }
 
+// Authentication (Task 7): a coordinator answering JoinGroup NotAuthorized (45) / SessionRevoked (46) is a
+// grant / login problem, not a transient one: the consumer finishes with the matching reason after ONE join —
+// it used to fall into the Backoff verdict and re-join until its retry budget ran out.
+TEST(GroupRoutingRegression, JoinGroupNotAuthorizedFinishesTheConsumerWithoutRejoinRegression) {
+    GroupRig r(4183, 4184);
+    r.gw.holdJoins     = false;
+    r.gw.joinErrorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::NotAuthorized);
+    auto gc = r.client.subscribeGroup("g", {"t"});
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return gc.finished(); }, 400'000)) << "joins: " << r.gw.joinGroups;
+    EXPECT_EQ(gc.failReason(), rc::GroupFailReason::NotAuthorized);
+    EXPECT_EQ(r.gw.joinGroups, 1);
+}
+
+TEST(GroupRoutingRegression, JoinGroupSessionRevokedFinishesTheConsumerRegression) {
+    GroupRig r(4185, 4186);
+    r.gw.holdJoins     = false;
+    r.gw.joinErrorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::SessionRevoked);
+    auto gc = r.client.subscribeGroup("g", {"t"});
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return gc.finished(); }, 400'000)) << "joins: " << r.gw.joinGroups;
+    EXPECT_EQ(gc.failReason(), rc::GroupFailReason::SessionRevoked);
+    EXPECT_EQ(r.gw.joinGroups, 1);
+}
+
 // ===========================================================================
 // No-hang fix round 2 (C1 / I2): the group state machine never loops forever,
 // never storms, never stays Stable on an error the broker could not serve.

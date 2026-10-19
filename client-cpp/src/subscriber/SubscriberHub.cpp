@@ -414,7 +414,13 @@ void SubscriberHub::onSubscribeResponse(
     // bound like an OK (subscriptionId 0, active, never delivering — a silent
     // hang).  Finish it with the broker's code; no Unsubscribe is owed.
     if (rsp.errorCode != 0) [[unlikely]] {
-        impl->failReason      = SubscriptionFailReason::RejectedByBroker;
+        // Authentication: a refused / revoked Subscribe is named, not a generic broker rejection.
+        impl->failReason =
+            rsp.errorCode == static_cast<int16_t>(rune::protocol::client::ErrorCode::NotAuthorized)
+                ? SubscriptionFailReason::NotAuthorized
+            : rsp.errorCode == static_cast<int16_t>(rune::protocol::client::ErrorCode::SessionRevoked)
+                ? SubscriptionFailReason::SessionRevoked
+                : SubscriptionFailReason::RejectedByBroker;
         impl->brokerErrorCode = static_cast<uint16_t>(rsp.errorCode);
         finish_(*impl);
         return;
@@ -1130,6 +1136,61 @@ bool SubscriberHub::endCatalogRead(int64_t correlationId, int64_t answerSid, int
         return true;
     }
     return false;
+}
+
+bool SubscriberHub::endRefused(int64_t correlationId, int64_t answerSid, int64_t seedSid,
+                               SubscriptionFailReason why, uint16_t code)
+{
+    if (correlationId == 0) return false;
+    if (pendingByCorrelation_.find(correlationId) != pendingByCorrelation_.end()) {
+        if (!answeredOnItsSession(correlationId, answerSid, seedSid)) {
+            ++staleResponsesIgnored_;   // an earlier session's answer: the re-sent Subscribe will be answered itself
+            return true;
+        }
+        return failPendingSubscribe(correlationId, why, code);
+    }
+    for (auto it = activeById_.begin(); it != activeById_.end(); ++it) {
+        SubscriptionImpl* impl = it->second;
+        if (impl == nullptr || impl->correlationId != correlationId) continue;
+        if (!impl->active || impl->unsubPending) return false;
+        const int64_t homeSid = homeSidOf_(*impl, seedSid);
+        if (homeSid == 0 || answerSid != homeSid) return true;   // a stale answer of an earlier session
+        impl->failReason      = why;
+        impl->brokerErrorCode = code;
+        finish_(*impl);   // inactive + final status (closed by onRecords if dispatching)
+        if (impl != dispatching_) activeById_.erase(it);   // else onRecords erases it once its handler returns
+        return true;
+    }
+    return false;
+}
+
+int SubscriberHub::endAllLive(SubscriptionFailReason why, uint16_t code)
+{
+    int ended = 0;
+    for (auto it = pendingByCorrelation_.begin(); it != pendingByCorrelation_.end();) {
+        auto& req = it->second;
+        if (req) clearUnsent_(*req);
+        if (req && req->impl) {
+            if (req->impl->active) {
+                req->impl->failReason      = why;
+                req->impl->brokerErrorCode = code;
+                ++ended;
+            }
+            finish_(*req->impl);
+        }
+        it = pendingByCorrelation_.erase(it);
+    }
+    for (auto it = activeById_.begin(); it != activeById_.end();) {
+        SubscriptionImpl* impl = it->second;
+        if (impl == nullptr || !impl->active) { ++it; continue; }
+        impl->failReason      = why;
+        impl->brokerErrorCode = code;
+        finish_(*impl);
+        ++ended;
+        if (impl == dispatching_) { ++it; continue; }   // onRecords erases it once its handler returns
+        it = activeById_.erase(it);
+    }
+    return ended;
 }
 
 int SubscriberHub::endSeedBound()

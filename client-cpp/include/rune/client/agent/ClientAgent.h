@@ -465,6 +465,8 @@ public:
     [[nodiscard]] bool     lastConnectAccepted() const noexcept { return lastConnectAccepted_; }
     [[nodiscard]] bool     lastConnectAwaited() const noexcept { return lastConnectAwaited_; }
     [[nodiscard]] uint32_t lastConnectSession() const noexcept { return lastConnectSession_; }
+    /// Authentication: the salted-password cache (test seam: hit / PBKDF2 counters).
+    [[nodiscard]] const session::ScramCache& scramCache() const noexcept { return scramCache_; }
 
     /// Index of the session leading (topicId, partition): its route's node
     /// session, lazily opened (async connect); 0 = the seed (no route).
@@ -900,6 +902,9 @@ private:
     // the pool-of-1 hot path a single deref (no string hashing) while the small N
     // multi-node case is a short linear scan (N ≤ cluster size).  Agent-thread only.
     std::vector<std::unique_ptr<Session>> sessions_;
+    /// Authentication (Task 7): the duty thread's salted-password cache, shared by every session's machine
+    /// (a client with one session per broker pays PBKDF2 once per verifier).  Agent-thread only.
+    session::ScramCache scramCache_;
 
     /// The seed (single) session — sessions_[0].  Pool-of-1 accessor: identical to
     /// the previous single-session member for both agent-internal doWork and the

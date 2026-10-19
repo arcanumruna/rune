@@ -183,6 +183,13 @@ enum class GroupFailReason : int32_t {
     /// errors, or — fix round 4 — an OffsetFetch answered NotCoordinator on
     /// every re-join).  A transient cause: the application may recreate the consumer.
     RetryBudgetExhausted = 3,
+    /// Authentication (client version 9): the coordinator or a partition's leader answered NotAuthorized (45)
+    /// — the principal holds no READ on the group / topic.  Not retriable (the grant is an admin's act):
+    /// the consumer is finished, never rejoined in a loop.
+    NotAuthorized = 4,
+    /// Authentication (D26): the session's user was dropped / disabled — everything of the session ends and the
+    /// session is not reconnected.
+    SessionRevoked = 5,
 };
 
 struct GroupConsumerStatus {

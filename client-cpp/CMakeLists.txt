@@ -216,6 +216,13 @@ target_include_directories(rune_client INTERFACE
     $<INSTALL_INTERFACE:include>
 )
 target_link_libraries(rune_client INTERFACE spdlog::spdlog)
+# Authentication (Task 7): the SCRAM client's salted-password cache (SessionMachine.h uses it).
+add_library(rune_client_scram STATIC src/session/ScramClient.cpp)
+target_include_directories(rune_client_scram PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>)
+target_link_libraries(rune_client_scram PUBLIC rune_crypto)
+target_link_libraries(rune_client INTERFACE rune_client_scram)
 if(aeron_FOUND)
     target_link_libraries(rune_client INTERFACE aeron::aeron)
 endif()
@@ -317,7 +324,7 @@ if(aeron_FOUND)
     # rune_client_transport above — ClientAgent.h is itself a public header
     # downstream targets (rune_client_producer, rune_client_subscriber,
     # rune_client_api, ...) compile against.
-    target_link_libraries(rune_client_agent PUBLIC rune_crypto OpenSSL::SSL OpenSSL::Crypto)
+    target_link_libraries(rune_client_agent PUBLIC rune_crypto rune_client_scram OpenSSL::SSL OpenSSL::Crypto)
     if(UNIX AND NOT APPLE)
         find_library(UUID_LIB uuid)
         if(UUID_LIB)
@@ -971,12 +978,15 @@ if(BUILD_TESTING)
     # ── Session state machine tests (CC-4) — no Aeron dependency ──────────────
     add_executable(rune_session_tests
         tests/session/SessionMachineTest.cpp
+        tests/session/SessionMachineAuthTest.cpp   # authentication Task 7: the SCRAM client + Authenticating
     )
     # client<->broker TLS/AEAD (Task 5): SessionMachine.h now drives a real
     # TlsSession/AeadCipher directly (header-only) — this target links rune_crypto
     # itself since it never goes through rune_client_agent/transport.
     target_link_libraries(rune_session_tests PRIVATE rune_client rune_crypto GTest::gtest_main)
     target_include_directories(rune_session_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})
+    target_compile_definitions(rune_session_tests PRIVATE
+        RUNE_CRYPTO_TESTDATA_DIR="${RUNE_CRYPTO_ROOT}/tests/testdata")
 
     gtest_discover_tests(rune_session_tests)
 
@@ -1435,6 +1445,19 @@ if(BUILD_TESTING)
             target_link_libraries(rune_client_ddl_tests PRIVATE ${UUID_LIB_INVOKER})
         endif()
         gtest_discover_tests(rune_client_ddl_tests)
+
+        # Authentication (Task 7): login, codes 44-47, SessionRevoked, the salted-password cache and the
+        # authToken removal — against the InvokerGateway's SCRAM-speaking broker model.
+        add_executable(rune_client_auth_tests
+            tests/client/ClientAuthErrorsTest.cpp
+            tests/client/ClientConnectRegressionTest.cpp
+        )
+        target_include_directories(rune_client_auth_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})
+        target_link_libraries(rune_client_auth_tests PRIVATE rune_client_api GTest::gtest_main)
+        if(UNIX AND NOT APPLE AND UUID_LIB_INVOKER)
+            target_link_libraries(rune_client_auth_tests PRIVATE ${UUID_LIB_INVOKER})
+        endif()
+        gtest_discover_tests(rune_client_auth_tests)
 
         # Catalog history (Task 13): the catalog reader — Subscribe(-6) from the
         # cache end, the caught-up marker, the verifying replay, the bounded

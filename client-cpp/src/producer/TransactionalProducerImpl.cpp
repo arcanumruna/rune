@@ -55,6 +55,8 @@ constexpr int16_t kConcurrentTransactions = static_cast<int16_t>(rpc::ErrorCode:
 constexpr int16_t kNotLeader              = static_cast<int16_t>(rpc::ErrorCode::NotLeader);
 constexpr int16_t kInvalidRequest         = static_cast<int16_t>(rpc::ErrorCode::InvalidRequest);
 constexpr int16_t kTransientLogFull       = static_cast<int16_t>(rpc::ErrorCode::TransientLogFull);
+constexpr int16_t kAuthenticationFailed   = static_cast<int16_t>(rpc::ErrorCode::AuthenticationFailed);   // 44..47
+constexpr int16_t kPasswordChangeRequired = static_cast<int16_t>(rpc::ErrorCode::PasswordChangeRequired);
 
 } // namespace
 
@@ -539,6 +541,10 @@ TransactionalProducerImpl::Verdict TransactionalProducerImpl::classify_(ReqKind 
     // same bytes fails the same way, so it is never retried (an EndTxn used to
     // retry it until the op deadline).
     if (ec == kInvalidRequest) return Verdict::Fail;
+    // Authentication (client version 9, 44..47): a login or a grant is an admin's act — re-sending the same
+    // request cannot change the answer.  Never retried (an EndTxn used to retry anything but InvalidTxnState
+    // until the op deadline); the op fails with the code.
+    if (ec >= kAuthenticationFailed && ec <= kPasswordChangeRequired) return Verdict::Fail;
     if (kind == ReqKind::EndTxn) {
         // F14: EndTxn is retried until 0 / 19 / 17 / 18.
         return ec == kInvalidTxnState ? Verdict::Fail : Verdict::Retry;
@@ -1408,6 +1414,14 @@ void TransactionalProducerImpl::onProduceResponse(const uint8_t* buf, std::size_
                                                     cfg_.produceTimeoutMs * 1'000'000LL);
         ib.notBeforeNs   = lastNowNs_ + backoffNs;
         ib.sentSessionId = 0;
+        return;
+    }
+    if (ec >= kAuthenticationFailed && ec <= kPasswordChangeRequired) {
+        // Authentication (44..47): NOT appended and never will be by re-sending — the transaction is abortable
+        // with the broker's code (abortTransaction() works, no epoch bump: nothing of ours is stored), not
+        // retried kMaxRetries times into a DeliveryFailed.
+        eraseBatch_(it);
+        poison_(OpStatus::BrokerError, static_cast<uint16_t>(ec), /*bumpEpoch=*/false);
         return;
     }
     if ((ec == kOutOfOrderSequence || unknownPid) && ps != nullptr) {

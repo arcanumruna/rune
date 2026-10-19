@@ -155,6 +155,14 @@ enum class SubscriptionFailReason : int32_t {
     /// the committed history: it is never resumed silently from position();
     /// re-read from 0 and re-validate (rune::client::CatalogReader does).
     CatalogReadEnded = 5,
+    /// Authentication (client version 9): the broker refused the Subscribe — or ended the live subscription when
+    /// its READ grant was revoked — with NotAuthorized (45), on the Subscribe's correlation id or in the
+    /// SubscribeResponse.  Never re-armed: a grant is an admin's act.  brokerErrorCode() is 45.
+    NotAuthorized = 6,
+    /// Authentication (D26): the session's user was dropped / disabled (SessionRevoked, 46) — on this
+    /// subscription's correlation id, or as the session-level notice that ends everything of the session.
+    /// The session is closed and not reconnected.  brokerErrorCode() is 46.
+    SessionRevoked = 7,
 };
 
 struct SubscriptionStatus {

@@ -183,6 +183,16 @@ public:
     /// `correlationId` (its handle sees finished()).  False if none.
     bool failPendingSubscribe(int64_t correlationId, SubscriptionFailReason reason,
                               uint16_t brokerErrorCode = 0);
+    /// Authentication (Task 7): the broker refused the Subscribe `correlationId` (ErrorResponse{NotAuthorized} —
+    /// a Subscribe never granted, or a live one whose READ was revoked) or revoked its session
+    /// (ErrorResponse{SessionRevoked} on the subscription): the PENDING or BOUND subscription is FINISHED with
+    /// `why` / `code` (brokerErrorCode), never re-armed.  An answer from a session the subscription is not on
+    /// (a stale one of an earlier session) is consumed and ignored.  False when `correlationId` names none.
+    bool endRefused(int64_t correlationId, int64_t answerSid, int64_t seedSid, SubscriptionFailReason why,
+                    uint16_t code);
+    /// Authentication (D26): the session was revoked — every active subscription, pending or bound on whichever
+    /// node session, is finished with `why` / `code`.  No allocation.  Returns how many were ended.
+    int endAllLive(SubscriptionFailReason why, uint16_t code);
 
     /// Rune E2 Task 13: the broker answered the Subscribe `correlationId` of a
     /// BOUND subscription with NotLeader / Redirect — its node stopped leading

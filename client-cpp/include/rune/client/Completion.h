@@ -62,6 +62,20 @@ enum class OpStatus : uint8_t {
     InvalidArgument, ///< the duty thread refused the op as malformed before sending it (payload = why)
 };
 
+/// Authentication (codes 44..47, client version 9): the name of an auth-related Completion::errorCode when
+/// status == BrokerError, else nullptr.  AuthenticationFailed ends the session (a connect fails with it, every
+/// pending op too); NotAuthorized fails exactly that op and is never re-sent; SessionRevoked completes
+/// everything in flight and is terminal (no reconnect); PasswordChangeRequired fails exactly that op.
+[[nodiscard]] constexpr const char* authErrorName(uint16_t code) noexcept {
+    switch (code) {
+    case 44: return "AuthenticationFailed";
+    case 45: return "NotAuthorized";
+    case 46: return "SessionRevoked";
+    case 47: return "PasswordChangeRequired";
+    default: return nullptr;
+    }
+}
+
 /// One completion record: 40 bytes, trivially copyable.  A variable payload
 /// (ping echo, schema descriptor blob, error text) follows it inline.
 struct Completion {
@@ -70,7 +84,8 @@ struct Completion {
                                  ///< DefineTopic/GetTopicSchema/AlterTopic: topicId; ResultTooLarge: real size
                                  ///< CreateView: viewTopicId; GetViewRow: rowLen (informational; the payload's
                                  ///< own length is ground truth)
-    int64_t  aux   = 0;          ///< GetTopicSchema/DefineTopic: version; AlterTopic: newVersion; Tier2: recordCount
+    int64_t  aux   = 0;          ///< Connect refused AuthenticationFailed: the broker's retryAfterMs (rate-limited login; 0 = none)
+                                 ///< GetTopicSchema/DefineTopic: version; AlterTopic: newVersion; Tier2: recordCount
                                  ///< CreateView: outputFingerprint (bit-cast uint64_t)
     OpKind   op{};
     OpStatus status = OpStatus::Ok;

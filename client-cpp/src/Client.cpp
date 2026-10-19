@@ -35,6 +35,8 @@
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
+#include <iterator>
 #include <random>
 #include <sstream>
 #include <stdexcept>
@@ -50,6 +52,17 @@ ClientConfig validatedConfig(ClientConfig c) {
     if (c.traceDdlRetries && c.runnerMode != RunnerMode::Invoker)
         throw std::invalid_argument("ClientConfig::traceDdlRetries requires RunnerMode::Invoker "
                                     "(the notes are duty-thread state, read by the Invoker owner)");
+    // Authentication: a password file is read ONCE, here; the contents (trailing newline stripped) become
+    // the password.  Both set is ambiguous: refused, never silently one over the other.
+    if (!c.passwordFile.empty()) {
+        if (!c.password.empty())
+            throw std::invalid_argument("ClientConfig: set either `password` or `passwordFile`, not both");
+        std::ifstream f(c.passwordFile, std::ios::binary);
+        if (!f) throw std::runtime_error("ClientConfig::passwordFile: cannot read '" + c.passwordFile + "'");
+        std::string pw((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        while (!pw.empty() && (pw.back() == '\n' || pw.back() == '\r')) pw.pop_back();
+        c.password = std::move(pw);
+    }
     return c;
 }
 // F8c C8: the runner start latch (spec §3.4) — one empty record on a
@@ -126,7 +139,8 @@ agent::AgentConfig toAgentConfig(const ClientConfig& c) {
     acfg.session.offerCrypto   = c.offerCrypto;
     acfg.session.tlsTrustPem   = c.tlsTrustPem;
     acfg.session.tlsExpectHost = c.tlsExpectHost;
-    acfg.session.authToken     = c.authToken;
+    acfg.session.username      = c.username;   // authentication: SCRAM credentials (never logged)
+    acfg.session.password      = c.password;
     acfg.session.requireCrypto = c.requireCrypto;
     acfg.transport.clientLivenessTimeoutNs = c.aeronClientLivenessTimeoutNs;
     // F12: malformed env values are reported (once per Client construction —
@@ -694,10 +708,45 @@ session::SessionState Client::state() const {
     return static_cast<session::SessionState>(seedStatusCache_.state);
 }
 
+AuthStatus Client::authStatus() const {
+    namespace rpc = rune::protocol::client;
+    const auto me = std::this_thread::get_id();
+    session::SessionState st;
+    rpc::AuthMode         mode;
+    bool                  passwordChange;
+    if (me == dutyThreadId_) {   // the duty thread itself (Invoker owner, a callback): the machine, directly
+        const auto& m  = agent_.seedMachine();
+        st             = m.state();
+        mode           = m.brokerAuthMode();
+        passwordChange = m.passwordChangeRequired();
+    } else {
+        if (me != ownerThread_) {
+            throw std::logic_error(
+                "Client::authStatus(): call from the owner (constructing) thread or a duty-cycle callback");
+        }
+        (void)seedStatus_.drainLatest(seedStatusCache_);   // Thread mode: the latest status the duty thread published
+        st             = static_cast<session::SessionState>(seedStatusCache_.state);
+        mode           = static_cast<rpc::AuthMode>(seedStatusCache_.authMode);
+        passwordChange = seedStatusCache_.passwordChangeRequired != 0;
+    }
+    AuthStatus a;
+    a.brokerMode = mode;
+    if (st == session::SessionState::Connected && mode == rpc::AuthMode::Required) {
+        a.kind = passwordChange ? AuthStatus::Kind::PasswordChangeRequired : AuthStatus::Kind::Authenticated;
+        a.user = cfg_.username;
+    }
+    return a;
+}
+
 void Client::publishSeedStatus_(session::SessionState st, int64_t sid) noexcept {
     if (cfg_.runnerMode != RunnerMode::Thread) return;  // Invoker: the owner reads it directly
     seedStatusLast_.state     = static_cast<uint8_t>(st);
     seedStatusLast_.sessionId = sid;
+    {   // authentication: the login facts that change on the same edges
+        const auto& m = agent_.seedMachine();
+        seedStatusLast_.authMode               = static_cast<uint8_t>(m.brokerAuthMode());
+        seedStatusLast_.passwordChangeRequired = m.passwordChangeRequired() ? 1 : 0;
+    }
     seedStatusDirty_ = !seedStatus_.tryPublish(seedStatusLast_);
 }
 
@@ -1655,6 +1704,7 @@ bool Client::seedCannotReconnect_() const noexcept {
     case session::SessionState::Connected:
     case session::SessionState::Connecting:
     case session::SessionState::Handshaking:
+    case session::SessionState::Authenticating:
     case session::SessionState::Resuming:
     case session::SessionState::Backoff:
         return false;
@@ -2097,11 +2147,11 @@ void Client::onSeedConnected_(int64_t sessionId, int32_t brokerVersion) {
     }
 }
 
-void Client::completeConnect_(OpStatus st, int64_t value, uint16_t errorCode, std::string_view text) {
+void Client::completeConnect_(OpStatus st, int64_t value, uint16_t errorCode, std::string_view text, int64_t aux) {
     if (!hasPendingConnect_) return;
     PendingCtl p = std::move(pendingConnect_);
     hasPendingConnect_ = false;
-    completeCtl_(p, st, value, 0, errorCode,
+    completeCtl_(p, st, value, aux, errorCode,
                  std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(text.data()), text.size()));
 }
 
@@ -2183,6 +2233,16 @@ void Client::failAllControl_(OpStatus st) {
     }
 }
 
+void Client::failAllControlWithCode_(uint16_t errorCode, std::string_view text) {
+    const auto payload = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(text.data()), text.size());
+    if (hasPendingConnect_) completeConnect_(OpStatus::BrokerError, 0, errorCode, text);
+    while (!pendingCtl_.empty()) {
+        PendingCtl p = takeCtl_(pendingCtl_.size() - 1);
+        completeCtl_(p, OpStatus::BrokerError,
+                     p.op == OpKind::Ping ? 0 : (isRoutedCtlOp(p.op) ? ddlNoValue(p.op) : -1), 0, errorCode, payload);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // F8c C3: *AndWait — cold-path blocking conveniences (pump-until-done)
 // ---------------------------------------------------------------------------
@@ -2203,6 +2263,7 @@ void Client::throwForStatus_(const char* what, const Completion& c, std::span<co
     case OpStatus::ResultTooLarge: msg += ": result too large (" + std::to_string(c.value) + " bytes)"; break;
     case OpStatus::BrokerError:
         msg += ": broker error code " + std::to_string(c.errorCode);
+        if (const char* an = authErrorName(c.errorCode)) msg += std::string(" (") + an + ")";
         if (!payload.empty()) msg += ": " + std::string(reinterpret_cast<const char*>(payload.data()), payload.size());
         break;
     default:                       msg += ": failed (status " + std::to_string(static_cast<int>(c.status)) + ")"; break;
@@ -3019,6 +3080,68 @@ void Client::sweepTimeouts(int64_t nowNs) {
 // onEgressFrame() — egress observer, runs on the runner/agent thread
 // ---------------------------------------------------------------------------
 
+bool Client::onAuthErrorResponse_(const codec::ErrorResponseView& e) {
+    namespace rpc = rune::protocol::client;
+    const auto ec = static_cast<rpc::ErrorCode>(static_cast<uint16_t>(e.code));
+    const auto code = static_cast<uint16_t>(e.code);
+    std::string msg(e.message);
+    if (msg.empty()) msg = std::string(authErrorName(code) != nullptr ? authErrorName(code) : "ErrorResponse") +
+                           " (code " + std::to_string(e.code) + ")";
+    const auto snap = agent_.stateAndSessionId();
+
+    if (e.correlationId == 0) {
+        if (ec != rpc::ErrorCode::SessionRevoked) return false;   // a session-level 44 concerns the login (below)
+        // D26: the session-level notice.  Only the SEED's own session ends the Client's work; the agent already
+        // put that session's machine in Rejected (a notice naming a session this client left was dropped by the
+        // agent's F-A C1 guard and arrives here with the id of no session we hold).
+        if (e.sessionId != 0 && e.sessionId != snap.sessionId) return true;
+        onSeedRevoked_(msg);
+        return true;
+    }
+
+    // A pending connect answered AuthenticationFailed by an ErrorResponse (the broker's auth deadline, D13): the
+    // seed machine went Rejected in the agent; the connect and every pending op end with the code, once.
+    if (ec == rpc::ErrorCode::AuthenticationFailed &&
+        e.correlationId == agent_.seedSession().machine.correlationId() &&
+        agent_.seedMachine().state() == session::SessionState::Rejected) {
+        completeConnect_(OpStatus::BrokerError, 0, code, msg);
+        failAllControlWithCode_(code, msg);
+        if (cbError_) invokeUserCallback_("onError", [&] { cbError_(msg); });
+        return true;
+    }
+
+    // A subscription's correlation id (the Subscribe, pending or bound): finished with the code, never re-armed.
+    const SubscriptionFailReason why = ec == rpc::ErrorCode::SessionRevoked ? SubscriptionFailReason::SessionRevoked
+                                     : ec == rpc::ErrorCode::NotAuthorized  ? SubscriptionFailReason::NotAuthorized
+                                                                            : SubscriptionFailReason::RejectedByBroker;
+    if (subscriberHub_.endRefused(e.correlationId, e.sessionId, snap.sessionId, why, code)) {
+        if (cbError_) invokeUserCallback_("onError", [&] { cbError_(msg); });
+        return true;
+    }
+    // A group member's partition fetch.
+    if (groupConsumerHub_.onFetchAuthRefused(e.correlationId, e.code)) {
+        if (cbError_) invokeUserCallback_("onError", [&] { cbError_(msg); });
+        return true;
+    }
+    // A produce batch answered by an ErrorResponse (its own ProduceResponse is the usual carrier): non-retriable,
+    // completes BrokerError with the code.  A non-batch id is ignored by the hub.
+    producerHub_.onProduceResponse(e.correlationId, -1, e.code, -1);
+    return false;   // control ops / DDL / connect: the generic tail completes them with the code
+}
+
+void Client::onSeedRevoked_(std::string_view text) {
+    constexpr uint16_t kRevoked = static_cast<uint16_t>(rune::protocol::client::ErrorCode::SessionRevoked);
+    // Every in-flight request: a pending connect, every control op, every unanswered produce batch.
+    failAllControlWithCode_(kRevoked, text);
+    producerHub_.failInFlightBroker(kRevoked);
+    // Every subscription and group consumer of the session.
+    (void)subscriberHub_.endAllLive(SubscriptionFailReason::SessionRevoked, kRevoked);
+    (void)groupConsumerHub_.revokeAll();
+    // The seed machine is Rejected(SessionRevoked): the duty cycle's failure tail (enterFailed_) closes the rest
+    // — nothing reconnects (D26).
+    if (cbError_) invokeUserCallback_("onError", [&] { cbError_(std::string(text)); });
+}
+
 void Client::onEgressFrame(codec::TemplateId tid,
                             const uint8_t*    buf,
                             std::size_t       len)
@@ -3104,6 +3227,41 @@ void Client::onEgressFrame(codec::TemplateId tid,
         break;
     }
 
+    // ---- AuthServerFinal (Task 7): the verdict of a session's login ----
+    case codec::TemplateId::AuthServerFinal: {
+        // The agent already drove the session's machine; this frame's verdict is in lastConnect*().
+        syncSeedSession_();
+        auto opt = rune::protocol::client::AuthServerFinal::decode(buf, len);
+        if (!opt) break;
+        if (!agent_.lastConnectAwaited()) break;   // stale / duplicate / after the login
+        if (agent_.lastConnectSession() != 0) {
+            // A leader node's own login: its group fetches follow its Connected edge.
+            if (agent_.lastConnectAccepted() && !groupConsumerHub_.empty())
+                (void)groupConsumerHub_.resendUnanswered(agent_.lastConnectSession());
+            break;
+        }
+        if (agent_.lastConnectAccepted()) {
+            // Authenticated: only NOW is the seed Connected — every connect-time action runs on this edge.
+            onSeedConnected_(agent_.seedMachine().sessionId(), agent_.sessionBrokerVersion(0));
+            break;
+        }
+        if (agent_.seedMachine().state() == session::SessionState::Authenticating) break;   // (cannot happen: awaited)
+        // The login was refused (or the broker proved nothing): the pending connect ends now, once, with the
+        // broker's code and its retry-after (a rate-limited login).  A Rejected seed also fails every pending
+        // op AuthenticationFailed — nothing more can be answered on it.
+        const auto& sm = agent_.seedMachine();
+        const bool rejected = sm.state() == session::SessionState::Rejected;
+        const uint16_t code = rejected ? static_cast<uint16_t>(sm.rejectCode())
+                                       : (opt->errorCode != 0 ? opt->errorCode : uint16_t{44});
+        std::string msg(opt->detail);
+        if (msg.empty()) msg = opt->errorCode == 0 ? "authentication failed: the broker failed to prove the password"
+                                                    : "authentication failed";
+        completeConnect_(OpStatus::BrokerError, 0, code, msg, static_cast<int64_t>(opt->retryAfterMs));
+        if (rejected) failAllControlWithCode_(code, msg);
+        if (cbError_) invokeUserCallback_("onError", [&] { cbError_(msg); });
+        break;
+    }
+
     // ---- ErrorResponse ----
     case codec::TemplateId::ErrorResponse: {
         syncSeedSession_();  // fix4: a SessionExpired just took the session down
@@ -3137,6 +3295,13 @@ void Client::onEgressFrame(codec::TemplateId tid,
                 }
                 break;
             }
+        }
+
+        // Authentication (Task 7): codes 44..47 — a refused / revoked subscription or group fetch, a rejected
+        // produce batch, a revoked session.  Never routed (Redirect / NotLeader) and never retried.
+        if (ec == rpc::ErrorCode::AuthenticationFailed || ec == rpc::ErrorCode::NotAuthorized ||
+            ec == rpc::ErrorCode::SessionRevoked || ec == rpc::ErrorCode::PasswordChangeRequired) {
+            if (onAuthErrorResponse_(*opt)) break;
         }
 
         // A group member's per-partition Subscribe refused by a non-leader:

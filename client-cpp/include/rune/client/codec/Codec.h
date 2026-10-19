@@ -186,7 +186,35 @@ struct ConnectResponseView {
     // v4 additive crypto fields (Task 5) — default => no crypto chosen.
     uint8_t          chosenCipher = 0;   // rune::crypto::Cipher value; 0 = none
     std::string_view handshakeBytes;     // handshake continuation blob (e.g. TLS ServerHello)
+
+    // v9 authentication fields (Task 7).  A pre-v9 broker's frame decodes as InProcess / Anonymous: it has no
+    // authentication, so the session is Connected at once (the pre-v9 behaviour).
+    rpc::AuthMode  authMode  = rpc::AuthMode::InProcess;
+    rpc::AuthState authState = rpc::AuthState::Anonymous;
 };
+
+/// Authentication (Task 7): encode a v9 ConnectResponse (test / fake-broker use).  Returns bytes written, or 0.
+inline std::size_t encodeConnectResponseV9(std::vector<uint8_t>& buf,
+                                           int16_t code, int32_t leaderMemberId, int64_t assignedSessionId,
+                                           int64_t sessionId, int64_t correlationId,
+                                           rpc::AuthMode authMode, rpc::AuthState authState,
+                                           int32_t brokerVersion = rpc::kBrokerVersion,
+                                           uint8_t chosenCipher = 0, std::string_view handshakeBytes = {}) noexcept {
+    rpc::ConnectResponse msg;
+    msg.sessionId         = sessionId;
+    msg.correlationId     = correlationId;
+    msg.code              = code;
+    msg.leaderMemberId    = leaderMemberId;
+    msg.assignedSessionId = assignedSessionId;
+    msg.brokerVersion     = brokerVersion;
+    msg.chosenCipher      = chosenCipher;
+    msg.handshakeBytes    = handshakeBytes;
+    msg.v9                = true;
+    msg.authMode          = authMode;
+    msg.authState         = authState;
+    buf.resize(rpc::ConnectResponse::ENCODED_SIZE_V9 + 4u + handshakeBytes.size());
+    return msg.encode(buf.data());
+}
 
 /// Encode a ConnectResponse frame into buf[0..cap-1].
 /// Returns bytes written (42 on success; 38 when brokerVersion < 0 encodes
@@ -232,6 +260,8 @@ inline std::optional<ConnectResponseView> decodeConnectResponse(const uint8_t* b
     v.brokerVersion     = opt->brokerVersion;
     v.chosenCipher      = opt->chosenCipher;
     v.handshakeBytes    = opt->handshakeBytes;
+    v.authMode          = opt->authMode;
+    v.authState         = opt->authState;
     return v;
 }
 

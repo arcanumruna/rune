@@ -847,6 +847,10 @@ public:
     /// of a close applied inside a handler).  Everything it calls is non-
     /// throwing (handlers are noexcept function pointers; no allocation).
     void failAllPending(OpStatus st) noexcept;
+    /// Authentication (D26): every batch IN FLIGHT (already sent, unanswered) completes BrokerError `errorCode`
+    /// (SessionRevoked) — the answer the broker's closing session can no longer give.  Records not yet sent
+    /// are left to the caller's terminal failure path.  Duty thread.
+    void failInFlightBroker(uint16_t errorCode) noexcept;
 
     /// Duty-cycle thread: fail every record of an in-flight batch (wire id)
     /// with DeliveryFailed.  Non-batch ids are ignored (they can come from any

@@ -24,9 +24,14 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <variant>
 #include <vector>
 
 #include <rune/client/codec/Codec.h>
+#include <rune/client/session/ScramClient.h>
+#include <rune/crypto/Kdf.h>
+#include <rune/crypto/Scram.h>
+#include <rune/protocol/client/AuthMessages.h>
 
 // client<->broker TLS/AEAD (Task 5) — cold-path handshake drive.  TlsSession/AeadCipher
 // are forward-declared-opaque wrappers around OpenSSL; including them here does NOT
@@ -56,6 +61,13 @@ enum class SessionState : uint8_t {
     // done() the session derives keys and moves to Connected.  A verify/export
     // failure is non-retriable -> Rejected (ErrorCode::HandshakeFailed).
     Handshaking,
+    // Authentication (spec §5, D11): entered from Connecting / Handshaking when the ConnectResponse says
+    // authMode Required and authState MustAuthenticate.  One SCRAM-SHA-512 exchange (AuthClientFirst,
+    // AuthClientFinal) runs inside the session — sealed once TLS is up; the state holds exactly that exchange
+    // (SessionMachine::scram_).  Connected only after the broker proved the password (AuthServerFinal{OK} with
+    // a valid server signature); no data frame leaves the session before.  A refusal is terminal Rejected
+    // (AuthenticationFailed) unless the broker rate-limited it (D27).
+    Authenticating,
 };
 
 // ---------------------------------------------------------------------------
@@ -152,7 +164,7 @@ struct SessionConfig {
     // identical to pre-Task-5 (every existing SessionMachineTest keeps passing,
     // including ones that pin an explicit pre-crypto clientVersion like 1).  true
     // = connect() offers a v4 ConnectRequest carrying cipherList/handshakeBytes/
-    // authToken and drives the TLS handshake described below.
+    // (an empty, reserved authToken) and drives the TLS handshake described below.
     bool offerCrypto = false;
     // trust: nullopt = trust the system store (production default); "" = trust
     // nothing (tests, deliberately untrusted); non-empty = a PEM CA bundle.
@@ -161,9 +173,12 @@ struct SessionConfig {
     // "" installs NO hostname check (TlsSession::makeClient contract) — set this to
     // the broker's DNS name in production; left empty only for loopback/tests.
     std::string tlsExpectHost;
-    // Client authZ token carried inside the (now-encrypted-by-TLS) Connect handshake
-    // payload; "" = none offered.  Validated by the broker's existing auth path.
-    std::string authToken;
+    // Authentication (spec §5): the SCRAM credentials.  username "" = no credentials — the broker answers
+    // AuthenticationFailed (the client never short-circuits: the broker enforces).  The password is never
+    // logged and never sent (only a proof derived from it).  The wire's ConnectRequest.authToken field stays
+    // reserved and is always sent empty (fix-on-sight: it was never validated).
+    std::string username;
+    std::string password;
 
     // Task 9 (downgrade safety, spec §11 require_tls's client-side mirror):
     // when true, a ConnectResponse{OK} that negotiates NO cipher (chosenCipher
@@ -311,6 +326,19 @@ public:
     [[nodiscard]] int64_t nextAttemptNs()  const noexcept { return backoff_.nextAttemptNs; }
     /// Rejected state: the non-retriable error code (0 otherwise).
     [[nodiscard]] int16_t rejectCode()     const noexcept { return rejectCode_; }
+    /// Authentication: only a Connected session may carry data frames (Authenticating / Handshaking /
+    /// Connecting never do).
+    [[nodiscard]] bool canSendData() const noexcept { return state_ == SessionState::Connected; }
+    /// Authentication: the broker's authMode from the latest accepted ConnectResponse (InProcess before any).
+    [[nodiscard]] rune::protocol::client::AuthMode brokerAuthMode() const noexcept { return authInfo_.brokerMode; }
+    /// Authentication: AuthServerFinal carried kAuthFlagMustChangePassword (bootstrap one-time password) —
+    /// the session is Connected but the broker only accepts a password change on it.
+    [[nodiscard]] bool passwordChangeRequired() const noexcept { return authInfo_.passwordChangeRequired; }
+    /// Authentication: the retryAfterMs of the AuthServerFinal{44} that last refused this session (0 = none).
+    [[nodiscard]] uint32_t authRetryAfterMs() const noexcept { return authInfo_.retryAfterMs; }
+    /// Authentication: the salted-password cache is the duty thread's (the agent's), shared by its sessions;
+    /// a machine built alone (tests) uses its own.  Duty thread, before the first connect.
+    void useScramCache(ScramCache* cache) noexcept { cache_ = cache != nullptr ? cache : &ownCache_; }
     /// client<->broker TLS/AEAD (Task 5): the session's crypto state.  `encrypted`
     /// is false until the handshake completes (or if no cipher was negotiated).
     [[nodiscard]] const CryptoState& cryptoState() const noexcept { return cryptoState_; }
@@ -342,6 +370,7 @@ public:
     /// fresh TLS episode.  No-op while Connected / Handshaking / terminal.
     void abandonResumeHint() noexcept {
         if (state_ == SessionState::Connected || state_ == SessionState::Handshaking ||
+            state_ == SessionState::Authenticating ||
             state_ == SessionState::Closed || state_ == SessionState::Rejected) return;
         sessionId_   = 0;
         cryptoState_ = CryptoState{};
@@ -378,6 +407,7 @@ public:
         // Force to Disconnected first so doConnect's Connecting transition is
         // a clean fresh episode (reset sessionId + all retry/redirect counters).
         state_ = SessionState::Disconnected;
+        scram_.reset();   // Authentication: an abandoned exchange
         // Task 5: a fresh TlsSession (any prior one is abandoned) — begun by doConnect.
         doConnect(nowNs, /*resetSessionId=*/true, /*freshEpisode=*/true);
     }
@@ -399,7 +429,7 @@ public:
             transitionTo(SessionState::Closed);
             return;
         }
-        if (state_ == SessionState::Handshaking) {
+        if (state_ == SessionState::Handshaking || state_ == SessionState::Authenticating) {
             // Task 5: sessionId_ was already assigned (the broker's first
             // ConnectResponse leg), so a polite goodbye is possible even though
             // the TLS handshake never finished; abandon the in-flight TlsSession.
@@ -433,7 +463,11 @@ public:
                            // params; default-0/empty keeps every pre-Task-5 call
                            // site (5 args) byte-for-byte unchanged in behaviour.
                            uint8_t  chosenCipher = 0,
-                           std::string_view handshakeBytes = {}) noexcept {
+                           std::string_view handshakeBytes = {},
+                           // Authentication (v9): defaults = a broker without authentication, so every
+                           // pre-v9 call site keeps its behaviour (Connected at once).
+                           rune::protocol::client::AuthMode  authMode  = rune::protocol::client::AuthMode::InProcess,
+                           rune::protocol::client::AuthState authState = rune::protocol::client::AuthState::Anonymous) noexcept {
         // FIX E: remove the redundant Closed guard before the !=Connecting guard.
         if (state_ != SessionState::Connecting) return;  // ignore in wrong state
 
@@ -458,6 +492,8 @@ public:
                     return;
                 }
                 hs_->chosenCipher = static_cast<rune::crypto::Cipher>(chosenCipher);
+                hs_->authMode     = authMode;     // the auth step follows the handshake's done()
+                hs_->authState    = authState;
                 transitionTo(SessionState::Handshaking);
                 onHandshakeBytes(reinterpret_cast<const uint8_t*>(handshakeBytes.data()),
                                   handshakeBytes.size(), nowNs);
@@ -475,9 +511,10 @@ public:
                 return;
             }
 
-            // Happy path — no crypto chosen (plaintext session, or a pre-v4 broker).
+            // Happy path — no crypto chosen (plaintext session, or a pre-v4 broker): authenticate when the
+            // broker requires it, else Connected.
             hs_.reset();
-            finishConnected_(nowNs);
+            beginAuthOrFinish_(nowNs, authMode, authState);
             return;
         }
 
@@ -605,6 +642,91 @@ public:
         // HandshakeContinueResponse) — nothing further to do this call.
     }
 
+    // ------------------------------------------------------------------------
+    // Authentication (spec §5, D5) — the SCRAM exchange of the Authenticating state.
+    // ------------------------------------------------------------------------
+
+    /// AuthServerFirst arrived: answer one RFC 5802 proof per active verifier (1 or 2) over its own AuthMessage,
+    /// salting the password through the agent's ScramCache (PBKDF2 only on a cold (salt, iterations)).  Ignored
+    /// outside Authenticating / ScramSentFirst.  A combined nonce that does not extend ours is a broker fault:
+    /// Rejected(AuthenticationFailed).
+    void onAuthServerFirst(const rune::protocol::client::AuthServerFirst& sf, int64_t nowNs) noexcept {
+        namespace rpc = rune::protocol::client;
+        namespace rs  = rune::crypto::scram;
+        if (state_ != SessionState::Authenticating || !scram_) return;
+        auto* first = std::get_if<ScramSentFirst>(&*scram_);
+        if (first == nullptr) return;   // a duplicate AuthServerFirst: the proof already went out
+        const std::string_view cn = first->clientNonce;
+        if (sf.combinedNonce.size() <= cn.size() || sf.combinedNonce.substr(0, cn.size()) != cn ||
+            sf.combinedNonce.find(',') != std::string_view::npos) {
+            failAuth_(rpc::ErrorCode::AuthenticationFailed, 0, nowNs);   // "broker nonce does not extend ours"
+            return;
+        }
+        if (sf.count < 1 || sf.count > rpc::kAuthMaxVerifiers) {
+            failAuth_(rpc::ErrorCode::AuthenticationFailed, 0, nowNs);
+            return;
+        }
+        const std::string combined(sf.combinedNonce);
+        const std::string cfwp = rs::clientFinalWithoutProof(combined);
+        ScramSentFinal fin;
+        fin.count = sf.count;
+        rpc::AuthClientFinal out;
+        out.sessionId     = sessionId_;
+        out.correlationId = correlationId_;
+        out.count         = sf.count;
+        for (uint8_t i = 0; i < sf.count; ++i) {
+            const auto salt = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(sf.salts[i].salt.data()),
+                                                       sf.salts[i].salt.size());
+            const auto* sp = cache_->saltedPassword(cfg_.password, salt, sf.salts[i].iterations);
+            if (sp == nullptr) { failAuthLocal_(); return; }
+            fin.authMessages[i] = rs::authMessage(first->clientFirstBare,
+                                                  rs::serverFirst(combined, salt, sf.salts[i].iterations), cfwp);
+            const auto proof = rs::clientProof(rune::crypto::Digest::Sha512, *sp, fin.authMessages[i]);
+            const auto sig   = rs::expectedServerSignature(rune::crypto::Digest::Sha512, *sp, fin.authMessages[i]);
+            if (!proof || !sig || proof->size != rpc::kScramProofBytes) { failAuthLocal_(); return; }
+            std::memcpy(out.proofs[i].data(), proof->bytes.data(), rpc::kScramProofBytes);
+            fin.expected[i] = *sig;
+        }
+        hsFrameBuf_.resize(out.encodedSize());
+        const std::size_t n = out.encode(hsFrameBuf_.data());
+        scram_.emplace(std::move(fin));   // ScramSentFirst -> ScramSentFinal: the same state, its next variables
+        if (n > 0) (void)io_.sendFrame(hsFrameBuf_.data(), n);
+    }
+
+    /// AuthServerFinal arrived — the verdict.  OK needs a server signature equal to one of the expected ones
+    /// (constant time): then Connected (finishConnected_); a missing / wrong signature means the broker could
+    /// not prove the password: Rejected(AuthenticationFailed).  An error code: 44 is terminal (Rejected) unless
+    /// rate-limited — with retryAfterMs > 0 and reconnectForeverAfterLive the session backs off at least that
+    /// long (D27).  The kAuthFlagMustChangePassword flag marks a one-time-password session.
+    void onAuthServerFinal(const rune::protocol::client::AuthServerFinal& f, int64_t nowNs) noexcept {
+        namespace rpc = rune::protocol::client;
+        if (state_ != SessionState::Authenticating || !scram_) return;
+        if (f.errorCode != 0) {
+            const auto ec = static_cast<rpc::ErrorCode>(f.errorCode);
+            if (ec == rpc::ErrorCode::AuthenticationFailed) failAuth_(ec, f.retryAfterMs, nowNs);
+            else onConnectError_(ec, nowNs);   // anything else (Internal ...): a connect failure
+            return;
+        }
+        const auto* fin = std::get_if<ScramSentFinal>(&*scram_);
+        if (fin == nullptr || f.serverSignature.size() != rpc::kAuthSignatureBytes) {
+            failAuth_(rpc::ErrorCode::AuthenticationFailed, 0, nowNs);   // no proof owed yet / no signature
+            return;
+        }
+        const auto got = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(f.serverSignature.data()),
+                                                  f.serverSignature.size());
+        bool match = false;
+        for (uint8_t i = 0; i < fin->count; ++i) {   // no early exit: constant time over the verifiers
+            match |= rune::crypto::constantTimeEqual(fin->expected[i].view(), got);
+        }
+        if (!match) {
+            failAuth_(rpc::ErrorCode::AuthenticationFailed, 0, nowNs);   // "broker failed to prove the password"
+            return;
+        }
+        authInfo_.passwordChangeRequired = (f.flags & rpc::kAuthFlagMustChangePassword) != 0;
+        authInfo_.retryAfterMs           = 0;
+        finishConnected_(nowNs);
+    }
+
     /// An ErrorResponse arrived.
     /// SessionExpired / UnknownSession in Connected → Resuming.
     /// Redirect/NotLeader in Connecting with an endpoint string → retarget + resend.
@@ -627,6 +749,25 @@ public:
                 transitionTo(SessionState::Resuming);
                 // doResume fires on the next tick (FIX D: Resuming is a real waiting state).
                 resumeEntryNs_ = nowNs;
+            } else if (ec == rpc::ErrorCode::SessionRevoked && incomingCorrelationId == 0) {
+                // Authentication (D26): the session-level ErrorResponse{SessionRevoked, corr 0} — the user was
+                // dropped / disabled (or the broker's security log halted).  The broker closes the session:
+                // terminal, never resumed or reconnected (a reconnect is AuthenticationFailed anyway).
+                rejectCode_       = static_cast<int16_t>(static_cast<uint16_t>(ec));
+                lastConnectError_ = rejectCode_;
+                transitionTo(SessionState::Rejected);
+            }
+            return;
+        }
+
+        if (state_ == SessionState::Authenticating) {
+            // Authentication: the broker ended the exchange with an ErrorResponse (its auth deadline, D13)
+            // instead of an AuthServerFinal.  Only the answer to THIS episode counts.
+            if (incomingCorrelationId != correlationId_) return;
+            if (ec == rpc::ErrorCode::AuthenticationFailed) {
+                failAuth_(ec, /*retryAfterMs=*/0, nowNs);
+            } else if (ec == rpc::ErrorCode::SessionExpired || ec == rpc::ErrorCode::UnknownSession) {
+                onConnectError_(ec, nowNs);
             }
             return;
         }
@@ -699,6 +840,9 @@ public:
         case SessionState::Handshaking:
             tickHandshaking_(nowNs);
             break;
+        case SessionState::Authenticating:
+            tickAuthenticating_(nowNs);
+            break;
         case SessionState::Connected:
             tickConnected(nowNs);
             break;
@@ -740,6 +884,7 @@ private:
 
     void transitionTo(SessionState next) noexcept {
         if (state_ == SessionState::Closed) return;  // terminal
+        if (next != SessionState::Authenticating) scram_.reset();   // the exchange's variables live in that state only
         state_ = next;
     }
 
@@ -800,7 +945,7 @@ private:
     /// Encode + send the current ConnectRequest.  Branches on whether a crypto
     /// handshake is in flight (hs_ engaged): with crypto, offers
     /// cipherList={bestLocalCipher()} + the pending ClientHello bytes (hs_->outbound,
-    /// drained by beginCryptoHandshake_()) + authToken, via the GROWABLE
+    /// drained by beginCryptoHandshake_()) + an empty authToken, via the GROWABLE
     /// hsFrameBuf_ (kScratchCap=512 is not guaranteed to fit a TLS flight);
     /// without crypto, the original fixed-scratch encode (byte-identical to
     /// pre-Task-5 behaviour).  Sets connectSentOk_ either way.
@@ -836,7 +981,7 @@ private:
                      : rune::protocol::client::kClientVersionCrypto),
                 sessionId_, correlationId_,
                 std::span<const uint8_t>(&cipherByte, 1),
-                hs, cfg_.authToken);
+                hs, std::string_view{});   // ConnectRequest.authToken: reserved, always empty
             connectSentOk_ = n > 0 && io_.sendFrame(hsFrameBuf_.data(), n);
             return;
         }
@@ -912,8 +1057,77 @@ private:
         cryptoState_.b2cKey = keys.b2c;
         std::memcpy(cryptoState_.b2cPrefix, keys.b2cPrefix, sizeof(cryptoState_.b2cPrefix));
         cryptoState_.encrypted = true;
+        const auto authMode  = hs_->authMode;
+        const auto authState = hs_->authState;
         hs_.reset();  // handshake object no longer needed once keys are exported
+        beginAuthOrFinish_(nowNs, authMode, authState);   // SCRAM runs sealed (D11), then Connected
+    }
+
+    /// Authentication (D11): the connect episode's last step.  The broker requires a login of this session
+    /// (authMode Required + authState MustAuthenticate) -> Authenticating, AuthClientFirst sent; anything else
+    /// (dev mode, an in-process broker, a resumed authenticated session, a pre-v9 broker) -> Connected.
+    void beginAuthOrFinish_(int64_t nowNs, rune::protocol::client::AuthMode mode,
+                            rune::protocol::client::AuthState state) noexcept {
+        namespace rpc = rune::protocol::client;
+        authInfo_.brokerMode = mode;
+        if (mode == rpc::AuthMode::Required && state == rpc::AuthState::MustAuthenticate) {
+            beginAuth_(nowNs);
+            return;
+        }
         finishConnected_(nowNs);
+    }
+
+    void beginAuth_(int64_t nowNs) noexcept {
+        namespace rpc = rune::protocol::client;
+        std::string nonce = rune::crypto::scram::makeNonce();
+        if (nonce.empty()) { failAuthLocal_(); return; }   // no randomness: fail closed
+        ScramSentFirst first;
+        first.clientFirstBare = rune::crypto::scram::clientFirstBare(cfg_.username, nonce);
+        first.clientNonce     = std::move(nonce);
+        connectStartNs_       = nowNs;                      // the login has its own connectTimeoutNs
+        authInfo_.passwordChangeRequired = false;
+        rpc::AuthClientFirst m;
+        m.sessionId     = sessionId_;
+        m.correlationId = correlationId_;
+        m.username      = cfg_.username;       // "" = no credentials: the broker answers 44, we never short-circuit
+        m.clientNonce   = first.clientNonce;
+        scram_.emplace(std::move(first));
+        transitionTo(SessionState::Authenticating);
+        hsFrameBuf_.resize(m.encodedSize());
+        const std::size_t n = m.encode(hsFrameBuf_.data());
+        if (n > 0) (void)io_.sendFrame(hsFrameBuf_.data(), n);
+    }
+
+    /// The broker refused the login (or proved nothing): terminal Rejected(code) — except a rate-limited 44
+    /// (retryAfterMs > 0) of a reconnect-forever session that was Live, which backs off at least that long (D27).
+    void failAuth_(rune::protocol::client::ErrorCode ec, uint32_t retryAfterMs, int64_t nowNs) noexcept {
+        lastConnectError_ = static_cast<int16_t>(static_cast<uint16_t>(ec));
+        authInfo_.retryAfterMs = retryAfterMs;
+        ++connectFailures_;
+        cryptoState_ = CryptoState{};
+        if (retryAfterMs > 0 && reconnectsForever_()) {
+            sessionId_ = 0;                       // the refused broker session is gone: the retry is fresh
+            enterBackoff_(nowNs);
+            const int64_t notBefore = nowNs + static_cast<int64_t>(retryAfterMs) * 1'000'000LL;
+            if (backoff_.nextAttemptNs < notBefore) backoff_.nextAttemptNs = notBefore;   // max(retryAfter, backoff)
+            return;
+        }
+        rejectCode_ = static_cast<int16_t>(static_cast<uint16_t>(ec));
+        transitionTo(SessionState::Rejected);
+    }
+
+    /// A LOCAL failure (no randomness, PBKDF2 refused): not the broker's verdict, but never a plaintext login.
+    void failAuthLocal_() noexcept {
+        lastConnectError_ = static_cast<int16_t>(static_cast<uint16_t>(rune::protocol::client::ErrorCode::Internal));
+        rejectCode_       = lastConnectError_;
+        cryptoState_      = CryptoState{};
+        transitionTo(SessionState::Rejected);
+    }
+
+    void tickAuthenticating_(int64_t nowNs) noexcept {
+        if (nowNs - connectStartNs_ > cfg_.connectTimeoutNs) {
+            onHandshakeTimedOut_(nowNs);   // a broker that never answers the login: transient, like a stuck handshake
+        }
     }
 
     /// Shared happy-path bookkeeping for "this connect episode is complete,
@@ -1041,7 +1255,8 @@ private:
     /// same handshake against the same broker identity cannot change the outcome.
     [[nodiscard]] static bool isNonRetriable_(rune::protocol::client::ErrorCode ec) noexcept {
         return ec == rune::protocol::client::ErrorCode::ProtocolVersion ||
-               ec == rune::protocol::client::ErrorCode::HandshakeFailed;
+               ec == rune::protocol::client::ErrorCode::HandshakeFailed ||
+               ec == rune::protocol::client::ErrorCode::AuthenticationFailed;   // credentials are cluster-wide (D27)
     }
 
     [[nodiscard]] bool reconnectsForever_() const noexcept {
@@ -1231,6 +1446,9 @@ private:
         rune::crypto::Cipher     chosenCipher = rune::crypto::Cipher::None;  // from ConnectResponse.chosenCipher
         std::vector<uint8_t>     outbound;   // pending outbound handshake bytes (cold path, growable)
         int64_t                  requestCorrelationId = 0;   // the ONE ConnectRequest this episode answers
+        // Authentication: the first leg's verdict on how this session logs in, applied when done() (D11).
+        rune::protocol::client::AuthMode  authMode  = rune::protocol::client::AuthMode::InProcess;
+        rune::protocol::client::AuthState authState = rune::protocol::client::AuthState::Anonymous;
         explicit HandshakeEpisode(rune::crypto::TlsSession t) noexcept : tls(std::move(t)) {}
     };
     std::optional<HandshakeEpisode> hs_;
@@ -1238,6 +1456,22 @@ private:
     // (kScratchCap=512 is not sized for a TLS flight); capacity persists.
     std::vector<uint8_t> hsFrameBuf_;
     CryptoState cryptoState_;
+
+    // ------------------------------------------------------------------------
+    // Authentication (Task 7) — the Authenticating state's own variable and the broker-mode observation.
+    // ------------------------------------------------------------------------
+    // The SCRAM exchange: engaged ONLY while Authenticating (transitionTo clears it on every other edge).
+    std::optional<ScramExchange> scram_;
+    // What the session learnt about authentication: the broker's mode (latched at the ConnectResponse that
+    // decided it), the one-time-password flag of the latest AuthServerFinal, the latest rate-limit.
+    struct AuthInfo {
+        rune::protocol::client::AuthMode brokerMode = rune::protocol::client::AuthMode::InProcess;
+        bool     passwordChangeRequired = false;
+        uint32_t retryAfterMs = 0;
+    };
+    AuthInfo     authInfo_{};
+    ScramCache   ownCache_;
+    ScramCache*  cache_ = &ownCache_;
 };
 
 } // namespace rune::client::session

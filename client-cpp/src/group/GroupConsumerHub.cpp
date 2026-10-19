@@ -195,8 +195,22 @@ GroupVerdict classifyGroupAnswer_(rpc::ErrorCode ec) noexcept {
     case rpc::ErrorCode::IllegalGeneration:
     case rpc::ErrorCode::StaleGeneration:     return GroupVerdict::Rejoin;    // the rebalance protocol
     case rpc::ErrorCode::ProtocolVersion:
-    case rpc::ErrorCode::InvalidRequest:      return GroupVerdict::Refuse;    // re-sending fails the same way
+    case rpc::ErrorCode::InvalidRequest:
+    // Authentication (client version 9): a grant / a login is an admin's act, not a transient condition —
+    // re-joining cannot change the answer (it used to fall into Backoff and loop until the retry budget).
+    case rpc::ErrorCode::AuthenticationFailed:
+    case rpc::ErrorCode::NotAuthorized:
+    case rpc::ErrorCode::SessionRevoked:
+    case rpc::ErrorCode::PasswordChangeRequired: return GroupVerdict::Refuse;    // re-sending fails the same way
     default:                                  return GroupVerdict::Backoff;   // Internal, NotLeader, unknown, ...
+    }
+}
+/// Why a Refuse verdict ended the consumer.
+GroupFailReason refusalFor_(rpc::ErrorCode ec) noexcept {
+    switch (ec) {
+    case rpc::ErrorCode::NotAuthorized:  return GroupFailReason::NotAuthorized;
+    case rpc::ErrorCode::SessionRevoked: return GroupFailReason::SessionRevoked;
+    default:                             return GroupFailReason::RefusedByBroker;
     }
 }
 } // namespace
@@ -914,6 +928,12 @@ bool GroupConsumerHub::onFetchSubscribeResponse(int64_t corrId, int16_t errorCod
         for (auto& [tp, fs] : impl->fetch) {
             if (fs.corrId != corrId) continue;
             fs.corrId = 0;
+            if (errorCode == static_cast<int16_t>(rpc::ErrorCode::NotAuthorized) ||
+                errorCode == static_cast<int16_t>(rpc::ErrorCode::SessionRevoked)) {
+                // Authentication: not retriable — never parked for a metadata retry loop.
+                refuse_(*impl, refusalFor_(static_cast<rpc::ErrorCode>(static_cast<uint16_t>(errorCode))));
+                return true;
+            }
             if (errorCode == 0) {
                 fs.subscriptionId = subscriptionId;
                 fs.redirects      = 0;
@@ -936,6 +956,33 @@ bool GroupConsumerHub::onFetchSubscribeResponse(int64_t corrId, int16_t errorCod
         break;
     }
     return true;  // a group fetch answer (maybe stale): never the SubscriberHub's
+}
+
+bool GroupConsumerHub::onFetchAuthRefused(int64_t corrId, int16_t errorCode)
+{
+    if (!isFetchCorrId(corrId)) return false;
+    for (GroupConsumerImpl* impl : impls_) {
+        if (!impl->active) continue;
+        for (auto& [tp, fs] : impl->fetch) {
+            // Unanswered (corrId), or a BOUND instance (its Subscribe id: a revoked READ ends it explicitly).
+            if (fs.corrId != corrId && !(fs.epoch != 0 && fs.instanceCorr == corrId)) continue;
+            refuse_(*impl, refusalFor_(static_cast<rpc::ErrorCode>(static_cast<uint16_t>(errorCode))));
+            return true;
+        }
+    }
+    return false;
+}
+
+int GroupConsumerHub::revokeAll()
+{
+    int n = 0;
+    for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {   // re-entrancy safe (I-3)
+        GroupConsumerImpl* const impl = impls_[ix];
+        if (!impl->active) continue;
+        refuse_(*impl, GroupFailReason::SessionRevoked);
+        ++n;
+    }
+    return n;
 }
 
 bool GroupConsumerHub::onFetchSubscribeRefused(int64_t corrId, bool park, int32_t& topicId, int32_t& partition)
@@ -1412,7 +1459,7 @@ void GroupConsumerHub::onJoinGroupResponse(const uint8_t* buf, std::size_t len,
             // MAJOR-2 (round 3): ProtocolVersion — this client is too old for the
             // broker.  No-hang wave: InvalidRequest (the broker could not decode
             // the JoinGroup) — re-joining re-sends the same bytes (a join storm).
-            refuse_(*impl, GroupFailReason::RefusedByBroker);
+            refuse_(*impl, refusalFor_(ec));
         } else if (v == GroupVerdict::Rejoin) {
             toRejoining_(*impl);
         } else {
@@ -1492,7 +1539,7 @@ void GroupConsumerHub::onSyncGroupResponse(const uint8_t* buf, std::size_t len,
             // All assigned partitions have sentinel -1 until this response arrives.
             sendOffsetFetch(*impl, sessionId, sendFn);
         } else if (v == GroupVerdict::Refuse) {
-            refuse_(*impl, GroupFailReason::RefusedByBroker);   // C1: never a SyncGroup loop
+            refuse_(*impl, refusalFor_(ec));   // C1: never a SyncGroup loop
         } else if (v == GroupVerdict::Rejoin) {
             toRejoining_(*impl);
         } else {
@@ -1523,7 +1570,7 @@ void GroupConsumerHub::onHeartbeatResponse(const uint8_t* buf, std::size_t len,
         switch (classifyGroupAnswer_(ec)) {
         case GroupVerdict::Ok:      impl->backoffRejoins = 0; break;   // fix round 3: proven healthy — budget reset
         case GroupVerdict::Rejoin:  toRejoining_(*impl); break;
-        case GroupVerdict::Refuse:  refuse_(*impl, GroupFailReason::RefusedByBroker); break;
+        case GroupVerdict::Refuse:  refuse_(*impl, refusalFor_(ec)); break;
         // C1: never stay Stable on an error the broker could not serve — the
         // broker may have evicted this member (split-brain): rejoin, paced.
         case GroupVerdict::Backoff: rejoinWithBackoff_(*impl); break;
@@ -1588,6 +1635,7 @@ void GroupConsumerHub::onOffsetFetchResponse(const uint8_t* buf, std::size_t len
         impl->offsetFetchPhase = GroupConsumerImpl::OffsetFetchPhase::Idle;   // answered: none in flight
 
         bool refused = false;
+        GroupFailReason refusedWhy = GroupFailReason::RefusedByBroker;
         bool rejoin = false;
         bool retriableError = false;
         // (#1a) Seed positions from committed offsets.
@@ -1604,7 +1652,10 @@ void GroupConsumerHub::onOffsetFetchResponse(const uint8_t* buf, std::size_t len
                 // (paced by retryOffsetFetch) within kMaxOffsetFetchAttempts.
                 const auto ec = static_cast<rpc::ErrorCode>(static_cast<uint16_t>(r.errorCode));
                 const GroupVerdict v = classifyGroupAnswer_(ec);
-                if (r.topicId < 0 || v == GroupVerdict::Refuse) refused = true;
+                if (r.topicId < 0 || v == GroupVerdict::Refuse) {
+                    refused = true;
+                    if (v == GroupVerdict::Refuse) refusedWhy = refusalFor_(ec);
+                }
                 // Fix round 4: NotCoordinator (& the rebalance set) = the coordinator
                 // moved / the group is rebalancing — the member REDISCOVERS the
                 // coordinator by re-joining (paced, capped: rejoinForOffsetFetch_),
@@ -1633,7 +1684,7 @@ void GroupConsumerHub::onOffsetFetchResponse(const uint8_t* buf, std::size_t len
             if (routed_()) impl->fetch[tp].offsetKnown = true;
         }
         if (refused) {
-            refuse_(*impl, GroupFailReason::RefusedByBroker);
+            refuse_(*impl, refusedWhy);
             break;
         }
         if (rejoin) {
@@ -1717,6 +1768,10 @@ void GroupConsumerHub::refuse_(GroupConsumerImpl& impl, GroupFailReason why)
               "version >= 3)"
         : why == GroupFailReason::RetryBudgetExhausted
             ? "a retriable coordinator failure persisted past its retry budget (transient: recreate the consumer)"
+        : why == GroupFailReason::NotAuthorized
+            ? "NotAuthorized: the principal holds no READ on the group / topic (ask an admin for the grant)"
+        : why == GroupFailReason::SessionRevoked
+            ? "SessionRevoked: the session's user was dropped or disabled"
             : "the broker coordinator refused this consumer's request (non-retriable answer)");
     if (routed_()) dropAllFetch_(impl);
     impl.failReason = why;

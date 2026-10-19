@@ -478,6 +478,14 @@ std::optional<CatalogResult<void>> CatalogReader::pollRefresh(int64_t nowNs, int
                                                     "catalog Subscribe refused by the broker (error code " +
                                                         std::to_string(code) + ")",
                                                     replayer_.nextOffset(), code});
+        case SubscriptionFailReason::NotAuthorized:   // authentication (D21): catalog reads need DESCRIBE ON CLUSTER
+        case SubscriptionFailReason::SessionRevoked:
+            return std::unexpected(CatalogReadError{CatalogReadError::Kind::Rejected,
+                                                    std::string(why == SubscriptionFailReason::NotAuthorized
+                                                                    ? "catalog read not authorized (NotAuthorized)"
+                                                                    : "catalog read ended: the session was revoked") +
+                                                        " (error code " + std::to_string(code) + ")",
+                                                    replayer_.nextOffset(), code});
         case SubscriptionFailReason::LeaderElsewhereWhileGroupActive:
             return std::unexpected(CatalogReadError{CatalogReadError::Kind::Rejected,
                                                     "catalog Subscribe could not be routed",

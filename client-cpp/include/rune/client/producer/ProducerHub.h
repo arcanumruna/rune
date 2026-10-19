@@ -147,6 +147,13 @@ public:
     /// SessionLost; the producers stay open).
     void failAll(OpStatus st);
 
+    /// Authentication (D26): every in-flight batch of every producer completes BrokerError `errorCode`.
+    void failInFlightBroker(uint16_t errorCode) {
+        for (ProducerImpl* impl : active_) {
+            if (impl != nullptr) impl->failInFlightBroker(errorCode);
+        }
+    }
+
     /// Client close (after closeAllRings): every producer completes everything
     /// it accepted with `st` exactly once, draining its closed ring to the
     /// frozen tail (bounded by the close-drain unblock rule).

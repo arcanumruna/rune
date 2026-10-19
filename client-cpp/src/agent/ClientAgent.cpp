@@ -84,6 +84,7 @@ ClientAgent::ClientAgent(AgentConfig cfg)
     seedCfg.keepaliveCorrelationId = -1;   // A10: sessions_[0]'s keepalive Pong routing
     sessions_.emplace_back(std::make_unique<Session>(
         this, seedCfg, cfg_.transport.ingressChannel));
+    sessions_.back()->machine.useScramCache(&scramCache_);   // authentication: one salted-password cache per duty thread
 }
 
 // ---------------------------------------------------------------------------
@@ -860,7 +861,10 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
             // SessionMachine::onConnectResponse.  A pre-v4 broker's decode leaves
             // these at their defaults (0 / empty), so this is a no-op then.
             opt->chosenCipher,
-            opt->handshakeBytes);
+            opt->handshakeBytes,
+            // Authentication (v9): the machine logs in (Authenticating) when the broker requires it.
+            opt->authMode,
+            opt->authState);
         s.machine.onActivity(nowNs);
         // Task 5: "accepted" now means reached Connected — true immediately for a
         // plaintext connect, true only once the TLS handshake finishes (possibly
@@ -913,7 +917,8 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
         // seed.  Resolve it by the (session id, connect corrId) pair — never by id alone.
         if (!(sp->machine.correlationId() == opt->correlationId &&
               (sp->machine.state() == session::SessionState::Connecting ||
-               sp->machine.state() == session::SessionState::Handshaking))) {
+               sp->machine.state() == session::SessionState::Handshaking ||
+               sp->machine.state() == session::SessionState::Authenticating))) {
             for (auto& cand : sessions_) {
                 if (cand->machine.state() == session::SessionState::Connected &&
                     cand->machine.sessionId() == opt->sessionId &&
@@ -960,6 +965,39 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
         break;
     }
 
+    // ---- Authentication (Task 7): the SCRAM exchange of a session's Authenticating state ----
+    case codec::TemplateId::AuthServerFirst: {
+        auto opt = ::rune::protocol::client::AuthServerFirst::decode(buf, len);
+        if (!opt) break;   // outside the wire bounds: the login then times out (never a proof to a malformed frame)
+        Session& s = sessionForConnectCorrId(opt->correlationId);
+        s.machine.onAuthServerFirst(*opt, nowNs);
+        break;
+    }
+
+    case codec::TemplateId::AuthServerFinal: {
+        auto opt = ::rune::protocol::client::AuthServerFinal::decode(buf, len);
+        if (!opt) break;
+        Session& s = sessionForConnectCorrId(opt->correlationId);
+        const bool awaited = s.machine.state() == session::SessionState::Authenticating &&
+                             s.machine.correlationId() == opt->correlationId;
+        s.machine.onAuthServerFinal(*opt, nowNs);
+        if (awaited) s.machine.onActivity(nowNs);
+        // The same per-leg verdict the ConnectResponse / HandshakeContinueResponse cases publish: "accepted"
+        // now means reached Connected — only an AuthServerFinal{OK} with a valid server signature gets there.
+        lastConnectAwaited_  = awaited;
+        lastConnectAccepted_ = awaited && s.machine.state() == session::SessionState::Connected;
+        lastConnectSession_  = 0;
+        for (uint32_t i = 0; i < sessions_.size(); ++i) {
+            if (sessions_[i].get() == &s) { lastConnectSession_ = i; break; }
+        }
+        if (lastConnectAccepted_) {
+            ++s.connectEpoch;   // a new connect episode (brokerVersion was recorded on the first leg)
+            if (routeIndex_.size() != 0 && produceResendFn_) produceResendFn_();
+        }
+        if (egressObserver_) egressObserver_(tid, buf, len);
+        break;
+    }
+
     case codec::TemplateId::ErrorResponse: {
         auto opt = codec::decodeErrorResponse(buf, len);
         if (!opt) break;
@@ -972,10 +1010,12 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
         Session* sp = &sessionForConnectCorrId(opt->correlationId);
         if (sp == &seedSession() && opt->sessionId != 0 &&
             (opt->code == static_cast<int16_t>(::rune::protocol::client::ErrorCode::SessionExpired) ||
-             opt->code == static_cast<int16_t>(::rune::protocol::client::ErrorCode::UnknownSession)) &&
+             opt->code == static_cast<int16_t>(::rune::protocol::client::ErrorCode::UnknownSession) ||
+             opt->code == static_cast<int16_t>(::rune::protocol::client::ErrorCode::SessionRevoked)) &&
             !(seedSession().machine.correlationId() == opt->correlationId &&
               (seedSession().machine.state() == session::SessionState::Connecting ||
-               seedSession().machine.state() == session::SessionState::Handshaking))) {
+               seedSession().machine.state() == session::SessionState::Handshaking ||
+               seedSession().machine.state() == session::SessionState::Authenticating))) {
             for (std::size_t i = 1; i < sessions_.size(); ++i) {
                 if (sessions_[i]->machine.sessionId() == opt->sessionId) { sp = sessions_[i].get(); break; }
             }
@@ -989,12 +1029,14 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
         {
             const bool fatal =
                 opt->code == static_cast<int16_t>(::rune::protocol::client::ErrorCode::SessionExpired) ||
-                opt->code == static_cast<int16_t>(::rune::protocol::client::ErrorCode::UnknownSession);
+                opt->code == static_cast<int16_t>(::rune::protocol::client::ErrorCode::UnknownSession) ||
+                opt->code == static_cast<int16_t>(::rune::protocol::client::ErrorCode::SessionRevoked);
             const int64_t mine = s.machine.sessionId();
             const bool answersMyConnect =
                 s.machine.correlationId() == opt->correlationId &&
                 (s.machine.state() == session::SessionState::Connecting ||
-                 s.machine.state() == session::SessionState::Handshaking);
+                 s.machine.state() == session::SessionState::Handshaking ||
+                 s.machine.state() == session::SessionState::Authenticating);
             // Fix round 2 (I-2): also while `mine` is 0 (a fresh connect holds no session a notice could name).
             if (fatal && opt->sessionId != 0 && mine != opt->sessionId && !answersMyConnect) [[unlikely]] {
                 ++staleSessionNotices_;
@@ -1207,6 +1249,7 @@ Session& ClientAgent::openSession_(const std::string& endpoint) noexcept {
     scfg.keepaliveCorrelationId = -(static_cast<int64_t>(sessions_.size()) + 1);   // A10: Pong routing
     sessions_.emplace_back(std::make_unique<Session>(this, std::move(scfg), endpoint));
     Session& s = *sessions_.back();
+    s.machine.useScramCache(&scramCache_);   // authentication: PBKDF2 once per verifier, not once per session
     // On the duty clock (the clock tick() runs on), never steady_clock: with an
     // injected nanoClock the two are different domains and the connect's
     // fast-retry / timeout would never (or only much later) come due.
@@ -1249,8 +1292,10 @@ Session& ClientAgent::sessionForConnectCorrId(int64_t corrId) noexcept {
         // HandshakeContinueResponse leg) — without this, a multi-node client's
         // HandshakeContinueResponse for a NON-seed session would always fall
         // through to the seed below.
+        // Authentication: Authenticating is the same connect episode too (the auth frames carry its corrId).
         if ((s->machine.state() == session::SessionState::Connecting ||
-             s->machine.state() == session::SessionState::Handshaking) &&
+             s->machine.state() == session::SessionState::Handshaking ||
+             s->machine.state() == session::SessionState::Authenticating) &&
             s->machine.correlationId() == corrId) {
             return *s;
         }
@@ -1507,7 +1552,10 @@ bool ClientAgent::sealForDestination_(session::SessionMachine& m,
     // (plaintext under require_tls is refused by the broker; under offered it
     // would bypass the mode the handshake is about to choose).  The caller treats
     // this like a refused offer: its own Connected-edge resend recovers it.
-    if (m.offersCrypto() && m.state() != session::SessionState::Connected) [[unlikely]] return false;
+    // Authentication: the login's own frames (AuthClientFirst / AuthClientFinal) leave in Authenticating —
+    // sealed by the keys the handshake just derived (crypto.encrypted) — and nothing else does.
+    if (m.offersCrypto() && m.state() != session::SessionState::Connected &&
+        m.state() != session::SessionState::Authenticating) [[unlikely]] return false;
     if (!crypto.encrypted) return true;  // plaintext session: nothing to do
     const SealedFrame sealed = sealForOffer(transport_, crypto, buf, len);
     if (sealed.len == 0) return false;  // seal failed — DROP, do not transmit

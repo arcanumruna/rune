@@ -14,6 +14,9 @@
 #include <rune/codec/Fingerprint.h>
 #include <rune/codec/Serialize.h>
 #include <rune/protocol/RecordBatch.h>
+#include <rune/crypto/Kdf.h>
+#include <rune/crypto/Scram.h>
+#include <rune/protocol/client/AuthMessages.h>
 #include <rune/protocol/client/Protocol.h>
 #include <rune/protocol/client/GroupMessages.h>
 #include <rune/protocol/client/MetadataMessages.h>
@@ -37,6 +40,7 @@
 #include <string>
 #include <tuple>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace test_support {
@@ -187,6 +191,42 @@ struct InvokerGateway {
     int16_t offsetFetchErrorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::NotCoordinator);
     int     offsetFetchRejectNext = 0;
     int16_t offsetFetchRejectCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::InvalidRequest);
+    // ---- Authentication (Task 7): a SCRAM-speaking broker model, as strict as the real one will be -----------
+    // authMode InProcess (default) = a pre-authentication broker: the historical gateway, byte-identical
+    // ConnectResponse.  Required = every v9 session must log in (users map, SCRAM-SHA-512); DevDisabled = v9
+    // frame, Anonymous.  A session below client version 9 under Required is refused ProtocolVersion (the
+    // version gate).  Until a session authenticated, ANY other request is answered ErrorResponse{44} and the
+    // session ends (D13); AuthServerFirst ALWAYS lists 2 salts (review I3: the count never reveals whether a
+    // user exists or is rotating) — real verifiers oldest first, then deterministic fake pads; an unknown
+    // user, a wrong password and an empty username all fail the same way (AuthServerFinal{44}).
+    rune::protocol::client::AuthMode authMode = rune::protocol::client::AuthMode::InProcess;
+    std::map<std::string, std::vector<rune::crypto::scram::Verifier>> users;
+    void addUser(const std::string& name, const std::string& password) {
+        users[name].push_back(*rune::crypto::scram::makeVerifier(password));
+    }
+    void setPassword(const std::string& name, const std::string& password) {   // SET PASSWORD: replaces all
+        users[name].clear();
+        addUser(name, password);
+    }
+    uint32_t retryAfterMsOnFailure = 0;      // AuthServerFinal{44}.retryAfterMs
+    bool     mustChangePassword    = false;  // AuthServerFinal.flags
+    bool     breakServerSignature  = false;  // a broker that cannot prove the password
+    int authFirsts = 0, authFinals = 0, authOk = 0, authFailed = 0;
+    int unauthenticatedRequests = 0;         // requests that arrived before the login finished (always refused)
+    std::vector<int64_t> authSessionIds;     // sessions that completed a login
+    /// ConnectRequest.authToken of every Connect received (the reserved wire field: must always be empty).
+    std::vector<std::string> connectAuthTokens;
+    /// D26: revoke `sid`: each live subscription of it is answered SessionRevoked on its Subscribe correlation
+    /// id, then the session-level ErrorResponse{SessionRevoked, corr 0}; the session is gone (closed).
+    void revokeSession(int64_t sid, int from = 0) {
+        namespace rp = rune::protocol::client;
+        for (const Subscribed& sub : subscribed) {
+            if (sub.sessionId == sid) sendError(from, static_cast<int16_t>(rp::ErrorCode::SessionRevoked), "revoked", sid, sub.corrId);
+        }
+        sendError(from, static_cast<int16_t>(rp::ErrorCode::SessionRevoked), "session revoked", sid, 0);
+        for (auto& [node, set] : sessionsAtNode) set.erase(sid);
+        authState_.erase(sid);
+    }
     // ConnectResponse.brokerVersion advertised (-1 = an older broker's 38-byte frame).
     int32_t advertisedBrokerVersion = rune::protocol::client::kBrokerVersion;
     std::map<int, int32_t> advertisedBrokerVersionAt;  // per endpoint (a rolling upgrade)
@@ -784,6 +824,122 @@ private:
         std::shared_ptr<aeron::ExclusivePublication> pub;
     };
     std::map<int64_t, SessionPub>                     sessionPubs;
+    // Authentication: one session's login, one state at a time (each holds only what it needs).
+    struct AuthAwaitingFirst {};
+    struct AuthAwaitingFinal {
+        std::string user, combined, clientFirstBare;
+        std::vector<rune::crypto::scram::Verifier> real;   // the real slots, oldest first (copied at AuthClientFirst)
+    };
+    struct AuthAuthenticated {};
+    using AuthSessionState = std::variant<AuthAwaitingFirst, AuthAwaitingFinal, AuthAuthenticated>;
+    std::map<int64_t, AuthSessionState> authState_;
+    int64_t authNonceCounter_ = 0;
+public:
+    /// Sessions that are mid-login or logged in (a session that failed / was revoked is gone).
+    [[nodiscard]] const std::map<int64_t, AuthSessionState>& authStates() const { return authState_; }
+private:
+
+    void replyTo_(int endpoint, int64_t sid, const uint8_t* b, std::size_t n) {
+        if (replyFromArrival && !replyOnAnnouncedEgress) send(endpoint, b, n);
+        else sendToSession(sid, b, n);
+    }
+    void endSession_(int64_t sid) {
+        for (auto& [node, set] : sessionsAtNode) set.erase(sid);
+        authState_.erase(sid);
+    }
+    /// The one failure answer — wrong password, unknown user, no credentials, out-of-order frames, an
+    /// unauthenticated request: AuthServerFinal{44} (+ the scripted retryAfterMs), and the session ends.
+    void failLogin_(int endpoint, int64_t sid, int64_t corr) {
+        namespace rp = rune::protocol::client;
+        ++authFailed;
+        rp::AuthServerFinal f;
+        f.sessionId = sid; f.correlationId = corr;
+        f.errorCode = static_cast<uint16_t>(rp::ErrorCode::AuthenticationFailed);
+        f.retryAfterMs = retryAfterMsOnFailure;
+        f.detail = "authentication failed";
+        std::vector<uint8_t> out(f.encodedSize());
+        const std::size_t n = f.encode(out.data());
+        replyTo_(endpoint, sid, out.data(), n);
+        endSession_(sid);
+    }
+    [[nodiscard]] static std::vector<uint8_t> fakeSalt_(const std::string& name, int slot) {
+        static const uint8_t seed[] = "rune-test-fake-salt-seed";
+        const std::string msg = "rune-fake-salt|" + std::to_string(slot) + "|" + name;
+        rune::crypto::DigestBytes d;
+        (void)rune::crypto::hmac(rune::crypto::Digest::Sha512, {seed, sizeof(seed) - 1},
+                                 {reinterpret_cast<const uint8_t*>(msg.data()), msg.size()}, d);
+        return std::vector<uint8_t>(d.bytes.begin(), d.bytes.begin() + 16);
+    }
+    void onAuthFirst_(int endpoint, const uint8_t* buf, std::size_t len) {
+        namespace rp = rune::protocol::client;
+        namespace rs = rune::crypto::scram;
+        const auto h = rp::MessageHeader::decode(buf, len);
+        if (!h) return;
+        const int64_t sid = h->sessionId, corr = h->correlationId;
+        const auto it = authState_.find(sid);
+        if (it == authState_.end() || !std::holds_alternative<AuthAwaitingFirst>(it->second)) {
+            failLogin_(endpoint, sid, corr);   // out of order
+            return;
+        }
+        ++authFirsts;
+        const auto m = rp::AuthClientFirst::decode(buf, len);
+        if (!m || m->mechanism != rp::kMechanismScramSha512) { failLogin_(endpoint, sid, corr); return; }
+        AuthAwaitingFinal st;
+        st.user = std::string(m->username);
+        if (const auto u = users.find(st.user); u != users.end()) st.real = u->second;
+        st.combined        = std::string(m->clientNonce) + "SRV" + std::to_string(++authNonceCounter_);
+        st.clientFirstBare = rs::clientFirstBare(st.user, m->clientNonce);
+        std::vector<uint8_t> salts[2];
+        uint32_t iters[2];
+        for (int i = 0; i < 2; ++i) {   // review I3: ALWAYS two slots
+            if (static_cast<std::size_t>(i) < st.real.size()) { salts[i] = st.real[static_cast<std::size_t>(i)].salt; iters[i] = st.real[static_cast<std::size_t>(i)].iterations; }
+            else { salts[i] = fakeSalt_(st.user, i); iters[i] = rs::kDefaultIterations; }
+        }
+        rp::AuthServerFirst sf;
+        sf.sessionId = sid; sf.correlationId = corr;
+        sf.combinedNonce = st.combined;
+        sf.count = 2;
+        for (int i = 0; i < 2; ++i)
+            sf.salts[static_cast<std::size_t>(i)] = {std::string_view(reinterpret_cast<const char*>(salts[i].data()), salts[i].size()), iters[i]};
+        std::vector<uint8_t> out(sf.encodedSize());
+        const std::size_t n = sf.encode(out.data());
+        it->second = std::move(st);
+        replyTo_(endpoint, sid, out.data(), n);
+    }
+    void onAuthFinal_(int endpoint, const uint8_t* buf, std::size_t len) {
+        namespace rp = rune::protocol::client;
+        namespace rs = rune::crypto::scram;
+        const auto h = rp::MessageHeader::decode(buf, len);
+        if (!h) return;
+        const int64_t sid = h->sessionId, corr = h->correlationId;
+        const auto it = authState_.find(sid);
+        const auto* st = it == authState_.end() ? nullptr : std::get_if<AuthAwaitingFinal>(&it->second);
+        if (st == nullptr) { failLogin_(endpoint, sid, corr); return; }
+        ++authFinals;
+        const auto m = rp::AuthClientFinal::decode(buf, len);
+        if (!m || m->count != 2) { failLogin_(endpoint, sid, corr); return; }   // one proof per listed salt
+        const std::string cfwp = rs::clientFinalWithoutProof(st->combined);
+        for (std::size_t i = 0; i < st->real.size(); ++i) {
+            const auto& v = st->real[i];
+            const std::string am = rs::authMessage(st->clientFirstBare, rs::serverFirst(st->combined, v.salt, v.iterations), cfwp);
+            if (!rs::verifyClientProof(rune::crypto::Digest::Sha512, v.storedKey, am, m->proofs[i])) continue;
+            auto sig = rs::serverSignature(rune::crypto::Digest::Sha512, v.serverKey, am).value();
+            if (breakServerSignature) sig.bytes[0] ^= 0xFF;
+            rp::AuthServerFinal f;
+            f.sessionId = sid; f.correlationId = corr; f.errorCode = 0;
+            f.flags = mustChangePassword ? rp::kAuthFlagMustChangePassword : uint8_t{0};
+            const std::string sigStr(reinterpret_cast<const char*>(sig.bytes.data()), sig.size);
+            f.serverSignature = sigStr;
+            std::vector<uint8_t> out(f.encodedSize());
+            const std::size_t n = f.encode(out.data());
+            it->second = AuthAuthenticated{};
+            ++authOk;
+            authSessionIds.push_back(sid);
+            replyTo_(endpoint, sid, out.data(), n);
+            return;
+        }
+        failLogin_(endpoint, sid, corr);
+    }
     struct DelayedConnect { std::chrono::steady_clock::time_point at; std::vector<uint8_t> frame; int endpoint = 0; };
     std::vector<DelayedConnect> delayedConnects;
     std::vector<std::pair<int64_t, std::vector<uint8_t>>> sessionOutbox;
@@ -1002,6 +1158,25 @@ private:
             }
         }
         if (!replay) ++framesReceived;
+        // Authentication: until a session's login finished, nothing but Connect / Disconnect / the login's own
+        // frames is accepted — the request is refused AuthenticationFailed and the session ends (D13).
+        if (authMode == rp::AuthMode::Required) {
+            const auto t = static_cast<rcc::TemplateId>(*tid);
+            if (t != rcc::TemplateId::Connect && t != rcc::TemplateId::Disconnect &&
+                t != rcc::TemplateId::HandshakeContinue && t != rcc::TemplateId::AuthClientFirst &&
+                t != rcc::TemplateId::AuthClientFinal && len >= 24) {
+                const auto hh = rp::MessageHeader::decode(buf, len);
+                const auto as = hh ? authState_.find(hh->sessionId) : authState_.end();
+                if (as != authState_.end() && !std::holds_alternative<AuthAuthenticated>(as->second)) {
+                    ++unauthenticatedRequests;
+                    sendError(replyFromArrival ? endpoint : 0,
+                              static_cast<int16_t>(rp::ErrorCode::AuthenticationFailed), "not authenticated",
+                              hh->sessionId, hh->correlationId);
+                    endSession_(hh->sessionId);
+                    return;
+                }
+            }
+        }
         // Catalog history (Task 5, F7): a test-installed handler for this template
         // answers the frame itself (e.g. Redirect / NotLeader / DdlResponse) —
         // consulted before any built-in behaviour.
@@ -1021,6 +1196,7 @@ private:
             ++connects;
             ++connectsAt[endpoint];
             connectCorrIds.push_back(c->correlationId);
+            connectAuthTokens.emplace_back(c->authToken);
             if (!replyConnects || silentEndpoints.count(endpoint) != 0) return;
             if (const auto rf = refuseConnectsWith.find(endpoint); rf != refuseConnectsWith.end()) {
                 // DR fix round 1 (I2): this node refuses every Connect with a code.
@@ -1043,21 +1219,44 @@ private:
                 sp.reg     = aeron->addExclusivePublication(sp.channel, c->egressStreamId);
                 sessionPubs.emplace(sid, std::move(sp));
             }
+            const bool clientV9 = c->clientVersion >= rp::kClientVersionAuth;
+            if (authMode == rp::AuthMode::Required && !clientV9) {
+                // The version gate: a client that cannot log in is refused non-retriably, no session is made.
+                uint8_t ro[64];
+                const std::size_t rn = rcc::encodeConnectResponse(
+                    ro, sizeof ro, static_cast<int16_t>(rp::ErrorCode::ProtocolVersion), 0, 0, c->sessionId,
+                    c->correlationId, advertisedBrokerVersion);
+                for (auto& [node, set] : sessionsAtNode) set.erase(sid);
+                send(endpoint, ro, rn);
+                return;
+            }
             uint8_t out[64];
-            const std::size_t n = rcc::encodeConnectResponse(
-                out, sizeof out, connectErrorCode != 0 ? connectErrorCode : static_cast<int16_t>(rcc::ErrorCode::OK),
-                0, sid, c->sessionId, c->correlationId,
-                advertisedBrokerVersionAt.count(endpoint) != 0 ? advertisedBrokerVersionAt[endpoint]
-                                                               : advertisedBrokerVersion);
-            if (replyFromArrival && !replyOnAnnouncedEgress) {
-                send(endpoint, out, n);
+            std::vector<uint8_t> outV9;
+            const int32_t bv = advertisedBrokerVersionAt.count(endpoint) != 0 ? advertisedBrokerVersionAt[endpoint]
+                                                                              : advertisedBrokerVersion;
+            const int16_t okCode = connectErrorCode != 0 ? connectErrorCode : static_cast<int16_t>(rcc::ErrorCode::OK);
+            std::size_t n;
+            const uint8_t* frame = out;
+            if (authMode != rp::AuthMode::InProcess && clientV9) {
+                const bool mustLogin = authMode == rp::AuthMode::Required && okCode == 0;
+                if (mustLogin) authState_[sid] = AuthAwaitingFirst{};
+                n = rcc::encodeConnectResponseV9(outV9, okCode, 0, sid, c->sessionId, c->correlationId, authMode,
+                                                 mustLogin ? rp::AuthState::MustAuthenticate : rp::AuthState::Anonymous, bv);
+                frame = outV9.data();
             } else {
-                sendToSession(sid, out, n);
+                n = rcc::encodeConnectResponse(out, sizeof out, okCode, 0, sid, c->sessionId, c->correlationId, bv);
+            }
+            if (replyFromArrival && !replyOnAnnouncedEgress) {
+                send(endpoint, frame, n);
+            } else {
+                sendToSession(sid, frame, n);
             }
             for (const auto& [sub, base] : recordsAfterNextConnect) pushRecords(sub, base, 1);
             recordsAfterNextConnect.clear();
             return;
         }
+        case rcc::TemplateId::AuthClientFirst: onAuthFirst_(endpoint, buf, len); return;
+        case rcc::TemplateId::AuthClientFinal: onAuthFinal_(endpoint, buf, len); return;
         case rcc::TemplateId::MetadataRequest: {
             const auto m = rp::MetadataRequest::decode(buf, len);
             if (!m) return;
