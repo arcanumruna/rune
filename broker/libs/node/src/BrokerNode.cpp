@@ -306,10 +306,11 @@ void BrokerNode::start() {
     }
     // Authentication Task 9 (D31/D32): dev mode is single-node only; an enabled broker needs its cluster key file
     // (programmatic configs bypass parseNodeConfig's check; the file itself is read here, on the startup thread).
-    if (auto err = config_.validateAuth(); err.has_value()) {
+    if (auto err = config_.validateAuth(&clusterKeys_); err.has_value()) {
         throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) +
                                  "]: refusing to start — " + *err);
     }
+    if (config_.testAfterAuthValidation) config_.testAfterAuthValidation();
     // F15 S3 (design note §6, review S3 I-1): a worker return-ring claim
     // exception is an invariant-violation halt, so the return ring size is a
     // correctness setting — its max message must hold the largest batch any
@@ -2122,9 +2123,13 @@ void BrokerNode::buildGateway() {
                               securityView_ ? &*securityView_ : nullptr);
         // Authentication Task 10 (D4/D32): the gateway's OWN copy of the cluster keys (loaded on this startup thread,
         // validated by validateAuth) verifies the bootstrap proof.  Dev / in-process configs hold none.
-        if (config_.authMode == AuthMode::Enabled)
-            if (auto keys = rune::peerlink::loadClusterKeys(config_.clusterKeyFile, config_.clusterKeyFileNext))
-                gateway_->setClusterKeys(std::move(*keys));
+        // Review C I4: the keys validated in start() ARE the keys in use - one load, handed out as copies; Enabled with
+        // none is an error, never a silent "authentication is not enabled" on every bootstrap.
+        if (config_.authMode == AuthMode::Enabled) {
+            if (!clusterKeys_) throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) +
+                                                        "]: authentication is enabled but no cluster key was loaded");
+            gateway_->setClusterKeys(*clusterKeys_);
+        }
         // DR-15 fix round 2 (LOW-4): clients' reply hostnames resolve off-thread.
         if (resolverHub_) gateway_->setHostResolver(resolverHub_->subscribeHostResolver());
         // fsyncgate fail-stop: worker StorageFailure signals (and the gateway's
@@ -3148,6 +3153,10 @@ void BrokerNode::publishCatalogMetrics_() noexcept {
 // Authentication Task 9 - control-thread halves of the `__security` log (D29).
 // ---------------------------------------------------------------------------
 void BrokerNode::onSecurityApplied_(const uint8_t* p, std::size_t n) {
+    if (heldMirror_.on) [[unlikely]] {   // test seam: stash, apply nothing
+        heldMirror_.frames.emplace_back(p, p + n);
+        return;
+    }
     int64_t offset = -1;
     std::span<const uint8_t> bytes;
     if (!decodeSecurityApplied(p, n, offset, bytes) || !securityView_) [[unlikely]] {
@@ -3275,6 +3284,18 @@ int64_t BrokerNode::appendSecurityRecordOnLeaderForTest(std::span<const uint8_t>
         if (base < 0) return -1;
         r->onLeaderLogAppended();   // reconcile LEO / HW, push to followers
         return base;
+    });
+}
+
+void BrokerNode::holdSecurityMirrorForTest(bool on) {
+    onControlThreadForTest([this, on]() {
+        heldMirror_.on = on;
+        if (!on) {
+            auto frames = std::move(heldMirror_.frames);
+            heldMirror_.frames.clear();
+            for (const auto& f : frames) onSecurityApplied_(f.data(), f.size());
+        }
+        return 0;
     });
 }
 
@@ -5002,8 +5023,12 @@ int BrokerNode::publishPlacementView_() {
 }
 
 int BrokerNode::resignIfHalted_(bool consensusLeader) {
-    if (catalogHaltedValue_ == 0) [[likely]] return 0;
     int work = 0;
+    // Authentication review C: a halted `__security` applier is reported to every member (a latched node-control
+    // mark): the controller steers the (-7, 0) leadership to a healthy broker.
+    if (securityHaltedValue_ != 0 && runtimeAgent_ && !holdHaltReportForTest_)
+        work += runtimeAgent_->controlledShutdown().reportSecurityHalted();
+    if (catalogHaltedValue_ == 0) [[likely]] return work;
     // Fix round 0 (ruling 2): every member — the controller first — learns this
     // process is halted (a latched mark on the node-control register): it is
     // never a placement target again.

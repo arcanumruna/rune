@@ -326,11 +326,14 @@ public:
             if (k.topicId == -6) {   // __catalog: steer the leadership off catalog-halted brokers (M2)
                 haltedScratch_.clear();
                 for (const auto& [n, st] : nodeLifecycle_) if (st.catalogHalted) haltedScratch_.push_back(n);
+            } else if (k.topicId == -7) {   // __security (review C): the same, off security-halted brokers
+                haltedScratch_.clear();
+                for (const auto& [n, st] : nodeLifecycle_) if (st.securityHalted) haltedScratch_.push_back(n);
             }
             const auto next = decideCoordinatorPartition(
                 k.topicId, k.partition, selfId_, msm_.assignment(k.topicId, k.partition),
                 eligibleNodes, &positions_, bootstrapEpoch, coordinatorReplicas_, isShutting_(selfId_),
-                k.topicId == -6 ? &haltedScratch_ : nullptr, &shuttingNodes_());   // I1: every coordinator partition
+                (k.topicId == -6 || k.topicId == -7) ? &haltedScratch_ : nullptr, &shuttingNodes_());   // I1: every coordinator partition
             if (!next) continue;
             rune::metadata::BalancerRecord br;
             br.isr      = next->isr;
@@ -849,6 +852,8 @@ public:
         /// CatalogApplier halted (kNodeCatalogHalted) — never a placement target;
         /// cleared only by a new process (adopt).
         bool    catalogHalted  = false;
+        /// Review C: this PROCESS reported its `__security` applier halted (kNodeSecurityHalted); cleared by a new process.
+        bool    securityHalted = false;
         /// ISR v3 (Step 7): the storage this PROCESS registered with (slots 7-9 of its node-control frame):
         /// the id (0 = none / an older binary) and the origin wire code (AlterIsrMsg::kStorageOrigin*).
         int64_t storageId      = 0;
@@ -868,6 +873,7 @@ public:
             nonce = n; shutting = false; userOnly = false; completePushed = false; pushedBits = -1;
             lineageRevoked = false;   // R1: a new live process
             catalogHalted  = false;   // Task 11: a new process has a fresh applier
+            securityHalted = false;
             featureLevel = -1;   // D15: a new process may be another binary
             storageId = 0; storageOrigin = 0;   // ISR v3: a new process re-reports its storage
             confirmed.clear();
@@ -930,6 +936,12 @@ public:
             spdlog::warn("MetadataService[{}]: node {} reports its __catalog apply HALTED — never a placement "
                          "target{}", selfId_, m.leaderId,
                          m.leaderId == selfId_ ? "; this node places / unplaces no catalog topic" : "");
+        }
+        if ((flags & rr::AlterIsrMsg::kNodeSecurityHalted) != 0 && !st.securityHalted) {
+            st.securityHalted = true;
+            ++routingInputsEpoch_;
+            spdlog::warn("MetadataService[{}]: node {} reports its __security apply HALTED — the (-7, 0) leadership is "
+                         "steered to a healthy broker", selfId_, m.leaderId);
         }
         if (shutdown && !st.shutting) {
             st.shutting = true;

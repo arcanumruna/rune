@@ -1,4 +1,5 @@
 // SecurityAdmin.cpp — the `__security` leadership on the admin thread (authentication plan D39).  See SecurityAdmin.h.
+#include <cctype>
 #include <rune/node/SecurityAdmin.h>
 
 #include <rune/catalog/CatalogFingerprint.h>
@@ -297,10 +298,34 @@ sec::Principal principalOf(const DdlMeta& meta, std::string authenticated, uint6
     p.requestFingerprint = fingerprint;
     return p;
 }
+
+/// Review C I1 (D10): `__security` is never compacted and readable by every ADMIN forever, so the leader is the last line
+/// of defence for a password literal.  True when `statement` has a PASSWORD keyword (any case) followed by a quoted
+/// literal (' " or $$) that is not exactly '<redacted>'.  Cold path.
+bool statementHasUnredactedPassword(std::string_view statement) {
+    constexpr std::string_view kWord = "PASSWORD", kRedacted = "'<redacted>'";
+    for (std::size_t i = 0; i + kWord.size() <= statement.size(); ++i) {
+        bool match = true;
+        for (std::size_t k = 0; k < kWord.size() && match; ++k)
+            match = std::toupper(static_cast<unsigned char>(statement[i + k])) == kWord[k];
+        if (!match) continue;
+        std::size_t j = i + kWord.size();
+        while (j < statement.size() && std::isspace(static_cast<unsigned char>(statement[j]))) ++j;
+        if (j >= statement.size()) continue;
+        const char q = statement[j];
+        if (q != '\'' && q != '"' && q != '$') continue;
+        if (statement.substr(j, kRedacted.size()) != kRedacted) return true;
+    }
+    return false;
+}
 } // namespace
 
 void SecurityAdmin::startDdl_(const SecurityDdlMsg& m, int64_t nowNs, SecurityRequest& req) {
     const sec::SecurityState& state = applier_.state();
+    if (statementHasUnredactedPassword(m.meta.statement)) {
+        answer_(req, kInvalidRequest, "the statement carries a password literal; the client must send the redacted statement (D10)");
+        return;
+    }
     const uint64_t fp = fingerprintOf(m);
     // 1. Dedupe (F14) on (requestId, statement fingerprint).
     if (!m.meta.requestId.none()) {

@@ -277,7 +277,7 @@ std::optional<std::string> NodeConfig::validateCatalogStream() const {
 // ---------------------------------------------------------------------------
 // NodeConfig::validateAuth  (authentication plan Task 9, D31/D32)
 // ---------------------------------------------------------------------------
-std::optional<std::string> NodeConfig::validateAuth() const {
+std::optional<std::string> NodeConfig::validateAuth(std::optional<rune::peerlink::ClusterKeys>* keysOut) const {
     if (authMode == AuthMode::DevDisabled) {
         if (peers.size() > 1)
             return "RUNE_AUTH=disabled (dev mode) refuses to start as part of a multi-broker cluster (RUNE_PEERS lists " +
@@ -287,6 +287,7 @@ std::optional<std::string> NodeConfig::validateAuth() const {
     if (authMode == AuthMode::InProcessUnauthenticated) return std::nullopt;
     auto keys = rune::peerlink::loadClusterKeys(clusterKeyFile, clusterKeyFileNext);
     if (!keys) return std::move(keys.error());
+    if (keysOut != nullptr) *keysOut = *keys;
     // Group / world access is warned about, not refused (Kubernetes secrets mount 0644).
     for (const std::string* f : {&clusterKeyFile, &clusterKeyFileNext}) {
         if (f->empty()) continue;

@@ -265,3 +265,118 @@ TEST(SecurityReplicationRegression, SecurityDdlViaAFollowerIsRedirectedToTheLead
     EXPECT_EQ(a3->objectId, a2->objectId);
     EXPECT_EQ(c.node(leader).securityViewForTest().appliedOffset, 0) << "no second event";
 }
+
+// Review C I5 (focus 4, D24): the real wiring - the egress drain holds the gated OK and pumpSecurityGate_ releases it at
+// min(view applied, refreshed).  The control thread's mirror is held; the admin has committed AND applied the event;
+// no OK may leave until THIS broker's view applied it.
+TEST(SecurityAnswerGateRegression, TheBrokerHoldsTheOkUntilItsOwnViewAppliedTheEventRegression) {
+    TmpDir dir{"sec_gate_real"};
+    const Ports ports = Ports::discover(1);
+    BrokerNode n{makeConfig(1, dir.path, ports, 1, Mode::Shard)};
+    n.start();
+    ASSERT_TRUE(n.awaitLeader(10'000ms));
+    const auto ready = std::chrono::steady_clock::now() + 20s;
+    while (securityOf(n).role != rune::replication::Role::Leader && std::chrono::steady_clock::now() < ready)
+        std::this_thread::sleep_for(20ms);
+    TmpDir cdir{"sec_gate_real_client"};
+    ShardTestClient cl(cdir.path / "wire");
+    cl.keepSessionsAlive(true);
+    cl.setClientVersion(pc::kClientVersionAuth);
+    int64_t sid = -1;
+    for (const auto dl = std::chrono::steady_clock::now() + 30s; sid < 0 && std::chrono::steady_clock::now() < dl;) {
+        sid = cl.connect("aeron:udp?endpoint=127.0.0.1:" + std::to_string(ports.client[0]), kClientStream);
+        if (sid < 0) std::this_thread::sleep_for(50ms);
+    }
+    ASSERT_GT(sid, 0);
+    const std::string ch = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(ports.client[0]);
+    n.holdSecurityMirrorForTest(true);
+    const int64_t corr = cl.nextCorrelationId();
+    const auto f = createRoleFrame(sid, corr, "gated_role", 77);
+    ASSERT_TRUE(cl.send(ch, kClientStream, f.data(), f.size()));
+    // The admin thread committed and applied the event ...
+    const auto deadline = std::chrono::steady_clock::now() + 20s;
+    auto adminApplied = [&] {
+        return n.onAdminThreadForTest([&n]() { return n.adminWorkerAgentForTest()->worker().securityApplier()->state().appliedOffset(); });
+    };
+    while (adminApplied() < 0 && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(10ms);
+    ASSERT_EQ(adminApplied(), 0);
+    // ... but THIS broker's view has not: no OK for a full second.
+    EXPECT_FALSE(cl.awaitAnyDdlAnswer(corr, std::chrono::steady_clock::now() + 1s).has_value()) << "the OK left before the view applied";
+    EXPECT_EQ(n.securityViewForTest().appliedOffset, -1);
+    n.holdSecurityMirrorForTest(false);
+    const auto ok = cl.awaitDdl(corr, std::chrono::steady_clock::now() + 20s);
+    ASSERT_TRUE(ok.has_value());
+    EXPECT_EQ(ok->errorCode, 0) << ok->detail;
+    EXPECT_EQ(cl.answersFor(corr), 1u) << "exactly once";
+    EXPECT_EQ(n.securityViewForTest().appliedOffset, 0);
+    // A dedupe retry of the committed request: its original OK is released through the same gate.
+    n.holdSecurityMirrorForTest(true);   // nothing new is mirrored, but the retry's gate offset (0) is already covered
+    const int64_t corr2 = cl.nextCorrelationId();
+    const auto retry = createRoleFrame(sid, corr2, "gated_role", 77);
+    ASSERT_TRUE(cl.send(ch, kClientStream, retry.data(), retry.size()));
+    const auto again = cl.awaitDdl(corr2, std::chrono::steady_clock::now() + 20s);
+    n.holdSecurityMirrorForTest(false);
+    ASSERT_TRUE(again.has_value());
+    EXPECT_EQ(again->errorCode, 0);
+    EXPECT_EQ(again->objectId, ok->objectId);
+    n.stop();
+}
+
+// Review C (parked item): a `__security` leader whose APPLIER halted (local damage) reports it in its node-control
+// register (kNodeSecurityHalted); the controller steers the (-7, 0) leadership to a healthy broker, so security DDL
+// works again without restarting anything.
+TEST(SecurityReplicationRegression, AHaltedSecurityLeaderIsSteeredOffRegression) {
+    ThreeNodes c = ThreeNodes::start("sec_halt_steer");
+    ASSERT_TRUE(awaitSecurityLeader(c, 30s));
+    const int32_t halted = settledSecurityLeader(c);
+    ASSERT_GT(halted, 0);
+    BrokerNode& hn = c.node(halted);
+    hn.onAdminThreadForTest([&hn]() {   // damage on the LEADER's applier only (an admin-thread seam)
+        hn.adminWorkerAgentForTest()->worker().securityApplierForTest()->tamperNextFingerprintForTest();
+        return 0;
+    });
+    GoldenAppender g;
+    ASSERT_GE(g.appendNext(c), 0) << "one valid event, committed by the healthy majority";
+    const auto deadline = std::chrono::steady_clock::now() + 30s;
+    while (!hn.securityViewForTest().halted && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(20ms);
+    ASSERT_TRUE(hn.securityViewForTest().halted) << "the damaged leader's mirror halted";
+
+    // The (-7, 0) leadership moves to a healthy broker (settled: committed ISR member, admin replica Leader).
+    int32_t now = halted;
+    while (now == halted && std::chrono::steady_clock::now() < deadline + 30s) {
+        now = settledSecurityLeader(c);
+        if (now <= 0 || now == halted) { now = halted; std::this_thread::sleep_for(50ms); }
+    }
+    ASSERT_NE(now, halted) << "the halted leader was never steered off";
+    ASSERT_GT(now, 0);
+
+    // CREATE ROLE through the NEW leader commits ...
+    ShardTestClient cl(c.clientsDir->path / "wire");
+    cl.keepSessionsAlive(true);
+    cl.setClientVersion(pc::kClientVersionAuth);
+    int64_t sid = -1;
+    for (const auto dl = std::chrono::steady_clock::now() + 30s; sid < 0 && std::chrono::steady_clock::now() < dl;) {
+        sid = cl.connect(c.clientChannel(now), kClientStream);
+        if (sid < 0) std::this_thread::sleep_for(50ms);
+    }
+    ASSERT_GT(sid, 0);
+    int64_t corr = cl.nextCorrelationId();
+    auto f = createRoleFrame(sid, corr, "after_steer", 9);
+    ASSERT_TRUE(cl.send(c.clientChannel(now), kClientStream, f.data(), f.size()));
+    auto ok = cl.awaitDdl(corr, std::chrono::steady_clock::now() + 30s);
+    ASSERT_TRUE(ok.has_value());
+    EXPECT_EQ(ok->errorCode, 0) << ok->detail;
+    // ... and the old leader still answers Internal (its route is Halted), never silently.
+    int64_t hsid = -1;
+    for (const auto dl = std::chrono::steady_clock::now() + 30s; hsid < 0 && std::chrono::steady_clock::now() < dl;) {
+        hsid = cl.connect(c.clientChannel(halted), kClientStream);
+        if (hsid < 0) std::this_thread::sleep_for(50ms);
+    }
+    ASSERT_GT(hsid, 0);
+    corr = cl.nextCorrelationId();
+    f = createRoleFrame(hsid, corr, "on_halted", 10);
+    ASSERT_TRUE(cl.send(c.clientChannel(halted), kClientStream, f.data(), f.size()));
+    const auto internal = cl.awaitAnyDdlAnswer(corr, std::chrono::steady_clock::now() + 20s);
+    ASSERT_TRUE(internal.has_value());
+    EXPECT_EQ(internal->code, static_cast<int16_t>(pc::ErrorCode::Internal)) << internal->message;
+}

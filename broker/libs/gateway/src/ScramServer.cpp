@@ -15,8 +15,6 @@ using rune::crypto::DigestBytes;
 
 namespace {
 
-constexpr uint32_t kFakeIterations = rs::kDefaultIterations;   // 4096 (D7)
-
 DigestBytes keyBytes(const std::array<uint8_t, 64>& k) noexcept {
     DigestBytes d;
     std::memcpy(d.bytes.data(), k.data(), 64);
@@ -50,11 +48,11 @@ std::vector<uint8_t> fakeSalt(const std::array<uint8_t, rune::security::kFakeSal
 
 /// A fake slot: a deterministic salt, 4096 iterations, and keys NOTHING can match (random per exchange).
 rs::Verifier fakeSlot(const std::array<uint8_t, rune::security::kFakeSaltSeedBytes>& seed, std::string_view tag,
-                      std::string_view name) {
+                      std::string_view name, uint32_t iterations) {
     rs::Verifier v;
     v.digest = Digest::Sha512;
     v.salt = fakeSalt(seed, tag, name);
-    v.iterations = kFakeIterations;
+    v.iterations = iterations;
     v.storedKey.size = 64;
     v.serverKey.size = 64;
     (void)rune::crypto::randomBytes(std::span<uint8_t>(v.storedKey.bytes.data(), 64));
@@ -84,7 +82,8 @@ std::optional<pc::AuthClientFirst> decodeClientFirst(const uint8_t* buf, std::si
     return m;
 }
 
-ServerFirstPlan scramServerFirst(const rune::security::SecurityState& state, const pc::AuthClientFirst& cf, int64_t deadlineNs)
+ServerFirstPlan scramServerFirst(const rune::security::SecurityState& state, const pc::AuthClientFirst& cf, int64_t deadlineNs,
+                                 uint32_t fakeIterations)
 {
     ServerFirstPlan plan;
     AuthAwaitingFinal& st = plan.next;
@@ -97,16 +96,17 @@ ServerFirstPlan scramServerFirst(const rune::security::SecurityState& state, con
     const std::array<uint8_t, rune::security::kFakeSaltSeedBytes> zeroSeed{};
     const auto& seed = state.fakeSaltSeed() ? *state.fakeSaltSeed() : zeroSeed;
 
+    if (fakeIterations < pc::kAuthIterationsMin || fakeIterations > pc::kAuthIterationsMax) fakeIterations = rs::kDefaultIterations;
     const rune::security::UserObject* user = cf.username.empty() ? nullptr : state.user(cf.username);
     if (user != nullptr && !user->verifiers.empty()) {
         st.userId = user->objectId;
         st.verifiers[0] = fromStored(user->verifiers[0]);
         st.verifiers[1] = user->verifiers.size() > 1 ? fromStored(user->verifiers[1])
-                                                     : fakeSlot(seed, "rune-fake-salt2|", cf.username);   // the pad
+                                                     : fakeSlot(seed, "rune-fake-salt2|", cf.username, fakeIterations);   // the pad
     } else {
         st.userId = 0;
-        st.verifiers[0] = fakeSlot(seed, "rune-fake-salt|", cf.username);
-        st.verifiers[1] = fakeSlot(seed, "rune-fake-salt2|", cf.username);
+        st.verifiers[0] = fakeSlot(seed, "rune-fake-salt|", cf.username, fakeIterations);
+        st.verifiers[1] = fakeSlot(seed, "rune-fake-salt2|", cf.username, fakeIterations);
     }
     st.count = AuthAwaitingFinal::kSlots;
 

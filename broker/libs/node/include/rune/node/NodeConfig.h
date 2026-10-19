@@ -55,6 +55,8 @@
 #include <string>
 #include <vector>
 
+namespace rune::peerlink { struct ClusterKeys; }   // validateAuth's out-parameter (review C I4)
+
 namespace rune::node {
 
 // ---------------------------------------------------------------------------
@@ -299,6 +301,9 @@ struct NodeConfig {
     // TEST-ONLY (ISR v3 Step 9, B-I8): every replica of this node emits no follower fetch for this long after
     // start (PartitionReplica::holdFetchesUntilForTest) - a wiped member that cannot catch up yet.  0 = off.
     int64_t testHoldFollowerFetchesMs = 0;
+    /// Test seam (review C I4): runs on the startup thread right after validateAuth() loaded the cluster key - a test
+    /// rewrites the key file here to prove the key validated is the key in use.  Cold; never set in production.
+    std::function<void()> testAfterAuthValidation;
     // TEST-ONLY (ISR v3 CP2 C1-R): drop every consensus frame sent by this peer for this long after the first frame seen
     // (an address change / transport reconnect window).  -1 = off.
     int32_t testDropConsensusFromPeer = -1;
@@ -975,7 +980,9 @@ struct NodeConfig {
     ///     >= 32 bytes after trimming (reads the file(s) — cold, startup thread).  A group/world-readable key file
     ///     is logged once (warned, not refused: Kubernetes secrets mount 0644).
     /// InProcessUnauthenticated reads nothing.  Checked by BrokerNode::start (programmatic configs too) and main.
-    std::optional<std::string> validateAuth() const;
+    /// Review C I4: with `keysOut` set, the keys read here are handed back (Enabled mode) - the ONE load of the cluster key:
+    /// BrokerNode::start keeps them in a member and hands out copies, so the key validated is the key in use.
+    std::optional<std::string> validateAuth(std::optional<rune::peerlink::ClusterKeys>* keysOut = nullptr) const;
 
     /// Refuses an Aeron dir that would destroy the log: the embedded driver runs
     /// with dir_delete_on_start + delete-on-shutdown and recursively deletes its

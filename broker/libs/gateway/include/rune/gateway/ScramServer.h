@@ -37,9 +37,11 @@ struct ServerFirstPlan {
 };
 /// Always succeeds in shape: a known user (enabled or not - a disabled account fails at the final leg, Review Focus 1)
 /// gets its 1-2 verifiers (+ a fake second slot for one), an unknown / empty name gets two fake slots.
-/// combinedNonce = clientNonce + a fresh server nonce.
+/// combinedNonce = clientNonce + a fresh server nonce.  `fakeIterations` (SecurityView::fakeIterations) is the count the
+/// fake slots advertise - the most common real count, so the answer does not reveal that an account is unknown.
 [[nodiscard]] ServerFirstPlan scramServerFirst(const rune::security::SecurityState&,
-                                               const rune::protocol::client::AuthClientFirst&, int64_t deadlineNs);
+                                               const rune::protocol::client::AuthClientFirst&, int64_t deadlineNs,
+                                               uint32_t fakeIterations = 4096);
 
 enum class LoginFailure : uint8_t { NoCredentials, UnknownUser, BadProof, Disabled, Throttled, Timeout, SecurityHalted };
 struct LoginOk { uint64_t userId; std::string user; bool mustChangePassword; std::array<uint8_t, 64> serverSignature; };

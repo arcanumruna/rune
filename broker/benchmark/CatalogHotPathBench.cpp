@@ -83,6 +83,50 @@ BENCHMARK(BM_GatewayProducePlacementGate)
     ->Unit(benchmark::kNanosecond)->MinTime(0.5);
 
 // ---------------------------------------------------------------------------
+// Review C I3 (authentication): the Required-mode cost of a produce.  Arg 0 = InProcess (every session AuthAnonymous),
+// Arg 1 = Required with an AuthAuthenticated session.  Required adds exactly one variant-index compare inside
+// handleProduce (on the session it already looked up) - within noise of arg 0.
+void BM_GatewayProduceAuthGate(benchmark::State& state) {
+    spdlog::set_level(spdlog::level::warn);
+    GatewayProduceRig rig(ProduceTopicMode::StaticRouted);
+    rune::gateway::SecurityView view{rune::security::SecurityState{}};
+    if (state.range(0) == 1) {
+        rig.gw.setAuthMode(rune::gateway::GatewayAuthMode::Required, &view);
+        rig.gw.setSessionAuthForTest(rig.sid, rune::gateway::AuthAuthenticated{1, "ws1", rune::gateway::PermissionTable::allowAll()});
+    }
+    std::vector<std::vector<uint8_t>> frames;
+    int64_t corr = 0;
+    int next = 0;
+    auto refill = [&] {
+        frames.clear();
+        frames.reserve(kPool);
+        for (int i = 0; i < kPool; ++i) frames.push_back(rig.produceFrame(++corr));
+        next = 0;
+    };
+    refill();
+    rig.produceOk = rig.produceErr = rig.produceNotLeader = 0;
+    allocsOn();
+    for (auto _ : state) {
+        if (next == kPool) [[unlikely]] {
+            g_allocEnabled.store(false);
+            state.PauseTiming(); refill(); state.ResumeTiming();
+            g_allocEnabled.store(true);
+        }
+        const auto& f = frames[static_cast<std::size_t>(next++)];
+        const uint64_t before = rig.produceOk + rig.produceErr + rig.produceNotLeader;
+        rig.produce(f);
+        for (int k = 0; k < 1024 && rig.produceOk + rig.produceErr + rig.produceNotLeader == before; ++k) rig.pass();
+    }
+    allocsOff(state);
+    rune::bench::gateCheck(state, rig.produceOk == static_cast<uint64_t>(state.iterations()) &&
+                                      rig.produceErr + rig.produceNotLeader == 0,
+                           "a produce was not answered OK");
+    state.SetItemsProcessed(state.iterations());
+}
+BENCHMARK(BM_GatewayProduceAuthGate)->Arg(0)->Arg(1)->Unit(benchmark::kNanosecond)->MinTime(1.0)->Repetitions(5)
+    ->ReportAggregatesOnly(false);
+
+// ---------------------------------------------------------------------------
 void BM_GatewaySubscribePlacementGate(benchmark::State& state) {
     spdlog::set_level(spdlog::level::warn);
     const auto mode = state.range(0) == 0 ? ProduceTopicMode::StaticRouted : ProduceTopicMode::CatalogPlaced;

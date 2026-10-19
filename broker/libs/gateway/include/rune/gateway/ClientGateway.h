@@ -399,7 +399,7 @@ public:
     void setClusterKeys(rune::peerlink::ClusterKeys keys) { clusterKeys_ = std::move(keys); }
     [[nodiscard]] uint64_t bootstrapsRefused() const noexcept { return bootstrapsRefused_; }
     /// How this broker authenticates sessions (ConnectResponse.authMode) and the control thread's SecurityView the
-    /// bootstrap window is read from (`__security` holds a Bootstrap event or not).  Required: a session that has not
+    /// bootstrap window is read from (open while no ENABLED security admin exists - a fresh cluster or a locked-out one, D3).  Required: a session that has not
     /// authenticated is limited by its SessionAuth state (gateFor); default InProcess = no gating, byte-identical to before.
     /// Both are control-thread values: the view pointer is read on the thread that owns the view (never across threads).
     void setAuthMode(rune::gateway::GatewayAuthMode m, const rune::gateway::SecurityView* view) noexcept {
@@ -2138,13 +2138,14 @@ private:
     /// The auth state a NEW session starts in (D11): AuthAwaitingFirst{now + authTimeout} when authenticating,
     /// AuthAnonymous otherwise.
     [[nodiscard]] rune::gateway::SessionAuth newSessionAuth_(int64_t nowNs, int64_t connectCorrelationId) const;
-    /// The bootstrap window (SecurityBootstrap accepted): no ENABLED security admin and a healthy view.
-    [[nodiscard]] bool bootstrapOpen_() const noexcept {
-        return securityView_ != nullptr && !securityView_->halted() && !securityView_->state().hasSecurityAdmin();
-    }
+    /// The bootstrap window (SecurityBootstrap accepted): cached in the SecurityView, O(1).
+    [[nodiscard]] bool bootstrapOpen_() const noexcept { return securityView_ != nullptr && securityView_->bootstrapWindowOpen(); }
     /// true = refused here: the auth gate (gateFor) answered AuthenticationFailed (and ended the session) or
     /// PasswordChangeRequired (the session stays) in the request's own response type.
     [[nodiscard]] bool authGateRefuses_(rune::protocol::client::TemplateId tid, const uint8_t* buf, std::size_t len);
+    /// The gate's answer: AuthenticationFailed + end, or PasswordChangeRequired (the session stays), in the request's own type.
+    void answerGate_(Session& session, const rune::protocol::client::MessageHeader& hdr, rune::gateway::AuthGate gate,
+                     const uint8_t* buf, std::size_t len);
     void handleAuthClientFirst_(const uint8_t* buf, std::size_t len);
     void handleAuthClientFinal_(const uint8_t* buf, std::size_t len);
     /// The ONE failure answer of a login (44, no retry-after unless rate-limited, the one detail text) then the end of

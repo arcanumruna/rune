@@ -402,3 +402,27 @@ TEST(AuthGatesRegression, ServerSideLoginCostIsMicrosecondsNotMillisecondsRegres
                  usec[50], usec[99]);
     EXPECT_LT(usec[50], 2000.0) << "far below the 5 ms gate: no PBKDF2 on the control thread";
 }
+
+// Review C: an unknown user's fake salts advertise the iteration count of the MOST COMMON real account, so a cluster
+// that raised its count is not trivially distinguishable (a fake at 4096 would stand out).
+TEST(AuthLoginRegression, FakeSaltsAdvertiseTheMostCommonRealIterationCountRegression) {
+    namespace sec = rune::security;
+    SecurityEventChain chain;
+    sec::BootstrapOps b; b.verifier = scramVerifierOf(kTestAdminPassword, 9); b.fakeSaltSeed.fill(0x42);   // 4096, one account
+    (void)chain.emit(b, "admin", "BOOTSTRAP", "bootstrap");
+    for (const char* name : {"ws1", "ws2", "ws3"})
+        (void)chain.emit(sec::CreateUserOps{scramVerifierOf(kTestPasswordA, 1, 8192)}, name, std::string("CREATE USER ") + name + " WITH PASSWORD '<redacted>';");
+    Rig rig(std::move(chain));
+    EXPECT_EQ(rig.view.fakeIterations(), 8192u) << "3 accounts at 8192 beat 1 at 4096";
+    const auto unknown = rig.login("nobody", {"x", "x"});
+    const auto real = rig.login("ws1", {kTestPasswordA, ""});
+    ASSERT_FALSE(unknown.firstBytes.empty());
+    ASSERT_FALSE(real.firstBytes.empty());
+    const auto u = pc::AuthServerFirst::decode(unknown.firstBytes.data(), unknown.firstBytes.size());
+    const auto r = pc::AuthServerFirst::decode(real.firstBytes.data(), real.firstBytes.size());
+    EXPECT_EQ(u->salts[0].iterations, 8192u);
+    EXPECT_EQ(u->salts[1].iterations, 8192u);
+    EXPECT_EQ(r->salts[0].iterations, 8192u);
+    EXPECT_EQ(r->salts[1].iterations, 8192u) << "the one-password user's pad uses it too";
+    EXPECT_EQ(Rig().view.fakeIterations(), 4096u) << "the default when the accounts use it";
+}

@@ -1,4 +1,5 @@
 #pragma once
+#include <rune/peerlink/ClusterKeys.h>
 // BrokerNode.h — Broker node consensus runtime (BR-2 + BR-3 + BR-7a).
 //
 // Assembles the full consensus engine from a NodeConfig:
@@ -1463,6 +1464,10 @@ public:
     [[nodiscard]] int64_t appendSecurityRecordOnLeaderForTest(std::span<const uint8_t> eventBytes);
     /// Test-only: while held, this broker's `__security` applier applies nothing (the replica still replicates).
     void holdSecurityApplyForTest(bool on);
+    /// Test-only (review C I5), CONTROL thread: while held, the mirrored `__security` frames (kA2cSecurityApplied) are
+    /// stashed unapplied - the SecurityView, and with it the D24 answer-gate release, stays where it was; on release
+    /// they are applied in order.  Proves no OK leaves before THIS broker enforces the event.
+    void holdSecurityMirrorForTest(bool on);
     /// Authentication Task 10: the gateway's session table / auth-gate counters (read ON the control thread).
     [[nodiscard]] bool gatewayHasSessionForTest(int64_t sessionId);
     [[nodiscard]] uint64_t authGateRefusalsForTest();
@@ -2304,6 +2309,11 @@ private:
     std::unique_ptr<rune::replication::PartitionReplica>  securityReplica_;
     std::optional<SecurityApplier>                        bootSecurityApplier_;
     std::optional<rune::gateway::SecurityView>            securityView_;
+    /// Review C I4: the cluster key(s), loaded ONCE in start() (nullopt unless authMode == Enabled); every component
+    /// (gateway now, peer links / frame crypto in Tasks 15-16) takes a copy of THIS.
+    std::optional<rune::peerlink::ClusterKeys>            clusterKeys_;
+    struct HeldMirror { bool on = false; std::vector<std::vector<uint8_t>> frames; };   // test seam (control thread)
+    HeldMirror                                            heldMirror_;
     uint64_t                                              securityAnswersHeld_    = 0;
     uint64_t                                              securityAnswersDropped_ = 0;
     uint64_t                                              securityAlterIsrRefused_ = 0;

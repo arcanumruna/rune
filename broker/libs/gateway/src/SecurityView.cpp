@@ -3,6 +3,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include <map>
 #include <string>
 #include <utility>
 
@@ -30,12 +31,25 @@ std::expected<sec::Applied, sec::ApplyError> SecurityView::onApplied(int64_t off
                          "the mirrored record does not decode: " + std::string{sec::decodeErrorName(ev.error())});
     auto a = sec::apply(state_, *ev, offset);
     if (!a) return std::unexpected(halt_(std::move(a.error())));
+    refreshDerived_();   // once per applied event: the O(users x grants) walk stays off every Connect
     return a;
 }
 
 void SecurityView::onHalted(const sec::ApplyError& error) {
     if (halted()) return;   // the first cause stays
     (void)halt_(error);
+}
+
+void SecurityView::refreshDerived_() {
+    window_ = state_.hasSecurityAdmin() ? Window::Closed : Window::Open;
+    std::map<uint32_t, std::size_t> counts;
+    for (const auto& [id, u] : state_.users())
+        for (const auto& v : u.verifiers) ++counts[v.iterations];
+    uint32_t best = 4096;
+    std::size_t bestN = 0;
+    for (const auto& [it, n] : counts)
+        if (n > bestN) { best = it; bestN = n; }
+    fakeIterations_ = best;
 }
 
 sec::ApplyError SecurityView::halt_(sec::ApplyError error) {

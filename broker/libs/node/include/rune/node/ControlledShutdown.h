@@ -123,6 +123,17 @@ public:
             state_ = Registering{};   // a fresh request: re-broadcast at once
         return 1;
     }
+    /// Authentication review C — CONTROL thread: this process's `__security` applier halted.  The pattern of
+    /// reportCatalogHalted: every node-control request carries kNodeSecurityHalted from now on and the node registers
+    /// again at once; the controller steers the (-7, 0) leadership to a healthy broker.  Idempotent.
+    int reportSecurityHalted() {
+        if (securityHalted_) return 0;
+        securityHalted_ = true;
+        if (!active_()) return 0;
+        if (std::holds_alternative<Running>(state_) || std::holds_alternative<Registering>(state_))
+            state_ = Registering{};
+        return 1;
+    }
     /// ISR v3 (Step 9): this node's storage id and origin wire code (AlterIsrMsg::kStorageOrigin*), carried in slots
     /// 7/8/9 of every node-control frame.  Startup thread / control thread.  `bind()` is unchanged.
     void setStorage(int64_t id, uint8_t origin) noexcept { storageId_ = id; storageOrigin_ = origin; }
@@ -323,7 +334,8 @@ private:
         m.leaderEpoch = 0;
         m.partitionEpoch = 0;
         m.isrCount  = rune::replication::AlterIsrMsg::kLeaderEpochBump;
-        m.isr[1]    = flags | (catalogHalted_ ? rune::replication::AlterIsrMsg::kNodeCatalogHalted : 0);
+        m.isr[1]    = flags | (catalogHalted_ ? rune::replication::AlterIsrMsg::kNodeCatalogHalted : 0) |
+                  (securityHalted_ ? rune::replication::AlterIsrMsg::kNodeSecurityHalted : 0);
         // D15: the metadata feature level this binary supports.
         m.isr[rune::replication::AlterIsrMsg::kNodeFeatureLevelSlot] = rune::replication::MetadataFeature::kLatest;
         m.isr[3]    = static_cast<int32_t>(static_cast<uint32_t>(incarnation_));
@@ -519,6 +531,7 @@ private:
     /// Task 11 fix round 0: a latched process attribute (orthogonal to the
     /// hand-off state machine): every request carries kNodeCatalogHalted.
     bool                                        catalogHalted_ = false;
+    bool                                        securityHalted_ = false;   ///< review C: same, for `__security`
     int64_t                                     storageId_     = 0;     ///< ISR v3: slots 7/8 of every frame
     uint8_t                                     storageOrigin_ = 0;     ///< ISR v3: slot 9 (0 = none)
     StorageOpenFn                               storageOpenFn_  = nullptr;

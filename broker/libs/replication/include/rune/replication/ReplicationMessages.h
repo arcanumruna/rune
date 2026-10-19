@@ -539,6 +539,9 @@ struct AlterIsrMsg {
     /// controller never places a new partition on a halted node, and a halted
     /// controller hands the controllership to a healthy peer when one is live.
     static constexpr int32_t kNodeCatalogHalted = 512;
+    /// Authentication review C: the same mark for the `__security` applier ("my security log is halted"): the controller
+    /// steers the (-7, 0) leadership off this process (a halted leader answers every security DDL Internal).
+    static constexpr int32_t kNodeSecurityHalted = 1024;
     static constexpr int32_t kConfirmUserClear = 1;
     static constexpr int32_t kConfirmAllClear  = 2;
     /// The controller's answer (responder id in `partition`): kAlterIsrOk =

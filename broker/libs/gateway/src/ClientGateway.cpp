@@ -2439,14 +2439,14 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
             resp.leaderMemberId    = thisNodeId_;
             resp.assignedSessionId = pending.sessionId;
             // Authentication Task 10 (D11): a v9 client of an authenticating broker is told how it authenticates and
-            // where it stands.  Bootstrap window (Required, `__security` holds no Bootstrap event): Anonymous - it may
+            // where it stands.  Bootstrap window (Required, no ENABLED security admin - a fresh cluster, or one whose last admin was disabled / dropped, D3 recovery): Anonymous - it may
             // send ONLY SecurityBootstrap.  Otherwise MustAuthenticate.  An in-process broker keeps the pre-v9 frame.
             pending.auth = newSessionAuth_(nowNs, pending.correlationId);
             if (authMode_ != rune::gateway::GatewayAuthMode::InProcess && pc::clientUnderstandsAuth(pending.clientVersion)) {
                 resp.v9 = true;
                 resp.authMode = authMode_ == rune::gateway::GatewayAuthMode::Required ? pc::AuthMode::Required
                                                                                        : pc::AuthMode::DevDisabled;
-                // Required: MustAuthenticate - except in the bootstrap window (no Bootstrap event applied), where the
+                // Required: MustAuthenticate - except in the bootstrap window (no enabled admin, SecurityView::bootstrapWindowOpen), where the
                 // session is told Anonymous and may send only SecurityBootstrap (and a login that cannot succeed).
                 resp.authState = authMode_ == rune::gateway::GatewayAuthMode::Required && !bootstrapOpen_()
                                      ? pc::AuthState::MustAuthenticate : pc::AuthState::Anonymous;
@@ -3378,6 +3378,14 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     // F23: any request is liveness (Kafka: idle == no requests).  Reuses the
     // lookup above — no extra cost on the produce hot path.
     session->lastSeenNs = nowNs_;
+    // Review C I3: the auth state is checked HERE, on the session already looked up (Task 12's PermissionTable::allows
+    // joins this spot).  AwaitingFirst / AwaitingFinal / PasswordChangeRequired (variant index < 3) never produce.
+    static_assert(std::is_same_v<std::variant_alternative_t<3, rune::gateway::SessionAuth>, rune::gateway::AuthAuthenticated>);
+    if (session->auth.index() < 3) [[unlikely]] {
+        const auto hdr = pc::MessageHeader::decode(buf, len);
+        answerGate_(*session, *hdr, rune::gateway::gateFor(session->auth, pc::TemplateId::Produce, false, false), buf, len);
+        return true;
+    }
     // G0.1: capture session id so the public sendRespReliable() test-seam knows
     // which session to target for the duration of this handleProduce() call.
     currentProduceSessionId_ = msg.sessionId;
@@ -7540,6 +7548,10 @@ bool ClientGateway::authGateRefuses_(pc::TemplateId tid, const uint8_t* buf, std
         case pc::TemplateId::Ping:
         case pc::TemplateId::Disconnect:
             return false;
+        // Review C I3: Produce is the hot path - it checks the auth state inside handleProduce, on the session it
+        // already looked up (no second header decode / hash lookup per frame).
+        case pc::TemplateId::Produce:
+            return false;
         default:
             break;
     }
@@ -7560,6 +7572,16 @@ bool ClientGateway::authGateRefuses_(pc::TemplateId tid, const uint8_t* buf, std
     const AuthGate gate = gateFor(session->auth, tid, tid == pc::TemplateId::SecurityBootstrap && bootstrapOpen_(), selfSetPassword);
     if (gate == AuthGate::Allow) return false;
 
+    answerGate_(*session, *hdr, gate, buf, len);
+    return true;
+}
+
+void ClientGateway::answerGate_(Session& sessionRef, const pc::MessageHeader& hdrRef, rune::gateway::AuthGate gate,
+                                const uint8_t* buf, std::size_t len)
+{
+    using namespace rune::gateway;
+    Session* session = &sessionRef;
+    const pc::MessageHeader* hdr = &hdrRef;
     const bool end = gate == AuthGate::AnswerAuthFailedAndEnd;
     const auto code = end ? pc::ErrorCode::AuthenticationFailed : pc::ErrorCode::PasswordChangeRequired;
     ++authGateRefusals_;
@@ -7579,7 +7601,6 @@ bool ClientGateway::authGateRefuses_(pc::TemplateId tid, const uint8_t* buf, std
         sendAnswer_(*session, scratch_.data(), n);
     }
     if (end) (void)closeSession_(hdr->sessionId);
-    return true;
 }
 
 void ClientGateway::failLogin_(Session& session, int64_t correlationId, uint32_t retryAfterMs)
@@ -7635,7 +7656,7 @@ void ClientGateway::handleAuthClientFirst_(const uint8_t* buf, std::size_t len)
         failLogin_(*session, m->correlationId, 0);
         return;
     }
-    ServerFirstPlan plan = scramServerFirst(securityView_->state(), *m, deadline);
+    ServerFirstPlan plan = scramServerFirst(securityView_->state(), *m, deadline, securityView_->fakeIterations());
     if (plan.frame.empty()) {   // no randomness for the nonce: fail closed
         ++loginsFailed_;
         spdlog::error("auth: login failed user={} source={} session={} reason=no-randomness", user, session->sourceHost, session->sessionId);

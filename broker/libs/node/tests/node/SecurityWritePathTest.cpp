@@ -298,6 +298,38 @@ TEST(SecurityWritePathRegression, NoEventEverCarriesAPasswordLiteralRegression) 
     }
 }
 
+// Review C I1 (D10): the leader refuses a statement carrying a password literal - the log is never compacted.
+TEST(SecurityWritePathRegression, AnUnredactedPasswordLiteralIsRefusedAndAppendsNothingRegression) {
+    SecurityDdlRig rig("unredacted");
+    rig.becomeServingLeader();
+    const std::vector<std::string> bad = {
+        "CREATE USER u1 WITH PASSWORD 'hunter2-correct-horse';",
+        "create user u1 with password \"x-long-password-1\";",
+        "ALTER USER u1 SET PASSWORD 'p4ssword-long-1' TERMINATE SESSIONS;",
+        "CREATE USER u1 WITH Password\t$$dollar-quoted$$;",
+        "CREATE USER u1 WITH PASSWORD '<redacted>' ; ALTER USER u1 ADD PASSWORD 'leak-this-1234';",
+    };
+    for (const auto& stmt : bad) {
+        auto m = rig.createUser("u1", "a-long-password-1");
+        m.meta = rig.meta(stmt);
+        const auto a = rig.ddl(std::move(m));
+        EXPECT_EQ(a.code, kInvalidRequest) << stmt;
+        EXPECT_NE(a.detail.find("password literal"), std::string::npos) << a.detail;
+    }
+    EXPECT_TRUE(rig.recordedEvents().empty()) << "nothing was appended";
+    // The redacted forms (and statements that merely mention the keyword) still pass.
+    EXPECT_EQ(rig.ddl(rig.createUser("u1", "a-long-password-1")).code, 0);
+    auto drop = rig.alterUser("u1", Ch::AddPassword);
+    drop.verifier = SecurityDdlRig::verifierFor("another-long-pw-1");
+    drop.meta = rig.meta("ALTER USER u1 ADD PASSWORD '<redacted>';");
+    EXPECT_EQ(rig.ddl(std::move(drop)).code, 0);
+    auto dp = rig.alterUser("u1", Ch::DropPassword);
+    dp.passwordIndex = 1;
+    dp.meta = rig.meta("ALTER USER u1 DROP PASSWORD 1;");
+    EXPECT_EQ(rig.ddl(std::move(dp)).code, 0);
+    EXPECT_EQ(rig.recordedEvents().size(), 3u);
+}
+
 TEST(SecurityWritePathRegression, PrincipalIsTheSessionsAuthenticatedUser) {
     SecurityDdlRig rig("principal");
     rig.becomeServingLeader();

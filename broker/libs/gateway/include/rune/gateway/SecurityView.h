@@ -29,7 +29,17 @@ public:
 
     /// `booted` = the state the startup thread replayed from the local log (appliedOffset() = the last event in it,
     /// -1 = none).  The next event this view accepts is booted.appliedOffset() + 1.
-    explicit SecurityView(rune::security::SecurityState booted) : state_(std::move(booted)) {}
+    explicit SecurityView(rune::security::SecurityState booted) : state_(std::move(booted)) { refreshDerived_(); }
+
+    /// Review C I2 (ruling: D3 recovery stays): the bootstrap window is open while NO ENABLED user effectively holds
+    /// ADMIN ON CLUSTER - a fresh cluster, and also a cluster whose last admin was disabled or dropped (the holder of the
+    /// cluster key is the root of trust; the bootstrap is still HMAC-gated).  Cached, recomputed once per applied event
+    /// (cold), so asking is O(1) per Connect / per gated frame.  A halted mirror is closed (fail closed).
+    /// Review C: the iteration count the FAKE salts of unknown users advertise - the most common count among the real
+    /// accounts' verifiers (4096, the default, when there are none) - so an unknown user's AuthServerFirst is not
+    /// trivially distinguishable by a non-default count.  Cached per applied event like the window.
+    [[nodiscard]] uint32_t fakeIterations() const noexcept { return fakeIterations_; }
+    [[nodiscard]] bool bootstrapWindowOpen() const noexcept { return window_ == Window::Open && !halted(); }
 
     /// Apply the admin applier's event at `offset` (its record bytes).  An error (a gap, an undecodable record, an
     /// apply refusal, a fingerprint mismatch) HALTS the mirror and is returned; nothing of that event is applied.
@@ -53,6 +63,10 @@ public:
 private:
     [[nodiscard]] rune::security::ApplyError halt_(rune::security::ApplyError error);
 
+    enum class Window : uint8_t { Open, Closed };
+    void refreshDerived_();   // window + fake-iteration count, once per applied event (cold)
+    Window                          window_ = Window::Closed;
+    uint32_t                        fakeIterations_ = 4096;
     rune::security::SecurityState   state_;
     std::variant<Mirroring, Halted> st_;
 };

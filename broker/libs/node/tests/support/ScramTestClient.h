@@ -20,13 +20,13 @@
 namespace rune::node::test {
 
 /// A real stored verifier (PBKDF2 at 4096 iterations) of `password` with a salt filled with 0xA0 + saltSeed.
-[[nodiscard]] inline rune::security::ScramVerifier scramVerifierOf(const std::string& password, uint8_t saltSeed = 0) {
+[[nodiscard]] inline rune::security::ScramVerifier scramVerifierOf(const std::string& password, uint8_t saltSeed = 0, uint32_t iterations = 4096) {
     namespace rs = rune::crypto::scram;
     std::vector<uint8_t> salt(16, static_cast<uint8_t>(0xA0 + saltSeed));
-    auto sp = rs::saltPassword(rune::crypto::Digest::Sha512, password, salt, 4096);
-    auto v = rs::makeVerifier(rune::crypto::Digest::Sha512, *sp, salt, 4096);
+    auto sp = rs::saltPassword(rune::crypto::Digest::Sha512, password, salt, iterations);
+    auto v = rs::makeVerifier(rune::crypto::Digest::Sha512, *sp, salt, iterations);
     rune::security::ScramVerifier out;
-    out.salt = salt; out.iterations = 4096;
+    out.salt = salt; out.iterations = iterations;
     std::memcpy(out.storedKey.data(), v->storedKey.bytes.data(), 64);
     std::memcpy(out.serverKey.data(), v->serverKey.bytes.data(), 64);
     return out;

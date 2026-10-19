@@ -1,9 +1,11 @@
 // SecurityGatewayTest.cpp — authentication Task 10 at the gateway (no Aeron): the cluster-key proof of
 // SecurityBootstrap (D4), the `__security` DDL route (Redirect / NotLeader / Internal like catalog DDL), the Subscribe
 // on -7, and the pre-authentication gate.  makeForTest + the apply*ForTest seams.
+#include "support/SecurityEventChain.h"
 #include <rune/gateway/BootstrapProof.h>
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
+#include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/Protocol.h>
 #include <rune/protocol/client/SchemaMessages.h>
@@ -102,6 +104,7 @@ struct Rig {
         if (auto e = pc::ErrorResponse::decode(b, n)) { s.code = e->code; s.text = std::string(e->message); }
         else if (auto d = pc::DdlResponse::decode(b, n)) { s.code = static_cast<int16_t>(d->errorCode); s.text = std::string(d->detail); }
         else if (auto r = pc::SubscribeResponse::decode(b, n)) { s.code = r->errorCode; }
+        else if (auto p = pc::ProduceResponse::decode(b, n)) { s.code = p->errorCode; }
         seen.push_back(std::move(s));
     }
     [[nodiscard]] const Seen* answerFor(int64_t c) const {
@@ -362,4 +365,72 @@ TEST(AuthGateRegression, SessionLevelFramesAndOpenSessionsAreNeverGated) {
     const auto f = open.createRole(1);
     open.gw.applyClientFrameForTest(f.data(), f.size());
     EXPECT_EQ(open.admin.securityDdls, 1);
+}
+
+// Review C I2 (ruling: D3 recovery stays): the window follows "no ENABLED admin", cached in the view.
+TEST(AuthGateRegression, BootstrapWindowFollowsTheRulingRegression) {
+    rune::node::test::SecurityEventChain chain;
+    auto ev0 = chain.emit(rune::security::BootstrapOps{rune::node::test::testVerifier(0), {}}, "admin", "BOOTSTRAP", "bootstrap");
+    SecurityView view{rune::security::SecurityState{}};
+    EXPECT_TRUE(view.bootstrapWindowOpen()) << "a fresh cluster";
+    ASSERT_TRUE(view.onApplied(0, *rune::security::encode(ev0)).has_value());
+    EXPECT_FALSE(view.bootstrapWindowOpen()) << "an enabled admin exists";
+    auto dis = chain.emit(rune::security::AlterUserOps{rune::security::DisableUser{}}, "admin", "ALTER USER admin DISABLE;");
+    ASSERT_TRUE(view.onApplied(1, *rune::security::encode(dis)).has_value());
+    EXPECT_TRUE(view.bootstrapWindowOpen()) << "the last admin was disabled: D3 recovery, still MAC-gated";
+    auto en = chain.emit(rune::security::AlterUserOps{rune::security::EnableUser{}}, "admin", "ALTER USER admin ENABLE;");
+    ASSERT_TRUE(view.onApplied(2, *rune::security::encode(en)).has_value());
+    EXPECT_FALSE(view.bootstrapWindowOpen());
+    view.onHalted(rune::security::ApplyError{});
+    EXPECT_FALSE(view.bootstrapWindowOpen()) << "a halted mirror fails closed";
+    // The gate follows the cached value for a new session.
+    Rig rig;
+    SecurityView open{rune::security::SecurityState{}};
+    rig.gw.setAuthMode(GatewayAuthMode::Required, &open);
+    rig.gw.setClusterKeys(keysFor(kA));
+    rig.gw.setSessionAuthForTest(rig.sid, AuthAwaitingFirst{INT64_MAX});
+    const BootFrame good(rig.sid, 40, kA);
+    rig.gw.applyClientFrameForTest(good.bytes.data(), good.bytes.size());
+    EXPECT_EQ(rig.admin.bootstraps, 1);
+}
+
+// Review C I3: Produce skips the pre-dispatch gate (no extra header decode / lookup per frame) and is checked inside
+// handleProduce on the session it already looked up.
+TEST(AuthGateRegression, ProduceFromAGatedSessionIsRefusedInItsOwnResponseAndEndedRegression) {
+    auto produceFrame = [](int64_t sid, int64_t corr) {
+        rune::protocol::RecordBatchBuilder rb(0, 1000);
+        rb.append("k", "v", 1000);
+        const auto batch = rb.build();
+        pc::Produce m;
+        m.sessionId = sid; m.correlationId = corr; m.topicId = 1; m.partition = 0; m.partitionKnown = 1; m.acks = 1;
+        m.producerId = -1; m.baseSequence = -1;
+        m.recordBatch = std::span<const uint8_t>(batch.data(), batch.size());
+        std::vector<uint8_t> b(m.encodedSize() + 8); b.resize(m.encode(b.data()));
+        return b;
+    };
+    auto code = [](const Seen* a) { return a ? a->code : int16_t{-1}; };
+    {
+        Rig rig;
+        auto view = adminView();
+        rig.gw.setAuthMode(GatewayAuthMode::Required, &view);
+        rig.gw.setSessionAuthForTest(rig.sid, AuthAwaitingFirst{INT64_MAX});
+        const auto f = produceFrame(rig.sid, 61);
+        rig.gw.applyClientFrameForTest(f.data(), f.size());
+        const Seen* a = rig.answerFor(61);
+        ASSERT_NE(a, nullptr);
+        EXPECT_EQ(a->tid, static_cast<uint16_t>(pc::TemplateId::ProduceResponse)) << "its own response type";
+        EXPECT_EQ(code(a), static_cast<int16_t>(pc::ErrorCode::AuthenticationFailed));
+        EXPECT_FALSE(rig.gw.hasSessionForTest(rig.sid));
+        EXPECT_EQ(rig.gw.authGateRefusals(), 1u);
+    }
+    {   // a one-time-password session: PasswordChangeRequired, and the session stays
+        Rig rig;
+        auto view = adminView();
+        rig.gw.setAuthMode(GatewayAuthMode::Required, &view);
+        rig.gw.setSessionAuthForTest(rig.sid, AuthPasswordChangeRequired{1, "admin"});
+        const auto f = produceFrame(rig.sid, 62);
+        rig.gw.applyClientFrameForTest(f.data(), f.size());
+        EXPECT_EQ(code(rig.answerFor(62)), static_cast<int16_t>(pc::ErrorCode::PasswordChangeRequired));
+        EXPECT_TRUE(rig.gw.hasSessionForTest(rig.sid));
+    }
 }
