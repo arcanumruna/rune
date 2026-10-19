@@ -186,6 +186,17 @@ target_link_libraries(rune_catalog PUBLIC rune_codec)
 target_compile_features(rune_catalog PUBLIC cxx_std_23)
 endif()
 
+# ── rune_security — the shared authentication library (auth spec §3, plan D1), compiled
+#    from the rune-codec sibling's sources like rune_catalog; reused when an embedding
+#    project (the broker's rune_client_broker_tests) defines it first.
+if(NOT TARGET rune_security)
+file(GLOB RUNE_SECURITY_SOURCES CONFIGURE_DEPENDS ${RUNE_CODEC_ROOT}/src/security/*.cpp)
+add_library(rune_security STATIC ${RUNE_SECURITY_SOURCES})
+target_include_directories(rune_security PUBLIC ${RUNE_CODEC_ROOT}/include)
+target_link_libraries(rune_security PUBLIC rune_catalog)
+target_compile_features(rune_security PUBLIC cxx_std_23)
+endif()
+
 # ── rune-ql — DDL parser + code-gen backends (sibling source static lib) ──────
 # Mirrors the rune-codec wiring above.  rune-ql's sources include rune-codec
 # headers, so we reuse the rune_codec target (already defined above) rather
