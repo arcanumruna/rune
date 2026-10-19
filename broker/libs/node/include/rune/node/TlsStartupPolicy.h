@@ -73,4 +73,13 @@ namespace rune::node {
     return perWorkerEgress && !shardMode && (requireTls || brokerHasTls);
 }
 
+// Ingress twin (auth fix program M4 / X012): with authentication Enabled, a worker polling its own ingress outside
+// shard mode would take Produce frames with no gateway authn/authz and no crypto entries.  Shard mode is the only
+// per-worker ingress that carries an ack sink (the worker enforces WRITE and decrypts); a non-shard one must not start.
+[[nodiscard]] inline bool mustRefuseNonShardPerWorkerIngressAuth(bool authEnabled,
+                                                                 bool perWorkerIngress,
+                                                                 bool shardMode) noexcept {
+    return authEnabled && perWorkerIngress && !shardMode;
+}
+
 } // namespace rune::node

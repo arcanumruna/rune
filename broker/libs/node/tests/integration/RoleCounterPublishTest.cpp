@@ -30,6 +30,7 @@
 #include <rune/security/testing/SecurityGoldenScript.h>
 
 #include <spdlog/sinks/ringbuffer_sink.h>
+#include <sys/stat.h>
 #include <gtest/gtest.h>
 
 #include <atomic>
@@ -345,6 +346,62 @@ TEST(NodeConfigRegression, DevModeSingleNodeStartsAndWarns) {
     EXPECT_GE(log.count("AUTHENTICATION DISABLED (RUNE_AUTH=disabled)"), 1) << "the dev-mode warning at start";
     EXPECT_GE(log.count("every request runs as 'anonymous' with full access"), 1);
     node.stop();
+}
+
+// Combined fix program M13 (X102): the `__security` log holds every user's StoredKey / ServerKey.  Its directory is 0700
+// and its segment, index and checkpoint files 0600 (the default-umask 0644 they used to get).  RED: pass the default mode
+// to the security Log (or drop the permissions() call) - the files / directory are group- and world-readable again.
+TEST(SecurityAtRestRegression, SecurityLogFilesAreOwnerOnlyRegression) {
+    TempDir tmp{"atrest_"};
+    const fs::path key = tmp.path.string() + "_atrest.key";
+    { std::ofstream(key) << std::string(40, 'k') << "\n"; }
+    fs::permissions(key, fs::perms::owner_read | fs::perms::owner_write);
+    NodeConfig cfg = makeSingleNodeConfig(tmp.path);
+    cfg.authMode = AuthMode::Enabled;
+    cfg.clusterKeyFile = key.string();
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(5s));
+    const fs::path dir = tmp.path / "__security";
+    ASSERT_TRUE(fs::is_directory(dir));
+    auto mode = [](const fs::path& p) { struct stat st {}; return ::stat(p.c_str(), &st) == 0 ? (st.st_mode & 0777) : mode_t{0xFFFF}; };
+    EXPECT_EQ(mode(dir), mode_t{0700}) << "directory";
+    int logs = 0, indexes = 0;
+    for (const auto& e : fs::directory_iterator(dir)) {
+        if (!e.is_regular_file()) continue;
+        const std::string ext = e.path().extension().string();
+        if (ext == ".log") ++logs;
+        if (ext == ".index") ++indexes;
+        if (ext == ".log" || ext == ".index" || e.path().filename() == "applied")
+            EXPECT_EQ(mode(e.path()), mode_t{0600}) << e.path();
+    }
+    EXPECT_GE(logs, 1);
+    EXPECT_GE(indexes, 1);
+    node.stop();
+}
+
+// M13 (X102): a cluster key file readable by group or others refuses to start (it was only warned about); 0400 starts.
+// RED: restore the warn-only branch in NodeConfig::validateAuth - the 0644 file starts.
+TEST(SecurityAtRestRegression, AGroupOrWorldReadableClusterKeyRefusesToStartRegression) {
+    TempDir tmp{"keymode_"};
+    const fs::path key = tmp.path.string() + "_mode.key";
+    { std::ofstream(key) << std::string(40, 'k') << "\n"; }
+    NodeConfig cfg = makeSingleNodeConfig(tmp.path);
+    cfg.authMode = AuthMode::Enabled;
+    cfg.clusterKeyFile = key.string();
+    for (const auto bad : {fs::perms::owner_read | fs::perms::owner_write | fs::perms::group_read,
+                           fs::perms::owner_read | fs::perms::owner_write | fs::perms::others_read,
+                           fs::perms::owner_read | fs::perms::owner_write | fs::perms::group_read | fs::perms::others_read}) {
+        fs::permissions(key, bad);
+        const auto err = cfg.validateAuth();
+        ASSERT_TRUE(err.has_value()) << std::oct << static_cast<int>(bad);
+        EXPECT_NE(err->find("RUNE_CLUSTER_KEY_FILE"), std::string::npos) << *err;
+        EXPECT_NE(err->find("refusing to start"), std::string::npos) << *err;
+    }
+    fs::permissions(key, fs::perms::owner_read);
+    EXPECT_FALSE(cfg.validateAuth().has_value()) << "0400 is what the launchers mount";
+    fs::permissions(key, fs::perms::owner_read | fs::perms::owner_write);
+    EXPECT_FALSE(cfg.validateAuth().has_value()) << "0600";
 }
 
 // An enabled broker with a good cluster key file starts and publishes 0; one with a 31-byte file refuses to start.

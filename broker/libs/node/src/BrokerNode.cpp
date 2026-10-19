@@ -70,6 +70,8 @@ namespace rune::node {
 // fields are not yet wired. Multi-node path reads from config_.
 // ---------------------------------------------------------------------------
 static constexpr int kIngressCapacity = 64 * 1024; //  64 KiB
+/// Combined fix program M13 (X102): permission bits of every `__security` segment / index / checkpoint file.
+static constexpr unsigned kSecurityFileMode = 0600;
 
 // ---------------------------------------------------------------------------
 // Max produce-batch derivation (F3 rounds 4-5) — see BrokerNode.h.  Every
@@ -1706,6 +1708,12 @@ void BrokerNode::buildWorkerPool() {
     // (aeron_ is null in unit tests that do not start the embedded driver).
     // Tests that need the per-worker path construct WorkerIngress directly.
     // -----------------------------------------------------------------------
+
+    // Combined fix program M4 (X012): with authentication Enabled EVERY worker enforces WRITE on its direct ingress,
+    // whatever the worker mode; one without a sink (non-shard per-worker ingress is refused at config time, but a
+    // programmatic config could still reach here) refuses every direct-ingress produce.
+    if (config_.authMode == AuthMode::Enabled)
+        for (int32_t i = 0; i < wc; ++i) workerPool_->worker(i).requireEnforcement();
 
     // Apply desired fragment limit + ack-slot reservation size from NodeConfig to
     // each worker (before runners start).
@@ -3863,7 +3871,16 @@ void BrokerNode::buildCatalog_() {
 void BrokerNode::bootFromSecurity_() {
     const fs::path dir = fs::path{config_.dataDir} / "__security";
     fs::create_directories(dir);
-    securityLog_ = std::make_unique<rune::storage::Log>(dir.string(), config_.offsetLogSegmentRollBytes);
+    // Combined fix program M13 (X102): the log holds every user's StoredKey / ServerKey - owner-only directory (0700,
+    // also tightening one an older run left 0755) and owner-only files (0600).
+    {
+        std::error_code permEc;
+        fs::permissions(dir, fs::perms::owner_all, fs::perm_options::replace, permEc);
+        if (permEc)
+            throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: cannot restrict " + dir.string() +
+                                     " to its owner (0700): " + permEc.message() + " - refusing to start");
+    }
+    securityLog_ = std::make_unique<rune::storage::Log>(dir.string(), config_.offsetLogSegmentRollBytes, kSecurityFileMode);
     securityLog_->recover();
     if (securityLog_->storageFailed())
         throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: __security recovery failed "

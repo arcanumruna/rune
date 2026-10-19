@@ -74,6 +74,7 @@
 #include <rune/node/ReturnFifo.h>
 #include <rune/node/WorkerViewSet.h>
 #include <rune/node/SessionAckSink.h>
+#include <rune/node/UnauthLogLimiter.h>
 #include <limits>
 #include <rune/node/WorkerOp.h>
 #include <rune/node/detail/NoTypeErasure.h>
@@ -123,6 +124,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <variant>
 #include <vector>
 
 #include <spdlog/spdlog.h>
@@ -681,7 +683,39 @@ public:
     void setShardClient(aeron::Aeron* client, int32_t controlTermBytes = 0) {
         ackSink_ = client ? std::make_unique<SessionAckSink>(AeronSessionPubPolicy{client, controlTermBytes}) : nullptr;
         if (ackSink_) ackSink_->setDirectBudgets(directSessionAckBudget_, static_cast<uint32_t>(kDirectAckBudget));
+        // A worker with its own sink has always enforced WRITE on its direct ingress: it becomes Enforcing.
+        if (ackSink_) enforcement_ = Enforcing{ackSink_.get()};
+        else if (auto* e = std::get_if<Enforcing>(&enforcement_)) e->sink = nullptr;
     }
+    /// Combined fix program M4 (X012): this worker must enforce WRITE on every direct-ingress produce (the broker runs
+    /// with authentication Enabled).  Called by BrokerNode on EVERY worker before its runner starts, whatever the
+    /// worker mode: an Enforcing worker without a sink (non-shard per-worker ingress, or after releaseShardClient)
+    /// refuses every direct-ingress produce instead of appending unchecked.
+    void requireEnforcement() noexcept {
+        if (!std::holds_alternative<Enforcing>(enforcement_)) enforcement_ = Enforcing{ackSink_.get()};
+    }
+    /// Combined fix program (X036): true when ANY batch of a client-supplied Produce record-batch span carries
+    /// kAttrControl.  Control batches (COMMIT/ABORT markers) are written only by the broker's own transaction
+    /// coordinator; a client-built one would forge a marker (LSO pin, producer fencing, cleaner deletes of committed
+    /// data).  Walks the batch chain by totalLength (header reads only, no allocation); a malformed length stops the
+    /// walk - the append's own validation refuses such a frame.  Shared by the gateway and the worker ingress.
+    [[nodiscard]] static bool hasControlBatch(const uint8_t* data, std::size_t len) noexcept {
+        namespace b = rune::protocol::batch;
+        std::size_t rd = 0;
+        while (rd + static_cast<std::size_t>(b::kRecordBatchOverhead) <= len) {
+            const rune::protocol::RecordBatchReader r(data + rd, len - rd);
+            if ((static_cast<uint16_t>(r.attributes()) & static_cast<uint16_t>(b::kAttrControl)) != 0) return true;
+            const int32_t t = r.totalLength();
+            if (t <= 0 || rd + static_cast<std::size_t>(t) > len) return false;
+            rd += static_cast<std::size_t>(t);
+        }
+        return false;
+    }
+
+    /// X103: produce frames this worker dropped because they failed to open, and the log lines the 1/1024 limit swallowed.
+    [[nodiscard]] uint64_t decryptFailuresForTest() const noexcept { return decryptFailures_; }
+    [[nodiscard]] uint64_t unauthLogSuppressed() const noexcept { return unauthLog_.suppressed(); }
+    [[nodiscard]] bool enforcingForTest() const noexcept { return std::holds_alternative<Enforcing>(enforcement_); }
     /// D8d: per-session direct (worker-ingress) outstanding-ack budget (cold;
     /// clamped to [1, kDirectAckBudget]).  Default SessionAckSink::
     /// kDefaultDirectSessionBudget.
@@ -702,7 +736,10 @@ public:
     [[nodiscard]] uint64_t directUnderflowsForTest() const noexcept { return ackSink_ ? ackSink_->directUnderflowsForTest() : 0; }
     [[nodiscard]] uint64_t directDroppedClosedForTest() const noexcept { return ackSink_ ? ackSink_->directDroppedClosed() : 0; }
     [[nodiscard]] uint64_t directExpiryCancelsForTest() const noexcept { return ackSink_ ? ackSink_->directExpiryCancelsForTest() : 0; }
-    void releaseShardClient() noexcept { ackSink_.reset(); }
+    void releaseShardClient() noexcept {
+        ackSink_.reset();
+        if (auto* e = std::get_if<Enforcing>(&enforcement_)) e->sink = nullptr;   // fail closed, never a dangling sink
+    }
     [[nodiscard]] bool workerSideAcks() const noexcept { return ackSink_ != nullptr; }
     [[nodiscard]] uint64_t sessionAnnouncesSeenForTest() const noexcept { return sessionAnnouncesSeen_; }
     [[nodiscard]] int32_t  lastAnnouncedClientVersionForTest() const noexcept { return lastAnnouncedClientVersion_; }
@@ -4622,6 +4659,13 @@ private:
     // Task 13 (spec §3.4): worker-side acks — engaged iff shard mode with this
     // worker's own client (setShardClient).  Worker-thread only once running.
     std::unique_ptr<SessionAckSink> ackSink_;
+    // Combined fix program M4 (X012): whether this worker's direct ingress checks the WRITE grant.  Each state holds
+    // what it needs: Enforcing carries the sink whose session table holds the grants (null = none attached, which
+    // refuses every direct-ingress produce).  Written on the startup thread before the runner starts, then read-only.
+    struct NotEnforcing {};
+    struct Enforcing { SessionAckSink* sink = nullptr; };
+    using EnforcementMode = std::variant<NotEnforcing, Enforcing>;
+    EnforcementMode enforcement_{NotEnforcing{}};
     // Fix round 1 (C1b/c) — the session ack queue bound.  A = queued acks, O =
     // owed returns (reservedAckSlots_, <= kMaxOwedReturnsCeiling).  Every intake
     // step is limited by ackRoom_() = kAckCapacity − A − O (op drain:
@@ -6773,6 +6817,23 @@ private:
         return 1;
     }
 
+    /// X036: answer a direct-ingress Produce frame that carries a client-built control batch InvalidRequest (consumed,
+    /// never appended), counted and logged rate-limited (worker-thread-owned counter).
+    [[gnu::cold]] [[gnu::noinline]] int refuseControlBatch_(const rune::protocol::client::Produce& msg, uint8_t directAck) {
+        if (controlBatchRefusals_++ % 1024 == 0)
+            spdlog::warn("Worker {}: WorkerIngress: produce with a client control batch refused InvalidRequest "
+                         "(session={}, topic={}); total {}", workerId_, msg.sessionId, msg.topicId, controlBatchRefusals_);
+        WorkerReturn ret = produceAnswer_(ProduceOrigin::WorkerIngress, msg.sessionId, msg.correlationId,
+                                          msg.topicId, msg.partition);
+        ret.directAck = directAck;
+        ret.errorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::InvalidRequest);
+        enqueueReturn_(ret);
+        return 1;
+    }
+    uint64_t controlBatchRefusals_ = 0;
+    uint64_t decryptFailures_ = 0;          ///< X103: produce frames dropped for failing to open (worker thread)
+    UnauthLogLimiter unauthLog_;            ///< X103: rate limit of the log lines an unauthenticated sender can drive
+
     int handleWorkerIngressFrame_(const uint8_t* data, std::size_t len,
                                   int64_t nowNs, uint8_t directAck = 0) {
         RUNE_FR_SPAN_PRODUCE(rune_fr::Site::WorkerIngressRecv, 0);
@@ -6815,9 +6876,12 @@ private:
                     // NEVER decode the ciphertext as plaintext. Same drop
                     // contract as an undecodable plaintext frame below.
                     if (directAck != 0) ackSink_->releaseDirect(produceSessionIdOf_(data), directAck);
-                    spdlog::warn("Worker {}: WorkerIngress: produce decrypt failed (session={}, "
-                                 "len={}); dropping (fail-closed)",
-                                 workerId_, produceSessionIdOf_(data), len);
+                    // X103: any UDP sender drives this on the produce thread - counted, logged first + every 1024th.
+                    ++decryptFailures_;
+                    if (unauthLog_.due(0)) [[unlikely]]
+                        spdlog::warn("Worker {}: WorkerIngress: produce decrypt failed (session={}, "
+                                     "len={}); dropping (fail-closed; failures so far {})",
+                                     workerId_, produceSessionIdOf_(data), len, decryptFailures_);
                     return 0;
                 }
                 decData = workerIngressOpenScratch_.data();
@@ -6855,10 +6919,15 @@ private:
         const pc::Produce& msg = *msgOpt;
 
         // Authentication Task 13 (spec §6, D30): the shard-mode WRITE check - ONE slot probe, ONE bounds check, ONE
-        // bit load.  Workers without worker-side acks keep no session table (unit rigs) and enforce nothing.  A
-        // session this worker has no slot for is denied (fail closed).
-        if (ackSink_) {
-            const WriteGrantSlot* grants = ackSink_->writeGrants(msg.sessionId);
+        // bit load.  NotEnforcing workers (dev mode, unit rigs without auth) keep no session table and enforce
+        // nothing.  A session this worker has no slot for is denied (fail closed), and an Enforcing worker with no
+        // sink attached (M4, X012) refuses every frame: it has no grants to consult.
+        if (const auto* enf = std::get_if<Enforcing>(&enforcement_)) {
+            if (enf->sink == nullptr) [[unlikely]] {
+                if (openSeq != 0) commitProduceSeq(openCtx, openSeq);   // consumed (answered)
+                return refuseNotAuthorized_(msg, directAck);
+            }
+            const WriteGrantSlot* grants = enf->sink->writeGrants(msg.sessionId);
             if (grants == nullptr || !allowsWrite(*grants, msg.topicId)) [[unlikely]] {
                 // The login's grants are enqueued on the lifecycle ring BEFORE the client learns it may produce, but
                 // this pass may have drained that ring before the enqueue: hold the frame one pass (the controlled
@@ -6871,6 +6940,12 @@ private:
                 if (openSeq != 0) [[unlikely]] commitProduceSeq(openCtx, openSeq);   // consumed (answered)
                 return refuseNotAuthorized_(msg, directAck);
             }
+        }
+
+        // X036: a client never writes a control batch (after the WRITE check, so an unauthorized sender hears 45).
+        if (hasControlBatch(msg.recordBatch.data(), msg.recordBatch.size())) [[unlikely]] {
+            if (openSeq != 0) commitProduceSeq(openCtx, openSeq);   // consumed (answered)
+            return refuseControlBatch_(msg, directAck);
         }
 
         // Look up the owned Log + replica for this partition.

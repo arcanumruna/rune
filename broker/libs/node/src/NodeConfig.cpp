@@ -2,6 +2,7 @@
 #include <rune/catalog/TopicName.h>
 #include <rune/consensus/PeerResolution.h>
 #include <rune/node/Worker.h>
+#include <rune/node/TlsStartupPolicy.h>
 #include <rune/peerlink/ClusterKeys.h>
 #include <rune/storage/Log.h>                       // Log::kMaxRollBytes                         // Worker::maxAcceptableBatchBytes (THE batch limit)
 
@@ -10,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdio>
 #include <cerrno>
 #include <charconv>
 #include <filesystem>
@@ -275,6 +277,39 @@ std::optional<std::string> NodeConfig::validateCatalogStream() const {
 }
 
 // ---------------------------------------------------------------------------
+// NodeConfig::validateAuthTopology  (combined fix program M4: X012, X082, X083)
+// ---------------------------------------------------------------------------
+std::optional<std::string> NodeConfig::validateAuthTopology() const {
+    if (authMode != AuthMode::Enabled) return std::nullopt;
+    if (mustRefuseNonShardPerWorkerIngressAuth(true, perWorkerIngressEnabled, shardMode()))
+        return std::string("RUNE_PER_WORKER_INGRESS=true without RUNE_WORKER_MODE=shard refuses to start with "
+                           "authentication enabled: a worker polling its own ingress outside shard mode has no "
+                           "authentication, authorization or frame crypto; use RUNE_WORKER_MODE=shard or unset it");
+    if (peers.size() > 1 && !shardMode())
+        return "RUNE_WORKER_MODE=legacy refuses to start with authentication enabled in a multi-broker cluster "
+               "(RUNE_PEERS lists " + std::to_string(peers.size()) + " brokers): legacy replication seals and opens "
+               "every byte on the control thread; use RUNE_WORKER_MODE=shard";
+    // Sealed peer links derive one nonce lane per sender: worker w uses sender id 3+w in a u8 (X082).
+    constexpr int32_t kMaxAuthWorkers = 252;
+    constexpr std::size_t kMaxAuthPeers = 16;
+    constexpr int32_t kMaxAuthNodeId = 65535;
+    if (workerCount > kMaxAuthWorkers)
+        return "RUNE_WORKERS=" + std::to_string(workerCount) + " exceeds " + std::to_string(kMaxAuthWorkers) +
+               " with authentication enabled: sealed worker frames would reuse a (key, nonce) pair";
+    if (peers.size() > kMaxAuthPeers)
+        return "RUNE_PEERS lists " + std::to_string(peers.size()) + " brokers; with authentication enabled at most " +
+               std::to_string(kMaxAuthPeers) + " are supported";
+    for (const auto& p : peers)
+        if (p.id > kMaxAuthNodeId)
+            return "RUNE_PEERS node id " + std::to_string(p.id) + " exceeds " + std::to_string(kMaxAuthNodeId) +
+                   " with authentication enabled";
+    if (nodeId > kMaxAuthNodeId)
+        return "RUNE_NODE_ID=" + std::to_string(nodeId) + " exceeds " + std::to_string(kMaxAuthNodeId) +
+               " with authentication enabled";
+    return std::nullopt;
+}
+
+// ---------------------------------------------------------------------------
 // NodeConfig::validateAuth  (authentication plan Task 9, D31/D32)
 // ---------------------------------------------------------------------------
 std::optional<std::string> NodeConfig::validateAuth(std::optional<rune::peerlink::ClusterKeys>* keysOut) const {
@@ -285,17 +320,20 @@ std::optional<std::string> NodeConfig::validateAuth(std::optional<rune::peerlink
         return std::nullopt;
     }
     if (authMode == AuthMode::InProcessUnauthenticated) return std::nullopt;
+    if (auto err = validateAuthTopology()) return err;
     auto keys = rune::peerlink::loadClusterKeys(clusterKeyFile, clusterKeyFileNext);
     if (!keys) return std::move(keys.error());
     if (keysOut != nullptr) *keysOut = *keys;
-    // Group / world access is warned about, not refused (Kubernetes secrets mount 0644).
+    // Combined fix program M13 (X102): the cluster key authenticates every broker and signs the bootstrap proof - a
+    // group- or world-accessible key file refuses to start (launchers mount it 0400; chmod 0400/0600 it).
     for (const std::string* f : {&clusterKeyFile, &clusterKeyFileNext}) {
         if (f->empty()) continue;
         struct stat st {};
         if (::stat(f->c_str(), &st) == 0 && (st.st_mode & (S_IRWXG | S_IRWXO)) != 0)
-            spdlog::warn("{}={} is readable by group or others (mode {:o}); restrict it to the broker's user (0600)",
-                         f == &clusterKeyFile ? "RUNE_CLUSTER_KEY_FILE" : "RUNE_CLUSTER_KEY_FILE_NEXT", *f,
-                         static_cast<unsigned>(st.st_mode & 0777));
+            return std::string(f == &clusterKeyFile ? "RUNE_CLUSTER_KEY_FILE" : "RUNE_CLUSTER_KEY_FILE_NEXT") + "=" + *f +
+                   " is accessible by group or others (mode " + [&] { char b[8]; std::snprintf(b, sizeof b, "%03o",
+                   static_cast<unsigned>(st.st_mode & 0777)); return std::string(b); }() +
+                   "); restrict it to the broker's user (chmod 0400) - refusing to start";
     }
     return std::nullopt;
 }

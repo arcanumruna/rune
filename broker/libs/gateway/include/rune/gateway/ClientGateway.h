@@ -92,6 +92,7 @@ namespace rune::node { class WorkerPool; struct WorkerReturn; }
 #include <rune/metadata/RoutingImage.h>
 #include <rune/replication/ReplicationMessages.h>
 #include <rune/node/RecordsPush.h>
+#include <rune/node/UnauthLogLimiter.h>
 #include <rune/node/SessionAnnouncer.h>
 #include <rune/node/PermissionShipper.h>
 // G0.1: ErrorCode enum for sendRespReliable() signature.
@@ -402,6 +403,8 @@ public:
     /// proof (D4) is verified with it.  Unset (InProcessUnauthenticated / dev): every bootstrap is refused.
     void setClusterKeys(rune::peerlink::ClusterKeys keys) { clusterKeys_ = std::move(keys); }
     [[nodiscard]] uint64_t bootstrapsRefused() const noexcept { return bootstrapsRefused_; }
+    /// X103: log lines the 1/1024 limiter swallowed (require-TLS refusals, bad bootstrap proofs, login failures).
+    [[nodiscard]] uint64_t unauthLogSuppressed() const noexcept { return unauthLog_.suppressed(); }
     /// How this broker authenticates sessions (ConnectResponse.authMode) and the control thread's SecurityView the
     /// bootstrap window is read from (open while no ENABLED security admin exists - a fresh cluster or a locked-out one, D3).  Required: a session that has not
     /// authenticated is limited by its SessionAuth state (gateFor); default InProcess = no gating, byte-identical to before.
@@ -1080,14 +1083,14 @@ public:
     int64_t injectTestSession(int64_t nowNs = 0,
                               int32_t clientVersion = rune::protocol::client::kClientVersion) {
         const int64_t sid = sessions_.nextSessionId();
-        sessions_.add(sid, /*egress=*/nullptr, nowNs, {}, 0, clientVersion);
+        sessions_.add(sid, /*egress=*/nullptr, rune::gateway::AuthAnonymous{}, nowNs, {}, 0, clientVersion);
         return sid;
     }
     /// Catalog history Task 9: a test session whose egress CHANNEL is known (the
     /// DDL principal's source address is the session's egress channel).
     int64_t injectTestSessionOnChannel(std::string egressChannel, int64_t nowNs = 0) {
         const int64_t sid = sessions_.nextSessionId();
-        sessions_.add(sid, /*egress=*/nullptr, nowNs, std::move(egressChannel), 0,
+        sessions_.add(sid, /*egress=*/nullptr, rune::gateway::AuthAnonymous{}, nowNs, std::move(egressChannel), 0,
                       rune::protocol::client::kClientVersion);
         return sid;
     }
@@ -2172,6 +2175,8 @@ private:
     /// handleSubscribe for topicId == kSecurityTopicId (authentication Task 10): the same contract on the second server.
     void handleSecuritySubscribe_(Session& session, const rune::protocol::client::Subscribe& msg);
     uint64_t securitySubscribesForwarded_ = 0;
+    rune::node::UnauthLogLimiter unauthLog_;   ///< X103: 1/1024 limiter of the log lines unauthenticated senders drive (kinds: 0 require-TLS, 1 login rate limited, 2 halted login, 3 bad bootstrap proof, 4 login failed)
+    uint64_t controlBatchRefusals_ = 0;   ///< X036: Produce frames refused for carrying a client control batch (rate-limited log)
     static void noteReadCorr_(std::vector<int64_t>& corrs, int64_t corr);
     rune::gateway::GatewayAuthMode authMode_ = rune::gateway::GatewayAuthMode::InProcess;
     const rune::gateway::SecurityView* securityView_ = nullptr;   // control thread's own mirror (same thread as the gateway)

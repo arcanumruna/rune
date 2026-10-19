@@ -90,7 +90,10 @@ struct Session {
     // Authentication Task 11 (D11 / D13): this session's authentication state (SessionAuth.h) - what it may send before
     // it authenticates, the SCRAM exchange in flight, who it is.  Control-thread owned.  AuthAnonymous (no gating) on an
     // in-process / dev broker; AuthAwaitingFirst{deadline} on an authenticating one.
-    SessionAuth                                    auth = AuthAnonymous{};   // NOT the variant's first alternative
+    // Chosen by whoever creates the session (SessionTable::add takes it explicitly): there is no default, so a session can
+    // never silently start allow-all.  AuthAnonymous is allow-all only on a dev / in-process broker (permsOf_ denies it
+    // on an authenticating one).
+    SessionAuth                                    auth;
     // D14: the host the session's Connect came from (the Aeron image's sourceIdentity host; the egress host for IPC) -
     // the throttle's key.  "" in unit tests.
     std::string                                    sourceHost;
@@ -209,6 +212,7 @@ public:
     // -----------------------------------------------------------------------
     Session& add(int64_t                                      sessionId,
                  std::shared_ptr<aeron::ExclusivePublication> egress,
+                 SessionAuth                                  auth,
                  int64_t                                      nowNs,
                  std::string                                  egressChannel = {},
                  int32_t                                      egressStreamId = 0,
@@ -216,6 +220,7 @@ public:
         Session s;
         s.sessionId      = sessionId;
         s.egress         = std::move(egress);
+        s.auth           = std::move(auth);
         s.lastSeenNs     = nowNs;
         s.egressChannel  = std::move(egressChannel);
         s.egressStreamId = egressStreamId;

@@ -188,7 +188,7 @@ int64_t ClientGateway::injectReliableTestSessionForTest(int64_t nowNs, int32_t c
     std::shared_ptr<aeron::ExclusivePublication> fake(
         reinterpret_cast<aeron::ExclusivePublication*>(placeholder), [](aeron::ExclusivePublication*) {});
     const int64_t sid = sessions_.nextSessionId();
-    sessions_.add(sid, std::move(fake), nowNs, {}, 0, clientVersion);
+    sessions_.add(sid, std::move(fake), rune::gateway::AuthAnonymous{}, nowNs, {}, 0, clientVersion);
     return sid;
 }
 
@@ -603,7 +603,7 @@ bool ClientGateway::sendRespReliable(rune::protocol::client::ErrorCode ec,
         // currentProduceSessionId_ (offerBytes_ routes through testEgressFn_ and
         // never dereferences the publication in test mode), so the spill drain
         // finds it like any live session.
-        sessions_.add(currentProduceSessionId_, /*egress=*/nullptr, nowNs_, {}, 0,
+        sessions_.add(currentProduceSessionId_, /*egress=*/nullptr, rune::gateway::AuthAnonymous{}, nowNs_, {}, 0,
                       rune::protocol::client::kClientVersion);
     }
 
@@ -2098,8 +2098,9 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
     // HandshakeFailed either way, never silently plaintext).
     if (!isRedirectCapture && !pc_entry.cryptoFailed &&
         mustRejectForRequireTls(requireTls_, pc_entry.tls.has_value())) {
-        spdlog::warn("ClientGateway: require_tls rejecting a plaintext Connect "
-                     "(session={})", sessionId);
+        if (unauthLog_.due(0)) [[unlikely]]   // X103: any host can drive this
+            spdlog::warn("ClientGateway: require_tls rejecting a plaintext Connect "
+                         "(session={})", sessionId);
         pc_entry.cryptoFailed = true;
     }
 
@@ -2510,12 +2511,11 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
         // path).  Carry the client's egress endpoint so a per-consumer
         // unicast Records publication can be lazily created on the first
         // subscribe.
-        sessions_.add(pending.sessionId, std::move(pub), nowNs,
+        sessions_.add(pending.sessionId, std::move(pub), std::move(pending.auth), nowNs,
                       pending.egressChannel, pending.egressStreamId,
                       pending.clientVersion);
         {
             Session* added = sessions_.find(pending.sessionId);
-            added->auth       = std::move(pending.auth);
             added->sourceHost = std::move(pending.sourceHost);
         }
 
@@ -2661,10 +2661,9 @@ void ClientGateway::handleHandshakeContinue_(const uint8_t* buf, std::size_t len
     // SEALS broker->client egress (b2c/b2cPrefix).  Getting this backwards
     // makes the handshake "succeed" with matching keys while every data-plane
     // AEAD op fails.
-    Session& session = sessions_.add(pending.sessionId, std::move(pending.resolvedPub), nowNs,
+    Session& session = sessions_.add(pending.sessionId, std::move(pending.resolvedPub), std::move(pending.auth), nowNs,
                                       pending.egressChannel, pending.egressStreamId,
                                       pending.clientVersion);
-    session.auth       = std::move(pending.auth);
     session.sourceHost = std::move(pending.sourceHost);
     // The TLS handshake took time: the login deadline runs from the moment the session exists.
     if (auto* first = std::get_if<rune::gateway::AuthAwaitingFirst>(&session.auth)) first->deadlineNs = nowNs + authTimeoutNs_;
@@ -3396,12 +3395,15 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         return true;
     }
     // Authentication Task 12 (D30, spec §2.1): WRITE on the topic - ONE index test, ONE bounds check, ONE byte load
-    // (PermissionTable::allows); an anonymous session (dev / in-process) skips it.  The denial path is cold.
-    if (const auto* authed = std::get_if<rune::gateway::AuthAuthenticated>(&session->auth))
-        if (!authed->perms.allows(msg.topicId, rune::security::opBit(rune::security::Operation::Write))) [[unlikely]]
-            if (deny_(*session, rune::gateway::authorizeTopicId(authed->perms, msg.topicId, rune::security::Operation::Write,
+    // (PermissionTable::allows).  permsOf_ is allow-all only on a dev / in-process broker; an AuthAnonymous session on
+    // an authenticating broker gets the deny-all table (X013), so nothing is produced for it.  The denial path is cold.
+    {
+        const rune::gateway::PermissionTable& perms = permsOf_(*session);
+        if (!perms.allows(msg.topicId, rune::security::opBit(rune::security::Operation::Write))) [[unlikely]]
+            if (deny_(*session, rune::gateway::authorizeTopicId(perms, msg.topicId, rune::security::Operation::Write,
                                                                  objectIndex_), buf, len))
                 return true;
+    }
     // G0.1: capture session id so the public sendRespReliable() test-seam knows
     // which session to target for the duration of this handleProduce() call.
     currentProduceSessionId_ = msg.sessionId;
@@ -3690,6 +3692,16 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     if (batchLen < kMinBatchSize) {
         spdlog::debug("ClientGateway: Produce batch too short ({} < {}); answered InvalidRequest",
                       batchLen, kMinBatchSize);
+        sendResp(pc::ErrorCode::InvalidRequest, partition, 0);
+        return true;
+    }
+
+    // X036: a client never writes a control batch (COMMIT/ABORT markers are the broker's own); any batch of the frame
+    // carrying kAttrControl refuses the whole frame, consumed and never appended.
+    if (rune::node::Worker::hasControlBatch(msg.recordBatch.data(), batchLen)) [[unlikely]] {
+        if (controlBatchRefusals_++ % 1024 == 0)
+            spdlog::warn("ClientGateway: Produce with a client control batch refused InvalidRequest "
+                         "(session={}, topic={}); total {}", msg.sessionId, msg.topicId, controlBatchRefusals_);
         sendResp(pc::ErrorCode::InvalidRequest, partition, 0);
         return true;
     }
@@ -7671,8 +7683,9 @@ const rune::gateway::PermissionTable& ClientGateway::permsOf_(const Session& s) 
 {
     if (const auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&s.auth)) return a->perms;
     // Dev / in-process brokers authenticate nobody: everything is allowed whatever a session's (test-set) state says.
-    if (authMode_ != rune::gateway::GatewayAuthMode::Required || std::holds_alternative<rune::gateway::AuthAnonymous>(s.auth))
-        return allowAllPerms_;
+    // On an authenticating broker only AuthAuthenticated holds grants: AuthAnonymous (the state of nobody who logged
+    // in) is denied everything (X013).
+    if (authMode_ != rune::gateway::GatewayAuthMode::Required) return allowAllPerms_;
     return denyAllPerms_;
 }
 
@@ -7911,14 +7924,16 @@ void ClientGateway::handleAuthClientFirst_(const uint8_t* buf, std::size_t len)
     const rune::gateway::LoginThrottle::Verdict v = loginThrottle_.check(user, session->sourceHost, nowNs_);
     if (!v.allowed) {
         ++loginsRateLimited_;
-        spdlog::warn("auth: rate limited user={} source={} retry_after_ms={}", user, session->sourceHost, v.retryAfterMs);
+        if (unauthLog_.due(1)) [[unlikely]]
+            spdlog::warn("auth: rate limited user={} source={} retry_after_ms={}", user, session->sourceHost, v.retryAfterMs);
         failLogin_(*session, m->correlationId, v.retryAfterMs);
         return;
     }
     if (securityView_ == nullptr || securityView_->halted()) {
         ++loginsFailed_;
-        spdlog::warn("auth: login failed user={} source={} session={} reason={}", user, session->sourceHost, session->sessionId,
-                     loginFailureName(LoginFailure::SecurityHalted));
+        if (unauthLog_.due(2)) [[unlikely]]
+            spdlog::warn("auth: login failed user={} source={} session={} reason={}", user, session->sourceHost, session->sessionId,
+                         loginFailureName(LoginFailure::SecurityHalted));
         failLogin_(*session, m->correlationId, 0);
         return;
     }
@@ -7959,8 +7974,9 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
     if (const LoginFailure* failure = std::get_if<LoginFailure>(&verdict)) {
         ++loginsFailed_;
         loginThrottle_.onFailure(user, session->sourceHost, nowNs_);
-        spdlog::warn("auth: login failed user={} source={} session={} reason={}", user, session->sourceHost, session->sessionId,
-                     loginFailureName(*failure));
+        if (unauthLog_.due(4)) [[unlikely]]
+            spdlog::warn("auth: login failed user={} source={} session={} reason={}", user, session->sourceHost, session->sessionId,
+                         loginFailureName(*failure));
         failLogin_(*session, hdr->correlationId, 0);
         return;
     }
@@ -8048,8 +8064,9 @@ void ClientGateway::reapAuthDeadlines_(int64_t nowNs)
         if (const auto* a = std::get_if<AuthAwaitingFirst>(&s->auth)) corr = a->correlationId;
         else if (const auto* b = std::get_if<AuthAwaitingFinal>(&s->auth)) { corr = b->correlationId; user = b->user; }
         ++loginsFailed_;
-        spdlog::warn("auth: login failed user={} source={} session={} reason={}", user, s->sourceHost, sid,
-                     loginFailureName(LoginFailure::Timeout));
+        if (unauthLog_.due(4)) [[unlikely]]
+            spdlog::warn("auth: login failed user={} source={} session={} reason={}", user, s->sourceHost, sid,
+                         loginFailureName(LoginFailure::Timeout));
         failLogin_(*s, corr, 0);
     }
 }
@@ -8318,8 +8335,9 @@ void ClientGateway::handleSecurityBootstrap(const uint8_t* buf, std::size_t len)
     const BootstrapProof proof = verifyBootstrapProof(m, clusterKeys_ ? &*clusterKeys_ : nullptr, bootstrapMacScratch_);
     if (proof != BootstrapProof::Ok) {
         ++bootstrapsRefused_;
-        spdlog::warn("security: bootstrap refused from {}: bad cluster-key proof{}", session->egressChannel,
-                     proof == BootstrapProof::NoKey ? " (this broker holds no cluster key: authentication is not enabled)" : "");
+        if (unauthLog_.due(3)) [[unlikely]]   // X103: an unauthenticated session drives this
+            spdlog::warn("security: bootstrap refused from {}: bad cluster-key proof{}", session->egressChannel,
+                         proof == BootstrapProof::NoKey ? " (this broker holds no cluster key: authentication is not enabled)" : "");
         pc::DdlResponse r;
         r.sessionId     = m.sessionId;
         r.correlationId = m.correlationId;

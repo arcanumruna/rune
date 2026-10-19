@@ -417,5 +417,64 @@ TEST(ClientGatewayHotPath, ProduceBatchExactEffectiveMaxBoundaryRegression)
     fs::remove_all(dir, ec);
 }
 
+// X036: a client-built CONTROL batch (a forged COMMIT/ABORT marker) anywhere in a Produce frame refuses the whole frame
+// InvalidRequest at the gateway, never forwarded.  The control batch is SECOND in the frame: a first-batch-only check
+// does not see it.  RED: delete the hasControlBatch check in handleProduce - the frame is accepted (answer != 39).
+TEST(ProduceValidationRegression, AClientControlBatchIsRefusedOnGatewayRegression)
+{
+    const fs::path dir = makeTempDir();
+    std::vector<rune::node::TopicSpec> specs;
+    {
+        rune::node::TopicSpec ts;
+        ts.name = "events"; ts.partitionCount = 1; ts.topicId = 0;
+        specs.push_back(ts);
+    }
+    rune::gateway::TopicRegistry registry(specs, dir.string());
+    std::vector<uint8_t> captured;
+    ClientGateway gw = ClientGateway::makeForTest(
+        [&captured](const uint8_t* buf, std::size_t len) -> int64_t { captured.assign(buf, buf + len); return 1; },
+        /*currentProduceSessionId=*/1);
+    gw.setTopicRegistry(&registry);
+    const int64_t sid = gw.injectTestSession(/*nowNs=*/0);
+
+    auto frameOf = [&](bool withControl, int64_t corr) {
+        rune::protocol::RecordBatchBuilder data(0, 1000);
+        data.append("k", "v", 1000);
+        std::vector<uint8_t> batches = data.build();
+        if (withControl) {
+            rune::protocol::RecordBatchBuilder ctl(0, 1000);
+            ctl.setControl(true);
+            ctl.setProducerId(7); ctl.setProducerEpoch(0); ctl.setBaseSequence(0);
+            ctl.append("", "", 1000);
+            const auto c = ctl.build();
+            batches.insert(batches.end(), c.begin(), c.end());
+        }
+        pc::Produce prod;
+        prod.sessionId = sid; prod.correlationId = corr; prod.topicId = 0; prod.partition = 0; prod.partitionKnown = 1;
+        prod.acks = 0; prod.producerId = -1; prod.baseSequence = -1;
+        prod.recordBatch = std::span<const uint8_t>(batches.data(), batches.size());
+        std::vector<uint8_t> frame(prod.encodedSize() + 8);
+        frame.resize(prod.encode(frame.data()));
+        return frame;
+    };
+    const auto bad = frameOf(true, 7);
+    gw.applyProduceForTest(bad.data(), bad.size());
+    ASSERT_FALSE(captured.empty());
+    auto resp = pc::ProduceResponse::decode(captured.data(), captured.size());
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_EQ(resp->errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest))
+        << "a control batch second in the frame must refuse the whole frame";
+
+    captured.clear();                       // control: the same frame without the control batch is not InvalidRequest
+    const auto ok = frameOf(false, 8);
+    gw.applyProduceForTest(ok.data(), ok.size());
+    if (!captured.empty()) {
+        auto r2 = pc::ProduceResponse::decode(captured.data(), captured.size());
+        if (r2) EXPECT_NE(r2->errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    }
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
 } // namespace
 } // namespace rune::gateway

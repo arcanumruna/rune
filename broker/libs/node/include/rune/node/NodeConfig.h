@@ -977,12 +977,17 @@ struct NodeConfig {
     ///   * DevDisabled with more than one peer ("RUNE_AUTH=disabled (dev mode) refuses to start as part of a
     ///     multi-broker cluster (RUNE_PEERS lists N brokers); enable authentication");
     ///   * Enabled: RUNE_CLUSTER_KEY_FILE (and RUNE_CLUSTER_KEY_FILE_NEXT when set) must exist, be readable and hold
-    ///     >= 32 bytes after trimming (reads the file(s) — cold, startup thread).  A group/world-readable key file
-    ///     is logged once (warned, not refused: Kubernetes secrets mount 0644).
+    ///     >= 32 bytes after trimming (reads the file(s) — cold, startup thread).  A group- or world-accessible key file
+    ///     REFUSES to start (M13, X102: launchers mount it 0400).
     /// InProcessUnauthenticated reads nothing.  Checked by BrokerNode::start (programmatic configs too) and main.
     /// Review C I4: with `keysOut` set, the keys read here are handed back (Enabled mode) - the ONE load of the cluster key:
     /// BrokerNode::start keeps them in a member and hands out copies, so the key validated is the key in use.
     std::optional<std::string> validateAuth(std::optional<rune::peerlink::ClusterKeys>* keysOut = nullptr) const;
+
+    /// Combined fix program M4 (X012, X082, X083): with authentication Enabled, nullopt = valid; else the refusal for
+    /// per-worker ingress outside shard mode, a multi-broker cluster outside shard mode, > 252 workers, > 16 peers or
+    /// a node id > 65535.  Pure config; part of validateAuth().
+    std::optional<std::string> validateAuthTopology() const;
 
     /// Refuses an Aeron dir that would destroy the log: the embedded driver runs
     /// with dir_delete_on_start + delete-on-shutdown and recursively deletes its

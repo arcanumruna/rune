@@ -52,7 +52,7 @@ TEST(SessionTableTest, AddFind_SessionPresent) {
     SessionTable t;
 
     const int64_t sid = t.nextSessionId();
-    t.add(sid, makeStubPub(), 1000LL);
+    t.add(sid, makeStubPub(), rune::gateway::AuthAnonymous{}, 1000LL);
 
     Session* s = t.find(sid);
     ASSERT_NE(s, nullptr);
@@ -78,7 +78,7 @@ TEST(SessionTableTest, Remove_Existing_ReturnsTrueAndGone) {
     SessionTable t;
 
     const int64_t sid = t.nextSessionId();
-    t.add(sid, makeStubPub(), 0LL);
+    t.add(sid, makeStubPub(), rune::gateway::AuthAnonymous{}, 0LL);
 
     EXPECT_NE(t.find(sid), nullptr);
 
@@ -104,7 +104,7 @@ TEST(SessionTableTest, Touch_UpdatesLastSeenNs) {
     SessionTable t;
 
     const int64_t sid = t.nextSessionId();
-    t.add(sid, makeStubPub(), 100LL);
+    t.add(sid, makeStubPub(), rune::gateway::AuthAnonymous{}, 100LL);
 
     t.touch(sid, 999LL);
 
@@ -133,11 +133,11 @@ TEST(SessionTableTest, Size_TracksAddAndRemove) {
     EXPECT_EQ(t.size(), 0u);
 
     const int64_t id1 = t.nextSessionId();
-    t.add(id1, makeStubPub(), 0LL);
+    t.add(id1, makeStubPub(), rune::gateway::AuthAnonymous{}, 0LL);
     EXPECT_EQ(t.size(), 1u);
 
     const int64_t id2 = t.nextSessionId();
-    t.add(id2, makeStubPub(), 0LL);
+    t.add(id2, makeStubPub(), rune::gateway::AuthAnonymous{}, 0LL);
     EXPECT_EQ(t.size(), 2u);
 
     t.remove(id1);
@@ -160,7 +160,7 @@ TEST(SessionTableTest, ManySessions_AllFindable) {
     for (int i = 0; i < N; ++i) {
         int64_t sid = t.nextSessionId();
         ids.push_back(sid);
-        t.add(sid, makeStubPub(), static_cast<int64_t>(i));
+        t.add(sid, makeStubPub(), rune::gateway::AuthAnonymous{}, static_cast<int64_t>(i));
     }
 
     EXPECT_EQ(t.size(), static_cast<std::size_t>(N));
@@ -181,11 +181,11 @@ TEST(SessionTableTest, ReAdd_AfterRemove_FindsNewEntry) {
     SessionTable t;
 
     const int64_t sid = t.nextSessionId();
-    t.add(sid, makeStubPub(), 1LL);
+    t.add(sid, makeStubPub(), rune::gateway::AuthAnonymous{}, 1LL);
     t.remove(sid);
 
     // Re-add with the same id and different nowNs.
-    t.add(sid, makeStubPub(), 42LL);
+    t.add(sid, makeStubPub(), rune::gateway::AuthAnonymous{}, 42LL);
 
     Session* s = t.find(sid);
     ASSERT_NE(s, nullptr);

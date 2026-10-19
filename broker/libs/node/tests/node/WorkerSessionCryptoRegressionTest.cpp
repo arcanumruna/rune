@@ -85,3 +85,18 @@ TEST(WorkerSessionCryptoRegression, ClosingASessionKeepsEveryOtherEntryReachable
     for (int64_t sid = 1; sid <= 500; ++sid)
         EXPECT_EQ(worker.sessionCryptoLookupForTest(sid), sid % 2 == 0) << "session " << sid;
 }
+
+// X103: any UDP sender can aim frames at an encrypted session's worker; each failed open used to log a warning ON THE
+// PRODUCE THREAD.  Failures are counted and logged the first time and every 1024th; the rest are counted as suppressed
+// (counter 1'000'239).  RED: log every failure (drop the due() gate) - the suppressed count stays 0.
+TEST(WorkerSessionCryptoRegression, DecryptFailuresAreCountedAndRateLimitedRegression) {
+    Worker worker(0);
+    ASSERT_TRUE(worker.tryEnqueueOp(encryptedAnnounce(1)));
+    worker.doWork(1);
+    ASSERT_EQ(worker.sessionCryptoEntriesForTest(), 1u);
+    const auto frame = produceFrameFor(1);   // unsealed: every open fails closed
+    constexpr int kFlood = 2500;
+    for (int i = 0; i < kFlood; ++i) EXPECT_EQ(worker.handleIngressFrameForTest(frame.data(), frame.size(), 1 + i), 0);
+    EXPECT_EQ(worker.decryptFailuresForTest(), static_cast<uint64_t>(kFlood));
+    EXPECT_EQ(worker.unauthLogSuppressed(), static_cast<uint64_t>(kFlood - 3)) << "logged at 0, 1024 and 2048 only";
+}

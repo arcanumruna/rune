@@ -434,3 +434,50 @@ TEST(AuthGateRegression, ProduceFromAGatedSessionIsRefusedInItsOwnResponseAndEnd
         EXPECT_TRUE(rig.gw.hasSessionForTest(rig.sid));
     }
 }
+
+// X013: AuthAnonymous is the state of nobody who logged in.  On an authenticating (Required) broker it holds no grants:
+// every request that needs one is denied.  RED: restore the allow-all arm for AuthAnonymous in permsOf_ (or skip the
+// check for it in handleProduce) - the produce is no longer answered NotAuthorized.
+TEST(AuthGateRegression, AnAnonymousSessionOnAnAuthenticatingBrokerIsDeniedEverythingRegression) {
+    Rig rig;
+    auto view = adminView();
+    rig.gw.setAuthMode(GatewayAuthMode::Required, &view);
+    rig.gw.setSessionAuthForTest(rig.sid, AuthAnonymous{});
+    rune::protocol::RecordBatchBuilder rb(0, 1000);
+    rb.append("k", "v", 1000);
+    const auto batch = rb.build();
+    pc::Produce m;
+    m.sessionId = rig.sid; m.correlationId = 71; m.topicId = 1; m.partition = 0; m.partitionKnown = 1; m.acks = 1;
+    m.producerId = -1; m.baseSequence = -1;
+    m.recordBatch = std::span<const uint8_t>(batch.data(), batch.size());
+    std::vector<uint8_t> f(m.encodedSize() + 8); f.resize(m.encode(f.data()));
+    rig.gw.applyClientFrameForTest(f.data(), f.size());
+    const Seen* a = rig.answerFor(71);
+    ASSERT_NE(a, nullptr);
+    EXPECT_EQ(a->tid, static_cast<uint16_t>(pc::TemplateId::ProduceResponse));
+    EXPECT_EQ(a->code, static_cast<int16_t>(pc::ErrorCode::NotAuthorized));
+    // The same session on a dev broker is allow-all (the answer is anything but 45).
+    Rig dev;
+    dev.gw.setSessionAuthForTest(dev.sid, AuthAnonymous{});
+    m.sessionId = dev.sid; m.correlationId = 72;
+    f.assign(m.encodedSize() + 8, 0); f.resize(m.encode(f.data()));
+    dev.gw.applyClientFrameForTest(f.data(), f.size());
+    if (const Seen* d = dev.answerFor(72)) EXPECT_NE(d->code, static_cast<int16_t>(pc::ErrorCode::NotAuthorized));
+}
+
+// X103: bad bootstrap proofs come from unauthenticated sessions.  Counted every time, logged the first time and every
+// 1024th; the rest only bump the suppression counter.  RED: log every refusal (drop the due() gate).
+TEST(AuthLoginRegression, UnauthenticatedLogLinesAreRateLimitedRegression) {
+    Rig rig;
+    rig.gw.setClusterKeys(keysFor(kA));
+    constexpr int kFlood = 2500;
+    for (int i = 0; i < kFlood; ++i) {
+        const BootFrame f(rig.sid, 1000 + i, kC);   // a MAC under ANOTHER cluster's key
+        rig.gw.applyDdlFrameForTest(f.bytes.data(), f.bytes.size());
+    }
+    EXPECT_EQ(rig.gw.bootstrapsRefused(), static_cast<uint64_t>(kFlood));
+    EXPECT_EQ(rig.gw.unauthLogSuppressed(), static_cast<uint64_t>(kFlood - 3));
+    int lines = 0;
+    for (const std::string& l : rig.logSink->last_formatted()) if (l.find("bootstrap refused") != std::string::npos) ++lines;
+    EXPECT_EQ(lines, 3) << "first, 1025th and 2049th";
+}

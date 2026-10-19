@@ -230,6 +230,99 @@ TEST(NodeConfigRegression, EgressControlHostDefaultsToTheAdvertisedHostRegressio
     EXPECT_EQ(natEnv("10.0.0.9"), "10.0.0.9") << "(f) an explicit control host still wins";
 }
 
+// Combined fix program M4 (X012): with authentication Enabled, per-worker ingress outside shard mode (a worker polling its
+// own endpoint with no gateway authn/authz and no frame crypto) refuses to start.  RED: delete the
+// mustRefuseNonShardPerWorkerIngressAuth check in validateAuthTopology.
+TEST(NodeConfigRegression, PerWorkerIngressWithoutShardRefusedWhenAuthEnabledRegression) {
+    auto env = legacyEnv(base1node());
+    env["RUNE_PER_WORKER_INGRESS"] = "true";
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    const auto err = r.config->validateAuthTopology();
+    ASSERT_TRUE(err.has_value());
+    EXPECT_NE(err->find("RUNE_PER_WORKER_INGRESS"), std::string::npos) << *err;
+    EXPECT_TRUE(r.config->validateAuth().has_value()) << "validateAuth (BrokerNode::start and main) carries it";
+
+    env["RUNE_AUTH"] = "disabled";                       // dev mode: nothing to enforce
+    r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    EXPECT_FALSE(r.config->validateAuthTopology().has_value());
+
+    auto shard = base1node();                            // shard mode forces per-worker ingress ON and is allowed
+    shard["RUNE_WORKER_MODE"] = "shard";
+    r = parseNodeConfig(fakeEnv(shard));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    EXPECT_TRUE(r.config->perWorkerIngressEnabled);
+    EXPECT_FALSE(r.config->validateAuthTopology().has_value());
+}
+
+// M4 (X083): an authenticating cluster of more than one broker must run shard mode (legacy replication would seal and
+// open every byte on the control thread).  RED: delete the peers.size() > 1 && !shardMode() refusal.
+TEST(NodeConfigRegression, NonShardMultiNodeRefusedWhenAuthEnabledRegression) {
+    auto r = parseNodeConfig(fakeEnv(legacyEnv(base3node())));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    const auto err = r.config->validateAuthTopology();
+    ASSERT_TRUE(err.has_value());
+    EXPECT_NE(err->find("RUNE_WORKER_MODE"), std::string::npos) << *err;
+
+    auto shard = base3node();
+    shard["RUNE_WORKER_MODE"] = "shard";
+    r = parseNodeConfig(fakeEnv(shard));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    EXPECT_FALSE(r.config->validateAuthTopology().has_value());
+}
+
+// M4 (X082): workers <= 252 (sender id 3+w in a u8), peers <= 16, node ids <= 65535 - refused at start, not at runtime.
+// RED: delete any one of the three bounds and its case below passes validation.
+TEST(NodeConfigRegression, TooManyWorkersPeersOrNodeIdRefusedWhenAuthEnabledRegression) {
+    auto shard1 = []() {
+        auto e = base1node();
+        e["RUNE_WORKER_MODE"] = "shard";
+        return e;
+    };
+    {
+        auto e = shard1();
+        e["RUNE_WORKERS"] = "252";
+        auto r = parseNodeConfig(fakeEnv(e));
+        ASSERT_TRUE(r.config.has_value()) << r.error;
+        EXPECT_FALSE(r.config->validateAuthTopology().has_value()) << "252 workers is the supported maximum";
+        e["RUNE_WORKERS"] = "253";
+        r = parseNodeConfig(fakeEnv(e));
+        ASSERT_TRUE(r.config.has_value()) << r.error;
+        const auto err = r.config->validateAuthTopology();
+        ASSERT_TRUE(err.has_value());
+        EXPECT_NE(err->find("RUNE_WORKERS"), std::string::npos) << *err;
+    }
+    {
+        auto peersOf = [](int n) {
+            std::string v;
+            for (int i = 0; i < n; ++i) v += (i ? "," : "") + std::to_string(i) + "@rune-" + std::to_string(i) + ":40111";
+            return v;
+        };
+        auto e = shard1();
+        e["RUNE_PEERS"] = peersOf(16);
+        auto r = parseNodeConfig(fakeEnv(e));
+        ASSERT_TRUE(r.config.has_value()) << r.error;
+        EXPECT_FALSE(r.config->validateAuthTopology().has_value()) << "16 peers is the supported maximum";
+        e["RUNE_PEERS"] = peersOf(17);
+        r = parseNodeConfig(fakeEnv(e));
+        ASSERT_TRUE(r.config.has_value()) << r.error;
+        const auto err = r.config->validateAuthTopology();
+        ASSERT_TRUE(err.has_value());
+        EXPECT_NE(err->find("RUNE_PEERS"), std::string::npos) << *err;
+    }
+    {
+        auto e = shard1();
+        e["RUNE_NODE_ID"] = "70000";
+        e["RUNE_PEERS"] = "70000@rune-1:40111";
+        auto r = parseNodeConfig(fakeEnv(e));
+        ASSERT_TRUE(r.config.has_value()) << r.error;
+        const auto err = r.config->validateAuthTopology();
+        ASSERT_TRUE(err.has_value());
+        EXPECT_NE(err->find("65535"), std::string::npos) << *err;
+    }
+}
+
 // Re-check I2: a LOOPBACK RUNE_PEER_BIND_HOST supplying the control host of a node advertised at a non-loopback
 // host refuses, as the explicit host does.  RED: the refusal checks only an explicit control host.
 TEST(NodeConfigRegression, LoopbackPeerBindOverrideOnANonLoopbackNodeRefusesStartRegression) {

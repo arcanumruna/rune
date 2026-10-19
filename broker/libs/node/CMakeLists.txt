@@ -1027,6 +1027,16 @@ if(BUILD_TESTING)
         rune_transaction
         GTest::gtest_main)
     gtest_discover_tests(rune_hotpath_b_regression_tests)
+    # Combined fix program tasks 2 / 6: worker direct-ingress enforcement + client control batches (no Aeron).
+    add_executable(rune_worker_enforcement_regression_tests
+        tests/integration/WorkerEnforcementRegressionTest.cpp)
+    target_link_libraries(rune_worker_enforcement_regression_tests PRIVATE
+        rune_node
+        rune_replication
+        rune_storage
+        rune_transaction
+        GTest::gtest_main)
+    gtest_discover_tests(rune_worker_enforcement_regression_tests)
     # D23 (D19-D21 review L2): the hot-path B tests that replace the global
     # operator new / delete (binary-wide) run in their own binary.
     add_executable(rune_hotpath_b_alloc_regression_tests
