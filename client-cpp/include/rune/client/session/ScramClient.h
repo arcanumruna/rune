@@ -30,6 +30,7 @@ namespace rune::client::session {
 struct ScramSentFirst {
     std::string clientNonce;
     std::string clientFirstBare;
+    bool        sent = false;   // the transport accepted the frame; false = back-pressured, re-offered every tick
 };
 
 /// AuthClientFinal sent (one proof per active verifier); waiting for AuthServerFinal.  `authMessages` and
@@ -38,6 +39,7 @@ struct ScramSentFinal {
     std::array<std::string, 2>                authMessages;
     std::array<rune::crypto::DigestBytes, 2>  expected;     // the server signature each verifier would sign with
     uint8_t                                   count = 1;
+    bool                                      sent = false;   // as ScramSentFirst::sent
 };
 
 using ScramExchange = std::variant<ScramSentFirst, ScramSentFinal>;

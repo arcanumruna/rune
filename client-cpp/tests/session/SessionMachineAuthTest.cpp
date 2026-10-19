@@ -415,6 +415,71 @@ TEST(ScramCacheTest, EvictsTheOldestAndZeroesWhatItDrops) {
     EXPECT_EQ(cache.size(), 0u);
 }
 
+// ---- Task 8 gap (a): a refused login offer is re-sent, not left to time out ---------------------------------
+
+namespace {
+struct RefusingIo : CapturingIo {
+    bool accept = true;
+    int  refused = 0;
+    bool sendFrame(const uint8_t* b, std::size_t n) override {
+        if (!accept) { ++refused; return false; }
+        return CapturingIo::sendFrame(b, n);
+    }
+};
+} // namespace
+
+TEST(SessionMachineAuthRegression, ARefusedAuthClientFirstIsResentWhenTheTransportRecoversRegression) {
+    RefusingIo io; sm::SessionConfig cfg; cfg.username = "ws1"; cfg.password = "correct horse battery";
+    sm::SessionMachine m(io, cfg);
+    m.connect(0);
+    const int64_t corr = io.lastCorrelation();
+    io.accept = false;                                     // the publication is back-pressured from here
+    auto r = authRequired(corr);
+    m.onConnectResponse(r.code, -1, r.assignedSessionId, corr, 1, 0, {}, r.authMode, r.authState);
+    ASSERT_EQ(m.state(), sm::SessionState::Authenticating);
+    EXPECT_EQ(io.countOf(pc::TemplateId::AuthClientFirst), 0);
+    m.tick(1'000'000); m.tick(2'000'000);
+    EXPECT_EQ(io.countOf(pc::TemplateId::AuthClientFirst), 0) << "still refused";
+    EXPECT_GE(io.refused, 2) << "re-offered every tick";
+    io.accept = true;
+    m.tick(3'000'000);
+    EXPECT_EQ(io.countOf(pc::TemplateId::AuthClientFirst), 1);
+    m.tick(4'000'000); m.tick(5'000'000);
+    EXPECT_EQ(io.countOf(pc::TemplateId::AuthClientFirst), 1) << "exactly once on the wire";
+    EXPECT_EQ(m.state(), sm::SessionState::Authenticating);
+    // The login then completes normally.
+    auto cf = pc::AuthClientFirst::decode(io.frames.back().data(), io.frames.back().size()).value();
+    Server srv; srv.verifiers.push_back(*rs::makeVerifier("correct horse battery"));
+    std::string combined; auto sf = srv.first(cf, combined);
+    m.onAuthServerFirst(sf, 6);
+    m.onAuthServerFinal(pc::AuthServerFinal{.errorCode = 0, .serverSignature = srv.signature(cf, combined, 0)}, 7);
+    EXPECT_EQ(m.state(), sm::SessionState::Connected);
+}
+
+TEST(SessionMachineAuthRegression, ARefusedAuthClientFinalIsResentWhenTheTransportRecoversRegression) {
+    RefusingIo io; sm::SessionConfig cfg; cfg.username = "ws1"; cfg.password = "correct horse battery";
+    sm::SessionMachine m(io, cfg);
+    m.connect(0);
+    auto r = authRequired(io.lastCorrelation());
+    m.onConnectResponse(r.code, -1, r.assignedSessionId, io.lastCorrelation(), 1, 0, {}, r.authMode, r.authState);
+    auto cf = pc::AuthClientFirst::decode(io.frames.back().data(), io.frames.back().size()).value();
+    Server srv; srv.verifiers.push_back(*rs::makeVerifier("correct horse battery"));
+    std::string combined; auto sf = srv.first(cf, combined);
+    io.accept = false;
+    m.onAuthServerFirst(sf, 2);
+    EXPECT_EQ(io.countOf(pc::TemplateId::AuthClientFinal), 0);
+    m.tick(1'000'000);
+    io.accept = true;
+    m.tick(2'000'000);
+    ASSERT_EQ(io.countOf(pc::TemplateId::AuthClientFinal), 1);
+    m.tick(3'000'000);
+    EXPECT_EQ(io.countOf(pc::TemplateId::AuthClientFinal), 1);
+    auto fin = pc::AuthClientFinal::decode(io.frames.back().data(), io.frames.back().size()).value();
+    EXPECT_TRUE(rs::verifyClientProof(cr::Digest::Sha512, srv.verifiers[0].storedKey,
+                                      srv.authMessage(cf, combined, 0), fin.proofs[0]))
+        << "the re-sent frame is the original proof";
+}
+
 // ---- the TLS path: SCRAM runs AFTER the handshake's done() and before Connected (D11) ----------------------
 
 namespace {

@@ -689,8 +689,8 @@ public:
         }
         hsFrameBuf_.resize(out.encodedSize());
         const std::size_t n = out.encode(hsFrameBuf_.data());
+        fin.sent = n > 0 && io_.sendFrame(hsFrameBuf_.data(), n);   // refused: tickAuthenticating_ re-offers it
         scram_.emplace(std::move(fin));   // ScramSentFirst -> ScramSentFinal: the same state, its next variables
-        if (n > 0) (void)io_.sendFrame(hsFrameBuf_.data(), n);
     }
 
     /// AuthServerFinal arrived — the verdict.  OK needs a server signature equal to one of the expected ones
@@ -1095,7 +1095,9 @@ private:
         transitionTo(SessionState::Authenticating);
         hsFrameBuf_.resize(m.encodedSize());
         const std::size_t n = m.encode(hsFrameBuf_.data());
-        if (n > 0) (void)io_.sendFrame(hsFrameBuf_.data(), n);
+        if (n == 0) { failAuthLocal_(); return; }   // a field that does not fit the wire: never a garbled login
+        if (io_.sendFrame(hsFrameBuf_.data(), n)) std::get<ScramSentFirst>(*scram_).sent = true;
+        // else: back-pressured — the frame stays in hsFrameBuf_ and tickAuthenticating_ re-offers it
     }
 
     /// The broker refused the login (or proved nothing): terminal Rejected(code) — except a rate-limited 44
@@ -1125,6 +1127,13 @@ private:
     }
 
     void tickAuthenticating_(int64_t nowNs) noexcept {
+        // A login frame the transport refused (back-pressure) is re-offered every tick until accepted — exactly
+        // once on the wire (a refused offer delivered nothing).  hsFrameBuf_ still holds it: nothing else in this
+        // state writes it.
+        if (scram_ && !hsFrameBuf_.empty()) {
+            bool* sent = std::visit([](auto& st) { return &st.sent; }, *scram_);
+            if (!*sent && io_.sendFrame(hsFrameBuf_.data(), hsFrameBuf_.size())) *sent = true;
+        }
         if (nowNs - connectStartNs_ > cfg_.connectTimeoutNs) {
             onHandshakeTimedOut_(nowNs);   // a broker that never answers the login: transient, like a stuck handshake
         }

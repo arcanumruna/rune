@@ -757,9 +757,9 @@ public:
     /// begin-close token Closed, fail every record not yet acknowledged with
     /// `st`, and complete every record later read from the closed ring with
     /// `st`.  Idempotent.
-    void applyCloseImmediately(OpStatus st);
+    void applyCloseImmediately(OpStatus st, uint16_t errorCode = 0);
     /// Alias for the duty-thread failure path (T15: Aeron client closed).
-    void failClose(OpStatus st) { applyCloseImmediately(st); }
+    void failClose(OpStatus st, uint16_t errorCode = 0) { applyCloseImmediately(st, errorCode); }
     /// Duty side, once per cycle while not Open: Draining's completion /
     /// deadline check.  Returns work done.
     int closeDuty(int64_t nowNs);
@@ -846,7 +846,7 @@ public:
     /// noexcept (fix round 2, N1): run from ~DutyScope (the deferred fail-all
     /// of a close applied inside a handler).  Everything it calls is non-
     /// throwing (handlers are noexcept function pointers; no allocation).
-    void failAllPending(OpStatus st) noexcept;
+    void failAllPending(OpStatus st, uint16_t errorCode = 0) noexcept;
     /// Authentication (D26): every batch IN FLIGHT (already sent, unanswered) completes BrokerError `errorCode`
     /// (SessionRevoked) — the answer the broker's closing session can no longer give.  Records not yet sent
     /// are left to the caller's terminal failure path.  Duty thread.
@@ -1197,7 +1197,7 @@ private:
     /// completes each record / Tier-2 batch with `st` (its ack handle, and a
     /// one-unit BatchAck) — never sends it.  Frees Tier-2 entries.  Returns
     /// messages read.
-    int discardRing_(OpStatus st, int limit);
+    int discardRing_(OpStatus st, int limit, uint16_t errorCode = 0);
     void pushAck_(PartitionState& ps, uint64_t handle);
     /// F8c C6: deliver ONE ack handle's completion (0 = void: nothing) —
     /// the onAck handler, or the Client's CQ registry.  Duty thread; never
@@ -1274,9 +1274,9 @@ private:
         emitBatchAck_(topicId, partition, -1, recordCount, -1, BatchAck::kClientFailure, st, units, -1);
     }
     /// Fails a live batch's records and releases its slot.
-    void failBatch_(PartitionState& ps, InFlightBatch& b, OpStatus st);
+    void failBatch_(PartitionState& ps, InFlightBatch& b, OpStatus st, uint16_t errorCode = 0);
     /// Fails the never-sent builder records of `ps` (handles + one BatchAck).
-    void failBuilder_(PartitionState& ps, OpStatus st);
+    void failBuilder_(PartitionState& ps, OpStatus st, uint16_t errorCode = 0);
     /// Draining: every accepted record completed and the ring consumed to the
     /// closed tail.
     [[nodiscard]] bool fullyDrained_() const noexcept;
@@ -1395,7 +1395,8 @@ private:
     };
     struct LifeClosed {};
     struct LifeDiscarding {
-        OpStatus status = OpStatus::Closed;
+        OpStatus status    = OpStatus::Closed;
+        uint16_t errorCode = 0;   // authentication (D26): BrokerError + SessionRevoked for a revoked session
     };
     std::variant<LifeOpen, LifeDraining, LifeClosed, LifeDiscarding> life_{};
     // Duty side: the intake is closed and the duty side knows it (Draining /
@@ -1409,6 +1410,7 @@ private:
     struct PendingFail {
         bool         armed    = false;
         OpStatus     status   = OpStatus::Closed;
+        uint16_t     errorCode = 0;
         bool         hadToken = false;
         LifeDraining drain{};
     };
@@ -1496,7 +1498,7 @@ private:
     /// is failed via its handle (void: counted + logged) and dropped.
     void applyDeferred_() noexcept;
     /// failAllPending: fail + drop every record deferred before the call.
-    void failDeferred_(OpStatus st);
+    void failDeferred_(OpStatus st, uint16_t errorCode = 0);
     /// sweepTimedOut: fail deferred records accepted >= deliveryNs ago.
     void expireDeferred_(int64_t nowNs, int64_t deliveryNs);
     /// Accept one record / Tier-2 token into the arena (inDuty_).  Validates the

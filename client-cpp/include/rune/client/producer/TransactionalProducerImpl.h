@@ -212,6 +212,9 @@ public:
     /// token completes Closed, the status channel is finished.  Later commands
     /// are discarded.  Idempotent.
     void failAll();
+    /// Authentication (D26): the session was revoked — terminal: every pending op completes BrokerError `errorCode`
+    /// (SessionRevoked), nothing is ever sent again.  Duty thread.
+    void failRevoked(uint16_t errorCode);
 
     // ---- F8c C7: close (rich state: Open -> Closing{...} -> closed_) ---------
     /// Begin closing: an open broker transaction (InTransaction /
@@ -424,7 +427,8 @@ private:
     int64_t addRequest_(ReqKind kind, uint64_t opId, int64_t deadlineNs);  // encodes; Unsent
     bool encode_(TxnRequest& r, const UserOp* op);
     void retry_(TxnRequest& r, Verdict v);
-    void enterFatal_(uint16_t errorCode, uint64_t exceptOpId = 0);
+    void enterFatal_(uint16_t errorCode, uint64_t exceptOpId = 0, OpStatus st = OpStatus::Fenced,
+                     std::string_view text = "TransactionalProducer: fenced — fatal");
     void poison_(OpStatus st, uint16_t errorCode, bool bumpEpoch = false);
     void finishTxn_();
     void markStarted_() noexcept;

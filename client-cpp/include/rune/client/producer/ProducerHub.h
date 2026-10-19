@@ -170,9 +170,9 @@ public:
 
     /// F8c C6a: the duty-thread failure tail-close of every producer (T15:
     /// the Aeron client closed under a shard).  Idempotent.
-    void failCloseAll(OpStatus st) {
+    void failCloseAll(OpStatus st, uint16_t errorCode = 0) {
         for (ProducerImpl* impl : active_) {
-            if (impl != nullptr) impl->failClose(st);
+            if (impl != nullptr) impl->failClose(st, errorCode);
         }
     }
 

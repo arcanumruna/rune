@@ -356,6 +356,42 @@ TEST(ClientAuthErrorsRegression, SessionRevokedFailsEverythingInFlightAndDoesNot
     EXPECT_EQ(r.client.state(), rc::session::SessionState::Rejected);
 }
 
+// Task 8 gap (b): a transactional producer's pending op is part of the session-wide revoke pass.
+TEST(ClientAuthErrorsRegression, SessionRevokedFailsATransactionalProducersPendingOpRegression) {
+    Rig r(authCfg(3742, "ws1", kPw));
+    r.connectOk();
+    rc::TransactionalProducer tp = r.client.transactionalProducer("tx-revoked");
+    test_support::TestCq cq(r.client);
+    auto init = cq.issue([&](rc::Completions& q, rc::Token t) { return tp.initTransactions(q, t); });
+    ASSERT_TRUE(init.accepted());
+    ASSERT_TRUE(r.drive([&] { return r.gw.initPids > 0; })) << "the InitProducerId is in flight, unanswered";
+    EXPECT_FALSE(init.ready());
+    r.gw.revokeSession(r.gw.assignedSessionId);
+    ASSERT_TRUE(r.drive([&] { return init.ready(); }));
+    EXPECT_EQ(init.outcome().c.status, rc::OpStatus::BrokerError);
+    EXPECT_EQ(init.outcome().c.errorCode, 46) << "SessionRevoked, not Closed / Fenced / a timeout";
+}
+
+// Task 8 gap (c): records accepted but not yet sent complete SessionRevoked too (D26), not Closed.
+TEST(ClientAuthErrorsRegression, UnsentRecordsCompleteSessionRevokedNotClosedRegression) {
+    Rig r(authCfg(3744, "ws1", kPw));
+    r.connectOk();
+    rc::ProducerConfig pcfg; pcfg.acks = rc::Acks::Leader; pcfg.lingerUs = 60'000'000; pcfg.maxInFlight = 8;
+    pcfg.produceTimeoutMs = 20'000; pcfg.deliveryTimeoutMs = 60'000;
+    rc::Producer p = r.client.producer(pcfg);
+    const auto topic = r.client.topic("t");
+    test_support::TestCq cq(r.client);
+    const std::vector<uint8_t> val(16, 0x5C);
+    auto s = cq.send(p, topic, rc::Key(uint64_t{1}), val);   // accepted, never flushed: lingers in the builder
+    ASSERT_TRUE(s.accepted());
+    r.passes(20);
+    ASSERT_TRUE(r.gw.produced.empty() && r.gw.held.empty()) << "the record was never sent";
+    r.gw.revokeSession(r.gw.assignedSessionId);
+    ASSERT_TRUE(r.drive([&] { return s.ready(); }));
+    EXPECT_EQ(s.outcome().c.status, rc::OpStatus::BrokerError);
+    EXPECT_EQ(s.outcome().c.errorCode, 46);
+}
+
 TEST(ClientAuthErrorsRegression, SessionRevokedFailsAPendingControlOpToo) {
     Rig r(authCfg(3734, "ws1", kPw));
     r.connectOk();

@@ -2798,7 +2798,12 @@ void Client::enterFailed_() {
     // Tail-close every producer's intake (a claim before the close is still read
     // from the ring and completed) and complete every accepted, unacknowledged
     // record Closed — exactly once (ProducerImpl's Discarding life).
-    producerHub_.failCloseAll(OpStatus::Closed);
+    // Authentication (D26): a REVOKED session completes the records it accepted but never sent SessionRevoked
+    // (BrokerError 46), like the ones already in flight — not Closed.
+    if (agent_.seedMachine().rejectCode() == static_cast<int16_t>(rune::protocol::client::ErrorCode::SessionRevoked))
+        producerHub_.failCloseAll(OpStatus::BrokerError, static_cast<uint16_t>(rune::protocol::client::ErrorCode::SessionRevoked));
+    else
+        producerHub_.failCloseAll(OpStatus::Closed);
     // Pending control ops can never be answered now.
     failAllControl_(OpStatus::Closed);
 }
@@ -3137,6 +3142,7 @@ void Client::onSeedRevoked_(std::string_view text) {
     // Every subscription and group consumer of the session.
     (void)subscriberHub_.endAllLive(SubscriptionFailReason::SessionRevoked, kRevoked);
     (void)groupConsumerHub_.revokeAll();
+    for (producer::TransactionalProducerImpl* tp : txnProducers_) tp->failRevoked(kRevoked);
     // The seed machine is Rejected(SessionRevoked): the duty cycle's failure tail (enterFailed_) closes the rest
     // — nothing reconnects (D26).
     if (cbError_) invokeUserCallback_("onError", [&] { cbError_(std::string(text)); });

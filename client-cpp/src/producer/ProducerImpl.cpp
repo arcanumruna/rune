@@ -863,7 +863,7 @@ bool ProducerImpl::debugArenaConsistent() noexcept {
     return true;
 }
 
-void ProducerImpl::failDeferred_(OpStatus st) {
+void ProducerImpl::failDeferred_(OpStatus st, uint16_t errorCode) {
     const bool prevScan = deferScanning_;
     deferScanning_ = true;  // callbacks below may push: never compact under our offsets
     const std::size_t end = deferred_.tail();  // only those deferred before the call
@@ -876,7 +876,7 @@ void ProducerImpl::failDeferred_(OpStatus st) {
         unaccountDeferred_(h);
         deferred_.kill(r);
         emitUnsentBatchAck_(h.topicId, h.partition, rc, st, 1);
-        completeHandle_(handle, tier2 ? OpKind::Tier2Batch : OpKind::Send, -1, tier2 ? rc : 0, st, 0);
+        completeHandle_(handle, tier2 ? OpKind::Tier2Batch : OpKind::Send, -1, tier2 ? rc : 0, st, errorCode);
     }
     deferScanning_ = prevScan;
 }
@@ -1305,7 +1305,7 @@ int ProducerImpl::drainRing(int64_t nowNs, int messageLimit) {
     // F8c C6a: closeImmediately / failure path / Client close — every record
     // read from the closed ring completes with the Discarding status.
     if (const auto* dc = std::get_if<LifeDiscarding>(&life_)) [[unlikely]] {
-        return discardRing_(dc->status, messageLimit);
+        return discardRing_(dc->status, messageLimit, dc->errorCode);
     }
 
     // F12: drain up to messageLimit messages in ONE pass; ProducerHub flushes
@@ -2620,21 +2620,21 @@ void ProducerImpl::emitBatchAck_(int32_t topicId, int32_t partition, int32_t bas
     hooks_.cqDeliver(hooks_.ctx, batchAckCqRef_, c);
 }
 
-void ProducerImpl::failBatch_(PartitionState& ps, InFlightBatch& b, OpStatus st) {
+void ProducerImpl::failBatch_(PartitionState& ps, InFlightBatch& b, OpStatus st, uint16_t errorCode) {
     emitBatchAck_(ps.topicId, ps.partition, b.baseSequence, b.recordCount, -1, BatchAck::kClientFailure,
                   st, b.tier2 ? 1u : static_cast<uint32_t>(b.recordCount), b.producerEpoch, b.producerId);
-    completeSlice_(ps, b.ackStart, b.ackCount, -1, st, 0, b.tier2, b.recordCount);
+    completeSlice_(ps, b.ackStart, b.ackCount, -1, st, errorCode, b.tier2, b.recordCount);
     markUnresolved_(ps, b);  // D: outcome at the broker unknown
     releaseResolved_(ps, b);
     reclaimAckRing_(ps);
 }
 
-void ProducerImpl::failBuilder_(PartitionState& ps, OpStatus st) {
+void ProducerImpl::failBuilder_(PartitionState& ps, OpStatus st, uint16_t errorCode) {
     if (!ps.builder || ps.builder->recordCount() == 0) return;
     const int32_t n = ps.builder->recordCount();
     emitUnsentBatchAck_(ps.topicId, ps.partition, n, st, static_cast<uint32_t>(n));
     if (ps.batchAckCount > 0) {
-        completeSlice_(ps, ps.batchAckStart, ps.batchAckCount, -1, st, 0, false, 0);
+        completeSlice_(ps, ps.batchAckStart, ps.batchAckCount, -1, st, errorCode, false, 0);
         ps.ackHead = ps.batchAckStart;  // reclaim the unsent (newest) slice
     }
     ps.batchAckCount = 0;
@@ -2907,7 +2907,7 @@ bool ProducerImpl::routeParked(int32_t topicId, int32_t partition) const noexcep
     return idx != detail::FlatIndexMap::kNone && partitions_[idx]->routeParked;
 }
 
-int ProducerImpl::discardRing_(OpStatus st, int limit) {
+int ProducerImpl::discardRing_(OpStatus st, int limit, uint16_t errorCode) {
     // Records still in the app->agent ring (single consumer: we are it) are
     // completed with `st` and never sent.  Tier-2 entries are freed.  NOTE:
     // the ring head advances only when read() returns, so a handler run here
@@ -2924,7 +2924,7 @@ int ProducerImpl::discardRing_(OpStatus st, int limit) {
                 const int32_t tid  = readLE32(p, kRecTopicIdOff);
                 const int32_t part = readLE32(p, kRecPartOff);
                 emitUnsentBatchAck_(tid, part, 1, st, 1);
-                completeHandle_(h, OpKind::Send, -1, 0, st, 0);
+                completeHandle_(h, OpKind::Send, -1, 0, st, errorCode);
             } else if (type == kMsgTier2Batch && len >= kT2TokenSize) {
                 std::unique_ptr<Tier2Entry> e(
                     reinterpret_cast<Tier2Entry*>(static_cast<uintptr_t>(readLE64(p, 0))));
@@ -2934,7 +2934,7 @@ int ProducerImpl::discardRing_(OpStatus st, int limit) {
                 const int32_t  tid = e->topicId, part = e->partition;
                 e.reset();
                 emitUnsentBatchAck_(tid, part, rc, st, 1);
-                completeHandle_(h, OpKind::Tier2Batch, -1, rc, st, 0);
+                completeHandle_(h, OpKind::Tier2Batch, -1, rc, st, errorCode);
             }
             // kMsgFlush: nothing to complete.
         },
@@ -2961,29 +2961,29 @@ void ProducerImpl::failInFlightBroker(uint16_t errorCode) noexcept {
     }
 }
 
-void ProducerImpl::failAllPending(OpStatus st) noexcept {
+void ProducerImpl::failAllPending(OpStatus st, uint16_t errorCode) noexcept {
     const DutyScope duty(*this);  // fix1 C1: sends from these callbacks are deferred
     // Records committed to the app ring so far (Ring mode; a closed ring's
     // later commits are completed by the Discarding drain / closeFinal).
     if (mode_ == IngressMode::Ring) {
         for (int pass = 0; pass < 64; ++pass) {
-            if (discardRing_(st, INT_MAX) == 0) break;
+            if (discardRing_(st, INT_MAX, errorCode) == 0) break;
         }
     }
-    failDeferred_(st);  // records deferred before this call were accepted: fail them too
+    failDeferred_(st, errorCode);  // records deferred before this call were accepted: fail them too
     // Everything the producer accepted: in-flight batches + the current builder
     // + queued Tier-2 batches.  Indexed walk: a handler may append partitions
     // (Ring mode sends from a handler only write the ring; Direct ones defer).
     for (std::size_t i = 0; i < partitions_.size(); ++i) {
         PartitionState& ps = *partitions_[i];
-        ps.inflight.forEachLive([&](InFlightBatch& b) { failBatch_(ps, b, st); });
-        failBuilder_(ps, st);
+        ps.inflight.forEachLive([&](InFlightBatch& b) { failBatch_(ps, b, st, errorCode); });
+        failBuilder_(ps, st, errorCode);
         while (!ps.pendingTier2Entries.empty()) {
             const uint64_t h  = ps.pendingTier2Entries.front().ackHandle;
             const int32_t  rc = ps.pendingTier2Entries.front().recordCount;
             ps.pendingTier2Entries.pop_front();
             emitUnsentBatchAck_(ps.topicId, ps.partition, rc, st, 1);
-            completeHandle_(h, OpKind::Tier2Batch, -1, rc, st, 0);
+            completeHandle_(h, OpKind::Tier2Batch, -1, rc, st, errorCode);
         }
         ps.builderBytes   = 0;
         ps.batchStartNs   = 0;
@@ -3062,12 +3062,12 @@ void ProducerImpl::applyBeginClose(const detail::OpTarget& target, Token token, 
     if (!inDuty_) (void)closeDuty(nowNs);  // inside a handler: the next hub pass decides
 }
 
-void ProducerImpl::applyCloseImmediately(OpStatus st) {
+void ProducerImpl::applyCloseImmediately(OpStatus st, uint16_t errorCode) {
     (void)closeIntake();  // idempotent: the failure path may be the first closer
     if (discarding()) return;
     const bool         wasDraining = draining();
     const LifeDraining d = wasDraining ? std::get<LifeDraining>(life_) : LifeDraining{};
-    life_     = LifeDiscarding{st};
+    life_     = LifeDiscarding{st, errorCode};
     flushAll_ = true;
     if (inDuty_) {
         // F8c fix round 1 (I1): called from a handler this producer fired
@@ -3076,11 +3076,12 @@ void ProducerImpl::applyCloseImmediately(OpStatus st) {
         // yet consumed).  Fail-all at the outermost DutyScope's end instead.
         pendingFail_.armed    = true;
         pendingFail_.status   = st;
+        pendingFail_.errorCode = errorCode;
         pendingFail_.hadToken = wasDraining;
         pendingFail_.drain    = d;
         return;
     }
-    failAllPending(st);
+    failAllPending(st, errorCode);
     if (wasDraining) {
         Completion c;
         c.token  = d.token;
@@ -3093,7 +3094,7 @@ void ProducerImpl::applyCloseImmediately(OpStatus st) {
 void ProducerImpl::runPendingFail_() noexcept {
     const PendingFail pf = pendingFail_;
     pendingFail_ = PendingFail{};
-    failAllPending(pf.status);  // nested DutyScope: inDuty_ is still set
+    failAllPending(pf.status, pf.errorCode);  // nested DutyScope: inDuty_ is still set
     if (pf.hadToken) {
         Completion c;
         c.token  = pf.drain.token;
@@ -3154,11 +3155,12 @@ void ProducerImpl::closeFinal(OpStatus st, int stalledYieldsBeforeUnblock) {
     // Review m9: an earlier failClose(st') set the status the ring's records
     // complete with — keep it.
     const OpStatus ringSt = discarding() ? std::get<LifeDiscarding>(life_).status : st;
+    const uint16_t ringEc = discarding() ? std::get<LifeDiscarding>(life_).errorCode : uint16_t{0};
     int stalled = 0;
     int failedUnblocks = 0;
     while (ring_.headPosition() < target) {
         const int64_t before = ring_.headPosition();
-        const int n = discardRing_(ringSt, INT_MAX);
+        const int n = discardRing_(ringSt, INT_MAX, ringEc);
         if (n > 0 || ring_.headPosition() != before) {
             stalled = 0;
             failedUnblocks = 0;

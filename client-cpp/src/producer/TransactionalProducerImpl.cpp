@@ -672,7 +672,7 @@ void TransactionalProducerImpl::publishStatus_() {
     statusDirty_ = !status.tryPublish(s) && !status.closed();
 }
 
-void TransactionalProducerImpl::enterFatal_(uint16_t errorCode, uint64_t exceptOpId) {
+void TransactionalProducerImpl::enterFatal_(uint16_t errorCode, uint64_t exceptOpId, OpStatus st, std::string_view text) {
     // Terminal (Kafka ProducerFencedException): nothing is ever sent again.
     state_ = SFatalError{errorCode};
     clearBatches_();
@@ -688,8 +688,13 @@ void TransactionalProducerImpl::enterFatal_(uint16_t errorCode, uint64_t exceptO
         ops_.erase(ops_.begin() + static_cast<std::ptrdiff_t>(i));
     }
     for (UserOp& op : ops) {
-        complete_(op, OpStatus::Fenced, errorCode, "TransactionalProducer: fenced — fatal");
+        complete_(op, st, errorCode, text);
     }
+}
+
+void TransactionalProducerImpl::failRevoked(uint16_t errorCode) {
+    if (closed_ || std::holds_alternative<SFatalError>(state_)) return;
+    enterFatal_(errorCode, 0, OpStatus::BrokerError, "TransactionalProducer: the session was revoked (SessionRevoked)");
 }
 
 std::size_t TransactionalProducerImpl::testWaitingRecords() const noexcept {
