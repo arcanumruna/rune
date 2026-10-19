@@ -82,7 +82,7 @@ public:
     ///   retained sealed segments no longer cost N read mmaps + N fds up front.
     LogSegment(std::string dir, int64_t baseOffset, int32_t indexIntervalBytes = 4096,
                int32_t indexMaxBytes = 8 * 1024 * 1024, bool prefaultIndex = false,
-               bool eagerReadMap = false, std::size_t readMapBytes = 0);
+               bool eagerReadMap = false, std::size_t readMapBytes = 0, unsigned fileMode = 0644);
     ~LogSegment();
     /// Raw-pointer overload — avoids heap allocation on the produce hot path.
     /// [data, data+len) must be a valid record batch.  Returns nextOffset.
@@ -446,6 +446,7 @@ private:
     bool ensureReadMap() noexcept;
     /// Eagerly create the read mapping at segment construction (off the hot path).
     void openReadMap(std::size_t bytes = 0) noexcept;
+    unsigned fileMode_ = 0644;   ///< permission bits of the .log / .index this segment creates (Log::fileMode)
     int64_t baseOffset_; int32_t indexIntervalBytes_;
     int32_t indexMaxBytes_;   // right-sized initial .index mmap size (grows on demand)
     std::string logPath_;   // D20: no std::fstream — fd_ is the only .log handle

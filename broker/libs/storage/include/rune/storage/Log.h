@@ -155,7 +155,9 @@ inline const SegInfo& SealedSegmentSnapshot::operator[](std::size_t i) const noe
 /// hot-path log operation is a direct, inlinable call with NO vtable.
 class Log {
 public:
-    Log(std::string dir, int64_t segmentRollBytes = 64LL*1024*1024);
+    /// `fileMode`: the permission bits of every segment (.log) and index file this Log creates - 0644 by default;
+    /// the `__security` log passes 0600 (its events carry every user's StoredKey / ServerKey; combined fix M13, X102).
+    Log(std::string dir, int64_t segmentRollBytes = 64LL*1024*1024, unsigned fileMode = 0644);
     ~Log();
     /// Zero-copy span overload — avoids per-call vector construction on the hot path.
     /// Appends [data, data+len) as a batch with the given lastOffset.
@@ -1386,6 +1388,7 @@ private:
     ReadyRing   readyRing_;
     LogSegment* readyFront_ = nullptr;     ///< owner: next ready segment (taken off the ring)
     int         failFront_  = 0;           ///< owner: a pulled failure not yet acted on (errno)
+    unsigned      fileMode_ = 0644;       ///< see the constructor
     bool          provisioned_ = false;   ///< see setProvisioning (owner config)
     ProvisionChannel* provisionChannel_ = nullptr;
     int64_t       provisionThresholdBytes_ = 0;   ///< owner: Threshold demand point

@@ -41,9 +41,10 @@ using CatalogCheckpoint = LogCheckpoint;
 struct LogCheckpointKind {
     const char* name;            // "__catalog" | "__security" — in every message
     char        magic[8];        // the file's first 8 bytes
+    unsigned    fileMode;        // the checkpoint file's permission bits (`__security`: 0600, combined fix M13)
 };
-inline constexpr LogCheckpointKind kCatalogLogKind  {"__catalog",  {'R', 'C', 'A', 'T', 'A', 'P', 'L', '1'}};
-inline constexpr LogCheckpointKind kSecurityLogKind {"__security", {'R', 'S', 'E', 'C', 'A', 'P', 'L', '1'}};
+inline constexpr LogCheckpointKind kCatalogLogKind  {"__catalog",  {'R', 'C', 'A', 'T', 'A', 'P', 'L', '1'}, 0644};
+inline constexpr LogCheckpointKind kSecurityLogKind {"__security", {'R', 'S', 'E', 'C', 'A', 'P', 'L', '1'}, 0600};
 
 /// The checkpoint file's name inside the log's directory.
 inline constexpr const char* kCatalogCheckpointFile = "applied";

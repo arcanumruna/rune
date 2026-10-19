@@ -141,8 +141,8 @@ void LogSegment::setCanonicalLogPath(const std::string& dir, int64_t base) noexc
 
 LogSegment::LogSegment(std::string dir, int64_t baseOffset, int32_t indexIntervalBytes,
                        int32_t indexMaxBytes, bool prefaultIndex, bool eagerReadMap,
-                       std::size_t readMapBytes)
-    : baseOffset_(baseOffset), indexIntervalBytes_(indexIntervalBytes),
+                       std::size_t readMapBytes, unsigned fileMode)
+    : fileMode_(fileMode), baseOffset_(baseOffset), indexIntervalBytes_(indexIntervalBytes),
       indexMaxBytes_(indexMaxBytes), nextOffset_(baseOffset), durableNext_(baseOffset) {
     logPath_ = fname(dir, baseOffset, ".log");
     // D20: ONE raw POSIX fd is the segment's only handle on its .log — every
@@ -152,7 +152,7 @@ LogSegment::LogSegment(std::string dir, int64_t baseOffset, int32_t indexInterva
     // FILE from ONE process-wide list with a linear walk — O(open segments) per
     // segment destruction (>1M owner passes to drain 256 retention drops at 40k
     // segments).
-    fd_ = ::open(logPath_.c_str(), O_RDWR | O_APPEND | O_CREAT | O_CLOEXEC, 0644);
+    fd_ = ::open(logPath_.c_str(), O_RDWR | O_APPEND | O_CREAT | O_CLOEXEC, static_cast<mode_t>(fileMode));
     // F3 fix-round-1, item 2: see prepareStaging()'s identical check above —
     // an unchecked open() failure used to leave fd_ at -1 and silently
     // continue, so sync() would silently skip the fdatasync forever (a
@@ -173,7 +173,7 @@ LogSegment::LogSegment(std::string dir, int64_t baseOffset, int32_t indexInterva
     // (set by the background pre-provisioner) touches the pages up front so the
     // append/roll hot path never faults them.
     index_ = std::make_unique<OffsetIndex>(fname(dir, baseOffset, ".index"), baseOffset,
-                                           indexMaxBytes_, prefaultIndex);
+                                           indexMaxBytes_, prefaultIndex, fileMode);
     // F3: only the segment that IS or WILL BE active gets an eager read mapping
     // (+ its own read-only fd, though that fd is now closed right after mmap —
     // see MappedFile).  A sealed segment recovered from disk (eagerReadMap ==
@@ -964,7 +964,7 @@ int64_t LogSegment::recover(bool syncIndex) {
     std::string indexTmp  = indexBase + ".index.tmp";
     // Remove any leftover .tmp from a previous crash
     std::filesystem::remove(indexTmp);
-    index_ = std::make_unique<OffsetIndex>(indexTmp, baseOffset_, indexMaxBytes_);
+    index_ = std::make_unique<OffsetIndex>(indexTmp, baseOffset_, indexMaxBytes_, false, fileMode_);
 
     size_t pos = 0; int64_t validBytes = 0; int64_t next = baseOffset_;
     // C2: seed bytesSinceIndex_ identically to append() so the index is reproducible.
@@ -1028,7 +1028,7 @@ int64_t LogSegment::recover(bool syncIndex) {
         }
     }
     // Reopen index_ from the canonical path and recount entries from mmap data.
-    index_ = std::make_unique<OffsetIndex>(indexPath, baseOffset_, indexMaxBytes_);
+    index_ = std::make_unique<OffsetIndex>(indexPath, baseOffset_, indexMaxBytes_, false, fileMode_);
     index_->rebuildEntries();
 
     return nextOffset_;

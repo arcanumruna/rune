@@ -14,7 +14,7 @@ public:
     /// @param prefault  touch every page of the fresh mapping so the cold
     ///   minor-page-faults are paid HERE (ideally on a background thread) rather
     ///   than on the append/roll hot path at the first index write.
-    OffsetIndex(std::string path, int64_t baseOffset, int32_t maxBytes, bool prefault = false);
+    OffsetIndex(std::string path, int64_t baseOffset, int32_t maxBytes, bool prefault = false, unsigned fileMode = 0644);
     void append(int64_t offset, int64_t position);
     OffsetPosition lookup(int64_t targetOffset) const;
     // CP-10: msync only the written prefix (entries_ * kEntrySize) instead of the

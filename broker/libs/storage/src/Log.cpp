@@ -106,7 +106,8 @@ int32_t Log::indexMaxBytesFor(int64_t rollBytes, int32_t indexIntervalBytes) noe
     return static_cast<int32_t>(bytes);
 }
 
-Log::Log(std::string dir, int64_t segmentRollBytes) : dir_(std::move(dir)), rollBytes_(segmentRollBytes) {
+Log::Log(std::string dir, int64_t segmentRollBytes, unsigned fileMode)
+    : dir_(std::move(dir)), rollBytes_(segmentRollBytes), fileMode_(fileMode) {
     // Review m2: sized for the deferred-roll overshoot cap, so a segment that
     // overshot rollBytes never grows its index mapping on the owner.
     indexMaxBytes_ = indexMaxBytesFor(maxDeferredRollBytes_(), kDefaultIndexIntervalBytes);
@@ -170,7 +171,8 @@ Log::Log(std::string dir, int64_t segmentRollBytes) : dir_(std::move(dir)), roll
     for (int64_t b : bases)
         install_(b, std::make_unique<LogSegment>(dir_, b, kDefaultIndexIntervalBytes,
                                                   indexMaxBytes_, /*prefaultIndex*/false,
-                                                  /*eagerReadMap*/ b == bases.back()));
+                                                  /*eagerReadMap*/ b == bases.back(),
+                                                  /*readMapBytes*/0, fileMode_));
     logEndOffset_ = activeSegment().nextOffset();
     // #5 non-blocking append: preallocate the active segment's blocks so hot-path
     // O_APPEND pwrite()s never stall on block allocation (append-p99 tail).
@@ -720,7 +722,7 @@ void Log::installNextSegment(int64_t base) {
         // active), the exception propagates, the next append retries.
         auto seg = std::make_unique<LogSegment>(
             dir_, base, kDefaultIndexIntervalBytes, indexMaxBytes_,
-            /*prefaultIndex*/false, /*eagerReadMap*/true);
+            /*prefaultIndex*/false, /*eagerReadMap*/true, /*readMapBytes*/0, fileMode_);
         seg->preallocate(rollBytes_);
         ++ownerPreallocs_;
         install_(base, std::move(seg));
@@ -1987,7 +1989,7 @@ bool Log::truncateTo_(int64_t truncateOffset) {
         int64_t base = std::max<int64_t>(0, truncateOffset);
         auto seg = std::make_unique<LogSegment>(dir_, base, kDefaultIndexIntervalBytes,
                                                  indexMaxBytes_, /*prefaultIndex*/false,
-                                                 /*eagerReadMap*/true);
+                                                 /*eagerReadMap*/true, /*readMapBytes*/0, fileMode_);
         install_(base, std::move(seg));
         segments_.rbegin()->second->setDirEntryGen(++dirMutGen_);   // MEDIUM-2: deletions + re-create
         logEndOffset_ = base;
@@ -2132,7 +2134,7 @@ bool Log::truncateTo_(int64_t truncateOffset) {
         // — F3: eagerReadMap=true.
         auto newSeg = std::make_unique<LogSegment>(dir_, base, kDefaultIndexIntervalBytes,
                                                     indexMaxBytes_, /*prefaultIndex*/false,
-                                                    /*eagerReadMap*/true);
+                                                    /*eagerReadMap*/true, /*readMapBytes*/0, fileMode_);
         // E2 crash seam: the surviving prefix keeps what was already synced.
         newSeg->inheritSyncedBytesForTest(
             std::min<int64_t>(seg.syncedBytesForTest(), static_cast<int64_t>(cutPos)));
@@ -2205,7 +2207,8 @@ bool Log::reloadSegments() {
         // F3: same eager-only-for-the-active-segment rule as the constructor.
         newSegments[b] = std::make_unique<LogSegment>(dir_, b, kDefaultIndexIntervalBytes,
                                                        indexMaxBytes_, /*prefaultIndex*/false,
-                                                       /*eagerReadMap*/ b == bases.back());
+                                                       /*eagerReadMap*/ b == bases.back(),
+                                                       /*readMapBytes*/0, fileMode_);
         newSegments[b]->setStorageState(&storage_);   // T10: recover() sees the failure state
         // F15 S4 N1 (merged with F3's install-by-swap): every installed segment
         // carries a fresh Log-wide generation — install_ is bypassed here, so
@@ -2331,7 +2334,8 @@ void Log::reloadSegmentNoPublish_(int64_t baseOffset) {
     // it starts from what the replaced object published (compaction never
     // makes a segment newer; a merge adds its members via raiseTsFloor).
     const int64_t floorTs = std::max(it->second->publishedTs(), it->second->tsFloor());
-    install_(baseOffset, std::make_unique<LogSegment>(dir_, baseOffset, kDefaultIndexIntervalBytes, indexMaxBytes_));
+    install_(baseOffset, std::make_unique<LogSegment>(dir_, baseOffset, kDefaultIndexIntervalBytes, indexMaxBytes_,
+                                                 false, false, 0, fileMode_));
     LogSegment& fresh = *segments_[baseOffset];
     fresh.raiseTsFloor(floorTs);
     fresh.recover();

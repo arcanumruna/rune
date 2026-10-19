@@ -21,9 +21,9 @@ struct FdCloseGuard {
 };
 } // namespace
 
-MappedFile::MappedFile(std::string path, size_t initialBytes, bool writable, bool prefault)
+MappedFile::MappedFile(std::string path, size_t initialBytes, bool writable, bool prefault, unsigned fileMode)
     : path_(std::move(path)), size_(initialBytes), writable_(writable) {
-    fd_ = ::open(path_.c_str(), writable ? (O_RDWR|O_CREAT) : O_RDONLY, 0644);
+    fd_ = ::open(path_.c_str(), writable ? (O_RDWR|O_CREAT) : O_RDONLY, static_cast<mode_t>(fileMode));
     if (fd_ < 0) throw std::runtime_error("open failed: " + path_);
     FdCloseGuard fdGuard{fd_};
     // Never SHRINK an existing file: the index is now right-sized and may have

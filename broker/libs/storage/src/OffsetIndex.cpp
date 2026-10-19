@@ -3,9 +3,9 @@
 #include <cstring>
 #include <stdexcept>
 namespace rune::storage {
-OffsetIndex::OffsetIndex(std::string path, int64_t baseOffset, int32_t maxBytes, bool prefault)
+OffsetIndex::OffsetIndex(std::string path, int64_t baseOffset, int32_t maxBytes, bool prefault, unsigned fileMode)
     : baseOffset_(baseOffset) {
-    file_ = std::make_unique<MappedFile>(std::move(path), maxBytes, true, prefault);
+    file_ = std::make_unique<MappedFile>(std::move(path), maxBytes, true, prefault, fileMode);
 }
 void OffsetIndex::append(int64_t offset, int64_t position) {
     // C4: Guard the 2GiB position limit here (where the cast happens) so all callers

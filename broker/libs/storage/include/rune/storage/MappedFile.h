@@ -10,7 +10,7 @@ public:
     ///   rather than lazily on the caller's first write.  Only meaningful for a
     ///   writable mapping.  Used by the segment pre-provisioner so the append/
     ///   roll hot path never faults index pages.
-    MappedFile(std::string path, size_t initialBytes, bool writable, bool prefault = false);
+    MappedFile(std::string path, size_t initialBytes, bool writable, bool prefault = false, unsigned fileMode = 0644);
     /// D3b fix round 2: a READ-ONLY mapping of an ALREADY-OPEN file `borrowedFd`
     /// (NOT owned: never closed here; the caller keeps it open for this object's
     /// lifetime).  Mapping and every resize() go through that fd — i.e. through

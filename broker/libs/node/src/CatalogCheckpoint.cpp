@@ -186,7 +186,7 @@ bool writeLogCheckpoint(const std::string& catalogDir, const LogCheckpoint& c, c
     // plane (one write per applied DDL), and the strings are built per call.
     const std::string path = (std::filesystem::path{catalogDir} / kCatalogCheckpointFile).string();
     const std::string tmp  = path + ".tmp";
-    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, static_cast<mode_t>(kind.fileMode));
     if (fd < 0) return false;
     if (!writeAllAndSync(fd, buf.data(), buf.size())) {
         const int saved = errno;
