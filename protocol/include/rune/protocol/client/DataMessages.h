@@ -749,9 +749,10 @@ struct ViewRowResponse {
     // 6 = the owning worker's ingress ring was full this cycle (retriable —
     // the read was not performed; re-issue it); 7 = the row exists but its
     // ViewRowResponse would exceed the broker's egress frame (non-retriable;
-    // no row bytes are carried).
+    // no row bytes are carried); 45 = NotAuthorized (client version 9: the session may not READ the view -
+    // the same value as ErrorCode::NotAuthorized, non-retriable).
     enum Status : uint16_t { kOk = 0, kAbsentKey = 1, kNotReady = 2, kSchemaMismatch = 3, kUnknownView = 4,
-                             kInvalidRequest = 5, kBusy = 6, kRowTooLarge = 7 };
+                             kInvalidRequest = 5, kBusy = 6, kRowTooLarge = 7, kNotAuthorized = 45 };
 
     /// Total encoded size accounting for the var field.
     std::size_t encodedSize() const noexcept {
