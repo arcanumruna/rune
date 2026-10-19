@@ -2,6 +2,15 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Updated 2026-10-19** — re-checked against the code after catalog history (`feat/catalog-history`) and the authentication plan. Order is now **auth → D → B → F → A**. Changes:
+> 1. **Part C is in the code** (verified: `HasRecordKey`, `typedPartitionCount`, `TypedTopic{producer_, topic_, version_}`, `send(rec)` → `sendWithKey_(rec, recordKey_(rec))`, the generator's `key()` in `rune-codec/src/Generator.cpp`). Task 8's Step 0 still runs, but its grep now targets `recordKey_` / `sendWithKey_` (C landed with those names: `send` no longer spells `Key(rec.key())` inline; `recordKey_` builds the key, including the >16-byte-key `std::invalid_argument` refusal the typed claim must mirror).
+> 2. **Branch base:** cut from the integration tip **after Part D merged** (D is on the auth tip); rune-codec is the `feat/catalog-history` lineage. Paths are the `/Users/vradu/Projects/se-worktrees/*` worktrees.
+> 3. **Line hints refreshed** (the producer files moved a few lines with the TransientLogFull retry): `ProduceFrameBuilder.h` `append` is lines 66–99 (comment + body); `ProducerImpl.h` message ids lines 75–77 (`kMsgSendRecord` … `kMsgTier2Batch`); `ProducerImpl.cpp` `drainRing` 1295–1381, `appendRecord_` 1384–1539 (comment + body), `discardRing_` 2910–2942, `tryAppendDirect_` 476–536, `throwForSendResult` 915–941, `encodeAndSend` 1546, `failBuilder_` 2632, `~ProducerImpl` 3191; `Producer.h` `SendResult` 229–245, the `AckToken` `send` 431, `private:` 569; `Completions.h` friends 297–299. Function names are the anchors — trust them over the numbers.
+> 4. **Copy count (spec §B) unchanged** by catalog history / auth: the produce path did not move. Auth adds one WRITE-bitmap check on the broker per produce (auth Task 13) — nothing client-side; a claim committed to a topic the session may not write completes `NotAuthorized (45)` exactly like a `send` (no new request type, no new grant: WRITE TOPIC).
+> 5. **Part F follows B and reuses its claim paths:** keep `SendResult::ClaimHeld` / `RejectReason::ClaimHeld` appended **last** in B so F can append `NotInTransaction` after them; keep `kMsgClaimBatch = 4` so F's `kMsgTxnControl = 5` follows. B must not add transactional behaviour (F does).
+> 6. **Fix-on-sight noted (owned by F, not B):** `Tier2Entry::batchBytes` is a per-batch heap `std::vector` behind a heap `Tier2Entry*` in the ring, and `PartitionState::pendingTier2Entries` is a `std::deque`; F Task 3 replaces them with a preallocated slot pool. B's `kMsgClaimBatch` carries its records inline in the ring (no heap), as written.
+> 7. Test gate wording aligned with CLAUDE.md #7: per task the affected executables; the full `*Regression*` suite (+ client `build_tsan`) at the checkpoints after Task 3, Task 6 and Task 9.
+
 **Goal:** Make the published zero-copy produce API real: `Producer::tryClaim(topic, key, len)` → a `Claim` (`buffer()` / `commit()` / `abort()`), `Producer::claimBatch(topic, key, n, recLen)` → a `BatchClaim` (`record(i)` / `commit()`, ONE atomic RecordBatch), SBE-style generated `XEncoder` / `XDecoder` flyweights for all-fixed-size schemas, and `TypedTopic::claim(keyValue)` returning the generated encoder over the claimed bytes.
 
 **Architecture:** Thread mode claims a slot in the producer's existing M2O ring (`kMsgSendRecord` for one record, a new `kMsgClaimBatch = 4` for a batch) and hands back the value bytes; `commit()` commits the ring slot and the agent path is unchanged (2 internal copies remain: ring → Produce frame → Aeron). Invoker mode reserves the record(s) directly in the partition's `ProduceFrameBuilder` (1 copy: frame → Aeron), guarded by an explicit per-producer claim state machine (`NoDirectClaim` / `DirectClaimOpen{slot, mark, …}`). rune-codec's `generateHeader` additionally emits `XEncoder` / `XDecoder` for schemas whose fields are all fixed-size; they load/store with `memcpy` through a small `rune::codec::fly` helper header (the ring value offset 38 is unaligned).
@@ -10,9 +19,9 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-11-rune-phase2b-design.md` — section **B. Zero-copy produce** is binding (copy count, API, implementation shape, generated flyweights, gates). Global constraints at the end of the spec.
 
-**Builds on / depends on:** Part **C** (typed topics route by key) MUST be merged first — this plan consumes, from C: the generated struct's `key()` accessor (returning the `isKey` field's value), `TopicSchemaResult.partitionCount`, and `TypedTopic` holding `TopicHandle{id, partitionCount}` and sending `Key(rec.key())`. Build order **C → E → D → B → A**. Parts E and D touch disjoint files (B does not consume them).
+**Builds on / depends on:** Part **C** (typed topics route by key) — merged (see the update note): the generated struct's `key()`, `TopicSchemaResult.partitionCount`, `TypedTopic` holding `TopicHandle{id, partitionCount}` and routing through `recordKey_(rec)`. Build order **C → E → E2 → (catalog history, auth) → D → B → F → A**. Parts E and D touch disjoint files (B does not consume them).
 
-**Repos and branches:** `rune-codec` and `rune-client-cpp` only. In each, cut `feat/phase2b-b-zero-copy-produce` from that repo's integration line **after C/E/D have landed on it**: rune-codec from `feat/schema-evolution-durable-tags`, rune-client-cpp from `feature/materialized-views`. The client compiles rune-codec from the canonical sibling `../rune-codec` (`RUNE_CODEC_ROOT`), so the codec checkout next to the client must be on this branch while client tasks run. Nothing is pushed.
+**Repos and branches:** `rune-codec` and `rune-client-cpp` only. In each (`/Users/vradu/Projects/se-worktrees/rune-codec`, `…/rune-client-cpp`), cut `feat/phase2b-b-zero-copy-produce` from that repo's integration tip **after Part D merged** (D sits on the authentication tip; rune-codec's line is `feat/catalog-history` → `feat/authentication`). The client compiles rune-codec from the canonical sibling `../rune-codec` (`RUNE_CODEC_ROOT`), so the codec checkout next to the client must be on this branch while client tasks run. Nothing is pushed.
 
 ## Global Constraints
 
@@ -28,6 +37,11 @@
 - Published API names (arcanum.regressorspath.com/rune/docs.html) implemented exactly: `Producer::tryClaim(topic, key, len)` with `buffer()`, `commit()`, `abort()`; `Producer::claimBatch(topic, key, n, recLen)` with `record(i)`, `commit()`; generated `XEncoder(span)` with chainable setters and `XEncoder::kBlockLength`, `XDecoder`; `TypedTopic::claim(keyValue)` returning the encoder with `commit()`.
 - Wire enums / ring message ids are append-only: `kMsgClaimBatch = 4` is appended after `kMsgTier2Batch = 3`; `SendResult::ClaimHeld` and `RejectReason::ClaimHeld` are appended last.
 - Commit messages end with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`. Nothing is pushed.
+
+## Decisions (added 2026-10-19)
+
+- **BD1 — Typed-claim keys follow Part C's `recordKey_` rules exactly** (fixed-width keys must fit `Key::kMaxInline` at compile time; a `string(N)` key longer than 16 bytes throws `std::invalid_argument` before anything is claimed). C landed after this plan was written and made that refusal explicit; `claim(keyValue)` built `Key(keyValue)` directly, which would have truncated or failed to compile.
+- **BD2 — B is transaction-agnostic.** Every claim path goes through the producer ring / builder, so Part F's transactional gate and batch attributes apply to claims without B knowing; B only keeps its appended enum / ring-id values last (update note 5).
 
 ## Review Focus
 
@@ -71,7 +85,7 @@ Most likely to bite a user, each pinned by a named test in its owning task:
 Build commands used throughout (run from each repo's root):
 - codec: `cmake --build build -j8` then `ctest --test-dir build …` (existing Debug / Unix Makefiles dir).
 - client: `cmake --build build -j8` then `ctest --test-dir build …` (existing Debug dir configured with the conan toolchain, `BUILD_TESTING=ON`, `BUILD_EXAMPLES=ON`). If `build/` is missing: `conan install . -of build -s build_type=Debug -s arch=x86_64 -s compiler.cppstd=gnu17 --build=missing && cmake -S . -B build -DBUILD_TESTING=ON -DBUILD_EXAMPLES=ON -DCMAKE_TOOLCHAIN_FILE=build/Debug/generators/conan_toolchain.cmake -DCMAKE_PREFIX_PATH="$PWD/build/Debug/generators"`.
-- Regression gate before EVERY commit, per touched repo: `ctest --test-dir build -R Regression --output-on-failure` (must be 0 failures), then `ctest --test-dir build --output-on-failure`.
+- Test gate (CLAUDE.md #7, updated 2026-10-19): per task, the executables covering what it touches plus every new or changed test (each task's Run step). The full `*Regression*` suite (`ctest --test-dir build -R Regression --output-on-failure -j14`, plus the client `build_tsan` build with `BUILD_TESTING=ON`) runs at the checkpoints — after Task 3, after Task 6, after Task 9 (before the final review). Where a task step below still says "Regression gate + full suite, then commit", the affected-area run binds per task and the full suite belongs to the checkpoint.
 
 ---
 
@@ -838,7 +852,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ### Task 3: client — `ProduceFrameBuilder` in-place record reservation
 
 **Files:**
-- Modify: `rune-client-cpp/include/rune/client/producer/ProduceFrameBuilder.h:57-87` (the `append` body) and its `private:` section
+- Modify: `rune-client-cpp/include/rune/client/producer/ProduceFrameBuilder.h:66-99` (the `append` comment + body) and its `private:` section (line 153)
 - Test: `rune-client-cpp/tests/producer/ProduceFrameBuilderTest.cpp` (append; already in `rune_pure_tests`)
 
 **Interfaces:**
@@ -1020,12 +1034,12 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ### Task 4: client — `Claim` + Thread-mode (Ring) `Producer::tryClaim`
 
 **Files:**
-- Modify: `rune-client-cpp/include/rune/client/producer/Producer.h` (after `enum class SendResult` (≈ line 241); the public API after the AckToken `send` overloads (≈ line 427); the `private:` section (≈ line 565))
+- Modify: `rune-client-cpp/include/rune/client/producer/Producer.h` (after `enum class SendResult` (lines 229–245); the public API after the AckToken `send` overloads (≈ line 431); the `private:` section (≈ line 569))
 - Create: `rune-client-cpp/src/producer/Claim.cpp`
 - Modify: `rune-client-cpp/src/producer/Producer.cpp` (new section before `// Tier-2: explicit atomic batch`)
 - Modify: `rune-client-cpp/include/rune/client/Completions.h` (forward declaration + friend at ≈ line 297)
 - Modify: `rune-client-cpp/include/rune/client/producer/ProducerImpl.h` (public claim API next to `trySubmit`)
-- Modify: `rune-client-cpp/src/producer/ProducerImpl.cpp` (claim bodies before `ProducerImpl::~ProducerImpl()` at ≈ line 3186)
+- Modify: `rune-client-cpp/src/producer/ProducerImpl.cpp` (claim bodies before `ProducerImpl::~ProducerImpl()` at ≈ line 3191)
 - Create: `rune-client-cpp/tests/support/FrameCapture.h`
 - Create: `rune-client-cpp/tests/producer/ProducerClaimTest.cpp`
 - Modify: `rune-client-cpp/CMakeLists.txt` (`rune_client_producer` sources; `rune_invoker_tests` sources)
@@ -1765,7 +1779,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - Modify: `rune-client-cpp/src/producer/Claim.cpp` (append `BatchClaim`)
 - Modify: `rune-client-cpp/src/producer/Producer.cpp` (append `claimBatch` to the 2b-B section)
 - Modify: `rune-client-cpp/include/rune/client/producer/ProducerImpl.h:73-76` (message ids), the claim API, the private helpers
-- Modify: `rune-client-cpp/src/producer/ProducerImpl.cpp` — anonymous-namespace helper after `recordBodyContrib`; `drainRing` (`:1295-1381`); `appendRecord_` (`:1384-1539`, replaced); `discardRing_` (`:2905-2937`); claim section (Task 4)
+- Modify: `rune-client-cpp/src/producer/ProducerImpl.cpp` — anonymous-namespace helper after `recordBodyContrib`; `drainRing` (`:1295-1381`); `appendRecord_` (`:1384-1539`, replaced); `discardRing_` (`:2910-2942`); claim section (Task 4)
 - Test: `rune-client-cpp/tests/producer/ProducerClaimTest.cpp` (append)
 
 **Interfaces:**
@@ -2106,7 +2120,7 @@ BatchClaim Producer::claimBatch(TopicHandle topic, const Key& key, uint32_t n, u
 }
 ```
 
-`ProducerImpl.h` — replace the message-id block (`:73-76`) with:
+`ProducerImpl.h` — replace the message-id block (`:72-77`, the comment + `kMsgSendRecord` … `kMsgTier2Batch`) with:
 
 ```cpp
 inline constexpr int32_t kMsgSendRecord  = 1; // SEND_RECORD (producer-ring local ID)
@@ -2350,7 +2364,7 @@ void ProducerImpl::appendBatch_(PartitionState& ps, const uint8_t* keyBytes, uin
 }
 ```
 
-Replace the whole of `discardRing_` (`:2905-2937`) with (the `kMsgClaimBatch` branch is the only change):
+Replace the whole of `discardRing_` (`:2910-2942`) with (the `kMsgClaimBatch` branch is the only change):
 
 ```cpp
 int ProducerImpl::discardRing_(OpStatus st, int limit) {
@@ -2472,7 +2486,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 **Files:**
 - Modify: `rune-client-cpp/include/rune/client/producer/Producer.h` (`enum class SendResult`: append `ClaimHeld`)
 - Modify: `rune-client-cpp/include/rune/client/producer/ProducerImpl.h` (`enum class RejectReason`: append `ClaimHeld`; `claimsAbandoned()` next to `deferredApplyFailures()`; private Direct-claim state machine)
-- Modify: `rune-client-cpp/src/producer/ProducerImpl.cpp` — `tryAppendDirect_` (`:476-536`), `throwForSendResult` (`:915-941`), `admitRecord_` (Task 5), `encodeAndSend` (top, `:1553`), `failBuilder_` (top, `:2627`), the 2b-B claim section (dispatch + Direct bodies)
+- Modify: `rune-client-cpp/src/producer/ProducerImpl.cpp` — `tryAppendDirect_` (`:476-536`), `throwForSendResult` (`:915-941`), `admitRecord_` (Task 5), `encodeAndSend` (top, `:1546`), `failBuilder_` (top, `:2632`), the 2b-B claim section (dispatch + Direct bodies)
 - Test: `rune-client-cpp/tests/producer/ProducerClaimTest.cpp` (append)
 
 **Interfaces:**
@@ -3183,8 +3197,8 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 - [ ] **Step 0: Verify the Part C interface is on this branch**
 
-Run: `grep -n "TopicHandle *topic_;\|uint16_t *version_\|Key(rec.key())" include/rune/client/TypedTopic.h`
-Expected: three hits (the member, the version, the key routing in `send`). Run: `grep -n "key()" ../rune-codec/src/Generator.cpp` — expected: at least one hit (C's generated `key()`). If any is missing, stop: Part C has not landed (B depends on it). If C landed with different member names, use C's names in Step 3 (the only references are `producer_`, `topic_`, `version_`).
+Run: `grep -n "TopicHandle *topic_;\|uint16_t *version_\|recordKey_\|sendWithKey_" include/rune/client/TypedTopic.h`
+Expected: hits for the member, the version, and C's key routing (`send` → `sendWithKey_(rec, recordKey_(rec))`; updated 2026-10-19 — C landed with these names). Also add to `TypedClaimTest.cpp` (Step 1): `TEST(TypedClaimRegression, OverlongStringKeyThrowsAndClaimsNothingRegression)` — a schema keyed by `string(20)` (add it to `GenClaimSchemas.cpp` as `long_key.gen.h`, `rune::gen::LongKey{code string(20) KEY, v Int64}`): `claim(std::string(17, 'x'))` throws `std::invalid_argument` and the frame capture shows no record and the ring no committed slot; `claim(std::string(16, 'x'))` routes like `send` of the same record. Run: `grep -n "key()" ../rune-codec/src/Generator.cpp` — expected: at least one hit (C's generated `key()`). If any is missing, stop: Part C has not landed (B depends on it). If C landed with different member names, use C's names in Step 3 (the only references are `producer_`, `topic_`, `version_`).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -3545,7 +3559,27 @@ In `class TypedTopic`, directly after the `send(const T& rec)` member, add:
         requires requires { typename U::Encoder; } && U::Encoder::kHasKey
     [[nodiscard]] TypedClaim<typename U::Encoder> claim(const typename U::Encoder::KeyType& keyValue) {
         using E = typename U::Encoder;
-        return TypedClaim<E>(producer_.tryClaim(topic_, Key(keyValue), E::kEncodedLength), version_, keyValue);
+        return TypedClaim<E>(producer_.tryClaim(topic_, claimKey_(keyValue), E::kEncodedLength), version_, keyValue);
+    }
+
+    /// (Updated 2026-10-19) The SAME key rules as Part C's recordKey_(rec): a trivially-copyable key
+    /// must fit Key::kMaxInline (static_assert); a string(N) key arrives as std::string_view and
+    /// longer than Key::kMaxInline throws std::invalid_argument BEFORE anything is claimed (never
+    /// truncated).  Pinned by TypedClaim.RoutesLikeTypedSendForEveryKey and the new
+    /// TypedClaimRegression.OverlongStringKeyThrowsAndClaimsNothingRegression.
+    template <class KeyT>
+    [[nodiscard]] static Key claimKey_(const KeyT& k) {
+        if constexpr (std::is_convertible_v<KeyT, std::string_view>) {
+            const std::string_view sv(k);
+            if (sv.size() > Key::kMaxInline) [[unlikely]]
+                throw std::invalid_argument("TypedTopic::claim: key is " + std::to_string(sv.size()) +
+                                            " bytes; a record key holds at most " + std::to_string(Key::kMaxInline));
+            return Key(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(sv.data()), sv.size()));
+        } else {
+            static_assert(std::is_trivially_copyable_v<KeyT> && sizeof(KeyT) <= Key::kMaxInline,
+                          "TypedTopic::claim: the key field cannot be a record key without truncation");
+            return Key(k);
+        }
     }
 
     /// Keyless schema: partition 0, empty record key (spec C's documented
@@ -3890,3 +3924,7 @@ Optional dashboard push (client CLAUDE.md §5): `../rune-broker/scripts/rune-liv
 9. **Name collisions.** A non-key field literally named `key` suppresses the flyweights (its setter would collide with the key helpers; Part C's struct `key()` has the same collision). Fields named `commit` / `abort` / `result` are hidden by `TypedClaim`'s members (reachable via `static_cast<E&>(w)`). Reject such names in Rune QL instead?
 10. **Real-broker e2e.** Spec B's gates are tests + benchmarks; this plan's end-to-end proof is a real `Client` over Aeron IPC to the in-process `InvokerGateway` (Task 7), not the dockerized broker. Is a docker e2e probe (e.g. a typed claim against a live `rune>`-defined all-fixed topic) required for 2b?
 11. **Part C interface assumptions** (Task 8 Step 0): `TypedTopic(ProducerT, TopicHandle, uint16_t version)`, members `producer_` / `topic_` / `version_`, `send` keyed by `Key(rec.key())`, and `key()`'s return type equal to the field's member type (`std::array<char, N>` for `string(N)`), so `Key(keyValue)` in `claim` picks the same `Key` constructor as C's `send`.
+
+### Spec gaps found 2026-10-19
+
+- **G1 — Typed-claim key length** (spec §B is silent; Part C made `send` refuse a >16-byte key): resolved by BD1.

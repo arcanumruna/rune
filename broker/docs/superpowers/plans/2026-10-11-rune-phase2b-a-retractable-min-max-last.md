@@ -2,6 +2,15 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Updated 2026-10-19** — re-checked against the code after catalog history (`feat/catalog-history`, broker `c50b06cd`) and the authentication plan; A now runs **last** (order auth → D → B → F → A). Changes:
+> 1. **Branch base:** cut from the integration tip after Part F merged (was `feature/materialized-views`). rune-codec is the `feat/catalog-history` lineage (it now also holds `rune_catalog` / `rune_security`).
+> 2. **The broker view code is unchanged since 2a** apart from `WorkerViewSet` (catalog `uninstallView`, transient-source cursor reconciliation): every `libs/view` line hint below was re-verified and holds. Stale hints fixed: `ViewPlanAuthor.h` enum (now line 46, comment 40–45), client `CMakeLists.txt` `rune_schema_codec_smoke_tests` (now 918–922), `WorkerViewSet.cpp` `maxRecordsPerPassFor` (comment 132–135, function 136), `view_probe.cpp` and `view-engine-e2e.sh` (now anchored by text, not line numbers — both files grew).
+> 3. **Test dirs:** `WorkerViewSetTest.cpp` now uses the per-process `tmpDir("…")` helper (fix c506bccf); Task 7's tests use it instead of fixed `/tmp/rune-views-*` paths (two concurrent runs would share a checkpoint dir).
+> 4. **Views are created through `__catalog`:** `createViewAndWait` is a catalog DDL (Redirect / NotLeader followed by the client); the `CreateView` event stores the authored plan (`normalizedPlanBlob`, fingerprinted) and the leader's `compiledPlanBlob`, and every broker installs the view from the applied event. Nothing in A changes the event or fingerprint format: the new rule byte 8 and the Min/Max/Last outputs are plan *content*. The e2e's `CATALOG_NAMES` list already contains `user_totals`.
+> 5. **Auth interactions:** no new request type. `CreateView` needs `CREATE VIEW` + `READ` on the source (auth D19), `GetViewRow` needs `READ VIEW`; the auth phase's Task 20 already runs `view-engine-e2e.sh` authenticated (`docker/lib/auth.sh`, `RUNE_USER` / `RUNE_PASSWORD_FILE` passed to the probe) — Task 9 keeps that wiring and adds nothing.
+> 6. **The e2e run** uses the `rsync` + `flock /root/vm.lock` form the other 2026-10 plans use (the old "git archive into /root/view-engine-e2e, rune-fr" staging is gone).
+> 7. New decision **AD1** and spec gap **G1** (mixed-version brokers) — see *Decisions* below.
+
 **Goal:** Aggregate views can maintain `Min`, `Max`, `Last` and `LastNonNull` with exact retraction on update, group move and delete, and keep that exact across a checkpoint/restart. 2a-only views stay exactly as they are.
 
 **Architecture:** Only views that use one of the four rules are **linked**. In a linked view, each contributor row gains `[prev u64][next u64]` links that form a doubly linked MRU list of the group's contributors, keyed by contributor key (`kNoContributor = UINT64_MAX`). Each group row gains `[head u64]` plus, per `Min`/`Max` field, a cached `[value 8B][state u8]`. `Last` is the head's value and `LastNonNull` is the first non-null value walking from the head. `Min`/`Max` come from the cache, and the fold walks the list once only when the cached extreme is retracted. Links, heads and caches live in the contributor and group tables that the 2a v2 multi-table checkpoint already persists, so recovery does not change. The per-pass delta cap's worst case per record grows from 5 to 8 dirty entries for linked views; the plan derives that bound exactly and a test pins it.
@@ -15,15 +24,16 @@
 ## Execution context
 
 - **Repos:** broker and client only. Use the canonical sibling layout under `/Users/vradu/Projects/se-worktrees/` (`rune-broker`, `rune-client-cpp`, and `../rune-codec` on `feat/schema-evolution-durable-tags`, which the broker CMake requires).
-- **Branches:** cut `feat/phase2b-a-retractable-min-max-last` from the integration branch `feature/materialized-views` in both repos:
+- **Branches:** cut `feat/phase2b-a-retractable-min-max-last` from each repo's integration tip **after Part F merged** (`<F-tip>` below = that branch, e.g. `feat/phase2b-f-unified-producer` or wherever F was merged):
   ```bash
-  git -C /Users/vradu/Projects/se-worktrees/rune-broker switch -c feat/phase2b-a-retractable-min-max-last feature/materialized-views
-  git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp switch -c feat/phase2b-a-retractable-min-max-last feature/materialized-views
+  git -C /Users/vradu/Projects/se-worktrees/rune-broker switch -c feat/phase2b-a-retractable-min-max-last <F-tip>
+  git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp switch -c feat/phase2b-a-retractable-min-max-last <F-tip>
   ```
+  Verify: `grep -n "uninstallView" libs/node/src/WorkerViewSet.cpp` and `grep -n "kCatalogTopicId" libs/node/include/rune/node/CatalogPartition.h` both hit (catalog history is in).
   All broker paths below are relative to `/Users/vradu/Projects/se-worktrees/rune-broker`. Client paths are prefixed `rune-client-cpp/` and are relative to `/Users/vradu/Projects/se-worktrees/`.
 - **Broker builds:** `build-fast` (Ninja, Debug, `BUILD_TESTING=ON`, already configured). Benchmarks use `build-bench-rel` (Ninja, `-O3 -DNDEBUG`, `BUILD_BENCHMARKS=ON`, already configured). If either directory is missing, configure it with `cmake -S . -B build-fast -G Ninja -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON -DCMAKE_TOOLCHAIN_FILE=build/Debug/generators/conan_toolchain.cmake -DCMAKE_PREFIX_PATH="$PWD/build/Debug/generators"`; for benchmarks, add `-DBUILD_BENCHMARKS=ON -DCMAKE_CXX_FLAGS_DEBUG="-O3 -DNDEBUG"` and use `-B build-bench-rel`.
 - **Client build:** `rune-client-cpp/build` (Unix Makefiles, Debug, `BUILD_TESTING=ON`, `BUILD_EXAMPLES=ON`, already configured). `cmake --build build` re-runs configure when `CMakeLists.txt` changes.
-- **Gate before every commit (CLAUDE.md #7):** run the full `*Regression*` suite of each touched repo first, then that task's own tests. Broker: `ctest --test-dir build-fast -R Regression --output-on-failure`. Client: `ctest --test-dir build -R Regression --output-on-failure`. Every fix gets a test whose suite or name contains `Regression`.
+- **Test gate (CLAUDE.md #7):** each task runs the executables covering what it touches plus every new or changed test (its "Run" step names the filter, `-j14`). The FULL `*Regression*` suite runs at the checkpoints — after Task 4 (layout), after Task 7 (fold + worker), after Task 9 (before the final review) — in each touched repo (broker `ctest --test-dir build-fast -R Regression --output-on-failure -j14`, client `ctest --test-dir build -R Regression --output-on-failure -j14`), also under ASan+UBSan and TSan (broker `build-asan` / `build-tsan`, client `build_tsan` with `BUILD_TESTING=ON`). A checkpoint failure is bisected over the commits since the last green checkpoint. Where a task's own step below still says "run the full Regression suite before committing", the per-task affected-area run is what binds; the full suite belongs to the checkpoint. Every fix gets a test whose suite or name contains `Regression`.
 - Nothing is pushed. Every commit message ends with the trailer `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 
 ## Global Constraints
@@ -37,6 +47,11 @@
 - Wire enums are append-only. Persistence: no new tables and no format change. Recovery is unchanged.
 - Inconsistent state (a link to a missing contributor, or a rescan whose non-null count does not match) increments `aggInconsistent`. It never crashes and never invents state.
 - §14.0 gate (typical-case fold): **record p99 < 5 µs, batch p99 < 10 µs, zero steady-state allocation.** The extreme-retraction benchmark (groups of 1k and 10k contributors) is **reported, not gated**.
+
+## Decisions (added 2026-10-19)
+
+- **AD1 — Mixed-version clusters:** a view using `Min` / `Max` / `Last` / `LastNonNull` is created only once **every** broker runs a build with Part A. `CreateView` events are applied on every broker from `__catalog` (the leader validates and compiles; each broker installs from the event's `compiledPlanBlob`), and a pre-A broker cannot install such a plan. A ships no wire/version negotiation for this (pre-1.0, rolling upgrades of the view engine are not supported yet): the release note says "upgrade every broker before creating a view with min/max/last". Task 1 already retargets `ViewPlanRegression.UnknownRuleValueIsRejected` to byte 9 (one past `LastNonNull`), so an unknown future rule still fails closed; Task 9's commit adds the release-note line to `docs/release-notes/` (one file, `phase2b-a-retractable-aggregates.md`).
+- **AD2 — No catalog format change:** nothing in A touches `rune_catalog` (event layout, fingerprints, golden logs); `CatalogGoldenRegression.*` must pass unchanged — run `ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-codec/build -R CatalogGolden` at each checkpoint as the proof.
 
 ## Review Focus
 
@@ -77,9 +92,9 @@ Also pinned: 2a views are unchanged, by `AggStateRegression.TwoAOnlyLayoutIsUnch
 - Modify: `libs/view/include/rune/view/ViewTypes.h:6-8`
 - Modify: `libs/view/src/ViewPlan.cpp:124-126`
 - Modify: `libs/view/tests/view/ViewPlanTest.cpp:240-246`
-- Modify: `rune-client-cpp/include/rune/client/view/ViewPlanAuthor.h:38-44`
+- Modify: `rune-client-cpp/include/rune/client/view/ViewPlanAuthor.h:40-46` (the comment block starting `// Mirrors rune::view::MergeRule` and the enum)
 - Create: `rune-client-cpp/tests/client/ViewPlanAuthorTest.cpp`
-- Modify: `rune-client-cpp/CMakeLists.txt:833-837` (the `rune_schema_codec_smoke_tests` target)
+- Modify: `rune-client-cpp/CMakeLists.txt:918-922` (the `rune_schema_codec_smoke_tests` target; anchor `add_executable(rune_schema_codec_smoke_tests`)
 
 **Interfaces:**
 - Produces: `enum class MergeRule : uint8_t { Replace, Count, Sum, Avg, Min, Max, Last, CountAll, LastNonNull };` (`LastNonNull == 8`) in both `rune::view` and `rune::client::view`.
@@ -163,7 +178,7 @@ TEST(ViewPlanAuthorRegression, LastNonNullIsAppendedAtWireValue8) {
 }
 ```
 
-In `rune-client-cpp/CMakeLists.txt`, replace the `rune_schema_codec_smoke_tests` block (lines 833–837) with:
+In `rune-client-cpp/CMakeLists.txt`, replace the `rune_schema_codec_smoke_tests` block (lines 918–922; anchor `add_executable(rune_schema_codec_smoke_tests`) with:
 
 ```cmake
     add_executable(rune_schema_codec_smoke_tests
@@ -178,7 +193,7 @@ In `rune-client-cpp/CMakeLists.txt`, replace the `rune_schema_codec_smoke_tests`
 Run: `cmake --build rune-client-cpp/build --target rune_schema_codec_smoke_tests`
 Expected: compile error `no member named 'LastNonNull'`.
 
-- [ ] **Step 6: Implement the client mirror.** In `rune-client-cpp/include/rune/client/view/ViewPlanAuthor.h`, replace lines 38–44 (the comment and the enum) with:
+- [ ] **Step 6: Implement the client mirror.** In `rune-client-cpp/include/rune/client/view/ViewPlanAuthor.h`, replace lines 40–46 (the comment starting `// Mirrors rune::view::MergeRule` and the enum) with:
 
 ```cpp
 // Mirrors rune::view::MergeRule (libs/view/include/rune/view/ViewTypes.h).
@@ -1989,7 +2004,7 @@ git commit -m "test(view): pin the linked fold's exact per-record dirty bound; m
 ### Task 7: Worker — per-pass cap from the derived bound; restart regression
 
 **Files:**
-- Modify: `libs/node/src/WorkerViewSet.cpp:130-148` (`maxRecordsPerPassFor`)
+- Modify: `libs/node/src/WorkerViewSet.cpp:132-` (`maxRecordsPerPassFor`: its comment starts at 132, the function at 136)
 - Test: `libs/node/tests/node/WorkerViewSetTest.cpp` (append)
 
 **Interfaces:**
@@ -2023,7 +2038,7 @@ TEST(WorkerViewSetRegression, RestartThenRetractingTheMaxIsExactRegression) {
     auto comp = rune::view::compileView(userMaxPlan(0), srcs, 0x4000000A).value();
 
     rune::node::ViewSnapshotChannel ch1;
-    rune::node::WorkerViewSet vs1(ch1, "/tmp/rune-views-max-rec");
+    rune::node::WorkerViewSet vs1(ch1, tmpDir("rune-views-max-rec"));
     vs1.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true);
     const auto b1 = orderBatch(0, {{1, 100, 10}, {2, 100, 50}, {3, 100, 30}});
     auto rr1 = [&](int64_t, int64_t) { return rune::storage::LogReadView{b1.data(), b1.size(), 0, 3}; };
@@ -2034,7 +2049,7 @@ TEST(WorkerViewSetRegression, RestartThenRetractingTheMaxIsExactRegression) {
     EXPECT_EQ(magic, rune::view::kViewCheckpointMagicV2) << "no new format: still the v2 record";
 
     rune::node::ViewSnapshotChannel ch2;
-    rune::node::WorkerViewSet vs2(ch2, "/tmp/rune-views-max-rec");
+    rune::node::WorkerViewSet vs2(ch2, tmpDir("rune-views-max-rec"));
     const std::span<const uint8_t> recs[] = {deltas[0]};
     vs2.installViewForRecovery(comp.plan, comp.rowLayout, src, /*persisted*/ true, /*partition*/ 0,
                                /*base*/ {}, recs, /*committedTail*/ 3);
@@ -2084,7 +2099,7 @@ TEST(WorkerViewSetRegression, PersistedRetractableMovesDeltasFitTheRingRegressio
     };
 
     rune::node::ViewSnapshotChannel ch;
-    rune::node::WorkerViewSet vs(ch, "/tmp/rune-views-max-large");
+    rune::node::WorkerViewSet vs(ch, tmpDir("rune-views-max-large"));
     vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true);
     std::vector<std::vector<uint8_t>> deltas;
     ASSERT_NO_THROW(driveToEnd(vs, ch, 6, rr, total, deltas));
@@ -2116,7 +2131,7 @@ Add `#include <algorithm>` and `#include <climits>` to the file's includes if th
 Run: `cmake --build build-fast -j --target rune_node_tests && ctest --test-dir build-fast -R 'WorkerViewSetRegression\.(RestartThenRetracting|PersistedRetractableMoves)' --output-on-failure`
 Expected: `PersistedRetractableMovesDeltasFitTheRingRegression` **fails**. `ASSERT_NO_THROW` reports the ring's oversized-claim exception: the 2a formula gives 366 B per record, so a pass covers about 358 move records, which really dirty 528 B each, about 189 KB, over the 128 KiB max message. `RestartThenRetractingTheMaxIsExactRegression` already passes on Task 5's fold. That is expected: it guards the recovery path, which needs no code change.
 
-- [ ] **Step 3: Implement.** In `libs/node/src/WorkerViewSet.cpp`, replace the comment and body of `maxRecordsPerPassFor` (lines 130–148) with:
+- [ ] **Step 3: Implement.** In `libs/node/src/WorkerViewSet.cpp`, replace the comment (from `// Most source records one fold pass may cover`) and the body of `maxRecordsPerPassFor` with:
 
 ```cpp
 // Most source records one fold pass may cover so the pass's checkpoint delta
@@ -2406,8 +2421,9 @@ git commit -m "bench(view): §14.0 gate for the retractable fold; report extreme
 ### Task 9: e2e — `user_totals` gains `max`, `min`, `last` across the restart
 
 **Files:**
-- Modify: `rune-client-cpp/examples/view_probe.cpp` (header comment `:52-57`; helpers `:251-332`; setup leg `:463-464`; verify leg `:556-564`)
-- Modify: `docker/view-engine-e2e.sh` (header comment `:23-26`, `:44-48`; banner `:402-403`)
+- Modify: `rune-client-cpp/examples/view_probe.cpp` (anchors: the header comment item `//     (d) Phase 2a: the PERSISTED aggregate view user_totals` (~line 59); the helpers `userTotalsPlan` / `userTotalsRowLayout` / `waitForTotals` (~321–380); the setup leg's `"user_totals u100 (initial)"` call (~1272); the verify leg from `// ---- (d) aggregate view recovered` (~1453))
+- Modify: `docker/view-engine-e2e.sh` (anchors: header item `#     5. Phase 2a: defineTopic "order"` (lines 23–26); header item `#     (d) user_totals recovered from its v2 checkpoint` (lines 48–51); the banner `log "  -> user_totals (Count(*)/Sum/Avg) recovered` + the next line (~558–559))
+- Create: `docs/release-notes/phase2b-a-retractable-aggregates.md` (Min / Max / Last / LastNonNull; AD1: upgrade every broker before creating such a view)
 
 **Interfaces:**
 - Consumes: everything above, on the real Aeron broker. The handoff env vars are unchanged (same view).
@@ -2518,7 +2534,7 @@ with
                                "user_totals u100 (post-restart max retraction rescans)")) return 46;
 ```
 
-Update the header comment item `(d)` (lines 52–57) to read:
+Update the header comment item `(d)` (the 6 lines from `//     (d) Phase 2a: the PERSISTED aggregate view user_totals`, ~59–64) to read:
 
 ```cpp
 //     (d) Phase 2a/2b: the PERSISTED aggregate view user_totals (GROUP BY userId:
@@ -2532,7 +2548,7 @@ Update the header comment item `(d)` (lines 52–57) to read:
 
 Build: `cmake --build rune-client-cpp/build --target view_probe`. Expected: it compiles.
 
-- [ ] **Step 4: e2e script text.** In `docker/view-engine-e2e.sh`, replace lines 23–26 with:
+- [ ] **Step 4: e2e script text.** In `docker/view-engine-e2e.sh`, replace the header item 5 (lines 23–26, from `#     5. Phase 2a: defineTopic "order"`) with:
 
 ```bash
 #     5. Phase 2a/2b: defineTopic "order" {orderId key, userId, amount}; createView
@@ -2541,7 +2557,7 @@ Build: `cmake --build rune-client-cpp/build --target view_probe`. Expected: it c
 #        move o3->(u100,5) -> u100 = {3, 85, 85/3, 50, 5, 5}, u200 AbsentKey.
 ```
 
-Replace lines 44–48 with:
+Replace the header item `(d)` (lines 48–51, from `#     (d) user_totals recovered from its v2 checkpoint`) with:
 
 ```bash
 #     (d) user_totals recovered from its v2 checkpoint: u100 = {3, 85, 85/3, 50,
@@ -2551,7 +2567,7 @@ Replace lines 44–48 with:
 #         contributor map, MRU lists and caches all survived the restart.
 ```
 
-Replace the two banner lines 402–403 with:
+Replace the two banner lines (`log "  -> user_totals (Count(*)/Sum/Avg) recovered …"` and `log "     + post-restart update retracts OK"`, ~558–559) with:
 
 ```bash
 log "  -> user_totals (Count(*)/Sum/Avg/Max/Min/Last) recovered from its v2 checkpoint (VIEW-RECOVERED format=v2, O>0)"
@@ -2561,11 +2577,10 @@ log "     + post-restart update retracts the pre-image, min and max exactly OK"
 - [ ] **Step 5: Run the e2e on the VM.** Honour `/root/vm.lock`: claim it with an owner marker and release it afterwards.
 
 ```bash
-# From /Users/vradu/Projects/se-worktrees: stage rune-broker, rune-protocol, rune-codec,
-# rune-client-cpp, rune-ql, rune-fr (git archive HEAD of each) into /root/view-engine-e2e/<repo>
-# on root@178.104.16.102 exactly as the Phase 2a e2e run did, then:
-ssh root@178.104.16.102 'cd /root/view-engine-e2e/rune-broker && bash docker/view-engine-e2e.sh'
+rsync -a --delete /Users/vradu/Projects/se-worktrees/ root@178.104.16.102:/root/se-worktrees/
+ssh root@178.104.16.102 'flock /root/vm.lock bash -c "cd /root/se-worktrees/rune-broker && bash docker/view-engine-e2e.sh"'
 ```
+(The script is authenticated since the auth phase — it bootstraps through `docker/lib/auth.sh` and passes `RUNE_USER` / `RUNE_PASSWORD_FILE` to the probe; change nothing there.)
 
 Expected: `VIEW-ENGINE-E2E: OK`, `SCRIPT_EXIT=0`, and six `user_totals` PROBE lines: initial, the u200 group move, recovered, u200 post-restart, pre-image + min, and max retraction.
 
@@ -2576,7 +2591,7 @@ Run: `ctest --test-dir build-fast -R Regression --output-on-failure` and `ctest 
 ```bash
 git -C ../rune-client-cpp add examples/view_probe.cpp
 git -C ../rune-client-cpp commit -m "test(view-probe): user_totals gains max/min/last; post-restart retraction of min and max" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
-git add docker/view-engine-e2e.sh
+git add docker/view-engine-e2e.sh docs/release-notes/phase2b-a-retractable-aggregates.md
 git commit -m "test(view): e2e covers retractable Min/Max/Last across a broker restart" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
@@ -2630,3 +2645,7 @@ git commit -m "test(view): e2e covers retractable Min/Max/Last across a broker r
 6. **Unused 2a accumulator bytes.** In linked views, each Min/Max/Last/LastNonNull column still occupies its 16-byte 2a accumulator slot in the group row, and that slot is unused. This keeps one group-row shape for both phases. If row compactness matters more than uniformity, the slots could be packed per rule.
 7. **`FoldStats::aggRescans`** is a new observability counter not named in the spec. It is used by tests (to show a rescan was skipped) and benchmarks. It is not surfaced in `ViewFoldCounters`.
 8. **Naming.** The controller gave the slug `a-retractable-min-max-last`. The plan file and branch use `…-phase2b-a-retractable-min-max-last` and `feat/phase2b-a-retractable-min-max-last`, which avoids a doubled `a-a-`.
+
+### Spec gaps found 2026-10-19
+
+- **G1 — Mixed-version brokers and new merge rules** (spec §A is silent): a `CreateView` with a rule a broker's build does not know is replicated to it through `__catalog`. Resolved by AD1 (upgrade every broker first; documented; the unknown-rule rejection stays fail-closed).
