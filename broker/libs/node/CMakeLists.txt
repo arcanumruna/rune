@@ -1678,6 +1678,14 @@ if(BUILD_TESTING)
                               GTest::gtest_main)
         gtest_discover_tests(rune_auth_enforcement_tests PROPERTIES TIMEOUT 600)
 
+        # Authentication Task 17: the 720-cell request x grant x timing interaction matrix (spec section 11) against ONE
+        # real authenticating broker (shard runtime); the expectations are support/AuthMatrixExpectations.h.
+        add_executable(rune_auth_matrix_tests tests/node/AuthInteractionMatrixRegressionTest.cpp)
+        target_include_directories(rune_auth_matrix_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_auth_matrix_tests PRIVATE rune_node rune_view rune_codec rune_catalog aeron::aeron
+                              GTest::gtest_main)
+        gtest_discover_tests(rune_auth_matrix_tests DISCOVERY_TIMEOUT 60 PROPERTIES TIMEOUT 900 LABELS matrix)
+
         # Authentication Task 13: shard-mode produce straight to the worker ingress against ONE real authenticating
         # broker (the worker's WRITE bitmaps shipped on the lifecycle ring) + the zero-allocation gates.
         add_executable(rune_shard_auth_produce_tests tests/integration/ShardAuthProduceTest.cpp)

@@ -111,8 +111,9 @@ public:
     }
 
     // ── DDL as the builder (precondition setup) ─────────────────────────────────────────────────────────────
-    int32_t defineTopic(int64_t sid, const std::string& name) {
-        const auto r = c().awaitDefine(c().sendDefineTopic(ch(), stream(), sid, name, 1, authRigCharBlob()), dl(20));
+    int32_t defineTopic(int64_t sid, const std::string& name, bool typed = true) {
+        const auto r = c().awaitDefine(c().sendDefineTopic(ch(), stream(), sid, name, 1,
+                                                           typed ? authRigCharBlob() : std::vector<uint8_t>{}), dl(20));
         return r && r->errorCode == 0 ? r->topicId : -1;
     }
     int32_t createView(int64_t sid, const std::string& name, int32_t source) {
