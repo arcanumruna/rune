@@ -83,6 +83,9 @@ inline Broker spawnBrokerIn(const fs::path& dir, int logSeq, const SpawnOptions&
         env.push_back("RUNE_WORKER_EGRESS_CONTROL_BASE_PORT=" + eg);
         env.push_back("RUNE_DATA_DIR=" + b.dataDir().string());
         env.push_back("RUNE_AERON_DIR=" + (b.dir / "aeron").string());
+        // Authentication defaults to ON (a cluster key file is then required); these process tests are about the
+        // broker's lifecycle / storage format, on one node - dev mode, explicitly (a test may override via extraEnv).
+        env.push_back("RUNE_AUTH=disabled");
     }
     for (const auto& e : o.extraEnv) env.push_back(e);
     std::vector<char*> envp;

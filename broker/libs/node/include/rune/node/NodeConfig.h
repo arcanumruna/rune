@@ -169,6 +169,12 @@ struct ClientEndpoint {
     int32_t     streamId = 0;
 };
 
+/// Authentication mode (authentication plan D31).  A NodeConfig built in code (every in-process test, every embedder)
+/// is InProcessUnauthenticated: anonymous sessions with full access and plaintext inter-broker links, byte-identical
+/// to the pre-authentication broker.  `parseNodeConfig` yields only Enabled (RUNE_AUTH unset / "enabled") or
+/// DevDisabled (RUNE_AUTH=disabled; single node only); `src/main.cpp` refuses InProcessUnauthenticated.
+enum class AuthMode : uint8_t { InProcessUnauthenticated = 0, Enabled = 1, DevDisabled = 2 };
+
 struct NodeConfig {
     /// "Derive from the host" sentinel for the Aeron transport sizes (mtu, socket
     /// buffer, receive window) — resolved once at BrokerNode::start() by
@@ -474,6 +480,21 @@ struct NodeConfig {
     // plaintext.  Default false (back-compat: plaintext clients are served
     // plaintext).  RUNE_REQUIRE_TLS env var (RUNE_TLS build only).
     bool requireTls = false;
+
+    // --- Authentication (authentication plan Task 9; spec §8 / §9) ---------------------------------------------
+    //   RUNE_AUTH                   — "enabled" (default when unset) | "disabled" (dev mode: single node only; every
+    //                                 request runs as 'anonymous' with full access; warned at start and every 5 min).
+    //   RUNE_CLUSTER_KEY_FILE       — required when enabled (single node included): the shared cluster key; the file
+    //                                 must hold >= 32 bytes after trailing whitespace is trimmed (checked at start by
+    //                                 validateAuth, not by parse).
+    //   RUNE_CLUSTER_KEY_FILE_NEXT  — optional: the key a rolling restart rotates to (a broker accepts both).
+    //   RUNE_AUTH_TIMEOUT_MS        — a session that has not authenticated within this is ended (default 10 000).
+    //   RUNE_PEER_AUTH_STREAM_ID    — the inter-broker handshake stream (default 40).
+    AuthMode    authMode = AuthMode::InProcessUnauthenticated;
+    std::string clusterKeyFile;
+    std::string clusterKeyFileNext;
+    int64_t     authTimeoutMs    = 10'000;
+    int32_t     peerAuthStreamId = 40;
 
     // Milestone E1: number of in-process partition workers. Each owned shard is
     // assigned to worker = hash(shardId) % workerCount (ShardRouter). Default 1
@@ -946,6 +967,15 @@ struct NodeConfig {
     /// nullopt = valid; else the error.  Checked by parseNodeConfig and by
     /// BrokerNode at start (programmatic configs).
     std::optional<std::string> validateCatalogStream() const;
+
+    /// Authentication plan Task 9 (D31/D32).  nullopt = valid; else the explicit refusal naming the variable:
+    ///   * DevDisabled with more than one peer ("RUNE_AUTH=disabled (dev mode) refuses to start as part of a
+    ///     multi-broker cluster (RUNE_PEERS lists N brokers); enable authentication");
+    ///   * Enabled: RUNE_CLUSTER_KEY_FILE (and RUNE_CLUSTER_KEY_FILE_NEXT when set) must exist, be readable and hold
+    ///     >= 32 bytes after trimming (reads the file(s) — cold, startup thread).  A group/world-readable key file
+    ///     is logged once (warned, not refused: Kubernetes secrets mount 0644).
+    /// InProcessUnauthenticated reads nothing.  Checked by BrokerNode::start (programmatic configs too) and main.
+    std::optional<std::string> validateAuth() const;
 
     /// Refuses an Aeron dir that would destroy the log: the embedded driver runs
     /// with dir_delete_on_start + delete-on-shutdown and recursively deletes its

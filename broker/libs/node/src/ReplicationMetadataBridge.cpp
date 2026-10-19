@@ -224,48 +224,59 @@ void ReplicationMetadataBridge::routeHoldLeadership_(rune::replication::Partitio
     }
 }
 
-void ReplicationMetadataBridge::postCatalogRole_(bool leader,
-                                                 const rune::metadata::PartitionAssignment* pa,
-                                                 int32_t msgType) noexcept
+void ReplicationMetadataBridge::postAdminLogRole_(int32_t topicId, bool leader,
+                                                  const rune::metadata::PartitionAssignment* pa,
+                                                  bool hold) noexcept
 {
+    const std::size_t ix = adminLogIndex_(topicId);
+    const bool security = ix == 1;
+    const char* log = security ? "__security" : "__catalog";
+    const int32_t roleType = security ? kMsgSecurityRole : kMsgCatalogRole;
+    const int32_t msgType = hold ? (security ? kMsgSecurityHoldLeadership : kMsgCatalogHoldLeadership) : roleType;
     AdminRoleMsg m;
     m.leader         = leader;
     m.epoch          = pa ? pa->leaderEpoch : 0;
-    m.leaderId       = (pa && msgType == kMsgCatalogRole) ? pa->leaderNode : rune::metadata::NO_LEADER;
+    m.leaderId       = (pa && !hold) ? pa->leaderNode : rune::metadata::NO_LEADER;
     m.partitionEpoch = pa ? pa->partitionEpoch : -1;
     if (leader && pa) {
         // Bounded by construction: replicas = every broker <= kMaxReplicas (16).
         const std::size_t n = std::min<std::size_t>(pa->isr.size(), AdminRoleMsg::kMaxIsr);
         if (n < pa->isr.size()) [[unlikely]]
-            spdlog::error("ReplicationMetadataBridge: __catalog ISR of {} members exceeds {} — "
+            spdlog::error("ReplicationMetadataBridge: {} ISR of {} members exceeds {} — "
                           "truncated (configuration beyond the replica bound)",
-                          pa->isr.size(), AdminRoleMsg::kMaxIsr);
+                          log, pa->isr.size(), AdminRoleMsg::kMaxIsr);
         m.isrCount = static_cast<int32_t>(n);
         for (std::size_t i = 0; i < n; ++i) m.isr[i] = pa->isr[i];
     }
-    if (catalogRolePending_) {          // keep order: the newer absolute role supersedes the held one
-        catalogRolePending_ = PendingCatalogRole{m, msgType};
+    auto& pending = adminRolePending_[ix];
+    if (pending) {          // keep order: the newer absolute role supersedes the held one (of the SAME log)
+        pending = PendingAdminRole{m, msgType};
         return;
     }
     if (catalogRoleRing_ != nullptr && encodeAdminRole(*catalogRoleRing_, m, msgType)) {
-        ++catalogRolesPosted_;
+        ++adminRolesPosted_[ix];
         return;
     }
-    catalogRolePending_ = PendingCatalogRole{m, msgType};
-    if (catalogRolesHeld_++ % 1024 == 0)
-        spdlog::warn("ReplicationMetadataBridge: __catalog role (leader={} epoch={} leaderId={}) held — "
+    pending = PendingAdminRole{m, msgType};
+    if (adminRolesHeld_[ix]++ % 1024 == 0)
+        spdlog::warn("ReplicationMetadataBridge: {} role (leader={} epoch={} leaderId={}) held — "
                      "admin role ring {}; retried every cycle (held so far: {})",
-                     m.leader, m.epoch, m.leaderId,
-                     catalogRoleRing_ ? "full" : "not wired yet", catalogRolesHeld_);
+                     log, m.leader, m.epoch, m.leaderId,
+                     catalogRoleRing_ ? "full" : "not wired yet", adminRolesHeld_[ix]);
 }
 
-int ReplicationMetadataBridge::flushCatalogRole_() noexcept
+int ReplicationMetadataBridge::flushAdminLogRoles_() noexcept
 {
-    if (!catalogRolePending_ || catalogRoleRing_ == nullptr) return 0;
-    if (!encodeAdminRole(*catalogRoleRing_, catalogRolePending_->m, catalogRolePending_->msgType)) return 0;
-    catalogRolePending_.reset();
-    ++catalogRolesPosted_;
-    return 1;
+    int flushed = 0;
+    for (std::size_t ix = 0; ix < adminRolePending_.size(); ++ix) {
+        auto& pending = adminRolePending_[ix];
+        if (!pending || catalogRoleRing_ == nullptr) continue;
+        if (!encodeAdminRole(*catalogRoleRing_, pending->m, pending->msgType)) continue;
+        pending.reset();
+        ++adminRolesPosted_[ix];
+        ++flushed;
+    }
+    return flushed;
 }
 
 } // namespace rune::node

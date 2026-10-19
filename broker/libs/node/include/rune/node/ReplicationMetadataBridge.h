@@ -60,7 +60,9 @@
 //   replicationIsLeaderForTest / replicationEpochForTest post a control task).
 
 #include <rune/node/AdminChannels.h>      // AdminRoleMsg (catalog history Task 6)
+#include <array>
 #include <rune/node/CatalogPartition.h>   // kCatalogTopicId
+#include <rune/node/SecurityPartition.h>  // kSecurityTopicId (auth Task 9)
 #include <rune/node/OneToOneByteRing.h>
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/node/WorkerOp.h>
@@ -180,9 +182,14 @@ public:
     void setCatalogRoleRing(OneToOneByteRing* ring) noexcept { catalogRoleRing_ = ring; }
     /// A catalog role is held (ring full / not wired).  Duty-cycle thread — the
     /// controller-answer relay holds its answer behind it (FIFO, fix round 1 M3).
-    [[nodiscard]] bool catalogRolePending() const noexcept { return catalogRolePending_.has_value(); }
+    [[nodiscard]] bool catalogRolePending() const noexcept { return adminRolePending_[0].has_value(); }
     [[nodiscard]] bool catalogRolePendingForTest() const noexcept { return catalogRolePending(); }
-    [[nodiscard]] uint64_t catalogRolesPostedForTest() const noexcept { return catalogRolesPosted_; }
+    [[nodiscard]] uint64_t catalogRolesPostedForTest() const noexcept { return adminRolesPosted_[0]; }
+    /// Authentication Task 9 (D39): the `__security` replica (-7, 0) rides the SAME admin role ring beside
+    /// `__catalog`'s (kMsgSecurityRole / kMsgSecurityHoldLeadership); each log has its own held-role slot (a newer
+    /// role of one log never supersedes the other's).
+    [[nodiscard]] bool securityRolePending() const noexcept { return adminRolePending_[1].has_value(); }
+    [[nodiscard]] uint64_t securityRolesPostedForTest() const noexcept { return adminRolesPosted_[1]; }
 
     // -----------------------------------------------------------------------
     // doWork — single duty-cycle step.
@@ -217,7 +224,7 @@ public:
         // (back-pressure / full ring) are retried every cycle, in order, until
         // delivered — never silently dropped.  Time-independent (no timers).
         int work = flushPendingRoleOps_();
-        if (catalogRolePending_) [[unlikely]] work += flushCatalogRole_();
+        if (adminRolePending_[0] || adminRolePending_[1]) [[unlikely]] work += flushAdminLogRoles_();
 
         // ── Step A: INTERNAL partitions ──────────────────────────────────────
         // Drive internal partitions (topicId < 0) from cluster-consensus
@@ -504,14 +511,14 @@ private:
             const auto* hp = currentMap.get(key.topicId, key.partition);
             if (!hp) return;
             ++leaderRolesHeld_;
-            if (key.topicId == kCatalogTopicId) { postCatalogRole_(false, hp, kMsgCatalogHoldLeadership); return; }
+            if (isAdminLogTopic_(key.topicId)) { postAdminLogRole_(key.topicId, false, hp, /*hold=*/true); return; }
             auto* held = registry_.lookup(key.topicId, key.partition);
             if (!held) { noteRoleWithoutReplica_(key); return; }
             routeHoldLeadership_(held, hp->leaderEpoch, hp->partitionEpoch);
             return;
         }
-        if (key.topicId == kCatalogTopicId) {   // Task 6: admin-owned — relay on the role ring
-            if (const auto* pa = currentMap.get(key.topicId, key.partition)) postCatalogRole_(true, pa);
+        if (isAdminLogTopic_(key.topicId)) {   // Task 6 / auth Task 9: admin-owned — relay on the role ring
+            if (const auto* pa = currentMap.get(key.topicId, key.partition)) postAdminLogRole_(key.topicId, true, pa);
             return;
         }
         auto* replica = registry_.lookup(key.topicId, key.partition);
@@ -538,8 +545,8 @@ private:
         const rune::metadata::PartitionKey& key,
         const rune::metadata::AssignmentMap& currentMap) noexcept
     {
-        if (key.topicId == kCatalogTopicId) {   // Task 6: admin-owned — relay on the role ring
-            postCatalogRole_(false, currentMap.get(key.topicId, key.partition));
+        if (isAdminLogTopic_(key.topicId)) {   // Task 6 / auth Task 9: admin-owned — relay on the role ring
+            postAdminLogRole_(key.topicId, false, currentMap.get(key.topicId, key.partition));
             return;
         }
         auto* replica = registry_.lookup(key.topicId, key.partition);
@@ -605,21 +612,28 @@ private:
     // Fields
     // -----------------------------------------------------------------------
 
-    // F26: __catalog (-6) is on the controller-ISR path with the coordinator
-    // partitions — otherwise mapDriven_ never forwards its assignment.
-    [[nodiscard]] static constexpr bool isCoordinatorTopic_(int32_t t) noexcept {
-        return t == -1 || t == -2 || t == kCatalogTopicId;
+    // F26: __catalog (-6) and __security (-7) are on the controller-ISR path with the coordinator
+    // partitions — otherwise mapDriven_ never forwards their assignments.
+    [[nodiscard]] static constexpr bool isAdminLogTopic_(int32_t t) noexcept {
+        return t == kAdminLogCatalogTopicId || t == kAdminLogSecurityTopicId;
     }
-    // Catalog history Task 6 (see setCatalogRoleRing).  Defined in the .cpp.
-    /// `msgType` = kMsgCatalogRole, or kMsgCatalogHoldLeadership (ISR v3 Step 10: the held leader role, leaderId -1).
-    void postCatalogRole_(bool leader, const rune::metadata::PartitionAssignment* pa,
-                          int32_t msgType = kMsgCatalogRole) noexcept;
-    int  flushCatalogRole_() noexcept;
+    [[nodiscard]] static constexpr bool isCoordinatorTopic_(int32_t t) noexcept {
+        return t == -1 || t == -2 || isAdminLogTopic_(t);
+    }
+    // Catalog history Task 6 (see setCatalogRoleRing); generalized over the admin logs by auth Task 9 (D39).
+    // Defined in the .cpp.  `hold` = ISR v3 Step 10: the held leader role (leaderId -1), kMsg{Catalog,Security}HoldLeadership;
+    // otherwise the log's kMsg{Catalog,Security}Role.
+    void postAdminLogRole_(int32_t topicId, bool leader, const rune::metadata::PartitionAssignment* pa,
+                           bool hold = false) noexcept;
+    int  flushAdminLogRoles_() noexcept;
+    [[nodiscard]] static constexpr std::size_t adminLogIndex_(int32_t topicId) noexcept {
+        return topicId == kAdminLogSecurityTopicId ? 1u : 0u;
+    }
     OneToOneByteRing*                              catalogRoleRing_    = nullptr;
-    struct PendingCatalogRole { AdminRoleMsg m; int32_t msgType; };
-    std::optional<PendingCatalogRole>              catalogRolePending_;
-    uint64_t                                       catalogRolesPosted_ = 0;
-    uint64_t                                       catalogRolesHeld_   = 0;
+    struct PendingAdminRole { AdminRoleMsg m; int32_t msgType; };
+    std::array<std::optional<PendingAdminRole>, 2> adminRolePending_{};   // [0] __catalog, [1] __security
+    std::array<uint64_t, 2>                        adminRolesPosted_{};
+    std::array<uint64_t, 2>                        adminRolesHeld_{};
     [[nodiscard]] bool mapDriven_(int32_t t) const noexcept {
         return t >= 0 || (coordinatorOnController_ && isCoordinatorTopic_(t));
     }

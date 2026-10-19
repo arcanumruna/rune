@@ -153,6 +153,15 @@ inline constexpr std::int32_t kStorageGateStateCounterTypeId      = 1'000'222;
 inline constexpr std::int32_t kLeaderRolesHeldCounterTypeId       = 1'000'223;
 inline constexpr std::int32_t kStoragePendingNodesCounterTypeId   = 1'000'224;
 inline constexpr std::int32_t kLostCommittedReportsCounterTypeId  = 1'000'225;
+// Authentication Task 9 (counter ids assigned once - Global Constraints): 226 = the `__security` apply halted (the
+// halted offset + 1; 0 = applying), 227 = the `__security` applied offset (-1 = none), 228 = the auth mode
+// (0 enabled, 1 dev-disabled; in-process configs publish 0).  Same key (node id) as the catalog counters.
+inline constexpr std::int32_t kSecurityApplyHaltedCounterTypeId   = 1'000'226;
+inline constexpr std::int32_t kSecurityAppliedOffsetCounterTypeId = 1'000'227;
+inline constexpr std::int32_t kAuthModeCounterTypeId              = 1'000'228;
+inline std::string securityApplyHaltedLabel(std::int32_t nodeId) { return "rune-security-apply-halted node=" + std::to_string(nodeId); }
+inline std::string securityAppliedOffsetLabel(std::int32_t nodeId) { return "rune-security-applied-offset node=" + std::to_string(nodeId); }
+inline std::string authModeLabel(std::int32_t nodeId) { return "rune-auth-mode node=" + std::to_string(nodeId); }
 inline std::string storageGateStateLabel(std::int32_t nodeId) { return "rune-storage-gate-state node=" + std::to_string(nodeId); }
 inline std::string leaderRolesHeldLabel(std::int32_t nodeId) { return "rune-leader-roles-held node=" + std::to_string(nodeId); }
 inline std::string storagePendingNodesLabel(std::int32_t nodeId) { return "rune-storage-pending-nodes node=" + std::to_string(nodeId); }

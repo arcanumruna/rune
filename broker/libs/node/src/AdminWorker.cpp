@@ -321,6 +321,18 @@ void AdminWorker::adoptBootedApplier(CatalogApplier booted, LiveEffects live) {
     pendingLive_ = std::move(live);
 }
 
+void AdminWorker::attachSecurity(SecurityApplier booted, rune::replication::PartitionReplica* replica,
+                                 SecurityLiveEffects live) {
+    if (booted.phaseName() != "Booted")
+        throw std::runtime_error("AdminWorker::attachSecurity: the SecurityApplier is in phase " +
+                                 std::string{booted.phaseName()} + ", not Booted - the startup thread must replay "
+                                 "the local __security prefix first (refusing to start)");
+    securityApplier_.emplace(std::move(booted));
+    securityReplica_ = replica;
+    securityAdmin_.emplace(*securityApplier_, replica, selfId_);
+    pendingSecurityLive_ = std::move(live);
+}
+
 void AdminWorker::deferTopicDirReconcile(std::string dataDir) {
     bootReconcile_ = AwaitingCatchUp{std::move(dataDir), false};
 }
@@ -541,14 +553,27 @@ int AdminWorker::doWork(int64_t nowNs) {
         pendingLive_.reset();
         ++work;
     }
+    if (pendingSecurityLive_) [[unlikely]] {   // Authentication Task 9: the booted security applier goes live, once
+        if (!securityApplier_->goLive(std::move(*pendingSecurityLive_)))
+            spdlog::critical("AdminWorker: the booted SecurityApplier refused to go live (phase {}) — __security "
+                             "will not apply", securityApplier_->phaseName());
+        pendingSecurityLive_.reset();
+        ++work;
+    }
     if (catalogPlane_ && catalogReplica_) {
         work += catalogPlane_->drivePeerResolve();
+        // ONE admin plane: frames are dispatched to the replica their topic id names (-6 catalog, -7 security).
+        const AdminLogReplicas replicas{catalogReplica_, securityReplica_};
         work += catalogPlane_->poll(kCatalogFragmentLimit,
-            [this, nowNs](int32_t topicId, int32_t partition, uint16_t templateId,
-                          const uint8_t* frame, std::size_t len) {
-                dispatchCatalogFrame(*catalogReplica_, topicId, partition, templateId, frame, len,
-                                     nowNs, catalogFrameStats_);
+            [this, nowNs, &replicas](int32_t topicId, int32_t partition, uint16_t templateId,
+                                     const uint8_t* frame, std::size_t len) {
+                dispatchAdminLogFrame(replicas, topicId, partition, templateId, frame, len, nowNs, catalogFrameStats_);
             });
+    }
+    if (securityReplica_) {
+        work += securityReplica_->doWork(nowNs);
+        if (!securityApplyHeldForTest_) [[likely]] work += securityApplier_->applyCommitted(*securityReplica_);
+        work += securityAdmin_->doWork(nowNs);
     }
     if (catalogReplica_) {
         work += catalogReplica_->doWork(nowNs);

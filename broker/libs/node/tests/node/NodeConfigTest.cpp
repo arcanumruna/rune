@@ -1,4 +1,5 @@
 #include <rune/node/NodeConfig.h>
+#include <rune/node/AuthDevMode.h>
 #include <rune/catalog/TopicName.h>
 #include <rune/node/EmbeddedDriver.h>
 #include <rune/node/HostDefaults.h>
@@ -6,6 +7,8 @@
 #include <rune/node/Worker.h>   // Worker::maxAcceptableBatchBytes (THE batch limit)
 
 #include <filesystem>
+#include <fstream>
+#include <unistd.h>
 
 #include <gtest/gtest.h>
 #include <map>
@@ -39,6 +42,7 @@ static std::map<std::string, std::string> base3node() {
         {"RUNE_PEERS",             "0@rune-1:40111,1@rune-2:40111,2@rune-3:40111"},
         {"RUNE_CLIENT_ENDPOINT",   "rune-2:50001"},
         {"RUNE_DATA_DIR",          "/data/rune"},
+        {"RUNE_CLUSTER_KEY_FILE",  "/etc/rune/cluster.key"},   // auth defaults to Enabled; parse only needs the variable
     };
 }
 
@@ -49,6 +53,7 @@ static std::map<std::string, std::string> base1node() {
         {"RUNE_PEERS",             "0@rune-1:40111"},
         {"RUNE_CLIENT_ENDPOINT",   "rune-1:50001"},
         {"RUNE_DATA_DIR",          "/data/rune"},
+        {"RUNE_CLUSTER_KEY_FILE",  "/etc/rune/cluster.key"},
     };
 }
 
@@ -1288,6 +1293,7 @@ TEST(NodeConfig, ParsesAeronMtuAndRcvWindow) {
                         {"RUNE_PEERS",            "0@h:1"},
                         {"RUNE_CLIENT_ENDPOINT",  "h:2"},
                         {"RUNE_DATA_DIR",         "/tmp/x"},
+                        {"RUNE_AUTH",             "disabled"},
                         {"RUNE_AERON_MTU",        "8192"},
                         {"RUNE_AERON_RCV_WINDOW", "262144"}});
     auto res = rune::node::parseNodeConfig(env);
@@ -1298,7 +1304,7 @@ TEST(NodeConfig, ParsesAeronMtuAndRcvWindow) {
 
 TEST(NodeConfig, ParsesAeronSendBatching) {
     std::map<std::string, std::string> base{{"RUNE_NODE_ID","0"},{"RUNE_PEERS","0@h:1"},
-        {"RUNE_CLIENT_ENDPOINT","h:2"},{"RUNE_DATA_DIR","/tmp/x"}};
+        {"RUNE_CLIENT_ENDPOINT","h:2"},{"RUNE_DATA_DIR","/tmp/x"},{"RUNE_AUTH","disabled"}};
     {
         auto res = rune::node::parseNodeConfig(fakeEnv(base));
         ASSERT_TRUE(res.config.has_value()) << res.error;
@@ -1320,7 +1326,7 @@ TEST(NodeConfig, ParsesAeronSendBatching) {
 
 TEST(NodeConfig, AeronUdpGsoDefaultsOnAndEnvTurnsItOff) {
     std::map<std::string, std::string> base{{"RUNE_NODE_ID","0"},{"RUNE_PEERS","0@h:1"},
-        {"RUNE_CLIENT_ENDPOINT","h:2"},{"RUNE_DATA_DIR","/tmp/x"}};
+        {"RUNE_CLIENT_ENDPOINT","h:2"},{"RUNE_DATA_DIR","/tmp/x"},{"RUNE_AUTH","disabled"}};
     EXPECT_TRUE(rune::node::NodeConfig{}.aeronUdpGso);
     {
         auto res = rune::node::parseNodeConfig(fakeEnv(base));
@@ -1348,7 +1354,7 @@ TEST(NodeConfig, AeronUdpGsoDefaultsOnAndEnvTurnsItOff) {
 // A7: epoll-first transport polling (rune_driver_wake.h rune_driver_epoll_poll_install) — default on, A/B-able.
 TEST(NodeConfig, AeronEpollPollDefaultsOnAndEnvTurnsItOff) {
     std::map<std::string, std::string> base{{"RUNE_NODE_ID","0"},{"RUNE_PEERS","0@h:1"},
-        {"RUNE_CLIENT_ENDPOINT","h:2"},{"RUNE_DATA_DIR","/tmp/x"}};
+        {"RUNE_CLIENT_ENDPOINT","h:2"},{"RUNE_DATA_DIR","/tmp/x"},{"RUNE_AUTH","disabled"}};
     EXPECT_TRUE(rune::node::NodeConfig{}.aeronEpollPoll);
     {
         auto res = rune::node::parseNodeConfig(fakeEnv(base));
@@ -1371,7 +1377,7 @@ TEST(NodeConfig, AeronEpollPollDefaultsOnAndEnvTurnsItOff) {
 
 TEST(NodeConfig, ParsesAeronTermSparse) {
     std::map<std::string, std::string> base{{"RUNE_NODE_ID","0"},{"RUNE_PEERS","0@h:1"},
-        {"RUNE_CLIENT_ENDPOINT","h:2"},{"RUNE_DATA_DIR","/tmp/x"}};
+        {"RUNE_CLIENT_ENDPOINT","h:2"},{"RUNE_DATA_DIR","/tmp/x"},{"RUNE_AUTH","disabled"}};
     {
         auto res = rune::node::parseNodeConfig(fakeEnv(base));
         ASSERT_TRUE(res.config.has_value()) << res.error;
@@ -1400,7 +1406,7 @@ TEST(NodeConfig, FragmentLimitDefaultAndOverride) {
         auto env = fakeEnv({{"RUNE_NODE_ID",        "0"},
                             {"RUNE_PEERS",           "0@h:1"},
                             {"RUNE_CLIENT_ENDPOINT", "h:2"},
-                            {"RUNE_DATA_DIR",        "/tmp/x"}});
+                            {"RUNE_DATA_DIR",        "/tmp/x"},{"RUNE_AUTH","disabled"}});
         auto res = rune::node::parseNodeConfig(env);
         ASSERT_TRUE(res.config.has_value()) << res.error;
         EXPECT_EQ(res.config->gatewayFragmentLimit, 256);
@@ -1411,6 +1417,7 @@ TEST(NodeConfig, FragmentLimitDefaultAndOverride) {
                             {"RUNE_PEERS",                   "0@h:1"},
                             {"RUNE_CLIENT_ENDPOINT",         "h:2"},
                             {"RUNE_DATA_DIR",                "/tmp/x"},
+                            {"RUNE_AUTH",                     "disabled"},
                             {"RUNE_GATEWAY_FRAGMENT_LIMIT",  "1000"}});
         auto res = rune::node::parseNodeConfig(env);
         ASSERT_TRUE(res.config.has_value()) << res.error;
@@ -1736,6 +1743,7 @@ static std::map<std::string, std::string> shard3node(int self = 0) {
                                   "2@127.0.0.1:40112:40202:40222:40640:40540"},
         {"RUNE_CLIENT_ENDPOINT",  "0.0.0.0:" + std::to_string(40200 + self)},
         {"RUNE_DATA_DIR",         "/data/rune"},
+        {"RUNE_CLUSTER_KEY_FILE", "/etc/rune/cluster.key"},
         {"RUNE_WORKERS",          "1"},
         {"RUNE_WORKER_MODE",      "shard"},
         {"RUNE_WORKER_INGRESS_BASE_PORT", std::to_string(40500 + 20 * self)},
@@ -2556,6 +2564,157 @@ TEST(NodeConfigRegression, StorageFormatEnvDefaultsToRequiredRegression) {
     }
     EXPECT_FALSE(parseStorageFormat("testfounder").has_value());
     EXPECT_EQ(NodeConfig{}.storageFormat, StorageFormat::TestFounder) << "the in-process (rig) default";
+}
+
+
+// ---------------------------------------------------------------------------
+// Authentication configuration (authentication plan Task 9, D31/D32; spec §8, §9)
+// ---------------------------------------------------------------------------
+
+TEST(NodeConfigRegression, AuthDefaultsToEnabledWhenUnsetRegression) {
+    auto r = parseNodeConfig(fakeEnv(base3node()));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    EXPECT_EQ(r.config->authMode, AuthMode::Enabled);
+    EXPECT_EQ(r.config->clusterKeyFile, "/etc/rune/cluster.key");
+    EXPECT_TRUE(r.config->clusterKeyFileNext.empty());
+    EXPECT_EQ(r.config->authTimeoutMs, 10'000);
+    EXPECT_EQ(r.config->peerAuthStreamId, 40);
+
+    auto env = base3node();
+    env["RUNE_AUTH"] = "enabled";
+    env["RUNE_CLUSTER_KEY_FILE_NEXT"] = "/etc/rune/next.key";
+    env["RUNE_AUTH_TIMEOUT_MS"] = "2500";
+    env["RUNE_PEER_AUTH_STREAM_ID"] = "41";
+    r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    EXPECT_EQ(r.config->authMode, AuthMode::Enabled);
+    EXPECT_EQ(r.config->clusterKeyFileNext, "/etc/rune/next.key");
+    EXPECT_EQ(r.config->authTimeoutMs, 2500);
+    EXPECT_EQ(r.config->peerAuthStreamId, 41);
+}
+
+TEST(NodeConfigRegression, UnknownRuneAuthValueIsRefused) {
+    for (const char* bad : {"", "off", "true", "Enabled", "DISABLED", "none"}) {
+        auto env = base1node();
+        env["RUNE_AUTH"] = bad;
+        auto r = parseNodeConfig(fakeEnv(env));
+        if (std::string_view(bad).empty()) {
+            // An empty value is "unset": the default (enabled) applies, never a silent dev mode.
+            ASSERT_TRUE(r.config.has_value()) << r.error;
+            EXPECT_EQ(r.config->authMode, AuthMode::Enabled);
+            continue;
+        }
+        EXPECT_FALSE(r.config.has_value()) << "RUNE_AUTH='" << bad << "' must be refused";
+        EXPECT_NE(r.error.find("RUNE_AUTH"), std::string::npos) << r.error;
+        EXPECT_NE(r.error.find("enabled"), std::string::npos) << r.error;
+    }
+}
+
+TEST(NodeConfigRegression, EnabledWithoutAClusterKeyFileRefusesToStartRegression) {
+    // Single node included (D4 / D32): authentication needs the cluster key even with no peers.
+    for (auto env : {base1node(), base3node()}) {
+        env.erase("RUNE_CLUSTER_KEY_FILE");
+        auto r = parseNodeConfig(fakeEnv(env));
+        EXPECT_FALSE(r.config.has_value());
+        EXPECT_NE(r.error.find("RUNE_CLUSTER_KEY_FILE"), std::string::npos) << r.error;
+    }
+    // ...but dev mode needs none.
+    auto env = base1node();
+    env.erase("RUNE_CLUSTER_KEY_FILE");
+    env["RUNE_AUTH"] = "disabled";
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    EXPECT_EQ(r.config->authMode, AuthMode::DevDisabled);
+}
+
+namespace {
+struct KeyDir {
+    std::filesystem::path path;
+    KeyDir() {
+        static int seq = 0;
+        path = std::filesystem::temp_directory_path() / ("rune_nckey_" + std::to_string(::getpid()) + "_" + std::to_string(seq++));
+        std::filesystem::create_directories(path);
+    }
+    ~KeyDir() { std::error_code ec; std::filesystem::remove_all(path, ec); }
+    std::string write(const std::string& name, const std::string& body, std::filesystem::perms p = std::filesystem::perms::owner_read | std::filesystem::perms::owner_write) const {
+        const auto f = path / name;
+        std::ofstream(f, std::ios::binary) << body;
+        std::filesystem::permissions(f, p, std::filesystem::perm_options::replace);
+        return f.string();
+    }
+};
+} // namespace
+
+TEST(NodeConfigRegression, ShortClusterKeyFileIsRefused) {
+    KeyDir d;
+    NodeConfig cfg;
+    cfg.authMode = AuthMode::Enabled;
+    cfg.clusterKeyFile = d.write("k31", std::string(31, 'k'));   // 31 bytes: one short
+    auto err = cfg.validateAuth();
+    ASSERT_TRUE(err.has_value());
+    EXPECT_NE(err->find("RUNE_CLUSTER_KEY_FILE"), std::string::npos) << *err;
+    EXPECT_NE(err->find(cfg.clusterKeyFile), std::string::npos) << *err;
+
+    cfg.clusterKeyFile = d.write("k32", std::string(32, 'k'));
+    EXPECT_FALSE(cfg.validateAuth().has_value());
+
+    cfg.clusterKeyFile = (d.path / "missing").string();
+    err = cfg.validateAuth();
+    ASSERT_TRUE(err.has_value());
+    EXPECT_NE(err->find(cfg.clusterKeyFile), std::string::npos) << *err;
+
+    // A short NEXT key is refused too, naming its own variable.
+    cfg.clusterKeyFile     = d.write("ok", std::string(40, 'a'));
+    cfg.clusterKeyFileNext = d.write("short-next", "tiny");
+    err = cfg.validateAuth();
+    ASSERT_TRUE(err.has_value());
+    EXPECT_NE(err->find("RUNE_CLUSTER_KEY_FILE_NEXT"), std::string::npos) << *err;
+
+    // Dev mode and in-process configs read no key file.
+    cfg.authMode = AuthMode::DevDisabled;
+    EXPECT_FALSE(cfg.validateAuth().has_value());
+    cfg.authMode = AuthMode::InProcessUnauthenticated;
+    EXPECT_FALSE(cfg.validateAuth().has_value());
+}
+
+TEST(NodeConfigRegression, DevModeRefusesAMultiBrokerClusterRegression) {
+    auto env = base3node();
+    env["RUNE_AUTH"] = "disabled";
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_FALSE(r.config.has_value());
+    EXPECT_EQ(r.error, "RUNE_AUTH=disabled (dev mode) refuses to start as part of a multi-broker cluster "
+                       "(RUNE_PEERS lists 3 brokers); enable authentication");
+    // The programmatic path refuses the same configuration.
+    NodeConfig cfg;
+    cfg.authMode = AuthMode::DevDisabled;
+    cfg.peers.resize(2);
+    auto err = cfg.validateAuth();
+    ASSERT_TRUE(err.has_value());
+    EXPECT_NE(err->find("multi-broker"), std::string::npos) << *err;
+}
+
+TEST(NodeConfigRegression, CodeBuiltConfigIsInProcessUnauthenticated) {
+    EXPECT_EQ(NodeConfig{}.authMode, AuthMode::InProcessUnauthenticated);   // D31: every existing in-process test
+    EXPECT_EQ(NodeConfig{}.authTimeoutMs, 10'000);
+    EXPECT_EQ(NodeConfig{}.peerAuthStreamId, 40);
+    // parse never yields it.
+    auto r = parseNodeConfig(fakeEnv(base1node()));
+    ASSERT_TRUE(r.config.has_value());
+    EXPECT_NE(r.config->authMode, AuthMode::InProcessUnauthenticated);
+}
+
+TEST(NodeConfigRegression, DevModeWarnsAtStartAndEveryFiveMinutes) {
+    DevModeWarnTimer t;
+    const int64_t s0 = 1'000'000'000'000LL;
+    EXPECT_TRUE(t.due(s0)) << "at start";
+    EXPECT_FALSE(t.due(s0 + 1)) << "not again at once";
+    EXPECT_FALSE(t.due(s0 + kDevModeWarnIntervalNs - 1));
+    EXPECT_TRUE(t.due(s0 + kDevModeWarnIntervalNs)) << "every 5 minutes";
+    EXPECT_FALSE(t.due(s0 + kDevModeWarnIntervalNs + 1));
+    EXPECT_TRUE(t.due(s0 + 2 * kDevModeWarnIntervalNs));
+    EXPECT_EQ(kDevModeWarnIntervalNs, 300'000'000'000LL);
+    EXPECT_NE(std::string(kDevModeWarning).find("AUTHENTICATION DISABLED (RUNE_AUTH=disabled): every request runs as "
+                                                "'anonymous' with full access"), std::string::npos);
 }
 
 } // namespace rune::node

@@ -64,6 +64,10 @@
 #include <rune/node/AdminIsrChannel.h>
 #include <rune/node/CatalogPartition.h>
 #include <rune/node/CatalogApplier.h>
+#include <rune/node/SecurityApplier.h>
+#include <rune/node/SecurityPartition.h>
+#include <rune/node/AuthDevMode.h>
+#include <rune/gateway/SecurityView.h>
 #include <rune/codec/Serialize.h>
 #include <rune/node/AdminControlPlane.h>
 #include <rune/node/DdlAnswerGate.h>
@@ -397,6 +401,25 @@ public:
                 else reportBadRoleFrame_(tid, n);
                 return;
             }
+            // Authentication Task 9 (D39): the `__security` replica's role, held role and AlterIsr answer.
+            if (tid == kMsgSecurityRole) {
+                AdminRoleMsg m;
+                if (decodeAdminRole(p, n, m)) worker_.onSecurityRole(m);
+                else reportBadRoleFrame_(tid, n);
+                return;
+            }
+            if (tid == kMsgSecurityHoldLeadership) {
+                AdminRoleMsg m;
+                if (decodeAdminRole(p, n, m)) worker_.onSecurityHoldLeadership(m);
+                else reportBadRoleFrame_(tid, n);
+                return;
+            }
+            if (tid == kMsgSecurityAlterIsrResponse) {
+                rune::replication::AlterIsrResponseMsg r{};
+                if (decodeCatalogAlterIsrResponse(p, n, r)) worker_.onSecurityAlterIsrResponse(r);
+                else reportBadRoleFrame_(tid, n);
+                return;
+            }
             reportBadRoleFrame_(tid, n);
         }, 16);
 
@@ -511,8 +534,10 @@ public:
         //    state), which halts the broker.  Signalled once (retried while the
         //    ring is full).
         if (!storageFailureSignalled_) {
-            // Catalog history Task 6: the __catalog log is admin-driven too.
+            // Catalog history Task 6: the __catalog log is admin-driven too (authentication Task 9: and __security's).
             auto* r = worker_.catalogReplica();
+            if (!(r && r->isDiskBacked() && r->log()->storageFailed()))
+                r = worker_.securityReplica();
             if (r && r->isDiskBacked() && r->log()->storageFailed()) [[unlikely]] {
                 // M3 (Task 10 round 4): the ring's max message is capacity/8;
                 // an over-long path would make write() THROW on this thread.
@@ -680,6 +705,17 @@ public:
     // the boot sink.
     [[nodiscard]] LiveEffects catalogLiveEffects() { return LiveEffects{catalogSink_(/*viewInstallRecovery=*/0)}; }
     [[nodiscard]] BootEffects catalogBootEffects() { return BootEffects{catalogSink_(/*viewInstallRecovery=*/1)}; }
+    // ── Authentication Task 9: the production SecurityApplier sinks (ADMIN thread only) ────────────────────────
+    // Every applied event's bytes become one kA2cSecurityApplied message on the SAME admin→control FIFO as the
+    // catalog's effects (one ring, one order); the applier's halt one kA2cSecurityHalted; a checkpoint storage
+    // failure the broker's halt path.  The boot sink is empty by design: the booted state is handed to the control
+    // thread's SecurityView directly (the startup thread, before any thread runs) and postBootStash delivers a
+    // boot-time halt through the live sink.
+    [[nodiscard]] SecurityLiveEffects securityLiveEffects() { return SecurityLiveEffects{securitySink_()}; }
+    [[nodiscard]] SecurityBootEffects securityBootEffects() const { return SecurityBootEffects{}; }
+    [[nodiscard]] SecurityEffects securitySinkForBootStash() { return securitySink_(); }
+    /// The `__security` replica's ISR channel (kA2cSecurityAlterIsr) - the control thread forwards it to the controller.
+    AdminIsrChannel& securityIsrChannel() noexcept { return securityIsrChannel_; }
     [[nodiscard]] std::size_t catalogBacklogForTest() const noexcept { return catalogBacklog_.count(); }
     [[nodiscard]] std::size_t catalogBacklogBytesForTest() const noexcept { return catalogBacklog_.usedBytes(); }
     [[nodiscard]] uint64_t catalogEffectsRefusedForTest() const noexcept { return catalogEffectsRefused_; }
@@ -819,6 +855,7 @@ private:
     // Catalog history Task 6: the __catalog replica's AlterIsr → failureRing_
     // (declared after it: initialised with a reference to it).
     AdminIsrChannel  catalogIsrChannel_{failureRing_};
+    AdminIsrChannel  securityIsrChannel_{failureRing_, kA2cSecurityAlterIsr};   // authentication Task 9 (D39)
     static constexpr int32_t kAdminTestTaskMsgTypeId = 0x7E58;
     rune::consensus::ControlRing<4096> testTaskRing_;   // test threads → admin (test-only)
     uint64_t         badRoleFrames_ = 0;
@@ -995,6 +1032,33 @@ private:
             if (detail.size() > room) detail.resize(room);
             postCatalog_(kA2cCatalogHalted, kCatalogHaltedFixedBytes + detail.size(), [&](uint8_t* p) {
                 writeCatalogHalted(p, err.offset, err.expected, err.actual, detail);
+            });
+        };
+        fx.storageFailed = [this](int e, const std::string& dir) {
+            std::string shown = dir;   // keep the path's TAIL (as the log storage-failure post)
+            const std::size_t maxDir = catalogMaxFrame_() - 4u;
+            if (shown.size() > maxDir) shown = "..." + dir.substr(dir.size() - (maxDir - 3u));
+            postCatalog_(kA2cStorageFailure, 4 + shown.size(), [&](uint8_t* p) {
+                std::memcpy(p, &e, 4);
+                std::memcpy(p + 4, shown.data(), shown.size());
+            });
+        };
+        return fx;
+    }
+
+    SecurityEffects securitySink_() {
+        SecurityEffects fx;
+        fx.maxFrameBytes = catalogMaxFrame_();   // D29: the applier halts on an event that cannot be mirrored in full
+        fx.eventApplied = [this](int64_t offset, std::span<const uint8_t> bytes) {
+            postCatalog_(kA2cSecurityApplied, kSecurityAppliedFixedBytes + bytes.size(),
+                         [&](uint8_t* p) { writeSecurityApplied(p, offset, bytes); });
+        };
+        fx.halted = [this](const rune::security::ApplyError& err) {
+            std::string detail = std::string{rune::security::applyErrorName(err.code)} + ": " + err.detail;
+            const std::size_t room = catalogMaxFrame_() - kSecurityHaltedFixedBytes;
+            if (detail.size() > room) detail.resize(room);
+            postCatalog_(kA2cSecurityHalted, kSecurityHaltedFixedBytes + detail.size(), [&](uint8_t* p) {
+                writeSecurityHalted(p, err.offset, err.expected, err.actual, detail);
             });
         };
         fx.storageFailed = [this](int e, const std::string& dir) {
@@ -1244,9 +1308,9 @@ public:
     template <class F>
     auto onOwnerThreadForTest(int32_t topicId, int32_t partition, F&& f,
                               std::chrono::milliseconds timeout = std::chrono::seconds{10}) {
-        if (topicId == kCatalogTopicId) {
+        if (topicId == kCatalogTopicId || topicId == kSecurityTopicId) {
             throw std::invalid_argument(
-                "onOwnerThreadForTest: __catalog (topicId=-6) is AdminWorker-owned; "
+                "onOwnerThreadForTest: __catalog (topicId=-6) and __security (topicId=-7) are AdminWorker-owned; "
                 "not routable via the owner-thread hook (use onAdminThreadForTest)");
         }
         return submitOwnerThreadTestTask_<OwnerThreadTestTask::Target::Replica>(
@@ -1284,6 +1348,26 @@ public:
     /// Test-only: the __catalog Log — ONLY while the admin thread is quiesced
     /// (before start(), after stop()); otherwise read it inside onAdminThreadForTest.
     [[nodiscard]] rune::storage::Log* catalogLogForTest() const noexcept { return catalogLog_.get(); }
+
+    // ── Authentication Task 9 test hooks (`__security`) ──────────────────────────────────────────────────────
+    /// Test-only, ADMIN thread only (inside onAdminThreadForTest): the `__security` replica (null: none built).
+    [[nodiscard]] rune::replication::PartitionReplica* securityReplicaForTest() const noexcept {
+        return securityReplica_.get();
+    }
+    /// Test-only: the `__security` Log - ONLY while the admin thread is quiesced (before start(), after stop()).
+    [[nodiscard]] rune::storage::Log* securityLogForTest() const noexcept { return securityLog_.get(); }
+    /// What the CONTROL thread's SecurityView holds (read ON the control thread).
+    struct SecurityViewSnap { bool present = false; int64_t appliedOffset = -1; uint64_t digest = 0; bool halted = false; };
+    [[nodiscard]] SecurityViewSnap securityViewForTest();
+    /// Append one record to `__security` on THIS broker's admin thread iff it leads (acks=all); returns the record's
+    /// base offset, or -1 (not the leader / below minIsr).  Test seam for the log's replication and mirroring - the
+    /// write path proper is SecurityAdmin (Task 10).
+    [[nodiscard]] int64_t appendSecurityRecordOnLeaderForTest(std::span<const uint8_t> eventBytes);
+    /// Test-only: while held, this broker's `__security` applier applies nothing (the replica still replicates).
+    void holdSecurityApplyForTest(bool on);
+    /// Counter values the control thread publishes (read ON the control thread).
+    struct SecurityMetricsSnap { int64_t halted = 0; int64_t applied = -1; int64_t authMode = 0; };
+    [[nodiscard]] SecurityMetricsSnap securityMetricsForTest();
     /// Test-only (Task 16): the number of boot replays (CatalogApplier::replayLocal calls that
     /// returned >= 0) since construction — exactly 1 after every start(): the ONE boot replay,
     /// on the startup thread (F4).  Immutable once start() returned.
@@ -1836,10 +1920,21 @@ private:
     // schema block.  Throws on any failure (no silent fallback: a broker
     // without its catalog never starts).
     void buildCatalog_();
+    // Authentication Task 9 (D39): dataDir/__security Log + replica on the SAME admin plane as __catalog's (built right
+    // after it; shares its transport and controller-ISR decision).  The startup thread replays the local prefix once
+    // (bootFromSecurity_) and hands the booted state to the control thread's SecurityView.
+    void bootFromSecurity_();
+    void buildSecurity_();
+    void forwardSecurityAlterIsr_(const uint8_t* p, std::size_t n);
+    static bool onAdminLogAlterIsrResponseThunk_(void* self, const rune::replication::AlterIsrResponseMsg& r) noexcept;
+    void onSecurityApplied_(const uint8_t* p, std::size_t n);
+    void onSecurityHalted_(const uint8_t* p, std::size_t n);
+    void publishSecurityMetrics_() noexcept;
+    [[nodiscard]] bool securityMetricsPending_() const noexcept;
+    int  serviceAuthMode_(int64_t nowNs);
     // Catalog history Task 6 (control thread): a kA2cCatalogAlterIsr frame →
     // the controller channel; the controller's (-6, 0) answer → the admin role ring.
     void forwardCatalogAlterIsr_(const uint8_t* p, std::size_t n);
-    static bool onCatalogAlterIsrResponseThunk_(void* self, const rune::replication::AlterIsrResponseMsg& r) noexcept;
 
     // Task 8b (RULING-4, SINGLE-NODE): create + register the user
     // PartitionReplica(s) for a RUNTIME-defined topic (created via
@@ -2099,6 +2194,27 @@ private:
     std::unique_ptr<rune::replication::PubAddBroker>      catalogAddBroker_;
     std::unique_ptr<rune::replication::PartitionReplica>  catalogReplica_;
     bool                                                  catalogOnController_ = false;
+    // Authentication Task 9 - the `__security` partition (topic -7, partition 0): the same ownership as __catalog's.
+    // securityLog_/securityReplica_ are admin-thread-owned once the admin thread runs (never in replicaRegistry_);
+    // bootSecurityApplier_ is the startup thread's booted applier until buildAdminWorker hands it to the AdminWorker;
+    // securityView_ is the CONTROL thread's own mirror (constructed on the startup thread from a COPY of the booted
+    // state, before any thread runs).
+    std::unique_ptr<rune::storage::Log>                   securityLog_;
+    std::unique_ptr<rune::replication::PartitionReplica>  securityReplica_;
+    std::optional<SecurityApplier>                        bootSecurityApplier_;
+    std::optional<rune::gateway::SecurityView>            securityView_;
+    uint64_t                                              securityAnswersHeld_    = 0;
+    uint64_t                                              securityAnswersDropped_ = 0;
+    uint64_t                                              securityAlterIsrRefused_ = 0;
+    std::int64_t                     securityHaltedCounterRegId_  = -1;
+    std::int64_t                     securityAppliedCounterRegId_ = -1;
+    std::int64_t                     authModeCounterRegId_        = -1;
+    std::shared_ptr<aeron::Counter>  securityHaltedCounter_;
+    std::shared_ptr<aeron::Counter>  securityAppliedCounter_;
+    std::shared_ptr<aeron::Counter>  authModeCounter_;
+    std::int64_t                     securityHaltedValue_  = 0;    // control-thread-owned (0 = applying)
+    std::int64_t                     securityAppliedValue_ = -1;   // control-thread-owned
+    DevModeWarnTimer                 devModeWarn_;                 // control thread
     // Catalog history Task 16 — the boot from __catalog (startup thread; immutable after start()).
     /// Opens/replays the local __catalog on the startup thread and fills the members below.
     void bootFromCatalog_();
@@ -2114,6 +2230,7 @@ private:
     // Control thread: the last consensus-driven catalog role posted (single node).
     struct PostedRole { bool leader = false; int32_t epoch = -1; };
     PostedRole                                            catalogLastRole_;
+    PostedRole                                            securityLastRole_;   // auth Task 9: __security (single node: the consensus leader)
     // Catalog history Task 11: the DDL route last published to the gateway, as
     // its key (CatalogRoute index + the leader id / halt offset) — the endpoint
     // string is built only on a change (an idle control pass allocates nothing).

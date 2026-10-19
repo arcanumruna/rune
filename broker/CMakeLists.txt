@@ -296,6 +296,7 @@ if(CMAKE_CXX_FLAGS MATCHES "-fsanitize=thread")
     link_libraries(rune_tsan_default_options)
 endif()
 
+add_subdirectory(libs/peerlink)
 add_subdirectory(libs/aeronutil)
 add_subdirectory(libs/metadata)
 add_subdirectory(libs/storage)

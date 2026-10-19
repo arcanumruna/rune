@@ -304,6 +304,12 @@ void BrokerNode::start() {
         throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) +
                                  "]: refusing to start — " + *err);
     }
+    // Authentication Task 9 (D31/D32): dev mode is single-node only; an enabled broker needs its cluster key file
+    // (programmatic configs bypass parseNodeConfig's check; the file itself is read here, on the startup thread).
+    if (auto err = config_.validateAuth(); err.has_value()) {
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) +
+                                 "]: refusing to start — " + *err);
+    }
     // F15 S3 (design note §6, review S3 I-1): a worker return-ring claim
     // exception is an invariant-violation halt, so the return ring size is a
     // correctness setting — its max message must hold the largest batch any
@@ -386,6 +392,9 @@ void BrokerNode::start() {
     //     sees every topic exactly as the catalog says.  The retired
     //     __topic_schemas / __views dirs are never read (no migration).
     bootFromCatalog_();
+    //     Authentication Task 9: the same for `__security` - its local prefix replays once, on this thread, and the
+    //     booted state is handed to the control thread's SecurityView before any thread runs.
+    bootFromSecurity_();
 
     // FD-1 (F6): raise the soft open-file limit to the hard limit (logged) and refuse to start when the hard
     // limit cannot hold the catalog's partitions — topics exist only through DDL, so the budget is the topics
@@ -517,6 +526,13 @@ void BrokerNode::start() {
             kCatalogApplyHaltedCounterTypeId, roleKey, kRoleKeyLength, catalogApplyHaltedLabel(config_.nodeId));
         catalogAppliedCounterRegId_ = aeron_->addCounter(
             kCatalogAppliedOffsetCounterTypeId, roleKey, kRoleKeyLength, catalogAppliedOffsetLabel(config_.nodeId));
+        // Authentication Task 9: 1'000'226 security apply halted, 227 security applied offset, 228 auth mode.
+        securityHaltedCounterRegId_ = aeron_->addCounter(
+            kSecurityApplyHaltedCounterTypeId, roleKey, kRoleKeyLength, securityApplyHaltedLabel(config_.nodeId));
+        securityAppliedCounterRegId_ = aeron_->addCounter(
+            kSecurityAppliedOffsetCounterTypeId, roleKey, kRoleKeyLength, securityAppliedOffsetLabel(config_.nodeId));
+        authModeCounterRegId_ = aeron_->addCounter(
+            kAuthModeCounterTypeId, roleKey, kRoleKeyLength, authModeLabel(config_.nodeId));
         unplaceableCounterRegId_ = aeron_->addCounter(
             kCatalogUnplaceableTopicsCounterTypeId, roleKey, kRoleKeyLength,
             catalogUnplaceableTopicsLabel(config_.nodeId));
@@ -679,6 +695,8 @@ void BrokerNode::start() {
     //     (the thread start orders every claim before the admin's first).
     if (adminWorkerAgent_) {
         adminWorkerAgent_->worker().applier().postBootStash(adminWorkerAgent_->catalogBootEffects().sink);
+        if (const SecurityApplier* sa = adminWorkerAgent_->worker().securityApplier())
+            sa->postBootStash(adminWorkerAgent_->securitySinkForBootStash());   // a boot-time halt reaches the control thread
         spdlog::info("BrokerNode[{}]: __catalog booted — {} boot replay, applier {} ({}), {} topic(s) built, {} "
                      "dropped id(s)", config_.nodeId, bootReplays_, adminWorkerAgent_->worker().applier().phaseName(),
                      adminWorkerAgent_->worker().applier().stateName(), bootTopics_.size(), bootDroppedIds_.size());
@@ -2655,6 +2673,8 @@ void BrokerNode::buildGateway() {
                     // by buildCatalog_ (admin-owned, never in replicaRegistry_);
                     // a broker without it never starts, so it always exists.
                     coord.push_back(rune::metadata::PartitionKey{kCatalogTopicId, kCatalogPartition});
+                    // Authentication Task 9 (D39): __security (-7) is on the same path, built by buildSecurity_.
+                    coord.push_back(rune::metadata::PartitionKey{kSecurityTopicId, kSecurityPartition});
                     if (!coord.empty()) {
                         metadataService_->setCoordinatorPartitions(std::move(coord), balancerNodes);
                         if (replBridge_) replBridge_->setCoordinatorPartitionsOnController(true);
@@ -3106,6 +3126,117 @@ void BrokerNode::publishCatalogMetrics_() noexcept {
 }
 
 // ---------------------------------------------------------------------------
+// Authentication Task 9 - control-thread halves of the `__security` log (D29).
+// ---------------------------------------------------------------------------
+void BrokerNode::onSecurityApplied_(const uint8_t* p, std::size_t n) {
+    int64_t offset = -1;
+    std::span<const uint8_t> bytes;
+    if (!decodeSecurityApplied(p, n, offset, bytes) || !securityView_) [[unlikely]] {
+        if (adminToControlRejects_++ % 1024 == 0)
+            spdlog::error("BrokerNode[{}]: malformed kA2cSecurityApplied (len={}) skipped", config_.nodeId, n);
+        return;
+    }
+    // The mirror applies the SAME event with the SAME library; a gap or an apply error halts it (fail closed -
+    // Task 14 turns that into revoked sessions and refused logins).
+    if (auto a = securityView_->onApplied(offset, bytes); a) {
+        securityAppliedValue_ = offset;
+    } else {
+        securityHaltedValue_ = a.error().offset + 1;
+    }
+    publishSecurityMetrics_();
+}
+
+void BrokerNode::onSecurityHalted_(const uint8_t* p, std::size_t n) {
+    SecurityHaltedMsg m;
+    if (!decodeSecurityHalted(p, n, m) || !securityView_) [[unlikely]] {
+        if (adminToControlRejects_++ % 1024 == 0)
+            spdlog::error("BrokerNode[{}]: malformed kA2cSecurityHalted (len={}) skipped", config_.nodeId, n);
+        return;
+    }
+    rune::security::ApplyError err;
+    err.offset   = m.offset;
+    err.code     = rune::security::ApplyError::Code::Precondition;
+    err.expected = m.expected;
+    err.actual   = m.actual;
+    err.detail   = m.detail;
+    securityView_->onHalted(err);
+    securityHaltedValue_ = m.offset + 1;
+    publishSecurityMetrics_();
+    spdlog::critical("BrokerNode[{}]: __security apply HALTED at offset {} (expected={:#x} actual={:#x}) - {}; this "
+                     "broker fails closed: authenticated sessions are revoked, logins and security changes refused "
+                     "until an operator intervenes (move dataDir/__security aside and restart)",
+                     config_.nodeId, m.offset, m.expected, m.actual, m.detail);
+}
+
+bool BrokerNode::securityMetricsPending_() const noexcept {
+    return (!securityHaltedCounter_ && securityHaltedCounterRegId_ >= 0) ||
+           (!securityAppliedCounter_ && securityAppliedCounterRegId_ >= 0) ||
+           (!authModeCounter_ && authModeCounterRegId_ >= 0);
+}
+
+void BrokerNode::publishSecurityMetrics_() noexcept {
+    if (!aeron_) return;
+    auto resolve = [this](std::shared_ptr<aeron::Counter>& c, std::int64_t regId) {
+        if (c || regId < 0) return;
+        try { c = aeron_->findCounter(regId); }
+        catch (...) { c.reset(); }
+    };
+    resolve(securityHaltedCounter_, securityHaltedCounterRegId_);
+    resolve(securityAppliedCounter_, securityAppliedCounterRegId_);
+    resolve(authModeCounter_, authModeCounterRegId_);
+    if (securityHaltedCounter_) securityHaltedCounter_->set(securityHaltedValue_);
+    if (securityAppliedCounter_) securityAppliedCounter_->set(securityAppliedValue_);
+    // 1'000'228: 0 = enabled (an in-process config publishes 0 too), 1 = dev-disabled.
+    if (authModeCounter_) authModeCounter_->set(config_.authMode == AuthMode::DevDisabled ? 1 : 0);
+}
+
+// Authentication Task 9 (spec §9): dev mode (RUNE_AUTH=disabled) is shouted at start and every five minutes by this
+// control-thread timer; the auth-mode counter resolves once the driver acked it.
+int BrokerNode::serviceAuthMode_(int64_t nowNs) {
+    int work = 0;
+    if (config_.authMode == AuthMode::DevDisabled && devModeWarn_.due(nowNs)) {
+        spdlog::warn("BrokerNode[{}]: {}", config_.nodeId, kDevModeWarning);
+        ++work;
+    }
+    return work;
+}
+
+BrokerNode::SecurityViewSnap BrokerNode::securityViewForTest() {
+    return onControlThreadForTest([this]() -> SecurityViewSnap {
+        SecurityViewSnap v;
+        if (!securityView_) return v;
+        v.present       = true;
+        v.appliedOffset = securityView_->appliedOffset();
+        v.digest        = securityView_->state().digest();
+        v.halted        = securityView_->halted();
+        return v;
+    });
+}
+
+BrokerNode::SecurityMetricsSnap BrokerNode::securityMetricsForTest() {
+    return onControlThreadForTest([this]() -> SecurityMetricsSnap {
+        publishSecurityMetrics_();
+        return SecurityMetricsSnap{securityHaltedValue_, securityAppliedValue_,
+                                   config_.authMode == AuthMode::DevDisabled ? 1 : 0};
+    });
+}
+
+int64_t BrokerNode::appendSecurityRecordOnLeaderForTest(std::span<const uint8_t> eventBytes) {
+    return onAdminThreadForTest([this, eventBytes]() -> int64_t {
+        rune::replication::PartitionReplica* r = securityReplica_.get();
+        if (r == nullptr || r->role() != rune::replication::Role::Leader) return -1;
+        const rune::replication::Offset base = r->append(eventBytes, /*acksAll=*/true);
+        if (base < 0) return -1;
+        r->onLeaderLogAppended();   // reconcile LEO / HW, push to followers
+        return base;
+    });
+}
+
+void BrokerNode::holdSecurityApplyForTest(bool on) {
+    onAdminThreadForTest([this, on]() { adminWorkerAgent_->worker().holdSecurityApplyForTest(on); });
+}
+
+// ---------------------------------------------------------------------------
 // BrokerNode::publishStorageMetrics_ — ISR v3 §3.10 (CONTROL thread; the publishCatalogMetrics_ pattern): resolves
 // each counter once the driver acked it and sets all four every pass (a plain store each).
 // ---------------------------------------------------------------------------
@@ -3476,11 +3607,94 @@ void BrokerNode::buildCatalog_() {
                  catalogOnController_ ? "the controller (ISR-elected, never unclean)" : "the consensus leader");
 }
 
+// ---------------------------------------------------------------------------
+// Authentication Task 9 - the `__security` partition (D39), the `__catalog` pattern:
+// BrokerNode::bootFromSecurity_ (STARTUP thread) opens and recovers dataDir/__security (a disk Log, never
+// in-memory), runs THE one boot replay of [0, checkpoint] through the SecurityApplier (a damaged or too-far
+// checkpoint throws: refuse to start) and hands a COPY of the booted state to the control thread's SecurityView
+// (D29) - all before any thread runs.  BrokerNode::buildSecurity_ gives the log its replica on the admin plane
+// (shared with __catalog's: frames dispatched by topic id) with the ISR v3 storage id; its leadership comes from
+// the controller-ISR path (multi-node) or the consensus leader (single node).
+// ---------------------------------------------------------------------------
+void BrokerNode::bootFromSecurity_() {
+    const fs::path dir = fs::path{config_.dataDir} / "__security";
+    fs::create_directories(dir);
+    securityLog_ = std::make_unique<rune::storage::Log>(dir.string(), config_.offsetLogSegmentRollBytes);
+    securityLog_->recover();
+    if (securityLog_->storageFailed())
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: __security recovery failed "
+                                 "(storage error " + std::to_string(securityLog_->storageErrno()) + ") at " +
+                                 dir.string() + " - refusing to start");
+    // Never compacted / retention-deleted: a recovered security log always starts at 0.
+    if (securityLog_->logStartOffset() != 0)
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: __security at " + dir.string() +
+                                 " starts at offset " + std::to_string(securityLog_->logStartOffset()) +
+                                 " - the security log is never truncated at the front; refusing to start");
+    bootSecurityApplier_.emplace(dir.string());
+    const int replayed = bootSecurityApplier_->replayLocal(*securityLog_, SecurityBootEffects{});   // throws: refuse boot
+    securityView_.emplace(bootSecurityApplier_->state());   // a COPY: the applier keeps its own (D29)
+    if (const rune::security::ApplyError* e = bootSecurityApplier_->haltError()) {
+        // A damaged local prefix: the broker boots fail-closed (Task 14 revokes / refuses on the halted mirror).
+        securityView_->onHalted(*e);
+        securityHaltedValue_ = e->offset + 1;
+    }
+    securityAppliedValue_ = securityView_->appliedOffset();
+    spdlog::info("BrokerNode[{}]: __security booted - {} event(s) replayed, applied through offset {}, applier {}",
+                 config_.nodeId, replayed, securityAppliedValue_, bootSecurityApplier_->stateName());
+}
+
+void BrokerNode::buildSecurity_() {
+    namespace rr = rune::replication;
+    if (!securityLog_ || !bootSecurityApplier_)
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: buildSecurity_ before "
+                                 "bootFromSecurity_ - the __security log is not open");
+    const fs::path dir = fs::path{config_.dataDir} / "__security";
+    std::vector<rr::NodeId> allNodeIds;
+    allNodeIds.reserve(config_.peers.size());
+    for (const auto& peer : config_.peers) allNodeIds.push_back(static_cast<rr::NodeId>(peer.id));
+    if (allNodeIds.size() > static_cast<std::size_t>(AdminRoleMsg::kMaxIsr))
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: __security is replicated to "
+                                 "every broker; " + std::to_string(allNodeIds.size()) +
+                                 " brokers exceed the replica bound " + std::to_string(AdminRoleMsg::kMaxIsr));
+
+    // The admin plane buildCatalog_ attached (catalogOnController_ = multi-node with a controller channel); a
+    // multi-node broker without it already refused to start there - never a silent fallback.
+    rr::PartitionTransport* transport = nullptr;
+    if (catalogOnController_) {
+        transport = catalogPlane_.get();
+    } else {
+        if (!config_.isSingleNode())
+            throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: __security is replicated to "
+                                     "every broker but there is no admin replication plane; refusing to start");
+        nullTransports_.push_back(std::make_unique<rr::NullPartitionTransport>());
+        transport = nullTransports_.back().get();
+    }
+
+    securityReplica_ = std::make_unique<rr::PartitionReplica>(
+        makeSecurityPartitionConfig(config_, allNodeIds.size()), rr::Role::Follower, /*epoch=*/0,
+        allNodeIds, allNodeIds, securityLog_.get(), transport);
+    if (replicaRegistry_ && replicaRegistry_->processIncarnation() != 0)
+        securityReplica_->setProcessIncarnation(replicaRegistry_->processIncarnation());
+    securityReplica_->setStorageId(storage_.id);   // ISR v3 Step 6
+    if (config_.testHoldFollowerFetchesMs > 0)
+        securityReplica_->holdFetchesUntilForTest(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() +
+            config_.testHoldFollowerFetchesMs * 1'000'000LL);
+    if (lifecycleNonce_ != 0) securityReplica_->setLineageIdentity(lifecycleNonce_);
+
+    spdlog::info("BrokerNode[{}]: __security built at {} (LEO={}, minIsr={}, {}, role from {})",
+                 config_.nodeId, dir.string(), securityLog_->logEndOffset(), securityMinIsr(allNodeIds.size()),
+                 catalogPlane_ ? "replicated on the admin plane (stream " + std::to_string(config_.catalogReplStreamId) + ")"
+                               : std::string("single node"),
+                 catalogOnController_ ? "the controller (ISR-elected, never unclean)" : "the consensus leader");
+}
+
 void BrokerNode::buildAdminWorker() {
     const int32_t nodeId = config_.nodeId;
     // Catalog history Task 6: the __catalog partition first, OUTSIDE the admin
     // block's catch — a broker without its catalog never starts.
     buildCatalog_();
+    buildSecurity_();   // Authentication Task 9: right after it - same plane, same controller-ISR decision
     try {
         // Catalog history Task 16: the SchemaRegistry / ViewRegistry are the
         // CatalogApplier's projections of __catalog (built by bootFromCatalog_);
@@ -3580,6 +3794,10 @@ void BrokerNode::buildAdminWorker() {
         // again; the admin thread's first pass makes it Live.
         adminWorkerAgent_->worker().adoptBootedApplier(std::move(*bootApplier_), adminWorkerAgent_->catalogLiveEffects());
         bootApplier_.reset();
+        // Authentication Task 9: the same for the booted SecurityApplier + the `__security` replica.
+        adminWorkerAgent_->worker().attachSecurity(std::move(*bootSecurityApplier_), securityReplica_.get(),
+                                                   adminWorkerAgent_->securityLiveEffects());
+        bootSecurityApplier_.reset();
         if (holdCatalogApplyAtBootForTest_) adminWorkerAgent_->worker().holdApplyForTest(true);
         if (bootReconcileDeferred_) {
             adminWorkerAgent_->worker().deferTopicDirReconcile(config_.dataDir);
@@ -3593,7 +3811,8 @@ void BrokerNode::buildAdminWorker() {
         if (catalogOnController_) {
             catalogReplica_->setIsrChannel(&adminWorkerAgent_->catalogIsrChannel());
             if (replBridge_) replBridge_->setCatalogRoleRing(&adminWorkerAgent_->roleRing());
-            replTransport_->setForeignAlterIsrResponseHandler(&BrokerNode::onCatalogAlterIsrResponseThunk_, this);
+            securityReplica_->setIsrChannel(&adminWorkerAgent_->securityIsrChannel());
+            replTransport_->setForeignAlterIsrResponseHandler(&BrokerNode::onAdminLogAlterIsrResponseThunk_, this);
         }
 
         // Dedicated thread (separate from gateway and produce workers).
@@ -3640,36 +3859,60 @@ void BrokerNode::forwardCatalogAlterIsr_(const uint8_t* p, std::size_t n) {
     }
 }
 
-bool BrokerNode::onCatalogAlterIsrResponseThunk_(void* self,
-                                                 const rune::replication::AlterIsrResponseMsg& r) noexcept {
+void BrokerNode::forwardSecurityAlterIsr_(const uint8_t* p, std::size_t n) {
+    rune::replication::AlterIsrMsg m{};
+    if (!decodeCatalogAlterIsr(p, n, m) || m.topicId != kSecurityTopicId) [[unlikely]] {
+        if (adminToControlRejects_++ % 1024 == 0)
+            spdlog::error("BrokerNode[{}]: malformed __security AlterIsr frame (len={}) skipped (rejects={})",
+                          config_.nodeId, n, adminToControlRejects_);
+        return;
+    }
+    if (!replTransport_ || !replTransport_->sendAlterIsr(m)) [[unlikely]] {
+        if (securityAlterIsrRefused_++ % 1024 == 0)
+            spdlog::warn("BrokerNode[{}]: __security AlterIsr refused by the controller channel ({}) - the replica "
+                         "re-sends it (refused so far: {})", config_.nodeId,
+                         replTransport_ ? "outbound ring full" : "no transport", securityAlterIsrRefused_);
+    }
+}
+
+// The controller's AlterIsrResponse for an admin log: (-6, 0) -> the catalog, (-7, 0) -> the security log; either
+// way verbatim (leaderId included) on the admin role ring under that log's message type.
+bool BrokerNode::onAdminLogAlterIsrResponseThunk_(void* self,
+                                                  const rune::replication::AlterIsrResponseMsg& r) noexcept {
     auto* node = static_cast<BrokerNode*>(self);
-    if (r.topicId != kCatalogTopicId || r.partition != kCatalogPartition) return true;   // not ours: as before
-    // Fix round 1 (M5): the admin thread is gone (stop()) — nothing will ever
+    const bool security = r.topicId == kSecurityTopicId && r.partition == kSecurityPartition;
+    if (!security && !(r.topicId == kCatalogTopicId && r.partition == kCatalogPartition))
+        return true;   // not ours: as before
+    const char* log = security ? "__security" : "__catalog";
+    uint64_t& answersHeld    = security ? node->securityAnswersHeld_ : node->catalogAnswersHeld_;
+    uint64_t& answersDropped = security ? node->securityAnswersDropped_ : node->catalogAnswersDropped_;
+    // Fix round 1 (M5): the admin thread is gone (stop()) - nothing will ever
     // drain the role ring; holding the answer would block this peer's whole
     // image (every -1/-2/-3 and node-control frame behind it).  Drop, counted.
-    // Fix round 1 (M3): FIFO with the role it depends on — while the bridge
-    // holds a catalog role, the answer must not overtake it on the ring.
+    // Fix round 1 (M3): FIFO with the role it depends on - while the bridge
+    // holds that log's role, the answer must not overtake it on the ring.
     // Held = false: re-delivered (Aeron path) / refused (local path; counted
     // by the transport, the leader re-sends).  Verbatim (leaderId included).
     OneToOneByteRing* ring = (node->adminWorkerAgent_ && !node->adminDrainStopped_)
                                  ? &node->adminWorkerAgent_->roleRing() : nullptr;
-    const bool rolePending = node->replBridge_ && node->replBridge_->catalogRolePending();
-    switch (relayCatalogAlterIsrResponse(ring, rolePending, r)) {
+    const bool rolePending = node->replBridge_ &&
+                             (security ? node->replBridge_->securityRolePending() : node->replBridge_->catalogRolePending());
+    switch (relayCatalogAlterIsrResponse(ring, rolePending, r,
+                                         security ? kMsgSecurityAlterIsrResponse : kMsgCatalogAlterIsrResponse)) {
     case CatalogAnswerRelay::Delivered:
         return true;
     case CatalogAnswerRelay::Dropped:
-        if (node->catalogAnswersDropped_++ % 1024 == 0)
-            spdlog::warn("BrokerNode[{}]: __catalog AlterIsr answer dropped — the admin thread is stopped "
-                         "(dropped so far: {})", node->config_.nodeId, node->catalogAnswersDropped_);
+        if (answersDropped++ % 1024 == 0)
+            spdlog::warn("BrokerNode[{}]: {} AlterIsr answer dropped - the admin thread is stopped "
+                         "(dropped so far: {})", node->config_.nodeId, log, answersDropped);
         return true;
     case CatalogAnswerRelay::Held:
         break;
     }
-    if (node->catalogAnswersHeld_++ % 1024 == 0)
-        spdlog::warn("BrokerNode[{}]: __catalog AlterIsr answer held ({}) — re-delivered after it "
-                     "(held so far: {})", node->config_.nodeId,
-                     rolePending ? "a catalog role is ahead of it" : "admin role ring full",
-                     node->catalogAnswersHeld_);
+    if (answersHeld++ % 1024 == 0)
+        spdlog::warn("BrokerNode[{}]: {} AlterIsr answer held ({}) - re-delivered after it "
+                     "(held so far: {})", node->config_.nodeId, log,
+                     rolePending ? "a role of that log is ahead of it" : "admin role ring full", answersHeld);
     return false;
 }
 
@@ -3841,6 +4084,7 @@ void BrokerNode::stop() {
     // after stop() (catalogLogForTest's contract: quiesced) and is freed with
     // the node (file flush on dtor), like schemaRegistry_.
     catalogReplica_.reset();
+    securityReplica_.reset();   // Authentication Task 9: the Log stays readable after stop() (securityLogForTest)
     // TX-3: destroy txn state store before replicaRegistry_ (holds raw ptr to txn replica).
     txnState_.reset();        // ReplicatedTxnStateStore (holds raw ptr to txn replica in registry)
     txnReplica_.reset();      // no-op: ownership transferred to replicaRegistry_ in buildGateway
@@ -3910,6 +4154,9 @@ void BrokerNode::stop() {
     for (auto& c : storageCounters_) c.reset();   // ISR v3 §3.10: the same rule (the Counter dtor uses the conductor)
     if (mtuProbeFd_ >= 0) { ::close(mtuProbeFd_); mtuProbeFd_ = -1; }   // re-check I1
     catalogAppliedCounter_.reset();
+    securityHaltedCounter_.reset();    // authentication Task 9: the same rule (released before aeron_)
+    securityAppliedCounter_.reset();
+    authModeCounter_.reset();
     for (auto& c : provCounters_) c.reset();   // re-review N4: same rule (the provisioner is stopped)
 
     // 4. Close the Aeron client (joins the C++ conductor thread).
@@ -4037,6 +4284,8 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
                      config_.nodeId, config_.tlsCertFile, config_.tlsKeyFile);
     });
 
+    work += serviceAuthMode_(nowNs);   // Authentication Task 9: the dev-mode warning timer + the auth-mode counter
+
     auto* agent = adminWorkerAgent_.get();
     if (!agent) return work;
 
@@ -4063,6 +4312,23 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
         }
         if (encodeAdminRole(agent->roleRing(), cm, kMsgCatalogRole)) {
             catalogLastRole_ = PostedRole{leaderNow, epochNow};
+            ++work;
+        }
+    }
+    // (1a') Authentication Task 9: the same for `__security` - single node, its role follows the consensus leader on
+    //       its own tracker (a full ring retries only this role); multi-node the bridge relays the committed (-7, 0).
+    if (!catalogOnController_ && securityReplica_ &&
+        (leaderNow != securityLastRole_.leader || epochNow != securityLastRole_.epoch)) {
+        AdminRoleMsg sm;
+        sm.leader   = leaderNow;
+        sm.epoch    = epochNow;
+        sm.leaderId = static_cast<int32_t>(v.leaderId);
+        if (leaderNow) {
+            for (const auto& peer : config_.peers)
+                if (sm.isrCount < AdminRoleMsg::kMaxIsr) sm.isr[static_cast<std::size_t>(sm.isrCount++)] = peer.id;
+        }
+        if (encodeAdminRole(agent->roleRing(), sm, kMsgSecurityRole)) {
+            securityLastRole_ = PostedRole{leaderNow, epochNow};
             ++work;
         }
     }
@@ -4132,6 +4398,11 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
                 forwardCatalogAlterIsr_(p, n);
                 return;
             }
+            // Authentication Task 9 (D29/D39): the `__security` replica's AlterIsr, every applied event's bytes for the
+            // SecurityView (this thread's own mirror) and the applier's halt.
+            if (tid == kA2cSecurityAlterIsr) { forwardSecurityAlterIsr_(p, n); return; }
+            if (tid == kA2cSecurityApplied)  { onSecurityApplied_(p, n); return; }
+            if (tid == kA2cSecurityHalted)   { onSecurityHalted_(p, n); return; }
             // Catalog history Task 8: the CatalogApplier's effects — this (control)
             // thread owns TopicRegistry, the replicas, the placement and the
             // cleaner's policy ring.  Every handler is idempotent (see BrokerNode.h).
@@ -4177,6 +4448,7 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
             }
         }, 16);
     if (catalogMetricsPending_()) [[unlikely]] publishCatalogMetrics_();   // a counter resolved late
+    if (securityMetricsPending_()) [[unlikely]] publishSecurityMetrics_();
     // Control (runtime) thread = the single producer of every worker ring.
     if (workerPool_) work += schemaFanout_.pump(*workerPool_);
     if (workerPool_) work += topicDroppedFanout_.pump(*workerPool_);   // R-M1

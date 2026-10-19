@@ -8,7 +8,8 @@ cmake_minimum_required(VERSION 3.20)
 add_library(rune_gateway
     src/ClientGateway.cpp
     src/TopicRegistry.cpp
-    src/TopicDirMarker.cpp)
+    src/TopicDirMarker.cpp
+    src/SecurityView.cpp)
 
 target_include_directories(rune_gateway PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
@@ -31,6 +32,8 @@ target_include_directories(rune_gateway PUBLIC ${RUNE_NODE_INCLUDE})
 # see the ★ BUILD/LINKAGE TRAP comment on rune_crypto's add_library() in the
 # top-level CMakeLists.txt.
 target_link_libraries(rune_gateway PUBLIC rune_crypto)
+# Authentication plan Task 9: the control thread's SecurityView (rune_security) and the cluster keys (rune_peerlink).
+target_link_libraries(rune_gateway PUBLIC rune_security rune_peerlink)
 # rune_codec PUBLIC: Worker.h (included transitively via WorkerPool.h) now
 # includes rune/codec/Validator.h for the Task 7 per-worker schema validation
 # hook.  Consumers that include Worker.h via RUNE_NODE_INCLUDE need rune_codec headers.
@@ -64,6 +67,14 @@ if(BUILD_TESTING)
         GTest::gtest_main)
     include(GoogleTest)
     gtest_discover_tests(rune_gateway_session_tests)
+
+    # Authentication Task 9: the control thread's SecurityView (D29).
+    add_executable(rune_gateway_security_view_tests
+        tests/gateway/SecurityViewTest.cpp)
+    target_link_libraries(rune_gateway_security_view_tests PRIVATE
+        rune_gateway
+        GTest::gtest_main)
+    gtest_discover_tests(rune_gateway_security_view_tests)
 
     # -------------------------------------------------------------------------
     # client<->broker TLS/AEAD (Task 7 handshake + Task 8 data-plane AEAD):

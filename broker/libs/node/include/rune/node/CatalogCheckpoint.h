@@ -28,27 +28,49 @@
 
 namespace rune::node {
 
-struct CatalogCheckpoint {
+/// Authentication plan Task 9 (D39): the checkpoint of ANY admin-owned replicated log (`__catalog`, `__security`) —
+/// one file format, one writer, one reader; the log's kind names it in messages and carries its magic (so a
+/// `__security` checkpoint is never mistaken for a `__catalog` one).
+struct LogCheckpoint {
     int64_t  appliedOffset = -1;
     uint64_t digest        = 0;
-    bool operator==(const CatalogCheckpoint&) const = default;
+    bool operator==(const LogCheckpoint&) const = default;
 };
+using CatalogCheckpoint = LogCheckpoint;
 
-/// The checkpoint file's name inside the catalog directory.
+struct LogCheckpointKind {
+    const char* name;            // "__catalog" | "__security" — in every message
+    char        magic[8];        // the file's first 8 bytes
+};
+inline constexpr LogCheckpointKind kCatalogLogKind  {"__catalog",  {'R', 'C', 'A', 'T', 'A', 'P', 'L', '1'}};
+inline constexpr LogCheckpointKind kSecurityLogKind {"__security", {'R', 'S', 'E', 'C', 'A', 'P', 'L', '1'}};
+
+/// The checkpoint file's name inside the log's directory.
 inline constexpr const char* kCatalogCheckpointFile = "applied";
 
-/// nullopt = none (no file).  Throws std::runtime_error (naming the path) on an
+/// nullopt = none (no file).  Throws std::runtime_error (naming the log and the path) on an
 /// unreadable, short, foreign or corrupt file.
-[[nodiscard]] std::optional<CatalogCheckpoint> readCatalogCheckpoint(const std::string& catalogDir);
+[[nodiscard]] std::optional<LogCheckpoint> readLogCheckpoint(const std::string& dir, const LogCheckpointKind& kind);
 
 /// tmp + fsync + rename + directory fsync.  false = not durable (errno is left
 /// set by the failing call); the previous checkpoint, if any, is intact.
-[[nodiscard]] bool writeCatalogCheckpoint(const std::string& catalogDir, const CatalogCheckpoint& c);
+[[nodiscard]] bool writeLogCheckpoint(const std::string& dir, const LogCheckpoint& c, const LogCheckpointKind& kind);
 
 /// Review M8 (Task 6 carry-over): a checkpoint at or past the local log end means
 /// the log lost events this broker already applied (and effected) — replaying the
-/// shorter log would silently fork this broker's catalog.  nullopt = consistent;
+/// shorter log would silently fork this broker's state.  nullopt = consistent;
 /// otherwise the explicit refusal message.  `logEndOffset` = the recovered LEO.
+[[nodiscard]] std::optional<std::string> logCheckpointBeyondLog(const std::optional<LogCheckpoint>& c,
+                                                                int64_t logEndOffset, const std::string& dir,
+                                                                const LogCheckpointKind& kind);
+
+// The catalog's names stay (wrappers over the generic ones above).
+[[nodiscard]] inline std::optional<CatalogCheckpoint> readCatalogCheckpoint(const std::string& catalogDir) {
+    return readLogCheckpoint(catalogDir, kCatalogLogKind);
+}
+[[nodiscard]] inline bool writeCatalogCheckpoint(const std::string& catalogDir, const CatalogCheckpoint& c) {
+    return writeLogCheckpoint(catalogDir, c, kCatalogLogKind);
+}
 [[nodiscard]] std::optional<std::string> catalogCheckpointBeyondLog(const std::optional<CatalogCheckpoint>& c,
                                                                     int64_t logEndOffset,
                                                                     const std::string& catalogDir);

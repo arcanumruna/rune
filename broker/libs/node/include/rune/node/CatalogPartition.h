@@ -19,14 +19,7 @@
 // This header stays free of NodeConfig.h (the bridge includes it; NodeConfig's
 // rune::node::TopicSpec collides with rune::metadata::TopicSpec in tests).
 
-#include <rune/replication/PartitionReplica.h>   // PartitionConfig, PartitionReplica
-#include <rune/replication/ReplicationMessages.h>
-
-#include <cstddef>
-#include <cstdint>
-#include <exception>
-
-#include <spdlog/spdlog.h>
+#include <rune/node/AdminLogPartition.h>   // the generic helpers this header's names delegate to
 
 namespace rune::node {
 
@@ -34,80 +27,27 @@ struct NodeConfig;
 
 /// The catalog's topic id (== rune::protocol::client::kCatalogTopicId; pinned by
 /// a static_assert in CatalogPartition.cpp).  Partition 0 is its only partition.
-inline constexpr int32_t kCatalogTopicId   = -6;
-inline constexpr int32_t kCatalogPartition = 0;
+inline constexpr int32_t kCatalogTopicId   = kAdminLogCatalogTopicId;   // -6
+inline constexpr int32_t kCatalogPartition = kAdminLogPartition;
 
 /// minIsr of `__catalog`: a majority of the brokers.
-[[nodiscard]] inline int32_t catalogMinIsr(std::size_t brokers) noexcept {
-    return static_cast<int32_t>(brokers / 2 + 1);
+[[nodiscard]] inline int32_t catalogMinIsr(std::size_t brokers) noexcept { return adminLogMinIsr(brokers); }
+
+/// The `__catalog` PartitionConfig (makeAdminLogPartitionConfig for -6).
+[[nodiscard]] inline rune::replication::PartitionConfig makeCatalogPartitionConfig(const NodeConfig& config,
+                                                                                   std::size_t brokers) {
+    return makeAdminLogPartitionConfig(config, brokers, kCatalogTopicId);
 }
 
-/// The `__catalog` PartitionConfig: Delete policy with no retention (never
-/// compacted, never retention-deleted, log start 0), minIsr = majority,
-/// Majority durability.  Every catalog append is acks=all (the replica's
-/// min-ISR gate: PartitionReplica::append(records, /*acksAll=*/true)).
-[[nodiscard]] rune::replication::PartitionConfig makeCatalogPartitionConfig(const NodeConfig& config,
-                                                                            std::size_t brokers);
+using CatalogFrameStats = AdminLogFrameStats;
 
-/// Frames the admin thread's catalog plane polled that it could not apply: a
-/// frame for another (topic, partition) — never possible on the dedicated
-/// catalog stream unless a peer is misconfigured — or a replica handler that
-/// threw.  Both are counted and logged (never silent).
-struct CatalogFrameStats {
-    uint64_t misrouted = 0;
-    uint64_t failed    = 0;
-};
-
-/// Apply one replication frame received on the catalog plane to the catalog
-/// replica (admin thread).  Mirrors Worker::pollReplTransportDispatch_ for the
-/// single admin-owned replica: the frame pointer is a zero-copy view valid only
-/// inside this call (the replica copies what it keeps).
+/// Apply one replication frame received on the catalog plane to the catalog replica (admin thread) — the generic
+/// dispatch with only -6 mapped.
 inline void dispatchCatalogFrame(rune::replication::PartitionReplica& replica,
                                  int32_t topicId, int32_t partition, uint16_t templateId,
                                  const uint8_t* frame, std::size_t len, int64_t nowNs,
                                  CatalogFrameStats& stats) noexcept {
-    namespace rr = rune::replication;
-    if (topicId != kCatalogTopicId || partition != kCatalogPartition) [[unlikely]] {
-        if (stats.misrouted++ % 1024 == 0)
-            spdlog::error("__catalog plane: frame for topicId={} partition={} (templateId={}) dropped — "
-                          "the catalog stream carries only (-6, 0); a peer is misconfigured "
-                          "(RUNE_CATALOG_REPL_STREAM_ID collision?) — dropped so far: {}",
-                          topicId, partition, templateId, stats.misrouted);
-        return;
-    }
-    try {
-        switch (templateId) {
-        case static_cast<uint16_t>(rr::ReplicationTemplateId::FetchRequest):
-            replica.onFetchRequest(rr::FetchRequestMsg::decode(frame, 0, len), nowNs);
-            break;
-        case static_cast<uint16_t>(rr::ReplicationTemplateId::FetchResponse):
-            replica.applyReplicated(rr::FetchResponseMsg::decode(frame, 0, len));
-            break;
-        case static_cast<uint16_t>(rr::ReplicationTemplateId::OffsetsForLeaderEpochReq):
-            replica.onOffsetsForLeaderEpochRequest(rr::OffsetsForLeaderEpochReqMsg::decode(frame, 0));
-            break;
-        case static_cast<uint16_t>(rr::ReplicationTemplateId::OffsetsForLeaderEpochResp):
-            replica.applyOffsetsForLeaderEpochResponse(rr::OffsetsForLeaderEpochRespMsg::decode(frame, 0));
-            break;
-        case rr::kReconcileFetchReqTemplateId:
-            replica.onReconcileRequest(rr::FetchRequestMsg::decode(frame, 0, len));
-            break;
-        case rr::kReconcileFetchRespTemplateId:
-            replica.applyReconcileResponse(rr::FetchResponseMsg::decode(frame, 0, len));
-            break;
-        default:
-            // The transport already drops unknown template ids before dispatch.
-            break;
-        }
-    } catch (const std::exception& ex) {
-        if (stats.failed++ % 1024 == 0)
-            spdlog::error("__catalog plane: templateId={} handler threw: {} (failures so far: {})",
-                          templateId, ex.what(), stats.failed);
-    } catch (...) {
-        if (stats.failed++ % 1024 == 0)
-            spdlog::error("__catalog plane: templateId={} handler threw an unknown exception "
-                          "(failures so far: {})", templateId, stats.failed);
-    }
+    dispatchAdminLogFrame(AdminLogReplicas{&replica, nullptr}, topicId, partition, templateId, frame, len, nowNs, stats);
 }
 
 } // namespace rune::node

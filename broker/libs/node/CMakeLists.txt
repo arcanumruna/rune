@@ -14,9 +14,12 @@ add_library(rune_node
     src/SchemaRegistry.cpp
     src/ViewRegistry.cpp
     src/AdminWorker.cpp
+    src/AdminLogPartition.cpp
     src/CatalogPartition.cpp
     src/CatalogCheckpoint.cpp
     src/CatalogApplier.cpp
+    src/SecurityApplier.cpp
+    src/SecurityAdmin.cpp
     src/CatalogReadServer.cpp
     src/CatalogEffectFrames.cpp
     src/ViewSnapshotIoAgent.cpp
@@ -60,6 +63,8 @@ target_link_libraries(rune_node PUBLIC rune_view)
 # Catalog history Task 7: the CatalogApplier folds __catalog through the shared
 # rune_catalog library (decode / apply / fingerprints — one set of frozen rules).
 target_link_libraries(rune_node PUBLIC rune_catalog)
+# Authentication plan Task 9: the SecurityApplier folds __security through rune_security; cluster keys via rune_peerlink.
+target_link_libraries(rune_node PUBLIC rune_security rune_peerlink)
 if(aeron_FOUND)
     target_link_libraries(rune_node PUBLIC aeron::aeron rune_replication_aeron rune_aeron_util)
     # Aeron's embedded media driver calls uuid_generate() from libuuid on Linux;
@@ -166,6 +171,7 @@ if(BUILD_TESTING)
         tests/node/ViewReadinessRegressionTest.cpp
         tests/node/ViewRecoveryRegressionTest.cpp
         tests/node/CatalogApplierTest.cpp
+        tests/node/SecurityApplierTest.cpp
         tests/node/CatalogWritePathTest.cpp
         tests/node/CatalogLeadershipTest.cpp
         tests/node/CatalogReadServerTest.cpp
@@ -196,6 +202,18 @@ if(BUILD_TESTING)
         rune_view
         GTest::gtest_main)
     gtest_discover_tests(rune_catalog_alloc_regression_tests)
+
+    # Authentication Task 9 (hard rule 4): an idle SecurityApplier pass allocates nothing.  Replaces the global
+    # operator new (binary-wide) — own binary, like the catalog's.
+    add_executable(rune_security_alloc_regression_tests
+        tests/node/SecurityAllocRegressionTest.cpp)
+    target_include_directories(rune_security_alloc_regression_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(rune_security_alloc_regression_tests PRIVATE
+        rune_node
+        rune_codec
+        rune_view
+        GTest::gtest_main)
+    gtest_discover_tests(rune_security_alloc_regression_tests)
 
     # Catalog history Task 20: the interaction matrix — the expectation table, the
     # 3-broker harness (3 AdminWorkers + replicas over one FilteringTransport, real
@@ -1605,7 +1623,8 @@ if(BUILD_TESTING)
         # (never unclean), new / wiped brokers refetch from 0; the admin/control
         # role + ISR relay units.
         add_executable(rune_catalog_replication_tests tests/integration/CatalogReplicationTest.cpp
-                tests/integration/StorageLossClusterTest.cpp)
+                tests/integration/StorageLossClusterTest.cpp
+                tests/integration/SecurityReplicationTest.cpp)
         target_include_directories(rune_catalog_replication_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_catalog_replication_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_catalog_replication_tests PROPERTIES TIMEOUT 360)

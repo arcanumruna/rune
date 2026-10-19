@@ -24,9 +24,17 @@
 #include <CncFileReader.h>
 #include <concurrent/CountersReader.h>
 
+#include <rune/node/AuthDevMode.h>
+#include <rune/node/SecurityPartition.h>
+#include <rune/security/SecurityEvent.h>
+#include <rune/security/testing/SecurityGoldenScript.h>
+
+#include <spdlog/sinks/ringbuffer_sink.h>
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <fstream>
+#include <span>
 #include <chrono>
 #include <filesystem>
 #include <string>
@@ -285,4 +293,125 @@ TEST(RoleCounterRegression, StorageGateCountersArePublishedRegression) {
     }
     EXPECT_TRUE(sawOne) << "the storage gate counter never read UNCONFIRMED (1) on the wiped node";
     EXPECT_TRUE(sawZeroAfter) << "the storage gate counter never returned to CONFIRMED (0)";
+}
+
+// ===========================================================================
+// Authentication Task 9: the auth-mode counter (1'000'228), the dev-mode warning, the cluster key check at start, and
+// the `__security` metrics (1'000'226 halted offset + 1 / 1'000'227 applied offset), all read from the CnC file.
+// ===========================================================================
+namespace {
+
+struct WarnCapture {   // RAII: never leaks the capture logger into later tests
+    std::shared_ptr<spdlog::sinks::ringbuffer_sink_mt> sink = std::make_shared<spdlog::sinks::ringbuffer_sink_mt>(1024);
+    std::shared_ptr<spdlog::logger> previous = spdlog::default_logger();
+    WarnCapture() {
+        auto capture = std::make_shared<spdlog::logger>("auth-capture", sink);
+        capture->set_level(spdlog::level::info);
+        spdlog::set_default_logger(capture);
+    }
+    ~WarnCapture() { spdlog::set_default_logger(previous); }
+    int count(const std::string& text) const {
+        int n = 0;
+        for (const std::string& l : sink->last_formatted()) n += l.find(text) != std::string::npos ? 1 : 0;
+        return n;
+    }
+    WarnCapture(const WarnCapture&) = delete;
+    WarnCapture& operator=(const WarnCapture&) = delete;
+};
+
+bool awaitCounter(const fs::path& aeronDir, std::int32_t typeId, std::int64_t want, std::chrono::milliseconds within) {
+    const auto deadline = std::chrono::steady_clock::now() + within;
+    while (std::chrono::steady_clock::now() < deadline) {
+        std::int64_t v = -999;
+        if (readCounterByType(aeronDir, typeId, v) && v == want) return true;
+        std::this_thread::sleep_for(20ms);
+    }
+    return false;
+}
+
+}  // namespace
+
+// Spec §9: RUNE_AUTH=disabled on one node starts, warns (once at start), and publishes counter 1'000'228 = 1.
+TEST(NodeConfigRegression, DevModeSingleNodeStartsAndWarns) {
+    TempDir tmp{"devmode_"};
+    NodeConfig cfg = makeSingleNodeConfig(tmp.path);
+    cfg.authMode = AuthMode::DevDisabled;
+    WarnCapture log;   // installed BEFORE any broker thread exists, and outliving the node
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(5s));
+    const fs::path aeronDir = tmp.path / "aeron";
+    EXPECT_TRUE(awaitCounter(aeronDir, kAuthModeCounterTypeId, 1, 10s)) << "counter 1'000'228 = 1 in dev mode";
+    EXPECT_GE(log.count("AUTHENTICATION DISABLED (RUNE_AUTH=disabled)"), 1) << "the dev-mode warning at start";
+    EXPECT_GE(log.count("every request runs as 'anonymous' with full access"), 1);
+    node.stop();
+}
+
+// An enabled broker with a good cluster key file starts and publishes 0; one with a 31-byte file refuses to start.
+TEST(NodeConfigRegression, EnabledModeNeedsAUsableClusterKeyFileAtStartRegression) {
+    TempDir tmp{"enabled_"};
+    const fs::path good = tmp.path.string() + "_good.key";
+    const fs::path bad  = tmp.path.string() + "_bad.key";
+    { std::ofstream(good) << std::string(40, 'k') << "\n"; }
+    { std::ofstream(bad) << std::string(31, 'k'); }
+    fs::permissions(good, fs::perms::owner_read | fs::perms::owner_write);
+    fs::permissions(bad, fs::perms::owner_read | fs::perms::owner_write);
+    {
+        NodeConfig cfg = makeSingleNodeConfig(tmp.path);
+        cfg.authMode = AuthMode::Enabled;
+        cfg.clusterKeyFile = bad.string();
+        BrokerNode node{cfg};
+        try {
+            node.start();
+            ADD_FAILURE() << "a short cluster key file must refuse to start";
+            node.stop();
+        } catch (const std::runtime_error& e) {
+            EXPECT_NE(std::string(e.what()).find("RUNE_CLUSTER_KEY_FILE"), std::string::npos) << e.what();
+            EXPECT_NE(std::string(e.what()).find(bad.string()), std::string::npos) << e.what();
+        }
+    }
+    TempDir tmp2{"enabled2_"};
+    NodeConfig cfg = makeSingleNodeConfig(tmp2.path);
+    cfg.authMode = AuthMode::Enabled;
+    cfg.clusterKeyFile = good.string();
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(5s));
+    EXPECT_TRUE(awaitCounter(tmp2.path / "aeron", kAuthModeCounterTypeId, 0, 10s)) << "counter 1'000'228 = 0 when enabled";
+    node.stop();
+    std::error_code ec; fs::remove(good, ec); fs::remove(bad, ec);
+}
+
+// The `__security` counters: applied offset follows the mirrored events; a record the rules refuse raises the halt
+// counter to (offset + 1) - the operator alert of D28.
+TEST(RoleCounterTest, SecurityApplyMetricsReadableFromCncRegression) {
+    TempDir tmp{"secmetrics_"};
+    NodeConfig cfg = makeSingleNodeConfig(tmp.path);
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(5s));
+    const fs::path aeronDir = tmp.path / "aeron";
+    ASSERT_TRUE(awaitCounter(aeronDir, kSecurityAppliedOffsetCounterTypeId, -1, 10s)) << "registered, nothing applied";
+    ASSERT_TRUE(awaitCounter(aeronDir, kSecurityApplyHaltedCounterTypeId, 0, 10s));
+
+    auto events = rune::security::testing::goldenScriptV1();
+    events[2].fingerprint ^= 1;
+    auto append = [&](std::size_t i) {
+        auto bytes = rune::security::encode(events[i]);
+        int64_t base = -1;
+        const auto deadline = std::chrono::steady_clock::now() + 10s;
+        while (base < 0 && std::chrono::steady_clock::now() < deadline) {
+            base = node.appendSecurityRecordOnLeaderForTest(std::span<const uint8_t>(*bytes));
+            if (base < 0) std::this_thread::sleep_for(20ms);
+        }
+        return base;
+    };
+    ASSERT_EQ(append(0), 0);
+    ASSERT_EQ(append(1), 1);
+    EXPECT_TRUE(awaitCounter(aeronDir, kSecurityAppliedOffsetCounterTypeId, 1, 10s));
+    EXPECT_TRUE(awaitCounter(aeronDir, kSecurityApplyHaltedCounterTypeId, 0, 1s));
+    ASSERT_EQ(append(2), 2);   // tampered
+    EXPECT_TRUE(awaitCounter(aeronDir, kSecurityApplyHaltedCounterTypeId, 3, 10s)) << "halted offset 2 -> counter 3";
+    EXPECT_TRUE(awaitCounter(aeronDir, kSecurityAppliedOffsetCounterTypeId, 1, 1s)) << "applied stays at the last good event";
+    node.stop();
 }

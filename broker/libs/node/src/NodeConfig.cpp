@@ -2,6 +2,7 @@
 #include <rune/catalog/TopicName.h>
 #include <rune/consensus/PeerResolution.h>
 #include <rune/node/Worker.h>
+#include <rune/peerlink/ClusterKeys.h>
 #include <rune/storage/Log.h>                       // Log::kMaxRollBytes                         // Worker::maxAcceptableBatchBytes (THE batch limit)
 
 #include <stdexcept>
@@ -12,6 +13,8 @@
 #include <cerrno>
 #include <charconv>
 #include <filesystem>
+#include <sys/stat.h>
+#include <spdlog/spdlog.h>
 #include <optional>
 #include <cstdlib>
 #include <sstream>
@@ -267,6 +270,31 @@ std::optional<std::string> NodeConfig::validateCatalogStream() const {
                " lies in the per-worker replication range [" + std::to_string(replBaseStreamId) + ", " +
                std::to_string(static_cast<int64_t>(replBaseStreamId) + count - 1) +
                "] (RUNE_REPL_BASE_STREAM_ID + RUNE_WORKERS)";
+    }
+    return std::nullopt;
+}
+
+// ---------------------------------------------------------------------------
+// NodeConfig::validateAuth  (authentication plan Task 9, D31/D32)
+// ---------------------------------------------------------------------------
+std::optional<std::string> NodeConfig::validateAuth() const {
+    if (authMode == AuthMode::DevDisabled) {
+        if (peers.size() > 1)
+            return "RUNE_AUTH=disabled (dev mode) refuses to start as part of a multi-broker cluster (RUNE_PEERS lists " +
+                   std::to_string(peers.size()) + " brokers); enable authentication";
+        return std::nullopt;
+    }
+    if (authMode == AuthMode::InProcessUnauthenticated) return std::nullopt;
+    auto keys = rune::peerlink::loadClusterKeys(clusterKeyFile, clusterKeyFileNext);
+    if (!keys) return std::move(keys.error());
+    // Group / world access is warned about, not refused (Kubernetes secrets mount 0644).
+    for (const std::string* f : {&clusterKeyFile, &clusterKeyFileNext}) {
+        if (f->empty()) continue;
+        struct stat st {};
+        if (::stat(f->c_str(), &st) == 0 && (st.st_mode & (S_IRWXG | S_IRWXO)) != 0)
+            spdlog::warn("{}={} is readable by group or others (mode {:o}); restrict it to the broker's user (0600)",
+                         f == &clusterKeyFile ? "RUNE_CLUSTER_KEY_FILE" : "RUNE_CLUSTER_KEY_FILE_NEXT", *f,
+                         static_cast<unsigned>(st.st_mode & 0777));
     }
     return std::nullopt;
 }
@@ -828,6 +856,29 @@ ConfigResult parseNodeConfig(
     }
 #endif
 
+    // --- Authentication (authentication plan Task 9): RUNE_AUTH default ON; dev mode is explicit and single-node.
+    if (const char* raw = getenv_fn("RUNE_AUTH"); raw && *raw) {
+        const std::string_view v(raw);
+        if (v == "enabled")       cfg.authMode = AuthMode::Enabled;
+        else if (v == "disabled") cfg.authMode = AuthMode::DevDisabled;
+        else return {{}, std::string("RUNE_AUTH must be 'enabled' (the default) or 'disabled' (dev mode), got: ") + raw};
+    } else {
+        cfg.authMode = AuthMode::Enabled;
+    }
+    if (const char* raw = getenv_fn("RUNE_CLUSTER_KEY_FILE"); raw && *raw) cfg.clusterKeyFile = raw;
+    if (const char* raw = getenv_fn("RUNE_CLUSTER_KEY_FILE_NEXT"); raw && *raw) cfg.clusterKeyFileNext = raw;
+    if (const char* raw = getenv_fn("RUNE_AUTH_TIMEOUT_MS"); raw && *raw) {
+        int64_t v = 0;
+        if (!parseInt64Positive(raw, v))
+            return {{}, std::string("RUNE_AUTH_TIMEOUT_MS must be a positive integer (ms), got: ") + raw};
+        cfg.authTimeoutMs = v;
+    }
+    if (const char* raw = getenv_fn("RUNE_PEER_AUTH_STREAM_ID"); raw && *raw) {
+        int32_t v = 0;
+        if (!parseInt32(raw, v) || v < 1)
+            return {{}, std::string("RUNE_PEER_AUTH_STREAM_ID must be a positive integer, got: ") + raw};
+        cfg.peerAuthStreamId = v;
+    }
     // Topics exist only through DDL (catalog history spec §8).  The retired static-topic setting is an
     // explicit refusal when present — never silently ignored.
     if (getenv_fn("RUNE_TOPICS") != nullptr)
@@ -1343,6 +1394,15 @@ ConfigResult parseNodeConfig(
 
     // Catalog history Task 6: after RUNE_WORKERS (the per-worker range) is known.
     if (auto err = cfg.validateCatalogStream()) return {{}, *err};
+
+    // Authentication (Task 9): last, so every other parse error keeps naming itself first.
+    if (cfg.authMode == AuthMode::DevDisabled && cfg.peers.size() > 1)
+        return {{}, "RUNE_AUTH=disabled (dev mode) refuses to start as part of a multi-broker cluster (RUNE_PEERS lists " +
+                        std::to_string(cfg.peers.size()) + " brokers); enable authentication"};
+    if (cfg.authMode == AuthMode::Enabled && cfg.clusterKeyFile.empty())
+        return {{}, "RUNE_CLUSTER_KEY_FILE is required when authentication is enabled (RUNE_AUTH unset or 'enabled'): "
+                    "point it at the shared cluster key file (generate one with `rune security gen-cluster-key`), or set "
+                    "RUNE_AUTH=disabled for single-node development"};
 
     return {std::move(cfg), {}, std::move(warnings)};
 }

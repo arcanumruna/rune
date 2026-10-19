@@ -33,7 +33,10 @@ namespace rune::node {
 
 class AdminIsrChannel final : public rune::replication::PartitionTransport {
 public:
-    explicit AdminIsrChannel(OneToOneByteRing& adminToControl) noexcept : ring_(adminToControl) {}
+    /// `msgType` = the admin→control message the proposal travels as: kA2cCatalogAlterIsr (the default, `__catalog`)
+    /// or kA2cSecurityAlterIsr (`__security`, authentication Task 9 / D39).
+    explicit AdminIsrChannel(OneToOneByteRing& adminToControl, int32_t msgType = kA2cCatalogAlterIsr) noexcept
+        : ring_(adminToControl), msgType_(msgType) {}
 
     AdminIsrChannel(const AdminIsrChannel&)            = delete;
     AdminIsrChannel& operator=(const AdminIsrChannel&) = delete;
@@ -47,7 +50,7 @@ public:
             ++refused_;
             return false;
         }
-        const auto idx = ring_.tryClaim(kA2cCatalogAlterIsr, rune::replication::AlterIsrMsg::TOTAL_SIZE);
+        const auto idx = ring_.tryClaim(msgType_, rune::replication::AlterIsrMsg::TOTAL_SIZE);
         if (idx < 0) {
             ++refused_;
             return false;
@@ -75,6 +78,7 @@ public:
 
 private:
     OneToOneByteRing& ring_;
+    int32_t  msgType_;
     uint64_t sent_    = 0;
     uint64_t refused_ = 0;
 };
@@ -88,10 +92,11 @@ private:
 /// (Control thread) relay the controller's answer for (-6, 0) to the admin
 /// thread, verbatim.  false = role ring full (the caller retries).
 [[nodiscard]] inline bool encodeCatalogAlterIsrResponse(OneToOneByteRing& roleRing,
-                                                        const rune::replication::AlterIsrResponseMsg& r) {
+                                                        const rune::replication::AlterIsrResponseMsg& r,
+                                                        int32_t msgType = kMsgCatalogAlterIsrResponse) {
     if (rune::replication::AlterIsrResponseMsg::TOTAL_SIZE > static_cast<std::size_t>(roleRing.maxMsgLength()))
         [[unlikely]] return false;   // tryClaim would throw; unreachable on the 4 KiB role ring
-    const auto idx = roleRing.tryClaim(kMsgCatalogAlterIsrResponse,
+    const auto idx = roleRing.tryClaim(msgType,
                                        rune::replication::AlterIsrResponseMsg::TOTAL_SIZE);
     if (idx < 0) return false;
     if (r.encode(roleRing.base() + idx, rune::replication::AlterIsrResponseMsg::TOTAL_SIZE) == 0) [[unlikely]] {
@@ -113,10 +118,11 @@ private:
 enum class CatalogAnswerRelay : uint8_t { Delivered, Held, Dropped };
 
 [[nodiscard]] inline CatalogAnswerRelay relayCatalogAlterIsrResponse(OneToOneByteRing* roleRing, bool rolePending,
-                                                                     const rune::replication::AlterIsrResponseMsg& r) {
+                                                                     const rune::replication::AlterIsrResponseMsg& r,
+                                                                     int32_t msgType = kMsgCatalogAlterIsrResponse) {
     if (roleRing == nullptr) return CatalogAnswerRelay::Dropped;
     if (rolePending) return CatalogAnswerRelay::Held;
-    return encodeCatalogAlterIsrResponse(*roleRing, r) ? CatalogAnswerRelay::Delivered : CatalogAnswerRelay::Held;
+    return encodeCatalogAlterIsrResponse(*roleRing, r, msgType) ? CatalogAnswerRelay::Delivered : CatalogAnswerRelay::Held;
 }
 
 /// (Admin thread) decode a kMsgCatalogAlterIsrResponse frame.  false = malformed.

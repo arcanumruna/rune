@@ -13,7 +13,6 @@
 namespace rune::node {
 namespace {
 
-constexpr std::array<char, 8> kMagic{'R', 'C', 'A', 'T', 'A', 'P', 'L', '1'};
 constexpr std::size_t kFileBytes = 8 + 8 + 8 + 8;
 
 uint64_t fnv1a64(const uint8_t* p, std::size_t n) noexcept {
@@ -138,12 +137,12 @@ bool writeCatalogHistoryEpoch(const std::string& path, const std::string& tmpPat
     return replaceDurably(path.c_str(), tmpPath.c_str(), dir.c_str(), buf.data(), buf.size());
 }
 
-std::optional<CatalogCheckpoint> readCatalogCheckpoint(const std::string& catalogDir) {
+std::optional<LogCheckpoint> readLogCheckpoint(const std::string& catalogDir, const LogCheckpointKind& kind) {
     const std::string path = (std::filesystem::path{catalogDir} / kCatalogCheckpointFile).string();
     const int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) {
         if (errno == ENOENT) return std::nullopt;
-        throw std::runtime_error("__catalog checkpoint " + path + ": open failed: " + std::strerror(errno));
+        throw std::runtime_error(std::string{kind.name} + " checkpoint " + path + ": open failed: " + std::strerror(errno));
     }
     std::array<uint8_t, kFileBytes + 1> buf{};
     std::size_t got = 0;
@@ -153,32 +152,32 @@ std::optional<CatalogCheckpoint> readCatalogCheckpoint(const std::string& catalo
             if (errno == EINTR) continue;
             const int saved = errno;
             ::close(fd);
-            throw std::runtime_error("__catalog checkpoint " + path + ": read failed: " + std::strerror(saved));
+            throw std::runtime_error(std::string{kind.name} + " checkpoint " + path + ": read failed: " + std::strerror(saved));
         }
         if (r == 0) break;
         got += static_cast<std::size_t>(r);
     }
     ::close(fd);
     if (got != kFileBytes)
-        throw std::runtime_error("__catalog checkpoint " + path + " is " + std::to_string(got) + " bytes (expected " +
+        throw std::runtime_error(std::string{kind.name} + " checkpoint " + path + " is " + std::to_string(got) + " bytes (expected " +
                                  std::to_string(kFileBytes) + ") — damaged; refusing to guess what was applied");
-    if (std::memcmp(buf.data(), kMagic.data(), kMagic.size()) != 0)
-        throw std::runtime_error("__catalog checkpoint " + path + " has a foreign magic — refusing to guess what was applied");
+    if (std::memcmp(buf.data(), kind.magic, sizeof kind.magic) != 0)
+        throw std::runtime_error(std::string{kind.name} + " checkpoint " + path + " has a foreign magic — refusing to guess what was applied");
     if (fnv1a64(buf.data(), 24) != getU64(buf.data() + 24))
-        throw std::runtime_error("__catalog checkpoint " + path + " fails its checksum — damaged; refusing to guess "
+        throw std::runtime_error(std::string{kind.name} + " checkpoint " + path + " fails its checksum — damaged; refusing to guess "
                                  "what was applied");
-    CatalogCheckpoint c;
+    LogCheckpoint c;
     c.appliedOffset = static_cast<int64_t>(getU64(buf.data() + 8));
     c.digest        = getU64(buf.data() + 16);
     if (c.appliedOffset < 0)
-        throw std::runtime_error("__catalog checkpoint " + path + " names a negative offset " +
+        throw std::runtime_error(std::string{kind.name} + " checkpoint " + path + " names a negative offset " +
                                  std::to_string(c.appliedOffset));
     return c;
 }
 
-bool writeCatalogCheckpoint(const std::string& catalogDir, const CatalogCheckpoint& c) {
+bool writeLogCheckpoint(const std::string& catalogDir, const LogCheckpoint& c, const LogCheckpointKind& kind) {
     std::array<uint8_t, kFileBytes> buf{};
-    std::memcpy(buf.data(), kMagic.data(), kMagic.size());
+    std::memcpy(buf.data(), kind.magic, sizeof kind.magic);
     putU64(buf.data() + 8, static_cast<uint64_t>(c.appliedOffset));
     putU64(buf.data() + 16, c.digest);
     putU64(buf.data() + 24, fnv1a64(buf.data(), 24));
@@ -211,17 +210,22 @@ bool writeCatalogCheckpoint(const std::string& catalogDir, const CatalogCheckpoi
     return fsyncDir(catalogDir);
 }
 
-std::optional<std::string> catalogCheckpointBeyondLog(const std::optional<CatalogCheckpoint>& c,
-                                                      int64_t logEndOffset, const std::string& catalogDir) {
+std::optional<std::string> logCheckpointBeyondLog(const std::optional<LogCheckpoint>& c, int64_t logEndOffset,
+                                                  const std::string& dir, const LogCheckpointKind& kind) {
     if (!c || c->appliedOffset < logEndOffset) return std::nullopt;
-    return "__catalog at " + catalogDir + ": the applied checkpoint names offset " +
+    return std::string{kind.name} + " at " + dir + ": the applied checkpoint names offset " +
            std::to_string(c->appliedOffset) + " but the local log ends at " + std::to_string(logEndOffset) +
            " — events this broker already applied are missing from its log (lost writes / a replaced data "
-           "dir); replaying the shorter history would silently fork the catalog.  Refusing to start: restore "
-           "the data dir (including __catalog) from backup.  Only in a multi-broker cluster whose other "
-           "brokers hold the catalog may dataDir/__catalog (including '" +
+           "dir); replaying the shorter history would silently fork " + kind.name + ".  Refusing to start: restore "
+           "the data dir (including " + kind.name + ") from backup.  Only in a multi-broker cluster whose other "
+           "brokers hold " + kind.name + " may dataDir/" + kind.name + " (including '" +
            std::string{kCatalogCheckpointFile} + "') be removed so this broker refetches it from its peers; "
            "never on a single broker (docs/SELF-HOSTING.md)";
+}
+
+std::optional<std::string> catalogCheckpointBeyondLog(const std::optional<CatalogCheckpoint>& c,
+                                                      int64_t logEndOffset, const std::string& catalogDir) {
+    return logCheckpointBeyondLog(c, logEndOffset, catalogDir, kCatalogLogKind);
 }
 
 } // namespace rune::node

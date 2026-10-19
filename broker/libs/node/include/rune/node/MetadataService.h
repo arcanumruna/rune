@@ -192,8 +192,9 @@ public:
     // Catalog history Task 6 (ruling 7): __catalog (-6) is on this path too —
     // replicas = every broker, leader elected only from ISR ∩ live
     // (allowUnclean = false), the controller preferring itself when in the ISR.
+    // Authentication Task 9 (D39): so is __security (-7), exactly alike.
     [[nodiscard]] static constexpr bool isControllerIsrInternalTopic(int32_t topicId) noexcept {
-        return topicId == -1 || topicId == -2 || topicId == -6;
+        return topicId == -1 || topicId == -2 || topicId == -6 || topicId == -7;
     }
     /// Enable the controller path for `keys` (replicated on `replicas`).
     void setCoordinatorPartitions(std::vector<rune::metadata::PartitionKey> keys,

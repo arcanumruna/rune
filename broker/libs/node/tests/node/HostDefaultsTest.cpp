@@ -728,7 +728,7 @@ TEST(HostDefaults, EnvOverridesSurviveTheDerivation) {
     // parseNodeConfig → explicit values → apply keeps them.
     std::map<std::string, std::string> env = {
         {"RUNE_NODE_ID", "0"}, {"RUNE_PEERS", "0@127.0.0.1:40110:40200:40220"},
-        {"RUNE_CLIENT_ENDPOINT", "127.0.0.1:40200"}, {"RUNE_DATA_DIR", "/tmp/hd"},
+        {"RUNE_CLIENT_ENDPOINT", "127.0.0.1:40200"}, {"RUNE_DATA_DIR", "/tmp/hd"}, {"RUNE_AUTH", "disabled"},
         {"RUNE_AERON_MTU", "1408"}, {"RUNE_AERON_RCV_WINDOW", "131072"},
         {"RUNE_AERON_SOCKET_BUFFER_BYTES", "2097152"}, {"RUNE_AERON_TERM_BUFFER_BYTES", "4194304"},
         {"RUNE_AERON_TERM_SPARSE", "true"}, {"RUNE_WORKER_MODE", "legacy"},
@@ -754,7 +754,8 @@ TEST(HostDefaults, EnvWithNothingSetIsTheDerivedDefault) {
     std::map<std::string, std::string> env = {
         {"RUNE_NODE_ID", "1"},
         {"RUNE_PEERS", "0@127.0.0.1:40110:40200:40220,1@127.0.0.1:40111:40201:40221,2@127.0.0.1:40112:40202:40222"},
-        {"RUNE_CLIENT_ENDPOINT", "127.0.0.1:40201"}, {"RUNE_DATA_DIR", "/tmp/hd"}};
+        {"RUNE_CLIENT_ENDPOINT", "127.0.0.1:40201"}, {"RUNE_DATA_DIR", "/tmp/hd"},
+        {"RUNE_CLUSTER_KEY_FILE", "/tmp/hd.key"}};
     auto r = parseNodeConfig([&](const char* k) -> const char* {
         auto it = env.find(k);
         return it == env.end() ? nullptr : it->second.c_str();
@@ -817,7 +818,7 @@ TEST(HostDefaults, InvalidMtuIsRefusedAndGarbageCoreBaseDisables) {
     auto parse = [](std::map<std::string, std::string> extra) {
         std::map<std::string, std::string> env = {
             {"RUNE_NODE_ID", "0"}, {"RUNE_PEERS", "0@127.0.0.1:40110"},
-            {"RUNE_CLIENT_ENDPOINT", "127.0.0.1:40200"}, {"RUNE_DATA_DIR", "/tmp/hd"}};
+            {"RUNE_CLIENT_ENDPOINT", "127.0.0.1:40200"}, {"RUNE_DATA_DIR", "/tmp/hd"}, {"RUNE_AUTH", "disabled"}};
         for (auto& [k, v] : extra) env[k] = v;
         return parseNodeConfig([env](const char* k) -> const char* {
             auto it = env.find(k);
@@ -1049,7 +1050,7 @@ TEST(NodeConfigEnv, IdleMaxParkUsMarksExplicitRegression) {
     const auto parse = [](const char* park) {
         std::map<std::string, std::string> env = {
             {"RUNE_NODE_ID", "0"}, {"RUNE_PEERS", "0@127.0.0.1:40110:40200:40220"},
-            {"RUNE_CLIENT_ENDPOINT", "127.0.0.1:40200"}, {"RUNE_DATA_DIR", "/tmp/hd"}};
+            {"RUNE_CLIENT_ENDPOINT", "127.0.0.1:40200"}, {"RUNE_DATA_DIR", "/tmp/hd"}, {"RUNE_AUTH", "disabled"}};
         if (park != nullptr) env["RUNE_IDLE_MAX_PARK_US"] = park;
         return parseNodeConfig([env](const char* k) -> const char* {
             auto it = env.find(k);

@@ -72,6 +72,14 @@ enum : int32_t {
     // ISR v3 Step 10 (control → admin, on the AdminRoleRing): the __catalog leader role was HELD (the storage gate is
     // closed) - an AdminRoleMsg {leader false, leaderId -1}; the admin thread asks for a failover and demotes.
     kMsgCatalogHoldLeadership = 21,
+    // Authentication Task 9 (D39) - control -> admin on the AdminRoleRing, the `__security` replica's counterparts of
+    // 9 / 10 / 21: its role (AdminRoleMsg, full form), the controller's AlterIsrResponse for (-7, 0) verbatim, and the
+    // held leader role (storage gate closed).
+    kMsgSecurityRole             = 22,
+    kMsgSecurityAlterIsrResponse = 23,
+    kMsgSecurityHoldLeadership   = 24,
+    // control -> admin on controlToAdminRing (Task 15 posts it): the peer link keys of the admin plane.
+    kMsgPeerLinkKeys             = 25,
 };
 
 /// kMsgPlacementView: [placeable:i32][haltedCount:u16][halted ids: i32 * haltedCount].
@@ -95,6 +103,11 @@ enum : int32_t {
     // Catalog history Task 12 — gateway → admin: catalog reads (CatalogReadServer).
     kMsgCatalogSubscribe   = 14,   // [session:i64][corr:i64][fromOffset:i64]
     kMsgCatalogUnsubscribe = 15,   // [session:i64][subscriptionId:i64]; -1 = the session closed (all of it)
+    // Authentication Task 10 - gateway -> admin: the security write path and `__security` reads.
+    kMsgSecurityDdl         = 30,
+    kMsgSecurityBootstrap   = 31,
+    kMsgSecuritySubscribe   = 32,  // the catalog layout: [session:i64][corr:i64][fromOffset:i64]
+    kMsgSecurityUnsubscribe = 33,  // the catalog layout: [session:i64][subscriptionId:i64]; -1 = the session closed
 };
 
 /// kMsgCatalogSubscribe / kMsgCatalogUnsubscribe (fixed layouts).
@@ -133,6 +146,12 @@ enum : int32_t {
     // kA2cCatalogTopicApplied layout; the control thread also marks the sink
     // "awaiting its plan" until the view's plan reached every worker.
     kA2cCatalogSinkApplied  = 12,
+    // Authentication Task 9 (D29/D39): the `__security` replica's AlterIsr proposal (verbatim SBE AlterIsrMsg), every
+    // applied event's bytes for the control thread's SecurityView ([offset:i64][event bytes]) and the applier's halt
+    // (the kA2cCatalogHalted layout).
+    kA2cSecurityAlterIsr    = 20,
+    kA2cSecurityApplied     = 21,
+    kA2cSecurityHalted      = 22,
 };
 
 // ---------------------------------------------------------------------------
@@ -1227,6 +1246,32 @@ inline void writeCatalogApplied(uint8_t* p, int64_t offset, uint64_t digest) noe
     offset = admin_wire::getI64(buf);
     digest = admin_wire::getU64(buf + 8);
     return offset >= 0;
+}
+
+// ─── `__security` effects (authentication Task 9; D29) ───────────────────────────────────────────────────────────
+//   kA2cSecurityApplied : [offset:i64][the applied event's record bytes]   (the control thread's SecurityView input)
+//   kA2cSecurityHalted  : the kA2cCatalogHalted layout [offset:i64][expected:u64][actual:u64][detail]
+inline constexpr std::size_t kSecurityAppliedFixedBytes = 8;
+inline void writeSecurityApplied(uint8_t* p, int64_t offset, std::span<const uint8_t> eventBytes) noexcept {
+    admin_wire::putI64(p, offset);
+    if (!eventBytes.empty()) std::memcpy(p + kSecurityAppliedFixedBytes, eventBytes.data(), eventBytes.size());
+}
+/// `bytes` aliases `buf` (valid while the ring message is).  false = short / negative offset.
+[[nodiscard]] inline bool decodeSecurityApplied(const uint8_t* buf, std::size_t len, int64_t& offset,
+                                                std::span<const uint8_t>& bytes) noexcept {
+    if (len <= kSecurityAppliedFixedBytes) return false;   // an event is never empty
+    offset = admin_wire::getI64(buf);
+    bytes  = std::span<const uint8_t>(buf + kSecurityAppliedFixedBytes, len - kSecurityAppliedFixedBytes);
+    return offset >= 0;
+}
+using SecurityHaltedMsg = CatalogHaltedMsg;
+inline constexpr std::size_t kSecurityHaltedFixedBytes = kCatalogHaltedFixedBytes;
+inline void writeSecurityHalted(uint8_t* p, int64_t offset, uint64_t expected, uint64_t actual,
+                                std::string_view detail) noexcept {
+    writeCatalogHalted(p, offset, expected, actual, detail);
+}
+[[nodiscard]] inline bool decodeSecurityHalted(const uint8_t* buf, std::size_t len, SecurityHaltedMsg& m) {
+    return decodeCatalogHalted(buf, len, m);
 }
 
 /// Claim `len` bytes of type `typeId` on `ring`, let `write(uint8_t*)` fill them,

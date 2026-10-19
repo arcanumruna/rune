@@ -38,6 +38,9 @@
 #include "rune/node/CatalogApplier.h"
 #include "rune/node/CatalogPartition.h"
 #include "rune/node/CatalogReadServer.h"
+#include "rune/node/SecurityAdmin.h"
+#include "rune/node/SecurityApplier.h"
+#include "rune/node/SecurityPartition.h"
 #include "rune/node/SchemaRegistry.h"
 #include "rune/node/TopicDirReconcile.h"
 #include "rune/node/ViewRegistry.h"
@@ -262,6 +265,29 @@ public:
     /// control → admin: the controller's AlterIsrResponse for (-6, 0), verbatim.
     void onCatalogAlterIsrResponse(const rune::replication::AlterIsrResponseMsg& r);
 
+    // ── `__security` (authentication Task 9, D39) ───────────────────────────
+    // The admin thread owns the `__security` replica and its SecurityApplier beside `__catalog`'s: the same plane
+    // (frames dispatched by topic id), the same pass.  Startup thread, before the admin thread starts:
+    /// Take over the applier the startup phase booted (phase Booted — std::runtime_error otherwise: the broker
+    /// refuses to start) and the `__security` replica (null: no security log).  The admin thread's FIRST pass
+    /// makes the applier Live through `live` (the ring encoders); nothing is replayed again.
+    void attachSecurity(SecurityApplier booted, rune::replication::PartitionReplica* replica,
+                        SecurityLiveEffects live);
+    /// Roles (control → admin, admin thread) - the SecurityAdmin's.
+    void onSecurityRole(const AdminRoleMsg& role) { if (securityAdmin_) securityAdmin_->onRole(role); }
+    void onSecurityHoldLeadership(const AdminRoleMsg& role) { if (securityAdmin_) securityAdmin_->onHoldLeadership(role); }
+    void onSecurityAlterIsrResponse(const rune::replication::AlterIsrResponseMsg& r) {
+        if (securityAdmin_) securityAdmin_->onAlterIsrResponse(r);
+    }
+    [[nodiscard]] rune::replication::PartitionReplica* securityReplica() const noexcept { return securityReplica_; }
+    [[nodiscard]] const SecurityApplier* securityApplier() const noexcept {
+        return securityApplier_ ? &*securityApplier_ : nullptr;
+    }
+    [[nodiscard]] SecurityApplier* securityApplierForTest() noexcept { return securityApplier_ ? &*securityApplier_ : nullptr; }
+    [[nodiscard]] const SecurityAdmin* securityAdmin() const noexcept { return securityAdmin_ ? &*securityAdmin_ : nullptr; }
+    /// Test seam (the 3-node suites): while held, doWork does not run the `__security` applier.
+    void holdSecurityApplyForTest(bool on) noexcept { securityApplyHeldForTest_ = on; }
+
     /// Drive the plane, the replica and the applier; advance / start DDL.
     int doWork(int64_t nowNs);
 
@@ -410,6 +436,12 @@ private:
     static constexpr int kCatalogFragmentLimit = 16;
 
     CatalogApplier                        applier_;
+    // Authentication Task 9: the `__security` log (admin-owned beside the catalog's).
+    rune::replication::PartitionReplica*  securityReplica_ = nullptr;
+    std::optional<SecurityApplier>        securityApplier_;
+    std::optional<SecurityAdmin>          securityAdmin_;
+    std::optional<SecurityLiveEffects>    pendingSecurityLive_;   // the booted applier's goLive, owed to the first pass
+    bool                                  securityApplyHeldForTest_ = false;
     CatalogRole                           role_{CatalogFollower{}};
     std::optional<CatalogReadServer>      readServer_;   // set iff catalogReplica_ (Task 12)
 

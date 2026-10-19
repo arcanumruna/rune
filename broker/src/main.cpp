@@ -154,6 +154,20 @@ int main(int argc, char** argv) {
         return 2;
     }
     for (const auto& w : warnings) spdlog::warn("rune-broker: {}", w);
+    // Authentication Task 9 (D31): the in-process default (anonymous, full access, plaintext links) exists for tests
+    // and embedders only.  parseNodeConfig never yields it; this guards an embedding mistake in this very file.
+    if (cfg->authMode == rune::node::AuthMode::InProcessUnauthenticated) {
+        std::cerr << "rune-broker: configuration error: the broker process refuses AuthMode::InProcessUnauthenticated "
+                     "(set RUNE_AUTH=enabled with RUNE_CLUSTER_KEY_FILE, or RUNE_AUTH=disabled for single-node "
+                     "development)\n";
+        return 2;
+    }
+    // The cluster key file(s) are read here, before any side effect, so a misconfiguration is exit 2 with its cause
+    // (BrokerNode::start repeats the check for programmatic configs).
+    if (auto authErr = cfg->validateAuth(); authErr.has_value()) {
+        std::cerr << "rune-broker: configuration error: " << *authErr << "\n";
+        return 2;
+    }
 
     spdlog::info("rune-broker: node {} starting, dataDir={}",
                  cfg->nodeId, cfg->dataDir);

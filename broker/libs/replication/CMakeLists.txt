@@ -10,6 +10,7 @@ target_include_directories(rune_replication PUBLIC
 # EpochFencing.h includes LeaderEpochCache.h from rune_storage; link it so
 # consumers of rune_replication also get rune_storage headers transitively.
 target_link_libraries(rune_replication PUBLIC rune_storage)
+target_link_libraries(rune_replication PUBLIC rune_peerlink)   # authentication plan Task 9
 
 # Task 4 (de-virtualised replica transport): the per-worker transport is
 # header-only Aeron code the replica calls concretely.

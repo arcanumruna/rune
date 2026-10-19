@@ -7,6 +7,8 @@ add_library(rune_consensus
 target_include_directories(rune_consensus PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         ${RUNE_PROTOCOL_INCLUDE})
+# Authentication plan Task 9: inter-broker authentication (cluster keys; Tasks 15/16 add the handshake + frame crypto).
+target_link_libraries(rune_consensus PUBLIC rune_peerlink)
 # Aeron headers needed for IngressRing, IdleStrategy, AgentRunner
 if(aeron_FOUND)
     target_link_libraries(rune_consensus PUBLIC aeron::aeron rune_aeron_util)
