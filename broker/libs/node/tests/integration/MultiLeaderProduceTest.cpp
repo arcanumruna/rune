@@ -255,10 +255,30 @@ protected:
         }
         ASSERT_TRUE(replicated) << "Metadata records must replicate to majority";
 
-        // Apply on all services.
-        metaSvc1_->doWork(clock);
-        metaSvc2_->doWork(clock);
-        metaSvc3_->doWork(clock);
+        // ISR v3 (Step 7/11): the leader claim appends a ControllerTermRecord and DECIDES nothing until its MSM has caught
+        // up to the claim LEO (ClaimCatchingUp -> ClaimReady); only then does the static assignment emit.  The loops
+        // above stop at the first appended record (the term record), so the assignments were never emitted -
+        // keep driving every replica and service until all three hold the full map (bounded, never a hang).
+        const auto complete = [this] {
+            for (MetadataService* svc : {metaSvc1_.get(), metaSvc2_.get(), metaSvc3_.get()}) {
+                for (int p = 0; p < 3; ++p)
+                    if (svc->assignment(kTopicA, p) == nullptr || svc->assignment(kTopicB, p) == nullptr) return false;
+                for (int p = 0; p < 2; ++p)
+                    if (svc->assignment(kTopicSolo, p) == nullptr) return false;
+            }
+            return true;
+        };
+        for (int i = 0; i < kDriverCap && !complete(); ++i) {
+            clock += 1'000'000LL;
+            metaReplica1_->doWork(clock);
+            metaReplica2_->doWork(clock);
+            metaReplica3_->doWork(clock);
+            metaTransport_.pump(clock);
+            metaSvc1_->doWork(clock);
+            metaSvc2_->doWork(clock);
+            metaSvc3_->doWork(clock);
+        }
+        ASSERT_TRUE(complete()) << "the leader's claim never caught up: static assignments were not emitted and applied everywhere";
 
         // ---- Verify assignment is committed on all nodes ----
         // (sanity check before building per-partition replicas)
@@ -940,6 +960,20 @@ TEST_F(MultiLeaderProduceFixture, Rf3_LaggingFollower_ShrunkByLagThenAckFires) {
 // Test 8: Follower assignment visibility — all 3 nodes see the same committed
 // assignment map after replication (end-to-end replicated metadata).
 // ===========================================================================
+// Regression (authentication Task 13, found failing at f8d49a97 and traced to ISR v3 Step 7/11): the fixture stopped
+// driving the controller at the first appended record (the claim's ControllerTermRecord); the controller decides
+// nothing until its claim caught up, so the static assignments were never emitted and EVERY fixture test failed in
+// SetUp.  SetUp now drives the claim to the full map; this pins it on all three services.
+TEST_F(MultiLeaderProduceFixture, SetUpDrivesTheLeaderClaimToTheFullStaticAssignmentOnEveryNodeRegression) {
+    for (MetadataService* svc : {metaSvc1_.get(), metaSvc2_.get(), metaSvc3_.get()}) {
+        for (int p = 0; p < 3; ++p) {
+            EXPECT_NE(svc->assignment(kTopicA, p), nullptr) << "topicA/" << p;
+            EXPECT_NE(svc->assignment(kTopicB, p), nullptr) << "topicB/" << p;
+        }
+        for (int p = 0; p < 2; ++p) EXPECT_NE(svc->assignment(kTopicSolo, p), nullptr) << "solo/" << p;
+    }
+}
+
 TEST_F(MultiLeaderProduceFixture, AllNodesSeeSameAssignmentAfterReplication) {
     // All three services must see the same assignment for each partition.
     for (int p = 0; p < 3; ++p) {
