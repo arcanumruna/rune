@@ -289,6 +289,8 @@ public:
         return pred();
     }
     const std::vector<PushedRecords>& records() const noexcept { return records_; }
+    /// Forget the pushed records and error frames seen so far (a long-lived client of a many-cell matrix).
+    void clearObserved() { records_.clear(); errors_.clear(); }
     const std::vector<ErrorSeen>&     errors()  const noexcept { return errors_; }
 
     using Clock = std::chrono::steady_clock;
@@ -342,6 +344,10 @@ public:
     }
 
     int64_t nextCorrelationId() noexcept { return ++corr_; }
+    /// The correlation id of the request this client sent last (the helpers that hide theirs).
+    [[nodiscard]] int64_t lastCorrelationId() const noexcept { return corr_; }
+    /// Authentication Task 17: how many non-Records frames arrived for `corr` (an exactly-one-answer check).
+    [[nodiscard]] std::size_t framesFor(int64_t corr) const { auto it = frameCount_.find(corr); return it == frameCount_.end() ? 0 : it->second; }
     /// Forget the last ConnectResponse, then wait for the next one (a machine that sent its own ConnectRequest through
     /// send()): nullopt if none by `deadline`.
     void forgetConnectResponse() noexcept { connect_.reset(); }
@@ -945,6 +951,7 @@ private:
     void onFrame_(const uint8_t* p, std::size_t n, int32_t imageSessionId) {
         auto hdr = pc::MessageHeader::decode(p, n);
         if (!hdr) return;
+        if (hdr->correlationId != 0 && hdr->templateId != static_cast<uint16_t>(pc::TemplateId::Records)) ++frameCount_[hdr->correlationId];
         if (captureRaw_ && hdr->correlationId != 0 && hdr->templateId != static_cast<uint16_t>(pc::TemplateId::Records))
             raw_[hdr->correlationId] = std::vector<uint8_t>(p, p + n);   // authentication Task 12: byte-level answer parity
         switch (static_cast<pc::TemplateId>(hdr->templateId)) {
@@ -1068,6 +1075,7 @@ private:
     std::map<int64_t, pc::CreateViewResponse>       views_;
     std::map<int64_t, pc::AlterTopicResponse>       alters_;
     bool                                            captureRaw_ = false;
+    std::map<int64_t, std::size_t>                  frameCount_;   // every non-Records frame by corr
     std::map<int64_t, std::vector<uint8_t>>         raw_;       // captureRawAnswers: every answer frame by corr
     std::map<int64_t, DdlAnswer>                    ddls_;      // DdlResponse (78) by corr (Task 11)
     std::map<std::pair<uint16_t, int64_t>, std::vector<uint8_t>> authFrames_;   // AuthServerFirst / Final raw bytes (auth Task 11)

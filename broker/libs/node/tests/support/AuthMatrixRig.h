@@ -3,11 +3,17 @@
 // BrokerNode (shard runtime, one worker, fused placement) with a bootstrapped admin, and per cell a fresh prefix
 // "c<ordinal>.", user, role and objects.  Every request type of AuthMatrixExpectations.h has one issue() branch that
 // sends the op's real frame and returns THE ANSWER CODE the broker gave (0 = the op's normal answer) plus whatever the
-// cell asserts on (the Metadata presence, the ViewRowResponse status, the answer frame for the no-leak check).
-// Every wait is bounded; a missing answer is code kNoAnswer, which no expectation names - the deadline is the failure.
+// cell asserts on: the answer's response template (assertion 1: the op's OWN response type), the answer frame without
+// its ids (assertion 3), the Metadata presence, the ViewRowResponse status.  Every wait is bounded; a missing answer is
+// code kNoAnswer, which no expectation names - the deadline is the failure.
+//
+// ViewOpen is GetViewRow by view topic id, the same request as ViewRead (the protocol has no name-addressed open).
 
+#include "support/AuthLogReader.h"
 #include "support/AuthMatrixExpectations.h"
 #include "support/AuthRig.h"
+
+#include <rune/protocol/RecordBatch.h>
 
 #include <algorithm>
 #include <memory>
@@ -23,6 +29,7 @@ public:
     using SO = rune::protocol::SecurityOperation;
     using ST = rune::protocol::SecurityResourceType;
     using SP = rune::protocol::SecurityPatternKind;
+    using TID = rune::protocol::client::TemplateId;
     static constexpr int32_t kMissingId = 98'765;
     static constexpr int kInvalidTxnState = 19;
 
@@ -33,11 +40,22 @@ public:
         int64_t corr = 0;            ///< the request's correlation id (streams: the subscription's)
         int64_t subId = 0;           ///< Subscribe: the subscription id
         std::string member;          ///< GroupJoin: the member id
-        std::vector<uint8_t> frame;  ///< the answer frame without its header ids (no-leak twin comparison)
+        std::vector<uint8_t> frame;  ///< the answer frame without its header ids (the no-leak twin comparison)
+        uint16_t templ = 0;          ///< the answer frame's template id
+        uint16_t wantTempl = 0;      ///< the template the op's own response type has (at the stage that answered)
+        int stage = 0;               ///< TxnProduce: 0 InitProducerId, 1 AddPartitionsToTxn, 2 Produce
     };
+    /// One transactional producer of a session (TxnProduce): initialised once, its sequence advanced per produce.
+    struct TxnState { bool inited = false; int64_t pid = 1; int16_t epoch = 0; int32_t seq = 0; };
 
-    AuthMatrixRig() : rig_("matrix", shardOptions()) {}
+    AuthMatrixRig() : rig_("matrix", shardOptions()) {
+        // The writer that makes records flow into the topic a subscription watches (assertion 4).
+        (void)rig_.newUser({grants::prefix(SO::Write, ST::Topic, "")}, &writerName_);
+        writerSid_ = rig_.login(writerName_);
+        baselineFailed_ = rig_.broker().counter(kLoginsFailedCounterTypeId).value_or(0);
+    }
     AuthRig& rig() noexcept { return rig_; }
+    int64_t writerSession() const noexcept { return writerSid_; }
 
     class Cell;
     Cell newCell();
@@ -46,7 +64,17 @@ private:
     static AuthBroker::Options shardOptions() { AuthBroker::Options o; o.shard = true; return o; }
     AuthRig rig_;
     int ordinal_ = 0;
-    friend class Cell;
+    std::string writerName_;
+    int64_t writerSid_ = 0;
+    // The bootstrap's first connection never logs in (the admin's one-time-password session is a second one), so the broker
+    // counts it once as a failed login when its authentication deadline expires: ONE extra "logins failed" tick that lands in
+    // whichever cell is running, tolerated exactly once.
+    int64_t baselineFailed_ = 0, knownFailed_ = 0;
+    // The catalog / security events read so far (a cursor each: a cell reads only what is new, never the whole log).
+    std::vector<rune::catalog::CatalogEvent> catalogEvents_;
+    std::vector<rune::security::SecurityEvent> securityEvents_;
+    int64_t catalogCursor_ = 0, securityCursor_ = 0;
+    bool deadlineTickSeen_ = false;
 };
 
 class AuthMatrixRig::Cell {
@@ -55,6 +83,10 @@ public:
         prefix_ = "c" + std::to_string(ord_) + ".";
         user_ = "u" + std::to_string(1000 + ord_);
         role_ = "r" + std::to_string(ord_);
+        okAtStart_ = counterNow(kLoginsOkCounterTypeId);
+        failedAtStart_ = counterNow(kLoginsFailedCounterTypeId);
+        revokedAtStart_ = counterNow(kSessionsRevokedCounterTypeId);
+        if (!m_.deadlineTickSeen_ && failedAtStart_ == m_.baselineFailed_ + m_.knownFailed_ + 1) m_.deadlineTickSeen_ = true;
     }
     const std::string& userName() const noexcept { return user_; }
     int64_t session() const noexcept { return sid_; }
@@ -67,6 +99,7 @@ public:
     std::string x() const { return prefix_ + "x"; }
     std::string newTopic() const { return prefix_ + "n"; }
     std::string newView() const { return prefix_ + "w"; }
+    std::string newRole() const { return "q" + std::to_string(ord_); }
 
     // ── objects (created by the builder) ────────────────────────────────────────────────────────────────────
     void createObjects(Op op, bool supportingOnly = false) {
@@ -90,7 +123,6 @@ public:
             default: break;
         }
     }
-
     /// A schema-less topic (the catalog's untyped topic: empty key field and descriptor).
     int32_t defineUntyped(const std::string& name) {
         pc::DefineTopic m;
@@ -180,11 +212,22 @@ public:
     }
 
     // ── sessions ────────────────────────────────────────────────────────────────────────────────────────────
-    void login() { sid_ = r_.login(user_); }
+    /// End the cell's sessions (a live catalog / security subscription would otherwise keep every later event flowing
+    /// to this client for the rest of the process).
+    void close() {
+        for (const int64_t s : {sid_, twinSid_})
+            if (s != 0) (void)r_.c().disconnect(r_.ch(), r_.stream(), s);
+        sid_ = twinSid_ = 0;
+        r_.c().clearObserved();
+    }
+    void login() { sid_ = r_.login(user_); ++loginsOk_; }
+    /// A reconnect attempt of the (disabled) user: the AuthServerFinal error code.
     int relogin() {
         const int64_t s = r_.wire().connect(r_.ch());
         if (s <= 0) return kNoAnswer;
-        return r_.wire().login(r_.ch(), s, user_, {AuthRig::kPw, AuthRig::kPw}).errorCode();
+        const int code = r_.wire().login(r_.ch(), s, user_, {AuthRig::kPw, AuthRig::kPw}).errorCode();
+        if (code == 0) ++loginsOk_; else ++loginsFailed_;
+        return code;
     }
     /// The session-level frame (corr 0) code after a disable, bounded.
     int awaitSessionLevel() { return errorOn(0, sid_); }
@@ -199,20 +242,37 @@ public:
     }
     /// A subscription's end: the ErrorResponse on its correlation id (GroupJoin: the member's next Heartbeat).
     int awaitEnd(Op op, const Answer& a) {
-        if (op == Op::GroupJoin) return r_.heartbeat(sid_, g(), a.member);
+        if (op == Op::GroupJoin) {
+            const int code = r_.heartbeat(sid_, g(), a.member);
+            note(r_.c().lastCorrelationId());
+            return code;
+        }
         return errorOn(a.corr);
     }
-    /// No Records frame for the subscription arrives within a short window after its end.
-    bool deliveredAfterEnd(const Answer& a) {
+
+    // ── assertion 4: records flow into a live subscription, and none after its end ──────────────────────────
+    /// Make one record flow into the subscription and wait for its delivery: the "succeeds once, subscription live and
+    /// receiving" half of the RevokedMid / UserDisabledMid timings.  Returns false (with a reason) if it never arrives.
+    bool makeLive(Op op, const Answer& a, std::string& why) {
         const std::size_t before = recordsOf(a.subId);
+        if (!trigger(op, why)) return false;
+        if (!r_.c().pollUntil([&] { return recordsOf(a.subId) > before; })) { why = "no record reached the live subscription"; return false; }
+        return true;
+    }
+    /// After the end frame was observed: produce more and assert none is delivered within the window.
+    bool noDeliveryAfterEnd(Op op, const Answer& a, std::string& why) {
+        r_.c().pollFor(std::chrono::milliseconds(20), [] { return false; });
+        const std::size_t before = recordsOf(a.subId);
+        if (!trigger(op, why)) return false;
         r_.c().pollFor(std::chrono::milliseconds(300), [] { return false; });
-        return recordsOf(a.subId) != before;
+        if (recordsOf(a.subId) != before) { why = "a Records frame was delivered after the end"; return false; }
+        return true;
     }
 
     // ── one request as the user (or as another session) ─────────────────────────────────────────────────────
-    Answer issue(Op op, bool missing, int64_t as = 0) { return issueAs(as ? as : sid_, op, missing); }
+    Answer issue(Op op, bool missing) { return issueAs(sid_, op, missing, txn_); }
 
-    Answer issueAs(int64_t sid, Op op, bool missing) {
+    Answer issueAs(int64_t sid, Op op, bool missing, TxnState& txn) {
         using namespace amatrix;
         Answer a;
         // R3: only the id-addressed requests name an id that never existed; the implicit objects (group, transactional
@@ -222,88 +282,122 @@ public:
         const int32_t tid = missing && idAddressed ? kMissingId : tid_;
         const int32_t vid = missing && idAddressed ? kMissingId : vid_;
         switch (op) {
-            case Op::Produce: a.code = produceVia(r_.broker().workerIngressChannel(), sid, tid, a); break;
-            case Op::ProduceRouted: a.code = produceVia(r_.ch(), sid, tid, a); break;
-            case Op::TxnProduce: {
-                const auto init = txnInit(sid, x());
-                if (init.code != 0) { a.code = init.code; break; }
-                a.code = txnAddPartitions(sid, init, tid, a);
+            case Op::Produce: a.wantTempl = tmpl(TID::ProduceResponse); a.code = produceVia(r_.broker().workerIngressChannel(), sid, tid, makeBatch(1), a); break;
+            case Op::ProduceRouted: a.wantTempl = tmpl(TID::ProduceResponse); a.code = produceVia(r_.ch(), sid, tid, makeBatch(1), a); break;
+            case Op::TxnProduce: a.code = txnProduce(sid, tid, txn, a); break;
+            case Op::TxnInit: {
+                a.wantTempl = tmpl(TID::InitProducerIdResponse);
+                const auto init = txnInit(sid, x(), a);
+                a.code = init.code;
                 break;
             }
-            case Op::TxnInit: a.code = txnInit(sid, x()).code; break;
             case Op::TxnEnd: {
-                auto init = txnInit(sid, x());
+                Answer scratch;
+                auto init = txnInit(sid, x(), scratch);
                 if (init.code != 0) init = {init.code, 1, 0};
+                a.wantTempl = tmpl(TID::EndTxnResponse);
                 a.code = txnEnd(sid, init, a);
                 // An authorized EndTxn with no transaction open answers InvalidTxnState (19): authorization passed, which
                 // is all the matrix asserts (WRITE on the transactional id is the whole requirement).
                 if (a.code == kInvalidTxnState) a.code = 0;
                 break;
             }
-            case Op::Subscribe: a.corr = r_.c().sendSubscribe(r_.ch(), r_.stream(), sid, tid, 0); a.code = subscribeCode(a); break;
-            case Op::CatalogRead: a.corr = r_.c().sendCatalogSubscribe(r_.ch(), r_.stream(), sid, 0); a.code = subscribeCode(a); break;
+            case Op::Subscribe: a.wantTempl = tmpl(TID::SubscribeResponse); a.corr = r_.c().sendSubscribe(r_.ch(), r_.stream(), sid, tid, 0); a.code = subscribeCode(a); break;
+            case Op::CatalogRead: a.wantTempl = tmpl(TID::SubscribeResponse); a.corr = r_.c().sendCatalogSubscribe(r_.ch(), r_.stream(), sid, 0); a.code = subscribeCode(a); break;
             case Op::SecurityRead:
+                a.wantTempl = tmpl(TID::SubscribeResponse);
                 a.corr = r_.c().sendSubscribe(r_.ch(), r_.stream(), sid, rune::protocol::client::kSecurityTopicId, 0);
                 a.code = subscribeCode(a);
                 break;
-            case Op::GroupJoin: a.code = r_.joinGroup(sid, g(), {tid}, &a.member); break;
+            case Op::GroupJoin: {
+                a.wantTempl = tmpl(TID::JoinGroupResponse);
+                const auto j = r_.c().joinGroup(r_.ch(), r_.stream(), sid, g(), {}, {tid});
+                a.corr = r_.c().lastCorrelationId();
+                note(a.corr);
+                captureFrame(a);
+                a.code = j ? j->errorCode : kNoAnswer;
+                if (j) a.member = j->memberId;
+                break;
+            }
             case Op::OffsetCommit: {
                 // A commit needs a live member: join first (a denied join leaves the commit to answer on its own).
                 std::string member = "m";
                 int32_t generation = 1;
-                if (const auto j = r_.c().joinGroup(r_.ch(), r_.stream(), sid, g(), {}, {tid}); j && j->errorCode == 0) {
-                    member = j->memberId; generation = j->generation;
+                if (const auto j = r_.c().joinGroup(r_.ch(), r_.stream(), sid, g(), {}, {tid})) {
+                    note(r_.c().lastCorrelationId());
+                    if (j->errorCode == 0) { member = j->memberId; generation = j->generation; }
                 }
+                a.wantTempl = tmpl(TID::OffsetCommitResponse);
                 const auto code = r_.c().offsetCommit(r_.ch(), r_.stream(), sid, g(), member, generation, tid, 0, 1);
+                a.corr = r_.c().lastCorrelationId();
+                note(a.corr);
+                captureFrame(a);
                 a.code = code ? *code : kNoAnswer;
                 break;
             }
-            case Op::OffsetFetch: a.code = r_.offsetFetch(sid, g(), tid); break;
+            case Op::OffsetFetch: {
+                a.wantTempl = tmpl(TID::OffsetFetchResponse);
+                const auto f = r_.c().offsetFetch(r_.ch(), r_.stream(), sid, g(), tid, 0);
+                a.corr = r_.c().lastCorrelationId();
+                note(a.corr);
+                captureFrame(a);
+                a.code = f ? f->second : kNoAnswer;
+                break;
+            }
             case Op::ViewRead: case Op::ViewOpen: {
+                a.wantTempl = tmpl(TID::ViewRowResponse);
                 a.corr = r_.c().sendGetViewRow(r_.ch(), r_.stream(), sid, vid, 1);
+                note(a.corr);
                 const auto ans = r_.c().awaitViewRowOrError(a.corr, AuthRig::dl());
+                captureFrame(a);
                 if (!ans) break;
                 a.viewStatus = ans->isError ? ans->errorCode : ans->status;
                 // 0 OK / 1 AbsentKey / 2 NotReady: authorized and answered (the view is empty); the rest as is.
-                a.code = a.viewStatus >= 0 && a.viewStatus <= 2 ? 0 : a.viewStatus;
+                a.code = !ans->isError && a.viewStatus >= 0 && a.viewStatus <= 2 ? 0 : a.viewStatus;
                 break;
             }
-            case Op::Metadata: {
-                const auto ids = r_.metadataTopics(sid);
-                a.code = 0;
-                a.present = !missing && std::find(ids.begin(), ids.end(), tid_) != ids.end();
-                break;
-            }
-            case Op::CreateTopic: a.corr = r_.c().sendDefineTopic(r_.ch(), r_.stream(), sid, newTopic(), 1, authRigCharBlob()); a.code = ddl(a); break;
-            case Op::CreateView: a.corr = r_.c().sendCreateView(r_.ch(), r_.stream(), sid, newView(), "id", 0, authRigViewPlan(newView(), {tid_})); a.code = ddl(a); break;
-            case Op::CreateSchema: a.corr = r_.c().sendDefineTopic(r_.ch(), r_.stream(), sid, u(), 1, authRigCharBlob()); a.code = ddl(a); break;
+            case Op::Metadata: metadata(sid, a); break;
+            case Op::CreateTopic: a.wantTempl = tmpl(TID::DefineTopicResponse); a.corr = r_.c().sendDefineTopic(r_.ch(), r_.stream(), sid, newTopic(), 1, authRigCharBlob()); a.code = ddl(a); okDdl(a, newTopic(), false); break;
+            case Op::CreateView: a.wantTempl = tmpl(TID::CreateViewResponse); a.corr = r_.c().sendCreateView(r_.ch(), r_.stream(), sid, newView(), "id", 0, authRigViewPlan(newView(), {tid_})); a.code = ddl(a); okDdl(a, newView(), false); break;
+            case Op::CreateSchema: a.wantTempl = tmpl(TID::DefineTopicResponse); a.corr = r_.c().sendDefineTopic(r_.ch(), r_.stream(), sid, u(), 1, authRigCharBlob()); a.code = ddl(a); okDdl(a, u(), false); break;
             case Op::AlterSchema: {
                 rune::codec::AlterOp o{};
                 o.type = rune::codec::AlterOpType::Add; o.name = "extra"; o.primType = rune::codec::PrimType::Int64; o.fixedLen = 0;
+                a.wantTempl = tmpl(TID::AlterTopicResponse);
                 a.corr = r_.c().sendAlterTopic(r_.ch(), r_.stream(), sid, t(), 0, rune::codec::encodeAlterOps({o}));
                 a.code = ddl(a);
+                okDdl(a, t(), false);
                 break;
             }
             case Op::SetCompatibility: {
                 rune::codec::AlterOp o{};
                 o.type = rune::codec::AlterOpType::SetCompatibility; o.primType = rune::codec::PrimType::Int64; o.fixedLen = 0;
                 o.mode = rune::codec::CompatMode::Forward;
+                a.wantTempl = tmpl(TID::AlterTopicResponse);
                 a.corr = r_.c().sendAlterTopic(r_.ch(), r_.stream(), sid, t(), 0, rune::codec::encodeAlterOps({o}));
                 a.code = ddl(a);
+                okDdl(a, t(), false);
                 break;
             }
             case Op::AlterTopicConfig: {
                 const pc::ConfigChangeWire cc{static_cast<uint8_t>(rune::protocol::ConfigKey::RetentionMs), 600'000};
+                a.wantTempl = tmpl(TID::DdlResponse);
                 a.corr = r_.c().sendAlterTopicConfig(r_.ch(), r_.stream(), sid, t(), 0, {cc});
                 a.code = ddl(a);
+                okDdl(a, t(), false);
                 break;
             }
-            case Op::AlterView: a.corr = r_.c().sendAlterView(r_.ch(), r_.stream(), sid, v(), "id", 0, 0, authRigViewPlan(v(), {tid_})); a.code = ddl(a); break;
-            case Op::DropTopic: a.corr = r_.c().sendDropTopic(r_.ch(), r_.stream(), sid, t()); a.code = ddl(a); break;
-            case Op::DropView: a.corr = r_.c().sendDropView(r_.ch(), r_.stream(), sid, v()); a.code = ddl(a); break;
+            case Op::AlterView: a.wantTempl = tmpl(TID::DdlResponse); a.corr = r_.c().sendAlterView(r_.ch(), r_.stream(), sid, v(), "id", 0, 0, authRigViewPlan(v(), {tid_})); a.code = ddl(a); okDdl(a, v(), false); break;
+            case Op::DropTopic: a.wantTempl = tmpl(TID::DdlResponse); a.corr = r_.c().sendDropTopic(r_.ch(), r_.stream(), sid, t()); a.code = ddl(a); okDdl(a, t(), false); break;
+            case Op::DropView: a.wantTempl = tmpl(TID::DdlResponse); a.corr = r_.c().sendDropView(r_.ch(), r_.stream(), sid, v()); a.code = ddl(a); okDdl(a, v(), false); break;
             case Op::SecurityDdl: {
-                const auto ans = securityWire().createRole(r_.ch(), sid, "q" + std::to_string(ord_) + "_" + std::to_string(++ddlSeq_));
+                a.wantTempl = tmpl(TID::DdlResponse);
+                const auto ans = r_.wire().createRole(r_.ch(), sid, newRole());
+                a.corr = r_.c().lastCorrelationId();
+                note(a.corr);
+                captureFrame(a);
                 a.code = ans.errorCode == 0xFFFF ? kNoAnswer : ans.errorCode;
+                okDdl(a, newRole(), true);
                 break;
             }
             case Op::kCount: break;
@@ -311,59 +405,166 @@ public:
         return a;
     }
 
-    /// Assertion 3 (D22 / D23): the frame of a NotAuthorized answer equals the frame a session without any grant gets for
-    /// the same request against the EXISTING object.  Call at the end of the cell.
-    bool hiddenTwinMatches(Op op, bool missing, const Answer& denied) {
-        if (denied.frame.empty()) return true;   // no frame captured for this op (txn / group / offset / metadata)
-        if (missing || tid_ < 0) createObjects(op);   // the existing object the twin must not learn about
+    /// Assertion 3 (D22 / D23): the frame of a NotAuthorized answer equals the frame a session without grants gets for
+    /// the same request against the EXISTING object (a TxnProduce twin holds WRITE on the transactional id when the
+    /// denial came after the init).  Empty string = holds; otherwise the reason.  Call at the end of the cell.
+    std::string hiddenTwinProblem(Op op, bool missing, const Answer& denied) {
+        if (denied.frame.empty()) return "no answer frame was captured for the NotAuthorized answer";
+        if (missing || tid_ < 0) { createObjects(op); if (::testing::Test::HasFatalFailure()) return "twin object creation failed"; }
         if (!twinCreated_) {
             const std::string n = "h" + std::to_string(1000 + ord_);
             const auto a = r_.broker().admin().createUser(r_.ch(), r_.broker().adminSession(), n, AuthRig::kPw);
-            if (a.errorCode != 0) return false;
+            if (a.errorCode != 0) return "twin user: " + a.detail;
+            if (op == Op::TxnProduce && denied.stage >= 1) grantTo(n, false, SO::Write, ST::TransactionalId, SP::Exact, x());
             twinSid_ = r_.login(n);
+            ++loginsOk_;
             twinCreated_ = true;
         }
-        const Answer twin = issueAs(twinSid_, op, /*missing=*/false);
-        return twin.code == 45 && twin.frame == denied.frame;
+        const Answer twin = issueAs(twinSid_, op, /*missing=*/false, twinTxn_);
+        if (twin.code != 45) return "the twin on the existing object answered " + std::to_string(twin.code);
+        if (twin.templ != denied.templ) return "the twin's response type differs";
+        if (blank(twin.frame) != blank(denied.frame)) return "the answer frames differ: NotAuthorized leaks existence";
+        return {};
+    }
+
+    // ── end-of-cell assertions ──────────────────────────────────────────────────────────────────────────────
+    /// Assertion 2: every one-shot request got exactly one answer frame, every subscription at least its response.
+    std::string answersProblem() {
+        r_.c().pollFor(std::chrono::milliseconds(30), [] { return false; });
+        for (const int64_t c : oneShot_)
+            if (r_.c().framesFor(c) != 1) return "request corr " + std::to_string(c) + " got " + std::to_string(r_.c().framesFor(c)) + " answers";
+        return {};
+    }
+    /// Assertion 5: the logins ok / failed and sessions-revoked counters moved exactly as the cell implies.
+    std::string countersProblem(bool disabled) {
+        struct C { std::int32_t id; int64_t start; int64_t delta; const char* name; };
+        for (const C& c : {C{kLoginsOkCounterTypeId, okAtStart_, loginsOk_, "logins ok"},
+                           C{kLoginsFailedCounterTypeId, failedAtStart_, loginsFailed_, "logins failed"},
+                           C{kSessionsRevokedCounterTypeId, revokedAtStart_, disabled ? 1 : 0, "sessions revoked"}}) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (counterNow(c.id) < c.start + c.delta && std::chrono::steady_clock::now() < deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            if (counterNow(c.id) < c.start + c.delta)
+                return std::string(c.name) + " counter is " + std::to_string(counterNow(c.id)) + ", expected " + std::to_string(c.start + c.delta);
+        }
+        r_.c().pollFor(std::chrono::milliseconds(30), [] { return false; });   // a stray extra tick would land here
+        for (const C& c : {C{kLoginsOkCounterTypeId, okAtStart_, loginsOk_, "logins ok"},
+                           C{kLoginsFailedCounterTypeId, failedAtStart_, loginsFailed_, "logins failed"},
+                           C{kSessionsRevokedCounterTypeId, revokedAtStart_, disabled ? 1 : 0, "sessions revoked"}}) {
+            const int64_t now = counterNow(c.id);
+            const bool tick = c.id == kLoginsFailedCounterTypeId && !m_.deadlineTickSeen_ && now == c.start + c.delta + 1;
+            if (now != c.start + c.delta && !tick)
+                return std::string(c.name) + " counter is " + std::to_string(now) + ", expected " + std::to_string(c.start + c.delta);
+            if (tick) m_.deadlineTickSeen_ = true;
+        }
+        m_.knownFailed_ += loginsFailed_;
+        return {};
+    }
+    /// Assertion 6: every DDL this cell's user got an OK for is recorded with principal.authenticated == the user.
+    std::string principalProblem() {
+        if (okDdl_.empty()) return {};
+        BrokerNode& n = r_.broker().node();
+        for (auto& e : readCatalogEvents(n, &m_.catalogCursor_)) m_.catalogEvents_.push_back(std::move(e));
+        for (auto& e : readSecurityEvents(n, &m_.securityCursor_)) m_.securityEvents_.push_back(std::move(e));
+        const auto& cat = m_.catalogEvents_;
+        const auto& sec = m_.securityEvents_;
+        for (const auto& [name, security] : okDdl_) {
+            std::string last;
+            bool found = false;
+            if (security) { for (const auto& e : sec) if (e.objectName == name) { found = true; last = e.principal.authenticated; } }
+            else { for (const auto& e : cat) if (e.objectName == name) { found = true; last = e.principal.authenticated; } }
+            if (!found) return "no " + std::string(security ? "__security" : "__catalog") + " event for " + name;
+            if (last != user_) return "event for " + name + " records principal '" + last + "', expected '" + user_ + "'";
+        }
+        return {};
     }
 
 private:
     struct TxnIds { int code = kNoAnswer; int64_t pid = 1; int16_t epoch = 0; };
+    static uint16_t tmpl(TID t) { return static_cast<uint16_t>(t); }
+    static constexpr std::size_t kHeader = pc::MessageHeader::ENCODED_SIZE;
     static std::vector<uint8_t> stripHeader(std::vector<uint8_t> f) {
-        constexpr std::size_t kHeader = pc::MessageHeader::ENCODED_SIZE;
         if (f.size() <= kHeader) return {};
         f.erase(f.begin(), f.begin() + kHeader);
         return f;
     }
-    AuthWireClient& securityWire() { return r_.wire(); }
+    /// Blank the topic / view ids an answer may echo (a real id and the never-existing one must not tell apart).
+    std::vector<uint8_t> blank(std::vector<uint8_t> f) const {
+        for (const int32_t id : {tid_, vid_, kMissingId}) {
+            if (id < 0 || f.size() < 4) continue;
+            uint8_t le[4];
+            std::memcpy(le, &id, 4);
+            for (std::size_t i = 0; i + 4 <= f.size(); ++i)
+                if (std::memcmp(f.data() + i, le, 4) == 0) std::memset(f.data() + i, 0, 4);
+        }
+        return f;
+    }
+    int64_t counterNow(std::int32_t id) const { return r_.broker().counter(id).value_or(-1); }
+    void note(int64_t corr) { if (corr != 0) oneShot_.push_back(corr); }
     std::size_t recordsOf(int64_t subId) {
         std::size_t n = 0;
         for (const auto& p : r_.c().records()) n += p.subscriptionId == subId ? 1 : 0;
         return n;
     }
+    /// Capture the answer frame of a.corr right now (before any later frame of the same correlation overwrites it).
     void captureFrame(Answer& a) {
         if (a.corr == 0) return;
-        if (const auto raw = r_.c().awaitRaw(a.corr, AuthRig::dl(2))) a.frame = stripHeader(*raw);
+        const auto raw = r_.c().awaitRaw(a.corr, AuthRig::dl(2));
+        if (!raw) return;
+        if (const auto h = pc::MessageHeader::decode(raw->data(), raw->size())) a.templ = h->templateId;
+        a.frame = stripHeader(*raw);
+    }
+    void fill(Answer& a, int64_t corr, const std::vector<uint8_t>& raw) {
+        a.corr = corr;
+        if (raw.empty()) return;
+        if (const auto h = pc::MessageHeader::decode(raw.data(), raw.size())) a.templ = h->templateId;
+        a.frame = stripHeader(raw);
+    }
+    void okDdl(const Answer& a, const std::string& name, bool security) {
+        if (a.code == 0) okDdl_.emplace_back(name, security);
     }
     int ddl(Answer& a) {
+        note(a.corr);
         const int code = r_.ddlCode(a.corr);
         captureFrame(a);
         return code;
     }
     int subscribeCode(Answer& a) {
         const auto code = r_.c().awaitSubscribeCode(a.corr, AuthRig::dl());
+        captureFrame(a);
         if (!code) return kNoAnswer;
         if (*code == 0) a.subId = r_.c().subscriptionIdOf(a.corr).value_or(0);
-        else captureFrame(a);
         return *code;
+    }
+    /// The record that must reach a live subscription of `op` (assertion 4).
+    bool trigger(Op op, std::string& why) {
+        ++triggers_;
+        switch (op) {
+            case Op::Subscribe:
+                if (r_.produce(m_.writerSid_, tid_, /*untilOk=*/true) != 0) { why = "the writer's produce failed"; return false; }
+                return true;
+            case Op::CatalogRead:
+                if (r_.defineTopic(r_.builder, prefix_ + "lv" + std::to_string(triggers_)) < 0) { why = "the builder's DDL failed"; return false; }
+                return true;
+            case Op::SecurityRead: {
+                const auto a = r_.broker().admin().createRole(r_.ch(), r_.broker().adminSession(), prefix_ + "lv" + std::to_string(triggers_));
+                if (a.errorCode != 0) { why = "the admin's CREATE ROLE failed: " + a.detail; return false; }
+                return true;
+            }
+            default: return true;
+        }
     }
     /// A produce on `channel`, retried while leadership / placement settles (NotLeader, UnknownTopic from the worker
     /// that has not heard of the topic yet); NotAuthorized and OK are final.  Bounded: 200 x 25 ms.
-    int produceVia(const std::string& channel, int64_t sid, int32_t topicId, Answer& a) {
+    int produceVia(const std::string& channel, int64_t sid, int32_t topicId, const std::vector<uint8_t>& batch, Answer& a,
+                   const TxnState* txn = nullptr) {
         int code = kNoAnswer;
         for (int attempt = 0; attempt < 200; ++attempt) {
             a.corr = r_.c().nextCorrelationId();
-            if (!r_.c().produce(channel, r_.stream(), sid, a.corr, topicId, 0, 1, makeBatch(1))) return kNoAnswer;
+            note(a.corr);
+            const bool sent = txn ? r_.c().produceIdempotent(channel, r_.stream(), sid, a.corr, topicId, 0, 1, txn->pid, txn->epoch, txn->seq, batch)
+                                  : r_.c().produce(channel, r_.stream(), sid, a.corr, topicId, 0, 1, batch);
+            if (!sent) return kNoAnswer;
             const auto ack = r_.c().awaitProduceResponseUntil(a.corr, AuthRig::dl(10));
             code = ack ? ack->errorCode : kNoAnswer;
             if (code != static_cast<int>(pc::ErrorCode::NotLeader) && code != static_cast<int>(pc::ErrorCode::UnknownTopic) &&
@@ -379,36 +580,61 @@ private:
         std::vector<uint8_t> buf(cap);
         const std::size_t len = m.encode(buf.data(), std::forward<Rest>(rest)...);
         if (len == 0 || !r_.c().send(r_.ch(), r_.stream(), buf.data(), len)) return {};
+        note(m.correlationId);
         return r_.rawAnswer(m.correlationId);
     }
     static std::span<const uint8_t> bytes(const std::string& s) { return {reinterpret_cast<const uint8_t*>(s.data()), s.size()}; }
-    TxnIds txnInit(int64_t sid, const std::string& txnId) {
+    static int errorCodeOf(const std::vector<uint8_t>& f) {
+        if (const auto e = pc::ErrorResponse::decode(f.data(), f.size())) return e->code;
+        return kNoAnswer;
+    }
+    TxnIds txnInit(int64_t sid, const std::string& txnId, Answer& a) {
         pc::InitProducerId m;
         m.sessionId = sid; m.correlationId = r_.c().nextCorrelationId(); m.transactionTimeoutMs = 30'000;
         m.transactionalId = bytes(txnId);
-        const auto a = sendRaw(m, 256);
+        const auto f = sendRaw(m, 256);
+        fill(a, m.correlationId, f);
         TxnIds out;
-        if (a.empty()) return out;
-        if (const auto h = pc::MessageHeader::decode(a.data(), a.size());
-            h && h->templateId == static_cast<uint16_t>(pc::TemplateId::InitProducerIdResponse)) {
-            if (const auto r = pc::InitProducerIdResponse::decode(a.data(), a.size())) {
+        if (f.empty()) return out;
+        if (a.templ == tmpl(TID::InitProducerIdResponse)) {
+            if (const auto r = pc::InitProducerIdResponse::decode(f.data(), f.size())) {
                 out.code = r->errorCode; out.pid = r->producerId; out.epoch = r->producerEpoch;
             }
-        } else if (const auto e = pc::ErrorResponse::decode(a.data(), a.size())) out.code = e->code;
+        } else out.code = errorCodeOf(f);
         return out;
     }
-    int txnAddPartitions(int64_t sid, const TxnIds& ids, int32_t topicId, Answer& a) {
+    /// InitProducerId once per producer, then AddPartitionsToTxn, then a transactional Produce: the first non-zero code
+    /// answers (stage 0 / 1 / 2).  The WRITE TOPIC check is the one the add and the produce run.
+    int txnProduce(int64_t sid, int32_t topicId, TxnState& st, Answer& a) {
+        if (!st.inited) {
+            a.wantTempl = tmpl(TID::InitProducerIdResponse);
+            a.stage = 0;
+            const auto init = txnInit(sid, x(), a);
+            if (init.code != 0) return init.code;
+            st.inited = true; st.pid = init.pid; st.epoch = init.epoch;
+        }
         pc::AddPartitionsToTxn m;
-        m.sessionId = sid; m.correlationId = r_.c().nextCorrelationId(); m.producerId = ids.pid; m.producerEpoch = ids.epoch;
+        m.sessionId = sid; m.correlationId = r_.c().nextCorrelationId(); m.producerId = st.pid; m.producerEpoch = st.epoch;
         const std::string txn = x();
         m.transactionalId = bytes(txn);
         const pc::TxnTopicPartition tp{topicId, 0};
         const auto f = sendRaw(m, 256, std::span<const pc::TxnTopicPartition>(&tp, 1));
+        a.wantTempl = tmpl(TID::AddPartitionsToTxnResponse);
+        a.stage = 1;
+        fill(a, m.correlationId, f);
         if (f.empty()) return kNoAnswer;
-        // (the response echoes the requested topic id, so its frame is not compared between a real and a missing id)
-        if (const auto r = pc::AddPartitionsToTxnResponse::decode(f.data(), f.size())) return r->results.empty() ? 0 : r->results[0].errorCode;
-        if (const auto e = pc::ErrorResponse::decode(f.data(), f.size())) return e->code;
-        return kNoAnswer;
+        int code = kNoAnswer;
+        if (const auto r = pc::AddPartitionsToTxnResponse::decode(f.data(), f.size())) code = r->results.empty() ? 0 : r->results[0].errorCode;
+        else code = errorCodeOf(f);
+        if (code != 0) return code;
+        rune::protocol::RecordBatchBuilder b(0, 1000);
+        b.setTransactional(true); b.setProducerId(st.pid); b.setProducerEpoch(st.epoch); b.setBaseSequence(st.seq);
+        b.append("k", "txn", 1000);
+        a.wantTempl = tmpl(TID::ProduceResponse);
+        a.stage = 2;
+        const int pcode = produceVia(r_.broker().workerIngressChannel(), sid, topicId, b.build(), a, &st);
+        if (pcode == 0) ++st.seq;
+        return pcode;
     }
     int txnEnd(int64_t sid, const TxnIds& ids, Answer& a) {
         pc::EndTxn m;
@@ -416,11 +642,30 @@ private:
         const std::string txn = x();
         m.transactionalId = bytes(txn);
         const auto f = sendRaw(m, 256);
+        fill(a, m.correlationId, f);
         if (f.empty()) return kNoAnswer;
-        a.frame = stripHeader(f);
         if (const auto r = pc::EndTxnResponse::decode(f.data(), f.size())) return r->errorCode;
-        if (const auto e = pc::ErrorResponse::decode(f.data(), f.size())) return e->code;
-        return kNoAnswer;
+        return errorCodeOf(f);
+    }
+    /// MetadataRequest{all}: no answer or an ErrorResponse is its code (never "filtered out"); a MetadataResponse is 0
+    /// with the cell's topic's presence taken from the decoded partitions.
+    void metadata(int64_t sid, Answer& a) {
+        a.wantTempl = tmpl(TID::MetadataResponse);
+        pc::MetadataRequest req;
+        req.sessionId = sid; req.correlationId = r_.c().nextCorrelationId();
+        std::vector<uint8_t> buf(req.encodedSize());
+        const std::size_t len = req.encode(buf.data());
+        if (!r_.c().send(r_.ch(), r_.stream(), buf.data(), len)) return;
+        note(req.correlationId);
+        const auto f = r_.rawAnswer(req.correlationId);
+        fill(a, req.correlationId, f);
+        if (f.empty()) return;
+        if (a.templ == tmpl(TID::MetadataResponse)) {
+            if (const auto r = pc::MetadataResponse::decode(f.data(), f.size())) {
+                a.code = 0;
+                for (const auto& e : r->partitions) a.present = a.present || (tid_ >= 0 && e.topicId == tid_);
+            }
+        } else a.code = errorCodeOf(f);
     }
 
     AuthMatrixRig& m_;
@@ -430,7 +675,11 @@ private:
     int64_t sid_ = 0, twinSid_ = 0;
     int32_t tid_ = -1, vid_ = -1, uid_ = -1;
     bool userCreated_ = false, twinCreated_ = false;
-    int ddlSeq_ = 0;
+    int triggers_ = 0;
+    TxnState txn_, twinTxn_;
+    std::vector<int64_t> oneShot_;
+    std::vector<std::pair<std::string, bool>> okDdl_;
+    int64_t okAtStart_ = 0, failedAtStart_ = 0, revokedAtStart_ = 0, loginsOk_ = 0, loginsFailed_ = 0;
 };
 
 inline AuthMatrixRig::Cell AuthMatrixRig::newCell() { return Cell(*this, ++ordinal_); }

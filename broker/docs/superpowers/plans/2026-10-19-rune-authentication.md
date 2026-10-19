@@ -147,7 +147,7 @@ Each decision the spec left open, made here, one line each (D-numbers are refere
 | `OffsetCommit` | `OffsetCommit` | READ GROUP g, READ TOPIC t |
 | `OffsetFetch` | `OffsetFetch` | READ GROUP g, READ TOPIC t |
 | `ViewRead` | `GetViewRow` by view topic id | READ VIEW v |
-| `ViewOpen` | open-for-read by view name | READ VIEW v |
+| `ViewOpen` | `GetViewRow` by view topic id (no name-addressed open exists; same request as `ViewRead`) | READ VIEW v |
 | `Metadata` | `MetadataRequest{all}` | DESCRIBE TOPIC t (presence of t in the answer) |
 | `CreateTopic` | `DefineTopic` on a free name | CREATE TOPIC name |
 | `CreateView` | `CreateView` over source s | CREATE VIEW name, READ TOPIC s |
@@ -194,7 +194,7 @@ Each decision the spec left open, made here, one line each (D-numbers are refere
 |---|---|---|
 | R1 | `None` (timings `Steady`, `CreatedAfterLogin`, `ObjectMissing`) | `Denied`: `NotAuthorized (45)` in the op's own response type, detail per D23; `Metadata`: `FilteredOut` (answer OK, the object absent) |
 | R2 | `CatalogRead` × `Exact` / `Prefix` (a topic-level DESCRIBE) | `Denied` (D21: catalog reads need DESCRIBE ON CLUSTER) |
-| R3 | `ObjectMissing` (granted) | `missingAnswer(op)`: id-addressed `Produce`, `ProduceRouted`, `TxnProduce`, `Subscribe`, `ViewRead` → `NotAuthorized (45)` (D22); implicit objects `TxnInit`, `GroupJoin`, `OffsetCommit`, `OffsetFetch` → `Ok`; `ViewOpen` → `ViewRowResponse` status 4 (UnknownView); `Metadata` → `FilteredOut`; `CreateTopic`, `CreateView` → `Ok` (created); `AlterSchema`, `SetCompatibility`, `AlterTopicConfig`, `AlterView`, `DropTopic`, `DropView` → `UnknownTopic (7)` |
+| R3 | `ObjectMissing` (granted) | `missingAnswer(op)`: id-addressed `Produce`, `ProduceRouted`, `TxnProduce`, `Subscribe`, `ViewRead`, `ViewOpen` → `NotAuthorized (45)` (D22); implicit objects `TxnInit`, `GroupJoin`, `OffsetCommit`, `OffsetFetch` → `Ok`; `Metadata` → `FilteredOut`; `CreateTopic`, `CreateView` → `Ok` (created); `AlterSchema`, `SetCompatibility`, `AlterTopicConfig`, `AlterView`, `DropTopic`, `DropView` → `UnknownTopic (7)` |
 | R4 | `RevokedMid` | `EndedNotAuthorized`: streaming ops (`Subscribe`, `GroupJoin`, `CatalogRead`, `SecurityRead`) receive `ErrorResponse{NotAuthorized}` on the subscription's correlation id within the rig bound and deliver nothing after it; one-shot ops: the second request `NotAuthorized (45)`; `Metadata`: second answer `FilteredOut` |
 | R5 | `UserDisabledMid` | `SessionRevoked`: every live subscription answered `SessionRevoked (46)`, then the session-level `SessionRevoked`, the session ends; a reconnect is `AuthenticationFailed (44)` |
 | R6 | `GrantedAfterLogin` | `DeniedThenOk`: first `NotAuthorized (45)` (`Metadata`: `FilteredOut`), then — after the GRANT's OK, same session, no reconnect — `Ok` |
@@ -202,7 +202,7 @@ Each decision the spec left open, made here, one line each (D-numbers are refere
 
 ### Cell counts (pinned by `AuthMatrixCountRegression.CellCountsArePinned`, Task 17)
 
-24 ops × 5 grants × 6 timings = **720 cells**: **517 applicable**, **203 `NotApplicable`** (NA1 66, NA2 24, NA3 72, NA4 22, NA5 10, NA6 9). Applicable by rule: R1 `Denied` 62, R2 `Denied` 8, R3 `Missing` 66 (`NotAuthorized` 15, `Ok` implicit 12, UnknownView 3, `FilteredOut` 4, `Ok` created 8, `UnknownTopic` 24), R4 `EndedNotAuthorized` 79, R5 `SessionRevoked` 79, R6 `DeniedThenOk` 79, R7 `Ok` 144 = **517**.
+24 ops × 5 grants × 6 timings = **720 cells**: **517 applicable**, **203 `NotApplicable`** (NA1 66, NA2 24, NA3 72, NA4 22, NA5 10, NA6 9). Applicable by rule: R1 `Denied` 62, R2 `Denied` 8, R3 `Missing` 66 (`NotAuthorized` 18, `Ok` implicit 12, `FilteredOut` 4, `Ok` created 8, `UnknownTopic` 24), R4 `EndedNotAuthorized` 79, R5 `SessionRevoked` 79, R6 `DeniedThenOk` 79, R7 `Ok` 144 = **517**.
 
 ### Every cell asserts
 
@@ -2569,11 +2569,10 @@ inline constexpr int16_t kNone = -1;
 struct MissingAnswer { Outcome outcome; int16_t code; int16_t viewStatus; };
 [[nodiscard]] constexpr MissingAnswer missingAnswer(Op o) noexcept {
     switch (o) {
-        case Op::Produce: case Op::ProduceRouted: case Op::TxnProduce: case Op::Subscribe: case Op::ViewRead:
+        case Op::Produce: case Op::ProduceRouted: case Op::TxnProduce: case Op::Subscribe: case Op::ViewRead: case Op::ViewOpen:
             return {Outcome::Denied, 45, kNone};                 // id-addressed (D22)
         case Op::TxnInit: case Op::GroupJoin: case Op::OffsetCommit: case Op::OffsetFetch:
             return {Outcome::Ok, 0, kNone};                      // implicit objects
-        case Op::ViewOpen: return {Outcome::Missing, 0, 4};      // ViewRowResponse status 4 UnknownView
         case Op::Metadata: return {Outcome::FilteredOut, 0, kNone};
         case Op::CreateTopic: case Op::CreateView: return {Outcome::Ok, 0, kNone};
         default: return {Outcome::Missing, 7, kNone};             // UnknownTopic (name-addressed alter / drop)
@@ -2714,9 +2713,9 @@ TEST(AuthMatrixCountRegression, CellCountsArePinned) {
     EXPECT_EQ(outcome[int(Outcome::EndedNotAuthorized)], 79);
     EXPECT_EQ(outcome[int(Outcome::SessionRevoked)], 79);
     EXPECT_EQ(outcome[int(Outcome::DeniedThenOk)], 79);
-    EXPECT_EQ(outcome[int(Outcome::Missing)], 3 + 24);             // UnknownView + UnknownTopic
+    EXPECT_EQ(outcome[int(Outcome::Missing)], 24);                 // UnknownTopic
     EXPECT_EQ(outcome[int(Outcome::FilteredOut)], 3 + 4);          // Metadata R1 (3 timings) + R3 (4 grants)
-    EXPECT_EQ(outcome[int(Outcome::Denied)], 59 + 8 + 15);         // R1 non-Metadata + R2 + R3 id-addressed
+    EXPECT_EQ(outcome[int(Outcome::Denied)], 59 + 8 + 18);         // R1 non-Metadata + R2 + R3 id-addressed (incl. ViewOpen)
 }
 ```
 

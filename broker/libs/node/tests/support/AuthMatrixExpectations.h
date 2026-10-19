@@ -39,11 +39,10 @@ inline constexpr int16_t kNone = -1;
 struct MissingAnswer { Outcome outcome; int16_t code; int16_t viewStatus; };
 [[nodiscard]] constexpr MissingAnswer missingAnswer(Op o) noexcept {
     switch (o) {
-        case Op::Produce: case Op::ProduceRouted: case Op::TxnProduce: case Op::Subscribe: case Op::ViewRead:
+        case Op::Produce: case Op::ProduceRouted: case Op::TxnProduce: case Op::Subscribe: case Op::ViewRead: case Op::ViewOpen:
             return {Outcome::Denied, 45, kNone};                 // id-addressed (D22)
         case Op::TxnInit: case Op::GroupJoin: case Op::OffsetCommit: case Op::OffsetFetch:
             return {Outcome::Ok, 0, kNone};                      // implicit objects
-        case Op::ViewOpen: return {Outcome::Missing, 0, 4};      // ViewRowResponse status 4 UnknownView
         case Op::Metadata: return {Outcome::FilteredOut, 0, kNone};
         case Op::CreateTopic: case Op::CreateView: return {Outcome::Ok, 0, kNone};
         default: return {Outcome::Missing, 7, kNone};             // UnknownTopic (name-addressed alter / drop)
