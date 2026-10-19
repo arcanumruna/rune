@@ -1513,6 +1513,8 @@ public:
     /// Authentication Task 10: the gateway's session table / auth-gate counters (read ON the control thread).
     [[nodiscard]] bool gatewayHasSessionForTest(int64_t sessionId);
     [[nodiscard]] uint64_t authGateRefusalsForTest();
+    /// Test-only (Task 19): requests the gateway answered NotAuthorized (45) since start (control thread, read-only).
+    [[nodiscard]] uint64_t gatewayNotAuthorizedForTest();
     /// Counter values the control thread publishes (read ON the control thread).
     struct SecurityMetricsSnap { int64_t halted = 0; int64_t applied = -1; int64_t authMode = 0; };
     [[nodiscard]] SecurityMetricsSnap securityMetricsForTest();

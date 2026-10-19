@@ -3,12 +3,15 @@
 // logins work through every broker, a REVOKE ends live subscriptions on every broker within 100 ms, a leader kill
 // mid security DDL applies the retried request once, peer keys right / wrong / none, key rotation across rolling
 // restarts.  Every wait is bounded.
+#include "support/AuthMatrixExpectations.h"
 #include "support/AuthRig.h"
 #include "support/AuthTrio.h"
 
 #include <algorithm>
 #include <cstdio>
+#include <future>
 #include <mutex>
+#include <thread>
 #include <set>
 #include <spdlog/sinks/base_sink.h>
 
@@ -287,6 +290,33 @@ TEST(AuthClusterRegression, WrongKeyBrokerNeverJoinsRegression) {
     const auto ack = w3.w->raw().awaitProduceResponseUntil(corr, Clock3::now() + 10s);
     EXPECT_FALSE(ack && ack->errorCode == 0) << "a wrong-key broker's forwarded produce must not be acknowledged";
 
+    // Node 3 never votes in a term the others accept: its consensus frames do not open on nodes 1 and 2 (they count
+    // them as dropped), so with the consensus leader gone the survivor has only its own vote and must NOT win a term.
+    auto election = [&](int id) {
+        return t.node(id).onControlThreadForTest([&t, id]() {
+            const auto* e = t.node(id).electionForTest();
+            return std::pair<int64_t, int32_t>{e ? e->leadershipTermId() : -1, e ? e->leaderMemberId() : -1};
+        });
+    };
+    const auto [term, consensusLeader] = election(1);
+    EXPECT_EQ(election(2), (std::pair<int64_t, int32_t>{term, consensusLeader})) << "nodes 1 and 2 agree on the term and the leader";
+    std::printf("CONSENSUS term=%lld leader=%d\n", static_cast<long long>(term), consensusLeader);
+    EXPECT_NE(consensusLeader, 3) << "the wrong-key node leads no term";
+    EXPECT_GT(t.node(1).peerLinksForTest().frameDrops + t.node(2).peerLinksForTest().frameDrops, 0u);
+    if (consensusLeader == 1 || consensusLeader == 2) {
+        const int survivor = 3 - consensusLeader;
+        t.stopNode(consensusLeader);
+        bool wonATerm = false;
+        const auto until = Clock3::now() + 8s;   // an observation window of an outcome that must NOT happen
+        while (Clock3::now() < until) {
+            const auto [tm, ld] = election(survivor);
+            if (ld == survivor && tm > term) wonATerm = true;
+            std::this_thread::sleep_for(50ms);
+        }
+        EXPECT_FALSE(wonATerm) << "node " << survivor << " must not win a term on node 3's vote";
+        t.restart(consensusLeader, t.keyContentsPath(consensusLeader));
+    }
+
     t.restart(3, good);
     EXPECT_TRUE(awaitNodeInIsr(t, 1, 3, 30s)) << "the right key brings node 3 back into the ISR within 30 s";
     EXPECT_TRUE(awaitNodeInIsr(t, 2, 3, 30s));
@@ -373,9 +403,96 @@ TEST(AuthClusterRegression, SecurityDdlRetryAfterLeaderKillAppliesOnceRegression
     EXPECT_EQ(countIn(t.node(leader)), 1);
 }
 
-// D33/D34: a producer and a consumer through three rolling restarts of the cluster key: (K1 | K2) -> (K2 | K1) -> (K2).
-// After every restart all links re-establish (counter 233 == 2 on each broker) and the consumer sees every acked record
-// exactly once, offsets contiguous.  Records are produced before, WHILE a broker is down, and after each restart.
+namespace {
+
+int ackOrErrorCode(ShardTestClient& c, int64_t corr, std::chrono::milliseconds within);   // defined with the matrix
+
+struct ProducerResult { std::vector<int64_t> acked; int attempts = 0; };
+struct ConsumerResult { std::set<int64_t> offsets; bool complete = false; int resubscribes = 0; };
+
+/// A producer that owns its client (own Aeron driver) and its thread: it logs in on whichever broker answers, follows
+/// Redirects, re-logs-in after a restart, and hands its acked offsets back at join.  Shares nothing with the test.
+ProducerResult runProducer(std::stop_token stop, std::array<std::string, 3> channels, std::filesystem::path dir, int32_t topic) {
+    ProducerResult out;
+    AuthWireClient w(dir);
+    std::array<int64_t, 3> sid{};
+    std::size_t node = 0;
+    while (!stop.stop_requested()) {
+        const std::size_t n = node % 3;
+        if (sid[n] == 0) {
+            const int64_t s = w.connect(channels[n], pc::kClientVersionAuth, 2s);
+            if (s > 0 && w.login(channels[n], s, "prod", {AuthTrio::kPw, AuthTrio::kPw}, 0, true, 5s).ok()) sid[n] = s;
+            else { ++node; std::this_thread::sleep_for(20ms); continue; }
+        }
+        auto& c = w.raw();
+        const int64_t corr = c.nextCorrelationId();
+        ++out.attempts;
+        if (!c.produce(channels[n], AuthWireClient::kClientStream, sid[n], corr, topic, 0, 1, makeBatch(1))) { sid[n] = 0; ++node; continue; }
+        const int code = ackOrErrorCode(c, corr, 2s);
+        if (code == 0) { out.acked.push_back(c.ackFor(corr)->baseOffset); std::this_thread::sleep_for(10ms); continue; }
+        if (code != 3 && code != 2) sid[n] = 0;   // no answer / revoked / refused: this broker's session is gone
+        ++node;
+        std::this_thread::sleep_for(10ms);
+    }
+    return out;
+}
+
+/// A consumer with its own client and thread: subscribes from the next missing offset on whichever broker leads,
+/// resubscribes elsewhere when its broker restarts.  `target` (a one-shot hand-off from the test: the last acked offset)
+/// tells it what "everything" is; it returns every offset it saw.
+ConsumerResult runConsumer(std::stop_token stop, std::future<int64_t> target, std::array<std::string, 3> channels,
+                           std::filesystem::path dir, int32_t topic, std::size_t batchBytes) {
+    ConsumerResult out;
+    AuthWireClient w(dir);
+    std::array<int64_t, 3> sid{};
+    std::size_t node = 0;
+    int64_t want = -2;   // -2 = not told yet
+    int64_t next = 0;
+    const auto hardStop = Clock3::now() + 240s;
+    while (!stop.stop_requested() && Clock3::now() < hardStop) {
+        if (want == -2 && target.wait_for(0ms) == std::future_status::ready) want = target.get();
+        if (want >= -1 && static_cast<int64_t>(out.offsets.size()) > want && *out.offsets.rbegin() >= want) { out.complete = true; break; }
+        const std::size_t n = node % 3;
+        if (sid[n] == 0) {
+            const int64_t s = w.connect(channels[n], pc::kClientVersionAuth, 2s);
+            if (s > 0 && w.login(channels[n], s, "cons", {AuthTrio::kPw, AuthTrio::kPw}, 0, true, 5s).ok()) sid[n] = s;
+            else { ++node; std::this_thread::sleep_for(20ms); continue; }
+        }
+        auto& c = w.raw();
+        const int64_t corr = c.subscribeIsolated(channels[n], AuthWireClient::kClientStream, sid[n], topic, 0, next, 0);
+        const auto code = corr ? c.awaitSubscribeCode(corr, Clock3::now() + 3s) : std::nullopt;
+        if (!code || *code != 0) { if (!code || *code != 3) sid[n] = 0; ++node; std::this_thread::sleep_for(20ms); continue; }
+        ++out.resubscribes;
+        const int64_t sub = c.subscriptionIdOf(corr).value_or(0);
+        std::size_t seenRecords = 0;
+        auto lastProgress = Clock3::now();
+        bool broken = false;
+        while (!stop.stop_requested() && !broken && Clock3::now() < hardStop) {
+            c.pollFor(50ms, [] { return false; });
+            for (; seenRecords < c.records().size(); ++seenRecords) {
+                const auto& r = c.records()[seenRecords];
+                if (r.subscriptionId != sub) continue;
+                const std::size_t k = batchBytes ? r.bytes.size() / batchBytes : 0;
+                for (std::size_t i = 0; i < std::max<std::size_t>(k, 1); ++i) out.offsets.insert(r.baseOffset + static_cast<int64_t>(i));
+                lastProgress = Clock3::now();
+            }
+            while (out.offsets.count(next)) ++next;
+            for (const auto& e : c.errors()) if (e.sessionId == sid[n] && e.code != 0) broken = true;
+            if (want == -2 && target.wait_for(0ms) == std::future_status::ready) want = target.get();
+            if (want >= -1 && next > want) { out.complete = true; return out; }
+            if (Clock3::now() - lastProgress > 4s && want != -2) broken = true;   // told the target but starved: another broker
+        }
+        sid[n] = 0;
+        ++node;
+    }
+    return out;
+}
+
+}  // namespace
+
+// D33/D34: a REAL concurrent producer and consumer (each its own client and thread, nothing shared) run through three
+// rolling restarts of the cluster key: (K1 | K2) -> (K2 | K1) -> (K2).  After every restart all links re-establish
+// (counter 233 == 2 on each broker); at the end the consumer has seen every acknowledged offset, contiguous from 0.
 TEST(AuthClusterRegression, KeyRotationAcrossARollingRestartKeepsTrafficFlowingRegression) {
     AuthTrio t("rotate");
     t.start();
@@ -388,80 +505,63 @@ TEST(AuthClusterRegression, KeyRotationAcrossARollingRestartKeepsTrafficFlowingR
     std::vector<AuthTrio::Session> bs{t.login(1, "builder")};
     const int32_t topic = defineTopicAnywhere(t, bs, "rot.t", 1);
     ASSERT_GE(topic, 0);
+    ASSERT_TRUE(AuthTrio::until(60s, [&] { const int32_t l = leaderOf(t, bs[0], topic, 0); return l >= 1 && l <= 3; }));
+    const std::size_t batchBytes = makeBatch(1).size();
 
     const std::string k1 = t.keyContentsPath(1);
     const std::string k2 = t.makeKeyFile("k2.key", 'Q');
-    int acked = 0, attempted = 0;
-    auto liveNode = [&](int avoid) { for (int id : {1, 2, 3}) if (id != avoid && t.cluster().running(id)) return id; return -1; };
-    auto leaderNode = [&](int avoid) -> int {
-        const int via = liveNode(avoid);
-        AuthTrio::Session b = t.login(via, "builder");
-        for (int i = 0; i < 400; ++i) {
-            const int32_t l = leaderOf(t, b, topic, 0);
-            if (l >= 1 && l <= 3 && t.cluster().running(l)) return l;
-            std::this_thread::sleep_for(25ms);
-        }
-        return -1;
-    };
-    auto produceSome = [&](int n, int avoid) {
-        const int l = leaderNode(avoid);
-        ASSERT_GT(l, 0) << "no live topic leader";
-        AuthTrio::Session p;
-        ASSERT_TRUE(AuthTrio::until(30s, [&] { try { p = t.login(l, "prod"); return true; } catch (...) { return false; } }));
-        for (int i = 0; i < n; ++i) {
-            ++attempted;
-            const auto ack = p.w->raw().produceUntilOk(t.channel(l), AuthWireClient::kClientStream, p.sid, topic, 0, 1, makeBatch(1), 200);
-            ASSERT_TRUE(ack.has_value()) << "produce through node " << l;
-            ++acked;
-        }
-    };
+    const std::array<std::string, 3> channels{t.channel(1), t.channel(2), t.channel(3)};
+    std::promise<int64_t> target;
+    std::jthread producer;
+    std::jthread consumer;
+    std::promise<ProducerResult> pOut;
+    std::promise<ConsumerResult> cOut;
+    auto pFut = pOut.get_future();
+    auto cFut = cOut.get_future();
+    producer = std::jthread([&, ch = channels](std::stop_token st) {
+        try { pOut.set_value(runProducer(st, ch, t.cluster().clientsDir->path / "rot_prod", topic)); }
+        catch (...) { pOut.set_exception(std::current_exception()); }
+    });
+    consumer = std::jthread([&, ch = channels, fut = target.get_future()](std::stop_token st) mutable {
+        try { cOut.set_value(runConsumer(st, std::move(fut), ch, t.cluster().clientsDir->path / "rot_cons", topic, batchBytes)); }
+        catch (...) { cOut.set_exception(std::current_exception()); }
+    });
+
     auto allLinked = [&] {
         return AuthTrio::until(60s, [&] {
             for (int id : {1, 2, 3}) if (t.counter(id, kPeerLinksEstablishedCounterTypeId).value_or(0) != 2) return false;
             return true;
         });
     };
-
-    produceSome(3, 0);
     ASSERT_TRUE(allLinked());
     struct Step { const char* name; std::string cur, next; };
     const std::vector<Step> steps = {{"K1|K2", k1, k2}, {"K2|K1", k2, k1}, {"K2", k2, ""}};
     for (const Step& st : steps) {
         for (int id : {1, 2, 3}) {
-            t.stopNode(id);
-            produceSome(2, id);   // traffic flows with one broker down
             const auto t0 = Clock3::now();
             t.restart(id, st.cur, st.next);
-            ASSERT_TRUE(allLinked()) << "step " << st.name << ": links after restarting node " << id;
+            const bool linked = allLinked();
             const double ms = std::chrono::duration<double, std::milli>(Clock3::now() - t0).count();
-            std::printf("ROTATION step=%s node=%d links-reestablished-after=%.0f ms\n", st.name, id, ms);
-            ASSERT_TRUE(awaitSecurityLeader(t.cluster(), 60s));
-            produceSome(2, 0);
+            std::printf("ROTATION step=%s node=%d restart+links-reestablished=%.0f ms\n", st.name, id, ms);
+            EXPECT_TRUE(linked) << "step " << st.name << ": links after restarting node " << id;
+            EXPECT_TRUE(awaitSecurityLeader(t.cluster(), 60s));
+            std::this_thread::sleep_for(300ms);   // traffic keeps flowing between restarts (the threads never stop)
         }
     }
-
-    // The consumer reads the partition from offset 0 off its leader: every acked record, contiguous, no duplicates.
-    const int l = leaderNode(0);
-    ASSERT_GT(l, 0);
-    AuthTrio::Session c;
-    ASSERT_TRUE(AuthTrio::until(30s, [&] { try { c = t.login(l, "cons"); return true; } catch (...) { return false; } }));
-    auto& raw = c.w->raw();
-    int64_t corr = 0;
-    ASSERT_TRUE(AuthTrio::until(60s, [&] {
-        corr = raw.sendSubscribe(t.channel(l), AuthWireClient::kClientStream, c.sid, topic, 0);
-        const auto code = raw.awaitSubscribeCode(corr, Clock3::now() + 10s);
-        return code && *code == 0;
-    }));
-    const int64_t sub = raw.subscriptionIdOf(corr).value_or(0);
-    std::set<int64_t> offsets;
-    raw.pollUntil([&] {
-        for (const auto& p : raw.records()) if (p.subscriptionId == sub) offsets.insert(p.baseOffset);
-        return static_cast<int>(offsets.size()) >= acked;
-    });
-    EXPECT_GE(static_cast<int>(offsets.size()), acked) << "every acked record is delivered";
-    EXPECT_LE(static_cast<int>(offsets.size()), attempted);
+    producer.request_stop();
+    producer.join();
+    const ProducerResult prod = pFut.get();
+    ASSERT_FALSE(prod.acked.empty());
+    const int64_t last = *std::max_element(prod.acked.begin(), prod.acked.end());
+    target.set_value(last);
+    consumer.join();
+    const ConsumerResult cons = cFut.get();
+    std::printf("ROTATION traffic: attempts=%d acked=%zu last=%lld consumer-offsets=%zu resubscribes=%d\n", prod.attempts,
+                prod.acked.size(), static_cast<long long>(last), cons.offsets.size(), cons.resubscribes);
+    EXPECT_TRUE(cons.complete) << "the consumer reached the last acknowledged offset";
     int64_t expect = 0;
-    for (const int64_t o : offsets) EXPECT_EQ(o, expect++) << "offsets contiguous";
+    for (const int64_t o : cons.offsets) { if (o > last) break; EXPECT_EQ(o, expect++) << "no gap in the consumed offsets"; }
+    for (const int64_t a : prod.acked) EXPECT_TRUE(cons.offsets.count(a)) << "acked offset " << a << " must be consumed";
 }
 
 // D8: AuthServerFirst for an unknown user carries the same fake salt and iteration count from every broker (derived from
@@ -488,4 +588,203 @@ TEST(AuthClusterRegression, UnknownUserSaltIsTheSameOnEveryBrokerRegression) {
         EXPECT_EQ(seen[i].salt, seen[0].salt) << "node " << i + 1;
         EXPECT_EQ(seen[i].iterations, seen[0].iterations) << "node " << i + 1;
     }
+}
+
+// D28: node 3's applier is damaged (halts on the next event) -> its sessions are revoked and logins refused (fails
+// closed); it is stopped, its `__security` directory moved aside, restarted: it refetches from offset 0, the digests
+// agree again, logins work.
+TEST(AuthClusterRegression, HaltedBrokerRefetchesSecurityAfterItsDirIsMovedAside) {
+    AuthTrio t("halted");
+    t.start();
+    t.bootstrapAdmin();
+    t.createUser(1, "alice");
+    AuthTrio::Session before;
+    ASSERT_TRUE(AuthTrio::until(30s, [&] { try { before = t.login(3, "alice"); return true; } catch (...) { return false; } }));
+    ASSERT_TRUE(t.awaitDigestsAgree(1, 30s));
+
+    BrokerNode& n3 = t.node(3);
+    n3.onAdminThreadForTest([&n3]() {
+        n3.adminWorkerAgentForTest()->worker().securityApplierForTest()->tamperNextFingerprintForTest();
+        return 0;
+    });
+    t.createUser(1, "bob");   // replicated everywhere; node 3's applier fails its fingerprint check and halts
+    ASSERT_TRUE(AuthTrio::until(30s, [&] { return n3.securityViewForTest().halted; })) << "node 3 must halt";
+    // Fails closed: alice's session on node 3 is revoked, new logins there are refused (44), the other brokers serve.
+    AuthWireClient& w = t.newWire(3);
+    const int64_t sid = w.connect(t.channel(3));
+    ASSERT_GT(sid, 0);
+    EXPECT_EQ(w.login(t.channel(3), sid, "alice", {AuthTrio::kPw, AuthTrio::kPw}).errorCode(), 44);
+    EXPECT_NO_THROW(t.login(1, "alice"));
+    EXPECT_GT(t.counter(3, kSecurityApplyHaltedCounterTypeId).value_or(0), 0);
+
+    t.stopNode(3);
+    const fs::path dir = t.cluster().dirs[2]->path / "__security";
+    ASSERT_TRUE(fs::is_directory(dir));
+    fs::rename(dir, t.cluster().dirs[2]->path / "__security.moved");
+    t.restart(3, t.keyContentsPath(3));
+    uint64_t digest = 0;
+    ASSERT_TRUE(t.awaitDigestsAgree(2, 60s, &digest)) << "node 3 refetched the whole log and agrees";
+    EXPECT_FALSE(t.node(3).securityViewForTest().halted);
+    EXPECT_TRUE(AuthTrio::until(30s, [&] { try { t.login(3, "alice"); t.login(3, "bob"); return true; } catch (...) { return false; } }))
+        << "logins succeed on node 3 again";
+}
+
+// §11 3-node slice: op x timing x via (the broker the user's session is on; the admin's DDL always goes through a
+// different broker).  45 cells, every code from amatrix::expectedCodes.  Grant Exact, except SecurityDdl (ViaRole).
+// Propagation of a change to the user's broker is asynchronous (the 100 ms gate has its own test), so each "after the
+// change" observation waits, bounded, for the expected answer; "first" observations wait for the grant to arrive.
+namespace {
+namespace am = rune::node::test::amatrix;
+
+struct UserSessions {
+    std::string name;
+    AuthWireClient* w = nullptr;
+    std::array<int64_t, 3> sid{};
+};
+
+int ackOrErrorCode(ShardTestClient& c, int64_t corr, std::chrono::milliseconds within) {
+    int code = kNoAnswer;
+    c.pollFor(within, [&] {
+        if (const auto a = c.ackFor(corr)) { code = a->errorCode; return true; }
+        for (const auto& e : c.errors()) if (e.correlationId == corr) { code = e.code; return true; }
+        return false;
+    });
+    return code;
+}
+
+/// Sent to `node`; a Redirect (3, the partition is led elsewhere) is followed to the leader's broker (`leaderNode`).
+int produceOnce(AuthTrio& t, UserSessions& u, int node, int32_t topic, int32_t part, int leaderNode) {
+    auto& c = u.w->raw();
+    for (int hop = 0; hop < 2; ++hop) {
+    if (hop == 1) node = leaderNode;
+    const int64_t corr = c.nextCorrelationId();
+    if (!c.produce(t.channel(node), AuthWireClient::kClientStream, u.sid[static_cast<std::size_t>(node - 1)], corr, topic, part, 1, makeBatch(1)))
+        return kNoAnswer;
+    const int code = ackOrErrorCode(c, corr, 5s);
+    if (code != 3 || node == leaderNode) return code;
+    }
+    return kNoAnswer;
+}
+
+/// DDL ops as the user: sent to `via`, the other brokers on Redirect / NotLeader.  `seq` makes every attempt's object new.
+int ddlOnce(AuthTrio& t, UserSessions& u, int via, am::Op op, int seq) {
+    auto& c = u.w->raw();
+    for (int k = 0; k < 3; ++k) {
+        const int node = (via - 1 + k) % 3 + 1;
+        const int64_t sid = u.sid[static_cast<std::size_t>(node - 1)];
+        int code = kNoAnswer;
+        if (op == am::Op::CreateTopic) {
+            const int64_t corr = c.sendDefineTopic(t.channel(node), AuthWireClient::kClientStream, sid,
+                                                   "mx.new." + u.name + "." + std::to_string(seq), 1, authRigCharBlob());
+            const auto a = c.awaitAnyDdlAnswer(corr, Clock3::now() + 15s);
+            code = a ? a->code : kNoAnswer;
+        } else {
+            code = u.w->createRole(t.channel(node), sid, "mxr." + u.name + "." + std::to_string(seq)).errorCode;
+        }
+        if (code != 2 && code != 3) return code;
+    }
+    return kNoAnswer;
+}
+
+}  // namespace
+
+TEST(AuthClusterRegression, MatrixSliceOpByTimingByViaBrokerRegression) {
+    AuthTrio t("matrix");
+    t.start();
+    t.bootstrapAdmin();
+    createBuilder(t);
+    std::vector<AuthTrio::Session> bs{t.login(1, "builder")};
+    const LedTopic led = defineLedTopic(t, bs, "mx.t");
+    ASSERT_GE(led.id, 0);
+    ASSERT_TRUE(led.part[0] >= 0 && led.part[1] >= 0 && led.part[2] >= 0);
+
+    using am::Op; using am::Timing; using am::Grant;
+    const std::vector<Op> ops = {Op::ProduceRouted, Op::Produce, Op::Subscribe, Op::CreateTopic, Op::SecurityDdl};
+    const std::vector<Timing> timings = {Timing::Steady, Timing::RevokedMid, Timing::UserDisabledMid};
+    int cells = 0, n = 0;
+    for (const Op op : ops) for (const Timing timing : timings) for (int via = 1; via <= 3; ++via) {
+        const Grant grant = op == Op::SecurityDdl ? Grant::ViaRole : Grant::Exact;
+        const am::ExpectedCodes want = am::expectedCodes(op, grant, timing);
+        ASSERT_NE(am::expect(op, grant, timing), am::Outcome::NotApplicable);
+        const int prefer = via % 3 + 1;   // the admin's DDL goes through a different broker
+        SCOPED_TRACE(std::string(am::name(op)) + "/" + std::string(am::name(timing)) + "/via" + std::to_string(via));
+        ++cells;
+        UserSessions u;
+        u.name = "mu" + std::to_string(++n);
+        t.createUser(prefer, u.name);
+        const int32_t part = op == Op::ProduceRouted ? led.part[static_cast<std::size_t>(via % 3)]    // led by another broker
+                                                     : led.part[static_cast<std::size_t>(via - 1)];   // led by `via`
+        const std::string newTopicGrant = "mx.new." + u.name + ".";
+        const std::string role = "mxrole." + u.name;
+        auto doRevoke = [&] {
+            switch (op) {
+                case Op::Produce: case Op::ProduceRouted: return t.revoke(prefer, u.name, SO::Write, ST::Topic, SP::Exact, "mx.t");
+                case Op::Subscribe: return t.revoke(prefer, u.name, SO::Read, ST::Topic, SP::Exact, "mx.t");
+                case Op::CreateTopic: return t.revoke(prefer, u.name, SO::Create, ST::Topic, SP::Prefix, newTopicGrant);
+                default: return t.ddl(prefer, [&](AuthWireClient& w, const std::string& ch, int64_t sid) { return w.revokeRole(ch, sid, u.name, role); });
+            }
+        };
+        switch (op) {
+            case Op::Produce: case Op::ProduceRouted: t.grant(prefer, u.name, SO::Write, ST::Topic, SP::Exact, "mx.t"); break;
+            case Op::Subscribe: t.grant(prefer, u.name, SO::Read, ST::Topic, SP::Exact, "mx.t"); break;
+            case Op::CreateTopic: t.grant(prefer, u.name, SO::Create, ST::Topic, SP::Prefix, newTopicGrant); break;
+            default:
+                t.mustOk(t.ddl(prefer, [&](AuthWireClient& w, const std::string& ch, int64_t sid) { return w.createRole(ch, sid, role); }), "role");
+                t.grant(prefer, role, SO::Admin, ST::Cluster, SP::Exact, "", /*role=*/true);
+                t.mustOk(t.ddl(prefer, [&](AuthWireClient& w, const std::string& ch, int64_t sid) { return w.grantRole(ch, sid, u.name, role); }), "grant role");
+        }
+        u.w = &t.newWire(via);
+        for (int id : {1, 2, 3}) {
+            AuthTrio::Session s;
+            ASSERT_TRUE(AuthTrio::until(30s, [&] { try { s = t.loginOn(*u.w, id, u.name); return true; } catch (...) { return false; } }));
+            u.sid[static_cast<std::size_t>(id - 1)] = s.sid;
+        }
+        const int64_t sid = u.sid[static_cast<std::size_t>(via - 1)];
+        auto& c = u.w->raw();
+        int seq = 0;
+        int64_t subCorr = 0;
+        auto action = [&]() -> int {
+            switch (op) {
+                case Op::Produce: case Op::ProduceRouted: return produceOnce(t, u, via, led.id, part, op == Op::ProduceRouted ? via % 3 + 1 : via);
+                case Op::Subscribe: {
+                    subCorr = c.sendSubscribe(t.channel(via), AuthWireClient::kClientStream, sid, led.id, part);
+                    const auto code = c.awaitSubscribeCode(subCorr, Clock3::now() + 10s);
+                    return code ? *code : kNoAnswer;
+                }
+                default: return ddlOnce(t, u, via, op, ++seq);
+            }
+        };
+        int first = kNoAnswer;
+        AuthTrio::until(20s, [&] { first = action(); return first == want.first; });
+        ASSERT_EQ(first, want.first) << "first answer";
+        if (timing == Timing::Steady) continue;
+
+        if (timing == Timing::RevokedMid) {
+            const auto r = doRevoke();
+            ASSERT_EQ(r.errorCode, 0) << r.detail;
+            if (op == Op::Subscribe) {
+                EXPECT_EQ(ackOrErrorCode(c, subCorr, 10s), want.second) << "the live subscription ends NotAuthorized";
+            } else {
+                int second = kNoAnswer;
+                AuthTrio::until(10s, [&] { second = action(); return second == want.second; });
+                EXPECT_EQ(second, want.second);
+            }
+        } else {   // UserDisabledMid
+            t.mustOk(t.ddl(prefer, [&](AuthWireClient& w, const std::string& ch, int64_t s) {
+                return w.alterPassword(ch, s, u.name, pc::UserChangeKind::Disable); }), "disable");
+            int revoked = kNoAnswer;
+            c.pollFor(10s, [&] {
+                for (const auto& e : c.errors()) if (e.sessionId == sid && e.code == want.second) { revoked = e.code; return true; }
+                return false;
+            });
+            EXPECT_EQ(revoked, want.second) << "the session is revoked";
+            AuthWireClient& w2 = t.newWire(via);
+            const int64_t s2 = w2.connect(t.channel(via));
+            ASSERT_GT(s2, 0);
+            int reconnect = kNoAnswer;
+            AuthTrio::until(10s, [&] { reconnect = w2.login(t.channel(via), s2, u.name, {AuthTrio::kPw, AuthTrio::kPw}).errorCode(); return reconnect == want.reconnect; });
+            EXPECT_EQ(reconnect, want.reconnect) << "a reconnect is refused";
+        }
+    }
+    EXPECT_EQ(cells, 45);
 }

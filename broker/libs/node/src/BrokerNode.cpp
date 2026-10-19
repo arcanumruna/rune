@@ -3452,6 +3452,9 @@ BrokerNode::SecurityViewSnap BrokerNode::securityViewForTest() {
 bool BrokerNode::gatewayHasSessionForTest(int64_t sessionId) {
     return onControlThreadForTest([this, sessionId]() { return gateway_ != nullptr && gateway_->hasSessionForTest(sessionId); });
 }
+uint64_t BrokerNode::gatewayNotAuthorizedForTest() {
+    return onControlThreadForTest([this]() -> uint64_t { return gateway_ ? gateway_->notAuthorizedAnswers() : 0; });
+}
 uint64_t BrokerNode::authGateRefusalsForTest() {
     return onControlThreadForTest([this]() -> uint64_t { return gateway_ ? gateway_->authGateRefusals() : 0; });
 }
