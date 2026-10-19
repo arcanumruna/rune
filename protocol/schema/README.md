@@ -37,6 +37,7 @@ treats an absent field as 0 (or -1 where noted). The wire minimum stays 3.
 | `AlterIsrResponse` (block 26 -> 46) | `proposalId int64`, `controllerEpoch int64`, `sendSeq int32` (echo / term of the answering controller; 0 = a v3 peer) |
 
 A below-committed report is an `AlterIsr` with `isrCount = kLeaderEpochBump`, `isr[1] = 2048`
-(`kBumpLeaderBelowCommitted`), `isr[2]` the floor and `proposalId` the report id; an old controller answers it Fenced.
+(`kBumpLeaderBelowCommitted`), `isr[2]` the floor (clamped to int32; informational), `isr[3]`/`isr[4]` the reporter's process
+incarnation (low/high 32 bits) and `proposalId` the report id; an old controller answers it Fenced.
 The node-control register carries the storage id in `isr[7]`/`isr[8]` and its origin in `isr[9]`. The broker's
 hand-rolled codecs (`ReplicationMessages.h`) are the reference for block clamping.
