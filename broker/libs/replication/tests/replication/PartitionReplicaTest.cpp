@@ -1703,6 +1703,90 @@ TEST(TruncationGuardRegression, CompactionGapReconcileIsNeverAHistoryMismatchReg
     EXPECT_EQ(f.nextFetch().lastEpochStartOffset, -1);
 }
 
+namespace {
+/// Epoch 3 at [0,5), epoch 5 at bases 7..11 (5 and 6 compacted away).
+void writeGappedLog(const std::string& dir) {
+    rune::storage::Log log(dir);
+    log.recover();
+    appendStamped(log, 3, {0, 1, 2, 3, 4});
+    appendStamped(log, 5, {7, 8, 9, 10, 11});
+}
+/// A leader over `dir` (epoch 6) asked by a follower that holds epoch 5's TRUE start 5: must not answer -11.
+void expectHonestLeaderNotMismatched(const std::string& dir) {
+    rune::storage::Log log(dir);
+    log.recover();
+    CapturingIsr t;
+    PartitionReplica L(makeConfig(1), Role::Leader, 6, {1, 2}, {1, 2}, &log, &t);
+    FetchRequestMsg req{};
+    req.leaderEpoch = 6; req.partition = 0; req.followerId = 2; req.fetchOffset = 12; req.maxBytes = 1 << 20;
+    req.topicId = 0; req.lastFetchedEpoch = 5; req.lastEpochStartOffset = 5;
+    EXPECT_NE(L.onFetchRequest(req, 1'000'000'000), kErrEpochHistoryMismatch);
+    EXPECT_EQ(L.epochHistoryMismatchesForTest(), 0u);
+}
+}  // namespace
+
+// CP3 R1: a gapped rebuild PERSISTS its shifted start (epoch-state image); a later clean restart loads that image as
+// valid.  Trust is re-derived at every boot: a start above the log start is comparable only when record s-1 is present.
+// RED: drop the markUnprovenEpochStarts_() call (replica #2 returns 7 and the leader answers -11).
+TEST(TruncationGuardRegression, PersistedGappedRebuildImageIsNeverComparedAfterACleanRestartRegression) {
+    TempDir dir("persisted_gap");
+    writeGappedLog(dir.path);
+    {
+        rune::storage::Log log(dir.path);
+        log.recover();
+        CapturingIsr t;
+        PartitionReplica f1(makeConfig(2), Role::Follower, 5, {1, 2}, {1, 2}, &log, &t);   // rebuild; persists the image
+        ASSERT_EQ(f1.heldEpochStartForTest(5), -1);
+    }
+    TempDir copy("persisted_gap_leader");
+    std::filesystem::copy(dir.path, copy.path, std::filesystem::copy_options::recursive |
+                                                std::filesystem::copy_options::overwrite_existing);
+    {   // clean restart: the image is valid and the recovery point known
+        rune::storage::Log log(dir.path);
+        log.recover();
+        CapturingIsr t;
+        PartitionReplica f2(makeConfig(2), Role::Follower, 5, {1, 2}, {1, 2}, &log, &t);
+        ASSERT_EQ(f2.lastFetchedEpoch(), 5);
+        EXPECT_EQ(f2.heldEpochStartForTest(5), -1);
+        EXPECT_EQ(f2.nextFetch().lastEpochStartOffset, -1);
+    }
+    expectHonestLeaderNotMismatched(copy.path);
+}
+
+// The migration case: a legacy `leader-epoch-checkpoint` written by an old binary after a gapped rebuild.
+TEST(TruncationGuardRegression, LegacyCheckpointWithAGappedStartIsNeverComparedRegression) {
+    TempDir dir("legacy_gap");
+    writeGappedLog(dir.path);
+    rune::storage::LeaderEpochCache c;
+    c.assign(3, 0);
+    c.assign(5, 7);
+    c.checkpointToFile(dir.path + "/leader-epoch-checkpoint");
+    rune::storage::Log log(dir.path);
+    log.recover();
+    CapturingIsr t;
+    PartitionReplica f(makeConfig(2), Role::Follower, 5, {1, 2}, {1, 2}, &log, &t);
+    ASSERT_EQ(f.lastFetchedEpoch(), 5);
+    EXPECT_EQ(f.heldEpochStartForTest(5), -1);
+}
+
+// A contiguous log keeps its comparable start across a clean restart.  RED: the helper marks unconditionally.
+TEST(TruncationGuardRegression, ContiguousStartStillComparedAfterACleanRestartRegression) {
+    TempDir dir("contig_restart");
+    {
+        rune::storage::Log log(dir.path);
+        log.recover();
+        appendStamped(log, 3, {0, 1, 2, 3, 4});
+        appendStamped(log, 5, {5, 6, 7, 8, 9});
+    }
+    for (int boot = 0; boot < 2; ++boot) {
+        rune::storage::Log log(dir.path);
+        log.recover();
+        CapturingIsr t;
+        PartitionReplica f(makeConfig(2), Role::Follower, 5, {1, 2}, {1, 2}, &log, &t);
+        EXPECT_EQ(f.heldEpochStartForTest(5), 5) << "boot " << boot;
+    }
+}
+
 // The same without the gap: the rebuilt start is the true one and is compared.
 TEST(TruncationGuardRegression, ContiguousRebuildStillComparesRegression) {
     TempDir dir("contig_rebuild");

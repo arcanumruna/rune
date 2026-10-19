@@ -1601,6 +1601,7 @@ private:
     /// CP3 I2: starts below this offset were re-derived from batch stamps over a compaction GAP (the first surviving batch of
     /// an epoch is not its first record) - never compared.  Starts at or above it were assigned live.
     Offset rederivedStartsBelow_ = 0;
+    void markUnprovenEpochStarts_();   ///< CP3 R1: boot-time proof that a start is its epoch's first record
 
     // ── Follower replication sync — SINGLE SOURCE OF TRUTH ──────────────────────
     // One explicit state machine (see FollowerSync.h) replaces the former scattered

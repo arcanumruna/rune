@@ -232,6 +232,7 @@ void PartitionReplica::initReplica(std::vector<NodeId> replicas,
         // re-derived from the surviving batches' stamps (Kafka recovery).  Only
         // against a RECOVERED log (the LEO is the true log end).
         if (diskLog_->isRecovered()) reconcileEpochCacheWithLog_();
+        if (diskLog_->isRecovered()) markUnprovenEpochStarts_();   // CP3 R1: before any image is (re)written
         if (es.state != ES::FileState::Missing) {
             // The state file is (or was) the authority: keep writing it — never
             // a legacy file next to it.  Writes the reconciled image (cold,
@@ -2398,6 +2399,26 @@ void PartitionReplica::reconcileEpochCacheWithLog_()
         from = next;
     }
     if (gapped) rederivedStartsBelow_ = std::max(rederivedStartsBelow_, leo);
+}
+
+// CP3 recheck R1: a start s > logStart is compared only when the record before it (s - 1) is physically present, which
+// proves s is the epoch's first record.  Over a compaction gap the true start may lie anywhere in the gap, whatever wrote
+// the entry: this boot's rebuild, an image a gapped rebuild persisted, a legacy checkpoint.  Stateless and re-derived at
+// every boot (compaction never refills a gap); errs only towards "not compared".  Cold: O(entries) one-batch reads.
+void PartitionReplica::markUnprovenEpochStarts_()
+{
+    const Offset ls = diskLog_->logStartOffset();
+    for (const auto& [e, s] : epochCache_.map()) {
+        (void)e;
+        if (s <= ls) continue;                                    // never compared anyway (heldEpochStart_)
+        const std::vector<uint8_t> b = diskLog_->read(s - 1, 1);  // cold, copying (as stampAt in reconcile)
+        bool present = false;
+        if (b.size() >= static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead)) {
+            rune::protocol::RecordBatchReader r(b.data(), b.size());
+            present = r.baseOffset() <= s - 1 && s - 1 <= r.baseOffset() + r.lastOffsetDelta();
+        }
+        if (!present) rederivedStartsBelow_ = std::max<Offset>(rederivedStartsBelow_, s + 1);
+    }
 }
 
 int PartitionReplica::doWork(int64_t nowNs)
