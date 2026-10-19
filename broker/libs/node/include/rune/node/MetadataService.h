@@ -1611,8 +1611,15 @@ public:
     /// becomes >= 0 on a COMMITTED apply (the metadata log now holds data on this storage).  Cold.
     using FirstApplyHook = void (*)(void*) noexcept;
     void setFirstApplyHook(FirstApplyHook hook, void* ctx) noexcept { firstApplyHook_ = hook; firstApplyCtx_ = ctx; }
+    /// A record that carries STATE was applied (anything but a ControllerTermRecord).  The controller's own claim
+    /// record is not "data on this storage": it must not make the empty-log bootstrap guard see a formed log.
+    void noteAppliedRecord_(std::string_view val) noexcept {
+        if (val.size() < 2) return;
+        const uint16_t t = static_cast<uint16_t>(static_cast<uint8_t>(val[0]) | (static_cast<uint8_t>(val[1]) << 8));
+        if (t != rune::metadata::kControllerTermRecordType) appliedStateRecord_ = true;
+    }
     void noteFirstApply_() noexcept {
-        if (firstApplyHook_ == nullptr || lastApplied_ < 0) return;
+        if (firstApplyHook_ == nullptr || lastApplied_ < 0 || !appliedStateRecord_) return;
         const FirstApplyHook h = firstApplyHook_;
         firstApplyHook_ = nullptr;
         h(firstApplyCtx_);
@@ -1912,6 +1919,14 @@ public:
     /// Stamped on every AlterIsr answer so a follower can drop an answer of a deposed controller.
     void setControllerEpoch(int64_t t) noexcept { controllerEpoch_ = t; }
     [[nodiscard]] int64_t controllerEpochForTest() const noexcept { return controllerEpoch_; }
+    /// ISR v3 R17: may a claim over an EMPTY metadata log bootstrap a new one?  A live thunk over BrokerNode's
+    /// storage (origin == Founder and no MetadataLog in the manifest), read at the ready edge.  Null = true.
+    using MayBootstrapFn = bool (*)(void*) noexcept;
+    void setMayBootstrap(MayBootstrapFn fn, void* ctx) noexcept { mayBootstrapFn_ = fn; mayBootstrapCtx_ = ctx; }
+    [[nodiscard]] bool mayBootstrap_() const noexcept { return mayBootstrapFn_ == nullptr || mayBootstrapFn_(mayBootstrapCtx_); }
+    /// NodeRuntimeAgent, once per cycle: the controller role was halted by the empty-log guard; resign the consensus.
+    [[nodiscard]] bool takeResignRequest() noexcept { const bool r = resignRequested_; resignRequested_ = false; return r; }
+    [[nodiscard]] bool resignRequestedForTest() const noexcept { return resignRequested_; }
     /// ISR v3 (Step 7): which topics are TRANSIENT (memory) partitions - a wiped sole-ISR leader of one keeps its
     /// lineage (it is decided on fresh reports) instead of going StorageReset.  Null = never transient.  Set by
     /// BrokerNode for single AND multi-node.
@@ -1955,7 +1970,7 @@ public:
     }
     /// The controller decides only once its map reflects its whole log as of
     /// the claim (see controllerReady_).
-    [[nodiscard]] bool controllerCaughtUpForTest() const noexcept { return controllerCaughtUp_; }
+    [[nodiscard]] bool controllerCaughtUpForTest() const noexcept { return std::holds_alternative<ClaimReady>(claim_); }
     /// F-B test-only: placement / ISR decisions queued under the current claim and not yet appended.
     [[nodiscard]] std::size_t pendingDecisionsForTest() const noexcept { return pendingDynamicRecords_.size(); }
 
@@ -2388,8 +2403,10 @@ public:
             // assignment over them.  Every decision waits until the MSM has
             // applied the log through the claim-time LEO; event-driven (the HW
             // reaches it as the followers fetch — no timer).
-            claimLeo_          = replica_->logEndOffset();
-            controllerCaughtUp_ = false;
+            // ISR v3 R9 (Raft section 5.4.2): the claim first commits a record of THIS term; nothing is decided or
+            // answered before it has (a deposed term's tail can no longer overwrite what is answered).
+            claim_ = ClaimNeedsTermRecord{replica_->logEndOffset()};
+            tryAppendTermRecord_();
             // MD1 Task 6: the static partition assignment is emitted (if not
             // already assigned — idempotent) once caught up (maybeCatchUp_).
             // Followers never emit.
@@ -2398,6 +2415,7 @@ public:
             stepDownController_();
         }
 
+        if (amLeader) tryAppendTermRecord_();   // ISR v3 R9: every cycle while the term record is not appended
         const rune::replication::Offset hw = replica_->highWatermark();
         for (auto it = inflight_.begin(); it != inflight_.end();)
             it = (it->second.at <= hw) ? inflight_.erase(it) : std::next(it);
@@ -2460,6 +2478,7 @@ public:
                         std::string_view val,
                         int64_t logOffset,  // base + offDelta (absolute log position)
                         int64_t /*ts*/) {
+                    noteAppliedRecord_(val);
                     msm_.apply(
                         reinterpret_cast<const uint8_t*>(val.data()),
                         val.size(),
@@ -2552,6 +2571,7 @@ public:
                         std::string_view val,
                         int64_t logOffset,  // absolute log position
                         int64_t /*ts*/) {
+                    noteAppliedRecord_(val);
                     msm_.apply(
                         reinterpret_cast<const uint8_t*>(val.data()),
                         val.size(),
@@ -2655,6 +2675,9 @@ public:
     // Test-only / diagnostic
     // -----------------------------------------------------------------------
 
+    /// The committed state machine (read-only): the storage gate and the node-side registration read it on the
+    /// control thread (ISR v3 Step 9).
+    [[nodiscard]] const rune::metadata::MetadataStateMachine& msm() const noexcept { return msm_; }
     /// Return the raw MSM (for snapshot / delta derivation in tests).
     rune::metadata::MetadataStateMachine& msmForTest() noexcept { return msm_; }
 
@@ -2697,6 +2720,17 @@ private:
     /// The controller-leadership step-down edge (replica demoted, consensus lost, halted, or a new replica
     /// epoch about to be re-claimed - F-B): everything decided under the old claim is dropped and the next
     /// claim starts a fresh catch-up.
+    /// R9: while ClaimNeedsTermRecord, append this term's ControllerTermRecord (retried every cycle on a refusal).
+    void tryAppendTermRecord_() {
+        if (!std::holds_alternative<ClaimNeedsTermRecord>(claim_) || !leaderReady_()) return;
+        const rune::replication::Offset base = std::get<ClaimNeedsTermRecord>(claim_).baseLeo;
+        uint8_t buf[rune::metadata::ControllerTermRecord::ENCODED_SIZE];
+        rune::metadata::ControllerTermRecord tr;
+        tr.term = controllerEpoch_;
+        const std::size_t n = tr.encode(buf, sizeof buf);
+        if (replica_->append(std::span<const uint8_t>(buf, n), /*acksAll=*/false) < 0) return;
+        claim_ = ClaimCatchingUp{base, replica_->logEndOffset()};
+    }
     void stepDownController_() {
         wasLeader_ = false;
         assigned_  = false;  // re-arm emit if we regain leadership later
@@ -2729,7 +2763,7 @@ private:
         // whole log onto it re-bumped the committed version on every flap); a
         // re-claim's rebuildFromLog resets the cursor anyway.
         if (!replica_->acceptsProduce()) lastApplied_ = -1;
-        controllerCaughtUp_ = false;   // F-B: a later claim always runs a fresh catch-up
+        claim_ = ClaimNone{};   // F-B: a later claim always runs a fresh catch-up
     }
 
     /// This replica may append to the metadata log (the replica's produce gate).
@@ -2740,25 +2774,38 @@ private:
     /// it leads AND its MSM reflects its whole log as of the claim.
     [[nodiscard]] bool controllerReady_() const noexcept {
         // Review M5: wasLeader_ = a claim edge ran (rebuild + claim LEO) - before it, nothing is decided on an empty MSM.
-        return wasLeader_ && leaderReady_() && consensusLeads_ && controllerCaughtUp_ && !halted_;
+        return wasLeader_ && leaderReady_() && consensusLeads_ && std::holds_alternative<ClaimReady>(claim_) && !halted_;
     }
     /// The catch-up edge: the HW (and the MSM apply cursor) reached the
     /// claim-time LEO — the map is complete; the deferred claim action runs.
     void maybeCatchUp_() {
-        if (controllerCaughtUp_ || !leaderReady_()) return;
+        const auto* catching = std::get_if<ClaimCatchingUp>(&claim_);
+        if (catching == nullptr || !leaderReady_()) return;
         const rune::replication::Offset applied = lastApplied_ < 0 ? 0 : lastApplied_;   // -1 = nothing yet
-        if (replica_->highWatermark() < claimLeo_ || applied < claimLeo_) return;
-        controllerCaughtUp_ = true;
+        if (replica_->highWatermark() < catching->claimLeo || applied < catching->claimLeo) return;
+        const rune::replication::Offset baseLeo = catching->baseLeo;
+        claim_ = ClaimReady{};
         recheckOnCatchUp_   = true;   // M2: re-spread decided on the complete map
+        // R17: read ONCE, here, at the ready edge, from the live storage origin (never captured earlier: a
+        // multi-node storage starts Undecided and founds at runtime).
+        const bool mb = mayBootstrap_();
+        if (baseLeo == 0 && !mb) {
+            spdlog::critical("MetadataService[{}]: claimed __cluster_metadata with an EMPTY log on a formed storage "
+                             "(not a founder with an empty metadata log) - refusing to bootstrap a new metadata log; "
+                             "halting the controller role", selfId_);
+            halt();
+            resignRequested_ = true;
+            return;
+        }
         // D15: a brand-new metadata log (nothing written by any binary yet) is
         // bootstrapped at this binary's level (KRaft: metadata.version is set
         // when the log is formatted), before any assignment.
-        if (claimLeo_ == 0 && msm_.featureLevel() < supportedFeatureLevel_)
+        if (baseLeo == 0 && mb && msm_.featureLevel() < supportedFeatureLevel_)
             pendingFeatureLevel_ = supportedFeatureLevel_;
         restoreLeaderlessMarks_();   // D15 item 1
         replayStorageRegistrations_();   // ISR v3 (A-I2): the soft storage state of the registrations already held
         storageReplayLevel_ = msm_.featureLevel();
-        emitStaticAssignmentIfNeeded();
+        if (baseLeo > 0 || mb) emitStaticAssignmentIfNeeded();
         reconcileRemovedTopics_(/*force=*/true);   // Task 8: removals recorded while not the ready controller
         drainDynamicQueue();
     }
@@ -3162,6 +3209,7 @@ private:
     rune::replication::Offset lastApplied_ = -1;
     FirstApplyHook firstApplyHook_ = nullptr;
     void*          firstApplyCtx_  = nullptr;
+    bool           appliedStateRecord_ = false;   ///< a non-term record was applied (see noteAppliedRecord_)
     // MetadataTruncationRebuildRegression: exclusive end of the log the MSM has
     // COMMITTED.  Committed records are never truncated (KIP-101/279 cut only
     // above the HW), so a rebuild after a truncation replays at least this far
@@ -3199,8 +3247,15 @@ private:
     /// Epoch-restart fix: the metadata LEO at this controller's claim, and
     /// whether the MSM has applied the log through it (true before any claim:
     /// direct-invocation unit rigs decide on what they applied).
-    rune::replication::Offset claimLeo_ = 0;
-    bool     controllerCaughtUp_ = true;
+    /// ISR v3 R9: the controller claim as ONE state (each state holds only what it needs).
+    struct ClaimNone {};
+    struct ClaimNeedsTermRecord { rune::replication::Offset baseLeo; };
+    struct ClaimCatchingUp { rune::replication::Offset baseLeo; rune::replication::Offset claimLeo; };
+    struct ClaimReady {};
+    std::variant<ClaimNone, ClaimNeedsTermRecord, ClaimCatchingUp, ClaimReady> claim_{ClaimReady{}};
+    bool     resignRequested_ = false;   ///< the empty-log guard asks NodeRuntimeAgent to resign the consensus
+    MayBootstrapFn mayBootstrapFn_  = nullptr;
+    void*          mayBootstrapCtx_ = nullptr;
     bool     halted_             = false;   ///< fix round 2 N2: stopping — decides nothing
     bool     recheckOnCatchUp_   = false;
     uint64_t preferredCheckedVersion_ = 0;

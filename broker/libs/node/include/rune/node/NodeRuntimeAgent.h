@@ -331,6 +331,8 @@ private:
             metadataService_->setConsensusLeads(isLocalLeader_());
             const int metaWork = metadataService_->doWork(nowNs);
             work += metaWork;
+            // ISR v3 R17: the empty-log guard halted the controller role - hand the consensus leadership on.
+            if (metadataService_->takeResignRequest() && election_) (void)election_->resign(nowNs);
             // Controlled shutdown (cold; two empty() checks when idle): member
             // confirmations → the controller, the controller's pushed COMPLETE
             // → the stopping node.  Every cycle (events, not the slow tick).

@@ -752,6 +752,11 @@ void BrokerNode::markConsensusWhenPresent_() {
     if (!StorageIdentity::isPresent(config_.dataDir, StorageIdentity::Class::Consensus)) return;
     if (StorageIdentity::markPresent(config_.dataDir, storage_, StorageIdentity::Class::Consensus)) consensusUnmarked_ = false;
 }
+bool BrokerNode::mayBootstrapThunk_(void* self) noexcept {
+    const auto& s = static_cast<BrokerNode*>(self)->storage_;
+    return s.origin == StorageIdentity::Origin::Founder &&
+           (s.manifest & static_cast<uint8_t>(StorageIdentity::Class::MetadataLog)) == 0;
+}
 void BrokerNode::markKnowledgeThunk_(void* self) noexcept {
     auto* n = static_cast<BrokerNode*>(self);
     try { (void)StorageIdentity::markPresent(n->config_.dataDir, n->storage_, StorageIdentity::Class::Knowledge); } catch (...) {}
@@ -2520,6 +2525,7 @@ void BrokerNode::buildGateway() {
             // ISR v3 Step 6: the first committed apply marks the MetadataLog class (set BEFORE the rebuild:
             // a restart over an existing log marks it too).
             metadataService_->setFirstApplyHook(&BrokerNode::markMetadataLogThunk_, this);
+            metadataService_->setMayBootstrap(&BrokerNode::mayBootstrapThunk_, this);   // ISR v3 R17
             // ISR v3 Step 7: a wiped sole-ISR leader of a TRANSIENT partition keeps its lineage (single AND multi-node).
             metadataService_->setTransientTopicPredicate(&BrokerNode::isTransientTopicTrampoline_, this);
             // Rebuild any previously committed assignments from the local Log.

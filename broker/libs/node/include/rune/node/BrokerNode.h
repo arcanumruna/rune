@@ -1881,6 +1881,9 @@ private:
     void markConsensusWhenPresent_();
     bool    consensusUnmarked_ = true;          ///< the Consensus class is not in the manifest yet
     int64_t lastConsensusMarkCheckNs_ = 0;
+    /// ISR v3 R17: may a claim over an EMPTY metadata log bootstrap a new one?  Read live at the claim edge (control
+    /// thread; storage_ is the one Loaded object): only a Founder whose manifest never recorded a metadata log.
+    static bool mayBootstrapThunk_(void* self) noexcept;
     static void markKnowledgeThunk_(void* self) noexcept;
     static void markMetadataLogThunk_(void* self) noexcept;
     static uint64_t transientLineageVersionTrampoline_(void* ctx) noexcept;   // R1 (round 5)

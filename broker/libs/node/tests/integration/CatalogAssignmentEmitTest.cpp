@@ -173,16 +173,18 @@ TEST(CatalogAssignmentEmitTest, SingleLeader_EmitsBalancedAssignmentOnLeaderClai
     EXPECT_GT(r1->logEndOffset(), 0)
         << "leader must have appended assignment records after leader-claim";
 
-    // Now drive replication until followers catch up (majority HW).
+    // Now drive replication until followers catch up (majority HW).  The leader service runs in the loop: since the
+    // controller-term record (Raft section 5.4.2) the claim emits its assignments only once that record has COMMITTED.
     bool replicated = false;
     for (int i = 0; i < kDriveCap && !replicated; ++i) {
         clock += 1'000'000LL;
         r1->doWork(clock); r2->doWork(clock); r3->doWork(clock);
         transport.pump(clock);
+        svc1.doWork(clock);
         // Majority = leader + at least one follower with HW >= LEO.
         // Kafka model: committed once on every ISR member; both followers learn it.
         if (r2->highWatermark() >= r1->logEndOffset() &&
-            r3->highWatermark() >= r1->logEndOffset()) {
+            r3->highWatermark() >= r1->logEndOffset() && svc1.assignment(2, 1) != nullptr) {
             replicated = true;
         }
     }
@@ -340,8 +342,8 @@ TEST(CatalogAssignmentEmitTest, Idempotent_NoDoubleEmitOnRePromotion) {
     svc2.doWork(clock);
 
     const Offset leoAfterRepromotion = replica->logEndOffset();
-    EXPECT_EQ(leoAfterFirst, leoAfterRepromotion)
-        << "re-promoted service must NOT append any new records "
+    EXPECT_EQ(leoAfterFirst + 1, leoAfterRepromotion)   // +1: the controller-term record (Raft §5.4.2)
+        << "re-promoted service must NOT append any new records but its controller-term record "
            "(msmAlreadyHasAllAssignments guard must fire)";
 
     // All assignments must still be visible on the new service (built from replay).
@@ -400,8 +402,8 @@ TEST(CatalogAssignmentEmitTest, OneRecordPerAppend_LargeTopicSetNeverMegaAppend)
     // got its own append call.  If a mega-append was used, this would be 1.
     const Offset leoAfterEmit = replica->logEndOffset();
     // D15: + the fresh log's bootstrap FeatureLevelRecord (its own entry).
-    EXPECT_EQ(leoAfterEmit, static_cast<Offset>(kTopicCount) + 1)
-        << "logEndOffset must advance by exactly " << kTopicCount << " + 1"
+    EXPECT_EQ(leoAfterEmit, static_cast<Offset>(kTopicCount) + 2)   // +1: the controller-term record (Raft §5.4.2)
+        << "logEndOffset must advance by exactly " << kTopicCount << " + 2"
         << " (one log entry per assignment record); got " << leoAfterEmit
         << " — a value of 1 means records were incorrectly mega-appended";
 
@@ -515,7 +517,7 @@ TEST(CatalogAssignmentEmitTest, BalancerError_IncrementCounterEmitsNothing) {
 
     // No assignment records must have been appended (D15: only the fresh
     // log's bootstrap FeatureLevelRecord).
-    EXPECT_EQ(replica->logEndOffset(), 1)
+    EXPECT_EQ(replica->logEndOffset(), 2)   // +1: the controller-term record (Raft §5.4.2)
         << "no assignment records must be appended when BalancerError is thrown";
 
     // The error counter must be non-zero.
@@ -1521,7 +1523,8 @@ TEST(EpochRestartControllerRegression, NewControllerNeverReemitsOverItsUncommitt
         r1->doWork(clock); r2->doWork(clock); r3->doWork(clock);
         transport.pump(clock);
     }
-    EXPECT_EQ(r1->logEndOffset(), leo) << "the new controller re-emitted assignments over its uncommitted log";
+    EXPECT_EQ(r1->logEndOffset(), leo + 1)   // +1: the controller-term record (Raft §5.4.2)
+        << "the new controller re-emitted assignments over its uncommitted log";
     const auto* pa = svc1.assignment(0, 0);
     ASSERT_NE(pa, nullptr);
     EXPECT_EQ(pa->leaderEpoch, le);
@@ -3975,6 +3978,8 @@ std::vector<LoggedRec> recordsInLog(rune::storage::Log& log) {
                 if (t == rune::metadata::kNodeStorageRecordType) {
                     const auto r = rune::metadata::NodeStorageRecord::decode(b, val.size());
                     if (r) out.push_back({logOffset, t, r->node, 0, r->storageId});
+                } else if (t == rune::metadata::kFeatureLevelRecordType) {
+                    out.push_back({logOffset, t, 0, 0, 0});
                 } else if (t == rune::metadata::kControllerTermRecordType) {
                     const auto r = rune::metadata::ControllerTermRecord::decode(b, val.size());
                     if (r) out.push_back({logOffset, t, 0, 0, r->term});
@@ -4398,4 +4403,106 @@ TEST(StorageRegistrationRegression, HaltClearsTheStorageSoftStateRegression) {
     c.svc->halt();
     EXPECT_STREQ(c.svc->storageRegStateForTest(3), "None");
     EXPECT_EQ(c.svc->storagePendingCount(), 0u);
+}
+
+// ===========================================================================
+// ISR v3 Step 8 - controller-term record + bootstrap guard.
+// ===========================================================================
+
+// R9 / I-P2: a claim is ready only once a record of ITS OWN term has committed.  With no follower reachable the
+// term record is appended but cannot commit.  RED: set ClaimReady at the claim LEO without appending the record.
+TEST(MetadataServiceRegression, ReadinessWaitsForAThisTermRecordRegression) {
+    CtlRig c;
+    const int64_t base = c.r1->logEndOffset();
+    c.transport.removeFollower(2);
+    c.transport.removeFollower(3);
+    c.r1->becomeFollower(c.r1->epoch() + 1, NodeId{-1});
+    c.drive(5);
+    c.r1->becomeLeader(c.r1->epoch() + 1, c.all);
+    c.r2->becomeFollower(c.r1->epoch(), 1);
+    c.r3->becomeFollower(c.r1->epoch(), 1);
+    c.drive(50);
+    EXPECT_FALSE(c.svc->controllerReady()) << "ready before a record of this term committed";
+    bool found = false;
+    for (const auto& r : storageRecordsInLog(c.log1)) found = found || (r.type == 0x8005 && r.offset == base);
+    EXPECT_TRUE(found) << "no controller-term record at the claim LEO";
+    c.transport.addFollower(2, c.r2.get());
+    c.transport.addFollower(3, c.r3.get());
+    c.drive(100);
+    EXPECT_TRUE(c.svc->controllerReady());
+}
+
+namespace {
+/// A single-node controller over an EMPTY metadata log (the Idempotent test's rig), driven to its claim.
+struct SoleController {
+    SaeTempDir dir{"mb"};
+    rune::storage::Log log{dir.path};
+    std::vector<NodeId> nodes{1};
+    InMemoryTransport transport;
+    std::unique_ptr<PartitionReplica> replica;
+    std::unique_ptr<MetadataService> svc;
+    int64_t clock = 0;
+    SoleController() {
+        log.recover();
+        replica = std::make_unique<PartitionReplica>(makeMetaCfg(1, 1), Role::Leader, 1, nodes, nodes, &log, &transport);
+        transport.setLeader(replica.get());
+        svc = std::make_unique<MetadataService>(replica.get(), 1);
+        svc->configure({TopicSpec{0, 1, 1, "", "t"}}, nodes);
+    }
+    void drive(int n) {
+        for (int i = 0; i < n; ++i) {
+            clock += 1'000'000LL;
+            replica->doWork(clock);
+            transport.pump(clock);
+            (void)svc->doWork(clock);
+        }
+    }
+};
+}  // namespace
+
+// R17 (v2-review C1): mayBootstrap is read at the claim, from the LIVE source - never copied when it is set.  A node
+// whose storage is Undecided at construction and founds before it claims must still bootstrap.
+// RED: copy the thunk's value into a member inside setMayBootstrap (it reads false and halts).
+TEST(MetadataServiceRegression, MayBootstrapIsReadAtTheClaimNotAtConstructionRegression) {
+    SoleController s;
+    bool flag = false;
+    s.svc->setMayBootstrap(+[](void* f) noexcept { return *static_cast<bool*>(f); }, &flag);
+    flag = true;   // after construction, before the first doWork
+    s.drive(100);
+    EXPECT_TRUE(s.svc->controllerReady());
+    const auto recs = recordsInLog(s.log);
+    ASSERT_GE(recs.size(), 2u);
+    EXPECT_EQ(recs[0].type, 0x8005);                               // the term record first
+    EXPECT_EQ(recs[1].type, rune::metadata::kFeatureLevelRecordType);   // then the bootstrap level
+}
+
+// R17: an empty claim on a formed storage never bootstraps: no level record, no static emit, not ready, resign.
+// RED: no guard.
+TEST(MetadataServiceRegression, EmptyClaimNeverBootstrapsOnAFormedStorageRegression) {
+    SoleController s;
+    bool flag = false;
+    s.svc->setMayBootstrap(+[](void* f) noexcept { return *static_cast<bool*>(f); }, &flag);
+    s.drive(100);
+    EXPECT_FALSE(s.svc->controllerReady());
+    EXPECT_TRUE(s.svc->resignRequestedForTest());
+    EXPECT_EQ(s.svc->assignment(0, 0), nullptr) << "a static assignment was emitted";
+    for (const auto& r : recordsInLog(s.log)) EXPECT_NE(r.type, rune::metadata::kFeatureLevelRecordType);
+}
+
+// R17 + the term record: the controller's OWN claim record is the first record a Founder's empty metadata log ever
+// applies.  It must not count as "data on this storage" (the manifest's MetadataLog mark), or every Founder's first
+// claim would read mayBootstrap == false at the ready edge and halt (found by ShardModeRegression.WorkerSideAcks*).
+// RED: the first-apply hook fires for the ControllerTermRecord.
+TEST(MetadataServiceRegression, FoundersOwnTermRecordIsNotDataOnItsStorageRegression) {
+    SoleController s;
+    bool fired = false;
+    s.svc->setFirstApplyHook(+[](void* f) noexcept { *static_cast<bool*>(f) = true; }, &fired);
+    s.svc->setMayBootstrap(+[](void* f) noexcept { return !*static_cast<bool*>(f); }, &fired);   // as BrokerNode's thunk
+    s.drive(100);
+    EXPECT_TRUE(s.svc->controllerReady()) << "the founder's first claim halted on its own term record";
+    EXPECT_FALSE(s.svc->resignRequestedForTest());
+    bool level = false;
+    for (const auto& r : recordsInLog(s.log)) level = level || r.type == rune::metadata::kFeatureLevelRecordType;
+    EXPECT_TRUE(level) << "the founder never bootstrapped the metadata log";
+    EXPECT_TRUE(fired) << "the bootstrap records themselves are data on the storage";
 }
