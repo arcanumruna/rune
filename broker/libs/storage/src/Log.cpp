@@ -2070,7 +2070,7 @@ bool Log::truncateTo_(int64_t truncateOffset) {
     while (pos + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) <= buf.size()) {
         rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
         int32_t total = r.totalLength();
-        if (total <= 0 || pos + static_cast<std::size_t>(total) > buf.size()) break;
+        if (total < rune::protocol::batch::kRecordBatchOverhead || pos + static_cast<std::size_t>(total) > buf.size()) break;
         // A3: CRC-gate the walk — a corrupt batch terminates the scan so we
         // don't misparse a corrupt totalLength as a valid batch boundary.
         if (!r.ensureValid()) break;

@@ -119,7 +119,7 @@ void buildIndex(const std::string& indexPath, int64_t baseOffset,
     while (pos + static_cast<size_t>(rune::protocol::batch::kRecordBatchOverhead) <= logData.size()) {
         rune::protocol::RecordBatchReader r(logData.data() + pos, logData.size() - pos);
         int32_t total = r.totalLength();
-        if (total <= 0 || pos + static_cast<size_t>(total) > logData.size()) break;
+        if (total < rune::protocol::batch::kRecordBatchOverhead || pos + static_cast<size_t>(total) > logData.size()) break;
 
         // C2: unified shouldIndex predicate (bytesSince==0 || bytesSince>=interval).
         if (bytesSince == 0 || bytesSince >= static_cast<int64_t>(indexIntervalBytes)) {
@@ -226,7 +226,7 @@ int64_t scanTxnState(const std::string& dir, const std::vector<int64_t>& bases, 
         while (pos + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) <= buf.size()) {
             rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
             const int32_t total = r.totalLength();
-            if (total <= 0 || pos + static_cast<std::size_t>(total) > buf.size()) break;
+            if (total < rune::protocol::batch::kRecordBatchOverhead || pos + static_cast<std::size_t>(total) > buf.size()) break;
             if (!r.ensureValid()) break;
             const int64_t base = r.baseOffset();
             if (base >= toOffset) break;
@@ -342,7 +342,7 @@ Offset LogCleaner::buildOffsetMapFromBases(const std::string& dir,
                <= buf.size()) {
             rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
             int32_t total = r.totalLength();
-            if (total <= 0 || pos + static_cast<size_t>(total) > buf.size()) break;
+            if (total < rune::protocol::batch::kRecordBatchOverhead || pos + static_cast<size_t>(total) > buf.size()) break;
             if (!r.ensureValid()) break;
 
             bool full = false;
@@ -412,7 +412,7 @@ void LogCleaner::buildOffsetMapFromBases(const std::string& dir,
             rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
             int32_t total = r.totalLength();
             // A3: bounds check before CRC; a corrupt totalLength must not misparse the walk.
-            if (total <= 0 || pos + static_cast<size_t>(total) > buf.size()) break;
+            if (total < rune::protocol::batch::kRecordBatchOverhead || pos + static_cast<size_t>(total) > buf.size()) break;
             // A3: CRC-gate the walk — stop on the first corrupt batch (same as recover()).
             if (!r.ensureValid()) break;
 
@@ -481,7 +481,7 @@ bool LogCleaner::rewriteSegmentImpl(
         rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
         int32_t total = r.totalLength();
         // A3: bounds check before CRC; a corrupt totalLength must not misparse the walk.
-        if (total <= 0 || pos + static_cast<size_t>(total) > buf.size()) break;
+        if (total < rune::protocol::batch::kRecordBatchOverhead || pos + static_cast<size_t>(total) > buf.size()) break;
         // A3: CRC-gate the walk — stop on the first corrupt batch.
         if (!r.ensureValid()) break;
 
@@ -1266,7 +1266,7 @@ void LogCleaner::deferInstall_(const std::string& dir, const std::vector<int64_t
             rune::protocol::RecordBatchReader r(out.data() + pos, out.size() - pos);
             const int32_t total = (pos + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) <= out.size())
                                       ? r.totalLength() : 0;
-            if (total <= 0 || pos + static_cast<std::size_t>(total) > out.size() || !r.ensureValid())
+            if (total < rune::protocol::batch::kRecordBatchOverhead || pos + static_cast<std::size_t>(total) > out.size() || !r.ensureValid())
                 throw std::runtime_error("LogCleaner: compacted output failed verification (segment " +
                                          std::to_string(outBase) + ")");
             if (bytesSince == 0 || bytesSince >= 4096) {
@@ -1424,7 +1424,7 @@ void LogCleaner::mergeGroupWithMap(
                <= buf.size()) {
             rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
             int32_t total = r.totalLength();
-            if (total <= 0 || pos + static_cast<size_t>(total) > buf.size()) break;
+            if (total < rune::protocol::batch::kRecordBatchOverhead || pos + static_cast<size_t>(total) > buf.size()) break;
             if (!r.ensureValid()) break;
 
             // CP-8: horizon gate (same logic as rewriteSegmentImpl).

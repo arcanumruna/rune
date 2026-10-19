@@ -556,7 +556,7 @@ std::vector<uint8_t> LogSegment::read(int64_t startOffset, int32_t maxBytes) {
             rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
             int32_t total = r.totalLength();
             // Batch cut off by window boundary — stop; outer loop will grow the window.
-            if (total <= 0 || pos + static_cast<size_t>(total) > buf.size()) break;
+            if (total < rune::protocol::batch::kRecordBatchOverhead || pos + static_cast<size_t>(total) > buf.size()) break;
             int64_t batchLast = r.baseOffset() + r.lastOffsetDelta();
             if (batchLast >= startOffset) {
                 return std::vector<uint8_t>(buf.begin() + static_cast<ptrdiff_t>(pos), buf.end());
@@ -748,7 +748,7 @@ LogReadView LogSegment::readInto(int64_t startOffset, int32_t maxBytes, uint8_t*
                     h += static_cast<std::size_t>(r);
                 }
                 const int32_t total = RecordBatchReader(hdr, kOverhead).totalLength();
-                if (total <= 0 || pos + static_cast<std::size_t>(total) > remaining) {
+                if (total < rune::protocol::batch::kRecordBatchOverhead || pos + static_cast<std::size_t>(total) > remaining) {
                     st = ReadIntoStatus::Unreadable;
                     return {};
                 }
@@ -761,7 +761,7 @@ LogReadView LogSegment::readInto(int64_t startOffset, int32_t maxBytes, uint8_t*
         }
         RecordBatchReader r(buf + pos, got - pos);
         const int32_t total = r.totalLength();
-        if (total <= 0) { st = ReadIntoStatus::Unreadable; return {}; }   // torn / corrupt
+        if (total < rune::protocol::batch::kRecordBatchOverhead) { st = ReadIntoStatus::Unreadable; return {}; }   // torn / corrupt
         const std::size_t end = pos + static_cast<std::size_t>(total);
         if (end > got) {
             // Cut by the request-sized window: read the rest of THIS batch when
@@ -782,7 +782,7 @@ LogReadView LogSegment::readInto(int64_t startOffset, int32_t maxBytes, uint8_t*
     while (end + kOverhead <= got) {
         RecordBatchReader r(buf + end, got - end);
         const int32_t total = r.totalLength();
-        if (total <= 0 || end + static_cast<std::size_t>(total) > got) break;
+        if (total < rune::protocol::batch::kRecordBatchOverhead || end + static_cast<std::size_t>(total) > got) break;
         if (end != firstPos) {
             if (cap == 0) break;
             if ((end - firstPos) + static_cast<std::size_t>(total) > cap) break;
@@ -823,7 +823,7 @@ LogReadView LogSegment::readView(int64_t startOffset, int32_t maxBytes) noexcept
         RecordBatchReader r(base + pos, size - pos);
         int32_t total = r.totalLength();
         // Torn / not-yet-fully-written tail — stop (readView never exposes it).
-        if (total <= 0 || pos + static_cast<std::size_t>(total) > size) break;
+        if (total < rune::protocol::batch::kRecordBatchOverhead || pos + static_cast<std::size_t>(total) > size) break;
         const int64_t batchLast = r.baseOffset() + r.lastOffsetDelta();
         if (batchLast >= startOffset) { firstPos = pos; firstBase = r.baseOffset(); break; }
         pos += static_cast<std::size_t>(total);
@@ -841,7 +841,7 @@ LogReadView LogSegment::readView(int64_t startOffset, int32_t maxBytes) noexcept
     while (end + kOverhead <= size) {
         RecordBatchReader r(base + end, size - end);
         int32_t total = r.totalLength();
-        if (total <= 0 || end + static_cast<std::size_t>(total) > size) break;
+        if (total < rune::protocol::batch::kRecordBatchOverhead || end + static_cast<std::size_t>(total) > size) break;
         if (end != firstPos) {
             // Past the first batch: only take more if a positive cap has room.
             if (cap == 0) break;  // maxBytes<=0 → exactly one batch
@@ -890,7 +890,7 @@ int LogSegment::truncateInPlace(int64_t truncateOffset, int64_t& keptMaxTs) noex
     while (pos + kOverhead <= size) {
         rune::protocol::RecordBatchReader r(base + pos, size - pos);
         const int32_t total = r.totalLength();
-        if (total <= 0 || pos + static_cast<std::size_t>(total) > size) break;
+        if (total < rune::protocol::batch::kRecordBatchOverhead || pos + static_cast<std::size_t>(total) > size) break;
         if (r.baseOffset() + r.lastOffsetDelta() >= truncateOffset) { atCut = true; break; }   // cut here (whole batch)
         const int64_t ts = toEpochMs(r.maxTimestamp());
         if (ts > maxTs) maxTs = ts;
@@ -973,7 +973,7 @@ int64_t LogSegment::recover(bool syncIndex) {
     while (pos + rune::protocol::batch::kRecordBatchOverhead <= buf.size()) {
         RecordBatchReader r(buf.data() + pos, buf.size() - pos);
         int32_t total = r.totalLength();
-        if (total <= 0 || pos + static_cast<size_t>(total) > buf.size() || !r.ensureValid()) break;
+        if (total < rune::protocol::batch::kRecordBatchOverhead || pos + static_cast<size_t>(total) > buf.size() || !r.ensureValid()) break;
         // C2: use the same shouldIndex() predicate as append()
         if (shouldIndex(bytesSinceIndex_, indexIntervalBytes_)) {
             index_->append(r.baseOffset(), validBytes); // C4: OffsetIndex::append guards 2GiB

@@ -351,6 +351,41 @@ TEST(LogSegment, RecoverTruncatesTornTail) {
     std::filesystem::remove_all(dir);
 }
 
+// F1 regression: a zero-filled tail (or a tail whose length field is 0..8 /
+// huge) after valid batches must recover by truncating at the last valid batch
+// -- no crash (ensureValid used to underflow tl - 21), no lost valid batch.
+TEST(LogSegmentRegression, RecoverTruncatesZeroFilledAndShortLengthTails) {
+    struct Tail { const char* name; uint32_t lenField; bool setLen; };
+    const Tail tails[] = {{"zero", 0, false}, {"len1", 1, true}, {"len8", 8, true},
+                          {"len48", 48, true}, {"huge", 0xFFFFFFFFu, true},
+                          {"nearmax", 0x7FFFFFF8u, true}};
+    for (const auto& t : tails) {
+        auto dir = makeTempDir("rune_seg_f1");
+        std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+        std::string logPath;
+        int64_t goodSize = 0;
+        {
+            LogSegment seg(dir.string(), 0);
+            RecordBatchBuilder b0(0, 1000); b0.append("k","v0",1000); seg.append(b0.build(), 0);
+            RecordBatchBuilder b1(1, 1001); b1.append("k","v1",1001); seg.append(b1.build(), 1);
+            logPath = seg.logPath();
+        }
+        goodSize = static_cast<int64_t>(std::filesystem::file_size(logPath));
+        {
+            std::vector<char> tail(200, 0);   // >= header size so the scan loop enters
+            if (t.setLen) for (int i = 0; i < 4; ++i) tail[8 + i] = static_cast<char>(t.lenField >> (8 * i));
+            std::ofstream f(logPath, std::ios::binary | std::ios::app);
+            f.write(tail.data(), static_cast<std::streamsize>(tail.size()));
+        }
+        LogSegment seg2(dir.string(), 0);
+        EXPECT_EQ(seg2.recover(), 2) << t.name;
+        EXPECT_EQ(static_cast<int64_t>(std::filesystem::file_size(logPath)), goodSize) << t.name;
+        auto tailRead = seg2.read(1, 1 << 20);
+        EXPECT_TRUE(RecordBatchReader(tailRead.data(), tailRead.size()).ensureValid()) << t.name;
+        std::filesystem::remove_all(dir);
+    }
+}
+
 // Recovery: clean segment (no corruption) — recover() keeps all batches, file size unchanged.
 TEST(LogSegment, RecoverCleanSegmentKeepsAllBatches) {
     auto dir = makeTempDir("rune_seg_rec_clean");
