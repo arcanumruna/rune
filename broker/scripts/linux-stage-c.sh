@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 # Stage c of the regression checkpoint on a Linux host (re-check M5): the Linux-only tests, for real.
 #
-#   scripts/linux-stage-c.sh [build-dir]      (build-dir default build-fast; called by run-regression.sh)
+#   scripts/linux-stage-c.sh [build-dir]      (build-dir default $RUNE_BUILD_DIR, else build-fast; called by
+#                                              run-regression.sh)
+#
+# build-dir is either a broker-only build (`cmake -S broker`: tests under <build>/libs/...) or the monorepo root
+# build (`cmake -S . -B build/root`: the same tree under <build>/broker/libs/...).  Which one is read from the
+# build's CMakeCache (CMAKE_HOME_DIRECTORY ends in /broker = broker-only); without a cache the first layout that
+# has the test binary wins.
 #
 # Runs, each in a private network namespace (`unshare -n`, loopback brought up) so the host's own interfaces and
 # sysctls are never touched:
@@ -12,7 +18,15 @@
 # CAP_NET_ADMIN alone does not allow `unshare -n`).  Without that it prints NOT GREEN and exits 3 — the stage is
 # never silently green.  Exit 0 only when both runs pass.
 set -u
-B="${1:-build-fast}"
+B="${1:-${RUNE_BUILD_DIR:-build-fast}}"
+TEST_BIN=rune_catalog_replication_tests
+home="$(grep -E '^CMAKE_HOME_DIRECTORY:' "$B/CMakeCache.txt" 2>/dev/null | head -1 | cut -d= -f2-)"
+case "$home" in
+    */broker) BIN="$B/libs/node/$TEST_BIN" ;;
+    "")       if [ -x "$B/libs/node/$TEST_BIN" ]; then BIN="$B/libs/node/$TEST_BIN"; else BIN="$B/broker/libs/node/$TEST_BIN"; fi ;;
+    *)        BIN="$B/broker/libs/node/$TEST_BIN" ;;
+esac
+[ -x "$BIN" ] || { echo "linux-stage-c: no $BIN (build dir '$B': is it built, and is it a broker-only or a monorepo root build?)" >&2; exit 2; }
 RANGE="45000 45039"
 
 # loopback up inside the new netns: `ip` when installed, else one SIOCSIFFLAGS via python3 (the builder image has
@@ -37,7 +51,7 @@ echo "== stage c (Linux): linux-only, RUNE_LINUX_GATE=1, private netns"
 unshare -n sh -c "$LO_UP && RUNE_LINUX_GATE=1 ctest --test-dir '$B' -L linux-only --output-on-failure"; r1=$?
 echo "== stage c (Linux): bind order, private netns, ip_local_port_range $RANGE, RUNE_BIND_ORDER_GATE=1"
 unshare -n sh -c "$LO_UP && echo '$RANGE' > /proc/sys/net/ipv4/ip_local_port_range && RUNE_BIND_ORDER_GATE=1 \
-    '$B/libs/node/rune_catalog_replication_tests' \
+    '$BIN' \
     --gtest_filter=BindOrderRegression.FixedPortsBindBeforeAnyEphemeralPublicationRegression"; r2=$?
 echo "== stage c (Linux): linux-only rc $r1, bind-order rc $r2"
 [ "$r1" -eq 0 ] && [ "$r2" -eq 0 ]

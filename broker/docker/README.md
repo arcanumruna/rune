@@ -33,8 +33,8 @@ docker build \
   .
 ```
 
-Run from the `rune-broker` repo root. The four `--build-context` entries supply the
-sibling repos the root `CMakeLists.txt` compiles unconditionally: `rune-protocol`
+Run from `broker/` in the monorepo (the compose files do the same with `context: ..`). The four `--build-context` entries supply the
+sibling subprojects (and flight-recorder, which has its own repository) the root `CMakeLists.txt` compiles unconditionally: `rune-protocol`
 (headers + `src/net`), `flight-recorder`, `rune-codec` (incl. the catalog library) and
 `rune-crypto`. `docker compose` passes the same four contexts for the broker
 image and for the `probe` image (`docker/Dockerfile.probe`), so prefer

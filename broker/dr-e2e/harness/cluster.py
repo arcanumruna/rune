@@ -23,7 +23,7 @@ from .timing import timed
 from . import auth
 from .driver import ensure_dr_client_image
 
-# Repo layout: dr-e2e/ lives inside rune-broker/, compose is at ../docker/.
+# Repo layout: dr-e2e/ lives inside broker/ (monorepo), compose is at ../docker/.
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _DR_E2E_DIR = os.path.dirname(_THIS_DIR)
 BROKER_REPO = os.path.dirname(_DR_E2E_DIR)
@@ -49,7 +49,7 @@ def ql_image() -> str:
     image = os.environ.get("DR_QL_IMAGE")
     if image:
         return image
-    client_repo = os.path.join(_SIBLINGS, "rune-client-cpp")
+    client_repo = os.path.join(_SIBLINGS, "client-cpp")
     return f"rune-ql-probe:{_git_sha(client_repo)}"
 
 

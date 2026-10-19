@@ -11,7 +11,7 @@ add_library(rune_protocol INTERFACE)
 target_include_directories(rune_protocol INTERFACE
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 
-# CLion helper (see common): a STATIC target so the IDE indexes headers.
+# CLion helper: a STATIC target so the IDE indexes headers.
 add_library(rune_protocol_dummy STATIC src/dummy.cpp)
 target_include_directories(rune_protocol_dummy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 

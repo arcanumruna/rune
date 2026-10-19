@@ -12,7 +12,7 @@
 # took >= 0.5 s in the last run (ctest's own CTestCostData.txt), so a new slow
 # suite is picked up automatically after its first run.
 set -u
-B="${1:-build-fast}"; shift || true
+B="${1:-${RUNE_BUILD_DIR:-build-fast}}"; shift || true
 COST="$B/Testing/Temporary/CTestCostData.txt"
 HEAVY_RE='ShardMode|UdpCluster|PerWorkerReplication|GR[0-9]+_Integration|GatewayReplicationWiring|TX2b_GatewayDriven|NodeGatewayFixture|BrokerNode|ThreeNode|CompactionRetentionSmoke|CompactionStress|WorkerPool|UdpMessageSink|RetentionCleanerAgent|BackPressure|BrokerProcessSignal'
 if [ -f "$COST" ]; then
