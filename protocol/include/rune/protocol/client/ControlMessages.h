@@ -169,6 +169,17 @@ struct ConnectRequest {
 // gated idiom used by Produce's BODY_FIXED_V0/V1 in DataMessages.h.
 // kProtocolVersion is not bumped; absence of the gate ⇒ no crypto chosen
 // (fields stay default).
+//
+// authentication (client version 9) — BODY_FIXED_V9 = 21, written iff `v9` is set
+// (the broker sets it for clientVersion >= 9):
+//   [42]      chosenCipher : uint8   (0 = none)
+//   [43]      authMode     : uint8   (AuthMode)
+//   [44]      authState    : uint8   (AuthState)
+//   [45..48]  handshakeBytes length : uint32 (ALWAYS present in a v9 frame, possibly 0)
+//   [49..]    handshakeBytes bytes
+// decode(): blockLength >= 21 reads authMode/authState; the handshake var bytes
+// always sit at fixedBase + blockLength.  A pre-v9 frame decodes as
+// authMode = InProcess, authState = Anonymous: a pre-v9 broker has no authentication.
 // ---------------------------------------------------------------------------
 struct ConnectResponse {
     int64_t sessionId         = 0;
@@ -182,14 +193,21 @@ struct ConnectResponse {
     uint8_t           chosenCipher = 0;    // rune::crypto::Cipher value; 0 = none
     std::string_view  handshakeBytes;      // handshake continuation blob (e.g. TLS ServerHello)
 
+    // v9 additive authentication fields — default ⇒ a broker without authentication.
+    bool      v9        = false;                  // encode the v9 frame (the broker sets it for clientVersion >= 9)
+    AuthMode  authMode  = AuthMode::InProcess;
+    AuthState authState = AuthState::Anonymous;
+
     static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::ConnectResponse); // 2
     static constexpr uint16_t BODY_FIXED    = 18;  // incl. brokerVersion (main)
     static constexpr uint16_t BODY_FIXED_V0 = 14;  // an older broker's body (no brokerVersion)
     static constexpr uint16_t BODY_FIXED_V4 = 19;  // + chosenCipher byte, AFTER brokerVersion
+    static constexpr uint16_t BODY_FIXED_V9 = 21;  // + authMode, authState bytes, AFTER chosenCipher
 
     static constexpr std::size_t ENCODED_SIZE    = MessageHeader::ENCODED_SIZE + BODY_FIXED;     // 42
     static constexpr std::size_t ENCODED_SIZE_V0 = MessageHeader::ENCODED_SIZE + BODY_FIXED_V0;  // 38
     static constexpr std::size_t ENCODED_SIZE_V4 = MessageHeader::ENCODED_SIZE + BODY_FIXED_V4;  // 43
+    static constexpr std::size_t ENCODED_SIZE_V9 = MessageHeader::ENCODED_SIZE + BODY_FIXED_V9;  // 45
 
     /// Encode the full frame into buf. Returns ENCODED_SIZE (42) when no
     /// crypto was chosen — byte-identical to main's brokerVersion frame — or
@@ -199,7 +217,7 @@ struct ConnectResponse {
         const bool chosenCrypto = (chosenCipher != 0) || !handshakeBytes.empty();
 
         MessageHeader hdr;
-        hdr.blockLength   = chosenCrypto ? BODY_FIXED_V4 : BODY_FIXED;
+        hdr.blockLength   = v9 ? BODY_FIXED_V9 : (chosenCrypto ? BODY_FIXED_V4 : BODY_FIXED);
         hdr.templateId    = TEMPLATE_ID;
         hdr.schemaId      = kSchemaId;
         hdr.version       = kProtocolVersion;
@@ -213,10 +231,14 @@ struct ConnectResponse {
         detail::putLE64 (buf, fixedBase + 6, assignedSessionId);
         detail::putLE32 (buf, fixedBase + 14, brokerVersion);
 
-        if (!chosenCrypto) return ENCODED_SIZE;
+        if (!v9 && !chosenCrypto) return ENCODED_SIZE;
 
         buf[fixedBase + 18] = chosenCipher;  // @42, AFTER brokerVersion [14..17]
-        std::size_t pos = static_cast<std::size_t>(fixedBase) + BODY_FIXED_V4;
+        if (v9) {
+            buf[fixedBase + 19] = static_cast<uint8_t>(authMode);
+            buf[fixedBase + 20] = static_cast<uint8_t>(authState);
+        }
+        std::size_t pos = static_cast<std::size_t>(fixedBase) + (v9 ? BODY_FIXED_V9 : BODY_FIXED_V4);
         pos += putVarBytes32(buf + pos,
                              reinterpret_cast<const uint8_t*>(handshakeBytes.data()),
                              static_cast<uint32_t>(handshakeBytes.size()));
@@ -251,7 +273,17 @@ struct ConnectResponse {
         // Produce BODY_FIXED_V0/V1 idiom). Absence ⇒ no crypto chosen.
         if (hdr.blockLength >= BODY_FIXED_V4 && avail >= ENCODED_SIZE_V4) {
             msg.chosenCipher = buf[fixedBase + 18];  // @42, AFTER brokerVersion [14..17]
-            std::size_t pos = static_cast<std::size_t>(fixedBase) + BODY_FIXED_V4;
+            if (hdr.blockLength >= BODY_FIXED_V9) {
+                if (avail < ENCODED_SIZE_V9) return std::nullopt;
+                const uint8_t mode  = buf[fixedBase + 19];
+                const uint8_t state = buf[fixedBase + 20];
+                if (mode > static_cast<uint8_t>(AuthMode::InProcess) ||
+                    state > static_cast<uint8_t>(AuthState::Anonymous)) return std::nullopt;
+                msg.v9        = true;
+                msg.authMode  = static_cast<AuthMode>(mode);
+                msg.authState = static_cast<AuthState>(state);
+            }
+            std::size_t pos = static_cast<std::size_t>(fixedBase) + hdr.blockLength;
             const uint8_t* hbData = nullptr;
             uint32_t       hbLen  = 0;
             if (!getVarBytes32(buf, avail, pos, hbData, hbLen)) return std::nullopt;

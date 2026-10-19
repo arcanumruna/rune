@@ -41,6 +41,8 @@ public:
         CHUNK = static_cast<std::uint8_t>(5),
         DESCRIPTOR_BLOB = static_cast<std::uint8_t>(6),
         EGRESS_CHANNEL = static_cast<std::uint8_t>(7),
+        PERMISSION_BITS = static_cast<std::uint8_t>(8),
+        PEER_KEYS = static_cast<std::uint8_t>(9),
         NULL_VALUE = static_cast<std::uint8_t>(255)
     };
 
@@ -56,6 +58,8 @@ public:
             case static_cast<std::uint8_t>(5): return CHUNK;
             case static_cast<std::uint8_t>(6): return DESCRIPTOR_BLOB;
             case static_cast<std::uint8_t>(7): return EGRESS_CHANNEL;
+            case static_cast<std::uint8_t>(8): return PERMISSION_BITS;
+            case static_cast<std::uint8_t>(9): return PEER_KEYS;
             case static_cast<std::uint8_t>(255): return NULL_VALUE;
         }
 
@@ -74,6 +78,8 @@ public:
             case CHUNK: return "CHUNK";
             case DESCRIPTOR_BLOB: return "DESCRIPTOR_BLOB";
             case EGRESS_CHANNEL: return "EGRESS_CHANNEL";
+            case PERMISSION_BITS: return "PERMISSION_BITS";
+            case PEER_KEYS: return "PEER_KEYS";
             case NULL_VALUE: return "NULL_VALUE";
         }
 

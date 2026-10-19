@@ -648,7 +648,7 @@ TEST(DispatchCheckFrame, UnsupportedVersionDataTemplate) {
 }
 
 // ===========================================================================
-// 5. UnknownTemplate — ids 0, 8, 15, 22, 45, 64, 99, 65535
+// 5. UnknownTemplate — ids 0, 22, 45(*), 81, 99, 65535 (8, 12..15, 64 are known)
 //    (valid schema + version but unknown id)
 //    Note: 16-21 (Produce..Unsubscribe) are KNOWN (PB-1/PB-2/PB-3).
 //          32-44 (JoinGroup..Assign) are KNOWN (CG-1).
@@ -696,12 +696,14 @@ TEST(DispatchCheckFrame, KnownTemplateEleven) {
     EXPECT_EQ(fc.templateId, 11u);
 }
 
-TEST(DispatchCheckFrame, UnknownTemplateFifteen) {
-    // 15 = last in control range (unassigned; 10/11 are now HandshakeContinue{,Response})
-    auto buf = makeValidHeaderBuf(15);
-    const auto fc = rpc::checkFrame(buf.data(), buf.size());
-    EXPECT_EQ(fc.status, rpc::FrameStatus::UnknownTemplate);
-    EXPECT_EQ(fc.templateId, 15u);
+TEST(DispatchCheckFrame, KnownTemplatesTwelveToFifteen) {
+    // 12..15 = AuthClientFirst..AuthServerFinal (client version 9)
+    for (uint16_t tid = 12; tid <= 15; ++tid) {
+        auto buf = makeValidHeaderBuf(tid);
+        const auto fc = rpc::checkFrame(buf.data(), buf.size());
+        EXPECT_EQ(fc.status, rpc::FrameStatus::Ok) << "tid=" << tid;
+        EXPECT_EQ(fc.templateId, tid);
+    }
 }
 
 TEST(DispatchCheckFrame, UnknownTemplateTwentyTwo) {
@@ -764,12 +766,22 @@ TEST(DispatchCheckFrame, KnownTemplatesSeventyFourToSeventyEight) {
     }
 }
 
-TEST(DispatchCheckFrame, UnknownTemplateSeventyNine) {
-    // 79 = first unassigned id in schema/view range after DdlResponse=78
-    auto buf = makeValidHeaderBuf(79);
+TEST(DispatchCheckFrame, KnownTemplatesSeventyNineAndEighty) {
+    // 79 = SecurityDdl, 80 = SecurityBootstrap (client version 9)
+    for (uint16_t tid = 79; tid <= 80; ++tid) {
+        auto buf = makeValidHeaderBuf(tid);
+        const auto fc = rpc::checkFrame(buf.data(), buf.size());
+        EXPECT_EQ(fc.status, rpc::FrameStatus::Ok) << "tid=" << tid;
+        EXPECT_EQ(fc.templateId, tid);
+    }
+}
+
+TEST(DispatchCheckFrame, UnknownTemplateEightyOne) {
+    // 81 = first unassigned id in schema/view range after SecurityBootstrap=80
+    auto buf = makeValidHeaderBuf(81);
     const auto fc = rpc::checkFrame(buf.data(), buf.size());
     EXPECT_EQ(fc.status, rpc::FrameStatus::UnknownTemplate);
-    EXPECT_EQ(fc.templateId, 79u);
+    EXPECT_EQ(fc.templateId, 81u);
 }
 
 TEST(DispatchCheckFrame, UnknownTemplateNinetyNine) {
@@ -938,23 +950,21 @@ TEST(DispatchIsKnownTemplate, KnownBoundaries) {
     // 0b/0c schema + view-engine range + catalog DDL: 64..78 must all be known
     // (DefineTopic..AlterTopicResponse 64..69; CreateView..ViewRowResponse 70..73, Task 18;
     //  DropTopic..DdlResponse 74..78, catalog history).
-    for (uint16_t tid = 64; tid <= 78; ++tid) {
+    for (uint16_t tid = 64; tid <= 80; ++tid) {
         EXPECT_TRUE(rpc::isKnownTemplate(tid)) << "tid=" << tid;
     }
 
-    // Not known: 0, 12..15 (unassigned control gap after HandshakeContinue{,Response}),
+    // Known since client v9: 12..15 (auth), 79..80 (security DDL).  Not known: 0,
     //            22..31 (unassigned produce/consume gap),
-    //            55..63 (unassigned groups/txn gap after TX-1), 79+ (unassigned schema/view gap),
+    //            55..63 (unassigned groups/txn gap after TX-1), 81+ (unassigned schema/view gap),
     //            65535.
     EXPECT_FALSE(rpc::isKnownTemplate(0));
-    EXPECT_FALSE(rpc::isKnownTemplate(12));
-    EXPECT_FALSE(rpc::isKnownTemplate(15));
     EXPECT_FALSE(rpc::isKnownTemplate(22));
     EXPECT_FALSE(rpc::isKnownTemplate(31));
     EXPECT_FALSE(rpc::isKnownTemplate(55));
     for (uint16_t tid = 74; tid <= 78; ++tid) {
         EXPECT_TRUE(rpc::isKnownTemplate(tid)) << "tid=" << tid;
     }
-    EXPECT_FALSE(rpc::isKnownTemplate(79));
+    EXPECT_FALSE(rpc::isKnownTemplate(81));
     EXPECT_FALSE(rpc::isKnownTemplate(65535));
 }

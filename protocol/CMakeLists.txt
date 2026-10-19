@@ -46,6 +46,8 @@ if(BUILD_TESTING)
             tests/protocol/client/SchemaConformanceTest.cpp
             tests/protocol/client/ViewMessagesTest.cpp
             tests/protocol/client/CatalogDdlMessagesTest.cpp
+            tests/protocol/client/AuthMessagesTest.cpp
+            tests/protocol/client/SecurityMessagesTest.cpp
             tests/protocol/ReplicationSchemaV4Test.cpp
             tests/protocol/internal/RingSbeTest.cpp
             tests/protocol/net/UdpGsoPlanTest.cpp)

@@ -42,6 +42,11 @@ enum class TemplateId : uint16_t {  // reserved ranges: control 1-15, produce/co
     // client<->broker TLS/AEAD (Task 4): handshake continuation — control range 10-11
     HandshakeContinue         = 10,
     HandshakeContinueResponse = 11,
+    // authentication (client version 9): SCRAM-SHA-512 exchange — control range 12-15
+    AuthClientFirst           = 12,
+    AuthServerFirst           = 13,
+    AuthClientFinal           = 14,
+    AuthServerFinal           = 15,
     // produce/consume range (16-31)
     Produce             = 16,
     ProduceResponse     = 17,
@@ -92,6 +97,9 @@ enum class TemplateId : uint16_t {  // reserved ranges: control 1-15, produce/co
     DropView             = 76,
     AlterView            = 77,
     DdlResponse          = 78,
+    // authentication (client version 9): security DDL + one-time bootstrap, both answered by DdlResponse (78)
+    SecurityDdl          = 79,
+    SecurityBootstrap    = 80,
 };
 
 enum class ErrorCode : uint16_t {
@@ -180,6 +188,12 @@ enum class ErrorCode : uint16_t {
                                   // the client resubscribes from the log start (no resume floor) and
                                   // surfaces the reset to the application.  Sent as ErrorResponse on
                                   // the Subscribe's correlationId, only to clients >= 7 (only they claim).
+    AuthenticationFailed   = 44,  // client version 9: SCRAM failed / not authenticated / auth deadline
+                                  // (see the version-9 note); with retryAfterMs > 0 a rate-limit.
+    NotAuthorized          = 45,  // client version 9: the request is not granted (default deny)
+    SessionRevoked         = 46,  // client version 9: the session's user was dropped / disabled /
+                                  // terminated; terminal (corr 0 = the session-level notice)
+    PasswordChangeRequired = 47,  // client version 9: a one-time-password session may only change its password
 };
 
 // ---------------------------------------------------------------------------
@@ -264,14 +278,34 @@ inline constexpr int32_t kClientVersionLineageNote                = 7;
 //   DefineTopic/AlterTopic/CreateView is answered in its own response type
 //   with InvalidRequest (client too old for cluster DDL routing; upgrade).
 //   (A session below 8 never receives DdlResponse: it never sends 74–77.)
+//   9 — authentication (spec 2026-10-13): after ConnectResponse (and TLS when negotiated) a session in
+//   authMode Required runs SCRAM-SHA-512 on AuthClientFirst (12) / AuthServerFirst (13) /
+//   AuthClientFinal (14) / AuthServerFinal (15); one proof per active verifier (D5).  Until it is
+//   authenticated every other request is answered AuthenticationFailed (44) and the session ends.
+//   NotAuthorized (45) answers any request not granted, in its own response type; SessionRevoked (46)
+//   ends a session whose user was dropped / disabled / terminated (corr 0 = the session-level notice);
+//   PasswordChangeRequired (47) answers every request of a one-time-password session except
+//   SecurityDdl{AlterUser self SetPassword}.  SecurityDdl (79) / SecurityBootstrap (80) are answered by
+//   DdlResponse (78).  An authentication-enabled broker answers a Connect below 9 ConnectResponse{ProtocolVersion}.
+//   ConnectResponse v9 (blockLength 21) carries authMode and authState.
 inline constexpr int32_t kClientVersionCatalog                    = 8;
-inline constexpr int32_t kClientVersion                           = 8;   // what this protocol's client announces
+inline constexpr int32_t kClientVersionAuth                       = 9;
+inline constexpr int32_t kClientVersion                           = 9;   // what this protocol's client announces
 
 // Subscribe{topicId = kCatalogTopicId, partition 0, partitionKnown 1} reads
 // the `__catalog` log (catalog history) from ANY broker — see DataMessages.h
 // above `struct Subscribe` for the history-epoch note and the caught-up marker
 // (both v8-only and format-neutral: an 8-byte recordBatch, like the lineage note).
 inline constexpr int32_t kCatalogTopicId                          = -6;
+
+// The `__security` log (client version 9) is internal partition -7; Subscribe{kSecurityTopicId}
+// reads it (security admins and brokers only), exactly like kCatalogTopicId.
+inline constexpr int32_t kSecurityTopicId                         = -7;
+
+/// ConnectResponse.authMode (v9): how this broker authenticates sessions.
+enum class AuthMode : uint8_t { Required = 0, DevDisabled = 1, InProcess = 2 };
+/// ConnectResponse.authState (v9): where the (possibly resumed) session stands.
+enum class AuthState : uint8_t { MustAuthenticate = 0, ResumedAuthenticated = 1, Anonymous = 2 };
 
 // ---------------------------------------------------------------------------
 // Broker versions (ConnectResponse.brokerVersion, an additive trailing field;
@@ -282,9 +316,11 @@ inline constexpr int32_t kCatalogTopicId                          = -6;
 //       cluster-unique.  A client runs a GroupConsumer only against >= 3.
 //   4 — client<->broker TLS/AEAD (Task 4): may choose a cipher / send
 //       handshake bytes on ConnectResponse. See kBrokerVersionCrypto.
+//   5 — authentication: ConnectResponse v9 carries authMode / authState (see client version 9).
 // ---------------------------------------------------------------------------
 inline constexpr int32_t kBrokerVersionExplicitGroupSubscriptions = 3;
-inline constexpr int32_t kBrokerVersion                           = 4;   // what this protocol's broker announces
+inline constexpr int32_t kBrokerVersionAuth                       = 5;   // authentication (ConnectResponse v9 fields)
+inline constexpr int32_t kBrokerVersion                           = 5;   // what this protocol's broker announces
 
 /// True when a session that connected with `clientVersion` handles
 /// InvalidRequest (39) as non-retriable on every response type (see version 5).
@@ -321,6 +357,12 @@ inline constexpr int32_t kBrokerVersion                           = 4;   // what
 /// non-leader broker answers its DDL InvalidRequest in its own response type (F37).
 [[nodiscard]] constexpr bool clientUnderstandsCatalogDdl(int32_t clientVersion) noexcept {
     return clientVersion >= kClientVersionCatalog;
+}
+
+/// True when a session that connected with `clientVersion` speaks authentication
+/// (version 9): templates 12-15, 79, 80 and codes 44-47.
+[[nodiscard]] constexpr bool clientUnderstandsAuth(int32_t clientVersion) noexcept {
+    return clientVersion >= kClientVersionAuth;
 }
 
 /// The produce error code a session that connected with `clientVersion` is

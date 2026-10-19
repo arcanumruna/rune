@@ -34,7 +34,8 @@ TEST(CatalogDdlWireRegression, ConstantsArePinned) {
     EXPECT_GE(pc::kClientVersion, pc::kClientVersionCatalog);
     EXPECT_EQ(pc::kCatalogTopicId, -6);
     for (uint16_t t = 74; t <= 78; ++t) EXPECT_TRUE(pc::isKnownTemplate(t)) << t << " (F1: else checkFrame drops it)";
-    EXPECT_FALSE(pc::isKnownTemplate(79));
+    EXPECT_TRUE(pc::isKnownTemplate(79)) << "SecurityDdl (client v9)";
+    EXPECT_FALSE(pc::isKnownTemplate(81));
     EXPECT_FALSE(pc::clientUnderstandsCatalogDdl(7));
     EXPECT_TRUE(pc::clientUnderstandsCatalogDdl(8));
 }

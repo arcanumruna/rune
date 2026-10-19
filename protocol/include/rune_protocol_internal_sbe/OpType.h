@@ -54,6 +54,8 @@ public:
         ALTER_ISR_RESPONSE = static_cast<std::uint8_t>(18),
         GET_VIEW_ROW = static_cast<std::uint8_t>(19),
         TOPIC_DROPPED = static_cast<std::uint8_t>(20),
+        SESSION_PERMISSIONS = static_cast<std::uint8_t>(21),
+        PEER_LINK_KEYS = static_cast<std::uint8_t>(22),
         TEST_TASK = static_cast<std::uint8_t>(200),
         NULL_VALUE = static_cast<std::uint8_t>(255)
     };
@@ -83,6 +85,8 @@ public:
             case static_cast<std::uint8_t>(18): return ALTER_ISR_RESPONSE;
             case static_cast<std::uint8_t>(19): return GET_VIEW_ROW;
             case static_cast<std::uint8_t>(20): return TOPIC_DROPPED;
+            case static_cast<std::uint8_t>(21): return SESSION_PERMISSIONS;
+            case static_cast<std::uint8_t>(22): return PEER_LINK_KEYS;
             case static_cast<std::uint8_t>(200): return TEST_TASK;
             case static_cast<std::uint8_t>(255): return NULL_VALUE;
         }
@@ -115,6 +119,8 @@ public:
             case ALTER_ISR_RESPONSE: return "ALTER_ISR_RESPONSE";
             case GET_VIEW_ROW: return "GET_VIEW_ROW";
             case TOPIC_DROPPED: return "TOPIC_DROPPED";
+            case SESSION_PERMISSIONS: return "SESSION_PERMISSIONS";
+            case PEER_LINK_KEYS: return "PEER_LINK_KEYS";
             case TEST_TASK: return "TEST_TASK";
             case NULL_VALUE: return "NULL_VALUE";
         }

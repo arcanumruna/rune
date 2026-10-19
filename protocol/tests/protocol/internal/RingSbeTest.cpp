@@ -325,6 +325,26 @@ TEST(RingSbe, ControlRecordAppendedCarriesIdentityAndOffsetRegression) {
     EXPECT_EQ(sbe::OpType::get(16), sbe::OpType::Value::RECONCILE_FETCH_REQ);
 }
 
+// Authentication (D30/D34): ring op types 21 / 22 and tail kinds 8 / 9 are pinned
+// (a wire value never moves).
+TEST(RingSbeRegression, AuthOpTypesAndTailKindsArePinned) {
+    EXPECT_EQ(static_cast<int>(sbe::OpType::Value::TOPIC_DROPPED), 20);
+    EXPECT_EQ(static_cast<int>(sbe::OpType::Value::SESSION_PERMISSIONS), 21);
+    EXPECT_EQ(static_cast<int>(sbe::OpType::Value::PEER_LINK_KEYS), 22);
+    EXPECT_EQ(sbe::OpType::get(21), sbe::OpType::Value::SESSION_PERMISSIONS);
+    EXPECT_EQ(sbe::OpType::get(22), sbe::OpType::Value::PEER_LINK_KEYS);
+    EXPECT_STREQ(sbe::OpType::c_str(sbe::OpType::Value::SESSION_PERMISSIONS), "SESSION_PERMISSIONS");
+    EXPECT_STREQ(sbe::OpType::c_str(sbe::OpType::Value::PEER_LINK_KEYS), "PEER_LINK_KEYS");
+    EXPECT_EQ(static_cast<int>(sbe::TailKind::Value::PERMISSION_BITS), 8);
+    EXPECT_EQ(static_cast<int>(sbe::TailKind::Value::PEER_KEYS), 9);
+    EXPECT_EQ(sbe::TailKind::get(8), sbe::TailKind::Value::PERMISSION_BITS);
+    EXPECT_EQ(sbe::TailKind::get(9), sbe::TailKind::Value::PEER_KEYS);
+    EXPECT_STREQ(sbe::TailKind::c_str(sbe::TailKind::Value::PERMISSION_BITS), "PERMISSION_BITS");
+    EXPECT_STREQ(sbe::TailKind::c_str(sbe::TailKind::Value::PEER_KEYS), "PEER_KEYS");
+    EXPECT_THROW((void)sbe::OpType::get(23), std::runtime_error);
+    EXPECT_THROW((void)sbe::TailKind::get(10), std::runtime_error);
+}
+
 // ---------------------------------------------------------------------------
 // F15 §7: TxnReturn (template 6) — a separate small fixed block on the return
 // ring so the ProduceResult carrier (WorkerReturn) never grows.

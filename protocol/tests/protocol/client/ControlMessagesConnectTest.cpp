@@ -804,8 +804,8 @@ TEST(HandshakeContinueResponse, TemplateIdIsEleven) {
 // kProtocolVersion (the MessageHeader wire version) stays at 3.
 // ---------------------------------------------------------------------------
 TEST(VersionGates, ClientBrokerVersionBumpedProtocolVersionUnchanged) {
-    EXPECT_EQ(rpc::kClientVersion, 8);   // v8: catalog history DDL (v7: transient lineage note + claim)
-    EXPECT_EQ(rpc::kBrokerVersion, 4);
+    EXPECT_EQ(rpc::kClientVersion, 9);   // v9: authentication (v8: catalog history DDL, v7: transient lineage note + claim)
+    EXPECT_EQ(rpc::kBrokerVersion, 5);
     EXPECT_EQ(rpc::kClientVersionCrypto, 4);
     EXPECT_EQ(rpc::kBrokerVersionCrypto, 4);
     EXPECT_EQ(rpc::kProtocolVersion, 3);
@@ -819,4 +819,95 @@ TEST(VersionGates, TransientLineageNoteGateAndPartitionDataResetArePinnedRegress
     EXPECT_FALSE(rpc::clientUnderstandsLineageNote(6));
     EXPECT_TRUE(rpc::clientUnderstandsLineageNote(7));
     EXPECT_EQ(static_cast<uint16_t>(rpc::ErrorCode::PartitionDataReset), 43u);
+}
+
+// ---------------------------------------------------------------------------
+// ConnectResponse v9 (authentication): authMode / authState after chosenCipher.
+// ---------------------------------------------------------------------------
+TEST(ConnectResponseRegression, V9CarriesAuthModeAndStateWithAndWithoutCrypto) {
+    for (const bool crypto : {false, true}) {
+        for (const auto mode : {rpc::AuthMode::Required, rpc::AuthMode::DevDisabled, rpc::AuthMode::InProcess}) {
+            for (const auto state : {rpc::AuthState::MustAuthenticate, rpc::AuthState::ResumedAuthenticated,
+                                     rpc::AuthState::Anonymous}) {
+                rpc::ConnectResponse resp;
+                resp.sessionId = 5; resp.correlationId = 6; resp.leaderMemberId = 1; resp.assignedSessionId = 100;
+                resp.v9 = true; resp.authMode = mode; resp.authState = state;
+                if (crypto) { resp.chosenCipher = 2; resp.handshakeBytes = "serverhello"; }
+                std::array<uint8_t, 128> buf{};
+                const std::size_t n = resp.encode(buf.data());
+                const std::size_t want = rpc::ConnectResponse::ENCODED_SIZE_V9 + 4u + (crypto ? 11u : 0u);
+                ASSERT_EQ(n, want);
+                const auto hdr = rpc::MessageHeader::decode(buf.data(), n);
+                ASSERT_TRUE(hdr);
+                EXPECT_EQ(hdr->blockLength, 21);
+                EXPECT_EQ(buf[24 + 18], crypto ? 2 : 0);
+                EXPECT_EQ(buf[24 + 19], static_cast<uint8_t>(mode));
+                EXPECT_EQ(buf[24 + 20], static_cast<uint8_t>(state));
+                auto d = rpc::ConnectResponse::decode(buf.data(), n);
+                ASSERT_TRUE(d);
+                EXPECT_TRUE(d->v9);
+                EXPECT_EQ(d->authMode, mode); EXPECT_EQ(d->authState, state);
+                EXPECT_EQ(d->chosenCipher, crypto ? 2 : 0);
+                EXPECT_EQ(d->handshakeBytes, crypto ? "serverhello" : "");
+                EXPECT_EQ(d->assignedSessionId, 100);
+                EXPECT_EQ(d->brokerVersion, rpc::kBrokerVersion);
+                // truncation anywhere inside the v9 frame never decodes as a v9 frame
+                for (std::size_t cut = 0; cut < n; ++cut) {
+                    auto t = rpc::ConnectResponse::decode(buf.data(), cut);
+                    if (t) EXPECT_FALSE(t->v9 && cut < n) << "cut " << cut;
+                }
+            }
+        }
+    }
+}
+
+TEST(ConnectResponseRegression, PreV9FrameDecodesAsInProcessAnonymous) {
+    rpc::ConnectResponse resp;
+    resp.sessionId = 5; resp.leaderMemberId = 1; resp.assignedSessionId = 100;
+    std::array<uint8_t, 128> buf{};
+    // the 42-byte main frame
+    std::size_t n = resp.encode(buf.data());
+    ASSERT_EQ(n, rpc::ConnectResponse::ENCODED_SIZE);
+    auto d = rpc::ConnectResponse::decode(buf.data(), n);
+    ASSERT_TRUE(d);
+    EXPECT_FALSE(d->v9); EXPECT_EQ(d->authMode, rpc::AuthMode::InProcess); EXPECT_EQ(d->authState, rpc::AuthState::Anonymous);
+    // a V4 (crypto) frame
+    resp.chosenCipher = 2; resp.handshakeBytes = "hello";
+    n = resp.encode(buf.data());
+    ASSERT_EQ(n, rpc::ConnectResponse::ENCODED_SIZE_V4 + 4u + 5u);
+    d = rpc::ConnectResponse::decode(buf.data(), n);
+    ASSERT_TRUE(d);
+    EXPECT_FALSE(d->v9); EXPECT_EQ(d->authMode, rpc::AuthMode::InProcess); EXPECT_EQ(d->authState, rpc::AuthState::Anonymous);
+    EXPECT_EQ(d->handshakeBytes, "hello");
+}
+
+TEST(ConnectResponseRegression, V9ForgedAuthBytesDoNotDecode) {
+    rpc::ConnectResponse resp;
+    resp.v9 = true;
+    std::array<uint8_t, 64> buf{};
+    const std::size_t n = resp.encode(buf.data());
+    buf[24 + 19] = 3;   // authMode out of range
+    EXPECT_FALSE(rpc::ConnectResponse::decode(buf.data(), n));
+    buf[24 + 19] = 0; buf[24 + 20] = 3;   // authState out of range
+    EXPECT_FALSE(rpc::ConnectResponse::decode(buf.data(), n));
+}
+
+TEST(ConnectResponseRegression, FutureLongerBlockKeepsVarBytesAtBlockLength) {
+    // A later version appends fixed bytes: var bytes sit at fixedBase + blockLength.
+    rpc::ConnectResponse resp;
+    resp.v9 = true; resp.authMode = rpc::AuthMode::Required; resp.authState = rpc::AuthState::MustAuthenticate;
+    resp.handshakeBytes = "";
+    std::array<uint8_t, 64> buf{};
+    std::size_t n = resp.encode(buf.data());
+    ASSERT_EQ(n, 49u);
+    // rebuild with blockLength 23: insert 2 unknown bytes before the var32 length
+    std::array<uint8_t, 64> big{};
+    std::memcpy(big.data(), buf.data(), 45);
+    big[45] = 0xAA; big[46] = 0xBB;
+    std::memcpy(big.data() + 47, buf.data() + 45, 4);
+    rpc::detail::putLE16(big.data(), 0, 23);
+    auto d = rpc::ConnectResponse::decode(big.data(), 51);
+    ASSERT_TRUE(d);
+    EXPECT_EQ(d->authMode, rpc::AuthMode::Required);
+    EXPECT_TRUE(d->handshakeBytes.empty());
 }

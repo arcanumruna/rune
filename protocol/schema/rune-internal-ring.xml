@@ -86,6 +86,17 @@
            topic it does not own answers UnknownTopic (like the gateway) instead of
            the retriable NotLeader.  Not ownership-gated (incarnation 0). -->
       <validValue name="TOPIC_DROPPED">20</validValue>
+      <!-- Authentication (spec 2026-10-13, D30): control -> EVERY worker on the session-lifecycle
+           ring: one chunk of a session's WRITE permission bitmap.  sessionId names the session,
+           nextOffset = first word index of this chunk, hwBound = total words, isolation = flags
+           {bit0 last chunk, bit1 grantAll}, tail (TailKind = PERMISSION_BITS) = the chunk's words,
+           little-endian u64 each.  The worker stages chunks and swaps on the last (a partial table
+           is never visible). -->
+      <validValue name="SESSION_PERMISSIONS">21</validValue>
+      <!-- Authentication (spec 2026-10-13, D33/D34): control -> EVERY worker: the keys of an
+           established inter-broker link.  topicId = peer node id, partition = link epoch,
+           tail (TailKind = PEER_KEYS) = [sendMaster 32][recvMaster 32]. -->
+      <validValue name="PEER_LINK_KEYS">22</validValue>
       <!-- F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
            runtime -> owning worker: run a test-owned task (opaque in-process
            pointer carried in the egressPub uint64 slot) against the replica
@@ -106,6 +117,10 @@
       <!-- Task 7: raw descriptor blob bytes for a SchemaUpdate op. -->
       <validValue name="DESCRIPTOR_BLOB">6</validValue>
       <validValue name="EGRESS_CHANNEL">7</validValue>
+      <!-- Authentication: SESSION_PERMISSIONS tail — permission bitmap words (LE u64). -->
+      <validValue name="PERMISSION_BITS">8</validValue>
+      <!-- Authentication: PEER_LINK_KEYS tail — [sendMaster 32][recvMaster 32]. -->
+      <validValue name="PEER_KEYS">9</validValue>
     </enum>
 
     <!-- WorkerReturn::Type -->

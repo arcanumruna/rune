@@ -14,7 +14,7 @@
 //   1. TooShort          — avail < MessageHeader::ENCODED_SIZE
 //   2. WrongSchema       — header.schemaId != kSchemaId
 //   3. UnsupportedVersion— header.version  >  kProtocolVersion
-//   4. UnknownTemplate   — templateId not in the known set (1..7 MA; 8-9 MD1; 16..21 MB; 32..44 MC)
+//   4. UnknownTemplate   — templateId not in the known set (1..7 MA; 8-9 MD1; 16..21 MB; 32..44 MC; 12..15 auth; 64..80)
 //   5. Ok
 //
 // Future tickets extend isKnownTemplate() as new template ids are assigned
@@ -57,14 +57,14 @@ struct FrameCheck {
 //                   Milestone C-B txn range (45..54).
 //
 // Reserved ranges (from Protocol.h):
-//   control         1-15   (Connect=1 .. Pong=7; MetadataRequest=8, MetadataResponse=9 assigned;
-//                            10-15 gap → UnknownTemplate)
+//   control         1-15   (Connect=1 .. Pong=7; MetadataRequest=8, MetadataResponse=9; handshake 10-11;
+//                            auth 12-15 — all assigned)
 //   produce/consume 16-31  (Produce=16 .. Unsubscribe=21 assigned; 22-31 gap → UnknownTemplate)
 //   groups/txn      32-63  (JoinGroup=32 .. Assign=44; InitProducerId=45..EndTxnResponse=54)
 //   view            64-95  (DefineTopic=64..TopicSchemaResponse=67; AlterTopic=68, AlterTopicResponse=69;
 //                            CreateView=70, CreateViewResponse=71, GetViewRow=72, ViewRowResponse=73;
 //                            catalog history: DropTopic=74, AlterTopicConfig=75, DropView=76,
-//                            AlterView=77, DdlResponse=78; 79-95 gap → UnknownTemplate)
+//                            AlterView=77, DdlResponse=78; SecurityDdl=79, SecurityBootstrap=80; 81-95 gap → UnknownTemplate)
 //
 // Extend this function when future tickets add template ids.
 // ---------------------------------------------------------------------------
@@ -88,6 +88,11 @@ struct FrameCheck {
         tid == static_cast<uint16_t>(TemplateId::HandshakeContinueResponse)) {
         return true;
     }
+    // authentication (client version 9): AuthClientFirst..AuthServerFinal = 12..15
+    if (tid >= static_cast<uint16_t>(TemplateId::AuthClientFirst) &&
+        tid <= static_cast<uint16_t>(TemplateId::AuthServerFinal)) {
+        return true;
+    }
     // Milestone B produce/subscribe range: 16..21
     if (tid >= static_cast<uint16_t>(TemplateId::Produce) &&
         tid <= static_cast<uint16_t>(TemplateId::Unsubscribe)) {
@@ -103,9 +108,9 @@ struct FrameCheck {
         tid <= static_cast<uint16_t>(TemplateId::EndTxnResponse)) {
         return true;
     }
-    // 0b/0c schema + view-engine range + catalog-history DDL: 64..78
+    // 0b/0c schema + view-engine range + catalog-history DDL + security DDL: 64..80
     if (tid >= static_cast<uint16_t>(TemplateId::DefineTopic) &&
-        tid <= static_cast<uint16_t>(TemplateId::DdlResponse)) {
+        tid <= static_cast<uint16_t>(TemplateId::SecurityBootstrap)) {
         return true;
     }
     return false;

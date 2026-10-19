@@ -26,6 +26,10 @@
 #include <rune/protocol/client/OffsetMessages.h>
 #include <rune/protocol/client/PingMessages.h>
 #include <rune/protocol/client/Protocol.h>
+#include <rune/protocol/client/AuthMessages.h>
+#include <rune/protocol/client/SecurityMessages.h>
+
+#include "AuthVectorFixtures.h"
 
 #include <array>
 #include <cstdint>
@@ -1214,4 +1218,143 @@ TEST(GroupConformance, AssignRevokeFileGolden) {
     ASSERT_EQ(n, 30u);
     EXPECT_EQ(std::memcmp(encBuf.data(), golden.data(), n), 0)
         << "Encoded bytes differ from golden cg1_assign_revoke.bin";
+}
+
+// ===========================================================================
+// Authentication (client version 9) golden vectors — fixtures shared with
+// conformance/gen_auth_vectors.cpp through AuthVectorFixtures.h.
+// ===========================================================================
+namespace av = rune::protocol::client::authvec;
+
+namespace {
+template <typename M>
+std::vector<uint8_t> encodeVec(const M& m) {
+    std::vector<uint8_t> buf(m.encodedSize() + 16);
+    buf.resize(m.encode(buf.data()));
+    return buf;
+}
+void expectHeader(const std::vector<uint8_t>& buf, uint16_t tid, uint16_t blockLength) {
+    auto h = rpc::MessageHeader::decode(buf.data(), buf.size());
+    ASSERT_TRUE(h.has_value());
+    EXPECT_EQ(h->templateId, tid); EXPECT_EQ(h->blockLength, blockLength);
+    EXPECT_EQ(h->schemaId, kSchemaId); EXPECT_EQ(h->version, kVersion);
+    EXPECT_EQ(h->sessionId, av::kSession); EXPECT_EQ(h->correlationId, av::kCorr);
+    EXPECT_EQ(rpc::checkFrame(buf.data(), buf.size()).status, rpc::FrameStatus::Ok);
+}
+} // namespace
+
+TEST(ConformanceGolden, AuthClientFirst) {
+    const auto golden = readVector("auth_client_first.bin");
+    ASSERT_EQ(golden.size(), 52u);
+    expectHeader(golden, 12, 1);
+    EXPECT_EQ(encodeVec(av::clientFirst()), golden);
+    auto d = rpc::AuthClientFirst::decode(golden.data(), golden.size());
+    ASSERT_TRUE(d);
+    EXPECT_EQ(d->mechanism, rpc::kMechanismScramSha512);
+    EXPECT_EQ(d->username, "ws1"); EXPECT_EQ(d->clientNonce, "rOprNGfwEbeRWgbNEkqO");
+}
+
+TEST(ConformanceGolden, AuthServerFirstTwoVerifiers) {
+    const auto golden = readVector("auth_server_first.bin");
+    ASSERT_EQ(golden.size(), 137u);
+    expectHeader(golden, 13, 0);
+    EXPECT_EQ(encodeVec(av::serverFirst()), golden);
+    auto d = rpc::AuthServerFirst::decode(golden.data(), golden.size());
+    ASSERT_TRUE(d);
+    EXPECT_EQ(d->count, 2);
+    EXPECT_EQ(d->salts[0].salt, av::salt16()); EXPECT_EQ(d->salts[0].iterations, 4096u);
+    EXPECT_EQ(d->salts[1].salt, av::salt32()); EXPECT_EQ(d->salts[1].iterations, 8192u);
+}
+
+TEST(ConformanceGolden, AuthClientFinalTwoProofs) {
+    const auto golden = readVector("auth_client_final.bin");
+    ASSERT_EQ(golden.size(), 153u);
+    expectHeader(golden, 14, 1);
+    EXPECT_EQ(encodeVec(av::clientFinal()), golden);
+    auto d = rpc::AuthClientFinal::decode(golden.data(), golden.size());
+    ASSERT_TRUE(d);
+    EXPECT_EQ(d->count, 2);
+    EXPECT_EQ(d->proofs, av::clientFinal().proofs);
+}
+
+TEST(ConformanceGolden, AuthServerFinalOkAndFailed) {
+    const auto ok = readVector("auth_server_final.bin");
+    ASSERT_EQ(ok.size(), 99u);
+    expectHeader(ok, 15, 7);
+    EXPECT_EQ(encodeVec(av::serverFinal()), ok);
+    auto d = rpc::AuthServerFinal::decode(ok.data(), ok.size());
+    ASSERT_TRUE(d);
+    EXPECT_EQ(d->errorCode, 0); EXPECT_EQ(d->flags, rpc::kAuthFlagMustChangePassword);
+    EXPECT_EQ(d->serverSignature, av::sig64());
+
+    const auto bad = readVector("auth_server_final_failed.bin");
+    ASSERT_EQ(bad.size(), 56u);
+    expectHeader(bad, 15, 7);
+    EXPECT_EQ(encodeVec(av::serverFinalFailed()), bad);
+    auto f = rpc::AuthServerFinal::decode(bad.data(), bad.size());
+    ASSERT_TRUE(f);
+    EXPECT_EQ(f->errorCode, 44); EXPECT_EQ(f->retryAfterMs, 750u); EXPECT_EQ(f->detail, "authentication failed");
+    EXPECT_TRUE(f->serverSignature.empty());
+}
+
+TEST(ConformanceGolden, SecurityDdlCreateUserSetPasswordGrant) {
+    const auto cu = readVector("security_ddl_create_user.bin");
+    ASSERT_EQ(cu.size(), 243u);
+    expectHeader(cu, 79, 0);
+    EXPECT_EQ(encodeVec(av::createUser()), cu);
+    auto d = rpc::SecurityDdl::decode(cu.data(), cu.size());
+    ASSERT_TRUE(d);
+    EXPECT_EQ(d->kind, rpc::SecurityOpKind::CreateUser); EXPECT_EQ(d->name, "ws1");
+    EXPECT_EQ(d->verifier, av::verifier()); EXPECT_EQ(d->ext, av::ext());
+
+    const auto sp = readVector("security_ddl_set_password.bin");
+    ASSERT_EQ(sp.size(), 267u);
+    EXPECT_EQ(encodeVec(av::setPassword()), sp);
+    d = rpc::SecurityDdl::decode(sp.data(), sp.size());
+    ASSERT_TRUE(d);
+    EXPECT_EQ(d->change, rpc::UserChangeKind::SetPassword); EXPECT_EQ(d->terminateSessions, 1);
+
+    const auto gr = readVector("security_ddl_grant.bin");
+    ASSERT_EQ(gr.size(), 116u);
+    EXPECT_EQ(encodeVec(av::grant()), gr);
+    d = rpc::SecurityDdl::decode(gr.data(), gr.size());
+    ASSERT_TRUE(d);
+    EXPECT_EQ(d->kind, rpc::SecurityOpKind::Grant); EXPECT_EQ(d->op, 2); EXPECT_EQ(d->patternKind, 1);
+    EXPECT_EQ(d->pattern, "world.");
+}
+
+TEST(ConformanceGolden, SecurityBootstrap) {
+    const auto golden = readVector("security_bootstrap.bin");
+    ASSERT_EQ(golden.size(), 261u);
+    expectHeader(golden, 80, 0);
+    EXPECT_EQ(encodeVec(av::bootstrap()), golden);
+    auto d = rpc::SecurityBootstrap::decode(golden.data(), golden.size());
+    ASSERT_TRUE(d);
+    EXPECT_EQ(d->adminName, "admin"); EXPECT_EQ(d->verifier, av::verifier());
+    EXPECT_EQ(d->nonce, av::bootstrap().nonce); EXPECT_EQ(d->mac, av::bootstrap().mac);
+}
+
+TEST(ConformanceGolden, ConnectResponseV9) {
+    const auto golden = readVector("connect_response_v9.bin");
+    ASSERT_EQ(golden.size(), 49u);   // 24 + 21 + var32 length (empty handshake)
+    expectHeader(golden, 2, 21);
+    std::array<uint8_t, 96> enc{};
+    const auto n = av::connectResponseV9().encode(enc.data());
+    ASSERT_EQ(n, golden.size());
+    EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0);
+    EXPECT_EQ(golden[42], 0); EXPECT_EQ(golden[43], 0); EXPECT_EQ(golden[44], 0);   // cipher none, Required, MustAuthenticate
+    auto d = rpc::ConnectResponse::decode(golden.data(), golden.size());
+    ASSERT_TRUE(d);
+    EXPECT_TRUE(d->v9); EXPECT_EQ(d->authMode, rpc::AuthMode::Required); EXPECT_EQ(d->authState, rpc::AuthState::MustAuthenticate);
+    EXPECT_EQ(d->brokerVersion, 5); EXPECT_EQ(d->assignedSessionId, static_cast<int64_t>(0xDEADBEEFULL));
+
+    const auto crypto = readVector("connect_response_v9_crypto.bin");
+    ASSERT_EQ(crypto.size(), 60u);
+    const auto n2 = av::connectResponseV9Crypto().encode(enc.data());
+    ASSERT_EQ(n2, crypto.size());
+    EXPECT_EQ(std::memcmp(enc.data(), crypto.data(), n2), 0);
+    auto c = rpc::ConnectResponse::decode(crypto.data(), crypto.size());
+    ASSERT_TRUE(c);
+    EXPECT_EQ(c->chosenCipher, 2); EXPECT_EQ(c->authState, rpc::AuthState::ResumedAuthenticated);
+    EXPECT_EQ(c->handshakeBytes, "serverhello");
 }
