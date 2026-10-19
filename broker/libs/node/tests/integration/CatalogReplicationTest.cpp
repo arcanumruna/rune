@@ -1017,39 +1017,32 @@ TEST(AeronTransportRegression, WorkerRelayCarriesProposalIdAndSendSeqRegression)
 TEST(CatalogReplicationRegression, ControllerTermIsWiredIntoEveryTransportAndAnswerRegression) {
     ThreeNodes c = ThreeNodes::start("cat_term");
     ASSERT_TRUE(c.awaitCatalogLeader(30s));
-    BrokerNode* ctl = nullptr;
-    int64_t T = 0;
-    const auto deadline = std::chrono::steady_clock::now() + 30s;
-    while (std::chrono::steady_clock::now() < deadline && T <= 0) {
+    // The term is re-sampled from the CURRENT controller on every iteration: a re-election mid-test moves it.
+    auto controllerTerm = [&]() -> int64_t {
         for (BrokerNode* n : c.live()) {
-            const bool leads = n->onControlThreadForTest([&] {
-                return n->electionForTest()->leaderMemberId() == n->nodeIdForTest();
+            const int64_t t = n->onControlThreadForTest([&]() -> int64_t {
+                return n->electionForTest()->leaderMemberId() == n->nodeIdForTest()
+                           ? static_cast<int64_t>(n->electionForTest()->leadershipTermId()) : 0;
             });
-            if (!leads) continue;
-            ctl = n;
-            T = n->onControlThreadForTest([&] { return static_cast<int64_t>(n->electionForTest()->leadershipTermId()); });
+            if (t > 0) return t;
         }
-        if (T <= 0) std::this_thread::sleep_for(50ms);
-    }
-    ASSERT_NE(ctl, nullptr);
-    ASSERT_GT(T, 0);
-    auto wired = [&](BrokerNode* n) {
-        const int64_t known = n->onControlThreadForTest([&] { return n->replTransportForTest()->knownControllerTermForTest(); });
-        const int64_t stamp = n->onControlThreadForTest([&] { return n->metadataServiceForTest()->controllerEpochForTest(); });
-        return known == T && stamp == T;
+        return 0;
     };
-    const auto wireDeadline = std::chrono::steady_clock::now() + 30s;
+    auto knownOf = [&](BrokerNode* n) { return n->onControlThreadForTest([&] { return n->replTransportForTest()->knownControllerTermForTest(); }); };
+    auto stampOf = [&](BrokerNode* n) { return n->onControlThreadForTest([&] { return n->metadataServiceForTest()->controllerEpochForTest(); }); };
+    int64_t T = 0;
     bool all = false;
-    while (std::chrono::steady_clock::now() < wireDeadline && !all) {
-        all = true;
-        for (BrokerNode* n : c.live()) all = all && wired(n);
+    const auto deadline = std::chrono::steady_clock::now() + 30s;
+    while (std::chrono::steady_clock::now() < deadline && !all) {
+        T = controllerTerm();
+        all = T > 0;
+        for (BrokerNode* n : c.live()) all = all && knownOf(n) == T && stampOf(n) == T;
         if (!all) std::this_thread::sleep_for(50ms);
     }
+    ASSERT_GT(T, 0);
     for (BrokerNode* n : c.live()) {
-        EXPECT_EQ(n->onControlThreadForTest([&] { return n->replTransportForTest()->knownControllerTermForTest(); }), T)
-            << "node " << n->nodeIdForTest() << ": the transport never learned the controller term";
-        EXPECT_EQ(n->onControlThreadForTest([&] { return n->metadataServiceForTest()->controllerEpochForTest(); }), T)
-            << "node " << n->nodeIdForTest() << ": the metadata service never stamps the controller term";
+        EXPECT_EQ(knownOf(n), T) << "node " << n->nodeIdForTest() << ": the transport never learned the controller term";
+        EXPECT_EQ(stampOf(n), T) << "node " << n->nodeIdForTest() << ": the metadata service never stamps the controller term";
     }
 }
 
