@@ -31,7 +31,8 @@ if(BUILD_TESTING)
         tests/AstSmokeTest.cpp
         tests/ParserTest.cpp
         tests/BackendsTest.cpp
-        tests/CatalogStatementsTest.cpp)
+        tests/CatalogStatementsTest.cpp
+        tests/SecurityStatementsTest.cpp)
     target_link_libraries(rune_ql_tests PRIVATE rune_ql GTest::gtest_main)
     include(GoogleTest)
     gtest_discover_tests(rune_ql_tests)

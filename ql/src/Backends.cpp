@@ -127,4 +127,49 @@ AlterTopicPlan applyAlterPlan(const AlterTopicDef& ad, uint16_t expectedVersion)
     };
 }
 
+std::expected<SecurityPlan, ParseError> applySecurityPlan(const Statement& st) {
+    namespace pc = rune::protocol::client;
+    SecurityPlan p;
+    const auto grantFields = [&p](SecOp op, const SecPattern& r, Grantee g, const std::string& who) {
+        p.name = who;
+        p.granteeKind = static_cast<uint8_t>(g);
+        p.op = static_cast<uint8_t>(op);
+        p.resourceType = static_cast<uint8_t>(r.type);
+        p.patternKind = r.prefix ? 1 : 0;
+        p.pattern = r.name;
+    };
+    if (const auto* d = std::get_if<CreateUserDef>(&st)) {
+        p.kind = pc::SecurityOpKind::CreateUser; p.name = d->name; p.password = d->password;
+    } else if (const auto* d = std::get_if<AlterUserDef>(&st)) {
+        p.kind = pc::SecurityOpKind::AlterUser; p.name = d->name;
+        switch (d->change) {
+            case AlterUserDef::Change::AddPassword:  p.change = pc::UserChangeKind::AddPassword; p.password = d->password; break;
+            case AlterUserDef::Change::DropPassword: p.change = pc::UserChangeKind::DropPassword; p.passwordIndex = d->index; break;
+            case AlterUserDef::Change::SetPassword:
+                p.change = pc::UserChangeKind::SetPassword; p.password = d->password;
+                p.terminateSessions = d->terminateSessions ? 1 : 0; break;
+            case AlterUserDef::Change::Disable: p.change = pc::UserChangeKind::Disable; break;
+            case AlterUserDef::Change::Enable:  p.change = pc::UserChangeKind::Enable; break;
+        }
+    } else if (const auto* d = std::get_if<DropUserDef>(&st)) {
+        p.kind = pc::SecurityOpKind::DropUser; p.name = d->name;
+    } else if (const auto* d = std::get_if<CreateRoleDef>(&st)) {
+        p.kind = pc::SecurityOpKind::CreateRole; p.name = d->name;
+    } else if (const auto* d = std::get_if<DropRoleDef>(&st)) {
+        p.kind = pc::SecurityOpKind::DropRole; p.name = d->name;
+    } else if (const auto* d = std::get_if<GrantDef>(&st)) {
+        p.kind = pc::SecurityOpKind::Grant; grantFields(d->op, d->resource, d->grantee, d->granteeName);
+    } else if (const auto* d = std::get_if<RevokeDef>(&st)) {
+        p.kind = pc::SecurityOpKind::Revoke; grantFields(d->op, d->resource, d->grantee, d->granteeName);
+    } else if (const auto* d = std::get_if<GrantRoleDef>(&st)) {
+        p.kind = pc::SecurityOpKind::GrantRole; p.name = d->user; p.roleName = d->role;
+    } else if (const auto* d = std::get_if<RevokeRoleDef>(&st)) {
+        p.kind = pc::SecurityOpKind::RevokeRole; p.name = d->user; p.roleName = d->role;
+    } else {
+        return std::unexpected(ParseError{0, 0, "not a security DDL statement (SHOW statements are client-side reads)"});
+    }
+    p.statement = redactedText(st);
+    return p;
+}
+
 } // namespace rune::ql

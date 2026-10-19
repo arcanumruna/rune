@@ -55,6 +55,46 @@ struct DiffDef {
     int64_t from = 0, to = 0;    // Schema: versions; Catalog: offsets
 };
 
+// ── Security statements (authentication phase, Task 6) ──────────────────────
+// The enum values are the wire / event bytes (= rune::security::Operation / ResourceType /
+// GranteeKind and the SecurityDdl `op` / `resourceType` / `granteeKind` bytes); rune-ql does not
+// depend on rune-codec's security library, so the mapping is pinned by value here.
+enum class SecOp : uint8_t { Read = 0, Write, Create, Alter, Drop, Describe, Admin };
+enum class SecResource : uint8_t { Cluster = 0, Topic, View, Group, TransactionalId };
+struct SecPattern { SecResource type = SecResource::Topic; bool prefix = false; std::string name; };
+enum class Grantee : uint8_t { User = 0, Role = 1 };
+struct CreateUserDef { std::string name; std::string password; };      // password: in memory only, never rendered
+struct AlterUserDef {
+    enum class Change : uint8_t { AddPassword, DropPassword, SetPassword, Disable, Enable } change = Change::Disable;
+    std::string name;
+    std::string password;              // AddPassword / SetPassword
+    uint8_t index = 0;                 // DropPassword: 1 (oldest) or 2
+    bool terminateSessions = false;    // SetPassword
+};
+struct DropUserDef   { std::string name; };
+struct CreateRoleDef { std::string name; };
+struct DropRoleDef   { std::string name; };
+struct GrantDef      { SecOp op = SecOp::Read; SecPattern resource; Grantee grantee = Grantee::User; std::string granteeName; };
+struct RevokeDef     { SecOp op = SecOp::Read; SecPattern resource; Grantee grantee = Grantee::User; std::string granteeName; };
+struct GrantRoleDef  { std::string role; std::string user; };
+struct RevokeRoleDef { std::string role; std::string user; };
+struct ShowUsersDef {};
+struct ShowRolesDef {};
+struct ShowGrantsDef { Grantee who = Grantee::User; std::string name; std::optional<AsOfPoint> at; };   // at: Offset | Time
+struct ShowSecurityHistoryDef { std::optional<Grantee> who; std::string name; std::optional<std::string> sinceIso; };
+
+// Security statements are APPENDED: the existing indices (0..7) never move.
 using Statement = std::variant<TopicDef, AlterTopicDef, AlterTopicConfigDef, DropTopicDef, DropViewDef,
-                               ShowHistoryDef, ShowAsOfDef, DiffDef>;
+                               ShowHistoryDef, ShowAsOfDef, DiffDef,
+                               CreateUserDef, AlterUserDef, DropUserDef, CreateRoleDef, DropRoleDef, GrantDef, RevokeDef,
+                               GrantRoleDef, RevokeRoleDef, ShowUsersDef, ShowRolesDef, ShowGrantsDef,
+                               ShowSecurityHistoryDef>;
+
+/// The canonical text of `s` with every password literal replaced by '<redacted>' (D10) — the ONLY statement
+/// text a client sends for a security statement.  Keywords upper-case, names quoted when not a plain IDENT.
+/// Catalog statements (topic / alter / drop topic|view / show history / as of / diff) are never re-rendered:
+/// their text is the caller's source, so this returns an empty string for them.
+[[nodiscard]] std::string redactedText(const Statement& s);
+[[nodiscard]] bool isSecurityStatement(const Statement& s) noexcept;
+[[nodiscard]] bool carriesPassword(const Statement& s) noexcept;
 } // namespace rune::ql

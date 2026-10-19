@@ -1,6 +1,7 @@
 // rune-ql parser — tokenizer + recursive-descent DDL parser
 // Grammar:
 //   statement   := topicStmt | transientStmt | alterStmt | dropStmt | showStmt | diffStmt
+//                | createStmt | grantStmt | revokeStmt                       (authentication: users / roles / grants)
 //   transientStmt := "transient" topicStmt                 (Phase 2b E: persistence = Transient)
 //   topicStmt   := "topic" IDENT [ "{" field ("," field)* ","? "}" ] "partitions" INT [ "replicas" INT ] [ "key" IDENT ]
 //                  [ "with" "(" createSetting ("," createSetting)* ")" ] ";"
@@ -18,7 +19,18 @@
 //   setting     := CONFIGKEY "=" SIGNED_INT | "min.cleanable.dirty.ratio" "=" DECIMAL     (DECIMAL in [0,1], <= 6 places → ppm)
 //   SIGNED_INT  := ["-"] INT  ('-' directly before the digits); any int64 — ranges are the catalog library's (topicConfigError)
 //   CONFIGKEY   := "retention.ms" | "retention.bytes" | "delete.retention.ms" | "min.compaction.lag.ms" | "max.compaction.lag.ms"
-//   dropStmt    := "drop" ("topic" | "view") IDENT ";"
+//   dropStmt    := "drop" ("topic" | "view") IDENT ";"  |  "drop" ( "user" | "role" ) NAME ";"
+//   createStmt  := "create" ( "user" NAME "with" "password" STRING | "role" NAME ) ";"
+//   alterUser   := "alter" "user" NAME ( "add" "password" STRING | "drop" "password" INT         (1 oldest | 2)
+//                                      | "set" "password" STRING [ "terminate" "sessions" ] | "disable" | "enable" ) ";"
+//   grantStmt   := "grant" ( OPERATION "on" resource "to" ( "user" | "role" ) NAME | "role" NAME "to" "user" NAME ) ";"
+//   revokeStmt  := "revoke" ( OPERATION "on" resource "from" ( "user" | "role" ) NAME | "role" NAME "from" "user" NAME ) ";"
+//   resource    := "cluster" | ( "topic" | "view" | "group" | "transactional_id" ) ( "prefix" STRING | NAME )
+//   OPERATION   := "read" | "write" | "create" | "alter" | "drop" | "describe" | "admin"
+//   showSecurity:= "show" ( "users" | "roles" ) ";"
+//                | "show" "grants" "for" ( "user" | "role" ) NAME [ "as" "of" ( "offset" INT | "time" STRING ) ] ";"
+//                | "show" "security" "history" [ ( "user" | "role" ) NAME ] [ "since" STRING ] ";"
+//   NAME        := IDENT | STRING        (names with '.', '@' or '-' are written as a STRING; a password STRING is non-empty)
 //   showStmt    := "show" "history" [ ("topic" | "view" | "schema") IDENT ] [ "since" STRING ] ";"
 //                | "show" ("schema" | "view" | "topic") IDENT "as" "of" ( "version" INT | "time" STRING | "offset" INT ) ";"
 //   diffStmt    := "diff" "schema" IDENT "version" INT "to" INT ";"
@@ -742,6 +754,8 @@ struct Parser {
                 "durable for life (define a new topic instead)"));
         }
 
+        if (isKw("user")) return parseAlterUser();
+
         // "topic"
         auto topicTok = expectKeyword("topic");
         if (!topicTok) return std::unexpected(std::move(topicTok.error()));
@@ -787,12 +801,259 @@ struct Parser {
         return Statement(std::in_place_type<AlterTopicDef>, std::move(ad));
     }
 
+    // ---- security statements (authentication) ----
+    // NAME := IDENT | STRING (non-empty)
+    std::expected<std::string, ParseError> parseName(std::string_view what) noexcept {
+        if (cur.kind == TK::Ident) { std::string v(cur.text); advance(); return v; }
+        if (cur.kind == TK::BadString) return std::unexpected(err("unterminated string literal"));
+        if (cur.kind == TK::String) {
+            if (cur.text.empty()) return std::unexpected(err(std::string(what) + " must not be empty"));
+            std::string v(cur.text);
+            advance();
+            return v;
+        }
+        return std::unexpected(err(std::string("expected ") + std::string(what) + " (an identifier or a quoted string), got " + got()));
+    }
+
+    std::expected<std::string, ParseError> parsePassword() noexcept {
+        Token t = cur;
+        auto p = parseString("the password");
+        if (!p) return p;
+        if (p->empty()) return std::unexpected(errAt(t, "password must not be empty"));
+        return p;
+    }
+
+    std::expected<Grantee, ParseError> parseGranteeKind() noexcept {
+        if (isKw("user")) { advance(); return Grantee::User; }
+        if (isKw("role")) { advance(); return Grantee::Role; }
+        return std::unexpected(err("expected 'user' or 'role', got " + got()));
+    }
+
+    std::expected<Statement, ParseError> parseCreateStatement() noexcept {
+        advance();   // "create"
+        if (isKw("role")) {
+            advance();
+            auto n = parseName("role name");
+            if (!n) return std::unexpected(std::move(n.error()));
+            auto semi = expect(TK::Semi, ";");
+            if (!semi) return std::unexpected(std::move(semi.error()));
+            return Statement(std::in_place_type<CreateRoleDef>, CreateRoleDef{std::move(*n)});
+        }
+        if (!isKw("user")) return std::unexpected(err("expected 'user' or 'role' after 'create', got " + got()));
+        advance();
+        auto n = parseName("user name");
+        if (!n) return std::unexpected(std::move(n.error()));
+        auto w = expectKeyword("with");
+        if (!w) return std::unexpected(std::move(w.error()));
+        auto pw = expectKeyword("password");
+        if (!pw) return std::unexpected(std::move(pw.error()));
+        auto p = parsePassword();
+        if (!p) return std::unexpected(std::move(p.error()));
+        auto semi = expect(TK::Semi, ";");
+        if (!semi) return std::unexpected(std::move(semi.error()));
+        return Statement(std::in_place_type<CreateUserDef>, CreateUserDef{std::move(*n), std::move(*p)});
+    }
+
+    // at "user" (after "alter")
+    std::expected<Statement, ParseError> parseAlterUser() noexcept {
+        advance();   // "user"
+        AlterUserDef a;
+        auto n = parseName("user name");
+        if (!n) return std::unexpected(std::move(n.error()));
+        a.name = std::move(*n);
+        if (isKw("add") || isKw("set")) {
+            const bool add = isKw("add");
+            advance();
+            auto pw = expectKeyword("password");
+            if (!pw) return std::unexpected(std::move(pw.error()));
+            auto p = parsePassword();
+            if (!p) return std::unexpected(std::move(p.error()));
+            a.password = std::move(*p);
+            a.change = add ? AlterUserDef::Change::AddPassword : AlterUserDef::Change::SetPassword;
+            if (!add && isKw("terminate")) {
+                advance();
+                auto ss = expectKeyword("sessions");
+                if (!ss) return std::unexpected(std::move(ss.error()));
+                a.terminateSessions = true;
+            }
+        } else if (isKw("drop")) {
+            advance();
+            auto pw = expectKeyword("password");
+            if (!pw) return std::unexpected(std::move(pw.error()));
+            Token it = cur;
+            auto i = parseInt();
+            if (!i) return std::unexpected(std::move(i.error()));
+            if (*i != 1 && *i != 2) return std::unexpected(errAt(it, "password index is 1 (oldest) or 2"));
+            a.change = AlterUserDef::Change::DropPassword;
+            a.index = static_cast<uint8_t>(*i);
+        } else if (isKw("disable")) {
+            advance();
+            a.change = AlterUserDef::Change::Disable;
+        } else if (isKw("enable")) {
+            advance();
+            a.change = AlterUserDef::Change::Enable;
+        } else {
+            return std::unexpected(err("expected 'add', 'drop', 'set', 'disable' or 'enable' after the user name, got " + got()));
+        }
+        auto semi = expect(TK::Semi, ";");
+        if (!semi) return std::unexpected(std::move(semi.error()));
+        return Statement(std::in_place_type<AlterUserDef>, std::move(a));
+    }
+
+    std::expected<SecOp, ParseError> parseOperation() noexcept {
+        static constexpr std::pair<std::string_view, SecOp> kOps[] = {
+            {"read", SecOp::Read}, {"write", SecOp::Write}, {"create", SecOp::Create}, {"alter", SecOp::Alter},
+            {"drop", SecOp::Drop}, {"describe", SecOp::Describe}, {"admin", SecOp::Admin}};
+        if (cur.kind == TK::Ident)
+            for (const auto& [kw, op] : kOps)
+                if (ieq(cur.text, kw)) { advance(); return op; }
+        return std::unexpected(err("expected an operation ('read', 'write', 'create', 'alter', 'drop', 'describe' or 'admin'), got " + got()));
+    }
+
+    std::expected<SecPattern, ParseError> parseResource() noexcept {
+        SecPattern r;
+        if (isKw("cluster")) { advance(); r.type = SecResource::Cluster; return r; }
+        if (isKw("topic")) r.type = SecResource::Topic;
+        else if (isKw("view")) r.type = SecResource::View;
+        else if (isKw("group")) r.type = SecResource::Group;
+        else if (isKw("transactional_id")) r.type = SecResource::TransactionalId;
+        else return std::unexpected(err("expected 'cluster', 'topic', 'view', 'group' or 'transactional_id', got " + got()));
+        advance();
+        if (isKw("prefix")) {
+            // `prefix 'x'` is a prefix pattern; a bare `prefix` is an object named prefix.
+            Lexer save = lex; Token savedCur = cur;
+            advance();
+            if (cur.kind == TK::String || cur.kind == TK::BadString) {
+                auto s = parseString("the prefix");
+                if (!s) return std::unexpected(std::move(s.error()));
+                r.prefix = true;
+                r.name = std::move(*s);
+                return r;
+            }
+            lex = save; cur = savedCur;
+        }
+        auto n = parseName("an object name");
+        if (!n) return std::unexpected(std::move(n.error()));
+        r.name = std::move(*n);
+        return r;
+    }
+
+    std::expected<Statement, ParseError> parseGrantRevoke(bool grant) noexcept {
+        advance();   // "grant" | "revoke"
+        const char* link = grant ? "to" : "from";
+        if (isKw("role")) {
+            advance();
+            auto role = parseName("role name");
+            if (!role) return std::unexpected(std::move(role.error()));
+            auto l = expectKeyword(link);
+            if (!l) return std::unexpected(std::move(l.error()));
+            auto u = expectKeyword("user");
+            if (!u) return std::unexpected(std::move(u.error()));
+            auto user = parseName("user name");
+            if (!user) return std::unexpected(std::move(user.error()));
+            auto semi = expect(TK::Semi, ";");
+            if (!semi) return std::unexpected(std::move(semi.error()));
+            if (grant) return Statement(std::in_place_type<GrantRoleDef>, GrantRoleDef{std::move(*role), std::move(*user)});
+            return Statement(std::in_place_type<RevokeRoleDef>, RevokeRoleDef{std::move(*role), std::move(*user)});
+        }
+        auto op = parseOperation();
+        if (!op) return std::unexpected(std::move(op.error()));
+        auto on = expectKeyword("on");
+        if (!on) return std::unexpected(std::move(on.error()));
+        auto res = parseResource();
+        if (!res) return std::unexpected(std::move(res.error()));
+        auto l = expectKeyword(link);
+        if (!l) return std::unexpected(std::move(l.error()));
+        auto who = parseGranteeKind();
+        if (!who) return std::unexpected(std::move(who.error()));
+        auto n = parseName(*who == Grantee::User ? "user name" : "role name");
+        if (!n) return std::unexpected(std::move(n.error()));
+        auto semi = expect(TK::Semi, ";");
+        if (!semi) return std::unexpected(std::move(semi.error()));
+        if (grant) return Statement(std::in_place_type<GrantDef>, GrantDef{*op, std::move(*res), *who, std::move(*n)});
+        return Statement(std::in_place_type<RevokeDef>, RevokeDef{*op, std::move(*res), *who, std::move(*n)});
+    }
+
+    // at "grants"
+    std::expected<Statement, ParseError> parseShowGrants() noexcept {
+        advance();
+        auto f = expectKeyword("for");
+        if (!f) return std::unexpected(std::move(f.error()));
+        ShowGrantsDef d;
+        auto who = parseGranteeKind();
+        if (!who) return std::unexpected(std::move(who.error()));
+        d.who = *who;
+        auto n = parseName(*who == Grantee::User ? "user name" : "role name");
+        if (!n) return std::unexpected(std::move(n.error()));
+        d.name = std::move(*n);
+        if (isKw("as")) {
+            advance();
+            auto of = expectKeyword("of");
+            if (!of) return std::unexpected(std::move(of.error()));
+            AsOfPoint at;
+            if (isKw("offset")) {
+                advance();
+                auto o = parseBoundedInt("offset", std::numeric_limits<int64_t>::max());
+                if (!o) return std::unexpected(std::move(o.error()));
+                at.by = AsOfPoint::By::Offset;
+                at.number = *o;
+            } else if (isKw("time")) {
+                advance();
+                auto t = parseIsoTime("'as of time'");
+                if (!t) return std::unexpected(std::move(t.error()));
+                at.by = AsOfPoint::By::Time;
+                at.timeIso = std::move(*t);
+            } else {
+                return std::unexpected(err("expected 'offset' or 'time' after 'as of', got " + got()));
+            }
+            d.at = std::move(at);
+        }
+        auto semi = expect(TK::Semi, ";");
+        if (!semi) return std::unexpected(std::move(semi.error()));
+        return Statement(std::in_place_type<ShowGrantsDef>, std::move(d));
+    }
+
+    // at "security"
+    std::expected<Statement, ParseError> parseShowSecurityHistory() noexcept {
+        advance();
+        auto h = expectKeyword("history");
+        if (!h) return std::unexpected(std::move(h.error()));
+        ShowSecurityHistoryDef d;
+        if (isKw("user") || isKw("role")) {
+            auto who = parseGranteeKind();
+            if (!who) return std::unexpected(std::move(who.error()));
+            d.who = *who;
+            auto n = parseName(*who == Grantee::User ? "user name" : "role name");
+            if (!n) return std::unexpected(std::move(n.error()));
+            d.name = std::move(*n);
+        }
+        if (isKw("since")) {
+            advance();
+            auto t = parseIsoTime("'since'");
+            if (!t) return std::unexpected(std::move(t.error()));
+            d.sinceIso = std::move(*t);
+        }
+        auto semi = expect(TK::Semi, ";");
+        if (!semi) return std::unexpected(std::move(semi.error()));
+        return Statement(std::in_place_type<ShowSecurityHistoryDef>, std::move(d));
+    }
+
     // ---- drop / show / diff ----
     std::expected<Statement, ParseError> parseDropStatement() noexcept {
         advance();   // "drop"
+        if (isKw("user") || isKw("role")) {
+            const bool isUser = isKw("user");
+            advance();
+            auto n = parseName(isUser ? "user name" : "role name");
+            if (!n) return std::unexpected(std::move(n.error()));
+            auto semi = expect(TK::Semi, ";");
+            if (!semi) return std::unexpected(std::move(semi.error()));
+            if (isUser) return Statement(std::in_place_type<DropUserDef>, DropUserDef{std::move(*n)});
+            return Statement(std::in_place_type<DropRoleDef>, DropRoleDef{std::move(*n)});
+        }
         const bool isTopic = isKw("topic");
         if (!isTopic && !isKw("view")) {
-            return std::unexpected(err("expected 'topic' or 'view' after 'drop', got " + got()));
+            return std::unexpected(err("expected 'topic', 'view', 'user' or 'role' after 'drop', got " + got()));
         }
         advance();
         auto nameToken = expect(TK::Ident, isTopic ? "topic name" : "view name");
@@ -813,6 +1074,16 @@ struct Parser {
 
     std::expected<Statement, ParseError> parseShowStatement() noexcept {
         advance();   // "show"
+        if (isKw("users") || isKw("roles")) {
+            const bool users = isKw("users");
+            advance();
+            auto semi = expect(TK::Semi, ";");
+            if (!semi) return std::unexpected(std::move(semi.error()));
+            if (users) return Statement(std::in_place_type<ShowUsersDef>);
+            return Statement(std::in_place_type<ShowRolesDef>);
+        }
+        if (isKw("grants")) return parseShowGrants();
+        if (isKw("security")) return parseShowSecurityHistory();
         if (isKw("history")) {
             advance();
             ShowHistoryDef sh;
@@ -835,7 +1106,7 @@ struct Parser {
         }
         auto kind = objectKindHere();
         if (!kind) {
-            return std::unexpected(err("expected 'history', 'schema', 'view' or 'topic' after 'show', got " + got()));
+            return std::unexpected(err("expected 'history', 'schema', 'view', 'topic', 'users', 'roles', 'grants' or 'security' after 'show', got " + got()));
         }
         advance();
         auto nameToken = expect(TK::Ident, "object name");
@@ -905,7 +1176,7 @@ struct Parser {
 
     // ---- statement dispatch (parse() and parseScript() share this) ----
     std::expected<Statement, ParseError> parseStatement() noexcept {
-        constexpr const char* kExpected = "expected 'topic', 'transient', 'alter', 'drop', 'show' or 'diff'";
+        constexpr const char* kExpected = "expected 'topic', 'transient', 'alter', 'drop', 'show', 'diff', 'create', 'grant' or 'revoke'";
         if (cur.kind != TK::Ident) {
             return std::unexpected(err(std::string(kExpected) + ", got " + got()));
         }
@@ -928,6 +1199,9 @@ struct Parser {
         if (isKw("drop"))  return parseDropStatement();
         if (isKw("show"))  return parseShowStatement();
         if (isKw("diff"))  return parseDiffStatement();
+        if (isKw("create")) return parseCreateStatement();
+        if (isKw("grant"))  return parseGrantRevoke(true);
+        if (isKw("revoke")) return parseGrantRevoke(false);
         return std::unexpected(err(std::string(kExpected) + ", got " + got()));
     }
 };
