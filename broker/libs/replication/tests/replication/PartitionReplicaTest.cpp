@@ -1438,15 +1438,17 @@ struct GuardRig {
     CapturingIsr t;
     PartitionReplica r;
     int64_t now = 1'000'000'000;
-    explicit GuardRig(bool unclean = false)
-        : r(withUnclean(unclean), Role::Follower, 0, {1, 2, 3}, {1, 2, 3}, &recovered(log), &t) {
+    bool unclean_;
+    /// `hwCap`: the highest HW the leader advertises (the followers learn the HW one fetch late).
+    explicit GuardRig(bool unclean = false, Offset hwCap = INT64_MAX)
+        : r(withUnclean(unclean), Role::Follower, 0, {1, 2, 3}, {1, 2, 3}, &recovered(log), &t), unclean_(unclean) {
         r.setIsrChannel(&t);
         r.becomeFollower(5, 1);
         for (int i = 0; i < 10; ++i) {
             auto p = makePayload(uint8_t(i), 8);
             FetchResponseMsg d{};
             d.leaderEpoch = 5; d.partition = 0; d.errorCode = kErrNone;
-            d.highWatermark = i + 1;
+            d.highWatermark = std::min<Offset>(i + 1, hwCap);
             d.records = std::span<const uint8_t>(p.data(), p.size());
             r.applyReplicated(d);
         }
@@ -1463,6 +1465,15 @@ struct GuardRig {
         rune::replication::ErrorPayloadBuf b;
         div.records = b.set(epoch, end);
         r.applyReplicated(div);
+    }
+    /// A process restart over the same data dir: a fresh replica (HW knowledge gone), epoch cache from disk.
+    void restart() {
+        r.~PartitionReplica();
+        log.recover();
+        new (&r) PartitionReplica(withUnclean(unclean_), Role::Follower, 0, std::vector<NodeId>{1, 2, 3},
+                                  std::vector<NodeId>{1, 2, 3}, &log, &t);
+        r.setIsrChannel(&t);
+        r.becomeFollower(5, 1);
     }
     /// Drive `ms` milliseconds in 10 ms ticks.
     void run(int ms) { for (int i = 0; i < ms / 10; ++i) r.doWork(now += 10'000'000); }
@@ -1565,6 +1576,51 @@ TEST(TruncationGuardRegression, DifferentEpochDivergenceStillTruncatesRegression
     g.diverge(5, 3, /*leaderEpoch=*/6);
     EXPECT_EQ(g.r.logEndOffset(), 3);
     EXPECT_FALSE(g.r.truncationRefusedForTest());
+}
+
+// CP3 I1: a current-epoch leader never answers DivergingEpoch(epoch_, y) with y below the LEO of a follower that holds
+// records of that epoch - whatever HW the follower learned (here 4; the divergence ends at 7 >= 4, so the HW guard
+// alone would let it truncate).  RED: remove the same-epoch branch (the follower truncates to 7).
+TEST(TruncationGuardRegression, SameEpochTruncationAboveTheLearnedHwIsRefusedRegression) {
+    GuardRig g(false, /*hwCap=*/4);
+    ASSERT_EQ(g.r.logEndOffset(), 10);
+    ASSERT_EQ(g.r.highWatermark(), 4);
+    g.diverge(5, 7);
+    EXPECT_TRUE(g.r.truncationRefusedForTest());
+    EXPECT_EQ(g.r.logEndOffset(), 10);
+    EXPECT_EQ(g.r.truncationsRefusedSameEpochForTest(), 1u);
+    g.run(50);
+    EXPECT_GE(g.t.reports(), 1);
+}
+
+// The rule reads the durable epoch cache, so a RESTARTED follower (HW knowledge gone) refuses too.
+// RED: remove the same-epoch branch (it truncates to 0).
+TEST(TruncationGuardRegression, RestartedFollowerRefusesASameEpochTruncationRegression) {
+    GuardRig g;
+    g.restart();
+    ASSERT_EQ(g.r.logEndOffset(), 10);
+    ASSERT_EQ(g.r.highWatermark(), 0);
+    g.diverge(5, 0);
+    EXPECT_TRUE(g.r.truncationRefusedForTest());
+    EXPECT_EQ(g.r.logEndOffset(), 10);
+}
+
+// No false positive: a stale answer for an OLDER epoch (to a fetch made before the follower held epoch-5 records) keeps
+// its legitimate truncation.  RED: drop the `divergingEpoch == epoch_` condition (the first case is refused).
+TEST(TruncationGuardRegression, StaleOlderEpochDivergenceStillTruncatesRegression) {
+    GuardRig g;   // 10 records at epoch 5
+    g.r.becomeFollower(6, 1);
+    for (int i = 0; i < 3; ++i) {
+        auto p = makePayload(uint8_t(0x40 + i), 8);
+        FetchResponseMsg d{};
+        d.leaderEpoch = 6; d.partition = 0; d.errorCode = kErrNone; d.highWatermark = 0;
+        d.records = std::span<const uint8_t>(p.data(), p.size());
+        g.r.applyReplicated(d);
+    }
+    ASSERT_EQ(g.r.logEndOffset(), 13);
+    g.diverge(5, 10, /*leaderEpoch=*/6);   // epoch 5 ends at 10 on both sides: truncate to 10 (the epoch-6 tail)
+    EXPECT_FALSE(g.r.truncationRefusedForTest());
+    EXPECT_EQ(g.r.logEndOffset(), 10);
 }
 
 // A same-epoch re-assert of the same leader keeps the refusal (a metadata re-apply must not unblock it).

@@ -1693,6 +1693,21 @@ void PartitionReplica::onDivergingEpoch_(int32_t divergingEpoch, Offset divergin
             : mine.second;
     if (truncTo > leo) truncTo = leo;
     if (truncTo < 0) truncTo = 0;
+    // ISR v3 CP3 I1: every record this follower holds that is stamped with its CURRENT epoch came from that epoch's single
+    // leader, whose log only grows while it leads (the restart fence forbids re-leading the epoch after a restart).  An
+    // honest current-epoch leader therefore never answers DivergingEpoch(epoch_, y) with y below our LEO.  Such an answer
+    // proves the leader lost data (a wiped dir, an old binary without the gate): refuse, whatever HW we learned.  The rule
+    // reads the durable epoch cache, so it also holds across a follower restart (followerHw_ is then 0).
+    {
+        const Offset ownStart = epochCache_.startOffsetFor(static_cast<int32_t>(epoch_));
+        const bool holdsOwnEpoch = ownStart >= 0 && ownStart < leo;   // RECORDS of epoch_, not a phantom entry
+        if (divergingEpoch == static_cast<int32_t>(epoch_) && holdsOwnEpoch && truncTo < leo && !memoryBacked_ &&
+            !cfg_.allowUncleanTruncation) [[unlikely]] {
+            ++truncationsRefusedSameEpoch_;
+            enterRefused_(truncTo, divergingEndOffset);
+            return;
+        }
+    }
     // ISR v3 Step 11 (3.8): a disk-backed follower whose own leader told it, in THIS epoch, that offsets up to followerHw_
     // are committed never truncates below that.  Only a leader that lost data can answer so (it was wiped, or elected
     // without the committed records): refuse, apply nothing, report to the controller.

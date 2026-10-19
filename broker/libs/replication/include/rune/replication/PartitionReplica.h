@@ -477,6 +477,7 @@ public:
     /// ISR v3 Step 11 test views: the truncation guard (3.8).
     [[nodiscard]] bool     truncationRefusedForTest() const noexcept { return std::holds_alternative<Refused>(divergenceGuard_); }
     [[nodiscard]] uint64_t truncationsRefusedForTest() const noexcept { return truncationsRefused_; }
+    [[nodiscard]] uint64_t truncationsRefusedSameEpochForTest() const noexcept { return truncationsRefusedSameEpoch_; }
     [[nodiscard]] uint64_t appliesDroppedRefusedForTest() const noexcept { return appliesDroppedRefused_; }
     [[nodiscard]] uint64_t epochHistoryMismatchesForTest() const noexcept { return epochHistoryMismatches_; }
     [[nodiscard]] uint64_t epochHistoryMismatchesSeenForTest() const noexcept { return epochHistoryMismatchesSeen_; }
@@ -1576,6 +1577,7 @@ private:
     };
     std::variant<NoRefusal, Refused> divergenceGuard_{};
     uint64_t truncationsRefused_ = 0;
+    uint64_t truncationsRefusedSameEpoch_ = 0;   ///< CP3 I1: refused because the follower holds records of its current epoch
     uint64_t appliesDroppedRefused_ = 0;
     uint64_t epochHistoryMismatches_ = 0;       ///< leader side: mismatch answers sent
     uint64_t epochHistoryMismatchesSeen_ = 0;   ///< follower side, refusal not applicable (memory / unclean): re-fetched

@@ -2204,6 +2204,39 @@ TEST(DrIntegrationRegression, WipedLeaderReLeadingTheSameEpochNeverTruncatesFoll
     EXPECT_FALSE(c.rep(3).truncationRefusedForTest());
 }
 
+// CP3 I1 (Ruling 11.4): the wiped leader re-leads the SAME epoch before the followers learned the last HW, and takes h
+// appends of its own before their first fetch.  The HW guard alone (floor = learned HW) would let both followers
+// truncate to h and lose acked [h, 20); the same-epoch rule refuses.
+// RED: remove the same-epoch branch in onDivergingEpoch_ (nodes 2 and 3 truncate to h and append node 1's history).
+TEST(DrIntegrationRegression, WipedLeaderReLeadingBeforeTheFollowersLearnedTheHwNeverTruncatesRegression) {
+    DrCluster c(3, noGate());
+    c.start();
+    ASSERT_EQ(c.produceAcked(20), 20);
+    ASSERT_TRUE(c.driveUntil([&] { return c.converged(); }, kCap));
+    // No wait for the HW: the harness is deterministic, the followers have not learned the last advance yet.
+    const Offset h = std::max(c.rep(2).highWatermark(), c.rep(3).highWatermark());
+    ASSERT_LT(h, 20) << "precondition: the followers have not learned the last HW";
+    const std::vector<uint8_t> before2 = c.logBytes(2, 0, 20), before3 = c.logBytes(3, 0, 20);
+    c.holdReportDecisions(true);
+    c.crash(1, CrashKind::DiskLoss);
+    c.restart(1);
+    c.applyMetadata(1);   // re-leads epoch 1 with an empty log
+    c.cut(2, 1); c.cut(3, 1);
+    ASSERT_EQ(c.produce(static_cast<int>(std::max<Offset>(h, 1))), static_cast<int>(std::max<Offset>(h, 1)));
+    c.run(20);
+    c.heal(2, 1); c.heal(3, 1);
+    c.run(200);
+    for (NodeId n : {2, 3}) {
+        EXPECT_EQ(c.rep(n).logEndOffset(), 20) << "node " << n << " truncated acked records";
+        EXPECT_TRUE(c.rep(n).truncationRefusedForTest()) << "node " << n;
+    }
+    EXPECT_EQ(c.logBytes(2, 0, 20), before2);
+    EXPECT_EQ(c.logBytes(3, 0, 20), before3);
+    c.holdReportDecisions(false);
+    c.run(200);
+    for (NodeId n : {2, 3}) { c.expectAckedPresent(n, "after the same-epoch refusal"); c.expectNoDuplicates(n); }
+}
+
 // A-I5 (rewritten per v2-review C2): the wiped leader re-leads an epoch whose OLD start is above 0 (epoch 2 started at
 // offset 10), writes a second history under it that OUTGROWS the followers, and the followers must not append it after
 // their own prefix: the leader's history check answers kErrEpochHistoryMismatch and they refuse.
