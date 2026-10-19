@@ -68,7 +68,7 @@ struct LocalRoleDelta {
 
 class MetadataStateMachine {
 public:
-    MetadataStateMachine() = default;
+    MetadataStateMachine() { nodeStorage_.reserve(128); pendingStorage_.reserve(16); }
 
     // ── Apply a raw log record buffer.  ───────────────────────────────────────
     // recordPos is the log position of this record.
@@ -136,7 +136,20 @@ public:
     }
     [[nodiscard]] uint64_t lineageVersion() const noexcept { return lineageVersion_; }
 
+    // ── ISR v3 (level >= 2): the committed storage id of a node (NodeStorageRecord), 0 = none.  Installed at
+    //    COMMIT like every record, and rebuilt by replay (the MSM is rebuilt from the log, never snapshotted
+    //    with it).  A ControllerTermRecord is decoded and ignored. ─────────────────────────────────────────
+    [[nodiscard]] int64_t nodeStorage(int32_t node) const noexcept {
+        for (const auto& e : nodeStorage_) if (e.first == node) return e.second;
+        return 0;
+    }
+
 private:
+    /// ISR v3: committed node → storage id (a handful of nodes: a flat vector, capacity reserved once).
+    std::vector<std::pair<int32_t, int64_t>> nodeStorage_;
+    struct PendingStorage { int64_t pos; int32_t node; int64_t storageId; };
+    std::vector<PendingStorage> pendingStorage_;
+    void installStorage_(int32_t node, int64_t storageId);
     // Committed assignments (pos <= committedPos)
     AssignmentMap committed_;
 
@@ -268,6 +281,8 @@ void MetadataStateMachine::restore(Reader& r)
     pendingFeature_.clear();
     lineages_.clear();
     pendingLineage_.clear();
+    nodeStorage_.clear();     // ISR v3: an image carries no storage ids (like a v0 image's lineages)
+    pendingStorage_.clear();
     featureLevel_ = 0;
     ++lineageVersion_;
     ++committedVersion_;
@@ -297,7 +312,8 @@ void MetadataStateMachine::restore(Reader& r)
                 // (dev) binary with an unknown kind restores as no mark.
                 const int32_t kind = r.readInt32();
                 pa.mark.kind = (kind == static_cast<int32_t>(LeaderlessMark::Kind::EmptyMemoryLeader) ||
-                                kind == static_cast<int32_t>(LeaderlessMark::Kind::LogDirOffline))
+                                kind == static_cast<int32_t>(LeaderlessMark::Kind::LogDirOffline) ||
+                                kind == static_cast<int32_t>(LeaderlessMark::Kind::StorageReset))
                                    ? static_cast<LeaderlessMark::Kind>(kind)
                                    : LeaderlessMark::Kind::None;
             }

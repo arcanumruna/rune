@@ -2520,6 +2520,8 @@ void BrokerNode::buildGateway() {
             // ISR v3 Step 6: the first committed apply marks the MetadataLog class (set BEFORE the rebuild:
             // a restart over an existing log marks it too).
             metadataService_->setFirstApplyHook(&BrokerNode::markMetadataLogThunk_, this);
+            // ISR v3 Step 7: a wiped sole-ISR leader of a TRANSIENT partition keeps its lineage (single AND multi-node).
+            metadataService_->setTransientTopicPredicate(&BrokerNode::isTransientTopicTrampoline_, this);
             // Rebuild any previously committed assignments from the local Log.
             metadataService_->rebuildFromLog();
             // Kafka AlterPartition: this node's transport hands every AlterIsr it

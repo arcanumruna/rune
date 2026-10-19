@@ -43,6 +43,19 @@ void MetadataStateMachine::apply(const uint8_t* buf, std::size_t len, int64_t re
         return;
     }
 
+    if (static_cast<uint16_t>(*typeOpt) == kNodeStorageRecordType) {   // ISR v3
+        const auto rec = NodeStorageRecord::decode(buf, len);
+        if (!rec.has_value()) return;
+        if (recordPos <= committedPos_) installStorage_(rec->node, rec->storageId);
+        else pendingStorage_.push_back(PendingStorage{recordPos, rec->node, rec->storageId});
+        return;
+    }
+
+    if (static_cast<uint16_t>(*typeOpt) == kControllerTermRecordType) {   // ISR v3 R9: decoded, ignored
+        (void)ControllerTermRecord::decode(buf, len);
+        return;
+    }
+
     if (static_cast<uint16_t>(*typeOpt) == kRemoveTopicPlacementRecordType) {   // catalog history Task 8
         const auto rec = RemoveTopicPlacementRecord::decode(buf, len);
         if (!rec.has_value()) return;
@@ -190,6 +203,15 @@ void MetadataStateMachine::removeTopic_(int32_t topicId)
     if (lineage) ++lineageVersion_;
 }
 
+void MetadataStateMachine::installStorage_(int32_t node, int64_t storageId)
+{
+    for (auto& e : nodeStorage_) {
+        if (e.first == node) { e.second = storageId; ++committedVersion_; return; }
+    }
+    nodeStorage_.emplace_back(node, storageId);
+    ++committedVersion_;
+}
+
 void MetadataStateMachine::installLineage_(int64_t key, const TransientLineage& l)
 {
     auto [it, fresh] = lineages_.try_emplace(key, l);
@@ -211,6 +233,16 @@ void MetadataStateMachine::flushPending(int64_t upToPos)
             else pendingLineage_[kept++] = e;
         }
         pendingLineage_.resize(kept);
+    }
+    if (!pendingStorage_.empty()) {
+        std::sort(pendingStorage_.begin(), pendingStorage_.end(),
+                  [](const PendingStorage& a, const PendingStorage& b) { return a.pos < b.pos; });
+        std::size_t kept = 0;
+        for (auto& e : pendingStorage_) {
+            if (e.pos <= upToPos) installStorage_(e.node, e.storageId);
+            else pendingStorage_[kept++] = e;
+        }
+        pendingStorage_.resize(kept);
     }
     if (!pendingFeature_.empty()) {
         std::erase_if(pendingFeature_, [&](const std::pair<int64_t, int16_t>& f) {
@@ -252,6 +284,7 @@ void MetadataStateMachine::revert(int64_t toCommittedPos)
     // (uncommitted) records.
     std::erase_if(pendingFeature_, [&](const std::pair<int64_t, int16_t>& f) { return f.first > toCommittedPos; });
     std::erase_if(pendingLineage_, [&](const PendingLineage& e) { return e.pos > toCommittedPos; });
+    std::erase_if(pendingStorage_, [&](const PendingStorage& e) { return e.pos > toCommittedPos; });
     if (pending_.empty()) return;
 
     std::size_t kept = 0;

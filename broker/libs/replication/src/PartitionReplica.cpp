@@ -560,7 +560,7 @@ Offset PartitionReplica::append(std::span<const uint8_t> records, bool acksAll)
     // B1: a follower or an incomplete leader refuses EVERY append (acks=all or
     // not — the MetadataService's acks=false records too; every caller queues /
     // retries on a negative result, never ignores it).
-    if (!acceptsProduce()) [[unlikely]] return kAppendNotLeader;
+    if (!acceptsProduce() || appendRefusedForTest_) [[unlikely]] return kAppendNotLeader;
 
     if (!committedIsrMeetsMinIsr_(acksAll)) {
         return -1; // gated by min-ISR

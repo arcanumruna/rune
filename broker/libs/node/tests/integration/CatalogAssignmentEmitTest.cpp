@@ -1140,7 +1140,7 @@ struct CtlRig {
     /// `userTopics` false: no user topic, the coordinator partition (-1, 0)
     /// on the controller path only (a cluster with no user topics).
     std::vector<TopicSpec> topics{TopicSpec{0, 1, 3, "", "t"}};
-    explicit CtlRig(bool userTopics = true, std::vector<TopicSpec> ts = {}) {
+    explicit CtlRig(bool userTopics = true, std::vector<TopicSpec> ts = {}, int16_t supportedLevel = -1) {
         if (!ts.empty()) topics = std::move(ts);
         log1.recover(); log2.recover(); log3.recover();
         r1 = std::make_unique<PartitionReplica>(makeMetaCfg(1), Role::Leader, 1, all, all, &log1, &transport);
@@ -1150,6 +1150,7 @@ struct CtlRig {
         transport.addFollower(2, r2.get());
         transport.addFollower(3, r3.get());
         svc = std::make_unique<MetadataService>(r1.get(), 1);
+        if (supportedLevel >= 0) svc->setSupportedFeatureLevel(supportedLevel);   // ISR v3: a level-1 rig
         if (userTopics) {
             svc->configure(topics, all);
         } else {
@@ -1172,6 +1173,48 @@ struct CtlRig {
         drive(50);
     }
     const PartitionAssignment& pa() { return *svc->assignment(0, 0); }
+    const PartitionAssignment& paOf(int32_t topic, int32_t part = 0) { return *svc->assignment(topic, part); }
+    /// ISR v3 Step 7: tick with only `n` eligible until `topic` is led by `n` (the balancer fails over to n and
+    /// fences the others out of the ISR: leader n, ISR {n}).
+    void forceLeader(int32_t n, int32_t topic = 0) {
+        // At least one tick: when n already leads, the fencing pass still shrinks the ISR to {n}.
+        for (int i = 0; i < 10 && (i == 0 || paOf(topic).leaderNode != n); ++i) tick({n});
+        ASSERT_EQ(paOf(topic).leaderNode, n);
+        ASSERT_EQ(paOf(topic).isr, std::vector<int32_t>{n});
+    }
+    /// The leader of `topic` proposes pa().isr + n at pa().partitionEpoch (isrStorage all 0); n must end in the ISR.
+    /// A full-set tick first: forceLeader left only the forced node eligible.
+    void readmit(int32_t n, int32_t topic = 0) {
+        tick();
+        const auto& a = paOf(topic);
+        rune::replication::AlterIsrMsg m{};
+        m.topicId = topic; m.partition = 0; m.leaderId = a.leaderNode; m.leaderEpoch = a.leaderEpoch;
+        std::vector<int32_t> isr = a.isr;
+        isr.push_back(n);
+        m.isrCount = static_cast<int32_t>(isr.size());
+        for (std::size_t i = 0; i < isr.size(); ++i) m.isr[i] = isr[i];
+        m.partitionEpoch = a.partitionEpoch;
+        (void)svc->onAlterIsr(m);
+        drive(50);
+        const auto& b = paOf(topic);
+        ASSERT_TRUE(std::find(b.isr.begin(), b.isr.end(), n) != b.isr.end()) << "node " << n << " was not admitted";
+    }
+    /// Leader loss and regain on the SAME node (no new register).
+    void bounceLeadership() {
+        const int32_t e = r1->epoch();
+        r1->becomeFollower(e + 1, NodeId{-1});
+        drive(5);
+        r1->becomeLeader(e + 2, all);
+        r2->becomeFollower(e + 2, 1);
+        r3->becomeFollower(e + 2, 1);
+        drive(100);
+        ASSERT_TRUE(svc->controllerCaughtUpForTest());
+    }
+    /// One tick with a record budget (reassignDeadPartitionLeaders cannot pass one).
+    void tickMax(int maxRecords) {
+        (void)svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr, 1000, maxRecords);
+        drive(50);
+    }
     /// Shrink the committed ISR to {leader}.
     void soleIsr() {
         const auto& a = pa();
@@ -3885,4 +3928,474 @@ TEST(ControllerReclaimRegression, NoDecisionBeforeTheFirstClaimEdgeRegression) {
     g.drive(100);
     EXPECT_TRUE(g.svc1->controllerReady());
     EXPECT_NE(g.svc1->assignment(0, 0), nullptr) << "the claim places what was recorded before it";
+}
+
+// ===========================================================================
+// ISR v3 Step 7 - controller storage tracking.
+// ===========================================================================
+namespace {
+constexpr uint8_t kStorageOriginFounder = rune::replication::AlterIsrMsg::kStorageOriginFounder;
+constexpr uint8_t kStorageOriginLegacy  = rune::replication::AlterIsrMsg::kStorageOriginLegacy;
+constexpr uint8_t kStorageOriginJoiner  = rune::replication::AlterIsrMsg::kStorageOriginJoiner;
+
+/// A node-control register frame carrying storage `id` / `origin` and feature slot 2 (what ControlledShutdown sends).
+rune::replication::AlterIsrResponseMsg registerStorage(MetadataService& svc, int32_t node, int64_t id, uint8_t origin,
+                                                       int64_t nonce) {
+    using rune::replication::AlterIsrMsg;
+    AlterIsrMsg m = nodeControl(node, nonce, false);
+    m.isr[AlterIsrMsg::kNodeFeatureLevelSlot] = 2;
+    m.isr[AlterIsrMsg::kNodeStorageLoSlot]     = static_cast<int32_t>(static_cast<uint32_t>(static_cast<uint64_t>(id)));
+    m.isr[AlterIsrMsg::kNodeStorageHiSlot]     = static_cast<int32_t>(static_cast<uint32_t>(static_cast<uint64_t>(id) >> 32));
+    m.isr[AlterIsrMsg::kNodeStorageOriginSlot] = origin;
+    rune::replication::AlterIsrResponseMsg resp{};
+    bool answered = false;
+    (void)svc.onAlterIsr(m, &resp, &answered);
+    return resp;
+}
+
+struct LoggedRec { int64_t offset; uint16_t type; int32_t a; int32_t b; int64_t id; };   // 0x8004: a=node id=storage; assignment: a=topic b=partition
+/// Every 0x8004 / 0x8005 record and every assignment record in the metadata log, by offset.
+std::vector<LoggedRec> recordsInLog(rune::storage::Log& log) {
+    std::vector<LoggedRec> out;
+    int64_t off = 0;
+    while (off < log.logEndOffset()) {
+        const auto v = log.readView(off, 64 * 1024);
+        if (v.empty()) break;
+        std::size_t pos = 0;
+        int64_t next = off;
+        while (pos < v.len) {
+            rune::protocol::RecordBatchReader reader(v.data + pos, v.len - pos);
+            if (!reader.ensureValid()) break;
+            const int32_t tl = reader.totalLength();
+            if (tl <= 0 || static_cast<std::size_t>(tl) > v.len - pos) break;
+            reader.forEachRecord([&](std::string_view, std::string_view val, int64_t logOffset, int64_t) {
+                if (val.size() < 2) return;
+                const auto* b = reinterpret_cast<const uint8_t*>(val.data());
+                const uint16_t t = static_cast<uint16_t>(b[0] | (b[1] << 8));
+                if (t == rune::metadata::kNodeStorageRecordType) {
+                    const auto r = rune::metadata::NodeStorageRecord::decode(b, val.size());
+                    if (r) out.push_back({logOffset, t, r->node, 0, r->storageId});
+                } else if (t == rune::metadata::kControllerTermRecordType) {
+                    const auto r = rune::metadata::ControllerTermRecord::decode(b, val.size());
+                    if (r) out.push_back({logOffset, t, 0, 0, r->term});
+                } else if (const auto ty = rune::protocol::metadata::peekRecordType(b, val.size());
+                           ty && *ty == rune::protocol::metadata::MetadataRecordType::UpdatePartitionAssignment) {
+                    const auto r = rune::protocol::metadata::UpdatePartitionAssignmentRecord::decode(b, val.size());
+                    if (r) out.push_back({logOffset, 0x0002, r->topicId, r->partition, 0});
+                }
+            });
+            next = std::max<int64_t>(next, reader.baseOffset() + reader.lastOffsetDelta() + 1);
+            pos += static_cast<std::size_t>(tl);
+        }
+        if (next <= off) break;
+        off = next;
+    }
+    return out;
+}
+std::vector<LoggedRec> storageRecordsInLog(rune::storage::Log& log) {
+    std::vector<LoggedRec> out;
+    for (const auto& r : recordsInLog(log)) if (r.type == 0x8004 || r.type == 0x8005) out.push_back(r);
+    return out;
+}
+std::size_t count8004(rune::storage::Log& log) {
+    std::size_t n = 0;
+    for (const auto& r : storageRecordsInLog(log)) n += r.type == 0x8004 ? 1 : 0;
+    return n;
+}
+int64_t last8005(rune::storage::Log& log) {
+    int64_t o = -1;
+    for (const auto& r : storageRecordsInLog(log)) if (r.type == 0x8005) o = r.offset;
+    return o;
+}
+int64_t only8004(rune::storage::Log& log) {
+    int64_t o = -1;
+    for (const auto& r : storageRecordsInLog(log)) if (r.type == 0x8004) o = r.offset;
+    return o;
+}
+int64_t lastAssignment(rune::storage::Log& log, int32_t topic) {
+    int64_t o = -1;
+    for (const auto& r : recordsInLog(log)) if (r.type == 0x0002 && r.a == topic) o = r.offset;
+    return o;
+}
+/// The leader of (topic, 0) proposes `isr` with per-member storage captures; returns {accepted, errorCode, answered}.
+struct ProposeResult { bool accepted; int16_t error; bool answered; };
+ProposeResult proposeWithCapture(CtlRig& c, std::vector<int32_t> isr, std::map<int32_t, int64_t> caps, int32_t topic = 0,
+                                 bool drive = true) {
+    const auto& a = c.paOf(topic);
+    rune::replication::AlterIsrMsg m{};
+    m.topicId = topic; m.partition = 0; m.leaderId = a.leaderNode; m.leaderEpoch = a.leaderEpoch;
+    m.isrCount = static_cast<int32_t>(isr.size());
+    for (std::size_t i = 0; i < isr.size(); ++i) {
+        m.isr[i] = isr[i];
+        const auto it = caps.find(isr[i]);
+        m.isrStorage[i] = it == caps.end() ? 0 : it->second;
+    }
+    m.partitionEpoch = a.partitionEpoch;
+    rune::replication::AlterIsrResponseMsg resp{};
+    bool answered = false;
+    const bool ok = c.svc->onAlterIsr(m, &resp, &answered);
+    if (drive) c.drive(50);
+    return {ok, resp.errorCode, answered};
+}
+bool isrHasNode(const PartitionAssignment& pa, int32_t n) { return std::find(pa.isr.begin(), pa.isr.end(), n) != pa.isr.end(); }
+/// Two topics, topic 0 led by a node != 3 and topic 1 led by 3, node 3 in both ISRs (the full replica set in each).
+void twoTopicsWithNode3Everywhere(CtlRig& c) {
+    c.forceLeader(3, 1);                 // both topics: leader 3, ISR {3}
+    for (int32_t t : {0, 1}) { c.readmit(1, t); c.readmit(2, t); }
+    ASSERT_EQ(c.paOf(0).isr.size(), 3u);
+    ASSERT_EQ(c.paOf(1).isr.size(), 3u);
+    (void)c.svc->onAlterIsr(c.bump());   // topic 0's leader (3) asks for a new epoch: another ISR member leads, 3 leaves
+    c.tick();
+    ASSERT_NE(c.paOf(0).leaderNode, 3);
+    c.readmit(3, 0);
+    ASSERT_TRUE(isrHasNode(c.paOf(0), 3));
+    ASSERT_EQ(c.paOf(1).leaderNode, 3);
+    ASSERT_TRUE(isrHasNode(c.paOf(1), 3));
+}
+}  // namespace
+
+// B-C1: a node WITHOUT a committed storage is still admitted (the check applies only when one is committed).
+// RED: the strict `cap == 0 -> mismatch` clause.
+TEST(StorageRegistrationRegression, NodeWithoutACommittedStorageIsStillAdmittedRegression) {
+    CtlRig c;
+    c.soleIsr();
+    const int32_t n = c.pa().leaderNode == 1 ? 2 : 1;
+    c.readmit(n);
+    EXPECT_TRUE(isrHasNode(c.pa(), n));
+}
+
+// Trust on first use: Legacy and Founder storages commit without any strip.  RED: strip Legacy.
+TEST(StorageRegistrationRegression, LegacyAndFounderAreTrustedOnFirstUseRegression) {
+    CtlRig c;
+    const int32_t pe = c.pa().partitionEpoch;
+    (void)registerStorage(*c.svc, 2, 0xA, kStorageOriginLegacy, 7);
+    c.drive(50);
+    EXPECT_EQ(c.svc->msmForTest().nodeStorage(2), 0xA);
+    EXPECT_EQ(c.pa().partitionEpoch, pe) << "a trust-on-first-use registration stripped the node";
+    (void)registerStorage(*c.svc, 3, 0xC, kStorageOriginFounder, 8);
+    c.drive(50);
+    EXPECT_EQ(c.svc->msmForTest().nodeStorage(3), 0xC);
+    EXPECT_EQ(c.pa().partitionEpoch, pe);
+}
+
+// A Joiner is stripped from EVERY ISR and leadership BEFORE its storage commits (I-S2): the strips precede the single
+// NodeStorageRecord in the log.  RED: queue the NodeStorageRecord in noteStorageRegistration_ itself.
+TEST(StorageRegistrationRegression, JoinerIsStrippedFromEveryIsrBeforeItsStorageCommitsRegression) {
+    CtlRig c(true, {TopicSpec{0, 1, 3, "", "t0"}, TopicSpec{1, 1, 3, "", "t1"}});
+    twoTopicsWithNode3Everywhere(c);
+    const int32_t l0 = c.paOf(0).leaderNode;
+    const int32_t le1 = c.paOf(1).leaderEpoch;
+    (void)registerStorage(*c.svc, 3, 0xB, kStorageOriginJoiner, 9);
+    c.tick(); c.drive(100);   // the strips
+    EXPECT_FALSE(isrHasNode(c.paOf(0), 3));
+    EXPECT_EQ(c.paOf(0).leaderNode, l0) << "a follower's strip changed the leader";
+    EXPECT_FALSE(isrHasNode(c.paOf(1), 3));
+    EXPECT_TRUE(c.paOf(1).leaderNode == 1 || c.paOf(1).leaderNode == 2);
+    EXPECT_EQ(c.paOf(1).leaderEpoch, le1 + 1);
+    EXPECT_EQ(c.svc->msmForTest().nodeStorage(3), 0) << "committed before the node left every ISR";
+    c.tick(); c.drive(100);   // the confirmation (the map names the node nowhere now)
+    EXPECT_EQ(count8004(c.log1), 1u);
+    EXPECT_EQ(c.svc->msmForTest().nodeStorage(3), 0xB);
+    const int64_t at = only8004(c.log1);
+    EXPECT_LT(lastAssignment(c.log1, 0), at);
+    EXPECT_LT(lastAssignment(c.log1, 1), at);
+}
+
+// The catalog partition (-6) is stripped like a user partition, and the confirmation waits for it.  (fenceIsrs_ removes
+// the same follower from the ISR, so the strip pass alone cannot be isolated here: the test pins the OUTCOME - no
+// partition names the node, and its storage commits.)
+TEST(StorageRegistrationRegression, CatalogPartitionIsStrippedTooRegression) {
+    CtlRig c(false);
+    c.svc->setCoordinatorPartitions({{-1, 0}, {-6, 0}}, c.all);
+    c.drive(50);
+    c.tick();
+    ASSERT_NE(c.svc->assignment(-6, 0), nullptr);
+    ASSERT_TRUE(isrHasNode(*c.svc->assignment(-6, 0), 3));
+    (void)registerStorage(*c.svc, 3, 0xB, kStorageOriginJoiner, 9);
+    c.tick(); c.tick(); c.drive(100);
+    EXPECT_FALSE(isrHasNode(*c.svc->assignment(-6, 0), 3));
+    EXPECT_FALSE(isrHasNode(*c.svc->assignment(-1, 0), 3));
+    EXPECT_EQ(c.svc->msmForTest().nodeStorage(3), 0xB);
+}
+
+// The sole in-sync leader loses its storage: the partition goes leaderless WITHOUT it in the lineage and is NOT
+// re-elected by the next ticks.  RED: let the balancer's record through (its no-survivor rule keeps {3}).
+TEST(StorageRegistrationRegression, SoleIsrLeaderWithLostStorageGoesLeaderlessWithoutItInTheLineageRegression) {
+    CtlRig c;
+    c.forceLeader(3);
+    (void)registerStorage(*c.svc, 3, 0xB, kStorageOriginJoiner, 9);
+    c.tick(); c.drive(100);
+    ASSERT_EQ(c.pa().leaderNode, rune::metadata::NO_LEADER);
+    EXPECT_TRUE(c.pa().isr.empty());
+    EXPECT_EQ(c.pa().mark.kind, LeaderlessMark::Kind::StorageReset);
+    EXPECT_EQ(c.pa().mark.node, 3);
+    for (int i = 0; i < 3; ++i) c.tick();
+    EXPECT_EQ(c.pa().leaderNode, rune::metadata::NO_LEADER) << "the wiped node was re-elected";
+}
+
+// A-I10: a TRANSIENT partition keeps its lineage ({3}) and the empty-memory mark.  RED: StorageReset for every partition.
+TEST(StorageRegistrationRegression, WipedSoleLeaderOfATransientPartitionKeepsItsLineageRegression) {
+    CtlRig c;
+    c.svc->setTransientTopicPredicate(+[](void*, int32_t t) noexcept { return t == 0; }, nullptr);
+    c.forceLeader(3);
+    (void)registerStorage(*c.svc, 3, 0xB, kStorageOriginJoiner, 9);
+    c.tick(); c.drive(100);
+    ASSERT_EQ(c.pa().leaderNode, rune::metadata::NO_LEADER);
+    EXPECT_EQ(c.pa().isr, std::vector<int32_t>{3});
+    EXPECT_EQ(c.pa().mark.kind, LeaderlessMark::Kind::EmptyMemoryLeader);
+}
+
+// A NO_LEADER lineage {3} drops the reset node.  RED: skip NO_LEADER partitions in the strip.
+TEST(StorageRegistrationRegression, LeaderlessLineageDropsTheResetNodeRegression) {
+    CtlRig c;
+    c.forceLeader(3);
+    c.tick({1, 2});   // 3 dead: no survivor -> NO_LEADER, lineage {3}
+    ASSERT_EQ(c.pa().leaderNode, rune::metadata::NO_LEADER);
+    ASSERT_EQ(c.pa().isr, std::vector<int32_t>{3});
+    (void)registerStorage(*c.svc, 3, 0xB, kStorageOriginJoiner, 9);
+    c.tick({1, 2}); c.drive(100);
+    EXPECT_TRUE(c.pa().isr.empty());
+}
+
+// M13: a pending node is erased from eligible_ AT registration, so an AlterIsr adding it before the next tick is
+// refused.  RED: no erase from eligible_ at registration.
+TEST(StorageRegistrationRegression, PendingNodeIsNeverAddedNorElectedRegression) {
+    CtlRig c;
+    c.forceLeader(1);
+    c.tick();   // the full live set: eligible_ = {1,2,3}
+    (void)registerStorage(*c.svc, 3, 0xB, kStorageOriginJoiner, 9);   // NO tick
+    const auto r = proposeWithCapture(c, {1, 3}, {});
+    EXPECT_TRUE(r.answered);
+    EXPECT_EQ(r.error, rune::replication::kAlterIsrIneligibleReplica);
+    EXPECT_FALSE(isrHasNode(c.pa(), 3));
+}
+
+// A proposal captured under the OLD storage is Ineligible once the new one is committed; the new capture is admitted.
+// Decided by a SUCCESSOR controller that never saw the node's registration (its `live` storage is unknown), so only
+// the committed clause can refuse.  RED: no committed clause.
+TEST(StorageRegistrationRegression, StaleProposalCapturedUnderTheOldStorageIsIneligibleRegression) {
+    CtlRig c;
+    (void)registerStorage(*c.svc, 3, 0xB, kStorageOriginJoiner, 9);
+    for (int i = 0; i < 6 && c.svc->msmForTest().nodeStorage(3) != 0xB; ++i) c.tick();
+    ASSERT_EQ(c.svc->msmForTest().nodeStorage(3), 0xB);
+    Failover f(c);
+    ASSERT_TRUE(f.svc2.controllerCaughtUpForTest());
+    f.tick();   // the successor learns the live set; node 3 is effective again
+    ASSERT_FALSE(isrHasNode(f.pa(), 3));
+    const auto propose = [&](int64_t cap) {
+        const auto& a = f.pa();
+        rune::replication::AlterIsrMsg m{};
+        m.topicId = 0; m.partition = 0; m.leaderId = a.leaderNode; m.leaderEpoch = a.leaderEpoch;
+        m.isrCount = static_cast<int32_t>(a.isr.size()) + 1;
+        std::size_t i = 0;
+        for (int32_t n : a.isr) m.isr[i++] = n;
+        m.isr[i] = 3; m.isrStorage[i] = cap;
+        m.partitionEpoch = a.partitionEpoch;
+        rune::replication::AlterIsrResponseMsg resp{};
+        bool answered = false;
+        const bool ok = f.svc2.onAlterIsr(m, &resp, &answered);
+        f.drive(50);
+        return ProposeResult{ok, resp.errorCode, answered};
+    };
+    const auto stale = propose(0xA);
+    EXPECT_EQ(stale.error, rune::replication::kAlterIsrIneligibleReplica);
+    EXPECT_FALSE(isrHasNode(f.pa(), 3));
+    EXPECT_TRUE(propose(0xB).accepted);
+    EXPECT_TRUE(isrHasNode(f.pa(), 3));
+}
+
+// A-M2: a proposal under a storage the node DISOWNED (it registered a newer one) is Ineligible before the strip even
+// runs.  eligible_ is re-added for the test so only the `live` clause can refuse.  RED: drop the `live` clause.
+TEST(StorageRegistrationRegression, ProposalUnderADisownedStorageIsIneligibleBeforeTheStripRegression) {
+    CtlRig c;
+    (void)registerStorage(*c.svc, 3, 0xA, kStorageOriginLegacy, 7);
+    c.drive(50);
+    ASSERT_EQ(c.svc->msmForTest().nodeStorage(3), 0xA);
+    c.forceLeader(1);
+    c.tick();
+    (void)registerStorage(*c.svc, 3, 0xB, kStorageOriginJoiner, 10);   // no tick
+    c.svc->eligibleInsertForTest(3);
+    const auto r = proposeWithCapture(c, {1, 3}, {{3, 0xA}});
+    EXPECT_EQ(r.error, rune::replication::kAlterIsrIneligibleReplica);
+    EXPECT_FALSE(isrHasNode(c.pa(), 3));
+}
+
+// A-M1: an in-flight record that names only OTHER nodes never blocks the confirmation.  RED: block on any in-flight
+// record of a partition the node replicates.
+TEST(StorageRegistrationRegression, UnrelatedInFlightRecordNeverBlocksConfirmationRegression) {
+    CtlRig c(true, {TopicSpec{0, 1, 3, "", "t0"}, TopicSpec{1, 1, 3, "", "t1"}});
+    ASSERT_TRUE(proposeWithCapture(c, {1, 2}, {}, /*topic=*/1).accepted);   // topic 1: ISR {1,2}; topic 0 keeps {1,2,3}
+    ASSERT_TRUE(isrHasNode(c.paOf(0), 3));
+    (void)registerStorage(*c.svc, 3, 0xB, kStorageOriginJoiner, 9);
+    c.tick();   // strips topic 0
+    ASSERT_FALSE(isrHasNode(c.paOf(0), 3));
+    ASSERT_FALSE(isrHasNode(c.paOf(1), 3));
+    // A shrink of topic 1 to {1}: accepted and NOT driven - in flight, naming only {1}.
+    ASSERT_TRUE(proposeWithCapture(c, {1}, {}, 1, /*drive=*/false).accepted);
+    const std::size_t before = count8004(c.log1);
+    (void)c.svc->reassignDeadPartitionLeaders({1, 2, 3}, 0);   // the tick, without the drive
+    c.drive(50);
+    EXPECT_GT(count8004(c.log1), before) << "an unrelated in-flight record blocked the confirmation";
+}
+
+// v2-review I4: an in-flight record that ADDS the node blocks its confirmation; after it commits the node is stripped
+// again and then confirmed.  RED: namesNodeInFlightOrQueued_ checks queued records only.
+TEST(StorageRegistrationRegression, InFlightExpansionAddingTheNodeBlocksConfirmationRegression) {
+    CtlRig c;
+    c.forceLeader(1);
+    c.tick();
+    ASSERT_TRUE(proposeWithCapture(c, {1, 3}, {}, 0, /*drive=*/false).accepted);   // accepted, in flight, names 3
+    (void)registerStorage(*c.svc, 3, 0xB, kStorageOriginJoiner, 9);
+    (void)c.svc->reassignDeadPartitionLeaders({1, 2, 3}, 0);   // tick, no drive: the expansion is still in flight
+    EXPECT_EQ(count8004(c.log1), 0u) << "confirmed while an in-flight record names the node";
+    c.drive(50);                                                  // the expansion commits
+    EXPECT_TRUE(isrHasNode(c.pa(), 3));
+    c.tick(); c.drive(100);                                       // stripped again
+    EXPECT_FALSE(isrHasNode(c.pa(), 3));
+    c.tick(); c.drive(100);                                       // then confirmed
+    EXPECT_EQ(count8004(c.log1), 1u);
+    EXPECT_LT(lastAssignment(c.log1, 0), only8004(c.log1));
+}
+
+// A-I2: the same controller regaining leadership rebuilds the strip from the registrations it holds (no new register).
+// RED: no replay in maybeCatchUp_.
+TEST(StorageRegistrationRegression, SameControllerRegainingLeadershipRebuildsTheStripRegression) {
+    CtlRig c(true, {TopicSpec{0, 1, 3, "", "t0"}, TopicSpec{1, 1, 3, "", "t1"}});
+    ASSERT_TRUE(isrHasNode(c.paOf(0), 3));
+    ASSERT_TRUE(isrHasNode(c.paOf(1), 3));
+    (void)registerStorage(*c.svc, 3, 0xB, kStorageOriginJoiner, 9);
+    c.tickMax(1);   // one strip
+    c.bounceLeadership();
+    c.tick(); c.drive(100);   // the second strip
+    EXPECT_FALSE(isrHasNode(c.paOf(0), 3));
+    EXPECT_FALSE(isrHasNode(c.paOf(1), 3));
+    c.tick(); c.drive(100);   // the confirmation
+    EXPECT_EQ(c.svc->msmForTest().nodeStorage(3), 0xB);
+}
+
+// A late frame of a dead process never erases the live process's strip, and the live process is told it was
+// superseded.  The late frame carries a nonce this controller never saw (the controller keeps its node-control
+// identities across a bounce, so a SEEN dead nonce is rejected before the table).  RED: erase on committed == reported
+// without the nonce check.
+TEST(StorageRegistrationRegression, LateFrameOfTheDeadProcessNeverErasesTheStripRegression) {
+    CtlRig c;
+    (void)registerStorage(*c.svc, 3, 0xA, kStorageOriginLegacy, 11);
+    c.drive(50);
+    ASSERT_EQ(c.svc->msmForTest().nodeStorage(3), 0xA);
+    c.bounceLeadership();
+    (void)registerStorage(*c.svc, 3, 0xB, kStorageOriginJoiner, 12);
+    (void)registerStorage(*c.svc, 3, 0xA, kStorageOriginLegacy, 13);   // the late frame (committed 0xA == reported)
+    EXPECT_STREQ(c.svc->storageRegStateForTest(3), "Stripping");
+    const auto& el = c.svc->eligibleForTest();
+    EXPECT_EQ(std::count(el.begin(), el.end(), 3), 0);
+    const auto resp = registerStorage(*c.svc, 3, 0xB, kStorageOriginJoiner, 12);
+    EXPECT_EQ(resp.errorCode, rune::replication::AlterIsrMsg::kNodeSuperseded);
+}
+
+// A-I2 / v2-review I9: a successor controller redoes an interrupted strip from the registration it is told again.
+// RED: skip registration when any strip record already exists in the committed map.
+TEST(StorageRegistrationRegression, SuccessorControllerRedoesAnInterruptedStripRegression) {
+    CtlRig c(true, {TopicSpec{0, 1, 3, "", "t0"}, TopicSpec{1, 1, 3, "", "t1"}});
+    (void)registerStorage(*c.svc, 3, 0xB, kStorageOriginJoiner, 9);
+    c.tickMax(1);   // one strip
+    Failover f(c);
+    ASSERT_TRUE(f.svc2.controllerCaughtUpForTest());
+    (void)registerStorage(f.svc2, 3, 0xB, kStorageOriginJoiner, 9);
+    f.tick();       // the remaining strip
+    f.tick();       // the confirmation
+    EXPECT_EQ(f.svc2.msmForTest().nodeStorage(3), 0xB);
+    EXPECT_EQ(count8004(c.log2), 1u);
+}
+
+// R10: below feature level 2 nothing is decided; raising the level replays the registrations.  RED: no level check.
+TEST(StorageRegistrationRegression, NothingIsDecidedBelowFeatureLevelTwoRegression) {
+    CtlRig c(true, {}, rune::replication::MetadataFeature::kBase);
+    ASSERT_LT(c.svc->featureLevel(), 2);
+    c.svc->setClusterMembers({1, 2, 3});
+    (void)registerStorage(*c.svc, 3, 0xB, kStorageOriginJoiner, 9);
+    c.tick(); c.drive(50);
+    EXPECT_EQ(count8004(c.log1), 0u);
+    EXPECT_TRUE(isrHasNode(c.pa(), 3));
+    c.svc->setSupportedFeatureLevel(rune::replication::MetadataFeature::kLatest);
+    (void)registerStorage(*c.svc, 1, 0x11, kStorageOriginLegacy, 21);
+    (void)registerStorage(*c.svc, 2, 0x12, kStorageOriginLegacy, 22);
+    (void)registerStorage(*c.svc, 3, 0xB, kStorageOriginJoiner, 9);
+    for (int i = 0; i < 20 && c.svc->featureLevel() < 2; ++i) c.drive(50);
+    ASSERT_EQ(c.svc->featureLevel(), 2);
+    c.tick(); c.drive(100);
+    c.tick(); c.drive(100);
+    EXPECT_FALSE(isrHasNode(c.pa(), 3));
+    EXPECT_EQ(c.svc->msmForTest().nodeStorage(3), 0xB);
+}
+
+// A second disk loss before the confirmation restarts the strip under the NEW storage; the first one is never committed.
+// RED: keep the first entry.
+TEST(StorageRegistrationRegression, SecondDiskLossBeforeConfirmationRestartsTheStripRegression) {
+    CtlRig c(true, {TopicSpec{0, 1, 3, "", "t0"}, TopicSpec{1, 1, 3, "", "t1"}});
+    (void)registerStorage(*c.svc, 3, 0xB, kStorageOriginJoiner, 9);
+    c.tickMax(1);
+    (void)registerStorage(*c.svc, 3, 0xC, kStorageOriginJoiner, 11);
+    c.tick(); c.drive(100);
+    c.tick(); c.drive(100);
+    EXPECT_EQ(c.svc->msmForTest().nodeStorage(3), 0xC);
+    for (const auto& r : storageRecordsInLog(c.log1)) EXPECT_FALSE(r.type == 0x8004 && r.id == 0xB) << "the first storage was committed";
+}
+
+// B-I7: a confirmation record that was lost (truncated) is re-decided: Committing -> Stripping -> a new record.
+// RED: no re-queue in pruneStorageRegs_.
+TEST(StorageRegistrationRegression, LostConfirmationRecordIsRequeuedRegression) {
+    CtlRig c;
+    c.svc->dropNextStorageAppendForTest();
+    (void)registerStorage(*c.svc, 3, 0xB, kStorageOriginJoiner, 9);
+    c.tick(); c.drive(100);   // the strip
+    c.tick(); c.drive(100);   // the confirmation is decided and lost
+    EXPECT_EQ(c.svc->msmForTest().nodeStorage(3), 0);
+    EXPECT_STREQ(c.svc->storageRegStateForTest(3), "Committing");
+    c.tick(); c.drive(50);
+    c.tick(); c.drive(50);
+    EXPECT_EQ(c.svc->msmForTest().nodeStorage(3), 0xB);
+    EXPECT_GE(c.svc->storageConfirmRequeuedForTest(), 1u);
+}
+
+// A lost trust-on-first-use record is re-queued by the next register (committed == 0).  RED: "unless queued or in
+// flight" without the committed == 0 re-queue (a register never queues twice).
+TEST(StorageRegistrationRegression, LostTrustOnFirstUseRecordIsRequeuedByTheNextRegisterRegression) {
+    CtlRig c;
+    c.svc->dropNextStorageAppendForTest();
+    (void)registerStorage(*c.svc, 2, 0xA, kStorageOriginLegacy, 5);
+    c.drive(50);
+    EXPECT_EQ(c.svc->msmForTest().nodeStorage(2), 0);
+    (void)registerStorage(*c.svc, 2, 0xA, kStorageOriginLegacy, 5);   // the same process re-registers
+    c.drive(50);
+    EXPECT_EQ(c.svc->msmForTest().nodeStorage(2), 0xA);
+}
+
+// v2-review I9: a confirmation queued in an earlier term is never appended in a later one.
+// RED: keep pendingStorageRecords_ across the leader loss.
+TEST(StorageRegistrationRegression, ConfirmationQueuedInAnEarlierTermIsNeverAppendedLaterRegression) {
+    CtlRig c;
+    (void)registerStorage(*c.svc, 3, 0xB, kStorageOriginJoiner, 9);
+    c.tick(); c.drive(100);   // strip: no partition names 3 any more
+    ASSERT_FALSE(isrHasNode(c.pa(), 3));
+    c.r1->setAppendRefusedForTest(true);
+    (void)c.svc->reassignDeadPartitionLeaders({1, 2, 3}, 0);   // the confirmation is queued; its append is refused
+    c.drive(20);
+    ASSERT_EQ(count8004(c.log1), 0u);
+    c.r1->setAppendRefusedForTest(false);
+    c.bounceLeadership();
+    c.tick(); c.drive(100);
+    EXPECT_EQ(count8004(c.log1), 1u) << "the stale queued record was appended as well";
+    EXPECT_GT(only8004(c.log1), last8005(c.log1)) << "the confirmation predates the regained term's record";
+    EXPECT_EQ(c.svc->msmForTest().nodeStorage(3), 0xB);
+}
+
+// v2-review I9: halt() clears the storage soft state.  RED: no clear in halt().
+TEST(StorageRegistrationRegression, HaltClearsTheStorageSoftStateRegression) {
+    CtlRig c;
+    (void)registerStorage(*c.svc, 3, 0xB, kStorageOriginJoiner, 9);
+    ASSERT_STREQ(c.svc->storageRegStateForTest(3), "Stripping");
+    ASSERT_EQ(c.svc->storagePendingCount(), 1u);
+    c.svc->halt();
+    EXPECT_STREQ(c.svc->storageRegStateForTest(3), "None");
+    EXPECT_EQ(c.svc->storagePendingCount(), 0u);
 }
