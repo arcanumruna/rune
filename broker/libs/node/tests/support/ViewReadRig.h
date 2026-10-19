@@ -154,7 +154,6 @@ public:
             owned.push_back(src.get());
             pool.worker(0).setOwnedDirect(owned);
             pool.worker(0).setViewSet(vs.get());
-            pool.coLocateViewWithSource(kViewTopic, kSrcTopic);
         }
         // 7. the gateway
         registry = std::make_unique<rune::gateway::TopicRegistry>(std::vector<rune::node::TopicSpec>{}, dir_ + "/reg");

@@ -163,7 +163,8 @@ public:
     // The catalog view of an id.  Serving = a static or catalog topic that
     // serves; Pending = applied, waiting behind a drop; Dropped = dropped here;
     // Unknown = never registered here, or a Gap.
-    enum class TopicState : uint8_t { Unknown, Serving, Pending, Dropped };
+    ///   ViewSink = a view's replica-less catalog-only sink (VLS B.2): no logs, no dirs, never a data-plane target.
+    enum class TopicState : uint8_t { Unknown, Serving, Pending, Dropped, ViewSink };
     [[nodiscard]] TopicState state(int32_t topicId) const noexcept {
         const Slot* sl = slot_(topicId);
         if (sl == nullptr) return TopicState::Unknown;
@@ -172,8 +173,21 @@ public:
             case kServingIdx: return TopicState::Serving;
             case kPendingIdx: return TopicState::Pending;
             case kDroppedIdx: return TopicState::Dropped;
+            case kViewSinkIdx: return TopicState::ViewSink;
             default:          return TopicState::Unknown;   // Gap
         }
+    }
+
+    /// VLS B.3: is the id a view sink?  O(1); the gateway front's refusal test for every data-plane op.
+    [[nodiscard]] bool isViewSink(int32_t topicId) const noexcept {
+        const Slot* sl = slot_(topicId);
+        return sl != nullptr && sl->index() == kViewSinkIdx;
+    }
+    /// A view sink's spec (partitions, key field, name); nullptr for any other slot.
+    [[nodiscard]] const rune::node::TopicSpec* viewSinkSpec(int32_t topicId) const noexcept {
+        const Slot* sl = slot_(topicId);
+        const auto* v = sl != nullptr ? std::get_if<ViewSink>(sl) : nullptr;
+        return v != nullptr ? &v->spec : nullptr;
     }
 
     /// A catalog-applied topic (createTopicAt) that serves only once its
@@ -240,7 +254,9 @@ private:
         rune::node::TopicSpec       spec;
         std::vector<PartitionEntry> partitions;
     };
-    using Slot = std::variant<Static, Serving, Pending, Gap, Dropped>;
+    struct ViewSink { rune::node::TopicSpec spec; };   // VLS B.2: id, name, partitions, key field -- nothing else
+    using Slot = std::variant<Static, Serving, Pending, Gap, Dropped, ViewSink>;
+    static constexpr std::size_t kViewSinkIdx = 5;
     static constexpr std::size_t kStaticIdx  = 0;
     static constexpr std::size_t kServingIdx = 1;
     static constexpr std::size_t kPendingIdx = 2;

@@ -2670,7 +2670,7 @@ void BrokerNode::buildGateway() {
                 const auto rf = static_cast<int16_t>(
                     std::max(1, static_cast<int>(allNodeIds.size())));
                 for (const auto& ts : bootTopics_) {
-                    if (ts.topicId < 0) continue; // skip internal topics
+                    if (ts.topicId < 0 || ts.viewSink) continue; // skip internal topics and view sinks (no replica)
                     rune::metadata::TopicSpec bs;
                     bs.topicId          = ts.topicId;
                     bs.partitionCount   = ts.partitionCount;
@@ -3666,7 +3666,9 @@ void BrokerNode::bootFromCatalog_() {
         rune::protocol::TopicConfig c;
         c.cleanupPolicy = 1;   // Compact
         c.partitionKey  = sp.keyField;
-        catalogTopics.push_back(bootSpecOfFrame(sp.topicId, sp.name, sp.partitions, /*rf*/0, sp.persistence, c));
+        TopicSpec bs = bootSpecOfFrame(sp.topicId, sp.name, sp.partitions, /*rf*/0, sp.persistence, c);
+        bs.viewSink = true;   // VLS B.2: catalog-only -- no dir, no log, no replica
+        catalogTopics.push_back(std::move(bs));
     };
     const int replayed = bootApplier_->replayLocal(*catalogLog_, BootEffects{std::move(sink)});   // throws: refuse boot
     if (replayed >= 0) ++bootReplays_;
@@ -4472,7 +4474,6 @@ void BrokerNode::fanoutViewPlan_(ViewPlanUpdateMsg msg) {
     } else if (auto plan = rune::view::deserializeCompiledViewPlan(msg.planBlob);
                plan && !plan->sourceTopicId.empty()) {
         if (gateway_) gateway_->noteViewSource(msg.viewTopicId, plan->sourceTopicId[0]);
-        if (workerPool_) workerPool_->coLocateViewWithSource(msg.viewTopicId, plan->sourceTopicId[0]);
     }
     viewFanoutBacklog_.push_back(ViewFanoutPending{std::move(msg), 0});
     (void)pumpViewFanout_();
@@ -5324,6 +5325,7 @@ void BrokerNode::onCatalogTopicApplied_(const uint8_t* p, std::size_t n, bool is
     // learn the object at the moment the catalog effect is applied here (idempotent), before it is built.
     if (gateway_) gateway_->onCatalogObjectApplied(m.topicId, m.name, isView);
     TopicSpec spec = topicSpecFromCatalog(m);
+    spec.viewSink = isView;   // VLS B.2
     // Step 3: a create whose name a dropped topic still holds (its dir not renamed
     // away yet) waits — FIFO per name, behind any create of that name already waiting.
     bool behind = catalogNameHeldByDrop_(spec.name);
@@ -5365,6 +5367,7 @@ void BrokerNode::runCatalogCreate_(const TopicSpec& spec) {
             throw std::runtime_error("injected replica-build fault (test)");
         const int32_t id = topicRegistry_->createTopicAt(spec.topicId, spec);   // idempotent (same id + name)
         if (id < 0) return;                                                      // refused (logged)
+        if (spec.viewSink) return;   // VLS B.2: a sink owns no replica, no group, no assignment -- the registry slot is all
         if (const TopicSpec* built = topicRegistry_->topic(id)) {
             // C1: install the group key BEFORE the replicas register (an owner never moves).  Catalog effects are
             // drained by the control loop only after buildWorkerPool() in start(), so workerPool_ is set here.
@@ -5396,6 +5399,12 @@ void BrokerNode::dropRuntimeTopic_(int32_t topicId, const std::string& name) {
     }
     if (!topicRegistry_) return;
 
+    if (topicRegistry_->isViewSink(topicId)) {   // VLS B.2: nothing to retire -- no replica, no log, no dir
+        (void)topicRegistry_->dropTopic(topicId);
+        if (gateway_) (void)gateway_->endTopicSubscriptions(topicId);
+        runPendingCreatesBehindDrop_();   // its name is free now
+        return;
+    }
     const TopicSpec* spec = topicRegistry_->topic(topicId);
     if (spec == nullptr) {   // unknown / gap / already dropped: the same effect again (idempotent)
         if (topicRegistry_->state(topicId) == rune::gateway::TopicRegistry::TopicState::Unknown)
@@ -5453,6 +5462,23 @@ void BrokerNode::dropRuntimeTopic_(int32_t topicId, const std::string& name) {
     droppedAwaitingRetire_.push_back(std::move(d));
 }
 
+void BrokerNode::runPendingCreatesBehindDrop_() {
+    if (pendingCreatesBehindDrop_.empty()) return;
+    {
+        // Step 3: run, in arrival order, every waiting create whose name no drop
+        // holds any more (a later create of a still-held name keeps waiting).
+        std::vector<PendingCreateBehindDrop> waiting;
+        waiting.swap(pendingCreatesBehindDrop_);
+        for (auto& pc : waiting) {
+            bool held = catalogNameHeldByDrop_(pc.spec.name);
+            for (const auto& q : pendingCreatesBehindDrop_)
+                held = held || q.spec.name == pc.spec.name || rune::catalog::topicNamesFoldEqual(q.spec.name, pc.spec.name);
+            if (held) pendingCreatesBehindDrop_.push_back(std::move(pc));
+            else      runCatalogCreate_(pc.spec);
+        }
+    }
+}
+
 int BrokerNode::serviceDroppedTopics_() {
     namespace fs = std::filesystem;
     int work = 0;
@@ -5501,19 +5527,7 @@ int BrokerNode::serviceDroppedTopics_() {
         renamed = true;
         ++work;
     }
-    if (renamed && !pendingCreatesBehindDrop_.empty()) {
-        // Step 3: run, in arrival order, every waiting create whose name no drop
-        // holds any more (a later create of a still-held name keeps waiting).
-        std::vector<PendingCreateBehindDrop> waiting;
-        waiting.swap(pendingCreatesBehindDrop_);
-        for (auto& pc : waiting) {
-            bool held = catalogNameHeldByDrop_(pc.spec.name);
-            for (const auto& q : pendingCreatesBehindDrop_)
-                held = held || q.spec.name == pc.spec.name || rune::catalog::topicNamesFoldEqual(q.spec.name, pc.spec.name);
-            if (held) pendingCreatesBehindDrop_.push_back(std::move(pc));
-            else      runCatalogCreate_(pc.spec);
-        }
-    }
+    if (renamed) runPendingCreatesBehindDrop_();
     if (!purgeOutbox_.empty()) work += pumpCatalogOutboxes_();
     return work;
 }
@@ -5582,6 +5596,8 @@ void BrokerNode::onViewUninstall_(int32_t viewTopicId) {
 }
 
 bool BrokerNode::catalogTopicServes_(int32_t topicId) const noexcept {
+    // VLS B.2: a view sink serves as soon as it is applied (catalog-only; the read gates are the gateway's).
+    if (topicRegistry_ && topicRegistry_->isViewSink(topicId)) return true;
     if (!topicRegistry_ || topicRegistry_->state(topicId) != rune::gateway::TopicRegistry::TopicState::Serving)
         return false;
     const TopicSpec* spec = topicRegistry_->topic(topicId);

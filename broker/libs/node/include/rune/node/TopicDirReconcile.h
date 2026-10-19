@@ -55,6 +55,7 @@ struct TopicDirReconciliation {
     std::vector<std::filesystem::path> quarantined;   // destinations under dataDir/quarantine/
     std::vector<std::filesystem::path> purged;        // dataDir/dropped/ entries removed
     std::vector<std::filesystem::path> retired;       // dataDir/dropped/ destinations of older incarnations (step 0)
+    std::vector<std::filesystem::path> removedSinkDirs;   // VLS B.2: empty dirs of former view-sink replicas, removed
 };
 
 /// `catalogTopics`: every topic the catalog holds live (view sinks included): name, id, persistence.

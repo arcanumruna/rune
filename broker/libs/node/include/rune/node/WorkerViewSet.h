@@ -463,6 +463,9 @@ public:
         if (it == views_.end()) return std::nullopt;
         return it->second.foldLeadership;
     }
+    /// VLS B.3: is `topicId` a view this worker has the plan of -- i.e. a view SINK id?  Pure read of worker-owned
+    /// state (the plan install ring carries every view id to every worker).
+    [[nodiscard]] bool isViewSink(int32_t topicId) const noexcept { return templates_.find(topicId) != templates_.end(); }
     [[nodiscard]] bool viewOutputFingerprint(int32_t viewTopicId, uint64_t& out) const {
         const auto it = templates_.find(viewTopicId);
         if (it == templates_.end()) return false;

@@ -2106,6 +2106,7 @@ private:
     // registries — no cross-thread mutation).  Returns the number of partitions
     // registered.  Multi-node partition placement is OUT OF SCOPE (deferred).
     int32_t createRuntimeUserReplicas(const TopicSpec& spec);
+    void    runPendingCreatesBehindDrop_();   ///< run, in arrival order, every waiting create whose name no drop holds
 
     // -----------------------------------------------------------------------
     // Catalog history Task 8 — the control thread executes the CatalogApplier's
