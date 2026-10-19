@@ -419,6 +419,10 @@ struct NodeConfig {
     // Overridable at runtime via RUNE_MIN_ISR env var.
     // Also forwarded to PartitionConfig::minIsr in buildReplication().
     int32_t gatewayMinIsr = 1;
+    /// RUNE_BROKER_LIVENESS_TIMEOUT_MS (CP3 I4): how long the controller waits without a heartbeat before it treats a node
+    /// as dead (fails its partitions over).  0 = the default, 3 x the election's leader-heartbeat timeout.  A deterministic
+    /// knob for fault tests (a wiped node must boot and find itself the committed leader before it is fenced out).
+    int64_t brokerLivenessTimeoutMs = 0;
 
     // Review 2026-10-04 MEDIUM-3 (RUNE_SURVIVOR_LEADER_ELECTION, default false):
     // opt-in position-proven survivor election for a partition whose committed

@@ -192,6 +192,16 @@ def parse_rune_role_storage(out: str) -> dict | None:
     }
 
 
+BOOT_LINE = "storage: dataDir="   # logged once per broker process, before anything else touches the data dir
+
+
+def slice_since_last_boot(text: str) -> str:
+    """The part of a (possibly multi-process) container log written by the LAST broker process: from the last boot line
+    on.  A restarted container keeps its old process's lines, so an order check on the whole log would see them."""
+    i = (text or "").rfind(BOOT_LINE)
+    return text[i:] if i >= 0 else ""
+
+
 def node_id_to_service(node_id: int) -> str:
     if node_id not in (0, 1, 2):
         raise ValueError(f"node id {node_id!r} out of range (expected 0-2)")
@@ -434,6 +444,10 @@ class Cluster:
              "bash", "-c",
              f'printf "%s" "$RQL" > /tmp/s.rql && exec rune ql -f /tmp/s.rql{rid} --broker {seed}'],
             timeout=timeout)
+
+    def logs_since_last_boot(self, service: str) -> str:
+        """The container's log from the last broker process's boot line on (see `slice_since_last_boot`)."""
+        return slice_since_last_boot(self.compose.logs(service, timeout=60))
 
     def container_name(self, service: str) -> str:
         """Compose v2's container name for a service of this project (no container_name/scale in the compose file)."""

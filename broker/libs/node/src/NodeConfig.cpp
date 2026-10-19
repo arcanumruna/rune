@@ -759,6 +759,17 @@ ConfigResult parseNodeConfig(
         }
     }
 
+    // --- RUNE_BROKER_LIVENESS_TIMEOUT_MS (optional, default 0 = 3 x the leader-heartbeat timeout) ---
+    {
+        const char* raw = getenv_fn("RUNE_BROKER_LIVENESS_TIMEOUT_MS");
+        if (raw && !std::string_view(raw).empty()) {
+            int32_t v{};
+            if (!parseInt32(raw, v) || v < 1)
+                return {{}, std::string("RUNE_BROKER_LIVENESS_TIMEOUT_MS must be a positive integer, got: ") + raw};
+            cfg.brokerLivenessTimeoutMs = v;
+        }
+    }
+
     // --- RUNE_SURVIVOR_LEADER_ELECTION (optional, default OFF) — review
     // 2026-10-04 MEDIUM-3: opt in to the position-proven survivor election (a
     // partition whose committed ISR has no live member elects its most complete

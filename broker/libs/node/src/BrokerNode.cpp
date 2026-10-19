@@ -2755,6 +2755,7 @@ void BrokerNode::buildGateway() {
     runtimeAgent_->setKnowledge(internalIsrKnowledge_.get());
     runtimeAgent_->setCanvassPublisher(publisher_.get());
     runtimeAgent_->setBootHistory(bootHistory_);
+    runtimeAgent_->setFailoverTimeoutOverrideNs(config_.brokerLivenessTimeoutMs * 1'000'000LL);
     if (config_.testCandidacyHoldAtBoot && !config_.isSingleNode()) runtimeAgent_->setTestCandidacyHold(true);   // R-I1
     // Controlled shutdown (Kafka parity): multi-node only — a single node has
     // nobody to hand off to (begin completes at once).  The controller's

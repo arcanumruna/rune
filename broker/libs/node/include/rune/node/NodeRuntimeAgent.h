@@ -188,6 +188,8 @@ public:
     void setCanvassPublisher(rune::consensus::SbeConsensusPublisher* p) noexcept { canvassPublisher_ = p; }
     /// node-state.dat existed with candidateTermId > 0, or term.log was non-empty, when the consensus objects were built.
     void setBootHistory(bool h) noexcept { bootHistory_ = h; }
+    /// CP3 I4: > 0 replaces the failover (broker liveness) timeout, 3 x the leader-heartbeat timeout by default.
+    void setFailoverTimeoutOverrideNs(int64_t ns) noexcept { failoverTimeoutOverrideNs_ = ns; }
     /// TEST seams (NodeConfig::testCandidacyHoldAtBoot sets it before start; the tests toggle it through
     /// onControlThreadForTest): hold the candidacy regardless of the gate.
     void setTestCandidacyHold(bool h) noexcept { testCandidacyHold_ = h; }
@@ -397,8 +399,8 @@ private:
                 // buffer (no std::vector return); the eligible vector handed to the
                 // balancer is a REUSED member (capacity persists → no steady-state
                 // heap alloc).
-                const int64_t failoverTimeoutNs =
-                    3 * election_->leaderHeartbeatTimeoutNs();
+                const int64_t failoverTimeoutNs = failoverTimeoutOverrideNs_ > 0
+                    ? failoverTimeoutOverrideNs_ : 3 * election_->leaderHeartbeatTimeoutNs();
                 const std::size_t n = election_->eligibleNodeIds(
                     nowNs, failoverTimeoutNs, eligBuf_.data(), eligBuf_.size());
 
@@ -1129,6 +1131,7 @@ private:
     rune::replication::InternalIsrKnowledge*           knowledge_         = nullptr;
     rune::consensus::SbeConsensusPublisher*            canvassPublisher_  = nullptr;
     bool                                               bootHistory_       = false;
+    int64_t                                            failoverTimeoutOverrideNs_ = 0;   ///< CP3 I4 (0 = default)
     bool                                               testCandidacyHold_ = false;
     /// R12 flags (every cycle) + the gate evaluation (A-M4: right after the consensus step, before the bridge).
     int serviceStorageGate_(int64_t nowNs) {

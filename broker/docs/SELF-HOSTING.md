@@ -39,6 +39,7 @@ or malformed.
 | `RUNE_CLIENT_ENDPOINT` | **yes** | — | host:port | **Raw `host:port`** the client gateway listens on (broker prepends `aeron:udp?endpoint=`). Use `0.0.0.0:40200` to bind all interfaces. Do **not** pass a full `aeron:udp?...` string. |
 | `RUNE_DATA_DIR` | **yes** | — | path | Writable dir for durable state (node-state, term log, partition logs). Mount a volume/bind-mount here. (Compose files set it to `/var/lib/rune`.) |
 | `RUNE_STORAGE_FORMAT` | no | *(unset: never format)* | `new` \| `join` \| `auto` | Read **only** when `RUNE_DATA_DIR` is empty and not formatted. Unset: the broker refuses to start and says what to run. `new`: format for a new cluster. `join`: format as a new or replaced disk of a running cluster. `auto`: development only — formats any empty dir. See "Formatting the data directory". |
+| `RUNE_BROKER_LIVENESS_TIMEOUT_MS` | no | *(unset: 3 × the leader-heartbeat timeout)* | int ms | How long the controller waits without a heartbeat before it treats a node as dead and fails its partitions over. A fault-test knob; leave unset in production. |
 | `RUNE_STORAGE_RECOVERY_VOTE` | no | `0` | bool | **Unsafe, disaster recovery only.** Lets an unconfirmed (replaced-disk) node vote, so a cluster that lost the disks of a majority can elect its one intact node. May lose metadata committed only on the lost disks. Logged at critical level. |
 | `RUNE_CLIENT_STREAM_ID` | no | `1` | int32 | Aeron stream id for client traffic. |
 | `RUNE_CONSENSUS_STREAM_ID` | no | `10` | int32 | Aeron stream id for inter-node consensus traffic. |

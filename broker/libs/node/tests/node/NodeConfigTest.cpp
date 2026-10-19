@@ -647,6 +647,21 @@ TEST(NodeConfigTest, ConsensusChannelUnaffectedByClientPort) {
     EXPECT_EQ(r.config->peers[2].consensusChannel(), "aeron:udp?endpoint=rune-3:40111");
 }
 
+// CP3 I4: RUNE_BROKER_LIVENESS_TIMEOUT_MS — default 0 (the agent uses 3 x the leader-heartbeat timeout); a positive value
+// is carried; garbage is refused.  RED: ignore the variable.
+TEST(NodeConfigRegression, BrokerLivenessTimeoutEnvIsParsedRegression) {
+    auto r = parseNodeConfig(fakeEnv(base1node()));
+    ASSERT_TRUE(r.error.empty()) << r.error;
+    EXPECT_EQ(r.config->brokerLivenessTimeoutMs, 0);
+    auto env = base1node();
+    env["RUNE_BROKER_LIVENESS_TIMEOUT_MS"] = "60000";
+    auto r2 = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r2.error.empty()) << r2.error;
+    EXPECT_EQ(r2.config->brokerLivenessTimeoutMs, 60000);
+    env["RUNE_BROKER_LIVENESS_TIMEOUT_MS"] = "soon";
+    EXPECT_FALSE(parseNodeConfig(fakeEnv(env)).error.empty());
+}
+
 // ---------------------------------------------------------------------------
 // M1: gatewayMinIsr — majority default + RUNE_MIN_ISR env override
 // ---------------------------------------------------------------------------
