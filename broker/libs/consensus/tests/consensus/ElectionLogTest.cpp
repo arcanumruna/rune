@@ -3690,3 +3690,105 @@ TEST(ElectionCandidacyRegression, StandDownAfterWithdrawIsRefusedRegression) {
     EXPECT_EQ(e.standDowns(), 0u);
     EXPECT_TRUE(e.resign(nowNs)) << "the withdrawn leader still hands off by resigning";
 }
+
+// ===========================================================================
+// ISR v3 Step 9 - the storage hold (a fourth candidacy state) and the founding evidence.
+// ===========================================================================
+
+// A-C2: the hold is a level set BEFORE the first doWork: the first canvass never stands.  The control (no hold) does,
+// so the test is sensitive.  RED: start at Candidate and hold only on change.
+TEST(ElectionStorageRegression, HoldSetBeforeTheFirstDoWorkBlocksTheFirstCanvassRegression) {
+    TempFile nsfFile(".nsf"), tlFile(".tl"), nsf2File(".nsf"), tl2File(".tl");
+    NodeStateFile nsf(nsfFile.str()), nsf2(nsf2File.str());
+    TermLog tl(tlFile.str()), tl2(tl2File.str());
+    StandDownRecorder pub, pub2;
+    auto held = makeSdElection(0, pub, nsf, tl, /*seed=*/0);
+    held.setStorageHold(true, 0);
+    EXPECT_STREQ(held.candidacyName(), "AwaitingStorage");
+    int64_t nowNs = 1'000'000LL;
+    EXPECT_TRUE(neverStands(held, pub, nowNs, /*term=*/0, 30)) << "a held node stood for election";
+    EXPECT_EQ(held.state(), ElectionState::Canvass) << "a held node left the canvass (nominated itself)";
+    EXPECT_FALSE(held.preBallotActiveForTest()) << "a held node opened a pre-ballot";
+    auto free = makeSdElection(0, pub2, nsf2, tl2, /*seed=*/0);
+    int64_t now2 = 1'000'000LL;
+    (void)neverStands(free, pub2, now2, /*term=*/0, 30);
+    EXPECT_NE(free.state(), ElectionState::Canvass) << "the control (no hold) never left the canvass: the test is vacuous";
+}
+
+// §3.6: a hold remembers a pending stand-down; the release restores it (StoodDown), then Candidate.  RED: release -> Candidate.
+TEST(ElectionStorageRegression, ReleaseRestoresAPendingStandDownRegression) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    StandDownRecorder pub;
+    auto e = makeSdElection(0, pub, nsf, tl, /*seed=*/0);
+    int64_t nowNs = 1'000'000LL;
+    bringToLeaderLogReplication(e, nowNs);
+    ASSERT_TRUE(driveSdLeaderToClosed(e, nowNs));
+    const Term term = e.leadershipTermId();
+    const int64_t at = nowNs;
+    ASSERT_TRUE(e.standDown(at, 5'000'000'000LL));
+    e.setStorageHold(true, at);
+    EXPECT_STREQ(e.candidacyName(), "AwaitingStorage");
+    e.setStorageHold(false, at + 1'000'000'000LL);
+    EXPECT_STREQ(e.candidacyName(), "StoodDown") << "the pending stand-down was forgotten on release";
+    nowNs = at + 1'000'000'000LL;
+    EXPECT_TRUE(neverStands(e, pub, nowNs, term, 2)) << "stood before the +5 s hold ended";
+    nowNs = at + 5'000'000'001LL;
+    e.doWork(nowNs);
+    EXPECT_STREQ(e.candidacyName(), "Candidate");
+}
+
+// R12: a candidate's term in a RequestVote is never founding evidence; a canvass carrying valid flags and no history is
+// "fresh", flags 0 (an old sender) and flag 1 are history.  RED: count candidateTermId, or read flag 0 as fresh.
+TEST(ElectionStorageRegression, CandidateTermIsNeverEvidenceAndFlagsAreRegression) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    StandDownRecorder pub;
+    auto e = makeSdElection(0, pub, nsf, tl, /*seed=*/0);
+    int64_t nowNs = 1'000'000LL;
+    e.doWork(nowNs);   // leave Init
+    e.onRequestVote(0, 0, /*candidateTermId=*/5, /*candidateId=*/1, nowNs);
+    EXPECT_FALSE(e.anyPeerHistory()) << "a RequestVote's candidate term counted as history";
+    EXPECT_EQ(e.maxPeerLeadershipTermId(), 0);
+    e.onCanvassPosition(0, 0, 0, /*from=*/1, /*flags=*/2);
+    EXPECT_EQ(e.peersHeardFreshCount(), 1);
+    EXPECT_FALSE(e.anyPeerHistory());
+    e.onCanvassPosition(0, 0, 0, /*from=*/2, /*flags=*/0);
+    EXPECT_TRUE(e.anyPeerHistory()) << "flags 0 (an old sender) must read as history";
+    EXPECT_EQ(e.peersHeardFreshCount(), 1);
+    EXPECT_EQ(e.peerWithHistory(), 2);
+
+    TempFile nsf2File(".nsf"), tl2File(".tl");
+    NodeStateFile nsf2(nsf2File.str());
+    TermLog       tl2(tl2File.str());
+    StandDownRecorder pub2;
+    auto f = makeSdElection(0, pub2, nsf2, tl2, /*seed=*/0);
+    f.doWork(nowNs);
+    f.onCanvassPosition(0, 0, 0, /*from=*/1, /*flags=*/3);
+    EXPECT_TRUE(f.anyPeerHistory()) << "flags 3 (valid, history) must read as history";
+    EXPECT_EQ(f.peersHeardFreshCount(), 0);
+}
+
+// ISR v3 §3.6 (ruling): a node with an untrusted storage ABSTAINS from other candidates' ballots - no PlaceVote(false)
+// (Aeron's isQuorumLeader fails on ANY Against, so a denying unconfirmed member would veto every election) and no
+// PreVote answer.  A trusted node answers.  RED: deny instead of abstaining (a placeVote(false) is sent).
+TEST(ElectionStorageRegression, AnUntrustedStorageAbstainsInsteadOfVetoingRegression) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    ElectionLogFakePublisher pub;
+    auto e = Election(true, -1, 0, 0, 0, 0, makeMembers3(0), 0, pub, nsf, tl,
+                      kElectionTimeoutNs, kStatusIntervalNs, kStartupCanvassTimeoutNs, 0);
+    int64_t nowNs = 1'000'000LL;
+    e.doWork(nowNs);   // leave Init
+    bool abstain = true;
+    e.setAbstainGate(+[](void* f) noexcept { return *static_cast<bool*>(f); }, &abstain);
+    e.onRequestVote(0, 0, /*candidateTermId=*/5, /*candidateId=*/1, nowNs);
+    EXPECT_TRUE(pub.placeVoteCalls.empty()) << "an abstaining node still answered the RequestVote";
+    EXPECT_EQ(e.abstentionsForTest(), 1u);
+    abstain = false;
+    e.onRequestVote(0, 0, /*candidateTermId=*/6, /*candidateId=*/1, nowNs);
+    EXPECT_EQ(pub.placeVoteCalls.size(), 1u) << "a trusted node must answer";
+}

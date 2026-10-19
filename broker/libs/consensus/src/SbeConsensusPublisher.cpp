@@ -40,17 +40,16 @@ void SbeConsensusPublisher::canvassPosition(
     Term    leadershipTermId,
     NodeId  followerMemberId)
 {
-    // protocolVersion is not threaded through ConsensusPublisher; send 0 (Java uses
-    // SemanticVersion.compose(0,17,0) but the Election interface omits it).
-    // The SBE field is present in the wire format; we encode it as 0 here.
-    // P2P-7 can wire in the real value once ConsensusModuleAgent is ported.
+    // ISR v3 R12: the protocolVersion field carries the founding-evidence FLAGS (bit 1 = flags valid, bit 0 = this
+    // process has history), set every control cycle by NodeRuntimeAgent (setCanvassFlags).  0 (never set) reads as
+    // "flags invalid" = history at the receiver (fail-safe).
     const auto len = CanvassPositionMsg::encode(
         buf_.data(), 0,
         logLeadershipTermId,
         logPosition,
         leadershipTermId,
         followerMemberId,
-        /*protocolVersion=*/0);
+        canvassFlags_);
     sink_.send(toMember, buf_.data(), len);
 }
 

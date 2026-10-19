@@ -1083,3 +1083,52 @@ TEST(StorageIdentityRegression, MarkersSetOnFirstExistenceRegression) {
     EXPECT_NE(m.find("knowledge"), std::string::npos) << m;
     EXPECT_NE(m.find("metadataLog"), std::string::npos) << m;
 }
+
+// ISR v3 Step 9 (R12, v2-review I2): the canvass flags are RECOMPUTED every control cycle - a long-running founder
+// advertises history once it has led or stood (term >= 1), not only what it held at boot.
+// RED: flags computed once at boot (2).
+TEST(ElectionStorageRegression, ALongRunningFounderAdvertisesHistoryRegression) {
+    ThreeNodes c = ThreeNodes::start("flags");
+    ASSERT_TRUE(c.awaitCatalogLeader(30s));
+    for (BrokerNode* n : c.live()) {
+        const int32_t flags = n->onControlThreadForTest([&] { return n->canvassFlagsForTest(); });
+        EXPECT_EQ(flags, 3) << "node " << n->nodeIdForTest() << ": valid flags (2) + history (1) once a term >= 1 ran";
+    }
+}
+
+// v2-review I3: a node whose data dir was wiped RAW (no storage.meta) and restarted with `auto` decides Joiner (it hears
+// the established cluster), registers with the DECIDED origin, and the controller commits its storage.
+// RED: drop the setStorage call in the `joined` branch (the register keeps origin 4 and is never processed).
+TEST(StorageGateWiringRegression, AutoWipedNodeIsConfirmedAsJoinerRegression) {
+    ThreeNodes c = ThreeNodes::start("autowipe");
+    ASSERT_TRUE(c.awaitCatalogLeader(30s));
+    const int X = c.catalogLeaderId() == 1 ? 2 : 1;
+    c.stop(X);
+    c.wipeRaw(X, rune::node::StorageFormat::Auto);
+    c.startNode(X);
+    const auto metaOf = [&](const char* key) -> std::string {
+        std::ifstream in(c.dirs[static_cast<std::size_t>(X - 1)]->path / "storage.meta");
+        std::string line;
+        const std::string p = std::string(key) + "=";
+        while (std::getline(in, line)) if (line.rfind(p, 0) == 0) return line.substr(p.size());
+        return {};
+    };
+    const auto deadline = std::chrono::steady_clock::now() + 30s;
+    bool ok = false;
+    int64_t committed = 0, id = 0;
+    while (!ok && std::chrono::steady_clock::now() < deadline) {
+        if (metaOf("origin") == "joiner") {
+            id = static_cast<int64_t>(std::stoull(metaOf("storageId"), nullptr, 16));
+            const int l = c.catalogLeaderId();
+            if (l > 0 && c.running(l)) {
+                committed = c.node(l).onControlThreadForTest([&] {
+                    return c.node(l).metadataServiceForTest()->msmForTest().nodeStorage(X);
+                });
+                ok = committed != 0 && committed == id;
+            }
+        }
+        if (!ok) std::this_thread::sleep_for(50ms);
+    }
+    EXPECT_EQ(metaOf("origin"), "joiner") << "the auto-formatted wiped node did not decide Joiner";
+    EXPECT_TRUE(ok) << "the controller never committed the joiner's storage (committed " << committed << ", id " << id << ")";
+}

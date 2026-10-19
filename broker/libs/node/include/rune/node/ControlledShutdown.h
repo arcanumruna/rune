@@ -123,6 +123,29 @@ public:
             state_ = Registering{};   // a fresh request: re-broadcast at once
         return 1;
     }
+    /// ISR v3 (Step 9): this node's storage id and origin wire code (AlterIsrMsg::kStorageOrigin*), carried in slots
+    /// 7/8/9 of every node-control frame.  Startup thread / control thread.  `bind()` is unchanged.
+    void setStorage(int64_t id, uint8_t origin) noexcept { storageId_ = id; storageOrigin_ = origin; }
+    /// ISR v3: is this node's storage CONFIRMED (the gate is open)?  While not, and while the controller has no
+    /// committed storage for this node, a Running node re-registers every kStorageReRegisterNs (the controller
+    /// ignores a register until it is a ready level >= 2 controller; an event or a lost frame must not stall it).
+    using StorageOpenFn = bool (*)(void* ctx) noexcept;
+    void setStorageOpenFn(StorageOpenFn fn, void* ctx) noexcept { storageOpenFn_ = fn; storageOpenCtx_ = ctx; }
+    static constexpr int64_t kStorageReRegisterNs = 5'000'000'000LL;
+    /// TEST ONLY (control thread): pretend the Running registration was acked in consensus term `t`.
+    void setRegisteredTermForTest(int64_t t) noexcept {
+        if (auto* r = std::get_if<Running>(&state_)) r->registeredTerm = t;
+    }
+    /// CONTROL thread: the storage gate decided (founded / joined): register again at once, with the decided
+    /// origin (the pattern of reportCatalogHalted).  Idempotent.
+    int reportStorageDecided() {
+        if (!active_()) return 0;
+        if (std::holds_alternative<Running>(state_) || std::holds_alternative<Registering>(state_)) {
+            state_ = Registering{};
+            return 1;
+        }
+        return 0;
+    }
     /// Control thread / tests: this process's current identity (nonce).
     [[nodiscard]] int64_t nonceOnControl() const noexcept { return incarnation_; }
 
@@ -227,6 +250,8 @@ private:
     struct Running {
         static constexpr Phase kPhase = Phase::Running;
         int32_t  registeredWith = -1;
+        int64_t  registeredTerm = -1;   ///< ISR v3: the consensus term the registration was acked in
+        int64_t  lastRegisterNs = 0;    ///< ISR v3: the last (re-)register, for the storage re-send cadence
         int32_t  remaining      = -1;   ///< readiness gate: partitions not in sync here (outOfSync)
         uint64_t mapVersion     = ~0ull;
         int32_t  gateCtl        = -2;   ///< controller the gate was computed under
@@ -303,6 +328,12 @@ private:
         m.isr[rune::replication::AlterIsrMsg::kNodeFeatureLevelSlot] = rune::replication::MetadataFeature::kLatest;
         m.isr[3]    = static_cast<int32_t>(static_cast<uint32_t>(incarnation_));
         m.isr[4]    = static_cast<int32_t>(static_cast<uint32_t>(static_cast<uint64_t>(incarnation_) >> 32));
+        // ISR v3: the storage this process runs on (slots 7/8 = id low/high, 9 = origin).
+        m.isr[rune::replication::AlterIsrMsg::kNodeStorageLoSlot] =
+            static_cast<int32_t>(static_cast<uint32_t>(static_cast<uint64_t>(storageId_)));
+        m.isr[rune::replication::AlterIsrMsg::kNodeStorageHiSlot] =
+            static_cast<int32_t>(static_cast<uint32_t>(static_cast<uint64_t>(storageId_) >> 32));
+        m.isr[rune::replication::AlterIsrMsg::kNodeStorageOriginSlot] = storageOrigin_;
         q.lastSendNs = nowNs;   // before the sends: a local answer arrives synchronously
         for (int32_t n : members_) (void)send_fn_(sendCtx_, n, m);   // ring full: re-sent later
         return 1;
@@ -319,18 +350,31 @@ private:
                      nowNs, force);
     }
 
-    int step_(Running& st, int64_t) {
+    int step_(Running& st, int64_t nowNs) {
         // A new controller may hold a mark an earlier process of this node
         // left (it was a member then): register again on every controller change.
+        // ISR v3: and on a new TERM of the same controller (its soft registration state died with the old term).
         if (!active_()) return 0;
         const int32_t ctl = controller_();
-        if (ctl >= 0 && ctl != st.registeredWith) { state_ = Registering{}; return 1; }
+        if (ctl >= 0 && (ctl != st.registeredWith || election_->leadershipTermId() > st.registeredTerm)) {
+            state_ = Registering{};
+            return 1;
+        }
         // Readiness gate (review L5): recomputed only on a committed-map change.
         const uint64_t v = metadata_->routingVersion();
         if (v != st.mapVersion || ctl != st.gateCtl) {   // N4: a lost controller → unknown
             st.mapVersion = v;
             st.gateCtl    = ctl;
             st.remaining  = ctl >= 0 ? outOfSync(metadata_->committedMap(), self_) : -1;
+        }
+        // ISR v3: until the storage is confirmed (gate open AND a committed record), keep telling the controller.
+        const bool open = storageOpenFn_ == nullptr || storageOpenFn_(storageOpenCtx_);
+        const bool committed = metadata_->featureLevel() < rune::replication::MetadataFeature::kStorageIdentity ||
+                               metadata_->msm().nodeStorage(self_) != 0;
+        if ((!open || !committed) && nowNs - st.lastRegisterNs >= kStorageReRegisterNs) {
+            st.lastRegisterNs = nowNs;
+            Request q;
+            return sendTo_(q, rune::replication::AlterIsrMsg::kNodeRegister, nowNs);
         }
         return 0;
     }
@@ -388,6 +432,8 @@ private:
         if (st.req.ackedBy >= 0 && st.req.ackedBy == controller_()) {
             Running r;
             r.registeredWith = st.req.ackedBy;
+            r.registeredTerm = election_->leadershipTermId();
+            r.lastRegisterNs = nowNs;
             state_ = r;
             return 1;
         }
@@ -473,6 +519,10 @@ private:
     /// Task 11 fix round 0: a latched process attribute (orthogonal to the
     /// hand-off state machine): every request carries kNodeCatalogHalted.
     bool                                        catalogHalted_ = false;
+    int64_t                                     storageId_     = 0;     ///< ISR v3: slots 7/8 of every frame
+    uint8_t                                     storageOrigin_ = 0;     ///< ISR v3: slot 9 (0 = none)
+    StorageOpenFn                               storageOpenFn_  = nullptr;
+    void*                                       storageOpenCtx_ = nullptr;
     std::vector<int32_t>                        members_;               ///< every cluster member (incl. self)
 
     State  state_{Running{}};                       // control thread

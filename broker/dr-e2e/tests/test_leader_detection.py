@@ -83,3 +83,26 @@ def test_leader_detection_independent_of_log_level(fresh_cluster):
     reading = cluster._read_role(leader_svc)
     assert reading is not None
     assert reading[0] == "LEADER"
+
+
+def test_rune_role_two_line_output_parses():
+    """ISR v3: rune_role prints a second STORAGE line; the ROLE parse is unchanged by it (no cluster needed)."""
+    from harness.cluster import _ROLE_RE, parse_rune_role_storage
+
+    out = (
+        "ROLE nodeId=1 role=FOLLOWER term=7\n"
+        "STORAGE nodeId=1 state=UNCONFIRMED heldLeaderRoles=3 pendingNodes=0 outOfSync=2 lostCommittedReports=1\n"
+    )
+    role = _ROLE_RE.search(out)
+    assert role and (role.group(1), role.group(2), role.group(3)) == ("1", "FOLLOWER", "7")
+    st = parse_rune_role_storage(out)
+    assert st == {
+        "node_id": 1, "state": "UNCONFIRMED", "held_leader_roles": 3, "pending_nodes": 0,
+        "out_of_sync": 2, "lost_committed_reports": 1,
+    }
+    # An absent counter: UNKNOWN state and -1 values; an older image: no STORAGE line at all.
+    unk = parse_rune_role_storage(
+        "ROLE nodeId=0 role=NONE term=-1\n"
+        "STORAGE nodeId=0 state=UNKNOWN heldLeaderRoles=-1 pendingNodes=-1 outOfSync=-1 lostCommittedReports=-1\n")
+    assert unk and unk["state"] == "UNKNOWN" and unk["held_leader_roles"] == -1
+    assert parse_rune_role_storage("ROLE nodeId=0 role=NONE term=-1\n") is None

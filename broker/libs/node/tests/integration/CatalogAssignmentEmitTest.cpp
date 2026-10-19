@@ -4506,3 +4506,61 @@ TEST(MetadataServiceRegression, FoundersOwnTermRecordIsNotDataOnItsStorageRegres
     EXPECT_TRUE(level) << "the founder never bootstrapped the metadata log";
     EXPECT_TRUE(fired) << "the bootstrap records themselves are data on the storage";
 }
+
+// ISR v3 Step 9: the node-control register carries the storage (slots 7/8 = id, 9 = origin) and, until the storage is
+// confirmed (gate open AND a committed record), is re-sent every 5 s; a new consensus term of the SAME controller
+// registers again.  RED: no resend, or the id-only controller check.
+TEST(ControlledShutdownRegression, RegisterCarriesStorageAndReRegistersUntilConfirmedRegression) {
+    RecordingRig r;
+    bool open = false;
+    r.cs.setStorage(0xB, 3);
+    r.cs.setStorageOpenFn(+[](void* o) noexcept { return *static_cast<bool*>(o); }, &open);
+    int64_t now = 1'000'000;
+    r.followLeader1(now);
+    (void)r.cs.doWork(now);
+    ASSERT_FALSE(r.sent.empty());
+    for (const auto& m : r.sent) {
+        EXPECT_EQ(m.isr[rune::replication::AlterIsrMsg::kNodeStorageLoSlot], 0xB);
+        EXPECT_EQ(m.isr[rune::replication::AlterIsrMsg::kNodeStorageHiSlot], 0);
+        EXPECT_EQ(m.isr[rune::replication::AlterIsrMsg::kNodeStorageOriginSlot], 3);
+    }
+    r.answer(rune::replication::kAlterIsrOk);
+    (void)r.cs.doWork(++now);
+    ASSERT_EQ(r.cs.phaseOnControl(), rune::node::ControlledShutdown::Phase::Running);
+    const std::size_t perRegister = 3;   // one frame per member {0, 1, 2}
+    const int64_t t0 = now;
+    r.sent.clear();
+    (void)r.cs.doWork(t0 + 4'900'000'000LL);
+    EXPECT_TRUE(r.sent.empty()) << "re-registered before the 5 s cadence";
+    (void)r.cs.doWork(t0 + 5'000'000'000LL);
+    EXPECT_EQ(r.sent.size(), perRegister) << "no register at +5 s";
+    (void)r.cs.doWork(t0 + 6'000'000'000LL);
+    EXPECT_EQ(r.sent.size(), perRegister) << "re-registered inside the cadence";
+    (void)r.cs.doWork(t0 + 10'000'000'000LL);
+    EXPECT_EQ(r.sent.size(), 2 * perRegister) << "no register at +10 s";
+    open = true;   // the gate opened; with no committed-storage requirement below level 2 nothing more is needed
+    (void)r.cs.doWork(t0 + 15'000'000'000LL);
+    EXPECT_EQ(r.sent.size(), 2 * perRegister) << "still registering after the storage was confirmed";
+    // A new term of the SAME controller: the registration is lost with the old term's soft state.
+    r.cs.setRegisteredTermForTest(r.e.leadershipTermId() - 1);
+    (void)r.cs.doWork(t0 + 16'000'000'000LL);
+    EXPECT_EQ(r.cs.phaseOnControl(), rune::node::ControlledShutdown::Phase::Registering);
+}
+
+// v2-review I3: the DECIDED origin rides the next register (a gate that founded / joined re-registers at once).
+TEST(ControlledShutdownRegression, DecidedOriginRidesTheNextRegisterRegression) {
+    RecordingRig r;
+    r.cs.setStorage(0xB, 4);   // Undecided
+    int64_t now = 1'000'000;
+    r.followLeader1(now);
+    (void)r.cs.doWork(now);
+    r.answer(rune::replication::kAlterIsrOk);
+    (void)r.cs.doWork(++now);
+    ASSERT_EQ(r.cs.phaseOnControl(), rune::node::ControlledShutdown::Phase::Running);
+    r.sent.clear();
+    r.cs.setStorage(0xB, 3);   // decided: Joiner
+    (void)r.cs.reportStorageDecided();
+    (void)r.cs.doWork(++now);
+    ASSERT_FALSE(r.sent.empty());
+    for (const auto& m : r.sent) EXPECT_EQ(m.isr[rune::replication::AlterIsrMsg::kNodeStorageOriginSlot], 3);
+}

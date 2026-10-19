@@ -170,10 +170,13 @@ public:
     // -----------------------------------------------------------------------
 
     // Election.java:284-332
+    /// `flags` = the canvass's protocolVersion field (ISR v3 R12): bit 1 (2) = flags valid, bit 0 (1) = the sender
+    /// has history.  An old sender's 0 reads as "flags invalid" = history (fail-safe).
     void onCanvassPosition(Term    logLeadershipTermId,
                            int64_t logPosition,
                            Term    leadershipTermId,
-                           NodeId  followerMemberId);
+                           NodeId  followerMemberId,
+                           int32_t flags = 0);
 
     // Election.java:334-380
     // nowNs is passed so the state transition to FollowerBallot uses the real clock.
@@ -253,8 +256,30 @@ public:
     [[nodiscard]] bool resigned() const noexcept { return std::holds_alternative<Resigned>(candidacy_); }
     /// "Candidate" | "StoodDown" | "Resigned" (tests, logs).
     [[nodiscard]] const char* candidacyName() const noexcept {
-        switch (candidacy_.index()) { case 0: return "Candidate"; case 1: return "StoodDown"; default: return "Resigned"; }
+        switch (candidacy_.index()) {
+            case 0: return "Candidate";
+            case 1: return "StoodDown";
+            case 2: return "Resigned";
+            default: return "AwaitingStorage";   // M1 (ISR v3): the storage hold
+        }
     }
+    /// ISR v3 §3.6 - the storage hold, a LEVEL re-asserted every cycle (and once at construction): while held this
+    /// node canvasses and votes nothing for itself - it never stands (candidacyBlocks_) - and a pending stand-down
+    /// is remembered, not lost.  Candidate -> AwaitingStorage{}; StoodDown{u,t} -> AwaitingStorage{u,t};
+    /// Resigned / AwaitingStorage: no-op.  Release: AwaitingStorage{u,t} -> StoodDown{u,t} while u > now, else
+    /// Candidate.  Duty-cycle thread.
+    void setStorageHold(bool hold, int64_t nowNs) noexcept;
+    /// ISR v3 R12 evidence (recorded in the handlers; read by StorageGate through NodeRuntimeAgent).  A peer's
+    /// candidateTermId (RequestVote) is NEVER evidence.
+    [[nodiscard]] int peersHeardFreshCount() const noexcept { return __builtin_popcount(heardFreshMask_); }
+    /// Peers heard from at all (any message), and the cluster member count (both for the UNCONFIRMED log line and
+    /// StorageGate's founding majority).
+    [[nodiscard]] int peersHeardCount() const noexcept { return __builtin_popcount(heardMask_); }
+    [[nodiscard]] std::size_t clusterSize() const noexcept { return clusterMembers_.size(); }
+    [[nodiscard]] bool anyPeerHistory() const noexcept { return anyHistory_; }
+    [[nodiscard]] Term maxPeerLeadershipTermId() const noexcept { return maxPeerLeadershipTermId_; }
+    [[nodiscard]] int32_t peerWithHistory() const noexcept { return peerWithHistory_; }
+    [[nodiscard]] uint64_t votesGrantedForTest() const noexcept { return votesGranted_; }
     /// Controlled shutdown, any role: never stand for election again in this
     /// process (it still votes).  A current leader keeps leading until
     /// resign().  Duty-cycle thread.
@@ -310,8 +335,18 @@ public:
     /// A peer's CandidacyState (ConsensusAgent dispatch).
     void onCandidacyState(NodeId fromMember, const CandidacyState& s) noexcept {
         (void)fromMember;
+        anyHistory_ = true;   // ISR v3 R12: a peer that exchanges metadata-ISR knowledge has history
         if (candidacyLearn_ != nullptr) candidacyLearn_(candidacyCtx_, s);
     }
+
+    /// ISR v3 §3.6 (ruling): a node whose STORAGE is not trusted ABSTAINS from other candidates' ballots - it answers
+    /// neither a RequestVote nor a PreVote.  A denial would be an Against vote, and Aeron's isQuorumLeader (and this
+    /// election's pre-ballot) fails on ANY Against: an unconfirmed member that denied every ballot would veto every
+    /// election while it is up, even one the other members can win.  Silence grants nothing (safe) and vetoes nothing.
+    /// It still canvasses and still evaluates its own candidacy through the vote gate.  nullptr = never abstains.
+    using AbstainGate = bool (*)(void* ctx) noexcept;
+    void setAbstainGate(AbstainGate fn, void* ctx) noexcept { abstainGate_ = fn; abstainCtx_ = ctx; }
+    [[nodiscard]] uint64_t abstentionsForTest() const noexcept { return abstentions_; }
 
     using VoteGate = bool (*)(void* ctx, NodeId candidate) noexcept;
     void setVoteGate(VoteGate fn, void* ctx) noexcept { voteGate_ = fn; voteGateCtx_ = ctx; }
@@ -552,10 +587,37 @@ private:
     //               StandDown for `term` meanwhile; then a Candidate again.
     //   Resigned  — resign() / withdrawCandidacy(): never stands again in this
     //               process; re-sends StandDown for `term` (-1 = none to send).
+    //   AwaitingStorage — ISR v3: the storage hold; never stands, sends no StandDown; remembers a pending stand-down.
     struct Candidate {};
     struct StoodDown { int64_t untilNs = 0; Term term = -1; };
     struct Resigned  { Term term = -1; };
-    std::variant<Candidate, StoodDown, Resigned> candidacy_{Candidate{}};
+    struct AwaitingStorage { int64_t standDownUntilNs = INT64_MIN; Term standDownTerm = -1; };
+    std::variant<Candidate, StoodDown, Resigned, AwaitingStorage> candidacy_{Candidate{}};
+    // ISR v3 R12 evidence (see the accessors).
+    uint32_t heardMask_      = 0;   ///< members heard from (any message), by id
+    uint32_t heardFreshMask_ = 0;   ///< members whose canvass said "valid flags, no history"
+    bool     anyHistory_     = false;
+    Term     maxPeerLeadershipTermId_ = 0;
+    int32_t  peerWithHistory_ = -1;
+    uint64_t votesGranted_   = 0;
+    AbstainGate abstainGate_ = nullptr;
+    void*       abstainCtx_  = nullptr;
+    uint64_t    abstentions_ = 0;
+    [[nodiscard]] bool abstains_() noexcept {
+        if (abstainGate_ == nullptr || !abstainGate_(abstainCtx_)) return false;
+        ++abstentions_;
+        return true;
+    }
+    void noteHeard_(NodeId id) noexcept { if (id >= 0 && id < 32) heardMask_ |= 1u << id; }
+    void noteTermEvidence_(NodeId from, Term t) noexcept {
+        if (from == thisMemberId_) return;
+        noteHeard_(from);
+        if (t > 0) {
+            anyHistory_ = true;
+            peerWithHistory_ = from;
+            if (t > maxPeerLeadershipTermId_) maxPeerLeadershipTermId_ = t;
+        }
+    }
     uint64_t standDowns_ = 0;
     /// Canvass: true = this node must not stand (re-sends its StandDown).
     bool candidacyBlocks_(int64_t nowNs, int workCount);

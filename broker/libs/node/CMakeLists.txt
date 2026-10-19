@@ -143,6 +143,7 @@ if(BUILD_TESTING)
     add_executable(rune_node_tests
         tests/node/NodeConfigTest.cpp
         tests/node/StorageIdentityTest.cpp
+        tests/node/StorageGateTest.cpp
         tests/node/HostDefaultsTest.cpp
         tests/node/FdBudgetTest.cpp
         tests/node/PortableFlushBackendTest.cpp
@@ -1189,7 +1190,7 @@ if(BUILD_TESTING)
                 aeron::aeron
                 GTest::gtest_main)
             gtest_discover_tests(rune_role_counter_publish_tests
-                PROPERTIES TIMEOUT 60
+                PROPERTIES TIMEOUT 180
                 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
         endif()
     endif()

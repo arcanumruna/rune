@@ -100,7 +100,13 @@ public:
 
     void standDown(NodeId toMember, Term leadershipTermId, NodeId leaderMemberId) override;
 
+    /// ISR v3 R12: the founding-evidence flags every CanvassPosition carries in its protocolVersion field
+    /// (bit 1 = valid, bit 0 = this process has history).  Set by the owning (control) thread every cycle.
+    void setCanvassFlags(int32_t flags) noexcept { canvassFlags_ = flags; }
+    [[nodiscard]] int32_t canvassFlags() const noexcept { return canvassFlags_; }
+
 private:
+    int32_t canvassFlags_ = 0;   ///< 0 = "flags invalid" (an unset publisher reads as history at the receiver)
     // Concrete sink + construction-time tag (Task 11 fix 2, B2): the runtime duty
     // cycle (worker 0's pass under fused placement) never dispatches through the
     // MessageSink vtable.  Generic = test doubles only.

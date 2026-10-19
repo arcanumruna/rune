@@ -169,6 +169,28 @@ _LEADER_RE = re.compile(r"node (\d+) is LEADER")
 # rune_role prints:  ROLE nodeId=<n> role=<LEADER|FOLLOWER|CANDIDATE|NONE> term=<t>
 _ROLE_RE = re.compile(r"ROLE nodeId=(-?\d+) role=(\w+) term=(-?\d+)")
 
+# ... and (ISR v3) a second line:
+#   STORAGE nodeId=<n> state=<CONFIRMED|UNCONFIRMED|UNDECIDED|UNKNOWN> heldLeaderRoles=<n> pendingNodes=<n> \
+#           outOfSync=<n> lostCommittedReports=<n>        (-1 = that counter is absent)
+_STORAGE_RE = re.compile(
+    r"STORAGE nodeId=(-?\d+) state=(\w+) heldLeaderRoles=(-?\d+) pendingNodes=(-?\d+) "
+    r"outOfSync=(-?\d+) lostCommittedReports=(-?\d+)")
+
+
+def parse_rune_role_storage(out: str) -> dict | None:
+    """Parse rune_role's STORAGE line (None when the line is absent: an image that predates the storage gate)."""
+    m = _STORAGE_RE.search(out or "")
+    if not m:
+        return None
+    return {
+        "node_id": int(m.group(1)),
+        "state": m.group(2),
+        "held_leader_roles": int(m.group(3)),
+        "pending_nodes": int(m.group(4)),
+        "out_of_sync": int(m.group(5)),
+        "lost_committed_reports": int(m.group(6)),
+    }
+
 
 def node_id_to_service(node_id: int) -> str:
     if node_id not in (0, 1, 2):

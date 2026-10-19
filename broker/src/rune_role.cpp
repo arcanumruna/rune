@@ -6,6 +6,9 @@
 // the leadership-term counter.  Prints ONE line to stdout:
 //
 //     ROLE nodeId=<n> role=<LEADER|FOLLOWER|CANDIDATE|NONE> term=<t>
+//     STORAGE nodeId=<n> state=<CONFIRMED|UNCONFIRMED|UNDECIDED|UNKNOWN> heldLeaderRoles=<n> pendingNodes=<n> \
+//             outOfSync=<n> lostCommittedReports=<n>        (ISR v3 section 3.10; one line; a counter that is
+//                                                            absent prints -1, the state prints UNKNOWN)
 //
 // This is the Aeron-faithful replacement for scraping "is LEADER" log lines:
 // the dr-e2e harness runs `docker exec <svc> rune_role` and parses this line,
@@ -76,10 +79,17 @@ int main(int argc, char** argv) {
     bool foundRole = false;
     bool foundTerm = false;
 
+    std::int64_t gateState = -1, heldRoles = -1, pendingNodes = -1, outOfSync = -1, lostCommitted = -1;
+
     counters.forEach(
         [&](std::int32_t id, std::int32_t typeId,
             const aeron::concurrent::AtomicBuffer& keyBuffer,
             const std::string& /*label*/) {
+            if (typeId == rune::node::kStorageGateStateCounterTypeId) gateState = counters.getCounterValue(id);
+            else if (typeId == rune::node::kLeaderRolesHeldCounterTypeId) heldRoles = counters.getCounterValue(id);
+            else if (typeId == rune::node::kStoragePendingNodesCounterTypeId) pendingNodes = counters.getCounterValue(id);
+            else if (typeId == rune::node::kOutOfSyncCounterTypeId) outOfSync = counters.getCounterValue(id);
+            else if (typeId == rune::node::kLostCommittedReportsCounterTypeId) lostCommitted = counters.getCounterValue(id);
             if (typeId == kRoleCounterTypeId) {
                 std::int32_t nid = -1;
                 if (decodeRoleKey(keyBuffer.buffer(),
@@ -105,5 +115,12 @@ int main(int argc, char** argv) {
     std::cout << "ROLE nodeId=" << nodeId
               << " role=" << roleCodeName(role)
               << " term=" << term << "\n";
+    const char* state = gateState == 0 ? "CONFIRMED" : gateState == 1 ? "UNCONFIRMED" : gateState == 2 ? "UNDECIDED" : "UNKNOWN";
+    std::cout << "STORAGE nodeId=" << nodeId
+              << " state=" << state
+              << " heldLeaderRoles=" << heldRoles
+              << " pendingNodes=" << pendingNodes
+              << " outOfSync=" << outOfSync
+              << " lostCommittedReports=" << lostCommitted << "\n";
     return 0;
 }

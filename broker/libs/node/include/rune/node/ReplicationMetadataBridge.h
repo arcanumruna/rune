@@ -129,6 +129,13 @@ public:
         prevMap_ = rune::metadata::AssignmentMap{};
     }
 
+    /// ISR v3 (Step 9): the storage gate changed state (founded / confirmed / unconfirmed): the next doWork re-derives
+    /// every role from the committed map (a held leader role becomes a real one when the gate opens, and the other
+    /// way round).  Step 10 adds the hold itself.  Control thread.
+    void onStorageGateChanged() noexcept { prevMap_ = rune::metadata::AssignmentMap{}; }
+    /// Leader roles routed as HELD (not led) because the storage gate was closed; monotonic.  Step 10.
+    [[nodiscard]] uint64_t leaderRolesHeld() const noexcept { return leaderRolesHeld_; }
+
     // -----------------------------------------------------------------------
     // setWorkerPool — wire the WorkerPool so role changes are routed to the
     // owning worker's SPSC ingress instead of calling becomeLeader/becomeFollower
@@ -620,6 +627,7 @@ private:
     // Snapshot of the committed map as of the last applyUserPartitionRoles call.
     // Used to compute the delta on subsequent cycles.
     rune::metadata::AssignmentMap                  prevMap_;
+    uint64_t                                       leaderRolesHeld_ = 0;   ///< ISR v3: held leader roles (Step 10)
 
     // Last observed consensus state (initialized to "no leader, epoch 0").
     // These are duty-cycle-thread-only (not atomic).

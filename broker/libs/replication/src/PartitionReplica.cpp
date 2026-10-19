@@ -1545,6 +1545,10 @@ void PartitionReplica::onUnapplicableBatch(Offset batchBase, Epoch leaderEpoch)
 // known (leaderId_ < 0) fall back to the transport's broadcast.
 bool PartitionReplica::sendFetchToLeader_(const FetchRequestMsg& req)
 {
+    // TEST seam (holdFetchesUntilForTest): a member that cannot catch up yet emits no fetch (nor ack).
+    if (fetchHoldUntilNs_ != 0 && std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count() < fetchHoldUntilNs_) [[unlikely]]
+        return true;
     if (leaderId_ >= 0 && leaderId_ != cfg_.selfId)
         return onTransport([&](auto& t) { return t.sendFetchRequestTo(leaderId_, req); });
     return onTransport([&](auto& t) { return t.sendFetchRequest(req); });

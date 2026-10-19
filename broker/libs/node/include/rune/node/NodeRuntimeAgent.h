@@ -40,6 +40,9 @@
 #include <rune/node/OwnerThreadTestTask.h>
 #include <rune/node/LeaderObserver.h>
 #include <rune/node/ControlledShutdown.h>
+#include <rune/node/StorageGate.h>
+#include <rune/consensus/SbeConsensusPublisher.h>
+#include <rune/replication/InternalIsrKnowledge.h>
 #include <rune/replication/AeronPartitionTransport.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune_fr/FlightRecorder.h>
@@ -175,6 +178,22 @@ public:
     /// F9a: the control-thread → observer leadership ring.  Set before start.
     void setLeaderObserver(LeaderObserver* o) noexcept { leaderObserver_ = o; }
 
+    // -----------------------------------------------------------------------
+    // ISR v3 Step 9 - the storage gate wiring.  All set by BrokerNode before the runtime thread starts; read only
+    // on this (control) thread.  A null gate (single node) means open everywhere.
+    // -----------------------------------------------------------------------
+    void setStorageGate(StorageGate* g) noexcept { storageGate_ = g; }
+    void setKnowledge(rune::replication::InternalIsrKnowledge* k) noexcept { knowledge_ = k; }
+    /// The consensus publisher whose CanvassPosition flags this agent sets every cycle (R12).
+    void setCanvassPublisher(rune::consensus::SbeConsensusPublisher* p) noexcept { canvassPublisher_ = p; }
+    /// node-state.dat existed with candidateTermId > 0, or term.log was non-empty, when the consensus objects were built.
+    void setBootHistory(bool h) noexcept { bootHistory_ = h; }
+    /// TEST seams (NodeConfig::testCandidacyHoldAtBoot sets it before start; the tests toggle it through
+    /// onControlThreadForTest): hold the candidacy regardless of the gate.
+    void setTestCandidacyHold(bool h) noexcept { testCandidacyHold_ = h; }
+    [[nodiscard]] int32_t canvassFlagsForTest() const noexcept { return canvassPublisher_ ? canvassPublisher_->canvassFlags() : -1; }
+    [[nodiscard]] const StorageGate* storageGate() const noexcept { return storageGate_; }
+
     int drainNodeControl_() {
         int sent = 0;
         if (auto& out = metadataService_->nodeControlOutbox(); !out.empty()) [[unlikely]] {
@@ -264,6 +283,7 @@ private:
         ++cycles_;
         // 1. Consensus (Election + IngressRing drain).
         int work = consensus_.doWork(nowNs);   // direct call (Single / Multi), never virtual in BrokerNode
+        work += serviceStorageGate_(nowNs);    // ISR v3 Step 9: flags, gate, hold - right after the consensus step
         // Task 11 fix 1: hand the gateway this cycle's leadership as a plain value
         // (was a per-cycle std::function LeaderView — which also built a
         // std::string on followers).  Same value BrokerNode::isLeader() reads.
@@ -1103,6 +1123,49 @@ private:
             if (v.nextIndex >= total) v.published = true;
         }
         return work;
+    }
+    // ISR v3 Step 9 (control thread).
+    StorageGate*                                       storageGate_       = nullptr;
+    rune::replication::InternalIsrKnowledge*           knowledge_         = nullptr;
+    rune::consensus::SbeConsensusPublisher*            canvassPublisher_  = nullptr;
+    bool                                               bootHistory_       = false;
+    bool                                               testCandidacyHold_ = false;
+    /// R12 flags (every cycle) + the gate evaluation (A-M4: right after the consensus step, before the bridge).
+    int serviceStorageGate_(int64_t nowNs) {
+        int work = 0;
+        if (canvassPublisher_ != nullptr && election_ != nullptr)
+            canvassPublisher_->setCanvassFlags(
+                2 | ((bootHistory_ || election_->leadershipTermId() > 0 || election_->candidateTermId() > 0) ? 1 : 0));
+        if (storageGate_ == nullptr || metadataService_ == nullptr) return work;
+        const auto ch = storageGate_->evaluate(metadataService_->msm(), evidence_(), nowNs);
+        if (election_) election_->setStorageHold(!storageGate_->mayStand() || testCandidacyHold_, nowNs);
+        using C = StorageGate::Change;
+        if ((ch == C::founded || ch == C::joined)) {
+            controlledShutdown_.setStorage(storageGate_->id(), storageGate_->originWireCode());
+            work += controlledShutdown_.reportStorageDecided();
+        }
+        if ((ch == C::joined || ch == C::unconfirmed) && knowledge_) knowledge_->setFailClosed();
+        if ((ch == C::founded || ch == C::confirmed || ch == C::unconfirmed) && bridge_) bridge_->onStorageGateChanged();
+        if (ch == C::unconfirmed && election_ && election_->isClosed() && election_->leaderMemberId() == selfId_)
+            (void)election_->standDown(nowNs, 0);   // M14: a leader whose storage was disowned hands the leadership on
+        return work + (ch != C::none ? 1 : 0);
+    }
+    [[nodiscard]] Evidence evidence_() const {
+        Evidence e;
+        if (election_ != nullptr) {
+            e.heardFresh      = election_->peersHeardFreshCount();
+            e.members         = static_cast<int>(election_->clusterSize());
+            e.anyHistory      = election_->anyPeerHistory();
+            e.maxPeerTerm     = election_->maxPeerLeadershipTermId();
+            e.peerWithHistory = election_->peerWithHistory();
+            e.peersHeard      = election_->peersHeardCount();
+            e.controllerId    = election_->leaderMemberId();
+            e.controllerTerm  = election_->leadershipTermId();
+        }
+        if (knowledge_ != nullptr && knowledge_->latest(rune::replication::InternalIsrKnowledge::kCandidacyTopicId, 0) != nullptr)
+            e.anyHistory = true;   // a durable metadata-ISR state is history
+        if (bridge_ != nullptr) e.heldLeaderRoles = bridge_->leaderRolesHeld();
+        return e;
     }
     rune::consensus::SlowTick                          failoverTick_;
     std::uint64_t                                      cycles_                = 0;

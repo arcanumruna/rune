@@ -185,6 +185,18 @@ public:
     /// state was persisted (LOW-A).
     [[nodiscard]] bool votable() const noexcept { return votable_; }
 
+    /// ISR v3 I-S4 / A-M5 (no new flag, M16): the node's storage is not (yet) trusted - a Joiner, or a storage the
+    /// controller disowned.  Clears `votable_` until the next successful offer() of a CURRENT-leadership state
+    /// sets it again (as today), whatever the file or an adopt() holds.  Control thread.
+    void setFailClosed() noexcept { votable_ = false; }
+    /// The newest held state's candidacy rule IGNORING votable_ (adopted states included): used only by the unsafe
+    /// disaster-recovery vote (RUNE_STORAGE_RECOVERY_VOTE).  A pending load still refuses.
+    [[nodiscard]] bool eligibleLearned(int32_t candidate) const noexcept {
+        if (loadPending_) return false;
+        const InternalIsrState* m = latest(kCandidacyTopicId, 0);
+        return m == nullptr || m->contains(candidate);
+    }
+
     [[nodiscard]] std::size_t size() const noexcept { return entries_.size(); }
     [[nodiscard]] uint64_t persistsForTest() const noexcept { return persists_; }
     [[nodiscard]] uint64_t staleTermRefusals() const noexcept { return staleTermRefusals_; }

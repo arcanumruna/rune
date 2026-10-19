@@ -19,6 +19,7 @@
 #include <rune/node/NodeConfig.h>
 #include <rune/node/RoleCounter.h>
 #include "support/TestWorkerCount.h"
+#include "support/CatalogBrokerCluster.h"
 
 #include <CncFileReader.h>
 #include <concurrent/CountersReader.h>
@@ -237,4 +238,51 @@ TEST(RoleCounterPublishTest, CatalogApplyMetricsReadableFromCncRegression) {
     });
     EXPECT_TRUE(await(5, 8)) << "halted offset 7 → counter 8; applied=" << applied << " halted=" << halted;
     node.stop();
+}
+
+// ===========================================================================
+// ISR v3 Step 9 (section 3.10): the storage gate counter is published to the CnC file and an external reader sees it
+// move: a wiped (Joiner) node reads UNCONFIRMED (1) while its storage is unconfirmed, then CONFIRMED (0).
+// RED: no publish (the counter never leaves its initial value).
+// ===========================================================================
+namespace {
+// The first counter of `typeId` in the CnC file at `aeronDir`; false when absent.
+bool readCounterByType(const fs::path& aeronDir, std::int32_t typeId, std::int64_t& value) {
+    try {
+        aeron::CncFileReader reader = aeron::CncFileReader::mapExisting(aeronDir.string().c_str());
+        aeron::concurrent::CountersReader counters = reader.countersReader();
+        bool found = false;
+        counters.forEach([&](std::int32_t id, std::int32_t t, const aeron::concurrent::AtomicBuffer&, const std::string&) {
+            if (t == typeId && !found) { value = counters.getCounterValue(id); found = true; }
+        });
+        return found;
+    } catch (...) {
+        return false;
+    }
+}
+}  // namespace
+
+TEST(RoleCounterRegression, StorageGateCountersArePublishedRegression) {
+    using namespace rune::node::test::catalog_cluster;
+    ThreeNodes c = ThreeNodes::start("rolectr");
+    ASSERT_TRUE(c.awaitCatalogLeader(30s));
+    const int X = c.catalogLeaderId() == 1 ? 2 : 1;
+    c.stop(X);
+    c.wipe(X);
+    // The joiner emits no follower fetch for a while, so its UNCONFIRMED state lasts long enough to be observed.
+    c.configTweak = [&](NodeConfig& k) { if (k.nodeId == X) k.testHoldFollowerFetchesMs = 2000; };
+    c.startNode(X);
+    const fs::path aeronDir = c.dirs[static_cast<std::size_t>(X - 1)]->path / "aeron";
+    bool sawOne = false, sawZeroAfter = false;
+    const auto deadline = std::chrono::steady_clock::now() + 30s;
+    while (!sawZeroAfter && std::chrono::steady_clock::now() < deadline) {
+        std::int64_t v = -1;
+        if (readCounterByType(aeronDir, kStorageGateStateCounterTypeId, v)) {
+            if (v == 1) sawOne = true;
+            if (v == 0 && sawOne) sawZeroAfter = true;
+        }
+        if (!sawZeroAfter) std::this_thread::sleep_for(20ms);
+    }
+    EXPECT_TRUE(sawOne) << "the storage gate counter never read UNCONFIRMED (1) on the wiped node";
+    EXPECT_TRUE(sawZeroAfter) << "the storage gate counter never returned to CONFIRMED (0)";
 }

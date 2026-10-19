@@ -278,6 +278,14 @@ struct NodeConfig {
     // test can probe it.  0 (default): no hold; never set in production.
     int64_t testUserDecisionHoldMs = 0;
 
+    // TEST-ONLY (ISR v3 Step 9, R-I1): hold the consensus candidacy from boot even for a Founder/Legacy storage,
+    // until the test releases it (BrokerNode::setTestCandidacyHold).  Makes a fresh-cluster formation
+    // deterministic: every node decides its storage before anyone stands.  Never set in production.
+    bool testCandidacyHoldAtBoot = false;
+    // TEST-ONLY (ISR v3 Step 9, B-I8): every replica of this node emits no follower fetch for this long after
+    // start (PartitionReplica::holdFetchesUntilForTest) - a wiped member that cannot catch up yet.  0 = off.
+    int64_t testHoldFollowerFetchesMs = 0;
+
     // Follower periodic-fetch backstop cadence (RUNE_FETCH_INTERVAL_US, default
     // 5000µs = 5ms).  GR-10 push + fast-ack is meant to drive replication; this
     // is only the lost-push backstop + ISR keepalive.  Exposed so acks=all

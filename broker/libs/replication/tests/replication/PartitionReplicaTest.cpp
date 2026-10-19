@@ -4948,3 +4948,26 @@ TEST(PartitionReplicaCaughtUpRegression, AFollowerIsCaughtUpOnlyOnceItsCurrentLe
     l.becomeLeader(3, {kL});
     EXPECT_TRUE(l.caughtUpWithLeader()) << "a leader's own HW is the truth (the caller checks its commit state)";
 }
+
+// ISR v3 I-S4 / A-M5: setFailClosed() clears votable_ whatever the file or an adopt() holds, until the next
+// successful offer() of a current-leadership state.  RED: a fail-closed that applies only when the file is absent.
+TEST(InternalIsrKnowledgeRegression, FailClosedAfterAdoptRegression) {
+    TempDir d("failclosed");
+    InternalIsrKnowledge k(d.path + "/internal-isr.state");
+    auto st = [](int64_t epoch, int64_t version, std::initializer_list<int32_t> m) {
+        InternalIsrState x{};
+        x.topicId = -3; x.partition = 0; x.leaderEpoch = epoch; x.version = version;
+        for (int32_t n : m) x.members[static_cast<std::size_t>(x.count++)] = n;
+        return x;
+    };
+    ASSERT_TRUE(k.adopt(st(6, 3, {1, 2})));   // a state held (adopted)
+    ASSERT_TRUE(k.eligible(1));
+    k.setFailClosed();
+    EXPECT_FALSE(k.eligible(1)) << "a fail-closed knowledge still votes for a member of the adopted state";
+    EXPECT_FALSE(k.eligible(3));
+    EXPECT_TRUE(k.eligibleLearned(1)) << "the recovery vote reads the adopted state";
+    EXPECT_FALSE(k.eligibleLearned(3));
+    ASSERT_TRUE(k.offer(st(7, 1, {1, 3})));   // the current leadership proves the knowledge again
+    EXPECT_TRUE(k.eligible(3));
+    EXPECT_FALSE(k.eligible(2));
+}
