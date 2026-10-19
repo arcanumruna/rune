@@ -150,7 +150,9 @@ if(NOT TARGET rune_crypto)
 add_library(rune_crypto STATIC
     ${RUNE_CRYPTO_ROOT}/src/Caps.cpp
     ${RUNE_CRYPTO_ROOT}/src/Aead.cpp
-    ${RUNE_CRYPTO_ROOT}/src/TlsSession.cpp)
+    ${RUNE_CRYPTO_ROOT}/src/TlsSession.cpp
+    ${RUNE_CRYPTO_ROOT}/src/Kdf.cpp
+    ${RUNE_CRYPTO_ROOT}/src/Scram.cpp)
 target_include_directories(rune_crypto PUBLIC ${RUNE_CRYPTO_ROOT}/include)
 target_link_libraries(rune_crypto PUBLIC OpenSSL::SSL OpenSSL::Crypto)
 target_compile_features(rune_crypto PUBLIC cxx_std_23)
