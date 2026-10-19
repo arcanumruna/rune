@@ -4780,3 +4780,37 @@ TEST(StorageRegistrationRegression, BelowCommittedReportFencesTheLeadersStorageR
     EXPECT_STREQ(c.svc->storageRegStateForTest(2), "None");
     EXPECT_GT(n2(), before) << "the storage was not re-confirmed";
 }
+
+// CP3 I3: the wiped leader has already shrunk the refusing followers out of the ISR ({2} alone) when the report is
+// decided: no other live member exists.  The partition goes leaderless without the node (StorageReset at level 2) - the
+// generic bump path would re-grant it to the leader that lost data at e + 1 and the followers would truncate across the
+// epoch.  RED: skip the LostCommitted branch in decideBumps_ (`if (false && ...)`): node 2 is re-granted at e + 1.
+TEST(StorageRegistrationRegression, BelowCommittedReportWithNoOtherIsrMemberGoesLeaderlessNotReGrantedRegression) {
+    CtlRig c;
+    leaderTwoWithFullIsr(c);
+    ASSERT_TRUE(proposeWithCapture(c, {2}, {}).accepted);   // the wiped leader shrank the refusers out
+    ASSERT_EQ(c.pa().isr.size(), 1u);
+    const int32_t e = c.pa().leaderEpoch;
+    const auto a = sendReport(c, 1, e);
+    ASSERT_TRUE(a.answered);
+    EXPECT_EQ(a.code, rune::replication::kAlterIsrOk);
+    c.tick(); c.drive(50);
+    EXPECT_EQ(c.pa().leaderNode, rune::metadata::NO_LEADER) << "the leader that lost data was re-granted";
+    EXPECT_EQ(c.pa().leaderEpoch, e + 1);
+    EXPECT_EQ(c.pa().mark.kind, rune::metadata::LeaderlessMark::Kind::StorageReset);
+}
+
+// The same at feature level 1: leaderless too, with no StorageReset mark (the mark is level >= 2).
+TEST(StorageRegistrationRegression, BelowCommittedReportWithNoOtherIsrMemberAtFeatureLevelOneGoesLeaderlessRegression) {
+    CtlRig c(true, {}, rune::replication::MetadataFeature::kBase);
+    ASSERT_LT(c.svc->featureLevel(), 2);
+    leaderTwoWithFullIsr(c);
+    ASSERT_TRUE(proposeWithCapture(c, {2}, {}).accepted);
+    ASSERT_EQ(c.pa().isr.size(), 1u);
+    const int32_t e = c.pa().leaderEpoch;
+    ASSERT_TRUE(sendReport(c, 1, e).answered);
+    c.tick(); c.drive(50);
+    EXPECT_EQ(c.pa().leaderNode, rune::metadata::NO_LEADER);
+    EXPECT_EQ(c.pa().leaderEpoch, e + 1);
+    EXPECT_EQ(c.pa().mark.kind, rune::metadata::LeaderlessMark::Kind::None);
+}
