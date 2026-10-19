@@ -1319,19 +1319,20 @@ TEST(ConformanceGolden, SecurityDdlCreateUserSetPasswordGrant) {
     EXPECT_EQ(encodeVec(av::grant()), gr);
     d = rpc::SecurityDdl::decode(gr.data(), gr.size());
     ASSERT_TRUE(d);
-    EXPECT_EQ(d->kind, rpc::SecurityOpKind::Grant); EXPECT_EQ(d->op, 2); EXPECT_EQ(d->patternKind, 1);
+    EXPECT_EQ(d->kind, rpc::SecurityOpKind::Grant); EXPECT_EQ(d->op, 1); EXPECT_EQ(d->resourceType, 1); EXPECT_EQ(d->patternKind, 1);   // WRITE TOPIC PREFIX
     EXPECT_EQ(d->pattern, "world.");
 }
 
 TEST(ConformanceGolden, SecurityBootstrap) {
     const auto golden = readVector("security_bootstrap.bin");
-    ASSERT_EQ(golden.size(), 261u);
+    ASSERT_EQ(golden.size(), 293u);   // incl. the 32-byte fake-salt seed (D8)
     expectHeader(golden, 80, 0);
     EXPECT_EQ(encodeVec(av::bootstrap()), golden);
     auto d = rpc::SecurityBootstrap::decode(golden.data(), golden.size());
     ASSERT_TRUE(d);
     EXPECT_EQ(d->adminName, "admin"); EXPECT_EQ(d->verifier, av::verifier());
     EXPECT_EQ(d->nonce, av::bootstrap().nonce); EXPECT_EQ(d->mac, av::bootstrap().mac);
+    EXPECT_EQ(d->fakeSaltSeed, av::bootstrap().fakeSaltSeed);
 }
 
 TEST(ConformanceGolden, ConnectResponseV9) {

@@ -60,7 +60,8 @@ inline SecurityDdl grant() {
     SecurityDdl m; m.sessionId = kSession; m.correlationId = kCorr; m.ext = ext();
     m.ext.statement = "GRANT WRITE ON TOPIC PREFIX 'world.' TO USER ws1";
     m.kind = SecurityOpKind::Grant; m.name = "ws1";
-    m.granteeKind = 0; m.op = 2; m.resourceType = 0; m.patternKind = 1; m.pattern = "world."; return m;
+    m.granteeKind = 0; m.op = 1; m.resourceType = 1; m.patternKind = 1; m.pattern = "world.";   // WRITE TOPIC PREFIX (a grant v1 accepts)
+    return m;
 }
 inline SecurityDdl setPassword() {
     SecurityDdl m = createUser();
@@ -70,6 +71,7 @@ inline SecurityDdl setPassword() {
 inline SecurityBootstrap bootstrap() {
     SecurityBootstrap m; m.sessionId = kSession; m.correlationId = kCorr;
     m.adminName = "admin"; m.verifier = verifier();
+    for (std::size_t i = 0; i < m.fakeSaltSeed.size(); ++i) m.fakeSaltSeed[i] = static_cast<uint8_t>(0x40 + i);
     for (std::size_t i = 0; i < m.nonce.size(); ++i) m.nonce[i] = static_cast<uint8_t>(0x10 + i);
     for (std::size_t i = 0; i < m.mac.size(); ++i) m.mac[i] = static_cast<uint8_t>(0x80 + i);
     return m;

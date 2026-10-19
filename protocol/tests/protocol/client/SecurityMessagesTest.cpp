@@ -101,13 +101,14 @@ TEST(SecurityMessagesRegression, BootstrapRoundTripsAndMacInputIsStable) {
     b.sessionId = 7; b.correlationId = 9; b.adminName = "admin";
     b.verifier = {kSalt, 4096, kStored, kServer};
     for (std::size_t i = 0; i < b.nonce.size(); ++i) b.nonce[i] = static_cast<uint8_t>(0x10 + i);
+    for (std::size_t i = 0; i < b.fakeSaltSeed.size(); ++i) b.fakeSaltSeed[i] = static_cast<uint8_t>(0x40 + i);
     b.mac.fill(0xEE);
     uint8_t buf[512];
     const std::size_t n = b.encode(buf);
     ASSERT_EQ(n, b.encodedSize());
     auto d = pc::SecurityBootstrap::decode(buf, n);
     ASSERT_TRUE(d);
-    EXPECT_EQ(d->adminName, "admin"); EXPECT_EQ(d->verifier, b.verifier); EXPECT_EQ(d->nonce, b.nonce); EXPECT_EQ(d->mac, b.mac);
+    EXPECT_EQ(d->adminName, "admin"); EXPECT_EQ(d->verifier, b.verifier); EXPECT_EQ(d->nonce, b.nonce); EXPECT_EQ(d->mac, b.mac); EXPECT_EQ(d->fakeSaltSeed, b.fakeSaltSeed);
 
     std::vector<uint8_t> in;
     pc::bootstrapMacInput(b, in);
@@ -119,9 +120,10 @@ TEST(SecurityMessagesRegression, BootstrapRoundTripsAndMacInputIsStable) {
     want.push_back(16); want.push_back(0); app(kSalt);
     want.push_back(0x00); want.push_back(0x10); want.push_back(0); want.push_back(0);   // 4096 LE
     app(kStored); app(kServer);
+    for (std::size_t i = 0; i < 32; ++i) want.push_back(static_cast<uint8_t>(0x40 + i));   // fakeSaltSeed (D8)
     for (std::size_t i = 0; i < 16; ++i) want.push_back(static_cast<uint8_t>(0x10 + i));
     EXPECT_EQ(in, want);
-    EXPECT_EQ(in.size(), 17u + 2 + 5 + 2 + 16 + 4 + 64 + 64 + 16);
+    EXPECT_EQ(in.size(), 17u + 2 + 5 + 2 + 16 + 4 + 64 + 64 + 32 + 16);
 
     b.mac.fill(0);   // the MAC is not part of its own input
     std::vector<uint8_t> in2; pc::bootstrapMacInput(b, in2);
@@ -154,4 +156,41 @@ TEST(SecurityMessagesRegression, TruncationNeverDecodes) {
     ASSERT_EQ(b.encode(buf.data()), buf.size());
     for (std::size_t cut = 0; cut < buf.size(); ++cut)
         EXPECT_FALSE(pc::SecurityBootstrap::decode(buf.data(), cut)) << "bootstrap cut " << cut;
+}
+
+TEST(SecurityMessagesRegression, BootstrapMacCoversTheFakeSaltSeedRegression) {
+    pc::SecurityBootstrap b; b.adminName = "admin"; b.verifier = verifier();
+    b.fakeSaltSeed.fill(0x33);
+    std::vector<uint8_t> a, c;
+    pc::bootstrapMacInput(b, a);
+    for (std::size_t i = 0; i < b.fakeSaltSeed.size(); ++i) {   // every seed byte is covered
+        auto b2 = b; b2.fakeSaltSeed[i] ^= 1;
+        pc::bootstrapMacInput(b2, c);
+        ASSERT_EQ(a.size(), c.size());
+        EXPECT_NE(a, c) << "seed byte " << i;
+    }
+    // and travels on the wire: a bootstrap shorter than seed+nonce+mac never decodes
+    std::vector<uint8_t> buf(b.encodedSize());
+    ASSERT_EQ(b.encode(buf.data()), buf.size());
+    EXPECT_EQ(pc::SecurityBootstrap::decode(buf.data(), buf.size())->fakeSaltSeed, b.fakeSaltSeed);
+}
+
+TEST(SecurityMessagesRegression, OutOfRangeGrantEnumBytesDoNotDecodeRegression) {
+    uint8_t buf[512];
+    for (int field = 0; field < 4; ++field) {
+        const uint8_t bad[4] = {2, 7, 5, 2};   // first out-of-range value of grantee, op, type, pattern kind
+        auto m = make(pc::SecurityOpKind::Grant, "ws1"); m.pattern = "world.";
+        m.granteeKind = 1; m.op = 1; m.resourceType = 1; m.patternKind = 1;
+        std::size_t n = m.encode(buf); ASSERT_GT(n, 0u);
+        EXPECT_TRUE(pc::SecurityDdl::decode(buf, n)) << "the in-range baseline decodes";
+        uint8_t* f[4] = {&m.granteeKind, &m.op, &m.resourceType, &m.patternKind};
+        *f[field] = bad[field];
+        n = m.encode(buf); ASSERT_GT(n, 0u);
+        EXPECT_FALSE(pc::SecurityDdl::decode(buf, n)) << "field " << field;
+    }
+    // the largest valid values still decode
+    auto top = make(pc::SecurityOpKind::Revoke, "r"); top.pattern = "x";
+    top.granteeKind = 1; top.op = 6; top.resourceType = 4; top.patternKind = 1;
+    std::size_t n = top.encode(buf);
+    EXPECT_TRUE(pc::SecurityDdl::decode(buf, n));
 }
