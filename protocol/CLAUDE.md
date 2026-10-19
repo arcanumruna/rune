@@ -8,7 +8,7 @@
 > package is effectively `INTERFACE`.
 
 Released independently as a Conan package. Consumed by siblings via the source
-include path `../rune-protocol/include` (that is how the broker and client
+include path `../protocol/include` (that is how the broker and client
 resolve it during development).
 
 ---
@@ -132,20 +132,8 @@ the full statement (threading, fences, idling) that governs every Rune repo.
 
 ---
 
-## 5. Session workflow — keep the live dashboard updated
+## 5. Session workflow
 
-Rune streams its development **live** — https://rune.regressorspath.com (fed by
-the `rune-live` server). **Every session must keep it updated.**
-
-1. **Tickets — Planka (`planka` MCP).** Board **"Rune / Roadmap"**
-   (id `1861164569347490826`): Backlog · In Progress · In Review · Done. Create
-   a card before starting; move it as you progress.
-2. **Chat:** `scripts/rune-live.sh chat plan "..."` (kinds `plan`/`thought`/`status`).
-3. **Tests/benchmarks:** push results with a *stable* suite name as first arg
-   (e.g. `rune-protocol/codec`) — the dashboard folds re-runs by it:
-   ```
-   scripts/rune-live.sh test "rune-protocol/codec" passed \
-     passed=N failed=0 total=N commit=$(git rev-parse --short HEAD)
-   ```
-   Override `RUNE_PUSH_TOKEN` / `RUNE_LIVE_URL` as needed; formats in
-   `rune-live/README.md`.
+**Tickets - Planka (`planka` MCP).** Board **"Rune / Roadmap"**
+(id `1861164569347490826`): Backlog · In Progress · In Review · Done. Create
+a card before starting; move it as you progress.

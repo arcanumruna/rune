@@ -4,11 +4,11 @@
 > library** — producer, subscriber, and consumer-group member — that downstream
 > apps (e.g. world-server) link to talk to the `rune-broker` cluster over Aeron.
 > It shares the wire/record formats with the broker via the header-only
-> `rune-protocol` package (consumed at `../rune-protocol/include`).
+> `rune-protocol` package (consumed at `../protocol/include`).
 
 The design lives in
-`../rune-broker/docs/superpowers/specs/2026-09-11-rune-client-and-broker-runtime-design.md`
-and the milestone-acceptance notes under `../rune-broker/docs/superpowers/`.
+`../broker/docs/superpowers/specs/2026-09-11-rune-client-and-broker-runtime-design.md`
+and the milestone-acceptance notes under `../broker/docs/superpowers/`.
 
 ---
 
@@ -196,29 +196,16 @@ agents under `doWork`/`IdleStrategy`, no hot-path locks or allocation, lock-free
 ring buffers for cross-thread handoff, injected advanceable clocks in tests
 (advance-and-tick, hard iteration caps, no wall-clock waits, no `while(cond)
 doWork()`), and `IdleStrategy` back-off when idle (never a bare spin). The full
-statement is in `../rune-broker/CLAUDE.md` §7 — read it and mirror Aeron's C++
+statement is in `../broker/CLAUDE.md` §7 — read it and mirror Aeron's C++
 client exactly.
 
 ---
 
-## 5. Session workflow — keep the live dashboard updated
+## 5. Session workflow
 
-Rune streams its development **live** — https://rune.regressorspath.com (fed by
-the `rune-live` server). **Every session must keep it updated.**
-
-1. **Tickets — Planka (`planka` MCP).** Board **"Rune / Roadmap"**
-   (id `1861164569347490826`): Backlog · In Progress · In Review · Done. Create
-   a card before starting; move it as you progress.
-2. **Chat:** `scripts/rune-live.sh chat plan "..."` (kinds `plan`/`thought`/`status`).
-   (The helper lives in the `rune-broker` / `rune-live` repos.)
-3. **Tests/benchmarks:** push results with a *stable* suite name as first arg
-   (e.g. `rune-client/produce`) so the dashboard folds re-runs by it:
-   ```
-   rune-live.sh test "rune-client/produce" passed \
-     passed=N failed=0 total=N commit=$(git rev-parse --short HEAD)
-   ```
-   Override `RUNE_PUSH_TOKEN` / `RUNE_LIVE_URL` as needed; formats in
-   `rune-live/README.md`.
+**Tickets - Planka (`planka` MCP).** Board **"Rune / Roadmap"**
+(id `1861164569347490826`): Backlog · In Progress · In Review · Done. Create
+a card before starting; move it as you progress.
 
 ---
 
