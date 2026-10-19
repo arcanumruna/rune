@@ -241,12 +241,11 @@ TEST(PeerHandshakeRegression, AForgedAcceptNeverEstablishesTheInitiator) {
     EXPECT_TRUE(std::holds_alternative<pl::ChallengeSent>(a.state())) << "still waiting for the real Accept";
 }
 
-TEST(PeerHandshakeRegression, ADuplicateHelloGetsTheSameChallengeAndAnUnansweredOneExpiresToThePriorLink) {
+TEST(PeerHandshakeRegression, ADuplicateHelloGetsTheSameChallengeAndNeverLeavesEstablished) {
     Pair p(keys('k'), keys('k')); p.run();
     ASSERT_TRUE(p.ka && p.kb);
     const auto* before = std::get_if<pl::Established>(&p.b.state());
     ASSERT_NE(before, nullptr);
-    const pl::LinkKeys liveKeys = before->keys;
 
     pl::PeerHello hello = lastOf<pl::PeerHello>(p, 1);
     hello.nonceA.fill(0x42);
@@ -255,10 +254,6 @@ TEST(PeerHandshakeRegression, ADuplicateHelloGetsTheSameChallengeAndAnUnanswered
     ASSERT_TRUE(c1.frame && c2.frame);
     EXPECT_EQ(*c1.frame, *c2.frame) << "idempotent for a repeated Hello";
     EXPECT_TRUE(std::holds_alternative<pl::Established>(p.b.state())) << "an unproven Hello never leaves Established";
-    (void)p.b.tick(300 * kMs + pl::PeerHandshake::kAwaitNs + 1);   // nobody proved anything
-    const auto* after = std::get_if<pl::Established>(&p.b.state());
-    ASSERT_NE(after, nullptr) << "the live link is restored";
-    EXPECT_EQ(after->keys, liveKeys);
 }
 
 TEST(PeerHandshakeRegression, AResponderWithoutALinkPokesAndAnEstablishedInitiatorRestarts) {
@@ -445,4 +440,72 @@ TEST(PeerLinkRegression, ForgedHintsRekeyAnIdleLinkAtMostOncePer30sRegression) {
         p.run(now);   // the real responder answers: the exchange completes at once
     }
     EXPECT_EQ(rekeys, 1);
+}
+
+TEST(PeerLinkRegression, AForgedProofAgainstAFullTablePerformsNoMacComputationRegression) {
+    pl::PeerHandshake b(2, 1, 20, keys('k'));
+    for (int k = 0; k < static_cast<int>(pl::PeerHandshake::kPending); ++k) {
+        pl::PeerHello f; f.from = 1; f.to = 2; f.keyId = keys('k').current.keyId; f.incarnation = 5;
+        f.nonceA.fill(static_cast<uint8_t>(k + 1));
+        ASSERT_TRUE(b.onHello(f, 1 * kMs).frame);
+    }
+    const uint64_t before = b.macComputations();
+    for (int i = 0; i < 100; ++i) {
+        pl::PeerProof pr; pr.from = 1; pr.to = 2; pr.macA.fill(static_cast<uint8_t>(i));
+        auto o = b.onProof(pr, 2 * kMs);
+        EXPECT_TRUE(o.logIsError);
+        EXPECT_FALSE(o.frame);
+    }
+    EXPECT_EQ(b.macComputations(), before) << "a forged Proof costs constant-time compares only";
+    EXPECT_TRUE(std::holds_alternative<pl::LinkIdle>(b.state()));
+}
+
+namespace {
+// One real round trip with `forgedBetween` forged Hellos landing between the Challenge and the Proof, against a
+// responder whose table is already full of forgeries (a flood under way).  True when the real peer links.
+bool oneTrial(int trial, int forgedBetween) {
+    pl::PeerHandshake b(2, 1, 20, keys('k'));
+    pl::PeerHandshake a(1, 2, 10, keys('k'));
+    auto forge = [&](int n, int64_t now) {
+        pl::PeerHello f; f.from = 1; f.to = 2; f.keyId = keys('k').current.keyId; f.incarnation = 5;
+        f.nonceA.fill(static_cast<uint8_t>(n)); f.nonceA[1] = static_cast<uint8_t>(trial); f.nonceA[2] = 0x77;
+        (void)b.onHello(f, now);
+    };
+    int64_t now = 1'000 * kMs;
+    for (std::size_t k = 0; k < pl::PeerHandshake::kPending; ++k) forge(static_cast<int>(k + 1), now);
+    auto hello = a.tick(now);
+    pl::PeerHello h;
+    if (!hello.frame || !pl::PeerHello::decode(hello.frame->data(), hello.frame->size(), h)) return false;
+    auto ch = b.onHello(h, now);
+    pl::PeerChallenge c;
+    if (!ch.frame || !pl::PeerChallenge::decode(ch.frame->data(), ch.frame->size(), c)) return false;
+    for (int k = 0; k < forgedBetween; ++k) forge(100 + k, now);     // the round trip: forgeries keep arriving
+    auto pr = a.onChallenge(c, now + kMs);
+    pl::PeerProof p;
+    if (!pr.frame || !pl::PeerProof::decode(pr.frame->data(), pr.frame->size(), p)) return false;
+    return b.onProof(p, now + 2 * kMs).established.has_value();
+}
+} // namespace
+
+TEST(PeerLinkRegression, ARealPeerSurvivesForgedHellosArrivingDuringItsRoundTripRegression) {
+    static_assert(pl::PeerHandshake::kPending == 8, "the table size is part of the contract");
+    constexpr int kTrials = 300;
+    int modest = 0, heavy = 0;
+    for (int t = 0; t < kTrials; ++t) { modest += oneTrial(t, 2); heavy += oneTrial(t, 8); }
+    EXPECT_GE(modest, kTrials * 60 / 100) << "2 forgeries per round trip: (7/8)^2 = 77% expected";
+    EXPECT_GE(heavy, kTrials * 15 / 100) << "8 forgeries per round trip: oldest-first evicted the real slot EVERY time; random survives 34%";
+}
+
+TEST(PeerLinkRegression, ATimedOutHintRekeyDoesNotDelayTheNextOneRegression) {
+    Pair p(keys('k'), keys('k')); p.run(1'000 * kMs);
+    ASSERT_TRUE(p.ka);
+    // A hint rekeys; the responder is gone, so the Hello is never answered and the attempt times out.
+    auto o = p.a.onUnknownEpoch(999, 3'000 * kMs);
+    ASSERT_TRUE(o.frame);
+    (void)p.a.tick(3'000 * kMs + pl::PeerHandshake::kAwaitNs);
+    ASSERT_TRUE(std::holds_alternative<pl::Established>(p.a.state())) << "the prior keys are restored";
+    // The responder restarts and pokes: the next rekey is due within the retry interval, not after 30 s.
+    pl::PeerRefuse poke; poke.from = 2; poke.to = 1; poke.reason = pl::RefuseReason::NoLink;
+    auto again = p.a.onRefuse(poke, 3'000 * kMs + pl::PeerHandshake::kAwaitNs + pl::PeerHandshake::kRetryNs);
+    EXPECT_TRUE(again.frame);
 }

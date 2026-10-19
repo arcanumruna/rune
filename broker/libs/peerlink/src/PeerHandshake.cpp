@@ -96,6 +96,13 @@ PeerHandshake::Out errorOut(PeerHandshake::LogLine l) {
 PeerHandshake::PeerHandshake(int32_t self, int32_t peer, uint64_t selfIncarnation, const ClusterKeys& keys)
     : self_(self), peer_(peer), incarnation_(selfIncarnation), keys_(keys) {}
 
+bool PeerHandshake::mac_(const ClusterKey& key, bool isB, int32_t idA, int32_t idB, const std::array<uint8_t, 32>& nonceA,
+                         const std::array<uint8_t, 32>& nonceB, uint64_t incA, uint64_t incB, uint64_t keyId,
+                         std::array<uint8_t, 64>& out) {
+    ++macOps_;
+    return transcriptMac(key, isB, idA, idB, nonceA, nonceB, incA, incB, keyId, out);
+}
+
 PeerHandshake::Out PeerHandshake::refuseOut_(RefuseReason r, uint64_t keyId) {
     PeerRefuse m; m.from = self_; m.to = peer_; m.reason = r;
     Out o = frameOut(m);
@@ -126,7 +133,6 @@ PeerHandshake::Out PeerHandshake::rekey_(int64_t nowNs) {
     if (!rune::crypto::randomBytes({hs.nonceA.data(), hs.nonceA.size()})) return {};
     hs.keyId = keys_.current.keyId; hs.sentNs = nowNs; hs.startNs = nowNs; hs.prior = *e;
     lastExchangeNs_ = nowNs;
-    lastHintRekeyNs_ = nowNs;
     PeerHello m; m.from = self_; m.to = peer_; m.keyId = hs.keyId; m.incarnation = incarnation_; m.nonceA = hs.nonceA;
     state_ = hs;
     return frameOut(m);
@@ -180,24 +186,30 @@ PeerHandshake::Out PeerHandshake::onHello(const PeerHello& h, int64_t nowNs) {
     for (auto& c : pending_) {
         if (c.used && nowNs - c.sentNs < kAwaitNs && c.nonceA == h.nonceA && c.peerIncarnation == h.incarnation && c.keyId == h.keyId) {
             PeerChallenge m; m.from = self_; m.to = peer_; m.keyId = c.keyId; m.incarnation = incarnation_; m.nonceB = c.nonceB;
-            if (!transcriptMac(*key, true, peer_, self_, c.nonceA, c.nonceB, c.peerIncarnation, incarnation_, c.keyId, m.macB))
+            if (!mac_(*key, true, peer_, self_, c.nonceA, c.nonceB, c.peerIncarnation, incarnation_, c.keyId, m.macB))
                 return {};
             return frameOut(m);
         }
     }
-    // A NEW nonce: nothing about the link state changes.  It takes a free (or expired) slot, else evicts the oldest.
-    // (No per-ms gate: a gate is a lottery a flooder wins.  The agent bounds Hellos per duty pass.)
+    // A NEW nonce: nothing about the link state changes.  It takes a free (or expired) slot, else evicts a RANDOM live
+    // one (oldest-first would let a flooder kill the real slot after exactly kPending forgeries; random survives n
+    // forgeries with probability (7/8)^n).  No per-ms gate: a gate is a lottery a flooder wins.
     PendingChallenge* slot = nullptr;
-    for (auto& c : pending_) {
+    for (auto& c : pending_)
         if (!c.used || nowNs - c.sentNs >= kAwaitNs) { slot = &c; break; }
-        if (slot == nullptr || c.sentNs < slot->sentNs) slot = &c;
+    if (slot == nullptr) {
+        static_assert((kPending & (kPending - 1)) == 0, "random eviction index is a mask");
+        uint8_t r = 0;
+        if (!rune::crypto::randomBytes({&r, 1})) return {};
+        slot = &pending_[r & (kPending - 1)];
     }
     PendingChallenge cs;
     cs.used = true; cs.nonceA = h.nonceA; cs.keyId = h.keyId; cs.peerIncarnation = h.incarnation; cs.sentNs = nowNs;
     if (!rune::crypto::randomBytes({cs.nonceB.data(), cs.nonceB.size()}))
         return errorOut(logLine("peer link from node %d: no random bytes available", peer_));
     PeerChallenge m; m.from = self_; m.to = peer_; m.keyId = h.keyId; m.incarnation = incarnation_; m.nonceB = cs.nonceB;
-    if (!transcriptMac(*key, true, peer_, self_, cs.nonceA, cs.nonceB, cs.peerIncarnation, incarnation_, cs.keyId, m.macB)) return {};
+    if (!mac_(*key, true, peer_, self_, cs.nonceA, cs.nonceB, cs.peerIncarnation, incarnation_, cs.keyId, m.macB)) return {};
+    if (!mac_(*key, false, peer_, self_, cs.nonceA, cs.nonceB, cs.peerIncarnation, incarnation_, cs.keyId, cs.wantMacA)) return {};
     *slot = cs;
     return frameOut(m);
 }
@@ -209,12 +221,12 @@ PeerHandshake::Out PeerHandshake::onChallenge(const PeerChallenge& c, int64_t no
     const ClusterKey* key = keys_.byId(h->keyId);
     if (!key) return {};
     std::array<uint8_t, 64> want{};
-    if (!transcriptMac(*key, true, self_, peer_, h->nonceA, c.nonceB, incarnation_, c.incarnation, h->keyId, want)) return {};
+    if (!mac_(*key, true, self_, peer_, h->nonceA, c.nonceB, incarnation_, c.incarnation, h->keyId, want)) return {};
     if (!macEq(want, c.macB))   // not the responder (or a forgery): logged, the state stays, the Hello is retried on its timer
         return errorOut(logLine("peer link from node %d REFUSED: %s (key id %016llx)", peer_, refuseReasonText(RefuseReason::BadProof),
                                 static_cast<unsigned long long>(h->keyId)));
     PeerProof p; p.from = self_; p.to = peer_;
-    if (!transcriptMac(*key, false, self_, peer_, h->nonceA, c.nonceB, incarnation_, c.incarnation, h->keyId, p.macA)) return {};
+    if (!mac_(*key, false, self_, peer_, h->nonceA, c.nonceB, incarnation_, c.incarnation, h->keyId, p.macA)) return {};
     ChallengeSent cs;
     cs.nonceA = h->nonceA; cs.nonceB = c.nonceB; cs.keyId = h->keyId; cs.peerIncarnation = c.incarnation; cs.sentNs = nowNs;
     cs.prior = h->prior;
@@ -226,17 +238,15 @@ PeerHandshake::Out PeerHandshake::onProof(const PeerProof& p, int64_t nowNs) {
     if (initiator() || p.from != peer_ || p.to != self_) return {};
     PendingChallenge* cs = nullptr;
     const ClusterKey* key = nullptr;
+    // No HMAC here: the expected Proof was computed when the Challenge was issued; a forgery costs only compares.
     for (auto& c : pending_) {
         if (!c.used || nowNs - c.sentNs >= kAwaitNs) continue;
         const ClusterKey* k = keys_.byId(c.keyId);
         if (!k) continue;
-        std::array<uint8_t, 64> want{};
-        if (!transcriptMac(*k, false, peer_, self_, c.nonceA, c.nonceB, c.peerIncarnation, incarnation_, c.keyId, want)) continue;
-        if (macEq(want, p.macA)) { cs = &c; key = k; break; }
+        if (macEq(c.wantMacA, p.macA) && cs == nullptr) { cs = &c; key = k; }   // no early exit: constant work per table
     }
-    if (cs == nullptr)   // no pending challenge matches: a forgery or a stale Proof - logged, nothing changes
-        return errorOut(logLine("peer link from node %d REFUSED: %s (key id %016llx)", peer_, refuseReasonText(RefuseReason::BadProof),
-                                static_cast<unsigned long long>(keys_.current.keyId)));
+    if (cs == nullptr)   // no pending challenge matches: a forgery or a stale Proof (a Proof names no key id) - logged, nothing changes
+        return errorOut(logLine("peer link from node %d REFUSED: %s (no pending challenge matches)", peer_, refuseReasonText(RefuseReason::BadProof)));
     const uint32_t epoch = ++epochCounter_;
     auto keys = deriveLinkKeys(*key, self_, peer_, false, cs->nonceA, cs->nonceB, epoch);
     PeerAccept a; a.from = self_; a.to = peer_; a.linkEpoch = epoch;
@@ -266,6 +276,9 @@ PeerHandshake::Out PeerHandshake::onAccept(const PeerAccept& a, int64_t nowNs) {
     if (!keys) { restorePrior_(cs->prior, nowNs); return {}; }
     Established e{*keys, cs->peerIncarnation, nowNs, nowNs};
     const uint64_t id = cs->keyId;
+    // The hint-rekey cap is armed only by a rekey that COMPLETED against the same incarnation (the hint was false):
+    // an attempt that timed out (a restarted responder not yet answering) must not delay the next one.
+    if (cs->prior && cs->prior->peerIncarnation == cs->peerIncarnation) lastHintRekeyNs_ = nowNs;
     state_ = e;
     Out o;
     o.established = *keys;

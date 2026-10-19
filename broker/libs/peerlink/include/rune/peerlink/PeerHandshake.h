@@ -46,6 +46,7 @@ struct ChallengeSent {
 struct PendingChallenge {
     bool used = false;
     std::array<uint8_t, 32> nonceA{}, nonceB{}; uint64_t keyId = 0; uint64_t peerIncarnation = 0; int64_t sentNs = 0;
+    std::array<uint8_t, 64> wantMacA{};   // the Proof we expect, computed once when the Challenge is issued
 };
 using LinkState = std::variant<LinkIdle, HelloSent, ChallengeSent, Established>;
 
@@ -99,11 +100,15 @@ public:
     /// An authenticated frame from this peer arrived on a sealed transport.
     void onAuthenticated(int64_t nowNs) noexcept;
 
+    /// Test-visible: HMAC transcript computations performed so far (pins that a forged Proof costs none).
+    [[nodiscard]] uint64_t macComputations() const noexcept { return macOps_; }
     [[nodiscard]] const LinkState& state() const noexcept { return state_; }
     [[nodiscard]] bool initiator() const noexcept { return self_ < peer_; }
     [[nodiscard]] int32_t peer() const noexcept { return peer_; }
 
 private:
+    bool mac_(const ClusterKey& key, bool isB, int32_t idA, int32_t idB, const std::array<uint8_t, 32>& nonceA,
+              const std::array<uint8_t, 32>& nonceB, uint64_t incA, uint64_t incB, uint64_t keyId, std::array<uint8_t, 64>& out);
     Out refuseOut_(RefuseReason r, uint64_t keyId);
     Out rekey_(int64_t nowNs);
     void restorePrior_(const std::optional<Established>& prior, int64_t nowNs) noexcept;
@@ -113,6 +118,7 @@ private:
     ClusterKeys keys_;
     uint32_t    epochCounter_ = 0;      // the responder's link epochs (Accept{epoch = counter + 1})
     std::array<PendingChallenge, kPending> pending_{};
+    uint64_t    macOps_ = 0;
     int64_t     lastHintRekeyNs_ = -1'000'000'000'000;
     int64_t     lastExchangeNs_ = -1'000'000'000'000;   // start of the last NEW exchange (<= 1 per kRetryNs)
     LinkState   state_{LinkIdle{0}};
