@@ -23,3 +23,20 @@ JAVA=/Applications/CLion.app/Contents/jbr/Contents/Home/bin/java   # or any JDK 
 
 The `sbe-all` fat jar (real-logic Simple Binary Encoding, `uk.co.real-logic:sbe-all`,
 now the aeron-io project) is vendored under `tools/` for reproducible, offline codegen.
+
+## `rune-replication.xml` (schemaId 112) - version 4 (ISR protocol v3)
+
+Version 4 is additive: every new field is `sinceVersion="4"`, an old decoder reads the fields it knows, and a new decoder
+treats an absent field as 0 (or -1 where noted). The wire minimum stays 3.
+
+| Message | New in v4 |
+|---|---|
+| `FetchRequest` (hand-rolled codec, block 44 -> 60) | `storageId int64` (the follower's storage identity), `lastEpochStartOffset int64` (where the follower's copy of `lastFetchedEpoch` starts; -1 = not held / unknown, never compared) |
+| `FetchResponse` | error code `-11` `kErrEpochHistoryMismatch`; payload `{int32 epoch, int64 leaderStartOffset}` |
+| `AlterIsr` (block 92 -> 232) | `proposalId int64` (correlation only, never part of the compare-and-set), `isrStorage int64[16]` (the storage id of each proposed member), `sendSeq int32` |
+| `AlterIsrResponse` (block 26 -> 46) | `proposalId int64`, `controllerEpoch int64`, `sendSeq int32` (echo / term of the answering controller; 0 = a v3 peer) |
+
+A below-committed report is an `AlterIsr` with `isrCount = kLeaderEpochBump`, `isr[1] = 2048`
+(`kBumpLeaderBelowCommitted`), `isr[2]` the floor and `proposalId` the report id; an old controller answers it Fenced.
+The node-control register carries the storage id in `isr[7]`/`isr[8]` and its origin in `isr[9]`. The broker's
+hand-rolled codecs (`ReplicationMessages.h`) are the reference for block clamping.
