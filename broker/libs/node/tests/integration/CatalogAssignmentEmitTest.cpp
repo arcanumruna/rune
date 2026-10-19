@@ -4108,7 +4108,8 @@ TEST(StorageRegistrationRegression, JoinerIsStrippedFromEveryIsrBeforeItsStorage
 
 // The catalog partition (-6) is stripped like a user partition, and the confirmation waits for it.  (fenceIsrs_ removes
 // the same follower from the ISR, so the strip pass alone cannot be isolated here: the test pins the OUTCOME - no
-// partition names the node, and its storage commits.)
+// partition names the node, and its storage commits.)  RED (CP2 M5) needs TWO mutations: leave storage-pending nodes in
+// the effective set (so fenceIsrs_ no longer removes them) AND make the strip pass skip topic -6.
 TEST(StorageRegistrationRegression, CatalogPartitionIsStrippedTooRegression) {
     CtlRig c(false);
     c.svc->setCoordinatorPartitions({{-1, 0}, {-6, 0}}, c.all);
@@ -4148,6 +4149,29 @@ TEST(StorageRegistrationRegression, WipedSoleLeaderOfATransientPartitionKeepsIts
     ASSERT_EQ(c.pa().leaderNode, rune::metadata::NO_LEADER);
     EXPECT_EQ(c.pa().isr, std::vector<int32_t>{3});
     EXPECT_EQ(c.pa().mark.kind, LeaderlessMark::Kind::EmptyMemoryLeader);
+    // CP2 I1: the lineage must survive the LATER ticks too (the strip pass must not remove 3), the storage is confirmed
+    // without it, and the partition is not stranded: fresh reports elect 3.  RED: no keptTransientLineage_ skip.
+    for (int i = 0; i < 4; ++i) c.tick();
+    EXPECT_EQ(c.pa().isr, std::vector<int32_t>{3}) << "a later tick stripped the kept transient lineage";
+    EXPECT_EQ(c.pa().mark.kind, LeaderlessMark::Kind::EmptyMemoryLeader);
+    EXPECT_EQ(c.svc->msmForTest().nodeStorage(3), 0xB) << "the storage was never confirmed";
+    const int32_t lle = c.pa().leaderEpoch;
+    for (int32_t n : {1, 2, 3}) (void)c.svc->onAlterIsr(leaderlessReport(n, lle, 0, 5 + n));
+    c.tick();
+    EXPECT_EQ(c.pa().leaderNode, 3) << "the transient partition stayed leaderless";
+}
+
+// CP2 I1 sibling: a DISK partition's lineage {3} is still stripped (the same outcome is RED under a predicate that
+// ignores the mark and the transient test: LeaderlessLineageDropsTheResetNodeRegression).
+TEST(StorageRegistrationRegression, WipedSoleLeaderOfADiskPartitionStillLosesItsLineageRegression) {
+    CtlRig c;
+    c.forceLeader(3);
+    (void)registerStorage(*c.svc, 3, 0xB, kStorageOriginJoiner, 9);
+    c.tick(); c.drive(100);
+    for (int i = 0; i < 3; ++i) c.tick();
+    EXPECT_EQ(c.pa().leaderNode, rune::metadata::NO_LEADER);
+    EXPECT_TRUE(c.pa().isr.empty());
+    EXPECT_EQ(c.pa().mark.kind, LeaderlessMark::Kind::StorageReset);
 }
 
 // A NO_LEADER lineage {3} drops the reset node.  RED: skip NO_LEADER partitions in the strip.

@@ -1711,9 +1711,18 @@ public:
         }
         return false;
     }
+    /// A-I10 (CP2 I1): the lineage {N} that `failOverWithout_` keeps for a wiped sole leader of a TRANSIENT (memory)
+    /// partition.  A memory partition's data does not survive a restart, so N's storage identity does not matter for
+    /// it: the strip and the confirmation must leave it alone (disk partitions are still stripped).
+    [[nodiscard]] bool keptTransientLineage_(int32_t topicId, const rune::metadata::PartitionAssignment& pa,
+                                             int32_t node) const noexcept {
+        return pa.leaderNode == rune::metadata::NO_LEADER && pa.mark.kind == rune::metadata::LeaderlessMark::Kind::EmptyMemoryLeader &&
+               pa.mark.node == node && isTransient_(topicId);
+    }
     [[nodiscard]] bool committedMapNames_(int32_t node) const {
         bool names = false;
-        msm_.committedMap().forEach([&](int32_t, int32_t, const rune::metadata::PartitionAssignment& pa) {
+        msm_.committedMap().forEach([&](int32_t topicId, int32_t, const rune::metadata::PartitionAssignment& pa) {
+            if (keptTransientLineage_(topicId, pa, node)) return;
             if (!names && (pa.leaderNode == node || std::find(pa.isr.begin(), pa.isr.end(), node) != pa.isr.end()))
                 names = true;
         });
@@ -1869,6 +1878,7 @@ public:
             msm_.committedMap().forEach([&](int32_t topicId, int32_t partition, const rm::PartitionAssignment& pa) {
                 const bool leads = pa.leaderNode == N;
                 if (!leads && std::find(pa.isr.begin(), pa.isr.end(), N) == pa.isr.end()) return;
+                if (!leads && keptTransientLineage_(topicId, pa, N)) return;
                 ++left;
                 const int64_t key = partitionKey_(topicId, partition);
                 bool busy = inflight_.count(key) != 0;
