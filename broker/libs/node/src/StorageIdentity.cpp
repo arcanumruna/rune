@@ -405,6 +405,13 @@ SI::Loaded SI::resolve(const std::string& d, StorageFormat fmt, bool singleNode,
         // 6. The manifest check.
         for (const auto& [k, n] : kClasses)
             if (has(l.manifest, k) && !classPresent(dir, k)) throw StorageRefusal(r3b(d, n, missingFilesOf(dir, k)));
+        // CP1 N1 (finishes M3): a Joiner whose manifest never recorded `knowledge` must not load an internal-isr.state
+        // that exists anyway - it is a restored file left by a crash between --reassign-join's storage.meta write and
+        // its unlink.  Delete it before BrokerNode opens it, so it can neither be loaded nor voted.
+        if (l.origin == Origin::Joiner && !has(l.manifest, Class::Knowledge) && fs::exists(dir / "internal-isr.state")) {
+            unlinkDurably(dir, "internal-isr.state");
+            spdlog::warn("storage: {} - removed a stale internal-isr.state (a Joiner's knowledge starts empty)", d);
+        }
         // The env is only read when formatting (R-W1 / R-W2).
         if (fmt == StorageFormat::New) {
             spdlog::info("RUNE_STORAGE_FORMAT ignored: already formatted");

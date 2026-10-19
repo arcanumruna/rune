@@ -424,8 +424,9 @@ TEST(StorageIdentityRegression, ReassignJoinOnAPreUpgradeDirWritesTheJoinerBefor
     const auto res = StorageIdentity::reassignJoin(d);
     EXPECT_EQ(res.code, 74) << "the unlink must have failed: " << res.out << res.err;
     ASSERT_TRUE(fs::exists(t.path / "storage.meta")) << "no storage.meta: the crash window adopts the dir as Legacy";
-    const auto n = StorageIdentity::resolve(d, StorageFormat::Required, false);
-    EXPECT_EQ(n.origin, Origin::Joiner) << "a dir interrupted mid-command must already be a Joiner";
+    std::ifstream mf(t.path / "storage.meta");
+    std::stringstream ms; ms << mf.rdbuf();
+    EXPECT_NE(ms.str().find("origin=joiner"), std::string::npos) << "a dir interrupted mid-command must already be a Joiner";
 }
 
 // CP1 review M4: an UNREADABLE storage.meta (EACCES/EIO) is an I/O fault, not a corrupt identity - R-2 would advise
@@ -438,4 +439,22 @@ TEST(StorageIdentityRegression, UnreadableStorageMetaIsAnIoErrorNotACorruptIdent
     fs::permissions(t.path / "storage.meta", fs::perms::none);
     EXPECT_THROW((void)StorageIdentity::resolve(d, StorageFormat::Required, false), rune::node::StorageIoError);
     fs::permissions(t.path / "storage.meta", fs::perms::owner_read | fs::perms::owner_write);
+}
+
+// CP1 N1: the crash between --reassign-join's storage.meta write and the unlink of the restored knowledge file leaves a
+// Joiner (manifest without `knowledge`) next to an internal-isr.state.  The next boot must delete it before it can be
+// loaded or voted.  RED: drop the boot-time removal (the file survives resolve).
+TEST(StorageIdentityRegression, JoinerBootDeletesAStaleInternalIsrStateRegression) {
+    TmpDir t("joiner_stale_knowledge");
+    const std::string d = t.str();
+    makeLegacy(t.path);
+    fs::create_directories(t.path / "internal-isr.state");   // makes the command's unlink fail = the crash point
+    touch(t.path / "internal-isr.state" / "x");
+    ASSERT_EQ(StorageIdentity::reassignJoin(d).code, 74);
+    ASSERT_TRUE(fs::exists(t.path / "storage.meta"));
+    fs::remove_all(t.path / "internal-isr.state");           // the restored file as the next boot would see it
+    touch(t.path / "internal-isr.state");
+    const auto n = StorageIdentity::resolve(d, StorageFormat::Required, false);
+    EXPECT_EQ(n.origin, Origin::Joiner);
+    EXPECT_FALSE(fs::exists(t.path / "internal-isr.state")) << "a Joiner booted with a restored knowledge file";
 }
