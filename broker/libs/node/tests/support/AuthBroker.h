@@ -197,6 +197,9 @@ public:
         require(w.lastConnect() && w.lastConnect()->authState == pc::AuthState::Anonymous, "the bootstrap window is offered");
         auto b = w.bootstrap(channel_, s0, opts_.keyContents, "admin", kBootstrapPassword);
         require(b.errorCode == 0, "bootstrap: " + b.detail);
+        // The bootstrap connection never logs in: end it, or its authentication deadline would count it as one failed login
+        // (logins-failed counter) 10 s later, in the middle of whatever a test asserts about that counter.
+        (void)w.raw().disconnect(channel_, AuthWireClient::kClientStream, s0);
         const int64_t s1 = w.connect(channel_);
         require(s1 > 0, "admin connect");
         const auto login = w.login(channel_, s1, "admin", {kBootstrapPassword, kBootstrapPassword});

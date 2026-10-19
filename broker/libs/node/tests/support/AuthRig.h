@@ -39,6 +39,7 @@ inline std::vector<uint8_t> authRigViewPlan(const std::string& viewName, const s
     rv::ViewPlan p;
     p.viewName = viewName;
     p.key = "id";
+    p.sizing.chunkBytes = 64u << 10;   // not the 32 MiB row-slab default: a rig with hundreds of views must stay small
     for (const int32_t id : sources) p.sources.push_back(rv::SourceSpec{id, "id"});
     p.output.push_back(rv::AuthoredField{"id", rune::codec::PrimType::Int64, 0, "id", rv::MergeRule::Replace});
     p.output.push_back(rv::AuthoredField{"hp", rune::codec::PrimType::Int64, 0, "hp", rv::MergeRule::Replace});
@@ -111,8 +112,9 @@ public:
     }
 
     // ── DDL as the builder (precondition setup) ─────────────────────────────────────────────────────────────
-    int32_t defineTopic(int64_t sid, const std::string& name) {
-        const auto r = c().awaitDefine(c().sendDefineTopic(ch(), stream(), sid, name, 1, authRigCharBlob()), dl(20));
+    int32_t defineTopic(int64_t sid, const std::string& name, bool typed = true) {
+        const auto r = c().awaitDefine(c().sendDefineTopic(ch(), stream(), sid, name, 1,
+                                                           typed ? authRigCharBlob() : std::vector<uint8_t>{}), dl(20));
         return r && r->errorCode == 0 ? r->topicId : -1;
     }
     int32_t createView(int64_t sid, const std::string& name, int32_t source) {

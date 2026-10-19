@@ -272,8 +272,8 @@ public:
         const std::size_t len = s.encode(buf.data());
         return send(gatewayChannel, stream, buf.data(), len) ? s.correlationId : 0;
     }
-    struct PushedRecords { int64_t subscriptionId; int64_t baseOffset; std::vector<uint8_t> bytes; };
-    struct ErrorSeen     { int64_t correlationId; int16_t code; std::string message; int64_t sessionId = 0; };
+    struct PushedRecords { int64_t subscriptionId; int64_t baseOffset; std::vector<uint8_t> bytes; uint64_t seq = 0; };
+    struct ErrorSeen     { int64_t correlationId; int16_t code; std::string message; int64_t sessionId = 0; uint64_t seq = 0; };
     /// Poll the egress until `pred()` holds (bounded: kMaxIters × 100 µs).
     template <class Pred> bool pollUntil(Pred pred) {
         for (int i = 0; i < kMaxIters; ++i) { poll_(); if (pred()) return true; pause_(); }
@@ -289,6 +289,8 @@ public:
         return pred();
     }
     const std::vector<PushedRecords>& records() const noexcept { return records_; }
+    /// Forget the pushed records and error frames seen so far (a long-lived client of a many-cell matrix).
+    void clearObserved() { records_.clear(); errors_.clear(); }
     const std::vector<ErrorSeen>&     errors()  const noexcept { return errors_; }
 
     using Clock = std::chrono::steady_clock;
@@ -342,6 +344,10 @@ public:
     }
 
     int64_t nextCorrelationId() noexcept { return ++corr_; }
+    /// The correlation id of the request this client sent last (the helpers that hide theirs).
+    [[nodiscard]] int64_t lastCorrelationId() const noexcept { return corr_; }
+    /// Authentication Task 17: how many non-Records frames arrived for `corr` (an exactly-one-answer check).
+    [[nodiscard]] std::size_t framesFor(int64_t corr) const { auto it = frameCount_.find(corr); return it == frameCount_.end() ? 0 : it->second; }
     /// Forget the last ConnectResponse, then wait for the next one (a machine that sent its own ConnectRequest through
     /// send()): nullopt if none by `deadline`.
     void forgetConnectResponse() noexcept { connect_.reset(); }
@@ -930,7 +936,7 @@ private:
         for (auto& cs : sessions_) {
             auto it = pubs_.find({cs.channel, cs.stream});
             if (it == pubs_.end() || !it->second) continue;
-            pc::Keepalive k; k.sessionId = cs.sessionId; k.correlationId = ++corr_;
+            pc::Keepalive k; k.sessionId = cs.sessionId; k.correlationId = ++keepaliveCorr_;   // never corr_: lastCorrelationId() must stay the last REQUEST
             uint8_t buf[pc::Keepalive::ENCODED_SIZE];
             const std::size_t len = k.encode(buf);
             aeron::concurrent::AtomicBuffer ab(buf, static_cast<aeron::util::index_t>(len));
@@ -945,6 +951,7 @@ private:
     void onFrame_(const uint8_t* p, std::size_t n, int32_t imageSessionId) {
         auto hdr = pc::MessageHeader::decode(p, n);
         if (!hdr) return;
+        if (hdr->correlationId != 0 && hdr->templateId != static_cast<uint16_t>(pc::TemplateId::Records)) ++frameCount_[hdr->correlationId];
         if (captureRaw_ && hdr->correlationId != 0 && hdr->templateId != static_cast<uint16_t>(pc::TemplateId::Records))
             raw_[hdr->correlationId] = std::vector<uint8_t>(p, p + n);   // authentication Task 12: byte-level answer parity
         switch (static_cast<pc::TemplateId>(hdr->templateId)) {
@@ -996,7 +1003,7 @@ private:
             case pc::TemplateId::Records:
                 if (auto r = pc::Records::decode(p, n))
                     records_.push_back({r->subscriptionId, r->baseOffset,
-                                        {r->recordBatch.begin(), r->recordBatch.end()}});
+                                        {r->recordBatch.begin(), r->recordBatch.end()}, ++arrivalSeq_});
                 break;
             case pc::TemplateId::JoinGroupResponse:
                 if (auto r = pc::JoinGroupResponse::decode(p, n))
@@ -1018,7 +1025,7 @@ private:
                 break;
             case pc::TemplateId::ErrorResponse:
                 if (auto e = pc::ErrorResponse::decode(p, n)) {
-                    errors_.push_back({e->correlationId, e->code, std::string(e->message), e->sessionId});
+                    errors_.push_back({e->correlationId, e->code, std::string(e->message), e->sessionId, ++arrivalSeq_});
                     // F-A: the broker said this session is gone (the reap's notice / an UnknownSession answer).
                     if (e->code == static_cast<int16_t>(pc::ErrorCode::SessionExpired) ||
                         e->code == static_cast<int16_t>(pc::ErrorCode::UnknownSession))
@@ -1068,6 +1075,7 @@ private:
     std::map<int64_t, pc::CreateViewResponse>       views_;
     std::map<int64_t, pc::AlterTopicResponse>       alters_;
     bool                                            captureRaw_ = false;
+    std::map<int64_t, std::size_t>                  frameCount_;   // every non-Records frame by corr
     std::map<int64_t, std::vector<uint8_t>>         raw_;       // captureRawAnswers: every answer frame by corr
     std::map<int64_t, DdlAnswer>                    ddls_;      // DdlResponse (78) by corr (Task 11)
     std::map<std::pair<uint16_t, int64_t>, std::vector<uint8_t>> authFrames_;   // AuthServerFirst / Final raw bytes (auth Task 11)
@@ -1087,6 +1095,8 @@ private:
     std::vector<ErrorSeen>                          errors_;
     std::set<int64_t>                               expired_;   // F-A: sessions the broker declared expired
     int64_t                                         corr_ = 0;
+    int64_t                                         keepaliveCorr_ = int64_t{1} << 40;   // the Keepalive ticks' own correlation ids
+    uint64_t                                        arrivalSeq_ = 0;   // one arrival order for records_ and errors_
 };
 
 } // namespace rune::node::test
