@@ -323,7 +323,14 @@ public:
     int32_t partitionLeaderEpoch() const { return static_cast<int32_t>(detail::getLE32(d_ + batch::kPartitionLeaderEpochOffset)); }
     int32_t lastOffsetDelta() const { return static_cast<int32_t>(detail::getLE32(d_ + batch::kLastOffsetDeltaOffset)); }
     int32_t recordCount()     const { return static_cast<int32_t>(detail::getLE32(d_ + batch::kRecordCountOffset)); }
-    int32_t totalLength()     const { return static_cast<int32_t>(detail::getLE32(d_ + batch::kLengthOffset)) + 12; }
+    /// Total batch size (length field + 12).  Overflow-safe: a length field that
+    /// is negative as int32 or would push the total past INT32_MAX yields -1
+    /// (never a plausible size; callers' `total <= 0` checks reject it).
+    int32_t totalLength()     const {
+        const uint32_t l = detail::getLE32(d_ + batch::kLengthOffset);
+        constexpr uint32_t kMaxLen = static_cast<uint32_t>(INT32_MAX) - 12u;
+        return l > kMaxLen ? -1 : static_cast<int32_t>(l + 12u);
+    }
     int64_t baseTimestamp()   const { return static_cast<int64_t>(detail::getLE64(d_ + batch::kBaseTimestampOffset)); }
     /// The maximum record timestamp in this batch (wall-clock ms or ns, as written).
     /// For a horizon-stamped batch this reflects the actual max record ts, not the
@@ -360,8 +367,10 @@ public:
 
     bool ensureValid() const {
         if (len_ < static_cast<size_t>(batch::kRecordBatchOverhead)) return false;
-        int32_t tl = totalLength();
-        if (tl <= 0 || static_cast<size_t>(tl) > len_) return false;
+        const int32_t tl = totalLength();
+        // A batch shorter than the fixed header (torn/zero-filled tail, garbage
+        // length) is invalid; without this, tl - kAttributesOffset underflows.
+        if (tl < batch::kRecordBatchOverhead || static_cast<size_t>(tl) > len_) return false;
         uint32_t stored = detail::getLE32(d_ + batch::kCrcOffset);
         uint32_t actual = crc32c(d_ + batch::kAttributesOffset,
                                  static_cast<size_t>(tl) - batch::kAttributesOffset);

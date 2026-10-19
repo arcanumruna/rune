@@ -921,3 +921,31 @@ TEST(RecordBatchReaderRegression, ForEachRecordTakesAMoveOnlyVisitor) {
     });
     EXPECT_EQ(lastOff, 101);
 }
+
+// F1 regression: a stored length field of 0..8 (torn / zero-filled tail) or a
+// huge/negative one must be refused, never read out of bounds (the CRC length
+// used to underflow as tl - 21).
+TEST(RecordBatchReaderRegression, EnsureValidRefusesShortAndHugeLengths) {
+    const uint32_t lens[] = {0u, 1u, 8u, 9u, 48u, 0xFFFFFFFFu, 0xFFFFFFF0u,
+                             0x80000000u, 0x7FFFFFFFu, 0x7FFFFFF4u, 0x7FFFFFF3u};
+    for (uint32_t l : lens) {
+        // Exactly-sized heap buffer so ASan/UBSan flags any OOB read.
+        std::vector<uint8_t> buf(b::kRecordBatchOverhead, 0);
+        for (int i = 0; i < 4; ++i) buf[b::kLengthOffset + i] = uint8_t(l >> (8 * i));
+        rune::protocol::RecordBatchReader r(buf.data(), buf.size());
+        EXPECT_FALSE(r.ensureValid()) << "len field " << l;
+    }
+    // Total lengths 0,1,12,20,60 on a larger buffer (length field = total-12).
+    for (int total : {0, 1, 12, 20, 60}) {
+        std::vector<uint8_t> buf(200, 0);
+        uint32_t l = uint32_t(total - 12);   // wraps for total < 12: also garbage
+        for (int i = 0; i < 4; ++i) buf[b::kLengthOffset + i] = uint8_t(l >> (8 * i));
+        EXPECT_FALSE(rune::protocol::RecordBatchReader(buf.data(), buf.size()).ensureValid())
+            << "total " << total;
+    }
+    // totalLength() near INT32_MAX is overflow-safe (-1), not UB.
+    std::vector<uint8_t> buf(b::kRecordBatchOverhead, 0);
+    const uint32_t l = 0x7FFFFFFFu;
+    for (int i = 0; i < 4; ++i) buf[b::kLengthOffset + i] = uint8_t(l >> (8 * i));
+    EXPECT_EQ(rune::protocol::RecordBatchReader(buf.data(), buf.size()).totalLength(), -1);
+}
