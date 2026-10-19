@@ -116,6 +116,10 @@ public:
         const auto* c = std::get_if<rune::peerlink::PeerFrameCrypto>(&crypto_);
         return c ? c->currentEpoch(peer) : 0u;
     }
+    [[nodiscard]] uint64_t authFrames(int32_t peer) const noexcept {
+        const auto* c = std::get_if<rune::peerlink::PeerFrameCrypto>(&crypto_);
+        return c ? c->authFrames(peer) : 0u;
+    }
     [[nodiscard]] uint64_t peerFrameDrops() const noexcept {
         const auto* c = std::get_if<rune::peerlink::PeerFrameCrypto>(&crypto_);
         return c ? c->drops() : 0u;

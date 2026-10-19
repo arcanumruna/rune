@@ -460,6 +460,11 @@ public:
     /// Frames dropped for want of a link / that did not open (counter 1'000'235's source).
     [[nodiscard]] uint64_t peerFrameDrops() const noexcept;
     [[nodiscard]] uint64_t unknownEpochFrames() const noexcept { return unknownEpochFrames_; }
+    /// Authenticated frames received from `peer` (monotonic; 0 when not sealed).
+    [[nodiscard]] uint64_t authFrames(int32_t peer) const noexcept {
+        const auto* c = std::get_if<rune::peerlink::PeerFrameCrypto>(&crypto_);
+        return c ? c->authFrames(peer) : 0u;
+    }
     /// The (peer, epoch) of the last received frame naming an epoch this transport does not hold, consumed once.
     [[nodiscard]] bool takeUnknownEpoch(int32_t& peer, uint32_t& epoch) noexcept {
         if (!pendingUnknown_.valid) return false;
@@ -550,17 +555,15 @@ private:
         return c == nullptr || c->hasLink(peer);
     }
     /// Open one received frame into recvScratch_ (sealed) and hand the plaintext to handleFrame_.  A frame whose
-    /// dispatch was refused (ABORT) is re-delivered by Aeron: its plaintext is kept and handed over again (the
-    /// replay window must not see the same seq twice).
+    /// dispatch was refused (ABORT) is re-delivered by Aeron: it opens again, because the replay
+    /// window is committed only after a non-ABORT dispatch.
     aeron::ControlledPollAction onSealedFragment_(const uint8_t* frame, std::size_t len);
     void noteOpenDrop_(rune::peerlink::PeerFrameCrypto::OpenResult r, int32_t from, uint32_t epoch) noexcept;
     void sizeSealScratch_();
-    struct PendingOpened { bool valid = false; int32_t from = -1; uint8_t sender = 0; uint64_t seq = 0; std::size_t plainLen = 0; };
     struct PendingUnknown { bool valid = false; int32_t peer = -1; uint32_t epoch = 0; };
     rune::peerlink::PeerCryptoMode crypto_{rune::peerlink::PeerPlain{}};
     std::vector<uint8_t>           sealScratch_;     ///< sealed outbound frame (cold-sized: pub max message + 32)
     std::vector<uint8_t>           recvScratch_;     ///< an opened frame's plaintext
-    PendingOpened                  pendingOpened_{};
     PendingUnknown                 pendingUnknown_{};
     uint64_t                       unknownEpochFrames_ = 0;
     uint64_t                       openDropsLogged_    = 0;

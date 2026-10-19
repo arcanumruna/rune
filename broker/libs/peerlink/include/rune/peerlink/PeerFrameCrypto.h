@@ -44,7 +44,6 @@ struct PeerPlain {};
 class PeerFrameCrypto {
 public:
     static constexpr std::size_t kMaxPeers       = 16;   // == FollowerSlots::kMaxReplicas
-    static constexpr std::size_t kMaxRecvSenders = 8;    // distinct sender ids one peer link may carry to this owner
     static constexpr int64_t     kRetainNs       = 2'000'000'000;   // the old epoch's grace period (D33)
     static constexpr int64_t     kClockNow       = std::numeric_limits<int64_t>::min();   // "read the clock yourself"
 
@@ -71,14 +70,21 @@ public:
     /// (plainLen + kPeerFrameOverhead) or 0.
     [[nodiscard]] std::size_t sealInPlace(int32_t peer, uint8_t* frame, std::size_t plainLen, std::size_t cap) noexcept;
 
-    enum class OpenResult : uint8_t { Ok, NotPeerFrame, UnknownPeer, UnknownEpoch, BadTag, Replay };
+    /// BadSender: the sender id is not this receiver's role (consensus 0, legacy 1, admin 2, worker w -> 3+w): refused
+    /// before any crypto, so a bogus id costs a compare.
+    enum class OpenResult : uint8_t { Ok, NotPeerFrame, UnknownPeer, UnknownEpoch, BadTag, Replay, BadSender };
     /// Open into `out` (never in place: AES-GCM writes unauthenticated plaintext before it checks the tag).  Never
     /// dispatches anything that did not verify.  `fromNode` / `epoch` are reported from the header as soon as it
     /// parsed (UnknownEpoch included, so the control thread can re-handshake).  `nowNs` is only read for a frame
     /// of a non-current epoch; kClockNow = the steady clock.
     [[nodiscard]] OpenResult open(const uint8_t* frame, std::size_t len, uint8_t* out, std::size_t cap,
                                   std::size_t& outLen, int32_t& fromNode, uint32_t& epoch,
-                                  int64_t nowNs = kClockNow) noexcept;
+                                  int64_t nowNs = kClockNow, bool commitWindow = true) noexcept;
+    /// For a caller that opened with commitWindow = false: commit the replay window once the frame was DISPATCHED
+    /// (not ABORTed), so a redelivery after back-pressure re-opens instead of reading as a replay.
+    void commitOpened(int32_t fromNode, uint32_t epoch, uint64_t seq) noexcept;
+    /// Frames from `peer` that authenticated (monotonic): the PeerLinkAgent's "the peer is alive" signal.
+    [[nodiscard]] uint64_t authFrames(int32_t peer) const noexcept;
 
     /// A caller dropped a frame because it knows there is no link (before claiming anything): counted like seal's.
     void noteNoLink() noexcept { ++drops_; ++noLinkDrops_; }
@@ -98,22 +104,22 @@ private:
         uint64_t                                 seq = 0, window = 0;   // the 64-wide replay window (CryptoState logic)
     };
     struct EpochState {
-        LinkKeys                                 keys;                    // kept for the lazy per-sender receive keys
+        LinkKeys                                 keys;
         std::optional<rune::crypto::AeadCipher>  send;                    // THIS sender's key for this direction
         uint64_t                                 sendSeq = 0;
-        std::array<RecvSender, kMaxRecvSenders>  recv{};
-        std::size_t                              recvCount = 0;
+        RecvSender                               recv;                    // the ONE sender id this receiver's role accepts
     };
     struct Retired { EpochState state; int64_t untilNs = 0; };
     struct PeerSlot {
         int32_t                  peer = -1;
         std::optional<EpochState> current;
         std::optional<Retired>    previous;
+        uint64_t                  authFrames = 0;
     };
 
     [[nodiscard]] const PeerSlot* slotOf_(int32_t peer) const noexcept;
     [[nodiscard]] PeerSlot* slotOf_(int32_t peer) noexcept;
-    [[nodiscard]] RecvSender* recvFor_(EpochState& e, uint8_t senderId) noexcept;
+    [[nodiscard]] EpochState* epochOf_(PeerSlot& s, uint32_t epoch, int64_t nowNs) noexcept;
     [[nodiscard]] std::size_t sealAt_(int32_t peer, const uint8_t* plain, std::size_t len, uint8_t* frame,
                                       std::size_t cap, bool inPlace) noexcept;
     OpenResult drop_(OpenResult r) noexcept { ++drops_; ++openDrops_[static_cast<std::size_t>(r)]; return r; }
@@ -123,7 +129,7 @@ private:
     std::array<PeerSlot, kMaxPeers> slots_{};
     std::size_t                used_ = 0;
     uint64_t                   drops_ = 0, noLinkDrops_ = 0;
-    std::array<uint64_t, 6>    openDrops_{};
+    std::array<uint64_t, 7>    openDrops_{};
 };
 
 /// Chosen at transport construction (Rule 3): PeerPlain = today's bytes, PeerFrameCrypto = sealed.

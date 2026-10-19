@@ -20,7 +20,7 @@ constexpr int64_t kSec = 1'000'000'000;
 } // namespace
 
 TEST(PeerFrameRegression, SealedFramesOpenOnlyAtTheirPeerAndOnlyOnce) {
-    pl::PeerFrameCrypto a(1, /*sender*/ 3), b(2, /*sender*/ 0);
+    pl::PeerFrameCrypto a(1, /*sender*/ 3), b(2, /*sender*/ 3);
     ASSERT_TRUE(a.installLink(2, linkFor(true), 0)); ASSERT_TRUE(b.installLink(1, linkFor(false), 0));
     const std::string msg = "FetchResponse bytes";
     std::vector<uint8_t> wire(msg.size() + pl::kPeerFrameOverhead), plain(msg.size());
@@ -67,7 +67,7 @@ TEST(PeerFrameRegression, PlaintextFramesAreNotPeerFrames) {
 }
 
 TEST(PeerFrameRegression, SealInPlaceEqualsSeal) {
-    pl::PeerFrameCrypto a(1, 3), a2(1, 3), b(2, 0);
+    pl::PeerFrameCrypto a(1, 3), a2(1, 3), b(2, 3);
     ASSERT_TRUE(a.installLink(2, linkFor(true), 0)); ASSERT_TRUE(a2.installLink(2, linkFor(true), 0));
     ASSERT_TRUE(b.installLink(1, linkFor(false), 0));
     const std::string msg = "the same plaintext sealed two ways";
@@ -82,29 +82,51 @@ TEST(PeerFrameRegression, SealInPlaceEqualsSeal) {
     EXPECT_EQ(std::string(out.begin(), out.begin() + outLen), msg);
 }
 
-TEST(PeerFrameRegression, EachSenderHasItsOwnReplayWindow) {
-    pl::PeerFrameCrypto s0(1, 0), s3(1, 3), b(2, 0);
-    ASSERT_TRUE(s0.installLink(2, linkFor(true), 0)); ASSERT_TRUE(s3.installLink(2, linkFor(true), 0));
-    ASSERT_TRUE(b.installLink(1, linkFor(false), 0));
-    std::vector<std::vector<uint8_t>> frames;
-    std::vector<uint8_t> out(32);
+TEST(PeerFrameRegression, ABogusSenderIsRefusedBeforeCryptoRegression) {
+    pl::PeerFrameCrypto a(1, 3), b(2, 3);
+    ASSERT_TRUE(a.installLink(2, linkFor(true), 0)); ASSERT_TRUE(b.installLink(1, linkFor(false), 0));
+    std::vector<uint8_t> w(8 + 32), out(32);
+    const auto n = a.seal(2, bytes("payload"), 7, w.data(), w.size());
+    ASSERT_GT(n, 0u);
     std::size_t outLen = 0; int32_t from = -1; uint32_t epoch = 0;
-    for (int i = 1; i <= 100; ++i) {
-        for (pl::PeerFrameCrypto* s : {&s0, &s3}) {
-            std::vector<uint8_t> w(8 + 32);
-            const std::string m = "frame" + std::to_string(i % 10);
-            const auto n = s->seal(2, bytes(m), m.size(), w.data(), w.size());
-            ASSERT_GT(n, 0u);
-            w.resize(n);
-            ASSERT_EQ(b.open(w.data(), w.size(), out.data(), out.size(), outLen, from, epoch), pl::PeerFrameCrypto::OpenResult::Ok)
-                << "sender " << int(s->senderId()) << " seq " << i;
-            frames.push_back(std::move(w));
-        }
+    for (int bogus = 0; bogus < 256; ++bogus) {
+        if (bogus == 3) continue;
+        w[1] = static_cast<uint8_t>(bogus);   // 255 different bogus sender ids
+        EXPECT_EQ(b.open(w.data(), n, out.data(), out.size(), outLen, from, epoch), pl::PeerFrameCrypto::OpenResult::BadSender) << bogus;
     }
-    EXPECT_EQ(frames.size(), 200u);
-    for (std::size_t i : {std::size_t{0}, std::size_t{1}, std::size_t{150}, std::size_t{199}})
-        EXPECT_EQ(b.open(frames[i].data(), frames[i].size(), out.data(), out.size(), outLen, from, epoch),
-                  pl::PeerFrameCrypto::OpenResult::Replay) << "frame " << i;
+    EXPECT_EQ(b.dropsOf(pl::PeerFrameCrypto::OpenResult::BadSender), 255u);
+    EXPECT_EQ(b.dropsOf(pl::PeerFrameCrypto::OpenResult::BadTag), 0u) << "refused before any crypto ran";
+    EXPECT_EQ(b.authFrames(1), 0u);
+    w[1] = 3;
+    EXPECT_EQ(b.open(w.data(), n, out.data(), out.size(), outLen, from, epoch), pl::PeerFrameCrypto::OpenResult::Ok) << "the role's sender still opens";
+    EXPECT_EQ(b.authFrames(1), 1u);
+}
+
+TEST(PeerFrameRegression, AFrameReplayedOntoAnotherPlaneFailsRegression) {
+    // The admin plane's frame (sender 2) copied onto the legacy plane (sender 1) and a worker plane (sender 4).
+    pl::PeerFrameCrypto admin(1, 2), legacyRx(2, 1), workerRx(2, 4), adminRx(2, 2);
+    ASSERT_TRUE(admin.installLink(2, linkFor(true), 0));
+    ASSERT_TRUE(legacyRx.installLink(1, linkFor(false), 0)); ASSERT_TRUE(workerRx.installLink(1, linkFor(false), 0));
+    ASSERT_TRUE(adminRx.installLink(1, linkFor(false), 0));
+    std::vector<uint8_t> w(8 + 32), out(32);
+    const auto n = admin.seal(2, bytes("catalog"), 7, w.data(), w.size());
+    std::size_t outLen = 0; int32_t from = -1; uint32_t epoch = 0;
+    EXPECT_NE(legacyRx.open(w.data(), n, out.data(), out.size(), outLen, from, epoch), pl::PeerFrameCrypto::OpenResult::Ok);
+    EXPECT_NE(workerRx.open(w.data(), n, out.data(), out.size(), outLen, from, epoch), pl::PeerFrameCrypto::OpenResult::Ok);
+    EXPECT_EQ(adminRx.open(w.data(), n, out.data(), out.size(), outLen, from, epoch), pl::PeerFrameCrypto::OpenResult::Ok);
+}
+
+TEST(PeerFrameRegression, ADeferredCommitReopensUntilCommittedRegression) {
+    pl::PeerFrameCrypto a(1, 1), b(2, 1);
+    ASSERT_TRUE(a.installLink(2, linkFor(true), 0)); ASSERT_TRUE(b.installLink(1, linkFor(false), 0));
+    std::vector<uint8_t> w(8 + 32), out(32);
+    const auto n = a.seal(2, bytes("fetch"), 5, w.data(), w.size());
+    std::size_t outLen = 0; int32_t from = -1; uint32_t epoch = 0;
+    for (int i = 0; i < 3; ++i)   // dispatch ABORTed: the same frame opens again each time
+        ASSERT_EQ(b.open(w.data(), n, out.data(), out.size(), outLen, from, epoch, pl::PeerFrameCrypto::kClockNow, false),
+                  pl::PeerFrameCrypto::OpenResult::Ok);
+    b.commitOpened(from, epoch, 1);
+    EXPECT_EQ(b.open(w.data(), n, out.data(), out.size(), outLen, from, epoch), pl::PeerFrameCrypto::OpenResult::Replay);
 }
 
 TEST(PeerFrameRegression, AnOldEpochStaysValidForTwoSecondsThenIsRefused) {

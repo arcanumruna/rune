@@ -198,7 +198,7 @@ TEST(PeerLinkAgentRegression, AWrongKeyNodeIsRefusedByEveryPeerAndLogsIt) {
     EXPECT_NE(t.find("peer link with node 2 established (epoch "), std::string::npos) << t;
     const auto* st = rig.agents[1]->stateOf(3);
     ASSERT_NE(st, nullptr);
-    EXPECT_TRUE(std::holds_alternative<pl::Refused>(*st) || std::holds_alternative<pl::HelloSent>(*st));
+    EXPECT_TRUE(std::holds_alternative<pl::HelloSent>(*st));
 }
 
 TEST(PeerLinkAgentRegression, ARestartedResponderIsReestablishedWithNewKeys) {

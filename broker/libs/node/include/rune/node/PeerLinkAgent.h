@@ -51,8 +51,13 @@ public:
     /// One duty pass: drain the subscription, tick every handshake.  Returns work done.
     int doWork(int64_t nowNs);
 
-    /// The consensus ingress saw a frame from `peer` naming an epoch we do not hold (Task 16).
+    /// The consensus ingress saw a frame from `peer` naming an epoch we do not hold (Task 16).  Unauthenticated: it
+    /// only matters once the peer has been silent (see PeerHandshake::onUnknownEpoch).
     void onUnknownEpoch(int32_t peer, uint32_t epoch, int64_t nowNs);
+    /// The transports' authenticated-frame counters for `peer` (monotonic sum); a rise means the peer is alive.
+    void observeAuthFrames(int32_t peer, uint64_t total, int64_t nowNs) noexcept;
+    [[nodiscard]] std::size_t peerCount() const noexcept { return peers_.size(); }
+    [[nodiscard]] int32_t peerIdAt(std::size_t i) const noexcept { return peers_[i].id; }
 
     /// Peers whose link is currently established (counter 1'000'233).
     [[nodiscard]] int64_t establishedPeers() const noexcept;
@@ -65,6 +70,7 @@ private:
     struct PeerSlot {
         int32_t                         id = -1;
         rune::peerlink::PeerHandshake   hs;
+        uint64_t                        authSeen = 0;   // the transports' authenticated-frame total last observed
         uint64_t                        refusals = 0;   // this peer's: the log is rate-limited (first, then every 64th ~ 13 s)
     };
 
