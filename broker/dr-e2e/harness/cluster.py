@@ -410,6 +410,31 @@ class Cluster:
         term = int(m.group(3))
         return role, node_id, term
 
+    def read_storage(self, service: str) -> dict | None:
+        """The storage gate of one node (``rune_role``'s STORAGE line, see `parse_rune_role_storage`), or None when the
+        container is down, rune_role is absent, or the counters are not allocated yet (callers poll)."""
+        try:
+            res = run(["docker", "exec", self.container_name(service), "rune_role"], timeout=5)
+        except Exception:
+            return None
+        return parse_rune_role_storage(res.stdout or "")
+
+    def ql(self, script: str, *, seed_service: str | None = None, request_id: str | None = None,
+           timeout: int = 60) -> "CmdResult":
+        """Run a Rune QL script (DDL or a read such as ``show history;``) through the `rune ql` CLI container on the
+        cluster network against ``seed_service`` (default rune-1).  One shot, no retry: the caller asserts on
+        ``.ok`` / ``.stdout``.  ``request_id`` (32 hex) makes a DDL script idempotent across a re-run."""
+        ensure_ql_image()
+        seed = f"{seed_service or SERVICES[0]}:{CLIENT_PORT}"
+        rid = f" --request-id {request_id}" if request_id else ""
+        return run(
+            ["docker", "run", "--rm", "--network", self.compose.network_name(), "--shm-size=256m",
+             "--security-opt", "seccomp=unconfined", "--platform", "linux/amd64",
+             "-e", f"RQL={script}", ql_image(),
+             "bash", "-c",
+             f'printf "%s" "$RQL" > /tmp/s.rql && exec rune ql -f /tmp/s.rql{rid} --broker {seed}'],
+            timeout=timeout)
+
     def container_name(self, service: str) -> str:
         """Compose v2's container name for a service of this project (no container_name/scale in the compose file)."""
         return f"{self.project}-{service}-1"
