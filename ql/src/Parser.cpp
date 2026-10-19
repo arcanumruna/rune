@@ -218,8 +218,17 @@ struct Parser {
     }
     // Keywords are case-insensitive (names are not).
     [[nodiscard]] bool isKw(std::string_view kw) const noexcept { return cur.kind == TK::Ident && ieq(cur.text, kw); }
+    // A string literal may be a password: its text (or an unterminated tail, which runs to the end of the line) is NEVER
+    // part of any error message, in any statement.  This is the class guard; `redactTokens` only widens it.
+    [[nodiscard]] static bool isStringTok(const Token& t) noexcept { return t.kind == TK::String || t.kind == TK::BadString; }
+    [[nodiscard]] static std::string quotedText(const Token& t) {
+        if (t.kind == TK::BadString) return "an unterminated string";
+        if (t.kind == TK::String) return "a string";
+        return "'" + std::string(t.text) + "'";
+    }
     [[nodiscard]] std::string got() const {
         if (cur.kind == TK::Eof) return "end of input";
+        if (isStringTok(cur)) return quotedText(cur);
         if (redactTokens) {
             switch (cur.kind) {
             case TK::Ident: return "an identifier";
@@ -318,7 +327,7 @@ struct Parser {
         }
         // Unknown type
         return std::unexpected(errAt(tk,
-            std::string("unknown type '") + std::string(tk.text) + "'"));
+            std::string("unknown type ") + quotedText(tk)));
     }
 
     // ---- field parsing ----
@@ -740,7 +749,7 @@ struct Parser {
             else if (isKw("forward"))  mode = Compatibility::Forward;
             else {
                 return std::unexpected(err(
-                    std::string("expected 'backward' or 'forward', got '") + std::string(cur.text) + "'"));
+                    std::string("expected 'backward' or 'forward', got ") + quotedText(cur)));
             }
             advance();
 
@@ -751,7 +760,7 @@ struct Parser {
         }
 
         return std::unexpected(err(
-            std::string("unknown alter operation '") + std::string(cur.text) + "'"));
+            std::string("unknown alter operation ") + quotedText(cur)));
     }
 
     // ---- top-level statement: "alter" ----

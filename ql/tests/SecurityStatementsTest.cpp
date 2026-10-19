@@ -197,6 +197,20 @@ TEST(SecurityStatementsRegression, ParseErrorsNeverEchoAPasswordRegression) {
         {"ALTER USER u SET PASSWORD 'pw-long-enough' junk77secret;", "junk77secret"},
         {"CREATE USER ws1 WITH PASSWORD 'abcdefghijklm' 9999secret;", "9999secret"},
         {"CREATE USER ws1 WITH PASSWORD ;", "zzz"},
+        // the keyword is missing or misplaced: the literal is the current token when the error is raised
+        {"CREATE USER ws1 WITH 'hunter2hunter2';", "hunter2hunter2"},
+        {"CREATE USER ws1 'hunter2hunter2';", "hunter2hunter2"},
+        {"ALTER USER ws1 SET 'hunter2hunter2';", "hunter2hunter2"},
+        {"ALTER USER ws1 ADD 'hunter2hunter2';", "hunter2hunter2"},
+        {"ALTER USER ws1 'hunter2hunter2';", "hunter2hunter2"},
+        {"CREATE USER ws1 WITH 'hunter2hunter2", "hunter2hunter2"},                  // unterminated: the tail runs on
+        {"ALTER USER ws1 SET PASSWORD 'hunter2hunter2", "hunter2hunter2"},
+        // the whole class: a quoted string in ANY statement is never echoed
+        {"CREATE USR ws1 WITH PASSWORD 'hunter2hunter2';", "hunter2hunter2"},
+        {"GRANT 'hunter2hunter2' ON TOPIC t TO ROLE r;", "hunter2hunter2"},
+        {"ALTER TOPIC t 'hunter2hunter2';", "hunter2hunter2"},
+        {"ALTER TOPIC t SET COMPATIBILITY 'hunter2hunter2';", "hunter2hunter2"},
+        {"DROP 'hunter2hunter2';", "hunter2hunter2"},
     };
     for (const auto& c : cases) {
         auto r = ql::parse(c.src);
@@ -205,6 +219,16 @@ TEST(SecurityStatementsRegression, ParseErrorsNeverEchoAPasswordRegression) {
         EXPECT_EQ(r.error().message.find("abcdefghijklm"), std::string::npos) << r.error().message;
         EXPECT_EQ(r.error().message.find("pw-long-enough"), std::string::npos) << r.error().message;
         EXPECT_FALSE(r.error().message.empty());
+    }
+    // parseScript: the failing statement's error carries no literal either
+    for (const char* script : {"create role r;\nCREATE USER ws1 WITH 'hunter2hunter2';",
+                               "create role r;\nALTER USER ws1 SET 'hunter2hunter2",
+                               "create role r;\nCREATE USER ws1 'hunter2hunter2';"}) {
+        auto sr = ql::parseScript(script);
+        ASSERT_FALSE(sr.has_value()) << script;
+        EXPECT_EQ(sr.error().statementIndex, 2u);
+        EXPECT_EQ(sr.error().error.message.find("hunter2"), std::string::npos) << sr.error().error.message;
+        EXPECT_FALSE(sr.error().error.message.empty());
     }
     // errors before the password keyword still name the offending token (the user's own text)
     auto early = ql::parse("CREATE USER ws1 WITHOUT PASSWORD 'x';");
