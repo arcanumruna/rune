@@ -137,8 +137,9 @@ Each broker applies the catalog in offset order and checks every event's fingerp
 it computes. If they differ, or an event cannot be applied, that broker's apply **halts**.
 
 **What it means.** The broker keeps serving the topics, schemas and views it had already applied. It
-accepts no catalog change, and answers every DDL with `Internal` (6) and the offset. It logs one
-critical line, `CatalogApplier: apply HALTED at offset N ...`, naming this page. The cluster's other
+accepts no catalog change, and answers every DDL with `Internal` (6) and the offset. It logs two
+critical lines, `CatalogApplier: apply HALTED at offset N ...` and
+`BrokerNode[id]: __catalog apply HALTED at offset N ...`, both naming this page. The cluster's other
 brokers are not affected, and a halted broker is not chosen to hold new topic replicas. A halt means
 this broker's copy or its software disagrees with the log; it never means data in the topics was
 lost.
@@ -159,8 +160,8 @@ Alert on the first being non-zero.
 2. Stop that broker.
 3. Move `dataDir/__catalog` aside (do not delete it). It holds the log and the `applied` file.
 4. Start the broker. It has no local catalog, so it fetches the whole log from the catalog leader and
-   applies it from offset 0. Topic directories are left in place and are checked again once the
-   catch-up is done (see [Data directory clean-up at boot](SELF-HOSTING.md#data-directory-clean-up-at-boot)).
+   applies it from offset 0. Topic directories are left in place; they are reconciled against the catalog
+   at the next boot after the catch-up (restart the broker once more to clean them up) (see [Data directory clean-up at boot](SELF-HOSTING.md#data-directory-clean-up-at-boot)).
 5. If it halts again at the same offset, the log or the software is at fault, not the copy. Keep the
    moved-aside directory, and compare catalogs, as below.
 

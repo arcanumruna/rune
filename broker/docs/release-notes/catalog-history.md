@@ -36,7 +36,8 @@ the statement text, a client name, a 128-bit request id that stays the same acro
 
 **Pre-v8 clients.** A DDL from a client older than version 8 cannot follow a Redirect. If it reaches
 a broker that is not the catalog leader, the broker answers `InvalidRequest` in the DDL's own
-response type, with the text "client too old for cluster DDL routing; upgrade", and logs a warning.
+response type and logs a warning ("client too old for cluster DDL routing; upgrade"); the reply
+itself carries no message text.
 Upgrade every client before you run DDL against a multi-node cluster. On a single node, and on the
 leader, an older client's DDL works.
 
