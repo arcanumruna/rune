@@ -1,0 +1,1062 @@
+// tests/crypto/ClientCryptoRegressionTest.cpp
+//
+// Task 15 (client<->broker TLS/AEAD): SECURITY REGRESSION SUITE, named
+// `*Regression*` so it is selected as the run-first priority gate (CLAUDE.md
+// rule 6/7), ahead of the rest of the test matrix.
+//
+// This is the CLIENT layer of the three-repo regression gate (the other two
+// are rune-crypto's tests/CryptoRegressionTest.cpp and rune-broker's
+// libs/gateway/tests/GatewayCryptoRegressionTest.cpp). It CONSOLIDATES
+// assertions already proven piecemeal in ClientCryptoRoundTripTest.cpp
+// (Tasks 5/6/6b/9/20) into one named suite, and FILLS four gaps that file
+// did not cover explicitly:
+//   - a dedicated ciphertext-byte-flip case distinct from the existing
+//     tag-byte-flip one (TamperedCiphertextIsDroppedWindowNotPoisoned only
+//     flips the LAST byte, which is inside the tag);
+//   - too-old-seq (>64 behind) dropped, on the client's egress-open path
+//     (the existing suite proves replay + in-window-reorder, but never
+//     "too old", even though openEgressFrame shares the identical window
+//     logic the gateway/worker-ingress suites already prove this for);
+//   - forged-seq-does-not-poison-the-window, on the client's egress-open
+//     path (a wrong-key frame claiming a fresh seq must fail auth AND leave
+//     the window untouched for a later legitimate frame using that seq);
+//   - cross-session/wrong-key injection using a SECOND, independently
+//     handshaked session's real derived key (a strictly stronger claim than
+//     "wrong key = random bytes");
+//   - untrusted-cert rejected at the SessionMachine level (the existing
+//     client suite only proves wrong-hostname; untrusted-cert was only ever
+//     proven at the rune-crypto TlsSession layer, not through the client's
+//     own connect() path);
+//   - a handshake blob proven LARGER than the old fixed 512-byte scratch,
+//     driven through SessionMachine's own (growable) hsBytes_ to a
+//     successful Connected session.
+//
+// This file duplicates ClientCryptoRoundTripTest.cpp's fixture helpers
+// locally (by design — see task-15-brief.md: "it's fine to add a focused
+// regression version ... don't delete the originals").
+
+#include <gtest/gtest.h>
+
+#include <rune/client/codec/Codec.h>
+#include <rune/client/codec/CryptoFrame.h>
+#include <rune/client/session/SessionMachine.h>
+#include <rune/crypto/TlsSession.h>
+
+#include <cstring>
+#include <optional>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+
+namespace cc = rune::client::codec;
+namespace sm = rune::client::session;
+namespace cr = rune::crypto;
+
+namespace {
+
+std::string slurp(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
+
+std::string testdataPath(const char* name) {
+#ifdef RUNE_CRYPTO_TESTDATA_DIR
+    return std::string(RUNE_CRYPTO_TESTDATA_DIR) + "/" + name;
+#else
+    return std::string("testdata/") + name;
+#endif
+}
+
+struct FakeIo final : sm::SessionIo {
+    std::vector<std::vector<uint8_t>> sends;
+    bool sendFrame(const uint8_t* buf, std::size_t len) override {
+        sends.emplace_back(buf, buf + len);
+        return true;
+    }
+    bool retarget(const std::string&) noexcept override { return true; }
+    [[nodiscard]] std::size_t sendCount() const { return sends.size(); }
+    [[nodiscard]] const std::vector<uint8_t>& last() const { return sends.back(); }
+};
+
+// Drive the handshake to completion (or failure). `*totalBytes`, if
+// non-null, accumulates every handshakeBytes payload transferred in either
+// direction (used by the 512-byte-scratch regression below). Mirrors
+// ClientCryptoRoundTripTest.cpp's driveHandshake exactly, plus the counter.
+bool driveHandshake(sm::SessionMachine& m, FakeIo& io, cr::TlsSession& srv,
+                     int64_t sessionId, int64_t nowNs, std::size_t* totalBytes = nullptr) {
+    std::size_t delivered = 0;
+    for (int i = 0; i < 20; ++i) {
+        if (io.sendCount() <= delivered) break;
+        const bool isFirst = (delivered == 0);
+        const auto& frame  = io.sends[delivered++];
+
+        std::string_view peerBytes;
+        int64_t          corrId = 0;
+        uint8_t          chosenCipher = 0;
+        if (isFirst) {
+            auto req = cc::decodeConnectRequest(frame.data(), frame.size());
+            if (!req || req->cipherList.empty() || req->handshakeBytes.empty()) return false;
+            peerBytes    = req->handshakeBytes;
+            corrId       = req->correlationId;
+            chosenCipher = req->cipherList[0];
+        } else {
+            auto hc = cc::decodeHandshakeContinue(frame.data(), frame.size());
+            if (!hc) return false;
+            peerBytes = hc->handshakeBytes;
+            corrId    = hc->correlationId;
+        }
+        if (totalBytes) *totalBytes += peerBytes.size();
+
+        if (srv.readInbound(reinterpret_cast<const uint8_t*>(peerBytes.data()), peerBytes.size()) ==
+            cr::HsState::Failed) {
+            return false;
+        }
+
+        uint8_t out[16384];
+        const std::size_t n = srv.writeOutbound(out, sizeof out);
+        if (totalBytes) *totalBytes += n;
+        const std::string_view outView(reinterpret_cast<const char*>(out), n);
+
+        if (isFirst) {
+            m.onConnectResponse(/*code=*/0, /*leaderMemberId=*/-1, /*assignedSessionId=*/sessionId,
+                                 corrId, nowNs, chosenCipher, outView);
+        } else if (m.state() == sm::SessionState::Handshaking) {
+            m.onHandshakeContinueResponse(/*code=*/0, outView, corrId, nowNs);
+        }
+    }
+    return m.state() == sm::SessionState::Connected && srv.done();
+}
+
+std::vector<uint8_t> buildPlainProduceFrame(int64_t sessionId, int64_t correlationId,
+                                             std::string_view body) {
+    namespace rpc = rune::protocol::client;
+    std::vector<uint8_t> buf(rpc::MessageHeader::ENCODED_SIZE + body.size());
+    rpc::MessageHeader h;
+    h.blockLength   = static_cast<uint16_t>(body.size());
+    h.templateId    = static_cast<uint16_t>(rpc::TemplateId::Produce);
+    h.sessionId     = sessionId;
+    h.correlationId = correlationId;
+    h.encode(buf.data());
+    std::memcpy(buf.data() + rpc::MessageHeader::ENCODED_SIZE, body.data(), body.size());
+    return buf;
+}
+
+sm::CryptoState brokerSideCryptoStateFor(cr::TlsSession& srv, const sm::SessionMachine& m,
+                                          int64_t sessionId) {
+    const auto keys = srv.exportKeys(m.cryptoState().cipher, sessionId);
+    sm::CryptoState c;
+    c.encrypted = true;
+    c.cipher    = keys.cipher;
+    c.send.emplace(keys.cipher, keys.b2c, keys.b2cPrefix);
+    c.recv.emplace(keys.cipher, keys.c2b, keys.c2bPrefix);
+    return c;
+}
+
+// Shared setup: drive a real TLS handshake to Connected+encrypted (or, for
+// the untrusted-cert regression case, to a deliberate failure).
+struct FrameFixture {
+    std::string    serverPem, serverKey, caPem;
+    cr::TlsSession  srv;
+    FakeIo          io;
+    sm::SessionMachine m;
+    static constexpr int64_t kSessionId = 42;
+
+    // `useDefaultTrust=false` means "use `trustPem` verbatim, even if empty"
+    // (TlsSession::makeClient's own contract: "" = explicitly trust nothing)
+    // -- distinguishing that from "no override given" (the common case,
+    // which loads the real test CA) requires a flag, since an empty string
+    // is itself a meaningful, distinct value here.
+    explicit FrameFixture(std::string trustPem = {}, bool useDefaultTrust = true)
+        : serverPem(slurp(testdataPath("server.pem")))
+        , serverKey(slurp(testdataPath("server.key")))
+        , caPem(useDefaultTrust ? slurp(testdataPath("ca.pem")) : std::move(trustPem))
+        , srv(cr::TlsSession::makeServer(serverPem.c_str(), serverKey.c_str()))
+        , m(io, [this] {
+              sm::SessionConfig c;
+              c.egressChannel  = "aeron:udp?endpoint=client:40456";
+              c.offerCrypto    = true;
+              c.tlsTrustPem    = caPem;
+              c.tlsExpectHost  = "localhost";
+              return c;
+          }())
+    {}
+
+    bool established(int64_t nowNs) {
+        m.connect(nowNs);
+        return driveHandshake(m, io, srv, kSessionId, nowNs + 1) && m.cryptoState().encrypted;
+    }
+};
+
+}  // namespace
+
+// ===========================================================================
+// AEAD tamper: ciphertext byte flip AND tag byte flip -> dropped.
+// ===========================================================================
+
+TEST(ClientCryptoRegression, CiphertextByteFlipDropped) {
+    FrameFixture f;
+    ASSERT_TRUE(f.srv.valid());
+    ASSERT_TRUE(f.established(1'000'000'000LL));
+
+    sm::CryptoState brokerSide = brokerSideCryptoStateFor(f.srv, f.m, FrameFixture::kSessionId);
+    const auto plain = buildPlainProduceFrame(FrameFixture::kSessionId, 800, "ciphertext-tamper");
+
+    uint8_t sealed[256];
+    const std::size_t sealedLen = cc::sealFrame(f.m.cryptoState(), plain.data(), plain.size(), sealed, sizeof sealed);
+    ASSERT_GT(sealedLen, 0u);
+
+    // Flip the FIRST ciphertext byte (right after the 36-byte clear AAD region, never the tag).
+    sealed[rune::protocol::client::kCryptoHeaderBytes] ^= 0xFF;
+
+    uint8_t opened[256];
+    EXPECT_EQ(cc::openEgressFrame(brokerSide, sealed, sealedLen, opened, sizeof opened), 0u)
+        << "a flipped ciphertext byte must be dropped";
+}
+
+TEST(ClientCryptoRegression, TagByteFlipDropped) {
+    FrameFixture f;
+    ASSERT_TRUE(f.srv.valid());
+    ASSERT_TRUE(f.established(1'000'000'000LL));
+
+    sm::CryptoState brokerSide = brokerSideCryptoStateFor(f.srv, f.m, FrameFixture::kSessionId);
+    const auto plain = buildPlainProduceFrame(FrameFixture::kSessionId, 801, "tag-tamper");
+
+    uint8_t sealed[256];
+    const std::size_t sealedLen = cc::sealFrame(f.m.cryptoState(), plain.data(), plain.size(), sealed, sizeof sealed);
+    ASSERT_GT(sealedLen, 0u);
+    sealed[sealedLen - 1] ^= 0x01;  // the last byte is always inside the 16B tag
+
+    const uint64_t recvSeqBefore = brokerSide.recvSeq;
+    uint8_t opened[256];
+    EXPECT_EQ(cc::openEgressFrame(brokerSide, sealed, sealedLen, opened, sizeof opened), 0u)
+        << "a flipped tag byte must be dropped";
+    EXPECT_EQ(brokerSide.recvSeq, recvSeqBefore) << "a rejected tamper must not poison the window";
+}
+
+TEST(ClientCryptoRegression, AadHeaderByteFlipDropped) {
+    FrameFixture f;
+    ASSERT_TRUE(f.srv.valid());
+    ASSERT_TRUE(f.established(1'000'000'000LL));
+
+    sm::CryptoState brokerSide = brokerSideCryptoStateFor(f.srv, f.m, FrameFixture::kSessionId);
+    const auto plain = buildPlainProduceFrame(FrameFixture::kSessionId, 802, "aad-tamper");
+
+    uint8_t sealed[256];
+    const std::size_t sealedLen = cc::sealFrame(f.m.cryptoState(), plain.data(), plain.size(), sealed, sizeof sealed);
+    ASSERT_GT(sealedLen, 0u);
+    sealed[8] ^= 0xFF;  // sessionId field — clear, part of the AAD
+
+    uint8_t opened[256];
+    EXPECT_EQ(cc::openEgressFrame(brokerSide, sealed, sealedLen, opened, sizeof opened), 0u)
+        << "a tampered sessionId (AAD) byte must be dropped even though ciphertext/tag are untouched";
+}
+
+// ===========================================================================
+// Replay: resent seq dropped; reorder within the 64-window accepted;
+// too-old (>64 behind) dropped; forged seq does not poison the window.
+// ===========================================================================
+
+TEST(ClientCryptoRegression, ResentSeqDropped) {
+    FrameFixture f;
+    ASSERT_TRUE(f.srv.valid());
+    ASSERT_TRUE(f.established(1'000'000'000LL));
+
+    sm::CryptoState brokerSide = brokerSideCryptoStateFor(f.srv, f.m, FrameFixture::kSessionId);
+    const auto plain = buildPlainProduceFrame(FrameFixture::kSessionId, 803, "replay-me");
+
+    uint8_t sealed[256];
+    const std::size_t sealedLen = cc::sealFrame(f.m.cryptoState(), plain.data(), plain.size(), sealed, sizeof sealed);
+    ASSERT_GT(sealedLen, 0u);
+
+    uint8_t opened[256];
+    ASSERT_EQ(cc::openEgressFrame(brokerSide, sealed, sealedLen, opened, sizeof opened), plain.size());
+    EXPECT_EQ(cc::openEgressFrame(brokerSide, sealed, sealedLen, opened, sizeof opened), 0u)
+        << "a resent (exact-duplicate) seq must be dropped";
+}
+
+TEST(ClientCryptoRegression, ReorderWithinWindowAccepted) {
+    FrameFixture f;
+    ASSERT_TRUE(f.srv.valid());
+    ASSERT_TRUE(f.established(1'000'000'000LL));
+
+    sm::CryptoState brokerSide = brokerSideCryptoStateFor(f.srv, f.m, FrameFixture::kSessionId);
+    uint8_t sealed1[256], sealed2[256], sealed3[256];
+    const auto plain1 = buildPlainProduceFrame(FrameFixture::kSessionId, 804, "seq-1");
+    const auto plain2 = buildPlainProduceFrame(FrameFixture::kSessionId, 805, "seq-2");
+    const auto plain3 = buildPlainProduceFrame(FrameFixture::kSessionId, 806, "seq-3");
+    const std::size_t len1 = cc::sealFrame(f.m.cryptoState(), plain1.data(), plain1.size(), sealed1, sizeof sealed1);
+    const std::size_t len2 = cc::sealFrame(f.m.cryptoState(), plain2.data(), plain2.size(), sealed2, sizeof sealed2);
+    const std::size_t len3 = cc::sealFrame(f.m.cryptoState(), plain3.data(), plain3.size(), sealed3, sizeof sealed3);
+    ASSERT_GT(len1, 0u); ASSERT_GT(len2, 0u); ASSERT_GT(len3, 0u);
+
+    uint8_t opened[256];
+    EXPECT_EQ(cc::openEgressFrame(brokerSide, sealed1, len1, opened, sizeof opened), plain1.size());
+    EXPECT_EQ(cc::openEgressFrame(brokerSide, sealed3, len3, opened, sizeof opened), plain3.size());
+    EXPECT_EQ(cc::openEgressFrame(brokerSide, sealed2, len2, opened, sizeof opened), plain2.size())
+        << "seq=2, delivered after seq=3 but still inside the window, must be accepted";
+}
+
+TEST(ClientCryptoRegression, TooOldSeqDropped) {
+    FrameFixture f;
+    ASSERT_TRUE(f.srv.valid());
+    ASSERT_TRUE(f.established(1'000'000'000LL));
+
+    sm::CryptoState brokerSide = brokerSideCryptoStateFor(f.srv, f.m, FrameFixture::kSessionId);
+
+    // Advance sendSeq to 100 by sealing 99 throwaway frames first, then the real "ahead" one.
+    uint8_t scratch[256];
+    for (int i = 0; i < 99; ++i) {
+        const auto plain = buildPlainProduceFrame(FrameFixture::kSessionId, 900 + i, "filler");
+        ASSERT_GT(cc::sealFrame(f.m.cryptoState(), plain.data(), plain.size(), scratch, sizeof scratch), 0u);
+    }
+    const auto plainAhead = buildPlainProduceFrame(FrameFixture::kSessionId, 999, "seq-100");
+    uint8_t sealedAhead[256];
+    const std::size_t lenAhead = cc::sealFrame(f.m.cryptoState(), plainAhead.data(), plainAhead.size(), sealedAhead, sizeof sealedAhead);
+    ASSERT_GT(lenAhead, 0u);
+
+    uint8_t opened[256];
+    ASSERT_EQ(cc::openEgressFrame(brokerSide, sealedAhead, lenAhead, opened, sizeof opened), plainAhead.size());
+    ASSERT_EQ(brokerSide.recvSeq, 100u);
+
+    // seq=1 is now 99 behind the high-water mark -- too old. CryptoState's
+    // own AeadCipher is private/non-rewindable, so build an equivalent c2b
+    // cipher from the independently re-exported session keys to seal seq=1
+    // directly (same key material sealFrame would have used for the real
+    // first frame of this session).
+    const auto plainOld = buildPlainProduceFrame(FrameFixture::kSessionId, 1, "seq-1-too-old");
+    const auto keys = f.srv.exportKeys(f.m.cryptoState().cipher, FrameFixture::kSessionId);
+    ASSERT_NE(keys.cipher, cr::Cipher::None);
+    cr::AeadCipher equivalentClientSend(keys.cipher, keys.c2b, keys.c2bPrefix);
+    namespace rpc = rune::protocol::client;
+    std::vector<uint8_t> wireOld(plainOld.size() + rpc::kCryptoOverhead);
+    std::memcpy(wireOld.data(), plainOld.data(), rpc::MessageHeader::ENCODED_SIZE);
+    rpc::CryptoSubHeader sub;
+    sub.version = 1;
+    sub.seq     = 1;
+    sub.encode(wireOld.data() + rpc::MessageHeader::ENCODED_SIZE);
+    const std::size_t bodyLen = plainOld.size() - rpc::MessageHeader::ENCODED_SIZE;
+    const std::size_t n = equivalentClientSend.seal(1, wireOld.data(), rpc::kCryptoHeaderBytes,
+                                                      plainOld.data() + rpc::MessageHeader::ENCODED_SIZE, bodyLen,
+                                                      wireOld.data() + rpc::kCryptoHeaderBytes);
+    ASSERT_GT(n, 0u);
+    wireOld.resize(rpc::kCryptoHeaderBytes + n);
+
+    EXPECT_EQ(cc::openEgressFrame(brokerSide, wireOld.data(), wireOld.size(), opened, sizeof opened), 0u)
+        << "a seq more than 64 behind the high-water mark must be dropped as too old";
+    EXPECT_EQ(brokerSide.recvSeq, 100u);
+}
+
+TEST(ClientCryptoRegression, ForgedSeqDoesNotPoisonWindowAgainstLaterLegitFrame) {
+    FrameFixture f;
+    ASSERT_TRUE(f.srv.valid());
+    ASSERT_TRUE(f.established(1'000'000'000LL));
+
+    sm::CryptoState brokerSide = brokerSideCryptoStateFor(f.srv, f.m, FrameFixture::kSessionId);
+    namespace rpc = rune::protocol::client;
+
+    const auto plain = buildPlainProduceFrame(FrameFixture::kSessionId, 1000, "forge-target");
+    const uint8_t fakePrefix[cr::kNoncePrefix] = {9, 9, 9, 9};
+    cr::AeadCipher wrongKeyCipher(f.m.cryptoState().cipher, cr::AeadKey{}, fakePrefix);
+
+    std::vector<uint8_t> forged(plain.size() + rpc::kCryptoOverhead);
+    std::memcpy(forged.data(), plain.data(), rpc::MessageHeader::ENCODED_SIZE);
+    rpc::CryptoSubHeader sub;
+    sub.version = 1;
+    sub.seq     = 5;
+    sub.encode(forged.data() + rpc::MessageHeader::ENCODED_SIZE);
+    const std::size_t bodyLen = plain.size() - rpc::MessageHeader::ENCODED_SIZE;
+    const std::size_t n = wrongKeyCipher.seal(5, forged.data(), rpc::kCryptoHeaderBytes,
+                                               plain.data() + rpc::MessageHeader::ENCODED_SIZE, bodyLen,
+                                               forged.data() + rpc::kCryptoHeaderBytes);
+    ASSERT_GT(n, 0u);
+    forged.resize(rpc::kCryptoHeaderBytes + n);
+
+    uint8_t opened[256];
+    EXPECT_EQ(cc::openEgressFrame(brokerSide, forged.data(), forged.size(), opened, sizeof opened), 0u);
+    EXPECT_EQ(brokerSide.recvSeq, 0u) << "a forged frame must never advance the window";
+
+    // The same seq (5), sealed LEGITIMATELY afterwards, must still succeed:
+    // seal an independent frame at seq=5 using the SAME real c2b key
+    // (re-exported from the broker side).
+    const auto keys = f.srv.exportKeys(f.m.cryptoState().cipher, FrameFixture::kSessionId);
+    cr::AeadCipher realClientSend(keys.cipher, keys.c2b, keys.c2bPrefix);
+    std::vector<uint8_t> realAtFive(plain.size() + rpc::kCryptoOverhead);
+    std::memcpy(realAtFive.data(), plain.data(), rpc::MessageHeader::ENCODED_SIZE);
+    rpc::CryptoSubHeader sub5;
+    sub5.version = 1;
+    sub5.seq     = 5;
+    sub5.encode(realAtFive.data() + rpc::MessageHeader::ENCODED_SIZE);
+    const std::size_t n5 = realClientSend.seal(5, realAtFive.data(), rpc::kCryptoHeaderBytes,
+                                                plain.data() + rpc::MessageHeader::ENCODED_SIZE, bodyLen,
+                                                realAtFive.data() + rpc::kCryptoHeaderBytes);
+    ASSERT_GT(n5, 0u);
+    realAtFive.resize(rpc::kCryptoHeaderBytes + n5);
+
+    EXPECT_EQ(cc::openEgressFrame(brokerSide, realAtFive.data(), realAtFive.size(), opened, sizeof opened),
+              plain.size())
+        << "the SAME seq (5), sealed legitimately, must still succeed -- the forged attempt left no trace";
+    EXPECT_EQ(brokerSide.recvSeq, 5u);
+}
+
+// ===========================================================================
+// Cross-session / wrong-key injection: a frame sealed under one session's
+// key must fail to open under ANOTHER (real, independently handshaked)
+// session's key.
+// ===========================================================================
+
+TEST(ClientCryptoRegression, CrossSessionInjectionFailsToOpenUnderDifferentSessionKey) {
+    FrameFixture sessionA;
+    FrameFixture sessionB;
+    ASSERT_TRUE(sessionA.srv.valid());
+    ASSERT_TRUE(sessionB.srv.valid());
+    ASSERT_TRUE(sessionA.established(1'000'000'000LL));
+    ASSERT_TRUE(sessionB.established(1'000'000'000LL));
+
+    sm::CryptoState brokerSideA = brokerSideCryptoStateFor(sessionA.srv, sessionA.m, FrameFixture::kSessionId);
+    sm::CryptoState brokerSideB = brokerSideCryptoStateFor(sessionB.srv, sessionB.m, FrameFixture::kSessionId);
+
+    const auto plain = buildPlainProduceFrame(FrameFixture::kSessionId, 1100, "session-a-body");
+    uint8_t sealed[256];
+    const std::size_t sealedLen =
+        cc::sealFrame(sessionA.m.cryptoState(), plain.data(), plain.size(), sealed, sizeof sealed);
+    ASSERT_GT(sealedLen, 0u);
+
+    uint8_t opened[256];
+    ASSERT_GT(cc::openEgressFrame(brokerSideA, sealed, sealedLen, opened, sizeof opened), 0u)
+        << "sanity: session A's own frame opens under session A's broker-side key";
+
+    EXPECT_EQ(cc::openEgressFrame(brokerSideB, sealed, sealedLen, opened, sizeof opened), 0u)
+        << "session A's sealed frame must never open under session B's independently-handshaked key";
+}
+
+// ===========================================================================
+// Per-sender (shard egress): sender 0 unchanged; distinct senders distinct
+// keys/windows; unknown/out-of-range senderId dropped fail-closed; the
+// senderId=64 boundary opens, 65 dropped.
+// ===========================================================================
+
+namespace {
+std::vector<uint8_t> sealAsSender(cr::AeadCipher& cipher, cr::Cipher cipherId, uint8_t senderId,
+                                   uint64_t seq, int64_t sessionId, int64_t correlationId,
+                                   std::string_view body) {
+    namespace rpc = rune::protocol::client;
+    const auto plain = buildPlainProduceFrame(sessionId, correlationId, body);
+    const std::size_t bodyLen = plain.size() - rpc::MessageHeader::ENCODED_SIZE;
+    std::vector<uint8_t> out(rpc::kCryptoHeaderBytes + bodyLen + cr::kTagSize);
+    std::memcpy(out.data(), plain.data(), rpc::MessageHeader::ENCODED_SIZE);
+    rpc::CryptoSubHeader sub;
+    sub.version  = 1;
+    sub.cipher   = static_cast<uint8_t>(cipherId);
+    sub.senderId = senderId;
+    sub.seq      = seq;
+    sub.encode(out.data() + rpc::MessageHeader::ENCODED_SIZE);
+    const std::size_t n = cipher.seal(seq, out.data(), rpc::kCryptoHeaderBytes,
+                                       plain.data() + rpc::MessageHeader::ENCODED_SIZE, bodyLen,
+                                       out.data() + rpc::kCryptoHeaderBytes);
+    EXPECT_GT(n, 0u);
+    out.resize(rpc::kCryptoHeaderBytes + n);
+    return out;
+}
+}  // namespace
+
+TEST(ClientCryptoRegression, Sender0OpensUnchanged) {
+    FrameFixture f;
+    ASSERT_TRUE(f.srv.valid());
+    ASSERT_TRUE(f.established(1'000'000'000LL));
+
+    const auto keys = f.srv.exportKeys(f.m.cryptoState().cipher, FrameFixture::kSessionId);
+    ASSERT_NE(keys.cipher, cr::Cipher::None);
+    cr::AeadCipher gatewayCipher(keys.cipher, keys.b2c, keys.b2cPrefix);
+    const auto sealed = sealAsSender(gatewayCipher, keys.cipher, 0, 1, FrameFixture::kSessionId, 1200, "gw");
+
+    uint8_t opened[256];
+    EXPECT_GT(cc::openEgressFrame(f.m.cryptoState(), sealed.data(), sealed.size(), opened, sizeof opened), 0u);
+}
+
+TEST(ClientCryptoRegression, DistinctSendersDistinctKeysNoCrossOpen) {
+    FrameFixture f;
+    ASSERT_TRUE(f.srv.valid());
+    ASSERT_TRUE(f.established(1'000'000'000LL));
+
+    const auto keys = f.srv.exportKeys(f.m.cryptoState().cipher, FrameFixture::kSessionId);
+    cr::AeadKey derived1{}, derived2{};
+    ASSERT_TRUE(cr::deriveSenderKey(keys.b2c, 1, derived1));
+    ASSERT_TRUE(cr::deriveSenderKey(keys.b2c, 2, derived2));
+    cr::AeadCipher worker1(keys.cipher, derived1, keys.b2cPrefix);
+    cr::AeadCipher worker2(keys.cipher, derived2, keys.b2cPrefix);
+
+    const auto sealed1 = sealAsSender(worker1, keys.cipher, 1, 1, FrameFixture::kSessionId, 1201, "w1");
+    uint8_t opened[256];
+    EXPECT_GT(cc::openEgressFrame(f.m.cryptoState(), sealed1.data(), sealed1.size(), opened, sizeof opened), 0u);
+
+    // Replaying sender 1's frame on its own window must be dropped.
+    EXPECT_EQ(cc::openEgressFrame(f.m.cryptoState(), sealed1.data(), sealed1.size(), opened, sizeof opened), 0u);
+
+    // The SAME seq (1) on sender 2's independent window must still succeed.
+    const auto sealed2 = sealAsSender(worker2, keys.cipher, 2, 1, FrameFixture::kSessionId, 1202, "w2");
+    EXPECT_GT(cc::openEgressFrame(f.m.cryptoState(), sealed2.data(), sealed2.size(), opened, sizeof opened), 0u)
+        << "sender 2's window is independent of sender 1's";
+}
+
+TEST(ClientCryptoRegression, OutOfRangeSenderIdDroppedFailClosed) {
+    FrameFixture f;
+    ASSERT_TRUE(f.srv.valid());
+    ASSERT_TRUE(f.established(1'000'000'000LL));
+
+    const auto keys = f.srv.exportKeys(f.m.cryptoState().cipher, FrameFixture::kSessionId);
+    cr::AeadCipher someCipher(keys.cipher, keys.b2c, keys.b2cPrefix);
+    const auto forged = sealAsSender(someCipher, keys.cipher, 250, 1, FrameFixture::kSessionId, 1203, "forged");
+
+    uint8_t opened[256];
+    EXPECT_EQ(cc::openEgressFrame(f.m.cryptoState(), forged.data(), forged.size(), opened, sizeof opened), 0u)
+        << "an out-of-range senderId must be dropped, fail-closed, with no trial decrypt";
+}
+
+TEST(ClientCryptoRegression, Sender64BoundaryOpensSender65Dropped) {
+    FrameFixture f;
+    ASSERT_TRUE(f.srv.valid());
+    ASSERT_TRUE(f.established(1'000'000'000LL));
+
+    const auto keys = f.srv.exportKeys(f.m.cryptoState().cipher, FrameFixture::kSessionId);
+
+    cr::AeadKey derived64{};
+    ASSERT_TRUE(cr::deriveSenderKey(keys.b2c, 64, derived64));
+    cr::AeadCipher cipher64(keys.cipher, derived64, keys.b2cPrefix);
+    const auto sealed64 = sealAsSender(cipher64, keys.cipher, 64, 1, FrameFixture::kSessionId, 1204, "w64");
+    uint8_t opened[256];
+    EXPECT_GT(cc::openEgressFrame(f.m.cryptoState(), sealed64.data(), sealed64.size(), opened, sizeof opened), 0u)
+        << "senderId 64 (the broker's top worker) must open";
+
+    cr::AeadKey derived65{};
+    ASSERT_TRUE(cr::deriveSenderKey(keys.b2c, 65, derived65));
+    cr::AeadCipher cipher65(keys.cipher, derived65, keys.b2cPrefix);
+    const auto sealed65 = sealAsSender(cipher65, keys.cipher, 65, 1, FrameFixture::kSessionId, 1205, "w65");
+    EXPECT_EQ(cc::openEgressFrame(f.m.cryptoState(), sealed65.data(), sealed65.size(), opened, sizeof opened), 0u)
+        << "senderId 65 is one past the broker's max worker -- must be dropped, fail-closed";
+}
+
+// ===========================================================================
+// Downgrade safety: requireCrypto terminal-fails on a no-cipher
+// ConnectResponse, never silent plaintext.
+// ===========================================================================
+
+TEST(ClientCryptoRegression, RequireCryptoTerminalFailsOnNoCipherResponse) {
+    FakeIo io;
+    sm::SessionConfig cfg;
+    cfg.egressChannel = "aeron:udp?endpoint=client:40456";
+    cfg.offerCrypto   = true;
+    cfg.requireCrypto = true;
+    cfg.tlsTrustPem   = "";
+    sm::SessionMachine m(io, cfg);
+
+    constexpr int64_t T0 = 1'000'000'000LL;
+    m.connect(T0);
+    auto req = cc::decodeConnectRequest(io.last().data(), io.last().size());
+    ASSERT_TRUE(req.has_value());
+
+    m.onConnectResponse(/*code=*/0, /*leaderMemberId=*/-1, /*assignedSessionId=*/99,
+                         req->correlationId, T0 + 1, /*chosenCipher=*/0, /*handshakeBytes=*/{});
+
+    EXPECT_EQ(m.state(), sm::SessionState::Rejected)
+        << "requireCrypto must terminally fail, never silently proceed plaintext";
+    EXPECT_FALSE(m.cryptoState().encrypted);
+}
+
+// ===========================================================================
+// Handshake: untrusted cert rejected; wrong expectHost rejected; a handshake
+// blob larger than the old 512-byte scratch is handled.
+// ===========================================================================
+
+TEST(ClientCryptoRegression, UntrustedCertRejectedAtSessionMachineLevel) {
+    // tlsTrustPem = "" -> TlsSession::makeClient's "explicitly trust nothing"
+    // contract, driven through the REAL SessionMachine::connect() path (not
+    // just rune-crypto's TlsSession directly).
+    FrameFixture f(/*trustPem=*/"", /*useDefaultTrust=*/false);
+    ASSERT_TRUE(f.srv.valid());
+
+    f.m.connect(1'000'000'000LL);
+    EXPECT_FALSE(driveHandshake(f.m, f.io, f.srv, FrameFixture::kSessionId, 1'000'000'001LL));
+    EXPECT_EQ(f.m.state(), sm::SessionState::Rejected);
+    EXPECT_FALSE(f.m.cryptoState().encrypted);
+}
+
+TEST(ClientCryptoRegression, WrongExpectHostRejected) {
+    const std::string serverPem = slurp(testdataPath("server.pem"));
+    const std::string serverKey = slurp(testdataPath("server.key"));
+    const std::string caPem     = slurp(testdataPath("ca.pem"));
+    cr::TlsSession srv = cr::TlsSession::makeServer(serverPem.c_str(), serverKey.c_str());
+    ASSERT_TRUE(srv.valid());
+
+    FakeIo io;
+    sm::SessionConfig cfg;
+    cfg.egressChannel = "aeron:udp?endpoint=client:40456";
+    cfg.offerCrypto   = true;
+    cfg.tlsTrustPem   = caPem;
+    cfg.tlsExpectHost = "not-the-cert-san.example";
+    sm::SessionMachine m(io, cfg);
+
+    constexpr int64_t T0 = 1'000'000'000LL;
+    m.connect(T0);
+    EXPECT_FALSE(driveHandshake(m, io, srv, /*sessionId=*/7, T0 + 1));
+    EXPECT_EQ(m.state(), sm::SessionState::Rejected);
+}
+
+TEST(ClientCryptoRegression, HandshakeBlobLargerThanOld512ByteScratchHandled) {
+    // SessionMachine's handshake bytes (hsBytes_) are a growable
+    // std::vector<uint8_t> today SPECIFICALLY so a flight (ServerHello +
+    // Certificate + CertVerify + Finished, which includes the broker's
+    // X.509 cert) isn't truncated by a fixed buffer. This drives a REAL
+    // handshake, sums every byte transferred, and proves a real flight
+    // exceeds the old 512-byte bound while still reaching Connected.
+    FrameFixture f;
+    ASSERT_TRUE(f.srv.valid());
+
+    f.m.connect(1'000'000'000LL);
+    std::size_t totalBytes = 0;
+    ASSERT_TRUE(driveHandshake(f.m, f.io, f.srv, FrameFixture::kSessionId, 1'000'000'001LL, &totalBytes));
+    EXPECT_EQ(f.m.state(), sm::SessionState::Connected);
+    EXPECT_GT(totalBytes, 512u)
+        << "a real TLS 1.3 handshake flight must exceed the old fixed 512-byte scratch bound "
+           "and still complete (asserted above) without truncation";
+}
+
+// ===========================================================================
+// No-hang fix round 5 (N17): a HandshakeContinueResponse with a code other than
+// HandshakeFailed (the broker evicted this handshake from its full
+// pending-connect table and answered Internal) is a retriable CONNECT failure —
+// never a terminal, mislabelled Rejected(HandshakeFailed).  HandshakeFailed
+// itself stays terminal.
+// ===========================================================================
+namespace {
+// Drives the machine into Handshaking (first leg answered); returns the connect corrId.
+int64_t intoHandshaking(FrameFixture& f, int64_t nowNs) {
+    f.m.connect(nowNs);
+    auto req = cc::decodeConnectRequest(f.io.last().data(), f.io.last().size());
+    EXPECT_TRUE(req.has_value());
+    const auto& hb = req->handshakeBytes;
+    EXPECT_NE(f.srv.readInbound(reinterpret_cast<const uint8_t*>(hb.data()), hb.size()), cr::HsState::Failed);
+    uint8_t out[16384];
+    const std::size_t n = f.srv.writeOutbound(out, sizeof out);
+    // Only the first half of the server's flight: the client's TLS needs more —
+    // it stays Handshaking, awaiting a HandshakeContinueResponse.
+    f.m.onConnectResponse(/*code=*/0, /*leaderMemberId=*/-1, FrameFixture::kSessionId, req->correlationId,
+                          nowNs + 1, req->cipherList[0], std::string_view(reinterpret_cast<const char*>(out), n / 2));
+    return req->correlationId;
+}
+}  // namespace
+
+TEST(ClientCryptoRegression, HandshakeContinueInternalIsARetriableConnectFailureRegression) {
+    FrameFixture f;
+    ASSERT_TRUE(f.srv.valid());
+    const int64_t corr = intoHandshaking(f, 1'000'000'000LL);
+    ASSERT_EQ(f.m.state(), sm::SessionState::Handshaking);
+    f.m.onHandshakeContinueResponse(static_cast<int16_t>(rune::protocol::client::ErrorCode::Internal), {}, corr,
+                                    1'000'000'010LL);
+    EXPECT_NE(f.m.state(), sm::SessionState::Rejected)
+        << "a full broker table turned into a terminal TLS failure";
+    EXPECT_NE(f.m.rejectCode(), static_cast<int16_t>(rune::protocol::client::ErrorCode::HandshakeFailed));
+    EXPECT_FALSE(f.m.cryptoState().encrypted);
+}
+
+TEST(ClientCryptoRegression, HandshakeContinueHandshakeFailedStaysTerminalRegression) {
+    FrameFixture f;
+    ASSERT_TRUE(f.srv.valid());
+    const int64_t corr = intoHandshaking(f, 1'000'000'000LL);
+    ASSERT_EQ(f.m.state(), sm::SessionState::Handshaking);
+    f.m.onHandshakeContinueResponse(static_cast<int16_t>(rune::protocol::client::ErrorCode::HandshakeFailed), {},
+                                    corr, 1'000'000'010LL);
+    EXPECT_EQ(f.m.state(), sm::SessionState::Rejected);
+}
+
+// ===========================================================================
+// DR client bugs fix round 3 (client-failover-review.md "Fix round 2 check":
+// N-I1 + M-2).
+// ===========================================================================
+
+// M-2 (ruling): a handshake the broker never finishes in time is a TRANSIENT
+// connect failure (a slow / recovering broker) — never a terminal verdict on its
+// certificate.  Plain config: Disconnected (the seed failover moves on); a Live
+// reconnectForever session: Backoff.  RED (before): terminal Rejected(HandshakeFailed).
+TEST(ClientCryptoRegression, HandshakeTimeoutIsATransientConnectFailureRegression) {
+    {
+        FrameFixture f;
+        ASSERT_TRUE(f.srv.valid());
+        (void)intoHandshaking(f, 1'000'000'000LL);
+        ASSERT_EQ(f.m.state(), sm::SessionState::Handshaking);
+        f.m.tick(1'000'000'000LL + sm::SessionConfig{}.connectTimeoutNs + 2);
+        EXPECT_EQ(f.m.state(), sm::SessionState::Disconnected);
+        EXPECT_EQ(f.m.rejectCode(), 0);
+        EXPECT_EQ(f.m.lastConnectError(), sm::SessionMachine::kHandshakeTimedOut);
+        EXPECT_FALSE(sm::SessionMachine::nonRetriableConnectError(f.m.lastConnectError()));
+        EXPECT_FALSE(f.m.cryptoState().encrypted);
+        EXPECT_EQ(f.m.sessionId(), 0) << "the half-made broker session is abandoned";
+    }
+    {
+        // A Live reconnectForever session: its fresh reconnect's handshake times out -> Backoff.
+        FakeIo io;
+        const std::string serverPem = slurp(testdataPath("server.pem"));
+        const std::string serverKey = slurp(testdataPath("server.key"));
+        const std::string caPem     = slurp(testdataPath("ca.pem"));
+        auto srv1 = cr::TlsSession::makeServer(serverPem.c_str(), serverKey.c_str());
+        sm::SessionConfig c;
+        c.egressChannel = "aeron:udp?endpoint=client:40456";
+        c.offerCrypto = true; c.tlsTrustPem = caPem; c.tlsExpectHost = "localhost";
+        c.reconnectForeverAfterLive = true;
+        sm::SessionMachine m(io, c);
+        int64_t now = 1'000'000'000LL;
+        m.connect(now);
+        ASSERT_TRUE(driveHandshake(m, io, srv1, /*sessionId=*/42, now + 1));
+        ASSERT_TRUE(m.everLive());
+        m.forceReconnect(now += 1'000'000);   // a fresh connect (a failover move)
+        auto req = cc::decodeConnectRequest(io.last().data(), io.last().size());
+        ASSERT_TRUE(req.has_value());
+        auto srv2 = cr::TlsSession::makeServer(serverPem.c_str(), serverKey.c_str());
+        const auto& hb = req->handshakeBytes;
+        ASSERT_FALSE(hb.empty());
+        ASSERT_NE(srv2.readInbound(reinterpret_cast<const uint8_t*>(hb.data()), hb.size()), cr::HsState::Failed);
+        uint8_t out[16384];
+        const std::size_t n = srv2.writeOutbound(out, sizeof out);
+        m.onConnectResponse(0, -1, 43, req->correlationId, now + 1, req->cipherList[0],
+                            std::string_view(reinterpret_cast<const char*>(out), n / 2));
+        ASSERT_EQ(m.state(), sm::SessionState::Handshaking);
+        m.tick(now + c.connectTimeoutNs + 2);
+        EXPECT_EQ(m.state(), sm::SessionState::Backoff) << "a Live forever session backs off, never Rejected";
+        EXPECT_EQ(m.rejectCode(), 0);
+        EXPECT_EQ(m.lastConnectError(), sm::SessionMachine::kHandshakeTimedOut);
+    }
+}
+
+namespace {
+/// A Connected+encrypted reconnectForever session whose broker expired it; the resume (a
+/// plaintext hint-only request) is answered SessionExpired for THAT connect: the machine
+/// connects fresh — returns that request.
+std::vector<uint8_t> freshConnectAfterAResumeRefused(FakeIo& io, sm::SessionMachine& m, int64_t& now) {
+    namespace rpc = rune::protocol::client;
+    m.onErrorResponse(static_cast<int16_t>(rpc::ErrorCode::SessionExpired), "", 0, now += 1'000'000);
+    m.tick(now += 1'000'000);   // Resuming -> the resume ConnectRequest
+    auto resume = cc::decodeConnectRequest(io.last().data(), io.last().size());
+    EXPECT_TRUE(resume.has_value());
+    EXPECT_EQ(m.state(), sm::SessionState::Connecting);
+    const std::size_t before = io.sendCount();
+    m.onErrorResponse(static_cast<int16_t>(rpc::ErrorCode::SessionExpired), "", resume->correlationId,
+                      now += 1'000'000);
+    EXPECT_GT(io.sendCount(), before) << "a fresh ConnectRequest follows the refused resume";
+    return io.last();
+}
+}  // namespace
+
+// N-I1: a connect that cannot resume on the same broker (the refused resume -> fresh
+// connect; a shard failover move lands exactly here) negotiates crypto AFRESH: the
+// request carries a new ClientHello, the old session's keys are gone, and a new
+// handshake makes the session encrypted under NEW keys.  Both requireCrypto and
+// offered-not-required.  RED (before): the request is plaintext and the session keeps
+// the old keys; under requireCrypto the plaintext answer makes it Rejected.
+TEST(ClientCryptoRegression, NonResumeReconnectNegotiatesCryptoAfreshRegression) {
+    for (const bool require : {false, true}) {
+        SCOPED_TRACE(require ? "requireCrypto" : "offered, not required");
+        FakeIo io;
+        const std::string serverPem = slurp(testdataPath("server.pem"));
+        const std::string serverKey = slurp(testdataPath("server.key"));
+        const std::string caPem     = slurp(testdataPath("ca.pem"));
+        auto srv1 = cr::TlsSession::makeServer(serverPem.c_str(), serverKey.c_str());
+        sm::SessionConfig c;
+        c.egressChannel = "aeron:udp?endpoint=client:40456";
+        c.offerCrypto = true; c.requireCrypto = require; c.tlsTrustPem = caPem; c.tlsExpectHost = "localhost";
+        c.reconnectForeverAfterLive = true;
+        sm::SessionMachine m(io, c);
+        int64_t now = 1'000'000'000LL;
+        m.connect(now);
+        ASSERT_TRUE(driveHandshake(m, io, srv1, /*sessionId=*/42, now + 1));
+        ASSERT_TRUE(m.cryptoState().encrypted);
+
+        const auto fresh = freshConnectAfterAResumeRefused(io, m, now);
+        auto req = cc::decodeConnectRequest(fresh.data(), fresh.size());
+        ASSERT_TRUE(req.has_value());
+        EXPECT_FALSE(req->handshakeBytes.empty()) << "the fresh connect carries a new ClientHello";
+        EXPECT_FALSE(req->cipherList.empty());
+        EXPECT_FALSE(m.cryptoState().encrypted) << "the old session's keys survived the fresh connect";
+
+        // The new broker completes a NEW handshake: Connected, encrypted under the new keys.
+        auto srv2 = cr::TlsSession::makeServer(serverPem.c_str(), serverKey.c_str());
+        const std::size_t start = io.sendCount() - 1;
+        // Drive the legs manually: answer, then forward every new client leg.
+        bool done = false;
+        std::size_t deliveredFromIo = start;
+        for (int leg = 0; leg < 20 && !done; ++leg) {
+            if (deliveredFromIo >= io.sendCount()) break;
+            const auto& frame = io.sends[deliveredFromIo++];
+            std::string_view peer;
+            int64_t corr = 0;
+            uint8_t cipher = 0;
+            if (leg == 0) {
+                auto r0 = cc::decodeConnectRequest(frame.data(), frame.size());
+                ASSERT_TRUE(r0.has_value());
+                peer = r0->handshakeBytes; corr = r0->correlationId; cipher = r0->cipherList.empty() ? 0 : r0->cipherList[0];
+            } else {
+                auto hc = cc::decodeHandshakeContinue(frame.data(), frame.size());
+                ASSERT_TRUE(hc.has_value());
+                peer = hc->handshakeBytes; corr = hc->correlationId;
+            }
+            ASSERT_NE(srv2.readInbound(reinterpret_cast<const uint8_t*>(peer.data()), peer.size()), cr::HsState::Failed);
+            uint8_t out[16384];
+            const std::size_t n = srv2.writeOutbound(out, sizeof out);
+            const std::string_view ov(reinterpret_cast<const char*>(out), n);
+            if (leg == 0) m.onConnectResponse(0, -1, /*new id*/ 77, corr, now + 1, cipher, ov);
+            else if (m.state() == sm::SessionState::Handshaking) m.onHandshakeContinueResponse(0, ov, corr, now + 1);
+            done = m.state() == sm::SessionState::Connected && srv2.done();
+        }
+        ASSERT_TRUE(done) << "the fresh handshake completes";
+        ASSERT_TRUE(m.cryptoState().encrypted);
+        // The NEW broker can open what the client seals (the keys are the new session's).
+        sm::CryptoState broker = brokerSideCryptoStateFor(srv2, m, 77);
+        const auto frame = buildPlainProduceFrame(77, 9, "hello");
+        uint8_t sealed[256];
+        const std::size_t sn = cc::sealFrame(m.cryptoState(), frame.data(), frame.size(), sealed, sizeof sealed);
+        ASSERT_GT(sn, 0u);
+        uint8_t opened[256];
+        EXPECT_GT(cc::openEgressFrame(broker, sealed, sn, opened, sizeof opened), 0u)
+            << "the session is sealed under keys the new broker holds";
+    }
+}
+
+// N-I1 (the resume half): a session that went silent is moved to ANOTHER broker (a shard
+// failover re-point) — its resume hint and keys are meaningless there (a require_tls
+// broker rejects a plaintext resume as HandshakeFailed, terminally; another broker would
+// accept it plaintext while the client keeps the old keys).  After abandonResumeHint()
+// the next request is a fresh connect with a fresh ClientHello.  RED (no abandon): a
+// plaintext resume carrying the old session id.
+TEST(ClientCryptoRegression, AMoveToAnotherBrokerAbandonsTheResumeHintAndNegotiatesAfreshRegression) {
+    FakeIo io;
+    const std::string serverPem = slurp(testdataPath("server.pem"));
+    const std::string serverKey = slurp(testdataPath("server.key"));
+    const std::string caPem     = slurp(testdataPath("ca.pem"));
+    auto srv1 = cr::TlsSession::makeServer(serverPem.c_str(), serverKey.c_str());
+    sm::SessionConfig c;
+    c.egressChannel = "aeron:udp?endpoint=client:40456";
+    c.offerCrypto = true; c.requireCrypto = true; c.tlsTrustPem = caPem; c.tlsExpectHost = "localhost";
+    c.reconnectForeverAfterLive = true;
+    sm::SessionMachine m(io, c);
+    int64_t now = 1'000'000'000LL;
+    m.connect(now);
+    ASSERT_TRUE(driveHandshake(m, io, srv1, /*sessionId=*/42, now + 1));
+    m.tick(now += 1'000'000);
+    m.tick(now += c.responseTimeoutNs + 1);   // silent broker: stale -> Resuming
+    ASSERT_EQ(m.state(), sm::SessionState::Resuming);
+    m.abandonResumeHint();                    // the seed moved to another broker (ClientAgent seed move)
+    const std::size_t before = io.sendCount();
+    m.tick(now += 1'000'000);                 // the resume step: now a fresh connect
+    ASSERT_GT(io.sendCount(), before);
+    auto req = cc::decodeConnectRequest(io.last().data(), io.last().size());
+    ASSERT_TRUE(req.has_value());
+    EXPECT_EQ(req->sessionId, 0) << "no resume hint for another broker";
+    EXPECT_FALSE(req->handshakeBytes.empty()) << "a fresh ClientHello, never a plaintext request";
+    EXPECT_FALSE(m.cryptoState().encrypted) << "the old session's keys are gone";
+}
+
+// ===========================================================================
+// DR client bugs fix round 4 (client-failover-review.md "Fix round 3 check":
+// N3-I1 and the TLS handshake class).  The broker never resumes (handleConnect
+// allocates a NEW session on every connect), so under offerCrypto EVERY
+// ConnectRequest — a resume on the same broker included — negotiates afresh.
+// ===========================================================================
+namespace {
+struct TlsMachine {
+    FakeIo io;
+    std::string serverPem = slurp(testdataPath("server.pem"));
+    std::string serverKey = slurp(testdataPath("server.key"));
+    std::string caPem     = slurp(testdataPath("ca.pem"));
+    sm::SessionConfig c;
+    std::optional<sm::SessionMachine> m;
+    int64_t now = 1'000'000'000LL;
+    explicit TlsMachine(bool require) {
+        c.egressChannel = "aeron:udp?endpoint=client:40456";
+        c.offerCrypto = true; c.requireCrypto = require; c.tlsTrustPem = caPem; c.tlsExpectHost = "localhost";
+        c.reconnectForeverAfterLive = true;
+        m.emplace(io, c);
+    }
+    cr::TlsSession server() { return cr::TlsSession::makeServer(serverPem.c_str(), serverKey.c_str()); }
+    /// Drive a NEW broker's handshake from the request at io.sends[from]; true = Connected + encrypted
+    /// under keys that broker holds (a frame the client seals opens on that broker).
+    bool completeFrom(std::size_t from, int64_t sid) {
+        auto srv = server();
+        std::size_t next = from;
+        for (int leg = 0; leg < 20; ++leg) {
+            if (next >= io.sendCount()) break;
+            const auto& frame = io.sends[next++];
+            std::string_view peer; int64_t corr = 0; uint8_t cipher = 0;
+            if (leg == 0) {
+                auto r = cc::decodeConnectRequest(frame.data(), frame.size());
+                if (!r || r->handshakeBytes.empty() || r->cipherList.empty()) return false;
+                peer = r->handshakeBytes; corr = r->correlationId; cipher = r->cipherList[0];
+            } else {
+                auto hc = cc::decodeHandshakeContinue(frame.data(), frame.size());
+                if (!hc) return false;
+                peer = hc->handshakeBytes; corr = hc->correlationId;
+            }
+            if (srv.readInbound(reinterpret_cast<const uint8_t*>(peer.data()), peer.size()) == cr::HsState::Failed)
+                return false;
+            uint8_t out[16384];
+            const std::size_t n = srv.writeOutbound(out, sizeof out);
+            const std::string_view ov(reinterpret_cast<const char*>(out), n);
+            if (leg == 0) m->onConnectResponse(0, -1, sid, corr, now + 1, cipher, ov);
+            else if (m->state() == sm::SessionState::Handshaking) m->onHandshakeContinueResponse(0, ov, corr, now + 1);
+            if (m->state() == sm::SessionState::Connected && srv.done()) break;
+        }
+        if (m->state() != sm::SessionState::Connected || !srv.done() || !m->cryptoState().encrypted) return false;
+        sm::CryptoState broker = brokerSideCryptoStateFor(srv, *m, sid);
+        const auto plain = buildPlainProduceFrame(sid, 9, "hello");
+        uint8_t sealed[256], opened[256];
+        const std::size_t sn = cc::sealFrame(m->cryptoState(), plain.data(), plain.size(), sealed, sizeof sealed);
+        return sn > 0 && cc::openEgressFrame(broker, sealed, sn, opened, sizeof opened) > 0;
+    }
+    /// The resume request just sent: carries a fresh ClientHello + the resume hint, and the old keys are gone.
+    void expectFreshTlsResume(std::size_t before, int64_t oldSid) {
+        ASSERT_GT(io.sendCount(), before) << "a resume ConnectRequest";
+        auto req = cc::decodeConnectRequest(io.last().data(), io.last().size());
+        ASSERT_TRUE(req.has_value());
+        EXPECT_EQ(req->sessionId, oldSid) << "the resume hint stays in the request (the broker ignores it)";
+        EXPECT_FALSE(req->handshakeBytes.empty()) << "a plaintext resume: a require_tls broker answers HandshakeFailed";
+        EXPECT_FALSE(req->cipherList.empty());
+        EXPECT_FALSE(m->cryptoState().encrypted) << "the old session's keys survived into the new session";
+    }
+};
+}  // namespace
+
+// N3-I1: a broker-sent SessionExpired (the F-A lease-reap notice after a client stall) on
+// the SAME broker: the resume negotiates crypto afresh and the new session is encrypted
+// under the new broker session's keys.  Both requireCrypto and offered-not-required.
+// RED (round 3's `sessionId_ == 0` rule): a plaintext resume keeping the old keys.
+TEST(ClientCryptoRegression, SessionExpiredResumeOnTheSameBrokerNegotiatesCryptoAfreshRegression) {
+    for (const bool require : {true, false}) {
+        SCOPED_TRACE(require ? "requireCrypto" : "offered, not required");
+        TlsMachine t(require);
+        t.m->connect(t.now);
+        ASSERT_TRUE(t.completeFrom(0, 42));
+        namespace rpc = rune::protocol::client;
+        t.m->onErrorResponse(static_cast<int16_t>(rpc::ErrorCode::SessionExpired), "", 0, t.now += 1'000'000, 42);
+        ASSERT_EQ(t.m->state(), sm::SessionState::Resuming);
+        const std::size_t before = t.io.sendCount();
+        t.m->tick(t.now += 1'000'000);
+        ASSERT_EQ(t.m->state(), sm::SessionState::Connecting);
+        t.expectFreshTlsResume(before, 42);
+        EXPECT_TRUE(t.completeFrom(t.io.sendCount() - 1, 43)) << "the same broker's new session is encrypted";
+    }
+}
+
+// N3-I1: an own-stall loss (the broker went silent past responseTimeout; no failover move)
+// resumes on the same broker: fresh TLS, never plaintext / the old keys.
+TEST(ClientCryptoRegression, OwnStallResumeNegotiatesCryptoAfreshRegression) {
+    for (const bool require : {true, false}) {
+        SCOPED_TRACE(require ? "requireCrypto" : "offered, not required");
+        TlsMachine t(require);
+        t.m->connect(t.now);
+        ASSERT_TRUE(t.completeFrom(0, 42));
+        t.m->tick(t.now += 1'000'000);
+        t.m->tick(t.now += t.c.responseTimeoutNs + 1);
+        ASSERT_EQ(t.m->state(), sm::SessionState::Resuming);
+        const std::size_t before = t.io.sendCount();
+        t.m->tick(t.now += 1'000'000);
+        t.expectFreshTlsResume(before, 42);
+        EXPECT_TRUE(t.completeFrom(t.io.sendCount() - 1, 43));
+    }
+}
+
+// Fix round 4: one TLS episode per ConnectRequest — a new request (a timeout retry under
+// a new correlationId) carries a NEW ClientHello, while a fast retry of the SAME request
+// re-sends that request's own.  RED (an episode kept across requests): the timeout retry
+// replays the previous request's ClientHello.
+TEST(ClientCryptoRegression, EveryConnectRequestCarriesItsOwnTlsEpisodeRegression) {
+    TlsMachine t(/*require=*/true);
+    t.m->connect(t.now);
+    auto first = cc::decodeConnectRequest(t.io.last().data(), t.io.last().size());
+    ASSERT_TRUE(first.has_value());
+    const std::string hello1(first->handshakeBytes);
+    ASSERT_FALSE(hello1.empty());
+    t.m->tick(t.now + t.c.connectTimeoutNs + 1);   // no answer: a timeout retry (a new request)
+    auto second = cc::decodeConnectRequest(t.io.last().data(), t.io.last().size());
+    ASSERT_TRUE(second.has_value());
+    ASSERT_NE(second->correlationId, first->correlationId);
+    EXPECT_FALSE(second->handshakeBytes.empty());
+    EXPECT_NE(std::string(second->handshakeBytes), hello1) << "a new request replayed the old ClientHello";
+    // And the new request's handshake completes.
+    t.now += t.c.connectTimeoutNs + 2;
+    EXPECT_TRUE(t.completeFrom(t.io.sendCount() - 1, 42));
+}
+
+// Fix round 4: crypto REQUIRED and the local TLS cannot be built (a broken trust bundle):
+// never a plaintext ConnectRequest — terminal Rejected(HandshakeFailed).  RED (before):
+// a plaintext request is sent ("degrade" fallback) and the session waits for its answer.
+TEST(ClientCryptoRegression, RequiredCryptoWithoutLocalTlsNeverSendsAPlaintextConnectRegression) {
+    FakeIo io;
+    sm::SessionConfig c;
+    c.egressChannel = "aeron:udp?endpoint=client:40456";
+    c.offerCrypto = true; c.requireCrypto = true;
+    c.tlsTrustPem = std::string("-----BEGIN CERTIFICATE-----\nnot a certificate\n-----END CERTIFICATE-----\n");
+    c.tlsExpectHost = "localhost";
+    if (cr::TlsSession::makeClient(c.tlsTrustPem->c_str(), "localhost").valid())
+        GTEST_SKIP() << "this TLS build accepts the broken bundle";
+    sm::SessionMachine m(io, c);
+    m.connect(1'000'000'000LL);
+    for (std::size_t i = 0; i < io.sendCount(); ++i) {
+        auto r = cc::decodeConnectRequest(io.sends[i].data(), io.sends[i].size());
+        EXPECT_FALSE(r.has_value() && r->handshakeBytes.empty()) << "a plaintext ConnectRequest left";
+    }
+    m.tick(1'000'000'001LL);
+    EXPECT_EQ(m.state(), sm::SessionState::Rejected);
+    EXPECT_EQ(m.rejectCode(), static_cast<int16_t>(rune::protocol::client::ErrorCode::HandshakeFailed));
+}
+
+// ===========================================================================
+// DR client bugs fix round 5 (client-failover-review.md "Fix round 4 check").
+// ===========================================================================
+
+// N4-I1: the broker failed the handshake on its FINAL leg after this machine already went
+// Connected (a TLS 1.3 client is done once it has sent its Finished).  Ruling: terminal
+// Rejected(HandshakeFailed), keys cleared — only for a frame naming this session's current
+// id AND its connect corrId with code HandshakeFailed.  RED (before): the machine stays
+// Connected (onHandshakeContinueResponse returns at its Handshaking guard).
+TEST(ClientCryptoRegression, FinalLegHandshakeFailedAfterConnectedIsTerminalRegression) {
+    namespace rpc = rune::protocol::client;
+    const auto hf = static_cast<int16_t>(rpc::ErrorCode::HandshakeFailed);
+    {
+        FrameFixture f;
+        ASSERT_TRUE(f.established(1'000'000'000LL));
+        f.m.onHandshakeContinueResponse(hf, {}, f.m.correlationId(), 1'000'000'100LL, f.m.sessionId());
+        EXPECT_EQ(f.m.state(), sm::SessionState::Rejected) << "a final-leg HandshakeFailed left the session Connected";
+        EXPECT_EQ(f.m.rejectCode(), hf);
+        EXPECT_FALSE(f.m.cryptoState().encrypted) << "the keys of a session the broker never promoted survived";
+    }
+    struct Neg { const char* what; int16_t code; int64_t corrDelta; int64_t sid; };
+    const Neg negs[] = {
+        {"wrong corrId", hf, 1, FrameFixture::kSessionId},
+        {"wrong session id", hf, 0, FrameFixture::kSessionId + 1},
+        {"session id 0", hf, 0, 0},
+        {"code Internal", static_cast<int16_t>(rpc::ErrorCode::Internal), 0, FrameFixture::kSessionId},
+    };
+    for (const auto& n : negs) {
+        SCOPED_TRACE(n.what);
+        FrameFixture f;
+        ASSERT_TRUE(f.established(1'000'000'000LL));
+        f.m.onHandshakeContinueResponse(n.code, {}, f.m.correlationId() + n.corrDelta, 1'000'000'100LL, n.sid);
+        EXPECT_EQ(f.m.state(), sm::SessionState::Connected);
+        EXPECT_TRUE(f.m.cryptoState().encrypted);
+    }
+}
+
+// N4-M1: a seed move while CONNECTING (abandonResumeHint) keeps the in-flight episode — the
+// next new request replaces it.  RED (before): the episode is dropped, and with
+// requireCrypto tickConnecting turns "no TLS" into a terminal Rejected.
+TEST(ClientCryptoRegression, AbandonResumeHintWhileConnectingKeepsTheHandshakeRegression) {
+    TlsMachine t(/*require=*/true);
+    t.m->connect(t.now);
+    ASSERT_EQ(t.m->state(), sm::SessionState::Connecting);
+    t.m->abandonResumeHint();
+    t.m->tick(t.now + 1);
+    EXPECT_EQ(t.m->state(), sm::SessionState::Connecting) << "a transient move became a terminal Rejected";
+    EXPECT_EQ(t.m->rejectCode(), 0);
+    // The episode still completes the handshake for its request.
+    EXPECT_TRUE(t.completeFrom(t.io.sendCount() - 1, 42));
+}

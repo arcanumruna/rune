@@ -1,0 +1,109 @@
+# syntax=docker/dockerfile:1
+# ──────────────────────────────────────────────────────────────────────────────
+# rune-client-cpp — rune-ql CLI-driven e2e image (Task 10, 0c #11 gate, linux/amd64)
+#
+# Unlike the 0b Dockerfile.schema-probe (two-stage: build the probe at IMAGE time
+# from a checked-in blob, then a slim runtime), the 0c e2e is CLI-DRIVEN: the
+# typed probe's header is produced by `rune schema generate` at RUNTIME (from the
+# broker's stored schema), and the probe is COMPILED after that.  So this image is
+# a SINGLE stage that RETAINS the full toolchain (gcc-13 + cmake + conan cache +
+# configured build tree + sibling headers), enabling docker/rune-ql-e2e.sh to run,
+# INSIDE the container, against the live broker:
+#
+#     rune schema apply    tests/e2e/characters.rql --broker rune-1:40200 --validate
+#     rune schema generate characters --out <RUNE_GEN_DIR> --broker rune-1:40200
+#     cmake --build /build/build --target rune_ql_probe   (compile probe vs header)
+#     ./rune_ql_probe                                      (typed round-trip)
+#
+# Build contexts (BuildKit named contexts, wired by docker/rune-ql-e2e.sh):
+#   rune-protocol -> ../../rune-protocol      (main headers: SchemaMessages.h)
+#   rune-codec    -> ../../rune-codec-0c      (0c codec: FixedStr; Serialize/Record/
+#                                              Validator/Generator + tools/gen)
+#   rune-fr       -> ../../rune-fr            (flight recorder; rune_client_api links)
+# ──────────────────────────────────────────────────────────────────────────────
+
+FROM gcc:13 AS builder
+
+ARG CMAKE_VERSION=3.31.5
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-pip python3-venv git curl ninja-build pkg-config \
+        default-jdk-headless uuid-dev zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip3 install --no-cache-dir --break-system-packages "conan~=2.0"
+
+ENV JAVA_HOME=/usr/lib/jvm/default-java
+
+RUN curl -LO https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz \
+    && tar -xzf cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz --strip-components=1 -C /usr/local \
+    && rm cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz \
+    && cmake --version
+
+WORKDIR /build
+RUN conan profile detect --force
+
+# Conan deps first (cache layer independent of source edits).
+COPY conanfile.py conandata.yml VERSION.txt ./
+RUN conan install . --output-folder=conan-release --build=missing -s build_type=Release
+
+# ── Sibling build contexts ────────────────────────────────────────────────────
+# rune-protocol (main): headers + the src/net GSO/driver-wake C sources that
+# rune_gso / rune_client_driver_wake compile (CMakeLists.txt resolves them via
+# ${RUNE_PROTOCOL_INCLUDE}/../src/net/*.c) — mirrors the rune-broker Dockerfile's
+# equivalent fix (COPY --from=rune-protocol src); this image was stale without
+# it (Task 21 fix-on-sight: CMake failed configure with "No SOURCES given to
+# target: rune_gso / rune_client_driver_wake").
+COPY --from=rune-protocol include /rune-protocol/include
+COPY --from=rune-protocol src     /rune-protocol/src
+# rune-codec (0c): compiled sibling (src + include) + the rune_codec_gen tool source.
+COPY --from=rune-codec src     /rune-codec/src
+COPY --from=rune-codec include /rune-codec/include
+COPY --from=rune-codec tools   /rune-codec/tools
+# rune-ql: compiled sibling (src + include); rune_cli_lib links it.
+COPY --from=rune-ql src     /rune-ql/src
+COPY --from=rune-ql include /rune-ql/include
+# rune-fr: compiled sibling (src + include); rune_client_api links it.
+COPY --from=rune-fr src     /rune-fr/src
+COPY --from=rune-fr include /rune-fr/include
+# rune-crypto (client<->broker TLS/AEAD, Task 5/7): compiled sibling (src + include).
+# The TLS/crypto merge from origin/main made the client CMake hard-require this:
+# add_library(rune_crypto ...) from ${RUNE_CRYPTO_ROOT}/src/{Caps,Aead,TlsSession}.cpp,
+# linked PUBLIC into rune_client_transport/rune_client_agent (and thus the probe).
+# OpenSSL::SSL/Crypto come from conan (openssl/3.3.2 in conandata.yml); the configure
+# below passes -DRUNE_CRYPTO_ROOT=/rune-crypto so the sibling path resolves.
+COPY --from=rune-crypto src     /rune-crypto/src
+COPY --from=rune-crypto include /rune-crypto/include
+
+# ── Application sources (last; edits do not bust the conan cache) ─────────────
+COPY . .
+
+# ── Configure + build the `rune` CLI (+ client libs the probe will link) ──────
+# BUILD_EXAMPLES=ON so the rune_ql_probe target is defined (EXCLUDE_FROM_ALL, so
+# NOT compiled now — its header does not exist until `rune schema generate` runs;
+# the e2e script builds it after generate).  We DO build all libs the probe links
+# now, so the runtime probe compile is a single TU + link.
+RUN cmake -S . -B build -G Ninja \
+        -DCMAKE_TOOLCHAIN_FILE=conan-release/build/Release/generators/conan_toolchain.cmake \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_TESTING=OFF \
+        -DBUILD_BENCHMARKS=OFF \
+        -DBUILD_EXAMPLES=ON \
+        -DRUNE_PROTOCOL_INCLUDE=/rune-protocol/include \
+        -DRUNE_CODEC_ROOT=/rune-codec \
+        -DRUNE_QL_ROOT=/rune-ql \
+        -DRUNE_FR_DIR=/rune-fr \
+        -DRUNE_CRYPTO_ROOT=/rune-crypto \
+        -DRUNE_GEN_DIR=/build/build/e2e-gen \
+    && cmake --build build --target rune \
+    && cmake --build build --target rune_client_api rune_client_producer rune_client_subscriber rune_codec
+
+# The `rune` CLI on PATH for the e2e script.
+RUN ln -sf /build/build/rune /usr/local/bin/rune
+
+# Aeron shared-memory note: the embedded media driver maps CnC + log buffers into
+# /dev/shm; run with --shm-size=256m (the e2e script sets this).
+ENV RUNE_GEN_DIR=/build/build/e2e-gen
+
+# No ENTRYPOINT: docker/rune-ql-e2e.sh drives this container with an explicit
+# `bash -c` command (apply -> generate -> compile probe -> run probe).
+WORKDIR /build

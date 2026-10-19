@@ -1,0 +1,117 @@
+# syntax=docker/dockerfile:1
+# ──────────────────────────────────────────────────────────────────────────────
+# rune-client-cpp — view_probe image (Task 21 view-engine client API e2e, linux/amd64)
+#
+# Builds ONLY the view_probe example: the Phase 1 view-engine client flow
+# (defineTopic "character" -> createView x2 [persisted, transient] ->
+# produce -> getViewRow -> decode, plus a restart-leg verify mode) against a
+# REAL rune-broker over real Aeron.  Unlike Dockerfile.rune-ql-probe, there is
+# no runtime codegen step: Phase 1 has no open-by-name / descriptor-fetch wire
+# for a view's output, so view_probe builds its own ViewPlan + decodes rowBytes
+# positionally (rune/client/view/{ViewPlanAuthor,ViewRowCodec}.h, header-only
+# client additions) — same "no codegen" shape as Dockerfile.schema-probe, which
+# this Dockerfile is modeled on.
+#
+# Build contexts (BuildKit named contexts, wired by the harness / compose):
+#   rune-protocol → ../../rune-protocol  (view-engine wire: CreateView=70 etc.)
+#   rune-codec    → ../../rune-codec     (0a codec: DescriptorBuilder/serialize)
+#   rune-fr       → ../../rune-fr        (flight recorder; rune_client_api links it)
+#   rune-ql       → ../../rune-ql        (rune_ql is always defined by CMakeLists)
+#   rune-crypto   → ../../rune-crypto    (client<->broker TLS/AEAD; rune_client_agent
+#                                         and rune_client_transport unconditionally
+#                                         link rune_crypto — CMakeLists.txt's
+#                                         RUNE_CRYPTO_ROOT defaults to ../rune-crypto,
+#                                         which from /build resolves to exactly
+#                                         /rune-crypto below; no -D override needed)
+#
+# Same two-stage pattern (gcc:13 builder -> bookworm-slim runtime) as
+# Dockerfile.schema-probe / Dockerfile.client.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── BUILDER ───────────────────────────────────────────────────────────────────
+FROM gcc:13 AS builder
+
+ARG CMAKE_VERSION=3.31.5
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-pip python3-venv git curl ninja-build pkg-config \
+        default-jdk-headless uuid-dev zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip3 install --no-cache-dir --break-system-packages "conan~=2.0"
+
+ENV JAVA_HOME=/usr/lib/jvm/default-java
+
+RUN curl -LO https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz \
+    && tar -xzf cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz --strip-components=1 -C /usr/local \
+    && rm cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz \
+    && cmake --version
+
+WORKDIR /build
+RUN conan profile detect --force
+
+# Conan deps first (cache layer independent of source edits).
+COPY conanfile.py conandata.yml VERSION.txt ./
+RUN conan install . --output-folder=conan-release --build=missing -s build_type=Release
+
+# ── Sibling build contexts ────────────────────────────────────────────────────
+# rune-protocol: headers + the net/ C sources.  rune_gso and
+# rune_client_driver_wake (both unconditional under aeron_FOUND) compile
+# src/net/rune_gso_bindings.c and src/net/rune_driver_wake.c, and
+# rune_client_transport links them — so src/ is required, not just include/.
+COPY --from=rune-protocol include /rune-protocol/include
+COPY --from=rune-protocol src     /rune-protocol/src
+# rune-codec (0a): compiled sibling (src + include + tools).  tools/ carries
+# rune_codec_gen_main.cpp, which CMake declares (add_executable rune_codec_gen)
+# at configure time regardless of the built target — its source must be present.
+COPY --from=rune-codec src     /rune-codec/src
+COPY --from=rune-codec include /rune-codec/include
+COPY --from=rune-codec tools   /rune-codec/tools
+# rune-fr: compiled sibling (src + include); rune_client_api links it.
+COPY --from=rune-fr src     /rune-fr/src
+COPY --from=rune-fr include /rune-fr/include
+# rune-ql: compiled sibling (src + include); rune_ql is unconditionally defined.
+COPY --from=rune-ql src     /rune-ql/src
+COPY --from=rune-ql include /rune-ql/include
+# rune-crypto: compiled sibling (src + include); rune_client_agent/transport
+# unconditionally link rune_crypto (client<->broker TLS/AEAD).
+COPY --from=rune-crypto src     /rune-crypto/src
+COPY --from=rune-crypto include /rune-crypto/include
+
+# ── Application sources (last; edits do not bust the conan cache) ─────────────
+COPY . .
+
+# ── Configure + build (view_probe only; tests/benchmarks off) ─────────────────
+# Point the sibling paths at the COPY destinations above.
+RUN cmake -S . -B build -G Ninja \
+        -DCMAKE_TOOLCHAIN_FILE=conan-release/build/Release/generators/conan_toolchain.cmake \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_TESTING=OFF \
+        -DBUILD_BENCHMARKS=OFF \
+        -DBUILD_EXAMPLES=ON \
+        -DRUNE_PROTOCOL_INCLUDE=/rune-protocol/include \
+        -DRUNE_CODEC_ROOT=/rune-codec \
+        -DRUNE_QL_ROOT=/rune-ql \
+        -DRUNE_FR_DIR=/rune-fr \
+        -DRUNE_CRYPTO_ROOT=/rune-crypto \
+    && cmake --build build --target view_probe -j2
+
+RUN cp -L /usr/local/lib64/libstdc++.so.6 /build/libstdc++.so.6
+
+# ── RUNTIME ───────────────────────────────────────────────────────────────────
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libstdc++6 \
+        libgcc-s1 \
+        libatomic1 \
+        libuuid1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/build/view_probe /usr/local/bin/view_probe
+COPY --from=builder /build/libstdc++.so.6 /usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.32
+RUN ldconfig
+
+RUN mkdir -p /var/lib/rune-client
+ENV RUNE_DATA_DIR=/var/lib/rune-client
+
+ENTRYPOINT ["/usr/local/bin/view_probe"]

@@ -1,0 +1,2 @@
+-- tests/e2e/schema_evolution/v4_rename.rql — RENAME COLUMN: v3 -> v4 (level -> power).
+alter topic chars_evo rename column level to power;

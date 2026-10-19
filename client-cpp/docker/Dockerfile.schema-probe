@@ -1,0 +1,104 @@
+# syntax=docker/dockerfile:1
+# ──────────────────────────────────────────────────────────────────────────────
+# rune-client-cpp — rune_schema_probe image (Task 13 typed round-trip, linux/amd64)
+#
+# Builds ONLY the rune_schema_probe example: the headline typed e2e probe that
+# runs define→openTopic<Characters>→send→consume→decode + a validation-reject
+# leg against a REAL rune-broker over real Aeron.
+#
+# Build contexts (BuildKit named contexts, wired by the harness / compose):
+#   rune-protocol → ../../rune-protocol-0b  (0b headers: SchemaMessages.h)
+#   rune-codec    → ../../rune-codec        (0a codec: Serialize/Record/Validator/Generator
+#                                            + tools/rune_codec_gen_main.cpp)
+#   rune-fr       → ../../rune-fr           (flight recorder; rune_client_api links it)
+#   rune-ql       → ../../rune-ql           (rune_ql is always defined by CMakeLists; C9 fix 1)
+#
+# The checked-in descriptor blob tests/generated/characters.blob is part of the
+# client repo build context; the CMake add_custom_command runs rune_codec_gen at
+# build time to emit characters.gen.h, compiled into the probe.
+#
+# Same two-stage pattern as Dockerfile.client (gcc:13 builder → bookworm-slim runtime).
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── BUILDER ───────────────────────────────────────────────────────────────────
+FROM gcc:13 AS builder
+
+ARG CMAKE_VERSION=3.31.5
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-pip python3-venv git curl ninja-build pkg-config \
+        default-jdk-headless uuid-dev zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip3 install --no-cache-dir --break-system-packages "conan~=2.0"
+
+ENV JAVA_HOME=/usr/lib/jvm/default-java
+
+RUN curl -LO https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz \
+    && tar -xzf cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz --strip-components=1 -C /usr/local \
+    && rm cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz \
+    && cmake --version
+
+WORKDIR /build
+RUN conan profile detect --force
+
+# Conan deps first (cache layer independent of source edits).
+COPY conanfile.py conandata.yml VERSION.txt ./
+RUN conan install . --output-folder=conan-release --build=missing -s build_type=Release
+
+# ── Sibling build contexts ────────────────────────────────────────────────────
+# rune-protocol (0b): header-only.  CMake resolves RUNE_PROTOCOL_INCLUDE below.
+COPY --from=rune-protocol include /rune-protocol/include
+COPY --from=rune-protocol src     /rune-protocol/src
+# rune-codec (0a): compiled sibling (src + include) + the rune_codec_gen tool source.
+COPY --from=rune-codec src     /rune-codec/src
+COPY --from=rune-codec include /rune-codec/include
+COPY --from=rune-codec tools   /rune-codec/tools
+# rune-fr: compiled sibling (src + include); rune_client_api links it.
+COPY --from=rune-fr src     /rune-fr/src
+COPY --from=rune-fr include /rune-fr/include
+COPY --from=rune-ql src     /rune-ql/src
+COPY --from=rune-ql include /rune-ql/include
+COPY --from=rune-crypto src     /rune-crypto/src
+COPY --from=rune-crypto include /rune-crypto/include
+
+# ── Application sources (last; edits do not bust the conan cache) ─────────────
+COPY . .
+
+# ── Configure + build (rune_schema_probe only; tests/benchmarks off) ──────────
+# Point the sibling paths at the COPY destinations above.
+RUN cmake -S . -B build -G Ninja \
+        -DCMAKE_TOOLCHAIN_FILE=conan-release/build/Release/generators/conan_toolchain.cmake \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_TESTING=OFF \
+        -DBUILD_BENCHMARKS=OFF \
+        -DBUILD_EXAMPLES=ON \
+        -DRUNE_PROTOCOL_INCLUDE=/rune-protocol/include \
+        -DRUNE_CODEC_ROOT=/rune-codec \
+        -DRUNE_QL_ROOT=/rune-ql \
+        -DRUNE_FR_DIR=/rune-fr \
+    && cmake --build build --target rune_schema_probe -j2
+
+RUN cp -L /usr/local/lib64/libstdc++.so.6 /build/libstdc++.so.6
+
+# ── RUNTIME ───────────────────────────────────────────────────────────────────
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libstdc++6 \
+        libgcc-s1 \
+        libatomic1 \
+        libuuid1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/build/rune_schema_probe /usr/local/bin/rune_schema_probe
+COPY --from=builder /build/libstdc++.so.6 /usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.32
+RUN ldconfig
+
+# Ship the checked-in blob so the probe can defineTopic() with it at runtime.
+COPY --from=builder /build/tests/generated/characters.blob /etc/rune/characters.blob
+
+RUN mkdir -p /var/lib/rune-client
+ENV RUNE_DATA_DIR=/var/lib/rune-client
+ENV RUNE_BLOB_PATH=/etc/rune/characters.blob
+
+ENTRYPOINT ["/usr/local/bin/rune_schema_probe"]

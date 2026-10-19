@@ -1,0 +1,121 @@
+# syntax=docker/dockerfile:1
+# ──────────────────────────────────────────────────────────────────────────────
+# rune-client-cpp — rune_client_ping example image (linux/amd64)
+#
+# Mirrors rune-broker's proven pattern:
+#   Stage 1 (builder): gcc:13 + Kitware CMake 3.31 + conan; builds rune_client_ping.
+#   Stage 2 (runtime): debian:bookworm-slim + copied gcc-13 libstdc++ + libuuid1.
+#
+# Build command (from rune-client-cpp repo root):
+#   docker build --platform linux/amd64 \
+#     --build-context rune-protocol=../rune-protocol \
+#     --build-context rune-fr=../rune-fr \
+#     --build-context rune-codec=../rune-codec \
+#     --build-context rune-ql=../rune-ql \
+#     -f docker/Dockerfile.client \
+#     -t rune-client-ping:$(git rev-parse --short HEAD) .   # git-SHA tag, never dev/latest
+#
+# The rune-protocol sibling repo is supplied via a BuildKit named build context.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── BUILDER ───────────────────────────────────────────────────────────────────
+FROM gcc:13 AS builder
+
+ARG CMAKE_VERSION=3.31.5
+
+# gcc:13 provides gcc-13/g++-13 + build-essential + make.  Add the rest:
+#   python3-pip      — conan
+#   ninja-build      — build backend
+#   default-jdk-headless — aeron's C++ build runs an SBE Java codegen step
+#   uuid-dev/zlib1g-dev  — aeron media-driver C dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-pip python3-venv git curl ninja-build pkg-config \
+        default-jdk-headless uuid-dev zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip3 install --no-cache-dir --break-system-packages "conan~=2.0"
+
+# aeron's SBE codegen locates the JDK via JAVA_HOME.
+ENV JAVA_HOME=/usr/lib/jvm/default-java
+
+# The project requires CMake >= 3.31; bookworm ships older. Install the pinned
+# official Kitware release into /usr/local (same pattern as rune-broker).
+RUN curl -LO https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz \
+    && tar -xzf cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz --strip-components=1 -C /usr/local \
+    && rm cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz \
+    && cmake --version
+
+WORKDIR /build
+RUN conan profile detect --force
+
+# ── Conan install (public ConanCenter only — aeron builds from source)
+# Copy ONLY the conan metadata first so this expensive layer is cached
+# independently of application source edits.
+COPY conanfile.py conandata.yml VERSION.txt ./
+RUN conan install . --output-folder=conan-release --build=missing -s build_type=Release
+
+# ── rune-protocol sibling headers
+# Supplied via a BuildKit named build context:
+#   --build-context rune-protocol=../rune-protocol
+COPY --from=rune-protocol include /rune-protocol/include
+COPY --from=rune-protocol src     /rune-protocol/src
+
+# rune-fr / rune-codec / rune-ql siblings (C9 fix round 1, the 5aaff86 recipe):
+# the client's CMakeLists always builds rune_fr and defines rune_codec / rune_ql
+# (and, with BUILD_EXAMPLES, rune_codec_gen and the EXCLUDE_FROM_ALL
+# rune_ql_probe), so configure needs their sources.  Named BuildKit contexts:
+#   --build-context rune-fr=../rune-fr --build-context rune-codec=../rune-codec
+#   --build-context rune-ql=../rune-ql
+COPY --from=rune-fr src     /rune-fr/src
+COPY --from=rune-fr include /rune-fr/include
+COPY --from=rune-codec src     /rune-codec/src
+COPY --from=rune-codec include /rune-codec/include
+COPY --from=rune-codec tools   /rune-codec/tools
+COPY --from=rune-ql src     /rune-ql/src
+COPY --from=rune-ql include /rune-ql/include
+COPY --from=rune-crypto src     /rune-crypto/src
+COPY --from=rune-crypto include /rune-crypto/include
+
+# ── Application sources (last; source edits do not bust the conan cache)
+COPY . .
+
+# ── Configure + build (rune_client_ping only; tests/benchmarks off)
+RUN cmake -S . -B build -G Ninja \
+        -DCMAKE_TOOLCHAIN_FILE=conan-release/build/Release/generators/conan_toolchain.cmake \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_TESTING=OFF \
+        -DBUILD_BENCHMARKS=OFF \
+        -DBUILD_EXAMPLES=ON \
+        -DRUNE_PROTOCOL_INCLUDE=/rune-protocol/include \
+        -DRUNE_CODEC_ROOT=/rune-codec \
+        -DRUNE_QL_ROOT=/rune-ql \
+        -DRUNE_FR_DIR=/rune-fr \
+    && cmake --build build --target rune_client_ping -j2
+
+# Stage the newer gcc-13 libstdc++ for the runtime.
+RUN cp -L /usr/local/lib64/libstdc++.so.6 /build/libstdc++.so.6
+
+# ── RUNTIME ───────────────────────────────────────────────────────────────────
+# debian:bookworm-slim shares the gcc:13 builder's glibc (2.36).
+# Only the binary + newer libstdc++ + libuuid1 land here.
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libstdc++6 \
+        libgcc-s1 \
+        libatomic1 \
+        libuuid1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/build/rune_client_ping /usr/local/bin/rune_client_ping
+COPY --from=builder /build/libstdc++.so.6 /usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.32
+RUN ldconfig
+
+# ── Aeron shared-memory note ──────────────────────────────────────────────────
+# The embedded Aeron media driver maps CnC + log buffers into /dev/shm.
+# Always start with --shm-size=256m.
+
+# ── Default data dir (overridden via RUNE_DATA_DIR env) ───────────────────────
+RUN mkdir -p /var/lib/rune-client
+ENV RUNE_DATA_DIR=/var/lib/rune-client
+
+ENTRYPOINT ["/usr/local/bin/rune_client_ping"]

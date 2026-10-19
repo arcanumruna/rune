@@ -1,0 +1,110 @@
+# syntax=docker/dockerfile:1
+# ──────────────────────────────────────────────────────────────────────────────
+# rune-client-cpp — rune_produce_subscribe example image (linux/amd64)
+#
+# CB-5 C — E2E produce/subscribe vs 3-node cluster.
+#
+# Mirrors Dockerfile.client; builds the rune_produce_subscribe binary.
+#
+# Build command (from rune-client-cpp repo root):
+#   docker build --platform linux/amd64 \
+#     --build-context rune-protocol=../rune-protocol \
+#     --build-context rune-fr=../rune-fr \
+#     --build-context rune-codec=../rune-codec \
+#     --build-context rune-ql=../rune-ql \
+#     --build-context rune-crypto=../rune-crypto \
+#     -f docker/Dockerfile.data \
+#     -t rune-client-data:$(git rev-parse --short HEAD) .   # git-SHA tag, never dev/latest
+#
+# The rune-protocol sibling repo is supplied via a BuildKit named build context.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── BUILDER ───────────────────────────────────────────────────────────────────
+FROM gcc:13 AS builder
+
+ARG CMAKE_VERSION=3.31.5
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-pip python3-venv git curl ninja-build pkg-config \
+        default-jdk-headless uuid-dev zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip3 install --no-cache-dir --break-system-packages "conan~=2.0"
+
+ENV JAVA_HOME=/usr/lib/jvm/default-java
+
+RUN curl -LO https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz \
+    && tar -xzf cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz --strip-components=1 -C /usr/local \
+    && rm cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz \
+    && cmake --version
+
+WORKDIR /build
+RUN conan profile detect --force
+
+# Conan install (cached independently of source edits).
+COPY conanfile.py conandata.yml VERSION.txt ./
+RUN conan install . --output-folder=conan-release --build=missing -s build_type=Release
+
+# rune-protocol sibling headers.
+COPY --from=rune-protocol include /rune-protocol/include
+COPY --from=rune-protocol src     /rune-protocol/src
+
+# rune-fr / rune-codec / rune-ql siblings (C9 fix round 1, the 5aaff86 recipe):
+# the client's CMakeLists always builds rune_fr and defines rune_codec / rune_ql
+# (and, with BUILD_EXAMPLES, rune_codec_gen and the EXCLUDE_FROM_ALL
+# rune_ql_probe), so configure needs their sources.  Named BuildKit contexts:
+#   --build-context rune-fr=../rune-fr --build-context rune-codec=../rune-codec
+#   --build-context rune-ql=../rune-ql
+COPY --from=rune-fr src     /rune-fr/src
+COPY --from=rune-fr include /rune-fr/include
+COPY --from=rune-codec src     /rune-codec/src
+COPY --from=rune-codec include /rune-codec/include
+COPY --from=rune-codec tools   /rune-codec/tools
+COPY --from=rune-ql src     /rune-ql/src
+COPY --from=rune-ql include /rune-ql/include
+
+# client<->broker TLS/AEAD (Task 5): rune-crypto sibling (TlsSession + AeadCipher +
+# CPU cipher selection), compiled into rune_crypto by the client's CMakeLists.
+# Supplied via the BuildKit named build context `rune-crypto`:
+#   docker build --build-context rune-crypto=../rune-crypto ...
+COPY --from=rune-crypto src     /rune-crypto/src
+COPY --from=rune-crypto include /rune-crypto/include
+
+# Application sources.
+COPY . .
+
+# Build rune_produce_subscribe only.
+RUN cmake -S . -B build -G Ninja \
+        -DCMAKE_TOOLCHAIN_FILE=conan-release/build/Release/generators/conan_toolchain.cmake \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_TESTING=OFF \
+        -DBUILD_BENCHMARKS=OFF \
+        -DBUILD_EXAMPLES=ON \
+        -DRUNE_PROTOCOL_INCLUDE=/rune-protocol/include \
+        -DRUNE_CODEC_ROOT=/rune-codec \
+        -DRUNE_QL_ROOT=/rune-ql \
+        -DRUNE_FR_DIR=/rune-fr \
+        -DRUNE_CRYPTO_ROOT=/rune-crypto \
+    && cmake --build build --target rune_produce_subscribe -j2
+
+RUN cp -L /usr/local/lib64/libstdc++.so.6 /build/libstdc++.so.6
+
+# ── RUNTIME ───────────────────────────────────────────────────────────────────
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libstdc++6 \
+        libgcc-s1 \
+        libatomic1 \
+        libuuid1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/build/rune_produce_subscribe /usr/local/bin/rune_produce_subscribe
+COPY --from=builder /build/libstdc++.so.6 /usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.32
+RUN ldconfig
+
+# Aeron embedded driver needs /dev/shm — use --shm-size=256m at runtime.
+
+RUN mkdir -p /var/lib/rune-client
+ENV RUNE_DATA_DIR=/var/lib/rune-client
+
+ENTRYPOINT ["/usr/local/bin/rune_produce_subscribe"]

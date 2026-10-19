@@ -1,0 +1,73 @@
+# docker/docker-compose.rune-ql.yml — Task 10 (0c #11 gate) SINGLE-NODE broker.
+#
+# One rune-broker node that self-elects, over real Aeron (default config), for
+# the 0c CLI-driven typed round-trip (docker/rune-ql-e2e.sh + rune_ql_probe).
+#
+# WHY THIS COMPOSE (vs the broker repo's docker-compose.single.yml):
+#   The broker CODE is UNCHANGED, but for 0c it must COMPILE against rune-codec
+#   (which adds FixedStr) so the broker's validator/readField handle a
+#   `string(N)` field.  This file therefore points the broker's build contexts at:
+#       rune-protocol -> ../../rune-protocol      (main; has SchemaMessages.h)
+#       rune-codec    -> ../../rune-codec      (0c codec: adds FixedStr)
+#       rune-fr       -> ../../rune-fr
+#   and the broker Dockerfile passes -DRUNE_CODEC_ROOT=/rune-codec.
+#
+#   The build `context` is the rune-broker repo; `dockerfile` is the broker's
+#   docker/Dockerfile.  NO rune-broker source change — only the codec source it
+#   compiles is swapped via the build context (rune-codec -> rune-codec).
+#
+# additional_contexts are resolved relative to THIS compose file's directory
+# (rune-client-cpp-0c/docker/), hence the ../../<repo> paths.
+#
+# Platform: linux/amd64 (Docker Desktop / Rosetta on Apple Silicon).
+# Image tag: rune-broker-0c-node:${RUNE_IMAGE_TAG:-single}.
+
+name: rune-ql-e2e
+
+services:
+  rune-1:
+    build:
+      # The broker repo root (contains docker/Dockerfile, conanfile.py, src/).
+      context: ../../rune-broker
+      dockerfile: docker/Dockerfile
+      args:
+        - CMAKE_BUILD_PARALLEL_LEVEL   # from the environment when set (small Docker VMs)
+      additional_contexts:
+        # relative to THIS compose file's dir (rune-client-cpp-0c/docker/):
+        rune-protocol: ../../rune-protocol      # main — has SchemaMessages.h
+        rune-fr: ../../rune-fr                  # flight recorder (compiled sibling)
+        rune-codec: ../../rune-codec            # sibling checkout (same set as the broker's x-broker-build)
+        rune-crypto: ../../rune-crypto
+    image: rune-broker-0c-node:${RUNE_IMAGE_TAG:-single}
+    platform: linux/amd64
+    hostname: rune-1
+    shm_size: "256m"
+    security_opt:
+      - seccomp=unconfined
+    environment:
+      # Single-node cluster: RUNE_PEERS lists ONLY this node -> self-elect.
+      RUNE_PEERS: "0@rune-1:40111:40200:40222"
+      RUNE_NODE_ID: "0"
+      RUNE_DATA_DIR: /var/lib/rune
+      # dev: auto-format the empty volume (single node -> founder); the broker refuses an unformatted dir otherwise
+      RUNE_STORAGE_FORMAT: "${RUNE_STORAGE_FORMAT:-auto}"
+      RUNE_CLIENT_ENDPOINT: "0.0.0.0:40200"
+      RUNE_ELECTION_TIMEOUT_MS: "300"
+      RUNE_ELECTION_STATUS_INTERVAL_MS: "50"
+      RUNE_STARTUP_CANVASS_TIMEOUT_MS: "200"
+      RUNE_LOG_LEVEL: "info"
+      RUNE_FS_LOG: "0"
+      # The typed topic "characters" is created at RUNTIME via `rune schema apply`.
+      # io_uring portability under Rosetta amd64 emulation.
+      RUNE_IO_BACKEND: "portable"
+    volumes:
+      - rune-data-1:/var/lib/rune
+    healthcheck:
+      test: ["CMD", "pgrep", "-x", "rune_broker"]
+      interval: 5s
+      timeout: 3s
+      start_period: 20s
+      retries: 5
+
+volumes:
+  rune-data-1:

@@ -1,0 +1,2 @@
+-- tests/e2e/schema_evolution/v5_set_compat_forward.rql — SET COMPATIBILITY forward: v4 -> v5.
+alter topic chars_evo set compatibility forward;

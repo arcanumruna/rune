@@ -1,0 +1,3 @@
+-- tests/e2e/schema_evolution/race_a.rql — one side of the concurrent-alter
+-- SchemaConflict race (same --expected-version as race_b.rql, run concurrently).
+alter topic chars_evo add column race_a int32;

@@ -1,0 +1,45 @@
+# Per-Dockerfile ignore for Dockerfile.data (rune_produce_subscribe E2E example).
+# Keep build context small + exclude the host build trees (a leaked host
+# CMakeCache.txt breaks the in-image cmake configure).
+
+# Build outputs (large; a leaked host build/ CMakeCache aborts the container build)
+build/
+build_release/
+build_tsan/
+build_asan/
+cov/
+cmake-build-debug/
+cmake-build-release/
+conan-release/
+
+# Version control
+.git/
+.gitignore
+
+# Superpowers / internal docs
+.superpowers/
+
+# Tests: keep tests/e2e/ and tests/generated/ WHOLE.  CMake configure (BUILD_EXAMPLES=ON) declares
+# every EXCLUDE_FROM_ALL probe target (rune_ql_probe, evo_probe_v1..4, evo_probe_multi, ...) and
+# needs their sources; a per-file allowlist goes stale whenever a probe is added (it did:
+# evo_probe_multi.cpp, CMakeLists.txt:697).
+tests/*
+!tests/e2e
+!tests/generated
+benchmark/
+bench/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# CI
+.woodpecker/
+
+# Docs
+docs/
+README.md
+CLAUDE.md

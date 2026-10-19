@@ -1,0 +1,6 @@
+# Exclude host build artifacts so they are not baked into the Docker image
+# (fresh-build discipline per CG-6 brief — stale-binary lesson).
+build/
+build_release/
+build_tsan/
+.git/
