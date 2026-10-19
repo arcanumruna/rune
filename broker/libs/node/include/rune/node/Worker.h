@@ -89,6 +89,9 @@
 #include <rune/node/WorkerEgress.h>
 #include <rune/node/RecordsPush.h>
 #include <rune/node/SessionAnnounceKeyTail.h>
+#include <bit>
+#include <rune/node/SessionCryptoTable.h>
+#include <rune/node/WorkerWriteGrants.h>
 #include <rune/node/RecordsOpen.h>
 #include <rune/crypto/Aead.h>
 #include <rune/crypto/Cipher.h>
@@ -713,6 +716,15 @@ public:
     /// hotpath-A: frames held (ABORT) because their partition's roll was deferred.
     [[nodiscard]] uint64_t intakeRollHoldsForTest() const noexcept { return intakeRollHolds_; }
     /// Test-only: per-session crypto entries (encrypted sessions announced here).
+    /// Test-only: probe-chain length of the last session-crypto lookup (the slot-indexed regression).
+    [[nodiscard]] std::size_t sessionCryptoLastProbesForTest() const noexcept { return sessionCrypto_.lastProbesForTest(); }
+    /// Test-only: look up one session's crypto entry exactly as the produce path does.
+    [[nodiscard]] bool sessionCryptoLookupForTest(int64_t sid) noexcept { return sessionCrypto_.find(sid) != nullptr; }
+    [[nodiscard]] std::size_t sessionCryptoCountForTest() const noexcept { return sessionCrypto_.size(); }
+    [[nodiscard]] uint64_t workerNotAuthorizedForTest() const noexcept { return workerNotAuthorized_; }
+    [[nodiscard]] uint64_t sessionPermissionChunksSeenForTest() const noexcept { return sessionPermissionChunksSeen_; }
+    [[nodiscard]] uint64_t intakeGrantHoldsForTest() const noexcept { return intakeGrantHolds_; }
+    [[nodiscard]] const SessionAckSink* ackSinkForTest() const noexcept { return ackSink_.get(); }
     [[nodiscard]] std::size_t sessionCryptoEntriesForTest() const noexcept { return sessionCrypto_.size(); }
     [[nodiscard]] uint64_t ackRoomOpPausesForTest() const noexcept { return ackRoomOpPauses_; }
     /// Fix round 2 (finding 9): session signals (Failed / Held / Released) the
@@ -1025,7 +1037,8 @@ public:
 
     /// Task 13 fix round 1 (C1a): ops that ride the session-lifecycle ring.
     [[nodiscard]] static constexpr bool isSessionLifecycleOp(WorkerOp::Type t) noexcept {
-        return t == WorkerOp::Type::SessionAnnounce || t == WorkerOp::Type::SessionClose;
+        return t == WorkerOp::Type::SessionAnnounce || t == WorkerOp::Type::SessionClose ||
+               t == WorkerOp::Type::SessionPermissions || t == WorkerOp::Type::PeerLinkKeys;
     }
 
     [[nodiscard]] bool tryEnqueueOp(WorkerOp op) {
@@ -1114,6 +1127,13 @@ public:
                 tailLen = op.egressChannel.size();
             }
             break;
+        case WorkerOp::Type::SessionPermissions:
+            // Authentication Task 13: the chunk's words, little-endian u64 (a view valid for this call).
+            static_assert(std::endian::native == std::endian::little, "permission chunks are shipped as raw LE words");
+            tailKind = sbe::TailKind::Value::PERMISSION_BITS;
+            tailSrc  = reinterpret_cast<const uint8_t*>(op.permWords);
+            tailLen  = op.permWordCount * sizeof(uint64_t);
+            break;
         default:
             break;  // NONE tail
         }
@@ -1180,7 +1200,9 @@ public:
            .batchAttrs(op.batchAttrs)
            .deferAck(static_cast<std::uint8_t>((op.deferAck ? kOpFlagDeferAck : 0u) |
                                                (op.crcValidated ? kOpFlagCrcValidated : 0u) |
-                                               (op.freshCursor ? kOpFlagFreshCursor : 0u)))
+                                               (op.freshCursor ? kOpFlagFreshCursor : 0u) |
+                                               (op.type == WorkerOp::Type::SessionAnnounce && op.grantAll
+                                                    ? kOpFlagGrantAll : 0u)))
            .durabilityTier(wireDurabilityTier)
            .enqueuedAtNs(op.enqueuedAtNs)
            .subscriptionId(op.subscriptionId)
@@ -2486,6 +2508,11 @@ private:
             if (ackSink_) ackSink_->close(op.sessionId());
             eraseSessionCrypto_(op.sessionId());   // Task 19: no-op if the session was never encrypted
             break;
+        case WorkerOp::Type::SessionPermissions:
+            executeSessionPermissionsWire_(op);
+            break;
+        case WorkerOp::Type::PeerLinkKeys:
+            break;   // authentication Task 15 installs the peer link keys here; nothing sends it before then
         }
     }
 
@@ -2494,6 +2521,22 @@ private:
     // sink adds this worker's own exclusive publication on its next flush.
     // Workers without worker-side acks (legacy, unit rigs) only count it.
     // -------------------------------------------------------------------
+    // Authentication Task 13 (D30): one chunk of a session's WRITE bitmap.  Staged in this worker's one
+    // PermissionStager and swapped into the session's slot on the last chunk (a partial table is never visible).
+    [[gnu::cold]] void executeSessionPermissionsWire_(sbe::WorkerOp& op) {
+        ++sessionPermissionChunksSeen_;
+        if (!ackSink_) return;   // a worker without worker-side acks keeps no session table (and enforces nothing)
+        const auto first = static_cast<uint64_t>(op.nextOffset());
+        const auto total = static_cast<uint64_t>(op.hwBound());
+        const std::uint32_t tailLen = op.tailLength();   // SBE var data: the length FIRST, then tail() advances past it
+        const auto* tail = reinterpret_cast<const uint8_t*>(op.tail());
+        const PermissionChunkResult r = permStager_.apply(
+            *ackSink_, op.sessionId(), first, total, op.isolation(), static_cast<uint64_t>(op.correlationId()), tail, tailLen);
+        if (r == PermissionChunkResult::Dropped) [[unlikely]]
+            spdlog::debug("Worker {}: permission chunk for session {} dropped (closed session or out-of-order chunk)",
+                          workerId_, op.sessionId());
+    }
+
     [[gnu::cold]] void executeSessionAnnounceWire_(sbe::WorkerOp& op) {
         ++sessionAnnouncesSeen_;
         const int64_t sid       = op.sessionId();
@@ -2513,8 +2556,9 @@ private:
             // SessionAnnounce (see enqueueOp's wireIsGroup comment).
             const bool c2bKeyValid    = op.isGroup() != 0;
             const auto decoded = rune::node::decodeSessionAnnounceCryptoTail(p, len);
-            WorkerSessionCrypto* cr = findSessionCrypto_(sid);
-            if (!cr) { sessionCrypto_.push_back(WorkerSessionCrypto{}); cr = &sessionCrypto_.back(); }
+            WorkerSessionCrypto* cr = sessionCrypto_.findOrInsert(sid);
+            if (cr == nullptr) [[unlikely]]   // unreachable: the runtime caps sessions below the table size
+                haltInvariant_("session crypto table full", "authentication Task 13: runtime session cap violated", 0);
             cr->sessionId  = sid;
             cr->sendSeq    = 0;    // fresh counter for THIS session on THIS worker (egress)
             cr->send.reset();      // fail closed by default: no cipher until proven valid below
@@ -2580,7 +2624,7 @@ private:
         // closes not yet queued everywhere) against kMaxSessions − 1, and
         // refuses longer channels at Connect.  A refusal would leave an
         // accepted session that is never acked: halt, never a silent drop.
-        if (!ackSink_->announce(sid, channel, stream, version)) [[unlikely]] {
+        if (!ackSink_->announce(sid, channel, stream, version, (op.deferAck() & kOpFlagGrantAll) != 0)) [[unlikely]] {
             spdlog::critical("Worker {}: session {} announcement refused (sessions {}, channel {} B, max {})",
                              workerId_, sid, ackSink_->sessionCount(), channel.size(), SessionAckSink::kMaxChannelBytes);
             haltInvariant_("session announcement refused", "Task 13 I2: runtime session cap violated", 0);
@@ -4718,6 +4762,12 @@ private:
     std::vector<WorkerSubscription> subs_;
     uint64_t egressReleases_ = 0;   ///< release ops executed (record-egress retire-on-ack)
 
+    // Authentication Task 13: this worker's one chunked-permission assembler (shared-nothing; worker thread only).
+    PermissionStager permStager_;
+    uint64_t         sessionPermissionChunksSeen_ = 0;
+    uint64_t         workerNotAuthorized_ = 0;   ///< shard produces refused NotAuthorized (counted)
+    uint64_t         intakeGrantHolds_    = 0;   ///< denied frames held one pass for a lifecycle op in flight
+
     // Task 19: this worker's per-session Records-egress crypto state — see
     // WorkerSessionCrypto's doc comment. Entries exist ONLY for encrypted
     // sessions (never for plaintext ones): empty for an all-plaintext
@@ -4725,26 +4775,16 @@ private:
     // encrypted sessions, not the whole shard) — same style already used for
     // subs_; a hash-by-sessionId is a known follow-up if that count ever
     // gets large enough to matter.
-    std::vector<WorkerSessionCrypto> sessionCrypto_;
-    [[nodiscard]] WorkerSessionCrypto* findSessionCrypto_(int64_t sid) noexcept {
-        for (auto& e : sessionCrypto_) if (e.sessionId == sid) return &e;
-        return nullptr;
-    }
-    void eraseSessionCrypto_(int64_t sid) noexcept {
-        for (std::size_t i = 0; i < sessionCrypto_.size(); ++i) {
-            if (sessionCrypto_[i].sessionId == sid) {
-                sessionCrypto_[i] = std::move(sessionCrypto_.back());
-                sessionCrypto_.pop_back();
-                return;
-            }
-        }
-    }
+    // Authentication Task 13 (fix-on-sight): slot-indexed (open addressing by session id), no longer a linear scan
+    // over every encrypted session on every produce frame.
+    SessionCryptoTable<WorkerSessionCrypto> sessionCrypto_;
+    [[nodiscard]] WorkerSessionCrypto* findSessionCrypto_(int64_t sid) noexcept { return sessionCrypto_.find(sid); }
+    void eraseSessionCrypto_(int64_t sid) noexcept { sessionCrypto_.erase(sid); }
     /// Test-only: whether this worker holds (any) crypto state for a session.
     [[nodiscard]] bool sessionCryptoInstalledForTest(int64_t sid) const noexcept {
-        for (const auto& e : sessionCrypto_) if (e.sessionId == sid) return e.send.has_value();
-        return false;
+        const WorkerSessionCrypto* e = sessionCrypto_.find(sid);
+        return e != nullptr && e->send.has_value();
     }
-    [[nodiscard]] std::size_t sessionCryptoCountForTest() const noexcept { return sessionCrypto_.size(); }
 
     // Task 19: this worker's OWN RecordsSealScratch for its Records-egress
     // seal path (shared-nothing: never shared across threads — mirrors
@@ -6664,6 +6704,20 @@ private:
     // `directAck` (D8d): the admission (SessionAckSink::admitDirect) of this
     // frame — carried by its answer (exactly one: produceCore_ answers every
     // path once, now or parked) and given back here if it is undecodable.
+    // Authentication Task 13: answer a shard-mode produce the session may not WRITE: ProduceResponse{NotAuthorized}
+    // on its correlation id (the frame is consumed, never appended), counted, logged rate-limited.
+    [[gnu::cold]] [[gnu::noinline]] int refuseNotAuthorized_(const rune::protocol::client::Produce& msg, uint8_t directAck) {
+        if (workerNotAuthorized_++ % 1024 == 0)
+            spdlog::warn("Worker {}: WorkerIngress: produce refused NotAuthorized (session={}, topic={}); total {}",
+                         workerId_, msg.sessionId, msg.topicId, workerNotAuthorized_);
+        WorkerReturn ret = produceAnswer_(ProduceOrigin::WorkerIngress, msg.sessionId, msg.correlationId,
+                                          msg.topicId, msg.partition);
+        ret.directAck = directAck;
+        ret.errorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::NotAuthorized);
+        enqueueReturn_(ret);
+        return 1;
+    }
+
     int handleWorkerIngressFrame_(const uint8_t* data, std::size_t len,
                                   int64_t nowNs, uint8_t directAck = 0) {
         RUNE_FR_SPAN_PRODUCE(rune_fr::Site::WorkerIngressRecv, 0);
@@ -6744,6 +6798,25 @@ private:
             return 0;
         }
         const pc::Produce& msg = *msgOpt;
+
+        // Authentication Task 13 (spec §6, D30): the shard-mode WRITE check - ONE slot probe, ONE bounds check, ONE
+        // bit load.  Workers without worker-side acks keep no session table (unit rigs) and enforce nothing.  A
+        // session this worker has no slot for is denied (fail closed).
+        if (ackSink_) {
+            const WriteGrantSlot* grants = ackSink_->writeGrants(msg.sessionId);
+            if (grants == nullptr || !allowsWrite(*grants, msg.topicId)) [[unlikely]] {
+                // The login's grants are enqueued on the lifecycle ring BEFORE the client learns it may produce, but
+                // this pass may have drained that ring before the enqueue: hold the frame one pass (the controlled
+                // poll re-delivers it after the next drain) rather than answer a stale NotAuthorized.
+                if (sessionRing_.producerPosition() > sessionRing_.consumerPosition()) [[unlikely]] {
+                    if (directAck != 0) ackSink_->releaseDirect(produceSessionIdOf_(data), directAck);
+                    ++intakeGrantHolds_;
+                    return kIngressHeld;                             // seq NOT committed: it re-opens
+                }
+                if (openSeq != 0) [[unlikely]] commitProduceSeq(openCtx, openSeq);   // consumed (answered)
+                return refuseNotAuthorized_(msg, directAck);
+            }
+        }
 
         // Look up the owned Log + replica for this partition.
         auto [log, replica] = getLogAndReplicaForPartition_(msg.topicId, msg.partition);

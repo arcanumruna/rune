@@ -59,7 +59,7 @@ public:
     using Clock = std::chrono::steady_clock;
     static constexpr const char* kPw = "user-password-12345";
 
-    explicit AuthRig(const std::string& tag = "enf") : b_(tag) {
+    explicit AuthRig(const std::string& tag = "enf", AuthBroker::Options options = {}) : b_(tag, std::move(options)) {
         b_.bootstrapAdmin();
         w_ = &b_.wire();
         c().captureRawAnswers(true);

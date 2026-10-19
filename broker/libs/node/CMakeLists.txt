@@ -135,6 +135,11 @@ if(BUILD_TESTING)
     add_executable(rune_session_announcer_tests tests/node/SessionAnnouncerTest.cpp)
     target_link_libraries(rune_session_announcer_tests PRIVATE rune_node rune_metadata GTest::gtest_main)
     gtest_discover_tests(rune_session_announcer_tests)
+    # Authentication Task 13: the resumable WRITE-bitmap shipper and the slot-indexed worker session crypto (no driver).
+    add_executable(rune_permission_shipper_tests tests/node/PermissionShipperTest.cpp
+                   tests/node/WorkerSessionCryptoRegressionTest.cpp)
+    target_link_libraries(rune_permission_shipper_tests PRIVATE rune_node rune_metadata GTest::gtest_main)
+    gtest_discover_tests(rune_permission_shipper_tests)
     if(UNIX AND NOT APPLE)
         # Real-driver UDP GSO/GRO bindings tests (Linux kernels only: UDP_SEGMENT/UDP_GRO).
         add_executable(rune_udp_gso_tests tests/node/UdpGsoBindingsTest.cpp)
@@ -1173,6 +1178,19 @@ if(BUILD_TESTING)
             target_link_libraries(rune_shard_worker_ack_tests PRIVATE rune_node rune_replication rune_codec aeron::aeron GTest::gtest_main)
             gtest_discover_tests(rune_shard_worker_ack_tests PROPERTIES TIMEOUT 120 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
+            # Authentication Task 13 (spec §6, D30): the shard worker's WRITE grants, a REAL invoker driver over aeron:ipc.
+            add_executable(rune_worker_write_grants_tests tests/node/WorkerWriteGrantsTest.cpp)
+            target_link_libraries(rune_worker_write_grants_tests PRIVATE rune_node rune_replication rune_codec aeron::aeron GTest::gtest_main)
+            gtest_discover_tests(rune_worker_write_grants_tests PROPERTIES TIMEOUT 120 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
+            # Authentication Task 13 (hard rule 4): the check allocates nothing, gateway path and shard worker path.
+            # Replaces the global operator new (binary-wide) - its own binary.
+            add_executable(rune_auth_alloc_regression_tests tests/node/AuthAllocRegressionTest.cpp)
+            target_include_directories(rune_auth_alloc_regression_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+            target_link_libraries(rune_auth_alloc_regression_tests PRIVATE rune_node rune_replication rune_codec rune_view
+                                  rune_catalog aeron::aeron GTest::gtest_main)
+            gtest_discover_tests(rune_auth_alloc_regression_tests PROPERTIES TIMEOUT 300 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
             # D8c: credit-based gateway pause of a slow gateway-routed client — a
             # real gateway in front of a real worker with worker-side acks.
             add_executable(rune_gateway_produce_credit_tests tests/integration/GatewayProduceCreditTest.cpp)
@@ -1615,6 +1633,14 @@ if(BUILD_TESTING)
         target_link_libraries(rune_auth_enforcement_tests PRIVATE rune_node rune_view rune_codec rune_catalog aeron::aeron
                               GTest::gtest_main)
         gtest_discover_tests(rune_auth_enforcement_tests PROPERTIES TIMEOUT 600)
+
+        # Authentication Task 13: shard-mode produce straight to the worker ingress against ONE real authenticating
+        # broker (the worker's WRITE bitmaps shipped on the lifecycle ring) + the zero-allocation gates.
+        add_executable(rune_shard_auth_produce_tests tests/integration/ShardAuthProduceTest.cpp)
+        target_include_directories(rune_shard_auth_produce_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_shard_auth_produce_tests PRIVATE rune_node rune_view rune_codec rune_catalog aeron::aeron
+                              GTest::gtest_main)
+        gtest_discover_tests(rune_shard_auth_produce_tests PROPERTIES TIMEOUT 600)
 
         # DR client bugs (2026-10-15): the REAL client against 3 REAL in-process brokers, a leader SIGKILLed mid-op
         # (seed failover, metadata from any live broker, re-route; produce / subscribe / group / txn / DDL / view row).

@@ -89,6 +89,7 @@ public:
             op.egressStreamId  = streamId;
             op.egressChannel   = channel;
             op.clientVersion   = clientVersion;
+            op.grantAll        = grantAll_;   // authentication Task 13 (D30): authMode != Enabled
             op.sessionEncrypted = sessionEncrypted;
             if (sessionEncrypted && keyReady) {
                 rune::crypto::AeadKey senderKey{};
@@ -163,6 +164,13 @@ public:
         return done;
     }
 
+    /// Authentication Task 13 (D30): grantAll = the broker does not enforce authentication (dev / in-process): every
+    /// announced session may write to every topic on a worker.  false (Enabled mode) = every shard produce of an
+    /// announced session is denied until its PermissionShipper update lands.  Set ONCE from the gateway's auth mode
+    /// (setAuthMode); the default (true) keeps every rig that predates authentication unchanged.
+    void setGrantAll(bool grantAll) noexcept { grantAll_ = grantAll; }
+    [[nodiscard]] bool grantAll() const noexcept { return grantAll_; }
+
     static constexpr std::size_t kBacklogWarnAt = 1024;
     [[nodiscard]] std::size_t pendingCloses() const noexcept { return closing_.size(); }
     [[nodiscard]] std::size_t pendingAnnounces() const noexcept { return announcing_.size(); }
@@ -188,6 +196,7 @@ private:
     std::vector<Announcing> announcing_;
     std::vector<Closing>    closing_;
     std::size_t             closeWarnAt_ = kBacklogWarnAt;
+    bool                    grantAll_ = true;
 };
 
 } // namespace rune::node

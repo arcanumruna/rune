@@ -123,6 +123,11 @@ struct WorkerOp {
         // The worker remembers it so a produce for a topic it does not own answers UnknownTopic
         // (matching the gateway) instead of the retriable NotLeader.  Not ownership-gated.
         TopicDropped              = 20, ///< control → worker: topicId was dropped by the catalog
+        // Authentication Task 13 (D30): control → EVERY worker on the session-lifecycle ring: one chunk of a
+        // session's WRITE permission bitmap (see permWords below for the field use).
+        SessionPermissions        = 21, ///< control → worker: a chunk of a session's WRITE bitmap
+        // Authentication Task 15/16: control → EVERY worker: the keys of an established inter-broker link.
+        PeerLinkKeys              = 22, ///< control → worker: peer link keys (Task 15; ignored until then)
         // F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
         // control → owning worker: run a test-owned OwnerThreadTestTask against
         // `replica` on the worker's OWN thread.  The opaque task ref travels in the
@@ -204,6 +209,16 @@ struct WorkerOp {
     // (copied once into the ring slot as the tail, TailKind = EGRESS_CHANNEL).
     int32_t          egressStreamId = 0;
     std::string_view egressChannel;
+    // Authentication Task 13 (D30): SessionAnnounce - the broker is NOT enforcing authentication (dev / in-process
+    // mode), so the session may write everywhere.  Wire: bit kOpFlagGrantAll of the `deferAck` flag byte.  The
+    // default is true so every rig that predates authentication keeps working; the gateway (the only production
+    // announcer) always passes `authMode != Enabled` explicitly.
+    bool             grantAll = true;
+    // SessionPermissions: sessionId = the session, nextOffset = the chunk's first word index, hwBound = total words,
+    // correlationId = the shipped epoch, isolation = kPermFlag* (last chunk / grantAll), tail = the chunk's words
+    // (TailKind PERMISSION_BITS, little-endian u64).  A VIEW valid only for the synchronous tryEnqueueOp call.
+    const uint64_t*  permWords     = nullptr;
+    std::size_t      permWordCount = 0;
     // D6: SessionAnnounce — the session's ConnectRequest.clientVersion (a
     // worker acking directly gates UnknownProducerId on it).
     // Task 12: ALSO carries SchemaUpdate's schema version (RegistryEntry::version
@@ -602,6 +617,7 @@ enum class EnqueueResult : uint8_t { Enqueued, Full, TooLarge };
 /// The wire `deferAck` byte of a WorkerOp is a flag set (F15 S5 fix round 1).
 inline constexpr uint8_t kOpFlagDeferAck     = 0x01;   ///< WorkerOp::deferAck (acks=all, steady state)
 inline constexpr uint8_t kOpFlagCrcValidated = 0x02;   ///< WorkerOp::crcValidated (Produce only)
+inline constexpr uint8_t kOpFlagGrantAll     = 0x08;   ///< WorkerOp::grantAll (SessionAnnounce only; authentication Task 13)
 inline constexpr uint8_t kOpFlagFreshCursor  = 0x04;   ///< WorkerOp::freshCursor (PushRead only; E2 M2)
 
 // ---------------------------------------------------------------------------

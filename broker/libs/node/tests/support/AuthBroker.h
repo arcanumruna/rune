@@ -78,6 +78,7 @@ public:
         AuthMode mode = AuthMode::Enabled;
         int64_t  authTimeoutMs = 10'000;
         std::string keyContents = std::string(48, 'K') + "\n";
+        bool shard = false;   ///< shard worker mode (clients can produce straight to the worker ingress; Task 13)
     };
     static constexpr const char* kBootstrapPassword = "bootstrap-otp-123456";
     static constexpr const char* kAdminPassword     = "admin-password-1234";
@@ -90,7 +91,7 @@ public:
         std::filesystem::remove_all(dir_);
         std::filesystem::create_directories(dir_);
         NodeConfig cfg;
-        pinLegacyRuntime(cfg);
+        if (!opts_.shard) pinLegacyRuntime(cfg);
         cfg.nodeId = 0;
         cfg.dataDir = (dir_ / "broker").string();
         cfg.aeronDir = (dir_ / "broker" / "aeron").string();
@@ -104,6 +105,28 @@ public:
         cfg.clientEndpoint.channel = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(clientPort_);
         cfg.clientEndpoint.streamId = 1;
         cfg.workerCount = 1;
+        if (opts_.shard) {   // like ShardModeTest::makeShardConfig: explicit collision-free ports, one worker
+            const auto blocks = freeUdpPortBlocks(3, 1);
+            cfg.workerMode = NodeConfig::WorkerMode::Shard;
+            cfg.runtimePlacement = NodeConfig::RuntimePlacement::Thread;
+            cfg.perWorkerIngressEnabled = cfg.perWorkerReplication = cfg.perWorkerEgressEnabled = true;
+            cfg.workerIngressBasePort = blocks[0];
+            cfg.workerReplBasePort = blocks[1];
+            cfg.workerEgressControlHost = "127.0.0.1";
+            cfg.workerEgressControlBasePort = blocks[2];
+            cfg.workerIngressBaseStreamId = 111;
+            cfg.workerCoreBase = -1;
+            cfg.aeronTermBufferBytes = 1 << 20;
+            cfg.replicationStreamId = 100;
+            cfg.replBaseStreamId = 200;
+            cfg.peers[0].clientPort = clientPort_;
+            cfg.peers[0].replicationPort = rune::aeronutil::testing::allocFreeUdpPort();
+            cfg.peers[0].replBasePort = blocks[1];
+            cfg.peers[0].ingressBasePort = blocks[0];
+            cfg.peers[0].workerCount = 1;
+            cfg.peers[0].egressControlBasePort = blocks[2];
+            ingressChannel_ = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(blocks[0]);
+        }
         cfg.authMode = opts_.mode;
         cfg.authTimeoutMs = opts_.authTimeoutMs;
         if (opts_.mode == AuthMode::Enabled) {
@@ -150,6 +173,8 @@ public:
 
     [[nodiscard]] BrokerNode& node() noexcept { return *node_; }
     [[nodiscard]] const std::string& channel() const noexcept { return channel_; }
+    /// Shard mode: worker 0's produce ingress endpoint (clients dial it with the client stream id).
+    [[nodiscard]] const std::string& workerIngressChannel() const noexcept { return ingressChannel_; }
     [[nodiscard]] std::string endpoint() const { return "127.0.0.1:" + std::to_string(clientPort_); }
     [[nodiscard]] const std::string& keyContents() const noexcept { return opts_.keyContents; }
     [[nodiscard]] const std::filesystem::path& keyFile() const noexcept { return keyFile_; }
@@ -251,7 +276,7 @@ private:
     std::filesystem::path                        dir_;
     std::filesystem::path                        keyFile_;
     uint16_t                                     clientPort_ = 0;
-    std::string                                  channel_, aeronDir_;
+    std::string                                  channel_, aeronDir_, ingressChannel_;
     std::unique_ptr<BrokerNode>                  node_;
     std::vector<std::unique_ptr<AuthWireClient>> wires_;
     AuthWireClient*                              admin_ = nullptr;

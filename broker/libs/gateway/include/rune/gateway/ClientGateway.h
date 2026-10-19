@@ -92,6 +92,7 @@ namespace rune::node { class WorkerPool; struct WorkerReturn; }
 #include <rune/replication/ReplicationMessages.h>
 #include <rune/node/RecordsPush.h>
 #include <rune/node/SessionAnnouncer.h>
+#include <rune/node/PermissionShipper.h>
 // G0.1: ErrorCode enum for sendRespReliable() signature.
 #include <rune/protocol/client/Protocol.h>
 #include <rune/protocol/client/MessageHeader.h>
@@ -407,6 +408,7 @@ public:
     void setAuthMode(rune::gateway::GatewayAuthMode m, const rune::gateway::SecurityView* view) noexcept {
         authMode_ = m;
         securityView_ = view;
+        sessionAnnouncer_.setGrantAll(m != rune::gateway::GatewayAuthMode::Required);   // authentication Task 13 (D30)
     }
     [[nodiscard]] rune::gateway::GatewayAuthMode authMode() const noexcept { return authMode_; }
     /// Requests refused by the auth gate (AuthenticationFailed + session end).
@@ -2237,6 +2239,15 @@ private:
     bool perWorkerIngressActive_ = false;
     bool shardMode_ = false;   // Task 13 (spec §3.4); set before the runtime runs
     rune::node::SessionAnnouncer sessionAnnouncer_;   // Task 13: runtime thread only
+    // Authentication Task 13 (D30): WRITE bitmaps to every worker; a login's AuthServerFinal{OK} waits for its epoch.
+    rune::node::PermissionShipper permissionShipper_;
+    uint64_t permEpoch_ = 0;
+    struct HeldLoginFinal { int64_t sessionId; uint64_t epoch; std::vector<uint8_t> frame; };
+    std::vector<HeldLoginFinal> heldLoginFinals_;     ///< cold: one per login whose grants are still being shipped
+    /// Ship `session`'s WRITE bitmap (Required mode + shard mode only); returns its epoch (0 = nothing to ship).
+    uint64_t shipPermissions_(const Session& session);
+    /// Release the held AuthServerFinal frames whose epoch every worker has accepted; retry unfinished shipments.
+    int servicePermissionShipping_();
     // Task 19: sessions whose per-worker crypto-key SessionAnnounce (second
     // wave) didn't fully land on every worker on the first attempt (a ring
     // was momentarily full) — retried each doWork() cycle

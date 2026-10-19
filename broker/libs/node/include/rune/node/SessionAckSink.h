@@ -85,6 +85,7 @@
 // Zero allocation per pass: fixed arrays, open addressing (backward-shift
 // delete), no node containers.  std::string only inside the policy's add()
 // (announcement, cold path).  Owner: the worker thread only.
+#include <rune/node/WorkerWriteGrants.h>
 #include <rune/node/AeronChannel.h>
 #include <rune/node/RecordsSeal.h>
 #include <rune/node/SessionSignalKind.h>
@@ -220,12 +221,17 @@ public:
     /// (the worker treats a refusal as an invariant violation).
     /// D6: `clientVersion` (ConnectRequest.clientVersion) gates the
     /// UnknownProducerId answer for this session (OOS below version 2).
+    /// Authentication Task 13 (D30): `grantAll` (the announce's mode bit: 1 in dev / in-process modes, 0 when
+    /// authentication is enabled) seeds a NEW session's write grants; a re-announce of a known session (the second,
+    /// crypto-key wave) never touches the grants it already holds.  Default false = deny until permissions arrive.
     bool announce(int64_t sessionId, std::string_view channel, int32_t streamId,
-                  int32_t clientVersion = 0) noexcept {   // D6 review: default = oldest (never 28 by omission)
+                  int32_t clientVersion = 0, bool grantAll = false) noexcept {   // D6 review: default = oldest (never 28 by omission)
         if (sessionId <= 0 || channel.size() > kMaxChannelBytes) return false;
         std::size_t idx = find_(sessionId);
-        if (idx == kNone) idx = insert_(sessionId);
+        const bool fresh = (idx == kNone);
+        if (fresh) idx = insert_(sessionId);
         if (idx == kNone) return false;                                   // table full
+        if (fresh) grants_[idx].grantAll = grantAll;
         clientVersion_[idx] = clientVersion;
         PubState& st = states_[idx];
         if (edges_[idx].lost) { edges_[idx].lost = 0; markDirty_(idx); }   // a fresh publication: not lost (yet)
@@ -634,6 +640,30 @@ public:
     /// Acks still queued after the last flush (held for their sessions).
     [[nodiscard]] std::size_t heldAcks() const noexcept { return heldAfterFlush_; }
     [[nodiscard]] std::size_t sessionCount() const noexcept { return count_; }
+
+    /// Authentication Task 13: the session's WRITE grants (nullptr = no such session).  O(1) average: one find_.
+    [[nodiscard]] const WriteGrantSlot* writeGrants(int64_t sessionId) const noexcept {
+        const std::size_t idx = find_(sessionId);
+        return idx == kNone ? nullptr : &grants_[idx];
+    }
+    /// Swap `words` into the session's slot (the old buffer comes back in `words`): no allocation.  False = unknown
+    /// session (closed meanwhile): nothing installed.
+    bool installWriteGrants(int64_t sessionId, std::vector<uint64_t>& words, bool grantAll, uint64_t epoch) noexcept {
+        const std::size_t idx = find_(sessionId);
+        if (idx == kNone) return false;
+        WriteGrantSlot& g = grants_[idx];
+        g.bits.swap(words);
+        g.grantAll = grantAll;
+        g.epoch    = epoch;
+        return true;
+    }
+    /// Test seam: slots examined by the last find_ of `sessionId` (probe chain length).
+    [[nodiscard]] std::size_t probeChainForTest(int64_t sessionId) const noexcept {
+        std::size_t i = hash_(sessionId);
+        std::size_t n = 1;
+        for (; keys_[i] != 0 && keys_[i] != sessionId && n <= kMaxSessions; i = (i + 1) & kMask) ++n;
+        return n;
+    }
     [[nodiscard]] std::size_t unreportedFailures() const noexcept { return unreported_; }
     [[nodiscard]] std::size_t pendingForTest() const noexcept { return ackCount_; }
     [[nodiscard]] uint64_t    droppedForTest() const noexcept { return dropped_; }
@@ -660,6 +690,7 @@ private:
         }
         return kNone;
     }
+    static void resetGrants_(WriteGrantSlot& g) noexcept { g.bits.clear(); g.grantAll = false; g.epoch = 0; }   // capacity persists
     std::size_t insert_(int64_t sid) noexcept {
         if (count_ == kMaxSessions - 1) return kNone;               // one empty slot ends every probe
         std::size_t i = hash_(sid);
@@ -667,6 +698,7 @@ private:
         keys_[i] = sid;
         states_[i] = PubFailed{};                                    // neutral (reported) placeholder
         heldPass_[i] = 0; edges_[i] = Edges{}; clientVersion_[i] = 0;
+        resetGrants_(grants_[i]);
         ++count_;
         return i;
     }
@@ -679,6 +711,7 @@ private:
         keys_[i] = 0;
         states_[i] = PubFailed{};                                    // releases a Ready publication
         heldPass_[i] = 0; edges_[i] = Edges{}; clientVersion_[i] = 0;
+        resetGrants_(grants_[i]);
         --count_;
         std::size_t j = i;
         for (;;) {
@@ -692,9 +725,11 @@ private:
             heldPass_[i] = heldPass_[j];
             edges_[i] = edges_[j];
             clientVersion_[i] = clientVersion_[j];
+            std::swap(grants_[i], grants_[j]);                       // the buffer travels with its key; j's old one is reset below
             keys_[j] = 0;
             states_[j] = PubFailed{};
             heldPass_[j] = 0; edges_[j] = Edges{}; clientVersion_[j] = 0;
+            resetGrants_(grants_[j]);
             i = j;
         }
     }
@@ -1015,6 +1050,7 @@ private:
     static constexpr int         kTombBits  = std::countr_zero(kTombSlots);
     std::array<Edges, kMaxSessions>                                  edges_{};
     std::array<int32_t, kMaxSessions>                                clientVersion_{}; // D6: per session
+    std::array<WriteGrantSlot, kMaxSessions>                         grants_{};        // authentication Task 13: moved with its key like clientVersion_
     std::array<int64_t, kMaxSessions>                                dirty_{};         // edges to report
     std::size_t                                                      dirtyCount_ = 0;
     std::array<int64_t, kMaxSessions>                                creditDirty_{};   // D8c: credits to report

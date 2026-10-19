@@ -797,6 +797,7 @@ int ClientGateway::doWork(int64_t nowNs) {
     work += advanceInlinePsmScans_();   // I3: budgeted inline producer-state rebuilds
     // Task 13: SessionClose ops a full worker ring refused earlier — never dropped.
     if (shardMode_ && workerPool_) work += sessionAnnouncer_.retryCloses(*workerPool_);
+    work += servicePermissionShipping_();   // authentication Task 13: unfinished WRITE bitmaps + held login answers
     // Task 19: the per-worker crypto-key SessionAnnounce (second wave) a
     // full worker ring refused earlier — retried until every worker has the
     // real key. Never a safety concern while this is in flight (every
@@ -1517,6 +1518,9 @@ bool ClientGateway::closeSession_(int64_t sid, bool notifyExpired)
     // Task 13: the workers forget it too (its queued acks drop, its
     // publications are released) — retried until every worker has it.
     if (shardMode_ && workerPool_) sessionAnnouncer_.close(*workerPool_, sid);
+    permissionShipper_.forget(sid);
+    for (std::size_t i = 0; i < heldLoginFinals_.size(); ++i)
+        if (heldLoginFinals_[i].sessionId == sid) { heldLoginFinals_.erase(heldLoginFinals_.begin() + static_cast<std::ptrdiff_t>(i)); break; }
     // Hybrid egress: drop any in-flight record-egress resolves for this session
     // (all workers — its buffered subscribes die with the session).
     for (auto pit = pendingRecordEgress_.begin(); pit != pendingRecordEgress_.end(); ) {
@@ -7670,7 +7674,11 @@ void ClientGateway::onCatalogObjectApplied(int32_t id, const std::string& name, 
     const rune::gateway::ObjectEntry* e = objectIndex_.at(id);
     if (e == nullptr) return;
     sessions_.forEach([&](Session& s) {
-        if (auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&s.auth)) a->perms.onObjectCreated(id, *e);
+        if (auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&s.auth)) {
+            a->perms.onObjectCreated(id, *e);
+            // Prefix extension (spec §6): a WRITE grant that now covers the new topic reaches the workers too.
+            if (a->perms.allows(id, rune::security::opBit(rune::security::Operation::Write))) (void)shipPermissions_(s);
+        }
     });
 }
 
@@ -7678,7 +7686,11 @@ void ClientGateway::onCatalogObjectDropped(int32_t id)
 {
     objectIndex_.onDropped(id);
     sessions_.forEach([&](Session& s) {
-        if (auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&s.auth)) a->perms.onObjectDropped(id);
+        if (auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&s.auth)) {
+            const bool hadWrite = a->perms.allows(id, rune::security::opBit(rune::security::Operation::Write));
+            a->perms.onObjectDropped(id);
+            if (hadWrite) (void)shipPermissions_(s);
+        }
     });
 }
 
@@ -7946,6 +7958,9 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
                      session->sessionId);
     if (ok.mustChangePassword) session->auth = AuthPasswordChangeRequired{ok.userId, ok.user};
     else                       session->auth = AuthAuthenticated{ok.userId, ok.user, compilePerms_(ok.userId)};
+    // Authentication Task 13: announce-before-accept for permissions - the workers learn this session's WRITE bitmap
+    // BEFORE the client learns it is logged in, so it can never produce ahead of its grants.
+    const uint64_t shipEpoch = shipPermissions_(*session);
 
     pc::AuthServerFinal f;
     f.sessionId       = hdr->sessionId;
@@ -7953,7 +7968,39 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
     f.errorCode       = 0;
     f.flags           = ok.mustChangePassword ? pc::kAuthFlagMustChangePassword : uint8_t{0};
     f.serverSignature = std::string_view(reinterpret_cast<const char*>(ok.serverSignature.data()), ok.serverSignature.size());
-    sendAnswer_(*session, scratch_.data(), f.encode(scratch_.data()));
+    const std::size_t finalLen = f.encode(scratch_.data());
+    if (shipEpoch != 0 && permissionShipper_.fullyShippedEpoch(session->sessionId) < shipEpoch) {
+        // A worker's lifecycle ring is full: hold the OK (cold, login rate) until every worker accepted the bitmap.
+        heldLoginFinals_.push_back({session->sessionId, shipEpoch,
+                                    std::vector<uint8_t>(scratch_.data(), scratch_.data() + finalLen)});
+        return;
+    }
+    sendAnswer_(*session, scratch_.data(), finalLen);
+}
+
+uint64_t ClientGateway::shipPermissions_(const Session& session)
+{
+    if (authMode_ != rune::gateway::GatewayAuthMode::Required || !shardMode_ || !workerPool_) return 0;
+    const auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&session.auth);
+    if (a == nullptr) return 0;   // must-change-password / anonymous: the worker slot stays empty (deny)
+    const uint64_t epoch = ++permEpoch_;
+    (void)permissionShipper_.ship(*workerPool_, session.sessionId, a->perms.writeBits(), a->perms.isAllowAll(), epoch);
+    return epoch;
+}
+
+int ClientGateway::servicePermissionShipping_()
+{
+    int work = 0;
+    if (!workerPool_ || !shardMode_) return 0;
+    if (permissionShipper_.pendingUpdates() != 0) work += permissionShipper_.retry(*workerPool_);
+    for (std::size_t i = 0; i < heldLoginFinals_.size(); ) {
+        HeldLoginFinal& h = heldLoginFinals_[i];
+        if (permissionShipper_.fullyShippedEpoch(h.sessionId) < h.epoch) { ++i; continue; }
+        if (Session* s = sessions_.find(h.sessionId)) sendAnswer_(*s, h.frame.data(), h.frame.size());
+        heldLoginFinals_.erase(heldLoginFinals_.begin() + static_cast<std::ptrdiff_t>(i));
+        ++work;
+    }
+    return work;
 }
 
 void ClientGateway::reapAuthDeadlines_(int64_t nowNs)
@@ -7990,6 +8037,7 @@ void ClientGateway::onSecurityApplied(const rune::security::Applied& applied)
     sessions_.forEach([&](Session& s) {
         if (const auto* pcr = std::get_if<AuthPasswordChangeRequired>(&s.auth); pcr != nullptr && pcr->userId == applied.objectId) {
             s.auth = AuthAuthenticated{pcr->userId, pcr->user, compilePerms_(pcr->userId)};
+            (void)shipPermissions_(s);   // authentication Task 13: the lifted session's grants reach the workers
         }
     });
 }
