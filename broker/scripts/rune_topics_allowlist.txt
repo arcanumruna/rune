@@ -1,0 +1,7 @@
+# The ONLY files that may mention RUNE_TOPICS (catalog history F5), each with its EXACT
+# number of mentions (more or fewer fails).  Anything else — or more mentions — fails
+# NoRuneTopicsGateRegression.RepositoryHasNoRuneTopicsMention.
+# <path>                                   <exact>  # why
+libs/node/src/NodeConfig.cpp               2      # the presence refusal (Task 17): the lookup + its message
+libs/node/tests/node/NodeConfigTest.cpp    3      # NodeConfigRegression.RuneTopicsIsRefusedWithAPointerToDdl (+ ...EmptyString...): the variable set to a value / "" and named in the error
+docs/release-notes/catalog-history.md      2      # the release note that names the removal (Task 25)

@@ -1,0 +1,10 @@
+# DR-E2E harness — Python deps.  Python >= 3.10.
+#
+# We drive Docker via the `docker` / `docker compose` CLI (subprocess) rather
+# than the docker SDK: the CLI is what the operators and the existing
+# docker/e2e*.sh scripts use, it needs no extra daemon-API surface, and it keeps
+# the harness portable across Docker Desktop / Linux CI.  So the runtime dep set
+# is intentionally tiny.
+pytest>=7.4
+pytest-timeout>=2.2   # hard per-test timeouts (bounded — no infinite waits)
+pytest-xdist>=3.5    # parallel workers (-n 2): each worker gets its own compose projects (Cluster.__init__)

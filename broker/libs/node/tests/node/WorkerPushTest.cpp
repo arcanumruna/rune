@@ -1,0 +1,978 @@
+// WorkerPushTest.cpp — read-rework T3/T4 I3a: in-worker read+encode+push loop.
+//
+// A Worker owns a real disk Log + its own dynamic-MDC WorkerEgress.  After a
+// Subscribe op registers a cursor, Worker::doWork reads whole batches via
+// Log::readView (zero-copy), encodes Records frames, and pushes them on its egress.
+// A dynamic-MDC subscriber verifies in-order, exactly-once delivery, multi-record
+// cursor advance, control-batch skip, subscribe-from-offset, and unsubscribe-stop.
+//
+// Uses an embedded UDP Aeron driver (same pattern as WorkerEgressTest).  The Log
+// is written before driving doWork (single-threaded test), so readView observes
+// committed data.  bound = LEO (no replica → read_uncommitted passthrough).
+#include <rune/aeronutil/testing/FreePort.h>
+#include <rune/node/EmbeddedDriver.h>
+#include <rune/node/Worker.h>
+#include <rune/node/WorkerOp.h>
+#include <rune/replication/PartitionReplica.h>
+#include <rune/transaction/ControlMarker.h>
+#include <rune/storage/InMemoryLog.h>
+#include <rune/storage/Log.h>
+#include <rune/protocol/RecordBatch.h>
+#include <rune/protocol/client/DataMessages.h>
+#include <rune/protocol/client/ControlMessages.h>
+#include <rune/protocol/client/Protocol.h>
+
+#include <Aeron.h>
+#include <Subscription.h>
+#include <FragmentAssembler.h>
+#include <concurrent/AtomicBuffer.h>
+#include <gtest/gtest.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <aeronmd/aeronmd.h>
+
+#include <atomic>
+#include <chrono>
+#include <filesystem>
+#include <map>
+#include <string>
+#include <thread>
+#include <vector>
+#include <unistd.h>
+
+using namespace std::chrono_literals;
+using namespace rune::node;
+namespace pc = rune::protocol::client;
+
+namespace {
+// D11: loopback endpoints from the shared allocator (20000..31999, never bind-0) — the old
+// fixed 24xxx ports collided with the allocator's ports in concurrently running tests.
+inline std::string freeEndpoint() { return "127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort()); }
+
+constexpr std::size_t kRingBytes = 512 * 1024;
+
+class WorkerPushFixture : public ::testing::Test {
+protected:
+    std::unique_ptr<rune::node::EmbeddedDriver> driver_;
+    std::shared_ptr<aeron::Aeron> aeron_;
+    std::string aeronDir_;
+
+    // Driver term length (UDP).  maxMessageLength = term / 8.
+    virtual int32_t termBufferBytes() const { return 64 * 1024; }
+
+    void SetUp() override {
+        startDriver();
+        if (HasFatalFailure()) return;  // driver failed to start: don't block in connect
+        aeron::Context ctx; ctx.aeronDir(aeronDir_);
+        aeron_ = aeron::Aeron::connect(ctx);
+        ASSERT_NE(aeron_, nullptr);
+    }
+    void TearDown() override { aeron_.reset(); stopDriver(); }
+
+    void startDriver() {
+        aeronDir_ = (std::filesystem::temp_directory_path() /
+                     ("rune_wpush_" + std::to_string(::getpid()))).string();
+        std::filesystem::remove_all(aeronDir_);
+        // One dedicated pumping thread (EmbeddedDriver::Threaded); no caller-side
+        // readiness pumping needed — aeron_driver_init already wrote cnc.dat and
+        // stamped the heartbeat synchronously before the driver thread starts.
+        rune::node::EmbeddedDriverConfig cfg;
+        cfg.dir             = aeronDir_;
+        cfg.termBufferBytes = termBufferBytes();
+        // Pinned (test driver, orthogonal to the broker defaults): the
+        // pre-2026-10-02 128 KiB receive window.  The back-pressure tests' depth is
+        // publisher limit = sender position + term/2, the sender bounded by this
+        // window — a host-derived 4 MiB window (Linux, 16 MiB sysctls) let all 12
+        // x 1 MiB offers through and voided the precondition.
+        cfg.rcvWindowBytes  = 128 * 1024;
+        try {
+            driver_ = std::make_unique<rune::node::EmbeddedDriver>(cfg, rune::node::DriverMode::Threaded);
+        } catch (const std::exception& e) {
+            FAIL() << "EmbeddedDriver failed to start: " << e.what();
+        }
+    }
+    void stopDriver() {
+        driver_.reset();
+    }
+    template <typename Pred>
+    bool waitFor(Pred p, std::chrono::milliseconds timeout = 5s) {
+        auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) { if (p()) return true; std::this_thread::sleep_for(1ms); }
+        return p();
+    }
+    std::shared_ptr<aeron::Subscription> resolveSub(const std::string& control,
+                                                    const std::string& endpoint, int32_t sid) {
+        std::string ch = "aeron:udp?control=" + control + "|control-mode=dynamic|endpoint=" + endpoint;
+        int64_t reg = aeron_->addSubscription(ch, sid);
+        std::shared_ptr<aeron::Subscription> sub;
+        waitFor([&]() { sub = aeron_->findSubscription(reg); return sub != nullptr; });
+        return sub;
+    }
+    std::filesystem::path tempLogDir() {
+        static std::atomic<int> seq{0};
+        auto d = std::filesystem::temp_directory_path() /
+                 ("rune_wpush_log_" + std::to_string(::getpid()) + "_" +
+                  std::to_string(seq.fetch_add(1)));
+        std::filesystem::remove_all(d); std::filesystem::create_directories(d);
+        return d;
+    }
+    // Append a batch of `nrec` records starting at baseOffset; returns nextOffset.
+    static int64_t appendBatch(rune::storage::Log& log, int64_t baseOffset, int nrec,
+                               bool control = false) {
+        rune::protocol::RecordBatchBuilder b(baseOffset, /*ts=*/1000 + baseOffset);
+        if (control) b.setControl(true);
+        for (int i = 0; i < nrec; ++i)
+            b.append("k", "v" + std::to_string(baseOffset + i), 1000 + baseOffset + i);
+        return log.append(b.build(), baseOffset + nrec - 1);
+    }
+
+    // Collect decoded Records baseOffsets from a subscription into `out`.
+    struct Collector {
+        std::vector<int64_t> baseOffsets;
+        aeron::FragmentAssembler fa;
+        Collector()
+            : fa([this](aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t off,
+                        aeron::util::index_t len, aeron::Header&) {
+                  auto dec = pc::Records::decode(
+                      reinterpret_cast<const uint8_t*>(buf.buffer() + off),
+                      static_cast<std::size_t>(len));
+                  if (dec) baseOffsets.push_back(dec->baseOffset);
+              }) {}
+    };
+
+    WorkerOp subscribeOp(int64_t subId, int32_t topicId, int32_t partition,
+                         int64_t nextOffset, rune::storage::Log* log) {
+        WorkerOp op;
+        op.type           = WorkerOp::Type::Subscribe;
+        op.subscriptionId = subId;
+        op.sessionId      = 4200 + subId;
+        op.topicId        = topicId;
+        op.partition      = partition;
+        op.nextOffset     = nextOffset;
+        op.logPtr         = log;
+        op.replica        = nullptr;  // passthrough → bound = LEO
+        return op;
+    }
+};
+
+TEST_F(WorkerPushFixture, DeliversAllBatchesInOrderExactlyOnce) {
+    auto dir = tempLogDir();
+    rune::storage::Log log(dir.string(), 64LL * 1024 * 1024);
+    constexpr int kN = 20;
+    for (int i = 0; i < kN; ++i) appendBatch(log, i, 1);
+    ASSERT_EQ(log.logEndOffset(), kN);
+
+    const std::string controlEp = freeEndpoint();
+    const char* control = controlEp.c_str();
+    WorkerEgress eg(aeron_, control, 3001);
+    ASSERT_TRUE(eg.resolved());
+    auto sub = resolveSub(control, freeEndpoint(), 3001);
+    ASSERT_NE(sub, nullptr);
+    ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
+
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(&eg);
+    ASSERT_TRUE(w.tryEnqueueOp(subscribeOp(1, 10, 0, 0, &log)));
+
+    Collector c;
+    ASSERT_TRUE(waitFor([&]() {
+        w.doWork(1);
+        sub->poll(c.fa.handler(), 64);
+        return static_cast<int>(c.baseOffsets.size()) >= kN;
+    }, 10s)) << "received " << c.baseOffsets.size() << "/" << kN;
+
+    ASSERT_EQ(static_cast<int>(c.baseOffsets.size()), kN);
+    for (int i = 0; i < kN; ++i)
+        EXPECT_EQ(c.baseOffsets[i], i) << "out-of-order or gap at index " << i;
+    std::filesystem::remove_all(dir);
+}
+
+// #65 review MAJOR-1: the in-worker subscription push (per-worker egress, on
+// by default in shard mode) reads with a pread into the worker scratch — never
+// through the segment read MMAP (first-touch faults take the process mmap_lock,
+// queued behind the provisioner / cleaner mmap+munmap: ~1 ms worker passes).
+TEST_F(WorkerPushFixture, OwnedSubscriptionPushNeverFaultsThroughTheReadMapRegression) {
+    auto dir = tempLogDir();
+    rune::storage::Log log(dir.string(), 64LL * 1024 * 1024);
+    constexpr int kN = 20;
+    for (int i = 0; i < kN; ++i) appendBatch(log, i, 1);
+    const std::string controlEp = freeEndpoint();
+    const char* control = controlEp.c_str();
+    WorkerEgress eg(aeron_, control, 3021);
+    ASSERT_TRUE(eg.resolved());
+    auto sub = resolveSub(control, freeEndpoint(), 3021);
+    ASSERT_NE(sub, nullptr);
+    ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(&eg);
+    const uint64_t viewsBefore = log.readViewCallsForTest();
+    ASSERT_TRUE(w.tryEnqueueOp(subscribeOp(1, 10, 0, 0, &log)));
+    Collector c;
+    ASSERT_TRUE(waitFor([&]() {
+        w.doWork(1);
+        sub->poll(c.fa.handler(), 64);
+        return static_cast<int>(c.baseOffsets.size()) >= kN;
+    }, 10s)) << "received " << c.baseOffsets.size() << "/" << kN;
+    for (int i = 0; i < kN; ++i) EXPECT_EQ(c.baseOffsets[i], i);
+    EXPECT_EQ(log.readViewCallsForTest(), viewsBefore)
+        << "the owned-subscription push read through the segment read mmap";
+    EXPECT_EQ(w.pushReadMapFallbacksForTest(), 0u);
+    std::filesystem::remove_all(dir);
+}
+
+// CG routing round 3 (MAJOR-1): every Records push carries the correlationId
+// of the client Subscribe that created the subscription, so the client binds
+// the push to ITS request (exact instance identity).  RED: 0.
+TEST_F(WorkerPushFixture, RecordsCarryTheSubscribeCorrelationIdRegression) {
+    auto dir = tempLogDir();
+    rune::storage::Log log(dir.string(), 64LL * 1024 * 1024);
+    for (int i = 0; i < 3; ++i) appendBatch(log, i, 1);
+    auto freePort = [] { return std::to_string(rune::aeronutil::testing::allocFreeUdpPort()); };   // D11: never bind-0
+    const std::string control = "127.0.0.1:" + freePort();
+    const std::string local   = "127.0.0.1:" + freePort();
+    WorkerEgress eg(aeron_, control.c_str(), 3011);
+    ASSERT_TRUE(eg.resolved());
+    auto sub = resolveSub(control.c_str(), local.c_str(), 3011);
+    ASSERT_NE(sub, nullptr);
+    ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
+
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(&eg);
+    WorkerOp op = subscribeOp(1, 10, 0, 0, &log);
+    op.correlationId = 0x2000000000000123LL;  // a client's group fetch Subscribe id
+    ASSERT_TRUE(w.tryEnqueueOp(std::move(op)));
+
+    std::vector<int64_t> corrs;
+    aeron::FragmentAssembler fa([&](aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t off,
+                                    aeron::util::index_t len, aeron::Header&) {
+        auto dec = pc::Records::decode(reinterpret_cast<const uint8_t*>(buf.buffer() + off),
+                                       static_cast<std::size_t>(len));
+        if (dec) corrs.push_back(dec->correlationId);
+    });
+    ASSERT_TRUE(waitFor([&]() {
+        w.doWork(1);
+        sub->poll(fa.handler(), 64);
+        return corrs.size() >= 3;
+    }, 10s));
+    for (const int64_t c : corrs) EXPECT_EQ(c, 0x2000000000000123LL);
+    std::filesystem::remove_all(dir);
+}
+
+TEST_F(WorkerPushFixture, MultiRecordBatchesAdvanceCursorByRecordCount) {
+    auto dir = tempLogDir();
+    rune::storage::Log log(dir.string(), 64LL * 1024 * 1024);
+    appendBatch(log, 0, 5);   // offsets 0..4
+    appendBatch(log, 5, 3);   // offsets 5..7
+    appendBatch(log, 8, 2);   // offsets 8..9
+    ASSERT_EQ(log.logEndOffset(), 10);
+
+    const std::string controlEp = freeEndpoint();
+    const char* control = controlEp.c_str();
+    WorkerEgress eg(aeron_, control, 3002);
+    ASSERT_TRUE(eg.resolved());
+    auto sub = resolveSub(control, freeEndpoint(), 3002);
+    ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
+
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(&eg);
+    ASSERT_TRUE(w.tryEnqueueOp(subscribeOp(1, 10, 0, 0, &log)));
+
+    Collector c;
+    ASSERT_TRUE(waitFor([&]() {
+        w.doWork(1); sub->poll(c.fa.handler(), 64);
+        return c.baseOffsets.size() >= 3;
+    }, 10s)) << "got " << c.baseOffsets.size();
+    ASSERT_EQ(c.baseOffsets.size(), 3u);
+    EXPECT_EQ(c.baseOffsets[0], 0);
+    EXPECT_EQ(c.baseOffsets[1], 5);
+    EXPECT_EQ(c.baseOffsets[2], 8);
+    std::filesystem::remove_all(dir);
+}
+
+TEST_F(WorkerPushFixture, ControlBatchesAreSkipped) {
+    auto dir = tempLogDir();
+    rune::storage::Log log(dir.string(), 64LL * 1024 * 1024);
+    appendBatch(log, 0, 1);                 // data @0
+    appendBatch(log, 1, 1, /*control=*/true); // control @1 (must NOT be delivered)
+    appendBatch(log, 2, 1);                 // data @2
+    ASSERT_EQ(log.logEndOffset(), 3);
+
+    const std::string controlEp = freeEndpoint();
+    const char* control = controlEp.c_str();
+    WorkerEgress eg(aeron_, control, 3003);
+    ASSERT_TRUE(eg.resolved());
+    auto sub = resolveSub(control, freeEndpoint(), 3003);
+    ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
+
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(&eg);
+    ASSERT_TRUE(w.tryEnqueueOp(subscribeOp(1, 10, 0, 0, &log)));
+
+    Collector c;
+    ASSERT_TRUE(waitFor([&]() {
+        w.doWork(1); sub->poll(c.fa.handler(), 64);
+        return c.baseOffsets.size() >= 2;
+    }, 10s)) << "got " << c.baseOffsets.size();
+    // Exactly the two data batches, control skipped.  Give a moment for any
+    // (wrongly) delivered control frame to arrive too.
+    for (int i = 0; i < 50; ++i) { w.doWork(1); sub->poll(c.fa.handler(), 64); std::this_thread::sleep_for(1ms); }
+    ASSERT_EQ(c.baseOffsets.size(), 2u) << "control batch must not be delivered";
+    EXPECT_EQ(c.baseOffsets[0], 0);
+    EXPECT_EQ(c.baseOffsets[1], 2);
+    std::filesystem::remove_all(dir);
+}
+
+TEST_F(WorkerPushFixture, SubscribeFromNonZeroOffset) {
+    auto dir = tempLogDir();
+    rune::storage::Log log(dir.string(), 64LL * 1024 * 1024);
+    for (int i = 0; i < 10; ++i) appendBatch(log, i, 1);
+
+    const std::string controlEp = freeEndpoint();
+    const char* control = controlEp.c_str();
+    WorkerEgress eg(aeron_, control, 3004);
+    ASSERT_TRUE(eg.resolved());
+    auto sub = resolveSub(control, freeEndpoint(), 3004);
+    ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
+
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(&eg);
+    ASSERT_TRUE(w.tryEnqueueOp(subscribeOp(1, 10, 0, /*nextOffset=*/5, &log)));
+
+    Collector c;
+    ASSERT_TRUE(waitFor([&]() {
+        w.doWork(1); sub->poll(c.fa.handler(), 64);
+        return c.baseOffsets.size() >= 5;
+    }, 10s)) << "got " << c.baseOffsets.size();
+    ASSERT_EQ(c.baseOffsets.size(), 5u);
+    for (int i = 0; i < 5; ++i) EXPECT_EQ(c.baseOffsets[i], 5 + i);
+    std::filesystem::remove_all(dir);
+}
+
+// Sanitizer triage T2 (2026-10-14): the gateway read a WORKER-owned Log's LEO and
+// segment map (logStartOffset) from its own thread to resolve Earliest — a TSan
+// data race (worker append vs gateway handleSubscribe).  The gateway now sends a
+// worker-owned subscription's Earliest as 0 (a fresh cursor) and the OWNING worker
+// raises it to its log start: after the head segments are deleted, an Earliest
+// (0) subscription must still deliver from the oldest surviving batch.
+TEST_F(WorkerPushFixture, FreshCursorBelowTheDiskLogStartResumesAtTheStartOnTheWorkerRegression) {
+    auto dir = tempLogDir();
+    rune::storage::Log log(dir.string(), 256);   // tiny roll: many sealed segments
+    log.recover();
+    for (int i = 0; i < 40; ++i) appendBatch(log, i, 1);
+    ASSERT_GT(log.deleteOldSegments(/*retainBytes=*/0), 0);
+    const int64_t start = log.logStartOffset();
+    ASSERT_GT(start, 0);
+    ASSERT_TRUE(log.read(0, 1 << 20).empty()) << "below the log start reads nothing (the starvation trap)";
+
+    const std::string controlEp = freeEndpoint();
+    const char* control = controlEp.c_str();
+    WorkerEgress eg(aeron_, control, 3007);
+    ASSERT_TRUE(eg.resolved());
+    auto sub = resolveSub(control, freeEndpoint(), 3007);
+    ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
+
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(&eg);
+    ASSERT_TRUE(w.tryEnqueueOp(subscribeOp(1, 10, 0, /*nextOffset=*/0, &log)));   // Earliest, fresh
+
+    Collector c;
+    const auto expected = static_cast<std::size_t>(40 - start);
+    ASSERT_TRUE(waitFor([&]() {
+        w.doWork(1); sub->poll(c.fa.handler(), 64);
+        return c.baseOffsets.size() >= expected;
+    }, 10s)) << "got " << c.baseOffsets.size() << " of " << expected;
+    ASSERT_EQ(c.baseOffsets.size(), expected);
+    EXPECT_EQ(c.baseOffsets.front(), start) << "resumes at the oldest surviving batch";
+    for (std::size_t i = 0; i < c.baseOffsets.size(); ++i)
+        EXPECT_EQ(c.baseOffsets[i], start + static_cast<int64_t>(i));
+    std::filesystem::remove_all(dir);
+}
+
+TEST_F(WorkerPushFixture, UnsubscribeStopsFurtherDelivery) {
+    auto dir = tempLogDir();
+    rune::storage::Log log(dir.string(), 64LL * 1024 * 1024);
+    for (int i = 0; i < 5; ++i) appendBatch(log, i, 1);
+
+    const std::string controlEp = freeEndpoint();
+    const char* control = controlEp.c_str();
+    WorkerEgress eg(aeron_, control, 3005);
+    ASSERT_TRUE(eg.resolved());
+    auto sub = resolveSub(control, freeEndpoint(), 3005);
+    ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
+
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(&eg);
+    ASSERT_TRUE(w.tryEnqueueOp(subscribeOp(1, 10, 0, 0, &log)));
+
+    Collector c;
+    ASSERT_TRUE(waitFor([&]() {
+        w.doWork(1); sub->poll(c.fa.handler(), 64);
+        return c.baseOffsets.size() >= 5;
+    }, 10s));
+    ASSERT_EQ(c.baseOffsets.size(), 5u);
+
+    // Unsubscribe, then produce 5 more — none must be delivered.
+    WorkerOp un; un.type = WorkerOp::Type::Unsubscribe; un.subscriptionId = 1;
+    ASSERT_TRUE(w.tryEnqueueOp(std::move(un)));
+    w.doWork(1);
+    for (int i = 5; i < 10; ++i) appendBatch(log, i, 1);
+    for (int i = 0; i < 100; ++i) { w.doWork(1); sub->poll(c.fa.handler(), 64); std::this_thread::sleep_for(1ms); }
+    EXPECT_EQ(c.baseOffsets.size(), 5u) << "no delivery after unsubscribe";
+    std::filesystem::remove_all(dir);
+}
+
+TEST_F(WorkerPushFixture, NoEgressWiredIsInertNoCrash) {
+    auto dir = tempLogDir();
+    rune::storage::Log log(dir.string(), 64LL * 1024 * 1024);
+    for (int i = 0; i < 5; ++i) appendBatch(log, i, 1);
+
+    Worker w(0, kRingBytes, kRingBytes);
+    // No setWorkerEgress → pushOwnedSubscriptions_ must be a no-op.
+    ASSERT_TRUE(w.tryEnqueueOp(subscribeOp(1, 10, 0, 0, &log)));
+    for (int i = 0; i < 10; ++i) w.doWork(1);
+    // Sub registered but nothing pushed; cursor untouched.
+    ASSERT_EQ(w.subscriptionsForTest().size(), 1u);
+    EXPECT_EQ(w.subscriptionsForTest()[0].nextOffset, 0);
+    std::filesystem::remove_all(dir);
+}
+
+
+// ===========================================================================
+// F19 (REGRESSION): per-worker egress (shard mode) skipped any batch whose
+// Records frame exceeded the 68 KiB egressScratch_ and advanced the cursor —
+// silent consumer data loss — and a frame between maxPayload and the scratch
+// but above the publication's maxMessageLength threw out of doWork.
+//
+// Fixed: deliverable frames go out as a vectored offer (header from scratch +
+// batch bytes zero-copy from the log view); a frame above maxMessageLength
+// answers ONE ErrorResponse{MessageTooLarge, correlationId = 0, message naming
+// the subscription/topic/partition/offset}
+// and parks that subscription (cursor not advanced; others unaffected);
+// back-pressure keeps the retry-from-same-cursor semantics.
+// ===========================================================================
+struct F19Egress {
+    struct Rec { int64_t subId; int64_t baseOffset; std::vector<uint8_t> bytes; };
+    struct Err { int64_t sessionId; int64_t correlationId; int16_t code; std::string message; };
+    std::vector<Rec> records;
+    std::vector<Err> errors;
+    aeron::FragmentAssembler fa;
+    F19Egress()
+        : fa([this](aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t off,
+                    aeron::util::index_t len, aeron::Header&) {
+              const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + off);
+              const auto  n = static_cast<std::size_t>(len);
+              if (auto r = pc::Records::decode(p, n))
+                  records.push_back({r->subscriptionId, r->baseOffset,
+                                     {r->recordBatch.begin(), r->recordBatch.end()}});
+              else if (auto e = pc::ErrorResponse::decode(p, n))
+                  errors.push_back({e->sessionId, e->correlationId, e->code, std::string(e->message)});
+          }) {}
+    [[nodiscard]] std::size_t recordsFor(int64_t subId) const {
+        std::size_t c = 0;
+        for (const auto& r : records) c += (r.subId == subId);
+        return c;
+    }
+};
+
+// Append one batch whose single record value is `valueBytes` long at the log's
+// LEO; returns the exact stored bytes.  Built once per size and restamped
+// (baseOffset, bytes 0..7, is not CRC-covered); appended without fsync (the
+// page cache is visible to readers) to keep the 1 MiB cases fast.
+static std::vector<uint8_t> f19AppendSized(rune::storage::Log& log, std::size_t valueBytes) {
+    static std::map<std::size_t, std::vector<uint8_t>> built;
+    const int64_t base = log.logEndOffset();
+    auto& tmpl = built[valueBytes];
+    if (tmpl.empty()) {
+        std::string value(valueBytes, '\0');
+        for (std::size_t i = 0; i < valueBytes; ++i)
+            value[i] = static_cast<char>((i * 31u) & 0xffu);
+        rune::protocol::RecordBatchBuilder b(0, 1000);
+        b.append("k", value, 1000);
+        tmpl = b.build();
+    }
+    std::vector<uint8_t> bytes = tmpl;
+    for (int i = 0; i < 8; ++i) bytes[i] = static_cast<uint8_t>(static_cast<uint64_t>(base) >> (8 * i));
+    log.appendNoSync(bytes.data(), bytes.size(), base);   // page cache: visible to readers
+    return bytes;
+}
+
+// 16 MiB UDP term → maxMessageLength 2 MiB: a 1 MiB batch is deliverable.
+class WorkerLargeBatchPushRegression : public WorkerPushFixture {
+protected:
+    int32_t termBufferBytes() const override { return 16 * 1024 * 1024; }
+};
+
+TEST_F(WorkerLargeBatchPushRegression, OneMiBBatchDeliveredIntactThenSmallBatch) {
+    auto dir = tempLogDir();
+    rune::storage::Log log(dir.string(), 64LL * 1024 * 1024);
+    const auto big   = f19AppendSized(log, 1024 * 1024);   // offset 0
+    const auto small = f19AppendSized(log, 16);            // offset 1
+
+    const std::string controlEp = freeEndpoint();
+    const char* control = controlEp.c_str();
+    WorkerEgress eg(aeron_, control, 3101);
+    ASSERT_TRUE(eg.resolved());
+    auto sub = resolveSub(control, freeEndpoint(), 3101);
+    ASSERT_NE(sub, nullptr);
+    ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
+
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(&eg);
+    ASSERT_TRUE(w.tryEnqueueOp(subscribeOp(1, 10, 0, 0, &log)));
+
+    F19Egress c;
+    ASSERT_TRUE(waitFor([&]() {
+        w.doWork(1); sub->poll(c.fa.handler(), 64);
+        return c.recordsFor(1) >= 2 || !c.errors.empty();
+    }, 10s)) << "received " << c.records.size() << "/2 (1 MiB batch skipped = F19)";
+    ASSERT_TRUE(c.errors.empty());
+    ASSERT_EQ(c.recordsFor(1), 2u);
+    EXPECT_EQ(c.records[0].baseOffset, 0);
+    EXPECT_EQ(c.records[0].bytes, big) << "1 MiB batch not byte-identical after reassembly";
+    EXPECT_EQ(c.records[1].baseOffset, 1);
+    EXPECT_EQ(c.records[1].bytes, small);
+    EXPECT_EQ(w.subscriptionsForTest()[0].nextOffset, 2);
+    std::filesystem::remove_all(dir);
+}
+
+TEST_F(WorkerLargeBatchPushRegression, BackPressuredLargeOfferRetriesWithoutLoss) {
+    auto dir = tempLogDir();
+    rune::storage::Log log(dir.string(), 256LL * 1024 * 1024);
+    constexpr int kBatches = 12;
+    std::vector<std::vector<uint8_t>> stored;
+    for (int i = 0; i < kBatches; ++i) stored.push_back(f19AppendSized(log, 1024 * 1024));
+
+    const std::string controlEp = freeEndpoint();
+    const char* control = controlEp.c_str();
+    WorkerEgress eg(aeron_, control, 3102);
+    ASSERT_TRUE(eg.resolved());
+    auto sub = resolveSub(control, freeEndpoint(), 3102);
+    ASSERT_NE(sub, nullptr);
+    ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
+
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(&eg);
+    ASSERT_TRUE(w.tryEnqueueOp(subscribeOp(1, 10, 0, 0, &log)));
+
+    // Drive the worker WITHOUT polling the subscriber: flow control closes the
+    // window and the 1 MiB offers back-pressure.
+    for (int i = 0; i < 4 * kBatches; ++i) w.doWork(1);
+    EXPECT_LT(w.subscriptionsForTest()[0].nextOffset, kBatches)
+        << "back-pressure never happened (test precondition)";
+
+    F19Egress c;
+    ASSERT_TRUE(waitFor([&]() {
+        w.doWork(1); sub->poll(c.fa.handler(), 64);
+        return c.recordsFor(1) >= static_cast<std::size_t>(kBatches) || !c.errors.empty();
+    }, 20s)) << "received " << c.records.size() << "/" << kBatches;
+    ASSERT_TRUE(c.errors.empty());
+    ASSERT_EQ(c.recordsFor(1), static_cast<std::size_t>(kBatches));
+    for (int i = 0; i < kBatches; ++i) {
+        EXPECT_EQ(c.records[i].baseOffset, i) << "gap/dup/reorder at " << i;
+        EXPECT_EQ(c.records[i].bytes, stored[i]) << "batch " << i << " corrupted";
+    }
+    EXPECT_EQ(w.subscriptionsForTest()[0].nextOffset, kBatches);
+    std::filesystem::remove_all(dir);
+}
+
+// 64 KiB UDP term → maxMessageLength 8 KiB: a 16 KiB batch cannot be delivered.
+class WorkerOversizePushRegression : public WorkerPushFixture {};
+
+TEST_F(WorkerOversizePushRegression, AboveMaxMessageLengthAnswersErrorNoSilentAdvance) {
+    auto dirA = tempLogDir();
+    auto dirB = tempLogDir();
+    rune::storage::Log logA(dirA.string(), 64LL * 1024 * 1024);
+    rune::storage::Log logB(dirB.string(), 64LL * 1024 * 1024);
+    f19AppendSized(logA, 16 * 1024);   // A@0: frame > 8 KiB max message
+    f19AppendSized(logA, 16);          // A@1: behind the undeliverable batch
+    f19AppendSized(logB, 16);          // B: another subscription, must flow
+    f19AppendSized(logB, 16);
+
+    const std::string controlEp = freeEndpoint();
+    const char* control = controlEp.c_str();
+    WorkerEgress eg(aeron_, control, 3103);
+    ASSERT_TRUE(eg.resolved());
+    auto sub = resolveSub(control, freeEndpoint(), 3103);
+    ASSERT_NE(sub, nullptr);
+    ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
+
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(&eg);
+    ASSERT_TRUE(w.tryEnqueueOp(subscribeOp(1, 10, 0, 0, &logA)));
+    ASSERT_TRUE(w.tryEnqueueOp(subscribeOp(2, 10, 1, 0, &logB)));
+
+    F19Egress c;
+    ASSERT_TRUE(waitFor([&]() {
+        w.doWork(1); sub->poll(c.fa.handler(), 64);
+        return !c.errors.empty() && c.recordsFor(2) >= 2;
+    }, 10s)) << "errors=" << c.errors.size() << " sub2 records=" << c.recordsFor(2);
+    ASSERT_EQ(c.errors.size(), 1u);
+    EXPECT_EQ(c.errors[0].correlationId, 0)
+        << "a subscription id must never be sent as a correlationId (collides with ping ids)";
+    EXPECT_NE(c.errors[0].message.find("subscription 1 topic 10 partition 0 offset 0"), std::string::npos)
+        << "message must name the subscription; got: " << c.errors[0].message;
+    EXPECT_EQ(c.errors[0].sessionId, 4201);
+    EXPECT_EQ(c.errors[0].code, static_cast<int16_t>(pc::ErrorCode::MessageTooLarge));
+
+    // Parked: no delivery past the failed batch, no second error, cursor stays.
+    for (int i = 0; i < 200; ++i) { w.doWork(1); sub->poll(c.fa.handler(), 64); }
+    EXPECT_EQ(c.recordsFor(1), 0u);
+    EXPECT_EQ(c.errors.size(), 1u) << "exactly one error, no spin";
+    for (const auto& s : w.subscriptionsForTest()) {
+        if (s.subscriptionId == 1) EXPECT_EQ(s.nextOffset, 0) << "silent advance past undelivered batch";
+        if (s.subscriptionId == 2) EXPECT_EQ(s.nextOffset, 2);
+    }
+    std::filesystem::remove_all(dirA);
+    std::filesystem::remove_all(dirB);
+}
+
+// ===========================================================================
+// F15 S4 (design note §2.4, K1): the worker-push egress arm serves
+// read_committed from the OWNING worker's RC state — bound = LSO(live HW),
+// aborted batches skipped, a pre-carrier group sub CUT at the first aborted
+// batch (addendum R-2).  The cursor (worker-owned) is the deterministic
+// observation; delivery is checked once the data is releasable.
+// ===========================================================================
+class NullTransportRc final : public rune::replication::PartitionTransport {
+public:
+    bool sendFetchRequest(const rune::replication::FetchRequestMsg&) override { return true; }
+    bool sendFetchResponse(rune::replication::NodeId, const rune::replication::FetchResponseMsg&) override { return true; }
+};
+class TxnRcRegression : public WorkerPushFixture {
+protected:
+    static rune::replication::PartitionConfig leaderCfg() {
+        rune::replication::PartitionConfig c;
+        c.topicId = 10; c.partitionId = 0; c.selfId = 1; c.minIsr = 1; c.durabilityTier = 1;
+        c.fetchIntervalNs = 1'000'000'000LL; c.isrCheckIntervalNs = 1'000'000'000LL; c.pushOnAppend = false;
+        c.replicaLagMaxMs = 1'000'000;
+        return c;
+    }
+    static void appendTxn(rune::storage::Log& log, int64_t base, int64_t pid) {
+        rune::protocol::RecordBatchBuilder b(base, 1000 + base);
+        b.setTransactional(true); b.setProducerId(pid); b.setProducerEpoch(0); b.setBaseSequence(0);
+        b.append("k", "txn", 1000 + base);
+        (void)log.append(b.build(), base);
+    }
+    static WorkerOp markerOp(rune::replication::PartitionReplica* r, int64_t pid, bool commit) {
+        WorkerOp op;
+        op.type = WorkerOp::Type::AppendControlRecord; op.topicId = r->topicId(); op.partition = 0;
+        op.replica = r; op.logPtr = r->log(); op.correlationId = pid;
+        op.recordBatchBytes = rune::transaction::ControlMarker::build(
+            pid, 0, commit ? rune::transaction::ControlType::Commit : rune::transaction::ControlType::Abort, 0);
+        return op;
+    }
+    WorkerOp rcSubscribeOp(int64_t subId, rune::replication::PartitionReplica* r, uint8_t iso,
+                           bool isGroup = false, bool carrier = true) {
+        WorkerOp op = subscribeOp(subId, r->topicId(), 0, 0, r->log());
+        op.replica = r; op.isolation = iso; op.isGroup = isGroup; op.groupCarrierReceived = carrier;
+        return op;
+    }
+};
+
+TEST_F(TxnRcRegression, WorkerPushReadCommittedHoldsOpenTxn) {
+    auto dir = tempLogDir();
+    rune::storage::Log log(dir.string(), 64LL * 1024 * 1024);
+    appendBatch(log, 0, 1);                       // data @0
+    appendTxn(log, 1, /*pid=*/7);                 // open txn @1
+    appendBatch(log, 2, 1);                       // data @2 (behind the LSO)
+    NullTransportRc t;
+    rune::replication::PartitionReplica rep(leaderCfg(), rune::replication::Role::Leader, 1, {1}, {1}, &log, &t);
+    rep.onLeaderLogAppended();
+    ASSERT_EQ(rep.highWatermark(), 3);
+
+    const std::string controlEp = freeEndpoint();
+    const char* control = controlEp.c_str();
+    WorkerEgress eg(aeron_, control, 3010);
+    ASSERT_TRUE(eg.resolved());
+    auto sub = resolveSub(control, freeEndpoint(), 3010);
+    ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
+
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(&eg);
+    w.setOwnedDirect(Worker::OwnedSet{&rep});
+    ASSERT_TRUE(w.tryEnqueueOp(rcSubscribeOp(1, &rep, /*read_committed*/1)));
+    Collector c;
+    ASSERT_TRUE(waitFor([&]() { w.doWork(1); sub->poll(c.fa.handler(), 64); return !c.baseOffsets.empty(); }, 10s));
+    for (int i = 0; i < 64; ++i) w.doWork(1);
+    ASSERT_EQ(w.subscriptionsForTest().size(), 1u);
+    EXPECT_EQ(w.subscriptionsForTest()[0].nextOffset, 1)
+        << "the worker push went past the open txn's first offset (HW-bounded, not LSO-bounded)";
+    // COMMIT → the LSO advances to the HW → the held batches are released, in order.
+    ASSERT_TRUE(w.tryEnqueueOp(markerOp(&rep, 7, /*commit=*/true)));
+    ASSERT_TRUE(waitFor([&]() { w.doWork(1); sub->poll(c.fa.handler(), 64); return c.baseOffsets.size() >= 3; }, 10s))
+        << "got " << c.baseOffsets.size();
+    EXPECT_EQ(c.baseOffsets, (std::vector<int64_t>{0, 1, 2}));
+    std::filesystem::remove_all(dir);
+}
+
+TEST_F(TxnRcRegression, WorkerPushFiltersAbortedBatch) {
+    auto dir = tempLogDir();
+    rune::storage::Log log(dir.string(), 64LL * 1024 * 1024);
+    appendTxn(log, 0, /*pid=*/7);                 // txn @0, aborted below
+    NullTransportRc t;
+    rune::replication::PartitionReplica rep(leaderCfg(), rune::replication::Role::Leader, 1, {1}, {1}, &log, &t);
+    rep.onLeaderLogAppended();
+
+    const std::string controlEp = freeEndpoint();
+    const char* control = controlEp.c_str();
+    WorkerEgress eg(aeron_, control, 3011);
+    ASSERT_TRUE(eg.resolved());
+    auto sub = resolveSub(control, freeEndpoint(), 3011);
+    ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
+
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(&eg);
+    w.setOwnedDirect(Worker::OwnedSet{&rep});
+    ASSERT_TRUE(w.tryEnqueueOp(markerOp(&rep, 7, /*commit=*/false)));   // ABORT @1
+    w.doWork(1);
+    ASSERT_EQ(log.logEndOffset(), 2);
+    appendBatch(log, 2, 1);                       // committed data @2
+    rep.onLeaderLogAppended();
+    ASSERT_TRUE(w.tryEnqueueOp(rcSubscribeOp(1, &rep, /*read_committed*/1)));
+    Collector c;
+    ASSERT_TRUE(waitFor([&]() { w.doWork(1); sub->poll(c.fa.handler(), 64);
+                                return !c.baseOffsets.empty() && c.baseOffsets.back() == 2; }, 10s));
+    EXPECT_EQ(c.baseOffsets, (std::vector<int64_t>{2})) << "read_committed worker push delivered the aborted batch";
+    EXPECT_EQ(w.subscriptionsForTest()[0].nextOffset, 3);
+    std::filesystem::remove_all(dir);
+}
+
+TEST_F(TxnRcRegression, WorkerPushPreCarrierGroupCutsAtAbortedBatch) {
+    // R-2 on the worker-push arm: pre-carrier (isolation guessed read_committed)
+    // the cursor stops AT the aborted batch; a read_uncommitted carrier then
+    // delivers it (never stripped before the true isolation is known).
+    auto dir = tempLogDir();
+    rune::storage::Log log(dir.string(), 64LL * 1024 * 1024);
+    appendTxn(log, 0, /*pid=*/7);
+    NullTransportRc t;
+    rune::replication::PartitionReplica rep(leaderCfg(), rune::replication::Role::Leader, 1, {1}, {1}, &log, &t);
+    rep.onLeaderLogAppended();
+
+    const std::string controlEp = freeEndpoint();
+    const char* control = controlEp.c_str();
+    WorkerEgress eg(aeron_, control, 3012);
+    ASSERT_TRUE(eg.resolved());
+    auto sub = resolveSub(control, freeEndpoint(), 3012);
+    ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
+
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(&eg);
+    w.setOwnedDirect(Worker::OwnedSet{&rep});
+    ASSERT_TRUE(w.tryEnqueueOp(markerOp(&rep, 7, /*commit=*/false)));   // ABORT @1
+    w.doWork(1);
+    appendBatch(log, 2, 1);
+    rep.onLeaderLogAppended();
+    ASSERT_TRUE(w.tryEnqueueOp(rcSubscribeOp(1, &rep, 1, /*isGroup=*/true, /*carrier=*/false)));
+    for (int i = 0; i < 64; ++i) w.doWork(1);
+    EXPECT_EQ(w.subscriptionsForTest()[0].nextOffset, 0) << "pre-carrier: the cursor passed an aborted batch";
+    ASSERT_TRUE(w.tryEnqueueOp(rcSubscribeOp(1, &rep, /*read_uncommitted carrier*/0, true, true)));
+    Collector c;
+    ASSERT_TRUE(waitFor([&]() { w.doWork(1); sub->poll(c.fa.handler(), 64);
+                                return !c.baseOffsets.empty() && c.baseOffsets.back() == 2; }, 10s));
+    EXPECT_EQ(c.baseOffsets, (std::vector<int64_t>{0, 2})) << "the aborted batch was lost before the carrier";
+    std::filesystem::remove_all(dir);
+}
+
+
+// ===========================================================================
+// Phase 2b E2 Task 5: the in-worker (shard-mode) subscription push of a
+// TRANSIENT partition — the Subscribe op carries no disk Log; the source is the
+// owned replica's InMemoryLog ring (zero-copy view, same thread).  A cursor the
+// ring evicted resumes AT the ring start (counted) — never a stall; a
+// subscription whose partition moved away parks and never reads the ring.
+// ===========================================================================
+class TransientOwnedPushRegression : public WorkerPushFixture {
+protected:
+    static rune::replication::PartitionConfig leaderCfg() {
+        rune::replication::PartitionConfig c;
+        c.topicId = 10; c.partitionId = 0; c.selfId = 1; c.minIsr = 1; c.durabilityTier = 1;
+        c.fetchIntervalNs = 1'000'000'000LL; c.isrCheckIntervalNs = 1'000'000'000LL; c.pushOnAppend = false;
+        c.replicaLagMaxMs = 1'000'000;
+        return c;
+    }
+    static int64_t appendRing(rune::storage::InMemoryLog& mem, int64_t base, std::size_t valueBytes = 8) {
+        rune::protocol::RecordBatchBuilder b(base, 1000 + base);
+        b.append("k", std::string(valueBytes, 'v'), 1000 + base);
+        const auto bytes = b.build();
+        EXPECT_GE(mem.append(bytes, base), 0);
+        return base + 1;
+    }
+    WorkerOp ringSubscribeOp(int64_t subId, rune::replication::PartitionReplica* r, int64_t from) {
+        WorkerOp op = subscribeOp(subId, r->topicId(), 0, from, /*log=*/nullptr);   // no disk Log
+        op.replica = r;
+        op.targetReplicaId = r->registryId(); op.incarnation = r->incarnation();   // as WorkerPool stamps it
+        return op;
+    }
+    struct NullT final : rune::replication::PartitionTransport {
+        bool sendFetchRequest(const rune::replication::FetchRequestMsg&) override { return true; }
+        bool sendFetchResponse(rune::replication::NodeId, const rune::replication::FetchResponseMsg&) override { return true; }
+    };
+};
+
+TEST_F(TransientOwnedPushRegression, OwnedSubscriptionPushesFromTheRingRegression) {
+    rune::storage::InMemoryLog mem(1u << 20, 1000);
+    constexpr int kN = 20;
+    for (int i = 0; i < kN; ++i) appendRing(mem, i);
+    NullT t;
+    rune::replication::PartitionReplica rep(leaderCfg(), rune::replication::Role::Leader, 1, {1}, {1}, &mem, &t);
+    rep.setRegistryHandle(3, 400);
+    rep.onLeaderLogAppended();
+    ASSERT_EQ(rep.highWatermark(), kN);
+
+    const std::string controlEp = freeEndpoint();
+    const char* control = controlEp.c_str();
+    WorkerEgress eg(aeron_, control, 3201);
+    ASSERT_TRUE(eg.resolved());
+    auto sub = resolveSub(control, freeEndpoint(), 3201);
+    ASSERT_NE(sub, nullptr);
+    ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
+
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(&eg);
+    w.setOwnedDirect(Worker::OwnedSet{&rep});
+    ASSERT_TRUE(w.tryEnqueueOp(ringSubscribeOp(1, &rep, 0)));
+    Collector c;
+    ASSERT_TRUE(waitFor([&]() {
+        w.doWork(1);
+        sub->poll(c.fa.handler(), 64);
+        return static_cast<int>(c.baseOffsets.size()) >= kN;
+    }, 10s)) << "a transient owned subscription pushed " << c.baseOffsets.size() << "/" << kN
+             << " (was: parked — no disk Log)";
+    for (int i = 0; i < kN; ++i) EXPECT_EQ(c.baseOffsets[i], i) << "out-of-order or gap at index " << i;
+    EXPECT_EQ(w.subscriptionsForTest()[0].nextOffset, kN);
+    EXPECT_EQ(w.transientCursorSkipsForTest(), 0u);
+}
+
+TEST_F(TransientOwnedPushRegression, EvictedCursorResumesAtTheRingStartRegression) {
+    rune::storage::InMemoryLog mem(8 * 1024, 1000);   // ~7 x 1 KiB batches fit: retention evicts
+    constexpr int kN = 20;
+    for (int i = 0; i < kN; ++i) appendRing(mem, i, 1000);
+    const int64_t start = mem.logStartOffset();
+    ASSERT_GT(start, 0) << "precondition: the ring evicted records";
+    NullT t;
+    rune::replication::PartitionReplica rep(leaderCfg(), rune::replication::Role::Leader, 1, {1}, {1}, &mem, &t);
+    rep.setRegistryHandle(3, 401);
+    rep.onLeaderLogAppended();
+    ASSERT_EQ(rep.highWatermark(), kN);
+
+    const std::string controlEp = freeEndpoint();
+    const char* control = controlEp.c_str();
+    WorkerEgress eg(aeron_, control, 3202);
+    ASSERT_TRUE(eg.resolved());
+    auto sub = resolveSub(control, freeEndpoint(), 3202);
+    ASSERT_NE(sub, nullptr);
+    ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
+
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(&eg);
+    w.setOwnedDirect(Worker::OwnedSet{&rep});
+    ASSERT_TRUE(w.tryEnqueueOp(ringSubscribeOp(1, &rep, /*from=*/0)));   // subscribed BELOW the ring start
+    Collector c;
+    ASSERT_TRUE(waitFor([&]() {
+        w.doWork(1);
+        sub->poll(c.fa.handler(), 64);
+        return !c.baseOffsets.empty() && c.baseOffsets.back() == kN - 1;
+    }, 10s)) << "a cursor below the ring start stalled (pushed " << c.baseOffsets.size() << ")";
+    ASSERT_FALSE(c.baseOffsets.empty());
+    EXPECT_EQ(c.baseOffsets.front(), start) << "resumed AT the ring start";
+    for (std::size_t i = 0; i < c.baseOffsets.size(); ++i) EXPECT_EQ(c.baseOffsets[i], start + static_cast<int64_t>(i));
+    // E2 final fix wave (M2): a subscription that STARTED below the ring start
+    // (its bind-time cursor) never fell behind — raised, not counted as lag.
+    // RED (before M2): counted as one skip of `start` evicted-unread records.
+    EXPECT_EQ(w.transientCursorSkipsForTest(), 0u) << "a fresh subscribe below the ring start counted as lag";
+    EXPECT_EQ(w.transientRecordsSkippedForTest(), 0u);
+    EXPECT_EQ(w.transientFreshCursorsRaisedForTest(), 1u) << "the fresh raise is counted once";
+}
+
+// E2 final fix wave (M2): a subscription that DELIVERED and then fell behind the
+// ring (the producer outran it and the ring evicted records it had not read)
+// is still counted and warned as evicted-unread records — only the fresh
+// bind-time cursor is exempt.
+TEST_F(TransientOwnedPushRegression, ASubscriptionThatDeliveredAndFellBehindIsCountedRegression) {
+    rune::storage::InMemoryLog mem(8 * 1024, 1000);   // ~7 x 1 KiB batches fit
+    for (int i = 0; i < 4; ++i) appendRing(mem, i, 1000);
+    ASSERT_EQ(mem.logStartOffset(), 0) << "precondition: nothing evicted yet";
+    NullT t;
+    rune::replication::PartitionReplica rep(leaderCfg(), rune::replication::Role::Leader, 1, {1}, {1}, &mem, &t);
+    rep.setRegistryHandle(3, 402);
+    rep.onLeaderLogAppended();
+
+    const std::string controlEp = freeEndpoint();
+    const char* control = controlEp.c_str();
+    WorkerEgress eg(aeron_, control, 3203);
+    ASSERT_TRUE(eg.resolved());
+    auto sub = resolveSub(control, freeEndpoint(), 3203);
+    ASSERT_NE(sub, nullptr);
+    ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
+
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(&eg);
+    w.setOwnedDirect(Worker::OwnedSet{&rep});
+    ASSERT_TRUE(w.tryEnqueueOp(ringSubscribeOp(1, &rep, /*from=*/0)));
+    Collector c;
+    ASSERT_TRUE(waitFor([&]() {
+        w.doWork(1);
+        sub->poll(c.fa.handler(), 64);
+        return c.baseOffsets.size() == 4u;
+    }, 10s)) << "delivered " << c.baseOffsets.size() << "/4";
+    ASSERT_EQ(w.subscriptionsForTest()[0].nextOffset, 4);
+
+    // The producer outruns the reader (no worker pass meanwhile): the ring evicts past its cursor.
+    for (int i = 4; i < 24; ++i) appendRing(mem, i, 1000);
+    rep.onLeaderLogAppended();
+    const int64_t start = mem.logStartOffset();
+    ASSERT_GT(start, 4) << "precondition: records the reader had not read were evicted";
+    ASSERT_TRUE(waitFor([&]() {
+        w.doWork(1);
+        sub->poll(c.fa.handler(), 64);
+        return !c.baseOffsets.empty() && c.baseOffsets.back() == 23;
+    }, 10s));
+    EXPECT_EQ(w.transientCursorSkipsForTest(), 1u) << "a reader that fell behind its ring was not counted";
+    EXPECT_EQ(w.transientRecordsSkippedForTest(), static_cast<uint64_t>(start - 4));
+    EXPECT_EQ(w.transientFreshCursorsRaisedForTest(), 0u);
+}
+
+TEST_F(TransientOwnedPushRegression, OwnershipMovedParksTheSubscriptionAndNeverReadsTheRingRegression) {
+    rune::storage::InMemoryLog mem(1u << 20, 1000);
+    int64_t next = 0;
+    for (int i = 0; i < 5; ++i) next = appendRing(mem, next);
+    NullT t;
+    rune::replication::PartitionReplica rep(leaderCfg(), rune::replication::Role::Leader, 1, {1}, {1}, &mem, &t);
+    rep.setRegistryHandle(3, 402);
+    rep.onLeaderLogAppended();
+
+    const std::string controlEp = freeEndpoint();
+    const char* control = controlEp.c_str();
+    WorkerEgress eg(aeron_, control, 3203);
+    ASSERT_TRUE(eg.resolved());
+    auto sub = resolveSub(control, freeEndpoint(), 3203);
+    ASSERT_NE(sub, nullptr);
+    ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
+
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(&eg);
+    w.setOwnedDirect(Worker::OwnedSet{&rep});
+    ASSERT_TRUE(w.tryEnqueueOp(ringSubscribeOp(1, &rep, 0)));
+    Collector c;
+    ASSERT_TRUE(waitFor([&]() { w.doWork(1); sub->poll(c.fa.handler(), 64); return c.baseOffsets.size() >= 5u; }, 10s));
+
+    WorkerOp away; away.type = WorkerOp::Type::SetOwnership;   // the partition moved to another worker
+    ASSERT_TRUE(w.tryEnqueueOp(std::move(away)));
+    w.doWork(2);
+    ASSERT_FALSE(w.subscriptionsForTest()[0].active) << "parked on ownership loss";
+    for (int i = 0; i < 5; ++i) next = appendRing(mem, next);   // the new owner's appends
+    rep.onLeaderLogAppended();
+    for (int i = 0; i < 100; ++i) { w.doWork(3); sub->poll(c.fa.handler(), 64); std::this_thread::sleep_for(1ms); }
+    EXPECT_EQ(c.baseOffsets.size(), 5u) << "pushed from a ring this worker no longer owns (a cross-thread read)";
+    EXPECT_EQ(w.subscriptionsForTest()[0].nextOffset, 5);
+
+    WorkerOp back; back.type = WorkerOp::Type::SetOwnership; back.ownedSet = {&rep};   // handed back
+    ASSERT_TRUE(w.tryEnqueueOp(std::move(back)));
+    ASSERT_TRUE(waitFor([&]() { w.doWork(4); sub->poll(c.fa.handler(), 64); return c.baseOffsets.size() >= 10u; }, 10s))
+        << "the re-granted subscription never resumed";
+    for (std::size_t i = 0; i < c.baseOffsets.size(); ++i) EXPECT_EQ(c.baseOffsets[i], static_cast<int64_t>(i));
+}
+
+
+} // namespace

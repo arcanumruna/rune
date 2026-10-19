@@ -1,0 +1,8 @@
+steps:
+  coverage:
+    image: rune-cpp-build:latest
+    commands:
+      - cmake . -B cov -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON -DENABLE_COVERAGE=ON -DCMAKE_TOOLCHAIN_FILE=build/Debug/generators/conan_toolchain.cmake -DCMAKE_PREFIX_PATH="$PWD/build/Debug/generators"
+      - cmake --build cov -j
+      - cd cov && ctest --output-on-failure
+      - gcovr -r .. --fail-under-line 90

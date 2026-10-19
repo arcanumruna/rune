@@ -1,0 +1,42 @@
+# Keep build context small — exclude everything that is not needed to build
+# the rune_broker binary.
+
+# Build outputs
+build/
+cov/
+cmake-build-debug/
+cmake-build-release/
+build-*/
+
+# e2e scratch (docker/view-engine-e2e.sh race barrier dir)
+.ddl-race.*/
+
+# Version control
+.git/
+.gitignore
+
+# Superpowers / internal docs
+.superpowers/
+
+# Test artifacts
+tests/
+benchmark/
+bench/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# CI (not needed inside the container)
+.woodpecker/
+
+# Docs (not needed in builder)
+docs/
+README.md
+CLAUDE.md
+
+# Scripts that drive docker (not needed inside)
+build_docker.sh

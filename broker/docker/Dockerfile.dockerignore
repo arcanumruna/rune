@@ -1,0 +1,56 @@
+# Keep build context small — exclude everything that is not needed to build
+# the rune_broker binary.
+
+# Build outputs
+build/
+cov/
+cmake-build-debug/
+cmake-build-release/
+build-*/
+cmake-build-*/
+
+# Version control
+.git/
+.gitignore
+
+# Superpowers / internal docs
+.superpowers/
+
+# Test artifacts
+tests/
+benchmark/
+bench/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# CI (not needed inside the container)
+.woodpecker/
+
+# Docs (not needed in builder)
+docs/
+README.md
+CLAUDE.md
+
+# Scripts that drive docker (not needed inside)
+build_docker.sh
+
+# Cluster keys / generated passwords of the authentication e2e (never baked into an image)
+docker/secrets/
+docker/.auth.*/
+
+# Launchers, compose files, docs of the e2e: they drive docker from outside and are not needed inside the build
+# (keeping them out of the context keeps the compiled layers cached when only a launcher changes)
+docker/*.sh
+!docker/entrypoint.sh
+docker/lib/
+docker/topics/
+docker/*.yml
+docker/README.md
+docker/rune-cluster.env.example
+docker/ping-probe
+dr-e2e/

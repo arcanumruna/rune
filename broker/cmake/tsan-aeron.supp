@@ -1,0 +1,53 @@
+# ThreadSanitizer suppressions for vendored Aeron client internals.
+#
+# Aeron's media-driver conductor thread and the application poll thread
+# communicate through lock-free ring buffers / log buffers using CPU
+# memory-ordering fences (Atomic64_*.h, AtomicBuffer volatile accessors).
+# TSan cannot see Aeron's hardware-fence-based happens-before edges, so it
+# reports these cross-thread accesses as data races even though they are
+# correct by Aeron's C++ memory model. These races live entirely inside the
+# vendored `aeron::` library (Image poll / TermReader / AtomicBuffer wrap /
+# CopyBroadcastReceiver image creation) and are NOT fixable in rune code.
+#
+# Scope: only the aeron::concurrent / aeron::Image internal accessors below.
+# rune's own replication/HW/log state is NOT suppressed — a real rune-side
+# race will still fail the build.
+
+# AtomicBuffer wrap/capacity/volatile reads during Subscription/Image::poll.
+race:aeron::concurrent::AtomicBuffer::wrap
+race:aeron::concurrent::AtomicBuffer::capacity
+race:aeron::concurrent::AtomicBuffer::getInt32Volatile
+
+# Ordered stores/loads on Aeron's log-buffer metadata (fence-based ordering).
+race:aeron::concurrent::atomic::putInt64Ordered
+race:aeron::concurrent::atomic::putInt32Ordered
+
+# Image::isClosed() atomic bool load racing the conductor's Image construction.
+race:aeron::Image::isClosed
+race:aeron::Image::poll
+
+# Term reader / header buffer wrap while the conductor rotates term buffers.
+race:aeron::concurrent::logbuffer::TermReader::read
+race:aeron::concurrent::logbuffer::Header::buffer
+race:aeron::concurrent::logbuffer::FrameDescriptor::frameLengthVolatile
+
+# HeaderWriter / ExclusivePublication claim path (client publish vs conductor).
+race:aeron::concurrent::logbuffer::HeaderWriter::write
+race:aeron::ExclusivePublication::tryClaim
+race:aeron::ExclusivePublication::newPosition
+
+# Broadcast receiver image-created callback (conductor publishes new Image).
+race:aeron::concurrent::broadcast::CopyBroadcastReceiver::receive
+
+# Subscription image array: the conductor publishes a new array through
+# AtomicArrayUpdater (a seqlock whose ordering comes from STANDALONE acquire/
+# release fences, which TSan does not model); the polling thread reads it in
+# Subscription::poll / imageCount / imageBySessionId.  Aeron-internal.
+race:aeron::util::addToArray
+race:aeron::util::removeFromArray
+# Reader side of the same seqlock: Subscription::imageBySessionId copies a
+# shared_ptr<Image> out of the conductor-published image array (refcount bump
+# racing the conductor's Image construction) — Aeron-owned memory only; rune
+# calls the public single-poller API from the subscription's own poll thread
+# (ImageLossWatch::afterPoll).  F27 re-review: confirmed Aeron-internal.
+race:aeron::Subscription::imageBySessionId

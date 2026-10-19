@@ -1,0 +1,40 @@
+# docker-compose.auth.yml — the 3-node authentication cluster of docker/auth-e2e.sh (overlay on docker-compose.yml).
+#
+#   docker compose -p rune-auth-e2e -f docker/docker-compose.yml -f docker/docker-compose.auth.yml up -d rune-1 rune-2 rune-3
+#
+# The base file already mounts ${RUNE_SECRETS_DIR}/cluster.key read-only at /run/secrets/cluster.key and points
+# RUNE_CLUSTER_KEY_FILE at it.  This overlay adds what the cluster-key ROTATION needs (spec §8: three rolling
+# steps, every node restarted with a different key pair each time): the whole secrets directory is mounted at
+# /run/keys, and each node reads its CURRENT / NEXT key from per-node variables —
+#   RUNE_KEY_CUR_<n>   path of node n's current key  (default: the base mount, /run/secrets/cluster.key)
+#   RUNE_KEY_NEXT_<n>  path of node n's next key     (default: none — RUNE_CLUSTER_KEY_FILE_NEXT is empty = unset)
+# e.g. step 1 of the rotation recreates rune-1 with RUNE_KEY_NEXT_1=/run/keys/cluster.next.key.
+# A recreate keeps the node's named volume (its log, its storage identity and its __security state).
+
+x-key-volume: &key-volume
+  type: bind
+  source: ${RUNE_SECRETS_DIR:?RUNE_SECRETS_DIR must name the directory holding cluster.key}
+  target: /run/keys
+  read_only: true
+  bind:
+    create_host_path: false
+
+services:
+  rune-1:
+    environment:
+      RUNE_CLUSTER_KEY_FILE: "${RUNE_KEY_CUR_1:-/run/secrets/cluster.key}"
+      RUNE_CLUSTER_KEY_FILE_NEXT: "${RUNE_KEY_NEXT_1:-}"
+    volumes:
+      - *key-volume
+  rune-2:
+    environment:
+      RUNE_CLUSTER_KEY_FILE: "${RUNE_KEY_CUR_2:-/run/secrets/cluster.key}"
+      RUNE_CLUSTER_KEY_FILE_NEXT: "${RUNE_KEY_NEXT_2:-}"
+    volumes:
+      - *key-volume
+  rune-3:
+    environment:
+      RUNE_CLUSTER_KEY_FILE: "${RUNE_KEY_CUR_3:-/run/secrets/cluster.key}"
+      RUNE_CLUSTER_KEY_FILE_NEXT: "${RUNE_KEY_NEXT_3:-}"
+    volumes:
+      - *key-volume

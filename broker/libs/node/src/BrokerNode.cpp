@@ -1,0 +1,6013 @@
+#include <rune/node/BrokerNode.h>
+#include <rune/node/CatalogHaltPolicy.h>
+#include <rune/catalog/TopicName.h>
+#include <rune/node/CatalogCheckpoint.h>
+#include <rune/node/HostDefaults.h>
+#include <rune/node/ThreadAffinity.h>
+#include <rune/node/TlsStartupPolicy.h>
+#include <rune/replication/ReplicationFrameLimits.h>
+#include <rune/node/WorkerOp.h>
+#include <rune/node/RoleCounter.h>
+
+#include <spdlog/spdlog.h>
+
+#include <algorithm>
+#include <cassert>
+#include <chrono>
+#include <filesystem>
+#include <optional>
+#include <set>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <random>
+#include <thread>
+#include <unordered_map>
+#include <vector>
+
+// CG-6 wiring: storage + replication headers for __consumer_offsets.
+#include <rune/replication/PartitionReplica.h>
+#include <rune/storage/Log.h>
+#include <rune/storage/InMemoryLog.h>
+// TX-3 wiring: transaction coordination service + replicated state store.
+#include <rune/node/TransactionCoordinationService.h>
+#include <rune/transaction/ReplicatedTxnStateStore.h>
+// MD1 Task 4: MetadataService for __cluster_metadata.
+#include <rune/node/MetadataService.h>
+// Task 6 / 16: AdminWorker + SchemaRegistry (the CatalogApplier's projection of __catalog).
+#include <rune/node/AdminWorker.h>
+#include <rune/node/SchemaRegistry.h>
+#include <rune/node/CatalogEffectFrames.h>
+#include <rune/gateway/TopicDirMarker.h>
+#include <rune/node/TopicDirReconcile.h>
+#include <rune/node/FdBudget.h>
+#include <rune/codec/Serialize.h>
+#include <rune/view/ViewPlan.h>   // Task 20: deserializeCompiledViewPlan (view->source co-location)
+// Task 6: RecordBatch reader for rebuildFromLog (same as TxnStateStore).
+#include <rune/protocol/RecordBatch.h>
+// Task 8a: protocol response frames for DDL egress (respondDefine/respondGet).
+#include <rune/protocol/client/SchemaMessages.h>
+#include <rune/protocol/client/DataMessages.h>
+#include <concurrent/logbuffer/FrameDescriptor.h>
+#include <cstdlib>
+#include <cstdio>
+#include <fcntl.h>
+#include <unistd.h>
+#include <cstring>
+
+// Task 13 fix round 3 (re-review 2, finding 2): every shard worker has a bit in
+// the gateway's per-session held mask (G-A6 pause on the gateway-routed path).
+static_assert(rune::node::NodeConfig::kMaxShardWorkers <= rune::gateway::ClientGateway::kMaxHeldMaskWorkers,
+              "shard worker cap must fit the gateway's held-by-worker mask");
+
+namespace fs = std::filesystem;
+using namespace rune::consensus;
+
+namespace rune::node {
+
+// ---------------------------------------------------------------------------
+// Timing constants — used ONLY for single-node (BR-2) path where NodeConfig
+// fields are not yet wired. Multi-node path reads from config_.
+// ---------------------------------------------------------------------------
+static constexpr int kIngressCapacity = 64 * 1024; //  64 KiB
+/// Combined fix program M13 (X102): permission bits of every `__security` segment / index / checkpoint file.
+static constexpr unsigned kSecurityFileMode = 0600;
+
+// ---------------------------------------------------------------------------
+// Max produce-batch derivation (F3 rounds 4-5) — see BrokerNode.h.  Every
+// limit CALLS the transport's/ring's own function; no hand arithmetic here.
+// ---------------------------------------------------------------------------
+namespace {
+
+// Controlled shutdown (review M1): a random, non-zero 64-bit identity of THIS
+// process — compared by identity, so a restart with a wiped data dir (whose
+// incarnation counter restarts low) is still a new process.  Cold (once).
+int64_t processNonce() { return ControlledShutdown::freshNonce(); }
+// Leader-epoch restart fence for a MEMORY-backed replica (disk-backed ones keep
+// it next to their log): <dataDir>/memory-epoch-fence/<topicId>-<partition>.state/.
+// The records do not survive a restart, but the epochs this node led at must
+// (a restarted leader must never lead again at one of them).  Cold.
+void setMemoryEpochFence(rune::replication::PartitionReplica& r, const std::string& dataDir,
+                         int32_t topicId, int32_t partition) {
+    if (dataDir.empty()) return;
+    const std::string dir = dataDir + "/memory-epoch-fence";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec) return;
+    // D15 review m5: written by the owning worker's async epoch-state writer
+    // (leader-epoch-state in <t>-<p>.state/), like a disk replica's; the
+    // pre-D15 plain fence file <t>-<p> is migrated into it.
+    const std::string base = dir + "/" + std::to_string(topicId) + "-" + std::to_string(partition);
+    r.setMemoryEpochStateDir(base + ".state", base);
+}
+// Task 10 (spec §3.1) + F30: the ONE place a newly built replica's disk
+// durability policy is set — boot (buildReplication) and runtime-created
+// topics (createRuntimeUserReplicas) alike, in shard AND thread placement.
+// User replicas (topicId >= 0) are always driven by a worker (the pool always
+// exists, >= 1 worker), which submits the follower flush, txn-marker / leader
+// append flushes and deferred roll seals to its io backend — never an inline
+// fsync on the worker.  Internal partitions (topicId < 0) run on the control
+// thread, which services neither flush requests nor pending seals: they keep
+// the inline path.
+// hotpath-A F2: a worker-driven disk log is also PROVISIONED — the
+// SegmentProvisionerAgent keeps its ready segments; a roll never creates one
+// on the worker (it is deferred and the intake back-pressures instead).
+void applyWorkerDrivenDurability(rune::replication::PartitionReplica& replica, int32_t topicId,
+                                 rune::storage::ProvisionChannel* provision, int thresholdPct) noexcept {
+    if (topicId < 0) return;
+    replica.setExternalFollowerFlush(true);
+    if (provision != nullptr && replica.isDiskBacked() && replica.log() != nullptr)
+        replica.log()->setProvisioning(provision, thresholdPct);
+}
+
+// Catalog history Task 17 (C1): the shard router of a topic list -- grouped topics map to the key that is a PURE
+// function of their group NAME (coPartitionGroupKey), so every broker agrees however its boot set differs.
+rune::metadata::ShardRouter shardRouterFor(int32_t workerCount, std::span<const TopicSpec> topics) {
+    rune::metadata::ShardRouter r(workerCount);
+    for (const TopicSpec& ts : topics)
+        if (!ts.coPartitionGroup.empty())
+            r.mapTopicToGroupKey(ts.topicId, rune::metadata::coPartitionGroupKey(ts.coPartitionGroup));
+    return r;
+}
+
+int32_t clampI32(int64_t v) noexcept {
+    if (v < 0) return 0;
+    if (v > INT32_MAX) return INT32_MAX;
+    return static_cast<int32_t>(v);
+}
+} // namespace
+
+// Integration wave 2 (F3 ⇄ F18 ⇄ F15 S3 ⇄ F19): F3's derivation helpers are
+// thin views of THE formula (Worker::maxAcceptableBatchBytes, via
+// NodeConfig::batchLimitFormula / produceIntakeLimit) and of its components,
+// built on the SAME primitives (Worker::maxOpTailBytesFor = op ring term;
+// ReplicationFrameLimits.h = replication terms; Worker::kProduceFrameFixedBytes
+// = client ingress term) — no second formula.
+std::size_t workerIngressMaxBatchBytes(const NodeConfig& config) noexcept {
+    return Worker::maxOpTailBytesFor(static_cast<std::size_t>(
+        config.workerIngressRingBytes > 0 ? config.workerIngressRingBytes : 0));
+}
+
+int32_t aeronIngressMaxBatchBytes(const NodeConfig& config) noexcept {
+    if (config.aeronTermBufferBytes <= 0) return 0;
+    const int64_t maxMsg = rune::replication::aeronMaxMessageLength(config.aeronTermBufferBytes);
+    return clampI32(maxMsg - static_cast<int64_t>(Worker::kProduceFrameFixedBytes));
+}
+
+int32_t ingressHardTransportMaxBytes(const NodeConfig& config) noexcept {
+    return clampI32(std::min<int64_t>(
+        static_cast<int64_t>(workerIngressMaxBatchBytes(config)),
+        static_cast<int64_t>(aeronIngressMaxBatchBytes(config))));
+}
+
+int32_t replicationHardTransportMaxBytes(const NodeConfig& config) noexcept {
+    // Both replication transport kinds: the legacy ring + publication path and
+    // the per-worker publication path (F18's frame limits, one source of truth).
+    namespace rr = rune::replication;
+    return clampI32(std::min(rr::maxFetchRecordsViaOutboundRing(config.replicationOutboundRingBytes),
+                             rr::maxFetchRecordsViaPublication(config.aeronTermBufferBytes)));
+}
+
+int32_t userTopicMaxFetchBytes(const NodeConfig& config) noexcept {
+    // A follower's FetchResponse records for a USER partition are forwarded
+    // to the owning worker through its ingress ring (ApplyReplicated) on the
+    // legacy transport — so a fetch/push chunk must never exceed what that
+    // ring can carry.  Unchanged (1 MiB) for the default 32 MiB ring.
+    //
+    // F3 round 6, item 1: multi-node also bounds it by the replication hard
+    // max — a coalesced push larger than what the transport carries is
+    // dropped, stalling acks=all for the 20 ms re-serve.  (PartitionReplica
+    // additionally caps each push at the transport's frame, F18 m-3.)
+    int64_t cap = std::min<int64_t>(rune::replication::kDefaultMaxFetchBytes,
+                                    static_cast<int64_t>(workerIngressMaxBatchBytes(config)));
+    if (!config.isSingleNode())
+        cap = std::min<int64_t>(cap, replicationHardTransportMaxBytes(config));
+    return clampI32(cap);
+}
+
+std::size_t configuredMaxProduceBatchBytes(const NodeConfig& config) noexcept {
+    if (config.maxProduceBatchBytes && *config.maxProduceBatchBytes > 0) {
+        return static_cast<std::size_t>(*config.maxProduceBatchBytes);
+    }
+    return rune::gateway::ClientGateway::kMaxProduceBatchBytes;
+}
+
+std::size_t effectiveMaxProduceBatchBytes(const NodeConfig& config) noexcept {
+    return static_cast<std::size_t>(config.produceIntakeLimit());
+}
+
+std::optional<std::string> validateEffectiveMaxProduceBatch(const NodeConfig& config) {
+    const std::size_t eff = effectiveMaxProduceBatchBytes(config);
+    if (eff >= kMinSaneMaxProduceBatchBytes) return std::nullopt;
+    return "effective max produce batch is " + std::to_string(eff) + " bytes (configured=" +
+           std::to_string(configuredMaxProduceBatchBytes(config)) + ", formula=" +
+           std::to_string(config.batchLimitFormula()) + ", workerIngress=" +
+           std::to_string(workerIngressMaxBatchBytes(config)) + ", aeronIngress=" +
+           std::to_string(aeronIngressMaxBatchBytes(config)) + ", replication=" +
+           std::to_string(replicationHardTransportMaxBytes(config)) +
+           ") — below the minimum of " + std::to_string(kMinSaneMaxProduceBatchBytes) +
+           " bytes needed to carry even one record.  Raise workerIngressRingBytes / "
+           "workerReturnRingBytes / replicationOutboundRingBytes / aeronTermBufferBytes "
+           "(or RUNE_MAX_PRODUCE_BATCH_BYTES).";
+}
+
+std::optional<std::string> validateExplicitMaxProduceBatch(const NodeConfig& config) {
+    // The default (unset) config always passes: there is nothing to refuse —
+    // the effective value is the formula (never a promise that was broken,
+    // since none was explicitly made).
+    if (!config.maxProduceBatchBytes || *config.maxProduceBatchBytes <= 0) {
+        return std::nullopt;
+    }
+    const std::size_t explicitBytes = static_cast<std::size_t>(*config.maxProduceBatchBytes);
+    const std::size_t hardMax = config.batchLimitFormula();
+    if (explicitBytes > hardMax) {
+        return "explicit max produce batch config (RUNE_MAX_PRODUCE_BATCH_BYTES=" +
+               std::to_string(explicitBytes) + " bytes) exceeds the broker's batch limit (" +
+               std::to_string(hardMax) + " bytes = min(8 MiB, every ring / Aeron frame a batch "
+               "crosses)) — such a batch could never be ingested, replicated or pushed.  Raise "
+               "workerIngressRingBytes/workerReturnRingBytes/replicationOutboundRingBytes/"
+               "aeronTermBufferBytes so the limit covers the requested max batch size, or "
+               "lower RUNE_MAX_PRODUCE_BATCH_BYTES.";
+    }
+    return std::nullopt;
+}
+
+// ---------------------------------------------------------------------------
+// BrokerNode::BrokerNode
+// ---------------------------------------------------------------------------
+BrokerNode::BrokerNode(NodeConfig config)
+    : config_{std::move(config)}
+{}
+
+// ---------------------------------------------------------------------------
+// BrokerNode::~BrokerNode
+// ---------------------------------------------------------------------------
+BrokerNode::~BrokerNode() {
+    stop();
+}
+
+// ---------------------------------------------------------------------------
+// BrokerNode::start
+// ---------------------------------------------------------------------------
+namespace {
+/// A backoff idle of the given shape (D2 round 2: control-plane threads).
+std::unique_ptr<rune::consensus::BackoffIdleStrategy> makeShapedBackoff(const NodeConfig::BackoffShape& s) {
+    return std::make_unique<rune::consensus::BackoffIdleStrategy>(
+        s.spins, s.yields, std::chrono::nanoseconds{s.minParkNs}, std::chrono::nanoseconds{s.maxParkNs});
+}
+} // namespace
+
+void BrokerNode::start() {
+    if (started_) return; // idempotent (controller-owned flag, F9a)
+    started_ = true;
+    // F9a fix round 1: the thread that starts the node is the ONE leadership
+    // observer (isLeader/leaderId/... drain the ring; others are refused).
+    // Bound before the control thread exists (ordered by its start).
+    leaderObserver_.bindObserver();
+
+    // 2026-10-02: the findings §4 config is the DEFAULT, derived from the host —
+    // Aeron mtu / socket buffer / window, shard base ports, worker affinity.
+    // Explicit values win; resolved ONCE here (before any reader) and logged in
+    // one line.  The line is emitted at WARN so it is visible in perf runs too
+    // (RUNE_LOG_LEVEL=warn) — it proves which config a measurement ran.
+    {
+        auto facts = probeHostNetFacts(nodeEndpointHosts(config_), config_.effectiveAeronDir());
+        if (hostFactsOverrideForTest_) hostFactsOverrideForTest_(facts);   // B-M5 test seam (cold)
+        const char* io   = std::getenv(kIoBackendEnv);
+        const auto hd    = applyHostDerivedDefaults(config_, facts,
+                                                    (io && *io) ? std::string_view(io) : std::string_view("auto"));
+        spdlog::warn("BrokerNode[{}]: effective config: {}", config_.nodeId, hd.summary);
+        if (!hd.warnings.empty())
+            spdlog::warn("BrokerNode[{}]: !!! TRANSPORT CONFIG WARNING: {}", config_.nodeId, hd.warnings);
+        // Review B-I2: the link-MTU watchdog's probe host — the first endpoint datagrams leave through a real
+        // interface for (non-loopback); the wildcard maps to the default route in probeInterfaceMtu.  Computed
+        // once (no allocation on the periodic probe).
+        mtuProbeDesc_.clear();
+        for (const auto& h : nodeEndpointHosts(config_))
+            if (!isLoopbackHost(h)) { mtuProbeDesc_ = h; break; }
+    }
+
+    // Spec §3.3: shard-mode misconfiguration is a HARD startup refusal, before any
+    // side effect (no dataDir, no driver, no ports).
+    // The Aeron dir is deleted recursively by the embedded driver: refuse one that
+    // equals/contains the data dir (covers programmatic configs that bypass the env
+    // parser).
+    if (auto err = config_.validateAeronDir(); err.has_value()) {
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) +
+                                 "]: refusing to start — " + *err);
+    }
+    if (auto err = config_.validateShardConfig(); err.has_value()) {
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) +
+                                 "]: refusing to start — " + *err);
+    }
+    // Catalog history Task 6: the __catalog plane's stream (programmatic configs
+    // bypass parseNodeConfig's check).
+    if (auto err = config_.validateCatalogStream(); err.has_value()) {
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) +
+                                 "]: refusing to start — " + *err);
+    }
+    // Authentication Task 9 (D31/D32): dev mode is single-node only; an enabled broker needs its cluster key file
+    // (programmatic configs bypass parseNodeConfig's check; the file itself is read here, on the startup thread).
+    if (auto err = config_.validateAuth(&clusterKeys_); err.has_value()) {
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) +
+                                 "]: refusing to start — " + *err);
+    }
+    if (config_.testAfterAuthValidation) config_.testAfterAuthValidation();
+    // F15 S3 (design note §6, review S3 I-1): a worker return-ring claim
+    // exception is an invariant-violation halt, so the return ring size is a
+    // correctness setting — its max message must hold the largest batch any
+    // intake path can store (and a full PushRead chunk), else a legal batch
+    // halts the broker on every restart.  Also the owed-return cap range.
+    if (auto err = Worker::validateRingConfig(
+            static_cast<std::size_t>(config_.workerReturnRingBytes),
+            static_cast<std::size_t>(config_.workerIngressRingBytes), config_.workerMaxOwedReturns);
+        err.has_value()) {
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) +
+                                 "]: refusing to start — " + *err);
+    }
+
+    // F3 round 4 (corrects round 3): refuse to start ONLY if the operator
+    // EXPLICITLY configured a max produce batch (RUNE_MAX_PRODUCE_BATCH_BYTES)
+    // that exceeds what the transport can ever carry.  The default (unset)
+    // config always passes this check by construction — see
+    // validateExplicitMaxProduceBatch()'s doc comment — because the gateway's
+    // EFFECTIVE max batch (installed on gateway_ below, once constructed) is
+    // always safely derived down to whatever the transport can actually
+    // carry, so an oversize-vs-transport batch is simply never ACCEPTED by
+    // the gateway in the first place (MessageTooLarge), rather than being
+    // accepted and then permanently unfetchable.  Same hard-refusal-before-
+    // any-side-effect pattern as the shard-config check above.
+    if (auto err = validateExplicitMaxProduceBatch(config_); err.has_value()) {
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) +
+                                 "]: refusing to start — " + *err);
+    }
+    // F3 round 5, item M3: an effective max too small to carry one record is a
+    // misconfiguration — refuse loudly (never silently fall back to 8 MiB).
+    if (auto err = validateEffectiveMaxProduceBatch(config_); err.has_value()) {
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) +
+                                 "]: refusing to start — " + *err);
+    }
+
+    // D2: every thread start() creates inherits THIS thread's mask — pin it to the non-worker CPUs for the
+    // rest of start() (node driver thread, Aeron conductor, runtime / admin / cleaner runners, flushers);
+    // workers re-pin to their own core on their first pass.  The caller's mask is restored on return.
+    // Empty set (unpinned workers, or no CPU outside them — warned in the effective-config line) = unchanged.
+    ScopedThreadAffinity nonWorkerAffinity(config_.nonWorkerCpus);
+    if (nonWorkerAffinity.result() > 0 && nonWorkerAffinity.result() != ENOTSUP)
+        spdlog::warn("BrokerNode[{}]: pinning the non-worker threads refused (errno={}) — they keep the "
+                     "inherited affinity and may preempt the workers", config_.nodeId, nonWorkerAffinity.result());
+
+    using sclock = std::chrono::steady_clock;
+    const auto t0 = sclock::now();
+
+    // 1. Create dataDir if missing.
+    fs::path dataDir{config_.dataDir};
+    std::error_code ec;
+    fs::create_directories(dataDir, ec);
+    if (ec) {
+        throw std::runtime_error("BrokerNode: cannot create dataDir '" +
+                                 config_.dataDir + "': " + ec.message());
+    }
+    // 1a. ISR design v3 §3.2 (Step 5): the storage identity.  NOTHING writes into dataDir before this line
+    //     (an empty dir that refuses must stay empty).  Throws StorageRefusal (main: exit 78).
+    storage_ = StorageIdentity::resolve(config_.dataDir, config_.storageFormat, config_.peers.size() <= 1, config_.nodeId);
+    spdlog::info("storage: dataDir={} storageId={} origin={} state=CONFIRMED", config_.dataDir,
+                 StorageIdentity::idHex(storage_.id), StorageIdentity::originName(storage_.origin));
+    // The embedded driver creates (and deletes) the Aeron dir itself but not its
+    // parents: a RUNE_AERON_DIR under a not-yet-existing parent fails driver init
+    // with a bare EINVAL.  Create the parent chain up front.
+    if (const fs::path aeronParent = fs::path{config_.effectiveAeronDir()}.parent_path();
+        !aeronParent.empty()) {
+        fs::create_directories(aeronParent, ec);
+        if (ec) {
+            throw std::runtime_error("BrokerNode: cannot create parent of aeronDir '" +
+                                     config_.effectiveAeronDir() + "': " + ec.message());
+        }
+    }
+
+    // 1b. Catalog history Task 16 (spec §3, §5.3): the broker BOOTS FROM __catalog.
+    //     bootFromCatalog_ opens the local __catalog log, runs the ONE boot replay
+    //     of its checkpointed prefix HERE, on the startup thread, before any boot
+    //     builder (F4), and leaves bootTopics_ (the catalog's live topics and view
+    //     sinks, in topic-id order), bootDroppedIds_ and the
+    //     booted applier.  Everything below — the TopicRegistry, replication, the
+    //     worker placement, the MetadataService — is built from bootTopics_, so it
+    //     sees every topic exactly as the catalog says.  The retired
+    //     __topic_schemas / __views dirs are never read (no migration).
+    bootFromCatalog_();
+    //     Authentication Task 9: the same for `__security` - its local prefix replays once, on this thread, and the
+    //     booted state is handed to the control thread's SecurityView before any thread runs.
+    bootFromSecurity_();
+
+    // FD-1 (F6): raise the soft open-file limit to the hard limit (logged) and refuse to start when the hard
+    // limit cannot hold the catalog's partitions — topics exist only through DDL, so the budget is the topics
+    // the boot replay produced (a mid-run EMFILE would fail-stop logs and halt the broker).
+    {
+        std::string fdErr;
+        uint64_t need = 0;
+        const bool fdOk = applyFdLimitAtStartup(config_, bootTopics_, fdErr, &need);
+        fdNeedAtBoot_ = need;                       // the budget actually applied (no second estimate)
+        if (!fdOk) {
+            spdlog::error("BrokerNode[{}]: {}", config_.nodeId, fdErr);
+            throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: " + fdErr);
+        }
+    }
+
+    // 2. Build the TopicRegistry (after dataDir creation, before the gateway).
+    //    recover() is called for each Log in the ctor so restart resumes at LEO.
+    //    Logs are single-writer: only the AgentRunner duty-cycle thread appends/reads.
+    topicRegistry_ = std::make_unique<rune::gateway::TopicRegistry>(
+        std::vector<TopicSpec>{}, config_.dataDir);
+    // Task 16: the catalog's live topics at THEIR ids, then a Dropped slot for
+    // every id the catalog dropped — including ids this broker never built (a
+    // dropped topic never serves again, and its id is never refilled).
+    // Fix round 1 (R1.4): a topic whose dir belongs to another incarnation is not built (the registry refuses
+    // it).  On a HALTED boot that is logged and the topic stays unbuilt (the broker keeps serving the rest);
+    // otherwise the boot refuses to start.
+    std::vector<int32_t> unbuilt;
+    for (const TopicSpec& t : bootTopics_) {
+        if (topicRegistry_->createTopicAt(t.topicId, t) >= 0) continue;
+        // Fix round 2 (F1): a boot whose dirs step 0 did NOT settle (halted, or the reconcile deferred) never turns
+        // a marker mismatch into a refusal to start: the topic stays unbuilt, never opened over the wrong dir.
+        const bool untrustedPrefix = (bootApplier_ && bootApplier_->halted()) || bootReconcileDeferred_;
+        if (untrustedPrefix) {
+            spdlog::critical("BrokerNode[{}]: catalog topic '{}' (id {}) not built at boot — its dir belongs to another "
+                             "incarnation and the local catalog is {} (see the TopicRegistry error above); the topic "
+                             "is not served by this broker until the catalog settles", config_.nodeId, t.name,
+                             t.topicId, bootApplier_ && bootApplier_->halted() ? "halted" : "still catching up");
+            unbuilt.push_back(t.topicId);
+            continue;
+        }
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: the catalog topic '" +
+                                 t.name + "' (id " + std::to_string(t.topicId) +
+                                 ") could not be built at boot — refusing to start");
+    }
+    std::erase_if(bootTopics_, [&](const TopicSpec& t) {
+        return std::find(unbuilt.begin(), unbuilt.end(), t.topicId) != unbuilt.end();
+    });
+    for (const int32_t id : bootDroppedIds_) (void)topicRegistry_->dropTopic(id);
+    topicsAtReplicationBuild_.clear();
+    for (int32_t id = 0; id < topicRegistry_->topicCount(); ++id)
+        if (topicRegistry_->state(id) == rune::gateway::TopicRegistry::TopicState::Serving)
+            topicsAtReplicationBuild_.push_back(id);
+
+    // 2b. DR-15 fix round 1: the cold peer-hostname resolver.  No duty thread
+    //     (worker / runtime / driver conductor) ever calls getaddrinfo for a
+    //     peer: every embedded driver answers the managed peer hosts from a
+    //     cache this hub feeds over rings, and every owner of a peer
+    //     publication re-adds an unresolved peer on its host's resolution
+    //     event.  One blocking pass here (startup thread, before any driver),
+    //     the hub thread starts at the end of start().
+    //     Single-node too (fix round 2): clients' reply hostnames resolve here.
+    {
+        std::vector<std::string> hosts;
+        if (!config_.isSingleNode())
+            for (const auto& peer : config_.peers) hosts.push_back(peer.host);
+        resolverHub_ = std::make_unique<PeerResolverHub>(hosts, resolveFnForTest_);
+        resolverHub_->resolveAllNow();
+        // Re-check I1: the link-MTU watchdog's target is resolved on the hub's cold thread (first time here, on the
+        // startup thread) — the control thread never resolves a name nor allocates for it.
+        if (!mtuProbeDesc_.empty()) {
+            mtuProbeRing_ = resolverHub_->subscribeMtuProbe(mtuProbeDesc_);
+            mtuProbeFd_   = ::socket(AF_INET, SOCK_DGRAM, 0);
+        }
+    }
+
+    // 3. Start embedded Aeron media driver.
+    startEmbeddedDriver();
+    const auto t1 = sclock::now();
+
+    // 4. Connect Aeron client — must point at the same dir as the driver.
+    {
+        const std::string aeronDir =
+            config_.effectiveAeronDir();
+        aeron::Context ctx;
+        ctx.aeronDir(aeronDir);
+        ctx.mediaDriverTimeout(config_.inProcessDriverTimeoutMs());   // in-process driver: survive own stalls
+        // Spec §3.2 fused placement: the runtime client has no conductor thread
+        // either — its conductor runs in worker 0's pass (during start(): in the
+        // interim pump runner below).
+        ctx.useConductorAgentInvoker(config_.fused());
+        aeron_ = aeron::Aeron::connect(ctx);
+        if (!aeron_) {
+            throw std::runtime_error("BrokerNode: failed to connect Aeron client");
+        }
+        // Fused: the runtime's invoker driver + conductor are serviced by an
+        // interim pump runner from HERE until worker 0 takes them over (step
+        // 7b) — every startup phase, however long, keeps them live (time-
+        // independent: no phase may out-last the client liveness timeout).
+        // Startup resolves on aeron_ then use the default sleep-poll pump,
+        // exactly as with thread placement's driver/conductor threads.
+        if (config_.fused()) {
+            startupPumpAgent_  = std::make_unique<DriverPumpAgent>(*nodeDriver_, *aeron_);
+            startupPumpIdle_   = makeBackoffIdle(config_.idleMaxParkUs);
+            startupPumpRunner_ = std::make_unique<rune::consensus::AgentRunner>(
+                *startupPumpAgent_, *startupPumpIdle_, clock_);
+            startupPumpRunner_->start();
+        }
+
+        // Allocate the Aeron node-role counter (RoleCounter.h) in the driver's
+        // CnC file.  This is the machine-readable leadership signal (mirrors
+        // Aeron Cluster's node-role counter); the dr-e2e harness reads it via
+        // rune_role instead of scraping logs.  addCounter returns a pending
+        // registration id; the driver acks asynchronously, after which
+        // publishRole() resolves it to the live Counter via findCounter().
+        std::uint8_t roleKey[kRoleKeyLength];
+        encodeRoleKey(roleKey, config_.nodeId);
+        roleCounterRegId_ = aeron_->addCounter(
+            kRoleCounterTypeId, roleKey, kRoleKeyLength,
+            roleCounterLabel(config_.nodeId));
+        termCounterRegId_ = aeron_->addCounter(
+            kTermCounterTypeId, roleKey, kRoleKeyLength,
+            termCounterLabel(config_.nodeId));
+        stuckMarkersCounterRegId_ = aeron_->addCounter(
+            kStuckMarkersCounterTypeId, roleKey, kRoleKeyLength,
+            stuckMarkersLabel(config_.nodeId));
+        outOfSyncCounterRegId_ = aeron_->addCounter(
+            kOutOfSyncCounterTypeId, roleKey, kRoleKeyLength, outOfSyncLabel(config_.nodeId));
+        catalogHaltedCounterRegId_ = aeron_->addCounter(
+            kCatalogApplyHaltedCounterTypeId, roleKey, kRoleKeyLength, catalogApplyHaltedLabel(config_.nodeId));
+        catalogAppliedCounterRegId_ = aeron_->addCounter(
+            kCatalogAppliedOffsetCounterTypeId, roleKey, kRoleKeyLength, catalogAppliedOffsetLabel(config_.nodeId));
+        // Authentication Task 9: 1'000'226 security apply halted, 227 security applied offset, 228 auth mode.
+        securityHaltedCounterRegId_ = aeron_->addCounter(
+            kSecurityApplyHaltedCounterTypeId, roleKey, kRoleKeyLength, securityApplyHaltedLabel(config_.nodeId));
+        securityAppliedCounterRegId_ = aeron_->addCounter(
+            kSecurityAppliedOffsetCounterTypeId, roleKey, kRoleKeyLength, securityAppliedOffsetLabel(config_.nodeId));
+        authModeCounterRegId_ = aeron_->addCounter(
+            kAuthModeCounterTypeId, roleKey, kRoleKeyLength, authModeLabel(config_.nodeId));
+        // Authentication Task 15: 1'000'233 peer links established, 234 peer-link refusals.
+        peerEstablishedCounterRegId_ = aeron_->addCounter(
+            kPeerLinksEstablishedCounterTypeId, roleKey, kRoleKeyLength, peerLinksEstablishedLabel(config_.nodeId));
+        peerRefusalsCounterRegId_ = aeron_->addCounter(
+            kPeerLinkRefusalsCounterTypeId, roleKey, kRoleKeyLength, peerLinkRefusalsLabel(config_.nodeId));
+        peerDropsCounterRegId_ = aeron_->addCounter(   // Authentication Task 16: 1'000'235 dropped peer frames
+            kPeerFrameDropsCounterTypeId, roleKey, kRoleKeyLength, peerFrameDropsLabel(config_.nodeId));
+        // Authentication Task 11: 1'000'229 logins ok, 230 failed, 231 rate-limited.
+        loginsOkCounterRegId_ = aeron_->addCounter(
+            kLoginsOkCounterTypeId, roleKey, kRoleKeyLength, loginsOkLabel(config_.nodeId));
+        loginsFailedCounterRegId_ = aeron_->addCounter(
+            kLoginsFailedCounterTypeId, roleKey, kRoleKeyLength, loginsFailedLabel(config_.nodeId));
+        loginsRateLimitedCounterRegId_ = aeron_->addCounter(
+            kLoginsRateLimitedCounterTypeId, roleKey, kRoleKeyLength, loginsRateLimitedLabel(config_.nodeId));
+        sessionsRevokedCounterRegId_ = aeron_->addCounter(
+            kSessionsRevokedCounterTypeId, roleKey, kRoleKeyLength, sessionsRevokedLabel(config_.nodeId));
+        unplaceableCounterRegId_ = aeron_->addCounter(
+            kCatalogUnplaceableTopicsCounterTypeId, roleKey, kRoleKeyLength,
+            catalogUnplaceableTopicsLabel(config_.nodeId));
+        blockedCounterRegId_ = aeron_->addCounter(
+            kCatalogBlockedPartitionsCounterTypeId, roleKey, kRoleKeyLength,
+            catalogBlockedPartitionsLabel(config_.nodeId));
+        linkMtuCounterRegId_ = aeron_->addCounter(
+            kLinkMtuDeficitCounterTypeId, roleKey, kRoleKeyLength, linkMtuDeficitLabel(config_.nodeId));
+        // ISR v3 §3.10 (B-I4): the storage counters.
+        storageCounterRegIds_[0] = aeron_->addCounter(kStorageGateStateCounterTypeId, roleKey, kRoleKeyLength,
+                                                      storageGateStateLabel(config_.nodeId));
+        storageCounterRegIds_[1] = aeron_->addCounter(kLeaderRolesHeldCounterTypeId, roleKey, kRoleKeyLength,
+                                                      leaderRolesHeldLabel(config_.nodeId));
+        storageCounterRegIds_[2] = aeron_->addCounter(kStoragePendingNodesCounterTypeId, roleKey, kRoleKeyLength,
+                                                      storagePendingNodesLabel(config_.nodeId));
+        storageCounterRegIds_[3] = aeron_->addCounter(kLostCommittedReportsCounterTypeId, roleKey, kRoleKeyLength,
+                                                      lostCommittedReportsLabel(config_.nodeId));
+
+        // Review A-I5: bind every fixed port of the NODE driver before its first publication (consensus /
+        // replication / gateway publications auto-bind ephemeral ports; one could take a later fixed bind).
+        // Fused shard mode runs worker 0 on this driver: its shard ports are anchored here too.
+        std::vector<std::string> subs, pubs;
+        subs.push_back(config_.selfConsensusBindChannel());
+        if (const std::string r = config_.selfReplicationBindChannel(); !r.empty()) subs.push_back(r);
+        if (!config_.clientEndpoint.channel.empty()) subs.push_back(config_.clientEndpoint.channel);
+        const int32_t W = config_.workerCount >= 1 ? config_.workerCount : 1;
+        const std::string egHost = config_.effectiveWorkerEgressControlHost();
+        if (config_.shardMode() && config_.fused()) {
+            subs.push_back(config_.shardIngressBindChannel(0));
+            subs.push_back(config_.shardReplBindChannel(0));
+            pubs.push_back("aeron:udp?control-mode=dynamic|control=" + egHost + ":" +
+                           std::to_string(config_.effectiveWorkerEgressControlBasePort()) + kAnchorPubTerm);
+        } else if (!config_.shardMode() && config_.perWorkerEgressEnabled) {
+            for (int32_t w = 0; w < W; ++w)
+                pubs.push_back("aeron:udp?control-mode=dynamic|control=" + egHost + ":" +
+                               std::to_string(config_.effectiveWorkerEgressControlBasePort() + w) + kAnchorPubTerm);
+        }
+        rune::aeronutil::AeronPump threadedPump;   // the node driver runs its own threads / the startup pump here
+        anchorFixedEndpoints_(aeron_, subs, pubs, threadedPump, "node driver");
+    }
+    const auto t2 = sclock::now();
+
+    // 4b. Authentication Task 15 (D32): the cluster key(s) were read ONCE by validateAuth (review C I4) and are
+    //     handed out as COPIES - the peer link agent takes its own; nothing ever re-reads the file.
+
+    // 5. Build all consensus objects (NodeStateFile, TermLog, Election, …).
+    buildConsensusObjects();
+    // ISR v3 Step 6: record the Consensus class in the manifest (R-3b) once node-state.dat AND term.log exist
+    // non-empty.  On a restart they do; on a first boot term.log is still empty here, so
+    // serviceAdminControl_ marks it as soon as the first term is written (ruling: the recipe marked it
+    // unconditionally here, which makes the NEXT boot refuse when the node stopped before its first term).
+    markConsensusWhenPresent_();
+    const auto t3 = sclock::now();
+
+    // 5b. hotpath-A F2: the segment provisioner exists BEFORE any replica is
+    //     built — every worker-driven disk log is wired to its demand hook.
+    provisionerAgent_ = std::make_unique<SegmentProvisionerAgent>(
+        static_cast<std::size_t>(config_.segmentProvisionDepth), config_.segmentProvisionCapBytes,
+        config_.dataDir, config_.segmentProvisionCapFreePct);
+    // Re-review N4: the provisioner's metrics as Aeron counters (CnC file).
+    if (aeron_) {
+        std::uint8_t key[kRoleKeyLength];
+        encodeRoleKey(key, config_.nodeId);
+        static constexpr std::pair<std::int32_t, const char*> kProvCounters[] = {
+            {kProvisionBuildFailuresCounterTypeId, "build-failures"},
+            {kProvisionRollHoldsCounterTypeId, "roll-holds"},
+            {kProvisionUnpreallocCounterTypeId, "unpreallocated-builds"},
+            {kProvisionParkedDroppedCounterTypeId, "parked-demands-dropped"},
+            {kProvisionReadMapFailuresCounterTypeId, "read-map-failures"}};
+        for (std::size_t i = 0; i < provCounterRegIds_.size(); ++i)
+            provCounterRegIds_[i] = aeron_->addCounter(kProvCounters[i].first, key, kRoleKeyLength,
+                                                       provisionMetricLabel(kProvCounters[i].second, config_.nodeId));
+    }
+    provisionerAgent_->setMetricSink(&BrokerNode::publishProvisionMetric_, this);
+
+    // 6. Build replication (GR-2/GR-3): PartitionReplicas + AeronPartitionTransport
+    //    + ReplicationMetadataBridge.  Requires: topicRegistry_ + aeron_ + consensus objs.
+    buildReplication();
+
+    // 6b. Authentication Task 15: the inter-broker link handshakes (Enabled, more than one peer).  After
+    //     buildReplication: the link incarnation is the process incarnation it just bumped.
+    buildPeerLinks_();
+
+    // 7. Build the ClientGateway and NodeRuntimeAgent (after aeron_ is live).
+    buildGateway();
+    // hotpath-A F2: every worker-driven disk log was wired to the provisioner's
+    // demand hook (its rolls defer while no ready segment exists) — a missing
+    // provisioner thread would wedge every roll.  Never start like that.
+    requireProvisionerRunner(provisionerAgent_ != nullptr, provisionerRunner_ != nullptr);
+
+    // 7.0 fsyncgate: a log whose recovery failed (index msync / dir fsync — the
+    //     log is marked storage-failed) must never serve.  Refuse to start —
+    //     critical log with the path, the halt path (exit 74), nothing served.
+    refuseStartOnFailedRecovery_();
+
+    // 7a. Self-contained worker shards (spec §3.1; Task 9 fix round 1 I2): the
+    //     per-worker invoker drivers + clients are created only NOW — after every
+    //     long phase (consensus build, offset/txn/metadata rebuilds, admin build)
+    //     — then their planes/ingress/egress are resolved (pumped by each shard's
+    //     own AeronPump on THIS thread) and the shard runners start right after.
+    //     Nothing ever leaves a shard driver/client unpumped for a long phase
+    //     (a gap > the client liveness timeout kills the client).  Each ShardAgent
+    //     takes pump ownership on its worker thread's first pass.
+    if (config_.shardMode()) {
+        buildShardRuntimes_();
+        attachShardRuntimes_();
+    }
+
+    // P2 (Task 10 round 4): switch the pool to ring-delivered ownership BEFORE
+    //    the control thread exists — runnersStarted_ is control-thread state and
+    //    is never written while the control thread runs.  SetOwnership ops the
+    //    control thread enqueues before a worker runner starts are applied, in
+    //    FIFO order, on that worker's first pass.
+    if (workerPool_) workerPool_->armRingOwnership();
+
+    // A9 (review M-1): ring doorbells only where a shard runner parks on them — wired here, before ANY
+    // producer thread of a worker ring exists (the control thread just below in thread placement).
+    if (workerPool_ && config_.shardMode())
+        (void)workerPool_->enableShardDoorbells(shardAgents_, config_, config_.fused());
+
+    // 7. Start the agent runner thread (drives NodeRuntimeAgent, which drives
+    //    consensus + gateway on the single-writer thread).
+    //    Spec §3.2: in fused placement the runtime has no thread of its own.
+    if (!config_.fused()) agentRunner_->start();
+
+    // 7b. E2 inc2b: start per-worker AgentRunner threads.
+    //     Must start AFTER buildGateway() (owned sets published in buildWorkerPool
+    //     which is called from buildGateway) and AFTER agentRunner_->start()
+    //     (control thread must be live before workers start draining ingress rings).
+    //     Workers are independent of the control agent but their ingress rings are
+    //     fed by the control thread, so the ordering: control first, workers after.
+    if (workerPool_) {
+        if (config_.shardMode()) {
+            if (config_.fused()) {
+                // The fused hook must be set before worker 0's thread exists.
+                // Hand-off: the interim pump runner is joined HERE (it never
+                // pumps again); worker 0 binds the runtime driver at its first
+                // pass — exactly one pumper at any time.
+                shardAgents_.at(0)->setFusedRuntime(runtimeAgent_.get(), nodeDriver_.get(), aeron_.get());
+                stopStartupPump_();
+                attachFusedRuntimeDoorbell_();   // A9: before the other workers / admin thread produce
+            }
+            // Backoff idle by default (never busy-spin unless explicitly opted in:
+            // RUNE_WORKER_IDLE=busyspin) — pinned or not.
+            // A7: park-until-work on each shard's driver readiness (RUNE_IDLE_WAKE, default on).
+            workerPool_->startShardRunners(shardAgents_, clock_, config_);
+        } else {
+            workerPool_->startRunners(config_.workerIdleStrategy, clock_, config_.idleMaxParkUs);
+        }
+        spdlog::info("BrokerNode[{}]: {} worker thread(s) started (shard={})",
+                     config_.nodeId, workerPool_->workerCount(), config_.shardMode());
+    }
+    // Fix round 0 (Task 6): the control thread's identity, for the test
+    // accessors that must never run on it (they would await themselves).
+    controlThreadId_ = config_.fused() ? (workerPool_ ? workerPool_->runnerThreadId(0) : std::thread::id{})
+                                       : agentRunner_->threadId();
+
+    // 7c. Task 6: start the AdminWorker AgentRunner thread.
+    //     Catalog history Task 16 (F4): the ONE boot replay of the local __catalog
+    //     prefix already ran, on the startup thread, in bootFromCatalog_ (step 1b)
+    //     — before any boot builder — and the AdminWorker adopted the booted
+    //     applier.  What needs a running broker is posted from the applied state
+    //     HERE, now that the workers exist: the validators, the view sinks' plan
+    //     gate and the recovery installs, the applied metric, and — when the replay
+    //     halted — the halt.  The admin thread's first pass makes the applier Live.
+    //     The ring's single producer is this thread until the admin thread starts
+    //     (the thread start orders every claim before the admin's first).
+    if (adminWorkerAgent_) {
+        adminWorkerAgent_->worker().applier().postBootStash(adminWorkerAgent_->catalogBootEffects().sink);
+        if (const SecurityApplier* sa = adminWorkerAgent_->worker().securityApplier())
+            sa->postBootStash(adminWorkerAgent_->securitySinkForBootStash());   // a boot-time halt reaches the control thread
+        spdlog::info("BrokerNode[{}]: __catalog booted — {} boot replay, applier {} ({}), {} topic(s) built, {} "
+                     "dropped id(s)", config_.nodeId, bootReplays_, adminWorkerAgent_->worker().applier().phaseName(),
+                     adminWorkerAgent_->worker().applier().stateName(), bootTopics_.size(), bootDroppedIds_.size());
+    }
+    if (adminWorkerRunner_) {
+        adminWorkerRunner_->start();
+        spdlog::info("BrokerNode[{}]: AdminWorker thread started", config_.nodeId);
+    }
+
+    // 8. Start the LogCleanerAgent on its own thread (CP-6).
+    //    Must start AFTER agentRunner_ so the duty cycle begins draining swaps
+    //    before the cleaner can enqueue any (avoids a window where a swap is
+    //    enqueued but never drained if agentRunner_ hasn't started yet).
+    if (cleanerRunner_) {
+        cleanerRunner_->start();
+    }
+    // 8b. hotpath-A F2: the segment provisioner (its own thread: never stalled
+    //     by a compaction pass).
+    if (provisionerRunner_) {
+        provisionerRunner_->start();
+    }
+    // 8c. Task 19: the per-node view-snapshot IO thread — drains every worker's
+    //     checkpoint-delta ring to disk off the produce/consume hot path.
+    if (viewSnapshotIoRunner_) {
+        viewSnapshotIoRunner_->start();
+        spdlog::info("BrokerNode[{}]: ViewSnapshotIoAgent thread started", config_.nodeId);
+    }
+
+    // 9. DR-15 fix round 1: the cold peer-hostname resolver thread — every
+    //    consumer ring is subscribed by now (subscribe*() is startup-only).
+    if (resolverHub_) resolverHub_->start();
+
+    const auto t_start = sclock::now();
+    spdlog::info(
+        "BrokerNode: node {} started (dataDir={}) "
+        "| driver_start={:.1f}ms aeron_connect={:.1f}ms consensus_build={:.1f}ms total={:.1f}ms",
+        config_.nodeId, config_.dataDir,
+        std::chrono::duration<double, std::milli>(t1 - t0).count(),
+        std::chrono::duration<double, std::milli>(t2 - t1).count(),
+        std::chrono::duration<double, std::milli>(t3 - t2).count(),
+        std::chrono::duration<double, std::milli>(t_start - t0).count());
+}
+
+// ---------------------------------------------------------------------------
+// BrokerNode::buildConsensusObjects — dispatches to single/multi-node path
+// ---------------------------------------------------------------------------
+void BrokerNode::buildConsensusObjects() {
+    const fs::path dataDir{config_.dataDir};
+
+    // Durable persistence files.
+    nodeStateFile_ = std::make_unique<NodeStateFile>(
+        (dataDir / "node-state.dat").string());
+    termLog_ = std::make_unique<TermLog>(
+        (dataDir / "term.log").string());
+    // ISR v3 R12: a node that already took part in an election has history (read before the Election touches the files).
+    bootHistory_ = nodeStateFile_->candidateTermId() > 0 || !termLog_->validTermEntries().empty();
+
+    // Cluster members — one entry per peer in config_.peers.
+    clusterMembers_.clear();
+    clusterMembers_.reserve(config_.peers.size());
+    for (const auto& peer : config_.peers) {
+        ClusterMember m;
+        m.id                = peer.id;
+        m.logPosition       = 0;
+        m.logLeadershipTermId = 0;
+        m.leadershipTermId  = 0;
+        clusterMembers_.push_back(m);
+    }
+
+    // IngressRing (MPSC; 64 KiB payload).
+    ingressRing_ = std::make_unique<IngressRing>(kIngressCapacity);
+
+    if (config_.isSingleNode()) {
+        buildSingleNodeConsensus();
+    } else {
+        buildMultiNodeConsensus();
+    }
+}
+
+void BrokerNode::markConsensusWhenPresent_() {
+    if ((storage_.manifest & static_cast<uint8_t>(StorageIdentity::Class::Consensus)) != 0) { consensusUnmarked_ = false; return; }
+    if (!StorageIdentity::isPresent(config_.dataDir, StorageIdentity::Class::Consensus)) return;
+    if (StorageIdentity::markPresent(config_.dataDir, storage_, StorageIdentity::Class::Consensus)) consensusUnmarked_ = false;
+}
+bool BrokerNode::mayBootstrapThunk_(void* self) noexcept {
+    const auto& s = static_cast<BrokerNode*>(self)->storage_;
+    return s.origin == StorageIdentity::Origin::Founder &&
+           (s.manifest & static_cast<uint8_t>(StorageIdentity::Class::MetadataLog)) == 0;
+}
+void BrokerNode::markKnowledgeThunk_(void* self) noexcept {
+    auto* n = static_cast<BrokerNode*>(self);
+    try { (void)StorageIdentity::markPresent(n->config_.dataDir, n->storage_, StorageIdentity::Class::Knowledge); } catch (...) {}
+}
+void BrokerNode::markMetadataLogThunk_(void* self) noexcept {
+    auto* n = static_cast<BrokerNode*>(self);
+    try { (void)StorageIdentity::markPresent(n->config_.dataDir, n->storage_, StorageIdentity::Class::MetadataLog); } catch (...) {}
+}
+
+// ---------------------------------------------------------------------------
+// BrokerNode::buildSingleNodeConsensus — BR-2 path (NullSink, self-elect)
+// ---------------------------------------------------------------------------
+void BrokerNode::buildSingleNodeConsensus() {
+    // Publisher (outbound transport: NullSink — no peers).
+    publisher_ = std::make_unique<SbeConsensusPublisher>(nullSink_);
+
+    // Election — use configurable timing from NodeConfig.
+    const int64_t electionTimeoutNs =
+        config_.electionTimeoutMs * 1'000'000LL;
+    const int64_t statusIntervalNs =
+        config_.electionStatusIntervalMs * 1'000'000LL;
+    const int64_t canvassTimeoutNs =
+        config_.startupCanvassTimeoutMs * 1'000'000LL;
+
+    election_ = std::make_unique<Election>(
+        /*isNodeStartup=*/true,
+        /*gracefulClosedLeaderId=*/-1,
+        /*leadershipTermId=*/0,
+        /*logLeadershipTermId=*/0,
+        /*logPosition=*/0,
+        /*appendPosition=*/0,
+        clusterMembers_,
+        static_cast<NodeId>(config_.nodeId),
+        *publisher_,
+        *nodeStateFile_,
+        *termLog_,
+        electionTimeoutNs,
+        statusIntervalNs,
+        canvassTimeoutNs,
+        /*rngSeed=*/42u);
+
+    // ConsensusAgent (plain — no ingress polling needed for 1-node).
+    agent_ = std::make_unique<ConsensusAgent>(*election_, *ingressRing_);
+
+    // NOTE: AgentRunner is created in buildGateway() after the gateway is built,
+    // so that NodeRuntimeAgent (consensus + gateway) is driven as a unit.
+}
+
+// ---------------------------------------------------------------------------
+// BrokerNode::buildMultiNodeConsensus — BR-3 path (UDP per-peer + ingress)
+// ---------------------------------------------------------------------------
+void BrokerNode::buildMultiNodeConsensus() {
+    using sclock = std::chrono::steady_clock;
+    const NodeId selfId = static_cast<NodeId>(config_.nodeId);
+
+    // -----------------------------------------------------------------------
+    // Step A: Create AeronIngress FIRST (subscribe on self's consensus endpoint).
+    // This ensures the subscription is active before peer publications connect,
+    // minimizing dropped canvass frames and SETUP-handshake latency.
+    // -----------------------------------------------------------------------
+    const auto& selfPeer = config_.self();
+    const auto t_ingress_start = sclock::now();
+    // DR-15 fix round 1 (MEDIUM-1): bind on peerBindHost() — never on this
+    // node's own DNS record (a k8s headless record appears only once Ready).
+    aeronIngress_ = std::make_unique<AeronIngress>(
+        aeron_,
+        config_.selfConsensusBindChannel(),
+        config_.consensusStreamId,
+        *ingressRing_,
+        rune::aeronutil::AeronPump{},
+        peerCrypto_(/*senderId=*/0));   // Authentication Task 16 (D33): consensus is sender 0
+    const auto t_ingress_end = sclock::now();
+    spdlog::debug(
+        "BrokerNode[{}]: AeronIngress resolved in {:.1f}ms",
+        config_.nodeId,
+        std::chrono::duration<double, std::milli>(t_ingress_end - t_ingress_start).count());
+
+    // -----------------------------------------------------------------------
+    // Step B: Build per-peer UDP sink (publish to each OTHER peer's endpoint).
+    // Subscriptions are now live — publication SETUP handshakes can succeed sooner.
+    // -----------------------------------------------------------------------
+    std::unordered_map<NodeId, UdpMessageSink::PeerEndpoint> peerEndpoints;
+    for (const auto& peer : config_.peers) {
+        if (peer.id == config_.nodeId) continue; // skip self
+        peerEndpoints[static_cast<NodeId>(peer.id)] =
+            UdpMessageSink::PeerEndpoint{
+                peer.consensusChannel(),
+                config_.consensusStreamId
+            };
+    }
+    const auto t_sink_start = sclock::now();
+    udpSink_ = std::make_unique<UdpMessageSink>(
+        aeron_, peerEndpoints, rune::aeronutil::AeronPump{},
+        resolverHub_ ? resolverHub_->subscribeOwner() : rune::consensus::PeerResolutionSource{},
+        peerCrypto_(/*senderId=*/0));   // Authentication Task 16 (D33): consensus is sender 0
+    const auto t_sink_end = sclock::now();
+    spdlog::debug(
+        "BrokerNode[{}]: UdpMessageSink publications resolved in {:.1f}ms",
+        config_.nodeId,
+        std::chrono::duration<double, std::milli>(t_sink_end - t_sink_start).count());
+
+    // Publisher over the UDP sink.
+    publisher_ = std::make_unique<SbeConsensusPublisher>(*udpSink_);
+
+    // -----------------------------------------------------------------------
+    // Step C: Election with configurable timing from NodeConfig.
+    // -----------------------------------------------------------------------
+    const int64_t electionTimeoutNs =
+        config_.electionTimeoutMs * 1'000'000LL;
+    const int64_t statusIntervalNs =
+        config_.electionStatusIntervalMs * 1'000'000LL;
+    const int64_t canvassTimeoutNs =
+        config_.startupCanvassTimeoutMs * 1'000'000LL;
+
+    election_ = std::make_unique<Election>(
+        /*isNodeStartup=*/true,
+        /*gracefulClosedLeaderId=*/-1,
+        /*leadershipTermId=*/0,
+        /*logLeadershipTermId=*/0,
+        /*logPosition=*/0,
+        /*appendPosition=*/0,
+        clusterMembers_,
+        selfId,
+        *publisher_,
+        *nodeStateFile_,
+        *termLog_,
+        electionTimeoutNs,
+        statusIntervalNs,
+        canvassTimeoutNs,
+        /*rngSeed=*/static_cast<uint64_t>(42u + selfId));
+
+    // ISR v3 A-C2: the candidacy hold is a LEVEL asserted from construction (the gate re-asserts it every cycle):
+    // a storage that is not yet trusted (Undecided / Joiner) neither stands nor votes for itself before the first
+    // doWork can canvass.  TestFounder / Legacy / Founder are not held (unless the test seam says so).
+    election_->setStorageHold(
+        (!(storage_.origin == StorageIdentity::Origin::Founder || storage_.origin == StorageIdentity::Origin::Legacy) ||
+         config_.testCandidacyHoldAtBoot) && config_.peers.size() > 1, 0);
+
+    // Inner ConsensusAgent (drives Election, drains IngressRing).
+    agent_ = std::make_unique<ConsensusAgent>(*election_, *ingressRing_);
+    if (config_.testDropConsensusFromPeer >= 0)
+        agent_->setTestDropFrom(config_.testDropConsensusFromPeer, config_.testDropConsensusForMs * 1'000'000LL);
+
+    // Composite NodeConsensusAgent (polls ingress THEN runs ConsensusAgent).
+    nodeAgent_ = std::make_unique<NodeConsensusAgent>(
+        *aeronIngress_, *agent_, *election_, selfId);
+
+    // NOTE: AgentRunner is created in buildGateway() after the gateway is built,
+    // so that NodeRuntimeAgent (nodeAgent + gateway) is driven as a unit.
+}
+
+// ---------------------------------------------------------------------------
+// BrokerNode::buildReplication — GR-2/GR-3.
+//
+// Constructs one PartitionReplica per owned partition (sharing the Log* from
+// TopicRegistry), one AeronPartitionTransport (per node), and the
+// ReplicationMetadataBridge that drives role transitions from consensus.
+//
+// Prerequisites:
+//   - topicRegistry_ is fully built (all Logs recovered).
+//   - aeron_ is connected.
+//   - config_.peers is populated.
+//
+// For the DR scope: the cluster leader is the leader of ALL partitions.
+// Replication channel per peer: peer.replicationChannel().  If no peer has
+// a replication port configured (all zero), we skip transport construction
+// but still build replicas with a null transport (no-op for single-node).
+//
+// Replica initial role: always starts as Follower (epoch 0, leaderId=-1) to
+// avoid stale leader assumptions at startup.  The ReplicationMetadataBridge
+// will call becomeLeader/becomeFollower on the first cycle after the
+// consensus layer resolves the initial leader.
+// ---------------------------------------------------------------------------
+void BrokerNode::buildReplication() {
+    using namespace rune::replication;
+
+    const NodeId selfId = static_cast<NodeId>(config_.nodeId);
+
+    // Collect all NodeIds in the cluster (used as the replica set + ISR seed).
+    std::vector<NodeId> allNodeIds;
+    allNodeIds.reserve(config_.peers.size());
+    for (const auto& peer : config_.peers) {
+        allNodeIds.push_back(static_cast<NodeId>(peer.id));
+    }
+
+    // -----------------------------------------------------------------------
+    // E5 Task 5: per-worker replication — pre-flight validation.
+    //
+    // Hard-refuse to start with invalid config when perWorkerReplication=true:
+    //   (a) Stream range collision: replBaseStreamId range must not overlap
+    //       client/consensus/workerIngress/workerEgress ranges.
+    //   (b) Asymmetric worker count: every peer that has advertised a worker count
+    //       must match this node's count; partial-knowledge peers (wc==0) are
+    //       tolerated (they will be re-checked on membership change).
+    //
+    // Neither validation requires aeron_ to be live; they gate the hard invariants
+    // that cannot be safely recovered from at runtime (stream collision = silent
+    // message loss; asymmetric W = split replication planes).
+    // -----------------------------------------------------------------------
+    if (config_.perWorkerReplication) {
+        if (auto err = config_.validateStreamRanges(); err.has_value()) {
+            throw std::runtime_error(
+                "BrokerNode[" + std::to_string(config_.nodeId) +
+                "]: per-worker replication stream range collision — " + *err);
+        }
+
+        // Build (nodeId, workerCount) peer list for symmetric-count check.
+        std::vector<std::pair<int32_t, int32_t>> wPeers;
+        wPeers.reserve(config_.peers.size());
+        for (const auto& p : config_.peers) {
+            if (p.id == config_.nodeId) continue;   // skip self
+            if (p.workerCount != 0)                 // 0 = not yet advertised
+                wPeers.push_back({p.id, p.workerCount});
+        }
+        auto wCheck = validateSymmetricWorkerCount(config_.workerCount, wPeers);
+        if (!wCheck.ok) {
+            throw std::runtime_error(
+                "BrokerNode[" + std::to_string(config_.nodeId) +
+                "]: per-worker replication refused — " + wCheck.error);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Build replTransport_ — AeronPartitionTransport (requires aeron_).
+    // Only constructed when this node has a replication port configured.
+    // Built FIRST so we have the transport pointer ready for replica construction.
+    // -----------------------------------------------------------------------
+    const auto& selfPeer = config_.self();
+    const bool hasReplPort = (selfPeer.replicationPort != 0);
+
+    if (hasReplPort && aeron_) {
+        const std::string ingressChannel = config_.selfReplicationBindChannel();   // MEDIUM-1: bind host
+        const int32_t     ingressStream  = config_.replicationStreamId;
+
+        try {
+            replTransport_ = std::make_unique<rune::replication::AeronPartitionTransport>(
+                aeron_, ingressChannel, ingressStream, selfId,
+                config_.replicationOutboundRingBytes, rune::aeronutil::AeronPump{},
+                peerCrypto_(/*senderId=*/1));   // Authentication Task 16 (D33): legacy replication is sender 1
+            // F18: every replication publication uses the embedded driver's term
+            // (no channel overrides term-length) — fixed before any worker runs.
+            replTransport_->setPublicationMaxMessageBytes(
+                rune::replication::aeronMaxMessageLength(config_.aeronTermBufferBytes));
+            // F18 (B-1): follower fetches never ask for more than one worker apply op.
+            replTransport_->setApplyRecordsCap(
+                static_cast<int64_t>(config_.workerIngressRingBytes) / 8 -
+                static_cast<int64_t>(rune::node::workerOpFrameBytes(0)));
+
+            // DR-15 fix round 1: resolution events before any peer is added.
+            if (resolverHub_) replTransport_->attachResolution(resolverHub_->subscribeOwner());
+
+            // Add each peer (excluding self) as an egress destination.
+            for (const auto& peer : config_.peers) {
+                if (peer.id == config_.nodeId) continue;       // skip self
+                if (peer.replicationPort == 0) continue;       // no replication endpoint
+                replTransport_->addPeer(
+                    static_cast<NodeId>(peer.id),
+                    peer.replicationChannel(),
+                    ingressStream);
+            }
+
+            spdlog::info("BrokerNode[{}]: AeronPartitionTransport built on {} (stream={}) with {} peers",
+                         config_.nodeId, ingressChannel, ingressStream,
+                         replTransport_->peerCount());
+
+        } catch (const std::exception& ex) {
+            spdlog::warn("BrokerNode[{}]: AeronPartitionTransport construction failed: {}; "
+                         "replication transport disabled",
+                         config_.nodeId, ex.what());
+            replTransport_.reset();
+        }
+    } else {
+        const int32_t topicCountForWarn = topicRegistry_->topicCount();
+        if (topicCountForWarn > 0 && config_.peers.size() > 1) {
+            spdlog::warn("BrokerNode[{}]: no replicationPort configured — "
+                         "replication transport NOT started (topics won't replicate)",
+                         config_.nodeId);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // E5 Task 5: per-worker replication transports.
+    //
+    // When perWorkerReplication is true AND aeron_ is live AND there are
+    // replication peers, construct one WorkerReplicationTransport per worker.
+    // Each transport W subscribes on stream (replBaseStreamId + W) and publishes
+    // to each peer's replication channel on the same stream offset.
+    //
+    // Single-node / no-peers: skip — nothing to replicate, and the brief
+    // explicitly says "do NOT build per-worker planes" when peers is empty
+    // (WorkerReplicationTransport::allResolved() returns false on empty peers).
+    //
+    // Hard-refuse if any transport fails to resolve: a half-wired replication
+    // plane silently drops messages for the partitions assigned to that worker.
+    // -----------------------------------------------------------------------
+    if (config_.shardMode()) {
+        // Self-contained worker shards (spec §3.1/§3.3): one DEFERRED plane per
+        // worker (replicas bind their concrete transport pointer now).  The planes
+        // attach to their shard's own client in attachShardRuntimes_(), after the
+        // long startup phases (fix round 1 I2).  Single node: no planes.
+        bool hasPeers = false;
+        for (const auto& peer : config_.peers) hasPeers |= (peer.id != config_.nodeId);
+        if (hasPeers) {
+            const int32_t wc = config_.workerCount >= 1 ? config_.workerCount : 1;
+            perWorkerReplTransports_.reserve(static_cast<std::size_t>(wc));
+            for (int32_t w = 0; w < wc; ++w) {
+                perWorkerReplTransports_.push_back(std::make_unique<WorkerReplicationTransport>(
+                    w, config_.shardReplBindChannel(w), config_.replBaseStreamId + w,
+                    WorkerReplicationTransport::DeferredAttach{},
+                    peerCrypto_(static_cast<uint8_t>(3 + w))));   // Authentication Task 16 (D33): worker w is sender 3 + w
+                // DR-15 fix round 1: worker w's resolution events (its OWN ring).
+                if (resolverHub_) perWorkerReplTransports_.back()->attachResolution(resolverHub_->subscribeOwner());
+            }
+        }
+    } else if (config_.perWorkerReplication && aeron_) {
+        // Collect (peerId, peerChannel) pairs for all peers with a replication port.
+        std::vector<std::pair<rune::replication::NodeId, std::string>> replPeers;
+        replPeers.reserve(config_.peers.size());
+        for (const auto& peer : config_.peers) {
+            if (peer.id == config_.nodeId) continue;
+            if (peer.replicationPort == 0) continue;
+            replPeers.push_back({
+                static_cast<rune::replication::NodeId>(peer.id),
+                peer.replicationChannel()
+            });
+        }
+
+        if (!replPeers.empty()) {
+            const int32_t wc = config_.workerCount >= 1 ? config_.workerCount : 1;
+            const std::string inboundChannel = config_.selfReplicationBindChannel();   // MEDIUM-1: bind host
+            if (inboundChannel.empty()) {
+                spdlog::warn("BrokerNode[{}]: perWorkerReplication=true but self has no "
+                             "replicationPort — per-worker transports skipped",
+                             config_.nodeId);
+            } else {
+                perWorkerReplTransports_.reserve(static_cast<std::size_t>(wc));
+                for (int32_t w = 0; w < wc; ++w) {
+                    const int32_t streamId = config_.replBaseStreamId + w;
+                    auto t = std::make_unique<WorkerReplicationTransport>(
+                        w, inboundChannel, streamId, WorkerReplicationTransport::DeferredAttach{},
+                        peerCrypto_(static_cast<uint8_t>(3 + w)));   // Authentication Task 16 (D33): worker w is sender 3 + w
+                    // DR-15 fix round 1: a legacy plane rides the NODE client — its
+                    // post-startup re-adds go through the control thread (MEDIUM-2),
+                    // triggered by its own resolution events.
+                    if (resolverHub_) t->attachResolution(resolverHub_->subscribeOwner());
+                    if (replTransport_) {
+                        legacyPlaneBrokers_.push_back(
+                            std::make_unique<rune::replication::PubAddBroker>(replPeers, streamId));
+                        replTransport_->addPubAddBroker(legacyPlaneBrokers_.back().get());
+                        t->setAddBroker(legacyPlaneBrokers_.back().get());
+                    }
+                    (void)t->attach(aeron_, replPeers, streamId);
+                    if (!t->resolved()) {
+                        // Hard-refuse a LOCAL failure only (inbound bind / peer
+                        // config).  DR-15: unresolved PEER pubs stay Resolving and
+                        // are re-added on the worker's passes (never fatal).
+                        throw std::runtime_error(
+                            "BrokerNode[" + std::to_string(config_.nodeId) +
+                            "]: per-worker replication transport for worker " +
+                            std::to_string(w) + " inbound did not resolve (local registration error or driver timeout) "
+                            "(stream=" + std::to_string(streamId) + ") — "
+                            "refusing to start with a half-wired plane");
+                    }
+                    perWorkerReplTransports_.push_back(std::move(t));
+                }
+                spdlog::info("BrokerNode[{}]: {} per-worker replication transport(s) built "
+                             "(replBaseStreamId={}, {} peer(s))",
+                             config_.nodeId, wc, config_.replBaseStreamId,
+                             replPeers.size());
+            }
+        } else {
+            spdlog::info("BrokerNode[{}]: perWorkerReplication=true but no replication peers — "
+                         "per-worker planes skipped (single-node or no peer repl ports)",
+                         config_.nodeId);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Build replicaRegistry_ — one PartitionReplica per (topicId, partition).
+    // Each replica shares the Log* from topicRegistry_ (non-owning).
+    // Initial role: Follower / epoch 0 (bridge will set correct role on first cycle).
+    // Transport pointer: use replTransport_ if available, else use a no-op
+    // InMemoryTransport owned locally (no peers = all frames dropped).
+    //
+    // We store an InMemoryTransport per-node as a fallback when no Aeron transport
+    // is available.  This avoids the PartitionReplica assert(transport != nullptr).
+    // -----------------------------------------------------------------------
+    replicaRegistry_ = std::make_unique<ReplicaRegistry>();
+    // KIP-903: every replica of this process stamps the process incarnation.
+    replicaRegistry_->setProcessIncarnation(StorageIdentity::bumpProcessIncarnation(
+        config_.dataDir, std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::system_clock::now().time_since_epoch()).count()));
+    replicaRegistry_->setStorageId(storage_.id);   // ISR v3 Step 6: stamped next to the incarnation
+    if (config_.testHoldFollowerFetchesMs > 0)   // TEST-ONLY (B-I8): a member that cannot catch up yet
+        replicaRegistry_->setHoldFetchesUntilForTest(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() +
+            config_.testHoldFollowerFetchesMs * 1'000'000LL);
+    if (config_.testDropConsensusFromPeer >= 0)   // TEST-ONLY (CP2 C1-R): the same dead link on the data plane
+        replicaRegistry_->setDropInternalIsrUntilForTest(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() +
+            config_.testDropConsensusForMs * 1'000'000LL);
+    // E2 C1 residual N1: the node-control identity (the same nonce the node
+    // registers with every controller) rides each transient lineage report.
+    if (lifecycleNonce_ == 0) lifecycleNonce_ = processNonce();
+    replicaRegistry_->setLineageIdentity(lifecycleNonce_);
+    // Review 2026-10-04 MAJOR-2/3: durable internal-ISR knowledge — internal
+    // replicas commit their ISR changes on a majority of it, and the consensus
+    // election votes only for members of its newest internal ISRs.
+    internalIsrKnowledge_ = std::make_unique<rune::replication::InternalIsrKnowledge>(
+        config_.dataDir.empty() ? std::string{} : config_.dataDir + "/internal-isr.state");
+    replicaRegistry_->setInternalIsrKnowledge(internalIsrKnowledge_.get());
+    internalIsrKnowledge_->setFirstPersistHook(&BrokerNode::markKnowledgeThunk_, this);   // ISR v3 Step 6
+    // ISR v3 I-S4: a Joiner's knowledge is not votable until an offer() from the current leadership succeeds,
+    // whatever the file holds.
+    if (storage_.origin == StorageIdentity::Origin::Joiner) internalIsrKnowledge_->setFailClosed();
+    {
+        // LOW-R4-2: __cluster_metadata is replicated on every configured node.
+        std::vector<int32_t> ids;
+        ids.reserve(config_.peers.size() + 1);
+        for (const auto& peer : config_.peers) ids.push_back(static_cast<int32_t>(peer.id));
+        if (std::find(ids.begin(), ids.end(), static_cast<int32_t>(config_.nodeId)) == ids.end())
+            ids.push_back(static_cast<int32_t>(config_.nodeId));
+        internalIsrKnowledge_->setReplicaSet(std::move(ids));
+    }
+    if (election_) {
+        // MEDIUM-B: RUNE_UNCLEAN_CONSENSUS_ELECTION (default off) leaves the
+        // candidacy gate unwired — a data-blind (unclean) consensus election.
+        if (config_.uncleanConsensusElection)
+            spdlog::warn("BrokerNode[{}]: RUNE_UNCLEAN_CONSENSUS_ELECTION is ON — the consensus "
+                         "candidacy gate is disabled; a node missing committed __cluster_metadata "
+                         "records may be elected (those records are then lost)", config_.nodeId);
+        else {
+            election_->setVoteGate(&BrokerNode::voteGateThunk_, this);   // ISR v3 Step 9: storage gate first
+            // ISR v3 ruling: an unconfirmed storage ABSTAINS (silence) instead of denying - see Election::setAbstainGate.
+            election_->setAbstainGate(&BrokerNode::abstainGateThunk_, this);
+            // Round-3 CRITICAL-R3: every vote (the candidate's own included) is
+            // gated, so the election participants exchange their newest durable
+            // __cluster_metadata ISR state while canvassing / voting — a node
+            // that missed a committed state learns it from a peer (adopt:
+            // durable, never acked, not term-gated).  Control thread (cold).
+            election_->setCandidacyExchange(
+                [](void* k, rune::consensus::CandidacyState& out) noexcept -> bool {
+                    auto* kn = static_cast<rune::replication::InternalIsrKnowledge*>(k);
+                    try { kn->retryLoadIfPending(); } catch (...) {}
+                    const auto* st = kn->candidacyState();
+                    if (st == nullptr) return false;
+                    out.leaderEpoch = st->leaderEpoch;
+                    out.version     = st->version;
+                    out.count       = st->count;
+                    for (int i = 0; i < st->count && i < rune::consensus::CandidacyState::kMaxMembers; ++i)
+                        out.members[static_cast<std::size_t>(i)] = st->members[static_cast<std::size_t>(i)];
+                    return true;
+                },
+                [](void* k, const rune::consensus::CandidacyState& in) noexcept {
+                    if (in.count < 0 || in.count > rune::replication::InternalIsrState::kMaxMembers) return;
+                    rune::replication::InternalIsrState st{};
+                    st.topicId     = rune::replication::InternalIsrKnowledge::kCandidacyTopicId;
+                    st.partition   = 0;
+                    st.leaderEpoch = in.leaderEpoch;
+                    st.version     = in.version;
+                    st.count       = in.count;
+                    for (int i = 0; i < in.count; ++i)
+                        st.members[static_cast<std::size_t>(i)] = in.members[static_cast<std::size_t>(i)];
+                    try {
+                        (void)static_cast<rune::replication::InternalIsrKnowledge*>(k)->adopt(st);
+                    } catch (...) {}   // a failed adopt leaves the older (safe) knowledge
+                },
+                internalIsrKnowledge_.get());
+        }
+        // Re-review MEDIUM-A: the knowledge refuses (so this node never acks)
+        // an internal ISR state of a leadership older than the consensus term
+        // this node voted in or observed — Raft's term rule applied to the ack.
+        internalIsrKnowledge_->setConsensusTermSource(
+            [](const void* e) noexcept -> int64_t {
+                // MAJOR-R3: the term voted in / followed — never a candidate
+                // term raised by a DENIED RequestVote.
+                return static_cast<int64_t>(static_cast<const Election*>(e)->ackTermId());
+            },
+            election_.get());
+    }
+    // Task 10 round 4 (Critical 1): the legacy replication transport resolves
+    // every inbound frame through the registry at USE time and holds no replica
+    // pointer (a removed partition can never be reached through it).  User
+    // replicas on per-worker planes stay off it (E5 Task 5), as before.
+    if (replTransport_)
+        replTransport_->setReplicaRegistry(replicaRegistry_.get(),
+                                           /*userPartitions=*/perWorkerReplTransports_.empty());
+
+    // E5 Task 5: build a local ShardRouter for per-worker transport selection
+    // when per-worker planes are available.  Uses shardRouterFor (group key =
+    // coPartitionGroupKey(name)), the same function as buildWorkerPool and
+    // createRuntimeUserReplicas, so the plane is the owner worker's.
+    // Only constructed when we have planes to route to.
+    std::optional<rune::metadata::ShardRouter> replRouter;
+    if (!perWorkerReplTransports_.empty()) {
+        replRouter = shardRouterFor(static_cast<int32_t>(perWorkerReplTransports_.size()), bootTopics_);
+    }
+
+    const int32_t topicCount = topicRegistry_->topicCount();
+    for (int32_t topicId = 0; topicId < topicCount; ++topicId) {
+        const auto* spec = topicRegistry_->topic(topicId);
+        if (!spec) continue;
+
+        for (int32_t part = 0; part < spec->partitionCount; ++part) {
+            // Task M1: select log backend by persistence mode.
+            // Transient: create an InMemoryLog (large caps — production-suitable).
+            // Disk-backed: use the Log from TopicRegistry (recovered on startup).
+            // De-virtualized seam (Milestone D P2): keep the concrete typed pointer
+            // and construct via the matching PartitionReplica overload — no ILog*.
+            rune::storage::Log*         diskLogPtr = nullptr;
+            rune::storage::InMemoryLog* memLogPtr  = nullptr;
+            const bool isTransient = (spec->persistence == rune::node::PersistenceMode::Transient);
+
+            if (isTransient) {
+                // Transient partition: create an InMemoryLog.
+                // Recovery SKIPS transient partitions — they start empty (precondition #3).
+                // Use config_.memoryLogRingBytes (default 8 MiB, env RUNE_TRANSIENT_LOG_RING_BYTES)
+                // as the fixed circular-ring capacity.  Keep DropOldest (not BackPressure)
+                // so existing memory-persistence tests are parity-unchanged.
+                const std::size_t kMemLogMaxBytes =
+                    static_cast<std::size_t>(config_.memoryLogRingBytes);
+                constexpr std::size_t kMemLogMaxRecords = 1'000'000UL;
+                memoryLogs_.push_back(
+                    std::make_unique<rune::storage::InMemoryLog>(
+                        kMemLogMaxBytes, kMemLogMaxRecords,
+                        rune::storage::FullPolicy::DropOldest));
+                memLogPtr = memoryLogs_.back().get();
+                spdlog::debug("BrokerNode[{}]: transient topic '{}' partition {} on InMemoryLog",
+                              config_.nodeId, spec->name, part);
+            } else {
+                diskLogPtr = topicRegistry_->log(topicId, part);
+                if (!diskLogPtr) {
+                    spdlog::warn("BrokerNode[{}]: log not found for topic {} partition {}; skipping replica",
+                                 config_.nodeId, spec->name, part);
+                    continue;
+                }
+            }
+
+            PartitionConfig pcfg;
+            pcfg.topicId              = topicId;   // DR-BUG-5: multi-topic routing
+            pcfg.partitionId          = static_cast<PartitionId>(part);
+            pcfg.selfId               = selfId;
+            pcfg.replicaLagMaxMs      = config_.replicaLagMaxMs;  // GR-5: configurable
+            pcfg.replicaLagMaxOffset  = 1'000'000'000;  // TIME-based lag only (see note at first use)
+            pcfg.minIsr               = config_.gatewayMinIsr;    // M1: consistent with gateway gate
+            pcfg.fetchIntervalNs      = config_.fetchIntervalNs;
+            pcfg.isrCheckIntervalNs   = 10'000'000LL;
+            pcfg.followerFlushIntervalNs = config_.followerFlushIntervalMs * 1'000'000LL;
+            pcfg.maxFetchBytes        = userTopicMaxFetchBytes(config_);   // F3 r5 I1
+            pcfg.allowUncleanTruncation = topicId >= 0 && config_.survivorLeaderElection;   // ISR v3 Step 11
+            // CP-2: thread TopicSpec.cleanupPolicy into PartitionConfig so that
+            // runBoundedCompaction() reads the correct policy from every replica.
+            // TopicSpec::CleanupPolicy and rune::replication::CleanupPolicy share
+            // the same underlying values (both uint8_t, 0=Delete/1=Compact/2=CompactDelete).
+            pcfg.cleanupPolicy = static_cast<rune::replication::CleanupPolicy>(
+                static_cast<uint8_t>(spec->cleanupPolicy));
+            // CP-2: compaction tuning — thread from TopicSpec (with sane defaults).
+            pcfg.minCleanableDirtyRatio = spec->minCleanableDirtyRatio;
+            pcfg.deleteRetentionMs      = spec->deleteRetentionMs;
+            // CP-3: size/time retention — thread from TopicSpec (-1 = unbounded).
+            pcfg.retentionBytes         = spec->retentionBytes;
+            pcfg.retentionMs            = spec->retentionMs;
+            // CP-8: compaction lag gates — thread from TopicSpec.
+            pcfg.minCompactionLagMs     = spec->minCompactionLagMs;
+            pcfg.maxCompactionLagMs     = spec->maxCompactionLagMs;
+            // CP-8: per-topic segment roll bytes for coalescing group bound.
+            pcfg.segmentRollBytes       = spec->segmentRollBytes;
+            // CP-9: retention scheduler cadence + async-delete delay.
+            // These were missing from BrokerNode::buildReplication (product bug
+            // exposed by the CP-5.1 smoke suite) — fixes retention not firing
+            // at the configured cadence when retentionCheckMs/fileDeleteDelayMs
+            // are set to small values in tests.
+            pcfg.retentionCheckMs       = spec->retentionCheckMs;
+            pcfg.fileDeleteDelayMs      = spec->fileDeleteDelayMs;
+            pcfg.logStartOffset         = spec->logStartOffset;
+            // Task M1 / precondition #1: forward parsed durability into PartitionConfig.
+            // 0 = Majority (default), 1 = AllInSync.
+            pcfg.durability = static_cast<rune::replication::DurabilityMode>(spec->durability);
+            // E3 Task 5: forward async-durability tier (0=Leader, 1=Majority, 2=Strict).
+            pcfg.durabilityTier = spec->durabilityTier;
+
+            // Determine the transport:
+            //
+            //   E5 Task 5 routing rules:
+            //   1. topicId < 0 (internal: __consumer_offsets=-1, __transaction_state=-2,
+            //      __cluster_metadata=-3, __catalog=-6):
+            //      ALWAYS the legacy replTransport_ regardless of flag.
+            //      Rationale: per-worker planes are worker-thread-only; internal
+            //      partitions are driven on the control thread by the bridge/services.
+            //
+            //   2. topicId >= 0 AND per-worker planes were built:
+            //      Use the plane for the worker that owns this (topicId, partition).
+            //      Transport selection is pure (deterministic ShardRouter hash) and
+            //      matches the worker's owned shard set exactly.
+            //
+            //   3. Flag off, or no planes built (no peers / no aeron_):
+            //      Legacy replTransport_ exactly as before (flag-off path unchanged).
+            PartitionTransport* transport = nullptr;
+            if (topicId >= 0 && !perWorkerReplTransports_.empty() && replRouter) {
+                // E5 Task 5: per-worker transport for user partitions.
+                const int32_t workerIdx = replRouter->workerForPartition(topicId, part);
+                transport = perWorkerReplTransports_[static_cast<std::size_t>(workerIdx)].get();
+            } else {
+                // Legacy path: real Aeron transport if available, else no-op.
+                transport = replTransport_.get();
+                if (!transport) {
+                    // Allocate a no-op NullPartitionTransport owned by the replica registry.
+                    // NullPartitionTransport drops all frames (final, direct no-op calls).
+                    nullTransports_.push_back(std::make_unique<NullPartitionTransport>());
+                    transport = nullTransports_.back().get();
+                }
+            }
+
+            // De-virtualized seam (Milestone D P2): dispatch to the matching
+            // concrete constructor overload so the replica stores a typed pointer.
+            auto replica = isTransient
+                ? std::make_unique<PartitionReplica>(
+                      pcfg, Role::Follower, /*epoch=*/0,
+                      allNodeIds, allNodeIds, memLogPtr, transport)
+                : std::make_unique<PartitionReplica>(
+                      pcfg, Role::Follower, /*epoch=*/0,
+                      allNodeIds, allNodeIds, diskLogPtr, transport);
+            applyWorkerDrivenDurability(*replica, topicId, provisionChannel_(), config_.segmentProvisionThresholdPct);   // Task 10 + F30 + hotpath-A
+            if (isTransient) setMemoryEpochFence(*replica, config_.dataDir, topicId, part);
+            // Kafka AlterPartition: user-partition ISR changes go through the
+            // controller (multi-node); internal partitions keep a leader-local ISR.
+            if (topicId >= 0 && replTransport_ && !config_.isSingleNode())
+                replica->setIsrChannel(replTransport_.get());
+
+            if (replTransport_) {
+                // DR-BUG-5: register with composite (topicId, partitionId) key so
+                // replicas from different topics with the same partition index do not
+                // collide in the transport routing table.
+                //
+                // E5 Task 5: when per-worker planes are live, user (topicId>=0) replicas
+                // are routed through per-worker transports — do NOT register them with
+                // the legacy transport's routing table (that would cause the control
+                // thread's AeronPartitionTransport::poll to dispatch to them, which
+                // violates shared-nothing: only the worker thread should drive them).
+                // Internal (topicId<0) replicas ALWAYS stay on the legacy transport.
+                const bool onPerWorkerPlane =
+                    (topicId >= 0 && !perWorkerReplTransports_.empty());
+                if (!onPerWorkerPlane) {
+                    replTransport_->registerReplica(topicId, replica->partitionId(), replica.get());
+                }
+            }
+
+            replicaRegistry_->add(topicId, part, std::move(replica));
+        }
+    }
+
+    if (replTransport_) {
+        spdlog::info("BrokerNode[{}]: registered {} replicas with AeronPartitionTransport",
+                     config_.nodeId, replicaRegistry_->replicaCount());
+    }
+
+    // -----------------------------------------------------------------------
+    // Build replBridge_ — ReplicationMetadataBridge.
+    // Always built (even without transport) so role transitions happen on
+    // the duty cycle; this is a no-op on single-node (only 1 peer = self).
+    // -----------------------------------------------------------------------
+    replBridge_ = std::make_unique<ReplicationMetadataBridge>(
+        selfId, allNodeIds, *replicaRegistry_);
+
+    spdlog::info("BrokerNode[{}]: replication built ({} replicas, transport={})",
+                 config_.nodeId,
+                 replicaRegistry_->replicaCount(),
+                 replTransport_ ? "aeron:udp" : "none");
+}
+
+// ---------------------------------------------------------------------------
+// BrokerNode::createRuntimeUserReplicas — Task 8b (RULING-4, SINGLE-NODE).
+//
+// Create + register the user PartitionReplica(s) for a RUNTIME-defined topic
+// so it becomes produce/consume-capable.  Called on the CONTROL thread from the
+// admin create-topic hook AFTER TopicRegistry::createTopic() has assigned the
+// authoritative id and created the dirs/logs.  This is a faithful, single-topic
+// replay of the boot buildReplication() user-topic loop — same PartitionConfig
+// threading, same InMemoryTransport fallback, same registry + transport
+// registration.  Adding to replicaRegistry_ bumps its generation, so the next
+// NodeRuntimeAgent::doWork cycle's WorkerPool::reconcile() assigns the replica to
+// a worker; addRuntimeTopic() on the MetadataService emits the assignment so the
+// bridge promotes the replica to Leader (single-node this node is the leader).
+// ---------------------------------------------------------------------------
+int32_t BrokerNode::createRuntimeUserReplicas(const TopicSpec& spec) {
+    using namespace rune::replication;
+
+    if (spec.topicId < 0) return 0;             // internal topics not handled here
+    if (!replicaRegistry_ || !topicRegistry_) return 0;
+
+    const NodeId selfId = static_cast<NodeId>(config_.nodeId);
+    std::vector<NodeId> allNodeIds;
+    allNodeIds.reserve(config_.peers.size());
+    for (const auto& peer : config_.peers)
+        allNodeIds.push_back(static_cast<NodeId>(peer.id));
+    if (allNodeIds.empty()) allNodeIds.push_back(selfId);  // single-node safety
+
+    const int32_t topicId = spec.topicId;
+    int32_t registered = 0;
+
+    // MUST-FIX (final review, item a): route runtime-created USER topics
+    // (topicId>=0) to the per-worker replication plane when planes are live —
+    // mirrors buildReplication().  Without this a runtime topic would land on the
+    // legacy transport (a different stream) while peers place it on a per-worker
+    // plane → it would silently fail to replicate on a multi-node cluster.
+    // Internal (topicId<0) always stays on legacy.  The plane index is
+    // workerIdForShard({key, p}, wc) with key = coPartitionGroupKey(group) or
+    // topicId — the WorkerPool router's formula (runCatalogCreate_ installs the
+    // group before this call).
+    const int32_t rtWc = static_cast<int32_t>(perWorkerReplTransports_.size());
+    const int32_t rtGk = spec.coPartitionGroup.empty() ? topicId : rune::metadata::coPartitionGroupKey(spec.coPartitionGroup);
+
+    for (int32_t part = 0; part < spec.partitionCount; ++part) {
+        // Skip if this partition replica already exists (idempotent re-invoke).
+        if (replicaRegistry_->lookup(topicId, part) != nullptr) continue;
+
+        rune::storage::Log*         diskLogPtr = nullptr;
+        rune::storage::InMemoryLog* memLogPtr  = nullptr;
+        const bool isTransient =
+            (spec.persistence == rune::node::PersistenceMode::Transient);
+
+        if (isTransient) {
+            const std::size_t kMemLogMaxBytes =
+                static_cast<std::size_t>(config_.memoryLogRingBytes);
+            constexpr std::size_t kMemLogMaxRecords = 1'000'000UL;
+            memoryLogs_.push_back(std::make_unique<rune::storage::InMemoryLog>(
+                kMemLogMaxBytes, kMemLogMaxRecords,
+                rune::storage::FullPolicy::DropOldest));
+            memLogPtr = memoryLogs_.back().get();
+        } else {
+            // Reuse the Log created + recovered by TopicRegistry::createTopic (Task 5).
+            diskLogPtr = topicRegistry_->log(topicId, part);
+            if (!diskLogPtr) {
+                spdlog::warn("BrokerNode[{}]: runtime topic '{}' partition {} has no log; "
+                             "skipping replica", config_.nodeId, spec.name, part);
+                continue;
+            }
+        }
+
+        // Mirror buildReplication()'s PartitionConfig threading exactly.
+        PartitionConfig pcfg;
+        pcfg.topicId              = topicId;
+        pcfg.partitionId          = static_cast<PartitionId>(part);
+        pcfg.selfId               = selfId;
+        pcfg.replicaLagMaxMs      = config_.replicaLagMaxMs;
+        pcfg.replicaLagMaxOffset  = 1'000'000'000;
+        pcfg.minIsr               = config_.gatewayMinIsr;
+        pcfg.fetchIntervalNs      = config_.fetchIntervalNs;
+        pcfg.isrCheckIntervalNs   = 10'000'000LL;
+        pcfg.followerFlushIntervalNs = config_.followerFlushIntervalMs * 1'000'000LL;
+        pcfg.maxFetchBytes        = userTopicMaxFetchBytes(config_);   // F3 r5 I1
+        pcfg.allowUncleanTruncation = topicId >= 0 && config_.survivorLeaderElection;   // ISR v3 Step 11
+        pcfg.cleanupPolicy = static_cast<rune::replication::CleanupPolicy>(
+            static_cast<uint8_t>(spec.cleanupPolicy));
+        pcfg.minCleanableDirtyRatio = spec.minCleanableDirtyRatio;
+        pcfg.deleteRetentionMs      = spec.deleteRetentionMs;
+        pcfg.retentionBytes         = spec.retentionBytes;
+        pcfg.retentionMs            = spec.retentionMs;
+        pcfg.minCompactionLagMs     = spec.minCompactionLagMs;
+        pcfg.maxCompactionLagMs     = spec.maxCompactionLagMs;
+        pcfg.segmentRollBytes       = spec.segmentRollBytes;
+        pcfg.retentionCheckMs       = spec.retentionCheckMs;
+        pcfg.fileDeleteDelayMs      = spec.fileDeleteDelayMs;
+        pcfg.logStartOffset         = spec.logStartOffset;
+        pcfg.durability = static_cast<rune::replication::DurabilityMode>(spec.durability);
+        pcfg.durabilityTier = spec.durabilityTier;
+
+        const bool onPerWorkerPlane =
+            (topicId >= 0 && !perWorkerReplTransports_.empty());
+        PartitionTransport* transport = nullptr;
+        if (onPerWorkerPlane) {
+            const int32_t workerIdx = rune::metadata::workerIdForShard(rune::metadata::ShardId{rtGk, part}, rtWc);
+            transport = perWorkerReplTransports_[static_cast<std::size_t>(workerIdx)].get();
+        } else {
+            transport = replTransport_.get();
+            if (!transport) {
+                nullTransports_.push_back(std::make_unique<NullPartitionTransport>());
+                transport = nullTransports_.back().get();
+            }
+        }
+
+        auto replica = isTransient
+            ? std::make_unique<PartitionReplica>(
+                  pcfg, Role::Follower, /*epoch=*/0,
+                  allNodeIds, allNodeIds, memLogPtr, transport)
+            : std::make_unique<PartitionReplica>(
+                  pcfg, Role::Follower, /*epoch=*/0,
+                  allNodeIds, allNodeIds, diskLogPtr, transport);
+        applyWorkerDrivenDurability(*replica, topicId, provisionChannel_(), config_.segmentProvisionThresholdPct);   // same policy as boot (F30 fix round 1, F3)
+        if (isTransient) setMemoryEpochFence(*replica, config_.dataDir, topicId, part);
+        if (topicId >= 0 && replTransport_ && !config_.isSingleNode())
+            replica->setIsrChannel(replTransport_.get());   // Kafka AlterPartition (see boot)
+
+        // User replicas on a per-worker plane are polled by their owning worker —
+        // do NOT register them in the legacy transport's routing table (that would
+        // double-dispatch via the control thread). Internal/legacy replicas: register.
+        if (replTransport_ && !onPerWorkerPlane)
+            replTransport_->registerReplica(topicId, replica->partitionId(), replica.get());
+
+        // add() bumps ReplicaRegistry::generation() → WorkerPool::reconcile()
+        // picks it up on the next control cycle and assigns it to a worker.
+        replicaRegistry_->add(topicId, part, std::move(replica));
+        ++registered;
+    }
+
+    // Register the runtime topic with the MetadataService so its assignment is
+    // emitted (leader-only) and the bridge promotes the replica to Leader.
+    // buildStaticRoutingImage() / future rebalances also pick it up.
+    if (metadataService_) {
+        rune::metadata::TopicSpec bs;
+        bs.topicId          = topicId;
+        bs.partitionCount   = spec.partitionCount;
+        // rf 0 = "every broker": resolved by the MetadataService against the
+        // placeable brokers (a catalog-halted broker is never a target; Task 11
+        // fix round 0).  An explicit rf is kept (more than the placeable brokers:
+        // an explicit placement error, never a silent shrink).
+        bs.rf               = 0;
+        if (spec.replicationFactor > 0)
+            bs.rf = std::min<int16_t>(spec.replicationFactor,
+                                      static_cast<int16_t>(std::max<std::size_t>(1, allNodeIds.size())));
+        bs.coPartitionGroup = spec.coPartitionGroup;
+        bs.partitionKey     = spec.partitionKey;
+        metadataService_->addRuntimeTopic(bs);
+    }
+
+    spdlog::info("BrokerNode[{}]: runtime topic '{}' (id={}) → {} user replica(s) registered "
+                 "(single-node); assignment emitted via MetadataService={}",
+                 config_.nodeId, spec.name, topicId, registered,
+                 metadataService_ ? "yes" : "no");
+    return registered;
+}
+
+// ---------------------------------------------------------------------------
+// BrokerNode::buildWorkerPool — E1: create WorkerPool and assign replicas.
+//
+// Must be called AFTER replicaRegistry_ is fully populated (i.e. AFTER
+// buildGateway() has added all user, offset, txn, and metadata replicas).
+//
+// Grouping rule: a topic with a non-empty TopicSpec::coPartitionGroup maps to
+// coPartitionGroupKey(group) — a pure function of the group NAME (shardRouterFor),
+// so every broker derives identical shard identities whatever its boot set.
+// Ungrouped topics fall back to their topicId.
+//
+// Ordinal invariant: partitionId() == partition ordinal (pcfg.partitionId = part
+// at BrokerNode.cpp:434). ShardRouter uses the ordinal as the partition index.
+// The assert below documents + enforces this; if partitionId ever becomes a
+// global gpid this will fire, preventing silent co-partition affinity breakage.
+// ---------------------------------------------------------------------------
+void BrokerNode::buildWorkerPool() {
+    const int32_t wc = config_.workerCount >= 1 ? config_.workerCount : 1;
+
+    // Group keys are a pure function of the group name (coPartitionGroupKey): every broker agrees.
+    rune::metadata::ShardRouter router = shardRouterFor(wc, bootTopics_);
+
+    workerPool_ = std::make_unique<WorkerPool>(
+        wc, std::move(router),
+        static_cast<std::size_t>(config_.workerIngressRingBytes),  // NodeConfig-configurable (bytes, pow2)
+        static_cast<std::size_t>(config_.workerReturnRingBytes),   // NodeConfig-configurable (bytes, pow2)
+        static_cast<std::size_t>(config_.ioSubmitRingDepth),       // E3 Task 7: io-ring depths
+        static_cast<std::size_t>(config_.ioCompletionRingDepth),   // E3 Task 7
+        config_.workerCoreBase);                                    // E4: CPU affinity base core
+
+    if (replicaRegistry_) {
+        // Ordinal-invariant assert: routing uses partitionId() as the partition
+        // ordinal. This holds because pcfg.partitionId = part (BrokerNode.cpp:434),
+        // i.e. partitionId() == the 0-based partition ordinal within the topic.
+        // If partitionId ever becomes a global gpid this assertion will fire,
+        // preventing silent co-partition affinity routing breakage. Internal
+        // system replicas (topicId < 0) use partitionId = 0 — also valid.
+        for (auto* r : replicaRegistry_->allReplicas()) {
+            if (!r) continue;
+            assert(static_cast<int32_t>(r->partitionId()) >= 0 &&
+                   "partitionId() must be a non-negative ordinal (pcfg.partitionId = part)");
+        }
+        workerPool_->assignFromRegistry(*replicaRegistry_);
+        // R-M1: boot (runners not started): every worker knows the ids the catalog already dropped.
+        for (int32_t w = 0; w < workerPool_->workerCount(); ++w) workerPool_->worker(w).setDroppedTopicsDirect(bootDroppedIds_);
+        // Task 10 fix 3 (I2): ops are only routed after an inline reconcile, so
+        // the SetOwnership that governs them is always ahead of them.
+        workerPool_->setRegistry(replicaRegistry_.get());
+    }
+
+    // -----------------------------------------------------------------------
+    // E5.1.3 (c): Per-worker Aeron ingress subscriptions.
+    //
+    // When RUNE_PER_WORKER_INGRESS=true, allocate one WorkerIngress per worker
+    // on stream (workerIngressBaseStreamId + workerId) and wire it into the
+    // worker via setWorkerIngress(ingress, /*active=*/true).
+    //
+    // DEFAULT: false — the gateway fanout remains the live production path.
+    // The gateway produce fanout is gated on !perWorkerIngressEnabled (deliverable e).
+    //
+    // IMPORTANT: the per-worker ingress is only created here when aeron_ is set
+    // (aeron_ is null in unit tests that do not start the embedded driver).
+    // Tests that need the per-worker path construct WorkerIngress directly.
+    // -----------------------------------------------------------------------
+
+    // Combined fix program M4 (X012): with authentication Enabled EVERY worker enforces WRITE on its direct ingress,
+    // whatever the worker mode; one without a sink (non-shard per-worker ingress is refused at config time, but a
+    // programmatic config could still reach here) refuses every direct-ingress produce.
+    if (config_.authMode == AuthMode::Enabled)
+        for (int32_t i = 0; i < wc; ++i) workerPool_->worker(i).requireEnforcement();
+
+    // Apply desired fragment limit + ack-slot reservation size from NodeConfig to
+    // each worker (before runners start).
+    for (int32_t i = 0; i < wc; ++i) {
+        workerPool_->worker(i).setDesiredFragmentLimit(config_.gatewayFragmentLimit);
+        workerPool_->worker(i).setAckSlotBytes(config_.workerAckSlotBytes);
+        workerPool_->worker(i).setBackgroundSyncIntervalNs(config_.workerSyncIntervalMs * 1'000'000LL);
+        if (!config_.ioWorkerCpus.empty()) workerPool_->worker(i).setIoWorkerCpus(config_.ioWorkerCpus);
+        workerPool_->worker(i).setIngressDrainLimit(config_.workerIngressDrainLimit);
+        workerPool_->worker(i).setReturnDrainLimit(config_.workerReturnDrainLimit);
+        workerPool_->worker(i).setMaxOwedReturns(static_cast<std::size_t>(config_.workerMaxOwedReturns));
+        // F15 S3 (re-review 2 B-1) ⇄ F18 ⇄ F19: ONE client-visible batch limit on
+        // every path — NodeConfig::produceIntakeLimit() wraps
+        // Worker::maxAcceptableBatchBytes (rings + replication + egress terms).
+        workerPool_->worker(i).setMaxBatchBytes(static_cast<std::size_t>(config_.produceIntakeLimit()));
+    }
+
+    // F15 S3 (§6): each worker re-checks its own return ring (defence in depth
+    // for the config-level check at the top of start()).
+    for (int32_t i = 0; i < wc; ++i) {
+        if (!workerPool_->worker(i).returnRingCoversMaxPushChunk())
+            throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: worker " +
+                                     std::to_string(i) + " return ring cannot hold a full PushReadResult — "
+                                     "refusing to start");
+    }
+
+    // 2026-10-02: io_uring is the default WHEN AVAILABLE — an auto-selected
+    // uring that cannot be set up fell back to portable; logged ONCE per node.
+    for (int32_t i = 0; i < wc; ++i) {
+        if (const auto& why = workerPool_->worker(i).ioFallbackReason(); !why.empty()) {
+            spdlog::warn("BrokerNode[{}]: io_uring unavailable ({}) — io backend falls back to 'portable' "
+                         "(set RUNE_IO_BACKEND=portable to silence)", config_.nodeId, why);
+            break;
+        }
+    }
+    if (config_.shardMode()) {
+        // Spec §3.1 never-block: a shard has no inline-fsync fallback, so the
+        // selected io backend MUST accept submissions (Task 10 fix 1 / C1).
+        for (int32_t i = 0; i < wc; ++i) {
+            if (!workerPool_->worker(i).ioAcceptsSubmissions()) {
+                const char* v = std::getenv(kIoBackendEnv);
+                throw std::runtime_error(
+                    "BrokerNode[" + std::to_string(config_.nodeId) + "]: " + kIoBackendEnv + "=" +
+                    (v ? v : "") + " selects an io backend that cannot accept submissions; shard "
+                    "mode requires a working async-durability backend (unset it, or use 'portable'"
+#if defined(__linux__)
+                    " or 'uring'"
+#endif
+                    ") — refusing to start");
+            }
+        }
+        // Self-contained worker shards (spec §3.1): each worker's client ingress,
+        // record egress and plane are attached in attachShardRuntimes_() on its
+        // OWN client, after the long startup phases (fix round 1 I2).
+        for (int32_t i = 0; i < wc; ++i) workerPool_->worker(i).setShardMode(true);
+        // Spec §3.3: Metadata advertises each partition's LEADER-worker ingress
+        // endpoint, from explicit RUNE_PEERS configuration (never derived).  Set
+        // here, before the control thread runs (single-writer, no sharing).
+        if (gateway_) {
+            std::vector<rune::gateway::ShardIngressEndpoint> eps;
+            eps.reserve(config_.peers.size());
+            for (const auto& peer : config_.peers)
+                eps.push_back({peer.id, peer.host, static_cast<int32_t>(peer.ingressBasePort),
+                               static_cast<int32_t>(peer.egressControlBasePort)});
+            gateway_->setShardIngressEndpoints(std::move(eps));
+        }
+    } else {
+        if (config_.perWorkerIngressEnabled && aeron_) {
+            const std::string& channel  = config_.clientEndpoint.channel;
+            const int32_t      baseStream = config_.workerIngressBaseStreamId;
+
+            workerIngresses_.reserve(static_cast<std::size_t>(wc));
+            for (int32_t i = 0; i < wc; ++i) {
+                const int32_t streamId = baseStream + i;
+                auto ing = std::make_unique<WorkerIngress>(aeron_, channel, streamId);
+                if (!ing->resolved()) {
+                    spdlog::warn("BrokerNode[{}]: WorkerIngress for worker {} on stream {} "
+                                 "did not resolve (Aeron registration error or driver timeout) — per-worker ingress disabled for this worker",
+                                 config_.nodeId, i, streamId);
+                } else {
+                    spdlog::info("BrokerNode[{}]: WorkerIngress for worker {} wired on stream {} (channel={})",
+                                 config_.nodeId, i, streamId, channel);
+                }
+                workerPool_->worker(i).setWorkerIngress(ing.get(), /*active=*/ing->resolved());
+                workerIngresses_.push_back(std::move(ing));
+            }
+            // Gate the gateway produce fanout: when per-worker ingress is active,
+            // produce arrives on each worker's dedicated stream — gateway must NOT also
+            // enqueue to workerPool_ (that would double-process the same produce).
+            if (gateway_) {
+                gateway_->setPerWorkerIngressActive(true);
+                spdlog::info("BrokerNode[{}]: gateway produce fanout GATED (perWorkerIngressActive=true)",
+                             config_.nodeId);
+
+                // E5.1.3 (d) R7 fix: register all user-partition logs as worker-owned
+                // so flushDirtyLogs() skips them (the worker calls log->sync on its
+                // own thread — the only thread appending to these logs).
+                if (replicaRegistry_ && topicRegistry_) {
+                    for (const auto& ts : bootTopics_) {
+                        for (int32_t p = 0; p < ts.partitionCount; ++p) {
+                            rune::storage::Log* log = topicRegistry_->log(ts.topicId, p);
+                            if (log) {
+                                gateway_->addWorkerOwnedLog(log);
+                            }
+                        }
+                    }
+                    spdlog::info("BrokerNode[{}]: {} user-partition logs marked worker-owned (R7 fix)",
+                                 config_.nodeId, bootTopics_.size());
+                }
+            }
+            spdlog::info("BrokerNode[{}]: per-worker ingress ACTIVE ({} subscriptions on base stream {})",
+                         config_.nodeId, wc, baseStream);
+        } else if (config_.perWorkerIngressEnabled && !aeron_) {
+            spdlog::warn("BrokerNode[{}]: RUNE_PER_WORKER_INGRESS=true but aeron_ is null — "
+                         "per-worker ingress NOT activated (no embedded driver)",
+                         config_.nodeId);
+        }
+
+        // -----------------------------------------------------------------------
+        // read-rework T3/T4 (I1b/I3b): per-worker dynamic-MDC EGRESS publications.
+        //
+        // Independent of per-worker ingress.  Each worker owns ONE ExclusivePublication
+        // it alone writes; consumers self-register via control-mode=dynamic.  Control
+        // address = host:(basePort+W), streamId = egressBase + W.  egressBase defaults
+        // to workerIngressBaseStreamId + workerCount so the ingress/egress stream ranges
+        // never overlap.  When active, the gateway routes Subscribe/Unsubscribe to the
+        // owning worker and stops pushing user partitions itself (I3b).
+        // -----------------------------------------------------------------------
+        if (config_.perWorkerEgressEnabled && aeron_) {
+            int32_t egressBase = config_.workerEgressBaseStreamId;
+            if (egressBase <= 0) egressBase = config_.workerIngressBaseStreamId + wc;
+            workerEgresses_.reserve(static_cast<std::size_t>(wc));
+            for (int32_t i = 0; i < wc; ++i) {
+                const int32_t     egStream = egressBase + i;
+                const std::string control  = config_.effectiveWorkerEgressControlHost() + ":" +
+                    std::to_string(config_.effectiveWorkerEgressControlBasePort() + i);
+                auto eg = std::make_unique<WorkerEgress>(aeron_, control, egStream);
+                if (!eg->resolved() || i == forceEgressUnresolvedForTest_) {
+                    // Review B-M1: never a silent WARN-and-disable (that worker would quietly drop to legacy
+                    // egress) — the same rule as the shard path: refuse to start, naming the control endpoint.
+                    throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: per-worker "
+                        "egress for worker " + std::to_string(i) + " (stream " + std::to_string(egStream) +
+                        ", control " + control + ") did not resolve — refusing to start (would silently fall back "
+                        "to legacy egress; a taken control port: see the startup ephemeral-range WARN)");
+                } else {
+                    spdlog::info("BrokerNode[{}]: WorkerEgress for worker {} wired on stream {} "
+                                 "(dynamic-MDC control={})",
+                                 config_.nodeId, i, egStream, control);
+                }
+                workerPool_->worker(i).setWorkerEgress(eg.get());
+                workerEgresses_.push_back(std::move(eg));
+            }
+            if (gateway_) {
+                gateway_->setPerWorkerEgressActive(true);
+                gateway_->setWorkerEgressParams(config_.effectiveWorkerEgressControlBasePort(), egressBase);
+                spdlog::info("BrokerNode[{}]: per-worker EGRESS ACTIVE — gateway routes "
+                             "Subscribe/Unsubscribe to owning workers (base stream {}, "
+                             "control base port {})",
+                             config_.nodeId, egressBase, config_.effectiveWorkerEgressControlBasePort());
+            }
+        } else if (config_.perWorkerEgressEnabled && !aeron_) {
+            spdlog::warn("BrokerNode[{}]: RUNE_PER_WORKER_EGRESS=true but aeron_ is null — "
+                         "per-worker egress NOT activated (no embedded driver)",
+                         config_.nodeId);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // E5 Task 5: wire each worker's per-worker replication transport.
+    //
+    // perWorkerReplTransports_ is populated by buildReplication() when
+    // perWorkerReplication=true && aeron_ && there are replication peers.
+    // At this point the workers' AgentRunners have NOT yet started, so it is
+    // safe to call setReplicationTransport (startup / single-threaded path).
+    //
+    // Non-owning: BrokerNode owns the WorkerReplicationTransport lifetime;
+    // workers hold raw pointers.  Task 6 will drive poll() from doWork;
+    // for this task the pointer is just stored on the worker.
+    // -----------------------------------------------------------------------
+    if (!perWorkerReplTransports_.empty()) {
+        const std::size_t planeCount = perWorkerReplTransports_.size();
+        for (int32_t i = 0; i < wc; ++i) {
+            const std::size_t idx = static_cast<std::size_t>(i) % planeCount;
+            workerPool_->worker(i).setReplicationTransport(
+                perWorkerReplTransports_[idx].get());
+        }
+        spdlog::info("BrokerNode[{}]: per-worker replication transport wired to {} worker(s)",
+                     config_.nodeId, wc);
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 19: live view-fold wiring.  One ViewSnapshotChannel + WorkerViewSet
+    // per worker; wire each into its worker via setViewSet() HERE — single-
+    // threaded, before the runners start (like setOwnedDirect).  A single
+    // per-NODE ViewSnapshotIoAgent drains every worker's checkpoint-delta ring
+    // (started in start(), stopped in stop() — mirrors the cleaner agent).
+    {
+        const std::string viewSnapDir =
+            (fs::path{config_.dataDir} / "__view_snapshots").string();
+        viewSnapshotChannels_.clear();
+        workerViewSets_.clear();
+        viewSnapshotChannels_.reserve(static_cast<std::size_t>(wc));
+        workerViewSets_.reserve(static_cast<std::size_t>(wc));
+        std::vector<ViewSnapshotChannel*> chPtrs;
+        chPtrs.reserve(static_cast<std::size_t>(wc));
+        for (int32_t i = 0; i < wc; ++i) {
+            viewSnapshotChannels_.push_back(std::make_unique<ViewSnapshotChannel>());
+            ViewSnapshotChannel* ch = viewSnapshotChannels_.back().get();
+            chPtrs.push_back(ch);
+            workerViewSets_.push_back(std::make_unique<WorkerViewSet>(*ch, viewSnapDir));
+            workerPool_->worker(i).setViewSet(workerViewSets_.back().get());
+        }
+        viewSnapshotIoAgent_ = std::make_unique<ViewSnapshotIoAgent>(
+            std::move(chPtrs), viewSnapDir, /*fsyncMs=*/50);
+        viewSnapshotIoIdleStrategy_ = makeShapedBackoff(config_.adminIdleShape());
+        viewSnapshotIoRunner_ = std::make_unique<rune::consensus::AgentRunner>(
+            *viewSnapshotIoAgent_, *viewSnapshotIoIdleStrategy_, viewSnapshotIoClock_);
+        spdlog::info("BrokerNode[{}]: view-fold wiring built ({} worker view sets, snapshot dir={})",
+                     config_.nodeId, wc, viewSnapDir);
+    }
+
+    spdlog::info("BrokerNode[{}]: WorkerPool built ({} workers, {} replicas assigned)",
+                 config_.nodeId, wc,
+                 replicaRegistry_ ? replicaRegistry_->replicaCount() : std::size_t(0));
+}
+
+// ---------------------------------------------------------------------------
+// BrokerNode::buildGateway — create the ClientGateway and NodeRuntimeAgent.
+//
+// Called AFTER buildConsensusObjects() (so agent_ / nodeAgent_ are valid)
+// and AFTER the aeron_ client is connected (so addSubscription succeeds).
+//
+// The leaderView lambda runs on the gateway's duty-cycle thread (the control
+// thread, same as the AgentRunner) and reads the leadership view DIRECTLY from
+// control-thread-owned state (LeaderObserver::computeOnControl — F9a).  It must
+// never call the observer accessors (isLeader()/leaderId()), which drain the
+// observer ring and belong to the external (main/test) thread.
+//
+// leaderView ruling (BR-7a / Milestone A):
+//   isLeader = node.isLeader()
+//   leaderClientEndpoint = isLeader ? config_.clientEndpoint.channel : ""
+//   Effect: followers degrade to accept locally (empty endpoint path in BR-5).
+//   TODO(Milestone B): per-peer client endpoints for exact REDIRECT.
+// ---------------------------------------------------------------------------
+void BrokerNode::onStorageFailure_(const std::string& logDir, int err) {
+    if (haltRaised_) return;
+    haltRaised_ = true;
+    spdlog::critical("BrokerNode[{}]: STORAGE FAILURE — fsync failed on {} (errno={}: {}). "
+                     "The log is permanently failed; HALTING the broker (exit {}). Restart "
+                     "recovery truncates to the last valid batch; replication re-heals it.",
+                     config_.nodeId, logDir, err, std::strerror(err), kExitStorageFailure);
+    if (haltHandler_) {
+        haltHandler_(haltCtx_, kExitStorageFailure);
+        return;
+    }
+    // No owner-installed handler: fail-stop immediately.  Restart recovery
+    // truncates the torn tail; nothing on this node may run past a failed fsync.
+    spdlog::critical("BrokerNode[{}]: no halt handler installed — exiting {} now",
+                     config_.nodeId, kExitStorageFailure);
+    spdlog::default_logger()->flush();
+    std::_Exit(kExitStorageFailure);
+}
+
+void BrokerNode::onInvariantViolation_(const std::string& what) {
+    if (haltRaised_) return;
+    haltRaised_ = true;
+    spdlog::critical("BrokerNode[{}]: INVARIANT VIOLATION — {} — halting (exit {})",
+                     config_.nodeId, what, kExitInvariantViolation);
+    if (haltHandler_) { haltHandler_(haltCtx_, kExitInvariantViolation); return; }
+    spdlog::default_logger()->flush();
+    std::_Exit(kExitInvariantViolation);
+}
+
+void BrokerNode::refuseStartOnFailedRecovery_() {
+    // Every log this node will serve — registry replicas AND the logs outside
+    // the registry (__catalog; the internal offset / txn / metadata logs; every
+    // configured topic's partition logs).  Enumerated explicitly (Task 10 fix 3
+    // / I1): the registry is not assumed to be complete.
+    std::vector<rune::storage::Log*> logs;
+    if (replicaRegistry_)
+        for (auto* r : replicaRegistry_->allReplicas())
+            if (r && r->isDiskBacked()) logs.push_back(r->log());
+    for (auto* l : {catalogLog_.get(), offsetLog_.get(), txnLog_.get(), metadataLog_.get()})
+        if (l) logs.push_back(l);
+    if (topicRegistry_)
+        for (const auto& ts : bootTopics_)
+            for (int32_t p = 0; p < ts.partitionCount; ++p)
+                if (auto* l = topicRegistry_->log(ts.topicId, p)) logs.push_back(l);
+    if (catalogRecoveryFaultForTest_ != 0 && catalogLog_) {
+        catalogLog_->setSyncFaultForTest(catalogRecoveryFaultForTest_);
+        catalogLog_->recover();
+        catalogLog_->setSyncFaultForTest(0);
+    }
+    for (auto* l : logs) {
+        if (!l->storageFailed()) continue;
+        spdlog::critical("BrokerNode[{}]: log {} FAILED recovery (errno={}) — refusing to start",
+                         config_.nodeId, l->dir(), l->storageErrno());
+        onStorageFailure_(l->dir(), l->storageErrno());
+        throw std::runtime_error("BrokerNode: log " + l->dir() + " failed recovery (storage failure) — refusing to start");
+    }
+    if (!replicaRegistry_) return;
+    if (recoveryFaultForTest_ != 0) {
+        // Test-only: re-run the first disk-backed user log's recovery with an
+        // injected msync fault — the real recover() failure path.
+        for (auto* r : replicaRegistry_->allReplicas()) {
+            if (r && r->topicId() >= 0 && r->isDiskBacked()) {
+                r->log()->setSyncFaultForTest(recoveryFaultForTest_);
+                r->log()->recover();
+                r->log()->setSyncFaultForTest(0);
+                break;
+            }
+        }
+    }
+    for (auto* r : replicaRegistry_->allReplicas()) {
+        if (!r || !r->isDiskBacked() || !r->log()->storageFailed()) continue;
+        const std::string dir = r->log()->dir();
+        const int err = r->log()->storageErrno();
+        spdlog::critical("BrokerNode[{}]: log {} FAILED recovery (errno={}) — refusing to start",
+                         config_.nodeId, dir, err);
+        onStorageFailure_(dir, err);   // halt path: handler (exit 74) or _Exit(74)
+        throw std::runtime_error("BrokerNode: log " + dir + " failed recovery (storage failure) — refusing to start");
+    }
+}
+
+void BrokerNode::buildGateway() {
+    if (startupPhaseHookForTest_) startupPhaseHookForTest_("build-gateway");   // test-only fault injection
+    // Capture config_ by value (immutable after construction).
+    const std::string clientChannel  = config_.clientEndpoint.channel;
+    const int32_t     clientStreamId = config_.clientEndpoint.streamId;
+    const int32_t     nodeId         = config_.nodeId;
+
+    // leaderView: read atomic isLeader() + leaderClientEndpoint() (GB-4).
+    //
+    // Milestone-B ruling: supply per-peer client endpoints for exact REDIRECT.
+    //   - leader → {isLeader=true, leaderClientEndpoint=""}  (no self-redirect)
+    //   - follower + known leader endpoint → {isLeader=false, leaderClientEndpoint=<peer channel>}
+    //   - follower + unknown endpoint → {isLeader=false, leaderClientEndpoint=""}
+    //     (gateway degrades to local-accept for Connect; data ops return NotLeader)
+    // Control thread: owner-state reads via LeaderObserver::computeOnControl (F9a).
+    auto leaderViewFn = [this]() -> rune::gateway::LeaderView {
+        const LeaderSnapshot v = leaderObserver_.computeOnControl();
+        return rune::gateway::LeaderView{
+            /*isLeader=*/v.isLeader,
+            /*leaderClientEndpoint=*/v.isLeader ? std::string{} : this->leaderClientEndpointFor_(v)
+        };
+    };
+
+    // Task 9 (RUNE_TLS): load the broker's TLS cert/key PEM TEXT from the
+    // configured file paths now, at construction, exactly once — the
+    // ClientGateway ctor wants PEM text, never a path (Task 7's contract).
+    // Both paths empty (no RUNE_TLS_CERT_FILE/RUNE_TLS_KEY_FILE, or a
+    // RUNE_TLS=OFF build where the fields are never populated — see
+    // NodeConfig.cpp) = crypto disabled, byte-identical to pre-Task-7/9
+    // behaviour.
+    //
+    // Review fix round 2 (Important): a configured-but-unreadable cert used
+    // to log and silently clear to plaintext whenever require_tls was off —
+    // a fail-open footgun.  rune::node::mustRefuseStartForUnloadableTls
+    // (TlsStartupPolicy.h) now refuses to start whenever TLS was configured
+    // at all (either path non-empty — including a PARTIAL config, only one
+    // of the two paths set) but didn't both load — independent of
+    // require_tls.  Only when NEITHER path is set does the broker proceed
+    // plaintext (TLS genuinely not configured).
+    std::string tlsCertPem, tlsKeyPem;
+    const bool tlsCertLoaded   = rune::node::loadPemFile(config_.tlsCertFile, tlsCertPem);
+    const bool tlsKeyLoaded    = rune::node::loadPemFile(config_.tlsKeyFile, tlsKeyPem);
+    const bool tlsIsConfigured = rune::node::tlsConfigured(config_.tlsCertFile, config_.tlsKeyFile);
+    if (rune::node::mustRefuseStartForUnloadableTls(tlsIsConfigured, tlsCertLoaded, tlsKeyLoaded)) {
+        throw std::runtime_error(
+            "BrokerNode[" + std::to_string(nodeId) + "]: TLS is configured (RUNE_TLS_CERT_FILE='" +
+            config_.tlsCertFile + "', RUNE_TLS_KEY_FILE='" + config_.tlsKeyFile +
+            "') but could not be fully loaded (cert loaded=" + (tlsCertLoaded ? "yes" : "no") +
+            ", key loaded=" + (tlsKeyLoaded ? "yes" : "no") +
+            ") — refusing to start rather than silently degrade to plaintext");
+    }
+    if (config_.requireTls && (tlsCertPem.empty() || tlsKeyPem.empty())) {
+        // require_tls with no usable cert would hard-reject every Connect
+        // (never a silent plaintext fleet) — refuse to start instead of
+        // bricking the broker at runtime on the first client connect.  The
+        // check above already covers "TLS configured but unloadable"; this
+        // one remains for "require_tls set but TLS not configured at all"
+        // (both paths empty).
+        throw std::runtime_error("BrokerNode: RUNE_REQUIRE_TLS is set but no usable TLS cert/key "
+                                  "was loaded (RUNE_TLS_CERT_FILE/RUNE_TLS_KEY_FILE) — refusing to "
+                                  "start (every Connect would be rejected)");
+    }
+    // Task 19 (per-worker egress crypto addendum): shard mode + require_tls
+    // used to be refused at startup here (the shard worker's Records egress
+    // was plaintext-only, so the combination could never serve a client).
+    // Now that the shard worker seals its own Records egress with its own
+    // per-sender key (RecordsSeal.h / SessionAnnounce key handoff), shard
+    // mode serves encrypted sessions exactly like legacy mode — this
+    // startup refusal is gone (see rune::node::TlsStartupPolicy.h's header
+    // note for the removed mustRefuseShardWithRequireTls).
+    //
+    // Task 19 review fix (Important): NON-shard per-worker egress has no
+    // such key handoff at all (SessionAnnouncer only runs in shard mode) —
+    // a worker there would push an encrypted session's Records in the
+    // clear. Refuse to start rather than fail open.
+    const bool brokerHasTlsAtStartup = !tlsCertPem.empty() && !tlsKeyPem.empty();
+    if (rune::node::mustRefuseNonShardPerWorkerEgressTls(
+            config_.perWorkerEgressEnabled, config_.shardMode(), config_.requireTls,
+            brokerHasTlsAtStartup)) {
+        throw std::runtime_error(
+            "BrokerNode[" + std::to_string(nodeId) + "]: non-shard per-worker-egress has no "
+            "Records crypto handoff; it cannot serve TLS — use shard mode or disable "
+            "per-worker egress");
+    }
+
+    // Build the gateway (subscribes on clientChannel).
+    try {
+        gateway_ = std::make_unique<rune::gateway::ClientGateway>(
+            aeron_,
+            clientChannel,
+            clientStreamId,
+            nodeId,
+            rune::gateway::ClientGateway::kDefaultSessionTimeoutNs,
+            std::move(leaderViewFn),
+            rune::gateway::ClientGateway::kDefaultConnectResolveTimeoutNs,
+            rune::aeronutil::AeronPump{},
+            tlsCertPem,
+            tlsKeyPem,
+            config_.requireTls
+        );
+        if (config_.maxHeldIdleMs > 0) gateway_->setMaxHeldIdleNs(config_.maxHeldIdleMs * 1'000'000LL);   // D8b
+        static_assert(NodeConfig::kMaxGatewayProduceCredits == rune::gateway::ClientGateway::kMaxSessionProduceCredits);
+        if (config_.gatewayProduceCredits > 0) gateway_->setSessionProduceCredits(config_.gatewayProduceCredits);   // D8c
+        // Wire in the TopicRegistry (GB-1). Non-owning pointer; registry outlives
+        // the gateway (both destroyed in stop() with registry after gateway).
+        gateway_->setTopicRegistry(topicRegistry_.get());
+        // Authentication Task 16: the workers' paced reports of dropped inter-broker frames -> counter 1'000'235.
+        workerPeerDrops_.assign(static_cast<std::size_t>(config_.workerCount >= 1 ? config_.workerCount : 1), 0);
+        gateway_->setPeerFrameDropSink(&BrokerNode::onWorkerPeerFrameDropsThunk_, this);
+        // Authentication Task 10 (D11/D13): how sessions authenticate + the bootstrap window's view (the control thread's
+        // own SecurityView - the gateway runs on this same thread).
+        gateway_->setAuthTimeoutNs(config_.authTimeoutMs * 1'000'000LL);   // D13: RUNE_AUTH_TIMEOUT_MS
+        gateway_->setAuthMode(config_.authMode == AuthMode::Enabled  ? rune::gateway::GatewayAuthMode::Required
+                              : config_.authMode == AuthMode::DevDisabled ? rune::gateway::GatewayAuthMode::Dev
+                                                                          : rune::gateway::GatewayAuthMode::InProcess,
+                              securityView_ ? &*securityView_ : nullptr);
+        gateway_->setBootObjects(std::move(bootObjects_));   // authentication Task 12: the catalog's live topics / views at boot
+        // Authentication Task 10 (D4/D32): the gateway's OWN copy of the cluster keys (loaded on this startup thread,
+        // validated by validateAuth) verifies the bootstrap proof.  Dev / in-process configs hold none.
+        // Review C I4: the keys validated in start() ARE the keys in use - one load, handed out as copies; Enabled with
+        // none is an error, never a silent "authentication is not enabled" on every bootstrap.
+        if (config_.authMode == AuthMode::Enabled) {
+            if (!clusterKeys_) throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) +
+                                                        "]: authentication is enabled but no cluster key was loaded");
+            gateway_->setClusterKeys(*clusterKeys_);
+        }
+        // DR-15 fix round 2 (LOW-4): clients' reply hostnames resolve off-thread.
+        if (resolverHub_) gateway_->setHostResolver(resolverHub_->subscribeHostResolver());
+        // fsyncgate fail-stop: worker StorageFailure signals (and the gateway's
+        // own flushDirtyLogs) land here on the runtime thread → halt.
+        gateway_->setStorageFailureHandler([this](const std::string& dir, int err) {
+            onStorageFailure_(dir, err);
+        });
+        gateway_->setInvariantViolationHandler([this](const std::string& what) {
+            onInvariantViolation_(what);
+        });
+
+        // Wire in the ReplicaRegistry (GR-4). Non-owning pointer; replicaRegistry_
+        // outlives the gateway (gateway_ is destroyed before replicaRegistry_ in stop()).
+        // When set, handleProduce() will call onLeaderLogAppended() after each
+        // append so the leader replica's tracked LEO/HW is reconciled and followers
+        // can fetch the new bytes (Mode A seam — no double-append).
+        gateway_->setReplicaRegistry(replicaRegistry_.get());
+        gateway_->setTransientLineage(&BrokerNode::transientLineageTrampoline_, this);   // round 6 (F1)
+
+        // M1: Apply the cluster-majority minIsr gate for acks=All produces.
+        // gatewayMinIsr is computed from the peer count (or RUNE_MIN_ISR env override)
+        // during parseNodeConfig; single-node → 1 (leader-only ISR is sufficient).
+        gateway_->setMinIsr(config_.gatewayMinIsr);
+        gateway_->setMaxProduceBatchBytes(
+            static_cast<std::size_t>(config_.produceIntakeLimit()));
+        spdlog::info("BrokerNode[{}]: effective max batch (produce intake) limit {} B "
+                     "(gateway {} B; ingress ring {} B, return ring {} B, repl outbound ring {} B, "
+                     "aeron term {} B)", nodeId, config_.produceIntakeLimit(),
+                     gateway_->maxProduceBatchBytes(), config_.workerIngressRingBytes,
+                     config_.workerReturnRingBytes, config_.replicationOutboundRingBytes,
+                     config_.aeronTermBufferBytes);
+        spdlog::info("BrokerNode[{}]: gateway minIsr set to {} (cluster size={})",
+                     nodeId, config_.gatewayMinIsr, config_.peers.size());
+
+        // G0.3: Apply the configurable fragment poll limit (RUNE_GATEWAY_FRAGMENT_LIMIT).
+        // Default 256 (raised from hard-coded 10 to avoid head-of-line blocking on
+        // batched ingress); sourced from NodeConfig::gatewayFragmentLimit.
+        gateway_->setFragmentLimit(config_.gatewayFragmentLimit);
+        spdlog::info("BrokerNode[{}]: gateway fragmentLimit set to {}",
+                     nodeId, config_.gatewayFragmentLimit);
+
+        // F3 round 6, item 6: the batch limit is a CLUSTER-WIDE constraint (a
+        // follower must carry what any leader accepted).  Shard mode verifies it
+        // per plane (PlaneHello → Refused on mismatch); legacy mode cannot, so
+        // the config MUST be homogeneous.  (F3 rounds 4-5's install is the ONE
+        // setMaxProduceBatchBytes(produceIntakeLimit()) above.)
+        if (!config_.isSingleNode() && !config_.shardMode()) {
+            spdlog::info("BrokerNode[{}]: legacy replication mode — max produce batch {} B "
+                         "(worker ingress ring {} B) is NOT verified against peers: "
+                         "RUNE_AERON_TERM_BUFFER_BYTES / RUNE_WORKER_INGRESS_RING_BYTES / "
+                         "RUNE_WORKER_RETURN_RING_BYTES / RUNE_REPLICATION_OUTBOUND_RING_BYTES / "
+                         "RUNE_MAX_PRODUCE_BATCH_BYTES MUST be identical on every node",
+                         nodeId, config_.produceIntakeLimit(), config_.workerIngressRingBytes);
+        }
+
+        // E5.1: Apply per-worker ingress base stream id (RUNE_WORKER_INGRESS_BASE_STREAM).
+        // Each PartitionEntry in the MetadataResponse will carry
+        //   ingressStreamId = base + ShardRouter.workerForPartition(topicId, partition)
+        // so the client can connect directly to the owning worker's ingress stream.
+        gateway_->setWorkerIngressBaseStreamId(config_.workerIngressBaseStreamId);
+        spdlog::info("BrokerNode[{}]: workerIngressBaseStreamId set to {}",
+                     nodeId, config_.workerIngressBaseStreamId);
+
+        // MD1 Task 9: Build nodeId → client endpoint map for per-partition REDIRECT.
+        // Built from NodeConfig::peers: each peer carries a clientPort (GB-4 per-peer
+        // client endpoint).  A zero clientPort means no known client endpoint (empty
+        // string); the gateway will fall back to NotLeader in that case.
+        {
+            std::unordered_map<int32_t, std::string> nodeEndpoints;
+            nodeEndpoints.reserve(config_.peers.size());
+            for (const auto& peer : config_.peers) {
+                // Advertise EVERY node's real client endpoint — including self.
+                // This map feeds two consumers: (1) the per-partition REDIRECT
+                // path, which never looks up self (both redirect sites guard on
+                // leaderNodeId != thisNodeId_ before the lookup), and (2) the
+                // MetadataResponse broker list, which MUST include self so a
+                // client seeded on this node can route to partitions THIS node
+                // leads.  Blanking self broke (2): the seed node advertised its
+                // own endpoint as "" → clients hit "endpoint unreachable" for
+                // every partition led by the seed.
+                nodeEndpoints[peer.id] = peer.clientChannel();
+            }
+            gateway_->setNodeEndpointMap(std::move(nodeEndpoints));
+            spdlog::info("BrokerNode[{}]: gateway nodeEndpointMap wired ({} entries)",
+                         nodeId, config_.peers.size());
+        }
+    } catch (const std::exception& ex) {
+        // D8 (2026-10-03): fail-fast, never a HEADLESS node.  This used to warn and continue without a
+        // gateway: the node still joined consensus (and could lead) but no client could ever reach it
+        // (and callers null-dereferenced gatewayForTest()).  Same rule as the per-worker transports.
+        gateway_.reset();
+        throw std::runtime_error("BrokerNode[" + std::to_string(nodeId) +
+                                 "]: ClientGateway construction failed — refusing to start without a client gateway: " +
+                                 ex.what());
+    }
+
+    // -----------------------------------------------------------------------
+    // CG-6 wiring: GroupCoordinationService → ClientGateway.
+    //
+    // Build a durable __consumer_offsets Log + single-partition PartitionReplica
+    // (InMemoryTransport — role transitions handled by the bridge like other
+    // replicas; no Aeron transport needed for the offset log in CG-6).
+    // Then create ReplicatedOffsetStore + GroupCoordinationService and wire
+    // both directions: gateway → service (setGroupService) and
+    // service → gateway (setGateway).
+    //
+    // This must happen AFTER gateway_ is set (we wire into it), and the
+    // GroupCoordinationService is passed to NodeRuntimeAgent so doWork
+    // drives the group coordinator duty cycle on the single-writer thread.
+    // -----------------------------------------------------------------------
+    if (gateway_) {
+        try {
+            const fs::path offsetDir = fs::path{config_.dataDir} / "__consumer_offsets";
+            fs::create_directories(offsetDir);
+
+            // One partition Log for all committed offsets (compact key/value encoding).
+            offsetLog_ = std::make_unique<rune::storage::Log>(
+                offsetDir.string(), config_.offsetLogSegmentRollBytes);
+            offsetLog_->recover();
+
+            // Wrap in a PartitionReplica for the __consumer_offsets topic.
+            // topicId=-1 is the sentinel for the offset log (not a user topic).
+            // When replTransport_ is available (multi-node cluster), use it so
+            // committed offsets are replicated to all peers and survive leader
+            // failover.  On single-node (no transport), fall back to NullPartitionTransport.
+            // The replica is added to replicaRegistry_ so the metadata bridge drives
+            // its role transitions (Follower → Leader on election, Leader → Follower
+            // on dethronement) exactly like user-topic replicas.
+            // Role starts Follower / epoch 0; the bridge corrects on first doWork.
+            const NodeId selfId = static_cast<NodeId>(config_.nodeId);
+
+            // Rebuild allNodeIds (same as in buildReplication).
+            std::vector<NodeId> allNodeIds;
+            allNodeIds.reserve(config_.peers.size());
+            for (const auto& peer : config_.peers) {
+                allNodeIds.push_back(static_cast<NodeId>(peer.id));
+            }
+
+            rune::replication::PartitionConfig ocfg;
+            ocfg.topicId              = -1;   // sentinel: not a user topic
+            ocfg.partitionId          = 0;
+            ocfg.selfId               = selfId;
+            // minIsr=1: offset commits are leader-local (no ISR majority wait).
+            // The replica still replicates to followers via Aeron so that a new
+            // leader can rebuild committed offsets after failover.  Leader-local
+            // (minIsr=1) avoids ISR-establishment delays on the new leader before
+            // the first offset commit succeeds.
+            ocfg.minIsr               = 1;
+            ocfg.replicaLagMaxMs      = config_.replicaLagMaxMs;
+            ocfg.replicaLagMaxOffset  = 1'000'000'000;  // TIME-based lag only (see note at first use)
+            ocfg.fetchIntervalNs      = config_.fetchIntervalNs;
+            ocfg.isrCheckIntervalNs   = 10'000'000LL;
+            ocfg.maxFetchBytes        = rune::replication::kDefaultMaxFetchBytes;
+            // CP-1: __consumer_offsets is a compacted topic (keep latest per key).
+            ocfg.cleanupPolicy        = rune::replication::CleanupPolicy::Compact;
+            // CP-2: compaction tuning for __consumer_offsets sentinel topic.
+            ocfg.minCleanableDirtyRatio = 0.5;          // 50% dirty before compaction fires
+            ocfg.deleteRetentionMs      = 86'400'000LL; // 1 day tombstone retention
+            // CP-10 Fix 3: match segmentRollBytes to the offset log's actual roll so
+            // the coalescer group bound is consistent with what the cleaner uses per-topic.
+            ocfg.segmentRollBytes       = config_.offsetLogSegmentRollBytes;
+
+            // Transport: real Aeron transport if available, else no-op NullPartitionTransport.
+            rune::replication::PartitionTransport* offsetTransport = replTransport_.get();
+            if (!offsetTransport) {
+                nullTransports_.push_back(std::make_unique<rune::replication::NullPartitionTransport>());
+                offsetTransport = nullTransports_.back().get();
+            }
+
+            offsetReplica_ = std::make_unique<rune::replication::PartitionReplica>(
+                ocfg,
+                rune::replication::Role::Follower, // bridge promotes to Leader on first doWork
+                /*epoch=*/0,
+                allNodeIds,
+                allNodeIds,
+                offsetLog_.get(),
+                offsetTransport);
+
+            // Register with the Aeron transport (topicId=-1, partitionId=0) so
+            // FetchRequest / FetchResponse frames for the offset log are routed here.
+            if (replTransport_) {
+                replTransport_->registerReplica(-1, 0, offsetReplica_.get());
+                // Re-review MEDIUM-B: controller-ISR path (Kafka AlterPartition),
+                // multi-node — as a user partition.
+                if (!config_.isSingleNode()) offsetReplica_->setIsrChannel(replTransport_.get());
+            }
+
+            // Add to replicaRegistry_ so the metadata bridge drives role transitions
+            // and NodeRuntimeAgent::doWork calls replica->doWork() each cycle.
+            if (replicaRegistry_) {
+                replicaRegistry_->add(-1, 0, std::move(offsetReplica_));
+                // After move, recover the raw pointer for offsetStore_ construction.
+                offsetReplica_.reset(); // unique_ptr now owned by replicaRegistry_
+            }
+            // Re-acquire raw pointer from registry for offsetStore_ construction.
+            rune::replication::PartitionReplica* offsetReplicaRaw =
+                replicaRegistry_ ? replicaRegistry_->lookup(-1, 0) : nullptr;
+
+            // ReplicatedOffsetStore: commits append to offsetReplicaRaw + in-memory map.
+            // offsetReplicaRaw is now owned by replicaRegistry_; offsetReplica_ is null.
+            offsetStore_ = std::make_unique<rune::coordination::ReplicatedOffsetStore>(
+                offsetReplicaRaw);
+            // Replay any previously committed offsets from the local Log.
+            // On a fresh node this is a no-op; on restart it restores durable state.
+            // On failover, GroupCoordinationService::doWork() will rebuild on
+            // becoming leader so the in-memory index reflects replicated commits.
+            offsetStore_->rebuildFromLog();
+
+            // GroupCoordinationService: handles JoinGroup / SyncGroup / Heartbeat /
+            // LeaveGroup / OffsetCommit / OffsetFetch for all consumer groups.
+            groupCoordService_ = std::make_unique<GroupCoordinationService>(
+                offsetStore_.get(),
+                topicRegistry_.get(),
+                // Control thread (F9a): owner-state view, never the observer ring.
+                [this]() -> bool { return leaderObserver_.computeOnControl().isLeader; },
+                [this]() -> NodeId { return leaderObserver_.computeOnControl().leaderId; });
+
+            // Wire both directions.
+            gateway_->setGroupService(groupCoordService_.get());
+            groupCoordService_->setGateway(gateway_.get());
+            // E2 final fix wave (C1): committed offsets of transient partitions
+            // are positions of THIS process's rings (single node) — an offset
+            // replayed from an earlier process is answered as none.
+            ensureProcessIncarnation_();
+            groupCoordService_->setTransientLineage(&BrokerNode::transientLineageTrampoline_, this);
+            groupCoordService_->setTransientLineageVersion(&BrokerNode::transientLineageVersionTrampoline_, this);
+
+            spdlog::info("BrokerNode[{}]: GroupCoordinationService wired (offsets at {})",
+                         nodeId, offsetDir.string());
+        } catch (const std::exception& ex) {
+            spdlog::error("BrokerNode[{}]: GroupCoordinationService setup failed: {}; "
+                          "group consumers will not work", nodeId, ex.what());
+            groupCoordService_.reset();
+            offsetStore_.reset();
+            // offsetReplica_ may have been moved into replicaRegistry_ already;
+            // reset() is safe either way (no-op if already null).
+            offsetReplica_.reset();
+            offsetLog_.reset();
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // TX-3: Build TransactionCoordinationService + replicated txn state store.
+    // Mirrors the GroupCoordinationService wiring above (CG-5/CG-6).
+    //
+    // __transaction_state: topicId=-2, partitionId=0 (sentinels, not user topics).
+    // minIsr=2 (majority): txn state transitions are majority-durable (unlike
+    // offsets which use minIsr=1 leader-local for lower latency).
+    // -----------------------------------------------------------------------
+    if (gateway_) {
+        try {
+            const fs::path txnDir = fs::path{config_.dataDir} / "__transaction_state";
+            fs::create_directories(txnDir);
+
+            txnLog_ = std::make_unique<rune::storage::Log>(txnDir.string());
+            txnLog_->recover();
+
+            const NodeId selfId = static_cast<NodeId>(config_.nodeId);
+
+            std::vector<NodeId> allNodeIds;
+            allNodeIds.reserve(config_.peers.size());
+            for (const auto& peer : config_.peers) {
+                allNodeIds.push_back(static_cast<NodeId>(peer.id));
+            }
+
+            rune::replication::PartitionConfig tcfg;
+            tcfg.topicId              = -2;  // sentinel: __transaction_state
+            tcfg.partitionId          = 0;
+            tcfg.selfId               = selfId;
+            tcfg.minIsr               = std::min(2, static_cast<int>(allNodeIds.size()));
+            tcfg.replicaLagMaxMs      = config_.replicaLagMaxMs;
+            tcfg.replicaLagMaxOffset  = 1'000'000'000;  // TIME-based lag only (see note at first use)
+            tcfg.fetchIntervalNs      = config_.fetchIntervalNs;
+            tcfg.isrCheckIntervalNs   = 10'000'000LL;
+            tcfg.maxFetchBytes        = rune::replication::kDefaultMaxFetchBytes;
+            // CP-1: __transaction_state is a compacted topic (keep latest per txnId).
+            tcfg.cleanupPolicy        = rune::replication::CleanupPolicy::Compact;
+            // CP-2: compaction tuning for __transaction_state sentinel topic.
+            tcfg.minCleanableDirtyRatio = 0.5;          // 50% dirty before compaction fires
+            tcfg.deleteRetentionMs      = 86'400'000LL; // 1 day tombstone retention
+            // CP-10 Fix 3: __transaction_state uses the same roll size as the offset log
+            // (offsetLogSegmentRollBytes) so the coalescer group bound is consistent.
+            tcfg.segmentRollBytes       = config_.offsetLogSegmentRollBytes;
+
+            rune::replication::PartitionTransport* txnTransport = replTransport_.get();
+            if (!txnTransport) {
+                nullTransports_.push_back(
+                    std::make_unique<rune::replication::NullPartitionTransport>());
+                txnTransport = nullTransports_.back().get();
+            }
+
+            txnReplica_ = std::make_unique<rune::replication::PartitionReplica>(
+                tcfg,
+                rune::replication::Role::Follower,
+                /*epoch=*/0,
+                allNodeIds,
+                allNodeIds,
+                txnLog_.get(),
+                txnTransport);
+
+            if (replTransport_) {
+                replTransport_->registerReplica(-2, 0, txnReplica_.get());
+                // Re-review MEDIUM-B: controller-ISR path, multi-node.
+                if (!config_.isSingleNode()) txnReplica_->setIsrChannel(replTransport_.get());
+            }
+
+            if (replicaRegistry_) {
+                replicaRegistry_->add(-2, 0, std::move(txnReplica_));
+                txnReplica_.reset();
+            }
+
+            rune::replication::PartitionReplica* txnReplicaRaw =
+                replicaRegistry_ ? replicaRegistry_->lookup(-2, 0) : nullptr;
+            if (!txnReplicaRaw && txnReplica_) {
+                txnReplicaRaw = txnReplica_.get(); // single-node path (no registry)
+            }
+
+            txnState_ = std::make_unique<rune::transaction::ReplicatedTxnStateStore>(
+                txnReplicaRaw);
+            // F15 §5.1: no startup fold — the TransactionCoordinationService
+            // folds the store at its coordinator LOAD (txn replica Leader,
+            // HW == LEO); nothing reads the store before.
+
+            txnCoordService_ = std::make_unique<TransactionCoordinationService>(
+                txnState_.get(),
+                topicRegistry_.get(),
+                // Control thread (F9a): owner-state view, never the observer ring.
+                [this]() -> bool { return leaderObserver_.computeOnControl().isLeader; },
+                [this]() -> NodeId { return leaderObserver_.computeOnControl().leaderId; });
+
+            txnCoordService_->setGateway(gateway_.get());
+            // D9 review MEDIUM-3: the stuck-markers gauge → its Aeron counter.
+            txnCoordService_->setStuckMarkersSink(&BrokerNode::publishStuckMarkers_, this);
+
+            gateway_->setTxnService(txnCoordService_.get());
+
+            // D9: cross-node transaction markers over the cluster plane — a
+            // marker for a partition led elsewhere is forwarded to its leader;
+            // markers from other coordinators are appended here.  Both ends run
+            // on the runtime thread (transport poll + gateway doWork).
+            if (replTransport_) {
+                replTransport_->setTxnMarkerHandlers(
+                    &rune::gateway::ClientGateway::onWriteTxnMarkerThunk,
+                    &rune::gateway::ClientGateway::onWriteTxnMarkerResponseThunk, gateway_.get());
+                replTransport_->setPlaneReconnectHandler(&rune::gateway::ClientGateway::onPlaneReconnectThunk,
+                                                         gateway_.get());
+                gateway_->setTxnMarkerChannel(rune::gateway::ClientGateway::TxnMarkerChannel{
+                    &rune::replication::AeronPartitionTransport::sendWriteTxnMarkerThunk,
+                    &rune::replication::AeronPartitionTransport::sendWriteTxnMarkerResponseThunk,
+                    replTransport_.get()});
+            }
+
+            spdlog::info("BrokerNode[{}]: TransactionCoordinationService wired (txn state at {})",
+                         nodeId, txnDir.string());
+        } catch (const std::exception& ex) {
+            spdlog::error("BrokerNode[{}]: TransactionCoordinationService setup failed: {}; "
+                          "transactions will not work", nodeId, ex.what());
+            txnCoordService_.reset();
+            txnState_.reset();
+            txnReplica_.reset();
+            txnLog_.reset();
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // MD1 Task 4: Build MetadataService + replicated __cluster_metadata log.
+    //
+    // Mirrors the GroupCoordinationService / TransactionCoordinationService
+    // wiring above.  topicId=-3 is the sentinel for __cluster_metadata
+    // (offsets=-1, txn=-2).
+    //
+    // FINDING-1: the metadata partition's OWN leadership follows
+    // cluster-consensus leadership, NOT the assignment map.  We register
+    // metadataReplica_ in replicaRegistry_ so the existing
+    // ReplicationMetadataBridge drives its leader/follower role from cluster
+    // leadership automatically.  Do NOT try to make the metadata partition
+    // follow the assignment map.
+    //
+    // Destruction order (reverse of construction, in stop()):
+    //   runtimeAgent_ → metadataService_ → metadataReplica_ (in registry)
+    //   → metadataLog_ → …
+    // -----------------------------------------------------------------------
+    // E2 shared-nothing fix (Part 2): MetadataService is now created
+    // unconditionally (no longer guarded by `if (gateway_)`).
+    //
+    // Previously this guard prevented single-node user-partition promotion:
+    // without gateway_, MetadataService was never wired, so the bridge's
+    // applyUserPartitionRoles() never fired, and user partitions stayed
+    // Follower → compaction/retention skipped them (LogCleanerAgent_CompactsViaBrokerNode
+    // + CoalescingEndToEndViaBrokerNode both failed for this reason).
+    //
+    // This is now safe because Part 1 routes all becomeLeader/becomeFollower
+    // calls from the bridge to the owning worker's SPSC ingress — eliminating
+    // the control-thread vs worker-thread data race that the guard was implicitly
+    // protecting against.
+    {
+        try {
+            const fs::path metaDir = fs::path{config_.dataDir} / "__cluster_metadata";
+            fs::create_directories(metaDir);
+
+            metadataLog_ = std::make_unique<rune::storage::Log>(metaDir.string());
+            metadataLog_->recover();
+
+            const NodeId selfId = static_cast<NodeId>(config_.nodeId);
+
+            std::vector<NodeId> allNodeIds;
+            allNodeIds.reserve(config_.peers.size());
+            for (const auto& peer : config_.peers) {
+                allNodeIds.push_back(static_cast<NodeId>(peer.id));
+            }
+
+            rune::replication::PartitionConfig mcfg;
+            mcfg.topicId              = -3;   // sentinel: __cluster_metadata
+            mcfg.partitionId          = 0;
+            mcfg.selfId               = selfId;
+            // minIsr=1: metadata records are leader-local in Phase 1 (same as
+            // offsets).  A later task may raise this once multi-node assignment
+            // is wired end-to-end.
+            mcfg.minIsr               = 1;
+            mcfg.replicaLagMaxMs      = config_.replicaLagMaxMs;
+            mcfg.replicaLagMaxOffset  = 1'000'000'000;  // TIME-based lag only (see note at first use)
+            mcfg.fetchIntervalNs      = config_.fetchIntervalNs;
+            mcfg.isrCheckIntervalNs   = 10'000'000LL;
+            mcfg.maxFetchBytes        = rune::replication::kDefaultMaxFetchBytes;
+            // __cluster_metadata: compacted log (keep latest assignment per key).
+            mcfg.cleanupPolicy        = rune::replication::CleanupPolicy::Compact;
+            mcfg.minCleanableDirtyRatio = 0.5;
+            mcfg.deleteRetentionMs      = 86'400'000LL; // 1 day tombstone retention
+            mcfg.segmentRollBytes       = config_.offsetLogSegmentRollBytes;
+
+            // Transport: real Aeron transport if available, else no-op NullPartitionTransport.
+            rune::replication::PartitionTransport* metaTransport = replTransport_.get();
+            if (!metaTransport) {
+                nullTransports_.push_back(
+                    std::make_unique<rune::replication::NullPartitionTransport>());
+                metaTransport = nullTransports_.back().get();
+            }
+
+            metadataReplica_ = std::make_unique<rune::replication::PartitionReplica>(
+                mcfg,
+                rune::replication::Role::Follower, // bridge promotes on first doWork
+                /*epoch=*/0,
+                allNodeIds,
+                allNodeIds,
+                metadataLog_.get(),
+                metaTransport);
+
+            // Register with Aeron transport (topicId=-3, partitionId=0).
+            if (replTransport_) {
+                replTransport_->registerReplica(-3, 0, metadataReplica_.get());
+            }
+
+            // Add to replicaRegistry_ so the metadata bridge drives role
+            // transitions and NodeRuntimeAgent::doWork calls replica->doWork.
+            if (replicaRegistry_) {
+                replicaRegistry_->add(-3, 0, std::move(metadataReplica_));
+                metadataReplica_.reset(); // ownership transferred to registry
+            }
+
+            // Re-acquire raw pointer for MetadataService construction.
+            rune::replication::PartitionReplica* metaReplicaRaw =
+                replicaRegistry_ ? replicaRegistry_->lookup(-3, 0) : nullptr;
+
+            // MetadataService: applies committed records on doWork; exposes assignment().
+            metadataService_ = std::make_unique<MetadataService>(
+                metaReplicaRaw, nodeId);
+            if (config_.testUserDecisionHoldMs > 0)   // TEST-ONLY (see NodeConfig)
+                metadataService_->setUserDecisionHoldForTest(config_.testUserDecisionHoldMs * 1'000'000);
+            if (config_.testHoldAllControllerDecisionsMs > 0)   // TEST-ONLY (ISR v3 Step 10): arms the runtime toggle
+                metadataService_->setHoldAllDecisionsMaxForTest(config_.testHoldAllControllerDecisionsMs * 1'000'000);
+            if (config_.testSupportedFeatureLevel >= 0)         // TEST-ONLY: an old-cluster controller
+                metadataService_->setSupportedFeatureLevel(config_.testSupportedFeatureLevel);
+            // ISR v3 Step 6: the first committed apply marks the MetadataLog class (set BEFORE the rebuild:
+            // a restart over an existing log marks it too).
+            metadataService_->setFirstApplyHook(&BrokerNode::markMetadataLogThunk_, this);
+            metadataService_->setMayBootstrap(&BrokerNode::mayBootstrapThunk_, this);   // ISR v3 R17
+            // ISR v3 Step 7: a wiped sole-ISR leader of a TRANSIENT partition keeps its lineage (single AND multi-node).
+            metadataService_->setTransientTopicPredicate(&BrokerNode::isTransientTopicTrampoline_, this);
+            // Rebuild any previously committed assignments from the local Log.
+            metadataService_->rebuildFromLog();
+            // Kafka AlterPartition: this node's transport hands every AlterIsr it
+            // receives (as the controller) to the MetadataService (control thread).
+            if (replTransport_)
+                replTransport_->setAlterIsrHandler(&MetadataService::onAlterIsrThunk,
+                                                   metadataService_.get());
+            // E2 final fix wave (C1): on a single node the controller confirms
+            // every transient partition's data lineage itself (no replica
+            // reports there: every ring is born with this process).
+            if (config_.isSingleNode()) {
+                ensureProcessIncarnation_();
+                metadataService_->setTransientLineageAuthority(processIncarnation_,
+                                                               &BrokerNode::isTransientTopicTrampoline_, this);
+            }
+
+            // MD1 Task 7: wire the MSM into the bridge so USER partitions are
+            // driven per-partition from the committed assignment map.
+            // FINDING-1: internal partitions continue to follow cluster-consensus
+            // leadership (the bridge handles that in Step A of doWork).
+            if (replBridge_) {
+                replBridge_->setMsm(&metadataService_->msmForTest());
+            }
+
+            // MD1 Task 6: configure static assignment emit context.
+            // Convert NodeConfig::TopicSpec (broker config) to
+            // rune::metadata::TopicSpec (balancer input).
+            // rf defaults to cluster size (all nodes replicate every partition).
+            // Task M1 Note C fix: coPartitionGroup + partitionKey are now forwarded
+            // from the parsed TopicSpec (previously hard-coded empty strings).
+            {
+                std::vector<rune::metadata::TopicSpec> balancerTopics;
+                balancerTopics.reserve(bootTopics_.size());
+                const auto rf = static_cast<int16_t>(
+                    std::max(1, static_cast<int>(allNodeIds.size())));
+                for (const auto& ts : bootTopics_) {
+                    if (ts.topicId < 0 || ts.viewSink) continue; // skip internal topics and view sinks (no replica)
+                    rune::metadata::TopicSpec bs;
+                    bs.topicId          = ts.topicId;
+                    bs.partitionCount   = ts.partitionCount;
+                    // A catalog topic's rf 0 = every PLACEABLE broker (resolved by the MetadataService).
+                    bs.rf               = ts.replicationFactor > 0 ? std::min<int16_t>(ts.replicationFactor, rf)
+                                                                   : int16_t{0};
+                    bs.coPartitionGroup = ts.coPartitionGroup; // Note C fix: from parsed config
+                    bs.partitionKey     = ts.partitionKey;     // Note C fix: from parsed config
+                    balancerTopics.push_back(std::move(bs));
+                }
+                // Convert allNodeIds (vector<NodeId>) to vector<int32_t> for balancer.
+                std::vector<rune::metadata::NodeId> balancerNodes;
+                balancerNodes.reserve(allNodeIds.size());
+                for (const auto nid : allNodeIds) {
+                    balancerNodes.push_back(static_cast<rune::metadata::NodeId>(nid));
+                }
+                metadataService_->configure(balancerTopics, balancerNodes);
+                // Task 16 (B3): every topic id the catalog dropped is unplaced — the
+                // metadata log may still hold its assignments (this broker was the
+                // controller, or replicated them), and a restart must not resurrect
+                // them.  Idempotent; the controller commits the removals once ready.
+                for (const int32_t droppedId : bootDroppedIds_) metadataService_->removeRuntimeTopic(droppedId);
+                // Commit-quorum failover floor: a partition failover must never
+                // install an ISR below the same minIsr the gateway enforces for
+                // acks=all — otherwise a transiently-isolated controller seizes
+                // leadership with ISR<minIsr and every produce is rejected (startup
+                // collapse).  See DynamicBalancerInputs::minIsr.
+                metadataService_->setMinIsr(config_.gatewayMinIsr);
+                metadataService_->setAllowSurvivorElection(config_.survivorLeaderElection);
+                // Task 11 fix round 5 (I1): a young controller process waits one
+                // report TTL before deciding user-partition leadership.
+                metadataService_->setUnservableReportWarmup(MetadataService::kUnservableReportTtlNs);
+                // D15: the metadata feature level is raised only once every
+                // member advertised it (its node-control registration).
+                metadataService_->setClusterMembers(balancerNodes);
+                // Re-review 2026-10-04 MEDIUM-B: the coordinator partitions
+                // (__consumer_offsets, __transaction_state) are on the controller-
+                // ISR path multi-node: this controller assigns them (ISR commits,
+                // election from the ISR, offline without a live member) and the
+                // bridge drives them from the committed map.  Their ISRs no longer
+                // gate the consensus — only __cluster_metadata's does.
+                if (replTransport_ && !config_.isSingleNode()) {
+                    std::vector<rune::metadata::PartitionKey> coord;
+                    for (int32_t t : {-1, -2})
+                        if (replicaRegistry_ && replicaRegistry_->lookup(t, 0) != nullptr)
+                            coord.push_back(rune::metadata::PartitionKey{t, 0});
+                    // Catalog history Task 6 (ruling 7): __catalog is on the same
+                    // controller-ISR path — replicas = every broker, leader elected
+                    // only from ISR ∩ live (never unclean).  Its replica is built
+                    // by buildCatalog_ (admin-owned, never in replicaRegistry_);
+                    // a broker without it never starts, so it always exists.
+                    coord.push_back(rune::metadata::PartitionKey{kCatalogTopicId, kCatalogPartition});
+                    // Authentication Task 9 (D39): __security (-7) is on the same path, built by buildSecurity_.
+                    coord.push_back(rune::metadata::PartitionKey{kSecurityTopicId, kSecurityPartition});
+                    if (!coord.empty()) {
+                        metadataService_->setCoordinatorPartitions(std::move(coord), balancerNodes);
+                        if (replBridge_) replBridge_->setCoordinatorPartitionsOnController(true);
+                    }
+                }
+                spdlog::info(
+                    "BrokerNode[{}]: MetadataService configured for assignment emit "
+                    "({} user topics, {} nodes, minIsr={})",
+                    nodeId, balancerTopics.size(), balancerNodes.size(),
+                    config_.gatewayMinIsr);
+            }
+
+            spdlog::info("BrokerNode[{}]: MetadataService wired (__cluster_metadata at {})",
+                         nodeId, metaDir.string());
+            // Follower-connect hang fix: metadata-driven routing ⇒ every broker
+            // hosts client sessions, in every role (only DDL is redirected, to
+            // the catalog leader; data ops per partition).  Never inferred from
+            // the routing image, which an empty cluster never has.
+            gateway_->setSessionAdmission(rune::gateway::ClientGateway::SessionAdmission::AnyNode);
+        } catch (const std::exception& ex) {
+            spdlog::error("BrokerNode[{}]: MetadataService setup failed: {}; "
+                          "cluster metadata will not be tracked", nodeId, ex.what());
+            metadataService_.reset();
+            metadataReplica_.reset();
+            metadataLog_.reset();
+        }
+    }
+
+    // E1: Build the WorkerPool + assign replicas to workers.
+    // Must run AFTER replicaRegistry_ is fully populated (user topics, offset,
+    // txn, and metadata replicas all added). The pool holds non-owning ptrs.
+    buildWorkerPool();
+
+    // E2 inc2a: Wire the WorkerPool into the gateway and the replication
+    // transport so their per-partition log work is routed through the owning
+    // worker's SPSC ingress ring.  Both setters are null-safe (no-op when
+    // workerPool_ is null, which happens when no topics are configured).
+    if (gateway_ && workerPool_) {
+        gateway_->setWorkerPool(workerPool_.get());   // narrows the batch limit to the workers'
+    }
+    // Round 5: an incarnation wrap must skip values the F7 owner map still holds.
+    if (workerPool_ && replicaRegistry_)
+        replicaRegistry_->setIncarnationInUseHook(&WorkerPool::tracksIncarnationThunk, workerPool_.get());
+    if (replTransport_ && workerPool_) {
+        replTransport_->setWorkerPool(workerPool_.get());
+    }
+    // E2 shared-nothing fix (Part 1): route replica role changes (becomeLeader/
+    // becomeFollower) to the owning worker's SPSC ingress so they execute on the
+    // worker thread — eliminating the control-thread vs worker-thread data race
+    // confirmed by TSan (bridge control thread ↔ Worker::doWork on worker thread).
+    if (replBridge_ && workerPool_) {
+        replBridge_->setWorkerPool(workerPool_.get());
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 6: Build the __catalog partition + the AdminWorker thread (catalog
+    // history Task 9: the catalog write path).  After buildWorkerPool(): the
+    // applier's validator / view-plan effects fan out to the workers.
+    // -----------------------------------------------------------------------
+    buildAdminWorker();
+
+    // Task 8a (RULING-2 F): wire the gateway → admin request sink so DefineTopic
+    // (64) / GetTopicSchema (66) frames are handed off to the AdminWorker ring
+    // (no registry access on the gateway hot path).
+    if (gateway_ && adminWorkerAgent_) {
+        gateway_->setAdminSink(adminWorkerAgent_.get());
+    }
+
+    // Restart recovery (Task 16): a restarted broker's views come back from the ONE boot replay of
+    // __catalog on the startup thread (bootFromCatalog_) on every broker; the recovery installs are
+    // posted by CatalogApplier::postBootStash once the workers exist (start(), step 7c).
+
+    // Build the composite runtime agent:
+    //   single-node: wraps agent_    (ConsensusAgent)
+    //   multi-node:  wraps nodeAgent_ (NodeConsensusAgent)
+    rune::consensus::Agent& innerAgent =
+        nodeAgent_ ? static_cast<rune::consensus::Agent&>(*nodeAgent_)
+                   : static_cast<rune::consensus::Agent&>(*agent_);
+
+    // ISR v3 Step 9 (M2): the storage gate exists BEFORE the runtime agent and is handed to it (and the bridge)
+    // before the runtime thread starts.  Multi-node only: a single node has no gate (open everywhere).
+    if (!config_.isSingleNode())
+        storageGate_ = std::make_unique<StorageGate>(storage_, config_.dataDir, config_.nodeId,
+                                                     static_cast<int>(config_.peers.size()),
+                                                     foundingShortDwellNs(), foundingLongDwellNs());   // C1 dwells
+    runtimeAgent_ = std::make_unique<NodeRuntimeAgent>(
+        innerAgent,
+        election_.get(),          // GR-2: election for leaderMemberId/leadershipTermId reads
+        replBridge_.get(),        // GR-2: metadata bridge (may be null if no replicas)
+        replTransport_.get(),     // GR-3: replication transport (may be null)
+        replicaRegistry_.get(),   // GR-3: replica registry (may be null if no topics)
+        gateway_.get(),
+        groupCoordService_.get(), // CG-6: group coordinator (null-safe if setup failed)
+        txnCoordService_.get(),   // TX-3: txn coordinator (null-safe if setup failed)
+        metadataService_.get(),   // MD1: metadata service (null-safe if setup failed)
+        workerPool_.get());       // E1: shard→worker pool (null-safe if no topics)
+    // F9a: the runtime publishes the leadership view to the observer thread over
+    // LeaderObserver's ring once per duty cycle (only on change).  Bound here,
+    // before the control thread starts (ordered by its start).
+    leaderObserver_.bind(election_.get(), nodeAgent_.get());
+    runtimeAgent_->setLeaderObserver(&leaderObserver_);
+    runtimeAgent_->setStorageGate(storageGate_.get());
+    if (replBridge_) replBridge_->setStorageGate(storageGate_.get());   // ISR v3 Step 10: held leader roles
+    runtimeAgent_->setKnowledge(internalIsrKnowledge_.get());
+    runtimeAgent_->setCanvassPublisher(publisher_.get());
+    runtimeAgent_->setBootHistory(bootHistory_);
+    runtimeAgent_->setFailoverTimeoutOverrideNs(config_.brokerLivenessTimeoutMs * 1'000'000LL);
+    if (config_.testCandidacyHoldAtBoot && !config_.isSingleNode()) runtimeAgent_->setTestCandidacyHold(true);   // R-I1
+    // Controlled shutdown (Kafka parity): multi-node only — a single node has
+    // nobody to hand off to (begin completes at once).  The controller's
+    // acks of this node's NODE-level requests arrive on the legacy transport
+    // (control thread).
+    if (!config_.isSingleNode() && replTransport_ && metadataService_ && election_) {
+        // Review M1: the node-control protocol identifies this PROCESS by a
+        // random nonce (compared by identity) — never by the data-dir counter,
+        // which restarts low after a wiped dir.
+        if (lifecycleNonce_ == 0) lifecycleNonce_ = processNonce();
+        runtimeAgent_->controlledShutdown().bind(
+            config_.nodeId, lifecycleNonce_,   // N1: the identity the lineage reports carry too
+            [](void* t, int32_t to, const rune::replication::AlterIsrMsg& m) noexcept {
+                return static_cast<rune::replication::AeronPartitionTransport*>(t)->sendNodeControl(to, m);
+            }, replTransport_.get(), metadataService_.get(), election_.get(), [this] {
+                std::vector<int32_t> ids;
+                for (const auto& pc : config_.peers) ids.push_back(pc.id);
+                return ids;
+            }());
+        replTransport_->setNodeControlResponseHandler(&ControlledShutdown::onResponseThunk,
+                                                      &runtimeAgent_->controlledShutdown());
+        // ISR v3 Step 9: every node-control frame carries this process's storage (slots 7/8/9); until the gate is
+        // open the node re-registers on a cadence.
+        {
+            const uint8_t wire = storageGate_ ? storageGate_->originWireCode()
+                               : storage_.origin == StorageIdentity::Origin::Founder ? 1
+                               : storage_.origin == StorageIdentity::Origin::Legacy  ? 2
+                               : storage_.origin == StorageIdentity::Origin::Joiner  ? 3 : 4;
+            runtimeAgent_->controlledShutdown().setStorage(storage_.id, wire);
+            if (storageGate_)
+                runtimeAgent_->controlledShutdown().setStorageOpenFn(
+                    [](void* g) noexcept { return static_cast<StorageGate*>(g)->open(); }, storageGate_.get());
+        }
+    }
+    // fsyncgate (Task 10 fix 2 / I-1): control-thread-driven replicas (internal
+    // partitions) whose fsync failed → halt.
+    runtimeAgent_->setStorageFailureHook([this](const std::string& dir, int err) {
+        onStorageFailure_(dir, err);
+    });
+    // F7 ownership invariant violation (a runtime replica move) → halt.
+    runtimeAgent_->setFatalHook([this](const std::string& what) { onInvariantViolation_(what); });
+    // Fused placement (spec §3.2, Task 11): every runtime cycle is part of a
+    // worker-0 pass — its O(partitions) failover/rebalance scan becomes an Aeron
+    // slow tick.  Thread placement: every cycle (unchanged).
+    if (config_.fused()) runtimeAgent_->setSlowTickIntervalNs(NodeRuntimeAgent::kSlowTickIntervalNs);
+    // Test/bench-only override of the fused slow-tick interval (ABAB proof of
+    // the slow tick: 0 = scan every cycle, the pre-slow-tick behaviour).
+    if (slowTickIntervalOverrideNs_ >= 0) runtimeAgent_->setSlowTickIntervalNs(slowTickIntervalOverrideNs_);
+    // Task 11 fix 1: leadership handed to the gateway as a value each cycle.
+    runtimeAgent_->setSelfId(config_.nodeId);
+    // Task 11 fix 2 (review m4): the production runtime path never takes a
+    // virtual fallback (Generic arms exist for test doubles only).
+    assert(runtimePathIsConcrete_() && "runtime duty cycle would dispatch virtually");
+
+    // -----------------------------------------------------------------------
+    // Task 8a (RULING-2 B): wire the admin control-plane servicing hook.
+    //
+    // Runs on the CONTROL (duty-cycle) thread every cycle.  It owns the three
+    // control-side ring endpoints for the schema DDL plane:
+    //   1. Post a role event to the admin thread whenever cluster leadership for
+    //      this node changes (Follower↔Leader) — the admin thread applies
+    //      becomeLeader/becomeFollower on the schema replica ON ITS OWN THREAD.
+    //   2. Drain the admin → control failure ring (the applier's catalog effects:
+    //      topics built / dropped at their catalog ids, validators, view plans).
+    //   3. Drain egressRing (admin → control): send DDL response frames on the
+    //      originating session's egress via gateway_->sendControlFrame.
+    // No cross-thread mutation: TopicRegistry + gateway egress are touched ONLY
+    // here on the control thread; the admin thread touches ONLY its replica.
+    // Direct (non-virtual, no std::function) call from the runtime duty cycle:
+    // under fused placement it runs on every worker-0 pass (§1a.5, Task 11 fix 1).
+    if (adminWorkerAgent_) runtimeAgent_->setAdminControl(&adminControl_);
+
+    // Select the runtime/gateway idle strategy (RUNE_RUNTIME_IDLE).  BusySpin →
+    // the consensus+gateway thread never parks → sub-100µs produce/ack round-trips
+    // (pegs the core; use on a dedicated CPU).  Default Backoff (safe).
+    if (config_.runtimeIdleStrategy == NodeConfig::WorkerIdleStrategy::BusySpin) {
+        idleStrategy_ = std::make_unique<rune::consensus::BusySpinIdleStrategy>();
+        spdlog::info("BrokerNode[{}]: runtime idle strategy = BusySpin (low latency; core pegged)",
+                     config_.nodeId);
+    } else {
+        // Legacy: backoff with configurable maxPark (RUNE_IDLE_MAX_PARK_US, default 200µs) — caps per-hop
+        // replication-round-trip wake latency without pegging the core (busyspin here starves consensus
+        // heartbeats → re-elections on shared cores).  D2 round 2, shard mode: the runtime is control plane
+        // only — park without yields up to RUNE_CONTROL_IDLE_MAX_PARK_US (NodeConfig::runtimeIdleShape).
+        idleStrategy_ = makeShapedBackoff(config_.runtimeIdleShape());
+    }
+
+    // AgentRunner drives the NodeRuntimeAgent (consensus + gateway on ONE thread).
+    agentRunner_ = std::make_unique<rune::consensus::AgentRunner>(
+        *runtimeAgent_, *idleStrategy_, clock_);
+
+    // -----------------------------------------------------------------------
+    // CP-6: Wire the LogCleanerAgent on its own AgentRunner thread.
+    //
+    // Prerequisite: replicaRegistry_ must be built (done above in buildReplication).
+    // The cleaner never accesses segments_ directly; it uses the sealed-segment
+    // snapshot (atomic published by the append thread) — so starting it here
+    // (before any appends begin) is safe.
+    //
+    // cycleBudgetBytes default (128 MiB) matches Kafka's default dedupe buffer.
+    // -----------------------------------------------------------------------
+    if (replicaRegistry_) {
+        // CP-8: enable segment coalescing when config_.enableCompactionCoalescing is true
+        // (default: true for Kafka parity).  The coalescingRollBytes ctor param is kept
+        // as a fallback default (64 MiB); per-topic roll is read from each replica's
+        // segmentRollBytes() at compaction time inside LogCleanerAgent::doWork.
+
+        // CP-10: the cleaner's ONE shared Throttler -- a broker setting (topics exist only through DDL; the throttle was
+        // never per-topic: it was the minimum over topics).
+        const int64_t cleanerIoMaxBytesPerSec = config_.cleanerIoMaxBytesPerSecond;   // -1 = unlimited
+
+        cleanerAgent_ = std::make_unique<LogCleanerAgent>(
+            replicaRegistry_.get(),
+            /*cycleBudgetBytes=*/   128LL * 1024 * 1024,
+            /*dedupeBufferBytes=*/  -1,
+            /*ioMaxBytesPerSec=*/   cleanerIoMaxBytesPerSec,
+            /*useCoalescing=*/      config_.enableCompactionCoalescing,
+            /*coalescingRollBytes=*/64LL * 1024 * 1024);
+        // Task 10 round 4: the cleaner never reads the registry — it gets its
+        // own replica view over a ring from the control thread, which frees a
+        // removed replica only after the cleaner acked the generation dropping it.
+        cleanerAgent_->setProducerIdExpirationMs(config_.producerIdExpirationMs);   // PSM round 1, I1
+        if (runtimeAgent_) {
+            cleanerViewChannel_ = runtimeAgent_->enableCleanerView();   // Task 8: also the policy-override ring
+            cleanerAgent_->attachViewChannel(cleanerViewChannel_);
+        }
+        cleanerRunner_ = std::make_unique<rune::consensus::AgentRunner>(
+            *cleanerAgent_, cleanerIdleStrategy_, cleanerClock_);
+        // hotpath-A F2: pre-provisioning + staging renames belong to the
+        // SegmentProvisionerAgent (its own view, its own thread).
+        if (provisionerAgent_ && runtimeAgent_ && !skipProvisionerRunnerForTest_) {
+            cleanerAgent_->setExternalProvisioner(true);
+            provisionerAgent_->attachViewChannel(runtimeAgent_->enableProvisionerView());
+            // Review m5: park on the demand ring's doorbell (woken by a demand),
+            // so an idle provisioner costs ~1/maxPark wakeups, not 10k/s.
+            provisionerIdleStrategy_ = std::make_unique<ParkUntilWorkIdle>(
+                IdleShape{10, 20, 1'000, std::max<int64_t>(config_.segmentProvisionerMaxParkUs, 1) * 1'000},
+                nullptr, 0, provisionerAgent_->doorbell());
+            provisionerRunner_ = std::make_unique<rune::consensus::AgentRunner>(
+                *provisionerAgent_, *provisionerIdleStrategy_, provisionerClock_);
+            spdlog::info("BrokerNode[{}]: SegmentProvisionerAgent wired (depth={}, maxPark={}us)", nodeId,
+                         provisionerAgent_->depth(), config_.segmentProvisionerMaxParkUs);
+        }
+        spdlog::info("BrokerNode[{}]: LogCleanerAgent wired ({} replicas, coalescing={}, ioThrottle={})",
+                     nodeId, replicaRegistry_->replicaCount(),
+                     config_.enableCompactionCoalescing ? "on" : "off",
+                     cleanerIoMaxBytesPerSec < 0 ? "unlimited" : std::to_string(cleanerIoMaxBytesPerSec) + "B/s");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Observer accessors (F9a).
+//
+// The leadership view is owned by the control thread.  It publishes a snapshot
+// on LeaderObserver's ring whenever the view changes; these accessors are the
+// ring's ONE consumer — the external thread driving the node (main()'s poll
+// loop or a test thread).  No atomics, no torn reads: every value comes from
+// one ring message.  Control-thread code must use computeOnControl() instead.
+// ---------------------------------------------------------------------------
+bool BrokerNode::awaitLeader(std::chrono::milliseconds timeout) {
+    using clock = std::chrono::steady_clock;
+    const auto deadline = clock::now() + timeout;
+
+    // Any decided leader: single-node → this node leads; multi-node → a leader
+    // (this node or a peer) is known.
+    auto hasLeader = [this]() -> bool { return leaderObserver_.observe().leaderId >= 0; };
+
+    while (clock::now() < deadline) {
+        if (hasLeader()) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    return hasLeader(); // one final check at deadline
+}
+
+// ---------------------------------------------------------------------------
+// Controlled shutdown (Kafka parity) — see ControlledShutdown.h.  Observer
+// thread.  The hand-off itself is event-driven on the control thread; this
+// only waits for its ring-published status, bounded by `budget` — a
+// last-resort cap after which the caller stops as before (logged).
+// ---------------------------------------------------------------------------
+int32_t BrokerNode::outOfSyncPartitions() noexcept {
+    if (!runtimeAgent_) return -1;
+    const auto st = runtimeAgent_->controlledShutdown().observe();
+    return st.phase == ControlledShutdown::Phase::Running ? st.remaining : -1;
+}
+
+bool BrokerNode::controlledShutdown(std::chrono::milliseconds budget) {
+    if (!started_ || stopped_ || !runtimeAgent_) return false;
+    using clock = std::chrono::steady_clock;
+    const auto t0 = clock::now();
+    const auto deadline = t0 + budget;
+    auto& cs = runtimeAgent_->controlledShutdown();
+    if (!cs.active()) return true;   // a single node: nobody to hand anything to
+    if (!cs.begin()) {
+        spdlog::warn("BrokerNode[{}]: controlled shutdown: command ring full — stopping without "
+                     "a hand-off", config_.nodeId);
+        return false;
+    }
+    spdlog::info("BrokerNode[{}]: controlled shutdown — handing partition leadership off "
+                 "(budget {} ms)", config_.nodeId, budget.count());
+    ControlledShutdown::Status st = cs.observe();
+    while (clock::now() < deadline) {
+        st = cs.observe();
+        if (st.phase == ControlledShutdown::Phase::Done) {
+            spdlog::info("BrokerNode[{}]: controlled shutdown complete in {} ms", config_.nodeId,
+                         std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - t0).count());
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});   // paces the ring poll only
+    }
+    st = cs.observe();
+    if (st.phase == ControlledShutdown::Phase::Done) return true;
+    spdlog::warn("BrokerNode[{}]: controlled shutdown budget ({} ms) exhausted in phase {} with {} "
+                 "partition(s) still led / ISR(s) still joined here — stopping anyway (they fail "
+                 "over as on an unclean stop)", config_.nodeId, budget.count(),
+                 static_cast<int>(st.phase), st.remaining);
+    return false;
+}
+
+LeaderSnapshot BrokerNode::leaderSnapshot() const noexcept {
+    return leaderObserver_.observe();
+}
+
+bool BrokerNode::isLeader() const noexcept {
+    // F9a: the observer thread's ring-drained snapshot (one snapshot carries
+    // leaderId + isLeader together, so the old TOCTOU between stateCode_ and
+    // observedLeaderId_ cannot occur).  The control thread's per-cycle push
+    // (Task 11) uses the owner-state predicate isLocalLeader() directly.
+    return leaderObserver_.observe().isLeader;
+}
+
+NodeId BrokerNode::leaderId() const noexcept {
+    return leaderObserver_.observe().leaderId;
+}
+
+Term BrokerNode::leadershipTermId() const noexcept {
+    // Previously a racy plain read of election_ from the observer thread; now
+    // the term travels in the same ring snapshot as the leader id.
+    return leaderObserver_.observe().term;
+}
+
+// ---------------------------------------------------------------------------
+// BrokerNode::publishRole — update the Aeron node-role + leadership-term
+// counters (RoleCounter.h) with this node's current view.
+//
+// Machine-readable leadership signal: the dr-e2e harness reads these counters
+// out of the CnC file via rune_role instead of scraping "is LEADER" log lines
+// (which are log-level dependent and fragile).  Mirrors Aeron Cluster, which
+// publishes node role + leadership term as counters.
+//
+// Resolves the pending addCounter registrations lazily: the embedded driver
+// acks counter allocation asynchronously, so findCounter() may return nullptr
+// for the first few calls — we simply retry on the next poll tick.  Once
+// resolved, the Counter is cached and set() is a single relaxed store.
+//
+// Observer thread: one ring-drained snapshot (role + term together, F9a).
+// Called from main's 100 ms poll loop.
+// ---------------------------------------------------------------------------
+// D9 review MEDIUM-3: TCS stuck-markers sink — CONTROL (runtime) thread only.
+// Resolves the counter registration lazily (the driver acks asynchronously);
+// false = not resolved yet, the TCS retries on its next gauge scan.
+// Re-review N4: provisioner metric sink — PROVISIONER thread only (the only
+// writer of provCounters_; resolved lazily, the driver acks asynchronously; a
+// value set before resolution is re-published with the next change).
+void BrokerNode::publishProvisionMetric_(void* self, int metric, std::int64_t value) noexcept
+{
+    auto* n = static_cast<BrokerNode*>(self);
+    if (!n->aeron_ || metric < 0 || static_cast<std::size_t>(metric) >= n->provCounters_.size()) return;
+    auto& c = n->provCounters_[static_cast<std::size_t>(metric)];
+    const std::int64_t reg = n->provCounterRegIds_[static_cast<std::size_t>(metric)];
+    if (!c && reg >= 0) {
+        try { c = n->aeron_->findCounter(reg); } catch (...) { c.reset(); }
+    }
+    if (c) c->set(value);
+}
+
+bool BrokerNode::publishStuckMarkers_(void* self, std::int64_t value)
+{
+    auto* n = static_cast<BrokerNode*>(self);
+    if (!n->aeron_) return false;
+    if (!n->stuckMarkersCounter_ && n->stuckMarkersCounterRegId_ >= 0) {
+        try { n->stuckMarkersCounter_ = n->aeron_->findCounter(n->stuckMarkersCounterRegId_); }
+        catch (...) { n->stuckMarkersCounter_.reset(); }
+    }
+    if (!n->stuckMarkersCounter_) return false;
+    n->stuckMarkersCounter_->set(value);
+    return true;
+}
+
+void BrokerNode::publishRole() noexcept {
+    if (!aeron_) return;
+
+    // Resolve pending counter registrations once the driver has acked them.
+    if (!roleCounter_ && roleCounterRegId_ >= 0) {
+        try { roleCounter_ = aeron_->findCounter(roleCounterRegId_); }
+        catch (...) { roleCounter_.reset(); }  // driver error — retry next tick
+    }
+    if (!termCounter_ && termCounterRegId_ >= 0) {
+        try { termCounter_ = aeron_->findCounter(termCounterRegId_); }
+        catch (...) { termCounter_.reset(); }
+    }
+
+    // Determine this node's current role.  We expose Leader vs Follower vs None;
+    // Candidate is not separately observable via the BrokerNode accessors, so a
+    // node that observes no leader yet is reported as None (pre-election gap).
+    const LeaderSnapshot v = leaderObserver_.observe();
+    const RoleCode role = v.isLeader ? RoleCode::Leader
+                        : (v.leaderId >= 0 ? RoleCode::Follower : RoleCode::None);
+
+    if (roleCounter_) {
+        roleCounter_->set(static_cast<std::int64_t>(role));
+    }
+    if (termCounter_) {
+        // Publish the term this node observes (its own leadership term id).
+        termCounter_->set(static_cast<std::int64_t>(v.term));
+    }
+    // Rolling-restart readiness gate (controlled shutdown review L5).
+    if (!outOfSyncCounter_ && outOfSyncCounterRegId_ >= 0) {
+        try { outOfSyncCounter_ = aeron_->findCounter(outOfSyncCounterRegId_); }
+        catch (...) { outOfSyncCounter_.reset(); }
+    }
+    if (outOfSyncCounter_) outOfSyncCounter_->set(static_cast<std::int64_t>(outOfSyncPartitions()));
+}
+
+// ---------------------------------------------------------------------------
+// BrokerNode::publishCatalogMetrics_ — catalog history Task 7 (CONTROL thread).
+// Resolves the catalog counters once the driver acked them and sets both; a
+// value that arrived before its counter resolved is re-published every control
+// pass until it lands (catalogMetricsPending_()).
+// ---------------------------------------------------------------------------
+void BrokerNode::publishCatalogMetrics_() noexcept {
+    if (!aeron_) return;
+    auto resolve = [this](std::shared_ptr<aeron::Counter>& c, std::int64_t regId) {
+        if (c || regId < 0) return;
+        try { c = aeron_->findCounter(regId); }
+        catch (...) { c.reset(); }
+    };
+    resolve(catalogHaltedCounter_, catalogHaltedCounterRegId_);
+    resolve(catalogAppliedCounter_, catalogAppliedCounterRegId_);
+    if (catalogHaltedCounter_) catalogHaltedCounter_->set(catalogHaltedValue_);
+    if (catalogAppliedCounter_) catalogAppliedCounter_->set(catalogAppliedValue_);
+}
+
+// ---------------------------------------------------------------------------
+// Authentication Task 9 - control-thread halves of the `__security` log (D29).
+// ---------------------------------------------------------------------------
+void BrokerNode::onSecurityApplied_(const uint8_t* p, std::size_t n) {
+    if (heldMirror_.on) [[unlikely]] {   // test seam: stash, apply nothing
+        heldMirror_.frames.emplace_back(p, p + n);
+        return;
+    }
+    int64_t offset = -1;
+    std::span<const uint8_t> bytes;
+    if (!decodeSecurityApplied(p, n, offset, bytes) || !securityView_) [[unlikely]] {
+        if (adminToControlRejects_++ % 1024 == 0)
+            spdlog::error("BrokerNode[{}]: malformed kA2cSecurityApplied (len={}) skipped", config_.nodeId, n);
+        return;
+    }
+    // The mirror applies the SAME event with the SAME library; a gap or an apply error halts it (fail closed -
+    // Task 14 turns that into revoked sessions and refused logins).
+    if (auto a = securityView_->onApplied(offset, bytes); a) {
+        // Task 14 (D25): refresh / end / revoke the affected sessions.  The answer gate releases (D24) once the gateway
+        // reports the event enforced (every table refreshed, every shipped bitmap accepted by every worker).
+        if (gateway_) gateway_->onSecurityApplied(offset, *a);
+        else securityRefreshedOffset_ = offset;
+        securityAppliedValue_ = offset;
+    } else {
+        securityHaltedValue_ = a.error().offset + 1;
+        failSecurityClosed_(a.error().offset, a.error().detail);
+    }
+    publishSecurityMetrics_();
+}
+
+void BrokerNode::onSecurityHalted_(const uint8_t* p, std::size_t n) {
+    SecurityHaltedMsg m;
+    if (!decodeSecurityHalted(p, n, m) || !securityView_) [[unlikely]] {
+        if (adminToControlRejects_++ % 1024 == 0)
+            spdlog::error("BrokerNode[{}]: malformed kA2cSecurityHalted (len={}) skipped", config_.nodeId, n);
+        return;
+    }
+    rune::security::ApplyError err;
+    err.offset   = m.offset;
+    err.code     = rune::security::ApplyError::Code::Precondition;
+    err.expected = m.expected;
+    err.actual   = m.actual;
+    err.detail   = m.detail;
+    securityView_->onHalted(err);
+    securityHaltedValue_ = m.offset + 1;
+    publishSecurityMetrics_();
+    failSecurityClosed_(m.offset, m.detail);
+}
+
+// Authentication Task 14 (D28): a halted `__security` apply FAILS CLOSED.  The held DDL OKs are answered Internal first
+// (they would claim an enforcement this broker can no longer give), then every authenticated session is revoked; new
+// logins are refused by the halted view (AuthServerFinal 44) and security DDL answers Internal.
+void BrokerNode::failSecurityClosed_(int64_t offset, const std::string& describe) {
+    spdlog::critical("BrokerNode[{}]: SECURITY APPLY HALTED at offset {}: {}; this broker refuses logins until repaired "
+                     "(docs/SECURITY.md#halted) - authenticated sessions are revoked, security changes refused "
+                     "(move dataDir/__security aside and restart)",
+                     config_.nodeId, offset, describe);
+    if (!securityGate_.empty()) (void)pumpSecurityGate_();
+    if (gateway_) gateway_->onSecurityHalted(offset);
+}
+
+bool BrokerNode::securityMetricsPending_() const noexcept {
+    return (!securityHaltedCounter_ && securityHaltedCounterRegId_ >= 0) ||
+           (!securityAppliedCounter_ && securityAppliedCounterRegId_ >= 0) ||
+           (!authModeCounter_ && authModeCounterRegId_ >= 0) ||
+           (!loginsOkCounter_ && loginsOkCounterRegId_ >= 0) ||
+           (!loginsFailedCounter_ && loginsFailedCounterRegId_ >= 0) ||
+           (!loginsRateLimitedCounter_ && loginsRateLimitedCounterRegId_ >= 0) ||
+           (!sessionsRevokedCounter_ && sessionsRevokedCounterRegId_ >= 0) ||
+           (gateway_ != nullptr && (gateway_->loginsOk() != publishedLoginsOk_ ||
+                                    gateway_->loginsFailed() != publishedLoginsFailed_ ||
+                                    gateway_->loginsRateLimited() != publishedLoginsRateLimited_ ||
+                                    gateway_->sessionsRevoked() != publishedSessionsRevoked_));
+}
+
+void BrokerNode::publishSecurityMetrics_() noexcept {
+    if (!aeron_) return;
+    auto resolve = [this](std::shared_ptr<aeron::Counter>& c, std::int64_t regId) {
+        if (c || regId < 0) return;
+        try { c = aeron_->findCounter(regId); }
+        catch (...) { c.reset(); }
+    };
+    resolve(securityHaltedCounter_, securityHaltedCounterRegId_);
+    resolve(securityAppliedCounter_, securityAppliedCounterRegId_);
+    resolve(authModeCounter_, authModeCounterRegId_);
+    resolve(loginsOkCounter_, loginsOkCounterRegId_);
+    resolve(loginsFailedCounter_, loginsFailedCounterRegId_);
+    resolve(loginsRateLimitedCounter_, loginsRateLimitedCounterRegId_);
+    resolve(sessionsRevokedCounter_, sessionsRevokedCounterRegId_);
+    if (gateway_ != nullptr) {   // control thread: the gateway's tallies are its own
+        publishedLoginsOk_ = gateway_->loginsOk();
+        publishedLoginsFailed_ = gateway_->loginsFailed();
+        publishedLoginsRateLimited_ = gateway_->loginsRateLimited();
+        publishedSessionsRevoked_ = gateway_->sessionsRevoked();
+    }
+    if (loginsOkCounter_) loginsOkCounter_->set(static_cast<std::int64_t>(publishedLoginsOk_));
+    if (loginsFailedCounter_) loginsFailedCounter_->set(static_cast<std::int64_t>(publishedLoginsFailed_));
+    if (loginsRateLimitedCounter_) loginsRateLimitedCounter_->set(static_cast<std::int64_t>(publishedLoginsRateLimited_));
+    if (sessionsRevokedCounter_) sessionsRevokedCounter_->set(static_cast<std::int64_t>(publishedSessionsRevoked_));
+    if (securityHaltedCounter_) securityHaltedCounter_->set(securityHaltedValue_);
+    if (securityAppliedCounter_) securityAppliedCounter_->set(securityAppliedValue_);
+    // 1'000'228: 0 = enabled (an in-process config publishes 0 too), 1 = dev-disabled.
+    if (authModeCounter_) authModeCounter_->set(config_.authMode == AuthMode::DevDisabled ? 1 : 0);
+}
+
+// Authentication Task 9 (spec §9): dev mode (RUNE_AUTH=disabled) is shouted at start and every five minutes by this
+// control-thread timer; the auth-mode counter resolves once the driver acked it.
+int BrokerNode::serviceAuthMode_(int64_t nowNs) {
+    int work = 0;
+    if (config_.authMode == AuthMode::DevDisabled && devModeWarn_.due(nowNs)) {
+        spdlog::warn("BrokerNode[{}]: {}", config_.nodeId, kDevModeWarning);
+        ++work;
+    }
+    return work;
+}
+
+// ---------------------------------------------------------------------------
+// Authentication Task 15 (D33, D35) - the inter-broker link handshakes.
+//
+// buildPeerLinks_ (STARTUP thread): a PeerLinkAgent per broker when authMode == Enabled and there is more than one
+// peer - one subscription on this node's consensus endpoint (stream peerAuthStreamId), one publication per peer to
+// its consensus endpoint, one pure PeerHandshake per peer; the link incarnation is the persisted process incarnation
+// (strictly higher on every restart).  InProcessUnauthenticated / DevDisabled build none: every transport stays
+// PeerPlain.  The agent takes a COPY of the cluster keys loaded once in start().
+// servicePeerLinks_ (CONTROL thread, every duty cycle): drives the agent, pumps the key fan-out (workers + admin,
+// over their rings) and publishes counters 233 / 234.  An established link's keys are installed here for the control
+// thread's own transports (consensus sink / ingress, legacy replication) and posted to every other owner.
+// ---------------------------------------------------------------------------
+void BrokerNode::buildPeerLinks_() {
+    if (config_.authMode != AuthMode::Enabled || config_.peers.size() <= 1 || !aeron_ || !clusterKeys_) return;
+    PeerLinkAgent::Params p;
+    p.selfId      = config_.nodeId;
+    p.incarnation = (replicaRegistry_ && replicaRegistry_->processIncarnation() > 0)
+                        ? static_cast<uint64_t>(replicaRegistry_->processIncarnation())
+                        : static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::system_clock::now().time_since_epoch()).count());
+    p.streamId    = config_.peerAuthStreamId;
+    p.bindChannel = config_.selfConsensusBindChannel();
+    p.keys        = *clusterKeys_;   // a COPY
+    for (const auto& peer : config_.peers) {
+        if (peer.id == config_.nodeId) continue;
+        p.peers.push_back(PeerLinkAgent::PeerEndpoint{peer.id, peer.consensusChannel()});
+    }
+    peerLinkAgent_ = std::make_unique<PeerLinkAgent>(
+        aeron_, std::move(p), resolverHub_ ? resolverHub_->subscribeOwner() : rune::consensus::PeerResolutionSource{});
+    peerLinkAgent_->setEstablishedSink(&BrokerNode::onPeerLinkEstablishedThunk_, this);
+    spdlog::info("BrokerNode[{}]: peer links - {} peer(s), handshake on stream {} (cluster key id {:016x}{})",
+                 config_.nodeId, config_.peers.size() - 1, config_.peerAuthStreamId, clusterKeys_->current.keyId,
+                 clusterKeys_->next ? ", next key held" : "");
+}
+
+void BrokerNode::onPeerLinkEstablishedThunk_(void* self, int32_t peer, const rune::peerlink::LinkKeys& k, int64_t nowNs) {
+    static_cast<BrokerNode*>(self)->onPeerLinkEstablished_(peer, k, nowNs);
+}
+
+void BrokerNode::onPeerLinkEstablished_(int32_t peer, const rune::peerlink::LinkKeys& k, int64_t nowNs) {
+    (void)nowNs;
+    // The transports this (control) thread owns, directly; every worker and the admin thread over their rings.  A
+    // transport that cannot take the keys keeps dropping its frames to that peer (counted) - never sends in the clear.
+    bool ok = true;
+    if (udpSink_)       ok = udpSink_->installPeerLink(peer, k) && ok;
+    if (aeronIngress_)  ok = aeronIngress_->installPeerLink(peer, k) && ok;
+    if (replTransport_) ok = replTransport_->installPeerLink(peer, k) && ok;
+    if (!ok) spdlog::error("BrokerNode[{}]: the link keys of node {} (epoch {}) could not be installed on every "
+                           "control-thread transport - its frames are dropped until the next handshake",
+                           config_.nodeId, peer, k.epoch);
+    peerLinkFanout_.post(peer, k);
+    // Frames sent under the previous epoch before the peer installed the new keys are simply dropped by it (counted).
+    spdlog::debug("BrokerNode[{}]: peer link with node {} installed (epoch {})", config_.nodeId, peer, k.epoch);
+}
+
+int BrokerNode::servicePeerLinks_(int64_t nowNs) {
+    if (!peerLinkAgent_) return 0;
+    // A frame named an epoch this thread's transports do not hold (the peer's continuous heartbeats under the new
+    // epoch): the agent re-handshakes (initiator side).  The peer's workers / admin plane only count (rule of D33).
+    {
+        int32_t peer = -1; uint32_t epoch = 0;
+        if (aeronIngress_ && aeronIngress_->takeUnknownEpoch(peer, epoch)) peerLinkAgent_->onUnknownEpoch(peer, epoch, nowNs);
+        if (replTransport_ && replTransport_->takeUnknownEpoch(peer, epoch)) peerLinkAgent_->onUnknownEpoch(peer, epoch, nowNs);
+    }
+    // An authenticated frame from a peer proves it is alive: only a peer that has been silent for a second can be
+    // rekeyed by an unauthenticated hint.
+    for (std::size_t i = 0; i < peerLinkAgent_->peerCount(); ++i) {
+        const int32_t id = peerLinkAgent_->peerIdAt(i);
+        peerLinkAgent_->observeAuthFrames(id, (aeronIngress_ ? aeronIngress_->authFrames(id) : 0u) +
+                                              (replTransport_ ? replTransport_->authFrames(id) : 0u), nowNs);
+    }
+    int work = peerLinkAgent_->doWork(nowNs);
+    work += peerLinkFanout_.pump(workerPool_.get(), adminWorkerAgent_ ? &adminWorkerAgent_->controlToAdminRing() : nullptr);
+    publishPeerLinkMetrics_();
+    return work;
+}
+
+void BrokerNode::publishPeerLinkMetrics_() noexcept {
+    if (!aeron_ || !peerLinkAgent_) return;
+    auto resolve = [this](std::shared_ptr<aeron::Counter>& c, std::int64_t regId) {
+        if (c || regId < 0) return;
+        try { c = aeron_->findCounter(regId); }
+        catch (...) { c.reset(); }
+    };
+    resolve(peerEstablishedCounter_, peerEstablishedCounterRegId_);
+    resolve(peerRefusalsCounter_, peerRefusalsCounterRegId_);
+    resolve(peerDropsCounter_, peerDropsCounterRegId_);
+    if (peerDropsCounter_) peerDropsCounter_->set(static_cast<std::int64_t>(peerFrameDropsTotal_()));
+    if (peerEstablishedCounter_) peerEstablishedCounter_->set(peerLinkAgent_->establishedPeers());
+    if (peerRefusalsCounter_) peerRefusalsCounter_->set(static_cast<std::int64_t>(peerLinkAgent_->refusals()));
+}
+
+uint64_t BrokerNode::peerFrameDropsTotal_() const noexcept {
+    uint64_t n = adminPeerDrops_;
+    if (udpSink_) n += udpSink_->peerFrameDrops();
+    if (aeronIngress_) n += aeronIngress_->peerFrameDrops();
+    if (replTransport_) n += replTransport_->peerFrameDrops();
+    for (const uint64_t w : workerPeerDrops_) n += w;
+    return n;
+}
+
+void BrokerNode::onWorkerPeerFrameDropsThunk_(void* self, int32_t worker, uint64_t drops) {
+    auto* me = static_cast<BrokerNode*>(self);
+    if (worker >= 0 && static_cast<std::size_t>(worker) < me->workerPeerDrops_.size())
+        me->workerPeerDrops_[static_cast<std::size_t>(worker)] = drops;
+}
+
+BrokerNode::PeerLinkSnap BrokerNode::peerLinksForTest() {
+    return onControlThreadForTest([this]() -> PeerLinkSnap {
+        PeerLinkSnap v;
+        if (!peerLinkAgent_) return v;
+        v.present     = true;
+        v.established = peerLinkAgent_->establishedPeers();
+        v.refusals    = peerLinkAgent_->refusals();
+        v.frameDrops  = peerFrameDropsTotal_();
+        for (const uint64_t w : workerPeerDrops_) v.workerDropsReported += w;
+        v.adminDropsReported = adminPeerDrops_;
+        v.sealed      = udpSink_ && udpSink_->peerSealed();
+        for (const auto& peer : config_.peers) {
+            if (peer.id == config_.nodeId) continue;
+            v.peers.push_back(peer.id);
+            if (peer.id >= 0 && peer.id < 16) v.epochOf[peer.id] = udpSink_ ? udpSink_->peerLinkEpoch(peer.id) : 0u;
+        }
+        return v;
+    });
+}
+
+uint32_t BrokerNode::workerPeerLinkEpochForTest(int32_t w, int32_t peer) {
+    return onWorkerThreadForTest(w, [peer](Worker& wk) -> uint32_t { return wk.peerLinkEpochForTest(peer); });
+}
+
+uint32_t BrokerNode::adminPeerLinkEpochForTest(int32_t peer) {
+    return onAdminThreadForTest([this, peer]() -> uint32_t {
+        return adminWorkerAgent_ ? adminWorkerAgent_->worker().peerLinkEpochForTest(peer) : 0u;
+    });
+}
+
+BrokerNode::SecurityViewSnap BrokerNode::securityViewForTest() {
+    return onControlThreadForTest([this]() -> SecurityViewSnap {
+        SecurityViewSnap v;
+        if (!securityView_) return v;
+        v.present       = true;
+        v.appliedOffset = securityView_->appliedOffset();
+        v.digest        = securityView_->state().digest();
+        v.halted        = securityView_->halted();
+        v.hasSecurityAdmin = securityView_->state().hasSecurityAdmin();
+        return v;
+    });
+}
+
+uint64_t BrokerNode::securityUserIdForTest(const std::string& name) {
+    return onControlThreadForTest([this, name]() -> uint64_t {
+        if (!securityView_) return 0;
+        const auto* u = securityView_->state().user(name);
+        return u ? u->objectId : 0;
+    });
+}
+
+BrokerNode::SecurityGateSnap BrokerNode::securityGateForTest() {
+    return onControlThreadForTest([this]() -> SecurityGateSnap {
+        SecurityGateSnap g;
+        g.held = securityGate_.size();
+        if (securityView_) g.applied = securityView_->appliedOffset();
+        g.refreshed = securityRefreshedOffset_;
+        if (gateway_) { g.gatewayEnforced = gateway_->securityEnforcedOffset(); g.pendingEnforce = gateway_->securityPendingEnforceForTest(); g.shipperPending = gateway_->permissionPendingUpdatesForTest(); }
+        return g;
+    });
+}
+
+int64_t BrokerNode::securityAppliedOffsetOnControlForTest() {
+    return onControlThreadForTest([this]() -> int64_t { return securityView_ ? securityView_->appliedOffset() : int64_t{-1}; });
+}
+
+uint64_t BrokerNode::workerPermissionEpochForTest(int32_t w, int64_t sessionId) {
+    return onWorkerThreadForTest(w, [sessionId](auto& worker) -> uint64_t { return worker.permissionEpochForTest(sessionId); });
+}
+
+std::size_t BrokerNode::workerDirectAcksInFlightForTest(int32_t w) {
+    return onWorkerThreadForTest(w, [](auto& worker) -> std::size_t { return worker.directAcksInFlightForTest(); });
+}
+
+bool BrokerNode::gatewayHasSessionForTest(int64_t sessionId) {
+    return onControlThreadForTest([this, sessionId]() { return gateway_ != nullptr && gateway_->hasSessionForTest(sessionId); });
+}
+uint64_t BrokerNode::gatewayNotAuthorizedForTest() {
+    return onControlThreadForTest([this]() -> uint64_t { return gateway_ ? gateway_->notAuthorizedAnswers() : 0; });
+}
+uint64_t BrokerNode::authGateRefusalsForTest() {
+    return onControlThreadForTest([this]() -> uint64_t { return gateway_ ? gateway_->authGateRefusals() : 0; });
+}
+
+BrokerNode::SecurityMetricsSnap BrokerNode::securityMetricsForTest() {
+    return onControlThreadForTest([this]() -> SecurityMetricsSnap {
+        publishSecurityMetrics_();
+        return SecurityMetricsSnap{securityHaltedValue_, securityAppliedValue_,
+                                   config_.authMode == AuthMode::DevDisabled ? 1 : 0};
+    });
+}
+
+int64_t BrokerNode::appendSecurityRecordOnLeaderForTest(std::span<const uint8_t> eventBytes) {
+    return onAdminThreadForTest([this, eventBytes]() -> int64_t {
+        rune::replication::PartitionReplica* r = securityReplica_.get();
+        if (r == nullptr || r->role() != rune::replication::Role::Leader) return -1;
+        const rune::replication::Offset base = r->append(eventBytes, /*acksAll=*/true);
+        if (base < 0) return -1;
+        r->onLeaderLogAppended();   // reconcile LEO / HW, push to followers
+        return base;
+    });
+}
+
+void BrokerNode::holdSecurityMirrorForTest(bool on) {
+    onControlThreadForTest([this, on]() {
+        heldMirror_.on = on;
+        if (!on) {
+            auto frames = std::move(heldMirror_.frames);
+            heldMirror_.frames.clear();
+            for (const auto& f : frames) onSecurityApplied_(f.data(), f.size());
+        }
+        return 0;
+    });
+}
+
+void BrokerNode::holdSecurityApplyForTest(bool on) {
+    onAdminThreadForTest([this, on]() { adminWorkerAgent_->worker().holdSecurityApplyForTest(on); });
+}
+
+// ---------------------------------------------------------------------------
+// BrokerNode::publishStorageMetrics_ — ISR v3 §3.10 (CONTROL thread; the publishCatalogMetrics_ pattern): resolves
+// each counter once the driver acked it and sets all four every pass (a plain store each).
+// ---------------------------------------------------------------------------
+int BrokerNode::publishStorageMetrics_() noexcept {
+    if (!aeron_) return 0;
+    const std::int64_t values[4] = {
+        storageGate_ ? storageGate_->stateCode() : 0,
+        replBridge_ ? static_cast<std::int64_t>(replBridge_->leaderRolesHeld()) : 0,
+        metadataService_ ? static_cast<std::int64_t>(metadataService_->storagePendingCount()) : 0,
+        metadataService_ ? static_cast<std::int64_t>(metadataService_->lostCommittedReports()) : 0};
+    for (std::size_t i = 0; i < 4; ++i) {
+        if (!storageCounters_[i] && storageCounterRegIds_[i] >= 0) {
+            try { storageCounters_[i] = aeron_->findCounter(storageCounterRegIds_[i]); }
+            catch (...) { storageCounters_[i].reset(); }
+        }
+        if (storageCounters_[i]) storageCounters_[i]->set(values[i]);
+    }
+    return 0;
+}
+
+// ISR v3 Step 9 (§3.6): the consensus vote gate.  An unconfirmed storage votes for nobody (a replaced disk must not
+// help elect a leader without the committed metadata it lost) - except under the unsafe disaster-recovery switch.
+bool BrokerNode::voteGateThunk_(void* self, int32_t c) noexcept {
+    auto* n = static_cast<BrokerNode*>(self);
+    if (n->storageGate_ && !n->storageGate_->mayVote()) {
+        if (!n->config_.storageRecoveryVote || !n->internalIsrKnowledge_->eligibleLearned(c)) return false;
+        n->logRecoveryVote_(c);
+        return true;
+    }
+    return rune::replication::InternalIsrKnowledge::voteGate(n->internalIsrKnowledge_.get(), c);
+}
+// CP2 C1-R: unanimous fresh evidence founds fast (nobody can hold history); a plain majority must outlast the
+// transport's reconnect to a restarted peer (resolver recheck + pending backoff + margin) and the election timeout.
+int64_t BrokerNode::foundingShortDwellNs() const noexcept {
+    return 3 * config_.electionStatusIntervalMs * 1'000'000LL;
+}
+int64_t BrokerNode::foundingLongDwellNs() const noexcept {
+    const int64_t status = config_.electionStatusIntervalMs * 1'000'000LL;
+    // std::max<int64_t>: on Linux int64_t is `long` and the `LL` literals are `long long` - a bare initializer_list of
+    // them does not deduce (gcc 13 in docker/Dockerfile rejected it; Apple clang's int64_t is `long long`).
+    return std::max<int64_t>({3 * status, config_.electionTimeoutMs * 1'000'000LL + status,
+                              PeerResolverHub::kRecheckNs + PeerResolverHub::kPendingMaxNs + 500'000'000LL});
+}
+bool BrokerNode::abstainGateThunk_(void* self) noexcept {
+    auto* n = static_cast<BrokerNode*>(self);
+    return n->storageGate_ && !n->storageGate_->mayVote() && !n->config_.storageRecoveryVote;
+}
+void BrokerNode::logRecoveryVote_(int32_t c) noexcept {
+    const int64_t term = election_ ? static_cast<int64_t>(election_->candidateTermId()) : -1;
+    if (c == lastRecoveryVoteCandidate_ && term == lastRecoveryVoteTerm_) return;   // critical once per (candidate, term)
+    lastRecoveryVoteCandidate_ = c;
+    lastRecoveryVoteTerm_      = term;
+    spdlog::critical("BrokerNode[{}]: RUNE_STORAGE_RECOVERY_VOTE: granting a vote to node {} (term {}) from an "
+                     "UNCONFIRMED storage - disaster recovery only; committed metadata that lived only on lost disks "
+                     "may be lost", config_.nodeId, c, term);
+}
+
+// ---------------------------------------------------------------------------
+// BrokerNode::leaderClientEndpoint (GB-4)
+// ---------------------------------------------------------------------------
+std::string BrokerNode::leaderClientEndpoint() const noexcept {
+    // Observer thread (F9a): one ring-drained snapshot.
+    return leaderClientEndpointFor_(leaderObserver_.observe());
+}
+
+// Pure function of a snapshot + the immutable peer config — callable on any
+// thread with a snapshot that thread legitimately owns.
+std::string BrokerNode::leaderClientEndpointFor_(const LeaderSnapshot& v) const noexcept {
+    // If this node is the leader, no redirect to self.
+    if (v.isLeader) return {};
+
+    const NodeId lid = v.leaderId;
+    if (lid < 0) return {};  // leader unknown — no endpoint
+
+    // Find the leader peer in the immutable config and return its clientChannel.
+    // config_.peers is sorted by id, so linear scan is bounded and fast.
+    for (const auto& peer : config_.peers) {
+        if (static_cast<NodeId>(peer.id) == lid) {
+            return peer.clientChannel();  // empty if clientPort == 0
+        }
+    }
+    return {};  // leader id not found in peer list (should not happen)
+}
+
+// ---------------------------------------------------------------------------
+// BrokerNode::buildAdminWorker — Task 6; catalog history Tasks 9 and 16.
+//
+//   1. buildCatalog_: the __catalog replica (+ its plane) over the Log the startup
+//      phase opened and replayed, outside the admin block's catch — a broker never
+//      starts without its catalog.
+//   2. AdminDeps: the DDL answers (encode + the admin → control egress ring),
+//      brokerCount / topicMinIsr (spec §8).
+//   3. The AdminWorkerAgent (owns the AdminWorker: replica, registries) adopts the
+//      applier bootFromCatalog_ booted (phase Booted; its first admin pass makes it
+//      Live) + its AdminWorkerRunner (dedicated thread, started by start() AFTER
+//      the boot stash is posted).
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// BrokerNode::bootFromCatalog_ — catalog history Task 16 (spec §3, §5.3; STARTUP
+// thread, step 1b, before the TopicRegistry and every builder).
+//
+//   1. dataDir/__catalog: a recovered disk Log (never InMemoryLog); the registries
+//      the applier projects into; the CatalogApplier (AwaitingBoot).
+//   2. THE one boot replay (F4): applier.replayLocal(log, BootCatalogSink) of the
+//      checkpointed prefix.  It throws — the broker refuses to start — on a
+//      corrupt checkpoint file or a checkpoint at/after the local log end (events
+//      this broker already applied are missing: never replay a shorter history,
+//      B1).  A HALTED replay (a bad event, a digest mismatch) does not refuse: the
+//      broker boots with the applied prefix, halted (route RouteHalted, critical).
+//      The BootCatalogSink fills the topic list (topicApplied / sinkApplied); what
+//      needs a running broker is posted from the applied state by postBootStash.
+//   3. bootTopics_ = the catalog's live topics and view sinks
+//      in topic-id order; bootDroppedIds_ = every topic id the catalog dropped
+//      (CatalogState: ids assigned and no longer live — tombstoned topics and
+//      retired view sinks), kept for the registry's Dropped slots and the
+//      MetadataService's placement removal.
+//   4. The topic-dir reconcile (TopicDirReconcile.h):
+//        halted         → NONE (nothing is moved, renamed, deleted or quarantined:
+//                         catalog damage ⇒ no destructive cleanup; B5);
+//        nothing applied and the data dir holds topic dirs (the local catalog was
+//                       wiped, or the disk is new) → DEFERRED until the applier has
+//                       caught up to the catalog leader's committed prefix, then
+//                       run once by the admin thread (B6);
+//        otherwise      → run now.
+// ---------------------------------------------------------------------------
+namespace {
+TopicSpec topicSpecFromCatalog(const CatalogTopicAppliedMsg& m);   // defined with the control thread's effect handlers
+// The TopicSpec the control thread's effect handler built from a CatalogTopicApplied
+// frame — the SAME mapping (a boot topic is byte-for-byte the topic the live effect
+// would have built).
+TopicSpec bootSpecOfFrame(int32_t topicId, const std::string& name, int32_t partitions, int16_t rf,
+                          rune::catalog::Persistence persistence, const rune::protocol::TopicConfig& c) {
+    CatalogTopicAppliedMsg m;
+    m.topicId           = topicId;
+    m.name              = name;
+    m.partitions        = partitions;
+    m.replicationFactor = rf;
+    m.persistence       = persistence == rune::catalog::Persistence::Transient ? 1 : 0;
+    m.config            = c;
+    return topicSpecFromCatalog(m);
+}
+
+bool dirHoldsEntries(const fs::path& d) {
+    std::error_code ec;
+    fs::directory_iterator it(d, ec), end;
+    return !ec && it != end;
+}
+} // namespace
+
+void BrokerNode::bootFromCatalog_() {
+    namespace cat = rune::catalog;
+    warnRetiredCatalogDirs(config_.dataDir);
+
+    const fs::path dir = fs::path{config_.dataDir} / "__catalog";
+    fs::create_directories(dir);
+    catalogLog_ = std::make_unique<rune::storage::Log>(dir.string(), config_.offsetLogSegmentRollBytes);
+    catalogLog_->recover();
+    if (catalogLog_->storageFailed())   // fix round 1 (R7): before anything reads the log or touches topics/
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: __catalog recovery failed "
+                                 "(storage error " + std::to_string(catalogLog_->storageErrno()) + ") at " +
+                                 dir.string() + " — refusing to start before the boot replay");
+    // Never compacted / retention-deleted: a recovered catalog always starts at
+    // 0 — a follower can never be "below the leader's start".  Anything else is
+    // a damaged (or foreign) directory: refuse loudly instead of serving it.
+    if (catalogLog_->logStartOffset() != 0) {
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: __catalog at " +
+                                 dir.string() + " starts at offset " +
+                                 std::to_string(catalogLog_->logStartOffset()) +
+                                 " — the catalog is never truncated at the front; refusing to start");
+    }
+
+    schemaRegistry_ = std::make_unique<SchemaRegistry>();
+    viewRegistry_   = std::make_unique<ViewRegistry>();
+    bootApplier_.emplace(dir.string(), *schemaRegistry_, *viewRegistry_);
+
+    // The BootCatalogSink: the topics the TopicRegistry / replication / placement
+    // build below.  (A dropped object posts nothing: the final state is replayed.)
+    std::vector<TopicSpec> catalogTopics;
+    CatalogEffects sink;
+    sink.maxFrameBytes = catalogEffectMaxFrame();   // an effect that could never be posted halts the boot, as before
+    bootObjects_ = rune::gateway::ObjectIndex{};
+    sink.topicApplied = [&catalogTopics, this](const cat::TopicObject& t) {
+        bootObjects_.onTopic(t.topicId, t.name);
+        catalogTopics.push_back(bootSpecOfFrame(t.topicId, t.name, t.partitions, t.replicationFactor, t.persistence,
+                                                t.config));
+    };
+    sink.sinkApplied = [&catalogTopics, this](const SinkSpec& sp) {   // a view's sink: a keyed, compacted table, every broker
+        bootObjects_.onView(sp.topicId, sp.name);
+        rune::protocol::TopicConfig c;
+        c.cleanupPolicy = 1;   // Compact
+        c.partitionKey  = sp.keyField;
+        TopicSpec bs = bootSpecOfFrame(sp.topicId, sp.name, sp.partitions, /*rf*/0, sp.persistence, c);
+        bs.viewSink = true;   // VLS B.2: catalog-only -- no dir, no log, no replica
+        catalogTopics.push_back(std::move(bs));
+    };
+    const int replayed = bootApplier_->replayLocal(*catalogLog_, BootEffects{std::move(sink)});   // throws: refuse boot
+    if (replayed >= 0) ++bootReplays_;
+    std::sort(catalogTopics.begin(), catalogTopics.end(),
+              [](const TopicSpec& a, const TopicSpec& b) { return a.topicId < b.topicId; });
+
+    bootDroppedIds_ = droppedTopicIds(bootApplier_->state());
+    bootTopics_ = std::move(catalogTopics);
+
+    const auto nowSeconds = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    const bool halted = bootApplier_->halted();
+    // Fix round 1 (R2): the reconcile runs ONLY here, on the startup thread.  A broker whose local catalog
+    // cannot be trusted (empty while catalog-made, marker-carrying topic dirs exist) defers it to a LATER
+    // boot, after it proved as a follower that it applied the leader's history (the catch-up sentinel).
+    const BootReconcile decision = decideBootReconcile(
+        halted, bootApplier_->lastApplied().offset, topicsHoldCatalogMarkedDir(config_.dataDir),
+        dirHoldsEntries(fs::path{config_.dataDir} / "dropped"), readCatchUpSentinel(config_.dataDir));
+    switch (decision) {
+    case BootReconcile::Skip:
+        spdlog::critical("BrokerNode[{}]: the __catalog boot replay HALTED — the broker boots with the prefix it "
+                         "applied ({} topic(s)), halted, and accepts no catalog change.  The topic-dir reconcile is "
+                         "SKIPPED this boot: NO topic dir is moved, renamed, deleted or quarantined (catalog damage: "
+                         "no destructive cleanup); topics created after the halt are not served until the catalog is "
+                         "repaired", config_.nodeId, bootTopics_.size());
+        break;
+    case BootReconcile::RunNow:
+    case BootReconcile::RunNowAndClearSentinel: {
+        (void)reconcileTopicDirs(config_.dataDir, bootTopics_, bootDroppedIds_, nowSeconds);
+        if (decision == BootReconcile::RunNowAndClearSentinel && !removeCatchUpSentinel(config_.dataDir))
+            spdlog::error("BrokerNode[{}]: cannot remove the catch-up sentinel in {} — the next boot reconciles "
+                          "again (idempotent)", config_.nodeId, config_.dataDir);
+        break;
+    }
+    case BootReconcile::Defer:
+        bootReconcileDeferred_ = true;
+        spdlog::warn("BrokerNode[{}]: a catalog catch-up began at an earlier boot and has not completed — no topic dir "
+                     "is touched", config_.nodeId);
+        break;
+    case BootReconcile::DeferAndWritePending:
+        if (!writeCatchUpSentinel(config_.dataDir, -1))
+            throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: cannot persist the catch-up "
+                                     "sentinel in " + config_.dataDir + " — refusing to start: a crash during catch-up "
+                                     "would reconcile against a partial catalog");
+        bootReconcileDeferred_ = true;
+        spdlog::warn("BrokerNode[{}]: the local __catalog is empty but {} holds catalog-made topic dirs (the catalog was "
+                     "wiped, or this is a new disk) — NO topic dir is touched at boot; the reconcile runs at the boot "
+                     "after this broker caught up to the catalog leader as a follower", config_.nodeId,
+                     config_.dataDir);
+        break;
+    }
+}
+
+// Task 23 (spec §10 gate): the boot step alone, for the 10 000-event gate test and benchmark.
+BrokerNode::BootReplayForBench BrokerNode::bootFromCatalogForBench(const std::string& dataDir) {
+    NodeConfig cfg;
+    cfg.nodeId  = 1;
+    cfg.dataDir = dataDir;
+    BrokerNode node{std::move(cfg)};
+    const auto t0 = std::chrono::steady_clock::now();
+    node.bootFromCatalog_();
+    const auto t1 = std::chrono::steady_clock::now();
+    BootReplayForBench r;
+    r.appliedEvents = node.bootApplier_ ? node.bootApplier_->lastApplied().offset + 1 : -1;
+    r.halted        = node.bootApplier_ && node.bootApplier_->halted();
+    r.bootTopics    = node.bootTopics_.size();
+    r.droppedIds    = node.bootDroppedIds_.size();
+    r.bootNs        = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+    return r;
+}
+
+// ---------------------------------------------------------------------------
+// BrokerNode::buildCatalog_ — catalog history Task 6 (spec §3, §5.6, ruling 7).
+//
+//   1. dataDir/__catalog + a recovered disk Log (never InMemoryLog).
+//   2. The replica: makeCatalogPartitionConfig, Follower at epoch 0, replicas =
+//      ISR seed = every broker.  Multi-node: its transport is a dedicated
+//      replication PLANE (a WorkerReplicationTransport built exactly like a
+//      legacy per-worker plane) on stream catalogReplStreamId over this node's
+//      replication channel, attached to the node client, its re-add broker on
+//      replTransport_ — polled ONLY by the admin thread.  Single node (or no
+//      replication transport): a NullPartitionTransport.
+//   3. NOT added to replicaRegistry_ (RULING-2 A: admin-owned); the bridge
+//      relays its committed assignment on the admin role ring, and its AlterIsr
+//      travels admin→control (AdminIsrChannel, wired once the agent exists).
+// Any failure throws: a broker never starts without its catalog.
+// ---------------------------------------------------------------------------
+void BrokerNode::buildCatalog_() {
+    namespace rr = rune::replication;
+    // Task 16: the catalog Log was opened, recovered and replayed by bootFromCatalog_
+    // (the startup phase); here it only gets its replica and replication plane.
+    if (!catalogLog_)
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: buildCatalog_ before "
+                                 "bootFromCatalog_ — the __catalog log is not open");
+    const fs::path dir = fs::path{config_.dataDir} / "__catalog";
+
+    std::vector<rr::NodeId> allNodeIds;
+    allNodeIds.reserve(config_.peers.size());
+    for (const auto& peer : config_.peers) allNodeIds.push_back(static_cast<rr::NodeId>(peer.id));
+    if (allNodeIds.size() > static_cast<std::size_t>(AdminRoleMsg::kMaxIsr)) {
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: __catalog is replicated "
+                                 "to every broker; " + std::to_string(allNodeIds.size()) +
+                                 " brokers exceed the replica bound " + std::to_string(AdminRoleMsg::kMaxIsr));
+    }
+
+    // Ruling 7: multi-node with a controller channel → the controller-ISR path.
+    catalogOnController_ = !config_.isSingleNode() && replTransport_ != nullptr;
+    if (catalogOnController_ && !metadataService_) {
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: __catalog needs the "
+                                 "controller (MetadataService failed to build) — refusing to start");
+    }
+
+    rr::PartitionTransport* transport = nullptr;
+    if (catalogOnController_) {
+        std::vector<std::pair<rr::NodeId, std::string>> replPeers;
+        replPeers.reserve(config_.peers.size());
+        for (const auto& peer : config_.peers) {
+            if (peer.id == config_.nodeId || peer.replicationPort == 0) continue;
+            replPeers.push_back({static_cast<rr::NodeId>(peer.id), peer.replicationChannel()});
+        }
+        const std::string inbound = config_.selfReplicationBindChannel();
+        if (!aeron_ || inbound.empty() || replPeers.size() + 1 != allNodeIds.size()) {
+            throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: __catalog replication "
+                                     "plane needs the node client and a replication port on every broker "
+                                     "(peers with one: " + std::to_string(replPeers.size()) + " of " +
+                                     std::to_string(allNodeIds.size() - 1) + ") — refusing to start");
+        }
+        const int32_t streamId = config_.catalogReplStreamId;
+        catalogPlane_ = std::make_unique<rr::WorkerReplicationTransport>(
+            /*workerId (diagnostic: the admin plane)=*/-1, inbound, streamId,
+            rr::WorkerReplicationTransport::DeferredAttach{},
+            peerCrypto_(/*senderId=*/2));   // Authentication Task 16 (D33): the admin plane is sender 2
+        // DR-15: resolution events for the ADMIN thread (the plane's owner); its
+        // post-startup re-adds go through the control thread (it rides the node
+        // client), exactly like a legacy per-worker plane.
+        if (resolverHub_) catalogPlane_->attachResolution(resolverHub_->subscribeOwner());
+        catalogAddBroker_ = std::make_unique<rr::PubAddBroker>(replPeers, streamId);
+        replTransport_->addPubAddBroker(catalogAddBroker_.get());
+        catalogPlane_->setAddBroker(catalogAddBroker_.get());
+        (void)catalogPlane_->attach(aeron_, replPeers, streamId);
+        if (!catalogPlane_->resolved()) {
+            throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: __catalog replication "
+                                     "plane inbound did not resolve (stream=" + std::to_string(streamId) +
+                                     ") — refusing to start with an unreplicated catalog");
+        }
+        transport = catalogPlane_.get();
+    } else {
+        // Fix round 0 (Task 6): never a silent fallback — a multi-node catalog
+        // without a replication transport could never be replicated (nor reach
+        // its majority minIsr).
+        if (!config_.isSingleNode()) {
+            throw std::runtime_error(
+                "BrokerNode[" + std::to_string(config_.nodeId) + "]: multi-node (" +
+                std::to_string(allNodeIds.size()) + " brokers) without a replication transport (" +
+                (config_.self().replicationPort == 0 ? std::string("no replicationPort configured for this node")
+                                                     : std::string("the replication transport failed to build")) +
+                ") — __catalog is replicated to every broker; refusing to start");
+        }
+        nullTransports_.push_back(std::make_unique<rr::NullPartitionTransport>());
+        transport = nullTransports_.back().get();
+    }
+
+    catalogReplica_ = std::make_unique<rr::PartitionReplica>(
+        makeCatalogPartitionConfig(config_, allNodeIds.size()), rr::Role::Follower, /*epoch=*/0,
+        allNodeIds, allNodeIds, catalogLog_.get(), transport);
+    // KIP-903 / E2 C1 residual N1: the same process identities every replica of
+    // this process carries (ReplicaRegistry::add stamps registry replicas).
+    if (replicaRegistry_ && replicaRegistry_->processIncarnation() != 0)
+        catalogReplica_->setProcessIncarnation(replicaRegistry_->processIncarnation());
+    catalogReplica_->setStorageId(storage_.id);   // ISR v3 Step 6
+    if (config_.testHoldFollowerFetchesMs > 0)
+        catalogReplica_->holdFetchesUntilForTest(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() +
+            config_.testHoldFollowerFetchesMs * 1'000'000LL);
+    if (lifecycleNonce_ != 0) catalogReplica_->setLineageIdentity(lifecycleNonce_);
+
+    spdlog::info("BrokerNode[{}]: __catalog built at {} (LEO={}, minIsr={}, {}, role from {})",
+                 config_.nodeId, dir.string(), catalogLog_->logEndOffset(),
+                 catalogMinIsr(allNodeIds.size()),
+                 catalogPlane_ ? "replicated on stream " + std::to_string(config_.catalogReplStreamId)
+                               : std::string("single node"),
+                 catalogOnController_ ? "the controller (ISR-elected, never unclean)" : "the consensus leader");
+}
+
+// ---------------------------------------------------------------------------
+// Authentication Task 9 - the `__security` partition (D39), the `__catalog` pattern:
+// BrokerNode::bootFromSecurity_ (STARTUP thread) opens and recovers dataDir/__security (a disk Log, never
+// in-memory), runs THE one boot replay of [0, checkpoint] through the SecurityApplier (a damaged or too-far
+// checkpoint throws: refuse to start) and hands a COPY of the booted state to the control thread's SecurityView
+// (D29) - all before any thread runs.  BrokerNode::buildSecurity_ gives the log its replica on the admin plane
+// (shared with __catalog's: frames dispatched by topic id) with the ISR v3 storage id; its leadership comes from
+// the controller-ISR path (multi-node) or the consensus leader (single node).
+// ---------------------------------------------------------------------------
+void BrokerNode::bootFromSecurity_() {
+    const fs::path dir = fs::path{config_.dataDir} / "__security";
+    fs::create_directories(dir);
+    // Combined fix program M13 (X102): the log holds every user's StoredKey / ServerKey - owner-only directory (0700,
+    // also tightening one an older run left 0755) and owner-only files (0600).
+    {
+        std::error_code permEc;
+        fs::permissions(dir, fs::perms::owner_all, fs::perm_options::replace, permEc);
+        if (permEc)
+            throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: cannot restrict " + dir.string() +
+                                     " to its owner (0700): " + permEc.message() + " - refusing to start");
+    }
+    securityLog_ = std::make_unique<rune::storage::Log>(dir.string(), config_.offsetLogSegmentRollBytes, kSecurityFileMode);
+    securityLog_->recover();
+    if (securityLog_->storageFailed())
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: __security recovery failed "
+                                 "(storage error " + std::to_string(securityLog_->storageErrno()) + ") at " +
+                                 dir.string() + " - refusing to start");
+    // Never compacted / retention-deleted: a recovered security log always starts at 0.
+    if (securityLog_->logStartOffset() != 0)
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: __security at " + dir.string() +
+                                 " starts at offset " + std::to_string(securityLog_->logStartOffset()) +
+                                 " - the security log is never truncated at the front; refusing to start");
+    bootSecurityApplier_.emplace(dir.string());
+    const int replayed = bootSecurityApplier_->replayLocal(*securityLog_, SecurityBootEffects{});   // throws: refuse boot
+    securityView_.emplace(bootSecurityApplier_->state());   // a COPY: the applier keeps its own (D29)
+    if (const rune::security::ApplyError* e = bootSecurityApplier_->haltError()) {
+        // A damaged local prefix: the broker boots fail-closed (Task 14 revokes / refuses on the halted mirror).
+        securityView_->onHalted(*e);
+        securityHaltedValue_ = e->offset + 1;
+    }
+    securityAppliedValue_ = securityView_->appliedOffset();
+    securityRefreshedOffset_ = securityAppliedValue_;   // the booted state is enforced from the first request
+    spdlog::info("BrokerNode[{}]: __security booted - {} event(s) replayed, applied through offset {}, applier {}",
+                 config_.nodeId, replayed, securityAppliedValue_, bootSecurityApplier_->stateName());
+}
+
+void BrokerNode::buildSecurity_() {
+    namespace rr = rune::replication;
+    if (!securityLog_ || !bootSecurityApplier_)
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: buildSecurity_ before "
+                                 "bootFromSecurity_ - the __security log is not open");
+    const fs::path dir = fs::path{config_.dataDir} / "__security";
+    std::vector<rr::NodeId> allNodeIds;
+    allNodeIds.reserve(config_.peers.size());
+    for (const auto& peer : config_.peers) allNodeIds.push_back(static_cast<rr::NodeId>(peer.id));
+    if (allNodeIds.size() > static_cast<std::size_t>(AdminRoleMsg::kMaxIsr))
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: __security is replicated to "
+                                 "every broker; " + std::to_string(allNodeIds.size()) +
+                                 " brokers exceed the replica bound " + std::to_string(AdminRoleMsg::kMaxIsr));
+
+    // The admin plane buildCatalog_ attached (catalogOnController_ = multi-node with a controller channel); a
+    // multi-node broker without it already refused to start there - never a silent fallback.
+    rr::PartitionTransport* transport = nullptr;
+    if (catalogOnController_) {
+        transport = catalogPlane_.get();
+    } else {
+        if (!config_.isSingleNode())
+            throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: __security is replicated to "
+                                     "every broker but there is no admin replication plane; refusing to start");
+        nullTransports_.push_back(std::make_unique<rr::NullPartitionTransport>());
+        transport = nullTransports_.back().get();
+    }
+
+    securityReplica_ = std::make_unique<rr::PartitionReplica>(
+        makeSecurityPartitionConfig(config_, allNodeIds.size()), rr::Role::Follower, /*epoch=*/0,
+        allNodeIds, allNodeIds, securityLog_.get(), transport);
+    if (replicaRegistry_ && replicaRegistry_->processIncarnation() != 0)
+        securityReplica_->setProcessIncarnation(replicaRegistry_->processIncarnation());
+    securityReplica_->setStorageId(storage_.id);   // ISR v3 Step 6
+    if (config_.testHoldFollowerFetchesMs > 0)
+        securityReplica_->holdFetchesUntilForTest(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() +
+            config_.testHoldFollowerFetchesMs * 1'000'000LL);
+    if (lifecycleNonce_ != 0) securityReplica_->setLineageIdentity(lifecycleNonce_);
+
+    spdlog::info("BrokerNode[{}]: __security built at {} (LEO={}, minIsr={}, {}, role from {})",
+                 config_.nodeId, dir.string(), securityLog_->logEndOffset(), securityMinIsr(allNodeIds.size()),
+                 catalogPlane_ ? "replicated on the admin plane (stream " + std::to_string(config_.catalogReplStreamId) + ")"
+                               : std::string("single node"),
+                 catalogOnController_ ? "the controller (ISR-elected, never unclean)" : "the consensus leader");
+}
+
+void BrokerNode::buildAdminWorker() {
+    const int32_t nodeId = config_.nodeId;
+    // Catalog history Task 6: the __catalog partition first, OUTSIDE the admin
+    // block's catch — a broker without its catalog never starts.
+    buildCatalog_();
+    buildSecurity_();   // Authentication Task 9: right after it - same plane, same controller-ISR decision
+    try {
+        // Catalog history Task 16: the SchemaRegistry / ViewRegistry are the
+        // CatalogApplier's projections of __catalog (built by bootFromCatalog_);
+        // the retired __topic_schemas / __views logs are never opened, read or
+        // written.
+
+        // ── Wire AdminDeps ───────────────────────────────────────────────────
+        // Catalog history Task 9: the AdminWorker writes __catalog (on the catalog
+        // leader) and applies it (every broker); the applier's effects reach the
+        // control thread through the agent's catalog sink (no create-topic
+        // round-trip: a topic's id comes from the catalog).  The deps are the DDL
+        // answers: encode the response frame and push it on egressRing_ (admin →
+        // control) as [sessionId:i64][frame]; the control thread sends it on the
+        // session's egress (single-writer) through the DDL answer gate.
+        AdminDeps deps;
+        deps.brokerCount = static_cast<int32_t>(std::max<std::size_t>(config_.peers.size(), 1));
+        deps.topicMinIsr = config_.gatewayMinIsr;
+
+        deps.respondDefine = [this](int64_t session, int64_t corr, int32_t topicId,
+                                    uint16_t version, uint16_t errorCode) {
+            if (!adminWorkerAgent_) return;
+            namespace pc = rune::protocol::client;
+            pc::DefineTopicResponse resp;
+            resp.sessionId     = session;
+            resp.correlationId = corr;
+            resp.topicId       = topicId;
+            resp.version       = version;
+            resp.errorCode     = errorCode;
+            uint8_t frame[pc::MessageHeader::ENCODED_SIZE + pc::DefineTopicResponse::BODY_FIXED];
+            const std::size_t n = resp.encode(frame);
+            // No-hang (R2): ring full → admin-owned bounded backlog, retried
+            // (never dropped).  A fixed-size answer always fits one ring message.
+            [[maybe_unused]] const bool posted = adminWorkerAgent_->postEgressFrame(session, frame, n);
+            assert(posted && "a fixed-size DDL answer always fits one admin egress message");
+        };
+        deps.respondAlter = [this](int64_t session, int64_t corr, int32_t topicId,
+                                   uint16_t newVersion, uint16_t errorCode) {
+            if (!adminWorkerAgent_) return;
+            namespace pc = rune::protocol::client;
+            pc::AlterTopicResponse resp;
+            resp.sessionId     = session;
+            resp.correlationId = corr;
+            resp.topicId       = topicId;
+            resp.newVersion    = newVersion;
+            resp.errorCode     = errorCode;
+            uint8_t frame[pc::MessageHeader::ENCODED_SIZE + pc::AlterTopicResponse::BODY_FIXED];
+            const std::size_t n = resp.encode(frame);
+            [[maybe_unused]] const bool posted = adminWorkerAgent_->postEgressFrame(session, frame, n);
+            assert(posted && "a fixed-size DDL answer always fits one admin egress message");
+        };
+        deps.respondGet = [this](int64_t session, int64_t corr, int32_t topicId,
+                                 uint16_t version, int32_t partitionCount,
+                                 const std::vector<uint8_t>& blob,
+                                 uint16_t errorCode) {
+            if (!adminWorkerAgent_) return;
+            // Fix round 3: the encode / post / MessageTooLarge logic lives in
+            // AdminWorkerAgent::postTopicSchemaResponse (directly testable).
+            adminWorkerAgent_->postTopicSchemaResponse(session, corr, topicId, version, partitionCount,
+                                                       blob, errorCode);
+        };
+        deps.respondCreateView = [this](int64_t session, int64_t corr, int32_t viewTopicId,
+                                        uint64_t outputFingerprint, uint16_t errorCode) {
+            if (!adminWorkerAgent_) return;
+            namespace pc = rune::protocol::client;
+            pc::CreateViewResponse resp;
+            resp.sessionId         = session;
+            resp.correlationId     = corr;
+            resp.viewTopicId       = viewTopicId;
+            resp.outputFingerprint = outputFingerprint;
+            resp.errorCode         = errorCode;
+            uint8_t frame[pc::MessageHeader::ENCODED_SIZE + pc::CreateViewResponse::BODY_FIXED];
+            const std::size_t n = resp.encode(frame);
+            [[maybe_unused]] const bool posted = adminWorkerAgent_->postEgressFrame(session, frame, n);
+            assert(posted && "a fixed-size DDL answer always fits one admin egress message");
+        };
+        deps.respondDdl = [this](int64_t session, int64_t corr, uint16_t code, uint64_t objectId,
+                                 uint32_t newVersion, int32_t gateTopicId, std::string_view detail) {
+            if (!adminWorkerAgent_) return;
+            adminWorkerAgent_->postDdlResponse(session, corr, code, objectId, newVersion, gateTopicId, detail);
+        };
+        deps.respondSecurity = [this](int64_t session, int64_t corr, uint16_t code, uint64_t objectId,
+                                      uint32_t newVersion, int64_t gateOffset, std::string_view detail) {
+            if (!adminWorkerAgent_) return;
+            adminWorkerAgent_->postSecurityResponse(session, corr, code, objectId, newVersion, gateOffset, detail);
+        };
+        deps.respondError = [this](int64_t session, int64_t corr, uint16_t code, std::string_view message) {
+            if (!adminWorkerAgent_) return;
+            adminWorkerAgent_->postErrorResponse(session, corr, code, message);
+        };
+        // Catalog history Task 12: the catalog read server's frames (admin thread)
+        // → the agent's catalog-read ring → the control thread → the session.
+        deps.catalogRead = [this](const CatalogReadFrameHead& head, std::span<const uint8_t> frame) {
+            return adminWorkerAgent_ != nullptr && adminWorkerAgent_->postCatalogReadFrame(head, frame);
+        };
+
+        // Construct AdminWorkerAgent (owns the AdminWorker — the __catalog replica
+        // and the registries its applier projects).
+        adminWorkerAgent_ = std::make_unique<AdminWorkerAgent>(
+            *schemaRegistry_, config_.nodeId, std::move(deps), viewRegistry_.get(),
+            catalogReplica_.get(), catalogPlane_.get());
+        // Task 16 (F4): the applier the startup phase booted — Booted, never replayed
+        // again; the admin thread's first pass makes it Live.
+        adminWorkerAgent_->worker().adoptBootedApplier(std::move(*bootApplier_), adminWorkerAgent_->catalogLiveEffects());
+        bootApplier_.reset();
+        // Authentication Task 9: the same for the booted SecurityApplier + the `__security` replica.
+        adminWorkerAgent_->worker().attachSecurity(std::move(*bootSecurityApplier_), securityReplica_.get(),
+                                                   adminWorkerAgent_->securityLiveEffects());
+        bootSecurityApplier_.reset();
+        if (holdCatalogApplyAtBootForTest_) adminWorkerAgent_->worker().holdApplyForTest(true);
+        if (bootReconcileDeferred_) {
+            adminWorkerAgent_->worker().deferTopicDirReconcile(config_.dataDir);
+        }
+
+        // Catalog history Task 6: wire the __catalog replica's controller path
+        // before any thread drives it.  ISR proposals → the admin→control ring
+        // (never replTransport_, which the control thread owns); its committed
+        // role ← the bridge, on the admin role ring (the control thread is that
+        // ring's single producer, as for the schema role below).
+        if (catalogOnController_) {
+            catalogReplica_->setIsrChannel(&adminWorkerAgent_->catalogIsrChannel());
+            if (replBridge_) replBridge_->setCatalogRoleRing(&adminWorkerAgent_->roleRing());
+            securityReplica_->setIsrChannel(&adminWorkerAgent_->securityIsrChannel());
+            replTransport_->setForeignAlterIsrResponseHandler(&BrokerNode::onAdminLogAlterIsrResponseThunk_, this);
+        }
+
+        // Dedicated thread (separate from gateway and produce workers).
+        // D2 round 2: shard mode parks without yields (NodeConfig::adminIdleShape); legacy: Agrona defaults.
+        adminWorkerIdleStrategy_ = makeShapedBackoff(config_.adminIdleShape());
+        adminWorkerRunner_ = std::make_unique<rune::consensus::AgentRunner>(
+            *adminWorkerAgent_, *adminWorkerIdleStrategy_, adminWorkerClock_);
+
+        spdlog::info("BrokerNode[{}]: AdminWorker wired over the booted __catalog applier", nodeId);
+
+    } catch (const std::exception& ex) {
+        spdlog::error(
+            "BrokerNode[{}]: AdminWorker setup failed: {}; schema DDL will not work",
+            nodeId, ex.what());
+        adminWorkerRunner_.reset();
+        adminWorkerAgent_.reset();
+    }
+    // Catalog history Task 6: the catalog has no other driver than the admin
+    // thread — no admin worker means an undriven catalog: never start so.
+    if (catalogReplica_ && !adminWorkerAgent_) {
+        throw std::runtime_error("BrokerNode[" + std::to_string(nodeId) + "]: the admin worker failed to "
+                                 "build — the __catalog replica would have no driver; refusing to start");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Catalog history Task 6 — control-thread halves of the catalog ISR relay.
+// ---------------------------------------------------------------------------
+void BrokerNode::forwardCatalogAlterIsr_(const uint8_t* p, std::size_t n) {
+    rune::replication::AlterIsrMsg m{};
+    if (!decodeCatalogAlterIsr(p, n, m) || m.topicId != kCatalogTopicId) [[unlikely]] {
+        if (adminToControlRejects_++ % 1024 == 0)
+            spdlog::error("BrokerNode[{}]: malformed __catalog AlterIsr frame (len={}) skipped (rejects={})",
+                          config_.nodeId, n, adminToControlRejects_);
+        return;
+    }
+    // A refused send (outbound ring full) is counted; the replica re-sends its
+    // proposal on its kAlterIsrResendNs cadence (it never assumes delivery).
+    if (!replTransport_ || !replTransport_->sendAlterIsr(m)) [[unlikely]] {
+        if (catalogAlterIsrRefused_++ % 1024 == 0)
+            spdlog::warn("BrokerNode[{}]: __catalog AlterIsr refused by the controller channel ({}) — "
+                         "the replica re-sends it (refused so far: {})", config_.nodeId,
+                         replTransport_ ? "outbound ring full" : "no transport", catalogAlterIsrRefused_);
+    }
+}
+
+void BrokerNode::forwardSecurityAlterIsr_(const uint8_t* p, std::size_t n) {
+    rune::replication::AlterIsrMsg m{};
+    if (!decodeCatalogAlterIsr(p, n, m) || m.topicId != kSecurityTopicId) [[unlikely]] {
+        if (adminToControlRejects_++ % 1024 == 0)
+            spdlog::error("BrokerNode[{}]: malformed __security AlterIsr frame (len={}) skipped (rejects={})",
+                          config_.nodeId, n, adminToControlRejects_);
+        return;
+    }
+    if (!replTransport_ || !replTransport_->sendAlterIsr(m)) [[unlikely]] {
+        if (securityAlterIsrRefused_++ % 1024 == 0)
+            spdlog::warn("BrokerNode[{}]: __security AlterIsr refused by the controller channel ({}) - the replica "
+                         "re-sends it (refused so far: {})", config_.nodeId,
+                         replTransport_ ? "outbound ring full" : "no transport", securityAlterIsrRefused_);
+    }
+}
+
+// The controller's AlterIsrResponse for an admin log: (-6, 0) -> the catalog, (-7, 0) -> the security log; either
+// way verbatim (leaderId included) on the admin role ring under that log's message type.
+bool BrokerNode::onAdminLogAlterIsrResponseThunk_(void* self,
+                                                  const rune::replication::AlterIsrResponseMsg& r) noexcept {
+    auto* node = static_cast<BrokerNode*>(self);
+    const bool security = r.topicId == kSecurityTopicId && r.partition == kSecurityPartition;
+    if (!security && !(r.topicId == kCatalogTopicId && r.partition == kCatalogPartition))
+        return true;   // not ours: as before
+    const char* log = security ? "__security" : "__catalog";
+    uint64_t& answersHeld    = security ? node->securityAnswersHeld_ : node->catalogAnswersHeld_;
+    uint64_t& answersDropped = security ? node->securityAnswersDropped_ : node->catalogAnswersDropped_;
+    // Fix round 1 (M5): the admin thread is gone (stop()) - nothing will ever
+    // drain the role ring; holding the answer would block this peer's whole
+    // image (every -1/-2/-3 and node-control frame behind it).  Drop, counted.
+    // Fix round 1 (M3): FIFO with the role it depends on - while the bridge
+    // holds that log's role, the answer must not overtake it on the ring.
+    // Held = false: re-delivered (Aeron path) / refused (local path; counted
+    // by the transport, the leader re-sends).  Verbatim (leaderId included).
+    OneToOneByteRing* ring = (node->adminWorkerAgent_ && !node->adminDrainStopped_)
+                                 ? &node->adminWorkerAgent_->roleRing() : nullptr;
+    const bool rolePending = node->replBridge_ &&
+                             (security ? node->replBridge_->securityRolePending() : node->replBridge_->catalogRolePending());
+    switch (relayCatalogAlterIsrResponse(ring, rolePending, r,
+                                         security ? kMsgSecurityAlterIsrResponse : kMsgCatalogAlterIsrResponse)) {
+    case CatalogAnswerRelay::Delivered:
+        return true;
+    case CatalogAnswerRelay::Dropped:
+        if (answersDropped++ % 1024 == 0)
+            spdlog::warn("BrokerNode[{}]: {} AlterIsr answer dropped - the admin thread is stopped "
+                         "(dropped so far: {})", node->config_.nodeId, log, answersDropped);
+        return true;
+    case CatalogAnswerRelay::Held:
+        break;
+    }
+    if (answersHeld++ % 1024 == 0)
+        spdlog::warn("BrokerNode[{}]: {} AlterIsr answer held ({}) - re-delivered after it "
+                     "(held so far: {})", node->config_.nodeId, log,
+                     rolePending ? "a role of that log is ahead of it" : "admin role ring full", answersHeld);
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// BrokerNode::stop
+// ---------------------------------------------------------------------------
+void BrokerNode::stop() {
+    if (stopped_) return; // idempotent (controller-owned flag, F9a)
+    stopped_ = true;
+    controlThreadId_ = std::thread::id{};   // fix round 0: a joined thread's id may be reused
+
+    // Controlled shutdown fix round 2 (N2): before ANY thread is joined, halt
+    // the controller role — this node decides nothing more while its data
+    // plane goes down (workers are joined first, the runtime last), hands the
+    // consensus off at once if it leads, and tells the members it is going.
+    // Event: wait for the runtime's ring-published Halted ack (bounded — a
+    // runtime that is not running never acks).
+    if (!crashForTest_ && runtimeAgent_ && runtimeAgent_->controlledShutdown().active()) {
+        auto& cs = runtimeAgent_->controlledShutdown();
+        if (cs.halt()) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{1};
+            bool acked = false;
+            while (!(acked = cs.observe().phase == ControlledShutdown::Phase::Halted) &&
+                   std::chrono::steady_clock::now() < deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds{1});   // paces the ring poll only
+            if (!acked)
+                spdlog::warn("BrokerNode[{}]: stop: the runtime never acked the halt (not running?) — "
+                             "stopping anyway", config_.nodeId);
+        }
+    }
+
+    // 0. DR-15 fix round 1: the cold resolver thread only posts into rings it
+    //    owns — stop it first (nothing below consumes it any more).
+    if (resolverHub_) resolverHub_->stop();
+
+    // 1a. E2 inc2b: stop per-worker AgentRunner threads FIRST.
+    //     Workers hold non-owning replica pointers; they must be quiesced before
+    //     replicaRegistry_ is torn down.  Stop them before the cleaner and main
+    //     agent so no in-flight worker op races with a replica being freed.
+    if (workerPool_) {
+        workerPool_->stopAndJoinRunners();
+        spdlog::info("BrokerNode[{}]: worker AgentRunner threads stopped", config_.nodeId);
+    }
+    // Task 19: stop the view-snapshot IO thread AFTER the workers (so no worker
+    // pushes a delta after the IO thread is gone; its WorkerViewSet producers are
+    // now quiesced) and BEFORE the WorkerViewSets/channels are destroyed.
+    if (viewSnapshotIoRunner_) {
+        viewSnapshotIoRunner_->stopAndJoin();
+        spdlog::info("BrokerNode[{}]: ViewSnapshotIoAgent thread stopped", config_.nodeId);
+    }
+    // Shard agents reference workers + their drivers/clients; the runners that
+    // drove them are joined, so nothing pumps a shard driver any more.
+    shardAgents_.clear();
+    // Task 13: the workers' session-ack publications release through their
+    // shard clients — explicitly here (runners joined, clients alive), never
+    // implicitly after a client closed.
+    if (workerPool_)
+        for (int32_t i = 0; i < workerPool_->workerCount(); ++i) workerPool_->worker(i).releaseShardClient();
+    // Fused placement (spec §3.2): the runtime driver's pumper — worker 0, or
+    // the interim startup pump runner if start() failed before the hand-off —
+    // is joined.  Hand the runtime's invoker driver to THIS thread: it drains +
+    // closes it after the runtime client closes (step 5).
+    stopStartupPump_();
+    if (config_.fused() && nodeDriver_) nodeDriver_->bindPumpThread();
+    // From here to step 5 nothing pumps the fused runtime driver/client: no
+    // invoke() ever runs again (so no inter-service timeout can fire) and close
+    // drains the CnC ring.  Never add a resolve on aeron_ to this teardown.
+    // NOTE (fused): the "stop X BEFORE the main agent runner" orderings below
+    // describe thread placement; under fused placement the runtime already
+    // stopped with worker 0 in 1a.  Both orders are safe (AdminWorker is async;
+    // a cleaner swap is enqueued only after the segment is renamed on disk).
+
+    // 1b-admin. Task 6: stop AdminWorker thread BEFORE the main agent runner.
+    //     The AdminWorker calls appendDurable which uses the schema replica.
+    //     The main agent drives the replica's doWork, so the admin thread must
+    //     be quiesced before the main agent stops.
+    if (adminWorkerRunner_) {
+        adminWorkerRunner_->stopAndJoin();
+        spdlog::info("BrokerNode[{}]: AdminWorker thread stopped", config_.nodeId);
+    }
+    // Catalog history Task 6: no admin-thread test task waits forever.
+    if (adminWorkerAgent_) adminWorkerAgent_->skipQueuedAdminThreadTestTasks();
+    // Fix round 1 (M5): tell the still-running control thread nobody drains the
+    // admin role ring any more (one command on an otherwise idle ring).
+    if (adminWorkerRunner_ && !adminLifecycleRing_.offer(kAdminStoppedSignal))
+        spdlog::error("BrokerNode[{}]: admin-stopped signal not delivered (ring full) — catalog answers "
+                      "may be held until the control thread stops", config_.nodeId);
+    // NOTE (Task 8a): do NOT reset adminWorkerAgent_ here.  The gateway holds it
+    // as adminSink_ and the NodeRuntimeAgent's admin control hook captures it;
+    // both run on the MAIN agent runner, which is still live at this point.  We
+    // reset it only AFTER agentRunner_->stopAndJoin() below (the main duty cycle
+    // is quiesced then), preventing a use-after-free of adminSink_ / the hook.
+
+    // 1b. Stop the LogCleanerAgent BEFORE the main agent runner.
+    //     This ensures the cleaner thread stops enqueuing swaps before the
+    //     duty cycle stops draining them (avoids a lost-swap scenario where
+    //     a swap is enqueued after the last drain).
+    if (cleanerRunner_) {
+        cleanerRunner_->stopAndJoin();
+    }
+    if (cleanerAgent_) cleanerAgent_->skipQueuedCleanerThreadTestTasks();   // no test thread waits forever
+    cleanerAgent_.reset();
+    // hotpath-A F2: the provisioner too (workers are joined: no demand is
+    // posted any more; the logs it serves outlive it — the registry is torn
+    // down later, and ~Log frees the ready segments it left).
+    if (provisionerRunner_) {
+        provisionerRunner_->stopAndJoin();
+    }
+
+    // 1c. Stop the main agent runner (signal + join the duty-cycle thread).
+    if (agentRunner_) {
+        agentRunner_->stopAndJoin();
+    }
+    // P2: the control thread is joined — only now may the pool's control-thread
+    // state (ring-ownership mode) change.
+    if (workerPool_) workerPool_->disarmAfterControlJoined();
+    if (gateway_) gateway_->logProducePauseStats();   // D8c: control thread joined — single reader
+    // No-hang fix round 3: the per-worker no-hang counters (the worker runners
+    // were joined in 1a — every worker's counter is final and single-reader now).
+    if (workerPool_) {
+        uint64_t undecodable = 0;
+        for (int32_t w = 0; w < workerPool_->workerCount(); ++w)
+            undecodable += workerPool_->worker(w).undecodableProduceAnswers();
+        if (undecodable != 0)
+            spdlog::warn("BrokerNode[{}]: no-hang stats — worker-ingress Produce frames answered "
+                         "InvalidRequest={}", config_.nodeId, undecodable);
+    }
+    // F9a: the control thread is joined — skip any owner-thread test task still
+    // queued for it (its test thread waits for a decision with no bound).
+    if (runtimeAgent_) runtimeAgent_->skipQueuedOwnerThreadTestTasks();
+
+    // Task 8a: main duty cycle is now quiesced — safe to drop the admin agent.
+    // Clear the gateway's admin sink first (defensive; gateway is torn down below).
+    if (gateway_) gateway_->setAdminSink(nullptr);
+    adminWorkerAgent_.reset();
+
+    // 2. Release the runtime agent and gateway FIRST — in this order:
+    //      a. runtimeAgent_ (holds refs to nodeAgent_/agent_ + gateway_ + replication)
+    //      b. gateway_ (owns the client ingress Subscription + pending egress
+    //                   ExclusivePublications — must deregister before aeron_.reset())
+    //      c. replication objects (replBridge_ → replicaRegistry_ → replTransport_)
+    //         replTransport_ owns Aeron Subscription + ExclusivePublications
+    //    BR-3b teardown ordering: AgentRunner stop → release gateway/nodeAgent/ingress/sink
+    //    → close aeron → stop driver.
+    releaseBindAnchors_();    // A-I5: the anchors hold no state (released while every client is alive)
+    runtimeAgent_.reset();    // composite agent (holds refs to inner agent + gateway + replication)
+    workerPool_.reset();      // E1: holds non-owning replica ptrs; drop before replicaRegistry_ frees them
+    // TX-3: destroy txn coordination service before gateway (holds gateway* + txnState*).
+    txnCoordService_.reset(); // TransactionCoordinationService (no Aeron resources, holds gateway*)
+    // CG-6: destroy group coordination service before gateway (it holds a gateway* ref).
+    groupCoordService_.reset(); // GroupCoordinationService (no Aeron resources, holds gateway* + offsets*)
+    // D9: the transport outlives the gateway — drop its marker handlers (ctx = gateway).
+    if (replTransport_) {
+        replTransport_->setTxnMarkerHandlers(nullptr, nullptr, nullptr);
+        replTransport_->setPlaneReconnectHandler(nullptr, nullptr);
+    }
+    gateway_.reset();         // ClientGateway: deregisters Subscription + ExclusivePubs
+    // MD1 Task 4: destroy metadata service before replicaRegistry_.
+    metadataService_.reset(); // MetadataService (holds raw ptr to metadata replica in registry)
+    metadataReplica_.reset(); // no-op: ownership transferred to replicaRegistry_ in buildGateway
+    metadataLog_.reset();     // Log for __cluster_metadata (file flush on dtor)
+    // adminWorkerAgent_ is already reset above (in the runner stop block).
+    // schemaRegistry_ is NOT reset: it owns no replica pointers and no thread
+    // touches it once the admin worker is gone, so it stays readable after stop()
+    // (schemaRegistryForTest's contract) and is freed with the node.
+    // viewRegistry_ is kept for the same reason (viewRegistryForTest after stop()).
+    // Catalog history Task 6: the admin thread is joined and the agent gone —
+    // the replica (holds the plane + log pointers) goes; the Log stays readable
+    // after stop() (catalogLogForTest's contract: quiesced) and is freed with
+    // the node (file flush on dtor), like schemaRegistry_.
+    catalogReplica_.reset();
+    securityReplica_.reset();   // Authentication Task 9: the Log stays readable after stop() (securityLogForTest)
+    // TX-3: destroy txn state store before replicaRegistry_ (holds raw ptr to txn replica).
+    txnState_.reset();        // ReplicatedTxnStateStore (holds raw ptr to txn replica in registry)
+    txnReplica_.reset();      // no-op: ownership transferred to replicaRegistry_ in buildGateway
+    txnLog_.reset();          // Log for __transaction_state (file flush on dtor)
+    // CG-6: destroy offset store before replicaRegistry_ (offsetStore_ holds raw ptr
+    //       to the offsetReplica which replicaRegistry_ owns after CG-6 refactor).
+    offsetStore_.reset();     // ReplicatedOffsetStore (holds raw ptr to offset replica in registry)
+    offsetReplica_.reset();   // no-op: ownership transferred to replicaRegistry_ in buildGateway
+    offsetLog_.reset();       // Log for __consumer_offsets (file flush on dtor)
+    replBridge_.reset();      // ReplicationMetadataBridge (no Aeron resources)
+    replicaRegistry_.reset(); // PartitionReplicas + offsetReplica (destroyed before transport)
+    memoryLogs_.clear();      // InMemoryLogs outlive replicas — clear after replicaRegistry_ on stop() path
+    replTransport_.reset();   // AeronPartitionTransport: deregisters replication Subscription + ExclusivePubs
+    // Task 5 teardown fix: perWorkerReplTransports_ holds per-worker inbound Subscriptions +
+    // per-peer ExclusivePublications.  Must be cleared AFTER replicaRegistry_ (no replica
+    // must dereference a freed transport) and BEFORE aeron_.reset() / stopEmbeddedDriver()
+    // so the Subscription/Publication dtors deregister from the conductor while it is
+    // still alive.  Without this clear(), those dtors run in ~BrokerNode which fires
+    // after stop() has already torn down the Aeron client → use-after-close on restart.
+    perWorkerReplTransports_.clear(); // WorkerReplicationTransports: deregisters per-worker Subscription + ExclusivePubs
+    // DR-15 fix round 2 (MEDIUM-B): a legacy plane's add broker may still hold an
+    // undelivered publication (resolved by the control thread after the worker
+    // stopped) — release it while the node client is alive (before aeron_.reset()).
+    legacyPlaneBrokers_.clear();
+    // Catalog history Task 6: the __catalog plane (inbound sub + peer pubs on
+    // the node client) and its add broker, while the client is alive.
+    catalogPlane_.reset();
+    catalogAddBroker_.reset();
+    // Per-worker ingress/egress deregister from their client while it is alive
+    // (legacy: the node client; shard: the worker's own client).
+    workerIngresses_.clear();
+    workerEgresses_.clear();
+    // Shard teardown: clients before their drivers, each driver handed to THIS
+    // thread (its pumping worker is joined) before it closes.  Before the node
+    // driver, which owns the parent aeron dir.
+    teardownShardRuntimes_();
+    nullTransports_.clear();  // Per-replica no-op transports (no Aeron resources)
+    topicRegistry_.reset();   // TopicRegistry: Logs are files (flushed/synced by Log dtor)
+
+    // 3. Release consensus objects that own Aeron publications / subscription.
+    //    Must happen BEFORE closing the Aeron client and media driver so the
+    //    client shuts down cleanly (publications/subscriptions deregistered while
+    //    the conductor is still running).
+    peerLinkAgent_.reset();  // Authentication Task 15: its subscription + peer publications, while the client is alive
+    nodeAgent_.reset();      // composite agent (holds refs to aeronIngress_ + agent_)
+    udpSink_.reset();        // ExclusivePublications (deregisters from conductor)
+    aeronIngress_.reset();   // Subscription (deregisters from conductor)
+    agent_.reset();          // ConsensusAgent (refs election_ + ingressRing_)
+    election_.reset();
+    publisher_.reset();
+    ingressRing_.reset();
+    nodeStateFile_.reset();
+    termLog_.reset();
+
+    // 3b. Release the Aeron node-role/term counters BEFORE closing the client.
+    //     ~Counter deregisters from the conductor, so it must run while the
+    //     conductor thread is still alive — otherwise the Counter dtor locks a
+    //     destroyed conductor mutex (recursive_mutex lock failed) at process
+    //     teardown.  Reset these here (not in ~BrokerNode) to fix that ordering.
+    roleCounter_.reset();
+    termCounter_.reset();
+    stuckMarkersCounter_.reset();   // D9: release before aeron_ (the Counter dtor uses the conductor)
+    outOfSyncCounter_.reset();      // readiness gate (L5): same rule
+    catalogHaltedCounter_.reset();  // catalog history Task 7: same rule
+    unplaceableCounter_.reset();    // Task 11 fix round 1
+    blockedCounter_.reset();        // Task 11 fix round 5 (M5)
+    linkMtuCounter_.reset();        // B-I2: released before aeron_
+    for (auto& c : storageCounters_) c.reset();   // ISR v3 §3.10: the same rule (the Counter dtor uses the conductor)
+    if (mtuProbeFd_ >= 0) { ::close(mtuProbeFd_); mtuProbeFd_ = -1; }   // re-check I1
+    catalogAppliedCounter_.reset();
+    securityHaltedCounter_.reset();    // authentication Task 9: the same rule (released before aeron_)
+    securityAppliedCounter_.reset();
+    authModeCounter_.reset();
+    peerEstablishedCounter_.reset();   // Authentication Task 15
+    peerRefusalsCounter_.reset();
+    peerDropsCounter_.reset();
+    loginsOkCounter_.reset();
+    loginsFailedCounter_.reset();
+    loginsRateLimitedCounter_.reset();
+    sessionsRevokedCounter_.reset();
+    for (auto& c : provCounters_) c.reset();   // re-review N4: same rule (the provisioner is stopped)
+
+    // 4. Close the Aeron client (joins the C++ conductor thread).
+    //    After aeron_.reset() all "remove publication / subscription / close client"
+    //    commands have been written into the CnC ring by the conductor's onClose().
+    if (aeron_) {
+        aeron_.reset();
+    }
+
+    // 5. Stop the embedded media driver.
+    //    stopEmbeddedDriver() first joins the driver thread (so we are the ONLY
+    //    thread touching the driver afterwards), then drains any final CnC commands
+    //    that the conductor posted during step 3 before calling aeron_driver_close().
+    stopEmbeddedDriver();
+
+    spdlog::info("BrokerNode: node {} stopped", config_.nodeId);
+}
+
+// ---------------------------------------------------------------------------
+// BrokerNode::startEmbeddedDriver
+// ---------------------------------------------------------------------------
+void BrokerNode::startEmbeddedDriver() {
+    auto dcfg = EmbeddedDriverConfig::fromNode(config_, config_.effectiveAeronDir());
+    if (resolverHub_) dcfg.peerResolution = resolverHub_->subscribeDriver();   // DR-15 fix round 1
+    // Every embedded driver: in-process liveness (NodeConfig::shardClientLivenessTimeoutNs, default 1 h).
+    dcfg.clientLivenessTimeoutNs = config_.shardClientLivenessTimeoutNs;
+    nodeDriver_ = std::make_unique<EmbeddedDriver>(
+        std::move(dcfg), config_.fused() ? DriverMode::Invoker : DriverMode::Threaded);
+}
+
+// ---------------------------------------------------------------------------
+// BrokerNode::fanoutViewPlan_ / pumpViewFanout_ (Task 19) — control thread.
+//
+// The control thread is the SINGLE producer of every worker channel's install
+// ring (shared-nothing).  A committed compiled view plan is queued (nextWorker
+// cursor) and delivered to each worker; a worker whose install ring is momentarily
+// full stops the pass and is retried next cycle (held, never dropped — a dropped
+// install would leave a view that never folds on that worker).
+// ---------------------------------------------------------------------------
+void BrokerNode::fanoutViewPlan_(ViewPlanUpdateMsg msg) {
+    // Task 20 (spec §11.2): co-locate the view sink with its SOURCE's shard group
+    // so a GetViewRow routed by viewTopicId lands on the worker that actually
+    // folded the view partition (the source-partition owner).  Control-thread
+    // only — the ShardRouter group map is written here and read only by routing
+    // on this same thread.  Decode the compiled plan's first source once (cold,
+    // per view creation); an unresolvable plan leaves the view a singleton group
+    // (correct for a single-worker broker).
+    //
+    // Task 22 fix round 1 (C1): the same decode feeds the gateway's view -> source
+    // map (a GetViewRow is served only by the source-partition leader), and an
+    // uninstall forgets it.  Every plan install (boot replay included) arrives
+    // through here (kA2cViewPlanUpdate), so no install bypasses the map.
+    if (msg.uninstall) {
+        if (gateway_) gateway_->forgetViewSource(msg.viewTopicId);
+    } else if (auto plan = rune::view::deserializeCompiledViewPlan(msg.planBlob);
+               plan && !plan->sourceTopicId.empty()) {
+        if (gateway_) gateway_->noteViewSource(msg.viewTopicId, plan->sourceTopicId[0]);
+    }
+    viewFanoutBacklog_.push_back(ViewFanoutPending{std::move(msg), 0});
+    (void)pumpViewFanout_();
+}
+
+int BrokerNode::pumpViewFanout_() {
+    int work = 0;
+    std::size_t done = 0;
+    const int32_t n = static_cast<int32_t>(viewSnapshotChannels_.size());
+    for (auto& pend : viewFanoutBacklog_) {
+        while (pend.nextWorker < n) {
+            ViewSnapshotChannel* ch = viewSnapshotChannels_[pend.nextWorker].get();
+            if (ch && !encodeViewPlanUpdate(ch->install,
+                                            ViewSnapshotChannel::kInstallMsgType, pend.msg))
+                break;   // ring full → retry next cycle (FIFO: later plans wait)
+            ++pend.nextWorker;
+            ++work;
+        }
+        if (pend.nextWorker < n) break;   // FIFO back-pressure
+        // Task 12 (N5): the plan is on every worker's install ring — a worker
+        // drains it before answering a GetViewRow it has no plan for.
+        if (gateway_ && !pend.msg.uninstall) gateway_->noteViewPlanDelivered(pend.msg.viewTopicId);
+        ++done;
+    }
+    if (done)
+        viewFanoutBacklog_.erase(viewFanoutBacklog_.begin(),
+                                 viewFanoutBacklog_.begin() + static_cast<std::ptrdiff_t>(done));
+    return work;
+}
+
+// BrokerNode::serviceAdminControl_ — the schema DDL control plane, one runtime
+// duty cycle (Task 8a RULING-2 B).  Runs on the CONTROL (runtime) thread via
+// AdminControlPlane::doWork — a direct call, never std::function / virtual.
+// ---------------------------------------------------------------------------
+int BrokerNode::serviceAdminControl_(int64_t nowNs) {
+    int work = 0;
+
+    // Task 9 (RUNE_TLS SIGHUP reload): polled FIRST, unconditionally — must
+    // work even on a deployment with no admin worker configured (the early
+    // `if (!agent) return 0;` below would otherwise skip it entirely).
+    // requestTlsCertReload() (any thread, e.g. main() on SIGHUP) only offered
+    // a trigger; the actual file re-read + swap happen HERE, on the control
+    // thread, so gateway_'s tlsCertPem_/tlsKeyPem_ are only ever mutated on
+    // their own single-writer thread (shared-nothing).
+    // Task 6 fix round 1 (M5): the admin runner was joined (stop()).
+    work += adminLifecycleRing_.poll([this](std::int32_t type, std::int64_t, std::int64_t) {
+        if (type == kAdminStoppedSignal) adminDrainStopped_ = true;
+    });
+    work += tlsReloadRing_.poll([this](std::int32_t type, std::int64_t, std::int64_t) {
+        if (type != kTlsReloadTrigger) return;
+        if (!gateway_ || config_.tlsCertFile.empty() || config_.tlsKeyFile.empty()) {
+            spdlog::warn("BrokerNode[{}]: TLS reload requested but no cert/key file is "
+                         "configured — ignored", config_.nodeId);
+            return;
+        }
+        std::string certPem, keyPem;
+        const bool certOk = loadPemFile(config_.tlsCertFile, certPem);
+        const bool keyOk  = loadPemFile(config_.tlsKeyFile, keyPem);
+        if (!certOk || !keyOk) {
+            spdlog::error("BrokerNode[{}]: TLS reload FAILED reading {} / {} — keeping the "
+                          "previous cert/key (in-flight and future handshakes unaffected)",
+                          config_.nodeId, config_.tlsCertFile, config_.tlsKeyFile);
+            return;
+        }
+        gateway_->reloadTlsCert(std::move(certPem), std::move(keyPem));
+        spdlog::info("BrokerNode[{}]: TLS cert/key reloaded from {} / {}",
+                     config_.nodeId, config_.tlsCertFile, config_.tlsKeyFile);
+    });
+
+    work += serviceAuthMode_(nowNs);   // Authentication Task 9: the dev-mode warning timer + the auth-mode counter
+    work += servicePeerLinks_(nowNs);  // Authentication Task 15: the peer link handshakes + key distribution
+
+    auto* agent = adminWorkerAgent_.get();
+    if (!agent) return work;
+
+    // (1) The consensus leadership as the control thread sees it (F9a — never the observer ring, whose one
+    //     consumer is the start() thread).  The retired __topic_schemas / __views role event that used to be
+    //     posted here on every change is gone with those logs (catalog history Task 16/17).
+    const LeaderSnapshot v = leaderObserver_.computeOnControl();
+    const bool leaderNow = v.isLeader;
+    const int32_t epochNow = static_cast<int32_t>(v.term);
+    // (1a) Catalog history Task 6: single node (no controller path) — the
+    //      __catalog role follows the consensus leader (ISR = every broker,
+    //      not controller-managed).  Tracked on
+    //      its own so a full ring retries only this role.  Multi-node, the
+    //      bridge relays the controller's committed (-6, 0) assignment instead.
+    if (!catalogOnController_ && catalogReplica_ &&
+        (leaderNow != catalogLastRole_.leader || epochNow != catalogLastRole_.epoch)) {
+        AdminRoleMsg cm;
+        cm.leader   = leaderNow;
+        cm.epoch    = epochNow;
+        cm.leaderId = static_cast<int32_t>(v.leaderId);
+        if (leaderNow) {
+            for (const auto& peer : config_.peers)
+                if (cm.isrCount < AdminRoleMsg::kMaxIsr) cm.isr[static_cast<std::size_t>(cm.isrCount++)] = peer.id;
+        }
+        if (encodeAdminRole(agent->roleRing(), cm, kMsgCatalogRole)) {
+            catalogLastRole_ = PostedRole{leaderNow, epochNow};
+            ++work;
+        }
+    }
+    // (1a') Authentication Task 9: the same for `__security` - single node, its role follows the consensus leader on
+    //       its own tracker (a full ring retries only this role); multi-node the bridge relays the committed (-7, 0).
+    if (!catalogOnController_ && securityReplica_ &&
+        (leaderNow != securityLastRole_.leader || epochNow != securityLastRole_.epoch)) {
+        AdminRoleMsg sm;
+        sm.leader   = leaderNow;
+        sm.epoch    = epochNow;
+        sm.leaderId = static_cast<int32_t>(v.leaderId);
+        if (leaderNow) {
+            for (const auto& peer : config_.peers)
+                if (sm.isrCount < AdminRoleMsg::kMaxIsr) sm.isr[static_cast<std::size_t>(sm.isrCount++)] = peer.id;
+        }
+        if (encodeAdminRole(agent->roleRing(), sm, kMsgSecurityRole)) {
+            securityLastRole_ = PostedRole{leaderNow, epochNow};
+            ++work;
+        }
+    }
+    // (1c) Catalog history Task 11: the DDL route the gateway answers by, and a
+    //      halted broker giving up the controllership.
+    work += resignIfHalted_(leaderNow);
+    work += publishCatalogRoute_(leaderNow);
+    work += publishSecurityRoute_(leaderNow);
+    work += publishPlacementView_();
+    work += reportUnbuildableReplicas_();
+    work += checkLinkMtu_(nowNs, /*force=*/false);   // re-check I1: the runtime's clock, no per-pass clock read
+    work += publishStorageMetrics_();                // ISR v3 §3.10
+    if (consensusUnmarked_ && nowNs - lastConsensusMarkCheckNs_ >= 1'000'000'000LL) {   // ISR v3 Step 6 (cold: until marked)
+        lastConsensusMarkCheckNs_ = nowNs;
+        markConsensusWhenPresent_();
+    }
+
+    // (1b) admin → control ring (F3 round 6/7, ported into T11's direct-call
+    //      control plane):
+    //   kA2cStorageFailure (Task 10 fix 3 / I1): schema-log storage failure →
+    //     the same halt path as every other log.
+    //   kA2cSchemaUpdate (F3 round 6, item 3): queue for the control-thread
+    //     fan-out to the worker rings.
+    //   F3 round 7, item 3: explicit per-type dispatch; an unknown/short frame
+    //   is logged (rate-limited) and skipped, never decoded as a failure.
+    work += agent->failureRing().drain(
+        [this](int32_t tid, aeron::concurrent::AtomicBuffer& b,
+               aeron::util::index_t off, aeron::util::index_t len) {
+            const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
+            const auto  n = static_cast<std::size_t>(len);
+            // Task 19: a compiled view plan fans out to every worker's install
+            // ring (handled here, before the 2-callback dispatcher — the control
+            // thread is the single producer of each worker channel's install ring).
+            if (tid == kA2cViewPlanUpdate) {
+                fanoutViewPlan_(decodeViewPlanUpdate(p, n));
+                return;
+            }
+            // Catalog history Task 7: the CatalogApplier's metrics.  A halt is
+            // loud here too (the admin thread logged it critical as it halted).
+            if (tid == kA2cCatalogApplied) {
+                int64_t offset = -1;
+                uint64_t digest = 0;
+                if (decodeCatalogApplied(p, n, offset, digest)) {
+                    catalogAppliedValue_ = offset;
+                    publishCatalogMetrics_();
+                } else if (adminToControlRejects_++ % 1024 == 0) [[unlikely]] {
+                    spdlog::error("BrokerNode[{}]: malformed kA2cCatalogApplied (len={}) skipped", config_.nodeId, n);
+                }
+                return;
+            }
+            if (tid == kA2cCatalogHalted) {
+                CatalogHaltedMsg m;
+                if (decodeCatalogHalted(p, n, m)) {
+                    catalogHaltedValue_ = m.offset + 1;
+                    publishCatalogMetrics_();
+                    spdlog::critical("BrokerNode[{}]: __catalog apply HALTED at offset {} (expected={:#x} actual={:#x}) "
+                                     "— {}; serving what was applied, accepting no catalog change "
+                                     "(docs/CATALOG.md#halted)", config_.nodeId, m.offset, m.expected, m.actual,
+                                     m.detail);
+                } else if (adminToControlRejects_++ % 1024 == 0) [[unlikely]] {
+                    spdlog::error("BrokerNode[{}]: malformed kA2cCatalogHalted (len={}) skipped", config_.nodeId, n);
+                }
+                return;
+            }
+            // Catalog history Task 6: the __catalog replica's AlterIsr → the
+            // controller channel (this thread owns replTransport_).
+            if (tid == kA2cCatalogAlterIsr) {
+                forwardCatalogAlterIsr_(p, n);
+                return;
+            }
+            // Authentication Task 9 (D29/D39): the `__security` replica's AlterIsr, every applied event's bytes for the
+            // SecurityView (this thread's own mirror) and the applier's halt.
+            if (tid == kA2cSecurityAlterIsr) { forwardSecurityAlterIsr_(p, n); return; }
+            if (tid == kA2cSecurityApplied)  { onSecurityApplied_(p, n); return; }
+            if (tid == kA2cSecurityHalted)   { onSecurityHalted_(p, n); return; }
+            if (tid == kA2cPeerFrameDrops) {   // Authentication Task 16: the admin plane's dropped inter-broker frames
+                if (n == 8) std::memcpy(&adminPeerDrops_, p, 8);
+                else if (adminToControlRejects_++ % 1024 == 0)
+                    spdlog::error("BrokerNode[{}]: malformed kA2cPeerFrameDrops (len={}) skipped", config_.nodeId, n);
+                return;
+            }
+            // Catalog history Task 8: the CatalogApplier's effects — this (control)
+            // thread owns TopicRegistry, the replicas, the placement and the
+            // cleaner's policy ring.  Every handler is idempotent (see BrokerNode.h).
+            if (tid == kA2cCatalogTopicApplied) { onCatalogTopicApplied_(p, n); return; }
+            if (tid == kA2cCatalogSinkApplied) {   // Task 12 (N5): a view sink — gated until its plan is on every worker
+                if (gateway_ && n >= 4) {
+                    int32_t viewTopicId;
+                    std::memcpy(&viewTopicId, p, 4);
+                    gateway_->noteViewSinkAwaitingPlan(viewTopicId);
+                }
+                onCatalogTopicApplied_(p, n, /*isView*/true);
+                return;
+            }
+            if (tid == kA2cCatalogTopicDropped) {
+                CatalogTopicDroppedMsg m;
+                if (decodeCatalogTopicDropped(p, n, m)) {
+                    if (gateway_) gateway_->onCatalogObjectDropped(m.topicId);   // authentication Task 12: tables lose the id's bits
+                    dropRuntimeTopic_(m.topicId, m.name);
+                }
+                else if (adminToControlRejects_++ % 1024 == 0) [[unlikely]]
+                    spdlog::error("BrokerNode[{}]: malformed kA2cCatalogTopicDropped (len={}) skipped",
+                                  config_.nodeId, n);
+                return;
+            }
+            if (tid == kA2cCatalogTopicConfig) { onCatalogTopicConfig_(p, n); return; }
+            if (tid == kA2cViewUninstall) {
+                const int32_t viewTopicId = decodeViewUninstall(p, n);
+                if (viewTopicId >= 0) onViewUninstall_(viewTopicId);
+                else if (adminToControlRejects_++ % 1024 == 0) [[unlikely]]
+                    spdlog::error("BrokerNode[{}]: malformed kA2cViewUninstall (len={}) skipped", config_.nodeId, n);
+                return;
+            }
+            const A2cDispatch d = dispatchAdminToControl(tid, p, n,
+                [this](int32_t e, std::string_view dir) {
+                    onStorageFailure_(std::string(dir), e);
+                },
+                [this](SchemaUpdateMsg m) {
+                    schemaFanout_.post(m.topicId, m.version, std::move(m.blob));
+                });
+            if ((d == A2cDispatch::Unknown || d == A2cDispatch::Malformed) &&
+                adminToControlRejects_++ % 1024 == 0) [[unlikely]] {
+                spdlog::error("BrokerNode[{}]: admin→control frame skipped ({} type={} "
+                              "len={}; rejects={})", config_.nodeId,
+                              d == A2cDispatch::Unknown ? "unknown" : "malformed",
+                              tid, n, adminToControlRejects_);
+            }
+        }, 16);
+    if (catalogMetricsPending_()) [[unlikely]] publishCatalogMetrics_();   // a counter resolved late
+    if (securityMetricsPending_()) [[unlikely]] publishSecurityMetrics_();
+    // Control (runtime) thread = the single producer of every worker ring.
+    if (workerPool_) work += schemaFanout_.pump(*workerPool_);
+    if (workerPool_) work += topicDroppedFanout_.pump(*workerPool_);   // R-M1
+    // Task 19: retry any view-plan install frames a worker ring could not take.
+    if (!viewFanoutBacklog_.empty()) work += pumpViewFanout_();
+    // Catalog history Task 8: the drop sequence's later steps + ring-full retries.
+    if (!droppedAwaitingRetire_.empty()) [[unlikely]] work += serviceDroppedTopics_();
+    if (!purgeOutbox_.empty() || !cleanerPolicyOutbox_.empty()) [[unlikely]] work += pumpCatalogOutboxes_();
+
+    // (3) Drain response frames (admin → control) → session egress.
+    //     C1 / M7: through the DDL answer gate — a DefineTopic / CreateView OK
+    //     leaves only once its topic serves (committed above, in (1b), and its
+    //     assignment routed); FIFO behind it.  The ring is drained only while the
+    //     gate holds nothing, so one drain always fits the gate.
+    auto send = [this](int64_t session, const uint8_t* f, std::size_t n) {
+        if (gateway_) (void)gateway_->sendControlFrame(session, f, n);
+    };
+    auto serves = [this](int32_t topicId) { return ddlTopicServes_(topicId); };
+    if (!ddlAnswerGate_.empty()) {
+        const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        std::string why;   // cold: an overdue answer only
+        work += ddlAnswerGate_.release(nowNs, serves, send,
+            [this](int64_t session, int32_t topicId) {
+                ++ddlAnswersOverdue_;
+                {   // R3-M1: stamp the evidence (cold: an overdue answer only), the runtime's clock
+                    const int64_t t = clock_.nowNs();
+                    if (ddlOverdueFirstNs_ == 0) ddlOverdueFirstNs_ = t;
+                    ddlOverdueLastNs_ = t;
+                }
+                spdlog::error("BrokerNode[{}]: DDL OK for topic id={} (session {}) held {} ms and the topic still "
+                              "does not serve — answered Internal (in doubt), not OK (in-doubt answers: {})",
+                              config_.nodeId, topicId, session, kDdlAnswerMaxHoldNs / 1'000'000, ddlAnswersOverdue_);
+            },
+            [this, &why](int64_t session, int32_t topicId) {
+                // Task 11 fix round 1 (I2): the held answer is explicit — the
+                // event committed; the topic is not placed / serving yet.
+                why = "the DDL committed but topic id=" + std::to_string(topicId) + " does not serve after " +
+                      std::to_string(kDdlAnswerMaxHoldNs / 1'000'000) + " ms";
+                const std::string reason = metadataService_ ? metadataService_->unplaceableReason(topicId) : "";
+                why += reason.empty() ? " (placement pending)"
+                                      : " — UNPLACEABLE: " + reason + "; placed when the placeable brokers change";
+                const bool v8 = gateway_ && rune::protocol::client::clientUnderstandsCatalogDdl(
+                                                gateway_->sessionClientVersion(session));
+                return DdlAnswerGate::Explanation{why, v8};
+            });
+    }
+    // (4) Catalog history Task 12: catalog-read frames (SubscribeResponse /
+    //     Records / the caught-up marker / an ended subscription's answer) →
+    //     the session's egress (sendControlFrame: queued under back-pressure; a
+    //     session its spill cannot hold is expired explicitly, which ends its
+    //     catalog subscriptions).  Never behind the DDL answer gate.
+    //     Fix round 0: a Records frame is OFFERED, never spilled — a back-pressured
+    //     session pauses that subscription (CatalogReadFlow); the ring is always
+    //     drained, so a slow reader never holds back another one.
+    struct CatalogReadSink {
+        BrokerNode&       node;
+        AdminWorkerAgent& agent;
+        using Offer = CatalogReadFlow::Offer;
+        using Room  = CatalogReadFlow::Room;
+        Offer tryOffer(int64_t session, const uint8_t* f, std::size_t n) {
+            if (!node.gateway_) return Offer::NoSession;
+            switch (node.gateway_->tryOfferCatalogFrame(session, f, n)) {
+            case rune::gateway::ClientGateway::CatalogOffer::Sent:          return Offer::Sent;
+            case rune::gateway::ClientGateway::CatalogOffer::BackPressured: return Offer::BackPressured;
+            case rune::gateway::ClientGateway::CatalogOffer::NoSession:     break;
+            }
+            return Offer::NoSession;
+        }
+        void sendReliable(int64_t session, const uint8_t* f, std::size_t n) {
+            if (node.gateway_) (void)node.gateway_->sendControlFrame(session, f, n);
+        }
+        Room room(int64_t session) {
+            if (!node.gateway_) return Room::Gone;
+            switch (node.gateway_->catalogEgressRoom(session)) {
+            case rune::gateway::ClientGateway::CatalogRoom::Ready:  return Room::Ready;
+            case rune::gateway::ClientGateway::CatalogRoom::NotYet: return Room::NotYet;
+            case rune::gateway::ClientGateway::CatalogRoom::Gone:   break;
+            }
+            return Room::Gone;
+        }
+        bool postPaused(int64_t session, int64_t subId, int64_t base, bool marker) {
+            return encodeCatalogReadPaused(agent.controlToAdminRing(), CatalogReadPausedMsg{session, subId, base, marker});
+        }
+        bool postSessionGone(int64_t session) {
+            return encodeCatalogSessionGone(agent.controlToAdminRing(), session);
+        }
+        bool postResume(int64_t session, int64_t subId) {
+            return encodeCatalogReadResume(agent.controlToAdminRing(), CatalogReadResumeMsg{session, subId});
+        }
+    } catalogSink{*this, *agent};
+    work += agent->catalogReadRing().drain(
+        [this, &catalogSink](int32_t /*tid*/, aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off,
+                             aeron::util::index_t len) {
+            catalogReadFlow_.onFrame(reinterpret_cast<const uint8_t*>(b.buffer() + off), static_cast<std::size_t>(len),
+                                     catalogSink);
+        }, 64);
+    if (!catalogReadFlow_.idle()) [[unlikely]] work += catalogReadFlow_.service(catalogSink);
+    if (ddlAnswerGate_.empty()) {
+        work += agent->egressRing().drain(
+            [this, &send, &serves](int32_t tid,
+                                   aeron::concurrent::AtomicBuffer& b,
+                                   aeron::util::index_t off,
+                                   aeron::util::index_t len) {
+                const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
+                const auto n = static_cast<std::size_t>(len);
+                if (n < 8) return;
+                int64_t session;
+                std::memcpy(&session, p, 8);
+                if (tid == kMsgEgressFrameGated) [[unlikely]] {
+                    // Authentication Task 10 (D24): [session][event offset][DdlResponse] - held until this broker's view
+                    // applied the event (pumpSecurityGate_); a full gate answers Internal at once, never drops.
+                    if (n < 16 + rune::protocol::client::MessageHeader::ENCODED_SIZE) return;
+                    const int64_t eventOffset = admin_wire::getI64(p + 8);
+                    securityGate_.hold(session, eventOffset, std::span<const uint8_t>(p + 16, n - 16), send);
+                    return;
+                }
+                const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                switch (ddlAnswerGate_.offer(session, p + 8, n - 8, nowNs, serves)) {
+                    case DdlAnswerGate::Offer::Pass: send(session, p + 8, n - 8); break;
+                    case DdlAnswerGate::Offer::Held: break;
+                    case DdlAnswerGate::Offer::Full:   // impossible by sizing: never dropped silently
+                        spdlog::critical("BrokerNode[{}]: DDL answer gate full — sending the answer ungated",
+                                         config_.nodeId);
+                        send(session, p + 8, n - 8);
+                        break;
+                }
+            }, 16);
+    }
+
+    if (!securityGate_.empty()) [[unlikely]] work += pumpSecurityGate_();
+    return work;
+}
+
+// Authentication Task 10 (D24): release the security DDL OKs this broker now enforces.  The enforced offset is the
+// view's applied offset until Task 13/14 delay it to the last permission refresh that reached every worker; a halted
+// mirror answers every held OK Internal (the OK would claim an enforcement this broker can no longer give).
+int BrokerNode::pumpSecurityGate_() {
+    auto send = [this](int64_t session, const uint8_t* f, std::size_t n) {
+        if (gateway_) (void)gateway_->sendControlFrame(session, f, n);
+    };
+    if (!securityView_) return 0;
+    if (securityView_->halted())
+        return securityGate_.failAll("security log halted on this broker; the change may have been applied elsewhere - retry "
+                                     "with the same requestId on another broker", send);
+    // Task 14: the gateway reports what it enforces (tables refreshed, bitmaps accepted by every worker); the boot / no-gateway
+    // baseline is securityRefreshedOffset_.
+    const int64_t enforced = gateway_ ? std::max(securityRefreshedOffset_, gateway_->securityEnforcedOffset()) : securityRefreshedOffset_;
+    return securityGate_.release(std::min(securityView_->appliedOffset(), enforced), send);
+}
+
+int AdminControlPlane::doWork(int64_t nowNs) {
+    // Task 23 fix round 3 (R2-I1): the control pass's scheduling-gap signal (cold path: one subtract + compare).
+    if (lastPassNs_ != 0 && nowNs - lastPassNs_ > maxPassGapNs_) maxPassGapNs_ = nowNs - lastPassNs_;
+    lastPassNs_ = nowNs;
+    // DR re-check I1: the duty cycle's clock is the control pass's clock (no per-pass steady_clock read).
+    return node_.serviceAdminControl_(nowNs);
+}
+
+// ---------------------------------------------------------------------------
+// Catalog history Task 11: the DDL route (CatalogRoute.h), control thread.
+//   halted (latched from kA2cCatalogHalted)      → RouteHalted{offset}
+//   multi-node: the committed (-6, 0) leader is self → RouteLocalLeader
+//               another broker                   → RouteRemote{its client channel}
+//               none                             → RouteUnknown
+//   single node: the consensus leader is self    → RouteLocalLeader, else RouteUnknown
+// Published only when its key changes.
+// ---------------------------------------------------------------------------
+int BrokerNode::publishCatalogRoute_(bool consensusLeader) {
+    if (!gateway_) return 0;
+    using rune::gateway::RouteKind;
+    RouteKind kind = RouteKind::Unknown;
+    int64_t   key  = 0;
+    if (catalogHaltedValue_ != 0) {
+        kind = RouteKind::Halted;
+        key  = catalogHaltedValue_ - 1;
+    } else if (catalogOnController_) {
+        const rune::metadata::PartitionAssignment* pa =
+            metadataService_ ? metadataService_->assignment(kCatalogTopicId, kCatalogPartition) : nullptr;
+        const int32_t leader = pa != nullptr ? pa->leaderNode : rune::metadata::NO_LEADER;
+        if (leader == config_.nodeId) {
+            kind = RouteKind::LocalLeader;
+        } else if (leader >= 0) {
+            kind = RouteKind::Remote;
+            key  = leader;
+        }
+    } else if (consensusLeader) {
+        kind = RouteKind::LocalLeader;
+    }
+    if (catalogRoutePublished_.kind && kind == *catalogRoutePublished_.kind && key == catalogRoutePublished_.key)
+        [[likely]] return 0;
+
+    rune::gateway::CatalogRoute route{rune::gateway::RouteUnknown{}};
+    switch (kind) {
+    case RouteKind::LocalLeader: route = rune::gateway::RouteLocalLeader{}; break;
+    case RouteKind::Remote: {
+        std::string endpoint;
+        for (const auto& peer : config_.peers)
+            if (peer.id == static_cast<int32_t>(key)) endpoint = peer.clientChannel();
+        route = rune::gateway::RouteRemote{std::move(endpoint)};
+        break;
+    }
+    case RouteKind::Halted:  route = rune::gateway::RouteHalted{key}; break;
+    case RouteKind::Unknown: break;
+    }
+    spdlog::info("BrokerNode[{}]: catalog DDL route -> {}{}", config_.nodeId, rune::gateway::catalogRouteName(route),
+                 kind == RouteKind::Remote   ? " (leader " + std::to_string(key) + ")"
+                 : kind == RouteKind::Halted ? " (applier halted at offset " + std::to_string(key) + ")"
+                                             : std::string{});
+    gateway_->setCatalogRoute(std::move(route));
+    catalogRoutePublished_ = PublishedCatalogRoute{kind, key};
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
+// Authentication Task 10 (D36): the `__security` DDL route, control thread - publishCatalogRoute_'s twin over the
+// committed (-7, 0) assignment (single node: the consensus leader) and the view's halt.
+// ---------------------------------------------------------------------------
+int BrokerNode::publishSecurityRoute_(bool consensusLeader) {
+    if (!gateway_) return 0;
+    using rune::gateway::RouteKind;
+    RouteKind kind = RouteKind::Unknown;
+    int64_t   key  = 0;
+    if (securityHaltedValue_ != 0) {
+        kind = RouteKind::Halted;
+        key  = securityHaltedValue_ - 1;
+    } else if (catalogOnController_) {
+        const rune::metadata::PartitionAssignment* pa =
+            metadataService_ ? metadataService_->assignment(kSecurityTopicId, kSecurityPartition) : nullptr;
+        const int32_t leader = pa != nullptr ? pa->leaderNode : rune::metadata::NO_LEADER;
+        if (leader == config_.nodeId) {
+            kind = RouteKind::LocalLeader;
+        } else if (leader >= 0) {
+            kind = RouteKind::Remote;
+            key  = leader;
+        }
+    } else if (consensusLeader) {
+        kind = RouteKind::LocalLeader;
+    }
+    if (securityRoutePublished_.kind && kind == *securityRoutePublished_.kind && key == securityRoutePublished_.key)
+        [[likely]] return 0;
+
+    rune::gateway::SecurityRoute route{rune::gateway::RouteUnknown{}};
+    switch (kind) {
+    case RouteKind::LocalLeader: route = rune::gateway::RouteLocalLeader{}; break;
+    case RouteKind::Remote: {
+        std::string endpoint;
+        for (const auto& peer : config_.peers)
+            if (peer.id == static_cast<int32_t>(key)) endpoint = peer.clientChannel();
+        route = rune::gateway::RouteRemote{std::move(endpoint)};
+        break;
+    }
+    case RouteKind::Halted:  route = rune::gateway::RouteHalted{key}; break;
+    case RouteKind::Unknown: break;
+    }
+    spdlog::info("BrokerNode[{}]: security DDL route -> {}{}", config_.nodeId, rune::gateway::catalogRouteName(route),
+                 kind == RouteKind::Remote   ? " (leader " + std::to_string(key) + ")"
+                 : kind == RouteKind::Halted ? " (applier halted at offset " + std::to_string(key) + ")"
+                                             : std::string{});
+    gateway_->setSecurityRoute(std::move(route));
+    securityRoutePublished_ = PublishedCatalogRoute{kind, key};
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
+// Review B-I2: link-MTU watchdog (CONTROL thread).  A link MTU below the Aeron MTU + IP/UDP header is a silent
+// condition otherwise: outbound GSO batches fall back to IP fragmentation (rune_gso_bindings), and INBOUND
+// datagrams above the link MTU from peers / clients are dropped by the kernel with no signal (produces time out,
+// followers leave the ISR).  Edge-triggered: one ERROR when it goes below, one WARN when it is restored.
+// ---------------------------------------------------------------------------
+int BrokerNode::checkLinkMtu_(int64_t nowNs, bool force) {
+    if (mtuProbeRing_ == nullptr && !mtuProbeForTest_) return 0;   // every endpoint loopback: off
+    if (!force && nowNs < nextMtuProbeNs_) [[likely]] return 0;
+    nextMtuProbeNs_ = nowNs + kMtuProbePeriodNs;
+    if (mtuProbeRing_ != nullptr) {   // the latest target the hub resolved (no DNS / allocation here)
+        (void)mtuProbeRing_->poll([this](std::int32_t type, std::int64_t a, std::int64_t b) {
+            MtuProbeTarget t;
+            std::memcpy(t.ifname, &a, 8);
+            std::memcpy(t.ifname + 8, &b, 8);
+            t.ifname[sizeof t.ifname - 1] = '\0';
+            t.valid = type == PeerResolverHub::kMtuProbeTargetV4 || type == PeerResolverHub::kMtuProbeTargetV6;
+            t.ipv6  = type == PeerResolverHub::kMtuProbeTargetV6;
+            mtuProbe_ = t;
+        }, 8);
+    }
+    if (!mtuProbe_.valid && !mtuProbeForTest_) return 0;   // no route to the probe host (yet)
+    const bool v6 = mtuProbe_.ipv6;
+    const int32_t m = mtuProbeForTest_ ? mtuProbeForTest_() : readInterfaceMtu(mtuProbe_, mtuProbeFd_);
+    if (m <= 0) return 0;   // unknown: no edge
+    lastLinkMtu_ = m;
+    const MtuCheck chk = checkLinkMtu(m, config_.aeronMtuBytes, v6);
+    if (chk.below && !mtuBelow_) {
+        mtuBelow_ = true;
+        ++mtuBelowEdges_;
+        const int32_t hdr = v6 ? kIpv6UdpHeaderBytes : kIpv4UdpHeaderBytes;
+        spdlog::error("BrokerNode[{}]: link MTU {} on the path to {} is below the Aeron MTU {} + {}: outbound GSO "
+                      "batches fall back to IP fragmentation, and INBOUND datagrams above {} from peers/clients "
+                      "are DROPPED by the kernel (produces time out, followers leave the ISR) — set "
+                      "RUNE_AERON_MTU={} on every node, or restore the link MTU",
+                      config_.nodeId, m, mtuProbeDesc_.empty() ? std::string_view("<test probe>") : std::string_view(mtuProbeDesc_),
+                      config_.aeronMtuBytes, hdr, m, m - hdr);
+    } else if (!chk.below && mtuBelow_) {
+        mtuBelow_ = false;
+        ++mtuRestoredEdges_;
+        spdlog::warn("BrokerNode[{}]: link MTU restored to {} (>= Aeron MTU {} + header) — transports whose UDP GSO "
+                     "fell back to plain sends recover per destination (rune-gso re-probes)",
+                     config_.nodeId, m, config_.aeronMtuBytes);
+    }
+    linkMtuDeficit_ = chk.below ? chk.needed - m : 0;
+    if (!linkMtuCounter_ && linkMtuCounterRegId_ >= 0 && aeron_) {
+        try { linkMtuCounter_ = aeron_->findCounter(linkMtuCounterRegId_); } catch (...) { linkMtuCounter_.reset(); }
+    }
+    if (linkMtuCounter_) linkMtuCounter_->set(linkMtuDeficit_);
+    return 1;
+}
+
+// Review A-I5: see BrokerNode.h (bindAnchorSubs_).  A fixed port that cannot be bound is a refusal naming the
+// port's channel and the sysctl that reserves it (Aeron's own error says only "Address already in use").
+// Re-check M2: an anchor publication never carries data — the minimum term (64 KiB) keeps its 3-term log buffer
+// out of the /dev/shm budget (exclusive publications on one send endpoint may differ in term length).
+const char* const BrokerNode::kAnchorPubTerm = "|term-length=65536";
+
+void BrokerNode::anchorFixedEndpoints_(const std::shared_ptr<aeron::Aeron>& client,
+                                       const std::vector<std::string>& subs, const std::vector<std::string>& pubs,
+                                       rune::aeronutil::AeronPump& pump, const char* where) {
+    auto refuse = [&](const std::string& ch, const std::string& why) {
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: fixed endpoint " + ch +
+                                 " (" + where + ") could not be bound: " + why + " — refusing to start (a port "
+                                 "inside the kernel's ephemeral range can be taken first: see the startup WARN; "
+                                 "reserve it with sysctl net.ipv4.ip_local_reserved_ports)");
+    };
+    for (const auto& ch : subs) {
+        bool failed = false;
+        std::string err;
+        std::shared_ptr<aeron::Subscription> s;
+        try {
+            const int64_t reg = client->addSubscription(ch, kBindAnchorStreamId);
+            s = pump.resolve([&]() -> std::shared_ptr<aeron::Subscription> {
+                try { return client->findSubscription(reg); }
+                catch (const std::exception& e) { err = e.what(); failed = true; return nullptr; }
+            }, rune::aeronutil::AeronPump::kUntilAnswered, &failed);
+        } catch (const std::exception& e) { err = e.what(); }
+        if (!s) refuse(ch, err.empty() ? std::string("not resolved") : err);
+        bindAnchorSubs_.push_back(std::move(s));
+        bindAnchorChannels_.push_back(ch);
+    }
+    for (const auto& ch : pubs) {
+        bool failed = false;
+        std::string err;
+        std::shared_ptr<aeron::ExclusivePublication> p;
+        try {
+            const int64_t reg = client->addExclusivePublication(ch, kBindAnchorStreamId);
+            p = pump.resolve([&]() -> std::shared_ptr<aeron::ExclusivePublication> {
+                try { return client->findExclusivePublication(reg); }
+                catch (const std::exception& e) { err = e.what(); failed = true; return nullptr; }
+            }, rune::aeronutil::AeronPump::kUntilAnswered, &failed);
+        } catch (const std::exception& e) { err = e.what(); }
+        if (!p) refuse(ch, err.empty() ? std::string("not resolved") : err);
+        bindAnchorPubs_.push_back(std::move(p));
+        bindAnchorChannels_.push_back(ch);
+    }
+}
+
+void BrokerNode::holdTransientLineageForTest(bool hold) {
+    (void)onControlThreadForTest([this, hold]() -> int64_t { holdTransientLineageForTest_ = hold; return 0; });
+}
+
+int32_t BrokerNode::runMtuWatchdogForTest() {
+    return static_cast<int32_t>(onControlThreadForTest([this]() -> int64_t {
+        (void)checkLinkMtu_(0, /*force=*/true);
+        return linkMtuDeficit_;
+    }));
+}
+
+std::pair<uint64_t, uint64_t> BrokerNode::mtuWatchdogEdgesForTest() {
+    const int64_t b = onControlThreadForTest([this]() -> int64_t { return static_cast<int64_t>(mtuBelowEdges_); });
+    const int64_t r = onControlThreadForTest([this]() -> int64_t { return static_cast<int64_t>(mtuRestoredEdges_); });
+    return {static_cast<uint64_t>(b), static_cast<uint64_t>(r)};
+}
+
+int BrokerNode::reportUnbuildableReplicas_() {
+    if (!metadataService_ || !replicaRegistry_ || !replTransport_ || !election_ || config_.isSingleNode()) return 0;
+    const uint64_t v      = metadataService_->routingVersion();
+    const bool     halted = catalogHaltedValue_ != 0;
+    // Steady state: the map unchanged and nothing assigned here is unbuilt.
+    if (v == unbuiltScanVersion_ && halted == unbuiltScanHalted_ && unbuilt_.empty()) [[likely]] return 0;
+    const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const int32_t self = config_.nodeId;
+    if (v != unbuiltScanVersion_ || halted != unbuiltScanHalted_) {   // cold: a committed-map / halt change
+        unbuiltScanVersion_ = v;
+        unbuiltScanHalted_  = halted;
+        std::set<int64_t> assignedHere;
+        metadataService_->committedMap().forEach(
+            [&](int32_t t, int32_t p, const rune::metadata::PartitionAssignment& pa) {
+                if (t < 0 || std::find(pa.replicas.begin(), pa.replicas.end(), self) == pa.replicas.end()) return;
+                if (topicRegistry_ &&
+                    topicRegistry_->state(t) == rune::gateway::TopicRegistry::TopicState::Dropped)
+                    return;   // the removal path, not a serving gap
+                if (replicaRegistry_->lookup(t, p) != nullptr) return;   // built: fine
+                const int64_t key = (static_cast<int64_t>(t) << 32) | static_cast<uint32_t>(p);
+                assignedHere.insert(key);
+                unbuilt_.try_emplace(key, UnbuiltReplica{nowNs, 0});
+            });
+        std::erase_if(unbuilt_, [&](const auto& e) { return !assignedHere.contains(e.first); });
+        if (unbuilt_.empty()) return 0;
+    }
+    // Built since the scan (runCatalogCreate_ registers it): stop reporting it.
+    std::erase_if(unbuilt_, [&](const auto& e) {
+        return replicaRegistry_->lookup(static_cast<int32_t>(e.first >> 32),
+                                        static_cast<int32_t>(static_cast<uint32_t>(e.first))) != nullptr;
+    });
+    if (nowNs - unbuiltLastPassNs_ < kUnservableReportPeriodNs) return 0;   // the live report's period
+    unbuiltLastPassNs_ = nowNs;
+    // Fix round 5 (I1): BROADCAST to every metadata member (as the node-control
+    // halt report is) — each keeps a TTL'd copy, so a successor controller holds
+    // fresh reports at its first decision.  Review M1: a full outbound ring never
+    // starves the same tail — the next pass starts at the first key it refused.
+    int work = 0;
+    auto start = unbuilt_.lower_bound(unbuiltResumeKey_);
+    if (start == unbuilt_.end()) start = unbuilt_.begin();
+    bool refused = false;
+    auto it = start;
+    for (std::size_t i = 0; i < unbuilt_.size(); ++i, ++it) {
+        if (it == unbuilt_.end()) it = unbuilt_.begin();
+        auto& [key, u] = *it;
+        if (!halted && nowNs - u.firstSeenNs < kUnbuiltReportGraceNs) continue;   // may still apply the create
+        if (u.lastSentNs == 0)
+            spdlog::warn("BrokerNode[{}]: assigned ({}, {}) but cannot serve it ({}) — reporting it to the controller "
+                         "(never elected its leader while it cannot)", config_.nodeId, key >> 32,
+                         static_cast<uint32_t>(key), halted ? "catalog apply halted" : "not built within the grace");
+        u.lastSentNs = nowNs;
+        rune::replication::AlterIsrMsg m{};
+        m.topicId   = static_cast<int32_t>(key >> 32);
+        m.partition = static_cast<int32_t>(static_cast<uint32_t>(key));
+        m.leaderId  = self;
+        m.isrCount  = rune::replication::AlterIsrMsg::kLeaderEpochBump;
+        m.isr[1]    = rune::replication::AlterIsrMsg::kBumpReplicaUnservable;
+        m.isr[3]    = static_cast<int32_t>(static_cast<uint32_t>(lifecycleNonce_));
+        m.isr[4]    = static_cast<int32_t>(static_cast<uint32_t>(static_cast<uint64_t>(lifecycleNonce_) >> 32));
+        bool allSent = true;
+        for (const auto& peer : config_.peers)   // incl. self (delivered locally)
+            allSent = replTransport_->sendNodeControl(peer.id, m) && allSent;
+        if (!allSent && !refused) { refused = true; unbuiltResumeKey_ = key; }   // M1: resume here next pass
+        ++work;
+    }
+    if (!refused) unbuiltResumeKey_ = 0;
+    return work;
+}
+
+int BrokerNode::publishPlacementView_() {
+    if (!metadataService_ || !adminWorkerAgent_) return 0;
+    int work = 0;
+    // The gauge (no allocation; set on change).
+    const auto unplaceable = static_cast<std::int64_t>(metadataService_->unplaceableTopicCount());
+    if (unplaceable != unplaceablePublished_) {
+        if (!unplaceableCounter_ && unplaceableCounterRegId_ >= 0 && aeron_) {
+            try { unplaceableCounter_ = aeron_->findCounter(unplaceableCounterRegId_); } catch (...) { unplaceableCounter_.reset(); }
+        }
+        if (unplaceableCounter_) {
+            unplaceableCounter_->set(unplaceable);
+            unplaceablePublished_ = unplaceable;
+        }
+    }
+    // Review M5 (round 5): BLOCKED partitions on their own gauge.
+    const auto blockedN = static_cast<std::int64_t>(metadataService_->blockedPartitionCount());
+    if (blockedN != blockedPublished_) {
+        if (!blockedCounter_ && blockedCounterRegId_ >= 0 && aeron_) {
+            try { blockedCounter_ = aeron_->findCounter(blockedCounterRegId_); } catch (...) { blockedCounter_.reset(); }
+        }
+        if (blockedCounter_) {
+            blockedCounter_->set(blockedN);
+            blockedPublished_ = blockedN;
+        }
+    }
+    // The view: every configured broker minus the catalog-halted ones (a fixed
+    // array — no allocation on the per-pass compare).
+    PlacementViewMsg v;
+    for (const auto& peer : config_.peers) {
+        if (metadataService_->catalogHalted(peer.id)) {
+            if (v.haltedCount < PlacementViewMsg::kMaxHalted) v.halted[v.haltedCount++] = peer.id;
+        } else {
+            ++v.placeable;
+        }
+    }
+    if (placementPostedOnce_ && v == placementPosted_) [[likely]] return work;
+    uint8_t buf[4 + 2 + 4 * PlacementViewMsg::kMaxHalted];
+    writePlacementView(buf, v);
+    if (adminWorkerAgent_->controlToAdminRing().write(buf, placementViewWireLen(v), kMsgPlacementView)) {
+        placementPosted_ = v;
+        placementPostedOnce_ = true;
+        spdlog::info("BrokerNode[{}]: placement view -> {} placeable broker(s), {} catalog-halted", config_.nodeId,
+                     v.placeable, v.haltedCount);
+        ++work;
+    }   // ring full: retried on the next pass
+    return work;
+}
+
+int BrokerNode::resignIfHalted_(bool consensusLeader) {
+    int work = 0;
+    // Authentication review C: a halted `__security` applier is reported to every member (a latched node-control
+    // mark): the controller steers the (-7, 0) leadership to a healthy broker.
+    if (securityHaltedValue_ != 0 && runtimeAgent_ && !holdHaltReportForTest_)
+        work += runtimeAgent_->controlledShutdown().reportSecurityHalted();
+    if (catalogHaltedValue_ == 0) [[likely]] return work;
+    // Fix round 0 (ruling 2): every member — the controller first — learns this
+    // process is halted (a latched mark on the node-control register): it is
+    // never a placement target again.
+    if (runtimeAgent_ && !holdHaltReportForTest_) work += runtimeAgent_->controlledShutdown().reportCatalogHalted();
+    if (!consensusLeader || !election_ || !metadataService_ || config_.isSingleNode()) return work;
+    // Fix round 0 (ruling 1): hand the controllership to a healthy peer ONLY while
+    // one is live — never leave the cluster without a controller.  With every
+    // broker halted this one stays the controller for the data plane (leader
+    // election, ISR) and places / unplaces no catalog topic (MetadataService).
+    const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    // Fix round 1 (review M1/M5): one bad event halts every applier within a
+    // replication round-trip of each other; their halt marks need that long to
+    // reach this node.  Decide only after the settle window, or a peer that is
+    // halting too still looks healthy (observed: two needless stand-downs).
+    const int64_t settleNs = haltedStandDownSettleNs(election_->leaderHeartbeatTimeoutNs());
+    if (haltedSinceNs_ < 0) haltedSinceNs_ = nowNs;
+    if (nowNs - haltedSinceNs_ < settleNs) return work;
+    std::array<rune::consensus::NodeId, 64> live{};
+    const std::size_t n = election_->eligibleNodeIds(nowNs, 3 * election_->leaderHeartbeatTimeoutNs(), live.data(),
+                                                     live.size());
+    if (!metadataService_->healthyPeerAmong(std::span<const int32_t>(live.data(), n))) return work;
+    // Review M1: a repeat stand-down (this halted node leads again) doubles the hold, capped.
+    const uint64_t prior = election_->standDowns();
+    const int64_t holdNs = haltedStandDownHoldNs(2 * election_->leaderHeartbeatTimeoutNs(), prior);
+    if (election_->standDown(nowNs, holdNs)) {
+        spdlog::critical("BrokerNode[{}]: __catalog apply halted — stood down from the controllership (a "
+                         "healthy peer is live; it places and unplaces topics from now on; hold {} ms, stand-down "
+                         "#{})", config_.nodeId, holdNs / 1'000'000, prior + 1);
+        ++work;
+    }
+    return work;
+}
+
+// ---------------------------------------------------------------------------
+// Catalog history Task 8 — the control thread executes the catalog's effects.
+// Cold (DDL rate).  See BrokerNode.h for the drop sequence and idempotency.
+// ---------------------------------------------------------------------------
+namespace {
+TopicSpec topicSpecFromCatalog(const CatalogTopicAppliedMsg& m) {
+    TopicSpec s;
+    s.name                   = m.name;
+    s.topicId                = m.topicId;
+    s.partitionCount         = m.partitions;
+    s.replicationFactor      = m.replicationFactor;
+    s.persistence            = m.persistence == 1 ? PersistenceMode::Transient : PersistenceMode::Disk;
+    const auto& c            = m.config;
+    s.cleanupPolicy          = c.cleanupPolicy <= 2 ? static_cast<TopicSpec::CleanupPolicy>(c.cleanupPolicy)
+                                                    : TopicSpec::CleanupPolicy::Delete;
+    s.retentionMs            = c.retentionMs;
+    s.retentionBytes         = c.retentionBytes;
+    s.deleteRetentionMs      = c.deleteRetentionMs;
+    s.minCleanableDirtyRatio = static_cast<double>(c.minCleanableDirtyRatioPpm) / 1'000'000.0;
+    s.segmentRollBytes       = c.segmentRollBytes;
+    s.minCompactionLagMs     = c.minCompactionLagMs;
+    s.maxCompactionLagMs     = c.maxCompactionLagMs;
+    s.retentionCheckMs       = c.retentionCheckMs;
+    s.fileDeleteDelayMs      = c.fileDeleteDelayMs;
+    s.durability             = c.durability;
+    s.durabilityTier         = c.durabilityTier;
+    s.coPartitionGroup       = c.coPartitionGroup;
+    s.partitionKey           = c.partitionKey;
+    return s;
+}
+} // namespace
+
+void BrokerNode::postCatalogEffectForTest(int32_t typeId, std::vector<uint8_t> payload) {
+    onAdminThreadForTest([this, typeId, payload = std::move(payload)]() {
+        adminWorkerAgent_->postCatalogFrameForTest(typeId, payload);
+    });
+}
+bool BrokerNode::catalogTopicServesForTest(int32_t topicId) {
+    return onControlThreadForTest([this, topicId]() { return catalogTopicServes_(topicId); });
+}
+void BrokerNode::holdCleanerViewAckForTest(bool on) {
+    onCleanerThreadForTest([this, on]() { cleanerAgent_->setHoldViewAckForTest(on); });
+}
+void BrokerNode::holdDroppedDirPurgeForTest(bool on) {
+    onAdminThreadForTest([this, on]() { adminWorkerAgent_->setHoldDroppedDirPurgeForTest(on); });
+}
+
+bool BrokerNode::catalogNameHeldByDrop_(const std::string& name) const noexcept {
+    // Fix round 1 (M4): ASCII-folded — on a case-insensitive filesystem a
+    // case-variant name shares dataDir/topics/<name>/ with the dropped one.
+    for (const auto& d : droppedAwaitingRetire_)
+        if (d.name == name || rune::catalog::topicNamesFoldEqual(d.name, name)) return true;
+    return false;
+}
+
+void BrokerNode::onCatalogTopicApplied_(const uint8_t* p, std::size_t n, bool isView) {
+    CatalogTopicAppliedMsg m;
+    if (!decodeCatalogTopicApplied(p, n, m)) {
+        if (adminToControlRejects_++ % 1024 == 0) [[unlikely]]
+            spdlog::error("BrokerNode[{}]: malformed kA2cCatalogTopicApplied (len={}) skipped", config_.nodeId, n);
+        return;
+    }
+    // Authentication Task 12 (spec §6): the gateway's ObjectIndex and every authenticated session's permission table
+    // learn the object at the moment the catalog effect is applied here (idempotent), before it is built.
+    if (gateway_) gateway_->onCatalogObjectApplied(m.topicId, m.name, isView);
+    TopicSpec spec = topicSpecFromCatalog(m);
+    spec.viewSink = isView;   // VLS B.2
+    // Step 3: a create whose name a dropped topic still holds (its dir not renamed
+    // away yet) waits — FIFO per name, behind any create of that name already waiting.
+    bool behind = catalogNameHeldByDrop_(spec.name);
+    // Fix-on-sight (Task 11): an AlterView's fresh sink carries the view's name
+    // while the OLD sink — dropped by the same event, whose drop effect the
+    // applier posts right after (install before uninstall, F27) — still holds it
+    // live here.  The catalog already freed the name, so the create waits behind
+    // that drop exactly as behind a retiring one (it was refused: the new sink
+    // never served and AlterView answered Internal after the gate's hold).
+    if (!behind && topicRegistry_) {
+        const auto holder = topicRegistry_->topicIdForName(spec.name);
+        const auto folded = topicRegistry_->topicIdForFoldedName(spec.name);
+        behind = (holder && *holder != spec.topicId) || (folded && *folded != spec.topicId);
+    }
+    for (const auto& pc : pendingCreatesBehindDrop_) {
+        if (pc.spec.topicId == spec.topicId) return;   // the same effect again: already queued (idempotent)
+        behind = behind || pc.spec.name == spec.name || rune::catalog::topicNamesFoldEqual(pc.spec.name, spec.name);
+    }
+    if (behind) {
+        spdlog::info("BrokerNode[{}]: catalog topic '{}' (id={}) waits behind the drop of its name "
+                     "(PendingCreateBehindDrop)", config_.nodeId, spec.name, spec.topicId);
+        // Fix round 1 (C1): the id is SEEN — reserved Pending, never a Gap a later
+        // create could tombstone; answered the retriable NotLeader meanwhile.
+        // Fix-on-sight (Task 8 N3): a refused reservation is explicit, never ignored.
+        if (topicRegistry_ && !topicRegistry_->reserveTopicAt(spec.topicId, spec.name))
+            spdlog::error("BrokerNode[{}]: catalog topic '{}' (id={}) could not be reserved behind the drop of its "
+                          "name — the slot is taken; it waits and answers NotLeader until the drop retires",
+                          config_.nodeId, spec.name, spec.topicId);
+        pendingCreatesBehindDrop_.push_back(PendingCreateBehindDrop{std::move(spec)});
+        return;
+    }
+    runCatalogCreate_(spec);
+}
+
+void BrokerNode::runCatalogCreate_(const TopicSpec& spec) {
+    if (!topicRegistry_) return;
+    try {
+        if (commitReplicaFault_ && *commitReplicaFault_ == spec.name) [[unlikely]]
+            throw std::runtime_error("injected replica-build fault (test)");
+        const int32_t id = topicRegistry_->createTopicAt(spec.topicId, spec);   // idempotent (same id + name)
+        if (id < 0) return;                                                      // refused (logged)
+        if (spec.viewSink) return;   // VLS B.2: a sink owns no replica, no group, no assignment -- the registry slot is all
+        if (const TopicSpec* built = topicRegistry_->topic(id)) {
+            // C1: install the group key BEFORE the replicas register (an owner never moves).  Catalog effects are
+            // drained by the control loop only after buildWorkerPool() in start(), so workerPool_ is set here.
+            if (workerPool_) workerPool_->mapCoPartitionGroup(id, built->coPartitionGroup);
+            else spdlog::error("BrokerNode[{}]: catalog topic '{}' (id={}) applied with no worker pool", config_.nodeId, built->name, id);
+            (void)createRuntimeUserReplicas(*built);   // idempotent: skips existing replicas; addRuntimeTopic
+        }
+    } catch (const std::exception& ex) {
+        // The topic does not serve (produce answers NotLeader / UnknownTopic) — as
+        // commitReplicaFault_ on the old path; the next boot rebuilds it.
+        spdlog::error("BrokerNode[{}]: catalog topic '{}' (id={}) — building it failed: {}", config_.nodeId,
+                      spec.name, spec.topicId, ex.what());
+    }
+}
+
+void BrokerNode::dropRuntimeTopic_(int32_t topicId, const std::string& name) {
+    // R-M1: every worker answers UnknownTopic (not the retriable NotLeader) for this id once the op runs —
+    // posted on every path below (pending create, gap id, live topic): the id is dropped on this broker.
+    if (workerPool_) topicDroppedFanout_.post(topicId);
+    // A create of this id still waiting behind an older drop never ran: forget
+    // it — its Pending slot becomes Dropped (it was seen: created, then dropped).
+    const auto before = pendingCreatesBehindDrop_.size();
+    std::erase_if(pendingCreatesBehindDrop_,
+                  [topicId](const PendingCreateBehindDrop& pc) { return pc.spec.topicId == topicId; });
+    if (metadataService_) metadataService_->removeRuntimeTopic(topicId);   // idempotent
+    if (pendingCreatesBehindDrop_.size() != before) {
+        if (topicRegistry_) (void)topicRegistry_->dropTopic(topicId);
+        return;
+    }
+    if (!topicRegistry_) return;
+
+    if (topicRegistry_->isViewSink(topicId)) {   // VLS B.2: nothing to retire -- no replica, no log, no dir
+        (void)topicRegistry_->dropTopic(topicId);
+        if (gateway_) (void)gateway_->endTopicSubscriptions(topicId);
+        runPendingCreatesBehindDrop_();   // its name is free now
+        return;
+    }
+    const TopicSpec* spec = topicRegistry_->topic(topicId);
+    if (spec == nullptr) {   // unknown / gap / already dropped: the same effect again (idempotent)
+        if (topicRegistry_->state(topicId) == rune::gateway::TopicRegistry::TopicState::Unknown)
+            (void)topicRegistry_->dropTopic(topicId);   // a Gap id: seen now — dropped, never refilled
+        // Fix round 2 (F4): a dir marked with THIS dropped id never stays under topics/<name> (a re-create of
+        // the name would be refused for a dir no topic uses): the retire sequence renames and purges it.
+        const auto m = rune::gateway::readTopicIdMarker(fs::path(config_.dataDir) / "topics" / name);
+        if (m.kind == rune::gateway::TopicIdMarker::Kind::Valid && m.id == topicId) {
+            DroppedTopic d;
+            d.id = topicId; d.name = name; d.diskBacked = true; d.step = drop_step::AwaitingRename{};
+            droppedAwaitingRetire_.push_back(std::move(d));
+        }
+        return;
+    }
+    DroppedTopic d;
+    d.id         = topicId;
+    d.name       = spec->name;
+    d.diskBacked = spec->persistence != PersistenceMode::Transient;
+    const int32_t partitions = spec->partitionCount;
+    if (d.name != name)
+        spdlog::warn("BrokerNode[{}]: catalog drop of id={} names '{}' but the topic is '{}' — dropping by id",
+                     config_.nodeId, topicId, name, d.name);
+    std::vector<rune::storage::Log*> logs;   // cold: the gateway forgets their addresses (M5)
+    for (int32_t part = 0; part < partitions; ++part) logs.push_back(topicRegistry_->log(topicId, part));
+    (void)topicRegistry_->dropTopic(topicId);   // serves nothing from now on (`spec` is not used after)
+    const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (gateway_) {
+        (void)gateway_->endTopicSubscriptions(topicId);   // explicit UnknownTopic, never silent
+        gateway_->forgetDroppedTopic(topicId, partitions, logs);
+    }
+    if (groupCoordService_) (void)groupCoordService_->onTopicDropped(d.name, nowNs);   // groups rebalance it away
+    drop_step::AwaitingRetire retire;
+    for (int32_t part = 0; part < partitions; ++part) {
+        rune::replication::PartitionReplica* r = replicaRegistry_ ? replicaRegistry_->lookup(topicId, part) : nullptr;
+        if (r == nullptr) continue;
+        if (!r->isDiskBacked()) retire.memLogs.push_back(r->memoryLog());
+        // Fence (routed to the owning worker, FIFO before the SetOwnership that drops
+        // it) + retire: freed only once every holder acked the generation.  The
+        // replication transport resolves through the registry: no route remains.
+        if (replBridge_) replBridge_->removePartition(topicId, part);
+        else             replicaRegistry_->remove(topicId, part);
+    }
+    if (workerPool_) workerPool_->forgetTopicRoute(topicId);   // M5: the router's group entry (view sinks)
+    if (cleanerViewChannel_) {   // clear the cleaner's override (count 0)
+        std::vector<uint8_t> clear(CleanerViewChannel::kPolicyHeaderBytes, 0);
+        std::memcpy(clear.data(), &topicId, 4);
+        cleanerPolicyOutbox_.push_back(std::move(clear));
+        (void)pumpCatalogOutboxes_();
+    }
+    retire.retireGen = replicaRegistry_ ? replicaRegistry_->generation() : 0;
+    d.step = std::move(retire);
+    spdlog::info("BrokerNode[{}]: catalog dropped topic '{}' (id={}): not served; {} partition(s) retiring",
+                 config_.nodeId, d.name, topicId, partitions);
+    droppedAwaitingRetire_.push_back(std::move(d));
+}
+
+void BrokerNode::runPendingCreatesBehindDrop_() {
+    if (pendingCreatesBehindDrop_.empty()) return;
+    {
+        // Step 3: run, in arrival order, every waiting create whose name no drop
+        // holds any more (a later create of a still-held name keeps waiting).
+        std::vector<PendingCreateBehindDrop> waiting;
+        waiting.swap(pendingCreatesBehindDrop_);
+        for (auto& pc : waiting) {
+            bool held = catalogNameHeldByDrop_(pc.spec.name);
+            for (const auto& q : pendingCreatesBehindDrop_)
+                held = held || q.spec.name == pc.spec.name || rune::catalog::topicNamesFoldEqual(q.spec.name, pc.spec.name);
+            if (held) pendingCreatesBehindDrop_.push_back(std::move(pc));
+            else      runCatalogCreate_(pc.spec);
+        }
+    }
+}
+
+int BrokerNode::serviceDroppedTopics_() {
+    namespace fs = std::filesystem;
+    int work = 0;
+    const uint64_t safeGen = runtimeAgent_ ? runtimeAgent_->retireSafeGeneration()
+                                           : (replicaRegistry_ ? replicaRegistry_->generation() : 0);
+    const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    bool renamed = false;
+    for (std::size_t i = 0; i < droppedAwaitingRetire_.size();) {
+        DroppedTopic& d = droppedAwaitingRetire_[i];
+        if (auto* w = std::get_if<drop_step::AwaitingRetire>(&d.step)) {
+            if (w->retireGen > safeGen) { ++i; continue; }   // a holder may still reference its Logs
+            if (topicRegistry_) (void)topicRegistry_->releaseDroppedLogs(d.id);
+            for (auto* ml : w->memLogs)
+                std::erase_if(memoryLogs_, [ml](const std::unique_ptr<rune::storage::InMemoryLog>& l) {
+                    return l.get() == ml;
+                });
+            d.step = drop_step::AwaitingRename{};
+            ++work;
+        }
+        // AwaitingRename: move the data away atomically, then hand it to the admin purge.
+        auto& rn = std::get<drop_step::AwaitingRename>(d.step);
+        if (nowNs < rn.retryAtNs) { ++i; continue; }   // M2: a failed rename backs off
+        const fs::path from = fs::path(config_.dataDir) / "topics" / d.name;
+        std::error_code ec;
+        if (d.diskBacked && fs::exists(fs::symlink_status(from, ec))) {
+            const fs::path droppedRoot = fs::path(config_.dataDir) / "dropped";
+            const fs::path to = droppedRoot / (std::to_string(d.id) + "." + d.name);
+            fs::create_directories(droppedRoot, ec);
+            if (!ec) fs::rename(from, to, ec);
+            if (ec) {
+                rn.backoffNs = rn.backoffNs == 0 ? kRenameRetryMinNs : std::min(rn.backoffNs * 2, kRenameRetryMaxNs);
+                rn.retryAtNs = nowNs + rn.backoffNs;
+                if (rn.failures++ % 64 == 0)
+                    spdlog::error("BrokerNode[{}]: renaming the dropped topic dir '{}' -> '{}' failed: {} — "
+                                  "retried in {} ms (never deleted in place; failures {})", config_.nodeId,
+                                  from.string(), to.string(), ec.message(), rn.backoffNs / 1'000'000, rn.failures);
+                ++i;
+                continue;
+            }
+            purgeOutbox_.push_back(to.string());
+        }
+        spdlog::info("BrokerNode[{}]: dropped topic '{}' (id={}) retired — its data moved to dropped/",
+                     config_.nodeId, d.name, d.id);
+        droppedAwaitingRetire_.erase(droppedAwaitingRetire_.begin() + static_cast<std::ptrdiff_t>(i));
+        renamed = true;
+        ++work;
+    }
+    if (renamed) runPendingCreatesBehindDrop_();
+    if (!purgeOutbox_.empty()) work += pumpCatalogOutboxes_();
+    return work;
+}
+
+int BrokerNode::pumpCatalogOutboxes_() {
+    int work = 0;
+    if (!purgeOutbox_.empty() && adminWorkerAgent_) {
+        std::size_t sent = 0;
+        for (const std::string& path : purgeOutbox_) {
+            OneToOneByteRing& ring = adminWorkerAgent_->controlToAdminRing();
+            if (path.size() > static_cast<std::size_t>(ring.maxMsgLength())) [[unlikely]] {
+                spdlog::error("BrokerNode[{}]: dropped dir path '{}' exceeds the control→admin ring message — "
+                              "left for the boot purge", config_.nodeId, path);
+                ++sent;
+                continue;
+            }
+            if (!ring.write(reinterpret_cast<const uint8_t*>(path.data()), path.size(), kMsgPurgeDroppedDir)) break;
+            ++sent;
+        }
+        purgeOutbox_.erase(purgeOutbox_.begin(), purgeOutbox_.begin() + static_cast<std::ptrdiff_t>(sent));
+        work += static_cast<int>(sent);
+    } else if (!purgeOutbox_.empty()) {
+        purgeOutbox_.clear();   // no admin thread: the boot purge removes them
+    }
+    if (!cleanerPolicyOutbox_.empty()) {
+        std::size_t sent = 0;
+        if (cleanerViewChannel_) {
+            for (const auto& f : cleanerPolicyOutbox_) {
+                if (!cleanerViewChannel_->view.write(f.data(), f.size(), CleanerViewChannel::kPolicyMsgType)) break;
+                ++sent;
+            }
+        } else {
+            sent = cleanerPolicyOutbox_.size();   // no cleaner: nothing consumes overrides
+        }
+        cleanerPolicyOutbox_.erase(cleanerPolicyOutbox_.begin(),
+                                   cleanerPolicyOutbox_.begin() + static_cast<std::ptrdiff_t>(sent));
+        work += static_cast<int>(sent);
+    }
+    return work;
+}
+
+void BrokerNode::onCatalogTopicConfig_(const uint8_t* p, std::size_t n) {
+    CatalogTopicConfigMsg m;
+    if (!decodeCatalogTopicConfig(p, n, m)) {
+        if (adminToControlRejects_++ % 1024 == 0) [[unlikely]]
+            spdlog::error("BrokerNode[{}]: malformed kA2cCatalogTopicConfig (len={}) skipped", config_.nodeId, n);
+        return;
+    }
+    // Ruling 5: the alterable keys reach the CLEANER (policy override on its view
+    // ring) — the replica's construction-time config is never touched.  The
+    // layout is the cleaner's kPolicyMsgType verbatim (checked above).
+    static_assert(CleanerViewChannel::kPolicyHeaderBytes == 6 && CleanerViewChannel::kPolicyEntryBytes ==
+                      kCatalogConfigEntryBytes, "kA2cCatalogTopicConfig is forwarded verbatim as kPolicyMsgType");
+    cleanerPolicyOutbox_.emplace_back(p, p + n);
+    (void)pumpCatalogOutboxes_();
+}
+
+void BrokerNode::onViewUninstall_(int32_t viewTopicId) {
+    if (gateway_) gateway_->forgetViewSource(viewTopicId);   // C1: control thread, same as noteViewSource
+    // Every worker drops the view's instances on its own thread (the install ring).
+    ViewPlanUpdateMsg msg;
+    msg.viewTopicId = viewTopicId;
+    msg.uninstall   = true;
+    viewFanoutBacklog_.push_back(ViewFanoutPending{std::move(msg), 0});
+    (void)pumpViewFanout_();
+}
+
+bool BrokerNode::catalogTopicServes_(int32_t topicId) const noexcept {
+    // VLS B.2: a view sink serves as soon as it is applied (catalog-only; the read gates are the gateway's).
+    if (topicRegistry_ && topicRegistry_->isViewSink(topicId)) return true;
+    if (!topicRegistry_ || topicRegistry_->state(topicId) != rune::gateway::TopicRegistry::TopicState::Serving)
+        return false;
+    const TopicSpec* spec = topicRegistry_->topic(topicId);
+    if (spec == nullptr) return false;
+    if (!metadataService_) return true;   // no placement authority: applied is serving
+    for (int32_t p = 0; p < spec->partitionCount; ++p) {
+        const rune::metadata::PartitionAssignment* assigned = metadataService_->assignment(topicId, p);
+        if (assigned == nullptr) return false;
+        // Task 17 (fix-on-sight): a role is routed only for the partitions THIS broker holds.  A topic with
+        // replicationFactor below the broker count is not held everywhere, and a partition held elsewhere never
+        // gets an intended role here — requiring one held every such DDL OK until the gate answered it Internal.
+        const bool heldHere = std::find(assigned->replicas.begin(), assigned->replicas.end(),
+                                        static_cast<int32_t>(config_.nodeId)) != assigned->replicas.end();
+        if (heldHere && replicaRegistry_ &&
+            replicaRegistry_->lookupHandle(topicId, p).intendedRole == ReplicaRegistry::IntendedRole::Unknown)
+            return false;
+    }
+    return true;
+}
+
+// C1 / M7 (catalog history Task 9): the topic of a DDL OK serves.  The admin
+// thread posts the applied topic (kA2cCatalogTopicApplied, failure ring) and the
+// OK (egress ring) on two rings with no order between them, so "serves" is decided
+// here, from what this (control) thread built: applied at its catalog id AND
+// placed (every partition assigned, its role routed) — catalogTopicServes_.  An
+// OK whose topic is not applied yet waits; one that never serves is answered
+// Internal (in doubt) by the gate.
+// Fix round 1 (Minor 2): an OK naming a topic this broker has DROPPED is a
+// dedupe retry's ORIGINAL result (a DefineTopic whose topic was dropped since, an
+// AlterView whose sink was retired since) — it will never serve, and it need not:
+// it passes at once, never held into an in-doubt Internal.
+bool BrokerNode::ddlTopicServes_(int32_t topicId) const noexcept {
+    return ddlGatedTopicServes(topicRegistry_.get(), topicId,
+                               [this](int32_t id) { return catalogTopicServes_(id); });
+}
+
+// ---------------------------------------------------------------------------
+// A9 (findings §4.15): fused placement — the runtime runs in worker 0's pass, so the cross-thread rings the
+// RUNTIME consumes ring worker 0's doorbell: every other worker's return ring and the admin thread's three
+// admin → control rings (all drained unconditionally each runtime pass).  Startup only: called before the
+// other workers' runners and the admin thread start (their first commit happens-after the attach).  A ring the
+// doorbell cannot watch (full) is left unattached — bounded by the park cap, logged.
+// ---------------------------------------------------------------------------
+void BrokerNode::attachFusedRuntimeDoorbell_() {
+    // Review M-1: only when worker 0's runner parks on its doorbell.
+    if (!workerPool_ || shardAgents_.empty() || !shardAgents_.front()->doorbellEnabled()) return;
+    detail::RingDoorbell& bell = shardAgents_.front()->doorbell();
+    int attached = 0, refused = 0;
+    auto attach = [&](OneToOneByteRing& ring) { (ring.attachConsumerDoorbell(bell) ? attached : refused)++; };
+    for (int32_t w = 1; w < workerPool_->workerCount(); ++w) {
+        Worker& wk = workerPool_->worker(w);
+        attach(wk.returnRingForDoorbell());
+        // Review M-2: the runtime PRODUCES into worker w's op + session rings; a refused claim (ring full)
+        // arms the ring's space wait, and worker w's drain rings worker 0 — runtime retries ("next cycle")
+        // never wait out a park.
+        wk.opRingForDoorbell().attachProducerDoorbell(bell);
+        wk.sessionRingForDoorbell().attachProducerDoorbell(bell);
+    }
+    if (auto* admin = adminWorkerAgent_.get()) {
+        attach(admin->failureRing());
+        attach(admin->egressRing());
+        attach(admin->catalogReadRing());   // Task 12
+    }
+    if (refused != 0)
+        spdlog::warn("BrokerNode[{}]: fused runtime doorbell full — {} ring(s) attached, {} bounded by the park cap",
+                     config_.nodeId, attached, refused);
+}
+
+// ---------------------------------------------------------------------------
+// BrokerNode::runtimePathIsConcrete_ — Task 11 fix 2: every call the runtime duty
+// cycle makes through a polymorphic seam resolves to a concrete final type.
+// ---------------------------------------------------------------------------
+bool BrokerNode::runtimePathIsConcrete_() const noexcept {
+    if (!runtimeAgent_ || runtimeAgent_->consensusKind() == NodeRuntimeAgent::ConsensusKind::Generic) return false;
+    if (election_ && !election_->publishPathIsConcrete()) return false;
+    if (replicaRegistry_)
+        for (auto* r : replicaRegistry_->allReplicas())
+            if (r && r->topicId() < 0 && r->transportKindForTest() == rune::replication::TransportKind::Generic)
+                return false;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// BrokerNode::stopStartupPump_ — fused only: stop + JOIN the interim runtime
+// driver pump runner (idempotent).  After it returns nothing pumps the runtime
+// driver until its next owner binds itself.
+// ---------------------------------------------------------------------------
+void BrokerNode::stopStartupPump_() noexcept {
+    if (startupPumpRunner_) startupPumpRunner_->stopAndJoin();
+    startupPumpRunner_.reset();
+    startupPumpAgent_.reset();
+    startupPumpIdle_.reset();
+}
+
+// ---------------------------------------------------------------------------
+// BrokerNode::stopEmbeddedDriver
+// ---------------------------------------------------------------------------
+void BrokerNode::stopEmbeddedDriver() noexcept {
+    nodeDriver_.reset();   // joins the driver thread, drains, closes (EmbeddedDriver::close)
+}
+
+// ---------------------------------------------------------------------------
+// BrokerNode::buildShardRuntimes_ — spec §3.1: per worker, an invoker driver
+// (<aeronDir>/w<w>) + an Aeron client with useConductorAgentInvoker(true).
+// Refuses (throws) when the aeron dir cannot hold one log per driver.
+// ---------------------------------------------------------------------------
+void BrokerNode::buildShardRuntimes_() {
+    const int32_t wc = config_.workerCount >= 1 ? config_.workerCount : 1;
+    std::error_code ec;
+    const auto space = fs::space(config_.effectiveAeronDir(), ec);
+    if (ec) {
+        spdlog::warn("BrokerNode[{}]: cannot stat free space of aeron dir {} ({}) — shard tmpfs budget "
+                     "NOT checked", config_.nodeId, config_.effectiveAeronDir(), ec.message());
+    } else if (auto err = checkAeronSpace(space.available, config_.fused() ? wc : wc + 1,
+                                          config_.aeronTermBufferBytes)) {
+        // wc shard drivers + the node driver share the aeron filesystem (fused:
+        // worker 0 rides the node driver, so wc drivers in total).
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) +
+                                 "]: refusing shard mode — " + *err);
+    }
+    shardDrivers_.reserve(static_cast<std::size_t>(wc));
+    shardClients_.reserve(static_cast<std::size_t>(wc));
+    for (int32_t w = 0; w < wc; ++w) {
+        // A4: fused placement — the runtime (control plane) already runs on worker
+        // 0's thread; worker 0 rides the node driver + runtime client instead of
+        // owning a second invoker driver (one Aeron driver per worker, no extra
+        // runtime driver duty-cycled on the same pass).
+        if (config_.fused() && w == 0) {
+            shardDrivers_.push_back(nullptr);
+            shardClients_.push_back(aeron_);
+            continue;
+        }
+        const std::string dir = (fs::path{config_.effectiveAeronDir()} / ("w" + std::to_string(w))).string();
+        auto dcfg = EmbeddedDriverConfig::fromNode(config_, dir);
+        if (resolverHub_) dcfg.peerResolution = resolverHub_->subscribeDriver();   // DR-15 fix round 1
+        // D2: the backoff default is for the NODE driver's idle loop; a worker's invoker driver is pumped by
+        // its worker (no idle loop) — keep its configured string exactly as before.
+        dcfg.idleStrategy = config_.driverIdleStrategy.empty() ? std::string("sleep-ns") : config_.driverIdleStrategy;
+        dcfg.clientLivenessTimeoutNs = config_.shardClientLivenessTimeoutNs;
+        shardDrivers_.push_back(std::make_unique<EmbeddedDriver>(std::move(dcfg), DriverMode::Invoker));
+        aeron::Context ctx;
+        ctx.aeronDir(dir);
+        ctx.mediaDriverTimeout(config_.inProcessDriverTimeoutMs());
+        ctx.useConductorAgentInvoker(true);
+        auto client = aeron::Aeron::connect(ctx);
+        if (!client)
+            throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: shard " +
+                                     std::to_string(w) + " Aeron client connect failed");
+        shardClients_.push_back(std::move(client));
+    }
+    spdlog::info("BrokerNode[{}]: {} shard runtime(s) (invoker driver + invoker client) under {}/w*",
+                 config_.nodeId, wc, config_.effectiveAeronDir());
+}
+
+namespace {
+// Startup-only composite pump: one pass of every shard's own AeronPump (driver
+// duty cycle + client conductor).  A refusal from any shard (not its pump
+// thread) fails the resolve fast, exactly like a single shard pump.
+struct ShardStartupPump {
+    std::vector<rune::aeronutil::AeronPump> pumps;
+    static int pumpAll(void* self) noexcept {
+        int work = 0;
+        for (auto& p : static_cast<ShardStartupPump*>(self)->pumps) {
+            const int w = p.pump();
+            if (w < 0) return rune::aeronutil::AeronPump::kRefused;
+            work += w;
+        }
+        return work;
+    }
+};
+} // namespace
+
+// ---------------------------------------------------------------------------
+// BrokerNode::attachShardRuntimes_ — right after buildShardRuntimes_(), right
+// before the runners start (no long phase in between).  Per worker w, on its OWN
+// client, resolved by pumping its OWN invoker driver from this thread: the
+// deferred replication plane (handshake enabled), client ingress, record egress,
+// then its ShardAgent.  Any unresolved resource is a hard refusal (throw).
+// ---------------------------------------------------------------------------
+void BrokerNode::attachShardRuntimes_() {
+    const int32_t wc = static_cast<int32_t>(shardClients_.size());
+    if (!workerPool_ || workerPool_->workerCount() != wc)
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) +
+                                 "]: shard runtime count does not match the worker pool — refusing to start");
+    int32_t egressBase = config_.workerEgressBaseStreamId;
+    if (egressBase <= 0) egressBase = config_.workerIngressBaseStreamId + wc;
+    const int32_t egressControlBase = config_.effectiveWorkerEgressControlBasePort();
+    shardAgents_.reserve(static_cast<std::size_t>(wc));
+    // Every resolve below pumps EVERY shard's driver + client (each through its
+    // own AeronPump; all are still owned by this start thread), so no shard goes
+    // unpumped while another one resolves: startup liveness is independent of
+    // the shard count and of how long any single resolve takes (fix round 2).
+    // A4: worker 0's driver is the node driver in fused placement — the interim
+    // startup pump runner is joined here (it never pumps again) and this thread
+    // becomes its only pumper until worker 0's first pass takes it over.
+    if (config_.fused()) {
+        stopStartupPump_();
+        nodeDriver_->bindPumpThread();
+    }
+    ShardStartupPump startupPump;
+    startupPump.pumps.reserve(static_cast<std::size_t>(wc));
+    for (int32_t w = 0; w < wc; ++w)
+        startupPump.pumps.push_back(shardDriver_(static_cast<std::size_t>(w)).pumpWith(
+            shardClients_[static_cast<std::size_t>(w)].get()));
+    for (int32_t w = 0; w < wc; ++w) {
+        const auto idx = static_cast<std::size_t>(w);
+        rune::aeronutil::AeronPump pump(&ShardStartupPump::pumpAll, &startupPump, nullptr);
+        if (w == shardResolveStallWorkerForTest_) [[unlikely]] {
+            // Test-only fault: a resolve of THIS shard that cannot complete for the
+            // configured time (pumping exactly as a real slow resolve would).
+            (void)pump.resolve([] { return false; }, shardResolveStallForTest_);
+        }
+        // Review A-I5: a shard on its OWN driver (thread placement) binds its fixed ports before its first
+        // publication (the replication plane's peer publications below).  Fused worker 0 shares the node
+        // driver: anchored at start.
+        if (shardClients_[idx] != aeron_) {
+            std::vector<std::string> subs{config_.shardIngressBindChannel(w), config_.shardReplBindChannel(w)};
+            std::vector<std::string> pubs{"aeron:udp?control-mode=dynamic|control=" +
+                                          config_.effectiveWorkerEgressControlHost() + ":" +
+                                          std::to_string(egressControlBase + w) + kAnchorPubTerm};
+            anchorFixedEndpoints_(shardClients_[idx], subs, pubs, pump, "shard driver");
+        }
+        if (!perWorkerReplTransports_.empty()) {
+            std::vector<std::pair<rune::replication::NodeId, std::string>> peersW;
+            std::vector<rune::replication::NodeId> peerIds;
+            for (const auto& peer : config_.peers) {
+                if (peer.id == config_.nodeId) continue;
+                peersW.push_back({static_cast<rune::replication::NodeId>(peer.id),
+                                  NodeConfig::shardPeerReplChannel(peer, w)});
+                peerIds.push_back(static_cast<rune::replication::NodeId>(peer.id));
+            }
+            auto& plane = *perWorkerReplTransports_[idx];
+            // DR-15 (2026-10-05): only a LOCAL failure (own inbound bind, bad peer
+            // config) refuses to start.  A peer whose publication does not
+            // resolve (its hostname is unresolvable while it restarts — k8s pod,
+            // DNS lag) stays Resolving and the worker re-adds it on its duty
+            // passes until it resolves; it then joins like a late peer.
+            if (!plane.attach(shardClients_[idx], peersW, config_.replBaseStreamId + w, pump))
+                throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: shard " +
+                                         std::to_string(w) + " replication plane inbound " +
+                                         config_.shardReplBindChannel(w) +
+                                         " did not resolve (local bind / peer config) — refusing to start");
+            if (!plane.allPeersResolved())
+                spdlog::warn("BrokerNode[{}]: shard {} replication plane: {} peer publication(s) unresolved at "
+                             "startup — serving without them; re-added until they resolve",
+                             config_.nodeId, w, plane.resolvingPeerCount());
+            // Runtime worker-count symmetry (Task 6 ruling I2): peers' RUNE_WORKERS
+            // are unknown at parse time, so each plane verifies them in-band.
+            // F3 round 6, item 6: the max-batch constraint is cluster-wide —
+            // advertise this node's effective max + worker ingress ring size.
+            plane.enablePlaneHandshake(static_cast<rune::replication::NodeId>(config_.nodeId), wc, peerIds,
+                                       static_cast<int64_t>(config_.produceIntakeLimit()),
+                                       config_.workerIngressRingBytes);
+        }
+        // F25: the shard ingress subscribes the CLIENT stream on this worker's
+        // own port — the stream the metadata advertises in shard mode, which the
+        // node endpoint's gateway subscribes too (an ingressEndpoint-unaware
+        // client lands there).  Legacy per-worker ingress keeps base + w.
+        auto ing = std::make_unique<WorkerIngress>(shardClients_[idx], config_.shardIngressBindChannel(w),
+                                                   config_.clientEndpoint.streamId, pump);
+        const std::string control = config_.effectiveWorkerEgressControlHost() + ":" + std::to_string(egressControlBase + w);
+        auto eg = std::make_unique<WorkerEgress>(shardClients_[idx], control, egressBase + w, pump);
+        if (!ing->resolved() || !eg->resolved() || w == forceEgressUnresolvedForTest_)
+            throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: shard " +
+                                     std::to_string(w) + " ingress/egress did not resolve — refusing to start");
+        Worker& wk = workerPool_->worker(w);
+        wk.setWorkerIngress(ing.get(), /*active=*/true);
+        wk.setWorkerEgress(eg.get());
+        // Task 13 (spec §3.4): produce acks on this worker's OWN publications to
+        // each announced session, created on its own invoker client.
+        wk.setShardClient(shardClients_[idx].get(), config_.aeronControlTermBufferBytes);
+        workerIngresses_.push_back(std::move(ing));
+        workerEgresses_.push_back(std::move(eg));
+        shardAgents_.push_back(std::make_unique<ShardAgent>(wk, shardDriver_(idx), *shardClients_[idx], clock_));
+    }
+    if (gateway_) {
+        gateway_->setPerWorkerIngressActive(true);
+        gateway_->setPerWorkerEgressActive(true);
+        gateway_->setWorkerEgressParams(egressControlBase, egressBase);
+        // Task 13: announce-before-accept, worker-side acks, worker PSM authority.
+        gateway_->setShardMode(true);
+        if (topicRegistry_)
+            for (const auto& ts : bootTopics_)
+                for (int32_t p = 0; p < ts.partitionCount; ++p)
+                    if (auto* log = topicRegistry_->log(ts.topicId, p)) gateway_->addWorkerOwnedLog(log);
+    }
+    spdlog::info("BrokerNode[{}]: {} worker shard(s) attached (own driver + client + plane + ingress + egress)",
+                 config_.nodeId, wc);
+}
+
+// ---------------------------------------------------------------------------
+// BrokerNode::teardownShardRuntimes_ — precondition: every shard runner joined.
+// Hand-off (EmbeddedDriver one-pumper contract): the closing thread binds itself
+// as each invoker driver's pumper, clients close (their close commands queue in
+// the CnC ring), then each driver drains + closes on this thread.  A driver that
+// still refuses to close is a leak: logged critical, debug builds abort.
+// ---------------------------------------------------------------------------
+void BrokerNode::teardownShardRuntimes_() noexcept {
+    if (shardDrivers_.empty() && shardClients_.empty()) return;
+    shardAgents_.clear();
+    for (auto& d : shardDrivers_) if (d) d->bindPumpThread();
+    // Clients first (their close commands queue in each driver's CnC ring), then
+    // drivers.  ~Aeron and EmbeddedDriver::close() are both noexcept and Aeron
+    // exposes no throwing close() to wrap, so there is nothing to catch here: a
+    // failing close terminates per the C++ contract.  What CAN go wrong without
+    // throwing — a driver close refused (wrong pump thread) — is checked below.
+    shardClients_.clear();
+    for (auto& d : shardDrivers_) {
+        if (!d) continue;
+        d->close();
+        const bool open = d->isOpen();
+        if (open) {
+            spdlog::critical("BrokerNode[{}]: shard driver {} did not close on the stopping thread — LEAK",
+                             config_.nodeId, d->dir());
+#ifndef NDEBUG
+            std::abort();
+#endif
+            (void)d.release();   // never re-run a failing close from the destructor
+        }
+    }
+    shardDrivers_.clear();
+}
+
+void BrokerNode::ensureProcessIncarnation_() {
+    if (processIncarnation_ != 0) return;
+    std::random_device rd;
+    processIncarnation_ = static_cast<int64_t>((((static_cast<uint64_t>(rd()) << 32) ^ rd()) | 1u) & 0x7fffffffffffffffull);
+}
+
+uint64_t BrokerNode::transientLineageVersionTrampoline_(void* ctx) noexcept {
+    auto* self = static_cast<BrokerNode*>(ctx);
+    return self->metadataService_ != nullptr ? self->metadataService_->transientLineageVersion() : 0;
+}
+
+bool BrokerNode::isTransientTopicTrampoline_(void* ctx, int32_t topicId) noexcept {
+    auto* self = static_cast<BrokerNode*>(ctx);
+    if (self->topicRegistry_ == nullptr) return false;
+    const TopicSpec* spec = self->topicRegistry_->topic(topicId);
+    return spec != nullptr && spec->persistence == PersistenceMode::Transient;
+}
+
+uint64_t BrokerNode::transientLineageTrampoline_(void* ctx, int32_t topicId, int32_t partition) noexcept {
+    // E2 final fix wave (C1, option b).  Runtime thread: the group handlers,
+    // the gateway and the MetadataService all run on the NodeRuntimeAgent.
+    auto* self = static_cast<BrokerNode*>(ctx);
+    if (!isTransientTopicTrampoline_(ctx, topicId)) return 0;   // a disk partition: no lineage
+    if (self->metadataService_ == nullptr || self->holdTransientLineageForTest_) [[unlikely]]
+        return GroupCoordinationService::kLineagePending;
+    static_assert(GroupCoordinationService::kLineagePending == rune::metadata::kLineageUntrusted);
+    return self->metadataService_->trustedTransientLineage(topicId, partition);   // residual N1
+}
+
+} // namespace rune::node

@@ -1,0 +1,221 @@
+# docker-compose.yml — 3-node rune-broker UDP cluster + raw-Aeron ping probe
+# BR-7b: 3 broker nodes over aeron:udp consensus (port 40111), client gateway
+# on port 40200 per node. Probe runs under the "tools" profile.
+#
+# Platform: linux/amd64 — the builder stage uses gcc:13 (x86_64 cmake binary).
+# On macOS/Apple Silicon, Docker Desktop's Rosetta emulation runs amd64 containers.
+#
+# IMAGE TAGGING: the broker image is tagged rune-broker-node:${RUNE_IMAGE_TAG}.
+# Set RUNE_IMAGE_TAG to the git commit SHA (e.g. export RUNE_IMAGE_TAG=$(git rev-parse --short HEAD))
+# before building so each commit's layers live under a unique tag and never collide
+# with other commits' layers in the containerd snapshot store.  Defaults to "latest"
+# for interactive use but the e2e harness always sets it to the commit SHA.
+
+name: rune-broker
+
+x-broker-build: &broker-build
+  context: ..
+  dockerfile: docker/Dockerfile
+  args:
+    - CMAKE_BUILD_PARALLEL_LEVEL   # from the environment when set (small Docker VMs); unset = ninja default
+  additional_contexts:
+    # relative to this compose file's dir (docker/), so ../../rune-protocol = the sibling repo
+    # RUNE_PROTOCOL_DIR overrides it (e.g. a rune-protocol worktree on main when the
+    # sibling checkout sits on a feature branch).
+    rune-protocol: ${RUNE_PROTOCOL_DIR:-../../rune-protocol}
+    # rune-fr flight recorder: compiled sibling lib wired by the root CMakeLists
+    # (add_library(rune_fr ...) from ${SRC}/../rune-fr).  Needs src/ AND include/.
+    rune-fr: ../../rune-fr
+    # rune-codec (0a): compiled sibling codec lib; Dockerfile COPYs --from=rune-codec.
+    rune-codec: ../../rune-codec
+    # rune-crypto (client<->broker TLS/AEAD): the Dockerfile COPYs --from=rune-crypto.
+    rune-crypto: ../../rune-crypto
+
+x-broker-env: &broker-env
+  # GR-9: peer spec includes the replicationPort (4th segment) so the data-plane
+  # replication transport actually STARTS — without it the broker logs
+  # "no replicationPort configured — topics won't replicate" and acks=All can
+  # never be majority-durable (committed records are lost on leader kill).
+  # Format: id@host:consensusPort:clientPort:replicationPort.
+  #   consensus  = 40111 (Raft/consensus aeron:udp)
+  #   client     = 40200 (client gateway aeron:udp)
+  #   replication= 40222 (follower→leader fetch / leader→follower data aeron:udp)
+  # Followers use clientPort to redirect Produce/Subscribe to the leader endpoint.
+  RUNE_PEERS: "0@rune-1:40111:40200:40222,1@rune-2:40111:40200:40222,2@rune-3:40111:40200:40222"
+  RUNE_DATA_DIR: /var/lib/rune
+  # dev: auto-format empty volumes (the dr-e2e harness and docker/*e2e.sh rely on it)
+  RUNE_STORAGE_FORMAT: "${RUNE_STORAGE_FORMAT:-auto}"
+  # Client gateway listens on all interfaces inside the container.
+  # RUNE_CLIENT_ENDPOINT is the raw "host:port" appended to "aeron:udp?endpoint=".
+  RUNE_CLIENT_ENDPOINT: "0.0.0.0:40200"
+  # Election timing — slightly relaxed for cross-container UDP latency.
+  RUNE_ELECTION_TIMEOUT_MS: "300"
+  RUNE_ELECTION_STATUS_INTERVAL_MS: "50"
+  RUNE_STARTUP_CANVASS_TIMEOUT_MS: "200"
+  # Optional log level (honoured by src/main.cpp via RUNE_LOG_LEVEL); "info"
+  # keeps the E2E output readable.  Set "debug" to surface gateway
+  # redirect/accept/subscribe decisions when diagnosing.
+  RUNE_LOG_LEVEL: "${RUNE_LOG_LEVEL:-info}"
+  # Diagnostic per-tick FollowerSync/ISR + transport-rate logging (RUNE_FS_LOG) is
+  # opt-in: unset / "" / "0" = OFF, and "0" is now also the DEFAULT (fd9a8bb).
+  # This explicit off pins e2e to off regardless of future default changes, so it
+  # never floods/starves the data-plane threads (esp. under amd64 emulation on
+  # Apple Silicon).  Set to "1" only when debugging replication.
+  RUNE_FS_LOG: "0"
+  # Container /dev/shm budget (2026-10-02 defaults): the broker DEFAULT term is
+  # 16 MiB and every publication/image maps 3 terms (48 MiB) — on the RECEIVING
+  # side too, so a DR client container (--shm-size=64m) could not hold one broker
+  # image.  Explicit 4 MiB terms (the pre-2026-10-02 size) for the containers.
+  RUNE_AERON_TERM_BUFFER_BYTES: "4194304"
+  # NO topics are declared here: the brokers boot with an empty catalog and the data-plane topics
+  # (events = 0, multi = 1, cg = 2, ids in creation order) are created by DDL once a leader is up:
+  # docker/create-topics.sh e2e  (docker/topics/e2e.rql; the dr-e2e harness does the same).
+  # E3 io_uring portability: Docker Desktop on Apple Silicon / Rosetta x86_64
+  # emulation does NOT translate the io_uring_setup(2) syscall (NR 425), causing
+  # the broker to crash on startup.  Setting RUNE_IO_BACKEND=portable activates
+  # UringFlushBackend's graceful fallback (submit() returns kNoToken; tier 0/1
+  # acks are enqueued synchronously without io_uring).  On bare-metal Linux CI
+  # where io_uring IS available, this variable is still safe — tier-2 (Strict)
+  # produces simply see the same back-pressure they would get with a full ring.
+  RUNE_IO_BACKEND: "portable"
+  # Authentication is ON by default: every node needs the SAME cluster key file (`rune security gen-cluster-key
+  # --out docker/secrets/cluster.key`), mounted read-only at /run/secrets/cluster.key.  RUNE_SECRETS_DIR moves
+  # the directory (the e2e launchers generate a per-run one).  Without the file the broker refuses to start.
+  RUNE_CLUSTER_KEY_FILE: /run/secrets/cluster.key
+
+services:
+  # ── Node 0 ──────────────────────────────────────────────────────────────────
+  rune-1:
+    build: *broker-build
+    image: rune-broker-node:${RUNE_IMAGE_TAG:-latest}
+    platform: linux/amd64
+    hostname: rune-1
+    # DR-BUG-RESTART-BIND: these fixed ports lie inside Linux's ephemeral range (32768-60999); reserved (a
+    # per-netns sysctl) so no socket auto-bound first - e.g. the broker's own Aeron publications while it
+    # starts - can take one and fail a (re)start with 'Address already in use' (the broker WARNs otherwise).
+    sysctls:
+      net.ipv4.ip_local_reserved_ports: "40111,40200,40222"
+    shm_size: "256m"
+    # E3: the broker uses raw io_uring_setup(2) for async durability.
+    # Docker Desktop's default seccomp profile blocks io_uring_setup (NR 425)
+    # on macOS — unconfined lets the syscall through.  This does NOT affect CI
+    # or bare-metal Linux where io_uring is allowed by default.
+    security_opt:
+      - seccomp=unconfined
+    environment:
+      <<: *broker-env
+      RUNE_NODE_ID: "0"
+    volumes:
+      - rune-data-1:/var/lib/rune
+      - type: bind
+        source: ${RUNE_SECRETS_DIR:-./secrets}/cluster.key
+        target: /run/secrets/cluster.key
+        read_only: true
+        bind:
+          create_host_path: false   # a missing key file fails the start; never a directory
+    healthcheck:
+      test: ["CMD", "pgrep", "-x", "rune_broker"]
+      interval: 5s
+      timeout: 3s
+      start_period: 20s
+      retries: 5
+
+  # ── Node 1 ──────────────────────────────────────────────────────────────────
+  rune-2:
+    build: *broker-build
+    image: rune-broker-node:${RUNE_IMAGE_TAG:-latest}
+    platform: linux/amd64
+    hostname: rune-2
+    # DR-BUG-RESTART-BIND: these fixed ports lie inside Linux's ephemeral range (32768-60999); reserved (a
+    # per-netns sysctl) so no socket auto-bound first - e.g. the broker's own Aeron publications while it
+    # starts - can take one and fail a (re)start with 'Address already in use' (the broker WARNs otherwise).
+    sysctls:
+      net.ipv4.ip_local_reserved_ports: "40111,40200,40222"
+    shm_size: "256m"
+    security_opt:
+      - seccomp=unconfined
+    environment:
+      <<: *broker-env
+      RUNE_NODE_ID: "1"
+    volumes:
+      - rune-data-2:/var/lib/rune
+      - type: bind
+        source: ${RUNE_SECRETS_DIR:-./secrets}/cluster.key
+        target: /run/secrets/cluster.key
+        read_only: true
+        bind:
+          create_host_path: false   # a missing key file fails the start; never a directory
+    healthcheck:
+      test: ["CMD", "pgrep", "-x", "rune_broker"]
+      interval: 5s
+      timeout: 3s
+      start_period: 20s
+      retries: 5
+
+  # ── Node 2 ──────────────────────────────────────────────────────────────────
+  rune-3:
+    build: *broker-build
+    image: rune-broker-node:${RUNE_IMAGE_TAG:-latest}
+    platform: linux/amd64
+    hostname: rune-3
+    # DR-BUG-RESTART-BIND: these fixed ports lie inside Linux's ephemeral range (32768-60999); reserved (a
+    # per-netns sysctl) so no socket auto-bound first - e.g. the broker's own Aeron publications while it
+    # starts - can take one and fail a (re)start with 'Address already in use' (the broker WARNs otherwise).
+    sysctls:
+      net.ipv4.ip_local_reserved_ports: "40111,40200,40222"
+    shm_size: "256m"
+    security_opt:
+      - seccomp=unconfined
+    environment:
+      <<: *broker-env
+      RUNE_NODE_ID: "2"
+    volumes:
+      - rune-data-3:/var/lib/rune
+      - type: bind
+        source: ${RUNE_SECRETS_DIR:-./secrets}/cluster.key
+        target: /run/secrets/cluster.key
+        read_only: true
+        bind:
+          create_host_path: false   # a missing key file fails the start; never a directory
+    healthcheck:
+      test: ["CMD", "pgrep", "-x", "rune_broker"]
+      interval: 5s
+      timeout: 3s
+      start_period: 20s
+      retries: 5
+
+  # ── Ping probe (profile: tools — NOT started by default `up`) ────────────────
+  # Built from a separate Dockerfile that compiles only the ping_probe binary.
+  # The node publishes Pong back to the probe's egress channel; the probe
+  # hostname must be resolvable inside the compose network so the node can
+  # open a UDP publication back to "probe:40300".
+  probe:
+    profiles: ["tools"]
+    image: rune-broker-probe:${RUNE_IMAGE_TAG:-latest}
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.probe
+      additional_contexts:
+        # relative to this compose file's dir (docker/), so ../../rune-protocol = the sibling repo
+        rune-protocol: ${RUNE_PROTOCOL_DIR:-../../rune-protocol}
+        # the same sibling set as x-broker-build: the root CMakeLists builds these libraries unconditionally
+        rune-fr: ../../rune-fr
+        rune-codec: ../../rune-codec
+        rune-crypto: ../../rune-crypto
+    platform: linux/amd64
+    hostname: probe
+    shm_size: "256m"
+    environment:
+      RUNE_PROBE_TARGET: "aeron:udp?endpoint=rune-1:40200"
+      RUNE_PROBE_TARGET_STREAM: "1"
+      RUNE_PROBE_EGRESS: "aeron:udp?endpoint=probe:40300"
+      RUNE_PROBE_EGRESS_STREAM: "2"
+      RUNE_PROBE_TIMEOUT_MS: "8000"
+      RUNE_DATA_DIR: /tmp/rune_probe
+    # No depends_on — the e2e.sh script ensures the cluster is up before running
+    # the probe. depends_on would auto-restart killed nodes during leader-kill tests.
+
+volumes:
+  rune-data-1:
+  rune-data-2:
+  rune-data-3:

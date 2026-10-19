@@ -1,0 +1,171 @@
+#pragma once
+// ViewSnapshotIoAgent.h — Task 13: dedicated view-checkpoint IO thread.
+//
+// Mirrors LogCleanerAgent: a rune::consensus::Agent driven by its own
+// AgentRunner thread, draining a worker->IO ring and doing pure file IO off
+// the produce/consume hot path.  Shared-nothing: the only cross-thread
+// communication is the two OneToOneByteRings in ViewSnapshotChannel; this
+// agent's file-handle map and counters are plain, single-thread-owned
+// members (no atomics, no locks -- it is the ONLY writer of every field
+// below, always called from the same AgentRunner thread).
+//
+// Each doWork(nowNs) cycle:
+//   1. Drain `channel.deltas` (bounded limit). For each frame:
+//        [viewTopicId i32][partition i32][delta bytes...]
+//      lazily open (or reuse) the per-(viewTopicId,partition) delta file and
+//      append the delta bytes to it (appendNoSync-style: write(), no fsync
+//      per message -- fsyncs are GROUPED, see below). Track the highest O
+//      seen for that key since the last fsync (parsed straight out of the
+//      delta bytes' own Task-12 header: [magic u32][O i64]...).
+//   2. OFFSET-ATOMIC fsync grouping: once nowNs - lastFsyncNs_ >= fsyncMs*1e6
+//      (or the drain came back empty while bytes are still pending), run ONE
+//      fdatasync per dirty fd this cycle, THEN -- only after every dirty fd
+//      has synced -- advance lastDurableOffset_[(view,part)] to the O that
+//      was appended before the sync, and post a `done` ack carrying it. A
+//      delta's O NEVER becomes "durable" before its bytes are fdatasync'd:
+//      a crash between append and fsync leaves lastDurableOffset() at the
+//      PRIOR fsync'd O, never the just-appended one.
+//
+// Back-pressure: `done` is a small fixed ring (4096 B); if it is momentarily
+// full the ack is simply retried next cycle (pendingAcks_ holds it) -- never
+// dropped, and lastDurableOffset() is already correct in-process regardless
+// (the ack is only a worker-side notification; readers of this agent, e.g.
+// the Task 16 readiness gate, call lastDurableOffset() directly).
+//
+// Failure handling (review round 1 fixes):
+//   - A transient ::open() failure (fd-ulimit, momentary ENOSPC/EACCES, dir
+//     not yet created, ...) is NEVER cached: fileFor_() does not insert a
+//     FileState for a key whose open() failed, so the very next delta for
+//     that key retries open() from scratch. openFailureCount() exposes a
+//     running total so a PERSISTENT failure is observable beyond one log
+//     line (never silently blackholes a key forever).
+//   - A short/failed ::write() is handled by looping to completion
+//     (writeFull(): EINTR and legitimate partial writes just resume from the
+//     new offset) so the only way handleDeltaFrame_ sees a write failure is
+//     a REAL I/O error. That is treated as FATAL for the (view,partition)'s
+//     file: pendingO/lastDurableO are never advanced past it, the file is
+//     marked `errored` (hasError()) and permanently stops accepting further
+//     deltas (a torn/partial record with no resync marker would otherwise
+//     silently misalign every later record's CRC on replay) -- the stream
+//     is never again presented as durable past the corruption.
+
+#include <rune/consensus/ConsensusAgent.h>
+#include <rune/node/ViewSnapshotChannel.h>
+
+#include <cstdint>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+namespace rune::node {
+
+class ViewSnapshotIoAgent final : public rune::consensus::Agent {
+public:
+    /// @param channel      The worker<->IO ring pair. Not owned; must outlive
+    ///                     this agent (same lifetime discipline as
+    ///                     CleanerViewChannel / LogCleanerAgent).
+    /// @param viewDataDir  Directory the per-(viewTopicId,partition) delta
+    ///                     files are created in. Created if missing.
+    /// @param fsyncMs      Grouped-fsync window in milliseconds. Default 50.
+    explicit ViewSnapshotIoAgent(ViewSnapshotChannel& channel,
+                                 std::string viewDataDir,
+                                 int64_t fsyncMs = 50);
+    // Task 19: per-NODE agent draining EVERY worker's channel.  Each pointer must
+    // outlive this agent (same lifetime discipline as the single-channel ctor).
+    // A delta's `done` ack is routed back to the channel it arrived on (so each
+    // worker learns the durable offset of its OWN deltas).
+    explicit ViewSnapshotIoAgent(std::vector<ViewSnapshotChannel*> channels,
+                                 std::string viewDataDir,
+                                 int64_t fsyncMs = 50);
+    ~ViewSnapshotIoAgent() override;
+
+    ViewSnapshotIoAgent(const ViewSnapshotIoAgent&)            = delete;
+    ViewSnapshotIoAgent& operator=(const ViewSnapshotIoAgent&) = delete;
+
+    int doWork(int64_t nowNs) override;
+    const char* name() const noexcept override { return "rune-view-io"; }
+
+    /// Durable O for (viewTopicId, partition): the highest O whose bytes are
+    /// CONFIRMED fdatasync'd. -1 if nothing has ever been made durable for
+    /// this key (used by the Task 16 readiness gate + this task's own test).
+    [[nodiscard]] int64_t lastDurableOffset(int32_t viewTopicId, int32_t partition) const noexcept;
+
+    /// True iff this (viewTopicId, partition)'s delta file hit a FATAL write
+    /// error and permanently stopped accepting further deltas (see file
+    /// header). The Task 16 readiness gate should treat this as "this
+    /// partition's snapshot stream needs recovery/rebuild", never as merely
+    /// "durability paused". False for a key that has never errored (whether
+    /// or not it has ever been seen at all).
+    [[nodiscard]] bool hasError(int32_t viewTopicId, int32_t partition) const noexcept;
+
+    /// Running total of ::open() failures observed across every key, for the
+    /// agent's whole lifetime. A transient failure is retried automatically
+    /// (never cached -- see file header); this counter is what makes a
+    /// PERSISTENT open failure observable (e.g. an ops alert on "still > 0
+    /// N cycles later") instead of silently stalling behind a single log line.
+    [[nodiscard]] int64_t openFailureCount() const noexcept { return openFailures_; }
+
+    /// Path of the delta file for (viewTopicId, partition) -- test seam (also
+    /// usable by recovery code that needs to reopen + replay the file).
+    [[nodiscard]] std::string deltaFilePathForTest(int32_t viewTopicId, int32_t partition) const;
+
+    /// Test-only failure injection: force the NEXT write to this key's file
+    /// to fail deterministically (reopens its fd O_RDONLY, so ::write()
+    /// fails with EBADF) -- a portable stand-in for a real short/failed
+    /// write, without relying on an OS-specific partial-write race window.
+    /// Opens the file first (via fileFor_) if it doesn't exist yet.
+    void forceWriteFailureForTest(int32_t viewTopicId, int32_t partition);
+
+private:
+    struct Key {
+        int32_t viewTopicId;
+        int32_t partition;
+        bool operator==(const Key& o) const noexcept {
+            return viewTopicId == o.viewTopicId && partition == o.partition;
+        }
+    };
+    struct KeyHash {
+        size_t operator()(const Key& k) const noexcept {
+            return (static_cast<size_t>(static_cast<uint32_t>(k.viewTopicId)) << 32) ^
+                   static_cast<size_t>(static_cast<uint32_t>(k.partition));
+        }
+    };
+    // IO-thread-owned per-(view,partition) file state. No atomics: this
+    // agent is the sole reader/writer of every FileState, always from the
+    // same AgentRunner thread (shared-nothing -- see file header).
+    struct FileState {
+        int     fd              = -1;
+        int64_t pendingO        = -1;  // highest O appended since the last fsync (-1 = none pending)
+        int64_t lastDurableO    = -1;  // highest O CONFIRMED fdatasync'd
+        bool    dirtySinceSync  = false;
+        bool    errored         = false; // FATAL write error: stream stopped (see hasError())
+        int     channelIdx      = 0;    // Task 19: which channel this (view,part) arrived on
+    };
+
+    void handleDeltaFrame_(const uint8_t* p, std::size_t len, int channelIdx);
+    // Returns nullptr on an ::open() failure -- NOT cached in files_, so the
+    // next call for the same key retries open() (review-round-1 fix: a
+    // transient failure must never permanently blackhole a key).
+    FileState* fileFor_(const Key& key);
+    std::string deltaFilePath_(const Key& key) const;
+    void flushDue_(int64_t nowNs, bool idle);
+    void postDone_(int32_t viewTopicId, int32_t partition, int64_t O, int channelIdx);
+    void drainPendingAcks_();
+
+    std::vector<ViewSnapshotChannel*> channels_;   // Task 19: one or more worker channels
+    std::string          viewDataDir_;
+    int64_t              fsyncMs_;
+    int64_t              lastFsyncNs_   = 0;
+    int64_t              openFailures_  = 0; // running total across every key (see openFailureCount())
+
+    std::unordered_map<Key, FileState, KeyHash> files_;
+
+    // A `done` ack the ring was too full to accept last cycle; retried next
+    // cycle before any new acks (never lost, never reordered ahead of a
+    // newer ack for the SAME key since flushDue_ only ever queues the
+    // latest durable O per key per pass).
+    struct PendingAck { int32_t viewTopicId; int32_t partition; int64_t O; int channelIdx; };
+    std::vector<PendingAck> pendingAcks_;
+};
+
+} // namespace rune::node

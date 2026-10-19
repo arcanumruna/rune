@@ -1,0 +1,410 @@
+"""E5 per-worker ingress e2e tests — REAL client + REAL broker containers.
+
+These tests guard the metadata-gating fix landed in 7d087e7:
+  "advertise ingressStreamId=0 (default gateway stream) unless
+   perWorkerIngressActive_ is set."
+
+Root-cause recap: before the fix, the broker advertised
+  PartitionEntry.ingressStreamId = base + workerForPartition(...)
+unconditionally.  With perWorkerIngress OFF (the default), there is no
+subscriber on that per-worker stream — only the gateway on clientStreamId.
+So the client routed produce to a dead stream → NOT_CONNECTED → ~5 s timeout
+→ inconsistent/dropped sends.  The in-process tests missed it because they
+forced the flag ON and hand-created subs — exactly the shortcut this file avoids.
+
+Test matrix (incremental — get A green first, then add the rest):
+  A. Default config (flag OFF): cluster with NO per-worker env vars.
+     Produce 500 records (acks=all) on the events topic; assert all delivered.
+     → Directly proves the fix: before 7d087e7 this would produce losses.
+  B. Per-worker ingress ON (flag=true, 2 workers): same 500-record produce;
+     assert all delivered.  Exercises the ON path end-to-end.
+  C. Multi-partition routing (flag ON, 4 workers, 4-partition cg topic):
+     produce across cg topic with 4 partitions; assert all delivered.
+  D. DEDICATED Aeron threading (flag ON, 2 workers, RUNE_AERON_THREADING_MODE=dedicated):
+     produce on events topic; assert all delivered.
+
+Harness conventions followed:
+  - function-scoped fixtures only (each test gets its own cluster): the env
+    overrides differ between tests so a session cluster would require down/up
+    churn anyway; function-scoped is cleaner and matches the fault-test pattern.
+  - Compose override pattern from test_compaction_e2e.py (_write_compose_override).
+  - CID base: 3_000_000 + n*5000 — fully disjoint from DR-1..15 (≤1.6M),
+    compaction suite (2M+), and harness warm-up window (990k-1M).
+  - REAL path: no mocked flags, no forced-subs shortcuts.  Tests produce via
+    the real rune-dr-client image against real broker containers.
+
+Markers:
+  - @pytest.mark.perworker  : the whole module
+"""
+
+from __future__ import annotations
+
+import os
+import tempfile
+import textwrap
+from typing import Iterator
+
+import pytest
+from harness.driver import DRAIN_QUIET_MS
+
+from harness import faults
+from harness.cluster import Cluster
+from harness.driver import run_clients
+from harness.invariants import (
+    assert_exactly_once,
+    assert_no_committed_loss,
+    assert_per_key_ordering,
+    assert_single_leader,
+)
+
+# ---------------------------------------------------------------------------
+# Module marker
+# ---------------------------------------------------------------------------
+pytestmark = pytest.mark.perworker
+
+# ---------------------------------------------------------------------------
+# CID base — disjoint from all existing suites.
+# ---------------------------------------------------------------------------
+_CID_STRIDE = 5000
+_run_counter = {"n": 0}
+
+
+def _next_cid_base() -> int:
+    _run_counter["n"] += 1
+    return 3_000_000 + _run_counter["n"] * _CID_STRIDE
+
+
+# ---------------------------------------------------------------------------
+# Timing constants
+# ---------------------------------------------------------------------------
+_CONNECT_MS = 40_000
+_STAGGER_MS  = 400
+
+# Client-side topic tables (name:topicId:partitions).
+# Must match the topics Cluster.up creates by DDL (DEFAULT_TOPICS: events:1,
+# multi:3, cg:4) → topicId is the zero-based creation order.
+_TOPICS_EVENTS = "events:0:1"   # topicId=0, 1 partition
+_TOPICS_CG     = "cg:2:4"      # topicId=2, 4 partitions
+
+
+# ---------------------------------------------------------------------------
+# Compose override factory
+#
+# Produces a per-test override YAML that injects per-worker-ingress env vars
+# on all three broker nodes without touching docker-compose.yml.
+# ---------------------------------------------------------------------------
+
+def _write_pwi_override(
+    tmp_dir: str,
+    *,
+    per_worker_ingress: bool,
+    workers: int = 2,
+    threading_mode: str | None = None,
+) -> str:
+    """Write a compose override that sets per-worker-ingress env on all nodes.
+
+    per_worker_ingress=True  → RUNE_PER_WORKER_INGRESS=true + RUNE_WORKERS=<workers>
+    per_worker_ingress=False → no RUNE_PER_WORKER_INGRESS var (default OFF)
+    threading_mode           → RUNE_AERON_THREADING_MODE if provided
+    """
+    env_lines: list[str] = []
+    if per_worker_ingress:
+        env_lines.append(f'              RUNE_PER_WORKER_INGRESS: "true"')
+        env_lines.append(f'              RUNE_WORKERS: "{workers}"')
+    if threading_mode is not None:
+        env_lines.append(f'              RUNE_AERON_THREADING_MODE: "{threading_mode}"')
+
+    env_block = "\n".join(env_lines)
+
+    override = textwrap.dedent(f"""\
+        # Per-worker-ingress compose override — generated by test_per_worker_ingress.py
+        services:
+          rune-1:
+            environment:
+{env_block}
+          rune-2:
+            environment:
+{env_block}
+          rune-3:
+            environment:
+{env_block}
+    """)
+
+    path = os.path.join(tmp_dir, "docker-compose.pwi-override.yml")
+    with open(path, "w") as f:
+        f.write(override)
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Cluster fixtures
+# ---------------------------------------------------------------------------
+
+def _build_flag() -> bool:
+    return os.environ.get("DR_E2E_BUILD", "0") == "1"
+
+
+@pytest.fixture
+def default_cluster() -> Iterator[Cluster]:
+    """Function-scoped cluster — DEFAULT broker config (no per-worker env vars).
+
+    This is the critical fixture for test A: it exercises the exact default
+    path that was broken before 7d087e7.
+    """
+    # global_overlays=False: this arm must stay the TRUE default config even when
+    # the matrix runs with a global overlay (e.g. the shard overlay).
+    c = Cluster(project="rune-dr-pwi-default", global_overlays=False)
+    try:
+        c.up(build=_build_flag(), leader_timeout=120)
+        c.wait_data_plane_ready(max_attempts=10, timeout_s=180)
+        yield c
+    finally:
+        faults.heal_all(c)
+        c.down()
+
+
+@pytest.fixture
+def pwi_on_cluster() -> Iterator[Cluster]:
+    """Function-scoped cluster with RUNE_PER_WORKER_INGRESS=true, 2 workers."""
+    tmp = tempfile.mkdtemp(prefix="rune_pwi_e2e_on_")
+    override = _write_pwi_override(tmp, per_worker_ingress=True, workers=2)
+    c = Cluster(project="rune-dr-pwi-on", override_files=[override])
+    try:
+        c.up(build=_build_flag(), leader_timeout=120)
+        c.wait_data_plane_ready(max_attempts=10, timeout_s=180)
+        yield c
+    finally:
+        faults.heal_all(c)
+        c.down()
+        try:
+            os.remove(override)
+            os.rmdir(tmp)
+        except OSError:
+            pass
+
+
+@pytest.fixture
+def pwi_multipart_cluster() -> Iterator[Cluster]:
+    """Function-scoped cluster with per-worker ingress ON and 4 workers.
+
+    Uses 4 workers to match the cg topic's 4 partitions (worker per partition).
+    """
+    tmp = tempfile.mkdtemp(prefix="rune_pwi_e2e_mp_")
+    override = _write_pwi_override(tmp, per_worker_ingress=True, workers=4)
+    c = Cluster(project="rune-dr-pwi-mp", override_files=[override])
+    try:
+        c.up(build=_build_flag(), leader_timeout=120)
+        c.wait_data_plane_ready(max_attempts=10, timeout_s=180,
+                                topics=_TOPICS_CG)
+        yield c
+    finally:
+        faults.heal_all(c)
+        c.down()
+        try:
+            os.remove(override)
+            os.rmdir(tmp)
+        except OSError:
+            pass
+
+
+@pytest.fixture
+def pwi_dedicated_cluster() -> Iterator[Cluster]:
+    """Function-scoped cluster with per-worker ingress ON + DEDICATED threading."""
+    tmp = tempfile.mkdtemp(prefix="rune_pwi_e2e_ded_")
+    override = _write_pwi_override(
+        tmp, per_worker_ingress=True, workers=2, threading_mode="dedicated"
+    )
+    c = Cluster(project="rune-dr-pwi-ded", override_files=[override])
+    try:
+        c.up(build=_build_flag(), leader_timeout=120)
+        c.wait_data_plane_ready(max_attempts=10, timeout_s=180)
+        yield c
+    finally:
+        faults.heal_all(c)
+        c.down()
+        try:
+            os.remove(override)
+            os.rmdir(tmp)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Shared produce-and-assert helper
+# ---------------------------------------------------------------------------
+
+def _produce_and_assert_all_delivered(
+    cluster: Cluster,
+    *,
+    records: int,
+    keys: int,
+    topics: str = _TOPICS_EVENTS,
+    sub_partitions: int = 1,
+) -> None:
+    """Produce `records` records (acks=all) and assert every one is delivered.
+
+    This is the core correctness check: the client routes produce through the
+    REAL metadata-advertised ingressStreamId, so any metadata-gating bug
+    (like the one fixed in 7d087e7) would surface here as losses.
+    """
+    cid_base = _next_cid_base()
+    _, leader_svc = cluster.identify_leader()
+    assert_single_leader(cluster)
+
+    # Produce with acks=all (majority-durable) so every PRODUCED line is a
+    # committed record that MUST appear in the delivered set.
+    produce_results = run_clients(
+        1,
+        network=cluster.compose.network_name(),
+        target_service=leader_svc,
+        cid_base=cid_base,
+        timeout_s=180,
+        mode="produce",
+        topics=topics,
+        records=records,
+        keys=keys,
+        acks="all",
+        timeout_ms=_CONNECT_MS,
+        connect_retries=0,
+        start_stagger_ms=_STAGGER_MS,
+    )
+    assert produce_results.ok, (
+        "produce failed — client exited non-zero:\n"
+        + "\n".join(
+            f"[cid={c.cid} exit={c.exit_code} rc={c.rc}]\n{c.raw[-1500:]}"
+            for c in produce_results.clients
+            if c.exit_code != 0 or c.rc != 0
+        )
+    )
+    assert len(produce_results.all_produced) == records, (
+        f"produced {len(produce_results.all_produced)} != expected {records}\n"
+        f"raw tail:\n{produce_results.clients[0].raw[-800:]}"
+    )
+
+    # Subscribe from earliest and assert all committed records come back.
+    cid_sub = _next_cid_base()
+    sub_results = run_clients(
+        1,
+        network=cluster.compose.network_name(),
+        target_service=leader_svc,
+        cid_base=cid_sub,
+        timeout_s=180,
+        mode="subscribe",
+        topics=topics,
+        sub_partitions=sub_partitions,
+        sub_partition_base=0,
+        keys=1,
+        expect=0,   # drain window; let assert_no_committed_loss do the count
+        from_="earliest",
+        subscribe_ms=60_000,
+        drain_quiet_ms=DRAIN_QUIET_MS,   # post-workload read of a static log: stop once complete (driver._drain_complete)
+        timeout_ms=_CONNECT_MS,
+        start_stagger_ms=_STAGGER_MS,
+    )
+    assert sub_results.ok, (
+        "subscribe failed — client exited non-zero:\n"
+        + "\n".join(
+            f"[cid={c.cid} exit={c.exit_code} rc={c.rc}]\n{c.raw[-1500:]}"
+            for c in sub_results.clients
+            if c.exit_code != 0 or c.rc != 0
+        )
+    )
+
+    # Merge produce + subscribe into a single Results for the invariant checks.
+    # assert_no_committed_loss works on results.all_produced vs results.all_delivered
+    # so we build a combined view: produced comes from produce_results, delivered
+    # comes from sub_results.
+    from harness.driver import Results
+    combined = Results()
+    combined.clients = produce_results.clients + sub_results.clients
+
+    assert_per_key_ordering(combined)
+    assert_no_committed_loss(combined)
+    assert_single_leader(cluster)
+
+
+# ---------------------------------------------------------------------------
+# Test A — default config (per-worker ingress OFF by default)
+#
+# This is the KEY test: it proves the 7d087e7 fix works.  Before the fix the
+# broker advertised ingressStreamId = base+worker even with perWorkerIngress
+# OFF → client routed to a dead stream → NOT_CONNECTED → losses.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.timeout(600)
+def test_A_default_config_produce_consistency(default_cluster):
+    """Default broker config (no per-worker env): all 500 records delivered.
+
+    Proves 7d087e7: ingressStreamId=0 advertised when flag is OFF → client
+    uses the default gateway stream → no dead-stream routing → no losses.
+    """
+    _produce_and_assert_all_delivered(
+        default_cluster,
+        records=500,
+        keys=4,
+        topics=_TOPICS_EVENTS,
+        sub_partitions=1,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test B — per-worker ingress ON, 2 workers
+# ---------------------------------------------------------------------------
+
+@pytest.mark.timeout(600)
+def test_B_per_worker_ingress_on(pwi_on_cluster):
+    """Per-worker ingress ON (2 workers): all 500 records delivered.
+
+    Exercises the per-worker path end-to-end: broker advertises per-worker
+    ingressStreamId when the flag is active; client routes correctly to the
+    owning worker's stream; all records committed and delivered.
+    """
+    _produce_and_assert_all_delivered(
+        pwi_on_cluster,
+        records=500,
+        keys=4,
+        topics=_TOPICS_EVENTS,
+        sub_partitions=1,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test C — multi-partition routing with per-worker ingress ON
+# ---------------------------------------------------------------------------
+
+@pytest.mark.timeout(600)
+def test_C_multipartition_routing(pwi_multipart_cluster):
+    """Per-worker ingress ON, 4 workers, 4-partition cg topic: all 500 delivered.
+
+    Exercises the partition→worker→stream routing table with multiple
+    partitions.  A routing bug (wrong worker assignment, stale stream table)
+    would surface as losses on some partitions.
+    """
+    _produce_and_assert_all_delivered(
+        pwi_multipart_cluster,
+        records=500,
+        keys=8,            # 8 keys over 4 partitions so all partitions get records
+        topics=_TOPICS_CG,
+        sub_partitions=4,  # subscribe to all 4 cg partitions
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test D — DEDICATED Aeron threading mode with per-worker ingress ON
+# ---------------------------------------------------------------------------
+
+@pytest.mark.timeout(600)
+def test_D_dedicated_threading_mode(pwi_dedicated_cluster):
+    """Per-worker ingress ON + RUNE_AERON_THREADING_MODE=dedicated: all 500 delivered.
+
+    The DEDICATED mode allocates separate conductor/sender/receiver threads
+    for Aeron.  Combined with per-worker ingress this is the highest-throughput
+    configuration; correctness must be identical to SHARED mode.
+    """
+    _produce_and_assert_all_delivered(
+        pwi_dedicated_cluster,
+        records=500,
+        keys=4,
+        topics=_TOPICS_EVENTS,
+        sub_partitions=1,
+    )

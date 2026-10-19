@@ -1,0 +1,679 @@
+#pragma once
+// ---------------------------------------------------------------------------
+// DrHarness.h — E2 / DUR-1: fast, deterministic, in-process disaster-recovery
+// harness for the replication data plane.
+//
+// What is REAL:  rune::storage::Log (files on disk, recover(), truncateTo),
+//                PartitionReplica (leader/follower, ISR, HW, KIP-101 probe,
+//                DR-BUG-6 completeness gate + reverse reconcile, epoch fencing),
+//                ProducerStateManager (rebuild from the log after a crash),
+//                FailoverElection (the controller's production election rule).
+// What is MODELLED (and how):
+//   * The network: one in-process message queue between per-node transport
+//     endpoints.  Faults: cut a directed link (frames lost on the wire, like
+//     UDP loss — the sender still sees "accepted"), isolate a node, drop the
+//     next N frames of a kind, uniform delivery delay in steps.  A crashed node
+//     loses every frame in flight to or from it (its Aeron images die with it).
+//   * The control plane: a tiny controller holding {leader, epoch, isr} that
+//     elects with the REAL rune::metadata::FailoverElection over an omniscient
+//     ReplicaPositionTable (every live replica's positionReport()).  Controller
+//     ISR semantics follow DynamicBalancer: the ISR only changes on a leader
+//     change (failover: elected ∪ (isr ∩ live)).
+//   * The produce path: the leader appends exactly as a worker does —
+//     Log::appendNoSyncRestamp (page cache, no fsync; A3 default: periodic
+//     fsync OFF) + PartitionReplica::onLeaderLogAppended(); an acks=all produce
+//     is refused below min-ISR and ACKED once the leader's served HW passes it
+//     while the same leader incarnation + epoch still leads (else it fails —
+//     never acked).
+//   * Crashes: CrashKind::ProcessKill — the process dies, the page cache (every
+//     pwrite) survives.  CrashKind::PowerLoss — everything not fsynced is lost:
+//     each segment .log is truncated to its durable extent (the max of what an
+//     inline sync made durable in any incarnation — Log::syncedExtentsForTest —
+//     and what survived the previous power loss).  PowerLossTorn additionally
+//     leaves a torn partial batch (the first bytes of the lost region) at the
+//     tail.  The leader-epoch checkpoint is written tmp+fsync+rename and so
+//     always survives.
+//   * Time: an injected clock advanced 1 ms per step; every drive loop is
+//     bounded and returns false on a stall.  No sleeps, no threads.
+//
+// "Kill-all" in this harness = ProcessKill of every node: page caches survive,
+// so every acks=all-acked record (on a majority's page cache) must survive.  A
+// simultaneous POWER LOSS of all nodes is outside the guarantee (periodic fsync
+// is off by default; durability comes from replication — the Kafka model).
+// ---------------------------------------------------------------------------
+
+#include <gtest/gtest.h>
+
+#include <rune/replication/PartitionReplica.h>
+#include <rune/metadata/FailoverElection.h>
+#include <rune/metadata/ReplicaPositionTable.h>
+#include <rune/protocol/RecordBatch.h>
+#include <rune/storage/Log.h>
+#include <rune/storage/ProducerStateManager.h>
+#include <rune/storage/ProducePath.h>
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <cstring>
+#include <deque>
+#include <filesystem>
+#include <functional>
+#include <map>
+#include <memory>
+#include <optional>
+#include <set>
+#include <string>
+#include <unistd.h>
+#include <vector>
+
+namespace rune::replication::dr {
+
+using rune::storage::Log;
+
+inline constexpr int64_t kStepNs   = 1'000'000LL;   // 1 ms per step
+inline constexpr int     kTopicId  = 7;
+inline constexpr int     kPartId   = 0;
+
+enum class CrashKind : uint8_t { ProcessKill, PowerLoss, PowerLossTorn };
+
+struct DrConfig {
+    int     minIsr                  = 2;
+    int64_t replicaLagMaxMs         = 50;
+    int64_t fetchIntervalNs         = kStepNs;
+    int64_t isrCheckIntervalNs      = kStepNs;
+    int64_t followerFlushIntervalNs = 0;            // A3 default: OFF
+    int64_t segmentRollBytes        = 64LL * 1024 * 1024;
+    int     deliveryDelaySteps      = 0;            // extra steps a frame spends on the wire
+    /// Production seal mode (worker-driven replicas: setExternalFollowerFlush →
+    /// Log::setDeferSealSync): a roll queues the seal fsync for the owning
+    /// worker's io backend.  The harness never completes it, so a sealed segment
+    /// is NOT durable until then (worst case for a power loss).
+    bool    deferSealSync           = false;
+};
+
+// ---------------------------------------------------------------------------
+// Network frames
+// ---------------------------------------------------------------------------
+enum class Kind : uint8_t { FetchReq, FetchResp, EpochReq, EpochResp, ReconReq, ReconResp };
+
+struct Frame {
+    Kind     kind{};
+    NodeId   from = -1;
+    NodeId   to   = -1;
+    uint64_t due  = 0;
+    FetchRequestMsg              freq{};
+    FetchResponseMsg             fresp{};
+    std::vector<uint8_t>         recs;     // owns fresp.records
+    OffsetsForLeaderEpochReqMsg  ereq{};
+    OffsetsForLeaderEpochRespMsg eresp{};
+};
+
+class DrCluster;
+
+/// One per node (as in production: a node's replica talks through its node's
+/// transport).  Generic kind → virtual dispatch, test fakes only.
+class DrEndpoint final : public PartitionTransport {
+public:
+    DrEndpoint(DrCluster* c, NodeId self) : c_(c), self_(self) {}
+    bool sendFetchRequest(const FetchRequestMsg&) override { return true; }   // leader unknown: lost
+    bool sendFetchRequestTo(NodeId leader, const FetchRequestMsg& req) override;
+    bool sendFetchResponse(NodeId to, const FetchResponseMsg& resp) override;
+    bool sendOffsetsForLeaderEpochRequest(NodeId to, const OffsetsForLeaderEpochReqMsg& m) override;
+    bool sendOffsetsForLeaderEpochResponse(NodeId to, const OffsetsForLeaderEpochRespMsg& m) override;
+    bool sendReconcileRequest(NodeId to, const FetchRequestMsg& m) override;
+    bool sendReconcileResponse(NodeId to, const FetchResponseMsg& m) override;
+private:
+    DrCluster* c_;
+    NodeId     self_;
+};
+
+struct DrNode {
+    NodeId                            id = -1;
+    std::string                       dir;
+    std::unique_ptr<Log>              log;
+    std::unique_ptr<DrEndpoint>       ep;
+    std::unique_ptr<PartitionReplica> rep;
+    bool                              up = false;
+    uint32_t                          incarnation = 0;
+    std::map<std::string, int64_t>    durableFloor;   // .log path → bytes known durable
+};
+
+/// A produce the harness issued (acks=all), and what became of it.
+struct Pending {
+    uint64_t id;
+    Offset   offset;
+    NodeId   leader;
+    Epoch    epoch;
+    uint32_t incarnation;
+};
+
+struct IdemResult {
+    enum class Status : uint8_t { Appended, Duplicate, OutOfOrder, Fenced, Refused };
+    Status status = Status::Refused;
+    Offset offset = -1;
+};
+
+inline std::string drUniq() {
+    static std::atomic<uint64_t> seq{0};
+    return std::to_string(::getpid()) + "_" + std::to_string(seq.fetch_add(1)) + "_" +
+           std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+}
+
+class DrCluster {
+public:
+    explicit DrCluster(int n, DrConfig cfg = {}) : cfg_(cfg) {
+        root_ = (std::filesystem::temp_directory_path() / ("rune_dr_" + drUniq())).string();
+        std::filesystem::create_directories(root_);
+        for (int i = 1; i <= n; ++i) replicas_.push_back(i);
+        nodes_.resize(static_cast<std::size_t>(n));
+        for (int i = 0; i < n; ++i) {
+            nodes_[i].id  = i + 1;
+            nodes_[i].dir = root_ + "/n" + std::to_string(i + 1);
+            std::filesystem::create_directories(nodes_[i].dir);
+        }
+    }
+    ~DrCluster() {
+        for (auto& n : nodes_) { n.rep.reset(); n.ep.reset(); n.log.reset(); }
+        std::error_code ec;
+        std::filesystem::remove_all(root_, ec);
+    }
+    DrCluster(const DrCluster&) = delete;
+    DrCluster& operator=(const DrCluster&) = delete;
+
+    // ---------------------------------------------------------------- lifecycle
+    /// Boot every node (production order: replica built as Follower@0, then
+    /// the metadata bridge applies the assignment) with `leader` at epoch 1.
+    void start(NodeId leader = 1) {
+        for (auto& n : nodes_) open_(n);
+        meta_.leader = leader;
+        meta_.epoch  = 1;
+        meta_.isr    = replicas_;
+        for (auto& n : nodes_) applyMetadata(n.id);
+    }
+
+    void crash(NodeId id, CrashKind kind, std::size_t tornBytes = 9) {
+        DrNode& n = node(id);
+        ASSERT_TRUE(n.up) << "crash of a node that is down";
+        const auto ext = n.log->syncedExtentsForTest();
+        n.rep.reset(); n.ep.reset(); n.log.reset();
+        n.up = false;
+        purge_(id);
+        for (const auto& e : ext)
+            if (e.syncedBytes > n.durableFloor[e.logPath]) n.durableFloor[e.logPath] = e.syncedBytes;
+        if (kind == CrashKind::ProcessKill) return;   // page cache survives
+        for (auto& f : std::filesystem::directory_iterator(n.dir)) {
+            if (f.path().extension() != ".log") continue;
+            const std::string p = f.path().string();
+            const auto size = static_cast<int64_t>(std::filesystem::file_size(p));
+            const auto it = n.durableFloor.find(p);
+            const int64_t keep = std::min<int64_t>(size, it == n.durableFloor.end() ? 0 : it->second);
+            int64_t newSize = keep;
+            if (kind == CrashKind::PowerLossTorn && size > keep)
+                newSize = std::min<int64_t>(size, keep + static_cast<int64_t>(tornBytes));
+            std::filesystem::resize_file(p, static_cast<uintmax_t>(newSize));
+            n.durableFloor[p] = keep;
+        }
+        lostOnPowerLoss_ = true;
+    }
+
+    /// Restart a crashed node: recover its log from disk and build a fresh
+    /// replica (Follower@0) — the control plane applies metadata separately.
+    void restart(NodeId id) {
+        DrNode& n = node(id);
+        ASSERT_FALSE(n.up);
+        open_(n);
+    }
+
+    /// The metadata bridge: (re)apply the current assignment to node `id`.
+    void applyMetadata(NodeId id) {
+        DrNode& n = node(id);
+        if (!n.up) return;
+        if (meta_.leader == id) {
+            n.rep->becomeLeader(meta_.epoch, meta_.isr);
+        } else if (meta_.leader >= 0) {
+            n.rep->becomeFollower(meta_.epoch, meta_.leader);
+        }
+    }
+
+    /// Controller failover: elect with the production FailoverElection over
+    /// (isr ∩ live) and the replicas' positions; bump the epoch and push the
+    /// assignment to every live node.  Returns the new leader (-1 = none).
+    /// `unreachable`: live nodes the controller cannot see (lost heartbeat) —
+    /// neither candidates nor told about the new assignment.
+    NodeId failover(std::initializer_list<NodeId> unreachable = {}) {
+        auto reachable = [&](NodeId id) {
+            return std::find(unreachable.begin(), unreachable.end(), id) == unreachable.end();
+        };
+        rune::metadata::ReplicaPositionTable pos;
+        std::vector<int32_t> live;
+        for (auto& n : nodes_) {
+            if (!n.up || !reachable(n.id)) continue;
+            live.push_back(n.id);
+            auto r = n.rep->positionReport();
+            r.topicId = kTopicId; r.partition = kPartId;
+            pos.report(r);
+        }
+        rune::metadata::ElectionInputs in;
+        in.cur.leaderNode     = rune::metadata::NO_LEADER;
+        in.cur.isr            = meta_.isr;
+        in.cur.replicas       = replicas_;
+        in.cur.leaderEpoch    = static_cast<int32_t>(meta_.epoch);
+        in.cur.partitionEpoch = 0;
+        in.liveNodes          = live;
+        in.positions          = &pos;
+        const auto out = rune::metadata::FailoverElection::elect(kTopicId, kPartId, in);
+        ++meta_.epoch;
+        if (out.change.newLeader == rune::metadata::NO_LEADER ||
+            out.change.newLeader == rune::metadata::NO_LEADER_CHANGE) {
+            meta_.leader = -1;
+            return -1;
+        }
+        meta_.leader = out.change.newLeader;
+        meta_.isr.assign(out.change.newIsr.begin(), out.change.newIsr.end());
+        for (auto& n : nodes_) if (reachable(n.id)) applyMetadata(n.id);
+        return meta_.leader;
+    }
+
+    /// Controller: hand leadership to `id` explicitly (preferred-leader move /
+    /// operator action), epoch+1, ISR unchanged.
+    void moveLeader(NodeId id) {
+        ++meta_.epoch;
+        meta_.leader = id;
+        if (std::find(meta_.isr.begin(), meta_.isr.end(), id) == meta_.isr.end())
+            meta_.isr.insert(meta_.isr.begin(), id);
+        for (auto& n : nodes_) applyMetadata(n.id);
+    }
+
+    // ---------------------------------------------------------------- driving
+    void step() {
+        ++step_;
+        clock_ += kStepNs;
+        for (auto& n : nodes_) if (n.up) n.rep->doWork(clock_);
+        deliver_();
+        settleAcks_();
+    }
+    void run(int steps) { for (int i = 0; i < steps; ++i) step(); }
+    bool driveUntil(const std::function<bool()>& done, int cap = 2000) {
+        for (int i = 0; i < cap && !done(); ++i) step();
+        return done();
+    }
+
+    // ---------------------------------------------------------------- network faults
+    void cut(NodeId a, NodeId b)     { cut_.insert({a, b}); }
+    void cutBoth(NodeId a, NodeId b) { cut(a, b); cut(b, a); }
+    void heal(NodeId a, NodeId b)    { cut_.erase({a, b}); cut_.erase({b, a}); }
+    void isolate(NodeId a)  { for (NodeId r : replicas_) if (r != a) cutBoth(a, r); }
+    void healAll()          { cut_.clear(); }
+    void dropNext(Kind k, int count) { dropNext_[static_cast<int>(k)] += count; }
+    uint64_t framesLost() const noexcept { return framesLost_; }
+
+    // ---------------------------------------------------------------- produce
+    /// acks=all produce of `count` single-record batches on the current
+    /// leader (production worker path).  Returns how many were APPENDED
+    /// (a refusal — no leader / incomplete / below min-ISR — stops early).
+    int produce(int count) {
+        int appended = 0;
+        for (int i = 0; i < count; ++i) {
+            if (!appendOne_(nextId_, /*pid*/-1, 0, -1).isOK()) break;
+            ++nextId_;
+            ++appended;
+        }
+        return appended;
+    }
+    /// Produce and drive until every one of them is acked (or failed).
+    int produceAcked(int count, int cap = 2000) {
+        EXPECT_TRUE(waitWritable(cap)) << "no writable leader";
+        const std::size_t before = acked_.size();
+        const int n = produce(count);
+        EXPECT_EQ(n, count) << "produce refused";
+        EXPECT_TRUE(driveUntil([&] { return pending_.empty(); }, cap)) << "acks did not settle";
+        return static_cast<int>(acked_.size() - before);
+    }
+
+    /// Drive until the controller's leader is up, Leader-role, complete and
+    /// its ISR meets min-ISR (a client would retry until then).
+    bool waitWritable(int cap = 2000) {
+        return driveUntil([&] {
+            DrNode* L = leaderNode_();
+            return L != nullptr && L->rep->acceptsProduce() &&
+                   static_cast<int>(L->rep->isr().size()) >= L->rep->minIsr();
+        }, cap);
+    }
+
+    /// Idempotent produce of ONE batch (pid, producerEpoch, seq) — validated
+    /// against the leader's producer state (rebuilt from the log on every
+    /// leadership / log-generation change, as the worker does).
+    IdemResult produceIdempotent(int64_t pid, int16_t pepoch, int32_t seq, uint64_t id) {
+        IdemResult r;
+        const auto o = appendOne_(id, pid, pepoch, seq);
+        if (o.isDuplicate) { r.status = IdemResult::Status::Duplicate; r.offset = o.baseOffset; return r; }
+        if (!o.isOK()) {
+            using EC = rune::protocol::client::ErrorCode;
+            if (o.error == EC::OutOfOrderSequence)   r.status = IdemResult::Status::OutOfOrder;
+            else if (o.error == EC::InvalidProducerEpoch) r.status = IdemResult::Status::Fenced;
+            return r;
+        }
+        r.status = IdemResult::Status::Appended;
+        r.offset = o.baseOffset;
+        return r;
+    }
+
+    // ---------------------------------------------------------------- inspection
+    DrNode& node(NodeId id) { return nodes_.at(static_cast<std::size_t>(id - 1)); }
+    PartitionReplica& rep(NodeId id) { return *node(id).rep; }
+    bool up(NodeId id) { return node(id).up; }
+    NodeId leader() const noexcept { return meta_.leader; }
+    Epoch  epoch()  const noexcept { return meta_.epoch; }
+    const std::vector<NodeId>& controllerIsr() const noexcept { return meta_.isr; }
+    const std::set<uint64_t>& acked() const noexcept { return acked_; }
+    std::size_t pendingCount() const noexcept { return pending_.size(); }
+    std::size_t failedCount() const noexcept { return failed_; }
+    int64_t clock() const noexcept { return clock_; }
+
+    /// Record ids in node `id`'s log in offset order (whole log, not HW-bounded).
+    std::vector<uint64_t> ids(NodeId id) {
+        std::vector<uint64_t> out;
+        DrNode& n = node(id);
+        if (!n.up) return out;
+        Offset at = n.log->logStartOffset();
+        const Offset leo = n.log->logEndOffset();
+        for (int guard = 0; at < leo && guard < 100000; ++guard) {
+            const auto bytes = n.log->read(at, 1 << 20);
+            if (bytes.empty()) break;
+            std::size_t pos = 0;
+            Offset next = at;
+            while (pos + rune::protocol::batch::kRecordBatchOverhead <= bytes.size()) {
+                rune::protocol::RecordBatchReader r(bytes.data() + pos, bytes.size() - pos);
+                const int32_t total = r.totalLength();
+                if (total <= 0 || pos + static_cast<std::size_t>(total) > bytes.size()) break;
+                r.forEach([&](std::string_view, std::string_view v, int64_t, int64_t) {
+                    uint64_t x = 0;
+                    if (v.size() == sizeof x) std::memcpy(&x, v.data(), sizeof x);
+                    out.push_back(x);
+                });
+                next = r.baseOffset() + r.lastOffsetDelta() + 1;
+                pos += static_cast<std::size_t>(total);
+            }
+            if (next <= at) break;
+            at = next;
+        }
+        return out;
+    }
+
+    /// Every acked id is present EXACTLY ONCE on node `id`.
+    void expectAckedPresent(NodeId id, const char* where = "") {
+        const auto v = ids(id);
+        std::map<uint64_t, int> count;
+        for (uint64_t x : v) ++count[x];
+        int missing = 0, dup = 0;
+        uint64_t firstMissing = 0;
+        for (uint64_t a : acked_) {
+            const auto it = count.find(a);
+            if (it == count.end()) { if (missing++ == 0) firstMissing = a; }
+            else if (it->second > 1) ++dup;
+        }
+        EXPECT_EQ(missing, 0) << where << ": node " << id << " lost " << missing
+                              << " ACKED records (first id " << firstMissing << ") of "
+                              << acked_.size() << "; log holds " << v.size();
+        EXPECT_EQ(dup, 0) << where << ": node " << id << " holds " << dup << " acked records twice";
+    }
+
+    /// No id appears twice on node `id`.
+    void expectNoDuplicates(NodeId id) {
+        const auto v = ids(id);
+        std::set<uint64_t> s(v.begin(), v.end());
+        EXPECT_EQ(s.size(), v.size()) << "node " << id << " holds duplicate records";
+    }
+
+    /// Every live replica holds the same records in the same order as the leader.
+    bool converged() {
+        DrNode* L = leaderNode_();
+        if (!L) return false;
+        const Offset leo = L->rep->logEndOffset();
+        for (auto& n : nodes_) {
+            if (!n.up || n.id == L->id) continue;
+            if (n.rep->logEndOffset() != leo) return false;
+        }
+        const auto ref = ids(L->id);
+        for (auto& n : nodes_) {
+            if (!n.up || n.id == L->id) continue;
+            if (ids(n.id) != ref) return false;
+        }
+        return true;
+    }
+
+    /// One line per node: role/epoch/LEO/HW/ISR + controller view (diagnostics).
+    std::string dump() {
+        std::string s = "controller{leader=" + std::to_string(meta_.leader) + " epoch=" +
+                         std::to_string(meta_.epoch) + " isr=";
+        for (NodeId i : meta_.isr) s += std::to_string(i) + ",";
+        s += "} acked=" + std::to_string(acked_.size()) + " failed=" + std::to_string(failed_) + "\n";
+        for (auto& n : nodes_) {
+            s += "  n" + std::to_string(n.id);
+            if (!n.up) { s += " DOWN\n"; continue; }
+            s += std::string(n.rep->role() == Role::Leader ? " L" : " F") +
+                 " ep=" + std::to_string(n.rep->epoch()) +
+                 " leo=" + std::to_string(n.rep->logEndOffset()) +
+                 " hw=" + std::to_string(n.rep->highWatermark()) +
+                 " complete=" + std::to_string(n.rep->isLeaderComplete()) +
+                 " cacheLatest=" + std::to_string(n.rep->leaderEpochCacheForTest().latestEpoch());
+            if (n.rep->role() == Role::Leader) {
+                s += " isr=";
+                for (NodeId i : n.rep->isr()) s += std::to_string(i) + ",";
+            }
+            s += "\n";
+        }
+        return s;
+    }
+
+    bool leaderIsrContains(NodeId member) {
+        DrNode* L = leaderNode_();
+        if (!L) return false;
+        const auto& isr = L->rep->isr();
+        return std::find(isr.begin(), isr.end(), member) != isr.end();
+    }
+
+    // Endpoint entry point.
+    /// Frames of `k` handed to the transport by node `from` (accepted or lost).
+    uint64_t sentBy(NodeId from, Kind k) const noexcept {
+        return sent_[static_cast<std::size_t>(from)][static_cast<int>(k)];
+    }
+
+    bool send(Frame&& f) {
+        const int k = static_cast<int>(f.kind);
+        if (f.from >= 0 && f.from < 8) ++sent_[static_cast<std::size_t>(f.from)][k];
+        if (dropNext_[k] > 0) { --dropNext_[k]; ++framesLost_; return true; }
+        if (cut_.count({f.from, f.to}) != 0) { ++framesLost_; return true; }   // lost on the wire
+        f.due = step_ + 1 + static_cast<uint64_t>(cfg_.deliveryDelaySteps);
+        wire_.push_back(std::move(f));
+        return true;
+    }
+
+private:
+    struct Meta {
+        NodeId              leader = -1;
+        Epoch               epoch  = 0;
+        std::vector<NodeId> isr;
+    };
+
+    PartitionConfig cfgFor_(NodeId id) const {
+        PartitionConfig c;
+        c.topicId                 = kTopicId;
+        c.partitionId             = kPartId;
+        c.selfId                  = id;
+        c.replicaLagMaxMs         = cfg_.replicaLagMaxMs;
+        c.replicaLagMaxOffset     = 10'000;
+        c.minIsr                  = cfg_.minIsr;
+        c.fetchIntervalNs         = cfg_.fetchIntervalNs;
+        c.isrCheckIntervalNs      = cfg_.isrCheckIntervalNs;
+        c.followerFlushIntervalNs = cfg_.followerFlushIntervalNs;
+        c.segmentRollBytes        = cfg_.segmentRollBytes;
+        c.maxFetchBytes           = 1;
+        return c;
+    }
+
+    void open_(DrNode& n) {
+        n.log = std::make_unique<Log>(n.dir, cfg_.segmentRollBytes);
+        n.log->recover();
+        if (cfg_.deferSealSync) n.log->setDeferSealSync(true);
+        n.ep  = std::make_unique<DrEndpoint>(this, n.id);
+        n.rep = std::make_unique<PartitionReplica>(cfgFor_(n.id), Role::Follower, /*epoch=*/0,
+                                                   replicas_, replicas_, n.log.get(), n.ep.get());
+        n.up = true;
+        ++n.incarnation;
+    }
+
+    DrNode* leaderNode_() {
+        if (meta_.leader < 0) return nullptr;
+        DrNode& L = node(meta_.leader);
+        if (!L.up || L.rep->role() != Role::Leader) return nullptr;
+        return &L;
+    }
+
+    /// The production produce path: the worker's role gate
+    /// (PartitionReplica::acceptsProduce — the SAME predicate Worker /
+    /// ClientGateway call) then the shared rune::storage::handleProduceBatch core
+    /// (min-ISR gate, PSM validate/update, page-cache append) and
+    /// onLeaderLogAppended().  The producer state is the leader's, rebuilt from
+    /// its log on every leadership / log-generation change (as the worker does).
+    rune::storage::ProduceOutcome appendOne_(uint64_t id, int64_t pid, int16_t pepoch, int32_t seq) {
+        rune::storage::ProduceOutcome refused;
+        refused.error = rune::protocol::client::ErrorCode::NotLeader;
+        DrNode* L = leaderNode_();
+        if (L == nullptr || !L->rep->acceptsProduce()) return refused;
+        ensurePsm_(*L);
+        rune::protocol::RecordBatchBuilder b(0, clock_ / 1'000'000);
+        if (pid >= 0) {
+            b.setProducerId(pid);
+            b.setProducerEpoch(pepoch);
+            b.setBaseSequence(seq);
+        }
+        char v[sizeof id];
+        std::memcpy(v, &id, sizeof id);
+        b.append(std::string_view{}, std::string_view(v, sizeof v), clock_ / 1'000'000);
+        const auto bytes = b.build();
+        const auto o = rune::storage::handleProduceBatch(
+            bytes.data(), bytes.size(), kTopicId, kPartId, pid, pepoch, seq, *L->log, psm_,
+            /*acksAll=*/true, static_cast<int>(L->rep->isr().size()), L->rep->minIsr(),
+            /*durabilityTier=*/1);
+        if (!o.isOK() || o.isDuplicate) return o;
+        L->rep->onLeaderLogAppended();
+        pending_.push_back(Pending{id, o.baseOffset, L->id, L->rep->epoch(), L->incarnation});
+        return o;
+    }
+
+    void settleAcks_() {
+        for (auto it = pending_.begin(); it != pending_.end();) {
+            DrNode& n = node(it->leader);
+            const bool same = n.up && n.incarnation == it->incarnation &&
+                              n.rep->role() == Role::Leader && n.rep->epoch() == it->epoch;
+            if (!same) { ++failed_; it = pending_.erase(it); continue; }
+            if (n.rep->highWatermark() > it->offset) {
+                acked_.insert(it->id);
+                it = pending_.erase(it);
+                continue;
+            }
+            ++it;
+        }
+    }
+
+    void ensurePsm_(DrNode& L) {
+        const uint64_t gen = (static_cast<uint64_t>(L.incarnation) << 48) ^
+                             (L.rep->leadershipGeneration() << 32) ^ L.rep->logGeneration() ^
+                             (static_cast<uint64_t>(L.id) << 56);
+        if (psmValid_ && psmGen_ == gen) return;
+        psm_.clearPartition(kTopicId, kPartId);
+        (void)psm_.rebuildFromLog(kTopicId, *L.log, L.log->logEndOffset(), kPartId);
+        psmGen_   = gen;
+        psmValid_ = true;
+    }
+
+    void purge_(NodeId id) {
+        for (auto it = wire_.begin(); it != wire_.end();) {
+            if (it->from == id || it->to == id) it = wire_.erase(it);
+            else ++it;
+        }
+    }
+
+    void deliver_() {
+        std::deque<Frame> now;
+        for (auto it = wire_.begin(); it != wire_.end();) {
+            if (it->due <= step_) { now.push_back(std::move(*it)); it = wire_.erase(it); }
+            else ++it;
+        }
+        for (auto& f : now) {
+            DrNode& n = node(f.to);
+            if (!n.up) continue;
+            PartitionReplica& r = *n.rep;
+            switch (f.kind) {
+                case Kind::FetchReq:  (void)r.onFetchRequest(f.freq, clock_); break;
+                case Kind::FetchResp:
+                    f.fresp.records = std::span<const uint8_t>(f.recs.data(), f.recs.size());
+                    r.applyReplicated(f.fresp); break;
+                case Kind::EpochReq:  r.onOffsetsForLeaderEpochRequest(f.ereq); break;
+                case Kind::EpochResp: r.applyOffsetsForLeaderEpochResponse(f.eresp); break;
+                case Kind::ReconReq:  r.onReconcileRequest(f.freq); break;
+                case Kind::ReconResp:
+                    f.fresp.records = std::span<const uint8_t>(f.recs.data(), f.recs.size());
+                    r.applyReconcileResponse(f.fresp); break;
+            }
+        }
+    }
+
+    DrConfig                cfg_;
+    std::string             root_;
+    std::vector<NodeId>     replicas_;
+    std::vector<DrNode>     nodes_;
+    Meta                    meta_;
+    std::deque<Frame>       wire_;
+    std::set<std::pair<NodeId, NodeId>> cut_;
+    int                     dropNext_[6] = {0, 0, 0, 0, 0, 0};
+    uint64_t                framesLost_ = 0;
+    uint64_t                sent_[8][6] = {};
+    uint64_t                step_  = 0;
+    int64_t                 clock_ = 0;
+    uint64_t                nextId_ = 1;
+    std::deque<Pending>     pending_;
+    std::set<uint64_t>      acked_;
+    std::size_t             failed_ = 0;
+    bool                    lostOnPowerLoss_ = false;
+    rune::storage::ProducerStateManager psm_;
+    uint64_t                psmGen_   = 0;
+    bool                    psmValid_ = false;
+};
+
+// ---------------------------------------------------------------------------
+// DrEndpoint
+// ---------------------------------------------------------------------------
+inline bool DrEndpoint::sendFetchRequestTo(NodeId leader, const FetchRequestMsg& req) {
+    Frame f; f.kind = Kind::FetchReq; f.from = self_; f.to = leader; f.freq = req;
+    return c_->send(std::move(f));
+}
+inline bool DrEndpoint::sendFetchResponse(NodeId to, const FetchResponseMsg& resp) {
+    Frame f; f.kind = Kind::FetchResp; f.from = self_; f.to = to; f.fresp = resp;
+    f.recs.assign(resp.records.begin(), resp.records.end());
+    f.fresp.records = {};
+    return c_->send(std::move(f));
+}
+inline bool DrEndpoint::sendOffsetsForLeaderEpochRequest(NodeId to, const OffsetsForLeaderEpochReqMsg& m) {
+    Frame f; f.kind = Kind::EpochReq; f.from = self_; f.to = to; f.ereq = m;
+    return c_->send(std::move(f));
+}
+inline bool DrEndpoint::sendOffsetsForLeaderEpochResponse(NodeId to, const OffsetsForLeaderEpochRespMsg& m) {
+    Frame f; f.kind = Kind::EpochResp; f.from = self_; f.to = to; f.eresp = m;
+    return c_->send(std::move(f));
+}
+inline bool DrEndpoint::sendReconcileRequest(NodeId to, const FetchRequestMsg& m) {
+    Frame f; f.kind = Kind::ReconReq; f.from = self_; f.to = to; f.freq = m;
+    return c_->send(std::move(f));
+}
+inline bool DrEndpoint::sendReconcileResponse(NodeId to, const FetchResponseMsg& m) {
+    Frame f; f.kind = Kind::ReconResp; f.from = self_; f.to = to; f.fresp = m;
+    f.recs.assign(m.records.begin(), m.records.end());
+    f.fresp.records = {};
+    return c_->send(std::move(f));
+}
+
+} // namespace rune::replication::dr

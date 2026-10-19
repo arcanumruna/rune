@@ -1,0 +1,29 @@
+# Shard-mode overlay for the dockerized DR matrix (Task 15).  Each container is its
+# own host, so every node uses the same per-worker base ports; RUNE_PEERS advertises
+# them explicitly (id@host:consensus:client:repl:replBase:ingressBase).
+# Use: RUNE_DR_COMPOSE_OVERRIDES=$PWD/docker/docker-compose.shard.yml pytest ...
+x-shard-env: &shard-env
+  RUNE_WORKER_MODE: "shard"
+  RUNE_RUNTIME_PLACEMENT: "fused"
+  RUNE_WORKER_INGRESS_BASE_PORT: "40500"
+  RUNE_WORKER_REPL_BASE_PORT: "40600"
+  # Authentication is ON: the base file mounts the cluster key at this path (docker-compose.yml); restated here so
+  # the overlay never silently depends on a base change.
+  RUNE_CLUSTER_KEY_FILE: /run/secrets/cluster.key
+  RUNE_PEERS: "0@rune-1:40111:40200:40222:40600:40500,1@rune-2:40111:40200:40222:40600:40500,2@rune-3:40111:40200:40222:40600:40500"
+
+# The explicit worker bases lie inside Linux's ephemeral range: reserved with the node ports (every worker,
+# up to 64) so a restart always binds (DR-BUG-RESTART-BIND; replaces the base file's value for this key).
+x-shard-sysctls: &shard-sysctls
+  net.ipv4.ip_local_reserved_ports: "40111,40200,40222,40500-40563,40600-40663"
+
+services:
+  rune-1:
+    environment: *shard-env
+    sysctls: *shard-sysctls
+  rune-2:
+    environment: *shard-env
+    sysctls: *shard-sysctls
+  rune-3:
+    environment: *shard-env
+    sysctls: *shard-sysctls

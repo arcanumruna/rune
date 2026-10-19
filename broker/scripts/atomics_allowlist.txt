@@ -1,0 +1,216 @@
+# atomics_allowlist.txt — the ONLY production sites where atomics / locks /
+# memory-ordering / blocking primitives may appear (scripts/check_no_atomics.py,
+# ctest NoAtomicsOrMutexesOutsideAllowlistRegression).
+#
+# Format:  <path> | <normalized line> | <count> | <CATEGORY> | <reason>
+#   normalized line = the hit line's code, trailing comment removed, whitespace
+#   collapsed.  The number of such lines in <path> must EQUAL <count>: an extra
+#   copy or a missing one fails.  No wildcards.
+# CATEGORY:
+#   RING        — inside a ring-buffer implementation (permanent).
+#   CLEANER     — the off-thread LogCleaner/compaction channel (permanent, user law).
+#   CRASH-ORDER — compiler-only barrier ordering stores into a single-writer
+#                 mmap'd file (not shared state; coordinator ruling F9a r1).
+#   CPU-HINT    — spin-wait CPU hint (pause/yield) in BusySpinIdleStrategy; no
+#                 shared state, no ordering contract (F9a r1: flagged by the
+#                 widened inline-asm detection — pending ruling).
+#   SLICE-B     — TEMPORARY: F9 slice B converts these, then deletes the entries.
+#   UNSCOPED    — TEMPORARY: owned by neither slice yet; must be converted.
+
+# ------------------------------------------------------------ RING
+libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | #include <atomic> | 1 | RING | agrona ring implementation internals
+libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | std::atomic_thread_fence(std::memory_order_release); | 2 | RING | agrona ring implementation internals
+libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | head = ring_atomic::getInt64Acquire(m_buffer, m_headPositionIndex); | 2 | RING | agrona ring implementation internals
+libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | return ring_atomic::getInt64Acquire(m_buffer, m_headPositionIndex); | 1 | RING | agrona ring implementation internals
+libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | return ring_atomic::getInt64Acquire(m_buffer, m_tailPositionIndex); | 1 | RING | agrona ring implementation internals
+libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | ring_atomic::getInt32Acquire(m_buffer, RD::RecordDescriptor::lengthOffset(recordIndex)); | 1 | RING | agrona ring implementation internals
+libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | ring_atomic::putInt32Release(m_buffer, RD::RecordDescriptor::lengthOffset(recordIndex), -recordLength); | 3 | RING | agrona ring implementation internals
+libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | ring_atomic::putInt32Release(m_buffer, RD::RecordDescriptor::lengthOffset(tailIndex), -padding); | 1 | RING | agrona ring implementation internals
+libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | ring_atomic::putInt32Release(m_buffer, RD::RecordDescriptor::lengthOffset(tailIndex), padding); | 1 | RING | agrona ring implementation internals
+libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | ring_atomic::putInt64Release(m_buffer, headCachePositionIndex, head); | 2 | RING | agrona ring implementation internals
+libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | ring_atomic::putInt64Release(m_buffer, headPositionIndex, head + bytesRead); | 1 | RING | agrona ring implementation internals
+libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | std::int64_t head = ring_atomic::getInt64Acquire(m_buffer, headCachePositionIndex); | 1 | RING | agrona ring implementation internals
+libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | tail = ring_atomic::getInt64Acquire(m_buffer, tailPositionIndex); | 1 | RING | agrona ring implementation internals
+libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | } while (!ring_atomic::compareAndSetInt64(m_buffer, tailPositionIndex, tail, newTail)); | 1 | RING | agrona ring implementation internals
+libs/node/include/rune/node/UringFlushBackend.h | const uint32_t head = __atomic_load_n(cqHead_, __ATOMIC_ACQUIRE); | 1 | RING | kernel-shared io_uring SQ/CQ ring head/tail
+libs/node/include/rune/node/UringFlushBackend.h | const uint32_t tail = __atomic_load_n(cqTail_, __ATOMIC_ACQUIRE); | 1 | RING | kernel-shared io_uring SQ/CQ ring head/tail
+libs/node/include/rune/node/UringFlushBackend.h | __atomic_store_n(cqHead_, head + 1, __ATOMIC_RELEASE); | 1 | RING | kernel-shared io_uring SQ/CQ ring head/tail
+libs/node/include/rune/node/detail/O2ORingBuffer.h | std::atomic_thread_fence(std::memory_order_release); | 2 | RING | agrona ring implementation internals
+libs/node/include/rune/node/detail/O2ORingBuffer.h | #include <atomic> | 1 | RING | A9 ring space-wait word (producer waits for space; Dekker fence with the consumer's head advance)
+libs/node/include/rune/node/detail/O2ORingBuffer.h | alignas(64) std::atomic<std::uint32_t> m_spaceWanted{0}; | 1 | RING | A9 ring space-wait word (producer waits for space; Dekker fence with the consumer's head advance)
+libs/node/include/rune/node/detail/O2ORingBuffer.h | if (m_spaceWanted.load(std::memory_order_relaxed) != 0 && | 1 | RING | A9 ring space-wait word (producer waits for space; Dekker fence with the consumer's head advance)
+libs/node/include/rune/node/detail/O2ORingBuffer.h | m_spaceWanted.exchange(0, std::memory_order_acq_rel) != 0) | 1 | RING | A9 ring space-wait word (producer waits for space; Dekker fence with the consumer's head advance)
+libs/node/include/rune/node/detail/O2ORingBuffer.h | m_spaceWanted.store(1, std::memory_order_relaxed); | 1 | RING | A9 ring space-wait word (producer waits for space; Dekker fence with the consumer's head advance)
+libs/node/include/rune/node/detail/O2ORingBuffer.h | return m_spaceWanted.load(std::memory_order_relaxed) != 0; | 1 | RING | A9 ring space-wait word (producer waits for space; Dekker fence with the consumer's head advance)
+libs/node/include/rune/node/detail/O2ORingBuffer.h | std::atomic_thread_fence(std::memory_order_seq_cst); | 2 | RING | A9 ring space-wait word (producer waits for space; Dekker fence with the consumer's head advance)
+libs/node/include/rune/node/detail/O2ORingBuffer.h | void disarmSpaceWait() noexcept { m_spaceWanted.store(0, std::memory_order_relaxed); } | 1 | RING | A9 ring space-wait word (producer waits for space; Dekker fence with the consumer's head advance)
+libs/node/include/rune/node/detail/O2ORingBuffer.h | const std::int64_t head = ring_atomic::getInt64Acquire(m_buffer, m_headPositionIndex); | 1 | RING | agrona ring implementation internals
+libs/node/include/rune/node/detail/O2ORingBuffer.h | const std::int64_t tail = ring_atomic::getInt64Acquire(m_buffer, m_tailPositionIndex); | 1 | RING | agrona ring implementation internals
+libs/node/include/rune/node/detail/O2ORingBuffer.h | head = ring_atomic::getInt64Acquire(m_buffer, m_headPositionIndex); | 2 | RING | agrona ring implementation internals
+libs/node/include/rune/node/detail/O2ORingBuffer.h | return ring_atomic::getInt64Acquire(m_buffer, m_tailPositionIndex); | 1 | RING | agrona ring implementation internals
+libs/node/include/rune/node/detail/O2ORingBuffer.h | ring_atomic::getInt32Acquire(m_buffer, RD::RecordDescriptor::lengthOffset(recordIndex)); | 2 | RING | agrona ring implementation internals
+libs/node/include/rune/node/detail/O2ORingBuffer.h | ring_atomic::putInt32Release(m_buffer, RD::RecordDescriptor::lengthOffset(recordIndex), -padding); | 1 | RING | agrona ring implementation internals
+libs/node/include/rune/node/detail/O2ORingBuffer.h | ring_atomic::putInt32Release(m_buffer, RD::RecordDescriptor::lengthOffset(recordIndex), -recordLength); | 3 | RING | agrona ring implementation internals
+libs/node/include/rune/node/detail/O2ORingBuffer.h | ring_atomic::putInt32Release(m_buffer, RD::RecordDescriptor::lengthOffset(recordIndex), padding); | 1 | RING | agrona ring implementation internals
+libs/node/include/rune/node/detail/O2ORingBuffer.h | ring_atomic::putInt64Release(m_buffer, headPositionIndex, head + bytesRead); | 3 | RING | agrona ring implementation internals
+libs/node/include/rune/node/detail/O2ORingBuffer.h | ring_atomic::putInt64Release(m_buffer, tailPositionIndex, nextTail); | 2 | RING | agrona ring implementation internals
+libs/consensus/include/rune/consensus/detail/RingDoorbell.h | #include <atomic> | 1 | RING | A9 ring doorbell (consumer parking word + Dekker fence; lost-wakeup-free wake of a parked consumer)
+libs/consensus/include/rune/consensus/detail/RingDoorbell.h | [[nodiscard]] bool parkingForTest() const noexcept { return parking_.load(std::memory_order_relaxed) != 0; } | 1 | RING | A9 ring doorbell (consumer parking word + Dekker fence; lost-wakeup-free wake of a parked consumer)
+libs/consensus/include/rune/consensus/detail/RingDoorbell.h | alignas(64) std::atomic<std::uint32_t> parking_{0}; | 1 | RING | A9 ring doorbell (consumer parking word + Dekker fence; lost-wakeup-free wake of a parked consumer)
+libs/consensus/include/rune/consensus/detail/RingDoorbell.h | if (parking_.load(std::memory_order_relaxed) != 0 && | 1 | RING | A9 ring doorbell (consumer parking word + Dekker fence; lost-wakeup-free wake of a parked consumer)
+libs/consensus/include/rune/consensus/detail/RingDoorbell.h | parking_.exchange(0, std::memory_order_acq_rel) != 0) | 1 | RING | A9 ring doorbell (consumer parking word + Dekker fence; lost-wakeup-free wake of a parked consumer)
+libs/consensus/include/rune/consensus/detail/RingDoorbell.h | parking_.store(0, std::memory_order_relaxed); | 2 | RING | A9 ring doorbell (consumer parking word + Dekker fence; lost-wakeup-free wake of a parked consumer)
+libs/consensus/include/rune/consensus/detail/RingDoorbell.h | parking_.store(1, std::memory_order_relaxed); | 1 | RING | A9 ring doorbell (consumer parking word + Dekker fence; lost-wakeup-free wake of a parked consumer)
+libs/consensus/include/rune/consensus/detail/RingDoorbell.h | std::atomic_thread_fence(std::memory_order_seq_cst); | 2 | RING | A9 ring doorbell (consumer parking word + Dekker fence; lost-wakeup-free wake of a parked consumer)
+libs/consensus/include/rune/consensus/detail/RingDoorbell.h | if (ring_atomic::getInt32Acquire(w.buf, idx) > 0) return true; | 1 | RING | A9 ring doorbell watch: committed-record length at the head (ring_atomic acquire load)
+libs/node/src/UringFlushBackend.cpp | const uint32_t head = __atomic_load_n(sqHead_, __ATOMIC_ACQUIRE); | 1 | RING | kernel-shared io_uring SQ/CQ ring head/tail (single pushSqes_ submit path: fsync, FADVISE, io-wq NOP, E1d linked write+fsync)
+libs/node/src/UringFlushBackend.cpp | const uint32_t tail = __atomic_load_n(sqTail_, __ATOMIC_RELAXED); | 1 | RING | kernel-shared io_uring SQ/CQ ring head/tail (single pushSqes_ submit path: fsync, FADVISE, io-wq NOP, E1d linked write+fsync)
+libs/node/src/UringFlushBackend.cpp | __atomic_store_n(sqTail_, tail + n, __ATOMIC_RELEASE); | 1 | RING | kernel-shared io_uring SQ/CQ ring head/tail (single pushSqes_ submit path: fsync, FADVISE, io-wq NOP, E1d linked write+fsync)
+libs/node/src/UringFlushBackend.cpp | __atomic_store_n(sqTail_, tail, __ATOMIC_RELEASE); | 1 | RING | kernel-shared io_uring SQ/CQ ring head/tail (single pushSqes_ submit path: fsync, FADVISE, io-wq NOP, E1d linked write+fsync)
+libs/node/src/UringFlushBackend.cpp | __atomic_store_n(sqTail_, tail + submitted, __ATOMIC_RELEASE); | 1 | RING | kernel-shared io_uring SQ tail: LOW-4b partial-enter rollback of the unconsumed SQEs (single pushSqes_ submit path)
+libs/consensus/include/rune/consensus/detail/RingAtomics.h | #include <atomic> | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
+libs/consensus/include/rune/consensus/detail/RingAtomics.h | [[nodiscard]] inline bool compareAndSetInt64(const aeron::concurrent::AtomicBuffer& b, aeron::util::index_t offset, | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
+libs/consensus/include/rune/consensus/detail/RingAtomics.h | [[nodiscard]] inline std::atomic_ref<T> word(const aeron::concurrent::AtomicBuffer& b, | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
+libs/consensus/include/rune/consensus/detail/RingAtomics.h | [[nodiscard]] inline std::int32_t getInt32Acquire(const aeron::concurrent::AtomicBuffer& b, | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
+libs/consensus/include/rune/consensus/detail/RingAtomics.h | [[nodiscard]] inline std::int64_t getInt64Acquire(const aeron::concurrent::AtomicBuffer& b, | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
+libs/consensus/include/rune/consensus/detail/RingAtomics.h | inline void putInt32Release(const aeron::concurrent::AtomicBuffer& b, aeron::util::index_t offset, | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
+libs/consensus/include/rune/consensus/detail/RingAtomics.h | inline void putInt64Release(const aeron::concurrent::AtomicBuffer& b, aeron::util::index_t offset, | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
+libs/consensus/include/rune/consensus/detail/RingAtomics.h | return std::atomic_ref<T>(*reinterpret_cast<T*>(b.buffer() + offset)); | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
+libs/consensus/include/rune/consensus/detail/RingAtomics.h | return word<std::int32_t>(b, offset).load(std::memory_order_acquire); | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
+libs/consensus/include/rune/consensus/detail/RingAtomics.h | return word<std::int64_t>(b, offset).compare_exchange_strong(expected, desired, | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
+libs/consensus/include/rune/consensus/detail/RingAtomics.h | return word<std::int64_t>(b, offset).load(std::memory_order_acquire); | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
+libs/consensus/include/rune/consensus/detail/RingAtomics.h | static_assert(std::atomic_ref<std::int32_t>::is_always_lock_free); | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
+libs/consensus/include/rune/consensus/detail/RingAtomics.h | static_assert(std::atomic_ref<std::int64_t>::is_always_lock_free); | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
+libs/consensus/include/rune/consensus/detail/RingAtomics.h | std::memory_order_seq_cst); | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
+libs/consensus/include/rune/consensus/detail/RingAtomics.h | word<std::int32_t>(b, offset).store(v, std::memory_order_release); | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
+libs/consensus/include/rune/consensus/detail/RingAtomics.h | word<std::int64_t>(b, offset).store(v, std::memory_order_release); | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
+
+# ------------------------------------------------------------ CLEANER
+libs/node/include/rune/node/LogCleanerAgent.h | #include <atomic> | 1 | CLEANER | D25 cleaner cycle counter (tests wait on cleaner progress, not sleeps)
+libs/node/include/rune/node/LogCleanerAgent.h | [[nodiscard]] uint64_t cyclesDoneForTest() const noexcept { return cyclesDone_.load(std::memory_order_acquire); } | 1 | CLEANER | D25 cleaner cycle counter (tests wait on cleaner progress, not sleeps)
+libs/node/include/rune/node/LogCleanerAgent.h | struct CycleDone { LogCleanerAgent& a; ~CycleDone() { a.cyclesDone_.fetch_add(1, std::memory_order_release); } } cycleDone{*this}; | 1 | CLEANER | D25 cleaner cycle counter (tests wait on cleaner progress, not sleeps)
+libs/node/include/rune/node/LogCleanerAgent.h | std::atomic<uint64_t> cyclesDone_{0}; | 1 | CLEANER | D25 cleaner cycle counter (tests wait on cleaner progress, not sleeps)
+libs/storage/include/rune/storage/Log.h | #include <atomic> | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
+libs/storage/include/rune/storage/Log.h | alignas(64) std::atomic<std::size_t> swapHead_{0}; | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
+libs/storage/include/rune/storage/Log.h | alignas(64) std::atomic<std::size_t> swapTail_{0}; | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
+libs/storage/include/rune/storage/Log.h | alignas(64) std::atomic<std::size_t> deleteHead_{0}; | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
+libs/storage/include/rune/storage/Log.h | alignas(64) std::atomic<std::size_t> deleteTail_{0}; | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
+libs/storage/src/Log.cpp | const std::size_t tail = swapTail_.load(std::memory_order_relaxed); | 2 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
+libs/storage/src/Log.cpp | const std::size_t head = swapHead_.load(std::memory_order_acquire); | 2 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
+libs/storage/src/Log.cpp | swapTail_.store(tail + n, std::memory_order_release); | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
+libs/storage/src/Log.cpp | const std::size_t head = swapHead_.load(std::memory_order_relaxed); | 2 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
+libs/storage/src/Log.cpp | const std::size_t tail = swapTail_.load(std::memory_order_acquire); | 2 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
+libs/storage/src/Log.cpp | swapHead_.store(tail, std::memory_order_release); | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
+libs/storage/src/Log.cpp | const std::size_t tail = deleteTail_.load(std::memory_order_relaxed); | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
+libs/storage/src/Log.cpp | const std::size_t head = deleteHead_.load(std::memory_order_acquire); | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
+libs/storage/src/Log.cpp | deleteTail_.store(tail + 1, std::memory_order_release); | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
+libs/storage/src/Log.cpp | const std::size_t head = deleteHead_.load(std::memory_order_relaxed); | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
+libs/storage/src/Log.cpp | const std::size_t tail = deleteTail_.load(std::memory_order_acquire); | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
+libs/storage/src/Log.cpp | deleteHead_.store(i, std::memory_order_release); | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
+libs/storage/include/rune/storage/Log.h | alignas(64) std::atomic<int> cleanerFailedErrno_{0}; | 1 | CLEANER | fix round 5 owner<->cleaner file-op channel (msg ring; no token): owner cold paths run only when the cleaner drained it; cleaner->owner checkpoint-failure flag
+libs/storage/src/Log.cpp | cleanerFailedErrno_.store(errno != 0 ? errno : EIO, std::memory_order_release); | 1 | CLEANER | fix round 5 owner<->cleaner file-op channel (msg ring; no token): owner cold paths run only when the cleaner drained it; cleaner->owner checkpoint-failure flag
+libs/storage/src/Log.cpp | if (const int e = cleanerFailedErrno_.load(std::memory_order_acquire); e != 0 && storage_.failedErrno == 0) | 1 | CLEANER | fix round 5 owner<->cleaner file-op channel (msg ring; no token): owner cold paths run only when the cleaner drained it; cleaner->owner checkpoint-failure flag
+libs/storage/src/Log.cpp | const std::size_t before = msgHead_.load(std::memory_order_relaxed); | 1 | CLEANER | fix round 5 owner<->cleaner file-op channel (msg ring; no token): owner cold paths run only when the cleaner drained it; cleaner->owner checkpoint-failure flag
+libs/storage/src/Log.cpp | if (msgHead_.load(std::memory_order_relaxed) == before) { | 1 | CLEANER | fix round 5 owner<->cleaner file-op channel (msg ring; no token): owner cold paths run only when the cleaner drained it; cleaner->owner checkpoint-failure flag
+libs/storage/src/Log.cpp | msgHead_.store(i, std::memory_order_release); | 2 | CLEANER | fix round 5 owner<->cleaner file-op channel (msg ring; no token): owner cold paths run only when the cleaner drained it; cleaner->owner checkpoint-failure flag
+libs/storage/src/Log.cpp | const std::size_t head = msgHead_.load(std::memory_order_acquire); | 2 | CLEANER | fix round 5 owner<->cleaner file-op channel (msg ring; no token): owner cold paths run only when the cleaner drained it; cleaner->owner checkpoint-failure flag
+libs/storage/src/Log.cpp | const std::size_t head = msgHead_.load(std::memory_order_relaxed); | 2 | CLEANER | fix round 5 owner<->cleaner file-op channel (msg ring; no token): owner cold paths run only when the cleaner drained it; cleaner->owner checkpoint-failure flag
+libs/storage/src/Log.cpp | const std::size_t tail = msgTail_.load(std::memory_order_acquire); | 2 | CLEANER | fix round 5 owner<->cleaner file-op channel (msg ring; no token): owner cold paths run only when the cleaner drained it; cleaner->owner checkpoint-failure flag
+libs/storage/src/Log.cpp | const std::size_t tail = msgTail_.load(std::memory_order_relaxed); | 3 | CLEANER | fix round 5 owner<->cleaner file-op channel (msg ring; no token): owner cold paths run only when the cleaner drained it; cleaner->owner checkpoint-failure flag
+libs/storage/include/rune/storage/Log.h | alignas(64) std::atomic<std::size_t> msgHead_{0}; | 1 | CLEANER | fix round 4 owner->cleaner file-op channel: msg ring (owner producer, file-op token holder consumer) + the per-log file-op token (cleaner per cycle, owner on cold paths only)
+libs/storage/include/rune/storage/Log.h | alignas(64) std::atomic<std::size_t> msgTail_{0}; | 1 | CLEANER | fix round 4 owner->cleaner file-op channel: msg ring (owner producer, file-op token holder consumer) + the per-log file-op token (cleaner per cycle, owner on cold paths only)
+libs/storage/src/Log.cpp | msgTail_.store(tail + n, std::memory_order_release); | 1 | CLEANER | fix round 4 owner->cleaner file-op channel: msg ring (owner producer, file-op token holder consumer) + the per-log file-op token (cleaner per cycle, owner on cold paths only)
+libs/replication/include/rune/replication/PartitionReplica.h | publishedLsoForCleaner_.store(firstUnstableOffset, std::memory_order_release); | 1 | CLEANER | D3b cleaner LSO snapshot: owning worker publishes the first unstable offset, LogCleanerAgent caps compaction at it
+libs/replication/include/rune/replication/PartitionReplica.h | return publishedLsoForCleaner_.load(std::memory_order_acquire); | 1 | CLEANER | D3b cleaner LSO snapshot: owning worker publishes the first unstable offset, LogCleanerAgent caps compaction at it
+libs/replication/include/rune/replication/PartitionReplica.h | std::atomic<Offset> publishedLsoForCleaner_{cfg_.topicId >= 0 ? Offset{0} : kNoCleanerLso}; | 1 | CLEANER | D3b cleaner LSO snapshot: owning worker publishes the first unstable offset, LogCleanerAgent caps compaction at it
+libs/replication/include/rune/replication/PartitionReplica.h | return publishedMarkerBoundForCleaner_.load(std::memory_order_acquire); | 1 | CLEANER | D3b r1 cleaner marker-removal bound: duty thread publishes min fetch position over every assigned replica, LogCleanerAgent gates marker removal on it
+libs/replication/include/rune/replication/PartitionReplica.h | std::atomic<Offset> publishedMarkerBoundForCleaner_{0}; | 1 | CLEANER | D3b r1 cleaner marker-removal bound: duty thread publishes min fetch position over every assigned replica, LogCleanerAgent gates marker removal on it
+libs/replication/src/PartitionReplica.cpp | publishedMarkerBoundForCleaner_.store(markerBound, std::memory_order_release); | 1 | CLEANER | D3b r1 cleaner marker-removal bound: duty thread publishes min fetch position over every assigned replica, LogCleanerAgent gates marker removal on it
+libs/replication/include/rune/replication/PartitionReplica.h | cleanerRewindAck_.store(gen, std::memory_order_release); | 1 | CLEANER | fix round 3 clean-watermark rewind channel: owner publishes a rewind point (gen/to), cleaner acknowledges (ack); the cleaner stays the single writer of lastCleanOffset_
+libs/replication/include/rune/replication/PartitionReplica.h | cleanerRewindGen_.store(gen + 1, std::memory_order_release); | 1 | CLEANER | fix round 3 clean-watermark rewind channel: owner publishes a rewind point (gen/to), cleaner acknowledges (ack); the cleaner stays the single writer of lastCleanOffset_
+libs/replication/include/rune/replication/PartitionReplica.h | cleanerRewindTo_.store(acked == gen ? to : std::min(prev, to), std::memory_order_relaxed); | 1 | CLEANER | fix round 3 clean-watermark rewind channel: owner publishes a rewind point (gen/to), cleaner acknowledges (ack); the cleaner stays the single writer of lastCleanOffset_
+libs/replication/include/rune/replication/PartitionReplica.h | const Offset prev = cleanerRewindTo_.load(std::memory_order_relaxed); | 1 | CLEANER | fix round 3 clean-watermark rewind channel: owner publishes a rewind point (gen/to), cleaner acknowledges (ack); the cleaner stays the single writer of lastCleanOffset_
+libs/replication/include/rune/replication/PartitionReplica.h | const Offset to = cleanerRewindTo_.load(std::memory_order_relaxed); | 1 | CLEANER | fix round 3 clean-watermark rewind channel: owner publishes a rewind point (gen/to), cleaner acknowledges (ack); the cleaner stays the single writer of lastCleanOffset_
+libs/replication/include/rune/replication/PartitionReplica.h | const uint64_t acked = cleanerRewindAck_.load(std::memory_order_acquire); | 1 | CLEANER | fix round 3 clean-watermark rewind channel: owner publishes a rewind point (gen/to), cleaner acknowledges (ack); the cleaner stays the single writer of lastCleanOffset_
+libs/replication/include/rune/replication/PartitionReplica.h | const uint64_t gen = cleanerRewindGen_.load(std::memory_order_acquire); | 1 | CLEANER | fix round 3 clean-watermark rewind channel: owner publishes a rewind point (gen/to), cleaner acknowledges (ack); the cleaner stays the single writer of lastCleanOffset_
+libs/replication/include/rune/replication/PartitionReplica.h | const uint64_t gen = cleanerRewindGen_.load(std::memory_order_relaxed); | 1 | CLEANER | fix round 3 clean-watermark rewind channel: owner publishes a rewind point (gen/to), cleaner acknowledges (ack); the cleaner stays the single writer of lastCleanOffset_
+libs/replication/include/rune/replication/PartitionReplica.h | if (gen == cleanerRewindAck_.load(std::memory_order_relaxed)) return; | 1 | CLEANER | fix round 3 clean-watermark rewind channel: owner publishes a rewind point (gen/to), cleaner acknowledges (ack); the cleaner stays the single writer of lastCleanOffset_
+libs/replication/include/rune/replication/PartitionReplica.h | std::atomic<Offset> cleanerRewindTo_{0}; | 1 | CLEANER | fix round 3 clean-watermark rewind channel: owner publishes a rewind point (gen/to), cleaner acknowledges (ack); the cleaner stays the single writer of lastCleanOffset_
+libs/replication/include/rune/replication/PartitionReplica.h | std::atomic<uint64_t> cleanerRewindAck_{0}; | 1 | CLEANER | fix round 3 clean-watermark rewind channel: owner publishes a rewind point (gen/to), cleaner acknowledges (ack); the cleaner stays the single writer of lastCleanOffset_
+libs/replication/include/rune/replication/PartitionReplica.h | std::atomic<uint64_t> cleanerRewindGen_{0}; | 1 | CLEANER | fix round 3 clean-watermark rewind channel: owner publishes a rewind point (gen/to), cleaner acknowledges (ack); the cleaner stays the single writer of lastCleanOffset_
+
+# ------------------------------------------------------------ CRASH-ORDER
+libs/consensus/src/NodeStateFile.cpp | inline void crashOrderBarrier() noexcept { asm volatile("" ::: "memory"); } | 1 | CRASH-ORDER | compiler-only barrier: store order of the single-writer mmap state file
+
+# ------------------------------------------------------------ CPU-HINT
+libs/consensus/include/rune/consensus/IdleStrategy.h | __asm__ volatile("pause" ::: "memory"); | 1 | CPU-HINT | BusySpinIdleStrategy spin hint (pause/yield; compiler-barrier fallback): no shared state
+libs/consensus/include/rune/consensus/IdleStrategy.h | __asm__ volatile("yield" ::: "memory"); | 1 | CPU-HINT | BusySpinIdleStrategy spin hint (pause/yield; compiler-barrier fallback): no shared state
+libs/consensus/include/rune/consensus/IdleStrategy.h | __asm__ volatile("" ::: "memory"); | 1 | CPU-HINT | BusySpinIdleStrategy spin hint (pause/yield; compiler-barrier fallback): no shared state
+
+# ------------------------------------------------------------ SLICE-B
+libs/gateway/include/rune/gateway/ClientGateway.h | #include <atomic> | 1 | SLICE-B | ClientGateway::minIsr_ (slice B)
+libs/gateway/include/rune/gateway/ClientGateway.h | minIsr_.store((minIsr >= 1) ? minIsr : 1, std::memory_order_relaxed); | 1 | SLICE-B | ClientGateway::minIsr_ (slice B)
+libs/gateway/include/rune/gateway/ClientGateway.h | return minIsr_.load(std::memory_order_relaxed); | 1 | SLICE-B | ClientGateway::minIsr_ (slice B)
+libs/gateway/include/rune/gateway/ClientGateway.h | std::atomic<int> minIsr_{1}; | 1 | SLICE-B | ClientGateway::minIsr_ (slice B)
+libs/gateway/src/ClientGateway.cpp | cachedMinIsr_ = minIsr_.load(std::memory_order_relaxed); | 1 | SLICE-B | ClientGateway::minIsr_ (slice B)
+libs/gateway/include/rune/gateway/ClientGateway.h | void syncMinIsrForTest() noexcept { cachedMinIsr_ = minIsr_.load(std::memory_order_relaxed); } | 1 | SLICE-B | ClientGateway::minIsr_ (slice B) — Task 10 r5 test seam (integration wave 2)
+libs/replication/include/rune/replication/PartitionReplica.h | #include <atomic> | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/include/rune/replication/PartitionReplica.h | #include <mutex> | 1 | SLICE-B | PartitionReplica mu_ pending-queue lock (slice B, explicit ruling)
+libs/replication/include/rune/replication/PartitionReplica.h | return publishedHwForCleaner_.load(std::memory_order_acquire); | 2 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/include/rune/replication/PartitionReplica.h | return static_cast<Role>(publishedRoleForCleaner_.load(std::memory_order_acquire)); | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/include/rune/replication/PartitionReplica.h | return publishedIsrSizeForGateway_.load(std::memory_order_acquire); | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/include/rune/replication/PartitionReplica.h | return publishedControllerEpoch_.load(std::memory_order_acquire); | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/include/rune/replication/PartitionReplica.h | const Offset raw = publishedReplicaLeo_[static_cast<std::size_t>(nodeId)] | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/include/rune/replication/PartitionReplica.h | .load(std::memory_order_acquire); | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/include/rune/replication/PartitionReplica.h | return lastCleanOffset_.load(std::memory_order_relaxed); | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/include/rune/replication/PartitionReplica.h | lastCleanOffset_.store(o, std::memory_order_relaxed); | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/include/rune/replication/PartitionReplica.h | std::atomic<Offset> lastCleanOffset_{0}; | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/include/rune/replication/PartitionReplica.h | std::atomic<Offset> publishedHwForCleaner_{0}; | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/include/rune/replication/PartitionReplica.h | std::atomic<int> publishedRoleForCleaner_{static_cast<int>(Role::Follower)}; | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/include/rune/replication/PartitionReplica.h | std::atomic<int> publishedIsrSizeForGateway_{0}; | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/include/rune/replication/PartitionReplica.h | std::atomic<int32_t> publishedControllerEpoch_{-1}; | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/include/rune/replication/PartitionReplica.h | std::array<std::atomic<Offset>, kMaxControllerNodes> publishedReplicaLeo_{}; | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/include/rune/replication/PartitionReplica.h | std::lock_guard lk(mu_); | 3 | SLICE-B | PartitionReplica mu_ pending-queue lock (slice B, explicit ruling; InMemoryTransport test fake — enqueue_/take_/pendingCount)
+libs/replication/include/rune/replication/PartitionReplica.h | mutable std::mutex mu_; | 1 | SLICE-B | PartitionReplica mu_ pending-queue lock (slice B, explicit ruling)
+libs/replication/src/PartitionReplica.cpp | publishedHwForCleaner_.store(computeServedHw(), std::memory_order_release); | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/src/PartitionReplica.cpp | publishedRoleForCleaner_.store(static_cast<int>(role_), std::memory_order_release); | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/src/PartitionReplica.cpp | publishedIsrSizeForGateway_.store(isrSize, std::memory_order_release); | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/src/PartitionReplica.cpp | publishedControllerEpoch_.store(static_cast<int32_t>(epoch_), std::memory_order_release); | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/src/PartitionReplica.cpp | publishedReplicaLeo_[static_cast<std::size_t>(cfg_.selfId)].store( | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/src/PartitionReplica.cpp | logEndOffset_() + 1, std::memory_order_release); | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/src/PartitionReplica.cpp | publishedReplicaLeo_[static_cast<std::size_t>(fid)].store( | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/src/PartitionReplica.cpp | leo + 1, std::memory_order_release); | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/src/PartitionReplica.cpp | publishedReplicaLeo_[static_cast<std::size_t>(n)].store(0, std::memory_order_release); | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B; rev3 CRITICAL-1 clears follower slots)
+
+# ------------------------------------------------------------ UNSCOPED
+libs/coordination/include/rune/coordination/GroupCoordinator.h | #include <atomic> | 1 | UNSCOPED | unused <atomic> include: delete
+libs/metadata/include/rune/metadata/RoutingImage.h | #include <atomic> | 1 | UNSCOPED | RoutingImage atomic shared_ptr publish: convert to a ring-delivered image
+libs/metadata/include/rune/metadata/RoutingImage.h | std::atomic_store_explicit(&current_, std::move(img), | 1 | UNSCOPED | RoutingImage atomic shared_ptr publish: convert to a ring-delivered image
+libs/metadata/include/rune/metadata/RoutingImage.h | std::memory_order_release); | 1 | UNSCOPED | RoutingImage atomic shared_ptr publish: convert to a ring-delivered image
+libs/metadata/include/rune/metadata/RoutingImage.h | return std::atomic_load_explicit(&current_, std::memory_order_acquire); | 1 | UNSCOPED | RoutingImage atomic shared_ptr publish: convert to a ring-delivered image
+libs/node/include/rune/node/Worker.h | #include <atomic> | 1 | UNSCOPED | unused <atomic> include: delete
+libs/storage/include/rune/storage/Log.h | alignas(64) std::atomic<std::size_t> renameReqHead_{0}; | 1 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
+libs/storage/include/rune/storage/Log.h | alignas(64) std::atomic<std::size_t> renameReqTail_{0}; | 1 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
+libs/storage/include/rune/storage/Log.h | alignas(64) std::atomic<std::size_t> renameDoneHead_{0}; | 1 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
+libs/storage/include/rune/storage/Log.h | alignas(64) std::atomic<std::size_t> renameDoneTail_{0}; | 1 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
+libs/storage/src/Log.cpp | const std::size_t head = renameReqHead_.load(std::memory_order_relaxed); | 2 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
+libs/storage/src/Log.cpp | const std::size_t tail = renameReqTail_.load(std::memory_order_relaxed); | 2 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
+libs/storage/src/Log.cpp | renameReqTail_.store(tail + 1, std::memory_order_release); | 1 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
+libs/storage/src/Log.cpp | const std::size_t tail = renameReqTail_.load(std::memory_order_acquire); | 1 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
+libs/storage/src/Log.cpp | const std::size_t dt = renameDoneTail_.load(std::memory_order_relaxed); | 1 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
+libs/storage/src/Log.cpp | const std::size_t dh = renameDoneHead_.load(std::memory_order_acquire); | 1 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
+libs/storage/src/Log.cpp | renameDoneTail_.store(dt + 1, std::memory_order_release); | 1 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
+libs/storage/src/Log.cpp | const std::size_t head = renameDoneHead_.load(std::memory_order_relaxed); | 1 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
+libs/storage/src/Log.cpp | const std::size_t tail = renameDoneTail_.load(std::memory_order_acquire); | 1 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
+libs/storage/src/Log.cpp | if (count > 0) renameDoneHead_.store(tail, std::memory_order_release); | 1 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
+libs/storage/include/rune/storage/Log.h | alignas(64) std::atomic<int64_t> cleanerPersistedRp_{kRecoveryPointUnknown}; | 1 | CLEANER | hotpath-A F4: owner->cleaner persisted recovery point (single writer; replaces the per-checkpoint snapshot republish)
+libs/storage/include/rune/storage/Log.h | cleanerPersistedRp_.store(v, std::memory_order_release); | 1 | CLEANER | hotpath-A F4: owner->cleaner persisted recovery point (single writer; replaces the per-checkpoint snapshot republish)
+libs/storage/include/rune/storage/Log.h | const int64_t rp = cleanerPersistedRp_.load(std::memory_order_acquire); | 1 | CLEANER | hotpath-A F4: owner->cleaner persisted recovery point (single writer; replaces the per-checkpoint snapshot republish)
+libs/storage/include/rune/storage/Log.h | return renameReqTail_.load(std::memory_order_relaxed) - renameDoneHead_.load(std::memory_order_relaxed) < | 1 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
+libs/storage/src/Log.cpp | const std::size_t reqHead = renameReqHead_.load(std::memory_order_acquire); | 1 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
+libs/storage/src/Log.cpp | const std::size_t reqTail = renameReqTail_.load(std::memory_order_relaxed); | 1 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
+libs/storage/src/Log.cpp | if (count > 0) renameReqHead_.store(i, std::memory_order_release); | 1 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
+libs/storage/include/rune/storage/Log.h | alignas(64) mutable std::atomic<uint8_t> snapMiddle_{1}; | 1 | CLEANER | Log cleaner channel: sealed-snapshot latest-value triple buffer (D22, replaced the mutex-backed shared_ptr atomic_store/load)
+libs/storage/include/rune/storage/Log.h | const uint8_t prev = snapMiddle_.exchange(snapFront_, std::memory_order_acq_rel); | 1 | CLEANER | Log cleaner channel: sealed-snapshot latest-value triple buffer (D22, replaced the mutex-backed shared_ptr atomic_store/load)
+libs/storage/include/rune/storage/Log.h | if (snapMiddle_.load(std::memory_order_relaxed) & kSnapFresh) { | 1 | CLEANER | Log cleaner channel: sealed-snapshot latest-value triple buffer (D22, replaced the mutex-backed shared_ptr atomic_store/load)
+libs/storage/src/Log.cpp | const uint8_t prev = snapMiddle_.exchange(mine, std::memory_order_acq_rel); | 1 | CLEANER | Log cleaner channel: sealed-snapshot latest-value triple buffer (D22, replaced the mutex-backed shared_ptr atomic_store/load)

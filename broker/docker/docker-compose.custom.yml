@@ -1,0 +1,150 @@
+# docker-compose.custom.yml — fully-customizable 3-node rune-broker cluster.
+#
+# Unlike docker-compose.yml (repo default: YAML anchors, named volumes, no host ports),
+# this file spells out EVERY env var per node, uses ${VAR}-substitution for all tunables,
+# bind-mounts host data dirs, and publishes each node's client UDP port so external
+# clients can connect. Edit rune-cluster.env (copy from rune-cluster.env.example).
+#
+# Run:
+#   cp docker/rune-cluster.env.example docker/rune-cluster.env   # then edit
+#   docker compose --env-file docker/rune-cluster.env -f docker/docker-compose.custom.yml up -d
+#   docker compose --env-file docker/rune-cluster.env -f docker/docker-compose.custom.yml logs -f
+#   docker compose --env-file docker/rune-cluster.env -f docker/docker-compose.custom.yml down
+#
+# Uses a prebuilt image (${RUNE_IMAGE}); build it first, e.g.:
+#   docker build --platform linux/amd64 --build-context rune-protocol=../rune-protocol \
+#       -f docker/Dockerfile -t rune-broker:latest .
+
+name: rune-cluster
+
+services:
+  rune-1:
+    image: ${RUNE_IMAGE:-rune-broker:latest}
+    platform: linux/amd64
+    hostname: rune-1
+    # DR-BUG-RESTART-BIND: these fixed ports lie inside Linux's ephemeral range (32768-60999); reserved (a
+    # per-netns sysctl) so no socket auto-bound first - e.g. the broker's own Aeron publications while it
+    # starts - can take one and fail a (re)start with 'Address already in use' (the broker WARNs otherwise).
+    sysctls:
+      net.ipv4.ip_local_reserved_ports: "${CONSENSUS_PORT:-40111},${CLIENT_PORT:-40200},${REPLICATION_PORT:-40222}"
+    shm_size: ${SHM_SIZE:-256m}
+    environment:
+      # --- required ---
+      RUNE_NODE_ID: "0"
+      # GB-4: id@host:consensusPort:clientPort — followers redirect data ops to leader's clientPort.
+      RUNE_PEERS: "0@rune-1:${CONSENSUS_PORT:-40111}:${CLIENT_PORT:-40200}:${REPLICATION_PORT:-40222},1@rune-2:${CONSENSUS_PORT:-40111}:${CLIENT_PORT:-40200}:${REPLICATION_PORT:-40222},2@rune-3:${CONSENSUS_PORT:-40111}:${CLIENT_PORT:-40200}:${REPLICATION_PORT:-40222}"
+      RUNE_CLIENT_ENDPOINT: "0.0.0.0:${CLIENT_PORT:-40200}"
+      RUNE_DATA_DIR: /var/lib/rune
+      # Empty: an empty data dir refuses to start (format it first: see rune-cluster.env.example).
+      RUNE_STORAGE_FORMAT: "${RUNE_STORAGE_FORMAT:-}"
+      # Authentication is ON by default: the same cluster key file on every node (see CLUSTER_KEY_FILE).
+      RUNE_CLUSTER_KEY_FILE: /run/secrets/cluster.key
+      # Container /dev/shm budget: 48 MiB per log at the 16 MiB default term.
+      RUNE_AERON_TERM_BUFFER_BYTES: "${RUNE_AERON_TERM_BUFFER_BYTES:-4194304}"
+      # --- optional (defaults shown) ---
+      RUNE_CLIENT_STREAM_ID: "${RUNE_CLIENT_STREAM_ID:-1}"
+      RUNE_CONSENSUS_STREAM_ID: "${RUNE_CONSENSUS_STREAM_ID:-10}"
+      RUNE_ELECTION_TIMEOUT_MS: "${RUNE_ELECTION_TIMEOUT_MS:-150}"
+      RUNE_ELECTION_STATUS_INTERVAL_MS: "${RUNE_ELECTION_STATUS_INTERVAL_MS:-20}"
+      RUNE_STARTUP_CANVASS_TIMEOUT_MS: "${RUNE_STARTUP_CANVASS_TIMEOUT_MS:-100}"
+    volumes:
+      - ${DATA_DIR_1:-./rune-data/node0}:/var/lib/rune
+      - type: bind
+        source: ${CLUSTER_KEY_FILE:-./secrets/cluster.key}
+        target: /run/secrets/cluster.key
+        read_only: true
+        bind:
+          create_host_path: false   # a missing key file fails the start; never a directory
+    ports:
+      - "${CLIENT_HOST_PORT_1:-40201}:${CLIENT_PORT:-40200}/udp"
+    healthcheck:
+      test: ["CMD", "pgrep", "-x", "rune_broker"]
+      interval: 5s
+      timeout: 3s
+      start_period: 20s
+      retries: 5
+    restart: unless-stopped
+
+  rune-2:
+    image: ${RUNE_IMAGE:-rune-broker:latest}
+    platform: linux/amd64
+    hostname: rune-2
+    # DR-BUG-RESTART-BIND: these fixed ports lie inside Linux's ephemeral range (32768-60999); reserved (a
+    # per-netns sysctl) so no socket auto-bound first - e.g. the broker's own Aeron publications while it
+    # starts - can take one and fail a (re)start with 'Address already in use' (the broker WARNs otherwise).
+    sysctls:
+      net.ipv4.ip_local_reserved_ports: "${CONSENSUS_PORT:-40111},${CLIENT_PORT:-40200},${REPLICATION_PORT:-40222}"
+    shm_size: ${SHM_SIZE:-256m}
+    environment:
+      RUNE_NODE_ID: "1"
+      RUNE_PEERS: "0@rune-1:${CONSENSUS_PORT:-40111}:${CLIENT_PORT:-40200}:${REPLICATION_PORT:-40222},1@rune-2:${CONSENSUS_PORT:-40111}:${CLIENT_PORT:-40200}:${REPLICATION_PORT:-40222},2@rune-3:${CONSENSUS_PORT:-40111}:${CLIENT_PORT:-40200}:${REPLICATION_PORT:-40222}"
+      RUNE_CLIENT_ENDPOINT: "0.0.0.0:${CLIENT_PORT:-40200}"
+      RUNE_DATA_DIR: /var/lib/rune
+      # Empty: an empty data dir refuses to start (format it first: see rune-cluster.env.example).
+      RUNE_STORAGE_FORMAT: "${RUNE_STORAGE_FORMAT:-}"
+      # Authentication is ON by default: the same cluster key file on every node (see CLUSTER_KEY_FILE).
+      RUNE_CLUSTER_KEY_FILE: /run/secrets/cluster.key
+      RUNE_CLIENT_STREAM_ID: "${RUNE_CLIENT_STREAM_ID:-1}"
+      RUNE_CONSENSUS_STREAM_ID: "${RUNE_CONSENSUS_STREAM_ID:-10}"
+      RUNE_ELECTION_TIMEOUT_MS: "${RUNE_ELECTION_TIMEOUT_MS:-150}"
+      RUNE_ELECTION_STATUS_INTERVAL_MS: "${RUNE_ELECTION_STATUS_INTERVAL_MS:-20}"
+      RUNE_STARTUP_CANVASS_TIMEOUT_MS: "${RUNE_STARTUP_CANVASS_TIMEOUT_MS:-100}"
+    volumes:
+      - ${DATA_DIR_2:-./rune-data/node1}:/var/lib/rune
+      - type: bind
+        source: ${CLUSTER_KEY_FILE:-./secrets/cluster.key}
+        target: /run/secrets/cluster.key
+        read_only: true
+        bind:
+          create_host_path: false   # a missing key file fails the start; never a directory
+    ports:
+      - "${CLIENT_HOST_PORT_2:-40202}:${CLIENT_PORT:-40200}/udp"
+    healthcheck:
+      test: ["CMD", "pgrep", "-x", "rune_broker"]
+      interval: 5s
+      timeout: 3s
+      start_period: 20s
+      retries: 5
+    restart: unless-stopped
+
+  rune-3:
+    image: ${RUNE_IMAGE:-rune-broker:latest}
+    platform: linux/amd64
+    hostname: rune-3
+    # DR-BUG-RESTART-BIND: these fixed ports lie inside Linux's ephemeral range (32768-60999); reserved (a
+    # per-netns sysctl) so no socket auto-bound first - e.g. the broker's own Aeron publications while it
+    # starts - can take one and fail a (re)start with 'Address already in use' (the broker WARNs otherwise).
+    sysctls:
+      net.ipv4.ip_local_reserved_ports: "${CONSENSUS_PORT:-40111},${CLIENT_PORT:-40200},${REPLICATION_PORT:-40222}"
+    shm_size: ${SHM_SIZE:-256m}
+    environment:
+      RUNE_NODE_ID: "2"
+      RUNE_PEERS: "0@rune-1:${CONSENSUS_PORT:-40111}:${CLIENT_PORT:-40200}:${REPLICATION_PORT:-40222},1@rune-2:${CONSENSUS_PORT:-40111}:${CLIENT_PORT:-40200}:${REPLICATION_PORT:-40222},2@rune-3:${CONSENSUS_PORT:-40111}:${CLIENT_PORT:-40200}:${REPLICATION_PORT:-40222}"
+      RUNE_CLIENT_ENDPOINT: "0.0.0.0:${CLIENT_PORT:-40200}"
+      RUNE_DATA_DIR: /var/lib/rune
+      # Empty: an empty data dir refuses to start (format it first: see rune-cluster.env.example).
+      RUNE_STORAGE_FORMAT: "${RUNE_STORAGE_FORMAT:-}"
+      # Authentication is ON by default: the same cluster key file on every node (see CLUSTER_KEY_FILE).
+      RUNE_CLUSTER_KEY_FILE: /run/secrets/cluster.key
+      RUNE_CLIENT_STREAM_ID: "${RUNE_CLIENT_STREAM_ID:-1}"
+      RUNE_CONSENSUS_STREAM_ID: "${RUNE_CONSENSUS_STREAM_ID:-10}"
+      RUNE_ELECTION_TIMEOUT_MS: "${RUNE_ELECTION_TIMEOUT_MS:-150}"
+      RUNE_ELECTION_STATUS_INTERVAL_MS: "${RUNE_ELECTION_STATUS_INTERVAL_MS:-20}"
+      RUNE_STARTUP_CANVASS_TIMEOUT_MS: "${RUNE_STARTUP_CANVASS_TIMEOUT_MS:-100}"
+    volumes:
+      - ${DATA_DIR_3:-./rune-data/node2}:/var/lib/rune
+      - type: bind
+        source: ${CLUSTER_KEY_FILE:-./secrets/cluster.key}
+        target: /run/secrets/cluster.key
+        read_only: true
+        bind:
+          create_host_path: false   # a missing key file fails the start; never a directory
+    ports:
+      - "${CLIENT_HOST_PORT_3:-40203}:${CLIENT_PORT:-40200}/udp"
+    healthcheck:
+      test: ["CMD", "pgrep", "-x", "rune_broker"]
+      interval: 5s
+      timeout: 3s
+      start_period: 20s
+      retries: 5
+    restart: unless-stopped

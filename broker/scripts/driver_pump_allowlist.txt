@@ -1,0 +1,46 @@
+# Exact allowlist for scripts/check_single_driver_pumper.py (inverted single-pumper rule).
+# Each entry: <file> | <normalized line text> | <count>.  Every site below is inside a
+# dedicated driver-thread lambda or a drain that runs after that thread is joined.
+# Prefer rune::node::EmbeddedDriver for new harnesses instead of adding entries.
+
+docker/ping-probe/ping_probe.cpp | aeron_driver_main_idle_strategy(g_driver, aeron_driver_main_do_work(g_driver)); | 1
+docker/ping-probe/ping_probe.cpp | if (aeron_driver_main_do_work(g_driver) == 0) break; | 1
+libs/gateway/tests/integration/GatewayAsyncDropTest.cpp | aeron_driver_main_do_work(driver_); | 1
+libs/gateway/tests/integration/GatewayAsyncDropTest.cpp | driver_, aeron_driver_main_do_work(driver_)); | 1
+libs/gateway/tests/integration/GatewayAsyncDropTest.cpp | if (aeron_driver_main_do_work(driver_) == 0) { | 1
+libs/gateway/tests/integration/GatewayDataOpRedirectTest.cpp | aeron_driver_main_do_work(driver_)); | 1
+libs/gateway/tests/integration/GatewayDataOpRedirectTest.cpp | aeron_driver_main_do_work(driver_); | 1
+libs/gateway/tests/integration/GatewayDataOpRedirectTest.cpp | if (aeron_driver_main_do_work(driver_) == 0) { | 1
+libs/gateway/tests/integration/GatewayLoopbackTest.cpp | aeron_driver_main_do_work(driver_)); | 1
+libs/gateway/tests/integration/GatewayLoopbackTest.cpp | aeron_driver_main_do_work(driver_); | 1
+libs/gateway/tests/integration/GatewayLoopbackTest.cpp | if (aeron_driver_main_do_work(driver_) == 0) { | 1
+libs/gateway/tests/integration/GatewayPerPartitionRoutingTest.cpp | aeron_driver_main_do_work(driver_)); | 1
+libs/gateway/tests/integration/GatewayPerPartitionRoutingTest.cpp | aeron_driver_main_do_work(driver_); | 1
+libs/gateway/tests/integration/GatewayPerPartitionRoutingTest.cpp | if (aeron_driver_main_do_work(driver_) == 0) { | 1
+libs/gateway/tests/integration/GatewayProduceTest.cpp | aeron_driver_main_do_work(driver_)); | 1
+libs/gateway/tests/integration/GatewayProduceTest.cpp | aeron_driver_main_do_work(driver_); | 1
+libs/gateway/tests/integration/GatewayProduceTest.cpp | if (aeron_driver_main_do_work(driver_) == 0) { | 1
+libs/gateway/tests/integration/GatewayRedirectTest.cpp | aeron_driver_main_do_work(driver_)); | 1
+libs/gateway/tests/integration/GatewayRedirectTest.cpp | aeron_driver_main_do_work(driver_); | 1
+libs/gateway/tests/integration/GatewayRedirectTest.cpp | if (aeron_driver_main_do_work(driver_) == 0) { | 1
+libs/gateway/tests/integration/GatewaySubscribeTest.cpp | aeron_driver_main_do_work(driver_)); | 1
+libs/gateway/tests/integration/GatewaySubscribeTest.cpp | aeron_driver_main_do_work(driver_); | 1
+libs/gateway/tests/integration/GatewaySubscribeTest.cpp | if (aeron_driver_main_do_work(driver_) == 0) { | 1
+libs/gateway/tests/integration/GatewayTimeoutTest.cpp | aeron_driver_main_do_work(driver_)); | 1
+libs/gateway/tests/integration/GatewayTimeoutTest.cpp | aeron_driver_main_do_work(driver_); | 1
+libs/gateway/tests/integration/GatewayTimeoutTest.cpp | if (aeron_driver_main_do_work(driver_) == 0) { | 1
+libs/gateway/tests/integration/MdcEgressSpikeTest.cpp | aeron_driver_main_idle_strategy(driver_, aeron_driver_main_do_work(driver_)); | 1
+libs/gateway/tests/integration/MetadataRequestTest.cpp | aeron_driver_main_do_work(driver_)); | 1
+libs/gateway/tests/integration/MetadataRequestTest.cpp | aeron_driver_main_do_work(driver_); | 1
+libs/gateway/tests/integration/MetadataRequestTest.cpp | if (aeron_driver_main_do_work(driver_) == 0) { | 1
+libs/gateway/tests/integration/ProduceIdempotentTest.cpp | aeron_driver_main_do_work(driver_)); | 1
+libs/gateway/tests/integration/ProduceIdempotentTest.cpp | aeron_driver_main_do_work(driver_); | 1
+libs/gateway/tests/integration/ProduceIdempotentTest.cpp | if (aeron_driver_main_do_work(driver_) == 0) { | 1
+libs/gateway/tests/integration/ReadCommittedPushTest.cpp | driver_, aeron_driver_main_do_work(driver_)); | 1
+libs/gateway/tests/integration/ReadCommittedPushTest.cpp | if (aeron_driver_main_do_work(driver_) == 0) break; | 1
+libs/node/tests/integration/CatalogBootstrapRoutingImageTest.cpp | driver, aeron_driver_main_do_work(driver)); | 1
+libs/node/tests/integration/UdpMessageSinkResolveTest.cpp | aeron_driver_main_idle_strategy(driver_, aeron_driver_main_do_work(driver_)); | 1
+libs/replication/tests/integration/AeronPartitionTransportIntegrationTest.cpp | aeron_driver_main_idle_strategy(driver_, aeron_driver_main_do_work(driver_)); | 1
+tests/integration/AeronTransportLoopbackTest.cpp | aeron_driver_main_idle_strategy(driver_, aeron_driver_main_do_work(driver_)); | 1
+libs/replication/tests/integration/PeerSealedTransportTest.cpp | thread_ = std::thread([this] { while (running_.load()) aeron_driver_main_idle_strategy(driver_, aeron_driver_main_do_work(driver_)); }); | 1
+libs/consensus/tests/consensus/PeerSealedConsensusTest.cpp | thread_ = std::thread([this] { while (running_.load()) aeron_driver_main_idle_strategy(driver_, aeron_driver_main_do_work(driver_)); }); | 1

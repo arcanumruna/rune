@@ -1,0 +1,7 @@
+// Generated into TSan builds only (see top-level CMakeLists.txt).
+// Every executable in a -fsanitize=thread build links this object, so the
+// vendored-Aeron suppressions apply whether a test runs under ctest or by hand.
+// An explicit TSAN_OPTIONS still overrides/extends these defaults.
+extern "C" const char* __tsan_default_options() {
+    return "suppressions=@RUNE_TSAN_AERON_SUPP@";
+}
