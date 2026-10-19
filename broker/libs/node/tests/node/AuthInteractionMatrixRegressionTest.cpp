@@ -56,8 +56,8 @@ TEST_P(AuthMatrixRegression, Cell) {
 
     // Streams under RevokedMid / UserDisabledMid: the subscription is live and receiving before the change.
     std::string why;
-    const bool liveStream = isStream(c.op) && first.subId > 0 &&
-                            (outcome == Outcome::EndedNotAuthorized || outcome == Outcome::SessionRevoked);
+    const bool liveStream = isStream(c.op) && (outcome == Outcome::EndedNotAuthorized || outcome == Outcome::SessionRevoked);
+    if (liveStream) { EXPECT_GT(first.subId, 0) << label << ": a live stream has a subscription id"; if (first.subId <= 0) return; }
     if (liveStream) EXPECT_TRUE(cell.makeLive(c.op, first, why)) << label << ": " << why;
 
     bool disabled = false;
@@ -112,6 +112,17 @@ TEST_P(AuthMatrixRegression, Cell) {
 INSTANTIATE_TEST_SUITE_P(All, AuthMatrixRegression, ::testing::ValuesIn(allCells()), [](const auto& info) {
     return std::string(name(info.param.op)) + "_" + std::string(name(info.param.grant)) + "_" + std::string(name(info.param.timing));
 });
+
+// N1: the matrix once failed a cell at random because the client's Keepalive ticks drew their correlation ids from the same
+// counter as requests, so lastCorrelationId() (read after a helper's wait) named a Keepalive, not the request.
+TEST(AuthMatrixRigRegression, KeepaliveDoesNotTakeCorrelationIdsFromRequestsRegression) {
+    rune::node::test::AuthRig r("kacorr");
+    const int64_t sid = r.newUser({});
+    (void)sid;
+    const int64_t before = r.c().lastCorrelationId();
+    r.c().pollFor(std::chrono::milliseconds(2500), [] { return false; });   // two Keepalive ticks of the live sessions
+    EXPECT_EQ(r.c().lastCorrelationId(), before) << "a Keepalive consumed a request correlation id";
+}
 
 TEST(AuthMatrixCountRegression, CellCountsArePinned) {
     int total = 0, na[7] = {}, outcome[8] = {};

@@ -1684,7 +1684,7 @@ if(BUILD_TESTING)
         target_include_directories(rune_auth_matrix_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_auth_matrix_tests PRIVATE rune_node rune_view rune_codec rune_catalog aeron::aeron
                               GTest::gtest_main)
-        gtest_discover_tests(rune_auth_matrix_tests DISCOVERY_TIMEOUT 60 PROPERTIES TIMEOUT 900 LABELS "matrix;small")
+        gtest_discover_tests(rune_auth_matrix_tests DISCOVERY_TIMEOUT 60 PROPERTIES TIMEOUT 900 LABELS small)
         rune_regression_batches(rune_auth_matrix_tests 4)   # the 720 cells run in the *Regression* gate as 4 sharded batches
 
         # Authentication Task 13: shard-mode produce straight to the worker ingress against ONE real authenticating

@@ -32,6 +32,8 @@ public:
     using TID = rune::protocol::client::TemplateId;
     static constexpr int32_t kMissingId = 98'765;
     static constexpr int kInvalidTxnState = 19;
+    static constexpr std::chrono::milliseconds kInFlightWindow{60};   ///< records already on the wire behind the end frame
+    static constexpr std::chrono::milliseconds kQuietWindow{300};   ///< how long "nothing after the end" is watched
 
     struct Answer {
         int code = kNoAnswer;
@@ -52,7 +54,6 @@ public:
         // The writer that makes records flow into the topic a subscription watches (assertion 4).
         (void)rig_.newUser({grants::prefix(SO::Write, ST::Topic, "")}, &writerName_);
         writerSid_ = rig_.login(writerName_);
-        baselineFailed_ = rig_.broker().counter(kLoginsFailedCounterTypeId).value_or(0);
     }
     AuthRig& rig() noexcept { return rig_; }
     int64_t writerSession() const noexcept { return writerSid_; }
@@ -66,15 +67,10 @@ private:
     int ordinal_ = 0;
     std::string writerName_;
     int64_t writerSid_ = 0;
-    // The bootstrap's first connection never logs in (the admin's one-time-password session is a second one), so the broker
-    // counts it once as a failed login when its authentication deadline expires: ONE extra "logins failed" tick that lands in
-    // whichever cell is running, tolerated exactly once.
-    int64_t baselineFailed_ = 0, knownFailed_ = 0;
     // The catalog / security events read so far (a cursor each: a cell reads only what is new, never the whole log).
     std::vector<rune::catalog::CatalogEvent> catalogEvents_;
     std::vector<rune::security::SecurityEvent> securityEvents_;
     int64_t catalogCursor_ = 0, securityCursor_ = 0;
-    bool deadlineTickSeen_ = false;
 };
 
 class AuthMatrixRig::Cell {
@@ -86,7 +82,6 @@ public:
         okAtStart_ = counterNow(kLoginsOkCounterTypeId);
         failedAtStart_ = counterNow(kLoginsFailedCounterTypeId);
         revokedAtStart_ = counterNow(kSessionsRevokedCounterTypeId);
-        if (!m_.deadlineTickSeen_ && failedAtStart_ == m_.baselineFailed_ + m_.knownFailed_ + 1) m_.deadlineTickSeen_ = true;
     }
     const std::string& userName() const noexcept { return user_; }
     int64_t session() const noexcept { return sid_; }
@@ -212,8 +207,8 @@ public:
     }
 
     // ── sessions ────────────────────────────────────────────────────────────────────────────────────────────
-    /// End the cell's sessions (a live catalog / security subscription would otherwise keep every later event flowing
-    /// to this client for the rest of the process).
+    /// End the cell's sessions.  (Hygiene only: the memory growth of a long run is the live view partitions' row slabs -
+    /// AuthRig's view plans use small chunks - not dead sessions.)
     void close() {
         for (const int64_t s : {sid_, twinSid_})
             if (s != 0) (void)r_.c().disconnect(r_.ch(), r_.stream(), s);
@@ -235,7 +230,7 @@ public:
         int code = kNoAnswer;
         r_.c().pollUntil([&] {
             for (const auto& e : r_.c().errors())
-                if (e.correlationId == corr && (sessionId == 0 || e.sessionId == sessionId)) { code = e.code; return true; }
+                if (e.correlationId == corr && (sessionId == 0 || e.sessionId == sessionId)) { code = e.code; endSeq_ = e.seq; return true; }
             return false;
         });
         return code;
@@ -259,13 +254,22 @@ public:
         if (!r_.c().pollUntil([&] { return recordsOf(a.subId) > before; })) { why = "no record reached the live subscription"; return false; }
         return true;
     }
-    /// After the end frame was observed: produce more and assert none is delivered within the window.
+    /// After the end frame was observed: produce more, wait the quiet window, and assert that NO Records frame for the
+    /// subscription arrived after the end frame (arrival order, not a sample: a record pushed right behind the end counts).
     bool noDeliveryAfterEnd(Op op, const Answer& a, std::string& why) {
-        r_.c().pollFor(std::chrono::milliseconds(20), [] { return false; });
-        const std::size_t before = recordsOf(a.subId);
+        if (endSeq_ == 0) { why = "no end frame was observed"; return false; }
+        auto after = [&] { std::size_t n = 0; for (const auto& p : r_.c().records()) n += p.subscriptionId == a.subId && p.seq > endSeq_ ? 1 : 0; return n; };
+        // The admin-log reads (catalog / security) are pushed by the admin worker's own publication while the gateway sends the
+        // end from its control thread: the event that CAUSED the end (the revoke / disable) may still be in flight behind the end
+        // frame.  At most that one record is tolerated (deferred: rune-followups/issues.md, "admin-log read end is not ordered
+        // with the admin worker's pushes"); a topic subscription tolerates none.  Nothing caused by a LATER event may arrive.
+        const std::size_t allowedInFlight = op == Op::CatalogRead || op == Op::SecurityRead ? 1 : 0;
+        r_.c().pollFor(kInFlightWindow, [] { return false; });
+        const std::size_t inFlight = after();
+        if (inFlight > allowedInFlight) { why = std::to_string(inFlight) + " Records frames were delivered after the end"; return false; }
         if (!trigger(op, why)) return false;
-        r_.c().pollFor(std::chrono::milliseconds(300), [] { return false; });
-        if (recordsOf(a.subId) != before) { why = "a Records frame was delivered after the end"; return false; }
+        r_.c().pollFor(kQuietWindow, [] { return false; });
+        if (after() != inFlight) { why = "a Records frame caused by a later event was delivered after the end"; return false; }
         return true;
     }
 
@@ -452,12 +456,9 @@ public:
                            C{kLoginsFailedCounterTypeId, failedAtStart_, loginsFailed_, "logins failed"},
                            C{kSessionsRevokedCounterTypeId, revokedAtStart_, disabled ? 1 : 0, "sessions revoked"}}) {
             const int64_t now = counterNow(c.id);
-            const bool tick = c.id == kLoginsFailedCounterTypeId && !m_.deadlineTickSeen_ && now == c.start + c.delta + 1;
-            if (now != c.start + c.delta && !tick)
+            if (now != c.start + c.delta)
                 return std::string(c.name) + " counter is " + std::to_string(now) + ", expected " + std::to_string(c.start + c.delta);
-            if (tick) m_.deadlineTickSeen_ = true;
         }
-        m_.knownFailed_ += loginsFailed_;
         return {};
     }
     /// Assertion 6: every DDL this cell's user got an OK for is recorded with principal.authenticated == the user.
@@ -676,6 +677,7 @@ private:
     int32_t tid_ = -1, vid_ = -1, uid_ = -1;
     bool userCreated_ = false, twinCreated_ = false;
     int triggers_ = 0;
+    uint64_t endSeq_ = 0;   ///< arrival sequence of the last end frame errorOn() matched
     TxnState txn_, twinTxn_;
     std::vector<int64_t> oneShot_;
     std::vector<std::pair<std::string, bool>> okDdl_;

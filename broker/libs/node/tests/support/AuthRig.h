@@ -39,6 +39,7 @@ inline std::vector<uint8_t> authRigViewPlan(const std::string& viewName, const s
     rv::ViewPlan p;
     p.viewName = viewName;
     p.key = "id";
+    p.sizing.chunkBytes = 64u << 10;   // not the 32 MiB row-slab default: a rig with hundreds of views must stay small
     for (const int32_t id : sources) p.sources.push_back(rv::SourceSpec{id, "id"});
     p.output.push_back(rv::AuthoredField{"id", rune::codec::PrimType::Int64, 0, "id", rv::MergeRule::Replace});
     p.output.push_back(rv::AuthoredField{"hp", rune::codec::PrimType::Int64, 0, "hp", rv::MergeRule::Replace});

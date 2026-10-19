@@ -272,8 +272,8 @@ public:
         const std::size_t len = s.encode(buf.data());
         return send(gatewayChannel, stream, buf.data(), len) ? s.correlationId : 0;
     }
-    struct PushedRecords { int64_t subscriptionId; int64_t baseOffset; std::vector<uint8_t> bytes; };
-    struct ErrorSeen     { int64_t correlationId; int16_t code; std::string message; int64_t sessionId = 0; };
+    struct PushedRecords { int64_t subscriptionId; int64_t baseOffset; std::vector<uint8_t> bytes; uint64_t seq = 0; };
+    struct ErrorSeen     { int64_t correlationId; int16_t code; std::string message; int64_t sessionId = 0; uint64_t seq = 0; };
     /// Poll the egress until `pred()` holds (bounded: kMaxIters × 100 µs).
     template <class Pred> bool pollUntil(Pred pred) {
         for (int i = 0; i < kMaxIters; ++i) { poll_(); if (pred()) return true; pause_(); }
@@ -936,7 +936,7 @@ private:
         for (auto& cs : sessions_) {
             auto it = pubs_.find({cs.channel, cs.stream});
             if (it == pubs_.end() || !it->second) continue;
-            pc::Keepalive k; k.sessionId = cs.sessionId; k.correlationId = ++corr_;
+            pc::Keepalive k; k.sessionId = cs.sessionId; k.correlationId = ++keepaliveCorr_;   // never corr_: lastCorrelationId() must stay the last REQUEST
             uint8_t buf[pc::Keepalive::ENCODED_SIZE];
             const std::size_t len = k.encode(buf);
             aeron::concurrent::AtomicBuffer ab(buf, static_cast<aeron::util::index_t>(len));
@@ -1003,7 +1003,7 @@ private:
             case pc::TemplateId::Records:
                 if (auto r = pc::Records::decode(p, n))
                     records_.push_back({r->subscriptionId, r->baseOffset,
-                                        {r->recordBatch.begin(), r->recordBatch.end()}});
+                                        {r->recordBatch.begin(), r->recordBatch.end()}, ++arrivalSeq_});
                 break;
             case pc::TemplateId::JoinGroupResponse:
                 if (auto r = pc::JoinGroupResponse::decode(p, n))
@@ -1025,7 +1025,7 @@ private:
                 break;
             case pc::TemplateId::ErrorResponse:
                 if (auto e = pc::ErrorResponse::decode(p, n)) {
-                    errors_.push_back({e->correlationId, e->code, std::string(e->message), e->sessionId});
+                    errors_.push_back({e->correlationId, e->code, std::string(e->message), e->sessionId, ++arrivalSeq_});
                     // F-A: the broker said this session is gone (the reap's notice / an UnknownSession answer).
                     if (e->code == static_cast<int16_t>(pc::ErrorCode::SessionExpired) ||
                         e->code == static_cast<int16_t>(pc::ErrorCode::UnknownSession))
@@ -1095,6 +1095,8 @@ private:
     std::vector<ErrorSeen>                          errors_;
     std::set<int64_t>                               expired_;   // F-A: sessions the broker declared expired
     int64_t                                         corr_ = 0;
+    int64_t                                         keepaliveCorr_ = int64_t{1} << 40;   // the Keepalive ticks' own correlation ids
+    uint64_t                                        arrivalSeq_ = 0;   // one arrival order for records_ and errors_
 };
 
 } // namespace rune::node::test
