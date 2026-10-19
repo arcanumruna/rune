@@ -552,9 +552,11 @@ void BrokerNode::start() {
 
     // 5. Build all consensus objects (NodeStateFile, TermLog, Election, …).
     buildConsensusObjects();
-    // ISR v3 Step 6: node-state.dat and term.log now exist - record the Consensus class in the manifest (R-3b).
-    // Cold boot path; a failed write is logged by markPresent and retried at the next boot.
-    (void)StorageIdentity::markPresent(config_.dataDir, storage_, StorageIdentity::Class::Consensus);
+    // ISR v3 Step 6: record the Consensus class in the manifest (R-3b) once node-state.dat AND term.log exist
+    // non-empty.  On a restart they do; on a first boot term.log is still empty here, so
+    // serviceAdminControl_ marks it as soon as the first term is written (ruling: the recipe marked it
+    // unconditionally here, which makes the NEXT boot refuse when the node stopped before its first term).
+    markConsensusWhenPresent_();
     const auto t3 = sclock::now();
 
     // 5b. hotpath-A F2: the segment provisioner exists BEFORE any replica is
@@ -745,6 +747,11 @@ void BrokerNode::buildConsensusObjects() {
     }
 }
 
+void BrokerNode::markConsensusWhenPresent_() {
+    if ((storage_.manifest & static_cast<uint8_t>(StorageIdentity::Class::Consensus)) != 0) { consensusUnmarked_ = false; return; }
+    if (!StorageIdentity::isPresent(config_.dataDir, StorageIdentity::Class::Consensus)) return;
+    if (StorageIdentity::markPresent(config_.dataDir, storage_, StorageIdentity::Class::Consensus)) consensusUnmarked_ = false;
+}
 void BrokerNode::markKnowledgeThunk_(void* self) noexcept {
     auto* n = static_cast<BrokerNode*>(self);
     try { (void)StorageIdentity::markPresent(n->config_.dataDir, n->storage_, StorageIdentity::Class::Knowledge); } catch (...) {}
@@ -3934,6 +3941,10 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
     work += publishPlacementView_();
     work += reportUnbuildableReplicas_();
     work += checkLinkMtu_(nowNs, /*force=*/false);   // re-check I1: the runtime's clock, no per-pass clock read
+    if (consensusUnmarked_ && nowNs - lastConsensusMarkCheckNs_ >= 1'000'000'000LL) {   // ISR v3 Step 6 (cold: until marked)
+        lastConsensusMarkCheckNs_ = nowNs;
+        markConsensusWhenPresent_();
+    }
 
     // (1b) admin → control ring (F3 round 6/7, ported into T11's direct-call
     //      control plane):

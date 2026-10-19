@@ -1878,6 +1878,9 @@ private:
     static bool isTransientTopicTrampoline_(void* ctx, int32_t topicId) noexcept;
     /// ISR v3 Step 6: the storage manifest markers.  Each runs once, on the control thread (cold fsync), when the
     /// class first exists durably: the internal-ISR knowledge file / the first committed __cluster_metadata apply.
+    void markConsensusWhenPresent_();
+    bool    consensusUnmarked_ = true;          ///< the Consensus class is not in the manifest yet
+    int64_t lastConsensusMarkCheckNs_ = 0;
     static void markKnowledgeThunk_(void* self) noexcept;
     static void markMetadataLogThunk_(void* self) noexcept;
     static uint64_t transientLineageVersionTrampoline_(void* ctx) noexcept;   // R1 (round 5)

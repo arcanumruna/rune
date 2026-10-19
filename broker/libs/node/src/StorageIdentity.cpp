@@ -616,6 +616,8 @@ int64_t SI::bumpProcessIncarnation(const std::string& dataDir, int64_t realtimeN
     return next;
 }
 
+bool SI::isPresent(const std::string& d, Class c) { return classPresent(fs::path{d}, c); }
+
 bool SI::markPresent(const std::string& d, Loaded& l, Class c) {
     if (has(l.manifest, c)) return true;
     Loaded n = l;

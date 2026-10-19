@@ -476,3 +476,16 @@ TEST(StorageIdentityRegression, IncarnationIsMonotonicAcrossAWipedDataDirRegress
     // Unwritable / unnamed dir: the clock.
     EXPECT_EQ(StorageIdentity::bumpProcessIncarnation("", 7777), 7777);
 }
+
+// ISR v3 Step 6 (found by ShardModeRegression.PeerFixedAndRestartedHeals): the Consensus class counts as present only
+// when node-state.dat AND term.log are NON-EMPTY.  A node that stops before its first term has an empty term.log, and
+// marking the class then makes the next boot refuse with R-3b.  RED: isPresent answers "exists".
+TEST(StorageIdentityRegression, ConsensusClassIsPresentOnlyOnceTheTermLogHoldsDataRegression) {
+    TmpDir t("consensus_present");
+    const std::string d = t.str();
+    touch(t.path / "node-state.dat", "x");
+    touch(t.path / "term.log", "");
+    EXPECT_FALSE(StorageIdentity::isPresent(d, StorageIdentity::Class::Consensus));
+    touch(t.path / "term.log", "y");
+    EXPECT_TRUE(StorageIdentity::isPresent(d, StorageIdentity::Class::Consensus));
+}

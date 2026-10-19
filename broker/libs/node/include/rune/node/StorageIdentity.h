@@ -72,6 +72,8 @@ public:
     static bool persistOrigin(const std::string& dir, Loaded& l, Origin to);
     /// Sets one manifest class.  Idempotent (no write when already set); never clears.
     static bool markPresent(const std::string& dir, Loaded& l, Class c);
+    /// True when the class's files exist non-empty in <dir> (the R-3b test).  Cold.
+    static bool isPresent(const std::string& dir, Class c);
     /// Test only (ShardModeTest): clears one manifest class of the dir's storage.meta.
     static bool clearClassForTest(const std::string& dir, Class c);
 
