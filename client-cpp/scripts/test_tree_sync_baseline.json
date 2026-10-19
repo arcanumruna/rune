@@ -8,6 +8,14 @@
   "include|#include <atomic>": 1,
   "sleep|std::this_thread::sleep_for": 8
  },
+ "tests/RuneCliSecurityLiveTest.cpp": {
+  "atomic|std::atomic": 4,
+  "include|#include <atomic>": 1,
+  "include|#include <mutex>": 1,
+  "lock|std::lock_guard": 3,
+  "mutex|std::mutex": 4,
+  "sleep|std::this_thread::sleep_for": 2
+ },
  "tests/agent/ClientAgentTest.cpp": {
   "atomic|std::atomic": 12,
   "include|#include <atomic>": 1,
@@ -17,15 +25,24 @@
   "atomic|std::atomic": 1,
   "include|#include <atomic>": 1
  },
+ "tests/catalog/CatalogReaderTest.cpp": {
+  "atomic|std::atomic": 2,
+  "include|#include <atomic>": 1
+ },
  "tests/client/ClientNotLeaderRetryTest.cpp": {
   "atomic|std::atomic": 5,
   "include|#include <atomic>": 1,
   "sleep|std::this_thread::sleep_for": 6
  },
  "tests/client/ClientSchemaTest.cpp": {
-  "atomic|std::atomic": 7,
+  "atomic|std::atomic": 11,
   "include|#include <atomic>": 1,
   "sleep|std::this_thread::sleep_for": 4
+ },
+ "tests/client/ClientSubscribeNotLeaderRegressionTest.cpp": {
+  "atomic|std::atomic": 10,
+  "include|#include <atomic>": 1,
+  "sleep|std::this_thread::sleep_for": 12
  },
  "tests/client/ClientTest.cpp": {
   "atomic|std::atomic": 14,
@@ -37,13 +54,22 @@
   "include|#include <atomic>": 1,
   "sleep|std::this_thread::sleep_for": 1
  },
+ "tests/client/ConnectRedirectRegressionTest.cpp": {
+  "atomic|std::atomic": 1,
+  "include|#include <atomic>": 1,
+  "sleep|std::this_thread::sleep_for": 6
+ },
+ "tests/client/GroupRoutingRegressionTest.cpp": {
+  "sleep|std::this_thread::sleep_for": 1
+ },
  "tests/client/HandleLifetimeTest.cpp": {
   "atomic|std::atomic": 17,
   "include|#include <atomic>": 1
  },
  "tests/client/HubCommandClientTest.cpp": {
-  "atomic|std::atomic": 12,
+  "atomic|std::atomic": 14,
   "include|#include <atomic>": 1,
+  "sleep|std::this_thread::sleep_for": 2,
   "sync|barrier": 2
  },
  "tests/client/InvokerClientTest.cpp": {
@@ -67,7 +93,12 @@
  "tests/client/RedirectTest.cpp": {
   "atomic|std::atomic": 12,
   "include|#include <atomic>": 1,
-  "sleep|std::this_thread::sleep_for": 24
+  "sleep|std::this_thread::sleep_for": 34
+ },
+ "tests/client/TlsConnectEdgeRegressionTest.cpp": {
+  "atomic|std::atomic": 1,
+  "include|#include <atomic>": 1,
+  "sleep|std::this_thread::sleep_for": 5
  },
  "tests/detail/OneToOneRingBufferTest.cpp": {
   "atomic|std::atomic": 1,
@@ -129,6 +160,10 @@
   "atomic|std::atomic": 5,
   "include|#include <atomic>": 1,
   "sleep|std::this_thread::sleep_for": 18
+ },
+ "tests/security/SecurityReaderTest.cpp": {
+  "atomic|std::atomic": 2,
+  "include|#include <atomic>": 1
  },
  "tests/subscriber/SubscriberHubCommandTest.cpp": {
   "atomic|std::atomic": 2,
