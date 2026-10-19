@@ -15,6 +15,10 @@
 // placement is HELD on every broker, the DDL commits + applies, every broker is probed for 1.5 s (a produce + Subscribe per
 // partition / a GetViewRow: retriable refusal only), no DDL answer may arrive in the window; then the placement is released.
 // Views are read through EVERY broker (a non-source broker redirects to the source leader, C1) and the hp checked.
+// CreateView under VLS B.6 (checkpoint fix B): a view sink is replica-less and owns NO placement, so the held placement gates
+// nothing of it - the cell instead pre-loads a sentinel key into the source and checks the view's REAL readiness gates
+// (committed + applied, plan delivered, source folded): never AbsentKey / UnknownView / a wrong row of the sentinel once
+// applied, the sentinel row served through every broker while the placement is held, and the OK allowed in the window.
 //
 // Test-only seams (the Task 22 report lists them): BrokerNode::crashForTest (a REAL crash: no controlled
 // shutdown), BrokerNode::holdCatalogAnswersForTest (the leader's DDL commits but is never answered),
@@ -100,6 +104,9 @@ constexpr int cNoAnswer = -2;   // R-I1: a broker that never answered (NOT the i
 [[nodiscard]] int64_t hpFor(int n, const std::string& name) {
     return 1000 * n + static_cast<int64_t>(std::hash<std::string>{}(name) % 997);
 }
+/// CreateView x CreateRacesPlacement (VLS B.6): the key / hp the source holds before the CreateView (never a dataCheck key 100n+10p+1).
+inline constexpr int64_t kRacesViewSentinelKey = 9;
+inline constexpr int64_t kRacesViewSentinelHp  = 4242;
 /// A view row of the "id, hp" view (viewPlanBlob): [null bitmap 1 B][id i64][hp i64] - its hp, or -1 when malformed.
 [[nodiscard]] int64_t rowHp(const std::vector<uint8_t>& row) {
     if (row.size() != 17) return -1;
@@ -1004,6 +1011,15 @@ void runCell(const CellParam& param, const CellSeams& seams = {}, CellOutcome* o
             ASSERT_TRUE(si.has_value());
             srcId = si->id;
         }
+        if (timing == cm::Timing::CreateRacesPlacement) {
+            // VLS B.6 (checkpoint fix B): the source already holds the sentinel key BEFORE the CreateView, so the window can
+            // tell a servable read (its row) from a premature / stale one (AbsentKey of a key the source holds).
+            const ProduceIdentity ident = freshIdentity();
+            const std::string value = asString(characterValue(kRacesViewSentinelKey, kRacesViewSentinelHp));
+            ASSERT_TRUE(rig.produceFollowing(preLeader, srcId, 0, batchFor(true, kRacesViewSentinelKey, value, ident), 60s, ident))
+                << cell << ": the sentinel record was never accepted into src";
+            srcHave[0].push_back(value);
+        }
         if (reuse) {
             ASSERT_NO_FATAL_FAILURE(rig.must(createViewSender("v", srcId), "create v (to be dropped)", preLeader));
             ASSERT_NO_FATAL_FAILURE(rig.must(dropViewSender("v"), "drop v", preLeader));
@@ -1166,18 +1182,48 @@ void runCell(const CellParam& param, const CellSeams& seams = {}, CellOutcome* o
                     if (answersHeldOn != lead && c.running(lead)) c.node(lead).holdCatalogAnswersForTest(false);
                     tRelease = Clock::now();
                 };
+                // VLS B.6 (checkpoint fix B): a view sink is replica-less and catalog-only - it owns NO placement, so the
+                // held placement gates nothing of the view.  Its real readiness gates are: the CreateView committed AND
+                // applied on the broker (the CatalogApplier applies [next, HW) only), the plan on every worker (the
+                // gateway's viewSinksAwaitingPlan_), the SOURCE partition placed and led, and the instance folded to the
+                // source's committed tail under THIS leadership.  The source holds the sentinel key before the CreateView,
+                // so a read before the view is servable shows as AbsentKey (stale) or UnknownView (applied, yet unknown);
+                // the only legitimate answers once it is applied are NotReady and the sentinel's row.
+                auto viewServableRead = [&](const Rig::ViewRead& r) {
+                    return r.ok() && rowHp(r.row) == kRacesViewSentinelHp;
+                };
+                auto viewLegitimate = [&](const Rig::ViewRead& r) {
+                    return viewServableRead(r) || (r.answered && !r.finalIsError && r.finalCode == pc::ViewRowResponse::kNotReady);
+                };
+                auto viewAnswerText = [](const Rig::ViewRead& r) {
+                    return r.answered ? std::string(r.finalIsError ? "error " : "status ") + std::to_string(r.finalCode) +
+                                            (r.ok() ? " hp " + std::to_string(rowHp(r.row)) : std::string())
+                                      : std::string("nothing");
+                };
                 if (info) {
                     auto refusing = [&](int n) {
                         if (kind == cm::Kind::CreateTopic) {
                             const int code = rig.produceOnce(n, info->id, 0, batchFor(true, 1, "warm"));
                             return code == cNotLeader || code == cRedirect;
                         }
-                        const auto r = rig.viewRowFollowing(n, info->id, 101);
-                        return r.answered && !r.finalIsError && r.finalCode == pc::ViewRowResponse::kNotReady;
+                        // B.6: warm up until the view SERVES through this broker - the held placement must not block it.  Before
+                        // that (not applied here yet / plan / fold pending) the answer is UnknownView, NotReady or a route
+                        // refusal; an AbsentKey or a wrong row of the sentinel the source already holds is a premature read.
+                        const auto r = rig.viewRowFollowing(n, info->id, static_cast<uint64_t>(kRacesViewSentinelKey));
+                        ++probes;
+                        EXPECT_FALSE(r.answered && !r.finalIsError &&
+                                     (r.finalCode == pc::ViewRowResponse::kAbsentKey || (r.ok() && !viewServableRead(r))))
+                            << what << ": GetViewRow(sentinel) through node " << n << " answered " << viewAnswerText(r)
+                            << " before the view served (a premature / stale read)";
+                        return viewServableRead(r);
                     };
                     for (int n : c.runningNodes()) {
                         const auto upTo = Clock::now() + 20s;
-                        while (Clock::now() < upTo && !refusing(n)) std::this_thread::sleep_for(20ms);
+                        bool reached = false;
+                        while (Clock::now() < upTo && !(reached = refusing(n))) std::this_thread::sleep_for(20ms);
+                        if (kind == cm::Kind::CreateView)
+                            EXPECT_TRUE(reached) << what << ": the view never served the sentinel row through node " << n
+                                                 << " (B.2: a sink owns no placement, the held placement must gate nothing)";
                     }
                     release();   // the event is applied: the OK enters the gate NOW (headSince starts), the window is inside its cap
                     if (seams.afterAnswerRelease) seams.afterAnswerRelease(c, rig);
@@ -1186,13 +1232,18 @@ void runCell(const CellParam& param, const CellSeams& seams = {}, CellOutcome* o
                             if (kind == cm::Kind::CreateTopic) {
                                 for (int p = 0; p < info->partitions; ++p) probes += rig.expectRetriableRefusal(n, info->id, p, what);
                             } else {
-                                const auto r = rig.viewRowFollowing(n, info->id, 101);
+                                const auto r = rig.viewRowFollowing(n, info->id, static_cast<uint64_t>(kRacesViewSentinelKey));
                                 ++probes;
-                                EXPECT_TRUE(r.answered && !r.finalIsError && r.finalCode == pc::ViewRowResponse::kNotReady)
-                                    << what << ": GetViewRow through node " << n << " answered "
-                                    << (r.answered ? std::string(r.finalIsError ? "error " : "status ") + std::to_string(r.finalCode)
-                                                   : std::string("nothing"))
-                                    << " (want NotReady: never AbsentKey / UnknownView / OK before the placement commits)";
+                                EXPECT_TRUE(viewLegitimate(r))
+                                    << what << ": GetViewRow(sentinel) through node " << n << " answered " << viewAnswerText(r)
+                                    << " (want the sentinel row or NotReady: never AbsentKey / UnknownView / a wrong row once applied)";
+                                // A key the source does not hold yet: AbsentKey (served) or NotReady, never a row / UnknownView.
+                                const auto a = rig.viewRowFollowing(n, info->id, 101);
+                                ++probes;
+                                EXPECT_TRUE(a.answered && !a.finalIsError &&
+                                            (a.finalCode == pc::ViewRowResponse::kAbsentKey || a.finalCode == pc::ViewRowResponse::kNotReady))
+                                    << what << ": GetViewRow(101, not in the source yet) through node " << n << " answered "
+                                    << viewAnswerText(a) << " (want AbsentKey or NotReady)";
                             }
                         }
                     }
@@ -1206,7 +1257,13 @@ void runCell(const CellParam& param, const CellSeams& seams = {}, CellOutcome* o
                 const Answer early = rig.await(ddlCorr, 20ms);
                 const auto held = Clock::now() - tRelease;
                 const auto gateCap = std::chrono::nanoseconds(BrokerNode::kDdlAnswerMaxHoldNs);
-                if (early.got) {
+                if (early.got && kind == cm::Kind::CreateView) {
+                    // VLS B.6: the sink owns no placement, so the CreateView's OK legitimately arrives while every placement
+                    // is held - here only after the event committed + applied on every broker and the view served the sentinel
+                    // through each one (above).  Never the gate's in-doubt Internal: there is no placement to overrun.
+                    if (early.code == cNotLeader) { pert.earlyNotLeader = true; pert.stampHarness(); }
+                    else EXPECT_EQ(early.code, cOk) << what << ": the CreateView's early answer (no placement gates a view sink)";
+                } else if (early.got) {
                     EXPECT_NE(early.code, cOk) << what << ": the DDL's OK arrived while its placement was HELD (R7)";
                     if (early.code == cNotLeader) { pert.earlyNotLeader = true; pert.stampHarness(); }
                     else EXPECT_TRUE(early.code == cInternal && held >= gateCap - 250ms)
@@ -1580,7 +1637,8 @@ void racesPlacementBelowMinIsr(cm::Kind kind, bool holdAnswers) {
 TEST(CatalogClusterRegression, RacesPlacementWithTheCatalogBelowMinIsrBeforeCommitNeverAnswersEarlyRegression) {
     racesPlacementBelowMinIsr(cm::Kind::CreateTopic, /*holdAnswers=*/true);
 }
-// T3b: the CreateView sibling.
+// T3b: the CreateView sibling (VLS B.6: the view's gates are its commit + apply + plan + source fold, not a placement).
+// RED (checkpoint fix B): a GetViewRow answered AbsentKey for the sentinel the source holds (an unfolded / premature read).
 TEST(CatalogClusterRegression, RacesPlacementCreateViewWithTheCatalogBelowMinIsrNeverAnswersEarlyRegression) {
     racesPlacementBelowMinIsr(cm::Kind::CreateView, /*holdAnswers=*/true);
 }
