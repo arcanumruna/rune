@@ -249,11 +249,7 @@ std::expected<void, EncodeError> encodeInto(const CatalogEvent& e, std::vector<u
     w.u16(e.formatVer); w.u16(static_cast<uint16_t>(e.kind)); w.u64(e.objectId);
     w.u32(e.prevVersion); w.u32(e.newVersion); w.i64(e.timestampMs); w.u64(e.fingerprint);
     w.str16(e.objectName); w.str32(e.statement);
-    w.i64(e.principal.sessionId); w.str16(e.principal.clientName); w.str16(e.principal.sourceAddress);
-    w.str16(e.principal.authenticated); w.u64(e.principal.requestId.hi); w.u64(e.principal.requestId.lo);
-    w.u64(e.principal.requestFingerprint);
-    w.u8(e.replayedFrom ? 1 : 0);
-    if (e.replayedFrom) { w.str16(e.replayedFrom->clusterId); w.i64(e.replayedFrom->offset); w.str16(e.replayedFrom->principal); }
+    wire::writePrincipalAndReplay(w, e.principal, e.replayedFrom);
     const std::size_t lenAt = w.size();
     w.u32(0);
     putOps(w, e.ops);
@@ -284,18 +280,9 @@ std::expected<CatalogEvent, DecodeError> decode(std::span<const uint8_t> bytes) 
         if (auto v = checkKind(kind)) return std::unexpected(asDecodeError(*v));
         e.kind = static_cast<EventKind>(kind);
         if (!r.u64(e.objectId) || !r.u32(e.prevVersion) || !r.u32(e.newVersion) || !r.i64(e.timestampMs) ||
-            !r.u64(e.fingerprint) || !r.str16(e.objectName) || !r.str32(e.statement) ||
-            !r.i64(e.principal.sessionId) || !r.str16(e.principal.clientName) ||
-            !r.str16(e.principal.sourceAddress) || !r.str16(e.principal.authenticated) ||
-            !r.u64(e.principal.requestId.hi) || !r.u64(e.principal.requestId.lo) || !r.u64(e.principal.requestFingerprint))
+            !r.u64(e.fingerprint) || !r.str16(e.objectName) || !r.str32(e.statement))
             return std::unexpected(DecodeError::Truncated);
-        bool hasReplay = false;
-        if (auto err = getBool(r, hasReplay)) return std::unexpected(*err);
-        if (hasReplay) {
-            ReplayedFrom rf;
-            if (!r.str16(rf.clusterId) || !r.i64(rf.offset) || !r.str16(rf.principal)) return std::unexpected(DecodeError::Truncated);
-            e.replayedFrom = std::move(rf);
-        }
+        if (auto err = wire::readPrincipalAndReplay(r, e.principal, e.replayedFrom)) return std::unexpected(*err);
         uint32_t opsLen; Reader ops(std::span<const uint8_t>{});
         if (!r.u32(opsLen) || !r.sub(opsLen, ops)) return std::unexpected(DecodeError::Truncated);
         auto o = getOps(ops, e.kind);

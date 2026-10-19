@@ -12,6 +12,7 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace rune::catalog::wire {
@@ -52,6 +53,8 @@ public:
         if (!fits(n, kMaxListCount, Error::TooManyElements)) return;
         u16(static_cast<uint16_t>(n));
     }
+    /// Raw bytes, no length prefix (the caller's own framing says how many).
+    void raw(std::span<const uint8_t> b) { bytes(b.data(), b.size()); }
     [[nodiscard]] std::size_t size() const noexcept { return out_.size(); }
     /// Back-fill a u32 length written earlier as a placeholder at `at`: the length of
     /// everything written after it.  Over 4 GiB is FieldTooLong.
@@ -106,6 +109,12 @@ public:
         uint32_t n; if (!u32(n) || rem() < n) return false;
         b.assign(in_.data() + pos_, in_.data() + pos_ + n); pos_ += n; return true;
     }
+    /// Exactly n raw bytes into dst (no length prefix).
+    bool raw(uint8_t* dst, std::size_t n) noexcept {
+        if (rem() < n) return false;
+        for (std::size_t i = 0; i < n; ++i) dst[i] = in_[pos_ + i];
+        pos_ += n; return true;
+    }
     /// A sub-reader over the next n bytes (advances past them).
     bool sub(uint32_t n, Reader& out) noexcept {
         if (rem() < n) return false;
@@ -132,6 +141,33 @@ private:
     std::span<const uint8_t> in_;
     std::size_t pos_ = 0;
 };
+
+/// THE principal + replayedFrom wire (formatVer 1) shared by __catalog and __security events:
+///   i64 sessionId, str16 clientName, str16 sourceAddress, str16 authenticated, u64 requestId.hi,
+///   u64 requestId.lo, u64 requestFingerprint, u8 hasReplayedFrom [str16 clusterId, i64 offset, str16 principal].
+inline void writePrincipalAndReplay(Writer& w, const Principal& p, const std::optional<ReplayedFrom>& rf) {
+    w.i64(p.sessionId); w.str16(p.clientName); w.str16(p.sourceAddress);
+    w.str16(p.authenticated); w.u64(p.requestId.hi); w.u64(p.requestId.lo);
+    w.u64(p.requestFingerprint);
+    w.u8(rf ? 1 : 0);
+    if (rf) { w.str16(rf->clusterId); w.i64(rf->offset); w.str16(rf->principal); }
+}
+/// nullopt = read; Truncated = ran out of bytes; BadEnum = the hasReplayedFrom byte is not 0 or 1.
+[[nodiscard]] inline std::optional<DecodeError> readPrincipalAndReplay(Reader& r, Principal& p, std::optional<ReplayedFrom>& rf) {
+    if (!r.i64(p.sessionId) || !r.str16(p.clientName) || !r.str16(p.sourceAddress) || !r.str16(p.authenticated) ||
+        !r.u64(p.requestId.hi) || !r.u64(p.requestId.lo) || !r.u64(p.requestFingerprint))
+        return DecodeError::Truncated;
+    uint8_t has;
+    if (!r.u8(has)) return DecodeError::Truncated;
+    if (has > 1) return DecodeError::BadEnum;
+    rf.reset();
+    if (has == 1) {
+        ReplayedFrom x;
+        if (!r.str16(x.clusterId) || !r.i64(x.offset) || !r.str16(x.principal)) return DecodeError::Truncated;
+        rf = std::move(x);
+    }
+    return std::nullopt;
+}
 
 /// THE formatVer-1 TopicConfig enum bounds — one definition, used by the event validation
 /// (validateEvent, encode, decode) AND topicConfigError, so the two can never diverge.

@@ -29,6 +29,15 @@ target_include_directories(rune_catalog PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/inclu
 target_link_libraries(rune_catalog PUBLIC rune_codec)
 target_compile_features(rune_catalog PUBLIC cxx_std_23)
 
+# ── rune_security — the shared authentication library (auth spec §3): event model,
+#    frozen per-formatVer apply rules, fingerprints, permissions, replayer, .rsec.
+#    Linked by the broker, the client and the rune CLI exactly like rune_catalog.
+file(GLOB RUNE_SECURITY_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/security/*.cpp)
+add_library(rune_security STATIC ${RUNE_SECURITY_SOURCES})
+target_include_directories(rune_security PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(rune_security PUBLIC rune_catalog)
+target_compile_features(rune_security PUBLIC cxx_std_23)
+
 # ── Helper: make_catalog_golden (writes tests/catalog/golden/v<N>/basic.rcat + prints the
 #    per-offset digests for tests/catalog/CatalogGoldenPins.h).  Run ONCE per formatVer.
 add_executable(make_catalog_golden tools/make_catalog_golden.cpp)
@@ -131,6 +140,11 @@ target_link_libraries(rune_catalog_tests PRIVATE rune_catalog GTest::gtest_main)
 target_compile_definitions(rune_catalog_tests PRIVATE
     RUNE_CATALOG_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/catalog/golden")
 gtest_discover_tests(rune_catalog_tests)
+
+file(GLOB RUNE_SECURITY_TEST_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/security/*Test.cpp)
+add_executable(rune_security_tests ${RUNE_SECURITY_TEST_SOURCES})
+target_link_libraries(rune_security_tests PRIVATE rune_security GTest::gtest_main)
+gtest_discover_tests(rune_security_tests)
 
 find_package(benchmark QUIET)
 if(benchmark_FOUND)
