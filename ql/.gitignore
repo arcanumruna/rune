@@ -1,0 +1,31 @@
+# Build artifacts
+build/
+
+# CMake user presets (local overrides)
+CMakeUserPresets.json
+
+# CMake scratch
+CMakeFiles/
+cmake_install.cmake
+CMakeCache.txt
+CTestTestfile.cmake
+DartConfiguration.tcl
+Makefile
+*.cmake
+!cmake/*.cmake
+
+# Conan scratch
+.conan/
+conan_provider.cmake
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# SDD scratch
+.superpowers/
+
+# macOS
+.DS_Store
