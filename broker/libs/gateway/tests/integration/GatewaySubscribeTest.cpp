@@ -23,7 +23,9 @@
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/node/NodeConfig.h>
+#include <rune/node/ReplicaRegistry.h>
 #include <rune/node/WorkerPool.h>
+#include <rune/replication/PartitionReplica.h>
 #include <rune/protocol/client/ControlMessages.h>
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/PingMessages.h>
@@ -1755,6 +1757,20 @@ public:
                 1, rune::metadata::ShardRouter(1));
             gw_->setWorkerPool(ownedPool_.get());
             pool_ = ownedPool_.get();
+            // CP1-I4: a worker-owned log is served through its replica's published HW (never read by the gateway).
+            const std::pair<int32_t, int32_t> parts[] = {{kTopicIdA, 4}, {kTopicIdC, 1}};
+            for (const auto& [tid, n] : parts)
+                for (int32_t p = 0; p < n; ++p) {
+                    rune::replication::PartitionConfig c;
+                    c.topicId = tid; c.partitionId = p; c.selfId = 1; c.minIsr = 1;
+                    c.replicaLagMaxOffset = 1'000'000'000; c.replicaLagMaxMs = 600'000;
+                    auto rep = std::make_unique<rune::replication::PartitionReplica>(
+                        c, rune::replication::Role::Leader, 1, std::vector<int32_t>{1}, std::vector<int32_t>{1},
+                        registry_->log(tid, p), &lbTransport_);
+                    rep->setExternalFollowerFlush(true);
+                    lbReplicas_.add(tid, p, std::move(rep));
+                }
+            gw_->setReplicaRegistry(&lbReplicas_);
         }
     }
     void TearDown() override {
@@ -1855,11 +1871,20 @@ public:
         std::vector<uint8_t> bytes = tmpl;
         for (int i = 0; i < 8; ++i) bytes[i] = static_cast<uint8_t>(static_cast<uint64_t>(base) >> (8 * i));
         log->appendNoSync(bytes.data(), bytes.size(), base);   // page cache: visible to readers
+        if (GetParam()) {   // publish the new end through the replica's HW (what the gateway clamps to)
+            if (auto* rep = lbReplicas_.lookup(kTopicIdA, partition)) {
+                rep->onLeaderLogAppended();
+                rep->doWork(lbNow_ += 1'000'000);
+            }
+        }
         return bytes;
     }
     std::map<std::size_t, std::vector<uint8_t>> built_;
+    int64_t lbNow_ = 1'000'000'000;
 
     std::unique_ptr<rune::node::WorkerPool> ownedPool_;
+    rune::replication::InMemoryTransport lbTransport_;
+    rune::node::ReplicaRegistry lbReplicas_;
 };
 
 TEST_P(GatewayLargeBatchPushRegression, OneMiBBatchDeliveredIntactThenSmallBatch)

@@ -19,7 +19,9 @@
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/metadata/ShardRouter.h>
+#include <rune/node/ReplicaRegistry.h>
 #include <rune/node/WorkerPool.h>
+#include <rune/replication/PartitionReplica.h>
 #include <rune/protocol/client/ControlMessages.h>
 #include <rune/protocol/client/DataMessages.h>
 
@@ -85,6 +87,8 @@ struct Rig {
     TempDir                         dir;
     std::unique_ptr<TopicRegistry>  registry;
     rune::node::WorkerPool          pool;
+    rune::replication::InMemoryTransport transport;   // CP1-I4: worker-owned logs are served via a replica's HW
+    rune::node::ReplicaRegistry     replicas;
     ClientGateway                   gw;
 
     explicit Rig(int32_t workers, int32_t partitions = 1, std::size_t ringBytes = 1 << 16)
@@ -100,6 +104,17 @@ struct Rig {
         gw.setWorkerPool(&pool);
         gw.setShardMode(true);
         gw.setPerWorkerEgressActive(true);
+        for (int32_t p = 0; p < partitions; ++p) {
+            rune::replication::PartitionConfig c;
+            c.topicId = 0; c.partitionId = p; c.selfId = 1; c.minIsr = 1;
+            c.replicaLagMaxOffset = 1'000'000'000; c.replicaLagMaxMs = 600'000;
+            auto rep = std::make_unique<rune::replication::PartitionReplica>(
+                c, rune::replication::Role::Leader, 1, std::vector<int32_t>{1}, std::vector<int32_t>{1},
+                registry->log(0, p), &transport);
+            rep->setExternalFollowerFlush(true);
+            replicas.add(0, p, std::move(rep));
+        }
+        gw.setReplicaRegistry(&replicas);
     }
     void subscribe(int64_t sid, int32_t partition) {
         const auto f = subscribeFrame(sid, 0, partition);
