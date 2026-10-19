@@ -1073,7 +1073,8 @@ public:
         rune::replication::FetchRequestMsg::encode(
             claimBuf, 0,
             req.leaderEpoch, req.partition, req.followerId,
-            req.fetchOffset, req.maxBytes, req.topicId, req.lastFetchedEpoch, req.incarnation);
+            req.fetchOffset, req.maxBytes, req.topicId, req.lastFetchedEpoch, req.incarnation,
+            req.storageId, req.lastEpochStartOffset);
         return pubReg_.broadcastToPeers(claimBuf, kSize);
     }
 
@@ -1090,7 +1091,8 @@ public:
         alignas(8) uint8_t claimBuf[kSize];
         rune::replication::FetchRequestMsg::encode(
             claimBuf, 0, req.leaderEpoch, req.partition, req.followerId,
-            req.fetchOffset, req.maxBytes, req.topicId, req.lastFetchedEpoch, req.incarnation);
+            req.fetchOffset, req.maxBytes, req.topicId, req.lastFetchedEpoch, req.incarnation,
+            req.storageId, req.lastEpochStartOffset);
         if (pubReg_.hasPeer(leader)) return pubReg_.sendToPeer(leader, claimBuf, kSize) > 0;
         return pubReg_.broadcastToPeers(claimBuf, kSize);
     }
@@ -1151,7 +1153,8 @@ public:
         rune::replication::FetchRequestMsg::encode(
             claimBuf, 0,
             req.leaderEpoch, req.partition, req.followerId,
-            req.fetchOffset, req.maxBytes, req.topicId, req.lastFetchedEpoch, req.incarnation);
+            req.fetchOffset, req.maxBytes, req.topicId, req.lastFetchedEpoch, req.incarnation,
+            req.storageId, req.lastEpochStartOffset);
         rune::replication::stampTemplateId(
             claimBuf, 0, rune::replication::kReconcileFetchReqTemplateId);
         return pubReg_.sendToPeer(toPeer, claimBuf, kSize) > 0;

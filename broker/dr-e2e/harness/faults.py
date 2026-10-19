@@ -388,6 +388,15 @@ def _volume_name(project: str, service_idx: int) -> str:
     return f"{project}_rune-data-{service_idx}"
 
 
+def format_storage(cluster, service: str, mode: str) -> None:
+    """Run `rune_broker storage format --<mode>` against <service>'s named volume (container stopped)."""
+    from .cluster import service_to_node_id   # lazy, like the other .cluster imports in this module
+    vol = _volume_name(cluster.project, service_to_node_id(service) + 1)
+    run(["docker", "run", "--rm", "-v", f"{vol}:/var/lib/rune", "-e", "RUNE_DATA_DIR=/var/lib/rune",
+         "--entrypoint", "/usr/local/bin/rune_broker", cluster.broker_image(), "storage", "format", f"--{mode}"],
+        timeout=60, check=True)
+
+
 def _exec_on_volume(volume: str, shell_cmd: str, timeout: int = 60):
     """Run a shell command inside a throwaway alpine container with the broker
     volume mounted at /data.  Returns CmdResult.

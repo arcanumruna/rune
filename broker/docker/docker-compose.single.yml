@@ -64,6 +64,8 @@ services:
       RUNE_PEERS: "0@rune-1:40111:40200:40222"
       RUNE_NODE_ID: "0"
       RUNE_DATA_DIR: /var/lib/rune
+      # dev: auto-format empty volumes (the dr-e2e harness and docker/*e2e.sh rely on it)
+      RUNE_STORAGE_FORMAT: "${RUNE_STORAGE_FORMAT:-auto}"
       RUNE_CLIENT_ENDPOINT: "0.0.0.0:40200"
       RUNE_ELECTION_TIMEOUT_MS: "300"
       RUNE_ELECTION_STATUS_INTERVAL_MS: "50"

@@ -1412,6 +1412,460 @@ TEST(EpochChangeTruncationTest, FollowerTruncatesToExactEpochBoundaryOffset) {
     EXPECT_EQ(replica.lastFetchedEpoch(), 3);
 }
 
+// ===========================================================================
+// ISR v3 Step 11 (3.8): the truncation guard.  A disk-backed follower that learned HW 10 from its leader in THIS epoch
+// never truncates below it: it refuses, applies nothing, fetches nothing and reports to the controller.
+// ===========================================================================
+namespace {
+struct CapturingIsr final : InMemoryTransport {
+    std::vector<AlterIsrMsg> sent;
+    int fetches = 0;
+    bool sendAlterIsr(const AlterIsrMsg& m) override { sent.push_back(m); return true; }
+    bool sendFetchRequest(const FetchRequestMsg& r) override { ++fetches; return InMemoryTransport::sendFetchRequest(r); }
+    bool sendFetchRequestTo(NodeId to, const FetchRequestMsg& r) override { ++fetches; return InMemoryTransport::sendFetchRequestTo(to, r); }
+    [[nodiscard]] int reports() const {
+        int n = 0;
+        for (const auto& m : sent) n += (m.isr[1] & AlterIsrMsg::kBumpLeaderBelowCommitted) != 0 ? 1 : 0;
+        return n;
+    }
+};
+rune::storage::Log& recovered(rune::storage::Log& l) { l.recover(); return l; }
+
+/// Follower 2 of {1,2,3} at epoch 5 behind leader 1, 10 records applied and HW 10 learned.
+struct GuardRig {
+    TempDir dir{"guard"};
+    rune::storage::Log log{dir.path};
+    CapturingIsr t;
+    PartitionReplica r;
+    int64_t now = 1'000'000'000;
+    bool unclean_;
+    /// `hwCap`: the highest HW the leader advertises (the followers learn the HW one fetch late).
+    explicit GuardRig(bool unclean = false, Offset hwCap = INT64_MAX)
+        : r(withUnclean(unclean), Role::Follower, 0, {1, 2, 3}, {1, 2, 3}, &recovered(log), &t), unclean_(unclean) {
+        r.setIsrChannel(&t);
+        r.becomeFollower(5, 1);
+        for (int i = 0; i < 10; ++i) {
+            auto p = makePayload(uint8_t(i), 8);
+            FetchResponseMsg d{};
+            d.leaderEpoch = 5; d.partition = 0; d.errorCode = kErrNone;
+            d.highWatermark = std::min<Offset>(i + 1, hwCap);
+            d.records = std::span<const uint8_t>(p.data(), p.size());
+            r.applyReplicated(d);
+        }
+    }
+    static PartitionConfig withUnclean(bool unclean) {
+        PartitionConfig c = makeConfig(2);
+        c.allowUncleanTruncation = unclean;
+        return c;
+    }
+    /// The leader answers DivergingEpoch (epoch, endOffset).
+    void diverge(int32_t epoch, Offset end, int64_t leaderEpoch = 5) {
+        FetchResponseMsg div{};
+        div.leaderEpoch = leaderEpoch; div.partition = 0; div.errorCode = kErrDivergingEpoch;
+        rune::replication::ErrorPayloadBuf b;
+        div.records = b.set(epoch, end);
+        r.applyReplicated(div);
+    }
+    /// A process restart over the same data dir: a fresh replica (HW knowledge gone), epoch cache from disk.
+    void restart() {
+        r.~PartitionReplica();
+        log.recover();
+        new (&r) PartitionReplica(withUnclean(unclean_), Role::Follower, 0, std::vector<NodeId>{1, 2, 3},
+                                  std::vector<NodeId>{1, 2, 3}, &log, &t);
+        r.setIsrChannel(&t);
+        r.becomeFollower(5, 1);
+    }
+    /// Drive `ms` milliseconds in 10 ms ticks.
+    void run(int ms) { for (int i = 0; i < ms / 10; ++i) r.doWork(now += 10'000'000); }
+};
+}  // namespace
+
+// The headline: the leader's lineage ends at 3, below the 10 this follower knows are committed -> refused, nothing is
+// truncated, a below-committed report goes to the controller within 50 ms.  RED: remove the guard branch (the follower
+// truncates to 3).
+TEST(TruncationGuardRegression, DivergenceBelowTheLearnedHighWatermarkIsRefusedAndReportedRegression) {
+    GuardRig g;
+    ASSERT_EQ(g.r.logEndOffset(), 10);
+    ASSERT_EQ(g.r.highWatermark(), 10);
+    g.diverge(5, 3);
+    ASSERT_TRUE(g.r.truncationRefusedForTest());
+    ASSERT_EQ(g.r.logEndOffset(), 10);
+    EXPECT_EQ(g.r.truncationsRefusedForTest(), 1u);
+    const int fetches0 = g.t.fetches;
+    g.run(50);
+    ASSERT_GE(g.t.reports(), 1) << "no report within 50 ms";
+    EXPECT_EQ(g.t.fetches, fetches0) << "a refusing follower must not fetch";
+    const AlterIsrMsg& m = g.t.sent.back();
+    EXPECT_EQ(m.leaderId, 2);
+    EXPECT_EQ(m.leaderEpoch, 5);
+    EXPECT_EQ(m.isrCount, AlterIsrMsg::kLeaderEpochBump);
+    EXPECT_EQ(m.isr[2], 10) << "the floor";
+    EXPECT_NE(m.proposalId, 0);
+}
+
+// An answer (Ok, or Fenced by an old controller) slows the resend to 1 s.  RED: place the answer branch after the
+// `role_ != Leader` return (reports every 50 ms).
+TEST(TruncationGuardRegression, ReportAnswerReachesTheRefusingFollowerRegression) {
+    GuardRig g;
+    g.diverge(5, 3);
+    ASSERT_TRUE(g.r.truncationRefusedForTest());
+    g.run(50);
+    ASSERT_GE(g.t.reports(), 1);
+    AlterIsrResponseMsg ok{};
+    ok.topicId = 0; ok.partition = 0; ok.leaderId = 2; ok.leaderEpoch = 5; ok.errorCode = kAlterIsrOk;
+    ok.proposalId = g.t.sent.back().proposalId;
+    g.r.onAlterIsrResponse(ok);
+    const int n0 = g.t.reports();
+    g.run(900);
+    EXPECT_EQ(g.t.reports(), n0) << "reports kept coming at the fast cadence after the answer";
+    g.run(150);
+    EXPECT_EQ(g.t.reports(), n0 + 1) << "no report at +1 s";
+}
+
+// The report is re-sent after Ok until the role changes (the controller may have lost it).  RED: stop resending after Ok.
+TEST(TruncationGuardRegression, ReportIsResentAfterOkUntilTheRoleChangesRegression) {
+    GuardRig g;
+    g.diverge(5, 3);
+    g.run(50);
+    ASSERT_GE(g.t.reports(), 1);
+    AlterIsrResponseMsg ok{};
+    ok.topicId = 0; ok.partition = 0; ok.leaderId = 2; ok.leaderEpoch = 5; ok.errorCode = kAlterIsrOk;
+    ok.proposalId = g.t.sent.back().proposalId;
+    g.r.onAlterIsrResponse(ok);
+    int n = g.t.reports();
+    g.run(1050);
+    EXPECT_EQ(g.t.reports(), n + 1);
+    n = g.t.reports();
+    g.run(1000);
+    EXPECT_EQ(g.t.reports(), n + 1) << "the report stopped after the first resend";
+    g.r.becomeFollower(6, 3);
+    EXPECT_FALSE(g.r.truncationRefusedForTest());
+    n = g.t.reports();
+    g.run(2000);
+    EXPECT_EQ(g.t.reports(), n) << "a role change must end the report";
+}
+
+// A refused replica applies nothing.  RED: no drop.
+TEST(TruncationGuardRegression, RefusedReplicaAppliesNothingRegression) {
+    GuardRig g;
+    g.diverge(5, 3);
+    ASSERT_TRUE(g.r.truncationRefusedForTest());
+    ASSERT_EQ(g.r.logEndOffset(), 10);
+    auto p = makePayload(0x77, 8);
+    FetchResponseMsg d{};
+    d.leaderEpoch = 5; d.partition = 0; d.errorCode = kErrNone; d.highWatermark = 10;
+    d.records = std::span<const uint8_t>(p.data(), p.size());
+    g.r.applyReplicated(d);
+    EXPECT_EQ(g.r.logEndOffset(), 10);
+    EXPECT_EQ(g.r.appliesDroppedRefusedForTest(), 1u);
+}
+
+// RUNE_SURVIVOR_LEADER_ELECTION (allowUncleanTruncation) keeps the Kafka behaviour.  RED: an inverted condition.
+TEST(TruncationGuardRegression, UncleanAllowedStillTruncatesRegression) {
+    GuardRig g(/*unclean=*/true);
+    g.diverge(5, 3);
+    EXPECT_EQ(g.r.logEndOffset(), 3);
+    EXPECT_FALSE(g.r.truncationRefusedForTest());
+}
+
+// The scope: a divergence in ANOTHER epoch than the one the HW was learned in still truncates (the HW is per epoch; a
+// new leader's first answer sets it).  RED: guard on a floor carried across epochs.
+TEST(TruncationGuardRegression, DifferentEpochDivergenceStillTruncatesRegression) {
+    GuardRig g;
+    g.r.becomeFollower(6, 3);   // followerHw_ resets
+    g.diverge(5, 3, /*leaderEpoch=*/6);
+    EXPECT_EQ(g.r.logEndOffset(), 3);
+    EXPECT_FALSE(g.r.truncationRefusedForTest());
+}
+
+// CP3 I1: a current-epoch leader never answers DivergingEpoch(epoch_, y) with y below the LEO of a follower that holds
+// records of that epoch - whatever HW the follower learned (here 4; the divergence ends at 7 >= 4, so the HW guard
+// alone would let it truncate).  RED: remove the same-epoch branch (the follower truncates to 7).
+TEST(TruncationGuardRegression, SameEpochTruncationAboveTheLearnedHwIsRefusedRegression) {
+    GuardRig g(false, /*hwCap=*/4);
+    ASSERT_EQ(g.r.logEndOffset(), 10);
+    ASSERT_EQ(g.r.highWatermark(), 4);
+    g.diverge(5, 7);
+    EXPECT_TRUE(g.r.truncationRefusedForTest());
+    EXPECT_EQ(g.r.logEndOffset(), 10);
+    EXPECT_EQ(g.r.truncationsRefusedSameEpochForTest(), 1u);
+    g.run(50);
+    EXPECT_GE(g.t.reports(), 1);
+}
+
+// The rule reads the durable epoch cache, so a RESTARTED follower (HW knowledge gone) refuses too.
+// RED: remove the same-epoch branch (it truncates to 0).
+TEST(TruncationGuardRegression, RestartedFollowerRefusesASameEpochTruncationRegression) {
+    GuardRig g;
+    g.restart();
+    ASSERT_EQ(g.r.logEndOffset(), 10);
+    ASSERT_EQ(g.r.highWatermark(), 0);
+    g.diverge(5, 0);
+    EXPECT_TRUE(g.r.truncationRefusedForTest());
+    EXPECT_EQ(g.r.logEndOffset(), 10);
+}
+
+// No false positive: a stale answer for an OLDER epoch (to a fetch made before the follower held epoch-5 records) keeps
+// its legitimate truncation.  RED: drop the `divergingEpoch == epoch_` condition (the first case is refused).
+TEST(TruncationGuardRegression, StaleOlderEpochDivergenceStillTruncatesRegression) {
+    GuardRig g;   // 10 records at epoch 5
+    g.r.becomeFollower(6, 1);
+    for (int i = 0; i < 3; ++i) {
+        auto p = makePayload(uint8_t(0x40 + i), 8);
+        FetchResponseMsg d{};
+        d.leaderEpoch = 6; d.partition = 0; d.errorCode = kErrNone; d.highWatermark = 0;
+        d.records = std::span<const uint8_t>(p.data(), p.size());
+        g.r.applyReplicated(d);
+    }
+    ASSERT_EQ(g.r.logEndOffset(), 13);
+    g.diverge(5, 10, /*leaderEpoch=*/6);   // epoch 5 ends at 10 on both sides: truncate to 10 (the epoch-6 tail)
+    EXPECT_FALSE(g.r.truncationRefusedForTest());
+    EXPECT_EQ(g.r.logEndOffset(), 10);
+}
+
+// CP3 I2: an epoch cache re-derived from batch stamps over a COMPACTION GAP names the first SURVIVING batch of an epoch,
+// not its first record; every other replica holds the true start.  Such a start is never compared (heldEpochStart_), on
+// either side, so an honest leader is never answered -11 / never fails over in a loop.
+namespace {
+/// Epoch-stamped single-record batches at the given bases (no replica involved): the on-disk state after compaction
+/// removed the batches in between.
+void appendStamped(rune::storage::Log& log, int32_t epoch, std::initializer_list<int64_t> bases) {
+    for (int64_t base : bases) {
+        rune::protocol::RecordBatchBuilder b(base, 1000);
+        b.append("k", "v", 1000);
+        auto x = b.build();
+        rune::protocol::RecordBatchReader::stampLeaderEpoch(x.data(), epoch);
+        log.append(x.data(), x.size(), base);
+    }
+}
+}  // namespace
+
+TEST(TruncationGuardRegression, CompactionGapRebuildIsNeverAHistoryMismatchRegression) {
+    TempDir dir("gap_rebuild");
+    {
+        rune::storage::Log log(dir.path);
+        log.recover();
+        appendStamped(log, 3, {0, 1, 2, 3, 4});
+        appendStamped(log, 5, {7, 8, 9, 10, 11});   // offsets 5..6 (epoch 5's true first batches) were compacted away
+    }
+    // The leader's own copy of the disk (the follower's boot would persist its epoch image into `dir`).
+    TempDir leaderDir("gap_rebuild_leader");
+    std::filesystem::copy(dir.path, leaderDir.path, std::filesystem::copy_options::recursive |
+                                                      std::filesystem::copy_options::overwrite_existing);
+    rune::storage::Log log(dir.path);
+    log.recover();
+    rune::storage::Log leaderLog(leaderDir.path);
+    leaderLog.recover();
+    CapturingIsr t;
+    PartitionReplica f(makeConfig(2), Role::Follower, 5, {1, 2}, {1, 2}, &log, &t);
+    ASSERT_EQ(f.logEndOffset(), 12);
+    ASSERT_EQ(f.lastFetchedEpoch(), 5);
+    EXPECT_EQ(f.heldEpochStartForTest(5), -1) << "a start derived over a gap must not be compared";
+    EXPECT_EQ(f.nextFetch().lastEpochStartOffset, -1);
+    // Leader side: rebuilt the same way, asked by a follower that holds the TRUE start 5.
+    PartitionReplica L(makeConfig(1), Role::Leader, 6, {1, 2}, {1, 2}, &leaderLog, &t);
+    EXPECT_EQ(L.heldEpochStartForTest(5), -1);
+    FetchRequestMsg req{};
+    req.leaderEpoch = 6; req.partition = 0; req.followerId = 2; req.fetchOffset = 12; req.maxBytes = 1 << 20;
+    req.topicId = 0; req.lastFetchedEpoch = 5; req.lastEpochStartOffset = 5;
+    EXPECT_NE(L.onFetchRequest(req, 1'000'000'000), kErrEpochHistoryMismatch);
+    EXPECT_EQ(L.epochHistoryMismatchesForTest(), 0u);
+}
+
+// The second rebuild site: a restart after a crash (recovery point unknown) re-derives the whole history in
+// reconcileEpochCacheWithLog_ even though an epoch image exists.  RED: reconcile does not mark the gap.
+TEST(TruncationGuardRegression, CompactionGapReconcileIsNeverAHistoryMismatchRegression) {
+    TempDir dir("gap_reconcile");
+    {
+        rune::storage::Log log(dir.path);
+        log.recover();
+        appendStamped(log, 3, {0, 1, 2, 3, 4});
+        appendStamped(log, 5, {7, 8, 9, 10, 11});
+    }
+    {   // boot 1: the epoch image is written, then the process crashes (no clean recovery-point checkpoint)
+        rune::storage::Log log(dir.path);
+        log.recover();
+        CapturingIsr t;
+        {
+            PartitionReplica f(makeConfig(2), Role::Follower, 5, {1, 2}, {1, 2}, &log, &t);
+        }
+        log.crashForTest();
+    }
+    std::error_code ec;   // no valid recovery point: restart re-derives the whole history
+    std::filesystem::remove(dir.path + "/" + rune::storage::Log::kRecoveryPointFile, ec);
+    rune::storage::Log log(dir.path);
+    log.recover();
+    CapturingIsr t;
+    PartitionReplica f(makeConfig(2), Role::Follower, 5, {1, 2}, {1, 2}, &log, &t);
+    ASSERT_EQ(f.logEndOffset(), 12);
+    ASSERT_EQ(f.lastFetchedEpoch(), 5);
+    EXPECT_EQ(f.heldEpochStartForTest(5), -1) << "a start re-derived over a gap must not be compared";
+    EXPECT_EQ(f.nextFetch().lastEpochStartOffset, -1);
+}
+
+namespace {
+/// Epoch 3 at [0,5), epoch 5 at bases 7..11 (5 and 6 compacted away).
+void writeGappedLog(const std::string& dir) {
+    rune::storage::Log log(dir);
+    log.recover();
+    appendStamped(log, 3, {0, 1, 2, 3, 4});
+    appendStamped(log, 5, {7, 8, 9, 10, 11});
+}
+/// A leader over `dir` (epoch 6) asked by a follower that holds epoch 5's TRUE start 5: must not answer -11.
+void expectHonestLeaderNotMismatched(const std::string& dir) {
+    rune::storage::Log log(dir);
+    log.recover();
+    CapturingIsr t;
+    PartitionReplica L(makeConfig(1), Role::Leader, 6, {1, 2}, {1, 2}, &log, &t);
+    FetchRequestMsg req{};
+    req.leaderEpoch = 6; req.partition = 0; req.followerId = 2; req.fetchOffset = 12; req.maxBytes = 1 << 20;
+    req.topicId = 0; req.lastFetchedEpoch = 5; req.lastEpochStartOffset = 5;
+    EXPECT_NE(L.onFetchRequest(req, 1'000'000'000), kErrEpochHistoryMismatch);
+    EXPECT_EQ(L.epochHistoryMismatchesForTest(), 0u);
+}
+}  // namespace
+
+// CP3 R1: a gapped rebuild PERSISTS its shifted start (epoch-state image); a later clean restart loads that image as
+// valid.  Trust is re-derived at every boot: a start above the log start is comparable only when record s-1 is present.
+// RED: drop the markUnprovenEpochStarts_() call (replica #2 returns 7 and the leader answers -11).
+TEST(TruncationGuardRegression, PersistedGappedRebuildImageIsNeverComparedAfterACleanRestartRegression) {
+    TempDir dir("persisted_gap");
+    writeGappedLog(dir.path);
+    {
+        rune::storage::Log log(dir.path);
+        log.recover();
+        CapturingIsr t;
+        PartitionReplica f1(makeConfig(2), Role::Follower, 5, {1, 2}, {1, 2}, &log, &t);   // rebuild; persists the image
+        ASSERT_EQ(f1.heldEpochStartForTest(5), -1);
+    }
+    TempDir copy("persisted_gap_leader");
+    std::filesystem::copy(dir.path, copy.path, std::filesystem::copy_options::recursive |
+                                                std::filesystem::copy_options::overwrite_existing);
+    {   // clean restart: the image is valid and the recovery point known
+        rune::storage::Log log(dir.path);
+        log.recover();
+        CapturingIsr t;
+        PartitionReplica f2(makeConfig(2), Role::Follower, 5, {1, 2}, {1, 2}, &log, &t);
+        ASSERT_EQ(f2.lastFetchedEpoch(), 5);
+        EXPECT_EQ(f2.heldEpochStartForTest(5), -1);
+        EXPECT_EQ(f2.nextFetch().lastEpochStartOffset, -1);
+    }
+    expectHonestLeaderNotMismatched(copy.path);
+}
+
+// The migration case: a legacy `leader-epoch-checkpoint` written by an old binary after a gapped rebuild.
+TEST(TruncationGuardRegression, LegacyCheckpointWithAGappedStartIsNeverComparedRegression) {
+    TempDir dir("legacy_gap");
+    writeGappedLog(dir.path);
+    rune::storage::LeaderEpochCache c;
+    c.assign(3, 0);
+    c.assign(5, 7);
+    c.checkpointToFile(dir.path + "/leader-epoch-checkpoint");
+    rune::storage::Log log(dir.path);
+    log.recover();
+    CapturingIsr t;
+    PartitionReplica f(makeConfig(2), Role::Follower, 5, {1, 2}, {1, 2}, &log, &t);
+    ASSERT_EQ(f.lastFetchedEpoch(), 5);
+    EXPECT_EQ(f.heldEpochStartForTest(5), -1);
+}
+
+// A contiguous log keeps its comparable start across a clean restart.  RED: the helper marks unconditionally.
+TEST(TruncationGuardRegression, ContiguousStartStillComparedAfterACleanRestartRegression) {
+    TempDir dir("contig_restart");
+    {
+        rune::storage::Log log(dir.path);
+        log.recover();
+        appendStamped(log, 3, {0, 1, 2, 3, 4});
+        appendStamped(log, 5, {5, 6, 7, 8, 9});
+    }
+    for (int boot = 0; boot < 2; ++boot) {
+        rune::storage::Log log(dir.path);
+        log.recover();
+        CapturingIsr t;
+        PartitionReplica f(makeConfig(2), Role::Follower, 5, {1, 2}, {1, 2}, &log, &t);
+        EXPECT_EQ(f.heldEpochStartForTest(5), 5) << "boot " << boot;
+    }
+}
+
+// The same without the gap: the rebuilt start is the true one and is compared.
+TEST(TruncationGuardRegression, ContiguousRebuildStillComparesRegression) {
+    TempDir dir("contig_rebuild");
+    {
+        rune::storage::Log log(dir.path);
+        log.recover();
+        appendStamped(log, 3, {0, 1, 2, 3, 4});
+        appendStamped(log, 5, {5, 6, 7, 8, 9});
+    }
+    rune::storage::Log log(dir.path);
+    log.recover();
+    CapturingIsr t;
+    PartitionReplica f(makeConfig(2), Role::Follower, 5, {1, 2}, {1, 2}, &log, &t);
+    ASSERT_EQ(f.logEndOffset(), 10);
+    EXPECT_EQ(f.heldEpochStartForTest(5), 5);
+    EXPECT_EQ(f.nextFetch().lastEpochStartOffset, 5);
+}
+
+// A same-epoch re-assert of the same leader keeps the refusal (a metadata re-apply must not unblock it).
+// RED: reset the guard before the same-epoch early return.
+TEST(TruncationGuardRegression, SameEpochReassertKeepsTheRefusalRegression) {
+    GuardRig g;
+    g.diverge(5, 3);
+    ASSERT_TRUE(g.r.truncationRefusedForTest());
+    g.r.becomeFollower(5, 1);
+    EXPECT_TRUE(g.r.truncationRefusedForTest());
+    g.r.becomeFollower(5, 3);   // another leader at the same epoch ends it
+    EXPECT_FALSE(g.r.truncationRefusedForTest());
+}
+
+// A history-mismatch answer at our epoch refuses too, and NEVER truncates (R16).  RED: truncate on the mismatch.
+TEST(TruncationGuardRegression, EpochHistoryMismatchRefusesAndNeverTruncatesRegression) {
+    GuardRig g;
+    FetchResponseMsg mm{};
+    mm.leaderEpoch = 5; mm.partition = 0; mm.errorCode = kErrEpochHistoryMismatch;
+    rune::replication::ErrorPayloadBuf b;
+    mm.records = b.set(5, 20);
+    g.r.applyReplicated(mm);
+    EXPECT_TRUE(g.r.truncationRefusedForTest());
+    EXPECT_EQ(g.r.logEndOffset(), 10);
+    g.run(50);
+    EXPECT_GE(g.t.reports(), 1);
+}
+
+// A memory-backed or unclean-allowed replica counts a mismatch and carries on (re-fetches): never refused, never truncated.
+TEST(TruncationGuardRegression, EpochHistoryMismatchIsCountedWhereTheGuardDoesNotApplyRegression) {
+    GuardRig g(/*unclean=*/true);
+    FetchResponseMsg mm{};
+    mm.leaderEpoch = 5; mm.partition = 0; mm.errorCode = kErrEpochHistoryMismatch;
+    rune::replication::ErrorPayloadBuf b;
+    mm.records = b.set(5, 20);
+    g.r.applyReplicated(mm);
+    EXPECT_FALSE(g.r.truncationRefusedForTest());
+    EXPECT_EQ(g.r.logEndOffset(), 10);
+    EXPECT_EQ(g.r.epochHistoryMismatchesSeenForTest(), 1u);
+}
+
+// The leader side: a follower whose copy of the shared epoch starts elsewhere is answered kErrEpochHistoryMismatch and
+// credited nothing; -1 (a side that does not hold the first record) is never compared.  RED: no history check.
+TEST(TruncationGuardRegression, LeaderAnswersAHistoryMismatchAndCreditsNothingRegression) {
+    TempDir dir("guard_leader");
+    rune::storage::Log log(dir.path);
+    log.recover();
+    CapturingIsr t;
+    PartitionReplica L(makeConfig(1), Role::Leader, 5, {1, 2}, {1, 2}, &log, &t);
+    for (int i = 0; i < 4; ++i) (void)L.append(makePayload(uint8_t(i), 8), false);
+    ASSERT_EQ(L.heldEpochStartForTest(5), 0);
+    FetchRequestMsg req{};
+    req.leaderEpoch = 5; req.partition = 0; req.followerId = 2; req.fetchOffset = 2; req.maxBytes = 1 << 20;
+    req.topicId = 0; req.lastFetchedEpoch = 5; req.lastEpochStartOffset = 7;   // a different start
+    EXPECT_EQ(L.onFetchRequest(req, 1'000'000'000), kErrEpochHistoryMismatch);
+    EXPECT_EQ(L.epochHistoryMismatchesForTest(), 1u);
+    req.lastEpochStartOffset = -1;   // unknown: never compared
+    EXPECT_NE(L.onFetchRequest(req, 1'001'000'000), kErrEpochHistoryMismatch);
+    req.lastEpochStartOffset = 0;    // the same start
+    EXPECT_NE(L.onFetchRequest(req, 1'002'000'000), kErrEpochHistoryMismatch);
+    EXPECT_EQ(L.epochHistoryMismatchesForTest(), 1u);
+}
+
 // Stronger assertion: truncation landed at EXACT numeric boundary before re-append.
 // We verify this by truncating WITHOUT appending new records and checking LEO directly.
 TEST(EpochChangeTruncationTest, TruncationLandsAtExactNumericBoundary) {
@@ -4947,4 +5401,27 @@ TEST(PartitionReplicaCaughtUpRegression, AFollowerIsCaughtUpOnlyOnceItsCurrentLe
     PartitionReplica l(makeConfig(kL), Role::Follower, 0, {kL}, {kL}, &llog, &transport);
     l.becomeLeader(3, {kL});
     EXPECT_TRUE(l.caughtUpWithLeader()) << "a leader's own HW is the truth (the caller checks its commit state)";
+}
+
+// ISR v3 I-S4 / A-M5: setFailClosed() clears votable_ whatever the file or an adopt() holds, until the next
+// successful offer() of a current-leadership state.  RED: a fail-closed that applies only when the file is absent.
+TEST(InternalIsrKnowledgeRegression, FailClosedAfterAdoptRegression) {
+    TempDir d("failclosed");
+    InternalIsrKnowledge k(d.path + "/internal-isr.state");
+    auto st = [](int64_t epoch, int64_t version, std::initializer_list<int32_t> m) {
+        InternalIsrState x{};
+        x.topicId = -3; x.partition = 0; x.leaderEpoch = epoch; x.version = version;
+        for (int32_t n : m) x.members[static_cast<std::size_t>(x.count++)] = n;
+        return x;
+    };
+    ASSERT_TRUE(k.adopt(st(6, 3, {1, 2})));   // a state held (adopted)
+    ASSERT_TRUE(k.eligible(1));
+    k.setFailClosed();
+    EXPECT_FALSE(k.eligible(1)) << "a fail-closed knowledge still votes for a member of the adopted state";
+    EXPECT_FALSE(k.eligible(3));
+    EXPECT_TRUE(k.eligibleLearned(1)) << "the recovery vote reads the adopted state";
+    EXPECT_FALSE(k.eligibleLearned(3));
+    ASSERT_TRUE(k.offer(st(7, 1, {1, 3})));   // the current leadership proves the knowledge again
+    EXPECT_TRUE(k.eligible(3));
+    EXPECT_FALSE(k.eligible(2));
 }

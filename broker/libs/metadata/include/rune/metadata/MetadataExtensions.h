@@ -197,6 +197,72 @@ struct RemoveTopicPlacementRecord {
     }
 };
 
+// ---------------------------------------------------------------------------
+// 5. NodeStorageRecord (recordType 0x8004) and ControllerTermRecord (0x8005) - ISR protocol v3.
+//
+//    NodeStorageRecord{node, storageId}: the controller COMMITS a node's storage id (feature level >= 2).  The
+//    MSM installs it at commit like every record; nodeStorage(node) is the committed id (0 = none).
+//    ControllerTermRecord{term}: the first record of a controller's claim (Raft section 5.4.2); the MSM
+//    decodes and IGNORES it (it changes nothing, so followers apply it as a no-op).  Older MSMs skip both types.
+//
+//    NodeStorageRecord: [0..1] type=0x8004 [2] version=0 [3..6] node int32 [7..14] storageId int64
+//    ControllerTermRecord: [0..1] type=0x8005 [2] version=0 [3..10] term int64
+// ---------------------------------------------------------------------------
+inline constexpr uint16_t kNodeStorageRecordType     = 0x8004;
+inline constexpr uint16_t kControllerTermRecordType  = 0x8005;
+
+struct NodeStorageRecord {
+    int32_t node      = -1;
+    int64_t storageId = 0;
+    static constexpr std::size_t ENCODED_SIZE = 15;
+
+    std::size_t encode(uint8_t* buf, std::size_t len) const noexcept {
+        if (len < ENCODED_SIZE) return 0;
+        namespace d = rune::protocol::metadata::detail;
+        buf[0] = static_cast<uint8_t>(kNodeStorageRecordType & 0xff);
+        buf[1] = static_cast<uint8_t>(kNodeStorageRecordType >> 8);
+        buf[2] = 0;
+        d::putS32(buf, 3, node);
+        d::putS64(buf, 7, storageId);
+        return ENCODED_SIZE;
+    }
+    static std::optional<NodeStorageRecord> decode(const uint8_t* buf, std::size_t len) noexcept {
+        if (len < ENCODED_SIZE) return std::nullopt;
+        const uint16_t type = static_cast<uint16_t>(buf[0] | (buf[1] << 8));
+        if (type != kNodeStorageRecordType || buf[2] != 0) return std::nullopt;
+        namespace d = rune::protocol::metadata::detail;
+        NodeStorageRecord r;
+        r.node      = d::getS32(buf, 3);
+        r.storageId = d::getS64(buf, 7);
+        if (r.node < 0 || r.storageId == 0) return std::nullopt;
+        return r;
+    }
+};
+
+struct ControllerTermRecord {
+    int64_t term = 0;
+    static constexpr std::size_t ENCODED_SIZE = 11;
+
+    std::size_t encode(uint8_t* buf, std::size_t len) const noexcept {
+        if (len < ENCODED_SIZE) return 0;
+        namespace d = rune::protocol::metadata::detail;
+        buf[0] = static_cast<uint8_t>(kControllerTermRecordType & 0xff);
+        buf[1] = static_cast<uint8_t>(kControllerTermRecordType >> 8);
+        buf[2] = 0;
+        d::putS64(buf, 3, term);
+        return ENCODED_SIZE;
+    }
+    static std::optional<ControllerTermRecord> decode(const uint8_t* buf, std::size_t len) noexcept {
+        if (len < ENCODED_SIZE) return std::nullopt;
+        const uint16_t type = static_cast<uint16_t>(buf[0] | (buf[1] << 8));
+        if (type != kControllerTermRecordType || buf[2] != 0) return std::nullopt;
+        namespace d = rune::protocol::metadata::detail;
+        ControllerTermRecord r;
+        r.term = d::getS64(buf, 3);
+        return r;
+    }
+};
+
 namespace leaderless_trailer {
 inline constexpr uint8_t     kTag  = 0xD1;
 inline constexpr std::size_t kSize = 14;
@@ -222,7 +288,8 @@ inline LeaderlessMark decode(const uint8_t* buf, std::size_t len) noexcept {
     if (len < kSize || buf[0] != kTag) return m;
     const uint8_t kind = buf[1];
     if (kind != static_cast<uint8_t>(LeaderlessMark::Kind::EmptyMemoryLeader) &&
-        kind != static_cast<uint8_t>(LeaderlessMark::Kind::LogDirOffline))
+        kind != static_cast<uint8_t>(LeaderlessMark::Kind::LogDirOffline) &&
+        kind != static_cast<uint8_t>(LeaderlessMark::Kind::StorageReset))
         return m;   // unknown kind (a newer binary): ignored
     m.kind = static_cast<LeaderlessMark::Kind>(kind);
     namespace d = rune::protocol::metadata::detail;

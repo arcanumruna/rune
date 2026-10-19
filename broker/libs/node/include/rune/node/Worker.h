@@ -2434,6 +2434,10 @@ private:
             if (auto* rep = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica());
                 rep != nullptr && op.replErrorCode() == rune::replication::kAlterIsrLocalLineageIdentity) {
                 rep->rotateLineageIdentity(op.nextOffset());   // R2: node-local identity rotation
+            } else if (auto* hold = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica());
+                       hold != nullptr && op.replErrorCode() == rune::replication::kAlterIsrLocalHoldLeadership) {
+                // ISR v3 Step 10 (R14): a held leader role (storage unconfirmed): node-local, never on the wire.
+                hold->holdLeadershipForStorage(op.roleEpoch(), op.rolePartitionEpoch());
             } else if (rep != nullptr) {
                 rune::replication::AlterIsrResponseMsg r{};
                 r.topicId        = op.topicId();
@@ -2446,6 +2450,8 @@ private:
                 r.leaderEpoch    = static_cast<rune::replication::Epoch>(op.roleEpoch());
                 r.partitionEpoch = op.rolePartitionEpoch();
                 r.errorCode      = op.replErrorCode();
+                r.proposalId     = op.nextOffset();      // ISR protocol: correlation ids (R14)
+                r.sendSeq        = op.roleLeaderId();
                 rep->onAlterIsrResponse(r);
             }
             break;
@@ -3863,6 +3869,8 @@ private:
         req.topicId     = op.topicId();
         req.lastFetchedEpoch = op.frLastFetchedEpoch();
         req.incarnation      = op.frIncarnation();
+        req.storageId        = op.hwBound();                // ISR protocol (R14)
+        req.lastEpochStartOffset = op.nextOffset();         // ISR protocol (R14)
 
         const ReplReadScope rs(*replica, replScratch_);
         try {
@@ -4262,7 +4270,7 @@ private:
         // TemplateId 1: FetchRequest — leader handles follower fetch.
         // Mirrors executeFetchRequestWire_ (~1664).
         case static_cast<uint16_t>(rr::ReplicationTemplateId::FetchRequest): {
-            const rr::FetchRequestMsg req = rr::FetchRequestMsg::decode(frame, 0);
+            const rr::FetchRequestMsg req = rr::FetchRequestMsg::decode(frame, 0, len);
             const ReplReadScope rs(*replica, replScratch_);
             try {
                 replica->onFetchRequest(req, nowNs);
@@ -4340,7 +4348,7 @@ private:
         // deficient-leader reverse pull request.  Mirrors the reconcile-request
         // handler path (onReconcileRequest).  The frame reuses FetchRequest layout.
         case rr::kReconcileFetchReqTemplateId: {
-            const rr::FetchRequestMsg req = rr::FetchRequestMsg::decode(frame, 0);
+            const rr::FetchRequestMsg req = rr::FetchRequestMsg::decode(frame, 0, len);
             try {
                 replica->onReconcileRequest(req);
             } catch (const std::exception& ex) {

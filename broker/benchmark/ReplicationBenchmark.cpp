@@ -339,7 +339,7 @@ static void BM_FetchRequest_Decode(benchmark::State& state) {
     FetchRequestMsg::encode(buf.data(), 0, 1, 0, 1, 4096, 65536);
 
     for (auto _ : state) {
-        auto m = FetchRequestMsg::decode(buf.data(), 0);
+        auto m = FetchRequestMsg::decode(buf.data(), 0, buf.size());
         benchmark::DoNotOptimize(m);
     }
     state.SetItemsProcessed(state.iterations());

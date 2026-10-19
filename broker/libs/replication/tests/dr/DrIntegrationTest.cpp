@@ -1917,6 +1917,59 @@ TEST(DrIntegrationRegression, AnsweredButUnappliedExpansionStillHoldsTheHwRegres
     expectAllConvergedAndAcked(c, "answered-but-unapplied expansion");
 }
 
+// ISR protocol (answer correlation, A-C1): an ELIGIBILITY flip between two sends of ONE proposal.  Send #1 is answered
+// Ineligible, but that answer is overtaken: send #2 (eligible by then) COMMITS the expansion, and #1's answer arrives
+// afterwards.  Without per-send correlation the late Ineligible clears the proposal at the same base, the leader's
+// maximal ISR collapses to the stale committed view while the controller already holds {1,2,3}, the HW passes node
+// 3's LEO and the records acked past it are lost when the controller elects node 3.
+// RED (drop the `sendSeq != lastSeq` check): the step-6 asserts fail; with them removed the 5 records are acked on
+// {1,2} and missing on node 3 after the failover.
+TEST(DrIntegrationRegression, EligibilityFlipBetweenTwoSendsNeverLosesAckedRecordsRegression) {
+    DrCluster c(3);
+    c.start();
+    ASSERT_EQ(c.produceAcked(10), 10);
+    ASSERT_TRUE(c.driveUntil([&] { return c.converged(); }, kCap));
+    // Shrink node 3 out (commits continue on {1,2}).
+    c.cutBoth(1, 3);
+    ASSERT_EQ(c.produceAcked(5), 5) << c.dump();
+    ASSERT_TRUE(c.driveUntil([&] { return !c.controllerIsrContains(3); }, kCap)) << c.dump();
+    ASSERT_TRUE(c.driveUntil([&] { return !c.rep(1).isrProposalPendingForTest(); }, kCap)) << c.dump();
+    // Node 3 is ineligible at the controller; the answer to send #1 (Ineligible) is parked.
+    c.setControllerEligible(3, false);
+    c.holdNext(Kind::AlterIsrResp);
+    c.heal(1, 3);
+    ASSERT_TRUE(c.driveUntil([&] { return c.heldCountForTest() == 1; }, kCap)) << c.dump();
+    // Node 3 turns eligible; send #2 commits {1,2,3}, which node 1 does not apply (its metadata replica lags),
+    // and no later resend reaches the controller.
+    c.holdMetadata(1);
+    c.setControllerEligible(3, true);
+    const uint64_t k0 = c.alterIsrCommitted();
+    ASSERT_TRUE(c.driveUntil([&] { return c.alterIsrCommitted() > k0; }, kCap)) << c.dump();
+    c.dropNext(Kind::AlterIsr, 1'000'000);
+    ASSERT_EQ(std::string(c.rep(1).isrProposalStateNameForTest()), "AwaitingCommit");
+    // Node 3 stops replicating.
+    c.cutBoth(1, 3);
+    // The old send's Ineligible answer arrives now.
+    c.releaseHeld();
+    c.run(5);
+    ASSERT_EQ(c.rep(1).olderSendAnswersForTest(), 1u);
+    ASSERT_EQ(std::string(c.rep(1).isrProposalStateNameForTest()), "AwaitingCommit");
+    // Records produced now must not commit: node 3 is a member the controller can elect.
+    const std::size_t ackedBefore = c.acked().size();
+    ASSERT_EQ(c.produce(5), 5);
+    c.run(300);
+    EXPECT_EQ(c.acked().size(), ackedBefore) << "HW passed the LEO of a member the controller can elect";
+    // The leader dies; the controller elects node 3: nothing acked may be missing there.
+    c.crash(1, CrashKind::ProcessKill);
+    c.healAll();
+    c.clearDropNext();
+    ASSERT_EQ(c.failover({}, /*positionsFrom=*/3), 3) << c.dump();
+    ASSERT_TRUE(c.waitWritable(kCap)) << c.dump();
+    c.restart(1);
+    c.releaseMetadata(1);
+    expectAllConvergedAndAcked(c, "older-send answer");
+}
+
 // Sibling: FencedLeaderEpoch — the controller already moved leadership while
 // the leader's committed view lags.  Until the new assignment demotes it, the
 // (zombie) leader must keep counting its pending expansion: the controller may
@@ -2099,4 +2152,189 @@ TEST(IsrProposalRegression, OlderCommittedAssignmentIsIgnoredRegression) {
     EXPECT_EQ(c.rep(1).staleAssignmentsForTest(), stale0 + 1);
     c.healAll();
     expectAllConvergedAndAcked(c, "older assignment");
+}
+
+// ===========================================================================
+// ISR v3 Step 11 - the truncation guard end to end (design section 3.8).
+// ===========================================================================
+namespace {
+// A long lag budget: the wiped leader must not shrink the refusing followers out of the ISR while the test observes them
+// (the report comes within 50 ms of the refusal, long before production's 10 s lag).
+DrConfig noGate() { DrConfig c; c.modelStorageGate = false; c.replicaLagMaxMs = 5000; return c; }
+bool anyRefused(DrCluster& c) {
+    for (NodeId id = 1; id <= 3; ++id)
+        if (c.up(id) && c.rep(id).truncationRefusedForTest()) return true;
+    return false;
+}
+}  // namespace
+
+// The reported bug: a leader that lost its data dir re-leads the SAME epoch with an empty log (its restart fence went
+// with the dir).  Its followers hold every acked record: they must never truncate to its empty lineage - they refuse,
+// report, and the controller fails the leader over.
+// RED: remove the guard branch in onDivergingEpoch_ (nodes 2 and 3 truncate to 0 and acked records are missing).
+TEST(DrIntegrationRegression, WipedLeaderReLeadingTheSameEpochNeverTruncatesFollowersRegression) {
+    DrCluster c(3, noGate());
+    c.start();
+    ASSERT_EQ(c.produceAcked(20), 20);
+    ASSERT_TRUE(c.driveUntil([&] { return c.converged(); }, kCap));
+    // The followers learn the HW one fetch after the leader advances it: wait until they hold it (the guard's floor).
+    ASSERT_TRUE(c.driveUntil([&] { return c.rep(2).highWatermark() == 20 && c.rep(3).highWatermark() == 20; }, kCap)) << c.dump();
+    c.holdReportDecisions(true);   // observe the refusing followers before the controller acts
+
+    c.crash(1, CrashKind::DiskLoss);
+    c.restart(1);
+    c.applyMetadata(1); c.applyMetadata(2); c.applyMetadata(3);   // node 1 re-leads epoch 1 with an empty log
+
+    c.run(200);
+    for (NodeId n : {2, 3}) {
+        EXPECT_GE(c.rep(n).logEndOffset(), 20) << "node " << n << " truncated below the committed offset";
+        EXPECT_TRUE(c.rep(n).truncationRefusedForTest()) << "node " << n;
+    }
+    EXPECT_GE(c.countAlterFlag(2, AlterIsrMsg::kBumpLeaderBelowCommitted) +
+              c.countAlterFlag(3, AlterIsrMsg::kBumpLeaderBelowCommitted), 1);
+
+    c.holdReportDecisions(false);   // the controller fails over on the report
+    c.run(200);
+    EXPECT_NE(c.leader(), 1);
+    for (NodeId n : {2, 3}) {
+        c.expectAckedPresent(n, "after the guard");
+        c.expectNoDuplicates(n);
+    }
+    EXPECT_FALSE(c.rep(2).truncationRefusedForTest());
+    EXPECT_FALSE(c.rep(3).truncationRefusedForTest());
+}
+
+// CP3 I1 (Ruling 11.4): the wiped leader re-leads the SAME epoch before the followers learned the last HW, and takes h
+// appends of its own before their first fetch.  The HW guard alone (floor = learned HW) would let both followers
+// truncate to h and lose acked [h, 20); the same-epoch rule refuses.
+// RED: remove the same-epoch branch in onDivergingEpoch_ (nodes 2 and 3 truncate to h and append node 1's history).
+TEST(DrIntegrationRegression, WipedLeaderReLeadingBeforeTheFollowersLearnedTheHwNeverTruncatesRegression) {
+    DrCluster c(3, noGate());
+    c.start();
+    ASSERT_EQ(c.produceAcked(20), 20);
+    ASSERT_TRUE(c.driveUntil([&] { return c.converged(); }, kCap));
+    // No wait for the HW: the harness is deterministic, the followers have not learned the last advance yet.
+    const Offset h = std::max(c.rep(2).highWatermark(), c.rep(3).highWatermark());
+    ASSERT_LT(h, 20) << "precondition: the followers have not learned the last HW";
+    const std::vector<uint8_t> before2 = c.logBytes(2, 0, 20), before3 = c.logBytes(3, 0, 20);
+    c.holdReportDecisions(true);
+    c.crash(1, CrashKind::DiskLoss);
+    c.restart(1);
+    c.applyMetadata(1);   // re-leads epoch 1 with an empty log
+    c.cut(2, 1); c.cut(3, 1);
+    ASSERT_EQ(c.produce(static_cast<int>(std::max<Offset>(h, 1))), static_cast<int>(std::max<Offset>(h, 1)));
+    c.run(20);
+    c.heal(2, 1); c.heal(3, 1);
+    c.run(200);
+    for (NodeId n : {2, 3}) {
+        EXPECT_EQ(c.rep(n).logEndOffset(), 20) << "node " << n << " truncated acked records";
+        EXPECT_TRUE(c.rep(n).truncationRefusedForTest()) << "node " << n;
+    }
+    EXPECT_EQ(c.logBytes(2, 0, 20), before2);
+    EXPECT_EQ(c.logBytes(3, 0, 20), before3);
+    c.holdReportDecisions(false);
+    c.run(200);
+    for (NodeId n : {2, 3}) { c.expectAckedPresent(n, "after the same-epoch refusal"); c.expectNoDuplicates(n); }
+}
+
+// A-I5 (rewritten per v2-review C2): the wiped leader re-leads an epoch whose OLD start is above 0 (epoch 2 started at
+// offset 10), writes a second history under it that OUTGROWS the followers, and the followers must not append it after
+// their own prefix: the leader's history check answers kErrEpochHistoryMismatch and they refuse.
+// RED: remove the leader history check (validation passes - epoch 2 ends at 40 >= 20 - and nodes 2 and 3 append node
+// 1's second history after their own prefix: the byte check fails at [20, ...) and the refusal flag is false).
+TEST(DrIntegrationRegression, WipedLeaderThatOutgrewTheFollowerIsNeverServedRegression) {
+    DrCluster c(3, noGate());
+    c.start();
+    ASSERT_EQ(c.produceAcked(10), 10);   // epoch 1 from offset 0
+    ASSERT_EQ(c.failover({2, 3}, /*positionsFrom=*/1), 1);   // node 1 again, epoch 2 starting at offset 10
+    c.applyMetadata(2); c.applyMetadata(3);
+    ASSERT_EQ(c.produceAcked(10), 10);
+    ASSERT_TRUE(c.driveUntil([&] { return c.converged(); }, kCap));
+    ASSERT_TRUE(c.driveUntil([&] { return c.rep(2).highWatermark() == 20 && c.rep(3).highWatermark() == 20; }, kCap)) << c.dump();
+    ASSERT_EQ(c.rep(2).heldEpochStartForTest(2), 10);
+    ASSERT_EQ(c.rep(3).heldEpochStartForTest(2), 10);
+    const std::vector<uint8_t> before2 = c.logBytes(2, 0, 20);
+    const std::vector<uint8_t> before3 = c.logBytes(3, 0, 20);
+    ASSERT_FALSE(before2.empty());
+    c.holdReportDecisions(true);
+
+    c.crash(1, CrashKind::DiskLoss);
+    c.restart(1);
+    c.applyMetadata(1);   // re-leads epoch 2 with an empty log: its epoch 2 starts at 0
+    ASSERT_EQ(c.rep(1).heldEpochStartForTest(2), 0);
+
+    c.cut(2, 1); c.cut(3, 1);
+    ASSERT_EQ(c.produce(40), 40);
+    c.run(20);
+    c.heal(2, 1); c.heal(3, 1);
+    c.run(200);
+
+    EXPECT_TRUE(c.rep(2).truncationRefusedForTest());
+    EXPECT_TRUE(c.rep(3).truncationRefusedForTest());
+    EXPECT_EQ(c.logBytes(2, 0, 20), before2) << "node 2's committed prefix changed";
+    EXPECT_EQ(c.logBytes(3, 0, 20), before3) << "node 3's committed prefix changed";
+    EXPECT_GE(c.rep(1).epochHistoryMismatchesForTest(), 1u);
+    EXPECT_EQ(c.rep(2).logEndOffset(), 20) << "node 2 appended the second history";
+    EXPECT_EQ(c.rep(3).logEndOffset(), 20) << "node 3 appended the second history";
+}
+
+// Harness-model documentation (B-M5), NOT gate coverage: with the storage gate modelled, the wiped node is held out of
+// the leadership (its restarted leader role fails over by bump) until its storage is confirmed, so no follower ever
+// meets its empty lineage.  RED: the gate is not modelled (applyMetadata skips the hold): node 1 re-leads and
+// refusals appear.
+TEST(DrIntegrationRegression, WipedLeaderIsGatedAndStrippedEndToEndRegression) {
+    DrCluster c(3);   // modelStorageGate = true
+    c.start();
+    ASSERT_EQ(c.produceAcked(20), 20);
+    ASSERT_TRUE(c.driveUntil([&] { return c.converged(); }, kCap));
+
+    c.crash(1, CrashKind::DiskLoss);
+    c.restart(1);
+    c.applyMetadata(1); c.applyMetadata(2); c.applyMetadata(3);
+    c.run(50);
+    EXPECT_FALSE(c.storageConfirmed(1));
+    c.confirmStorage(1);
+    c.run(200);
+
+    EXPECT_FALSE(anyRefused(c));
+    for (NodeId n : {2, 3}) EXPECT_EQ(c.rep(n).truncationsRefusedForTest(), 0u) << "node " << n;
+    for (NodeId n : {2, 3}) { c.expectAckedPresent(n, "gated"); c.expectNoDuplicates(n); }
+    ASSERT_TRUE(c.driveUntil([&] { return c.converged(); }, kCap)) << c.dump();
+    c.expectAckedPresent(1, "the wiped node catches up");
+}
+
+// ===========================================================================
+// ISR v3 Step 12 - the internal-quorum proposal is a variant (InternalNone | InternalPending | InternalCommitted).
+// ===========================================================================
+// A COMMITTED internal ISR state is re-sent (anti-entropy) to every replica that has not acked it, and the leader stops
+// once all acked.  Node 3 misses the commit that removes node 2, then two re-sends to it are lost too; it acks the third.
+// RED: resend only from InternalPending (node 3 never learns the committed state).
+TEST(InternalIsrRegression, CommittedStateIsResentUntilEveryReplicaAckedRegression) {
+    DrConfig cfg;
+    cfg.topicId = -3;   // the internal-ISR store partition
+    DrCluster c(3, cfg);
+    c.start(1);
+    ASSERT_EQ(c.produceAcked(10), 10);
+    ASSERT_TRUE(c.driveUntil([&] {
+        return !c.rep(1).internalSeedPendingForTest() && !c.rep(1).isrProposalPendingForTest();
+    }, kCap));
+    c.cut(1, 3);                                 // the commit's frame to node 3 is lost
+    c.cut(2, kControllerAddr);                   // node 2 consensus-dead: fenced out of the ISR
+    ASSERT_TRUE(c.driveUntil([&] {
+        return !c.rep(1).isrProposalPendingForTest() && !c.leaderIsrContains(2);
+    }, kCap)) << c.dump();
+    EXPECT_STREQ(c.rep(1).isrProposalStateNameForTest(), "None") << "committed: nothing pending";
+    const auto* k3 = c.node(3).isrKnowledge->latest(-3, kPartId);
+    ASSERT_TRUE(k3 == nullptr || k3->contains(2)) << "precondition: node 3 missed the commit";
+    c.heal(1, 3);
+    c.dropNext(Kind::InternalIsr, 2);            // the next two re-sends are lost as well
+    ASSERT_TRUE(c.driveUntil([&] {
+        const auto* k = c.node(3).isrKnowledge->latest(-3, kPartId);
+        return k != nullptr && !k->contains(2);
+    }, kCap)) << "the committed state was never re-sent to node 3\n" << c.dump();
+    EXPECT_GE(c.sentBy(1, Kind::InternalIsr), 3u);
+    c.run(100);   // every replica acked: the leader stops
+    const uint64_t quiet = c.sentBy(1, Kind::InternalIsr);
+    c.run(300);
+    EXPECT_EQ(c.sentBy(1, Kind::InternalIsr), quiet) << "the leader kept re-sending an acked state";
 }

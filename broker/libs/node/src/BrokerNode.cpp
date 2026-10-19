@@ -77,34 +77,6 @@ static constexpr int kIngressCapacity = 64 * 1024; //  64 KiB
 // ---------------------------------------------------------------------------
 namespace {
 
-// KIP-903 (review 2026-10-04 MEDIUM-4): this node's PROCESS incarnation —
-// a counter in the data dir bumped durably (tmp + fsync + rename) on every
-// start, stamped on every FetchRequest.  Cold (once per process).  Falls back
-// to the realtime clock (ns) when the data dir cannot be written.
-int64_t bumpProcessIncarnation(const std::string& dataDir) {
-    const auto fallback = [] {
-        return static_cast<int64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count());
-    };
-    if (dataDir.empty()) return fallback();
-    const std::string path = dataDir + "/process-incarnation";
-    int64_t prev = 0;
-    if (FILE* f = std::fopen(path.c_str(), "r")) {
-        long long v = 0;
-        if (std::fscanf(f, "%lld", &v) == 1 && v > 0) prev = static_cast<int64_t>(v);
-        std::fclose(f);
-    }
-    const int64_t next = prev + 1;
-    const std::string tmp = path + ".tmp";
-    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) return fallback();
-    char buf[32];
-    const int n = std::snprintf(buf, sizeof buf, "%lld\n", static_cast<long long>(next));
-    const bool ok = n > 0 && ::write(fd, buf, static_cast<std::size_t>(n)) == n && ::fsync(fd) == 0;
-    ::close(fd);
-    if (!ok || std::rename(tmp.c_str(), path.c_str()) != 0) return fallback();
-    return next;
-}
 // Controlled shutdown (review M1): a random, non-zero 64-bit identity of THIS
 // process — compared by identity, so a restart with a wiped data dir (whose
 // incarnation counter restarts low) is still a new process.  Cold (once).
@@ -387,6 +359,11 @@ void BrokerNode::start() {
         throw std::runtime_error("BrokerNode: cannot create dataDir '" +
                                  config_.dataDir + "': " + ec.message());
     }
+    // 1a. ISR design v3 §3.2 (Step 5): the storage identity.  NOTHING writes into dataDir before this line
+    //     (an empty dir that refuses must stay empty).  Throws StorageRefusal (main: exit 78).
+    storage_ = StorageIdentity::resolve(config_.dataDir, config_.storageFormat, config_.peers.size() <= 1, config_.nodeId);
+    spdlog::info("storage: dataDir={} storageId={} origin={} state=CONFIRMED", config_.dataDir,
+                 StorageIdentity::idHex(storage_.id), StorageIdentity::originName(storage_.origin));
     // The embedded driver creates (and deletes) the Aeron dir itself but not its
     // parents: a RUNE_AERON_DIR under a not-yet-existing parent fails driver init
     // with a bare EINVAL.  Create the parent chain up front.
@@ -548,6 +525,15 @@ void BrokerNode::start() {
             catalogBlockedPartitionsLabel(config_.nodeId));
         linkMtuCounterRegId_ = aeron_->addCounter(
             kLinkMtuDeficitCounterTypeId, roleKey, kRoleKeyLength, linkMtuDeficitLabel(config_.nodeId));
+        // ISR v3 §3.10 (B-I4): the storage counters.
+        storageCounterRegIds_[0] = aeron_->addCounter(kStorageGateStateCounterTypeId, roleKey, kRoleKeyLength,
+                                                      storageGateStateLabel(config_.nodeId));
+        storageCounterRegIds_[1] = aeron_->addCounter(kLeaderRolesHeldCounterTypeId, roleKey, kRoleKeyLength,
+                                                      leaderRolesHeldLabel(config_.nodeId));
+        storageCounterRegIds_[2] = aeron_->addCounter(kStoragePendingNodesCounterTypeId, roleKey, kRoleKeyLength,
+                                                      storagePendingNodesLabel(config_.nodeId));
+        storageCounterRegIds_[3] = aeron_->addCounter(kLostCommittedReportsCounterTypeId, roleKey, kRoleKeyLength,
+                                                      lostCommittedReportsLabel(config_.nodeId));
 
         // Review A-I5: bind every fixed port of the NODE driver before its first publication (consensus /
         // replication / gateway publications auto-bind ephemeral ports; one could take a later fixed bind).
@@ -575,6 +561,11 @@ void BrokerNode::start() {
 
     // 5. Build all consensus objects (NodeStateFile, TermLog, Election, …).
     buildConsensusObjects();
+    // ISR v3 Step 6: record the Consensus class in the manifest (R-3b) once node-state.dat AND term.log exist
+    // non-empty.  On a restart they do; on a first boot term.log is still empty here, so
+    // serviceAdminControl_ marks it as soon as the first term is written (ruling: the recipe marked it
+    // unconditionally here, which makes the NEXT boot refuse when the node stopped before its first term).
+    markConsensusWhenPresent_();
     const auto t3 = sclock::now();
 
     // 5b. hotpath-A F2: the segment provisioner exists BEFORE any replica is
@@ -742,6 +733,8 @@ void BrokerNode::buildConsensusObjects() {
         (dataDir / "node-state.dat").string());
     termLog_ = std::make_unique<TermLog>(
         (dataDir / "term.log").string());
+    // ISR v3 R12: a node that already took part in an election has history (read before the Election touches the files).
+    bootHistory_ = nodeStateFile_->candidateTermId() > 0 || !termLog_->validTermEntries().empty();
 
     // Cluster members — one entry per peer in config_.peers.
     clusterMembers_.clear();
@@ -763,6 +756,25 @@ void BrokerNode::buildConsensusObjects() {
     } else {
         buildMultiNodeConsensus();
     }
+}
+
+void BrokerNode::markConsensusWhenPresent_() {
+    if ((storage_.manifest & static_cast<uint8_t>(StorageIdentity::Class::Consensus)) != 0) { consensusUnmarked_ = false; return; }
+    if (!StorageIdentity::isPresent(config_.dataDir, StorageIdentity::Class::Consensus)) return;
+    if (StorageIdentity::markPresent(config_.dataDir, storage_, StorageIdentity::Class::Consensus)) consensusUnmarked_ = false;
+}
+bool BrokerNode::mayBootstrapThunk_(void* self) noexcept {
+    const auto& s = static_cast<BrokerNode*>(self)->storage_;
+    return s.origin == StorageIdentity::Origin::Founder &&
+           (s.manifest & static_cast<uint8_t>(StorageIdentity::Class::MetadataLog)) == 0;
+}
+void BrokerNode::markKnowledgeThunk_(void* self) noexcept {
+    auto* n = static_cast<BrokerNode*>(self);
+    try { (void)StorageIdentity::markPresent(n->config_.dataDir, n->storage_, StorageIdentity::Class::Knowledge); } catch (...) {}
+}
+void BrokerNode::markMetadataLogThunk_(void* self) noexcept {
+    auto* n = static_cast<BrokerNode*>(self);
+    try { (void)StorageIdentity::markPresent(n->config_.dataDir, n->storage_, StorageIdentity::Class::MetadataLog); } catch (...) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -884,8 +896,17 @@ void BrokerNode::buildMultiNodeConsensus() {
         canvassTimeoutNs,
         /*rngSeed=*/static_cast<uint64_t>(42u + selfId));
 
+    // ISR v3 A-C2: the candidacy hold is a LEVEL asserted from construction (the gate re-asserts it every cycle):
+    // a storage that is not yet trusted (Undecided / Joiner) neither stands nor votes for itself before the first
+    // doWork can canvass.  TestFounder / Legacy / Founder are not held (unless the test seam says so).
+    election_->setStorageHold(
+        (!(storage_.origin == StorageIdentity::Origin::Founder || storage_.origin == StorageIdentity::Origin::Legacy) ||
+         config_.testCandidacyHoldAtBoot) && config_.peers.size() > 1, 0);
+
     // Inner ConsensusAgent (drives Election, drains IngressRing).
     agent_ = std::make_unique<ConsensusAgent>(*election_, *ingressRing_);
+    if (config_.testDropConsensusFromPeer >= 0)
+        agent_->setTestDropFrom(config_.testDropConsensusFromPeer, config_.testDropConsensusForMs * 1'000'000LL);
 
     // Composite NodeConsensusAgent (polls ingress THEN runs ConsensusAgent).
     nodeAgent_ = std::make_unique<NodeConsensusAgent>(
@@ -1130,7 +1151,18 @@ void BrokerNode::buildReplication() {
     // -----------------------------------------------------------------------
     replicaRegistry_ = std::make_unique<ReplicaRegistry>();
     // KIP-903: every replica of this process stamps the process incarnation.
-    replicaRegistry_->setProcessIncarnation(bumpProcessIncarnation(config_.dataDir));
+    replicaRegistry_->setProcessIncarnation(StorageIdentity::bumpProcessIncarnation(
+        config_.dataDir, std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::system_clock::now().time_since_epoch()).count()));
+    replicaRegistry_->setStorageId(storage_.id);   // ISR v3 Step 6: stamped next to the incarnation
+    if (config_.testHoldFollowerFetchesMs > 0)   // TEST-ONLY (B-I8): a member that cannot catch up yet
+        replicaRegistry_->setHoldFetchesUntilForTest(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() +
+            config_.testHoldFollowerFetchesMs * 1'000'000LL);
+    if (config_.testDropConsensusFromPeer >= 0)   // TEST-ONLY (CP2 C1-R): the same dead link on the data plane
+        replicaRegistry_->setDropInternalIsrUntilForTest(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() +
+            config_.testDropConsensusForMs * 1'000'000LL);
     // E2 C1 residual N1: the node-control identity (the same nonce the node
     // registers with every controller) rides each transient lineage report.
     if (lifecycleNonce_ == 0) lifecycleNonce_ = processNonce();
@@ -1141,6 +1173,10 @@ void BrokerNode::buildReplication() {
     internalIsrKnowledge_ = std::make_unique<rune::replication::InternalIsrKnowledge>(
         config_.dataDir.empty() ? std::string{} : config_.dataDir + "/internal-isr.state");
     replicaRegistry_->setInternalIsrKnowledge(internalIsrKnowledge_.get());
+    internalIsrKnowledge_->setFirstPersistHook(&BrokerNode::markKnowledgeThunk_, this);   // ISR v3 Step 6
+    // ISR v3 I-S4: a Joiner's knowledge is not votable until an offer() from the current leadership succeeds,
+    // whatever the file holds.
+    if (storage_.origin == StorageIdentity::Origin::Joiner) internalIsrKnowledge_->setFailClosed();
     {
         // LOW-R4-2: __cluster_metadata is replicated on every configured node.
         std::vector<int32_t> ids;
@@ -1158,8 +1194,9 @@ void BrokerNode::buildReplication() {
                          "candidacy gate is disabled; a node missing committed __cluster_metadata "
                          "records may be elected (those records are then lost)", config_.nodeId);
         else {
-            election_->setVoteGate(&rune::replication::InternalIsrKnowledge::voteGate,
-                                   internalIsrKnowledge_.get());
+            election_->setVoteGate(&BrokerNode::voteGateThunk_, this);   // ISR v3 Step 9: storage gate first
+            // ISR v3 ruling: an unconfirmed storage ABSTAINS (silence) instead of denying - see Election::setAbstainGate.
+            election_->setAbstainGate(&BrokerNode::abstainGateThunk_, this);
             // Round-3 CRITICAL-R3: every vote (the candidate's own included) is
             // gated, so the election participants exchange their newest durable
             // __cluster_metadata ISR state while canvassing / voting — a node
@@ -1274,6 +1311,7 @@ void BrokerNode::buildReplication() {
             pcfg.isrCheckIntervalNs   = 10'000'000LL;
             pcfg.followerFlushIntervalNs = config_.followerFlushIntervalMs * 1'000'000LL;
             pcfg.maxFetchBytes        = userTopicMaxFetchBytes(config_);   // F3 r5 I1
+            pcfg.allowUncleanTruncation = topicId >= 0 && config_.survivorLeaderElection;   // ISR v3 Step 11
             // CP-2: thread TopicSpec.cleanupPolicy into PartitionConfig so that
             // runBoundedCompaction() reads the correct policy from every replica.
             // TopicSpec::CleanupPolicy and rune::replication::CleanupPolicy share
@@ -1475,6 +1513,7 @@ int32_t BrokerNode::createRuntimeUserReplicas(const TopicSpec& spec) {
         pcfg.isrCheckIntervalNs   = 10'000'000LL;
         pcfg.followerFlushIntervalNs = config_.followerFlushIntervalMs * 1'000'000LL;
         pcfg.maxFetchBytes        = userTopicMaxFetchBytes(config_);   // F3 r5 I1
+        pcfg.allowUncleanTruncation = topicId >= 0 && config_.survivorLeaderElection;   // ISR v3 Step 11
         pcfg.cleanupPolicy = static_cast<rune::replication::CleanupPolicy>(
             static_cast<uint8_t>(spec.cleanupPolicy));
         pcfg.minCleanableDirtyRatio = spec.minCleanableDirtyRatio;
@@ -2517,6 +2556,16 @@ void BrokerNode::buildGateway() {
                 metaReplicaRaw, nodeId);
             if (config_.testUserDecisionHoldMs > 0)   // TEST-ONLY (see NodeConfig)
                 metadataService_->setUserDecisionHoldForTest(config_.testUserDecisionHoldMs * 1'000'000);
+            if (config_.testHoldAllControllerDecisionsMs > 0)   // TEST-ONLY (ISR v3 Step 10): arms the runtime toggle
+                metadataService_->setHoldAllDecisionsMaxForTest(config_.testHoldAllControllerDecisionsMs * 1'000'000);
+            if (config_.testSupportedFeatureLevel >= 0)         // TEST-ONLY: an old-cluster controller
+                metadataService_->setSupportedFeatureLevel(config_.testSupportedFeatureLevel);
+            // ISR v3 Step 6: the first committed apply marks the MetadataLog class (set BEFORE the rebuild:
+            // a restart over an existing log marks it too).
+            metadataService_->setFirstApplyHook(&BrokerNode::markMetadataLogThunk_, this);
+            metadataService_->setMayBootstrap(&BrokerNode::mayBootstrapThunk_, this);   // ISR v3 R17
+            // ISR v3 Step 7: a wiped sole-ISR leader of a TRANSIENT partition keeps its lineage (single AND multi-node).
+            metadataService_->setTransientTopicPredicate(&BrokerNode::isTransientTopicTrampoline_, this);
             // Rebuild any previously committed assignments from the local Log.
             metadataService_->rebuildFromLog();
             // Kafka AlterPartition: this node's transport hands every AlterIsr it
@@ -2685,6 +2734,12 @@ void BrokerNode::buildGateway() {
         nodeAgent_ ? static_cast<rune::consensus::Agent&>(*nodeAgent_)
                    : static_cast<rune::consensus::Agent&>(*agent_);
 
+    // ISR v3 Step 9 (M2): the storage gate exists BEFORE the runtime agent and is handed to it (and the bridge)
+    // before the runtime thread starts.  Multi-node only: a single node has no gate (open everywhere).
+    if (!config_.isSingleNode())
+        storageGate_ = std::make_unique<StorageGate>(storage_, config_.dataDir, config_.nodeId,
+                                                     static_cast<int>(config_.peers.size()),
+                                                     foundingShortDwellNs(), foundingLongDwellNs());   // C1 dwells
     runtimeAgent_ = std::make_unique<NodeRuntimeAgent>(
         innerAgent,
         election_.get(),          // GR-2: election for leaderMemberId/leadershipTermId reads
@@ -2701,6 +2756,13 @@ void BrokerNode::buildGateway() {
     // before the control thread starts (ordered by its start).
     leaderObserver_.bind(election_.get(), nodeAgent_.get());
     runtimeAgent_->setLeaderObserver(&leaderObserver_);
+    runtimeAgent_->setStorageGate(storageGate_.get());
+    if (replBridge_) replBridge_->setStorageGate(storageGate_.get());   // ISR v3 Step 10: held leader roles
+    runtimeAgent_->setKnowledge(internalIsrKnowledge_.get());
+    runtimeAgent_->setCanvassPublisher(publisher_.get());
+    runtimeAgent_->setBootHistory(bootHistory_);
+    runtimeAgent_->setFailoverTimeoutOverrideNs(config_.brokerLivenessTimeoutMs * 1'000'000LL);
+    if (config_.testCandidacyHoldAtBoot && !config_.isSingleNode()) runtimeAgent_->setTestCandidacyHold(true);   // R-I1
     // Controlled shutdown (Kafka parity): multi-node only — a single node has
     // nobody to hand off to (begin completes at once).  The controller's
     // acks of this node's NODE-level requests arrive on the legacy transport
@@ -2721,6 +2783,18 @@ void BrokerNode::buildGateway() {
             }());
         replTransport_->setNodeControlResponseHandler(&ControlledShutdown::onResponseThunk,
                                                       &runtimeAgent_->controlledShutdown());
+        // ISR v3 Step 9: every node-control frame carries this process's storage (slots 7/8/9); until the gate is
+        // open the node re-registers on a cadence.
+        {
+            const uint8_t wire = storageGate_ ? storageGate_->originWireCode()
+                               : storage_.origin == StorageIdentity::Origin::Founder ? 1
+                               : storage_.origin == StorageIdentity::Origin::Legacy  ? 2
+                               : storage_.origin == StorageIdentity::Origin::Joiner  ? 3 : 4;
+            runtimeAgent_->controlledShutdown().setStorage(storage_.id, wire);
+            if (storageGate_)
+                runtimeAgent_->controlledShutdown().setStorageOpenFn(
+                    [](void* g) noexcept { return static_cast<StorageGate*>(g)->open(); }, storageGate_.get());
+        }
     }
     // fsyncgate (Task 10 fix 2 / I-1): control-thread-driven replicas (internal
     // partitions) whose fsync failed → halt.
@@ -3032,6 +3106,62 @@ void BrokerNode::publishCatalogMetrics_() noexcept {
 }
 
 // ---------------------------------------------------------------------------
+// BrokerNode::publishStorageMetrics_ — ISR v3 §3.10 (CONTROL thread; the publishCatalogMetrics_ pattern): resolves
+// each counter once the driver acked it and sets all four every pass (a plain store each).
+// ---------------------------------------------------------------------------
+int BrokerNode::publishStorageMetrics_() noexcept {
+    if (!aeron_) return 0;
+    const std::int64_t values[4] = {
+        storageGate_ ? storageGate_->stateCode() : 0,
+        replBridge_ ? static_cast<std::int64_t>(replBridge_->leaderRolesHeld()) : 0,
+        metadataService_ ? static_cast<std::int64_t>(metadataService_->storagePendingCount()) : 0,
+        metadataService_ ? static_cast<std::int64_t>(metadataService_->lostCommittedReports()) : 0};
+    for (std::size_t i = 0; i < 4; ++i) {
+        if (!storageCounters_[i] && storageCounterRegIds_[i] >= 0) {
+            try { storageCounters_[i] = aeron_->findCounter(storageCounterRegIds_[i]); }
+            catch (...) { storageCounters_[i].reset(); }
+        }
+        if (storageCounters_[i]) storageCounters_[i]->set(values[i]);
+    }
+    return 0;
+}
+
+// ISR v3 Step 9 (§3.6): the consensus vote gate.  An unconfirmed storage votes for nobody (a replaced disk must not
+// help elect a leader without the committed metadata it lost) - except under the unsafe disaster-recovery switch.
+bool BrokerNode::voteGateThunk_(void* self, int32_t c) noexcept {
+    auto* n = static_cast<BrokerNode*>(self);
+    if (n->storageGate_ && !n->storageGate_->mayVote()) {
+        if (!n->config_.storageRecoveryVote || !n->internalIsrKnowledge_->eligibleLearned(c)) return false;
+        n->logRecoveryVote_(c);
+        return true;
+    }
+    return rune::replication::InternalIsrKnowledge::voteGate(n->internalIsrKnowledge_.get(), c);
+}
+// CP2 C1-R: unanimous fresh evidence founds fast (nobody can hold history); a plain majority must outlast the
+// transport's reconnect to a restarted peer (resolver recheck + pending backoff + margin) and the election timeout.
+int64_t BrokerNode::foundingShortDwellNs() const noexcept {
+    return 3 * config_.electionStatusIntervalMs * 1'000'000LL;
+}
+int64_t BrokerNode::foundingLongDwellNs() const noexcept {
+    const int64_t status = config_.electionStatusIntervalMs * 1'000'000LL;
+    return std::max({3 * status, config_.electionTimeoutMs * 1'000'000LL + status,
+                     PeerResolverHub::kRecheckNs + PeerResolverHub::kPendingMaxNs + 500'000'000LL});
+}
+bool BrokerNode::abstainGateThunk_(void* self) noexcept {
+    auto* n = static_cast<BrokerNode*>(self);
+    return n->storageGate_ && !n->storageGate_->mayVote() && !n->config_.storageRecoveryVote;
+}
+void BrokerNode::logRecoveryVote_(int32_t c) noexcept {
+    const int64_t term = election_ ? static_cast<int64_t>(election_->candidateTermId()) : -1;
+    if (c == lastRecoveryVoteCandidate_ && term == lastRecoveryVoteTerm_) return;   // critical once per (candidate, term)
+    lastRecoveryVoteCandidate_ = c;
+    lastRecoveryVoteTerm_      = term;
+    spdlog::critical("BrokerNode[{}]: RUNE_STORAGE_RECOVERY_VOTE: granting a vote to node {} (term {}) from an "
+                     "UNCONFIRMED storage - disaster recovery only; committed metadata that lived only on lost disks "
+                     "may be lost", config_.nodeId, c, term);
+}
+
+// ---------------------------------------------------------------------------
 // BrokerNode::leaderClientEndpoint (GB-4)
 // ---------------------------------------------------------------------------
 std::string BrokerNode::leaderClientEndpoint() const noexcept {
@@ -3331,6 +3461,11 @@ void BrokerNode::buildCatalog_() {
     // this process carries (ReplicaRegistry::add stamps registry replicas).
     if (replicaRegistry_ && replicaRegistry_->processIncarnation() != 0)
         catalogReplica_->setProcessIncarnation(replicaRegistry_->processIncarnation());
+    catalogReplica_->setStorageId(storage_.id);   // ISR v3 Step 6
+    if (config_.testHoldFollowerFetchesMs > 0)
+        catalogReplica_->holdFetchesUntilForTest(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() +
+            config_.testHoldFollowerFetchesMs * 1'000'000LL);
     if (lifecycleNonce_ != 0) catalogReplica_->setLineageIdentity(lifecycleNonce_);
 
     spdlog::info("BrokerNode[{}]: __catalog built at {} (LEO={}, minIsr={}, {}, role from {})",
@@ -3772,6 +3907,7 @@ void BrokerNode::stop() {
     unplaceableCounter_.reset();    // Task 11 fix round 1
     blockedCounter_.reset();        // Task 11 fix round 5 (M5)
     linkMtuCounter_.reset();        // B-I2: released before aeron_
+    for (auto& c : storageCounters_) c.reset();   // ISR v3 §3.10: the same rule (the Counter dtor uses the conductor)
     if (mtuProbeFd_ >= 0) { ::close(mtuProbeFd_); mtuProbeFd_ = -1; }   // re-check I1
     catalogAppliedCounter_.reset();
     for (auto& c : provCounters_) c.reset();   // re-review N4: same rule (the provisioner is stopped)
@@ -3937,6 +4073,11 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
     work += publishPlacementView_();
     work += reportUnbuildableReplicas_();
     work += checkLinkMtu_(nowNs, /*force=*/false);   // re-check I1: the runtime's clock, no per-pass clock read
+    work += publishStorageMetrics_();                // ISR v3 §3.10
+    if (consensusUnmarked_ && nowNs - lastConsensusMarkCheckNs_ >= 1'000'000'000LL) {   // ISR v3 Step 6 (cold: until marked)
+        lastConsensusMarkCheckNs_ = nowNs;
+        markConsensusWhenPresent_();
+    }
 
     // (1b) admin → control ring (F3 round 6/7, ported into T11's direct-call
     //      control plane):

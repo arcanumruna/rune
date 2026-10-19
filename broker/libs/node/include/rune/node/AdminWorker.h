@@ -248,6 +248,9 @@ public:
     /// retriable NotLeader (spec §5.2): the retry dedupes on the new leader if the
     /// event committed.
     void onCatalogRole(const AdminRoleMsg& role);
+    /// ISR v3 Step 10: the committed __catalog leadership is HELD (storage unconfirmed): never lead; ask the controller
+    /// for a failover (the restart-fence bump) and serve as a follower of nobody.
+    void onCatalogHoldLeadership(const AdminRoleMsg& role);
     /// control → admin (Task 11 fix round 1, I2): the placement view — the
     /// leader's dry-run refuses an explicit rf above `placeable` with
     /// InvalidRequest naming the shortfall and the halted brokers.  Until the

@@ -99,6 +99,23 @@ struct FollowerSlot {
     // frame of a dead process) is never credited, and a CHANGED one below the
     // HW marks the follower unclean (it lost committed records in a restart).
     int64_t incarnation = 0;
+    // ISR v3 Step 6 (R8 / A-I9): the storage id this follower last fetched with (0 = never seen or a v3 follower),
+    // and the storages it replaced (a fetch carrying one of them is a frame of a dead process).  Like
+    // `incarnation`, NONE of the three is reset by resetLeadership(): they describe the follower's process
+    // and disk, not this leadership - forgetting them on a leader change would let a dead process's late
+    // frame be credited again.
+    int64_t                storageId   = 0;
+    std::array<int64_t, 2> deadStorages{};
+    uint8_t                deadNext    = 0;
+
+    [[nodiscard]] bool isDeadStorage(int64_t s) const noexcept {
+        return s != 0 && (deadStorages[0] == s || deadStorages[1] == s);
+    }
+    void pushDeadStorage(int64_t s) noexcept {
+        if (s == 0 || isDeadStorage(s)) return;
+        deadStorages[deadNext] = s;
+        deadNext = static_cast<uint8_t>((deadNext + 1) & 1u);
+    }
 
     /// F27 R1: the link to this follower went down and came back: anything the
     /// transport accepted while it was down may be lost — forget every claim of
@@ -129,7 +146,7 @@ struct FollowerSlot {
         validated = false; unclean = false;
         // connGen is NOT reset: it belongs to the link, not the leadership — a
         // bounce across a re-election must still rewind (re-review 2 N1).
-        // incarnation is NOT reset either (MEDIUM-4: see the field).
+        // incarnation, storageId and deadStorages are NOT reset either (MEDIUM-4 / ISR v3 Step 6: see the fields).
     }
 };
 

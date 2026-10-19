@@ -430,6 +430,11 @@ void AdminWorker::onCatalogRole(const AdminRoleMsg& role) {
     demote_(role.leaderId, role.epoch);
 }
 
+void AdminWorker::onCatalogHoldLeadership(const AdminRoleMsg& role) {
+    if (catalogReplica_ != nullptr) catalogReplica_->holdLeadershipForStorage(role.epoch, role.partitionEpoch);
+    demote_(-1, role.epoch);
+}
+
 void AdminWorker::demote_(int32_t leaderId, int32_t epoch) {
     if (!std::holds_alternative<CatalogHalted>(role_)) setRole_(CatalogFollower{leaderId, epoch});
     // Spec §5.2: an in-flight DDL is answered at once — the retriable NotLeader

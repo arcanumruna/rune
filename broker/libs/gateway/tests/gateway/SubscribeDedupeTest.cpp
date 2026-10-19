@@ -16,7 +16,9 @@
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/metadata/ShardRouter.h>
+#include <rune/node/ReplicaRegistry.h>
 #include <rune/node/WorkerPool.h>
+#include <rune/replication/PartitionReplica.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/ControlMessages.h>
 #include <rune/protocol/client/DataMessages.h>
@@ -77,6 +79,10 @@ struct Rig {
     TempDir                                 dir;
     std::unique_ptr<TopicRegistry>          registry;
     std::unique_ptr<rune::node::WorkerPool> pool;
+    // CP1-I4: a worker-routed partition is served through its replica's published HW (a worker-owned log is never
+    // read by the gateway), so the worker rig registers a replica per partition, as production always does.
+    rune::replication::InMemoryTransport    transport;
+    rune::node::ReplicaRegistry             replicas;
     ClientGateway                           gw;
     std::vector<pc::SubscribeResponse>      responses;
     std::vector<pc::Records>                records;
@@ -99,6 +105,17 @@ struct Rig {
             gw.setWorkerPool(pool.get());
             gw.setShardMode(true);
             gw.setPerWorkerEgressActive(true);
+            for (int32_t p = 0; p < partitions; ++p) {
+                rune::replication::PartitionConfig c;
+                c.topicId = 0; c.partitionId = p; c.selfId = 1; c.minIsr = 1;
+                c.replicaLagMaxOffset = 1'000'000'000; c.replicaLagMaxMs = 600'000;
+                auto rep = std::make_unique<rune::replication::PartitionReplica>(
+                    c, rune::replication::Role::Leader, 1, std::vector<int32_t>{1}, std::vector<int32_t>{1},
+                    registry->log(0, p), &transport);
+                rep->setExternalFollowerFlush(true);
+                replicas.add(0, p, std::move(rep));
+            }
+            gw.setReplicaRegistry(&replicas);
         }
     }
     void subscribe(int64_t sid, int64_t corr, int64_t fromOffset = 0, int32_t partition = 0) {
@@ -405,4 +422,64 @@ TEST(SubscribeDedupeRegression, GetViewRowOnAFullWorkerRingIsAnsweredBusyRegress
     ASSERT_EQ(rows.size(), 1u) << "a GetViewRow refused by a full worker ring was dropped";
     EXPECT_EQ(rows[0].correlationId, corr - 1);
     EXPECT_EQ(rows[0].status, pc::ViewRowResponse::kBusy);
+}
+
+// CP1 review I4 (a real product race, pre-existing): the gateway read a WORKER-owned Log (LEO, and the segment map
+// through logStartOffset()) for every topic created by DDL since boot, because ownership was decided by a set filled
+// only from the boot topics.  A topic that never went through addWorkerOwnedLog (a runtime topic) is exactly this
+// test's topic.  The gateway must resolve ownership by the routing predicate: for a worker-routed partition the
+// Earliest start is 0 here (the owning worker raises the cursor on ITS thread, Worker::raiseFreshDiskCursor_) and the
+// clamp is the replica's published HW.  RED (the set-based gatewayOwnsLog_): the start is the log's logStartOffset(),
+// read from the worker's log on the gateway thread (a data race under TSan, a wrong start when the worker retains).
+TEST(ClientGatewayRegression, SubscribeToARuntimeTopicNeverReadsTheWorkerOwnedLogRegression) {
+    TempDir dir;
+    rune::node::TopicSpec ts;
+    ts.name = "runtime"; ts.partitionCount = 1; ts.topicId = 0;
+    ts.segmentRollBytes = 256;   // tiny segments: retention can advance the log start
+    TopicRegistry registry(std::vector<rune::node::TopicSpec>{ts}, dir.path.string());
+    rune::storage::Log* log = registry.log(0, 0);
+    ASSERT_NE(log, nullptr);
+    for (int i = 0; i < 40; ++i) {
+        const int64_t base = log->logEndOffset();
+        rune::protocol::RecordBatchBuilder b(base, 1000LL);
+        b.append("k", "v", 1000LL);
+        log->append(b.build(), base);
+    }
+    ASSERT_GT(log->segmentBaseOffsets().size(), 1u);
+    ASSERT_GT(log->deleteOldSegments(/*retainBytes=*/0), 0);
+    const int64_t S = log->logStartOffset();
+    ASSERT_GT(S, 0) << "retention must advance the log start past 0";
+
+    rune::replication::InMemoryTransport transport;
+    rune::replication::PartitionConfig c;
+    c.topicId = 0; c.partitionId = 0; c.selfId = 1; c.minIsr = 1;
+    c.replicaLagMaxOffset = 1'000'000'000; c.replicaLagMaxMs = 600'000;
+    auto rep = std::make_unique<rune::replication::PartitionReplica>(
+        c, rune::replication::Role::Leader, 1, std::vector<int32_t>{1}, std::vector<int32_t>{1}, log, &transport);
+    rune::node::ReplicaRegistry reg;
+    rep->setExternalFollowerFlush(true);
+    rune::replication::PartitionReplica* r = rep.get();
+    reg.add(0, 0, std::move(rep));
+    for (int i = 0; i < 100 && r->gatewayHighWatermark() < log->logEndOffset(); ++i) r->doWork(1'000'000LL * (i + 1));
+    ASSERT_GE(r->gatewayHighWatermark(), S) << "the replica's published HW must cover the retained data";
+
+    std::vector<pc::SubscribeResponse> responses;
+    ClientGateway gw = ClientGateway::makeForTest([](const uint8_t*, std::size_t) -> int64_t { return 1; }, 1);
+    rune::node::WorkerPool pool(1, rune::metadata::ShardRouter(1), 1 << 16, 1 << 16, 16, 16);
+    gw.setTopicRegistry(&registry);
+    gw.setReplicaRegistry(&reg);
+    gw.setCommittedMetadataReady(true);
+    gw.setWorkerPool(&pool);
+    gw.setShardMode(true);
+    gw.setPerWorkerEgressActive(true);
+    gw.setOnEgressFrame([&](int64_t, const uint8_t* b, std::size_t n) {
+        if (auto sr = pc::SubscribeResponse::decode(b, n)) responses.push_back(*sr);
+    });
+    const int64_t sid = gw.injectTestSession(0);
+    const auto f = subscribeFrame(sid, kCorr, /*partition=*/0, /*Earliest=*/-2);
+    gw.applySubscribeForTest(f.data(), f.size());
+    ASSERT_EQ(responses.size(), 1u);
+    ASSERT_EQ(responses[0].errorCode, static_cast<int16_t>(pc::ErrorCode::OK));
+    EXPECT_EQ(gw.subscriptionNextOffsetForTest(responses[0].subscriptionId), 0)
+        << "the gateway resolved the Earliest start from a log the worker owns (start " << S << ")";
 }

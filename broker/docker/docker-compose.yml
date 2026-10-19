@@ -43,6 +43,8 @@ x-broker-env: &broker-env
   # Followers use clientPort to redirect Produce/Subscribe to the leader endpoint.
   RUNE_PEERS: "0@rune-1:40111:40200:40222,1@rune-2:40111:40200:40222,2@rune-3:40111:40200:40222"
   RUNE_DATA_DIR: /var/lib/rune
+  # dev: auto-format empty volumes (the dr-e2e harness and docker/*e2e.sh rely on it)
+  RUNE_STORAGE_FORMAT: "${RUNE_STORAGE_FORMAT:-auto}"
   # Client gateway listens on all interfaces inside the container.
   # RUNE_CLIENT_ENDPOINT is the raw "host:port" appended to "aeron:udp?endpoint=".
   RUNE_CLIENT_ENDPOINT: "0.0.0.0:40200"

@@ -83,6 +83,7 @@
 #include <deque>
 #include <utility>
 #include <optional>
+#include <variant>
 #include <map>
 #include <span>
 #include <unordered_map>
@@ -610,6 +611,8 @@ public:
             resp->topicId = m.topicId; resp->partition = m.partition;
             resp->leaderId = m.leaderId; resp->leaderEpoch = m.leaderEpoch;
             resp->partitionEpoch = partitionEpoch; resp->errorCode = code;
+            resp->proposalId = m.proposalId; resp->sendSeq = m.sendSeq;   // ISR protocol: echo the correlation ids
+            resp->controllerEpoch = controllerEpoch_;
             if (answer) *answer = true;
         };
         // Controlled shutdown: a NODE-level request (no partition) — recorded
@@ -624,6 +627,13 @@ public:
             noteUnservable_(m);
             return false;
         }
+        // ISR v3 Step 11 (3.8, B-I3): a follower refused to truncate below the committed offset - the leader's log is
+        // below what it told the followers is committed.  Decided at EVERY feature level (a report is not a storage
+        // record): the leader is failed over to another live ISR member, and (level 2) its storage is fenced.  A report
+        // for a stale leader/epoch is answered Fenced; a repeated one overwrites the request, which survives a
+        // partitionEpoch change (A-I4).  Only a ready controller answers.
+        if (m.isrCount == rr::AlterIsrMsg::kLeaderEpochBump && (m.isr[1] & rr::AlterIsrMsg::kBumpLeaderBelowCommitted) != 0)
+            return onBelowCommittedReport_(m, reply);
         if (!controllerReady_()) return false;
         // Internal topics: only the coordinator partitions on the controller
         // path (MEDIUM-B); __cluster_metadata uses the internal-ISR store.
@@ -676,9 +686,18 @@ public:
             // (flapping).  Members already committed are kept (a shrink of them
             // is the leader's call).
             const bool added = std::find(pa->isr.begin(), pa->isr.end(), n) == pa->isr.end();
+            // I-S3: a member is added only under the storage the leader validated it with.
+            bool storageMismatch = false;
+            if (msm_.featureLevel() >= rr::MetadataFeature::kStorageIdentity) {
+                const int64_t committed = msm_.nodeStorage(n);              // 0 = no record yet
+                const auto lc = nodeLifecycle_.find(n);
+                const int64_t live = lc != nodeLifecycle_.end() ? lc->second.storageId : 0;   // last registered (review A M2)
+                const int64_t cap  = m.isrStorage[static_cast<std::size_t>(i)];
+                storageMismatch = (committed != 0 && cap != committed) || (live != 0 && cap != 0 && cap != live);
+            }
             if (added && n != m.leaderId &&
                 ((eligibleKnown_ && std::find(eligible_.begin(), eligible_.end(), n) == eligible_.end()) ||
-                 isShutting_(n))) {   // controlled shutdown: never re-admitted
+                 isShutting_(n) || storageMismatch)) {   // controlled shutdown: never re-admitted
                 droppedIneligible = true;
                 continue;
             }
@@ -716,6 +735,44 @@ public:
         drainDynamicQueue();
         return true;
     }
+    template <typename Reply>
+    bool onBelowCommittedReport_(const rune::replication::AlterIsrMsg& m, Reply& reply) {
+        namespace rr = rune::replication;
+        if (!controllerReady_()) return false;
+        if (m.topicId < 0 && !coordinatorKey_(m.topicId, m.partition)) return false;
+        const rune::metadata::PartitionAssignment* pa = msm_.assignment(m.topicId, m.partition);
+        if (pa == nullptr) { reply(rr::kAlterIsrFencedLeaderEpoch, -1); return false; }
+        if (pa->leaderNode >= 0 && pa->leaderNode != m.leaderId && pa->leaderEpoch == static_cast<int32_t>(m.leaderEpoch)) {
+            BumpRequest r;
+            r.requester      = pa->leaderNode;
+            r.leaderEpoch    = pa->leaderEpoch;
+            r.partitionEpoch = pa->partitionEpoch;
+            r.fence          = pa->leaderEpoch;
+            r.reason         = BumpReason::LostCommitted;
+            r.leo            = -1;
+            r.incarnation    = 0;
+            bumpRequests_[partitionKey_(m.topicId, m.partition)] = r;   // overwrite: the newest report names the newest pe
+            ++lostCommittedReports_;
+            if (msm_.featureLevel() >= rr::MetadataFeature::kStorageIdentity) fenceStorage_(pa->leaderNode);   // A-I4.4
+            reply(rr::kAlterIsrOk, pa->partitionEpoch);
+        } else {
+            reply(rr::kAlterIsrFencedLeaderEpoch, pa->partitionEpoch);
+        }
+        return false;
+    }
+    /// A-I4.4: the leader whose log fell below the committed offset lost its storage as far as the cluster can tell,
+    /// whatever its register says.  Fence it like a replaced disk: strip it from every ISR, leadership and lineage, then
+    /// re-confirm.  Nonce 0 belongs to no process, so no register erases the entry (section 3.3 row 1); an existing
+    /// entry (a strip already in progress) is kept.
+    void fenceStorage_(int32_t node) {
+        if (storageRegs_.find(node) != storageRegs_.end()) return;
+        const int64_t S = msm_.nodeStorage(node);
+        if (S == 0) return;   // nothing committed to re-confirm: the first registration decides it
+        spdlog::warn("controller: node {} led a partition whose log is below the committed offset: fencing its storage {:x}",
+                     node, static_cast<uint64_t>(S));
+        storageRegs_[node] = Stripping{S, rune::replication::AlterIsrMsg::kStorageOriginJoiner, 0, lastNowNs_, lastNowNs_};
+        std::erase(eligible_, node);
+    }
     /// Leader-epoch restart fence (PartitionReplica::setLeaderEpochFenceFile):
     /// the committed leader `m.leaderId` refused leadership at the committed
     /// epoch (it already led at it in an earlier incarnation — leading again
@@ -741,12 +798,14 @@ public:
         r.leaderEpoch    = pa.leaderEpoch;
         r.partitionEpoch = pa.partitionEpoch;
         r.fence          = (m.isr[1] & rr::AlterIsrMsg::kBumpFenceValid) != 0 ? m.isr[0] : -1;
-        r.memoryBacked   = (m.isr[1] & rr::AlterIsrMsg::kBumpMemoryBacked) != 0;
-        r.logDirFailed   = (m.isr[1] & rr::AlterIsrMsg::kBumpLogDirFailed) != 0;
+        const bool logDirFailed = (m.isr[1] & rr::AlterIsrMsg::kBumpLogDirFailed) != 0;
+        r.reason         = logDirFailed ? BumpReason::LogDirFailed
+                         : (m.isr[1] & rr::AlterIsrMsg::kBumpMemoryBacked) != 0 ? BumpReason::MemoryEmpty
+                                                                              : BumpReason::Fence;
         r.leo            = m.isr[2];
         r.incarnation    = incarnationOf_(m);
-        noteIncarnation_(m.leaderId, r.incarnation, r.logDirFailed);
-        if (r.logDirFailed) markOffline_(m.topicId, m.partition, m.leaderId, r.incarnation);
+        noteIncarnation_(m.leaderId, r.incarnation, logDirFailed);
+        if (logDirFailed) markOffline_(m.topicId, m.partition, m.leaderId, r.incarnation);
         bumpRequests_[partitionKey_(m.topicId, m.partition)] = r;
         return false;   // decided (and enqueued) by the next rebalance tick
     }
@@ -789,6 +848,10 @@ public:
         /// CatalogApplier halted (kNodeCatalogHalted) — never a placement target;
         /// cleared only by a new process (adopt).
         bool    catalogHalted  = false;
+        /// ISR v3 (Step 7): the storage this PROCESS registered with (slots 7-9 of its node-control frame):
+        /// the id (0 = none / an older binary) and the origin wire code (AlterIsrMsg::kStorageOrigin*).
+        int64_t storageId      = 0;
+        uint8_t storageOrigin  = 0;
         uint32_t supersededNext = 0;
         std::unordered_map<int32_t, int32_t> confirmed;   ///< controller side: member → clear bits
         [[nodiscard]] bool isSuperseded(int64_t n) const noexcept {
@@ -805,6 +868,7 @@ public:
             lineageRevoked = false;   // R1: a new live process
             catalogHalted  = false;   // Task 11: a new process has a fresh applier
             featureLevel = -1;   // D15: a new process may be another binary
+            storageId = 0; storageOrigin = 0;   // ISR v3: a new process re-reports its storage
             confirmed.clear();
             return true;
         }
@@ -849,6 +913,12 @@ public:
                          selfId_, m.leaderId);
         }
         st.featureLevel = static_cast<int16_t>(m.isr[rr::AlterIsrMsg::kNodeFeatureLevelSlot]);   // D15
+        st.storageId = static_cast<int64_t>(
+            (static_cast<uint64_t>(static_cast<uint32_t>(m.isr[rr::AlterIsrMsg::kNodeStorageHiSlot])) << 32) |
+            static_cast<uint32_t>(m.isr[rr::AlterIsrMsg::kNodeStorageLoSlot]));
+        st.storageOrigin = static_cast<uint8_t>(m.isr[rr::AlterIsrMsg::kNodeStorageOriginSlot]);
+        if (controllerReady_() && msm_.featureLevel() >= rr::MetadataFeature::kStorageIdentity)
+            noteStorageRegistration_(m.leaderId, st);   // ISR v3 §3.3: the registration table
         if (wasShutting && !st.shutting)
             spdlog::info("MetadataService[{}]: node {} restarted (new process) — its shutdown mark is "
                          "cleared", selfId_, m.leaderId);
@@ -892,6 +962,7 @@ public:
         r.leaderEpoch    = static_cast<rr::Epoch>(static_cast<int32_t>(static_cast<uint32_t>(nonce)));
         r.partitionEpoch = static_cast<int32_t>(static_cast<uint32_t>(static_cast<uint64_t>(nonce) >> 32));
         r.errorCode      = complete ? rr::kAlterIsrOk : rr::AlterIsrMsg::kNodeShutdownPending;
+        r.controllerEpoch = controllerEpoch_;
     }
     /// Controller: push COMPLETE to stopping `node` the first time it holds.
     void maybePushComplete_(int32_t node, NodeLifecycle& st) {
@@ -1504,6 +1575,22 @@ public:
             bool isOffered = false;   // busy (in flight / queued) ones wait for the next tick
             for (const auto& o : offered) isOffered = isOffered || (o.topicId == topicId && o.partition == partition);
             if (!isOffered) { ++it; continue; }
+            if (it->second.reason == BumpReason::LostCommitted) {
+                // ISR v3: the leader's log is below the committed HW.  The balancer's failover (if any) would keep
+                // the requester in the ISR; the request is decided HERE: it leaves, another live member leads.
+                const rune::metadata::PartitionAssignment* lpa = msm_.assignment(topicId, partition);
+                if (lpa == nullptr) { it = bumpRequests_.erase(it); continue; }
+                const bool hadRec = std::any_of(recs.begin(), recs.end(), [&](const rune::metadata::BalancerRecord& r) {
+                    return r.rec.topicId == topicId && r.rec.partition == partition; });
+                if (!hadRec && static_cast<int>(recs.size()) >= maxRecords) { ++it; continue; }   // next tick
+                std::erase_if(recs, [&](const rune::metadata::BalancerRecord& r) {
+                    return r.rec.topicId == topicId && r.rec.partition == partition; });
+                failOverWithout_(topicId, partition, *lpa, it->second.requester,
+                                 rune::metadata::LeaderlessMark::Kind::StorageReset, recs);
+                ++bumpFailovers_;
+                it = bumpRequests_.erase(it);
+                continue;
+            }
             bool decided = false;
             for (const auto& r : recs) decided = decided || (r.rec.topicId == topicId && r.rec.partition == partition);
             if (decided) { ++bumpFailovers_; it = bumpRequests_.erase(it); continue; }
@@ -1532,7 +1619,7 @@ public:
             }
             if (!br.isr.empty()) {
                 ++bumpFailovers_;   // coordinator failover decided above
-            } else if (q.logDirFailed || (q.memoryBacked && q.leo == 0)) {
+            } else if (q.reason == BumpReason::LogDirFailed || (q.reason == BumpReason::MemoryEmpty && q.leo == 0)) {
                 // N1: an offline log dir is never re-granted; N2: an EMPTY
                 // memory leader is not re-elected blind — the partition goes
                 // leaderless (Kafka offline, ISR lineage kept); the memory case
@@ -1542,11 +1629,11 @@ public:
                 br.isr             = pa->isr;
                 // D15 item 1: WHY it is leaderless is committed with the record
                 // (a successor controller re-derives the exclusion from it).
-                br.mark.kind = q.logDirFailed ? rune::metadata::LeaderlessMark::Kind::LogDirOffline
-                                              : rune::metadata::LeaderlessMark::Kind::EmptyMemoryLeader;
+                br.mark.kind = q.reason == BumpReason::LogDirFailed ? rune::metadata::LeaderlessMark::Kind::LogDirOffline
+                                                                    : rune::metadata::LeaderlessMark::Kind::EmptyMemoryLeader;
                 br.mark.node        = q.requester;
                 br.mark.incarnation = q.incarnation;
-                if (!q.logDirFailed) {
+                if (q.reason != BumpReason::LogDirFailed) {
                     emptyMemoryLeader_[it->first] = EmptyMemoryLeader{q.requester, br.rec.leaderEpoch, q.incarnation};
                     leaderlessReports_.erase(it->first);
                 }
@@ -1562,6 +1649,285 @@ public:
             br.rec.replicas = rune::protocol::metadata::Int32ArrayView{br.replicas.data(), static_cast<uint16_t>(br.replicas.size())};
             recs.push_back(std::move(br));
             it = bumpRequests_.erase(it);
+        }
+    }
+
+    /// ISR v3 Step 6 (storage manifest): called ONCE, on the control thread, the first time `lastApplied_`
+    /// becomes >= 0 on a COMMITTED apply (the metadata log now holds data on this storage).  Cold.
+    using FirstApplyHook = void (*)(void*) noexcept;
+    void setFirstApplyHook(FirstApplyHook hook, void* ctx) noexcept { firstApplyHook_ = hook; firstApplyCtx_ = ctx; }
+    /// A record that carries STATE was applied (anything but a ControllerTermRecord).  The controller's own claim
+    /// record is not "data on this storage": it must not make the empty-log bootstrap guard see a formed log.
+    void noteAppliedRecord_(std::string_view val) noexcept {
+        if (val.size() < 2) return;
+        const uint16_t t = static_cast<uint16_t>(static_cast<uint8_t>(val[0]) | (static_cast<uint8_t>(val[1]) << 8));
+        if (t != rune::metadata::kControllerTermRecordType) appliedStateRecord_ = true;
+    }
+    void noteFirstApply_() noexcept {
+        if (firstApplyHook_ == nullptr || lastApplied_ < 0 || !appliedStateRecord_) return;
+        const FirstApplyHook h = firstApplyHook_;
+        firstApplyHook_ = nullptr;
+        h(firstApplyCtx_);
+    }
+
+
+    // =======================================================================
+    // ISR v3 (Step 7) - controller storage tracking (design section 3.3).
+    //
+    // A node whose LIVE storage differs from the one the controller committed (a disk replaced or wiped, or a
+    // Joiner) is FENCED: stripped from every ISR, leadership and retained lineage, and only then is its new
+    // storage id committed.  Everything below is soft, control-thread state of the READY controller; the
+    // committed truth is msm_.nodeStorage().  Cold paths only (registrations, ticks).
+    // =======================================================================
+    struct Stripping  { int64_t storageId; uint8_t origin; int64_t nonce; int64_t sinceNs; int64_t lastLogNs; };
+    struct Committing { int64_t storageId; uint8_t origin; int64_t nonce; int64_t appendedAt; };
+    using StorageReg = std::variant<Stripping, Committing>;
+
+    [[nodiscard]] static int64_t regNonce_(const StorageReg& r) noexcept {
+        return std::holds_alternative<Stripping>(r) ? std::get<Stripping>(r).nonce : std::get<Committing>(r).nonce;
+    }
+    [[nodiscard]] bool isTransient_(int32_t topicId) const noexcept {
+        return transientFn_ != nullptr && transientFn_(transientCtx_, topicId);   // null = never transient
+    }
+    [[nodiscard]] bool storageRecordQueuedOrInflight_(int32_t node) const noexcept {
+        if (storageInflight_.count(node) != 0) return true;
+        for (const auto& q : pendingStorageRecords_) if (q.node == node) return true;
+        return false;
+    }
+    /// An in-flight (appended, not committed) or queued assignment record that names `node` as its leader or an
+    /// ISR member (v2-review I4).  A record that names only OTHER nodes (a shrink) never blocks `node`.
+    [[nodiscard]] bool namesNodeInFlightOrQueued_(int32_t node) const noexcept {
+        for (const auto& [k, ir] : inflight_) {
+            (void)k;
+            if (ir.leader == node) return true;
+            for (std::size_t i = 0; i < ir.n; ++i) if (ir.isr[i] == node) return true;
+        }
+        return queuedDynamicNames_(node);
+    }
+    [[nodiscard]] bool queuedDynamicNames_(int32_t node) const noexcept {
+        for (const auto& q : pendingDynamicRecords_) {
+            if (q.rec.leaderNode == node) return true;
+            for (int32_t m : q.isr) if (m == node) return true;
+        }
+        return false;
+    }
+    /// A-I10 (CP2 I1): the lineage {N} that `failOverWithout_` keeps for a wiped sole leader of a TRANSIENT (memory)
+    /// partition.  A memory partition's data does not survive a restart, so N's storage identity does not matter for
+    /// it: the strip and the confirmation must leave it alone (disk partitions are still stripped).
+    [[nodiscard]] bool keptTransientLineage_(int32_t topicId, const rune::metadata::PartitionAssignment& pa,
+                                             int32_t node) const noexcept {
+        return pa.leaderNode == rune::metadata::NO_LEADER && pa.mark.kind == rune::metadata::LeaderlessMark::Kind::EmptyMemoryLeader &&
+               pa.mark.node == node && isTransient_(topicId);
+    }
+    [[nodiscard]] bool committedMapNames_(int32_t node) const {
+        bool names = false;
+        msm_.committedMap().forEach([&](int32_t topicId, int32_t, const rune::metadata::PartitionAssignment& pa) {
+            if (keptTransientLineage_(topicId, pa, node)) return;
+            if (!names && (pa.leaderNode == node || std::find(pa.isr.begin(), pa.isr.end(), node) != pa.isr.end()))
+                names = true;
+        });
+        return names;
+    }
+
+    /// The registration table (section 3.3).  Ready controller, level >= 2.
+    void noteStorageRegistration_(int32_t node, const NodeLifecycle& st) {
+        namespace rr = rune::replication;
+        const int64_t S = st.storageId;
+        if (S == 0 || st.storageOrigin == rr::AlterIsrMsg::kStorageOriginUndecided ||
+            st.storageOrigin == rr::AlterIsrMsg::kStorageOriginNone)
+            return;                                                       // nothing to act on yet
+        const int64_t committed = msm_.nodeStorage(node);
+        if (committed == S) {
+            // The committed storage is the live one.  Erase the soft entry only if it is THIS process's (A-I2): a late
+            // frame of a dead process must not undo a newer process's strip; a nonce-0 fence is never erased.
+            const auto it = storageRegs_.find(node);
+            if (it != storageRegs_.end() && regNonce_(it->second) != 0 && regNonce_(it->second) == st.nonce)
+                storageRegs_.erase(it);
+            return;
+        }
+        const bool trust = committed == 0 && (st.storageOrigin == rr::AlterIsrMsg::kStorageOriginFounder ||
+                                              st.storageOrigin == rr::AlterIsrMsg::kStorageOriginLegacy);
+        if (trust) {
+            // Trust on first use.  A stale pending entry belongs to an older storage of this node: dropped (the live
+            // process is the founder/legacy one).  Re-queued by every register while committed == 0 (B-I7).
+            storageRegs_.erase(node);
+            if (!storageRecordQueuedOrInflight_(node)) {
+                pendingStorageRecords_.push_back(rune::metadata::NodeStorageRecord{node, S});
+                drainDynamicQueue();
+            }
+            return;
+        }
+        // A Joiner (nothing committed), or any origin whose committed storage differs: fence it.
+        const auto it = storageRegs_.find(node);
+        if (it != storageRegs_.end() && std::holds_alternative<Stripping>(it->second) &&
+            std::get<Stripping>(it->second).storageId == S && std::get<Stripping>(it->second).nonce == st.nonce)
+            return;                                                       // the same registration again
+        int k = 0, l = 0, j = 0;
+        msm_.committedMap().forEach([&](int32_t, int32_t, const rune::metadata::PartitionAssignment& pa) {
+            const bool inIsr = std::find(pa.isr.begin(), pa.isr.end(), node) != pa.isr.end();
+            if (pa.leaderNode == node) ++l;
+            else if (inIsr && pa.leaderNode == rune::metadata::NO_LEADER) ++j;
+            else if (inIsr) ++k;
+        });
+        spdlog::warn("controller: node {} reported storage {:x} (committed {}, origin {}): stripping it from {} ISRs, "
+                     "{} leaderships, {} lineages before confirming", node, static_cast<uint64_t>(S),
+                     committed == 0 ? std::string("none") : (std::ostringstream{} << std::hex << committed).str(),
+                     storageOriginName_(st.storageOrigin), k, l, j);
+        storageRegs_[node] = Stripping{S, st.storageOrigin, st.nonce, lastNowNs_, lastNowNs_};
+        std::erase(eligible_, node);                                       // M13: not admissible from this instant
+    }
+    [[nodiscard]] static const char* storageOriginName_(uint8_t o) noexcept {
+        switch (o) { case 1: return "founder"; case 2: return "legacy"; case 3: return "joiner"; case 4: return "undecided"; default: return "none"; }
+    }
+    /// Replay (A-I2): the registrations held in nodeLifecycle_ survive a controller change as soft state of every
+    /// member; the new ready controller rebuilds its storageRegs_ from them.
+    void replayStorageRegistrations_() {
+        if (!controllerReady_() || msm_.featureLevel() < rune::replication::MetadataFeature::kStorageIdentity) return;
+        for (auto& [n, st] : nodeLifecycle_)
+            if (st.storageId != 0) noteStorageRegistration_(n, st);
+    }
+    /// The level edge: the first ready cycle that observes level >= 2 after the registrations were held back.
+    void storageLevelEdge_() {
+        if (controllerReady_() && msm_.featureLevel() >= rune::replication::MetadataFeature::kStorageIdentity &&
+            storageReplayLevel_ < rune::replication::MetadataFeature::kStorageIdentity) {
+            storageReplayLevel_ = msm_.featureLevel();
+            replayStorageRegistrations_();
+        }
+    }
+    /// B-I7: a Committing entry whose node storage is committed is done; one whose record is neither in flight nor
+    /// queued (truncated, or lost) goes back to Stripping, which re-decides it.
+    void pruneStorageRegs_() {
+        for (auto it = storageRegs_.begin(); it != storageRegs_.end();) {
+            auto* c = std::get_if<Committing>(&it->second);
+            if (c == nullptr) { ++it; continue; }
+            if (msm_.nodeStorage(it->first) == c->storageId) {
+                spdlog::info("controller: storage {:x} of node {} confirmed", static_cast<uint64_t>(c->storageId), it->first);
+                it = storageRegs_.erase(it);
+                continue;
+            }
+            if (!storageRecordQueuedOrInflight_(it->first)) {
+                it->second = Stripping{c->storageId, c->origin, c->nonce, lastNowNs_, lastNowNs_};
+                ++storageConfirmRequeued_;
+            }
+            ++it;
+        }
+    }
+    /// The strip: the ONE helper behind both the storage strip and Step 11's LostCommitted (section 3.3).  `node` leaves
+    /// partition `pa`'s leadership: another live ISR member leads, else the partition goes leaderless without it.
+    /// Co-partition units are handled per partition; the preferred-leader pass restores colocation afterwards.
+    void failOverWithout_(int32_t topicId, int32_t partition, const rune::metadata::PartitionAssignment& pa,
+                          int32_t node, rune::metadata::LeaderlessMark::Kind markKind,
+                          std::vector<rune::metadata::BalancerRecord>& recs) {
+        namespace rm = rune::metadata;
+        const int64_t key = partitionKey_(topicId, partition);
+        rm::ElectionInputs ei;
+        ei.cur = pa;
+        std::erase(ei.cur.isr, node);
+        ei.positions = &positions_;
+        for (int32_t n : ei.cur.isr)   // (isr \ {node}) ∩ effective \ shutting \ unservable \ offline
+            if (isEligible_(n) && !isShutting_(n) && !reportedUnservable(topicId, partition, n) &&
+                !isOffline_(topicId, partition, n))
+                ei.liveNodes.push_back(n);
+        rm::BalancerRecord br;
+        br.replicas = pa.replicas;
+        br.rec.topicId     = topicId;
+        br.rec.partition   = partition;
+        br.rec.leaderEpoch = pa.leaderEpoch + 1;
+        if (!ei.liveNodes.empty()) {
+            const rm::ElectionOutcome out = rm::FailoverElection::elect(topicId, partition, ei);
+            br.rec.leaderNode = out.change.newLeader;
+            br.isr            = out.change.newIsr;
+        } else if (isTransient_(topicId)) {
+            // A transient (memory) partition keeps its lineage: it is decided on fresh reports (A-I10).
+            br.rec.leaderNode = rm::NO_LEADER;
+            br.isr            = pa.isr;
+            br.mark.kind      = rm::LeaderlessMark::Kind::EmptyMemoryLeader;
+            br.mark.node      = node;
+            emptyMemoryLeader_[key] = EmptyMemoryLeader{node, br.rec.leaderEpoch, 0};
+            leaderlessReports_.erase(key);
+        } else {
+            br.rec.leaderNode = rm::NO_LEADER;
+            br.isr            = ei.cur.isr;
+            const int64_t oldStorage = msm_.nodeStorage(node);
+            if (msm_.featureLevel() >= rune::replication::MetadataFeature::kStorageIdentity) {
+                br.mark.kind        = markKind;
+                br.mark.node        = node;
+                br.mark.incarnation = oldStorage;
+            }
+            emptyMemoryLeader_[key] = EmptyMemoryLeader{node, br.rec.leaderEpoch, oldStorage};
+            leaderlessReports_.erase(key);
+            if (storageResetWarned_.insert(key).second)   // M15: once per partition
+                spdlog::warn("controller: partition {}/{} lost its only in-sync replica's storage (node {}); it stays "
+                             "offline until RUNE_SURVIVOR_LEADER_ELECTION=1 elects the most complete live replica (may "
+                             "lose committed records)", topicId, partition, node);
+        }
+        br.rec.partitionEpoch = std::max(pa.partitionEpoch + 1, br.rec.leaderEpoch);
+        br.rec.isr      = rune::protocol::metadata::Int32ArrayView{br.isr.data(), static_cast<uint16_t>(br.isr.size())};
+        br.rec.replicas = rune::protocol::metadata::Int32ArrayView{br.replicas.data(), static_cast<uint16_t>(br.replicas.size())};
+        recs.push_back(std::move(br));
+    }
+    /// The strip pass: every committed partition that names a Stripping node loses it.  A partition with a record in
+    /// flight or queued is busy and waits (decided again on the committed state); a record the balancer emitted for
+    /// the partition in this pass is replaced by the strip (M8).
+    void decideStorageResets_(std::vector<rune::metadata::BalancerRecord>& recs, int maxRecords) {
+        namespace rm = rune::metadata;
+        for (auto& [N, reg] : storageRegs_) {
+            auto* st = std::get_if<Stripping>(&reg);
+            if (st == nullptr) continue;
+            int left = 0, blocked = 0;
+            msm_.committedMap().forEach([&](int32_t topicId, int32_t partition, const rm::PartitionAssignment& pa) {
+                const bool leads = pa.leaderNode == N;
+                if (!leads && std::find(pa.isr.begin(), pa.isr.end(), N) == pa.isr.end()) return;
+                if (!leads && keptTransientLineage_(topicId, pa, N)) return;
+                ++left;
+                const int64_t key = partitionKey_(topicId, partition);
+                bool busy = inflight_.count(key) != 0;
+                for (const auto& q : pendingDynamicRecords_)
+                    busy = busy || (q.rec.topicId == topicId && q.rec.partition == partition);
+                if (busy) { ++blocked; return; }
+                const auto same = [&](const rm::BalancerRecord& r) { return r.rec.topicId == topicId && r.rec.partition == partition; };
+                const bool replaced = std::any_of(recs.begin(), recs.end(), same);
+                if (!replaced && static_cast<int>(recs.size()) >= maxRecords) return;   // next tick
+                std::erase_if(recs, same);
+                if (leads) {
+                    failOverWithout_(topicId, partition, pa, N, rm::LeaderlessMark::Kind::StorageReset, recs);
+                } else {
+                    rm::BalancerRecord br;   // a follower, or N in a NO_LEADER lineage: same leader and epoch
+                    br.replicas = pa.replicas;
+                    for (int32_t n : pa.isr) if (n != N) br.isr.push_back(n);
+                    br.mark = pa.mark;
+                    br.rec.topicId        = topicId;
+                    br.rec.partition      = partition;
+                    br.rec.leaderNode     = pa.leaderNode;
+                    br.rec.leaderEpoch    = pa.leaderEpoch;
+                    br.rec.partitionEpoch = pa.partitionEpoch + 1;
+                    br.rec.isr      = rune::protocol::metadata::Int32ArrayView{br.isr.data(), static_cast<uint16_t>(br.isr.size())};
+                    br.rec.replicas = rune::protocol::metadata::Int32ArrayView{br.replicas.data(), static_cast<uint16_t>(br.replicas.size())};
+                    recs.push_back(std::move(br));
+                }
+            });
+            if (left > 0 && lastNowNs_ - st->lastLogNs >= 30'000'000'000LL) {
+                st->lastLogNs = lastNowNs_;
+                spdlog::warn("controller: storage of node {} still pending: {} partitions left, {} blocked by in-flight records",
+                             N, left, blocked);
+            }
+        }
+    }
+    /// Confirm (A-M1, v2-review I4): the committed map names the node nowhere, and no in-flight, queued or just-decided
+    /// record names it as leader or ISR member -> queue its NodeStorageRecord.  It drains after the assignment records.
+    void confirmStorageRegs_(const std::vector<rune::metadata::BalancerRecord>& recs) {
+        for (auto& [N, reg] : storageRegs_) {
+            auto* st = std::get_if<Stripping>(&reg);
+            if (st == nullptr) continue;
+            if (committedMapNames_(N) || namesNodeInFlightOrQueued_(N) || storageRecordQueuedOrInflight_(N)) continue;
+            bool inRecs = false;
+            for (const auto& r : recs) {
+                inRecs = inRecs || r.rec.leaderNode == N;
+                for (int32_t m : r.isr) inRecs = inRecs || m == N;
+            }
+            if (inRecs) continue;
+            pendingStorageRecords_.push_back(rune::metadata::NodeStorageRecord{N, st->storageId});
+            reg = Committing{st->storageId, st->origin, st->nonce, lastNowNs_};
         }
     }
 
@@ -1604,12 +1970,49 @@ public:
     /// stepped-down / resumed-zombie controller keep reassigning partitions.
     /// Default true: harnesses without a consensus layer decide on the role.
     void setConsensusLeads(bool leads) noexcept { consensusLeads_ = leads; }
+    /// ISR protocol: this node's consensus leadership term, pushed every cycle (NodeRuntimeAgent).
+    /// Stamped on every AlterIsr answer so a follower can drop an answer of a deposed controller.
+    void setControllerEpoch(int64_t t) noexcept { controllerEpoch_ = t; }
+    [[nodiscard]] int64_t controllerEpochForTest() const noexcept { return controllerEpoch_; }
+    /// ISR v3 R17: may a claim over an EMPTY metadata log bootstrap a new one?  A live thunk over BrokerNode's
+    /// storage (origin == Founder and no MetadataLog in the manifest), read at the ready edge.  Null = true.
+    using MayBootstrapFn = bool (*)(void*) noexcept;
+    void setMayBootstrap(MayBootstrapFn fn, void* ctx) noexcept { mayBootstrapFn_ = fn; mayBootstrapCtx_ = ctx; }
+    [[nodiscard]] bool mayBootstrap_() const noexcept { return mayBootstrapFn_ == nullptr || mayBootstrapFn_(mayBootstrapCtx_); }
+    /// NodeRuntimeAgent, once per cycle: the controller role was halted by the empty-log guard; resign the consensus.
+    [[nodiscard]] bool takeResignRequest() noexcept { const bool r = resignRequested_; resignRequested_ = false; return r; }
+    [[nodiscard]] bool resignRequestedForTest() const noexcept { return resignRequested_; }
+    /// ISR v3 (Step 7): which topics are TRANSIENT (memory) partitions - a wiped sole-ISR leader of one keeps its
+    /// lineage (it is decided on fresh reports) instead of going StorageReset.  Null = never transient.  Set by
+    /// BrokerNode for single AND multi-node.
+    void setTransientTopicPredicate(bool (*fn)(void*, int32_t), void* ctx) noexcept { transientFn_ = fn; transientCtx_ = ctx; }
+    /// TEST ONLY (ISR v3 Step 10): while set, runDynamicRebalanceOnTick takes NO decision for ANY partition (erasing
+    /// every record it would emit, of every topic id - the userDecisionHoldNs_ pattern widened) and no storage record
+    /// is drained.  `maxNs` > 0: the hold lapses by itself after that long (control-thread clock).
+    void setHoldAllDecisionsForTest(bool on) noexcept { holdAll_ = on; holdAllSinceNs_ = lastNowNs_; }
+    void setHoldAllDecisionsMaxForTest(int64_t maxNs) noexcept { holdAllMaxNs_ = maxNs; }
+    [[nodiscard]] bool holdAllDecisionsActiveForTest() const noexcept { return holdAllActive_(); }
+    /// Counter sources (kStoragePendingNodesCounterTypeId / kLostCommittedReportsCounterTypeId).
+    [[nodiscard]] std::size_t storagePendingCount() const noexcept { return controllerReady_() ? storageRegs_.size() : 0; }
+    [[nodiscard]] uint64_t lostCommittedReports() const noexcept { return lostCommittedReports_; }
+    [[nodiscard]] uint64_t storageConfirmRequeuedForTest() const noexcept { return storageConfirmRequeued_; }
+    /// Test seams.
+    [[nodiscard]] const char* storageRegStateForTest(int32_t node) const noexcept {
+        const auto it = storageRegs_.find(node);
+        if (it == storageRegs_.end()) return "None";
+        return std::holds_alternative<Stripping>(it->second) ? "Stripping" : "Committing";
+    }
+    [[nodiscard]] const std::vector<int32_t>& eligibleForTest() const noexcept { return eligible_; }
+    void eligibleInsertForTest(int32_t node) { if (!isEligible_(node)) eligible_.push_back(node); }
+    /// The next storage record is dropped as if it had been appended and then lost (truncated): nothing is in flight.
+    void dropNextStorageAppendForTest() noexcept { dropNextStorageAppend_ = true; }
     /// Fix round 2 (N2): this node is stopping (plain stop()) — it decides
     /// nothing any more (no rebalance, no AlterIsr answers, no emit).
     void halt() noexcept {
         if (halted_) return;
         halted_ = true;
         pendingDynamicRecords_.clear();   // undecided under this leadership: the next controller re-decides
+        pendingStorageRecords_.clear(); storageInflight_.clear(); storageRegs_.clear();   // ISR v3 (v2-review I9)
         spdlog::info("MetadataService[{}]: halted (node stopping) — no further controller decisions", selfId_);
     }
     [[nodiscard]] bool haltedForTest() const noexcept { return halted_; }
@@ -1628,7 +2031,7 @@ public:
     }
     /// The controller decides only once its map reflects its whole log as of
     /// the claim (see controllerReady_).
-    [[nodiscard]] bool controllerCaughtUpForTest() const noexcept { return controllerCaughtUp_; }
+    [[nodiscard]] bool controllerCaughtUpForTest() const noexcept { return std::holds_alternative<ClaimReady>(claim_); }
     /// F-B test-only: placement / ISR decisions queued under the current claim and not yet appended.
     [[nodiscard]] std::size_t pendingDecisionsForTest() const noexcept { return pendingDynamicRecords_.size(); }
 
@@ -1758,10 +2161,19 @@ public:
     {
         if (!controllerReady_()) return 0;
 
+        // ISR v3: a node whose storage is pending (Stripping / Committing) is not eligible for ANYTHING - not an
+        // election candidate, not an ISR addition, not a live data-plane leader - until its record commits.
+        if (holdAllActive_()) [[unlikely]] return 0;   // TEST seam: no decision of any kind while held
+        pruneStorageRegs_();
+        effectiveEligibleScratch_.clear();
+        for (const auto n : eligibleNodes)
+            if (storageRegs_.find(n) == storageRegs_.end()) effectiveEligibleScratch_.push_back(n);
+        const std::vector<rune::metadata::NodeId>& effective = effectiveEligibleScratch_;
+
         // MEDIUM-2: the eligible set onAlterIsr filters additions against
         // (a stopping node is never admitted either — checked live there).
         const std::vector<int32_t>& shutting = shuttingNodes_();
-        eligible_.assign(eligibleNodes.begin(), eligibleNodes.end());
+        eligible_.assign(effective.begin(), effective.end());
         const bool firstLiveSet = !eligibleKnown_;
         eligibleKnown_ = true;
         if (firstLiveSet && !shutting.empty())   // a pending COMPLETE waited for the live set: an event, not a re-send
@@ -1769,7 +2181,7 @@ public:
         revokeDeadLineageIdentities_();   // R1 (round 5)
 
         // MEDIUM-B: coordinator partitions (controller-ISR path).
-        const std::size_t coord = reconcileCoordinatorPartitions(eligibleNodes);
+        const std::size_t coord = reconcileCoordinatorPartitions(effective);
         // Task 11 fix round 5 (I1): every member holds the broadcast "cannot serve"
         // reports; a controller PROCESS younger than one report TTL may lack one —
         // it decides no user-partition leadership until it has held them a full TTL.
@@ -1785,11 +2197,13 @@ public:
             std::vector<rune::metadata::DynamicBalancerInputs::LeaderExclusion> ex;
             validBumpExclusions_(ex);
             std::vector<rune::metadata::BalancerRecord> recs;
+            decideStorageResets_(recs, maxRecordsPerCycle);
             decideBumps_(recs, maxRecordsPerCycle, ex);
             decideLeaderless_(recs, maxRecordsPerCycle);
             // Fencing (dead + controlled-shutdown nodes) of the coordinator
             // ISRs — review D3: else a stopping node never leaves them.
-            fenceIsrs_(eligibleNodes, recs);
+            fenceIsrs_(effective, recs);
+            confirmStorageRegs_(recs);
             const std::size_t n = recs.size();
             if (n > 0) emitDynamicAssignment(recs);
             return coord + n;
@@ -1797,7 +2211,7 @@ public:
 
         rune::metadata::DynamicBalancerInputs in;
         in.cur       = &msm_.committedMap();
-        in.liveNodes = eligibleNodes;   // eligibleNodes(), not raw liveNodes()
+        in.liveNodes = effective;   // eligibleNodes() minus the storage-pending nodes, not raw liveNodes()
         in.topics    = configuredTopics_;
         in.positions = positions;
         in.maxPreferredElectionsPerCycle = maxPreferredElectionsPerCycle;
@@ -1837,6 +2251,7 @@ public:
                 if (advanced) dataPlaneAliveScratch_.push_back(pa.leaderNode);
             });
         }
+        std::erase_if(dataPlaneAliveScratch_, [this](int32_t n) { return storageRegs_.find(n) != storageRegs_.end(); });
         in.dataPlaneAliveLeaders = dataPlaneAliveScratch_;
         validBumpExclusions_(in.excludedLeaders);   // MAJOR-1
         unservableExclusions_(in.electionExcluded);  // Task 11 fix round 4 (election only)
@@ -1845,6 +2260,13 @@ public:
         // move to a live in-sync replica, a sole-ISR one stays, a dead
         // leader's partition prefers a non-stopping survivor (review D5).
         in.avoidLeaders = shutting;
+        // CP2 I2: below the storage-identity level a Joiner's gate can never open (no NodeStorageRecord exists), so
+        // never prefer it as a leader (soft: a sole survivor is still elected).  Stops the elect/hold/bump churn.
+        if (msm_.featureLevel() < rune::replication::MetadataFeature::kStorageIdentity)
+            for (const auto& [n, lc] : nodeLifecycle_)
+                if (lc.storageOrigin == rune::replication::AlterIsrMsg::kStorageOriginJoiner ||
+                    lc.storageOrigin == rune::replication::AlterIsrMsg::kStorageOriginUndecided)
+                    in.avoidLeaders.push_back(n);
 
         rune::metadata::DynamicBalancer bal;
         std::vector<rune::metadata::BalancerRecord> recs = bal.rebalance(in);
@@ -1899,9 +2321,11 @@ public:
         }
         // MAJOR-1: the bump requests the balancer did not fail over (before
         // the fencing pass: a partition with a record is skipped there).
+        decideStorageResets_(recs, maxRecordsPerCycle);   // ISR v3: after the balancer, before the bumps
         decideBumps_(recs, maxRecordsPerCycle, in.excludedLeaders);
         decideLeaderless_(recs, maxRecordsPerCycle);   // N2
-        fenceIsrs_(eligibleNodes, recs);
+        fenceIsrs_(effective, recs);
+        confirmStorageRegs_(recs);
         const std::size_t count = recs.size();
         if (count > 0) emitDynamicAssignment(recs);
         return count + coord;
@@ -2048,8 +2472,10 @@ public:
             // assignment over them.  Every decision waits until the MSM has
             // applied the log through the claim-time LEO; event-driven (the HW
             // reaches it as the followers fetch — no timer).
-            claimLeo_          = replica_->logEndOffset();
-            controllerCaughtUp_ = false;
+            // ISR v3 R9 (Raft section 5.4.2): the claim first commits a record of THIS term; nothing is decided or
+            // answered before it has (a deposed term's tail can no longer overwrite what is answered).
+            claim_ = ClaimNeedsTermRecord{replica_->logEndOffset()};
+            tryAppendTermRecord_();
             // MD1 Task 6: the static partition assignment is emitted (if not
             // already assigned — idempotent) once caught up (maybeCatchUp_).
             // Followers never emit.
@@ -2058,14 +2484,18 @@ public:
             stepDownController_();
         }
 
+        if (amLeader) tryAppendTermRecord_();   // ISR v3 R9: every cycle while the term record is not appended
         const rune::replication::Offset hw = replica_->highWatermark();
         for (auto it = inflight_.begin(); it != inflight_.end();)
-            it = (it->second <= hw) ? inflight_.erase(it) : std::next(it);
+            it = (it->second.at <= hw) ? inflight_.erase(it) : std::next(it);
+        for (auto it = storageInflight_.begin(); it != storageInflight_.end();)   // ISR v3: swept with inflight_
+            it = it->second <= hw ? storageInflight_.erase(it) : std::next(it);
         for (auto it = lineageInflight_.begin(); it != lineageInflight_.end();)
             it = (it->second <= hw) ? lineageInflight_.erase(it) : std::next(it);
         for (auto it = removalInflight_.begin(); it != removalInflight_.end();)   // Task 8
             it = (it->second <= hw) ? removalInflight_.erase(it) : std::next(it);
         if (amLeader) maybeRaiseFeatureLevel_();   // D15 (no-op once at the supported level)
+        if (amLeader) storageLevelEdge_();         // ISR v3: the first ready cycle at level >= 2 replays the registrations
         if (amLeader) maybeConfirmSingleNodeLineages_();   // C1 (single node only)
         if (amLeader) retryUnplaceable_();                  // Task 11 fix round 1 (I1/I2)
         pruneUnservable_(nowNs);                            // Task 11 fix round 4
@@ -2117,6 +2547,7 @@ public:
                         std::string_view val,
                         int64_t logOffset,  // base + offDelta (absolute log position)
                         int64_t /*ts*/) {
+                    noteAppliedRecord_(val);
                     msm_.apply(
                         reinterpret_cast<const uint8_t*>(val.data()),
                         val.size(),
@@ -2140,6 +2571,7 @@ public:
         // hw is the next-unwritten offset so the last committed is hw-1).
         msm_.commit(hw - 1);
         if (cursor > lastApplied_) lastApplied_ = cursor;
+        noteFirstApply_();
         if (hw > committedEnd_) committedEnd_ = hw;
         if (amLeader) maybeCatchUp_();
 
@@ -2175,6 +2607,7 @@ public:
         routingInputsEpoch_ += msm_.committedVersion() + 1;
         msm_ = rune::metadata::MetadataStateMachine{};
         lastApplied_ = -1;
+        appliedStateRecord_ = false;   // CP2: the rebuild re-derives it from the log it replays
 
         if (hw <= 0) return false;
 
@@ -2208,6 +2641,7 @@ public:
                         std::string_view val,
                         int64_t logOffset,  // absolute log position
                         int64_t /*ts*/) {
+                    noteAppliedRecord_(val);
                     msm_.apply(
                         reinterpret_cast<const uint8_t*>(val.data()),
                         val.size(),
@@ -2229,6 +2663,7 @@ public:
         // Commit everything up to hw-1.
         msm_.commit(hw - 1);
         lastApplied_ = cursor;
+        noteFirstApply_();
         committedEnd_ = hw;
         return true;
     }
@@ -2310,6 +2745,9 @@ public:
     // Test-only / diagnostic
     // -----------------------------------------------------------------------
 
+    /// The committed state machine (read-only): the storage gate and the node-side registration read it on the
+    /// control thread (ISR v3 Step 9).
+    [[nodiscard]] const rune::metadata::MetadataStateMachine& msm() const noexcept { return msm_; }
     /// Return the raw MSM (for snapshot / delta derivation in tests).
     rune::metadata::MetadataStateMachine& msmForTest() noexcept { return msm_; }
 
@@ -2352,6 +2790,17 @@ private:
     /// The controller-leadership step-down edge (replica demoted, consensus lost, halted, or a new replica
     /// epoch about to be re-claimed - F-B): everything decided under the old claim is dropped and the next
     /// claim starts a fresh catch-up.
+    /// R9: while ClaimNeedsTermRecord, append this term's ControllerTermRecord (retried every cycle on a refusal).
+    void tryAppendTermRecord_() {
+        if (!std::holds_alternative<ClaimNeedsTermRecord>(claim_) || !leaderReady_()) return;
+        const rune::replication::Offset base = std::get<ClaimNeedsTermRecord>(claim_).baseLeo;
+        uint8_t buf[rune::metadata::ControllerTermRecord::ENCODED_SIZE];
+        rune::metadata::ControllerTermRecord tr;
+        tr.term = controllerEpoch_;
+        const std::size_t n = tr.encode(buf, sizeof buf);
+        if (replica_->append(std::span<const uint8_t>(buf, n), /*acksAll=*/false) < 0) return;
+        claim_ = ClaimCatchingUp{base, replica_->logEndOffset()};
+    }
     void stepDownController_() {
         wasLeader_ = false;
         assigned_  = false;  // re-arm emit if we regain leadership later
@@ -2366,10 +2815,17 @@ private:
         removedReconciledVersion_ = UINT64_MAX;
         pendingFeatureLevel_  = -1;   // D15: the next controller re-decides
         featureInflightLevel_ = -1;
+        // ISR v3 (v2-review I9): no storage record decided in an earlier leadership is ever appended in a later one;
+        // the replay on the next ready edge rebuilds storageRegs_ from nodeLifecycle_.
+        pendingStorageRecords_.clear(); storageInflight_.clear(); storageRegs_.clear();
         // Controlled-shutdown marks are kept (soft, every member holds
         // them); confirmations were the old controller's — re-collected.
         for (auto& [n, st] : nodeLifecycle_) { st.confirmed.clear(); st.pushedBits = -1; st.completePushed = false; }
         confirmCheckedVersion_ = 0;
+        // e2118e83 sibling (re-claim): the live set was learnt under THAT leadership; a re-claiming controller
+        // must learn it again before it confirms any shutdown COMPLETE (or filters an ISR addition) on it.
+        eligible_.clear();
+        eligibleKnown_ = false;
         // Follower: reset lastApplied_ so we re-apply from scratch if we
         // become leader again later.  Review M1: only when the replica really
         // stopped leading - a consensus-only deposition (or halt) keeps the log
@@ -2377,7 +2833,7 @@ private:
         // whole log onto it re-bumped the committed version on every flap); a
         // re-claim's rebuildFromLog resets the cursor anyway.
         if (!replica_->acceptsProduce()) lastApplied_ = -1;
-        controllerCaughtUp_ = false;   // F-B: a later claim always runs a fresh catch-up
+        claim_ = ClaimNone{};   // F-B: a later claim always runs a fresh catch-up
     }
 
     /// This replica may append to the metadata log (the replica's produce gate).
@@ -2388,23 +2844,41 @@ private:
     /// it leads AND its MSM reflects its whole log as of the claim.
     [[nodiscard]] bool controllerReady_() const noexcept {
         // Review M5: wasLeader_ = a claim edge ran (rebuild + claim LEO) - before it, nothing is decided on an empty MSM.
-        return wasLeader_ && leaderReady_() && consensusLeads_ && controllerCaughtUp_ && !halted_;
+        return wasLeader_ && leaderReady_() && consensusLeads_ && std::holds_alternative<ClaimReady>(claim_) && !halted_;
     }
     /// The catch-up edge: the HW (and the MSM apply cursor) reached the
     /// claim-time LEO — the map is complete; the deferred claim action runs.
     void maybeCatchUp_() {
-        if (controllerCaughtUp_ || !leaderReady_()) return;
+        const auto* catching = std::get_if<ClaimCatchingUp>(&claim_);
+        if (catching == nullptr || !leaderReady_()) return;
         const rune::replication::Offset applied = lastApplied_ < 0 ? 0 : lastApplied_;   // -1 = nothing yet
-        if (replica_->highWatermark() < claimLeo_ || applied < claimLeo_) return;
-        controllerCaughtUp_ = true;
+        if (replica_->highWatermark() < catching->claimLeo || applied < catching->claimLeo) return;
+        const rune::replication::Offset baseLeo = catching->baseLeo;
+        claim_ = ClaimReady{};
         recheckOnCatchUp_   = true;   // M2: re-spread decided on the complete map
+        // R17: read ONCE, here, at the ready edge, from the live storage origin (never captured earlier: a
+        // multi-node storage starts Undecided and founds at runtime).
+        const bool mb = mayBootstrap_();
+        // CP2 8.3: "empty" = the log holds no record but ControllerTermRecords (a crash between the claim's term record
+        // and the bootstrap records leaves a log with offsets but no state), not merely baseLeo == 0.
+        const bool emptyLog = baseLeo == 0 || !appliedStateRecord_;
+        if (emptyLog && !mb) {
+            spdlog::critical("MetadataService[{}]: claimed __cluster_metadata with an EMPTY log on a formed storage "
+                             "(not a founder with an empty metadata log) - refusing to bootstrap a new metadata log; "
+                             "halting the controller role", selfId_);
+            halt();
+            resignRequested_ = true;
+            return;
+        }
         // D15: a brand-new metadata log (nothing written by any binary yet) is
         // bootstrapped at this binary's level (KRaft: metadata.version is set
         // when the log is formatted), before any assignment.
-        if (claimLeo_ == 0 && msm_.featureLevel() < supportedFeatureLevel_)
+        if (emptyLog && mb && msm_.featureLevel() < supportedFeatureLevel_)
             pendingFeatureLevel_ = supportedFeatureLevel_;
         restoreLeaderlessMarks_();   // D15 item 1
-        emitStaticAssignmentIfNeeded();
+        replayStorageRegistrations_();   // ISR v3 (A-I2): the soft storage state of the registrations already held
+        storageReplayLevel_ = msm_.featureLevel();
+        if (!emptyLog || mb) emitStaticAssignmentIfNeeded();
         reconcileRemovedTopics_(/*force=*/true);   // Task 8: removals recorded while not the ready controller
         drainDynamicQueue();
     }
@@ -2463,7 +2937,8 @@ private:
             br.rec.partitionEpoch = std::max(pa.partitionEpoch + 1, br.rec.leaderEpoch);
             br.rec.isr      = rune::protocol::metadata::Int32ArrayView{br.isr.data(), static_cast<uint16_t>(br.isr.size())};
             br.rec.replicas = rune::protocol::metadata::Int32ArrayView{br.replicas.data(), static_cast<uint16_t>(br.replicas.size())};
-            if (pa.mark.kind == rm::LeaderlessMark::Kind::EmptyMemoryLeader) {
+            if (pa.mark.kind == rm::LeaderlessMark::Kind::EmptyMemoryLeader ||
+                pa.mark.kind == rm::LeaderlessMark::Kind::StorageReset) {   // ISR v3: re-armed exactly alike
                 emptyMemoryLeader_[key] = EmptyMemoryLeader{pa.mark.node, br.rec.leaderEpoch, pa.mark.incarnation};
                 leaderlessReports_.erase(key);
             }
@@ -2698,7 +3173,7 @@ private:
 
     void drainDynamicQueue() {
         if (pendingDynamicRecords_.empty() && pendingLineageRecords_.empty() && pendingRemovalRecords_.empty() &&
-            pendingFeatureLevel_ <= msm_.featureLevel())
+            pendingStorageRecords_.empty() && pendingFeatureLevel_ <= msm_.featureLevel())
             return;
         // kept queued until this replica may append; F-B / D17: a consensus-deposed or halted controller whose
         // replica still leads never appends what it decided (the step-down edge also clears the queues).
@@ -2766,10 +3241,34 @@ private:
             if (replica_->append(std::span<const uint8_t>(encBuf, n), /*acksAll=*/false) < 0) break;
             // In flight until committed: no other decision (AlterIsr, rebalance)
             // for this partition is taken on a state this record will change.
-            inflight_[partitionKey_(br.rec.topicId, br.rec.partition)] = replica_->logEndOffset();
+            {
+                InflightRec ir;
+                ir.at     = replica_->logEndOffset();
+                ir.leader = br.rec.leaderNode;
+                ir.n      = static_cast<uint8_t>(std::min<std::size_t>(br.isr.size(), ir.isr.size()));
+                for (std::size_t i = 0; i < ir.n; ++i) ir.isr[i] = br.isr[i];
+                inflight_[partitionKey_(br.rec.topicId, br.rec.partition)] = ir;
+            }
             cycleBytes   += n;
             cycleRecords += 1;
             pendingDynamicRecords_.pop_front();
+        }
+
+        // ISR v3 (I-S2): storage records drain AFTER the assignment records of the same pass, so log order puts every
+        // strip before its confirmation; a record waits while any queued assignment record still names its node.
+        for (std::size_t i = 0; i < pendingStorageRecords_.size() && cycleRecords < kMaxRecordsPerBatch && !holdAllActive_();) {
+            const rune::metadata::NodeStorageRecord sr = pendingStorageRecords_[i];
+            if (queuedDynamicNames_(sr.node)) { ++i; continue; }
+            if (dropNextStorageAppend_) {   // TEST seam: as if appended and then lost (truncated) - nothing in flight
+                dropNextStorageAppend_ = false;
+                pendingStorageRecords_.erase(pendingStorageRecords_.begin() + static_cast<std::ptrdiff_t>(i));
+                continue;
+            }
+            const std::size_t n = sr.encode(encBuf, kEncBufSize);
+            if (replica_->append(std::span<const uint8_t>(encBuf, n), /*acksAll=*/false) < 0) break;
+            storageInflight_[sr.node] = replica_->logEndOffset();
+            pendingStorageRecords_.erase(pendingStorageRecords_.begin() + static_cast<std::ptrdiff_t>(i));
+            ++cycleRecords;
         }
     }
 
@@ -2781,11 +3280,15 @@ private:
 
     // Last log offset we have read batches from.  Initialized to -1 (nothing applied).
     rune::replication::Offset lastApplied_ = -1;
+    FirstApplyHook firstApplyHook_ = nullptr;
+    void*          firstApplyCtx_  = nullptr;
+    bool           appliedStateRecord_ = false;   ///< a non-term record was applied (see noteAppliedRecord_)
     // MetadataTruncationRebuildRegression: exclusive end of the log the MSM has
     // COMMITTED.  Committed records are never truncated (KIP-101/279 cut only
     // above the HW), so a rebuild after a truncation replays at least this far
     // (capped at the LEO) even while the freshly-demoted follower's HW reads 0.
     rune::replication::Offset committedEnd_ = 0;
+    int64_t controllerEpoch_ = 0;   ///< ISR protocol: stamped on every answer (setControllerEpoch)
     bool consensusLeads_ = true;   ///< D17 / review MAJOR-1 (setConsensusLeads)
 
     // Follower→Leader transition gate (mirrors TCS / GCS patterns).
@@ -2793,7 +3296,15 @@ private:
     rune::replication::Epoch claimEpoch_ = -1;   ///< F-B: the replica epoch of the current controller claim
     /// partition key → metadata-log end offset of its last appended (not yet
     /// committed) assignment record.
-    std::unordered_map<int64_t, rune::replication::Offset> inflight_;
+    /// v2-review I4: an appended-not-committed assignment record, with the CONTENT the storage confirmation needs
+    /// (a record that adds a node to a leader/ISR blocks that node's confirmation).
+    struct InflightRec {
+        rune::replication::Offset at = 0;                   ///< the metadata-log end offset after its append
+        int32_t                   leader = -1;
+        uint8_t                   n = 0;
+        std::array<int32_t, 16>   isr{};
+    };
+    std::unordered_map<int64_t, InflightRec> inflight_;
     uint64_t alterIsrAccepted_ = 0, alterIsrRejected_ = 0;
     /// MEDIUM-2: the eligible (unfenced, live) set of the last rebalance tick —
     /// onAlterIsr never adds a node outside it.  Unknown before the first tick.
@@ -2809,8 +3320,15 @@ private:
     /// Epoch-restart fix: the metadata LEO at this controller's claim, and
     /// whether the MSM has applied the log through it (true before any claim:
     /// direct-invocation unit rigs decide on what they applied).
-    rune::replication::Offset claimLeo_ = 0;
-    bool     controllerCaughtUp_ = true;
+    /// ISR v3 R9: the controller claim as ONE state (each state holds only what it needs).
+    struct ClaimNone {};
+    struct ClaimNeedsTermRecord { rune::replication::Offset baseLeo; };
+    struct ClaimCatchingUp { rune::replication::Offset baseLeo; rune::replication::Offset claimLeo; };
+    struct ClaimReady {};
+    std::variant<ClaimNone, ClaimNeedsTermRecord, ClaimCatchingUp, ClaimReady> claim_{ClaimReady{}};
+    bool     resignRequested_ = false;   ///< the empty-log guard asks NodeRuntimeAgent to resign the consensus
+    MayBootstrapFn mayBootstrapFn_  = nullptr;
+    void*          mayBootstrapCtx_ = nullptr;
     bool     halted_             = false;   ///< fix round 2 N2: stopping — decides nothing
     bool     recheckOnCatchUp_   = false;
     uint64_t preferredCheckedVersion_ = 0;
@@ -2820,13 +3338,16 @@ private:
     /// leads; the requester — a restarted ex-leader that may have lost acked
     /// records — rejoins as a follower).  key → the request; decided by the
     /// next rebalance tick (co-partition units move together).
+    enum class BumpReason : uint8_t { Fence, MemoryEmpty, LogDirFailed, LostCommitted };
     struct BumpRequest {
         int32_t requester      = -1;
         int32_t leaderEpoch    = -1;
         int32_t partitionEpoch = -1;
         int32_t fence          = -1;
-        bool    memoryBacked   = false;
-        bool    logDirFailed   = false;   ///< N1
+        /// ISR v3 (Step 7): why the requester asks.  Fence = the restart fence; MemoryEmpty = a memory-backed
+        /// leader restarted (empty when leo == 0); LogDirFailed (N1); LostCommitted = the leader's log is below
+        /// the committed HW (Step 11's below-committed report).
+        BumpReason reason = BumpReason::Fence;
         int32_t leo            = -1;      ///< the requester's LEO (clamped)
         int64_t incarnation    = 0;
     };
@@ -2852,6 +3373,23 @@ private:
     struct EmptyMemoryLeader { int32_t requester; int32_t leaderlessEpoch; int64_t incarnation = 0; };
     std::unordered_map<int64_t, EmptyMemoryLeader> emptyMemoryLeader_;
     uint64_t leaderlessMarksRestored_ = 0;   ///< D15: marks re-derived from the committed map
+    // ISR v3 (Step 7): the soft storage state (section 3.3); cleared together on leader loss and in halt().
+    std::map<int32_t, StorageReg>                              storageRegs_;
+    std::deque<rune::metadata::NodeStorageRecord>              pendingStorageRecords_;
+    std::unordered_map<int32_t, rune::replication::Offset>     storageInflight_;   ///< node -> LEO after its record's append
+    std::vector<rune::metadata::NodeId>                        effectiveEligibleScratch_;   ///< capacity persists
+    int16_t   storageReplayLevel_ = 0;
+    uint64_t  storageConfirmRequeued_ = 0;
+    uint64_t  lostCommittedReports_ = 0;   ///< Step 11 increments it
+    bool      dropNextStorageAppend_ = false;
+    bool      holdAll_ = false;                 ///< setHoldAllDecisionsForTest
+    int64_t   holdAllSinceNs_ = 0, holdAllMaxNs_ = 0;
+    [[nodiscard]] bool holdAllActive_() const noexcept {
+        return holdAll_ && holdAllMaxNs_ > 0 && lastNowNs_ < holdAllSinceNs_ + holdAllMaxNs_;
+    }
+    std::unordered_set<int64_t> storageResetWarned_;   ///< M15 (cold)
+    bool    (*transientFn_)(void*, int32_t) = nullptr;
+    void*     transientCtx_ = nullptr;
     /// D15: feature level (see setClusterMembers).
     std::vector<int32_t> clusterMembers_;
     int16_t supportedFeatureLevel_ = rune::replication::MetadataFeature::kLatest;

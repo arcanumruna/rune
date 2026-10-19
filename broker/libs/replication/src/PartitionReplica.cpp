@@ -232,6 +232,7 @@ void PartitionReplica::initReplica(std::vector<NodeId> replicas,
         // re-derived from the surviving batches' stamps (Kafka recovery).  Only
         // against a RECOVERED log (the LEO is the true log end).
         if (diskLog_->isRecovered()) reconcileEpochCacheWithLog_();
+        if (diskLog_->isRecovered()) markUnprovenEpochStarts_();   // CP3 R1: before any image is (re)written
         if (es.state != ES::FileState::Missing) {
             // The state file is (or was) the authority: keep writing it — never
             // a legacy file next to it.  Writes the reconciled image (cold,
@@ -327,6 +328,7 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr, int
         publishCleanerState();
         return;
     }
+    divergenceGuard_ = NoRefusal{};   // ISR v3 Step 11 (3.8): a leader refuses nothing; the refusal ends with the role
 
     // Leader-epoch restart fence (see setLeaderEpochFenceFile): an epoch this
     // replica already led at (or holds records of) in an earlier incarnation is
@@ -372,6 +374,7 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr, int
         }
     }
     staleLead_.pending = false;
+    storageHoldBackoffNs_ = 0;   // the gate let this leadership through: the next hold starts a new sequence
     report_.pending    = false;
     // E2 final fix wave (C1 multi-node): a TRANSIENT leader reports, for this
     // leadership, the leader epoch its ring's data came from (-1: unborn) — the
@@ -509,6 +512,8 @@ void PartitionReplica::becomeFollower(Epoch leaderEpoch, NodeId leaderId)
         publishCleanerState();
         return;
     }
+    // ISR v3 Step 11 (3.8): another (epoch, leader) ends a refusal; the same-epoch re-assert above keeps it.
+    divergenceGuard_ = NoRefusal{};
 
     // Kafka makeFollower: no truncation here.  Divergence is found and resolved
     // on the fetch path: our first fetch carries lastFetchedEpoch, the leader
@@ -560,7 +565,7 @@ Offset PartitionReplica::append(std::span<const uint8_t> records, bool acksAll)
     // B1: a follower or an incomplete leader refuses EVERY append (acks=all or
     // not — the MetadataService's acks=false records too; every caller queues /
     // retries on a negative result, never ignores it).
-    if (!acceptsProduce()) [[unlikely]] return kAppendNotLeader;
+    if (!acceptsProduce() || appendRefusedForTest_) [[unlikely]] return kAppendNotLeader;
 
     if (!committedIsrMeetsMinIsr_(acksAll)) {
         return -1; // gated by min-ISR
@@ -820,17 +825,31 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     bool incarnationChanged = false;
     if (req.incarnation != 0) {
         if (FollowerSlot* const s0 = followerSlots_.find(req.followerId)) {
-            if (req.incarnation < s0->incarnation) [[unlikely]] return kErrStaleIncarnation;
-            if (req.incarnation > s0->incarnation) {
-                incarnationChanged = s0->incarnation != 0;
-                s0->incarnation    = req.incarnation;
-                // Round-3 LOW-R3-1: a restarted replica may have lost (or failed
-                // closed on) its internal-ISR knowledge — forget its ack so the
-                // anti-entropy re-sends the latest state (cold: restarts only).
-                if (incarnationChanged && internalQuorum_()) {
-                    const int idx = slotIndex_(req.followerId);
-                    if (idx >= 0) internalIsrAcks_ &= ~(1u << idx);
+            // ISR v3 Step 6 (R8 / A-I9): a storage id is the identity of the follower's DISK.  A frame carrying a
+            // storage the follower has since replaced is a dead process's; a different non-zero storage is a new
+            // process whatever its incarnation (a wiped dir restarts the counter low).  storageId == 0 (a v3
+            // follower) keeps the KIP-903 rule below.
+            if (req.storageId != 0 && s0->isDeadStorage(req.storageId)) [[unlikely]] return kErrStaleIncarnation;
+            const bool newStorage = req.storageId != 0 && s0->storageId != 0 && req.storageId != s0->storageId;
+            if (newStorage) {
+                s0->pushDeadStorage(s0->storageId);
+                s0->storageId   = req.storageId;
+                s0->incarnation = req.incarnation;
+                incarnationChanged = true;
+            } else {
+                if (req.incarnation < s0->incarnation) [[unlikely]] return kErrStaleIncarnation;
+                if (req.incarnation > s0->incarnation) {
+                    incarnationChanged = s0->incarnation != 0;
+                    s0->incarnation    = req.incarnation;
                 }
+                if (req.storageId != 0) s0->storageId = req.storageId;
+            }
+            // Round-3 LOW-R3-1: a restarted replica may have lost (or failed
+            // closed on) its internal-ISR knowledge — forget its ack so the
+            // anti-entropy re-sends the latest state (cold: restarts only).
+            if (incarnationChanged && internalQuorum_()) {
+                const int idx = slotIndex_(req.followerId);
+                if (idx >= 0) internalIsrAcks_ &= ~(1u << idx);
             }
         }
     }
@@ -862,6 +881,22 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     if (vreq.lastFetchedEpoch >= 0) {
         const Offset leo = logEndOffset_();
         const auto ans = epochCache_.endOffsetForEpoch(vreq.lastFetchedEpoch, leo);
+        // ISR v3 Step 11 (A-I5, R16): the follower and this leader hold the FIRST record of the shared epoch yet disagree
+        // on where it starts - two histories under one epoch (a leader that lost its disk and re-led).  Credit nothing,
+        // never truncate the follower: it refuses and reports.  A side that does not hold the epoch's first record
+        // (a ring reset, a retention cut) sends / has -1 and is never compared.
+        if (ans.first == vreq.lastFetchedEpoch && req.lastEpochStartOffset >= 0) {
+            const Offset mine = heldEpochStart_(ans.first);
+            if (mine >= 0 && mine != req.lastEpochStartOffset) [[unlikely]] {
+                ErrorPayload{ans.first, mine}.encode(errPayload_.data());
+                auto mm = makeFetchResponse(highWatermark(), kErrEpochHistoryMismatch,
+                                            std::span<const uint8_t>(errPayload_.data(), ErrorPayload::SIZE));
+                if (!onTransport([&](auto& t) { return t.sendFetchResponse(req.followerId, mm); })) ++sendRefusals_;
+                ++epochHistoryMismatches_;
+                logMismatchOnce_(req.followerId, ans.first);
+                return kErrEpochHistoryMismatch;
+            }
+        }
         if (ans.first < vreq.lastFetchedEpoch || ans.second < req.fetchOffset) [[unlikely]] {
             // We hold every committed record (we were elected from the ISR):
             // whatever the follower holds past our lineage is uncommitted —
@@ -1250,6 +1285,11 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
             ep.endOffset >= 0 && ep.endOffset < logEndOffset_()) {
             onDivergingEpoch_(/*epoch=*/-1, ep.endOffset);
         }
+        // ISR v3 Step 11 (A-I5): the leader holds a different history under our epoch.  Never truncate on it (R16).
+        if (resp.errorCode == kErrEpochHistoryMismatch && role_ == Role::Follower && resp.leaderEpoch == epoch_ &&
+            ErrorPayload::decode(resp.records, ep)) {
+            onEpochHistoryMismatch_(ep.epoch, ep.endOffset);
+        }
         if (resp.errorCode == kErrUnsupportedWireVersion && v2RefusalsLogged_++ == 0) {
             spdlog::critical("PartitionReplica[node={} topic={} part={}]: dropped a v2 (pre-KIP-320) "
                              "replication frame from leader {} — mixed v2/v3 replication is "
@@ -1258,6 +1298,9 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
         // Other errors: ignored (the control plane drives role changes).
         return;
     }
+    // ISR v3 Step 11 (3.8): a refusing follower applies nothing - the lineage it was told to truncate to ends below
+    // what it knows is committed; the controller fails the leader over.
+    if (std::holds_alternative<Refused>(divergenceGuard_)) [[unlikely]] { ++appliesDroppedRefused_; return; }
     // Fix round 5: a decided divergence truncation is pending — appending now
     // would extend the diverged tail.  Drop; the post-truncation fetch re-pulls.
     if (followerSync_.truncatePending()) [[unlikely]] { ++appliesDroppedTruncatePending_; return; }
@@ -1531,6 +1574,12 @@ void PartitionReplica::onUnapplicableBatch(Offset batchBase, Epoch leaderEpoch)
 // known (leaderId_ < 0) fall back to the transport's broadcast.
 bool PartitionReplica::sendFetchToLeader_(const FetchRequestMsg& req)
 {
+    // TEST seam (holdFetchesUntilForTest): a member that cannot catch up yet emits no fetch (nor ack).
+    // ISR v3 Step 11: a refusing follower fetches nothing (the lineage it was given is not one it will follow).
+    if (std::holds_alternative<Refused>(divergenceGuard_)) [[unlikely]] return true;
+    if (fetchHoldUntilNs_ != 0 && std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count() < fetchHoldUntilNs_) [[unlikely]]
+        return true;
     if (leaderId_ >= 0 && leaderId_ != cfg_.selfId)
         return onTransport([&](auto& t) { return t.sendFetchRequestTo(leaderId_, req); });
     return onTransport([&](auto& t) { return t.sendFetchRequest(req); });
@@ -1557,6 +1606,10 @@ FetchRequestMsg PartitionReplica::nextFetch() const noexcept
     req.topicId     = cfg_.topicId;   // DR-BUG-5: stamp topicId for transport routing
     req.lastFetchedEpoch = lastFetchedEpoch();   // KIP-320/595
     req.incarnation      = processIncarnation_;  // KIP-903
+    req.storageId        = storageId_;           // ISR v3 Step 6
+    // ISR v3 Step 11 (A-I5): where this replica's copy of lastFetchedEpoch STARTS, when it holds that epoch's first
+    // record; -1 (never compared) otherwise.
+    req.lastEpochStartOffset = req.lastFetchedEpoch >= 0 ? heldEpochStart_(req.lastFetchedEpoch) : -1;
     return req;
 }
 
@@ -1578,6 +1631,8 @@ void PartitionReplica::rebuildEpochCacheFromLog_()
 {
     Offset at = onLog([](auto& L) { return L.logStartOffset(); });
     const Offset leo = logEndOffset_();
+    Offset expect = at;      // CP3 I2: the next batch base if the walk is contiguous
+    bool gapped = false;
     for (int guard = 0; at < leo && guard < (1 << 20); ++guard) {
         // Copying read (cold): never leaves sealed segments mapped (lazy maps).
         const std::vector<uint8_t> buf = onLog([&](auto& L) { return L.read(at, 1 << 20); });
@@ -1591,12 +1646,17 @@ void PartitionReplica::rebuildEpochCacheFromLog_()
             rune::protocol::RecordBatchReader r(v.data + pos, v.len - pos);
             const int32_t total = r.totalLength();
             if (total <= 0 || pos + static_cast<std::size_t>(total) > v.len) break;
+            if (r.baseOffset() != expect) gapped = true;
             next = r.baseOffset() + r.lastOffsetDelta() + 1;
+            expect = next;
             pos += static_cast<std::size_t>(total);
         }
         if (next <= at) break;
         at = next;
     }
+    // CP3 I2: over a compaction gap the first surviving batch of an epoch is not its first record: the starts derived
+    // here are never compared (heldEpochStart_).  Starts at or above the LEO were assigned live and stay trusted.
+    if (gapped) rederivedStartsBelow_ = std::max(rederivedStartsBelow_, leo);
 }
 
 // Kafka LeaderEpochFileCache.assign on append: each batch whose stamped epoch
@@ -1641,6 +1701,29 @@ void PartitionReplica::onDivergingEpoch_(int32_t divergingEpoch, Offset divergin
             : mine.second;
     if (truncTo > leo) truncTo = leo;
     if (truncTo < 0) truncTo = 0;
+    // ISR v3 CP3 I1: every record this follower holds that is stamped with its CURRENT epoch came from that epoch's single
+    // leader, whose log only grows while it leads (the restart fence forbids re-leading the epoch after a restart).  An
+    // honest current-epoch leader therefore never answers DivergingEpoch(epoch_, y) with y below our LEO.  Such an answer
+    // proves the leader lost data (a wiped dir, an old binary without the gate): refuse, whatever HW we learned.  The rule
+    // reads the durable epoch cache, so it also holds across a follower restart (followerHw_ is then 0).
+    {
+        const Offset ownStart = epochCache_.startOffsetFor(static_cast<int32_t>(epoch_));
+        const bool holdsOwnEpoch = ownStart >= 0 && ownStart < leo;   // RECORDS of epoch_, not a phantom entry
+        if (divergingEpoch == static_cast<int32_t>(epoch_) && holdsOwnEpoch && truncTo < leo && !memoryBacked_ &&
+            !cfg_.allowUncleanTruncation) [[unlikely]] {
+            ++truncationsRefusedSameEpoch_;
+            enterRefused_(truncTo, divergingEndOffset);
+            return;
+        }
+    }
+    // ISR v3 Step 11 (3.8): a disk-backed follower whose own leader told it, in THIS epoch, that offsets up to followerHw_
+    // are committed never truncates below that.  Only a leader that lost data can answer so (it was wiped, or elected
+    // without the committed records): refuse, apply nothing, report to the controller.
+    if (truncTo < followerHw_ && hwLearnedEpoch_ == static_cast<int64_t>(epoch_) && !memoryBacked_ &&
+        !cfg_.allowUncleanTruncation) [[unlikely]] {
+        enterRefused_(truncTo, divergingEndOffset);
+        return;
+    }
     if (truncTo < followerHw_) [[unlikely]] {
         // Kafka logs and truncates: a complete leader's lineage ends below what
         // we were told is committed — only an election of a replica lacking
@@ -2285,6 +2368,8 @@ void PartitionReplica::reconcileEpochCacheWithLog_()
             from = start;
         }
     }
+    Offset expect = from;    // CP3 I2: contiguity of the re-derived region
+    bool gapped = false;
     for (int guard = 0; from < leo && guard < (1 << 20); ++guard) {
         const std::vector<uint8_t> buf = diskLog_->read(from, 1 << 20);   // cold, copying read
         if (buf.empty()) break;
@@ -2305,11 +2390,34 @@ void PartitionReplica::reconcileEpochCacheWithLog_()
                 }
                 if (ep > epochCache_.latestEpoch()) epochCache_.assign(ep, r.baseOffset());
             }
+            if (r.baseOffset() != expect) gapped = true;
             next = r.baseOffset() + r.lastOffsetDelta() + 1;
+            expect = next;
             pos += static_cast<std::size_t>(total);
         }
         if (next <= from) break;
         from = next;
+    }
+    if (gapped) rederivedStartsBelow_ = std::max(rederivedStartsBelow_, leo);
+}
+
+// CP3 recheck R1: a start s > logStart is compared only when the record before it (s - 1) is physically present, which
+// proves s is the epoch's first record.  Over a compaction gap the true start may lie anywhere in the gap, whatever wrote
+// the entry: this boot's rebuild, an image a gapped rebuild persisted, a legacy checkpoint.  Stateless and re-derived at
+// every boot (compaction never refills a gap); errs only towards "not compared".  Cold: O(entries) one-batch reads.
+void PartitionReplica::markUnprovenEpochStarts_()
+{
+    const Offset ls = diskLog_->logStartOffset();
+    for (const auto& [e, s] : epochCache_.map()) {
+        (void)e;
+        if (s <= ls) continue;                                    // never compared anyway (heldEpochStart_)
+        const std::vector<uint8_t> b = diskLog_->read(s - 1, 1);  // cold, copying (as stampAt in reconcile)
+        bool present = false;
+        if (b.size() >= static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead)) {
+            rune::protocol::RecordBatchReader r(b.data(), b.size());
+            present = r.baseOffset() <= s - 1 && s - 1 <= r.baseOffset() + r.lastOffsetDelta();
+        }
+        if (!present) rederivedStartsBelow_ = std::max<Offset>(rederivedStartsBelow_, s + 1);
     }
 }
 
@@ -2384,6 +2492,7 @@ int PartitionReplica::doWork(int64_t nowNs)
     if (staleLead_.pending) [[unlikely]] work += requestLeaderEpochBump_(nowNs);
     if (report_.pending) [[unlikely]] work += sendLeaderlessReport_(nowNs);
     if (lineageReport_.pending) [[unlikely]] work += sendLineageReport_(nowNs);
+    if (std::holds_alternative<Refused>(divergenceGuard_)) [[unlikely]] work += sendRefusedReport_(nowNs);
 
     if (role_ == Role::Leader) {
         // DR-BUG-6: reset the follower-lag TIME clock on the first tick after
@@ -2498,7 +2607,8 @@ int PartitionReplica::doWork(int64_t nowNs)
             const int64_t keepaliveNs = std::clamp<int64_t>(
                 (cfg_.replicaLagMaxMs * 1'000'000LL) / 4,
                 cfg_.fetchIntervalNs, 20'000'000LL);
-            const bool wedged = wedgedAtOffset_ >= 0;   // (cleared above if LEO moved)
+            const bool wedged = wedgedAtOffset_ >= 0 ||
+                                std::holds_alternative<Refused>(divergenceGuard_);   // (wedge cleared above if LEO moved)
             const FollowerSync::State fsPrev = followerSync_.state();
             const bool fsWasArmed = followerSync_.fetchArmed();
             const FollowerSync::Action act = wedged
@@ -2749,10 +2859,12 @@ void PartitionReplica::applyCommittedIsr_(std::vector<NodeId> isr, int32_t parti
     const bool changed = !sameMembers_(isr, committedIsr_);
     committedIsr_ = std::move(isr);
     if (partitionEpoch >= 0) {
-        if (isrProposal_.pending() && partitionEpoch != isrProposal_.basePartitionEpoch)
-            clearIsrProposalPhase_();
+        if (!std::holds_alternative<NoProposal>(ctrlProposal_) && partitionEpoch != bodyOf_(ctrlProposal_).base)
+            ctrlProposal_ = NoProposal{};
+        // An internal-quorum proposal never has a controller base: any controller-assigned epoch resolves it (unchanged).
+        clearIsrProposalPhase_();
         committedPartitionEpoch_ = partitionEpoch;
-    } else if (changed || (isrProposal_.pending() && sameMembers_(isrProposal_.isr, committedIsr_))) {
+    } else if (changed || internalPendingIs_(committedIsr_)) {
         clearIsrProposalPhase_();
     }
     applyMaximalIsr_();
@@ -2760,6 +2872,15 @@ void PartitionReplica::applyCommittedIsr_(std::vector<NodeId> isr, int32_t parti
 
 void PartitionReplica::onAlterIsrResponse(const AlterIsrResponseMsg& r)
 {
+    // ISR v3 Step 11 (B-I3): ANY answer to our below-committed report (Ok, or Fenced by an old controller) slows the
+    // resend to 1 s; only a role change ends it.  First statement: the report must be answered even when this replica
+    // is not a leader and holds no proposal.
+    if (auto* g = std::get_if<Refused>(&divergenceGuard_);
+        g != nullptr && r.leaderId == cfg_.selfId && r.leaderEpoch == g->epoch && r.topicId == cfg_.topicId &&
+        r.partition == cfg_.partitionId && (r.proposalId == 0 || r.proposalId == g->reportId)) {
+        g->cadenceNs = 1'000'000'000LL;
+        return;
+    }
     // C1 multi-node: the controller committed our lineage report (or we no
     // longer lead at that epoch).  A FencedLeaderEpoch may also concern an ISR
     // proposal of the same leadership: fall through to it.
@@ -2778,67 +2899,86 @@ void PartitionReplica::onAlterIsrResponse(const AlterIsrResponseMsg& r)
         report_.pending = false;
         return;
     }
-    if (role_ != Role::Leader || isrManager_ == nullptr || !isrProposal_.pending()) return;
+    if (role_ != Role::Leader || isrManager_ == nullptr || isrChannel_ == nullptr) return;
+    if (std::holds_alternative<NoProposal>(ctrlProposal_)) return;
     if (r.leaderEpoch != epoch_) return;                         // an answer for another leadership
-    bool clear = false;
+    const ProposalBody P = bodyOf_(ctrlProposal_);               // a COPY: ctrlProposal_ is reassigned below
+    // Answer correlation (I-P1): an answer for another proposal id never touches this one (0 = a v3 controller).
+    if (r.proposalId != 0 && r.proposalId != P.id) { ++staleAnswers_; return; }
+    auto* a = std::get_if<AwaitingCommit>(&ctrlProposal_);
+    if (a == nullptr) { ++answersWhileAwaitingMetadata_; return; }   // AwaitingMetadata*: only the assignment resolves
+    if (r.proposalId != 0 && r.sendSeq != 0 && r.sendSeq != a->lastSeq) {
+        // An answer to an OLDER send of this proposal: the newest send may still commit after it (frames between
+        // one leader and the controller are FIFO, so the answer to the newest send is decided after every earlier
+        // one).  Hold the resend (1, 2, 4, 8 s) and keep waiting for the newest send's answer.
+        ++olderSendAnswers_;
+        a->resendNotBeforeNs = lastKnownNowNs_ + (kAwaitNewestAnswerNs << std::min(a->olderAnswers, 3));
+        ++a->olderAnswers;
+        return;
+    }
+    const bool atBase = r.partitionEpoch == P.base;
     switch (r.errorCode) {
+        case kAlterIsrOk:
+            if (!atBase) return;
+            // CP1 M1: an Ok at our base means "the proposed set IS the controller's committed ISR at this base".
+            // Our committed view at the same partitionEpoch must hold every proposed member; if it does not,
+            // the views disagree and clearing would stop counting a member the controller can elect.  Fail
+            // safe: keep the members counted (AwaitingMetadata) and say so.
+            for (int i = 0; i < P.count; ++i) {
+                const NodeId n = P.members[static_cast<std::size_t>(i)];
+                if (std::find(committedIsr_.begin(), committedIsr_.end(), n) != committedIsr_.end()) continue;
+                if (okAnswersDisagreeing_++ == 0)
+                    spdlog::warn("PartitionReplica[node={} topic={} part={}]: AlterIsr answered OK at partitionEpoch {} for a "
+                                 "set naming node {} that this replica's committed ISR lacks - the views disagree; keeping "
+                                 "the proposal counted until the committed assignment arrives",
+                                 cfg_.selfId, cfg_.topicId, cfg_.partitionId, P.base, n);
+                ctrlProposal_ = AwaitingMetadata{P, a->lastSeq, lastKnownNowNs_, a->sentNs};
+                ++isrAwaitingMetadata_;
+                return;
+            }
+            break;
         case kAlterIsrIneligibleReplica:
-            // Nothing committed: the controller dropped the fenced additions and
-            // the rest equals the committed ISR (answered for OUR base only).
-            clear = (r.partitionEpoch == isrProposal_.basePartitionEpoch);
-            if (clear) expandBackoffUntilNs_ = lastKnownNowNs_ + kAlterIsrResendNs;
+            // Nothing committed: the controller dropped the fenced additions and the rest equals the committed
+            // ISR (answered for OUR base only).
+            if (!atBase) return;
+            expandBackoffUntilNs_ = lastKnownNowNs_ + kAlterIsrResendNs;
+            break;
+        case kAlterIsrInvalidRequest:
+            // Answered only for a proposal derived from the CURRENT committed state (leader epoch and partitionEpoch
+            // checked first, MetadataService::onAlterIsr): nothing newer is committed, so this replica's committed
+            // view is the controller's - collapsing to it is safe.  A GENUINE InvalidRequest always carries pe ==
+            // our base; any other pe is a late answer for an earlier proposal and must never clear this one.
+            if (!atBase) return;
+            // A-M2: never re-derive and re-send the same invalid set at RTT rate.
+            invalidRequestBackoffUntilNs_ = lastKnownNowNs_ + kAlterIsrResendNs;
+            if (!invalidRequestWarned_) {
+                invalidRequestWarned_ = true;
+                std::string set;
+                for (int i = 0; i < P.count; ++i) { if (!set.empty()) set += ','; set += std::to_string(P.members[static_cast<std::size_t>(i)]); }
+                spdlog::warn("PartitionReplica[node={} topic={} part={}]: AlterIsr {{{}}} at partitionEpoch {} "
+                             "answered INVALID_REQUEST (a member is not a replica, or the leader is missing) - "
+                             "this replica's replica set disagrees with the controller's; re-derived after {} ms",
+                             cfg_.selfId, cfg_.topicId, cfg_.partitionId, set, P.base,
+                             kAlterIsrResendNs / 1'000'000);
+            }
             break;
         case kAlterIsrInvalidUpdateVersion:
         case kAlterIsrFencedLeaderEpoch:
-            // DR-BUG-6 residual (2026-10-15): NEVER resolved by the answer.  A newer
-            // partitionEpoch / leader epoch is committed that this replica has not
-            // applied yet (once applied, applyCommittedIsr_ / the role change has
-            // already resolved the proposal) — and it may be THIS proposal, committed
-            // with its answer lost (a re-send is then answered InvalidUpdateVersion),
-            // or committed before the controller moved leadership (FencedLeaderEpoch).
-            // Dropping it here collapsed the maximal ISR to the stale committed view
-            // while the controller could already elect the added member: the HW
-            // passed that member's LEO, and its election lost acked records.  Kafka
-            // keeps the pending state until the metadata arrives
-            // (Partition.handleAlterPartitionError); so do we — the committed
-            // assignment that must follow (it is committed) resolves it.
-            // A-M1: AwaitingMetadata — re-sent slowly (loss recovery), WARNed if it lasts.
-            if (isrProposal_.phase != ProposalPhase::AwaitingMetadata) {
-                isrProposal_.phase = ProposalPhase::AwaitingMetadata;
-                isrProposal_.awaitingSinceNs = lastKnownNowNs_;
-                isrProposal_.awaitingWarned = false;
-                ++isrAwaitingMetadata_;
-            }
-            break;
-        case kAlterIsrInvalidRequest:
-            // Answered only for a proposal derived from the CURRENT committed state
-            // (leader epoch and partitionEpoch checked first, MetadataService::
-            // onAlterIsr): nothing newer is committed, so this replica's committed
-            // view is the controller's — collapsing to it is safe.  Review A-I2 (the
-            // part that is safe without a proposal id): a GENUINE InvalidRequest
-            // always carries pe == our base; any other pe is a late answer for an
-            // earlier proposal and must never clear this one.
-            clear = (r.partitionEpoch == isrProposal_.basePartitionEpoch);
-            if (clear) {
-                // A-M2: never re-derive and re-send the same invalid set at RTT rate.
-                invalidRequestBackoffUntilNs_ = lastKnownNowNs_ + kAlterIsrResendNs;
-                if (!invalidRequestWarned_) {
-                    invalidRequestWarned_ = true;
-                    std::string set;
-                    for (NodeId n : isrProposal_.isr) { if (!set.empty()) set += ','; set += std::to_string(n); }
-                    spdlog::warn("PartitionReplica[node={} topic={} part={}]: AlterIsr {{{}}} at partitionEpoch {} "
-                                 "answered INVALID_REQUEST (a member is not a replica, or the leader is missing) — "
-                                 "this replica's replica set disagrees with the controller's; re-derived after {} ms",
-                                 cfg_.selfId, cfg_.topicId, cfg_.partitionId, set, isrProposal_.basePartitionEpoch,
-                                 kAlterIsrResendNs / 1'000'000);
-                }
-            }
-            break;
-        default:   // kAlterIsrOk: resolved by the applied assignment
-            break;
+            // DR-BUG-6 residual (2026-10-15): NEVER resolved by the answer.  A newer partitionEpoch / leader epoch is
+            // committed that this replica has not applied yet (once applied, applyCommittedIsr_ / the role change has
+            // already resolved the proposal) - and it may be THIS proposal, committed with its answer lost (a re-send
+            // is then answered InvalidUpdateVersion), or committed before the controller moved leadership (Fenced).
+            // Dropping it here collapsed the maximal ISR to the stale committed view while the controller could
+            // already elect the added member: the HW passed that member's LEO, and its election lost acked records.
+            // Kafka keeps the pending state until the metadata arrives (Partition.handleAlterPartitionError); so do
+            // we - the committed assignment that must follow resolves it.  A-M1: re-sent slowly, WARNed if it lasts.
+            ctrlProposal_ = AwaitingMetadata{P, a->lastSeq, lastKnownNowNs_, a->sentNs};   // P copied before the assignment
+            ++isrAwaitingMetadata_;
+            return;
+        default:
+            return;
     }
-    if (!clear) return;
-    clearIsrProposalPhase_();
+    ctrlProposal_ = NoProposal{};
     applyMaximalIsr_();
     publishCleanerState();
 }
@@ -2846,8 +2986,12 @@ void PartitionReplica::onAlterIsrResponse(const AlterIsrResponseMsg& r)
 void PartitionReplica::applyMaximalIsr_()
 {
     isrManager_->setIsr(committedIsr_);
-    if (isrProposal_.pending())
-        for (NodeId id : isrProposal_.isr) (void)isrManager_->addToIsr(id);
+    if (!std::holds_alternative<NoProposal>(ctrlProposal_)) {
+        const ProposalBody& pb = bodyOf_(ctrlProposal_);
+        for (int i = 0; i < pb.count; ++i) (void)isrManager_->addToIsr(pb.members[static_cast<std::size_t>(i)]);
+    } else if (const auto* ip = std::get_if<InternalPending>(&internalProposal_)) {
+        for (int i = 0; i < ip->count; ++i) (void)isrManager_->addToIsr(ip->members[static_cast<std::size_t>(i)]);
+    }
     syncIsrToLeaderState();
     recomputeHw();
 }
@@ -2891,10 +3035,10 @@ void PartitionReplica::shrinkIsrToLive(std::span<const int32_t> live, int64_t no
 bool PartitionReplica::updateIsr_(int64_t nowNs)
 {
     if (role_ != Role::Leader || isrManager_ == nullptr) return false;
-    if (internalQuorum_() && !isrProposal_.pending() && internalIsrVersion_ > 0 &&
-        nowNs - isrProposal_.sentNs >= kAlterIsrResendNs) {
+    if (internalQuorum_() && internalIsrVersion_ > 0 && std::holds_alternative<InternalCommitted>(internalProposal_) &&
+        nowNs - std::get<InternalCommitted>(internalProposal_).sentNs >= kAlterIsrResendNs) {
         // Anti-entropy (re-review 2026-10-04 MAJOR-A): after a commit,
-        // isrProposal_ still holds the COMMITTED (version, members); keep
+        // InternalCommitted still holds the COMMITTED (version, members); keep
         // re-sending it to every replica that has not acked it (a lost frame,
         // a node that was down) — knowledge converges without a lucky frame.
         // Cold: one small frame per un-acked replica per resend interval.
@@ -2902,24 +3046,33 @@ bool PartitionReplica::updateIsr_(int64_t nowNs)
             ? ~0u : ((1u << followerSlots_.size()) - 1u);
         if ((internalIsrAcks_ & all) != all) publishInternalIsr_(nowNs);
     }
-    if ((isrChannel_ != nullptr || internalQuorum_()) && isrProposal_.pending()) {
-        // One proposal in flight: re-send it until the controller (internal:
-        // a majority of the replicas) commits it or another committed change
-        // resolves it (the request, the answer or the record may have been lost).
-        // A-M1: AwaitingMetadata re-sends at the slow cadence and WARNs once if it lasts.
-        const bool awaiting = isrProposal_.phase == ProposalPhase::AwaitingMetadata;
-        if (awaiting && !isrProposal_.awaitingWarned &&
-            nowNs - isrProposal_.awaitingSinceNs >= kAwaitingMetadataWarnNs) {
-            isrProposal_.awaitingWarned = true;
-            spdlog::warn("PartitionReplica[node={} topic={} part={}]: an AlterIsr proposal at partitionEpoch {} was "
-                         "answered stale {} s ago and the newer committed assignment has still not reached this "
-                         "replica — its metadata replica lags or is wedged (the HW stays held by the proposed members)",
-                         cfg_.selfId, cfg_.topicId, cfg_.partitionId, isrProposal_.basePartitionEpoch,
-                         (nowNs - isrProposal_.awaitingSinceNs) / 1'000'000'000LL);
-        }
-        if (nowNs - isrProposal_.sentNs >= (awaiting ? kAwaitingMetadataResendNs : kAlterIsrResendNs)) {
-            if (internalQuorum_()) publishInternalIsr_(nowNs);
-            else                   sendIsrProposal_(nowNs);
+    if (internalQuorum_() && std::holds_alternative<InternalPending>(internalProposal_)) {
+        // One proposal in flight: re-send it until a majority of the replicas commits it or another committed
+        // change resolves it (the request, the answer or the record may have been lost).
+        if (nowNs - std::get<InternalPending>(internalProposal_).sentNs >= kAlterIsrResendNs) publishInternalIsr_(nowNs);
+        return false;
+    }
+    if (isrChannel_ != nullptr && !internalQuorum_() && !std::holds_alternative<NoProposal>(ctrlProposal_)) {
+        // Controller-managed: one proposal in flight, re-sent until the controller commits it or another committed
+        // change resolves it.  AwaitingCommit re-sends at the fast cadence (never before a hold set by an answer to
+        // an older send); AwaitingMetadata* at the slow cadence (loss recovery only) and WARNs once if it lasts.
+        if (auto* a = std::get_if<AwaitingCommit>(&ctrlProposal_)) {
+            if (nowNs - a->sentNs >= kAlterIsrResendNs && nowNs >= a->resendNotBeforeNs) sendIsrProposal_(nowNs);
+        } else {
+            if (auto* m = std::get_if<AwaitingMetadata>(&ctrlProposal_)) {
+                if (nowNs - m->sinceNs >= kAwaitingMetadataWarnNs) {
+                    spdlog::warn("PartitionReplica[node={} topic={} part={}]: an AlterIsr proposal at partitionEpoch {} was "
+                                 "answered stale {} s ago and the newer committed assignment has still not reached this "
+                                 "replica - its metadata replica lags or is wedged (the HW stays held by the proposed members)",
+                                 cfg_.selfId, cfg_.topicId, cfg_.partitionId, m->p.base,
+                                 (nowNs - m->sinceNs) / 1'000'000'000LL);
+                    ctrlProposal_ = AwaitingMetadataWarned{m->p, m->lastSeq, m->sentNs};   // m dangles after this line
+                }
+            }
+            const int64_t sentNs = std::holds_alternative<AwaitingMetadata>(ctrlProposal_)
+                ? std::get<AwaitingMetadata>(ctrlProposal_).sentNs
+                : std::get<AwaitingMetadataWarned>(ctrlProposal_).sentNs;
+            if (nowNs - sentNs >= kAwaitingMetadataResendNs) sendIsrProposal_(nowNs);
         }
         return false;
     }
@@ -3002,10 +3155,12 @@ bool PartitionReplica::changeIsr_(const std::vector<NodeId>& desired, int64_t no
     if (internalQuorum_()) {
         // MAJOR-2/3: publish a new version; it commits once a majority of the
         // replicas durably holds it.  HW over committed ∪ proposed meanwhile.
-        if (isrProposal_.pending()) return false;   // one change at a time
-        isrProposal_.phase = ProposalPhase::Sent;
-        isrProposal_.isr.assign(desired.begin(), desired.end());
-        isrProposal_.version = ++internalIsrVersion_;
+        if (std::holds_alternative<InternalPending>(internalProposal_)) return false;   // one change at a time
+        InternalPending np;
+        np.version = ++internalIsrVersion_;
+        np.count   = static_cast<uint8_t>(std::min<std::size_t>(desired.size(), np.members.size()));
+        for (std::size_t i = 0; i < np.count; ++i) np.members[i] = desired[i];
+        internalProposal_ = np;
         internalIsrAcks_     = 0;
         applyMaximalIsr_();
         publishInternalIsr_(nowNs);
@@ -3020,16 +3175,22 @@ bool PartitionReplica::changeIsr_(const std::vector<NodeId>& desired, int64_t no
         publishCleanerState();
         return true;
     }
-    if (isrProposal_.pending()) return false;   // one change at a time (re-sent by updateIsr_)
+    if (!std::holds_alternative<NoProposal>(ctrlProposal_)) return false;   // one change at a time (re-sent by updateIsr_)
     if (nowNs < invalidRequestBackoffUntilNs_) return false;   // A-M2: after an InvalidRequest
     // Controller-managed: propose; HW over committed ∪ proposed meanwhile — a
     // member being shrunk keeps holding the HW back until the controller
-    // committed its removal (it is electable until then).
-    isrProposal_.phase = ProposalPhase::Sent;
-    isrProposal_.awaitingSinceNs = 0;
-    isrProposal_.awaitingWarned = false;
-    isrProposal_.isr.assign(desired.begin(), desired.end());
-    isrProposal_.basePartitionEpoch = committedPartitionEpoch_;
+    // committed its removal (it is electable until then).  The body (members, their storage ids, the CAS base)
+    // is captured ONCE here and travels unchanged in every resend.
+    ProposalBody b{};
+    b.id = ++proposalSeq_;
+    b.base = committedPartitionEpoch_;
+    b.count = static_cast<uint8_t>(std::min<std::size_t>(desired.size(), 16));
+    for (int i = 0; i < b.count; ++i) {
+        const NodeId n = desired[static_cast<std::size_t>(i)];
+        b.members[static_cast<std::size_t>(i)] = n;
+        b.storages[static_cast<std::size_t>(i)] = n == cfg_.selfId ? storageId_ : slotStorage_(n);
+    }
+    ctrlProposal_ = AwaitingCommit{b, /*lastSeq=*/0, nowNs, /*resendNotBeforeNs=*/0, /*olderAnswers=*/0};
     applyMaximalIsr_();
     sendIsrProposal_(nowNs);
     publishCleanerState();
@@ -3045,15 +3206,17 @@ int PartitionReplica::slotIndex_(NodeId id) const noexcept
 
 void PartitionReplica::publishInternalIsr_(int64_t nowNs)
 {
-    isrProposal_.sentNs = nowNs;
+    InternalBody* const body = internalBody_();
+    if (body == nullptr) return;   // no proposal (never reached: callers hold a Pending or Committed one)
+    body->sentNs = nowNs;
     InternalIsrMsg m{};
     m.topicId     = cfg_.topicId;
     m.partition   = cfg_.partitionId;
     m.leaderId    = cfg_.selfId;
     m.leaderEpoch = epoch_;
-    m.version     = isrProposal_.version;
-    m.isrCount    = static_cast<int32_t>(std::min<std::size_t>(isrProposal_.isr.size(), InternalIsrMsg::kMaxIsr));
-    for (int i = 0; i < m.isrCount; ++i) m.isr[static_cast<std::size_t>(i)] = isrProposal_.isr[static_cast<std::size_t>(i)];
+    m.version     = body->version;
+    m.isrCount    = static_cast<int32_t>(std::min<std::size_t>(body->count, InternalIsrMsg::kMaxIsr));
+    for (int i = 0; i < m.isrCount; ++i) m.isr[static_cast<std::size_t>(i)] = body->members[static_cast<std::size_t>(i)];
     // Our own durable copy first: it is our ack (and our vote gate's view).
     const int self = slotIndex_(cfg_.selfId);
     if (self >= 0 && (internalIsrAcks_ & (1u << self)) == 0) {
@@ -3073,20 +3236,23 @@ void PartitionReplica::publishInternalIsr_(int64_t nowNs)
 
 void PartitionReplica::maybeCommitInternalIsr_()
 {
-    if (!isrProposal_.pending()) return;
+    const auto* pending = std::get_if<InternalPending>(&internalProposal_);
+    if (pending == nullptr) return;
     const int majority = static_cast<int>(configuredReplicas_.size()) / 2 + 1;
     if (std::popcount(internalIsrAcks_) < majority) return;
-    committedIsr_.assign(isrProposal_.isr.begin(), isrProposal_.isr.end());
-    isrProposal_.phase    = ProposalPhase::None;
+    InternalCommitted done;
+    static_cast<InternalBody&>(done) = *pending;
+    committedIsr_.assign(done.members.begin(), done.members.begin() + done.count);
+    internalProposal_     = done;   // Pending -> Committed: the body stays for the anti-entropy re-send
     internalSeedPending_  = false;
     if (isrKnowledge_ != nullptr) {
         // LOW-R4-1: committed — now the state this node shares in the exchange.
         InternalIsrState st{};
         st.topicId = cfg_.topicId; st.partition = cfg_.partitionId; st.leaderEpoch = epoch_;
-        st.version = isrProposal_.version;
-        st.count   = static_cast<int32_t>(std::min<std::size_t>(isrProposal_.isr.size(), InternalIsrMsg::kMaxIsr));
+        st.version = done.version;
+        st.count   = static_cast<int32_t>(std::min<std::size_t>(done.count, InternalIsrMsg::kMaxIsr));
         for (int i = 0; i < st.count; ++i)
-            st.members[static_cast<std::size_t>(i)] = isrProposal_.isr[static_cast<std::size_t>(i)];
+            st.members[static_cast<std::size_t>(i)] = done.members[static_cast<std::size_t>(i)];
         isrKnowledge_->noteCommitted(st);
     }
     applyMaximalIsr_();
@@ -3098,7 +3264,7 @@ void PartitionReplica::onInternalIsrAck(const InternalIsrAckMsg& m)
     // Pending: the ack counts toward the commit majority.  Committed: it stops
     // the anti-entropy re-send to that replica (MAJOR-A).
     if (!internalQuorum_() || role_ != Role::Leader || internalIsrVersion_ == 0) return;
-    if (m.leaderEpoch != epoch_ || m.version < isrProposal_.version) return;   // an older state
+    if (m.leaderEpoch != epoch_ || m.version < internalVersion_()) return;   // an older state
     const int idx = slotIndex_(m.followerId);
     if (idx < 0) return;
     internalIsrAcks_ |= (1u << idx);
@@ -3108,6 +3274,8 @@ void PartitionReplica::onInternalIsrAck(const InternalIsrAckMsg& m)
 void PartitionReplica::onInternalIsr(const InternalIsrMsg& m)
 {
     if (!internalQuorum_() || m.isrCount < 0 || m.isrCount > InternalIsrMsg::kMaxIsr) return;
+    if (dropInternalIsrUntilNs_ != 0 && std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count() < dropInternalIsrUntilNs_) [[unlikely]] return;
     InternalIsrState st{};
     st.topicId = m.topicId; st.partition = m.partition; st.leaderEpoch = m.leaderEpoch;
     st.version = m.version; st.count = m.isrCount; st.members = m.isr;
@@ -3248,19 +3416,120 @@ bool PartitionReplica::persistLedEpoch_(Epoch e)
 void PartitionReplica::refuseStaleLeadership_(Epoch newEpoch, int32_t partitionEpoch)
 {
     ++staleLeadRefusals_;
-    spdlog::warn("PartitionReplica[node={}] topic={} part={}: leadership at epoch {} REFUSED — "
-                 "restart fence {} (led by an earlier incarnation, or no durable fence); "
+    armLeadershipBump_(newEpoch, partitionEpoch, "restart fence (led by an earlier incarnation, or no durable fence)",
+                       /*storageHold=*/false);
+}
+
+// ---------------------------------------------------------------------------
+// ISR v3 Step 11 (3.8): the truncation guard
+// ---------------------------------------------------------------------------
+void PartitionReplica::enterRefused_(Offset truncTo, Offset leaderEndOffset)
+{
+    const auto* g = std::get_if<Refused>(&divergenceGuard_);
+    if (g == nullptr || g->epoch != epoch_ || g->leader != leaderId_) {
+        divergenceGuard_ = Refused{epoch_, leaderId_, truncTo, followerHw_, ++proposalSeq_, 0, 0, kAlterIsrResendNs};
+        spdlog::critical("PartitionReplica[node={} topic={} part={}]: REFUSED to truncate below the committed offset {} "
+                         "(leader {} epoch {} lineage ends at {}; LEO {}) - reporting it to the controller, applying "
+                         "nothing until the leadership changes",
+                         cfg_.selfId, cfg_.topicId, cfg_.partitionId, followerHw_, leaderId_,
+                         static_cast<long long>(epoch_), leaderEndOffset, logEndOffset_());
+    }
+    ++truncationsRefused_;
+    followerSync_.reset();
+}
+
+void PartitionReplica::onEpochHistoryMismatch_(int32_t epoch, Offset leaderStart)
+{
+    // Memory-backed replicas and an enabled unclean mode keep today's behaviour: count it and fetch again (the leader
+    // credited nothing).  Never a truncation: a start offset says nothing about which history is right (R16).
+    if (memoryBacked_ || cfg_.allowUncleanTruncation) {
+        ++epochHistoryMismatchesSeen_;
+        return;
+    }
+    (void)epoch;
+    enterRefused_(followerHw_, leaderStart);
+}
+
+void PartitionReplica::logMismatchOnce_(NodeId follower, int32_t epoch)
+{
+    for (const MismatchLogged& m : mismatchLogged_)
+        if (m.follower == follower && m.epoch == epoch) return;
+    mismatchLogged_[mismatchLoggedNext_] = MismatchLogged{follower, epoch};
+    mismatchLoggedNext_ = static_cast<uint8_t>((mismatchLoggedNext_ + 1) % mismatchLogged_.size());
+    spdlog::critical("PartitionReplica[node={} topic={} part={}]: follower {} holds a different history under epoch {} "
+                     "(its start differs from ours {}) - nothing is served or credited to it; it must refuse and report "
+                     "(this leader's log may have been lost and re-created under the same epoch)",
+                     cfg_.selfId, cfg_.topicId, cfg_.partitionId, follower, epoch, heldEpochStart_(epoch));
+}
+
+int PartitionReplica::sendRefusedReport_(int64_t nowNs)
+{
+    auto* g = std::get_if<Refused>(&divergenceGuard_);
+    if (g == nullptr) return 0;
+    int work = 0;
+    // Every 30 s: the refusal is never silent.  lastLogNs 0 = just entered (the entry itself logged).
+    if (g->lastLogNs == 0) {
+        g->lastLogNs = std::max<int64_t>(nowNs, 1);
+    } else if (nowNs - g->lastLogNs >= 30'000'000'000LL) {
+        g->lastLogNs = nowNs;
+        spdlog::critical("PartitionReplica[node={} topic={} part={}]: still REFUSED to truncate below the committed "
+                         "offset {} (leader {} epoch {} lineage ends at {}; refusals {}; {})",
+                         cfg_.selfId, cfg_.topicId, cfg_.partitionId, g->floor, g->leader,
+                         static_cast<long long>(g->epoch), g->truncTo, truncationsRefused_,
+                         isrChannel_ == nullptr ? "no controller path" : "waiting for the controller");
+    }
+    if (isrChannel_ == nullptr) return 0;
+    if (g->lastReportNs != 0 && nowNs - g->lastReportNs < g->cadenceNs) return 0;
+    g->lastReportNs = std::max<int64_t>(nowNs, 1);
+    AlterIsrMsg m{};
+    m.topicId        = cfg_.topicId;
+    m.partition      = cfg_.partitionId;
+    m.leaderId       = cfg_.selfId;
+    m.leaderEpoch    = g->epoch;
+    m.isrCount       = AlterIsrMsg::kLeaderEpochBump;
+    m.partitionEpoch = -1;
+    m.isr[1] = AlterIsrMsg::kBumpLeaderBelowCommitted;
+    m.isr[2] = static_cast<int32_t>(std::min<Offset>(g->floor, std::numeric_limits<int32_t>::max()));
+    m.isr[3] = static_cast<int32_t>(static_cast<uint64_t>(processIncarnation_) & 0xffffffffu);
+    m.isr[4] = static_cast<int32_t>(static_cast<uint64_t>(processIncarnation_) >> 32);
+    m.proposalId = g->reportId;
+    if (!isrChannel_->sendAlterIsr(m)) ++sendRefusals_;
+    ++work;
+    return work;
+}
+
+void PartitionReplica::holdLeadershipForStorage(Epoch e, int32_t pe)
+{
+    ++storageHolds_;
+    const bool coalesce = staleLead_.pending && staleLead_.storageHold && !staleLead_.sent;   // read BEFORE becomeFollower clears it
+    // A replica that never led here is still a follower of the previous epoch: stamp the committed epoch first, so the
+    // follower of nobody sits at (or above) the epoch it was named leader at.
+    if (role_ != Role::Leader && epoch_ < e) becomeFollower(e, NodeId{-1});
+    // CP2 I2: pace consecutive holds (below feature level 2 the gate never opens and the controller keeps re-granting).
+    constexpr int64_t kMaxBackoffNs = 30'000'000'000LL;
+    if (!coalesce) {   // an unsent hold keeps its slot
+        storageHoldNotBeforeNs_ = lastStorageBumpNs_ + storageHoldBackoffNs_;
+        storageHoldBackoffNs_   = storageHoldBackoffNs_ == 0 ? 1'000'000'000LL : std::min(2 * storageHoldBackoffNs_, kMaxBackoffNs);
+    }
+    armLeadershipBump_(e, pe, "storage unconfirmed", /*storageHold=*/true);
+}
+
+void PartitionReplica::armLeadershipBump_(Epoch newEpoch, int32_t partitionEpoch, const char* why, bool storageHold)
+{
+    spdlog::warn("PartitionReplica[node={}] topic={} part={}: leadership at epoch {} REFUSED — {} (restart fence {}); "
                  "asking the controller for a new epoch",
                  cfg_.selfId, cfg_.topicId, static_cast<int>(cfg_.partitionId),
-                 static_cast<long long>(newEpoch), static_cast<long long>(restartFenceEpoch_));
+                 static_cast<long long>(newEpoch), why, static_cast<long long>(restartFenceEpoch_));
     // Never lead (and never accept a produce) under it: a follower of no leader.
     if (role_ == Role::Leader)
         becomeFollower(epoch_ > newEpoch ? epoch_ : newEpoch, NodeId{-1});
     report_.pending = false;   // the partition HAS a committed leader (us): a bump, not a report
+    divergenceGuard_ = NoRefusal{};   // ISR v3 Step 11 (3.8): a refused / held leadership ends a refusal
     staleLead_.pending        = true;
     staleLead_.epoch          = newEpoch;
     staleLead_.partitionEpoch = partitionEpoch;
     staleLead_.sent           = false;
+    staleLead_.storageHold    = storageHold;
     publishCleanerState();
 }
 
@@ -3271,6 +3540,10 @@ int PartitionReplica::requestLeaderEpochBump_(int64_t nowNs)
     // answer or the record may be lost) — convergence is decided by the
     // controller's committed assignment, never by this interval.
     if (staleLead_.sent && nowNs - staleLead_.sentNs < kAlterIsrResendNs) return 0;
+    if (staleLead_.storageHold) {
+        if (nowNs < storageHoldNotBeforeNs_) return 0;   // CP2 I2: paced
+        lastStorageBumpNs_ = nowNs;
+    }
     staleLead_.sent   = true;
     staleLead_.sentNs = nowNs;
     AlterIsrMsg m{};
@@ -3364,15 +3637,28 @@ int PartitionReplica::sendLeaderlessReport_(int64_t nowNs)
 
 void PartitionReplica::sendIsrProposal_(int64_t nowNs)
 {
-    isrProposal_.sentNs = nowNs;
+    // Visit the pending states: every send of ONE proposal carries its id and a fresh, increasing sendSeq.
+    int32_t seq = 0;
+    // CP1 M5: the ordinal saturates (an int32 overflow would be UB); a saturated ordinal only means "newest" forever.
+    const auto bump = [](int32_t& v) noexcept { if (v < INT32_MAX) ++v; return v; };
+    if (auto* a = std::get_if<AwaitingCommit>(&ctrlProposal_))              { seq = bump(a->lastSeq); a->sentNs = nowNs; }
+    else if (auto* w = std::get_if<AwaitingMetadata>(&ctrlProposal_))       { seq = bump(w->lastSeq); w->sentNs = nowNs; }
+    else if (auto* x = std::get_if<AwaitingMetadataWarned>(&ctrlProposal_)) { seq = bump(x->lastSeq); x->sentNs = nowNs; }
+    else return;   // no proposal: nothing to send
+    const ProposalBody& b = bodyOf_(ctrlProposal_);
     AlterIsrMsg m{};
     m.topicId     = cfg_.topicId;
     m.partition   = cfg_.partitionId;
     m.leaderId    = cfg_.selfId;
     m.leaderEpoch = epoch_;
-    m.isrCount    = static_cast<int32_t>(std::min<std::size_t>(isrProposal_.isr.size(), AlterIsrMsg::kMaxIsr));
-    for (int i = 0; i < m.isrCount; ++i) m.isr[static_cast<std::size_t>(i)] = isrProposal_.isr[static_cast<std::size_t>(i)];
-    m.partitionEpoch = isrProposal_.basePartitionEpoch;   // MEDIUM-1: compare-and-set version
+    m.isrCount    = static_cast<int32_t>(std::min<std::size_t>(b.count, AlterIsrMsg::kMaxIsr));
+    for (int i = 0; i < m.isrCount; ++i) {
+        m.isr[static_cast<std::size_t>(i)]        = b.members[static_cast<std::size_t>(i)];
+        m.isrStorage[static_cast<std::size_t>(i)] = b.storages[static_cast<std::size_t>(i)];
+    }
+    m.partitionEpoch = b.base;   // MEDIUM-1: compare-and-set version
+    m.proposalId     = b.id;     // correlation only - never part of the CAS
+    m.sendSeq        = seq;
     if (!isrChannel_->sendAlterIsr(m)) ++sendRefusals_;   // re-sent on the next resend tick
 }
 

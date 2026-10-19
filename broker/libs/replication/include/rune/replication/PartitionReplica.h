@@ -46,6 +46,7 @@
 #include <mutex>
 #include <span>
 #include <unordered_map>
+#include <variant>
 #include <limits>
 #include <vector>
 #include <string>
@@ -129,6 +130,10 @@ inline constexpr int16_t kErrDivergingEpoch = -7;
 // process incarnation of the follower than one already seen — dropped (no
 // answer, no credit).
 inline constexpr int16_t kErrStaleIncarnation = -10;
+// ISR protocol: the leader's start offset for the shared epoch differs from the follower's - a second
+// history under one epoch (a leader that lost its disk and re-led).  The answer's payload is
+// ErrorPayload{epoch, leaderStartOffset} (in `records`); the follower refuses to append and reports.
+inline constexpr int16_t kErrEpochHistoryMismatch = -11;
 // The default replication fetch-ceiling (requested chunk size) used for
 // every PartitionConfig across the broker (see BrokerNode.cpp).  This is
 // deliberately NOT required to cover the gateway's max accepted produce
@@ -189,6 +194,10 @@ struct PartitionConfig {
     // E3 Task 5: async-durability tier (0=Leader, 1=Majority, 2=Strict).
     // Strict (2) = ack only after local fsync completion; others ack on append.
     uint8_t durabilityTier = 1;  // default Majority — parity-safe (existing tests unchanged)
+    /// ISR v3 Step 11: a disk-backed follower never truncates below the HW its own leader told it in this epoch
+    /// (it refuses and reports instead).  true restores the Kafka behaviour (log and truncate) - the broker sets
+    /// it from RUNE_SURVIVOR_LEADER_ELECTION for user topics, where an unclean election is a configured choice.
+    bool allowUncleanTruncation = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -458,6 +467,23 @@ public:
     /// valid durable state: the fence stays unknown (the first leadership of
     /// the incarnation is refused, as without a data dir).  Cold.
     void setMemoryEpochStateDir(const std::string& dir, const std::string& legacyFenceFile);
+    /// ISR v3 Step 10 (R3): the node's storage is not confirmed (the gate is closed) and the committed assignment names
+    /// this node the leader at (e, pe).  The replica never leads under it: it is a follower of nobody and asks the
+    /// controller for a failover through the same restart-fence bump a refused leadership uses (the controller moves the
+    /// leadership to another live ISR member, or - sole replica - re-grants it past the fence; the bridge re-derives the
+    /// role when the gate opens).  Runs on the replica's owning thread (worker, or control for internal partitions).
+    void holdLeadershipForStorage(Epoch e, int32_t pe);
+    [[nodiscard]] uint64_t storageHoldsForTest() const noexcept { return storageHolds_; }
+    /// ISR v3 Step 11 test views: the truncation guard (3.8).
+    [[nodiscard]] bool     truncationRefusedForTest() const noexcept { return std::holds_alternative<Refused>(divergenceGuard_); }
+    [[nodiscard]] uint64_t truncationsRefusedForTest() const noexcept { return truncationsRefused_; }
+    [[nodiscard]] uint64_t truncationsRefusedSameEpochForTest() const noexcept { return truncationsRefusedSameEpoch_; }
+    [[nodiscard]] uint64_t appliesDroppedRefusedForTest() const noexcept { return appliesDroppedRefused_; }
+    [[nodiscard]] uint64_t epochHistoryMismatchesForTest() const noexcept { return epochHistoryMismatches_; }
+    [[nodiscard]] uint64_t epochHistoryMismatchesSeenForTest() const noexcept { return epochHistoryMismatchesSeen_; }
+    [[nodiscard]] Offset   heldEpochStartForTest(int32_t e) const noexcept { return heldEpochStart_(e); }
+    /// (follower) the leader this replica follows; -1 = none known (a held leader role follows nobody).
+    [[nodiscard]] NodeId leaderId() const noexcept { return leaderId_; }
     [[nodiscard]] Epoch restartFenceEpochForTest() const noexcept { return restartFenceEpoch_; }
     [[nodiscard]] bool  staleLeadershipPendingForTest() const noexcept { return staleLead_.pending; }
     [[nodiscard]] uint64_t staleLeadershipRefusalsForTest() const noexcept { return staleLeadRefusals_; }
@@ -484,12 +510,51 @@ public:
     /// Test view: a new internal leadership has not yet committed its first ISR.
     [[nodiscard]] bool internalSeedPendingForTest() const noexcept { return internalSeedPending_; }
     /// Test view: an AlterIsr proposal is in flight.
-    [[nodiscard]] bool isrProposalPendingForTest() const noexcept { return isrProposal_.pending(); }
-    [[nodiscard]] bool isrProposalAwaitingMetadataForTest() const noexcept {
-        return isrProposal_.phase == ProposalPhase::AwaitingMetadata;
+    [[nodiscard]] bool isrProposalPendingForTest() const noexcept {
+        return !std::holds_alternative<NoProposal>(ctrlProposal_) || std::holds_alternative<InternalPending>(internalProposal_);
     }
+    /// True in AwaitingMetadata and AwaitingMetadataWarned (a stale answer was received).
+    [[nodiscard]] bool isrProposalAwaitingMetadataForTest() const noexcept {
+        return std::holds_alternative<AwaitingMetadata>(ctrlProposal_) ||
+               std::holds_alternative<AwaitingMetadataWarned>(ctrlProposal_);
+    }
+    /// "None" / "AwaitingCommit" / "AwaitingMetadata" / "AwaitingMetadataWarned" / "InternalPending".
+    [[nodiscard]] const char* isrProposalStateNameForTest() const noexcept {
+        if (std::holds_alternative<AwaitingCommit>(ctrlProposal_)) return "AwaitingCommit";
+        if (std::holds_alternative<AwaitingMetadata>(ctrlProposal_)) return "AwaitingMetadata";
+        if (std::holds_alternative<AwaitingMetadataWarned>(ctrlProposal_)) return "AwaitingMetadataWarned";
+        return std::holds_alternative<InternalPending>(internalProposal_) ? "InternalPending" : "None";
+    }
+    [[nodiscard]] int64_t pendingProposalIdForTest() const noexcept { return bodyOf_(ctrlProposal_).id; }
+    [[nodiscard]] std::vector<int64_t> pendingProposalStoragesForTest() const {
+        const ProposalBody& b = bodyOf_(ctrlProposal_);
+        return std::vector<int64_t>(b.storages.begin(), b.storages.begin() + b.count);
+    }
+    [[nodiscard]] int64_t followerStorageForTest(NodeId n) const noexcept { return slotStorage_(n); }   // ISR v3 Step 6
+    /// TEST ONLY (ISR v3 Step 7): append() refuses (kAppendNotLeader) while set - a leader whose append is refused.
+    void setAppendRefusedForTest(bool on) noexcept { appendRefusedForTest_ = on; }
+    /// TEST ONLY (ISR v3 Step 9, B-I8): emit no follower fetch / ack until the steady clock reaches `deadlineNs`.
+    void holdFetchesUntilForTest(int64_t deadlineNs) noexcept { fetchHoldUntilNs_ = deadlineNs; }
+    /// TEST SEAM (CP2 C1-R): ignore inbound internal-ISR proposals until this steady-clock time (a dead link from the leader).
+    void dropInternalIsrUntilForTest(int64_t deadlineNs) noexcept { dropInternalIsrUntilNs_ = deadlineNs; }
+    [[nodiscard]] uint64_t olderSendAnswersForTest() const noexcept { return olderSendAnswers_; }
+    [[nodiscard]] uint64_t answersWhileAwaitingMetadataForTest() const noexcept { return answersWhileAwaitingMetadata_; }
+    [[nodiscard]] uint64_t staleAnswersForTest() const noexcept { return staleAnswers_; }
+    [[nodiscard]] uint64_t okAnswersDisagreeingForTest() const noexcept { return okAnswersDisagreeing_; }
+    /// Test seam (CP1 M5): force the ordinal of the pending AwaitingCommit proposal.
+    void setPendingLastSeqForTest(int32_t v) noexcept {
+        if (auto* a = std::get_if<AwaitingCommit>(&ctrlProposal_)) a->lastSeq = v;
+    }
+    [[nodiscard]] int32_t pendingLastSeqForTest() const noexcept {
+        if (const auto* a = std::get_if<AwaitingCommit>(&ctrlProposal_)) return a->lastSeq;
+        return 0;
+    }
+    /// ISR protocol: this node's storage id, captured into every proposal it makes for itself.
+    void setStorageId(int64_t s) noexcept { storageId_ = s; }
     [[nodiscard]] uint64_t isrAwaitingMetadataForTest() const noexcept { return isrAwaitingMetadata_; }
-    [[nodiscard]] bool isrAwaitingMetadataWarnedForTest() const noexcept { return isrProposal_.awaitingWarned; }
+    [[nodiscard]] bool isrAwaitingMetadataWarnedForTest() const noexcept {
+        return std::holds_alternative<AwaitingMetadataWarned>(ctrlProposal_);
+    }
     [[nodiscard]] uint64_t staleAssignmentsForTest() const noexcept { return staleAssignments_; }
     /// Test view: the maximal ISR the HW is computed over (committed ∪ proposed).
     [[nodiscard]] const std::vector<NodeId>& maximalIsrForTest() const noexcept;
@@ -1497,6 +1562,47 @@ private:
     // after every becomeFollower until then — not a committed prefix.
     int64_t hwLearnedEpoch_ = -1;
 
+    // ISR v3 Step 11 (3.8): the truncation guard.  NoRefusal, or Refused holding exactly what the refusal needs.
+    // Refused: the follower applies nothing and fetches nothing; it re-sends a below-committed report to the controller
+    // at cadenceNs (50 ms, 1 s once any answer arrived) until the role changes (becomeLeader, a refused/held
+    // leadership, or becomeFollower to another (epoch, leader)); the controller fails the leader over.
+    struct NoRefusal {};
+    struct Refused {
+        Epoch   epoch;
+        NodeId  leader;
+        Offset  truncTo;
+        Offset  floor;
+        int64_t reportId;
+        int64_t lastReportNs;
+        int64_t lastLogNs;
+        int64_t cadenceNs;
+    };
+    std::variant<NoRefusal, Refused> divergenceGuard_{};
+    uint64_t truncationsRefused_ = 0;
+    uint64_t truncationsRefusedSameEpoch_ = 0;   ///< CP3 I1: refused because the follower holds records of its current epoch
+    uint64_t appliesDroppedRefused_ = 0;
+    uint64_t epochHistoryMismatches_ = 0;       ///< leader side: mismatch answers sent
+    uint64_t epochHistoryMismatchesSeen_ = 0;   ///< follower side, refusal not applicable (memory / unclean): re-fetched
+    /// Log once per (follower, epoch): 16 inline entries, then the oldest is overwritten.
+    struct MismatchLogged { NodeId follower = -1; int32_t epoch = -1; };
+    std::array<MismatchLogged, 16> mismatchLogged_{};
+    uint8_t mismatchLoggedNext_ = 0;
+    void logMismatchOnce_(NodeId follower, int32_t epoch);
+    void enterRefused_(Offset truncTo, Offset leaderEndOffset);
+    void onEpochHistoryMismatch_(int32_t epoch, Offset leaderStart);
+    int  sendRefusedReport_(int64_t nowNs);
+    /// The epoch's start offset when this replica holds that epoch's FIRST record, else -1 (R16, v2-review C2): a start
+    /// equal to a log start above 0 (a transient ring reset, a retention cut, a cache rebuild) is never compared.
+    [[nodiscard]] Offset heldEpochStart_(int32_t e) const noexcept {
+        const Offset s  = epochCache_.startOffsetFor(e);
+        const Offset ls = onLog([](auto& L) { return L.logStartOffset(); });
+        return (s >= 0 && s >= rederivedStartsBelow_ && (s == 0 || s > ls)) ? s : -1;
+    }
+    /// CP3 I2: starts below this offset were re-derived from batch stamps over a compaction GAP (the first surviving batch of
+    /// an epoch is not its first record) - never compared.  Starts at or above it were assigned live.
+    Offset rederivedStartsBelow_ = 0;
+    void markUnprovenEpochStarts_();   ///< CP3 R1: boot-time proof that a start is its epoch's first record
+
     // ── Follower replication sync — SINGLE SOURCE OF TRUTH ──────────────────────
     // One explicit state machine (see FollowerSync.h) replaces the former scattered
     // flags (heardFromLeader_ / lastResponseEmpty_ / lastKnownLeaderHw_ /
@@ -1691,38 +1797,106 @@ private:
     //                      recovery only: the answer may have come from a zombie controller); WARN once after
     //                      kAwaitingMetadataWarnNs (a wedged metadata replica is never silent).
     // Both non-None phases count the proposed members in the maximal ISR.
-    enum class ProposalPhase : uint8_t { None = 0, Sent = 1, AwaitingMetadata = 2 };
-    struct IsrProposal {
-        ProposalPhase       phase = ProposalPhase::None;
-        std::vector<NodeId> isr;          ///< proposed ISR (AlterIsr)
-        int64_t             sentNs  = 0;
-        int32_t             basePartitionEpoch = -1;   ///< MEDIUM-1: the CAS version it was derived from
-        int64_t             version = 0;               ///< internal quorum mode: the published version
-        int64_t             awaitingSinceNs = 0;       ///< AwaitingMetadata only: when the stale answer arrived
-        bool                awaitingWarned  = false;   ///< AwaitingMetadata only: the 10 s WARN was emitted
-        [[nodiscard]] bool pending() const noexcept { return phase != ProposalPhase::None; }
+    // ISR protocol (controller-managed mode): the proposal is a std::variant, each state holding exactly
+    // its own variables (hard rule 3).  The internal-quorum mode keeps its own variant (InternalNone | InternalPending | InternalCommitted) below.
+    //   NoProposal              — nothing in flight.
+    //   AwaitingCommit          — sent; re-sent every kAlterIsrResendNs (and not before resendNotBeforeNs).
+    //   AwaitingMetadata        — a stale/fenced answer to the NEWEST send: only the committed assignment resolves it.
+    //   AwaitingMetadataWarned  — the same, WARNed after kAwaitingMetadataWarnNs.
+    struct ProposalBody {
+        int64_t id = 0;                        ///< ++proposalSeq_, stable across resends
+        int32_t base = -1;                     ///< the CAS partitionEpoch it was derived from
+        uint8_t count = 0;
+        std::array<NodeId, 16> members{};
+        std::array<int64_t, 16> storages{};    ///< storage id of each member, captured at creation
     };
-    /// Resets the proposal IN PLACE (the member vector keeps its capacity): every exit from Leader and every
-    /// new leadership (review A-M3/A-M4, B-M2).  `version` (internal quorum mode) is reset too.
-    void resetIsrProposal_() noexcept {
-        isrProposal_.phase = ProposalPhase::None;
-        isrProposal_.isr.clear();
-        isrProposal_.sentNs = 0;
-        isrProposal_.basePartitionEpoch = -1;
-        isrProposal_.version = 0;
-        isrProposal_.awaitingSinceNs = 0;
-        isrProposal_.awaitingWarned = false;
+    struct NoProposal {};
+    struct AwaitingCommit {
+        ProposalBody p; int32_t lastSeq = 0; int64_t sentNs = 0; int64_t resendNotBeforeNs = 0; int32_t olderAnswers = 0;
+    };
+    struct AwaitingMetadata       { ProposalBody p; int32_t lastSeq = 0; int64_t sinceNs = 0; int64_t sentNs = 0; };
+    struct AwaitingMetadataWarned { ProposalBody p; int32_t lastSeq = 0; int64_t sentNs = 0; };
+    using CtrlProposal = std::variant<NoProposal, AwaitingCommit, AwaitingMetadata, AwaitingMetadataWarned>;
+    [[nodiscard]] static const ProposalBody& bodyOf_(const CtrlProposal& v) noexcept {
+        static const ProposalBody kNone{};
+        if (const auto* a = std::get_if<AwaitingCommit>(&v)) return a->p;
+        if (const auto* a = std::get_if<AwaitingMetadata>(&v)) return a->p;
+        if (const auto* a = std::get_if<AwaitingMetadataWarned>(&v)) return a->p;
+        return kNone;
     }
-    void clearIsrProposalPhase_() noexcept {   // resolved (committed / answered for THIS base): members kept for capacity
-        isrProposal_.phase = ProposalPhase::None;
-        isrProposal_.awaitingSinceNs = 0;
-        isrProposal_.awaitingWarned = false;
+    CtrlProposal ctrlProposal_{};
+    int64_t proposalSeq_ = 0;                  ///< never reset; id = ++proposalSeq_
+    int64_t storageId_ = 0;                    ///< this node's storage id (setStorageId)
+    bool    appendRefusedForTest_ = false;     ///< setAppendRefusedForTest
+    int64_t dropInternalIsrUntilNs_ = 0;       ///< dropInternalIsrUntilForTest (0 = off)
+    int64_t fetchHoldUntilNs_ = 0;             ///< holdFetchesUntilForTest (steady-clock ns, 0 = off)
+    uint64_t olderSendAnswers_ = 0;            ///< answers to an older send of the pending proposal
+    uint64_t answersWhileAwaitingMetadata_ = 0;///< answers received outside AwaitingCommit
+    uint64_t staleAnswers_ = 0;                ///< answers for another proposal id
+    uint64_t okAnswersDisagreeing_ = 0;        ///< CP1 M1: Ok at our base naming a member our committed ISR lacks
+    /// The storage id of a ISR member, captured into a proposal (Step 6 makes it read the follower slot).
+    [[nodiscard]] int64_t slotStorage_(NodeId n) const noexcept {
+        const FollowerSlot* const s = followerSlots_.find(n);
+        return s != nullptr ? s->storageId : 0;
+    }
+    static constexpr int64_t kAwaitNewestAnswerNs = 1'000'000'000LL;   ///< 1 s base of the older-send hold (1,2,4,8 s)
+
+    // Internal-quorum mode only (ISR v3 Step 12, hard rule 3): the proposal is a std::variant, each state holding exactly
+    // what it needs, with no allocation (the members are an inline array).
+    //   InternalNone      - no proposal (a fresh leadership).
+    //   InternalPending   - published, not yet held by a majority: re-sent every kAlterIsrResendNs; the HW counts
+    //                       committed U proposed members meanwhile.
+    //   InternalCommitted - a majority holds it (or another committed change resolved it): anti-entropy re-sends it every
+    //                       kAlterIsrResendNs until every replica acked it.
+    struct InternalBody {
+        int64_t version = 0;
+        uint8_t count   = 0;
+        std::array<NodeId, 16> members{};
+        int64_t sentNs  = 0;
+    };
+    struct InternalNone {};
+    struct InternalPending   : InternalBody {};
+    struct InternalCommitted : InternalBody {};
+    using InternalProposal = std::variant<InternalNone, InternalPending, InternalCommitted>;
+    /// The body of a Pending or Committed proposal, or null for None.
+    [[nodiscard]] InternalBody* internalBody_() noexcept {
+        if (auto* p = std::get_if<InternalPending>(&internalProposal_)) return p;
+        if (auto* c = std::get_if<InternalCommitted>(&internalProposal_)) return c;
+        return nullptr;
+    }
+    [[nodiscard]] int64_t internalVersion_() const noexcept {
+        if (const auto* p = std::get_if<InternalPending>(&internalProposal_)) return p->version;
+        if (const auto* c = std::get_if<InternalCommitted>(&internalProposal_)) return c->version;
+        return 0;
+    }
+    /// Resets the proposal (every exit from Leader and every new leadership: review A-M3/A-M4, B-M2).  The internal
+    /// proposal's `version` is reset with it.
+    void resetIsrProposal_() noexcept {
+        internalProposal_ = InternalNone{};
+        ctrlProposal_ = NoProposal{};
+    }
+    void clearIsrProposalPhase_() noexcept {   // internal-quorum: resolved by a committed change - Pending keeps its body as Committed
+        if (const auto* p = std::get_if<InternalPending>(&internalProposal_)) {
+            InternalCommitted c;
+            static_cast<InternalBody&>(c) = *p;
+            internalProposal_ = c;
+        }
+    }
+    /// The Pending proposal names exactly the members of `v`.
+    [[nodiscard]] bool internalPendingIs_(const std::vector<NodeId>& v) const noexcept {
+        const auto* p = std::get_if<InternalPending>(&internalProposal_);
+        if (p == nullptr || p->count != v.size()) return false;
+        for (NodeId id : v)
+            if (std::find(p->members.begin(), p->members.begin() + p->count, id) == p->members.begin() + p->count) return false;
+        return true;
     }
     uint64_t isrAwaitingMetadata_   = 0;   ///< proposals that entered AwaitingMetadata (A-M1)
     uint64_t staleAssignments_      = 0;   ///< committed assignments older than the applied one, ignored (A-M5)
     int64_t  invalidRequestBackoffUntilNs_ = 0;   ///< A-M2: no new proposal before this after an InvalidRequest
+    // CP1 M6: a one-shot WARN latch (one bit, no per-state data), reset with the leadership; kept as a bool on purpose -
+    // a std::variant<NotWarned, Warned> would hold the same single bit.
     bool     invalidRequestWarned_  = false;      ///< A-M2: WARN once per leadership
-    IsrProposal isrProposal_{};
+    InternalProposal internalProposal_{};
     /// MEDIUM-1: partitionEpoch of the committed assignment (-1 = unknown /
     /// not controller-managed).  Set by every becomeLeader.
     int32_t committedPartitionEpoch_ = -1;
@@ -1752,10 +1926,19 @@ private:
         int32_t partitionEpoch = -1;         ///< its committed partitionEpoch
         int64_t sentNs         = 0;
         bool    sent           = false;
+        bool    storageHold    = false;      ///< a held (not refused) leadership: its bump is paced (CP2 I2)
     };
     StaleLeadership staleLead_;
+    /// CP2 I2: consecutive storage holds ask for a new epoch 1, 2, 4 ... 30 s apart (the first of a process at once).
+    int64_t storageHoldBackoffNs_  = 0;   ///< spacing the NEXT hold will observe (0 = the next hold asks at once)
+    int64_t storageHoldNotBeforeNs_ = 0;  ///< the armed hold's bump may not be sent before this
+    int64_t lastStorageBumpNs_     = 0;
     uint64_t        staleLeadRefusals_ = 0;
     void refuseStaleLeadership_(Epoch newEpoch, int32_t partitionEpoch);
+    /// The shared body of a refused/held leadership: a follower of nobody, and a pending restart-fence bump request
+    /// (requestLeaderEpochBump_) for the committed (newEpoch, partitionEpoch).  `why` goes into the log line only.
+    void armLeadershipBump_(Epoch newEpoch, int32_t partitionEpoch, const char* why, bool storageHold);
+    uint64_t        storageHolds_ = 0;
     int  requestLeaderEpochBump_(int64_t nowNs);
     bool persistLedEpoch_(Epoch e);
     /// Fix round 2 N1 (KIP-112): a fence write failed — this replica's log dir

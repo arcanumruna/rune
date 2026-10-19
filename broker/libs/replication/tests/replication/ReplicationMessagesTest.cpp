@@ -18,6 +18,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <vector>
 #include <climits>
 
@@ -39,10 +40,12 @@ TEST(ReplicationMessages, SchemaIdIs112) {
     EXPECT_EQ(kSchemaId, 112);
 }
 
-TEST(ReplicationMessages, SchemaVersionIs3) {
+TEST(ReplicationMessages, SchemaVersionIs4) {
     // DR-BUG-5: 1→2 (topicId); KIP-320/595: 2→3 (FetchRequest.lastFetchedEpoch,
-    // FetchResponse.divergingEpoch / divergingEndOffset).
-    EXPECT_EQ(kSchemaVersion, 3);
+    // FetchResponse.divergingEpoch / divergingEndOffset); ISR protocol: 3→4 (storage id,
+    // correlated AlterIsr answers).  A v3 leader's FetchResponse is still applied.
+    EXPECT_EQ(kSchemaVersion, 4);
+    EXPECT_EQ(kMinReplicationVersion, 3);
 }
 
 TEST(ReplicationMessages, FetchRequestTemplateId) {
@@ -54,8 +57,9 @@ TEST(ReplicationMessages, FetchResponseTemplateId) {
 }
 
 TEST(ReplicationMessages, FetchRequestBlockLength) {
-    // v3: 3×int64 + 5×int32 = 24 + 20 = 44 (lastFetchedEpoch + KIP-903 incarnation; v2 was 32)
-    EXPECT_EQ(FetchRequestMsg::BLOCK_LENGTH, 44u);
+    // v4: 5×int64 + 5×int32 = 40 + 20 = 60 (storageId + lastEpochStartOffset; v3 was 44, v2 32)
+    EXPECT_EQ(FetchRequestMsg::BLOCK_LENGTH, 60u);
+    EXPECT_EQ(FetchRequestMsg::BLOCK_LENGTH_V3, 44u);
     EXPECT_EQ(FetchRequestMsg::BLOCK_LENGTH_V2, 32u);
 }
 
@@ -70,27 +74,27 @@ TEST(ReplicationMessages, FetchResponseBlockLengthFixed) {
 TEST(ReplicationMessages, FetchRequestTotalSize) {
     EXPECT_EQ(FetchRequestMsg::TOTAL_SIZE,
               ReplicationMessageHeader::ENCODED_SIZE + FetchRequestMsg::BLOCK_LENGTH);
-    // v3: 8 (header) + 44 (block) = 52; a v2 frame (40) is still decodable.
-    EXPECT_EQ(FetchRequestMsg::TOTAL_SIZE, 52u);
+    // v4: 8 (header) + 60 (block) = 68; a v2 frame (40) is still decodable.
+    EXPECT_EQ(FetchRequestMsg::TOTAL_SIZE, 68u);
     EXPECT_EQ(FetchRequestMsg::MIN_SIZE, 40u);
 }
 
 // KIP-320/595 wire compatibility: a v3 FetchRequest carries lastFetchedEpoch;
 // a v2 frame (32-byte block) decodes as lastFetchedEpoch = -1 (no validation).
 TEST(ReplicationMessages, FetchRequestLastFetchedEpochV3RoundTripAndV2Absent) {
-    uint8_t buf[64]{};
-    ASSERT_EQ(FetchRequestMsg::encode(buf, 0, 4, 1, 2, 77, 1 << 20, 9, /*lastFetchedEpoch=*/3), 52u);
-    FetchRequestMsg m = FetchRequestMsg::decode(buf, 0);
+    uint8_t buf[FetchRequestMsg::TOTAL_SIZE]{};
+    ASSERT_EQ(FetchRequestMsg::encode(buf, 0, 4, 1, 2, 77, 1 << 20, 9, /*lastFetchedEpoch=*/3), 68u);
+    FetchRequestMsg m = FetchRequestMsg::decode(buf, 0, sizeof(buf));
     EXPECT_EQ(m.fetchOffset, 77);
     EXPECT_EQ(m.topicId, 9);
     EXPECT_EQ(m.lastFetchedEpoch, 3);
     // A v2 sender: blockLength 32 in the header, no field after topicId.
-    uint8_t v2[64]{};
+    uint8_t v2[FetchRequestMsg::TOTAL_SIZE]{};
     (void)FetchRequestMsg::encode(v2, 0, 4, 1, 2, 77, 1 << 20, 9, 3);
     v2[0] = 32; v2[1] = 0;                            // header blockLength = 32
     v2[6] = 2;  v2[7] = 0;                            // header version = 2
     std::memset(v2 + 8 + 32, 0x5A, 4);                // garbage past the v2 block
-    m = FetchRequestMsg::decode(v2, 0);
+    m = FetchRequestMsg::decode(v2, 0, sizeof(v2));
     EXPECT_EQ(m.fetchOffset, 77);
     EXPECT_EQ(m.lastFetchedEpoch, kLastFetchedEpochV2Frame) << "a v2 frame is marked (fail closed)";
 }
@@ -124,7 +128,7 @@ TEST(ReplicationMessages, AlterIsrRoundTrip) {
     a.topicId = 3; a.partition = 2; a.leaderId = 1; a.leaderEpoch = 9; a.isrCount = 2;
     a.isr[0] = 1; a.isr[1] = 3;
     a.partitionEpoch = 17;
-    EXPECT_EQ(AlterIsrMsg::TOTAL_SIZE, 8u + 92u);
+    EXPECT_EQ(AlterIsrMsg::TOTAL_SIZE, 8u + 232u);
     uint8_t buf[AlterIsrMsg::TOTAL_SIZE]{};
     ASSERT_EQ(a.encode(buf, sizeof buf), AlterIsrMsg::TOTAL_SIZE);
     EXPECT_EQ(peekTemplateId(buf), AlterIsrMsg::TEMPLATE_ID);
@@ -171,7 +175,7 @@ TEST(ReplicationMessages, FetchRequestCarriesIncarnation) {
     uint8_t buf[FetchRequestMsg::TOTAL_SIZE]{};
     ASSERT_EQ(FetchRequestMsg::encode(buf, 0, 4, 1, 2, 99, 1024, 7, 3, 0x1234567890LL),
               FetchRequestMsg::TOTAL_SIZE);
-    const auto m = FetchRequestMsg::decode(buf, 0);
+    const auto m = FetchRequestMsg::decode(buf, 0, sizeof(buf));
     EXPECT_EQ(m.lastFetchedEpoch, 3);
     EXPECT_EQ(m.incarnation, 0x1234567890LL);
 }
@@ -195,7 +199,7 @@ TEST(FetchRequest, RoundTripBasicValues) {
     std::size_t written = FetchRequestMsg::encode(buf, 0, epoch, part, fol, off, maxB);
     EXPECT_EQ(written, FetchRequestMsg::TOTAL_SIZE);
 
-    FetchRequestMsg m = FetchRequestMsg::decode(buf, 0);
+    FetchRequestMsg m = FetchRequestMsg::decode(buf, 0, sizeof(buf));
     EXPECT_EQ(m.leaderEpoch, epoch);
     EXPECT_EQ(m.partition,   part);
     EXPECT_EQ(m.followerId,  fol);
@@ -212,7 +216,7 @@ TEST(FetchRequest, DistinctSentinelValues) {
         /*fetchOffset*/  0x2122232425262728LL,
         /*maxBytes*/     0x31323334);
 
-    FetchRequestMsg m = FetchRequestMsg::decode(buf, 0);
+    FetchRequestMsg m = FetchRequestMsg::decode(buf, 0, sizeof(buf));
     EXPECT_EQ(m.leaderEpoch, 0x0102030405060708LL);
     EXPECT_EQ(m.partition,   0x0A0B0C0D);
     EXPECT_EQ(m.followerId,  0x1E1F2021);
@@ -223,7 +227,7 @@ TEST(FetchRequest, DistinctSentinelValues) {
 TEST(FetchRequest, ZeroValues) {
     uint8_t buf[kBufSize]{};
     FetchRequestMsg::encode(buf, 0, 0, 0, 0, 0, 0);
-    FetchRequestMsg m = FetchRequestMsg::decode(buf, 0);
+    FetchRequestMsg m = FetchRequestMsg::decode(buf, 0, sizeof(buf));
     EXPECT_EQ(m.leaderEpoch, 0);
     EXPECT_EQ(m.partition,   0);
     EXPECT_EQ(m.followerId,  0);
@@ -234,7 +238,7 @@ TEST(FetchRequest, ZeroValues) {
 TEST(FetchRequest, MaxInt64FetchOffset) {
     uint8_t buf[kBufSize]{};
     FetchRequestMsg::encode(buf, 0, INT64_MAX, 0, 0, INT64_MAX, INT32_MAX);
-    FetchRequestMsg m = FetchRequestMsg::decode(buf, 0);
+    FetchRequestMsg m = FetchRequestMsg::decode(buf, 0, sizeof(buf));
     EXPECT_EQ(m.leaderEpoch, INT64_MAX);
     EXPECT_EQ(m.fetchOffset, INT64_MAX);
     EXPECT_EQ(m.maxBytes,    INT32_MAX);
@@ -243,7 +247,7 @@ TEST(FetchRequest, MaxInt64FetchOffset) {
 TEST(FetchRequest, NegativeEpochAllowed) {
     uint8_t buf[kBufSize]{};
     FetchRequestMsg::encode(buf, 0, -1LL, -1, -1, -1LL, -1);
-    FetchRequestMsg m = FetchRequestMsg::decode(buf, 0);
+    FetchRequestMsg m = FetchRequestMsg::decode(buf, 0, sizeof(buf));
     EXPECT_EQ(m.leaderEpoch, -1LL);
     EXPECT_EQ(m.partition,   -1);
     EXPECT_EQ(m.followerId,  -1);
@@ -282,7 +286,7 @@ TEST(FetchRequest, EncodingAtNonZeroOffset) {
     std::size_t written = FetchRequestMsg::encode(buf, OFFSET, 99LL, 1, 2, 500LL, 1000);
     EXPECT_EQ(written, FetchRequestMsg::TOTAL_SIZE);
 
-    FetchRequestMsg m = FetchRequestMsg::decode(buf, OFFSET);
+    FetchRequestMsg m = FetchRequestMsg::decode(buf, OFFSET, sizeof(buf));
     EXPECT_EQ(m.leaderEpoch, 99LL);
     EXPECT_EQ(m.partition,   1);
     EXPECT_EQ(m.followerId,  2);
@@ -301,7 +305,7 @@ TEST(FetchRequest, MaxBytesZeroMeansPositionOnly) {
     // maxBytes=0 is legal: follower is reporting its position without requesting data
     uint8_t buf[kBufSize]{};
     FetchRequestMsg::encode(buf, 0, 5LL, 2, 1, 9999LL, 0);
-    FetchRequestMsg m = FetchRequestMsg::decode(buf, 0);
+    FetchRequestMsg m = FetchRequestMsg::decode(buf, 0, sizeof(buf));
     EXPECT_EQ(m.maxBytes, 0);
     EXPECT_EQ(m.fetchOffset, 9999LL);
 }
@@ -566,7 +570,7 @@ TEST(FetchRequest, TopicIdRoundTrip) {
         /*leaderEpoch=*/1LL, /*partition=*/0,
         /*followerId=*/2, /*fetchOffset=*/100LL,
         /*maxBytes=*/4096, /*topicId=*/7);
-    FetchRequestMsg m = FetchRequestMsg::decode(buf, 0);
+    FetchRequestMsg m = FetchRequestMsg::decode(buf, 0, sizeof(buf));
     EXPECT_EQ(m.topicId, 7);
     // Other fields must be unaffected.
     EXPECT_EQ(m.leaderEpoch, 1LL);
@@ -580,7 +584,7 @@ TEST(FetchRequest, TopicIdDefaultIsZero) {
     uint8_t buf[kBufSize]{};
     // Call without topicId (default parameter = 0).
     FetchRequestMsg::encode(buf, 0, 5LL, 3, 1, 50LL, 512);
-    FetchRequestMsg m = FetchRequestMsg::decode(buf, 0);
+    FetchRequestMsg m = FetchRequestMsg::decode(buf, 0, sizeof(buf));
     EXPECT_EQ(m.topicId, 0) << "default topicId must be 0";
 }
 
@@ -590,8 +594,8 @@ TEST(FetchRequest, TopicIdDistinguishesTwoTopics) {
     uint8_t buf1[kBufSize]{};
     FetchRequestMsg::encode(buf0, 0, 1LL, 0, 1, 0LL, 0, /*topicId=*/0);
     FetchRequestMsg::encode(buf1, 0, 1LL, 0, 1, 0LL, 0, /*topicId=*/1);
-    auto m0 = FetchRequestMsg::decode(buf0, 0);
-    auto m1 = FetchRequestMsg::decode(buf1, 0);
+    auto m0 = FetchRequestMsg::decode(buf0, 0, sizeof(buf0));
+    auto m1 = FetchRequestMsg::decode(buf1, 0, sizeof(buf1));
     EXPECT_EQ(m0.partition, m1.partition) << "same partition index";
     EXPECT_NE(m0.topicId,   m1.topicId)   << "different topicId must produce different decoded value";
     EXPECT_EQ(m0.topicId, 0);
@@ -809,4 +813,163 @@ TEST(D9TxnMarkerWireRegression, WriteTxnMarkerResponseRoundTripAndTruncation) {
     EXPECT_FALSE(WriteTxnMarkerResponseMsg::decode(buf.data(), buf.size() - 1, d)) << "truncated";
     stampTemplateId(buf.data(), 0, WriteTxnMarkerMsg::TEMPLATE_ID);
     EXPECT_FALSE(WriteTxnMarkerResponseMsg::decode(buf.data(), buf.size(), d)) << "another template id";
+}
+
+// ============================================================================
+// ISR protocol (schema v4): storage id, correlated AlterIsr answers
+// ============================================================================
+
+namespace {
+// A hand-built frame header: {blockLength, templateId, schemaId 112, version}.
+void putHeader(uint8_t* b, uint16_t block, uint16_t tmpl, uint16_t ver) {
+    detail::write_le<uint16_t>(b + 0, block);
+    detail::write_le<uint16_t>(b + 2, tmpl);
+    detail::write_le<uint16_t>(b + 4, kSchemaId);
+    detail::write_le<uint16_t>(b + 6, ver);
+}
+}  // namespace
+
+TEST(ReplicationMessagesRegression, AlterIsrV4RoundTripsAllNewFieldsRegression) {
+    AlterIsrMsg a{};
+    a.topicId = 3; a.partition = 2; a.leaderId = 1; a.leaderEpoch = 9; a.isrCount = 3;
+    a.isr[0] = 1; a.isr[1] = 2; a.isr[2] = 3; a.partitionEpoch = 17;
+    a.proposalId = 77; a.sendSeq = 3;
+    a.isrStorage[0] = 11; a.isrStorage[1] = 22; a.isrStorage[2] = 33;
+    uint8_t buf[AlterIsrMsg::TOTAL_SIZE]{};
+    ASSERT_EQ(a.encode(buf, sizeof buf), AlterIsrMsg::TOTAL_SIZE);
+    AlterIsrMsg b{};
+    ASSERT_TRUE(AlterIsrMsg::decode(buf, sizeof buf, b));
+    EXPECT_EQ(b.proposalId, 77);
+    EXPECT_EQ(b.sendSeq, 3);
+    EXPECT_EQ(b.isrStorage[0], 11); EXPECT_EQ(b.isrStorage[1], 22); EXPECT_EQ(b.isrStorage[2], 33);
+    EXPECT_EQ(b.isrStorage[3], 0);
+    EXPECT_EQ(b.partitionEpoch, 17);
+}
+
+TEST(ReplicationMessagesRegression, AlterIsrV3FrameDecodesWithZeroesRegression) {
+    // A v3 sender's frame: block 92, version 3, 100 bytes in all.
+    uint8_t f[100]{};
+    putHeader(f, 92, AlterIsrMsg::TEMPLATE_ID, 3);
+    uint8_t* p = f + 8;
+    detail::write_le<int32_t>(p + 0, 1);      // topicId
+    detail::write_le<int32_t>(p + 4, 2);      // partition
+    detail::write_le<int32_t>(p + 8, 3);      // leaderId
+    detail::write_le<int64_t>(p + 12, 4);     // leaderEpoch
+    detail::write_le<int32_t>(p + 20, 2);     // isrCount
+    detail::write_le<int32_t>(p + 24, 3);     // isr[0]
+    detail::write_le<int32_t>(p + 28, 5);     // isr[1]
+    detail::write_le<int32_t>(p + 88, 9);     // partitionEpoch
+    AlterIsrMsg m{};
+    m.proposalId = 99; m.sendSeq = 99; m.isrStorage[0] = 99;   // decode must overwrite, not keep
+    ASSERT_TRUE(AlterIsrMsg::decode(f, sizeof f, m));
+    EXPECT_EQ(m.topicId, 1); EXPECT_EQ(m.partition, 2); EXPECT_EQ(m.leaderId, 3);
+    EXPECT_EQ(m.leaderEpoch, 4); EXPECT_EQ(m.isrCount, 2);
+    EXPECT_EQ(m.isr[0], 3); EXPECT_EQ(m.isr[1], 5); EXPECT_EQ(m.partitionEpoch, 9);
+    EXPECT_EQ(m.proposalId, 0);
+    EXPECT_EQ(m.sendSeq, 0);
+    for (int64_t s : m.isrStorage) EXPECT_EQ(s, 0);
+    // A frame shorter than its own header claims is refused.
+    EXPECT_FALSE(AlterIsrMsg::decode(f, sizeof f - 1, m));
+}
+
+TEST(ReplicationMessagesRegression, AlterIsrResponseV3AndV4DecodeRegression) {
+    uint8_t f[34]{};
+    putHeader(f, 26, AlterIsrResponseMsg::TEMPLATE_ID, 3);
+    uint8_t* p = f + 8;
+    detail::write_le<int32_t>(p + 0, 1);
+    detail::write_le<int32_t>(p + 4, 2);
+    detail::write_le<int32_t>(p + 8, 3);
+    detail::write_le<int64_t>(p + 12, 4);
+    detail::write_le<int32_t>(p + 20, 9);
+    detail::write_le<int16_t>(p + 24, kAlterIsrIneligibleReplica);
+    AlterIsrResponseMsg m{};
+    m.proposalId = 99; m.controllerEpoch = 99; m.sendSeq = 99;
+    ASSERT_TRUE(AlterIsrResponseMsg::decode(f, sizeof f, m));
+    EXPECT_EQ(m.topicId, 1); EXPECT_EQ(m.leaderEpoch, 4); EXPECT_EQ(m.partitionEpoch, 9);
+    EXPECT_EQ(m.errorCode, kAlterIsrIneligibleReplica);
+    EXPECT_EQ(m.proposalId, 0); EXPECT_EQ(m.controllerEpoch, 0); EXPECT_EQ(m.sendSeq, 0);
+
+    AlterIsrResponseMsg r{};
+    r.topicId = 1; r.partition = 2; r.leaderId = 3; r.leaderEpoch = 4; r.partitionEpoch = 9;
+    r.errorCode = kAlterIsrOk; r.proposalId = 77; r.controllerEpoch = 8; r.sendSeq = 3;
+    uint8_t buf[AlterIsrResponseMsg::TOTAL_SIZE]{};
+    ASSERT_EQ(r.encode(buf, sizeof buf), AlterIsrResponseMsg::TOTAL_SIZE);
+    AlterIsrResponseMsg d{};
+    ASSERT_TRUE(AlterIsrResponseMsg::decode(buf, sizeof buf, d));
+    EXPECT_EQ(d.proposalId, 77); EXPECT_EQ(d.controllerEpoch, 8); EXPECT_EQ(d.sendSeq, 3);
+}
+
+TEST(ReplicationMessagesRegression, FetchRequestV4FieldsAndV3FrameRegression) {
+    uint8_t buf[FetchRequestMsg::TOTAL_SIZE]{};
+    ASSERT_EQ(FetchRequestMsg::encode(buf, 0, 4, 1, 2, 77, 1 << 20, 9, /*lastFetchedEpoch=*/3,
+                                      /*incarnation=*/55, /*storageId=*/0x1234, /*lastEpochStartOffset=*/9),
+              FetchRequestMsg::TOTAL_SIZE);
+    FetchRequestMsg m = FetchRequestMsg::decode(buf, 0, sizeof buf);
+    EXPECT_EQ(m.storageId, 0x1234);
+    EXPECT_EQ(m.lastEpochStartOffset, 9);
+    EXPECT_EQ(m.incarnation, 55);
+    // A v3 sender: header block 44 (and a 52-byte frame): the v4 fields read their absent values,
+    // the incarnation is kept.
+    uint8_t v3[FetchRequestMsg::TOTAL_SIZE]{};
+    (void)FetchRequestMsg::encode(v3, 0, 4, 1, 2, 77, 1 << 20, 9, 3, 55, 0x1234, 9);
+    v3[0] = 44; v3[1] = 0; v3[6] = 3; v3[7] = 0;
+    m = FetchRequestMsg::decode(v3, 0, 52);
+    EXPECT_EQ(m.storageId, 0);
+    EXPECT_EQ(m.lastEpochStartOffset, -1);
+    EXPECT_EQ(m.incarnation, 55);
+    EXPECT_EQ(m.lastFetchedEpoch, 3);
+}
+
+TEST(ReplicationMessagesRegression, FetchRequestDecodeNeverReadsPastTheFrameRegression) {
+    // A 40-byte frame (a v2 frame's size) whose header claims a 60-byte block.  On the HEAP and
+    // exactly sized, so a read past it is a heap-buffer-overflow under ASan.
+    auto frame = std::make_unique<uint8_t[]>(40);
+    std::memset(frame.get(), 0, 40);
+    putHeader(frame.get(), 60, FetchRequestMsg::TEMPLATE_ID, 4);
+    const FetchRequestMsg m = FetchRequestMsg::decode(frame.get(), 0, 40);
+    EXPECT_EQ(m.incarnation, 0);
+    EXPECT_EQ(m.storageId, 0);
+    EXPECT_EQ(m.lastEpochStartOffset, -1);
+}
+
+TEST(ReplicationMessagesRegression, FetchResponseFromAV3LeaderIsAcceptedRegression) {
+    uint8_t buf[256]{};
+    const std::size_t n = FetchResponseMsg::encode(buf, 0, 4, 1, 10, 0, int16_t{0}, {}, 9);
+    buf[6] = 3; buf[7] = 0;                       // header version = 3 (a leader of the previous release)
+    const FetchResponseMsg m = FetchResponseMsg::decode(buf, 0, n);
+    EXPECT_NE(m.errorCode, kErrUnsupportedWireVersion);
+    buf[6] = 2;                                   // a v2 leader is still refused
+    EXPECT_EQ(FetchResponseMsg::decode(buf, 0, n).errorCode, kErrUnsupportedWireVersion);
+}
+
+TEST(ReplicationMessagesRegression, StaleControllerAnswerRuleRegression) {
+    EXPECT_TRUE(isStaleControllerAnswer(6, 7));
+    EXPECT_FALSE(isStaleControllerAnswer(7, 7));
+    EXPECT_FALSE(isStaleControllerAnswer(8, 7));
+    EXPECT_FALSE(isStaleControllerAnswer(0, 7)) << "a v3 controller sends no term";
+}
+
+// CP1 review M2: a v4 field is read only when the header's block covers it.  A peer that claims version 4 with a
+// v3-sized block (92 / 26) in an exactly sized HEAP frame must read as v3 (zeros), never past the frame.  Clean under
+// ASan.  RED: gate on the acting version alone (heap-buffer-overflow).
+TEST(ReplicationMessagesRegression, V4FieldsOfAV3SizedBlockAreNeverReadPastTheFrameRegression) {
+    {
+        auto f = std::make_unique<uint8_t[]>(100);
+        std::memset(f.get(), 0, 100);
+        putHeader(f.get(), 92, AlterIsrMsg::TEMPLATE_ID, 4);
+        detail::write_le<int32_t>(f.get() + 8 + 20, 2);   // isrCount
+        AlterIsrMsg m{};
+        m.proposalId = 9; m.sendSeq = 9; m.isrStorage[0] = 9;
+        ASSERT_TRUE(AlterIsrMsg::decode(f.get(), 100, m));
+        EXPECT_EQ(m.proposalId, 0); EXPECT_EQ(m.sendSeq, 0); EXPECT_EQ(m.isrStorage[0], 0);
+    }
+    {
+        auto f = std::make_unique<uint8_t[]>(34);
+        std::memset(f.get(), 0, 34);
+        putHeader(f.get(), 26, AlterIsrResponseMsg::TEMPLATE_ID, 4);
+        AlterIsrResponseMsg m{};
+        m.proposalId = 9; m.controllerEpoch = 9; m.sendSeq = 9;
+        ASSERT_TRUE(AlterIsrResponseMsg::decode(f.get(), 34, m));
+        EXPECT_EQ(m.proposalId, 0); EXPECT_EQ(m.controllerEpoch, 0); EXPECT_EQ(m.sendSeq, 0);
+    }
 }

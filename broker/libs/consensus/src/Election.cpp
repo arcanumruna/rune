@@ -750,13 +750,26 @@ int Election::followerReady(int64_t nowNs)
 void Election::onCanvassPosition(Term    logLeadershipTermId,
                                  int64_t logPosition,
                                  Term    leadershipTermId,
-                                 NodeId  followerMemberId)
+                                 NodeId  followerMemberId,
+                                 int32_t flags)
 {
     // Election.java:291-294
     if (state_ == ElectionState::Init) return;
 
     // Skip messages from self
     if (followerMemberId == thisMemberId_) return;
+
+    // ISR v3 R12: founding evidence.  "Fresh" = the sender says (valid flags) it has no history; an invalid-flags
+    // canvass (an old sender's 0) or a history flag is history.
+    if (memberById(followerMemberId) == nullptr) return;   // M11: only members are founding evidence
+    noteHeard_(followerMemberId);
+    if ((flags & 2) != 0 && (flags & 1) == 0) {
+        if (followerMemberId >= 0 && followerMemberId < 32) heardFreshMask_ |= 1u << followerMemberId;
+    } else {
+        anyHistory_ = true;
+        peerWithHistory_ = followerMemberId;
+    }
+    if (leadershipTermId > maxPeerLeadershipTermId_) maxPeerLeadershipTermId_ = leadershipTermId;
 
     // Election.java:296-299: clear gracefulClosedLeaderId if it was this member
     // — except a leader that RESIGNED to us (StandDown, controlled shutdown):
@@ -791,6 +804,8 @@ void Election::onRequestVote(Term    logLeadershipTermId,
 
     // Election.java:346-349: ignore vote requests from self
     if (candidateId == thisMemberId_) return;
+    noteHeard_(candidateId);   // ISR v3 R12: the heard bit only - a candidate's term is NEVER founding evidence
+    if (abstains_()) return;   // ISR v3: an untrusted storage takes no part in another node's ballot (no Against veto)
 
     // ClosedLeaderStepDownRegression: Aeron ConsensusModuleAgent.onRequestVote —
     // outside an election a candidate with a higher term than ours means the
@@ -917,6 +932,7 @@ void Election::onNewLeadershipTerm(int64_t nowNs,
     // onRequestVote) — the leader's next heartbeat repeats it.
     if (state_ == ElectionState::Init) return;
     noteLeaderHeard_(leaderMemberIdArg, leadershipTermIdArg, nowNs);   // D29: even one refused below (by floor)
+    noteTermEvidence_(leaderMemberIdArg, leadershipTermIdArg);          // ISR v3 R12
 
     // Election.java:430: if CLOSED ignore — EXCEPT a same-term NLT from the leader
     // we already follow is a LIVENESS HEARTBEAT, not an election message.  The
@@ -1093,6 +1109,7 @@ void Election::onAppendPosition(int64_t nowNs,
                                 NodeId  followerMemberIdArg,
                                 uint8_t /*flags*/)
 {
+    noteTermEvidence_(followerMemberIdArg, leadershipTermIdArg);   // ISR v3 R12
     // Election.java:541-543: ignore if wrong leadershipTermId
     if (leadershipTermIdArg != leadershipTermId_) {
         if (electLog()) {
@@ -1133,6 +1150,7 @@ void Election::onCommitPosition(int64_t nowNs,
 {
     if (state_ == ElectionState::Init) return;   // D24 review MAJOR-1 (see onNewLeadershipTerm)
     noteLeaderHeard_(leaderMemberIdArg, leadershipTermIdArg, nowNs);   // D29
+    noteTermEvidence_(leaderMemberIdArg, leadershipTermIdArg);          // ISR v3 R12
 
     // A1 fix (audit 2026-09-11): a CommitPosition with a strictly-higher term while
     // this node is in a LEADER state signals a new election has concluded elsewhere.
@@ -1204,7 +1222,10 @@ bool Election::standDown(int64_t nowNs, int64_t holdNs)
     // A withdrawn node never takes a (bounded) hold that would mask it: it
     // resigns instead (controlled shutdown owns that path).
     if (std::holds_alternative<Resigned>(candidacy_)) return false;
-    candidacy_ = StoodDown{nowNs + std::max<int64_t>(holdNs, 0), leadershipTermId_};
+    if (std::holds_alternative<AwaitingStorage>(candidacy_))   // the storage hold stays; the stand-down is remembered
+        candidacy_ = AwaitingStorage{nowNs + std::max<int64_t>(holdNs, 0), leadershipTermId_};
+    else
+        candidacy_ = StoodDown{nowNs + std::max<int64_t>(holdNs, 0), leadershipTermId_};
     ++standDowns_;
     for (const ClusterMember& m : clusterMembers_)
         if (m.id != thisMemberId_) publisher_.standDown(m.id, leadershipTermId_, thisMemberId_);
@@ -1218,7 +1239,21 @@ void Election::withdrawCandidacy() noexcept
 {
     // Any state → Resigned; a pending stand-down's StandDown keeps being re-sent.
     if (const auto* sd = std::get_if<StoodDown>(&candidacy_)) { candidacy_ = Resigned{sd->term}; return; }
+    if (const auto* as = std::get_if<AwaitingStorage>(&candidacy_)) { candidacy_ = Resigned{as->standDownTerm}; return; }
     if (!std::holds_alternative<Resigned>(candidacy_)) candidacy_ = Resigned{-1};
+}
+
+void Election::setStorageHold(bool hold, int64_t nowNs) noexcept
+{
+    if (hold) {
+        if (std::holds_alternative<Candidate>(candidacy_)) candidacy_ = AwaitingStorage{};
+        else if (const auto* sd = std::get_if<StoodDown>(&candidacy_)) candidacy_ = AwaitingStorage{sd->untilNs, sd->term};
+        return;   // Resigned / AwaitingStorage: no-op
+    }
+    if (const auto* as = std::get_if<AwaitingStorage>(&candidacy_)) {
+        if (as->standDownUntilNs > nowNs) candidacy_ = StoodDown{as->standDownUntilNs, as->standDownTerm};
+        else candidacy_ = Candidate{};
+    }
 }
 
 bool Election::candidacyBlocks_(int64_t nowNs, int workCount)
@@ -1228,6 +1263,7 @@ bool Election::candidacyBlocks_(int64_t nowNs, int workCount)
             for (const ClusterMember& m : clusterMembers_)
                 if (m.id != thisMemberId_) publisher_.standDown(m.id, term, thisMemberId_);
     };
+    if (std::holds_alternative<AwaitingStorage>(candidacy_)) return true;   // ISR v3: held, no StandDown resend
     if (const auto* r = std::get_if<Resigned>(&candidacy_)) {
         resend(r->term);
         return true;
@@ -1457,6 +1493,7 @@ void Election::onPreVoteRequest(int64_t nowNs, Term term, Term logLeadershipTerm
 {
     if (state_ == ElectionState::Init) return;
     if (candidateId == thisMemberId_ || memberById(candidateId) == nullptr) return;
+    if (abstains_()) return;   // ISR v3: see setAbstainGate
     // Non-binding: grant iff we WOULD vote for it at `term` and no live leader
     // holds us — and change nothing (no candidate term, no floor, no state).
     const bool grant = term > candidateTermId_ && term > followFloorTermId_ &&
@@ -1799,6 +1836,7 @@ void Election::placeVote(Term candidateTermId, NodeId candidateId, bool vote)
     // Election.java:1184: clusterMemberByIdMap.get(candidateId)
     ClusterMember* candidate = memberById(candidateId);
     if (candidate != nullptr) {
+        if (vote) ++votesGranted_;             // ISR v3 (votesGrantedForTest)
         publishCandidacyState_(candidateId);   // CRITICAL-R3: our knowledge with the vote
         // Election.java:1187-1194: consensusPublisher.placeVote(...)
         publisher_.placeVote(

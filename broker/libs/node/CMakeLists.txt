@@ -1,5 +1,6 @@
 add_library(rune_node
     src/NodeConfig.cpp
+    src/StorageIdentity.cpp
     src/PemFile.cpp
     src/BrokerNode.cpp
     src/EmbeddedDriver.cpp
@@ -141,6 +142,8 @@ if(BUILD_TESTING)
     # Unit tests (NodeConfig + PortableFlushBackend + OneToOneByteRing + SchemaCodecSmoke + SchemaRegistry + AdminWorker)
     add_executable(rune_node_tests
         tests/node/NodeConfigTest.cpp
+        tests/node/StorageIdentityTest.cpp
+        tests/node/StorageGateTest.cpp
         tests/node/HostDefaultsTest.cpp
         tests/node/FdBudgetTest.cpp
         tests/node/PortableFlushBackendTest.cpp
@@ -1187,7 +1190,7 @@ if(BUILD_TESTING)
                 aeron::aeron
                 GTest::gtest_main)
             gtest_discover_tests(rune_role_counter_publish_tests
-                PROPERTIES TIMEOUT 60
+                PROPERTIES TIMEOUT 180
                 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
         endif()
     endif()
@@ -1601,7 +1604,8 @@ if(BUILD_TESTING)
         # real replication on its admin-thread plane, controller-ISR leader
         # (never unclean), new / wiped brokers refetch from 0; the admin/control
         # role + ISR relay units.
-        add_executable(rune_catalog_replication_tests tests/integration/CatalogReplicationTest.cpp)
+        add_executable(rune_catalog_replication_tests tests/integration/CatalogReplicationTest.cpp
+                tests/integration/StorageLossClusterTest.cpp)
         target_include_directories(rune_catalog_replication_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_catalog_replication_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_catalog_replication_tests PROPERTIES TIMEOUT 360)

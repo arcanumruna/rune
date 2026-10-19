@@ -78,7 +78,10 @@ inline constexpr int64_t kStepNs   = 1'000'000LL;   // 1 ms per step
 inline constexpr int     kTopicId  = 7;
 inline constexpr int     kPartId   = 0;
 
-enum class CrashKind : uint8_t { ProcessKill, PowerLoss, PowerLossTorn };
+/// DiskLoss (ISR v3 Step 11): the process dies and the node's whole data dir is deleted; the restart takes a NEW
+/// storage id (a replaced disk), and - with DrConfig::modelStorageGate - the node's storage is unconfirmed until
+/// confirmStorage().
+enum class CrashKind : uint8_t { ProcessKill, PowerLoss, PowerLossTorn, DiskLoss };
 
 struct DrConfig {
     int     minIsr                  = 2;
@@ -104,6 +107,10 @@ struct DrConfig {
     /// any replica), leader-local ISR seeded with every replica, no lag shrink,
     /// consensus-dead members fenced out (see fenceDeadForInternal_).
     int32_t topicId                 = kTopicId;
+    /// ISR v3 Step 11: model the storage gate (harness documentation, not gate coverage): applyMetadata routes
+    /// holdLeadershipForStorage(epoch, partitionEpoch) to a node that leads while its storage is unconfirmed (a DiskLoss
+    /// restart, until confirmStorage()).  false = the pre-gate world: a wiped leader simply re-leads.
+    bool    modelStorageGate        = true;
 };
 
 // ---------------------------------------------------------------------------
@@ -164,6 +171,9 @@ struct DrNode {
     std::unique_ptr<InternalIsrKnowledge> isrKnowledge;
     bool                              up = false;
     uint32_t                          incarnation = 0;
+    /// ISR v3 Step 6: this node's storage id (a data dir's identity).  Assigned on the first open_; a restart keeps
+    /// it (same disk); a DiskLoss restart takes a fresh one (Step 11).
+    int64_t                           storageId = 0;
     /// The node's consensus terms (as its Election holds them): the highest
     /// candidate term seen (raised by ANY RequestVote, granted or denied), the
     /// highest term it GRANTED a vote in, and the term of the leader it
@@ -239,6 +249,14 @@ public:
         purge_(id);
         for (const auto& e : ext)
             if (e.syncedBytes > n.durableFloor[e.logPath]) n.durableFloor[e.logPath] = e.syncedBytes;
+        if (kind == CrashKind::DiskLoss) {
+            std::error_code ec;
+            for (auto& f : std::filesystem::directory_iterator(n.dir)) std::filesystem::remove_all(f.path(), ec);
+            n.durableFloor.clear();
+            n.storageId = 0;                    // the next open_ takes a fresh storage id: a replaced disk
+            storageConfirmed_[id] = false;
+            return;
+        }
         if (kind == CrashKind::ProcessKill) return;   // page cache survives
         for (auto& f : std::filesystem::directory_iterator(n.dir)) {
             if (f.path().extension() != ".log") continue;
@@ -268,11 +286,67 @@ public:
         DrNode& n = node(id);
         if (!n.up) return;
         if (heldMeta_.count(id) != 0) return;   // its metadata replica lags (holdMetadata): applied on release
-        if (meta_.leader == id) {
+        if (meta_.leader == id && cfg_.modelStorageGate && !storageConfirmed(id)) {
+            n.rep->holdLeadershipForStorage(meta_.epoch, cfg_.topicId >= 0 ? meta_.partitionEpoch : -1);
+        } else if (meta_.leader == id) {
             n.rep->becomeLeader(meta_.epoch, meta_.isr, cfg_.topicId >= 0 ? meta_.partitionEpoch : -1);
         } else if (meta_.leader >= 0) {
             n.rep->becomeFollower(meta_.epoch, meta_.leader);
         }
+    }
+
+    /// ISR v3 Step 11: the node's storage is confirmed (the gate opened); it may lead again.
+    [[nodiscard]] bool storageConfirmed(NodeId id) const {
+        const auto it = storageConfirmed_.find(id);
+        return it == storageConfirmed_.end() || it->second;
+    }
+    void confirmStorage(NodeId id) {
+        storageConfirmed_[id] = true;
+        applyMetadata(id);
+    }
+    /// The harness controller holds its decision on a below-committed report (the report is recorded and answered
+    /// only when the hold is released): lets a test observe the refusing follower before the failover.
+    void holdReportDecisions(bool hold) {
+        holdReports_ = hold;
+        if (!hold && !heldReport_.empty()) {
+            std::vector<AlterIsrMsg> r;
+            r.swap(heldReport_);
+            for (const auto& m : r) controllerAlterIsr_(m);
+        }
+    }
+    /// ISR v3 Step 11: every AlterIsr the harness controller received (appended on arrival), and how many of them were
+    /// from `from` with flag `flag` set in isr[1] on a leader-epoch-bump frame.
+    [[nodiscard]] int countAlterFlag(NodeId from, int32_t flag) const {
+        int n = 0;
+        for (const auto& m : alterLog_)
+            if (m.leaderId == from && m.isrCount == AlterIsrMsg::kLeaderEpochBump && (m.isr[1] & flag) != 0) ++n;
+        return n;
+    }
+    /// The bytes of the batches of node `id`'s log whose base offset is in [from, to).
+    std::vector<uint8_t> logBytes(NodeId id, Offset from, Offset to) {
+        std::vector<uint8_t> out;
+        DrNode& n = node(id);
+        if (!n.up) return out;
+        Offset at = std::max<Offset>(from, n.log->logStartOffset());
+        const Offset leo = n.log->logEndOffset();
+        for (int guard = 0; at < to && at < leo && guard < 100000; ++guard) {
+            const auto bytes = n.log->read(at, 1 << 20);
+            if (bytes.empty()) break;
+            std::size_t pos = 0;
+            Offset next = at;
+            while (pos + rune::protocol::batch::kRecordBatchOverhead <= bytes.size()) {
+                rune::protocol::RecordBatchReader r(bytes.data() + pos, bytes.size() - pos);
+                const int32_t total = r.totalLength();
+                if (total <= 0 || pos + static_cast<std::size_t>(total) > bytes.size()) break;
+                if (r.baseOffset() >= to) return out;
+                out.insert(out.end(), bytes.data() + pos, bytes.data() + pos + total);
+                next = r.baseOffset() + r.lastOffsetDelta() + 1;
+                pos += static_cast<std::size_t>(total);
+            }
+            if (next <= at) break;
+            at = next;
+        }
+        return out;
     }
 
     /// Controller failover: elect with the production FailoverElection over
@@ -411,6 +485,7 @@ public:
     uint64_t alterIsrIneligible() const noexcept { return alterIsrIneligible_; }
     uint64_t leaderEpochBumps() const noexcept { return leaderEpochBumps_; }
     uint64_t bumpFailovers() const noexcept { return bumpFailovers_; }
+    uint64_t lostCommittedFailovers() const noexcept { return lostCommittedFailovers_; }
 
 
     // ---------------------------------------------------------------- driving
@@ -449,6 +524,20 @@ public:
     void holdMetadata(NodeId id)    { heldMeta_.insert(id); }
     void releaseMetadata(NodeId id) { heldMeta_.erase(id); applyMetadata(id); }
     void dropNext(Kind k, int count) { dropNext_[static_cast<int>(k)] += count; }
+    void clearDropNext() { for (int& d : dropNext_) d = 0; }
+    /// The next frame of kind `k` is PARKED instead of queued (it is not lost); releaseHeld() re-queues every
+    /// parked frame for delivery on the next step.  Models one answer overtaken by a later send's commit.
+    void holdNext(Kind k) { holdNext_[static_cast<int>(k)] += 1; }
+    void releaseHeld() {
+        for (auto& f : held_) { f.due = step_ + 1; wire_.push_back(std::move(f)); }
+        held_.clear();
+    }
+    [[nodiscard]] std::size_t heldCountForTest() const noexcept { return held_.size(); }
+    /// The controller's eligibility of `n` for ISR ADMISSION (heartbeat/storage gate), independent of the wire:
+    /// an ineligible node is never added by an AlterIsr (the proposal is answered Ineligible).
+    void setControllerEligible(NodeId n, bool eligible) {
+        if (eligible) ineligible_.erase(n); else ineligible_.insert(n);
+    }
     uint64_t framesLost() const noexcept { return framesLost_; }
 
     // ---------------------------------------------------------------- produce
@@ -658,6 +747,7 @@ public:
         if (f.from >= 0 && f.from < 8) ++sent_[static_cast<std::size_t>(f.from)][k];
         if (dropNext_[k] > 0) { --dropNext_[k]; ++framesLost_; return true; }
         if (cut_.count({f.from, f.to}) != 0) { ++framesLost_; return true; }   // lost on the wire
+        if (holdNext_[k] > 0) { --holdNext_[k]; held_.push_back(std::move(f)); return true; }   // parked (holdNext)
         f.due = step_ + 1 + static_cast<uint64_t>(cfg_.deliveryDelaySteps);
         wire_.push_back(std::move(f));
         return true;
@@ -703,6 +793,8 @@ private:
         n.up = true;
         ++n.incarnation;
         n.rep->setProcessIncarnation(n.incarnation);   // KIP-903 (as ReplicaRegistry::add)
+        if (n.storageId == 0) n.storageId = ++storageSeq_;
+        n.rep->setStorageId(n.storageId);               // ISR v3 Step 6 (as ReplicaRegistry::add)
     }
 
     /// INTERNAL partition: NodeRuntimeAgent's Kafka broker fencing — the leader
@@ -749,13 +841,42 @@ private:
         return node(id).up && cut_.count({id, kControllerAddr}) == 0;
     }
     void controllerAlterIsr_(const AlterIsrMsg& m) {
+        alterLog_.push_back(m);   // ISR v3 Step 11: every frame the controller receives
         auto reply = [&](int16_t code) {
             Frame f; f.kind = Kind::AlterIsrResp; f.from = kControllerAddr; f.to = m.leaderId;
             f.alterResp.topicId = m.topicId; f.alterResp.partition = m.partition;
             f.alterResp.leaderId = m.leaderId; f.alterResp.leaderEpoch = m.leaderEpoch;
             f.alterResp.partitionEpoch = meta_.partitionEpoch; f.alterResp.errorCode = code;
+            f.alterResp.proposalId = m.proposalId; f.alterResp.sendSeq = m.sendSeq;
             (void)send(std::move(f));
         };
+        // ISR v3 Step 11 (MetadataService::onBelowCommittedReport_ + decideBumps_): a follower refused to truncate below the
+        // committed offset - the leader's log is below it.  The leader leaves the ISR and another live member leads;
+        // a report for a stale (leader, epoch) is answered Fenced.  No leader to fail over to: recorded, undecided.
+        if (m.isrCount == AlterIsrMsg::kLeaderEpochBump && (m.isr[1] & AlterIsrMsg::kBumpLeaderBelowCommitted) != 0) {
+            if (holdReports_) { heldReport_.push_back(m); return; }
+            if (meta_.leader >= 0 && meta_.leader != m.leaderId && meta_.epoch == m.leaderEpoch) {
+                const NodeId lost = meta_.leader;
+                NodeId other = -1;
+                for (NodeId n : meta_.isr)
+                    if (n != lost && liveToController_(n)) { other = n; break; }
+                reply(kAlterIsrOk);
+                if (other < 0) return;   // nobody else to lead: the partition stays as it is
+                std::vector<NodeId> isr{other};
+                for (NodeId n : meta_.isr) if (n != other && n != lost) isr.push_back(n);
+                meta_.leader = other;
+                meta_.isr    = std::move(isr);
+                ++meta_.epoch;
+                meta_.partitionEpoch = std::max<int32_t>(meta_.partitionEpoch + 1, static_cast<int32_t>(meta_.epoch));
+                ++bumpFailovers_;
+                ++lostCommittedFailovers_;
+                for (auto& n : nodes_)
+                    if (cut_.count({kControllerAddr, n.id}) == 0) applyMetadata(n.id);
+            } else {
+                reply(kAlterIsrFencedLeaderEpoch);
+            }
+            return;
+        }
         if (m.leaderId != meta_.leader || m.leaderEpoch != meta_.epoch) {
             reply(kAlterIsrFencedLeaderEpoch);
             return;
@@ -808,7 +929,7 @@ private:
         for (int i = 0; i < m.isrCount; ++i) {
             const NodeId n = m.isr[static_cast<std::size_t>(i)];
             const bool added = std::find(meta_.isr.begin(), meta_.isr.end(), n) == meta_.isr.end();
-            if (added && n != m.leaderId && !liveToController(n)) { dropped = true; continue; }
+            if (added && n != m.leaderId && (!liveToController(n) || ineligible_.count(n) != 0)) { dropped = true; continue; }
             isr.push_back(n);
         }
         if (std::find(isr.begin(), isr.end(), m.leaderId) == isr.end()) {
@@ -935,12 +1056,21 @@ private:
     std::string             root_;
     std::vector<NodeId>     replicas_;
     std::vector<DrNode>     nodes_;
+    std::map<NodeId, bool>  storageConfirmed_;       ///< ISR v3 Step 11: absent = confirmed
+    std::vector<AlterIsrMsg> alterLog_;              ///< ISR v3 Step 11
+    std::vector<AlterIsrMsg> heldReport_;            ///< holdReportDecisions
+    bool                    holdReports_ = false;
+    uint64_t                lostCommittedFailovers_ = 0;
+    int64_t                 storageSeq_ = 0;   // ISR v3 Step 6: the next storage id (see DrNode::storageId)
     Meta                    meta_;
     std::deque<Frame>       wire_;
     std::set<std::pair<NodeId, NodeId>> cut_;
     std::set<NodeId> heldMeta_;   ///< nodes whose metadata replica lags (holdMetadata)
     int forceInvalidRequest_ = 0;   ///< forceInvalidRequestNext: next n well-based proposals answered INVALID_REQUEST
     int                     dropNext_[kKinds] = {};
+    int                     holdNext_[kKinds] = {};   ///< holdNext: next n frames of a kind are parked
+    std::deque<Frame>       held_;                    ///< parked frames (releaseHeld re-queues them)
+    std::set<NodeId>        ineligible_;              ///< setControllerEligible(n, false)
     uint64_t                framesLost_ = 0;
     uint64_t                sent_[8][kKinds] = {};
     uint64_t                alterIsrCommitted_ = 0;

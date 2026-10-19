@@ -31,6 +31,9 @@
 #include <limits>
 #include <rune/gateway/SpillFifo.h>
 #include <rune/node/NodeConfig.h>
+#include <rune/node/StorageIdentity.h>
+#include <rune/node/StorageGate.h>
+#include <array>
 #include <rune/node/HostDefaults.h>
 #include <rune/consensus/ControlRing.h>   // Task 9: tlsReloadRing_ (SIGHUP trigger)
 #include <rune/node/EmbeddedDriver.h>
@@ -379,6 +382,12 @@ public:
                 // reported, never applied as a default Follower@0 role.
                 AdminRoleMsg m;
                 if (decodeAdminRole(p, n, m)) worker_.onCatalogRole(m);
+                else reportBadRoleFrame_(tid, n);
+                return;
+            }
+            if (tid == kMsgCatalogHoldLeadership) {   // ISR v3 Step 10: the catalog leader role was held
+                AdminRoleMsg m;
+                if (decodeAdminRole(p, n, m)) worker_.onCatalogHoldLeadership(m);
                 else reportBadRoleFrame_(tid, n);
                 return;
             }
@@ -1488,6 +1497,36 @@ public:
     }
     /// Test-only, CONTROL thread only: the consensus Election (nullptr when none).
     [[nodiscard]] const rune::consensus::Election* electionForTest() const noexcept { return election_.get(); }
+    // ISR v3 Step 9 test seams (the first two: call inside onControlThreadForTest).
+    /// The flags the next CanvassPosition carries (R12): 2 = valid, | 1 = this process has history; -1 = no publisher.
+    /// Test-only, CONTROL thread: does this node abstain from other candidates' ballots right now?
+    [[nodiscard]] int64_t foundingLongDwellNsForTest() const noexcept { return storageGate_ ? storageGate_->longDwellNs() : -1; }
+    [[nodiscard]] bool abstainsForTest() noexcept { return abstainGateThunk_(this); }
+    [[nodiscard]] int32_t canvassFlagsForTest() const noexcept { return publisher_ ? publisher_->canvassFlags() : -1; }
+    /// StorageGate::stateCode(): 0 CONFIRMED, 1 UNCONFIRMED, 2 UNDECIDED (0 on a single node).
+    [[nodiscard]] int storageGateStateForTest() const noexcept { return storageGate_ ? storageGate_->stateCode() : 0; }
+    /// Hold / release the candidacy regardless of the gate (posted to the control thread).
+    template <class = void>   // instantiated after onControlThreadForTest is defined
+    void setTestCandidacyHold(bool hold) {
+        (void)onControlThreadForTest([this, hold]() { if (runtimeAgent_) runtimeAgent_->setTestCandidacyHold(hold); return 0; });
+    }
+    /// ISR v3 Step 10: hold / release EVERY controller decision of this node (MetadataService::setHoldAllDecisionsForTest;
+    /// posted to the control thread).  Needs NodeConfig::testHoldAllControllerDecisionsMs > 0.
+    template <class = void>
+    void setControllerDecisionHoldForTest(bool on) {
+        (void)onControlThreadForTest([this, on]() { if (metadataService_) metadataService_->setHoldAllDecisionsForTest(on); return 0; });
+    }
+    /// The consensus leader (this node, if it is) resigns (posted to the control thread).
+    template <class = void>
+    void resignConsensusForTest() {
+        (void)onControlThreadForTest([this]() {
+            if (election_) (void)election_->resign(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+            return 0;
+        });
+    }
+    /// CP1-I1: the replication transport (control-thread state; read it through onControlThreadForTest).
+    [[nodiscard]] rune::replication::AeronPartitionTransport* replTransportForTest() const noexcept { return replTransport_.get(); }
 
     /// Test-only: true if the replication metadata bridge has propagated this
     /// node's leadership to its internal PartitionReplicas.  Read ON the control
@@ -1854,6 +1893,10 @@ private:
     // Configuration (immutable after construction)
     // -----------------------------------------------------------------------
     NodeConfig config_;
+    /// ISR design v3 §3.2 (Step 5): this data dir's storage identity, resolved in start() before anything
+    /// writes into the data dir.  Owned by the starting thread until the threads exist; later steps hand it
+    /// to its one owner (the storage gate).
+    StorageIdentity::Loaded storage_;
     /// E2 final fix wave (C1, USER DECISION option b): a transient partition's
     /// data lineage is COMMITTED METADATA (TransientLineageRecord) — the
     /// coordinator answers from the lineage confirmed for the partition's
@@ -1869,6 +1912,28 @@ private:
     void ensureProcessIncarnation_();
     static uint64_t transientLineageTrampoline_(void* ctx, int32_t topicId, int32_t partition) noexcept;
     static bool isTransientTopicTrampoline_(void* ctx, int32_t topicId) noexcept;
+    /// ISR v3 Step 6: the storage manifest markers.  Each runs once, on the control thread (cold fsync), when the
+    /// class first exists durably: the internal-ISR knowledge file / the first committed __cluster_metadata apply.
+    void markConsensusWhenPresent_();
+    bool    consensusUnmarked_ = true;          ///< the Consensus class is not in the manifest yet
+    int64_t lastConsensusMarkCheckNs_ = 0;
+    /// ISR v3 R17: may a claim over an EMPTY metadata log bootstrap a new one?  Read live at the claim edge (control
+    /// thread; storage_ is the one Loaded object): only a Founder whose manifest never recorded a metadata log.
+    static bool mayBootstrapThunk_(void* self) noexcept;
+    static void markKnowledgeThunk_(void* self) noexcept;
+    /// ISR v3 Step 9 (§3.6): the consensus vote gate - the storage gate first, then the metadata-ISR knowledge; with
+    /// RUNE_STORAGE_RECOVERY_VOTE an unconfirmed node votes for what its knowledge ever learned (critical log).
+    static bool voteGateThunk_(void* self, int32_t candidate) noexcept;
+    static bool abstainGateThunk_(void* self) noexcept;
+    [[nodiscard]] int64_t foundingShortDwellNs() const noexcept;
+    [[nodiscard]] int64_t foundingLongDwellNs() const noexcept;
+    void logRecoveryVote_(int32_t candidate) noexcept;
+    int publishStorageMetrics_() noexcept;
+    std::unique_ptr<StorageGate> storageGate_;   ///< multi-node only (null = open everywhere); control thread
+    bool    bootHistory_ = false;                ///< R12: node-state.dat / term.log held history at boot
+    int32_t lastRecoveryVoteCandidate_ = -1;
+    int64_t lastRecoveryVoteTerm_      = -1;
+    static void markMetadataLogThunk_(void* self) noexcept;
     static uint64_t transientLineageVersionTrampoline_(void* ctx) noexcept;   // R1 (round 5)
 
     // Task 9 (RUNE_TLS SIGHUP reload): the trigger-only cross-thread ring —
@@ -2111,6 +2176,9 @@ private:
     uint64_t         mtuRestoredEdges_     = 0;
     std::int64_t     linkMtuCounterRegId_  = -1;
     std::shared_ptr<aeron::Counter> linkMtuCounter_;
+    // ISR v3 §3.10: the storage counters (registered with the others, published by publishStorageMetrics_).
+    std::array<std::int64_t, 4>                    storageCounterRegIds_{-1, -1, -1, -1};
+    std::array<std::shared_ptr<aeron::Counter>, 4> storageCounters_{};
     std::function<int32_t()> mtuProbeForTest_;   ///< cold test seam (setMtuProbeForTest)
     std::function<void(HostNetFacts&)> hostFactsOverrideForTest_;   ///< cold test seam (B-M5)
     bool holdTransientLineageForTest_ = false;   ///< control thread only (holdTransientLineageForTest)

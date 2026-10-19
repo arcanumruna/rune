@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 # The Linux-only stage of the regression checkpoint (review B-I1, DR-bugs fix round 1; isolation: re-check I3).
 #
-#   scripts/run-linux-regression-vm.sh [jobs] [build-dir]
+#   scripts/run-linux-regression-vm.sh [jobs] [build-dir] [ctest-filter]
 #     jobs       default 3 (the VM has 4 cores, shared with k3s)
 #     build-dir  default build-fast (its CMakeCache names the sibling trees)
+#     ctest-filter  default empty.  ISR v3 Step 10 (CP2): a ctest -R regex.  When set, the stage also configures
+#                BUILD_INTEGRATION_TESTING=ON, builds rune_consensus_candidacy_tests, rune_client_broker_tests and
+#                rune_node_tests (exit 2, naming the target, when one does not exist) and runs
+#                `ctest -R <filter>` in a third container; its verdict joins the stage's.
 #
 # The Mac cannot build the Linux-only tests (UDP GSO / GRO, netns sysctls), so a checkpoint is green only with
 # this stage: the exact trees this build compiles are copied to the VM (k3s-node-01) and, inside the broker
@@ -28,7 +32,9 @@
 # Exit code = the stage's verdict.  The sanitizer checkpoint (build-asan / build-tsan, Mac) does not need this
 # stage: GSO is not sanitizer-relevant on the Mac (stub bindings).
 set -u
-J="${1:-3}"; B="${2:-build-fast}"
+J="${1:-3}"; B="${2:-build-fast}"; F="${3:-}"
+ITEG=OFF; XT=""
+if [ -n "$F" ]; then ITEG=ON; XT="rune_consensus_candidacy_tests rune_client_broker_tests rune_node_tests"; fi
 VM="${RUNE_LINUX_GATE_HOST:-root@178.104.16.102}"
 GD="${RUNE_LINUX_GATE_DIR:-/root/rune-linux-gate}"
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
@@ -73,10 +79,10 @@ DOCKER_BUILDKIT=1 docker build --platform linux/amd64 -f docker/Dockerfile --tar
     --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$J -t "$IMG" . > "$RUN/builder.log" 2>&1 \\
     || { echo "builder stage failed:"; tail -30 "$RUN/builder.log"; exit 2; }
 CFG='cmake -S /src/rune-broker -B /src/_build -G Ninja -DCMAKE_TOOLCHAIN_FILE=/build/conan-release/build/Release/generators/conan_toolchain.cmake \\
-  -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DBUILD_BENCHMARKS=OFF -DBUILD_INTEGRATION_TESTING=OFF \\
+  -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DBUILD_BENCHMARKS=OFF -DBUILD_INTEGRATION_TESTING=$ITEG \\
   -DRUNE_PROTOCOL_INCLUDE=/src/rune-protocol/include -DRUNE_CODEC_ROOT=/src/rune-codec -DRUNE_CRYPTO_ROOT=/src/rune-crypto \\
   -DRUNE_FR_DIR=/src/rune-fr -DRUNE_CLIENT_ROOT=/src/rune-client-cpp -DRUNE_QL_ROOT=/src/rune-ql -DRUNE_TLS=ON > /src/cmake.log 2>&1'
-docker run --rm --name "rune-linux-gate-build-$RID" -v "$RUN:/src" "$IMG" bash -c "\$CFG && cmake --build /src/_build -j$J --target rune_udp_gso_tests rune_catalog_replication_tests > /src/ninja.log 2>&1" \\
+docker run --rm --name "rune-linux-gate-build-$RID" -v "$RUN:/src" "$IMG" bash -c "\$CFG && for t in $XT; do ninja -C /src/_build -t targets all | grep -q \"^\\\$t:\" || { echo \"missing target \\\$t (the ctest filter needs it)\" >&2; exit 2; }; done && cmake --build /src/_build -j$J --target rune_udp_gso_tests rune_catalog_replication_tests $XT > /src/ninja.log 2>&1" \\
     || { echo "build failed:"; tail -20 "$RUN/cmake.log" "$RUN/ninja.log"; exit 2; }
 echo "== linux-only (CAP_NET_ADMIN, RUNE_LINUX_GATE=1)"
 docker run --rm --name "rune-linux-gate-run-$RID" --cap-add NET_ADMIN --shm-size=1g -e RUNE_LINUX_GATE=1 -v "$RUN:/src" "$IMG" \\
@@ -85,6 +91,12 @@ echo "== bind order (netns ip_local_port_range 45000-45039, RUNE_BIND_ORDER_GATE
 docker run --rm --name "rune-linux-gate-bind-$RID" --sysctl net.ipv4.ip_local_port_range="45000 45039" --shm-size=1g \\
     -e RUNE_BIND_ORDER_GATE=1 -v "$RUN:/src" "$IMG" \\
     bash -c "/src/_build/libs/node/rune_catalog_replication_tests --gtest_filter='BindOrderRegression.FixedPortsBindBeforeAnyEphemeralPublicationRegression'"; rc2=\$?
+rcF=0
+if [ -n "$F" ]; then
+    echo "== ctest -R '$F' (--shm-size=1g)"
+    docker run --rm --name "rune-linux-gate-filter-$RID" --shm-size=1g -v "$RUN:/src" "$IMG" \\
+        bash -c "ctest --test-dir /src/_build -R '$F' --output-on-failure"; rcF=\$?
+fi
 rc3=0
 if [ "${RUNE_LINUX_GATE_SELFTEST:-0}" = "1" ]; then
     echo "== selftest: linux-stage-c.sh, --privileged (expect 0)"
@@ -96,14 +108,14 @@ if [ "${RUNE_LINUX_GATE_SELFTEST:-0}" = "1" ]; then
     echo "== selftest: privileged rc \$p, unprivileged rc \$u"
     [ "\$p" -eq 0 ] && [ "\$u" -eq 3 ] || rc3=1
 fi
-echo "== linux stage ($RID): linux-only rc \$rc1, bind-order rc \$rc2\$([ "${RUNE_LINUX_GATE_SELFTEST:-0}" = 1 ] && echo ", selftest rc \$rc3")"
+echo "== linux stage ($RID): linux-only rc \$rc1, bind-order rc \$rc2\$([ -n "$F" ] && echo ", filter rc \$rcF")\$([ "${RUNE_LINUX_GATE_SELFTEST:-0}" = 1 ] && echo ", selftest rc \$rc3")"
 rc4=0
 if [ -f "$RUN/meta/extra.sh" ]; then
     echo "== extra: RUNE_LINUX_GATE_EXTRA (RUN, IMG, RID, J exported)"
     RUN="$RUN" IMG="$IMG" RID="$RID" J="$J" bash "$RUN/meta/extra.sh"; rc4=\$?
     echo "== extra rc \$rc4"
 fi
-[ "\$rc1" -eq 0 ] && [ "\$rc2" -eq 0 ] && [ "\$rc3" -eq 0 ] && [ "\$rc4" -eq 0 ]
+[ "\$rc1" -eq 0 ] && [ "\$rc2" -eq 0 ] && [ "\${rcF:-0}" -eq 0 ] && [ "\$rc3" -eq 0 ] && [ "\$rc4" -eq 0 ]
 REMOTE
 if [ -n "${RUNE_LINUX_GATE_EXTRA:-}" ]; then
     cp "$RUNE_LINUX_GATE_EXTRA" "$STAGE/meta/extra.sh" || exit 2

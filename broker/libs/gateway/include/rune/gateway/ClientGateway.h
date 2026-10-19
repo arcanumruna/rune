@@ -595,6 +595,8 @@ public:
     //
     // Called from BrokerNode::buildWorkerPool() for each user-partition log
     // before runners start (single-threaded startup, no race).
+    // CP1-I4: this set no longer decides who reads a log (gatewayOwnsLog_ uses routesToWorker_); it only backs
+    // flushDirtyLogs() as defence in depth (dirtyLogs_ is filled only by gateway appends).
     // flushDirtyLogs() skips any log in this set, so the gateway never calls
     // Log::sync on a log the worker is appending to (R7 closed).
     // Internal partitions (topicId < 0) must NOT be registered here.
@@ -603,13 +605,13 @@ public:
         if (log) workerOwnedLogs_.insert(log);
     }
     [[nodiscard]] std::size_t workerOwnedLogCountForTest() const noexcept { return workerOwnedLogs_.size(); }
-    /// Sanitizer triage T2 (2026-10-14): true iff `log` is read on THIS (gateway)
-    /// thread — not registered as worker-owned.  A worker-owned Log's LEO /
-    /// segment map belong to its worker and are never read here.
-    [[nodiscard]] bool gatewayOwnsLog_(const rune::storage::Log* log) const noexcept {
-        return log != nullptr &&
-               (workerOwnedLogs_.empty() ||
-                workerOwnedLogs_.count(const_cast<rune::storage::Log*>(log)) == 0);
+    /// T2 + CP1-I4: true iff `log` is read on THIS (gateway) thread.  Decided by the ROUTING predicate (who
+    /// appends), never by a registration set: topics created by DDL at runtime were never registered in
+    /// workerOwnedLogs_, so a set-based answer called a worker-appended log gateway-owned and the gateway read
+    /// its LEO and segment map (a data race; a wrong log start skips records for an Earliest subscriber).  A
+    /// worker-owned Log's LEO / segment map belong to its worker and are never read here.
+    [[nodiscard]] bool gatewayOwnsLog_(int32_t topicId, const rune::storage::Log* log) const noexcept {
+        return log != nullptr && !routesToWorker_(topicId);
     }
 
     // -----------------------------------------------------------------------

@@ -99,10 +99,11 @@ void ConsensusAgent::onCanvassPosition(
     int64_t logPosition,
     Term    leadershipTermId,
     NodeId  followerMemberId,
-    int32_t /*protocolVersion*/)
+    int32_t protocolVersion)
 {
+    // ISR v3 R12: the field carries the sender's founding-evidence flags (bit 1 valid, bit 0 history).
     election_.onCanvassPosition(logLeadershipTermId, logPosition,
-                                leadershipTermId, followerMemberId);
+                                leadershipTermId, followerMemberId, protocolVersion);
     (void)nowNs; // Election::onCanvassPosition doesn't take nowNs
 }
 

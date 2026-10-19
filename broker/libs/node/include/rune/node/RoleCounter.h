@@ -144,6 +144,19 @@ inline constexpr std::int32_t kLinkMtuDeficitCounterTypeId = 1'000'221;
 inline std::string linkMtuDeficitLabel(std::int32_t nodeId) {
     return "rune_link_mtu_deficit node=" + std::to_string(nodeId);
 }
+/// ISR v3 §3.10 (B-I4): the storage gate and the controller's storage tracking.  Control thread only.
+///   1'000'222  storage gate state: 0 CONFIRMED, 1 UNCONFIRMED, 2 UNDECIDED (0 on a single node)
+///   1'000'223  leader roles held (routed as held, not led) by the closed gate: the bridge's monotonic count
+///   1'000'224  nodes whose storage is pending on the READY controller (storageRegs_.size()), else 0
+///   1'000'225  below-committed (lost committed) reports the controller received
+inline constexpr std::int32_t kStorageGateStateCounterTypeId      = 1'000'222;
+inline constexpr std::int32_t kLeaderRolesHeldCounterTypeId       = 1'000'223;
+inline constexpr std::int32_t kStoragePendingNodesCounterTypeId   = 1'000'224;
+inline constexpr std::int32_t kLostCommittedReportsCounterTypeId  = 1'000'225;
+inline std::string storageGateStateLabel(std::int32_t nodeId) { return "rune-storage-gate-state node=" + std::to_string(nodeId); }
+inline std::string leaderRolesHeldLabel(std::int32_t nodeId) { return "rune-leader-roles-held node=" + std::to_string(nodeId); }
+inline std::string storagePendingNodesLabel(std::int32_t nodeId) { return "rune-storage-pending-nodes node=" + std::to_string(nodeId); }
+inline std::string lostCommittedReportsLabel(std::int32_t nodeId) { return "rune-lost-committed-reports node=" + std::to_string(nodeId); }
 inline std::string catalogAppliedOffsetLabel(std::int32_t nodeId) {
     return "rune-catalog-applied-offset node=" + std::to_string(nodeId);
 }

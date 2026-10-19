@@ -1434,3 +1434,68 @@ TEST(MetadataStateMachineRegression, RemoveTopicPlacementAppliesInLogOrderWithAs
     (void)rec.encode(rb, sizeof rb);
     EXPECT_FALSE(RemoveTopicPlacementRecord::decode(rb, rn).has_value()) << "internal ids are never removed";
 }
+
+// ISR v3 Step 7: a NodeStorageRecord installs at COMMIT (never at apply), and a rebuilt MSM (clear + re-apply +
+// commit) reaches the same value.  RED: install at apply.
+TEST(MetadataStateMachineRegression, NodeStorageRecordCommitsOnlyAtTheHwAndRebuildsRegression) {
+    uint8_t rb[32];
+    NodeStorageRecord rec;
+    rec.node = 3; rec.storageId = 0xB;
+    const std::size_t rn = rec.encode(rb, sizeof rb);
+    ASSERT_EQ(rn, NodeStorageRecord::ENCODED_SIZE);
+    MetadataStateMachine msm;
+    msm.apply(rb, rn, 5);
+    EXPECT_EQ(msm.nodeStorage(3), 0) << "installed at apply, before the HW passed it";
+    const uint64_t v0 = msm.committedVersion();
+    msm.commit(6);
+    EXPECT_EQ(msm.nodeStorage(3), 0xB);
+    EXPECT_GT(msm.committedVersion(), v0) << "an install bumps the committed version";
+    MetadataStateMachine again;      // clear + re-apply + commit
+    again.apply(rb, rn, 5);
+    again.commit(6);
+    EXPECT_EQ(again.nodeStorage(3), 0xB);
+    EXPECT_EQ(again.nodeStorage(4), 0);
+    // A later record for the same node replaces it.
+    rec.storageId = 0xC;
+    const std::size_t rn2 = rec.encode(rb, sizeof rb);
+    again.apply(rb, rn2, 7);
+    again.commit(7);
+    EXPECT_EQ(again.nodeStorage(3), 0xC);
+}
+
+// ISR v3 Step 7: the trailer of a NO_LEADER record carries kind 3.  RED: the old trailer decode (kind -> None).
+TEST(MetadataStateMachineRegression, StorageResetMarkRoundTripsRegression) {
+    auto [b, n] = encodeUpdate({5, 0, NO_LEADER, {}, {1, 2, 3}, 4, 6});
+    LeaderlessMark m;
+    m.kind = LeaderlessMark::Kind::StorageReset; m.node = 3; m.incarnation = 0xB;
+    const std::size_t t = leaderless_trailer::encode(b.data() + n, b.size() - n, m);
+    ASSERT_EQ(t, leaderless_trailer::kSize);
+    MetadataStateMachine msm;
+    msm.apply(b.data(), n + t, 0);
+    msm.commit(0);
+    const PartitionAssignment* pa = msm.assignment(5, 0);
+    ASSERT_NE(pa, nullptr);
+    EXPECT_EQ(pa->mark.kind, LeaderlessMark::Kind::StorageReset);
+    EXPECT_EQ(pa->mark.node, 3);
+    EXPECT_EQ(pa->mark.incarnation, 0xB);
+}
+
+// ISR v3 Step 7 (R9): a ControllerTermRecord is applied as a no-op.  RED: route it to the assignment decode
+// (lossCount grows).
+TEST(MetadataStateMachineRegression, ControllerTermRecordIsANoOpRegression) {
+    MetadataStateMachine msm;
+    auto [b0, n0] = encodeUpdate({5, 0, 1, {1}, {1}, 1, 1});
+    msm.apply(b0.data(), n0, 0);
+    msm.commit(0);
+    const uint64_t v = msm.committedVersion();
+    const uint64_t loss = msm.lossCount();
+    uint8_t rb[16];
+    ControllerTermRecord rec; rec.term = 7;
+    const std::size_t rn = rec.encode(rb, sizeof rb);
+    ASSERT_EQ(rn, ControllerTermRecord::ENCODED_SIZE);
+    msm.apply(rb, rn, 1);
+    msm.commit(1);
+    EXPECT_EQ(msm.committedVersion(), v);
+    EXPECT_EQ(msm.lossCount(), loss);
+    EXPECT_EQ(ControllerTermRecord::decode(rb, rn)->term, 7);
+}

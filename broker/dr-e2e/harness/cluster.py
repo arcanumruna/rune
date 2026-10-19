@@ -169,6 +169,38 @@ _LEADER_RE = re.compile(r"node (\d+) is LEADER")
 # rune_role prints:  ROLE nodeId=<n> role=<LEADER|FOLLOWER|CANDIDATE|NONE> term=<t>
 _ROLE_RE = re.compile(r"ROLE nodeId=(-?\d+) role=(\w+) term=(-?\d+)")
 
+# ... and (ISR v3) a second line:
+#   STORAGE nodeId=<n> state=<CONFIRMED|UNCONFIRMED|UNDECIDED|UNKNOWN> heldLeaderRoles=<n> pendingNodes=<n> \
+#           outOfSync=<n> lostCommittedReports=<n>        (-1 = that counter is absent)
+_STORAGE_RE = re.compile(
+    r"STORAGE nodeId=(-?\d+) state=(\w+) heldLeaderRoles=(-?\d+) pendingNodes=(-?\d+) "
+    r"outOfSync=(-?\d+) lostCommittedReports=(-?\d+)")
+
+
+def parse_rune_role_storage(out: str) -> dict | None:
+    """Parse rune_role's STORAGE line (None when the line is absent: an image that predates the storage gate)."""
+    m = _STORAGE_RE.search(out or "")
+    if not m:
+        return None
+    return {
+        "node_id": int(m.group(1)),
+        "state": m.group(2),
+        "held_leader_roles": int(m.group(3)),
+        "pending_nodes": int(m.group(4)),
+        "out_of_sync": int(m.group(5)),
+        "lost_committed_reports": int(m.group(6)),
+    }
+
+
+BOOT_LINE = "storage: dataDir="   # logged once per broker process, before anything else touches the data dir
+
+
+def slice_since_last_boot(text: str) -> str:
+    """The part of a (possibly multi-process) container log written by the LAST broker process: from the last boot line
+    on.  A restarted container keeps its old process's lines, so an order check on the whole log would see them."""
+    i = (text or "").rfind(BOOT_LINE)
+    return text[i:] if i >= 0 else ""
+
 
 def node_id_to_service(node_id: int) -> str:
     if node_id not in (0, 1, 2):
@@ -217,6 +249,7 @@ class Cluster:
         _env_tag = os.environ.get("RUNE_IMAGE_TAG")
         _sha = _env_tag or _git_sha(BROKER_REPO)   # review B-M6: "<sha>-dirty" for a dirty tree (never HEAD's tag)
         print(f"[harness] broker image tag {_sha} ({'RUNE_IMAGE_TAG' if _env_tag else 'git HEAD'})", flush=True)
+        self._image_sha = _sha   # broker_image(): the image `storage format` runs from (faults.format_storage)
         # RUNE_DR_COMPOSE_OVERRIDES: global overlays (e.g. docker/docker-compose.shard.yml)
         # that run the whole matrix in a mode.  They go FIRST so a test's own
         # override_files still win, and default-config baseline arms opt out entirely
@@ -228,6 +261,10 @@ class Cluster:
                                image_tag=_sha)
         self._up = False
         self._serving_cache: str | None = None
+
+    def broker_image(self) -> str:
+        """The broker image this cluster runs (``rune-broker-node:<sha>``, the compose image_tag)."""
+        return f"rune-broker-node:{self._image_sha}"
 
     # ---- lifecycle --------------------------------------------------------
 
@@ -382,6 +419,35 @@ class Cluster:
         node_id = int(m.group(1))
         term = int(m.group(3))
         return role, node_id, term
+
+    def read_storage(self, service: str) -> dict | None:
+        """The storage gate of one node (``rune_role``'s STORAGE line, see `parse_rune_role_storage`), or None when the
+        container is down, rune_role is absent, or the counters are not allocated yet (callers poll)."""
+        try:
+            res = run(["docker", "exec", self.container_name(service), "rune_role"], timeout=5)
+        except Exception:
+            return None
+        return parse_rune_role_storage(res.stdout or "")
+
+    def ql(self, script: str, *, seed_service: str | None = None, request_id: str | None = None,
+           timeout: int = 60) -> "CmdResult":
+        """Run a Rune QL script (DDL or a read such as ``show history;``) through the `rune ql` CLI container on the
+        cluster network against ``seed_service`` (default rune-1).  One shot, no retry: the caller asserts on
+        ``.ok`` / ``.stdout``.  ``request_id`` (32 hex) makes a DDL script idempotent across a re-run."""
+        ensure_ql_image()
+        seed = f"{seed_service or SERVICES[0]}:{CLIENT_PORT}"
+        rid = f" --request-id {request_id}" if request_id else ""
+        return run(
+            ["docker", "run", "--rm", "--network", self.compose.network_name(), "--shm-size=256m",
+             "--security-opt", "seccomp=unconfined", "--platform", "linux/amd64",
+             "-e", f"RQL={script}", ql_image(),
+             "bash", "-c",
+             f'printf "%s" "$RQL" > /tmp/s.rql && exec rune ql -f /tmp/s.rql{rid} --broker {seed}'],
+            timeout=timeout)
+
+    def logs_since_last_boot(self, service: str) -> str:
+        """The container's log from the last broker process's boot line on (see `slice_since_last_boot`)."""
+        return slice_since_last_boot(self.compose.logs(service, timeout=60))
 
     def container_name(self, service: str) -> str:
         """Compose v2's container name for a service of this project (no container_name/scale in the compose file)."""

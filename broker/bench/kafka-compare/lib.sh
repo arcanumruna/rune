@@ -98,7 +98,7 @@ rune_start_broker() {
   pkill -9 -f "$RUNE_BROKER_BIN" 2>/dev/null; sleep 0.4
   log "rune broker: workers=$workers topics='$topics' io=$io"
   # shellcheck disable=SC2086
-  env RUNE_NODE_ID=1 RUNE_PEERS="1@127.0.0.1:${RUNE_CONSENSUS_PORT}:${RUNE_CLIENT_PORT}" \
+  env RUNE_NODE_ID=1 RUNE_STORAGE_FORMAT=new RUNE_PEERS="1@127.0.0.1:${RUNE_CONSENSUS_PORT}:${RUNE_CLIENT_PORT}" \
       RUNE_CLIENT_ENDPOINT="0.0.0.0:${RUNE_CLIENT_PORT}" \
       RUNE_DATA_DIR="$logdir" RUNE_AERON_DIR="$d/a" RUNE_WORKERS="$workers" \
       RUNE_PER_WORKER_INGRESS=true RUNE_PER_WORKER_EGRESS=true \

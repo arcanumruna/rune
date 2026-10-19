@@ -877,6 +877,8 @@ TEST(CompactionRetentionSmoke, InternalTopic_Recovery_CompactedLog) {
 
     // The BrokerNode creates the offset log at dataDir/__consumer_offsets/.
     const fs::path offsetDir = tmp.path / "__consumer_offsets";
+    // ISR design v3 Step 5: format before seeding (seeded state alone is a partly deleted legacy dir, R-3).
+    rune::node::test::formatFounderForTest(tmp.path);
     std::error_code ec;
     fs::create_directories(offsetDir, ec);
     const std::string offsetLogDir = offsetDir.string();

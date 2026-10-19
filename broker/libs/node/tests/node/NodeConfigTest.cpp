@@ -647,6 +647,21 @@ TEST(NodeConfigTest, ConsensusChannelUnaffectedByClientPort) {
     EXPECT_EQ(r.config->peers[2].consensusChannel(), "aeron:udp?endpoint=rune-3:40111");
 }
 
+// CP3 I4: RUNE_BROKER_LIVENESS_TIMEOUT_MS — default 0 (the agent uses 3 x the leader-heartbeat timeout); a positive value
+// is carried; garbage is refused.  RED: ignore the variable.
+TEST(NodeConfigRegression, BrokerLivenessTimeoutEnvIsParsedRegression) {
+    auto r = parseNodeConfig(fakeEnv(base1node()));
+    ASSERT_TRUE(r.error.empty()) << r.error;
+    EXPECT_EQ(r.config->brokerLivenessTimeoutMs, 0);
+    auto env = base1node();
+    env["RUNE_BROKER_LIVENESS_TIMEOUT_MS"] = "60000";
+    auto r2 = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r2.error.empty()) << r2.error;
+    EXPECT_EQ(r2.config->brokerLivenessTimeoutMs, 60000);
+    env["RUNE_BROKER_LIVENESS_TIMEOUT_MS"] = "soon";
+    EXPECT_FALSE(parseNodeConfig(fakeEnv(env)).error.empty());
+}
+
 // ---------------------------------------------------------------------------
 // M1: gatewayMinIsr — majority default + RUNE_MIN_ISR env override
 // ---------------------------------------------------------------------------
@@ -2493,3 +2508,54 @@ TEST(NodeConfigRegression, UnsetRuneTopicsBootsWithNoTopicsFieldRegression) {
     EXPECT_TRUE(r.warnings.empty());
 }
 }  // namespace rune::node
+
+// ---------------------------------------------------------------------------
+// ISR design v3 §3.2 (Step 5): RUNE_STORAGE_FORMAT.  The env default is Required (an empty data dir refuses
+// to start); new / join / auto map; anything else — TestFounder included — is the R-6 configuration error.
+// The in-process struct default is TestFounder (rigs only).  RED: env default Auto.
+// ---------------------------------------------------------------------------
+namespace rune::node {
+
+TEST(NodeConfigRegression, StorageFormatEnvDefaultsToRequiredRegression) {
+    {
+        auto r = parseNodeConfig(fakeEnv(base3node()));
+        ASSERT_TRUE(r.config.has_value()) << r.error;
+        EXPECT_EQ(r.config->storageFormat, StorageFormat::Required) << "unset must never format";
+        EXPECT_FALSE(r.config->storageRecoveryVote);
+    }
+    {
+        auto env = base3node();
+        env["RUNE_STORAGE_FORMAT"] = "";
+        auto r = parseNodeConfig(fakeEnv(env));
+        ASSERT_TRUE(r.config.has_value()) << r.error;
+        EXPECT_EQ(r.config->storageFormat, StorageFormat::Required);
+    }
+    const std::pair<const char*, StorageFormat> ok[] = {
+        {"new", StorageFormat::New}, {"join", StorageFormat::Join}, {"auto", StorageFormat::Auto}};
+    for (const auto& [v, want] : ok) {
+        auto env = base1node();
+        env["RUNE_STORAGE_FORMAT"] = v;
+        auto r = parseNodeConfig(fakeEnv(env));
+        ASSERT_TRUE(r.config.has_value()) << v << ": " << r.error;
+        EXPECT_EQ(r.config->storageFormat, want) << v;
+    }
+    for (const char* bad : {"xyz", "testfounder", "TestFounder", "NEW"}) {
+        auto env = base3node();
+        env["RUNE_STORAGE_FORMAT"] = bad;
+        auto r = parseNodeConfig(fakeEnv(env));
+        EXPECT_FALSE(r.config.has_value()) << bad << " must be refused";
+        EXPECT_EQ(r.error, std::string("RUNE_STORAGE_FORMAT='") + bad +
+                               "' is not one of new, join, auto\n(unset = never format an empty data dir)");
+    }
+    for (const char* on : {"1", "true", "TRUE"}) {
+        auto env = base3node();
+        env["RUNE_STORAGE_RECOVERY_VOTE"] = on;
+        auto r = parseNodeConfig(fakeEnv(env));
+        ASSERT_TRUE(r.config.has_value()) << r.error;
+        EXPECT_TRUE(r.config->storageRecoveryVote) << on;
+    }
+    EXPECT_FALSE(parseStorageFormat("testfounder").has_value());
+    EXPECT_EQ(NodeConfig{}.storageFormat, StorageFormat::TestFounder) << "the in-process (rig) default";
+}
+
+} // namespace rune::node

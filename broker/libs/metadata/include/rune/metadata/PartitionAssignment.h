@@ -35,6 +35,7 @@ struct LeaderlessMark {
         None              = 0,
         EmptyMemoryLeader = 1,   ///< `node`, the memory-backed sole-ISR leader, restarted EMPTY
         LogDirOffline     = 2,   ///< `node`'s log dir is offline (until a new incarnation)
+        StorageReset      = 3,   ///< ISR v3 (level >= 2): `node`'s STORAGE was replaced; the partition stays offline without it
     };
     Kind    kind        = Kind::None;
     int32_t node        = -1;

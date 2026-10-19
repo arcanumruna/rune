@@ -369,7 +369,8 @@ endif()
 # (spawn rune_broker, kill(pid, SIGINT/SIGTERM), expect a clean exit 0).
 if(BUILD_TESTING)
     find_package(GTest REQUIRED)
-    add_executable(rune_broker_process_tests tests/process/BrokerProcessSignalTest.cpp)
+    add_executable(rune_broker_process_tests tests/process/BrokerProcessSignalTest.cpp
+                                          tests/process/StorageFormatProcessTest.cpp)
     target_link_libraries(rune_broker_process_tests PRIVATE GTest::gtest_main)
     target_include_directories(rune_broker_process_tests PRIVATE ${CMAKE_SOURCE_DIR}/libs/aeronutil/include)
     target_compile_definitions(rune_broker_process_tests PRIVATE

@@ -36,6 +36,12 @@ public:
     /// (monotonic per node, bumped on every start — BrokerNode), stamped on
     /// every replica added from now on.  Set before the first add().
     void setProcessIncarnation(int64_t inc) noexcept { processIncarnation_ = inc; }
+    /// ISR v3 Step 6: this node's storage id (storage.meta), stamped on every replica added from now on.
+    void setStorageId(int64_t id) noexcept { storageId_ = id; }
+    /// TEST ONLY (NodeConfig::testHoldFollowerFetchesMs): every replica added from now on emits no follower fetch
+    /// until the steady clock reaches `deadlineNs`.
+    void setHoldFetchesUntilForTest(int64_t deadlineNs) noexcept { holdFetchesUntilNs_ = deadlineNs; }
+    void setDropInternalIsrUntilForTest(int64_t deadlineNs) noexcept { dropInternalIsrUntilNs_ = deadlineNs; }
     /// E2 C1 residual N1: the node-control process identity (see
     /// PartitionReplica::setLineageIdentity) stamped on every replica added.
     void setLineageIdentity(int64_t id) noexcept { lineageIdentity_ = id; }
@@ -61,6 +67,9 @@ public:
         // KIP-903: every replica of this process stamps the node's process
         // incarnation on its FetchRequests (0 = untracked: unit rigs).
         if (processIncarnation_ != 0) replica->setProcessIncarnation(processIncarnation_);
+        if (storageId_ != 0) replica->setStorageId(storageId_);   // ISR v3 Step 6
+        if (holdFetchesUntilNs_ != 0) replica->holdFetchesUntilForTest(holdFetchesUntilNs_);
+        if (dropInternalIsrUntilNs_ != 0) replica->dropInternalIsrUntilForTest(dropInternalIsrUntilNs_);
         if (lineageIdentity_ != 0) replica->setLineageIdentity(lineageIdentity_);   // E2 C1 residual N1
         // MAJOR-2/3: internal replicas commit ISR changes on a majority's
         // durable knowledge (this node's store).
@@ -298,6 +307,9 @@ private:
     std::vector<Retired>  retired_;
     std::vector<uint32_t> freeIds_;
     int64_t processIncarnation_ = 0;   ///< KIP-903 (see setProcessIncarnation)
+    int64_t storageId_ = 0;            ///< ISR v3 Step 6 (see setStorageId)
+    int64_t dropInternalIsrUntilNs_ = 0;   ///< test seam (see setDropInternalIsrUntilForTest)
+    int64_t holdFetchesUntilNs_ = 0;   ///< test seam (see setHoldFetchesUntilForTest)
     int64_t lineageIdentity_    = 0;   ///< E2 C1 residual N1
     rune::replication::InternalIsrKnowledge* internalIsrKnowledge_ = nullptr;   ///< MAJOR-2/3
     uint32_t              nextId_          = 1;   // 0 = unregistered (not gated)

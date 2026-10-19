@@ -11,11 +11,15 @@
 #include <rune/node/BrokerNode.h>
 #include <rune/node/CatalogPartition.h>
 #include <rune/node/NodeConfig.h>
+#include <rune/node/StorageIdentity.h>
+
+#include <gtest/gtest.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/Log.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -196,6 +200,7 @@ struct ThreeNodes {
     void startNode(int id) {
         NodeConfig cfg = makeConfig(id, dirs[static_cast<std::size_t>(id - 1)]->path, ports, 3, mode);
         if (configTweak) configTweak(cfg);
+        if (const auto f = storageFormatFor_[static_cast<std::size_t>(id - 1)]) cfg.storageFormat = *f;   // wipeRaw
         nodes[static_cast<std::size_t>(id - 1)] = std::make_unique<BrokerNode>(cfg);
         if (beforeStart) beforeStart(id, *nodes[static_cast<std::size_t>(id - 1)]);
         nodes[static_cast<std::size_t>(id - 1)]->start();
@@ -204,12 +209,42 @@ struct ThreeNodes {
         auto& n = nodes[static_cast<std::size_t>(id - 1)];
         if (n) { n->stop(); n.reset(); }
     }
+    /// A lost disk replaced the production way (ISR design v3 Step 5): the contents go, then the operator's
+    /// `rune_broker storage format --join` — the node restarts as a Joiner (the in-process TestFounder default
+    /// would otherwise re-found the empty dir).
     void wipe(int id) {
+        removeContents_(id);
+        storageFormatFor_[static_cast<std::size_t>(id - 1)].reset();   // CP1 M7: a prior wipeRaw override must not outlive this wipe
+        formatJoin(id);
+    }
+    [[nodiscard]] bool hasStorageFormatOverrideForTest(int id) const {
+        return storageFormatFor_[static_cast<std::size_t>(id - 1)].has_value();
+    }
+    void formatJoin(int id) {
+        ASSERT_EQ(rune::node::StorageIdentity::format(dirs[static_cast<std::size_t>(id - 1)]->path.string(),
+                                                      rune::node::StorageIdentity::Origin::Joiner,
+                                                      rune::node::StorageIdentity::Mode::None, false).code, 0);
+    }
+    /// The contents only, no storage.meta (v3-check V3-I1): the node restarts with format `f` (Auto / New /
+    /// Required).  TestFounder is refused: it would re-found a wiped node, a state production cannot reach.
+    void wipeRaw(int id, rune::node::StorageFormat f) {
+        if (f == rune::node::StorageFormat::TestFounder) {
+            ADD_FAILURE() << "a raw-wiped node must restart Auto/New/Required: TestFounder would re-found it";
+            return;
+        }
+        removeContents_(id);
+        storageFormatFor_[static_cast<std::size_t>(id - 1)] = f;
+    }
+    BrokerNode& node(int id) { return *nodes[static_cast<std::size_t>(id - 1)]; }
+private:
+    void removeContents_(int id) {
         std::error_code ec;
         for (const auto& e : fs::directory_iterator(dirs[static_cast<std::size_t>(id - 1)]->path, ec))
             fs::remove_all(e.path(), ec);
     }
-    BrokerNode& node(int id) { return *nodes[static_cast<std::size_t>(id - 1)]; }
+    /// Per node: the storage format wipeRaw installed (applied after configTweak); nullopt = the config's own.
+    std::array<std::optional<rune::node::StorageFormat>, 3> storageFormatFor_{};
+public:
     [[nodiscard]] bool running(int id) const { return nodes[static_cast<std::size_t>(id - 1)] != nullptr; }
     std::vector<BrokerNode*> live() {
         std::vector<BrokerNode*> v;

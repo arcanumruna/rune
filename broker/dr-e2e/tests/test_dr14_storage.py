@@ -47,6 +47,14 @@ Scenarios:
      full tmpfs mount, unreliable on Docker Desktop LinuxKit / macOS Rosetta; enable
      on Linux CI with appropriate kernel/mount setup.
 
+  5. LOST DATA DIR (ISR v3, IMPLEMENTED)
+     A node whose disk is lost and replaced (SIGKILL, volume wiped, restarted with no pause) while producers run and
+     DDLs have been committed.  The wiped node may lead a partition, lead __catalog, or be the controller.  It must
+     come back UNCONFIRMED (holding its leader roles), be stripped and confirmed, and rejoin; no follower may ever
+     truncate below its committed offset; no acked record is lost.
+       * test_dr14_disk_loss_fast_restart_never_truncates_committed[target_role][fmt]
+       * test_dr14_wiped_node_without_format_refuses_to_start (production formatting: exit 78 until `--join`)
+
 CID window: 1_300_000+ — disjoint from all prior DR suites.
   DR-1: n*1000, DR-2: 100_000+, DR-3: 300_000+, DR-4: 400_000+,
   DR-5: 500_000+, DR-6: 600_000+, DR-7: 700_000+, DR-10: 800_000+,
@@ -87,14 +95,17 @@ HARNESS UNCERTAINTIES (flagged for controller review):
 
 from __future__ import annotations
 
+import hashlib
+import re
 import signal
+import threading
 import time
 
 import pytest
 
 from harness import faults
 from harness.dockerutil import run
-from harness.cluster import SERVICES, node_id_to_service
+from harness.cluster import BOOT_LINE, SERVICES, node_id_to_service, service_to_node_id, slice_since_last_boot
 from harness.driver import DRAIN_QUIET_MS, Results, run_clients
 from harness.invariants import (
     assert_exactly_once,
@@ -663,3 +674,362 @@ def test_dr14_disk_full_graceful_degradation(fresh_cluster):  # pragma: no cover
         durability for records it could not persist (false-durable ack).
     """
     pass  # body never executes (skipped)
+
+
+# ── Scenario 5: lost data dir (ISR v3) ───────────────────────────────────────
+
+_TOPIC_MULTI = 1          # DEFAULT_TOPICS: events = 0, multi = 1, cg = 2
+_TOPIC_CATALOG = -6       # the replicated __catalog partition
+_COMMITTED_BELOW = "below our known committed offset"
+
+
+def _volume_of(cluster, svc: str) -> str:
+    return faults._volume_name(cluster.project, SERVICES.index(svc) + 1)
+
+
+def _wipe_volume(cluster, svc: str) -> None:
+    """Delete everything inside the (stopped) node's data volume: a replaced disk."""
+    res = faults._exec_on_volume(_volume_of(cluster, svc), "rm -rf /data/* /data/.[!.]* /data/..?*")
+    assert res.ok, f"wiping {svc}'s volume failed:\n{res.stdout}{res.stderr}"
+
+
+def _pick_target(cluster, target_role: str) -> str:
+    """The service playing `target_role`: the leader of a user partition, the __catalog leader, or the controller
+    (the consensus / metadata leader)."""
+    _, controller_svc = cluster.identify_leader()
+    if target_role == "controller":
+        return controller_svc
+    topic = _TOPIC_MULTI if target_role == "partition_leader" else _TOPIC_CATALOG
+    leaders = cluster.partition_leaders(topic)
+    assert leaders, f"no becomeLeader line for topic {topic} in any broker log"
+    return leaders[min(leaders)]
+
+
+class _StoragePoller:
+    """Polls a node's `rune_role` STORAGE line every 200 ms from a thread and keeps the readings in order."""
+
+    def __init__(self, cluster, svc: str):
+        self._cluster, self._svc = cluster, svc
+        self.readings: list[dict] = []
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            r = self._cluster.read_storage(self._svc)
+            if r is not None:
+                self.readings.append(r)
+            self._stop.wait(0.2)
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        self._thread.join(timeout=15)
+
+    def first_index(self, state: str) -> int:
+        return next((i for i, r in enumerate(self.readings) if r["state"] == state), -1)
+
+    def wait_confirmed(self, timeout_s: float) -> dict | None:
+        """The first reading with state CONFIRMED and outOfSync == 0, within `timeout_s`."""
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            for r in list(self.readings):
+                if r["state"] == "CONFIRMED" and r["out_of_sync"] == 0:
+                    return r
+            time.sleep(0.2)
+        return None
+
+
+_HISTORY_ROW_RE = re.compile(r"^\s*\d+\s")
+
+
+def _history_rows_digest(out: str) -> str:
+    """sha256 of the history ROW lines only (a line that starts with an offset number): a header, footer or banner can
+    never make two equal histories differ."""
+    rows = [ln.rstrip() for ln in (out or "").splitlines() if _HISTORY_ROW_RE.match(ln)]
+    return hashlib.sha256("\n".join(rows).encode()).hexdigest()
+
+
+def _catalog_digest(cluster, svc: str) -> str:
+    res = cluster.ql("show history;", seed_service=svc, timeout=90)
+    assert res.ok, f"show history through {svc} failed:\n{res.stdout}{res.stderr}"
+    return _history_rows_digest(res.stdout)
+
+
+def _await_equal_catalog_digests(cluster, timeout_s: float = 60) -> dict:
+    """Poll until every node's catalog history digest agrees (a follower's catalog HW may lag), then return them."""
+    deadline = time.time() + timeout_s
+    digests: dict = {}
+    while time.time() < deadline:
+        digests = {svc: _catalog_digest(cluster, svc) for svc in SERVICES}
+        if len(set(digests.values())) == 1:
+            return digests
+        time.sleep(2.0)
+    return digests
+
+
+# The order of the gate's own log lines is read from the RESTARTED process's log (sampling a counter every 200 ms can
+# miss a state that lasts under a second).
+_UNCONFIRMED_LINE = "storage UNCONFIRMED (id="
+_CONFIRMED_LINE = "storage CONFIRMED (id="
+_HOLD_LINE = "REFUSED \u2014 storage unconfirmed"          # armLeadershipBump_'s warn for a held leader role (informational)
+_GUARD_LINE = "REFUSED to truncate"                        # the truncation guard (a follower refused a lineage)
+
+
+def _strip_leaderships(logs: str, node_id: int) -> int | None:
+    """The leaderships count of the controller's strip line for `node_id` ("stripping it from <k> ISRs, <l> leaderships"),
+    or None when no node logged one."""
+    m = re.search(rf"controller: node {node_id} reported storage [0-9a-f]+ \(committed [^)]*\): "
+                  rf"stripping it from \d+ ISRs, (\d+) leaderships", logs or "")
+    return int(m.group(1)) if m else None
+
+
+def _led_before_confirmed(boot_log: str, node_id: int) -> bool:
+    """True when the restarted process logged a becomeLeader (any partition, __catalog included) BEFORE its storage was
+    confirmed - the one thing the gate exists to prevent."""
+    head = boot_log.split(_CONFIRMED_LINE, 1)[0]
+    return re.search(rf"PartitionReplica\[node={node_id}\] becomeLeader", head) is not None
+
+
+def _await_settled_leaders(cluster, timeout_s: float = 180) -> dict:
+    """The user topic's partition leaders once all 3 are known and unchanged across two reads 10 s apart (the GROW
+    rebalance after the recovery may still be moving leadership back)."""
+    deadline = time.time() + timeout_s
+    prev = None
+    while time.time() < deadline:
+        cur = cluster.partition_leaders(_TOPIC_MULTI)
+        if len(cur) == 3 and cur == prev:
+            return cur
+        prev = cur
+        time.sleep(10.0)
+    raise AssertionError(f"partition leaders of topic {_TOPIC_MULTI} never settled: {prev}")
+
+
+def _assert_recovered_after_disk_loss(cluster, wiped_svc: str, poller: "_StoragePoller", producers: list,
+                                      subscribe_svc: str, keys: int, *, expect_role_hold: bool,
+                                      restarted_at: float, boot_log: str | None = None,
+                                      settled_producer=None) -> None:
+    """The recovery assertions shared by the disk-loss cases (see the module docstring, scenario 5)."""
+    # Within 120 s of the restart call: CONFIRMED and in sync again (the poller supplies outOfSync / pendingNodes).
+    final = poller.wait_confirmed(max(1.0, restarted_at + 120 - time.time()))
+    assert final is not None, f"{wiped_svc} not CONFIRMED with outOfSync=0 within 120 s; last: {poller.readings[-3:]}"
+    # The gate's own lines from the restarted process: UNCONFIRMED before CONFIRMED (and the hold, if it led a role).
+    log = boot_log if boot_log is not None else cluster.logs_since_last_boot(wiped_svc)
+    u, c = log.find(_UNCONFIRMED_LINE), log.find(_CONFIRMED_LINE)
+    assert u >= 0, f"{wiped_svc}'s restarted process never logged '{_UNCONFIRMED_LINE}':\n{log[-2500:]}"
+    assert c > u, f"{wiped_svc} logged CONFIRMED before UNCONFIRMED (or never confirmed):\n{log[-2500:]}"
+    # The safety property the hold exists for: the restarted process never led anything before it was confirmed.
+    nid = service_to_node_id(wiped_svc)
+    assert not _led_before_confirmed(log, nid), f"{wiped_svc} became a leader before its storage was CONFIRMED:\n{log[-2500:]}"
+    # The controller stripped the node (whichever node was controller logged it); with a leadership if it led one.
+    all_logs = "\n".join(cluster.compose.logs(svc, timeout=60) for svc in SERVICES)
+    leaderships = _strip_leaderships(all_logs, nid)
+    assert leaderships is not None, f"no controller logged the strip of node {nid} ({wiped_svc})"
+    if expect_role_hold:
+        assert leaderships >= 1, f"node {nid} led a role at the kill but the strip found {leaderships} leaderships"
+    print(f"[dr14] {wiped_svc}: strip leaderships={leaderships}; hold line seen: {_HOLD_LINE in log}", flush=True)
+    # Every node's controller view has no pending storage left.
+    deadline = time.time() + 60
+    pending = {}
+    while time.time() < deadline:
+        pending = {svc: (cluster.read_storage(svc) or {}).get("pending_nodes", -1) for svc in SERVICES}
+        if all(v == 0 for v in pending.values()):
+            break
+        time.sleep(0.5)
+    assert all(v == 0 for v in pending.values()), f"pendingNodes != 0 at the end: {pending}"
+    # With the gate working the truncation guard must NEVER fire: a refusal here is a gate bug the guard masked.
+    for svc in SERVICES:
+        logs = cluster.compose.logs(svc, timeout=60)
+        assert _COMMITTED_BELOW not in logs, f"{svc} logged '{_COMMITTED_BELOW}' - a follower truncated committed data"
+        assert _GUARD_LINE not in logs, f"{svc}: the truncation guard fired ('{_GUARD_LINE}') - the gate let a wiped leader lead"
+        reading = cluster.read_storage(svc)
+        assert reading is not None and reading["lost_committed_reports"] <= 0, (
+            f"{svc}: lostCommittedReports={None if reading is None else reading['lost_committed_reports']} (a below-committed report was made)")
+    # Settled (CONFIRMED, nothing pending, leaders stable): the post-recovery producer must ack everything.
+    if settled_producer is not None:
+        _await_settled_leaders(cluster)
+        producers = list(producers) + [settled_producer()]
+    # Committed set intact: ordering, exactly-once, no loss.
+    sub = _subscribe_all(cluster, subscribe_svc, _next_cid_base(), keys, window_ms=90_000)
+    assert_no_committed_loss(Results(clients=[c for r in producers for c in r.clients] + sub.clients))
+    assert_per_key_ordering(sub)
+    assert_exactly_once(sub)
+    assert_single_leader(cluster)
+    # The catalog history is identical through every node (polled: a follower's catalog may lag a moment).
+    digests = _await_equal_catalog_digests(cluster)
+    assert len(set(digests.values())) == 1, f"catalog history differs between nodes after 60 s: {digests}"
+    # A post-recovery round trip.
+    _, leader_svc = cluster.identify_leader()
+    _assert_cluster_healthy(cluster, leader_svc, keys)
+
+
+@pytest.mark.fault
+@pytest.mark.timeout(1200)
+@pytest.mark.parametrize("fmt", ["auto", "join"])
+@pytest.mark.parametrize("target_role", ["partition_leader", "catalog_leader", "controller"])
+def test_dr14_disk_loss_fast_restart_never_truncates_committed(tmp_path, target_role, fmt):
+    """SIGKILL a node, wipe its data volume and restart it at once - while rate-limited acks=All producers run and
+    after 3 DDLs - for the node that leads a user partition, leads __catalog, or is the controller.
+
+    The wiped node must come back UNCONFIRMED (and, if it led a role, hold it), be stripped from every ISR, confirmed
+    and rejoin; the truncation guard must never fire (the gate keeps the wiped node from leading), no follower may
+    truncate below its committed offset, and no acked record is lost - including 150 records acked by a producer started after the recovery settled.
+    ``fmt``: ``auto`` (compose RUNE_STORAGE_FORMAT=auto formats the empty dir as a joiner) or ``join`` (the operator's
+    `rune_broker storage format --join`).  The controller's broker-liveness timeout is raised to 120 s
+    (RUNE_BROKER_LIVENESS_TIMEOUT_MS) so the wiped node deterministically boots, replicates the metadata and finds itself
+    still named leader, instead of racing the failover.  Fixes: ISR v3 Steps 7-11.
+    """
+    from harness.cluster import Cluster
+    override = tmp_path / "liveness.yml"
+    override.write_text("services:\n" + "".join(
+        f"  {s}:\n    environment:\n      RUNE_BROKER_LIVENESS_TIMEOUT_MS: \"120000\"\n" for s in SERVICES))
+    cluster = Cluster(project="rune-dr-diskloss", override_files=[str(override)])
+    keys = 4
+    try:
+        cluster.up(leader_timeout=120)
+        cluster.wait_data_plane_ready(max_attempts=5, timeout_s=60)
+        assert_single_leader(cluster)
+
+        # Committed catalog history: 3 DDLs.
+        for i in range(3):
+            res = cluster.ql(f"topic dr14_disk_loss_{i} partitions 1;", timeout=90)
+            assert res.ok, f"DDL {i} failed:\n{res.stdout}{res.stderr}"
+
+        target_svc = _pick_target(cluster, target_role)
+        led_roles = [svc for topic in (_TOPIC_MULTI, _TOPIC_CATALOG) for svc in cluster.partition_leaders(topic).values()]
+        expect_role_hold = target_svc in led_roles    # the committed map names it leader at the kill
+        survivors = [s for s in SERVICES if s != target_svc]
+
+        # Rate-limited producers (they may bail on the failover - acceptable; only ACKED records are audited).
+        holder: dict[str, Results] = {}
+
+        def _run_producers():
+            holder["r"] = _produce(cluster, survivors[0], 1, _next_cid_base(), 1200, keys, rate_hz=40)
+
+        producer_thread = threading.Thread(target=_run_producers, daemon=True)
+        producer_thread.start()
+        time.sleep(3.0)    # let production get going
+
+        faults.kill_node(cluster, target_svc, signal.SIGKILL)
+        _wipe_volume(cluster, target_svc)
+        if fmt == "join":
+            faults.format_storage(cluster, target_svc, "join")
+        with _StoragePoller(cluster, target_svc) as poller:
+            restarted_at = time.time()
+            faults.restart(cluster, target_svc)      # no pause: the committed assignment still names it
+            producer_thread.join(timeout=300)
+            produced = holder.get("r", Results())
+
+            def _after_recovery() -> Results:
+                # Started only once the node is CONFIRMED, nothing is pending and the partition leaders are stable: it
+                # must ack ALL 150 records (the "through the recovery" claim stays with the first producer, whose acked
+                # records are audited above the failover).
+                r = _produce(cluster, survivors[1], 1, _next_cid_base(), 150, keys, rate_hz=15)
+                assert r.ok and len(r.all_produced) == 150, (
+                    f"post-recovery producer acked {len(r.all_produced)} of 150:\n"
+                    + "\n".join(c.raw[-800:] for c in r.clients))
+                return r
+
+            _assert_recovered_after_disk_loss(
+                cluster, target_svc, poller, [produced], survivors[1], keys,
+                expect_role_hold=expect_role_hold, restarted_at=restarted_at, settled_producer=_after_recovery)
+    finally:
+        cluster.down()
+
+
+@pytest.mark.fault
+@pytest.mark.timeout(900)
+def test_dr14_wiped_node_without_format_refuses_to_start(tmp_path):
+    """Production formatting: with RUNE_STORAGE_FORMAT unset a wiped node refuses to start (exit 78) and says which
+    command formats it; after `rune_broker storage format --join` it rejoins as a replaced disk and recovers as in
+    the fast-restart cases.  The override unsets the variable for rune-2 only, AFTER the cluster formed (a fresh
+    volume needs the compose default `auto` to form in the first place)."""
+    from harness.cluster import Cluster
+    c = Cluster(project="rune-dr-noformat")
+    keys = 4
+    try:
+        c.up(leader_timeout=120)
+        c.wait_data_plane_ready(max_attempts=5, timeout_s=60)
+        assert_single_leader(c)
+        pre = _produce(c, "rune-1", 1, _next_cid_base(), 120, keys)
+        assert pre.ok and len(pre.all_produced) == 120, "pre-wipe produce failed"
+        override = tmp_path / "no-format-rune-2.yml"
+        override.write_text("services:\n  rune-2:\n    environment:\n      RUNE_STORAGE_FORMAT: \"\"\n")
+        c.compose._override_files.append(str(override))
+
+        faults.kill_node(c, "rune-2", signal.SIGKILL)
+        _wipe_volume(c, "rune-2")
+        c.compose.up("rune-2")                       # recreates the container with the unset format variable
+
+        # Within 30 s: stopped with exit code 78 and the log names the command to run.
+        name = c.container_name("rune-2")
+        deadline = time.time() + 30
+        code = None
+        while time.time() < deadline:
+            res = run(["docker", "inspect", "-f", "{{.State.Status}} {{.State.ExitCode}}", name], timeout=15)
+            status, _, exit_code = (res.stdout or "").strip().partition(" ")
+            if status in ("exited", "dead"):
+                code = int(exit_code)
+                break
+            time.sleep(0.5)
+        assert code == 78, f"rune-2 did not refuse to start with exit 78 within 30 s (exit code {code})"
+        logs = run(["docker", "logs", name], timeout=30)
+        text = (logs.stdout or "") + (logs.stderr or "")
+        assert "rune_broker storage format --join" in text, "the refusal does not name `rune_broker storage format --join`"
+        assert BOOT_LINE not in text, "the process logged its storage boot line: it did not refuse before touching the dir"
+
+        # The operator formats the disk as a replacement and starts the node again.
+        faults.format_storage(c, "rune-2", "join")
+        with _StoragePoller(c, "rune-2") as poller:
+            restarted_at = time.time()
+            c.compose.up("rune-2")
+            # The container was recreated by the first `up`: its log holds only the refused start and this one; the
+            # last boot line separates them.
+            _assert_recovered_after_disk_loss(c, "rune-2", poller, [pre], "rune-1", keys,
+                                              expect_role_hold=False, restarted_at=restarted_at)
+    finally:
+        c.down()
+
+
+def test_dr14_storage_poller_orders_states_without_a_cluster():
+    """No cluster needed: the poller keeps readings in order and reports the first index of a state / confirmation; the
+    boot-log slicer separates the restarted process from the one it replaced (RED: slice at the FIRST boot line and the
+    old process's CONFIRMED precedes the new process's UNCONFIRMED)."""
+    class _Fake:
+        def __init__(self):
+            self.seq = [None,
+                        {"state": "UNCONFIRMED", "held_leader_roles": 1, "out_of_sync": 2, "pending_nodes": 1},
+                        {"state": "UNCONFIRMED", "held_leader_roles": 1, "out_of_sync": 1, "pending_nodes": 1},
+                        {"state": "CONFIRMED", "held_leader_roles": 0, "out_of_sync": 0, "pending_nodes": 0}]
+            self.i = 0
+
+        def read_storage(self, svc):
+            r = self.seq[min(self.i, len(self.seq) - 1)]
+            self.i += 1
+            return r
+
+    with _StoragePoller(_Fake(), "rune-1") as p:
+        final = p.wait_confirmed(10)
+    assert final is not None and final["state"] == "CONFIRMED"
+    assert 0 <= p.first_index("UNCONFIRMED") < p.first_index("CONFIRMED")
+    assert p.first_index("UNDECIDED") == -1
+
+    two_boots = (f"{BOOT_LINE}/d storageId=1 state=CONFIRMED\n{_CONFIRMED_LINE}1)\n"
+                 f"{BOOT_LINE}/d storageId=2 state=CONFIRMED\n{_UNCONFIRMED_LINE}2)\n{_CONFIRMED_LINE}2)\n")
+    last = slice_since_last_boot(two_boots)
+    assert last.find(_UNCONFIRMED_LINE) >= 0 and last.find(_UNCONFIRMED_LINE) < last.find(_CONFIRMED_LINE)
+    assert two_boots.find(_CONFIRMED_LINE) < two_boots.find(_UNCONFIRMED_LINE)   # the unsliced log would mislead
+    assert slice_since_last_boot("no boot line here") == ""
+    log = ("controller: node 1 reported storage ab12 (committed none, origin joiner): stripping it from 2 ISRs, "
+           "1 leaderships, 0 lineages before confirming\n")
+    assert _strip_leaderships(log, 1) == 1 and _strip_leaderships(log, 2) is None
+    before = f"{BOOT_LINE}/d\nPartitionReplica[node=1] becomeLeader topic=1 part=0 epoch=3\n{_UNCONFIRMED_LINE}2)\n{_CONFIRMED_LINE}2)\n"
+    after = f"{BOOT_LINE}/d\n{_UNCONFIRMED_LINE}2)\n{_CONFIRMED_LINE}2)\nPartitionReplica[node=1] becomeLeader topic=1 part=0 epoch=4\n"
+    assert _led_before_confirmed(before, 1) and not _led_before_confirmed(after, 1)
+    assert not _led_before_confirmed(before, 2)
+    digest_a = _history_rows_digest("offset  time\n  12  t  define\n  15  t  alter\nfooter 1\n")
+    digest_b = _history_rows_digest("HEADER\n  12  t  define\n  15  t  alter\nother footer\n")
+    assert digest_a == digest_b != _history_rows_digest("  12  t  define\n")

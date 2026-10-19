@@ -23,6 +23,7 @@
 //   version     : uint16   (= 1)
 // ---------------------------------------------------------------------------
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -53,7 +54,9 @@ namespace rsbe = ::rune::protocol::replication::sbe;
 // Schema constants
 // ---------------------------------------------------------------------------
 inline constexpr uint16_t kSchemaId      = 112;
-inline constexpr uint16_t kSchemaVersion = 3; // v2: DR-BUG-5 topicId; v3: KIP-320/595 lastFetchedEpoch, AlterIsr
+inline constexpr uint16_t kSchemaVersion = 4; // v2: DR-BUG-5 topicId; v3: KIP-320/595 lastFetchedEpoch, AlterIsr; v4: ISR protocol (storage id, correlated AlterIsr answers)
+/// The oldest schema version whose FetchResponse this binary still applies (v3 leaders send v3 headers during a roll).
+inline constexpr uint16_t kMinReplicationVersion = 3;
 /// Mixed v2/v3 replication is UNSUPPORTED (fail closed): a decoded v2
 /// FetchRequest carries this lastFetchedEpoch sentinel (the leader refuses it
 /// unless the follower's log is empty) and a decoded v2 FetchResponse carries
@@ -199,10 +202,15 @@ struct FetchRequestMsg {
     /// fetch from an incarnation older than one it already saw from that
     /// follower (a frame of a dead process).
     int64_t     incarnation = 0;
+    /// v4: the follower's storage id (0 = unknown / a v3 sender).
+    int64_t     storageId = 0;
+    /// v4: the start offset of the epoch of the follower's last batch (-1 = unknown / a v3 sender).
+    int64_t     lastEpochStartOffset = -1;
 
     static constexpr uint16_t TEMPLATE_ID  = 1;
-    static constexpr uint16_t BLOCK_LENGTH = 44; // 3×int64 + 5×int32 (v3)
+    static constexpr uint16_t BLOCK_LENGTH = 60; // 5×int64 + 5×int32 (v4)
     static_assert(BLOCK_LENGTH == rsbe::FetchRequest::sbeBlockLength());
+    static constexpr uint16_t BLOCK_LENGTH_V3 = 44;
     static constexpr uint16_t BLOCK_LENGTH_V2 = 32;
     static constexpr std::size_t TOTAL_SIZE =
         ReplicationMessageHeader::ENCODED_SIZE + BLOCK_LENGTH;
@@ -219,7 +227,9 @@ struct FetchRequestMsg {
                               int32_t     maxBytes_,
                               int32_t     topicId_ = 0,
                               int32_t     lastFetchedEpoch_ = -1,
-                              int64_t     incarnation_ = 0) noexcept
+                              int64_t     incarnation_ = 0,
+                              int64_t     storageId_ = 0,
+                              int64_t     lastEpochStartOffset_ = -1) noexcept
     {
         std::size_t pos = offset;
         pos += ReplicationMessageHeader::encode(buf, pos, BLOCK_LENGTH, TEMPLATE_ID);
@@ -232,16 +242,23 @@ struct FetchRequestMsg {
         detail::write_le<int32_t>(p + 28, topicId_);
         detail::write_le<int32_t>(p + 32, lastFetchedEpoch_);
         detail::write_le<int64_t>(p + 36, incarnation_);
+        detail::write_le<int64_t>(p + 44, storageId_);
+        detail::write_le<int64_t>(p + 52, lastEpochStartOffset_);
         return TOTAL_SIZE;
     }
 
-    /// Decode FetchRequest from buf[offset] (at least MIN_SIZE bytes).  A v2
-    /// frame (blockLength 32) carries no lastFetchedEpoch: decoded as
-    /// kLastFetchedEpochV2Frame (the leader fails closed on it).
+    /// Decode FetchRequest from buf[offset] (at least MIN_SIZE bytes of a frame of `len`
+    /// bytes).  A v2 frame (blockLength 32) carries no lastFetchedEpoch: decoded as
+    /// kLastFetchedEpochV2Frame (the leader fails closed on it).  Each later field is read
+    /// only when the header's block covers it AND the frame holds it (a header may claim more
+    /// than the frame carries): a v3 frame reads storageId 0 / lastEpochStartOffset -1.
     static FetchRequestMsg decode(const uint8_t* buf,
-                                  std::size_t offset) noexcept
+                                  std::size_t offset,
+                                  std::size_t len) noexcept
     {
-        const uint16_t blockLen = detail::read_le<uint16_t>(buf + offset);
+        const std::size_t avail = len > offset + ReplicationMessageHeader::ENCODED_SIZE
+                                      ? len - offset - ReplicationMessageHeader::ENCODED_SIZE : 0;
+        const std::size_t blockLen = std::min<std::size_t>(detail::read_le<uint16_t>(buf + offset), avail);
         const uint8_t* p = buf + offset + ReplicationMessageHeader::ENCODED_SIZE;
         FetchRequestMsg m{};
         m.leaderEpoch  = detail::read_le<int64_t>(p +  0);
@@ -252,7 +269,9 @@ struct FetchRequestMsg {
         m.topicId      = detail::read_le<int32_t>(p + 28);
         m.lastFetchedEpoch = blockLen >= 36 ? detail::read_le<int32_t>(p + 32)
                                             : kLastFetchedEpochV2Frame;
-        m.incarnation = blockLen >= BLOCK_LENGTH ? detail::read_le<int64_t>(p + 36) : 0;
+        m.incarnation = blockLen >= BLOCK_LENGTH_V3 ? detail::read_le<int64_t>(p + 36) : 0;
+        m.storageId   = blockLen >= 52 ? detail::read_le<int64_t>(p + 44) : 0;
+        m.lastEpochStartOffset = blockLen >= BLOCK_LENGTH ? detail::read_le<int64_t>(p + 52) : -1;
         return m;
     }
 };
@@ -377,7 +396,7 @@ struct FetchResponseMsg {
                 reinterpret_cast<const uint8_t*>(sv.data()), sv.size()};
         }
         // Mixed v2/v3 is unsupported: a v2 leader's frame is never applied.
-        if (mh.version() < kSchemaVersion) {
+        if (mh.version() < kMinReplicationVersion) {
             m.errorCode = kErrUnsupportedWireVersion;
             m.records   = {};
         }
@@ -440,8 +459,11 @@ inline constexpr int16_t kBase = 0;
 /// ignore them, so nothing is gated on it yet; future request kinds an older
 /// controller would drop are gated on a level above it.
 inline constexpr int16_t kLeaderlessMarks = 1;
+/// ISR protocol (storage identity): gates the storage strip, the NodeStorageRecord
+/// confirmation and the StorageReset leaderless mark.
+inline constexpr int16_t kStorageIdentity = 2;
 /// The level this binary supports.
-inline constexpr int16_t kLatest = kLeaderlessMarks;
+inline constexpr int16_t kLatest = kStorageIdentity;
 } // namespace MetadataFeature
 
 struct AlterIsrMsg {
@@ -531,6 +553,20 @@ struct AlterIsrMsg {
     /// highest metadata feature level its binary supports in this slot (an
     /// older binary leaves it 0 = MetadataFeature::kBase).
     static constexpr int kNodeFeatureLevelSlot = 6;
+    /// ISR protocol (storage identity): a node-control request carries the sender's storage id
+    /// in slots 7 (low 32 bits) / 8 (high 32 bits) and its origin in slot 9.
+    static constexpr int kNodeStorageLoSlot     = 7;
+    static constexpr int kNodeStorageHiSlot     = 8;
+    static constexpr int kNodeStorageOriginSlot = 9;
+    static constexpr int32_t kStorageOriginNone      = 0;
+    static constexpr int32_t kStorageOriginFounder   = 1;
+    static constexpr int32_t kStorageOriginLegacy    = 2;
+    static constexpr int32_t kStorageOriginJoiner    = 3;
+    static constexpr int32_t kStorageOriginUndecided = 4;
+    /// Not a bump: a follower's below-committed report (its log end is below the HW it learned
+    /// in its leadership).  isr[1] = this flag, `leaderId` = the reporter, isr[2] = the floor
+    /// (clamped to int32), isr[3]/isr[4] = the reporter's incarnation, `proposalId` = reportId.
+    static constexpr int32_t kBumpLeaderBelowCommitted = 2048;
     int32_t topicId        = 0;
     int32_t partition      = 0;
     NodeId  leaderId       = -1;
@@ -538,7 +574,14 @@ struct AlterIsrMsg {
     int32_t isrCount       = 0;
     std::array<int32_t, kMaxIsr> isr{};
     int32_t partitionEpoch = -1;
+    /// v4: correlation only - never part of the CAS; 0 = a v3 sender.
+    int64_t proposalId = 0;
+    /// v4: the storage id of each proposed ISR member, parallel to `isr`.
+    std::array<int64_t, kMaxIsr> isrStorage{};
+    /// v4: 1-based ordinal of this send of `proposalId`; 0 = a v3 sender.
+    int32_t sendSeq = 0;
 
+    static constexpr std::size_t V3_BLOCK = 92;
     static constexpr std::size_t TOTAL_SIZE =
         rsbe::MessageHeader::encodedLength() + rsbe::AlterIsr::sbeBlockLength();
 
@@ -547,17 +590,23 @@ struct AlterIsrMsg {
         rsbe::AlterIsr enc;
         enc.wrapAndApplyHeader(reinterpret_cast<char*>(buf), 0, cap);
         enc.topicId(topicId).partition(partition).leaderId(leaderId)
-           .leaderEpoch(leaderEpoch).isrCount(isrCount).partitionEpoch(partitionEpoch);
-        for (int i = 0; i < kMaxIsr; ++i)
+           .leaderEpoch(leaderEpoch).isrCount(isrCount).partitionEpoch(partitionEpoch)
+           .proposalId(proposalId).sendSeq(sendSeq);
+        for (int i = 0; i < kMaxIsr; ++i) {
             enc.isr(static_cast<std::uint64_t>(i), isr[static_cast<std::size_t>(i)]);
+            enc.isrStorage(static_cast<std::uint64_t>(i), isrStorage[static_cast<std::size_t>(i)]);
+        }
         return TOTAL_SIZE;
     }
+    /// Accepts a v3 frame (block 92) as well as v4+ (block >= 232): the v4 fields read 0 when the
+    /// sender's acting version predates them.
     [[nodiscard]] static bool decode(const uint8_t* buf, std::size_t len, AlterIsrMsg& m) noexcept {
-        if (len < TOTAL_SIZE) return false;
+        if (len < rsbe::MessageHeader::encodedLength() + V3_BLOCK) return false;
         char* b = reinterpret_cast<char*>(const_cast<uint8_t*>(buf));
         rsbe::MessageHeader mh;
         mh.wrap(b, 0, 0, len);
-        if (mh.templateId() != TEMPLATE_ID || mh.blockLength() < rsbe::AlterIsr::sbeBlockLength()) return false;
+        if (mh.templateId() != TEMPLATE_ID || mh.blockLength() < V3_BLOCK) return false;
+        if (len < rsbe::MessageHeader::encodedLength() + mh.blockLength()) return false;
         rsbe::AlterIsr dec;
         dec.wrapForDecode(b, rsbe::MessageHeader::encodedLength(), mh.blockLength(), mh.version(), len);
         m.topicId        = dec.topicId();
@@ -569,6 +618,14 @@ struct AlterIsrMsg {
         if (m.isrCount < 0 || m.isrCount > kMaxIsr) return false;
         for (int i = 0; i < kMaxIsr; ++i)
             m.isr[static_cast<std::size_t>(i)] = dec.isr(static_cast<std::uint64_t>(i));
+        // A v4 field is read only when the sender's acting version has it AND its header block covers it: a
+        // header claiming version 4 with a v3-sized block would otherwise read past the frame.
+        const std::size_t bl = mh.blockLength();
+        m.proposalId = (dec.proposalIdInActingVersion() && bl >= 100) ? dec.proposalId() : 0;
+        m.sendSeq    = (dec.sendSeqInActingVersion() && bl >= 232) ? dec.sendSeq() : 0;
+        for (int i = 0; i < kMaxIsr; ++i)
+            m.isrStorage[static_cast<std::size_t>(i)] =
+                (dec.isrStorageInActingVersion() && bl >= 228) ? dec.isrStorage(static_cast<std::uint64_t>(i)) : 0;
         return true;
     }
 };
@@ -588,6 +645,13 @@ inline constexpr int16_t kAlterIsrLineageConfirmed     = 5;
 /// this process's node-control identity ROTATED.  The replica adopts it and,
 /// leading a transient partition, re-reports its lineage under it.
 inline constexpr int16_t kAlterIsrLocalLineageIdentity = 100;
+/// ISR protocol: NODE-LOCAL only, never on the wire - the node's own runtime tells a held
+/// leader role (storage not confirmed) to ask for a failover through the restart-fence bump.
+inline constexpr int16_t kAlterIsrLocalHoldLeadership = 101;
+
+/// A controller answer stamped with a term below the newest term this node has learned
+/// comes from a deposed controller.  answer 0 = a v3 sender (no term): never stale.
+inline bool isStaleControllerAnswer(int64_t answer, int64_t known) noexcept { return answer > 0 && answer < known; }
 
 // ---------------------------------------------------------------------------
 // AlterIsrResponse (template 8, v3) — Kafka AlterPartitionResponse.  The leader
@@ -603,7 +667,13 @@ struct AlterIsrResponseMsg {
     Epoch   leaderEpoch    = -1;
     int32_t partitionEpoch = -1;   ///< the controller's committed partitionEpoch
     int16_t errorCode      = kAlterIsrOk;
+    /// v4: echoes of the request's proposalId / sendSeq (0 = answering a v3 request), and the
+    /// term of the answering controller (0 = a v3 controller).
+    int64_t proposalId      = 0;
+    int64_t controllerEpoch = 0;
+    int32_t sendSeq         = 0;
 
+    static constexpr std::size_t V3_BLOCK = 26;
     static constexpr std::size_t TOTAL_SIZE =
         rsbe::MessageHeader::encodedLength() + rsbe::AlterIsrResponse::sbeBlockLength();
 
@@ -612,15 +682,17 @@ struct AlterIsrResponseMsg {
         rsbe::AlterIsrResponse enc;
         enc.wrapAndApplyHeader(reinterpret_cast<char*>(buf), 0, cap);
         enc.topicId(topicId).partition(partition).leaderId(leaderId)
-           .leaderEpoch(leaderEpoch).partitionEpoch(partitionEpoch).errorCode(errorCode);
+           .leaderEpoch(leaderEpoch).partitionEpoch(partitionEpoch).errorCode(errorCode)
+           .proposalId(proposalId).controllerEpoch(controllerEpoch).sendSeq(sendSeq);
         return TOTAL_SIZE;
     }
     [[nodiscard]] static bool decode(const uint8_t* buf, std::size_t len, AlterIsrResponseMsg& m) noexcept {
-        if (len < TOTAL_SIZE) return false;
+        if (len < rsbe::MessageHeader::encodedLength() + V3_BLOCK) return false;
         char* b = reinterpret_cast<char*>(const_cast<uint8_t*>(buf));
         rsbe::MessageHeader mh;
         mh.wrap(b, 0, 0, len);
-        if (mh.templateId() != TEMPLATE_ID || mh.blockLength() < rsbe::AlterIsrResponse::sbeBlockLength()) return false;
+        if (mh.templateId() != TEMPLATE_ID || mh.blockLength() < V3_BLOCK) return false;
+        if (len < rsbe::MessageHeader::encodedLength() + mh.blockLength()) return false;
         rsbe::AlterIsrResponse dec;
         dec.wrapForDecode(b, rsbe::MessageHeader::encodedLength(), mh.blockLength(), mh.version(), len);
         m.topicId        = dec.topicId();
@@ -629,6 +701,10 @@ struct AlterIsrResponseMsg {
         m.leaderEpoch    = dec.leaderEpoch();
         m.partitionEpoch = dec.partitionEpoch();
         m.errorCode      = dec.errorCode();
+        const std::size_t bl = mh.blockLength();   // see AlterIsrMsg::decode: acting version AND block coverage
+        m.proposalId      = (dec.proposalIdInActingVersion() && bl >= 34) ? dec.proposalId() : 0;
+        m.controllerEpoch = (dec.controllerEpochInActingVersion() && bl >= 42) ? dec.controllerEpoch() : 0;
+        m.sendSeq         = (dec.sendSeqInActingVersion() && bl >= 46) ? dec.sendSeq() : 0;
         return true;
     }
 };

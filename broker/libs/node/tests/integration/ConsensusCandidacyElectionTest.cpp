@@ -37,6 +37,7 @@
 #include "support/TestCluster.h"
 #include <rune/node/EmbeddedDriver.h>
 #include <rune/node/NodeConfig.h>
+#include <rune/node/StorageIdentity.h>
 #include <rune/replication/InternalIsrKnowledge.h>
 #include <rune/replication/PartitionReplica.h>
 
@@ -52,10 +53,13 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
+#include <functional>
 #include <memory>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -182,6 +186,33 @@ public:
     void start(int id) {
         nodes_[static_cast<std::size_t>(id)] = std::make_unique<BrokerNode>(config(id));
         nodes_[static_cast<std::size_t>(id)]->start();
+    }
+    /// `start` with a config tweak (storageFormat = Auto / New, testCandidacyHoldAtBoot, testHoldFollowerFetchesMs).
+    void startWith(int id, const std::function<void(NodeConfig&)>& tweak) {
+        NodeConfig cfg = config(id);
+        if (tweak) tweak(cfg);
+        nodes_[static_cast<std::size_t>(id)] = std::make_unique<BrokerNode>(cfg);
+        nodes_[static_cast<std::size_t>(id)]->start();
+    }
+    /// The data dir's contents only (no storage.meta): the node restarts with the format its config names.
+    void wipeRaw(int id) {
+        std::error_code ec;
+        for (const auto& e : fs::directory_iterator(dirs_[static_cast<std::size_t>(id)]->path, ec))
+            fs::remove_all(e.path(), ec);
+    }
+    /// A replaced disk the production way (ISR design v3 Step 5): the contents go, then `storage format --join`.
+    void wipe(int id) {
+        wipeRaw(id);
+        ASSERT_EQ(rune::node::StorageIdentity::format(dirs_[static_cast<std::size_t>(id)]->path.string(),
+                                                      rune::node::StorageIdentity::Origin::Joiner,
+                                                      rune::node::StorageIdentity::Mode::None, false).code, 0);
+    }
+    /// storage.meta's `origin=` value ("" when absent) - read from the test thread (nothing shared in memory).
+    [[nodiscard]] std::string originOnDisk(int id) const {
+        std::ifstream in(dirs_[static_cast<std::size_t>(id)]->path / "storage.meta");
+        std::string line;
+        while (std::getline(in, line)) if (line.rfind("origin=", 0) == 0) return line.substr(7);
+        return {};
     }
     void stop(int id) {
         auto& n = nodes_[static_cast<std::size_t>(id)];
@@ -475,4 +506,270 @@ TEST(ConsensusCandidacyElectionRegression, DeniedCandidacyNeverFreezesLiveLeader
              << ", L pending=" << c.meta(L).pending;
     EXPECT_TRUE(c.agreeOn(L, {L, A, B})) << "leadership changed — the scenario no longer pins MAJOR-R3";
     EXPECT_EQ(c.election(L).leadershipTerm, T);
+}
+
+// ===========================================================================
+// ISR v3 Step 9 - the storage gate end to end.
+// ===========================================================================
+namespace {
+using rune::node::StorageFormat;
+
+std::string candidacyOf(Cluster& c, int id) {
+    return c.node(id).onControlThreadForTest([&] { return std::string(c.node(id).electionForTest()->candidacyName()); });
+}
+int gateStateOf(Cluster& c, int id) {
+    return c.node(id).onControlThreadForTest([&] { return c.node(id).storageGateStateForTest(); });
+}
+}  // namespace
+
+// §3.6 / A-C2: a Joiner's candidacy hold is a LEVEL set at construction - the first canvass is already held, and it
+// stays held while the storage is unconfirmed.  The joiner cannot fetch (testHoldFollowerFetchesMs), so its own view of
+// the metadata never confirms it deterministically.  RED: the change-only call (the hold only on a gate transition).
+TEST(StorageGateWiringRegression, JoinerElectionIsHeldFromBootRegression) {
+    Cluster c(3);
+    for (int i = 0; i < 3; ++i) c.start(i);
+    const int32_t L = settledLeader(c, {0, 1, 2}, 20s);
+    ASSERT_GE(L, 0);
+    const int X = (L + 1) % 3;
+    c.stop(X);
+    c.wipe(X);
+    c.startWith(X, [](NodeConfig& k) { k.testHoldFollowerFetchesMs = 60'000; });
+    EXPECT_EQ(candidacyOf(c, X), "AwaitingStorage") << "the joiner was a candidate right after start()";
+    std::this_thread::sleep_for(3 * 100ms);   // 3x the canvass timeout
+    EXPECT_EQ(candidacyOf(c, X), "AwaitingStorage") << "the joiner stood for election";
+    EXPECT_EQ(gateStateOf(c, X), 1);
+}
+
+// B-I8 + A-C2 (deterministic): a wiped member that is still in the committed metadata ISR - so every vote would go to
+// it - never becomes consensus leader while the others hold; the committed metadata survives the real leader's return.
+// RED: the change-only hold.  X is then the sole unheld candidate, with L's and Y's knowledge votes, so it wins every run.
+TEST(ConsensusCandidacyElectionRegression, WipedMemberNeverConsensusLeader_CommittedMetadataSurvivesRegression) {
+    Cluster c(3);
+    for (int i = 0; i < 3; ++i) c.start(i);
+    const int32_t L = settledLeader(c, {0, 1, 2}, 20s);
+    ASSERT_GE(L, 0);
+    ASSERT_EQ(c.defineTopic(), 0);
+    const int X = (L + 1) % 3, Y = (L + 2) % 3;
+    const int64_t hw = c.meta(L).hw;
+
+    c.stop(X);
+    c.wipe(X);
+    c.startWith(X, [](NodeConfig& k) { k.testHoldFollowerFetchesMs = 60'000; });
+    EXPECT_TRUE(c.knowledge(L).contains(X)) << "precondition: L still lists X in the metadata ISR";
+    EXPECT_TRUE(c.knowledge(Y).contains(X)) << "precondition: Y still lists X in the metadata ISR";
+
+    c.node(Y).setTestCandidacyHold(true);
+    c.node(L).setTestCandidacyHold(true);
+    c.node(L).resignConsensusForTest();
+    // Ruling: 2 s, not 5 s.  A resigned metadata leader fences members it no longer hears from out of the metadata ISR
+    // after a few heartbeat timeouts; on a starved host (TSan, a parallel build) that shrink can land inside a longer
+    // window and leave Y ineligible for good.  2 s is ample to see an unheld X win (it does so within ~0.3 s).
+    const auto until5s = std::chrono::steady_clock::now() + 2s;
+    bool xLed = false, agreed = false;
+    std::string isrHistory;   // diagnostics only: L's metadata-ISR knowledge over the window
+    std::string lastK;
+    while (std::chrono::steady_clock::now() < until5s) {
+        for (int i = 0; i < 3; ++i) if (c.election(i).closedWith(X)) xLed = true;
+        if (c.agreedLeader({0, 1, 2}) != -1) agreed = true;
+        if (const std::string k = str(c.knowledge(L)); k != lastK) {
+            lastK = k;
+            isrHistory += " " + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch()).count() % 100000) + ":" + k;
+        }
+        std::this_thread::sleep_for(10ms);
+    }
+    EXPECT_FALSE(xLed) << "the wiped member became consensus leader";
+    EXPECT_FALSE(agreed) << "a leader was agreed while every candidate was held";
+
+    c.node(Y).setTestCandidacyHold(false);
+    ASSERT_TRUE(until([&] { return c.election(Y).closedWith(Y) || c.agreedLeader({0, 1, 2}) == Y; }, 5s))
+        << "Y never led after its hold was released (L's ISR knowledge over the window:" << isrHistory << "): " << [&] {
+               std::string d;
+               for (int i = 0; i < 3; ++i) {
+                   const auto v = c.election(i);
+                   d += " node" + std::to_string(i) + "=" + std::to_string(static_cast<int>(v.state)) + "/leader" +
+                        std::to_string(v.leader) + "/term" + std::to_string(v.leadershipTerm) + "/cand" +
+                        std::to_string(v.candidateTerm) + "/" + candidacyOf(c, i) + "/gate" + std::to_string(gateStateOf(c, i));
+               }
+               for (int i = 0; i < 3; ++i)
+                   d += " | pos" + std::to_string(i) + "=" + c.node(i).onControlThreadForTest([&] {
+                            const auto* e = c.node(i).electionForTest();
+                            return std::to_string(e->logLeadershipTermId()) + ":" + std::to_string(e->appendPosition()) +
+                                   " pvG" + std::to_string(e->preVotesGrantedForTest()) + " pvD" + std::to_string(e->preVotesDeniedForTest()) +
+                                   " vG" + std::to_string(e->votesGrantedForTest());
+                        });
+               d += " | L.eligible(Y)=" + std::to_string(c.node(L).onControlThreadForTest([&] {
+                        return c.node(L).internalIsrKnowledgeForTest()->eligible(Y); })) +
+                    " L.votable=" + std::to_string(c.node(L).onControlThreadForTest([&] {
+                        return c.node(L).internalIsrKnowledgeForTest()->votable(); })) +
+                    " knowL=" + str(c.knowledge(L)) + " knowY=" + str(c.knowledge(Y));
+               return d;
+           }();
+    EXPECT_TRUE(until([&] { const auto m = c.meta(Y); return m.leader && m.leo >= hw; }, 15s))
+        << "committed metadata did not survive the hand-over";
+}
+
+// R-I1: three nodes formatted `auto`, all held at boot, decide their storage first; releasing the holds forms the
+// cluster and every node is a Founder.  RED: decide Joiner on any heard peer.
+TEST(ConsensusCandidacyElectionRegression, FreshClusterFormsWithEveryNodeFounderRegression) {
+    Cluster c(3);
+    for (int i = 0; i < 3; ++i)
+        c.startWith(i, [](NodeConfig& k) { k.storageFormat = StorageFormat::Auto; k.testCandidacyHoldAtBoot = true; });
+    for (int i = 0; i < 3; ++i)
+        ASSERT_TRUE(until([&] { return gateStateOf(c, i) != 2; }, 30s)) << "node " << i << " never left UNDECIDED";
+    for (int i = 0; i < 3; ++i) c.node(i).setTestCandidacyHold(false);
+    ASSERT_TRUE(until([&] { return c.agreedLeader({0, 1, 2}) >= 0; }, 10s)) << "no leader after the holds were released";
+    for (int i = 0; i < 3; ++i) EXPECT_EQ(c.originOnDisk(i), "founder") << "node " << i;
+}
+
+// A node that starts minutes after the others and hears an established cluster joins as a Joiner and is confirmed -
+// the first two found.  RED: a unanimity founding rule.
+TEST(ConsensusCandidacyElectionRegression, SequentialStartStillFormsRegression) {
+    Cluster c(3);
+    const auto autoFmt = [](NodeConfig& k) { k.storageFormat = StorageFormat::Auto; };
+    c.startWith(0, autoFmt);
+    std::this_thread::sleep_for(2s);
+    c.startWith(1, autoFmt);
+    ASSERT_TRUE(until([&] { return c.agreedLeader({0, 1}) >= 0; }, 30s)) << "0 and 1 never formed a cluster";
+    std::this_thread::sleep_for(2s);
+    c.startWith(2, autoFmt);
+    ASSERT_TRUE(until([&] { return c.originOnDisk(2) == "joiner"; }, 30s)) << "node 2 never decided Joiner";
+    EXPECT_TRUE(until([&] { return gateStateOf(c, 2) == 0; }, 30s)) << "node 2 was never CONFIRMED";
+    EXPECT_EQ(c.originOnDisk(0), "founder");
+    EXPECT_EQ(c.originOnDisk(1), "founder");
+}
+
+// v2-review C1: an Undecided cluster founds at runtime and its controller BOOTSTRAPS the metadata log - the
+// mayBootstrap thunk is read at the claim, from the live origin.  RED: evaluate it once in BrokerNode::start and keep
+// the bool (origin Undecided -> false -> the controller halts and resigns; no ready controller ever exists).
+TEST(ConsensusCandidacyElectionRegression, FreshUndecidedThreeNodeClusterBootstrapsRegression) {
+    Cluster c(3);
+    for (int i = 0; i < 3; ++i)
+        c.startWith(i, [](NodeConfig& k) { k.storageFormat = StorageFormat::Auto; });
+    int32_t L = -1;
+    ASSERT_TRUE(until([&] { L = c.agreedLeader({0, 1, 2}); return L >= 0; }, 30s)) << "no consensus leader";
+    EXPECT_TRUE(until([&] {
+        return c.node(L).onControlThreadForTest([&] {
+            auto* md = c.node(L).metadataServiceForTest();
+            return md != nullptr && md->controllerReady() &&
+                   md->featureLevel() == rune::replication::MetadataFeature::kLatest;
+        });
+    }, 30s)) << "the leader never became a ready controller at the latest feature level";
+}
+
+// Replaces v2's fail-stop: `--new` formatted into a RUNNING cluster joins it instead of founding; it grants no vote
+// until CONFIRMED.  RED: the founder rule on mode New.
+TEST(StorageFormatRegression, NewFormattedIntoARunningClusterJoinsRegression) {
+    Cluster c(3);
+    for (int i = 0; i < 3; ++i) c.start(i);
+    const int32_t L = settledLeader(c, {0, 1, 2}, 20s);
+    ASSERT_GE(L, 0);
+    const int X = (L + 1) % 3;
+    c.stop(X);
+    c.wipeRaw(X);
+    c.startWith(X, [](NodeConfig& k) { k.storageFormat = StorageFormat::New; });
+    ASSERT_TRUE(until([&] { return c.originOnDisk(X) == "joiner"; }, 10s)) << "X never decided Joiner";
+    bool confirmed = false;
+    ASSERT_TRUE(until([&] {
+        const auto r = c.node(X).onControlThreadForTest([&] {
+            return std::make_pair(c.node(X).storageGateStateForTest(), c.node(X).electionForTest()->votesGrantedForTest());
+        });
+        if (r.first != 0) EXPECT_EQ(r.second, 0u) << "a vote was granted by an unconfirmed storage";
+        confirmed = r.first == 0;
+        return confirmed;
+    }, 30s)) << "X was never CONFIRMED";
+}
+
+// C1 (CP2 review): history is transitive in the canvass flags - a Joiner that never led still advertises history, so an
+// Undecided peer cannot count it as "fresh".  Both other nodes are stopped: L has no quorum, only canvasses (no NLT), so
+// the wiped X learns of history from L's canvass flag alone and holds no term of its own.
+// RED: the old flag formula (boot history / own terms only) gives 2.
+TEST(StorageGateWiringRegression, AJoinerAdvertisesHistoryRegression) {
+    Cluster c(3);
+    for (int i = 0; i < 3; ++i) c.start(i);
+    const int32_t L = settledLeader(c, {0, 1, 2}, 20s);
+    ASSERT_GE(L, 0);
+    const int X = (L + 1) % 3, Y = (L + 2) % 3;
+    c.stop(X);
+    c.stop(Y);
+    c.wipe(X);
+    c.startWith(X, [](NodeConfig& k) { k.testHoldFollowerFetchesMs = 60'000; });
+    EXPECT_TRUE(until([&] {
+        return c.node(X).onControlThreadForTest([&] { return c.node(X).canvassFlagsForTest(); }) == 3;
+    }, 5s)) << "a joiner advertised fresh flags (" << c.node(X).onControlThreadForTest([&] { return c.node(X).canvassFlagsForTest(); }) << ")";
+}
+
+// C1-R: the founding dwell must cover the transport's reconnect to a restarted peer (resolver recheck 1 s + pending
+// backoff 1 s).  RED: the old max(300 ms, 3 x status) dwell.
+TEST(StorageGateWiringRegression, FoundingDwellCoversPeerReResolutionRegression) {
+    Cluster c(3);
+    for (int i = 0; i < 3; ++i) c.start(i);
+    ASSERT_GE(settledLeader(c, {0, 1, 2}, 20s), 0);
+    const int64_t dwell = c.node(0).onControlThreadForTest([&] { return c.node(0).foundingLongDwellNsForTest(); });
+    EXPECT_GE(dwell, rune::node::PeerResolverHub::kRecheckNs + rune::node::PeerResolverHub::kPendingMaxNs);
+}
+
+// C1 / C1-R (CP2): two replaced disks restart (auto) next to one live node L that holds the history, while L's frames do
+// not reach them for 1.5 s (an address change: the transport reconnects late).  Neither wiped node may found over L: no
+// wiped node leads and L's committed metadata is never truncated.  `dropOnlyToX2`: only X2 loses L's frames - X2 must
+// then join through X1's history flag.  Run with --gtest_repeat=20.
+// RED: the 300 ms dwell (both found at once) / without the transitive flag (X2 founds on X1's fresh canvass).
+void twoReplacedDisksScenario(bool dropOnlyToX2) {
+    Cluster c(3);
+    for (int i = 0; i < 3; ++i) c.start(i);
+    const int32_t L = settledLeader(c, {0, 1, 2}, 20s);
+    ASSERT_GE(L, 0);
+    ASSERT_EQ(c.defineTopic(), 0);
+    const int X1 = (L + 1) % 3, X2 = (L + 2) % 3;
+    const int64_t hw = c.meta(L).hw;
+    c.stop(X1);
+    c.stop(X2);
+    c.wipeRaw(X1);
+    c.wipeRaw(X2);
+    const auto fmt = [&](bool drop) {
+        return [drop, L](NodeConfig& k) {
+            k.storageFormat = StorageFormat::Auto;
+            k.testHoldFollowerFetchesMs = 60'000;   // the data plane would hand them L's history too: model the dead link
+            if (drop) { k.testDropConsensusFromPeer = L; k.testDropConsensusForMs = 1500; }
+        };
+    };
+    c.startWith(X1, fmt(!dropOnlyToX2));   // both restart together: each first hears the other's "fresh" canvass
+    c.startWith(X2, fmt(true));
+    ASSERT_TRUE(until([&] { return c.originOnDisk(X1) == "joiner"; }, 20s)) << "X1 decided " << c.originOnDisk(X1);
+    ASSERT_TRUE(until([&] { return c.originOnDisk(X2) == "joiner"; }, 20s))
+        << "X2 decided " << c.originOnDisk(X2) << ": it founded over a live history node";
+    const auto end = std::chrono::steady_clock::now() + 5s;
+    while (std::chrono::steady_clock::now() < end) {
+        EXPECT_FALSE(c.election(X1).closedWith(X1) || c.election(X1).closedWith(X2));
+        EXPECT_FALSE(c.election(X2).closedWith(X1) || c.election(X2).closedWith(X2));
+        EXPECT_GE(c.meta(L).leo, hw) << "the live node's committed metadata was truncated";
+        std::this_thread::sleep_for(20ms);
+    }
+}
+TEST(ConsensusCandidacyElectionRegression, TwoReplacedDisksNeverFoundOverALiveHistoryMemberRegression) {
+    twoReplacedDisksScenario(false);
+}
+TEST(ConsensusCandidacyElectionRegression, ReplacedDiskNeverFoundsOnAJoinersFreshCanvassRegression) {
+    twoReplacedDisksScenario(true);
+}
+
+// CP2 review M6: the abstention is switched OFF by the unsafe recovery vote (and only by it) on an unconfirmed storage.
+// RED: drop the `!storageRecoveryVote` term in BrokerNode::abstainGateThunk_.
+TEST(StorageGateWiringRegression, RecoveryVoteSwitchesAbstentionOffRegression) {
+    Cluster c(3);
+    for (int i = 0; i < 3; ++i) c.start(i);
+    const int32_t L = settledLeader(c, {0, 1, 2}, 20s);
+    ASSERT_GE(L, 0);
+    const int X = (L + 1) % 3;
+    c.stop(X);
+    c.wipe(X);
+    c.startWith(X, [](NodeConfig& k) { k.testHoldFollowerFetchesMs = 60'000; });
+    ASSERT_EQ(gateStateOf(c, X), 1);
+    EXPECT_TRUE(c.node(X).onControlThreadForTest([&] { return c.node(X).abstainsForTest(); }))
+        << "an unconfirmed storage must abstain";
+    c.stop(X);
+    c.startWith(X, [](NodeConfig& k) { k.testHoldFollowerFetchesMs = 60'000; k.storageRecoveryVote = true; });
+    ASSERT_EQ(gateStateOf(c, X), 1);
+    EXPECT_FALSE(c.node(X).onControlThreadForTest([&] { return c.node(X).abstainsForTest(); }))
+        << "the recovery vote must turn abstention off";
 }
