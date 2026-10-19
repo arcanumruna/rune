@@ -48,6 +48,7 @@
 //                        RUNE_ACKED_FILE, written when it ends) has arrived.  Role both: every acked record.
 //   RUNE_STOP_FILE       when this file exists the producer stops producing and the consumer stops consuming
 //   RUNE_ACKED_FILE / RUNE_RECEIVED_FILE  where the acked / received sequence numbers are written (one per line)
+//   RUNE_ACKS            all (default) | leader: the producer's acks (an acked record is durable with all)
 //   RUNE_QUIET           1 = no per-record output
 // Output (stdout): "WS: READY" once connected (and the group assigned), "WS-PRODUCER: acked=<a> failed=<f>",
 //   "WS-CONSUMER: distinct=<d> total=<t>".  A produce refused with an authentication code exits 1 printing
@@ -311,8 +312,6 @@ int runWorldServer(ClientConfig& cfg, const std::string& role, int timeoutMs) {
 
     WsSeen seen;
     std::atomic<bool> assigned{!doConsume || group.empty()};
-    if (getEnvStr("RUNE_MODE") == "ws") return runWorldServer(cfg, getEnvStr("RUNE_WS_ROLE", "both"), timeoutMs);
-
     int rc = 0;
 
     try {
@@ -370,7 +369,9 @@ int runWorldServer(ClientConfig& cfg, const std::string& role, int timeoutMs) {
             const TopicHandle th = c.topic(produceTopic);
             if (!th.valid()) { std::cerr << "CLIENT: topic '" << produceTopic << "' not valid\n"; return 1; }
             ProducerConfig pcfg;
-            pcfg.acks             = Acks::Leader;
+            // "Acked" must mean durable: with acks=leader a record acked by a leader that is then restarted may never
+            // have been replicated (the cluster-key rotation restarts every broker under this producer).
+            pcfg.acks             = getEnvStr("RUNE_ACKS", "all") == "leader" ? Acks::Leader : Acks::All;
             pcfg.lingerUs         = 1;
             pcfg.batchBytes       = 1;
             pcfg.maxInFlight      = 16;
@@ -537,6 +538,8 @@ int main() {
                   << topicsStr << "'\n";
         return 1;
     }
+
+    if (getEnvStr("RUNE_MODE") == "ws") return runWorldServer(cfg, getEnvStr("RUNE_WS_ROLE", "both"), timeoutMs);
 
     int rc = 0;
 
