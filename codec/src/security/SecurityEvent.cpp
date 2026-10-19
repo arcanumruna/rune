@@ -168,6 +168,11 @@ std::expected<Ops, DecodeError> getOps(Reader& r, EventKind kind) {
 
 } // namespace
 
+std::optional<EncodeError> validateEvent(const SecurityEvent& e) noexcept {
+    if (auto v = validate(e)) return asEncodeError(*v);
+    return std::nullopt;
+}
+
 EventKind kindOf(const Ops& ops) noexcept { return static_cast<EventKind>(ops.index() + 1); }
 
 std::expected<void, EncodeError> encodeInto(const SecurityEvent& e, std::vector<uint8_t>& out) {

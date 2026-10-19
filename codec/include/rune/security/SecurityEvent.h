@@ -96,6 +96,9 @@ enum class EncodeError : uint8_t { KindOpsMismatch, FieldTooLong, BadVerifier,
                                    UnknownFormatVer, UnknownKind, BadEnum };
 
 [[nodiscard]] EventKind kindOf(const Ops&) noexcept;
+/// THE formatVer-1 value validation, the one rule set encode and decode run — exported so apply()
+/// refuses an in-memory event exactly where encode would.  nullopt = valid.
+[[nodiscard]] std::optional<EncodeError> validateEvent(const SecurityEvent&) noexcept;
 [[nodiscard]] std::expected<void, EncodeError> encodeInto(const SecurityEvent&, std::vector<uint8_t>& out);   // clears, reuses capacity
 [[nodiscard]] std::expected<std::vector<uint8_t>, EncodeError> encode(const SecurityEvent&);
 [[nodiscard]] std::expected<SecurityEvent, DecodeError> decode(std::span<const uint8_t>) noexcept;
