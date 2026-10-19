@@ -43,6 +43,7 @@ or malformed.
 | `RUNE_ELECTION_TIMEOUT_MS` | no | `150` | int64 ms | Max wait per election round. Raise for slow / cross-datacenter links. |
 | `RUNE_ELECTION_STATUS_INTERVAL_MS` | no | `20` | int64 ms | Canvass / heartbeat cadence. |
 | `RUNE_STARTUP_CANVASS_TIMEOUT_MS` | no | `100` | int64 ms | Extended canvass window on first boot (peer discovery). |
+| `RUNE_CATALOG_REPL_STREAM_ID` | no | `30` | int32 | Aeron stream id of the `__catalog` replication stream (see [The catalog](#the-catalog-__catalog)). Must differ from `RUNE_REPLICATION_STREAM_ID` and lie outside the per-worker range `[RUNE_REPL_BASE_STREAM_ID, RUNE_REPL_BASE_STREAM_ID + RUNE_WORKERS)`; the broker refuses to start otherwise. Keep it the same on every node. |
 | `RUNE_TRANSIENT_LOG_RING_BYTES` | no | `8388608` (8 MiB) | int32 bytes | Node-wide ring size of every transient partition. Must be a power of two; any other value keeps the default. `RUNE_MEMORY_LOG_RING_BYTES` is a **deprecated** alias that logs one warning; when both are set, the canonical name wins. |
 
 > Not env-configurable (yet): dynamic membership.
@@ -58,20 +59,89 @@ or malformed.
 
 ### Topics are created by DDL
 
-A broker starts with no topics. Every topic is created through the catalog, with Rune QL DDL, once a
-catalog leader is up and before anything produces or subscribes:
+A broker starts with no topics, and no environment variable defines one. The variable that earlier
+releases used for boot topics is gone: a broker that finds it set refuses to start, with an error
+that points here. Every topic is created through the catalog, with Rune QL DDL, once a catalog leader
+is up and before anything produces or subscribes:
 
 ```bash
-rune ql -e "topic events partitions 3;" --broker rune-1:40200
+rune ql -e "topic events partitions 3 replicas 3;" --broker rune-1:40200
 rune ql -e "transient topic presence partitions 1;" --broker rune-1:40200
 rune ql -f topics.rql --request-id 0123456789abcdef0123456789abcd00 --broker rune-1:40200
 ```
 
-`-f` runs the statements in order and stops at the first error, naming its statement. A fixed
-`--request-id` makes a re-run return the original results instead of `TopicExists`. A topic's id is
-assigned in creation order, from 0. Settings go in a `with (...)` clause (for example
-`with (tier = leader)`), and `replicas N` sets the replication factor. The client's `defineTopic`
-does the same from code. The docker e2e scripts create their topics with `docker/create-topics.sh`.
+`--broker` can name any broker: a broker that is not the catalog leader answers a DDL with a
+Redirect, and the CLI and the client follow it (at most 3 hops). `-f` runs the statements in order
+and stops at the first error, naming its statement. A fixed `--request-id` makes a re-run return the
+original results instead of `TopicExists` (with `-f`, statement N uses the id plus N - 1). A topic's
+id is assigned in creation order, from 0. The client's `defineTopic` does the same from code. The
+docker e2e scripts create their topics with `docker/create-topics.sh`.
+
+**Typed and untyped topics.** `topic NAME partitions N ...;` makes an untyped topic: records are
+opaque bytes. `topic NAME { field type, ... } partitions N key FIELD;` makes a typed topic with a
+schema; a typed topic needs both the field list and `key`. `transient topic ...;` makes a transient
+topic (see [Transient topics](#transient-topics)); persistence is fixed at creation.
+
+**Replication factor.** `replicas R` is the topic's replication factor.
+
+- `R` must be at most the broker count, and at least `RUNE_MIN_ISR` (a majority of the brokers
+  unless you set it). Each violation is answered `InvalidRequest` (39) with a detail that names the
+  bound.
+- `R` must also not exceed the brokers that can hold a replica now: a broker whose catalog apply
+  halted is not a placement target, and the detail names it.
+- `replicas 0`, or leaving `replicas` out, means every broker.
+
+**Creation settings.** A `with (key = value, ...)` clause after the statement sets the topic's
+creation settings. Each key may appear once. These replace the options of the removed variable:
+
+| Removed option | `with (...)` key | Values and default |
+|---|---|---|
+| `rf=N` | `replicas N` (not in `with`) | 0 = every broker (default) |
+| `persistence=transient` | `transient topic` (not in `with`) | `disk` (default) or `transient` |
+| `group=G` | `copartition.group = 'G'` | string, none by default |
+| `key=F` | `partition.key = 'F'` | string, none by default |
+| `durability=` | `durability` | `majority` (default), `all-in-sync` |
+| `tier=` | `tier` | `leader`, `majority` (default), `strict` |
+| policy field | `cleanup.policy` | `delete` (default), `compact`, `compact_delete` |
+| segment roll bytes | `segment.bytes` | 1 to 2 080 374 783; default 64 MiB |
+| delete retention ms | `delete.retention.ms` | at least 0; default 86 400 000 |
+| retention ms | `retention.ms` | at least -1; -1 = unbounded (default) |
+| retention bytes | `retention.bytes` | at least -1; -1 = unbounded (default) |
+| retention check ms | `retention.check.ms` | at least 1; default 300 000 |
+| file delete delay ms | `file.delete.delay.ms` | at least 1; default 60 000 |
+| min cleanable dirty ratio | `min.cleanable.dirty.ratio` | decimal 0 to 1, at most 6 places; default 0.5 |
+| max compaction lag ms | `max.compaction.lag.ms` | at least -1; -1 = disabled (default) |
+| (new) | `min.compaction.lag.ms` | at least 0; default 0 |
+
+A value outside its range is answered `InvalidRequest` (39) with a detail such as
+`retention.ms -2 < -1`.
+
+```bash
+rune ql -e "topic orders partitions 4 replicas 3 with (tier = leader, durability = all-in-sync);" --broker rune-1:40200
+rune ql -e "topic audit partitions 1 with (cleanup.policy = compact, segment.bytes = 1048576);" --broker rune-1:40200
+rune ql -e "topic player { userId uint64, name string(32), score int64 } partitions 4 key userId;" --broker rune-1:40200
+```
+
+**Changing a topic.** `alter topic NAME set key = value, ...;` changes the six alterable
+settings: `retention.ms`, `retention.bytes`, `delete.retention.ms`, `min.cleanable.dirty.ratio`,
+`min.compaction.lag.ms` and `max.compaction.lag.ms`. Every other `with` key is fixed at creation. The
+same ranges apply to the resulting config. Altering a view is answered `ViewNotAlterable` (38); an
+unknown topic is answered `UnknownTopic` (7). Schema changes use the other form of `alter topic`
+(`add column`, `drop column`, `rename column`, `set compatibility`).
+
+```bash
+rune ql -e "alter topic events set retention.ms = 604800000, retention.bytes = 1073741824;" --broker rune-1:40200
+```
+
+**Dropping.** `drop topic NAME;` and `drop view NAME;` end the object's life; both are events in the
+catalog and stay in its history.
+
+- `drop topic` on a view is answered `InvalidRequest` with "is a view; use DROP VIEW".
+- `drop topic` on the source of a live view is answered `InvalidRequest`, naming the view. Drop the
+  view first.
+- Dropping an unknown name is answered `UnknownTopic` (7).
+- The data of a dropped topic is moved to `dataDir/dropped/` and purged. A name may be created again
+  afterwards; the new object has a new id, so history never mixes the two.
 
 ### Topic and view names
 
@@ -98,6 +168,36 @@ One rule applies to topic and view names in Rune QL, the client's `defineTopic` 
   that view's `createView` failed or is in doubt. A `createView` retry with the same name and
   definition reuses its own failed attempt's output topic, which is always empty because nothing
   can write to it before its definition commits.
+
+### The catalog (`__catalog`)
+
+`__catalog` is an internal topic that holds the log of every DDL: each topic, schema and view
+change is one event in it. A broker's topics, schemas and views are what you get by applying that log
+in order. The event model, the history reads and the operator tools are in
+[CATALOG.md](CATALOG.md).
+
+- It has one partition, replicated to **every** broker, written with `acks=all`. Its minimum ISR is
+  a majority of the brokers.
+- Unclean leader election is never used for it.
+- It is never compacted and never deleted by retention. It is always on disk, never transient.
+- Its replication stream is `RUNE_CATALOG_REPL_STREAM_ID` (default 30), the same on every node.
+- A DDL sent to a broker that is not its leader is answered with a Redirect to the leader. If it
+  has fewer than a majority of replicas in sync, a DDL is answered `NotLeader` (retriable) and
+  produce and consume on existing topics are unaffected.
+
+**Restart.** A broker replays its local copy of `__catalog` before it builds anything, then catches
+up from the leader. It records the last offset it applied in `dataDir/__catalog/applied`.
+
+**A new broker.** The cluster adds a `__catalog` replica on it, and it fetches the whole log from
+offset 0 and applies it.
+
+**Old directories.** `dataDir/__topic_schemas` and `dataDir/__views` from earlier releases are
+ignored and never changed (there is no migration). A warning names them if they hold data. Delete
+them by hand when you no longer need them.
+
+**A broker whose apply halts** (a replayed event's fingerprint does not match) keeps serving what
+it already applied and accepts no catalog change. See [the halted-apply
+runbook](CATALOG.md#halted).
 
 ### Data directory clean-up at boot
 
