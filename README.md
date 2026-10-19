@@ -77,7 +77,6 @@ The **flight recorder** lives in its own repository,
 
 | | |
 |---|---|
-| **Development OS** | macOS (Apple Silicon builds as x86_64: pass `-s arch=x86_64` to Conan and `-DCMAKE_OSX_ARCHITECTURES=x86_64`, because the Aeron recipe does not support macOS arm64). |
 | **Production and tests of Linux-only code** | Linux. io_uring (kernel 5.6 or newer for the opcodes the broker uses; it falls back to a portable backend when io_uring is unavailable), UDP GSO and epoll polling are Linux only. |
 | **Compiler** | A C++23 compiler. The Docker builder uses GCC 13; the macOS development builds use Apple clang 17. CMake does not check the version. |
 | **CMake** | 3.31 or newer for the root, `broker/`, `client-cpp/`, `crypto/` and `protocol/`; 3.25 for `codec/` and `ql/`. |
