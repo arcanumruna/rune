@@ -1,0 +1,6 @@
+-- docker/topics/catalog-e2e.rql: the first DDL of docker/catalog-e2e.sh, run through broker 1.
+-- Ids in creation order: players = 0, events = 1, presence = 2 (the script's produce/consume uses events = 1).
+-- players is typed (id is its key; hp feeds the view the script creates through broker 2).
+topic players { id int64, hp int64 } partitions 1 replicas 3 key id;
+topic events partitions 1 replicas 3;
+transient topic presence partitions 1;

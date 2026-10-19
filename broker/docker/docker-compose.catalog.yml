@@ -1,0 +1,168 @@
+# docker/docker-compose.catalog.yml — the 3-node cluster of docker/catalog-e2e.sh (catalog history, Task 24).
+#
+# ONE file, TWO compose projects: `CLUSTER=a` (the cluster under test) and `CLUSTER=b` (a fresh, empty
+# cluster the exported catalog is replayed into).  Run as
+#     CLUSTER=a docker compose -p catalog-a -f docker/docker-compose.catalog.yml up -d
+# The containers are named, hostnamed and network-aliased `${CLUSTER}-rune-N` (a-rune-1.., b-rune-1..), and
+# RUNE_PEERS uses those names, so one client container attached to both networks addresses every broker
+# unambiguously (the bare service names rune-1..3 exist in BOTH networks and are never used).  No host
+# ports are published: the clusters and the CLI container talk over the compose networks only (the file's
+# "distinct ports" requirement is met by the distinct networks).
+# The topics are NOT declared here: the brokers boot with an empty catalog and the script creates every
+# topic by DDL.  All three nodes share ONE image (build rune-1 only; building the three concurrently OOMs).
+# RUNE_CATALOG_REPL_STREAM_ID defaults to 30 (the broker default, the same on every node).
+
+name: catalog-${CLUSTER:-a}
+
+x-broker-build: &broker-build
+  context: ..
+  dockerfile: docker/Dockerfile
+  args:
+    - CMAKE_BUILD_PARALLEL_LEVEL   # from the environment when set (small Docker VMs); unset = ninja default
+  additional_contexts:
+    # relative to this compose file's dir (docker/), so ../../rune-protocol = the sibling repo
+    # RUNE_PROTOCOL_DIR overrides it (e.g. a rune-protocol worktree on main when the
+    # sibling checkout sits on a feature branch).
+    rune-protocol: ${RUNE_PROTOCOL_DIR:-../../rune-protocol}
+    # rune-fr flight recorder: compiled sibling lib wired by the root CMakeLists
+    # (add_library(rune_fr ...) from ${SRC}/../rune-fr).  Needs src/ AND include/.
+    rune-fr: ../../rune-fr
+    # rune-codec (0a): compiled sibling codec lib; Dockerfile COPYs --from=rune-codec.
+    rune-codec: ../../rune-codec
+    # rune-crypto (client<->broker TLS/AEAD): the Dockerfile COPYs --from=rune-crypto.
+    rune-crypto: ../../rune-crypto
+
+x-broker-env: &broker-env
+  # GR-9: peer spec includes the replicationPort (4th segment) so the data-plane
+  # replication transport actually STARTS — without it the broker logs
+  # "no replicationPort configured — topics won't replicate" and acks=All can
+  # never be majority-durable (committed records are lost on leader kill).
+  # Format: id@host:consensusPort:clientPort:replicationPort.
+  #   consensus  = 40111 (Raft/consensus aeron:udp)
+  #   client     = 40200 (client gateway aeron:udp)
+  #   replication= 40222 (follower→leader fetch / leader→follower data aeron:udp)
+  # Followers use clientPort to redirect Produce/Subscribe to the leader endpoint.
+  RUNE_PEERS: "0@${CLUSTER}-rune-1:40111:40200:40222,1@${CLUSTER}-rune-2:40111:40200:40222,2@${CLUSTER}-rune-3:40111:40200:40222"
+  RUNE_DATA_DIR: /var/lib/rune
+  # Client gateway listens on all interfaces inside the container.
+  # RUNE_CLIENT_ENDPOINT is the raw "host:port" appended to "aeron:udp?endpoint=".
+  RUNE_CLIENT_ENDPOINT: "0.0.0.0:40200"
+  # Election timing — slightly relaxed for cross-container UDP latency.
+  RUNE_ELECTION_TIMEOUT_MS: "300"
+  RUNE_ELECTION_STATUS_INTERVAL_MS: "50"
+  RUNE_STARTUP_CANVASS_TIMEOUT_MS: "200"
+  # Optional log level (honoured by src/main.cpp via RUNE_LOG_LEVEL); "info"
+  # keeps the E2E output readable.  Set "debug" to surface gateway
+  # redirect/accept/subscribe decisions when diagnosing.
+  RUNE_LOG_LEVEL: "${RUNE_LOG_LEVEL:-info}"
+  # Diagnostic per-tick FollowerSync/ISR + transport-rate logging (RUNE_FS_LOG) is
+  # opt-in: unset / "" / "0" = OFF, and "0" is now also the DEFAULT (fd9a8bb).
+  # This explicit off pins e2e to off regardless of future default changes, so it
+  # never floods/starves the data-plane threads (esp. under amd64 emulation on
+  # Apple Silicon).  Set to "1" only when debugging replication.
+  RUNE_FS_LOG: "0"
+  # Container /dev/shm budget (2026-10-02 defaults): the broker DEFAULT term is
+  # 16 MiB and every publication/image maps 3 terms (48 MiB) — on the RECEIVING
+  # side too, so a DR client container (--shm-size=64m) could not hold one broker
+  # image.  Explicit 4 MiB terms (the pre-2026-10-02 size) for the containers.
+  RUNE_AERON_TERM_BUFFER_BYTES: "4194304"
+  # NO topics are declared here: the brokers boot with an empty catalog and the data-plane topics
+  # (events = 0, multi = 1, cg = 2, ids in creation order) are created by DDL once a leader is up:
+  # docker/create-topics.sh e2e  (docker/topics/e2e.rql; the dr-e2e harness does the same).
+  # E3 io_uring portability: Docker Desktop on Apple Silicon / Rosetta x86_64
+  # emulation does NOT translate the io_uring_setup(2) syscall (NR 425), causing
+  # the broker to crash on startup.  Setting RUNE_IO_BACKEND=portable activates
+  # UringFlushBackend's graceful fallback (submit() returns kNoToken; tier 0/1
+  # acks are enqueued synchronously without io_uring).  On bare-metal Linux CI
+  # where io_uring IS available, this variable is still safe — tier-2 (Strict)
+  # produces simply see the same back-pressure they would get with a full ring.
+  RUNE_IO_BACKEND: "portable"
+  # The __catalog replication stream (default 30; the same on every node, outside the per-worker range).
+  RUNE_CATALOG_REPL_STREAM_ID: "${RUNE_CATALOG_REPL_STREAM_ID:-30}"
+
+services:
+  rune-1:
+    build: *broker-build
+    image: rune-broker-node:${RUNE_IMAGE_TAG:-latest}
+    platform: linux/amd64
+    container_name: ${CLUSTER}-rune-1
+    hostname: ${CLUSTER}-rune-1
+    networks:
+      default:
+        aliases:
+          - ${CLUSTER}-rune-1
+    sysctls:
+      net.ipv4.ip_local_reserved_ports: "40111,40200,40222"
+    shm_size: "256m"
+    security_opt:
+      - seccomp=unconfined
+    environment:
+      <<: *broker-env
+      RUNE_NODE_ID: "0"
+    volumes:
+      - rune-data-1:/var/lib/rune
+    healthcheck:
+      test: ["CMD", "pgrep", "-x", "rune_broker"]
+      interval: 5s
+      timeout: 3s
+      start_period: 20s
+      retries: 5
+
+  rune-2:
+    build: *broker-build
+    image: rune-broker-node:${RUNE_IMAGE_TAG:-latest}
+    platform: linux/amd64
+    container_name: ${CLUSTER}-rune-2
+    hostname: ${CLUSTER}-rune-2
+    networks:
+      default:
+        aliases:
+          - ${CLUSTER}-rune-2
+    sysctls:
+      net.ipv4.ip_local_reserved_ports: "40111,40200,40222"
+    shm_size: "256m"
+    security_opt:
+      - seccomp=unconfined
+    environment:
+      <<: *broker-env
+      RUNE_NODE_ID: "1"
+    volumes:
+      - rune-data-2:/var/lib/rune
+    healthcheck:
+      test: ["CMD", "pgrep", "-x", "rune_broker"]
+      interval: 5s
+      timeout: 3s
+      start_period: 20s
+      retries: 5
+
+  rune-3:
+    build: *broker-build
+    image: rune-broker-node:${RUNE_IMAGE_TAG:-latest}
+    platform: linux/amd64
+    container_name: ${CLUSTER}-rune-3
+    hostname: ${CLUSTER}-rune-3
+    networks:
+      default:
+        aliases:
+          - ${CLUSTER}-rune-3
+    sysctls:
+      net.ipv4.ip_local_reserved_ports: "40111,40200,40222"
+    shm_size: "256m"
+    security_opt:
+      - seccomp=unconfined
+    environment:
+      <<: *broker-env
+      RUNE_NODE_ID: "2"
+    volumes:
+      - rune-data-3:/var/lib/rune
+    healthcheck:
+      test: ["CMD", "pgrep", "-x", "rune_broker"]
+      interval: 5s
+      timeout: 3s
+      start_period: 20s
+      retries: 5
+
+volumes:
+  rune-data-1:
+  rune-data-2:
+  rune-data-3:
