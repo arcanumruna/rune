@@ -136,6 +136,15 @@ target_include_directories(rune_catalog PUBLIC ${RUNE_CODEC_ROOT}/include ${RUNE
 target_link_libraries(rune_catalog PUBLIC rune_codec)
 target_compile_features(rune_catalog PUBLIC cxx_std_23)
 
+# ── rune_security — the shared authentication library (auth spec §3, plan D1): event
+#    model, frozen v1 apply rules, fingerprints, permissions, verifying replayer, .rsec.
+#    Compiled from the rune-codec sibling's sources, exactly like rune_catalog.
+file(GLOB RUNE_SECURITY_SOURCES CONFIGURE_DEPENDS ${RUNE_CODEC_ROOT}/src/security/*.cpp)
+add_library(rune_security STATIC ${RUNE_SECURITY_SOURCES})
+target_include_directories(rune_security PUBLIC ${RUNE_CODEC_ROOT}/include)
+target_link_libraries(rune_security PUBLIC rune_catalog)
+target_compile_features(rune_security PUBLIC cxx_std_23)
+
 # Task 9 / spec §11: RUNE_TLS — the client<->broker TLS/AEAD enablement gate.
 # OFF (default): NodeConfig.cpp never reads RUNE_TLS_CERT_FILE/RUNE_TLS_KEY_FILE/
 # RUNE_REQUIRE_TLS from the environment (guarded by the RUNE_TLS_ENABLED compile
