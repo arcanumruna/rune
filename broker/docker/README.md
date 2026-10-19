@@ -34,7 +34,8 @@ docker build \
 ```
 
 Run from `broker/` in the monorepo (the compose files do the same with `context: ..`). The four `--build-context` entries supply the
-sibling subprojects (and flight-recorder, which has its own repository) the root `CMakeLists.txt` compiles unconditionally: `rune-protocol`
+sibling subprojects the root `CMakeLists.txt` compiles unconditionally (`flight-recorder` is a separate
+repository, `$FLIGHT_RECORDER_DIR`): `rune-protocol`
 (headers + `src/net`), `flight-recorder`, `rune-codec` (incl. the catalog library) and
 `rune-crypto`. `docker compose` passes the same four contexts for the broker
 image and for the `probe` image (`docker/Dockerfile.probe`), so prefer
@@ -68,21 +69,22 @@ across a rolling restart. Reference: [../docs/SECURITY.md](../docs/SECURITY.md).
 
 ## Environment variables
 
-All config is read by `src/main.cpp` (`parseNodeConfigFromEnv`).
+All config is read by `parseNodeConfigFromEnv` (`libs/node/src/NodeConfig.cpp`); the complete table, with every
+default, is [../../docs/configuration.md](../../docs/configuration.md). The variables a deployment normally sets:
 
 | Variable                        | Required | Default     | Description                                      |
 |---------------------------------|----------|-------------|--------------------------------------------------|
 | `RUNE_NODE_ID`                  | yes      | —           | Integer node ID (0-based)                        |
 | `RUNE_CLUSTER_KEY_FILE`         | yes (auth on, the default) | — | Shared cluster key file; the broker refuses to start without it. `RUNE_AUTH=disabled` is single-node development only |
 | `RUNE_PEERS`                    | yes      | —           | Comma-separated `id@host:port` list (all nodes)  |
-| `RUNE_CLIENT_ENDPOINT`          | yes      | —           | Aeron UDP endpoint for clients, e.g. `aeron:udp?endpoint=0.0.0.0:40200` |
+| `RUNE_CLIENT_ENDPOINT`          | yes      | —           | Client listen address: `host:port`, e.g. `0.0.0.0:40200` (a full `aeron:udp?endpoint=...` channel is also accepted) |
 | `RUNE_CLIENT_STREAM_ID`         | no       | `1`         | Aeron stream ID for client traffic               |
 | `RUNE_CONSENSUS_STREAM_ID`      | no       | `10`        | Aeron stream ID for consensus traffic            |
 | `RUNE_DATA_DIR`                 | no       | `/var/lib/rune` | Writable data directory (mount a volume here) |
 | `RUNE_STORAGE_FORMAT`           | no       | (unset: never format) | `new` / `join` / `auto`; read **only** when the data dir is empty and not formatted. Unset: an empty dir refuses to start (exit 78) and prints the command to run. `auto` is development only. See `docs/SELF-HOSTING.md` "Formatting the data directory" |
 | `RUNE_STORAGE_RECOVERY_VOTE`    | no       | `0`         | Unsafe, disaster recovery only (see `docs/SELF-HOSTING.md`) |
-| `RUNE_ELECTION_TIMEOUT_MIN_MS`  | no       | (default)   | Min election timeout in ms                       |
-| `RUNE_ELECTION_TIMEOUT_MAX_MS`  | no       | (default)   | Max election timeout in ms                       |
+| `RUNE_ELECTION_TIMEOUT_MS`      | no       | `150`       | Maximum wait per election round, in ms           |
+| `RUNE_ELECTION_STATUS_INTERVAL_MS` | no    | `20`        | Canvass and heartbeat cadence, in ms             |
 
 ---
 
@@ -117,9 +119,11 @@ Then start it:
 docker run --rm \
   --platform linux/amd64 \
   --shm-size=256m \
+  -v "$PWD/secrets/cluster.key:/run/secrets/cluster.key:ro" \
+  -e RUNE_CLUSTER_KEY_FILE=/run/secrets/cluster.key \
   -e RUNE_NODE_ID=0 \
-  -e RUNE_PEERS='0@127.0.0.1:40100' \
-  -e RUNE_CLIENT_ENDPOINT='aeron:udp?endpoint=0.0.0.0:40200' \
+  -e RUNE_PEERS='0@127.0.0.1:40111' \
+  -e RUNE_CLIENT_ENDPOINT='0.0.0.0:40200' \
   -e RUNE_DATA_DIR=/var/lib/rune \
   -v rune-data:/var/lib/rune \
   rune-broker:dev
@@ -159,7 +163,7 @@ names (`rune-1`, `rune-2`, `rune-3`) resolve automatically.
 
 ### Bring up the cluster
 
-Run from the `rune-broker` repo root:
+Run from the `broker/` directory:
 
 ```sh
 docker compose -f docker/docker-compose.yml build

@@ -7,17 +7,21 @@ All inter-node (consensus) and client traffic is `aeron:udp`.
 ## Prerequisites
 
 - Docker (with BuildKit).
-- The sibling `rune-protocol` repo checked out next to `rune-broker` — its headers are
-  supplied at build time via a BuildKit named context (Phase-1 sibling-include).
+- The monorepo checkout (`broker/`, `protocol/`, `codec/`, `crypto/` side by side) and a checkout of the
+  [flight-recorder](https://github.com/arcanumruna/flight-recorder) repository (`FLIGHT_RECORDER_DIR`, by default next to
+  the monorepo). Their sources reach the image through BuildKit named contexts.
 
 ## Build the image
 
-Run from the `rune-broker` repo root:
+Run from the `broker/` directory:
 
 ```sh
 docker build \
   --platform linux/amd64 \
   --build-context rune-protocol=../protocol \
+  --build-context flight-recorder="$FLIGHT_RECORDER_DIR" \
+  --build-context rune-codec=../codec \
+  --build-context rune-crypto=../crypto \
   -f docker/Dockerfile \
   -t rune-broker:latest \
   .
@@ -28,14 +32,15 @@ docker build \
 
 ## Configuration reference (all environment variables)
 
-These are **every** variable the broker reads (from `libs/node/src/NodeConfig.cpp`). There
-are no others — the process exits non-zero with a clear message if a required one is missing
-or malformed.
+These are the variables a deployment normally sets (from `libs/node/src/NodeConfig.cpp`). The broker reads
+more tuning variables (Aeron transport, idle strategies, rings, flight recorder); the **complete** list, with defaults, is
+[docs/configuration.md](../../docs/configuration.md). The process exits non-zero with a clear message if a required variable is
+missing or malformed.
 
 | Variable | Required | Default | Type | Description |
 |---|---|---|---|---|
 | `RUNE_NODE_ID` | **yes** | — | int | This node's id (0-based). Must be one of the ids in `RUNE_PEERS`. |
-| `RUNE_PEERS` | **yes** | — | list | Comma-separated `id@host:consensusPort` for **all** nodes incl. self. Ids unique; must contain `RUNE_NODE_ID`; `host:port` is **raw** (broker builds `aeron:udp?endpoint=…`). Whitespace trimmed; trailing/empty entries rejected. Single-node: just `0@127.0.0.1:40111`. |
+| `RUNE_PEERS` | **yes** | — | list | Comma-separated `id@host:consensusPort[:clientPort[:replicationPort[...]]]` for **all** nodes incl. self. Ids unique; must contain `RUNE_NODE_ID`; `host:port` is **raw** (broker builds `aeron:udp?endpoint=…`). Whitespace trimmed; trailing/empty entries rejected. Single-node: just `0@127.0.0.1:40111`. A cluster needs the client and replication ports too: `0@rune-1:40111:40200:40222,…` (see the compose files). |
 | `RUNE_CLIENT_ENDPOINT` | **yes** | — | host:port | **Raw `host:port`** the client gateway listens on (broker prepends `aeron:udp?endpoint=`). Use `0.0.0.0:40200` to bind all interfaces. Do **not** pass a full `aeron:udp?...` string. |
 | `RUNE_DATA_DIR` | **yes** | — | path | Writable dir for durable state (node-state, term log, partition logs). Mount a volume/bind-mount here. (Compose files set it to `/var/lib/rune`.) |
 | `RUNE_STORAGE_FORMAT` | no | *(unset: never format)* | `new` \| `join` \| `auto` | Read **only** when `RUNE_DATA_DIR` is empty and not formatted. Unset: the broker refuses to start and says what to run. `new`: format for a new cluster. `join`: format as a new or replaced disk of a running cluster. `auto`: development only — formats any empty dir. See "Formatting the data directory". |
@@ -512,7 +517,7 @@ the compose files mount `./secrets/cluster.key` (or `$RUNE_SECRETS_DIR/cluster.k
 start the stack when it is missing:
 
 ```sh
-# from the rune-broker repo root
+# from the broker/ directory
 rune security gen-cluster-key --out docker/secrets/cluster.key
 docker compose -f docker/docker-compose.yml up -d rune-1 rune-2 rune-3
 docker compose -f docker/docker-compose.yml logs -f
@@ -528,7 +533,7 @@ membership list, `shm_size: 256m`, and a per-node named volume:
 ```yaml
 # sketch — see docker/docker-compose.yml for the full file
 x-broker-env: &broker-env
-  RUNE_PEERS: "0@rune-1:40111,1@rune-2:40111,2@rune-3:40111"   # identical on every node
+  RUNE_PEERS: "0@rune-1:40111:40200:40222,1@rune-2:40111:40200:40222,2@rune-3:40111:40200:40222"   # identical on every node
   RUNE_CLIENT_ENDPOINT: "0.0.0.0:40200"                        # raw host:port
   RUNE_DATA_DIR: /var/lib/rune
 
@@ -640,9 +645,10 @@ volumes, no host ports, `build:` from source). For your own deployment use the
   shm size, stream ids, election timings).
 
 ```sh
-# 1. Build (or pull) the image once
+# 1. Build (or pull) the image once (see "Build the image" above for the four build contexts)
 docker build --platform linux/amd64 --build-context rune-protocol=../protocol \
-    -f docker/Dockerfile -t rune-broker:latest .
+    --build-context flight-recorder="$FLIGHT_RECORDER_DIR" --build-context rune-codec=../codec \
+    --build-context rune-crypto=../crypto -f docker/Dockerfile -t rune-broker:latest .
 
 # 2. Copy + edit the env file
 cp docker/rune-cluster.env.example docker/rune-cluster.env
@@ -678,9 +684,9 @@ host-to-host. Example for node 0 on `hostA` (peers `hostA/hostB/hostC`):
 
 ```sh
 docker run -d --name rune-0 --platform linux/amd64 --shm-size=256m \
-  -p 40111:40111/udp -p 40200:40200/udp \
+  -p 40111:40111/udp -p 40200:40200/udp -p 40222:40222/udp \
   -e RUNE_NODE_ID=0 \
-  -e RUNE_PEERS='0@hostA:40111,1@hostB:40111,2@hostC:40111' \
+  -e RUNE_PEERS='0@hostA:40111:40200:40222,1@hostB:40111:40200:40222,2@hostC:40111:40200:40222' \
   -e RUNE_CLIENT_ENDPOINT='0.0.0.0:40200' \
   -e RUNE_DATA_DIR=/var/lib/rune \
   -e RUNE_ELECTION_TIMEOUT_MS=1000 \
@@ -689,6 +695,9 @@ docker run -d --name rune-0 --platform linux/amd64 --shm-size=256m \
   -v /srv/rune/node0:/var/lib/rune \
   rune-broker:latest
 ```
+
+Also publish the per-worker UDP ports, which shard mode derives from the node id (`8200 + 192 × id` and the next 191 ports;
+see [Derived ports](../../docs/configuration.md#derived-ports)).
 
 Before the first start, format `/srv/rune/node0` once on each host (`docker run --rm -v /srv/rune/node0:/var/lib/rune
 -e RUNE_DATA_DIR=/var/lib/rune rune-broker:latest rune_broker storage format --new`; see "Formatting the data

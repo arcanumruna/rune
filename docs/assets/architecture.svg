@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 470" width="1200" height="470" role="img" aria-label="Architecture: a C++ client talks over Aeron UDP to a node. The gateway handles connect, login, metadata and DDL, and records DDL in the catalog and security logs. Produce and subscribe go straight to the shard worker that owns the partition. Workers append to the partition log and replicate it to the in-sync follower nodes. Materialized views are folded from the partition logs.">
+  <defs>
+    <linearGradient id="hot" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#22d3ee"/><stop offset="1" stop-color="#a855f7"/></linearGradient>
+    <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#a855f7"/></marker>
+  </defs>
+  <rect width="1200" height="470" rx="22" fill="#06060a"/>
+  <rect x=".5" y=".5" width="1199" height="469" rx="21.5" fill="none" stroke="#a885f7" stroke-opacity=".22"/>
+  <text x="600" y="36" text-anchor="middle" font-family="'JetBrains Mono','SF Mono',Menlo,Consolas,monospace" font-size="12" letter-spacing="4" fill="#7a7a92">ONE NODE OF A CLUSTER · ALL TRAFFIC OVER AERON UDP</text>
+  <rect x="30" y="160" width="190" height="130" rx="16" fill="#0d0d16" stroke="#a885f7" stroke-opacity=".3" stroke-width="1"/>
+  <text x="125.0" y="194" text-anchor="middle" font-family="'Space Grotesk','Segoe UI',Helvetica,Arial,sans-serif" font-size="20" font-weight="600" fill="#edecf5">Client</text>
+  <text x="125.0" y="222" text-anchor="middle" font-family="'JetBrains Mono','SF Mono',Menlo,Consolas,monospace" font-size="12.5" fill="#a3a3b8">C++ library · rune CLI</text>
+  <text x="125.0" y="244" text-anchor="middle" font-family="'JetBrains Mono','SF Mono',Menlo,Consolas,monospace" font-size="12.5" fill="#7a7a92">Thread or Invoker mode</text>
+  <text x="125.0" y="266" text-anchor="middle" font-family="'JetBrains Mono','SF Mono',Menlo,Consolas,monospace" font-size="12.5" fill="#7a7a92">login: SCRAM-SHA-512</text>
+  <rect x="310" y="70" width="220" height="130" rx="16" fill="#0d0d16" stroke="#a885f7" stroke-opacity=".3" stroke-width="1"/>
+  <text x="420.0" y="104" text-anchor="middle" font-family="'Space Grotesk','Segoe UI',Helvetica,Arial,sans-serif" font-size="20" font-weight="600" fill="#edecf5">Gateway</text>
+  <text x="420.0" y="132" text-anchor="middle" font-family="'JetBrains Mono','SF Mono',Menlo,Consolas,monospace" font-size="12.5" fill="#a3a3b8">connect · login</text>
+  <text x="420.0" y="154" text-anchor="middle" font-family="'JetBrains Mono','SF Mono',Menlo,Consolas,monospace" font-size="12.5" fill="#7a7a92">metadata · DDL</text>
+  <text x="420.0" y="176" text-anchor="middle" font-family="'JetBrains Mono','SF Mono',Menlo,Consolas,monospace" font-size="12.5" fill="#7a7a92">redirect to the leader</text>
+  <rect x="310" y="250" width="220" height="130" rx="16" fill="#0d0d16" stroke="url(#hot)" stroke-opacity="1" stroke-width="1.6"/>
+  <text x="420.0" y="284" text-anchor="middle" font-family="'Space Grotesk','Segoe UI',Helvetica,Arial,sans-serif" font-size="20" font-weight="600" fill="#edecf5">Shard workers</text>
+  <text x="420.0" y="312" text-anchor="middle" font-family="'JetBrains Mono','SF Mono',Menlo,Consolas,monospace" font-size="12.5" fill="#a3a3b8">own their partitions</text>
+  <text x="420.0" y="334" text-anchor="middle" font-family="'JetBrains Mono','SF Mono',Menlo,Consolas,monospace" font-size="12.5" fill="#7a7a92">own Aeron streams</text>
+  <text x="420.0" y="356" text-anchor="middle" font-family="'JetBrains Mono','SF Mono',Menlo,Consolas,monospace" font-size="12.5" fill="#7a7a92">append · replicate · serve</text>
+  <rect x="610" y="70" width="220" height="130" rx="16" fill="#0d0d16" stroke="#a885f7" stroke-opacity=".3" stroke-width="1"/>
+  <text x="720.0" y="104" text-anchor="middle" font-family="'Space Grotesk','Segoe UI',Helvetica,Arial,sans-serif" font-size="20" font-weight="600" fill="#edecf5">Catalog + security</text>
+  <text x="720.0" y="132" text-anchor="middle" font-family="'JetBrains Mono','SF Mono',Menlo,Consolas,monospace" font-size="12.5" fill="#a3a3b8">__catalog · __security</text>
+  <text x="720.0" y="154" text-anchor="middle" font-family="'JetBrains Mono','SF Mono',Menlo,Consolas,monospace" font-size="12.5" fill="#7a7a92">replicated event logs</text>
+  <text x="720.0" y="176" text-anchor="middle" font-family="'JetBrains Mono','SF Mono',Menlo,Consolas,monospace" font-size="12.5" fill="#7a7a92">history · as of · diff</text>
+  <rect x="610" y="250" width="220" height="130" rx="16" fill="#0d0d16" stroke="url(#hot)" stroke-opacity="1" stroke-width="1.6"/>
+  <text x="720.0" y="284" text-anchor="middle" font-family="'Space Grotesk','Segoe UI',Helvetica,Arial,sans-serif" font-size="20" font-weight="600" fill="#edecf5">Partition log</text>
+  <text x="720.0" y="312" text-anchor="middle" font-family="'JetBrains Mono','SF Mono',Menlo,Consolas,monospace" font-size="12.5" fill="#a3a3b8">append · offset index</text>
+  <text x="720.0" y="334" text-anchor="middle" font-family="'JetBrains Mono','SF Mono',Menlo,Consolas,monospace" font-size="12.5" fill="#7a7a92">disk, or transient ring</text>
+  <text x="720.0" y="356" text-anchor="middle" font-family="'JetBrains Mono','SF Mono',Menlo,Consolas,monospace" font-size="12.5" fill="#7a7a92">retention · compaction</text>
+  <rect x="910" y="70" width="260" height="130" rx="16" fill="#0d0d16" stroke="#a885f7" stroke-opacity=".3" stroke-width="1"/>
+  <text x="1040.0" y="104" text-anchor="middle" font-family="'Space Grotesk','Segoe UI',Helvetica,Arial,sans-serif" font-size="20" font-weight="600" fill="#edecf5">Materialized views</text>
+  <text x="1040.0" y="132" text-anchor="middle" font-family="'JetBrains Mono','SF Mono',Menlo,Consolas,monospace" font-size="12.5" fill="#a3a3b8">folded from topics</text>
+  <text x="1040.0" y="154" text-anchor="middle" font-family="'JetBrains Mono','SF Mono',Menlo,Consolas,monospace" font-size="12.5" fill="#7a7a92">persisted or transient</text>
+  <text x="1040.0" y="176" text-anchor="middle" font-family="'JetBrains Mono','SF Mono',Menlo,Consolas,monospace" font-size="12.5" fill="#7a7a92">read by key</text>
+  <rect x="910" y="250" width="260" height="130" rx="16" fill="#0d0d16" stroke="#a885f7" stroke-opacity=".3" stroke-width="1"/>
+  <text x="1040.0" y="284" text-anchor="middle" font-family="'Space Grotesk','Segoe UI',Helvetica,Arial,sans-serif" font-size="20" font-weight="600" fill="#edecf5">Follower nodes</text>
+  <text x="1040.0" y="312" text-anchor="middle" font-family="'JetBrains Mono','SF Mono',Menlo,Consolas,monospace" font-size="12.5" fill="#a3a3b8">same log, in-sync replicas</text>
+  <text x="1040.0" y="334" text-anchor="middle" font-family="'JetBrains Mono','SF Mono',Menlo,Consolas,monospace" font-size="12.5" fill="#7a7a92">acks: leader · majority · strict</text>
+  <text x="1040.0" y="356" text-anchor="middle" font-family="'JetBrains Mono','SF Mono',Menlo,Consolas,monospace" font-size="12.5" fill="#7a7a92">ISR · failover · re-election</text>
+  <polyline points="125,160 125,135 304,135" fill="none" stroke="#a855f7" stroke-width="2" stroke-dasharray="5 5" marker-end="url(#ar)"/>
+  <text x="215" y="126" text-anchor="middle" font-family="'JetBrains Mono','SF Mono',Menlo,Consolas,monospace" font-size="11.5" fill="#7a7a92">control</text>
+  <polyline points="125,290 125,315 304,315" fill="none" stroke="#a855f7" stroke-width="2" marker-end="url(#ar)"/>
+  <text x="215" y="338" text-anchor="middle" font-family="'JetBrains Mono','SF Mono',Menlo,Consolas,monospace" font-size="11.5" fill="#7a7a92">produce · subscribe</text>
+  <line x1="536" y1="135" x2="604" y2="135" stroke="#a855f7" stroke-width="2" stroke-dasharray="5 5" marker-end="url(#ar)"/>
+  <line x1="536" y1="315" x2="604" y2="315" stroke="#a855f7" stroke-width="2" marker-end="url(#ar)"/>
+  <line x1="836" y1="315" x2="904" y2="315" stroke="#a855f7" stroke-width="2" marker-end="url(#ar)"/>
+  <text x="870" y="306" text-anchor="middle" font-family="'JetBrains Mono','SF Mono',Menlo,Consolas,monospace" font-size="11.5" fill="#7a7a92">replicate</text>
+  <line x1="836" y1="262" x2="904" y2="200" stroke="#a855f7" stroke-width="2" stroke-dasharray="5 5" marker-end="url(#ar)"/>
+  <text x="884" y="238" text-anchor="middle" font-family="'JetBrains Mono','SF Mono',Menlo,Consolas,monospace" font-size="11.5" fill="#7a7a92">fold</text>
+  <line x1="40" y1="430" x2="86" y2="430" stroke="#a855f7" stroke-width="2" marker-end="url(#ar)"/>
+  <text x="98" y="434" font-family="'JetBrains Mono','SF Mono',Menlo,Consolas,monospace" font-size="12" fill="#a3a3b8">data path: straight to the worker that owns the partition</text>
+  <line x1="560" y1="430" x2="606" y2="430" stroke="#a855f7" stroke-width="2" stroke-dasharray="5 5" marker-end="url(#ar)"/>
+  <text x="618" y="434" font-family="'JetBrains Mono','SF Mono',Menlo,Consolas,monospace" font-size="12" fill="#a3a3b8">control path: session, metadata, DDL, derived state</text>
+</svg>
