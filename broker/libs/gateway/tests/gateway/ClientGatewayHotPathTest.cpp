@@ -528,5 +528,55 @@ TEST(ProduceValidationRegression, AMalformedBatchChainIsRefusedOnGatewayRegressi
     fs::remove_all(dir, ec);
 }
 
+// X036 (review I3): a produce frame is EXACTLY ONE non-control batch.  A well-formed second batch would be appended with no
+// CRC, producer-state or offset-restamp check; a lone control batch is a forged marker; a bad declared length (0, negative,
+// near INT32_MAX) must neither crash nor pass.  RED: replace refusesClientBatches with the multi-batch walk (or drop the
+// t == len test) - the two-batch frame is accepted; drop the control test - the lone control frame is accepted.
+TEST(ProduceValidationRegression, ASingleBatchRuleIsEnforcedOnGatewayRegression)
+{
+    const fs::path dir = makeTempDir();
+    std::vector<rune::node::TopicSpec> specs;
+    { rune::node::TopicSpec ts; ts.name = "events"; ts.partitionCount = 1; ts.topicId = 0; specs.push_back(ts); }
+    rune::gateway::TopicRegistry registry(specs, dir.string());
+    std::vector<uint8_t> captured;
+    ClientGateway gw = ClientGateway::makeForTest(
+        [&captured](const uint8_t* buf, std::size_t len) -> int64_t { captured.assign(buf, buf + len); return 1; }, 1);
+    gw.setTopicRegistry(&registry);
+    const int64_t sid = gw.injectTestSession(0);
+    auto data = [](const char* k) { rune::protocol::RecordBatchBuilder b(0, 1000); b.append(k, "v", 1000); return b.build(); };
+    auto control = [] { rune::protocol::RecordBatchBuilder b(0, 1000); b.setControl(true); b.setProducerId(7); b.setProducerEpoch(0);
+                        b.setBaseSequence(0); b.append("", "", 1000); return b.build(); };
+    auto setLen = [](std::vector<uint8_t>& b, uint32_t field) {
+        for (int i = 0; i < 4; ++i) b[static_cast<std::size_t>(rune::protocol::batch::kLengthOffset) + i] = static_cast<uint8_t>(field >> (8 * i));
+    };
+    struct Case { const char* name; std::vector<uint8_t> batches; bool refused; };
+    std::vector<Case> cases;
+    { auto a = data("a"); auto b = data("b"); a.insert(a.end(), b.begin(), b.end()); cases.push_back({"two well-formed batches", a, true}); }
+    cases.push_back({"lone control batch", control(), true});
+    { auto a = data("a"); setLen(a, 0); cases.push_back({"length 0", a, true}); }
+    { auto a = data("a"); setLen(a, 0xFFFFFFF0u); cases.push_back({"negative length", a, true}); }
+    { auto a = data("a"); setLen(a, 0x7FFFFFF8u); cases.push_back({"length near INT32_MAX", a, true}); }
+    { auto a = data("a"); setLen(a, 0x7FFFFFF4u); cases.push_back({"length INT32_MAX-12+..", a, true}); }
+    cases.push_back({"one well-formed batch", data("a"), false});
+    int corr = 200;
+    for (const auto& c : cases) {
+        captured.clear();
+        pc::Produce prod;
+        prod.sessionId = sid; prod.correlationId = ++corr; prod.topicId = 0; prod.partition = 0; prod.partitionKnown = 1;
+        prod.acks = 0; prod.producerId = -1; prod.baseSequence = -1;
+        prod.recordBatch = std::span<const uint8_t>(c.batches.data(), c.batches.size());
+        std::vector<uint8_t> frame(prod.encodedSize() + 8);
+        frame.resize(prod.encode(frame.data()));
+        gw.applyProduceForTest(frame.data(), frame.size());
+        ASSERT_FALSE(captured.empty()) << c.name;
+        auto resp = pc::ProduceResponse::decode(captured.data(), captured.size());
+        ASSERT_TRUE(resp.has_value()) << c.name;
+        if (c.refused) EXPECT_EQ(resp->errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest)) << c.name;
+        else           EXPECT_NE(resp->errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest)) << c.name;
+    }
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
 } // namespace
 } // namespace rune::gateway

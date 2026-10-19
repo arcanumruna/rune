@@ -1,8 +1,8 @@
 #pragma once
 // UnauthLogLimiter.h - combined fix program M13 (X103): log lines an UNAUTHENTICATED sender can drive (a worker's decrypt
 // failure on the produce thread, a require-TLS refusal, a bad bootstrap proof, login failures) are logged the first
-// time and then every 1024th occurrence of their kind; every other occurrence only bumps `suppressed()` (published as
-// counter 1'000'239).  Single-writer: owned by the one thread that logs; no atomics, no allocation.
+// time and then every 1024th occurrence of their kind; every other occurrence only bumps `suppressed()` (NOT yet published as
+// counter 1'000'239: that needs the worker-to-control fold and a BrokerNode registration).  Single-writer: owned by the one thread that logs; no atomics, no allocation.
 #include <cstddef>
 #include <cstdint>
 

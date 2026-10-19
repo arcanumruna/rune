@@ -694,25 +694,23 @@ public:
     void requireEnforcement() noexcept {
         if (!std::holds_alternative<Enforcing>(enforcement_)) enforcement_ = Enforcing{ackSink_.get()};
     }
-    /// Combined fix program (X036): true when a client-supplied Produce record-batch span must be REFUSED whole -
-    /// any batch carries kAttrControl (COMMIT/ABORT markers are the broker's own; a client-built one would forge a
-    /// marker), OR the batch chain is malformed.  The append validates (CRC) only the FIRST batch and writes the whole
-    /// span, so the chain is checked strictly here, fail-closed: every batch is at least a header long, fits in the
-    /// span, and the chain ends exactly at `len`.  Header reads only, no allocation.  Shared by gateway and worker.
+    /// Combined fix program (X036, review I1/I3): true when a client-supplied Produce record-batch span must be REFUSED.
+    /// A client produce frame carries EXACTLY ONE batch: the append CRC-checks, producer-checks and offset-restamps only
+    /// the first batch yet writes the whole span, so a second batch (or trailing bytes) would land unvalidated and break
+    /// the log's offset invariant.  Refused: fewer than a header's bytes, a declared length that is not the span, or the
+    /// control bit (COMMIT/ABORT markers are the broker's own).  O(1), header reads only, no allocation; the length is
+    /// computed in 64 bits from the raw field (RecordBatchReader::totalLength adds 12 to an int32: UB near INT32_MAX).
     [[nodiscard]] static bool refusesClientBatches(const uint8_t* data, std::size_t len) noexcept {
         namespace b = rune::protocol::batch;
-        const auto overhead = static_cast<std::size_t>(b::kRecordBatchOverhead);
-        std::size_t rd = 0;
-        while (rd < len) {
-            if (len - rd < overhead) return true;                      // trailing partial header
-            const rune::protocol::RecordBatchReader r(data + rd, len - rd);
-            if ((static_cast<uint16_t>(r.attributes()) & static_cast<uint16_t>(b::kAttrControl)) != 0) return true;
-            const int32_t t = r.totalLength();
-            if (t < static_cast<int32_t>(overhead) || static_cast<std::size_t>(t) > len - rd) return true;   // runt / overlong
-            rd += static_cast<std::size_t>(t);
-        }
-        return false;
+        if (len < static_cast<std::size_t>(b::kRecordBatchOverhead)) return true;
+        uint32_t lengthField = 0;
+        std::memcpy(&lengthField, data + b::kLengthOffset, sizeof lengthField);   // little-endian wire, as the reader
+        if constexpr (std::endian::native == std::endian::big) lengthField = __builtin_bswap32(lengthField);
+        if (static_cast<uint64_t>(lengthField) + 12u != static_cast<uint64_t>(len)) return true;   // 0, "negative", huge, short, long
+        const rune::protocol::RecordBatchReader r(data, len);
+        return (static_cast<uint16_t>(r.attributes()) & static_cast<uint16_t>(b::kAttrControl)) != 0;
     }
+
     /// X103: produce frames this worker dropped because they failed to open, and the log lines the 1/1024 limit swallowed.
     [[nodiscard]] uint64_t decryptFailuresForTest() const noexcept { return decryptFailures_; }
     [[nodiscard]] uint64_t unauthLogSuppressed() const noexcept { return unauthLog_.suppressed(); }
@@ -6822,7 +6820,7 @@ private:
     /// never appended), counted and logged rate-limited (worker-thread-owned counter).
     [[gnu::cold]] [[gnu::noinline]] int refuseControlBatch_(const rune::protocol::client::Produce& msg, uint8_t directAck) {
         if (controlBatchRefusals_++ % 1024 == 0)
-            spdlog::warn("Worker {}: WorkerIngress: produce with a client control/malformed batch chain refused InvalidRequest "
+            spdlog::warn("Worker {}: WorkerIngress: produce with a frame that is not exactly one non-control batch refused InvalidRequest "
                          "(session={}, topic={}); total {}", workerId_, msg.sessionId, msg.topicId, controlBatchRefusals_);
         WorkerReturn ret = produceAnswer_(ProduceOrigin::WorkerIngress, msg.sessionId, msg.correlationId,
                                           msg.topicId, msg.partition);

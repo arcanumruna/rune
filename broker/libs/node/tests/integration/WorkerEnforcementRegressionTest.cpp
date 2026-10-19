@@ -101,3 +101,40 @@ TEST(ProduceValidationRegression, AMalformedBatchChainIsRefusedOnWorkerRegressio
         EXPECT_EQ(rig.log->logEndOffset(), leo) << "variant " << variant;
     }
 }
+
+// X036 (review I3) at the worker's direct ingress: exactly one non-control batch.  Same RED as the gateway test.
+TEST(ProduceValidationRegression, ASingleBatchRuleIsEnforcedOnWorkerRegression) {
+    Rig rig;
+    auto data = [](const char* k) { rune::protocol::RecordBatchBuilder b(0, 1000); b.append(k, "v", 1000); return b.build(); };
+    auto control = [] { rune::protocol::RecordBatchBuilder b(0, 1000); b.setControl(true); b.setProducerId(7); b.setProducerEpoch(0);
+                        b.setBaseSequence(0); b.append("", "", 1000); return b.build(); };
+    auto setLen = [](std::vector<uint8_t>& b, uint32_t field) {
+        for (int i = 0; i < 4; ++i) b[static_cast<std::size_t>(rune::protocol::batch::kLengthOffset) + i] = static_cast<uint8_t>(field >> (8 * i));
+    };
+    struct Case { const char* name; std::vector<uint8_t> batches; bool refused; };
+    std::vector<Case> cases;
+    { auto a = data("a"); auto b = data("b"); a.insert(a.end(), b.begin(), b.end()); cases.push_back({"two well-formed batches", a, true}); }
+    cases.push_back({"lone control batch", control(), true});
+    { auto a = data("a"); setLen(a, 0); cases.push_back({"length 0", a, true}); }
+    { auto a = data("a"); setLen(a, 0xFFFFFFF0u); cases.push_back({"negative length", a, true}); }
+    { auto a = data("a"); setLen(a, 0x7FFFFFF8u); cases.push_back({"length near INT32_MAX", a, true}); }
+    cases.push_back({"one well-formed batch", data("a"), false});
+    int corr = 50;
+    for (const auto& c : cases) {
+        pc::Produce msg;
+        msg.sessionId = 1; msg.correlationId = ++corr; msg.topicId = 1; msg.partition = 0;
+        msg.partitionKnown = 1; msg.acks = 1; msg.producerId = -1; msg.producerEpoch = 0; msg.baseSequence = -1;
+        msg.recordBatch = std::span<const uint8_t>(c.batches);
+        std::vector<uint8_t> frame(msg.encodedSize());
+        frame.resize(msg.encode(frame.data()));
+        const int64_t leo = rig.log->logEndOffset();
+        rig.pass(&frame);
+        const int16_t code = answerOf(rig);
+        if (c.refused) {
+            EXPECT_EQ(code, static_cast<int16_t>(pc::ErrorCode::InvalidRequest)) << c.name;
+            EXPECT_EQ(rig.log->logEndOffset(), leo) << c.name << ": nothing appended";
+        } else {
+            EXPECT_EQ(code, 0) << c.name;
+        }
+    }
+}

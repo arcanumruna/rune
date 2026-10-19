@@ -3713,7 +3713,7 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     // carrying kAttrControl refuses the whole frame, consumed and never appended.
     if (rune::node::Worker::refusesClientBatches(msg.recordBatch.data(), batchLen)) [[unlikely]] {
         if (controlBatchRefusals_++ % 1024 == 0)
-            spdlog::warn("ClientGateway: Produce with a client control batch refused InvalidRequest "
+            spdlog::warn("ClientGateway: Produce frame is not exactly one non-control batch; refused InvalidRequest "
                          "(session={}, topic={}); total {}", msg.sessionId, msg.topicId, controlBatchRefusals_);
         sendResp(pc::ErrorCode::InvalidRequest, partition, 0);
         return true;
