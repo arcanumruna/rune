@@ -6,12 +6,14 @@
 #include <rune/aeronutil/testing/FreePort.h>
 #include <rune/node/EmbeddedDriver.h>
 #include <rune/protocol/RecordBatch.h>
+#include <rune/protocol/client/AuthMessages.h>
 #include <rune/protocol/client/ControlMessages.h>
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/GroupMessages.h>
 #include <rune/protocol/client/OffsetMessages.h>
 #include <rune/protocol/client/MessageHeader.h>
 #include <rune/protocol/client/MetadataMessages.h>
+#include <rune/protocol/client/PingMessages.h>
 #include <rune/protocol/client/Protocol.h>
 #include <rune/protocol/client/SchemaMessages.h>
 
@@ -151,6 +153,7 @@ public:
         req.egressStreamId = kEgressStream;
         req.clientVersion  = clientVersion_;
         req.egressChannel  = egressChannel_;
+        req.sessionId      = connectHint_;   // authentication Task 11: a resume hint (0 = none)
         std::vector<uint8_t> buf(pc::MessageHeader::ENCODED_SIZE + pc::ConnectRequest::BODY_FIXED + 2 +
                                  req.egressChannel.size());
         const std::size_t len = req.encode(buf.data());
@@ -339,6 +342,55 @@ public:
     }
 
     int64_t nextCorrelationId() noexcept { return ++corr_; }
+    /// Forget the last ConnectResponse, then wait for the next one (a machine that sent its own ConnectRequest through
+    /// send()): nullopt if none by `deadline`.
+    void forgetConnectResponse() noexcept { connect_.reset(); }
+    std::optional<pc::ConnectResponse> awaitConnectResponse(Clock::time_point deadline) {
+        while (Clock::now() < deadline) {
+            poll_();
+            if (connect_) return connect_;
+            pause_();
+        }
+        return connect_;
+    }
+    /// The sessionId of later ConnectRequests (the resume hint of a reconnecting client; 0 = a fresh connect).
+    void setConnectHint(int64_t sessionId) noexcept { connectHint_ = sessionId; }
+    /// Authentication Task 11: the raw bytes of the AuthServerFirst (13) / AuthServerFinal (15) frames by correlation id.
+    /// The first of the two to arrive for `corr` (a rate-limited or malformed AuthClientFirst is answered by a final
+    /// straight away).  nullopt: none by `deadline`.
+    struct AuthFrame { uint16_t templateId = 0; std::vector<uint8_t> bytes; };
+    std::optional<AuthFrame> awaitAuthFrame(int64_t corr, Clock::time_point deadline) {
+        while (Clock::now() < deadline) {
+            poll_();
+            if (auto a = authFrameFor_(corr)) return a;
+            pause_();
+        }
+        return authFrameFor_(corr);
+    }
+    /// The AuthServerFinal (15) for `corr` specifically (after an AuthServerFirst was seen).
+    std::optional<AuthFrame> awaitAuthFinal(int64_t corr, Clock::time_point deadline) {
+        const auto key = std::make_pair(static_cast<uint16_t>(pc::TemplateId::AuthServerFinal), corr);
+        while (Clock::now() < deadline) {
+            poll_();
+            if (auto it = authFrames_.find(key); it != authFrames_.end()) return AuthFrame{key.first, it->second};
+            pause_();
+        }
+        return std::nullopt;
+    }
+    /// A session-level Ping (a request the broker answers with a Pong, or UnknownSession for a dead session): the
+    /// ErrorResponse code answered for it, nullopt if none by `deadline` (a Pong or silence).
+    std::optional<int16_t> pingError(const std::string& ch, int32_t stream, int64_t sid, Clock::time_point deadline) {
+        pc::Ping p; p.sessionId = sid; p.correlationId = ++corr_;
+        uint8_t buf[64];
+        const std::size_t len = p.encode(buf);
+        if (!send(ch, stream, buf, len)) return std::nullopt;
+        while (Clock::now() < deadline) {
+            poll_();
+            for (const ErrorSeen& e : errors_) if (e.correlationId == p.correlationId) return e.code;
+            pause_();
+        }
+        return std::nullopt;
+    }
     /// The last ConnectResponse this client decoded (authentication tests read authMode / authState from it).
     [[nodiscard]] const std::optional<pc::ConnectResponse>& lastConnectResponse() const noexcept { return connect_; }
 
@@ -778,6 +830,11 @@ private:
         const std::size_t len = m.encode(buf.data());
         return len > 0 && send(ch, stream, buf.data(), len) ? m.correlationId : 0;
     }
+    std::optional<AuthFrame> authFrameFor_(int64_t corr) const {
+        for (const uint16_t t : {static_cast<uint16_t>(pc::TemplateId::AuthServerFirst), static_cast<uint16_t>(pc::TemplateId::AuthServerFinal)})
+            if (auto it = authFrames_.find({t, corr}); it != authFrames_.end()) return AuthFrame{t, it->second};
+        return std::nullopt;
+    }
     std::optional<AnyAnswer> anyDdlAnswer_(int64_t corr) const {
         namespace T = rune::protocol::client;
         if (auto it = defines_.find(corr); it != defines_.end())
@@ -954,6 +1011,10 @@ private:
                         expired_.insert(e->sessionId);
                 }
                 break;
+            case pc::TemplateId::AuthServerFirst:
+            case pc::TemplateId::AuthServerFinal:
+                authFrames_[{hdr->templateId, hdr->correlationId}] = std::vector<uint8_t>(p, p + n);
+                break;
             case pc::TemplateId::DdlResponse:
                 if (auto r = pc::DdlResponse::decode(p, n))
                     ddls_[r->correlationId] = DdlAnswer{r->errorCode, r->objectId, r->newVersion, r->gateTopicId,
@@ -993,12 +1054,14 @@ private:
     std::map<int64_t, pc::CreateViewResponse>       views_;
     std::map<int64_t, pc::AlterTopicResponse>       alters_;
     std::map<int64_t, DdlAnswer>                    ddls_;      // DdlResponse (78) by corr (Task 11)
+    std::map<std::pair<uint16_t, int64_t>, std::vector<uint8_t>> authFrames_;   // AuthServerFirst / Final raw bytes (auth Task 11)
     struct ViewRowSeen { uint16_t status = 0; std::vector<uint8_t> row; };
     std::map<int64_t, ViewRowSeen>                  viewRows_;   // ViewRowResponse (status + row bytes) by corr
     std::map<int64_t, SchemaAnswer>                 schemas_;
     std::map<int64_t, int16_t>                      subscribes_;   // SubscribeResponse errorCode by corr
     std::map<int64_t, int64_t>                      subscribeIds_; // SubscribeResponse subscriptionId by corr
     int32_t                                         clientVersion_ = 1;
+    int64_t                                         connectHint_ = 0;
     std::map<int64_t, JoinAnswer>                   joins_;
     std::map<int64_t, int16_t>                      heartbeats_;
     std::map<int64_t, int16_t>                      commits_;

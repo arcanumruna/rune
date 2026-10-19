@@ -1,0 +1,237 @@
+#pragma once
+// AuthBroker.h - ONE real BrokerNode with authentication ENABLED (single node, real Aeron UDP), a generated cluster key
+// file, and the helpers every authentication test needs (authentication Task 11; used by Tasks 11-19):
+//
+//   bootstrapAdmin()          - `rune security bootstrap` the way the CLI does it over the wire (cluster-key MAC), the
+//                               one-time-password login, and the admin's own password change; afterwards an admin
+//                               session is kept for the helpers below
+//   createUser(name, pw, grants...) / createRole / grant / grantRole / alter*  - security DDL as that admin
+//   wire()                    - a fresh AuthWireClient (its own embedded Aeron driver) for raw-frame work
+//   counter(typeId)           - a CnC counter of this broker (1'000'229-231 = logins ok / failed / rate-limited)
+//   LogCapture                - the broker's control-thread log lines (reason=..., "authenticated over plaintext")
+//
+// Every wait is bounded (the deadline is the failure, never a hang).  Options: DevDisabled mode, a short auth deadline.
+
+#include "support/AuthWireClient.h"
+#include "support/SecurityBrokerCluster.h"
+#include "support/TestNodeConfig.h"
+
+#include <rune/aeronutil/testing/FreePort.h>
+#include <rune/node/BrokerNode.h>
+#include <rune/node/NodeConfig.h>
+#include <rune/node/RoleCounter.h>
+
+#include <CncFileReader.h>
+#include <concurrent/CountersReader.h>
+
+#include <spdlog/sinks/ringbuffer_sink.h>
+#include <spdlog/spdlog.h>
+
+#include <atomic>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include <unistd.h>
+
+namespace rune::node::test {
+
+/// RAII: captures the default logger (every broker thread logs through it) and restores it.  Install BEFORE the broker.
+struct LogCapture {
+    std::shared_ptr<spdlog::sinks::ringbuffer_sink_mt> sink = std::make_shared<spdlog::sinks::ringbuffer_sink_mt>(4096);
+    std::shared_ptr<spdlog::logger> previous = spdlog::default_logger();
+    LogCapture() {
+        auto capture = std::make_shared<spdlog::logger>("auth-log-capture", sink);
+        capture->set_level(spdlog::level::info);
+        spdlog::set_default_logger(capture);
+    }
+    ~LogCapture() { spdlog::set_default_logger(previous); }
+    LogCapture(const LogCapture&) = delete;
+    LogCapture& operator=(const LogCapture&) = delete;
+    [[nodiscard]] int count(const std::string& text) const {
+        int n = 0;
+        for (const std::string& l : sink->last_formatted()) n += l.find(text) != std::string::npos ? 1 : 0;
+        return n;
+    }
+    [[nodiscard]] std::string all() const {
+        std::string out;
+        for (const std::string& l : sink->last_formatted()) out += l;
+        return out;
+    }
+};
+
+struct AuthGrant {
+    rune::protocol::SecurityOperation op = rune::protocol::SecurityOperation::Read;
+    rune::protocol::SecurityResourceType type = rune::protocol::SecurityResourceType::Topic;
+    rune::protocol::SecurityPatternKind kind = rune::protocol::SecurityPatternKind::Exact;
+    std::string pattern;
+};
+
+class AuthBroker {
+public:
+    struct Options {
+        AuthMode mode = AuthMode::Enabled;
+        int64_t  authTimeoutMs = 10'000;
+        std::string keyContents = std::string(48, 'K') + "\n";
+    };
+    static constexpr const char* kBootstrapPassword = "bootstrap-otp-123456";
+    static constexpr const char* kAdminPassword     = "admin-password-1234";
+
+    explicit AuthBroker(const std::string& tag) : AuthBroker(tag, Options{}) {}
+    AuthBroker(const std::string& tag, Options o)
+        : opts_(std::move(o)),
+          dir_(std::filesystem::temp_directory_path() /
+               ("rune_authbroker_" + tag + "_" + std::to_string(::getpid()) + "_" + std::to_string(seq_()++))) {
+        std::filesystem::remove_all(dir_);
+        std::filesystem::create_directories(dir_);
+        NodeConfig cfg;
+        pinLegacyRuntime(cfg);
+        cfg.nodeId = 0;
+        cfg.dataDir = (dir_ / "broker").string();
+        cfg.aeronDir = (dir_ / "broker" / "aeron").string();
+        cfg.consensusStreamId = 10;
+        PeerConfig self;
+        self.id = 0;
+        self.host = "127.0.0.1";
+        self.consensusPort = rune::aeronutil::testing::allocFreeUdpPort();
+        cfg.peers = {self};
+        clientPort_ = rune::aeronutil::testing::allocFreeUdpPort();
+        cfg.clientEndpoint.channel = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(clientPort_);
+        cfg.clientEndpoint.streamId = 1;
+        cfg.workerCount = 1;
+        cfg.authMode = opts_.mode;
+        cfg.authTimeoutMs = opts_.authTimeoutMs;
+        if (opts_.mode == AuthMode::Enabled) {
+            keyFile_ = dir_ / "cluster.key";
+            { std::ofstream f(keyFile_, std::ios::binary); f << opts_.keyContents; }
+            std::filesystem::permissions(keyFile_, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write);
+            cfg.clusterKeyFile = keyFile_.string();
+        }
+        channel_ = cfg.clientEndpoint.channel;
+        aeronDir_ = cfg.aeronDir;
+        node_ = std::make_unique<BrokerNode>(cfg);
+        node_->start();
+        if (!node_->awaitLeader(std::chrono::seconds(30))) throw std::runtime_error("AuthBroker: no leader");
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (security_cluster::securityOf(*node_).role != rune::replication::Role::Leader) {
+            if (std::chrono::steady_clock::now() > deadline) throw std::runtime_error("AuthBroker: __security never led");
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
+    ~AuthBroker() {
+        admin_ = nullptr;
+        wires_.clear();
+        if (node_) node_->stop();
+        node_.reset();
+        std::error_code ec;
+        std::filesystem::remove_all(dir_, ec);
+    }
+    AuthBroker(const AuthBroker&) = delete;
+    AuthBroker& operator=(const AuthBroker&) = delete;
+
+    [[nodiscard]] BrokerNode& node() noexcept { return *node_; }
+    [[nodiscard]] const std::string& channel() const noexcept { return channel_; }
+    [[nodiscard]] std::string endpoint() const { return "127.0.0.1:" + std::to_string(clientPort_); }
+    [[nodiscard]] const std::string& keyContents() const noexcept { return opts_.keyContents; }
+    [[nodiscard]] const std::filesystem::path& keyFile() const noexcept { return keyFile_; }
+    [[nodiscard]] const std::filesystem::path& dir() const noexcept { return dir_; }
+    /// A fresh directory for a client's own Aeron driver / data.
+    [[nodiscard]] std::filesystem::path clientDir() { return dir_ / ("client" + std::to_string(clientDirs_++)); }
+
+    /// A fresh raw-frame client (its own embedded driver).  Owned here: it never outlives the broker.
+    AuthWireClient& wire() {
+        wires_.push_back(std::make_unique<AuthWireClient>(clientDir()));
+        return *wires_.back();
+    }
+
+    /// Bootstrap (cluster-key MAC), log in with the one-time password, change the admin's password; keeps that admin
+    /// session.  Throws on any step that does not behave (a test precondition).
+    void bootstrapAdmin(const std::string& adminPassword = kAdminPassword) {
+        AuthWireClient& w = wire();
+        const int64_t s0 = w.connect(channel_);
+        require(s0 > 0, "bootstrap connect");
+        require(w.lastConnect() && w.lastConnect()->authState == pc::AuthState::Anonymous, "the bootstrap window is offered");
+        auto b = w.bootstrap(channel_, s0, opts_.keyContents, "admin", kBootstrapPassword);
+        require(b.errorCode == 0, "bootstrap: " + b.detail);
+        const int64_t s1 = w.connect(channel_);
+        require(s1 > 0, "admin connect");
+        const auto login = w.login(channel_, s1, "admin", {kBootstrapPassword, kBootstrapPassword});
+        require(login.ok() && login.mustChangePassword(), "the one-time password logs in and must be changed");
+        const auto set = w.alterPassword(channel_, s1, "admin", pc::UserChangeKind::SetPassword, adminPassword);
+        require(set.errorCode == 0, "admin SET PASSWORD: " + set.detail);
+        admin_ = &w;
+        adminSid_ = s1;
+    }
+
+    void createUser(const std::string& name, const std::string& password, const std::vector<AuthGrant>& grants = {}) {
+        auto a = admin().createUser(channel_, adminSid_, name, password);
+        require(a.errorCode == 0, "CREATE USER " + name + ": " + a.detail);
+        for (const AuthGrant& g : grants) {
+            auto r = admin().grant(channel_, adminSid_, name, false, g.op, g.type, g.kind, g.pattern);
+            require(r.errorCode == 0, "GRANT to " + name + ": " + r.detail);
+        }
+    }
+    void disableUser(const std::string& name) {
+        auto a = admin().alterPassword(channel_, adminSid_, name, pc::UserChangeKind::Disable);
+        require(a.errorCode == 0, "DISABLE " + name + ": " + a.detail);
+    }
+    void addPassword(const std::string& name, const std::string& password) {
+        auto a = admin().alterPassword(channel_, adminSid_, name, pc::UserChangeKind::AddPassword, password);
+        require(a.errorCode == 0, "ADD PASSWORD " + name + ": " + a.detail);
+    }
+    void dropOldestPassword(const std::string& name) {
+        auto a = admin().alterPassword(channel_, adminSid_, name, pc::UserChangeKind::DropPassword, {}, false, 1);
+        require(a.errorCode == 0, "DROP PASSWORD 1 " + name + ": " + a.detail);
+    }
+    AuthWireClient& admin() {
+        require(admin_ != nullptr, "bootstrapAdmin() first");
+        return *admin_;
+    }
+    [[nodiscard]] int64_t adminSession() const noexcept { return adminSid_; }
+
+    // ── CnC counters ─────────────────────────────────────────────────────────────────────────────────────────
+    [[nodiscard]] std::optional<int64_t> counter(std::int32_t typeId) const {
+        try {
+            aeron::CncFileReader reader = aeron::CncFileReader::mapExisting(aeronDir_.c_str());
+            aeron::concurrent::CountersReader counters = reader.countersReader();
+            std::optional<int64_t> found;
+            counters.forEach([&](std::int32_t id, std::int32_t t, const aeron::concurrent::AtomicBuffer&, const std::string&) {
+                if (t == typeId && !found) found = counters.getCounterValue(id);
+            });
+            return found;
+        } catch (...) { return std::nullopt; }
+    }
+    /// The counter reaches `want` (bounded); the last value read otherwise.
+    [[nodiscard]] bool awaitCounter(std::int32_t typeId, int64_t want, std::chrono::milliseconds within = std::chrono::seconds(10)) const {
+        const auto deadline = std::chrono::steady_clock::now() + within;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (const auto v = counter(typeId); v && *v == want) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return false;
+    }
+
+private:
+    static void require(bool ok, const std::string& what) {
+        if (!ok) throw std::runtime_error("AuthBroker: " + what);
+    }
+    static int& seq_() { static int s = 0; return s; }
+
+    Options                                      opts_;
+    std::filesystem::path                        dir_;
+    std::filesystem::path                        keyFile_;
+    uint16_t                                     clientPort_ = 0;
+    std::string                                  channel_, aeronDir_;
+    std::unique_ptr<BrokerNode>                  node_;
+    std::vector<std::unique_ptr<AuthWireClient>> wires_;
+    AuthWireClient*                              admin_ = nullptr;
+    int64_t                                      adminSid_ = 0;
+    int                                          clientDirs_ = 0;
+};
+
+} // namespace rune::node::test

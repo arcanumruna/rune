@@ -11,6 +11,7 @@
 
 #include <array>
 #include <cstring>
+#include <map>
 #include <optional>
 #include <span>
 #include <string>
@@ -52,6 +53,12 @@ inline constexpr const char* kTestAdminPassword = "admin password 123";
 }
 [[nodiscard]] inline rune::security::SecurityState makeAuthTestState(uint8_t seed = 0x42) { return makeAuthTestChain(seed).state(); }
 
+/// The salted-password cache of the real client (ScramCache): PBKDF2 is the expensive step of a login, paid once per
+/// (salt, iterations) per client; later logins skip it.  Keyed on salt bytes + iterations.
+struct ScramSaltCache {
+    std::map<std::string, rune::crypto::scram::SaltedPassword> entries;
+};
+
 struct ScramAnswer {
     rune::protocol::client::AuthClientFinal final;
     std::array<std::array<uint8_t, 64>, 2>  expectedSignature{};   ///< per slot, what the broker must sign with
@@ -61,7 +68,8 @@ struct ScramAnswer {
 [[nodiscard]] inline std::optional<ScramAnswer> scramAnswer(const std::string& user, const std::string& clientNonce,
                                                             const rune::protocol::client::AuthServerFirst& first,
                                                             const std::array<std::string, 2>& passwords, int64_t sessionId,
-                                                            int64_t correlationId, uint8_t count = 0) {
+                                                            int64_t correlationId, uint8_t count = 0,
+                                                            ScramSaltCache* cache = nullptr) {
     namespace rs = rune::crypto::scram;
     ScramAnswer out;
     out.final.sessionId = sessionId;
@@ -74,7 +82,14 @@ struct ScramAnswer {
         if (i >= first.count || passwords[i].empty()) continue;
         const auto salt = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(first.salts[i].salt.data()),
                                                    first.salts[i].salt.size());
-        auto sp = rs::saltPassword(rune::crypto::Digest::Sha512, passwords[i], salt, first.salts[i].iterations);
+        std::optional<rs::SaltedPassword> sp;
+        const std::string key = passwords[i] + '|' + std::string(first.salts[i].salt) + '|' + std::to_string(first.salts[i].iterations);
+        if (cache != nullptr)
+            if (auto it = cache->entries.find(key); it != cache->entries.end()) sp = it->second;
+        if (!sp) {
+            sp = rs::saltPassword(rune::crypto::Digest::Sha512, passwords[i], salt, first.salts[i].iterations);
+            if (sp && cache != nullptr) cache->entries.emplace(key, *sp);
+        }
         if (!sp) return std::nullopt;
         const std::string am = rs::authMessage(cfb, rs::serverFirst(combined, salt, first.salts[i].iterations),
                                                rs::clientFinalWithoutProof(combined));

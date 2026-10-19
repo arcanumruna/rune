@@ -7556,7 +7556,8 @@ bool ClientGateway::authGateRefuses_(pc::TemplateId tid, const uint8_t* buf, std
                 selfSetPassword = m->kind == pc::SecurityOpKind::AlterUser &&
                                   m->change == pc::UserChangeKind::SetPassword && m->name == pcr->user;
 
-    const AuthGate gate = gateFor(session->auth, tid, bootstrapOpen_(), selfSetPassword);
+    // bootstrapOpen_() walks the account list: evaluated only for the one request that can use it (never per frame).
+    const AuthGate gate = gateFor(session->auth, tid, tid == pc::TemplateId::SecurityBootstrap && bootstrapOpen_(), selfSetPassword);
     if (gate == AuthGate::Allow) return false;
 
     const bool end = gate == AuthGate::AnswerAuthFailedAndEnd;

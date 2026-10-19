@@ -15,6 +15,8 @@
 #include <spdlog/sinks/ringbuffer_sink.h>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <random>
 
@@ -365,4 +367,38 @@ TEST(AuthLoginRegression, ADevOrInProcessGatewayNeverGatesAndAnswersALoginAttemp
     EXPECT_NE(pc::AuthServerFinal::decode(f->bytes.data(), f->bytes.size())->errorCode, 0);
     rig.send(defineTopicFrame(sid, 6));
     EXPECT_EQ(rig.admin.otherSubmits, 1) << "anonymous: allowed";
+}
+
+// The plan's 5 ms login gate, from the broker's side: the SERVER half of a full login (AuthClientFirst + AuthClientFinal
+// handled on the control thread) is hashes and HMACs only - the server never runs PBKDF2 - so it costs microseconds and
+// can never stall the control loop.  (The end-to-end wire gate is ClientLoginBrokerRegression's AuthGatesRegression.)
+TEST(AuthGatesRegression, ServerSideLoginCostIsMicrosecondsNotMillisecondsRegression) {
+    Rig rig;
+    // Precompute the client's side so only the broker's work is timed.
+    const std::string nonce = "bench-nonce-0123456789";
+    std::vector<double> usec;
+    for (int i = 0; i < 100; ++i) {
+        const int64_t sid = rig.newSession("10.0.0." + std::to_string(i % 200));
+        pc::AuthClientFirst cf; cf.sessionId = sid; cf.correlationId = 1000 + i; cf.username = "ws2"; cf.clientNonce = nonce;
+        std::vector<uint8_t> first(cf.encodedSize()); first.resize(cf.encode(first.data()));
+        const std::size_t before = rig.seen.size();
+        const auto t0 = std::chrono::steady_clock::now();
+        rig.send(first);
+        const auto t1 = std::chrono::steady_clock::now();
+        const Frame* f1 = nullptr;
+        for (std::size_t k = before; k < rig.seen.size(); ++k) if (rig.seen[k].tid == static_cast<uint16_t>(pc::TemplateId::AuthServerFirst)) f1 = &rig.seen[k];
+        ASSERT_NE(f1, nullptr);
+        const auto sf = pc::AuthServerFirst::decode(f1->bytes.data(), f1->bytes.size());
+        auto ans = scramAnswer("ws2", nonce, *sf, {kTestPasswordA, ""}, sid, cf.correlationId);
+        std::vector<uint8_t> fin(ans->final.encodedSize()); fin.resize(ans->final.encode(fin.data()));
+        const auto t2 = std::chrono::steady_clock::now();
+        rig.send(fin);
+        const auto t3 = std::chrono::steady_clock::now();
+        ASSERT_TRUE(std::holds_alternative<AuthAuthenticated>(*rig.gw.sessionAuthForTest(sid)));
+        usec.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count() + std::chrono::duration<double, std::micro>(t3 - t2).count());
+    }
+    std::sort(usec.begin(), usec.end());
+    std::fprintf(stderr, "[ login ] server-side cost of a full SCRAM login (Debug build): p50 = %.1f us, p99 = %.1f us\n",
+                 usec[50], usec[99]);
+    EXPECT_LT(usec[50], 2000.0) << "far below the 5 ms gate: no PBKDF2 on the control thread";
 }
