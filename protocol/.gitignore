@@ -1,0 +1,22 @@
+# --- rune-protocol (project) ---
+build/
+bench/
+cmake-build-*/
+CMakeUserPresets.json
+conan-graph.json
+conan-pkglist.json
+*.log
+
+# --- general (from Bitbucket template) ---
+node_modules/
+dist/
+*.class
+*.py[cod]
+*.jar
+target/
+.idea/
+TEST*.xml
+.DS_Store
+Thumbs.db
+*.app
+*.exe

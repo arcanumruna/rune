@@ -1,0 +1,227 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  rune-replication.xml — SBE schema for Rune's cross-node REPLICATION wire messages
+  (leader<->follower fetch, OffsetsForLeaderEpoch exchange, reconcile).
+
+  These travel worker → outbound ring → Aeron publication → peer node (a real wire),
+  so unlike the process-local internal ring schema (rune-internal-ring.xml, id=7),
+  these are genuine wire messages.  schemaId 112 + version 2 preserve the ids the
+  previous hand-rolled ReplicationMessages.h used (ReplicationMessageHeader.schemaId
+  == 112, DR-BUG-5 bumped version to 2 for the topicId fields).
+
+  SBE gives generated encode/decode/encodedLength — so the outbound-ring send path
+  can claim exactly encodedLength() bytes and encode in place (zero-copy, no fixed
+  stack buffer → no buffer-overflow when a replicated batch exceeds a guessed cap).
+-->
+<sbe:messageSchema xmlns:sbe="http://fixprotocol.io/2016/sbe"
+                   package="rune.protocol.replication.sbe"
+                   id="112"
+                   version="4"
+                   semanticVersion="1.2"
+                   description="Rune cross-node replication wire messages"
+                   byteOrder="littleEndian">
+
+  <types>
+    <!-- AlterIsr: up to 16 replicas (FollowerSlots::kMaxReplicas). -->
+    <type name="isrArray" primitiveType="int32" length="16"/>
+    <!-- AlterIsr v4: the storage id of each proposed ISR member, parallel to isrArray. -->
+    <type name="storageArray" primitiveType="int64" length="16"/>
+    <composite name="messageHeader" description="SBE message header (fixed 8 bytes)">
+      <type name="blockLength" primitiveType="uint16"/>
+      <type name="templateId"  primitiveType="uint16"/>
+      <type name="schemaId"    primitiveType="uint16"/>
+      <type name="version"     primitiveType="uint16"/>
+    </composite>
+
+    <!-- Variable-length raw record-batch bytes (zero-copy view on decode). -->
+    <composite name="varDataEncoding" description="raw variable-length byte block">
+      <type name="length"  primitiveType="uint32" maxValue="1073741824"/>
+      <type name="varData" primitiveType="uint8" length="0"/>
+    </composite>
+  </types>
+
+  <!-- ====================================================================== -->
+  <!-- FetchRequest (follower → leader) : template 1                           -->
+  <!-- ====================================================================== -->
+  <sbe:message name="FetchRequest" id="1" description="follower fetch request">
+    <field name="leaderEpoch" id="1" type="int64"/>
+    <field name="partition"   id="2" type="int32"/>
+    <field name="followerId"  id="3" type="int32"/>
+    <field name="fetchOffset" id="4" type="int64"/>
+    <field name="maxBytes"    id="5" type="int32"/>
+    <field name="topicId"     id="6" type="int32"/>
+    <!-- v3 (KIP-320/595): epoch of the last batch in the follower's log (-1 = none /
+         sender predates v3 = no lineage validation).  The leader validates
+         (fetchOffset, lastFetchedEpoch) against its own epoch lineage on EVERY fetch. -->
+    <field name="lastFetchedEpoch" id="7" type="int32" sinceVersion="3"/>
+    <!-- v3 (KIP-903): the follower PROCESS incarnation (monotonic per node, bumped on
+         every start; 0 = unknown).  The leader ignores a fetch from an incarnation
+         older than one it has already seen from that follower (a frame of a dead
+         process), so it never credits a position the restarted follower may have lost. -->
+    <field name="incarnation" id="8" type="int64" sinceVersion="3"/>
+    <!-- v4: the follower's storage id (0 = unknown / sender predates v4). -->
+    <field name="storageId" id="9" type="int64" sinceVersion="4"/>
+    <!-- v4: the start offset of the epoch of the follower's last batch (-1 = unknown). -->
+    <field name="lastEpochStartOffset" id="10" type="int64" sinceVersion="4"/>
+  </sbe:message>
+
+  <!-- ====================================================================== -->
+  <!-- FetchResponse (leader → follower) : template 2 — carries the records    -->
+  <!-- ====================================================================== -->
+  <sbe:message name="FetchResponse" id="2" description="leader fetch response (records tail)">
+    <field name="leaderEpoch"    id="1" type="int64"/>
+    <field name="partition"      id="2" type="int32"/>
+    <field name="highWatermark"  id="3" type="int64"/>
+    <field name="logStartOffset" id="4" type="int64"/>
+    <field name="errorCode"      id="5" type="int16"/>
+    <field name="topicId"        id="6" type="int32"/>
+    <!-- v3: the block is UNCHANGED (data frames keep their 46-byte framing).  An
+         ERROR answer with no records may carry a small fixed payload in `records`:
+           errorCode -7 (DivergingEpoch, KIP-320/595) / -4 (OffsetOutOfRange):
+             int32 divergingEpoch | int64 endOffset   (12 bytes, little-endian)
+         = the leader's endOffsetForEpoch(lastFetchedEpoch) (DivergingEpoch) or its
+         log end offset (OffsetOutOfRange).  Mixed v2/v3 replication is UNSUPPORTED:
+         a v3 replica refuses v2 frames (fail closed). -->
+    <data  name="records"        id="7" type="varDataEncoding"/>
+  </sbe:message>
+
+  <!-- ====================================================================== -->
+  <!-- OffsetsForLeaderEpochRequest (DR-BUG-6) : template 3                    -->
+  <!-- ====================================================================== -->
+  <sbe:message name="OffsetsForLeaderEpochRequest" id="3" description="OLE request">
+    <field name="currentEpoch"   id="1" type="int64"/>
+    <field name="partition"      id="2" type="int32"/>
+    <field name="followerId"     id="3" type="int32"/>
+    <field name="requestedEpoch" id="4" type="int64"/>
+    <field name="followerLeo"    id="5" type="int64"/>
+    <field name="topicId"        id="6" type="int32"/>
+  </sbe:message>
+
+  <!-- ====================================================================== -->
+  <!-- OffsetsForLeaderEpochResponse (DR-BUG-6) : template 4                   -->
+  <!-- ====================================================================== -->
+  <sbe:message name="OffsetsForLeaderEpochResponse" id="4" description="OLE response">
+    <field name="leaderEpoch"   id="1" type="int64"/>
+    <field name="partition"     id="2" type="int32"/>
+    <field name="responseEpoch" id="3" type="int64"/>
+    <field name="endOffset"     id="4" type="int64"/>
+    <field name="errorCode"     id="5" type="int16"/>
+    <field name="topicId"       id="6" type="int32"/>
+  </sbe:message>
+
+  <!-- ====================================================================== -->
+  <!-- Reconcile fetch req/resp (DR-BUG-6) : templates 5/6 — same shapes as    -->
+  <!-- FetchRequest/FetchResponse but distinct template ids so the receiver     -->
+  <!-- routes them to the reconcile path.                                       -->
+  <!-- ====================================================================== -->
+  <!-- stale: the broker never uses this codec; the wire re-stamps FetchRequest's layout -->
+  <sbe:message name="ReconcileFetchRequest" id="5" description="reconcile fetch request">
+    <field name="leaderEpoch" id="1" type="int64"/>
+    <field name="partition"   id="2" type="int32"/>
+    <field name="followerId"  id="3" type="int32"/>
+    <field name="fetchOffset" id="4" type="int64"/>
+    <field name="maxBytes"    id="5" type="int32"/>
+    <field name="topicId"     id="6" type="int32"/>
+  </sbe:message>
+
+  <sbe:message name="ReconcileFetchResponse" id="6" description="reconcile fetch response (records tail)">
+    <field name="leaderEpoch"    id="1" type="int64"/>
+    <field name="partition"      id="2" type="int32"/>
+    <field name="highWatermark"  id="3" type="int64"/>
+    <field name="logStartOffset" id="4" type="int64"/>
+    <field name="errorCode"      id="5" type="int16"/>
+    <field name="topicId"        id="6" type="int32"/>
+    <data  name="records"        id="7" type="varDataEncoding"/>
+  </sbe:message>
+
+  <!-- ====================================================================== -->
+  <!-- AlterIsr (partition leader → controller) : template 7  (v3)              -->
+  <!-- Kafka AlterPartition: the leader PROPOSES an ISR change; the controller   -->
+  <!-- commits it to the metadata log (partitionEpoch + 1) and every node applies -->
+  <!-- it.  The leader's HW counts the maximal ISR (committed ∪ proposed) until  -->
+  <!-- then; the controller elects only from the committed ISR.                  -->
+  <!-- partitionEpoch = the partition epoch of the committed assignment the     -->
+  <!-- proposal was derived from: the controller commits it only while that is  -->
+  <!-- still the committed partitionEpoch (Kafka's compare-and-set — monotonic, -->
+  <!-- so no ABA: a stale / re-ordered proposal is never committed).            -->
+  <!-- ====================================================================== -->
+  <sbe:message name="AlterIsr" id="7" description="ISR change proposal" sinceVersion="3">
+    <field name="topicId"        id="1" type="int32"/>
+    <field name="partition"      id="2" type="int32"/>
+    <field name="leaderId"       id="3" type="int32"/>
+    <field name="leaderEpoch"    id="4" type="int64"/>
+    <field name="isrCount"       id="5" type="int32"/>
+    <field name="isr"            id="6" type="isrArray"/>
+    <field name="partitionEpoch" id="7" type="int32"/>
+    <!-- v4: correlation only - never part of the CAS; 0 = v3 sender -->
+    <field name="proposalId"     id="8" type="int64" sinceVersion="4"/>
+    <field name="isrStorage"     id="9" type="storageArray" sinceVersion="4"/>
+    <!-- v4: 1-based ordinal of this send of proposalId -->
+    <field name="sendSeq"        id="10" type="int32" sinceVersion="4"/>
+  </sbe:message>
+
+  <!-- ====================================================================== -->
+  <!-- AlterIsrResponse (controller → partition leader) : template 8  (v3)     -->
+  <!-- Kafka AlterPartitionResponse: errorCode 0 = committed (or already the   -->
+  <!-- committed state) at partitionEpoch; otherwise an explicit reject        -->
+  <!-- (INELIGIBLE_REPLICA, FENCED_LEADER_EPOCH, INVALID_UPDATE_VERSION, ...). -->
+  <!-- The leader clears its pending proposal on a commit (the applied        -->
+  <!-- assignment) or on INELIGIBLE_REPLICA / INVALID_REQUEST answered at its  -->
+  <!-- base partitionEpoch; NEVER on INVALID_UPDATE_VERSION / FENCED_LEADER_   -->
+  <!-- EPOCH (the committed assignment that must follow resolves those).       -->
+  <!-- ====================================================================== -->
+  <sbe:message name="AlterIsrResponse" id="8" description="ISR change answer" sinceVersion="3">
+    <field name="topicId"        id="1" type="int32"/>
+    <field name="partition"      id="2" type="int32"/>
+    <field name="leaderId"       id="3" type="int32"/>
+    <field name="leaderEpoch"    id="4" type="int64"/>
+    <field name="partitionEpoch" id="5" type="int32"/>
+    <field name="errorCode"      id="6" type="int16"/>
+    <!-- v4: echoes of the request's correlation ids, and the term of the answering controller -->
+    <field name="proposalId"      id="7" type="int64" sinceVersion="4"/>
+    <field name="controllerEpoch" id="8" type="int64" sinceVersion="4"/>
+    <field name="sendSeq"         id="9" type="int32" sinceVersion="4"/>
+  </sbe:message>
+
+  <!-- ====================================================================== -->
+  <!-- InternalIsr (internal-partition leader → every replica) : template 9    -->
+  <!-- The ISR of an INTERNAL partition (led by the consensus leader).  Every  -->
+  <!-- replica persists the newest (leaderEpoch, version) it sees and acks it; -->
+  <!-- a change commits once a majority of the cluster persisted it, and a     -->
+  <!-- node votes / stands in a consensus election only for a candidate in the -->
+  <!-- newest internal ISRs it persisted (Raft quorum intersection).           -->
+  <!-- ====================================================================== -->
+  <sbe:message name="InternalIsr" id="9" description="internal-partition ISR state" sinceVersion="3">
+    <field name="topicId"     id="1" type="int32"/>
+    <field name="partition"   id="2" type="int32"/>
+    <field name="leaderId"    id="3" type="int32"/>
+    <field name="leaderEpoch" id="4" type="int64"/>
+    <field name="version"     id="5" type="int64"/>
+    <field name="isrCount"    id="6" type="int32"/>
+    <field name="isr"         id="7" type="isrArray"/>
+  </sbe:message>
+
+  <!-- ====================================================================== -->
+  <!-- InternalIsrAck (replica → internal-partition leader) : template 10      -->
+  <!-- "I durably hold InternalIsr (leaderEpoch, version) or newer."           -->
+  <!-- ====================================================================== -->
+  <sbe:message name="InternalIsrAck" id="10" description="internal ISR state persisted" sinceVersion="3">
+    <field name="topicId"     id="1" type="int32"/>
+    <field name="partition"   id="2" type="int32"/>
+    <field name="followerId"  id="3" type="int32"/>
+    <field name="leaderEpoch" id="4" type="int64"/>
+    <field name="version"     id="5" type="int64"/>
+  </sbe:message>
+
+  <!-- ====================================================================== -->
+  <!-- RESERVED template ids 11 / 12 — rune-broker D9 cross-node transaction  -->
+  <!-- markers, carried on THIS stream (schema 112) as hand-rolled fixed       -->
+  <!-- blocks defined in rune-broker libs/replication/include/rune/            -->
+  <!-- replication/ReplicationMessages.h (WriteTxnMarkerMsg /                  -->
+  <!-- WriteTxnMarkerResponseMsg).  The broker dispatches on the template id   -->
+  <!-- alone: do NOT assign 11 or 12 to another message here.                  -->
+  <!--   11 = WriteTxnMarker          (txn coordinator → partition leader)     -->
+  <!--   12 = WriteTxnMarkerResponse  (partition leader → txn coordinator)     -->
+  <!-- ====================================================================== -->
+
+</sbe:messageSchema>

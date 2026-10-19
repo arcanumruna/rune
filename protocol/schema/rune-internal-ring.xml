@@ -1,0 +1,365 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  rune-internal-ring.xml — SBE schema for Rune's INTERNAL in-process ring-buffer
+  messages (worker op/return + async-flush request/completion).
+
+  IMPORTANT: these messages are PROCESS-LOCAL.  They travel only between threads in
+  one process over SPSC/MPSC byte rings, and some fields (replica, logPtr) are raw
+  in-process pointers carried as opaque uint64.  They MUST NOT be sent across a real
+  wire or persisted.  SBE is used here for the wrap-in-place flyweight codec (encode
+  directly into the claimed ring slot; decode a zero-copy view) and offset-safety —
+  NOT for cross-process schema evolution.
+
+  Distinct schemaId (7) from the client-facing wire schema (120).
+-->
+<sbe:messageSchema xmlns:sbe="http://fixprotocol.io/2016/sbe"
+                   package="rune.protocol.internal.sbe"
+                   id="7"
+                   version="0"
+                   semanticVersion="1.0"
+                   description="Rune internal in-process ring messages (process-local)"
+                   byteOrder="littleEndian">
+
+  <types>
+    <composite name="messageHeader" description="SBE message header (fixed 8 bytes)">
+      <type name="blockLength" primitiveType="uint16"/>
+      <type name="templateId"  primitiveType="uint16"/>
+      <type name="schemaId"    primitiveType="uint16"/>
+      <type name="version"     primitiveType="uint16"/>
+    </composite>
+
+    <!-- Variable-length raw byte tail (record batch / replicated records / isr /
+         owned-set / chunk — interpreted per the tailKind field). -->
+    <composite name="varDataEncoding" description="raw variable-length byte block">
+      <type name="length"  primitiveType="uint32" maxValue="1073741824"/>
+      <type name="varData" primitiveType="uint8" length="0"/>
+    </composite>
+
+    <!-- WorkerOp::Type -->
+    <enum name="OpType" encodingType="uint8">
+      <validValue name="PRODUCE">0</validValue>
+      <validValue name="PUSH_READ">1</validValue>
+      <validValue name="APPLY_REPLICATED">2</validValue>
+      <validValue name="BECOME_LEADER">3</validValue>
+      <validValue name="BECOME_FOLLOWER">4</validValue>
+      <validValue name="SET_OWNERSHIP">5</validValue>
+      <validValue name="FETCH_REQUEST">6</validValue>
+      <validValue name="OFFSETS_FOR_LEADER_EPOCH_REQ">7</validValue>
+      <validValue name="RECONCILE_FETCH_RESP">8</validValue>
+      <validValue name="APPEND_CONTROL_RECORD">9</validValue>
+      <validValue name="SUBSCRIBE">10</validValue>
+      <validValue name="UNSUBSCRIBE">11</validValue>
+      <!-- Task 7: admin → worker schema validator push (SchemaUpdate = 12).
+           Carries topicId (existing scalar field) + descriptor blob (tail,
+           TailKind = DESCRIPTOR_BLOB).  Worker builds a local rune::codec::Validator
+           from the blob on its own thread (shared-nothing). -->
+      <validValue name="SCHEMA_UPDATE">12</validValue>
+      <!-- Self-contained worker shards (spec §3.4): runtime → every worker.
+           SESSION_ANNOUNCE: sessionId + egressStreamId + egress channel (tail,
+           TailKind = EGRESS_CHANNEL); the worker opens its OWN exclusive publication.
+           SESSION_CLOSE: sessionId; the worker drops the session and its queued acks. -->
+      <validValue name="SESSION_ANNOUNCE">13</validValue>
+      <validValue name="SESSION_CLOSE">14</validValue>
+      <!-- Task 10 round 4: follower/peer-side replication handlers that touch a
+           USER replica's log/state, routed to the owning worker (never executed on
+           the control thread).  OLE_RESP reuses ole*/replErrorCode scalars
+           (leaderEpoch→oleCurrentEpoch, responseEpoch→oleRequestedEpoch,
+           endOffset→oleFollowerLeo); RECONCILE_FETCH_REQ reuses the fr* scalars. -->
+      <validValue name="OFFSETS_FOR_LEADER_EPOCH_RESP">15</validValue>
+      <validValue name="RECONCILE_FETCH_REQ">16</validValue>
+      <!-- F15 (m1, handled in step S9): control → every worker, the runtime's
+           min-ISR admission policy (retried until delivered; latest supersedes).
+           (18 = ALTER_ISR_RESPONSE.) -->
+      <validValue name="SET_ADMISSION_POLICY">17</validValue>
+      <!-- AlterIsrResponse (controller answer) routed to the owning worker of a
+           USER partition leader: roleEpoch = leaderEpoch, rolePartitionEpoch,
+           replErrorCode = the controller's error code. -->
+      <validValue name="ALTER_ISR_RESPONSE">18</validValue>
+      <!-- Task 20 (view engine phase 1): GetViewRow point-read routed to the
+           worker that owns the view (viewTopicId, partition).  Reuses existing
+           scalar fields (no new wire field): topicId = viewTopicId, nextOffset =
+           keyU64, hwBound = requestedFingerprint.  The worker probes
+           WorkerViewSet::getRow and answers ReturnType::VIEW_ROW_RESULT. -->
+      <validValue name="GET_VIEW_ROW">19</validValue>
+      <!-- Task 23 fix round 1 (R-M1): control -> EVERY worker, cold: the catalog dropped
+           topicId (scalar topicId).  The worker records it so a shard-mode produce to a
+           topic it does not own answers UnknownTopic (like the gateway) instead of
+           the retriable NotLeader.  Not ownership-gated (incarnation 0). -->
+      <validValue name="TOPIC_DROPPED">20</validValue>
+      <!-- Authentication (spec 2026-10-13, D30): control -> EVERY worker on the session-lifecycle
+           ring: one chunk of a session's WRITE permission bitmap.  sessionId names the session,
+           nextOffset = first word index of this chunk, hwBound = total words, isolation = flags
+           {bit0 last chunk, bit1 grantAll}, tail (TailKind = PERMISSION_BITS) = the chunk's words,
+           little-endian u64 each.  The worker stages chunks and swaps on the last (a partial table
+           is never visible). -->
+      <validValue name="SESSION_PERMISSIONS">21</validValue>
+      <!-- Authentication (spec 2026-10-13, D33/D34): control -> EVERY worker: the keys of an
+           established inter-broker link.  topicId = peer node id, partition = link epoch,
+           tail (TailKind = PEER_KEYS) = [sendMaster 32][recvMaster 32]. -->
+      <validValue name="PEER_LINK_KEYS">22</validValue>
+      <!-- F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
+           runtime -> owning worker: run a test-owned task (opaque in-process
+           pointer carried in the egressPub uint64 slot) against the replica
+           (replica field) on the worker's OWN thread.  Cold branch; never sent
+           by production code.  Value 200 = out of the production op range so
+           future production ops keep the dense 0..N numbering. -->
+      <validValue name="TEST_TASK">200</validValue>
+    </enum>
+
+    <!-- Which variable field the tail holds (matches TailKind in WorkerWire.h). -->
+    <enum name="TailKind" encodingType="uint8">
+      <validValue name="NONE">0</validValue>
+      <validValue name="RECORD_BATCH">1</validValue>
+      <validValue name="REPLICATED_RECORDS">2</validValue>
+      <validValue name="ISR_LIST">3</validValue>
+      <validValue name="OWNED_SET">4</validValue>
+      <validValue name="CHUNK">5</validValue>
+      <!-- Task 7: raw descriptor blob bytes for a SchemaUpdate op. -->
+      <validValue name="DESCRIPTOR_BLOB">6</validValue>
+      <validValue name="EGRESS_CHANNEL">7</validValue>
+      <!-- Authentication: SESSION_PERMISSIONS tail — permission bitmap words (LE u64). -->
+      <validValue name="PERMISSION_BITS">8</validValue>
+      <!-- Authentication: PEER_LINK_KEYS tail — [sendMaster 32][recvMaster 32]. -->
+      <validValue name="PEER_KEYS">9</validValue>
+    </enum>
+
+    <!-- WorkerReturn::Type -->
+    <enum name="ReturnType" encodingType="uint8">
+      <validValue name="PRODUCE_RESULT">0</validValue>
+      <validValue name="PUSH_READ_RESULT">1</validValue>
+      <!-- Retired (F15): was PRODUCE_NOTIFY, the post-ack PSM/LSO notification of
+           the self-contained-shards spec §3.4.  Under F15 Option B the owning
+           worker keeps its own read_committed state, so it is never emitted.
+           The value stays reserved so 3..6 keep their meaning. -->
+      <validValue name="RESERVED_2">2</validValue>
+      <!-- Worker → runtime fail-stop signal (fsyncgate): a log's fsync failed;
+           the log is permanently failed and the runtime halts the broker.
+           topicId/partition name the log, errorCode carries errno, chunk the dir. -->
+      <validValue name="STORAGE_FAILURE">3</validValue>
+      <!-- Worker applied a SET_OWNERSHIP: partition = workerId, lastOffset =
+           ownershipGen.  The runtime frees replicas removed at or below the
+           minimum acked generation (no worker can still reference them). -->
+      <validValue name="OWNERSHIP_ACK">4</validValue>
+      <!-- An APPEND_CONTROL_RECORD refused by the ownership guard (stale
+           routing): topicId / partition / producerId, the marker in chunk.  The
+           runtime re-routes it or surfaces NotLeader to the txn coordinator. -->
+      <validValue name="CONTROL_RECORD_REFUSED">5</validValue>
+      <!-- Task 10 round 4: an APPEND_CONTROL_RECORD executed by the owning worker.
+           correlationId = the runtime's marker token, baseOffset = the offset the
+           marker ACTUALLY landed at (authoritative; never pre-computed), or
+           errorCode != 0 when the append itself failed (e.g. min-ISR gate). -->
+      <validValue name="CONTROL_RECORD_APPENDED">6</validValue>
+      <!-- Task 20: the answer to a GET_VIEW_ROW op.  Reuses existing scalar
+           fields (the WorkerReturn layout is pinned): errorCode = status
+           (0=OK,1=AbsentKey,2=NotReady,3=SchemaMismatch,4=UnknownView),
+           recordCount = rowLen (informational), readTopicId = viewTopicId;
+           the chunk tail carries the row bytes on OK. -->
+      <validValue name="VIEW_ROW_RESULT">7</validValue>
+    </enum>
+
+    <!-- F15: TxnReturn::kind -->
+    <enum name="TxnReturnKind" encodingType="uint8">
+      <!-- the marker identified by token is committed (HW > its offset), or
+           errorCode != 0 (e.g. NotLeader: the marker task re-drives). -->
+      <validValue name="CONTROL_RECORD_COMMITTED">1</validValue>
+      <!-- reserved for F15-FU1 (hanging-transaction safety net); never emitted yet. -->
+      <validValue name="TXN_HANGING">2</validValue>
+    </enum>
+
+    <!-- E1d: the fixed block a WriteSyncRequest writes (a recovery-point
+         checkpoint slot image).  `length` says how many of its bytes. -->
+    <type name="WriteBlock64" primitiveType="uint8" length="64"/>
+  </types>
+
+  <!-- ====================================================================== -->
+  <!-- WorkerOp (control/transport/bridge → worker)                            -->
+  <!-- ====================================================================== -->
+  <sbe:message name="WorkerOp" id="1" description="op sent to a Worker over its ingress ring">
+    <field name="opType"          id="1"  type="OpType"/>
+    <field name="topicId"         id="2"  type="int32"/>
+    <field name="partition"       id="3"  type="int32"/>
+    <!-- process-local raw pointers carried as opaque uint64 (never cross a wire) -->
+    <field name="replica"         id="4"  type="uint64"/>
+    <field name="logPtr"          id="5"  type="uint64"/>
+    <!-- produce fields -->
+    <field name="sessionId"       id="6"  type="int64"/>
+    <field name="correlationId"   id="7"  type="int64"/>
+    <field name="acks"            id="8"  type="int16"/>
+    <field name="producerId"      id="9"  type="int64"/>
+    <field name="producerEpoch"   id="10" type="int16"/>
+    <field name="baseSequence"    id="11" type="int32"/>
+    <field name="lastOffsetDelta" id="12" type="int32"/>
+    <field name="recordCount"     id="13" type="int32"/>
+    <field name="batchAttrs"      id="14" type="uint16"/>
+    <field name="deferAck"        id="15" type="uint8"/>
+    <field name="durabilityTier"  id="16" type="uint8"/>
+    <field name="enqueuedAtNs"    id="17" type="int64"/>
+    <!-- pushread / subscribe fields -->
+    <field name="subscriptionId"  id="18" type="int64"/>
+    <field name="nextOffset"      id="19" type="int64"/>
+    <field name="hwBound"         id="20" type="int64"/>
+    <field name="isolation"       id="21" type="uint8"/>
+    <field name="isGroup"         id="22" type="uint8"/>
+    <field name="groupCarrierReceived" id="23" type="uint8"/>
+    <!-- become leader/follower fields -->
+    <field name="roleEpoch"       id="24" type="int64"/>
+    <field name="roleLeaderId"    id="25" type="int32"/>
+    <!-- replicated payload scalars (also reused by ReconcileFetchResp) -->
+    <field name="replLeaderEpoch"    id="26" type="int32"/>
+    <field name="replPartition"      id="27" type="int32"/>
+    <field name="replHighWatermark"  id="28" type="int64"/>
+    <field name="replLogStartOffset" id="29" type="int64"/>
+    <field name="replErrorCode"      id="30" type="int16"/>
+    <field name="replTopicId"        id="31" type="int32"/>
+    <!-- FetchRequest (leader-side) fields -->
+    <field name="frLeaderEpoch"   id="32" type="int64"/>
+    <field name="frFollowerId"    id="33" type="int32"/>
+    <field name="frFetchOffset"   id="34" type="int64"/>
+    <field name="frMaxBytes"      id="35" type="int32"/>
+    <field name="frNowNs"         id="36" type="int64"/>
+    <!-- OffsetsForLeaderEpochReq fields -->
+    <field name="oleCurrentEpoch"   id="37" type="int64"/>
+    <field name="oleFollowerId"     id="38" type="int32"/>
+    <field name="oleRequestedEpoch" id="39" type="int64"/>
+    <field name="oleFollowerLeo"    id="40" type="int64"/>
+    <!-- Hybrid egress: per-consumer unicast egress publication pointer for a
+         Subscribe op.  Opaque uint64 (reinterpret of aeron::ExclusivePublication*),
+         created + lifetime-owned by the gateway, written ONLY by the owning worker
+         (shared-nothing single-writer).  0 = none (use MDC broadcast path). -->
+    <field name="egressPub"       id="42" type="uint64"/>
+    <!-- SESSION_ANNOUNCE: the client session's egress stream id (channel in the tail). -->
+    <field name="egressStreamId"  id="45" type="int32"/>
+    <!-- Ownership guard (Task 10 fix 3): the target replica's dense registry id (targetReplicaId)
+         and incarnation (0 = unregistered / not gated), and for SET_OWNERSHIP
+         the registry generation it reflects (acked back as OWNERSHIP_ACK). -->
+    <field name="targetReplicaId" id="46" type="uint32"/>
+    <field name="incarnation"     id="47" type="uint32"/>
+    <field name="ownershipGen"    id="48" type="uint64"/>
+    <!-- Task 10 round 5: PRODUCE — the runtime's current min-ISR admission
+         policy (0 = use the replica's configured minIsr).  The OWNING worker
+         applies the acks=all gate against its own ISR (never the control thread). -->
+    <field name="minIsr"          id="49" type="int32"/>
+    <!-- D6: SESSION_ANNOUNCE — the session's ConnectRequest.clientVersion, so a
+         worker acking directly (shard mode) answers UnknownProducerId only to
+         clients that understand it (older ones get OutOfOrderSequence). -->
+    <field name="clientVersion"   id="50" type="int32"/>
+    <!-- KIP-320/595 (replication schema v3), process-local copy:
+         FETCH_REQUEST: the follower's lastFetchedEpoch (-1 = none). -->
+    <field name="frLastFetchedEpoch"     id="53" type="int32"/>
+    <!-- BECOME_LEADER / ALTER_ISR_RESPONSE: the committed assignment's partition
+         epoch (AlterIsr compare-and-set). -->
+    <field name="rolePartitionEpoch"     id="54" type="int32"/>
+    <!-- FETCH_REQUEST: the follower's process incarnation (KIP-903; 0 = unknown). -->
+    <field name="frIncarnation"          id="55" type="int64"/>
+    <!-- which variable field the tail holds -->
+    <field name="tailKind"        id="43" type="TailKind"/>
+    <!-- variable tail (record batch / replicated records / isr / owned-set) -->
+    <data  name="tail"            id="44" type="varDataEncoding"/>
+  </sbe:message>
+
+  <!-- ====================================================================== -->
+  <!-- WorkerReturn (worker → control over the return ring)                    -->
+  <!-- ====================================================================== -->
+  <sbe:message name="WorkerReturn" id="2" description="result returned from a Worker over its return ring">
+    <field name="returnType"      id="1"  type="ReturnType"/>
+    <!-- ProduceResult fields -->
+    <field name="sessionId"       id="2"  type="int64"/>
+    <field name="correlationId"   id="3"  type="int64"/>
+    <field name="partition"       id="4"  type="int32"/>
+    <!-- baseOffset: the batch's base offset on OK.  D6: on a PRODUCE_RESULT
+         answered UnknownProducerId (28) it carries the partition's
+         logStartOffset instead (the wire ProduceResponse.logStartOffset) — the
+         ProduceResult carrier does not grow (F15 §7). -->
+    <field name="baseOffset"      id="5"  type="int64"/>
+    <field name="lastOffset"      id="6"  type="int64"/>
+    <field name="errorCode"       id="7"  type="int16"/>
+    <field name="deferAck"        id="8"  type="uint8"/>
+    <field name="replica"         id="9"  type="uint64"/>  <!-- process-local pointer -->
+    <field name="producerId"      id="10" type="int64"/>
+    <field name="producerEpoch"   id="11" type="int16"/>
+    <field name="baseSequence"    id="12" type="int32"/>
+    <field name="recordCount"     id="13" type="int32"/>
+    <field name="topicId"         id="14" type="int32"/>
+    <field name="batchAttrs"      id="15" type="uint16"/>
+    <field name="enqueuedAtNs"    id="16" type="int64"/>
+    <!-- PushReadResult fields -->
+    <field name="subscriptionId"  id="17" type="int64"/>
+    <field name="readTopicId"     id="18" type="int32"/>
+    <field name="readPartition"   id="19" type="int32"/>
+    <field name="newNextOffset"   id="20" type="int64"/>
+    <field name="hwBound"         id="21" type="int64"/>
+    <field name="isolation"       id="22" type="uint8"/>
+    <field name="isGroup"         id="23" type="uint8"/>
+    <field name="groupCarrierReceived" id="24" type="uint8"/>
+    <!-- Task 10 round 4: the target replica's identity (registry id + incarnation)
+         echoed from the op, so the runtime refers to replicas by identity (and
+         resolves them through the registry) instead of holding a raw pointer. -->
+    <field name="targetReplicaId" id="26" type="uint32"/>
+    <field name="incarnation"     id="27" type="uint32"/>
+    <!-- PushReadResult chunk (raw record-batch bytes) -->
+    <data  name="chunk"           id="25" type="varDataEncoding"/>
+  </sbe:message>
+
+  <!-- ====================================================================== -->
+  <!-- FlushRequest (worker → flusher, async-durability submit ring)           -->
+  <!-- ====================================================================== -->
+  <sbe:message name="FlushRequest" id="3" description="async fdatasync submit">
+    <field name="fd"            id="1" type="int32"/>
+    <field name="flushBoundary" id="2" type="int64"/>
+    <field name="token"         id="3" type="int64"/>
+  </sbe:message>
+
+  <!-- ====================================================================== -->
+  <!-- FlushCompletion (flusher → worker, async-durability completion ring)    -->
+  <!-- ====================================================================== -->
+  <sbe:message name="FlushCompletion" id="4" description="async fdatasync completion">
+    <field name="token"         id="1" type="int64"/>
+    <field name="flushBoundary" id="2" type="int64"/>
+    <field name="errorCode"     id="3" type="int32"/>
+  </sbe:message>
+
+  <!-- ====================================================================== -->
+  <!-- OutboundFrame (worker → control-thread outbound ring)                   -->
+  <!-- Wraps an ALREADY-SBE-encoded replication message (payload) with the      -->
+  <!-- process-local routing target node id.  The worker encodes this straight  -->
+  <!-- into the claimed outbound-ring slot (wrap-in-place); drainOutbound decodes-->
+  <!-- targetNodeId + a zero-copy payload span and offers the payload on that    -->
+  <!-- peer's publication.  targetNodeId == -1 is the broadcast sentinel.        -->
+  <!-- ====================================================================== -->
+  <sbe:message name="OutboundFrame" id="5" description="worker→control outbound ring envelope">
+    <field name="targetNodeId" id="1" type="int32"/>
+    <data  name="payload"      id="2" type="varDataEncoding"/>
+  </sbe:message>
+
+  <!-- ====================================================================== -->
+  <!-- TxnReturn (worker → control over the SAME return ring as WorkerReturn,  -->
+  <!-- discriminated by template id).  F15 design note §7: a small fixed block -->
+  <!-- so the ProduceResult carrier (WorkerReturn) never grows.  Ids 1-5 are   -->
+  <!-- taken (4 = FlushCompletion).                                            -->
+  <!-- ====================================================================== -->
+  <sbe:message name="TxnReturn" id="6" description="worker→control transactional return">
+    <field name="kind"        id="1" type="TxnReturnKind"/>
+    <field name="topicId"     id="2" type="int32"/>
+    <field name="partition"   id="3" type="int32"/>
+    <field name="incarnation" id="4" type="uint32"/>
+    <field name="leaderEpoch" id="5" type="int32"/>
+    <field name="token"       id="6" type="int64"/>
+    <field name="errorCode"   id="7" type="int16"/>
+  </sbe:message>
+
+  <!-- ====================================================================== -->
+  <!-- WriteSyncRequest (worker → flusher, the SAME submit ring as            -->
+  <!-- FlushRequest, discriminated by template id).  E1d: pwrite a small fixed -->
+  <!-- block (<= 64 bytes, carried inline — no pointer, no lifetime coupling) -->
+  <!-- at `fileOffset` of an already-open, pre-allocated file, then fdatasync it;  -->
+  <!-- ONE FlushCompletion (same token space) reports the combined result.    -->
+  <!-- ====================================================================== -->
+  <sbe:message name="WriteSyncRequest" id="7" description="async pwrite of a small block + fdatasync">
+    <field name="fd"     id="1" type="int32"/>
+    <field name="length" id="2" type="uint16"/>
+    <field name="fileOffset" id="3" type="int64"/>
+    <field name="token"  id="4" type="int64"/>
+    <field name="block"  id="5" type="WriteBlock64"/>
+  </sbe:message>
+
+</sbe:messageSchema>
