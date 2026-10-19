@@ -122,7 +122,7 @@ matrices stay small and large ones are one edit away.
 `records`, `keys`, `rate_hz`, `from` (earliest/latest/offset:N), `slow_subscriber_ms`,
 `expect`, `cid_base`, `timeout_ms`, `subscribe_ms`.
 
-The driver binary is `rune-client-cpp/examples/dr_client.cpp`; it emits
+The driver binary is `client-cpp/examples/dr_client.cpp`; it emits
 machine-parseable lines:
 
 ```

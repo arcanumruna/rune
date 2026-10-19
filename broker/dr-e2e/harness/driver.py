@@ -1,6 +1,6 @@
 """Multi-client driver: launch N rune-dr-client containers + parse their output.
 
-The dr_client binary (rune-client-cpp/examples/dr_client.cpp, image
+The dr_client binary (client-cpp/examples/dr_client.cpp, image
 `rune-dr-client:<client sha>`, built by `ensure_dr_client_image`) is fully env-driven and emits machine-parseable lines:
 
     PRODUCED  cid=<c> key=<k> seq=<s> part=<p> offset=<o>
@@ -38,12 +38,13 @@ from . import auth
 from .dockerutil import CommandTimeout, _git_sha, run, run_until
 from .timing import timed
 
-# The dr client image is tied to the rune-client-cpp checkout: `rune-dr-client:<client HEAD sha>`, built by
+# The dr client image is tied to the client-cpp checkout: `rune-dr-client:<client HEAD sha>`, built by
 # `ensure_dr_client_image()` (called from `Cluster.up()`).  DR_CLIENT_IMAGE names a prebuilt image instead; it must
 # carry a matching `rune.client.sha` label (Dockerfile.dr) or the harness refuses it - a stale image once ran
 # against a current broker and failed every produce with SchemaValidationFailed (24).
 _BROKER_REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-CLIENT_REPO = os.environ.get("DR_CLIENT_REPO", os.path.join(os.path.dirname(_BROKER_REPO), "rune-client-cpp"))
+# Monorepo layout: broker/ and client-cpp/ are siblings under the monorepo root.
+CLIENT_REPO = os.environ.get("DR_CLIENT_REPO", os.path.join(os.path.dirname(_BROKER_REPO), "client-cpp"))
 _CLIENT_SHA = _git_sha(CLIENT_REPO)
 DR_IMAGE = os.environ.get("DR_CLIENT_IMAGE", f"rune-dr-client:{_CLIENT_SHA}")
 class ClientHangWarning(UserWarning):
@@ -55,7 +56,18 @@ class ClientHangWarning(UserWarning):
 # 3 s: a static backlog streams at millisecond gaps (dr_client prints every record as it lands), so 3 s of silence
 # after every partition delivered is > 1000x the stream's own gap.
 DRAIN_QUIET_MS = int(os.environ.get("DR_DRAIN_QUIET_MS", "3000"))
-_DR_BUILD_CONTEXTS = ("rune-protocol", "flight-recorder", "rune-codec", "rune-ql", "rune-crypto")
+# BuildKit named context (as Dockerfile.dr spells it) -> directory name next to client-cpp/ in the monorepo.
+# flight-recorder lives in its own repository: FLIGHT_RECORDER_DIR, else a checkout next to the monorepo root.
+_DR_BUILD_CONTEXTS = {"rune-protocol": "protocol", "flight-recorder": None, "rune-codec": "codec",
+                      "rune-ql": "ql", "rune-crypto": "crypto"}
+
+
+def build_context_dir(name: str) -> str:
+    """Host directory behind the named build context `name` (see _DR_BUILD_CONTEXTS)."""
+    sib = os.path.dirname(CLIENT_REPO)
+    if name == "flight-recorder":
+        return os.environ.get("FLIGHT_RECORDER_DIR", os.path.join(os.path.dirname(sib), "flight-recorder"))
+    return os.path.join(sib, _DR_BUILD_CONTEXTS[name])
 
 
 @timed("image.dr_client")
@@ -95,13 +107,12 @@ def _ensure_dr_client_image() -> None:
     # Review B-M6: never label an image with a sha its code is not.
     if _CLIENT_SHA.endswith("-dirty") and os.environ.get("DR_ALLOW_DIRTY_CLIENT") != "1":
         raise RuntimeError(
-            f"rune-client-cpp at {CLIENT_REPO} has uncommitted changes — an image built from it is not "
+            f"client-cpp at {CLIENT_REPO} has uncommitted changes — an image built from it is not "
             f"{_CLIENT_SHA[:-6]}; commit/stash, point DR_CLIENT_REPO at a clean worktree, or set DR_ALLOW_DIRTY_CLIENT=1")
-    sib = os.path.dirname(CLIENT_REPO)
     ctx: list[str] = []
     for d in _DR_BUILD_CONTEXTS:
-        ctx += ["--build-context", f"{d}={os.path.join(sib, d)}"]
-    proto_sha = _git_sha(os.path.join(sib, "rune-protocol"))
+        ctx += ["--build-context", f"{d}={build_context_dir(d)}"]
+    proto_sha = _git_sha(build_context_dir("rune-protocol"))
     print(f"[dr-e2e] dr client image {DR_IMAGE}: client {_CLIENT_SHA}, rune-protocol {proto_sha}", flush=True)
     run(["docker", "build", "--platform", "linux/amd64", "-f", os.path.join(CLIENT_REPO, "docker", "Dockerfile.dr"),
          *ctx, "--build-arg", f"RUNE_CLIENT_SHA={_CLIENT_SHA}", "--label", f"rune.protocol.sha={proto_sha}",
@@ -113,7 +124,7 @@ def _ensure_dr_client_image() -> None:
 # DR_CLIENT_PLATFORM=linux/amd64 forces emulation for an amd64-only image.
 _PLATFORM_ARGS = (["--platform", os.environ["DR_CLIENT_PLATFORM"]] if os.environ.get("DR_CLIENT_PLATFORM") else [])
 
-# The env var of the dr_client IMAGE (rune-client-cpp/examples/dr_client.cpp) that carries ITS topic table
+# The env var of the dr_client IMAGE (client-cpp/examples/dr_client.cpp) that carries ITS topic table
 # "name:topicId:partitions,...".  That is the client's own setting - the brokers take no topic list; their
 # topics are created by DDL (Cluster.create_topics).  The one spelling lives here, for every harness caller.
 CLIENT_TOPICS_ENV = "RUNE_CLIENT_TOPIC_TABLE"

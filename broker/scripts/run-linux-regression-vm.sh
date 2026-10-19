@@ -3,7 +3,10 @@
 #
 #   scripts/run-linux-regression-vm.sh [jobs] [build-dir] [ctest-filter]
 #     jobs       default 3 (the VM has 4 cores, shared with k3s)
-#     build-dir  default build-fast (its CMakeCache names the sibling trees)
+#     build-dir  default $RUNE_BUILD_DIR, else build-fast under broker/, else build/root at the monorepo root.
+#                Either a broker-only build (cmake -S broker) or the monorepo root build (cmake -S . -B build/root):
+#                both cache the same RUNE_*_ROOT / FLIGHT_RECORDER_DIR variables that name the trees to copy.  A
+#                relative path is tried against the cwd, broker/ and the monorepo root, in that order.
 #     ctest-filter  default empty.  ISR v3 Step 10 (CP2): a ctest -R regex.  When set, the stage also configures
 #                BUILD_INTEGRATION_TESTING=ON, builds rune_consensus_candidacy_tests, rune_client_broker_tests and
 #                rune_node_tests (exit 2, naming the target, when one does not exist) and runs
@@ -32,7 +35,7 @@
 # Exit code = the stage's verdict.  The sanitizer checkpoint (build-asan / build-tsan, Mac) does not need this
 # stage: GSO is not sanitizer-relevant on the Mac (stub bindings).
 set -u
-J="${1:-3}"; B="${2:-build-fast}"; F="${3:-}"
+J="${1:-3}"; B="${2:-${RUNE_BUILD_DIR:-}}"; F="${3:-}"
 ITEG=OFF; XT=""
 if [ -n "$F" ]; then ITEG=ON; XT="rune_consensus_candidacy_tests rune_client_broker_tests rune_node_tests"; fi
 # The Linux VM to gate on, as user@host.  No default: set RUNE_LINUX_GATE_HOST (or just RUNE_VM_HOST).
@@ -40,8 +43,13 @@ VM="${RUNE_LINUX_GATE_HOST:-${RUNE_VM_HOST:+root@${RUNE_VM_HOST}}}"
 [ -n "$VM" ] || { echo "run-linux-regression-vm: set RUNE_VM_HOST (VM address) or RUNE_LINUX_GATE_HOST (user@host)" >&2; exit 2; }
 GD="${RUNE_LINUX_GATE_DIR:-/root/rune-linux-gate}"
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
-CACHE="$HERE/$B/CMakeCache.txt"
-[ -f "$CACHE" ] || { echo "run-linux-regression-vm: no $CACHE" >&2; exit 2; }
+ROOT="$(cd "$HERE/.." && pwd)"
+CACHE=""
+if [ -n "$B" ]; then cands=("$B" "$PWD/$B" "$HERE/$B" "$ROOT/$B"); else cands=("$HERE/build-fast" "$ROOT/build/root"); fi
+for c in "${cands[@]}"; do
+    [ -f "$c/CMakeCache.txt" ] && { CACHE="$c/CMakeCache.txt"; break; }
+done
+[ -n "$CACHE" ] || { echo "run-linux-regression-vm: no CMakeCache.txt in any of: ${cands[*]} (pass the build dir or set RUNE_BUILD_DIR)" >&2; exit 2; }
 val() { grep -E "^$1:" "$CACHE" | head -1 | cut -d= -f2-; }
 PROTO="$(cd "$(val RUNE_PROTOCOL_INCLUDE)/.." && pwd)"
 declare -a NAMES=(broker protocol client-cpp codec flight-recorder ql crypto)

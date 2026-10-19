@@ -39,4 +39,3 @@ README.md
 CLAUDE.md
 
 # Scripts that drive docker (not needed inside)
-build_docker.sh

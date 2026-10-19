@@ -1,5 +1,4 @@
 requirements:
-  - "common/1.0.10@vradu/dev"
   - "aeron/1.41.4"
 test_requirements:
   - "gtest/1.16.0"

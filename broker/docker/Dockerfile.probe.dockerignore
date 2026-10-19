@@ -37,7 +37,6 @@ README.md
 CLAUDE.md
 
 # Scripts
-build_docker.sh
 
 # Cluster keys / generated passwords of the authentication e2e
 docker/secrets/

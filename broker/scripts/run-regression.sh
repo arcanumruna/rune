@@ -2,7 +2,8 @@
 # The FULL broker `*Regression*` suite — the checkpoint gate (CLAUDE.md rule 7).
 #
 #   scripts/run-regression.sh [build-dir] [jobs] [extra ctest args...]
-#     build-dir  default build-fast
+#     build-dir  default $RUNE_BUILD_DIR, else build-fast; a broker-only build (cmake -S broker) or the monorepo
+#                root build (cmake -S . -B build/root); the stage-c scripts handle both layouts
 #     jobs       default 10 (stage a's -j)
 #
 # Three stages, ALL mandatory at every checkpoint (a checkpoint is green only when all are):
@@ -23,7 +24,7 @@
 # Prints each stage's wall time and the total; exits non-zero if any stage failed.  A latency stage over
 # 60 s is reported (it is the serial tail of every checkpoint).
 set -u
-B="${1:-build-fast}"; shift || true
+B="${1:-${RUNE_BUILD_DIR:-build-fast}}"; shift || true
 J="${1:-10}"; shift || true
 
 now() { perl -MTime::HiRes=time -e 'printf "%.1f\n", time'; }
