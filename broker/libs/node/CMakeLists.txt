@@ -127,7 +127,7 @@ if(BUILD_TESTING)
     # to TSan's default halt_on_error=0 (races still reported + non-zero exit, but
     # not stopped at first). A real rune-side race still fails the build either way.
     set(RUNE_TSAN_AERON_SUPP
-        "${CMAKE_SOURCE_DIR}/cmake/tsan-aeron.supp")
+        "${RUNE_BROKER_DIR}/cmake/tsan-aeron.supp")
 
     # Task 13 (spec §3.4): worker-side ack sink + announce-before-accept (no driver).
     add_executable(rune_session_ack_sink_tests tests/node/SessionAckSinkTest.cpp)
@@ -1817,7 +1817,7 @@ if(BUILD_TESTING)
     target_compile_definitions(rune_psm_hw_bound_tests PRIVATE
         TX2B_UNIT_ONLY=1)
     target_include_directories(rune_psm_hw_bound_tests PRIVATE
-        ${CMAKE_SOURCE_DIR}/libs/aeronutil/include)   # header-only testing/FreePort.h
+        ${RUNE_BROKER_DIR}/libs/aeronutil/include)   # header-only testing/FreePort.h
     target_link_libraries(rune_psm_hw_bound_tests PRIVATE
         rune_storage
         GTest::gtest_main)

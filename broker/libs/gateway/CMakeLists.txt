@@ -81,13 +81,13 @@ if(BUILD_TESTING)
 
     # Authentication Task 11: the broker half of SCRAM as pure functions.
     add_executable(rune_gateway_scram_server_tests tests/ScramServerTest.cpp)
-    target_include_directories(rune_gateway_scram_server_tests PRIVATE ${CMAKE_SOURCE_DIR}/libs/node/tests)
+    target_include_directories(rune_gateway_scram_server_tests PRIVATE ${RUNE_BROKER_DIR}/libs/node/tests)
     target_link_libraries(rune_gateway_scram_server_tests PRIVATE rune_gateway GTest::gtest_main)
     gtest_discover_tests(rune_gateway_scram_server_tests)
 
     # Authentication Task 11: the gateway's login state machine (gate, SCRAM legs, throttle, deadline, counters) - no Aeron.
     add_executable(rune_gateway_auth_login_tests tests/gateway/AuthLoginGatewayTest.cpp)
-    target_include_directories(rune_gateway_auth_login_tests PRIVATE ${CMAKE_SOURCE_DIR}/libs/node/tests)
+    target_include_directories(rune_gateway_auth_login_tests PRIVATE ${RUNE_BROKER_DIR}/libs/node/tests)
     target_link_libraries(rune_gateway_auth_login_tests PRIVATE rune_gateway rune_node spdlog::spdlog GTest::gtest_main)
     gtest_discover_tests(rune_gateway_auth_login_tests)
 
@@ -269,7 +269,7 @@ if(BUILD_TESTING)
 
     # Authentication Task 10: the bootstrap proof (D4), the __security route, Subscribe -7 and the pre-auth gate - no Aeron.
     add_executable(rune_gateway_security_tests tests/gateway/SecurityGatewayTest.cpp)
-    target_include_directories(rune_gateway_security_tests PRIVATE ${CMAKE_SOURCE_DIR}/libs/node/tests)
+    target_include_directories(rune_gateway_security_tests PRIVATE ${RUNE_BROKER_DIR}/libs/node/tests)
     target_link_libraries(rune_gateway_security_tests PRIVATE rune_gateway rune_node spdlog::spdlog GTest::gtest_main)
     gtest_discover_tests(rune_gateway_security_tests)
 
@@ -281,7 +281,7 @@ if(BUILD_TESTING)
 
     # Phase 2b E2: the transient interaction matrix (1008 TEST_P cells) — no Aeron.
     add_executable(rune_gateway_transient_matrix_tests tests/gateway/TransientInteractionMatrixTest.cpp)
-    target_include_directories(rune_gateway_transient_matrix_tests PRIVATE ${CMAKE_SOURCE_DIR}/libs/node/tests)
+    target_include_directories(rune_gateway_transient_matrix_tests PRIVATE ${RUNE_BROKER_DIR}/libs/node/tests)
     target_link_libraries(rune_gateway_transient_matrix_tests PRIVATE rune_gateway rune_node rune_replication
                           rune_storage rune_transaction spdlog::spdlog GTest::gtest_main)
     gtest_discover_tests(rune_gateway_transient_matrix_tests DISCOVERY_TIMEOUT 120 PROPERTIES LABELS small)

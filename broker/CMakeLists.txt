@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.31)
 project(rune_broker)
+# Anchor for broker-relative paths: CMAKE_SOURCE_DIR is the monorepo root when the root CMakeLists hosts us.
+set(RUNE_BROKER_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # clangd / tooling: export compile_commands.json (C++23 flags reach the IDE).
@@ -315,12 +317,12 @@ endif()
 
 # TSan environment for every Aeron-using test target (vendored Aeron client
 # internals are suppressed via cmake/tsan-aeron.supp; rune code is not).
-set(RUNE_TSAN_AERON_SUPP "${CMAKE_SOURCE_DIR}/cmake/tsan-aeron.supp")
+set(RUNE_TSAN_AERON_SUPP "${RUNE_BROKER_DIR}/cmake/tsan-aeron.supp")
 set(RUNE_AERON_TSAN_ENV "TSAN_OPTIONS=halt_on_error=1 suppressions=${RUNE_TSAN_AERON_SUPP}")
 # In a TSan build, link a default-options object into EVERY executable so the
 # Aeron suppressions apply even to test targets registered without the env.
 if(CMAKE_CXX_FLAGS MATCHES "-fsanitize=thread")
-    configure_file(${CMAKE_SOURCE_DIR}/cmake/tsan_default_options.cpp.in
+    configure_file(${RUNE_BROKER_DIR}/cmake/tsan_default_options.cpp.in
                    ${CMAKE_BINARY_DIR}/rune_tsan_default_options.cpp @ONLY)
     add_library(rune_tsan_default_options OBJECT ${CMAKE_BINARY_DIR}/rune_tsan_default_options.cpp)
     link_libraries(rune_tsan_default_options)
@@ -414,7 +416,7 @@ if(BUILD_TESTING)
     add_executable(rune_broker_process_tests tests/process/BrokerProcessSignalTest.cpp
                                           tests/process/StorageFormatProcessTest.cpp)
     target_link_libraries(rune_broker_process_tests PRIVATE GTest::gtest_main)
-    target_include_directories(rune_broker_process_tests PRIVATE ${CMAKE_SOURCE_DIR}/libs/aeronutil/include)
+    target_include_directories(rune_broker_process_tests PRIVATE ${RUNE_BROKER_DIR}/libs/aeronutil/include)
     target_compile_definitions(rune_broker_process_tests PRIVATE
         RUNE_BROKER_BIN="$<TARGET_FILE:rune_broker>")
     add_dependencies(rune_broker_process_tests rune_broker)
