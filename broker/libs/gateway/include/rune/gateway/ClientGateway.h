@@ -434,6 +434,9 @@ public:
     void onSecurityHalted(int64_t offset);
     /// The newest security event offset whose refresh EVERY worker has accepted (D24 answer gate); -1 = none yet.
     [[nodiscard]] int64_t securityEnforcedOffset() const noexcept { return securityEnforcedOffset_; }
+    /// Test probes (Task 18): the event waiting for the shipper to drain (-1 none) and the shipper's queued updates.
+    [[nodiscard]] int64_t securityPendingEnforceForTest() const noexcept { return securityPendingEnforce_; }
+    [[nodiscard]] std::size_t permissionPendingUpdatesForTest() const noexcept { return permissionShipper_.pendingUpdates(); }
     /// Counter 1'000'232: sessions revoked (disabled / dropped / TERMINATE SESSIONS / security halt).
     [[nodiscard]] uint64_t sessionsRevoked() const noexcept { return sessionsRevoked_; }
     // ── authentication Task 12: per-session permission tables and the enforcement of every request type ──
@@ -1431,7 +1434,16 @@ private:
     // that revokeGroupSubscriptions() can remove exactly those and leave
     // normal client-initiated subscriptions untouched.
     // -----------------------------------------------------------------------
+    /// Where a subscription's cursor lives (auth Task 18, M3).  One explicit state per subscription: the worker-side
+    /// lifecycle used to be implicit in three structures (a waiter list, the sub-op queue, this record).
+    ///   GatewayPushed  - the gateway pushes it (internal topics, no per-worker egress): no worker cursor, nothing to cancel.
+    ///   AwaitingEgress - its Subscribe is buffered in pendingRecordEgress_[{sessionId, owner worker}] until the session's
+    ///                    record-egress pub resolves; the worker has NOT seen it, so an unsubscribe cancels the waiter.
+    ///   AtWorker       - the Subscribe op was handed to the owning worker (ring or sub-op queue): an unsubscribe op follows
+    ///                    it in FIFO order.
+    enum class Cursor : uint8_t { GatewayPushed, AwaitingEgress, AtWorker };
     struct Subscription {
+        Cursor  cursor         = Cursor::GatewayPushed;
         int64_t subscriptionId = 0;
         int64_t sessionId      = 0;
         // The correlationId of the client's Subscribe that created it: stamped
@@ -1655,6 +1667,9 @@ private:
     // → MDC fallback).
     rune::node::WorkerOp buildSubscribeOp_(const BufferedSubscribe& s, void* egressPub) const;
     void enqueueSubscribeOp_(const BufferedSubscribe& s, void* egressPub);
+    void parkAwaitingEgress_(const BufferedSubscribe& s);
+    /// A buffered Subscribe leaves the waiter list for the worker, unless its subscription ended while it waited.
+    void releaseAwaiting_(const BufferedSubscribe& s, void* egressPub);
     // Resolve in-flight record-egress pubs (non-blocking) + drain buffered
     // subscribes.  Called from doWork().
     void pollPendingRecordEgress_(int64_t nowNs);
@@ -2686,6 +2701,24 @@ public:
     void forwardUnsubscribeForTest(int64_t subId, int32_t topicId, int32_t partition) {
         forwardUnsubscribeToWorker_(subId, topicId, partition);
     }
+    /// Test-only (auth Task 18): a subscription whose Subscribe is parked in pendingRecordEgress_ awaiting a record-egress
+    /// pub that has not resolved (regId stays -1: pollPendingRecordEgressForTest then takes the MDC fallback drain).
+    void addSubscriptionAwaitingEgressForTest(int64_t subId, int64_t sessionId, int32_t topicId, int32_t partition) {
+        Subscription sub;
+        sub.subscriptionId = subId; sub.sessionId = sessionId; sub.topicId = topicId; sub.partition = partition;
+        subscriptions_.emplace(subId, std::move(sub));
+        parkAwaitingEgress_(BufferedSubscribe{subId, 0, sessionId, topicId, partition, 0, 0, false, false});
+    }
+    void pollPendingRecordEgressForTest(int64_t nowNs) { pollPendingRecordEgress_(nowNs); }
+    [[nodiscard]] int pendingEgressWaitersForTest() const noexcept {
+        int n = 0;
+        for (const auto& [k, pend] : pendingRecordEgress_) n += static_cast<int>(pend.waiters.size());
+        return n;
+    }
+    [[nodiscard]] bool subscriptionAwaitsEgressForTest(int64_t subId) const {
+        const auto it = subscriptions_.find(subId);
+        return it != subscriptions_.end() && it->second.cursor == Cursor::AwaitingEgress;
+    }
     /// Test-only: run the retry pumps (markers + subscription ops) once.
     int pumpRetryQueuesForTest() { return pumpMarkerQueue_() + pumpSubOps_() + pumpEgressReleases_(); }
     // Record-egress lifetime (retire-on-ack) test hooks.
@@ -2703,6 +2736,10 @@ public:
         BufferedSubscribe b;
         b.subId = subId; b.sessionId = sid; b.topicId = topicId; b.partition = partition;
         pend.waiters.push_back(b);
+        Subscription sub;   // the real path holds the record, state AwaitingEgress, while its Subscribe waits
+        sub.subscriptionId = subId; sub.sessionId = sid; sub.topicId = topicId; sub.partition = partition;
+        sub.cursor = Cursor::AwaitingEgress;
+        subscriptions_.emplace(subId, std::move(sub));
         onRecordEgressResolved_(sid, worker, pend, std::move(pub));
     }
     [[nodiscard]] std::size_t retiringRecordEgressCountForTest() const noexcept { return retiringEgress_.size(); }

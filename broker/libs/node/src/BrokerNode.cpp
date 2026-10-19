@@ -3457,6 +3457,29 @@ uint64_t BrokerNode::securityUserIdForTest(const std::string& name) {
     });
 }
 
+BrokerNode::SecurityGateSnap BrokerNode::securityGateForTest() {
+    return onControlThreadForTest([this]() -> SecurityGateSnap {
+        SecurityGateSnap g;
+        g.held = securityGate_.size();
+        if (securityView_) g.applied = securityView_->appliedOffset();
+        g.refreshed = securityRefreshedOffset_;
+        if (gateway_) { g.gatewayEnforced = gateway_->securityEnforcedOffset(); g.pendingEnforce = gateway_->securityPendingEnforceForTest(); g.shipperPending = gateway_->permissionPendingUpdatesForTest(); }
+        return g;
+    });
+}
+
+int64_t BrokerNode::securityAppliedOffsetOnControlForTest() {
+    return onControlThreadForTest([this]() -> int64_t { return securityView_ ? securityView_->appliedOffset() : int64_t{-1}; });
+}
+
+uint64_t BrokerNode::workerPermissionEpochForTest(int32_t w, int64_t sessionId) {
+    return onWorkerThreadForTest(w, [sessionId](auto& worker) -> uint64_t { return worker.permissionEpochForTest(sessionId); });
+}
+
+std::size_t BrokerNode::workerDirectAcksInFlightForTest(int32_t w) {
+    return onWorkerThreadForTest(w, [](auto& worker) -> std::size_t { return worker.directAcksInFlightForTest(); });
+}
+
 bool BrokerNode::gatewayHasSessionForTest(int64_t sessionId) {
     return onControlThreadForTest([this, sessionId]() { return gateway_ != nullptr && gateway_->hasSessionForTest(sessionId); });
 }

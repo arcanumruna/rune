@@ -18,6 +18,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <utility>
 #include <cassert>
 #include <functional>
 #include <optional>
@@ -28,7 +29,6 @@ namespace rune::metadata {
 class AssignmentMap {
 public:
     static constexpr uint64_t EMPTY_KEY   = ~uint64_t{0};   // 0xFFFFFFFFFFFFFFFF
-    static constexpr uint64_t DELETED_KEY = ~uint64_t{1};   // 0xFFFFFFFFFFFFFFFE
 
     static constexpr float    LOAD_FACTOR = 0.60f;
     static constexpr int      INITIAL_CAP = 16;             // must be power of 2
@@ -54,7 +54,6 @@ public:
             const uint64_t ek = keys_[idx];
             if (ek == EMPTY_KEY)   return nullptr;
             if (ek == k)           return &values_[idx];
-            // DELETED_KEY: keep probing
             idx = (idx + 1) & mask;
         }
     }
@@ -78,23 +77,15 @@ public:
     {
         maybeRehash();
         const uint64_t k = makeKey(topicId, partition);
-        int firstDeleted = -1;
         const int mask = capacity_ - 1;
         int idx = hashIndex(k, mask);
         for (;;) {
             const uint64_t ek = keys_[idx];
             if (ek == EMPTY_KEY) {
-                // Use firstDeleted slot if we passed one
-                int slot = (firstDeleted >= 0) ? firstDeleted : idx;
-                keys_[slot]   = k;
-                values_[slot] = pa;
+                keys_[idx]   = k;
+                values_[idx] = pa;
                 ++size_;
                 return;
-            }
-            if (ek == DELETED_KEY) {
-                if (firstDeleted < 0) firstDeleted = idx;
-                idx = (idx + 1) & mask;
-                continue;
             }
             if (ek == k) {
                 values_[idx] = pa;  // overwrite
@@ -114,7 +105,24 @@ public:
             const uint64_t ek = keys_[idx];
             if (ek == EMPTY_KEY) return;           // not found
             if (ek == k) {
-                keys_[idx] = DELETED_KEY;
+                // Backward-shift deletion: NO tombstones.  Every key behind the hole whose home slot is not cyclically
+                // inside (hole, it] moves into the hole, so each probe chain stays unbroken and an EMPTY slot always
+                // exists (the load factor bounds live entries; a tombstone would not count toward it and create / drop
+                // churn would eventually leave no EMPTY slot, so get() of an absent key looped forever).
+                int hole = idx;
+                int j = idx;
+                for (;;) {
+                    j = (j + 1) & mask;
+                    const uint64_t jk = keys_[j];
+                    if (jk == EMPTY_KEY) break;
+                    const int home = hashIndex(jk, mask);
+                    if (((j - home) & mask) >= ((j - hole) & mask)) {
+                        keys_[hole]   = jk;
+                        values_[hole] = std::move(values_[j]);
+                        hole = j;
+                    }
+                }
+                keys_[hole] = EMPTY_KEY;
                 --size_;
                 return;
             }
@@ -131,7 +139,7 @@ public:
     {
         for (int i = 0; i < capacity_; ++i) {
             const uint64_t k = keys_[i];
-            if (k == EMPTY_KEY || k == DELETED_KEY) continue;
+            if (k == EMPTY_KEY) continue;
             fn(static_cast<int32_t>(k >> 32),
                static_cast<int32_t>(k & 0xFFFFFFFFu),
                values_[i]);
@@ -193,7 +201,7 @@ private:
         allocate(newCap);
         for (int i = 0; i < oldCap; ++i) {
             const uint64_t k = oldKeys[i];
-            if (k == EMPTY_KEY || k == DELETED_KEY) continue;
+            if (k == EMPTY_KEY) continue;
             // Re-insert without re-checking load (we already doubled)
             const int mask = capacity_ - 1;
             int idx = hashIndex(k, mask);

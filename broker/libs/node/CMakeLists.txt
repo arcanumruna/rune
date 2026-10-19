@@ -1695,6 +1695,14 @@ if(BUILD_TESTING)
                               GTest::gtest_main)
         gtest_discover_tests(rune_auth_cluster_tests PROPERTIES TIMEOUT 900)
 
+        # Authentication Task 18: seeded, model-checked stress - racing security DDL vs produce / subscribe / create against
+        # an independent permission model (support/PermissionModel.h).
+        add_executable(rune_auth_stress_tests tests/node/AuthStressRegressionTest.cpp tests/node/AuthDdlAnswerStallRegressionTest.cpp)
+        target_include_directories(rune_auth_stress_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_auth_stress_tests PRIVATE rune_node rune_view rune_codec rune_catalog aeron::aeron
+                              GTest::gtest_main)
+        gtest_discover_tests(rune_auth_stress_tests PROPERTIES TIMEOUT 900)
+
         # DR client bugs (2026-10-15): the REAL client against 3 REAL in-process brokers, a leader SIGKILLed mid-op
         # (seed failover, metadata from any live broker, re-route; produce / subscribe / group / txn / DDL / view row).
         add_executable(rune_client_failover_broker_tests tests/client/ClientFailoverBrokerRegressionTest.cpp)

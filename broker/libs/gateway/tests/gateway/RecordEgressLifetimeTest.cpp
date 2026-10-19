@@ -399,3 +399,41 @@ TEST(RecordEgressLifetimeRegression, NonShardModeCloseKeepsThePubAliveUntilTheWo
     EXPECT_EQ(pub.destroyed, 1);
     EXPECT_EQ(r.gw.retiringRecordEgressCountForTest(), 0u);
 }
+
+// Auth Task 18 (seeded stress): a revoke ends a subscription whose Subscribe still waits for the session's record-egress
+// pub.  The unsubscribe must cancel the waiter - else the pub's resolution enqueues the Subscribe to the worker, a zombie
+// cursor the gateway no longer knows (it pushed after the revoke, and again after a re-grant of READ).
+TEST(RecordEgressLifetimeRegression, UnsubscribeCancelsASubscribeStillAwaitingItsEgressPub) {
+    Rig r(1);
+    const int64_t sid = r.gw.injectTestSession(0);
+    auto& w = r.pool.worker(r.owner(0));
+    r.gw.addSubscriptionAwaitingEgressForTest(/*subId=*/41, sid, 0, 0);
+    ASSERT_TRUE(r.gw.subscriptionAwaitsEgressForTest(41));
+    ASSERT_EQ(r.gw.pendingEgressWaitersForTest(), 1);
+
+    r.gw.forwardUnsubscribeForTest(41, 0, 0);                  // the revoke ends it while the pub is still pending
+    EXPECT_EQ(r.gw.pendingEgressWaitersForTest(), 0) << "the waiter is cancelled where it waits";
+    EXPECT_FALSE(r.gw.subscriptionAwaitsEgressForTest(41));
+
+    r.gw.pollPendingRecordEgressForTest(1);                    // the pub resolves (here: the MDC fallback drain)
+    r.gw.pumpRetryQueuesForTest();
+    w.doWork(1);
+    w.doWork(2);
+    EXPECT_EQ(r.gw.pendingRecordEgressCountForTest(), 0u) << "the pending resolve drained";
+    EXPECT_EQ(r.gw.pendingSubOpsForTest(), 0u) << "no Subscribe op was queued for the ended subscription";
+    EXPECT_TRUE(w.subscriptionsForTest().empty()) << "the worker holds no cursor for an ended subscription";
+}
+
+// The positive control of the test above: without an unsubscribe the same parked Subscribe DOES reach the worker.
+TEST(RecordEgressLifetimeRegression, ASubscribeAwaitingItsEgressPubReachesTheWorkerOnceItResolves) {
+    Rig r(1);
+    const int64_t sid = r.gw.injectTestSession(0);
+    auto& w = r.pool.worker(r.owner(0));
+    r.gw.addSubscriptionAwaitingEgressForTest(/*subId=*/42, sid, 0, 0);
+    r.gw.pollPendingRecordEgressForTest(1);
+    r.gw.pumpRetryQueuesForTest();
+    w.doWork(1);
+    w.doWork(2);
+    EXPECT_FALSE(r.gw.subscriptionAwaitsEgressForTest(42));
+    EXPECT_EQ(w.subscriptionsForTest().size(), 1u) << "the harness path delivers (so the cancel test is not vacuous)";
+}

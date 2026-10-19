@@ -271,3 +271,85 @@ TEST(PartitionAssignmentBumpRules, LeaderEpoch_NeverDecreases)
     auto next = mergeChange(cur, change);
     EXPECT_GE(next.leaderEpoch, cur.leaderEpoch);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Authentication Task 18 (seeded stress, seed 0): a DDL-churned AssignmentMap probed forever.  remove() left tombstones
+// that never counted toward the load factor, so create / drop churn over distinct topic ids ate every EMPTY slot and
+// get() of an absent key then looped for good on the control thread (every DDL answer stalled behind it).
+// ─────────────────────────────────────────────────────────────────────────────
+#include "rune/metadata/AssignmentMap.h"
+
+
+TEST(AssignmentMapRegression, ChurnOverDistinctTopicIdsNeverExhaustsEmptySlots) {
+    // On the broken table the absent-key get() below never returns: the ctest TIMEOUT (60 s) is the failure.
+    AssignmentMap m;
+    // a handful of live entries; thousands of create-then-drop cycles over fresh ids (DDL churn)
+    for (int32_t id = 1; id <= 5000; ++id) {
+        m.put(id, 0, PartitionAssignment{});
+        if (id > 3) m.remove(id - 3, 0);
+    }
+    EXPECT_EQ(m.size(), 3);
+    for (int32_t id = 6000; id < 6100; ++id) EXPECT_EQ(m.get(id, 0), nullptr);   // absent keys must terminate
+    for (int32_t id = 4998; id <= 5000; ++id) EXPECT_NE(m.get(id, 0), nullptr);
+}
+
+TEST(AssignmentMapRegression, RemoveKeepsEveryOtherEntryReachable) {
+    AssignmentMap m;
+    for (int32_t id = 1; id <= 200; ++id) m.put(id, 0, PartitionAssignment{});
+    for (int32_t id = 1; id <= 200; id += 2) m.remove(id, 0);
+    for (int32_t id = 1; id <= 200; ++id) EXPECT_EQ(m.get(id, 0) != nullptr, id % 2 == 0) << id;
+    int n = 0;
+    m.forEach([&](int32_t, int32_t, const PartitionAssignment&) { ++n; });
+    EXPECT_EQ(n, 100);
+}
+
+#include <map>
+#include <random>
+
+TEST(AssignmentMapRegression, RandomPutRemoveMatchesAStdMap) {
+    std::mt19937 rng(7);
+    AssignmentMap m;
+    std::map<std::pair<int32_t, int32_t>, int32_t> model;
+    for (int step = 0; step < 20000; ++step) {
+        const int32_t t = static_cast<int32_t>(rng() % 300), p = static_cast<int32_t>(rng() % 3);
+        if (rng() % 2) { PartitionAssignment pa; pa.leaderNode = step; m.put(t, p, pa); model[{t, p}] = step; }
+        else { m.remove(t, p); model.erase({t, p}); }
+        if (step % 97 == 0) {
+            ASSERT_EQ(m.size(), static_cast<int>(model.size()));
+            for (int32_t tt = 0; tt < 300; ++tt) for (int32_t pp = 0; pp < 3; ++pp) {
+                const auto* got = m.get(tt, pp);
+                const auto it = model.find({tt, pp});
+                ASSERT_EQ(got != nullptr, it != model.end()) << step << " " << tt << "," << pp;
+                if (got) ASSERT_EQ(got->leaderNode, it->second);
+            }
+        }
+    }
+}
+
+// Forced collisions and wrap-around: a table of capacity 16 held at 9 live keys (the 0.6 load bound), keys chosen so many
+// share a home slot, and clusters that wrap past the last slot; compared against a std::map, forEach included.
+TEST(AssignmentMapRegression, DenseTableWithCollisionsAndWrapAroundMatchesAStdMap) {
+    std::mt19937 rng(11);
+    AssignmentMap m;
+    std::map<std::pair<int32_t, int32_t>, int32_t> model;
+    // grow past the initial capacity first so cap == 16 is not the only regime, then churn at <= 9 live keys
+    for (int round = 0; round < 40000; ++round) {
+        const int32_t t = static_cast<int32_t>(rng() % 24);   // few distinct keys -> constant collisions in 16 slots
+        if (model.size() < 9 && (rng() % 3) != 0) { PartitionAssignment pa; pa.leaderNode = round; m.put(t, 0, pa); model[{t, 0}] = round; }
+        else { m.remove(t, 0); model.erase({t, 0}); }
+        ASSERT_LE(m.size(), 9);
+        ASSERT_EQ(m.size(), static_cast<int>(model.size()));
+        for (int32_t k = 0; k < 24; ++k) {
+            const auto* got = m.get(k, 0);
+            const auto it = model.find({k, 0});
+            ASSERT_EQ(got != nullptr, it != model.end()) << round << " key " << k;
+            if (got) ASSERT_EQ(got->leaderNode, it->second);
+        }
+        if (round % 50 == 0) {
+            std::map<std::pair<int32_t, int32_t>, int32_t> seen;
+            m.forEach([&](int32_t tt, int32_t pp, const PartitionAssignment& pa) { seen[{tt, pp}] = pa.leaderNode; });
+            ASSERT_EQ(seen, model) << round;
+        }
+    }
+    EXPECT_EQ(m.capacity(), 16) << "stayed in the dense cap-16 regime";
+}
