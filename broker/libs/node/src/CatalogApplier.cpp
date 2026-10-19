@@ -196,7 +196,6 @@ void CatalogApplier::postBootStash(const CatalogEffects& sink) const {
             if (t->schema && sink.schemaChanged) sink.schemaChanged(*t);
         }
         for (const cat::ViewObject* v : state_.views()) {
-            if (viewSinkPartitionError(*v, state_)) continue;
             if (maxFrame != 0 && viewEffectFramesError(*v, state_, maxFrame)) continue;
             if (sink.sinkApplied) sink.sinkApplied(sinkSpecOf(*v));
             if (sink.viewInstalled) sink.viewInstalled(*v);
@@ -230,7 +229,6 @@ void CatalogApplier::emitFinalState_() {
         if (t->schema && sink->schemaChanged) sink->schemaChanged(*t);
     }
     for (const cat::ViewObject* v : state_.views()) {
-        if (auto err = viewSinkPartitionError(*v, state_)) { refuse(std::move(*err)); continue; }   // VLS B.2: halt
         if (maxFrame != 0)
             if (auto err = viewEffectFramesError(*v, state_, maxFrame)) { refuse(std::move(*err)); continue; }
         if (sink->sinkApplied) sink->sinkApplied(sinkSpecOf(*v));

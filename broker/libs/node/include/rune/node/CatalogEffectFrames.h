@@ -36,9 +36,6 @@ namespace rune::node {
                                                                 std::size_t maxFrame);
 /// Same for a view's final state (its sink's TopicApplied + its ViewPlanUpdate,
 /// which carries the first source's materialized descriptor from `state`).
-/// VLS B.2 invariant: a view sink mirrors its sources' partition counts.  Independent of any frame budget.
-[[nodiscard]] std::optional<std::string> viewSinkPartitionError(const rune::catalog::ViewObject& v,
-                                                                const rune::catalog::CatalogState& state);
 [[nodiscard]] std::optional<std::string> viewEffectFramesError(const rune::catalog::ViewObject& v,
                                                                const rune::catalog::CatalogState& state,
                                                                std::size_t maxFrame);

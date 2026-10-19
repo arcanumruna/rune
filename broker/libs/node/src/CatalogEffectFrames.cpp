@@ -58,19 +58,8 @@ std::optional<std::string> topicEffectFramesError(const cat::TopicObject& t, std
     return std::nullopt;
 }
 
-std::optional<std::string> viewSinkPartitionError(const cat::ViewObject& v, const cat::CatalogState& state) {
-    // VLS B.2: the sink owns no replicas -- (view, p) is owned exactly as (source, p), so the counts must match.
-    for (const std::string& name : v.def.sourceNames)
-        if (const cat::TopicObject* s = state.topicByName(name); s && s->partitions != v.def.sinkPartitions)
-            return "the sink of view '" + v.name + "' has " + std::to_string(v.def.sinkPartitions) +
-                   " partition(s) but its source '" + s->name + "' has " + std::to_string(s->partitions) +
-                   " (a view sink mirrors its source's partitioning)";
-    return std::nullopt;
-}
-
 std::optional<std::string> viewEffectFramesError(const cat::ViewObject& v, const cat::CatalogState& state,
                                                  std::size_t maxFrame) {
-    if (auto e = viewSinkPartitionError(v, state)) return e;
     if (auto e = tooLarge("the view sink's TopicApplied effect", v.name,
                           catalogTopicAppliedWireLen(v.name, sinkConfigOf(v)), maxFrame))
         return e;

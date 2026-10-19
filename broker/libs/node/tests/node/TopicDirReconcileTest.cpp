@@ -432,3 +432,46 @@ TEST(TopicDirReconcileRegression, CatchUpSentinelRoundTripsAndMalformedReadsAsPe
     EXPECT_EQ(rune::node::readCatchUpSentinel(d.path.string()).kind, K::Absent);
     EXPECT_TRUE(rune::node::removeCatchUpSentinel(d.path.string())) << "absent -> true";
 }
+
+// ---------------------------------------------------------------------------
+// VLS B.2 (M14): a view sink owns no dir.  An old sink dir (an earlier build made a replica for it) that holds no
+// record is removed at boot; a live topic's dir and a sink dir holding records are not touched as a sink.
+// ---------------------------------------------------------------------------
+#include <rune/gateway/TopicRegistry.h>
+
+TEST(ViewSinkBootRegression, ReconcileRemovesAnOldEmptySinkDirAndLeavesLiveTopicsAlone) {
+    TempDataDir d("sinkdir");
+    mark(d.path / "topics" / "players", 1);
+    fs::create_directories(d.path / "topics" / "players" / "0");
+    mark(d.path / "topics" / "top", 2);   // the old sink replica's dir: marker + empty partition dir
+    fs::create_directories(d.path / "topics" / "top" / "0");
+    TopicSpec sink = spec("top", 2);
+    sink.viewSink = true;
+    const auto r = rune::node::reconcileTopicDirs(d.path.string(), {spec("players", 1), sink}, {}, kNow);
+    EXPECT_FALSE(fs::exists(d.path / "topics" / "top")) << "the sink's empty dir is removed";
+    EXPECT_EQ(r.removedSinkDirs.size(), 1u);
+    EXPECT_TRUE(fs::exists(d.path / "topics" / "players")) << "a live topic's dir stays";
+    EXPECT_TRUE(r.quarantined.empty());
+}
+
+TEST(ViewSinkBootRegression, RegistryHoldsASinkAsACatalogOnlySlotWithNoLogNoDirAndDropsAtOnce) {
+    TempDataDir d("sinkreg");
+    rune::gateway::TopicRegistry reg({}, d.path.string());
+    TopicSpec sink = spec("top", 3);
+    sink.viewSink = true;
+    sink.partitionCount = 2;
+    ASSERT_EQ(reg.createTopicAt(3, sink), 3);
+    EXPECT_EQ(reg.state(3), rune::gateway::TopicRegistry::TopicState::ViewSink);
+    EXPECT_TRUE(reg.isViewSink(3));
+    EXPECT_EQ(reg.topic(3), nullptr) << "no serving spec: never a data-plane target";
+    EXPECT_EQ(reg.log(3, 0), nullptr);
+    EXPECT_FALSE(fs::exists(d.path / "topics" / "top")) << "no dir";
+    ASSERT_NE(reg.viewSinkSpec(3), nullptr);
+    EXPECT_EQ(reg.viewSinkSpec(3)->partitionCount, 2);
+    EXPECT_GE(reg.partitionForKey(3, std::span<const uint8_t>{}), 0) << "GetViewRow still resolves key -> partition";
+    EXPECT_EQ(reg.createTopicAt(3, sink), 3) << "the same effect again is idempotent";
+    ASSERT_TRUE(reg.dropTopic(3));
+    EXPECT_EQ(reg.state(3), rune::gateway::TopicRegistry::TopicState::Dropped);
+    EXPECT_FALSE(reg.topicIdForName("top").has_value()) << "the name is free at once (no logs to retire)";
+    EXPECT_EQ(reg.createTopicAt(3, sink), -1) << "a dropped id is never refilled";
+}
