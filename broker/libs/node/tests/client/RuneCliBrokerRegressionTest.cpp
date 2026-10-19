@@ -595,3 +595,16 @@ TEST(RuneCliBrokerRegression, ReplayMapsRenamesDropsReAddsConfigAndTransientByNa
     EXPECT_EQ(std::get<rcat::CreateTopicOps>(d[5].event.ops).persistence, rcat::Persistence::Transient);
     EXPECT_EQ(runCli({"catalog", "diff", "--from", src.endpoint(), "--to", dst.endpoint()}, &o, &e), 0) << o;
 }
+
+TEST(RuneCliBrokerRegression, QlExpectedVersionConflictIsTheBrokersSchemaConflictRegression) {
+    OneBroker b("cli_ev");
+    std::stringstream o, e;
+    ASSERT_EQ(rune::cli::run({"ql", "-e", "topic ev { id int64 } partitions 1 key id;", "--broker", b.endpoint()}, o, e), 0) << e.str();
+    std::stringstream o2, e2;
+    ASSERT_EQ(rune::cli::run({"ql", "-e", "alter topic ev add column a int32;", "--expected-version", "1",
+                              "--broker", b.endpoint()}, o2, e2), 0) << e2.str();
+    std::stringstream o3, e3;
+    EXPECT_EQ(rune::cli::run({"ql", "-e", "alter topic ev add column b int32;", "--expected-version", "1",
+                              "--broker", b.endpoint()}, o3, e3), 1);
+    EXPECT_NE(e3.str().find("SchemaConflict"), std::string::npos) << e3.str();
+}

@@ -1601,6 +1601,7 @@ endif()
 add_library(rune_cli_lib STATIC
     src/cli/Cli.cpp
     src/cli/CatalogCommands.cpp
+    src/cli/QlEngine.cpp
     src/cli/SecurityCommands.cpp
 )
 target_include_directories(rune_cli_lib PUBLIC

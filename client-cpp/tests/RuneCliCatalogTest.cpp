@@ -648,3 +648,22 @@ TEST(RuneCliCatalogRegression, AwaitRequestVisibleRetriesUntilVisibleAndIsBounde
         EXPECT_EQ(lookups, 0);
     }
 }
+
+TEST(RuneCliCatalogRegression, QlExpectedVersionIsValidatedAndShownInTheDryRunPlanRegression) {
+    std::stringstream out, err;
+    EXPECT_EQ(rune::cli::run({"ql", "-e", "alter topic t add column c int32;", "--expected-version", "x", "--dry-run"}, out, err), 2);
+    EXPECT_NE(err.str().find("--expected-version"), std::string::npos) << err.str();
+    std::stringstream o2, e2;
+    EXPECT_EQ(rune::cli::run({"ql", "-e", "alter topic t add column c int32;", "--expected-version", "70000", "--dry-run"}, o2, e2), 2);
+    std::stringstream o3, e3;
+    ASSERT_EQ(rune::cli::run({"ql", "-e", "alter topic t add column c int32;", "--expected-version", "5", "--dry-run"}, o3, e3), 0)
+        << e3.str();
+    EXPECT_NE(o3.str().find("expected version 5"), std::string::npos) << o3.str();
+}
+
+TEST(RuneCliCatalogRegression, QlValidateIsShownInTheDryRunPlanRegression) {
+    std::stringstream out, err;
+    ASSERT_EQ(rune::cli::run({"ql", "-e", "topic t { id int64 } partitions 1 key id;", "--validate", "--dry-run"}, out, err), 0)
+        << err.str();
+    EXPECT_NE(out.str().find("validate"), std::string::npos) << out.str();
+}

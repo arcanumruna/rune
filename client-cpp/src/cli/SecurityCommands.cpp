@@ -2,6 +2,7 @@
 #include "rune/cli/SecurityCommands.h"
 
 #include "CliSupport.h"
+#include "QlEngine.h"
 #include "rune/cli/CatalogCommands.h"
 
 #include <rune/client/detail/SecureZero.h>
@@ -286,8 +287,8 @@ int cmdBootstrap(const std::vector<std::string>& args, std::ostream& out, std::o
 
 #ifdef RUNE_CLI_LIVE_ENABLED
     // The bootstrap proves itself with the cluster-key MAC, not a login: this connection presents no credentials.
-    LiveBroker broker;
-    if (!broker.open(a, endpoint, false, err, /*withCredentials=*/false, /*quietFailure=*/true)) {
+    engine::LiveBroker broker;
+    if (!broker.open(engine::liveOptionsOf(a, endpoint, false), err, /*withCredentials=*/false, /*quietFailure=*/true)) {
         // Review B I5 / spec §7: a connection WITHOUT credentials refused with AuthenticationFailed means the cluster
         // requires a login — it already has a security admin.  Say so explicitly (never the bare "code 44").
         if (broker.lastFailure().find("AuthenticationFailed") != std::string::npos) {
