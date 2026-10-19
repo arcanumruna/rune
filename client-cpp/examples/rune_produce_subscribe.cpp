@@ -371,7 +371,9 @@ int runWorldServer(ClientConfig& cfg, const std::string& role, int timeoutMs) {
             ProducerConfig pcfg;
             // "Acked" must mean durable: with acks=leader a record acked by a leader that is then restarted may never
             // have been replicated (the cluster-key rotation restarts every broker under this producer).
-            pcfg.acks             = getEnvStr("RUNE_ACKS", "all") == "leader" ? Acks::Leader : Acks::All;
+            const bool acksLeader = getEnvStr("RUNE_ACKS", "all") == "leader";
+            pcfg.acks             = acksLeader ? Acks::Leader : Acks::All;
+            std::cout << "WS: producer acks=" << (acksLeader ? "leader" : "all") << "\n";   // the e2e asserts it (an acked record must be durable)
             pcfg.lingerUs         = 1;
             pcfg.batchBytes       = 1;
             pcfg.maxInFlight      = 16;
