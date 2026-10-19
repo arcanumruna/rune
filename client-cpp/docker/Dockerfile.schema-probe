@@ -7,11 +7,11 @@
 # leg against a REAL rune-broker over real Aeron.
 #
 # Build contexts (BuildKit named contexts, wired by the harness / compose):
-#   rune-protocol → ../../rune-protocol-0b  (0b headers: SchemaMessages.h)
-#   rune-codec    → ../../rune-codec        (0a codec: Serialize/Record/Validator/Generator
+#   rune-protocol → ../../protocol-0b  (0b headers: SchemaMessages.h)
+#   rune-codec    → ../../codec        (0a codec: Serialize/Record/Validator/Generator
 #                                            + tools/rune_codec_gen_main.cpp)
-#   rune-fr       → ../../rune-fr           (flight recorder; rune_client_api links it)
-#   rune-ql       → ../../rune-ql           (rune_ql is always defined by CMakeLists; C9 fix 1)
+#   flight-recorder       → ../../flight-recorder           (flight recorder; rune_client_api links it)
+#   rune-ql       → ../../ql           (rune_ql is always defined by CMakeLists; C9 fix 1)
 #
 # The checked-in descriptor blob tests/generated/characters.blob is part of the
 # client repo build context; the CMake add_custom_command runs rune_codec_gen at
@@ -53,9 +53,9 @@ COPY --from=rune-protocol src     /rune-protocol/src
 COPY --from=rune-codec src     /rune-codec/src
 COPY --from=rune-codec include /rune-codec/include
 COPY --from=rune-codec tools   /rune-codec/tools
-# rune-fr: compiled sibling (src + include); rune_client_api links it.
-COPY --from=rune-fr src     /rune-fr/src
-COPY --from=rune-fr include /rune-fr/include
+# flight-recorder: compiled sibling (src + include); rune_client_api links it.
+COPY --from=flight-recorder src     /flight-recorder/src
+COPY --from=flight-recorder include /flight-recorder/include
 COPY --from=rune-ql src     /rune-ql/src
 COPY --from=rune-ql include /rune-ql/include
 COPY --from=rune-crypto src     /rune-crypto/src
@@ -75,7 +75,7 @@ RUN cmake -S . -B build -G Ninja \
         -DRUNE_PROTOCOL_INCLUDE=/rune-protocol/include \
         -DRUNE_CODEC_ROOT=/rune-codec \
         -DRUNE_QL_ROOT=/rune-ql \
-        -DRUNE_FR_DIR=/rune-fr \
+        -DFLIGHT_RECORDER_DIR=/flight-recorder \
     && cmake --build build --target rune_schema_probe -j2
 
 RUN cp -L /usr/local/lib64/libstdc++.so.6 /build/libstdc++.so.6

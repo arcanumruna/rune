@@ -2,7 +2,7 @@
 # replbench.sh — 3-node REPLICATION throughput + flight-recorder latency-breakdown
 # benchmark for the acks=all (majority / all-in-sync) path. Purpose: measure the
 # full "leader receives message -> last replica appends it -> commit -> client ack"
-# pipeline with per-stage rune-fr histograms, so we can drive Rune's replication
+# pipeline with per-stage flight-recorder histograms, so we can drive Rune's replication
 # throughput to Kafka parity.
 #
 # Optimal-config by DEFAULT (override via env): 2 workers, 4 partitions, batching
@@ -53,11 +53,11 @@ export CELL_CORES="${CELL_CORES:-0}"
 
 # ── flight recorder (opt-in via REPL_FR=1) ───────────────────────────────────
 FR="${REPL_FR:-1}"
-FROUT="${RUNE_FR_OUT:-/tmp/frout}"
+FROUT="${FLIGHT_RECORDER_OUT:-/tmp/frout}"
 if [ "$FR" = "1" ]; then
   rm -rf "$FROUT"; mkdir -p "$FROUT"
-  export RUNE_FR_ENABLE=1 RUNE_FR_OUT="$FROUT"
-  export RUNE_FR_RING_BYTES="${RUNE_FR_RING_BYTES:-33554432}"   # 32 MiB/thread (shared-VM safe)
+  export FLIGHT_RECORDER_ENABLE=1 FLIGHT_RECORDER_OUT="$FROUT"
+  export FLIGHT_RECORDER_RING_BYTES="${FLIGHT_RECORDER_RING_BYTES:-33554432}"   # 32 MiB/thread (shared-VM safe)
 fi
 
 echo "=== replbench: parts=$PARTS workers=$WORKERS recs=$RECS win=$WIN vbytes=$VBYTES linger=${LINGER_US}us batch=${BATCH_BYTES} FR=$FR ==="

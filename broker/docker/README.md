@@ -24,10 +24,10 @@ keeping the runtime image slim.
 ```sh
 docker build \
   --platform linux/amd64 \
-  --build-context rune-protocol=../rune-protocol \
-  --build-context rune-fr=../rune-fr \
-  --build-context rune-codec=../rune-codec \
-  --build-context rune-crypto=../rune-crypto \
+  --build-context rune-protocol=../protocol \
+  --build-context flight-recorder=../../flight-recorder \
+  --build-context rune-codec=../codec \
+  --build-context rune-crypto=../crypto \
   -f docker/Dockerfile \
   -t rune-broker:dev \
   .
@@ -35,7 +35,7 @@ docker build \
 
 Run from the `rune-broker` repo root. The four `--build-context` entries supply the
 sibling repos the root `CMakeLists.txt` compiles unconditionally: `rune-protocol`
-(headers + `src/net`), `rune-fr`, `rune-codec` (incl. the catalog library) and
+(headers + `src/net`), `flight-recorder`, `rune-codec` (incl. the catalog library) and
 `rune-crypto`. `docker compose` passes the same four contexts for the broker
 image and for the `probe` image (`docker/Dockerfile.probe`), so prefer
 `docker compose -f docker/docker-compose.yml build`.

@@ -20,8 +20,8 @@
 # Topic names are identifiers (letters, digits, underscore): the spec's "world." family is world_*; group names are free
 # text, so the groups stay world-*.
 #
-# Usage:  bash docker/auth-e2e.sh   (sibling layout ../rune-protocol ../rune-codec ../rune-crypto ../rune-fr ../rune-ql
-#         ../rune-client-cpp, as docker/catalog-e2e.sh)
+# Usage:  bash docker/auth-e2e.sh   (sibling layout ../protocol ../codec ../crypto ../flight-recorder ../ql
+#         ../client-cpp, as docker/catalog-e2e.sh)
 #
 # House style: bounded waits (never a fixed sleep as a gate), trap teardown, every failure names its step.
 # Environment:
@@ -35,7 +35,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "${SCRIPT_DIR}/lib/auth.sh"
 BROKER_REPO="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PROJECTS="$(cd "${BROKER_REPO}/.." && pwd)"
-CLIENT_REPO="${PROJECTS}/rune-client-cpp"
+# flight-recorder is its own repo, checked out next to the monorepo (compose additional_contexts read FLIGHT_RECORDER_DIR).
+export FLIGHT_RECORDER_DIR="${FLIGHT_RECORDER_DIR:-${PROJECTS}/../flight-recorder}"
+CLIENT_REPO="${PROJECTS}/client-cpp"
 COMPOSE_PROJECT="rune-auth-e2e"
 NETWORK="${COMPOSE_PROJECT}_default"
 WORK_DIR="${E2E_WORK_DIR:-${BROKER_REPO}/.auth-e2e-work}"
@@ -82,7 +84,8 @@ ql_as() { local u="$1" p="$2"; shift 2; txt "${OP_TIMEOUT_S}" rune ql --user "${
 admin_ql() { ql_as admin /work/admin.pw "$@"; }
 now_ms() { echo $(( $(date +%s%N) / 1000000 )); }
 
-for d in rune-protocol rune-codec rune-crypto rune-fr rune-ql rune-client-cpp; do
+[ -d "${FLIGHT_RECORDER_DIR}" ] || fail "missing flight-recorder checkout (set FLIGHT_RECORDER_DIR)"
+for d in protocol codec crypto ql client-cpp; do
     [ -d "${PROJECTS}/${d}" ] || fail "missing ../${d}"
 done
 [ -f "${SCRIPT_DIR}/topics/auth-e2e.rql" ] || fail "missing docker/topics/auth-e2e.rql"

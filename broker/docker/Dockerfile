@@ -53,24 +53,24 @@ RUN conan install . --output-folder=conan-release --build=missing -s build_type=
 
 # ── rune-protocol sibling headers (Phase-1 sibling-include, not yet packaged) ─
 # libs/storage includes <rune/protocol/RecordBatch.h>. CMake resolves
-# RUNE_PROTOCOL_INCLUDE to <src>/../rune-protocol/include → /rune-protocol/include
+# RUNE_PROTOCOL_INCLUDE to <src>/../protocol/include → /rune-protocol/include
 # in this image. Supplied via a BuildKit named build context:
-#   docker build --build-context rune-protocol=../rune-protocol ...
+#   docker build --build-context rune-protocol=../protocol ...
 COPY --from=rune-protocol include /rune-protocol/include
 # GSO-1 / A7: rune_gso + rune_driver_wake compile rune-protocol C sources (src/net).
 COPY --from=rune-protocol src     /rune-protocol/src
 
-# ── rune-fr flight recorder sibling (compiled: src + include) ─────────────────
-# The root CMakeLists wires add_library(rune_fr ...) from ${SRC}/../rune-fr, which
-# from WORKDIR /build resolves to /rune-fr.  Unlike rune-protocol (headers only),
-# rune-fr is COMPILED, so copy BOTH its sources and headers.  Supplied via the
-# BuildKit named build context `rune-fr` (see docker-compose additional_contexts).
-COPY --from=rune-fr src     /rune-fr/src
-COPY --from=rune-fr include /rune-fr/include
+# ── flight-recorder flight recorder sibling (compiled: src + include) ─────────────────
+# The root CMakeLists wires add_library(flight_recorder ...) from ${SRC}/../flight-recorder, which
+# from WORKDIR /build resolves to /flight-recorder.  Unlike rune-protocol (headers only),
+# flight-recorder is COMPILED, so copy BOTH its sources and headers.  Supplied via the
+# BuildKit named build context `flight-recorder` (see docker-compose additional_contexts).
+COPY --from=flight-recorder src     /flight-recorder/src
+COPY --from=flight-recorder include /flight-recorder/include
 
 # ── rune-codec (0a) sibling (compiled: src + include) ─────────────────────────
 # The root CMakeLists wires add_library(rune_codec ...) from ${RUNE_CODEC_ROOT}
-# (default ${SRC}/../rune-codec → /rune-codec here) and links it into rune_node.
+# (default ${SRC}/../codec → /rune-codec here) and links it into rune_node.
 # rune-codec is COMPILED (Serialize/Record/Validator/Generator), so copy BOTH its
 # sources and headers.  Supplied via the BuildKit named build context `rune-codec`
 # (see docker-compose additional_contexts).  The CMake configure below passes
@@ -83,7 +83,7 @@ COPY --from=rune-codec include /rune-codec/include
 # CMakeLists wires add_library(rune_crypto ...) from ${RUNE_CRYPTO_ROOT} and links
 # it PUBLIC on rune_gateway → transitively into rune_node/rune_broker.  Supplied via
 # the BuildKit named build context `rune-crypto`:
-#   docker build --build-context rune-crypto=../rune-crypto ...
+#   docker build --build-context rune-crypto=../crypto ...
 # The configure below passes -DRUNE_CRYPTO_ROOT=/rune-crypto; OpenSSL comes from conan.
 COPY --from=rune-crypto src     /rune-crypto/src
 COPY --from=rune-crypto include /rune-crypto/include

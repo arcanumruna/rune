@@ -8,7 +8,7 @@
 #include <rune/replication/ReplicationMessages.h>
 #include <rune/replication/ReplicationFrameLimits.h>
 #include <rune/protocol/RecordBatch.h>
-#include <rune_fr/FlightRecorder.h>
+#include <flight_recorder/FlightRecorder.h>
 #include <rune_protocol_internal_sbe/MessageHeader.h>
 #include <rune_protocol_internal_sbe/OutboundFrame.h>
 
@@ -195,7 +195,7 @@ bool AeronPartitionTransport::sendFetchRequest(const FetchRequestMsg& req)
 bool AeronPartitionTransport::sendFetchResponse(NodeId                toFollower,
                                                  const FetchResponseMsg& resp)
 {
-    RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplSendFetchResp, 0);
+    FLIGHT_RECORDER_SPAN_REPLICATION(flight_recorder::Site::ReplSendFetchResp, 0);
     // #2b zero-copy: encode the FetchResponse straight into the claimed outbound-ring
     // slot's OutboundFrame payload — one copy (records: log mmap → ring) instead of
     // the old encode-into-`wire` + putPayload-into-ring double copy.  Shared-nothing:
@@ -337,7 +337,7 @@ bool AeronPartitionTransport::enqueueFetchResponse(int32_t                 targe
     enc.sbePosition(lenPos + isbe::OutboundFrame::payloadHeaderLength() + payloadLen);
     // FR mark BEFORE commit: once committed the consumer may drain + free the slot
     // and a later claim may reuse it, so marking after would mis-pair the slot.
-    RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplOutEnqueue, static_cast<uint32_t>(idx));
+    FLIGHT_RECORDER_MARK_REPLICATION(flight_recorder::Site::ReplOutEnqueue, static_cast<uint32_t>(idx));
     outboundRing_.commit(idx);
     return true;
 }
@@ -533,7 +533,7 @@ bool AeronPartitionTransport::enqueueOutbound(int32_t        targetNodeId,
     // Worker-clock: frame handed to the outbound ring (→ control thread drains it).
     // corr = ring slot offset; pairs 1:1 with ReplOutDrain (same slot).  Marked
     // BEFORE commit (after commit the slot may already be drained and reused).
-    RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplOutEnqueue, static_cast<uint32_t>(idx));
+    FLIGHT_RECORDER_MARK_REPLICATION(flight_recorder::Site::ReplOutEnqueue, static_cast<uint32_t>(idx));
     outboundRing_.commit(idx);
     return true;
 }
@@ -545,7 +545,7 @@ bool AeronPartitionTransport::enqueueOutbound(int32_t        targetNodeId,
 // ---------------------------------------------------------------------------
 int AeronPartitionTransport::drainOutbound()
 {
-    RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplOutboundDrain, 0);
+    FLIGHT_RECORDER_SPAN_REPLICATION(flight_recorder::Site::ReplOutboundDrain, 0);
     // F27 F1: NOTHING the ring accepted is ever dropped here.  Phase A flushes
     // each peer's held frames in order (a refusal stops that peer only); phase B
     // routes ring frames through the hold router under a CONTROLLED read — a
@@ -585,7 +585,7 @@ int AeronPartitionTransport::drainOutbound()
         if (consumed) {
             // Control-clock: frame drained from the outbound ring (offered or held).
             // corr = ring slot offset == the enqueue's tryClaim index.
-            RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplOutDrain, static_cast<uint32_t>(offset));
+            FLIGHT_RECORDER_MARK_REPLICATION(flight_recorder::Site::ReplOutDrain, static_cast<uint32_t>(offset));
             ++txOutDrained_;
         }
         return consumed;
@@ -609,7 +609,7 @@ int AeronPartitionTransport::drainOutbound()
 // ---------------------------------------------------------------------------
 int AeronPartitionTransport::poll(int64_t nowNs)
 {
-    RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplIngressPoll, 0);
+    FLIGHT_RECORDER_SPAN_REPLICATION(flight_recorder::Site::ReplIngressPoll, 0);
     nowNs_ = nowNs;
 
     // Non-blocking probe: try to resolve pending publications.
@@ -670,7 +670,7 @@ aeron::ControlledPollAction AeronPartitionTransport::onFragment(
     aeron::Header&                   /*header*/)
 {
     ++txFragsRecv_;
-    RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplOnFragment, 0);
+    FLIGHT_RECORDER_SPAN_REPLICATION(flight_recorder::Site::ReplOnFragment, 0);
     if (std::holds_alternative<rune::peerlink::PeerFrameCrypto>(crypto_)) [[unlikely]]
         return onSealedFragment_(reinterpret_cast<const uint8_t*>(buffer.buffer() + offset),
                                  static_cast<std::size_t>(length));
@@ -887,7 +887,7 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
             // Control-clock: fetch op enqueued to the worker ring (corr=recvSeq).
             // Pairs 1:1 (FIFO) with ReplWorkerOpRun when the worker dequeues it →
             // the gap is the EXACT control→worker handoff latency on this node.
-            RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplFragRecv, inRecvSeq_++);
+            FLIGHT_RECORDER_MARK_REPLICATION(flight_recorder::Site::ReplFragRecv, inRecvSeq_++);
         } else {
             rep->onFetchRequest(req, nowNs_, peerConnGen_(req.followerId));   // R1
         }
@@ -1022,7 +1022,7 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
                 return Action::ABORT;
             }
             // Control-clock: apply op enqueued to the worker ring (corr=recvSeq).
-            RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplFragRecv, inRecvSeq_++);
+            FLIGHT_RECORDER_MARK_REPLICATION(flight_recorder::Site::ReplFragRecv, inRecvSeq_++);
         } else {
             // INLINE path (internal partitions / no WorkerPool): call applyReplicated
             // synchronously.  E1 low: contained like the worker path (Worker.h

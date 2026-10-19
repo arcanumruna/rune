@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # rune-protocol is header-only; consumed via the sibling source include path.
-set(RUNE_PROTOCOL_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/../rune-protocol/include"
+set(RUNE_PROTOCOL_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/../protocol/include"
     CACHE PATH "rune-protocol include dir")
 
 find_package(aeron)
@@ -113,38 +113,58 @@ if(BUILD_BENCHMARKS)
     find_package(benchmark REQUIRED)
 endif()
 
-# ── rune-fr flight recorder (sibling static lib) ─────────────────────────────
-# Mirrors the broker's wiring so the client can be traced with the SAME rune-fr
-# (compile-in default; runtime-disabled until RUNE_FR_ENABLE=1).
-option(ENABLE_FLIGHT_RECORDER "Compile in rune-fr flight-recorder instrumentation" ON)
-set(RUNE_FR_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../rune-fr" CACHE PATH "Path to the rune-fr sibling repo")
+# ── flight-recorder (sibling static lib) ─────────────────────────────
+# Mirrors the broker's wiring so the client can be traced with the SAME flight-recorder
+# (compile-in default; runtime-disabled until FLIGHT_RECORDER_ENABLE=1).
+option(ENABLE_FLIGHT_RECORDER "Compile in flight-recorder instrumentation" ON)
+# flight-recorder lives in its own repo (github.com/arcanumruna/flight-recorder).
+# -DFLIGHT_RECORDER_DIR=<checkout with src/ + include/> overrides (local development,
+# docker builds); otherwise FetchContent clones it at the pinned commit (clone only: we
+# compile its sources ourselves).  Keep the pin in sync with client-cpp/CMakeLists.txt.
+set(FLIGHT_RECORDER_DIR "" CACHE PATH "Local flight-recorder checkout; empty = fetch it")
+set(FLIGHT_RECORDER_GIT_REPOSITORY "git@github.com:arcanumruna/flight-recorder.git" CACHE STRING
+    "flight-recorder git URL used when FLIGHT_RECORDER_DIR is unset")
+set(FLIGHT_RECORDER_GIT_TAG "0ba261e45fa12c9b900c46983eaf7ca7fec0f8c9" CACHE STRING
+    "pinned flight-recorder commit")
+if(NOT FLIGHT_RECORDER_DIR)
+    include(FetchContent)
+    FetchContent_Declare(flight_recorder_src
+        GIT_REPOSITORY ${FLIGHT_RECORDER_GIT_REPOSITORY}
+        GIT_TAG        ${FLIGHT_RECORDER_GIT_TAG}
+        SOURCE_SUBDIR  _no_cmake_build)
+    FetchContent_MakeAvailable(flight_recorder_src)
+    set(FLIGHT_RECORDER_DIR "${flight_recorder_src_SOURCE_DIR}" CACHE PATH "" FORCE)
+endif()
+if(NOT EXISTS "${FLIGHT_RECORDER_DIR}/src/Calibration.cpp")
+    message(FATAL_ERROR "FLIGHT_RECORDER_DIR (${FLIGHT_RECORDER_DIR}) is not a flight-recorder checkout")
+endif()
 # Catalog history (Task 5, F7): every shared sibling target below is defined
 # only when absent, so a parent project (the broker's rune_client_broker_tests)
 # can embed this one with add_subdirectory and supply its own copy.  The
 # standalone build is unchanged.
-if(NOT TARGET rune_fr)
-add_library(rune_fr STATIC
-    ${RUNE_FR_DIR}/src/Calibration.cpp
-    ${RUNE_FR_DIR}/src/Enable.cpp
-    ${RUNE_FR_DIR}/src/Registry.cpp
-    ${RUNE_FR_DIR}/src/Report.cpp)
-target_include_directories(rune_fr PUBLIC ${RUNE_FR_DIR}/include)
+if(NOT TARGET flight_recorder)
+add_library(flight_recorder STATIC
+    ${FLIGHT_RECORDER_DIR}/src/Calibration.cpp
+    ${FLIGHT_RECORDER_DIR}/src/Enable.cpp
+    ${FLIGHT_RECORDER_DIR}/src/Registry.cpp
+    ${FLIGHT_RECORDER_DIR}/src/Report.cpp)
+target_include_directories(flight_recorder PUBLIC ${FLIGHT_RECORDER_DIR}/include)
 if(aeron_FOUND)
-    target_link_libraries(rune_fr PUBLIC aeron::aeron)
+    target_link_libraries(flight_recorder PUBLIC aeron::aeron)
 endif()
-target_compile_features(rune_fr PUBLIC cxx_std_23)
+target_compile_features(flight_recorder PUBLIC cxx_std_23)
 if(ENABLE_FLIGHT_RECORDER)
-    target_compile_definitions(rune_fr PUBLIC RUNE_FR=1)
+    target_compile_definitions(flight_recorder PUBLIC FLIGHT_RECORDER=1)
 else()
-    target_compile_definitions(rune_fr PUBLIC RUNE_FR=0)
+    target_compile_definitions(flight_recorder PUBLIC FLIGHT_RECORDER=0)
 endif()
 endif()
 
 # ── rune-crypto (client<->broker TLS/AEAD, Task 5) — sibling source static lib ──
-# Mirrors the rune-fr wiring above: TlsSession (TLS 1.3 memory-BIO handshake) +
+# Mirrors the flight-recorder wiring above: TlsSession (TLS 1.3 memory-BIO handshake) +
 # AeadCipher (seal/open) + Caps (CPU cipher selection), consumed by SessionMachine.h
 # (header-only) and, once Task 6 lands, the produce/egress seal/open seams.
-set(RUNE_CRYPTO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../rune-crypto"
+set(RUNE_CRYPTO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../crypto"
     CACHE PATH "Path to the rune-crypto sibling repo")
 if(NOT TARGET rune_crypto)
 add_library(rune_crypto STATIC
@@ -158,8 +178,8 @@ target_link_libraries(rune_crypto PUBLIC OpenSSL::SSL OpenSSL::Crypto)
 target_compile_features(rune_crypto PUBLIC cxx_std_23)
 endif()
 
-# ── rune-codec (0a) — consumed as a SIBLING source static lib (like rune-fr) ──
-set(RUNE_CODEC_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../rune-codec"
+# ── rune-codec (0a) — consumed as a SIBLING source static lib (like flight-recorder) ──
+set(RUNE_CODEC_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../codec"
     CACHE PATH "Path to the rune-codec sibling repo")
 if(NOT TARGET rune_codec)
 add_library(rune_codec STATIC
@@ -201,7 +221,7 @@ endif()
 # Mirrors the rune-codec wiring above.  rune-ql's sources include rune-codec
 # headers, so we reuse the rune_codec target (already defined above) rather
 # than re-defining it, avoiding duplicate-target errors.
-set(RUNE_QL_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../rune-ql"
+set(RUNE_QL_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../ql"
     CACHE PATH "Path to the rune-ql sibling repo")
 file(GLOB RUNE_QL_SRCS "${RUNE_QL_ROOT}/src/*.cpp")
 add_library(rune_ql STATIC ${RUNE_QL_SRCS})
@@ -277,12 +297,12 @@ if(aeron_FOUND)
         $<BUILD_INTERFACE:${RUNE_PROTOCOL_INCLUDE}>  # FrameCrc.h (B1): Crc32c / RecordBatch layout
         $<INSTALL_INTERFACE:include>
     )
-    target_link_libraries(rune_client_transport PUBLIC aeron::aeron spdlog::spdlog rune_fr rune_gso rune_client_driver_wake)
+    target_link_libraries(rune_client_transport PUBLIC aeron::aeron spdlog::spdlog flight_recorder rune_gso rune_client_driver_wake)
     # client<->broker TLS/AEAD (Task 5): SessionMachine.h is a PUBLIC header that
     # #includes rune-crypto's headers and holds a TlsSession/CryptoState member, so
     # every downstream target compiling a TU that includes ClientAgent.h/Client.h
     # (rune_client_api, rune_client_producer, test/benchmark targets, ...) needs
-    # rune_crypto's include dir too — PUBLIC, same as rune_fr right above (fix
+    # rune_crypto's include dir too — PUBLIC, same as flight_recorder right above (fix
     # round 1: an earlier PRIVATE here only satisfied THIS target's own link,
     # not the transitive header dependency every downstream target has).
     target_link_libraries(rune_client_transport PUBLIC rune_crypto OpenSSL::SSL OpenSSL::Crypto)
@@ -354,7 +374,7 @@ if(aeron_FOUND)
         rune_client_agent
         aeron::aeron
         spdlog::spdlog
-        rune_fr
+        flight_recorder
     )
     if(UNIX AND NOT APPLE)
         find_library(UUID_LIB uuid)
@@ -501,7 +521,7 @@ if(BUILD_EXAMPLES AND aeron_FOUND)
         rune_client_api
         rune_client_producer
         rune_client_subscriber
-        rune_fr
+        flight_recorder
     )
     if(UNIX AND NOT APPLE)
         find_library(UUID_LIB uuid)
@@ -533,7 +553,7 @@ if(BUILD_EXAMPLES AND aeron_FOUND)
     # T15b gates 2-5: real-broker driver for every client arm (see its header).
     add_executable(shard_gate examples/shard_gate.cpp)
     target_include_directories(shard_gate PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/examples/bench)
-    target_link_libraries(shard_gate PRIVATE rune_client_api rune_client_producer rune_client_subscriber rune_fr)
+    target_link_libraries(shard_gate PRIVATE rune_client_api rune_client_producer rune_client_subscriber flight_recorder)
     if(UNIX AND NOT APPLE)
         find_library(UUID_LIB_SHARD_GATE uuid)
         if(UUID_LIB_SHARD_GATE)
@@ -924,7 +944,7 @@ if(BUILD_TESTING)
     if(NOT EXISTS "${RUNE_CONFORMANCE_DIR}/vectors")
         message(FATAL_ERROR
             "CC-2: conformance vector directory not found: ${RUNE_CONFORMANCE_DIR}/vectors\n"
-            "  The sibling rune-protocol repo must be present at ${CMAKE_CURRENT_SOURCE_DIR}/../rune-protocol")
+            "  The sibling rune-protocol repo must be present at ${CMAKE_CURRENT_SOURCE_DIR}/../protocol")
     endif()
 
     add_executable(rune_client_tests

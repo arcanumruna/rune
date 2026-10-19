@@ -46,7 +46,7 @@ done
 if command -v docker >/dev/null 2>&1; then
   ids=$(docker ps -aq --filter 'name=^rune-' 2>/dev/null); [ -n "$ids" ] && docker rm -f $ids >/dev/null 2>&1
 fi
-# rune-fr traces (default RUNE_FR_OUT=/tmp/frout*) + broker egress scratch fill the root disk.
+# flight-recorder traces (default FLIGHT_RECORDER_OUT=/tmp/frout*) + broker egress scratch fill the root disk.
 rm -rf /tmp/frout* /tmp/rune_bn_egress_* 2>/dev/null
 
 # Strays: re-check a few times (SIGKILLed processes take a moment to be reaped).

@@ -65,7 +65,7 @@
 #include <rune/storage/ZeroedBytes.h>
 #include <rune/consensus/ConsensusAgent.h>
 #include <rune/replication/PartitionReplica.h>
-#include <rune_fr/FlightRecorder.h>
+#include <flight_recorder/FlightRecorder.h>
 #include <rune/node/OneToOneByteRing.h>
 #include <rune/node/detail/RingDoorbell.h>
 #include <rune/node/OwnerThreadTestTask.h>
@@ -1599,7 +1599,7 @@ public:
     //      NEVER drop an ack.
     int doWork(int64_t nowNs) override {
         // Per-tick span: inter-tick gap = scheduler handoff/park; duration = tick cost.
-        RUNE_FR_SPAN_RUNTIME(rune_fr::Site::WorkerDoWork, 0);
+        FLIGHT_RECORDER_SPAN_RUNTIME(flight_recorder::Site::WorkerDoWork, 0);
         int work = 0;
         // E2 final fix wave (residual): ONE read_committed ring-rebuild budget
         // per pass, shared by every memory-backed partition rebuilding (the
@@ -1689,7 +1689,7 @@ public:
         // ops that mutate owned_ (on THIS worker thread — single-owner, no lock).
         // Strict-tier produces record their log in dirtyThisCycle_ (token=0).
         {
-            RUNE_FR_SPAN_RUNTIME(rune_fr::Site::WorkerDrainIngress, 0);
+            FLIGHT_RECORDER_SPAN_RUNTIME(flight_recorder::Site::WorkerDrainIngress, 0);
             work += static_cast<int>(drainIngress_());
         }
 
@@ -1701,7 +1701,7 @@ public:
         // Shared-nothing: owned_ is a plain member touched only by this thread.
         // Step 5: per-replica ISR checks / follower fetch emission.
         {
-            RUNE_FR_SPAN_RUNTIME(rune_fr::Site::WorkerReplicaDoWorkStage, 0);
+            FLIGHT_RECORDER_SPAN_RUNTIME(flight_recorder::Site::WorkerReplicaDoWorkStage, 0);
             for (auto* replica : owned_) {
                 if (!replica) continue;
                 const ReplReadScope rs(*replica, replScratch_);
@@ -1733,7 +1733,7 @@ public:
         // Test seam only: the (ctx, fn*) trampoline for fake pub registries.
         // Neither wired → no poll (flag-off path unchanged).
         if (workerReplTransport_) {
-            RUNE_FR_SPAN_RUNTIME(rune_fr::Site::WorkerReplPollDrive, 0);
+            FLIGHT_RECORDER_SPAN_RUNTIME(flight_recorder::Site::WorkerReplPollDrive, 0);
             work += pollReplTransport_(*workerReplTransport_, nowNs);
         } else if (replTransportCtx_) [[unlikely]] {
             work += replTransportPollFn_(replTransportCtx_, kReplFetchLimit, this, nowNs);
@@ -1744,7 +1744,7 @@ public:
         // the HW bound is fresh.  No-op unless subs_ is populated (Subscribe ops)
         // AND a WorkerEgress is wired (pre-I3b: gateway still owns push → inert).
         {
-            RUNE_FR_SPAN_RUNTIME(rune_fr::Site::WorkerEgressPushStage, 0);
+            FLIGHT_RECORDER_SPAN_RUNTIME(flight_recorder::Site::WorkerEgressPushStage, 0);
             work += pushOwnedSubscriptions_(nowNs);
         }
 
@@ -2477,7 +2477,7 @@ private:
         case WorkerOp::Type::ApplyReplicated:
             // Worker-clock: dequeued a routed apply op.  corr=runSeq pairs 1:1 (FIFO)
             // with the control thread's ReplFragRecv → EXACT control→worker handoff.
-            RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplWorkerOpRun, workerRunSeq_++);
+            FLIGHT_RECORDER_MARK_REPLICATION(flight_recorder::Site::ReplWorkerOpRun, workerRunSeq_++);
             executeApplyReplicatedWire_(op);
             break;
         case WorkerOp::Type::BecomeLeader:
@@ -2491,7 +2491,7 @@ private:
             break;
         // E5.1.2c: leader-side replication state handlers
         case WorkerOp::Type::FetchRequest:
-            RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplWorkerOpRun, workerRunSeq_++);
+            FLIGHT_RECORDER_MARK_REPLICATION(flight_recorder::Site::ReplWorkerOpRun, workerRunSeq_++);
             executeFetchRequestWire_(op);
             break;
         case WorkerOp::Type::OffsetsForLeaderEpochReq:
@@ -3236,7 +3236,7 @@ private:
     // duration of this callback — the log restamps + copies it at append).
     // -------------------------------------------------------------------
     void executeProduceWire_(sbe::WorkerOp& op) {
-        RUNE_FR_SPAN_PRODUCE(rune_fr::Site::WorkerAppend,
+        FLIGHT_RECORDER_SPAN_PRODUCE(flight_recorder::Site::WorkerAppend,
                              static_cast<uint32_t>(op.correlationId()));
         // F15 S5 (§2.5, I6) + Task 13 (spec §3.4): a gateway-received produce
         // joins THE produce path of this worker in EVERY mode (Legacy default
@@ -3426,7 +3426,7 @@ private:
         rune::storage::Log*                  logPtr  = nullptr;
     };
     void executePushReadWire_(sbe::WorkerOp& op) {
-        RUNE_FR_SPAN_READ(rune_fr::Site::ReadEncodePush,
+        FLIGHT_RECORDER_SPAN_READ(flight_recorder::Site::ReadEncodePush,
                           static_cast<uint32_t>(op.sessionId()));
         ++pushReads_;
         PushReadArgs a;
@@ -6544,10 +6544,10 @@ private:
             entry.ret.errorCode = code;
             // Keyed by (partition<<24)|offset — unique across partitions;
             // correlates across nodes with follower apply/fetch + onFetchRequest.
-            RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplPendingAckFire,
+            FLIGHT_RECORDER_MARK_REPLICATION(flight_recorder::Site::ReplPendingAckFire,
                 (static_cast<uint32_t>(entry.ret.partition) << 24) |
                     (static_cast<uint32_t>(entry.lastOffset) & 0xFFFFFFu));
-            RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplAckSendOff,
+            FLIGHT_RECORDER_MARK_REPLICATION(flight_recorder::Site::ReplAckSendOff,
                 (static_cast<uint32_t>(entry.ret.partition) << 24) |
                     (static_cast<uint32_t>(entry.lastOffset) & 0xFFFFFFu));
             enqueueReturn_(entry.ret);
@@ -6841,7 +6841,7 @@ private:
 
     int handleWorkerIngressFrame_(const uint8_t* data, std::size_t len,
                                   int64_t nowNs, uint8_t directAck = 0) {
-        RUNE_FR_SPAN_PRODUCE(rune_fr::Site::WorkerIngressRecv, 0);
+        FLIGHT_RECORDER_SPAN_PRODUCE(flight_recorder::Site::WorkerIngressRecv, 0);
         namespace pc = rune::protocol::client;
 
         // Task 22 (shard worker decrypts produce / per-worker ingress,
@@ -7261,7 +7261,7 @@ private:
         }
 
         // Waterfall: leader appended [baseOffset..lastOffset].  Keyed by lastOffset.
-        RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplLeaderAppend,
+        FLIGHT_RECORDER_MARK_REPLICATION(flight_recorder::Site::ReplLeaderAppend,
             (static_cast<uint32_t>(f.partition) << 24) |
                 (static_cast<uint32_t>(ret.lastOffset) & 0xFFFFFFu));   // a duplicate: its original range
         // GR-4 Mode A: advance the replica's LEO/HW after successful append.
@@ -7318,7 +7318,7 @@ private:
         // Timeout: nowNs + ackTimeoutNs_ (generous — accounts for fetch-handling
         // latency added by E5.1.2c, where fetch waits a worker cycle).
         // Keyed by (partition<<24)|offset (see ReplPendingAckFire).
-        RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplPendingAckEnqueue,
+        FLIGHT_RECORDER_MARK_REPLICATION(flight_recorder::Site::ReplPendingAckEnqueue,
             (static_cast<uint32_t>(ret.partition) << 24) |
                 (static_cast<uint32_t>(lastOff) & 0xFFFFFFu));   // a duplicate: its ORIGINAL range
         PendingAcksAll pending;

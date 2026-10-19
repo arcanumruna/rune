@@ -35,7 +35,7 @@ extern "C" {
 #include <rune/client/transport/FrameCrc.h>
 #include <rune/client/transport/Resolution.h>
 #include <rune/client/transport/TransportConfig.h>
-#include <rune_fr/FlightRecorder.h>
+#include <flight_recorder/FlightRecorder.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -473,7 +473,7 @@ private:
     aeron::on_reserved_value_supplier_t sealSupplier_;
     std::int64_t sealInTerm_(aeron::concurrent::AtomicBuffer& term, aeron::util::index_t termOffset) noexcept;
     /// FR: coalescer for refused offers (retried every duty cycle; empty when compiled out).
-    [[no_unique_address]] rune_fr::Throttle frOfferRefused_{};
+    [[no_unique_address]] flight_recorder::Throttle frOfferRefused_{};
 
     // ---- Resolution constants ------------------------------------------------
     static constexpr int kResolveMaxMs = 5'000; // hard cap for pub/sub resolve

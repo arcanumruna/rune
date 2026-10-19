@@ -20,7 +20,7 @@
 #
 # Usage:  bash docker/rune-ql-e2e.sh
 # Run from the rune-client-cpp-0c repo root.  Requires the sibling repos:
-#   ../rune-broker  ../rune-protocol  ../rune-codec  ../rune-ql  ../rune-fr
+#   ../broker  ../protocol  ../codec  ../ql  ../flight-recorder
 #
 # Constraints (engineering philosophy #11/#16):
 #   - Real client↔broker over real Aeron (NOT in-process); the DEFAULT path.
@@ -45,7 +45,7 @@ CLIENT_IMAGE="rune-ql-probe:$(cd "${CLIENT_REPO}" && git rev-parse --short HEAD)
 CLIENT_HOSTNAME="rune-ql-probe"
 CLIENT_EGRESS_PORT="40500"
 
-export RUNE_IMAGE_TAG="$(cd "${PROJECTS}/rune-broker" && git rev-parse --short HEAD)-0c"
+export RUNE_IMAGE_TAG="$(cd "${PROJECTS}/broker" && git rev-parse --short HEAD)-0c"
 
 log()  { echo "[rune-ql-e2e] $*" >&2; }
 fail() { echo "[rune-ql-e2e] FAIL: $*" >&2; exit 1; }
@@ -53,12 +53,12 @@ fail() { echo "[rune-ql-e2e] FAIL: $*" >&2; exit 1; }
 # ---------------------------------------------------------------------------
 # Preflight: sibling repos present.
 # ---------------------------------------------------------------------------
-[ -d "${PROJECTS}/rune-broker" ]    || fail "missing ../rune-broker"
-[ -d "${PROJECTS}/rune-protocol" ]  || fail "missing ../rune-protocol"
-[ -d "${PROJECTS}/rune-codec" ]     || fail "missing ../rune-codec"
-[ -d "${PROJECTS}/rune-crypto" ]    || fail "missing ../rune-crypto"
-[ -d "${PROJECTS}/rune-ql" ]        || fail "missing ../rune-ql"
-[ -d "${PROJECTS}/rune-fr" ]        || fail "missing ../rune-fr"
+[ -d "${PROJECTS}/broker" ]    || fail "missing ../broker"
+[ -d "${PROJECTS}/protocol" ]  || fail "missing ../protocol"
+[ -d "${PROJECTS}/codec" ]     || fail "missing ../codec"
+[ -d "${PROJECTS}/crypto" ]    || fail "missing ../crypto"
+[ -d "${PROJECTS}/ql" ]        || fail "missing ../ql"
+[ -d "${FLIGHT_RECORDER_DIR:-${PROJECTS}/../flight-recorder}" ]        || fail "missing ../flight-recorder"
 [ -f "${CLIENT_DOCKERFILE}" ]       || fail "missing ${CLIENT_DOCKERFILE}"
 [ -f "${CLIENT_REPO}/tests/e2e/characters.rql" ] || fail "missing tests/e2e/characters.rql"
 
@@ -88,11 +88,11 @@ set +e
 out=$(docker build \
     --platform linux/amd64 \
     -f "${CLIENT_DOCKERFILE}" \
-    --build-context rune-protocol="${PROJECTS}/rune-protocol" \
-    --build-context rune-codec="${PROJECTS}/rune-codec" \
-    --build-context rune-ql="${PROJECTS}/rune-ql" \
-    --build-context rune-fr="${PROJECTS}/rune-fr" \
-    --build-context rune-crypto="${PROJECTS}/rune-crypto" \
+    --build-context rune-protocol="${PROJECTS}/protocol" \
+    --build-context rune-codec="${PROJECTS}/codec" \
+    --build-context rune-ql="${PROJECTS}/ql" \
+    --build-context flight-recorder="${FLIGHT_RECORDER_DIR:-${PROJECTS}/../flight-recorder}" \
+    --build-context rune-crypto="${PROJECTS}/crypto" \
     -t "${CLIENT_IMAGE}" \
     "${CLIENT_REPO}" 2>&1); rc=$?
 set -e

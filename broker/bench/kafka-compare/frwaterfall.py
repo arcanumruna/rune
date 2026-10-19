@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""frwaterfall.py — replication commit/ack latency from rune-fr Chrome traces.
+"""frwaterfall.py — replication commit/ack latency from flight-recorder Chrome traces.
 Truncation-tolerant: regex-extracts complete event objects (recovers the valid prefix
 if kill -9 cut the trailing ']'), so it works even on a mid-write snapshot.
 Pairs same-process marks by corr=(partition<<24)|offset on each node:

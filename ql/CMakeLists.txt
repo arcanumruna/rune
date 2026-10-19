@@ -4,7 +4,7 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ── rune-codec sibling source lib ────────────────────────────────────────────
-set(RUNE_CODEC_ROOT "../rune-codec" CACHE PATH "Path to rune-codec source root")
+set(RUNE_CODEC_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../codec" CACHE PATH "Path to rune-codec source root")
 
 add_library(rune_codec_dep STATIC
     ${RUNE_CODEC_ROOT}/src/Serialize.cpp
@@ -19,7 +19,7 @@ file(GLOB RUNE_QL_SOURCES CONFIGURE_DEPENDS src/*.cpp)
 add_library(rune_ql STATIC ${RUNE_QL_SOURCES})
 target_include_directories(rune_ql PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # rune-ql includes only the std-only rune/protocol/CatalogTypes.h (F32).
-set(RUNE_PROTOCOL_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/../rune-protocol/include" CACHE PATH "rune-protocol include dir")
+set(RUNE_PROTOCOL_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/../protocol/include" CACHE PATH "rune-protocol include dir")
 target_include_directories(rune_ql PUBLIC ${RUNE_PROTOCOL_INCLUDE})
 target_link_libraries(rune_ql PUBLIC rune_codec_dep)
 

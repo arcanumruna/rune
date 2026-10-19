@@ -15,7 +15,7 @@ target_include_directories(rune_codec PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
 # ── rune_catalog — the shared catalog-history library (spec §6): event model,
 #    frozen per-formatVer apply rules, fingerprints, replayer, queries, .rcat.
 #    Linked by the broker (AdminWorker), the client and the rune CLI.
-set(RUNE_PROTOCOL_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/../rune-protocol/include" CACHE PATH
+set(RUNE_PROTOCOL_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/../protocol/include" CACHE PATH
     "rune-protocol include dir (rune/protocol/CatalogTypes.h: the one TopicConfig + RequestId)")
 add_library(rune_catalog STATIC
     src/catalog/CatalogEvent.cpp

@@ -7,7 +7,7 @@
 #include <rune/gateway/RequestRejection.h>
 #include <rune/gateway/BootstrapProof.h>
 #include <cassert>
-#include <rune_fr/FlightRecorder.h>
+#include <flight_recorder/FlightRecorder.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/gateway/GatewayReplicaView.h>
 #include <rune/node/AeronChannel.h>
@@ -3386,7 +3386,7 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         return true;
     }
     const pc::Produce& msg = *msgOpt;
-    RUNE_FR_SPAN_PRODUCE(rune_fr::Site::GatewayHandle,
+    FLIGHT_RECORDER_SPAN_PRODUCE(flight_recorder::Site::GatewayHandle,
                          static_cast<uint32_t>(msg.correlationId));
 
     // 2. Require known session.
@@ -6459,7 +6459,7 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
             // Mark the instant the gateway first sees the worker's produce result.
             // The gap between WorkerAppend (worker thread) and this mark is the
             // worker→gateway return-ring + duty-cycle latency (same correlationId).
-            RUNE_FR_MARK_PRODUCE(rune_fr::Site::WorkerProcessOp,
+            FLIGHT_RECORDER_MARK_PRODUCE(flight_recorder::Site::WorkerProcessOp,
                                  static_cast<uint32_t>(ret.correlationId));
             // Task 13 (spec §3.4): with worker-side acks (shard mode) a
             // deferAck ProduceResult is the post-ack notification of an ack the
@@ -6513,7 +6513,7 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
             // re-validation holds — so the gateway never parks a worker-owned
             // ack (its pendingAcks_ serves only the inline, control-owned path).
             {
-                RUNE_FR_SPAN_PRODUCE(rune_fr::Site::ProduceAckSend,
+                FLIGHT_RECORDER_SPAN_PRODUCE(flight_recorder::Site::ProduceAckSend,
                                      static_cast<uint32_t>(ret.correlationId));
                 pc::ProduceResponse okResp;
                 okResp.sessionId     = ret.sessionId;

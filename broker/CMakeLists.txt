@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # rune-protocol is header-only; consumed via the sibling source include path in Phase 1.
-set(RUNE_PROTOCOL_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/../rune-protocol/include"
+set(RUNE_PROTOCOL_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/../protocol/include"
     CACHE PATH "rune-protocol include dir")
 
 # rune_node include path — exposed as a CMake variable so gateway (which rune_node links)
@@ -34,35 +34,55 @@ if(NOT TARGET aeron::aeron)
 endif()
 find_package(spdlog REQUIRED)
 
-# ── rune-fr — ultra-low-overhead flight recorder ─────────────────────────────
+# ── flight-recorder — ultra-low-overhead flight recorder ─────────────────────────────
 # Consumed as a SIBLING source lib (like rune-protocol; no conan publish gate).
 # Header-first + 4 small .cpp; depends only on aeron's header-only AtomicBuffer/
 # RecordDescriptor (already a broker dep).
 #
 # COMPILE FLAG: -DENABLE_FLIGHT_RECORDER=ON (default) compiles the instrumentation
-# in (runtime-disabled by default → ~0 cost until rune_fr::enable()).  Build with
-# -DENABLE_FLIGHT_RECORDER=OFF to compile EVERY span/mark out to nothing (RUNE_FR=0)
+# in (runtime-disabled by default → ~0 cost until flight_recorder::enable()).  Build with
+# -DENABLE_FLIGHT_RECORDER=OFF to compile EVERY span/mark out to nothing (FLIGHT_RECORDER=0)
 # — a production build with zero recorder footprint.  At RUN time (ENABLE build),
-# arm with RUNE_FR_ENABLE and choose which paths with RUNE_FR_CATEGORIES.
-option(ENABLE_FLIGHT_RECORDER "Compile in rune-fr flight-recorder instrumentation" ON)
-set(RUNE_FR_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../rune-fr" CACHE PATH "Path to the rune-fr sibling repo")
-add_library(rune_fr STATIC
-    ${RUNE_FR_DIR}/src/Calibration.cpp
-    ${RUNE_FR_DIR}/src/Enable.cpp
-    ${RUNE_FR_DIR}/src/Registry.cpp
-    ${RUNE_FR_DIR}/src/Report.cpp)
-target_include_directories(rune_fr PUBLIC ${RUNE_FR_DIR}/include)
-target_link_libraries(rune_fr PUBLIC aeron::aeron)
-target_compile_features(rune_fr PUBLIC cxx_std_23)
-# PUBLIC so the RUNE_FR macro reaches every file that includes FlightRecorder.h.
+# arm with FLIGHT_RECORDER_ENABLE and choose which paths with FLIGHT_RECORDER_CATEGORIES.
+option(ENABLE_FLIGHT_RECORDER "Compile in flight-recorder instrumentation" ON)
+# flight-recorder lives in its own repo (github.com/arcanumruna/flight-recorder).
+# -DFLIGHT_RECORDER_DIR=<checkout with src/ + include/> overrides (local development,
+# docker builds); otherwise FetchContent clones it at the pinned commit (clone only: we
+# compile its sources ourselves).  Keep the pin in sync with client-cpp/CMakeLists.txt.
+set(FLIGHT_RECORDER_DIR "" CACHE PATH "Local flight-recorder checkout; empty = fetch it")
+set(FLIGHT_RECORDER_GIT_REPOSITORY "git@github.com:arcanumruna/flight-recorder.git" CACHE STRING
+    "flight-recorder git URL used when FLIGHT_RECORDER_DIR is unset")
+set(FLIGHT_RECORDER_GIT_TAG "0ba261e45fa12c9b900c46983eaf7ca7fec0f8c9" CACHE STRING
+    "pinned flight-recorder commit")
+if(NOT FLIGHT_RECORDER_DIR)
+    include(FetchContent)
+    FetchContent_Declare(flight_recorder_src
+        GIT_REPOSITORY ${FLIGHT_RECORDER_GIT_REPOSITORY}
+        GIT_TAG        ${FLIGHT_RECORDER_GIT_TAG}
+        SOURCE_SUBDIR  _no_cmake_build)
+    FetchContent_MakeAvailable(flight_recorder_src)
+    set(FLIGHT_RECORDER_DIR "${flight_recorder_src_SOURCE_DIR}" CACHE PATH "" FORCE)
+endif()
+if(NOT EXISTS "${FLIGHT_RECORDER_DIR}/src/Calibration.cpp")
+    message(FATAL_ERROR "FLIGHT_RECORDER_DIR (${FLIGHT_RECORDER_DIR}) is not a flight-recorder checkout")
+endif()
+add_library(flight_recorder STATIC
+    ${FLIGHT_RECORDER_DIR}/src/Calibration.cpp
+    ${FLIGHT_RECORDER_DIR}/src/Enable.cpp
+    ${FLIGHT_RECORDER_DIR}/src/Registry.cpp
+    ${FLIGHT_RECORDER_DIR}/src/Report.cpp)
+target_include_directories(flight_recorder PUBLIC ${FLIGHT_RECORDER_DIR}/include)
+target_link_libraries(flight_recorder PUBLIC aeron::aeron)
+target_compile_features(flight_recorder PUBLIC cxx_std_23)
+# PUBLIC so the FLIGHT_RECORDER macro reaches every file that includes FlightRecorder.h.
 if(ENABLE_FLIGHT_RECORDER)
-    target_compile_definitions(rune_fr PUBLIC RUNE_FR=1)
+    target_compile_definitions(flight_recorder PUBLIC FLIGHT_RECORDER=1)
 else()
-    target_compile_definitions(rune_fr PUBLIC RUNE_FR=0)
+    target_compile_definitions(flight_recorder PUBLIC FLIGHT_RECORDER=0)
 endif()
 
 # ── rune-crypto — client<->broker TLS/AEAD (Task 7) ──────────────────────────
-# Consumed as a SIBLING source lib, exactly like rune-fr/rune-codec above (no
+# Consumed as a SIBLING source lib, exactly like flight-recorder/rune-codec above (no
 # conan publish gate yet).  Header-first (TlsSession.h/Aead.h/Cipher.h) + 3
 # small .cpp.
 #
@@ -81,7 +101,7 @@ endif()
 #   propagates to rune_broker and every test/benchmark executable without any
 #   further change here.
 find_package(OpenSSL REQUIRED)
-set(RUNE_CRYPTO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../rune-crypto"
+set(RUNE_CRYPTO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../crypto"
     CACHE PATH "Path to the rune-crypto sibling repo")
 add_library(rune_crypto STATIC
     ${RUNE_CRYPTO_ROOT}/src/Caps.cpp
@@ -110,8 +130,8 @@ if(UNIX AND NOT APPLE)
     endforeach()
 endif()
 
-# ── rune-codec (0a) — consumed as a SIBLING source static lib (like rune-fr) ──
-set(RUNE_CODEC_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../rune-codec"
+# ── rune-codec (0a) — consumed as a SIBLING source static lib (like flight-recorder) ──
+set(RUNE_CODEC_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../codec"
     CACHE PATH "Path to the rune-codec sibling repo")
 add_library(rune_codec STATIC
     ${RUNE_CODEC_ROOT}/src/Serialize.cpp
@@ -319,11 +339,11 @@ add_subdirectory(libs/gateway)
 # rune_client_broker_tests (the client's blocking *AndWait DDL against a real
 # in-process BrokerNode).  Required under BUILD_TESTING — never a silent skip.
 # The client's own `if(NOT TARGET …)` guards (Task 5) reuse the broker's copies
-# of the shared sibling targets (rune_fr / rune_codec / rune_crypto / rune_gso /
+# of the shared sibling targets (flight_recorder / rune_codec / rune_crypto / rune_gso /
 # rune_driver_wake as rune_client_driver_wake) — after libs/ so they all exist;
 # its own tests and benchmarks are not built here (BUILD_TESTING / BUILD_BENCHMARKS
 # are shadowed OFF for the subdirectory only).
-set(RUNE_CLIENT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../rune-client-cpp" CACHE PATH
+set(RUNE_CLIENT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../client-cpp" CACHE PATH
     "Path to the rune-client-cpp sibling repo (rune_client_broker_tests)")
 if(BUILD_TESTING)
     if(NOT EXISTS "${RUNE_CLIENT_ROOT}/CMakeLists.txt")
@@ -351,13 +371,13 @@ if(BUILD_TESTING)
 endif()
 
 
-# Flight-recorder instrumentation: link rune_fr PUBLIC into every instrumented
+# Flight-recorder instrumentation: link flight_recorder PUBLIC into every instrumented
 # lib so the headers propagate to dependents (and their tests).
-target_link_libraries(rune_storage     PUBLIC rune_fr)
-target_link_libraries(rune_consensus   PUBLIC rune_fr)
-target_link_libraries(rune_replication PUBLIC rune_fr)
-target_link_libraries(rune_node        PUBLIC rune_fr rune_codec)
-target_link_libraries(rune_gateway     PUBLIC rune_fr)
+target_link_libraries(rune_storage     PUBLIC flight_recorder)
+target_link_libraries(rune_consensus   PUBLIC flight_recorder)
+target_link_libraries(rune_replication PUBLIC flight_recorder)
+target_link_libraries(rune_node        PUBLIC flight_recorder rune_codec)
+target_link_libraries(rune_gateway     PUBLIC flight_recorder)
 
 # client<->broker TLS/AEAD (Task 8b): the node header Worker.h now reaches
 # <rune/crypto/Aead.h> via RecordsPush.h -> RecordsSeal.h (the Records-push seal
@@ -373,7 +393,7 @@ target_link_libraries(rune_node        PUBLIC rune_crypto)
 target_link_libraries(rune_replication PUBLIC rune_crypto)
 
 add_executable(rune_broker src/main.cpp)
-target_link_libraries(rune_broker PRIVATE rune_node rune_storage rune_fr spdlog::spdlog)
+target_link_libraries(rune_broker PRIVATE rune_node rune_storage flight_recorder spdlog::spdlog)
 if(aeron_FOUND)
     target_link_libraries(rune_broker PRIVATE aeron::aeron)
     # libuuid (needed by aeron's embedded driver on Linux) is linked PUBLIC on

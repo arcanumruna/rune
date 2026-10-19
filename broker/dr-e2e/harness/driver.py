@@ -55,7 +55,7 @@ class ClientHangWarning(UserWarning):
 # 3 s: a static backlog streams at millisecond gaps (dr_client prints every record as it lands), so 3 s of silence
 # after every partition delivered is > 1000x the stream's own gap.
 DRAIN_QUIET_MS = int(os.environ.get("DR_DRAIN_QUIET_MS", "3000"))
-_DR_BUILD_CONTEXTS = ("rune-protocol", "rune-fr", "rune-codec", "rune-ql", "rune-crypto")
+_DR_BUILD_CONTEXTS = ("rune-protocol", "flight-recorder", "rune-codec", "rune-ql", "rune-crypto")
 
 
 @timed("image.dr_client")

@@ -1,7 +1,7 @@
 #include <rune/storage/Timestamps.h>
 #include <rune/storage/Log.h>
 #include <rune/protocol/RecordBatch.h>
-#include <rune_fr/FlightRecorder.h>
+#include <flight_recorder/FlightRecorder.h>
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -1022,7 +1022,7 @@ int64_t Log::appendNoSync(const uint8_t* data, std::size_t len, int64_t lastOffs
 }
 int64_t Log::appendNoSyncRestamp(const uint8_t* batch, std::size_t len,
                                  int32_t lastOffsetDelta, int64_t& outBaseOffset) {
-    RUNE_FR_SPAN_STORAGE(rune_fr::Site::StorageWrite, 0);
+    FLIGHT_RECORDER_SPAN_STORAGE(flight_recorder::Site::StorageWrite, 0);
     // Assign the base offset atomically from the log's current end offset, then
     // write zero-copy (pwritev restamp): the assigned base offset lands in the
     // page cache without any mutable copy of `batch`.  maybeRoll() runs first;
@@ -1057,7 +1057,7 @@ LogReadView Log::readInto(int64_t startOffset, int32_t maxBytes, uint8_t* buf, s
 }
 LogReadView Log::readInto(int64_t startOffset, int32_t maxBytes, uint8_t* buf, std::size_t bufCap,
                           ReadIntoStatus& st, int64_t boundOffset, int* errOut) noexcept {
-    RUNE_FR_SPAN_READ(rune_fr::Site::ReadLogRead, 0);
+    FLIGHT_RECORDER_SPAN_READ(flight_recorder::Site::ReadLogRead, 0);
     st = ReadIntoStatus::Absent;
     auto it = segments_.upper_bound(startOffset);
     if (it == segments_.begin()) return {};
@@ -1075,7 +1075,7 @@ LogReadView Log::readInto(int64_t startOffset, int32_t maxBytes, uint8_t* buf, s
     return v;
 }
 LogReadView Log::readView(int64_t startOffset, int32_t maxBytes) noexcept {
-    RUNE_FR_SPAN_READ(rune_fr::Site::ReadLogRead, 0);
+    FLIGHT_RECORDER_SPAN_READ(flight_recorder::Site::ReadLogRead, 0);
     ++readViewCalls_;
     mapReaders_ = true;   // D26: growth is provisioned only for logs read through the mapping
     auto it = segments_.upper_bound(startOffset);

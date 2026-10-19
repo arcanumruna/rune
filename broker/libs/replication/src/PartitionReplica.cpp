@@ -19,7 +19,7 @@
 
 #include <limits>
 #include <rune/protocol/RecordBatch.h>
-#include <rune_fr/FlightRecorder.h>
+#include <flight_recorder/FlightRecorder.h>
 #if RUNE_REPLICATION_HAS_AERON
 #include <rune/replication/WorkerReplicationTransport.h>
 #include <rune/replication/AeronPartitionTransport.h>
@@ -750,7 +750,7 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
                                          uint32_t connGen)
 {
     if (req.maxBytes == 0) ++rtFastAcks_;   // pure fast-ack (LEO advance only)
-    RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplFetchReqHandle,
+    FLIGHT_RECORDER_SPAN_REPLICATION(flight_recorder::Site::ReplFetchReqHandle,
                              static_cast<uint32_t>(req.followerId));
     // Guard: drop silently if this replica is not yet the leader.
     // This can happen during the window between Aeron transport receiving a
@@ -1005,7 +1005,7 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     {
         const Offset newHwOnFetch = leaderState_.highWatermark();
         if (newHwOnFetch > prevHwOnFetch) {
-            RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplHwAdvance,
+            FLIGHT_RECORDER_MARK_REPLICATION(flight_recorder::Site::ReplHwAdvance,
                 (static_cast<uint32_t>(cfg_.partitionId) << 24) |
                     (static_cast<uint32_t>(newHwOnFetch - 1) & 0xFFFFFFu));
         }
@@ -1252,7 +1252,7 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
     if (awaitEsFetch_) [[unlikely]] { ++appliesDroppedAwaitEs_; return; }
     ++rtApplies_;
     rtApplyBytes_ += static_cast<int64_t>(resp.records.size());
-    RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplFetchRespApply,
+    FLIGHT_RECORDER_SPAN_REPLICATION(flight_recorder::Site::ReplFetchRespApply,
                              static_cast<uint32_t>(cfg_.partitionId));
     if (resp.errorCode != kErrNone) {
         // F18 (I-1) ⇄ F3 (fix-round-2 item A): the batch at our LEO cannot be
@@ -1534,7 +1534,7 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
     //     leader's ReplLeaderAppend / ReplHwAdvance for end-to-end (cross-node)
     //     replication latency.
     if (postLeo > preLeo) {
-        RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplFollowerRecv,
+        FLIGHT_RECORDER_MARK_REPLICATION(flight_recorder::Site::ReplFollowerRecv,
             (static_cast<uint32_t>(cfg_.partitionId) << 24) |
                 (static_cast<uint32_t>(postLeo - 1) & 0xFFFFFFu));
     }
@@ -2448,7 +2448,7 @@ int PartitionReplica::doWork(int64_t nowNs)
             // once per interval.
             followerFlushRequested_ = true;
         } else {
-            RUNE_FR_SPAN_STORAGE(rune_fr::Site::StorageFlush,
+            FLIGHT_RECORDER_SPAN_STORAGE(flight_recorder::Site::StorageFlush,
                                  static_cast<uint32_t>(cfg_.partitionId));
             // fsyncgate: a failed fsync never escapes doWork (callers run on
             // AgentRunner threads with no catch → std::terminate).  The log is now
@@ -3675,7 +3675,7 @@ void PartitionReplica::recomputeHw()
     //     Keyed by (partition<<24)|committedOffset to pair with ReplLeaderAppend.
     const Offset newHwRecompute = leaderState_.highWatermark();
     if (newHwRecompute > prevHwRecompute) {
-        RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplHwAdvance,
+        FLIGHT_RECORDER_MARK_REPLICATION(flight_recorder::Site::ReplHwAdvance,
             (static_cast<uint32_t>(cfg_.partitionId) << 24) |
                 (static_cast<uint32_t>(newHwRecompute - 1) & 0xFFFFFFu));
     }
@@ -3888,7 +3888,7 @@ rune::storage::LogReadView PartitionReplica::readLog_(Offset from, int32_t maxBy
 
 int PartitionReplica::pushToFollowers(Offset pushCeiling, Offset floorIn) noexcept
 {
-    RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplPushToFollowers,
+    FLIGHT_RECORDER_SPAN_REPLICATION(flight_recorder::Site::ReplPushToFollowers,
                              static_cast<uint32_t>(cfg_.partitionId));
     if (role_ != Role::Leader) return 0;
     if (!isrManager_) return 0;

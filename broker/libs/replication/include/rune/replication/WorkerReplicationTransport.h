@@ -87,7 +87,7 @@
 #include <rune/consensus/PeerResolution.h>       // off-thread resolution events
 #include <rune/replication/ReplicationFrameLimits.h> // F18 frame limits (one source)
 #include <rune/replication/ReplicationMessages.h> // SBE codecs + stampTemplateId
-#include <rune_fr/FlightRecorder.h>                // #4 deep instrumentation
+#include <flight_recorder/FlightRecorder.h>                // #4 deep instrumentation
 #include <rune/peerlink/PeerFrameCrypto.h>        // authentication Task 16: AEAD on every inter-broker frame
 
 #include <spdlog/spdlog.h>
@@ -351,7 +351,7 @@ public:
     // -----------------------------------------------------------------------
     bool broadcastToPeers(const uint8_t* buf, std::size_t len) noexcept
     {
-        RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplWorkerBroadcast, 0);
+        FLIGHT_RECORDER_SPAN_REPLICATION(flight_recorder::Site::ReplWorkerBroadcast, 0);
         bool all = false;
         bool anyRefused = false;
         for (std::size_t i = 0; i < pubCount_; ++i) {
@@ -376,7 +376,7 @@ public:
         aeron::ExclusivePublication* pub = findPub_(peer);
         if (!pub) return -1;
         const std::size_t len = prefixLen + body.size();
-        RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplWorkerSendOnPub,
+        FLIGHT_RECORDER_SPAN_REPLICATION(flight_recorder::Site::ReplWorkerSendOnPub,
                                  static_cast<uint32_t>(len));
         if (crypto_ != nullptr) [[unlikely]] return sendSealedGather_(*pub, peer, prefix, prefixLen, body);
         if (len > static_cast<std::size_t>(pub->maxMessageLength())) [[unlikely]] {
@@ -416,7 +416,7 @@ private:
     int64_t sendOnPub_(aeron::ExclusivePublication& pub, rune::replication::NodeId peer,
                        const uint8_t* buf, std::size_t len) noexcept
     {
-        RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplWorkerSendOnPub,
+        FLIGHT_RECORDER_SPAN_REPLICATION(flight_recorder::Site::ReplWorkerSendOnPub,
                                  static_cast<uint32_t>(len));
         if (crypto_ != nullptr) [[unlikely]] return sendSealed_(pub, peer, buf, len);
         // Guard: offer() THROWS IllegalArgumentException if len > maxMessageLength.
@@ -959,7 +959,7 @@ public:
     template <class Dispatch>
     int poll(int fragmentLimit, Dispatch&& dispatch)
     {
-        RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplWorkerPoll, 0);
+        FLIGHT_RECORDER_SPAN_REPLICATION(flight_recorder::Site::ReplWorkerPoll, 0);
         if (!resolved()) [[unlikely]] return 0;
 
         using D = std::remove_reference_t<Dispatch>;
@@ -1232,7 +1232,7 @@ public:
     // -----------------------------------------------------------------------
     bool sendFetchRequest(const rune::replication::FetchRequestMsg& req) override
     {
-        RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplWorkerFetchReqSend,
+        FLIGHT_RECORDER_SPAN_REPLICATION(flight_recorder::Site::ReplWorkerFetchReqSend,
                                  static_cast<uint32_t>(req.partition));
         constexpr std::size_t kSize = rune::replication::FetchRequestMsg::TOTAL_SIZE;
         alignas(8) uint8_t claimBuf[kSize];
@@ -1251,7 +1251,7 @@ public:
     bool sendFetchRequestTo(rune::replication::NodeId leader,
                             const rune::replication::FetchRequestMsg& req) override
     {
-        RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplWorkerFetchReqSend,
+        FLIGHT_RECORDER_SPAN_REPLICATION(flight_recorder::Site::ReplWorkerFetchReqSend,
                                  static_cast<uint32_t>(req.partition));
         constexpr std::size_t kSize = rune::replication::FetchRequestMsg::TOTAL_SIZE;
         alignas(8) uint8_t claimBuf[kSize];
@@ -1271,7 +1271,7 @@ public:
     bool sendFetchResponse(rune::replication::NodeId toFollower,
                            const rune::replication::FetchResponseMsg& resp) override
     {
-        RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplWorkerSend,
+        FLIGHT_RECORDER_SPAN_REPLICATION(flight_recorder::Site::ReplWorkerSend,
                                  static_cast<uint32_t>(resp.records.size()));
         return sendFetchResponseImpl_(toFollower, resp, /*reconcile=*/false);
     }
@@ -1349,7 +1349,7 @@ private:
     template <class Dispatch>
     void dispatchFrame_(const uint8_t* frame, std::size_t len, int32_t sessionId, Dispatch& dispatch)
     {
-        RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplWorkerDispatch,
+        FLIGHT_RECORDER_SPAN_REPLICATION(flight_recorder::Site::ReplWorkerDispatch,
                                  static_cast<uint32_t>(len));
         if (len < rune::replication::ReplicationMessageHeader::ENCODED_SIZE)
             [[unlikely]] return;  // too short to have a valid header

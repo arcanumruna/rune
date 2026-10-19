@@ -41,7 +41,7 @@ elif command -v gtimeout >/dev/null 2>&1; then _RUNE_TIMEOUT=gtimeout
 else _RUNE_TIMEOUT=""; fi
 
 _rune_auth_ql_image() {
-    echo "${QL_IMAGE:-rune-ql-probe:$(git -C "${_rune_auth_projects}/rune-client-cpp" rev-parse --short HEAD 2>/dev/null || echo unknown)}"
+    echo "${QL_IMAGE:-rune-ql-probe:$(git -C "${_rune_auth_projects}/client-cpp" rev-parse --short HEAD 2>/dev/null || echo unknown)}"
 }
 
 # rune_auth_init : makes the per-run directory and exports RUNE_AUTH_DIR / RUNE_SECRETS_DIR / RUNE_AUTH_WORK_DIR.

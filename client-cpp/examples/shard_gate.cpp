@@ -702,7 +702,7 @@ int runVerify(const Args& a) {
 
 int main(int argc, char** argv) {
     const Args a = parse(argc, argv);
-    // rune-fr: armed by RUNE_FR_ENABLE before any client thread; report on exit.
+    // flight-recorder: armed by FLIGHT_RECORDER_ENABLE before any client thread; report on exit.
     rune::bench::FrRun fr("gate-" + a.arm);
     try {
         if (a.arm == "verify") return runVerify(a);

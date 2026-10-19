@@ -45,7 +45,7 @@
 #include <rune/replication/InternalIsrKnowledge.h>
 #include <rune/replication/AeronPartitionTransport.h>
 #include <rune/replication/PartitionReplica.h>
-#include <rune_fr/FlightRecorder.h>
+#include <flight_recorder/FlightRecorder.h>
 #include <rune/replication/Types.h>
 #include <rune/storage/LogCleaner.h>
 #include <rune/storage/Log.h>
@@ -281,7 +281,7 @@ public:
 
 private:
     int doWorkImpl_(int64_t nowNs) {
-        RUNE_FR_SPAN_RUNTIME(rune_fr::Site::RuntimeDoWork, 0);
+        FLIGHT_RECORDER_SPAN_RUNTIME(flight_recorder::Site::RuntimeDoWork, 0);
         ++cycles_;
         // 1. Consensus (Election + IngressRing drain).
         int work = consensus_.doWork(nowNs);   // direct call (Single / Multi), never virtual in BrokerNode

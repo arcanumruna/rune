@@ -13,14 +13,14 @@
 # this Dockerfile is modeled on.
 #
 # Build contexts (BuildKit named contexts, wired by the harness / compose):
-#   rune-protocol → ../../rune-protocol  (view-engine wire: CreateView=70 etc.)
-#   rune-codec    → ../../rune-codec     (0a codec: DescriptorBuilder/serialize)
-#   rune-fr       → ../../rune-fr        (flight recorder; rune_client_api links it)
-#   rune-ql       → ../../rune-ql        (rune_ql is always defined by CMakeLists)
-#   rune-crypto   → ../../rune-crypto    (client<->broker TLS/AEAD; rune_client_agent
+#   rune-protocol → ../../protocol  (view-engine wire: CreateView=70 etc.)
+#   rune-codec    → ../../codec     (0a codec: DescriptorBuilder/serialize)
+#   flight-recorder       → ../../flight-recorder        (flight recorder; rune_client_api links it)
+#   rune-ql       → ../../ql        (rune_ql is always defined by CMakeLists)
+#   rune-crypto   → ../../crypto    (client<->broker TLS/AEAD; rune_client_agent
 #                                         and rune_client_transport unconditionally
 #                                         link rune_crypto — CMakeLists.txt's
-#                                         RUNE_CRYPTO_ROOT defaults to ../rune-crypto,
+#                                         RUNE_CRYPTO_ROOT defaults to ../crypto,
 #                                         which from /build resolves to exactly
 #                                         /rune-crypto below; no -D override needed)
 #
@@ -66,9 +66,9 @@ COPY --from=rune-protocol src     /rune-protocol/src
 COPY --from=rune-codec src     /rune-codec/src
 COPY --from=rune-codec include /rune-codec/include
 COPY --from=rune-codec tools   /rune-codec/tools
-# rune-fr: compiled sibling (src + include); rune_client_api links it.
-COPY --from=rune-fr src     /rune-fr/src
-COPY --from=rune-fr include /rune-fr/include
+# flight-recorder: compiled sibling (src + include); rune_client_api links it.
+COPY --from=flight-recorder src     /flight-recorder/src
+COPY --from=flight-recorder include /flight-recorder/include
 # rune-ql: compiled sibling (src + include); rune_ql is unconditionally defined.
 COPY --from=rune-ql src     /rune-ql/src
 COPY --from=rune-ql include /rune-ql/include
@@ -91,7 +91,7 @@ RUN cmake -S . -B build -G Ninja \
         -DRUNE_PROTOCOL_INCLUDE=/rune-protocol/include \
         -DRUNE_CODEC_ROOT=/rune-codec \
         -DRUNE_QL_ROOT=/rune-ql \
-        -DRUNE_FR_DIR=/rune-fr \
+        -DFLIGHT_RECORDER_DIR=/flight-recorder \
         -DRUNE_CRYPTO_ROOT=/rune-crypto \
     && cmake --build build --target view_probe -j2
 

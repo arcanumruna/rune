@@ -48,8 +48,8 @@
 # subscriptions Redirect; the probe saw acked=200 inDoubt=0 and a new leader.
 #
 # Usage:  bash docker/transient-failover-e2e.sh   (from the rune-broker repo
-# root; sibling layout ../rune-protocol ../rune-codec ../rune-crypto ../rune-fr
-# ../rune-ql ../rune-client-cpp, as docker/view-engine-e2e.sh).
+# root; sibling layout ../protocol ../codec ../crypto ../flight-recorder
+# ../ql ../client-cpp, as docker/view-engine-e2e.sh).
 #
 # Bounded waits everywhere, clean teardown (compose down -v) even on failure.
 
@@ -64,7 +64,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "${SCRIPT_DIR}/lib/auth.sh"
 BROKER_REPO="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PROJECTS="$(cd "${BROKER_REPO}/.." && pwd)"
-CLIENT_REPO="${PROJECTS}/rune-client-cpp"
+# flight-recorder is its own repo (github.com/arcanumruna/flight-recorder), checked out next to the monorepo.
+FLIGHT_RECORDER_SRC="${FLIGHT_RECORDER_DIR:-${PROJECTS}/../flight-recorder}"
+CLIENT_REPO="${PROJECTS}/client-cpp"
 
 COMPOSE_FILE="${BROKER_REPO}/docker/docker-compose.yml"
 TOPIC_ID=3   # presence_failover: the 4th topic of docker/topics/transient-failover.rql (ids follow creation order)
@@ -115,11 +117,11 @@ create_topics() {
 rune_auth_init   # RUNE_SECRETS_DIR (the compose mount of the cluster key) + RUNE_AUTH_WORK_DIR (passwords)
 read -r -a AUTH_ARGS <<< "$(rune_auth_probe_args)"
 
-[ -d "${PROJECTS}/rune-protocol" ] || fail "missing ../rune-protocol"
-[ -d "${PROJECTS}/rune-codec" ]    || fail "missing ../rune-codec"
-[ -d "${PROJECTS}/rune-crypto" ]   || fail "missing ../rune-crypto"
-[ -d "${PROJECTS}/rune-fr" ]       || fail "missing ../rune-fr"
-[ -d "${PROJECTS}/rune-ql" ]       || fail "missing ../rune-ql"
+[ -d "${PROJECTS}/protocol" ] || fail "missing ../protocol"
+[ -d "${PROJECTS}/codec" ]    || fail "missing ../codec"
+[ -d "${PROJECTS}/crypto" ]   || fail "missing ../crypto"
+[ -d "${FLIGHT_RECORDER_SRC}" ]       || fail "missing ../flight-recorder"
+[ -d "${PROJECTS}/ql" ]       || fail "missing ../ql"
 [ -f "${CLIENT_DOCKERFILE}" ]      || fail "missing ${CLIENT_DOCKERFILE}"
 
 teardown() {
@@ -166,11 +168,11 @@ set +e
 out=$(docker build \
     --platform linux/amd64 \
     -f "${CLIENT_DOCKERFILE}" \
-    --build-context rune-protocol="${PROJECTS}/rune-protocol" \
-    --build-context rune-codec="${PROJECTS}/rune-codec" \
-    --build-context rune-crypto="${PROJECTS}/rune-crypto" \
-    --build-context rune-fr="${PROJECTS}/rune-fr" \
-    --build-context rune-ql="${PROJECTS}/rune-ql" \
+    --build-context rune-protocol="${PROJECTS}/protocol" \
+    --build-context rune-codec="${PROJECTS}/codec" \
+    --build-context rune-crypto="${PROJECTS}/crypto" \
+    --build-context flight-recorder="${FLIGHT_RECORDER_SRC}" \
+    --build-context rune-ql="${PROJECTS}/ql" \
     -t "${CLIENT_IMAGE}" \
     "${CLIENT_REPO}" 2>&1); rc=$?
 set -e

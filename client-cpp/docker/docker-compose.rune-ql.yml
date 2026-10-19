@@ -7,9 +7,9 @@
 #   The broker CODE is UNCHANGED, but for 0c it must COMPILE against rune-codec
 #   (which adds FixedStr) so the broker's validator/readField handle a
 #   `string(N)` field.  This file therefore points the broker's build contexts at:
-#       rune-protocol -> ../../rune-protocol      (main; has SchemaMessages.h)
-#       rune-codec    -> ../../rune-codec      (0c codec: adds FixedStr)
-#       rune-fr       -> ../../rune-fr
+#       rune-protocol -> ../../protocol      (main; has SchemaMessages.h)
+#       rune-codec    -> ../../codec      (0c codec: adds FixedStr)
+#       flight-recorder       -> ${FLIGHT_RECORDER_DIR:-../../../flight-recorder}
 #   and the broker Dockerfile passes -DRUNE_CODEC_ROOT=/rune-codec.
 #
 #   The build `context` is the rune-broker repo; `dockerfile` is the broker's
@@ -28,16 +28,16 @@ services:
   rune-1:
     build:
       # The broker repo root (contains docker/Dockerfile, conanfile.py, src/).
-      context: ../../rune-broker
+      context: ../../broker
       dockerfile: docker/Dockerfile
       args:
         - CMAKE_BUILD_PARALLEL_LEVEL   # from the environment when set (small Docker VMs)
       additional_contexts:
         # relative to THIS compose file's dir (rune-client-cpp-0c/docker/):
-        rune-protocol: ../../rune-protocol      # main — has SchemaMessages.h
-        rune-fr: ../../rune-fr                  # flight recorder (compiled sibling)
-        rune-codec: ../../rune-codec            # sibling checkout (same set as the broker's x-broker-build)
-        rune-crypto: ../../rune-crypto
+        rune-protocol: ../../protocol      # main — has SchemaMessages.h
+        flight-recorder: ${FLIGHT_RECORDER_DIR:-../../../flight-recorder}                  # flight recorder (compiled sibling)
+        rune-codec: ../../codec            # sibling checkout (same set as the broker's x-broker-build)
+        rune-crypto: ../../crypto
     image: rune-broker-0c-node:${RUNE_IMAGE_TAG:-single}
     platform: linux/amd64
     hostname: rune-1

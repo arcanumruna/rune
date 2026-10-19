@@ -17,7 +17,7 @@ Run from the `rune-broker` repo root:
 ```sh
 docker build \
   --platform linux/amd64 \
-  --build-context rune-protocol=../rune-protocol \
+  --build-context rune-protocol=../protocol \
   -f docker/Dockerfile \
   -t rune-broker:latest \
   .
@@ -535,7 +535,7 @@ x-broker-env: &broker-env
 services:
   rune-1:
     build: { context: .., dockerfile: docker/Dockerfile,
-             additional_contexts: { rune-protocol: ../../rune-protocol } }
+             additional_contexts: { rune-protocol: ../../protocol } }
     platform: linux/amd64
     hostname: rune-1
     shm_size: "256m"
@@ -641,7 +641,7 @@ volumes, no host ports, `build:` from source). For your own deployment use the
 
 ```sh
 # 1. Build (or pull) the image once
-docker build --platform linux/amd64 --build-context rune-protocol=../rune-protocol \
+docker build --platform linux/amd64 --build-context rune-protocol=../protocol \
     -f docker/Dockerfile -t rune-broker:latest .
 
 # 2. Copy + edit the env file

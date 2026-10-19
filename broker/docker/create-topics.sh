@@ -41,7 +41,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BROKER_REPO="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PROJECTS="$(cd "${BROKER_REPO}/.." && pwd)"
-CLIENT_REPO="${PROJECTS}/rune-client-cpp"
+# flight-recorder is its own repo (github.com/arcanumruna/flight-recorder), checked out next to the monorepo.
+FLIGHT_RECORDER_SRC="${FLIGHT_RECORDER_DIR:-${PROJECTS}/../flight-recorder}"
+CLIENT_REPO="${PROJECTS}/client-cpp"
 
 DEADLINE_S="${CREATE_TOPICS_DEADLINE_S:-60}"
 SEED="${SEED:-rune-1:40200}"
@@ -63,18 +65,18 @@ ensure_image() {
     # stale image that happens to carry the HEAD sha tag.
     local dockerfile="${CLIENT_REPO}/docker/Dockerfile.rune-ql-probe" d
     [ -f "${dockerfile}" ] || fail "missing ${dockerfile} (the rune CLI image)"
-    for d in rune-protocol rune-codec rune-ql rune-fr rune-crypto; do
+    for d in protocol codec ql crypto; do
         [ -d "${PROJECTS}/${d}" ] || fail "missing ../${d} (needed to build ${QL_IMAGE})"
     done
     log "Building the rune CLI image ${QL_IMAGE}..."
     local out rc
     set +e
     out=$(docker build --platform linux/amd64 -f "${dockerfile}" \
-        --build-context rune-protocol="${PROJECTS}/rune-protocol" \
-        --build-context rune-codec="${PROJECTS}/rune-codec" \
-        --build-context rune-ql="${PROJECTS}/rune-ql" \
-        --build-context rune-fr="${PROJECTS}/rune-fr" \
-        --build-context rune-crypto="${PROJECTS}/rune-crypto" \
+        --build-context rune-protocol="${PROJECTS}/protocol" \
+        --build-context rune-codec="${PROJECTS}/codec" \
+        --build-context rune-ql="${PROJECTS}/ql" \
+        --build-context flight-recorder="${FLIGHT_RECORDER_SRC}" \
+        --build-context rune-crypto="${PROJECTS}/crypto" \
         -t "${QL_IMAGE}" "${CLIENT_REPO}" 2>&1); rc=$?
     set -e
     [ "${rc}" -eq 0 ] || { echo "${out}" | tail -40 >&2; fail "building ${QL_IMAGE} failed (exit ${rc})"; }

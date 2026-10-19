@@ -16,7 +16,7 @@
 #include <rune/consensus/NanoClock.h>
 #include <rune/node/EmbeddedDriver.h>
 #include <rune/node/Worker.h>
-#include <rune_fr/FlightRecorder.h>
+#include <flight_recorder/FlightRecorder.h>
 
 #include <Aeron.h>
 
@@ -69,7 +69,7 @@ public:
     }
 
     int doWork(int64_t nowNs) override {
-        RUNE_FR_SPAN_RUNTIME(rune_fr::Site::ShardPass, 0);
+        FLIGHT_RECORDER_SPAN_RUNTIME(flight_recorder::Site::ShardPass, 0);
         if (!bound_) [[unlikely]] {
             driver_.bindPumpThread();          // ownership hand-off: startup thread → this thread
             if (runtimeDriver_) runtimeDriver_->bindPumpThread();

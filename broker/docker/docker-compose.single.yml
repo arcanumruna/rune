@@ -10,10 +10,10 @@
 #   2. The 0b schema messages (DefineTopic/GetTopicSchema/…) live in the 0b
 #      protocol worktree, and the broker links rune-codec (0a).  The stock
 #      docker-compose.yml points the `rune-protocol` build context at
-#      ../../rune-protocol (the MAIN worktree, which lacks SchemaMessages.h)
+#      ../../protocol (the MAIN worktree, which lacks SchemaMessages.h)
 #      and supplies NO rune-codec context.  This file wires BOTH correctly:
-#        rune-protocol → ../../rune-protocol-0b   (has SchemaMessages.h)
-#        rune-codec    → ../../rune-codec         (0a codec sibling)
+#        rune-protocol → ../../protocol-0b   (has SchemaMessages.h)
+#        rune-codec    → ../../codec         (0a codec sibling)
 #      and the Dockerfile passes -DRUNE_CODEC_ROOT=/rune-codec.
 #
 # Platform: linux/amd64 (Docker Desktop / Rosetta on Apple Silicon).
@@ -31,22 +31,22 @@ services:
         - CMAKE_BUILD_PARALLEL_LEVEL   # from the environment when set (small Docker VMs); unset = ninja default
       additional_contexts:
         # relative to this compose file's dir (docker/):
-        #   ../../rune-protocol = the sibling worktree (has SchemaMessages.h on
+        #   ../../protocol = the sibling worktree (has SchemaMessages.h on
         #   this branch; the old "-0b" suffix was a prior epoch's naming and no
         #   longer matches the schema-evolution worktree set).
-        rune-protocol: ../../rune-protocol
-        # rune-fr flight recorder: compiled sibling lib (src/ + include/).  Not
+        rune-protocol: ../../protocol
+        # flight-recorder flight recorder: compiled sibling lib (src/ + include/).  Not
         # part of this feature, so it is NOT worktreed under se-worktrees/ —
-        # ../../rune-fr resolves via a local symlink to the canonical checkout.
-        rune-fr: ../../rune-fr
+        # ../../flight-recorder resolves via a local symlink to the canonical checkout.
+        flight-recorder: ${FLIGHT_RECORDER_DIR:-../../../flight-recorder}
         # rune-codec (0a): compiled sibling lib (src/ + include/) linked into rune_node
-        rune-codec: ../../rune-codec
+        rune-codec: ../../codec
         # rune-crypto (client<->broker TLS/AEAD, Task 5/7): compiled sibling lib
         # (src/ + include/). The TLS/crypto merge from origin/main made the broker
         # Dockerfile hard-require this via `COPY --from=rune-crypto …` +
         # -DRUNE_CRYPTO_ROOT=/rune-crypto; without this named context the broker
         # image build fails with "COPY --from=rune-crypto: context not found".
-        rune-crypto: ../../rune-crypto
+        rune-crypto: ../../crypto
     image: rune-broker-node:${RUNE_IMAGE_TAG:-single}
     platform: linux/amd64
     hostname: rune-1

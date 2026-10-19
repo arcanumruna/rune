@@ -19,17 +19,17 @@ x-broker-build: &broker-build
   args:
     - CMAKE_BUILD_PARALLEL_LEVEL   # from the environment when set (small Docker VMs); unset = ninja default
   additional_contexts:
-    # relative to this compose file's dir (docker/), so ../../rune-protocol = the sibling repo
+    # relative to this compose file's dir (docker/), so ../../protocol = the sibling repo
     # RUNE_PROTOCOL_DIR overrides it (e.g. a rune-protocol worktree on main when the
     # sibling checkout sits on a feature branch).
-    rune-protocol: ${RUNE_PROTOCOL_DIR:-../../rune-protocol}
-    # rune-fr flight recorder: compiled sibling lib wired by the root CMakeLists
-    # (add_library(rune_fr ...) from ${SRC}/../rune-fr).  Needs src/ AND include/.
-    rune-fr: ../../rune-fr
+    rune-protocol: ${RUNE_PROTOCOL_DIR:-../../protocol}
+    # flight-recorder flight recorder: compiled sibling lib wired by the root CMakeLists
+    # (add_library(flight_recorder ...) from ${SRC}/../flight-recorder).  Needs src/ AND include/.
+    flight-recorder: ${FLIGHT_RECORDER_DIR:-../../../flight-recorder}
     # rune-codec (0a): compiled sibling codec lib; Dockerfile COPYs --from=rune-codec.
-    rune-codec: ../../rune-codec
+    rune-codec: ../../codec
     # rune-crypto (client<->broker TLS/AEAD): the Dockerfile COPYs --from=rune-crypto.
-    rune-crypto: ../../rune-crypto
+    rune-crypto: ../../crypto
 
 x-broker-env: &broker-env
   # GR-9: peer spec includes the replicationPort (4th segment) so the data-plane
@@ -196,12 +196,12 @@ services:
       context: ..
       dockerfile: docker/Dockerfile.probe
       additional_contexts:
-        # relative to this compose file's dir (docker/), so ../../rune-protocol = the sibling repo
-        rune-protocol: ${RUNE_PROTOCOL_DIR:-../../rune-protocol}
+        # relative to this compose file's dir (docker/), so ../../protocol = the sibling repo
+        rune-protocol: ${RUNE_PROTOCOL_DIR:-../../protocol}
         # the same sibling set as x-broker-build: the root CMakeLists builds these libraries unconditionally
-        rune-fr: ../../rune-fr
-        rune-codec: ../../rune-codec
-        rune-crypto: ../../rune-crypto
+        flight-recorder: ${FLIGHT_RECORDER_DIR:-../../../flight-recorder}
+        rune-codec: ../../codec
+        rune-crypto: ../../crypto
     platform: linux/amd64
     hostname: probe
     shm_size: "256m"

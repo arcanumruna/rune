@@ -12,7 +12,7 @@
 #   docker compose --env-file docker/rune-cluster.env -f docker/docker-compose.custom.yml down
 #
 # Uses a prebuilt image (${RUNE_IMAGE}); build it first, e.g.:
-#   docker build --platform linux/amd64 --build-context rune-protocol=../rune-protocol \
+#   docker build --platform linux/amd64 --build-context rune-protocol=../protocol \
 #       -f docker/Dockerfile -t rune-broker:latest .
 
 name: rune-cluster

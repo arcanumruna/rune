@@ -1,15 +1,15 @@
-// examples/bench/FrRun.h — rune-fr lifecycle for the bench / gate binaries.
+// examples/bench/FrRun.h — flight-recorder lifecycle for the bench / gate binaries.
 //
 // Construct FIRST in main (before any client / shard thread records):
-// rune_fr::configureFromEnv() sizes the rings and arms recording when
-// RUNE_FR_ENABLE is set (compiled in, OFF by default; see rune_fr/Report.h for
-// RUNE_FR_RING_BYTES / _SLOW_SPAN_NS / _THROTTLE_NS / _DRAIN_MS / _CATEGORIES).
+// flight_recorder::configureFromEnv() sizes the rings and arms recording when
+// FLIGHT_RECORDER_ENABLE is set (compiled in, OFF by default; see flight_recorder/Report.h for
+// FLIGHT_RECORDER_RING_BYTES / _SLOW_SPAN_NS / _THROTTLE_NS / _DRAIN_MS / _CATEGORIES).
 // On destruction — every exit path of main, including a caught error — the
 // report (hist + Chrome trace + tape + meta with the cross-process anchor) is
-// written to RUNE_FR_OUT (default cwd) as fr-*-client-p<pid>-<tag>.*.
+// written to FLIGHT_RECORDER_OUT (default cwd) as fr-*-client-p<pid>-<tag>.*.
 #pragma once
 
-#include <rune_fr/FlightRecorder.h>
+#include <flight_recorder/FlightRecorder.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -20,8 +20,8 @@ namespace rune::bench {
 
 class FrRun {
 public:
-    explicit FrRun(std::string tag) : tag_(std::move(tag)), on_(rune_fr::configureFromEnv()) {
-        if (on_) std::fprintf(stderr, "rune-fr: client flight recording ENABLED (tag=%s)\n", tag_.c_str());
+    explicit FrRun(std::string tag) : tag_(std::move(tag)), on_(flight_recorder::configureFromEnv()) {
+        if (on_) std::fprintf(stderr, "flight-recorder: client flight recording ENABLED (tag=%s)\n", tag_.c_str());
     }
     ~FrRun() { dump(); }
     FrRun(const FrRun&)            = delete;
@@ -32,15 +32,15 @@ public:
         if (!on_ || dumped_) return;
         dumped_ = true;
         try {
-            const char*       out = std::getenv("RUNE_FR_OUT");
+            const char*       out = std::getenv("FLIGHT_RECORDER_OUT");
             const std::string dir = (out != nullptr && *out != '\0') ? out : ".";
             const std::string sfx = "-client-p" + std::to_string(static_cast<long>(::getpid())) + "-" + tag_;
-            const bool ok = rune_fr::dumpAll(dir, sfx, "client", tag_);
-            std::fprintf(stderr, "rune-fr: client report %s %s (suffix=%s, dropped=%llu)\n",
+            const bool ok = flight_recorder::dumpAll(dir, sfx, "client", tag_);
+            std::fprintf(stderr, "flight-recorder: client report %s %s (suffix=%s, dropped=%llu)\n",
                          ok ? "written to" : "FAILED for", dir.c_str(), sfx.c_str(),
-                         static_cast<unsigned long long>(rune_fr::droppedRecords()));
+                         static_cast<unsigned long long>(flight_recorder::droppedRecords()));
         } catch (...) {
-            std::fprintf(stderr, "rune-fr: client report FAILED (exception)\n");
+            std::fprintf(stderr, "flight-recorder: client report FAILED (exception)\n");
         }
     }
 

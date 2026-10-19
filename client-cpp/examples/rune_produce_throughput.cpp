@@ -42,7 +42,7 @@
 #include <rune/client/Key.h>
 #include <rune/client/TopicHandle.h>
 #include <rune/client/producer/Producer.h>
-#include <rune_fr/FlightRecorder.h>
+#include <flight_recorder/FlightRecorder.h>
 
 #include "BenchEnv.h"
 #include "FrRun.h"
@@ -70,8 +70,8 @@ int main(int argc, char** argv) {
         std::cerr << "CLIENT: RUNE_TOPICS was renamed to RUNE_CLIENT_TOPIC_TABLE (the client's name:topicId:partitions table)\n";
         return 2;
     }
-    // rune-fr: armed by RUNE_FR_ENABLE before any client thread starts; the
-    // report is written to RUNE_FR_OUT on every exit path, in EVERY mode
+    // flight-recorder: armed by FLIGHT_RECORDER_ENABLE before any client thread starts; the
+    // report is written to FLIGHT_RECORDER_OUT on every exit path, in EVERY mode
     // (legacy void/acked AND the invoker open/saturate bench).
     rune::bench::FrRun fr(argc > 1 ? "invoker" : "agent");
     // Any argument selects the invoker-shard bench (spec §5); env-only runs keep the
@@ -176,7 +176,7 @@ int main(int argc, char** argv) {
             } actx{&acked, &succeeded, &failed, &sampleGate, &lat, &sendTs};
             p.onAck([](void* raw, Token tok, int64_t /*offset*/, OpStatus st, uint16_t) noexcept {
                 auto* a = static_cast<AckCtx*>(raw);
-                RUNE_FR_MARK_PRODUCE(rune_fr::Site::ClientDrvAckCb, static_cast<uint32_t>(tok));
+                FLIGHT_RECORDER_MARK_PRODUCE(flight_recorder::Site::ClientDrvAckCb, static_cast<uint32_t>(tok));
                 // `acked` is published LAST (release): main stops waiting once it
                 // reaches nRecords and then reads succeeded/failed/lat and reuses
                 // this frame's stack — every other write must happen-before it.
@@ -232,7 +232,7 @@ int main(int argc, char** argv) {
                 // MIF window (ack starvation) — the driver's view of pipeline stall.
                 const double windowWaitUs =
                     std::chrono::duration<double, std::micro>(sendTs1 - submitTs).count();
-                RUNE_FR_MARK_VAL_PRODUCE(rune_fr::Site::ClientDrvSend,
+                FLIGHT_RECORDER_MARK_VAL_PRODUCE(flight_recorder::Site::ClientDrvSend,
                     static_cast<uint32_t>(i), windowWaitUs);
                 sendTs[static_cast<std::size_t>(i)] = sendTs1;
                 p.send(th, Key(static_cast<uint64_t>(i % keys)), std::span<const uint8_t>(val),

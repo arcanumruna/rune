@@ -65,8 +65,8 @@
 #
 # Usage:  bash docker/view-engine-e2e.sh
 # Run from the rune-broker repo root (this worktree). Requires the sibling
-# worktrees: ../rune-protocol ../rune-codec ../rune-crypto ../rune-fr ../rune-ql
-# ../rune-client-cpp (feat/view-engine-phase1 on both the broker and the
+# worktrees: ../protocol ../codec ../crypto ../flight-recorder ../ql
+# ../client-cpp (feat/view-engine-phase1 on both the broker and the
 # client repo).
 #
 # Constraints (engineering philosophy #5/#7):
@@ -86,7 +86,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "${SCRIPT_DIR}/lib/auth.sh"
 BROKER_REPO="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PROJECTS="$(cd "${BROKER_REPO}/.." && pwd)"
-CLIENT_REPO="${PROJECTS}/rune-client-cpp"
+# flight-recorder is its own repo (github.com/arcanumruna/flight-recorder), checked out next to the monorepo.
+FLIGHT_RECORDER_SRC="${FLIGHT_RECORDER_DIR:-${PROJECTS}/../flight-recorder}"
+CLIENT_REPO="${PROJECTS}/client-cpp"
 
 COMPOSE_FILE="${BROKER_REPO}/docker/docker-compose.single.yml"
 CLIENT_DOCKERFILE="${CLIENT_REPO}/docker/Dockerfile.view-probe"
@@ -132,12 +134,12 @@ fail() { echo "[view-engine-e2e] FAIL: $*" >&2; exit 1; }
 # ---------------------------------------------------------------------------
 # Preflight: sibling repos + fixtures present.
 # ---------------------------------------------------------------------------
-[ -d "${PROJECTS}/rune-protocol" ] || fail "missing ../rune-protocol"
-[ -d "${PROJECTS}/rune-codec" ]    || fail "missing ../rune-codec"
-[ -d "${PROJECTS}/rune-crypto" ]   || fail "missing ../rune-crypto"
-[ -d "${PROJECTS}/rune-fr" ]       || fail "missing ../rune-fr (symlink it to the canonical rune-fr checkout if not worktreed)"
-[ -d "${PROJECTS}/rune-ql" ]       || fail "missing ../rune-ql"
-[ -d "${CLIENT_REPO}" ]            || fail "missing ../rune-client-cpp"
+[ -d "${PROJECTS}/protocol" ] || fail "missing ../protocol"
+[ -d "${PROJECTS}/codec" ]    || fail "missing ../codec"
+[ -d "${PROJECTS}/crypto" ]   || fail "missing ../crypto"
+[ -d "${FLIGHT_RECORDER_SRC}" ]       || fail "missing ../flight-recorder (symlink it to the canonical flight-recorder checkout if not worktreed)"
+[ -d "${PROJECTS}/ql" ]       || fail "missing ../ql"
+[ -d "${CLIENT_REPO}" ]            || fail "missing ../client-cpp"
 [ -f "${CLIENT_DOCKERFILE}" ]      || fail "missing ${CLIENT_DOCKERFILE}"
 [ -f "${CLIENT_REPO}/examples/view_probe.cpp" ] || fail "missing ${CLIENT_REPO}/examples/view_probe.cpp"
 
@@ -199,11 +201,11 @@ set +e
 client_build_out=$(docker build \
     --platform linux/amd64 \
     -f "${CLIENT_DOCKERFILE}" \
-    --build-context rune-protocol="${PROJECTS}/rune-protocol" \
-    --build-context rune-codec="${PROJECTS}/rune-codec" \
-    --build-context rune-crypto="${PROJECTS}/rune-crypto" \
-    --build-context rune-fr="${PROJECTS}/rune-fr" \
-    --build-context rune-ql="${PROJECTS}/rune-ql" \
+    --build-context rune-protocol="${PROJECTS}/protocol" \
+    --build-context rune-codec="${PROJECTS}/codec" \
+    --build-context rune-crypto="${PROJECTS}/crypto" \
+    --build-context flight-recorder="${FLIGHT_RECORDER_SRC}" \
+    --build-context rune-ql="${PROJECTS}/ql" \
     -t "${CLIENT_IMAGE}" \
     "${CLIENT_REPO}" 2>&1)
 client_build_rc=$?

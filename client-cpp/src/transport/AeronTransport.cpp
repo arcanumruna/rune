@@ -277,7 +277,7 @@ AeronTransport::OfferResult AeronTransport::offerToPub(aeron::ExclusivePublicati
         if (pos > 0) return OfferResult::Accepted;
         // FR: refused (arg = -position: 1 NOT_CONNECTED, 2 BACK_PRESSURED,
         // 3 ADMIN_ACTION, 4 CLOSED, 5 MAX_POSITION) — throttled.
-        RUNE_FR_THROTTLED_PRODUCE(frOfferRefused_, rune_fr::Site::ClientTransportRefused,
+        FLIGHT_RECORDER_THROTTLED_PRODUCE(frOfferRefused_, flight_recorder::Site::ClientTransportRefused,
                                   static_cast<uint32_t>(pub.streamId()), static_cast<uint16_t>(-pos));
         if (pos == aeron::PUBLICATION_CLOSED || pos == aeron::MAX_POSITION_EXCEEDED) {
             return OfferResult::Fatal;

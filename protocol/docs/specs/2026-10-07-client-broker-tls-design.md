@@ -21,7 +21,7 @@ Encrypt the **client↔broker** network link (produce frames, ack/egress frames,
 - **CPU-adaptive fast paths with graceful fallback.** Use hardware AES (VAES/AVX-512, then AES-NI / ARMv8 crypto) when present; fall back to ChaCha20-Poly1305 otherwise — the lowest-latency option achievable without hardware AES.
 - **Standard certificates.** The broker authenticates with an X.509 cert that **Let's Encrypt can issue** (public DNS name, DNS-01 ACME), verifiable by clients against the public trust store.
 - **Shared-nothing conformance.** Per-session crypto state owned by exactly one thread; cross-thread key delivery (only where unavoidable) via a ring-buffer op, never shared memory.
-- **Measurable.** Overhead proven with rune-fr spans and a benchmark gate, not assumed.
+- **Measurable.** Overhead proven with flight-recorder spans and a benchmark gate, not assumed.
 - **Toggle.** Compile/runtime switch (`RUNE_TLS`) so the plaintext transport and the encrypted transport can both be built, for migration and A/B latency measurement.
 
 ### Non-goals
@@ -97,7 +97,7 @@ Each side detects CPU crypto capability at init and advertises an ordered AEAD p
 1. **AES-256-GCM** when both peers have hardware AES. OpenSSL's EVP AES-GCM runtime-dispatches internally to the **VAES/AVX-512** implementation where available, else **AES-NI (+PCLMULQDQ)**, else **ARMv8 crypto (AES+PMULL)** — we do not hand-write assembly; we inherit OpenSSL's dispatch and simply verify a vectorized impl was selected at init.
 2. **ChaCha20-Poly1305** when hardware AES is absent — fast in portable SIMD and constant-time without AES-NI; the "lowest-latency by normal means" floor.
 
-Capability is detected via OpenSSL (`OPENSSL_ia32cap` / EVP availability) and recorded so rune-fr can label which path a connection took.
+Capability is detected via OpenSSL (`OPENSSL_ia32cap` / EVP availability) and recorded so flight-recorder can label which path a connection took.
 
 ---
 
@@ -181,7 +181,7 @@ A single shared `seal()` / `open()` helper keeps the gateway and per-worker-ingr
 - **Dependency: OpenSSL 3.x** (one library for both the TLS 1.3 handshake + cert validation and the data-path EVP AEAD, both runtime-dispatched). Builds on Linux and macOS/arm64. Added via Conan, consistent with the sibling repos' dependency style. (libsodium was considered and rejected — it would mean two crypto libs and its own TLS gap.)
 - **Toggle:** `RUNE_TLS` CMake option + runtime config. Off → today's plaintext transport, zero added code on the hot path. On → encrypted transport. Both buildable for migration and A/B latency measurement.
 - **Config:** cert path + key path (+ reload on SIGHUP), ACME hook (external), client trust-store path (default: system), cipher preference override (default: capability-driven), `require_tls` (broker rejects plaintext when set), per-session rekey thresholds.
-- **Measurement:** new rune-fr sites `CryptoSeal` / `CryptoOpen` (value = bytes, arg = cipher-path id) at the four seams, so the per-hop overhead on the produce→ack waterfall is proven, not assumed.
+- **Measurement:** new flight-recorder sites `CryptoSeal` / `CryptoOpen` (value = bytes, arg = cipher-path id) at the four seams, so the per-hop overhead on the produce→ack waterfall is proven, not assumed.
 
 ---
 
@@ -205,7 +205,7 @@ A single shared `seal()` / `open()` helper keeps the gateway and per-worker-ingr
 - **Security regression suite (`*Regression*`, runs first):** tamper (flip a ciphertext/tag byte → dropped), replay (resend a frame → dropped by window), reorder within window (accepted), cross-session frame injection (dropped by AAD), downgrade attempt (client/broker refuse below negotiated floor).
 - **Fragmentation test:** encrypted 64 KiB produce batch (multi-fragment) round-trips and decodes identically to plaintext — proves the above-Aeron design.
 - **E2E:** encrypted produce→ack and encrypted egress consume, 3-node broker, with `RUNE_TLS` on.
-- **Benchmark gate:** rune-fr `CryptoSeal`/`CryptoOpen` + end-to-end produce→ack latency, encrypted vs plaintext, on both a VAES host and an AES-NI host. **Gate: single/small produce→ack adds < 5–10 µs on the fast path**; publish the numbers (per earlier house rule — no "done" without the bench).
+- **Benchmark gate:** flight-recorder `CryptoSeal`/`CryptoOpen` + end-to-end produce→ack latency, encrypted vs plaintext, on both a VAES host and an AES-NI host. **Gate: single/small produce→ack adds < 5–10 µs on the fast path**; publish the numbers (per earlier house rule — no "done" without the bench).
 
 ---
 

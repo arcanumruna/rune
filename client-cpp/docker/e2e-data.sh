@@ -35,7 +35,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLIENT_REPO="$(cd "${SCRIPT_DIR}/.." && pwd)"
-BROKER_DOCKER_DIR="${CLIENT_REPO}/../rune-broker/docker"
+BROKER_DOCKER_DIR="${CLIENT_REPO}/../broker/docker"
 BROKER_COMPOSE="${BROKER_DOCKER_DIR}/docker-compose.yml"
 
 if [ ! -f "${BROKER_COMPOSE}" ]; then
@@ -176,11 +176,11 @@ log "Step 4: Building rune-client-data image (${DATA_IMAGE})..."
 set +e
 out=$(docker build \
     --platform linux/amd64 \
-    --build-context rune-protocol="${CLIENT_REPO}/../rune-protocol" \
-    --build-context rune-fr="${CLIENT_REPO}/../rune-fr" \
-    --build-context rune-codec="${CLIENT_REPO}/../rune-codec" \
-    --build-context rune-ql="${CLIENT_REPO}/../rune-ql" \
-    --build-context rune-crypto="${CLIENT_REPO}/../rune-crypto" \
+    --build-context rune-protocol="${CLIENT_REPO}/../protocol" \
+    --build-context flight-recorder="${FLIGHT_RECORDER_DIR:-${CLIENT_REPO}/../../flight-recorder}" \
+    --build-context rune-codec="${CLIENT_REPO}/../codec" \
+    --build-context rune-ql="${CLIENT_REPO}/../ql" \
+    --build-context rune-crypto="${CLIENT_REPO}/../crypto" \
     -f "${CLIENT_REPO}/docker/Dockerfile.data" \
     -t "${DATA_IMAGE}" \
     "${CLIENT_REPO}" 2>&1); rc=$?

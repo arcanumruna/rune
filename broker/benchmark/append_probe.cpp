@@ -7,7 +7,7 @@
 // not a synchronous create.
 //
 // Build (arm64, from source, RELEASE):
-//   c++ -std=c++23 -O2 -DNDEBUG -Ilibs/storage/include -I../rune-protocol/include \
+//   c++ -std=c++23 -O2 -DNDEBUG -Ilibs/storage/include -I../protocol/include \
 //     benchmark/append_probe.cpp libs/storage/src/Log.cpp libs/storage/src/LogSegment.cpp \
 //     libs/storage/src/OffsetIndex.cpp libs/storage/src/MappedFile.cpp -o /tmp/append_probe
 // Args: rollBytes nAppends bg syncEvery

@@ -42,8 +42,8 @@ CACHE="$HERE/$B/CMakeCache.txt"
 [ -f "$CACHE" ] || { echo "run-linux-regression-vm: no $CACHE" >&2; exit 2; }
 val() { grep -E "^$1:" "$CACHE" | head -1 | cut -d= -f2-; }
 PROTO="$(cd "$(val RUNE_PROTOCOL_INCLUDE)/.." && pwd)"
-declare -a NAMES=(rune-broker rune-protocol rune-client-cpp rune-codec rune-fr rune-ql rune-crypto)
-declare -a TREES=("$HERE" "$PROTO" "$(val RUNE_CLIENT_ROOT)" "$(val RUNE_CODEC_ROOT)" "$(val RUNE_FR_DIR)" \
+declare -a NAMES=(rune-broker rune-protocol rune-client-cpp rune-codec flight-recorder rune-ql rune-crypto)
+declare -a TREES=("$HERE" "$PROTO" "$(val RUNE_CLIENT_ROOT)" "$(val RUNE_CODEC_ROOT)" "$(val FLIGHT_RECORDER_DIR)" \
                   "$(val RUNE_QL_ROOT)" "$(val RUNE_CRYPTO_ROOT)")
 for i in "${!TREES[@]}"; do
     t="${TREES[$i]}"
@@ -74,14 +74,14 @@ cat > "$STAGE/meta/gate.sh" <<REMOTE
 set -u
 cd "$RUN/rune-broker" || exit 2
 DOCKER_BUILDKIT=1 docker build --platform linux/amd64 -f docker/Dockerfile --target builder \\
-    --build-context rune-protocol=../rune-protocol --build-context rune-fr=../rune-fr \\
-    --build-context rune-codec=../rune-codec --build-context rune-crypto=../rune-crypto \\
+    --build-context rune-protocol=../protocol --build-context flight-recorder=../../flight-recorder \\
+    --build-context rune-codec=../codec --build-context rune-crypto=../crypto \\
     --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$J -t "$IMG" . > "$RUN/builder.log" 2>&1 \\
     || { echo "builder stage failed:"; tail -30 "$RUN/builder.log"; exit 2; }
 CFG='cmake -S /src/rune-broker -B /src/_build -G Ninja -DCMAKE_TOOLCHAIN_FILE=/build/conan-release/build/Release/generators/conan_toolchain.cmake \\
   -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DBUILD_BENCHMARKS=OFF -DBUILD_INTEGRATION_TESTING=$ITEG \\
   -DRUNE_PROTOCOL_INCLUDE=/src/rune-protocol/include -DRUNE_CODEC_ROOT=/src/rune-codec -DRUNE_CRYPTO_ROOT=/src/rune-crypto \\
-  -DRUNE_FR_DIR=/src/rune-fr -DRUNE_CLIENT_ROOT=/src/rune-client-cpp -DRUNE_QL_ROOT=/src/rune-ql -DRUNE_TLS=ON > /src/cmake.log 2>&1'
+  -DFLIGHT_RECORDER_DIR=/src/flight-recorder -DRUNE_CLIENT_ROOT=/src/rune-client-cpp -DRUNE_QL_ROOT=/src/rune-ql -DRUNE_TLS=ON > /src/cmake.log 2>&1'
 docker run --rm --name "rune-linux-gate-build-$RID" -v "$RUN:/src" "$IMG" bash -c "\$CFG && for t in $XT; do ninja -C /src/_build -t targets all | grep -q \"^\\\$t:\" || { echo \"missing target \\\$t (the ctest filter needs it)\" >&2; exit 2; }; done && cmake --build /src/_build -j$J --target rune_udp_gso_tests rune_catalog_replication_tests $XT > /src/ninja.log 2>&1" \\
     || { echo "build failed:"; tail -20 "$RUN/cmake.log" "$RUN/ninja.log"; exit 2; }
 echo "== linux-only (CAP_NET_ADMIN, RUNE_LINUX_GATE=1)"

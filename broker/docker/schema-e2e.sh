@@ -15,7 +15,7 @@
 #
 # Usage:  bash docker/schema-e2e.sh
 # Run from the rune-broker repo root.  Requires the sibling repos:
-#   ../rune-protocol, ../rune-codec, ../rune-fr, ../rune-ql, ../rune-crypto, ../rune-client-cpp
+#   ../protocol, ../codec, ../flight-recorder, ../ql, ../crypto, ../client-cpp
 #
 # Constraints (engineering philosophy #11/#16):
 #   - Real client↔broker over real Aeron (NOT in-process).
@@ -29,7 +29,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "${SCRIPT_DIR}/lib/auth.sh"   # authentication is ON: cluster key, bootstrap, e2e user (Task 20)
 BROKER_REPO="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PROJECTS="$(cd "${BROKER_REPO}/.." && pwd)"
-CLIENT_REPO="${CLIENT_REPO:-${PROJECTS}/rune-client-cpp}"
+# flight-recorder is its own repo (github.com/arcanumruna/flight-recorder), checked out next to the monorepo.
+FLIGHT_RECORDER_SRC="${FLIGHT_RECORDER_DIR:-${PROJECTS}/../flight-recorder}"
+CLIENT_REPO="${CLIENT_REPO:-${PROJECTS}/client-cpp}"
 
 COMPOSE_FILE="${BROKER_REPO}/docker/docker-compose.single.yml"
 PROBE_DOCKERFILE="${CLIENT_REPO}/docker/Dockerfile.schema-probe"
@@ -54,7 +56,8 @@ fail() { echo "[schema-e2e] FAIL: $*" >&2; exit 1; }
 # Sibling repos live next to the broker repo (../<repo>).  NB: the compose
 # additional_contexts use ../../<repo> because they resolve relative to the
 # compose file's dir (docker/), not the repo root.
-for d in rune-protocol rune-codec rune-fr rune-ql rune-crypto; do
+[ -d "${FLIGHT_RECORDER_SRC}" ] || fail "missing flight-recorder checkout (set FLIGHT_RECORDER_DIR)"
+for d in protocol codec ql crypto; do
     [ -d "${PROJECTS}/${d}" ] || fail "missing ../${d}"
 done
 [ -d "${CLIENT_REPO}" ]      || fail "missing ${CLIENT_REPO}"
@@ -89,11 +92,11 @@ set +e
 out=$(docker build \
     --platform linux/amd64 \
     -f "${PROBE_DOCKERFILE}" \
-    --build-context rune-protocol="${PROJECTS}/rune-protocol" \
-    --build-context rune-codec="${PROJECTS}/rune-codec" \
-    --build-context rune-fr="${PROJECTS}/rune-fr" \
-    --build-context rune-ql="${PROJECTS}/rune-ql" \
-    --build-context rune-crypto="${PROJECTS}/rune-crypto" \
+    --build-context rune-protocol="${PROJECTS}/protocol" \
+    --build-context rune-codec="${PROJECTS}/codec" \
+    --build-context flight-recorder="${FLIGHT_RECORDER_SRC}" \
+    --build-context rune-ql="${PROJECTS}/ql" \
+    --build-context rune-crypto="${PROJECTS}/crypto" \
     -t "${PROBE_IMAGE}" \
     "${CLIENT_REPO}" 2>&1); rc=$?
 set -e

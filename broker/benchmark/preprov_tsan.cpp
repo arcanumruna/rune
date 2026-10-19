@@ -14,7 +14,7 @@
 //
 // Build (x86_64 TSan):
 //   c++ -std=c++23 -O1 -g -fsanitize=thread -Ilibs/storage/include \
-//     -I../rune-protocol/include benchmark/preprov_tsan.cpp \
+//     -I../protocol/include benchmark/preprov_tsan.cpp \
 //     build-tsan/libs/storage/librune_storage.a -o /tmp/preprov_tsan
 #include <rune/storage/Log.h>
 #include <rune/protocol/RecordBatch.h>

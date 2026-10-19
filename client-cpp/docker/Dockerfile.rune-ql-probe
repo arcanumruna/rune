@@ -16,10 +16,10 @@
 #     ./rune_ql_probe                                      (typed round-trip)
 #
 # Build contexts (BuildKit named contexts, wired by docker/rune-ql-e2e.sh):
-#   rune-protocol -> ../../rune-protocol      (main headers: SchemaMessages.h)
-#   rune-codec    -> ../../rune-codec-0c      (0c codec: FixedStr; Serialize/Record/
+#   rune-protocol -> ../../protocol      (main headers: SchemaMessages.h)
+#   rune-codec    -> ../../codec-0c      (0c codec: FixedStr; Serialize/Record/
 #                                              Validator/Generator + tools/gen)
-#   rune-fr       -> ../../rune-fr            (flight recorder; rune_client_api links)
+#   flight-recorder       -> ${FLIGHT_RECORDER_DIR:-../../../flight-recorder}            (flight recorder; rune_client_api links)
 # ──────────────────────────────────────────────────────────────────────────────
 
 FROM gcc:13 AS builder
@@ -62,9 +62,9 @@ COPY --from=rune-codec tools   /rune-codec/tools
 # rune-ql: compiled sibling (src + include); rune_cli_lib links it.
 COPY --from=rune-ql src     /rune-ql/src
 COPY --from=rune-ql include /rune-ql/include
-# rune-fr: compiled sibling (src + include); rune_client_api links it.
-COPY --from=rune-fr src     /rune-fr/src
-COPY --from=rune-fr include /rune-fr/include
+# flight-recorder: compiled sibling (src + include); rune_client_api links it.
+COPY --from=flight-recorder src     /flight-recorder/src
+COPY --from=flight-recorder include /flight-recorder/include
 # rune-crypto (client<->broker TLS/AEAD, Task 5/7): compiled sibling (src + include).
 # The TLS/crypto merge from origin/main made the client CMake hard-require this:
 # add_library(rune_crypto ...) from ${RUNE_CRYPTO_ROOT}/src/{Caps,Aead,TlsSession}.cpp,
@@ -91,7 +91,7 @@ RUN cmake -S . -B build -G Ninja \
         -DRUNE_PROTOCOL_INCLUDE=/rune-protocol/include \
         -DRUNE_CODEC_ROOT=/rune-codec \
         -DRUNE_QL_ROOT=/rune-ql \
-        -DRUNE_FR_DIR=/rune-fr \
+        -DFLIGHT_RECORDER_DIR=/flight-recorder \
         -DRUNE_CRYPTO_ROOT=/rune-crypto \
         -DRUNE_GEN_DIR=/build/build/e2e-gen \
     && cmake --build build --target rune \

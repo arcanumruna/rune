@@ -24,7 +24,7 @@
 #include "ShardTestClient.h"
 #include "TestClusterCore.h"
 
-#include <rune_fr/FlightRecorder.h>
+#include <flight_recorder/FlightRecorder.h>
 
 #include <benchmark/benchmark.h>
 #include <spdlog/spdlog.h>
@@ -94,10 +94,10 @@ NodeConfig benchConfig(const fs::path& dataDir, bool fused, uint16_t clientPort,
 }
 
 void report(benchmark::State& state) {
-    rune_fr::Recorder::instance().drain();
-    for (const auto& s : rune_fr::collectSiteStats()) {
-        const char* prefix = s.site == rune_fr::Site::ShardPass     ? "pass_"
-                           : s.site == rune_fr::Site::RuntimeDoWork ? "rt_" : nullptr;
+    flight_recorder::Recorder::instance().drain();
+    for (const auto& s : flight_recorder::collectSiteStats()) {
+        const char* prefix = s.site == flight_recorder::Site::ShardPass     ? "pass_"
+                           : s.site == flight_recorder::Site::RuntimeDoWork ? "rt_" : nullptr;
         if (!prefix) continue;
         const std::string p(prefix);
         state.counters[p + "n"]    = static_cast<double>(s.count);
@@ -138,10 +138,10 @@ void BM_ShardPassRuntimePlacement(benchmark::State& state) {
         state.SkipWithError("warm-up produce failed"); return;
     }
 
-    rune_fr::Recorder::instance().drain();
-    rune_fr::Recorder::instance().reset();
-    rune_fr::setCategoryMask(rune_fr::categoryBit(rune_fr::Category::Runtime));
-    rune_fr::enable();
+    flight_recorder::Recorder::instance().drain();
+    flight_recorder::Recorder::instance().reset();
+    flight_recorder::setCategoryMask(flight_recorder::categoryBit(flight_recorder::Category::Runtime));
+    flight_recorder::enable();
     int64_t corr = 1'000'000;
     int32_t part = 0;
     for (auto _ : state) {
@@ -155,7 +155,7 @@ void BM_ShardPassRuntimePlacement(benchmark::State& state) {
             std::this_thread::sleep_for(std::chrono::milliseconds{1});   // let the shard spin idle
         }
     }
-    rune_fr::disable();
+    flight_recorder::disable();
     report(state);
     node.stop();
 }

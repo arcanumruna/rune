@@ -30,13 +30,13 @@ COPY conanfile.py conandata.yml VERSION.txt ./
 RUN conan install . --output-folder=conan-release --build=missing -s build_type=Release
 
 # rune-protocol headers
-# The root CMakeLists.txt builds rune_fr (:49-53), rune_crypto (:84-90), rune_gso from rune-protocol/src/net (:98) and
+# The root CMakeLists.txt builds flight_recorder (:49-53), rune_crypto (:84-90), rune_gso from rune-protocol/src/net (:98) and
 # rune_codec + the catalog glob (:112-131) unconditionally, so every sibling's src/ AND include/ must be present
 # (the CMake defaults resolve /build/../<repo> to /<repo>).
 COPY --from=rune-protocol include /rune-protocol/include
 COPY --from=rune-protocol src     /rune-protocol/src
-COPY --from=rune-fr src     /rune-fr/src
-COPY --from=rune-fr include /rune-fr/include
+COPY --from=flight-recorder src     /flight-recorder/src
+COPY --from=flight-recorder include /flight-recorder/include
 COPY --from=rune-codec src     /rune-codec/src
 COPY --from=rune-codec include /rune-codec/include
 COPY --from=rune-crypto src     /rune-crypto/src

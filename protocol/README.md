@@ -27,4 +27,4 @@ Expected: all tests pass; target ≥90% line coverage (100% on pure logic).
 
 ## Design
 
-See [the rune-broker design spec](../rune-broker/docs/specs/2026-09-10-rune-broker-design.md) for protocol and integration details.
+See [the rune-broker design spec](../broker/docs/specs/2026-09-10-rune-broker-design.md) for protocol and integration details.

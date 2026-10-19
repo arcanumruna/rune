@@ -12,8 +12,8 @@
 # `docker exec` into it; it is attached to both cluster networks and addresses the brokers by their
 # `a-rune-N` / `b-rune-N` names.
 #
-# Usage:  bash docker/catalog-e2e.sh   (sibling layout ../rune-protocol ../rune-codec ../rune-crypto
-#         ../rune-fr ../rune-ql ../rune-client-cpp, as docker/transient-failover-e2e.sh)
+# Usage:  bash docker/catalog-e2e.sh   (sibling layout ../protocol ../codec ../crypto
+#         ../flight-recorder ../ql ../client-cpp, as docker/transient-failover-e2e.sh)
 #
 # House style: bounded waits (never a fixed sleep as a gate), trap teardown, every failure names its step.
 # Environment:
@@ -33,7 +33,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "${SCRIPT_DIR}/lib/auth.sh"
 BROKER_REPO="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PROJECTS="$(cd "${BROKER_REPO}/.." && pwd)"
-CLIENT_REPO="${PROJECTS}/rune-client-cpp"
+# flight-recorder is its own repo, checked out next to the monorepo (compose additional_contexts read FLIGHT_RECORDER_DIR).
+export FLIGHT_RECORDER_DIR="${FLIGHT_RECORDER_DIR:-${PROJECTS}/../flight-recorder}"
+CLIENT_REPO="${PROJECTS}/client-cpp"
 COMPOSE_FILE="${BROKER_REPO}/docker/docker-compose.catalog.yml"
 WORK_DIR="${E2E_WORK_DIR:-${BROKER_REPO}/.catalog-e2e-work}"
 
@@ -70,7 +72,8 @@ tx()           { docker exec "${TOOLS}" "$@"; }        # a command in the client
 txt()          { local t="$1"; shift; docker exec "${TOOLS}" timeout "${t}" "$@"; }
 rune_ql()      { txt "${OP_TIMEOUT_S}" rune ql "$@"; }
 
-for d in rune-protocol rune-codec rune-crypto rune-fr rune-ql rune-client-cpp; do
+[ -d "${FLIGHT_RECORDER_DIR}" ] || fail "missing flight-recorder checkout (set FLIGHT_RECORDER_DIR)"
+for d in protocol codec crypto ql client-cpp; do
     [ -d "${PROJECTS}/${d}" ] || fail "missing ../${d}"
 done
 [ -f "${COMPOSE_FILE}" ] || fail "missing ${COMPOSE_FILE}"

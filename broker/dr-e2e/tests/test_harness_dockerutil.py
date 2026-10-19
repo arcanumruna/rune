@@ -174,7 +174,7 @@ def test_without_an_image_override_the_harness_builds_it_with_all_five_contexts(
     d.ensure_dr_client_image()
     (build,) = r.builds()
     sib = os.path.dirname(d.CLIENT_REPO)
-    for name in ("rune-protocol", "rune-fr", "rune-codec", "rune-ql", "rune-crypto"):
+    for name in ("rune-protocol", "flight-recorder", "rune-codec", "rune-ql", "rune-crypto"):
         i = build.index(f"{name}={os.path.join(sib, name)}")
         assert build[i - 1] == "--build-context"
     assert ["--build-arg", f"RUNE_CLIENT_SHA={_SHA}"] == build[build.index("--build-arg"):build.index("--build-arg") + 2]

@@ -19,7 +19,7 @@
 // PUBLIC interface (it includes <Aeron.h>) — pulling rune/crypto/Aead.h in
 // here means every downstream target that compiles a TU including
 // SessionTable.h now needs rune_crypto's include dir transitively.  rune_crypto
-// + OpenSSL must be linked PUBLIC on rune_gateway (mirroring rune_fr / the
+// + OpenSSL must be linked PUBLIC on rune_gateway (mirroring flight_recorder / the
 // client's Task-5 fix-round-1), not PRIVATE as the brief's literal text says.
 //
 // CryptoState itself (Task 8) lives in its own aeron-free header —

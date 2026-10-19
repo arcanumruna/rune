@@ -10,7 +10,7 @@
 #include <rune/node/StorageIdentity.h>
 #include <rune/node/ThreadAffinity.h>
 
-#include <rune_fr/FlightRecorder.h>
+#include <flight_recorder/FlightRecorder.h>
 
 #include <spdlog/spdlog.h>
 
@@ -72,34 +72,34 @@ static void drainControlEvents(rune::node::ControlEventRing& events, ControlStat
 }
 
 // ---------------------------------------------------------------------------
-// rune-fr — flight recorder init + report helpers.
+// flight-recorder — flight recorder init + report helpers.
 // ---------------------------------------------------------------------------
-// Per-thread ring size: env RUNE_FR_RING_BYTES, default 128 MiB/thread (~5.6M
+// Per-thread ring size: env FLIGHT_RECORDER_RING_BYTES, default 128 MiB/thread (~5.6M
 // 24-byte records) so a full bench run is captured without drop-on-full. MUST be
 // set BEFORE any broker thread registers a ring (i.e. before node.start()).
 static void frConfigure() {
     std::uint64_t ringBytes = 128ull * 1024 * 1024;
-    if (const char* rb = std::getenv("RUNE_FR_RING_BYTES")) {
+    if (const char* rb = std::getenv("FLIGHT_RECORDER_RING_BYTES")) {
         const std::uint64_t v = std::strtoull(rb, nullptr, 10);
         if (v > 0) ringBytes = v;
     }
-    rune_fr::Recorder::instance().configure(static_cast<size_t>(ringBytes));
+    flight_recorder::Recorder::instance().configure(static_cast<size_t>(ringBytes));
 
-    if (std::getenv("RUNE_FR_ENABLE")) {
-        rune_fr::enable();
-        spdlog::info("rune-fr: flight recording ENABLED (ring {} MiB/thread)",
+    if (std::getenv("FLIGHT_RECORDER_ENABLE")) {
+        flight_recorder::enable();
+        spdlog::info("flight-recorder: flight recording ENABLED (ring {} MiB/thread)",
                      ringBytes / (1024 * 1024));
     }
 }
 
 // Drain all thread rings and write histogram + Chrome-trace + raw tape to
-// RUNE_FR_OUT (default cwd). Off the hot path (shutdown / SIGUSR1).
+// FLIGHT_RECORDER_OUT (default cwd). Off the hot path (shutdown / SIGUSR1).
 static void frReport(const std::string& tag) {
-    if (!rune_fr::isEnabled()) return;
-    rune_fr::Recorder::instance().drain();
-    const char* out = std::getenv("RUNE_FR_OUT");
+    if (!flight_recorder::isEnabled()) return;
+    flight_recorder::Recorder::instance().drain();
+    const char* out = std::getenv("FLIGHT_RECORDER_OUT");
     const std::string dir = (out && *out) ? out : ".";
-    // Disambiguate per broker so co-located cluster nodes sharing one RUNE_FR_OUT
+    // Disambiguate per broker so co-located cluster nodes sharing one FLIGHT_RECORDER_OUT
     // dir do not overwrite each other's reports: suffix with node id + pid.
     const char* nid = std::getenv("RUNE_NODE_ID");
     const std::string sfx = "-n" + std::string(nid ? nid : "x") +
@@ -107,11 +107,11 @@ static void frReport(const std::string& tag) {
                             "-" + tag;
     {
         std::ofstream f(dir + "/fr-hist" + sfx + ".txt");
-        if (f) rune_fr::dumpHistograms(f);
+        if (f) flight_recorder::dumpHistograms(f);
     }
-    rune_fr::exportChromeTrace(dir + "/fr-trace" + sfx + ".json");
-    rune_fr::writeTape(dir + "/fr-tape" + sfx + ".bin");
-    spdlog::info("rune-fr: report written to {} (suffix={})", dir, sfx);
+    flight_recorder::exportChromeTrace(dir + "/fr-trace" + sfx + ".json");
+    flight_recorder::writeTape(dir + "/fr-tape" + sfx + ".bin");
+    spdlog::info("flight-recorder: report written to {} (suffix={})", dir, sfx);
 }
 
 // ---------------------------------------------------------------------------

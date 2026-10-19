@@ -46,7 +46,7 @@ dr-e2e/
 * Docker (Docker Desktop on macOS is fine — netem proven, see caveat below).
 * The broker + client images built once:
   * `rune-broker-rune-{1,2,3}` — `cd rune-broker && docker compose -f docker/docker-compose.yml build`
-  * `rune-dr-client:<client sha>` — built by the harness ONCE per session, before any test (`harness.images.prepare_all`, from `pytest_sessionstart`: `docker build -f docker/Dockerfile.dr` with the five build contexts rune-protocol, rune-fr, rune-codec, rune-ql, rune-crypto). A prebuilt `DR_CLIENT_IMAGE` must carry a matching `rune.client.sha` label (`--build-arg RUNE_CLIENT_SHA=<client HEAD>`) or the harness refuses it; `DR_ALLOW_STALE_CLIENT_IMAGE=1` accepts a mismatch explicitly.
+  * `rune-dr-client:<client sha>` — built by the harness ONCE per session, before any test (`harness.images.prepare_all`, from `pytest_sessionstart`: `docker build -f docker/Dockerfile.dr` with the five build contexts rune-protocol, flight-recorder, rune-codec, rune-ql, rune-crypto). A prebuilt `DR_CLIENT_IMAGE` must carry a matching `rune.client.sha` label (`--build-arg RUNE_CLIENT_SHA=<client HEAD>`) or the harness refuses it; `DR_ALLOW_STALE_CLIENT_IMAGE=1` accepts a mismatch explicitly.
   * the rune CLI image (`rune-ql-probe:<client sha>`, topic DDL), `rune-netem:<hash>` and `alpine:latest` — prepared in the same session step.
   * The broker image `rune-broker-node:<RUNE_IMAGE_TAG or broker HEAD>` must exist (or `DR_E2E_BUILD=1` builds it in that step).
   A failed build/check ends the session before the first test (exit 3) - never inside a test's timeout.

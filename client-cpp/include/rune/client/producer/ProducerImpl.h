@@ -50,7 +50,7 @@
 #include <rune/client/detail/FlatIndexMap.h>
 #include <rune/client/producer/InFlightRing.h>
 #include <rune/client/producer/ProduceFrameBuilder.h>
-#include <rune_fr/FlightRecorder.h>
+#include <flight_recorder/FlightRecorder.h>
 #include <rune/client/detail/M2ORingBuffer.h> // internal MPSC ring (controlledRead/ABORT, templated read)
 
 #include <thread>
@@ -1316,8 +1316,8 @@ private:
     uint64_t framesSent_  = 0; // total Aeron frames offered to transport
     // FR (fr-hop-instrumentation): coalescers for conditions retried every duty
     // cycle (empty when FR is compiled out).
-    [[no_unique_address]] rune_fr::Throttle frOfferRefused_{};
-    [[no_unique_address]] rune_fr::Throttle frWindowFull_{};
+    [[no_unique_address]] flight_recorder::Throttle frOfferRefused_{};
+    [[no_unique_address]] flight_recorder::Throttle frWindowFull_{};
     uint64_t recordsSent_ = 0; // total records drained from the ring
     uint64_t flushVisits_ = 0; // F12: partitions examined by flushBatches (debugFlushVisits)
 
