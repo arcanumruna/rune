@@ -211,9 +211,9 @@ struct WorkerOp {
     std::string_view egressChannel;
     // Authentication Task 13 (D30): SessionAnnounce - the broker is NOT enforcing authentication (dev / in-process
     // mode), so the session may write everywhere.  Wire: bit kOpFlagGrantAll of the `deferAck` flag byte.  The
-    // default is true so every rig that predates authentication keeps working; the gateway (the only production
-    // announcer) always passes `authMode != Enabled` explicitly.
-    bool             grantAll = true;
+    // default is FALSE (default deny, Task 14 ruling: the old default-true was fail-open for any announcer that forgot
+    // to say); dev / in-process announcers (the gateway's setAuthMode, test rigs) set it explicitly.
+    bool             grantAll = false;   // default DENY
     // SessionPermissions: sessionId = the session, nextOffset = the chunk's first word index, hwBound = total words,
     // correlationId = the shipped epoch, isolation = kPermFlag* (last chunk / grantAll), tail = the chunk's words
     // (TailKind PERMISSION_BITS, little-endian u64).  A VIEW valid only for the synchronous tryEnqueueOp call.

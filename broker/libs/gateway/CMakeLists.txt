@@ -14,6 +14,7 @@ add_library(rune_gateway
     src/SessionAuth.cpp
     src/PermissionTable.cpp
     src/Authorizer.cpp
+    src/LiveSecurityChanges.cpp
     src/ScramServer.cpp)
 
 target_include_directories(rune_gateway PUBLIC
@@ -94,6 +95,11 @@ if(BUILD_TESTING)
     add_executable(rune_gateway_permission_table_tests tests/PermissionTableTest.cpp)
     target_link_libraries(rune_gateway_permission_table_tests PRIVATE rune_gateway GTest::gtest_main)
     gtest_discover_tests(rune_gateway_permission_table_tests)
+
+    # Authentication Task 14: what a permission refresh ends for one session - pure, no Aeron.
+    add_executable(rune_gateway_live_security_changes_tests tests/LiveSecurityChangesTest.cpp)
+    target_link_libraries(rune_gateway_live_security_changes_tests PRIVATE rune_gateway GTest::gtest_main)
+    gtest_discover_tests(rune_gateway_live_security_changes_tests)
 
     # Authentication Task 9: the control thread's SecurityView (D29).
     add_executable(rune_gateway_security_view_tests

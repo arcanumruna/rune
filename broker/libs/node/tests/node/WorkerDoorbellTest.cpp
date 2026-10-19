@@ -96,7 +96,7 @@ TEST(WorkerDoorbell, OpAndSessionRingsRingTheParkedWorker) {
     EXPECT_TRUE(bell.armForPark()) << "drained: park";
 
     WorkerOp announce;
-    announce.type = WorkerOp::Type::SessionAnnounce;
+    announce.type = WorkerOp::Type::SessionAnnounce; announce.grantAll = true;
     announce.sessionId = 7;
     ASSERT_TRUE(w.tryEnqueueOp(std::move(announce)));
     EXPECT_TRUE(bell.firedForTest()) << "a session lifecycle op wakes the parked worker";

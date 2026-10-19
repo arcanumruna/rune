@@ -38,6 +38,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace rune::gateway {
 
@@ -162,6 +163,11 @@ struct Session {
         }
     };
     std::unordered_map<SubKey, int64_t, SubKeyHash> subIdByKey;
+    // Authentication Task 14: the correlation ids of this session's `__catalog` / `__security` Subscribes (the admin
+    // thread owns the subscriptions; a live permission loss answers ErrorResponse{NotAuthorized} on each of these).
+    // Cold, bounded (kMaxReadCorrs, oldest dropped); a stale entry (already unsubscribed) only costs one ignored frame.
+    static constexpr std::size_t kMaxReadCorrs = 64;
+    std::vector<int64_t> catalogReadCorrs, securityReadCorrs;
 
     // client<->broker TLS/AEAD (Task 7): this session's crypto state.
     // `crypto.encrypted` is false (default CryptoState) for a plaintext

@@ -63,6 +63,7 @@
 #include <rune/gateway/SecurityView.h>
 #include <rune/gateway/SessionAuth.h>
 #include <rune/gateway/Authorizer.h>
+#include <rune/gateway/LiveSecurityChanges.h>
 #include <rune/gateway/ObjectIndex.h>
 #include <rune/gateway/LoginThrottle.h>
 #include <rune/gateway/ScramServer.h>
@@ -420,10 +421,18 @@ public:
     [[nodiscard]] uint64_t loginsOk() const noexcept { return loginsOk_; }
     [[nodiscard]] uint64_t loginsFailed() const noexcept { return loginsFailed_; }
     [[nodiscard]] uint64_t loginsRateLimited() const noexcept { return loginsRateLimited_; }
-    /// The SecurityView applied `applied` (BrokerNode calls this right after the view did): the one transition that
-    /// lands with the login - a `SET PASSWORD` of a user lifts the must-change-password state of that user's sessions.
-    /// (The general refresh / revoke on every change is Task 14.)
-    void onSecurityApplied(const rune::security::Applied& applied);
+    /// The SecurityView applied the event at `offset` (BrokerNode calls this right after the view did) - authentication
+    /// Task 14, D25: Refresh -> every affected user's authenticated session recompiles its permission table, ends what
+    /// lost READ (explicitly, NotAuthorized), ships its WRITE bits and a lifted must-change-password session becomes
+    /// authenticated; Revoke -> every session of the affected users completes SessionRevoked and closes.  Control thread.
+    void onSecurityApplied(int64_t offset, const rune::security::Applied& applied);
+    /// The view halted (the admin applier's kA2cSecurityHalted, or the mirror's own apply error): fail closed - every
+    /// authenticated / must-change-password session is revoked (D28).  Idempotent.
+    void onSecurityHalted(int64_t offset);
+    /// The newest security event offset whose refresh EVERY worker has accepted (D24 answer gate); -1 = none yet.
+    [[nodiscard]] int64_t securityEnforcedOffset() const noexcept { return securityEnforcedOffset_; }
+    /// Counter 1'000'232: sessions revoked (disabled / dropped / TERMINATE SESSIONS / security halt).
+    [[nodiscard]] uint64_t sessionsRevoked() const noexcept { return sessionsRevoked_; }
     // ── authentication Task 12: per-session permission tables and the enforcement of every request type ──
     /// Boot (startup thread, before any thread runs): the catalog's live topics / views, from the replay.
     void setBootObjects(rune::gateway::ObjectIndex objects) { objectIndex_ = std::move(objects); }
@@ -2149,11 +2158,13 @@ private:
     uint64_t catalogSubscribesForwarded_ = 0;
     void forwardCatalogUnsubscribe_(int64_t sid, int64_t subscriptionId);
     int  flushPendingCatalogUnsubs_();
+    [[nodiscard]] bool submitCatalogOrSecurityUnsub_(int64_t sid, int64_t subscriptionId);
     /// handleSubscribe for topicId == kCatalogTopicId: answered here or forwarded.
     void handleCatalogSubscribe_(Session& session, const rune::protocol::client::Subscribe& msg);
     /// handleSubscribe for topicId == kSecurityTopicId (authentication Task 10): the same contract on the second server.
     void handleSecuritySubscribe_(Session& session, const rune::protocol::client::Subscribe& msg);
     uint64_t securitySubscribesForwarded_ = 0;
+    static void noteReadCorr_(std::vector<int64_t>& corrs, int64_t corr);
     rune::gateway::GatewayAuthMode authMode_ = rune::gateway::GatewayAuthMode::InProcess;
     const rune::gateway::SecurityView* securityView_ = nullptr;   // control thread's own mirror (same thread as the gateway)
     /// The auth state a NEW session starts in (D11): AuthAwaitingFirst{now + authTimeout} when authenticating,
@@ -2201,6 +2212,18 @@ private:
     rune::gateway::LoginThrottle loginThrottle_;
     int64_t  authTimeoutNs_ = 10'000'000'000LL;
     uint64_t loginsOk_ = 0, loginsFailed_ = 0, loginsRateLimited_ = 0;
+    // ── authentication Task 14: live security changes ──
+    uint64_t sessionsRevoked_ = 0;
+    int64_t  securityEnforcedOffset_ = -1;       ///< every event <= this is enforced here (tables refreshed, bitmaps accepted by every worker)
+    int64_t  securityPendingEnforce_ = -1;       ///< applied here, waiting for the permission shipper to drain
+    std::vector<int64_t> liveScratch_;           ///< reused session-id list (capacity persists)
+    /// Recompile one session's table, end what lost READ, ship the WRITE bits.
+    void refreshSession_(int64_t sid);
+    /// Revoke one session: SessionRevoked on every live subscription, then session-level (corr 0) with `reason`, then close.
+    void revokeSession_(int64_t sid, std::string_view reason);
+    void executeLiveActions_(Session& s, const rune::gateway::LiveActions& act);
+    void sendErrorOn_(Session& s, int64_t corr, uint16_t code, std::string_view message);
+    void noteEnforced_(int64_t offset) noexcept;
     int32_t  currentImageSessionId_ = 0;   ///< the Aeron image (publication) session id of the frame being dispatched
     std::vector<int64_t> authReapScratch_; ///< reused by reapAuthDeadlines_ (capacity persists)
     uint64_t authGateRefusals_ = 0;
@@ -2238,7 +2261,7 @@ private:
     // when RUNE_PER_WORKER_INGRESS=true.
     bool perWorkerIngressActive_ = false;
     bool shardMode_ = false;   // Task 13 (spec §3.4); set before the runtime runs
-    rune::node::SessionAnnouncer sessionAnnouncer_;   // Task 13: runtime thread only
+    rune::node::SessionAnnouncer sessionAnnouncer_{/*grantAll=*/true};   // Task 13: runtime thread only; the default mode (InProcess) enforces nothing - setAuthMode(Required) turns it off (Task 14: the announcer itself defaults to DENY)
     // Authentication Task 13 (D30): WRITE bitmaps to every worker; a login's AuthServerFinal{OK} waits for its epoch.
     rune::node::PermissionShipper permissionShipper_;
     uint64_t permEpoch_ = 0;
@@ -2248,6 +2271,7 @@ private:
     uint64_t shipPermissions_(const Session& session);
     /// Release the held AuthServerFinal frames whose epoch every worker has accepted; retry unfinished shipments.
     int servicePermissionShipping_();
+    int servicePermissionShippingWork_();
     // Task 19: sessions whose per-worker crypto-key SessionAnnounce (second
     // wave) didn't fully land on every worker on the first attempt (a ring
     // was momentarily full) — retried each doWork() cycle

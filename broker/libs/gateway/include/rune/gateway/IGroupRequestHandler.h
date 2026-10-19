@@ -69,6 +69,19 @@ struct IGroupRequestHandler {
     // evictSessionMembers: every member on `sessionId` — ONLY for a request
     // whose body is undecodable (its group is unknown).
     virtual void evictSessionMembers(int64_t sessionId, int64_t nowNs) { (void)sessionId; (void)nowNs; }
+
+    // Authentication Task 14: a live permission change took a session's READ on some groups away.  Every member of
+    // `sessionId` whose group `mayRead(ctx, group)` refuses leaves its group (its subscriptions are revoked, the
+    // session mapping dropped) - its next Heartbeat / Commit / Fetch is then answered NotAuthorized by the gateway's
+    // own check.  Returns the number of members removed.  Cold; `mayRead` is a plain function (no allocation).
+    struct GroupReadCheck {
+        bool (*mayRead)(void* ctx, std::string_view groupId) noexcept = nullptr;
+        void* ctx = nullptr;
+    };
+    virtual int removeUnauthorizedMembers(int64_t sessionId, int64_t nowNs, GroupReadCheck check) {
+        (void)sessionId; (void)nowNs; (void)check;
+        return 0;
+    }
 };
 
 } // namespace rune::gateway

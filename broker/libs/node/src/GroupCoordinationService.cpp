@@ -828,6 +828,38 @@ void GroupCoordinationService::evictMember(std::string_view groupId, std::string
     }
 }
 
+int GroupCoordinationService::removeUnauthorizedMembers(int64_t sessionId, int64_t nowNs, GroupReadCheck check)
+{
+    if (check.mayRead == nullptr) return 0;
+    int removed = 0;
+    for (auto& [groupId, coord] : coordinators_) {
+        if (check.mayRead(check.ctx, groupId)) continue;
+        evictScratch_.clear();
+        for (const auto& member : coord.members()) {
+            memberKeyScratch_.clear();
+            memberKeyScratch_.append(groupId);
+            memberKeyScratch_ += ':';
+            memberKeyScratch_.append(member.memberId);
+            const auto it = memberSessionMap_.find(memberKeyScratch_);
+            if (it != memberSessionMap_.end() && it->second == sessionId) evictScratch_.push_back(member.memberId);
+        }
+        if (evictScratch_.empty()) continue;
+        if (gateway_) gateway_->revokeGroupSubscriptions(sessionId);   // as LeaveGroup: before the mapping goes
+        for (const auto& memberId : evictScratch_) {
+            spdlog::warn("GroupCoordinationService: session {} lost READ on group '{}' - member '{}' removed (its next "
+                         "request is answered NotAuthorized)", sessionId, groupId, memberId);
+            coord.leave(memberId, coord.generationId(), nowNs);
+            memberKeyScratch_.clear();
+            memberKeyScratch_.append(groupId);
+            memberKeyScratch_ += ':';
+            memberKeyScratch_.append(memberId);
+            memberSessionMap_.erase(memberKeyScratch_);
+            ++removed;
+        }
+    }
+    return removed;
+}
+
 void GroupCoordinationService::evictSessionMembers(int64_t sessionId, int64_t nowNs)
 {
     for (auto& [groupId, coord] : coordinators_) {

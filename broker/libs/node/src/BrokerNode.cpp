@@ -541,6 +541,8 @@ void BrokerNode::start() {
             kLoginsFailedCounterTypeId, roleKey, kRoleKeyLength, loginsFailedLabel(config_.nodeId));
         loginsRateLimitedCounterRegId_ = aeron_->addCounter(
             kLoginsRateLimitedCounterTypeId, roleKey, kRoleKeyLength, loginsRateLimitedLabel(config_.nodeId));
+        sessionsRevokedCounterRegId_ = aeron_->addCounter(
+            kSessionsRevokedCounterTypeId, roleKey, kRoleKeyLength, sessionsRevokedLabel(config_.nodeId));
         unplaceableCounterRegId_ = aeron_->addCounter(
             kCatalogUnplaceableTopicsCounterTypeId, roleKey, kRoleKeyLength,
             catalogUnplaceableTopicsLabel(config_.nodeId));
@@ -3168,11 +3170,14 @@ void BrokerNode::onSecurityApplied_(const uint8_t* p, std::size_t n) {
     // The mirror applies the SAME event with the SAME library; a gap or an apply error halts it (fail closed -
     // Task 14 turns that into revoked sessions and refused logins).
     if (auto a = securityView_->onApplied(offset, bytes); a) {
-        if (gateway_) gateway_->onSecurityApplied(*a);   // Task 11: a SET PASSWORD frees the user's one-time-password sessions
+        // Task 14 (D25): refresh / end / revoke the affected sessions.  The answer gate releases (D24) once the gateway
+        // reports the event enforced (every table refreshed, every shipped bitmap accepted by every worker).
+        if (gateway_) gateway_->onSecurityApplied(offset, *a);
+        else securityRefreshedOffset_ = offset;
         securityAppliedValue_ = offset;
-        securityRefreshedOffset_ = offset;   // Task 13/14: delayed until the permission refresh reached every worker
     } else {
         securityHaltedValue_ = a.error().offset + 1;
+        failSecurityClosed_(a.error().offset, a.error().detail);
     }
     publishSecurityMetrics_();
 }
@@ -3193,10 +3198,19 @@ void BrokerNode::onSecurityHalted_(const uint8_t* p, std::size_t n) {
     securityView_->onHalted(err);
     securityHaltedValue_ = m.offset + 1;
     publishSecurityMetrics_();
-    spdlog::critical("BrokerNode[{}]: __security apply HALTED at offset {} (expected={:#x} actual={:#x}) - {}; this "
-                     "broker fails closed: authenticated sessions are revoked, logins and security changes refused "
-                     "until an operator intervenes (move dataDir/__security aside and restart)",
-                     config_.nodeId, m.offset, m.expected, m.actual, m.detail);
+    failSecurityClosed_(m.offset, m.detail);
+}
+
+// Authentication Task 14 (D28): a halted `__security` apply FAILS CLOSED.  The held DDL OKs are answered Internal first
+// (they would claim an enforcement this broker can no longer give), then every authenticated session is revoked; new
+// logins are refused by the halted view (AuthServerFinal 44) and security DDL answers Internal.
+void BrokerNode::failSecurityClosed_(int64_t offset, const std::string& describe) {
+    spdlog::critical("BrokerNode[{}]: SECURITY APPLY HALTED at offset {}: {}; this broker refuses logins until repaired "
+                     "(docs/SECURITY.md#halted) - authenticated sessions are revoked, security changes refused "
+                     "(move dataDir/__security aside and restart)",
+                     config_.nodeId, offset, describe);
+    if (!securityGate_.empty()) (void)pumpSecurityGate_();
+    if (gateway_) gateway_->onSecurityHalted(offset);
 }
 
 bool BrokerNode::securityMetricsPending_() const noexcept {
@@ -3206,9 +3220,11 @@ bool BrokerNode::securityMetricsPending_() const noexcept {
            (!loginsOkCounter_ && loginsOkCounterRegId_ >= 0) ||
            (!loginsFailedCounter_ && loginsFailedCounterRegId_ >= 0) ||
            (!loginsRateLimitedCounter_ && loginsRateLimitedCounterRegId_ >= 0) ||
+           (!sessionsRevokedCounter_ && sessionsRevokedCounterRegId_ >= 0) ||
            (gateway_ != nullptr && (gateway_->loginsOk() != publishedLoginsOk_ ||
                                     gateway_->loginsFailed() != publishedLoginsFailed_ ||
-                                    gateway_->loginsRateLimited() != publishedLoginsRateLimited_));
+                                    gateway_->loginsRateLimited() != publishedLoginsRateLimited_ ||
+                                    gateway_->sessionsRevoked() != publishedSessionsRevoked_));
 }
 
 void BrokerNode::publishSecurityMetrics_() noexcept {
@@ -3224,14 +3240,17 @@ void BrokerNode::publishSecurityMetrics_() noexcept {
     resolve(loginsOkCounter_, loginsOkCounterRegId_);
     resolve(loginsFailedCounter_, loginsFailedCounterRegId_);
     resolve(loginsRateLimitedCounter_, loginsRateLimitedCounterRegId_);
+    resolve(sessionsRevokedCounter_, sessionsRevokedCounterRegId_);
     if (gateway_ != nullptr) {   // control thread: the gateway's tallies are its own
         publishedLoginsOk_ = gateway_->loginsOk();
         publishedLoginsFailed_ = gateway_->loginsFailed();
         publishedLoginsRateLimited_ = gateway_->loginsRateLimited();
+        publishedSessionsRevoked_ = gateway_->sessionsRevoked();
     }
     if (loginsOkCounter_) loginsOkCounter_->set(static_cast<std::int64_t>(publishedLoginsOk_));
     if (loginsFailedCounter_) loginsFailedCounter_->set(static_cast<std::int64_t>(publishedLoginsFailed_));
     if (loginsRateLimitedCounter_) loginsRateLimitedCounter_->set(static_cast<std::int64_t>(publishedLoginsRateLimited_));
+    if (sessionsRevokedCounter_) sessionsRevokedCounter_->set(static_cast<std::int64_t>(publishedSessionsRevoked_));
     if (securityHaltedCounter_) securityHaltedCounter_->set(securityHaltedValue_);
     if (securityAppliedCounter_) securityAppliedCounter_->set(securityAppliedValue_);
     // 1'000'228: 0 = enabled (an in-process config publishes 0 too), 1 = dev-disabled.
@@ -4237,6 +4256,7 @@ void BrokerNode::stop() {
     loginsOkCounter_.reset();
     loginsFailedCounter_.reset();
     loginsRateLimitedCounter_.reset();
+    sessionsRevokedCounter_.reset();
     for (auto& c : provCounters_) c.reset();   // re-review N4: same rule (the provisioner is stopped)
 
     // 4. Close the Aeron client (joins the C++ conductor thread).
@@ -4679,7 +4699,10 @@ int BrokerNode::pumpSecurityGate_() {
     if (securityView_->halted())
         return securityGate_.failAll("security log halted on this broker; the change may have been applied elsewhere - retry "
                                      "with the same requestId on another broker", send);
-    return securityGate_.release(std::min(securityView_->appliedOffset(), securityRefreshedOffset_), send);
+    // Task 14: the gateway reports what it enforces (tables refreshed, bitmaps accepted by every worker); the boot / no-gateway
+    // baseline is securityRefreshedOffset_.
+    const int64_t enforced = gateway_ ? std::max(securityRefreshedOffset_, gateway_->securityEnforcedOffset()) : securityRefreshedOffset_;
+    return securityGate_.release(std::min(securityView_->appliedOffset(), enforced), send);
 }
 
 int AdminControlPlane::doWork(int64_t nowNs) {

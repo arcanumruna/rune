@@ -4905,6 +4905,13 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
 // the admin thread sends the SubscribeResponse, the backlog up to this broker's
 // HW, the caught-up marker and the live events.
 // ---------------------------------------------------------------------------
+void ClientGateway::noteReadCorr_(std::vector<int64_t>& corrs, int64_t corr)
+{
+    for (const int64_t c : corrs) if (c == corr) return;
+    if (corrs.size() >= Session::kMaxReadCorrs) corrs.erase(corrs.begin());
+    corrs.push_back(corr);
+}
+
 void ClientGateway::handleCatalogSubscribe_(Session& session, const pc::Subscribe& msg)
 {
     auto answer = [&](pc::ErrorCode ec) {
@@ -4941,6 +4948,7 @@ void ClientGateway::handleCatalogSubscribe_(Session& session, const pc::Subscrib
         sendAnswer_(session, scratch_.data(), n);
         return;
     }
+    noteReadCorr_(session.catalogReadCorrs, msg.correlationId);
     ++catalogSubscribesForwarded_;
 }
 
@@ -4982,7 +4990,17 @@ void ClientGateway::handleSecuritySubscribe_(Session& session, const pc::Subscri
         sendAnswer_(session, scratch_.data(), n);
         return;
     }
+    noteReadCorr_(session.securityReadCorrs, msg.correlationId);
     ++securitySubscribesForwarded_;
+}
+
+// The admin request an Unsubscribe id names: a `__security` subscription id (or kEndSecurityReadsOnly) the second read
+// server, anything else (-1 = a session close, which the admin applies to both; kEndCatalogReadsOnly) the catalog route.
+bool ClientGateway::submitCatalogOrSecurityUnsub_(int64_t sid, int64_t subscriptionId)
+{
+    if (subscriptionId == rune::gateway::kEndSecurityReadsOnly) return adminSink_->submitSecurityUnsubscribe(sid, -1);
+    if (rune::gateway::isSecuritySubscriptionId(subscriptionId)) return adminSink_->submitSecurityUnsubscribe(sid, subscriptionId);
+    return adminSink_->submitCatalogUnsubscribe(sid, subscriptionId);
 }
 
 void ClientGateway::forwardCatalogUnsubscribe_(int64_t sid, int64_t subscriptionId)
@@ -4990,10 +5008,7 @@ void ClientGateway::forwardCatalogUnsubscribe_(int64_t sid, int64_t subscription
     if (adminSink_ == nullptr) return;
     // FIFO behind any already waiting (a close after a single unsubscribe stays after it).
     // A `__security` subscription id names the second read server (its own request-ring message).
-    const bool security = subscriptionId != -1 && rune::gateway::isSecuritySubscriptionId(subscriptionId);
-    if (pendingCatalogUnsubs_.empty() &&
-        (security ? adminSink_->submitSecurityUnsubscribe(sid, subscriptionId)
-                  : adminSink_->submitCatalogUnsubscribe(sid, subscriptionId))) return;
+    if (pendingCatalogUnsubs_.empty() && submitCatalogOrSecurityUnsub_(sid, subscriptionId)) return;
     // M3: a close supersedes the session's waiting single unsubscribes; duplicates coalesce.
     if (subscriptionId == -1)
         std::erase_if(pendingCatalogUnsubs_, [sid](const PendingCatalogUnsubscribe& p) { return p.sessionId == sid; });
@@ -5030,11 +5045,7 @@ int ClientGateway::flushPendingCatalogUnsubs_()
 {
     std::size_t sent = 0;
     while (sent < pendingCatalogUnsubs_.size() &&
-           (rune::gateway::isSecuritySubscriptionId(pendingCatalogUnsubs_[sent].subscriptionId)
-                ? adminSink_->submitSecurityUnsubscribe(pendingCatalogUnsubs_[sent].sessionId,
-                                                        pendingCatalogUnsubs_[sent].subscriptionId)
-                : adminSink_->submitCatalogUnsubscribe(pendingCatalogUnsubs_[sent].sessionId,
-                                                       pendingCatalogUnsubs_[sent].subscriptionId)))
+           submitCatalogOrSecurityUnsub_(pendingCatalogUnsubs_[sent].sessionId, pendingCatalogUnsubs_[sent].subscriptionId))
         ++sent;
     if (sent != 0)
         pendingCatalogUnsubs_.erase(pendingCatalogUnsubs_.begin(),
@@ -7988,7 +7999,7 @@ uint64_t ClientGateway::shipPermissions_(const Session& session)
     return epoch;
 }
 
-int ClientGateway::servicePermissionShipping_()
+int ClientGateway::servicePermissionShippingWork_()
 {
     int work = 0;
     if (!workerPool_ || !shardMode_) return 0;
@@ -8002,6 +8013,17 @@ int ClientGateway::servicePermissionShipping_()
     }
     return work;
 }
+
+int ClientGateway::servicePermissionShipping_()
+{
+    const int work = servicePermissionShippingWork_();
+    if (securityPendingEnforce_ >= 0 && permissionShipper_.pendingUpdates() == 0) {   // Task 14: the D24 gate may release
+        securityEnforcedOffset_ = std::max(securityEnforcedOffset_, securityPendingEnforce_);
+        securityPendingEnforce_ = -1;
+    }
+    return work;
+}
+
 
 void ClientGateway::reapAuthDeadlines_(int64_t nowNs)
 {
@@ -8028,18 +8050,166 @@ void ClientGateway::reapAuthDeadlines_(int64_t nowNs)
     }
 }
 
-void ClientGateway::onSecurityApplied(const rune::security::Applied& applied)
+// ---------------------------------------------------------------------------
+// Authentication Task 14 (spec §6, D24-D26, D28): live security changes.  Control thread; cold (one security event).
+// ---------------------------------------------------------------------------
+void ClientGateway::noteEnforced_(int64_t offset) noexcept
+{
+    // Enforced = every table refreshed AND every shipped bitmap accepted by every worker; until the shipper drains the
+    // event waits (servicePermissionShipping_ promotes it).
+    if (permissionShipper_.pendingUpdates() == 0) {
+        securityEnforcedOffset_ = std::max(securityEnforcedOffset_, offset);
+        securityPendingEnforce_ = -1;
+    } else {
+        securityPendingEnforce_ = std::max(securityPendingEnforce_, offset);
+    }
+}
+
+void ClientGateway::sendErrorOn_(Session& s, int64_t corr, uint16_t code, std::string_view message)
+{
+    pc::ErrorResponse er;
+    er.sessionId     = s.sessionId;
+    er.correlationId = corr;
+    er.code          = static_cast<int16_t>(code);
+    er.message       = message.substr(0, 240);
+    sendAnswer_(s, scratch_.data(), er.encode(scratch_.data()));
+}
+
+void ClientGateway::onSecurityApplied(int64_t offset, const rune::security::Applied& applied)
 {
     using namespace rune::gateway;
-    if (applied.kind != rune::security::EventKind::AlterUser || securityView_ == nullptr) return;
-    const rune::security::UserObject* user = securityView_->state().userById(applied.objectId);
-    if (user == nullptr || user->mustChangePassword) return;   // not (yet) a SET PASSWORD of this user
-    sessions_.forEach([&](Session& s) {
-        if (const auto* pcr = std::get_if<AuthPasswordChangeRequired>(&s.auth); pcr != nullptr && pcr->userId == applied.objectId) {
-            s.auth = AuthAuthenticated{pcr->userId, pcr->user, compilePerms_(pcr->userId)};
-            (void)shipPermissions_(s);   // authentication Task 13: the lifted session's grants reach the workers
+    if (securityView_ == nullptr || securityView_->halted()) return;
+    if (applied.effect != rune::security::SessionEffect::None && !applied.affectedUsers.empty()) {
+        liveScratch_.clear();
+        sessions_.forEach([&](Session& s) {
+            uint64_t uid = 0;
+            if (const auto* a = std::get_if<AuthAuthenticated>(&s.auth)) uid = a->userId;
+            else if (const auto* p = std::get_if<AuthPasswordChangeRequired>(&s.auth)) uid = p->userId;
+            else return;
+            if (std::binary_search(applied.affectedUsers.begin(), applied.affectedUsers.end(), uid)) liveScratch_.push_back(s.sessionId);
+        });
+        if (applied.effect == rune::security::SessionEffect::Refresh) {
+            for (const int64_t sid : liveScratch_) refreshSession_(sid);
+        } else {
+            const char* reason = "password changed (TERMINATE SESSIONS)";
+            if (applied.kind == rune::security::EventKind::DropUser) reason = "user dropped";
+            else if (const auto* u = securityView_->state().userById(applied.objectId); u != nullptr && !u->enabled) reason = "user disabled";
+            for (const int64_t sid : liveScratch_) revokeSession_(sid, reason);
         }
+    }
+    noteEnforced_(offset);
+}
+
+void ClientGateway::refreshSession_(int64_t sid)
+{
+    using namespace rune::gateway;
+    Session* s = sessions_.find(sid);
+    if (s == nullptr) return;
+    if (const auto* pcr = std::get_if<AuthPasswordChangeRequired>(&s->auth)) {
+        // The Task 11 transition, through this one path: a SET PASSWORD cleared the user's must-change flag.
+        const rune::security::UserObject* user = securityView_->state().userById(pcr->userId);
+        if (user == nullptr || user->mustChangePassword) return;
+        s->auth = AuthAuthenticated{pcr->userId, pcr->user, compilePerms_(pcr->userId)};
+        (void)shipPermissions_(*s);
+        return;
+    }
+    auto* a = std::get_if<AuthAuthenticated>(&s->auth);
+    if (a == nullptr) return;
+    PermissionTable fresh = compilePerms_(a->userId);
+    const LiveActions actions = refreshActions(a->perms, fresh, *s, objectIndex_);
+    const bool writeChanged = a->perms.isAllowAll() != fresh.isAllowAll() ||
+                              !std::equal(a->perms.writeBits().begin(), a->perms.writeBits().end(),
+                                          fresh.writeBits().begin(), fresh.writeBits().end());
+    a->perms = std::move(fresh);
+    if (writeChanged) (void)shipPermissions_(*s);   // a revoked WRITE fails the next produce on both paths
+    if (!actions.empty()) executeLiveActions_(*s, actions);
+}
+
+void ClientGateway::executeLiveActions_(Session& s, const rune::gateway::LiveActions& act)
+{
+    using namespace rune::gateway;
+    const PermissionTable& perms = permsOf_(s);
+    for (const EndSubscription& e : act.ends) {
+        // Unsubscribe to the owning worker (ordered before any later push on its ring), then forget it here: the gateway
+        // drops a racing push of an ended subscription id.
+        if (perWorkerEgressActive_ && workerPool_) forwardUnsubscribeToWorker_(e.subscriptionId, e.topicId, e.partition);
+        s.subIdByKey.erase(Session::SubKey{e.correlationId, e.topicId, e.partition});
+        subscriptions_.erase(e.subscriptionId);
+        const auto d = authorizeTopicId(perms, e.topicId, rune::security::Operation::Read, objectIndex_);
+        sendErrorOn_(s, e.correlationId, e.code, d ? std::string_view(d->detail) : std::string_view("not authorized"));
+        ++notAuthorizedAnswers_;
+    }
+    if (act.endCatalogReads) {
+        forwardCatalogUnsubscribe_(s.sessionId, rune::gateway::kEndCatalogReadsOnly);
+        const auto d = authorizeCluster(perms, rune::security::Operation::Describe);
+        for (const int64_t corr : s.catalogReadCorrs)
+            sendErrorOn_(s, corr, static_cast<uint16_t>(pc::ErrorCode::NotAuthorized), d ? std::string_view(d->detail) : std::string_view("not authorized"));
+        s.catalogReadCorrs.clear();
+    }
+    if (act.endSecurityReads) {
+        forwardCatalogUnsubscribe_(s.sessionId, rune::gateway::kEndSecurityReadsOnly);
+        const auto d = authorizeCluster(perms, rune::security::Operation::Admin);
+        for (const int64_t corr : s.securityReadCorrs)
+            sendErrorOn_(s, corr, static_cast<uint16_t>(pc::ErrorCode::NotAuthorized), d ? std::string_view(d->detail) : std::string_view("not authorized"));
+        s.securityReadCorrs.clear();
+    }
+    // Group members: a lost group READ removes the member (its next Heartbeat / Commit / Fetch answers 45); a group
+    // partition subscription whose TOPIC lost READ removes the session's members too (the rejoin is then refused by the
+    // join check) - a consumer must not keep receiving a topic it may no longer read.
+    bool groupTopicLost = false;
+    if (const auto it = groupMemberSubs_.find(s.sessionId); it != groupMemberSubs_.end())
+        for (const int64_t subId : it->second)
+            if (const auto sub = subscriptions_.find(subId);
+                sub != subscriptions_.end() && sub->second.topicId >= 0 &&
+                !perms.allows(sub->second.topicId, rune::security::opBit(rune::security::Operation::Read)))
+                groupTopicLost = true;
+    if (groupService_ != nullptr && (act.endGroups || groupTopicLost)) {
+        if (groupTopicLost) {
+            groupService_->evictSessionMembers(s.sessionId, nowNs_);
+        } else {
+            const PermissionTable* table = &perms;
+            groupService_->removeUnauthorizedMembers(
+                s.sessionId, nowNs_,
+                IGroupRequestHandler::GroupReadCheck{
+                    [](void* ctx, std::string_view group) noexcept {
+                        return static_cast<const PermissionTable*>(ctx)->allowsName(
+                            rune::security::ResourceType::Group, group, rune::security::opBit(rune::security::Operation::Read));
+                    },
+                    const_cast<PermissionTable*>(table)});
+        }
+    }
+}
+
+void ClientGateway::revokeSession_(int64_t sid, std::string_view reason)
+{
+    using namespace rune::gateway;
+    Session* s = sessions_.find(sid);
+    if (s == nullptr) return;
+    std::string user = "<unknown>";
+    if (const auto* a = std::get_if<AuthAuthenticated>(&s->auth)) user = a->user;
+    else if (const auto* p = std::get_if<AuthPasswordChangeRequired>(&s->auth)) user = p->user;
+    ++sessionsRevoked_;
+    spdlog::warn("auth: session {} of user {} revoked: {}", sid, user, reason);
+    const auto code = static_cast<uint16_t>(pc::ErrorCode::SessionRevoked);
+    // Each live subscription (and admin-log read) completes SessionRevoked on its correlation id ...
+    for (const auto& [key, subId] : s->subIdByKey) { (void)subId; sendErrorOn_(*s, key.correlationId, code, reason); }
+    for (const int64_t corr : s->catalogReadCorrs) sendErrorOn_(*s, corr, code, reason);
+    for (const int64_t corr : s->securityReadCorrs) sendErrorOn_(*s, corr, code, reason);
+    // ... then the session-level frame (corr 0): every other in-flight request of the session completes with it.
+    sendErrorOn_(*s, 0, code, reason);
+    (void)closeSession_(sid);
+}
+
+void ClientGateway::onSecurityHalted(int64_t offset)
+{
+    using namespace rune::gateway;
+    liveScratch_.clear();
+    sessions_.forEach([&](Session& s) {
+        if (std::holds_alternative<AuthAuthenticated>(s.auth) || std::holds_alternative<AuthPasswordChangeRequired>(s.auth))
+            liveScratch_.push_back(s.sessionId);
     });
+    for (const int64_t sid : liveScratch_) revokeSession_(sid, "security log halted on this broker");
+    (void)offset;
 }
 
 bool ClientGateway::resumeAuthenticated_(const pc::ConnectRequest& req)

@@ -69,6 +69,11 @@ inline constexpr int64_t kSecuritySubscriptionIdBit = int64_t{1} << 61;
     return isCatalogSubscriptionId(subscriptionId) && (subscriptionId & kSecuritySubscriptionIdBit) != 0;
 }
 
+/// Authentication Task 14: a live permission refresh ends ONE kind of admin-log read of a session (the session stays).
+/// Pseudo subscription ids of an Unsubscribe: -1 (session close) ends both servers' reads, these end one server's.
+inline constexpr int64_t kEndCatalogReadsOnly  = -2;   ///< every `__catalog` read of the session
+inline constexpr int64_t kEndSecurityReadsOnly = -3;   ///< every `__security` read of the session
+
 struct IAdminRequestSink {
     virtual ~IAdminRequestSink() = default;
 

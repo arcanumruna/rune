@@ -2034,6 +2034,7 @@ private:
     void forwardSecurityAlterIsr_(const uint8_t* p, std::size_t n);
     static bool onAdminLogAlterIsrResponseThunk_(void* self, const rune::replication::AlterIsrResponseMsg& r) noexcept;
     void onSecurityApplied_(const uint8_t* p, std::size_t n);
+    void failSecurityClosed_(int64_t offset, const std::string& describe);   // Task 14 (D28)
     void onSecurityHalted_(const uint8_t* p, std::size_t n);
     void publishSecurityMetrics_() noexcept;
     [[nodiscard]] bool securityMetricsPending_() const noexcept;
@@ -2330,6 +2331,9 @@ private:
     std::shared_ptr<aeron::Counter>  loginsOkCounter_;
     std::shared_ptr<aeron::Counter>  loginsFailedCounter_;
     std::shared_ptr<aeron::Counter>  loginsRateLimitedCounter_;
+    std::int64_t                     sessionsRevokedCounterRegId_ = -1;   // Task 14: 1'000'232
+    std::shared_ptr<aeron::Counter>  sessionsRevokedCounter_;
+    std::uint64_t                    publishedSessionsRevoked_ = 0;
     std::uint64_t                    publishedLoginsOk_ = 0, publishedLoginsFailed_ = 0, publishedLoginsRateLimited_ = 0;
     std::int64_t                     securityHaltedValue_  = 0;    // control-thread-owned (0 = applying)
     std::int64_t                     securityAppliedValue_ = -1;   // control-thread-owned

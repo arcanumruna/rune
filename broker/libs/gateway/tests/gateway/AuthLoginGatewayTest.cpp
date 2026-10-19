@@ -338,7 +338,7 @@ TEST(AuthLoginTest, ASessionThatMustChangeItsPasswordMayOnlyChangeItsOwnAndThenI
     ASSERT_TRUE(bytes.has_value());
     auto applied = rig.view.onApplied(static_cast<int64_t>(rig.chain.count()) - 1, *bytes);
     ASSERT_TRUE(applied.has_value()) << applied.error().detail;
-    rig.gw.onSecurityApplied(*applied);
+    rig.gw.onSecurityApplied(static_cast<int64_t>(rig.chain.count()) - 1, *applied);
     EXPECT_TRUE(std::holds_alternative<AuthAuthenticated>(*rig.gw.sessionAuthForTest(o.sid)));
     rig.send(defineTopicFrame(o.sid, 74));
     // Task 12: free of the must-change rule, the session is judged by its grants (admin holds ADMIN, not CREATE).

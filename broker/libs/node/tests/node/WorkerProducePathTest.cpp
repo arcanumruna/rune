@@ -947,7 +947,7 @@ TEST(WorkerProduceRegression, EncryptedFrameHeldByADeferredRollIsAppendedOnRedel
     for (std::size_t i = 0; i < sizeof(key.bytes); ++i) key.bytes[i] = static_cast<uint8_t>(i * 5 + 1);
     const uint8_t prefix[4] = {9, 8, 7, 6};
     WorkerOp ann;
-    ann.type = WorkerOp::Type::SessionAnnounce;
+    ann.type = WorkerOp::Type::SessionAnnounce; ann.grantAll = true;
     ann.sessionId = kSid;
     ann.egressStreamId = 7;
     ann.egressChannel = "aeron:ipc";

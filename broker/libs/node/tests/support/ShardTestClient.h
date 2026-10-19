@@ -273,7 +273,7 @@ public:
         return send(gatewayChannel, stream, buf.data(), len) ? s.correlationId : 0;
     }
     struct PushedRecords { int64_t subscriptionId; int64_t baseOffset; std::vector<uint8_t> bytes; };
-    struct ErrorSeen     { int64_t correlationId; int16_t code; std::string message; };
+    struct ErrorSeen     { int64_t correlationId; int16_t code; std::string message; int64_t sessionId = 0; };
     /// Poll the egress until `pred()` holds (bounded: kMaxIters × 100 µs).
     template <class Pred> bool pollUntil(Pred pred) {
         for (int i = 0; i < kMaxIters; ++i) { poll_(); if (pred()) return true; pause_(); }
@@ -1018,7 +1018,7 @@ private:
                 break;
             case pc::TemplateId::ErrorResponse:
                 if (auto e = pc::ErrorResponse::decode(p, n)) {
-                    errors_.push_back({e->correlationId, e->code, std::string(e->message)});
+                    errors_.push_back({e->correlationId, e->code, std::string(e->message), e->sessionId});
                     // F-A: the broker said this session is gone (the reap's notice / an UnknownSession answer).
                     if (e->code == static_cast<int16_t>(pc::ErrorCode::SessionExpired) ||
                         e->code == static_cast<int16_t>(pc::ErrorCode::UnknownSession))

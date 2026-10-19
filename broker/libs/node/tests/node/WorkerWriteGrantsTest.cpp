@@ -2,6 +2,7 @@
 // A REAL invoker driver over aeron:ipc (the ShardWorkerAckTest fixture): a client produces straight to the worker's
 // ingress; the answer comes back on the session's own publication.
 #include <rune/node/EmbeddedDriver.h>
+#include <rune/node/SessionAnnouncer.h>
 #include <rune/node/Worker.h>
 #include <rune/node/WorkerIngress.h>
 #include <rune/node/WorkerOp.h>
@@ -149,6 +150,23 @@ TEST(WorkerWriteGrantRegression, UnauthenticatedSessionProduceToWorkerIsDeniedRe
     EXPECT_EQ(f.acks[41].errorCode, static_cast<int16_t>(pc::ErrorCode::NotAuthorized));
     EXPECT_EQ(f.log->logEndOffset(), 0) << "nothing is appended for a denied session";
     EXPECT_EQ(f.worker->workerNotAuthorizedForTest(), 1u);
+}
+
+// Task 14 ruling (Task 13 R2 reversed): the default is DENY.  An announcer that forgot to say anything - no grantAll, no
+// shipped bitmap - must not open the log.
+TEST(WorkerWriteGrantRegression, ASessionAnnouncedWithDefaultFlagsAndNoShippedBitmapIsDeniedRegression) {
+    EXPECT_FALSE(WorkerOp{}.grantAll) << "the WorkerOp default is deny";
+    EXPECT_FALSE(SessionAnnouncer{}.grantAll()) << "the announcer default is deny";
+    Fixture f;
+    {
+        WorkerOp a; a.type = WorkerOp::Type::SessionAnnounce; a.sessionId = 9;   // nothing else set: every default
+        a.egressStreamId = kEgress; a.egressChannel = kEgressChannel;
+        ASSERT_TRUE(f.worker->tryEnqueueOp(std::move(a)));
+    }
+    f.produce(9, 51);
+    ASSERT_TRUE(f.awaitAck(51));
+    EXPECT_EQ(f.acks[51].errorCode, static_cast<int16_t>(pc::ErrorCode::NotAuthorized));
+    EXPECT_EQ(f.log->logEndOffset(), 0);
 }
 
 TEST(WorkerWriteGrantRegression, GrantedTopicIsAppendedAndAnUngrantedOneIsNot) {

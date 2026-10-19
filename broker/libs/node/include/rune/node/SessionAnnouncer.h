@@ -35,6 +35,9 @@ namespace rune::node {
 
 class SessionAnnouncer {
 public:
+    SessionAnnouncer() = default;
+    /// `grantAll` = the dev / in-process answer (see setGrantAll); the default constructor denies.
+    explicit SessionAnnouncer(bool grantAll) noexcept : grantAll_(grantAll) {}
     /// Announce `sessionId` to every worker not yet reached.  True once every
     /// worker has it queued (then — and only then — the runtime may accept).
     /// D6: `clientVersion` (ConnectRequest.clientVersion) rides along so a
@@ -167,7 +170,7 @@ public:
     /// Authentication Task 13 (D30): grantAll = the broker does not enforce authentication (dev / in-process): every
     /// announced session may write to every topic on a worker.  false (Enabled mode) = every shard produce of an
     /// announced session is denied until its PermissionShipper update lands.  Set ONCE from the gateway's auth mode
-    /// (setAuthMode); the default (true) keeps every rig that predates authentication unchanged.
+    /// (setAuthMode / the gateway constructor); the default is false (deny): an announcer that forgets fails closed.
     void setGrantAll(bool grantAll) noexcept { grantAll_ = grantAll; }
     [[nodiscard]] bool grantAll() const noexcept { return grantAll_; }
 
@@ -196,7 +199,7 @@ private:
     std::vector<Announcing> announcing_;
     std::vector<Closing>    closing_;
     std::size_t             closeWarnAt_ = kBacklogWarnAt;
-    bool                    grantAll_ = true;
+    bool                    grantAll_ = false;   // default deny (Task 14); the gateway sets it explicitly
 };
 
 } // namespace rune::node

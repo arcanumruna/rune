@@ -130,7 +130,7 @@ struct Fixture {
             if (!egress) egress = client->findSubscription(sreg);
             if (!producePub) producePub = client->findExclusivePublication(preg);
         }
-        WorkerOp a; a.type = WorkerOp::Type::SessionAnnounce; a.sessionId = 5;
+        WorkerOp a; a.type = WorkerOp::Type::SessionAnnounce; a.grantAll = true; a.sessionId = 5;
         a.egressStreamId = kEgress; a.egressChannel = kEgressChannel; a.clientVersion = session5Version;
         EXPECT_TRUE(worker->tryEnqueueOp(std::move(a)));
     }
@@ -169,7 +169,7 @@ struct Fixture {
         ASSERT_TRUE(egress2 && pub2 && pub2->isConnected());
     }
     void announce(int64_t sid, int32_t egressStream, int32_t clientVersion = 0) {
-        WorkerOp a; a.type = WorkerOp::Type::SessionAnnounce; a.sessionId = sid;
+        WorkerOp a; a.type = WorkerOp::Type::SessionAnnounce; a.grantAll = true; a.sessionId = sid;
         a.egressStreamId = egressStream; a.egressChannel = kEgressChannel; a.clientVersion = clientVersion;
         ASSERT_TRUE(worker->tryEnqueueOp(std::move(a)));
     }
@@ -409,7 +409,7 @@ TEST(ShardWorkerAckRegression, ClosedSessionGetsNoAckAndReannounceRestoresIt) {
     f.produce(/*corr=*/2, /*acks=*/0);
     for (int i = 0; i < 2'000; ++i) f.step();
     EXPECT_EQ(f.acks.count(2), 0u) << "a closed session's acks are dropped (the client is gone)";
-    WorkerOp a; a.type = WorkerOp::Type::SessionAnnounce; a.sessionId = 5;
+    WorkerOp a; a.type = WorkerOp::Type::SessionAnnounce; a.grantAll = true; a.sessionId = 5;
     a.egressStreamId = kEgress; a.egressChannel = kEgressChannel;
     ASSERT_TRUE(f.worker->tryEnqueueOp(std::move(a)));
     f.produce(/*corr=*/3, /*acks=*/0);
@@ -434,7 +434,7 @@ TEST(ShardWorkerAckRegression, GatewayRoutedProduceDrainedWithItsJustCommittedAn
             : OwnerThreadTestTask(Target::Replica, 1, 0, &run, Clock::now() + std::chrono::hours(1)), f(fx) {}
         static void run(OwnerThreadTestTask& t, PartitionReplica*) noexcept {
             auto& self = static_cast<Task&>(t);
-            WorkerOp a; a.type = WorkerOp::Type::SessionAnnounce; a.sessionId = 6;
+            WorkerOp a; a.type = WorkerOp::Type::SessionAnnounce; a.grantAll = true; a.sessionId = 6;
             a.egressStreamId = kEgress2; a.egressChannel = kEgressChannel;
             if (!self.f->worker->tryEnqueueOp(std::move(a))) return;
             self.routed = self.f->routedProduce(6, 61);
@@ -570,7 +570,7 @@ TEST(ShardWorkerAckRegression, StalledClientGetsEveryAckAfterAnyStall) {
 // reconnects) — never a silent black hole.
 TEST(ShardWorkerAckRegression, UndeliverableSessionPublicationIsReportedToTheRuntime) {
     Fixture f({1}, 1);
-    WorkerOp a; a.type = WorkerOp::Type::SessionAnnounce; a.sessionId = 8;
+    WorkerOp a; a.type = WorkerOp::Type::SessionAnnounce; a.grantAll = true; a.sessionId = 8;
     a.egressStreamId = kEgress2; a.egressChannel = "aeron:udp?endpoint=127.0.0.1:notaport";
     ASSERT_TRUE(f.worker->tryEnqueueOp(std::move(a)));
     int failed = 0; int64_t failedSid = 0;
@@ -626,7 +626,7 @@ struct MidPassAnnounce : OwnerThreadTestTask {
         : OwnerThreadTestTask(Target::Replica, 1, 0, &run, Clock::now() + std::chrono::hours(1)), f(fx) {}
     static void run(OwnerThreadTestTask& t, PartitionReplica*) noexcept {
         auto& self = static_cast<MidPassAnnounce&>(t);
-        WorkerOp a; a.type = WorkerOp::Type::SessionAnnounce; a.sessionId = 7;
+        WorkerOp a; a.type = WorkerOp::Type::SessionAnnounce; a.grantAll = true; a.sessionId = 7;
         a.egressStreamId = kEgress2; a.egressChannel = kEgressChannel;
         if (!self.f->worker->tryEnqueueOp(std::move(a))) return;   // the runtime announces...
         auto fr = Fixture::produceFrame(7, 7'000'001, 0);           // ...the client's frame lands
@@ -734,7 +734,7 @@ TEST(ShardWorkerAckRegression, DeferredSessionSignalIsCountedAndStillDeliveredOn
     while (f.worker->injectReturnForTest(filler)) {}        // the runtime is slow: ret_ full
     ASSERT_TRUE(f.routedProduce(5, 71));                    // its notification goes to the FIFO
     f.step();
-    WorkerOp a; a.type = WorkerOp::Type::SessionAnnounce; a.sessionId = 8;
+    WorkerOp a; a.type = WorkerOp::Type::SessionAnnounce; a.grantAll = true; a.sessionId = 8;
     a.egressStreamId = kEgress2; a.egressChannel = "aeron:udp?endpoint=127.0.0.1:notaport";
     ASSERT_TRUE(f.worker->tryEnqueueOp(std::move(a)));
     for (int i = 0; i < 50; ++i) f.step();

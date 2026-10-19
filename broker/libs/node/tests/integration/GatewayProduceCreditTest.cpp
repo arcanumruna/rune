@@ -183,7 +183,7 @@ struct Rig {
     // A gateway session the worker knows (announce-before-accept, as the gateway's announcer does).
     int64_t session(int32_t egressStream, const std::string& ackChannel = kAckChannel) {
         const int64_t sid = gw.injectTestSession(now);
-        WorkerOp a; a.type = WorkerOp::Type::SessionAnnounce; a.sessionId = sid;
+        WorkerOp a; a.type = WorkerOp::Type::SessionAnnounce; a.grantAll = true; a.sessionId = sid;
         a.egressStreamId = egressStream; a.egressChannel = ackChannel;
         EXPECT_TRUE(w().tryEnqueueOp(std::move(a)));
         for (int i = 0; i < 8; ++i) runWorker();

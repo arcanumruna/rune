@@ -38,6 +38,8 @@ public:
     /// Name-addressed (groups, transactional ids, DDL names): the retained patterns matched against `name`.  Cold.
     [[nodiscard]] bool allowsName(rune::security::ResourceType, std::string_view name, uint8_t opBits) const noexcept;
     [[nodiscard]] bool isAllowAll() const noexcept { return allowAll_; }
+    /// The retained effective grants (sorted, unique) - what Task 14 diffs across a refresh.  Empty for allow-all / deny-all.
+    [[nodiscard]] std::span<const rune::security::GrantSpec> grants() const noexcept { return grants_; }
 
     /// A topic / view created after login (spec §6): set its bits from the retained grants.  Cold; may grow ops_.
     void onObjectCreated(int32_t id, const ObjectEntry&);

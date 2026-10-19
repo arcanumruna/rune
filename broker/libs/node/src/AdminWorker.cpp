@@ -299,6 +299,10 @@ void AdminWorker::catalogSubscribe(const CatalogSubscribeMsg& m) {
 
 void AdminWorker::catalogUnsubscribe(const CatalogUnsubscribeMsg& m) {
     // A single unsubscribe names ONE server by its id space; a session close (-1) ends the session's reads on both.
+    if (m.subscriptionId == rune::gateway::kEndCatalogReadsOnly) {   // Task 14: DESCRIBE ON CLUSTER revoked - the security reads stay
+        if (readServer_) readServer_->unsubscribe(m.session, -1);
+        return;
+    }
     if (m.subscriptionId != -1 && rune::gateway::isSecuritySubscriptionId(m.subscriptionId)) {
         if (securityReadServer_) securityReadServer_->unsubscribe(m.session, m.subscriptionId);
         return;

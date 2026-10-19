@@ -18,7 +18,7 @@ namespace pc = rune::protocol::client;
 namespace {
 WorkerOp encryptedAnnounce(int64_t sid) {
     WorkerOp a;
-    a.type = WorkerOp::Type::SessionAnnounce;
+    a.type = WorkerOp::Type::SessionAnnounce; a.grantAll = true;
     a.sessionId = sid;
     a.egressStreamId = 7;
     a.egressChannel = "aeron:ipc";

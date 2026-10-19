@@ -1610,7 +1610,8 @@ if(BUILD_TESTING)
                        tests/client/ClientConnectRoleRegressionTest.cpp
                        tests/client/ClientDdlClusterRegressionTest.cpp
                        tests/client/ClientLoginBrokerRegressionTest.cpp
-                       tests/client/RuneCliSecurityBrokerRegressionTest.cpp)
+                       tests/client/RuneCliSecurityBrokerRegressionTest.cpp
+                       tests/client/ClientSessionRevokedBrokerRegressionTest.cpp)
         target_include_directories(rune_client_broker_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_client_broker_tests PRIVATE rune_node rune_view rune_codec rune_catalog
                               rune_client_api rune_cli_lib aeron::aeron GTest::gtest_main)
@@ -1628,7 +1629,8 @@ if(BUILD_TESTING)
         # ONE real authenticating broker (raw frames): AuthEnforcement (the §2.1 map), AuthVisibility (hidden == missing),
         # CatalogPrincipal (the catalog / security events record the authenticated user).
         add_executable(rune_auth_enforcement_tests tests/node/AuthEnforcementTest.cpp
-                       tests/node/AuthVisibilityTest.cpp tests/node/CatalogPrincipalTest.cpp)
+                       tests/node/AuthVisibilityTest.cpp tests/node/CatalogPrincipalTest.cpp
+                       tests/node/AuthLiveChangeTest.cpp tests/node/SecurityHaltTest.cpp)
         target_include_directories(rune_auth_enforcement_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_auth_enforcement_tests PRIVATE rune_node rune_view rune_codec rune_catalog aeron::aeron
                               GTest::gtest_main)

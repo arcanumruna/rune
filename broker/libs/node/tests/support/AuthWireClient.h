@@ -164,6 +164,26 @@ public:
         m.patternKind = static_cast<uint8_t>(kind); m.pattern = pattern;
         return securityDdl(channel, m, "GRANT ...;");
     }
+    DdlAnswer revoke(const std::string& channel, int64_t sid, const std::string& grantee, bool granteeIsRole,
+                     rune::protocol::SecurityOperation op, rune::protocol::SecurityResourceType type,
+                     rune::protocol::SecurityPatternKind kind, const std::string& pattern) {
+        pc::SecurityDdl m; m.sessionId = sid; m.kind = pc::SecurityOpKind::Revoke; m.name = grantee;
+        m.granteeKind = granteeIsRole ? 1 : 0; m.op = static_cast<uint8_t>(op); m.resourceType = static_cast<uint8_t>(type);
+        m.patternKind = static_cast<uint8_t>(kind); m.pattern = pattern;
+        return securityDdl(channel, m, "REVOKE ...;");
+    }
+    DdlAnswer revokeRole(const std::string& channel, int64_t sid, const std::string& user, const std::string& role) {
+        pc::SecurityDdl m; m.sessionId = sid; m.kind = pc::SecurityOpKind::RevokeRole; m.name = user; m.roleName = role;
+        return securityDdl(channel, m, "REVOKE ROLE " + role + " FROM " + user + ";");
+    }
+    DdlAnswer dropRole(const std::string& channel, int64_t sid, const std::string& name) {
+        pc::SecurityDdl m; m.sessionId = sid; m.kind = pc::SecurityOpKind::DropRole; m.name = name;
+        return securityDdl(channel, m, "DROP ROLE " + name + ";");
+    }
+    DdlAnswer dropUser(const std::string& channel, int64_t sid, const std::string& name) {
+        pc::SecurityDdl m; m.sessionId = sid; m.kind = pc::SecurityOpKind::DropUser; m.name = name;
+        return securityDdl(channel, m, "DROP USER " + name + ";");
+    }
     DdlAnswer grantRole(const std::string& channel, int64_t sid, const std::string& user, const std::string& role) {
         pc::SecurityDdl m; m.sessionId = sid; m.kind = pc::SecurityOpKind::GrantRole; m.name = user; m.roleName = role;
         return securityDdl(channel, m, "GRANT ROLE " + role + " TO " + user + ";");
