@@ -112,7 +112,9 @@ PeerHandshake::Out PeerHandshake::refuseOut_(RefuseReason r, uint64_t keyId) {
     return o;
 }
 
-void PeerHandshake::restorePrior_(const std::optional<Established>& prior, int64_t nowNs) noexcept {
+// `prior` is taken BY VALUE: callers hand in the copy stored inside the current state_ alternative, which the assignment
+// below destroys - assigning from it by reference is a self-overlapping variant assignment.
+void PeerHandshake::restorePrior_(std::optional<Established> prior, int64_t nowNs) noexcept {
     if (prior) state_ = *prior; else state_ = LinkIdle{nowNs};
 }
 
