@@ -950,6 +950,16 @@ private:
             runOwnerThreadTestTask(ref, nullptr);
             return true;
         }
+        if (task.target() == OwnerThreadTestTask::Target::WorkerThread) {   // authentication Task 15: worker `partition()`
+            if (workerPool_ && task.partition() >= 0 && task.partition() < workerPool_->workerCount()) {
+                WorkerOp op;
+                op.type      = WorkerOp::Type::TestTask;
+                op.egressPub = ref;   // opaque task ref (WorkerOp::TestTask contract); no replica
+                return static_cast<bool>(workerPool_->worker(task.partition()).tryEnqueueOp(std::move(op)));
+            }
+            skipOwnerThreadTestTask(ref);   // no such worker: reported as skipped, never run
+            return true;
+        }
         const int32_t tid = task.topicId();
         const int32_t pid = task.partition();
         rune::replication::PartitionReplica* replica =

@@ -47,10 +47,12 @@ AeronPartitionTransport::AeronPartitionTransport(
         int32_t                        ingressStreamId,
         NodeId                         selfId,
         int                            outboundRingBytes,
-        rune::aeronutil::AeronPump     pump)
+        rune::aeronutil::AeronPump     pump,
+        rune::peerlink::PeerCryptoMode crypto)
     : aeron_(std::move(aeron))
     , selfId_(selfId)
     , outboundRing_(outboundRingBytes)  // NodeConfig-configurable ring size
+    , crypto_(std::move(crypto))
 {
     // Register ingress subscription.  One bounded synchronous wait at
     // construction — never called on the duty-cycle hot path.
@@ -148,10 +150,12 @@ bool AeronPartitionTransport::deliverFrameForTest(const uint8_t* frame, std::siz
 int64_t AeronPartitionTransport::maxFetchRecordsBytes() const noexcept
 {
     const int64_t kFrameFixed = static_cast<int64_t>(FetchResponseMsg::encodedSize(0));
+    // Authentication Task 16 (D34): both hops leave room for the 32-byte peer frame in every mode.
+    constexpr int64_t kPeer = static_cast<int64_t>(rune::peerlink::kPeerFrameOverhead);
     int64_t cap = static_cast<int64_t>(outboundRing_.maxMsgLength())
-                - static_cast<int64_t>(kOutboundEnvelopeOverhead) - kFrameFixed;
+                - static_cast<int64_t>(kOutboundEnvelopeOverhead) - kPeer - kFrameFixed;
     if (pubMaxMessageBytes_ > 0) {
-        cap = std::min<int64_t>(cap, pubMaxMessageBytes_ - kFrameFixed);
+        cap = std::min<int64_t>(cap, pubMaxMessageBytes_ - kPeer - kFrameFixed);
     }
     return std::max<int64_t>(0, cap);
 }
@@ -667,6 +671,9 @@ aeron::ControlledPollAction AeronPartitionTransport::onFragment(
 {
     ++txFragsRecv_;
     RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplOnFragment, 0);
+    if (std::holds_alternative<rune::peerlink::PeerFrameCrypto>(crypto_)) [[unlikely]]
+        return onSealedFragment_(reinterpret_cast<const uint8_t*>(buffer.buffer() + offset),
+                                 static_cast<std::size_t>(length));
     return handleFrame_(reinterpret_cast<const uint8_t*>(buffer.buffer() + offset),
                         static_cast<std::size_t>(length));
 }
@@ -843,7 +850,7 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
         if (followerPeer && followerPeer->pub) {
             const int32_t pubCeiling =
                 static_cast<int32_t>(followerPeer->pub->maxMessageLength())
-                - kFetchResponseOverhead;
+                - kFetchResponseOverhead - static_cast<int32_t>(rune::peerlink::kPeerFrameOverhead);   // D34
             if (pubCeiling < ceiling) ceiling = pubCeiling;
         }
         if (ceiling < 0) ceiling = 0;
@@ -1099,7 +1106,8 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
         auto* peer = findPeer(req.followerId);
         if (peer && peer->pub) {
             const int32_t pubCeiling =
-                static_cast<int32_t>(peer->pub->maxMessageLength()) - kOverhead;
+                static_cast<int32_t>(peer->pub->maxMessageLength()) - kOverhead
+                - static_cast<int32_t>(rune::peerlink::kPeerFrameOverhead);   // D34
             if (pubCeiling < ceiling) ceiling = pubCeiling;
         }
         if (ceiling < 0) ceiling = 0;
@@ -1272,9 +1280,13 @@ void AeronPartitionTransport::resolvePendingPubs()
 // sendOnPub — non-blocking zero-copy send (tryClaim → commit; fallback offer).
 // ---------------------------------------------------------------------------
 int64_t AeronPartitionTransport::sendOnPub(aeron::ExclusivePublication& pub,
+                                         NodeId                       peer,
                                          const uint8_t*               buf,
                                          std::size_t                  len)
 {
+    if (std::holds_alternative<rune::peerlink::PeerFrameCrypto>(crypto_)) [[unlikely]]
+        return sendSealedOnPub_(pub, peer, buf, len);
+
     // Defence-in-depth: NEVER let offer() throw IllegalArgumentException on an
     // oversized frame.  This branch must never be reached in normal operation:
     // later batches are bounded by req.maxBytes (capped to the deliverable
@@ -1317,6 +1329,130 @@ int64_t AeronPartitionTransport::sendOnPub(aeron::ExclusivePublication& pub,
     const int64_t result = pub.offer(atomicBuf, 0,
                                       static_cast<aeron::util::index_t>(len));
     return result;
+}
+
+// ---------------------------------------------------------------------------
+// Authentication Task 16 (D34): sealed send / open.  Control thread only.
+// ---------------------------------------------------------------------------
+bool AeronPartitionTransport::installPeerLink(int32_t peer, const rune::peerlink::LinkKeys& keys) noexcept
+{
+    auto* c = std::get_if<rune::peerlink::PeerFrameCrypto>(&crypto_);
+    if (c == nullptr) return false;
+    try {
+        sizeSealScratch_();   // COLD, here: never on the send / receive path
+        return c->installLink(peer, keys, rune::peerlink::steadyNowNs());
+    } catch (...) { return false; }
+}
+
+uint32_t AeronPartitionTransport::peerLinkEpoch(int32_t peer) const noexcept
+{
+    const auto* c = std::get_if<rune::peerlink::PeerFrameCrypto>(&crypto_);
+    return c ? c->currentEpoch(peer) : 0u;
+}
+
+uint64_t AeronPartitionTransport::peerFrameDrops() const noexcept
+{
+    const auto* c = std::get_if<rune::peerlink::PeerFrameCrypto>(&crypto_);
+    return c ? c->drops() : 0u;
+}
+
+// COLD: the seal / open scratch is sized to the largest frame the peer publications carry (+ the peer overhead); the
+// transport knows it from setPublicationMaxMessageBytes() (set once before any worker runs) or the first resolved pub.
+void AeronPartitionTransport::sizeSealScratch_()
+{
+    if (!sealScratch_.empty()) return;
+    int64_t ml = pubMaxMessageBytes_;
+    for (const auto& [id, peer] : peers_)
+        if (peer.pub) ml = std::max<int64_t>(ml, static_cast<int64_t>(peer.pub->maxMessageLength()));
+    if (ml <= 0) return;
+    const std::size_t bytes = static_cast<std::size_t>(ml) + rune::peerlink::kPeerFrameOverhead;
+    recvScratch_.resize(bytes);
+    sealScratch_.resize(bytes);
+}
+
+int64_t AeronPartitionTransport::sendSealedOnPub_(aeron::ExclusivePublication& pub, NodeId peer,
+                                                  const uint8_t* buf, std::size_t len)
+{
+    auto& c = *std::get_if<rune::peerlink::PeerFrameCrypto>(&crypto_);
+    if (!c.hasLink(peer)) [[unlikely]] {
+        // "No established link to the destination -> the frame is not sent": counted, rate-limited log, and the peer
+        // is DOWN for this frame (never held: the link edge re-drives the fetch once the keys are installed).
+        c.noteNoLink();
+        if ((noLinkLogged_++ % 1024) == 0)
+            spdlog::warn("AeronPartitionTransport[node={}]: peer frames to node {} dropped: link not established "
+                         "({} dropped so far)", selfId_, peer, noLinkLogged_);
+        return kOfferPeerDown;
+    }
+    const std::size_t sealedLen = len + rune::peerlink::kPeerFrameOverhead;
+    if (sealScratch_.empty()) [[unlikely]] sizeSealScratch_();   // normally sized at install; a one-time fallback
+    if (sealedLen > static_cast<std::size_t>(pub.maxMessageLength()) || sealedLen > sealScratch_.size()) {
+        spdlog::warn("AeronPartitionTransport::sendSealedOnPub_: drop oversized frame len={} (+{} B peer frame) "
+                     "maxMessageLength={} scratch={}", len, rune::peerlink::kPeerFrameOverhead,
+                     pub.maxMessageLength(), sealScratch_.size());
+        ++oversizedFrameDropped_;
+        return kOfferOversized;   // permanent: never held
+    }
+    // A frame that fits one MTU payload is sealed straight into the claimed term buffer; claiming first means
+    // back-pressure never burns a sequence number.
+    if (sealedLen <= static_cast<std::size_t>(pub.maxPayloadLength())) {
+        aeron::concurrent::logbuffer::BufferClaim claim;
+        int64_t pos = pub.tryClaim(static_cast<aeron::util::index_t>(sealedLen), claim);
+        if (pos == aeron::ADMIN_ACTION) pos = pub.tryClaim(static_cast<aeron::util::index_t>(sealedLen), claim);
+        if (pos > 0) {
+            if (c.seal(peer, buf, len, claim.buffer().buffer() + claim.offset(), sealedLen) == 0) [[unlikely]] {
+                claim.abort();
+                return kOfferOversized;   // a cipher error: never transmitted, never held
+            }
+            claim.commit();
+            return pos;
+        }
+        return pos;   // BACK_PRESSURED / NOT_CONNECTED: the caller holds the (unsealed) frame
+    }
+    const std::size_t n = c.seal(peer, buf, len, sealScratch_.data(), sealScratch_.size());
+    if (n == 0) [[unlikely]] return kOfferOversized;
+    aeron::concurrent::AtomicBuffer ab(sealScratch_.data(), static_cast<aeron::util::index_t>(n));
+    return pub.offer(ab, 0, static_cast<aeron::util::index_t>(n));
+}
+
+void AeronPartitionTransport::noteOpenDrop_(rune::peerlink::PeerFrameCrypto::OpenResult r, int32_t from, uint32_t epoch) noexcept
+{
+    if (r == rune::peerlink::PeerFrameCrypto::OpenResult::UnknownEpoch) {
+        ++unknownEpochFrames_;
+        pendingUnknown_ = PendingUnknown{true, from, epoch};   // the PeerLinkAgent (same thread) re-handshakes
+    }
+    if ((openDropsLogged_++ % 1024) == 0)
+        spdlog::warn("AeronPartitionTransport[node={}]: frame from node {} dropped: {} (epoch {}; {} dropped so far)",
+                     selfId_, from, rune::peerlink::PeerFrameCrypto::name(r), epoch, openDropsLogged_);
+}
+
+aeron::ControlledPollAction AeronPartitionTransport::onSealedFragment_(const uint8_t* frame, std::size_t len)
+{
+    auto& c = *std::get_if<rune::peerlink::PeerFrameCrypto>(&crypto_);
+    if (recvScratch_.empty()) sizeSealScratch_();
+    // A re-delivered frame (the previous dispatch ABORTed): same header -> reuse its already opened plaintext.
+    if (pendingOpened_.valid && len >= rune::peerlink::kPeerHeaderBytes && frame[0] == rune::peerlink::kPeerFrameMagic &&
+        frame[1] == pendingOpened_.sender) {
+        uint64_t seq = 0; std::memcpy(&seq, frame + 8, 8);
+        uint16_t from = 0; std::memcpy(&from, frame + 2, 2);
+        if (seq == pendingOpened_.seq && from == pendingOpened_.from) {
+            const auto act = handleFrame_(recvScratch_.data(), pendingOpened_.plainLen);
+            if (act != aeron::ControlledPollAction::ABORT) pendingOpened_.valid = false;
+            return act;
+        }
+    }
+    pendingOpened_.valid = false;
+    std::size_t plainLen = 0; int32_t from = -1; uint32_t epoch = 0;
+    const auto r = c.open(frame, len, recvScratch_.data(), recvScratch_.size(), plainLen, from, epoch);
+    if (r != rune::peerlink::PeerFrameCrypto::OpenResult::Ok) [[unlikely]] {
+        noteOpenDrop_(r, from, epoch);
+        return aeron::ControlledPollAction::CONTINUE;   // dropped and counted, never dispatched
+    }
+    const auto act = handleFrame_(recvScratch_.data(), plainLen);
+    if (act == aeron::ControlledPollAction::ABORT) {
+        uint64_t seq = 0; std::memcpy(&seq, frame + 8, 8);
+        pendingOpened_ = PendingOpened{true, from, frame[1], seq, plainLen};
+    }
+    return act;
 }
 
 // ---------------------------------------------------------------------------

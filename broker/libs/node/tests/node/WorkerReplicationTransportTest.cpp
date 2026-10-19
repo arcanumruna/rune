@@ -25,6 +25,7 @@
 #include <rune/replication/ReplicationMessages.h>
 
 #include <gtest/gtest.h>
+#include <rune/peerlink/PeerFrameCrypto.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -831,7 +832,8 @@ TEST(WorkerReplicationTransport, PollCapsFetchRequestMaxBytes)
     // kFetchResponseOverhead = FetchResponseMsg::encodedSize(0).
     const int32_t kOverhead =
         static_cast<int32_t>(FetchResponseMsg::encodedSize(0));
-    const int32_t kSmallMax  = kOverhead + 512;   // only 512 bytes of records fit
+    const int32_t kPeer = static_cast<int32_t>(rune::peerlink::kPeerFrameOverhead);   // D34: every mode leaves room for it
+    const int32_t kSmallMax  = kOverhead + kPeer + 512;   // only 512 bytes of records fit
     h.pubs.setFakeMaxMessageLength(kSmallMax);
     // Re-create transport with the updated shared state (transport already shares state).
     const int32_t expectedCeiling = 512;
@@ -884,7 +886,8 @@ TEST(WorkerReplicationTransport, PollCapsReconcileFetchReqMaxBytes)
     auto h = makeTestPair(/*workerId=*/1, {2, 3});
 
     const int32_t kOverhead  = static_cast<int32_t>(FetchResponseMsg::encodedSize(0));
-    const int32_t kSmallMax  = kOverhead + 256;
+    const int32_t kPeer = static_cast<int32_t>(rune::peerlink::kPeerFrameOverhead);   // D34
+    const int32_t kSmallMax  = kOverhead + kPeer + 256;
     h.pubs.setFakeMaxMessageLength(kSmallMax);
 
     auto buf = makeFetchRequestFrame(/*partition=*/0, /*topicId=*/0, 1 << 18);

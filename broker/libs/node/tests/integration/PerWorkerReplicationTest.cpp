@@ -1388,8 +1388,8 @@ TEST(LargeBatchReplicationRegression, MultiBatchPushAboveFollowerFrameNeverWedge
 // the gateway must enforce that same value (effective max + 1 -> MessageTooLarge
 // is pinned at the gateway/worker layers: ClientGatewayHotPath.ProduceBatch-
 // ExactEffectiveMaxBoundaryRegression, WorkerProduceRegression.*).  Round 4
-// derived 524242 for the defaults, 16 bytes above what the legacy ring path
-// can carry (524226): such a batch was accepted and then never delivered.
+// derived 524210 for the defaults, 16 bytes above what the legacy ring path
+// can carry (524194; D34: both 32 bytes below their pre-Task-16 values): such a batch was accepted and then never delivered.
 // Real 3-node BrokerNodes, real embedded drivers, default 4 MiB term/rings.
 // ===========================================================================
 namespace {
@@ -1429,7 +1429,7 @@ void runExactEffectiveMaxReplicates(bool perWorker) {
     }
 
     const std::size_t effMax = rune::node::effectiveMaxProduceBatchBytes(cfgs[0]);
-    ASSERT_EQ(effMax, 524226u) << "4 MiB multi-node derivation (see BrokerNodeRegression)";
+    ASSERT_EQ(effMax, 524194u) << "4 MiB multi-node derivation (see BrokerNodeRegression)";
 
     std::array<std::unique_ptr<rune::node::BrokerNode>, 3> nodes;
     for (int i = 0; i < 3; ++i) nodes[i] = std::make_unique<rune::node::BrokerNode>(cfgs[i]);

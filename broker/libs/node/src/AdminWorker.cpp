@@ -553,6 +553,23 @@ bool AdminWorker::updateRole_() {
 }
 
 // ─── ingress ────────────────────────────────────────────────────────────────
+void AdminWorker::onPeerLinkKeys(const PeerLinkKeysMsg& m) noexcept {
+    rune::peerlink::LinkKeys k;
+    k.epoch = m.epoch; k.sendMaster = m.sendMaster; k.recvMaster = m.recvMaster;
+    ++peerLinkKeysSeen_;
+    if (catalogPlane_ != nullptr && catalogPlane_->peerSealed() && !catalogPlane_->installPeerLink(m.peer, k)) [[unlikely]]
+        spdlog::error("AdminWorker: the link keys of node {} (epoch {}) could not be installed - admin frames "
+                      "to/from it are dropped", m.peer, k.epoch);
+}
+
+uint32_t AdminWorker::peerLinkEpochForTest(int32_t peer) const noexcept {
+    return catalogPlane_ != nullptr ? catalogPlane_->peerLinkEpoch(peer) : 0u;
+}
+
+uint64_t AdminWorker::peerFrameDrops() const noexcept {
+    return catalogPlane_ != nullptr ? catalogPlane_->peerFrameDrops() : 0u;
+}
+
 void AdminWorker::submit(DdlRequest req) {
     if (pending_.size() >= kMaxPendingDdl) [[unlikely]] {
         ++pendingDdlRefused_;

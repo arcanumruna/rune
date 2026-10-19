@@ -31,6 +31,11 @@ enum class SessionSignalKind : int64_t {
     /// again.  WorkerReturn::baseOffset = the runtime's retire token; the
     /// runtime destroys the publication on this acknowledgement (retire-on-ack).
     EgressReleased = 8,
+    /// Authentication Task 16: NOT a session signal - a worker reports the cumulative number of inter-broker frames
+    /// its replication plane dropped (no established link / did not open): WorkerReturn::baseOffset = the count,
+    /// ::partition = the worker, ::sessionId unused.  Paced (<= one per second, only when it changed).  The runtime
+    /// folds the per-worker counts into counter 1'000'235 - the worker owns its crypto, nothing is shared.
+    PeerFrameDrops = 9,
 };
 
 } // namespace rune::node
