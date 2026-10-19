@@ -2,7 +2,7 @@
 
 **Status:** design / awaiting review
 **Date:** 2026-09-30
-**Author:** vradu + Claude
+**Author:** arcanumruna + Claude
 **Related:** `docs/superpowers/plans/2026-09-30-replication-throughput-optimization.md` (lever #4; and #1 multiplex which composes on top), memory `rune-replication-benchmark-kafka`, `rune-milestone-e-runtime`, `aeron-is-the-bible`, `rune-shared-nothing-law`.
 
 ## 1. Problem & goal

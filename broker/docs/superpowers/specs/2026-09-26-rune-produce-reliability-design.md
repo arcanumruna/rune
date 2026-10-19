@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-26
 **Status:** Draft for review
-**Owner:** vradu
+**Owner:** arcanumruna
 **Related:** bug `rune-single-partition-produce-loss`; benchmark spec `2026-09-26-rune-vs-kafka-benchmark-design.md`; deferred task #23.
 
 ## Goal

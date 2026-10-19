@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-26
 **Status:** Draft for review
-**Owner:** vradu
+**Owner:** arcanumruna
 
 ## Goal
 

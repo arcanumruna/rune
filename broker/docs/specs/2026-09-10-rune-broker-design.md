@@ -222,14 +222,14 @@ Kafka-*like* mental model, C++-native and Aeron-framed (not wire-compatible).
 
 ## 11. Project structure, packaging & tooling
 
-The workspace is **three sibling projects** under `~/Projects`, following the exact `world-server`/`common` conventions (Conan 2, CMake ≥3.31, C++23, `conan_provider.cmake`, `VERSION.txt` + `set_version`, packages published `name/x.y.z@vradu/dev` to the `artifactory` remote via Woodpecker CI). Splitting is minimal — only where it earns reuse or independent release.
+The workspace is **three sibling projects** under `~/Projects`, following the exact `world-server`/`common` conventions (Conan 2, CMake ≥3.31, C++23, `conan_provider.cmake`, `VERSION.txt` + `set_version`, packages published `name/x.y.z@<user>/dev` to the `artifactory` remote via Woodpecker CI). Splitting is minimal — only where it earns reuse or independent release.
 
 ```
 ~/Projects/
   rune-protocol/   # Conan library — shared wire + record-batch v2 format, offsets,
                    #   error codes, SBE-style codecs. Single source of truth for the
                    #   on-disk AND on-wire encoding. Released independently.
-                   #   deps: common@vradu/dev (Agrona buffers), aeron
+                   #   deps: common@<user>/dev (Agrona buffers), aeron
   rune-client/     # Conan library — standalone, INDEPENDENTLY RELEASABLE C++ client
                    #   (producer, consumer, consumer-group member, admin). The only
                    #   package downstream apps (e.g. world-server) consume.

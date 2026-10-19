@@ -1,6 +1,6 @@
 # Review: rune-client-cpp 8d2f826 — refused redirect re-offer re-driven by per-pass route resend (DR-2)
 
-Reviewer: Claude (Opus), 2026-10-05. Worktree: /Users/vradu/Projects/rune-client-cpp-wt16.
+Reviewer: Claude (Opus), 2026-10-05. Worktree: ~/Projects/rune-client-cpp-wt16.
 
 ## Verdict: APPROVE WITH CHANGES (no CRITICAL/MAJOR; two MEDIUM ordering gaps, both EOS-safe)
 

@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Updates internal @vradu/dev dependencies in conandata.yml to match
+# Updates internal @${CONAN_USER}/${CONAN_CHANNEL} dependencies in conandata.yml to match
 # the latest released version (from git tags) of each sibling project.
 #
 # Usage: ./update-deps.sh
 set -euo pipefail
+: "${CONAN_USER:?set CONAN_USER (conan package user)}"
+: "${CONAN_CHANNEL:=dev}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PARENT_DIR="$(dirname "$SCRIPT_DIR")"
@@ -26,7 +28,7 @@ pkg_to_dir() {
 }
 
 # Extract internal package names from conandata.yml
-PKGS=$(sed -n 's/.*"\([a-z0-9_-]*\)\/[^"]*@vradu\/dev".*/\1/p' "$CONANDATA" | sort -u)
+PKGS=$(sed -n 's/.*"\([a-z0-9_-]*\)\/[^"]*@${CONAN_USER}\/${CONAN_CHANNEL}".*/\1/p' "$CONANDATA" | sort -u)
 
 CHANGED=false
 for pkg in $PKGS; do
@@ -53,14 +55,14 @@ for pkg in $PKGS; do
   release_version="${latest_tag#v}"
 
   # Check if already up to date
-  current=$(sed -n "s/.*\"${pkg}\/\([^\"]*\)@vradu\/dev\".*/\1/p" "$CONANDATA")
+  current=$(sed -n "s/.*\"${pkg}\/\([^\"]*\)@${CONAN_USER}\/${CONAN_CHANNEL}\".*/\1/p" "$CONANDATA")
   if [[ "$current" == "$release_version" ]]; then
     echo "✔️  $pkg already at $release_version"
     continue
   fi
 
   # Replace in conandata.yml
-  sed -i '' "s|\"${pkg}/[^\"]*@vradu/dev\"|\"${pkg}/${release_version}@vradu/dev\"|g" "$CONANDATA"
+  sed -i '' "s|\"${pkg}/[^\"]*@${CONAN_USER}/${CONAN_CHANNEL}\"|\"${pkg}/${release_version}@${CONAN_USER}/${CONAN_CHANNEL}\"|g" "$CONANDATA"
   echo "✅ $pkg $current → $release_version"
   CHANGED=true
 done

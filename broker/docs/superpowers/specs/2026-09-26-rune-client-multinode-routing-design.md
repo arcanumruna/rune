@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-26
 **Status:** Draft for review — rev 2 incorporates round-1 adversarial review (4 lenses: concurrency, failure/liveness, in-flight/ack/exactly-once, hot-path/resource).
-**Owner:** vradu
+**Owner:** arcanumruna
 **Repo:** rune-client-cpp (library). Broker unchanged **pending the Task-0 spike** (egress stream-id addressability).
 
 ## Goal

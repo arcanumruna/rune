@@ -6,7 +6,7 @@
 
 **Architecture:** Two Conan 2 C++23 projects mirroring `world-server`/`common`. `rune-protocol` owns the on-disk/on-wire batch format (single source of truth). `rune-broker`'s `librune_storage` builds a partitioned append-only log of memory-mapped segments on top of that format, with crash recovery, retention, and leader-epoch/producer-state bookkeeping reserved for later phases. No networking, replication, or consensus in Phase 1 — the "API" is an in-process `Log` facade proving the storage engine end-to-end.
 
-**Tech Stack:** C++23, CMake ≥3.31, Conan 2, gtest 1.16.0, `aeron` (ConanCenter), `common@vradu/dev` (Agrona buffers), Woodpecker CI.
+**Tech Stack:** C++23, CMake ≥3.31, Conan 2, gtest 1.16.0, `aeron` (ConanCenter), `common@<user>/dev` (Agrona buffers), Woodpecker CI.
 
 **Spec:** `rune-broker/docs/specs/2026-09-10-rune-broker-design.md` (§6 Storage internals, §6.4 record batch, §10 phasing, §12 testing).
 
@@ -14,7 +14,7 @@
 
 - **Language/std:** C++23 (`set(CMAKE_CXX_STANDARD 23)`), matching `common`.
 - **Build system:** CMake ≥ 3.31; Conan 2 with `conan_provider.cmake` dependency provider; `CMakeDeps` + `CMakeToolchain`.
-- **Versioning:** `VERSION.txt` = `0.1.0-snapshot`; `set_version()` reads it. Packages: `rune-protocol/x.y.z@vradu/dev`, `rune-broker` app.
+- **Versioning:** `VERSION.txt` = `0.1.0-snapshot`; `set_version()` reads it. Packages: `rune-protocol/x.y.z@<user>/dev`, `rune-broker` app.
 - **Publishing:** the agent writes `build.sh`/`release.sh`/CI but **NEVER runs `conan create/export/upload`** — publishing is CI-only (user-owned packages).
 - **Local build/test:** cross-compile `-s arch=x86_64` on ARM Macs for Aeron compatibility (as `world-server/build.sh`); enable tests with `-DBUILD_TESTING=ON`; run via `ctest`/`gtest_discover_tests`.
 - **Namespace:** all C++ in namespace `rune` (sub-namespaces `rune::protocol`, `rune::storage`).
@@ -108,7 +108,7 @@ class RuneProtocolConan(ConanFile):
 
 ```yaml
 requirements:
-  - "common/1.0.10@vradu/dev"
+  - "common/1.0.10@<user>/dev"
   - "aeron/1.51.0"
 test_requirements:
   - "gtest/1.16.0"
@@ -755,7 +755,7 @@ git commit -m "feat(protocol): RecordBatchReader decode + ensureValid + epoch st
 #!/bin/bash
 set -e
 VERSION=$(cat VERSION.txt | tr -d '[:space:]')
-PACKAGE="rune-protocol/${VERSION}@vradu/dev"
+PACKAGE="rune-protocol/${VERSION}@<user>/dev"
 ARCH="-s arch=x86_64"
 echo "📦 $PACKAGE"
 conan install . --build=missing -s build_type=Release $ARCH --format=json > conan-graph.json
@@ -764,8 +764,8 @@ cmake . -B build -DCMAKE_OSX_ARCHITECTURES=x86_64 \
   -DCMAKE_PREFIX_PATH="$PWD/build/Release/generators" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
 cmake --build build -- VERBOSE=1
 (cd build && ctest --output-on-failure)
-conan create . --user=vradu --channel=dev $ARCH
-conan export . --user=vradu --channel=dev
+conan create . --user=<user> --channel=dev $ARCH
+conan export . --user=<user> --channel=dev
 conan list --graph=conan-graph.json --graph-binaries=build --format=json > conan-pkglist.json
 conan upload --list=conan-pkglist.json --remote=artifactory -c
 conan upload "$PACKAGE" --remote=artifactory -c
@@ -846,8 +846,8 @@ class RuneBrokerConan(ConanFile):
 
 ```yaml
 requirements:
-  - "rune-protocol/0.1.0-snapshot@vradu/dev"
-  - "common/1.0.10@vradu/dev"
+  - "rune-protocol/0.1.0-snapshot@<user>/dev"
+  - "common/1.0.10@<user>/dev"
   - "aeron/1.51.0"
   - "spdlog/1.14.0"
   - "gtest/1.16.0"

@@ -1,6 +1,6 @@
 # Client lows batch: report (rune-client-cpp, fix/client-lows)
 
-Worktree `/Users/vradu/Projects/rune-client-cpp-wt18`, branch `fix/client-lows` from `4d4a20a`. Not merged and not
+Worktree `~/Projects/rune-client-cpp-wt18`, branch `fix/client-lows` from `4d4a20a`. Not merged and not
 pushed. Mac build: `build/` (x86_64 Debug, configured as the brief says, with `RUNE_PROTOCOL_INCLUDE=/tmp/proto-main/include`
 from a `main` worktree of rune-protocol). Linux check: the arm64 `rune-client-dev-arm64:d4` container (Release, gcc 13),
 build dir `/tmp/wt18-linux`. No Rosetta hangs.

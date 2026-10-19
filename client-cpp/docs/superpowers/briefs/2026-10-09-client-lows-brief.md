@@ -1,6 +1,6 @@
 # Client lows batch: rune-client-cpp
 
-Worktree /Users/vradu/Projects/rune-client-cpp-wt18, branch fix/client-lows (from origin/main 4d4a20a). Read
+Worktree ~/Projects/rune-client-cpp-wt18, branch fix/client-lows (from origin/main 4d4a20a). Read
 CLAUDE.md first.
 
 ## Items
@@ -17,7 +17,7 @@ CLAUDE.md first.
    re-offers the whole window, which is extra traffic. Re-offer only what was refused, if the code allows it cleanly;
    otherwise rule it with numbers.
 3. **D6 rest:** client nits R2-n1..n5 and C-F21/F24/F31/F32. Find them in docs/superpowers (grep "R2-n1", "C-F21"
-   across this repo and /Users/vradu/Projects/rune-broker-wt26/docs). Also the T13 slow-client test on the old
+   across this repo and ~/Projects/rune-broker-wt26/docs). Also the T13 slow-client test on the old
    transport: move it to the default transport. /dev/shm capacity (192 failures): investigate whether still relevant,
    then fix or rule.
 
@@ -25,12 +25,12 @@ CLAUDE.md first.
 - RED-first for every behaviour fix, with `*Regression*` test names. No sleeps in tests.
 - Duty thread only; no atomics or mutex outside the allowlist (ctest guard).
 - Build: the Mac build works again. Configure a new build dir exactly like
-  /Users/vradu/Projects/rune-client-cpp/build (toolchain from rune-client-cpp/build/build/Debug/generators, Ninja,
-  -DBUILD_TESTING=ON, OPENSSL_ROOT_DIR=/Users/vradu/.conan2/p/opensc63382a50a0c7/p, -DOpenSSL_DIR=OpenSSL_DIR-NOTFOUND,
+  ~/Projects/rune-client-cpp/build (toolchain from rune-client-cpp/build/build/Debug/generators, Ninja,
+  -DBUILD_TESTING=ON, OPENSSL_ROOT_DIR=~/.conan2/p/opensc63382a50a0c7/p, -DOpenSSL_DIR=OpenSSL_DIR-NOTFOUND,
   -DCMAKE_IGNORE_PREFIX_PATH=/opt/homebrew, -DCMAKE_EXE_LINKER_FLAGS=-lz,
-  -DRUNE_CRYPTO_ROOT=/Users/vradu/Projects/rune-crypto, -DRUNE_PROTOCOL_INCLUDE=/Users/vradu/Projects/rune-protocol/include).
+  -DRUNE_CRYPTO_ROOT=~/Projects/rune-crypto, -DRUNE_PROTOCOL_INCLUDE=~/Projects/rune-protocol/include).
   The sibling rune-protocol checkout is on a feature branch; use
-  `git -C /Users/vradu/Projects/rune-protocol worktree add /tmp/proto-main main` and point RUNE_PROTOCOL_INCLUDE there.
+  `git -C ~/Projects/rune-protocol worktree add /tmp/proto-main main` and point RUNE_PROTOCOL_INCLUDE there.
 - If x86 test binaries hang at launch again (Rosetta), stop and say so in the report.
 - Run the affected targets; run the full ctest -j6 once at the end.
 - Small logical commits ending with `Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>`. Do NOT
