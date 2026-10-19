@@ -45,6 +45,7 @@ int32_t defineTopicAnywhere(AuthTrio& t, const std::vector<AuthTrio::Session>& s
 
 /// One topic with 3 partitions; part[i] = a partition broker i+1 leads (-1 = none).  A subscription / produce binds only
 /// on the partition's leader (a follower answers Redirect / NotLeader).
+int ackOrErrorCode(ShardTestClient& c, int64_t corr, std::chrono::milliseconds within);   // defined with the matrix
 struct LedTopic { int32_t id = -1; std::array<int32_t, 3> part{-1, -1, -1}; };
 LedTopic defineLedTopic(AuthTrio& t, const std::vector<AuthTrio::Session>& bs, const std::string& name) {
     LedTopic out;
@@ -298,19 +299,22 @@ TEST(AuthClusterRegression, WrongKeyBrokerNeverJoinsRegression) {
         for (int obs : {1, 2}) EXPECT_TRUE(isrHas(t, obs, 3, false, led.id)) << "node 3 re-entered an ISR seen by node " << obs;
     }
     // A client session on node 3 (its security view is on its own disk) cannot produce to a partition led elsewhere:
-    // it answers Redirect (3), nothing is stored on the leader, and node 3's frames keep being dropped (never opened).
+    // the gateway never forwards a produce, it answers Redirect (3) to the leader's endpoint (NotLeader (2) only when its
+    // routing image has no leader for the partition), and nothing is stored on the leader.
     AuthTrio::Session w3;
     ASSERT_TRUE(AuthTrio::until(30s, [&] { try { w3 = t.login(3, "writer"); return true; } catch (...) { return false; } }));
+    const bool routeKnown = t.node(3).onControlThreadForTest([&t, &led]() {
+        const MetadataService* ms = t.node(3).metadataServiceForTest();
+        const auto* pa = ms ? ms->assignment(led.id, led.part[0]) : nullptr;
+        return pa != nullptr && pa->leaderNode != rune::metadata::NO_LEADER;
+    });
     const int64_t leo0 = partitionLeo(&t.node(1), led.id, led.part[0]);
-    const uint64_t drops0 = t.node(1).peerLinksForTest().frameDrops + t.node(2).peerLinksForTest().frameDrops;
     const int64_t corr = w3.w->raw().nextCorrelationId();
     ASSERT_TRUE(w3.w->raw().produce(t.channel(3), AuthWireClient::kClientStream, w3.sid, corr, led.id, led.part[0], 1, makeBatch(1)));
-    const auto ack = w3.w->raw().awaitProduceResponseUntil(corr, Clock3::now() + 10s);
-    // The produce is never acknowledged: node 3 has no link to the leader, so the forwarded frame is dropped unopened
-    // (no answer) or refused - and, the real proof, nothing reaches the leader's log.
-    EXPECT_TRUE(!ack.has_value() || ack->errorCode != 0) << "a wrong-key broker must never acknowledge a produce";
+    const int code3 = ackOrErrorCode(w3.w->raw(), corr, 10s);
+    if (routeKnown) EXPECT_EQ(code3, 3) << "Redirect to the partition's leader";
+    else EXPECT_TRUE(code3 == 3 || code3 == 2) << "Redirect, or NotLeader while the routing image is empty; got " << code3;
     EXPECT_EQ(partitionLeo(&t.node(1), led.id, led.part[0]), leo0) << "nothing reached the leader's log";
-    EXPECT_GT(drops0, 0u) << "node 3's frames were dropped unopened by nodes 1 and 2";
 
     // Node 3 never votes in a term the others accept.  Its consensus frames do not open on nodes 1 and 2, so with the
     // consensus leader gone the survivor has only its own vote and must NOT win a term - and the control: with the
@@ -611,6 +615,11 @@ TEST(AuthClusterRegression, KeyRotationAcrossARollingRestartKeepsTrafficFlowingR
         const auto to = k + 1 < restarts.size() ? restarts[k + 1].start : loopEnd;
         const bool any = std::any_of(prod.ackedAt.begin(), prod.ackedAt.end(), [&](const auto& tp) { return tp > from && tp < to; });
         EXPECT_TRUE(any) << "no ack landed after step " << restarts[k].step << " restart of node " << restarts[k].node;
+        // recovery: restart finished -> the first acknowledged record
+        double firstMs = -1;
+        for (const auto& tp : prod.ackedAt) if (tp > from) { firstMs = std::chrono::duration<double, std::milli>(tp - from).count(); break; }
+        std::printf("ROTATION recovery step=%s node=%d restart-end-to-first-ack=%.0f ms\n", restarts[k].step, restarts[k].node, firstMs);
+        EXPECT_TRUE(firstMs >= 0 && firstMs <= 3000.0) << "step " << restarts[k].step << " node " << restarts[k].node << ": first ack after " << firstMs << " ms (bound 3000)";
     }
 }
 
