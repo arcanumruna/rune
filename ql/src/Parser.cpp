@@ -1254,4 +1254,15 @@ std::expected<std::vector<Statement>, ScriptError> parseScript(std::string_view 
     return out;
 }
 
+// Phase 2b Part D: the console's continuation rule, on the SAME lexer as parse(),
+// so comments ('--') and strings ('...') are skipped exactly as the parser skips them.
+InputState classifyInput(std::string_view src) noexcept {
+    Lexer lex{src};
+    Token t = lex.next();
+    if (t.kind == TK::Eof) return InputState::Empty;
+    TK last = t.kind;
+    for (t = lex.next(); t.kind != TK::Eof; t = lex.next()) last = t.kind;
+    return last == TK::Semi ? InputState::Complete : InputState::Incomplete;
+}
+
 } // namespace rune::ql
