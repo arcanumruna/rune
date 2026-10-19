@@ -8390,6 +8390,17 @@ uint16_t ClientGateway::viewRowGate_(int32_t viewTopicId, int32_t partition) con
     // VLS B.2: a sink owns no placement -- the view partition IS the source partition, so its gate is the source's.
     if (st == St::ViewSink) {
         const int32_t src = viewSourceOf_(viewTopicId);
+        // I3 (fail closed): the sink mirrors its source's partitioning; a catalog that says otherwise can never be
+        // routed (the view partition IS the source partition).  Permanent UnknownView, never a wrong-table read.
+        const rune::node::TopicSpec* sinkSpec = topicRegistry_->viewSinkSpec(viewTopicId);
+        const rune::node::TopicSpec* srcSpec  = src >= 0 ? topicRegistry_->topic(src) : nullptr;
+        if (sinkSpec != nullptr && srcSpec != nullptr && sinkSpec->partitionCount != srcSpec->partitionCount) [[unlikely]] {
+            if (viewSinkMismatchLogs_++ % 1024 == 0)
+                spdlog::critical("ClientGateway: view sink id={} has {} partition(s) but its source id={} has {} -- GetViewRow "
+                                 "answers UnknownView (a sink mirrors its source's partitioning; fix the catalog)",
+                                 viewTopicId, sinkSpec->partitionCount, src, srcSpec->partitionCount);
+            return pc::ViewRowResponse::kUnknownView;
+        }
         return (src >= 0 && !placementCommitted_(src, partition)) ? pc::ViewRowResponse::kNotReady : kViewRowNoGate;
     }
     if (st == St::Pending || (st == St::Unknown && placementCommitted_(viewTopicId, 0)) ||
@@ -8470,7 +8481,8 @@ void ClientGateway::handleGetViewRow(const uint8_t* buf, std::size_t len)
     op.hwBound       = static_cast<int64_t>(m.requestedFingerprint); // requestedFingerprint (reused field)
 
     // VLS B.2: route by the SOURCE topic (the sink has no router entry); op.topicId stays the view id.
-    const int32_t routeTopic = viewSourceOf_(m.viewTopicId) >= 0 ? viewSourceOf_(m.viewTopicId) : m.viewTopicId;
+    const int32_t viewSrc    = viewSourceOf_(m.viewTopicId);
+    const int32_t routeTopic = viewSrc >= 0 ? viewSrc : m.viewTopicId;
     if (!workerPool_->tryEnqueueOp(routeTopic, partition, std::move(op))) {
         // Back-pressure: the worker ingress ring is full this cycle.  No-hang
         // (R2): answered ViewRowResponse{Busy (6)} — the read was not performed;
@@ -9073,13 +9085,14 @@ void ClientGateway::handleMetadata(const uint8_t* buf, std::size_t len)
             // D1: a ZERO-partition __orphan.<id> placeholder recovered at boot
             // keeps its pre-restart assignment in __cluster_metadata).
             if (topicRegistry_) {
-                if (topicId >= topicRegistry_->topicCount()) continue;
+                // M1: a source that fails a registry filter lists neither itself nor its sinks (alias 0 ends the loop).
+                if (topicId >= topicRegistry_->topicCount()) { if (alias == 0) break; continue; }
                 const rune::node::TopicSpec* spec = alias > 0 ? topicRegistry_->viewSinkSpec(topicId)
                                                               : topicRegistry_->topic(topicId);
-                if (spec == nullptr || partition >= spec->partitionCount) continue;
+                if (spec == nullptr || partition >= spec->partitionCount) { if (alias == 0) break; continue; }
                 // Task 8 (C1 generalized): a catalog topic is listed once its
                 // placement is committed (the bootstrap image is not committed).
-                if (topicRegistry_->placementGated(topicId) && !img->committed()) continue;
+                if (topicRegistry_->placementGated(topicId) && !img->committed()) { if (alias == 0) break; continue; }
             }
 
             // Filter: requested topics only (when non-empty topic list in request).

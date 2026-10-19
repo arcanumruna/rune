@@ -95,10 +95,11 @@ public:
     static constexpr std::string_view kOtherEndpoint = "aeron:udp?endpoint=10.0.0.2:40123";
     enum class Mode : uint8_t { ServedHere, SourceLedElsewhere };
 
-    GatewayViewReadRig(Mode mode, std::size_t fillers)
+    GatewayViewReadRig(Mode mode, std::size_t fillers, int32_t workerCount = 1)
         : dir_(makeDir_()),
           srcLog(dir_ + "/src"),
           vsDir_(dir_ + "/views"),
+          pool(workerCount, rune::metadata::ShardRouter(workerCount), 1 << 22, 1 << 25, 64, 64),
           gw(rune::gateway::ClientGateway::makeForTest(
               [this](const uint8_t* b, std::size_t n) -> int64_t { onFrame_(b, n); return 1; }, 1)) {
         namespace vd = view_read_rig_detail;
@@ -152,8 +153,11 @@ public:
             rune::node::Worker::OwnedSet owned;
             for (auto& f : fillerReps) owned.push_back(f.get());
             owned.push_back(src.get());
-            pool.worker(0).setOwnedDirect(owned);
-            pool.worker(0).setViewSet(vs.get());
+            srcOwner = pool.ownerWorkerId(kSrcTopic, 0);
+            for (int32_t w = 0; w < pool.workerCount(); ++w) {
+                if (w == srcOwner) pool.worker(w).setOwnedDirect(owned);
+                pool.worker(w).setViewSet(vs.get());   // every worker has the plan (the install ring reaches all)
+            }
         }
         // 7. the gateway
         registry = std::make_unique<rune::gateway::TopicRegistry>(std::vector<rune::node::TopicSpec>{}, dir_ + "/reg");
@@ -161,6 +165,7 @@ public:
             rune::node::TopicSpec vsSpec;
             vsSpec.name = "char_hp";
             vsSpec.partitionCount = 1;
+            vsSpec.viewSink = true;   // VLS B.2: a catalog-only sink, exactly what the broker registers
             if (registry->createTopicAt(kViewTopic, vsSpec) != kViewTopic)
                 throw std::logic_error("GatewayViewReadRig: createTopicAt(view sink) did not give the view topic id");
         }
@@ -212,9 +217,22 @@ public:
         for (int k = 0; k < 64 && viewOk + viewOther + redirects + errOther == before; ++k) pass();
         return viewOk == okBefore + 1 && viewOk + viewOther + redirects + errOther == before + 1;
     }
+    /// The error code of the last frame: ErrorResponse.code, else the first body int16 (Produce/SubscribeResponse).
+    int32_t lastCode() const {
+        namespace pc = rune::protocol::client;
+        const auto h = pc::MessageHeader::decode(lastFrame.data(), lastFrame.size());
+        if (!h) return -1000;
+        if (h->templateId == pc::ErrorResponse::TEMPLATE_ID) {
+            const auto r = pc::ErrorResponse::decode(lastFrame.data(), lastFrame.size());
+            return r ? r->code : -1001;
+        }
+        const std::size_t o = pc::MessageHeader::ENCODED_SIZE;
+        if (lastFrame.size() < o + 2) return -1002;
+        return static_cast<int16_t>(lastFrame[o] | (lastFrame[o + 1] << 8));
+    }
     void pass() {
         now += 1'000'000;
-        (void)pool.worker(0).doWork(now);
+        for (int32_t w = 0; w < pool.workerCount(); ++w) (void)pool.worker(w).doWork(now);
         channel.deltas.drain([](int32_t, aeron::concurrent::AtomicBuffer&, aeron::util::index_t, aeron::util::index_t) {},
                              1 << 20);
         gw.drainWorkerReturnsForTest(now);
@@ -235,9 +253,11 @@ public:
     std::unique_ptr<rune::node::WorkerViewSet>                     vs;
     rune::view::RowLayout                                          layout;
     std::unique_ptr<rune::gateway::TopicRegistry>                  registry;
-    rune::node::WorkerPool                                         pool{1, rune::metadata::ShardRouter(1), 1 << 22, 1 << 25, 64, 64};
+    rune::node::WorkerPool                                         pool;
     rune::gateway::ClientGateway                                   gw;
     int64_t                                                        sid = 0;
+    int32_t                                                        srcOwner = 0;
+    std::vector<uint8_t>                                           lastFrame;   ///< the last egress frame (any type)
     int64_t                                                        now = 1'000'000'000;
 
 private:
@@ -255,6 +275,7 @@ private:
     }
     void onFrame_(const uint8_t* b, std::size_t n) {
         namespace pc = rune::protocol::client;
+        lastFrame.assign(b, b + n);
         const auto h = pc::MessageHeader::decode(b, n);
         if (!h) { ++otherFrames; return; }
         if (h->templateId == pc::ViewRowResponse::TEMPLATE_ID) {

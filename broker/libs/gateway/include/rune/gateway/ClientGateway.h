@@ -1805,6 +1805,7 @@ private:
     /// VLS B.3: true (and answered InvalidRequest) when `topicId` is a view sink.  Call AFTER authorization.
     bool refuseViewSink_(const uint8_t* buf, std::size_t len, int32_t topicId, const char* what);
     uint64_t viewSinkRefusals_ = 0;
+    mutable uint64_t viewSinkMismatchLogs_ = 0;   ///< I3: rate limit of the critical partition-mismatch log
     bool answerRejection_(Session& session, const rune::protocol::client::MessageHeader& hdr,
                           uint16_t code, const char* why, const uint8_t* buf, std::size_t len);
     // No-hang fix rounds 4-5 (item 8 / N23): make a pre-v5 client's
