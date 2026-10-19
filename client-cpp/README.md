@@ -40,8 +40,8 @@ auto diff    = client.catalogDiff(a, b, 10s);        // DIFF
 ```
 
 The catalog reads block and may be called only from the thread that constructed the `Client`;
-another thread constructs its own `CatalogReader`. A DDL answered by a broker older than client
-version 8 is not routed; upgrade clients before running DDL against a multi-node cluster.
+another thread constructs its own `CatalogReader`. A client older than version 8 cannot follow a DDL Redirect: a non-leader broker answers its DDL
+`InvalidRequest`. Upgrade clients before running DDL against a multi-node cluster.
 
 ### CLI
 
