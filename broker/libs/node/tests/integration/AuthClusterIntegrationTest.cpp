@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <mutex>
+#include <set>
 #include <spdlog/sinks/base_sink.h>
 
 using namespace rune::node;
@@ -370,4 +371,121 @@ TEST(AuthClusterRegression, SecurityDdlRetryAfterLeaderKillAppliesOnceRegression
     t.restart(leader, t.keyContentsPath(leader));
     ASSERT_TRUE(t.awaitDigestsAgree(before + 1, 60s));
     EXPECT_EQ(countIn(t.node(leader)), 1);
+}
+
+// D33/D34: a producer and a consumer through three rolling restarts of the cluster key: (K1 | K2) -> (K2 | K1) -> (K2).
+// After every restart all links re-establish (counter 233 == 2 on each broker) and the consumer sees every acked record
+// exactly once, offsets contiguous.  Records are produced before, WHILE a broker is down, and after each restart.
+TEST(AuthClusterRegression, KeyRotationAcrossARollingRestartKeepsTrafficFlowingRegression) {
+    AuthTrio t("rotate");
+    t.start();
+    t.bootstrapAdmin();
+    createBuilder(t);
+    t.createUser(1, "prod");
+    t.grant(1, "prod", SO::Write, ST::Topic, SP::Prefix, "rot.");
+    t.createUser(1, "cons");
+    t.grant(1, "cons", SO::Read, ST::Topic, SP::Prefix, "rot.");
+    std::vector<AuthTrio::Session> bs{t.login(1, "builder")};
+    const int32_t topic = defineTopicAnywhere(t, bs, "rot.t", 1);
+    ASSERT_GE(topic, 0);
+
+    const std::string k1 = t.keyContentsPath(1);
+    const std::string k2 = t.makeKeyFile("k2.key", 'Q');
+    int acked = 0, attempted = 0;
+    auto liveNode = [&](int avoid) { for (int id : {1, 2, 3}) if (id != avoid && t.cluster().running(id)) return id; return -1; };
+    auto leaderNode = [&](int avoid) -> int {
+        const int via = liveNode(avoid);
+        AuthTrio::Session b = t.login(via, "builder");
+        for (int i = 0; i < 400; ++i) {
+            const int32_t l = leaderOf(t, b, topic, 0);
+            if (l >= 1 && l <= 3 && t.cluster().running(l)) return l;
+            std::this_thread::sleep_for(25ms);
+        }
+        return -1;
+    };
+    auto produceSome = [&](int n, int avoid) {
+        const int l = leaderNode(avoid);
+        ASSERT_GT(l, 0) << "no live topic leader";
+        AuthTrio::Session p;
+        ASSERT_TRUE(AuthTrio::until(30s, [&] { try { p = t.login(l, "prod"); return true; } catch (...) { return false; } }));
+        for (int i = 0; i < n; ++i) {
+            ++attempted;
+            const auto ack = p.w->raw().produceUntilOk(t.channel(l), AuthWireClient::kClientStream, p.sid, topic, 0, 1, makeBatch(1), 200);
+            ASSERT_TRUE(ack.has_value()) << "produce through node " << l;
+            ++acked;
+        }
+    };
+    auto allLinked = [&] {
+        return AuthTrio::until(60s, [&] {
+            for (int id : {1, 2, 3}) if (t.counter(id, kPeerLinksEstablishedCounterTypeId).value_or(0) != 2) return false;
+            return true;
+        });
+    };
+
+    produceSome(3, 0);
+    ASSERT_TRUE(allLinked());
+    struct Step { const char* name; std::string cur, next; };
+    const std::vector<Step> steps = {{"K1|K2", k1, k2}, {"K2|K1", k2, k1}, {"K2", k2, ""}};
+    for (const Step& st : steps) {
+        for (int id : {1, 2, 3}) {
+            t.stopNode(id);
+            produceSome(2, id);   // traffic flows with one broker down
+            const auto t0 = Clock3::now();
+            t.restart(id, st.cur, st.next);
+            ASSERT_TRUE(allLinked()) << "step " << st.name << ": links after restarting node " << id;
+            const double ms = std::chrono::duration<double, std::milli>(Clock3::now() - t0).count();
+            std::printf("ROTATION step=%s node=%d links-reestablished-after=%.0f ms\n", st.name, id, ms);
+            ASSERT_TRUE(awaitSecurityLeader(t.cluster(), 60s));
+            produceSome(2, 0);
+        }
+    }
+
+    // The consumer reads the partition from offset 0 off its leader: every acked record, contiguous, no duplicates.
+    const int l = leaderNode(0);
+    ASSERT_GT(l, 0);
+    AuthTrio::Session c;
+    ASSERT_TRUE(AuthTrio::until(30s, [&] { try { c = t.login(l, "cons"); return true; } catch (...) { return false; } }));
+    auto& raw = c.w->raw();
+    int64_t corr = 0;
+    ASSERT_TRUE(AuthTrio::until(60s, [&] {
+        corr = raw.sendSubscribe(t.channel(l), AuthWireClient::kClientStream, c.sid, topic, 0);
+        const auto code = raw.awaitSubscribeCode(corr, Clock3::now() + 10s);
+        return code && *code == 0;
+    }));
+    const int64_t sub = raw.subscriptionIdOf(corr).value_or(0);
+    std::set<int64_t> offsets;
+    raw.pollUntil([&] {
+        for (const auto& p : raw.records()) if (p.subscriptionId == sub) offsets.insert(p.baseOffset);
+        return static_cast<int>(offsets.size()) >= acked;
+    });
+    EXPECT_GE(static_cast<int>(offsets.size()), acked) << "every acked record is delivered";
+    EXPECT_LE(static_cast<int>(offsets.size()), attempted);
+    int64_t expect = 0;
+    for (const int64_t o : offsets) EXPECT_EQ(o, expect++) << "offsets contiguous";
+}
+
+// D8: AuthServerFirst for an unknown user carries the same fake salt and iteration count from every broker (derived from
+// the replicated fake-salt seed), so a client cannot tell the brokers apart or an absent user from a present one.
+TEST(AuthClusterRegression, UnknownUserSaltIsTheSameOnEveryBrokerRegression) {
+    AuthTrio t("salt");
+    t.start();
+    t.bootstrapAdmin();
+    t.createUser(1, "alice");
+    ASSERT_TRUE(t.awaitDigestsAgree(1, 30s));
+    struct Seen { std::string salt; uint32_t iterations = 0; };
+    std::vector<Seen> seen;
+    for (int id : {1, 2, 3}) {
+        AuthWireClient& w = t.newWire(id);
+        const int64_t sid = w.connect(t.channel(id));
+        ASSERT_GT(sid, 0);
+        const auto l = w.login(t.channel(id), sid, "nobody", {"x", "x"}, 0, /*sendFinal=*/false);
+        ASSERT_TRUE(l.first.has_value()) << "node " << id;
+        ASSERT_GE(l.first->count, 1);
+        seen.push_back({std::string(l.first->salts[0].salt), l.first->salts[0].iterations});
+    }
+    EXPECT_FALSE(seen[0].salt.empty());
+    for (int i = 1; i < 3; ++i) {
+        EXPECT_EQ(seen[i].salt, seen[0].salt) << "node " << i + 1;
+        EXPECT_EQ(seen[i].iterations, seen[0].iterations) << "node " << i + 1;
+    }
 }
