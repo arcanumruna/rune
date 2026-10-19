@@ -32,7 +32,7 @@ PeerLinkAgent::PeerLinkAgent(std::shared_ptr<aeron::Aeron> aeron, Params params,
     if (!sub_) throw std::runtime_error("PeerLinkAgent: the peer-auth subscription did not resolve");
     peers_.reserve(params.peers.size());
     for (const auto& peer : params.peers)
-        peers_.push_back(PeerSlot{peer.id, pl::PeerHandshake(params.selfId, peer.id, params.incarnation, params.keys), 0});
+        peers_.push_back(PeerSlot{peer.id, pl::PeerHandshake(params.selfId, peer.id, params.incarnation, params.keys), 0, 0});
 }
 
 PeerLinkAgent::PeerSlot* PeerLinkAgent::slot_(int32_t id) noexcept {
@@ -56,9 +56,9 @@ void PeerLinkAgent::absorb_(PeerSlot& p, pl::PeerHandshake::Out&& o, int64_t now
         if (o.logIsError) {
             ++refusals_;   // counter 1'000'234 counts every refusal ...
             if (p.refusals++ % kLogEvery == 0)   // ... the log line is rate-limited (a retry every 200 ms would flood it)
-                spdlog::error("BrokerNode[{}]: {}{}", self_, *o.log, p.refusals > 1 ? " (repeated)" : "");
+                spdlog::error("BrokerNode[{}]: {}{}", self_, o.log->view(), p.refusals > 1 ? " (repeated)" : "");
         } else {
-            spdlog::info("BrokerNode[{}]: {}", self_, *o.log);
+            spdlog::info("BrokerNode[{}]: {}", self_, o.log->view());
         }
     }
     if (o.frame) sink_.send(static_cast<rune::consensus::NodeId>(p.id), o.frame->data(), o.frame->size());
@@ -100,7 +100,14 @@ int PeerLinkAgent::doWork(int64_t nowNs) {
 }
 
 void PeerLinkAgent::onUnknownEpoch(int32_t peer, uint32_t epoch, int64_t nowNs) {
-    if (PeerSlot* p = slot_(peer)) p->hs.onUnknownEpoch(epoch, nowNs);
+    if (PeerSlot* p = slot_(peer)) absorb_(*p, p->hs.onUnknownEpoch(epoch, nowNs), nowNs);
+}
+
+void PeerLinkAgent::observeAuthFrames(int32_t peer, uint64_t total, int64_t nowNs) noexcept {
+    PeerSlot* p = slot_(peer);
+    if (p == nullptr || total == p->authSeen) return;
+    p->authSeen = total;
+    p->hs.onAuthenticated(nowNs);
 }
 
 } // namespace rune::node

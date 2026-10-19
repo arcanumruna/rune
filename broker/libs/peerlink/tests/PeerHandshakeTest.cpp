@@ -31,9 +31,12 @@ struct Pair {
 
     void absorb(int producedBy, pl::PeerHandshake::Out o) {
         auto& logs = producedBy == 0 ? logsA : logsB;
-        if (o.log) logs.push_back(*o.log);
+        if (o.log) logs.push_back(o.log->str());
         if (o.established) (producedBy == 0 ? ka : kb) = o.established;
-        if (o.frame) { q.emplace_back(1 - producedBy, *o.frame); trace.emplace_back(1 - producedBy, *o.frame); }
+        if (o.frame) {
+            std::vector<uint8_t> v(o.frame->data(), o.frame->data() + o.frame->size());
+            q.emplace_back(1 - producedBy, v); trace.emplace_back(1 - producedBy, v);
+        }
     }
 
     void deliver(int to, const std::vector<uint8_t>& f, int64_t now) {
@@ -87,7 +90,7 @@ TEST(PeerHandshakeRegression, SameKeyEstablishesMatchingLinkKeys) {
 TEST(PeerLinkRegression, WrongKeyIsRefusedAndLoggedOnBothSidesRegression) {
     Pair p(keys('k'), keys('x')); p.run();
     EXPECT_FALSE(p.ka || p.kb);
-    EXPECT_TRUE(std::holds_alternative<pl::Refused>(p.a.state()));
+    EXPECT_TRUE(std::holds_alternative<pl::HelloSent>(p.a.state())) << "a Refuse is logged only: the state stays";
     ASSERT_FALSE(p.logsA.empty()); ASSERT_FALSE(p.logsB.empty());
     EXPECT_NE(p.logsA.back().find("REFUSED by 2"), std::string::npos) << p.logsA.back();
     EXPECT_NE(p.logsA.back().find("no common cluster key"), std::string::npos) << p.logsA.back();
@@ -123,20 +126,10 @@ TEST(PeerHandshakeRegression, AReplayedHelloOrProofNeverEstablishes) {
     EXPECT_NE(ch.nonceB, lastOf<pl::PeerChallenge>(p, 0).nonceB) << "a replayed Hello meets a new nonceB";
     auto r = fresh.onProof(proof, 0);                    // the old Proof is bound to the old nonceB
     EXPECT_FALSE(r.established);
-    ASSERT_TRUE(r.frame);
-    pl::PeerRefuse ref; ASSERT_TRUE(pl::PeerRefuse::decode(r.frame->data(), r.frame->size(), ref));
-    EXPECT_EQ(ref.reason, pl::RefuseReason::BadProof);
+    EXPECT_FALSE(r.frame) << "a bad Proof is logged, never answered";
     EXPECT_FALSE(std::holds_alternative<pl::Established>(fresh.state()));
     ASSERT_TRUE(r.log);
     EXPECT_TRUE(r.logIsError);
-
-    // An older incarnation than the one established: Refuse{StaleIncarnation}; the live link is untouched.
-    pl::PeerHello old = hello; old.incarnation = 9;
-    auto s = p.b.onHello(old, 0);
-    ASSERT_TRUE(s.frame);
-    ASSERT_TRUE(pl::PeerRefuse::decode(s.frame->data(), s.frame->size(), ref));
-    EXPECT_EQ(ref.reason, pl::RefuseReason::StaleIncarnation);
-    EXPECT_TRUE(std::holds_alternative<pl::Established>(p.b.state()));
 }
 
 TEST(PeerHandshakeRegression, AReflectedChallengeMacIsNotAValidProof) {
@@ -149,25 +142,21 @@ TEST(PeerHandshakeRegression, AReflectedChallengeMacIsNotAValidProof) {
     pl::PeerProof reflected; reflected.from = 1; reflected.to = 2; reflected.macA = ch.macB;   // B's own MAC as A's Proof
     auto r = b.onProof(reflected, 0);
     EXPECT_FALSE(r.established);
-    ASSERT_TRUE(r.frame);
-    pl::PeerRefuse ref; ASSERT_TRUE(pl::PeerRefuse::decode(r.frame->data(), r.frame->size(), ref));
-    EXPECT_EQ(ref.reason, pl::RefuseReason::BadProof);
+    EXPECT_FALSE(r.frame);
+    EXPECT_TRUE(r.logIsError);
 }
 
-TEST(PeerHandshakeRegression, RefusedRetriesEvery200ms) {
+TEST(PeerHandshakeRegression, ARefusedInitiatorKeepsRetryingTheSameHelloEvery200ms) {
     pl::PeerHandshake a(1, 2, 10, keys('k')), b(2, 1, 20, keys('x'));
     auto h = a.tick(0); ASSERT_TRUE(h.frame);
     pl::PeerHello first; ASSERT_TRUE(pl::PeerHello::decode(h.frame->data(), h.frame->size(), first));
     auto r = b.onHello(first, 1 * kMs); ASSERT_TRUE(r.frame);
     pl::PeerRefuse ref; ASSERT_TRUE(pl::PeerRefuse::decode(r.frame->data(), r.frame->size(), ref));
-    (void)a.onRefuse(ref, 5 * kMs);
-    ASSERT_TRUE(std::holds_alternative<pl::Refused>(a.state()));
-    EXPECT_FALSE(a.tick(204 * kMs + 999'999).frame) << "nothing before +200 ms";
-    auto again = a.tick(205 * kMs);
-    ASSERT_TRUE(again.frame) << "a fresh Hello at +200 ms";
-    pl::PeerHello second; ASSERT_TRUE(pl::PeerHello::decode(again.frame->data(), again.frame->size(), second));
-    EXPECT_NE(second.nonceA, first.nonceA) << "a new nonce";
-    EXPECT_TRUE(std::holds_alternative<pl::HelloSent>(a.state()));
+    auto lg = a.onRefuse(ref, 5 * kMs);
+    EXPECT_TRUE(lg.log && lg.logIsError) << "logged";
+    EXPECT_TRUE(std::holds_alternative<pl::HelloSent>(a.state())) << "a Refuse carries no MAC: the state stays";
+    EXPECT_FALSE(a.tick(199 * kMs).frame);
+    EXPECT_TRUE(a.tick(200 * kMs).frame);
 }
 
 TEST(PeerHandshakeRegression, AnUnansweredHelloIsRepeatedWithTheSameNonce) {
@@ -197,20 +186,6 @@ TEST(PeerHandshakeRegression, APeerRestartWithAHigherIncarnationReestablishesWit
     ASSERT_NE(est, nullptr);
     EXPECT_EQ(est->peerIncarnation, 21u);
 
-    // Afterwards an OLDER incarnation never displaces the live link — as Hello at the responder ...
-    pl::PeerHello oldHello; oldHello.from = 1; oldHello.to = 2; oldHello.keyId = keys('k').current.keyId; oldHello.incarnation = 9;
-    auto s = p.b.onHello(oldHello, 3'000 * kMs);
-    ASSERT_TRUE(s.frame);
-    pl::PeerRefuse ref; ASSERT_TRUE(pl::PeerRefuse::decode(s.frame->data(), s.frame->size(), ref));
-    EXPECT_EQ(ref.reason, pl::RefuseReason::StaleIncarnation);
-    // ... and as Challenge at the initiator.
-    pl::PeerChallenge oldCh; oldCh.from = 2; oldCh.to = 1; oldCh.keyId = keys('k').current.keyId; oldCh.incarnation = 19;
-    auto t = p.a.onChallenge(oldCh, 3'000 * kMs);
-    ASSERT_TRUE(t.frame);
-    ASSERT_TRUE(pl::PeerRefuse::decode(t.frame->data(), t.frame->size(), ref));
-    EXPECT_EQ(ref.reason, pl::RefuseReason::StaleIncarnation);
-    EXPECT_TRUE(std::holds_alternative<pl::Established>(p.a.state()));
-    EXPECT_TRUE(std::holds_alternative<pl::Established>(p.b.state()));
 }
 
 TEST(PeerHandshakeRegression, AnInitiatorRestartReestablishesWithAHigherIncarnationHello) {
@@ -226,17 +201,19 @@ TEST(PeerHandshakeRegression, AnInitiatorRestartReestablishesWithAHigherIncarnat
     EXPECT_EQ(est->peerIncarnation, 11u);
 }
 
-TEST(PeerHandshakeRegression, AnUnknownEpochFrameTriggersARehandshake) {
+TEST(PeerHandshakeRegression, AnUnknownEpochFromASilentPeerRekeysWithoutDroppingTheLiveKeys) {
     Pair p(keys('k'), keys('k')); p.run();
     ASSERT_TRUE(p.ka && p.kb);
     const auto firstHello = lastOf<pl::PeerHello>(p, 1);
     p.ka.reset(); p.kb.reset();
-    p.a.onUnknownEpoch(7, 5'000 * kMs);
-    auto o = p.a.tick(5'000 * kMs);
-    ASSERT_TRUE(o.frame) << "a fresh Hello at once";
+    auto o = p.a.onUnknownEpoch(7, 5'000 * kMs);   // silent for 5 s: the hint may start an exchange
+    ASSERT_TRUE(o.frame) << "a fresh Hello";
+    const auto* hs = std::get_if<pl::HelloSent>(&p.a.state());
+    ASSERT_NE(hs, nullptr);
+    ASSERT_TRUE(hs->prior) << "the old keys stay live until the exchange completes";
     pl::PeerHello again; ASSERT_TRUE(pl::PeerHello::decode(o.frame->data(), o.frame->size(), again));
     EXPECT_NE(again.nonceA, firstHello.nonceA);
-    p.q.emplace_back(1, *o.frame);
+    p.absorb(0, std::move(o));
     p.run(5'000 * kMs);
     ASSERT_TRUE(p.ka && p.kb);
     EXPECT_EQ(p.ka->epoch, 2u);
@@ -246,7 +223,7 @@ TEST(PeerHandshakeRegression, AnUnknownEpochFrameTriggersARehandshake) {
 TEST(PeerHandshakeRegression, TheCurrentEpochNamedAsUnknownIsIgnored) {
     Pair p(keys('k'), keys('k')); p.run();
     ASSERT_TRUE(p.ka);
-    p.a.onUnknownEpoch(p.ka->epoch, 5'000 * kMs);
+    EXPECT_FALSE(p.a.onUnknownEpoch(p.ka->epoch, 5'000 * kMs).frame);
     EXPECT_TRUE(std::holds_alternative<pl::Established>(p.a.state()));
 }
 
@@ -264,37 +241,19 @@ TEST(PeerHandshakeRegression, AForgedAcceptNeverEstablishesTheInitiator) {
     EXPECT_TRUE(std::holds_alternative<pl::ChallengeSent>(a.state())) << "still waiting for the real Accept";
 }
 
-TEST(PeerHandshakeRegression, AnUnprovenHelloNeverRaisesTheIncarnationHighWater) {
-    Pair p(keys('k'), keys('k')); p.run();
-    ASSERT_TRUE(p.ka && p.kb);
-    pl::PeerHello huge = lastOf<pl::PeerHello>(p, 1); huge.incarnation = ~uint64_t{0} >> 1;   // never followed by a Proof
-    (void)p.b.onHello(huge, 10 * kMs);
-    p.ka.reset(); p.kb.reset();
-    // The real initiator (incarnation 10) can still re-handshake: the bogus Hello proved nothing.
-    p.q.clear();
-    p.a.onUnknownEpoch(42, 3'000 * kMs);
-    p.run(3'000 * kMs);
-    EXPECT_TRUE(p.ka && p.kb);
-}
-
-TEST(PeerHandshakeRegression, ADuplicateHelloGetsTheSameChallengeAndAnUnansweredOneExpiresToThePriorLink) {
+TEST(PeerHandshakeRegression, ADuplicateHelloGetsTheSameChallengeAndNeverLeavesEstablished) {
     Pair p(keys('k'), keys('k')); p.run();
     ASSERT_TRUE(p.ka && p.kb);
     const auto* before = std::get_if<pl::Established>(&p.b.state());
     ASSERT_NE(before, nullptr);
-    const pl::LinkKeys liveKeys = before->keys;
 
     pl::PeerHello hello = lastOf<pl::PeerHello>(p, 1);
     hello.nonceA.fill(0x42);
-    auto c1 = p.b.onHello(hello, 100 * kMs);
-    auto c2 = p.b.onHello(hello, 150 * kMs);
+    auto c1 = p.b.onHello(hello, 300 * kMs);
+    auto c2 = p.b.onHello(hello, 350 * kMs);
     ASSERT_TRUE(c1.frame && c2.frame);
     EXPECT_EQ(*c1.frame, *c2.frame) << "idempotent for a repeated Hello";
-    EXPECT_TRUE(std::holds_alternative<pl::ChallengeSent>(p.b.state()));
-    (void)p.b.tick(100 * kMs + pl::PeerHandshake::kAwaitNs + 1);   // nobody proved anything
-    const auto* after = std::get_if<pl::Established>(&p.b.state());
-    ASSERT_NE(after, nullptr) << "the live link is restored";
-    EXPECT_EQ(after->keys, liveKeys);
+    EXPECT_TRUE(std::holds_alternative<pl::Established>(p.b.state())) << "an unproven Hello never leaves Established";
 }
 
 TEST(PeerHandshakeRegression, AResponderWithoutALinkPokesAndAnEstablishedInitiatorRestarts) {
@@ -307,14 +266,16 @@ TEST(PeerHandshakeRegression, AResponderWithoutALinkPokesAndAnEstablishedInitiat
     EXPECT_TRUE(b.tick(200 * kMs).frame) << "every 200 ms";
 }
 
-TEST(PeerHandshakeRegression, AStaleNoLinkRightAfterEstablishmentIsIgnored) {
+TEST(PeerHandshakeRegression, ANoLinkPokeFromASilentPeerRekeysAndFromALivePeerIsIgnored) {
     Pair p(keys('k'), keys('k')); p.run(1'000 * kMs);
     ASSERT_TRUE(p.ka);
     pl::PeerRefuse poke; poke.from = 2; poke.to = 1; poke.reason = pl::RefuseReason::NoLink;
-    (void)p.a.onRefuse(poke, 1'000 * kMs + 10 * kMs);
+    p.a.onAuthenticated(1'900 * kMs);
+    EXPECT_FALSE(p.a.onRefuse(poke, 2'000 * kMs).frame) << "an authenticated frame 100 ms ago: the peer is alive";
     EXPECT_TRUE(std::holds_alternative<pl::Established>(p.a.state()));
-    (void)p.a.onRefuse(poke, 1'000 * kMs + pl::PeerHandshake::kNoLinkGuardNs + kMs);
-    EXPECT_TRUE(std::holds_alternative<pl::LinkIdle>(p.a.state()));
+    auto o = p.a.onRefuse(poke, 3'000 * kMs);
+    EXPECT_TRUE(o.frame) << "silent for 1.1 s: a Hello, with the old keys kept";
+    EXPECT_TRUE(std::holds_alternative<pl::HelloSent>(p.a.state()));
 }
 
 TEST(PeerHandshakeRegression, AFrameFromAHigherIdThanTheInitiatorIsNotAPeer) {
@@ -338,4 +299,213 @@ TEST(PeerHandshakeRegression, MessagesRoundTripAndRejectWrongSizes) {
     pl::PeerRefuse r; r.reason = pl::RefuseReason::BadProof; r.encode(buf);
     buf[9] = 9;
     EXPECT_FALSE(pl::PeerRefuse::decode(buf, pl::PeerRefuse::kSize, r)) << "an unknown reason is not a frame";
+}
+
+// ---- Task 11 (M12): unauthenticated input never changes link state ----
+
+TEST(PeerLinkRegression, AForgedUnknownEpochNeverRehandshakesRegression) {
+    Pair p(keys('k'), keys('k')); p.run();
+    ASSERT_TRUE(p.ka);
+    // The peer is alive (authenticated frames keep arriving) while a forger names epochs.
+    for (int i = 1; i <= 50; ++i) {
+        const int64_t now = 10'000 * kMs + i * 10 * kMs;
+        p.a.onAuthenticated(now - kMs);
+        EXPECT_FALSE(p.a.onUnknownEpoch(1000 + i, now).frame) << i;
+        ASSERT_TRUE(std::holds_alternative<pl::Established>(p.a.state()));
+    }
+    // Even a silent peer is rekeyed at most once per 200 ms, and the keys survive each attempt.
+    const auto first = p.a.onUnknownEpoch(9, 100'000 * kMs);
+    ASSERT_TRUE(first.frame);
+    const auto* hs = std::get_if<pl::HelloSent>(&p.a.state());
+    ASSERT_NE(hs, nullptr);
+    EXPECT_TRUE(hs->prior);
+}
+
+TEST(PeerLinkRegression, ForgedRefuseChallengeHelloNoLinkNeverDisruptALinkRegression) {
+    Pair p(keys('k'), keys('k')); p.run(1'000 * kMs);
+    ASSERT_TRUE(p.ka && p.kb);
+    const pl::LinkKeys liveA = p.ka->epoch ? *p.ka : *p.ka;
+    p.a.onAuthenticated(1'500 * kMs);
+    const int64_t now = 1'600 * kMs;
+    // At the initiator: Refuse of every reason, a Challenge with a garbage mac.
+    for (auto reason : {pl::RefuseReason::NoCommonKey, pl::RefuseReason::BadProof, pl::RefuseReason::NotAPeer,
+                        pl::RefuseReason::StaleIncarnation, pl::RefuseReason::NoLink}) {
+        pl::PeerRefuse r; r.from = 2; r.to = 1; r.reason = reason;
+        (void)p.a.onRefuse(r, now);
+        ASSERT_TRUE(std::holds_alternative<pl::Established>(p.a.state())) << static_cast<int>(reason);
+    }
+    pl::PeerChallenge ch; ch.from = 2; ch.to = 1; ch.keyId = keys('k').current.keyId; ch.incarnation = 1;
+    (void)p.a.onChallenge(ch, now);
+    EXPECT_TRUE(std::holds_alternative<pl::Established>(p.a.state()));
+    EXPECT_EQ(std::get<pl::Established>(p.a.state()).keys, liveA);
+
+    // Mid-exchange, a forged Refuse / Challenge / Accept does not abort it.
+    pl::PeerHandshake a2(1, 2, 10, keys('k'));
+    auto h = a2.tick(0); ASSERT_TRUE(h.frame);
+    pl::PeerRefuse r; r.from = 2; r.to = 1; r.reason = pl::RefuseReason::BadProof;
+    (void)a2.onRefuse(r, 1 * kMs);
+    ch.keyId = keys('k').current.keyId;
+    (void)a2.onChallenge(ch, 2 * kMs);
+    EXPECT_TRUE(std::holds_alternative<pl::HelloSent>(a2.state()));
+
+    // At the responder: a forged Proof and an unknown-key Hello leave the live link alone.
+    pl::PeerProof pr; pr.from = 1; pr.to = 2;
+    (void)p.b.onProof(pr, now);
+    EXPECT_TRUE(std::holds_alternative<pl::Established>(p.b.state()));
+    pl::PeerHello bad; bad.from = 1; bad.to = 2; bad.keyId = 0xdead; bad.incarnation = 1;
+    (void)p.b.onHello(bad, now);
+    EXPECT_TRUE(std::holds_alternative<pl::Established>(p.b.state()));
+    // A forged Hello with the REAL public key id is answered with a Challenge but leaves the responder Established.
+    pl::PeerHello real; real.from = 1; real.to = 2; real.keyId = keys('k').current.keyId; real.incarnation = 1; real.nonceA.fill(7);
+    auto ans = p.b.onHello(real, now);
+    EXPECT_TRUE(ans.frame);
+    ASSERT_TRUE(std::holds_alternative<pl::Established>(p.b.state()));
+    EXPECT_EQ(std::get<pl::Established>(p.b.state()).keys, *p.kb) << "same keys, same epoch";
+}
+
+TEST(PeerLinkRegression, ARestartedPeerRelinksUnderAFloodRegression) {
+    Pair p(keys('k'), keys('k')); p.run(1'000 * kMs);
+    ASSERT_TRUE(p.ka && p.kb);
+    // b restarts (no link, no keys).  A forger floods a with Refuse / NoLink / bad Challenges every 5 ms.
+    p.b = pl::PeerHandshake(2, 1, 21, keys('k'));
+    p.ka.reset(); p.kb.reset();
+    p.q.clear();
+    bool relinked = false;
+    for (int i = 0; i < 400 && !relinked; ++i) {
+        const int64_t now = (3'000 + i * 5) * kMs;
+        pl::PeerRefuse r; r.from = 2; r.to = 1; r.reason = (i % 2) ? pl::RefuseReason::BadProof : pl::RefuseReason::NoCommonKey;
+        (void)p.a.onRefuse(r, now);
+        pl::PeerChallenge ch; ch.from = 2; ch.to = 1; ch.keyId = keys('k').current.keyId; ch.incarnation = 9;
+        (void)p.a.onChallenge(ch, now);
+        pl::PeerHello f; f.from = 1; f.to = 2; f.keyId = keys('k').current.keyId; f.incarnation = 3;   // forged Hello at b
+        f.nonceA.fill(static_cast<uint8_t>(i + 1));
+        (void)p.b.onHello(f, now);
+        p.run(now);   // b's NoLink poke (every 200 ms), a's Hello, the real handshake
+        relinked = p.ka && p.kb;
+    }
+    EXPECT_TRUE(relinked) << "the real handshake completes through the flood";
+    ASSERT_TRUE(std::holds_alternative<pl::Established>(p.a.state()));
+    EXPECT_EQ(std::get<pl::Established>(p.a.state()).peerIncarnation, 21u);
+}
+
+TEST(PeerLinkRegression, AFreshDataDirPeerRejoinsRegression) {
+    // A rebuilt broker has a LOWER incarnation than the one its peers last saw (fresh data dir / clock): it still joins.
+    Pair p(keys('k'), keys('k'), /*incA=*/1'000, /*incB=*/2'000); p.run(1'000 * kMs);
+    ASSERT_TRUE(p.ka && p.kb);
+    p.b = pl::PeerHandshake(2, 1, 5, keys('k'));        // responder rebuilt: incarnation 5 < 2000
+    p.ka.reset(); p.kb.reset();
+    for (int i = 0; i < 3 && !(p.ka && p.kb); ++i) p.run((3'000 + i * 1'000) * kMs);
+    EXPECT_TRUE(p.ka && p.kb) << "a lower incarnation at the initiator is not refused";
+    p.a = pl::PeerHandshake(1, 2, 3, keys('k'));        // the initiator rebuilt too: Hello with incarnation 3 < 1000
+    p.ka.reset(); p.kb.reset();
+    for (int i = 0; i < 3 && !(p.ka && p.kb); ++i) p.run((10'000 + i * 1'000) * kMs);
+    EXPECT_TRUE(p.ka && p.kb) << "a lower incarnation at the responder is not refused";
+}
+
+TEST(PeerLinkRegression, AForgedHelloFloodAtTheResponderNeverHoldsARestartedPeerOutRegression) {
+    Pair p(keys('k'), keys('k')); p.run(1'000 * kMs);
+    ASSERT_TRUE(p.ka && p.kb);
+    p.a = pl::PeerHandshake(1, 2, 11, keys('k'));   // the initiator restarts: its Hello must get through the flood
+    p.ka.reset(); p.kb.reset(); p.q.clear();
+    for (int k = 0; k < 20; ++k) {   // the flood is already under way: every pending slot is taken by a forgery
+        pl::PeerHello f; f.from = 1; f.to = 2; f.keyId = keys('k').current.keyId; f.incarnation = 5;
+        f.nonceA.fill(static_cast<uint8_t>(100 + k));
+        (void)p.b.onHello(f, 2'999 * kMs);
+    }
+    bool relinked = false;
+    for (int i = 0; i < 400 && !relinked; ++i) {
+        const int64_t now = (3'000 + i) * kMs;
+        for (int k = 0; k < 3; ++k) {   // three forged Hellos with the real key id every millisecond
+            pl::PeerHello f; f.from = 1; f.to = 2; f.keyId = keys('k').current.keyId; f.incarnation = 5;
+            f.nonceA.fill(static_cast<uint8_t>(i * 3 + k + 1));
+            (void)p.b.onHello(f, now);
+            EXPECT_TRUE(std::holds_alternative<pl::LinkIdle>(p.b.state()) || std::holds_alternative<pl::Established>(p.b.state()));
+        }
+        p.run(now);
+        relinked = p.ka && p.kb;
+    }
+    EXPECT_TRUE(relinked) << "the real Hello is answered and its Proof matches its own pending slot";
+}
+
+TEST(PeerLinkRegression, ForgedHintsRekeyAnIdleLinkAtMostOncePer30sRegression) {
+    Pair p(keys('k'), keys('k')); p.run();
+    ASSERT_TRUE(p.ka);
+    pl::PeerRefuse poke; poke.from = 2; poke.to = 1; poke.reason = pl::RefuseReason::NoLink;
+    int rekeys = 0;
+    for (int i = 1; i <= 100; ++i) {   // 10 s of forged hints on a link with no authenticated traffic
+        const int64_t now = (2'000 + i * 100) * kMs;
+        auto o = p.a.onRefuse(poke, now);
+        if (!o.frame) o = p.a.onUnknownEpoch(500 + i, now);
+        if (o.frame) { ++rekeys; p.absorb(0, std::move(o)); }
+        p.run(now);   // the real responder answers: the exchange completes at once
+    }
+    EXPECT_EQ(rekeys, 1);
+}
+
+TEST(PeerLinkRegression, AForgedProofAgainstAFullTablePerformsNoMacComputationRegression) {
+    pl::PeerHandshake b(2, 1, 20, keys('k'));
+    for (int k = 0; k < static_cast<int>(pl::PeerHandshake::kPending); ++k) {
+        pl::PeerHello f; f.from = 1; f.to = 2; f.keyId = keys('k').current.keyId; f.incarnation = 5;
+        f.nonceA.fill(static_cast<uint8_t>(k + 1));
+        ASSERT_TRUE(b.onHello(f, 1 * kMs).frame);
+    }
+    const uint64_t before = b.macComputations();
+    for (int i = 0; i < 100; ++i) {
+        pl::PeerProof pr; pr.from = 1; pr.to = 2; pr.macA.fill(static_cast<uint8_t>(i));
+        auto o = b.onProof(pr, 2 * kMs);
+        EXPECT_TRUE(o.logIsError);
+        EXPECT_FALSE(o.frame);
+    }
+    EXPECT_EQ(b.macComputations(), before) << "a forged Proof costs constant-time compares only";
+    EXPECT_TRUE(std::holds_alternative<pl::LinkIdle>(b.state()));
+}
+
+namespace {
+// One real round trip with `forgedBetween` forged Hellos landing between the Challenge and the Proof, against a
+// responder whose table is already full of forgeries (a flood under way).  True when the real peer links.
+bool oneTrial(int trial, int forgedBetween) {
+    pl::PeerHandshake b(2, 1, 20, keys('k'));
+    pl::PeerHandshake a(1, 2, 10, keys('k'));
+    auto forge = [&](int n, int64_t now) {
+        pl::PeerHello f; f.from = 1; f.to = 2; f.keyId = keys('k').current.keyId; f.incarnation = 5;
+        f.nonceA.fill(static_cast<uint8_t>(n)); f.nonceA[1] = static_cast<uint8_t>(trial); f.nonceA[2] = 0x77;
+        (void)b.onHello(f, now);
+    };
+    int64_t now = 1'000 * kMs;
+    for (std::size_t k = 0; k < pl::PeerHandshake::kPending; ++k) forge(static_cast<int>(k + 1), now);
+    auto hello = a.tick(now);
+    pl::PeerHello h;
+    if (!hello.frame || !pl::PeerHello::decode(hello.frame->data(), hello.frame->size(), h)) return false;
+    auto ch = b.onHello(h, now);
+    pl::PeerChallenge c;
+    if (!ch.frame || !pl::PeerChallenge::decode(ch.frame->data(), ch.frame->size(), c)) return false;
+    for (int k = 0; k < forgedBetween; ++k) forge(100 + k, now);     // the round trip: forgeries keep arriving
+    auto pr = a.onChallenge(c, now + kMs);
+    pl::PeerProof p;
+    if (!pr.frame || !pl::PeerProof::decode(pr.frame->data(), pr.frame->size(), p)) return false;
+    return b.onProof(p, now + 2 * kMs).established.has_value();
+}
+} // namespace
+
+TEST(PeerLinkRegression, ARealPeerSurvivesForgedHellosArrivingDuringItsRoundTripRegression) {
+    static_assert(pl::PeerHandshake::kPending == 8, "the table size is part of the contract");
+    constexpr int kTrials = 300;
+    int modest = 0, heavy = 0;
+    for (int t = 0; t < kTrials; ++t) { modest += oneTrial(t, 2); heavy += oneTrial(t, 8); }
+    EXPECT_GE(modest, kTrials * 60 / 100) << "2 forgeries per round trip: (7/8)^2 = 77% expected";
+    EXPECT_GE(heavy, kTrials * 15 / 100) << "8 forgeries per round trip: oldest-first evicted the real slot EVERY time; random survives 34%";
+}
+
+TEST(PeerLinkRegression, ATimedOutHintRekeyDoesNotDelayTheNextOneRegression) {
+    Pair p(keys('k'), keys('k')); p.run(1'000 * kMs);
+    ASSERT_TRUE(p.ka);
+    // A hint rekeys; the responder is gone, so the Hello is never answered and the attempt times out.
+    auto o = p.a.onUnknownEpoch(999, 3'000 * kMs);
+    ASSERT_TRUE(o.frame);
+    (void)p.a.tick(3'000 * kMs + pl::PeerHandshake::kAwaitNs);
+    ASSERT_TRUE(std::holds_alternative<pl::Established>(p.a.state())) << "the prior keys are restored";
+    // The responder restarts and pokes: the next rekey is due within the retry interval, not after 30 s.
+    pl::PeerRefuse poke; poke.from = 2; poke.to = 1; poke.reason = pl::RefuseReason::NoLink;
+    auto again = p.a.onRefuse(poke, 3'000 * kMs + pl::PeerHandshake::kAwaitNs + pl::PeerHandshake::kRetryNs);
+    EXPECT_TRUE(again.frame);
 }

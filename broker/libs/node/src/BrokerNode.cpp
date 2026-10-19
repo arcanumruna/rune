@@ -3363,6 +3363,13 @@ int BrokerNode::servicePeerLinks_(int64_t nowNs) {
         if (aeronIngress_ && aeronIngress_->takeUnknownEpoch(peer, epoch)) peerLinkAgent_->onUnknownEpoch(peer, epoch, nowNs);
         if (replTransport_ && replTransport_->takeUnknownEpoch(peer, epoch)) peerLinkAgent_->onUnknownEpoch(peer, epoch, nowNs);
     }
+    // An authenticated frame from a peer proves it is alive: only a peer that has been silent for a second can be
+    // rekeyed by an unauthenticated hint.
+    for (std::size_t i = 0; i < peerLinkAgent_->peerCount(); ++i) {
+        const int32_t id = peerLinkAgent_->peerIdAt(i);
+        peerLinkAgent_->observeAuthFrames(id, (aeronIngress_ ? aeronIngress_->authFrames(id) : 0u) +
+                                              (replTransport_ ? replTransport_->authFrames(id) : 0u), nowNs);
+    }
     int work = peerLinkAgent_->doWork(nowNs);
     work += peerLinkFanout_.pump(workerPool_.get(), adminWorkerAgent_ ? &adminWorkerAgent_->controlToAdminRing() : nullptr);
     publishPeerLinkMetrics_();
