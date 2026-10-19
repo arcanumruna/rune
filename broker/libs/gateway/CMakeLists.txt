@@ -9,7 +9,10 @@ add_library(rune_gateway
     src/ClientGateway.cpp
     src/TopicRegistry.cpp
     src/TopicDirMarker.cpp
-    src/SecurityView.cpp)
+    src/SecurityView.cpp
+    src/LoginThrottle.cpp
+    src/SessionAuth.cpp
+    src/ScramServer.cpp)
 
 target_include_directories(rune_gateway PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
@@ -67,6 +70,23 @@ if(BUILD_TESTING)
         GTest::gtest_main)
     include(GoogleTest)
     gtest_discover_tests(rune_gateway_session_tests)
+
+    # Authentication Task 11: the brute-force curve (D14) - pure, no Aeron.
+    add_executable(rune_gateway_login_throttle_tests tests/LoginThrottleTest.cpp)
+    target_link_libraries(rune_gateway_login_throttle_tests PRIVATE rune_gateway GTest::gtest_main)
+    gtest_discover_tests(rune_gateway_login_throttle_tests)
+
+    # Authentication Task 11: the broker half of SCRAM as pure functions.
+    add_executable(rune_gateway_scram_server_tests tests/ScramServerTest.cpp)
+    target_include_directories(rune_gateway_scram_server_tests PRIVATE ${CMAKE_SOURCE_DIR}/libs/node/tests)
+    target_link_libraries(rune_gateway_scram_server_tests PRIVATE rune_gateway GTest::gtest_main)
+    gtest_discover_tests(rune_gateway_scram_server_tests)
+
+    # Authentication Task 11: the gateway's login state machine (gate, SCRAM legs, throttle, deadline, counters) - no Aeron.
+    add_executable(rune_gateway_auth_login_tests tests/gateway/AuthLoginGatewayTest.cpp)
+    target_include_directories(rune_gateway_auth_login_tests PRIVATE ${CMAKE_SOURCE_DIR}/libs/node/tests)
+    target_link_libraries(rune_gateway_auth_login_tests PRIVATE rune_gateway rune_node spdlog::spdlog GTest::gtest_main)
+    gtest_discover_tests(rune_gateway_auth_login_tests)
 
     # Authentication Task 9: the control thread's SecurityView (D29).
     add_executable(rune_gateway_security_view_tests

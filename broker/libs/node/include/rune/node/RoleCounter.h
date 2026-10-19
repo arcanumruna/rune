@@ -159,6 +159,14 @@ inline constexpr std::int32_t kLostCommittedReportsCounterTypeId  = 1'000'225;
 inline constexpr std::int32_t kSecurityApplyHaltedCounterTypeId   = 1'000'226;
 inline constexpr std::int32_t kSecurityAppliedOffsetCounterTypeId = 1'000'227;
 inline constexpr std::int32_t kAuthModeCounterTypeId              = 1'000'228;
+// Authentication Task 11: 229 = logins ok, 230 = logins failed, 231 = logins rate-limited (monotonic, per broker; the
+// gateway's control-thread values).  Same key (node id) as the other security counters.
+inline constexpr std::int32_t kLoginsOkCounterTypeId          = 1'000'229;
+inline constexpr std::int32_t kLoginsFailedCounterTypeId      = 1'000'230;
+inline constexpr std::int32_t kLoginsRateLimitedCounterTypeId = 1'000'231;
+inline std::string loginsOkLabel(std::int32_t nodeId) { return "rune-logins-ok node=" + std::to_string(nodeId); }
+inline std::string loginsFailedLabel(std::int32_t nodeId) { return "rune-logins-failed node=" + std::to_string(nodeId); }
+inline std::string loginsRateLimitedLabel(std::int32_t nodeId) { return "rune-logins-rate-limited node=" + std::to_string(nodeId); }
 inline std::string securityApplyHaltedLabel(std::int32_t nodeId) { return "rune-security-apply-halted node=" + std::to_string(nodeId); }
 inline std::string securityAppliedOffsetLabel(std::int32_t nodeId) { return "rune-security-applied-offset node=" + std::to_string(nodeId); }
 inline std::string authModeLabel(std::int32_t nodeId) { return "rune-auth-mode node=" + std::to_string(nodeId); }

@@ -21,7 +21,7 @@
 //   need = kBaseFds
 //        + sum over the catalog's topics of
 //            partitionCount * (openSegments(topic) * kFdsPerSegment + kE1dFdsPerLog)
-//        + kInternalPartitionsReserve * (kDefaultOpenSegments * kFdsPerSegment + kE1dFdsPerLog)
+//        + (kInternalPartitionsReserve + kAdminLogs) * (kDefaultOpenSegments * kFdsPerSegment + kE1dFdsPerLog)
 //   openSegments(topic) = retentionBytes > 0
 //                           ? ceil(retentionBytes / segmentRollBytes) + 1   (retained + active)
 //                           : kDefaultOpenSegments                          (unbounded: a floor)
@@ -50,6 +50,9 @@ inline constexpr uint64_t kE1dFdsPerLog             = 2;
 inline constexpr uint64_t kDefaultOpenSegments      = 4;
 inline constexpr uint64_t kBaseFds                  = 1024;
 inline constexpr uint64_t kInternalPartitionsReserve = 64;
+/// The replicated admin logs every broker holds open for its whole lifetime, counted EXPLICITLY (not hidden in the
+/// reserve): `__catalog` and - since authentication Task 9 - `__security` (never compacted, never deleted).
+inline constexpr uint64_t kAdminLogs                 = 2;
 
 /// Estimated open files the broker needs for `topics` (formula above).
 /// `readySegmentsPerPartition` (hotpath-A review M3): the segment provisioner

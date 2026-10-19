@@ -28,7 +28,7 @@
 // touching <Aeron.h>.
 #include <rune/gateway/CryptoState.h>
 #include <rune/gateway/SpillPool.h>
-#include <rune/gateway/SessionAuthGate.h>
+#include <rune/gateway/SessionAuth.h>
 
 #include <array>
 #include <cstddef>
@@ -86,9 +86,13 @@ struct Session {
     // understand (UnknownProducerId is answered OutOfOrderSequence below
     // protocol::client::kClientVersionUnknownProducerId).  0 = unknown (oldest).
     int32_t                                        clientVersion = 0;
-    // Authentication Task 10 (ruling): what this session may do before it authenticates (SessionAuthGate.h).  Set from
-    // the ConnectResponse the client was told; SessionOpen (no gating) on an in-process / dev broker.
-    SessionAuthGate                                authGate;
+    // Authentication Task 11 (D11 / D13): this session's authentication state (SessionAuth.h) - what it may send before
+    // it authenticates, the SCRAM exchange in flight, who it is.  Control-thread owned.  AuthAnonymous (no gating) on an
+    // in-process / dev broker; AuthAwaitingFirst{deadline} on an authenticating one.
+    SessionAuth                                    auth = AuthAnonymous{};   // NOT the variant's first alternative
+    // D14: the host the session's Connect came from (the Aeron image's sourceIdentity host; the egress host for IPC) -
+    // the throttle's key.  "" in unit tests.
+    std::string                                    sourceHost;
     // D8b round 2: bit w set = worker w reports this session's ack publication
     // Lost (NOT_CONNECTED); lostSinceNs = when the mask last became non-zero, restarted by a Found
     // from one worker while another is still Lost (D8b-L: a successful claim is proof of life).

@@ -301,7 +301,7 @@ TEST(AuthGateRegression, AnAnonymousBootstrapWindowSessionSendingAnythingButBoot
     auto view = emptyView();
     rig.gw.setAuthMode(GatewayAuthMode::Required, &view);
     rig.gw.setClusterKeys(keysFor(kA));
-    rig.gw.setSessionAuthGateForTest(rig.sid, SessionBootstrapOnly{});
+    rig.gw.setSessionAuthForTest(rig.sid, AuthAwaitingFirst{INT64_MAX});
     const auto f = rig.createRole(11);   // not a bootstrap
     rig.gw.applyClientFrameForTest(f.data(), f.size());
     EXPECT_EQ(rig.admin.securityDdls, 0) << "never reached the admin ring";
@@ -318,7 +318,7 @@ TEST(AuthGateRegression, TheBootstrapWindowAdmitsExactlyBootstrapWithAValidMac) 
     auto view = emptyView();
     rig.gw.setAuthMode(GatewayAuthMode::Required, &view);
     rig.gw.setClusterKeys(keysFor(kA));
-    rig.gw.setSessionAuthGateForTest(rig.sid, SessionBootstrapOnly{});
+    rig.gw.setSessionAuthForTest(rig.sid, AuthAwaitingFirst{INT64_MAX});
     const BootFrame bad(rig.sid, 20, kC);
     rig.gw.applyClientFrameForTest(bad.bytes.data(), bad.bytes.size());
     EXPECT_EQ(rig.admin.bootstraps, 0);
@@ -336,7 +336,7 @@ TEST(AuthGateRegression, AfterBootstrapAnonymousSessionsAreRefusedEvenForBootstr
     ASSERT_TRUE(view.state().hasSecurityAdmin());
     rig.gw.setAuthMode(GatewayAuthMode::Required, &view);
     rig.gw.setClusterKeys(keysFor(kA));
-    rig.gw.setSessionAuthGateForTest(rig.sid, SessionBootstrapOnly{});   // offered the window BEFORE it closed
+    rig.gw.setSessionAuthForTest(rig.sid, AuthAwaitingFirst{INT64_MAX});   // offered the window BEFORE it closed
     const BootFrame good(rig.sid, 30, kA);
     rig.gw.applyClientFrameForTest(good.bytes.data(), good.bytes.size());
     EXPECT_EQ(rig.admin.bootstraps, 0) << "the window is closed";
@@ -349,7 +349,7 @@ TEST(AuthGateRegression, SessionLevelFramesAndOpenSessionsAreNeverGated) {
     Rig rig;
     auto view = emptyView();
     rig.gw.setAuthMode(GatewayAuthMode::Required, &view);
-    rig.gw.setSessionAuthGateForTest(rig.sid, SessionMustAuthenticate{});
+    rig.gw.setSessionAuthForTest(rig.sid, AuthAwaitingFirst{INT64_MAX});
     pc::Keepalive k;
     k.sessionId = rig.sid;
     std::vector<uint8_t> kb(64); kb.resize(k.encode(kb.data()));
@@ -358,7 +358,7 @@ TEST(AuthGateRegression, SessionLevelFramesAndOpenSessionsAreNeverGated) {
     EXPECT_EQ(rig.gw.authGateRefusals(), 0u);
     // An in-process gateway gates nothing.
     Rig open;
-    open.gw.setSessionAuthGateForTest(open.sid, SessionMustAuthenticate{});   // ignored: authMode_ is InProcess
+    open.gw.setSessionAuthForTest(open.sid, AuthAwaitingFirst{INT64_MAX});   // ignored: authMode_ is InProcess
     const auto f = open.createRole(1);
     open.gw.applyClientFrameForTest(f.data(), f.size());
     EXPECT_EQ(open.admin.securityDdls, 1);

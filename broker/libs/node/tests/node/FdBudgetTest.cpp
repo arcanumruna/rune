@@ -18,7 +18,7 @@ TopicSpec topic(int32_t partitions, int64_t retentionBytes = -1, int64_t roll = 
 }
 // estimateFdNeed takes a span (F6): the catalog boot's topics; a braced list is spelled as a vector here.
 uint64_t needOf(const std::vector<TopicSpec>& t, uint64_t ready = 0) { return estimateFdNeed(t, ready); }
-constexpr uint64_t kInternal = kInternalPartitionsReserve * (kDefaultOpenSegments * kFdsPerSegment + kE1dFdsPerLog);
+constexpr uint64_t kInternal = (kInternalPartitionsReserve + kAdminLogs) * (kDefaultOpenSegments * kFdsPerSegment + kE1dFdsPerLog);
 } // namespace
 
 TEST(FdBudgetRegression, EstimateCountsSegmentsAndE1dFdsPerPartition) {
@@ -31,6 +31,14 @@ TEST(FdBudgetRegression, EstimateCountsSegmentsAndE1dFdsPerPartition) {
     EXPECT_EQ(needOf({topic(2), topic(3)}),
               kBaseFds + kInternal + 5 * (kDefaultOpenSegments * kFdsPerSegment + kE1dFdsPerLog));
     EXPECT_EQ(needOf({}), kBaseFds + kInternal);
+}
+
+// Authentication Task 11 (carry-over from Task 9): the `__security` log is an open log of every broker - counted.
+TEST(FdBudgetRegression, TheSecurityLogIsCountedNotLeftToTheReserveRegression) {
+    static_assert(kAdminLogs == 2, "__catalog and __security");
+    const uint64_t perLog = kDefaultOpenSegments * kFdsPerSegment + kE1dFdsPerLog;
+    EXPECT_EQ(needOf({}), kBaseFds + kInternalPartitionsReserve * perLog + 2 * perLog)
+        << "an empty catalog still holds the two admin logs open";
 }
 
 // hotpath-A review M3: the provisioner's READY segments are budgeted too.

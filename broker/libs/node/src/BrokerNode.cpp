@@ -533,6 +533,13 @@ void BrokerNode::start() {
             kSecurityAppliedOffsetCounterTypeId, roleKey, kRoleKeyLength, securityAppliedOffsetLabel(config_.nodeId));
         authModeCounterRegId_ = aeron_->addCounter(
             kAuthModeCounterTypeId, roleKey, kRoleKeyLength, authModeLabel(config_.nodeId));
+        // Authentication Task 11: 1'000'229 logins ok, 230 failed, 231 rate-limited.
+        loginsOkCounterRegId_ = aeron_->addCounter(
+            kLoginsOkCounterTypeId, roleKey, kRoleKeyLength, loginsOkLabel(config_.nodeId));
+        loginsFailedCounterRegId_ = aeron_->addCounter(
+            kLoginsFailedCounterTypeId, roleKey, kRoleKeyLength, loginsFailedLabel(config_.nodeId));
+        loginsRateLimitedCounterRegId_ = aeron_->addCounter(
+            kLoginsRateLimitedCounterTypeId, roleKey, kRoleKeyLength, loginsRateLimitedLabel(config_.nodeId));
         unplaceableCounterRegId_ = aeron_->addCounter(
             kCatalogUnplaceableTopicsCounterTypeId, roleKey, kRoleKeyLength,
             catalogUnplaceableTopicsLabel(config_.nodeId));
@@ -2108,6 +2115,7 @@ void BrokerNode::buildGateway() {
         gateway_->setTopicRegistry(topicRegistry_.get());
         // Authentication Task 10 (D11/D13): how sessions authenticate + the bootstrap window's view (the control thread's
         // own SecurityView - the gateway runs on this same thread).
+        gateway_->setAuthTimeoutNs(config_.authTimeoutMs * 1'000'000LL);   // D13: RUNE_AUTH_TIMEOUT_MS
         gateway_->setAuthMode(config_.authMode == AuthMode::Enabled  ? rune::gateway::GatewayAuthMode::Required
                               : config_.authMode == AuthMode::DevDisabled ? rune::gateway::GatewayAuthMode::Dev
                                                                           : rune::gateway::GatewayAuthMode::InProcess,
@@ -3150,6 +3158,7 @@ void BrokerNode::onSecurityApplied_(const uint8_t* p, std::size_t n) {
     // The mirror applies the SAME event with the SAME library; a gap or an apply error halts it (fail closed -
     // Task 14 turns that into revoked sessions and refused logins).
     if (auto a = securityView_->onApplied(offset, bytes); a) {
+        if (gateway_) gateway_->onSecurityApplied(*a);   // Task 11: a SET PASSWORD frees the user's one-time-password sessions
         securityAppliedValue_ = offset;
         securityRefreshedOffset_ = offset;   // Task 13/14: delayed until the permission refresh reached every worker
     } else {
@@ -3183,7 +3192,13 @@ void BrokerNode::onSecurityHalted_(const uint8_t* p, std::size_t n) {
 bool BrokerNode::securityMetricsPending_() const noexcept {
     return (!securityHaltedCounter_ && securityHaltedCounterRegId_ >= 0) ||
            (!securityAppliedCounter_ && securityAppliedCounterRegId_ >= 0) ||
-           (!authModeCounter_ && authModeCounterRegId_ >= 0);
+           (!authModeCounter_ && authModeCounterRegId_ >= 0) ||
+           (!loginsOkCounter_ && loginsOkCounterRegId_ >= 0) ||
+           (!loginsFailedCounter_ && loginsFailedCounterRegId_ >= 0) ||
+           (!loginsRateLimitedCounter_ && loginsRateLimitedCounterRegId_ >= 0) ||
+           (gateway_ != nullptr && (gateway_->loginsOk() != publishedLoginsOk_ ||
+                                    gateway_->loginsFailed() != publishedLoginsFailed_ ||
+                                    gateway_->loginsRateLimited() != publishedLoginsRateLimited_));
 }
 
 void BrokerNode::publishSecurityMetrics_() noexcept {
@@ -3196,6 +3211,17 @@ void BrokerNode::publishSecurityMetrics_() noexcept {
     resolve(securityHaltedCounter_, securityHaltedCounterRegId_);
     resolve(securityAppliedCounter_, securityAppliedCounterRegId_);
     resolve(authModeCounter_, authModeCounterRegId_);
+    resolve(loginsOkCounter_, loginsOkCounterRegId_);
+    resolve(loginsFailedCounter_, loginsFailedCounterRegId_);
+    resolve(loginsRateLimitedCounter_, loginsRateLimitedCounterRegId_);
+    if (gateway_ != nullptr) {   // control thread: the gateway's tallies are its own
+        publishedLoginsOk_ = gateway_->loginsOk();
+        publishedLoginsFailed_ = gateway_->loginsFailed();
+        publishedLoginsRateLimited_ = gateway_->loginsRateLimited();
+    }
+    if (loginsOkCounter_) loginsOkCounter_->set(static_cast<std::int64_t>(publishedLoginsOk_));
+    if (loginsFailedCounter_) loginsFailedCounter_->set(static_cast<std::int64_t>(publishedLoginsFailed_));
+    if (loginsRateLimitedCounter_) loginsRateLimitedCounter_->set(static_cast<std::int64_t>(publishedLoginsRateLimited_));
     if (securityHaltedCounter_) securityHaltedCounter_->set(securityHaltedValue_);
     if (securityAppliedCounter_) securityAppliedCounter_->set(securityAppliedValue_);
     // 1'000'228: 0 = enabled (an in-process config publishes 0 too), 1 = dev-disabled.
@@ -4183,6 +4209,9 @@ void BrokerNode::stop() {
     securityHaltedCounter_.reset();    // authentication Task 9: the same rule (released before aeron_)
     securityAppliedCounter_.reset();
     authModeCounter_.reset();
+    loginsOkCounter_.reset();
+    loginsFailedCounter_.reset();
+    loginsRateLimitedCounter_.reset();
     for (auto& c : provCounters_) c.reset();   // re-review N4: same rule (the provisioner is stopped)
 
     // 4. Close the Aeron client (joins the C++ conductor thread).

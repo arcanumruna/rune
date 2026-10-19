@@ -765,7 +765,7 @@ int ClientGateway::doWork(int64_t nowNs) {
                         const auto* frame = reinterpret_cast<const uint8_t*>(buffer.buffer() + offset);
                         if (!admitClientFrame_(frame, static_cast<std::size_t>(length))) [[unlikely]]
                             return aeron::ControlledPollAction::ABORT;
-                        (void)header;
+                        currentImageSessionId_ = header.sessionId();   // D14 (one store per frame)
                         // D8c fix round 1: a produce deferred by the per-worker cap is not
                         // consumed — ABORT it (redelivered at the next poll).
                         if (!onClientFrame_(frame, static_cast<std::size_t>(length))) [[unlikely]]
@@ -1050,6 +1050,7 @@ bool ClientGateway::inlineWaiterStillValid_(const rune::replication::PartitionRe
 // then erase them — avoids iterator invalidation.
 // ---------------------------------------------------------------------------
 void ClientGateway::reapExpired(int64_t nowNs) {
+    reapAuthDeadlines_(nowNs);   // Authentication Task 11 (D13): sessions that never logged in
     reapScratch_.clear();
 
     sessions_.forEach([&](Session& s) {
@@ -1088,8 +1089,9 @@ void ClientGateway::reapExpired(int64_t nowNs) {
 void ClientGateway::onFragment(aeron::concurrent::AtomicBuffer& buffer,
                                aeron::util::index_t             offset,
                                aeron::util::index_t             length,
-                               aeron::Header&                   /*header*/)
+                               aeron::Header&                   header)
 {
+    currentImageSessionId_ = header.sessionId();   // D14: the Connect's source host is read off this image
     (void)onClientFrame_(reinterpret_cast<const uint8_t*>(buffer.buffer() + offset), static_cast<std::size_t>(length));
 }
 
@@ -1222,6 +1224,8 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
         case pc::TemplateId::AlterView:
         case pc::TemplateId::SecurityDdl:
         case pc::TemplateId::SecurityBootstrap:
+        case pc::TemplateId::AuthClientFirst:
+        case pc::TemplateId::AuthClientFinal:
         case pc::TemplateId::GetViewRow:
             if (const auto hdr = pc::MessageHeader::decode(buf, len)) {
                 sessions_.touch(hdr->sessionId, nowNs_);
@@ -1311,6 +1315,13 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
             break;
         case pc::TemplateId::AlterView:
             handleAlterView(buf, len);
+            break;
+        // Authentication Task 11: the SCRAM login (12 / 14); 13 / 15 are broker->client.
+        case pc::TemplateId::AuthClientFirst:
+            handleAuthClientFirst_(buf, len);
+            break;
+        case pc::TemplateId::AuthClientFinal:
+            handleAuthClientFinal_(buf, len);
             break;
         // Authentication Task 10: security DDL (79) and the one-time bootstrap (80).
         case pc::TemplateId::SecurityDdl:
@@ -1881,6 +1892,18 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
     }
 
     const auto& req = *reqOpt;
+
+    // Authentication Task 11 (D11): a session that already authenticated on THIS broker, reconnecting from the same
+    // endpoint, keeps its authentication (answered ResumedAuthenticated; no new session).
+    if (resumeAuthenticated_(req)) return;
+    // Authentication Task 11 (D11 version gate): an authenticating broker refuses a pre-v9 client AT THE HANDSHAKE
+    // (ConnectResponse{ProtocolVersion}, non-retriable for every client version) - it could never log in, and it
+    // must not be able to reach a gated session at all.  No session is created.
+    const bool refusedForVersion = authMode_ == rune::gateway::GatewayAuthMode::Required &&
+                                   !pc::clientUnderstandsAuth(req.clientVersion);
+    if (refusedForVersion) [[unlikely]]
+        spdlog::warn("auth: refused client version {} at connect (authentication requires {})", req.clientVersion,
+                     pc::kClientVersionAuth);
     // Task 13 fix round 1 (I2): a worker's ack table stores the reply channel in
     // a fixed slot — refuse a longer one HERE (never accept a session no worker
     // can ack; the worker treats a refused announcement as an invariant halt).
@@ -2001,6 +2024,10 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
     pc_entry.clientVersion         = req.clientVersion;   // D6
     if (channelTooLongForShard) [[unlikely]]
         pc_entry.refuseCode = static_cast<uint16_t>(pc::ErrorCode::InvalidRequest);
+    if (refusedForVersion) [[unlikely]]
+        pc_entry.refuseCode = static_cast<uint16_t>(pc::ErrorCode::ProtocolVersion);   // wins over any other refusal
+    if (authMode_ == rune::gateway::GatewayAuthMode::Required && pc_entry.refuseCode == 0)
+        pc_entry.sourceHost = sourceHostOf_(pc_entry.egressChannel);   // D14: the throttle key (cold: one Connect)
 
     // client<->broker TLS/AEAD (Task 7): drive the server-role handshake's
     // FIRST leg right here, synchronously, off the client's ClientHello
@@ -2414,12 +2441,14 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
             // Authentication Task 10 (D11): a v9 client of an authenticating broker is told how it authenticates and
             // where it stands.  Bootstrap window (Required, `__security` holds no Bootstrap event): Anonymous - it may
             // send ONLY SecurityBootstrap.  Otherwise MustAuthenticate.  An in-process broker keeps the pre-v9 frame.
-            pending.authGate = newSessionGate_(pending.clientVersion);
+            pending.auth = newSessionAuth_(nowNs, pending.correlationId);
             if (authMode_ != rune::gateway::GatewayAuthMode::InProcess && pc::clientUnderstandsAuth(pending.clientVersion)) {
                 resp.v9 = true;
                 resp.authMode = authMode_ == rune::gateway::GatewayAuthMode::Required ? pc::AuthMode::Required
                                                                                        : pc::AuthMode::DevDisabled;
-                resp.authState = std::holds_alternative<rune::gateway::SessionMustAuthenticate>(pending.authGate)
+                // Required: MustAuthenticate - except in the bootstrap window (no Bootstrap event applied), where the
+                // session is told Anonymous and may send only SecurityBootstrap (and a login that cannot succeed).
+                resp.authState = authMode_ == rune::gateway::GatewayAuthMode::Required && !bootstrapOpen_()
                                      ? pc::AuthState::MustAuthenticate : pc::AuthState::Anonymous;
             }
             if (pending.tls) {
@@ -2474,7 +2503,12 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
         // subscribe.
         sessions_.add(pending.sessionId, std::move(pub), nowNs,
                       pending.egressChannel, pending.egressStreamId,
-                      pending.clientVersion).authGate = pending.authGate;
+                      pending.clientVersion);
+        {
+            Session* added = sessions_.find(pending.sessionId);
+            added->auth       = std::move(pending.auth);
+            added->sourceHost = std::move(pending.sourceHost);
+        }
 
         it = pendingConnects_.erase(it);
     }
@@ -2621,7 +2655,10 @@ void ClientGateway::handleHandshakeContinue_(const uint8_t* buf, std::size_t len
     Session& session = sessions_.add(pending.sessionId, std::move(pending.resolvedPub), nowNs,
                                       pending.egressChannel, pending.egressStreamId,
                                       pending.clientVersion);
-    session.authGate = pending.authGate;
+    session.auth       = std::move(pending.auth);
+    session.sourceHost = std::move(pending.sourceHost);
+    // The TLS handshake took time: the login deadline runs from the moment the session exists.
+    if (auto* first = std::get_if<rune::gateway::AuthAwaitingFirst>(&session.auth)) first->deadlineNs = nowNs + authTimeoutNs_;
     session.crypto.cipher = keys.cipher;
     session.crypto.recv.emplace(keys.cipher, keys.c2b, keys.c2bPrefix);  // OPENs client->broker
     session.crypto.send.emplace(keys.cipher, keys.b2c, keys.b2cPrefix);  // SEALs broker->client
@@ -7145,6 +7182,10 @@ rune::gateway::DdlMetaView ClientGateway::ddlMetaOf_(const pc::DdlExtension* ext
     rune::gateway::DdlMetaView m;
     m.sessionId     = sessionId;
     m.sourceAddress = session.egressChannel;
+    // The authenticated user (Task 11; Task 12 makes the catalog principal carry it too): a view into the session's
+    // auth state, copied by the admin ring submit before this frame's handler returns.
+    if (const auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&session.auth)) m.authenticated = a->user;
+    else if (const auto* p = std::get_if<rune::gateway::AuthPasswordChangeRequired>(&session.auth)) m.authenticated = p->user;
     if (ext != nullptr) {
         m.statement         = ext->statement;
         m.clientName        = ext->clientName;
@@ -7459,25 +7500,40 @@ void ClientGateway::handleAlterView(const uint8_t* buf, std::size_t len)
 }
 
 // ---------------------------------------------------------------------------
-// Authentication Task 10 (ruling): the session gate of an authenticating broker.
+// Authentication Task 11 (D11 / D13 / D14): the SCRAM server in the session handshake.
+//
+// Everything below runs on the CONTROL thread, which owns every Session's `auth` state, the LoginThrottle and the
+// SecurityView it reads: no lock, no atomic, no copy of the view.  Login work is hash / HMAC only (the server never
+// runs PBKDF2), so a login never stalls the duty cycle.
 // ---------------------------------------------------------------------------
-rune::gateway::SessionAuthGate ClientGateway::newSessionGate_(int32_t clientVersion) const
+rune::gateway::SessionAuth ClientGateway::newSessionAuth_(int64_t nowNs, int64_t connectCorrelationId) const
 {
     using namespace rune::gateway;
-    if (authMode_ != GatewayAuthMode::Required) return SessionOpen{};
-    // A pre-v9 client cannot authenticate at all (Task 11 refuses it at the handshake); it is never offered bootstrap.
-    if (!pc::clientUnderstandsAuth(clientVersion)) return SessionMustAuthenticate{};
-    // The bootstrap window: no Bootstrap event applied (no ENABLED security admin).  A missing view is a
-    // misconfiguration - the window is closed, never open by default.
-    if (securityView_ != nullptr && !securityView_->halted() && !securityView_->state().hasSecurityAdmin())
-        return SessionBootstrapOnly{};
-    return SessionMustAuthenticate{};
+    if (authMode_ != GatewayAuthMode::Required) return AuthAnonymous{};
+    return AuthAwaitingFirst{nowNs + authTimeoutNs_, connectCorrelationId};
+}
+
+std::string ClientGateway::sourceHostOf_(std::string_view egressChannel) const
+{
+    // The REAL UDP source of the Connect image ("1.2.3.4:5678" / "[::1]:5678"); IPC images have no host, and a test
+    // gateway has no subscription: fall back to the host of the client's reply endpoint.
+    if (sub_ != nullptr && currentImageSessionId_ != 0) {
+        if (const auto image = sub_->imageBySessionId(currentImageSessionId_)) {
+            std::string_view id = image->sourceIdentity();
+            if (!id.empty() && id.rfind("aeron:", 0) != 0) {
+                if (const auto colon = id.rfind(':'); colon != std::string_view::npos) id = id.substr(0, colon);
+                if (id.size() > 2 && id.front() == '[' && id.back() == ']') id = id.substr(1, id.size() - 2);
+                if (!id.empty()) return std::string(id);
+            }
+        }
+    }
+    return std::string(rune::consensus::PeerHostTable::endpointHost(egressChannel));
 }
 
 bool ClientGateway::authGateRefuses_(pc::TemplateId tid, const uint8_t* buf, std::size_t len)
 {
     using namespace rune::gateway;
-    switch (tid) {   // the session level: always allowed
+    switch (tid) {   // the session level: always allowed (gateFor says so too; this skips the session lookup)
         case pc::TemplateId::Connect:
         case pc::TemplateId::HandshakeContinue:
         case pc::TemplateId::Keepalive:
@@ -7491,31 +7547,216 @@ bool ClientGateway::authGateRefuses_(pc::TemplateId tid, const uint8_t* buf, std
     if (!hdr) return false;                               // the handler answers / notes it
     Session* session = sessions_.find(hdr->sessionId);
     if (!session) return false;                           // the handler notes it (no session to answer)
-    bool refuse = true;
-    if (std::holds_alternative<SessionOpen>(session->authGate)) {
-        refuse = false;
-    } else if (std::holds_alternative<SessionBootstrapOnly>(session->authGate)) {
-        // Only SecurityBootstrap, and only while `__security` still holds no Bootstrap event (a closed window refuses
-        // even the session that was offered it).  Its cluster-key MAC is verified by handleSecurityBootstrap (D4).
-        refuse = !(tid == pc::TemplateId::SecurityBootstrap && securityView_ != nullptr && !securityView_->halted() &&
-                   !securityView_->state().hasSecurityAdmin());
-    }
-    if (!refuse) return false;
+
+    // A one-time-password session may send exactly `ALTER USER <self> SET PASSWORD`.
+    bool selfSetPassword = false;
+    if (tid == pc::TemplateId::SecurityDdl)
+        if (const auto* pcr = std::get_if<AuthPasswordChangeRequired>(&session->auth))
+            if (const auto m = pc::SecurityDdl::decode(buf, len))
+                selfSetPassword = m->kind == pc::SecurityOpKind::AlterUser &&
+                                  m->change == pc::UserChangeKind::SetPassword && m->name == pcr->user;
+
+    const AuthGate gate = gateFor(session->auth, tid, bootstrapOpen_(), selfSetPassword);
+    if (gate == AuthGate::Allow) return false;
+
+    const bool end = gate == AuthGate::AnswerAuthFailedAndEnd;
+    const auto code = end ? pc::ErrorCode::AuthenticationFailed : pc::ErrorCode::PasswordChangeRequired;
     ++authGateRefusals_;
     if (authGateRefusals_ % 1024 == 1)
-        spdlog::warn("ClientGateway: session {} sent template {} before authenticating - answered AuthenticationFailed and "
-                     "ended (D13; refusals so far: {})", hdr->sessionId, hdr->templateId, authGateRefusals_);
-    if (!rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed), "authentication required")) {
-        // The request has no response type of its own: the session-level ErrorResponse (control ops), so the client
-        // is never left waiting.
+        spdlog::warn("ClientGateway: session {} sent template {} {} - answered {}{} (D13; refusals so far: {})", hdr->sessionId,
+                     hdr->templateId, end ? "before authenticating" : "while it must change its password",
+                     end ? "AuthenticationFailed and ended" : "PasswordChangeRequired", "", authGateRefusals_);
+    const char* why = end ? "authentication required" : "password change required";
+    if (!rejectRequest_(buf, len, static_cast<uint16_t>(code), why)) {
+        // The request has no response type of its own: the session-level ErrorResponse, so the client is never left
+        // waiting.
         pc::ErrorResponse er;
         er.sessionId     = hdr->sessionId;
         er.correlationId = hdr->correlationId;
-        er.code          = static_cast<int16_t>(pc::ErrorCode::AuthenticationFailed);
+        er.code          = static_cast<int16_t>(code);
         const std::size_t n = er.encode(scratch_.data());
         sendAnswer_(*session, scratch_.data(), n);
     }
-    (void)closeSession_(hdr->sessionId);
+    if (end) (void)closeSession_(hdr->sessionId);
+    return true;
+}
+
+void ClientGateway::failLogin_(Session& session, int64_t correlationId, uint32_t retryAfterMs)
+{
+    pc::AuthServerFinal f;
+    f.sessionId     = session.sessionId;
+    f.correlationId = correlationId;
+    f.errorCode     = static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed);
+    f.retryAfterMs  = retryAfterMs;
+    f.detail        = "authentication failed";   // the ONLY failure text (Review Focus 1)
+    const std::size_t n = f.encode(scratch_.data());
+    sendAnswer_(session, scratch_.data(), n);
+    (void)closeSession_(session.sessionId);
+}
+
+void ClientGateway::handleAuthClientFirst_(const uint8_t* buf, std::size_t len)
+{
+    using namespace rune::gateway;
+    const auto hdr = pc::MessageHeader::decode(buf, len);
+    if (!hdr) { noteUnanswerable_(buf, len, "AuthClientFirst: no decodable header"); return; }
+    Session* session = sessions_.find(hdr->sessionId);
+    if (!session) { noteUnanswerable_(buf, len, "AuthClientFirst for unknown session"); return; }
+    const auto* awaiting = std::get_if<AuthAwaitingFirst>(&session->auth);
+    if (awaiting == nullptr) {
+        // Authenticated / anonymous (the gate let it pass): a login makes no sense here.  Answered, the session stays.
+        pc::AuthServerFinal f;
+        f.sessionId = hdr->sessionId; f.correlationId = hdr->correlationId;
+        f.errorCode = static_cast<uint16_t>(pc::ErrorCode::InvalidRequest);
+        f.detail    = "session does not accept a login";
+        sendAnswer_(*session, scratch_.data(), f.encode(scratch_.data()));
+        return;
+    }
+    const int64_t deadline = awaiting->deadlineNs;
+    const auto m = decodeClientFirst(buf, len);
+    if (!m || m->mechanism != pc::kMechanismScramSha512) {
+        ++loginsFailed_;
+        spdlog::warn("auth: login failed user=<undecodable> source={} session={} reason=malformed", session->sourceHost, session->sessionId);
+        failLogin_(*session, hdr->correlationId, 0);
+        return;
+    }
+    const std::string user(m->username);
+    const rune::gateway::LoginThrottle::Verdict v = loginThrottle_.check(user, session->sourceHost, nowNs_);
+    if (!v.allowed) {
+        ++loginsRateLimited_;
+        spdlog::warn("auth: rate limited user={} source={} retry_after_ms={}", user, session->sourceHost, v.retryAfterMs);
+        failLogin_(*session, m->correlationId, v.retryAfterMs);
+        return;
+    }
+    if (securityView_ == nullptr || securityView_->halted()) {
+        ++loginsFailed_;
+        spdlog::warn("auth: login failed user={} source={} session={} reason={}", user, session->sourceHost, session->sessionId,
+                     loginFailureName(LoginFailure::SecurityHalted));
+        failLogin_(*session, m->correlationId, 0);
+        return;
+    }
+    ServerFirstPlan plan = scramServerFirst(securityView_->state(), *m, deadline);
+    if (plan.frame.empty()) {   // no randomness for the nonce: fail closed
+        ++loginsFailed_;
+        spdlog::error("auth: login failed user={} source={} session={} reason=no-randomness", user, session->sourceHost, session->sessionId);
+        failLogin_(*session, m->correlationId, 0);
+        return;
+    }
+    session->auth = std::move(plan.next);
+    sendAnswer_(*session, plan.frame.data(), plan.frame.size());
+}
+
+void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
+{
+    using namespace rune::gateway;
+    const auto hdr = pc::MessageHeader::decode(buf, len);
+    if (!hdr) { noteUnanswerable_(buf, len, "AuthClientFinal: no decodable header"); return; }
+    Session* session = sessions_.find(hdr->sessionId);
+    if (!session) { noteUnanswerable_(buf, len, "AuthClientFinal for unknown session"); return; }
+    const auto* st = std::get_if<AuthAwaitingFinal>(&session->auth);
+    if (st == nullptr) {
+        pc::AuthServerFinal f;
+        f.sessionId = hdr->sessionId; f.correlationId = hdr->correlationId;
+        f.errorCode = static_cast<uint16_t>(pc::ErrorCode::InvalidRequest);
+        f.detail    = "session does not accept a login";
+        sendAnswer_(*session, scratch_.data(), f.encode(scratch_.data()));
+        return;
+    }
+    const std::string user = st->user;
+    const auto fin = pc::AuthClientFinal::decode(buf, len);
+    std::variant<LoginOk, LoginFailure> verdict = LoginFailure::BadProof;
+    if (securityView_ == nullptr || securityView_->halted()) verdict = LoginFailure::SecurityHalted;
+    else if (nowNs_ > st->deadlineNs)                         verdict = LoginFailure::Timeout;
+    else if (fin)                                             verdict = scramServerFinal(securityView_->state(), *st, *fin);
+
+    if (const LoginFailure* failure = std::get_if<LoginFailure>(&verdict)) {
+        ++loginsFailed_;
+        loginThrottle_.onFailure(user, session->sourceHost, nowNs_);
+        spdlog::warn("auth: login failed user={} source={} session={} reason={}", user, session->sourceHost, session->sessionId,
+                     loginFailureName(*failure));
+        failLogin_(*session, hdr->correlationId, 0);
+        return;
+    }
+    const LoginOk& ok = std::get<LoginOk>(verdict);
+    ++loginsOk_;
+    loginThrottle_.onSuccess(user, session->sourceHost);
+    spdlog::info("auth: login ok user={} source={} session={}", ok.user, session->sourceHost, session->sessionId);
+    if (!session->crypto.encrypted)   // D12: TLS stays optional - said once per session (a session logs in once)
+        spdlog::warn("auth: session {} authenticated over plaintext (no TLS): frames are not integrity-protected",
+                     session->sessionId);
+    if (ok.mustChangePassword) session->auth = AuthPasswordChangeRequired{ok.userId, ok.user};
+    else                       session->auth = AuthAuthenticated{ok.userId, ok.user, PermissionTable::allowAll()};
+
+    pc::AuthServerFinal f;
+    f.sessionId       = hdr->sessionId;
+    f.correlationId   = hdr->correlationId;
+    f.errorCode       = 0;
+    f.flags           = ok.mustChangePassword ? pc::kAuthFlagMustChangePassword : uint8_t{0};
+    f.serverSignature = std::string_view(reinterpret_cast<const char*>(ok.serverSignature.data()), ok.serverSignature.size());
+    sendAnswer_(*session, scratch_.data(), f.encode(scratch_.data()));
+}
+
+void ClientGateway::reapAuthDeadlines_(int64_t nowNs)
+{
+    using namespace rune::gateway;
+    if (authMode_ != GatewayAuthMode::Required) return;
+    authReapScratch_.clear();
+    sessions_.forEach([&](Session& s) {
+        int64_t deadline = INT64_MAX;
+        if (const auto* a = std::get_if<AuthAwaitingFirst>(&s.auth)) deadline = a->deadlineNs;
+        else if (const auto* b = std::get_if<AuthAwaitingFinal>(&s.auth)) deadline = b->deadlineNs;
+        if (nowNs > deadline) authReapScratch_.push_back(s.sessionId);
+    });
+    for (const int64_t sid : authReapScratch_) {
+        Session* s = sessions_.find(sid);
+        if (s == nullptr) continue;
+        int64_t corr = 0;
+        std::string user = "<none>";
+        if (const auto* a = std::get_if<AuthAwaitingFirst>(&s->auth)) corr = a->correlationId;
+        else if (const auto* b = std::get_if<AuthAwaitingFinal>(&s->auth)) { corr = b->correlationId; user = b->user; }
+        ++loginsFailed_;
+        spdlog::warn("auth: login failed user={} source={} session={} reason={}", user, s->sourceHost, sid,
+                     loginFailureName(LoginFailure::Timeout));
+        failLogin_(*s, corr, 0);
+    }
+}
+
+void ClientGateway::onSecurityApplied(const rune::security::Applied& applied)
+{
+    using namespace rune::gateway;
+    if (applied.kind != rune::security::EventKind::AlterUser || securityView_ == nullptr) return;
+    const rune::security::UserObject* user = securityView_->state().userById(applied.objectId);
+    if (user == nullptr || user->mustChangePassword) return;   // not (yet) a SET PASSWORD of this user
+    sessions_.forEach([&](Session& s) {
+        if (const auto* pcr = std::get_if<AuthPasswordChangeRequired>(&s.auth); pcr != nullptr && pcr->userId == applied.objectId) {
+            s.auth = AuthAuthenticated{pcr->userId, pcr->user, PermissionTable::allowAll()};
+        }
+    });
+}
+
+bool ClientGateway::resumeAuthenticated_(const pc::ConnectRequest& req)
+{
+    using namespace rune::gateway;
+    if (authMode_ != GatewayAuthMode::Required || req.sessionId == 0 || !pc::clientUnderstandsAuth(req.clientVersion)) return false;
+    if (!req.cipherList.empty() || !req.handshakeBytes.empty()) return false;   // a crypto offer starts a fresh session
+    Session* s = sessions_.find(req.sessionId);
+    if (s == nullptr || s->crypto.encrypted) return false;
+    if (!std::holds_alternative<AuthAuthenticated>(s->auth) && !std::holds_alternative<AuthPasswordChangeRequired>(s->auth))
+        return false;
+    // The same client: the same reply endpoint AND the same source host.
+    if (s->egressChannel != req.egressChannel || s->egressStreamId != req.egressStreamId ||
+        s->sourceHost != sourceHostOf_(req.egressChannel))
+        return false;
+    pc::ConnectResponse resp;
+    resp.sessionId         = s->sessionId;
+    resp.correlationId     = req.correlationId;
+    resp.code              = static_cast<int16_t>(pc::ErrorCode::OK);
+    resp.leaderMemberId    = thisNodeId_;
+    resp.assignedSessionId = s->sessionId;
+    resp.v9                = true;
+    resp.authMode          = pc::AuthMode::Required;
+    resp.authState         = pc::AuthState::ResumedAuthenticated;
+    sessions_.touch(s->sessionId, nowNs_);
+    sendAnswer_(*s, scratch_.data(), resp.encode(scratch_.data()));
     return true;
 }
 

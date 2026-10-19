@@ -61,7 +61,9 @@
 #include <rune/gateway/CatalogRoute.h>
 #include <rune/gateway/SecurityRoute.h>
 #include <rune/gateway/SecurityView.h>
-#include <rune/gateway/SessionAuthGate.h>
+#include <rune/gateway/SessionAuth.h>
+#include <rune/gateway/LoginThrottle.h>
+#include <rune/gateway/ScramServer.h>
 #include <rune/peerlink/ClusterKeys.h>
 // client<->broker TLS/AEAD (Task 7): server-role handshake driver. SessionTable.h
 // (above) already pulls in rune/crypto/Aead.h + Cipher.h for CryptoState; this
@@ -398,7 +400,7 @@ public:
     [[nodiscard]] uint64_t bootstrapsRefused() const noexcept { return bootstrapsRefused_; }
     /// How this broker authenticates sessions (ConnectResponse.authMode) and the control thread's SecurityView the
     /// bootstrap window is read from (`__security` holds a Bootstrap event or not).  Required: a session that has not
-    /// authenticated is limited by its SessionAuthGate; default InProcess = no gating, byte-identical to before.
+    /// authenticated is limited by its SessionAuth state (gateFor); default InProcess = no gating, byte-identical to before.
     /// Both are control-thread values: the view pointer is read on the thread that owns the view (never across threads).
     void setAuthMode(rune::gateway::GatewayAuthMode m, const rune::gateway::SecurityView* view) noexcept {
         authMode_ = m;
@@ -407,10 +409,31 @@ public:
     [[nodiscard]] rune::gateway::GatewayAuthMode authMode() const noexcept { return authMode_; }
     /// Requests refused by the auth gate (AuthenticationFailed + session end).
     [[nodiscard]] uint64_t authGateRefusals() const noexcept { return authGateRefusals_; }
-    /// Test seam: the gate of an existing session.
-    void setSessionAuthGateForTest(int64_t sid, rune::gateway::SessionAuthGate g) {
-        if (Session* s = sessions_.find(sid)) s->authGate = g;
+    /// How long a session may take to complete its SCRAM login (RUNE_AUTH_TIMEOUT_MS, D13); default 10 s.
+    void setAuthTimeoutNs(int64_t ns) noexcept { authTimeoutNs_ = ns; }
+    /// Counters 1'000'229 / 230 / 231 (logins ok / failed / rate-limited): monotonic, control-thread values the
+    /// BrokerNode publishes to the CnC file.
+    [[nodiscard]] uint64_t loginsOk() const noexcept { return loginsOk_; }
+    [[nodiscard]] uint64_t loginsFailed() const noexcept { return loginsFailed_; }
+    [[nodiscard]] uint64_t loginsRateLimited() const noexcept { return loginsRateLimited_; }
+    /// The SecurityView applied `applied` (BrokerNode calls this right after the view did): the one transition that
+    /// lands with the login - a `SET PASSWORD` of a user lifts the must-change-password state of that user's sessions.
+    /// (The general refresh / revoke on every change is Task 14.)
+    void onSecurityApplied(const rune::security::Applied& applied);
+    /// Test seam: the auth state of an existing session.
+    void setSessionAuthForTest(int64_t sid, rune::gateway::SessionAuth a) {
+        if (Session* s = sessions_.find(sid)) s->auth = std::move(a);
     }
+    [[nodiscard]] const rune::gateway::SessionAuth* sessionAuthForTest(int64_t sid) {
+        const Session* s = sessions_.find(sid);
+        return s ? &s->auth : nullptr;
+    }
+    /// Test seam: the source host the throttle keys a session by.
+    void setSessionSourceHostForTest(int64_t sid, std::string host) {
+        if (Session* s = sessions_.find(sid)) s->sourceHost = std::move(host);
+    }
+    /// Test seam: the gateway clock the auth handlers (throttle, deadline) read (doWork sets it each cycle).
+    void setNowNsForTest(int64_t ns) noexcept { nowNs_ = ns; }
     [[nodiscard]] bool hasSessionForTest(int64_t sid) { return sessions_.find(sid) != nullptr; }
     [[nodiscard]] uint64_t securitySubscribesForwarded() const noexcept { return securitySubscribesForwarded_; }
     /// DDLs answered by the route without reaching the admin ring (Redirect /
@@ -1468,7 +1491,8 @@ private:
         std::string egressChannel;
         int32_t     egressStreamId = 0;
         int32_t     clientVersion  = 0;   ///< D6: ConnectRequest.clientVersion
-        rune::gateway::SessionAuthGate authGate;   ///< decided when the ConnectResponse is built (what the client was told)
+        rune::gateway::SessionAuth auth;   ///< decided when the ConnectResponse is built (what the client was told)
+        std::string sourceHost;            ///< D14: the Connect image's source host (throttle key)
 
         // Task 13 (spec §3.4): every worker has this session's reply destination
         // queued (announce-before-accept) — set once, so a ConnectResponse retry
@@ -2111,11 +2135,34 @@ private:
     uint64_t securitySubscribesForwarded_ = 0;
     rune::gateway::GatewayAuthMode authMode_ = rune::gateway::GatewayAuthMode::InProcess;
     const rune::gateway::SecurityView* securityView_ = nullptr;   // control thread's own mirror (same thread as the gateway)
-    uint64_t authGateRefusals_ = 0;
-    /// The gate a NEW session starts in, and the v9 ConnectResponse fields it implies (see SessionAuthGate.h).
-    [[nodiscard]] rune::gateway::SessionAuthGate newSessionGate_(int32_t clientVersion) const;
-    /// true = refused here (AuthenticationFailed in the request's own response type, then the session ends).
+    /// The auth state a NEW session starts in (D11): AuthAwaitingFirst{now + authTimeout} when authenticating,
+    /// AuthAnonymous otherwise.
+    [[nodiscard]] rune::gateway::SessionAuth newSessionAuth_(int64_t nowNs, int64_t connectCorrelationId) const;
+    /// The bootstrap window (SecurityBootstrap accepted): no ENABLED security admin and a healthy view.
+    [[nodiscard]] bool bootstrapOpen_() const noexcept {
+        return securityView_ != nullptr && !securityView_->halted() && !securityView_->state().hasSecurityAdmin();
+    }
+    /// true = refused here: the auth gate (gateFor) answered AuthenticationFailed (and ended the session) or
+    /// PasswordChangeRequired (the session stays) in the request's own response type.
     [[nodiscard]] bool authGateRefuses_(rune::protocol::client::TemplateId tid, const uint8_t* buf, std::size_t len);
+    void handleAuthClientFirst_(const uint8_t* buf, std::size_t len);
+    void handleAuthClientFinal_(const uint8_t* buf, std::size_t len);
+    /// The ONE failure answer of a login (44, no retry-after unless rate-limited, the one detail text) then the end of
+    /// the session.  Review Focus 1: nothing on the wire says why.
+    void failLogin_(Session& session, int64_t correlationId, uint32_t retryAfterMs);
+    /// Sessions still awaiting their login past the deadline: AuthServerFinal{44} + end (D13).
+    void reapAuthDeadlines_(int64_t nowNs);
+    /// A Connect whose hint names this broker's own authenticated session on the same endpoint (plaintext): answered
+    /// ResumedAuthenticated, no new session.  true = answered.
+    [[nodiscard]] bool resumeAuthenticated_(const rune::protocol::client::ConnectRequest& req);
+    /// The throttle key host of a Connect: the Aeron image's source host, else the reply endpoint's host.
+    [[nodiscard]] std::string sourceHostOf_(std::string_view egressChannel) const;
+    rune::gateway::LoginThrottle loginThrottle_;
+    int64_t  authTimeoutNs_ = 10'000'000'000LL;
+    uint64_t loginsOk_ = 0, loginsFailed_ = 0, loginsRateLimited_ = 0;
+    int32_t  currentImageSessionId_ = 0;   ///< the Aeron image (publication) session id of the frame being dispatched
+    std::vector<int64_t> authReapScratch_; ///< reused by reapAuthDeadlines_ (capacity persists)
+    uint64_t authGateRefusals_ = 0;
     uint64_t bootstrapsRefused_ = 0;
     std::optional<rune::peerlink::ClusterKeys> clusterKeys_;
     std::vector<uint8_t> bootstrapMacScratch_;   // reused MAC input (capacity persists)

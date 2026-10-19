@@ -2313,6 +2313,14 @@ private:
     std::shared_ptr<aeron::Counter>  securityHaltedCounter_;
     std::shared_ptr<aeron::Counter>  securityAppliedCounter_;
     std::shared_ptr<aeron::Counter>  authModeCounter_;
+    // Authentication Task 11: 1'000'229 logins ok, 230 failed, 231 rate-limited (the gateway's control-thread tallies).
+    std::int64_t                     loginsOkCounterRegId_          = -1;
+    std::int64_t                     loginsFailedCounterRegId_      = -1;
+    std::int64_t                     loginsRateLimitedCounterRegId_ = -1;
+    std::shared_ptr<aeron::Counter>  loginsOkCounter_;
+    std::shared_ptr<aeron::Counter>  loginsFailedCounter_;
+    std::shared_ptr<aeron::Counter>  loginsRateLimitedCounter_;
+    std::uint64_t                    publishedLoginsOk_ = 0, publishedLoginsFailed_ = 0, publishedLoginsRateLimited_ = 0;
     std::int64_t                     securityHaltedValue_  = 0;    // control-thread-owned (0 = applying)
     std::int64_t                     securityAppliedValue_ = -1;   // control-thread-owned
     DevModeWarnTimer                 devModeWarn_;                 // control thread
