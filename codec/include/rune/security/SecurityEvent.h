@@ -5,14 +5,16 @@
 // timestampMs i64, fingerprint u64), then
 //   objectName (u16 len + bytes), statement (u32 len + bytes; REDACTED — never a password),
 //   the principal and replayedFrom exactly as __catalog v1 (shared wire code),
-//   opsLen u32, then tag u8 (= the Ops variant index) and the body (the event's tail).
+//   opsLen u32, then tag u8 (= the KIND, exactly as __catalog frames its ops) and the body (the event's tail).
 // Verifier body: saltLen u8 (16..64), salt, iterations u32 (4096..1e6), storedKey[64], serverKey[64].
 // Grant / Revoke body: grantee u8, op u8, type u8, patternKind u8, name u16+bytes.
-// AlterUser body: changeTag u8 (= the UserChange variant index) + (DropPassword: index u8;
+// AlterUser body: changeTag u8 (= UserChangeKind, 0-based: Add 0, Drop 1, Set 2, Disable 3, Enable 4) + (DropPassword: index u8;
 // AddPassword: verifier; SetPassword: verifier + terminate u8 0|1; Disable / Enable: empty).
+// Bootstrap body: verifier, fakeSaltSeed[32] (D8: the cluster-wide fake-salt key, set once).
 // GrantRole / RevokeRole body: roleId u64, roleName u16+bytes.  Empty bodies are zero bytes.
 // FROZEN with formatVer 1: a change ships as formatVer 2.
 #include <rune/catalog/CatalogEvent.h>
+#include <rune/protocol/SecurityTypes.h>
 
 #include <array>
 #include <compare>
@@ -31,10 +33,11 @@ namespace rune::security {
 enum class EventKind : uint16_t { CreateUser = 1, AlterUser = 2, DropUser = 3, CreateRole = 4, DropRole = 5,
                                   Grant = 6, Revoke = 7, GrantRole = 8, RevokeRole = 9, Bootstrap = 10 };
 inline constexpr uint16_t kFormatV1 = 1, kCurrentFormatVer = kFormatV1;
-enum class Operation    : uint8_t { Read = 0, Write = 1, Create = 2, Alter = 3, Drop = 4, Describe = 5, Admin = 6 };
-enum class ResourceType : uint8_t { Cluster = 0, Topic = 1, View = 2, Group = 3, TransactionalId = 4 };
-enum class PatternKind  : uint8_t { Exact = 0, Prefix = 1 };
-enum class GranteeKind  : uint8_t { User = 0, Role = 1 };
+// The frozen enums are defined ONCE, in rune-protocol (SecurityTypes.h); the wire, this event and rune-ql share them.
+using Operation    = rune::protocol::SecurityOperation;      // Read 0 … Admin 6
+using ResourceType = rune::protocol::SecurityResourceType;   // Cluster 0 … TransactionalId 4
+using PatternKind  = rune::protocol::SecurityPatternKind;    // Exact 0, Prefix 1
+using GranteeKind  = rune::protocol::SecurityGranteeKind;    // User 0, Role 1
 [[nodiscard]] constexpr uint8_t opBit(Operation o) noexcept { return static_cast<uint8_t>(1u << static_cast<uint8_t>(o)); }
 
 struct ResourcePattern { ResourceType type = ResourceType::Topic; PatternKind kind = PatternKind::Exact;
@@ -69,7 +72,9 @@ struct GrantRoleOps  { uint64_t roleId = 0; std::string roleName;
                        bool operator==(const GrantRoleOps&) const = default; };     // object = the user
 struct RevokeRoleOps { uint64_t roleId = 0; std::string roleName;
                        bool operator==(const RevokeRoleOps&) const = default; };
-struct BootstrapOps  { ScramVerifier verifier; bool operator==(const BootstrapOps&) const = default; };   // D3
+inline constexpr std::size_t kFakeSaltSeedBytes = 32;
+struct BootstrapOps  { ScramVerifier verifier; std::array<uint8_t, kFakeSaltSeedBytes> fakeSaltSeed{};   // D3, D8
+                       bool operator==(const BootstrapOps&) const = default; };
 
 using Ops = std::variant<CreateUserOps, AlterUserOps, DropUserOps, CreateRoleOps, DropRoleOps,
                          GrantOps, RevokeOps, GrantRoleOps, RevokeRoleOps, BootstrapOps>;

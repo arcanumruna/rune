@@ -206,3 +206,43 @@ TEST(SecurityApplyV1Regression, ValidNameAcceptsExactlyTheDocumentedAlphabet) {
     EXPECT_FALSE(rs::validName("")); EXPECT_FALSE(rs::validName("a b")); EXPECT_FALSE(rs::validName("__a"));
     EXPECT_TRUE(rs::validName("_a")); EXPECT_FALSE(rs::validName("a/b")); EXPECT_FALSE(rs::validName("é"));
 }
+
+TEST(SecurityApplyV1Regression, FakeSaltSeedIsSetOnceByTheFirstBootstrapRegression) {
+    Script sc;
+    EXPECT_FALSE(sc.s.fakeSaltSeed().has_value());
+    const uint64_t emptyDigest = sc.s.digest();
+    rs::BootstrapOps first{v(1)}; first.fakeSaltSeed.fill(0xA1);
+    ASSERT_TRUE(sc.run(first, "admin").has_value());
+    ASSERT_TRUE(sc.s.fakeSaltSeed().has_value());
+    EXPECT_EQ((*sc.s.fakeSaltSeed())[0], 0xA1);
+    // every admin gone, a second bootstrap with another seed: the cluster keeps the FIRST seed
+    sc.run(rs::AlterUserOps{rs::DisableUser{}}, "admin");
+    rs::BootstrapOps second{v(2)}; second.fakeSaltSeed.fill(0xB2);
+    ASSERT_TRUE(sc.run(second, "admin2").has_value());
+    EXPECT_EQ((*sc.s.fakeSaltSeed())[0], 0xA1) << "fake salts never change for the life of the cluster";
+    // the digest covers the seed (replicas must agree on it), the fingerprints do not
+    Script a, b;
+    rs::BootstrapOps x{v(1)}, y{v(1)}; x.fakeSaltSeed.fill(1); y.fakeSaltSeed.fill(2);
+    a.run(x, "admin"); b.run(y, "admin");
+    EXPECT_EQ(rs::fingerprintOf(*a.s.user("admin"), a.s), rs::fingerprintOf(*b.s.user("admin"), b.s));
+    EXPECT_NE(a.s.digest(), b.s.digest());
+    EXPECT_NE(a.s.digest(), emptyDigest);
+}
+
+TEST(SecurityApplyV1Regression, GrantsOnInternalNamesAreRefusedRegression) {
+    Script sc; sc.run(rs::CreateUserOps{v(1)}, "u");
+    const rs::GrantSpec bad[] = {
+        g(rs::Operation::Read, rs::ResourceType::Topic, rs::PatternKind::Exact, "__security"),
+        g(rs::Operation::Read, rs::ResourceType::Topic, rs::PatternKind::Prefix, "__"),
+        g(rs::Operation::Read, rs::ResourceType::Topic, rs::PatternKind::Prefix, "__cat"),
+        g(rs::Operation::Read, rs::ResourceType::View, rs::PatternKind::Exact, "__views"),
+        g(rs::Operation::Read, rs::ResourceType::Group, rs::PatternKind::Prefix, "__consumer"),
+        g(rs::Operation::Write, rs::ResourceType::TransactionalId, rs::PatternKind::Exact, "__x"),
+        g(rs::Operation::Read, rs::ResourceType::Topic, rs::PatternKind::Exact, std::string(250, 'a')),
+        g(rs::Operation::Read, rs::ResourceType::Topic, rs::PatternKind::Prefix, std::string(250, 'a')),
+    };
+    for (const auto& b : bad)
+        EXPECT_EQ(sc.run(rs::GrantOps{rs::GranteeKind::User, b}, "u").error().refusal, rs::Refusal::InvalidGrant) << b.resource.name.substr(0, 12);
+    EXPECT_TRUE(sc.run(rs::GrantOps{rs::GranteeKind::User, g(rs::Operation::Read, rs::ResourceType::Topic, rs::PatternKind::Exact, std::string(249, 'a'))}, "u").has_value());
+    EXPECT_TRUE(sc.run(rs::GrantOps{rs::GranteeKind::User, g(rs::Operation::Read, rs::ResourceType::Topic, rs::PatternKind::Prefix, "_x")}, "u").has_value()) << "a single underscore is an ordinary name";
+}

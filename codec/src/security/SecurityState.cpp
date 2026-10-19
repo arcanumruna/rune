@@ -34,7 +34,7 @@ std::vector<uint64_t> SecurityState::membersOf(uint64_t roleId) const {
     return out;
 }
 
-bool SecurityState::hasSecurityAdmin() const noexcept {
+bool SecurityState::hasSecurityAdmin() const {
     for (const auto& [id, u] : users_) {
         if (!u.enabled) continue;
         const auto grants = effectiveGrants(*this, id);
@@ -49,7 +49,7 @@ std::optional<RequestRecord> SecurityState::request(const RequestId& id) const {
     return it->second;
 }
 
-uint64_t SecurityState::digest() const noexcept {
+uint64_t SecurityState::digest() const {
     namespace det = rune::catalog::detail;
     uint64_t h = rune::codec::detail::kFnvSeed;
     h = det::fnvU64(h, static_cast<uint64_t>(appliedOffset_));
@@ -67,6 +67,8 @@ uint64_t SecurityState::digest() const noexcept {
         }
     }
     for (const Tombstone& t : tombstones_) h = det::fnvU64(h, fingerprintOf(t));
+    h = rune::codec::detail::fnv1a_byte(h, fakeSaltSeed_ ? 1 : 0);   // replicas must agree on the D8 seed
+    if (fakeSaltSeed_) h = det::fnvBytes(h, fakeSaltSeed_->data(), fakeSaltSeed_->size());
     return h;
 }
 
@@ -135,6 +137,9 @@ bool validGrant(const GrantSpec& g) noexcept {
         break;
     }
     if (!(allowed & opBit(g.op))) return false;
+    // I6: internal objects ("__…": __security, __catalog, __consumer_offsets, …) are never grantable by pattern;
+    // and a pattern is bounded like the names it matches (the protocol's kSecurityPatternMax).
+    if (p.type != ResourceType::Cluster && (p.name.starts_with("__") || p.name.size() > 249)) return false;
     if (p.type != ResourceType::Cluster && p.kind == PatternKind::Exact && p.name.empty()) return false;
     return true;
 }

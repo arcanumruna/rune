@@ -74,7 +74,9 @@ std::vector<SecurityEvent> goldenScriptV1() {
     const GrantSpec readEvents = spec(Operation::Read, ResourceType::Topic, PatternKind::Exact, "player_events");
     const GrantSpec writeWorld = spec(Operation::Write, ResourceType::Topic, PatternKind::Prefix, "world.");
     const GrantSpec readGroup  = spec(Operation::Read, ResourceType::Group, PatternKind::Prefix, "world-");
-    b.emit(BootstrapOps{verifierAt(b.next())}, "admin", "BOOTSTRAP USER admin WITH PASSWORD '<redacted>';");
+    BootstrapOps boot{verifierAt(b.next())};
+    for (std::size_t i = 0; i < boot.fakeSaltSeed.size(); ++i) boot.fakeSaltSeed[i] = static_cast<uint8_t>(0x60 + i);
+    b.emit(boot, "admin", "BOOTSTRAP USER admin WITH PASSWORD '<redacted>';");
     b.emit(CreateRoleOps{}, "world_server", "CREATE ROLE world_server;");
     b.emit(GrantOps{GranteeKind::Role, readEvents}, "world_server", "GRANT READ ON TOPIC player_events TO ROLE world_server;");
     b.emit(GrantOps{GranteeKind::Role, writeWorld}, "world_server", "GRANT WRITE ON TOPIC PREFIX 'world.' TO ROLE world_server;");

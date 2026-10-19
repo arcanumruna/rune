@@ -75,3 +75,18 @@ TEST(SecurityPermissionsRegression, HasSecurityAdminCountsEffectiveAdminViaARole
     sc.run(rs::AlterUserOps{rs::DisableUser{}}, "u");
     EXPECT_FALSE(sc.s.hasSecurityAdmin());
 }
+
+TEST(SecurityPermissionsRegression, NoPatternEverMatchesAnInternalObjectRegression) {
+    for (const char* internal : {"__security", "__consumer_offsets", "__catalog", "__"}) {
+        for (auto type : {ResourceType::Topic, ResourceType::View, ResourceType::Group, ResourceType::TransactionalId}) {
+            EXPECT_FALSE(rs::matches({type, PatternKind::Prefix, ""}, type, internal)) << internal;
+            EXPECT_FALSE(rs::matches({type, PatternKind::Prefix, "_"}, type, internal)) << internal;
+            EXPECT_FALSE(rs::matches({type, PatternKind::Exact, internal}, type, internal)) << internal;
+        }
+        const std::vector<rs::GrantSpec> all = {g(Operation::Read, ResourceType::Topic, PatternKind::Prefix, ""),
+                                                g(Operation::Create, ResourceType::Cluster, PatternKind::Exact, "")};
+        EXPECT_EQ(rs::opsOn(all, ResourceType::Topic, internal) & (rs::opBit(Operation::Read)), 0) << internal;
+    }
+    EXPECT_TRUE(rs::matches({ResourceType::Topic, PatternKind::Prefix, ""}, ResourceType::Topic, "_single")) << "one underscore is an ordinary name";
+    EXPECT_TRUE(rs::matches({ResourceType::Cluster, PatternKind::Exact, ""}, ResourceType::Cluster, ""));
+}

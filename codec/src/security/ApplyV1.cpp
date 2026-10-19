@@ -214,6 +214,7 @@ Applied ApplyV1::commit(SecurityState& s, const SecurityEvent& e, int64_t offset
             s.tombstones_.push_back(std::move(ch.tomb));
         }
     }, st.change);
+    if (const auto* b = std::get_if<BootstrapOps>(&e.ops); b && !s.fakeSaltSeed_) s.fakeSaltSeed_ = b->fakeSaltSeed;   // D8: the first one wins
     s.appliedOffset_ = offset;
     if (!e.principal.requestId.none())
         s.requests_.try_emplace(e.principal.requestId,

@@ -29,7 +29,7 @@ uint64_t verifier(uint64_t h, const ScramVerifier& v) noexcept {
 }
 } // namespace
 
-uint64_t fingerprintOf(const UserObject& u, const SecurityState& s) noexcept {
+uint64_t fingerprintOf(const UserObject& u, const SecurityState& s) {
     uint64_t h = cdd::kFnvSeed;
     h = u8(h, 'U');
     h = str(h, u.name);

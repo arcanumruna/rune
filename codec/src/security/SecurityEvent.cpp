@@ -84,13 +84,15 @@ void putGrant(Writer& w, const GrantSpec& g) {
     w.e8(g.op); w.e8(g.resource.type); w.e8(g.resource.kind); w.str16(g.resource.name);
 }
 void putOps(Writer& w, const Ops& ops) {
-    w.u8(static_cast<uint8_t>(ops.index()));   // the tag = the variant index (frozen)
+    w.u8(static_cast<uint8_t>(kindOf(ops)));   // the tag = the kind, exactly as __catalog (frozen)
     std::visit([&](const auto& o) {
         using T = std::decay_t<decltype(o)>;
-        if constexpr (std::is_same_v<T, CreateUserOps> || std::is_same_v<T, BootstrapOps>) {
+        if constexpr (std::is_same_v<T, CreateUserOps>) {
             putVerifier(w, o.verifier);
+        } else if constexpr (std::is_same_v<T, BootstrapOps>) {
+            putVerifier(w, o.verifier); w.raw(o.fakeSaltSeed);
         } else if constexpr (std::is_same_v<T, AlterUserOps>) {
-            w.u8(static_cast<uint8_t>(o.change.index()));
+            w.u8(static_cast<uint8_t>(o.change.index()));   // the change tag = UserChangeKind (0-based, frozen)
             std::visit([&](const auto& c) {
                 using C = std::decay_t<decltype(c)>;
                 if constexpr (std::is_same_v<C, AddPassword>) putVerifier(w, c.verifier);
@@ -125,10 +127,15 @@ bool getGrant(Reader& r, GrantSpec& g) {
 }
 std::expected<Ops, DecodeError> getOps(Reader& r, EventKind kind) {
     uint8_t tag; if (!r.u8(tag)) return std::unexpected(DecodeError::Truncated);
-    if (tag != static_cast<uint8_t>(static_cast<uint16_t>(kind) - 1)) return std::unexpected(DecodeError::KindOpsMismatch);
+    if (tag != static_cast<uint8_t>(kind)) return std::unexpected(DecodeError::KindOpsMismatch);
     switch (kind) {
     case EventKind::CreateUser: { CreateUserOps o; if (auto e = getVerifier(r, o.verifier)) return std::unexpected(*e); return o; }
-    case EventKind::Bootstrap:  { BootstrapOps o;  if (auto e = getVerifier(r, o.verifier)) return std::unexpected(*e); return o; }
+    case EventKind::Bootstrap: {
+        BootstrapOps o;
+        if (auto e = getVerifier(r, o.verifier)) return std::unexpected(*e);
+        if (!r.raw(o.fakeSaltSeed.data(), o.fakeSaltSeed.size())) return std::unexpected(DecodeError::Truncated);
+        return o;
+    }
     case EventKind::AlterUser: {
         uint8_t ct; if (!r.u8(ct)) return std::unexpected(DecodeError::Truncated);
         AlterUserOps o;

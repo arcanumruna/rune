@@ -17,7 +17,7 @@
 
 namespace rune::security {
 
-[[nodiscard]] uint64_t fingerprintOf(const UserObject&, const SecurityState&) noexcept;   // role NAMES, never ids
+[[nodiscard]] uint64_t fingerprintOf(const UserObject&, const SecurityState&);   // role NAMES, never ids
 [[nodiscard]] uint64_t fingerprintOf(const RoleObject&) noexcept;
 [[nodiscard]] uint64_t fingerprintOf(const Tombstone&) noexcept;
 

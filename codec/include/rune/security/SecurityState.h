@@ -5,6 +5,7 @@
 // Single-threaded, owned by whoever replays.  Cold path (control plane).
 #include <rune/security/SecurityEvent.h>
 
+#include <array>
 #include <cstdint>
 #include <expected>
 #include <map>
@@ -55,19 +56,23 @@ public:
     [[nodiscard]] const std::map<uint64_t, RoleObject>& roles() const noexcept { return roles_; }
     [[nodiscard]] const std::vector<Tombstone>& tombstones() const noexcept { return tombstones_; }
     [[nodiscard]] std::vector<uint64_t> membersOf(uint64_t roleId) const;   // sorted
-    [[nodiscard]] bool hasSecurityAdmin() const noexcept;                    // an ENABLED user effectively holds ADMIN CLUSTER
+    [[nodiscard]] bool hasSecurityAdmin() const;                    // an ENABLED user effectively holds ADMIN CLUSTER
     [[nodiscard]] int64_t appliedOffset() const noexcept { return appliedOffset_; }   // -1 = nothing applied
     [[nodiscard]] uint64_t nextObjectId() const noexcept { return nextObjectId_; }    // users and roles share one counter
     [[nodiscard]] std::optional<RequestRecord> request(const RequestId&) const;
     /// FNV-1a-64 over appliedOffset, nextObjectId, each live user then role fingerprint in objectId order,
     /// each tombstone in apply order.  Equal digests at equal offsets = the replicas agree.
-    [[nodiscard]] uint64_t digest() const noexcept;
+    [[nodiscard]] uint64_t digest() const;
+    /// D8: the cluster-wide key of the fake salts, set by the FIRST Bootstrap event and never changed
+    /// (a later Bootstrap keeps it).  nullopt before any bootstrap.  Covered by digest(), not by fingerprints.
+    [[nodiscard]] const std::optional<std::array<uint8_t, kFakeSaltSeedBytes>>& fakeSaltSeed() const noexcept { return fakeSaltSeed_; }
 private:
     friend struct ApplyV1;
     std::map<uint64_t, UserObject> users_; std::map<uint64_t, RoleObject> roles_;
     std::map<std::string, uint64_t, std::less<>> userNames_, roleNames_;
     std::vector<Tombstone> tombstones_;
     std::unordered_map<RequestId, RequestRecord, rune::catalog::RequestIdHash> requests_;
+    std::optional<std::array<uint8_t, kFakeSaltSeedBytes>> fakeSaltSeed_;
     uint64_t nextObjectId_ = 1; int64_t appliedOffset_ = -1;
 };
 

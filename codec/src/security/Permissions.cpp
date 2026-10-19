@@ -7,6 +7,7 @@ namespace rune::security {
 
 bool matches(const ResourcePattern& p, ResourceType type, std::string_view name) noexcept {
     if (p.type != type) return false;
+    if (type != ResourceType::Cluster && name.starts_with("__")) return false;   // I6: internal objects never match a pattern
     return p.kind == PatternKind::Exact ? name == p.name : name.starts_with(p.name);
 }
 
