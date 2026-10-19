@@ -1515,6 +1515,8 @@ public:
     [[nodiscard]] uint64_t authGateRefusalsForTest();
     /// Test-only (Task 19): requests the gateway answered NotAuthorized (45) since start (control thread, read-only).
     [[nodiscard]] uint64_t gatewayNotAuthorizedForTest();
+    /// Test-only (Task 19): the object id of user `name` in this broker's SecurityView (0 = none); control thread, read-only.
+    [[nodiscard]] uint64_t securityUserIdForTest(const std::string& name);
     /// Counter values the control thread publishes (read ON the control thread).
     struct SecurityMetricsSnap { int64_t halted = 0; int64_t applied = -1; int64_t authMode = 0; };
     [[nodiscard]] SecurityMetricsSnap securityMetricsForTest();

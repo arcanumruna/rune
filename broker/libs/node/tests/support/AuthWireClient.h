@@ -23,7 +23,6 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
-#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -32,6 +31,24 @@ namespace rune::node::test {
 
 class AuthWireClient {
 public:
+    struct Verifier {
+        std::vector<uint8_t> salt;
+        std::array<uint8_t, 64> stored{}, server{};
+        [[nodiscard]] pc::VerifierWire wire() const {
+            return pc::VerifierWire{std::string_view(reinterpret_cast<const char*>(salt.data()), salt.size()), 4096,
+                                    std::string_view(reinterpret_cast<const char*>(stored.data()), 64),
+                                    std::string_view(reinterpret_cast<const char*>(server.data()), 64)};
+        }
+    };
+    static Verifier verifierOf(const std::string& password) {
+        Verifier out;
+        const auto v = rune::crypto::scram::makeVerifier(password, 4096);
+        out.salt = v->salt;
+        std::memcpy(out.stored.data(), v->storedKey.bytes.data(), 64);
+        std::memcpy(out.server.data(), v->serverKey.bytes.data(), 64);
+        return out;
+    }
+
     using Clock = std::chrono::steady_clock;
     using DdlAnswer = ShardTestClient::DdlAnswer;
 
@@ -146,9 +163,12 @@ public:
     }
     DdlAnswer createUser(const std::string& channel, int64_t sid, const std::string& name, const std::string& password,
                          std::chrono::milliseconds within = std::chrono::seconds{30}) {
-        // A pinned request id is a RETRY of the same request: byte-identical, so the verifier (random salt) is reused.
-        static std::map<std::string, Verifier> pinnedVerifiers;
-        const Verifier v = pinnedRid_ ? pinnedVerifiers.try_emplace(password, verifierOf(password)).first->second : verifierOf(password);
+        return createUserWithVerifier(channel, sid, name, verifierOf(password), within);
+    }
+    /// A retry of the SAME request (pinRequestId) must be byte-identical, so the caller owns the verifier (random salt)
+    /// and passes the same one each time.
+    DdlAnswer createUserWithVerifier(const std::string& channel, int64_t sid, const std::string& name, const Verifier& v,
+                                     std::chrono::milliseconds within = std::chrono::seconds{30}) {
         pc::SecurityDdl m; m.sessionId = sid; m.kind = pc::SecurityOpKind::CreateUser; m.name = name; m.verifier = v.wire();
         return securityDdl(channel, m, "CREATE USER " + name + " WITH PASSWORD '<redacted>';", within);
     }
@@ -226,24 +246,6 @@ public:
     static constexpr int32_t kClientStream = 1;
 
 private:
-    struct Verifier {
-        std::vector<uint8_t> salt;
-        std::array<uint8_t, 64> stored{}, server{};
-        [[nodiscard]] pc::VerifierWire wire() const {
-            return pc::VerifierWire{std::string_view(reinterpret_cast<const char*>(salt.data()), salt.size()), 4096,
-                                    std::string_view(reinterpret_cast<const char*>(stored.data()), 64),
-                                    std::string_view(reinterpret_cast<const char*>(server.data()), 64)};
-        }
-    };
-    static Verifier verifierOf(const std::string& password) {
-        Verifier out;
-        const auto v = rune::crypto::scram::makeVerifier(password, 4096);
-        out.salt = v->salt;
-        std::memcpy(out.stored.data(), v->storedKey.bytes.data(), 64);
-        std::memcpy(out.server.data(), v->serverKey.bytes.data(), 64);
-        return out;
-    }
-
     ShardTestClient cl_;
     ScramSaltCache cache_;
     bool cacheSaltedPasswords_ = false;

@@ -1693,7 +1693,7 @@ if(BUILD_TESTING)
         target_include_directories(rune_auth_cluster_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_auth_cluster_tests PRIVATE rune_node rune_view rune_codec rune_catalog aeron::aeron
                               GTest::gtest_main)
-        gtest_discover_tests(rune_auth_cluster_tests PROPERTIES TIMEOUT 900 RUN_SERIAL TRUE)   # 3 brokers + clients per test
+        gtest_discover_tests(rune_auth_cluster_tests PROPERTIES TIMEOUT 900)
 
         # DR client bugs (2026-10-15): the REAL client against 3 REAL in-process brokers, a leader SIGKILLed mid-op
         # (seed failover, metadata from any live broker, re-route; produce / subscribe / group / txn / DDL / view row).

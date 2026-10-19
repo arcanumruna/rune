@@ -75,30 +75,28 @@ public:
     }
     /// Stop node i and start it again over the same dir with the given key files; its wires/sessions are dropped.
     void restart(int id, const std::string& current, const std::string& next = {}) {
-        dropWires_(id);
+        dropSessions_(id);
         setKey(id, current, next);
         c_.stop(id);
         c_.startNode(id);
     }
     [[nodiscard]] const std::string& keyContentsPath(int id) const { return keyPath_[static_cast<std::size_t>(id - 1)]; }
     void setAuthMode(AuthMode m) noexcept { authMode_ = m; }
-    void stopNode(int id) { dropWires_(id); c_.stop(id); }
+    void stopNode(int id) { dropSessions_(id); c_.stop(id); }
 
     // ── wires and sessions ───────────────────────────────────────────────────────────────────────────────────
-    AuthWireClient& newWire(int id) {
-        auto& slot = wires_[static_cast<std::size_t>(id - 1)];
-        slot.push_back(std::make_unique<AuthWireClient>(c_.clientsDir->path / ("w" + std::to_string(++wireSeq_))));
-        return *slot.back();
+    /// The ONE embedded Aeron driver of this trio (a client with sessions on every broker, for every user): it lives as
+    /// long as the trio, so a test with many cells does not pile up drivers.  Sessions, not wires, are per user / broker;
+    /// a session whose broker restarted is dead, the wire itself stays valid (no dangling pointers).
+    AuthWireClient& wire() {
+        if (!wire_) wire_ = std::make_unique<AuthWireClient>(c_.clientsDir->path / "trio_wire");
+        return *wire_;
     }
-    /// A logged-in session on broker `id` (its own wire).  Throws if the login is refused.
+    AuthWireClient& newWire(int /*id*/) { return wire(); }
+    /// A logged-in session on broker `id` (on the trio wire).  Throws if the login is refused.
     struct Session { AuthWireClient* w = nullptr; int64_t sid = 0; int node = 0; };
     Session login(int id, const std::string& user, const std::string& pw = kPw) {
-        AuthWireClient& w = newWire(id);
-        const int64_t sid = w.connect(channel(id));
-        if (sid <= 0) throw std::runtime_error("AuthTrio: connect failed on node " + std::to_string(id));
-        const auto l = w.login(channel(id), sid, user, {pw, pw});
-        if (!l.ok()) throw std::runtime_error("AuthTrio: login refused for " + user + " on node " + std::to_string(id));
-        return {&w, sid, id};
+        return loginOn(wire(), id, user, pw);
     }
 
     /// Log `user` in on broker `id` through an EXISTING wire (one wire can hold sessions on all three brokers).
@@ -164,7 +162,9 @@ public:
                 if (!c_.running(id)) continue;
                 const Session a = adminOn(id);
                 last = fn(*a.w, channel(id), a.sid);
-                if (last.errorCode != 2 && last.errorCode != 3 && last.errorCode != 0xFFFF) return last;
+                // 0xFFFF (no answer: the session idle-expired) / 44 / 46 (revoked): log in again before the next attempt
+                if (last.errorCode == 0xFFFF || last.errorCode == 44 || last.errorCode == 46) { admin_[static_cast<std::size_t>(id - 1)] = {}; continue; }
+                if (last.errorCode != 2 && last.errorCode != 3) return last;
             }
             if (Clock3::now() >= deadline) return last;
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -241,17 +241,13 @@ private:
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
     }
-    void dropWires_(int id) {
-        wires_[static_cast<std::size_t>(id - 1)].clear();
-        admin_[static_cast<std::size_t>(id - 1)] = {};
-    }
+    void dropSessions_(int id) { admin_[static_cast<std::size_t>(id - 1)] = {}; }   // the broker's sessions died with it
 
     catalog_cluster::TmpDir keys_;
     ThreeNodes c_;
     std::array<std::string, 3> keyContents_, keyPath_, nextPath_;
-    std::array<std::vector<std::unique_ptr<AuthWireClient>>, 3> wires_;
+    std::unique_ptr<AuthWireClient> wire_;
     std::array<Session, 3> admin_{};
-    int wireSeq_ = 0;
     AuthMode authMode_ = AuthMode::Enabled;
 };
 

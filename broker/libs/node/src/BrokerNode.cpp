@@ -3449,6 +3449,14 @@ BrokerNode::SecurityViewSnap BrokerNode::securityViewForTest() {
     });
 }
 
+uint64_t BrokerNode::securityUserIdForTest(const std::string& name) {
+    return onControlThreadForTest([this, name]() -> uint64_t {
+        if (!securityView_) return 0;
+        const auto* u = securityView_->state().user(name);
+        return u ? u->objectId : 0;
+    });
+}
+
 bool BrokerNode::gatewayHasSessionForTest(int64_t sessionId) {
     return onControlThreadForTest([this, sessionId]() { return gateway_ != nullptr && gateway_->hasSessionForTest(sessionId); });
 }
