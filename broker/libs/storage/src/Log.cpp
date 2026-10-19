@@ -987,7 +987,7 @@ int64_t Log::append(const uint8_t* data, std::size_t len, int64_t lastOffset) {
     // This ensures the incremental counter tracks batches that land on the
     // current active segment, NOT the batch that caused the roll.
     throwIfFailed_();
-    maybeRoll();
+    { FLIGHT_RECORDER_SPAN_STORAGE(flight_recorder::Site::StorageRoll, 0); maybeRoll(); }
     logEndOffset_ = activeSegment().append(data, len, lastOffset);
     advanceRecoveryPoint_();   // E1d: the durable append synced the active segment
     maybeCheckpointInline_();
@@ -1011,7 +1011,7 @@ int64_t Log::appendNoSync(const uint8_t* data, std::size_t len, int64_t lastOffs
     // The caller (gateway doWork) calls sync() once after the ingress batch.
     // CP-8: same post-roll update pattern as append() above.
     throwIfFailed_();
-    maybeRoll();
+    { FLIGHT_RECORDER_SPAN_STORAGE(flight_recorder::Site::StorageRoll, 0); maybeRoll(); }
     logEndOffset_ = activeSegment().appendNoSync(data, len, lastOffset);
     if (len >= static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead)) {
         // MAJOR-1 (review fix round 1): EVERY batch of a multi-batch append.
@@ -1029,7 +1029,7 @@ int64_t Log::appendNoSyncRestamp(const uint8_t* batch, std::size_t len,
     // the base offset is read AFTER the roll so it matches the segment the batch
     // actually lands in.
     throwIfFailed_();
-    maybeRoll();
+    { FLIGHT_RECORDER_SPAN_STORAGE(flight_recorder::Site::StorageRoll, 0); maybeRoll(); }
     const int64_t base       = logEndOffset_;
     const int64_t lastOffset = base + static_cast<int64_t>(lastOffsetDelta);
     outBaseOffset = base;

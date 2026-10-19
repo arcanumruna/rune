@@ -1,3 +1,4 @@
+#include <flight_recorder/FlightRecorder.h>
 #include <rune/storage/LogSegment.h>
 #include <rune/storage/Timestamps.h>
 #include <rune/protocol/RecordBatch.h>
@@ -361,7 +362,8 @@ int64_t LogSegment::writeAndUpdateState(const uint8_t* data, std::size_t len, in
 
     if (shouldIndex(bytesSinceIndex_, indexIntervalBytes_)) {
         rune::protocol::RecordBatchReader r(data, len);
-        index_->append(r.baseOffset(), logSize_); // C4: OffsetIndex::append guards 2GiB
+        { FLIGHT_RECORDER_SPAN_STORAGE(flight_recorder::Site::StorageIndex, 0);
+          index_->append(r.baseOffset(), logSize_); } // C4: OffsetIndex::append guards 2GiB
         bytesSinceIndex_ = 0;
     }
     if (storage_ && storage_->writeFaultForTest > 0) [[unlikely]]
@@ -406,7 +408,8 @@ int64_t LogSegment::appendNoSync(const uint8_t* data, std::size_t len, int64_t l
     // Update the sparse index (mmap write, no syscall).
     if (shouldIndex(bytesSinceIndex_, indexIntervalBytes_)) {
         rune::protocol::RecordBatchReader r(data, len);
-        index_->append(r.baseOffset(), logSize_); // C4: OffsetIndex::append guards 2GiB
+        { FLIGHT_RECORDER_SPAN_STORAGE(flight_recorder::Site::StorageIndex, 0);
+          index_->append(r.baseOffset(), logSize_); } // C4: OffsetIndex::append guards 2GiB
         bytesSinceIndex_ = 0;
     }
 
@@ -432,6 +435,7 @@ int64_t LogSegment::appendNoSync(const uint8_t* data, std::size_t len, int64_t l
         storage_->writeFaultForTest = 0;
         written = ::pwrite(fd_, data, len / 2, writePos);   // a simulated short write
     } else {
+        FLIGHT_RECORDER_SPAN_STORAGE(flight_recorder::Site::StoragePwrite, static_cast<uint32_t>(len));
         written = ::pwrite(fd_, data, len, writePos);
     }
     if (written != static_cast<ssize_t>(len)) [[unlikely]] {
@@ -463,7 +467,8 @@ int64_t LogSegment::appendNoSyncRestamp(const uint8_t* data, std::size_t len,
     // Sparse index: use the ASSIGNED baseOffset (data still carries the stale
     // client value, so we must NOT read it via RecordBatchReader::baseOffset()).
     if (shouldIndex(bytesSinceIndex_, indexIntervalBytes_)) {
-        index_->append(baseOffset, logSize_); // C4: OffsetIndex guards 2GiB
+        { FLIGHT_RECORDER_SPAN_STORAGE(flight_recorder::Site::StorageIndex, 0);
+          index_->append(baseOffset, logSize_); } // C4: OffsetIndex guards 2GiB
         bytesSinceIndex_ = 0;
     }
 
@@ -507,6 +512,7 @@ int64_t LogSegment::appendNoSyncRestamp(const uint8_t* data, std::size_t len,
         storage_->writeFaultForTest = 0;
         written = ::pwritev(fd_, iov, 1, writePos);   // a simulated short write (first iovec only)
     } else {
+        FLIGHT_RECORDER_SPAN_STORAGE(flight_recorder::Site::StoragePwrite, static_cast<uint32_t>(len));
         written = ::pwritev(fd_, iov, iovCnt, writePos);
     }
     if (written != static_cast<ssize_t>(len)) [[unlikely]] {

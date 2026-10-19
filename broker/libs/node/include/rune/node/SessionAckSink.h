@@ -90,6 +90,7 @@
 #include <rune/node/RecordsSeal.h>
 #include <rune/node/SessionSignalKind.h>
 #include <rune/protocol/client/DataMessages.h>
+#include <flight_recorder/FlightRecorder.h>
 
 #include <Aeron.h>
 #include <ExclusivePublication.h>
@@ -387,9 +388,18 @@ private:
                             [[unlikely]] claimedWatched_(idx);
                         if (a.credit) noteCredit_(idx);              // D8c: gateway-routed — return its credit
                         else if (a.direct) directDone_(a.direct, idx, true);   // D8d: its direct share
+                        // Hop chain: the ack left on the client's session publication.
+                        FLIGHT_RECORDER_MARK_VAL_REPLICATION(flight_recorder::Site::ShAckClaimed,
+                                                             flight_recorder::foldCorr(a.correlationId),
+                                                             static_cast<double>(a.baseOffset));
                         ++work;
                         continue;
                     }
+                    // FR: refused (arg = -position: 1 NOT_CONNECTED, 2 BACK_PRESSURED,
+                    // 3 ADMIN_ACTION, 4 fatal) — throttled, it retries every pass.
+                    FLIGHT_RECORDER_THROTTLED_REPLICATION(frClaimBlocked_, flight_recorder::Site::ShAckClaimBlocked,
+                                                          flight_recorder::foldCorr(a.correlationId),
+                                                          static_cast<uint16_t>(pos < 0 ? -pos : 0));
                     if (pos == kClaimFatal) [[unlikely]] {           // can never deliver: CLOSED / MAX_POSITION
                         fail_(st);
                         if (a.direct) directDone_(a.direct, idx, false);
@@ -755,11 +765,25 @@ private:
     void noteHoldEdges_() noexcept {
         for (std::size_t k = 0; k < heldPrevCount_; ++k) {
             const std::size_t idx = find_(heldPrev_[k]);
-            if (idx != kNone && heldPass_[idx] != pass_) markDirty_(idx);   // released
+            if (idx != kNone && heldPass_[idx] != pass_) {                 // released
+                FLIGHT_RECORDER_MARK_ARG_VAL_PRODUCE(flight_recorder::Site::ShAckHold,
+                                                     static_cast<uint32_t>(heldPrev_[k]), 0, 0.0);
+                markDirty_(idx);
+            }
         }
         for (std::size_t k = 0; k < heldNowCount_; ++k) {
             const std::size_t idx = find_(heldNow_[k]);
-            if (idx != kNone && edges_[idx].reportedHeld == 0) markDirty_(idx);   // newly held
+            if (idx == kNone) continue;
+#if FLIGHT_RECORDER && !defined(FLIGHT_RECORDER_NO_PRODUCE)
+            if (flight_recorder::enabled(flight_recorder::Site::ShAckHold)) [[unlikely]] {   // FR edge: newly held
+                bool wasHeld = false;
+                for (std::size_t j = 0; j < heldPrevCount_ && !wasHeld; ++j) wasHeld = heldPrev_[j] == heldNow_[k];
+                if (!wasHeld) flight_recorder::markArgVal(flight_recorder::Site::ShAckHold,
+                                                          static_cast<uint32_t>(heldNow_[k]), 1,
+                                                          static_cast<double>(heldAfterFlush_));
+            }
+#endif
+            if (edges_[idx].reportedHeld == 0) markDirty_(idx);                  // newly held
         }
         for (std::size_t k = 0; k < heldNowCount_; ++k) heldPrev_[k] = heldNow_[k];   // only the live prefix
         heldPrevCount_ = heldNowCount_;
@@ -1086,6 +1110,7 @@ private:
     std::size_t                                                      unreported_ = 0;
     uint64_t                                                         pass_    = 0;
     uint64_t                                                         dropped_ = 0;
+    [[no_unique_address]] flight_recorder::Throttle                  frClaimBlocked_{};   // FR only
     // D8d — direct budget (rich state: the congestion episode holds its tag + pacing count).
     struct DirectEpisode { uint16_t tag = 0; uint32_t deferredPasses = 0; };   ///< tag 0 = no episode
     std::size_t                                                      directInFlight_ = 0;

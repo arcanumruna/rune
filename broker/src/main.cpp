@@ -74,44 +74,36 @@ static void drainControlEvents(rune::node::ControlEventRing& events, ControlStat
 // ---------------------------------------------------------------------------
 // flight-recorder — flight recorder init + report helpers.
 // ---------------------------------------------------------------------------
-// Per-thread ring size: env FLIGHT_RECORDER_RING_BYTES, default 128 MiB/thread (~5.6M
-// 24-byte records) so a full bench run is captured without drop-on-full. MUST be
-// set BEFORE any broker thread registers a ring (i.e. before node.start()).
+// flight_recorder::configureFromEnv: FLIGHT_RECORDER_ENABLE arms recording (compiled in, OFF by
+// default); FLIGHT_RECORDER_RING_BYTES (default 128 MiB/thread), FLIGHT_RECORDER_CATEGORIES,
+// FLIGHT_RECORDER_SLOW_SPAN_NS, FLIGHT_RECORDER_THROTTLE_NS, FLIGHT_RECORDER_DRAIN_MS (a background
+// drainer keeps a long run from filling the rings).  MUST run BEFORE any broker
+// thread registers a ring (i.e. before node.start()).
 static void frConfigure() {
-    std::uint64_t ringBytes = 128ull * 1024 * 1024;
-    if (const char* rb = std::getenv("FLIGHT_RECORDER_RING_BYTES")) {
-        const std::uint64_t v = std::strtoull(rb, nullptr, 10);
-        if (v > 0) ringBytes = v;
-    }
-    flight_recorder::Recorder::instance().configure(static_cast<size_t>(ringBytes));
-
-    if (std::getenv("FLIGHT_RECORDER_ENABLE")) {
-        flight_recorder::enable();
-        spdlog::info("flight-recorder: flight recording ENABLED (ring {} MiB/thread)",
-                     ringBytes / (1024 * 1024));
+    if (flight_recorder::configureFromEnv()) {
+        spdlog::info("flight-recorder: flight recording ENABLED (slow-span {} ns, throttle {} ns)",
+                     static_cast<uint64_t>(flight_recorder::cyclesToNs(flight_recorder::slowSpanTsc())),
+                     static_cast<uint64_t>(flight_recorder::cyclesToNs(flight_recorder::throttleTsc())));
     }
 }
 
-// Drain all thread rings and write histogram + Chrome-trace + raw tape to
-// FLIGHT_RECORDER_OUT (default cwd). Off the hot path (shutdown / SIGUSR1).
+// Drain all thread rings and write hist + Chrome trace + tape + meta (the
+// cross-process anchor) to FLIGHT_RECORDER_OUT (default cwd).  Off the hot path
+// (shutdown / SIGUSR1).
 static void frReport(const std::string& tag) {
     if (!flight_recorder::isEnabled()) return;
-    flight_recorder::Recorder::instance().drain();
     const char* out = std::getenv("FLIGHT_RECORDER_OUT");
     const std::string dir = (out && *out) ? out : ".";
     // Disambiguate per broker so co-located cluster nodes sharing one FLIGHT_RECORDER_OUT
     // dir do not overwrite each other's reports: suffix with node id + pid.
     const char* nid = std::getenv("RUNE_NODE_ID");
-    const std::string sfx = "-n" + std::string(nid ? nid : "x") +
-                            "-p" + std::to_string(static_cast<long>(::getpid())) +
-                            "-" + tag;
-    {
-        std::ofstream f(dir + "/fr-hist" + sfx + ".txt");
-        if (f) flight_recorder::dumpHistograms(f);
-    }
-    flight_recorder::exportChromeTrace(dir + "/fr-trace" + sfx + ".json");
-    flight_recorder::writeTape(dir + "/fr-tape" + sfx + ".bin");
-    spdlog::info("flight-recorder: report written to {} (suffix={})", dir, sfx);
+    const std::string node = nid ? nid : "x";
+    const std::string sfx = "-n" + node + "-p" + std::to_string(static_cast<long>(::getpid())) + "-" + tag;
+    if (flight_recorder::dumpAll(dir, sfx, "broker", node))
+        spdlog::info("flight-recorder: report written to {} (suffix={}, dropped={})", dir, sfx,
+                     flight_recorder::droppedRecords());
+    else
+        spdlog::error("flight-recorder: report to {} (suffix={}) FAILED", dir, sfx);
 }
 
 // ---------------------------------------------------------------------------

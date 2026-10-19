@@ -63,6 +63,7 @@
 #include <rune/storage/InMemoryLog.h>
 #include <rune/storage/LeaderEpochCache.h>
 #include <rune/storage/ProducerStateManager.h>
+#include <flight_recorder/FlightRecorder.h>
 
 // Forward-declared so this public header does not pull in the rune-protocol
 // include path; the builder is held by unique_ptr and only completed in the .cpp.
@@ -1752,6 +1753,13 @@ private:
     // pushCursor(); the old shared lastPushedOffset_ advanced even when a push to
     // one follower was refused, so that follower's data waited for a timer.
     uint64_t sendRefusals_ = 0;   // F27: transport-refused replication sends (retried)
+    // FR (fr-hop-instrumentation): coalescers for refusals retried every pass
+    // (empty when FR is compiled out).
+    [[no_unique_address]] flight_recorder::Throttle frPushRefused_{};
+    [[no_unique_address]] flight_recorder::Throttle frPushWindow_{};
+    [[no_unique_address]] flight_recorder::Throttle frAnswerRefused_{};
+    [[no_unique_address]] flight_recorder::Throttle frFetchRefused_{};
+    [[no_unique_address]] flight_recorder::Throttle frFastAckRefused_{};
     uint64_t owedRebuilds_ = 0;   // F27 F7: owed Data answer rebuilds (log walk)
     // Durability: effective minIsr for the acksAll produce gate.
     // Majority mode: cfg_.minIsr.

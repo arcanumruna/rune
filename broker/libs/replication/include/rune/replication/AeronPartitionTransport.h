@@ -57,6 +57,7 @@
 // (compiled under rune_replication_aeron which has RUNE_NODE_INCLUDE).
 namespace rune::node { class WorkerPool; class ReplicaRegistry; }
 
+#include <flight_recorder/FlightRecorder.h>
 #include <rune/replication/OutboundHoldRouter.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/replication/ReplicationFrameLimits.h>
@@ -721,6 +722,7 @@ private:
     OutboundHoldRouter<PubOffer> holdRouter_;
     uint64_t oversizedApplyRefused_ = 0;   // F18; control thread only
     uint64_t oversizedFrameDropped_ = 0;   // F18; see oversizedFrameDropped()
+    [[no_unique_address]] flight_recorder::Throttle frOfferRefused_{};   // FR only (polling thread)
     int64_t  pubMaxMessageBytes_    = 0;   // F18; immutable after start
     int64_t  applyRecordsCap_       = 0;   // F18 (B-1); immutable after start
     uint64_t oversizedApplyDropped_ = 0;   // F18 (B-1); control thread only

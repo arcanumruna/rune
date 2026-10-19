@@ -57,6 +57,7 @@
 #include <thread>
 
 #include <rune/consensus/IdleStrategy.h>
+#include <flight_recorder/FlightRecorder.h>
 
 #include <cerrno>
 #include <unistd.h>
@@ -410,6 +411,11 @@ void BasicPortableFlushBackend<Sync>::flusherLoop_() {
                 int64_t         reqBound = 0;
                 CompletionToken reqTok   = 0;
                 int32_t         ec       = 0;
+                {
+                // FR: the write/fdatasync itself, on the flusher thread (off the worker).  The span is
+                // scoped to the disk request only (the completion post below stays outside it); its
+                // commit may register a ring, so errno is captured INSIDE it.
+                FLIGHT_RECORDER_SPAN_STORAGE(flight_recorder::Site::StorageFsync, static_cast<uint32_t>(msgTypeId));
                 if (msgTypeId == static_cast<int32_t>(flushsbe::WriteSyncRequest::sbeTemplateId())) {
                     int fd = -1;   // E1d: pwrite + fdatasync (may block — off the worker path)
                     ec = detail::runWriteSync<Sync>(buf, offset, length, reqTok, fd);
@@ -426,6 +432,7 @@ void BasicPortableFlushBackend<Sync>::flusherLoop_() {
                     // Perform the datasync (may block — intentional; off the worker path).
                     const int rc = Sync(r.fd);
                     ec = (rc == 0) ? 0 : errno;
+                }
                 }
 
                 // SBE wrap-in-place encode of the completion into the claimed slot.

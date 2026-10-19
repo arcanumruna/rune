@@ -1328,6 +1328,11 @@ int64_t AeronPartitionTransport::sendOnPub(aeron::ExclusivePublication& pub,
     // Fallback: offer (copies into term buffer).
     const int64_t result = pub.offer(atomicBuf, 0,
                                       static_cast<aeron::util::index_t>(len));
+    // FR: refused (arg = -position) — throttled, the caller retries every pass.
+    if (result <= 0)
+        FLIGHT_RECORDER_THROTTLED_REPLICATION(frOfferRefused_, flight_recorder::Site::ReplCtlOfferRefused,
+                                      static_cast<uint32_t>(pub.streamId()),
+                                      static_cast<uint16_t>(result < 0 ? -result : 0));
     return result;
 }
 

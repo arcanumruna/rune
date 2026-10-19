@@ -2900,7 +2900,12 @@ bool ClientGateway::sendOnPub(aeron::ExclusivePublication& pub,
                               const uint8_t*               buf,
                               std::size_t                  len)
 {
-    if (!pub.isConnected()) return false;
+    if (!pub.isConnected()) {
+        // FR: refused, not connected (arg 1 = NOT_CONNECTED) — throttled.
+        FLIGHT_RECORDER_THROTTLED_PRODUCE(frOfferRefused_, flight_recorder::Site::GatewayOfferRefused,
+                                  static_cast<uint32_t>(pub.streamId()), 1);
+        return false;
+    }
 
     // AtomicBuffer takes a non-const pointer, but Aeron only reads (copies out)
     // the data — it never writes back through the pointer.  The cast is safe.
@@ -2923,6 +2928,9 @@ bool ClientGateway::sendOnPub(aeron::ExclusivePublication& pub,
 
     const int64_t result = pub.offer(atomicBuf, 0,
                                      static_cast<aeron::util::index_t>(len));
+    if (result <= 0)   // FR: refused (arg = -position) — throttled, retried by the caller
+        FLIGHT_RECORDER_THROTTLED_PRODUCE(frOfferRefused_, flight_recorder::Site::GatewayOfferRefused,
+                                  static_cast<uint32_t>(pub.streamId()), static_cast<uint16_t>(result < 0 ? -result : 0));
     return result > 0;
 }
 
@@ -3386,8 +3394,7 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         return true;
     }
     const pc::Produce& msg = *msgOpt;
-    FLIGHT_RECORDER_SPAN_PRODUCE(flight_recorder::Site::GatewayHandle,
-                         static_cast<uint32_t>(msg.correlationId));
+    FLIGHT_RECORDER_SPAN_PRODUCE(flight_recorder::Site::GatewayHandle, flight_recorder::foldCorr(msg.correlationId));
 
     // 2. Require known session.
     Session* session = sessions_.find(msg.sessionId);
@@ -6459,8 +6466,7 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
             // Mark the instant the gateway first sees the worker's produce result.
             // The gap between WorkerAppend (worker thread) and this mark is the
             // worker→gateway return-ring + duty-cycle latency (same correlationId).
-            FLIGHT_RECORDER_MARK_PRODUCE(flight_recorder::Site::WorkerProcessOp,
-                                 static_cast<uint32_t>(ret.correlationId));
+            FLIGHT_RECORDER_MARK_PRODUCE(flight_recorder::Site::WorkerProcessOp, flight_recorder::foldCorr(ret.correlationId));
             // Task 13 (spec §3.4): with worker-side acks (shard mode) a
             // deferAck ProduceResult is the post-ack notification of an ack the
             // worker already sent — and the only produce traffic the runtime
@@ -6513,8 +6519,7 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
             // re-validation holds — so the gateway never parks a worker-owned
             // ack (its pendingAcks_ serves only the inline, control-owned path).
             {
-                FLIGHT_RECORDER_SPAN_PRODUCE(flight_recorder::Site::ProduceAckSend,
-                                     static_cast<uint32_t>(ret.correlationId));
+                FLIGHT_RECORDER_SPAN_PRODUCE(flight_recorder::Site::ProduceAckSend, flight_recorder::foldCorr(ret.correlationId));
                 pc::ProduceResponse okResp;
                 okResp.sessionId     = ret.sessionId;
                 okResp.correlationId = ret.correlationId;
