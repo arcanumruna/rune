@@ -24,7 +24,8 @@ add_library(rune_catalog STATIC
     src/catalog/ApplyV1.cpp
     src/catalog/CatalogReplayer.cpp
     src/catalog/CatalogQueries.cpp
-    src/catalog/CatalogFile.cpp)
+    src/catalog/CatalogFile.cpp
+    src/catalog/RecordFile.cpp)
 target_include_directories(rune_catalog PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${RUNE_PROTOCOL_INCLUDE})
 target_link_libraries(rune_catalog PUBLIC rune_codec)
 target_compile_features(rune_catalog PUBLIC cxx_std_23)
@@ -42,6 +43,11 @@ target_compile_features(rune_security PUBLIC cxx_std_23)
 #    per-offset digests for tests/catalog/CatalogGoldenPins.h).  Run ONCE per formatVer.
 add_executable(make_catalog_golden tools/make_catalog_golden.cpp)
 target_link_libraries(make_catalog_golden PRIVATE rune_catalog)
+
+# ── Helper: make_security_golden (writes tests/security/golden/v<N>/basic.rsec + prints the
+#    per-offset digests for tests/security/SecurityGoldenPins.h).  Run ONCE per formatVer.
+add_executable(make_security_golden tools/make_security_golden.cpp)
+target_link_libraries(make_security_golden PRIVATE rune_security)
 
 # ── CLI tool: rune_codec_gen ─────────────────────────────────────────────────
 add_executable(rune_codec_gen tools/rune_codec_gen_main.cpp)
@@ -144,13 +150,16 @@ gtest_discover_tests(rune_catalog_tests)
 file(GLOB RUNE_SECURITY_TEST_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/security/*Test.cpp)
 add_executable(rune_security_tests ${RUNE_SECURITY_TEST_SOURCES})
 target_link_libraries(rune_security_tests PRIVATE rune_security GTest::gtest_main)
+target_compile_definitions(rune_security_tests PRIVATE
+    RUNE_SECURITY_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/security/golden"
+    RUNE_CATALOG_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/catalog/golden")
 gtest_discover_tests(rune_security_tests)
 
 find_package(benchmark QUIET)
 if(benchmark_FOUND)
     message(STATUS "rune_codec_bench: Google Benchmark ${benchmark_VERSION} found")
-    add_executable(rune_codec_bench benchmark/ValidatorBenchmark.cpp benchmark/CatalogReplayBench.cpp)
-    target_link_libraries(rune_codec_bench PRIVATE rune_catalog benchmark::benchmark)   # rune_codec comes PUBLIC via rune_catalog
+    add_executable(rune_codec_bench benchmark/ValidatorBenchmark.cpp benchmark/CatalogReplayBench.cpp benchmark/SecurityReplayBench.cpp)
+    target_link_libraries(rune_codec_bench PRIVATE rune_security benchmark::benchmark)   # rune_catalog + rune_codec come PUBLIC via rune_security
 else()
     message(STATUS "rune_codec_bench: Google Benchmark NOT found — rune_codec_bench is not built in this build dir")
 endif()
