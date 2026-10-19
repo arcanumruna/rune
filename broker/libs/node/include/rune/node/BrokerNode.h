@@ -74,6 +74,10 @@
 #include <rune/node/SecurityAnswerGate.h>
 #include <rune/node/SchemaFanout.h>
 #include <rune/node/TopicDroppedFanout.h>
+#include <rune/node/PeerLinkAgent.h>
+#include <rune/node/PeerLinkFanout.h>
+#include <rune/peerlink/ClusterKeys.h>
+#include <rune/peerlink/PeerLinkKeyStore.h>
 #include <rune/node/ViewSnapshotChannel.h>
 #include <rune/node/ViewSnapshotIoAgent.h>
 #include <rune/node/OwnerThreadTestTask.h>
@@ -470,7 +474,7 @@ public:
 
         // 2. Drain the control → admin ring: dropped-dir purges (catalog history
         //    Task 8) — explicit per-type dispatch.
-        work += controlToAdminRing_.drain([this](int32_t tid,
+        work += controlToAdminRing_.drain([this, nowNs](int32_t tid,
                                                  aeron::concurrent::AtomicBuffer& b,
                                                  aeron::util::index_t off,
                                                  aeron::util::index_t len) {
@@ -501,6 +505,13 @@ public:
                 if (decodeCatalogReadResume(p, n, m)) worker_.catalogReadResume(m);
                 else if (badControlFrames_++ % 1024 == 0)
                     spdlog::error("AdminWorkerAgent: malformed kMsgCatalogReadResume (len={}) refused", n);
+                return;
+            }
+            if (tid == kMsgPeerLinkKeys) {   // Authentication Task 15 (D33)
+                PeerLinkKeysMsg m;
+                if (decodePeerLinkKeys(p, n, m)) worker_.onPeerLinkKeys(m, nowNs);
+                else if (badControlFrames_++ % 1024 == 0)
+                    spdlog::error("AdminWorkerAgent: malformed kMsgPeerLinkKeys (len={}) refused", n);
                 return;
             }
             if (tid == kMsgPurgeDroppedDir) {
@@ -1463,6 +1474,22 @@ public:
     [[nodiscard]] int64_t appendSecurityRecordOnLeaderForTest(std::span<const uint8_t> eventBytes);
     /// Test-only: while held, this broker's `__security` applier applies nothing (the replica still replicates).
     void holdSecurityApplyForTest(bool on);
+    // ── Authentication Task 15 test hooks (inter-broker links) ───────────────────────────────────────────────
+    /// What the CONTROL thread's PeerLinkAgent / distribution holds (read ON the control thread).
+    struct PeerLinkSnap { bool present = false; int64_t established = 0; uint64_t refusals = 0;
+                          uint32_t epochOf[16] = {}; int32_t peerCount = 0; std::vector<int32_t> peers; };
+    [[nodiscard]] PeerLinkSnap peerLinksForTest();
+    /// The link epoch worker `w` / the admin thread holds for `peer` (0 = none); read ON that thread.
+    [[nodiscard]] uint32_t workerPeerLinkEpochForTest(int32_t w, int32_t peer);
+    [[nodiscard]] uint32_t adminPeerLinkEpochForTest(int32_t peer);
+    /// Run `f(Worker&)` on worker `w`'s own thread (same contract as onOwnerThreadForTest).
+    template <class F>
+    auto onWorkerThreadForTest(int32_t w, F&& f, std::chrono::milliseconds timeout = std::chrono::seconds{10}) {
+        if (!workerPool_ || w < 0 || w >= workerPool_->workerCount())
+            throw std::invalid_argument("onWorkerThreadForTest: no such worker");
+        return submitOwnerThreadTestTask_<OwnerThreadTestTask::Target::WorkerThread>(
+            -1, w, [this, w, fn = std::forward<F>(f)]() mutable { return fn(workerPool_->worker(w)); }, timeout);
+    }
     /// Authentication Task 10: the gateway's session table / auth-gate counters (read ON the control thread).
     [[nodiscard]] bool gatewayHasSessionForTest(int64_t sessionId);
     [[nodiscard]] uint64_t authGateRefusalsForTest();
@@ -2033,6 +2060,14 @@ private:
     void publishSecurityMetrics_() noexcept;
     [[nodiscard]] bool securityMetricsPending_() const noexcept;
     int  serviceAuthMode_(int64_t nowNs);
+    // Authentication Task 15 (D33): the inter-broker link handshakes.  buildPeerLinks_ (startup thread) builds the
+    // PeerLinkAgent when authMode == Enabled and there is more than one peer; servicePeerLinks_ (control thread, every
+    // duty cycle) drives it, distributes newly established keys and publishes counters 233 / 234.
+    void buildPeerLinks_();
+    int  servicePeerLinks_(int64_t nowNs);
+    void publishPeerLinkMetrics_() noexcept;
+    static void onPeerLinkEstablishedThunk_(void* self, int32_t peer, const rune::peerlink::LinkKeys& k, int64_t nowNs);
+    void onPeerLinkEstablished_(int32_t peer, const rune::peerlink::LinkKeys& k, int64_t nowNs);
     // Catalog history Task 6 (control thread): a kA2cCatalogAlterIsr frame →
     // the controller channel; the controller's (-6, 0) answer → the admin role ring.
     void forwardCatalogAlterIsr_(const uint8_t* p, std::size_t n);
@@ -2324,6 +2359,15 @@ private:
     std::int64_t                     securityHaltedValue_  = 0;    // control-thread-owned (0 = applying)
     std::int64_t                     securityAppliedValue_ = -1;   // control-thread-owned
     DevModeWarnTimer                 devModeWarn_;                 // control thread
+    // Authentication Task 15: the cluster key file(s), read ONCE in start() (startup thread) and handed out as COPIES.
+    std::optional<rune::peerlink::ClusterKeys> clusterKeys_;
+    std::unique_ptr<PeerLinkAgent>   peerLinkAgent_;               // control thread (null: no peer links)
+    PeerLinkFanout                   peerLinkFanout_;              // control thread: keys -> workers + admin, over rings
+    rune::peerlink::PeerLinkKeyStore controlPeerKeys_;             // the control thread's own view (Task 16: its transports)
+    std::int64_t                     peerEstablishedCounterRegId_ = -1;
+    std::int64_t                     peerRefusalsCounterRegId_    = -1;
+    std::shared_ptr<aeron::Counter>  peerEstablishedCounter_;
+    std::shared_ptr<aeron::Counter>  peerRefusalsCounter_;
     // Catalog history Task 16 — the boot from __catalog (startup thread; immutable after start()).
     /// Opens/replays the local __catalog on the startup thread and fills the members below.
     void bootFromCatalog_();

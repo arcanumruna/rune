@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 // WorkerOp.h — E2 inc2a: op-envelope types for the per-worker SPSC ingress ring.
 //
 // DESIGN
@@ -123,6 +124,11 @@ struct WorkerOp {
         // The worker remembers it so a produce for a topic it does not own answers UnknownTopic
         // (matching the gateway) instead of the retriable NotLeader.  Not ownership-gated.
         TopicDropped              = 20, ///< control → worker: topicId was dropped by the catalog
+        // Authentication Task 15 (D33): control → EVERY worker on the session-lifecycle ring: the keys of an
+        // established inter-broker link.  topicId = peer node id, partition = link epoch, tail (TailKind = PEER_KEYS) =
+        // [sendMaster 32][recvMaster 32] (WorkerOp::peerKeys).  Cold (one per link establishment); never
+        // ownership-gated.  (21 = SESSION_PERMISSIONS, Task 12.)
+        PeerLinkKeys              = 22, ///< control → worker: install an established peer link's keys
         // F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
         // control → owning worker: run a test-owned OwnerThreadTestTask against
         // `replica` on the worker's OWN thread.  The opaque task ref travels in the
@@ -386,6 +392,11 @@ struct WorkerOp {
     // directly — no dedicated schemaUpdateVersion field, so encoding a
     // SchemaUpdate op costs no extra branch on the shared enqueueOp path).
     std::vector<uint8_t> schemaUpdateBlob;
+
+    // Authentication Task 15: a PeerLinkKeys op's key material, [sendMaster 32][recvMaster 32] (the tail on the wire).
+    // topicId = the peer node id, partition = the link epoch.
+    static constexpr std::size_t kPeerKeysBytes = 64;
+    std::array<uint8_t, kPeerKeysBytes> peerKeys{};
 
     // -----------------------------------------------------------------------
     // E5.1.2c: FetchRequest-specific fields (leader handles follower fetch).

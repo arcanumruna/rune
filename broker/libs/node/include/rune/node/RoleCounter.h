@@ -167,6 +167,12 @@ inline constexpr std::int32_t kLoginsRateLimitedCounterTypeId = 1'000'231;
 inline std::string loginsOkLabel(std::int32_t nodeId) { return "rune-logins-ok node=" + std::to_string(nodeId); }
 inline std::string loginsFailedLabel(std::int32_t nodeId) { return "rune-logins-failed node=" + std::to_string(nodeId); }
 inline std::string loginsRateLimitedLabel(std::int32_t nodeId) { return "rune-logins-rate-limited node=" + std::to_string(nodeId); }
+// Authentication Task 15: 233 = peers whose inter-broker link is established (0..N-1), 234 = peer-link refusals logged
+// by this broker (both directions; monotonic).  Same key (node id) as the other security counters.
+inline constexpr std::int32_t kPeerLinksEstablishedCounterTypeId = 1'000'233;
+inline constexpr std::int32_t kPeerLinkRefusalsCounterTypeId     = 1'000'234;
+inline std::string peerLinksEstablishedLabel(std::int32_t nodeId) { return "rune-peer-links-established node=" + std::to_string(nodeId); }
+inline std::string peerLinkRefusalsLabel(std::int32_t nodeId) { return "rune-peer-link-refusals node=" + std::to_string(nodeId); }
 inline std::string securityApplyHaltedLabel(std::int32_t nodeId) { return "rune-security-apply-halted node=" + std::to_string(nodeId); }
 inline std::string securityAppliedOffsetLabel(std::int32_t nodeId) { return "rune-security-applied-offset node=" + std::to_string(nodeId); }
 inline std::string authModeLabel(std::int32_t nodeId) { return "rune-auth-mode node=" + std::to_string(nodeId); }

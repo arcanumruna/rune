@@ -1362,6 +1362,29 @@ inline void writePlacementView(uint8_t* p, const PlacementViewMsg& m) noexcept {
     return true;
 }
 
+/// kMsgPeerLinkKeys (Task 15, control -> admin on controlToAdminRing): the keys of an established inter-broker link,
+/// [peer:i32][epoch:u32][sendMaster 32][recvMaster 32].  Cold: one per link establishment.
+inline constexpr std::size_t kPeerLinkKeysWireLen = 4 + 4 + 32 + 32;
+struct PeerLinkKeysMsg {
+    int32_t  peer  = -1;
+    uint32_t epoch = 0;
+    std::array<uint8_t, 32> sendMaster{}, recvMaster{};
+};
+inline void writePeerLinkKeys(uint8_t* p, const PeerLinkKeysMsg& m) noexcept {
+    admin_wire::putI32(p, m.peer);
+    admin_wire::putI32(p + 4, static_cast<int32_t>(m.epoch));
+    std::memcpy(p + 8, m.sendMaster.data(), 32);
+    std::memcpy(p + 40, m.recvMaster.data(), 32);
+}
+[[nodiscard]] inline bool decodePeerLinkKeys(const uint8_t* buf, std::size_t len, PeerLinkKeysMsg& m) noexcept {
+    if (len != kPeerLinkKeysWireLen) return false;
+    m.peer  = admin_wire::getI32(buf);
+    m.epoch = static_cast<uint32_t>(admin_wire::getI32(buf + 4));
+    std::memcpy(m.sendMaster.data(), buf + 8, 32);
+    std::memcpy(m.recvMaster.data(), buf + 40, 32);
+    return m.peer >= 0 && m.epoch != 0;
+}
+
 inline constexpr std::size_t kViewUninstallWireLen = 4;
 inline void writeViewUninstall(uint8_t* p, int32_t viewTopicId) noexcept { admin_wire::putI32(p, viewTopicId); }
 /// The view's sink topic id, or -1 on a malformed frame.

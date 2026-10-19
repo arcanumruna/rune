@@ -382,6 +382,36 @@ TEST(NodeConfigRegression, EnabledModeNeedsAUsableClusterKeyFileAtStartRegressio
     std::error_code ec; fs::remove(good, ec); fs::remove(bad, ec);
 }
 
+// Authentication Task 15: counters 1'000'233 (peers with an established link) and 1'000'234 (peer-link refusals
+// logged by this broker, both directions) read from each node's CnC file.  Node 3 holds another cluster key: nodes 1
+// and 2 link with each other only and each logs one refusal (they refused node 3's key); node 3 has no link and
+// logs the refusals it received.
+TEST(RoleCounterRegression, PeerLinkCountersArePublishedRegression) {
+    using namespace rune::node::test::catalog_cluster;
+    const fs::path keyDir = fs::temp_directory_path() / ("plctr_" + std::to_string(::getpid()));
+    fs::create_directories(keyDir);
+    { std::ofstream(keyDir / "k.key") << std::string(48, 'k') << "\n"; }
+    { std::ofstream(keyDir / "x.key") << std::string(48, 'x') << "\n"; }
+    ThreeNodes c = ThreeNodes::startWith("plctr", [&](NodeConfig& k) {
+        k.authMode = AuthMode::Enabled;
+        k.clusterKeyFile = ((k.nodeId == 3) ? keyDir / "x.key" : keyDir / "k.key").string();
+    });
+    auto aeronDir = [&](int id) { return c.dirs[static_cast<std::size_t>(id - 1)]->path / "aeron"; };
+    EXPECT_TRUE(awaitCounter(aeronDir(1), kPeerLinksEstablishedCounterTypeId, 1, 20s)) << "node 1 links with node 2 only";
+    EXPECT_TRUE(awaitCounter(aeronDir(2), kPeerLinksEstablishedCounterTypeId, 1, 20s));
+    EXPECT_TRUE(awaitCounter(aeronDir(3), kPeerLinksEstablishedCounterTypeId, 0, 20s));
+    for (int id : {1, 2, 3}) {
+        std::int64_t refusals = -1;
+        const auto deadline = std::chrono::steady_clock::now() + 20s;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (readCounterByType(aeronDir(id), kPeerLinkRefusalsCounterTypeId, refusals) && refusals >= 1) break;
+            std::this_thread::sleep_for(20ms);
+        }
+        EXPECT_GE(refusals, 1) << "node " << id << " logged (and counted) a refusal";
+    }
+    std::error_code ec; fs::remove_all(keyDir, ec);
+}
+
 // The `__security` counters: applied offset follows the mirrored events; a record the rules refuse raises the halt
 // counter to (offset + 1) - the operator alert of D28.
 TEST(RoleCounterTest, SecurityApplyMetricsReadableFromCncRegression) {

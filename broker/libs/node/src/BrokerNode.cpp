@@ -533,6 +533,11 @@ void BrokerNode::start() {
             kSecurityAppliedOffsetCounterTypeId, roleKey, kRoleKeyLength, securityAppliedOffsetLabel(config_.nodeId));
         authModeCounterRegId_ = aeron_->addCounter(
             kAuthModeCounterTypeId, roleKey, kRoleKeyLength, authModeLabel(config_.nodeId));
+        // Authentication Task 15: 1'000'233 peer links established, 234 peer-link refusals.
+        peerEstablishedCounterRegId_ = aeron_->addCounter(
+            kPeerLinksEstablishedCounterTypeId, roleKey, kRoleKeyLength, peerLinksEstablishedLabel(config_.nodeId));
+        peerRefusalsCounterRegId_ = aeron_->addCounter(
+            kPeerLinkRefusalsCounterTypeId, roleKey, kRoleKeyLength, peerLinkRefusalsLabel(config_.nodeId));
         // Authentication Task 11: 1'000'229 logins ok, 230 failed, 231 rate-limited.
         loginsOkCounterRegId_ = aeron_->addCounter(
             kLoginsOkCounterTypeId, roleKey, kRoleKeyLength, loginsOkLabel(config_.nodeId));
@@ -582,6 +587,15 @@ void BrokerNode::start() {
     }
     const auto t2 = sclock::now();
 
+    // 4b. Authentication Task 15 (D32): the cluster key file(s), read ONCE here (the startup thread) and handed out as
+    //     COPIES - the peer link agent takes its own; nothing ever re-reads the file.
+    if (config_.authMode == AuthMode::Enabled) {
+        auto keys = rune::peerlink::loadClusterKeys(config_.clusterKeyFile, config_.clusterKeyFileNext);
+        if (!keys)
+            throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: " + keys.error());
+        clusterKeys_ = std::move(*keys);
+    }
+
     // 5. Build all consensus objects (NodeStateFile, TermLog, Election, …).
     buildConsensusObjects();
     // ISR v3 Step 6: record the Consensus class in the manifest (R-3b) once node-state.dat AND term.log exist
@@ -615,6 +629,10 @@ void BrokerNode::start() {
     // 6. Build replication (GR-2/GR-3): PartitionReplicas + AeronPartitionTransport
     //    + ReplicationMetadataBridge.  Requires: topicRegistry_ + aeron_ + consensus objs.
     buildReplication();
+
+    // 6b. Authentication Task 15: the inter-broker link handshakes (Enabled, more than one peer).  After
+    //     buildReplication: the link incarnation is the process incarnation it just bumped.
+    buildPeerLinks_();
 
     // 7. Build the ClientGateway and NodeRuntimeAgent (after aeron_ is live).
     buildGateway();
@@ -3239,6 +3257,97 @@ int BrokerNode::serviceAuthMode_(int64_t nowNs) {
     return work;
 }
 
+// ---------------------------------------------------------------------------
+// Authentication Task 15 (D33, D35) - the inter-broker link handshakes.
+//
+// buildPeerLinks_ (STARTUP thread): a PeerLinkAgent per broker when authMode == Enabled and there is more than one
+// peer - one subscription on this node's consensus endpoint (stream peerAuthStreamId), one publication per peer to
+// its consensus endpoint, one pure PeerHandshake per peer; the link incarnation is the persisted process incarnation
+// (strictly higher on every restart).  InProcessUnauthenticated / DevDisabled build none: every transport stays
+// PeerPlain.  The agent takes a COPY of the cluster keys loaded once in start().
+// servicePeerLinks_ (CONTROL thread, every duty cycle): drives the agent, pumps the key fan-out (workers + admin,
+// over their rings) and publishes counters 233 / 234.  An established link's keys are installed here for the control
+// thread's own transports (consensus sink / ingress, legacy replication) and posted to every other owner.
+// ---------------------------------------------------------------------------
+void BrokerNode::buildPeerLinks_() {
+    if (config_.authMode != AuthMode::Enabled || config_.peers.size() <= 1 || !aeron_ || !clusterKeys_) return;
+    PeerLinkAgent::Params p;
+    p.selfId      = config_.nodeId;
+    p.incarnation = (replicaRegistry_ && replicaRegistry_->processIncarnation() > 0)
+                        ? static_cast<uint64_t>(replicaRegistry_->processIncarnation())
+                        : static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::system_clock::now().time_since_epoch()).count());
+    p.streamId    = config_.peerAuthStreamId;
+    p.bindChannel = config_.selfConsensusBindChannel();
+    p.keys        = *clusterKeys_;   // a COPY
+    for (const auto& peer : config_.peers) {
+        if (peer.id == config_.nodeId) continue;
+        p.peers.push_back(PeerLinkAgent::PeerEndpoint{peer.id, peer.consensusChannel()});
+    }
+    peerLinkAgent_ = std::make_unique<PeerLinkAgent>(
+        aeron_, std::move(p), resolverHub_ ? resolverHub_->subscribeOwner() : rune::consensus::PeerResolutionSource{});
+    peerLinkAgent_->setEstablishedSink(&BrokerNode::onPeerLinkEstablishedThunk_, this);
+    spdlog::info("BrokerNode[{}]: peer links - {} peer(s), handshake on stream {} (cluster key id {:016x}{})",
+                 config_.nodeId, config_.peers.size() - 1, config_.peerAuthStreamId, clusterKeys_->current.keyId,
+                 clusterKeys_->next ? ", next key held" : "");
+}
+
+void BrokerNode::onPeerLinkEstablishedThunk_(void* self, int32_t peer, const rune::peerlink::LinkKeys& k, int64_t nowNs) {
+    static_cast<BrokerNode*>(self)->onPeerLinkEstablished_(peer, k, nowNs);
+}
+
+void BrokerNode::onPeerLinkEstablished_(int32_t peer, const rune::peerlink::LinkKeys& k, int64_t nowNs) {
+    (void)controlPeerKeys_.install(peer, k, nowNs);   // this thread's transports (Task 16: sink, ingress, legacy)
+    peerLinkFanout_.post(peer, k);                    // every worker + the admin thread, over rings
+}
+
+int BrokerNode::servicePeerLinks_(int64_t nowNs) {
+    if (!peerLinkAgent_) return 0;
+    int work = peerLinkAgent_->doWork(nowNs);
+    work += peerLinkFanout_.pump(workerPool_.get(), adminWorkerAgent_ ? &adminWorkerAgent_->controlToAdminRing() : nullptr);
+    publishPeerLinkMetrics_();
+    return work;
+}
+
+void BrokerNode::publishPeerLinkMetrics_() noexcept {
+    if (!aeron_ || !peerLinkAgent_) return;
+    auto resolve = [this](std::shared_ptr<aeron::Counter>& c, std::int64_t regId) {
+        if (c || regId < 0) return;
+        try { c = aeron_->findCounter(regId); }
+        catch (...) { c.reset(); }
+    };
+    resolve(peerEstablishedCounter_, peerEstablishedCounterRegId_);
+    resolve(peerRefusalsCounter_, peerRefusalsCounterRegId_);
+    if (peerEstablishedCounter_) peerEstablishedCounter_->set(peerLinkAgent_->establishedPeers());
+    if (peerRefusalsCounter_) peerRefusalsCounter_->set(static_cast<std::int64_t>(peerLinkAgent_->refusals()));
+}
+
+BrokerNode::PeerLinkSnap BrokerNode::peerLinksForTest() {
+    return onControlThreadForTest([this]() -> PeerLinkSnap {
+        PeerLinkSnap v;
+        if (!peerLinkAgent_) return v;
+        v.present     = true;
+        v.established = peerLinkAgent_->establishedPeers();
+        v.refusals    = peerLinkAgent_->refusals();
+        for (const auto& peer : config_.peers) {
+            if (peer.id == config_.nodeId) continue;
+            v.peers.push_back(peer.id);
+            if (peer.id >= 0 && peer.id < 16) v.epochOf[peer.id] = controlPeerKeys_.currentEpoch(peer.id);
+        }
+        return v;
+    });
+}
+
+uint32_t BrokerNode::workerPeerLinkEpochForTest(int32_t w, int32_t peer) {
+    return onWorkerThreadForTest(w, [peer](Worker& wk) -> uint32_t { return wk.peerLinkEpochForTest(peer); });
+}
+
+uint32_t BrokerNode::adminPeerLinkEpochForTest(int32_t peer) {
+    return onAdminThreadForTest([this, peer]() -> uint32_t {
+        return adminWorkerAgent_ ? adminWorkerAgent_->worker().peerLinkEpochForTest(peer) : 0u;
+    });
+}
+
 BrokerNode::SecurityViewSnap BrokerNode::securityViewForTest() {
     return onControlThreadForTest([this]() -> SecurityViewSnap {
         SecurityViewSnap v;
@@ -4180,6 +4289,7 @@ void BrokerNode::stop() {
     //    Must happen BEFORE closing the Aeron client and media driver so the
     //    client shuts down cleanly (publications/subscriptions deregistered while
     //    the conductor is still running).
+    peerLinkAgent_.reset();  // Authentication Task 15: its subscription + peer publications, while the client is alive
     nodeAgent_.reset();      // composite agent (holds refs to aeronIngress_ + agent_)
     udpSink_.reset();        // ExclusivePublications (deregisters from conductor)
     aeronIngress_.reset();   // Subscription (deregisters from conductor)
@@ -4209,6 +4319,8 @@ void BrokerNode::stop() {
     securityHaltedCounter_.reset();    // authentication Task 9: the same rule (released before aeron_)
     securityAppliedCounter_.reset();
     authModeCounter_.reset();
+    peerEstablishedCounter_.reset();   // Authentication Task 15
+    peerRefusalsCounter_.reset();
     loginsOkCounter_.reset();
     loginsFailedCounter_.reset();
     loginsRateLimitedCounter_.reset();
@@ -4340,6 +4452,7 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
     });
 
     work += serviceAuthMode_(nowNs);   // Authentication Task 9: the dev-mode warning timer + the auth-mode counter
+    work += servicePeerLinks_(nowNs);  // Authentication Task 15: the peer link handshakes + key distribution
 
     auto* agent = adminWorkerAgent_.get();
     if (!agent) return work;

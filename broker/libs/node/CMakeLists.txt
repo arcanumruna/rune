@@ -20,6 +20,7 @@ add_library(rune_node
     src/CatalogApplier.cpp
     src/SecurityApplier.cpp
     src/SecurityAdmin.cpp
+    src/PeerLinkAgent.cpp
     src/CatalogReadServer.cpp
     src/CatalogEffectFrames.cpp
     src/ViewSnapshotIoAgent.cpp
@@ -132,7 +133,7 @@ if(BUILD_TESTING)
     add_executable(rune_session_ack_sink_tests tests/node/SessionAckSinkTest.cpp)
     target_link_libraries(rune_session_ack_sink_tests PRIVATE rune_node GTest::gtest_main)
     gtest_discover_tests(rune_session_ack_sink_tests)
-    add_executable(rune_session_announcer_tests tests/node/SessionAnnouncerTest.cpp)
+    add_executable(rune_session_announcer_tests tests/node/SessionAnnouncerTest.cpp tests/node/PeerLinkFanoutTest.cpp)
     target_link_libraries(rune_session_announcer_tests PRIVATE rune_node rune_metadata GTest::gtest_main)
     gtest_discover_tests(rune_session_announcer_tests)
     if(UNIX AND NOT APPLE)
@@ -1529,6 +1530,20 @@ if(BUILD_TESTING)
     # knowledge exchange + internal-ISR term source driven end to end over real
     # Aeron (in-process BrokerNodes on loopback, no Docker).  *Regression*.
     # ---------------------------------------------------------------------------
+    # Authentication Task 15: the inter-broker link handshakes (agent over one driver; three in-process brokers).
+    if(BUILD_NODE_UDP_TESTS AND aeron_FOUND)
+        add_executable(rune_peer_link_agent_tests
+            tests/integration/PeerLinkAgentTest.cpp)
+        target_include_directories(rune_peer_link_agent_tests PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_peer_link_agent_tests PRIVATE
+            rune_node
+            aeron::aeron
+            GTest::gtest_main)
+        gtest_discover_tests(rune_peer_link_agent_tests
+            PROPERTIES TIMEOUT 240)
+    endif()
+
     if(BUILD_NODE_UDP_TESTS AND aeron_FOUND)
         add_executable(rune_consensus_candidacy_tests
             tests/integration/ConsensusCandidacyElectionTest.cpp)
