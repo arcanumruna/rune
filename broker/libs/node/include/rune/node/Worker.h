@@ -694,24 +694,25 @@ public:
     void requireEnforcement() noexcept {
         if (!std::holds_alternative<Enforcing>(enforcement_)) enforcement_ = Enforcing{ackSink_.get()};
     }
-    /// Combined fix program (X036): true when ANY batch of a client-supplied Produce record-batch span carries
-    /// kAttrControl.  Control batches (COMMIT/ABORT markers) are written only by the broker's own transaction
-    /// coordinator; a client-built one would forge a marker (LSO pin, producer fencing, cleaner deletes of committed
-    /// data).  Walks the batch chain by totalLength (header reads only, no allocation); a malformed length stops the
-    /// walk - the append's own validation refuses such a frame.  Shared by the gateway and the worker ingress.
-    [[nodiscard]] static bool hasControlBatch(const uint8_t* data, std::size_t len) noexcept {
+    /// Combined fix program (X036): true when a client-supplied Produce record-batch span must be REFUSED whole -
+    /// any batch carries kAttrControl (COMMIT/ABORT markers are the broker's own; a client-built one would forge a
+    /// marker), OR the batch chain is malformed.  The append validates (CRC) only the FIRST batch and writes the whole
+    /// span, so the chain is checked strictly here, fail-closed: every batch is at least a header long, fits in the
+    /// span, and the chain ends exactly at `len`.  Header reads only, no allocation.  Shared by gateway and worker.
+    [[nodiscard]] static bool refusesClientBatches(const uint8_t* data, std::size_t len) noexcept {
         namespace b = rune::protocol::batch;
+        const auto overhead = static_cast<std::size_t>(b::kRecordBatchOverhead);
         std::size_t rd = 0;
-        while (rd + static_cast<std::size_t>(b::kRecordBatchOverhead) <= len) {
+        while (rd < len) {
+            if (len - rd < overhead) return true;                      // trailing partial header
             const rune::protocol::RecordBatchReader r(data + rd, len - rd);
             if ((static_cast<uint16_t>(r.attributes()) & static_cast<uint16_t>(b::kAttrControl)) != 0) return true;
             const int32_t t = r.totalLength();
-            if (t <= 0 || rd + static_cast<std::size_t>(t) > len) return false;
+            if (t < static_cast<int32_t>(overhead) || static_cast<std::size_t>(t) > len - rd) return true;   // runt / overlong
             rd += static_cast<std::size_t>(t);
         }
         return false;
     }
-
     /// X103: produce frames this worker dropped because they failed to open, and the log lines the 1/1024 limit swallowed.
     [[nodiscard]] uint64_t decryptFailuresForTest() const noexcept { return decryptFailures_; }
     [[nodiscard]] uint64_t unauthLogSuppressed() const noexcept { return unauthLog_.suppressed(); }
@@ -6821,7 +6822,7 @@ private:
     /// never appended), counted and logged rate-limited (worker-thread-owned counter).
     [[gnu::cold]] [[gnu::noinline]] int refuseControlBatch_(const rune::protocol::client::Produce& msg, uint8_t directAck) {
         if (controlBatchRefusals_++ % 1024 == 0)
-            spdlog::warn("Worker {}: WorkerIngress: produce with a client control batch refused InvalidRequest "
+            spdlog::warn("Worker {}: WorkerIngress: produce with a client control/malformed batch chain refused InvalidRequest "
                          "(session={}, topic={}); total {}", workerId_, msg.sessionId, msg.topicId, controlBatchRefusals_);
         WorkerReturn ret = produceAnswer_(ProduceOrigin::WorkerIngress, msg.sessionId, msg.correlationId,
                                           msg.topicId, msg.partition);
@@ -6943,7 +6944,7 @@ private:
         }
 
         // X036: a client never writes a control batch (after the WRITE check, so an unauthorized sender hears 45).
-        if (hasControlBatch(msg.recordBatch.data(), msg.recordBatch.size())) [[unlikely]] {
+        if (refusesClientBatches(msg.recordBatch.data(), msg.recordBatch.size())) [[unlikely]] {
             if (openSeq != 0) commitProduceSeq(openCtx, openSeq);   // consumed (answered)
             return refuseControlBatch_(msg, directAck);
         }

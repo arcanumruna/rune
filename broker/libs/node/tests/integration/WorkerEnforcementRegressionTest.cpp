@@ -56,7 +56,7 @@ TEST(WorkerEnforcementRegression, AnEnforcingWorkerWithoutASinkDeniesEveryDirect
     EXPECT_EQ(rig.log->logEndOffset(), leo) << "nothing appended";
 }
 
-// X036. RED: delete the hasControlBatch check in handleWorkerIngressFrame_ - the frame (control batch second) is appended.
+// X036. RED: delete the refusesClientBatches check in handleWorkerIngressFrame_ - the frame (control batch second) is appended.
 TEST(ProduceValidationRegression, AClientControlBatchIsRefusedOnWorkerRegression) {
     Rig rig;
     const auto bad = frameWith(true, 2);
@@ -67,4 +67,37 @@ TEST(ProduceValidationRegression, AClientControlBatchIsRefusedOnWorkerRegression
     const auto ok = frameWith(false, 3);
     rig.pass(&ok);
     EXPECT_EQ(answerOf(rig), 0) << "the same frame without the control batch is accepted";
+}
+
+// X036 (review I1): same chain rules at the worker's direct ingress.  RED: fail-open walk - the frames are appended.
+TEST(ProduceValidationRegression, AMalformedBatchChainIsRefusedOnWorkerRegression) {
+    Rig rig;
+    rune::protocol::RecordBatchBuilder first(0, 1000);
+    first.append("k", "v", 1000);
+    const std::vector<uint8_t> a = first.build();
+    rune::protocol::RecordBatchBuilder second(0, 1000);
+    second.append("k2", "v2", 1000);
+    const std::vector<uint8_t> b = second.build();
+    auto patch = [&](std::vector<uint8_t>& chain, uint32_t total) {
+        const uint32_t v = total - 12;
+        for (int i = 0; i < 4; ++i) chain[a.size() + static_cast<std::size_t>(rune::protocol::batch::kLengthOffset) + i] = static_cast<uint8_t>(v >> (8 * i));
+    };
+    for (int variant = 1; variant <= 3; ++variant) {
+        std::vector<uint8_t> chain = a;
+        if (variant == 3) chain.insert(chain.end(), b.begin(), b.begin() + 10);
+        else {
+            chain.insert(chain.end(), b.begin(), b.end());
+            patch(chain, variant == 1 ? static_cast<uint32_t>(b.size()) + 4096 : 30u);
+        }
+        pc::Produce msg;
+        msg.sessionId = 1; msg.correlationId = 10 + variant; msg.topicId = 1; msg.partition = 0;
+        msg.partitionKnown = 1; msg.acks = 1; msg.producerId = -1; msg.producerEpoch = 0; msg.baseSequence = -1;
+        msg.recordBatch = std::span<const uint8_t>(chain);
+        std::vector<uint8_t> frame(msg.encodedSize());
+        frame.resize(msg.encode(frame.data()));
+        const int64_t leo = rig.log->logEndOffset();
+        rig.pass(&frame);
+        EXPECT_EQ(answerOf(rig), static_cast<int16_t>(pc::ErrorCode::InvalidRequest)) << "variant " << variant;
+        EXPECT_EQ(rig.log->logEndOffset(), leo) << "variant " << variant;
+    }
 }

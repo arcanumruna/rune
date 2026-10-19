@@ -419,7 +419,7 @@ TEST(ClientGatewayHotPath, ProduceBatchExactEffectiveMaxBoundaryRegression)
 
 // X036: a client-built CONTROL batch (a forged COMMIT/ABORT marker) anywhere in a Produce frame refuses the whole frame
 // InvalidRequest at the gateway, never forwarded.  The control batch is SECOND in the frame: a first-batch-only check
-// does not see it.  RED: delete the hasControlBatch check in handleProduce - the frame is accepted (answer != 39).
+// does not see it.  RED: delete the refusesClientBatches check in handleProduce - the frame is accepted (answer != 39).
 TEST(ProduceValidationRegression, AClientControlBatchIsRefusedOnGatewayRegression)
 {
     const fs::path dir = makeTempDir();
@@ -468,9 +468,61 @@ TEST(ProduceValidationRegression, AClientControlBatchIsRefusedOnGatewayRegressio
     captured.clear();                       // control: the same frame without the control batch is not InvalidRequest
     const auto ok = frameOf(false, 8);
     gw.applyProduceForTest(ok.data(), ok.size());
-    if (!captured.empty()) {
-        auto r2 = pc::ProduceResponse::decode(captured.data(), captured.size());
-        if (r2) EXPECT_NE(r2->errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    ASSERT_FALSE(captured.empty()) << "the control half must observe an answer";
+    auto r2 = pc::ProduceResponse::decode(captured.data(), captured.size());
+    ASSERT_TRUE(r2.has_value());
+    EXPECT_NE(r2->errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
+// X036 (review I1): the append CRC-checks only the FIRST batch and writes the whole span, so a malformed chain behind a
+// valid first batch (overlong totalLength, runt totalLength, trailing partial header) would be appended unchanged and
+// could hide a forged marker.  Every such frame is refused InvalidRequest whole.  RED: make refusesClientBatches return
+// false on a malformed chain (the old fail-open walk) - these frames are no longer InvalidRequest.
+TEST(ProduceValidationRegression, AMalformedBatchChainIsRefusedOnGatewayRegression)
+{
+    const fs::path dir = makeTempDir();
+    std::vector<rune::node::TopicSpec> specs;
+    { rune::node::TopicSpec ts; ts.name = "events"; ts.partitionCount = 1; ts.topicId = 0; specs.push_back(ts); }
+    rune::gateway::TopicRegistry registry(specs, dir.string());
+    std::vector<uint8_t> captured;
+    ClientGateway gw = ClientGateway::makeForTest(
+        [&captured](const uint8_t* buf, std::size_t len) -> int64_t { captured.assign(buf, buf + len); return 1; }, 1);
+    gw.setTopicRegistry(&registry);
+    const int64_t sid = gw.injectTestSession(0);
+    rune::protocol::RecordBatchBuilder first(0, 1000);
+    first.append("k", "v", 1000);
+    const std::vector<uint8_t> a = first.build();
+    auto lenPatch = [](std::vector<uint8_t>& b, std::size_t at, uint32_t total) {   // wire length = total - 12
+        const uint32_t v = total - 12;
+        for (int i = 0; i < 4; ++i) b[at + static_cast<std::size_t>(rune::protocol::batch::kLengthOffset) + i] = static_cast<uint8_t>(v >> (8 * i));
+    };
+    auto chainOf = [&](int variant) {
+        std::vector<uint8_t> chain = a;
+        rune::protocol::RecordBatchBuilder second(0, 1000);
+        second.append("k2", "v2", 1000);
+        const std::vector<uint8_t> b = second.build();
+        if (variant == 3) { chain.insert(chain.end(), b.begin(), b.begin() + 10); return chain; }   // trailing partial header
+        chain.insert(chain.end(), b.begin(), b.end());
+        if (variant == 1) lenPatch(chain, a.size(), static_cast<uint32_t>(b.size()) + 4096);          // overlong
+        if (variant == 2) lenPatch(chain, a.size(), 30);                                               // runt (< header)
+        return chain;
+    };
+    for (int variant = 1; variant <= 3; ++variant) {
+        captured.clear();
+        const auto batches = chainOf(variant);
+        pc::Produce prod;
+        prod.sessionId = sid; prod.correlationId = 100 + variant; prod.topicId = 0; prod.partition = 0; prod.partitionKnown = 1;
+        prod.acks = 0; prod.producerId = -1; prod.baseSequence = -1;
+        prod.recordBatch = std::span<const uint8_t>(batches.data(), batches.size());
+        std::vector<uint8_t> frame(prod.encodedSize() + 8);
+        frame.resize(prod.encode(frame.data()));
+        gw.applyProduceForTest(frame.data(), frame.size());
+        ASSERT_FALSE(captured.empty()) << variant;
+        auto resp = pc::ProduceResponse::decode(captured.data(), captured.size());
+        ASSERT_TRUE(resp.has_value()) << variant;
+        EXPECT_EQ(resp->errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest)) << "malformed chain variant " << variant;
     }
     std::error_code ec;
     fs::remove_all(dir, ec);

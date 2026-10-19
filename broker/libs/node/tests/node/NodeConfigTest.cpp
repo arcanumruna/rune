@@ -241,7 +241,9 @@ TEST(NodeConfigRegression, PerWorkerIngressWithoutShardRefusedWhenAuthEnabledReg
     const auto err = r.config->validateAuthTopology();
     ASSERT_TRUE(err.has_value());
     EXPECT_NE(err->find("RUNE_PER_WORKER_INGRESS"), std::string::npos) << *err;
-    EXPECT_TRUE(r.config->validateAuth().has_value()) << "validateAuth (BrokerNode::start and main) carries it";
+    const auto viaAuth = r.config->validateAuth();
+    ASSERT_TRUE(viaAuth.has_value()) << "validateAuth (BrokerNode::start and main) carries it";
+    EXPECT_NE(viaAuth->find("RUNE_PER_WORKER_INGRESS"), std::string::npos) << *viaAuth;
 
     env["RUNE_AUTH"] = "disabled";                       // dev mode: nothing to enforce
     r = parseNodeConfig(fakeEnv(env));

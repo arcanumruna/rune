@@ -1910,7 +1910,7 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
     // must not be able to reach a gated session at all.  No session is created.
     const bool refusedForVersion = authMode_ == rune::gateway::GatewayAuthMode::Required &&
                                    !pc::clientUnderstandsAuth(req.clientVersion);
-    if (refusedForVersion) [[unlikely]]
+    if (refusedForVersion && unauthLog_.due(5)) [[unlikely]]   // X103: any UDP sender can drive this
         spdlog::warn("auth: refused client version {} at connect (authentication requires {})", req.clientVersion,
                      pc::kClientVersionAuth);
     // Task 13 fix round 1 (I2): a worker's ack table stores the reply channel in
@@ -3711,7 +3711,7 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
 
     // X036: a client never writes a control batch (COMMIT/ABORT markers are the broker's own); any batch of the frame
     // carrying kAttrControl refuses the whole frame, consumed and never appended.
-    if (rune::node::Worker::hasControlBatch(msg.recordBatch.data(), batchLen)) [[unlikely]] {
+    if (rune::node::Worker::refusesClientBatches(msg.recordBatch.data(), batchLen)) [[unlikely]] {
         if (controlBatchRefusals_++ % 1024 == 0)
             spdlog::warn("ClientGateway: Produce with a client control batch refused InvalidRequest "
                          "(session={}, topic={}); total {}", msg.sessionId, msg.topicId, controlBatchRefusals_);
@@ -7937,7 +7937,8 @@ void ClientGateway::handleAuthClientFirst_(const uint8_t* buf, std::size_t len)
     const auto m = decodeClientFirst(buf, len);
     if (!m || m->mechanism != pc::kMechanismScramSha512) {
         ++loginsFailed_;
-        spdlog::warn("auth: login failed user=<undecodable> source={} session={} reason=malformed", session->sourceHost, session->sessionId);
+        if (unauthLog_.due(6)) [[unlikely]]
+            spdlog::warn("auth: login failed user=<undecodable> source={} session={} reason=malformed", session->sourceHost, session->sessionId);
         failLogin_(*session, hdr->correlationId, 0);
         return;
     }

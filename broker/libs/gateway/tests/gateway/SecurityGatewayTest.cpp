@@ -481,3 +481,24 @@ TEST(AuthLoginRegression, UnauthenticatedLogLinesAreRateLimitedRegression) {
     for (const std::string& l : rig.logSink->last_formatted()) if (l.find("bootstrap refused") != std::string::npos) ++lines;
     EXPECT_EQ(lines, 3) << "first, 1025th and 2049th";
 }
+
+// X103 (review I2): a malformed first login leg is driven by an unauthenticated session.  Counted every time, logged the
+// first time and every 1024th.  RED: drop the due(6) gate - every frame logs.
+TEST(AuthLoginRegression, MalformedFirstLegLogLinesAreRateLimitedRegression) {
+    Rig rig;
+    auto view = adminView();
+    rig.gw.setAuthMode(GatewayAuthMode::Required, &view);
+    constexpr int kFlood = 1100;
+    for (int i = 0; i < kFlood; ++i) {
+        rig.gw.setSessionAuthForTest(rig.sid, AuthAwaitingFirst{INT64_MAX});
+        pc::AuthClientFirst cf;
+        cf.sessionId = rig.sid; cf.correlationId = 500 + i; cf.mechanism = 0;   // not SCRAM-SHA-512: undecodable as a first leg
+        std::vector<uint8_t> b(cf.encodedSize() + 8); b.resize(cf.encode(b.data()));
+        rig.gw.applyClientFrameForTest(b.data(), b.size());
+        if (!rig.gw.hasSessionForTest(rig.sid)) rig.sid = rig.gw.injectTestSession(0, pc::kClientVersionAuth);
+    }
+    int lines = 0;
+    for (const std::string& l : rig.logSink->last_formatted()) if (l.find("reason=malformed") != std::string::npos) ++lines;
+    EXPECT_EQ(lines, 2) << "first and 1025th only";
+    EXPECT_EQ(rig.gw.unauthLogSuppressed(), static_cast<uint64_t>(kFlood - 2));
+}

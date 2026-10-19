@@ -132,6 +132,18 @@ TEST(AuthLoginRegression, PreV9ClientIsRefusedAtConnectRegression) {
     EXPECT_TRUE(w.connectAndLogin(b.channel(), "admin", AuthBroker::kAdminPassword).ok());
 }
 
+// X103 (review I2): a bare pre-v9 Connect from any UDP sender is refused with a log line; a flood logs the first and every
+// 1024th only.  RED: drop the due(5) gate - every refusal logs.
+TEST(AuthLoginRegression, VersionRefusalLogLinesAreRateLimitedRegression) {
+    LogCapture log;
+    AuthBroker b("v8flood");
+    b.bootstrapAdmin();
+    AuthWireClient& w = b.wire();
+    constexpr int kFlood = 40;
+    for (int i = 0; i < kFlood; ++i) EXPECT_EQ(w.connect(b.channel(), pc::kClientVersionCatalog), -1);
+    EXPECT_EQ(log.count("auth: refused client version 8 at connect"), 1) << "first only; the 1025th is beyond this flood";
+}
+
 TEST(AuthLoginRegression, RequestBeforeAuthenticationIsAnsweredAuthenticationFailedAndEndsTheSession) {
     AuthBroker b("preauth");
     b.bootstrapAdmin();
