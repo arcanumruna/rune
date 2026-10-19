@@ -10,6 +10,7 @@
 
 #include <rune/client/subscriber/SubscriberHub.h>
 #include <rune/client/group/GroupConsumerHub.h>  // isFetchCorrId (header-only constexpr)
+#include <rune/client/TopicHandle.h>            // isEventLogTopic
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/Protocol.h>  // kCatalogTopicId
 
@@ -496,7 +497,7 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv, int64_t currentSessi
     if (rb.size() == 8) [[unlikely]] {
         uint64_t l = 0;
         for (int i = 0; i < 8; ++i) l |= static_cast<uint64_t>(rb[static_cast<std::size_t>(i)]) << (8 * i);
-        if (impl.topicId == rune::protocol::client::kCatalogTopicId) {
+        if (isEventLogTopic(impl.topicId)) {
             // Catalog history (client version 8, Task 13 fix round 2): the stream's
             // HISTORY-EPOCH NOTE (baseOffset −1, before any record) or the CAUGHT-UP
             // MARKER (baseOffset = the broker's HW, the same epoch).  Never a
@@ -529,7 +530,7 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv, int64_t currentSessi
     if (rb.empty()) {
         // A catalog frame with no epoch is not a version-8 marker: never taken as
         // "caught up" (the reader's deadline ends a read that never gets one).
-        if (impl.topicId == rune::protocol::client::kCatalogTopicId) [[unlikely]] { noteMalformed_(); return; }
+        if (isEventLogTopic(impl.topicId)) [[unlikely]] { noteMalformed_(); return; }
         // A POSITION NOTE (client version 6): the broker's cursor for this
         // subscription, sent right before it answers NotLeader (moved).  Kept
         // only while nothing was delivered (rearmMovedAway resumes there).
@@ -1125,7 +1126,7 @@ bool SubscriberHub::endCatalogRead(int64_t correlationId, int64_t answerSid, int
     for (auto it = activeById_.begin(); it != activeById_.end(); ++it) {
         SubscriptionImpl* impl = it->second;
         if (impl == nullptr || impl->correlationId != correlationId) continue;
-        if (impl->topicId != rune::protocol::client::kCatalogTopicId) return false;   // not a catalog read
+        if (!isEventLogTopic(impl->topicId)) return false;   // not an event-log (catalog / security) read
         if (!impl->active || impl->unsubPending) return false;
         const int64_t homeSid = homeSidOf_(*impl, seedSid);
         if (homeSid == 0 || answerSid != homeSid) return false;   // a stale answer of an earlier session

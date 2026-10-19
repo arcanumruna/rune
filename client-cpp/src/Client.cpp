@@ -20,6 +20,7 @@
 #include <rune/client/Client.h>
 #include <rune/client/agent/AgentProduceSink.h>
 #include <rune/client/detail/CpuAffinity.h>
+#include <rune/client/detail/SecureZero.h>
 #include <rune/client/detail/OneToOneRingBuffer.h>
 #include <rune/client/producer/ProducerImpl.h>
 #include <rune/client/codec/DataCodec.h>
@@ -161,6 +162,7 @@ Client::Client(ClientConfig cfg)
     , agent_(toAgentConfig(cfg_))
     , partitionRouter_(metadataCache_)
     , catalogReader_(std::make_unique<CatalogReader>(*this))   // eagerly, on the owning thread (I2)
+    , securityReader_(std::make_unique<SecurityReader>(*this))   // authentication Task 8: same rule
 {
     if (cfg_.traceDdlRetries) ddlRetryNotes_.reserve(kMaxDdlRetryNotes);   // push_back never reallocates on the duty thread
     // F8c review n1: releaseCq_ is noexcept and may defer a release; the list
@@ -1404,6 +1406,7 @@ std::optional<std::size_t> decodedRequestIdOffset(rune::client::OpKind op, std::
     case OpKind::DropView:         if (auto m = rpc::DropView::decode(f.data(), f.size())) ext = m->ext; break;
     case OpKind::AlterView:        if (auto m = rpc::AlterView::decode(f.data(), f.size())) ext = m->ext; break;
     case OpKind::AlterTopicConfig: if (auto m = rpc::AlterTopicConfig::decode(f.data(), f.size())) ext = m->ext; break;
+    case OpKind::SecurityDdl:      if (auto m = rpc::SecurityDdl::decode(f.data(), f.size())) ext = m->ext; break;
     default: break;
     }
     if (!ext) return std::nullopt;
@@ -1492,6 +1495,43 @@ OpResult Client::alterTopicConfig(std::string_view name, uint32_t expectedVersio
     if (n == 0) return OpResult::InvalidArgument;
     return issueDdl_(OpKind::AlterTopicConfig, target, token, std::span<const uint8_t>(frame.data(), n), msg.ext,
                      msg.extOffset());
+}
+
+OpResult Client::securityDdl(rune::ql::SecurityPlan plan, const DdlOptions& ddl, CompletionTarget target, Token token) {
+    namespace rpc = rune::protocol::client;
+    rpc::SecurityDdl msg;
+    security::VerifierStorage vs;
+    // Throws std::invalid_argument for a short password BEFORE anything is sent (D9).
+    try {
+        security::fillSecurityDdl(plan, cfg_.scramIterations, cfg_.minPasswordLength, vs, msg);
+    } catch (...) {
+        detail::secureZero(plan.password.data(), plan.password.size());
+        throw;
+    }
+    DdlOptions d = ddl;
+    d.statement  = plan.statement;   // D10: ONLY the redacted statement ever travels
+    msg.ext      = ddlExt_(d);
+    std::vector<uint8_t> frame(msg.encodedSize());
+    const std::size_t n = msg.encode(frame.data());
+    detail::secureZero(plan.password.data(), plan.password.size());   // the verifier is built: the password is not needed
+    if (n == 0) return OpResult::InvalidArgument;
+    return issueDdl_(OpKind::SecurityDdl, target, token, std::span<const uint8_t>(frame.data(), n), msg.ext,
+                     rpc::MessageHeader::ENCODED_SIZE);   // the extension follows the header directly (D36)
+}
+
+OpResult Client::bootstrapSecurity(std::string_view adminName, std::string_view oneTimePassword,
+                                   std::span<const uint8_t> clusterKeyFileContents, CompletionTarget target,
+                                   Token token) {
+    namespace rpc = rune::protocol::client;
+    rpc::SecurityBootstrap msg;
+    security::VerifierStorage vs;
+    security::buildBootstrap(adminName, oneTimePassword, clusterKeyFileContents, cfg_.scramIterations,
+                             cfg_.minPasswordLength, vs, msg);
+    std::vector<uint8_t> frame(msg.encodedSize());
+    const std::size_t n = msg.encode(frame.data());
+    if (n == 0) return OpResult::InvalidArgument;
+    // No DDL extension: the bootstrap's nonce is its identity; a resend carries the same bytes.
+    return issueControl_(OpKind::SecurityBootstrap, target, token, std::span<const uint8_t>(frame.data(), n), 0, 0);
 }
 
 OpResult Client::getViewRow(int32_t viewTopicId, uint64_t keyU64, uint64_t requestedFingerprint,
@@ -2391,6 +2431,57 @@ CatalogResult<std::vector<rune::catalog::DiffEntry>> Client::catalogDiff(const r
     return rune::catalog::diff(*sa, *sb);
 }
 
+SecurityReader& Client::securityReader() {
+    static_assert(std::is_const_v<decltype(securityReader_)>, "the security reader must be created eagerly and never reassigned");
+    securityReader_->checkOwner_();
+    return *securityReader_;
+}
+
+Client::SecurityResult<std::vector<rune::security::RecordedEvent>> Client::securityHistory(
+    const rune::security::HistoryFilter& filter, std::chrono::milliseconds timeout) {
+    SecurityReader& r = securityReader();
+    if (auto ok = r.refresh(timeout); !ok) return std::unexpected(std::move(ok.error()));
+    return rune::security::history(r.events(), filter);
+}
+
+Client::SecurityResult<rune::security::GrantsView> Client::securityGrantsFor(
+    rune::security::GranteeKind kind, std::string_view name, std::optional<rune::security::AsOf> at,
+    std::chrono::milliseconds timeout) {
+    SecurityReader& r = securityReader();
+    if (auto ok = r.refresh(timeout); !ok) return std::unexpected(std::move(ok.error()));
+    const rune::security::SecurityState* state = &r.state();
+    rune::security::SecurityState asOf;
+    if (at) {
+        auto s = rune::security::stateAsOf(r.events(), *at);
+        if (!s) {
+            return std::unexpected(CatalogReadError{CatalogReadError::Kind::Replay, rune::security::describe(s.error()),
+                                                    s.error().offset, 0});
+        }
+        asOf  = std::move(*s);
+        state = &asOf;
+    }
+    auto g = rune::security::grantsFor(*state, kind, name);
+    if (!g) {
+        return std::unexpected(CatalogReadError{CatalogReadError::Kind::Rejected,
+                                                "no such live " + std::string(kind == rune::security::GranteeKind::Role ? "role" : "user") +
+                                                    " '" + std::string(name) + "'",
+                                                -1, 0});
+    }
+    return std::move(*g);
+}
+
+Client::SecurityResult<std::vector<rune::security::UserRow>> Client::securityUsers(std::chrono::milliseconds timeout) {
+    SecurityReader& r = securityReader();
+    if (auto ok = r.refresh(timeout); !ok) return std::unexpected(std::move(ok.error()));
+    return rune::security::users(r.state());
+}
+
+Client::SecurityResult<std::vector<rune::security::RoleRow>> Client::securityRoles(std::chrono::milliseconds timeout) {
+    SecurityReader& r = securityReader();
+    if (auto ok = r.refresh(timeout); !ok) return std::unexpected(std::move(ok.error()));
+    return rune::security::roles(r.state());
+}
+
 void Client::connectAndWait(std::chrono::nanoseconds timeout) {
     andWait_("connect()", timeout, 0,
              [&](Completions& q, Token t) { return connect(q, t); },
@@ -2568,6 +2659,34 @@ DdlResult Client::dropTopicAndWait(std::string_view name, const DdlOptions& ddl,
                  if (c.status != OpStatus::BrokerError) throwForStatus_("dropTopic()", c, p);
                  result = ddlResultOf(c, p);
                  result.requestId = ddl.requestId.none() ? requestIdOf(c) : ddl.requestId;
+             });
+    return result;
+}
+
+SecurityDdlResult Client::securityDdlAndWait(rune::ql::SecurityPlan plan, const DdlOptions& ddl,
+                                             std::chrono::milliseconds timeout) {
+    SecurityDdlResult result;
+    andWait_("securityDdl()", timeout, 0,
+             [&](Completions& q, Token t) { return securityDdl(std::move(plan), ddl, q, t); },
+             [&](const Completion& c, std::span<const uint8_t> p) {
+                 if (c.status != OpStatus::BrokerError && c.status != OpStatus::Ok) throwForStatus_("securityDdl()", c, p);
+                 const DdlResult r = ddlResultOf(c, p);
+                 result = SecurityDdlResult{r.errorCode, r.objectId, r.newVersion, r.detail,
+                                            ddl.requestId.none() ? requestIdOf(c) : ddl.requestId};
+             });
+    return result;
+}
+
+SecurityDdlResult Client::bootstrapSecurityAndWait(std::string_view adminName, std::string_view oneTimePassword,
+                                                   std::span<const uint8_t> clusterKeyFileContents,
+                                                   std::chrono::milliseconds timeout) {
+    SecurityDdlResult result;
+    andWait_("bootstrapSecurity()", timeout, 0,
+             [&](Completions& q, Token t) { return bootstrapSecurity(adminName, oneTimePassword, clusterKeyFileContents, q, t); },
+             [&](const Completion& c, std::span<const uint8_t> p) {
+                 if (c.status != OpStatus::BrokerError && c.status != OpStatus::Ok) throwForStatus_("bootstrapSecurity()", c, p);
+                 const DdlResult r = ddlResultOf(c, p);
+                 result = SecurityDdlResult{r.errorCode, r.objectId, r.newVersion, r.detail};
              });
     return result;
 }
@@ -4004,7 +4123,8 @@ void Client::onEgressFrame(codec::TemplateId tid,
         if (const std::size_t i = findCtl_(opt->correlationId);
             i < pendingCtl_.size() &&
             (pendingCtl_[i].op == OpKind::DropTopic || pendingCtl_[i].op == OpKind::DropView ||
-             pendingCtl_[i].op == OpKind::AlterView || pendingCtl_[i].op == OpKind::AlterTopicConfig)) {
+             pendingCtl_[i].op == OpKind::AlterView || pendingCtl_[i].op == OpKind::AlterTopicConfig ||
+             pendingCtl_[i].op == OpKind::SecurityDdl || pendingCtl_[i].op == OpKind::SecurityBootstrap)) {
             if (opt->errorCode == static_cast<uint16_t>(rpc::ErrorCode::NotLeader)) {
                 onDdlNotLeader_(i, opt->detail, now());
                 break;
@@ -4705,7 +4825,7 @@ Subscription Client::subscribeImpl(TopicHandle              topic,
     impl->isolation     = static_cast<uint8_t>(opts.isolation);
     impl->handler       = std::move(handler);
     // Catalog history (Task 13): the epoch note / caught-up marker callbacks (TopicHandle::catalog()).
-    if (topic.topicId == rune::protocol::client::kCatalogTopicId) {
+    if (isEventLogTopic(topic.topicId)) {
         impl->onCaughtUp     = std::move(opts.onCaughtUp);
         impl->onHistoryEpoch = std::move(opts.onHistoryEpoch);
     }

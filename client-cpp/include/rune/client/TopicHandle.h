@@ -42,6 +42,16 @@ struct TopicHandle {
     /// …) — committed events only, then the caught-up marker
     /// (SubscribeOptions::onCaughtUp).  Not a producible topic (valid() is false).
     static constexpr TopicHandle catalog() noexcept { return {rune::protocol::client::kCatalogTopicId, 1}; }
+
+    /// Authentication (Task 8): the `__security` log (topic id −7, one partition) — the same stream contract as
+    /// catalog() (history-epoch note, committed records, caught-up marker), readable only by ADMIN CLUSTER holders
+    /// (the broker answers NotAuthorized otherwise).  Not a producible topic.
+    static constexpr TopicHandle security() noexcept { return {rune::protocol::client::kSecurityTopicId, 1}; }
 };
+
+/// The replicated event logs a client reads with the epoch-note / caught-up-marker stream contract.
+[[nodiscard]] constexpr bool isEventLogTopic(int32_t topicId) noexcept {
+    return topicId == rune::protocol::client::kCatalogTopicId || topicId == rune::protocol::client::kSecurityTopicId;
+}
 
 } // namespace rune::client

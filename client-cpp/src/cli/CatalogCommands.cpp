@@ -8,7 +8,10 @@
 // timeout below — a missing broker, a lost leader or a silent cluster is an explicit error,
 // never a hang.  Nothing is ever written to `out` for a failed export.
 #include "rune/cli/CatalogCommands.h"
+#include "rune/cli/SecurityCommands.h"
+#include "CliSupport.h"
 
+#include <rune/client/detail/SecureZero.h>
 #include "rune/ql/Backends.h"
 #include "rune/ql/Parser.h"
 
@@ -55,6 +58,8 @@ namespace rune::cli {
 
 namespace cat = rune::catalog;
 namespace ql  = rune::ql;
+namespace sec = rune::security;
+using namespace rune::cli::support;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Pure helpers
@@ -168,9 +173,10 @@ std::string_view errorCodeName(uint16_t code) noexcept {
         "ConcurrentTransactions", "UnknownProducerId", "HandshakeFailed", "SchemaIncompatible", "SchemaConflict",
         "ViewExists", "ViewSourceNotFound", "ViewFieldUnresolved", "ViewKeyInvalid", "ViewNotCoPartitioned",
         "ViewSourceTransient", "ViewNotAlterable", "InvalidRequest", "InvalidTopicName", "ViewSourceIsView",
-        "TransientLogFull", "PartitionDataReset"};
+        "TransientLogFull", "PartitionDataReset", "AuthenticationFailed", "NotAuthorized", "SessionRevoked",
+        "PasswordChangeRequired"};
 #ifdef RUNE_CLI_LIVE_ENABLED
-    static_assert(std::size(kNames) == static_cast<std::size_t>(rune::protocol::client::ErrorCode::PartitionDataReset) + 1,
+    static_assert(std::size(kNames) == static_cast<std::size_t>(rune::protocol::client::ErrorCode::PasswordChangeRequired) + 1,
                   "errorCodeName: one name per rune::protocol::client::ErrorCode");
     static_assert(static_cast<uint16_t>(rune::protocol::client::ErrorCode::TopicExists) == 25,
                   "errorCodeName: the table is indexed by the enum's values");
@@ -337,267 +343,26 @@ void printCatalogUsage(std::ostream& err) {
         << "      Exit 0: no differences; 3: differences (printed); 1: error; 2: usage.\n";
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Argument parsing (strict: an unknown option, a missing value or a stray word is a usage error)
-// ═══════════════════════════════════════════════════════════════════════════
-namespace {
-
-struct ParsedArgs {
-    std::map<std::string, std::string> values;
-    std::set<std::string> flags;
-    [[nodiscard]] bool has(const std::string& k) const { return values.count(k) != 0 || flags.count(k) != 0; }
-    [[nodiscard]] std::string value(const std::string& k) const {
-        const auto it = values.find(k);
-        return it == values.end() ? std::string() : it->second;
-    }
-};
-
-// The test-only overrides the schema commands already accept (not advertised).
-constexpr std::string_view kHiddenValueFlags[] = {"--cli-stream-in", "--cli-stream-out", "--cli-data-dir",
-                                                  "--cli-egress"};
-
-bool parseArgs(std::string_view cmd, const std::vector<std::string>& args, std::initializer_list<std::string_view> valueFlags,
-               std::initializer_list<std::string_view> boolFlags, ParsedArgs& out, std::ostream& err) {
-    auto isIn = [](std::string_view a, auto&& list) { return std::find(std::begin(list), std::end(list), a) != std::end(list); };
-    for (std::size_t i = 0; i < args.size(); ++i) {
-        const std::string& a = args[i];
-        if (isIn(a, valueFlags) || isIn(a, kHiddenValueFlags)) {
-            if (i + 1 >= args.size()) {
-                err << "rune " << cmd << ": " << a << " needs a value\n";
-                return false;
-            }
-            if (out.has(a)) {
-                err << "rune " << cmd << ": " << a << " given twice\n";
-                return false;
-            }
-            out.values[a] = args[++i];
-        } else if (isIn(a, boolFlags)) {
-            if (out.has(a)) {
-                err << "rune " << cmd << ": " << a << " given twice\n";
-                return false;
-            }
-            out.flags.insert(a);
-        } else {
-            err << "rune " << cmd << ": " << (a.rfind('-', 0) == 0 ? "unknown option '" : "unexpected argument '") << a
-                << "'\n";
-            return false;
-        }
-    }
-    return true;
-}
-
-/// A non-negative int64 ("0".."9223372036854775807"), digits only.
-std::optional<int64_t> parseOffset(std::string_view s) noexcept {
-    if (s.empty()) return std::nullopt;
-    int64_t v = 0;
-    const auto r = std::from_chars(s.data(), s.data() + s.size(), v);
-    if (r.ec != std::errc{} || r.ptr != s.data() + s.size() || v < 0) return std::nullopt;
-    return v;
-}
-
-int usageError(std::string_view cmd, std::ostream& err, const std::string& msg) {
-    err << "rune " << cmd << ": " << msg << "\n";
-    printCatalogUsage(err);
-    return 2;
-}
-
-} // namespace
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Live broker access
-// ═══════════════════════════════════════════════════════════════════════════
+// (argument parsing and the live broker connection moved to CliSupport.h: shared with SecurityCommands.cpp)
 #ifdef RUNE_CLI_LIVE_ENABLED
 namespace {
 
 namespace rc  = rune::client;
 namespace rpc = rune::protocol::client;
 
-constexpr std::chrono::seconds kConnectWait{10};
-/// Bound on every catalog read (the client's reads are unbounded without one).
-constexpr std::chrono::seconds kCatalogWait{15};
 
-std::string toChannel(const std::string& endpoint) {
-    if (endpoint.rfind("aeron:", 0) == 0) return endpoint;
-    return "aeron:udp?endpoint=" + endpoint;
-}
-
-/// "host:port" of an `aeron:udp?endpoint=host:port[&...]` channel; "" for any other channel.
-std::string udpEndpointOf(const std::string& channel) {
-    const std::string key = "aeron:udp?endpoint=";
-    if (channel.rfind(key, 0) != 0) return {};
-    const auto end = channel.find('&', key.size());
-    return channel.substr(key.size(), end == std::string::npos ? std::string::npos : end - key.size());
-}
-
-/// The local address the OS would use to reach `hostport` (UDP connect + getsockname — no packet is sent),
-/// as an Aeron egress channel; nullopt (with `why`) when it cannot be determined.
-std::optional<std::string> localEgressFor(const std::string& hostport, std::string& why) {
-    const auto colon = hostport.rfind(':');
-    if (colon == std::string::npos || colon == 0 || colon + 1 == hostport.size()) {
-        why = "'" + hostport + "' is not host:port";
-        return std::nullopt;
-    }
-    const std::string host = hostport.substr(0, colon), port = hostport.substr(colon + 1);
-    addrinfo hints{};
-    hints.ai_family   = AF_INET;
-    hints.ai_socktype = SOCK_DGRAM;
-    addrinfo* res = nullptr;
-    if (const int rc = ::getaddrinfo(host.c_str(), port.c_str(), &hints, &res); rc != 0 || res == nullptr) {
-        why = "cannot resolve '" + host + "'";
-        return std::nullopt;
-    }
-    std::optional<std::string> result;
-    const int fd = ::socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (fd >= 0) {
-        if (::connect(fd, res->ai_addr, res->ai_addrlen) == 0) {
-            sockaddr_in local{};
-            socklen_t len = sizeof local;
-            if (::getsockname(fd, reinterpret_cast<sockaddr*>(&local), &len) == 0) {
-                char ip[INET_ADDRSTRLEN] = {};
-                if (::inet_ntop(AF_INET, &local.sin_addr, ip, sizeof ip) != nullptr)
-                    result = std::string("aeron:udp?endpoint=") + ip + ":" + std::to_string(ntohs(local.sin_port));
-            }
-        }
-        ::close(fd);
-    }
-    ::freeaddrinfo(res);
-    if (!result) why = "cannot determine a local address that reaches '" + hostport + "'";
-    return result;
-}
-
-/// A per-client scratch directory (the embedded driver's data dir), removed on destruction.
-class ScopedDir {
-public:
-    ScopedDir() = default;
-    explicit ScopedDir(std::filesystem::path p) : path_(std::move(p)) {}
-    ScopedDir(ScopedDir&& o) noexcept : path_(std::move(o.path_)) { o.path_.clear(); }
-    ScopedDir& operator=(ScopedDir&& o) noexcept {
-        reset();
-        path_ = std::move(o.path_);
-        o.path_.clear();
-        return *this;
-    }
-    ~ScopedDir() { reset(); }
-    [[nodiscard]] const std::filesystem::path& path() const noexcept { return path_; }
-
-private:
-    void reset() noexcept {
-        if (path_.empty()) return;
-        std::error_code ec;
-        std::filesystem::remove_all(path_, ec);
-        path_.clear();
-    }
-    std::filesystem::path path_;
-};
-
-/// One connected Client for one broker.  Invoker mode: this thread is the duty thread, so the
-/// DDL retry notes (--verbose) are read race-free.
-class LiveBroker {
-public:
-    LiveBroker() = default;
-    LiveBroker(const LiveBroker&) = delete;
-    LiveBroker& operator=(const LiveBroker&) = delete;
-    ~LiveBroker() { close(); }
-
-    /// false (a message on err) when the endpoint is unusable or the connect fails / times out.
-    bool open(const ParsedArgs& a, const std::string& endpoint, bool verbose, std::ostream& err) {
-        rc::ClientConfig cfg;
-        cfg.gatewayChannel = toChannel(endpoint);
-        cfg.clientName     = "rune-cli";
-        cfg.runnerMode     = rc::RunnerMode::Invoker;
-        cfg.traceDdlRetries = verbose;
-        std::string egress = a.value("--cli-egress");
-        if (egress.empty()) {
-            if (const char* env = std::getenv("RUNE_EGRESS"); env != nullptr) egress = env;
-        }
-        if (egress.empty()) {
-            if (const std::string ep = udpEndpointOf(cfg.gatewayChannel); !ep.empty()) {
-                std::string why;
-                const auto local = localEgressFor(ep, why);
-                if (!local) {
-                    err << "rune: " << why << "; set --cli-egress (or RUNE_EGRESS)\n";
-                    return false;
-                }
-                egress = *local;
-            }
-        }
-        if (!egress.empty()) cfg.egressChannel = egress;
-        try {
-            if (const std::string v = a.value("--cli-stream-in"); !v.empty()) cfg.gatewayStreamId = std::stoi(v);
-            if (const std::string v = a.value("--cli-stream-out"); !v.empty()) cfg.egressStreamId = std::stoi(v);
-        } catch (const std::exception&) {
-            err << "rune: --cli-stream-in/--cli-stream-out must be integers\n";
-            return false;
-        }
-        if (a.has("--cli-data-dir")) {
-            cfg.dataDir = a.value("--cli-data-dir");   // the caller's directory, used as is (and left in place)
-        } else {   // a private scratch directory per client, removed on close
-            dir_ = ScopedDir(std::filesystem::temp_directory_path() /
-                             ("rune-cli-" + std::to_string(::getpid()) + "-" + std::to_string(reinterpret_cast<std::uintptr_t>(this)) + "-" +
-                              std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())));
-            cfg.dataDir = dir_.path().string();
-        }
-        ddlTimeout_ = std::chrono::milliseconds(cfg.ddlTimeoutMs);
-        verbose_ = verbose;
-        try {
-            client_ = std::make_unique<rc::Client>(cfg);
-            client_->connectAndWait(kConnectWait);
-            return true;
-        } catch (const std::exception& e) {
-            if (std::string_view(e.what()).find("timed out") != std::string_view::npos)
-                err << "rune: connect to " << endpoint << " timed out\n";
-            else
-                err << "rune error: " << e.what() << "\n";
-            close();
-            return false;
-        }
-    }
-
-    void close() noexcept {
-        if (client_) {
-            try {
-                client_->close();
-            } catch (...) {
-            }
-            client_.reset();
-        }
-        dir_ = ScopedDir();
-    }
-
-    [[nodiscard]] rc::Client& client() { return *client_; }
-    [[nodiscard]] std::chrono::milliseconds ddlTimeout() const noexcept { return ddlTimeout_; }
-
-    /// --verbose: print (and clear) the Redirect / NotLeader retries the client followed since the last call.
-    void flushVerbose(std::ostream& err) {
-        if (!verbose_ || !client_) return;
-        std::vector<rc::Client::DdlRetryNote> notes;
-        const std::size_t dropped = client_->takeDdlRetryNotes(notes);
-        for (const auto& n : notes) {
-            if (n.kind == rc::Client::DdlRetryNote::Kind::Redirect)
-                err << "rune: redirect " << n.redirects << "/" << rc::Client::kMaxDdlRedirects << " -> " << n.text << "\n";
-            else
-                err << "rune: NotLeader" << (n.text.empty() ? "" : " (" + n.text + ")") << ", retrying in " << n.backoffMs
-                    << " ms\n";
-        }
-        if (dropped != 0) err << "rune: " << dropped << " further retry notes dropped\n";
-    }
-
-private:
-    ScopedDir                   dir_;
-    std::unique_ptr<rc::Client> client_;
-    std::chrono::milliseconds   ddlTimeout_{15'000};
-    bool                        verbose_ = false;
-};
-
-std::string catalogReadFailure(const rc::CatalogReadError& e) {
+std::string eventLogReadFailure(std::string_view what, const rc::CatalogReadError& e) {
     static constexpr const char* kKinds[] = {"timed out", "verification failed", "client closed", "refused by the broker",
                                              "cache full", "record too large"};
-    std::string s = "catalog read ";
+    std::string s(what);
+    s += " read ";
     s += kKinds[static_cast<std::size_t>(e.kind)];
     if (!e.detail.empty()) s += ": " + e.detail;
     if (e.brokerErrorCode != 0) s += " (" + brokerFailure(e.brokerErrorCode, {}) + ")";
     return s;
 }
+std::string catalogReadFailure(const rc::CatalogReadError& e) { return eventLogReadFailure("catalog", e); }
+std::string securityReadFailure(const rc::CatalogReadError& e) { return eventLogReadFailure("security", e); }
 
 int64_t steadyNowMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -639,9 +404,32 @@ struct PAlterConfig { ql::AlterTopicConfigPlan plan; };
 struct PDropTopic   { std::string name; };
 struct PDropView    { std::string name; };
 struct PHistory     { cat::HistoryFilter filter; std::string text; };
+/// Authentication (Task 8): a security DDL — the plan holds the plaintext password, wiped when the statement is done.
+struct PSecurity {
+    mutable ql::SecurityPlan plan;
+    PSecurity() = default;
+    explicit PSecurity(ql::SecurityPlan p) : plan(std::move(p)) {}
+    PSecurity(PSecurity&&) noexcept = default;
+    PSecurity& operator=(PSecurity&&) noexcept = default;
+    PSecurity(const PSecurity&) = delete;
+    PSecurity& operator=(const PSecurity&) = delete;
+    ~PSecurity() { wipe(); }
+    void wipe() const noexcept {
+        if (!plan.password.empty()) rune::client::detail::secureZero(plan.password.data(), plan.password.size());
+    }
+};
+/// SHOW USERS / ROLES / GRANTS / SECURITY HISTORY — client-side replays of `__security`.
+struct PSecShow {
+    enum class Kind { Users, Roles, Grants, History } kind = Kind::Users;
+    sec::GranteeKind who = sec::GranteeKind::User;       // Grants
+    std::string name;                                    // Grants / History filter
+    std::optional<sec::AsOf> at;                         // Grants
+    sec::HistoryFilter filter;                           // History
+    std::string text;
+};
 struct PAsOf        { cat::ObjectType kind = cat::ObjectType::Topic; std::string name; cat::AsOf at; std::string text; };
 struct PDiff        { cat::AsOf a, b; std::string onlyTopic; bool restrictToTopic = false; std::string text; };
-using Prepared = std::variant<PDefine, PAlter, PAlterConfig, PDropTopic, PDropView, PHistory, PAsOf, PDiff>;
+using Prepared = std::variant<PDefine, PAlter, PAlterConfig, PDropTopic, PDropView, PHistory, PAsOf, PDiff, PSecurity, PSecShow>;
 
 cat::ObjectType objectType(ql::ObjectKind k) noexcept {
     switch (k) {
@@ -662,6 +450,49 @@ std::string requestIdHex(const cat::RequestId& id) { return hex16(id.hi) + hex16
 
 /// Parse-and-plan one statement.  nullopt + `why` when it is refused (versions beyond u16, a bad
 /// setting, an undecodable time).
+std::optional<Prepared> prepareSecurity(const ql::Statement& st, std::string& why) {
+    if (const auto* u = std::get_if<ql::ShowUsersDef>(&st)) { (void)u; PSecShow p; p.kind = PSecShow::Kind::Users; p.text = ql::redactedText(st); return Prepared{std::move(p)}; }
+    if (std::holds_alternative<ql::ShowRolesDef>(st)) { PSecShow p; p.kind = PSecShow::Kind::Roles; p.text = ql::redactedText(st); return Prepared{std::move(p)}; }
+    if (const auto* g = std::get_if<ql::ShowGrantsDef>(&st)) {
+        PSecShow p;
+        p.kind = PSecShow::Kind::Grants;
+        p.who  = g->who;
+        p.name = g->name;
+        p.text = ql::redactedText(st);
+        if (g->at) {
+            switch (g->at->by) {
+                case ql::AsOfPoint::By::Offset: p.at = sec::AsOf{sec::AsOf::By::Offset, g->at->number}; break;
+                case ql::AsOfPoint::By::Time: {
+                    const auto ms = parseIsoMs(g->at->timeIso);
+                    if (!ms) { why = "invalid time '" + g->at->timeIso + "'"; return std::nullopt; }
+                    p.at = sec::AsOf{sec::AsOf::By::Time, *ms};
+                    break;
+                }
+                case ql::AsOfPoint::By::Version:
+                    why = "SHOW GRANTS … AS OF VERSION is not defined: use AS OF OFFSET <n> or AS OF TIME '<iso>'";
+                    return std::nullopt;
+            }
+        }
+        return Prepared{std::move(p)};
+    }
+    if (const auto* h = std::get_if<ql::ShowSecurityHistoryDef>(&st)) {
+        PSecShow p;
+        p.kind = PSecShow::Kind::History;
+        p.text = ql::redactedText(st);
+        if (h->who) p.filter.kind = *h->who;
+        p.filter.name = h->name;
+        if (h->sinceIso) {
+            const auto ms = parseIsoMs(*h->sinceIso);
+            if (!ms) { why = "invalid time '" + *h->sinceIso + "'"; return std::nullopt; }
+            p.filter.sinceMs = *ms;
+        }
+        return Prepared{std::move(p)};
+    }
+    auto plan = ql::applySecurityPlan(st);
+    if (!plan) { why = plan.error().message; return std::nullopt; }
+    return Prepared{PSecurity{std::move(*plan)}};
+}
+
 std::optional<Prepared> prepare(const ql::Statement& st, std::string& why) {
     auto checkVersion = [&](int64_t v, std::string_view kind, uint64_t max) {
         if (v < 0 || static_cast<uint64_t>(v) > max) {
@@ -743,10 +574,7 @@ std::optional<Prepared> prepare(const ql::Statement& st, std::string& why) {
                     }
                     return Prepared{std::move(p)};
                 } else if constexpr (!std::is_same_v<T, ql::DiffDef>) {
-                    // Authentication: user / role / grant / SHOW statements arrive with the security DDL API
-                    // (Task 8).  Until then they are refused explicitly — never executed, never silently dropped.
-                    why = "security statements are not supported by this command yet";
-                    return std::nullopt;
+                    return prepareSecurity(st, why);   // user / role / grant DDL and SHOW … (authentication Task 8)
                 } else {
                     PDiff p;
                     if (s.scope == ql::DiffDef::Scope::Schema) {
@@ -811,6 +639,8 @@ void printPlan(const Prepared& p, const std::optional<cat::RequestId>& rid, std:
                 out << "drop topic " << s.name << "\n";
             } else if constexpr (std::is_same_v<T, PDropView>) {
                 out << "drop view " << s.name << "\n";
+            } else if constexpr (std::is_same_v<T, PSecurity>) {
+                out << s.plan.statement << "\n";   // the REDACTED statement (D10): a password literal never prints
             } else {
                 out << s.text << "\n";
             }
@@ -956,6 +786,68 @@ struct QlRun {
         out << "dropped topic '" << s.name << "'\n";
         return true;
     }
+    // ---- authentication (Task 8): security DDL and SHOW … ---------------------------------------------------------
+    std::optional<cat::RequestId> lastSecurityDdl;   // a SHOW after a security DDL waits until the reader shows it
+
+    bool awaitLastSecurityDdl() {
+        if (!lastSecurityDdl) return true;
+        auto& reader = broker.client().securityReader();
+        const int64_t deadline = steadyNowMs() + std::chrono::duration_cast<std::chrono::milliseconds>(kCatalogWait).count();
+        std::string why = "not visible before the deadline";
+        for (;;) {
+            const int64_t left = std::max<int64_t>(1, deadline - steadyNowMs());
+            if (auto r = reader.refresh(std::chrono::milliseconds(left)); !r) { why = securityReadFailure(r.error()); break; }
+            if (reader.state().request(*lastSecurityDdl)) return true;
+            if (steadyNowMs() >= deadline) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        return fail("the security read did not show this script's last DDL (request id " + requestIdHex(*lastSecurityDdl) +
+                    "): " + why);
+    }
+
+    bool run(const PSecurity& s, const rc::DdlOptions& ddl) {
+        ql::SecurityPlan plan = s.plan;   // the client wipes this copy; the Prepared's own is wiped by its destructor
+        const auto r = broker.client().securityDdlAndWait(std::move(plan), ddl, broker.ddlTimeout());
+        s.wipe();
+        broker.flushVerbose(err);
+        if (r.errorCode != 0) return fail(brokerFailure(r.errorCode, r.detail));
+        lastSecurityDdl = r.requestId;
+        out << "ok: " << s.plan.statement << " (object " << r.objectId << ", version " << r.newVersion << ")\n";
+        return true;
+    }
+
+    bool run(const PSecShow& s, const rc::DdlOptions&) {
+        if (!awaitLastSecurityDdl()) return false;
+        auto& c = broker.client();
+        switch (s.kind) {
+            case PSecShow::Kind::Users: {
+                const auto r = c.securityUsers(kCatalogWait);
+                if (!r) return fail(securityReadFailure(r.error()));
+                out << formatUsersTable(*r);
+                return true;
+            }
+            case PSecShow::Kind::Roles: {
+                const auto r = c.securityRoles(kCatalogWait);
+                if (!r) return fail(securityReadFailure(r.error()));
+                out << formatRolesTable(*r);
+                return true;
+            }
+            case PSecShow::Kind::Grants: {
+                const auto r = c.securityGrantsFor(s.who, s.name, s.at, kCatalogWait);
+                if (!r) return fail(securityReadFailure(r.error()));
+                out << formatGrantsTable(*r);
+                return true;
+            }
+            case PSecShow::Kind::History: {
+                const auto r = c.securityHistory(s.filter, kCatalogWait);
+                if (!r) return fail(securityReadFailure(r.error()));
+                out << formatSecurityHistoryTable(*r);
+                return true;
+            }
+        }
+        return false;
+    }
+
     bool run(const PDropView& s, const rc::DdlOptions& ddl) {
         const auto r = broker.client().dropViewAndWait(s.name, ddl, broker.ddlTimeout());
         broker.flushVerbose(err);

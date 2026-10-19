@@ -325,6 +325,8 @@ if(aeron_FOUND)
     # downstream targets (rune_client_producer, rune_client_subscriber,
     # rune_client_api, ...) compile against.
     target_link_libraries(rune_client_agent PUBLIC rune_crypto rune_client_scram OpenSSL::SSL OpenSSL::Crypto)
+    # Authentication (Task 8): Client.h's security DDL API names rune::ql::SecurityPlan / rune::security types.
+    target_link_libraries(rune_client_agent PUBLIC rune_ql rune_security)
     if(UNIX AND NOT APPLE)
         find_library(UUID_LIB uuid)
         if(UUID_LIB)
@@ -419,6 +421,8 @@ if(aeron_FOUND)
         src/shard/ShardConfig.cpp
         src/shard/ClientShard.cpp
         src/catalog/CatalogReader.cpp
+        src/security/SecurityDdl.cpp
+        src/security/SecurityReader.cpp
     )
     target_include_directories(rune_client_api PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -431,6 +435,8 @@ if(aeron_FOUND)
         rune_client_producer
         rune_client_agent
         rune_catalog
+        rune_security
+        rune_ql
         aeron::aeron
         spdlog::spdlog
     )
@@ -1472,6 +1478,18 @@ if(BUILD_TESTING)
         endif()
         gtest_discover_tests(rune_client_catalog_tests)
 
+        # Authentication (Task 8): the security DDL wire and the __security reader on the shared event-log stream.
+        add_executable(rune_client_security_tests
+            tests/security/SecurityDdlTest.cpp
+            tests/security/SecurityReaderTest.cpp
+        )
+        target_include_directories(rune_client_security_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})
+        target_link_libraries(rune_client_security_tests PRIVATE rune_client_api GTest::gtest_main)
+        if(UNIX AND NOT APPLE AND UUID_LIB_INVOKER)
+            target_link_libraries(rune_client_security_tests PRIVATE ${UUID_LIB_INVOKER})
+        endif()
+        gtest_discover_tests(rune_client_security_tests)
+
         # EOS-OOS / EOS-DUP follow-ups: idempotence end to end against the
         # InvokerGateway's broker idempotence model + fault injection (own
         # binary: public API + bare ProducerImpl only).
@@ -1550,13 +1568,14 @@ endif()
 add_library(rune_cli_lib STATIC
     src/cli/Cli.cpp
     src/cli/CatalogCommands.cpp
+    src/cli/SecurityCommands.cpp
 )
 target_include_directories(rune_cli_lib PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${RUNE_QL_ROOT}/include
     ${RUNE_CODEC_ROOT}/include
 )
-target_link_libraries(rune_cli_lib PUBLIC rune_ql rune_codec rune_catalog)
+target_link_libraries(rune_cli_lib PUBLIC rune_ql rune_codec rune_catalog rune_security rune_crypto)
 target_compile_features(rune_cli_lib PUBLIC cxx_std_23)
 
 # Enable the live broker path when Aeron is available.
@@ -1603,6 +1622,34 @@ if(BUILD_TESTING)
     target_link_libraries(rune_cli_catalog_tests PRIVATE rune_cli_lib rune_catalog GTest::gtest_main)
     target_compile_features(rune_cli_catalog_tests PRIVATE cxx_std_23)
     gtest_discover_tests(rune_cli_catalog_tests)
+endif()
+
+# ── Authentication Task 8: `rune security` / `rune ql` security statements, OFFLINE ───────────────────────
+if(BUILD_TESTING)
+    add_executable(rune_cli_security_tests
+        tests/RuneCliSecurityTest.cpp
+    )
+    target_include_directories(rune_cli_security_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})
+    target_link_libraries(rune_cli_security_tests PRIVATE rune_cli_lib rune_security GTest::gtest_main)
+    target_compile_features(rune_cli_security_tests PRIVATE cxx_std_23)
+    gtest_discover_tests(rune_cli_security_tests)
+endif()
+
+# ── Authentication Task 8: the CLI against the SCRAM-speaking InvokerGateway (login flags, banner, ql, bootstrap) ──
+if(BUILD_TESTING AND aeron_FOUND)
+    add_executable(rune_cli_security_live_tests
+        tests/RuneCliSecurityLiveTest.cpp
+    )
+    target_include_directories(rune_cli_security_live_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${RUNE_CODEC_ROOT}/include ${RUNE_QL_ROOT}/include)
+    target_link_libraries(rune_cli_security_live_tests PRIVATE rune_cli_lib rune_client_api GTest::gtest_main)
+    target_compile_features(rune_cli_security_live_tests PRIVATE cxx_std_23)
+    if(UNIX AND NOT APPLE)
+        find_library(UUID_LIB_SECLIVE uuid)
+        if(UUID_LIB_SECLIVE)
+            target_link_libraries(rune_cli_security_live_tests PRIVATE ${UUID_LIB_SECLIVE})
+        endif()
+    endif()
+    gtest_discover_tests(rune_cli_security_live_tests)
 endif()
 
 # ── Task 9: rune CLI live tests (schema apply/get/list via loopback Aeron) ─────

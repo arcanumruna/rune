@@ -63,6 +63,8 @@
 #include <rune/client/DutyView.h>
 #include <rune/client/shard/ShardState.h>
 #include <rune/client/catalog/CatalogReader.h>
+#include <rune/client/security/SecurityDdl.h>
+#include <rune/client/security/SecurityReader.h>
 #include <rune/catalog/CatalogQueries.h>
 #include <rune/protocol/CatalogTypes.h>
 #include <rune/protocol/client/SchemaMessages.h>
@@ -964,6 +966,37 @@ public:
     /// Any other thread: std::logic_error (every runner mode).
     CatalogReader& catalogReader();
 
+    // ---- Authentication (Task 8): security DDL and reads of `__security` ----------------------------------
+    /// Every security DDL.  The VERIFIER is built here from the plan's password (D9: at least
+    /// ClientConfig::minPasswordLength bytes, else std::invalid_argument "password must be at least N characters" —
+    /// nothing is sent; iterations = ClientConfig::scramIterations), and only the plan's REDACTED statement is sent
+    /// (D10; DdlOptions::statement is ignored).  Redirect to the `__security` leader and NotLeader retries behave
+    /// exactly like catalog DDL (same budget, the same request id on every resend).  The plan (by value) holds the
+    /// plaintext password: it is wiped after the frame is built.
+    OpResult securityDdl(rune::ql::SecurityPlan plan, const DdlOptions& ddl, CompletionTarget target, Token token);
+    SecurityDdlResult securityDdlAndWait(rune::ql::SecurityPlan plan, const DdlOptions& ddl,
+                                         std::chrono::milliseconds timeout);
+    /// D4: the one-time bootstrap of a fresh cluster — `adminName` + a one-time password + the CLUSTER KEY FILE's
+    /// bytes (the MAC under the key proves possession; the library never prints the password).
+    OpResult bootstrapSecurity(std::string_view adminName, std::string_view oneTimePassword,
+                               std::span<const uint8_t> clusterKeyFileContents, CompletionTarget target, Token token);
+    SecurityDdlResult bootstrapSecurityAndWait(std::string_view adminName, std::string_view oneTimePassword,
+                                               std::span<const uint8_t> clusterKeyFileContents,
+                                               std::chrono::milliseconds timeout);
+
+    // Reads of `__security` (ADMIN CLUSTER only — any other principal gets Kind::Rejected, brokerErrorCode 45):
+    // the catalog reads' contract (owner thread only, a cached verified prefix + history epoch, Timeout / Replay /
+    // Closed / Rejected errors), on the shared EventLogStream.
+    template <class T> using SecurityResult = std::expected<T, CatalogReadError>;
+    SecurityResult<std::vector<rune::security::RecordedEvent>> securityHistory(const rune::security::HistoryFilter& filter,
+                                                                                std::chrono::milliseconds timeout);
+    SecurityResult<rune::security::GrantsView> securityGrantsFor(rune::security::GranteeKind kind, std::string_view name,
+                                                                  std::optional<rune::security::AsOf> at,
+                                                                  std::chrono::milliseconds timeout);
+    SecurityResult<std::vector<rune::security::UserRow>> securityUsers(std::chrono::milliseconds timeout);
+    SecurityResult<std::vector<rune::security::RoleRow>> securityRoles(std::chrono::milliseconds timeout);
+    SecurityReader& securityReader();
+
     /// Topics successfully defined through this Client (Task 9 CLI), in
     /// definition order.  Duty-owned registry, read through a ListTopics op.
     [[nodiscard]] std::vector<std::pair<std::string, int32_t>>
@@ -1143,7 +1176,7 @@ private:
     // -------------------------------------------------------------------------
 
     friend class Completions;
-    friend class CatalogReader;   // refresh(): the runner mode, doWork(), checkBlockingCaller_
+    template <class P> friend class detail::EventLogStream;   // refresh(): the runner mode, doWork(), checkBlockingCaller_
 
     /// A completion's destination as the duty thread holds it (shared with
     /// the group / txn libraries since F8c C4).
@@ -1187,7 +1220,7 @@ private:
     [[nodiscard]] static constexpr bool isDdlOp(OpKind op) noexcept {
         return op == OpKind::DefineTopic || op == OpKind::AlterTopic || op == OpKind::CreateView ||
                op == OpKind::DropTopic || op == OpKind::DropView || op == OpKind::AlterView ||
-               op == OpKind::AlterTopicConfig;
+               op == OpKind::AlterTopicConfig || op == OpKind::SecurityDdl || op == OpKind::SecurityBootstrap;
     }
     /// Task 22 fix round 1 (C1): the ops answered by a Redirect / NotLeader and so
     /// re-sent on the named node's session within the retry budget: the DDLs and
@@ -1991,6 +2024,7 @@ private:
     // (never touched by the duty thread — its callbacks only write the reader's
     // own ring).  Declared late: destroyed early, after ~Client's close.
     const std::unique_ptr<CatalogReader> catalogReader_;
+    const std::unique_ptr<SecurityReader> securityReader_;   // authentication Task 8 (same owner-thread rule)
     uint32_t testSkewDdlRequestIdAt_ = 0;   // F4 test seam: issuing thread only (testSkewNextDdlRequestIdAt)
 
     // Task 1.3: produce routing moved to the agent's flush→sendFn boundary

@@ -43,6 +43,9 @@ enum class OpKind : uint8_t {
     DropView,          ///< Client::dropView() / dropViewAndWait()
     AlterView,         ///< Client::alterView() / alterViewAndWait()
     AlterTopicConfig,  ///< Client::alterTopicConfig() / alterTopicConfigAndWait()
+    // Authentication (Task 8): security DDL (wire 79) and the one-time bootstrap (wire 80), answered by DdlResponse 78.
+    SecurityDdl,        ///< Client::securityDdl() / securityDdlAndWait()
+    SecurityBootstrap,  ///< Client::bootstrapSecurity() / bootstrapSecurityAndWait()
 };
 
 enum class OpStatus : uint8_t {
