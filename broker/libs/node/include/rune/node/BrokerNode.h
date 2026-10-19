@@ -1477,7 +1477,8 @@ public:
     [[nodiscard]] rune::replication::PartitionReplica* securityReplicaForTest() const noexcept {
         return securityReplica_.get();
     }
-    /// Test-only: the `__security` Log - ONLY while the admin thread is quiesced (before start(), after stop()).
+    /// Test-only: the `__security` Log - while the admin thread is quiesced (before start(), after stop()) or inside
+    /// onAdminThreadForTest.
     [[nodiscard]] rune::storage::Log* securityLogForTest() const noexcept { return securityLog_.get(); }
     /// What the CONTROL thread's SecurityView holds (read ON the control thread).
     struct SecurityViewSnap { bool present = false; int64_t appliedOffset = -1; uint64_t digest = 0; bool halted = false; bool hasSecurityAdmin = false; };
@@ -1511,11 +1512,19 @@ public:
             -1, w, [this, w, fn = std::forward<F>(f)]() mutable { return fn(workerPool_->worker(w)); }, timeout);
     }
     /// Authentication Task 10: the gateway's session table / auth-gate counters (read ON the control thread).
-    /// Task 18: the D24 answer gate's state (read ON the control thread).
-    struct SecurityGateSnap { std::size_t held = 0; int64_t applied = -1, refreshed = -1, gatewayEnforced = -1, pendingEnforce = -1; std::size_t shipperPending = 0; };
-    [[nodiscard]] SecurityGateSnap securityGateForTest();
     [[nodiscard]] bool gatewayHasSessionForTest(int64_t sessionId);
     [[nodiscard]] uint64_t authGateRefusalsForTest();
+    // ── Authentication Task 18 test hooks (each a snapshot taken ON the owning thread) ──
+    /// The D24 answer gate's state (read ON the control thread).
+    struct SecurityGateSnap { std::size_t held = 0; int64_t applied = -1, refreshed = -1, gatewayEnforced = -1, pendingEnforce = -1; std::size_t shipperPending = 0; };
+    [[nodiscard]] SecurityGateSnap securityGateForTest();
+    /// The offset the CONTROL thread's SecurityView has applied (-1: no view) - bounds each change's enforcement window.
+    [[nodiscard]] int64_t securityAppliedOffsetOnControlForTest();
+    /// The shipped permission epoch worker `w` holds for `sessionId` (0: none), read ON that worker's thread.
+    [[nodiscard]] uint64_t workerPermissionEpochForTest(int32_t w, int64_t sessionId);
+    /// Shard-produce frames worker `w` admitted and has not yet answered (read ON that worker's thread): 0 once every
+    /// received frame was answered (the broker-side answered == received).
+    [[nodiscard]] std::size_t workerDirectAcksInFlightForTest(int32_t w);
     /// Counter values the control thread publishes (read ON the control thread).
     struct SecurityMetricsSnap { int64_t halted = 0; int64_t applied = -1; int64_t authMode = 0; };
     [[nodiscard]] SecurityMetricsSnap securityMetricsForTest();

@@ -768,6 +768,12 @@ public:
     [[nodiscard]] std::size_t sessionCryptoCountForTest() const noexcept { return sessionCrypto_.size(); }
     [[nodiscard]] uint64_t workerNotAuthorizedForTest() const noexcept { return workerNotAuthorized_; }
     [[nodiscard]] uint64_t sessionPermissionChunksSeenForTest() const noexcept { return sessionPermissionChunksSeen_; }
+    /// Test-only (auth Task 18): the shipped permission epoch this worker holds for `sid` (0 = no slot / not enforcing).
+    [[nodiscard]] uint64_t permissionEpochForTest(int64_t sid) const noexcept {
+        if (const auto* enf = std::get_if<Enforcing>(&enforcement_); enf != nullptr && enf->sink != nullptr)
+            if (const WriteGrantSlot* g = enf->sink->writeGrants(sid)) return g->epoch;
+        return 0;
+    }
     [[nodiscard]] uint64_t intakeGrantHoldsForTest() const noexcept { return intakeGrantHolds_; }
     [[nodiscard]] const SessionAckSink* ackSinkForTest() const noexcept { return ackSink_.get(); }
     [[nodiscard]] std::size_t sessionCryptoEntriesForTest() const noexcept { return sessionCrypto_.size(); }

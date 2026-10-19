@@ -121,7 +121,7 @@ if(BUILD_TESTING)
         GTest::gtest_main)
 
     include(GoogleTest)
-    gtest_discover_tests(rune_partition_assignment_tests)
+    gtest_discover_tests(rune_partition_assignment_tests PROPERTIES TIMEOUT 60)
     gtest_discover_tests(rune_metadata_state_machine_tests)
     gtest_discover_tests(rune_static_balancer_tests)
     gtest_discover_tests(rune_routing_image_tests)

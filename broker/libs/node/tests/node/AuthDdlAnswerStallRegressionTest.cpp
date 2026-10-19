@@ -1,6 +1,11 @@
-// AuthDdlAnswerStallRegressionTest.cpp - authentication Task 18: the seeded stress (seed 0) found the security DDL answer
-// pipeline stalling for good (the D24 answer gate never released a held OK and every later OK queued behind it).  These are
-// the minimal deterministic reproductions.
+// AuthDdlAnswerStallRegressionTest.cpp - authentication Task 18: the seeded stress (seed 0) found two broker bugs.
+//  1. The security DDL answers stalled for good: the control thread spun in AssignmentMap::get (tombstone exhaustion after
+//     topic create/drop churn); its regression lives in libs/metadata/tests/PartitionAssignmentTest.cpp
+//     (AssignmentMapRegression).  The first two tests here are the end-to-end shape of the racing DDLs that exposed it.
+//  2. A revoke-ended subscription whose Subscribe still waited for its session's record-egress pub became a zombie worker
+//     cursor (it pushed after the revoke, and again after a re-grant).  The deterministic gateway-level regression is
+//     RecordEgressLifetimeRegression.UnsubscribeCancelsASubscribeStillAwaitingItsEgressPub; the tests below are its
+//     end-to-end shape.
 #include "support/AuthRig.h"
 
 using namespace rune::node;
@@ -140,6 +145,7 @@ void subscribeRacingRevokeStaysEnded(bool shard, const char* tag) {
     auto& adm = rig.broker().admin();
     const int64_t ws = rig.newUser({exact(SO::Write, ST::Topic, "orders")});
     ASSERT_EQ(rig.produce(ws, rig.orders, true), 0);
+    int subscribedRounds = 0;
     for (int round = 0; round < 15; ++round) {
         std::string reader;
         const int64_t rs = rig.newUser({exact(SO::Read, ST::Topic, "orders")}, &reader);
@@ -158,9 +164,11 @@ void subscribeRacingRevokeStaysEnded(bool shard, const char* tag) {
         ASSERT_EQ(adm.grant(rig.ch(), rig.broker().adminSession(), reader, false, SO::Read, ST::Topic, SP::Exact, "orders").errorCode, 0);
         for (int i = 0; i < 3; ++i) ASSERT_EQ(rig.produce(ws, rig.orders), 0);
         c.pollFor(400ms, [] { return false; });
+        if (*code == 0) ++subscribedRounds;
         EXPECT_EQ(pushes(), atEnd) << "round " << round << ": subscribe answered " << *code << ", the sub (id " << subId
                                    << ") delivered after the revoke ended it and a re-grant";
     }
+    EXPECT_GT(subscribedRounds, 0) << "at least one round took the path under test (Subscribe OK, then revoked)";
 }
 }  // namespace
 

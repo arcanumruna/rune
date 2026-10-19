@@ -4221,8 +4221,25 @@ rune::node::WorkerOp ClientGateway::buildSubscribeOp_(const BufferedSubscribe& s
     return op;
 }
 
+void ClientGateway::parkAwaitingEgress_(const BufferedSubscribe& s)
+{
+    const int32_t wid = workerPool_ ? workerPool_->ownerWorkerId(s.topicId, s.partition) : 0;
+    pendingRecordEgress_[{s.sessionId, wid}].waiters.push_back(s);
+    if (const auto it = subscriptions_.find(s.subId); it != subscriptions_.end()) it->second.cursor = Cursor::AwaitingEgress;
+}
+
+void ClientGateway::releaseAwaiting_(const BufferedSubscribe& s, void* egressPub)
+{
+    // The subscription may have ended while its Subscribe waited (a state AwaitingEgress is cancelled by the unsubscribe,
+    // so this is the defensive half): nothing goes to the worker for a subscription the gateway no longer holds.
+    const auto it = subscriptions_.find(s.subId);
+    if (it == subscriptions_.end() || it->second.cursor != Cursor::AwaitingEgress) return;
+    enqueueSubscribeOp_(s, egressPub);
+}
+
 void ClientGateway::enqueueSubscribeOp_(const BufferedSubscribe& s, void* egressPub)
 {
+    if (const auto it = subscriptions_.find(s.subId); it != subscriptions_.end()) it->second.cursor = Cursor::AtWorker;
     rune::node::WorkerOp op = buildSubscribeOp_(s, egressPub);
 
     // M5: never dropped — a refused Subscribe (or one behind a queued lifecycle
@@ -4342,6 +4359,7 @@ void ClientGateway::forwardSubscribeToWorker_(int64_t subId, int64_t sessionId,
         }
     }
     pend.waiters.push_back(s);
+    if (const auto it = subscriptions_.find(subId); it != subscriptions_.end()) it->second.cursor = Cursor::AwaitingEgress;
 }
 
 // pollPendingRecordEgress_ — resolve in-flight per-session record-egress pubs
@@ -4382,7 +4400,7 @@ void ClientGateway::pollPendingRecordEgress_(int64_t nowNs)
             spdlog::warn("ClientGateway: record-egress pub for session {} worker {} did not "
                          "resolve ({} waiters) — falling back to MDC",
                          sessionId, workerId, pend.waiters.size());
-            for (const auto& w : pend.waiters) enqueueSubscribeOp_(w, nullptr);
+            for (const auto& w : pend.waiters) releaseAwaiting_(w, nullptr);
             it = pendingRecordEgress_.erase(it);
             continue;
         }
@@ -4396,7 +4414,7 @@ void ClientGateway::onRecordEgressResolved_(int64_t sessionId, int32_t workerId,
     if (rune::gateway::Session* sess = sessions_.find(sessionId)) {
         auto& slot = sess->recordEgressByWorker[workerId];
         if (!slot) slot = std::move(pub);   // else: the extra resolve dies here, never handed out
-        for (const auto& w : pend.waiters) enqueueSubscribeOp_(w, slot.get());
+        for (const auto& w : pend.waiters) releaseAwaiting_(w, slot.get());
     }
     // else: the session closed meanwhile — its buffered subscribes are moot and
     // the pub (never handed to a worker) is released with `pub`.
@@ -4404,16 +4422,18 @@ void ClientGateway::onRecordEgressResolved_(int64_t sessionId, int32_t workerId,
 
 void ClientGateway::forwardUnsubscribeToWorker_(int64_t subId, int32_t topicId, int32_t partition)
 {
-    // Task 18 (seeded stress): a Subscribe still WAITING for its session's record-egress pub (pendingRecordEgress_) has not
-    // reached the worker, so there is nothing there to unsubscribe - and left in the waiter list it would be enqueued
-    // later, a zombie cursor the gateway no longer knows (it kept pushing after a revoke ended the subscription, and
-    // resumed on a re-grant).  Cancel it where it waits.
-    for (auto& [key, pend] : pendingRecordEgress_) {
-        for (std::size_t i = 0; i < pend.waiters.size(); ++i) {
-            if (pend.waiters[i].subId != subId) continue;
-            pend.waiters.erase(pend.waiters.begin() + static_cast<std::ptrdiff_t>(i));
-            return;
+    // Task 18 (seeded stress): a subscription in state AwaitingEgress has not reached the worker (its Subscribe waits in
+    // pendingRecordEgress_ for the session's pub), so there is nothing there to unsubscribe - and left waiting it would be
+    // enqueued later, a zombie cursor the gateway no longer knows (it kept pushing after a revoke ended the subscription,
+    // and resumed on a re-grant).  Cancel the waiter the state names.
+    if (const auto sit = subscriptions_.find(subId); sit != subscriptions_.end() && sit->second.cursor == Cursor::AwaitingEgress) {
+        const int32_t wid = workerPool_->ownerWorkerId(sit->second.topicId, sit->second.partition);
+        if (const auto pit = pendingRecordEgress_.find({sit->second.sessionId, wid}); pit != pendingRecordEgress_.end()) {
+            auto& ws = pit->second.waiters;
+            ws.erase(std::remove_if(ws.begin(), ws.end(), [subId](const BufferedSubscribe& w) { return w.subId == subId; }), ws.end());
         }
+        sit->second.cursor = Cursor::GatewayPushed;
+        return;
     }
     // M5: never dropped on a full ring — queued (behind any queued Subscribe of
     // the same worker, so the pair keeps its order) and retried every doWork.

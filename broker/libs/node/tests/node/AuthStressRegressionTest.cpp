@@ -6,7 +6,7 @@
 // Invariants: (1) no OK without the model allowing it at SOME instant of [request sent, answer seen] - the changes are
 // applied in log order, so the instants are the prefix states [answered-before-send, sent-before-answer]; (2) every
 // change that (per the model) takes READ from a live subscription ends it with NotAuthorized / SessionRevoked within
-// 1 s of the change's answer, with no Records after; (3) every request is answered within 5 s; (4) convergence: with all
+// 1 s of the change's answer (also when the revoke RACED the Subscribe), with no Record at or above the log end seen at the end; (3) every request is answered within 5 s; (4) convergence: with all
 // changes answered, a probe of every session x topic answers exactly what the model says.
 // RUNE_AUTH_STRESS_SEEDS / RUNE_AUTH_STRESS_STEPS override the 64 seeds x 300 steps.  A failure prints the seed and the
 // step list.
@@ -87,6 +87,31 @@ int envInt(const char* name, int dflt) {
     return v && *v ? std::atoi(v) : dflt;
 }
 
+/// What the invariants actually checked (non-vacuity, review I6): asserted to be nonzero over a full run.
+struct Tally {
+    uint64_t shardOk = 0, routedOk = 0, subOk = 0, createOk = 0;          // successes checked by invariant 1
+    uint64_t mustEndMet = 0, mustEndRacing = 0;                           // invariant 2: ends required and met in 1 s (racing: the revoke raced the Subscribe)
+    uint64_t recordsChecked = 0, endedSubsChecked = 0;                    // "no Records after the end"
+    uint64_t probes = 0, shardDeniedProbes = 0, routedDeniedProbes = 0, shardOkProbes = 0, routedOkProbes = 0;
+    uint64_t sessionsProbed = 0, disabledLoginsRefused = 0, epochsChecked = 0;
+    void add(const Tally& o) {
+        shardOk += o.shardOk; routedOk += o.routedOk; subOk += o.subOk; createOk += o.createOk; mustEndMet += o.mustEndMet;
+        mustEndRacing += o.mustEndRacing; recordsChecked += o.recordsChecked; endedSubsChecked += o.endedSubsChecked;
+        probes += o.probes; shardDeniedProbes += o.shardDeniedProbes; routedDeniedProbes += o.routedDeniedProbes;
+        shardOkProbes += o.shardOkProbes; routedOkProbes += o.routedOkProbes; sessionsProbed += o.sessionsProbed;
+        disabledLoginsRefused += o.disabledLoginsRefused; epochsChecked += o.epochsChecked;
+    }
+    [[nodiscard]] std::string str() const {
+        std::ostringstream o;
+        o << "shardOk=" << shardOk << " routedOk=" << routedOk << " subOk=" << subOk << " createOk=" << createOk
+          << " mustEndMet=" << mustEndMet << " (racing " << mustEndRacing << ") endedSubs=" << endedSubsChecked
+          << " records=" << recordsChecked << " probes=" << probes << " (shard denied " << shardDeniedProbes << ", routed denied "
+          << routedDeniedProbes << ", shard ok " << shardOkProbes << ", routed ok " << routedOkProbes << ") sessions=" << sessionsProbed
+          << " disabledLoginsRefused=" << disabledLoginsRefused << " epochs=" << epochsChecked;
+        return o.str();
+    }
+};
+
 struct Sess {
     int         user = 0;
     ShardTestClient* c = nullptr;
@@ -102,12 +127,11 @@ struct Sub {
     int32_t     topicId = 0;
     int64_t     corr = 0, subId = 0;
     std::size_t estSent = 0;     // changes sent when the SubscribeResponse OK was seen
-    Clock::time_point deadline;  // MustEnd: the error is due
-    std::size_t recordsAtEnd = 0;
+    Clock::time_point deadline;  // MustEnd: the error is due (1 s after the answer of the change that took READ)
+    Clock::time_point liveAt;    // when its SubscribeResponse OK was seen
+    bool        racing = false;  // MustEnd found by the revoke-raced-the-Subscribe rule
     int         endCode = 0;
-    std::size_t endStep = 0, lateStep = 0;
-    Clock::time_point endAt;
-    bool settled = false;
+    int64_t     bound = 0;       // the partition's log end when the end was seen: a Record at or above it is a violation
     std::size_t sentSteps = 0;
     std::size_t lo_ = 0;
     Clock::time_point sentAt_;
@@ -125,12 +149,12 @@ struct Req {
     std::size_t step = 0;
 };
 
-struct Pending { std::size_t idx; int64_t corr; pm::Change c; std::size_t lo; bool answered = false; int code = 0; };
+struct Pending { std::size_t idx; int64_t corr; pm::Change c; std::size_t lo; bool answered = false; int code = 0; Clock::time_point answeredAt; };
 
 class Seed {
 public:
-    Seed(AuthRig& rig, std::vector<ShardTestClient*> /*unused*/, std::vector<AuthWireClient*> uw, int seed, int steps)
-        : rig_(rig), uw_(std::move(uw)), seed_(seed), steps_(steps), rng_(static_cast<uint64_t>(seed) * 0x9E3779B97F4A7C15ull + 1) {}
+    Seed(AuthRig& rig, std::vector<AuthWireClient*> uw, int seed, int steps, Tally& tally)
+        : rig_(rig), uw_(std::move(uw)), seed_(seed), steps_(steps), tally_(tally), rng_(static_cast<uint64_t>(seed) * 0x9E3779B97F4A7C15ull + 1) {}
 
     std::string run() {
         setup_();
@@ -145,7 +169,8 @@ public:
         teardown_();
         if (fail_.empty()) return {};
         std::ostringstream o;
-        o << "AUTH STRESS FAILURE seed=" << seed_ << ": " << fail_ << "\nsteps (" << log_.size() << "):\n";
+        o << "AUTH STRESS FAILURE seed=" << seed_ << ": " << fail_ << "\nreplay: RUNE_AUTH_STRESS_FIRST_SEED=" << seed_
+          << " RUNE_AUTH_STRESS_SEEDS=1 rune_auth_stress_tests --gtest_filter='AuthStress*'\nsteps (" << log_.size() << "):\n";
         for (const std::string& l : log_) o << "  " << l << "\n";
         return o.str();
     }
@@ -175,24 +200,34 @@ private:
         states_.push_back(model_);
         for (const std::string& t : topicNames_()) exists_[t] = -1;
         for (const std::string& t : {topicNames_()[0], topicNames_()[1], topicNames_()[3], topicNames_()[5]}) builderCreate_(t);
-        for (int u = 0; u < 2; ++u) for (int k = 0; k < 3; ++k) { sess_.push_back({u, &uw_[static_cast<std::size_t>(u)]->raw(), uw_[static_cast<std::size_t>(u)], 0, false}); login_(sess_.size() - 1); }
-        for (std::size_t i = 0; i < sess_.size(); ++i) scanFrom_[sess_[i].c] = scanFrom_.count(sess_[i].c) ? scanFrom_[sess_[i].c] : sess_[i].c->errors().size();
-        for (auto* c : clients_()) recBase_[c] = c->records().size();
+        // 2 users x 3 sessions, one wire client (own Aeron driver, own egress image) per session
+        for (std::size_t i = 0; i < uw_.size(); ++i) { sess_.push_back({static_cast<int>(i / 3), &uw_[i]->raw(), uw_[i], 0, false}); login_(i); }
     }
-    std::vector<ShardTestClient*> clients_() { return {&rig_.c(), &uw_[0]->raw(), &uw_[1]->raw(), &rig_.broker().admin().raw()}; }
+    std::vector<ShardTestClient*> clients_() {
+        std::vector<ShardTestClient*> v{&rig_.c(), &rig_.broker().admin().raw()};
+        for (AuthWireClient* w : uw_) v.push_back(&w->raw());
+        return v;
+    }
     void login_(std::size_t i) {
         Sess& s = sess_[i];
-        s.sid = s.w->connect(rig_.ch());
-        if (s.sid <= 0) { failWith_("connect"); return; }
-        if (!s.w->login(rig_.ch(), s.sid, user_(s.user), {AuthRig::kPw, AuthRig::kPw}).ok()) { failWith_("login " + user_(s.user)); return; }
-        s.alive = true;
+        // a login the per-source throttle refuses (retry_after hint, spec §5: a refused disabled-user attempt arms it for
+        // this host) is retried like the real client does - bounded
+        std::string lastLogin;
+        for (int attempt = 0; attempt < 30; ++attempt) {
+            s.sid = s.w->connect(rig_.ch());
+            if (s.sid <= 0) { failWith_("connect"); return; }
+            const auto l = s.w->login(rig_.ch(), s.sid, user_(s.user), {AuthRig::kPw, AuthRig::kPw});
+            if (l.ok()) { s.alive = true; return; }
+            lastLogin = std::string("answered=") + (l.answered() ? "yes" : "no") + " code=" + std::to_string(l.errorCode()) + " first=" + (l.first ? "yes" : "no");
+            std::this_thread::sleep_for(200ms);
+        }
+        failWith_("login " + user_(s.user) + " kept failing (" + lastLogin + ")");
     }
     void builderCreate_(const std::string& name) {
         const int32_t id = rig_.defineTopic(rig_.builder, name);
         if (id < 0) { failWith_("builder create " + name); return; }
         exists_[name] = id;
         rig_.awaitListed(id);
-        // the worker learns the topic a moment later: warm the shard path so the produce answers are not all transient
     }
     void teardown_() {
         for (Sess& s : sess_) if (s.alive) { s.c->disconnect(rig_.ch(), AuthRig::stream(), s.sid); s.alive = false; }
@@ -223,10 +258,12 @@ private:
             auto& adm = rig_.broker().admin().raw();
             const auto a = adm.awaitAnyDdlAnswer(c.corr, Clock::now() + 1ms);
             if (!a) { if (now - sentAt_[c.idx] > 5s) { std::string un; for (const Pending& q : changes_) if (!q.answered) un += " #" + std::to_string(q.idx) + "(" + q.c.str() + ")"; failWith_("unanswered security DDL #" + std::to_string(c.idx) + ": " + c.c.str() + "; all unanswered:" + un + "; gate{" + gateStr_() + "}; answered changes: " + std::to_string(std::count_if(changes_.begin(), changes_.end(), [](const Pending& q) { return q.answered; })) + "/" + std::to_string(changes_.size())); } continue; }
-            c.code = a->responseTemplate == static_cast<uint16_t>(pc::TemplateId::DdlResponse)
-                         ? (adm.awaitDdl(c.corr, Clock::now() + 1s) ? adm.awaitDdl(c.corr, Clock::now() + 1s)->errorCode : 0xFFFF)
-                         : a->code;
+            if (a->responseTemplate == static_cast<uint16_t>(pc::TemplateId::DdlResponse)) {
+                const auto d = adm.awaitDdl(c.corr, Clock::now() + 1s);
+                c.code = d ? d->errorCode : 0xFFFF;
+            } else c.code = a->code;
             c.answered = true;
+            c.answeredAt = now;
             const bool expectRefusal = refusal_[c.idx] != pm::Refusal::None;
             if ((c.code != 0) != expectRefusal)
                 failWith_("DDL '" + c.c.str() + "' answered code " + std::to_string(c.code) + " but the model predicts " + (expectRefusal ? "a refusal" : "OK"));
@@ -234,10 +271,14 @@ private:
             for (Sub& s : subs_) {
                 if (s.st != Sub::St::Live || s.estSent > c.idx) continue;
                 if (!states_[c.idx + 1].allowed(user_(sess_[static_cast<std::size_t>(s.sess)].user), pm::Op::Read, s.topic)) {
-                    s.st = Sub::St::MustEnd; s.deadline = now + 1s;
+                    s.st = Sub::St::MustEnd; s.deadline = now + 1s; s.racing = false;
                 }
             }
         }
+        // the contiguous answered prefix: changes are applied in log order, so once changes 0..k-1 are ALL answered the
+        // broker has applied at least states_[k]
+        std::size_t contig = 0;
+        while (contig < changes_.size() && changes_[contig].answered) ++contig;
         // requests
         for (std::size_t i = 0; i < reqs_.size();) {
             Req& r = reqs_[i];
@@ -245,7 +286,10 @@ private:
             int code = kNoAnswer;
             bool got = false;
             if (r.kind == Req::Kind::Produce) {
-                if (const auto a = s.c->ackFor(r.corr)) { code = a->errorCode; got = true; }
+                if (const auto a = s.c->ackFor(r.corr)) {
+                    code = a->errorCode; got = true;
+                    if (code == 0) maxAcked_[r.topicId] = std::max<int64_t>(maxAcked_.count(r.topicId) ? maxAcked_[r.topicId] : -1, a->baseOffset);
+                }
             } else if (const auto a = s.c->awaitDefine(r.corr, Clock::now() + 1ms)) { code = a->errorCode; got = true; if (code == 0) exists_[r.topic] = a->topicId; }
             if (!got && revokedFrame_(s)) { got = true; code = 46; if (r.kind == Req::Kind::Create) unknown_.insert(r.topic); }   // the create may or may not have happened   // "SessionRevoked on every in-flight request" (spec §10)
             if (!got) {
@@ -255,6 +299,10 @@ private:
             if (code == 0 && !allowedSomewhere_(r.lo, hi, s.user, r.kind == Req::Kind::Produce ? pm::Op::Write : pm::Op::Create, r.topic))
                 failWith_(std::string("UNAUTHORIZED SUCCESS: ") + (r.kind == Req::Kind::Produce ? "produce" : "create") + " on " + r.topic + " by " +
                       user_(s.user) + " sent at step " + std::to_string(r.step) + ", states [" + std::to_string(r.lo) + "," + std::to_string(hi) + "] never allow it");
+            if (code == 0) {
+                if (r.kind == Req::Kind::Create) ++tally_.createOk;
+                else ++(r.routed ? tally_.routedOk : tally_.shardOk);
+            }
             reqs_.erase(reqs_.begin() + static_cast<std::ptrdiff_t>(i));
         }
         // subscribes + subscription ends
@@ -266,13 +314,21 @@ private:
                         if (!allowedSomewhere_(s.lo_, hi, se.user, pm::Op::Read, s.topic))
                             failWith_("UNAUTHORIZED SUCCESS: subscribe on " + s.topic + " by " + user_(se.user) + " sent at step " + std::to_string(s.sentSteps) + " never allowed in states [" + std::to_string(s.lo_) + "," + std::to_string(hi) + "]");
                         s.subId = se.c->subscriptionIdOf(s.corr).value_or(0);
-                        s.st = Sub::St::Live; s.estSent = hi;
+                        s.st = Sub::St::Live; s.estSent = hi; s.liveAt = now;
+                        ++tally_.subOk;
                     } else s.st = Sub::St::Ended;
-                } else if (revokedFrame_(se)) s.st = Sub::St::Ended;
+                } else if (revokedFrame_(se)) { s.st = Sub::St::Ended; s.endCode = 46; s.bound = logEndBound_(s); }
                 else if (now - s.sentAt_ > 5s) failWith_("unanswered subscribe (step " + std::to_string(s.sentSteps) + ")");
             }
-            if (s.st == Sub::St::Ended && s.endCode != 0 && !s.settled && now > s.endAt + 400ms) { s.recordsAtEnd = pushes_(se, s.subId); s.settled = true; }   // records already in flight at the end may still land
-            if (s.st == Sub::St::Ended && s.endCode != 0 && s.subId != 0 && s.settled && s.lateStep == 0 && pushes_(se, s.subId) != s.recordsAtEnd) s.lateStep = step_ + 1;
+            // invariant 2, the revoke that RACED the Subscribe: it was authorised at some applied prefix <= estSent; once the
+            // changes 0..estSent-1 are all answered the broker has applied at least states_[estSent], and if that denies READ
+            // some change after the authorisation took it from this live subscription - it must end within 1 s
+            if (s.st == Sub::St::Live && s.estSent <= contig &&
+                !states_[s.estSent].allowed(user_(se.user), pm::Op::Read, s.topic)) {
+                Clock::time_point last = s.liveAt;
+                for (std::size_t k = 0; k < s.estSent; ++k) last = std::max(last, changes_[k].answeredAt);
+                s.st = Sub::St::MustEnd; s.deadline = last + 1s; s.racing = true;
+            }
             if (s.st == Sub::St::Live || s.st == Sub::St::MustEnd) {
                 const auto& errs = se.c->errors();
                 for (std::size_t e = 0; e < errs.size(); ++e) {
@@ -280,10 +336,11 @@ private:
                     s.endCode = errs[e].code;
                     if (s.st == Sub::St::MustEnd && s.endCode != 45 && s.endCode != 46)
                         failWith_("subscription on " + s.topic + " ended with code " + std::to_string(s.endCode) + ", expected 45/46");
-                    s.st = Sub::St::Ended; s.recordsAtEnd = pushes_(se, s.subId); s.endStep = step_; s.endAt = now;
+                    if (s.st == Sub::St::MustEnd) { ++tally_.mustEndMet; tally_.mustEndRacing += s.racing ? 1 : 0; }
+                    s.st = Sub::St::Ended; s.bound = logEndBound_(s);
                     break;
                 }
-                if (s.st == Sub::St::MustEnd && now > s.deadline + 500ms)
+                if (s.st == Sub::St::MustEnd && now > s.deadline)
                     failWith_("REVOKE DID NOT END the subscription on " + s.topic + " of " + user_(se.user) + " (1 s after the change's answer)");
             }
         }
@@ -294,10 +351,13 @@ private:
                " gwEnforced=" + std::to_string(g.gatewayEnforced) + " pendingEnforce=" + std::to_string(g.pendingEnforce) +
                " shipperPending=" + std::to_string(g.shipperPending);
     }
-    static std::string offsetsOf_(Sess& s, int64_t subId) {
-        std::string o;
-        for (const auto& p : s.c->records()) if (p.subscriptionId == subId) o += std::to_string(p.baseOffset) + ",";
-        return o;
+    /// An upper bound of the partition's log end now: the highest acked offset + 1 plus every produce still unanswered
+    /// (each appends one record).  A Record of an ended subscription at or above it can only come from a produce sent
+    /// after the end - the worker must no longer push it.
+    int64_t logEndBound_(const Sub& s) const {
+        int64_t b = (maxAcked_.count(s.topicId) ? maxAcked_.at(s.topicId) : -1) + 1;
+        for (const Req& r : reqs_) b += (r.kind == Req::Kind::Produce && r.topicId == s.topicId) ? 1 : 0;
+        return b;
     }
     static bool revokedFrame_(Sess& s) {
         for (const auto& e : s.c->errors()) if (e.sessionId == s.sid && e.code == 46) return true;
@@ -496,39 +556,82 @@ private:
             }
         }
         if (!fail_.empty()) return;
-        // no Records after the end of a subscription
-        for (const Sub& s : subs_)
-            if (s.st == Sub::St::Ended && s.settled && s.subId != 0 && pushes_(sess_[static_cast<std::size_t>(s.sess)], s.subId) != s.recordsAtEnd && s.endCode != 0) {
-                failWith_("Records delivered on " + s.topic + " after its ErrorResponse(" + std::to_string(s.endCode) + "): " + std::to_string(s.recordsAtEnd) + " -> " + std::to_string(pushes_(sess_[static_cast<std::size_t>(s.sess)], s.subId)) + " ended at step " + std::to_string(s.endStep) + ", first late record at step " + std::to_string(s.lateStep - 1) + " topicId(sub)=" + std::to_string(s.topicId) + " topicId(now)=" + std::to_string(exists_[s.topic]) + " baseOffsets=" + offsetsOf_(sess_[static_cast<std::size_t>(s.sess)], s.subId) + " (sub of step " + std::to_string(s.sentSteps) + ", user " + user_(sess_[static_cast<std::size_t>(s.sess)].user) + ")"); return;
+        // no Records after the end of a subscription: nothing at or above the log end seen when it ended
+        for (const Sub& s : subs_) {
+            if (s.st != Sub::St::Ended || s.subId == 0 || s.endCode == 0) continue;
+            ++tally_.endedSubsChecked;
+            for (const auto& p : sess_[static_cast<std::size_t>(s.sess)].c->records()) {
+                if (p.subscriptionId != s.subId) continue;
+                ++tally_.recordsChecked;
+                if (p.baseOffset >= s.bound) {
+                    failWith_("Records delivered on " + s.topic + " after its ErrorResponse(" + std::to_string(s.endCode) + "): offset " +
+                              std::to_string(p.baseOffset) + " >= the log end " + std::to_string(s.bound) + " at the end (sub of step " +
+                              std::to_string(s.sentSteps) + ", user " + user_(sess_[static_cast<std::size_t>(s.sess)].user) + ")");
+                    return;
+                }
             }
+        }
         if (const std::string d = digestConvergence(rig_.broker().node()); !d.empty()) { failWith_("CONVERGENCE: " + d); return; }
-        // probes: every alive session x existing topic answers exactly what the model says
+        // broker side (review I5): every shard-produce frame the worker admitted was answered, and every enforcing session
+        // holds a shipped permission epoch on the worker
+        {
+            const auto until = Clock::now() + 3s;
+            std::size_t inFlight = rig_.broker().node().workerDirectAcksInFlightForTest(0);
+            while (inFlight != 0 && Clock::now() < until) { pump_(10ms); inFlight = rig_.broker().node().workerDirectAcksInFlightForTest(0); }
+            if (inFlight != 0) { failWith_("BROKER: " + std::to_string(inFlight) + " shard produce frame(s) admitted by the worker were never answered"); return; }
+            for (const Sess& se : sess_) {
+                if (!se.alive) continue;
+                if (rig_.broker().node().workerPermissionEpochForTest(0, se.sid) == 0) { failWith_("BROKER: the worker holds no permission epoch for a live session"); return; }
+                ++tally_.epochsChecked;
+            }
+            if (rig_.broker().node().securityAppliedOffsetOnControlForTest() != rig_.broker().node().securityViewForTest().appliedOffset) {
+                failWith_("BROKER: the control thread's applied offset probe disagrees with the view snapshot"); return;
+            }
+        }
+        // a disabled user cannot log in (a fresh login attempt is refused AuthenticationFailed)
+        for (int u = 0; u < 2; ++u) {
+            if (fin.isEnabled(user_(u)) || seed_ % 16 != 0) continue;   // each refusal arms the per-source login throttle: sampled
+            const auto l = uw_[static_cast<std::size_t>(u) * 3]->connectAndLogin(rig_.ch(), user_(u), AuthRig::kPw);
+            if (l.ok()) { failWith_("CONVERGENCE: a disabled user " + user_(u) + " logged in"); return; }
+            ++tally_.disabledLoginsRefused;
+        }
+        // probes: EVERY alive session x existing topic x BOTH produce paths (worker ingress, gateway-routed) + Subscribe
         step_ = static_cast<std::size_t>(steps_) + 1;
-        std::size_t probed = 0;
         for (std::size_t i = 0; i < sess_.size() && fail_.empty(); ++i) {
             Sess& s = sess_[i];
             if (!s.alive) continue;
-            if (probed++ >= 3) break;   // 3 sessions per seed keep the suite in budget; the seeds rotate the users
+            ++tally_.sessionsProbed;
             for (const std::string& t : existing_()) {
                 const bool wantW = fin.allowed(user_(s.user), pm::Op::Write, t), wantR = fin.allowed(user_(s.user), pm::Op::Read, t);
-                int pc = kNoAnswer;
+                for (const bool routed : {false, true}) {
+                    int code = kNoAnswer;
+                    for (int a = 0; a < 80; ++a) {   // transient answers (NotLeader / UnknownTopic while a topic settles) are retried
+                        const int64_t corr = s.c->nextCorrelationId();
+                        const std::string& chan = routed ? rig_.ch() : rig_.broker().workerIngressChannel();
+                        if (!s.c->produce(chan, AuthRig::stream(), s.sid, corr, exists_[t], 0, 1, makeBatch(1))) break;
+                        const auto ack = s.c->awaitProduceResponseUntil(corr, Clock::now() + 5s);
+                        code = ack ? ack->errorCode : kNoAnswer;
+                        if (code == 0 || code == 45 || code == kNoAnswer) break;
+                        std::this_thread::sleep_for(25ms);
+                    }
+                    ++tally_.probes;
+                    if (wantW != (code == 0) || (!wantW && code != 45))
+                        failWith_(std::string("CONVERGENCE: ") + (routed ? "routed" : "shard-path") + " produce on " + t + " as " + user_(s.user) + "/" + std::to_string(i) +
+                                  " answered " + std::to_string(code) + ", model says " + (wantW ? "allowed" : "denied"));
+                    (wantW ? (routed ? tally_.routedOkProbes : tally_.shardOkProbes) : (routed ? tally_.routedDeniedProbes : tally_.shardDeniedProbes)) += 1;
+                    if (!fail_.empty()) return;
+                }
+                int sc = kNoAnswer;
                 for (int a = 0; a < 80; ++a) {
-                    const int64_t corr = s.c->nextCorrelationId();
-                    const bool routed = (a % 2) == 1 || !wantW;
-                    const std::string& chan = routed ? rig_.ch() : rig_.broker().workerIngressChannel();
-                    if (!s.c->produce(chan, AuthRig::stream(), s.sid, corr, exists_[t], 0, 1, makeBatch(1))) break;
-                    const auto ack = s.c->awaitProduceResponseUntil(corr, Clock::now() + 5s);
-                    pc = ack ? ack->errorCode : kNoAnswer;
-                    if (pc == 0 || pc == 45 || pc == kNoAnswer) break;
+                    sc = s.c->awaitSubscribeCode(s.c->sendSubscribe(rig_.ch(), AuthRig::stream(), s.sid, exists_[t], 0), Clock::now() + 5s).value_or(kNoAnswer);
+                    if (sc != static_cast<int>(pc::ErrorCode::NotLeader)) break;
                     std::this_thread::sleep_for(25ms);
                 }
-                if (wantW != (pc == 0) || (!wantW && pc != 45))
-                    failWith_("CONVERGENCE: produce on " + t + " as " + user_(s.user) + " answered " + std::to_string(pc) + ", model says " + (wantW ? "allowed" : "denied"));
-                const int sc = s.c->awaitSubscribeCode(s.c->sendSubscribe(rig_.ch(), AuthRig::stream(), s.sid, exists_[t], 0), Clock::now() + 5s).value_or(kNoAnswer);
+                ++tally_.probes;
                 if (wantR != (sc == 0) || (!wantR && sc != 45))
-                    if (!(sc != 0 && wantR && sc == static_cast<int>(pc::ErrorCode::NotLeader)))
-                        failWith_("CONVERGENCE: subscribe on " + t + " as " + user_(s.user) + " answered " + std::to_string(sc) + ", model says " + (wantR ? "allowed" : "denied"));
-                if (!fail_.empty()) break;
+                    failWith_("CONVERGENCE: subscribe on " + t + " as " + user_(s.user) + "/" + std::to_string(i) + " answered " + std::to_string(sc) +
+                              ", model says " + (wantR ? "allowed" : "denied"));
+                if (!fail_.empty()) return;
             }
         }
     }
@@ -536,6 +639,8 @@ private:
     AuthRig& rig_;
     std::vector<AuthWireClient*> uw_;
     int seed_, steps_;
+    Tally& tally_;
+    std::map<int32_t, int64_t> maxAcked_;   // topic id -> highest acked base offset
     std::mt19937_64 rng_;
     std::size_t step_ = 0;
     std::string fail_;
@@ -550,7 +655,6 @@ private:
     std::vector<Sub> subs_;
     std::map<std::string, int32_t> exists_;
     std::set<std::string> creating_, unknown_;
-    std::map<ShardTestClient*, std::size_t> scanFrom_, recBase_;
     uint64_t reqCounter_ = 0;
 };
 
@@ -559,19 +663,35 @@ private:
 TEST(AuthStressRegression, SeededRandomGrantRevokeTrafficHoldsEveryInvariant) {
     const int seeds = envInt("RUNE_AUTH_STRESS_SEEDS", 64);
     const int steps = envInt("RUNE_AUTH_STRESS_STEPS", 300);
+    const int first = envInt("RUNE_AUTH_STRESS_FIRST_SEED", 0);   // replay: FIRST_SEED=N SEEDS=1
     AuthBroker::Options o;
     o.shard = true;
     AuthRig rig("stress", o);
-    AuthWireClient& u0 = rig.broker().wire();
-    AuthWireClient& u1 = rig.broker().wire();
-    u0.cacheSaltedPasswords(true);
-    u1.cacheSaltedPasswords(true);
+    std::vector<AuthWireClient*> wires;
+    for (int i = 0; i < 6; ++i) { wires.push_back(&rig.broker().wire()); wires.back()->cacheSaltedPasswords(true); }
+    Tally tally;
     const auto t0 = Clock::now();
-    for (int seed = 0; seed < seeds; ++seed) {
-        Seed s(rig, {}, {&u0, &u1}, seed, steps);
+    for (int seed = first; seed < first + seeds; ++seed) {
+        Tally t;
+        Seed s(rig, wires, seed, steps, t);
         const std::string failure = s.run();
         ASSERT_TRUE(failure.empty()) << failure;
+        tally.add(t);
     }
     std::cout << "[auth-stress] " << seeds << " seeds x " << steps << " steps in "
-              << std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - t0).count() << " s\n";
+              << std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - t0).count() << " s\n[auth-stress] " << tally.str() << "\n";
+    if (seeds >= 64 && steps >= 300) {   // non-vacuity floors of a full run (review I6)
+        EXPECT_GE(tally.shardOk, 100u);
+        EXPECT_GE(tally.routedOk, 100u);
+        EXPECT_GE(tally.subOk, 100u);
+        EXPECT_GE(tally.createOk, 1u);
+        EXPECT_GE(tally.mustEndMet, 20u);
+        EXPECT_GE(tally.recordsChecked, 1u);
+        EXPECT_GE(tally.shardDeniedProbes, 50u);
+        EXPECT_GE(tally.routedDeniedProbes, 50u);
+        EXPECT_GE(tally.shardOkProbes, 50u);
+        EXPECT_GE(tally.routedOkProbes, 50u);
+        EXPECT_GE(tally.disabledLoginsRefused, 1u);
+        EXPECT_GE(tally.epochsChecked, 100u);
+    }
 }
