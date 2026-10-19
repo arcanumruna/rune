@@ -449,6 +449,8 @@ TEST(RoleCounterRegression, PeerLinkCountersArePublishedRegression) {
     fs::create_directories(keyDir);
     { std::ofstream(keyDir / "k.key") << std::string(48, 'k') << "\n"; }
     { std::ofstream(keyDir / "x.key") << std::string(48, 'x') << "\n"; }
+    for (const char* n : {"k.key", "x.key"})   // M13: a group/world-readable key refuses to start
+        fs::permissions(keyDir / n, fs::perms::owner_read | fs::perms::owner_write);
     ThreeNodes c = ThreeNodes::startWith("plctr", [&](NodeConfig& k) {
         k.authMode = AuthMode::Enabled;
         k.clusterKeyFile = ((k.nodeId == 3) ? keyDir / "x.key" : keyDir / "k.key").string();

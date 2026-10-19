@@ -20,6 +20,7 @@ namespace {
 fs::path keyFileWith(const fs::path& dir, const std::string& name, char c) {
     const fs::path p = dir / name;
     std::ofstream(p, std::ios::binary) << std::string(48, c) << "\n";
+    fs::permissions(p, fs::perms::owner_read | fs::perms::owner_write);   // M13: a group/world-readable key refuses to start
     return p;
 }
 
