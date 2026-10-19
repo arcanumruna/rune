@@ -7974,7 +7974,7 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
     if (const LoginFailure* failure = std::get_if<LoginFailure>(&verdict)) {
         ++loginsFailed_;
         loginThrottle_.onFailure(user, session->sourceHost, nowNs_);
-        if (unauthLog_.due(4)) [[unlikely]]
+        if (unauthLog_.due(8 + static_cast<std::size_t>(*failure))) [[unlikely]]   // per reason
             spdlog::warn("auth: login failed user={} source={} session={} reason={}", user, session->sourceHost, session->sessionId,
                          loginFailureName(*failure));
         failLogin_(*session, hdr->correlationId, 0);
@@ -8064,7 +8064,7 @@ void ClientGateway::reapAuthDeadlines_(int64_t nowNs)
         if (const auto* a = std::get_if<AuthAwaitingFirst>(&s->auth)) corr = a->correlationId;
         else if (const auto* b = std::get_if<AuthAwaitingFinal>(&s->auth)) { corr = b->correlationId; user = b->user; }
         ++loginsFailed_;
-        if (unauthLog_.due(4)) [[unlikely]]
+        if (unauthLog_.due(8 + static_cast<std::size_t>(LoginFailure::Timeout))) [[unlikely]]
             spdlog::warn("auth: login failed user={} source={} session={} reason={}", user, s->sourceHost, sid,
                          loginFailureName(LoginFailure::Timeout));
         failLogin_(*s, corr, 0);
