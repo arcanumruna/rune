@@ -48,6 +48,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/auth.sh
+. "${SCRIPT_DIR}/lib/auth.sh"   # authentication is ON: cluster key, bootstrap, e2e user (Task 20)
 BROKER_REPO="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PROJECTS="$(cd "${BROKER_REPO}/.." && pwd)"
 CLIENT_REPO="${PROJECTS}/rune-client-cpp"
@@ -113,7 +115,9 @@ teardown() {
     log "Tearing down (compose down -v + client rm)..."
     docker rm -f "${CLIENT_HOSTNAME}" 2>/dev/null || true
     docker compose -p "${COMPOSE_PROJECT}" -f "${COMPOSE_FILE}" down -v --remove-orphans 2>/dev/null || true
+    rune_auth_cleanup
 }
+rune_auth_init   # RUNE_SECRETS_DIR (compose mount of the cluster key) + RUNE_AUTH_WORK_DIR (passwords)
 trap teardown EXIT
 
 # ---------------------------------------------------------------------------
@@ -177,6 +181,10 @@ log "Build complete."
 # Step 2: Start the single broker node.
 # ---------------------------------------------------------------------------
 log "Step 2: Starting single broker node rune-1..."
+log "Step 1c: building the rune CLI image + generating the cluster key..."
+bash "${SCRIPT_DIR}/create-topics.sh" --build-image || fail "could not build the rune CLI image"
+rune_gen_cluster_key "${RUNE_SECRETS_DIR}" || fail "could not generate the cluster key"
+
 docker compose -p "${COMPOSE_PROJECT}" -f "${COMPOSE_FILE}" up -d rune-1
 
 # ---------------------------------------------------------------------------
@@ -197,6 +205,10 @@ if [ -z "${leader}" ]; then
     fail "Timed out (${LEADER_WAIT_S}s) waiting for leader"
 fi
 log "Leader elected: ${leader}"
+
+log "Step 3a: bootstrapping the cluster + the e2e user..."
+rune_auth_prepare "${BROKER_NETWORK}" "rune-1:40200" || fail "bootstrap / e2e user"
+read -r -a AUTH_ARGS <<< "$(rune_auth_probe_args)"
 
 # ---------------------------------------------------------------------------
 # Step 4: Run the CLI-driven, multi-phase client container on the broker
@@ -379,6 +391,7 @@ client_out=$(docker run --rm \
     -e RUNE_EGRESS_HOST="${CLIENT_HOSTNAME}" \
     -e RUNE_DATA_DIR="/tmp/rune_evo_probe" \
     -e RUNE_TIMEOUT_MS="${PROBE_TIMEOUT_MS}" \
+    "${AUTH_ARGS[@]}" \
     -e RECORDS_V1="${RECORDS_V1}" \
     -e RECORDS_V2="${RECORDS_V2}" \
     -e RECORDS_V3="${RECORDS_V3}" \

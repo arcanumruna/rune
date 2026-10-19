@@ -21,6 +21,10 @@
 #   7. Assert PROBE: OK from a survivor.
 #   8. Report success; trap tears down (`docker compose down -v`).
 #
+# Authentication (Task 20): every launcher now runs an AUTHENTICATED cluster.  The script generates a cluster key
+# before `up` (docker/lib/auth.sh), bootstraps the first admin and creates the e2e user once a leader exists, and
+# create-topics.sh logs in as that user.  The raw-Aeron ping probe needs no login (Ping is a session-level frame).
+#
 # Constraints (brief):
 #   - All channels aeron:udp.
 #   - Bounded waits, hard caps, clear failure messages.
@@ -30,6 +34,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/auth.sh
+. "${SCRIPT_DIR}/lib/auth.sh"
 COMPOSE_FILE="docker/docker-compose.yml"
 COMPOSE_NETWORK="rune-broker_default"   # docker-compose.yml: `name: rune-broker`
 LEADER_WAIT_S=90          # max seconds to wait for initial leader (log polling)
@@ -60,7 +66,9 @@ fail() { echo "[e2e] FAIL: $*" >&2; exit 1; }
 teardown() {
     log "Tearing down compose stack (down -v)..."
     docker compose -f "${COMPOSE_FILE}" down -v --remove-orphans 2>/dev/null || true
+    rune_auth_cleanup
 }
+rune_auth_init   # RUNE_SECRETS_DIR (the compose mount of the cluster key) + RUNE_AUTH_WORK_DIR (passwords)
 trap teardown EXIT
 
 # ---------------------------------------------------------------------------
@@ -83,6 +91,8 @@ echo "${out}" | grep -E "^( Image|ERROR|#[0-9]+ DONE|#[0-9]+ ERROR)" || true
 [ "${rc}" -eq 0 ] || { echo "${out}" | tail -60 >&2; fail "probe image build failed (exit ${rc})"; }
 docker image inspect "rune-broker-probe:${RUNE_IMAGE_TAG:-latest}" >/dev/null 2>&1 || fail "probe image not built: rune-broker-probe:${RUNE_IMAGE_TAG:-latest}"
 bash "${SCRIPT_DIR}/create-topics.sh" --build-image || fail "could not build the rune CLI image"
+log "Generating the cluster key (rune security gen-cluster-key)..."
+rune_gen_cluster_key "${RUNE_SECRETS_DIR}" || fail "could not generate the cluster key"
 log "Build complete."
 
 # ---------------------------------------------------------------------------
@@ -163,6 +173,7 @@ run_probe_once() {
         log "Probe OK: ${out}"
         return 0
     fi
+    log "  probe output: $(echo "${out}" | tail -6 | tr '\n' '|')"
     return 1
 }
 
@@ -200,6 +211,12 @@ log "Step 3: Awaiting initial leader (up to ${LEADER_WAIT_S}s)..."
 leader_id=$(await_leader_id "${LEADER_WAIT_S}")
 leader_svc=$(node_id_to_service "${leader_id}")
 log "Initial leader: node ID=${leader_id} → service=${leader_svc}"
+
+# ---------------------------------------------------------------------------
+# Step 3a: Bootstrap the first admin and create the e2e user (authentication is ON).
+# ---------------------------------------------------------------------------
+log "Step 3a: bootstrapping the cluster + the e2e user..."
+rune_auth_prepare "${COMPOSE_NETWORK}" "rune-1:40200" || fail "bootstrap / e2e user"
 
 # ---------------------------------------------------------------------------
 # Step 3b: Create the topics by DDL (the brokers boot with an empty catalog).  Twice:

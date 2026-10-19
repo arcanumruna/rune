@@ -78,6 +78,10 @@ x-broker-env: &broker-env
   # where io_uring IS available, this variable is still safe — tier-2 (Strict)
   # produces simply see the same back-pressure they would get with a full ring.
   RUNE_IO_BACKEND: "portable"
+  # Authentication is ON by default: every node needs the SAME cluster key file (`rune security gen-cluster-key
+  # --out docker/secrets/cluster.key`), mounted read-only at /run/secrets/cluster.key.  RUNE_SECRETS_DIR moves
+  # the directory (the e2e launchers generate a per-run one).  Without the file the broker refuses to start.
+  RUNE_CLUSTER_KEY_FILE: /run/secrets/cluster.key
 
 services:
   # ── Node 0 ──────────────────────────────────────────────────────────────────
@@ -103,6 +107,12 @@ services:
       RUNE_NODE_ID: "0"
     volumes:
       - rune-data-1:/var/lib/rune
+      - type: bind
+        source: ${RUNE_SECRETS_DIR:-./secrets}/cluster.key
+        target: /run/secrets/cluster.key
+        read_only: true
+        bind:
+          create_host_path: false   # a missing key file fails the start; never a directory
     healthcheck:
       test: ["CMD", "pgrep", "-x", "rune_broker"]
       interval: 5s
@@ -129,6 +139,12 @@ services:
       RUNE_NODE_ID: "1"
     volumes:
       - rune-data-2:/var/lib/rune
+      - type: bind
+        source: ${RUNE_SECRETS_DIR:-./secrets}/cluster.key
+        target: /run/secrets/cluster.key
+        read_only: true
+        bind:
+          create_host_path: false   # a missing key file fails the start; never a directory
     healthcheck:
       test: ["CMD", "pgrep", "-x", "rune_broker"]
       interval: 5s
@@ -155,6 +171,12 @@ services:
       RUNE_NODE_ID: "2"
     volumes:
       - rune-data-3:/var/lib/rune
+      - type: bind
+        source: ${RUNE_SECRETS_DIR:-./secrets}/cluster.key
+        target: /run/secrets/cluster.key
+        read_only: true
+        bind:
+          create_host_path: false   # a missing key file fails the start; never a directory
     healthcheck:
       test: ["CMD", "pgrep", "-x", "rune_broker"]
       interval: 5s

@@ -29,7 +29,8 @@ rune_produce() {
   log "rune produce: $scenario $tier rec=$records vb=$vbytes parts=$parts wk=$workers win=$window idle=$idle"
   local out
   # shellcheck disable=SC2086
-  out="$(env RUNE_TARGET="aeron:udp?endpoint=127.0.0.1:${RUNE_CLIENT_PORT}" \
+  out="$(env RUNE_USER="$RUNE_USER" RUNE_PASSWORD_FILE="$RUNE_PASSWORD_FILE" \
+      RUNE_TARGET="aeron:udp?endpoint=127.0.0.1:${RUNE_CLIENT_PORT}" \
       RUNE_EGRESS="aeron:udp?endpoint=127.0.0.1:${RUNE_EGRESS_PORT}" \
       RUNE_DATA_DIR="$cdir" RUNE_CLIENT_TOPIC_TABLE="bench:0:${parts}" \
       RUNE_BENCH_RECORDS="$records" RUNE_BENCH_VALUE_BYTES="$vbytes" \
@@ -60,7 +61,8 @@ rune_consume() {
   for c in $(seq 1 "$ncons"); do
     local port=$((RUNE_EGRESS_PORT + 1 + c)) dd="$WORK/rune/rc$c"; mkdir -p "$dd"
     # shellcheck disable=SC2086
-    env RUNE_TARGET="aeron:udp?endpoint=127.0.0.1:${RUNE_CLIENT_PORT}" \
+    env RUNE_USER="$RUNE_USER" RUNE_PASSWORD_FILE="$RUNE_PASSWORD_FILE" \
+        RUNE_TARGET="aeron:udp?endpoint=127.0.0.1:${RUNE_CLIENT_PORT}" \
         RUNE_EGRESS="aeron:udp?endpoint=127.0.0.1:${port}" \
         RUNE_DATA_DIR="$dd" RUNE_CLIENT_TOPIC_TABLE="bench:0:${parts}" RUNE_BENCH_MODE=catchup \
         RUNE_BENCH_FROM=earliest RUNE_BENCH_RECORDS="$records" RUNE_BENCH_IDLE_MS="${RUNE_CONS_IDLE_MS:-10000}" \

@@ -47,6 +47,10 @@ or malformed.
 | `RUNE_ELECTION_STATUS_INTERVAL_MS` | no | `20` | int64 ms | Canvass / heartbeat cadence. |
 | `RUNE_STARTUP_CANVASS_TIMEOUT_MS` | no | `100` | int64 ms | Extended canvass window on first boot (peer discovery). |
 | `RUNE_CATALOG_REPL_STREAM_ID` | no | `30` | int32 | Aeron stream id of the `__catalog` replication stream (see [The catalog](#the-catalog-__catalog)). Must differ from `RUNE_REPLICATION_STREAM_ID` and lie outside the per-worker range `[RUNE_REPL_BASE_STREAM_ID, RUNE_REPL_BASE_STREAM_ID + RUNE_WORKERS)`; the broker refuses to start otherwise. Keep it the same on every node. |
+| `RUNE_CLUSTER_KEY_FILE` | **yes** (authentication on, the default) | — | path | The shared cluster key file: 64 hex characters from `rune security gen-cluster-key`, the same on every node. Unreadable, missing, shorter than 32 bytes or group/world-accessible: the broker refuses to start. See [Authentication is on by default](#authentication-is-on-by-default). |
+| `RUNE_CLUSTER_KEY_FILE_NEXT` | no | *(unset)* | path | A second key for [rotation](SECURITY.md#the-cluster-key-d32-d35): the broker accepts the current or the next key. |
+| `RUNE_AUTH` | no | `enabled` | `enabled` \| `disabled` | `disabled` is dev mode: no login, every request runs as `anonymous` with full access. **Single-node development only**: a broker with more than one peer refuses to start in dev mode. |
+| `RUNE_AUTH_TIMEOUT_MS` | no | `10000` | int ms | A session that has not completed its login within this is answered `AuthenticationFailed` and ended. |
 | `RUNE_TRANSIENT_LOG_RING_BYTES` | no | `8388608` (8 MiB) | int32 bytes | Node-wide ring size of every transient partition. Must be a power of two; any other value keeps the default. `RUNE_MEMORY_LOG_RING_BYTES` is a **deprecated** alias that logs one warning; when both are set, the canonical name wins. |
 
 > Not env-configurable (yet): dynamic membership.
@@ -409,6 +413,51 @@ before a produce is acknowledged but is **never written to disk**.
 
 ---
 
+## Authentication is on by default
+
+A broker **refuses to start without a cluster key file** (`RUNE_CLUSTER_KEY_FILE`), on a single node
+too, and every client needs credentials. Nothing is generated for you: a key made inside one container
+would differ from its peers' and split the cluster. Reference: [SECURITY.md](SECURITY.md).
+
+**1. Make a key, once, and give every node the same file** (mode `0600`/`0400`; Kubernetes: a secret
+mounted with `defaultMode: 0400`):
+
+```sh
+docker run --rm -v "$PWD/secrets:/out" <rune-cli-image> rune security gen-cluster-key --out /out/cluster.key
+# or, with the rune CLI installed:  rune security gen-cluster-key --out secrets/cluster.key
+```
+
+Mount it read-only on each node and point the broker at it (`docker/docker-compose*.yml` do this with
+`./secrets/cluster.key` at `/run/secrets/cluster.key`; `RUNE_SECRETS_DIR` moves the directory):
+
+```sh
+-v "$PWD/secrets/cluster.key:/run/secrets/cluster.key:ro" -e RUNE_CLUSTER_KEY_FILE=/run/secrets/cluster.key
+```
+
+**2. Bootstrap the first admin, once per cluster**, with the same key (it proves you may):
+
+```sh
+rune security bootstrap --admin admin --cluster-key-file secrets/cluster.key --broker <any-node>:40200
+# one-time password for admin: ...        (printed once)
+```
+
+For automation pass `--password-file <path>` with a password you generated. The admin must change it
+at first login (`ALTER USER admin SET PASSWORD '...';`); until then every other request answers
+`PasswordChangeRequired`. Then create the roles, users and grants your services need
+(`CREATE ROLE`, `GRANT`, `CREATE USER ... WITH PASSWORD`, see [SECURITY.md](SECURITY.md#rune-ql-statements)).
+
+**3. Give clients credentials.** The client library takes `ClientConfig::username` and `password` (or
+`passwordFile`); the `rune` CLI and the example binaries take `--user` / `--password-file` or the
+environment variables `RUNE_USER` / `RUNE_PASSWORD_FILE`. A password is never accepted on the command line
+or in the environment. A client older than version 9 is refused at the connect.
+
+**4. Production.** Build with TLS and set `RUNE_REQUIRE_TLS=true` (SCRAM keeps the password off the wire but
+does not protect the data), and alert on the counters in [SECURITY.md](SECURITY.md#metrics).
+
+**Dev mode.** `RUNE_AUTH=disabled` switches authentication off for **single-node development only**. The broker
+shouts a warning at start and every 5 minutes, and refuses to start when `RUNE_PEERS` lists more than one broker.
+It is never the default.
+
 ## Single node
 
 A single-node cluster **self-elects itself leader** on boot. Good for local dev and
@@ -420,12 +469,15 @@ Format the data volume once (see "Formatting the data directory"):
 docker run --rm -v rune-data:/var/lib/rune -e RUNE_DATA_DIR=/var/lib/rune rune-broker:latest rune_broker storage format --new
 ```
 
-Then start the broker:
+Then start the broker (with the cluster key of [Authentication is on by default](#authentication-is-on-by-default);
+for throw-away local development add `-e RUNE_AUTH=disabled` instead of the key):
 
 ```sh
 docker run --rm \
   --platform linux/amd64 \
   --shm-size=256m \
+  -v "$PWD/secrets/cluster.key:/run/secrets/cluster.key:ro" \
+  -e RUNE_CLUSTER_KEY_FILE=/run/secrets/cluster.key \
   -e RUNE_NODE_ID=0 \
   -e RUNE_PEERS='0@127.0.0.1:40111' \
   -e RUNE_CLIENT_ENDPOINT='0.0.0.0:40200' \
@@ -455,8 +507,13 @@ endpoint to a routable address, e.g. `-p 40200:40200/udp` with
 The three nodes elect **one leader** over `aeron:udp`; they must share a network so the
 peer DNS names resolve. The repo ships `docker/docker-compose.yml` wired for exactly this.
 
+Every node needs the same cluster key first (see [Authentication is on by default](#authentication-is-on-by-default));
+the compose files mount `./secrets/cluster.key` (or `$RUNE_SECRETS_DIR/cluster.key`) read-only and refuse to
+start the stack when it is missing:
+
 ```sh
 # from the rune-broker repo root
+rune security gen-cluster-key --out docker/secrets/cluster.key
 docker compose -f docker/docker-compose.yml up -d rune-1 rune-2 rune-3
 docker compose -f docker/docker-compose.yml logs -f
 ```
@@ -499,6 +556,9 @@ Tear down (including volumes): `docker compose -f docker/docker-compose.yml down
 - Peer addresses are **DNS names on the shared compose network** (`rune-1`, `rune-2`,
   `rune-3`) — the default Docker bridge has no multicast, so consensus uses `aeron:udp`
   unicast to those names.
+- **The cluster key is identical on every node**; rotate it with three rolling restarts
+  ([SECURITY.md](SECURITY.md#the-cluster-key-d32-d35)). Inter-broker frames are encrypted and carry 32
+  bytes of overhead.
 - **Static membership** — the peer list is fixed at boot (dynamic membership is a later
   feature).
 - Clients connect to **any** node's client endpoint; killing the leader triggers automatic

@@ -236,7 +236,9 @@ int main() {
         req.sessionId      = 0;
         req.correlationId  = 1001;
         req.egressStreamId = egressStream;
-        req.clientVersion  = 1;
+        // Authentication (Task 20): a cluster with authentication on refuses a client older than version 9 at Connect.
+        // The probe never logs in: Ping is a session-level frame the broker answers before authentication.
+        req.clientVersion  = pc::kClientVersionAuth;
         req.egressChannel  = egress;
         const std::size_t reqLen = req.encode(scratch);
 

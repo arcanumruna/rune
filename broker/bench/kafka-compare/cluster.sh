@@ -61,6 +61,7 @@ rune_start_cluster() {
   CLUSTER_PERSISTENCE="$persistence"
   local peers; peers="$(rune_cluster_peers)"
   pkill -9 -x rune_broker 2>/dev/null; sleep 0.5
+  rune_bench_auth_key || return 1   # authentication is ON: every node mounts the SAME cluster key file
   RUNE_CLUSTER_PIDS=()
   [ -n "$workers" ] && { rune_shard_layout_check "$workers" || return 1; }
   # Explicit knobs only (KEY=VALUE words; empty when unset).
@@ -96,7 +97,8 @@ rune_start_cluster() {
     # Co-located loopback cluster: bind the client endpoint on 127.0.0.1 (a
     # wildcard bind accepts remote clients, so the broker would derive the NIC MTU
     # instead of the 64 KiB loopback MTU).
-    env RUNE_NODE_ID=$i RUNE_STORAGE_FORMAT=new RUNE_PEERS="$peers" RUNE_CLIENT_ENDPOINT="${RUNE_CLIENT_BIND:-127.0.0.1}:$cport" \
+    env RUNE_CLUSTER_KEY_FILE="$RUNE_BENCH_AUTH_DIR/cluster.key" \
+        RUNE_NODE_ID=$i RUNE_STORAGE_FORMAT=new RUNE_PEERS="$peers" RUNE_CLIENT_ENDPOINT="${RUNE_CLIENT_BIND:-127.0.0.1}:$cport" \
         RUNE_DATA_DIR="$logdir" RUNE_AERON_DIR="$d/a" \
         $knobs $eg \
         $(rune_shard_env "$i" "${workers:-1}") \
@@ -111,6 +113,7 @@ rune_start_cluster() {
   local leader; leader="$(rune_wait_leader 60)"
   [ -z "$leader" ] && { log "CLUSTER: no leader elected"; for i in 0 1 2; do tail -5 "$WORK/rune-c$i/broker.log"; done; return 1; }
   # The brokers boot with an empty catalog: create the topics by DDL (retries while the catalog leader forms).
+  rune_bench_bootstrap "$((40200+leader))" || return 1
   rune_create_topics "$((40200+leader))" "$topics" || return 1
   log "rune cluster ready: leader=node$leader (client port $((40200+leader)))"
   echo "$leader"

@@ -47,6 +47,7 @@ from harness.driver import (
     run_clients,
     DR_IMAGE,
 )
+from harness import auth
 from harness.dockerutil import run as docker_run
 from harness.invariants import (
     assert_group_bounded_duplicates,
@@ -121,6 +122,7 @@ def _run_group_member_named(
     ]
     for k, v in env.items():
         args += ["-e", f"{k}={v}"]
+    args += auth.docker_args()   # authentication: log in as the e2e user
     args.append(DR_IMAGE)
 
     res = docker_run(args, timeout=timeout_s)

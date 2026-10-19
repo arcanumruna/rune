@@ -16,6 +16,10 @@
 #                              to the catalog leader by itself
 #   CREATE_TOPICS_DEADLINE_S   total budget in seconds (default 60)
 #   QL_IMAGE                   the CLI image (default rune-ql-probe:<rune-client-cpp HEAD>, always rebuilt)
+#   RUNE_AUTH_WORK_DIR         the launcher's credentials directory (docker/lib/auth.sh: rune_auth_init +
+#                              rune_auth_prepare).  Set: the CLI logs in as the e2e user (RUNE_USER /
+#                              RUNE_PASSWORD_FILE=/work/e2e.pw) - every broker has authentication ON, so DDL needs
+#                              a CREATE grant.  Unset: no credentials (only a dev-mode broker accepts that).
 #
 # Behaviour:
 #   * `rune ql -f` runs the statements in order and stops at the first error, naming its statement.
@@ -46,6 +50,11 @@ RETRY_PAUSE_S=0.5
 
 log()  { echo "[create-topics] $*" >&2; }
 fail() { echo "[create-topics] FAIL: $*" >&2; exit 1; }
+
+# shellcheck source=lib/auth.sh
+. "${SCRIPT_DIR}/lib/auth.sh"
+AUTH_ARGS=()
+if [ -n "${RUNE_AUTH_WORK_DIR:-}" ]; then read -r -a AUTH_ARGS <<< "$(rune_auth_probe_args)"; fi
 
 QL_IMAGE="${QL_IMAGE:-rune-ql-probe:$(git -C "${CLIENT_REPO}" rev-parse --short HEAD 2>/dev/null || echo unknown)}"
 
@@ -98,6 +107,7 @@ run_attempt() {
     docker run --rm --name "${CONTAINER}" \
         --platform linux/amd64 --network "${COMPOSE_NETWORK}" --shm-size=256m --security-opt seccomp=unconfined \
         -v "${RQL_DIR}:/topics:ro" \
+        ${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"} \
         "${QL_IMAGE}" \
         rune ql -f "/topics/${NAME}.rql" --request-id "${REQUEST_ID}" --broker "${SEED}" > "${OUT_FILE}" 2>&1 &
     local pid=$!

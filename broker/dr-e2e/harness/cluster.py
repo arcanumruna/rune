@@ -20,6 +20,7 @@ from typing import Sequence
 from .dockerutil import Compose, _git_sha, run
 from . import timing
 from .timing import timed
+from . import auth
 from .driver import ensure_dr_client_image
 
 # Repo layout: dr-e2e/ lives inside rune-broker/, compose is at ../docker/.
@@ -273,6 +274,9 @@ class Cluster:
            clean: bool = True) -> "Cluster":
         # Every e2e test brings a Cluster up before any dr client runs: refuse (or build) a stale client image here.
         ensure_dr_client_image()
+        # Authentication is ON: the brokers refuse to start without the cluster key file (RUNE_SECRETS_DIR is
+        # what docker-compose.yml mounts it from); the harness generates one per process.
+        auth.ensure_key()
         # The brokers boot with an empty catalog: once a leader exists the topics are
         # created by DDL (create_topics below).
         #
@@ -293,6 +297,8 @@ class Cluster:
         self.compose.up(*SERVICES, timeout=180)
         self._up = True
         self.wait_for_leader(leader_timeout)
+        # A fresh cluster: bootstrap the first admin and create the e2e user the harness's clients log in as.
+        auth.bootstrap(self.compose.network_name(), f"{SERVICES[0]}:{CLIENT_PORT}")
         if self.topics:
             self.create_topics(self.topics)
         return self
@@ -353,6 +359,7 @@ class Cluster:
                 res = run(
                     ["docker", "run", "--rm", "--network", network, "--shm-size=256m",
                      "--security-opt", "seccomp=unconfined", "--platform", "linux/amd64",
+                     *auth.docker_args(),
                      "-e", f"RQL={script}", image,
                      "bash", "-c",
                      f'printf "%s" "$RQL" > /tmp/topics.rql && '
@@ -387,6 +394,7 @@ class Cluster:
     def down(self) -> None:
         # Idempotent, best-effort, bounded. Safe to call multiple times.
         self.compose.down()
+        auth.forget(self.compose.network_name())
         self._up = False
 
     # ---- leadership -------------------------------------------------------
@@ -440,6 +448,7 @@ class Cluster:
         return run(
             ["docker", "run", "--rm", "--network", self.compose.network_name(), "--shm-size=256m",
              "--security-opt", "seccomp=unconfined", "--platform", "linux/amd64",
+             *auth.docker_args(),
              "-e", f"RQL={script}", ql_image(),
              "bash", "-c",
              f'printf "%s" "$RQL" > /tmp/s.rql && exec rune ql -f /tmp/s.rql{rid} --broker {seed}'],

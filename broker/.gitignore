@@ -59,3 +59,8 @@ Thumbs.db
 *.flv
 *.mov
 *.wmv
+
+# --- Authentication e2e: generated cluster keys and passwords never enter git or an image ---
+/docker/secrets/
+/docker/.auth.*/
+/.catalog-e2e-work/
