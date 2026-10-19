@@ -10,6 +10,7 @@ extern "C" {
 #include <Aeron.h>
 #include <Context.h>
 
+#include <rune/node/EmbeddedDriver.h>
 #include <rune/peerlink/PeerFrameCrypto.h>
 #include <rune/peerlink/PeerHandshake.h>
 #include <rune/replication/ReplicationMessages.h>
@@ -90,36 +91,20 @@ pl::LinkKeys linkFor(bool aToB) {
 
 class MediaDriver {
 public:
-    MediaDriver() {
-        static std::atomic<int> seq{0};
-        dir_ = (fs::temp_directory_path() / ("rune_pfa_" + std::to_string(::getpid()) + "_" + std::to_string(seq++))).string();
-        if (aeron_driver_context_init(&ctx_) < 0) throw std::runtime_error(aeron_errmsg());
-        aeron_driver_context_set_dir(ctx_, dir_.c_str());
-        aeron_driver_context_set_threading_mode(ctx_, AERON_THREADING_MODE_SHARED);
-        aeron_driver_context_set_dir_delete_on_start(ctx_, true);
-        aeron_driver_context_set_dir_delete_on_shutdown(ctx_, true);
-        aeron_driver_context_set_shared_idle_strategy(ctx_, "sleep-ns");
-        aeron_driver_context_set_term_buffer_sparse_file(ctx_, true);
-        aeron_driver_context_set_term_buffer_length(ctx_, 64 * 1024);
-        aeron_driver_context_set_ipc_term_buffer_length(ctx_, 64 * 1024);
-        if (aeron_driver_init(&driver_, ctx_) < 0) throw std::runtime_error(aeron_errmsg());
-        if (aeron_driver_start(driver_, true) < 0) throw std::runtime_error(aeron_errmsg());
-        running_.store(true);
-        thread_ = std::thread([this] { while (running_.load()) aeron_driver_main_idle_strategy(driver_, aeron_driver_main_do_work(driver_)); });
-    }
-    ~MediaDriver() {
-        running_.store(false);
-        if (thread_.joinable()) thread_.join();
-        aeron_driver_close(driver_);
-        aeron_driver_context_close(ctx_);
-    }
-    [[nodiscard]] const std::string& dir() const { return dir_; }
+    MediaDriver() : driver_(makeCfg(), rune::node::DriverMode::Threaded) {}
+    [[nodiscard]] const std::string& dir() const { return driver_.dir(); }
 private:
-    aeron_driver_context_t* ctx_ = nullptr;
-    aeron_driver_t*         driver_ = nullptr;
-    std::string             dir_;
-    std::atomic<bool>       running_{false};
-    std::thread             thread_;
+    static rune::node::EmbeddedDriverConfig makeCfg() {
+        static std::atomic<int> seq{0};
+        rune::node::EmbeddedDriverConfig c;
+        c.dir = (fs::temp_directory_path() / ("rune_pfa_" + std::to_string(::getpid()) + "_" + std::to_string(seq++))).string();
+        c.termBufferBytes  = 64 * 1024;
+        c.termBufferSparse = true;
+        c.udpGso           = false;
+        c.epollPoll        = false;
+        return c;
+    }
+    rune::node::EmbeddedDriver driver_;   // the one dedicated pump thread
 };
 
 }  // namespace

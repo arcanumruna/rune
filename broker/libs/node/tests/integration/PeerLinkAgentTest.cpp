@@ -5,6 +5,7 @@
 #include "support/SecurityBrokerCluster.h"
 
 #include <rune/aeronutil/testing/FreePort.h>
+#include <rune/node/EmbeddedDriver.h>
 #include <rune/node/PeerLinkAgent.h>
 
 #include <spdlog/sinks/ostream_sink.h>
@@ -20,6 +21,7 @@ extern "C" {
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <filesystem>
 #include <fstream>
 #include <rune/node/RoleCounter.h>
 #include <chrono>
@@ -37,37 +39,20 @@ namespace {
 
 class MediaDriver {
 public:
-    MediaDriver() {
-        if (aeron_driver_context_init(&ctx_) < 0) throw std::runtime_error(aeron_errmsg());
-        aeron_driver_context_set_threading_mode(ctx_, AERON_THREADING_MODE_SHARED);
-        aeron_driver_context_set_dir_delete_on_start(ctx_, true);
-        aeron_driver_context_set_dir_delete_on_shutdown(ctx_, true);
-        aeron_driver_context_set_shared_idle_strategy(ctx_, "sleep-ns");
-        aeron_driver_context_set_term_buffer_sparse_file(ctx_, true);
-        aeron_driver_context_set_term_buffer_length(ctx_, 64 * 1024);
-        aeron_driver_context_set_dir(ctx_, (dir_.path / "aeron").c_str());
-        if (aeron_driver_init(&driver_, ctx_) < 0) throw std::runtime_error(aeron_errmsg());
-        if (aeron_driver_start(driver_, true) < 0) throw std::runtime_error(aeron_errmsg());
-        aeronDir_ = aeron_driver_context_get_dir(ctx_);
-        running_.store(true);
-        thread_ = std::thread([this] {
-            while (running_.load()) aeron_driver_main_idle_strategy(driver_, aeron_driver_main_do_work(driver_));
-        });
-    }
-    ~MediaDriver() {
-        running_.store(false);
-        if (thread_.joinable()) thread_.join();
-        aeron_driver_close(driver_);
-        aeron_driver_context_close(ctx_);
-    }
-    [[nodiscard]] const std::string& aeronDir() const { return aeronDir_; }
+    MediaDriver() : driver_(makeCfg(dir_.path / "aeron"), DriverMode::Threaded) {}
+    [[nodiscard]] const std::string& aeronDir() const { return driver_.dir(); }
 private:
-    TmpDir                  dir_{"plagent_drv"};
-    aeron_driver_context_t* ctx_ = nullptr;
-    aeron_driver_t*         driver_ = nullptr;
-    std::string             aeronDir_;
-    std::atomic<bool>       running_{false};
-    std::thread             thread_;
+    static EmbeddedDriverConfig makeCfg(const std::filesystem::path& d) {
+        EmbeddedDriverConfig c;
+        c.dir               = d.string();
+        c.termBufferBytes   = 64 * 1024;
+        c.termBufferSparse  = true;
+        c.udpGso            = false;
+        c.epollPoll         = false;
+        return c;
+    }
+    TmpDir         dir_{"plagent_drv"};
+    EmbeddedDriver driver_;   // the one dedicated pump thread
 };
 
 pl::ClusterKeys keysOf(char c, std::optional<char> next = std::nullopt) {

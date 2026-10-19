@@ -3353,9 +3353,11 @@ TEST(CompactionCleanerAgentRegression, TruncatePendingFollowerPostsNoNewCleanerW
     auto cfg = makeCompactConfig(785);
     PartitionReplica follower(cfg, Role::Follower, 1, {1, 2}, {1, 2}, &log, &transport);
     follower.becomeFollower(/*leaderEpoch=*/2, /*leaderId=*/2);
-    {   // the leader's HW covers everything (retention may drop up to it)
+    {   // the leader's HW covers the prefix retention drops, but stays AT the
+        // divergence point: the ISR v3 truncation guard refuses (rightly) to
+        // truncate below the committed offset, so HW must not exceed 20.
         FetchResponseMsg hw{};
-        hw.leaderEpoch = 2; hw.partition = 0; hw.topicId = 785; hw.highWatermark = 30;
+        hw.leaderEpoch = 2; hw.partition = 0; hw.topicId = 785; hw.highWatermark = 20;
         follower.applyReplicated(hw);
     }
     // One posted file op pending: the divergence truncation defers.
