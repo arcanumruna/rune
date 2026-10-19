@@ -1686,6 +1686,14 @@ if(BUILD_TESTING)
                               GTest::gtest_main)
         gtest_discover_tests(rune_shard_auth_produce_tests PROPERTIES TIMEOUT 600)
 
+        # Authentication Task 19: THREE real authenticating brokers (sealed peer links): __security replication and
+        # digests, logins via every broker, the 100 ms revoke gate, leader kill mid security DDL, peer keys, rotation.
+        add_executable(rune_auth_cluster_tests tests/integration/AuthClusterIntegrationTest.cpp)
+        target_include_directories(rune_auth_cluster_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_auth_cluster_tests PRIVATE rune_node rune_view rune_codec rune_catalog aeron::aeron
+                              GTest::gtest_main)
+        gtest_discover_tests(rune_auth_cluster_tests PROPERTIES TIMEOUT 900)
+
         # DR client bugs (2026-10-15): the REAL client against 3 REAL in-process brokers, a leader SIGKILLed mid-op
         # (seed failover, metadata from any live broker, re-route; produce / subscribe / group / txn / DDL / view row).
         add_executable(rune_client_failover_broker_tests tests/client/ClientFailoverBrokerRegressionTest.cpp)

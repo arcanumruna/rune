@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -126,7 +127,7 @@ public:
         m.correlationId = cl_.nextCorrelationId();
         m.ext.clientName = "auth-wire-client";
         m.ext.statement = statement;
-        m.ext.requestId = {0xA07E'0000'0000'0000ull | nonce_, ++requestCounter_};
+        m.ext.requestId = pinnedRid_ ? *pinnedRid_ : rune::protocol::RequestId{0xA07E'0000'0000'0000ull | nonce_, ++requestCounter_};
         const auto deadline = Clock::now() + within;
         m.correlationId = cl_.nextCorrelationId();
         std::vector<uint8_t> b(m.encodedSize());
@@ -143,10 +144,13 @@ public:
         pc::SecurityDdl m; m.sessionId = sid; m.kind = pc::SecurityOpKind::CreateRole; m.name = name;
         return securityDdl(channel, m, "CREATE ROLE " + name + ";");
     }
-    DdlAnswer createUser(const std::string& channel, int64_t sid, const std::string& name, const std::string& password) {
-        const auto v = verifierOf(password);
+    DdlAnswer createUser(const std::string& channel, int64_t sid, const std::string& name, const std::string& password,
+                         std::chrono::milliseconds within = std::chrono::seconds{30}) {
+        // A pinned request id is a RETRY of the same request: byte-identical, so the verifier (random salt) is reused.
+        static std::map<std::string, Verifier> pinnedVerifiers;
+        const Verifier v = pinnedRid_ ? pinnedVerifiers.try_emplace(password, verifierOf(password)).first->second : verifierOf(password);
         pc::SecurityDdl m; m.sessionId = sid; m.kind = pc::SecurityOpKind::CreateUser; m.name = name; m.verifier = v.wire();
-        return securityDdl(channel, m, "CREATE USER " + name + " WITH PASSWORD '<redacted>';");
+        return securityDdl(channel, m, "CREATE USER " + name + " WITH PASSWORD '<redacted>';", within);
     }
     DdlAnswer alterPassword(const std::string& channel, int64_t sid, const std::string& user, pc::UserChangeKind change,
                             const std::string& password = {}, bool terminate = false, uint8_t index = 1) {
@@ -212,6 +216,10 @@ public:
         return d ? *d : DdlAnswer{0xFFFF, 0, 0, -1, "no answer"};
     }
 
+    /// Task 19: every following securityDdl carries this request id (a retry of the SAME request after a leader kill);
+    /// nullopt = a fresh id per DDL again.
+    void pinRequestId(std::optional<rune::protocol::RequestId> r) noexcept { pinnedRid_ = r; }
+
     /// Cache Hi(password, salt, i) like the real client's ScramCache: only the first login pays PBKDF2.
     void cacheSaltedPasswords(bool on) noexcept { cacheSaltedPasswords_ = on; }
 
@@ -241,6 +249,7 @@ private:
     bool cacheSaltedPasswords_ = false;
     uint64_t nonce_ = (static_cast<uint64_t>(std::random_device{}()) << 16 ^ std::random_device{}()) & 0x0000'FFFF'FFFF'FFFFull;
     uint64_t requestCounter_ = 0;
+    std::optional<rune::protocol::RequestId> pinnedRid_;
 };
 
 } // namespace rune::node::test
