@@ -142,7 +142,7 @@ Every ticket's requirements implicitly include this section.
 *Aeron-bible: client is a single-writer `doWork` agent under `IdleStrategy`; app→client submission via an Agrona ring; zero-alloc handlers; injected clock in tests.*
 
 ### CC-1 — Repo scaffolding
-- **Action:** `git init rune-client-cpp`; `CMakeLists.txt` + `conanfile.py` (deps: `aeron`, gtest, google-benchmark; `rune-protocol` via sibling include like `rune-broker`); `.woodpecker` CI mirroring siblings; `.gitignore` (PID+counter temp-path convention noted). *(If the user pre-creates the empty repo + bitbucket remote, skip the init and target it.)*
+- **Action:** `git init rune-client-cpp`; `CMakeLists.txt` + `conanfile.py` (deps: `aeron`, gtest, google-benchmark; `rune-protocol` via sibling include like `rune-broker`); `.woodpecker` CI mirroring siblings; `.gitignore` (PID+counter temp-path convention noted). *(If the user pre-creates the empty repo + the git host remote, skip the init and target it.)*
 - **Acceptance:** empty project builds + runs a trivial gtest under `-j2`.
 
 ### CC-2 — Codec adapter + conformance

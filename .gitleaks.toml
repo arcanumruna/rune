@@ -1,0 +1,11 @@
+title = "rune gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Non-secret constants that trip the generic-api-key rule"
+paths = [
+  # kSecret1/kSecret2 are hash-mixing constants of the skimpy offset map, not credentials.
+  '''broker/libs/storage/include/rune/storage/SkimpyOffsetMap\.h''',
+]

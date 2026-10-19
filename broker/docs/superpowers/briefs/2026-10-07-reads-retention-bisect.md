@@ -26,7 +26,7 @@ The clearest signal is not p99.9. It is the **worker part of the worst solo `rea
 
 ## Method
 
-- **Box:** k3s-node-01 (178.104.16.102), bare metal, 4 cores. k3s was stopped (inactive) throughout. `docker ps -q` was empty before every batch, and every run line logged `containers=0`.
+- **Box:** k3s-node-01 ($RUNE_VM_HOST), bare metal, 4 cores. k3s was stopped (inactive) throughout. `docker ps -q` was empty before every batch, and every run line logged `containers=0`.
 - **Recipe:** the one from `2026-10-07-final-verification.md` §2, reused exactly.
   - Builder image `rune-latgate-builder:dc274e8` (gcc-13, conan Release; rune-protocol/rune-codec/rune-fr baked into the image as in `v/prep.sh`).
   - Only the target `rune_duty_pass_latency_gate_tests` was built, in Release.
@@ -116,7 +116,7 @@ Note on the coordinator's mid-task request for a binary search: the linear sweep
 
 ```bash
 # source per SHA (local)
-git -C /Users/vradu/Projects/rune-broker-wt26 archive <sha> | ssh root@178.104.16.102 'mkdir -p /root/e3g/bisect/<sha>/src && tar -x -C /root/e3g/bisect/<sha>/src'
+git -C /Users/vradu/Projects/rune-broker-wt26 archive <sha> | ssh root@$RUNE_VM_HOST 'mkdir -p /root/e3g/bisect/<sha>/src && tar -x -C /root/e3g/bisect/<sha>/src'
 
 # /root/e3g/bisect/build.sh <sha>...   (under flock -w 7200 /root/vm.lock)
 docker run --rm -v $d/src:/src:ro -v $d/build:/work rune-latgate-builder:dc274e8 bash -c "cmake -S /src -B /work/build -G Ninja \

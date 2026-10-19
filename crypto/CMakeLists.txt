@@ -14,7 +14,10 @@ if(BUILD_TESTING)
     include(GoogleTest)
     add_executable(rune_crypto_tests tests/CapsTest.cpp tests/AeadTest.cpp tests/TlsSessionTest.cpp tests/CryptoRegressionTest.cpp tests/KdfTest.cpp tests/ScramTest.cpp)
     target_link_libraries(rune_crypto_tests PRIVATE rune_crypto GTest::gtest_main)
-    gtest_discover_tests(rune_crypto_tests WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    # Test TLS fixtures (testdata/{server.key,server.pem,ca.pem}) are generated, never committed.
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/GenerateTestCerts.cmake)
+    rune_crypto_generate_test_certs("${CMAKE_CURRENT_BINARY_DIR}/testdata")
+    gtest_discover_tests(rune_crypto_tests WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 endif()
 
 option(BUILD_BENCHMARKS "Build benchmarks" OFF)

@@ -1386,9 +1386,9 @@ done
 - [ ] **Step 4: Run the real-broker e2e on the VM** (never on the Mac):
 
 ```bash
-rsync -a --delete /Users/vradu/Projects/se-worktrees/ root@178.104.16.102:/root/se-worktrees/
-ssh root@178.104.16.102 'flock /root/vm.lock bash -c "cd /root/se-worktrees/rune-client-cpp && bash docker/rune-ql-e2e.sh"'
-ssh root@178.104.16.102 'flock /root/vm.lock bash -c "cd /root/se-worktrees/rune-broker && bash docker/schema-evolution-e2e.sh"'
+rsync -a --delete /Users/vradu/Projects/se-worktrees/ root@$RUNE_VM_HOST:/root/se-worktrees/
+ssh root@$RUNE_VM_HOST 'flock /root/vm.lock bash -c "cd /root/se-worktrees/rune-client-cpp && bash docker/rune-ql-e2e.sh"'
+ssh root@$RUNE_VM_HOST 'flock /root/vm.lock bash -c "cd /root/se-worktrees/rune-broker && bash docker/schema-evolution-e2e.sh"'
 ```
 Expected: `rune-ql-e2e.sh` ends with its PASSED banner; `schema-evolution-e2e.sh` passes phases 1–8 (phase 5: exit 30 + "incompatible"; phase 7: one success, one SchemaConflict).
 

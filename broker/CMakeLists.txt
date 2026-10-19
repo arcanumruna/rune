@@ -103,6 +103,12 @@ endif()
 find_package(OpenSSL REQUIRED)
 set(RUNE_CRYPTO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../crypto"
     CACHE PATH "Path to the rune-crypto sibling repo")
+# TLS test fixtures (server.key/server.pem/ca.pem) are generated at configure time, never committed.
+set(RUNE_CRYPTO_TESTDATA_GEN "${CMAKE_BINARY_DIR}/rune-crypto-testdata")
+if(BUILD_TESTING AND EXISTS "${RUNE_CRYPTO_ROOT}/cmake/GenerateTestCerts.cmake")
+    include(${RUNE_CRYPTO_ROOT}/cmake/GenerateTestCerts.cmake)
+    rune_crypto_generate_test_certs("${RUNE_CRYPTO_TESTDATA_GEN}")
+endif()
 add_library(rune_crypto STATIC
     ${RUNE_CRYPTO_ROOT}/src/Caps.cpp
     ${RUNE_CRYPTO_ROOT}/src/Aead.cpp

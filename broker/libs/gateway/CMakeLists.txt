@@ -136,7 +136,7 @@ if(BUILD_TESTING)
         rune_crypto
         GTest::gtest_main)
     target_compile_definitions(rune_gateway_crypto_tests PRIVATE
-        RUNE_CRYPTO_TESTDATA_DIR="${RUNE_CRYPTO_ROOT}/tests/testdata")
+        RUNE_CRYPTO_TESTDATA_DIR="${RUNE_CRYPTO_TESTDATA_GEN}")
     gtest_discover_tests(rune_gateway_crypto_tests)
 
     # -------------------------------------------------------------------------
@@ -161,7 +161,7 @@ if(BUILD_TESTING)
         rune_crypto
         GTest::gtest_main)
     target_compile_definitions(rune_gateway_crypto_regression_tests PRIVATE
-        RUNE_CRYPTO_TESTDATA_DIR="${RUNE_CRYPTO_ROOT}/tests/testdata")
+        RUNE_CRYPTO_TESTDATA_DIR="${RUNE_CRYPTO_TESTDATA_GEN}")
     gtest_discover_tests(rune_gateway_crypto_regression_tests)
 
     # -------------------------------------------------------------------------
@@ -183,7 +183,7 @@ if(BUILD_TESTING)
         rune_crypto
         GTest::gtest_main)
     target_compile_definitions(rune_gateway_require_tls_tests PRIVATE
-        RUNE_CRYPTO_TESTDATA_DIR="${RUNE_CRYPTO_ROOT}/tests/testdata")
+        RUNE_CRYPTO_TESTDATA_DIR="${RUNE_CRYPTO_TESTDATA_GEN}")
     gtest_discover_tests(rune_gateway_require_tls_tests)
 
     # -------------------------------------------------------------------------

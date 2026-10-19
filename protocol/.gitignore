@@ -7,7 +7,7 @@ conan-graph.json
 conan-pkglist.json
 *.log
 
-# --- general (from Bitbucket template) ---
+# --- general (from the repo template) ---
 node_modules/
 dist/
 *.class

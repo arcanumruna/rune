@@ -52,7 +52,7 @@ Binds every task and every result cell. Copy verbatim into the plan.
   Aeron media driver + OS on the other 8 (no oversubscription).
 - **Provisioning:** created via `hcloud` in-session, hard teardown deadline
   (proposed 2 h). Fingerprint captured to `specs.json`.
-- **Prototype first on build-agent-01 (178.104.21.208)** before spending on ccx43.
+- **Prototype first on build-agent-01 ($RUNE_BENCH_VM_HOST)** before spending on ccx43.
 
 ## Durability Tiers (matched-comparison levels)
 

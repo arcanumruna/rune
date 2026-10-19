@@ -2577,8 +2577,8 @@ log "     + post-restart update retracts the pre-image, min and max exactly OK"
 - [ ] **Step 5: Run the e2e on the VM.** Honour `/root/vm.lock`: claim it with an owner marker and release it afterwards.
 
 ```bash
-rsync -a --delete /Users/vradu/Projects/se-worktrees/ root@178.104.16.102:/root/se-worktrees/
-ssh root@178.104.16.102 'flock /root/vm.lock bash -c "cd /root/se-worktrees/rune-broker && bash docker/view-engine-e2e.sh"'
+rsync -a --delete /Users/vradu/Projects/se-worktrees/ root@$RUNE_VM_HOST:/root/se-worktrees/
+ssh root@$RUNE_VM_HOST 'flock /root/vm.lock bash -c "cd /root/se-worktrees/rune-broker && bash docker/view-engine-e2e.sh"'
 ```
 (The script is authenticated since the auth phase — it bootstraps through `docker/lib/auth.sh` and passes `RUNE_USER` / `RUNE_PASSWORD_FILE` to the probe; change nothing there.)
 

@@ -2,7 +2,7 @@
 
 **Status:** design approved in conversation 2026-10-11 (aggregate store; Last semantics; LastNonNull; numeric Min/Max; fixed-size zero-copy first). Builds on Phase 2a (`feature/materialized-views`: broker 6965024, protocol d0578c4, client 0e8505c).
 **Parent spec:** `2026-10-08-rune-view-engine-single-source-design.md` (§6 aggregate table, §6.4 nulls, §9.2 aux state is checkpointed, §14.0 latency gates).
-**Public API already published** on arcanum.regressorspath.com/rune/docs.html (v0.5.6): `tryClaim`, `claimBatch`, `PositionEncoder`, `TypedTopic::claim`, `rune>` console. 2b makes those names real. Composite keys, joins and `create view` in Rune QL (also on the site) are **Phase 3**, not 2b.
+**Public API already published** on the published Arcanum site/rune/docs.html (v0.5.6): `tryClaim`, `claimBatch`, `PositionEncoder`, `TypedTopic::claim`, `rune>` console. 2b makes those names real. Composite keys, joins and `create view` in Rune QL (also on the site) are **Phase 3**, not 2b.
 
 Four parts, four independent implementation plans:
 

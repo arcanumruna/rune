@@ -2414,8 +2414,8 @@ Add to the final PASSED banner: `log "  -> user_totals (Count(*)/Sum/Avg) recove
 
 ```bash
 # from the broker worktree: stage broker, protocol, client (git archive HEAD of each) into
-# /root/view-engine-e2e/<repo> on root@178.104.16.102 exactly as the Phase 1 e2e runs did, then:
-ssh root@178.104.16.102 'cd /root/view-engine-e2e/rune-broker && bash docker/view-engine-e2e.sh'
+# /root/view-engine-e2e/<repo> on root@$RUNE_VM_HOST exactly as the Phase 1 e2e runs did, then:
+ssh root@$RUNE_VM_HOST 'cd /root/view-engine-e2e/rune-broker && bash docker/view-engine-e2e.sh'
 ```
 Expected: `VIEW-ENGINE-E2E: OK`, `SCRIPT_EXIT=0`, including the four `user_totals` PROBE lines.
 

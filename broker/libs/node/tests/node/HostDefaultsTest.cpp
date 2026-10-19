@@ -299,7 +299,7 @@ TEST(HostDefaults, SweepNeverProducesAnInvalidDriverConfig) {
 // ---------------------------------------------------------------------------
 TEST(HostDefaults, LoopbackAndWildcardHosts) {
     for (const char* h : {"127.0.0.1", "127.1.2.3", "localhost", "::1", "[::1]"}) EXPECT_TRUE(isLoopbackHost(h)) << h;
-    for (const char* h : {"10.0.0.1", "178.104.16.102", "0.0.0.0", "::", "", "example.com"}) EXPECT_FALSE(isLoopbackHost(h)) << h;
+    for (const char* h : {"10.0.0.1", "203.0.113.7", "0.0.0.0", "::", "", "example.com"}) EXPECT_FALSE(isLoopbackHost(h)) << h;
     for (const char* h : {"0.0.0.0", "::", "", "*"}) EXPECT_TRUE(isWildcardHost(h)) << h;
     EXPECT_FALSE(isWildcardHost("127.0.0.1"));
 }

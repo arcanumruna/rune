@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- **Where things run (user, 2026-09-30):** every benchmark and every real end-to-end / DR run happens on **k3s-node-01** (`root@178.104.16.102`, repos under `/root/rune-e5`), never on the Mac; local runs are unit/integration only.
+- **Where things run (user, 2026-09-30):** every benchmark and every real end-to-end / DR run happens on **k3s-node-01** (`root@$RUNE_VM_HOST`, repos under `/root/rune-e5`), never on the Mac; local runs are unit/integration only.
 - **Mandatory VM cleanup before EVERY benchmark and e2e/DR run:** `bash /root/rune-e5/rune-broker/bench/kafka-compare/vm-clean.sh` (created by the broker plan, Task 16 Step 3b — if it is not on the VM yet, run that step first). It kills all Rune/Kafka/bench/client processes and Rune DR containers, waits for load1 < 1, and exits 1 on strays, a busy box, < 3 GiB root disk or < 1 GiB `/dev/shm` free. A run that did not start from a passing `vm-clean.sh` is not a valid measurement. The bench's `--idle-check-only` gate runs after it, not instead of it.
 - Pass criterion (spec §1): "on the 4-core k3s-node-01 box, 3 brokers + 1 client co-located, 1 KB records, 3-node acks=all with the replicated, no-fsync-before-ack guarantee (Rune `tier=majority`, `durability=all-in-sync` — the same guarantee as Kafka acks=all with default flushing), an open-loop producer offering 100,000 rec/s for 60 s achieves ≥ 100,000 rec/s and p99 end-to-end ≤ 100 µs (every record measured, coordinated-omission-safe)."
 - §1a.1 Shared-nothing. Every piece of mutable state is owned by exactly one thread. No shared mutable state, no locks/mutex/condvar, no atomics as cross-thread coordination (atomics only inside ring-buffer primitives), no `thread_local` on hot paths.
@@ -7828,7 +7828,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 
 ### Task 19: Validation — full suites + TSan, real end-to-end (legacy and shard brokers, default and flag-on), interleaved A/B, §1 pass run
 
-Spec §6: "Unit/regression … In-process integration … Dockerized DR matrix with shard mode on, plus TSan … VM runs, shard mode on and off (off must equal today's behaviour) … §1 pass criterion on a verified-idle box." §1a.7: "Done" means the real end-to-end path is green in the default configuration as well as flag-on. VM: `root@178.104.16.102` (4 cores), repos under `/root/rune-e5`, client build dir `/root/rune-e5/rune-client-cpp/build/Release/build/Release` (Unix Makefiles, Release, `BUILD_TESTING=ON`, `BUILD_EXAMPLES=ON`, toolchain `/root/rune-e5/rune-client-cpp/build/Release/build/Release/generators/conan_toolchain.cmake`). The VM has no `rune-ql` sibling yet (the client's CMake globs it), so it is synced too.
+Spec §6: "Unit/regression … In-process integration … Dockerized DR matrix with shard mode on, plus TSan … VM runs, shard mode on and off (off must equal today's behaviour) … §1 pass criterion on a verified-idle box." §1a.7: "Done" means the real end-to-end path is green in the default configuration as well as flag-on. VM: `root@$RUNE_VM_HOST` (4 cores), repos under `/root/rune-e5`, client build dir `/root/rune-e5/rune-client-cpp/build/Release/build/Release` (Unix Makefiles, Release, `BUILD_TESTING=ON`, `BUILD_EXAMPLES=ON`, toolchain `/root/rune-e5/rune-client-cpp/build/Release/build/Release/generators/conan_toolchain.cmake`). The VM has no `rune-ql` sibling yet (the client's CMake globs it), so it is synced too.
 
 **Files:**
 - Create (outside the repo, not committed): `/tmp/sic-e2e.sh`, `/tmp/sic-ab.sh`
@@ -7862,9 +7862,9 @@ cd /Users/vradu/Projects
 RS="--exclude=.git --exclude=build --exclude=build-fast --exclude=build-release --exclude=build_release \
     --exclude=build_tsan --exclude=cmake-build-* --exclude=CMakeFiles --exclude=.sdd --exclude=docs"
 for r in rune-protocol rune-fr rune-codec rune-ql rune-client-cpp; do
-  rsync -az $RS $r/ root@178.104.16.102:/root/rune-e5/$r/
+  rsync -az $RS $r/ root@$RUNE_VM_HOST:/root/rune-e5/$r/
 done
-ssh root@178.104.16.102 'cd /root/rune-e5/rune-client-cpp && \
+ssh root@$RUNE_VM_HOST 'cd /root/rune-e5/rune-client-cpp && \
   cmake -S . -B build/Release/build/Release > /tmp/sic-cfg.log 2>&1 && \
   cmake --build build/Release/build/Release -j4 2>&1 | tail -2 && \
   ctest --test-dir build/Release/build/Release -R Regression --output-on-failure 2>&1 | tail -3 && \
@@ -7948,8 +7948,8 @@ exit $fail
 - [ ] **Step 4: Run it**
 
 ```bash
-scp /tmp/sic-e2e.sh root@178.104.16.102:/root/rune-e5/sic-e2e.sh
-ssh root@178.104.16.102 'bash /root/rune-e5/rune-broker/bench/kafka-compare/vm-clean.sh && bash /root/rune-e5/sic-e2e.sh 2>&1 | tail -20'
+scp /tmp/sic-e2e.sh root@$RUNE_VM_HOST:/root/rune-e5/sic-e2e.sh
+ssh root@$RUNE_VM_HOST 'bash /root/rune-e5/rune-broker/bench/kafka-compare/vm-clean.sh && bash /root/rune-e5/sic-e2e.sh 2>&1 | tail -20'
 ```
 Expected: every `default:` line shows `succeeded=300000 failed=0`; every `invoker:` line shows `errors=0` and `achieved_rps≈20000`; `E2E_EXIT=0`. While the broker plan has not landed, the legacy half must pass and the script ends with `SHARD_BROKER_UNAVAILABLE ... E2E_EXIT=1` — this task is then NOT done (§1a.7): keep it open and re-run Step 4 when the broker plan lands.
 
@@ -7967,9 +7967,9 @@ Expected: the broker plan's DR matrix reports all scenarios passed with the clie
 ```bash
 cd /Users/vradu/Projects/rune-client-cpp
 git worktree add /tmp/sic-main main
-rsync -az --exclude=.git /tmp/sic-main/ root@178.104.16.102:/root/rune-e5/rune-client-cpp-main/
+rsync -az --exclude=.git /tmp/sic-main/ root@$RUNE_VM_HOST:/root/rune-e5/rune-client-cpp-main/
 git worktree remove /tmp/sic-main
-ssh root@178.104.16.102 'cd /root/rune-e5/rune-client-cpp-main && \
+ssh root@$RUNE_VM_HOST 'cd /root/rune-e5/rune-client-cpp-main && \
   cmake -S . -B build-rel -DCMAKE_BUILD_TYPE=Release -DBUILD_EXAMPLES=ON -DBUILD_TESTING=OFF \
     -DCMAKE_TOOLCHAIN_FILE=/root/rune-e5/rune-client-cpp/build/Release/build/Release/generators/conan_toolchain.cmake \
     > /tmp/sic-main-cfg.log 2>&1 && cmake --build build-rel -j4 --target rune_produce_throughput 2>&1 | tail -1'
@@ -8002,8 +8002,8 @@ rune_stop_cluster
 
 ```bash
 /Users/vradu/Projects/rune-client-cpp/cmake-build-sic-rel/rune_produce_throughput --idle-check-only --idle-check-cores 0,1,2,3 || echo "local check n/a"
-scp /tmp/sic-ab.sh root@178.104.16.102:/root/rune-e5/sic-ab.sh
-ssh root@178.104.16.102 'bash /root/rune-e5/rune-broker/bench/kafka-compare/vm-clean.sh && /root/rune-e5/rune-client-cpp/build/Release/build/Release/rune_produce_throughput --idle-check-only --idle-check-cores 0,1,2,3 && bash /root/rune-e5/sic-ab.sh' | tee /tmp/sic-ab.out
+scp /tmp/sic-ab.sh root@$RUNE_VM_HOST:/root/rune-e5/sic-ab.sh
+ssh root@$RUNE_VM_HOST 'bash /root/rune-e5/rune-broker/bench/kafka-compare/vm-clean.sh && /root/rune-e5/rune-client-cpp/build/Release/build/Release/rune_produce_throughput --idle-check-only --idle-check-cores 0,1,2,3 && bash /root/rune-e5/sic-ab.sh' | tee /tmp/sic-ab.out
 grep -c "RUN FAILED" /tmp/sic-ab.out
 ```
 Expected: `IDLE_CHECK ... -> PASS` first (else stop: the box is not idle — find and stop the foreign load; never blame "server noise"); 30 RESULT lines, `RUN FAILED` count 0, every run `failed=0`. Validate before interpreting (§1a.10): same two binaries throughout, all 30 captures complete. Compare medians of `records_per_sec`, `p50_us`, `p99_us` (A vs B): B must be ≥ A on throughput and ≤ A on p99. A worse B is a bug in this branch's default path: bisect by task commit on the same A/B harness, cite the exact code path, fix with a regression test, re-run. Push both medians:
@@ -8019,7 +8019,7 @@ AB_STATUS=$( [ "$(grep -c '^[0-9]* [AB] RESULT' /tmp/sic-ab.out)" = 30 ] && echo
 Layout (spec §5): client shard pinned to core 0; broker i (shard worker 0, runtime fused) pinned to core i+1 — the broker plan's harness pins the brokers. Verified-idle box first.
 
 ```bash
-ssh root@178.104.16.102 'set -e
+ssh root@$RUNE_VM_HOST 'set -e
 bash /root/rune-e5/rune-broker/bench/kafka-compare/vm-clean.sh
 P=/root/rune-e5/rune-client-cpp/build/Release/build/Release/rune_produce_throughput
 $P --idle-check-only --idle-check-cores 0,1,2,3
@@ -8050,9 +8050,9 @@ cd /Users/vradu/Projects/rune-client-cpp
 git status --short             # clean except the untracked conan_provider.cmake
 git log --oneline main..HEAD   # one commit per task
 git stash list                 # the parked RUNE_RETARGET_DBG stash is still there
-ssh root@178.104.16.102 'systemctl is-active k3s || echo "k3s not running"'
+ssh root@$RUNE_VM_HOST 'systemctl is-active k3s || echo "k3s not running"'
 ```
-Leave the `RUNE_RETARGET_DBG` stash untouched and report that it exists (it targets the pre-refactor `retarget()` loop and will not apply cleanly on this branch). The VM is the 4-core bench box of spec §1 with k3s stopped for benching: once the bench session is over, restore it with `ssh root@178.104.16.102 'systemctl start k3s'` (a running k3s invalidates any later bench number, so this is the very last step). Do not push the branch.
+Leave the `RUNE_RETARGET_DBG` stash untouched and report that it exists (it targets the pre-refactor `retarget()` loop and will not apply cleanly on this branch). The VM is the 4-core bench box of spec §1 with k3s stopped for benching: once the bench session is over, restore it with `ssh root@$RUNE_VM_HOST 'systemctl start k3s'` (a running k3s invalidates any later bench number, so this is the very last step). Do not push the branch.
 
 ---
 

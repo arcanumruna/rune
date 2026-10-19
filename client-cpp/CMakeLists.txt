@@ -166,6 +166,12 @@ endif()
 # (header-only) and, once Task 6 lands, the produce/egress seal/open seams.
 set(RUNE_CRYPTO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../crypto"
     CACHE PATH "Path to the rune-crypto sibling repo")
+# TLS test fixtures (server.key/server.pem/ca.pem) are generated at configure time, never committed.
+set(RUNE_CRYPTO_TESTDATA_GEN "${CMAKE_BINARY_DIR}/rune-crypto-testdata")
+if(BUILD_TESTING AND EXISTS "${RUNE_CRYPTO_ROOT}/cmake/GenerateTestCerts.cmake")
+    include(${RUNE_CRYPTO_ROOT}/cmake/GenerateTestCerts.cmake)
+    rune_crypto_generate_test_certs("${RUNE_CRYPTO_TESTDATA_GEN}")
+endif()
 if(NOT TARGET rune_crypto)
 add_library(rune_crypto STATIC
     ${RUNE_CRYPTO_ROOT}/src/Caps.cpp
@@ -1012,7 +1018,7 @@ if(BUILD_TESTING)
     target_link_libraries(rune_session_tests PRIVATE rune_client rune_crypto GTest::gtest_main)
     target_include_directories(rune_session_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})
     target_compile_definitions(rune_session_tests PRIVATE
-        RUNE_CRYPTO_TESTDATA_DIR="${RUNE_CRYPTO_ROOT}/tests/testdata")
+        RUNE_CRYPTO_TESTDATA_DIR="${RUNE_CRYPTO_TESTDATA_GEN}")
 
     gtest_discover_tests(rune_session_tests)
 
@@ -1025,7 +1031,7 @@ if(BUILD_TESTING)
     target_link_libraries(rune_client_crypto_tests PRIVATE rune_client rune_crypto GTest::gtest_main)
     target_include_directories(rune_client_crypto_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})
     target_compile_definitions(rune_client_crypto_tests PRIVATE
-        RUNE_CRYPTO_TESTDATA_DIR="${RUNE_CRYPTO_ROOT}/tests/testdata")
+        RUNE_CRYPTO_TESTDATA_DIR="${RUNE_CRYPTO_TESTDATA_GEN}")
 
     gtest_discover_tests(rune_client_crypto_tests)
 
@@ -1042,7 +1048,7 @@ if(BUILD_TESTING)
     target_link_libraries(rune_client_crypto_regression_tests PRIVATE rune_client rune_crypto GTest::gtest_main)
     target_include_directories(rune_client_crypto_regression_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})
     target_compile_definitions(rune_client_crypto_regression_tests PRIVATE
-        RUNE_CRYPTO_TESTDATA_DIR="${RUNE_CRYPTO_ROOT}/tests/testdata")
+        RUNE_CRYPTO_TESTDATA_DIR="${RUNE_CRYPTO_TESTDATA_GEN}")
 
     gtest_discover_tests(rune_client_crypto_regression_tests)
 
@@ -1152,7 +1158,7 @@ if(BUILD_TESTING)
         )
         # DR client bugs fix round 3 (N-M1): the TLS redirect gateway's test certificates.
         target_compile_definitions(rune_redirect_tests PRIVATE
-            RUNE_CRYPTO_TESTDATA_DIR="${RUNE_CRYPTO_ROOT}/tests/testdata")
+            RUNE_CRYPTO_TESTDATA_DIR="${RUNE_CRYPTO_TESTDATA_GEN}")
 
         gtest_discover_tests(rune_redirect_tests)
 

@@ -6,7 +6,7 @@ Run-and-report only; no root-cause interpretation.
 
 | item | value |
 |---|---|
-| box | k3s-node-01 (178.104.16.102), k3s stopped throughout |
+| box | k3s-node-01 ($RUNE_VM_HOST), k3s stopped throughout |
 | virtualization | KVM guest (`QEMU HARDDISK` root disk), not physical bare metal |
 | kernel | 5.15.0-173-generic (Ubuntu 22.04.5 LTS) |
 | CPU | 4 vCPU, Intel Xeon Processor (Skylake, IBRS, no TSX), 1 thread/core, 1 NUMA node, 16 MiB L3 |

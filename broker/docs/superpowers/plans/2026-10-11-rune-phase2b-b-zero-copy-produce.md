@@ -34,7 +34,7 @@
 - Spec B: "Value offset 38 in the ring is not 8-aligned and generated records are packed: flyweights use `memcpy` loads/stores (no aliasing UB)."
 - Spec B: flyweights only for schemas whose fields are **all fixed-size**; schemas with `string` / `bytes` keep today's struct + `encode()` unchanged.
 - Spec B gate: "claim paths **0 allocations** steady state"; benchmarks `send(span)` vs `tryClaim` vs `TypedTopic::send` vs typed `claim`, per-record p50/p99 and allocations.
-- Published API names (arcanum.regressorspath.com/rune/docs.html) implemented exactly: `Producer::tryClaim(topic, key, len)` with `buffer()`, `commit()`, `abort()`; `Producer::claimBatch(topic, key, n, recLen)` with `record(i)`, `commit()`; generated `XEncoder(span)` with chainable setters and `XEncoder::kBlockLength`, `XDecoder`; `TypedTopic::claim(keyValue)` returning the encoder with `commit()`.
+- Published API names (the published Arcanum site/rune/docs.html) implemented exactly: `Producer::tryClaim(topic, key, len)` with `buffer()`, `commit()`, `abort()`; `Producer::claimBatch(topic, key, n, recLen)` with `record(i)`, `commit()`; generated `XEncoder(span)` with chainable setters and `XEncoder::kBlockLength`, `XDecoder`; `TypedTopic::claim(keyValue)` returning the encoder with `commit()`.
 - Wire enums / ring message ids are append-only: `kMsgClaimBatch = 4` is appended after `kMsgTier2Batch = 3`; `SendResult::ClaimHeld` and `RejectReason::ClaimHeld` are appended last.
 - Commit messages end with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`. Nothing is pushed.
 

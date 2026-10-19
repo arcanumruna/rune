@@ -160,7 +160,7 @@ HEALTHCHECK --interval=5s --timeout=3s --start-period=10s --retries=3 \
 # ── Metadata ─────────────────────────────────────────────────────────────────
 LABEL org.opencontainers.image.title="rune-broker" \
       org.opencontainers.image.description="Rune single-node broker — embedded Aeron media driver, self-elect" \
-      org.opencontainers.image.source="https://github.com/vradu/rune-broker"
+      org.opencontainers.image.source="https://github.com/arcanumruna/rune"
 
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["/usr/local/bin/rune_broker"]

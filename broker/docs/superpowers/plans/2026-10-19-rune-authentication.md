@@ -34,7 +34,7 @@
   - **Per task / fix round:** build, then run the executables covering the code the task touches plus every new or changed test, at `-j14` — each task's "Run" step names the exact filter: `ctest --test-dir <build> -R '<filter>' --output-on-failure -j14`.
   - **The FULL `*Regression*` suite runs only at the checkpoints**, in every repo touched since the last checkpoint (broker `ctest --test-dir build-fast -R Regression --output-on-failure -j14`; client, protocol, rune-ql, rune-codec, rune-crypto `ctest --test-dir build -R Regression --output-on-failure -j14`), and also under ASan+UBSan and TSan (broker `build-asan` / `build-tsan`, client `build_tsan` with `BUILD_TESTING=ON`). A checkpoint failure is bisected over the commits since the last green checkpoint.
   - **Checkpoints:** A after Task 4 (crypto + shared library); B after Task 8 (wire, language, client); C after Task 13 (log, write path, login, enforcement, workers — nothing earlier ships partial enforcement); D after Task 16 (live changes, peer links); E after Task 19 (matrix, stress, 3-node slice); F after Task 20 — before the final whole-branch review.
-- **Docker e2e** (Task 20) runs on the k3s VM (`ssh root@178.104.16.102`, under `flock /root/vm.lock`), never on the local Mac.
+- **Docker e2e** (Task 20) runs on the k3s VM (`ssh root@$RUNE_VM_HOST`, under `flock /root/vm.lock`), never on the local Mac.
 - Nothing is pushed. Every commit message ends with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 
 ## Amendments after review A (2026-10-19) — binding, override the text below
@@ -2824,9 +2824,9 @@ Spec §11 "Docker e2e, 3 nodes" (1. bootstrap; 2. create a role, a user and gran
 - [ ] **Step 3: Run on the VM** (never the local Mac):
 
 ```bash
-rsync -a --delete /Users/vradu/Projects/se-worktrees/ root@178.104.16.102:/root/se-worktrees/
-ssh root@178.104.16.102 'flock /root/vm.lock bash /root/se-worktrees/rune-broker/docker/auth-e2e.sh'
-ssh root@178.104.16.102 'flock /root/vm.lock bash -c "cd /root/se-worktrees/rune-broker/docker && ./e2e.sh && ./view-engine-e2e.sh && ./transient-failover-e2e.sh && ./catalog-e2e.sh"'
+rsync -a --delete /Users/vradu/Projects/se-worktrees/ root@$RUNE_VM_HOST:/root/se-worktrees/
+ssh root@$RUNE_VM_HOST 'flock /root/vm.lock bash /root/se-worktrees/rune-broker/docker/auth-e2e.sh'
+ssh root@$RUNE_VM_HOST 'flock /root/vm.lock bash -c "cd /root/se-worktrees/rune-broker/docker && ./e2e.sh && ./view-engine-e2e.sh && ./transient-failover-e2e.sh && ./catalog-e2e.sh"'
 ```
 
 Expected: `AUTH-E2E: OK`, and every migrated e2e passes authenticated.

@@ -1121,7 +1121,7 @@ git commit -m "feat(view): GetViewRow point-read path + openView fingerprint han
 - Produces: an end-to-end green: `CREATE VIEW` → produce typed records → `GetViewRow` returns the folded row → restart the broker → readiness gate replays → `GetViewRow` returns the recovered row. Covers both a **persisted** and a **transient** view (transient returns empty-then-refilled after restart, asserted).
 
 - [ ] **Step 1: Write the client typed read + the e2e script.** The script must (per the `schema-evolution-e2e.sh` template): `set -euo pipefail`; unique `COMPOSE_PROJECT` + `RUNE_IMAGE_TAG`; preflight sibling dirs; trap `teardown`; build broker image capturing its own exit code (no `| grep || true`); build the client probe image with `--build-context` for each sibling; `up -d rune-1`; await `node N is LEADER` by bounded log poll; run the probe container; assert `client_rc==0` **and** `grep -q 'VIEW-ENGINE-E2E: OK'`.
-- [ ] **Step 2: Run the e2e** — **on the k3s-node-01 VM** (`ssh root@178.104.16.102`, respecting `/root/vm.lock`), per the standing rule that e2e runs on the VM:
+- [ ] **Step 2: Run the e2e** — **on the k3s-node-01 VM** (`ssh root@$RUNE_VM_HOST`, respecting `/root/vm.lock`), per the standing rule that e2e runs on the VM:
       `bash docker/view-engine-e2e.sh`
       Expected: `VIEW-ENGINE-E2E: OK` and a green summary banner.
 - [ ] **Step 3: Run the FULL regression suite first, then the rest** (CLAUDE.md #7):
@@ -1143,6 +1143,6 @@ git -C ../rune-client-cpp commit -m "feat(client): openView + typed getViewRow +
 
 - **Branch:** the broker worktree currently reports branch `feat/schema-evolution-durable-tags` (the shipped prerequisite), not `feature/materialized-views`. Confirm the intended Phase 1 base branch with the user before Task 1 and branch from it; the prerequisite is merged there.
 - **No atomics in `libs/**`:** every new file under `libs/view` and `libs/node` must pass `scripts/check_no_atomics.py` — use the existing ring types for all cross-thread handoff; the pre-provision (Task 5) and all per-view state are single-worker-owned.
-- **E2E on the VM:** Task 21's docker e2e runs on k3s-node-01 (`ssh root@178.104.16.102`), honoring `/root/vm.lock`, per the standing project rule for real-Aeron e2e.
+- **E2E on the VM:** Task 21's docker e2e runs on k3s-node-01 (`ssh root@$RUNE_VM_HOST`), honoring `/root/vm.lock`, per the standing project rule for real-Aeron e2e.
 - **`ALTER TOPIC DROP` of a tag a live view KEYS on (§6.3/§15 #9):** Phase 1 validates the key tag exists at `CreateView` (Task 9), but the *reverse* guard — rejecting an `ALTER TOPIC DROP` of a tag some live view uses as its key — requires the existing `ALTER TOPIC` path (`AdminWorker::startAlter_`) to consult `ViewRegistry`. That cross-path hook is a **small Phase 1.5 follow-on**, not in this plan; until it lands, a projected/merged field drop degrades to null correctly (Task 10), but dropping a keyed tag is not yet blocked at the source side.
 - **Deferred to later phases (own plans):** aggregates+retraction+nulls (Phase 2); co-partitioned joins §8 (Phase 3); acks/consistency/`sendAndWait`/flow-control, multi-node placement/failover (Phase 4); `ALTER VIEW` live rebuild; multi-node `__views` replication; full read-time query engine (range/filter/`GROUP BY`) + SQL translator.

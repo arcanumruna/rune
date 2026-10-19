@@ -35,14 +35,16 @@ set -u
 J="${1:-3}"; B="${2:-build-fast}"; F="${3:-}"
 ITEG=OFF; XT=""
 if [ -n "$F" ]; then ITEG=ON; XT="rune_consensus_candidacy_tests rune_client_broker_tests rune_node_tests"; fi
-VM="${RUNE_LINUX_GATE_HOST:-root@178.104.16.102}"
+# The Linux VM to gate on, as user@host.  No default: set RUNE_LINUX_GATE_HOST (or just RUNE_VM_HOST).
+VM="${RUNE_LINUX_GATE_HOST:-${RUNE_VM_HOST:+root@${RUNE_VM_HOST}}}"
+[ -n "$VM" ] || { echo "run-linux-regression-vm: set RUNE_VM_HOST (VM address) or RUNE_LINUX_GATE_HOST (user@host)" >&2; exit 2; }
 GD="${RUNE_LINUX_GATE_DIR:-/root/rune-linux-gate}"
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 CACHE="$HERE/$B/CMakeCache.txt"
 [ -f "$CACHE" ] || { echo "run-linux-regression-vm: no $CACHE" >&2; exit 2; }
 val() { grep -E "^$1:" "$CACHE" | head -1 | cut -d= -f2-; }
 PROTO="$(cd "$(val RUNE_PROTOCOL_INCLUDE)/.." && pwd)"
-declare -a NAMES=(rune-broker rune-protocol rune-client-cpp rune-codec flight-recorder rune-ql rune-crypto)
+declare -a NAMES=(broker protocol client-cpp codec flight-recorder ql crypto)
 declare -a TREES=("$HERE" "$PROTO" "$(val RUNE_CLIENT_ROOT)" "$(val RUNE_CODEC_ROOT)" "$(val FLIGHT_RECORDER_DIR)" \
                   "$(val RUNE_QL_ROOT)" "$(val RUNE_CRYPTO_ROOT)")
 for i in "${!TREES[@]}"; do
@@ -72,16 +74,16 @@ for i in "${!TREES[@]}"; do
 done
 cat > "$STAGE/meta/gate.sh" <<REMOTE
 set -u
-cd "$RUN/rune-broker" || exit 2
+cd "$RUN/broker" || exit 2
 DOCKER_BUILDKIT=1 docker build --platform linux/amd64 -f docker/Dockerfile --target builder \\
-    --build-context rune-protocol=../protocol --build-context flight-recorder=../../flight-recorder \\
+    --build-context rune-protocol=../protocol --build-context flight-recorder=../flight-recorder \\
     --build-context rune-codec=../codec --build-context rune-crypto=../crypto \\
     --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$J -t "$IMG" . > "$RUN/builder.log" 2>&1 \\
     || { echo "builder stage failed:"; tail -30 "$RUN/builder.log"; exit 2; }
-CFG='cmake -S /src/rune-broker -B /src/_build -G Ninja -DCMAKE_TOOLCHAIN_FILE=/build/conan-release/build/Release/generators/conan_toolchain.cmake \\
+CFG='cmake -S /src/broker -B /src/_build -G Ninja -DCMAKE_TOOLCHAIN_FILE=/build/conan-release/build/Release/generators/conan_toolchain.cmake \\
   -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DBUILD_BENCHMARKS=OFF -DBUILD_INTEGRATION_TESTING=$ITEG \\
-  -DRUNE_PROTOCOL_INCLUDE=/src/rune-protocol/include -DRUNE_CODEC_ROOT=/src/rune-codec -DRUNE_CRYPTO_ROOT=/src/rune-crypto \\
-  -DFLIGHT_RECORDER_DIR=/src/flight-recorder -DRUNE_CLIENT_ROOT=/src/rune-client-cpp -DRUNE_QL_ROOT=/src/rune-ql -DRUNE_TLS=ON > /src/cmake.log 2>&1'
+  -DRUNE_PROTOCOL_INCLUDE=/src/protocol/include -DRUNE_CODEC_ROOT=/src/codec -DRUNE_CRYPTO_ROOT=/src/crypto \\
+  -DFLIGHT_RECORDER_DIR=/src/flight-recorder -DRUNE_CLIENT_ROOT=/src/client-cpp -DRUNE_QL_ROOT=/src/ql -DRUNE_TLS=ON > /src/cmake.log 2>&1'
 docker run --rm --name "rune-linux-gate-build-$RID" -v "$RUN:/src" "$IMG" bash -c "\$CFG && for t in $XT; do ninja -C /src/_build -t targets all | grep -q \"^\\\$t:\" || { echo \"missing target \\\$t (the ctest filter needs it)\" >&2; exit 2; }; done && cmake --build /src/_build -j$J --target rune_udp_gso_tests rune_catalog_replication_tests $XT > /src/ninja.log 2>&1" \\
     || { echo "build failed:"; tail -20 "$RUN/cmake.log" "$RUN/ninja.log"; exit 2; }
 echo "== linux-only (CAP_NET_ADMIN, RUNE_LINUX_GATE=1)"
@@ -101,10 +103,10 @@ rc3=0
 if [ "${RUNE_LINUX_GATE_SELFTEST:-0}" = "1" ]; then
     echo "== selftest: linux-stage-c.sh, --privileged (expect 0)"
     docker run --rm --name "rune-linux-gate-m5p-$RID" --privileged --shm-size=1g -v "$RUN:/src" "$IMG" \\
-        bash /src/rune-broker/scripts/linux-stage-c.sh /src/_build; p=\$?
+        bash /src/broker/scripts/linux-stage-c.sh /src/_build; p=\$?
     echo "== selftest: linux-stage-c.sh, unprivileged (expect 3)"
     docker run --rm --name "rune-linux-gate-m5u-$RID" --shm-size=1g -v "$RUN:/src" "$IMG" \\
-        bash /src/rune-broker/scripts/linux-stage-c.sh /src/_build; u=\$?
+        bash /src/broker/scripts/linux-stage-c.sh /src/_build; u=\$?
     echo "== selftest: privileged rc \$p, unprivileged rc \$u"
     [ "\$p" -eq 0 ] && [ "\$u" -eq 3 ] || rc3=1
 fi

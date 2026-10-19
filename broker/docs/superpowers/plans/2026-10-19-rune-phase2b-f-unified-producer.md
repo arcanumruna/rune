@@ -29,7 +29,7 @@
   Verify before Task 1: `grep -n "tryClaim" include/rune/client/producer/Producer.h`, `grep -n "kMsgClaimBatch" include/rune/client/producer/ProducerImpl.h`, `grep -n "ClaimHeld" include/rune/client/producer/Producer.h` (client) all hit. rune-protocol, rune-codec, rune-ql stay on their integration tips (no change).
 - **Builds:** client `cmake --build /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -j14` (Debug, `BUILD_TESTING=ON`, `BUILD_EXAMPLES=ON`, `BUILD_BENCHMARKS=ON` for Task 14), client TSan `build_tsan`; broker `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 --target rune_client_broker_tests rune_client_failover_broker_tests` (compiles the client from `RUNE_CLIENT_ROOT=../rune-client-cpp`).
 - **Test gate (CLAUDE.md #7):** per task, the executables covering the touched code plus every new or changed test (each task's Run step, `-j14`). The FULL `*Regression*` suite runs at the checkpoints — **A** after Task 4, **B** after Task 9, **C** after Task 13, **D** after Task 15 (before the final whole-branch review) — in both repos (`ctest --test-dir <build> -R Regression --output-on-failure -j14`), plus client `build_tsan` and broker `build-asan` / `build-tsan`. A checkpoint failure is bisected over the commits since the last green checkpoint.
-- **Docker e2e** (Task 15) only on the k3s VM (`ssh root@178.104.16.102`, `flock /root/vm.lock`), never on the Mac.
+- **Docker e2e** (Task 15) only on the k3s VM (`ssh root@$RUNE_VM_HOST`, `flock /root/vm.lock`), never on the Mac.
 - Nothing is pushed. Every commit message ends with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 
 ## Global Constraints
@@ -771,9 +771,9 @@ enum class Outcome : uint8_t { Delivered, DeliveredOnce, AtMostOnce, Refused, Co
 - [ ] **Step 3: Run on the VM** (never the Mac):
 
 ```bash
-rsync -a --delete /Users/vradu/Projects/se-worktrees/ root@178.104.16.102:/root/se-worktrees/
-ssh root@178.104.16.102 'flock /root/vm.lock bash /root/se-worktrees/rune-broker/docker/eos-e2e.sh'
-ssh root@178.104.16.102 'flock /root/vm.lock bash -c "cd /root/se-worktrees/rune-broker/docker && ./view-engine-e2e.sh && ./catalog-e2e.sh"'
+rsync -a --delete /Users/vradu/Projects/se-worktrees/ root@$RUNE_VM_HOST:/root/se-worktrees/
+ssh root@$RUNE_VM_HOST 'flock /root/vm.lock bash /root/se-worktrees/rune-broker/docker/eos-e2e.sh'
+ssh root@$RUNE_VM_HOST 'flock /root/vm.lock bash -c "cd /root/se-worktrees/rune-broker/docker && ./view-engine-e2e.sh && ./catalog-e2e.sh"'
 ```
 Expected: `EOS-E2E: OK` (count 200 000, each once, the zombie fenced); the view-engine e2e (its read_committed transaction leg now on the unified producer) and the catalog e2e still pass.
 - [ ] **Step 4: Commit** (client + broker) — `test(eos): 3-node exactly-once e2e on the unified producer (every path, injected aborts + rewind, coordinator and leader kills, zombie fenced); docs and release notes`.

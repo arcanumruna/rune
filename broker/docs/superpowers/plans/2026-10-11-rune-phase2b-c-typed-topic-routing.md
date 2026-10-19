@@ -42,7 +42,7 @@
 - Wire enums and fields are append-only. `TopicSchemaResponse` keeps `BODY_FIXED = 8`, `blockLength = 8`, templateId 67 and header version `kProtocolVersion` (3). `partitionCount` is **appended after the descriptor blob**, so pre-2b decoders, which stop after the blob, ignore it.
 - A typed topic whose schema has **no key field** keeps today's behaviour: partition 0, empty key. This is documented in `TypedTopic.h` and `Generator.h`.
 - `TypedTopic::send(rec)` routes exactly like `Producer::send(TopicHandle{id, partitionCount}, Key(rec.key()), bytes)`.
-- The public API names published on arcanum.regressorspath.com are unchanged by this part. `Client::openTopicAndWait<T>`, `TypedTopic::fromSchema` and `TypedTopic::send` keep their signatures. Only the low-level `TypedTopic(ProducerT, …)` constructor changes its second parameter from `int32_t topicId` to `TopicHandle`. Part B relies on that.
+- The public API names published on the published Arcanum site are unchanged by this part. `Client::openTopicAndWait<T>`, `TypedTopic::fromSchema` and `TypedTopic::send` keep their signatures. Only the low-level `TypedTopic(ProducerT, …)` constructor changes its second parameter from `int32_t topicId` to `TopicHandle`. Part B relies on that.
 - Cross-plan interface (consumed by Part B): `TopicSchemaResult.partitionCount`, generated `key()`, `TypedTopic` holding `TopicHandle{id, partitionCount}` (exposed as `handle()`), and `rune::client::HasRecordKey<T>`.
 
 ## Review Focus
@@ -2296,9 +2296,9 @@ log "  -> typed_route: 8-partition typed topic routed by key (Phase 2b C)"
 
 ```bash
 # Stage the four Part C repos (git archive HEAD of each, from se-worktrees/) into
-# /root/view-engine-e2e/<repo> on root@178.104.16.102 exactly as the Phase 1/2a
+# /root/view-engine-e2e/<repo> on root@$RUNE_VM_HOST exactly as the Phase 1/2a
 # e2e runs did — broker, protocol, CODEC (new for this part), client — then:
-ssh root@178.104.16.102 'cd /root/view-engine-e2e/rune-broker && bash docker/view-engine-e2e.sh'
+ssh root@$RUNE_VM_HOST 'cd /root/view-engine-e2e/rune-broker && bash docker/view-engine-e2e.sh'
 ```
 Expected output: `PROBE: typed_route OK — 64 records over N partitions …` (N > 1), `Typed routing OK: TYPED-ROUTING: OK parts=8 records=64 …`, the full `VIEW-ENGINE-E2E: OK`, and `SCRIPT_EXIT=0`. A failure exit code in 40..46 identifies which typed-routing assertion failed.
 

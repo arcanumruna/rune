@@ -22,7 +22,7 @@
 - **Latency floor:** native `<100µs` p99 gate must hold on the right-sized box; per-record latency must not regress. `[[benchmark-latency-gate]]`
 - **Benchmark rigor:** warm up before measuring; matched partition count + tuned config for both systems; prove every claim (no assumptions). `[[rune-ull-engineering-standard]]`
 - **Never push; local `main` only.** Docker images tagged with git SHA, never `:latest`. `[[docker-image-tag-policy]]`
-- **Hetzner box** `root@178.104.21.208` is user-authorized for benchmarking this session; do **not** touch verdaccio/artifactory containers or change `net.core.rmem_max`.
+- **Hetzner box** `root@$RUNE_BENCH_VM_HOST` is user-authorized for benchmarking this session; do **not** touch verdaccio/artifactory containers or change `net.core.rmem_max`.
 
 ## Acceptance Gates (this plan)
 

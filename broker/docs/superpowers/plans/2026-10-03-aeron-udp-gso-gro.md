@@ -54,7 +54,7 @@
 - [ ] **Step 1:** rune-protocol (shared sibling checkout `/Users/vradu/Projects/rune-protocol`, consumed by every worktree): `git -C /Users/vradu/Projects/rune-protocol switch -c feat/udp-gso` (from its current HEAD f3fa865; leave the unrelated modified `CLAUDE.md` alone — never stage it).
 - [ ] **Step 2:** broker: `git -C /Users/vradu/Projects/rune-broker-wt26 worktree add /Users/vradu/Projects/rune-broker-wt29 -b feat/udp-gso integ/perf-defaults`.
 - [ ] **Step 3:** client: `git -C /Users/vradu/Projects/rune-client-cpp-wt4 worktree add /Users/vradu/Projects/rune-client-cpp-wt5 -b feat/udp-gso HEAD` (HEAD = ab37438; the uncommitted canOffer WIP in wt4 stays there and is NOT part of this plan).
-- [ ] **Step 4:** VM tree: `ssh root@178.104.16.102 'mkdir -p /root/gso'`; sync script `/root/gso/sync.sh` is created in Task 2 Step 6.
+- [ ] **Step 4:** VM tree: `ssh root@$RUNE_VM_HOST 'mkdir -p /root/gso'`; sync script `/root/gso/sync.sh` is created in Task 2 Step 6.
 
 ---
 
@@ -236,7 +236,7 @@ git commit -m "feat(net): pure UDP GSO grouping / GRO split helpers"
 - [ ] **Step 1: Pin the Aeron include layout (probe).** On the VM (Linux), compile a 3-line C file to learn which include dirs the internal headers need:
 
 ```bash
-ssh root@178.104.16.102 'I=$(grep -o "/root/.conan2/p/[^;\"]*aeron[^;\"]*/p/include" /root/wt26/rune-broker/build-rel/CMakeCache.txt | head -1); echo $I;
+ssh root@$RUNE_VM_HOST 'I=$(grep -o "/root/.conan2/p/[^;\"]*aeron[^;\"]*/p/include" /root/wt26/rune-broker/build-rel/CMakeCache.txt | head -1); echo $I;
 printf "#include \"aeron_driver_context.h\"\n#include \"media/aeron_udp_channel_transport.h\"\n#include \"util/aeron_netutil.h\"\n#include \"util/aeron_error.h\"\nint main(void){return AERON_DRIVER_RECEIVER_IO_VECTOR_LENGTH_MAX;}\n" > /tmp/gsoprobe.c;
 gcc-13 -std=gnu11 -I$I -I$I/aeron -I$I/aeronmd -c /tmp/gsoprobe.c -o /tmp/gsoprobe.o && echo PROBE-OK'
 ```
@@ -507,13 +507,13 @@ cat > /tmp/gso-sync.sh <<'EOF'
 # Mac -> VM source sync for the GSO work (no build dirs, no .git).
 set -e
 for r in rune-protocol rune-fr rune-codec; do
-  rsync -a --delete --exclude build --exclude 'build-*' --exclude .git /Users/vradu/Projects/$r/ root@178.104.16.102:/root/gso/$r/
+  rsync -a --delete --exclude build --exclude 'build-*' --exclude .git /Users/vradu/Projects/$r/ root@$RUNE_VM_HOST:/root/gso/$r/
 done
-rsync -a --delete --exclude 'build*' --exclude .git /Users/vradu/Projects/rune-broker-wt29/ root@178.104.16.102:/root/gso/rune-broker/
-rsync -a --delete --exclude 'build*' --exclude .git /Users/vradu/Projects/rune-client-cpp-wt5/ root@178.104.16.102:/root/gso/rune-client-cpp/
+rsync -a --delete --exclude 'build*' --exclude .git /Users/vradu/Projects/rune-broker-wt29/ root@$RUNE_VM_HOST:/root/gso/rune-broker/
+rsync -a --delete --exclude 'build*' --exclude .git /Users/vradu/Projects/rune-client-cpp-wt5/ root@$RUNE_VM_HOST:/root/gso/rune-client-cpp/
 EOF
 bash /tmp/gso-sync.sh
-ssh root@178.104.16.102 'flock -w 7200 /root/vm.lock bash -c "cd /root/gso/rune-broker && export CC=gcc-13 CXX=g++-13 && cmake -S . -B build-rel -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=/root/rune-e5/rune-broker/build/Release/build/Release/generators/conan_toolchain.cmake -DBUILD_TESTING=ON -DBUILD_BROKER_NODE_TESTS=ON -DBUILD_GATEWAY_TESTS=ON -DBUILD_NODE_UDP_TESTS=ON -DBUILD_AERON_REPLICATION_TESTS=ON > /root/gso/cfg.log 2>&1 && nice -n 5 ninja -C build-rel -j4 rune_udp_gso_tests 2>&1 | tail -5"'
+ssh root@$RUNE_VM_HOST 'flock -w 7200 /root/vm.lock bash -c "cd /root/gso/rune-broker && export CC=gcc-13 CXX=g++-13 && cmake -S . -B build-rel -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=/root/rune-e5/rune-broker/build/Release/build/Release/generators/conan_toolchain.cmake -DBUILD_TESTING=ON -DBUILD_BROKER_NODE_TESTS=ON -DBUILD_GATEWAY_TESTS=ON -DBUILD_NODE_UDP_TESTS=ON -DBUILD_AERON_REPLICATION_TESTS=ON > /root/gso/cfg.log 2>&1 && nice -n 5 ninja -C build-rel -j4 rune_udp_gso_tests 2>&1 | tail -5"'
 ```
 Expected: FAIL to build — `rune_gso` target / `rune_gso_bindings.h` not found.
 
@@ -1056,7 +1056,7 @@ If `aeron_INCLUDE_DIRS` is empty on the VM, use the variable CMakeDeps defines f
 
 ```bash
 bash /tmp/gso-sync.sh
-ssh root@178.104.16.102 'flock -w 7200 /root/vm.lock bash -c "cd /root/gso/rune-broker && nice -n 5 ninja -C build-rel -j4 rune_udp_gso_tests 2>&1 | tail -3 && ./build-rel/rune_udp_gso_tests 2>&1 | tail -20"'
+ssh root@$RUNE_VM_HOST 'flock -w 7200 /root/vm.lock bash -c "cd /root/gso/rune-broker && nice -n 5 ninja -C build-rel -j4 rune_udp_gso_tests 2>&1 | tail -3 && ./build-rel/rune_udp_gso_tests 2>&1 | tail -20"'
 ```
 Expected: `[  PASSED  ] 10 tests.` and stderr shows `rune-gso: UDP GSO active ... seg=1408` and `rune-gso: UDP GRO active ...`.
 

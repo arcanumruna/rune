@@ -1,6 +1,6 @@
 # Final verification on the bench box (2026-10-07)
 
-- **Box:** k3s-node-01 (178.104.16.102): amd64, 4 cores, ext4 root disk (/dev/sda1), k3s stopped.
+- **Box:** k3s-node-01 ($RUNE_VM_HOST): amd64, 4 cores, ext4 root disk (/dev/sda1), k3s stopped.
 - **Code under test:** broker main `dc274e8`, with image `rune-broker-node:dc274e8` built on the box.
 - **Client image:** `rune-dr-client:4c36d0b`.
 - **Latency baseline:** `70217bd`, which is hot-path A merged and hot-path B not yet merged.
