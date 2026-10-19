@@ -3449,6 +3449,17 @@ BrokerNode::SecurityViewSnap BrokerNode::securityViewForTest() {
     });
 }
 
+BrokerNode::SecurityGateSnap BrokerNode::securityGateForTest() {
+    return onControlThreadForTest([this]() -> SecurityGateSnap {
+        SecurityGateSnap g;
+        g.held = securityGate_.size();
+        if (securityView_) g.applied = securityView_->appliedOffset();
+        g.refreshed = securityRefreshedOffset_;
+        if (gateway_) { g.gatewayEnforced = gateway_->securityEnforcedOffset(); g.pendingEnforce = gateway_->securityPendingEnforceForTest(); g.shipperPending = gateway_->permissionPendingUpdatesForTest(); }
+        return g;
+    });
+}
+
 bool BrokerNode::gatewayHasSessionForTest(int64_t sessionId) {
     return onControlThreadForTest([this, sessionId]() { return gateway_ != nullptr && gateway_->hasSessionForTest(sessionId); });
 }

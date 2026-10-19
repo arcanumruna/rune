@@ -434,6 +434,9 @@ public:
     void onSecurityHalted(int64_t offset);
     /// The newest security event offset whose refresh EVERY worker has accepted (D24 answer gate); -1 = none yet.
     [[nodiscard]] int64_t securityEnforcedOffset() const noexcept { return securityEnforcedOffset_; }
+    /// Test probes (Task 18): the event waiting for the shipper to drain (-1 none) and the shipper's queued updates.
+    [[nodiscard]] int64_t securityPendingEnforceForTest() const noexcept { return securityPendingEnforce_; }
+    [[nodiscard]] std::size_t permissionPendingUpdatesForTest() const noexcept { return permissionShipper_.pendingUpdates(); }
     /// Counter 1'000'232: sessions revoked (disabled / dropped / TERMINATE SESSIONS / security halt).
     [[nodiscard]] uint64_t sessionsRevoked() const noexcept { return sessionsRevoked_; }
     // ── authentication Task 12: per-session permission tables and the enforcement of every request type ──

@@ -271,3 +271,66 @@ TEST(PartitionAssignmentBumpRules, LeaderEpoch_NeverDecreases)
     auto next = mergeChange(cur, change);
     EXPECT_GE(next.leaderEpoch, cur.leaderEpoch);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Authentication Task 18 (seeded stress, seed 0): a DDL-churned AssignmentMap probed forever.  remove() left tombstones
+// that never counted toward the load factor, so create / drop churn over distinct topic ids ate every EMPTY slot and
+// get() of an absent key then looped for good on the control thread (every DDL answer stalled behind it).
+// ─────────────────────────────────────────────────────────────────────────────
+#include "rune/metadata/AssignmentMap.h"
+
+#include <atomic>
+#include <chrono>
+#include <memory>
+#include <thread>
+
+TEST(AssignmentMapRegression, ChurnOverDistinctTopicIdsNeverExhaustsEmptySlots) {
+    auto done = std::make_shared<std::atomic<bool>>(false);
+    std::thread([done] {
+        AssignmentMap m;
+        // a handful of live entries; thousands of create-then-drop cycles over fresh ids (DDL churn)
+        for (int32_t id = 1; id <= 5000; ++id) {
+            m.put(id, 0, PartitionAssignment{});
+            if (id > 3) m.remove(id - 3, 0);
+        }
+        EXPECT_EQ(m.size(), 3);
+        for (int32_t id = 6000; id < 6100; ++id) EXPECT_EQ(m.get(id, 0), nullptr);   // absent keys must terminate
+        for (int32_t id = 4998; id <= 5000; ++id) EXPECT_NE(m.get(id, 0), nullptr);
+        done->store(true);
+    }).detach();
+    for (int i = 0; i < 100 && !done->load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    ASSERT_TRUE(done->load()) << "AssignmentMap::get() of an absent key never returned (tombstones exhausted every EMPTY slot)";
+}
+
+TEST(AssignmentMapRegression, RemoveKeepsEveryOtherEntryReachable) {
+    AssignmentMap m;
+    for (int32_t id = 1; id <= 200; ++id) m.put(id, 0, PartitionAssignment{});
+    for (int32_t id = 1; id <= 200; id += 2) m.remove(id, 0);
+    for (int32_t id = 1; id <= 200; ++id) EXPECT_EQ(m.get(id, 0) != nullptr, id % 2 == 0) << id;
+    int n = 0;
+    m.forEach([&](int32_t, int32_t, const PartitionAssignment&) { ++n; });
+    EXPECT_EQ(n, 100);
+}
+
+#include <map>
+#include <random>
+
+TEST(AssignmentMapRegression, RandomPutRemoveMatchesAStdMap) {
+    std::mt19937 rng(7);
+    AssignmentMap m;
+    std::map<std::pair<int32_t, int32_t>, int32_t> model;
+    for (int step = 0; step < 20000; ++step) {
+        const int32_t t = static_cast<int32_t>(rng() % 300), p = static_cast<int32_t>(rng() % 3);
+        if (rng() % 2) { PartitionAssignment pa; pa.leaderNode = step; m.put(t, p, pa); model[{t, p}] = step; }
+        else { m.remove(t, p); model.erase({t, p}); }
+        if (step % 97 == 0) {
+            ASSERT_EQ(m.size(), static_cast<int>(model.size()));
+            for (int32_t tt = 0; tt < 300; ++tt) for (int32_t pp = 0; pp < 3; ++pp) {
+                const auto* got = m.get(tt, pp);
+                const auto it = model.find({tt, pp});
+                ASSERT_EQ(got != nullptr, it != model.end()) << step << " " << tt << "," << pp;
+                if (got) ASSERT_EQ(got->leaderNode, it->second);
+            }
+        }
+    }
+}

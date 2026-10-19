@@ -1511,6 +1511,9 @@ public:
             -1, w, [this, w, fn = std::forward<F>(f)]() mutable { return fn(workerPool_->worker(w)); }, timeout);
     }
     /// Authentication Task 10: the gateway's session table / auth-gate counters (read ON the control thread).
+    /// Task 18: the D24 answer gate's state (read ON the control thread).
+    struct SecurityGateSnap { std::size_t held = 0; int64_t applied = -1, refreshed = -1, gatewayEnforced = -1, pendingEnforce = -1; std::size_t shipperPending = 0; };
+    [[nodiscard]] SecurityGateSnap securityGateForTest();
     [[nodiscard]] bool gatewayHasSessionForTest(int64_t sessionId);
     [[nodiscard]] uint64_t authGateRefusalsForTest();
     /// Counter values the control thread publishes (read ON the control thread).

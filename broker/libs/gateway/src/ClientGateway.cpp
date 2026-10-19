@@ -4404,6 +4404,17 @@ void ClientGateway::onRecordEgressResolved_(int64_t sessionId, int32_t workerId,
 
 void ClientGateway::forwardUnsubscribeToWorker_(int64_t subId, int32_t topicId, int32_t partition)
 {
+    // Task 18 (seeded stress): a Subscribe still WAITING for its session's record-egress pub (pendingRecordEgress_) has not
+    // reached the worker, so there is nothing there to unsubscribe - and left in the waiter list it would be enqueued
+    // later, a zombie cursor the gateway no longer knows (it kept pushing after a revoke ended the subscription, and
+    // resumed on a re-grant).  Cancel it where it waits.
+    for (auto& [key, pend] : pendingRecordEgress_) {
+        for (std::size_t i = 0; i < pend.waiters.size(); ++i) {
+            if (pend.waiters[i].subId != subId) continue;
+            pend.waiters.erase(pend.waiters.begin() + static_cast<std::ptrdiff_t>(i));
+            return;
+        }
+    }
     // M5: never dropped on a full ring — queued (behind any queued Subscribe of
     // the same worker, so the pair keeps its order) and retried every doWork.
     PendingSubOp p;

@@ -13,6 +13,10 @@
 #include "support/AuthRig.h"
 #include "support/PermissionModel.h"
 
+#include <rune/protocol/RecordBatch.h>
+#include <rune/security/SecurityReplayer.h>
+#include <rune/storage/Log.h>
+
 #include <algorithm>
 #include <cstdlib>
 #include <random>
@@ -29,6 +33,54 @@ using Clock = std::chrono::steady_clock;
 using namespace std::chrono_literals;
 
 namespace {
+
+/// Invariant 4 (digest): the broker's SecurityView digest equals the digest of `__security` replayed from offset 0 by the
+/// shared verifying SecurityReplayer (the library every client folds the log through).  Empty string = equal.
+std::string digestConvergence(BrokerNode& node) {
+    struct Replay { uint64_t digest = 0; int64_t applied = -1; std::string error; };
+    const Replay replay = node.onAdminThreadForTest([&node]() -> Replay {
+        Replay out;
+        rune::storage::Log* log = node.securityLogForTest();
+        if (log == nullptr) { out.error = "no __security log"; return out; }
+        rune::security::SecurityReplayer r;
+        int64_t next = 0;
+        const int64_t leo = log->logEndOffset();
+        while (next < leo) {
+            const std::vector<uint8_t> data = log->read(next, 1 << 22);
+            if (data.empty()) break;
+            std::size_t pos = 0;
+            const int64_t before = next;
+            while (pos < data.size() && out.error.empty()) {
+                rune::protocol::RecordBatchReader reader(data.data() + pos, data.size() - pos);
+                if (!reader.ensureValid()) break;
+                const auto tl = static_cast<std::size_t>(reader.totalLength());
+                reader.forEachRecord([&](std::string_view, std::string_view val, int64_t off, int64_t) {
+                    if (off < next || !out.error.empty()) return;
+                    const auto fed = r.feed(off, std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(val.data()), val.size()));
+                    if (!fed) { out.error = rune::security::describe(fed.error()); return; }
+                    next = off + 1;
+                });
+                if (tl == 0) break;
+                pos += tl;
+            }
+            if (!out.error.empty() || next == before) break;
+        }
+        out.digest = r.state().digest();
+        out.applied = r.state().appliedOffset();
+        return out;
+    });
+    if (!replay.error.empty()) return "the __security log does not replay: " + replay.error;
+    for (int i = 0; i < 400; ++i) {   // the view catches up to the log end within a moment
+        const auto v = node.securityViewForTest();
+        if (v.appliedOffset == replay.applied) {
+            if (v.halted) return "the SecurityView is halted";
+            return v.digest == replay.digest ? std::string{} : "SecurityView digest " + std::to_string(v.digest) +
+                   " != replayed digest " + std::to_string(replay.digest) + " at offset " + std::to_string(replay.applied);
+        }
+        std::this_thread::sleep_for(10ms);
+    }
+    return "the SecurityView never reached the log end (replay applied " + std::to_string(replay.applied) + ")";
+}
 
 int envInt(const char* name, int dflt) {
     const char* v = std::getenv(name);
@@ -170,7 +222,7 @@ private:
             if (c.answered) continue;
             auto& adm = rig_.broker().admin().raw();
             const auto a = adm.awaitAnyDdlAnswer(c.corr, Clock::now() + 1ms);
-            if (!a) { if (now - sentAt_[c.idx] > 5s) { std::string un; for (const Pending& q : changes_) if (!q.answered) un += " #" + std::to_string(q.idx) + "(" + q.c.str() + ")"; failWith_("unanswered security DDL #" + std::to_string(c.idx) + ": " + c.c.str() + "; all unanswered:" + un + "; answered changes: " + std::to_string(std::count_if(changes_.begin(), changes_.end(), [](const Pending& q) { return q.answered; })) + "/" + std::to_string(changes_.size())); } continue; }
+            if (!a) { if (now - sentAt_[c.idx] > 5s) { std::string un; for (const Pending& q : changes_) if (!q.answered) un += " #" + std::to_string(q.idx) + "(" + q.c.str() + ")"; failWith_("unanswered security DDL #" + std::to_string(c.idx) + ": " + c.c.str() + "; all unanswered:" + un + "; gate{" + gateStr_() + "}; answered changes: " + std::to_string(std::count_if(changes_.begin(), changes_.end(), [](const Pending& q) { return q.answered; })) + "/" + std::to_string(changes_.size())); } continue; }
             c.code = a->responseTemplate == static_cast<uint16_t>(pc::TemplateId::DdlResponse)
                          ? (adm.awaitDdl(c.corr, Clock::now() + 1s) ? adm.awaitDdl(c.corr, Clock::now() + 1s)->errorCode : 0xFFFF)
                          : a->code;
@@ -195,7 +247,7 @@ private:
             if (r.kind == Req::Kind::Produce) {
                 if (const auto a = s.c->ackFor(r.corr)) { code = a->errorCode; got = true; }
             } else if (const auto a = s.c->awaitDefine(r.corr, Clock::now() + 1ms)) { code = a->errorCode; got = true; if (code == 0) exists_[r.topic] = a->topicId; }
-            if (!got && revokedFrame_(s)) { got = true; code = 46; }   // "SessionRevoked on every in-flight request" (spec §10)
+            if (!got && revokedFrame_(s)) { got = true; code = 46; if (r.kind == Req::Kind::Create) unknown_.insert(r.topic); }   // the create may or may not have happened   // "SessionRevoked on every in-flight request" (spec §10)
             if (!got) {
                 if (now - r.sentAt > 5s) { failWith_("unanswered request (step " + std::to_string(r.step) + ")"); return; }
                 ++i; continue;
@@ -235,6 +287,17 @@ private:
                     failWith_("REVOKE DID NOT END the subscription on " + s.topic + " of " + user_(se.user) + " (1 s after the change's answer)");
             }
         }
+    }
+    std::string gateStr_() {
+        const auto g = rig_.broker().node().securityGateForTest();
+        return "held=" + std::to_string(g.held) + " applied=" + std::to_string(g.applied) + " refreshed=" + std::to_string(g.refreshed) +
+               " gwEnforced=" + std::to_string(g.gatewayEnforced) + " pendingEnforce=" + std::to_string(g.pendingEnforce) +
+               " shipperPending=" + std::to_string(g.shipperPending);
+    }
+    static std::string offsetsOf_(Sess& s, int64_t subId) {
+        std::string o;
+        for (const auto& p : s.c->records()) if (p.subscriptionId == subId) o += std::to_string(p.baseOffset) + ",";
+        return o;
     }
     static bool revokedFrame_(Sess& s) {
         for (const auto& e : s.c->errors()) if (e.sessionId == s.sid && e.code == 46) return true;
@@ -352,7 +415,7 @@ private:
             subs_.push_back(sub);
         } else if (roll < 94) {   // CREATE TOPIC by a user
             std::vector<std::string> free;
-            for (const std::string& n : topicNames_()) if (exists_[n] < 0 && !creating_.count(n)) free.push_back(n);
+            for (const std::string& n : topicNames_()) if (exists_[n] < 0 && !creating_.count(n) && !unknown_.count(n)) free.push_back(n);
             if (free.empty()) { note_("idle"); return; }
             const std::string t = free[static_cast<std::size_t>(pick_(static_cast<int>(free.size())))];
             Req r; r.kind = Req::Kind::Create; r.sess = static_cast<int>(si); r.topic = t;
@@ -366,6 +429,7 @@ private:
             quiesceCreates_();
             if (!fail_.empty()) return;
             const std::string t = topicNames_()[static_cast<std::size_t>(pick_(7))];
+            if (unknown_.count(t)) { note_("idle"); return; }   // a create answered by the session revocation: existence unknown
             if (exists_[t] >= 0) {
                 const bool subbed = std::any_of(subs_.begin(), subs_.end(), [&](const Sub& x) { return x.topic == t && x.st != Sub::St::Ended; });
                 if (subbed) { note_("idle"); return; }
@@ -435,8 +499,9 @@ private:
         // no Records after the end of a subscription
         for (const Sub& s : subs_)
             if (s.st == Sub::St::Ended && s.settled && s.subId != 0 && pushes_(sess_[static_cast<std::size_t>(s.sess)], s.subId) != s.recordsAtEnd && s.endCode != 0) {
-                failWith_("Records delivered on " + s.topic + " after its ErrorResponse(" + std::to_string(s.endCode) + "): " + std::to_string(s.recordsAtEnd) + " -> " + std::to_string(pushes_(sess_[static_cast<std::size_t>(s.sess)], s.subId)) + " ended at step " + std::to_string(s.endStep) + ", first late record at step " + std::to_string(s.lateStep - 1) + " (sub of step " + std::to_string(s.sentSteps) + ", user " + user_(sess_[static_cast<std::size_t>(s.sess)].user) + ")"); return;
+                failWith_("Records delivered on " + s.topic + " after its ErrorResponse(" + std::to_string(s.endCode) + "): " + std::to_string(s.recordsAtEnd) + " -> " + std::to_string(pushes_(sess_[static_cast<std::size_t>(s.sess)], s.subId)) + " ended at step " + std::to_string(s.endStep) + ", first late record at step " + std::to_string(s.lateStep - 1) + " topicId(sub)=" + std::to_string(s.topicId) + " topicId(now)=" + std::to_string(exists_[s.topic]) + " baseOffsets=" + offsetsOf_(sess_[static_cast<std::size_t>(s.sess)], s.subId) + " (sub of step " + std::to_string(s.sentSteps) + ", user " + user_(sess_[static_cast<std::size_t>(s.sess)].user) + ")"); return;
             }
+        if (const std::string d = digestConvergence(rig_.broker().node()); !d.empty()) { failWith_("CONVERGENCE: " + d); return; }
         // probes: every alive session x existing topic answers exactly what the model says
         step_ = static_cast<std::size_t>(steps_) + 1;
         std::size_t probed = 0;
@@ -484,7 +549,7 @@ private:
     std::vector<Req> reqs_;
     std::vector<Sub> subs_;
     std::map<std::string, int32_t> exists_;
-    std::set<std::string> creating_;
+    std::set<std::string> creating_, unknown_;
     std::map<ShardTestClient*, std::size_t> scanFrom_, recBase_;
     uint64_t reqCounter_ = 0;
 };
