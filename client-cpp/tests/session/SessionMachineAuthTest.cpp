@@ -80,8 +80,9 @@ struct Rig {
     std::unique_ptr<sm::SessionMachine> m;
     int64_t corr = 0;
     explicit Rig(const std::string& user = "ws1", const std::string& pass = "correct horse battery",
-                 bool forever = false) {
+                 bool forever = false, bool allowUnauthenticated = false) {
         cfg.username = user; cfg.password = pass; cfg.reconnectForeverAfterLive = forever;
+        cfg.allowUnauthenticatedBroker = allowUnauthenticated;
         m = std::make_unique<sm::SessionMachine>(io, cfg);
     }
     void connectAuthRequired(int64_t now = 1) {
@@ -208,7 +209,7 @@ TEST(SessionMachineAuthRegression, AuthenticationFailedIsTerminalUnlessRateLimit
         EXPECT_EQ(t.m->authRetryAfterMs(), 800u);
     }
     {   // reconnectForeverAfterLive + a previous Live episode: 44 with retryAfterMs 800 -> Backoff >= now + 800 ms
-        Rig t("ws1", "correct horse battery", /*forever=*/true);
+        Rig t("ws1", "correct horse battery", /*forever=*/true, /*allowUnauthenticated=*/true);   // episode 1 is a dev-style OK
         t.m->connect(0);
         const int64_t c0 = t.io.lastCorrelation();
         t.m->onConnectResponse(0, -1, 42, c0, 1);                // a dev-mode style OK: Connected, Live
@@ -231,7 +232,7 @@ TEST(SessionMachineAuthRegression, AuthenticationFailedIsTerminalUnlessRateLimit
         EXPECT_EQ(t.io.countOf(pc::TemplateId::AuthClientFirst), 1);
     }
     {   // the same without retryAfterMs: terminal even for a reconnect-forever session
-        Rig t("ws1", "correct horse battery", true);
+        Rig t("ws1", "correct horse battery", true, true);
         t.m->connect(0);
         t.m->onConnectResponse(0, -1, 42, t.io.lastCorrelation(), 1);
         t.m->forceReconnect(10);
@@ -243,7 +244,7 @@ TEST(SessionMachineAuthRegression, AuthenticationFailedIsTerminalUnlessRateLimit
 }
 
 TEST(SessionMachineAuthRegression, ADevModeBrokerSkipsAuthentication) {
-    CapturingIo io; sm::SessionConfig cfg; cfg.username = "ws1"; cfg.password = "pw";
+    CapturingIo io; sm::SessionConfig cfg;   // no credentials: a dev-mode broker is the expected peer
     sm::SessionMachine m(io, cfg);
     m.connect(0);
     const int64_t corr = io.lastCorrelation();
@@ -254,7 +255,7 @@ TEST(SessionMachineAuthRegression, ADevModeBrokerSkipsAuthentication) {
 }
 
 TEST(SessionMachineAuthRegression, APreV9BrokerConnectsAtOnceWithoutAuthentication) {
-    CapturingIo io; sm::SessionConfig cfg; cfg.username = "ws1"; cfg.password = "pw";
+    CapturingIo io; sm::SessionConfig cfg;
     sm::SessionMachine m(io, cfg);
     m.connect(0);
     m.onConnectResponse(0, -1, 42, io.lastCorrelation(), 1);   // defaults: InProcess / Anonymous (no v9 trailer)
@@ -262,14 +263,79 @@ TEST(SessionMachineAuthRegression, APreV9BrokerConnectsAtOnceWithoutAuthenticati
     EXPECT_EQ(io.countOf(pc::TemplateId::AuthClientFirst), 0);
 }
 
-TEST(SessionMachineAuthRegression, AResumedAuthenticatedSessionDoesNotReauthenticate) {
-    CapturingIo io; sm::SessionConfig cfg; cfg.username = "ws1"; cfg.password = "pw";
+// Review B I3: a client WITH credentials never takes a broker's word that it need not log in.  Connected needs a
+// completed login (server signature verified) or the resume of a session THIS machine authenticated.
+TEST(SessionMachineAuthRegression, ACredentialedClientRefusesABrokerThatSkipsTheLoginRegression) {
+    struct Case { const char* name; pc::AuthMode mode; pc::AuthState state; bool preV9; };
+    const Case cases[] = {
+        {"DevDisabled",                pc::AuthMode::DevDisabled, pc::AuthState::Anonymous, false},
+        {"InProcess",                  pc::AuthMode::InProcess,   pc::AuthState::Anonymous, false},
+        {"pre-v9 (no trailer)",        pc::AuthMode::InProcess,   pc::AuthState::Anonymous, true},
+        {"Required+Anonymous",         pc::AuthMode::Required,    pc::AuthState::Anonymous, false},
+        {"Required+Resumed on first",  pc::AuthMode::Required,    pc::AuthState::ResumedAuthenticated, false},
+    };
+    for (const bool allow : {false, true}) {
+        for (const Case& c : cases) {
+            SCOPED_TRACE(std::string(c.name) + (allow ? " allowUnauthenticatedBroker" : ""));
+            CapturingIo io; sm::SessionConfig cfg; cfg.username = "ws1"; cfg.password = "correct horse battery";
+            cfg.allowUnauthenticatedBroker = allow;
+            sm::SessionMachine m(io, cfg);
+            m.connect(0);
+            if (c.preV9) m.onConnectResponse(0, -1, 42, io.lastCorrelation(), 1);
+            else m.onConnectResponse(0, -1, 42, io.lastCorrelation(), 1, 0, {}, c.mode, c.state);
+            if (allow) {
+                EXPECT_EQ(m.state(), sm::SessionState::Connected);
+                EXPECT_FALSE(m.authenticated()) << "an accepted unauthenticated broker is still not a login";
+            } else {
+                EXPECT_EQ(m.state(), sm::SessionState::Rejected);
+                EXPECT_EQ(m.rejectCode(), 44);
+                EXPECT_FALSE(m.rejectDetail().empty()) << "the refusal names its case";
+            }
+            EXPECT_EQ(io.countOf(pc::TemplateId::AuthClientFirst), 0);
+        }
+    }
+    // The detail names the case (the operator's next step).
+    CapturingIo io; sm::SessionConfig cfg; cfg.username = "ws1"; cfg.password = "x";
+    sm::SessionMachine a(io, cfg);
+    a.connect(0);
+    a.onConnectResponse(0, -1, 42, io.lastCorrelation(), 1, 0, {}, pc::AuthMode::Required, pc::AuthState::Anonymous);
+    EXPECT_NE(a.rejectDetail().find("rune security bootstrap"), std::string::npos) << a.rejectDetail();
+    CapturingIo io2;
+    sm::SessionMachine b(io2, cfg);
+    b.connect(0);
+    b.onConnectResponse(0, -1, 42, io2.lastCorrelation(), 1, 0, {}, pc::AuthMode::DevDisabled, pc::AuthState::Anonymous);
+    EXPECT_NE(b.rejectDetail().find("allowUnauthenticatedBroker"), std::string::npos) << b.rejectDetail();
+}
+
+TEST(SessionMachineAuthRegression, AnEarnedResumeIsAcceptedAndAnUnearnedOneIsNot) {
+    CapturingIo io; sm::SessionConfig cfg; cfg.username = "ws1"; cfg.password = "correct horse battery";
     sm::SessionMachine m(io, cfg);
     m.connect(0);
-    m.onConnectResponse(0, -1, 42, io.lastCorrelation(), 1, 0, {}, pc::AuthMode::Required,
-                        pc::AuthState::ResumedAuthenticated);
-    EXPECT_EQ(m.state(), sm::SessionState::Connected);
-    EXPECT_EQ(io.countOf(pc::TemplateId::AuthClientFirst), 0);
+    auto r = authRequired(io.lastCorrelation());
+    m.onConnectResponse(r.code, -1, 42, io.lastCorrelation(), 1, 0, {}, r.authMode, r.authState);
+    auto cf = pc::AuthClientFirst::decode(io.frames.back().data(), io.frames.back().size()).value();
+    Server srv; srv.verifiers.push_back(*rs::makeVerifier("correct horse battery"));
+    std::string combined; auto sf = srv.first(cf, combined);
+    m.onAuthServerFirst(sf, 2);
+    m.onAuthServerFinal(pc::AuthServerFinal{.errorCode = 0, .serverSignature = srv.signature(cf, combined, 0)}, 3);
+    ASSERT_EQ(m.state(), sm::SessionState::Connected);
+    EXPECT_TRUE(m.authenticated());
+    const int firstsBefore = io.countOf(pc::TemplateId::AuthClientFirst);
+    // The link drops; the machine resumes (the hint is its own authenticated id).
+    m.onTransportDisconnected(10);
+    m.tick(11);
+    ASSERT_EQ(m.state(), sm::SessionState::Connecting);
+    m.onConnectResponse(0, -1, 42, io.lastCorrelation(), 12, 0, {}, pc::AuthMode::Required, pc::AuthState::ResumedAuthenticated);
+    EXPECT_EQ(m.state(), sm::SessionState::Connected) << "the broker kept this machine's own authenticated session";
+    EXPECT_TRUE(m.authenticated());
+    EXPECT_EQ(io.countOf(pc::TemplateId::AuthClientFirst), firstsBefore) << "no second login";
+    // ... but "resumed" under ANOTHER session id was never authenticated by this machine.
+    m.onTransportDisconnected(20);
+    m.tick(21);
+    ASSERT_EQ(m.state(), sm::SessionState::Connecting);
+    m.onConnectResponse(0, -1, 77, io.lastCorrelation(), 22, 0, {}, pc::AuthMode::Required, pc::AuthState::ResumedAuthenticated);
+    EXPECT_EQ(m.state(), sm::SessionState::Rejected);
+    EXPECT_EQ(m.rejectCode(), 44);
 }
 
 TEST(SessionMachineAuthRegression, NoDataFrameLeavesBeforeConnected) {
@@ -367,6 +433,16 @@ TEST(SessionMachineAuthRegression, ALoginThatNeverAnswersTimesOutLikeAStuckHands
 TEST(SessionMachineAuthRegression, AnErrorResponseAuthenticationFailedEndsTheLogin) {
     Rig t; t.connectAuthRequired();
     t.m->onErrorResponse(44, "authentication deadline", t.corr, 3, 42);   // D13: the broker's auth deadline
+    EXPECT_EQ(t.m->state(), sm::SessionState::Rejected);
+    EXPECT_EQ(t.m->rejectCode(), 44);
+}
+
+// Review B M2: the broker's auth deadline (D13) is a SESSION-level refusal: correlation id 0, naming the session.
+TEST(SessionMachineAuthRegression, ASessionLevelAuthenticationFailedEndsTheLoginRegression) {
+    Rig t; t.connectAuthRequired();
+    t.m->onErrorResponse(44, "authentication deadline", /*corr=*/0, 3, /*noticeSessionId=*/99);   // another session's
+    EXPECT_EQ(t.m->state(), sm::SessionState::Authenticating) << "a notice naming another session moves nothing";
+    t.m->onErrorResponse(44, "authentication deadline", 0, 4, 42);
     EXPECT_EQ(t.m->state(), sm::SessionState::Rejected);
     EXPECT_EQ(t.m->rejectCode(), 44);
 }
@@ -541,4 +617,44 @@ TEST(SessionMachineAuthRegression, OverTlsTheLoginFollowsTheHandshakeAndConnecte
     EXPECT_EQ(m.state(), sm::SessionState::Authenticating);
     m.onAuthServerFinal(pc::AuthServerFinal{.errorCode = 0, .serverSignature = s.signature(cf, combined, 0)}, 3);
     EXPECT_EQ(m.state(), sm::SessionState::Connected);
+}
+
+// Review B I2: the broker's final-leg HandshakeFailed arrives while the machine is Authenticating (a TLS 1.3 client is
+// done once it has SENT its Finished): terminal Rejected(HandshakeFailed), not a transient timeout.
+TEST(SessionMachineAuthRegression, AFinalLegHandshakeFailedWhileAuthenticatingIsRejectedHandshakeFailedRegression) {
+    const std::string serverPem = slurp(testdata("server.pem")), serverKey = slurp(testdata("server.key")),
+                      caPem = slurp(testdata("ca.pem"));
+    cr::TlsSession srv = cr::TlsSession::makeServer(serverPem.c_str(), serverKey.c_str());
+    ASSERT_TRUE(srv.valid());
+    CapturingIo io; sm::SessionConfig cfg;
+    cfg.offerCrypto = true; cfg.tlsTrustPem = caPem; cfg.tlsExpectHost = "localhost";
+    cfg.username = "ws1"; cfg.password = "correct horse battery";
+    sm::SessionMachine m(io, cfg);
+    m.connect(0);
+    std::size_t delivered = 0;
+    constexpr int64_t kSid = 42;
+    for (int i = 0; i < 20 && m.state() != sm::SessionState::Authenticating; ++i) {
+        ASSERT_GT(io.frames.size(), delivered);
+        const auto& frame = io.frames[delivered];
+        const bool first = delivered++ == 0;
+        std::string_view peer; int64_t corr = 0; uint8_t cipher = 0;
+        if (first) {
+            auto req = rune::client::codec::decodeConnectRequest(frame.data(), frame.size());
+            peer = req->handshakeBytes; corr = req->correlationId; cipher = req->cipherList[0];
+        } else {
+            auto hc = rune::client::codec::decodeHandshakeContinue(frame.data(), frame.size());
+            peer = hc->handshakeBytes; corr = hc->correlationId;
+        }
+        ASSERT_NE(srv.readInbound(reinterpret_cast<const uint8_t*>(peer.data()), peer.size()), cr::HsState::Failed);
+        uint8_t out[16384];
+        const std::size_t n = srv.writeOutbound(out, sizeof out);
+        const std::string_view outView(reinterpret_cast<const char*>(out), n);
+        if (first) m.onConnectResponse(0, -1, kSid, corr, 1, cipher, outView, pc::AuthMode::Required, pc::AuthState::MustAuthenticate);
+        else m.onHandshakeContinueResponse(0, outView, corr, 1);
+    }
+    ASSERT_EQ(m.state(), sm::SessionState::Authenticating);
+    m.onHandshakeContinueResponse(static_cast<int16_t>(pc::ErrorCode::HandshakeFailed), {}, m.correlationId(), 2, kSid);
+    EXPECT_EQ(m.state(), sm::SessionState::Rejected);
+    EXPECT_EQ(m.rejectCode(), static_cast<int16_t>(pc::ErrorCode::HandshakeFailed));
+    EXPECT_FALSE(m.cryptoState().encrypted) << "the keys of the failed episode are gone";
 }

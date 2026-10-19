@@ -63,6 +63,7 @@
 #include <rune/client/DutyView.h>
 #include <rune/client/shard/ShardState.h>
 #include <rune/client/catalog/CatalogReader.h>
+#include <rune/client/detail/SecureZero.h>
 #include <rune/client/security/SecurityDdl.h>
 #include <rune/client/security/SecurityReader.h>
 #include <rune/catalog/CatalogQueries.h>
@@ -368,6 +369,11 @@ struct ClientConfig {
     // `password` and `passwordFile` throws std::invalid_argument; an unreadable file throws
     // std::runtime_error.
     std::string passwordFile;
+    // allowUnauthenticatedBroker (review B I3): a Client WITH credentials refuses a broker that skips the login
+    // (dev mode RUNE_AUTH=disabled, a pre-authentication broker, a cluster with no security admin yet) with
+    // AuthenticationFailed — a rogue endpoint must not receive a credentialed client's data.  Set true to accept
+    // such a broker anyway (authStatus() then reports Anonymous).  A Client without credentials is unaffected.
+    bool allowUnauthenticatedBroker = false;
     // minPasswordLength / scramIterations: how this client builds a NEW verifier (ALTER USER ...
     // SET PASSWORD, the CLI's bootstrap) — the broker never sees a password, so the minimum is the
     // client's rule (D9).  Not used by the login itself, which follows the broker's salt and count.
@@ -660,6 +666,8 @@ public:
     void testRequestMetadataNow() noexcept { lastUrgentMetadataNs_ = INT64_MIN; requestMetadataNow_(); }
     /// Test hook (duty-cycle thread only): agent session `i`'s state.
     [[nodiscard]] session::SessionState testSessionStateAt(uint32_t i) const noexcept { return agent_.sessionStateAt(i); }
+    /// Review B I5 test seam (Invoker owner only): the seed's link dropped — Connected -> Resuming -> a resume ConnectRequest.
+    void testForceResume() { agent_.seedSession().machine.onTransportDisconnected(now()); }
     [[nodiscard]] uint64_t testSessionConnectFailuresAt(uint32_t i) const noexcept { return agent_.sessionConnectFailuresAt(i); }
     /// Test hook (duty-cycle thread only): the cached advertised ingress stream (0 = none).
     [[nodiscard]] int32_t testIngressStreamIdFor(int32_t topicId, int32_t partition) const {
@@ -1248,6 +1256,7 @@ private:
         /// own deadline; it never reached a broker.
         struct CtlAwaitingSeed { std::vector<uint8_t> frame; };
         std::variant<std::monostate, DdlPending, CtlAwaitingSeed> ddl;   // catalog history: a DDL's own state
+        detail::SecretString newPassword;   // review B I4: a self SET PASSWORD's plaintext until its answer (wiped always)
     };
 
     /// Header of a kMsgControlOp ring record (followed by the op's frame).
@@ -1263,6 +1272,7 @@ private:
         // decode at issue), stamped by the duty thread (instance id + its
         // counter); 0 = the frame carries an explicit requestId (or is not a DDL).
         uint32_t          requestIdAt   = 0;
+        uint16_t          secretLen     = 0;   // review B I4: trailing bytes of the record's frame area that are a secret, not wire
     };
 
     /// A handler completion deferred while close() runs (delivered after every
@@ -1279,7 +1289,8 @@ private:
         uint8_t state     = 0;
         uint8_t authMode  = static_cast<uint8_t>(rune::protocol::client::AuthMode::InProcess);   // brokerAuthMode()
         uint8_t passwordChangeRequired = 0;                                                      // one-time password
-        uint8_t pad[5]{};
+        uint8_t authenticated = 0;                                                               // review B I3: an earned session
+        uint8_t pad[4]{};
     };
 
     // -------------------------------------------------------------------------
@@ -1417,8 +1428,11 @@ private:
     static void rediscoverTrampoline_(void* ctx) noexcept;
 
     // ---- F8c C3: control ops (duty-thread owned pending table) --------------
+    /// `secret` (review B I4): bytes carried to the duty thread AFTER the wire frame in the same record, handed to the
+    /// op's PendingCtl::newPassword (a self SET PASSWORD's plaintext, installed on OK) — never sent, wiped on any outcome.
     OpResult issueControl_(OpKind op, CompletionTarget target, Token token,
-                           std::span<const uint8_t> frame, uint32_t payloadHint, uint32_t requestIdAt = 0);
+                           std::span<const uint8_t> frame, uint32_t payloadHint, uint32_t requestIdAt = 0,
+                           std::span<const uint8_t> secret = {});
     // ---- Catalog history (Task 5): DDL issue + answers (duty thread, cold) ----
     /// The DDL extension of `ddl` (views into `ddl` / cfg_; requestId as given).
     [[nodiscard]] rune::protocol::client::DdlExtension ddlExt_(const DdlOptions& ddl) const noexcept;
@@ -1427,7 +1441,11 @@ private:
     /// generated requestId there when ext.requestId is none() — the offset is
     /// verified against a decode of the frame first.
     OpResult issueDdl_(OpKind op, CompletionTarget target, Token token, std::span<const uint8_t> frame,
-                       const rune::protocol::client::DdlExtension& ext, std::size_t extOffset);
+                       const rune::protocol::client::DdlExtension& ext, std::size_t extOffset,
+                       std::span<const uint8_t> secret = {});
+    /// Review B I4: the session user's own SET PASSWORD was applied — every session logs in with the new password
+    /// from now on, the salted-password cache is cleared, a one-time session becomes a normal one.
+    void installSelfPassword_(std::string_view newPassword) noexcept;
     /// ErrorResponse{Redirect, endpoint} for pendingCtl_[i] (a DDL).
     void onDdlRedirect_(std::size_t i, std::string_view endpoint, int64_t nowNs);
     /// NotLeader (ErrorResponse or a response's errorCode 2) for pendingCtl_[i] (a DDL).

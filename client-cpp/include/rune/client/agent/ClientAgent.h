@@ -465,6 +465,26 @@ public:
     [[nodiscard]] bool     lastConnectAccepted() const noexcept { return lastConnectAccepted_; }
     [[nodiscard]] bool     lastConnectAwaited() const noexcept { return lastConnectAwaited_; }
     [[nodiscard]] uint32_t lastConnectSession() const noexcept { return lastConnectSession_; }
+    /// Review B I4: the credential changed (the user set their own password): every session logs in with
+    /// `newPassword` from now on (also sessions opened later), the salted-password cache is cleared (the old password's
+    /// salted values must not survive), a one-time session is a normal one.  Duty thread.
+    void installPassword(std::string_view newPassword) noexcept {
+        if (!cfg_.session.password.empty()) detail::secureZero(cfg_.session.password.data(), cfg_.session.password.size());
+        cfg_.session.password.assign(newPassword);
+        for (auto& s : sessions_) s->machine.installPassword(newPassword);
+        scramCache_.clear();
+    }
+    /// Review B I1: sessions other than the seed that are Rejected (revoked / login refused) — cheap check (the
+    /// session list is cluster-sized).  The owner then fails the routes they carried.
+    [[nodiscard]] uint32_t rejectedLeaderSessions() const noexcept {
+        uint32_t n = 0;
+        for (std::size_t i = 1; i < sessions_.size(); ++i)
+            if (sessions_[i]->machine.state() == session::SessionState::Rejected) ++n;
+        return n;
+    }
+    /// Review B I1: the Rejected leader session's reject code (46 / 44 ...) when (topicId, partition) is routed through
+    /// one, else 0.  Never opens a session.
+    [[nodiscard]] int16_t rejectedRouteCode(int32_t topicId, int32_t partition) const noexcept;
     /// Authentication: the salted-password cache (test seam: hit / PBKDF2 counters).
     [[nodiscard]] const session::ScramCache& scramCache() const noexcept { return scramCache_; }
 

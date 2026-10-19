@@ -76,6 +76,8 @@ struct TwoLegTlsGateway {
     /// HandshakeContinueResponse{HandshakeFailed}, re-offered `failRepeats` more times — the real
     /// broker re-offers it reliably) for connects whose corrId is >= failFinalLegFromCorr.
     bool failFinalLeg = false;
+    /// Review B I2: the ConnectResponse is v9 with authMode Required / MustAuthenticate — after its TLS the client logs in.
+    bool requireAuth = false;
     int64_t failFinalLegFromCorr = 0;
     int failRepeats = 3;
     int finalLegFailuresSent = 0;
@@ -191,6 +193,15 @@ struct TwoLegTlsGateway {
                 legSid = sid;
                 secondLegPending = true;
             }
+            if (requireAuth) {
+                std::vector<uint8_t> v9;
+                const std::size_t rn9 = rcc::encodeConnectResponseV9(
+                    v9, 0, 0, sid, c->sessionId, c->correlationId, rune::protocol::client::AuthMode::Required,
+                    rune::protocol::client::AuthState::MustAuthenticate, rune::protocol::client::kBrokerVersion,
+                    c->cipherList[0], std::string_view(reinterpret_cast<const char*>(out), first));
+                sendRaw(v9.data(), rn9);
+                return;
+            }
             uint8_t resp[16384 + 128];
             const std::size_t rn = rcc::encodeConnectResponse(
                 resp, sizeof resp, 0, 0, sid, c->sessionId, c->correlationId, rune::protocol::client::kBrokerVersion,
@@ -266,8 +277,9 @@ struct Rig {
     bool invoker = false;
     std::unique_ptr<Client> client;
     std::unique_ptr<TwoLegTlsGateway> gw;
-    explicit Rig(bool invokerMode = false, bool twoLeg = true) : invoker(invokerMode) {
+    explicit Rig(bool invokerMode = false, bool twoLeg = true, bool login = false) : invoker(invokerMode) {
         ClientConfig cfg;
+        if (login) { cfg.username = "ws1"; cfg.password = "correct horse battery"; }
         cfg.gatewayChannel = "aeron:ipc"; cfg.gatewayStreamId = kInStr;
         cfg.egressChannel  = "aeron:ipc"; cfg.egressStreamId  = kEgStr;
         cfg.dataDir = agentDir; cfg.connectTimeoutMs = 8000; cfg.pingTimeoutMs = 8000;
@@ -429,6 +441,25 @@ TEST(TlsConnectEdgeRegression, FinalLegHandshakeFailedFailsTheSeedExplicitlyRegr
     EXPECT_EQ(r.gw->finalLegFailuresSent, 1 + r.gw->failRepeats) << "precondition: the failure was re-offered";
     EXPECT_EQ(r.client->testHandshakeFinalLegFailures(), 1u) << "re-offered failures are applied once";
     EXPECT_FALSE(conn.failed()) << "connect() is never re-answered";
+}
+
+// Review B I2: with authentication a TLS 1.3 client has sent its Finished and sits in Authenticating (not
+// Connected) when the broker's final-leg HandshakeFailed arrives.  It must be Rejected(HandshakeFailed), terminal,
+// and the pending connect must complete with that code — not time out as a transient failure.  RED (before):
+// the verdict was dropped (`state_ != Connected`), the connect hung until its timeout.
+TEST(TlsConnectEdgeRegression, FinalLegHandshakeFailedWhileAuthenticatingFailsTheConnectRegression) {
+    Rig r(/*invokerMode=*/true, /*twoLeg=*/false, /*login=*/true);
+    r.gw->failFinalLeg = true;
+    r.gw->requireAuth  = true;
+    test_support::TestCq cq(*r.client);
+    auto conn = cq.issue([&](Completions& q, Token t) { return r.client->connect(q, t); });
+    ASSERT_TRUE(r.pumpWithin(3s, [&] { return conn.ready(); })) << "the connect hung (the verdict was ignored)";
+    EXPECT_EQ(conn.status(), OpStatus::BrokerError) << conn.describe();
+    EXPECT_EQ(conn.outcome().c.errorCode, 29) << "HandshakeFailed";
+    EXPECT_TRUE(r.pumpWithin(1s, [&] { return r.client->state() == rcs::SessionState::Rejected; }));
+    const int connectsAtFailure = r.gw->connectsSeen;
+    r.pumpFor(1s);
+    EXPECT_EQ(r.gw->connectsSeen, connectsAtFailure) << "terminal: never a reconnect";
 }
 
 // A node session (a partition route to another node) fails its final leg: only THAT

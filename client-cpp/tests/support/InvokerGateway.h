@@ -17,6 +17,7 @@
 #include <rune/crypto/Kdf.h>
 #include <rune/crypto/Scram.h>
 #include <rune/protocol/client/AuthMessages.h>
+#include <rune/protocol/client/SecurityMessages.h>
 #include <rune/protocol/client/Protocol.h>
 #include <rune/protocol/client/GroupMessages.h>
 #include <rune/protocol/client/MetadataMessages.h>
@@ -203,13 +204,28 @@ struct InvokerGateway {
     std::map<std::string, std::vector<rune::crypto::scram::Verifier>> users;
     void addUser(const std::string& name, const std::string& password) {
         users[name].push_back(*rune::crypto::scram::makeVerifier(password));
+        bootstrapped = true;   // a cluster with users has been bootstrapped
     }
     void setPassword(const std::string& name, const std::string& password) {   // SET PASSWORD: replaces all
         users[name].clear();
         addUser(name, password);
     }
     uint32_t retryAfterMsOnFailure = 0;      // AuthServerFinal{44}.retryAfterMs
-    bool     mustChangePassword    = false;  // AuthServerFinal.flags
+    bool     mustChangePassword    = false;  // AuthServerFinal.flags (every user)
+    /// Review B I5 — the bootstrap ruling.  Under Required, while the cluster is NOT bootstrapped every session is
+    /// answered authState Anonymous and may send ONLY SecurityBootstrap (anything else: AuthenticationFailed + the
+    /// session ends); the bootstrap (template 80) is verified against `clusterKey` (HMAC-SHA-512 under
+    /// deriveClusterKey(clusterKey)->master; a bad MAC: DdlResponse{39}), creates the admin with must-change-password
+    /// and is accepted ONCE (a second: DdlResponse{39 "already bootstrapped"}).  addUser() counts as bootstrapped.
+    bool                 bootstrapped = false;
+    std::vector<uint8_t> clusterKey;
+    int                  bootstraps = 0;                 // accepted bootstraps
+    std::set<std::string> mustChange;                    // users that must change their password first (their requests: 47)
+    /// Review B M6: the login's first leg is held (AuthClientFirst captured, not answered) until releaseHeldAuth().
+    bool holdAuthFirst = false;
+    int  heldAuthFirsts = 0;
+    std::set<int> rejectLoginsAt;                        // endpoints whose logins are all refused (44) — a halted node (D28)
+    int  resumedAnswers = 0;                             // ConnectResponse{ResumedAuthenticated} sent
     bool     breakServerSignature  = false;  // a broker that cannot prove the password
     int authFirsts = 0, authFinals = 0, authOk = 0, authFailed = 0;
     int unauthenticatedRequests = 0;         // requests that arrived before the login finished (always refused)
@@ -566,6 +582,7 @@ struct InvokerGateway {
     void expireSession(int64_t sessionId) {
         namespace rcc = rune::client::codec;
         for (auto& [node, set] : sessionsAtNode) set.erase(sessionId);   // strict sessions: gone
+        authState_.erase(sessionId);
         std::vector<uint8_t> out(128);
         const std::size_t    n = rcc::encodeErrorResponse(
             out.data(), out.size(),
@@ -825,16 +842,25 @@ private:
     };
     std::map<int64_t, SessionPub>                     sessionPubs;
     // Authentication: one session's login, one state at a time (each holds only what it needs).
+    struct AuthAnonymous {};          // review B I5: not bootstrapped — only SecurityBootstrap is accepted
     struct AuthAwaitingFirst {};
     struct AuthAwaitingFinal {
         std::string user, combined, clientFirstBare;
         std::vector<rune::crypto::scram::Verifier> real;   // the real slots, oldest first (copied at AuthClientFirst)
     };
-    struct AuthAuthenticated {};
-    using AuthSessionState = std::variant<AuthAwaitingFirst, AuthAwaitingFinal, AuthAuthenticated>;
+    struct AuthAuthenticated { std::string user; };
+    using AuthSessionState = std::variant<AuthAnonymous, AuthAwaitingFirst, AuthAwaitingFinal, AuthAuthenticated>;
+    std::vector<std::pair<int, std::vector<uint8_t>>> heldAuth_;
     std::map<int64_t, AuthSessionState> authState_;
     int64_t authNonceCounter_ = 0;
 public:
+    /// Answers every held AuthClientFirst (review B M6).
+    void releaseHeldAuth() {
+        holdAuthFirst = false;
+        auto held = std::move(heldAuth_);
+        heldAuth_.clear();
+        for (auto& [ep, f] : held) onAuthFirst_(ep, f.data(), f.size());
+    }
     /// Sessions that are mid-login or logged in (a session that failed / was revoked is gone).
     [[nodiscard]] const std::map<int64_t, AuthSessionState>& authStates() const { return authState_; }
 private:
@@ -870,6 +896,41 @@ private:
                                  {reinterpret_cast<const uint8_t*>(msg.data()), msg.size()}, d);
         return std::vector<uint8_t>(d.bytes.begin(), d.bytes.begin() + 16);
     }
+    void onBootstrap_(int endpoint, const uint8_t* buf, std::size_t len) {
+        namespace rp = rune::protocol::client;
+        const auto m = rp::SecurityBootstrap::decode(buf, len);
+        if (!m) return;
+        auto refuse = [&](const char* why) {
+            rp::DdlResponse r; r.sessionId = m->sessionId; r.correlationId = m->correlationId;
+            r.errorCode = static_cast<uint16_t>(rp::ErrorCode::InvalidRequest);
+            r.detail = why;
+            sendDdlResponse(replyFromArrival ? endpoint : 0, r);
+        };
+        if (bootstrapped) { refuse("already bootstrapped: this cluster has a security admin"); return; }
+        const auto key = rune::crypto::deriveClusterKey(clusterKey);
+        std::vector<uint8_t> input;
+        rp::bootstrapMacInput(*m, input);
+        rune::crypto::DigestBytes mac;
+        if (!key || input.empty() ||
+            !rune::crypto::hmac(rune::crypto::Digest::Sha512, key->master, input, mac) ||
+            !rune::crypto::constantTimeEqual(std::span<const uint8_t>(mac.bytes.data(), 64), std::span<const uint8_t>(m->mac))) {
+            refuse("bootstrap proof invalid: the cluster key does not match");
+            return;
+        }
+        rune::crypto::scram::Verifier v;
+        v.salt.assign(m->verifier.salt.begin(), m->verifier.salt.end());
+        v.iterations = m->verifier.iterations;
+        v.storedKey.size = 64; v.serverKey.size = 64;
+        std::memcpy(v.storedKey.bytes.data(), m->verifier.storedKey.data(), 64);
+        std::memcpy(v.serverKey.bytes.data(), m->verifier.serverKey.data(), 64);
+        const std::string admin(m->adminName);
+        users[admin] = {v};
+        mustChange.insert(admin);
+        bootstrapped = true;
+        ++bootstraps;
+        rp::DdlResponse r; r.sessionId = m->sessionId; r.correlationId = m->correlationId; r.objectId = 1; r.newVersion = 1;
+        sendDdlResponse(replyFromArrival ? endpoint : 0, r);
+    }
     void onAuthFirst_(int endpoint, const uint8_t* buf, std::size_t len) {
         namespace rp = rune::protocol::client;
         namespace rs = rune::crypto::scram;
@@ -879,6 +940,12 @@ private:
         const auto it = authState_.find(sid);
         if (it == authState_.end() || !std::holds_alternative<AuthAwaitingFirst>(it->second)) {
             failLogin_(endpoint, sid, corr);   // out of order
+            return;
+        }
+        if (rejectLoginsAt.count(endpoint) != 0) { ++authFirsts; failLogin_(endpoint, sid, corr); return; }
+        if (holdAuthFirst) {   // review B M6: a slow login — captured, answered by releaseHeldAuth()
+            ++heldAuthFirsts;
+            heldAuth_.emplace_back(endpoint, std::vector<uint8_t>(buf, buf + len));
             return;
         }
         ++authFirsts;
@@ -927,12 +994,13 @@ private:
             if (breakServerSignature) sig.bytes[0] ^= 0xFF;
             rp::AuthServerFinal f;
             f.sessionId = sid; f.correlationId = corr; f.errorCode = 0;
-            f.flags = mustChangePassword ? rp::kAuthFlagMustChangePassword : uint8_t{0};
+            f.flags = (mustChangePassword || mustChange.count(st->user) != 0) ? rp::kAuthFlagMustChangePassword : uint8_t{0};
             const std::string sigStr(reinterpret_cast<const char*>(sig.bytes.data()), sig.size);
+            const std::string loginUser = st->user;
             f.serverSignature = sigStr;
             std::vector<uint8_t> out(f.encodedSize());
             const std::size_t n = f.encode(out.data());
-            it->second = AuthAuthenticated{};
+            it->second = AuthAuthenticated{loginUser};
             ++authOk;
             authSessionIds.push_back(sid);
             replyTo_(endpoint, sid, out.data(), n);
@@ -1167,7 +1235,10 @@ private:
                 t != rcc::TemplateId::AuthClientFinal && len >= 24) {
                 const auto hh = rp::MessageHeader::decode(buf, len);
                 const auto as = hh ? authState_.find(hh->sessionId) : authState_.end();
-                if (as != authState_.end() && !std::holds_alternative<AuthAuthenticated>(as->second)) {
+                const bool anonymousBootstrap =
+                    as != authState_.end() && std::holds_alternative<AuthAnonymous>(as->second) &&
+                    t == rcc::TemplateId::SecurityBootstrap;
+                if (as != authState_.end() && !std::holds_alternative<AuthAuthenticated>(as->second) && !anonymousBootstrap) {
                     ++unauthenticatedRequests;
                     sendError(replyFromArrival ? endpoint : 0,
                               static_cast<int16_t>(rp::ErrorCode::AuthenticationFailed), "not authenticated",
@@ -1176,6 +1247,56 @@ private:
                     return;
                 }
             }
+        }
+        // Review B I5: an authenticated session of a must-change-password user may only change that password
+        // (ALTER USER <self> SET PASSWORD); every other request answers PasswordChangeRequired (47) in its own
+        // response type (ErrorResponse here — the fake needs one carrier).
+        if (authMode == rp::AuthMode::Required && len >= 24) {
+            const auto hh = rp::MessageHeader::decode(buf, len);
+            const auto as = hh ? authState_.find(hh->sessionId) : authState_.end();
+            if (as != authState_.end()) {
+                if (const auto* au = std::get_if<AuthAuthenticated>(&as->second);
+                    au != nullptr && mustChange.count(au->user) != 0) {
+                    const auto t = static_cast<rcc::TemplateId>(*tid);
+                    if (t != rcc::TemplateId::Disconnect && t != rcc::TemplateId::Ping) {
+                        if (t == rcc::TemplateId::SecurityDdl) {
+                            const auto m = rp::SecurityDdl::decode(buf, len);
+                            if (m && m->kind == rp::SecurityOpKind::AlterUser &&
+                                m->change == rp::UserChangeKind::SetPassword && m->name == au->user) {
+                                rune::crypto::scram::Verifier v;
+                                v.salt.assign(m->verifier.salt.begin(), m->verifier.salt.end());
+                                v.iterations = m->verifier.iterations;
+                                v.storedKey.size = 64; v.serverKey.size = 64;
+                                std::memcpy(v.storedKey.bytes.data(), m->verifier.storedKey.data(), 64);
+                                std::memcpy(v.serverKey.bytes.data(), m->verifier.serverKey.data(), 64);
+                                users[au->user] = {v};
+                                mustChange.erase(au->user);
+                                rp::DdlResponse r; r.sessionId = m->sessionId; r.correlationId = m->correlationId;
+                                r.objectId = 1; r.newVersion = 2;
+                                sendDdlResponse(replyFromArrival ? endpoint : 0, r);
+                                return;
+                            }
+                            if (m) {
+                                rp::DdlResponse r; r.sessionId = m->sessionId; r.correlationId = m->correlationId;
+                                r.errorCode = static_cast<uint16_t>(rp::ErrorCode::PasswordChangeRequired);
+                                r.detail = "change your password first (ALTER USER <you> SET PASSWORD)";
+                                sendDdlResponse(replyFromArrival ? endpoint : 0, r);
+                                return;
+                            }
+                        }
+                        sendError(replyFromArrival ? endpoint : 0, static_cast<int16_t>(rp::ErrorCode::PasswordChangeRequired),
+                                  "change your password first", hh->sessionId, hh->correlationId);
+                        return;
+                    }
+                }
+            }
+        }
+        // Review B I5: the built-in bootstrap (Required mode, no test handler installed): an ANONYMOUS session only,
+        // the MAC verified under the cluster key, accepted once.
+        if (authMode == rp::AuthMode::Required && *tid == rp::SecurityBootstrap::TEMPLATE_ID &&
+            templateHandlers.find(*tid) == templateHandlers.end()) {
+            onBootstrap_(endpoint, buf, len);
+            return;
         }
         // Catalog history (Task 5, F7): a test-installed handler for this template
         // answers the frame itself (e.g. Redirect / NotLeader / DdlResponse) —
@@ -1210,6 +1331,18 @@ private:
             ackBeforeNextConnect.clear();
             int64_t sid = assignedSessionId;
             if (uniqueSessionIds) sid = (c->sessionId != 0 && !newIdOnResume) ? c->sessionId : nextUniqueSessionId++;
+            // Review B I5 (D11): a resume of a session that IS authenticated on this node keeps its login — the
+            // answer is ResumedAuthenticated and no second login runs.  Anything else logs in afresh.
+            bool resumedAuth = false;
+            if (authMode == rp::AuthMode::Required && connectErrorCode == 0 && c->sessionId != 0) {
+                const auto known = authState_.find(c->sessionId);
+                const auto node  = sessionsAtNode.find(nodeOf(endpoint));
+                if (known != authState_.end() && std::holds_alternative<AuthAuthenticated>(known->second) &&
+                    node != sessionsAtNode.end() && node->second.count(c->sessionId) != 0 && !newIdOnResume) {
+                    resumedAuth = true;
+                    sid         = c->sessionId;
+                }
+            }
             if (connectErrorCode == 0) sessionsAtNode[nodeOf(endpoint)].insert(sid);   // strict sessions: known here
             clientVersions[sid]      = c->clientVersion;   // D6: the version gate's input
             lastConnectClientVersion = c->clientVersion;
@@ -1238,10 +1371,15 @@ private:
             std::size_t n;
             const uint8_t* frame = out;
             if (authMode != rp::AuthMode::InProcess && clientV9) {
-                const bool mustLogin = authMode == rp::AuthMode::Required && okCode == 0;
-                if (mustLogin) authState_[sid] = AuthAwaitingFirst{};
-                n = rcc::encodeConnectResponseV9(outV9, okCode, 0, sid, c->sessionId, c->correlationId, authMode,
-                                                 mustLogin ? rp::AuthState::MustAuthenticate : rp::AuthState::Anonymous, bv);
+                // Required: not bootstrapped -> Anonymous (only SecurityBootstrap is accepted, I5); a resumed
+                // authenticated session -> ResumedAuthenticated; else a login is due.
+                rp::AuthState st = rp::AuthState::Anonymous;
+                if (authMode == rp::AuthMode::Required && okCode == 0) {
+                    if (resumedAuth) { st = rp::AuthState::ResumedAuthenticated; ++resumedAnswers; }
+                    else if (!bootstrapped) { st = rp::AuthState::Anonymous; authState_[sid] = AuthAnonymous{}; }
+                    else { st = rp::AuthState::MustAuthenticate; authState_[sid] = AuthAwaitingFirst{}; }
+                }
+                n = rcc::encodeConnectResponseV9(outV9, okCode, 0, sid, c->sessionId, c->correlationId, authMode, st, bv);
                 frame = outV9.data();
             } else {
                 n = rcc::encodeConnectResponse(out, sizeof out, okCode, 0, sid, c->sessionId, c->correlationId, bv);

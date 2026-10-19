@@ -147,6 +147,13 @@ public:
     /// SessionLost; the producers stay open).
     void failAll(OpStatus st);
 
+    /// Review B I1: see ProducerImpl::failRoutedBroker.
+    void failRoutedBroker(ProducerImpl::RouteFailFn pred, void* ctx) {
+        for (ProducerImpl* impl : active_) {
+            if (impl != nullptr) impl->failRoutedBroker(pred, ctx);
+        }
+    }
+
     /// Authentication (D26): every in-flight batch of every producer completes BrokerError `errorCode`.
     void failInFlightBroker(uint16_t errorCode) {
         for (ProducerImpl* impl : active_) {

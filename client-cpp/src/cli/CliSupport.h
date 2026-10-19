@@ -198,6 +198,38 @@ inline std::string envOr(const char* name) {
     return v != nullptr ? std::string(v) : std::string();
 }
 
+/// Review B I6: the credential flags are GLOBAL — every command that connects resolves them the same way:
+/// `--user` (else RUNE_USER) and `--password-file` (else RUNE_PASSWORD_FILE).  No password ever comes from argv or
+/// the environment.
+inline void applyCredentials(rc::ClientConfig& cfg, const std::string& userFlag, const std::string& passwordFileFlag) {
+    cfg.username     = !userFlag.empty() ? userFlag : envOr("RUNE_USER");
+    cfg.passwordFile = !passwordFileFlag.empty() ? passwordFileFlag : envOr("RUNE_PASSWORD_FILE");
+}
+
+/// Review B I6: the dev-mode banner, after any CLI connect (stderr, so it never mixes with a command's output).
+inline void printDevBannerIfAny(const rc::Client& client, std::ostream& err) {
+    if (client.authStatus().brokerMode == rpc::AuthMode::DevDisabled) {
+        err << "WARNING: this broker runs with authentication DISABLED (RUNE_AUTH=disabled, dev mode)\n";
+    }
+}
+
+/// Review B I6: `--password` / `--password=...` anywhere in `args` is refused (usage error text on `err`); a set
+/// RUNE_PASSWORD is ignored with a warning.  true = the arguments are acceptable.
+inline bool refusePasswordArgs(std::string_view cmd, const std::vector<std::string>& args, std::ostream& err) {
+    if (std::getenv("RUNE_PASSWORD") != nullptr) {
+        err << "rune: warning: RUNE_PASSWORD is ignored: a password is never read from the environment "
+               "(use --password-file <path> or RUNE_PASSWORD_FILE)\n";
+    }
+    for (const std::string& a : args) {
+        if (a == "--password" || a.rfind("--password=", 0) == 0) {
+            err << "rune " << cmd << ": --password is not accepted: a password is never given on the command line "
+                   "(use --password-file <path> or RUNE_PASSWORD_FILE)\n";
+            return false;
+        }
+    }
+    return true;
+}
+
 class LiveBroker {
 public:
     LiveBroker() = default;
@@ -207,7 +239,7 @@ public:
 
     /// false (a message on err) when the endpoint is unusable or the connect fails / times out.
     bool open(const ParsedArgs& a, const std::string& endpoint, bool verbose, std::ostream& err,
-              bool withCredentials = true) {
+              bool withCredentials = true, bool quietFailure = false) {
         rc::ClientConfig cfg;
         cfg.gatewayChannel = toChannel(endpoint);
         cfg.clientName     = "rune-cli";
@@ -246,24 +278,19 @@ public:
         }
         // Authentication (Task 8): who to log in as.  --user / RUNE_USER and --password-file / RUNE_PASSWORD_FILE;
         // a password is NEVER taken from argv (parseArgs refuses --password) or from the environment.
-        if (withCredentials) {
-            cfg.username     = a.has("--user") ? a.value("--user") : envOr("RUNE_USER");
-            cfg.passwordFile = a.has("--password-file") ? a.value("--password-file") : envOr("RUNE_PASSWORD_FILE");
-        }
+        if (withCredentials) applyCredentials(cfg, a.value("--user"), a.value("--password-file"));
         ddlTimeout_ = std::chrono::milliseconds(cfg.ddlTimeoutMs);
         verbose_ = verbose;
         try {
             client_ = std::make_unique<rc::Client>(cfg);
             client_->connectAndWait(kConnectWait);
-            // Dev mode (RUNE_AUTH=disabled): every session is anonymous and every request allowed — say so, loudly.
-            if (client_->authStatus().brokerMode == rpc::AuthMode::DevDisabled) {
-                err << "WARNING: this broker runs with authentication DISABLED (RUNE_AUTH=disabled, dev mode)\n";
-            }
+            printDevBannerIfAny(*client_, err);   // dev mode: say so, loudly
             return true;
         } catch (const std::exception& e) {
+            lastFailure_ = e.what();
             if (std::string_view(e.what()).find("timed out") != std::string_view::npos)
                 err << "rune: connect to " << endpoint << " timed out\n";
-            else
+            else if (!quietFailure)
                 err << "rune error: " << e.what() << "\n";
             close();
             return false;
@@ -282,6 +309,8 @@ public:
     }
 
     [[nodiscard]] rc::Client& client() { return *client_; }
+    /// The text of the last failed open() (the exception message), for callers that explain it themselves.
+    [[nodiscard]] const std::string& lastFailure() const noexcept { return lastFailure_; }
     [[nodiscard]] std::chrono::milliseconds ddlTimeout() const noexcept { return ddlTimeout_; }
 
     /// --verbose: print (and clear) the Redirect / NotLeader retries the client followed since the last call.
@@ -304,6 +333,7 @@ private:
     std::unique_ptr<rc::Client> client_;
     std::chrono::milliseconds   ddlTimeout_{15'000};
     bool                        verbose_ = false;
+    std::string                 lastFailure_;
 };
 
 #endif   // RUNE_CLI_LIVE_ENABLED

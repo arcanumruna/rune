@@ -11,6 +11,7 @@
 #include "rune/cli/Cli.h"
 #include "rune/cli/CatalogCommands.h"
 #include "rune/cli/SecurityCommands.h"
+#include "CliSupport.h"
 
 #include "rune/ql/Parser.h"
 #include "rune/ql/Backends.h"
@@ -54,6 +55,7 @@ bool isWaitTimeout(const std::exception& e) {
 bool connectOrReport(rune::client::Client& client, std::ostream& err) {
     try {
         client.connectAndWait(kCliWait);
+        rune::cli::support::printDevBannerIfAny(client, err);   // review B I6
         return true;
     } catch (const std::exception& e) {
         if (isWaitTimeout(e)) {
@@ -172,6 +174,9 @@ rune::client::ClientConfig buildClientConfig(const std::vector<std::string>& arg
     // Aeron data directory: hidden test override.
     const std::string dataDir = flagValue(args, "--cli-data-dir");
     if (!dataDir.empty()) cfg.dataDir = dataDir;
+
+    // Review B I6: the credential flags are global (--user / --password-file, RUNE_USER / RUNE_PASSWORD_FILE).
+    rune::cli::support::applyCredentials(cfg, flagValue(args, "--user"), flagValue(args, "--password-file"));
 
     return cfg;
 }
@@ -757,6 +762,8 @@ int cmdSchema(const std::vector<std::string>& args,
               std::ostream& out,
               std::ostream& err)
 {
+    // Review B I6: the same credential rules as every other command (no password in argv / env).
+    if (!rune::cli::support::refusePasswordArgs("schema", args, err)) return 2;
     // args[0] == "schema", args[1] == subcommand
     if (args.size() < 2) {
         err << "rune schema: subcommand required (apply|alter|get|list|generate)\n";
@@ -768,6 +775,8 @@ int cmdSchema(const std::vector<std::string>& args,
     // Pass sub-args with sub itself as args[0] for consistent indexing.
     std::vector<std::string> subArgs(args.begin() + 1, args.end());
 
+    // The Client constructor reads a --password-file: an unreadable file is a clean CLI error, not an exception.
+    try {
     if (sub == "apply") {
         return cmdSchemaApply(subArgs, out, err);
     }
@@ -782,6 +791,10 @@ int cmdSchema(const std::vector<std::string>& args,
     }
     if (sub == "generate") {
         return cmdSchemaGenerate(subArgs, out, err);
+    }
+    } catch (const std::exception& e) {
+        err << "rune error: " << e.what() << "\n";
+        return 1;
     }
 
     err << "rune schema: unknown subcommand '" << sub << "'\n";

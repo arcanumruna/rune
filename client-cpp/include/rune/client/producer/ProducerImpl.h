@@ -851,6 +851,12 @@ public:
     /// (SessionRevoked) — the answer the broker's closing session can no longer give.  Records not yet sent
     /// are left to the caller's terminal failure path.  Duty thread.
     void failInFlightBroker(uint16_t errorCode) noexcept;
+    /// Review B I1: a partition whose route is Rejected (its leader node's session was revoked / refused): `pred`
+    /// returns the error code (46 / 44) for a partition on such a route, 0 otherwise.  For each such partition every
+    /// in-flight batch AND the unsent builder complete BrokerError with that code, at once — never held until the
+    /// delivery timeout.  Idempotent; cheap when nothing matches.  Duty thread.
+    using RouteFailFn = uint16_t (*)(void* ctx, int32_t topicId, int32_t partition) noexcept;
+    void failRoutedBroker(RouteFailFn pred, void* ctx) noexcept;
 
     /// Duty-cycle thread: fail every record of an in-flight batch (wire id)
     /// with DeliveryFailed.  Non-batch ids are ignored (they can come from any

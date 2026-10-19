@@ -11,6 +11,7 @@
 #include <cctype>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <set>
 #include <sstream>
 #include <sys/stat.h>
@@ -105,8 +106,41 @@ TEST(RuneCliSecurityRegression, PasswordIsNeverAcceptedFromArgvOrEnv) {
     }
 }
 
+namespace {
+/// Runs the CLI with `text` on stdin (the `-f -` form).
+CliRun runCliWithStdin(std::vector<std::string> args, const std::string& text) {
+    std::istringstream in(text);
+    auto* old = std::cin.rdbuf(in.rdbuf());
+    CliRun r = runCli(std::move(args));
+    std::cin.rdbuf(old);
+    return r;
+}
+} // namespace
+
+// Review B I7: a password literal on the command line (-e) is visible to ps and the shell history: refused
+// (exit 2, nothing planned or sent, the literal never echoed) for a statement that CARRIES one — even with --dry-run.
+TEST(RuneCliSecurityRegression, APasswordLiteralInArgvIsRefusedRegression) {
+    for (const bool dry : {true, false}) {
+        std::vector<std::string> args = {"ql"};
+        if (dry) args.push_back("--dry-run");
+        args.insert(args.end(), {"-e", "create user u with password 'long enough pw';"});
+        const CliRun r = runCli(args);
+        EXPECT_EQ(r.code, 2) << "dry=" << dry;
+        EXPECT_NE(r.err.find("visible to ps and shell history"), std::string::npos) << r.err;
+        EXPECT_NE(r.err.find("-f -"), std::string::npos) << "the message names the safe forms";
+        EXPECT_EQ(r.err.find("long enough"), std::string::npos) << "the literal is never echoed";
+        EXPECT_TRUE(r.out.empty()) << "nothing was planned: " << r.out;
+    }
+    // A statement WITHOUT a password literal is fine on -e.
+    EXPECT_EQ(runCli({"ql", "--dry-run", "-e", "alter user u disable;"}).code, 0);
+    // The safe form: stdin.
+    const CliRun ok = runCliWithStdin({"ql", "--dry-run", "-f", "-"}, "create user u with password 'long enough pw';");
+    EXPECT_EQ(ok.code, 0) << ok.err;
+    EXPECT_EQ(ok.out, "CREATE USER u WITH PASSWORD '<redacted>';\n");
+}
+
 TEST(RuneCliSecurityRegression, QlDryRunPrintsTheRedactedStatement) {
-    const CliRun r = runCli({"ql", "--dry-run", "-e", "create user u with password 'long enough pw';"});
+    const CliRun r = runCliWithStdin({"ql", "--dry-run", "-f", "-"}, "create user u with password 'long enough pw';");
     ASSERT_EQ(r.code, 0) << r.err;
     EXPECT_EQ(r.out, "CREATE USER u WITH PASSWORD '<redacted>';\n");
     EXPECT_EQ(r.out.find("long enough"), std::string::npos);

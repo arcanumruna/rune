@@ -2941,6 +2941,29 @@ int ProducerImpl::discardRing_(OpStatus st, int limit, uint16_t errorCode) {
         limit);
 }
 
+void ProducerImpl::failRoutedBroker(RouteFailFn pred, void* ctx) noexcept {
+    const DutyScope duty(*this);
+    for (std::size_t i = 0; i < partitions_.size(); ++i) {
+        PartitionState& ps = *partitions_[i];
+        const uint16_t errorCode = pred(ctx, ps.topicId, ps.partition);
+        if (errorCode == 0) continue;
+        ps.inflight.forEachLive([&](InFlightBatch& b) {
+            const uint32_t units = b.tier2 ? 1u : static_cast<uint32_t>(b.recordCount);
+            emitBatchAck_(ps.topicId, ps.partition, b.baseSequence, b.recordCount, -1,
+                          static_cast<int16_t>(errorCode), OpStatus::BrokerError, units, b.producerEpoch,
+                          b.producerId);
+            completeSlice_(ps, b.ackStart, b.ackCount, -1, OpStatus::BrokerError, errorCode, b.tier2,
+                           b.recordCount);
+            markUnresolved_(ps, b);
+            releaseResolved_(ps, b);
+            reclaimAckRing_(ps);
+        });
+        failBuilder_(ps, OpStatus::BrokerError, errorCode);
+        ps.resendParked = false;
+        ps.laneWait     = false;
+    }
+}
+
 void ProducerImpl::failInFlightBroker(uint16_t errorCode) noexcept {
     const DutyScope duty(*this);
     for (std::size_t i = 0; i < partitions_.size(); ++i) {

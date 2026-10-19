@@ -66,7 +66,7 @@ void fillSecurityDdl(const rune::ql::SecurityPlan& plan, uint32_t iterations, ui
 void buildBootstrap(std::string_view adminName, std::string_view oneTimePassword,
                     std::span<const uint8_t> clusterKeyFileContents, uint32_t iterations,
                     uint32_t minPasswordLength, VerifierStorage& vs, rpc::SecurityBootstrap& msg) {
-    const auto key = rune::crypto::deriveClusterKey(clusterKeyFileContents);
+    auto key = rune::crypto::deriveClusterKey(clusterKeyFileContents);
     if (!key) throw std::invalid_argument("the cluster key file must hold at least 32 bytes");
     buildVerifier(oneTimePassword, iterations, minPasswordLength, vs);
     msg.adminName = adminName;
@@ -83,6 +83,7 @@ void buildBootstrap(std::string_view adminName, std::string_view oneTimePassword
     }
     std::memcpy(msg.mac.data(), mac.bytes.data(), msg.mac.size());
     detail::secureZero(input.data(), input.size());
+    detail::secureZero(key->master.data(), key->master.size());   // the derived master key
     detail::secureZero(mac.bytes.data(), mac.bytes.size());
 }
 

@@ -8,6 +8,8 @@
 #include <rune/client/Client.h>
 #include <rune/client/agent/ClientAgent.h>
 #include <rune/protocol/client/SchemaMessages.h>
+#include <rune/ql/Parser.h>
+#include <rune/ql/Backends.h>
 
 #include <gtest/gtest.h>
 
@@ -215,6 +217,254 @@ TEST(ClientAuthErrorsRegression, PasswordFileIsReadOnceAndBothSetIsRefused) {
         EXPECT_THROW(rc::Client{c}, std::runtime_error);
     }
     ::unlink(path.c_str());
+}
+
+// Review B I1 (D26 is per session): a LEADER NODE's session revoked (a D28-style halt of that node) fails its
+// requests promptly with 46 and ends its subscription — the Client survives and the seed keeps working.  RED
+// (before): the node-1 batches were held by a Rejected session and completed DeliveryFailed after 30 s.
+namespace {
+struct TwoNodeRig {
+    rc::ClientConfig c;
+    rc::Client client;
+    test_support::InvokerGateway gw;
+    int n1 = 0;
+    std::string node1;
+    static rc::ClientConfig cfg(int32_t in) {
+        rc::ClientConfig c = authCfg(in, "ws1", kPw);
+        c.nanoClock = nullptr;                      // UDP node sessions retry their connect on the real duty clock
+        c.topics[0].partitionCount = 2;
+        return c;
+    }
+    explicit TwoNodeRig(int32_t in) : c(cfg(in)), client(c), gw(c.dataDir + "/aeron", "aeron:ipc", in, "aeron:ipc", in + 1) {
+        gw.authMode = pc::AuthMode::Required;
+        gw.addUser("ws1", kPw);
+        gw.uniqueSessionIds = true;
+        gw.replyFromArrival = true;
+        const int p0 = freePort(), p1 = freePort();
+        (void)gw.addEndpoint(udp(p0), in);
+        node1 = udp(p1);
+        n1 = gw.addEndpoint(node1, in);
+        gw.nodeOfEndpoint[n1] = n1;
+        gw.brokerHost  = "127.0.0.1";
+        gw.brokerPort  = p0;
+        gw.moreBrokers = {{1, "127.0.0.1", p1}};
+        gw.partitions  = {{1, 0, 1, 1, in, ""}, {1, 1, 0, 1, in, ""}};   // p0 led by node 1, p1 by the seed
+    }
+    template <class P> bool drive(P&& pred) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < deadline) {
+            client.doWork(); gw.pump();
+            if (pred()) return true;
+        }
+        return false;
+    }
+    void passes(int n) { for (int i = 0; i < n; ++i) { client.doWork(); gw.pump(); } }
+    static rc::Key keyFor(int32_t partition) {
+        for (uint64_t i = 1;; ++i) if (rc::Key(i).partition(2) == partition) return rc::Key(i);
+    }
+};
+} // namespace
+
+TEST(ClientAuthErrorsRegression, ARevokedLeaderNodeSessionFailsItsRequestsSessionRevokedButNotTheClientRegression) {
+    TwoNodeRig r(3760);
+    ASSERT_TRUE(r.drive([&] { return r.gw.ready(); }));
+    test_support::TestCq cq(r.client);
+    auto conn = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.connect(q, t); });
+    ASSERT_TRUE(r.drive([&] { return conn.ready(); }));
+    ASSERT_TRUE(conn.ok()) << conn.describe();
+    ASSERT_TRUE(r.drive([&] { return r.client.testLeaderFor(1, 0) == 1; })) << "metadata names node 1 as p0's leader";
+    r.gw.replyAcks = false;                          // node-1 batches stay in flight
+    rc::ProducerConfig pcfg; pcfg.acks = rc::Acks::Leader; pcfg.lingerUs = 60'000'000; pcfg.batchBytes = 64 * 1024;
+    pcfg.maxInFlight = 8; pcfg.produceTimeoutMs = 60'000; pcfg.deliveryTimeoutMs = 120'000;
+    rc::Producer p = r.client.producer(pcfg);
+    const auto topic = r.client.topic("t");
+    const std::vector<uint8_t> val(16, 0x5C);
+    std::vector<test_support::PendingOp> sends;
+    for (int i = 0; i < 3; ++i) {
+        sends.push_back(cq.send(p, topic, TwoNodeRig::keyFor(0), val));
+        ASSERT_TRUE(sends.back().accepted()) << "send " << i << " result " << static_cast<int>(sends.back().sendResult());
+        p.flush();
+        r.passes(30);
+    }
+    ASSERT_TRUE(r.drive([&] { return r.gw.produced.size() >= 1; })) << "a batch in flight on node 1 (authOk " << r.gw.authOk << " firsts " << r.gw.authFirsts << " connects " << r.gw.connects << " s1 " << static_cast<int>(r.client.testSessionStateAt(1)) << " frames " << r.gw.framesReceived << " produced " << r.gw.produced.size() << " held " << r.gw.held.size() << ")";
+    for (const auto& pr : r.gw.produced) EXPECT_EQ(pr.endpoint, r.n1);
+    r.gw.subscribeLeader[0] = r.n1;                  // the seed redirects the Subscribe to node 1
+    rc::Subscription sub = r.client.subscribe(topic, 0, {}, &noopRecords);
+    ASSERT_TRUE(r.drive([&] { return !r.gw.subscribed.empty() && sub.subscriptionId() != 0; }));
+    ASSERT_EQ(r.gw.subscribed.back().endpoint, r.n1);
+    const int64_t node1Sid = r.gw.subscribed.back().sessionId;
+    ASSERT_NE(node1Sid, r.gw.authSessionIds.front()) << "node 1 has its own session";
+
+    r.gw.revokeSession(node1Sid, r.n1);              // 46 per subscription, then the session-level 46
+    r.passes(50);                                    // PROMPTLY — not after deliveryTimeoutMs
+    for (auto& s : sends) {
+        ASSERT_TRUE(s.ready()) << "a batch routed to the revoked node's session was held";
+        EXPECT_EQ(s.outcome().c.status, rc::OpStatus::BrokerError);
+        EXPECT_EQ(s.outcome().c.errorCode, 46);
+    }
+    ASSERT_TRUE(r.drive([&] { return sub.finished(); }));
+    EXPECT_EQ(sub.failReason(), rc::SubscriptionFailReason::SessionRevoked);
+    // A new send to the revoked route fails at once too; the Client and the seed are fine.
+    auto later = cq.send(p, topic, TwoNodeRig::keyFor(0), val);
+    ASSERT_TRUE(later.accepted());
+    p.flush();
+    r.passes(50);
+    ASSERT_TRUE(later.ready());
+    EXPECT_EQ(later.outcome().c.errorCode, 46);
+    EXPECT_EQ(r.client.state(), rc::session::SessionState::Connected) << "D26 is per session: the Client survives";
+    r.gw.replyAcks = true;
+    auto viaSeed = cq.send(p, topic, TwoNodeRig::keyFor(1), val);
+    ASSERT_TRUE(viaSeed.accepted());
+    p.flush();
+    ASSERT_TRUE(r.drive([&] { return viaSeed.ready(); }));
+    EXPECT_TRUE(viaSeed.ok()) << viaSeed.describe();
+}
+
+TEST(ClientAuthErrorsRegression, ALeaderNodeLoginRefusedFailsItsRequestsAuthenticationFailedButNotTheClientRegression) {
+    TwoNodeRig r(3762);
+    r.gw.rejectLoginsAt.insert(r.n1);                // node 1 refuses every login (a halted broker, D28)
+    ASSERT_TRUE(r.drive([&] { return r.gw.ready(); }));
+    test_support::TestCq cq(r.client);
+    auto conn = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.connect(q, t); });
+    ASSERT_TRUE(r.drive([&] { return conn.ready(); }));
+    ASSERT_TRUE(conn.ok()) << conn.describe();
+    ASSERT_TRUE(r.drive([&] { return r.client.testLeaderFor(1, 0) == 1; }));
+    rc::ProducerConfig pcfg; pcfg.acks = rc::Acks::Leader; pcfg.lingerUs = 60'000'000; pcfg.batchBytes = 64 * 1024;
+    pcfg.maxInFlight = 8; pcfg.produceTimeoutMs = 60'000; pcfg.deliveryTimeoutMs = 120'000;
+    rc::Producer p = r.client.producer(pcfg);
+    const std::vector<uint8_t> val(16, 0x5C);
+    auto s = cq.send(p, r.client.topic("t"), TwoNodeRig::keyFor(0), val);
+    ASSERT_TRUE(s.accepted());
+    p.flush();
+    ASSERT_TRUE(r.drive([&] { return s.ready(); })) << "the batch was held behind a Rejected session";
+    EXPECT_EQ(s.outcome().c.status, rc::OpStatus::BrokerError);
+    EXPECT_EQ(s.outcome().c.errorCode, 44);
+    EXPECT_EQ(r.client.state(), rc::session::SessionState::Connected);
+}
+
+// Review B I5: against a Required broker with no security admin yet, a credential-less client's session is Anonymous
+// and may carry ONLY the bootstrap: no keepalive, no connect-time metadata request (the strict fake ends a session
+// that sends anything else).  The bootstrap itself — MAC checked, accepted once — creates the admin.
+TEST(ClientAuthErrorsRegression, ABootstrapOnlySessionSendsNothingButTheBootstrapRegression) {
+    Rig r(authCfg(3756, "", ""));
+    r.gw.users.clear();
+    r.gw.bootstrapped = false;
+    const std::string keyFile(64, 'k');
+    r.gw.clusterKey.assign(keyFile.begin(), keyFile.end());
+    r.connectOk();
+    EXPECT_EQ(r.client.authStatus().kind, rc::AuthStatus::Kind::Anonymous);
+    EXPECT_EQ(r.client.authStatus().brokerMode, pc::AuthMode::Required);
+    r.passes(300, 20'000'000);   // 6 s of duty cycles: a keepalive (1 s) or metadata request would show
+    EXPECT_EQ(r.gw.unauthenticatedRequests, 0) << "the Anonymous session sent something other than the bootstrap";
+    EXPECT_EQ(r.gw.pings, 0);
+    EXPECT_EQ(r.gw.metadataRequests, 0);
+    EXPECT_EQ(r.client.state(), rc::session::SessionState::Connected);
+    const std::vector<uint8_t> key(keyFile.begin(), keyFile.end());
+    test_support::TestCq cq(r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.bootstrapSecurity("admin", "a one-time password 24", key, q, t); });
+    ASSERT_TRUE(f.accepted());
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }));
+    ASSERT_TRUE(f.ok()) << f.describe();
+    EXPECT_EQ(r.gw.bootstraps, 1);
+    // A second bootstrap is refused (spec §7): the cluster has an admin now.
+    auto again = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.bootstrapSecurity("admin2", "another one-time pw 24", key, q, t); });
+    ASSERT_TRUE(again.accepted());
+    ASSERT_TRUE(r.drive([&] { return again.ready(); }));
+    EXPECT_EQ(again.outcome().c.status, rc::OpStatus::BrokerError);
+    EXPECT_EQ(again.outcome().c.errorCode, 39);
+    EXPECT_EQ(r.gw.bootstraps, 1);
+}
+
+// A credentialed client is refused by that same fresh cluster, naming the fix (review B I3 + I5).
+TEST(ClientAuthErrorsRegression, ACredentialedClientAgainstAnUnbootstrappedClusterIsToldToBootstrapRegression) {
+    Rig r(authCfg(3758, "ws1", kPw));
+    r.gw.users.clear();
+    r.gw.bootstrapped = false;
+    test_support::TestCq cq(r.client);
+    auto f = r.connectOp(cq);
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }));
+    ASSERT_TRUE(f.failed());
+    EXPECT_EQ(f.outcome().c.errorCode, 44);
+    const auto b = f.bytes();
+    EXPECT_NE(std::string(b.begin(), b.end()).find("rune security bootstrap"), std::string::npos)
+        << std::string(b.begin(), b.end());
+    EXPECT_EQ(r.gw.authFirsts, 0) << "no SCRAM was attempted on a session the broker called Anonymous";
+}
+
+// Review B I4: after the user changed THEIR OWN password the Client's credential is the new one — a later login
+// (a failover, a redirect, a resumed session that expired) must use it, and a one-time session is a normal one.
+TEST(ClientAuthErrorsRegression, AfterASelfSetPasswordTheNextLoginUsesTheNewPasswordRegression) {
+    Rig r(authCfg(3750, "ws1", kPw));
+    r.gw.mustChange.insert("ws1");   // the bootstrap-style one-time password
+    r.connectOk();
+    EXPECT_EQ(r.client.authStatus().kind, rc::AuthStatus::Kind::PasswordChangeRequired);
+    auto st = rune::ql::parse("alter user ws1 set password 'new password 456';");
+    ASSERT_TRUE(st.has_value());
+    auto plan = rune::ql::applySecurityPlan(*st);
+    ASSERT_TRUE(plan.has_value());
+    // The fake applies the change (a built-in must-change handler) and answers OK; the Client then installs it.
+    test_support::TestCq cq(r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.securityDdl(*plan, {}, q, t); });
+    ASSERT_TRUE(f.accepted());
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }));
+    ASSERT_TRUE(f.ok()) << f.describe();
+    EXPECT_EQ(r.client.authStatus().kind, rc::AuthStatus::Kind::Authenticated) << "the one-time flag is cleared";
+    ASSERT_EQ(r.gw.authOk, 1);
+    // The session expires: the re-login must present the NEW password.
+    r.gw.expireSession(r.gw.assignedSessionId);
+    ASSERT_TRUE(r.drive([&] { return r.gw.authOk == 2 || r.gw.authFailed > 0; }, 10'000'000));
+    EXPECT_EQ(r.gw.authOk, 2);
+    EXPECT_EQ(r.gw.authFailed, 0) << "the stale one-time password was presented";
+    ASSERT_TRUE(r.drive([&] { return r.client.state() == rc::session::SessionState::Connected; }, 10'000'000));
+    EXPECT_EQ(r.client.authStatus().kind, rc::AuthStatus::Kind::Authenticated);
+}
+
+// Review B M6 (the machine-level canSendData() test asserted a getter nothing in production calls): the REAL
+// path.  Records, a Subscribe and a control op are issued while the login is held mid-flight; the strict fake counts
+// every request that reaches it before the login finished — it must stay 0, and everything flows once Connected.
+TEST(ClientAuthErrorsRegression, NoDataFrameLeavesBeforeConnectedRegression) {
+    Rig r(authCfg(3754, "ws1", kPw));
+    r.gw.holdAuthFirst = true;                   // a slow login
+    test_support::TestCq cq(r.client);
+    auto conn = r.connectOp(cq);
+    ASSERT_TRUE(r.drive([&] { return r.gw.heldAuthFirsts == 1; }));
+    rc::ProducerConfig pcfg; pcfg.acks = rc::Acks::Leader; pcfg.lingerUs = 1; pcfg.batchBytes = 1;
+    rc::Producer p = r.client.producer(pcfg);
+    const auto topic = r.client.topic("t");
+    const std::vector<uint8_t> val(16, 0x5C);
+    auto s = cq.send(p, topic, rc::Key(uint64_t{1}), val);
+    ASSERT_TRUE(s.accepted());
+    p.flush();
+    rc::Subscription sub = r.client.subscribe(topic, 0, {}, &noopRecords);
+    auto ping = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.ping({}, q, t); });
+    r.passes(300, 1'000'000);
+    EXPECT_FALSE(conn.ready()) << "still logging in";
+    EXPECT_TRUE(r.gw.produced.empty() && r.gw.held.empty()) << "a record left the session before Connected";
+    EXPECT_TRUE(r.gw.subscribed.empty()) << "a Subscribe left the session before Connected";
+    EXPECT_EQ(r.gw.pings, 0) << "a control op left the session before Connected";
+    EXPECT_EQ(r.gw.unauthenticatedRequests, 0);
+    r.gw.releaseHeldAuth();                      // the login completes
+    ASSERT_TRUE(r.drive([&] { return conn.ready(); }));
+    ASSERT_TRUE(conn.ok()) << conn.describe();
+    ASSERT_TRUE(r.drive([&] { return !r.gw.produced.empty() && !r.gw.subscribed.empty(); }));
+    EXPECT_EQ(r.gw.unauthenticatedRequests, 0);
+}
+
+// Review B I5 (d): a resume of a session that IS authenticated keeps its login — no second SCRAM exchange.
+TEST(ClientAuthErrorsRegression, AResumedSessionKeepsItsLoginRegression) {
+    Rig r(authCfg(3752, "ws1", kPw));
+    r.gw.uniqueSessionIds = true;
+    r.connectOk();
+    ASSERT_EQ(r.gw.authFirsts, 1);
+    const int64_t sid = r.client.state() == rc::session::SessionState::Connected ? r.gw.authSessionIds.front() : 0;
+    r.client.testForceResume();   // the link drops: Connected -> Resuming -> a resume ConnectRequest with the hint
+    ASSERT_TRUE(r.drive([&] { return r.gw.resumedAnswers == 1; }, 10'000'000));
+    ASSERT_TRUE(r.drive([&] { return r.client.state() == rc::session::SessionState::Connected; }, 10'000'000));
+    EXPECT_EQ(r.gw.authFirsts, 1) << "no second login across the resume";
+    EXPECT_EQ(r.gw.authOk, 1);
+    EXPECT_EQ(r.client.authStatus().kind, rc::AuthStatus::Kind::Authenticated) << "an earned resume";
+    EXPECT_EQ(r.client.authStatus().user, "ws1");
+    EXPECT_NE(sid, 0);
 }
 
 // ---- 45 / 47 on an op --------------------------------------------------------------------------------------

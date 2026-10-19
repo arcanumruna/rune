@@ -920,7 +920,8 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
                sp->machine.state() == session::SessionState::Handshaking ||
                sp->machine.state() == session::SessionState::Authenticating))) {
             for (auto& cand : sessions_) {
-                if (cand->machine.state() == session::SessionState::Connected &&
+                if ((cand->machine.state() == session::SessionState::Connected ||
+                     cand->machine.state() == session::SessionState::Authenticating) &&   // review B I2
                     cand->machine.sessionId() == opt->sessionId &&
                     cand->machine.correlationId() == opt->correlationId) { sp = cand.get(); break; }
             }
@@ -1415,6 +1416,22 @@ uint32_t ClientAgent::leaderSessionIndex(int32_t topicId, int32_t partition) noe
     return r.sessionIndex;
 }
 
+int16_t ClientAgent::rejectedRouteCode(int32_t topicId, int32_t partition) const noexcept {
+    if (routeIndex_.size() == 0) return 0;
+    const uint32_t idx = routeIndex_.find(routeKey(topicId, partition));
+    if (idx == detail::FlatIndexMap::kNone) return 0;
+    const PartitionRoute& r = routes_[idx];
+    uint32_t si = r.sessionIndex;
+    if (si == kNoSession) {   // not resolved yet: look the endpoint up WITHOUT opening a session
+        for (std::size_t i = 1; i < sessions_.size(); ++i) {
+            if (sameEndpoint(sessions_[i]->endpoint, r.sessionEndpoint)) { si = static_cast<uint32_t>(i); break; }
+        }
+    }
+    if (si == kNoSession || si == 0 || si >= sessions_.size()) return 0;
+    const session::SessionMachine& m = sessions_[si]->machine;
+    return m.state() == session::SessionState::Rejected ? m.rejectCode() : int16_t{0};
+}
+
 int64_t ClientAgent::connectedSessionId(uint32_t index) const noexcept {
     if (index >= sessions_.size()) return 0;
     const session::SessionMachine& m = sessions_[index]->machine;
@@ -1556,6 +1573,12 @@ bool ClientAgent::sealForDestination_(session::SessionMachine& m,
     // sealed by the keys the handshake just derived (crypto.encrypted) — and nothing else does.
     if (m.offersCrypto() && m.state() != session::SessionState::Connected &&
         m.state() != session::SessionState::Authenticating) [[unlikely]] return false;
+    // Review B M1 (defence in depth): in Authenticating only the login's own frames (and a goodbye) may leave.
+    if (m.state() == session::SessionState::Authenticating && len >= rune::protocol::client::MessageHeader::ENCODED_SIZE) [[unlikely]] {
+        const auto tid = static_cast<codec::TemplateId>(rune::protocol::client::detail::getLE16(buf, 2));
+        if (tid != codec::TemplateId::AuthClientFirst && tid != codec::TemplateId::AuthClientFinal &&
+            tid != codec::TemplateId::Disconnect) return false;
+    }
     if (!crypto.encrypted) return true;  // plaintext session: nothing to do
     const SealedFrame sealed = sealForOffer(transport_, crypto, buf, len);
     if (sealed.len == 0) return false;  // seal failed — DROP, do not transmit

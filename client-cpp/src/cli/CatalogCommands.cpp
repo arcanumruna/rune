@@ -986,6 +986,18 @@ int cmdQl(const std::vector<std::string>& args, std::ostream& out, std::ostream&
         prepared.push_back(std::move(*p));
     }
 
+    // Review B I7: a password literal on the command line (-e) is visible to `ps` and the shell history — the same
+    // reason `--password` is refused.  A statement that carries one must come from a file or stdin.
+    if (!script) {
+        for (const Prepared& p : prepared) {
+            if (const auto* sp = std::get_if<PSecurity>(&p); sp != nullptr && !sp->plan.password.empty()) {
+                return usageError("ql", err,
+                                  "a password literal on the command line is visible to ps and shell history; put the "
+                                  "statement in a file (-f <file>) or pipe it (-f -)");
+            }
+        }
+    }
+
     auto idOf = [&](std::size_t i) -> std::optional<cat::RequestId> {
         return ids.base ? std::optional<cat::RequestId>(ids.at(i + 1)) : std::nullopt;
     };

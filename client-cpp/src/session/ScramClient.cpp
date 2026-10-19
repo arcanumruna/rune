@@ -66,6 +66,7 @@ const rune::crypto::scram::SaltedPassword* ScramCache::saltedPassword(std::strin
     if (salt.size() > kMaxSalt) {
         wipe_(overflow_);
         overflow_.sp = *sp;
+        secureZero(sp->bytes.bytes.data(), sp->bytes.bytes.size());   // review B M4: no stray copy
         return &overflow_.sp;
     }
     put(salt, iterations, *sp);

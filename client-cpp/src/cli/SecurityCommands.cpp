@@ -83,6 +83,7 @@ bool writeClusterKeyFile(const std::string& path, std::string& why) {
         if (n <= 0) { ok = false; break; }
         off += static_cast<std::size_t>(n);
     }
+    if (ok && ::fsync(fd) != 0) ok = false;   // review B M9: the key is on disk before we say so
     ::close(fd);
     rune::client::detail::secureZero(hex.data(), hex.size());
     if (!ok) {
@@ -224,14 +225,16 @@ int cmdGenClusterKey(const std::vector<std::string>& args, std::ostream& out, st
 }
 
 bool readFileBytes(const std::string& path, std::string& bytes, std::ostream& err) {
-    std::ifstream f(path, std::ios::binary);
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) {
         err << "rune: cannot read '" << path << "'\n";
         return false;
     }
-    std::ostringstream buf;
-    buf << f.rdbuf();
-    bytes = buf.str();
+    // Read straight into the destination (no stream-buffer copies of key / password material linger).
+    const std::streamsize n = f.tellg();
+    f.seekg(0);
+    bytes.assign(n > 0 ? static_cast<std::size_t>(n) : 0, '\0');
+    if (n > 0) f.read(bytes.data(), n);
     return true;
 }
 
@@ -284,7 +287,18 @@ int cmdBootstrap(const std::vector<std::string>& args, std::ostream& out, std::o
 #ifdef RUNE_CLI_LIVE_ENABLED
     // The bootstrap proves itself with the cluster-key MAC, not a login: this connection presents no credentials.
     LiveBroker broker;
-    if (!broker.open(a, endpoint, false, err, /*withCredentials=*/false)) { wipe(); return 1; }
+    if (!broker.open(a, endpoint, false, err, /*withCredentials=*/false, /*quietFailure=*/true)) {
+        // Review B I5 / spec §7: a connection WITHOUT credentials refused with AuthenticationFailed means the cluster
+        // requires a login — it already has a security admin.  Say so explicitly (never the bare "code 44").
+        if (broker.lastFailure().find("AuthenticationFailed") != std::string::npos) {
+            err << "rune: bootstrap refused: this cluster already has a security admin (it requires a login); "
+                   "use `rune ql --user <admin> --password-file <file>` to manage it\n";
+        } else {
+            err << "rune error: " << broker.lastFailure() << "\n";
+        }
+        wipe();
+        return 1;
+    }
     rune::client::SecurityDdlResult r;
     try {
         r = broker.client().bootstrapSecurityAndWait(

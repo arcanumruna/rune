@@ -142,6 +142,7 @@ agent::AgentConfig toAgentConfig(const ClientConfig& c) {
     acfg.session.tlsExpectHost = c.tlsExpectHost;
     acfg.session.username      = c.username;   // authentication: SCRAM credentials (never logged)
     acfg.session.password      = c.password;
+    acfg.session.allowUnauthenticatedBroker = c.allowUnauthenticatedBroker;
     acfg.session.requireCrypto = c.requireCrypto;
     acfg.transport.clientLivenessTimeoutNs = c.aeronClientLivenessTimeoutNs;
     // F12: malformed env values are reported (once per Client construction —
@@ -164,6 +165,9 @@ Client::Client(ClientConfig cfg)
     , catalogReader_(std::make_unique<CatalogReader>(*this))   // eagerly, on the owning thread (I2)
     , securityReader_(std::make_unique<SecurityReader>(*this))   // authentication Task 8: same rule
 {
+    // Review B M4: the agent's sessions hold the credential from here on (one owner, wiped when replaced); the Client's
+    // own copy is not kept.
+    if (!cfg_.password.empty()) { detail::secureZero(cfg_.password.data(), cfg_.password.size()); cfg_.password.clear(); }
     if (cfg_.traceDdlRetries) ddlRetryNotes_.reserve(kMaxDdlRetryNotes);   // push_back never reallocates on the duty thread
     // F8c review n1: releaseCq_ is noexcept and may defer a release; the list
     // never holds more than one entry per registry slot, so reserve it once
@@ -716,11 +720,13 @@ AuthStatus Client::authStatus() const {
     session::SessionState st;
     rpc::AuthMode         mode;
     bool                  passwordChange;
+    bool                  earned;
     if (me == dutyThreadId_) {   // the duty thread itself (Invoker owner, a callback): the machine, directly
         const auto& m  = agent_.seedMachine();
         st             = m.state();
         mode           = m.brokerAuthMode();
         passwordChange = m.passwordChangeRequired();
+        earned         = m.authenticated();
     } else {
         if (me != ownerThread_) {
             throw std::logic_error(
@@ -730,10 +736,13 @@ AuthStatus Client::authStatus() const {
         st             = static_cast<session::SessionState>(seedStatusCache_.state);
         mode           = static_cast<rpc::AuthMode>(seedStatusCache_.authMode);
         passwordChange = seedStatusCache_.passwordChangeRequired != 0;
+        earned         = seedStatusCache_.authenticated != 0;
     }
     AuthStatus a;
     a.brokerMode = mode;
-    if (st == session::SessionState::Connected && mode == rpc::AuthMode::Required) {
+    // Review B I3: Authenticated only for a session this client earned (a login, or its own resume) — never for a
+    // Required+Anonymous session or a broker accepted via allowUnauthenticatedBroker.
+    if (st == session::SessionState::Connected && mode == rpc::AuthMode::Required && earned) {
         a.kind = passwordChange ? AuthStatus::Kind::PasswordChangeRequired : AuthStatus::Kind::Authenticated;
         a.user = cfg_.username;
     }
@@ -748,6 +757,7 @@ void Client::publishSeedStatus_(session::SessionState st, int64_t sid) noexcept 
         const auto& m = agent_.seedMachine();
         seedStatusLast_.authMode               = static_cast<uint8_t>(m.brokerAuthMode());
         seedStatusLast_.passwordChangeRequired = m.passwordChangeRequired() ? 1 : 0;
+        seedStatusLast_.authenticated          = m.authenticated() ? 1 : 0;
     }
     seedStatusDirty_ = !seedStatus_.tryPublish(seedStatusLast_);
 }
@@ -1176,7 +1186,21 @@ Completion Client::andWaitTrampoline_(void* ctx, const char* what, std::chrono::
 // ---------------------------------------------------------------------------
 
 OpResult Client::issueControl_(OpKind op, CompletionTarget target, Token token,
-                               std::span<const uint8_t> frame, uint32_t payloadHint, uint32_t requestIdAt) {
+                               std::span<const uint8_t> wireFrame, uint32_t payloadHint, uint32_t requestIdAt,
+                               std::span<const uint8_t> secret) {
+    // A secret rides after the wire frame in the same record (the duty thread splits it off).
+    std::vector<uint8_t> withSecret;
+    std::span<const uint8_t> frame = wireFrame;
+    if (!secret.empty()) {
+        if (secret.size() > 0xFFFFu) return OpResult::InvalidArgument;
+        withSecret.assign(wireFrame.begin(), wireFrame.end());
+        withSecret.insert(withSecret.end(), secret.begin(), secret.end());
+        frame = withSecret;
+    }
+    struct Wipe {
+        std::vector<uint8_t>& v;
+        ~Wipe() { if (!v.empty()) detail::secureZero(v.data(), v.size()); }
+    } wipeGuard{withSecret};
     if (token > kMaxToken) return OpResult::InvalidArgument;
     if (target.cq == nullptr && target.handler.fn == nullptr) return OpResult::InvalidArgument;
     if (frame.size() > agent_.maxFrameLength()) return OpResult::InvalidArgument;
@@ -1190,6 +1214,7 @@ OpResult Client::issueControl_(OpKind op, CompletionTarget target, Token token,
     h.token       = token;
     h.op          = op;
     h.requestIdAt = requestIdAt;
+    h.secretLen   = static_cast<uint16_t>(secret.size());
     Completions* q = target.cq;
     if (q != nullptr) {
         if (q->client_ != this) return OpResult::InvalidArgument;
@@ -1416,7 +1441,8 @@ std::optional<std::size_t> decodedRequestIdOffset(rune::client::OpKind op, std::
 } // namespace
 
 OpResult Client::issueDdl_(OpKind op, CompletionTarget target, Token token, std::span<const uint8_t> frame,
-                           const rune::protocol::client::DdlExtension& ext, std::size_t extOffset) {
+                           const rune::protocol::client::DdlExtension& ext, std::size_t extOffset,
+                           std::span<const uint8_t> secret) {
     namespace rpc = rune::protocol::client;
     uint32_t requestIdAt = 0;
     if (ext.requestId.none()) {
@@ -1432,7 +1458,7 @@ OpResult Client::issueDdl_(OpKind op, CompletionTarget target, Token token, std:
             testSkewDdlRequestIdAt_ = 0;
         }
     }
-    return issueControl_(op, target, token, frame, 0, requestIdAt);
+    return issueControl_(op, target, token, frame, 0, requestIdAt, secret);
 }
 
 OpResult Client::dropTopic(std::string_view name, const DdlOptions& ddl, CompletionTarget target, Token token) {
@@ -1513,10 +1539,20 @@ OpResult Client::securityDdl(rune::ql::SecurityPlan plan, const DdlOptions& ddl,
     msg.ext      = ddlExt_(d);
     std::vector<uint8_t> frame(msg.encodedSize());
     const std::size_t n = msg.encode(frame.data());
+    // Review B I4: a user changing THEIR OWN password keeps the plaintext (on the duty thread only, wiped on any
+    // outcome) until the broker answers OK, so the next login of this Client uses it.  ADD PASSWORD needs nothing
+    // (the old password stays valid, D6).
+    const bool selfSet = plan.kind == rpc::SecurityOpKind::AlterUser && plan.change == rpc::UserChangeKind::SetPassword &&
+                         !cfg_.username.empty() && plan.name == cfg_.username;
+    std::span<const uint8_t> secret;
+    if (selfSet) secret = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(plan.password.data()), plan.password.size());
+    OpResult res = OpResult::InvalidArgument;
+    if (n != 0) {
+        res = issueDdl_(OpKind::SecurityDdl, target, token, std::span<const uint8_t>(frame.data(), n), msg.ext,
+                        rpc::MessageHeader::ENCODED_SIZE, secret);   // the extension follows the header directly (D36)
+    }
     detail::secureZero(plan.password.data(), plan.password.size());   // the verifier is built: the password is not needed
-    if (n == 0) return OpResult::InvalidArgument;
-    return issueDdl_(OpKind::SecurityDdl, target, token, std::span<const uint8_t>(frame.data(), n), msg.ext,
-                     rpc::MessageHeader::ENCODED_SIZE);   // the extension follows the header directly (D36)
+    return res;
 }
 
 OpResult Client::bootstrapSecurity(std::string_view adminName, std::string_view oneTimePassword,
@@ -1580,8 +1616,13 @@ void Client::applyControlOpRecord_(const uint8_t* rec, std::size_t len) {
     applyControlOp_(h, std::span<const uint8_t>(rec + sizeof h, len - sizeof h));
 }
 
-void Client::applyControlOp_(const ControlOpHeader& h, std::span<const uint8_t> frame) {
+void Client::applyControlOp_(const ControlOpHeader& h, std::span<const uint8_t> frameAndSecret) {
     PendingCtl p;
+    std::span<const uint8_t> frame = frameAndSecret;
+    if (h.secretLen != 0 && h.secretLen <= frameAndSecret.size()) {   // review B I4: split the secret off the wire frame
+        frame = frameAndSecret.first(frameAndSecret.size() - h.secretLen);
+        p.newPassword.assign(std::string_view(reinterpret_cast<const char*>(frameAndSecret.data()) + frame.size(), h.secretLen));
+    }
     p.token                = h.token;
     p.op                   = h.op;
     p.target.handler       = h.handler;
@@ -2175,7 +2216,9 @@ void Client::onSeedConnected_(int64_t sessionId, int32_t brokerVersion) {
 
     // MD1 Task 10: on each successful connect, request a full metadata
     // refresh so the cache is populated for zero-RTT partition routing.
-    sendMetadataRequest(sessionId);
+    // Review B I5: a bootstrap-only session (Required + Anonymous) carries nothing but the bootstrap — the broker
+    // answers any other frame AuthenticationFailed and closes the session.
+    if (!agent_.seedMachine().anonymousBootstrap()) sendMetadataRequest(sessionId);
 
     // Fire onConnected. fix1 C1: this runs inside the noexcept
     // ClientAgent::doWork chain (dispatchEgressFrame -> egressObserver_ ->
@@ -2271,6 +2314,12 @@ void Client::failAllControl_(OpStatus st) {
         PendingCtl p = takeCtl_(pendingCtl_.size() - 1);
         completeCtl_(p, st);
     }
+}
+
+void Client::installSelfPassword_(std::string_view newPassword) noexcept {
+    if (!cfg_.password.empty()) detail::secureZero(cfg_.password.data(), cfg_.password.size());
+    cfg_.password.assign(newPassword);
+    agent_.installPassword(newPassword);   // every session's config, the salted-password cache, the one-time flag
 }
 
 void Client::failAllControlWithCode_(uint16_t errorCode, std::string_view text) {
@@ -2912,6 +2961,23 @@ void Client::enterFailed_() {
                  "rune-client: %s — failing for good: every accepted record completes Closed, "
                  "no further I/O\n",
                  rejected ? "the broker rejected the session (non-retriable)" : "the Aeron client closed");
+    // Review B M3: a local refusal (nonce mismatch, a broker that skipped the login, no randomness) never produced an
+    // AuthServerFinal for the Client to read — complete the pending connect / ops with the machine's code, here.
+    if (rejected) {
+        const auto& sm = agent_.seedMachine();
+        const int16_t rc = sm.rejectCode();
+        using Ec = rune::protocol::client::ErrorCode;
+        if (rc == static_cast<int16_t>(Ec::AuthenticationFailed) || rc == static_cast<int16_t>(Ec::SessionRevoked) ||
+            rc == static_cast<int16_t>(Ec::Internal)) {
+            std::string why = sm.rejectDetail();
+            if (why.empty()) why = rc == static_cast<int16_t>(Ec::AuthenticationFailed) ? "authentication failed"
+                                  : rc == static_cast<int16_t>(Ec::SessionRevoked)      ? "the session was revoked"
+                                                                                         : "login failed locally";
+            completeConnect_(OpStatus::BrokerError, 0, static_cast<uint16_t>(rc), why,
+                             static_cast<int64_t>(sm.authRetryAfterMs()));
+            failAllControlWithCode_(static_cast<uint16_t>(rc), why);
+        }
+    }
     // Stop all I/O first, so nothing below can reach the transport.
     agent_.enterFailedMode();
     // Tail-close every producer's intake (a claim before the close is still read
@@ -4130,6 +4196,12 @@ void Client::onEgressFrame(codec::TemplateId tid,
                 break;
             }
             PendingCtl p = takeCtl_(i);
+            // Review B I4: the broker applied this user's OWN password change — install it before anything can log in.
+            if (opt->errorCode == 0 && p.op == OpKind::SecurityDdl && !p.newPassword.empty()) {
+                installSelfPassword_(p.newPassword.view());
+                syncSeedSession_();
+            }
+            p.newPassword.wipe();
             completeCtl_(p, opt->errorCode == 0 ? OpStatus::Ok : OpStatus::BrokerError,
                          static_cast<int64_t>(opt->objectId), static_cast<int64_t>(opt->newVersion),
                          opt->errorCode,
@@ -4974,7 +5046,17 @@ detail::SendResult Client::fetchOfferTrampoline_(void* ctx, uint32_t session, co
 // connect attempt.  Each one of a session some partition routes to asks for fresh
 // metadata (Kafka: a failed connection requests a metadata update; rate-limited by
 // requestMetadataNow_); the answer re-routes the partition (and its held batches).
+namespace {
+uint16_t rejectedRouteTrampoline(void* ctx, int32_t topicId, int32_t partition) noexcept {
+    return static_cast<uint16_t>(static_cast<rune::client::agent::ClientAgent*>(ctx)->rejectedRouteCode(topicId, partition));
+}
+} // namespace
+
 int Client::watchProduceRoutes_(int64_t nowNs) noexcept {
+    // Review B I1: a leader node's session that is Rejected (its user was revoked there, or its login was refused)
+    // can never carry its partitions' batches: they fail NOW with the session's code (46 / 44), not after the
+    // delivery timeout.  A metadata refresh that moves the partition re-routes new sends as it always does.
+    if (agent_.rejectedLeaderSessions() != 0) [[unlikely]] producerHub_.failRoutedBroker(&rejectedRouteTrampoline, &agent_);
     // Review MEDIUM-2: a produce attempt timed out (Kafka: a request timeout
     // requests a metadata update) — the partition may have moved silently.
     bool ask = producerHub_.takeMetadataWanted();
