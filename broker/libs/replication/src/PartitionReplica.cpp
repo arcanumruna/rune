@@ -2813,9 +2813,9 @@ void PartitionReplica::applyCommittedIsr_(std::vector<NodeId> isr, int32_t parti
         if (!std::holds_alternative<NoProposal>(ctrlProposal_) && partitionEpoch != bodyOf_(ctrlProposal_).base)
             ctrlProposal_ = NoProposal{};
         // An internal-quorum proposal never has a controller base: any controller-assigned epoch resolves it (unchanged).
-        if (isrProposal_.pending()) clearIsrProposalPhase_();
+        clearIsrProposalPhase_();
         committedPartitionEpoch_ = partitionEpoch;
-    } else if (changed || (isrProposal_.pending() && sameMembers_(isrProposal_.isr, committedIsr_))) {
+    } else if (changed || internalPendingIs_(committedIsr_)) {
         clearIsrProposalPhase_();
     }
     applyMaximalIsr_();
@@ -2940,8 +2940,8 @@ void PartitionReplica::applyMaximalIsr_()
     if (!std::holds_alternative<NoProposal>(ctrlProposal_)) {
         const ProposalBody& pb = bodyOf_(ctrlProposal_);
         for (int i = 0; i < pb.count; ++i) (void)isrManager_->addToIsr(pb.members[static_cast<std::size_t>(i)]);
-    } else if (isrProposal_.pending()) {
-        for (NodeId id : isrProposal_.isr) (void)isrManager_->addToIsr(id);
+    } else if (const auto* ip = std::get_if<InternalPending>(&internalProposal_)) {
+        for (int i = 0; i < ip->count; ++i) (void)isrManager_->addToIsr(ip->members[static_cast<std::size_t>(i)]);
     }
     syncIsrToLeaderState();
     recomputeHw();
@@ -2986,10 +2986,10 @@ void PartitionReplica::shrinkIsrToLive(std::span<const int32_t> live, int64_t no
 bool PartitionReplica::updateIsr_(int64_t nowNs)
 {
     if (role_ != Role::Leader || isrManager_ == nullptr) return false;
-    if (internalQuorum_() && !isrProposal_.pending() && internalIsrVersion_ > 0 &&
-        nowNs - isrProposal_.sentNs >= kAlterIsrResendNs) {
+    if (internalQuorum_() && internalIsrVersion_ > 0 && std::holds_alternative<InternalCommitted>(internalProposal_) &&
+        nowNs - std::get<InternalCommitted>(internalProposal_).sentNs >= kAlterIsrResendNs) {
         // Anti-entropy (re-review 2026-10-04 MAJOR-A): after a commit,
-        // isrProposal_ still holds the COMMITTED (version, members); keep
+        // InternalCommitted still holds the COMMITTED (version, members); keep
         // re-sending it to every replica that has not acked it (a lost frame,
         // a node that was down) — knowledge converges without a lucky frame.
         // Cold: one small frame per un-acked replica per resend interval.
@@ -2997,10 +2997,10 @@ bool PartitionReplica::updateIsr_(int64_t nowNs)
             ? ~0u : ((1u << followerSlots_.size()) - 1u);
         if ((internalIsrAcks_ & all) != all) publishInternalIsr_(nowNs);
     }
-    if (internalQuorum_() && isrProposal_.pending()) {
+    if (internalQuorum_() && std::holds_alternative<InternalPending>(internalProposal_)) {
         // One proposal in flight: re-send it until a majority of the replicas commits it or another committed
         // change resolves it (the request, the answer or the record may have been lost).
-        if (nowNs - isrProposal_.sentNs >= kAlterIsrResendNs) publishInternalIsr_(nowNs);
+        if (nowNs - std::get<InternalPending>(internalProposal_).sentNs >= kAlterIsrResendNs) publishInternalIsr_(nowNs);
         return false;
     }
     if (isrChannel_ != nullptr && !internalQuorum_() && !std::holds_alternative<NoProposal>(ctrlProposal_)) {
@@ -3106,10 +3106,12 @@ bool PartitionReplica::changeIsr_(const std::vector<NodeId>& desired, int64_t no
     if (internalQuorum_()) {
         // MAJOR-2/3: publish a new version; it commits once a majority of the
         // replicas durably holds it.  HW over committed ∪ proposed meanwhile.
-        if (isrProposal_.pending()) return false;   // one change at a time
-        isrProposal_.phase = ProposalPhase::Sent;
-        isrProposal_.isr.assign(desired.begin(), desired.end());
-        isrProposal_.version = ++internalIsrVersion_;
+        if (std::holds_alternative<InternalPending>(internalProposal_)) return false;   // one change at a time
+        InternalPending np;
+        np.version = ++internalIsrVersion_;
+        np.count   = static_cast<uint8_t>(std::min<std::size_t>(desired.size(), np.members.size()));
+        for (std::size_t i = 0; i < np.count; ++i) np.members[i] = desired[i];
+        internalProposal_ = np;
         internalIsrAcks_     = 0;
         applyMaximalIsr_();
         publishInternalIsr_(nowNs);
@@ -3155,15 +3157,17 @@ int PartitionReplica::slotIndex_(NodeId id) const noexcept
 
 void PartitionReplica::publishInternalIsr_(int64_t nowNs)
 {
-    isrProposal_.sentNs = nowNs;
+    InternalBody* const body = internalBody_();
+    if (body == nullptr) return;   // no proposal (never reached: callers hold a Pending or Committed one)
+    body->sentNs = nowNs;
     InternalIsrMsg m{};
     m.topicId     = cfg_.topicId;
     m.partition   = cfg_.partitionId;
     m.leaderId    = cfg_.selfId;
     m.leaderEpoch = epoch_;
-    m.version     = isrProposal_.version;
-    m.isrCount    = static_cast<int32_t>(std::min<std::size_t>(isrProposal_.isr.size(), InternalIsrMsg::kMaxIsr));
-    for (int i = 0; i < m.isrCount; ++i) m.isr[static_cast<std::size_t>(i)] = isrProposal_.isr[static_cast<std::size_t>(i)];
+    m.version     = body->version;
+    m.isrCount    = static_cast<int32_t>(std::min<std::size_t>(body->count, InternalIsrMsg::kMaxIsr));
+    for (int i = 0; i < m.isrCount; ++i) m.isr[static_cast<std::size_t>(i)] = body->members[static_cast<std::size_t>(i)];
     // Our own durable copy first: it is our ack (and our vote gate's view).
     const int self = slotIndex_(cfg_.selfId);
     if (self >= 0 && (internalIsrAcks_ & (1u << self)) == 0) {
@@ -3183,20 +3187,23 @@ void PartitionReplica::publishInternalIsr_(int64_t nowNs)
 
 void PartitionReplica::maybeCommitInternalIsr_()
 {
-    if (!isrProposal_.pending()) return;
+    const auto* pending = std::get_if<InternalPending>(&internalProposal_);
+    if (pending == nullptr) return;
     const int majority = static_cast<int>(configuredReplicas_.size()) / 2 + 1;
     if (std::popcount(internalIsrAcks_) < majority) return;
-    committedIsr_.assign(isrProposal_.isr.begin(), isrProposal_.isr.end());
-    isrProposal_.phase    = ProposalPhase::None;
+    InternalCommitted done;
+    static_cast<InternalBody&>(done) = *pending;
+    committedIsr_.assign(done.members.begin(), done.members.begin() + done.count);
+    internalProposal_     = done;   // Pending -> Committed: the body stays for the anti-entropy re-send
     internalSeedPending_  = false;
     if (isrKnowledge_ != nullptr) {
         // LOW-R4-1: committed — now the state this node shares in the exchange.
         InternalIsrState st{};
         st.topicId = cfg_.topicId; st.partition = cfg_.partitionId; st.leaderEpoch = epoch_;
-        st.version = isrProposal_.version;
-        st.count   = static_cast<int32_t>(std::min<std::size_t>(isrProposal_.isr.size(), InternalIsrMsg::kMaxIsr));
+        st.version = done.version;
+        st.count   = static_cast<int32_t>(std::min<std::size_t>(done.count, InternalIsrMsg::kMaxIsr));
         for (int i = 0; i < st.count; ++i)
-            st.members[static_cast<std::size_t>(i)] = isrProposal_.isr[static_cast<std::size_t>(i)];
+            st.members[static_cast<std::size_t>(i)] = done.members[static_cast<std::size_t>(i)];
         isrKnowledge_->noteCommitted(st);
     }
     applyMaximalIsr_();
@@ -3208,7 +3215,7 @@ void PartitionReplica::onInternalIsrAck(const InternalIsrAckMsg& m)
     // Pending: the ack counts toward the commit majority.  Committed: it stops
     // the anti-entropy re-send to that replica (MAJOR-A).
     if (!internalQuorum_() || role_ != Role::Leader || internalIsrVersion_ == 0) return;
-    if (m.leaderEpoch != epoch_ || m.version < isrProposal_.version) return;   // an older state
+    if (m.leaderEpoch != epoch_ || m.version < internalVersion_()) return;   // an older state
     const int idx = slotIndex_(m.followerId);
     if (idx < 0) return;
     internalIsrAcks_ |= (1u << idx);

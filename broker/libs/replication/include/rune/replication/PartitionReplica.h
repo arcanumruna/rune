@@ -510,7 +510,7 @@ public:
     [[nodiscard]] bool internalSeedPendingForTest() const noexcept { return internalSeedPending_; }
     /// Test view: an AlterIsr proposal is in flight.
     [[nodiscard]] bool isrProposalPendingForTest() const noexcept {
-        return !std::holds_alternative<NoProposal>(ctrlProposal_) || isrProposal_.pending();
+        return !std::holds_alternative<NoProposal>(ctrlProposal_) || std::holds_alternative<InternalPending>(internalProposal_);
     }
     /// True in AwaitingMetadata and AwaitingMetadataWarned (a stale answer was received).
     [[nodiscard]] bool isrProposalAwaitingMetadataForTest() const noexcept {
@@ -522,7 +522,7 @@ public:
         if (std::holds_alternative<AwaitingCommit>(ctrlProposal_)) return "AwaitingCommit";
         if (std::holds_alternative<AwaitingMetadata>(ctrlProposal_)) return "AwaitingMetadata";
         if (std::holds_alternative<AwaitingMetadataWarned>(ctrlProposal_)) return "AwaitingMetadataWarned";
-        return isrProposal_.pending() ? "InternalPending" : "None";
+        return std::holds_alternative<InternalPending>(internalProposal_) ? "InternalPending" : "None";
     }
     [[nodiscard]] int64_t pendingProposalIdForTest() const noexcept { return bodyOf_(ctrlProposal_).id; }
     [[nodiscard]] std::vector<int64_t> pendingProposalStoragesForTest() const {
@@ -1790,7 +1790,7 @@ private:
     //                      kAwaitingMetadataWarnNs (a wedged metadata replica is never silent).
     // Both non-None phases count the proposed members in the maximal ISR.
     // ISR protocol (controller-managed mode): the proposal is a std::variant, each state holding exactly
-    // its own variables (hard rule 3).  The internal-quorum mode keeps the small IsrProposal below.
+    // its own variables (hard rule 3).  The internal-quorum mode keeps its own variant (InternalNone | InternalPending | InternalCommitted) below.
     //   NoProposal              — nothing in flight.
     //   AwaitingCommit          — sent; re-sent every kAlterIsrResendNs (and not before resendNotBeforeNs).
     //   AwaitingMetadata        — a stale/fenced answer to the NEWEST send: only the committed assignment resolves it.
@@ -1832,26 +1832,54 @@ private:
     }
     static constexpr int64_t kAwaitNewestAnswerNs = 1'000'000'000LL;   ///< 1 s base of the older-send hold (1,2,4,8 s)
 
-    // Internal-quorum mode only.
-    enum class ProposalPhase : uint8_t { None = 0, Sent = 1 };
-    struct IsrProposal {
-        ProposalPhase       phase = ProposalPhase::None;
-        std::vector<NodeId> isr;          ///< proposed ISR (internal quorum)
-        int64_t             sentNs  = 0;
-        int64_t             version = 0;               ///< internal quorum mode: the published version
-        [[nodiscard]] bool pending() const noexcept { return phase != ProposalPhase::None; }
+    // Internal-quorum mode only (ISR v3 Step 12, hard rule 3): the proposal is a std::variant, each state holding exactly
+    // what it needs, with no allocation (the members are an inline array).
+    //   InternalNone      - no proposal (a fresh leadership).
+    //   InternalPending   - published, not yet held by a majority: re-sent every kAlterIsrResendNs; the HW counts
+    //                       committed U proposed members meanwhile.
+    //   InternalCommitted - a majority holds it (or another committed change resolved it): anti-entropy re-sends it every
+    //                       kAlterIsrResendNs until every replica acked it.
+    struct InternalBody {
+        int64_t version = 0;
+        uint8_t count   = 0;
+        std::array<NodeId, 16> members{};
+        int64_t sentNs  = 0;
     };
-    /// Resets the proposal IN PLACE (the member vector keeps its capacity): every exit from Leader and every
-    /// new leadership (review A-M3/A-M4, B-M2).  `version` (internal quorum mode) is reset too.
+    struct InternalNone {};
+    struct InternalPending   : InternalBody {};
+    struct InternalCommitted : InternalBody {};
+    using InternalProposal = std::variant<InternalNone, InternalPending, InternalCommitted>;
+    /// The body of a Pending or Committed proposal, or null for None.
+    [[nodiscard]] InternalBody* internalBody_() noexcept {
+        if (auto* p = std::get_if<InternalPending>(&internalProposal_)) return p;
+        if (auto* c = std::get_if<InternalCommitted>(&internalProposal_)) return c;
+        return nullptr;
+    }
+    [[nodiscard]] int64_t internalVersion_() const noexcept {
+        if (const auto* p = std::get_if<InternalPending>(&internalProposal_)) return p->version;
+        if (const auto* c = std::get_if<InternalCommitted>(&internalProposal_)) return c->version;
+        return 0;
+    }
+    /// Resets the proposal (every exit from Leader and every new leadership: review A-M3/A-M4, B-M2).  The internal
+    /// proposal's `version` is reset with it.
     void resetIsrProposal_() noexcept {
-        isrProposal_.phase = ProposalPhase::None;
-        isrProposal_.isr.clear();
-        isrProposal_.sentNs = 0;
-        isrProposal_.version = 0;
+        internalProposal_ = InternalNone{};
         ctrlProposal_ = NoProposal{};
     }
-    void clearIsrProposalPhase_() noexcept {   // internal-quorum / self-managed: resolved; members kept for capacity
-        isrProposal_.phase = ProposalPhase::None;
+    void clearIsrProposalPhase_() noexcept {   // internal-quorum: resolved by a committed change - Pending keeps its body as Committed
+        if (const auto* p = std::get_if<InternalPending>(&internalProposal_)) {
+            InternalCommitted c;
+            static_cast<InternalBody&>(c) = *p;
+            internalProposal_ = c;
+        }
+    }
+    /// The Pending proposal names exactly the members of `v`.
+    [[nodiscard]] bool internalPendingIs_(const std::vector<NodeId>& v) const noexcept {
+        const auto* p = std::get_if<InternalPending>(&internalProposal_);
+        if (p == nullptr || p->count != v.size()) return false;
+        for (NodeId id : v)
+            if (std::find(p->members.begin(), p->members.begin() + p->count, id) == p->members.begin() + p->count) return false;
+        return true;
     }
     uint64_t isrAwaitingMetadata_   = 0;   ///< proposals that entered AwaitingMetadata (A-M1)
     uint64_t staleAssignments_      = 0;   ///< committed assignments older than the applied one, ignored (A-M5)
@@ -1859,7 +1887,7 @@ private:
     // CP1 M6: a one-shot WARN latch (one bit, no per-state data), reset with the leadership; kept as a bool on purpose -
     // a std::variant<NotWarned, Warned> would hold the same single bit.
     bool     invalidRequestWarned_  = false;      ///< A-M2: WARN once per leadership
-    IsrProposal isrProposal_{};
+    InternalProposal internalProposal_{};
     /// MEDIUM-1: partitionEpoch of the committed assignment (-1 = unknown /
     /// not controller-managed).  Set by every becomeLeader.
     int32_t committedPartitionEpoch_ = -1;

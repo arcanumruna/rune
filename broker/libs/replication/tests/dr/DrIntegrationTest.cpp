@@ -2269,3 +2269,39 @@ TEST(DrIntegrationRegression, WipedLeaderIsGatedAndStrippedEndToEndRegression) {
     ASSERT_TRUE(c.driveUntil([&] { return c.converged(); }, kCap)) << c.dump();
     c.expectAckedPresent(1, "the wiped node catches up");
 }
+
+// ===========================================================================
+// ISR v3 Step 12 - the internal-quorum proposal is a variant (InternalNone | InternalPending | InternalCommitted).
+// ===========================================================================
+// A COMMITTED internal ISR state is re-sent (anti-entropy) to every replica that has not acked it, and the leader stops
+// once all acked.  Node 3 misses the commit that removes node 2, then two re-sends to it are lost too; it acks the third.
+// RED: resend only from InternalPending (node 3 never learns the committed state).
+TEST(InternalIsrRegression, CommittedStateIsResentUntilEveryReplicaAckedRegression) {
+    DrConfig cfg;
+    cfg.topicId = -3;   // the internal-ISR store partition
+    DrCluster c(3, cfg);
+    c.start(1);
+    ASSERT_EQ(c.produceAcked(10), 10);
+    ASSERT_TRUE(c.driveUntil([&] {
+        return !c.rep(1).internalSeedPendingForTest() && !c.rep(1).isrProposalPendingForTest();
+    }, kCap));
+    c.cut(1, 3);                                 // the commit's frame to node 3 is lost
+    c.cut(2, kControllerAddr);                   // node 2 consensus-dead: fenced out of the ISR
+    ASSERT_TRUE(c.driveUntil([&] {
+        return !c.rep(1).isrProposalPendingForTest() && !c.leaderIsrContains(2);
+    }, kCap)) << c.dump();
+    EXPECT_STREQ(c.rep(1).isrProposalStateNameForTest(), "None") << "committed: nothing pending";
+    const auto* k3 = c.node(3).isrKnowledge->latest(-3, kPartId);
+    ASSERT_TRUE(k3 == nullptr || k3->contains(2)) << "precondition: node 3 missed the commit";
+    c.heal(1, 3);
+    c.dropNext(Kind::InternalIsr, 2);            // the next two re-sends are lost as well
+    ASSERT_TRUE(c.driveUntil([&] {
+        const auto* k = c.node(3).isrKnowledge->latest(-3, kPartId);
+        return k != nullptr && !k->contains(2);
+    }, kCap)) << "the committed state was never re-sent to node 3\n" << c.dump();
+    EXPECT_GE(c.sentBy(1, Kind::InternalIsr), 3u);
+    c.run(100);   // every replica acked: the leader stops
+    const uint64_t quiet = c.sentBy(1, Kind::InternalIsr);
+    c.run(300);
+    EXPECT_EQ(c.sentBy(1, Kind::InternalIsr), quiet) << "the leader kept re-sending an acked state";
+}
