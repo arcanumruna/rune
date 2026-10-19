@@ -1623,6 +1623,104 @@ TEST(TruncationGuardRegression, StaleOlderEpochDivergenceStillTruncatesRegressio
     EXPECT_EQ(g.r.logEndOffset(), 10);
 }
 
+// CP3 I2: an epoch cache re-derived from batch stamps over a COMPACTION GAP names the first SURVIVING batch of an epoch,
+// not its first record; every other replica holds the true start.  Such a start is never compared (heldEpochStart_), on
+// either side, so an honest leader is never answered -11 / never fails over in a loop.
+namespace {
+/// Epoch-stamped single-record batches at the given bases (no replica involved): the on-disk state after compaction
+/// removed the batches in between.
+void appendStamped(rune::storage::Log& log, int32_t epoch, std::initializer_list<int64_t> bases) {
+    for (int64_t base : bases) {
+        rune::protocol::RecordBatchBuilder b(base, 1000);
+        b.append("k", "v", 1000);
+        auto x = b.build();
+        rune::protocol::RecordBatchReader::stampLeaderEpoch(x.data(), epoch);
+        log.append(x.data(), x.size(), base);
+    }
+}
+}  // namespace
+
+TEST(TruncationGuardRegression, CompactionGapRebuildIsNeverAHistoryMismatchRegression) {
+    TempDir dir("gap_rebuild");
+    {
+        rune::storage::Log log(dir.path);
+        log.recover();
+        appendStamped(log, 3, {0, 1, 2, 3, 4});
+        appendStamped(log, 5, {7, 8, 9, 10, 11});   // offsets 5..6 (epoch 5's true first batches) were compacted away
+    }
+    // The leader's own copy of the disk (the follower's boot would persist its epoch image into `dir`).
+    TempDir leaderDir("gap_rebuild_leader");
+    std::filesystem::copy(dir.path, leaderDir.path, std::filesystem::copy_options::recursive |
+                                                      std::filesystem::copy_options::overwrite_existing);
+    rune::storage::Log log(dir.path);
+    log.recover();
+    rune::storage::Log leaderLog(leaderDir.path);
+    leaderLog.recover();
+    CapturingIsr t;
+    PartitionReplica f(makeConfig(2), Role::Follower, 5, {1, 2}, {1, 2}, &log, &t);
+    ASSERT_EQ(f.logEndOffset(), 12);
+    ASSERT_EQ(f.lastFetchedEpoch(), 5);
+    EXPECT_EQ(f.heldEpochStartForTest(5), -1) << "a start derived over a gap must not be compared";
+    EXPECT_EQ(f.nextFetch().lastEpochStartOffset, -1);
+    // Leader side: rebuilt the same way, asked by a follower that holds the TRUE start 5.
+    PartitionReplica L(makeConfig(1), Role::Leader, 6, {1, 2}, {1, 2}, &leaderLog, &t);
+    EXPECT_EQ(L.heldEpochStartForTest(5), -1);
+    FetchRequestMsg req{};
+    req.leaderEpoch = 6; req.partition = 0; req.followerId = 2; req.fetchOffset = 12; req.maxBytes = 1 << 20;
+    req.topicId = 0; req.lastFetchedEpoch = 5; req.lastEpochStartOffset = 5;
+    EXPECT_NE(L.onFetchRequest(req, 1'000'000'000), kErrEpochHistoryMismatch);
+    EXPECT_EQ(L.epochHistoryMismatchesForTest(), 0u);
+}
+
+// The second rebuild site: a restart after a crash (recovery point unknown) re-derives the whole history in
+// reconcileEpochCacheWithLog_ even though an epoch image exists.  RED: reconcile does not mark the gap.
+TEST(TruncationGuardRegression, CompactionGapReconcileIsNeverAHistoryMismatchRegression) {
+    TempDir dir("gap_reconcile");
+    {
+        rune::storage::Log log(dir.path);
+        log.recover();
+        appendStamped(log, 3, {0, 1, 2, 3, 4});
+        appendStamped(log, 5, {7, 8, 9, 10, 11});
+    }
+    {   // boot 1: the epoch image is written, then the process crashes (no clean recovery-point checkpoint)
+        rune::storage::Log log(dir.path);
+        log.recover();
+        CapturingIsr t;
+        {
+            PartitionReplica f(makeConfig(2), Role::Follower, 5, {1, 2}, {1, 2}, &log, &t);
+        }
+        log.crashForTest();
+    }
+    std::error_code ec;   // no valid recovery point: restart re-derives the whole history
+    std::filesystem::remove(dir.path + "/" + rune::storage::Log::kRecoveryPointFile, ec);
+    rune::storage::Log log(dir.path);
+    log.recover();
+    CapturingIsr t;
+    PartitionReplica f(makeConfig(2), Role::Follower, 5, {1, 2}, {1, 2}, &log, &t);
+    ASSERT_EQ(f.logEndOffset(), 12);
+    ASSERT_EQ(f.lastFetchedEpoch(), 5);
+    EXPECT_EQ(f.heldEpochStartForTest(5), -1) << "a start re-derived over a gap must not be compared";
+    EXPECT_EQ(f.nextFetch().lastEpochStartOffset, -1);
+}
+
+// The same without the gap: the rebuilt start is the true one and is compared.
+TEST(TruncationGuardRegression, ContiguousRebuildStillComparesRegression) {
+    TempDir dir("contig_rebuild");
+    {
+        rune::storage::Log log(dir.path);
+        log.recover();
+        appendStamped(log, 3, {0, 1, 2, 3, 4});
+        appendStamped(log, 5, {5, 6, 7, 8, 9});
+    }
+    rune::storage::Log log(dir.path);
+    log.recover();
+    CapturingIsr t;
+    PartitionReplica f(makeConfig(2), Role::Follower, 5, {1, 2}, {1, 2}, &log, &t);
+    ASSERT_EQ(f.logEndOffset(), 10);
+    EXPECT_EQ(f.heldEpochStartForTest(5), 5);
+    EXPECT_EQ(f.nextFetch().lastEpochStartOffset, 5);
+}
+
 // A same-epoch re-assert of the same leader keeps the refusal (a metadata re-apply must not unblock it).
 // RED: reset the guard before the same-epoch early return.
 TEST(TruncationGuardRegression, SameEpochReassertKeepsTheRefusalRegression) {

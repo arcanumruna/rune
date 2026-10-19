@@ -1594,8 +1594,11 @@ private:
     [[nodiscard]] Offset heldEpochStart_(int32_t e) const noexcept {
         const Offset s  = epochCache_.startOffsetFor(e);
         const Offset ls = onLog([](auto& L) { return L.logStartOffset(); });
-        return (s >= 0 && (s == 0 || s > ls)) ? s : -1;
+        return (s >= 0 && s >= rederivedStartsBelow_ && (s == 0 || s > ls)) ? s : -1;
     }
+    /// CP3 I2: starts below this offset were re-derived from batch stamps over a compaction GAP (the first surviving batch of
+    /// an epoch is not its first record) - never compared.  Starts at or above it were assigned live.
+    Offset rederivedStartsBelow_ = 0;
 
     // ── Follower replication sync — SINGLE SOURCE OF TRUTH ──────────────────────
     // One explicit state machine (see FollowerSync.h) replaces the former scattered

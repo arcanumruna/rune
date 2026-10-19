@@ -1630,6 +1630,8 @@ void PartitionReplica::rebuildEpochCacheFromLog_()
 {
     Offset at = onLog([](auto& L) { return L.logStartOffset(); });
     const Offset leo = logEndOffset_();
+    Offset expect = at;      // CP3 I2: the next batch base if the walk is contiguous
+    bool gapped = false;
     for (int guard = 0; at < leo && guard < (1 << 20); ++guard) {
         // Copying read (cold): never leaves sealed segments mapped (lazy maps).
         const std::vector<uint8_t> buf = onLog([&](auto& L) { return L.read(at, 1 << 20); });
@@ -1643,12 +1645,17 @@ void PartitionReplica::rebuildEpochCacheFromLog_()
             rune::protocol::RecordBatchReader r(v.data + pos, v.len - pos);
             const int32_t total = r.totalLength();
             if (total <= 0 || pos + static_cast<std::size_t>(total) > v.len) break;
+            if (r.baseOffset() != expect) gapped = true;
             next = r.baseOffset() + r.lastOffsetDelta() + 1;
+            expect = next;
             pos += static_cast<std::size_t>(total);
         }
         if (next <= at) break;
         at = next;
     }
+    // CP3 I2: over a compaction gap the first surviving batch of an epoch is not its first record: the starts derived
+    // here are never compared (heldEpochStart_).  Starts at or above the LEO were assigned live and stay trusted.
+    if (gapped) rederivedStartsBelow_ = std::max(rederivedStartsBelow_, leo);
 }
 
 // Kafka LeaderEpochFileCache.assign on append: each batch whose stamped epoch
@@ -2360,6 +2367,8 @@ void PartitionReplica::reconcileEpochCacheWithLog_()
             from = start;
         }
     }
+    Offset expect = from;    // CP3 I2: contiguity of the re-derived region
+    bool gapped = false;
     for (int guard = 0; from < leo && guard < (1 << 20); ++guard) {
         const std::vector<uint8_t> buf = diskLog_->read(from, 1 << 20);   // cold, copying read
         if (buf.empty()) break;
@@ -2380,12 +2389,15 @@ void PartitionReplica::reconcileEpochCacheWithLog_()
                 }
                 if (ep > epochCache_.latestEpoch()) epochCache_.assign(ep, r.baseOffset());
             }
+            if (r.baseOffset() != expect) gapped = true;
             next = r.baseOffset() + r.lastOffsetDelta() + 1;
+            expect = next;
             pos += static_cast<std::size_t>(total);
         }
         if (next <= from) break;
         from = next;
     }
+    if (gapped) rederivedStartsBelow_ = std::max(rederivedStartsBelow_, leo);
 }
 
 int PartitionReplica::doWork(int64_t nowNs)
