@@ -3,6 +3,7 @@
 // logins work through every broker, a REVOKE ends live subscriptions on every broker within 100 ms, a leader kill
 // mid security DDL applies the retried request once, peer keys right / wrong / none, key rotation across rolling
 // restarts.  Every wait is bounded.
+#include "rune/node/MetadataService.h"
 #include "support/AuthMatrixExpectations.h"
 #include "support/AuthRig.h"
 #include "support/AuthTrio.h"
@@ -619,7 +620,10 @@ TEST(AuthClusterRegression, KeyRotationAcrossARollingRestartKeepsTrafficFlowingR
         double firstMs = -1;
         for (const auto& tp : prod.ackedAt) if (tp > from) { firstMs = std::chrono::duration<double, std::milli>(tp - from).count(); break; }
         std::printf("ROTATION recovery step=%s node=%d restart-end-to-first-ack=%.0f ms\n", restarts[k].step, restarts[k].node, firstMs);
-        EXPECT_TRUE(firstMs >= 0 && firstMs <= 3000.0) << "step " << restarts[k].step << " node " << restarts[k].node << ": first ack after " << firstMs << " ms (bound 3000)";
+        // Floor: a restarted controller defers user-partition elections for one unservable-report TTL, then the
+        // producer's 1 s no-answer timeout + re-login; +1 s margin. Derived, so a TTL change moves the bound with it.
+        constexpr double kRecoveryBoundMs = rune::node::MetadataService::kUnservableReportTtlNs / 1e6 + 1000.0 + 1000.0;
+        EXPECT_TRUE(firstMs >= 0 && firstMs <= kRecoveryBoundMs) << "step " << restarts[k].step << " node " << restarts[k].node << ": first ack after " << firstMs << " ms (bound " << kRecoveryBoundMs << ")";
     }
 }
 
