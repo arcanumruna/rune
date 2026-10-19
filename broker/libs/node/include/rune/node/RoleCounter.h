@@ -171,6 +171,10 @@ inline std::string loginsRateLimitedLabel(std::int32_t nodeId) { return "rune-lo
 // by this broker (both directions; monotonic).  Same key (node id) as the other security counters.
 inline constexpr std::int32_t kPeerLinksEstablishedCounterTypeId = 1'000'233;
 inline constexpr std::int32_t kPeerLinkRefusalsCounterTypeId     = 1'000'234;
+// Authentication Task 16: 235 = inter-broker frames dropped - no established link to the destination, or the frame did
+// not open (bad tag / replay / unknown peer or epoch / not a peer frame) - summed over every transport owner.
+inline constexpr std::int32_t kPeerFrameDropsCounterTypeId = 1'000'235;
+inline std::string peerFrameDropsLabel(std::int32_t nodeId) { return "rune-peer-frame-drops node=" + std::to_string(nodeId); }
 inline std::string peerLinksEstablishedLabel(std::int32_t nodeId) { return "rune-peer-links-established node=" + std::to_string(nodeId); }
 inline std::string peerLinkRefusalsLabel(std::int32_t nodeId) { return "rune-peer-link-refusals node=" + std::to_string(nodeId); }
 inline std::string securityApplyHaltedLabel(std::int32_t nodeId) { return "rune-security-apply-halted node=" + std::to_string(nodeId); }

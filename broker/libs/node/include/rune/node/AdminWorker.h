@@ -39,7 +39,7 @@
 #include "rune/node/CatalogPartition.h"
 #include "rune/node/CatalogReadServer.h"
 #include "rune/node/SecurityAdmin.h"
-#include <rune/peerlink/PeerLinkKeyStore.h>
+#include <rune/peerlink/PeerFrameCrypto.h>
 #include "rune/node/SecurityApplier.h"
 #include "rune/node/SecurityPartition.h"
 #include "rune/node/SchemaRegistry.h"
@@ -290,15 +290,13 @@ public:
     [[nodiscard]] int32_t placeableBrokers() const noexcept {
         return placementKnown_ ? placement_.placeable : deps_.brokerCount;
     }
-    /// control -> admin (Task 15, D33): the keys of an established inter-broker link.  This thread's OWN store; Task 16
-    /// hands them to the admin plane's PeerFrameCrypto.  Cold.
-    void onPeerLinkKeys(const PeerLinkKeysMsg& m, int64_t nowNs) noexcept {
-        rune::peerlink::LinkKeys k;
-        k.epoch = m.epoch; k.sendMaster = m.sendMaster; k.recvMaster = m.recvMaster;
-        if (peerKeys_.install(m.peer, k, nowNs)) ++peerLinkKeysSeen_;
-    }
-    [[nodiscard]] uint32_t peerLinkEpochForTest(int32_t peer) const noexcept { return peerKeys_.currentEpoch(peer); }
+    /// control -> admin (Task 15, D33): the keys of an established inter-broker link, for THIS thread's admin
+    /// replication plane (a transport built PeerSealed; null / PeerPlain: nothing to install).  Cold.
+    void onPeerLinkKeys(const PeerLinkKeysMsg& m) noexcept;
+    [[nodiscard]] uint32_t peerLinkEpochForTest(int32_t peer) const noexcept;
     [[nodiscard]] uint64_t peerLinkKeysSeenForTest() const noexcept { return peerLinkKeysSeen_; }
+    /// Inter-broker frames the admin plane dropped (no link / did not open); admin thread.
+    [[nodiscard]] uint64_t peerFrameDrops() const noexcept;
     /// control → admin: the controller's AlterIsrResponse for (-6, 0), verbatim.
     void onCatalogAlterIsrResponse(const rune::replication::AlterIsrResponseMsg& r);
 
@@ -515,7 +513,6 @@ private:
     /// that LEADS the catalog is never "caught up" this way (its history is whatever its own log holds).
     [[nodiscard]] bool bootReconcileReady_() const noexcept;
     int stepBootReconcile_();
-    rune::peerlink::PeerLinkKeyStore peerKeys_;   // Task 15: the admin plane's view of the inter-broker links
     uint64_t                         peerLinkKeysSeen_ = 0;
     PlacementViewMsg placement_{};         // the control thread's placement view (onPlacementView)
     bool             placementKnown_ = false;

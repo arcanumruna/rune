@@ -157,6 +157,9 @@ enum : int32_t {
     kA2cSecurityAlterIsr    = 20,
     kA2cSecurityApplied     = 21,
     kA2cSecurityHalted      = 22,
+    // Authentication Task 16: the admin plane's cumulative dropped inter-broker frames, [count:u64] (paced, only on a
+    // change) - the control thread folds it into counter 1'000'235.
+    kA2cPeerFrameDrops      = 23,
 };
 
 // ---------------------------------------------------------------------------

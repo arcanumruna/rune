@@ -8,7 +8,7 @@ target_include_directories(rune_consensus PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         ${RUNE_PROTOCOL_INCLUDE})
 # Authentication plan Task 9: inter-broker authentication (cluster keys; Tasks 15/16 add the handshake + frame crypto).
-target_link_libraries(rune_consensus PUBLIC rune_peerlink)
+target_link_libraries(rune_consensus PUBLIC rune_peerlink spdlog::spdlog)
 # Aeron headers needed for IngressRing, IdleStrategy, AgentRunner
 if(aeron_FOUND)
     target_link_libraries(rune_consensus PUBLIC aeron::aeron rune_aeron_util)
@@ -45,6 +45,14 @@ if(BUILD_TESTING)
                  COMMAND rune_consensus_tests --gtest_filter=*PreVoteRegression*:*D29bRegression*)
         set_tests_properties(ConsensusSimsUnderJitter${jit}Regression PROPERTIES ENVIRONMENT "SIM_JITTER=${jit}")
     endforeach()
+endif()
+
+# Authentication Task 16: three consensus nodes over real UDP, every frame sealed (needs an embedded media driver).
+if(BUILD_TESTING AND aeron_FOUND)
+    add_executable(rune_peer_sealed_consensus_tests tests/consensus/PeerSealedConsensusTest.cpp)
+    target_link_libraries(rune_peer_sealed_consensus_tests PRIVATE rune_consensus aeron::aeron GTest::gtest_main)
+    gtest_discover_tests(rune_peer_sealed_consensus_tests
+        PROPERTIES TIMEOUT 120 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 endif()
 
 option(BUILD_INTEGRATION_TESTING "Build integration tests" ON)

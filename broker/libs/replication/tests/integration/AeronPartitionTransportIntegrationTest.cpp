@@ -585,8 +585,10 @@ TEST(AeronPartitionTransportInteg, MaxFetchResponseHonorsTermBoundRegression) {
                               /*selfId=*/1, kRingBytes);
     t.setPublicationMaxMessageBytes(rune::replication::aeronMaxMessageLength(kTermBytes));
 
-    const int32_t kFrameworkOverhead = static_cast<int32_t>(FetchResponseMsg::encodedSize(0));
-    // Aeron maxMessageLength(64 KiB term) = 8192; minus the FetchResponse framing.
+    // Authentication Task 16 (D34): every inter-broker limit leaves the 32-byte peer frame in EVERY mode.
+    const int32_t kPeerOverhead = static_cast<int32_t>(rune::peerlink::kPeerFrameOverhead);
+    const int32_t kFrameworkOverhead = static_cast<int32_t>(FetchResponseMsg::encodedSize(0)) + kPeerOverhead;
+    // Aeron maxMessageLength(64 KiB term) = 8192; minus the FetchResponse framing and the peer frame.
     EXPECT_EQ(t.maxFetchResponseBytes(), 8192 - kFrameworkOverhead)
         << "the term bound (8192) is tighter than the ring bound (524288) and must win";
     EXPECT_EQ(t.maxFetchResponseBytes(),

@@ -2,15 +2,31 @@
 // every worker (lifecycle ring) and the admin thread (control -> admin ring); resumable, newest epoch wins.
 #include <rune/node/PeerLinkFanout.h>
 #include <rune/metadata/ShardRouter.h>
+#include <rune/replication/WorkerReplicationTransport.h>
 
 #include <gtest/gtest.h>
 
 using namespace rune::node;
 
 namespace {
-std::unique_ptr<WorkerPool> pool(int32_t n, std::size_t ringBytes = 1 << 16) {
-    return std::make_unique<WorkerPool>(n, rune::metadata::ShardRouter(n), ringBytes, 4096, 16, 16);
-}
+/// Each worker owns a replication plane built PeerSealed (never attached to Aeron: only its crypto is used here).
+struct SealedPool {
+    std::unique_ptr<WorkerPool> pool;
+    std::vector<std::unique_ptr<rune::replication::WorkerReplicationTransport>> planes;
+    explicit SealedPool(int32_t n, std::size_t ringBytes) {
+        pool = std::make_unique<WorkerPool>(n, rune::metadata::ShardRouter(n), ringBytes, 4096, 16, 16);
+        for (int32_t w = 0; w < n; ++w) {
+            planes.push_back(std::make_unique<rune::replication::WorkerReplicationTransport>(
+                w, "aeron:ipc", 600 + w, rune::replication::WorkerReplicationTransport::DeferredAttach{},
+                rune::peerlink::PeerFrameCrypto(1, static_cast<uint8_t>(3 + w))));
+            pool->worker(w).setReplicationTransport(planes.back().get());
+        }
+    }
+    WorkerPool* operator->() { return pool.get(); }
+    WorkerPool& operator*() { return *pool; }
+    WorkerPool* get() { return pool.get(); }
+};
+SealedPool pool(int32_t n, std::size_t ringBytes = 1 << 16) { return SealedPool(n, ringBytes); }
 void drainAll(WorkerPool& p) {
     for (int pass = 0; pass < 2; ++pass)
         for (int32_t w = 0; w < p.workerCount(); ++w) p.worker(w).doWork(1);

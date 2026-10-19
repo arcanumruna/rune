@@ -400,6 +400,30 @@ TEST(RoleCounterRegression, PeerLinkCountersArePublishedRegression) {
     EXPECT_TRUE(awaitCounter(aeronDir(1), kPeerLinksEstablishedCounterTypeId, 1, 20s)) << "node 1 links with node 2 only";
     EXPECT_TRUE(awaitCounter(aeronDir(2), kPeerLinksEstablishedCounterTypeId, 1, 20s));
     EXPECT_TRUE(awaitCounter(aeronDir(3), kPeerLinksEstablishedCounterTypeId, 0, 20s));
+    // 1'000'235: node 3 has no link at all - every frame it tried to send (consensus, the controller / replication
+    // transport, its workers' planes, the admin plane) was dropped and counted; the control thread folds the workers'
+    // and the admin plane's paced reports into the one counter.
+    {
+        const auto deadline = std::chrono::steady_clock::now() + 30s;
+        bool workers = false, admin = false;
+        while (std::chrono::steady_clock::now() < deadline && !(workers && admin)) {
+            const auto snap = c.node(3).peerLinksForTest();
+            workers = snap.workerDropsReported > 0;
+            admin   = snap.adminDropsReported > 0;
+            if (!(workers && admin)) std::this_thread::sleep_for(50ms);
+        }
+        EXPECT_TRUE(workers) << "node 3's worker plane reported its dropped peer frames to the control thread";
+        EXPECT_TRUE(admin)   << "node 3's admin plane reported its dropped peer frames to the control thread";
+        std::int64_t drops = -1;
+        const auto until = std::chrono::steady_clock::now() + 20s;
+        while (std::chrono::steady_clock::now() < until) {
+            if (readCounterByType(aeronDir(3), kPeerFrameDropsCounterTypeId, drops) && drops >= 3) break;
+            std::this_thread::sleep_for(50ms);
+        }
+        EXPECT_GE(drops, 3) << "counter 1'000'235 sums every owner's drops";
+        const auto snap = c.node(3).peerLinksForTest();
+        EXPECT_GE(static_cast<uint64_t>(drops), snap.workerDropsReported + snap.adminDropsReported);
+    }
     for (int id : {1, 2, 3}) {
         std::int64_t refusals = -1;
         const auto deadline = std::chrono::steady_clock::now() + 20s;

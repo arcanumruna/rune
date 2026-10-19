@@ -538,6 +538,8 @@ void BrokerNode::start() {
             kPeerLinksEstablishedCounterTypeId, roleKey, kRoleKeyLength, peerLinksEstablishedLabel(config_.nodeId));
         peerRefusalsCounterRegId_ = aeron_->addCounter(
             kPeerLinkRefusalsCounterTypeId, roleKey, kRoleKeyLength, peerLinkRefusalsLabel(config_.nodeId));
+        peerDropsCounterRegId_ = aeron_->addCounter(   // Authentication Task 16: 1'000'235 dropped peer frames
+            kPeerFrameDropsCounterTypeId, roleKey, kRoleKeyLength, peerFrameDropsLabel(config_.nodeId));
         // Authentication Task 11: 1'000'229 logins ok, 230 failed, 231 rate-limited.
         loginsOkCounterRegId_ = aeron_->addCounter(
             kLoginsOkCounterTypeId, roleKey, kRoleKeyLength, loginsOkLabel(config_.nodeId));
@@ -879,7 +881,9 @@ void BrokerNode::buildMultiNodeConsensus() {
         aeron_,
         config_.selfConsensusBindChannel(),
         config_.consensusStreamId,
-        *ingressRing_);
+        *ingressRing_,
+        rune::aeronutil::AeronPump{},
+        peerCrypto_(/*senderId=*/0));   // Authentication Task 16 (D33): consensus is sender 0
     const auto t_ingress_end = sclock::now();
     spdlog::debug(
         "BrokerNode[{}]: AeronIngress resolved in {:.1f}ms",
@@ -902,7 +906,8 @@ void BrokerNode::buildMultiNodeConsensus() {
     const auto t_sink_start = sclock::now();
     udpSink_ = std::make_unique<UdpMessageSink>(
         aeron_, peerEndpoints, rune::aeronutil::AeronPump{},
-        resolverHub_ ? resolverHub_->subscribeOwner() : rune::consensus::PeerResolutionSource{});
+        resolverHub_ ? resolverHub_->subscribeOwner() : rune::consensus::PeerResolutionSource{},
+        peerCrypto_(/*senderId=*/0));   // Authentication Task 16 (D33): consensus is sender 0
     const auto t_sink_end = sclock::now();
     spdlog::debug(
         "BrokerNode[{}]: UdpMessageSink publications resolved in {:.1f}ms",
@@ -1045,7 +1050,8 @@ void BrokerNode::buildReplication() {
         try {
             replTransport_ = std::make_unique<rune::replication::AeronPartitionTransport>(
                 aeron_, ingressChannel, ingressStream, selfId,
-                config_.replicationOutboundRingBytes);
+                config_.replicationOutboundRingBytes, rune::aeronutil::AeronPump{},
+                peerCrypto_(/*senderId=*/1));   // Authentication Task 16 (D33): legacy replication is sender 1
             // F18: every replication publication uses the embedded driver's term
             // (no channel overrides term-length) — fixed before any worker runs.
             replTransport_->setPublicationMaxMessageBytes(
@@ -1115,7 +1121,8 @@ void BrokerNode::buildReplication() {
             for (int32_t w = 0; w < wc; ++w) {
                 perWorkerReplTransports_.push_back(std::make_unique<WorkerReplicationTransport>(
                     w, config_.shardReplBindChannel(w), config_.replBaseStreamId + w,
-                    WorkerReplicationTransport::DeferredAttach{}));
+                    WorkerReplicationTransport::DeferredAttach{},
+                    peerCrypto_(static_cast<uint8_t>(3 + w))));   // Authentication Task 16 (D33): worker w is sender 3 + w
                 // DR-15 fix round 1: worker w's resolution events (its OWN ring).
                 if (resolverHub_) perWorkerReplTransports_.back()->attachResolution(resolverHub_->subscribeOwner());
             }
@@ -1145,7 +1152,8 @@ void BrokerNode::buildReplication() {
                 for (int32_t w = 0; w < wc; ++w) {
                     const int32_t streamId = config_.replBaseStreamId + w;
                     auto t = std::make_unique<WorkerReplicationTransport>(
-                        w, inboundChannel, streamId, WorkerReplicationTransport::DeferredAttach{});
+                        w, inboundChannel, streamId, WorkerReplicationTransport::DeferredAttach{},
+                        peerCrypto_(static_cast<uint8_t>(3 + w)));   // Authentication Task 16 (D33): worker w is sender 3 + w
                     // DR-15 fix round 1: a legacy plane rides the NODE client — its
                     // post-startup re-adds go through the control thread (MEDIUM-2),
                     // triggered by its own resolution events.
@@ -2131,6 +2139,9 @@ void BrokerNode::buildGateway() {
         // Wire in the TopicRegistry (GB-1). Non-owning pointer; registry outlives
         // the gateway (both destroyed in stop() with registry after gateway).
         gateway_->setTopicRegistry(topicRegistry_.get());
+        // Authentication Task 16: the workers' paced reports of dropped inter-broker frames -> counter 1'000'235.
+        workerPeerDrops_.assign(static_cast<std::size_t>(config_.workerCount >= 1 ? config_.workerCount : 1), 0);
+        gateway_->setPeerFrameDropSink(&BrokerNode::onWorkerPeerFrameDropsThunk_, this);
         // Authentication Task 10 (D11/D13): how sessions authenticate + the bootstrap window's view (the control thread's
         // own SecurityView - the gateway runs on this same thread).
         gateway_->setAuthTimeoutNs(config_.authTimeoutMs * 1'000'000LL);   // D13: RUNE_AUTH_TIMEOUT_MS
@@ -3297,12 +3308,30 @@ void BrokerNode::onPeerLinkEstablishedThunk_(void* self, int32_t peer, const run
 }
 
 void BrokerNode::onPeerLinkEstablished_(int32_t peer, const rune::peerlink::LinkKeys& k, int64_t nowNs) {
-    (void)controlPeerKeys_.install(peer, k, nowNs);   // this thread's transports (Task 16: sink, ingress, legacy)
-    peerLinkFanout_.post(peer, k);                    // every worker + the admin thread, over rings
+    (void)nowNs;
+    // The transports this (control) thread owns, directly; every worker and the admin thread over their rings.  A
+    // transport that cannot take the keys keeps dropping its frames to that peer (counted) - never sends in the clear.
+    bool ok = true;
+    if (udpSink_)       ok = udpSink_->installPeerLink(peer, k) && ok;
+    if (aeronIngress_)  ok = aeronIngress_->installPeerLink(peer, k) && ok;
+    if (replTransport_) ok = replTransport_->installPeerLink(peer, k) && ok;
+    if (!ok) spdlog::error("BrokerNode[{}]: the link keys of node {} (epoch {}) could not be installed on every "
+                           "control-thread transport - its frames are dropped until the next handshake",
+                           config_.nodeId, peer, k.epoch);
+    peerLinkFanout_.post(peer, k);
+    // Frames sent under the previous epoch before the peer installed the new keys are simply dropped by it (counted).
+    spdlog::debug("BrokerNode[{}]: peer link with node {} installed (epoch {})", config_.nodeId, peer, k.epoch);
 }
 
 int BrokerNode::servicePeerLinks_(int64_t nowNs) {
     if (!peerLinkAgent_) return 0;
+    // A frame named an epoch this thread's transports do not hold (the peer's continuous heartbeats under the new
+    // epoch): the agent re-handshakes (initiator side).  The peer's workers / admin plane only count (rule of D33).
+    {
+        int32_t peer = -1; uint32_t epoch = 0;
+        if (aeronIngress_ && aeronIngress_->takeUnknownEpoch(peer, epoch)) peerLinkAgent_->onUnknownEpoch(peer, epoch, nowNs);
+        if (replTransport_ && replTransport_->takeUnknownEpoch(peer, epoch)) peerLinkAgent_->onUnknownEpoch(peer, epoch, nowNs);
+    }
     int work = peerLinkAgent_->doWork(nowNs);
     work += peerLinkFanout_.pump(workerPool_.get(), adminWorkerAgent_ ? &adminWorkerAgent_->controlToAdminRing() : nullptr);
     publishPeerLinkMetrics_();
@@ -3318,8 +3347,25 @@ void BrokerNode::publishPeerLinkMetrics_() noexcept {
     };
     resolve(peerEstablishedCounter_, peerEstablishedCounterRegId_);
     resolve(peerRefusalsCounter_, peerRefusalsCounterRegId_);
+    resolve(peerDropsCounter_, peerDropsCounterRegId_);
+    if (peerDropsCounter_) peerDropsCounter_->set(static_cast<std::int64_t>(peerFrameDropsTotal_()));
     if (peerEstablishedCounter_) peerEstablishedCounter_->set(peerLinkAgent_->establishedPeers());
     if (peerRefusalsCounter_) peerRefusalsCounter_->set(static_cast<std::int64_t>(peerLinkAgent_->refusals()));
+}
+
+uint64_t BrokerNode::peerFrameDropsTotal_() const noexcept {
+    uint64_t n = adminPeerDrops_;
+    if (udpSink_) n += udpSink_->peerFrameDrops();
+    if (aeronIngress_) n += aeronIngress_->peerFrameDrops();
+    if (replTransport_) n += replTransport_->peerFrameDrops();
+    for (const uint64_t w : workerPeerDrops_) n += w;
+    return n;
+}
+
+void BrokerNode::onWorkerPeerFrameDropsThunk_(void* self, int32_t worker, uint64_t drops) {
+    auto* me = static_cast<BrokerNode*>(self);
+    if (worker >= 0 && static_cast<std::size_t>(worker) < me->workerPeerDrops_.size())
+        me->workerPeerDrops_[static_cast<std::size_t>(worker)] = drops;
 }
 
 BrokerNode::PeerLinkSnap BrokerNode::peerLinksForTest() {
@@ -3329,10 +3375,14 @@ BrokerNode::PeerLinkSnap BrokerNode::peerLinksForTest() {
         v.present     = true;
         v.established = peerLinkAgent_->establishedPeers();
         v.refusals    = peerLinkAgent_->refusals();
+        v.frameDrops  = peerFrameDropsTotal_();
+        for (const uint64_t w : workerPeerDrops_) v.workerDropsReported += w;
+        v.adminDropsReported = adminPeerDrops_;
+        v.sealed      = udpSink_ && udpSink_->peerSealed();
         for (const auto& peer : config_.peers) {
             if (peer.id == config_.nodeId) continue;
             v.peers.push_back(peer.id);
-            if (peer.id >= 0 && peer.id < 16) v.epochOf[peer.id] = controlPeerKeys_.currentEpoch(peer.id);
+            if (peer.id >= 0 && peer.id < 16) v.epochOf[peer.id] = udpSink_ ? udpSink_->peerLinkEpoch(peer.id) : 0u;
         }
         return v;
     });
@@ -3709,7 +3759,8 @@ void BrokerNode::buildCatalog_() {
         const int32_t streamId = config_.catalogReplStreamId;
         catalogPlane_ = std::make_unique<rr::WorkerReplicationTransport>(
             /*workerId (diagnostic: the admin plane)=*/-1, inbound, streamId,
-            rr::WorkerReplicationTransport::DeferredAttach{});
+            rr::WorkerReplicationTransport::DeferredAttach{},
+            peerCrypto_(/*senderId=*/2));   // Authentication Task 16 (D33): the admin plane is sender 2
         // DR-15: resolution events for the ADMIN thread (the plane's owner); its
         // post-startup re-adds go through the control thread (it rides the node
         // client), exactly like a legacy per-worker plane.
@@ -4321,6 +4372,7 @@ void BrokerNode::stop() {
     authModeCounter_.reset();
     peerEstablishedCounter_.reset();   // Authentication Task 15
     peerRefusalsCounter_.reset();
+    peerDropsCounter_.reset();
     loginsOkCounter_.reset();
     loginsFailedCounter_.reset();
     loginsRateLimitedCounter_.reset();
@@ -4572,6 +4624,12 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
             if (tid == kA2cSecurityAlterIsr) { forwardSecurityAlterIsr_(p, n); return; }
             if (tid == kA2cSecurityApplied)  { onSecurityApplied_(p, n); return; }
             if (tid == kA2cSecurityHalted)   { onSecurityHalted_(p, n); return; }
+            if (tid == kA2cPeerFrameDrops) {   // Authentication Task 16: the admin plane's dropped inter-broker frames
+                if (n == 8) std::memcpy(&adminPeerDrops_, p, 8);
+                else if (adminToControlRejects_++ % 1024 == 0)
+                    spdlog::error("BrokerNode[{}]: malformed kA2cPeerFrameDrops (len={}) skipped", config_.nodeId, n);
+                return;
+            }
             // Catalog history Task 8: the CatalogApplier's effects — this (control)
             // thread owns TopicRegistry, the replicas, the placement and the
             // cleaner's policy ring.  Every handler is idempotent (see BrokerNode.h).

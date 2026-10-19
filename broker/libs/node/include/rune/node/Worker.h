@@ -89,7 +89,6 @@
 #include <rune/node/WorkerEgress.h>
 #include <rune/node/RecordsPush.h>
 #include <rune/node/SessionAnnounceKeyTail.h>
-#include <rune/peerlink/PeerLinkKeyStore.h>
 #include <rune/node/RecordsOpen.h>
 #include <rune/crypto/Aead.h>
 #include <rune/crypto/Cipher.h>
@@ -707,7 +706,12 @@ public:
     [[nodiscard]] uint64_t sessionClosesSeenForTest() const noexcept { return sessionClosesSeen_; }
     /// Task 15 test probe (read on THIS worker's thread, or after it joined): the link epoch this worker holds for
     /// `peer` (0 = none), and how many PeerLinkKeys ops it applied.
-    [[nodiscard]] uint32_t peerLinkEpochForTest(int32_t peer) const noexcept { return peerKeys_.currentEpoch(peer); }
+    [[nodiscard]] uint32_t peerLinkEpochForTest(int32_t peer) const noexcept {
+        return workerReplTransport_ != nullptr ? workerReplTransport_->peerLinkEpoch(peer) : 0u;
+    }
+    [[nodiscard]] uint64_t peerFrameDropsForTest() const noexcept {
+        return workerReplTransport_ != nullptr ? workerReplTransport_->peerFrameDrops() : 0u;
+    }
     [[nodiscard]] uint64_t peerLinkKeysSeenForTest() const noexcept { return peerLinkKeysSeen_; }
     /// Acks dropped by the sink (closed / failed / stalled sessions).
     [[nodiscard]] uint64_t sessionAcksDroppedForTest() const noexcept { return ackSink_ ? ackSink_->droppedForTest() : 0; }
@@ -2516,12 +2520,17 @@ private:
         }
         rune::peerlink::LinkKeys k;
         k.epoch = static_cast<uint32_t>(op.partition());
+        const int32_t peer = op.topicId();
         const char* tail = op.tail();   // SBE var data: one call (it advances the decode position)
         std::memcpy(k.sendMaster.data(), tail, 32);
         std::memcpy(k.recvMaster.data(), tail + 32, 32);
-        if (!peerKeys_.install(op.topicId(), k, passNowNs_)) [[unlikely]]
-            spdlog::error("Worker {}: peer link table full - keys of node {} dropped", workerId_, op.topicId());
         ++peerLinkKeysSeen_;
+        // This worker's own replication plane (a transport built PeerSealed); none (legacy gateway-routed
+        // replication) or PeerPlain: nothing to install.
+        if (workerReplTransport_ != nullptr && workerReplTransport_->peerSealed() &&
+            !workerReplTransport_->installPeerLink(peer, k)) [[unlikely]]
+            spdlog::error("Worker {}: the link keys of node {} (epoch {}) could not be installed - frames to/from it "
+                          "are dropped", workerId_, peer, k.epoch);
     }
 
     // -------------------------------------------------------------------
@@ -4200,9 +4209,19 @@ private:
     // calls it directly on the typed pointer; the test seam via the trampoline.
     // -------------------------------------------------------------------
     template <typename T>
+    void reportPeerFrameDrops_(WorkerReplicationTransportImpl<T>& t, int64_t nowNs) {
+        if (!t.peerSealed() || nowNs < nextPeerDropReportNs_) [[likely]] return;
+        nextPeerDropReportNs_ = nowNs + 1'000'000'000LL;
+        const uint64_t drops = t.peerFrameDrops();
+        if (drops == reportedPeerDrops_) return;
+        if (trySessionSignal_(0, SessionSignalKind::PeerFrameDrops, static_cast<int64_t>(drops))) reportedPeerDrops_ = drops;
+    }
+
+    template <typename T>
     int pollReplTransport_(WorkerReplicationTransportImpl<T>& t, int64_t nowNs) {
         // Shard plane handshake (spec §3.3): one predicted branch unless a peer
         // is unverified / refused (then a hello on the retry cadence).
+        reportPeerFrameDrops_(t, nowNs);   // Task 16: paced (<= 1 per second), only when the count changed
         const int hs = t.driveHandshake(nowNs);
         // DR-15 (2026-10-05): a peer whose publication did not resolve at
         // startup (hostname unresolvable while it restarts) is re-added here on
@@ -4589,8 +4608,9 @@ private:
     uint64_t sessionAnnouncesSeen_ = 0;
     int32_t  lastAnnouncedClientVersion_ = -1;   ///< D6 test probe (the last SessionAnnounce's)
     uint64_t sessionClosesSeen_    = 0;
-    rune::peerlink::PeerLinkKeyStore peerKeys_;     // Task 15: this worker's view of the inter-broker links
     uint64_t peerLinkKeysSeen_     = 0;
+    int64_t  nextPeerDropReportNs_ = 0;   // Task 16: paced report of the plane's dropped peer frames
+    uint64_t reportedPeerDrops_    = 0;
     uint64_t intakePausedFrames_   = 0;   // fix round 1: per-session G-A6 pause (ABORTs); D8d: + direct budget
     uint64_t intakeRollHolds_      = 0;   // hotpath-A: frames held because their partition's roll is deferred
     uint32_t directSessionAckBudget_ = SessionAckSink::kDefaultDirectSessionBudget;   // D8d

@@ -60,6 +60,7 @@ namespace rune::node { class WorkerPool; class ReplicaRegistry; }
 #include <rune/replication/OutboundHoldRouter.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/replication/ReplicationFrameLimits.h>
+#include <rune/peerlink/PeerFrameCrypto.h>      // authentication Task 16
 #include <rune_protocol_internal_sbe/MessageHeader.h>
 #include <rune_protocol_internal_sbe/OutboundFrame.h>
 #include <concurrent/logbuffer/FrameDescriptor.h>
@@ -81,6 +82,7 @@ namespace rune::node { class WorkerPool; class ReplicaRegistry; }
 #include <functional>
 #include <memory>
 #include <unordered_map>
+#include <variant>
 #include <vector>
 
 namespace rune::replication {
@@ -121,7 +123,8 @@ public:
                             int32_t                        ingressStreamId,
                             NodeId                         selfId,
                             int                            outboundRingBytes = 4 * 1024 * 1024,
-                            rune::aeronutil::AeronPump     pump = {});
+                            rune::aeronutil::AeronPump     pump = {},
+                            rune::peerlink::PeerCryptoMode crypto = rune::peerlink::PeerPlain{});
 
     /// Fixed overhead of the SBE OutboundFrame envelope (SBE header +
     /// targetNodeId block + varData length prefix) that wraps every frame in
@@ -445,6 +448,25 @@ public:
         return static_cast<int>(peers_.size());
     }
 
+    // -----------------------------------------------------------------------
+    // Authentication Task 16 (D34): this transport's inter-broker frame crypto (built PeerPlain or PeerSealed, chosen
+    // at construction; sender id 1, D33).  Control thread only - the keys arrive from the PeerLinkAgent on the same
+    // thread.  Every frame sent to a peer is sealed WHOLE; every frame received is opened after reassembly.
+    // -----------------------------------------------------------------------
+    [[nodiscard]] bool peerSealed() const noexcept { return std::holds_alternative<rune::peerlink::PeerFrameCrypto>(crypto_); }
+    /// COLD.  False: not sealed, or the link could not be installed.
+    bool installPeerLink(int32_t peer, const rune::peerlink::LinkKeys& keys) noexcept;
+    [[nodiscard]] uint32_t peerLinkEpoch(int32_t peer) const noexcept;
+    /// Frames dropped for want of a link / that did not open (counter 1'000'235's source).
+    [[nodiscard]] uint64_t peerFrameDrops() const noexcept;
+    [[nodiscard]] uint64_t unknownEpochFrames() const noexcept { return unknownEpochFrames_; }
+    /// The (peer, epoch) of the last received frame naming an epoch this transport does not hold, consumed once.
+    [[nodiscard]] bool takeUnknownEpoch(int32_t& peer, uint32_t& epoch) noexcept {
+        if (!pendingUnknown_.valid) return false;
+        peer = pendingUnknown_.peer; epoch = pendingUnknown_.epoch; pendingUnknown_.valid = false;
+        return true;
+    }
+
 private:
     // -----------------------------------------------------------------------
     // Internal types
@@ -489,8 +511,11 @@ private:
     /// Send a raw buffer on a peer's ExclusivePublication.  Returns the Aeron
     /// result (> 0 accepted; BACK_PRESSURED / ADMIN_ACTION / NOT_CONNECTED ...
     /// refused — the caller HOLDS the frame, F27) or kOfferOversized (permanent).
-    int64_t sendOnPub(aeron::ExclusivePublication& pub,
+    int64_t sendOnPub(aeron::ExclusivePublication& pub, NodeId peer,
                       const uint8_t* buf, std::size_t len);
+    /// Task 16: the sealed variant of sendOnPub (a transport built PeerSealed).  No link -> the peer is treated as
+    /// DOWN for this frame (kOfferPeerDown: not held; the link edge re-drives the fetch).
+    int64_t sendSealedOnPub_(aeron::ExclusivePublication& pub, NodeId peer, const uint8_t* buf, std::size_t len);
 
     /// F27 F1 / R1: the hold router's Offer policy — offer `buf` to peer `id`'s
     /// pub.  No publication (registration failed, or not resolved yet) means the
@@ -501,7 +526,7 @@ private:
         int64_t operator()(NodeId id, const uint8_t* buf, std::size_t len) {
             PeerPub* p = t->findPeer(id);
             if (p == nullptr || !p->registered || !p->pub) return kOfferPeerDown;
-            return t->sendOnPub(*p->pub, buf, len);
+            return t->sendOnPub(*p->pub, id, buf, len);
         }
     };
     friend struct PubOffer;
@@ -512,10 +537,34 @@ private:
     /// reaches the replica.
     uint32_t peerConnGen_(NodeId peer) noexcept {
         PeerPub* p = findPeer(peer);
-        holdRouter_.noteLink(peer, p && p->registered && p->pub && p->pub->isConnected());
+        // Task 16: a sealed transport's link is up only once the peer link is ESTABLISHED too (the down -> up edge
+        // re-drives the fetch when the keys arrive).
+        holdRouter_.noteLink(peer, p && p->registered && p->pub && p->pub->isConnected() && linkUp_(peer));
         return holdRouter_.connGen(peer);
     }
     uint64_t lastPushFailed_ = 0;   ///< R3: last logged OutboundHoldStats::pushFailed
+
+    // --- Authentication Task 16 (control thread only) ---
+    [[nodiscard]] bool linkUp_(NodeId peer) const noexcept {
+        const auto* c = std::get_if<rune::peerlink::PeerFrameCrypto>(&crypto_);
+        return c == nullptr || c->hasLink(peer);
+    }
+    /// Open one received frame into recvScratch_ (sealed) and hand the plaintext to handleFrame_.  A frame whose
+    /// dispatch was refused (ABORT) is re-delivered by Aeron: its plaintext is kept and handed over again (the
+    /// replay window must not see the same seq twice).
+    aeron::ControlledPollAction onSealedFragment_(const uint8_t* frame, std::size_t len);
+    void noteOpenDrop_(rune::peerlink::PeerFrameCrypto::OpenResult r, int32_t from, uint32_t epoch) noexcept;
+    void sizeSealScratch_();
+    struct PendingOpened { bool valid = false; int32_t from = -1; uint8_t sender = 0; uint64_t seq = 0; std::size_t plainLen = 0; };
+    struct PendingUnknown { bool valid = false; int32_t peer = -1; uint32_t epoch = 0; };
+    rune::peerlink::PeerCryptoMode crypto_{rune::peerlink::PeerPlain{}};
+    std::vector<uint8_t>           sealScratch_;     ///< sealed outbound frame (cold-sized: pub max message + 32)
+    std::vector<uint8_t>           recvScratch_;     ///< an opened frame's plaintext
+    PendingOpened                  pendingOpened_{};
+    PendingUnknown                 pendingUnknown_{};
+    uint64_t                       unknownEpochFrames_ = 0;
+    uint64_t                       openDropsLogged_    = 0;
+    uint64_t                       noLinkLogged_       = 0;
 
     /// Look up a peer's PeerPub entry (or nullptr if not found).
     PeerPub* findPeer(NodeId id);

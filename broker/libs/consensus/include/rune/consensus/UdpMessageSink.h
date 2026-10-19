@@ -54,6 +54,8 @@
 
 #include <rune/aeronutil/AeronPump.h>
 #include <rune/consensus/PeerResolution.h>
+#include <rune/peerlink/PeerFrameCrypto.h>   // authentication Task 16: AEAD on every inter-broker frame
+#include <spdlog/spdlog.h>
 
 #include <Aeron.h>
 #include <ExclusivePublication.h>
@@ -62,6 +64,7 @@
 #include <cstdio>
 #include <string>
 #include <unordered_map>
+#include <vector>
 #include <memory>
 #include <chrono>
 #include <thread>
@@ -84,9 +87,13 @@ public:
                    const std::unordered_map<rune::consensus::NodeId,
                                              PeerEndpoint>&                 peerEndpoints,
                    rune::aeronutil::AeronPump                               pump = {},
-                   rune::consensus::PeerResolutionSource                    resolution = {})
+                   rune::consensus::PeerResolutionSource                    resolution = {},
+                   rune::peerlink::PeerCryptoMode                           crypto = rune::peerlink::PeerPlain{})
         : aeron_(std::move(aeron))
+        , crypto_(std::move(crypto))
     {
+        if (std::holds_alternative<rune::peerlink::PeerFrameCrypto>(crypto_))
+            sealScratch_.resize(kMaxSealedPayload + rune::peerlink::kPeerFrameOverhead);   // COLD, once
         // DR-15 fix round 1: off-thread resolution events (PeerResolverHub).
         inbox_.attach(resolution);
         (void)inbox_.poll();   // prefilled addresses first: the adds below go out numeric (DR-4)
@@ -118,6 +125,24 @@ public:
 
     ~UdpMessageSink() override = default;
 
+    // ----- Authentication Task 16: this sink's frame crypto (sender id 0, D33).  Control thread only. -----
+    [[nodiscard]] bool peerSealed() const noexcept { return std::holds_alternative<rune::peerlink::PeerFrameCrypto>(crypto_); }
+    bool installPeerLink(int32_t peer, const rune::peerlink::LinkKeys& keys) noexcept {
+        auto* c = std::get_if<rune::peerlink::PeerFrameCrypto>(&crypto_);
+        if (c == nullptr) return false;
+        try { return c->installLink(peer, keys, rune::peerlink::steadyNowNs()); } catch (...) { return false; }
+    }
+    [[nodiscard]] uint32_t peerLinkEpoch(int32_t peer) const noexcept {
+        const auto* c = std::get_if<rune::peerlink::PeerFrameCrypto>(&crypto_);
+        return c ? c->currentEpoch(peer) : 0u;
+    }
+    [[nodiscard]] uint64_t peerFrameDrops() const noexcept {
+        const auto* c = std::get_if<rune::peerlink::PeerFrameCrypto>(&crypto_);
+        return c ? c->drops() : 0u;
+    }
+    /// The largest consensus frame a sealed sink carries (the ingress ring's maximum message is 8 KiB).
+    static constexpr std::size_t kMaxSealedPayload = 16 * 1024;
+
     /// Test-only: number of peer publications still unresolved (runs one resolve probe).
     [[nodiscard]] int unresolvedForTest() noexcept { return resolvePending(); }
     /// Test-only: registrations issued after the first one per peer.
@@ -142,6 +167,28 @@ public:
         auto& pub = it->second.pub;
         if (!pub) return;                      // not yet resolved — drop (canvass retries)
         if (!pub->isConnected()) return;       // not connected — drop (will retry)
+
+        // Task 16 (D34): a sealed sink seals the WHOLE frame before Aeron fragments it; no established link to the
+        // destination -> nothing is sent (counted, rate-limited log).  PeerPlain: one predicted branch, today's bytes.
+        if (auto* c = std::get_if<rune::peerlink::PeerFrameCrypto>(&crypto_)) [[unlikely]] {
+            if (!c->hasLink(toMember)) {
+                c->noteNoLink();
+                if ((noLinkLogged_++ % 1024) == 0)
+                    spdlog::warn("UdpMessageSink: peer frames to node {} dropped: link not established ({} dropped so far)",
+                                 toMember, noLinkLogged_);
+                return;
+            }
+            if (len > kMaxSealedPayload) [[unlikely]] {
+                c->noteNoLink();   // counted with the other undeliverable frames
+                if ((noLinkLogged_++ % 1024) == 0)
+                    spdlog::error("UdpMessageSink: consensus frame {} B exceeds the {} B seal scratch - dropped", len, kMaxSealedPayload);
+                return;
+            }
+            const std::size_t n = c->seal(toMember, buf, len, sealScratch_.data(), sealScratch_.size());
+            if (n == 0) [[unlikely]] return;   // a cipher error: never transmitted
+            buf = sealScratch_.data();
+            len = n;
+        }
 
         auto* mutableBuf = const_cast<uint8_t*>(buf);
         aeron::concurrent::AtomicBuffer atomicBuf(
@@ -290,6 +337,9 @@ private:
     rune::consensus::PeerResolutionInbox inbox_;   // consensus duty thread: resolution events
 
     std::shared_ptr<aeron::Aeron> aeron_;
+    rune::peerlink::PeerCryptoMode crypto_{rune::peerlink::PeerPlain{}};   // Task 16: chosen at construction
+    std::vector<uint8_t>           sealScratch_;                            // sealed frame (preallocated, sealed only)
+    uint64_t                       noLinkLogged_ = 0;
     std::unordered_map<rune::consensus::NodeId, PeerSlot> peers_;
 };
 

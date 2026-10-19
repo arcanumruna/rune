@@ -1845,6 +1845,14 @@ private:
     /// cap): the shard-mode controlled poll ABORTs it and redelivers it later.
     bool onClientFrame_(const uint8_t* buf, std::size_t len);
     void onSessionSignal_(const rune::node::WorkerReturn& ret);
+public:
+    /// Authentication Task 16: a worker's paced report of the inter-broker frames its replication plane dropped
+    /// (WorkerReturn SessionSignal kind PeerFrameDrops) is handed to the runtime (counter 1'000'235) - control thread.
+    using PeerFrameDropSinkFn = void (*)(void* ctx, int32_t worker, uint64_t cumulativeDrops);
+    void setPeerFrameDropSink(PeerFrameDropSinkFn fn, void* ctx) noexcept { peerDropFn_ = fn; peerDropCtx_ = ctx; }
+private:
+    PeerFrameDropSinkFn peerDropFn_  = nullptr;
+    void*               peerDropCtx_ = nullptr;
     void sendSessionExpired_(aeron::ExclusivePublication* pub, Session* session, int64_t sid);
     /// Evict the oldest pending connect (the kMaxPendingConnects cap).
     void evictOldestPendingConnect_();

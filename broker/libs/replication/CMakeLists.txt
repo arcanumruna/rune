@@ -156,7 +156,8 @@ if(BUILD_TESTING)
         "Build AeronPartitionTransport in-process Aeron integration tests (GR-1)" ON)
     if(BUILD_AERON_REPLICATION_TESTS AND aeron_FOUND)
         add_executable(rune_replication_aeron_tests
-            tests/integration/AeronPartitionTransportIntegrationTest.cpp)
+            tests/integration/AeronPartitionTransportIntegrationTest.cpp
+            tests/integration/PeerSealedTransportTest.cpp)
         target_link_libraries(rune_replication_aeron_tests PRIVATE
             rune_replication_aeron
             aeron::aeron

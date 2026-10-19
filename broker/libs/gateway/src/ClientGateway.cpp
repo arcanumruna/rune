@@ -1803,6 +1803,10 @@ void ClientGateway::onSessionSignal_(const rune::node::WorkerReturn& ret)
 {
     using K = rune::node::SessionSignalKind;
     const auto kind = static_cast<K>(ret.lastOffset);
+    if (kind == K::PeerFrameDrops) [[unlikely]] {   // Task 16: not a session signal - a worker's plane drop count
+        if (peerDropFn_ != nullptr) peerDropFn_(peerDropCtx_, ret.partition, static_cast<uint64_t>(ret.baseOffset));
+        return;
+    }
     if (kind == K::EgressReleased) {                                  // retire-on-ack: the worker let go
         onEgressReleased_(ret.partition, static_cast<uint64_t>(ret.baseOffset));
         return;

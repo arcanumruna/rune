@@ -14,6 +14,8 @@
 
 #include <rune/aeronutil/AeronPump.h>
 #include <rune/consensus/IngressRing.h>
+#include <rune/peerlink/PeerFrameCrypto.h>   // authentication Task 16
+#include <spdlog/spdlog.h>
 
 #include <Aeron.h>
 #include <Subscription.h>
@@ -22,6 +24,7 @@
 #include <util/Index.h>
 
 #include <memory>
+#include <vector>
 #include <stdexcept>
 #include <chrono>
 
@@ -43,10 +46,14 @@ public:
                  const std::string&            channel,
                  int32_t                       streamId,
                  IngressRing&                  ingressRing,
-                 rune::aeronutil::AeronPump    pump = {})
+                 rune::aeronutil::AeronPump    pump = {},
+                 rune::peerlink::PeerCryptoMode crypto = rune::peerlink::PeerPlain{})
         : aeron_(std::move(aeron))
         , ingressRing_(ingressRing)
+        , crypto_(std::move(crypto))
     {
+        if (std::holds_alternative<rune::peerlink::PeerFrameCrypto>(crypto_))
+            recvScratch_.resize(kMaxSealedPayload + rune::peerlink::kPeerFrameOverhead);   // COLD, once
         int64_t regId = aeron_->addSubscription(channel, streamId);
 
         // Until Aeron answers (bounded by Aeron's driverTimeoutMs, default 10 s).  Spec §3.6: an invoker driver/conductor (fused runtime) is
@@ -74,9 +81,19 @@ public:
                 assembler_.onFragment(
                     [this](aeron::concurrent::AtomicBuffer& buffer, aeron::util::index_t offset,
                            aeron::util::index_t length, aeron::Header&) {
+                        const auto* frame = reinterpret_cast<const uint8_t*>(buffer.buffer() + offset);
+                        if (auto* c = std::get_if<rune::peerlink::PeerFrameCrypto>(&crypto_)) [[unlikely]] {
+                            // Task 16 (D34): open AFTER reassembly, BEFORE the ring - a frame that does not open
+                            // never reaches the consensus agent (dropped, counted, rate-limited log).
+                            std::size_t plainLen = 0; int32_t from = -1; uint32_t epoch = 0;
+                            const auto r = c->open(frame, static_cast<std::size_t>(length), recvScratch_.data(),
+                                                   recvScratch_.size(), plainLen, from, epoch);
+                            if (r != rune::peerlink::PeerFrameCrypto::OpenResult::Ok) [[unlikely]] { noteOpenDrop_(r, from, epoch); return; }
+                            ingressRing_.write(recvScratch_.data(), plainLen);
+                            return;
+                        }
                         // Write the (reassembled) frame into the ingress ring.
-                        ingressRing_.write(reinterpret_cast<const uint8_t*>(buffer.buffer() + offset),
-                                           static_cast<std::size_t>(length));
+                        ingressRing_.write(frame, static_cast<std::size_t>(length));
                     },
                     b, o, l, h);
             },
@@ -87,10 +104,47 @@ public:
 
     aeron::Subscription& subscription() { return *sub_; }
 
+    // ----- Authentication Task 16: this ingress's frame crypto (the receive side of the consensus link).  Control
+    //       thread only; the PeerLinkAgent's keys are installed here by the same thread. -----
+    [[nodiscard]] bool peerSealed() const noexcept { return std::holds_alternative<rune::peerlink::PeerFrameCrypto>(crypto_); }
+    bool installPeerLink(int32_t peer, const rune::peerlink::LinkKeys& keys) noexcept {
+        auto* c = std::get_if<rune::peerlink::PeerFrameCrypto>(&crypto_);
+        if (c == nullptr) return false;
+        try { return c->installLink(peer, keys, rune::peerlink::steadyNowNs()); } catch (...) { return false; }
+    }
+    [[nodiscard]] uint32_t peerLinkEpoch(int32_t peer) const noexcept {
+        const auto* c = std::get_if<rune::peerlink::PeerFrameCrypto>(&crypto_);
+        return c ? c->currentEpoch(peer) : 0u;
+    }
+    [[nodiscard]] uint64_t peerFrameDrops() const noexcept {
+        const auto* c = std::get_if<rune::peerlink::PeerFrameCrypto>(&crypto_);
+        return c ? c->drops() : 0u;
+    }
+    /// The (peer, epoch) of the last frame naming an epoch this ingress does not hold - consumed once.  The peer's
+    /// heartbeats arrive continuously, so the PeerLinkAgent (same thread) learns of a stale link within a beat.
+    [[nodiscard]] bool takeUnknownEpoch(int32_t& peer, uint32_t& epoch) noexcept {
+        if (!pendingUnknown_.valid) return false;
+        peer = pendingUnknown_.peer; epoch = pendingUnknown_.epoch; pendingUnknown_.valid = false;
+        return true;
+    }
+    static constexpr std::size_t kMaxSealedPayload = 16 * 1024;   // a consensus frame; the ring's maximum message is 8 KiB
+
 private:
+    void noteOpenDrop_(rune::peerlink::PeerFrameCrypto::OpenResult r, int32_t from, uint32_t epoch) noexcept {
+        if (r == rune::peerlink::PeerFrameCrypto::OpenResult::UnknownEpoch) pendingUnknown_ = PendingUnknown{true, from, epoch};
+        if ((openDropsLogged_++ % 1024) == 0)
+            spdlog::warn("AeronIngress: frame from node {} dropped: {} (epoch {}; {} dropped so far)", from,
+                         rune::peerlink::PeerFrameCrypto::name(r), epoch, openDropsLogged_);
+    }
+    struct PendingUnknown { bool valid = false; int32_t peer = -1; uint32_t epoch = 0; };
+
     std::shared_ptr<aeron::Aeron>          aeron_;
     std::shared_ptr<aeron::Subscription>   sub_;
     IngressRing&                           ingressRing_;
+    rune::peerlink::PeerCryptoMode         crypto_{rune::peerlink::PeerPlain{}};   // Task 16: chosen at construction
+    std::vector<uint8_t>                   recvScratch_;                           // an opened frame (preallocated)
+    PendingUnknown                         pendingUnknown_{};
+    uint64_t                               openDropsLogged_ = 0;
     rune::aeronutil::FragmentAssembler     assembler_;
     rune::aeronutil::ImageLossWatch        imageWatch_;
 };

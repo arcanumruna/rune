@@ -183,6 +183,7 @@ if(BUILD_TESTING)
         tests/node/CatalogGatesRegressionTest.cpp
         tests/node/WorkerOwnedIndexRegressionTest.cpp
         tests/node/WorkerDroppedTopicRegressionTest.cpp
+        tests/node/ReplicationFrameLimitsRegressionTest.cpp
         )
     target_include_directories(rune_node_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     target_link_libraries(rune_node_tests PRIVATE
@@ -207,6 +208,20 @@ if(BUILD_TESTING)
         rune_view
         GTest::gtest_main)
     gtest_discover_tests(rune_catalog_alloc_regression_tests)
+
+    # Authentication Task 16 (hard rule 4): sealed inter-broker replication allocates nothing in steady state.  Replaces the
+    # global operator new (binary-wide) - own binary; counts only the test thread's allocations.
+    if(aeron_FOUND)
+        add_executable(rune_peer_frame_alloc_regression_tests
+            tests/node/PeerFrameAllocRegressionTest.cpp)
+        target_link_libraries(rune_peer_frame_alloc_regression_tests PRIVATE
+            rune_node
+            rune_replication
+            aeron::aeron
+            GTest::gtest_main)
+        gtest_discover_tests(rune_peer_frame_alloc_regression_tests
+            PROPERTIES TIMEOUT 120 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+    endif()
 
     # Authentication Task 9 (hard rule 4): an idle SecurityApplier pass allocates nothing.  Replaces the global
     # operator new (binary-wide) — own binary, like the catalog's.
@@ -1533,7 +1548,8 @@ if(BUILD_TESTING)
     # Authentication Task 15: the inter-broker link handshakes (agent over one driver; three in-process brokers).
     if(BUILD_NODE_UDP_TESTS AND aeron_FOUND)
         add_executable(rune_peer_link_agent_tests
-            tests/integration/PeerLinkAgentTest.cpp)
+            tests/integration/PeerLinkAgentTest.cpp
+            tests/integration/PeerSealedClusterTest.cpp)
         target_include_directories(rune_peer_link_agent_tests PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_peer_link_agent_tests PRIVATE
