@@ -2260,6 +2260,13 @@ public:
         // move to a live in-sync replica, a sole-ISR one stays, a dead
         // leader's partition prefers a non-stopping survivor (review D5).
         in.avoidLeaders = shutting;
+        // CP2 I2: below the storage-identity level a Joiner's gate can never open (no NodeStorageRecord exists), so
+        // never prefer it as a leader (soft: a sole survivor is still elected).  Stops the elect/hold/bump churn.
+        if (msm_.featureLevel() < rune::replication::MetadataFeature::kStorageIdentity)
+            for (const auto& [n, lc] : nodeLifecycle_)
+                if (lc.storageOrigin == rune::replication::AlterIsrMsg::kStorageOriginJoiner ||
+                    lc.storageOrigin == rune::replication::AlterIsrMsg::kStorageOriginUndecided)
+                    in.avoidLeaders.push_back(n);
 
         rune::metadata::DynamicBalancer bal;
         std::vector<rune::metadata::BalancerRecord> recs = bal.rebalance(in);

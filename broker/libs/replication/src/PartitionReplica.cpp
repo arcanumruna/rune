@@ -373,6 +373,7 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr, int
         }
     }
     staleLead_.pending = false;
+    storageHoldBackoffNs_ = 0;   // the gate let this leadership through: the next hold starts a new sequence
     report_.pending    = false;
     // E2 final fix wave (C1 multi-node): a TRANSIENT leader reports, for this
     // leadership, the leader epoch its ring's data came from (-1: unborn) — the
@@ -3365,9 +3366,8 @@ bool PartitionReplica::persistLedEpoch_(Epoch e)
 void PartitionReplica::refuseStaleLeadership_(Epoch newEpoch, int32_t partitionEpoch)
 {
     ++staleLeadRefusals_;
-    armLeadershipBump_(newEpoch, partitionEpoch,
-                       "restart fence " + std::to_string(static_cast<long long>(restartFenceEpoch_)) +
-                       " (led by an earlier incarnation, or no durable fence)");
+    armLeadershipBump_(newEpoch, partitionEpoch, "restart fence (led by an earlier incarnation, or no durable fence)",
+                       /*storageHold=*/false);
 }
 
 // ---------------------------------------------------------------------------
@@ -3451,18 +3451,25 @@ int PartitionReplica::sendRefusedReport_(int64_t nowNs)
 void PartitionReplica::holdLeadershipForStorage(Epoch e, int32_t pe)
 {
     ++storageHolds_;
+    const bool coalesce = staleLead_.pending && staleLead_.storageHold && !staleLead_.sent;   // read BEFORE becomeFollower clears it
     // A replica that never led here is still a follower of the previous epoch: stamp the committed epoch first, so the
     // follower of nobody sits at (or above) the epoch it was named leader at.
     if (role_ != Role::Leader && epoch_ < e) becomeFollower(e, NodeId{-1});
-    armLeadershipBump_(e, pe, "storage unconfirmed");
+    // CP2 I2: pace consecutive holds (below feature level 2 the gate never opens and the controller keeps re-granting).
+    constexpr int64_t kMaxBackoffNs = 30'000'000'000LL;
+    if (!coalesce) {   // an unsent hold keeps its slot
+        storageHoldNotBeforeNs_ = lastStorageBumpNs_ + storageHoldBackoffNs_;
+        storageHoldBackoffNs_   = storageHoldBackoffNs_ == 0 ? 1'000'000'000LL : std::min(2 * storageHoldBackoffNs_, kMaxBackoffNs);
+    }
+    armLeadershipBump_(e, pe, "storage unconfirmed", /*storageHold=*/true);
 }
 
-void PartitionReplica::armLeadershipBump_(Epoch newEpoch, int32_t partitionEpoch, const std::string& why)
+void PartitionReplica::armLeadershipBump_(Epoch newEpoch, int32_t partitionEpoch, const char* why, bool storageHold)
 {
-    spdlog::warn("PartitionReplica[node={}] topic={} part={}: leadership at epoch {} REFUSED — {}; "
+    spdlog::warn("PartitionReplica[node={}] topic={} part={}: leadership at epoch {} REFUSED — {} (restart fence {}); "
                  "asking the controller for a new epoch",
                  cfg_.selfId, cfg_.topicId, static_cast<int>(cfg_.partitionId),
-                 static_cast<long long>(newEpoch), why);
+                 static_cast<long long>(newEpoch), why, static_cast<long long>(restartFenceEpoch_));
     // Never lead (and never accept a produce) under it: a follower of no leader.
     if (role_ == Role::Leader)
         becomeFollower(epoch_ > newEpoch ? epoch_ : newEpoch, NodeId{-1});
@@ -3472,6 +3479,7 @@ void PartitionReplica::armLeadershipBump_(Epoch newEpoch, int32_t partitionEpoch
     staleLead_.epoch          = newEpoch;
     staleLead_.partitionEpoch = partitionEpoch;
     staleLead_.sent           = false;
+    staleLead_.storageHold    = storageHold;
     publishCleanerState();
 }
 
@@ -3482,6 +3490,10 @@ int PartitionReplica::requestLeaderEpochBump_(int64_t nowNs)
     // answer or the record may be lost) — convergence is decided by the
     // controller's committed assignment, never by this interval.
     if (staleLead_.sent && nowNs - staleLead_.sentNs < kAlterIsrResendNs) return 0;
+    if (staleLead_.storageHold) {
+        if (nowNs < storageHoldNotBeforeNs_) return 0;   // CP2 I2: paced
+        lastStorageBumpNs_ = nowNs;
+    }
     staleLead_.sent   = true;
     staleLead_.sentNs = nowNs;
     AlterIsrMsg m{};

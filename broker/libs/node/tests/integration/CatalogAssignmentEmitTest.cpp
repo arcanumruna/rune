@@ -4609,6 +4609,25 @@ TEST(StorageRegistrationRegression, HeldLeaderFailsOverBelowFeatureLevelTwoRegre
     EXPECT_FALSE(isrHasNode(c.pa(), 3));
 }
 
+// CP2 I2: below feature level 2 a Joiner's gate never opens, so the controller must not elect it when another live ISR
+// member exists (soft avoid) - else the elect / hold / bump loop never ends.  RED: no avoid entry for Joiners.
+TEST(StorageRegistrationRegression, JoinerIsAvoidedAsLeaderBelowLevelTwoRegression) {
+    for (const int32_t joiner : {2, 3}) {
+        SCOPED_TRACE(joiner);
+        CtlRig c(true, {}, rune::replication::MetadataFeature::kBase);
+        ASSERT_LT(c.svc->featureLevel(), 2);
+        c.forceLeader(1);
+        c.readmit(2);
+        c.readmit(3);
+        ASSERT_EQ(c.pa().isr.size(), 3u);
+        (void)registerStorage(*c.svc, joiner, 0xB, kStorageOriginJoiner, 9);
+        const int32_t other = joiner == 2 ? 3 : 2;
+        c.tick({joiner, other});   // node 1 dies
+        c.tick({joiner, other});
+        EXPECT_EQ(c.pa().leaderNode, other) << "the unconfirmed Joiner was elected below feature level 2";
+    }
+}
+
 // ===========================================================================
 // ISR v3 Step 11 - the controller side of the truncation guard (design section 3.8).
 // ===========================================================================

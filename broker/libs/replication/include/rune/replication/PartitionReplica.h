@@ -1917,13 +1917,18 @@ private:
         int32_t partitionEpoch = -1;         ///< its committed partitionEpoch
         int64_t sentNs         = 0;
         bool    sent           = false;
+        bool    storageHold    = false;      ///< a held (not refused) leadership: its bump is paced (CP2 I2)
     };
     StaleLeadership staleLead_;
+    /// CP2 I2: consecutive storage holds ask for a new epoch 1, 2, 4 ... 30 s apart (the first of a process at once).
+    int64_t storageHoldBackoffNs_  = 0;   ///< spacing the NEXT hold will observe (0 = the next hold asks at once)
+    int64_t storageHoldNotBeforeNs_ = 0;  ///< the armed hold's bump may not be sent before this
+    int64_t lastStorageBumpNs_     = 0;
     uint64_t        staleLeadRefusals_ = 0;
     void refuseStaleLeadership_(Epoch newEpoch, int32_t partitionEpoch);
     /// The shared body of a refused/held leadership: a follower of nobody, and a pending restart-fence bump request
     /// (requestLeaderEpochBump_) for the committed (newEpoch, partitionEpoch).  `why` goes into the log line only.
-    void armLeadershipBump_(Epoch newEpoch, int32_t partitionEpoch, const std::string& why);
+    void armLeadershipBump_(Epoch newEpoch, int32_t partitionEpoch, const char* why, bool storageHold);
     uint64_t        storageHolds_ = 0;
     int  requestLeaderEpochBump_(int64_t nowNs);
     bool persistLedEpoch_(Epoch e);

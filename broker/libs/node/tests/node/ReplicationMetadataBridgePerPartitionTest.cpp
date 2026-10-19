@@ -768,6 +768,38 @@ TEST_F(StorageGateBridgeRegression, HeldLeaderRoleRequestsAFailoverRegression) {
     EXPECT_EQ(rep->epoch(), 3u);
 }
 
+// CP2 I2: below feature level 2 the controller keeps re-granting a held Joiner.  Consecutive holds are PACED: the first
+// bump goes out at once, the following re-grants coalesce behind the backoff, and one more goes out after it elapses.
+// RED: no backoff (every re-grant bumps at once: 4 alters).
+TEST_F(StorageGateBridgeRegression, ConsecutiveHeldReGrantsBackOffRegression) {
+    PartitionReplica* rep = addHeldReplica(0);
+    MetadataStateMachine msm;
+    auto bridge = makeBridge(&msm);
+    rune::node::StorageIdentity::Loaded L{0xB, rune::node::StorageIdentity::Origin::Joiner, rune::node::StorageIdentity::Mode::None, 0};
+    rune::node::StorageGate gate(L, metaDir_.path, kSelf, 3);
+    ASSERT_EQ(gate.evaluate(msm, Evidence{}, 0), StorageGate::Change::none);
+    bridge->setStorageGate(&gate);
+    int64_t pos = 0, now = 0;
+    const auto regrant = [&](int32_t epoch) {
+        auto [ubuf, usz] = encodeUpdate({0, 0, kSelf, {kSelf, kNode2, kNode3}, {kSelf, kNode2, kNode3}, epoch, epoch + 1});
+        msm.apply(ubuf.data(), usz, pos);
+        msm.commit(++pos);
+        (void)bridge->doWork(kNode2, 1);
+        now += 10'000'000;
+        rep->doWork(now);
+    };
+    regrant(3);
+    EXPECT_EQ(transport_.alters.size(), 1u) << "the first hold must ask at once";
+    for (int32_t e = 4; e <= 6; ++e) {
+        regrant(e);
+        EXPECT_EQ(transport_.alters.size(), 1u) << "re-grant at epoch " << e << " bumped again inside the backoff";
+    }
+    now += 1'100'000'000;
+    rep->doWork(now);
+    EXPECT_EQ(transport_.alters.size(), 2u) << "the paced bump never went out";
+    EXPECT_EQ(transport_.alters.back().leaderEpoch, 6);
+}
+
 // __catalog is admin-thread-owned: its held role reaches the admin ring as kMsgCatalogHoldLeadership {leader false,
 // leaderId -1}.  RED: post it with kMsgCatalogRole.
 TEST_F(StorageGateBridgeRegression, CatalogRoleIsHeldAsFollowerOfNobodyRegression) {
