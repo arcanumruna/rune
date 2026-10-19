@@ -2551,6 +2551,10 @@ void BrokerNode::buildGateway() {
                 metaReplicaRaw, nodeId);
             if (config_.testUserDecisionHoldMs > 0)   // TEST-ONLY (see NodeConfig)
                 metadataService_->setUserDecisionHoldForTest(config_.testUserDecisionHoldMs * 1'000'000);
+            if (config_.testHoldAllControllerDecisionsMs > 0)   // TEST-ONLY (ISR v3 Step 10): arms the runtime toggle
+                metadataService_->setHoldAllDecisionsMaxForTest(config_.testHoldAllControllerDecisionsMs * 1'000'000);
+            if (config_.testSupportedFeatureLevel >= 0)         // TEST-ONLY: an old-cluster controller
+                metadataService_->setSupportedFeatureLevel(config_.testSupportedFeatureLevel);
             // ISR v3 Step 6: the first committed apply marks the MetadataLog class (set BEFORE the rebuild:
             // a restart over an existing log marks it too).
             metadataService_->setFirstApplyHook(&BrokerNode::markMetadataLogThunk_, this);
@@ -2747,6 +2751,7 @@ void BrokerNode::buildGateway() {
     leaderObserver_.bind(election_.get(), nodeAgent_.get());
     runtimeAgent_->setLeaderObserver(&leaderObserver_);
     runtimeAgent_->setStorageGate(storageGate_.get());
+    if (replBridge_) replBridge_->setStorageGate(storageGate_.get());   // ISR v3 Step 10: held leader roles
     runtimeAgent_->setKnowledge(internalIsrKnowledge_.get());
     runtimeAgent_->setCanvassPublisher(publisher_.get());
     runtimeAgent_->setBootHistory(bootHistory_);

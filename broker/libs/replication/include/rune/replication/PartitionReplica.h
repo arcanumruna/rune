@@ -463,6 +463,15 @@ public:
     /// valid durable state: the fence stays unknown (the first leadership of
     /// the incarnation is refused, as without a data dir).  Cold.
     void setMemoryEpochStateDir(const std::string& dir, const std::string& legacyFenceFile);
+    /// ISR v3 Step 10 (R3): the node's storage is not confirmed (the gate is closed) and the committed assignment names
+    /// this node the leader at (e, pe).  The replica never leads under it: it is a follower of nobody and asks the
+    /// controller for a failover through the same restart-fence bump a refused leadership uses (the controller moves the
+    /// leadership to another live ISR member, or - sole replica - re-grants it past the fence; the bridge re-derives the
+    /// role when the gate opens).  Runs on the replica's owning thread (worker, or control for internal partitions).
+    void holdLeadershipForStorage(Epoch e, int32_t pe);
+    [[nodiscard]] uint64_t storageHoldsForTest() const noexcept { return storageHolds_; }
+    /// (follower) the leader this replica follows; -1 = none known (a held leader role follows nobody).
+    [[nodiscard]] NodeId leaderId() const noexcept { return leaderId_; }
     [[nodiscard]] Epoch restartFenceEpochForTest() const noexcept { return restartFenceEpoch_; }
     [[nodiscard]] bool  staleLeadershipPendingForTest() const noexcept { return staleLead_.pending; }
     [[nodiscard]] uint64_t staleLeadershipRefusalsForTest() const noexcept { return staleLeadRefusals_; }
@@ -1837,6 +1846,10 @@ private:
     StaleLeadership staleLead_;
     uint64_t        staleLeadRefusals_ = 0;
     void refuseStaleLeadership_(Epoch newEpoch, int32_t partitionEpoch);
+    /// The shared body of a refused/held leadership: a follower of nobody, and a pending restart-fence bump request
+    /// (requestLeaderEpochBump_) for the committed (newEpoch, partitionEpoch).  `why` goes into the log line only.
+    void armLeadershipBump_(Epoch newEpoch, int32_t partitionEpoch, const std::string& why);
+    uint64_t        storageHolds_ = 0;
     int  requestLeaderEpochBump_(int64_t nowNs);
     bool persistLedEpoch_(Epoch e);
     /// Fix round 2 N1 (KIP-112): a fence write failed — this replica's log dir

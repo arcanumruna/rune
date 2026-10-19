@@ -1248,5 +1248,36 @@ TEST(WorkerFetchRelayRegression, StorageIdAndEpochStartSurviveTheWorkerOpRegress
     EXPECT_EQ(replica->followerStorageForTest(2), 0xABCD);
 }
 
+// ISR v3 Step 10 (R14): a held leader role reaches a worker-owned replica as a node-local AlterIsrResponse op
+// (kAlterIsrLocalHoldLeadership, no new op type): the replica is held and asks for the restart-fence bump.
+// RED: omit the hold branch in Worker.h (the op is handled as a controller answer; nothing is held).
+TEST(WorkerHoldLeadershipRegression, HeldLeaderRoleThroughTheWorkerOpHoldsTheReplicaRegression) {
+    TempDir logDir("hold_");
+    rune::storage::Log log(logDir.path.string());
+    log.recover();
+    NullTransport transport;
+    rune::replication::PartitionConfig cfg{};
+    cfg.topicId = 12; cfg.partitionId = 0; cfg.selfId = 1; cfg.minIsr = 1;
+    cfg.replicaLagMaxMs = 10'000; cfg.replicaLagMaxOffset = 10'000;
+    cfg.fetchIntervalNs = 1'000'000LL; cfg.isrCheckIntervalNs = 1'000'000LL; cfg.maxFetchBytes = 1 << 20;
+    const std::vector<rune::replication::NodeId> all{1, 2, 3};
+    auto replica = std::make_unique<rune::replication::PartitionReplica>(
+        cfg, rune::replication::Role::Follower, 0, all, all, &log, &transport);
+    replica->setIsrChannel(&transport);
+    Worker worker(0);
+    worker.setOwnedDirect({replica.get()});
+    int64_t now = 1'000'000'000LL;
+    ASSERT_FALSE(replica->staleLeadershipPendingForTest());
+    WorkerOp op;
+    op.type = WorkerOp::Type::AlterIsrResponse; op.replica = replica.get(); op.topicId = 12; op.partition = 0;
+    op.roleEpoch = 3; op.rolePartitionEpoch = 4;
+    op.replicatedPayload.errorCode = rune::replication::kAlterIsrLocalHoldLeadership;
+    ASSERT_TRUE(static_cast<bool>(worker.tryEnqueueOp(std::move(op))));
+    worker.doWork(now += 1'000'000);
+    EXPECT_EQ(replica->storageHoldsForTest(), 1u) << "the held role never reached the replica";
+    EXPECT_TRUE(replica->staleLeadershipPendingForTest()) << "no failover request was armed";
+    EXPECT_NE(replica->role(), rune::replication::Role::Leader);
+}
+
 } // namespace
 } // namespace rune::node

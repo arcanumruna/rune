@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cassert>
 #include <rune/node/WorkerPool.h>
+#include <rune/node/StorageGate.h>
 
 #include <spdlog/spdlog.h>
 
@@ -199,13 +200,38 @@ int ReplicationMetadataBridge::flushPendingRoleOps_() noexcept
 // ---------------------------------------------------------------------------
 // Catalog history Task 6: the __catalog role relay (control thread → admin).
 // ---------------------------------------------------------------------------
+bool ReplicationMetadataBridge::gateClosed_() const noexcept
+{
+    return gate_ != nullptr && !gate_->open();
+}
+
+void ReplicationMetadataBridge::routeHoldLeadership_(rune::replication::PartitionReplica* replica,
+                                                     int32_t leaderEpoch, int32_t partitionEpoch) noexcept
+{
+    recordIntendedRole_(replica, ReplicaRegistry::IntendedRole::Follower);   // it leads nothing
+    if (workerPool_ && replica->topicId() >= 0) {
+        WorkerOp op;
+        op.type               = WorkerOp::Type::AlterIsrResponse;
+        op.topicId            = replica->topicId();
+        op.partition          = static_cast<int32_t>(replica->partitionId());
+        op.replica            = replica;
+        op.replicatedPayload.errorCode = rune::replication::kAlterIsrLocalHoldLeadership;
+        op.roleEpoch          = leaderEpoch;
+        op.rolePartitionEpoch = partitionEpoch;
+        enqueueRoleOp_(std::move(op), /*fence=*/false);   // latest-wins per replica; retried while the ring is full
+    } else {
+        replica->holdLeadershipForStorage(leaderEpoch, partitionEpoch);
+    }
+}
+
 void ReplicationMetadataBridge::postCatalogRole_(bool leader,
-                                                 const rune::metadata::PartitionAssignment* pa) noexcept
+                                                 const rune::metadata::PartitionAssignment* pa,
+                                                 int32_t msgType) noexcept
 {
     AdminRoleMsg m;
     m.leader         = leader;
     m.epoch          = pa ? pa->leaderEpoch : 0;
-    m.leaderId       = pa ? pa->leaderNode : rune::metadata::NO_LEADER;
+    m.leaderId       = (pa && msgType == kMsgCatalogRole) ? pa->leaderNode : rune::metadata::NO_LEADER;
     m.partitionEpoch = pa ? pa->partitionEpoch : -1;
     if (leader && pa) {
         // Bounded by construction: replicas = every broker <= kMaxReplicas (16).
@@ -218,14 +244,14 @@ void ReplicationMetadataBridge::postCatalogRole_(bool leader,
         for (std::size_t i = 0; i < n; ++i) m.isr[i] = pa->isr[i];
     }
     if (catalogRolePending_) {          // keep order: the newer absolute role supersedes the held one
-        catalogRolePending_ = m;
+        catalogRolePending_ = PendingCatalogRole{m, msgType};
         return;
     }
-    if (catalogRoleRing_ != nullptr && encodeAdminRole(*catalogRoleRing_, m, kMsgCatalogRole)) {
+    if (catalogRoleRing_ != nullptr && encodeAdminRole(*catalogRoleRing_, m, msgType)) {
         ++catalogRolesPosted_;
         return;
     }
-    catalogRolePending_ = m;
+    catalogRolePending_ = PendingCatalogRole{m, msgType};
     if (catalogRolesHeld_++ % 1024 == 0)
         spdlog::warn("ReplicationMetadataBridge: __catalog role (leader={} epoch={} leaderId={}) held — "
                      "admin role ring {}; retried every cycle (held so far: {})",
@@ -236,7 +262,7 @@ void ReplicationMetadataBridge::postCatalogRole_(bool leader,
 int ReplicationMetadataBridge::flushCatalogRole_() noexcept
 {
     if (!catalogRolePending_ || catalogRoleRing_ == nullptr) return 0;
-    if (!encodeAdminRole(*catalogRoleRing_, *catalogRolePending_, kMsgCatalogRole)) return 0;
+    if (!encodeAdminRole(*catalogRoleRing_, catalogRolePending_->m, catalogRolePending_->msgType)) return 0;
     catalogRolePending_.reset();
     ++catalogRolesPosted_;
     return 1;

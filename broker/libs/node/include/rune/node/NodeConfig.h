@@ -282,6 +282,14 @@ struct NodeConfig {
     // until the test releases it (BrokerNode::setTestCandidacyHold).  Makes a fresh-cluster formation
     // deterministic: every node decides its storage before anyone stands.  Never set in production.
     bool testCandidacyHoldAtBoot = false;
+    // TEST-ONLY (ISR v3 Step 10): MetadataService::setHoldAllDecisionsForTest (toggled at runtime through
+    // BrokerNode::setControllerDecisionHoldForTest) makes the ready controller take NO tick decision for ANY partition and
+    // append no storage record while set.  This field arms the seam: a toggle-on lasts at most this long (a safety
+    // net - a failing test must not wedge its cluster).  0 (default): the toggle has no effect; never set in production.
+    int64_t testHoldAllControllerDecisionsMs = 0;
+    // TEST-ONLY (ISR v3 Step 10): the metadata feature level this controller supports (0 = kBase: no storage tracking,
+    // no NodeStorageRecord - the old-cluster path).  -1 (default): the binary's own level.
+    int16_t testSupportedFeatureLevel = -1;
     // TEST-ONLY (ISR v3 Step 9, B-I8): every replica of this node emits no follower fetch for this long after
     // start (PartitionReplica::holdFetchesUntilForTest) - a wiped member that cannot catch up yet.  0 = off.
     int64_t testHoldFollowerFetchesMs = 0;

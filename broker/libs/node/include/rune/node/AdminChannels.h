@@ -69,6 +69,9 @@ enum : int32_t {
     kMsgCatalogReadPaused = 18,   // [session:i64][subscriptionId:i64][baseOffset:i64][droppedMarker:u8]
     kMsgCatalogReadResume = 19,   // [session:i64][subscriptionId:i64]
     kMsgCatalogSessionGone = 20,  // [session:i64] — fix round 3: a probe found the session gone
+    // ISR v3 Step 10 (control → admin, on the AdminRoleRing): the __catalog leader role was HELD (the storage gate is
+    // closed) - an AdminRoleMsg {leader false, leaderId -1}; the admin thread asks for a failover and demotes.
+    kMsgCatalogHoldLeadership = 21,
 };
 
 /// kMsgPlacementView: [placeable:i32][haltedCount:u16][halted ids: i32 * haltedCount].

@@ -48,6 +48,8 @@
 
 #include <rune/node/ReplicationMetadataBridge.h>
 #include <rune/node/ReplicaRegistry.h>
+#include <rune/node/StorageGate.h>
+#include <rune/metadata/MetadataExtensions.h>
 #include <rune/metadata/MetadataStateMachine.h>
 #include <rune/metadata/AssignmentMap.h>
 #include <rune/metadata/PartitionAssignment.h>
@@ -670,4 +672,143 @@ TEST_F(BridgePerPartitionTest, RoleCommittedBeforeTheReplicaWasBuiltIsAppliedOnc
     EXPECT_EQ(rep->role(), Role::Leader) << "the committed role applied once the replica exists";
     EXPECT_EQ(rep->epoch(), 4u);
     EXPECT_EQ(bridge->lateRolesAppliedForTest(), 1u);
+}
+
+// ===========================================================================
+// ISR v3 Step 10 - the storage gate in the bridge: a leader role routed while the gate is closed is HELD (a follower of
+// nobody) and asks the controller for a failover through the restart-fence bump; the gate opening re-derives it.
+// ===========================================================================
+namespace {
+class CapturingTransport final : public MockTransport {
+public:
+    std::vector<AlterIsrMsg> alters;
+    bool sendAlterIsr(const AlterIsrMsg& m) override { alters.push_back(m); return true; }
+};
+
+struct DrainedFrame { int32_t type; AdminRoleMsg msg; };
+std::vector<DrainedFrame> drainCatalogFrames(OneToOneByteRing& ring) {
+    std::vector<DrainedFrame> out;
+    while (ring.drain([&](int32_t tid, aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off,
+                          aeron::util::index_t len) {
+        AdminRoleMsg m;
+        EXPECT_TRUE(decodeAdminRole(reinterpret_cast<const uint8_t*>(b.buffer() + off),
+                                    static_cast<std::size_t>(len), m));
+        out.push_back({tid, m});
+    }, 64) > 0) {}
+    return out;
+}
+void applyStorageRecord(MetadataStateMachine& msm, int64_t pos, int32_t node, int64_t id) {
+    uint8_t buf[32];
+    rune::metadata::NodeStorageRecord r;
+    r.node = node; r.storageId = id;
+    const std::size_t n = r.encode(buf, sizeof buf);
+    msm.apply(buf, n, pos);
+    msm.commit(pos + 1);
+}
+}  // namespace
+
+class StorageGateBridgeRegression : public ::testing::Test {
+protected:
+    static constexpr NodeId kSelf = 1, kNode2 = 2, kNode3 = 3;
+    CapturingTransport transport_;
+    ReplicaRegistry registry_;
+    BridgeTmpDir logDir_{"gate_log"}, fenceDir_{"gate_fence"}, metaDir_{"gate_meta"};
+    std::unique_ptr<rune::storage::Log> log_;
+    PartitionReplica* addHeldReplica(int32_t topic, Role role = Role::Follower) {
+        log_ = std::make_unique<rune::storage::Log>(logDir_.path);
+        log_->recover();
+        const std::vector<NodeId> all = {kSelf, kNode2, kNode3};
+        auto rep = std::make_unique<PartitionReplica>(makeCfg(topic, 0, kSelf), role, 1, all, all, log_.get(), &transport_);
+        rep->setIsrChannel(&transport_);
+        rep->setLeaderEpochFenceFile(fenceDir_.path + "/fence");
+        PartitionReplica* raw = rep.get();
+        registry_.add(topic, 0, std::move(rep));
+        return raw;
+    }
+    void commitUser(MetadataStateMachine& msm, int32_t topic, int32_t leader, int32_t leaderEpoch, int32_t partitionEpoch) {
+        auto [ubuf, usz] = encodeUpdate({topic, 0, leader, {kSelf, kNode2, kNode3}, {kSelf, kNode2, kNode3}, leaderEpoch, partitionEpoch});
+        msm.apply(ubuf.data(), usz, 0);
+        msm.commit(1);
+    }
+    std::unique_ptr<ReplicationMetadataBridge> makeBridge(const MetadataStateMachine* msm) {
+        auto b = std::make_unique<ReplicationMetadataBridge>(kSelf, std::vector<NodeId>{kSelf, kNode2, kNode3}, registry_, msm);
+        return b;
+    }
+};
+
+// Held leader role: the replica is a follower of nobody, counts the held role, and (next doWork) sends the restart-fence
+// bump {leaderEpoch 3, partitionEpoch 4}; when the controller commits the node's storage the gate opens, the bridge
+// re-derives and the replica leads at the committed epoch.  RED: route a plain becomeFollower(E, NO_LEADER) (no bump:
+// `alters` stays empty).
+TEST_F(StorageGateBridgeRegression, HeldLeaderRoleRequestsAFailoverRegression) {
+    PartitionReplica* rep = addHeldReplica(0);
+    MetadataStateMachine msm;
+    commitUser(msm, 0, kSelf, 3, 4);
+    auto bridge = makeBridge(&msm);
+    rune::node::StorageIdentity::Loaded L{0xB, rune::node::StorageIdentity::Origin::Joiner, rune::node::StorageIdentity::Mode::None, 0};
+    rune::node::StorageGate gate(L, metaDir_.path, kSelf, 3);
+    ASSERT_EQ(gate.evaluate(msm, Evidence{}, 0), StorageGate::Change::none);
+    ASSERT_FALSE(gate.open());
+    bridge->setStorageGate(&gate);
+    (void)bridge->doWork(kNode2, 1);
+    EXPECT_EQ(rep->role(), Role::Follower);
+    EXPECT_EQ(rep->leaderId(), -1);
+    EXPECT_EQ(bridge->leaderRolesHeldForTest(), 1u);
+    rep->doWork(1'000'000);
+    ASSERT_FALSE(transport_.alters.empty()) << "a held leader role asked for no failover";
+    const AlterIsrMsg& bump = transport_.alters.back();
+    EXPECT_EQ(bump.isrCount, AlterIsrMsg::kLeaderEpochBump);
+    EXPECT_EQ(bump.leaderEpoch, 3);
+    EXPECT_EQ(bump.partitionEpoch, 4);
+    applyStorageRecord(msm, 1, kSelf, 0xB);
+    ASSERT_EQ(gate.evaluate(msm, Evidence{}, 0), StorageGate::Change::confirmed);
+    bridge->onStorageGateChanged();
+    (void)bridge->doWork(kNode2, 1);
+    EXPECT_EQ(rep->role(), Role::Leader);
+    EXPECT_EQ(rep->epoch(), 3u);
+}
+
+// __catalog is admin-thread-owned: its held role reaches the admin ring as kMsgCatalogHoldLeadership {leader false,
+// leaderId -1}.  RED: post it with kMsgCatalogRole.
+TEST_F(StorageGateBridgeRegression, CatalogRoleIsHeldAsFollowerOfNobodyRegression) {
+    MetadataStateMachine msm;
+    commitCatalogAssignment(msm, 0, kSelf, {kSelf, kNode2, kNode3}, 3, 4);
+    OneToOneByteRing ring(1 << 12);
+    auto bridge = makeBridge(&msm);
+    bridge->setCoordinatorPartitionsOnController(true);
+    bridge->setCatalogRoleRing(&ring);
+    rune::node::StorageIdentity::Loaded L{0xB, rune::node::StorageIdentity::Origin::Joiner, rune::node::StorageIdentity::Mode::None, 0};
+    rune::node::StorageGate gate(L, metaDir_.path, kSelf, 3);
+    (void)gate.evaluate(msm, Evidence{}, 0);
+    bridge->setStorageGate(&gate);
+    (void)bridge->doWork(kNode2, 1);
+    const auto frames = drainCatalogFrames(ring);
+    ASSERT_EQ(frames.size(), 1u);
+    EXPECT_EQ(frames[0].type, kMsgCatalogHoldLeadership);
+    EXPECT_FALSE(frames[0].msg.leader);
+    EXPECT_EQ(frames[0].msg.leaderId, -1);
+    EXPECT_EQ(frames[0].msg.epoch, 3);
+}
+
+// A Confirmed leader whose node storage the controller replaces is demoted at once: the gate's change re-derives the
+// roles.  RED: no prevMap_ reset in onStorageGateChanged (the unchanged map derives no delta).
+TEST_F(StorageGateBridgeRegression, MismatchDemotesALeaderRegression) {
+    PartitionReplica* rep = addHeldReplica(0);
+    MetadataStateMachine msm;
+    commitUser(msm, 0, kSelf, 3, 4);
+    auto bridge = makeBridge(&msm);
+    rune::node::StorageIdentity::Loaded L{0xB, rune::node::StorageIdentity::Origin::Founder, rune::node::StorageIdentity::Mode::None, 0};
+    rune::node::StorageGate gate(L, metaDir_.path, kSelf, 3);
+    ASSERT_EQ(gate.evaluate(msm, Evidence{}, 0), StorageGate::Change::none);
+    ASSERT_TRUE(gate.open());
+    bridge->setStorageGate(&gate);
+    (void)bridge->doWork(kNode2, 1);
+    ASSERT_EQ(rep->role(), Role::Leader);
+    EXPECT_EQ(rep->epoch(), 3u);
+    applyStorageRecord(msm, 1, kSelf, 0xC);   // the controller committed ANOTHER storage for this node
+    ASSERT_EQ(gate.evaluate(msm, Evidence{}, 0), StorageGate::Change::unconfirmed);
+    bridge->onStorageGateChanged();
+    (void)bridge->doWork(kNode2, 1);
+    EXPECT_EQ(rep->role(), Role::Follower);
+    EXPECT_EQ(rep->leaderId(), -1);
 }

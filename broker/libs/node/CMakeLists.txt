@@ -1604,7 +1604,8 @@ if(BUILD_TESTING)
         # real replication on its admin-thread plane, controller-ISR leader
         # (never unclean), new / wiped brokers refetch from 0; the admin/control
         # role + ISR relay units.
-        add_executable(rune_catalog_replication_tests tests/integration/CatalogReplicationTest.cpp)
+        add_executable(rune_catalog_replication_tests tests/integration/CatalogReplicationTest.cpp
+                tests/integration/StorageLossClusterTest.cpp)
         target_include_directories(rune_catalog_replication_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_catalog_replication_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_catalog_replication_tests PROPERTIES TIMEOUT 360)

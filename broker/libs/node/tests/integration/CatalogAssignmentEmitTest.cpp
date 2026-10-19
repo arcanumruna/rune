@@ -4564,3 +4564,23 @@ TEST(ControlledShutdownRegression, DecidedOriginRidesTheNextRegisterRegression) 
     ASSERT_FALSE(r.sent.empty());
     for (const auto& m : r.sent) EXPECT_EQ(m.isr[rune::replication::AlterIsrMsg::kNodeStorageOriginSlot], 3);
 }
+
+// ISR v3 Step 10 (R3, R10): at feature level 1 nothing tracks storage, but a HELD leader role still fails over BY BUMP:
+// the replica's restart-fence bump moves the leadership to another live ISR member and the requester leaves the ISR.
+// RED: in decideBumps_ take the same-leader re-grant branch for a Fence bump even when another live ISR member exists
+// (the leader stays 3).
+TEST(StorageRegistrationRegression, HeldLeaderFailsOverBelowFeatureLevelTwoRegression) {
+    CtlRig c(true, {}, rune::replication::MetadataFeature::kBase);
+    ASSERT_LT(c.svc->featureLevel(), 2);
+    c.forceLeader(3);
+    c.readmit(1);
+    c.readmit(2);
+    ASSERT_EQ(c.pa().leaderNode, 3);
+    ASSERT_EQ(c.pa().isr.size(), 3u);
+    const int32_t le = c.pa().leaderEpoch;
+    (void)c.svc->onAlterIsr(c.bump());   // the restart-fence bump a held leader role sends
+    c.tick();
+    EXPECT_NE(c.pa().leaderNode, 3) << "the held leader was re-granted its leadership";
+    EXPECT_EQ(c.pa().leaderEpoch, le + 1);
+    EXPECT_FALSE(isrHasNode(c.pa(), 3));
+}

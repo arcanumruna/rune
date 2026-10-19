@@ -385,6 +385,12 @@ public:
                 else reportBadRoleFrame_(tid, n);
                 return;
             }
+            if (tid == kMsgCatalogHoldLeadership) {   // ISR v3 Step 10: the catalog leader role was held
+                AdminRoleMsg m;
+                if (decodeAdminRole(p, n, m)) worker_.onCatalogHoldLeadership(m);
+                else reportBadRoleFrame_(tid, n);
+                return;
+            }
             if (tid == kMsgCatalogAlterIsrResponse) {
                 rune::replication::AlterIsrResponseMsg r{};
                 if (decodeCatalogAlterIsrResponse(p, n, r)) worker_.onCatalogAlterIsrResponse(r);
@@ -1500,6 +1506,12 @@ public:
     template <class = void>   // instantiated after onControlThreadForTest is defined
     void setTestCandidacyHold(bool hold) {
         (void)onControlThreadForTest([this, hold]() { if (runtimeAgent_) runtimeAgent_->setTestCandidacyHold(hold); return 0; });
+    }
+    /// ISR v3 Step 10: hold / release EVERY controller decision of this node (MetadataService::setHoldAllDecisionsForTest;
+    /// posted to the control thread).  Needs NodeConfig::testHoldAllControllerDecisionsMs > 0.
+    template <class = void>
+    void setControllerDecisionHoldForTest(bool on) {
+        (void)onControlThreadForTest([this, on]() { if (metadataService_) metadataService_->setHoldAllDecisionsForTest(on); return 0; });
     }
     /// The consensus leader (this node, if it is) resigns (posted to the control thread).
     template <class = void>

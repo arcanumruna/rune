@@ -79,6 +79,8 @@
 #include <vector>
 
 namespace rune::node {
+class StorageGate;   // ISR v3 Step 10 (the bridge reads open(); defined in StorageGate.h)
+
 
 // Forward declaration: WorkerPool is defined in WorkerPool.h.
 // Not included here to avoid pulling in NodeConfig.h (rune::node::TopicSpec),
@@ -133,6 +135,9 @@ public:
     /// every role from the committed map (a held leader role becomes a real one when the gate opens, and the other
     /// way round).  Step 10 adds the hold itself.  Control thread.
     void onStorageGateChanged() noexcept { prevMap_ = rune::metadata::AssignmentMap{}; }
+    /// ISR v3 Step 10: the storage gate (null = open everywhere: single node).  Read on the control thread only.
+    void setStorageGate(const StorageGate* gate) noexcept { gate_ = gate; }
+    [[nodiscard]] uint64_t leaderRolesHeldForTest() const noexcept { return leaderRolesHeld_; }
     /// Leader roles routed as HELD (not led) because the storage gate was closed; monotonic.  Step 10.
     [[nodiscard]] uint64_t leaderRolesHeld() const noexcept { return leaderRolesHeld_; }
 
@@ -474,6 +479,14 @@ public:
     }
 private:
 
+    /// ISR v3 Step 10: true while a gate is wired and not open.  Defined in the .cpp (StorageGate.h stays out of this
+    /// header).
+    [[nodiscard]] bool gateClosed_() const noexcept;
+    /// A held leader role: user partitions with a worker pool -> a node-local AlterIsrResponse WorkerOp
+    /// (kAlterIsrLocalHoldLeadership, R14: no new op type); otherwise the replica is held directly.
+    void routeHoldLeadership_(rune::replication::PartitionReplica* replica, int32_t leaderEpoch,
+                              int32_t partitionEpoch) noexcept;
+    const StorageGate*                             gate_ = nullptr;
     void routeBecomeFollower_(
         rune::replication::PartitionReplica*  replica,
         rune::replication::Epoch              epoch,
@@ -484,6 +497,19 @@ private:
         const rune::metadata::PartitionKey& key,
         const rune::metadata::AssignmentMap& currentMap) noexcept
     {
+        // ISR v3 Step 10 (I-S1): a leader role routed while the storage gate is closed is HELD - the replica leads
+        // nothing and asks the controller for a failover (the restart-fence bump).  Follower roles and deletes are
+        // never gated.  The gate opening / closing re-derives every role (onStorageGateChanged).
+        if (gateClosed_()) {
+            const auto* hp = currentMap.get(key.topicId, key.partition);
+            if (!hp) return;
+            ++leaderRolesHeld_;
+            if (key.topicId == kCatalogTopicId) { postCatalogRole_(false, hp, kMsgCatalogHoldLeadership); return; }
+            auto* held = registry_.lookup(key.topicId, key.partition);
+            if (!held) { noteRoleWithoutReplica_(key); return; }
+            routeHoldLeadership_(held, hp->leaderEpoch, hp->partitionEpoch);
+            return;
+        }
         if (key.topicId == kCatalogTopicId) {   // Task 6: admin-owned — relay on the role ring
             if (const auto* pa = currentMap.get(key.topicId, key.partition)) postCatalogRole_(true, pa);
             return;
@@ -585,10 +611,13 @@ private:
         return t == -1 || t == -2 || t == kCatalogTopicId;
     }
     // Catalog history Task 6 (see setCatalogRoleRing).  Defined in the .cpp.
-    void postCatalogRole_(bool leader, const rune::metadata::PartitionAssignment* pa) noexcept;
+    /// `msgType` = kMsgCatalogRole, or kMsgCatalogHoldLeadership (ISR v3 Step 10: the held leader role, leaderId -1).
+    void postCatalogRole_(bool leader, const rune::metadata::PartitionAssignment* pa,
+                          int32_t msgType = kMsgCatalogRole) noexcept;
     int  flushCatalogRole_() noexcept;
     OneToOneByteRing*                              catalogRoleRing_    = nullptr;
-    std::optional<AdminRoleMsg>                    catalogRolePending_;
+    struct PendingCatalogRole { AdminRoleMsg m; int32_t msgType; };
+    std::optional<PendingCatalogRole>              catalogRolePending_;
     uint64_t                                       catalogRolesPosted_ = 0;
     uint64_t                                       catalogRolesHeld_   = 0;
     [[nodiscard]] bool mapDriven_(int32_t t) const noexcept {

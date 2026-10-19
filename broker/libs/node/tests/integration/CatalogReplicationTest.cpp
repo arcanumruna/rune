@@ -225,6 +225,25 @@ TEST(CatalogReplicationRegression, AFollowerWhoseDataDirIsWipedRefetchesFromZero
     EXPECT_TRUE(c.awaitInCatalogIsr(victim, 20s));
 }
 
+// ISR v3 Step 10 (B-I8): the same disk loss for a node formatted `auto` (a raw wipe, no storage.meta): it decides Joiner
+// at runtime, is stripped and confirmed by the controller, refetches the catalog from 0 and rejoins the ISR.
+TEST(CatalogReplicationRegression, AnAutoFormattedFollowerWhoseDataDirIsWipedRefetchesFromZeroAndRejoinsTheIsr) {
+    ThreeNodes c = ThreeNodes::start("cat_wipe_auto");
+    ASSERT_TRUE(c.awaitCatalogLeader(30s));
+    const int64_t hw1 = c.appendEventOnCatalogLeaderForTest();
+    ASSERT_GE(hw1, 1);
+    const int32_t leader = c.catalogLeaderId();
+    const int32_t victim = leader == 3 ? 2 : 3;
+    ASSERT_TRUE(c.awaitCatalogEndOffset(c.node(victim), hw1, 10s));
+    c.stop(victim);
+    c.wipeRaw(victim, rune::node::StorageFormat::Auto);
+    const int64_t hw2 = c.appendEventOnCatalogLeaderForTest();
+    ASSERT_GT(hw2, hw1) << "two of three keep committing";
+    c.startNode(victim);
+    EXPECT_TRUE(c.awaitCatalogEndOffset(c.node(victim), hw2, 30s)) << "refetched from offset 0";
+    EXPECT_TRUE(c.awaitInCatalogIsr(victim, 30s));
+}
+
 // A full-cluster restart: every broker recovers its disk catalog, and the
 // committed leader (which already led at the committed epoch in its previous
 // incarnation — the restart fence) is re-elected only at a NEW epoch through

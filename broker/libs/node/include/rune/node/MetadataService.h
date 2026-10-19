@@ -1931,6 +1931,12 @@ public:
     /// lineage (it is decided on fresh reports) instead of going StorageReset.  Null = never transient.  Set by
     /// BrokerNode for single AND multi-node.
     void setTransientTopicPredicate(bool (*fn)(void*, int32_t), void* ctx) noexcept { transientFn_ = fn; transientCtx_ = ctx; }
+    /// TEST ONLY (ISR v3 Step 10): while set, runDynamicRebalanceOnTick takes NO decision for ANY partition (erasing
+    /// every record it would emit, of every topic id - the userDecisionHoldNs_ pattern widened) and no storage record
+    /// is drained.  `maxNs` > 0: the hold lapses by itself after that long (control-thread clock).
+    void setHoldAllDecisionsForTest(bool on) noexcept { holdAll_ = on; holdAllSinceNs_ = lastNowNs_; }
+    void setHoldAllDecisionsMaxForTest(int64_t maxNs) noexcept { holdAllMaxNs_ = maxNs; }
+    [[nodiscard]] bool holdAllDecisionsActiveForTest() const noexcept { return holdAllActive_(); }
     /// Counter sources (kStoragePendingNodesCounterTypeId / kLostCommittedReportsCounterTypeId).
     [[nodiscard]] std::size_t storagePendingCount() const noexcept { return controllerReady_() ? storageRegs_.size() : 0; }
     [[nodiscard]] uint64_t lostCommittedReports() const noexcept { return lostCommittedReports_; }
@@ -2102,6 +2108,7 @@ public:
 
         // ISR v3: a node whose storage is pending (Stripping / Committing) is not eligible for ANYTHING - not an
         // election candidate, not an ISR addition, not a live data-plane leader - until its record commits.
+        if (holdAllActive_()) [[unlikely]] return 0;   // TEST seam: no decision of any kind while held
         pruneStorageRegs_();
         effectiveEligibleScratch_.clear();
         for (const auto n : eligibleNodes)
@@ -3183,7 +3190,7 @@ private:
 
         // ISR v3 (I-S2): storage records drain AFTER the assignment records of the same pass, so log order puts every
         // strip before its confirmation; a record waits while any queued assignment record still names its node.
-        for (std::size_t i = 0; i < pendingStorageRecords_.size() && cycleRecords < kMaxRecordsPerBatch;) {
+        for (std::size_t i = 0; i < pendingStorageRecords_.size() && cycleRecords < kMaxRecordsPerBatch && !holdAllActive_();) {
             const rune::metadata::NodeStorageRecord sr = pendingStorageRecords_[i];
             if (queuedDynamicNames_(sr.node)) { ++i; continue; }
             if (dropNextStorageAppend_) {   // TEST seam: as if appended and then lost (truncated) - nothing in flight
@@ -3309,6 +3316,11 @@ private:
     uint64_t  storageConfirmRequeued_ = 0;
     uint64_t  lostCommittedReports_ = 0;   ///< Step 11 increments it
     bool      dropNextStorageAppend_ = false;
+    bool      holdAll_ = false;                 ///< setHoldAllDecisionsForTest
+    int64_t   holdAllSinceNs_ = 0, holdAllMaxNs_ = 0;
+    [[nodiscard]] bool holdAllActive_() const noexcept {
+        return holdAll_ && holdAllMaxNs_ > 0 && lastNowNs_ < holdAllSinceNs_ + holdAllMaxNs_;
+    }
     std::unordered_set<int64_t> storageResetWarned_;   ///< M15 (cold)
     bool    (*transientFn_)(void*, int32_t) = nullptr;
     void*     transientCtx_ = nullptr;

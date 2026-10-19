@@ -2434,6 +2434,10 @@ private:
             if (auto* rep = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica());
                 rep != nullptr && op.replErrorCode() == rune::replication::kAlterIsrLocalLineageIdentity) {
                 rep->rotateLineageIdentity(op.nextOffset());   // R2: node-local identity rotation
+            } else if (auto* hold = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica());
+                       hold != nullptr && op.replErrorCode() == rune::replication::kAlterIsrLocalHoldLeadership) {
+                // ISR v3 Step 10 (R14): a held leader role (storage unconfirmed): node-local, never on the wire.
+                hold->holdLeadershipForStorage(op.roleEpoch(), op.rolePartitionEpoch());
             } else if (rep != nullptr) {
                 rune::replication::AlterIsrResponseMsg r{};
                 r.topicId        = op.topicId();

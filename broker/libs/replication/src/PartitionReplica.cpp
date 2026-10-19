@@ -3307,11 +3307,26 @@ bool PartitionReplica::persistLedEpoch_(Epoch e)
 void PartitionReplica::refuseStaleLeadership_(Epoch newEpoch, int32_t partitionEpoch)
 {
     ++staleLeadRefusals_;
-    spdlog::warn("PartitionReplica[node={}] topic={} part={}: leadership at epoch {} REFUSED — "
-                 "restart fence {} (led by an earlier incarnation, or no durable fence); "
+    armLeadershipBump_(newEpoch, partitionEpoch,
+                       "restart fence " + std::to_string(static_cast<long long>(restartFenceEpoch_)) +
+                       " (led by an earlier incarnation, or no durable fence)");
+}
+
+void PartitionReplica::holdLeadershipForStorage(Epoch e, int32_t pe)
+{
+    ++storageHolds_;
+    // A replica that never led here is still a follower of the previous epoch: stamp the committed epoch first, so the
+    // follower of nobody sits at (or above) the epoch it was named leader at.
+    if (role_ != Role::Leader && epoch_ < e) becomeFollower(e, NodeId{-1});
+    armLeadershipBump_(e, pe, "storage unconfirmed");
+}
+
+void PartitionReplica::armLeadershipBump_(Epoch newEpoch, int32_t partitionEpoch, const std::string& why)
+{
+    spdlog::warn("PartitionReplica[node={}] topic={} part={}: leadership at epoch {} REFUSED — {}; "
                  "asking the controller for a new epoch",
                  cfg_.selfId, cfg_.topicId, static_cast<int>(cfg_.partitionId),
-                 static_cast<long long>(newEpoch), static_cast<long long>(restartFenceEpoch_));
+                 static_cast<long long>(newEpoch), why);
     // Never lead (and never accept a produce) under it: a follower of no leader.
     if (role_ == Role::Leader)
         becomeFollower(epoch_ > newEpoch ? epoch_ : newEpoch, NodeId{-1});
