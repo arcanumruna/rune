@@ -37,6 +37,15 @@
 - **Docker e2e** (Task 20) runs on the k3s VM (`ssh root@178.104.16.102`, under `flock /root/vm.lock`), never on the local Mac.
 - Nothing is pushed. Every commit message ends with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 
+## Amendments after review A (2026-10-19) — binding, override the text below
+
+- **D2 / Task 2:** the `__security` ops tag equals the kind (variant index + 1), exactly as `__catalog`; the "(= the variant index)" parenthetical is wrong. The AlterUser change tag stays 0-based.
+- **D8:** the unknown-user fake salt is keyed on the 32-byte `fakeSaltSeed` carried by the Bootstrap event / `SecurityBootstrap` (set once, covered by the bootstrap MAC) — NOT on the cluster key.
+- **D5 + D8:** the broker ALWAYS sends 2 salts; a user with one password, or an unknown user, gets a deterministic fake second salt. The client always answers with 2 proofs. (Task 11 broker, Task 7 client.)
+- **I5:** Operation / ResourceType / PatternKind / GranteeKind are defined once in rune-protocol `SecurityTypes.h`; codec and ql alias them.
+- **I6:** non-cluster grant patterns never match `__` names; v1 `validGrant` refuses patterns starting with `__`.
+- **Owed test (Task 11):** `ScramRegression.TwoVerifierExchangeAcceptsOnlyTheRealSlotRegression`.
+
 ## Global Constraints
 
 - **HARD RULES (CLAUDE.md, all eight), as they bind here:**
