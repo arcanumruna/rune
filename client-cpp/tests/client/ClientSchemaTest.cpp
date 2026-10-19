@@ -1182,6 +1182,27 @@ TEST(ClientSchemaRegression, GetViewRowInvalidRequestAndBusyStatusesCompleteTheR
     }
 }
 
+// Authentication Task 12/13: a GetViewRow the session may not READ is answered ViewRowResponse{status = 45} (the view-row
+// type has no error-code field).  The client maps it to ViewRowResult::kNotAuthorized - complete at once, no row bytes,
+// never retried and never mistaken for another status.
+TEST(ClientSchemaRegression, GetViewRowNotAuthorizedStatusIsMappedAndNeverRetriedRegression) {
+    static_assert(ViewRowResult::kNotAuthorized == rpc::ViewRowResponse::kNotAuthorized);
+    static_assert(ViewRowResult::kNotAuthorized == static_cast<uint16_t>(rpc::ErrorCode::NotAuthorized));
+    SchemaHarness h(1148, 1149);
+    h.build();
+    h.connectAndWait();
+    h.gw->viewRowStatus = ViewRowResult::kNotAuthorized;
+    auto fut = h.getViewRowOp(0x40000007, /*keyU64=*/7, /*requestedFingerprint=*/0);
+    h.pumpGwUntil([&]() { return fut.ready(); });
+    ASSERT_TRUE(fut.waitReady()) << "a NotAuthorized view read was left pending";
+    ViewRowResult r;
+    ASSERT_NO_THROW(r = fut.getViewRowResult());
+    EXPECT_EQ(r.status, ViewRowResult::kNotAuthorized);
+    EXPECT_NE(r.status, ViewRowResult::kUnknownView) << "the default status must not stand in for it";
+    EXPECT_TRUE(r.rowBytes.empty());
+    EXPECT_EQ(h.gw->getViewRowsSeen.load(), 1) << "NotAuthorized is never re-sent";
+}
+
 // The DDL responses answered InvalidSchema (23) for a malformed request complete
 // the pending op with that code (GetTopicSchema / AlterTopic / CreateView).
 TEST(ClientSchemaRegression, DdlInvalidSchemaAnswersCompleteThePendingOpRegression) {

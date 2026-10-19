@@ -93,7 +93,8 @@ struct Completion {
     OpKind   op{};
     OpStatus status = OpStatus::Ok;
     uint16_t errorCode = 0;      ///< broker ErrorCode when status == BrokerError; for GetViewRow carries the
-                                 ///< ViewRowResponse::Status (1=AbsentKey,2=NotReady,3=SchemaMismatch,4=UnknownView)
+                                 ///< ViewRowResponse::Status (1=AbsentKey,2=NotReady,3=SchemaMismatch,4=UnknownView,
+                                 ///< ...,45=NotAuthorized: no READ on the view)
     uint32_t payloadLen = 0;     ///< bytes of inline payload
     uint32_t reservedBytes = 0;  ///< credit returned to the Completions on consume (§2.2)
     uint32_t reserved0 = 0;      ///< BatchAck: producerEpoch; GetTopicSchema: the topic's partitionCount

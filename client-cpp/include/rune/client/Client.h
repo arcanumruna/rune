@@ -199,7 +199,9 @@ struct CreateViewResult {
 /// (0=OK, 1=AbsentKey, 2=NotReady, 3=SchemaMismatch, 4=UnknownView,
 /// 5=InvalidRequest — the broker could not decode the request, non-retriable,
 /// 6=Busy — the owning worker was full, the read was not performed, retry,
-/// 7=RowTooLarge — the row exceeds the broker's egress frame, non-retriable; matching
+/// 7=RowTooLarge — the row exceeds the broker's egress frame, non-retriable,
+/// 45=NotAuthorized — the session holds no READ on the view (authentication, client version 9; the same value as
+/// ErrorCode::NotAuthorized; non-retriable, answered for a missing and a hidden view alike); matching
 /// rune::protocol::client::ViewRowResponse's enum values exactly — duplicated
 /// here as plain uint16_t constants so Client.h need not include
 /// DataMessages.h). `rowBytes`'s OWN size is ground truth for the row length
@@ -215,6 +217,7 @@ struct ViewRowResult {
     static constexpr uint16_t kInvalidRequest  = 5;
     static constexpr uint16_t kBusy            = 6;
     static constexpr uint16_t kRowTooLarge     = 7;   ///< the row exceeds the broker's egress frame (no bytes)
+    static constexpr uint16_t kNotAuthorized   = 45;  ///< the session may not READ the view (no bytes; never retried)
     /// Client-side only: the view's source-partition leader was not reached within
     /// the retry budget; never sent by a broker.  NB: a GetViewRow's deadline is
     /// pingTimeoutMs (not ddlTimeoutMs); when that is shorter than ddlRetryBudget
@@ -913,7 +916,7 @@ public:
     /// within min(pingTimeoutMs, ddlRetryBudget) and ends as ViewRowResult::kNotLeader, or as a Timeout (throws) when
     /// pingTimeoutMs is the shorter of the two (the defaults).
     /// Task 21: getViewRow(), blocking. A non-OK ViewRowResponse status (e.g.
-    /// AbsentKey, NotReady) is returned in the result (not thrown) — only a
+    /// AbsentKey, NotReady, NotAuthorized) is returned in the result (not thrown) — only a
     /// transport-level failure (Timeout, NotConnected, SessionLost, Closed)
     /// throws.
     ViewRowResult getViewRowAndWait(int32_t viewTopicId, uint64_t keyU64, uint64_t requestedFingerprint,
