@@ -23,8 +23,9 @@ its followers truncated records that clients had been acknowledged. Every part b
 - **`RUNE_STORAGE_RECOVERY_VOTE`** (default `0`) is a disaster-recovery escape hatch only: it lets an unconfirmed node vote
   so a cluster that lost the disks of a majority can elect its one intact node. It can lose metadata that only the lost
   disks held, and logs at critical level.
-- **A follower never truncates below the high watermark its own leader told it in the same epoch.** If the leader's
-  lineage ends lower (a leader that lost its log), the follower refuses, applies nothing, fetches nothing, logs
+- **A follower never truncates records of its current epoch at that epoch's leader's request, nor below the high
+  watermark its leader told it in that epoch.** An honest leader of an epoch never loses a record of it, so a leader whose
+  lineage ends below the follower's own records of that epoch (a leader that lost its log) is refused: the follower applies nothing, fetches nothing, logs
   `REFUSED to truncate below the committed offset ...`, and reports to the controller, which fails the leader over. A
   leader whose first record of an epoch starts somewhere else than the follower's copy (two histories under one epoch)
   answers `kErrEpochHistoryMismatch`, and the follower refuses the same way. `RUNE_SURVIVOR_LEADER_ELECTION=1` keeps the
@@ -53,8 +54,12 @@ feature level **2**. The level rises on its own once every node runs this binary
 3. When the last node runs the new binary the cluster commits level 2. **There is no downgrade after level 2**: old
    binaries ignore `storage.meta` and skip the new metadata records, but a cluster at level 2 has fenced storages the old
    code cannot honour.
-4. Until the roll completes, the below-committed report and the truncation guard already work (they are decided at every
-   level), but the controller cannot fence a replaced storage.
+4. Once the **controller** runs this binary, the below-committed report is decided at every feature level (the leader is
+   failed over); only the storage fence waits for level 2. While the controller still runs an old binary it answers the
+   report `FencedLeaderEpoch`. The follower keeps refusing (no data is lost), but the partition keeps the leader that lost
+   its data until you stop that node or the controller is upgraded.
+5. **Do not replace or wipe the disk of a node that still runs the old binary.** The old binary has no storage gate:
+   upgrade the node first, then format the new disk `--join`.
 
 ## 3. Roll forward only while any node logs `storage UNCONFIRMED`
 
@@ -100,8 +105,9 @@ copy `storage.meta` on its own: a damaged or missing one makes the broker refuse
   races of the previous protocol (a late answer to a superseded proposal) remain possible until every node runs this
   binary.
 - **A cluster id** is not carried on the wire: a broker pointed at the wrong cluster is not detected by identity alone.
-- **User partition directories deleted inside an intact storage** (the node's `storage.meta` survives) are not detected
-  (Kafka parity).
+- **User partition directories deleted inside an intact storage** are not fenced by the storage gate. When the node
+  re-leads such a partition, its followers refuse and the controller fails it over. The first data epoch of a partition,
+  if the node's new log outgrows the followers before they fetch, is not detected (the same limit as the next bullet).
 - **Different-epoch divergence below a floor** (power loss of a sole-ISR leader with fsync off) needs unclean-shutdown
   detection (Kafka KIP-966) and is a follow-up.
 - **A node-control path cut while consensus is up** (the node reaches consensus peers but not the controller's control
