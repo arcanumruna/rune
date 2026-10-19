@@ -26,10 +26,10 @@
 ```bash
 CMAKE=/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/bin/cmake
 # Configure once (skip if build-tsan already configured):
-"$CMAKE" -S /Users/vradu/Projects/rune-broker -B /Users/vradu/Projects/rune-broker/build-tsan \
+"$CMAKE" -S ~/Projects/rune-broker -B ~/Projects/rune-broker/build-tsan \
   -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS="-fsanitize=thread -g" \
   -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread" \
-  -DCMAKE_TOOLCHAIN_FILE=/Users/vradu/.conan2/... # (use the CLion conan_host_profile toolchain already wired in this repo)
+  -DCMAKE_TOOLCHAIN_FILE=~/.conan2/... # (use the CLion conan_host_profile toolchain already wired in this repo)
 ```
 > If `build-tsan` is already configured in this repo, skip the configure line and just `--build`.
 
@@ -162,7 +162,7 @@ Add to `libs/metadata/CMakeLists.txt` (mirror the existing `rune_routing_image_t
 Run:
 ```bash
 CMAKE=/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/bin/cmake
-"$CMAKE" --build /Users/vradu/Projects/rune-broker/build-tsan --target rune_shard_router_tests
+"$CMAKE" --build ~/Projects/rune-broker/build-tsan --target rune_shard_router_tests
 ```
 Expected: FAIL — compile error, `rune/metadata/ShardRouter.h` not found.
 
@@ -262,8 +262,8 @@ private:
 - [ ] **Step 4: Run the test to verify it passes**
 
 ```bash
-"$CMAKE" --build /Users/vradu/Projects/rune-broker/build-tsan --target rune_shard_router_tests
-/Users/vradu/Projects/rune-broker/build-tsan/libs/metadata/rune_shard_router_tests
+"$CMAKE" --build ~/Projects/rune-broker/build-tsan --target rune_shard_router_tests
+~/Projects/rune-broker/build-tsan/libs/metadata/rune_shard_router_tests
 ```
 Expected: PASS (5 tests).
 
@@ -388,7 +388,7 @@ Add to `libs/node/CMakeLists.txt` (mirror `rune_bridge_per_partition_tests`, min
 
 Run:
 ```bash
-"$CMAKE" --build /Users/vradu/Projects/rune-broker/build-tsan --target rune_worker_tests
+"$CMAKE" --build ~/Projects/rune-broker/build-tsan --target rune_worker_tests
 ```
 Expected: FAIL — `rune/node/Worker.h` not found.
 
@@ -468,8 +468,8 @@ private:
 - [ ] **Step 4: Run the test to verify it passes**
 
 ```bash
-"$CMAKE" --build /Users/vradu/Projects/rune-broker/build-tsan --target rune_worker_tests
-/Users/vradu/Projects/rune-broker/build-tsan/libs/node/rune_worker_tests
+"$CMAKE" --build ~/Projects/rune-broker/build-tsan --target rune_worker_tests
+~/Projects/rune-broker/build-tsan/libs/node/rune_worker_tests
 ```
 Expected: PASS (2 tests).
 
@@ -648,7 +648,7 @@ Add to `libs/node/CMakeLists.txt`:
 
 Run:
 ```bash
-"$CMAKE" --build /Users/vradu/Projects/rune-broker/build-tsan --target rune_worker_pool_tests
+"$CMAKE" --build ~/Projects/rune-broker/build-tsan --target rune_worker_pool_tests
 ```
 Expected: FAIL — `rune/node/WorkerPool.h` not found.
 
@@ -744,8 +744,8 @@ private:
 - [ ] **Step 4: Run the test to verify it passes**
 
 ```bash
-"$CMAKE" --build /Users/vradu/Projects/rune-broker/build-tsan --target rune_worker_pool_tests
-/Users/vradu/Projects/rune-broker/build-tsan/libs/node/rune_worker_pool_tests
+"$CMAKE" --build ~/Projects/rune-broker/build-tsan --target rune_worker_pool_tests
+~/Projects/rune-broker/build-tsan/libs/node/rune_worker_pool_tests
 ```
 Expected: PASS (4 tests).
 
@@ -808,7 +808,7 @@ TEST(NodeConfig, RuneWorkersFloorsToOne) {
 - [ ] **Step 2: Run the test to verify it fails**
 
 ```bash
-"$CMAKE" --build /Users/vradu/Projects/rune-broker/build-tsan --target rune_node_tests
+"$CMAKE" --build ~/Projects/rune-broker/build-tsan --target rune_node_tests
 ```
 Expected: FAIL — `workerCount` is not a member of `NodeConfig`.
 
@@ -842,8 +842,8 @@ In `libs/node/src/NodeConfig.cpp`, after the block that parses `gatewayMinIsr` /
 - [ ] **Step 4: Run the test to verify it passes**
 
 ```bash
-"$CMAKE" --build /Users/vradu/Projects/rune-broker/build-tsan --target rune_node_tests
-/Users/vradu/Projects/rune-broker/build-tsan/libs/node/rune_node_tests --gtest_filter='NodeConfig.*Worker*'
+"$CMAKE" --build ~/Projects/rune-broker/build-tsan --target rune_node_tests
+~/Projects/rune-broker/build-tsan/libs/node/rune_node_tests --gtest_filter='NodeConfig.*Worker*'
 ```
 Expected: PASS (3 new tests).
 
@@ -923,7 +923,7 @@ TEST(WorkerPool, NodeRuntimeAgentDelegatesReplicaIterationToPool) {
 - [ ] **Step 2: Run to verify it fails**
 
 ```bash
-"$CMAKE" --build /Users/vradu/Projects/rune-broker/build-tsan --target rune_worker_pool_tests
+"$CMAKE" --build ~/Projects/rune-broker/build-tsan --target rune_worker_pool_tests
 ```
 Expected: FAIL — `NodeRuntimeAgent` full ctor has no `workerPool` parameter.
 
@@ -1065,8 +1065,8 @@ void BrokerNode::buildWorkerPool() {
 - [ ] **Step 5: Run to verify the delegated-path test + node build pass**
 
 ```bash
-"$CMAKE" --build /Users/vradu/Projects/rune-broker/build-tsan --target rune_worker_pool_tests rune_node
-/Users/vradu/Projects/rune-broker/build-tsan/libs/node/rune_worker_pool_tests
+"$CMAKE" --build ~/Projects/rune-broker/build-tsan --target rune_worker_pool_tests rune_node
+~/Projects/rune-broker/build-tsan/libs/node/rune_worker_pool_tests
 ```
 Expected: PASS (delegation + reconcile tests).
 
@@ -1141,9 +1141,9 @@ TEST(WorkerPool, ConcurrentDisjointWorkersAreRaceFree) {
 - [ ] **Step 2: Run under TSan to verify (must be clean; if a race is reported it FAILS)**
 
 ```bash
-"$CMAKE" --build /Users/vradu/Projects/rune-broker/build-tsan --target rune_worker_pool_tests
+"$CMAKE" --build ~/Projects/rune-broker/build-tsan --target rune_worker_pool_tests
 TSAN_OPTIONS=halt_on_error=1 \
-  /Users/vradu/Projects/rune-broker/build-tsan/libs/node/rune_worker_pool_tests \
+  ~/Projects/rune-broker/build-tsan/libs/node/rune_worker_pool_tests \
   --gtest_filter='WorkerPool.ConcurrentDisjointWorkersAreRaceFree'
 ```
 Expected on first correct run: PASS with NO TSan warning. If TSan reports a race, it means ownership is not actually disjoint (or a replica shares state) — fix the router/assignment, do NOT suppress.
@@ -1155,7 +1155,7 @@ If the test races, the defect is in Task 1/3 assignment (a shard mapped to two w
 - [ ] **Step 4: Confirm the whole pool suite is green under TSan**
 
 ```bash
-/Users/vradu/Projects/rune-broker/build-tsan/libs/node/rune_worker_pool_tests
+~/Projects/rune-broker/build-tsan/libs/node/rune_worker_pool_tests
 ```
 Expected: PASS (all tests, TSan clean).
 
@@ -1275,8 +1275,8 @@ Add to `libs/node/CMakeLists.txt` (inside the existing `if(aeron_FOUND)` block, 
 
 Run:
 ```bash
-"$CMAKE" --build /Users/vradu/Projects/rune-broker/build-tsan --target rune_worker_pool_parity_tests
-/Users/vradu/Projects/rune-broker/build-tsan/libs/node/rune_worker_pool_parity_tests
+"$CMAKE" --build ~/Projects/rune-broker/build-tsan --target rune_worker_pool_parity_tests
+~/Projects/rune-broker/build-tsan/libs/node/rune_worker_pool_parity_tests
 ```
 Expected: FAIL first (missing a test accessor for the router, or an assertion) — then iterate to green.
 
@@ -1305,8 +1305,8 @@ Configure the D suites to run with 4 workers by exporting `RUNE_WORKERS=4` (Brok
 
 ```bash
 CMAKE=/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/bin/cmake
-"$CMAKE" --build /Users/vradu/Projects/rune-broker/build-tsan
-BIN=/Users/vradu/Projects/rune-broker/build-tsan
+"$CMAKE" --build ~/Projects/rune-broker/build-tsan
+BIN=~/Projects/rune-broker/build-tsan
 export RUNE_WORKERS=4
 for t in \
   libs/metadata/rune_metadata_state_machine_tests \

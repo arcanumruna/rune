@@ -1,6 +1,6 @@
 # Consumer-group routing fix: report (2026-10-04)
 
-Client worktree: `/Users/vradu/Projects/rune-client-cpp-wt14`, branch `fix/group-subscribe-routing`, rebased on client main `3c7e97b`. Nothing was pushed. No broker change was needed (see Defect 2).
+Client worktree: `~/Projects/rune-client-cpp-wt14`, branch `fix/group-subscribe-routing`, rebased on client main `3c7e97b`. Nothing was pushed. No broker change was needed (see Defect 2).
 
 ## Defect 1: a member's partition Subscribe never reaches the partition leader
 

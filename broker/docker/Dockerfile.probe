@@ -52,6 +52,10 @@ RUN cmake -S . -B build -G Ninja \
         -DBUILD_TESTING=OFF \
         -DBUILD_BENCHMARKS=OFF \
         -DBUILD_INTEGRATION_TESTING=OFF \
+        -DRUNE_PROTOCOL_INCLUDE=/rune-protocol/include \
+        -DRUNE_CODEC_ROOT=/rune-codec \
+        -DRUNE_CRYPTO_ROOT=/rune-crypto \
+        -DFLIGHT_RECORDER_DIR=/flight-recorder \
         -DBUILD_PING_PROBE=ON \
     && cmake --build build --target ping_probe -j2
 

@@ -9,7 +9,7 @@ consensus leader. Before D4, a group member bootstrapped against a follower re-j
 
 The first client fix (this branch, commits a0f61a1 + 25c2ae5) MOVES the seed session onto the coordinator
 (retarget + reconnect + seed endpoint sync). It works end-to-end, but review
-`/Users/vradu/Projects/rune-broker-wt26/docs/superpowers/briefs/2026-10-08-d4-client-review.md` found 3 MAJORs,
+`~/Projects/rune-broker-wt26/docs/superpowers/briefs/2026-10-08-d4-client-review.md` found 3 MAJORs,
 all caused by moving the seed:
 - duplicate sessions per node, with the wrong crypto state;
 - stale route session index 0;
@@ -70,7 +70,7 @@ already exists on this branch).
 - Duty thread only. No atomics / mutex outside the allowlist (ctest `NoAtomicsOrMutexesOutsideAllowlistRegression`).
 - No allocation per frame on the produce hot path (coordinator frames are control-plane).
 - Never busy-spin.
-- Build: `/Users/vradu/Projects/rune-client-cpp-wt17/build` (already configured, Ninja): `cmake --build build -j6`.
+- Build: `~/Projects/rune-client-cpp-wt17/build` (already configured, Ninja): `cmake --build build -j6`.
   Targeted tests while iterating (`./build/rune_invoker_tests --gtest_filter=...`). Run the full `ctest -j6` once at
   the end.
 - Commit on branch `fix/d4-coordinator-redirect` in wt17 (small logical commits; end each commit message with
@@ -78,7 +78,7 @@ already exists on this branch).
   worktrees. Do NOT dispatch subagents.
 
 ## Report
-Write `/Users/vradu/Projects/rune-client-cpp-wt17/docs/superpowers/briefs/2026-10-08-d4-coordinator-session-report.md`:
+Write `~/Projects/rune-client-cpp-wt17/docs/superpowers/briefs/2026-10-08-d4-coordinator-session-report.md`:
 - the design as built;
 - each test, and its RED evidence (the test failing with the fix reverted);
 - the review findings addressed, or ruled with a reason;

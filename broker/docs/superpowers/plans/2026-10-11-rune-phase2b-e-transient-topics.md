@@ -15,23 +15,23 @@
 ## Execution context
 
 - **Repos and branches.** Cut `feat/phase2b-e-transient-topics` from each repo's integration branch:
-  - broker `/Users/vradu/Projects/rune-broker-matviews` from `feature/materialized-views`
-  - protocol `/Users/vradu/Projects/se-worktrees/rune-protocol` from `feat/view-engine-phase2a` (== `feature/materialized-views`)
-  - client `/Users/vradu/Projects/se-worktrees/rune-client-cpp` from `feat/view-engine-phase2a` (== `feature/materialized-views`)
-  - ql `/Users/vradu/Projects/se-worktrees/rune-ql` from `feat/schema-evolution-durable-tags`
+  - broker `~/Projects/rune-broker-matviews` from `feature/materialized-views`
+  - protocol `~/Projects/se-worktrees/rune-protocol` from `feat/view-engine-phase2a` (== `feature/materialized-views`)
+  - client `~/Projects/se-worktrees/rune-client-cpp` from `feat/view-engine-phase2a` (== `feature/materialized-views`)
+  - ql `~/Projects/se-worktrees/rune-ql` from `feat/schema-evolution-durable-tags`
   ```bash
-  git -C /Users/vradu/Projects/rune-broker-matviews switch -c feat/phase2b-e-transient-topics feature/materialized-views
-  git -C /Users/vradu/Projects/se-worktrees/rune-protocol switch -c feat/phase2b-e-transient-topics feat/view-engine-phase2a
-  git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp switch -c feat/phase2b-e-transient-topics feat/view-engine-phase2a
-  git -C /Users/vradu/Projects/se-worktrees/rune-ql switch -c feat/phase2b-e-transient-topics feat/schema-evolution-durable-tags
+  git -C ~/Projects/rune-broker-matviews switch -c feat/phase2b-e-transient-topics feature/materialized-views
+  git -C ~/Projects/se-worktrees/rune-protocol switch -c feat/phase2b-e-transient-topics feat/view-engine-phase2a
+  git -C ~/Projects/se-worktrees/rune-client-cpp switch -c feat/phase2b-e-transient-topics feat/view-engine-phase2a
+  git -C ~/Projects/se-worktrees/rune-ql switch -c feat/phase2b-e-transient-topics feat/schema-evolution-durable-tags
   ```
-- **Builds (canonical sibling layout).** The client/ql/protocol checkouts are siblings under `se-worktrees/` (the client compiles `../rune-ql`, `../rune-codec`, `../rune-protocol` from there). The broker checkout's siblings (`/Users/vradu/Projects/rune-protocol`, `…/rune-codec`) are NOT these branches, so configure the broker's `build-fast` once with explicit sibling overrides:
+- **Builds (canonical sibling layout).** The client/ql/protocol checkouts are siblings under `se-worktrees/` (the client compiles `../rune-ql`, `../rune-codec`, `../rune-protocol` from there). The broker checkout's siblings (`~/Projects/rune-protocol`, `…/rune-codec`) are NOT these branches, so configure the broker's `build-fast` once with explicit sibling overrides:
   ```bash
-  cd /Users/vradu/Projects/rune-broker-matviews
+  cd ~/Projects/rune-broker-matviews
   cmake -S . -B build-fast -G Ninja -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON \
-    -DCMAKE_TOOLCHAIN_FILE=/Users/vradu/Projects/rune-broker/build/Debug/generators/conan_toolchain.cmake \
-    -DRUNE_PROTOCOL_INCLUDE=/Users/vradu/Projects/se-worktrees/rune-protocol/include \
-    -DRUNE_CODEC_ROOT=/Users/vradu/Projects/se-worktrees/rune-codec
+    -DCMAKE_TOOLCHAIN_FILE=~/Projects/rune-broker/build/Debug/generators/conan_toolchain.cmake \
+    -DRUNE_PROTOCOL_INCLUDE=~/Projects/se-worktrees/rune-protocol/include \
+    -DRUNE_CODEC_ROOT=~/Projects/se-worktrees/rune-codec
   ```
   - ql: existing build dir `build/build/Release` (Makefiles; `cmake --build build/build/Release -j --target rune_ql_tests`).
   - protocol: existing build dir `build` (`cmake --build build -j --target rune_protocol_tests`).
@@ -100,7 +100,7 @@ Also pinned (less likely, cheap): a topic or field literally named `transient` s
 
 ### Task 1: Rune QL — `transient topic`, `TopicDef.persistence`, alter rejection
 
-**Repo:** `/Users/vradu/Projects/se-worktrees/rune-ql`
+**Repo:** `~/Projects/se-worktrees/rune-ql`
 
 **Files:**
 - Modify: `include/rune/ql/Ast.h`
@@ -374,8 +374,8 @@ Bench (record the number in the commit body, no gate — DDL is a cold path): `c
 - [ ] **Step 5: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-ql add include/rune/ql/Ast.h include/rune/ql/Backends.h src/Parser.cpp src/Backends.cpp tests/ParserTest.cpp tests/BackendsTest.cpp benchmark/ParseBench.cpp
-git -C /Users/vradu/Projects/se-worktrees/rune-ql commit -m "feat(ql): transient topic statement; TopicDef.persistence; alter cannot change persistence
+git -C ~/Projects/se-worktrees/rune-ql add include/rune/ql/Ast.h include/rune/ql/Backends.h src/Parser.cpp src/Backends.cpp tests/ParserTest.cpp tests/BackendsTest.cpp benchmark/ParseBench.cpp
+git -C ~/Projects/se-worktrees/rune-ql commit -m "feat(ql): transient topic statement; TopicDef.persistence; alter cannot change persistence
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -384,7 +384,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ### Task 2: Protocol — `DefineTopic` appended persistence byte
 
-**Repo:** `/Users/vradu/Projects/se-worktrees/rune-protocol`
+**Repo:** `~/Projects/se-worktrees/rune-protocol`
 
 **Files:**
 - Modify: `include/rune/protocol/client/SchemaMessages.h:12-57` (`struct DefineTopic`)
@@ -558,8 +558,8 @@ Expected: all PASS, including the unchanged `SchemaConformance.DefineTopicDecode
 - [ ] **Step 5: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-protocol add include/rune/protocol/client/SchemaMessages.h tests/protocol/client/SchemaMessagesTest.cpp tests/protocol/client/SchemaConformanceTest.cpp
-git -C /Users/vradu/Projects/se-worktrees/rune-protocol commit -m "feat(protocol): DefineTopic optional trailing persistence byte (0 disk, 1 transient)
+git -C ~/Projects/se-worktrees/rune-protocol add include/rune/protocol/client/SchemaMessages.h tests/protocol/client/SchemaMessagesTest.cpp tests/protocol/client/SchemaConformanceTest.cpp
+git -C ~/Projects/se-worktrees/rune-protocol commit -m "feat(protocol): DefineTopic optional trailing persistence byte (0 disk, 1 transient)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -568,7 +568,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ### Task 3: Broker — rename `PersistenceMode::Memory` → `Transient`; `persistence=transient` + deprecated `memory` alias
 
-**Repo:** broker `/Users/vradu/Projects/rune-broker-matviews`
+**Repo:** broker `~/Projects/rune-broker-matviews`
 
 **Files:**
 - Create: `libs/node/include/rune/node/PersistenceMode.h`
@@ -1793,7 +1793,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ### Task 8: Client — `Persistence`, `defineTopic*` overloads, `schema apply` honours `transient topic`
 
-**Repo:** `/Users/vradu/Projects/se-worktrees/rune-client-cpp` (compiles `../rune-ql` + `../rune-protocol` from Tasks 1-2)
+**Repo:** `~/Projects/se-worktrees/rune-client-cpp` (compiles `../rune-ql` + `../rune-protocol` from Tasks 1-2)
 
 **Files:**
 - Modify: `include/rune/client/Client.h:83-90` (enum), `:569-571` and `:622-625` (overloads)
@@ -2021,8 +2021,8 @@ Expected: all PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp add include/rune/client/Client.h src/Client.cpp src/cli/Cli.cpp tests/client/ClientSchemaTest.cpp tests/RuneCliLiveTest.cpp
-git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp commit -m "feat(client): Persistence on defineTopic/defineTopicAndWait; schema apply honours transient topic
+git -C ~/Projects/se-worktrees/rune-client-cpp add include/rune/client/Client.h src/Client.cpp src/cli/Cli.cpp tests/client/ClientSchemaTest.cpp tests/RuneCliLiveTest.cpp
+git -C ~/Projects/se-worktrees/rune-client-cpp commit -m "feat(client): Persistence on defineTopic/defineTopicAndWait; schema apply honours transient topic
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```

@@ -22,17 +22,17 @@ E's **Task 10 (e2e) was written BLOCKED on this part and was NOT executed** (che
 ## Execution context
 
 - **Repos / branch:** `feat/phase2b-e2-transient-data-path`, already cut from `feature/materialized-views` in
-  - `/Users/vradu/Projects/se-worktrees/rune-broker` (base `6a3b9baa`)
-  - `/Users/vradu/Projects/se-worktrees/rune-client-cpp` (base `c06348b`)
-  - `/Users/vradu/Projects/se-worktrees/rune-protocol` (base `1890349`; Task 1 only)
+  - `~/Projects/se-worktrees/rune-broker` (base `6a3b9baa`)
+  - `~/Projects/se-worktrees/rune-client-cpp` (base `c06348b`)
+  - `~/Projects/se-worktrees/rune-protocol` (base `1890349`; Task 1 only)
 
   Verify with `git -C <repo> log --oneline -1` before Task 1.
 - **Builds (all already configured — do not re-run the configure step unless a directory is missing):**
-  - broker tests: `build-fast` (Ninja, Debug, `BUILD_TESTING=ON`, `BUILD_BENCHMARKS=OFF`; `RUNE_PROTOCOL_INCLUDE` → `../rune-protocol/include`, `RUNE_CODEC_ROOT` → `../rune-codec`). After a `CMakeLists.txt` edit: `cmake /Users/vradu/Projects/se-worktrees/rune-broker/build-fast`.
-  - broker benchmarks: `build-bench-rel` (Ninja, `BUILD_BENCHMARKS=ON`, `-O3 -DNDEBUG`). After a `CMakeLists.txt` edit: `cmake /Users/vradu/Projects/se-worktrees/rune-broker/build-bench-rel`.
+  - broker tests: `build-fast` (Ninja, Debug, `BUILD_TESTING=ON`, `BUILD_BENCHMARKS=OFF`; `RUNE_PROTOCOL_INCLUDE` → `../rune-protocol/include`, `RUNE_CODEC_ROOT` → `../rune-codec`). After a `CMakeLists.txt` edit: `cmake ~/Projects/se-worktrees/rune-broker/build-fast`.
+  - broker benchmarks: `build-bench-rel` (Ninja, `BUILD_BENCHMARKS=ON`, `-O3 -DNDEBUG`). After a `CMakeLists.txt` edit: `cmake ~/Projects/se-worktrees/rune-broker/build-bench-rel`.
   - client: `build` (Unix Makefiles; `RUNE_PROTOCOL_INCLUDE` → `../rune-protocol/include`).
   - protocol: `build` (Unix Makefiles; target `rune_protocol_tests`).
-  - If `build-fast` is missing: `cmake -S . -B build-fast -G Ninja -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON -DCMAKE_TOOLCHAIN_FILE=/Users/vradu/Projects/se-worktrees/rune-broker/build/Debug/generators/conan_toolchain.cmake -DRUNE_PROTOCOL_INCLUDE=/Users/vradu/Projects/se-worktrees/rune-protocol/include -DRUNE_CODEC_ROOT=/Users/vradu/Projects/se-worktrees/rune-codec`.
+  - If `build-fast` is missing: `cmake -S . -B build-fast -G Ninja -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON -DCMAKE_TOOLCHAIN_FILE=~/Projects/se-worktrees/rune-broker/build/Debug/generators/conan_toolchain.cmake -DRUNE_PROTOCOL_INCLUDE=~/Projects/se-worktrees/rune-protocol/include -DRUNE_CODEC_ROOT=~/Projects/se-worktrees/rune-codec`.
 - **Test gate (CLAUDE.md rule 7, as amended in broker `03f2955f`):**
   - **Per task / fix round:** build, then run the test executables covering the code the task touches plus every new or changed test, at `-j14` — each task's "Run" step names the exact `ctest -R` filter (`ctest --test-dir <build> -R '<filter>' --output-on-failure -j14`).
   - **The FULL `*Regression*` suite runs only at controller checkpoints**, in every repo touched since the last checkpoint: `ctest --test-dir build-fast -R Regression --output-on-failure -j14` (broker), `ctest --test-dir build -R Regression --output-on-failure -j14` (client), `ctest --test-dir build -R Regression --output-on-failure` (protocol). A checkpoint failure is bisected over the commits since the last green checkpoint.
@@ -237,7 +237,7 @@ TEST(TransientLogFullRegression, OldClientsAreAnsweredNotLeader) {
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-protocol/build -j14 --target rune_protocol_tests`
+Run: `cmake --build ~/Projects/se-worktrees/rune-protocol/build -j14 --target rune_protocol_tests`
 Expected: compile error `no member named 'TransientLogFull' in 'rune::protocol::client::ErrorCode'`.
 
 - [ ] **Step 3: Implement — `Protocol.h`**
@@ -313,7 +313,7 @@ and extend its doc comment's first sentence: `… for clients below kClientVersi
 
 - [ ] **Step 4: Run the protocol tests**
 
-Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-protocol/build -j14 --target rune_protocol_tests && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-protocol/build -R 'TransientLogFull|UnknownProducerId|DataMessages|Conformance' --output-on-failure -j14`
+Run: `cmake --build ~/Projects/se-worktrees/rune-protocol/build -j14 --target rune_protocol_tests && ctest --test-dir ~/Projects/se-worktrees/rune-protocol/build -R 'TransientLogFull|UnknownProducerId|DataMessages|Conformance' --output-on-failure -j14`
 Expected: all PASS (the conformance vectors carry no client version field; if one pins `kClientVersion == 5`, update that pin in the same commit — it is the version this protocol announces).
 
 - [ ] **Step 5: Write the failing client tests** — append to `rune-client-cpp/tests/producer/ProducerRouteParkTest.cpp`:
@@ -386,7 +386,7 @@ TEST(TransactionalProducerTest, TransientLogFullBacksOffWithoutSpendingRetriesRe
 
 - [ ] **Step 6: Run to verify they fail**
 
-Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -j14 && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -R 'TransientLogFull' --output-on-failure -j14`
+Run: `cmake --build ~/Projects/se-worktrees/rune-client-cpp/build -j14 && ctest --test-dir ~/Projects/se-worktrees/rune-client-cpp/build -R 'TransientLogFull' --output-on-failure -j14`
 Expected: `ProducerRoutePark.TransientLogFullIsRetriedAfterBackoffWithoutParkingRegression` FAILS (`t.failed == 1`: rule D fails it); `TransactionalProducerTest.TransientLogFullBacksOffWithoutSpendingRetriesRegression` FAILS ("re-sent on the very next cycle", then the transaction leaves `InTransaction` after 5 answers).
 
 - [ ] **Step 7: Implement — client**
@@ -467,21 +467,21 @@ with
 
 - [ ] **Step 8: Run to verify they pass**
 
-Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -j14 && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -R 'ProducerRoutePark|TransactionalProducerTest|UnknownProducerId|ProducerAckPath|Session' --output-on-failure -j14`
+Run: `cmake --build ~/Projects/se-worktrees/rune-client-cpp/build -j14 && ctest --test-dir ~/Projects/se-worktrees/rune-client-cpp/build -R 'ProducerRoutePark|TransactionalProducerTest|UnknownProducerId|ProducerAckPath|Session' --output-on-failure -j14`
 Expected: all PASS (`ProducerUnknownProducerIdTest` pins `cfg.clientVersion == rpc::kClientVersion`, which follows the constant).
 
-Then the broker builds against the new header: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'UnknownProducerId|ClientGatewayEgress|SessionAckSink' --output-on-failure -j14`
+Then the broker builds against the new header: `cmake --build ~/Projects/se-worktrees/rune-broker/build-fast -j14 && ctest --test-dir ~/Projects/se-worktrees/rune-broker/build-fast -R 'UnknownProducerId|ClientGatewayEgress|SessionAckSink' --output-on-failure -j14`
 Expected: PASS (no broker code changed; sessions now announce 6).
 
 - [ ] **Step 9: Commit (two repos)**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-protocol add include/rune/protocol/client/Protocol.h tests/protocol/client/DataMessagesTest.cpp
-git -C /Users/vradu/Projects/se-worktrees/rune-protocol commit -m "feat(protocol): ErrorCode::TransientLogFull = 42, client version 6 (old clients answered NotLeader)
+git -C ~/Projects/se-worktrees/rune-protocol add include/rune/protocol/client/Protocol.h tests/protocol/client/DataMessagesTest.cpp
+git -C ~/Projects/se-worktrees/rune-protocol commit -m "feat(protocol): ErrorCode::TransientLogFull = 42, client version 6 (old clients answered NotLeader)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
-git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp add src/producer/ProducerImpl.cpp include/rune/client/producer/TransactionalProducerImpl.h src/producer/TransactionalProducerImpl.cpp include/rune/client/producer/Producer.h tests/producer/ProducerRouteParkTest.cpp tests/producer/TransactionalProducerTest.cpp
-git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp commit -m "feat(client): retry TransientLogFull (42) after a backoff, same identity, no metadata refresh
+git -C ~/Projects/se-worktrees/rune-client-cpp add src/producer/ProducerImpl.cpp include/rune/client/producer/TransactionalProducerImpl.h src/producer/TransactionalProducerImpl.cpp include/rune/client/producer/Producer.h tests/producer/ProducerRouteParkTest.cpp tests/producer/TransactionalProducerTest.cpp
+git -C ~/Projects/se-worktrees/rune-client-cpp commit -m "feat(client): retry TransientLogFull (42) after a backoff, same identity, no metadata refresh
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -1897,7 +1897,7 @@ with
 
 - [ ] **Step 5: Run to verify they pass**
 
-Run: `cmake /Users/vradu/Projects/se-worktrees/rune-broker/build-fast && cmake --build build-fast -j14 && ctest --test-dir build-fast -R 'TransientDataPath|Worker|ProducePath|F15|HotPathB|ShardNonBlocking|TxnCoordination|TransactionCoordination' --output-on-failure -j14`
+Run: `cmake ~/Projects/se-worktrees/rune-broker/build-fast && cmake --build build-fast -j14 && ctest --test-dir build-fast -R 'TransientDataPath|Worker|ProducePath|F15|HotPathB|ShardNonBlocking|TxnCoordination|TransactionCoordination' --output-on-failure -j14`
 Expected: all PASS.
 
 - [ ] **Step 6: Commit**
@@ -2310,7 +2310,7 @@ In `libs/node/CMakeLists.txt`, after `gtest_discover_tests(rune_transient_data_p
 
 - [ ] **Step 2: Run it**
 
-Run: `cmake /Users/vradu/Projects/se-worktrees/rune-broker/build-fast && cmake --build build-fast -j14 --target rune_transient_alloc_regression_tests && ctest --test-dir build-fast -R 'SteadyStateProduceEvictAndPushRead' --output-on-failure -j14`
+Run: `cmake ~/Projects/se-worktrees/rune-broker/build-fast && cmake --build build-fast -j14 --target rune_transient_alloc_regression_tests && ctest --test-dir build-fast -R 'SteadyStateProduceEvictAndPushRead' --output-on-failure -j14`
 Expected: PASS (Tasks 2-5 were written allocation-free: restamp append = one memcpy into the preallocated ring, `readView` = a pointer view, eviction = an index move). If it FAILS, the printed backtrace names the allocation — fix it in the named function (HARD RULE 4), never by loosening the test.
 
 - [ ] **Step 3: Write the benchmark** — in `benchmark/WorkerProduceLatencyBench.cpp`, insert before the closing `} // namespace` of the anonymous namespace (right after `BM_WorkerRoleGate_Baseline`):
@@ -2825,7 +2825,7 @@ In `libs/gateway/CMakeLists.txt`, after `gtest_discover_tests(rune_gateway_topic
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cmake /Users/vradu/Projects/se-worktrees/rune-broker/build-fast && cmake --build build-fast -j14 --target rune_gateway_transient_tests && ctest --test-dir build-fast -R 'TransientGateway' --output-on-failure -j14`
+Run: `cmake ~/Projects/se-worktrees/rune-broker/build-fast && cmake --build build-fast -j14 --target rune_gateway_transient_tests && ctest --test-dir build-fast -R 'TransientGateway' --output-on-failure -j14`
 Expected: `Subscribe…Accepted`, `ProduceThroughTheWorker…`, `SubscribeLatest…`, `CommittedRuntime…` and `FullRing…` FAIL (Subscribe/Produce answered `UnknownPartition` = 8); `GroupSubscription…` FAILS (`addGroupSubscription` returns -1); `TxnMarker…` FAILS (`appendControlRecord` returns -1); `UncommittedTransientTopicServesNothingUntilCommit…` FAILS only after `r.commit()` (the C1 half passes today — it pins the rule the change must keep); `TransientGateway.WithoutAWorkerPool…` PASSES (pins "never inline").
 
 - [ ] **Step 3: Implement — `ClientGateway.h`**
@@ -3489,7 +3489,7 @@ add:
 
 - [ ] **Step 2: Run them**
 
-Run: `cmake /Users/vradu/Projects/se-worktrees/rune-broker/build-fast && cmake --build build-fast -j14 --target rune_transient_topic_data_path_tests && ctest --test-dir build-fast -R 'TransientTopicDataPath' --output-on-failure -j14`
+Run: `cmake ~/Projects/se-worktrees/rune-broker/build-fast && cmake --build build-fast -j14 --target rune_transient_topic_data_path_tests && ctest --test-dir build-fast -R 'TransientTopicDataPath' --output-on-failure -j14`
 Expected: all five PASS on top of Tasks 1-7. (At `6a3b9baa` every one FAILS: the shard produce answers Internal (6), the legacy produce/subscribe answer UnknownPartition (8).) A failure here is a real integration gap: fix it in the owning layer with its own `*Regression*` test before continuing.
 
 - [ ] **Step 3: Docs** — in `docs/SELF-HOSTING.md`, in the "### Transient topics" section, replace the line
@@ -4208,7 +4208,7 @@ In the root `CMakeLists.txt`, in `add_executable(rune_broker_benchmark …)`, re
 
 - [ ] **Step 2: Run the benchmark (gate)**
 
-Run: `cmake /Users/vradu/Projects/se-worktrees/rune-broker/build-bench-rel && cmake --build build-bench-rel -j14 --target rune_broker_benchmark && $(find build-bench-rel -name rune_broker_benchmark -type f | head -1) --benchmark_filter='ViewFoldSource|ViewFoldReplace' --benchmark_repetitions=3 --benchmark_report_aggregates_only=true`
+Run: `cmake ~/Projects/se-worktrees/rune-broker/build-bench-rel && cmake --build build-bench-rel -j14 --target rune_broker_benchmark && $(find build-bench-rel -name rune_broker_benchmark -type f | head -1) --benchmark_filter='ViewFoldSource|ViewFoldReplace' --benchmark_repetitions=3 --benchmark_report_aggregates_only=true`
 Expected: the four `ViewFoldSource` benchmarks complete without `SkipWithError`; **Transient `p50Us` and `p99Us` ≤ Disk's** (medians of the 3 repetitions) and **Transient `records_per_s` ≥ Disk's**; `BM_ViewFoldReplace` (the §14.0 fold gate: `record_p99_us < 5`, `batch_p99_us < 10`, `steady_alloc == 0`) unchanged within noise from Part E's numbers in `3c1ce059` (record_p99 0.416-0.417 µs, batch_p99 0.875-0.959 µs). If transient is slower than disk, stop and profile — a gate failure, not a tolerance to widen.
 
 - [ ] **Step 3: Commit** (replace the text of the second `-m` with the measured Step 2 lines)
@@ -5133,7 +5133,7 @@ In `libs/gateway/CMakeLists.txt`, after `gtest_discover_tests(rune_gateway_trans
 
 - [ ] **Step 3: Run the matrix**
 
-Run: `cmake /Users/vradu/Projects/se-worktrees/rune-broker/build-fast && cmake --build build-fast -j14 --target rune_gateway_transient_matrix_tests && ctest --test-dir build-fast -R 'TransientMatrix' --output-on-failure -j14`
+Run: `cmake ~/Projects/se-worktrees/rune-broker/build-fast && cmake --build build-fast -j14 --target rune_gateway_transient_matrix_tests && ctest --test-dir build-fast -R 'TransientMatrix' --output-on-failure -j14`
 Expected: `TransientMatrixCountRegression.CellCountsArePinned` PASSES; 366 `AllCells/TransientMatrixRegression.Cell/*` PASS and 642 are SKIPPED (each with its rule). On top of Tasks 1-9 every applicable cell is expected green — a failing cell is either a real gap (fix it in the owning layer with its own `*Regression*` test, keep the cell) or a rig defect (fix the rig, never the table). Do NOT edit `expect()` to make a cell pass; a table change needs the controller's ruling and a plan update.
 
 - [ ] **Step 4: Commit**
@@ -5388,7 +5388,7 @@ In `libs/node/CMakeLists.txt`, after `gtest_discover_tests(rune_transient_alloc_
 
 - [ ] **Step 2: Run it**
 
-Run: `cmake /Users/vradu/Projects/se-worktrees/rune-broker/build-fast && cmake --build build-fast -j14 --target rune_transient_stress_tests && ctest --test-dir build-fast -R 'TransientDataPathStress' --output-on-failure -j14`
+Run: `cmake ~/Projects/se-worktrees/rune-broker/build-fast && cmake --build build-fast -j14 --target rune_transient_stress_tests && ctest --test-dir build-fast -R 'TransientDataPathStress' --output-on-failure -j14`
 Expected: all 64 seeds PASS. A failing seed is a real interleaving bug (or a model error): reproduce it alone (`--gtest_filter='*SeededModelChecked/<n>'`), fix the owning layer with a `*Regression*` test that replays the minimal step sequence, keep the seed.
 
 - [ ] **Step 3: Commit**
@@ -5814,11 +5814,11 @@ Expected: `VIEW-ENGINE-E2E: OK, exit 0.` with both `presence_t` lines in the pro
 
 - [ ] **Step 5: Gate + commit (two repos)**
 
-Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -j14 --target view_probe && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -R 'ViewProbe|View' --output-on-failure -j14` (the probe compiles; no unit test covers it — Step 4 is its test).
+Run: `cmake --build ~/Projects/se-worktrees/rune-client-cpp/build -j14 --target view_probe && ctest --test-dir ~/Projects/se-worktrees/rune-client-cpp/build -R 'ViewProbe|View' --output-on-failure -j14` (the probe compiles; no unit test covers it — Step 4 is its test).
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp add examples/view_probe.cpp
-git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp commit -m "test(e2e): transient topic leg in view_probe (define, 3 acks, 3 subscribe starts, read_committed, restart empty)
+git -C ~/Projects/se-worktrees/rune-client-cpp add examples/view_probe.cpp
+git -C ~/Projects/se-worktrees/rune-client-cpp commit -m "test(e2e): transient topic leg in view_probe (define, 3 acks, 3 subscribe starts, read_committed, restart empty)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 git add docker/view-engine-e2e.sh

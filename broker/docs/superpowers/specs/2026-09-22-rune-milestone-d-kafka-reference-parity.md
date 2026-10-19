@@ -1,7 +1,7 @@
 # Milestone D — Kafka (KRaft) Reference & Edge-Case Parity
 
 > **STATUS: REFERENCE.** Distilled from a source read of Apache Kafka
-> **v4.5 (KRaft era)** at `/Users/vradu/Projects/kafka`. Companion to the D design
+> **v4.5 (KRaft era)** at `~/Projects/kafka`. Companion to the D design
 > spec. Purpose: mirror Kafka's proven controller-assigns mechanics and, critically,
 > its **edge-case handling**, so the Rune implementation does not reintroduce bugs
 > Kafka already solved. Every rule carries a Kafka `file:line` and the bug it

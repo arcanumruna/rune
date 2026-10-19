@@ -77,7 +77,7 @@ TEST(TxnOffsetCommit, AddOffsetsToTxn_ApiExists) {
 - [ ] **Step 2: Run build to see compile error**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 if ! command -v cmake >/dev/null 2>&1; then CMAKE_BIN=$(dirname "$(find "$HOME/.conan2" -type f -name cmake -path '*/bin/*' 2>/dev/null | head -1)"); export PATH="$CMAKE_BIN:$PATH"; fi
 cmake --build build -j2 2>&1 | tail -20
 ```
@@ -1195,7 +1195,7 @@ Expected: F7-a and F7-b PASS.
 - [ ] **Step 4: Run the full suite (seq + -j4)**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker/build
+cd ~/Projects/rune-broker/build
 ctest --timeout 90 2>&1 | tail -5
 ctest -j4 --timeout 90 2>&1 | tail -2
 ```
@@ -1217,7 +1217,7 @@ git commit -m "test(transaction): F7 cross-layer leader-failover EOS test — 2-
 - [ ] **Step 1: Run the full suite sequentially and with -j4**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 if ! command -v cmake >/dev/null 2>&1; then CMAKE_BIN=$(dirname "$(find "$HOME/.conan2" -type f -name cmake -path '*/bin/*' 2>/dev/null | head -1)"); export PATH="$CMAKE_BIN:$PATH"; fi
 cmake --build build -j2
 cd build && ctest --timeout 90 2>&1 | tail -5
@@ -1229,7 +1229,7 @@ Expected: all tests pass in both modes.
 - [ ] **Step 2: Final commit (using exact message from spec)**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 git add -A
 git commit -m "feat(transaction): real addOffsetsToTxn (offsets applied on commit / discarded on abort, persisted+recovered) + cross-layer leader-failover EOS test (marker-durability invariant) [P5-5 review]"
 ```

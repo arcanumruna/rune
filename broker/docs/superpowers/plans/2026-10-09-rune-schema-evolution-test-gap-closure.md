@@ -1,6 +1,6 @@
 # Schema-Evolution Test Gap-Closure — Implementation Plan
 
-> Execute subagent-driven. Fresh implementer per task + review. Tests only (no production-logic changes except test-infra/docker wiring where noted). All work on the already-merged `feat/schema-evolution-durable-tags` worktrees under `/Users/vradu/Projects/se-worktrees/`.
+> Execute subagent-driven. Fresh implementer per task + review. Tests only (no production-logic changes except test-infra/docker wiring where noted). All work on the already-merged `feat/schema-evolution-durable-tags` worktrees under `~/Projects/se-worktrees/`.
 
 **Goal:** implement the highest-value `[GAP]` scenarios from `docs/superpowers/specs/2026-10-08-rune-schema-evolution-test-matrix.md` — especially **reading a log that mixes records written under different schema versions across a non-trivial evolution lineage**, plus binding, recovery, and compaction.
 
@@ -9,7 +9,7 @@
 ## Global Constraints
 - Tests only; do not change production schema logic. Test-infra/docker wiring may change (GC7).
 - Each test pins a concrete invariant; name regression-style (`*Regression*`) where it guards a rule. Run the repo's regression suite FIRST.
-- Build recipes: codec — conan `-r conancenter`, `cmake_layout` (`build/build/Release`), `rune_codec_tests`. broker — x86_64 cross (`-s arch=x86_64`, `-DRUNE_FR_DIR=/Users/vradu/Projects/rune-fr`, `build-fast`, targets `rune_node_tests`/`rune_schema_gateway_tests`/`rune_schema_persistence_tests`). client — x86_64 cross + `-DRUNE_CRYPTO_ROOT=/Users/vradu/Projects/rune-crypto` + openssl.
+- Build recipes: codec — conan `-r conancenter`, `cmake_layout` (`build/build/Release`), `rune_codec_tests`. broker — x86_64 cross (`-s arch=x86_64`, `-DRUNE_FR_DIR=~/Projects/rune-fr`, `build-fast`, targets `rune_node_tests`/`rune_schema_gateway_tests`/`rune_schema_persistence_tests`). client — x86_64 cross + `-DRUNE_CRYPTO_ROOT=~/Projects/rune-crypto` + openssl.
 - The durable invariant under test everywhere: a record decodes against ITS writer version; identity is `(topicId, tag)`, never name/position; tags never reused.
 
 ---

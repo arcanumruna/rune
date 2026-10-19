@@ -1,13 +1,13 @@
 # Brief: Kafka-faithful replica divergence handling (replaces DUR-1's heuristic layer)
 
-Worktree: /Users/vradu/Projects/rune-broker-wt31 (branch feat/dur-1, HEAD f153662) for the broker; rune-protocol
-changes in a NEW worktree you create: `git -C /Users/vradu/Projects/rune-protocol worktree add -b feat/fetch-epoch
-../rune-protocol-fe HEAD` and build the broker against it with -DRUNE_PROTOCOL_INCLUDE=/Users/vradu/Projects/rune-protocol-fe/include.
+Worktree: ~/Projects/rune-broker-wt31 (branch feat/dur-1, HEAD f153662) for the broker; rune-protocol
+changes in a NEW worktree you create: `git -C ~/Projects/rune-protocol worktree add -b feat/fetch-epoch
+../rune-protocol-fe HEAD` and build the broker against it with -DRUNE_PROTOCOL_INCLUDE=~/Projects/rune-protocol-fe/include.
 Commit locally; NEVER push; never run any conan package command (create/export/upload are forbidden). Do not
 spawn subagents. Configure a build-fast like the existing one in wt31.
 
 ## Why (read first)
-- /Users/vradu/.claude/jobs/303105aa/tmp/E-report.md — what DUR-1 built (audit, DR suite, fix round 1).
+- ~/.claude/jobs/303105aa/tmp/E-report.md — what DUR-1 built (audit, DR suite, fix round 1).
 - Two Opus reviews found that the heuristic layer added in b7d877f/f153662 (probe credit for ISR/HW, "wedged"/
   "diverged" follower flags, leader ADOPTION of a survivor's committed prefix across epochs, reconcile pulls at
   LEO-1 with byte-identical boundary matching) keeps producing correctness/liveness holes. Reproductions:
@@ -53,6 +53,6 @@ internals and the cleaner (scripts/check_no_atomics.py OK). Keep the DR suite (r
 its existing scenarios green; 30x repeat at the end. Full Mac suite green (every test binary the branch builds).
 Out of scope: the async-seal power-loss recovery point (E1d) — another agent does it; do not touch Log::recover.
 
-Report: /Users/vradu/.claude/jobs/303105aa/tmp/R-report.md (design as built, what was removed, RED->GREEN per
+Report: ~/.claude/jobs/303105aa/tmp/R-report.md (design as built, what was removed, RED->GREEN per
 review finding, protocol change, suite results, remaining E1b items). Return only: status, commit SHAs per repo,
 one-line test summary, concerns.

@@ -1,7 +1,7 @@
 # Review: rune-fr 5fe5464 — `rune_fr_c_now` returns 0 while disabled (A8)
 
 Reviewer: Claude (read-only).  Date: 2026-10-04.
-Branch: `diag/fr-shard-waterfall` in `/Users/vradu/Projects/rune-fr`.
+Branch: `diag/fr-shard-waterfall` in `~/Projects/rune-fr`.
 
 ## Verdict: APPROVE (0 CRITICAL, 0 MAJOR, 0 MEDIUM, 4 LOW)
 

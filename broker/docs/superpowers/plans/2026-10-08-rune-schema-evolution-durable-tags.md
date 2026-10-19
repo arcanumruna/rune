@@ -8,7 +8,7 @@
 
 **Tech Stack:** C++23, CMake, Conan 2, GoogleTest, Google Benchmark, Aeron, Docker. Five sibling repos.
 
-**Spec:** `/Users/vradu/Projects/rune-broker-matviews/docs/superpowers/specs/2026-10-08-rune-schema-evolution-durable-tags-design.md`
+**Spec:** `~/Projects/rune-broker-matviews/docs/superpowers/specs/2026-10-08-rune-schema-evolution-durable-tags-design.md`
 
 ## Global Constraints
 
@@ -21,7 +21,7 @@
 - **Golden fingerprint `0x8FC60841B8667539`** (rune-codec `FixedStrSerializeTest.cpp:28`) **must remain unchanged** for the existing v1 schema — any new absorbed bytes are appended and guarded so additive schemas' fingerprints are byte-stable.
 - **DDL is serialized** through the single AdminWorker thread (`DdlState` Idle/AwaitingId/AwaitingCommit, one op in-flight + `pending_` deque). ALTER carries an optional `expectedVersion` for optimistic CAS (mismatch ⇒ conflict reject).
 - **Sentinels:** `untilVersion = 0xFFFF` means ∞ (live). `expectedVersion = 0` / `requestedFingerprint = 0` mean "unspecified / latest".
-- **Repos & roots:** rune-codec `/Users/vradu/Projects/rune-codec`; rune-protocol `/Users/vradu/Projects/rune-protocol`; rune-broker `/Users/vradu/Projects/rune-broker-matviews`; rune-ql `/Users/vradu/Projects/rune-ql`; rune-client-cpp `/Users/vradu/Projects/rune-client-cpp`. Each repo's tests build the sibling rune-codec via its existing `RUNE_CODEC_ROOT`/sibling-source mechanism.
+- **Repos & roots:** rune-codec `~/Projects/rune-codec`; rune-protocol `~/Projects/rune-protocol`; rune-broker `~/Projects/rune-broker-matviews`; rune-ql `~/Projects/rune-ql`; rune-client-cpp `~/Projects/rune-client-cpp`. Each repo's tests build the sibling rune-codec via its existing `RUNE_CODEC_ROOT`/sibling-source mechanism.
 
 ## AlterOps wire encoding (shared contract — rune-codec is the single source of truth)
 
@@ -49,7 +49,7 @@ Input classes the spec implies but ordinary task tests might miss; each gets a t
 
 ---
 
-# rune-codec (`/Users/vradu/Projects/rune-codec`)
+# rune-codec (`~/Projects/rune-codec`)
 
 ### Task 1: Durable tags + `untilVersion` in the descriptor model
 
@@ -90,7 +90,7 @@ TEST(Descriptor, AddTaggedPreservesExplicitTagThroughBuild) {
   `cmake --build build --target rune_codec_tests && ctest --test-dir build -R Descriptor`
 - [ ] **Step 3: Implement.** Add `uint16_t untilVersion = 0xFFFF;` to `FieldDescriptor`. Add inline `isLiveAt`. Add `addTagged`/`addFixedStrTagged` that push a `FieldDescriptor` with the explicit `id = tag`. Refactor `build()` so the fixed/var offset passes stay, but it no longer overwrites `id` (the `add`/`addFixedStr` paths already set `id` before `build()`; make `build()` leave `id` as-is). Keep the additive-only invariant check.
 - [ ] **Step 4: Run — expect PASS.** Also run the full suite to confirm no regression of existing id-as-index assumptions: `ctest --test-dir build`.
-- [ ] **Step 5: Commit** — `git -C /Users/vradu/Projects/rune-codec add -A && git commit -m "feat(codec): durable field tags + untilVersion in descriptor model"`
+- [ ] **Step 5: Commit** — `git -C ~/Projects/rune-codec add -A && git commit -m "feat(codec): durable field tags + untilVersion in descriptor model"`
 
 ### Task 2: `materializeAsOf(descriptor, version)` — per-version offsets
 
@@ -302,7 +302,7 @@ TEST(Evolve, DropKeyFieldRejected) {
 
 ---
 
-# rune-protocol (`/Users/vradu/Projects/rune-protocol`)
+# rune-protocol (`~/Projects/rune-protocol`)
 
 ### Task 7: `AlterTopic`/`AlterTopicResponse` wire ops
 
@@ -318,7 +318,7 @@ TEST(Evolve, DropKeyFieldRejected) {
   `cmake -S . -B build -DBUILD_TESTING=ON && cmake --build build --target rune_protocol_tests && ctest --test-dir build -R 'Schema|Dispatch'`
 - [ ] **Step 3:** Add the enum values, the two structs, widen `isKnownTemplate` schema range upper bound to `AlterTopicResponse` (update the `// 64..67` comment to `64..69`).
 - [ ] **Step 4:** Run — expect PASS.
-- [ ] **Step 5: Commit** — `git -C /Users/vradu/Projects/rune-protocol add -A && git commit -m "feat(protocol): AlterTopic/AlterTopicResponse client wire ops"`
+- [ ] **Step 5: Commit** — `git -C ~/Projects/rune-protocol add -A && git commit -m "feat(protocol): AlterTopic/AlterTopicResponse client wire ops"`
 
 ### Task 8: Fingerprint-selecting `GetTopicSchema`
 
@@ -335,7 +335,7 @@ TEST(Evolve, DropKeyFieldRejected) {
 
 ---
 
-# rune-broker (`/Users/vradu/Projects/rune-broker-matviews`)
+# rune-broker (`~/Projects/rune-broker-matviews`)
 
 ### Task 9: Multi-version `SchemaRegistry` + per-topic tag allocator / compat mode
 
@@ -362,7 +362,7 @@ TEST(SchemaRegistry, KeepsMultipleVersionsAndLooksUpByFingerprint) {
 ```
 
 - [ ] **Step 2-4:** Run FAIL → implement multi-version storage + the new accessors + serialize the two new TopicSchema fields → run PASS. Keep single-writer, no atomics (admin-thread-owned).
-- [ ] **Step 5: Commit** — `git -C /Users/vradu/Projects/rune-broker-matviews add -A && git commit -m "feat(broker): multi-version SchemaRegistry + tag allocator + compat mode"`
+- [ ] **Step 5: Commit** — `git -C ~/Projects/rune-broker-matviews add -A && git commit -m "feat(broker): multi-version SchemaRegistry + tag allocator + compat mode"`
 
 ### Task 10: Un-hardcode schema version in the DefineTopic path
 
@@ -480,7 +480,7 @@ TEST(SchemaPersistence, ReplayReconstructsAllVersionsAndNextTag) {
 
 ---
 
-# rune-ql (`/Users/vradu/Projects/rune-ql`)
+# rune-ql (`~/Projects/rune-ql`)
 
 ### Task 16: `ALTER TOPIC` grammar + AST
 
@@ -518,7 +518,7 @@ TEST(Parser, ExistingTopicStatementStillParses) {
 ```
 
 - [ ] **Step 2-4:** Run FAIL → widen `parse()` return to the variant, add the `alter` statement parser (reuse `parseType` for ADD COLUMN; text-match `add`/`drop`/`rename`/`column`/`to`/`set`/`compatibility`/`backward`/`forward`; `,`-separated ops; `;` + EOF guard), update `Backends.cpp`/`tests` call sites for the new return type → run PASS.
-- [ ] **Step 5: Commit** — `git -C /Users/vradu/Projects/rune-ql add -A && git commit -m "feat(ql): ALTER TOPIC grammar + AST"`
+- [ ] **Step 5: Commit** — `git -C ~/Projects/rune-ql add -A && git commit -m "feat(ql): ALTER TOPIC grammar + AST"`
 
 ### Task 17: `AlterTopicPlan` backend (emit AlterOps blob)
 
@@ -535,7 +535,7 @@ TEST(Parser, ExistingTopicStatementStillParses) {
 
 ---
 
-# rune-client-cpp (`/Users/vradu/Projects/rune-client-cpp`)
+# rune-client-cpp (`~/Projects/rune-client-cpp`)
 
 ### Task 18: `Client::alterTopic*` + fingerprint-selecting `getTopicSchema`
 
@@ -548,7 +548,7 @@ TEST(Parser, ExistingTopicStatementStillParses) {
 
 - [ ] **Step 1:** Loopback test (mirror existing schema loopback): an `AlterTopic` frame is encoded and an injected `AlterTopicResponse` is surfaced as `AlterTopicResult`; `getTopicSchemaAndWait(name, fp)` sends the fingerprint.
 - [ ] **Step 2-4:** Run FAIL → add the methods + wire encode/decode → run PASS.
-- [ ] **Step 5: Commit** — `git -C /Users/vradu/Projects/rune-client-cpp add -A && git commit -m "feat(client): alterTopic + fingerprint-selecting getTopicSchema"`
+- [ ] **Step 5: Commit** — `git -C ~/Projects/rune-client-cpp add -A && git commit -m "feat(client): alterTopic + fingerprint-selecting getTopicSchema"`
 
 ### Task 19: Version-binding typed gate (`openTopic`/`TypedTopic` stamp bound version)
 
@@ -595,7 +595,7 @@ TEST(OpenTopicGate, StaleFingerprintStillThrows) {
 ### Task 21: Real-Aeron schema-evolution e2e
 
 **Files:**
-- Create: `/Users/vradu/Projects/rune-broker-matviews/docker/schema-evolution-e2e.sh` (model on `docker/schema-e2e.sh`), reuse `docker/docker-compose.single.yml` and the probe image from `../rune-client-cpp`
+- Create: `~/Projects/rune-broker-matviews/docker/schema-evolution-e2e.sh` (model on `docker/schema-e2e.sh`), reuse `docker/docker-compose.single.yml` and the probe image from `../rune-client-cpp`
 - Modify (if a new probe is needed): a probe that opens a topic with an older generated header
 
 **Interfaces:** full-stack, default config.

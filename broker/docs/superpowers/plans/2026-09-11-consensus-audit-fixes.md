@@ -48,7 +48,7 @@
 
 Run:
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 grep -rn "RaftNode\|RaftLog\|PersistentState\|Messages\.h" libs/consensus/src/ libs/consensus/include/ \
   --include="*.cpp" --include="*.h" \
   | grep -v "RaftNode\.\|RaftLog\.\|PersistentState\." \
@@ -67,7 +67,7 @@ If any production hit is found, STOP and reconcile before continuing.
 - [ ] **Step 2: Remove source and header files**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 rm libs/consensus/src/RaftNode.cpp \
    libs/consensus/src/RaftLog.cpp \
    libs/consensus/src/PersistentState.cpp \
@@ -117,7 +117,7 @@ add_executable(rune_consensus_tests
 - [ ] **Step 4: Reconfigure and build**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 if ! command -v cmake >/dev/null 2>&1; then CMAKE_BIN=$(dirname "$(find "$HOME/.conan2" -type f -name cmake -path '*/bin/*' 2>/dev/null | head -1)"); export PATH="$CMAKE_BIN:$PATH"; fi
 cmake -S . -B build
 cmake --build build -j2
@@ -127,14 +127,14 @@ Expected: build succeeds with no errors.
 - [ ] **Step 5: Run tests — verify 387 pass**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker/build && ctest --timeout 60 --output-on-failure 2>&1 | tail -5
+cd ~/Projects/rune-broker/build && ctest --timeout 60 --output-on-failure 2>&1 | tail -5
 ```
 Expected: all 387 tests pass. If count differs from 387, recount with `grep -c "^TEST\|^TEST_F" libs/consensus/tests/consensus/*.cpp`.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 git add -A
 git commit -m "refactor(consensus): remove dead vanilla-Raft duplicate (RaftNode/RaftLog/PersistentState) [audit C1]
 
@@ -215,7 +215,7 @@ TEST(NodeStateFile, FileSyncLevel1_FreshInit_DurableNullValue) {
 - [ ] **Step 2: Run tests to verify they fail (or pass trivially — if so, note)**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker/build && ctest -R NodeStateFile --timeout 60 --output-on-failure 2>&1 | tail -20
+cd ~/Projects/rune-broker/build && ctest -R NodeStateFile --timeout 60 --output-on-failure 2>&1 | tail -20
 ```
 Note: the reopen tests may pass even with fileSyncLevel=0 in a test environment (OS flushes dirty pages on close). That is expected — the tests document the intent and exercise the code path. The safety guarantee is about crash-survival which cannot be unit-tested without crash injection.
 
@@ -261,7 +261,7 @@ void NodeStateFile::syncFile() const {
 - [ ] **Step 5: Build and run NodeStateFile tests**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker && cmake --build build -j2 && \
+cd ~/Projects/rune-broker && cmake --build build -j2 && \
   cd build && ctest -R NodeStateFile --timeout 60 --output-on-failure
 ```
 Expected: all NodeStateFile tests pass (now 27 tests: 25 original + 2 new).
@@ -271,7 +271,7 @@ Expected: all NodeStateFile tests pass (now 27 tests: 25 original + 2 new).
 Existing Election tests construct `NodeStateFile nsf(path)` with no second arg. They now get `fileSyncLevel=1`. The fsync overhead is ~microseconds in tests — verify no timeout failures:
 
 ```bash
-cd /Users/vradu/Projects/rune-broker/build && ctest --timeout 60 --output-on-failure 2>&1 | tail -5
+cd ~/Projects/rune-broker/build && ctest --timeout 60 --output-on-failure 2>&1 | tail -5
 ctest -j4 --timeout 60 2>&1 | tail -2
 ```
 Expected: all 389 tests pass (387 + 2 new) seq and parallel.
@@ -279,7 +279,7 @@ Expected: all 389 tests pass (387 + 2 new) seq and parallel.
 - [ ] **Step 7: Commit**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 git add libs/consensus/include/rune/consensus/NodeStateFile.h \
         libs/consensus/src/NodeStateFile.cpp \
         libs/consensus/tests/consensus/NodeStateFileTest.cpp
@@ -416,7 +416,7 @@ TEST(ElectionLog, NLT_LeaderLogBehindFollower_IsIgnored) {
 - [ ] **Step 2: Build and run to verify the new tests FAIL**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker && cmake --build build -j2 && \
+cd ~/Projects/rune-broker && cmake --build build -j2 && \
   cd build && ctest -R ElectionLog --timeout 60 --output-on-failure 2>&1 | grep -E "FAILED|PASSED|LC1|LC2|NLT_Unvoted|NLT_Leader"
 ```
 Expected: `NLT_UnvotedTerm_IsIgnored` and `NLT_LeaderLogBehindFollower_IsIgnored` FAIL (currently the code accepts both).
@@ -495,7 +495,7 @@ Note: also remove/update the `(void)` suppressions at the bottom to match the ne
 - [ ] **Step 4: Build and run the new LC1/LC2 tests — verify they PASS**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker && cmake --build build -j2 && \
+cd ~/Projects/rune-broker && cmake --build build -j2 && \
   cd build && ctest -R "NLT_Unvoted|NLT_Leader" --timeout 60 --output-on-failure
 ```
 Expected: both PASS.
@@ -503,7 +503,7 @@ Expected: both PASS.
 - [ ] **Step 5: Run full suite — verify all 391 pass**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker/build && ctest --timeout 60 --output-on-failure 2>&1 | tail -5
+cd ~/Projects/rune-broker/build && ctest --timeout 60 --output-on-failure 2>&1 | tail -5
 ctest -j4 --timeout 60 2>&1 | tail -2
 ```
 Expected: 391 tests pass (389 + 2 new LC tests).
@@ -513,7 +513,7 @@ Expected: 391 tests pass (389 + 2 new LC tests).
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 git add libs/consensus/src/Election.cpp \
         libs/consensus/tests/consensus/ElectionLogTest.cpp
 git commit -m "fix(consensus): validate NLT candidateTermId and leader log freshness [audit B2]
@@ -585,7 +585,7 @@ TEST(ClusterMember, HasQuorumAtPosition_DifferentLogBranch_NotCounted) {
 - [ ] **Step 2: Verify test fails to compile (new parameter not yet added)**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker && cmake --build build -j2 2>&1 | grep -i "error\|hasQuorumAtPosition" | head -10
+cd ~/Projects/rune-broker && cmake --build build -j2 2>&1 | grep -i "error\|hasQuorumAtPosition" | head -10
 ```
 Expected: compile error — `hasQuorumAtPosition` does not have a `logLeadershipTermId` parameter yet.
 
@@ -637,7 +637,7 @@ Replace `hasQuorumAtPosition` (lines ~176-190):
 Search for `hasQuorumAtPosition` in `libs/consensus/src/Election.cpp`:
 
 ```bash
-grep -n "hasQuorumAtPosition" /Users/vradu/Projects/rune-broker/libs/consensus/src/Election.cpp
+grep -n "hasQuorumAtPosition" ~/Projects/rune-broker/libs/consensus/src/Election.cpp
 ```
 
 For each call site, add `logLeadershipTermId_` as the second argument (after `leadershipTermId_`). Example — in `leaderReady()`:
@@ -658,8 +658,8 @@ Apply the same pattern to any other call sites found.
 - [ ] **Step 5: Check for hasReachedPosition call sites outside ClusterMember.h**
 
 ```bash
-grep -n "hasReachedPosition" /Users/vradu/Projects/rune-broker/libs/consensus/src/*.cpp \
-  /Users/vradu/Projects/rune-broker/libs/consensus/tests/**/*.cpp 2>/dev/null
+grep -n "hasReachedPosition" ~/Projects/rune-broker/libs/consensus/src/*.cpp \
+  ~/Projects/rune-broker/libs/consensus/tests/**/*.cpp 2>/dev/null
 ```
 
 Update any direct call sites to pass the new `logLtId` parameter.
@@ -667,7 +667,7 @@ Update any direct call sites to pass the new `logLtId` parameter.
 - [ ] **Step 6: Build and run ClusterMember + full suite**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker && cmake --build build -j2 && \
+cd ~/Projects/rune-broker && cmake --build build -j2 && \
   cd build && ctest -R ClusterMember --timeout 60 --output-on-failure && \
   ctest --timeout 60 2>&1 | tail -5
 ```
@@ -676,7 +676,7 @@ Expected: new C6 test passes; all other tests pass (392 total).
 - [ ] **Step 7: Commit**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 git add libs/consensus/include/rune/consensus/ClusterMember.h \
         libs/consensus/src/Election.cpp \
         libs/consensus/tests/consensus/ClusterMemberTest.cpp
@@ -755,7 +755,7 @@ int Election::followerReplay(int64_t nowNs)
 - [ ] **Step 3: Build and run full suite — verify assertions don't fire**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker && cmake --build build -j2 && \
+cd ~/Projects/rune-broker && cmake --build build -j2 && \
   cd build && ctest --timeout 60 --output-on-failure 2>&1 | tail -5
 ```
 Expected: all 392 tests pass (assertions should not fire since all tests start with position 0).
@@ -763,7 +763,7 @@ Expected: all 392 tests pass (assertions should not fire since all tests start w
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 git add libs/consensus/src/Election.cpp
 git commit -m "fix(consensus): guard Phase-2 Archive pass-throughs with precondition assertions [audit C5]
 
@@ -963,7 +963,7 @@ TEST(ElectionLog, OnAppendPosition_FromSelf_Processed) {
 - [ ] **Step 5: Build and run all new tests**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker && cmake --build build -j2 && \
+cd ~/Projects/rune-broker && cmake --build build -j2 && \
   cd build && ctest -R "ClusterMember|ElectionBallot|ElectionLog" --timeout 60 --output-on-failure 2>&1 | tail -20
 ```
 Expected: all new tests pass.
@@ -971,7 +971,7 @@ Expected: all new tests pass.
 - [ ] **Step 6: Run full suite**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker/build && ctest --timeout 60 --output-on-failure 2>&1 | tail -5
+cd ~/Projects/rune-broker/build && ctest --timeout 60 --output-on-failure 2>&1 | tail -5
 ctest -j4 --timeout 60 2>&1 | tail -2
 ```
 Expected: all ~398 tests pass (392 + 6 new: 2 ClusterMember + 1 ElectionBallot + 3 ElectionLog).
@@ -979,7 +979,7 @@ Expected: all ~398 tests pass (392 + 6 new: 2 ClusterMember + 1 ElectionBallot +
 - [ ] **Step 7: Commit**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 git add libs/consensus/tests/consensus/ClusterMemberTest.cpp \
         libs/consensus/tests/consensus/ElectionBallotTest.cpp \
         libs/consensus/tests/consensus/ElectionLogTest.cpp
@@ -1008,7 +1008,7 @@ These tests would have caught B2 before it was committed."
 - [ ] **Step 1: Final build and sequential test run**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 if ! command -v cmake >/dev/null 2>&1; then CMAKE_BIN=$(dirname "$(find "$HOME/.conan2" -type f -name cmake -path '*/bin/*' 2>/dev/null | head -1)"); export PATH="$CMAKE_BIN:$PATH"; fi
 cmake --build build -j2
 cd build && ctest --timeout 60 --output-on-failure 2>&1 | tail -5
@@ -1018,7 +1018,7 @@ Expected: all tests pass, no failures.
 - [ ] **Step 2: Parallel test run**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker/build && ctest -j4 --timeout 60 2>&1 | tail -2
+cd ~/Projects/rune-broker/build && ctest -j4 --timeout 60 2>&1 | tail -2
 ```
 Expected: same result as sequential.
 
@@ -1028,36 +1028,36 @@ Run the following checks and confirm each:
 
 ```bash
 # B1: default fileSyncLevel is now 1
-grep "fileSyncLevel = 1" /Users/vradu/Projects/rune-broker/libs/consensus/include/rune/consensus/NodeStateFile.h
+grep "fileSyncLevel = 1" ~/Projects/rune-broker/libs/consensus/include/rune/consensus/NodeStateFile.h
 
 # B1+S3: syncFile now calls fsync and checks msync return
-grep -A 10 "void NodeStateFile::syncFile" /Users/vradu/Projects/rune-broker/libs/consensus/src/NodeStateFile.cpp
+grep -A 10 "void NodeStateFile::syncFile" ~/Projects/rune-broker/libs/consensus/src/NodeStateFile.cpp
 
 # B2: candidateTermId gate and log-freshness check in onNewLeadershipTerm
-grep -n "candidateTermId_\|compareLog" /Users/vradu/Projects/rune-broker/libs/consensus/src/Election.cpp | grep -A2 "B2\|nextLeadershipTermId"
+grep -n "candidateTermId_\|compareLog" ~/Projects/rune-broker/libs/consensus/src/Election.cpp | grep -A2 "B2\|nextLeadershipTermId"
 
 # C1: RaftNode files gone
-ls /Users/vradu/Projects/rune-broker/libs/consensus/src/RaftNode.cpp 2>&1
+ls ~/Projects/rune-broker/libs/consensus/src/RaftNode.cpp 2>&1
 
 # C2: compareLog boundary test exists
-grep "SameTerm_ShorterCandidate" /Users/vradu/Projects/rune-broker/libs/consensus/tests/consensus/ClusterMemberTest.cpp
+grep "SameTerm_ShorterCandidate" ~/Projects/rune-broker/libs/consensus/tests/consensus/ClusterMemberTest.cpp
 
 # C5: assert guards in pass-throughs
-grep "PHASE-2-ARCHIVE-DEFERRED\|assert" /Users/vradu/Projects/rune-broker/libs/consensus/src/Election.cpp | head -10
+grep "PHASE-2-ARCHIVE-DEFERRED\|assert" ~/Projects/rune-broker/libs/consensus/src/Election.cpp | head -10
 
 # C6: logLeadershipTermId in hasReachedPosition
-grep "logLeadershipTermId" /Users/vradu/Projects/rune-broker/libs/consensus/include/rune/consensus/ClusterMember.h | head -5
+grep "logLeadershipTermId" ~/Projects/rune-broker/libs/consensus/include/rune/consensus/ClusterMember.h | head -5
 
 # New Leader-Completeness tests exist
 grep "NLT_UnvotedTerm\|NLT_LeaderLog\|FollowerBehind_Does\|DifferentLogBranch" \
-  /Users/vradu/Projects/rune-broker/libs/consensus/tests/consensus/ElectionLogTest.cpp \
-  /Users/vradu/Projects/rune-broker/libs/consensus/tests/consensus/ClusterMemberTest.cpp
+  ~/Projects/rune-broker/libs/consensus/tests/consensus/ElectionLogTest.cpp \
+  ~/Projects/rune-broker/libs/consensus/tests/consensus/ClusterMemberTest.cpp
 ```
 
 - [ ] **Step 4: Count new test total**
 
 ```bash
-grep -c "^TEST\|^TEST_F" /Users/vradu/Projects/rune-broker/libs/consensus/tests/consensus/*.cpp | \
+grep -c "^TEST\|^TEST_F" ~/Projects/rune-broker/libs/consensus/tests/consensus/*.cpp | \
   awk -F: '{sum += $2} END {print "Total tests:", sum}'
 ```
 
@@ -1066,14 +1066,14 @@ grep -c "^TEST\|^TEST_F" /Users/vradu/Projects/rune-broker/libs/consensus/tests/
 The user requires a specific commit message. Since all prior tasks already committed incrementally, create a final tag/summary commit:
 
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 git log --oneline -8
 ```
 
 Verify the commit history shows the 6 task commits. If the user wants a single squashed commit, rebase the last 6 commits interactively — but since the instructions say "do not amend" and squashing was not requested, leave the incremental commits as-is. The final commit (if any code remains unstaged) is:
 
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 git add -A
 # Only run if there are staged changes (check git status first)
 git diff --cached --stat | head -5

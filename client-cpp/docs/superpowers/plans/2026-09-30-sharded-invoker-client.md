@@ -8,7 +8,7 @@
 
 **Tech Stack:** C++23, CMake ≥ 3.31 + Conan 2 (x86_64 Debug/Release toolchains already generated under `build/build/Debug/generators` and `build_release/build/Release/generators`), Aeron 1.41.4 (C media driver `aeronmd` + C++ client), GoogleTest, rune-protocol (sibling headers), rune-fr (sibling static lib).
 
-**Spec:** /Users/vradu/Projects/rune-broker/docs/superpowers/specs/2026-09-30-self-contained-worker-shards-design.md
+**Spec:** ~/Projects/rune-broker/docs/superpowers/specs/2026-09-30-self-contained-worker-shards-design.md
 
 ## Global Constraints
 
@@ -32,7 +32,7 @@
 - The default mode must pass every pre-existing test after every task. Test names that pin a fix contain `Regression` so `ctest -R Regression` / `--gtest_filter='*Regression*'` runs them as a suite; run that suite first, then the full suite.
 - Build/test dirs used by this plan (created in Task 1, both gitignored by `/cmake-build-*/`): tests `cmake-build-sic` (Debug, x86_64, `BUILD_TESTING=ON`, `BUILD_EXAMPLES=ON`; baseline 292 tests, 100% pass); examples/bench `cmake-build-sic-rel` (Release, `BUILD_EXAMPLES=ON`, `BUILD_BENCHMARKS=ON`, `BUILD_TESTING=OFF`). The old `build/` dir's `all` target is broken by the codegen bug fixed in Task 1 and holds stale binaries — do not use it.
 - Never `conan create/export/upload`. Never push. Commit only on branch `feat/sharded-invoker-client`. Never commit the stashed `RUNE_RETARGET_DBG` diff (Task 1 stashes it).
-- Session protocol (repo CLAUDE.md §5): after each task's full-suite run push the counts ctest printed: `/Users/vradu/Projects/rune-broker/scripts/rune-live.sh test "rune-client/sharded-invoker" passed passed=$PASSED failed=$FAILED total=$TOTAL commit=$(git rev-parse --short HEAD)` (status `failed` when `$FAILED` > 0).
+- Session protocol (repo CLAUDE.md §5): after each task's full-suite run push the counts ctest printed: `~/Projects/rune-broker/scripts/rune-live.sh test "rune-client/sharded-invoker" passed passed=$PASSED failed=$FAILED total=$TOTAL commit=$(git rev-parse --short HEAD)` (status `failed` when `$FAILED` > 0).
 
 ## Review Focus
 
@@ -91,7 +91,7 @@
 - [ ] **Step 1: Park the unrelated debug diff**
 
 ```bash
-cd /Users/vradu/Projects/rune-client-cpp
+cd ~/Projects/rune-client-cpp
 git status --short
 # Expected:
 #  M examples/rune_produce_throughput.cpp
@@ -108,7 +108,7 @@ git switch -c feat/sharded-invoker-client
 `BUILD_EXAMPLES=ON` breaks `cmake --build` of the `all` target today: the custom command runs a bare `rune_codec_gen` that is not on `PATH`.
 
 ```bash
-cd /Users/vradu/Projects/rune-client-cpp
+cd ~/Projects/rune-client-cpp
 G=$PWD/build/build/Debug/generators
 cmake -S . -B cmake-build-sic-rel -DCMAKE_BUILD_TYPE=Release -DBUILD_EXAMPLES=ON -DBUILD_BENCHMARKS=ON -DBUILD_TESTING=OFF \
   -DCMAKE_TOOLCHAIN_FILE=$PWD/build_release/build/Release/generators/conan_toolchain.cmake \
@@ -132,7 +132,7 @@ with
 - [ ] **Step 4: Build examples and the tests dir; record the baseline**
 
 ```bash
-cd /Users/vradu/Projects/rune-client-cpp
+cd ~/Projects/rune-client-cpp
 cmake --build cmake-build-sic-rel -j8 --target generate_characters_header rune_produce_throughput rune_producer_accum_bench 2>&1 | tail -3
 G=$PWD/build/build/Debug/generators
 cmake -S . -B cmake-build-sic -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON -DBUILD_EXAMPLES=ON \
@@ -145,7 +145,7 @@ Expected: `generate_characters_header` and `rune_produce_throughput` build (`[10
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /Users/vradu/Projects/rune-client-cpp
+cd ~/Projects/rune-client-cpp
 git add examples/rune_produce_throughput.cpp CMakeLists.txt
 git commit -m "bench(client): backoff window wait + fix characters.gen.h codegen command
 
@@ -281,7 +281,7 @@ Expected: PASS (`[  PASSED  ] 1 test.` then all transport tests pass).
 - [ ] **Step 7: Full suite, then commit**
 
 ```bash
-cd /Users/vradu/Projects/rune-client-cpp
+cd ~/Projects/rune-client-cpp
 cmake --build cmake-build-sic -j8 && ctest --test-dir cmake-build-sic -R Regression --output-on-failure && ctest --test-dir cmake-build-sic -j4 --timeout 300 2>&1 | tail -3
 git add include/rune/client/transport/AeronTransport.h src/transport/AeronTransport.cpp tests/transport/AeronTransportTest.cpp
 git commit -m "fix(transport): drive the embedded driver from exactly one thread
@@ -645,7 +645,7 @@ Update the constructor initializer `agent_(makeAgentConfig(cfg_))` (`:84`) to `a
 A driver-default change must be proven on every real-driver test, not only the config tests.
 
 ```bash
-cd /Users/vradu/Projects/rune-client-cpp
+cd ~/Projects/rune-client-cpp
 cmake --build cmake-build-sic -j8
 ./cmake-build-sic/rune_transport_tests
 ctest --test-dir cmake-build-sic -R Regression --output-on-failure
@@ -1934,7 +1934,7 @@ In `bench/ProducerAccumBench.cpp` replace the atomic counters and the 3-argument
 (`ProducerImpl::SendFn` does not exist yet — for this step spell the type out as `std::function<bool(int32_t, int32_t, int32_t, const uint8_t*, std::size_t)>` and add `#include <functional>`; Step 5 switches it to the alias.)
 
 ```bash
-cd /Users/vradu/Projects/rune-client-cpp
+cd ~/Projects/rune-client-cpp
 cmake --build cmake-build-sic-rel --target rune_producer_accum_bench -j8
 cp cmake-build-sic-rel/rune_producer_accum_bench /tmp/accum_A
 for i in 1 2 3; do ACCUM_RECORDS=5000000 ACCUM_PARTITIONS=64 RUNE_LINGER_US=0 RUNE_BATCH_BYTES=16384 /tmp/accum_A | grep RESULT; done
@@ -6366,7 +6366,7 @@ Shared interface with the broker plan (FIXED): per-partition `ingressEndpoint` =
 
 - [ ] **Step 1: Verify the protocol field has landed (dependency gate)**
 
-Run: `grep -n "ingressEndpoint" /Users/vradu/Projects/rune-protocol/include/rune/protocol/client/MetadataMessages.h`
+Run: `grep -n "ingressEndpoint" ~/Projects/rune-protocol/include/rune/protocol/client/MetadataMessages.h`
 Expected: lines showing `ingressEndpoint` as a member of `struct PartitionEntry` and in `MetadataResponse::encode`/`decode`/`encodedSize`. **If there is no output: STOP this task** — record "Task 16 blocked: rune-protocol MetadataResponse.ingressEndpoint (broker plan) not landed" in the task tracker, leave the checkboxes open, and continue with Task 17; resume here when the field exists. Do not add the field from this plan (the broker plan owns the schema change).
 
 - [ ] **Step 2: Write the failing tests**
@@ -7786,12 +7786,12 @@ and prepend to the header comment: `//   With arguments: invoker-shard open-loop
 - [ ] **Step 5: Build, then a real end-to-end smoke against the local broker (default AND invoker)**
 
 ```bash
-cd /Users/vradu/Projects/rune-client-cpp
+cd ~/Projects/rune-client-cpp
 cmake --build cmake-build-sic-rel --target rune_produce_throughput -j8
 rm -rf /tmp/sic-broker /tmp/sic-client-a /tmp/sic-client-b && mkdir -p /tmp/sic-broker
 RUNE_NODE_ID=0 RUNE_PEERS="0@127.0.0.1:40111:40200:40222" RUNE_CLIENT_ENDPOINT="127.0.0.1:40200" \
 RUNE_DATA_DIR=/tmp/sic-broker RUNE_TOPICS="bench:8" RUNE_WORKERS=2 RUNE_PER_WORKER_INGRESS=true \
-RUNE_LOG_LEVEL=warn /Users/vradu/Projects/rune-broker/build-release/rune_broker > /tmp/sic-broker.log 2>&1 &
+RUNE_LOG_LEVEL=warn ~/Projects/rune-broker/build-release/rune_broker > /tmp/sic-broker.log 2>&1 &
 BROKER=$!
 for i in $(seq 1 80); do grep -q "is LEADER" /tmp/sic-broker.log && break; sleep 0.25; done
 # (a) default configuration: legacy env path, thread-mode client
@@ -7841,7 +7841,7 @@ Spec §6: "Unit/regression … In-process integration … Dockerized DR matrix w
 - [ ] **Step 1: Local — regression suite first, then everything, then TSan**
 
 ```bash
-cd /Users/vradu/Projects/rune-client-cpp
+cd ~/Projects/rune-client-cpp
 cmake --build cmake-build-sic -j8
 ctest --test-dir cmake-build-sic -R Regression --output-on-failure
 ctest --test-dir cmake-build-sic -j4 --timeout 300 --output-on-failure 2>&1 | tail -5
@@ -7849,7 +7849,7 @@ cmake --build cmake-build-sic-tsan -j8
 ctest --test-dir cmake-build-sic-tsan -R Regression --output-on-failure
 ctest --test-dir cmake-build-sic-tsan -j2 --timeout 600 2>&1 | tail -5
 grep -c "WARNING: ThreadSanitizer" cmake-build-sic-tsan/Testing/Temporary/LastTest.log
-/Users/vradu/Projects/rune-broker/scripts/rune-live.sh test "rune-client/sharded-invoker" passed \
+~/Projects/rune-broker/scripts/rune-live.sh test "rune-client/sharded-invoker" passed \
   passed=$(ctest --test-dir cmake-build-sic -N | awk '/Total Tests/{print $3}') failed=0 \
   total=$(ctest --test-dir cmake-build-sic -N | awk '/Total Tests/{print $3}') commit=$(git rev-parse --short HEAD)
 ```
@@ -7858,7 +7858,7 @@ Expected: `100% tests passed` in both dirs (the 292 baseline tests plus the new 
 - [ ] **Step 2: Sync to the VM (needs the user's approval: rsync to a public IP) and build + test on Linux**
 
 ```bash
-cd /Users/vradu/Projects
+cd ~/Projects
 RS="--exclude=.git --exclude=build --exclude=build-fast --exclude=build-release --exclude=build_release \
     --exclude=build_tsan --exclude=cmake-build-* --exclude=CMakeFiles --exclude=.sdd --exclude=docs"
 for r in rune-protocol rune-fr rune-codec rune-ql rune-client-cpp; do
@@ -7958,14 +7958,14 @@ Expected: every `default:` line shows `succeeded=300000 failed=0`; every `invoke
 The dockerized DR matrix lives in `rune-broker/dr-e2e` and drives `dr_client`. With the broker plan's shard mode on, rebuild its client image from this branch (tag it with this commit's SHA, never `latest`), run the full matrix per the broker plan's DR step, and require it green in both `RUNE_WORKER_MODE=legacy` and `shard` before flipping any default (spec §7).
 
 ```bash
-cd /Users/vradu/Projects/rune-client-cpp && git rev-parse --short HEAD   # image tag for dr_client
+cd ~/Projects/rune-client-cpp && git rev-parse --short HEAD   # image tag for dr_client
 ```
 Expected: the broker plan's DR matrix reports all scenarios passed with the client image `rune-client:<sha>`.
 
 - [ ] **Step 6: Interleaved A/B of the default path (main vs branch), n = 15**
 
 ```bash
-cd /Users/vradu/Projects/rune-client-cpp
+cd ~/Projects/rune-client-cpp
 git worktree add /tmp/sic-main main
 rsync -az --exclude=.git /tmp/sic-main/ root@$RUNE_VM_HOST:/root/rune-e5/rune-client-cpp-main/
 git worktree remove /tmp/sic-main
@@ -8001,7 +8001,7 @@ rune_stop_cluster
 ```
 
 ```bash
-/Users/vradu/Projects/rune-client-cpp/cmake-build-sic-rel/rune_produce_throughput --idle-check-only --idle-check-cores 0,1,2,3 || echo "local check n/a"
+~/Projects/rune-client-cpp/cmake-build-sic-rel/rune_produce_throughput --idle-check-only --idle-check-cores 0,1,2,3 || echo "local check n/a"
 scp /tmp/sic-ab.sh root@$RUNE_VM_HOST:/root/rune-e5/sic-ab.sh
 ssh root@$RUNE_VM_HOST 'bash /root/rune-e5/rune-broker/bench/kafka-compare/vm-clean.sh && /root/rune-e5/rune-client-cpp/build/Release/build/Release/rune_produce_throughput --idle-check-only --idle-check-cores 0,1,2,3 && bash /root/rune-e5/sic-ab.sh' | tee /tmp/sic-ab.out
 grep -c "RUN FAILED" /tmp/sic-ab.out
@@ -8010,8 +8010,8 @@ Expected: `IDLE_CHECK ... -> PASS` first (else stop: the box is not idle — fin
 
 ```bash
 AB_STATUS=$( [ "$(grep -c '^[0-9]* [AB] RESULT' /tmp/sic-ab.out)" = 30 ] && echo passed || echo failed )
-/Users/vradu/Projects/rune-broker/scripts/rune-live.sh test "rune-client/sharded-invoker-ab" "$AB_STATUS" \
-  runs=30 commit=$(git -C /Users/vradu/Projects/rune-client-cpp rev-parse --short HEAD)
+~/Projects/rune-broker/scripts/rune-live.sh test "rune-client/sharded-invoker-ab" "$AB_STATUS" \
+  runs=30 commit=$(git -C ~/Projects/rune-client-cpp rev-parse --short HEAD)
 ```
 
 - [ ] **Step 7: Spec §1 pass criterion (needs the broker plan's shard mode + fused runtime)**
@@ -8039,14 +8039,14 @@ Expected: `IDLE_CHECK ... -> PASS`, `THREAD shard=0 core=0 ...`, `RESULT mode=op
 
 ```bash
 PASS_STATUS=$(grep -q "GATE .* -> PASS" /tmp/sic-pass.out && echo passed || echo failed)
-/Users/vradu/Projects/rune-broker/scripts/rune-live.sh test "rune-client/pass-criterion" "$PASS_STATUS" \
-  commit=$(git -C /Users/vradu/Projects/rune-client-cpp rev-parse --short HEAD)
+~/Projects/rune-broker/scripts/rune-live.sh test "rune-client/pass-criterion" "$PASS_STATUS" \
+  commit=$(git -C ~/Projects/rune-client-cpp rev-parse --short HEAD)
 ```
 
 - [ ] **Step 8: Close out**
 
 ```bash
-cd /Users/vradu/Projects/rune-client-cpp
+cd ~/Projects/rune-client-cpp
 git status --short             # clean except the untracked conan_provider.cmake
 git log --oneline main..HEAD   # one commit per task
 git stash list                 # the parked RUNE_RETARGET_DBG stash is still there

@@ -1,0 +1,14 @@
+# build trees and tool caches
+build*/
+.cache/
+.superpowers/
+.auth-e2e-work/
+docker/secrets/*.key
+**/docker/secrets/*.key
+CMakeUserPresets.json
+compile_commands.json
+Testing/
+*.log
+.DS_Store
+.idea/
+.vscode/

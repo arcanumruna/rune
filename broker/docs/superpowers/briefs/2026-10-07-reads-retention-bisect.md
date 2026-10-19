@@ -116,7 +116,7 @@ Note on the coordinator's mid-task request for a binary search: the linear sweep
 
 ```bash
 # source per SHA (local)
-git -C /Users/vradu/Projects/rune-broker-wt26 archive <sha> | ssh root@$RUNE_VM_HOST 'mkdir -p /root/e3g/bisect/<sha>/src && tar -x -C /root/e3g/bisect/<sha>/src'
+git -C ~/Projects/rune-broker-wt26 archive <sha> | ssh root@$RUNE_VM_HOST 'mkdir -p /root/e3g/bisect/<sha>/src && tar -x -C /root/e3g/bisect/<sha>/src'
 
 # /root/e3g/bisect/build.sh <sha>...   (under flock -w 7200 /root/vm.lock)
 docker run --rm -v $d/src:/src:ro -v $d/build:/work rune-latgate-builder:dc274e8 bash -c "cmake -S /src -B /work/build -G Ninja \

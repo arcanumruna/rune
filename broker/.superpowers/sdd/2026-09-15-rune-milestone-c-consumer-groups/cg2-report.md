@@ -129,7 +129,7 @@ Single-node leader (minIsr=1, ISR={self}) — HW advances immediately after each
 
 ```bash
 export PATH="/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/bin:$PATH"
-cd /Users/vradu/Projects/rune-broker/build
+cd ~/Projects/rune-broker/build
 cmake . -DBUILD_TESTING=ON
 cmake --build . --target rune_coordination_tests rune_offset_replication_tests -j4
 ./libs/coordination/rune_coordination_tests
@@ -216,7 +216,7 @@ defers it to the DR-9 M1 zero-copy card.
 
 ```bash
 export PATH="/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/bin:$PATH"
-cd /Users/vradu/Projects/rune-broker/build
+cd ~/Projects/rune-broker/build
 cmake --build . --target rune_coordination_tests rune_offset_replication_tests rune_replication_tests -j4
 ./libs/coordination/rune_coordination_tests
 ./libs/node/rune_offset_replication_tests

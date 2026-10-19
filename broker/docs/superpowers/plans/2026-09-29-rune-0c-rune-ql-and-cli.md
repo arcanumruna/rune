@@ -8,7 +8,7 @@
 
 **Tech Stack:** C++23, CMake ≥3.25, Conan 2, GoogleTest, Google Benchmark. Repos: `rune-codec` (extended), new `rune-ql`, `rune-client-cpp` (CLI). rune-broker/rune-protocol unchanged.
 
-**Spec:** `/Users/vradu/Projects/rune-broker-matviews/docs/superpowers/specs/2026-09-29-rune-0c-rune-ql-and-cli-design.md`
+**Spec:** `~/Projects/rune-broker-matviews/docs/superpowers/specs/2026-09-29-rune-0c-rune-ql-and-cli-design.md`
 
 ## Global Constraints
 
@@ -20,7 +20,7 @@
 - **No query/plan-IR/ALTER/enum-syntax in 0c** (create-topic only, single version).
 - **rune-codec public API (existing, from 0a/0b):** `DescriptorBuilder(name,version).add(name,PrimType,sinceVersion,isKey,enumValues).build()`; `serialize`/`deserialize`/`toText`/`fingerprint`; `Validator`; `readField`; `generateHeader`. `PrimType{Int32,Int64,UInt16,UInt32,UInt64,Float64,Bool,Enum,String,Bytes}` (FixedStr appended by this plan). Record framing `[blockLength:u16][version:u16][fixed block][var tail]` LE.
 - **0b client API (on main):** `Client::defineTopic(name,partitions,keyField,validate,blob)→future<DefineTopicResult>`, `getTopicSchema(name)→future<TopicSchemaResult{topicId,version,descriptorBlob,errorCode}>`, `openTopic<T>`. `rune_schema_gen` in rune-client-cpp/tools.
-- **Toolchains (NOT on PATH):** rune-codec/rune-ql cmake `/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/bin/cmake` (native arm64); rune-client-cpp via Conan 2 x86_64 cross flow (`conan install . --build=missing -s arch=x86_64` + `-DCMAKE_OSX_ARCHITECTURES=x86_64` + generated toolchain; pass `-DRUNE_CODEC_ROOT=/Users/vradu/Projects/rune-codec -DRUNE_QL_ROOT=/Users/vradu/Projects/rune-ql -DRUNE_PROTOCOL_INCLUDE=/Users/vradu/Projects/rune-protocol/include`). Docker for the e2e.
+- **Toolchains (NOT on PATH):** rune-codec/rune-ql cmake `/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/bin/cmake` (native arm64); rune-client-cpp via Conan 2 x86_64 cross flow (`conan install . --build=missing -s arch=x86_64` + `-DCMAKE_OSX_ARCHITECTURES=x86_64` + generated toolchain; pass `-DRUNE_CODEC_ROOT=~/Projects/rune-codec -DRUNE_QL_ROOT=~/Projects/rune-ql -DRUNE_PROTOCOL_INCLUDE=~/Projects/rune-protocol/include`). Docker for the e2e.
 - **Worktrees (SDD setup):** rune-codec + rune-client-cpp get a `feature/0c-rune-ql` worktree off `main`; rune-ql is a brand-new repo (`git init`, first task). Consumers point `RUNE_CODEC_ROOT`/`RUNE_QL_ROOT` at the right paths.
 
 ---
@@ -29,7 +29,7 @@
 
 **rune-codec (extended):** `include/rune/codec/PrimType.h` (+FixedStr), `include/rune/codec/Descriptor.h` (+`fixedLen`, `addFixedStr`, `fieldWidth`, build layout), `src/Serialize.cpp` (+fixedLen ser/deser/toText), `include/rune/codec/Fingerprint.h` (+fixedLen), `src/Record.cpp` (+FixedStr read), `src/Validator.cpp` (+FixedStr entry/bounds), `src/Generator.cpp` (+FixedStr member/encode/decode). Tests under `tests/`.
 
-**rune-ql (new repo `/Users/vradu/Projects/rune-ql`):** `include/rune/ql/Ast.h`, `include/rune/ql/Parser.h` + `src/Parser.cpp`, `include/rune/ql/Backends.h` + `src/Backends.cpp`, `tests/`, `benchmark/ParseBench.cpp`, `CMakeLists.txt`, `conanfile.py`, `.gitignore`.
+**rune-ql (new repo `~/Projects/rune-ql`):** `include/rune/ql/Ast.h`, `include/rune/ql/Parser.h` + `src/Parser.cpp`, `include/rune/ql/Backends.h` + `src/Backends.cpp`, `tests/`, `benchmark/ParseBench.cpp`, `CMakeLists.txt`, `conanfile.py`, `.gitignore`.
 
 **rune-client-cpp:** `tools/rune_cli.cpp` (new), `CMakeLists.txt` (+`RUNE_QL_ROOT`, `rune_ql` sibling lib, `rune` executable), `tests/`, a Docker e2e (`docker/`-style) + a checked-in `characters.rql`.
 
@@ -383,7 +383,7 @@ git commit -m "feat(codec): FixedStr codegen + end-to-end round-trip"
 ## Task 5: rune-ql repo scaffold + AST
 
 **Files:**
-- Create: `/Users/vradu/Projects/rune-ql/` — `CMakeLists.txt`, `conanfile.py`, `.gitignore`, `include/rune/ql/Ast.h`, `tests/AstSmokeTest.cpp`
+- Create: `~/Projects/rune-ql/` — `CMakeLists.txt`, `conanfile.py`, `.gitignore`, `include/rune/ql/Ast.h`, `tests/AstSmokeTest.cpp`
 
 **Interfaces:**
 - Produces: the repo builds; `rune::ql::{FieldDef, TopicDef, ParseError}` exist; consumes rune-codec via `RUNE_CODEC_ROOT` sibling source lib.
@@ -417,7 +417,7 @@ TEST(Ast, Constructs) {
 ```
 
 - [ ] **Step 4: Configure + build + run** (native cmake), verify green.
-Run: `<cmake> -S . -B build -DBUILD_TESTING=ON -DRUNE_CODEC_ROOT=/Users/vradu/Projects/rune-codec && <cmake> --build build && (cd build && ctest --output-on-failure)`
+Run: `<cmake> -S . -B build -DBUILD_TESTING=ON -DRUNE_CODEC_ROOT=~/Projects/rune-codec && <cmake> --build build && (cd build && ctest --output-on-failure)`
 
 - [ ] **Step 5: Commit**
 ```bash

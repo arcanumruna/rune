@@ -1,9 +1,9 @@
 # Brief: E1d — durable recovery point (async-seal power-loss gap)
 
-Worktree: /Users/vradu/Projects/rune-broker-wt32 (branch fix/e1d-recovery-point, from feat/dur-1 f153662 — it has
+Worktree: ~/Projects/rune-broker-wt32 (branch fix/e1d-recovery-point, from feat/dur-1 f153662 — it has
 the DR harness and the disabled acceptance test). Commit locally; NEVER push; never run any conan package command
 (create/export/upload are forbidden). Do not spawn subagents. Configure your own build-fast (copy the configure line
-from /Users/vradu/Projects/rune-broker-wt31/build-fast/CMakeCache.txt). Another agent is concurrently reworking
+from ~/Projects/rune-broker-wt31/build-fast/CMakeCache.txt). Another agent is concurrently reworking
 replication divergence in wt31 (PartitionReplica / fetch protocol) — stay in storage + the cleaner + recovery; do
 not touch PartitionReplica fetch/divergence logic.
 
@@ -39,5 +39,5 @@ missing R file, crash between data fdatasync and R persist. Deterministic, no sl
 virtual calls, std::function, allocation; no atomics/mutex outside ring internals and the cleaner
 (scripts/check_no_atomics.py OK). Full Mac suite green (every test binary the branch builds), DR suite 30x repeat.
 
-Report: /Users/vradu/Projects/rune-broker-wt26/docs/superpowers/briefs/2026-10-03-E1d-report.md (design as built,
+Report: ~/Projects/rune-broker-wt26/docs/superpowers/briefs/2026-10-03-E1d-report.md (design as built,
 RED->GREEN per test, suite results, follow-ups). Return only: status, commit SHAs, one-line test summary, concerns.

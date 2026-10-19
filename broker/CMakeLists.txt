@@ -52,7 +52,7 @@ option(ENABLE_FLIGHT_RECORDER "Compile in flight-recorder instrumentation" ON)
 set(FLIGHT_RECORDER_DIR "" CACHE PATH "Local flight-recorder checkout; empty = fetch it")
 set(FLIGHT_RECORDER_GIT_REPOSITORY "git@github.com:arcanumruna/flight-recorder.git" CACHE STRING
     "flight-recorder git URL used when FLIGHT_RECORDER_DIR is unset")
-set(FLIGHT_RECORDER_GIT_TAG "0ba261e45fa12c9b900c46983eaf7ca7fec0f8c9" CACHE STRING
+set(FLIGHT_RECORDER_GIT_TAG "0c78e1a4d51d7cf3ddaa8d3fb3dc378e6c4dacea" CACHE STRING
     "pinned flight-recorder commit")
 if(NOT FLIGHT_RECORDER_DIR)
     include(FetchContent)

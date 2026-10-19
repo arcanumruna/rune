@@ -3,7 +3,7 @@
 Date: 2026-09-11
 Auditor: Opus code auditor (read-only)
 Scope: `libs/storage/include/rune/storage/*.h`, `libs/storage/src/*.cpp`, `libs/storage/tests/**`
-Protocol reference (sibling repo, not modified): `/Users/vradu/Projects/rune-protocol/include/rune/protocol/RecordBatch.h`
+Protocol reference (sibling repo, not modified): `~/Projects/rune-protocol/include/rune/protocol/RecordBatch.h`
 
 ---
 

@@ -174,13 +174,13 @@ conan-pkglist.json
 
 - [ ] **Step 8: Copy the Conan provider**
 
-Run: `cp /Users/vradu/Projects/common/conan_provider.cmake /Users/vradu/Projects/rune-protocol/conan_provider.cmake`
+Run: `cp ~/Projects/common/conan_provider.cmake ~/Projects/rune-protocol/conan_provider.cmake`
 
 - [ ] **Step 9: Configure + build + run the smoke test**
 
 Run:
 ```bash
-cd /Users/vradu/Projects/rune-protocol
+cd ~/Projects/rune-protocol
 conan install . --build=missing -s build_type=Debug -s arch=x86_64 --format=json > conan-graph.json
 cmake . -B build -DCMAKE_OSX_ARCHITECTURES=x86_64 \
   -DCMAKE_TOOLCHAIN_FILE=build/Debug/generators/conan_toolchain.cmake \
@@ -194,7 +194,7 @@ Expected: `rune_protocol_tests` PASS (1 test).
 - [ ] **Step 10: Init git repo + commit**
 
 ```bash
-cd /Users/vradu/Projects/rune-protocol && git init -q
+cd ~/Projects/rune-protocol && git init -q
 git add -A && git commit -m "chore(protocol): scaffold rune-protocol conan/cmake project"
 ```
 
@@ -775,10 +775,10 @@ echo "✅ Done."
 - [ ] **Step 2: Copy `release.sh`, `update-deps.sh`, `bump_version.py` from `common`**
 
 ```bash
-cp /Users/vradu/Projects/common/release.sh /Users/vradu/Projects/rune-protocol/release.sh
-cp /Users/vradu/Projects/common/update-deps.sh /Users/vradu/Projects/rune-protocol/update-deps.sh
-cp /Users/vradu/Projects/common/bump_version.py /Users/vradu/Projects/rune-protocol/bump_version.py
-chmod +x /Users/vradu/Projects/rune-protocol/*.sh
+cp ~/Projects/common/release.sh ~/Projects/rune-protocol/release.sh
+cp ~/Projects/common/update-deps.sh ~/Projects/rune-protocol/update-deps.sh
+cp ~/Projects/common/bump_version.py ~/Projects/rune-protocol/bump_version.py
+chmod +x ~/Projects/rune-protocol/*.sh
 ```
 
 - [ ] **Step 3: Create `.woodpecker/build.yml`** (build + test only; publish gated to CI creds)
@@ -933,13 +933,13 @@ ENTRYPOINT ["/usr/local/bin/rune_broker"]
 
 - [ ] **Step 8: Configure, build, run smoke test**
 
-Run (same conan+cmake incantation as Task 1 Step 9, from `/Users/vradu/Projects/rune-broker`, adding `-DBUILD_TESTING=ON`).
+Run (same conan+cmake incantation as Task 1 Step 9, from `~/Projects/rune-broker`, adding `-DBUILD_TESTING=ON`).
 Expected: `rune_storage_tests` PASS; `rune_broker` binary prints version.
 
 - [ ] **Step 9: Commit**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 git add -A && git commit -m "chore(broker): scaffold rune-broker app + librune_storage"
 ```
 

@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-01
 **Status:** DESIGN NOTE, revision 3 (revision 2 + the five blocking items of design re-review #2, verdict Approve-with-changes). No code changes. This note gates F15 (ruling R17).
-**Base:** rune-broker `feat/f15-eos-correctness` in `/Users/vradu/Projects/rune-broker-wt10`: `b04f871` plus the S0 RED tests `63b5346`. rune-protocol @ `56df0c7`.
+**Base:** rune-broker `feat/f15-eos-correctness` in `~/Projects/rune-broker-wt10`: `b04f871` plus the S0 RED tests `63b5346`. rune-protocol @ `56df0c7`.
 **Revision 2 answers:** design-gate review #1, verdict REWORK (`.superpowers/sdd/2026-09-30-self-contained-worker-shards-broker/f15-design-review-1.md`), and the S0 report (`…/f15-s0-report.md`, 25 RED tests plus the new defect **N4**).
 **Motivating review:** Task 10 round-5 re-review (C1, I1, I3, I4, m1–m5). History is in `…/task-10-report.md` (rounds 3–5).
 **Related:** `2026-09-30-self-contained-worker-shards-design.md` §3.4 (this note retires its "post-ack" LSO notification), `2026-09-16-rune-milestone-c-b-exactly-once-transactions-design.md`, client ticket F14.

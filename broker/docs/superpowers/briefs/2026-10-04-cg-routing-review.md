@@ -1,7 +1,7 @@
 # Review: consumer-group fetch routing (`fix/group-subscribe-routing`)
 
 **Date:** 2026-10-04
-**Worktree:** `/Users/vradu/Projects/rune-client-cpp-wt14`
+**Worktree:** `~/Projects/rune-client-cpp-wt14`
 **Branch:** base `main 3c7e97b`; commits `bfe31ef bff9024 48a5329 679f4bc 6d2e013`
 **Report reviewed:** `2026-10-04-cg-routing-report.md`
 

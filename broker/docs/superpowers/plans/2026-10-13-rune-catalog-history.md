@@ -60,16 +60,16 @@ Binding rulings from the pre-flight scan (`.superpowers/sdd/2026-10-13-rune-cata
 
 ## Execution context
 
-- **Repos / branch:** create `feat/catalog-history` in each worktree under `/Users/vradu/Projects/se-worktrees/`:
-  - `rune-broker`: `git -C /Users/vradu/Projects/se-worktrees/rune-broker switch -c feat/catalog-history 7d86db94`
-  - `rune-protocol`: `git -C /Users/vradu/Projects/se-worktrees/rune-protocol switch -c feat/catalog-history efc25fb`
-  - `rune-client-cpp`: `git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp switch -c feat/catalog-history d0a5c74`
-  - `rune-ql`: `git -C /Users/vradu/Projects/se-worktrees/rune-ql switch -c feat/catalog-history 0814827`
-  - `rune-codec`: `git -C /Users/vradu/Projects/se-worktrees/rune-codec switch -c feat/catalog-history 0ccf109`
+- **Repos / branch:** create `feat/catalog-history` in each worktree under `~/Projects/se-worktrees/`:
+  - `rune-broker`: `git -C ~/Projects/se-worktrees/rune-broker switch -c feat/catalog-history 7d86db94`
+  - `rune-protocol`: `git -C ~/Projects/se-worktrees/rune-protocol switch -c feat/catalog-history efc25fb`
+  - `rune-client-cpp`: `git -C ~/Projects/se-worktrees/rune-client-cpp switch -c feat/catalog-history d0a5c74`
+  - `rune-ql`: `git -C ~/Projects/se-worktrees/rune-ql switch -c feat/catalog-history 0814827`
+  - `rune-codec`: `git -C ~/Projects/se-worktrees/rune-codec switch -c feat/catalog-history 0ccf109`
 
-  Verify each with `git -C <repo> log --oneline -1` before Task 1. Never touch `/Users/vradu/Projects/rune-protocol` or `/Users/vradu/Projects/rune-client-cpp` (other branches, dirty).
+  Verify each with `git -C <repo> log --oneline -1` before Task 1. Never touch `~/Projects/rune-protocol` or `~/Projects/rune-client-cpp` (other branches, dirty).
 - **Builds (already configured — re-run cmake only after a `CMakeLists.txt` edit):**
-  - broker tests: `build-fast` (Ninja, Debug, `BUILD_TESTING=ON`, `RUNE_PROTOCOL_INCLUDE` → `../rune-protocol/include`, `RUNE_CODEC_ROOT` → `../rune-codec`). After a CMake edit: `cmake /Users/vradu/Projects/se-worktrees/rune-broker/build-fast`. If missing: `cmake -S . -B build-fast -G Ninja -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON -DCMAKE_TOOLCHAIN_FILE=/Users/vradu/Projects/se-worktrees/rune-broker/build/Debug/generators/conan_toolchain.cmake -DRUNE_PROTOCOL_INCLUDE=/Users/vradu/Projects/se-worktrees/rune-protocol/include -DRUNE_CODEC_ROOT=/Users/vradu/Projects/se-worktrees/rune-codec`.
+  - broker tests: `build-fast` (Ninja, Debug, `BUILD_TESTING=ON`, `RUNE_PROTOCOL_INCLUDE` → `../rune-protocol/include`, `RUNE_CODEC_ROOT` → `../rune-codec`). After a CMake edit: `cmake ~/Projects/se-worktrees/rune-broker/build-fast`. If missing: `cmake -S . -B build-fast -G Ninja -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON -DCMAKE_TOOLCHAIN_FILE=~/Projects/se-worktrees/rune-broker/build/Debug/generators/conan_toolchain.cmake -DRUNE_PROTOCOL_INCLUDE=~/Projects/se-worktrees/rune-protocol/include -DRUNE_CODEC_ROOT=~/Projects/se-worktrees/rune-codec`.
   - broker benchmarks: `build-bench-rel` (Ninja, `BUILD_BENCHMARKS=ON`, `-O3 -DNDEBUG`).
   - client: `build` (Unix Makefiles; `RUNE_PROTOCOL_INCLUDE` → `../rune-protocol/include`, `RUNE_CODEC_ROOT` → `../rune-codec`, `RUNE_QL_ROOT` → `../rune-ql`).
   - protocol: `build` (target `rune_protocol_tests`). rune-ql: `build` (target `rune_ql_tests`). rune-codec: `build` (targets `rune_codec_tests`, new `rune_catalog_tests`) and `build-rel` (Release, `rune_codec_bench`; created in Task 3).
@@ -472,7 +472,7 @@ gtest_discover_tests(rune_catalog_tests)
 
 - [ ] **Step 3: Run to verify they fail**
 
-Run: `cmake /Users/vradu/Projects/se-worktrees/rune-codec/build && cmake --build /Users/vradu/Projects/se-worktrees/rune-codec/build -j14 --target rune_catalog_tests`
+Run: `cmake ~/Projects/se-worktrees/rune-codec/build && cmake --build ~/Projects/se-worktrees/rune-codec/build -j14 --target rune_catalog_tests`
 Expected: compile error `'rune/catalog/CatalogEvent.h' file not found`.
 
 - [ ] **Step 4a: Create `rune-protocol/include/rune/protocol/CatalogTypes.h`** (F32, F14 — the one definition; Task 4 pins it with protocol tests):
@@ -550,8 +550,8 @@ struct RequestIdHash {
 Commit it in rune-protocol before Step 4 (the codec includes it through `RUNE_PROTOCOL_INCLUDE`):
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-protocol add include/rune/protocol/CatalogTypes.h
-git -C /Users/vradu/Projects/se-worktrees/rune-protocol commit -m "feat(protocol): CatalogTypes.h — the one TopicConfig definition + 128-bit RequestId (catalog history F32/F14)
+git -C ~/Projects/se-worktrees/rune-protocol add include/rune/protocol/CatalogTypes.h
+git -C ~/Projects/se-worktrees/rune-protocol commit -m "feat(protocol): CatalogTypes.h — the one TopicConfig definition + 128-bit RequestId (catalog history F32/F14)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -1042,14 +1042,14 @@ Note the truncation test: a prefix that cuts inside the length-prefixed ops blob
 
 - [ ] **Step 7: Run the tests**
 
-Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-codec/build -j14 --target rune_catalog_tests && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-codec/build -R 'CatalogEvent' --output-on-failure -j14`
+Run: `cmake --build ~/Projects/se-worktrees/rune-codec/build -j14 --target rune_catalog_tests && ctest --test-dir ~/Projects/se-worktrees/rune-codec/build -R 'CatalogEvent' --output-on-failure -j14`
 Expected: all 9 `CatalogEventRegression.*` PASS.
 
 - [ ] **Step 8: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-codec add include/rune/catalog/CatalogEvent.h src/catalog/Wire.h src/catalog/CatalogEvent.cpp tests/catalog/CatalogEventTest.cpp CMakeLists.txt
-git -C /Users/vradu/Projects/se-worktrees/rune-codec commit -m "feat(catalog): event model + frozen formatVer-1 encoding (catalog history §4)
+git -C ~/Projects/se-worktrees/rune-codec add include/rune/catalog/CatalogEvent.h src/catalog/Wire.h src/catalog/CatalogEvent.cpp tests/catalog/CatalogEventTest.cpp CMakeLists.txt
+git -C ~/Projects/se-worktrees/rune-codec commit -m "feat(catalog): event model + frozen formatVer-1 encoding (catalog history §4)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -1363,7 +1363,7 @@ TEST(CatalogApplyV1Regression, FingerprintCoversEveryDefinitionField) {
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-codec/build -j14 --target rune_catalog_tests`
+Run: `cmake --build ~/Projects/se-worktrees/rune-codec/build -j14 --target rune_catalog_tests`
 Expected: compile error `'rune/catalog/CatalogState.h' file not found`.
 
 - [ ] **Step 3: Implement `CatalogState.h`**
@@ -1558,14 +1558,14 @@ A future `formatVer` adds `ApplyV2` and a dispatch arm here; `ApplyV1` is never 
 
 - [ ] **Step 6: Run the tests**
 
-Run: `cmake /Users/vradu/Projects/se-worktrees/rune-codec/build && cmake --build /Users/vradu/Projects/se-worktrees/rune-codec/build -j14 --target rune_catalog_tests && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-codec/build -R 'CatalogEvent|CatalogApplyV1' --output-on-failure -j14`
+Run: `cmake ~/Projects/se-worktrees/rune-codec/build && cmake --build ~/Projects/se-worktrees/rune-codec/build -j14 --target rune_catalog_tests && ctest --test-dir ~/Projects/se-worktrees/rune-codec/build -R 'CatalogEvent|CatalogApplyV1' --output-on-failure -j14`
 Expected: all PASS.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-codec add include/rune/catalog src/catalog tests/catalog CMakeLists.txt
-git -C /Users/vradu/Projects/se-worktrees/rune-codec commit -m "feat(catalog): catalog state + frozen v1 apply rules + id-free fingerprints
+git -C ~/Projects/se-worktrees/rune-codec add include/rune/catalog src/catalog tests/catalog CMakeLists.txt
+git -C ~/Projects/se-worktrees/rune-codec commit -m "feat(catalog): catalog state + frozen v1 apply rules + id-free fingerprints
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -1825,7 +1825,7 @@ TEST(CatalogGoldenRegression, TheGoldenScriptStillProducesTheCheckedInBytes) {
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-codec/build -j14 --target rune_catalog_tests`
+Run: `cmake --build ~/Projects/se-worktrees/rune-codec/build -j14 --target rune_catalog_tests`
 Expected: compile error `'rune/catalog/CatalogReplayer.h' file not found`.
 
 - [ ] **Step 3: Implement** `CatalogReplayer.cpp` (decode → `Gap` if `offset != nextOffset()` → `apply` → wrap errors; `describe` formats `offset N: <Decode|Gap|Apply> <code name> [expected=0x… actual=0x…] <detail>`), `CatalogQueries.cpp` (the semantics above; `stateAsOf` replays through a fresh `CatalogReplayer`, so an as-of point past a bad event surfaces that event's error), `CatalogFile.cpp` (`"RCAT"` + u16 1 header; `readRcat` refuses a bad magic, an unknown file version, a truncated record, or non-increasing offsets, each with a message naming the byte position).
@@ -1865,9 +1865,9 @@ int main(int argc, char** argv) {
 CMake (in `rune-codec/CMakeLists.txt`): `add_executable(make_catalog_golden tools/make_catalog_golden.cpp)` linked to `rune_catalog`; `target_compile_definitions(rune_catalog_tests PRIVATE RUNE_CATALOG_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/catalog/golden")`; add `CatalogReplayerTest.cpp`, `CatalogQueriesTest.cpp`, `CatalogGoldenTest.cpp` to `rune_catalog_tests` and the three new `.cpp` to `rune_catalog`. Then generate and freeze:
 
 ```bash
-cmake /Users/vradu/Projects/se-worktrees/rune-codec/build && cmake --build /Users/vradu/Projects/se-worktrees/rune-codec/build -j14 --target make_catalog_golden
-mkdir -p /Users/vradu/Projects/se-worktrees/rune-codec/tests/catalog/golden/v1
-/Users/vradu/Projects/se-worktrees/rune-codec/build/make_catalog_golden /Users/vradu/Projects/se-worktrees/rune-codec/tests/catalog/golden/v1/basic.rcat > /tmp/pins.txt
+cmake ~/Projects/se-worktrees/rune-codec/build && cmake --build ~/Projects/se-worktrees/rune-codec/build -j14 --target make_catalog_golden
+mkdir -p ~/Projects/se-worktrees/rune-codec/tests/catalog/golden/v1
+~/Projects/se-worktrees/rune-codec/build/make_catalog_golden ~/Projects/se-worktrees/rune-codec/tests/catalog/golden/v1/basic.rcat > /tmp/pins.txt
 ```
 
 Create `tests/catalog/CatalogGoldenPins.h` as `#pragma once`, `#include <cstdint>`, `namespace rune::catalog::golden {` + the printed array verbatim + `}`. These 18 constants are frozen from now on.
@@ -1876,14 +1876,14 @@ Create `tests/catalog/CatalogGoldenPins.h` as `#pragma once`, `#include <cstdint
 
 - [ ] **Step 6: Run the tests + bench**
 
-Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-codec/build -j14 --target rune_catalog_tests && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-codec/build -R 'Catalog' --output-on-failure -j14`
+Run: `cmake --build ~/Projects/se-worktrees/rune-codec/build -j14 --target rune_catalog_tests && ctest --test-dir ~/Projects/se-worktrees/rune-codec/build -R 'Catalog' --output-on-failure -j14`
 Expected: all `CatalogEventRegression.*`, `CatalogApplyV1Regression.*`, `CatalogReplayerRegression.*`, `CatalogQueriesRegression.*`, `CatalogGoldenRegression.*` PASS.
 Run (bench — create the Release build dir once, F35; the existing conan Release toolchain provides Google Benchmark):
 
 ```bash
-cmake -S /Users/vradu/Projects/se-worktrees/rune-codec -B /Users/vradu/Projects/se-worktrees/rune-codec/build-rel -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=/Users/vradu/Projects/se-worktrees/rune-codec/build/Release/generators/conan_toolchain.cmake
-cmake --build /Users/vradu/Projects/se-worktrees/rune-codec/build-rel -j14 --target rune_codec_bench
-/Users/vradu/Projects/se-worktrees/rune-codec/build-rel/rune_codec_bench --benchmark_filter=CatalogReplay
+cmake -S ~/Projects/se-worktrees/rune-codec -B ~/Projects/se-worktrees/rune-codec/build-rel -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=~/Projects/se-worktrees/rune-codec/build/Release/generators/conan_toolchain.cmake
+cmake --build ~/Projects/se-worktrees/rune-codec/build-rel -j14 --target rune_codec_bench
+~/Projects/se-worktrees/rune-codec/build-rel/rune_codec_bench --benchmark_filter=CatalogReplay
 ```
 
 Expected: the configure step reports `benchmark` found (a missing benchmark package is a failure of this step, never a skip); < 200 ms per iteration; record the number in the commit body.
@@ -1891,8 +1891,8 @@ Expected: the configure step reports `benchmark` found (a missing benchmark pack
 - [ ] **Step 7: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-codec add include/rune/catalog src/catalog tools/make_catalog_golden.cpp tests/catalog benchmark/CatalogReplayBench.cpp CMakeLists.txt
-git -C /Users/vradu/Projects/se-worktrees/rune-codec commit -m "feat(catalog): verifying replayer, history/as-of/diff, .rcat, v1 golden log + replay bench
+git -C ~/Projects/se-worktrees/rune-codec add include/rune/catalog src/catalog tools/make_catalog_golden.cpp tests/catalog benchmark/CatalogReplayBench.cpp CMakeLists.txt
+git -C ~/Projects/se-worktrees/rune-codec commit -m "feat(catalog): verifying replayer, history/as-of/diff, .rcat, v1 golden log + replay bench
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -2056,7 +2056,7 @@ TEST(CatalogDdlWireRegression, DdlResponseRoundTrips) {
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cmake /Users/vradu/Projects/se-worktrees/rune-protocol/build && cmake --build /Users/vradu/Projects/se-worktrees/rune-protocol/build -j14 --target rune_protocol_tests`
+Run: `cmake ~/Projects/se-worktrees/rune-protocol/build && cmake --build ~/Projects/se-worktrees/rune-protocol/build -j14 --target rune_protocol_tests`
 Expected: compile errors (`DropTopic` is not a member of `TemplateId`, …).
 
 - [ ] **Step 3: Implement** the constants, structs and the trailer rules above, following `DefineTopic`'s existing encode/decode style (`putVarStr`, `getVarStr`, `putVarBytes32`, `getVarBytes32`, `detail::putLE*`). Each new struct has `TEMPLATE_ID`, `encodedSize()`, `encode()`, `static decode()` returning `std::optional`. `DdlExtension` gets free functions `extEncodedSize`, `putExt`, `getExt` (the statement uses a u32 length).
@@ -2065,14 +2065,14 @@ Expected: compile errors (`DropTopic` is not a member of `TemplateId`, …).
 
 - [ ] **Step 5: Run**
 
-Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-protocol/build -j14 --target rune_protocol_tests && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-protocol/build -R 'CatalogDdlWire|DefineTopic|Conformance|DispatchCheckFrame|Dispatch|VersionGates' --output-on-failure`
+Run: `cmake --build ~/Projects/se-worktrees/rune-protocol/build -j14 --target rune_protocol_tests && ctest --test-dir ~/Projects/se-worktrees/rune-protocol/build -R 'CatalogDdlWire|DefineTopic|Conformance|DispatchCheckFrame|Dispatch|VersionGates' --output-on-failure`
 Expected: PASS.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-protocol add include tests conformance CMakeLists.txt
-git -C /Users/vradu/Projects/se-worktrees/rune-protocol commit -m "feat(protocol): catalog DDL wire — templates 74-78, DDL extension, DefineTopic rf/config, kCatalogTopicId, client v8
+git -C ~/Projects/se-worktrees/rune-protocol add include tests conformance CMakeLists.txt
+git -C ~/Projects/se-worktrees/rune-protocol commit -m "feat(protocol): catalog DDL wire — templates 74-78, DDL extension, DefineTopic rf/config, kCatalogTopicId, client v8
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -2335,26 +2335,26 @@ TEST(ClientDdlRedirectRegression, InvalidRequestDetailReachesTheCaller) {
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cmake /Users/vradu/Projects/se-worktrees/rune-client-cpp/build && cmake --build /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -j14 --target rune_client_tests`
+Run: `cmake ~/Projects/se-worktrees/rune-client-cpp/build && cmake --build ~/Projects/se-worktrees/rune-client-cpp/build -j14 --target rune_client_tests`
 Expected: compile errors (`dropTopic` is not a member of `rune::client::Client`; `templateHandlers` is not a member of `test_support::InvokerGateway`).
 
 - [ ] **Step 3: Implement** the ops, options, the `DdlRetry` variant (no scattered retry fields), the `ErrorResponse` branch (placed **before** the data-op Redirect branch, matched by `findCtl_(corrId)` and an `isDdlOp(op)` predicate covering `DefineTopic, AlterTopic, CreateView, DropTopic, DropView, AlterView, AlterTopicConfig`), the `DdlResponse` case, and `int Client::resendDueDdl_(int64_t nowNs)` called in the duty cycle next to `retryRedirectedSubscribes_`. `ClientAgent::offerToEndpoint(const std::string& channel, const uint8_t*, std::size_t)` reuses the per-endpoint session lookup `offerToPartition` uses. The `*AndWait` forms are the usual pump-until-done wrappers over the non-blocking ops (their real-broker tests land in Tasks 11 and 22). Add the `if(NOT TARGET …)` guards to `CMakeLists.txt` and reconfigure the standalone build to prove it unchanged.
 
 - [ ] **Step 4: Run**
 
-Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -j14 && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -R 'ClientDdlRedirect|ClientCatalogDdl|ClientSchema|Redirect|InvokerClient|IngressEndpointRouting|Conformance' --output-on-failure -j14`
+Run: `cmake --build ~/Projects/se-worktrees/rune-client-cpp/build -j14 && ctest --test-dir ~/Projects/se-worktrees/rune-client-cpp/build -R 'ClientDdlRedirect|ClientCatalogDdl|ClientSchema|Redirect|InvokerClient|IngressEndpointRouting|Conformance' --output-on-failure -j14`
 Expected: PASS (existing `RedirectTest`, `ClientSchemaTest`, `InvokerClientTest` unchanged).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp add include src tests CMakeLists.txt
-git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp commit -m "feat(client): catalog DDL ops + DDL extension; every DDL follows Redirect and retries NotLeader in budget
+git -C ~/Projects/se-worktrees/rune-client-cpp add include src tests CMakeLists.txt
+git -C ~/Projects/se-worktrees/rune-client-cpp commit -m "feat(client): catalog DDL ops + DDL extension; every DDL follows Redirect and retries NotLeader in budget
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
-- [ ] **Checkpoint B (controller):** full `*Regression*` suites in protocol and client; broker `build-fast` still builds against the new protocol headers (`cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14`).
+- [ ] **Checkpoint B (controller):** full `*Regression*` suites in protocol and client; broker `build-fast` still builds against the new protocol headers (`cmake --build ~/Projects/se-worktrees/rune-broker/build-fast -j14`).
 
 ---
 
@@ -2467,21 +2467,21 @@ TEST(CatalogReplicationRegression, ANewBrokerWithAnEmptyDataDirFetchesTheCatalog
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cmake /Users/vradu/Projects/se-worktrees/rune-broker/build-fast && cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 --target rune_catalog_replication_tests rune_node_tests`
+Run: `cmake ~/Projects/se-worktrees/rune-broker/build-fast && cmake --build ~/Projects/se-worktrees/rune-broker/build-fast -j14 --target rune_catalog_replication_tests rune_node_tests`
 Expected: compile errors (`rune/node/CatalogPartition.h` not found).
 
 - [ ] **Step 3: Implement** the files and edits listed above. `MetadataService::isControllerIsrInternalTopic(id)` returns `id == -1 || id == -2 || id == kCatalogTopicId`, and the bridge's `isCoordinatorTopic_` the same set (F26 — add `TEST_F(BridgePerPartitionTest, CatalogAssignmentIsForwardedOnTheControllerPathRegression)` to `libs/node/tests/node/ReplicationMetadataBridgePerPartitionTest.cpp` (listed in Files): with `coordinatorOnController_`, a committed `(−6, 0)` assignment reaches the admin role ring); `BrokerNode` (anchor `metadataService_->setCoordinatorPartitions(std::move(coord), balancerNodes);`) appends `rune::metadata::PartitionKey{kCatalogTopicId, 0}` to `coord`. `decideCoordinatorPartition` needs no change (replicas = `balancerNodes`, never unclean — re-read its doc comment, it already elects only from `ISR ∩ live`).
 
 - [ ] **Step 4: Run**
 
-Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'CatalogReplication|AdminIsrChannel|MetadataService|Coordinator|ReplicationMetadataBridge|NodeConfig' --output-on-failure -j14`
+Run: `cmake --build ~/Projects/se-worktrees/rune-broker/build-fast -j14 && ctest --test-dir ~/Projects/se-worktrees/rune-broker/build-fast -R 'CatalogReplication|AdminIsrChannel|MetadataService|Coordinator|ReplicationMetadataBridge|NodeConfig' --output-on-failure -j14`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs/node CMakeLists.txt
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "feat(catalog): __catalog partition on every broker — real replication, controller-ISR leader, never unclean
+git -C ~/Projects/se-worktrees/rune-broker add libs/node CMakeLists.txt
+git -C ~/Projects/se-worktrees/rune-broker commit -m "feat(catalog): __catalog partition on every broker — real replication, controller-ISR leader, never unclean
 
 Fix-on-sight: the admin catalogs rode a NullPartitionTransport and followed the
 consensus leader (E2 carry-over root cause).
@@ -2718,21 +2718,21 @@ TEST(CatalogAllocRegression, SteadyIdleApplyAllocatesNothingRegression) {
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cmake /Users/vradu/Projects/se-worktrees/rune-broker/build-fast && cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 --target rune_node_tests`
+Run: `cmake ~/Projects/se-worktrees/rune-broker/build-fast && cmake --build ~/Projects/se-worktrees/rune-broker/build-fast -j14 --target rune_node_tests`
 Expected: compile error (`rune/node/CatalogApplier.h` not found).
 
 - [ ] **Step 3: Implement** as specified. `CatalogApplier` holds the state machine `std::variant<Applying, Halted>` and the effects phase `std::variant<AwaitingBoot, Booted, Live>` (F4); `nextOffset()` returns `std::get<Applying>(st_).nextOffset` or −1. The production `LiveEffects` (built in `AdminWorkerAgent`) encodes the `kA2c*` messages; `topicApplied` and `sinkApplied` both encode `kA2cCatalogTopicApplied` (a sink: default `TopicConfig`, rf 0); `schemaChanged` → `kA2cSchemaUpdate` (existing) when `validate`; `viewInstalled` → `kA2cViewPlanUpdate` (existing) with its recovery byte **0** — the production `BootEffects` sets it to **1** (until Task 16 replaces the boot sink): the byte is chosen by which phase's sink runs, never passed as a flag; a full ring is the existing backlog path (`schemaBacklog_` / `topicCommittedBacklog_` pattern: preallocated, flushed next pass, never dropped).
 
 - [ ] **Step 4: Run**
 
-Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 --target rune_node_tests rune_catalog_alloc_regression_tests && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'CatalogApplier|CatalogAlloc|SchemaRegistry|ViewRegistry' --output-on-failure -j14`
+Run: `cmake --build ~/Projects/se-worktrees/rune-broker/build-fast -j14 --target rune_node_tests rune_catalog_alloc_regression_tests && ctest --test-dir ~/Projects/se-worktrees/rune-broker/build-fast -R 'CatalogApplier|CatalogAlloc|SchemaRegistry|ViewRegistry' --output-on-failure -j14`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs/node CMakeLists.txt
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "feat(catalog): CatalogApplier — offset-ordered verified apply, halt on mismatch, checkpoint before effects
+git -C ~/Projects/se-worktrees/rune-broker add libs/node CMakeLists.txt
+git -C ~/Projects/se-worktrees/rune-broker commit -m "feat(catalog): CatalogApplier — offset-ordered verified apply, halt on mismatch, checkpoint before effects
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -2838,21 +2838,21 @@ Plus: `MetadataStateMachineTest` — `RemoveTopicPlacementRecordErasesEveryParti
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 --target rune_node_tests rune_gateway_tests rune_metadata_tests`
+Run: `cmake --build ~/Projects/se-worktrees/rune-broker/build-fast -j14 --target rune_node_tests rune_gateway_tests rune_metadata_tests`
 Expected: compile errors (`createTopicAt` / `uninstallView` / `removeRuntimeTopic` missing).
 
 - [ ] **Step 3: Implement** the edits above. In `BrokerNode`'s admin→control drain (anchor `if (tid == kA2cTopicCommitted) {`), add the new `tid` branches before the dispatcher; `kA2cCatalogTopicApplied` builds a `TopicSpec` from the message and runs `topicRegistry_->createTopicAt(id, spec)` + `createRuntimeUserReplicas(spec)` (unchanged body, it already registers the topic with `MetadataService::addRuntimeTopic`) inside the existing `try`/`catch` (a failure logs the error and leaves the topic not serving — produce answers `NotLeader` — exactly the current `commitReplicaFault_` behaviour). The gateway's new rule is additive here (the old `awaitingCommit` check stays for the old write path until Task 9).
 
 - [ ] **Step 4: Run**
 
-Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'CatalogEffects|CatalogGateway|MetadataStateMachine|LogCleanerPolicyOverride|WorkerViewSet|TopicServability|TransientGateway|TransientInteractionMatrix|TopicRegistry' --output-on-failure -j14`
+Run: `cmake --build ~/Projects/se-worktrees/rune-broker/build-fast -j14 && ctest --test-dir ~/Projects/se-worktrees/rune-broker/build-fast -R 'CatalogEffects|CatalogGateway|MetadataStateMachine|LogCleanerPolicyOverride|WorkerViewSet|TopicServability|TransientGateway|TransientInteractionMatrix|TopicRegistry' --output-on-failure -j14`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs CMakeLists.txt
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "feat(catalog): control-thread effects — create/drop at catalog ids, placement add/remove, config override, view uninstall; C1 generalized
+git -C ~/Projects/se-worktrees/rune-broker add libs CMakeLists.txt
+git -C ~/Projects/se-worktrees/rune-broker commit -m "feat(catalog): control-thread effects — create/drop at catalog ids, placement add/remove, config override, view uninstall; C1 generalized
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -3100,7 +3100,7 @@ TEST(CatalogWritePathRegression, AnswerComesAfterLocalApplyNotJustCommit) {
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 --target rune_node_tests`
+Run: `cmake --build ~/Projects/se-worktrees/rune-broker/build-fast -j14 --target rune_node_tests`
 Expected: compile error (`support/CatalogDdlRig.h` / `AdminWorker::submit` missing).
 
 (`CatalogDdlRig` provides, besides the calls above: `advanceClockPast(ns)` (its deterministic clock), `resumeFollower(id)` (the silent follower fetches again), `countEventsWithRequestId(RequestId)`; the define/alter helpers take `requestId` as `rune::protocol::RequestId`.)
@@ -3111,14 +3111,14 @@ Expected: compile error (`support/CatalogDdlRig.h` / `AdminWorker::submit` missi
 
 - [ ] **Step 5: Run**
 
-Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'CatalogWritePath|CatalogApplier|AdminWorker|DdlFinalFix|SchemaGateway|CreateView|GetViewRow|SchemaPersistence|TopicServability|TransientGateway|TransientInteractionMatrix|DdlAnswerGate' --output-on-failure -j14`
+Run: `cmake --build ~/Projects/se-worktrees/rune-broker/build-fast -j14 && ctest --test-dir ~/Projects/se-worktrees/rune-broker/build-fast -R 'CatalogWritePath|CatalogApplier|AdminWorker|DdlFinalFix|SchemaGateway|CreateView|GetViewRow|SchemaPersistence|TopicServability|TransientGateway|TransientInteractionMatrix|DdlAnswerGate' --output-on-failure -j14`
 Expected: PASS.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs CMakeLists.txt
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "feat(catalog): every DDL is a __catalog event written by the catalog leader; new Drop/AlterView/AlterTopicConfig ops; rf bounds; request-id dedupe
+git -C ~/Projects/se-worktrees/rune-broker add libs CMakeLists.txt
+git -C ~/Projects/se-worktrees/rune-broker commit -m "feat(catalog): every DDL is a __catalog event written by the catalog leader; new Drop/AlterView/AlterTopicConfig ops; rf bounds; request-id dedupe
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -3148,14 +3148,14 @@ The DDL conformance plan's suites (`DdlHarness.h`, `DdlExpectations.h`, `DdlHarn
 
 - [ ] **Step 3: Run**
 
-Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'Ddl' --output-on-failure -j14`
+Run: `cmake --build ~/Projects/se-worktrees/rune-broker/build-fast -j14 && ctest --test-dir ~/Projects/se-worktrees/rune-broker/build-fast -R 'Ddl' --output-on-failure -j14`
 Expected: PASS — every occupant × op cell answers its pinned code; the stress (`DdlStressRegression`) still finds no divergence from its model.
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs/node/tests
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "test(catalog): port the DDL conformance suite to the catalog write path (+ drop/alter-view/config ops; orphan occupant retired)
+git -C ~/Projects/se-worktrees/rune-broker add libs/node/tests
+git -C ~/Projects/se-worktrees/rune-broker commit -m "test(catalog): port the DDL conformance suite to the catalog write path (+ drop/alter-view/config ops; orphan occupant retired)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -3335,14 +3335,14 @@ TEST(ClientDdlBrokerRegression, ARetriedRequestIdGetsTheOriginalResultFromTheBro
 
 - [ ] **Step 4: Run**
 
-Run: `cmake /Users/vradu/Projects/se-worktrees/rune-broker/build-fast && cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'CatalogLeadership|CatalogGateway|CatalogWritePath|SchemaGateway|ClientDdlBroker' --output-on-failure -j14`
+Run: `cmake ~/Projects/se-worktrees/rune-broker/build-fast && cmake --build ~/Projects/se-worktrees/rune-broker/build-fast -j14 && ctest --test-dir ~/Projects/se-worktrees/rune-broker/build-fast -R 'CatalogLeadership|CatalogGateway|CatalogWritePath|SchemaGateway|ClientDdlBroker' --output-on-failure -j14`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs CMakeLists.txt
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "feat(catalog): DDL Redirect to the catalog leader, NotLeader on leader change / catch-up / below minIsr, Internal when halted; pre-v8 DDL on a non-leader answered InvalidRequest; real client vs real broker tests
+git -C ~/Projects/se-worktrees/rune-broker add libs CMakeLists.txt
+git -C ~/Projects/se-worktrees/rune-broker commit -m "feat(catalog): DDL Redirect to the catalog leader, NotLeader on leader change / catch-up / below minIsr, Internal when halted; pre-v8 DDL on a non-leader answered InvalidRequest; real client vs real broker tests
 
 Fix-on-sight: a non-leader admin answered DDL Internal (non-retriable) instead of a redirect.
 
@@ -3446,14 +3446,14 @@ plus a gateway test `CatalogGatewayRegression.CatalogSubscribeIsForwardedOnAnyBr
 
 - [ ] **Step 2: Run to verify they fail**, **Step 3: implement**, **Step 4: Run**
 
-Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'CatalogReadServer|CatalogGateway|CatalogAlloc' --output-on-failure -j14`
+Run: `cmake --build ~/Projects/se-worktrees/rune-broker/build-fast -j14 && ctest --test-dir ~/Projects/se-worktrees/rune-broker/build-fast -R 'CatalogReadServer|CatalogGateway|CatalogAlloc' --output-on-failure -j14`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "feat(catalog): __catalog readable with Subscribe on any broker (admin-thread read server, caught-up marker)
+git -C ~/Projects/se-worktrees/rune-broker add libs
+git -C ~/Projects/se-worktrees/rune-broker commit -m "feat(catalog): __catalog readable with Subscribe on any broker (admin-thread read server, caught-up marker)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -3603,19 +3603,19 @@ TEST(ClientCatalogReadBrokerRegression, ASecondReadSeesNewDdlFromTheCachedPrefix
 
 - [ ] **Step 2: Run to verify they fail**, **Step 3: implement**, **Step 4: Run**
 
-Run: `cmake /Users/vradu/Projects/se-worktrees/rune-client-cpp/build && cmake --build /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -j14 && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -R 'CatalogReader|Subscriber|OneToOneRingBuffer' --output-on-failure -j14`
-Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 --target rune_client_broker_tests && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'ClientCatalogReadBroker|ClientDdlBroker' --output-on-failure -j14`
+Run: `cmake ~/Projects/se-worktrees/rune-client-cpp/build && cmake --build ~/Projects/se-worktrees/rune-client-cpp/build -j14 && ctest --test-dir ~/Projects/se-worktrees/rune-client-cpp/build -R 'CatalogReader|Subscriber|OneToOneRingBuffer' --output-on-failure -j14`
+Run: `cmake --build ~/Projects/se-worktrees/rune-broker/build-fast -j14 --target rune_client_broker_tests && ctest --test-dir ~/Projects/se-worktrees/rune-broker/build-fast -R 'ClientCatalogReadBroker|ClientDdlBroker' --output-on-failure -j14`
 Expected: PASS.
 
 - [ ] **Step 5: Commit** (two repos)
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp add include src tests CMakeLists.txt
-git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp commit -m "feat(client): catalogHistory / catalogAsOf / catalogDiff over the shared replay library (cached prefix)
+git -C ~/Projects/se-worktrees/rune-client-cpp add include src tests CMakeLists.txt
+git -C ~/Projects/se-worktrees/rune-client-cpp commit -m "feat(client): catalogHistory / catalogAsOf / catalogDiff over the shared replay library (cached prefix)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs/node/tests/client
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "test(catalog): the real client's catalog reads against a real broker
+git -C ~/Projects/se-worktrees/rune-broker add libs/node/tests/client
+git -C ~/Projects/se-worktrees/rune-broker commit -m "test(catalog): the real client's catalog reads against a real broker
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -3800,27 +3800,27 @@ TEST(QlCatalogStatementsRegression, ParseScriptErrorNamesTheStatementIndexRegres
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cmake /Users/vradu/Projects/se-worktrees/rune-ql/build && cmake --build /Users/vradu/Projects/se-worktrees/rune-ql/build -j14 --target rune_ql_tests`
+Run: `cmake ~/Projects/se-worktrees/rune-ql/build && cmake --build ~/Projects/se-worktrees/rune-ql/build -j14 --target rune_ql_tests`
 Expected: compile errors (`DropTopicDef` undeclared).
 
 - [ ] **Step 3: Implement** the grammar (one new `parseX()` per statement in the existing recursive-descent style; `parseStatement()` dispatches on the first keyword: `topic`, `transient`, `alter`, `drop`, `show`, `diff`). Dotted config keys are tokenised as `IDENT ('.' IDENT)*` joined. `parse()` = `parseStatement()` + an end-of-input check (only whitespace / comments may follow); `parseScript()` loops `parseStatement()` until end of input, recording the 1-based index of each statement (F8). `replicas` parses as an integer checked against `[0, INT16_MAX]` (F31).
 
-- [ ] **Step 4: Update the client** for the new variant (`rune-client-cpp/src/cli/Cli.cpp` uses `parse`'s result: replace its `std::get_if<TopicDef>` / `<AlterTopicDef>` handling with a `std::visit` over `Statement`, every new alternative answering "not supported by 'schema apply' — use 'rune ql'" until Task 15; `schema apply` keeps the single-statement `parse()`, so a file with several statements is now an explicit parse error naming `rune ql -f` instead of applying only the first — F8, pinned by a new `RuneCliOffline` case `SchemaApplyRefusesAMultiStatementFileRegression` in `rune-client-cpp/tests/RuneCliOfflineTest.cpp`). Build the client and run `ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -R RuneCliOffline --output-on-failure`.
+- [ ] **Step 4: Update the client** for the new variant (`rune-client-cpp/src/cli/Cli.cpp` uses `parse`'s result: replace its `std::get_if<TopicDef>` / `<AlterTopicDef>` handling with a `std::visit` over `Statement`, every new alternative answering "not supported by 'schema apply' — use 'rune ql'" until Task 15; `schema apply` keeps the single-statement `parse()`, so a file with several statements is now an explicit parse error naming `rune ql -f` instead of applying only the first — F8, pinned by a new `RuneCliOffline` case `SchemaApplyRefusesAMultiStatementFileRegression` in `rune-client-cpp/tests/RuneCliOfflineTest.cpp`). Build the client and run `ctest --test-dir ~/Projects/se-worktrees/rune-client-cpp/build -R RuneCliOffline --output-on-failure`.
 
 - [ ] **Step 5: Run**
 
-Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-ql/build -j14 && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-ql/build --output-on-failure && cmake --build /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -j14`
+Run: `cmake --build ~/Projects/se-worktrees/rune-ql/build -j14 && ctest --test-dir ~/Projects/se-worktrees/rune-ql/build --output-on-failure && cmake --build ~/Projects/se-worktrees/rune-client-cpp/build -j14`
 Expected: all rune-ql tests PASS; client builds.
 
 - [ ] **Step 6: Commit** (two repos)
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-ql add include src tests CMakeLists.txt
-git -C /Users/vradu/Projects/se-worktrees/rune-ql commit -m "feat(ql): SHOW HISTORY / AS OF / DIFF, DROP TOPIC|VIEW, ALTER TOPIC SET, replicas, untyped topics
+git -C ~/Projects/se-worktrees/rune-ql add include src tests CMakeLists.txt
+git -C ~/Projects/se-worktrees/rune-ql commit -m "feat(ql): SHOW HISTORY / AS OF / DIFF, DROP TOPIC|VIEW, ALTER TOPIC SET, replicas, untyped topics
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
-git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp add src/cli/Cli.cpp tests/RuneCliOfflineTest.cpp
-git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp commit -m "refactor(cli): visit the rune-ql Statement variant; schema apply refuses multi-statement files
+git -C ~/Projects/se-worktrees/rune-client-cpp add src/cli/Cli.cpp tests/RuneCliOfflineTest.cpp
+git -C ~/Projects/se-worktrees/rune-client-cpp commit -m "refactor(cli): visit the rune-ql Statement variant; schema apply refuses multi-statement files
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -4036,20 +4036,20 @@ TEST(RuneCliBrokerRegression, DiffOfTwoBrokersReportsDifferencesWithExit3) {
 
 - [ ] **Step 2: Run to verify they fail**, **Step 3: implement**, **Step 4: Run**
 
-Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -j14 && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -R 'RuneCli' --output-on-failure -j14`
+Run: `cmake --build ~/Projects/se-worktrees/rune-client-cpp/build -j14 && ctest --test-dir ~/Projects/se-worktrees/rune-client-cpp/build -R 'RuneCli' --output-on-failure -j14`
 Expected: PASS (the live cases skip without a broker, as today).
-Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 --target rune_client_broker_tests && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'RuneCliBroker|ClientCatalogReadBroker|ClientDdlBroker' --output-on-failure -j14`
+Run: `cmake --build ~/Projects/se-worktrees/rune-broker/build-fast -j14 --target rune_client_broker_tests && ctest --test-dir ~/Projects/se-worktrees/rune-broker/build-fast -R 'RuneCliBroker|ClientCatalogReadBroker|ClientDdlBroker' --output-on-failure -j14`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp add include src tests CMakeLists.txt
-git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp commit -m "feat(cli): rune ql (-f scripts, --request-id) + rune catalog export|replay|diff (fingerprint-verified, idempotent replay)
+git -C ~/Projects/se-worktrees/rune-client-cpp add include src tests CMakeLists.txt
+git -C ~/Projects/se-worktrees/rune-client-cpp commit -m "feat(cli): rune ql (-f scripts, --request-id) + rune catalog export|replay|diff (fingerprint-verified, idempotent replay)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs/node/tests/client libs/node/CMakeLists.txt
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "test(catalog): the real rune CLI against real brokers (ql scripts, request ids, export/replay/diff)
+git -C ~/Projects/se-worktrees/rune-broker add libs/node/tests/client libs/node/CMakeLists.txt
+git -C ~/Projects/se-worktrees/rune-broker commit -m "test(catalog): the real rune CLI against real brokers (ql scripts, request ids, export/replay/diff)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -4167,14 +4167,14 @@ TEST(CatalogBootRegression, HaltedBootReplayStillBootsAndRefusesDdl) {
 
 - [ ] **Step 2: Run to verify they fail**, **Step 3: implement**, **Step 4: Run**
 
-Run: `cmake /Users/vradu/Projects/se-worktrees/rune-broker/build-fast && cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'CatalogBoot|SchemaRegistry|ViewRegistry|ViewRecovery|ViewReadiness|TopicName|PerWorkerReplicationWiring|PartitionReplica|CatalogApplier|CatalogWritePath|SchemaPersistence' --output-on-failure -j14`
+Run: `cmake ~/Projects/se-worktrees/rune-broker/build-fast && cmake --build ~/Projects/se-worktrees/rune-broker/build-fast -j14 && ctest --test-dir ~/Projects/se-worktrees/rune-broker/build-fast -R 'CatalogBoot|SchemaRegistry|ViewRegistry|ViewRecovery|ViewReadiness|TopicName|PerWorkerReplicationWiring|PartitionReplica|CatalogApplier|CatalogWritePath|SchemaPersistence' --output-on-failure -j14`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add -A libs
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "feat(catalog): boot from __catalog; retire __topic_schemas, __views and runtime-topic recovery (no migration)
+git -C ~/Projects/se-worktrees/rune-broker add -A libs
+git -C ~/Projects/se-worktrees/rune-broker commit -m "feat(catalog): boot from __catalog; retire __topic_schemas, __views and runtime-topic recovery (no migration)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -4276,14 +4276,14 @@ TEST(NodeConfigRegression, RuneTopicsIsRefusedWithAPointerToDdl) {
 
 - [ ] **Step 2: Run to verify they fail**, **Step 3: implement** + migrate the listed files, **Step 4: Run**
 
-Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'TestCluster|NodeConfig|BrokerNode|DdlHarness|FdBudget' --output-on-failure -j14`
-Expected: PASS. `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-bench-rel -j14 --target rune_broker_benchmark` builds.
+Run: `cmake --build ~/Projects/se-worktrees/rune-broker/build-fast -j14 && ctest --test-dir ~/Projects/se-worktrees/rune-broker/build-fast -R 'TestCluster|NodeConfig|BrokerNode|DdlHarness|FdBudget' --output-on-failure -j14`
+Expected: PASS. `cmake --build ~/Projects/se-worktrees/rune-broker/build-bench-rel -j14 --target rune_broker_benchmark` builds.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add -A libs benchmark src
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "feat(catalog)!: remove RUNE_TOPICS, NodeConfig::topics, rf= and the static/runtime collision rule; FD budget from the catalog; TestCluster::defineTopic
+git -C ~/Projects/se-worktrees/rune-broker add -A libs benchmark src
+git -C ~/Projects/se-worktrees/rune-broker commit -m "feat(catalog)!: remove RUNE_TOPICS, NodeConfig::topics, rf= and the static/runtime collision rule; FD budget from the catalog; TestCluster::defineTopic
 
 Topics exist only through DDL. A set RUNE_TOPICS refuses to load with a pointer to the DDL docs.
 
@@ -4307,13 +4307,13 @@ Two files change meaning, not just mechanics:
 - [ ] **Step 1: Migrate** every file above by the rule; delete each `cfg.topics` line; build.
 - [ ] **Step 2: Run**
 
-Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'Compaction|Consensus|ControlledShutdown|D9|DdlConformanceBroker|EpochRestart|Gateway|MultiLeader|PerWorkerReplication|Rebalance|ShardMode|ShardNonBlocking|CatalogAssignmentEmit|CatalogBootstrapRoutingImage|TransientTopicDataPath|WorkerPoolParity|ClusterDisasterRecovery|CreateView|SchemaGateway' --output-on-failure -j14`
+Run: `cmake --build ~/Projects/se-worktrees/rune-broker/build-fast -j14 && ctest --test-dir ~/Projects/se-worktrees/rune-broker/build-fast -R 'Compaction|Consensus|ControlledShutdown|D9|DdlConformanceBroker|EpochRestart|Gateway|MultiLeader|PerWorkerReplication|Rebalance|ShardMode|ShardNonBlocking|CatalogAssignmentEmit|CatalogBootstrapRoutingImage|TransientTopicDataPath|WorkerPoolParity|ClusterDisasterRecovery|CreateView|SchemaGateway' --output-on-failure -j14`
 Expected: PASS — the same scenarios as before the migration.
 - [ ] **Step 3: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add -A libs tests
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "test(catalog): integration tests create their topics by DDL (TestCluster::defineTopic)
+git -C ~/Projects/se-worktrees/rune-broker add -A libs tests
+git -C ~/Projects/se-worktrees/rune-broker commit -m "test(catalog): integration tests create their topics by DDL (TestCluster::defineTopic)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -4331,7 +4331,7 @@ Spec §8: docker e2e scripts create their topics through the CLI or the probe be
 - Modify: `bench/kafka-compare/{cluster.sh,lib.sh,run-rune.sh,replbench.sh,README.md}` (native brokers: after start, `"$RUNE_CLI" ql -e "topic bench partitions $P with (tier = leader);" --broker …`; `RUNE_CLI` defaults to `../rune-client-cpp/build/rune`; the README's D0 row reads `topic bench … with (tier = leader)`)
 - Modify: `docs/release-notes/phase2b-c-typed-topic-routing.md`, `docs/release-notes/phase2b-e-transient-topics.md`, `docs/SELF-HOSTING.md`, `docs/superpowers/2026-09-14-rune-client-milestone-b-acceptance.md` (replace each `RUNE_TOPICS` example with the DDL equivalent; release notes keep their history in prose: "topics were then declared with an environment variable, since removed — see SELF-HOSTING")
 - Create: `scripts/check_no_rune_topics.py`, `scripts/rune_topics_allowlist.txt` (F5: the explicit allowlist the gate reads); modify root `CMakeLists.txt` (`add_test(NAME NoRuneTopicsGateRegression.RepositoryHasNoRuneTopicsMention COMMAND python3 ${CMAKE_SOURCE_DIR}/scripts/check_no_rune_topics.py ${CMAKE_SOURCE_DIR})`)
-- Fix-on-sight (F5): `build-release/` is tracked (`git ls-files build-release` lists `Makefile`s, `librune_node.a`, `rune_broker`, …) and its binaries contain the string. Untrack it — `git -C /Users/vradu/Projects/se-worktrees/rune-broker rm -r -q --cached build-release` (the files stay on disk) — and add `/build-*/` to `.gitignore` next to `/build/` so no build dir is ever tracked again. The gate's binary check below is its regression.
+- Fix-on-sight (F5): `build-release/` is tracked (`git ls-files build-release` lists `Makefile`s, `librune_node.a`, `rune_broker`, …) and its binaries contain the string. Untrack it — `git -C ~/Projects/se-worktrees/rune-broker rm -r -q --cached build-release` (the files stay on disk) — and add `/build-*/` to `.gitignore` next to `/build/` so no build dir is ever tracked again. The gate's binary check below is its regression.
 
 `scripts/rune_topics_allowlist.txt`:
 
@@ -4399,25 +4399,25 @@ print("ok: no RUNE_TOPICS mention outside scripts/rune_topics_allowlist.txt")
 
 - [ ] **Step 1: Run the gate to see it fail**
 
-Run: `python3 /Users/vradu/Projects/se-worktrees/rune-broker/scripts/check_no_rune_topics.py /Users/vradu/Projects/se-worktrees/rune-broker`
+Run: `python3 ~/Projects/se-worktrees/rune-broker/scripts/check_no_rune_topics.py ~/Projects/se-worktrees/rune-broker`
 Expected: exit 1 listing the docker / dr-e2e / bench / docs hits and the tracked `build-release/` binaries.
 
 - [ ] **Step 2: Migrate** every listed file; untrack `build-release/` and ignore `/build-*/` (F5).
 
 - [ ] **Step 3: Run the gate + the scripts**
 
-Run: `cmake /Users/vradu/Projects/se-worktrees/rune-broker/build-fast && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R NoRuneTopicsGate --output-on-failure`
+Run: `cmake ~/Projects/se-worktrees/rune-broker/build-fast && ctest --test-dir ~/Projects/se-worktrees/rune-broker/build-fast -R NoRuneTopicsGate --output-on-failure`
 Expected: PASS (`ok: no RUNE_TOPICS mention outside scripts/rune_topics_allowlist.txt`).
-Run: `bash /Users/vradu/Projects/se-worktrees/rune-broker/docker/e2e.sh` and `bash /Users/vradu/Projects/se-worktrees/rune-broker/docker/transient-failover-e2e.sh`
+Run: `bash ~/Projects/se-worktrees/rune-broker/docker/e2e.sh` and `bash ~/Projects/se-worktrees/rune-broker/docker/transient-failover-e2e.sh`
 Expected: both end with their existing success line (topics now created by `create-topics.sh`).
-Run: `cd /Users/vradu/Projects/se-worktrees/rune-broker/dr-e2e && python3 -m pytest tests/test_multi_leader_smoke.py -x`
+Run: `cd ~/Projects/se-worktrees/rune-broker/dr-e2e && python3 -m pytest tests/test_multi_leader_smoke.py -x`
 Expected: PASS (the smoke the others share the harness with; the full dr-e2e matrix runs at Checkpoint F).
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add -A docker dr-e2e bench docs scripts CMakeLists.txt .gitignore
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "chore(catalog): docker, dr-e2e and kafka-compare create topics by DDL; RUNE_TOPICS grep gate (explicit allowlist); untrack build-release
+git -C ~/Projects/se-worktrees/rune-broker add -A docker dr-e2e bench docs scripts CMakeLists.txt .gitignore
+git -C ~/Projects/se-worktrees/rune-broker commit -m "chore(catalog): docker, dr-e2e and kafka-compare create topics by DDL; RUNE_TOPICS grep gate (explicit allowlist); untrack build-release
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -4692,14 +4692,14 @@ INSTANTIATE_TEST_SUITE_P(AllCells, CatalogInteractionMatrixRegression, testing::
 
 - [ ] **Step 4: Run**
 
-Run: `cmake /Users/vradu/Projects/se-worktrees/rune-broker/build-fast && cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 --target rune_catalog_matrix_tests && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'CatalogMatrixCount|CatalogInteractionMatrix' --output-on-failure -j14`
+Run: `cmake ~/Projects/se-worktrees/rune-broker/build-fast && cmake --build ~/Projects/se-worktrees/rune-broker/build-fast -j14 --target rune_catalog_matrix_tests && ctest --test-dir ~/Projects/se-worktrees/rune-broker/build-fast -R 'CatalogMatrixCount|CatalogInteractionMatrix' --output-on-failure -j14`
 Expected: 2 count pins PASS; 300 cells PASS, 24 SKIPPED (R1).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "test(catalog): interaction matrix — expectation table + 3-broker harness + 324-cell parameterized unit matrix
+git -C ~/Projects/se-worktrees/rune-broker add libs
+git -C ~/Projects/se-worktrees/rune-broker commit -m "test(catalog): interaction matrix — expectation table + 3-broker harness + 324-cell parameterized unit matrix
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -4779,14 +4779,14 @@ INSTANTIATE_TEST_SUITE_P(Seeds, CatalogStressRegression, testing::Range(1u, 65u)
 
 - [ ] **Step 3: Run**
 
-Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 --target rune_catalog_stress_tests && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'CatalogStress' --output-on-failure -j14`
+Run: `cmake --build ~/Projects/se-worktrees/rune-broker/build-fast -j14 --target rune_catalog_stress_tests && ctest --test-dir ~/Projects/se-worktrees/rune-broker/build-fast -R 'CatalogStress' --output-on-failure -j14`
 Expected: 64 seeds PASS. A failure prints its seed + step: rerun that seed alone (`--gtest_filter='*Seeds/<n>'`), fix the bug, add a named `*Regression` unit test for it in the owning task's test file.
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "test(catalog): seeded model-checked catalog stress (64 seeds x 400 steps, independent model)
+git -C ~/Projects/se-worktrees/rune-broker add libs
+git -C ~/Projects/se-worktrees/rune-broker commit -m "test(catalog): seeded model-checked catalog stress (64 seeds x 400 steps, independent model)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -4885,14 +4885,14 @@ TEST(ClientDdlClusterRegression, BelowMinIsrAndWaitFailsExplicitlyWithNotLeader)
 
 - [ ] **Step 2: Run**
 
-Run: `cmake /Users/vradu/Projects/se-worktrees/rune-broker/build-fast && cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 --target rune_catalog_integration_tests rune_catalog_replication_tests rune_client_broker_tests && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'CatalogCluster|CatalogReplication|ClientDdlCluster' --output-on-failure -j4`
+Run: `cmake ~/Projects/se-worktrees/rune-broker/build-fast && cmake --build ~/Projects/se-worktrees/rune-broker/build-fast -j14 --target rune_catalog_integration_tests rune_catalog_replication_tests rune_client_broker_tests && ctest --test-dir ~/Projects/se-worktrees/rune-broker/build-fast -R 'CatalogCluster|CatalogReplication|ClientDdlCluster' --output-on-failure -j4`
 Expected: PASS (`-j4`: each cell runs three brokers).
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "test(catalog): 3-node BrokerNode slice — runtime DDL through every broker, leader kill mid-DDL (closes E2 multi-node DDL carry-over)
+git -C ~/Projects/se-worktrees/rune-broker add libs
+git -C ~/Projects/se-worktrees/rune-broker commit -m "test(catalog): 3-node BrokerNode slice — runtime DDL through every broker, leader kill mid-DDL (closes E2 multi-node DDL carry-over)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -4950,21 +4950,21 @@ TEST(CatalogAllocRegression, IdleCatalogAdminPassAllocatesNothingRegression) {
 
 - [ ] **Step 2: Run the tests**
 
-Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'CatalogGates|CatalogAlloc|SteadyStateDutyPassesNeverAllocate|SteadyStateProduceEvictAndPushReadNeverAllocate|RingRebuildWithMoreProducersThanTheMarkerSetNeverAllocates|ZeroAlloc' --output-on-failure -j14`
+Run: `cmake --build ~/Projects/se-worktrees/rune-broker/build-fast -j14 && ctest --test-dir ~/Projects/se-worktrees/rune-broker/build-fast -R 'CatalogGates|CatalogAlloc|SteadyStateDutyPassesNeverAllocate|SteadyStateProduceEvictAndPushReadNeverAllocate|RingRebuildWithMoreProducersThanTheMarkerSetNeverAllocates|ZeroAlloc' --output-on-failure -j14`
 Expected: PASS.
 
 - [ ] **Step 3: Benchmarks** — boot replay (Release gate) and hot-path parity against the base commit:
 
 ```bash
-cmake /Users/vradu/Projects/se-worktrees/rune-broker/build-bench-rel && cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-bench-rel -j14 --target rune_broker_benchmark
-/Users/vradu/Projects/se-worktrees/rune-broker/build-bench-rel/rune_broker_benchmark --benchmark_filter='CatalogBootReplay' --benchmark_repetitions=5
+cmake ~/Projects/se-worktrees/rune-broker/build-bench-rel && cmake --build ~/Projects/se-worktrees/rune-broker/build-bench-rel -j14 --target rune_broker_benchmark
+~/Projects/se-worktrees/rune-broker/build-bench-rel/rune_broker_benchmark --benchmark_filter='CatalogBootReplay' --benchmark_repetitions=5
 # hot-path parity: the same filter on the base (7d86db94, built in a scratch worktree) and on this branch
-git -C /Users/vradu/Projects/se-worktrees/rune-broker worktree add /tmp/catalog-base 7d86db94
-cmake -S /tmp/catalog-base -B /tmp/catalog-base/build-bench-rel -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_BENCHMARKS=ON -DBUILD_TESTING=OFF -DCMAKE_TOOLCHAIN_FILE=/Users/vradu/Projects/se-worktrees/rune-broker/build/Debug/generators/conan_toolchain.cmake -DRUNE_PROTOCOL_INCLUDE=/Users/vradu/Projects/se-worktrees/rune-protocol/include -DRUNE_CODEC_ROOT=/Users/vradu/Projects/se-worktrees/rune-codec && cmake --build /tmp/catalog-base/build-bench-rel -j14 --target rune_broker_benchmark
-for b in /tmp/catalog-base/build-bench-rel /Users/vradu/Projects/se-worktrees/rune-broker/build-bench-rel; do
+git -C ~/Projects/se-worktrees/rune-broker worktree add /tmp/catalog-base 7d86db94
+cmake -S /tmp/catalog-base -B /tmp/catalog-base/build-bench-rel -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_BENCHMARKS=ON -DBUILD_TESTING=OFF -DCMAKE_TOOLCHAIN_FILE=~/Projects/se-worktrees/rune-broker/build/Debug/generators/conan_toolchain.cmake -DRUNE_PROTOCOL_INCLUDE=~/Projects/se-worktrees/rune-protocol/include -DRUNE_CODEC_ROOT=~/Projects/se-worktrees/rune-codec && cmake --build /tmp/catalog-base/build-bench-rel -j14 --target rune_broker_benchmark
+for b in /tmp/catalog-base/build-bench-rel ~/Projects/se-worktrees/rune-broker/build-bench-rel; do
   $b/rune_broker_benchmark --benchmark_filter='WorkerProduceLatency|ProducePath|PushRead|FusedRuntimePass' --benchmark_repetitions=5 --benchmark_report_aggregates_only=true
 done
-git -C /Users/vradu/Projects/se-worktrees/rune-broker worktree remove /tmp/catalog-base
+git -C ~/Projects/se-worktrees/rune-broker worktree remove /tmp/catalog-base
 ```
 
 Expected: `CatalogBootReplay` median < 1 s; every hot-path benchmark's median within ±5 % of the base (noise band; the catalog adds nothing to these paths). A regression beyond 5 % is a bug to find and fix in this task (with a `*Regression` test), not a number to accept. Record all medians in the commit body. (`/tmp/catalog-base` is a throwaway worktree the step removes; it is built against the base protocol headers' superset, which compile unchanged.)
@@ -4972,8 +4972,8 @@ Expected: `CatalogBootReplay` median < 1 s; every hot-path benchmark's median wi
 - [ ] **Step 4: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add benchmark libs CMakeLists.txt
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -F /tmp/catalog-gates-msg.txt
+git -C ~/Projects/se-worktrees/rune-broker add benchmark libs CMakeLists.txt
+git -C ~/Projects/se-worktrees/rune-broker commit -F /tmp/catalog-gates-msg.txt
 ```
 
 where `/tmp/catalog-gates-msg.txt` is written in Step 3 from the benchmark output: first line `test(catalog): gates — 10k-event boot replay < 1 s, idle catalog admin pass allocates nothing, hot-path alloc gates green, hot-path benches at parity`, a blank line, one line per benchmark `<name>: base <median> -> branch <median> (<delta %>)` plus `CatalogBootReplay: <median>`, a blank line, `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
@@ -5000,17 +5000,17 @@ Spec §10 "Docker e2e, 3 nodes": 1. DDL through each broker; 2. the `__catalog` 
 - [ ] **Step 1: Write the compose file, the `.rql` and the script.**
 - [ ] **Step 2: Run**
 
-Run: `bash /Users/vradu/Projects/se-worktrees/rune-broker/docker/catalog-e2e.sh`
+Run: `bash ~/Projects/se-worktrees/rune-broker/docker/catalog-e2e.sh`
 Expected: ends with `CATALOG-E2E: OK`, exit 0.
 - [ ] **Step 3: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp add examples/view_probe.cpp
-git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp commit -m "feat(examples): view_probe --create-only (catalog e2e)
+git -C ~/Projects/se-worktrees/rune-client-cpp add examples/view_probe.cpp
+git -C ~/Projects/se-worktrees/rune-client-cpp commit -m "feat(examples): view_probe --create-only (catalog e2e)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add docker
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "test(catalog): docker e2e — 3-node DDL via each broker, leader killed mid-DDL, export/replay/diff into a fresh cluster
+git -C ~/Projects/se-worktrees/rune-broker add docker
+git -C ~/Projects/se-worktrees/rune-broker commit -m "test(catalog): docker e2e — 3-node DDL via each broker, leader killed mid-DDL, export/replay/diff into a fresh cluster
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -5026,12 +5026,12 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - Modify: `rune-client-cpp/README.md` (the new API + CLI commands), `rune-ql/README.md` if present (the new statements).
 
 - [ ] **Step 1: Write the docs.**
-- [ ] **Step 2: Verify** every statement in them parses with the built CLI (`/Users/vradu/Projects/se-worktrees/rune-client-cpp/build/rune ql -e "<each statement>" --dry-run`), and rerun the grep gate: `ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R NoRuneTopicsGate --output-on-failure` — it passes with the release note's mentions inside its allowlisted count; any other doc mention (e.g. in `SELF-HOSTING.md` or `CATALOG.md`) fails it.
+- [ ] **Step 2: Verify** every statement in them parses with the built CLI (`~/Projects/se-worktrees/rune-client-cpp/build/rune ql -e "<each statement>" --dry-run`), and rerun the grep gate: `ctest --test-dir ~/Projects/se-worktrees/rune-broker/build-fast -R NoRuneTopicsGate --output-on-failure` — it passes with the release note's mentions inside its allowlisted count; any other doc mention (e.g. in `SELF-HOSTING.md` or `CATALOG.md`) fails it.
 - [ ] **Step 3: Commit** (broker docs; client/ql READMEs in their repos)
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add docs
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "docs(catalog): topics are created by DDL; __catalog; history/as-of/diff; replay; halted-apply runbook; release notes
+git -C ~/Projects/se-worktrees/rune-broker add docs
+git -C ~/Projects/se-worktrees/rune-broker commit -m "docs(catalog): topics are created by DDL; __catalog; history/as-of/diff; replay; halted-apply runbook; release notes
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```

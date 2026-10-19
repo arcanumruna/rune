@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - **Language:** C++23. **Build:** CMake ≥3.25 + Conan 2. Match rune-protocol conventions (header-first, `namespace rune::codec`).
-- **New standalone repo** `rune-codec` at `/Users/vradu/Projects/rune-codec` (sibling to rune-protocol). No dependency on rune-broker / rune-protocol.
+- **New standalone repo** `rune-codec` at `~/Projects/rune-codec` (sibling to rune-protocol). No dependency on rune-broker / rune-protocol.
 - **Zero-copy on read:** `readField`/generated `decode` return views into the caller's buffer; no allocation on the read path.
 - **Determinism:** the fingerprint is a pure function of the canonical descriptor — identical across machines/runs.
 - **Primitive set (v1):** `INT32, INT64, UINT16, UINT32, UINT64, FLOAT64, BOOL, ENUM(int32-backed), STRING, BYTES`. `STRING`/`BYTES` are var-data; all others are fixed-width.
@@ -25,10 +25,10 @@
 ### Task 1: Repo scaffolding + toolchain smoke test
 
 **Files:**
-- Create: `/Users/vradu/Projects/rune-codec/CMakeLists.txt`
-- Create: `/Users/vradu/Projects/rune-codec/conanfile.py`
-- Create: `/Users/vradu/Projects/rune-codec/include/rune/codec/Version.h`
-- Test: `/Users/vradu/Projects/rune-codec/tests/SmokeTest.cpp`
+- Create: `~/Projects/rune-codec/CMakeLists.txt`
+- Create: `~/Projects/rune-codec/conanfile.py`
+- Create: `~/Projects/rune-codec/include/rune/codec/Version.h`
+- Test: `~/Projects/rune-codec/tests/SmokeTest.cpp`
 
 **Interfaces:**
 - Produces: a buildable CMake project with a `rune_codec` library target and a `rune_codec_tests` gtest target; `rune::codec::kVersion` constant.

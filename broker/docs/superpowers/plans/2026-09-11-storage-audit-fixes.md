@@ -18,7 +18,7 @@
 - Unique temp paths: use `getpid()` + atomic counter in every new test.
 - NO `conan create/export/upload`.
 - cmake is not on PATH; discover it from `$HOME/.conan2` (see build command below).
-- Build: `cmake --build /Users/vradu/Projects/rune-broker/build -j2`
+- Build: `cmake --build ~/Projects/rune-broker/build -j2`
 - Test filter: `ctest -R 'Log|LogSegment|OffsetIndex|MappedFile|Retention|ProducerState|LogCleaner|Compaction|PartitionApi' --timeout 60 --output-on-failure`
 - Do NOT dispatch subagents.
 
@@ -48,7 +48,7 @@
 ## Build/Test Command Reference
 
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 if ! command -v cmake >/dev/null 2>&1; then
   CMAKE_BIN=$(dirname "$(find "$HOME/.conan2" -type f -name cmake -path '*/bin/*' 2>/dev/null | head -1)")
   export PATH="$CMAKE_BIN:$PATH"
@@ -75,7 +75,7 @@ cd build && ctest -R 'Log|LogSegment|OffsetIndex|MappedFile|Retention|ProducerSt
 - [ ] **Step 1: Confirm no non-test callers**
 
 ```bash
-grep -r "ProducerState\b" /Users/vradu/Projects/rune-broker/libs --include="*.h" --include="*.cpp" \
+grep -r "ProducerState\b" ~/Projects/rune-broker/libs --include="*.h" --include="*.cpp" \
   | grep -v ProducerStateManager | grep -v ProducerStateTest | grep -v ProducerState.h
 ```
 
@@ -84,8 +84,8 @@ Expected: empty output (no production uses of the bare `ProducerState` class).
 - [ ] **Step 2: Delete the header and test file**
 
 ```bash
-rm /Users/vradu/Projects/rune-broker/libs/storage/include/rune/storage/ProducerState.h
-rm /Users/vradu/Projects/rune-broker/libs/storage/tests/storage/ProducerStateTest.cpp
+rm ~/Projects/rune-broker/libs/storage/include/rune/storage/ProducerState.h
+rm ~/Projects/rune-broker/libs/storage/tests/storage/ProducerStateTest.cpp
 ```
 
 - [ ] **Step 3: Remove ProducerStateTest from CMakeLists.txt**
@@ -96,7 +96,7 @@ Then search for any `ProducerState\.h` include in CMakeLists and remove.
 - [ ] **Step 4: Build + run remaining ProducerState tests to confirm no regression**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 CMAKE_BIN=$(dirname "$(find "$HOME/.conan2" -type f -name cmake -path '*/bin/*' 2>/dev/null | head -1)")
 export PATH="$CMAKE_BIN:$PATH"
 cmake --build build -j2
@@ -108,7 +108,7 @@ Expected: `ProducerStateManagerTest` suite still passes; `ProducerStateTest` no 
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 git add -A
 git commit -m "fix(storage): remove legacy ProducerState (S1 — superseded by ProducerStateManager, no non-test callers)"
 ```
@@ -171,7 +171,7 @@ TEST(LogSegment, SyncMakesBatchesReadableOnReopen) {
 - [ ] **Step 2: Run to confirm it fails (LogSegment::sync() not yet declared)**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 CMAKE_BIN=$(dirname "$(find "$HOME/.conan2" -type f -name cmake -path '*/bin/*' 2>/dev/null | head -1)")
 export PATH="$CMAKE_BIN:$PATH"
 cmake --build build -j2 2>&1 | tail -20
@@ -300,7 +300,7 @@ void Log::sync() { activeSegment().sync(); }
 - [ ] **Step 6: Build + run sync test**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 CMAKE_BIN=$(dirname "$(find "$HOME/.conan2" -type f -name cmake -path '*/bin/*' 2>/dev/null | head -1)")
 export PATH="$CMAKE_BIN:$PATH"
 cmake --build build -j2 && cd build && ctest -R LogSegment --timeout 60 --output-on-failure
@@ -311,7 +311,7 @@ Expected: all `LogSegment` tests pass including `SyncMakesBatchesReadableOnReope
 - [ ] **Step 7: Run full suite**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker/build
+cd ~/Projects/rune-broker/build
 ctest --timeout 60 2>&1 | tail -5
 ```
 
@@ -320,7 +320,7 @@ Expected: all tests pass.
 - [ ] **Step 8: Commit**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 git add -A
 git commit -m "fix(storage): B1+B2 durable append — fdatasync .log + msync .index in LogSegment::sync(), called after every append (durable-by-default)"
 ```
@@ -386,7 +386,7 @@ TEST(LogSegment, RecoverProducesCanonicalIndexNoIndex2) {
 - [ ] **Step 2: Confirm test fails (recover() still writes .index2)**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 CMAKE_BIN=$(dirname "$(find "$HOME/.conan2" -type f -name cmake -path '*/bin/*' 2>/dev/null | head -1)")
 export PATH="$CMAKE_BIN:$PATH"
 cmake --build build -j2 && cd build && ctest -R 'RecoverProducesCanonicalIndex' --timeout 60 --output-on-failure
@@ -484,7 +484,7 @@ At the top of `LogSegment.cpp`, ensure these are present:
 - [ ] **Step 5: Build + run canonical-index test**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 CMAKE_BIN=$(dirname "$(find "$HOME/.conan2" -type f -name cmake -path '*/bin/*' 2>/dev/null | head -1)")
 export PATH="$CMAKE_BIN:$PATH"
 cmake --build build -j2 && cd build && ctest -R LogSegment --timeout 60 --output-on-failure
@@ -495,7 +495,7 @@ Expected: all LogSegment tests pass, including the new canonical-index test.
 - [ ] **Step 6: Run full suite**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker/build
+cd ~/Projects/rune-broker/build
 ctest --timeout 60 2>&1 | tail -5
 ```
 
@@ -504,7 +504,7 @@ Expected: all tests pass.
 - [ ] **Step 7: Commit**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 git add -A
 git commit -m "fix(storage): B3 — recover() writes canonical .index via atomic .index.tmp rename (no .index2 orphan)"
 ```
@@ -589,7 +589,7 @@ TEST(LogSegment, RecoverIndexMatchesAppendIndex) {
 
 Build and run:
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 CMAKE_BIN=$(dirname "$(find "$HOME/.conan2" -type f -name cmake -path '*/bin/*' 2>/dev/null | head -1)")
 export PATH="$CMAKE_BIN:$PATH"
 cmake --build build -j2 && cd build && ctest -R 'RecoverIndexMatchesAppendIndex' --timeout 60 --output-on-failure
@@ -664,7 +664,7 @@ bytesSince += total;
 - [ ] **Step 4: Build + run**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 CMAKE_BIN=$(dirname "$(find "$HOME/.conan2" -type f -name cmake -path '*/bin/*' 2>/dev/null | head -1)")
 export PATH="$CMAKE_BIN:$PATH"
 cmake --build build -j2 && cd build && ctest -R 'Log|LogSegment|LogCleaner' --timeout 60 --output-on-failure
@@ -675,7 +675,7 @@ Expected: all pass.
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 git add -A
 git commit -m "fix(storage): C2 — unified shouldIndex() helper makes recover()/append()/buildIndex() produce identical sparse index"
 ```
@@ -776,7 +776,7 @@ TEST(Log, TruncateToZeroRemovesAll) {
 - [ ] **Step 2: Confirm C1-a fails**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 CMAKE_BIN=$(dirname "$(find "$HOME/.conan2" -type f -name cmake -path '*/bin/*' 2>/dev/null | head -1)")
 export PATH="$CMAKE_BIN:$PATH"
 cmake --build build -j2 && cd build && ctest -R 'TruncateInsideLastBatch' --timeout 60 --output-on-failure
@@ -840,7 +840,7 @@ std::filesystem::resize_file(lpath, static_cast<std::uintmax_t>(cutPos));
 - [ ] **Step 4: Build + run truncateTo tests**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 CMAKE_BIN=$(dirname "$(find "$HOME/.conan2" -type f -name cmake -path '*/bin/*' 2>/dev/null | head -1)")
 export PATH="$CMAKE_BIN:$PATH"
 cmake --build build -j2 && cd build && ctest -R 'Log' --timeout 60 --output-on-failure
@@ -851,7 +851,7 @@ Expected: all Log tests pass.
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 git add -A
 git commit -m "fix(storage): C1 — truncateTo uses validEnd default (no silent keep-everything), rounds down to batch boundary"
 ```
@@ -1018,7 +1018,7 @@ if (e.windowHead < 0 || e.windowHead >= kRetryWindowSize)
 - [ ] **Step 6: Build + run ProducerStateManager tests**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 CMAKE_BIN=$(dirname "$(find "$HOME/.conan2" -type f -name cmake -path '*/bin/*' 2>/dev/null | head -1)")
 export PATH="$CMAKE_BIN:$PATH"
 cmake --build build -j2 && cd build && ctest -R ProducerState --timeout 60 --output-on-failure
@@ -1029,7 +1029,7 @@ Expected: all pass.
 - [ ] **Step 7: Commit**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 git add -A
 git commit -m "fix(storage): S2 remove dead epoch if-body, S3 assert baseSequence>=0, S4 64-bit snapshot size, S5 clamp windowHead/windowCount on load"
 ```
@@ -1185,7 +1185,7 @@ TEST(LogSegment, SyncedDataSurvivesFreshSegmentOpen) {
 - [ ] **Step 3: Build + run new crash-durability tests**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 CMAKE_BIN=$(dirname "$(find "$HOME/.conan2" -type f -name cmake -path '*/bin/*' 2>/dev/null | head -1)")
 export PATH="$CMAKE_BIN:$PATH"
 cmake --build build -j2 && cd build && ctest -R 'LogCleaner|LogSegment' --timeout 60 --output-on-failure
@@ -1196,7 +1196,7 @@ Expected: all pass.
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 git add -A
 git commit -m "test(storage): T1/T2 real crash-durability tests — compact+reopen, sync+reopen, no .index2 orphan post-compact"
 ```
@@ -1327,7 +1327,7 @@ In `Log.cpp` `maybeRoll()`, add:
 - [ ] **Step 7: Build + run full suite**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 CMAKE_BIN=$(dirname "$(find "$HOME/.conan2" -type f -name cmake -path '*/bin/*' 2>/dev/null | head -1)")
 export PATH="$CMAKE_BIN:$PATH"
 cmake --build build -j2
@@ -1342,7 +1342,7 @@ Expected: all tests pass, both sequential and parallel (-j4).
 - [ ] **Step 8: Commit**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 git add -A
 git commit -m "fix(storage): CL1-CL6 cleanups, C3 doc, C4 2GiB guard in OffsetIndex::append+buildIndex, S6 cap buildOffsetMap at activeBase"
 ```
@@ -1354,7 +1354,7 @@ git commit -m "fix(storage): CL1-CL6 cleanups, C3 doc, C4 2GiB guard in OffsetIn
 - [ ] **Step 1: Full sequential test run**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 CMAKE_BIN=$(dirname "$(find "$HOME/.conan2" -type f -name cmake -path '*/bin/*' 2>/dev/null | head -1)")
 export PATH="$CMAKE_BIN:$PATH"
 cmake --build build -j2
@@ -1366,7 +1366,7 @@ Expected: all tests pass.
 - [ ] **Step 2: Parallel test run**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker/build
+cd ~/Projects/rune-broker/build
 ctest -j4 --timeout 60 2>&1 | tail -3
 ```
 
@@ -1384,31 +1384,31 @@ Expected: empty.
 
 ```bash
 # Confirm ProducerState.h is gone (S1)
-ls /Users/vradu/Projects/rune-broker/libs/storage/include/rune/storage/ProducerState.h 2>&1
+ls ~/Projects/rune-broker/libs/storage/include/rune/storage/ProducerState.h 2>&1
 
 # Confirm sync() is declared (B1+B2)
-grep -n "void sync" /Users/vradu/Projects/rune-broker/libs/storage/include/rune/storage/LogSegment.h
+grep -n "void sync" ~/Projects/rune-broker/libs/storage/include/rune/storage/LogSegment.h
 
 # Confirm no .index2 in recover() (B3)
-grep -n "index2" /Users/vradu/Projects/rune-broker/libs/storage/src/LogSegment.cpp
+grep -n "index2" ~/Projects/rune-broker/libs/storage/src/LogSegment.cpp
 
 # Confirm shouldIndex helper (C2)
-grep -n "shouldIndex" /Users/vradu/Projects/rune-broker/libs/storage/src/LogSegment.cpp
+grep -n "shouldIndex" ~/Projects/rune-broker/libs/storage/src/LogSegment.cpp
 
 # Confirm cutPos=0 default (C1)
-grep -n "cutPos" /Users/vradu/Projects/rune-broker/libs/storage/src/Log.cpp
+grep -n "cutPos" ~/Projects/rune-broker/libs/storage/src/Log.cpp
 
 # Confirm 64-bit size (S4)
-grep -n "uint64_t" /Users/vradu/Projects/rune-broker/libs/storage/src/ProducerStateManager.cpp | head -5
+grep -n "uint64_t" ~/Projects/rune-broker/libs/storage/src/ProducerStateManager.cpp | head -5
 
 # Confirm windowCount clamp (S5)
-grep -n "clamp" /Users/vradu/Projects/rune-broker/libs/storage/src/ProducerStateManager.cpp
+grep -n "clamp" ~/Projects/rune-broker/libs/storage/src/ProducerStateManager.cpp
 ```
 
 - [ ] **Step 5: Final squash commit (audit)**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 git add -A
 git commit -m "fix(storage): durable append+index sync, canonical index recovery (no .index2 orphan), exact truncateTo, reproducible sparse index, dedup/overflow fixes + real crash-durability tests [audit]"
 ```

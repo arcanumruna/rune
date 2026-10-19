@@ -75,6 +75,7 @@ RUN cmake -S . -B build -G Ninja \
         -DRUNE_PROTOCOL_INCLUDE=/rune-protocol/include \
         -DRUNE_CODEC_ROOT=/rune-codec \
         -DRUNE_QL_ROOT=/rune-ql \
+        -DRUNE_CRYPTO_ROOT=/rune-crypto \
         -DFLIGHT_RECORDER_DIR=/flight-recorder \
     && cmake --build build --target rune_schema_probe -j2
 

@@ -106,6 +106,7 @@ RUN cmake -S . -B build -G Ninja \
         -DRUNE_PROTOCOL_INCLUDE=/rune-protocol/include \
         -DRUNE_CODEC_ROOT=/rune-codec \
         -DRUNE_CRYPTO_ROOT=/rune-crypto \
+        -DFLIGHT_RECORDER_DIR=/flight-recorder \
         -DRUNE_TLS=ON \
     && cmake --build build --target rune_broker rune_role
 

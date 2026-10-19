@@ -1,7 +1,7 @@
 # DUR-1 fix round — Kafka model for acks=all (report)
 
-Broker: `/Users/vradu/Projects/rune-broker-wt31` branch `feat/dur-1` (local, not pushed), on top of 0ff9322.
-Protocol: `/Users/vradu/Projects/rune-protocol-fe` branch `feat/fetch-epoch` (local, not pushed).
+Broker: `~/Projects/rune-broker-wt31` branch `feat/dur-1` (local, not pushed), on top of 0ff9322.
+Protocol: `~/Projects/rune-protocol-fe` branch `feat/fetch-epoch` (local, not pushed).
 Commits: see §6.  Nothing pushed; no conan command run; no subagents.
 
 Binding decision implemented (user, 2026-10-03): acks=all = Kafka model — HW = min LEO over the

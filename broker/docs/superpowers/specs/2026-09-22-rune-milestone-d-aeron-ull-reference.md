@@ -1,6 +1,6 @@
 # Milestone D — Aeron/Agrona Low-Latency Reference (techniques Rune mirrors)
 
-> **STATUS: REFERENCE.** Source-read of Aeron at `/Users/vradu/Projects/aeron`
+> **STATUS: REFERENCE.** Source-read of Aeron at `~/Projects/aeron`
 > (+ Agrona 2.6.0 sources; C ports under `aeron-client/src/main/c/`). Per the
 > "Aeron is the bible" rule, Rune mirrors these techniques exactly. Two parts:
 > (1) the low-latency **primitives** (hot path + control plane); (2) the **Aeron

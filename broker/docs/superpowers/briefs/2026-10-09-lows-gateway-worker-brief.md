@@ -1,6 +1,6 @@
 # Lows batch C: gateway, worker and DR harness
 
-Worktree /Users/vradu/Projects/rune-broker-wt72, branch fix/lows-gateway-worker (from integ/perf-defaults 4b0b6a6).
+Worktree ~/Projects/rune-broker-wt72, branch fix/lows-gateway-worker (from integ/perf-defaults 4b0b6a6).
 
 ## Items
 1. **D8b-L: re-review lows.** Find the D8b re-review in docs/superpowers/briefs (2026-10-04-d8b-review.md and
@@ -39,7 +39,7 @@ Worktree /Users/vradu/Projects/rune-broker-wt72, branch fix/lows-gateway-worker 
 - Hot-path budget: worker / owner duty pass at most 100 us. Any change touching worker, owner or duty-pass code
   states its cost; measure before/after if it touches the per-pass path.
 - Aeron-faithful consensus (documented tightenings only).
-- Build dir: create `build-fast` with the same cache settings as /Users/vradu/Projects/rune-broker-wt26/build-fast:
+- Build dir: create `build-fast` with the same cache settings as ~/Projects/rune-broker-wt26/build-fast:
   `cmake -S . -B build-fast -G Ninja -DBUILD_TESTING=ON` with the CMAKE_* / RUNE_PROTOCOL_INCLUDE / OPENSSL_ROOT_DIR /
   CMAKE_IGNORE_PREFIX_PATH / CMAKE_EXE_LINKER_FLAGS=-lz values copied from that dir's CMakeCache.txt. Ninja and
   ccache are on PATH.

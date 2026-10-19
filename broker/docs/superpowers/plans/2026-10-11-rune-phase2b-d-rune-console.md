@@ -10,7 +10,7 @@
 > 5. **Live tests move to real brokers** (catalog ruling F7): blocking `rune::cli::run(... --broker ...)` cases run in the broker repo's `rune_client_broker_tests` against in-process `OneBroker`s, not against the client repo's single-threaded `CliTestGateway`.
 > 6. **Auth interactions** (auth runs before D): the console logs in with `--user` / `--password-file` (or `RUNE_USER` / `RUNE_PASSWORD_FILE`; never a password in argv / env); an interactive console with `--user` and no password file prompts with echo off; the dev-mode banner and error names 44–47 come from the shared engine; `SessionRevoked` ends the console (auth D26). No new request types → no new grants; each statement needs its request's grant from the auth plan's op table.
 > 7. **Interactive idle**: the CLI client runs `RunnerMode::Invoker`; a console waiting at its prompt must keep pumping `Client::doWork()` or its session lapses. Task 4 adds a polling line source.
-> 8. Repos / paths fixed: worktrees `/Users/vradu/Projects/se-worktrees/*` only (the old `rune-broker-matviews` path is gone); docker e2e runs on the k3s VM under `flock /root/vm.lock`, never on the Mac.
+> 8. Repos / paths fixed: worktrees `~/Projects/se-worktrees/*` only (the old `rune-broker-matviews` path is gone); docker e2e runs on the k3s VM under `flock /root/vm.lock`, never on the Mac.
 > 9. Exit codes aligned with the existing CLI (2 = usage, 1 = local / parse error, N = the broker error code of the failing statement).
 
 **Goal:** A `rune console` command runs Rune QL statements interactively (`rune> ` prompt) or from a file (`-f`) over one broker session, sharing one executor with `rune ql`. `rune schema` becomes read-only (`list|get|generate`); the old `schema apply|alter` assertions move to console tests.
@@ -28,12 +28,12 @@
 - Branch `feat/phase2b-d-rune-console` in rune-ql, rune-client-cpp and rune-broker, cut from each repo's integration tip **after the authentication phase merged** (`feat/authentication`, or wherever it was merged):
   ```bash
   for r in rune-ql rune-client-cpp rune-broker; do
-    git -C /Users/vradu/Projects/se-worktrees/$r switch -c feat/phase2b-d-rune-console feat/authentication
+    git -C ~/Projects/se-worktrees/$r switch -c feat/phase2b-d-rune-console feat/authentication
   done
   ```
-  Verify before Task 1 (each must hit): `grep -n "parseScript" /Users/vradu/Projects/se-worktrees/rune-ql/include/rune/ql/Parser.h`, `grep -n "struct QlRun" /Users/vradu/Projects/se-worktrees/rune-client-cpp/src/cli/CatalogCommands.cpp`, `grep -n "passwordFile" /Users/vradu/Projects/se-worktrees/rune-client-cpp/include/rune/client/Client.h`, `grep -n "authStatus" /Users/vradu/Projects/se-worktrees/rune-client-cpp/include/rune/client/Client.h`. If the auth greps miss, auth has not merged: stop and report.
+  Verify before Task 1 (each must hit): `grep -n "parseScript" ~/Projects/se-worktrees/rune-ql/include/rune/ql/Parser.h`, `grep -n "struct QlRun" ~/Projects/se-worktrees/rune-client-cpp/src/cli/CatalogCommands.cpp`, `grep -n "passwordFile" ~/Projects/se-worktrees/rune-client-cpp/include/rune/client/Client.h`, `grep -n "authStatus" ~/Projects/se-worktrees/rune-client-cpp/include/rune/client/Client.h`. If the auth greps miss, auth has not merged: stop and report.
 - The client compiles `../rune-ql/src/*.cpp`, `../rune-codec` and `../rune-protocol/include`; the broker's `rune_client_broker_tests` compiles the client from `RUNE_CLIENT_ROOT` (default `../rune-client-cpp`). All three worktrees stay on `feat/phase2b-d-rune-console` while building.
-- **Builds:** rune-ql `cmake --build /Users/vradu/Projects/se-worktrees/rune-ql/build -j14 --target rune_ql_tests rune_ql_bench`; client `cmake --build /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -j14`; broker `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 --target rune_client_broker_tests`.
+- **Builds:** rune-ql `cmake --build ~/Projects/se-worktrees/rune-ql/build -j14 --target rune_ql_tests rune_ql_bench`; client `cmake --build ~/Projects/se-worktrees/rune-client-cpp/build -j14`; broker `cmake --build ~/Projects/se-worktrees/rune-broker/build-fast -j14 --target rune_client_broker_tests`.
 - **Test gate (CLAUDE.md #7):** each task runs the executables covering what it touches plus every new or changed test (its "Run" step names the filter). The FULL `*Regression*` suite runs at the checkpoints — after Task 2 (A), after Task 5 (B), after Task 6 (C, before the final review) — in every repo touched since the last checkpoint: `ctest --test-dir <build> -R Regression --output-on-failure -j14`, plus the client TSan build (`build_tsan`, `BUILD_TESTING=ON`) and broker ASan+UBSan / TSan (`build-asan`, `build-tsan`) per the sanitizer-checkpoint rule. A checkpoint failure is bisected over the commits since the last green checkpoint.
 - Nothing is pushed. Every commit message ends with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 
@@ -221,7 +221,7 @@ TEST(ParseScriptRegression, TransientTopicInAScript) {
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail** — `cmake --build /Users/vradu/Projects/se-worktrees/rune-ql/build -j14 --target rune_ql_tests` → `use of undeclared identifier 'classifyInput'`. (The `ParseScriptRegression.*` pins compile and are expected to pass already once the file builds; they guard behaviour the console depends on.)
+- [ ] **Step 2: Run to verify they fail** — `cmake --build ~/Projects/se-worktrees/rune-ql/build -j14 --target rune_ql_tests` → `use of undeclared identifier 'classifyInput'`. (The `ParseScriptRegression.*` pins compile and are expected to pass already once the file builds; they guard behaviour the console depends on.)
 
 - [ ] **Step 3: Implement.** Append to `include/rune/ql/Parser.h`, inside `namespace rune::ql`, after `parseScript`:
 
@@ -275,13 +275,13 @@ static void BM_ClassifyInput(benchmark::State& state) {
 BENCHMARK(BM_ClassifyInput);
 ```
 
-- [ ] **Step 5: Run** — `ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-ql/build -R 'ClassifyInput|ParseScript|QlCatalogStatements|Parser' --output-on-failure -j14` → PASS; `/Users/vradu/Projects/se-worktrees/rune-ql/build/rune_ql_bench --benchmark_filter='BM_ParseScript3|BM_ClassifyInput'` → record both numbers (reported, not gated; `BM_ClassifyInput` should be well under 1 µs).
+- [ ] **Step 5: Run** — `ctest --test-dir ~/Projects/se-worktrees/rune-ql/build -R 'ClassifyInput|ParseScript|QlCatalogStatements|Parser' --output-on-failure -j14` → PASS; `~/Projects/se-worktrees/rune-ql/build/rune_ql_bench --benchmark_filter='BM_ParseScript3|BM_ClassifyInput'` → record both numbers (reported, not gated; `BM_ClassifyInput` should be well under 1 µs).
 
 - [ ] **Step 6: Commit (rune-ql)**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-ql add include/rune/ql/Parser.h src/Parser.cpp tests/ScriptTest.cpp CMakeLists.txt benchmark/ParseBench.cpp
-git -C /Users/vradu/Projects/se-worktrees/rune-ql commit -m "feat(ql): classifyInput for the console continuation prompt; parseScript console pins
+git -C ~/Projects/se-worktrees/rune-ql add include/rune/ql/Parser.h src/Parser.cpp tests/ScriptTest.cpp CMakeLists.txt benchmark/ParseBench.cpp
+git -C ~/Projects/se-worktrees/rune-ql commit -m "feat(ql): classifyInput for the console continuation prompt; parseScript console pins
 
 Bench: BM_ParseScript3 <n> ns, BM_ClassifyInput <n> ns.
 
@@ -377,7 +377,7 @@ TEST(RuneCliBrokerRegression, QlExpectedVersionConflictIsTheBrokersSchemaConflic
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail** — client: `ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -R RuneCliCatalog --output-on-failure` → the two new tests fail (`--expected-version` / `--validate` unknown → exit 2 with "unknown option").
+- [ ] **Step 2: Run to verify they fail** — client: `ctest --test-dir ~/Projects/se-worktrees/rune-client-cpp/build -R RuneCliCatalog --output-on-failure` → the two new tests fail (`--expected-version` / `--validate` unknown → exit 2 with "unknown option").
 
 - [ ] **Step 3: Move the engine.** Create `src/cli/QlEngine.h` with the declarations above (plus the moved type definitions: the `P*` structs, `Prepared`, `IdSeq`, `LiveBroker`, `QlRun` — `QlRun`'s member functions stay inline in the header or move to `QlEngine.cpp`, the implementer's choice) and `src/cli/QlEngine.cpp` with the moved bodies, inside `namespace rune::cli::engine` and the same `#ifdef RUNE_CLI_LIVE_ENABLED` guards as today. In `CatalogCommands.cpp` replace the moved code with `#include "QlEngine.h"` and `using namespace engine;` inside `namespace rune::cli`. `cmdQl`:
   - parse flags: `parseArgs("ql", args, {"-e", "-f", "--request-id", "--broker", "--expected-version", "--user", "--password-file"}, {"--dry-run", "--verbose", "--validate"}, a, err)` (keep whatever credential flags the auth phase added — do not duplicate them);
@@ -386,16 +386,16 @@ TEST(RuneCliBrokerRegression, QlExpectedVersionConflictIsTheBrokersSchemaConflic
   - `LiveOptions lo{endpoint, a.value("--cli-egress"), a.value("--cli-stream-in"), a.value("--cli-stream-out"), a.value("--cli-data-dir"), a.has("--verbose"), …credentials as the auth phase reads them…}; broker.open(lo, err)`.
   - `QlRun run{broker, out, err, script, 1};` — `style` defaults to `Ql`, so `rune ql` output is byte-identical.
   In `QlRun`, every `return fail(brokerFailure(r.errorCode, r.detail));` becomes `lastErrorCode = r.errorCode; return fail(brokerFailure(r.errorCode, r.detail));` (a helper `failBroker(code, detail)` is fine).
-- [ ] **Step 4: Run** — `ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -R 'RuneCli' --output-on-failure -j14` → PASS (every pre-existing `RuneCliCatalog*` case unchanged); broker `ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'RuneCliBroker' --output-on-failure -j14` → PASS.
+- [ ] **Step 4: Run** — `ctest --test-dir ~/Projects/se-worktrees/rune-client-cpp/build -R 'RuneCli' --output-on-failure -j14` → PASS (every pre-existing `RuneCliCatalog*` case unchanged); broker `ctest --test-dir ~/Projects/se-worktrees/rune-broker/build-fast -R 'RuneCliBroker' --output-on-failure -j14` → PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp add src/cli tests/RuneCliCatalogTest.cpp CMakeLists.txt
-git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp commit -m "refactor(cli): the rune ql engine moves to QlEngine.{h,cpp} (shared with the console); rune ql --validate / --expected-version
+git -C ~/Projects/se-worktrees/rune-client-cpp add src/cli tests/RuneCliCatalogTest.cpp CMakeLists.txt
+git -C ~/Projects/se-worktrees/rune-client-cpp commit -m "refactor(cli): the rune ql engine moves to QlEngine.{h,cpp} (shared with the console); rune ql --validate / --expected-version
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs/node/tests/client/RuneCliBrokerRegressionTest.cpp
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "test(cli): rune ql --expected-version conflict answers SchemaConflict from a real broker
+git -C ~/Projects/se-worktrees/rune-broker add libs/node/tests/client/RuneCliBrokerRegressionTest.cpp
+git -C ~/Projects/se-worktrees/rune-broker commit -m "test(cli): rune ql --expected-version conflict answers SchemaConflict from a real broker
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -668,7 +668,7 @@ TEST(ConsoleOfflineRegression, ExpectedVersionMalformedIsCleanErrorNotCrash) {
 
 CMake: add `tests/RuneConsoleOfflineTest.cpp` to `rune_cli_offline_tests`' sources.
 
-- [ ] **Step 2: Run to verify they fail** — `cmake --build /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -j14 --target rune_cli_offline_tests` → `no matching function for call to 'run'` (no 4-argument overload yet).
+- [ ] **Step 2: Run to verify they fail** — `cmake --build ~/Projects/se-worktrees/rune-client-cpp/build -j14 --target rune_cli_offline_tests` → `no matching function for call to 'run'` (no 4-argument overload yet).
 
 - [ ] **Step 3: Public overload.** In `include/rune/cli/Cli.h` add `#include <istream>` and, after the existing declaration:
 
@@ -966,12 +966,12 @@ int run(std::vector<std::string> args, std::istream& in, std::ostream& out, std:
 ```
 CMake: `rune_cli_lib` gains `src/cli/Console.cpp`.
 
-- [ ] **Step 7: Run** — `ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -R 'RuneCli|Console' --output-on-failure -j14` → every `ConsoleOffline*` PASSES with all pre-existing CLI tests.
+- [ ] **Step 7: Run** — `ctest --test-dir ~/Projects/se-worktrees/rune-client-cpp/build -R 'RuneCli|Console' --output-on-failure -j14` → every `ConsoleOffline*` PASSES with all pre-existing CLI tests.
 - [ ] **Step 8: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp add src/cli include/rune/cli/Cli.h tests/RuneConsoleOfflineTest.cpp CMakeLists.txt
-git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp commit -m "feat(cli): rune console — REPL state machine, -f scripts, --dry-run on the shared rune ql engine
+git -C ~/Projects/se-worktrees/rune-client-cpp add src/cli include/rune/cli/Cli.h tests/RuneConsoleOfflineTest.cpp CMakeLists.txt
+git -C ~/Projects/se-worktrees/rune-client-cpp commit -m "feat(cli): rune console — REPL state machine, -f scripts, --dry-run on the shared rune ql engine
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -1141,7 +1141,7 @@ TEST(RuneConsoleBrokerRegression, SessionRevokedEndsTheConsoleRegression) {
 
 Add `tests/client/RuneConsoleBrokerRegressionTest.cpp` to `rune_client_broker_tests` in `libs/node/CMakeLists.txt`.
 
-- [ ] **Step 2: Run to verify they fail** — `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 --target rune_client_broker_tests && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R RuneConsoleBroker --output-on-failure` → fail (`runLive` stub: "live mode requires …").
+- [ ] **Step 2: Run to verify they fail** — `cmake --build ~/Projects/se-worktrees/rune-broker/build-fast -j14 --target rune_client_broker_tests && ctest --test-dir ~/Projects/se-worktrees/rune-broker/build-fast -R RuneConsoleBroker --output-on-failure` → fail (`runLive` stub: "live mode requires …").
 
 - [ ] **Step 3: Console success lines in `QlRun`** (`OutputStyle::Console`, DD2). In each DDL `run(...)`, after the success branch, print:
 
@@ -1226,16 +1226,16 @@ bool PollingFdLineSource::next(std::string& line) {
 
 `runLiveOnFdForTest(args, fd, out, err, idlePumps)` parses options exactly as `cmdConsole` and runs steps 3–5 with `PollingFdLineSource(fd, &pumpClient, &broker)`, storing `src.idlePumps` into `*idlePumps`; it is declared in `include/rune/cli/Console.h` (already on `rune_cli_lib`'s public include path, which `rune_client_broker_tests` links).
 
-- [ ] **Step 5: Run** — client `ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -R 'RuneCli|Console' --output-on-failure -j14` → PASS; broker `ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'RuneConsoleBroker|RuneCliBroker' --output-on-failure -j14` → PASS.
+- [ ] **Step 5: Run** — client `ctest --test-dir ~/Projects/se-worktrees/rune-client-cpp/build -R 'RuneCli|Console' --output-on-failure -j14` → PASS; broker `ctest --test-dir ~/Projects/se-worktrees/rune-broker/build-fast -R 'RuneConsoleBroker|RuneCliBroker' --output-on-failure -j14` → PASS.
 - [ ] **Step 6: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp add src/cli include/rune/cli CMakeLists.txt
-git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp commit -m "feat(cli): live rune console — one session, ok lines, broker error codes, idle pumping, login (password prompt, SessionRevoked ends it)
+git -C ~/Projects/se-worktrees/rune-client-cpp add src/cli include/rune/cli CMakeLists.txt
+git -C ~/Projects/se-worktrees/rune-client-cpp commit -m "feat(cli): live rune console — one session, ok lines, broker error codes, idle pumping, login (password prompt, SessionRevoked ends it)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs/node/tests/client/RuneConsoleBrokerRegressionTest.cpp libs/node/CMakeLists.txt libs/node/include libs/node/src
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "test(cli): the real rune console against real brokers (one session, errors keep it, -f codes, idle, auth)
+git -C ~/Projects/se-worktrees/rune-broker add libs/node/tests/client/RuneConsoleBrokerRegressionTest.cpp libs/node/CMakeLists.txt libs/node/include libs/node/src
+git -C ~/Projects/se-worktrees/rune-broker commit -m "test(cli): the real rune console against real brokers (one session, errors keep it, -f codes, idle, auth)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -1317,18 +1317,18 @@ TEST(RuneConsoleBrokerRegression, ScriptDefinesThenAltersWithExpectedVersionRegr
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail** — `ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -R RuneCliOffline --output-on-failure` → the removed-subcommand test fails (`schema apply` still runs).
+- [ ] **Step 2: Run to verify they fail** — `ctest --test-dir ~/Projects/se-worktrees/rune-client-cpp/build -R RuneCliOffline --output-on-failure` → the removed-subcommand test fails (`schema apply` still runs).
 - [ ] **Step 3: Implement.** In `cmdSchema`: `if (sub == "apply" || sub == "alter") { err << "rune schema " << sub << " was removed: use `rune console -f <file.rql>` (or `rune ql -f`)\n"; return 2; }`; delete `cmdSchemaApply`, `cmdSchemaAlter`, `reportAlterResult` and any helper only they used; `printUsage` loses the two `schema apply|alter` entries; the schema subcommand error lists `get|list|generate`. Delete the migrated `CliLive*` tests from `RuneCliLiveTest.cpp` and fix its header comment (the gateway now serves `get`/`list`/`generate` and the `ql` cases only).
-- [ ] **Step 4: Run** — client `ctest … -R 'RuneCli|Console|CliLive' --output-on-failure -j14`; broker `ctest … -R 'RuneConsoleBroker|RuneCliBroker' --output-on-failure -j14` → PASS. `grep -rn "schema apply\|schema alter" /Users/vradu/Projects/se-worktrees/rune-client-cpp/src /Users/vradu/Projects/se-worktrees/rune-client-cpp/tests --include='*.cpp'` → only the removal message and its regression test.
+- [ ] **Step 4: Run** — client `ctest … -R 'RuneCli|Console|CliLive' --output-on-failure -j14`; broker `ctest … -R 'RuneConsoleBroker|RuneCliBroker' --output-on-failure -j14` → PASS. `grep -rn "schema apply\|schema alter" ~/Projects/se-worktrees/rune-client-cpp/src ~/Projects/se-worktrees/rune-client-cpp/tests --include='*.cpp'` → only the removal message and its regression test.
 - [ ] **Step 5: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp add src/cli tests CMakeLists.txt
-git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp commit -m "feat(cli)!: rune schema is read-only (apply/alter removed -> rune console -f); tests migrated
+git -C ~/Projects/se-worktrees/rune-client-cpp add src/cli tests CMakeLists.txt
+git -C ~/Projects/se-worktrees/rune-client-cpp commit -m "feat(cli)!: rune schema is read-only (apply/alter removed -> rune console -f); tests migrated
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs/node/tests/client/RuneConsoleBrokerRegressionTest.cpp
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "test(cli): console carries the migrated schema apply/alter live assertions
+git -C ~/Projects/se-worktrees/rune-broker add libs/node/tests/client/RuneConsoleBrokerRegressionTest.cpp
+git -C ~/Projects/se-worktrees/rune-broker commit -m "test(cli): console carries the migrated schema apply/alter live assertions
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -1349,7 +1349,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - [ ] **Step 1: List every call site:**
 
 ```bash
-grep -rn "rune schema \(apply\|alter\)" /Users/vradu/Projects/se-worktrees/rune-client-cpp/docker /Users/vradu/Projects/se-worktrees/rune-client-cpp/tests/e2e /Users/vradu/Projects/se-worktrees/rune-client-cpp/CMakeLists.txt /Users/vradu/Projects/se-worktrees/rune-broker/docker
+grep -rn "rune schema \(apply\|alter\)" ~/Projects/se-worktrees/rune-client-cpp/docker ~/Projects/se-worktrees/rune-client-cpp/tests/e2e ~/Projects/se-worktrees/rune-client-cpp/CMakeLists.txt ~/Projects/se-worktrees/rune-broker/docker
 ```
 Expected (2026-10-19): `rune-ql-e2e.sh` (header line 12, the call at ~147, the summary at ~209), `Dockerfile.rune-ql-probe:13`, `docker-compose.rune-ql.yml:60`, `schema-evolution-e2e.sh` (header 14–28, calls at ~229, 243, 255, 268, 281, 285, 319, 323), the `.rql` / probe comments.
 
@@ -1357,18 +1357,18 @@ Expected (2026-10-19): `rune-ql-e2e.sh` (header line 12, the call at ~147, the s
 
 ```bash
 perl -pi -e 's/rune schema (apply|alter)\b/rune console -f/g' \
-  /Users/vradu/Projects/se-worktrees/rune-client-cpp/docker/rune-ql-e2e.sh \
-  /Users/vradu/Projects/se-worktrees/rune-client-cpp/docker/Dockerfile.rune-ql-probe \
-  /Users/vradu/Projects/se-worktrees/rune-client-cpp/docker/docker-compose.rune-ql.yml \
-  /Users/vradu/Projects/se-worktrees/rune-client-cpp/CMakeLists.txt \
-  /Users/vradu/Projects/se-worktrees/rune-client-cpp/tests/e2e/characters.rql \
-  /Users/vradu/Projects/se-worktrees/rune-client-cpp/tests/e2e/schema_evolution/v1.rql \
-  /Users/vradu/Projects/se-worktrees/rune-client-cpp/tests/e2e/rune_ql_probe.cpp \
-  /Users/vradu/Projects/se-worktrees/rune-client-cpp/tests/e2e/evo_probe_v1.cpp \
-  /Users/vradu/Projects/se-worktrees/rune-client-cpp/tests/e2e/evo_probe_v2.cpp \
-  /Users/vradu/Projects/se-worktrees/rune-client-cpp/tests/e2e/evo_probe_v3.cpp \
-  /Users/vradu/Projects/se-worktrees/rune-client-cpp/tests/e2e/evo_probe_v4.cpp \
-  /Users/vradu/Projects/se-worktrees/rune-broker/docker/schema-evolution-e2e.sh
+  ~/Projects/se-worktrees/rune-client-cpp/docker/rune-ql-e2e.sh \
+  ~/Projects/se-worktrees/rune-client-cpp/docker/Dockerfile.rune-ql-probe \
+  ~/Projects/se-worktrees/rune-client-cpp/docker/docker-compose.rune-ql.yml \
+  ~/Projects/se-worktrees/rune-client-cpp/CMakeLists.txt \
+  ~/Projects/se-worktrees/rune-client-cpp/tests/e2e/characters.rql \
+  ~/Projects/se-worktrees/rune-client-cpp/tests/e2e/schema_evolution/v1.rql \
+  ~/Projects/se-worktrees/rune-client-cpp/tests/e2e/rune_ql_probe.cpp \
+  ~/Projects/se-worktrees/rune-client-cpp/tests/e2e/evo_probe_v1.cpp \
+  ~/Projects/se-worktrees/rune-client-cpp/tests/e2e/evo_probe_v2.cpp \
+  ~/Projects/se-worktrees/rune-client-cpp/tests/e2e/evo_probe_v3.cpp \
+  ~/Projects/se-worktrees/rune-client-cpp/tests/e2e/evo_probe_v4.cpp \
+  ~/Projects/se-worktrees/rune-broker/docker/schema-evolution-e2e.sh
 ```
 Then by hand:
 (a) `schema-evolution-e2e.sh`: the comment explaining the exit code now reads "`rune console -f` stops at the first failing statement and returns the broker's wire errorCode as its exit code (`QlRun::lastErrorCode`)". Phase 5 expects exit 30 and "incompatible"; phase 7's two racers (`rune console -f race_X.rql --expected-version 5`) expect exactly one 0 and one 31 whose stderr matches `stale\|conflict` (`SchemaConflict (31) …`). Read the phase 5 / 7 blocks after the pass and adjust only the grep patterns if the message text differs.
@@ -1378,15 +1378,15 @@ Then by hand:
 - [ ] **Step 3: Static checks** — the Step 1 grep prints nothing; `bash -n` on both scripts passes; `rune console --dry-run -f` parses every `.rql` the scripts use:
 
 ```bash
-for f in /Users/vradu/Projects/se-worktrees/rune-client-cpp/tests/e2e/*.rql /Users/vradu/Projects/se-worktrees/rune-client-cpp/tests/e2e/schema_evolution/*.rql; do
-  /Users/vradu/Projects/se-worktrees/rune-client-cpp/build/rune console --dry-run -f "$f" > /dev/null || echo "FAIL $f"
+for f in ~/Projects/se-worktrees/rune-client-cpp/tests/e2e/*.rql ~/Projects/se-worktrees/rune-client-cpp/tests/e2e/schema_evolution/*.rql; do
+  ~/Projects/se-worktrees/rune-client-cpp/build/rune console --dry-run -f "$f" > /dev/null || echo "FAIL $f"
 done
 ```
 
 - [ ] **Step 4: Run the real-broker e2e on the VM** (never on the Mac):
 
 ```bash
-rsync -a --delete /Users/vradu/Projects/se-worktrees/ root@$RUNE_VM_HOST:/root/se-worktrees/
+rsync -a --delete ~/Projects/se-worktrees/ root@$RUNE_VM_HOST:/root/se-worktrees/
 ssh root@$RUNE_VM_HOST 'flock /root/vm.lock bash -c "cd /root/se-worktrees/rune-client-cpp && bash docker/rune-ql-e2e.sh"'
 ssh root@$RUNE_VM_HOST 'flock /root/vm.lock bash -c "cd /root/se-worktrees/rune-broker && bash docker/schema-evolution-e2e.sh"'
 ```
@@ -1395,12 +1395,12 @@ Expected: `rune-ql-e2e.sh` ends with its PASSED banner; `schema-evolution-e2e.sh
 - [ ] **Step 5: Commit (two repos)**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp add docker tests/e2e CMakeLists.txt
-git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp commit -m "test(e2e): rune-ql e2e drives rune console -f
+git -C ~/Projects/se-worktrees/rune-client-cpp add docker tests/e2e CMakeLists.txt
+git -C ~/Projects/se-worktrees/rune-client-cpp commit -m "test(e2e): rune-ql e2e drives rune console -f
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add docker/schema-evolution-e2e.sh
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "test(e2e): schema-evolution e2e drives rune console -f (schema apply/alter removed)
+git -C ~/Projects/se-worktrees/rune-broker add docker/schema-evolution-e2e.sh
+git -C ~/Projects/se-worktrees/rune-broker commit -m "test(e2e): schema-evolution e2e drives rune console -f (schema apply/alter removed)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```

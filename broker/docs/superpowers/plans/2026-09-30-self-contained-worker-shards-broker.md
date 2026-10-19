@@ -108,7 +108,7 @@ Review of the working tree (`git status` / `git diff` on `perf/replication-instr
 | `RUNE_EXP_NO_DUP_FETCH`, `lastPushNs_`, `FetchProgress` + `fetchProgress_` `unordered_map` (`PartitionReplica.h/.cpp`) | **Remove.** Replaced in Task 3 by the permanent, always-on, tested per-follower progress gate over a flat slot array (no env gate, no map, no global recency). |
 
 **Files:**
-- Modify (rune-fr): `/Users/vradu/Projects/rune-fr/include/rune_fr/Sites.h` (already edited; commit only)
+- Modify (rune-fr): `~/Projects/rune-fr/include/rune_fr/Sites.h` (already edited; commit only)
 - Modify: `bench/kafka-compare/cluster.sh:13-18`
 - Modify: `libs/node/include/rune/node/WorkerPool.h:43-69` (`makeBackoffIdle`)
 - Modify: `libs/replication/include/rune/replication/PartitionReplica.h:815-822`
@@ -122,7 +122,7 @@ Review of the working tree (`git status` / `git diff` on `perf/replication-instr
 - [ ] **Step 1: Write the failing check (no experiment hook may ship)**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 git grep -nE 'RUNE_EXP_NO_DUP_FETCH|RUNE_FOLLOWER_FLUSH_MS|RUNE_IDLE_MAX_YIELDS|RUNE_IDLE_MIN_PARK_US|lastPushNs_|fetchProgress_' -- libs src bench
 ```
 
@@ -194,7 +194,7 @@ In `doWork` replace the lambda-initialised interval (and its 3-line EXPERIMENT c
 
 Run:
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 git grep -nE 'RUNE_EXP_NO_DUP_FETCH|RUNE_FOLLOWER_FLUSH_MS|RUNE_IDLE_MAX_YIELDS|RUNE_IDLE_MIN_PARK_US|lastPushNs_|fetchProgress_' -- libs src bench; echo "exit=$?"
 cmake --build build-fast
 ctest --test-dir build-fast -R Regression --output-on-failure
@@ -205,13 +205,13 @@ Expected: grep prints nothing and `exit=1`; build succeeds; every `*Regression*`
 - [ ] **Step 5: Commit (rune-fr first, then the broker in two commits)**
 
 ```bash
-cd /Users/vradu/Projects/rune-fr
+cd ~/Projects/rune-fr
 git add include/rune_fr/Sites.h
 git commit -m "feat(sites): per-worker replication transport + worker doWork sub-stage sites
 
 Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 git add libs/node/include/rune/node/NodeConfig.h libs/node/src/NodeConfig.cpp \
         libs/node/src/BrokerNode.cpp libs/node/tests/node/NodeConfigTest.cpp \
         bench/kafka-compare/cluster.sh
@@ -239,8 +239,8 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 `MetadataResponse` is a hand-written SBE-style flat codec (`MetadataMessages.h`), not generated from an XML schema, so "regenerate codec" = edit the codec by hand; no generator run is involved. Entries are a fixed 28-byte stride, so the field cannot go inside the entry without breaking older decoders. It is added as a **trailer after `partitions[]`**: `uint16 endpointCount` (== partitionCount) followed by one var-string per partition. Older decoders stop after `partitions[]` and ignore trailing bytes (their decode never checks for leftover bytes). The trailer is written **only when at least one endpoint is non-empty**, so default-config frames stay byte-identical. `kProtocolVersion` is unchanged.
 
 **Files:**
-- Modify: `/Users/vradu/Projects/rune-protocol/include/rune/protocol/client/MetadataMessages.h` (`PartitionEntry` ~line 160; `MetadataResponse::encode/encodedSize/decode`)
-- Test: `/Users/vradu/Projects/rune-protocol/tests/protocol/client/MetadataMessagesTest.cpp` (append)
+- Modify: `~/Projects/rune-protocol/include/rune/protocol/client/MetadataMessages.h` (`PartitionEntry` ~line 160; `MetadataResponse::encode/encodedSize/decode`)
+- Test: `~/Projects/rune-protocol/tests/protocol/client/MetadataMessagesTest.cpp` (append)
 
 **Interfaces:**
 - Produces: `std::string_view rune::protocol::client::PartitionEntry::ingressEndpoint` (`"host:port"`, empty = use node endpoint; on decode a view into the frame buffer); `bool MetadataResponse::hasIngressEndpoints() const noexcept`. Consumed by Task 14 (broker) and the rune-client-cpp plan.
@@ -323,7 +323,7 @@ TEST(MetadataMessagesIngressEndpointRegression, TrailerCountMismatchRejected) {
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cmake --build /Users/vradu/Projects/rune-protocol/build --target rune_protocol_tests && /Users/vradu/Projects/rune-protocol/build/rune_protocol_tests --gtest_filter='MetadataMessagesIngressEndpoint*'`
+Run: `cmake --build ~/Projects/rune-protocol/build --target rune_protocol_tests && ~/Projects/rune-protocol/build/rune_protocol_tests --gtest_filter='MetadataMessagesIngressEndpoint*'`
 Expected: FAIL to compile — `'ingressEndpoint' is not a member of 'rune::protocol::client::PartitionEntry'`.
 
 - [ ] **Step 3: Implement**
@@ -388,15 +388,15 @@ Update the frame-layout comment block at the top of the file with `[after partit
 
 - [ ] **Step 4: Run to verify they pass (and nothing else broke)**
 
-Run: `cmake --build /Users/vradu/Projects/rune-protocol/build --target rune_protocol_tests && /Users/vradu/Projects/rune-protocol/build/rune_protocol_tests`
+Run: `cmake --build ~/Projects/rune-protocol/build --target rune_protocol_tests && ~/Projects/rune-protocol/build/rune_protocol_tests`
 Expected: PASS — all tests, including the pre-existing `MetadataMessages.ResponseTruncationReject`.
-Then: `cmake --build /Users/vradu/Projects/rune-broker/build-fast --target rune_gateway_metadata_response_tests rune_metadata_request_tests && /Users/vradu/Projects/rune-broker/build-fast/libs/gateway/rune_gateway_metadata_response_tests && /Users/vradu/Projects/rune-broker/build-fast/libs/gateway/rune_metadata_request_tests`
+Then: `cmake --build ~/Projects/rune-broker/build-fast --target rune_gateway_metadata_response_tests rune_metadata_request_tests && ~/Projects/rune-broker/build-fast/libs/gateway/rune_gateway_metadata_response_tests && ~/Projects/rune-broker/build-fast/libs/gateway/rune_metadata_request_tests`
 Expected: PASS (broker compiles against the sibling header unchanged).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /Users/vradu/Projects/rune-protocol
+cd ~/Projects/rune-protocol
 git add include/rune/protocol/client/MetadataMessages.h tests/protocol/client/MetadataMessagesTest.cpp
 git commit -m "feat(protocol): additive MetadataResponse per-partition ingressEndpoint trailer
 
@@ -738,7 +738,7 @@ Add both new replication test files to the `add_executable(rune_replication_test
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cmake --build /Users/vradu/Projects/rune-broker/build-fast --target rune_replication_tests rune_worker_replication_transport_tests`
+Run: `cmake --build ~/Projects/rune-broker/build-fast --target rune_replication_tests rune_worker_replication_transport_tests`
 Expected: FAIL to compile — `rune/replication/FollowerSlots.h: No such file`, and `'sendFetchRequestTo' marked 'override' but does not override`.
 
 - [ ] **Step 3: Implement**
@@ -951,7 +951,7 @@ and in `WorkerReplicationTransportImpl` after `sendFetchRequest`:
 
 Run:
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 cmake --build build-fast
 ctest --test-dir build-fast -R Regression --output-on-failure
 ./build-fast/libs/replication/rune_replication_tests --gtest_filter='FollowerSlots*:NoDupFetchGate*:FastAckUnicast*'
@@ -1066,7 +1066,7 @@ Register it: in `libs/node/CMakeLists.txt` change `add_executable(rune_worker_re
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cmake --build /Users/vradu/Projects/rune-broker/build-fast --target rune_worker_replication_transport_tests`
+Run: `cmake --build ~/Projects/rune-broker/build-fast --target rune_worker_replication_transport_tests`
 Expected: FAIL to compile — `'TransportKind' is not a member of 'rune::replication'`.
 
 - [ ] **Step 3: Implement**
@@ -1074,7 +1074,7 @@ Expected: FAIL to compile — `'TransportKind' is not a member of 'rune::replica
 1. Move the transport:
 
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 git mv libs/node/include/rune/node/WorkerReplicationTransport.h \
        libs/replication/include/rune/replication/WorkerReplicationTransport.h
 sed -i '' -e 's/^namespace rune::node {/namespace rune::replication {/' \
@@ -1509,7 +1509,7 @@ CMake: add `tests/storage/InMemoryLogReadViewTest.cpp` to `add_executable(rune_i
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cmake --build /Users/vradu/Projects/rune-broker/build-fast --target rune_in_memory_log_tests rune_replication_tests rune_replication_zero_alloc_tests rune_worker_replication_transport_tests`
+Run: `cmake --build ~/Projects/rune-broker/build-fast --target rune_in_memory_log_tests rune_replication_tests rune_replication_zero_alloc_tests rune_worker_replication_transport_tests`
 Expected: FAIL to compile — `'readView' is not a member of 'rune::storage::InMemoryLog'` and `rune/replication/BatchPrefix.h: No such file or directory`. (Building `rune_replication_zero_alloc_tests` alone at this point compiles and FAILS at runtime: `ZeroAllocReplicaRegression.DataFetchAllocatesNothing` reports ≥ 1 allocation from `L.read(...)`'s vector.)
 
 - [ ] **Step 3: Implement**
@@ -1984,7 +1984,7 @@ TEST(BrokerNodeRegression, ShardInvalidConfigRefusesStartBeforeAnySideEffect) {
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cmake --build /Users/vradu/Projects/rune-broker/build-fast --target rune_node_tests rune_broker_node_tests`
+Run: `cmake --build ~/Projects/rune-broker/build-fast --target rune_node_tests rune_broker_node_tests`
 Expected: FAIL to compile — `'WorkerMode' is not a member of 'rune::node::NodeConfig'`.
 
 - [ ] **Step 3: Implement**
@@ -2426,7 +2426,7 @@ and add `src/EmbeddedDriver.cpp` to `add_library(rune_node ...)`.
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cmake --build /Users/vradu/Projects/rune-broker/build-fast --target rune_embedded_driver_tests`
+Run: `cmake --build ~/Projects/rune-broker/build-fast --target rune_embedded_driver_tests`
 Expected: FAIL to compile — `rune/node/EmbeddedDriver.h: No such file or directory`.
 
 - [ ] **Step 3: Extract verbatim (red), then fix (green)**
@@ -2866,7 +2866,7 @@ CMake (next to `rune_embedded_driver_tests`):
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cmake --build /Users/vradu/Projects/rune-broker/build-fast --target rune_aeron_pump_tests`
+Run: `cmake --build ~/Projects/rune-broker/build-fast --target rune_aeron_pump_tests`
 Expected: FAIL to compile — `rune/aeronutil/AeronPump.h: No such file or directory` / `no member named 'pumpWith'`.
 
 - [ ] **Step 3: Implement**
@@ -3026,7 +3026,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 Spec §3.1. In shard mode, `BrokerNode` builds for each worker `w`: `EmbeddedDriver(<aeronDir>/w<w>, Invoker)` + an Aeron client with `useConductorAgentInvoker(true)`; binds the worker's client ingress (`shardIngressBindChannel(w)`, stream `workerIngressBaseStreamId + w`), its replication plane (`shardReplBindChannel(w)` → each peer's `shardPeerReplChannel(peer, w)`, stream `replBaseStreamId + w`) and its record egress to **that** client, resolving everything with the worker's own `AeronPump` on the startup thread; any unresolved per-worker resource is a hard refusal. A `ShardAgent` (final) runs the pass: (1) driver duty cycle, (2) client conductor, (3–6) `Worker::doWork` in shard order. Pinned workers (`RUNE_WORKER_CORE_BASE >= 0`) busy-spin; unpinned shard workers use the backoff idle (principle §1a.3: never busy-spin a shared core). A loop-duration alarm counts passes longer than 100 µs from the injected clock only.
 
 **Files:**
-- Modify (rune-fr): `/Users/vradu/Projects/rune-fr/include/rune_fr/Sites.h` (add `ShardPass`)
+- Modify (rune-fr): `~/Projects/rune-fr/include/rune_fr/Sites.h` (add `ShardPass`)
 - Create: `libs/node/include/rune/node/ShardAgent.h`, `libs/node/src/ShardAgent.cpp`
 - Modify: `libs/node/include/rune/node/Worker.h` — `class Worker final`; `setShardMode`; `doWork` (~line 590) dispatch; new `doWorkShard_`
 - Modify: `libs/node/include/rune/node/WorkerPool.h` — `startShardRunners`
@@ -3532,7 +3532,7 @@ and inside the `if(BUILD_NODE_UDP_TESTS AND aeron_FOUND)` block that defines `ru
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cmake --build /Users/vradu/Projects/rune-broker/build-fast --target rune_shard_agent_tests rune_shard_mode_tests`
+Run: `cmake --build ~/Projects/rune-broker/build-fast --target rune_shard_agent_tests rune_shard_mode_tests`
 Expected: FAIL to compile — `rune/node/ShardAgent.h: No such file or directory`, `no member named 'setShardMode' in 'rune::node::Worker'`, `no member named 'shardDriverCountForTest'`.
 
 - [ ] **Step 3: Implement**
@@ -3842,8 +3842,8 @@ In `start()`, right after `startEmbeddedDriver();`: `if (config_.shardMode()) bu
 
 Run:
 ```bash
-cd /Users/vradu/Projects/rune-fr && git diff --stat
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-fr && git diff --stat
+cd ~/Projects/rune-broker
 cmake --build build-fast
 ./build-fast/libs/node/rune_shard_agent_tests
 ./build-fast/libs/node/rune_shard_mode_tests
@@ -3855,12 +3855,12 @@ Expected: PASS — shard tests green; the full suite (default config) unchanged.
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /Users/vradu/Projects/rune-fr
+cd ~/Projects/rune-fr
 git add include/rune_fr/Sites.h
 git commit -m "feat(sites): ShardPass (self-contained worker shard pass)
 
 Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 git add libs/node/include/rune/node/ShardAgent.h libs/node/src/ShardAgent.cpp \
         libs/node/include/rune/node/Worker.h libs/node/include/rune/node/WorkerPool.h \
         libs/node/include/rune/node/BrokerNode.h libs/node/src/BrokerNode.cpp libs/node/CMakeLists.txt \
@@ -4080,7 +4080,7 @@ CMake (in the `aeron_FOUND` test area, next to `rune_async_durability_tests`):
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cmake --build /Users/vradu/Projects/rune-broker/build-fast --target rune_shard_nonblocking_tests`
+Run: `cmake --build ~/Projects/rune-broker/build-fast --target rune_shard_nonblocking_tests`
 Expected: FAIL to compile — `no member named 'setExternalFollowerFlush'`, `'syncCallsForTest'`, `'bgFlushSubmitsForTest'`.
 
 - [ ] **Step 3: Implement**
@@ -4421,7 +4421,7 @@ TEST(ShardModeFusedRegression, ReturnRingPressureNeverDeadlocksTheFusedLoop) {
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cmake --build /Users/vradu/Projects/rune-broker/build-fast --target rune_aeron_pump_tests rune_shard_mode_tests`
+Run: `cmake --build ~/Projects/rune-broker/build-fast --target rune_aeron_pump_tests rune_shard_mode_tests`
 Expected: FAIL to compile — `no matching constructor for initialization of 'rune::consensus::AeronIngress'` (5 args) and `no member named 'runtimeThreadStartedForTest'`.
 
 - [ ] **Step 3: Implement**
@@ -4524,9 +4524,9 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 Spec §3.2 / §3.4: "Runtime ↔ worker traffic stays on the existing SPSC rings (… session announcements, post-ack notifications)". The process-local SBE schema (`schemaId=7`) gains two op types, one tail kind, one scalar and one return type; the generated flyweights are regenerated with the vendored `sbe-all-1.40.2.jar`. The broker's `WorkerOp::Type` / `WorkerReturn::Type` enums map to these by value (`static_cast`), so the new values are 13, 14 and 2 exactly. The broker's `executeFromWire_` switches on its own enum, so the broker still builds after this task unchanged.
 
 **Files:**
-- Modify: `/Users/vradu/Projects/rune-protocol/schema/rune-internal-ring.xml` (enums `OpType`, `TailKind`, `ReturnType`; `WorkerOp` field after `egressPub`)
-- Regenerate: `/Users/vradu/Projects/rune-protocol/include/rune_protocol_internal_sbe/*.h`
-- Test: `/Users/vradu/Projects/rune-protocol/tests/protocol/internal/RingSbeTest.cpp` (append)
+- Modify: `~/Projects/rune-protocol/schema/rune-internal-ring.xml` (enums `OpType`, `TailKind`, `ReturnType`; `WorkerOp` field after `egressPub`)
+- Regenerate: `~/Projects/rune-protocol/include/rune_protocol_internal_sbe/*.h`
+- Test: `~/Projects/rune-protocol/tests/protocol/internal/RingSbeTest.cpp` (append)
 
 **Interfaces:**
 - Produces (namespace `rune::protocol::internal::sbe`): `OpType::Value::SESSION_ANNOUNCE` (13), `OpType::Value::SESSION_CLOSE` (14), `TailKind::Value::EGRESS_CHANNEL` (7), `ReturnType::Value::PRODUCE_NOTIFY` (2), `WorkerOp::egressStreamId(int32_t)` / `int32_t WorkerOp::egressStreamId() const`.
@@ -4580,7 +4580,7 @@ TEST(RingSbe, ProduceNotifyReturnTypeRoundTrips) {
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cmake --build /Users/vradu/Projects/rune-protocol/build --target rune_protocol_tests`
+Run: `cmake --build ~/Projects/rune-protocol/build --target rune_protocol_tests`
 Expected: FAIL to compile — `'SESSION_ANNOUNCE' is not a member of 'OpType::Value'`, `no member named 'egressStreamId'`.
 
 - [ ] **Step 3: Edit the schema and regenerate**
@@ -4614,7 +4614,7 @@ In `schema/rune-internal-ring.xml`:
 Regenerate:
 
 ```bash
-cd /Users/vradu/Projects/rune-protocol
+cd ~/Projects/rune-protocol
 JAVA=/Applications/CLion.app/Contents/jbr/Contents/Home/bin/java
 "$JAVA" -Dsbe.target.language=cpp -Dsbe.output.dir=include \
     -jar tools/sbe-all-1.40.2.jar schema/rune-internal-ring.xml
@@ -4626,17 +4626,17 @@ Expected: `OpType.h`, `TailKind.h`, `ReturnType.h`, `WorkerOp.h` modified; no ot
 
 Run:
 ```bash
-cmake --build /Users/vradu/Projects/rune-protocol/build --target rune_protocol_tests && /Users/vradu/Projects/rune-protocol/build/rune_protocol_tests
-cmake --build /Users/vradu/Projects/rune-broker/build-fast
-ctest --test-dir /Users/vradu/Projects/rune-broker/build-fast -R Regression --output-on-failure
-ctest --test-dir /Users/vradu/Projects/rune-broker/build-fast -E 'udp|UDP|Udp' --output-on-failure -j4
+cmake --build ~/Projects/rune-protocol/build --target rune_protocol_tests && ~/Projects/rune-protocol/build/rune_protocol_tests
+cmake --build ~/Projects/rune-broker/build-fast
+ctest --test-dir ~/Projects/rune-broker/build-fast -R Regression --output-on-failure
+ctest --test-dir ~/Projects/rune-broker/build-fast -E 'udp|UDP|Udp' --output-on-failure -j4
 ```
 Expected: PASS (the broker ring codec encodes the new `egressStreamId` scalar as whatever the claimed slot held until Task 13 sets it; nothing reads it yet).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /Users/vradu/Projects/rune-protocol
+cd ~/Projects/rune-protocol
 git add schema/rune-internal-ring.xml include/rune_protocol_internal_sbe tests/protocol/internal/RingSbeTest.cpp
 git commit -m "feat(protocol): internal ring SESSION_ANNOUNCE/SESSION_CLOSE + PRODUCE_NOTIFY (worker-side acks)
 
@@ -5129,7 +5129,7 @@ gateway (`libs/gateway/CMakeLists.txt`, next to `rune_gateway_metadata_response_
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cmake --build /Users/vradu/Projects/rune-broker/build-fast --target rune_session_ack_sink_tests rune_session_announcer_tests rune_shard_worker_ack_tests rune_gateway_shard_notify_tests`
+Run: `cmake --build ~/Projects/rune-broker/build-fast --target rune_session_ack_sink_tests rune_session_announcer_tests rune_shard_worker_ack_tests rune_gateway_shard_notify_tests`
 Expected: FAIL to compile — `rune/node/SessionAckSink.h: No such file`, `'SessionAnnounce' is not a member of 'WorkerOp::Type'`, `no member named 'setShardClient'`, `no member named 'setShardMode' in 'ClientGateway'`.
 
 - [ ] **Step 3: Implement**
@@ -5955,7 +5955,7 @@ static std::size_t rpcLegacySize(const std::vector<pc::BrokerEntry>& brokers, st
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cmake --build /Users/vradu/Projects/rune-broker/build-fast --target rune_gateway_metadata_response_tests`
+Run: `cmake --build ~/Projects/rune-broker/build-fast --target rune_gateway_metadata_response_tests`
 Expected: FAIL to compile — `no member named 'setShardIngressEndpoints' in 'rune::gateway::ClientGateway'`.
 
 - [ ] **Step 3: Implement**
@@ -6073,7 +6073,7 @@ Spec §3.3 harness bullet, §5, §6.3. `RUNE_SHARD=1` makes `cluster.sh` give no
 - [ ] **Step 1: Write the failing checks**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker/bench/kafka-compare
+cd ~/Projects/rune-broker/bench/kafka-compare
 bash -c 'set -e; WORK=/tmp; source ./cluster.sh
   [ "$(RUNE_SHARD=1 rune_cluster_peers)" = "0@127.0.0.1:40110:40200:40220:40600:40500,1@127.0.0.1:40111:40201:40221:40620:40520,2@127.0.0.1:40112:40202:40222:40640:40540" ]
   [ "$(RUNE_SHARD=1 RUNE_RUNTIME_PLACEMENT=fused rune_shard_env 2)" = "RUNE_WORKER_MODE=shard RUNE_RUNTIME_PLACEMENT=fused RUNE_WORKER_INGRESS_BASE_PORT=40540 RUNE_WORKER_REPL_BASE_PORT=40640 RUNE_WORKER_CORE_BASE=3" ]
@@ -6105,7 +6105,7 @@ def test_no_env_means_no_extra_overrides(monkeypatch):
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: the bash block above; then `cd /Users/vradu/Projects/rune-broker/dr-e2e && python3 -m pytest tests/test_harness_overrides.py -q`
+Run: the bash block above; then `cd ~/Projects/rune-broker/dr-e2e && python3 -m pytest tests/test_harness_overrides.py -q`
 Expected: bash exits non-zero (`rune_shard_env: command not found`); pytest FAILS `test_env_overrides_are_appended_after_explicit_ones`.
 
 - [ ] **Step 3: Implement**
@@ -6205,7 +6205,7 @@ services:
 
 - [ ] **Step 4: Run to verify they pass**
 
-Run: the bash block from Step 1 → prints `HARNESS-OK`; `cd /Users/vradu/Projects/rune-broker/dr-e2e && python3 -m pytest tests/test_harness_overrides.py -q` → `2 passed`; `docker compose -f docker/docker-compose.yml -f docker/docker-compose.shard.yml config >/dev/null && echo COMPOSE-OK` (from the repo root) → `COMPOSE-OK`.
+Run: the bash block from Step 1 → prints `HARNESS-OK`; `cd ~/Projects/rune-broker/dr-e2e && python3 -m pytest tests/test_harness_overrides.py -q` → `2 passed`; `docker compose -f docker/docker-compose.yml -f docker/docker-compose.shard.yml config >/dev/null && echo COMPOSE-OK` (from the repo root) → `COMPOSE-OK`.
 
 - [ ] **Step 5: Commit**
 
@@ -6434,7 +6434,7 @@ Expected: PASS. Any failure is a real bug: write the failing repro at the lowest
 - [ ] **Step 2: Rung 1+2 on the Mac — regression suite first, then everything, default and flag-on**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 cmake --build build-fast
 ctest --test-dir build-fast -R Regression --output-on-failure
 ctest --test-dir build-fast --output-on-failure -j2
@@ -6510,9 +6510,9 @@ Expected: `apt=0`, a Docker server version, a compose version, and ≥ 3 GiB sti
 Runs on k3s-node-01 (Global Constraints). Sync all four repos first, then build SHA-tagged images there:
 
 ```bash
-TAG="$(cd /Users/vradu/Projects/rune-broker && git rev-parse --short HEAD)"
+TAG="$(cd ~/Projects/rune-broker && git rev-parse --short HEAD)"
 for r in rune-broker rune-protocol rune-fr rune-client-cpp; do
-  rsync -az --delete --exclude 'build*' --exclude '.git' /Users/vradu/Projects/$r/ root@$RUNE_VM_HOST:/root/rune-e5/$r/
+  rsync -az --delete --exclude 'build*' --exclude '.git' ~/Projects/$r/ root@$RUNE_VM_HOST:/root/rune-e5/$r/
 done
 ssh root@$RUNE_VM_HOST "bash /root/rune-e5/rune-broker/bench/kafka-compare/vm-clean.sh && \
   cd /root/rune-e5/rune-broker && export RUNE_IMAGE_TAG=$TAG && docker compose -f docker/docker-compose.yml build && \
@@ -6541,7 +6541,7 @@ Expected: the matrix that is green on the default config is green in shard mode 
 
 ```bash
 for r in rune-broker rune-protocol rune-fr; do
-  rsync -az --delete --exclude 'build*' --exclude '.git' /Users/vradu/Projects/$r/ root@$RUNE_VM_HOST:/root/rune-e5/$r/
+  rsync -az --delete --exclude 'build*' --exclude '.git' ~/Projects/$r/ root@$RUNE_VM_HOST:/root/rune-e5/$r/
 done
 ssh root@$RUNE_VM_HOST 'cd /root/rune-e5/rune-broker && cmake --build build-linux -j4 \
   && ctest --test-dir build-linux -R "Regression|Uring|Shard|AsyncDurability" --output-on-failure'
@@ -6567,7 +6567,7 @@ Immediately after a passing `vm-clean.sh` on k3s-node-01, with the rune-client-c
 - [ ] **Step 8: Commit the suite (and any regression tests added while climbing the ladder)**
 
 ```bash
-cd /Users/vradu/Projects/rune-broker
+cd ~/Projects/rune-broker
 git add libs/node/tests/integration/ShardFailoverTest.cpp libs/node/CMakeLists.txt bench/kafka-compare/vm-clean.sh
 git commit -m "test(node): shard-mode failover suite (leader kill, rolling restart, reconnect) + validation ladder
 

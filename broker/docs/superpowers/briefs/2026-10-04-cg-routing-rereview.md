@@ -1,7 +1,7 @@
 # Re-review: consumer-group fetch routing, fix round 1 (`fix/group-subscribe-routing`)
 
 **Date:** 2026-10-04
-**Worktree:** `/Users/vradu/Projects/rune-client-cpp-wt14`
+**Worktree:** `~/Projects/rune-client-cpp-wt14`
 **Commits reviewed:** `3ad6fb8`, `187f129`, `14caf1c` (diff `6d2e013..HEAD`)
 **Inputs:** `2026-10-04-cg-routing-review.md` (round-0 REJECT) and the "Fix round 1" section of `2026-10-04-cg-routing-report.md`
 **Broker checked:** `rune-broker-wt26` @ `161de4c`

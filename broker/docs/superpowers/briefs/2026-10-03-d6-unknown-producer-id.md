@@ -1,9 +1,9 @@
 # Brief: D6 — UNKNOWN_PRODUCER_ID (protocol + broker + client)
 
-Worktrees (all created for you): rune-protocol /Users/vradu/Projects/rune-protocol-d6 (branch
-feat/unknown-producer-id); broker /Users/vradu/Projects/rune-broker-wt34 (branch feat/d6-unknown-pid, from integ);
-client /Users/vradu/Projects/rune-client-cpp-wt10 (branch feat/d6-unknown-pid, client incl. B/D7/GSO).
-Build broker and client against -DRUNE_PROTOCOL_INCLUDE=/Users/vradu/Projects/rune-protocol-d6/include.
+Worktrees (all created for you): rune-protocol ~/Projects/rune-protocol-d6 (branch
+feat/unknown-producer-id); broker ~/Projects/rune-broker-wt34 (branch feat/d6-unknown-pid, from integ);
+client ~/Projects/rune-client-cpp-wt10 (branch feat/d6-unknown-pid, client incl. B/D7/GSO).
+Build broker and client against -DRUNE_PROTOCOL_INCLUDE=~/Projects/rune-protocol-d6/include.
 Commit locally; NEVER push; never run any conan package command (create/export/upload are forbidden). Do not spawn
 subagents. Another agent works on replication in rune-broker-wt31 — stay out of PartitionReplica/replication; the
 broker change is in ProducerStateManager::validate + the produce paths (gateway + worker) only.
@@ -57,5 +57,5 @@ One in-process end-to-end test (real broker + real client in the client repo's b
 broker's integration harness): retention + failover -> producer continues with no spurious failure.
 Full Mac suites green in all three repos; check_no_atomics OK. Hot path: no allocation/virtual/std::function.
 
-Report: /Users/vradu/Projects/rune-broker-wt26/docs/superpowers/briefs/2026-10-03-D6-report.md. Return only:
+Report: ~/Projects/rune-broker-wt26/docs/superpowers/briefs/2026-10-03-D6-report.md. Return only:
 status, commit SHAs per repo, one-line test summary, concerns.

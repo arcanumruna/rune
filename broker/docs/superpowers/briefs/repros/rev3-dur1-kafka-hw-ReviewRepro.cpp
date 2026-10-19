@@ -1,4 +1,4 @@
-#include "/Users/vradu/Projects/rune-broker-wt31/libs/replication/tests/replication/PartitionReplicaTest.cpp"
+#include "~/Projects/rune-broker-wt31/libs/replication/tests/replication/PartitionReplicaTest.cpp"
 
 namespace {
 FetchRequestMsg fr(Epoch ep, NodeId f, Offset off, int32_t lfe) {

@@ -23,14 +23,14 @@
 
 ## Execution context
 
-- **Repos:** broker and client only. Use the canonical sibling layout under `/Users/vradu/Projects/se-worktrees/` (`rune-broker`, `rune-client-cpp`, and `../rune-codec` on `feat/schema-evolution-durable-tags`, which the broker CMake requires).
+- **Repos:** broker and client only. Use the canonical sibling layout under `~/Projects/se-worktrees/` (`rune-broker`, `rune-client-cpp`, and `../rune-codec` on `feat/schema-evolution-durable-tags`, which the broker CMake requires).
 - **Branches:** cut `feat/phase2b-a-retractable-min-max-last` from each repo's integration tip **after Part F merged** (`<F-tip>` below = that branch, e.g. `feat/phase2b-f-unified-producer` or wherever F was merged):
   ```bash
-  git -C /Users/vradu/Projects/se-worktrees/rune-broker switch -c feat/phase2b-a-retractable-min-max-last <F-tip>
-  git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp switch -c feat/phase2b-a-retractable-min-max-last <F-tip>
+  git -C ~/Projects/se-worktrees/rune-broker switch -c feat/phase2b-a-retractable-min-max-last <F-tip>
+  git -C ~/Projects/se-worktrees/rune-client-cpp switch -c feat/phase2b-a-retractable-min-max-last <F-tip>
   ```
   Verify: `grep -n "uninstallView" libs/node/src/WorkerViewSet.cpp` and `grep -n "kCatalogTopicId" libs/node/include/rune/node/CatalogPartition.h` both hit (catalog history is in).
-  All broker paths below are relative to `/Users/vradu/Projects/se-worktrees/rune-broker`. Client paths are prefixed `rune-client-cpp/` and are relative to `/Users/vradu/Projects/se-worktrees/`.
+  All broker paths below are relative to `~/Projects/se-worktrees/rune-broker`. Client paths are prefixed `rune-client-cpp/` and are relative to `~/Projects/se-worktrees/`.
 - **Broker builds:** `build-fast` (Ninja, Debug, `BUILD_TESTING=ON`, already configured). Benchmarks use `build-bench-rel` (Ninja, `-O3 -DNDEBUG`, `BUILD_BENCHMARKS=ON`, already configured). If either directory is missing, configure it with `cmake -S . -B build-fast -G Ninja -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON -DCMAKE_TOOLCHAIN_FILE=build/Debug/generators/conan_toolchain.cmake -DCMAKE_PREFIX_PATH="$PWD/build/Debug/generators"`; for benchmarks, add `-DBUILD_BENCHMARKS=ON -DCMAKE_CXX_FLAGS_DEBUG="-O3 -DNDEBUG"` and use `-B build-bench-rel`.
 - **Client build:** `rune-client-cpp/build` (Unix Makefiles, Debug, `BUILD_TESTING=ON`, `BUILD_EXAMPLES=ON`, already configured). `cmake --build build` re-runs configure when `CMakeLists.txt` changes.
 - **Test gate (CLAUDE.md #7):** each task runs the executables covering what it touches plus every new or changed test (its "Run" step names the filter, `-j14`). The FULL `*Regression*` suite runs at the checkpoints — after Task 4 (layout), after Task 7 (fold + worker), after Task 9 (before the final review) — in each touched repo (broker `ctest --test-dir build-fast -R Regression --output-on-failure -j14`, client `ctest --test-dir build -R Regression --output-on-failure -j14`), also under ASan+UBSan and TSan (broker `build-asan` / `build-tsan`, client `build_tsan` with `BUILD_TESTING=ON`). A checkpoint failure is bisected over the commits since the last green checkpoint. Where a task's own step below still says "run the full Regression suite before committing", the per-task affected-area run is what binds; the full suite belongs to the checkpoint. Every fix gets a test whose suite or name contains `Regression`.
@@ -51,7 +51,7 @@
 ## Decisions (added 2026-10-19)
 
 - **AD1 — Mixed-version clusters:** a view using `Min` / `Max` / `Last` / `LastNonNull` is created only once **every** broker runs a build with Part A. `CreateView` events are applied on every broker from `__catalog` (the leader validates and compiles; each broker installs from the event's `compiledPlanBlob`), and a pre-A broker cannot install such a plan. A ships no wire/version negotiation for this (pre-1.0, rolling upgrades of the view engine are not supported yet): the release note says "upgrade every broker before creating a view with min/max/last". Task 1 already retargets `ViewPlanRegression.UnknownRuleValueIsRejected` to byte 9 (one past `LastNonNull`), so an unknown future rule still fails closed; Task 9's commit adds the release-note line to `docs/release-notes/` (one file, `phase2b-a-retractable-aggregates.md`).
-- **AD2 — No catalog format change:** nothing in A touches `rune_catalog` (event layout, fingerprints, golden logs); `CatalogGoldenRegression.*` must pass unchanged — run `ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-codec/build -R CatalogGolden` at each checkpoint as the proof.
+- **AD2 — No catalog format change:** nothing in A touches `rune_catalog` (event layout, fingerprints, golden logs); `CatalogGoldenRegression.*` must pass unchanged — run `ctest --test-dir ~/Projects/se-worktrees/rune-codec/build -R CatalogGolden` at each checkpoint as the proof.
 
 ## Review Focus
 
@@ -2577,7 +2577,7 @@ log "     + post-restart update retracts the pre-image, min and max exactly OK"
 - [ ] **Step 5: Run the e2e on the VM.** Honour `/root/vm.lock`: claim it with an owner marker and release it afterwards.
 
 ```bash
-rsync -a --delete /Users/vradu/Projects/se-worktrees/ root@$RUNE_VM_HOST:/root/se-worktrees/
+rsync -a --delete ~/Projects/se-worktrees/ root@$RUNE_VM_HOST:/root/se-worktrees/
 ssh root@$RUNE_VM_HOST 'flock /root/vm.lock bash -c "cd /root/se-worktrees/rune-broker && bash docker/view-engine-e2e.sh"'
 ```
 (The script is authenticated since the auth phase — it bootstraps through `docker/lib/auth.sh` and passes `RUNE_USER` / `RUNE_PASSWORD_FILE` to the probe; change nothing there.)

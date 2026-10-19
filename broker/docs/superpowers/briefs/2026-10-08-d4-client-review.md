@@ -1,6 +1,6 @@
 # D4 client review — coordinator redirect + seed identity (rune-client-cpp)
 
-- Worktree: `/Users/vradu/Projects/rune-client-cpp-wt17`, branch `fix/d4-coordinator-redirect`
+- Worktree: `~/Projects/rune-client-cpp-wt17`, branch `fix/d4-coordinator-redirect`
 - Commits on main (42ff385): `a0f61a1` (coordinator answer moves the seed; reconnect re-joins in-flight joins), `25c2ae5` (seed endpoint follows every retarget)
 - Reviewed: full `git diff main..HEAD`, plus every user of `Session::endpoint`, `cfg_.transport.ingressChannel`, `transport_.ingressChannel()`, `sameEndpoint`, `sessionForEndpoint`, route `sessionIndex` caching, crypto seal lookup, Pong/Connect/Error demux, the T15a Backoff retargets, the txn producer resend, and GroupConsumerHub join paths. On the broker side: `ClientGateway::redirectToCoordinator_`, `SessionTable::nextSessionId`, and `GroupCoordinator::join` (new member on an empty memberId).
 - Tests run at HEAD (macOS, `build/`):

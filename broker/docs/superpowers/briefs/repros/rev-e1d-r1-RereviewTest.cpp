@@ -1,4 +1,4 @@
-#include "/Users/vradu/Projects/rune-broker-wt32/libs/storage/tests/storage/RecoveryPointTest.cpp"
+#include "~/Projects/rune-broker-wt32/libs/storage/tests/storage/RecoveryPointTest.cpp"
 
 // MAJOR candidate: a checkpoint write completed (durable) while the log was
 // unowned; the new owner resets (outcome unknown) and then truncates between

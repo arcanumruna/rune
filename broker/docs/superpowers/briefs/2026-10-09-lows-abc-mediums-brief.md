@@ -1,10 +1,10 @@
 # Fix round: the MEDIUMs of the lows A/B/C review
 
-Worktree /Users/vradu/Projects/rune-broker-wt71, branch fix/lows-storage-replication. It is already fast-forwarded
+Worktree ~/Projects/rune-broker-wt71, branch fix/lows-storage-replication. It is already fast-forwarded
 or merged to integ/perf-defaults, so it contains all three lows batches.
 
 Read the review first: docs/superpowers/briefs/2026-10-09-lows-abc-review.md (copy it from
-/Users/vradu/Projects/rune-broker-wt26/docs/superpowers/briefs/ if missing). Fix:
+~/Projects/rune-broker-wt26/docs/superpowers/briefs/ if missing). Fix:
 - **M1 (D26): persistent read EIO.** A persistent pread EIO is retried on every worker pass, which stalls the
   worker, and nothing escalates.
   - Fix: treat it like a write failure. Mark the log storage-failed (sticky), so the log-dir-offline / broker halt
@@ -28,7 +28,7 @@ virtual calls; worker / owner duty pass at most 100 us (measure if touched); nev
 
 **IMPORTANT build / test environment.** x86_64 binaries HANG at launch on this Mac (Rosetta is wedged). Do NOT run
 Mac-built test binaries. Use the native arm64 Linux dev container:
-- `/Users/vradu/Projects/rune-dev/devrun.sh /Users/vradu/Projects/rune-broker-wt71 '<cmd>'`.
+- `~/Projects/rune-dev/devrun.sh ~/Projects/rune-broker-wt71 '<cmd>'`.
   - It mounts the worktree at /src and the build dir at /bt (= <wt>/build-linux), with the sibling repos.
   - Configure once: `devrun.sh WT 'cmake -S /src -B /bt -G Ninja $RUNE_CMAKE'`.
   - Then `devrun.sh WT 'cmake --build /bt --target <t> -j8 && /bt/libs/.../<t> --gtest_filter=...'`.

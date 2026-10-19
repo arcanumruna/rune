@@ -8,7 +8,7 @@
 
 **Tech Stack:** C++23, CMake ≥3.31, Conan 2, GoogleTest, Google Benchmark, Aeron. Three repos: `rune-protocol` (header-only, sibling include), `rune-broker` (x86_64 prod), `rune-client-cpp`; `rune-codec` (0a) consumed read-only as a sibling source static library.
 
-**Spec:** `/Users/vradu/Projects/rune-broker-matviews/docs/superpowers/specs/2026-09-29-rune-0b-schema-registry-typed-transport-design.md`
+**Spec:** `~/Projects/rune-broker-matviews/docs/superpowers/specs/2026-09-29-rune-0b-schema-registry-typed-transport-design.md`
 
 ## Global Constraints
 
@@ -409,7 +409,7 @@ TEST(SchemaCodecSmoke, FingerprintAndRoundTrip) {
 ```
 Register it with the node test target (`gtest_discover_tests`), linking `rune_codec`.
 
-- [ ] **Step 4: Configure + build + run**, verify it fails first if `rune_codec` is not yet linked, then passes after linking. Use the repo's Conan+CMake flow; on macos arm64 pass `-DRUNE_CODEC_ROOT=/Users/vradu/Projects/rune-codec`.
+- [ ] **Step 4: Configure + build + run**, verify it fails first if `rune_codec` is not yet linked, then passes after linking. Use the repo's Conan+CMake flow; on macos arm64 pass `-DRUNE_CODEC_ROOT=~/Projects/rune-codec`.
 
 - [ ] **Step 5: Commit**
 ```bash
@@ -817,7 +817,7 @@ git commit -m "feat(broker): gateway routes DDL to AdminWorker (enqueue-only, no
 - [ ] **Step 1:** Make `RUNE_PROTOCOL_INCLUDE` (line ~7) a `CACHE PATH` as in Task 2 Step 1.
 - [ ] **Step 2:** Add the identical `rune_codec` STATIC target block (Task 2 Step 2) and link it into the client library target and the tools.
 - [ ] **Step 3:** Add the smoke test (copy Task 2 Step 3), register with a client test target.
-- [ ] **Step 4:** Configure/build/run; verify pass (pass `-DRUNE_CODEC_ROOT=/Users/vradu/Projects/rune-codec` on macos arm64).
+- [ ] **Step 4:** Configure/build/run; verify pass (pass `-DRUNE_CODEC_ROOT=~/Projects/rune-codec` on macos arm64).
 - [ ] **Step 5: Commit**
 ```bash
 git add CMakeLists.txt tests/SchemaCodecSmokeTest.cpp

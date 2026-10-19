@@ -21,14 +21,14 @@
 
 ## Execution context
 
-- **Repos / branch:** create `feat/authentication` in each worktree under `/Users/vradu/Projects/se-worktrees/`, from the integration base:
-  - `rune-broker`: the base is `feat/isr-protocol` with `feat/catalog-history` merged (the controller merges it first if `git -C /Users/vradu/Projects/se-worktrees/rune-broker-drbugs merge-base --is-ancestor c50b06cd feat/isr-protocol` fails), then `git -C /Users/vradu/Projects/se-worktrees/rune-broker switch -c feat/authentication <that commit>`. Verify `grep -n kMsgCatalogHoldLeadership libs/node/include/rune/node/AdminChannels.h` and `grep -n 'CatalogReadServer' libs/node/include/rune/node/AdminWorker.h` both hit before Task 1.
+- **Repos / branch:** create `feat/authentication` in each worktree under `~/Projects/se-worktrees/`, from the integration base:
+  - `rune-broker`: the base is `feat/isr-protocol` with `feat/catalog-history` merged (the controller merges it first if `git -C ~/Projects/se-worktrees/rune-broker-drbugs merge-base --is-ancestor c50b06cd feat/isr-protocol` fails), then `git -C ~/Projects/se-worktrees/rune-broker switch -c feat/authentication <that commit>`. Verify `grep -n kMsgCatalogHoldLeadership libs/node/include/rune/node/AdminChannels.h` and `grep -n 'CatalogReadServer' libs/node/include/rune/node/AdminWorker.h` both hit before Task 1.
   - `rune-protocol`: from `feat/storage-incarnation` (it contains `feat/catalog-history`; the ISR broker builds against it — `rune-protocol-storage` worktree).
   - `rune-client-cpp`: from `feat/catalog-history` merged with the client commit the ISR broker builds against (`rune-client-cpp-storage` at `0f53f2a`).
   - `rune-ql`, `rune-codec`: from `feat/catalog-history`.
   - `rune-crypto`: from `main`.
 
-  Verify each with `git -C <repo> log --oneline -1` before Task 1. Never touch `/Users/vradu/Projects/rune-protocol` or `/Users/vradu/Projects/rune-client-cpp` (other branches, dirty). Re-point `RUNE_PROTOCOL_INCLUDE` of `build-fast` / `build-bench-rel` at the worktree used (`cmake -DRUNE_PROTOCOL_INCLUDE=... <build>`), and add `-DRUNE_CRYPTO_ROOT=/Users/vradu/Projects/se-worktrees/rune-crypto`.
+  Verify each with `git -C <repo> log --oneline -1` before Task 1. Never touch `~/Projects/rune-protocol` or `~/Projects/rune-client-cpp` (other branches, dirty). Re-point `RUNE_PROTOCOL_INCLUDE` of `build-fast` / `build-bench-rel` at the worktree used (`cmake -DRUNE_PROTOCOL_INCLUDE=... <build>`), and add `-DRUNE_CRYPTO_ROOT=~/Projects/se-worktrees/rune-crypto`.
 - **Builds (re-run cmake only after a `CMakeLists.txt` edit):** broker `build-fast` (Ninja, Debug, `BUILD_TESTING=ON`), broker benchmarks `build-bench-rel` (`BUILD_BENCHMARKS=ON`, `-O3 -DNDEBUG`), client `build`, protocol `build` (`rune_protocol_tests`), rune-ql `build` (`rune_ql_tests`), rune-codec `build` (`rune_codec_tests`, `rune_catalog_tests`, new `rune_security_tests`) and `build-rel` (`rune_codec_bench`), rune-crypto `build` (`BUILD_TESTING=ON`, `rune_crypto_tests`) and `build-rel` (`BUILD_BENCHMARKS=ON`, created in Task 1). Broker client-integration tests: `build-fast` target `rune_client_broker_tests` (the real client from `RUNE_CLIENT_ROOT`).
 - **Test gate (CLAUDE.md rule 7):**
   - **Per task / fix round:** build, then run the executables covering the code the task touches plus every new or changed test, at `-j14` — each task's "Run" step names the exact filter: `ctest --test-dir <build> -R '<filter>' --output-on-failure -j14`.
@@ -484,7 +484,7 @@ TEST(ScramRegression, NoncesArePrintableWithoutCommasAndUnique) {
 
 - [ ] **Step 3: Run to verify they fail**
 
-Run: `cmake /Users/vradu/Projects/se-worktrees/rune-crypto/build && cmake --build /Users/vradu/Projects/se-worktrees/rune-crypto/build -j14 --target rune_crypto_tests`
+Run: `cmake ~/Projects/se-worktrees/rune-crypto/build && cmake --build ~/Projects/se-worktrees/rune-crypto/build -j14 --target rune_crypto_tests`
 Expected: compile error `'rune/crypto/Kdf.h' file not found`.
 
 - [ ] **Step 4: Implement `Kdf.cpp`** — OpenSSL 3 EVP only:
@@ -575,22 +575,22 @@ bool verifyClientProof(Digest d, const DigestBytes& storedKey, std::string_view 
 
 - [ ] **Step 7: Run**
 
-Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-crypto/build -j14 && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-crypto/build -R 'Kdf|Scram|Aead|Tls|Crypto' --output-on-failure -j14 && cmake --build /Users/vradu/Projects/se-worktrees/rune-crypto/build-rel -j14 --target rune_crypto_scram_bench && /Users/vradu/Projects/se-worktrees/rune-crypto/build-rel/rune_crypto_scram_bench --benchmark_repetitions=5 --benchmark_report_aggregates_only=true`
+Run: `cmake --build ~/Projects/se-worktrees/rune-crypto/build -j14 && ctest --test-dir ~/Projects/se-worktrees/rune-crypto/build -R 'Kdf|Scram|Aead|Tls|Crypto' --output-on-failure -j14 && cmake --build ~/Projects/se-worktrees/rune-crypto/build-rel -j14 --target rune_crypto_scram_bench && ~/Projects/se-worktrees/rune-crypto/build-rel/rune_crypto_scram_bench --benchmark_repetitions=5 --benchmark_report_aggregates_only=true`
 Expected: all PASS; `BM_ScramFullExchangeTwoVerifiers` median < 5 ms (record the three medians in the commit body; a median ≥ 5 ms is a bug to fix here — the D7 iteration default is sized by this number). Also build the broker and client once (`cmake --build .../rune-broker/build-fast --target rune_gateway`, `cmake --build .../rune-client-cpp/build --target rune_client_api`) to prove the source lists link.
 
 - [ ] **Step 8: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-crypto add include src tests bench CMakeLists.txt
-git -C /Users/vradu/Projects/se-worktrees/rune-crypto commit -m "feat(crypto): HMAC, PBKDF2, HKDF, random, constant-time compare, base64, SCRAM-SHA-512 (RFC 5802/7677)
+git -C ~/Projects/se-worktrees/rune-crypto add include src tests bench CMakeLists.txt
+git -C ~/Projects/se-worktrees/rune-crypto commit -m "feat(crypto): HMAC, PBKDF2, HKDF, random, constant-time compare, base64, SCRAM-SHA-512 (RFC 5802/7677)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add CMakeLists.txt
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "build: compile rune-crypto Kdf/Scram sources (authentication Task 1)
+git -C ~/Projects/se-worktrees/rune-broker add CMakeLists.txt
+git -C ~/Projects/se-worktrees/rune-broker commit -m "build: compile rune-crypto Kdf/Scram sources (authentication Task 1)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
-git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp add CMakeLists.txt
-git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp commit -m "build: compile rune-crypto Kdf/Scram sources (authentication Task 1)
+git -C ~/Projects/se-worktrees/rune-client-cpp add CMakeLists.txt
+git -C ~/Projects/se-worktrees/rune-client-cpp commit -m "build: compile rune-crypto Kdf/Scram sources (authentication Task 1)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -786,20 +786,20 @@ TEST(SecurityEventRegression, EncodeIntoReusesCapacity) {
 (`detail_testing::opsBodySize` = the encoded size of the ops body after the tag byte; `body` therefore indexes the first body byte — for a grant `[grantee][op][type]…`.)
 
 - [ ] **Step 2: Add the build targets** (CMake as listed above).
-- [ ] **Step 3: Run to verify they fail** — `cmake /Users/vradu/Projects/se-worktrees/rune-codec/build && cmake --build /Users/vradu/Projects/se-worktrees/rune-codec/build -j14 --target rune_security_tests` → `'rune/security/SecurityEvent.h' file not found`.
+- [ ] **Step 3: Run to verify they fail** — `cmake ~/Projects/se-worktrees/rune-codec/build && cmake --build ~/Projects/se-worktrees/rune-codec/build -j14 --target rune_security_tests` → `'rune/security/SecurityEvent.h' file not found`.
 - [ ] **Step 4: Implement** `SecurityEvent.h` (the interfaces above, verbatim) and `SecurityEvent.cpp`: the writer / reader are `src/catalog/Wire.h`'s (`#include "../catalog/Wire.h"`); the principal and replayedFrom are written / read by ONE copy of the code: extract the inline lines of `CatalogEvent.cpp` (encode ~`:252–256`, anchor `w.i64(e.principal.sessionId)`; decode ~`:288–297`, anchor `!r.i64(e.principal.sessionId)`) into `inline void writePrincipalAndReplay(Writer&, const Principal&, const std::optional<ReplayedFrom>&)` and `inline bool readPrincipalAndReplay(Reader&, Principal&, std::optional<ReplayedFrom>&)` in `Wire.h`, called by both encoders — `CatalogEventRegression.*` and `CatalogGoldenRegression.*` must stay green, proving the catalog bytes did not change. Every enum byte is range-checked on decode (`BadEnum`), every verifier field bound-checked (`BadVerifier`) on encode and decode, the ops tag must equal the kind (`KindOpsMismatch`), and the reader must end exactly at the end (`TrailingBytes`).
-- [ ] **Step 5: Run** — `cmake --build /Users/vradu/Projects/se-worktrees/rune-codec/build -j14 && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-codec/build -R 'SecurityEvent|CatalogEvent' --output-on-failure -j14` → PASS (9 security tests + every catalog event test).
+- [ ] **Step 5: Run** — `cmake --build ~/Projects/se-worktrees/rune-codec/build -j14 && ctest --test-dir ~/Projects/se-worktrees/rune-codec/build -R 'SecurityEvent|CatalogEvent' --output-on-failure -j14` → PASS (9 security tests + every catalog event test).
 - [ ] **Step 6: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-codec add include/rune/security src/security src/catalog tests/security CMakeLists.txt
-git -C /Users/vradu/Projects/se-worktrees/rune-codec commit -m "feat(security): rune_security event model and frozen formatVer-1 encoding (catalog header, shared principal wire)
+git -C ~/Projects/se-worktrees/rune-codec add include/rune/security src/security src/catalog tests/security CMakeLists.txt
+git -C ~/Projects/se-worktrees/rune-codec commit -m "feat(security): rune_security event model and frozen formatVer-1 encoding (catalog header, shared principal wire)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add CMakeLists.txt && git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "build: link rune_security (authentication Task 2)
+git -C ~/Projects/se-worktrees/rune-broker add CMakeLists.txt && git -C ~/Projects/se-worktrees/rune-broker commit -m "build: link rune_security (authentication Task 2)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
-git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp add CMakeLists.txt && git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp commit -m "build: link rune_security (authentication Task 2)
+git -C ~/Projects/se-worktrees/rune-client-cpp add CMakeLists.txt && git -C ~/Projects/se-worktrees/rune-client-cpp commit -m "build: link rune_security (authentication Task 2)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -1109,14 +1109,14 @@ TEST(SecurityPermissionsRegression, EffectiveGrantsAreTheUnionOfDirectAndRoles) 
 
 `SecurityFingerprintTest.cpp`: `SecurityFingerprintRegression.IdsAreNeverHashed` (two states building the same users / roles in different orders — different objectIds — give equal per-object fingerprints and equal role-name lists), `…EveryUserFieldChangesTheFingerprint` (name, version, enabled, mustChangePassword, each verifier byte class, a role name, a grant field — each alone flips it), `…DigestEqualsAtEqualOffsetsAndDiffersAfterAnyEvent`.
 
-- [ ] **Step 2: Run to verify they fail** — `cmake --build /Users/vradu/Projects/se-worktrees/rune-codec/build -j14 --target rune_security_tests` → `'rune/security/SecurityState.h' file not found`.
+- [ ] **Step 2: Run to verify they fail** — `cmake --build ~/Projects/se-worktrees/rune-codec/build -j14 --target rune_security_tests` → `'rune/security/SecurityState.h' file not found`.
 - [ ] **Step 3: Implement** `SecurityState.cpp` (accessors, `digest`, `membersOf`, `hasSecurityAdmin` = any enabled user whose `clusterOps(effectiveGrants)` has `opBit(Admin)`), `ApplyV1.cpp` (the table above; `apply` = `UnsupportedFormat` / `OutOfOrder` checks → copy-free validation → mutate a **scratch copy of the touched objects only** → fingerprint check → commit, so a refusal never leaves a half-applied state; records the `RequestRecord` when `principal.requestId` is not none), `SecurityFingerprint.cpp`, `Permissions.cpp` (`matches`: same type, Exact → equality, Prefix → `name.starts_with(p.name)`; `opsOn`: OR of `opBit(op)` over matching grants, OR CLUSTER's CREATE / ALTER / DROP / DESCRIBE for Topic / View and DESCRIBE for Group / TransactionalId, then `| opBit(Describe)` when non-zero; `validGrant`: D16 / D17, CLUSTER must be `Exact ""`, Exact names non-empty).
-- [ ] **Step 4: Run** — `ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-codec/build -R 'Security' --output-on-failure -j14` → PASS.
+- [ ] **Step 4: Run** — `ctest --test-dir ~/Projects/se-worktrees/rune-codec/build -R 'Security' --output-on-failure -j14` → PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-codec add include/rune/security src/security tests/security
-git -C /Users/vradu/Projects/se-worktrees/rune-codec commit -m "feat(security): security state, frozen v1 apply rules, fingerprints, effective permissions
+git -C ~/Projects/se-worktrees/rune-codec add include/rune/security src/security tests/security
+git -C ~/Projects/se-worktrees/rune-codec commit -m "feat(security): security state, frozen v1 apply rules, fingerprints, effective permissions
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -1174,14 +1174,14 @@ Spec §3 ("History reads … use the shared replay library and the same commands
   - The golden script (`goldenScriptV1`, 16 events, every kind at least once, offsets 0..15): Bootstrap `admin`; CreateRole `world_server`; Grant READ TOPIC `player_events` → role; Grant WRITE TOPIC PREFIX `world.` → role; Grant READ GROUP PREFIX `world-` → role; CreateUser `ws1`; GrantRole `world_server` → `ws1`; AlterUser `ws1` AddPassword; AlterUser `ws1` DropPassword 1; Revoke WRITE PREFIX `world.` ← role; AlterUser `admin` SetPassword (no terminate); AlterUser `ws1` Disable; AlterUser `ws1` Enable; RevokeRole `world_server` ← `ws1`; DropRole `world_server`; DropUser `ws1`. Fixed salts / keys (`0x10 + offset`), `timestampMs = 1'760'000'000'000 + offset * 1000`, `principal.authenticated = "admin"` (`"bootstrap"` at offset 0 — D3), statements redacted.
 - [ ] **Step 2: Run to verify they fail** (missing headers).
 - [ ] **Step 3: Implement** RecordFile (move the `.rcat` reader / writer bodies there, parameterized by magic), the replayer (decode → `apply` → `ReplayError` naming the offset; `feed` refuses `offset != nextOffset()` with `Gap`), queries (pure over `RecordedEvent` spans; `stateAsOf` replays through a `SecurityReplayer`), `.rsec`, the golden script.
-- [ ] **Step 4: Generate the golden log and pins** — `cmake --build /Users/vradu/Projects/se-worktrees/rune-codec/build --target make_security_golden && /Users/vradu/Projects/se-worktrees/rune-codec/build/make_security_golden /Users/vradu/Projects/se-worktrees/rune-codec/tests/security/golden/v1/basic.rsec` — it writes the file and prints `kBasicV1Digests` (one `digest()` per offset); paste them into `SecurityGoldenPins.h` (frozen from here on: a later failure means a v1 rule changed).
+- [ ] **Step 4: Generate the golden log and pins** — `cmake --build ~/Projects/se-worktrees/rune-codec/build --target make_security_golden && ~/Projects/se-worktrees/rune-codec/build/make_security_golden ~/Projects/se-worktrees/rune-codec/tests/security/golden/v1/basic.rsec` — it writes the file and prints `kBasicV1Digests` (one `digest()` per offset); paste them into `SecurityGoldenPins.h` (frozen from here on: a later failure means a v1 rule changed).
 - [ ] **Step 5: Bench** — `SecurityReplayBench.cpp`: `BM_SecurityReplay10kEvents` (10 000 events: 1 000 users, 200 roles, grants and role changes) through `SecurityReplayer` in `build-rel`; record the median (no gate — the boot replay gate of the catalog, < 1 s for 10k, is asserted for `__security` in Task 9's `SecurityApplierRegression.BootReplayOf10kEventsUnderOneSecond`).
-- [ ] **Step 6: Run** — `cmake --build /Users/vradu/Projects/se-worktrees/rune-codec/build -j14 && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-codec/build -R 'Security|Catalog|RecordFile' --output-on-failure -j14` → PASS; `/Users/vradu/Projects/se-worktrees/rune-codec/build-rel/rune_codec_bench --benchmark_filter=SecurityReplay`.
+- [ ] **Step 6: Run** — `cmake --build ~/Projects/se-worktrees/rune-codec/build -j14 && ctest --test-dir ~/Projects/se-worktrees/rune-codec/build -R 'Security|Catalog|RecordFile' --output-on-failure -j14` → PASS; `~/Projects/se-worktrees/rune-codec/build-rel/rune_codec_bench --benchmark_filter=SecurityReplay`.
 - [ ] **Step 7: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-codec add include src tests tools benchmark CMakeLists.txt
-git -C /Users/vradu/Projects/se-worktrees/rune-codec commit -m "feat(security): verifying replayer, history/as-of/grants-for, .rsec (generalized record file), v1 golden log, replay bench
+git -C ~/Projects/se-worktrees/rune-codec add include src tests tools benchmark CMakeLists.txt
+git -C ~/Projects/se-worktrees/rune-codec commit -m "feat(security): verifying replayer, history/as-of/grants-for, .rsec (generalized record file), v1 golden log, replay bench
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -1340,7 +1340,7 @@ TEST(AuthMessagesRegression, OutOfBoundsFieldsDoNotDecode) {
 
 `SecurityMessagesTest.cpp`: `SecurityMessagesRegression.EveryOpKindRoundTrips` (CreateUser with verifier, each AlterUser change, Drop/CreateRole, Grant/Revoke with a prefix pattern, GrantRole/RevokeRole, all with an extension carrying a 128-bit request id), `…VerifierKeysMustBe64Bytes`, `…BootstrapMacInputIsStable` (pinned bytes of `bootstrapMacInput` for a fixed request), `…TruncationNeverDecodes`. `ControlMessagesConnectTest.cpp` gains `ConnectResponseRegression.V9CarriesAuthModeAndStateWithAndWithoutCrypto` and `…PreV9FrameDecodesAsInProcessAnonymous` (a 42-byte and a V4 frame decode with `authMode == InProcess`), and the client-version pin moves to 9.
 
-- [ ] **Step 2: Run to verify they fail** — `cmake --build /Users/vradu/Projects/se-worktrees/rune-protocol/build -j14 --target rune_protocol_tests` → missing `AuthMessages.h`.
+- [ ] **Step 2: Run to verify they fail** — `cmake --build ~/Projects/se-worktrees/rune-protocol/build -j14 --target rune_protocol_tests` → missing `AuthMessages.h`.
 - [ ] **Step 3: Implement** (encoders return 0 when a field does not fit — the house `fits()` idiom; decoders are bounds-checked and return `nullopt`), the schema edits, the version comment block in `Protocol.h`:
 
 ```cpp
@@ -1355,12 +1355,12 @@ TEST(AuthMessagesRegression, OutOfBoundsFieldsDoNotDecode) {
 //   DdlResponse (78).  An authentication-enabled broker answers a Connect below 9 ConnectResponse{ProtocolVersion}.
 ```
 
-- [ ] **Step 4: Run** — `ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-protocol/build -R 'AuthMessages|SecurityMessages|Connect|Dispatch|Conformance' --output-on-failure -j14` → PASS.
+- [ ] **Step 4: Run** — `ctest --test-dir ~/Projects/se-worktrees/rune-protocol/build -R 'AuthMessages|SecurityMessages|Connect|Dispatch|Conformance' --output-on-failure -j14` → PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-protocol add include schema tests
-git -C /Users/vradu/Projects/se-worktrees/rune-protocol commit -m "feat(protocol): authentication wire - codes 44-47, client v9 / broker v5, SCRAM templates 12-15, SecurityDdl 79, SecurityBootstrap 80, ConnectResponse v9 auth fields, kSecurityTopicId, ring ops 21/22
+git -C ~/Projects/se-worktrees/rune-protocol add include schema tests
+git -C ~/Projects/se-worktrees/rune-protocol commit -m "feat(protocol): authentication wire - codes 44-47, client v9 / broker v5, SCRAM templates 12-15, SecurityDdl 79, SecurityBootstrap 80, ConnectResponse v9 auth fields, kSecurityTopicId, ring ops 21/22
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -1501,12 +1501,12 @@ TEST(SecurityStatementsRegression, ScriptsMixCatalogAndSecurityStatements) {
 
 - [ ] **Step 2: Run to verify they fail.**
 - [ ] **Step 3: Implement** the AST, the parser branches (`create`, `grant`, `revoke`, the `alter user` / `drop user|role` / `show users|roles|grants|security` branches added beside the existing ones; `parseStatement`'s `kExpected` lists the new leading keywords), `Redact.cpp` (`redactedText` re-renders every statement kind; non-security statements render their existing text unchanged — only security statements are ever sent re-rendered), `applySecurityPlan`.
-- [ ] **Step 4: Run** — `cmake --build /Users/vradu/Projects/se-worktrees/rune-ql/build -j14 && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-ql/build --output-on-failure -j14` → every test PASS (the existing ones untouched).
+- [ ] **Step 4: Run** — `cmake --build ~/Projects/se-worktrees/rune-ql/build -j14 && ctest --test-dir ~/Projects/se-worktrees/rune-ql/build --output-on-failure -j14` → every test PASS (the existing ones untouched).
 - [ ] **Step 5: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-ql add include src tests CMakeLists.txt
-git -C /Users/vradu/Projects/se-worktrees/rune-ql commit -m "feat(ql): CREATE/ALTER/DROP USER, CREATE/DROP ROLE, GRANT/REVOKE, SHOW USERS/ROLES/GRANTS/SECURITY HISTORY, redacted statements, security plans
+git -C ~/Projects/se-worktrees/rune-ql add include src tests CMakeLists.txt
+git -C ~/Projects/se-worktrees/rune-ql commit -m "feat(ql): CREATE/ALTER/DROP USER, CREATE/DROP ROLE, GRANT/REVOKE, SHOW USERS/ROLES/GRANTS/SECURITY HISTORY, redacted statements, security plans
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -1649,14 +1649,14 @@ TEST(SessionMachineAuthRegression, NoDataFrameLeavesBeforeConnected) {
 
 `ClientAuthErrorsTest.cpp` (the `InvokerGateway` fake, `authMode = Required`, users `{"ws1": "correct horse battery"}`): `ClientAuthErrorsRegression.WrongPasswordFailsConnectWithAuthenticationFailed`, `…NoCredentialsFailsConnectWithAuthenticationFailed` (the fake answers 44 to an empty username — the broker enforces, the client never short-circuits), `…NotAuthorizedFailsTheOpWithoutRetry` (the fake answers a DefineTopic `45`: the result is `NotAuthorized`, exactly one DefineTopic sent), `…NotAuthorizedOnASubscriptionEndsIt`, `…SessionRevokedFailsEverythingInFlightAndDoesNotReconnectRegression` (three produces in flight + a subscription, the fake sends `ErrorResponse{46, corr 0}`: all four complete `SessionRevoked`, `connectsArrived` does not grow for 2 s of pumping), `…PasswordChangeRequiredIsReportedAndOnlyTheOpFails`, `…ScramCachePaysPbkdf2OncePerVerifierRegression` (three sessions to three endpoints of the fake with the same verifier → `ScramCache` hit count 2, PBKDF2 count 1 — a test seam counter in `ScramCache`). `ClientConnectRegressionTest.cpp`: `ClientConnectRegression.NoAuthTokenIsEverSentRegression` (with `offerCrypto = true`, the captured `ConnectRequest.authToken` is empty; `ClientConfig` has no `authToken` member — `static_assert(!requires(rune::client::ClientConfig c) { c.authToken; })`).
 
-- [ ] **Step 2: Run to verify they fail** — `cmake --build /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -j14` → missing `onAuthServerFirst` / `Authenticating`.
+- [ ] **Step 2: Run to verify they fail** — `cmake --build ~/Projects/se-worktrees/rune-client-cpp/build -j14` → missing `onAuthServerFirst` / `Authenticating`.
 - [ ] **Step 3: Implement.** Key rules: `SessionMachine::onConnectResponse` gains the v9 fields (defaults keep every existing call site); the `OK` branch calls `beginAuthOrFinish_(nowNs)` instead of `finishConnected_` (for the TLS path: after the handshake's `done()` — the same place `finishConnected_` is called at `SessionMachine.h` ~`:916`); `beginAuthOrFinish_` → `Authenticating` + `AuthClientFirst{username, makeNonce()}` when `authMode == Required && authState == MustAuthenticate`, else `finishConnected_`. `onAuthServerFirst` validates `combinedNonce.starts_with(clientNonce)` (else Rejected 44: "broker nonce does not extend ours"), salts each verifier's password through the agent's `ScramCache` (cold; PBKDF2 at most twice), sends one proof per verifier, stores the expected server signatures (`ScramSentFinal`). `onAuthServerFinal` with OK: the signature must equal one of the expected (constant time) → `finishConnected_`; the `kAuthFlagMustChangePassword` flag sets the session's `passwordChangeRequired()`. `tick()` in `Authenticating` applies `connectTimeoutNs` like `Handshaking`. The agent decodes templates 13 / 15 (sealed like every post-handshake frame) and routes by session id; `ErrorResponse{46, corr 0}` triggers the session-wide `SessionRevoked` completion pass (the existing SessionLost completion path, with the code `SessionRevoked` and **no** reconnect scheduling).
-- [ ] **Step 4: Run** — `ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -R 'SessionMachine|ClientAuthErrors|ClientConnect|Crypto' --output-on-failure -j14` → PASS (every existing SessionMachine test included: the defaults keep the pre-v9 behaviour).
+- [ ] **Step 4: Run** — `ctest --test-dir ~/Projects/se-worktrees/rune-client-cpp/build -R 'SessionMachine|ClientAuthErrors|ClientConnect|Crypto' --output-on-failure -j14` → PASS (every existing SessionMachine test included: the defaults keep the pre-v9 behaviour).
 - [ ] **Step 5: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp add include src tests
-git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp commit -m "feat(client): SCRAM-SHA-512 login (Authenticating state, one proof per active verifier, salted-password cache), codes 44-47, SessionRevoked is terminal; drop the never-validated authToken
+git -C ~/Projects/se-worktrees/rune-client-cpp add include src tests
+git -C ~/Projects/se-worktrees/rune-client-cpp commit -m "feat(client): SCRAM-SHA-512 login (Authenticating state, one proof per active verifier, salted-password cache), codes 44-47, SessionRevoked is terminal; drop the never-validated authToken
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -1706,12 +1706,12 @@ SecurityResult<std::vector<rune::security::RoleRow>> securityRoles(std::chrono::
   - `RuneCliSecurityTest.cpp` (offline): `RuneCliSecurityRegression.GenClusterKeyWritesSixtyFourHexCharsAtMode0600`, `…PasswordIsNeverAcceptedFromArgvOrEnv` (`--password secret` → usage error; `RUNE_PASSWORD=x` ignored with a warning), `…QlDryRunPrintsTheRedactedStatement` (`rune ql --dry-run -e "create user u with password 'long enough pw';"` prints `CREATE USER u WITH PASSWORD '<redacted>';`), `…BootstrapRequiresAClusterKeyFile`.
 - [ ] **Step 2: Run to verify they fail.**
 - [ ] **Step 3: Implement.** `rune ql` routes every `rune::ql::isSecurityStatement` statement through `securityDdlAndWait` (SHOW statements through the reads; output tables: `SHOW USERS` → `name enabled must_change passwords roles version`; `SHOW GRANTS` → `source operation resource pattern` with `source` = `direct` or `role:<name>`; `SHOW SECURITY HISTORY` → `offset time kind object version principal statement`). `rune security bootstrap`: without `--password-file` it generates 24 characters from `[A-Za-z0-9]` with `randomBytes` (rejection sampling), prints exactly one line `one-time password for <admin>: <pw>` to stdout and nothing else secret; with `--password-file` it reads it and prints `bootstrapped <admin> (password from <path>)`. The banner: after any CLI connect whose `authStatus().brokerMode == DevDisabled`, stderr gets `WARNING: this broker runs with authentication DISABLED (RUNE_AUTH=disabled, dev mode)`.
-- [ ] **Step 4: Run** — `ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -R 'SecurityDdl|SecurityReader|CatalogReader|RuneCli' --output-on-failure -j14` → PASS.
+- [ ] **Step 4: Run** — `ctest --test-dir ~/Projects/se-worktrees/rune-client-cpp/build -R 'SecurityDdl|SecurityReader|CatalogReader|RuneCli' --output-on-failure -j14` → PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp add include src tests CMakeLists.txt
-git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp commit -m "feat(client): security DDL (verifiers built client-side, redacted statements), __security reader on a shared event-log stream, rune ql security statements, rune security bootstrap/gen-cluster-key, --user/--password-file, dev-mode banner
+git -C ~/Projects/se-worktrees/rune-client-cpp add include src tests CMakeLists.txt
+git -C ~/Projects/se-worktrees/rune-client-cpp commit -m "feat(client): security DDL (verifiers built client-side, redacted statements), __security reader on a shared event-log stream, rune ql security statements, rune security bootstrap/gen-cluster-key, --user/--password-file, dev-mode banner
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -1795,12 +1795,12 @@ Spec §3 (the log's properties), §8 (the cluster key file and its rotation vari
   - `SecurityReplicationTest.cpp` (3 nodes, `InProcessUnauthenticated` — authentication is not the subject here, the log is): `SecurityReplicationRegression.FormationCreatesSecurityOnEveryBrokerWithACleanLeader`, `…AnAppendedEventReachesEveryBrokersViewInOffsetOrder` (append through the leader's test seam `appendSecurityEventOnLeaderForTest`; every broker's `SecurityView::appliedOffset()` reaches it and the digests agree), `…NeverCompactedOrRetentionDeleted`, `…AWipedFollowerRefetchesSecurityFromZero` (the ISR v3 catalog test, for −7).
 - [ ] **Step 2: Run to verify they fail.**
 - [ ] **Step 3: Implement** in this order: config + refusals + `main.cpp`; `ClusterKeys` (D32 with `rune::crypto::hkdf` / `hmac`); the generic admin-log helpers (catalog tests must stay green: `ctest -R 'CatalogPartition|CatalogReplication|CatalogApplier|CatalogCheckpoint'`); `SecurityApplier` (a structural copy of `CatalogApplier` minus projections and per-kind effects: one `eventApplied` per event); `SecurityView`; the bridge / metadata / BrokerNode wiring; the dev-mode timer.
-- [ ] **Step 4: Run** — `cmake /Users/vradu/Projects/se-worktrees/rune-broker/build-fast && cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'NodeConfig|ClusterKeys|SecurityApplier|SecurityAlloc|SecurityReplication|Catalog' --output-on-failure -j14` → PASS.
+- [ ] **Step 4: Run** — `cmake ~/Projects/se-worktrees/rune-broker/build-fast && cmake --build ~/Projects/se-worktrees/rune-broker/build-fast -j14 && ctest --test-dir ~/Projects/se-worktrees/rune-broker/build-fast -R 'NodeConfig|ClusterKeys|SecurityApplier|SecurityAlloc|SecurityReplication|Catalog' --output-on-failure -j14` → PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs src CMakeLists.txt
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "feat(security): RUNE_AUTH (default on) + dev mode rules, cluster key files, the __security partition on the admin plane, SecurityApplier, the control-thread SecurityView
+git -C ~/Projects/se-worktrees/rune-broker add libs src CMakeLists.txt
+git -C ~/Projects/se-worktrees/rune-broker commit -m "feat(security): RUNE_AUTH (default on) + dev mode rules, cluster key files, the __security partition on the admin plane, SecurityApplier, the control-thread SecurityView
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -1858,12 +1858,12 @@ public:
   - 3-node (append to `SecurityReplicationTest.cpp`): `SecurityReplicationRegression.SecurityDdlViaAFollowerIsRedirectedToTheLeader`.
 - [ ] **Step 2: Run to verify they fail.**
 - [ ] **Step 3: Implement** (the AdminWorker's existing machinery is the template: `startNext_`, `advance_`, `answer_` — copy their structure into `SecurityAdmin`; do not touch the catalog's state machine).
-- [ ] **Step 4: Run** — `ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'SecurityWritePath|SecurityBootstrap|SecurityReadServer|CatalogReadServer|SecurityAnswerGate|SecurityReplication|CatalogWritePath|CatalogLeadership' --output-on-failure -j14` → PASS.
+- [ ] **Step 4: Run** — `ctest --test-dir ~/Projects/se-worktrees/rune-broker/build-fast -R 'SecurityWritePath|SecurityBootstrap|SecurityReadServer|CatalogReadServer|SecurityAnswerGate|SecurityReplication|CatalogWritePath|CatalogLeadership' --output-on-failure -j14` → PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "feat(security): SecurityAdmin write path (dedupe, redirect, NotLeader, halted), cluster-key-proven bootstrap, __security reads, the DDL answer gate; CatalogReadServer takes its topic id
+git -C ~/Projects/se-worktrees/rune-broker add libs
+git -C ~/Projects/se-worktrees/rune-broker commit -m "feat(security): SecurityAdmin write path (dedupe, redirect, NotLeader, halted), cluster-key-proven bootstrap, __security reads, the DDL answer gate; CatalogReadServer takes its topic id
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -1985,12 +1985,12 @@ TEST(LoginThrottleRegression, AFullTableEvictsTheOldestNeverAllocatesNorRefuses)
 
 - [ ] **Step 2: Run to verify they fail.**
 - [ ] **Step 3: Implement** (ScramServer and LoginThrottle as pure, separately tested units; the gateway wiring last). The gateway's SecurityView reference is the control thread's object (same thread — no copy needed).
-- [ ] **Step 4: Run** — `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'LoginThrottle|ScramServer|AuthLogin|ClientLoginBroker|RuneCliSecurityBroker|AuthGates|Gateway|Connect' --output-on-failure -j14` → PASS (every existing gateway / connect test included: they run `InProcessUnauthenticated` → `AuthAnonymous`).
+- [ ] **Step 4: Run** — `cmake --build ~/Projects/se-worktrees/rune-broker/build-fast -j14 && ctest --test-dir ~/Projects/se-worktrees/rune-broker/build-fast -R 'LoginThrottle|ScramServer|AuthLogin|ClientLoginBroker|RuneCliSecurityBroker|AuthGates|Gateway|Connect' --output-on-failure -j14` → PASS (every existing gateway / connect test included: they run `InProcessUnauthenticated` → `AuthAnonymous`).
 - [ ] **Step 5: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs CMakeLists.txt
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "feat(auth): SCRAM-SHA-512 server in the session handshake, auth states, version gate, throttle without lockout, auth deadline, dev-mode anonymous sessions, login logs/counters, 5 ms login gate
+git -C ~/Projects/se-worktrees/rune-broker add libs CMakeLists.txt
+git -C ~/Projects/se-worktrees/rune-broker commit -m "feat(auth): SCRAM-SHA-512 server in the session handshake, auth states, version gate, throttle without lockout, auth deadline, dev-mode anonymous sessions, login logs/counters, 5 ms login gate
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -2120,12 +2120,12 @@ TEST(PermissionTableRegression, AllowAllAllowsEverythingIncludingCluster) {
 
 - [ ] **Step 2: Run to verify they fail.**
 - [ ] **Step 3: Implement** — `PermissionTable` / `ObjectIndex` / `Authorizer` first (unit-tested), then each handler in the order of the map; the `Authorizer` is the only place a code or a detail text is chosen.
-- [ ] **Step 4: Run** — `ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'PermissionTable|AuthEnforcement|AuthVisibility|CatalogPrincipal|AuthLogin|Gateway|Schema|View|Group|Txn' --output-on-failure -j14` → PASS.
+- [ ] **Step 4: Run** — `ctest --test-dir ~/Projects/se-worktrees/rune-broker/build-fast -R 'PermissionTable|AuthEnforcement|AuthVisibility|CatalogPrincipal|AuthLogin|Gateway|Schema|View|Group|Txn' --output-on-failure -j14` → PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "feat(auth): per-session permission tables (exact, prefix, cluster, implied describe, created-after-login), enforcement of every request type, visibility, authenticated principal on DDL events
+git -C ~/Projects/se-worktrees/rune-broker add libs
+git -C ~/Projects/se-worktrees/rune-broker commit -m "feat(auth): per-session permission tables (exact, prefix, cluster, implied describe, created-after-login), enforcement of every request type, visibility, authenticated principal on DDL events
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -2178,12 +2178,12 @@ public:
   - `benchmark/AuthCheckBench.cpp`: `BM_GatewayPermissionTableAllows` (`PermissionTable::allows` on a 10 000-topic table, random topic ids from a pre-generated array), `BM_WorkerAllowsWrite` (`allowsWrite` on a resolved slot), `BM_WorkerSlotLookupPlusAllowsWrite` (the `find_` probe + check, reported).
 - [ ] **Step 2: Run to verify they fail.**
 - [ ] **Step 3: Implement** (schema ops 21 / 22 already exist from Task 5; the WorkerOp encode / decode cases mirror `SessionAnnounce`'s tail handling; `executeSessionPermissionsWire_` is `[[gnu::cold]]`).
-- [ ] **Step 4: Run the tests** — `ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'WorkerWriteGrant|PermissionShipper|WorkerSessionCrypto|ShardAuthProduce|AuthAlloc|SessionAckSink|SessionAnnouncer|Worker|HotPath|ZeroAlloc|Transient' --output-on-failure -j14` → PASS.
+- [ ] **Step 4: Run the tests** — `ctest --test-dir ~/Projects/se-worktrees/rune-broker/build-fast -R 'WorkerWriteGrant|PermissionShipper|WorkerSessionCrypto|ShardAuthProduce|AuthAlloc|SessionAckSink|SessionAnnouncer|Worker|HotPath|ZeroAlloc|Transient' --output-on-failure -j14` → PASS.
 - [ ] **Step 5: Gates (Release)** — the check bench and hot-path parity against the same branch with authentication off:
 
 ```bash
-cmake /Users/vradu/Projects/se-worktrees/rune-broker/build-bench-rel && cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-bench-rel -j14 --target rune_broker_benchmark
-B=/Users/vradu/Projects/se-worktrees/rune-broker/build-bench-rel/rune_broker_benchmark
+cmake ~/Projects/se-worktrees/rune-broker/build-bench-rel && cmake --build ~/Projects/se-worktrees/rune-broker/build-bench-rel -j14 --target rune_broker_benchmark
+B=~/Projects/se-worktrees/rune-broker/build-bench-rel/rune_broker_benchmark
 $B --benchmark_filter='PermissionTableAllows|AllowsWrite' --benchmark_repetitions=10 --benchmark_report_aggregates_only=true
 # parity: the same hot-path benches with RUNE_BENCH_AUTH=off (InProcessUnauthenticated, grantAll) and =on (Enabled, granted)
 for m in off on; do RUNE_BENCH_AUTH=$m $B --benchmark_filter='WorkerProduceLatency|ProducePath|PushRead|FusedRuntimePass' --benchmark_repetitions=5 --benchmark_report_aggregates_only=true; done
@@ -2194,8 +2194,8 @@ Expected: `BM_GatewayPermissionTableAllows` and `BM_WorkerAllowsWrite` medians �
 - [ ] **Step 6: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs benchmark
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -F /tmp/auth-gates-msg.txt
+git -C ~/Projects/se-worktrees/rune-broker add libs benchmark
+git -C ~/Projects/se-worktrees/rune-broker commit -F /tmp/auth-gates-msg.txt
 ```
 
 (first line `feat(auth): worker WRITE bitmaps on the lifecycle ring, shard produce check, slot-indexed session crypto, <=2 ns check, hot-path parity, zero-alloc gates`, a blank line, one line per benchmark, a blank line, the `Co-Authored-By` trailer.)
@@ -2254,12 +2254,12 @@ TEST(AuthLiveChangeRegression, RevokedReadEndsLiveSubscriptionsRegression) {
 and in the same style: `…RevokedWriteFailsTheNextGatewayProduceRegression`, `…RevokedWriteFailsTheNextShardProduceRegression`, `…RoleRevokeRefreshesEveryMember` (3 users of one role, one revoke, all three lose it), `…DropRoleRefreshesMembers`, `…GrantArrivesWithoutReconnect`, `…PrefixGrantCoversATopicCreatedAfterLogin`, `…DisableRevokesEnableAllowsLogin` (live subscription → 46, session-level 46, `UnknownSession` to a Ping; login → 44 while disabled; ENABLE → login OK), `…DropUserRevokesEverySession` (two sessions of the user, both revoked), `…SetPasswordKeepsSessions` (live session keeps receiving; the old password's new login → 44, the new one OK), `…SetPasswordTerminateRevokes`, `…CatalogReadEndsWhenDescribeClusterIsRevoked`, `…GroupMemberLosingGroupReadIsRemovedWithNotAuthorized`, `…TheGrantOkIsEnforcedByTheAnsweringBrokerImmediately` (GRANT then, with zero delay, a produce on the same broker → OK, 100 iterations; REVOKE then produce → 45, 100 iterations — D24). `SecurityHaltTest.cpp`: `SecurityHaltRegression.HaltRevokesEverySessionAndRefusesLoginsRegression` (the applier's `tamperNextFingerprintForTest`, then any security DDL: every authenticated session is revoked with the halt detail, a new login answers 44, a security DDL answers `Internal`, counter `226` = 1; the single-node broker stays up and keeps serving nothing to anyone — fail closed; the repair-by-refetch path needs a peer and is the 3-node `AuthClusterRegression.HaltedBrokerRefetchesSecurityAfterItsDirIsMovedAside` in Task 19). `ClientSessionRevokedBrokerRegressionTest.cpp` (the real client): `ClientSessionRevokedBrokerRegression.InFlightRequestsAndSubscriptionsCompleteSessionRevokedAndNothingReconnects`.
 - [ ] **Step 2: Run to verify they fail.**
 - [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run** — `ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'LiveSecurityChanges|AuthLiveChange|SecurityHalt|ClientSessionRevoked|AuthEnforcement|AuthLogin|Group' --output-on-failure -j14` → PASS.
+- [ ] **Step 4: Run** — `ctest --test-dir ~/Projects/se-worktrees/rune-broker/build-fast -R 'LiveSecurityChanges|AuthLiveChange|SecurityHalt|ClientSessionRevoked|AuthEnforcement|AuthLogin|Group' --output-on-failure -j14` → PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "feat(auth): live security changes - refresh tables, end revoked subscriptions/groups/reads explicitly, fail revoked produces, SessionRevoked on disable/drop/terminate, fail closed on a security halt
+git -C ~/Projects/se-worktrees/rune-broker add libs
+git -C ~/Projects/se-worktrees/rune-broker commit -m "feat(auth): live security changes - refresh tables, end revoked subscriptions/groups/reads explicitly, fail revoked produces, SessionRevoked on disable/drop/terminate, fail closed on a security halt
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -2395,12 +2395,12 @@ TEST(PeerHandshakeRegression, AnUnknownEpochFrameTriggersARehandshake) {
 (Write every listed test body in full — each comment states its steps and assertions.) `PeerLinkKeysTest.cpp`: `PeerLinkKeysRegression.DerivationIsDirectionalAndNonceBound`. `PeerLinkAgentTest.cpp` (3 in-process nodes with real Aeron on the peer-auth stream only): `PeerLinkAgentRegression.EveryPairEstablishesWithinTwoSeconds`, `…AWrongKeyNodeIsRefusedByEveryPeerAndLogsIt`, `…KeysReachEveryWorkerAndTheAdminThread` (test probes: each worker's and the admin plane's crypto knows epoch E for each peer).
 - [ ] **Step 2: Run to verify they fail.**
 - [ ] **Step 3: Implement** (handshake + keys pure first, then the agent).
-- [ ] **Step 4: Run** — `ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'PeerHandshake|PeerLink' --output-on-failure -j14` → PASS.
+- [ ] **Step 4: Run** — `ctest --test-dir ~/Projects/se-worktrees/rune-broker/build-fast -R 'PeerHandshake|PeerLink' --output-on-failure -j14` → PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs CMakeLists.txt
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "feat(peerlink): mutual HMAC challenge-response under the cluster key, directional link keys, current/next rotation, refusals logged on both sides, keys distributed to every transport owner
+git -C ~/Projects/se-worktrees/rune-broker add libs CMakeLists.txt
+git -C ~/Projects/se-worktrees/rune-broker commit -m "feat(peerlink): mutual HMAC challenge-response under the cluster key, directional link keys, current/next rotation, refusals logged on both sides, keys distributed to every transport owner
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -2504,12 +2504,12 @@ TEST(PeerFrameRegression, AnOldEpochStaysValidForTwoSecondsThenIsRefused) {
 (Every empty-bodied test is written in full; its name and comment are its contract.) `PeerSealedTransportTest.cpp` (two `WorkerReplicationTransportImpl` over real Aeron IPC with `PeerFrameCrypto` installed): `PeerSealedTransportRegression.FetchRoundTripsSealed`, `…NoLinkMeansNothingIsSentAndItIsCounted`, `…AWrongKeyPeerIsDroppedNeverDispatched`; the same three for `AeronPartitionTransport`. `PeerSealedConsensusTest.cpp`: `PeerSealedConsensusRegression.ElectionCompletesOverSealedFrames` (3 consensus agents, links pre-installed), `…AKeylessNodeNeverAffectsTheTerm` (a node whose frames do not open cannot start an election that the others observe). `PeerFrameAllocRegressionTest.cpp`: `PeerFrameAllocRegression.SteadySealedReplicationAllocatesNothing`. `ReplicationFrameLimitsRegressionTest.cpp`: `ReplicationFrameLimitsRegression.EveryLimitLeavesRoomForThePeerFrameOverhead` (the largest frame each limit admits, sealed, still fits the transport's max message).
 - [ ] **Step 2: Run to verify they fail.**
 - [ ] **Step 3: Implement** — `PeerFrameCrypto` first (unit-tested), then each transport behind `PeerCryptoMode` (`std::visit` once per frame is one predictable branch; the `PeerPlain` path compiles to today's code), then the limits, then the BrokerNode wiring (each transport's constructor receives its mode; a worker / the admin plane gets its links through Task 15's distribution).
-- [ ] **Step 4: Run** — `ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'PeerFrame|PeerSealed|ReplicationFrameLimits|Replication|Consensus|Election|Catalog|Security' --output-on-failure -j14` → PASS; then the bench `build-bench-rel/rune_broker_benchmark --benchmark_filter='PeerFrame' --benchmark_repetitions=5` (`BM_PeerFrameSeal16K`, `BM_PeerFrameOpen16K`; record the medians — no gate, they inform the 3-node replication latency recorded in Task 19).
+- [ ] **Step 4: Run** — `ctest --test-dir ~/Projects/se-worktrees/rune-broker/build-fast -R 'PeerFrame|PeerSealed|ReplicationFrameLimits|Replication|Consensus|Election|Catalog|Security' --output-on-failure -j14` → PASS; then the bench `build-bench-rel/rune_broker_benchmark --benchmark_filter='PeerFrame' --benchmark_repetitions=5` (`BM_PeerFrameSeal16K`, `BM_PeerFrameOpen16K`; record the medians — no gate, they inform the 3-node replication latency recorded in Task 19).
 - [ ] **Step 5: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs benchmark
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "feat(peerlink): AEAD on every inter-broker frame (consensus, replication, admin plane) with per-sender keys and replay windows; unauthenticated peers dropped and counted; frame limits leave room for the overhead
+git -C ~/Projects/se-worktrees/rune-broker add libs benchmark
+git -C ~/Projects/se-worktrees/rune-broker commit -m "feat(peerlink): AEAD on every inter-broker frame (consensus, replication, admin plane) with per-sender keys and replay windows; unauthenticated peers dropped and counted; frame limits leave room for the overhead
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -2721,13 +2721,13 @@ TEST(AuthMatrixCountRegression, CellCountsArePinned) {
 
 (The count check reconciles with the section's rule counts: R1 62 = 59 `Denied` + 3 Metadata `FilteredOut`; R3 66 = 15 `Denied` + 12 `Ok` + 3 `Missing`(view) + 4 `FilteredOut` + 8 `Ok` + 24 `Missing`(topic).)
 
-- [ ] **Step 2: Build the rig** against the expectations until every applicable cell passes: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 --target rune_auth_matrix_tests && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'AuthMatrix' --output-on-failure -j14`.
+- [ ] **Step 2: Build the rig** against the expectations until every applicable cell passes: `cmake --build ~/Projects/se-worktrees/rune-broker/build-fast -j14 --target rune_auth_matrix_tests && ctest --test-dir ~/Projects/se-worktrees/rune-broker/build-fast -R 'AuthMatrix' --output-on-failure -j14`.
 Expected: 517 PASS, 203 SKIPPED (each naming NA1–NA6), `CellCountsArePinned` PASS. A failing cell is a product bug unless the table is wrong — a table change needs the spec section it follows quoted in the commit body.
 - [ ] **Step 3: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs/node/tests libs/node/CMakeLists.txt
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "test(auth): interaction matrix - 24 request types x 5 grant forms x 6 timings (720 cells, 517 applicable) on one auth-enabled broker
+git -C ~/Projects/se-worktrees/rune-broker add libs/node/tests libs/node/CMakeLists.txt
+git -C ~/Projects/se-worktrees/rune-broker commit -m "test(auth): interaction matrix - 24 request types x 5 grant forms x 6 timings (720 cells, 517 applicable) on one auth-enabled broker
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -2751,12 +2751,12 @@ Spec §11 "Seeded, model-checked stress": random grant / revoke sequences interl
 4. **Convergence:** at the end of each seed, for every session, a probe produce / subscribe on every topic answers exactly what the model says (no window: all changes answered), and the broker's `SecurityView` digest equals `SecurityState` replayed from `__security` by the client library.
 
 - [ ] **Step 1: Write the model and the test** (`TEST(AuthStressRegression, SeededRandomGrantRevokeTrafficHoldsEveryInvariant)` looping seeds `0..63`; `RUNE_AUTH_STRESS_SEEDS` overrides the count for a long local run; a failure prints the seed and the step list for replay).
-- [ ] **Step 2: Run** — `ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'AuthStress' --output-on-failure` → PASS (record the wall time; budget ≤ 4 min).
+- [ ] **Step 2: Run** — `ctest --test-dir ~/Projects/se-worktrees/rune-broker/build-fast -R 'AuthStress' --output-on-failure` → PASS (record the wall time; budget ≤ 4 min).
 - [ ] **Step 3: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "test(auth): seeded model-checked stress - racing grant/revoke/role/disable vs produce (both paths)/subscribe/create against an independent permission model
+git -C ~/Projects/se-worktrees/rune-broker add libs
+git -C ~/Projects/se-worktrees/rune-broker commit -m "test(auth): seeded model-checked stress - racing grant/revoke/role/disable vs produce (both paths)/subscribe/create against an independent permission model
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -2785,12 +2785,12 @@ Spec §11 "Brokers" and the 3-node items, §12 (revoke propagation ≤ 100 ms on
 - `ClientAuthClusterRegression.WorldServerClientProducesAndConsumesThroughEveryBroker` (the real `rune::client::Client` with username / password, one session per broker, typed produce + consume on `world.*` through each; REVOKE WRITE → the next produce completes `NotAuthorized`, no retry storm: exactly one ProduceRequest per failed record).
 
 - [ ] **Step 1: Write the trio and the tests.**
-- [ ] **Step 2: Run** — `ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'AuthCluster|ClientAuthCluster' --output-on-failure -j4` → PASS (record the revoke-propagation p50 / max and the rotation timings in the commit body).
+- [ ] **Step 2: Run** — `ctest --test-dir ~/Projects/se-worktrees/rune-broker/build-fast -R 'AuthCluster|ClientAuthCluster' --output-on-failure -j4` → PASS (record the revoke-propagation p50 / max and the rotation timings in the commit body).
 - [ ] **Step 3: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "test(auth): 3-node slice - __security replication, logins via every broker, revoke <=100 ms gate, leader kill mid security DDL, wrong/no cluster key, key rotation across rolling restarts, dev-mode refusal, real client
+git -C ~/Projects/se-worktrees/rune-broker add libs
+git -C ~/Projects/se-worktrees/rune-broker commit -m "test(auth): 3-node slice - __security replication, logins via every broker, revoke <=100 ms gate, leader kill mid security DDL, wrong/no cluster key, key rotation across rolling restarts, dev-mode refusal, real client
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -2824,7 +2824,7 @@ Spec §11 "Docker e2e, 3 nodes" (1. bootstrap; 2. create a role, a user and gran
 - [ ] **Step 3: Run on the VM** (never the local Mac):
 
 ```bash
-rsync -a --delete /Users/vradu/Projects/se-worktrees/ root@$RUNE_VM_HOST:/root/se-worktrees/
+rsync -a --delete ~/Projects/se-worktrees/ root@$RUNE_VM_HOST:/root/se-worktrees/
 ssh root@$RUNE_VM_HOST 'flock /root/vm.lock bash /root/se-worktrees/rune-broker/docker/auth-e2e.sh'
 ssh root@$RUNE_VM_HOST 'flock /root/vm.lock bash -c "cd /root/se-worktrees/rune-broker/docker && ./e2e.sh && ./view-engine-e2e.sh && ./transient-failover-e2e.sh && ./catalog-e2e.sh"'
 ```
@@ -2833,11 +2833,11 @@ Expected: `AUTH-E2E: OK`, and every migrated e2e passes authenticated.
 - [ ] **Step 4: Commit** (per repo)
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp add examples README.md && git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp commit -m "feat(examples): RUNE_USER / RUNE_PASSWORD_FILE credentials; README: authentication
+git -C ~/Projects/se-worktrees/rune-client-cpp add examples README.md && git -C ~/Projects/se-worktrees/rune-client-cpp commit -m "feat(examples): RUNE_USER / RUNE_PASSWORD_FILE credentials; README: authentication
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add docker dr-e2e bench docs
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "test(auth): docker e2e (bootstrap, role/user/grants, world-server produce+consume, revoke fails explicitly, cluster-key rotation across rolling restarts); launchers bootstrap and authenticate; SECURITY.md, SELF-HOSTING, release notes
+git -C ~/Projects/se-worktrees/rune-broker add docker dr-e2e bench docs
+git -C ~/Projects/se-worktrees/rune-broker commit -m "test(auth): docker e2e (bootstrap, role/user/grants, world-server produce+consume, revoke fails explicitly, cluster-key rotation across rolling restarts); launchers bootstrap and authenticate; SECURITY.md, SELF-HOSTING, release notes
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```

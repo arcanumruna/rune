@@ -14,10 +14,10 @@
 
 ## Execution context
 
-- **Checkouts (canonical sibling layout, the one the broker's `build-fast` is configured against):** `/Users/vradu/Projects/se-worktrees/{rune-broker,rune-protocol,rune-codec,rune-client-cpp}`. `build-fast/CMakeCache.txt` resolves `RUNE_PROTOCOL_INCLUDE=../rune-protocol/include` and `RUNE_CODEC_ROOT=../rune-codec`. The client's `build/` resolves the same siblings. Every path below is relative to the repo named in the task.
+- **Checkouts (canonical sibling layout, the one the broker's `build-fast` is configured against):** `~/Projects/se-worktrees/{rune-broker,rune-protocol,rune-codec,rune-client-cpp}`. `build-fast/CMakeCache.txt` resolves `RUNE_PROTOCOL_INCLUDE=../rune-protocol/include` and `RUNE_CODEC_ROOT=../rune-codec`. The client's `build/` resolves the same siblings. Every path below is relative to the repo named in the task.
 - **Branches.** Cut `feat/phase2b-c-typed-topic-routing` in all four repos before Task 1:
   ```bash
-  cd /Users/vradu/Projects/se-worktrees
+  cd ~/Projects/se-worktrees
   git -C rune-protocol   checkout -b feat/phase2b-c-typed-topic-routing feature/materialized-views
   git -C rune-broker     checkout -b feat/phase2b-c-typed-topic-routing feature/materialized-views
   git -C rune-client-cpp checkout -b feat/phase2b-c-typed-topic-routing feature/materialized-views
@@ -82,7 +82,7 @@ The spec's own regression test is `TypedTopicRoutingRegression.EightPartitionTyp
 
 ### Task 1: Protocol — `TopicSchemaResponse` gains a trailing `partitionCount`
 
-**Repo:** `/Users/vradu/Projects/se-worktrees/rune-protocol`
+**Repo:** `~/Projects/se-worktrees/rune-protocol`
 
 **Files:**
 - Modify: `include/rune/protocol/client/SchemaMessages.h:118-157` (the `TopicSchemaResponse` comment + struct)
@@ -359,7 +359,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ### Task 2: Broker — `GetTopicSchema` reports the topic's partition count
 
-**Repo:** `/Users/vradu/Projects/se-worktrees/rune-broker` (compiles `../rune-protocol` from Task 1)
+**Repo:** `~/Projects/se-worktrees/rune-broker` (compiles `../rune-protocol` from Task 1)
 
 **Files:**
 - Modify: `libs/node/include/rune/node/AdminWorker.h:73-76` (`respondGet` signature)
@@ -686,7 +686,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ### Task 3: Codec — the generated struct exposes `key()`
 
-**Repo:** `/Users/vradu/Projects/se-worktrees/rune-codec`
+**Repo:** `~/Projects/se-worktrees/rune-codec`
 
 **Files:**
 - Modify: `src/Generator.cpp` (includes; insert after the var-len members block that ends at line 123 `o << "\n";`)
@@ -1006,7 +1006,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ### Task 4: Client — the broker's `partitionCount` reaches `TopicSchemaResult`
 
-**Repo:** `/Users/vradu/Projects/se-worktrees/rune-client-cpp` (compiles `../rune-protocol` from Task 1)
+**Repo:** `~/Projects/se-worktrees/rune-client-cpp` (compiles `../rune-protocol` from Task 1)
 
 **Files:**
 - Modify: `include/rune/client/Completion.h:73` (`reserved0` doc)
@@ -1327,7 +1327,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ### Task 5: Client — `TypedTopic` routes by `Key(rec.key())` over the topic's partitions
 
-**Repo:** `/Users/vradu/Projects/se-worktrees/rune-client-cpp` (compiles `../rune-codec` from Task 3)
+**Repo:** `~/Projects/se-worktrees/rune-client-cpp` (compiles `../rune-codec` from Task 3)
 
 **Files:**
 - Rewrite: `include/rune/client/TypedTopic.h` (full content below)
@@ -2096,7 +2096,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ### Task 6: Real-broker e2e — an 8-partition typed topic routes by key
 
-**Repos:** client `/Users/vradu/Projects/se-worktrees/rune-client-cpp`, broker `/Users/vradu/Projects/se-worktrees/rune-broker`
+**Repos:** client `~/Projects/se-worktrees/rune-client-cpp`, broker `~/Projects/se-worktrees/rune-broker`
 
 **Files:**
 - Modify: `rune-client-cpp/examples/view_probe.cpp` (includes; new `typedRoutingLeg`; one call in `setup` mode)
@@ -2306,14 +2306,14 @@ Expected output: `PROBE: typed_route OK — 64 records over N partitions …` (N
 
 ```bash
 # client
-cd /Users/vradu/Projects/se-worktrees/rune-client-cpp
+cd ~/Projects/se-worktrees/rune-client-cpp
 ctest --test-dir build -R Regression --output-on-failure
 git add examples/view_probe.cpp CMakeLists.txt
 git commit -m "test(e2e): view_probe typed_route leg — 8-partition typed topic routes by key (Phase 2b C)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 # broker
-cd /Users/vradu/Projects/se-worktrees/rune-broker
+cd ~/Projects/se-worktrees/rune-broker
 ctest --test-dir build-fast -R Regression --output-on-failure
 git add docker/view-engine-e2e.sh
 git commit -m "test(e2e): assert typed-topic key routing on a real broker (Phase 2b C)

@@ -23,11 +23,11 @@
 
 - **Repos / branch:** `feat/phase2b-f-unified-producer` in rune-client-cpp and rune-broker (tests + docker + docs only in the broker; no broker library change), cut from each repo's integration tip after Part B merged:
   ```bash
-  git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp switch -c feat/phase2b-f-unified-producer <B-tip>
-  git -C /Users/vradu/Projects/se-worktrees/rune-broker      switch -c feat/phase2b-f-unified-producer <B-tip>
+  git -C ~/Projects/se-worktrees/rune-client-cpp switch -c feat/phase2b-f-unified-producer <B-tip>
+  git -C ~/Projects/se-worktrees/rune-broker      switch -c feat/phase2b-f-unified-producer <B-tip>
   ```
   Verify before Task 1: `grep -n "tryClaim" include/rune/client/producer/Producer.h`, `grep -n "kMsgClaimBatch" include/rune/client/producer/ProducerImpl.h`, `grep -n "ClaimHeld" include/rune/client/producer/Producer.h` (client) all hit. rune-protocol, rune-codec, rune-ql stay on their integration tips (no change).
-- **Builds:** client `cmake --build /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -j14` (Debug, `BUILD_TESTING=ON`, `BUILD_EXAMPLES=ON`, `BUILD_BENCHMARKS=ON` for Task 14), client TSan `build_tsan`; broker `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 --target rune_client_broker_tests rune_client_failover_broker_tests` (compiles the client from `RUNE_CLIENT_ROOT=../rune-client-cpp`).
+- **Builds:** client `cmake --build ~/Projects/se-worktrees/rune-client-cpp/build -j14` (Debug, `BUILD_TESTING=ON`, `BUILD_EXAMPLES=ON`, `BUILD_BENCHMARKS=ON` for Task 14), client TSan `build_tsan`; broker `cmake --build ~/Projects/se-worktrees/rune-broker/build-fast -j14 --target rune_client_broker_tests rune_client_failover_broker_tests` (compiles the client from `RUNE_CLIENT_ROOT=../rune-client-cpp`).
 - **Test gate (CLAUDE.md #7):** per task, the executables covering the touched code plus every new or changed test (each task's Run step, `-j14`). The FULL `*Regression*` suite runs at the checkpoints — **A** after Task 4, **B** after Task 9, **C** after Task 13, **D** after Task 15 (before the final whole-branch review) — in both repos (`ctest --test-dir <build> -R Regression --output-on-failure -j14`), plus client `build_tsan` and broker `build-asan` / `build-tsan`. A checkpoint failure is bisected over the commits since the last green checkpoint.
 - **Docker e2e** (Task 15) only on the k3s VM (`ssh root@$RUNE_VM_HOST`, `flock /root/vm.lock`), never on the Mac.
 - Nothing is pushed. Every commit message ends with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
@@ -320,19 +320,19 @@ TEST(ProducerTxnApiRegression, PlainProducerHotPathIsUnchangedRegression) {
 ```
 (`Completions::reservedBytesForTest()` — add a test accessor if it does not exist; `BatchBuilder::trySend()` — use B's / the existing non-throwing Tier-2 submit name; if the existing API only has `send()`, assert the throw instead. `rc::Producer p(&impl)` on a bare impl: the handle's destructor must not free a stack impl — use the existing bare-rig helper in `ProducerTest.cpp` instead of a raw pointer if one exists.)
 
-- [ ] **Step 2: Run to verify they fail** — `cmake --build /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -j14 --target rune_producer_tests` → `no member named 'transactionalId'` / `'NotInTransaction'`.
+- [ ] **Step 2: Run to verify they fail** — `cmake --build ~/Projects/se-worktrees/rune-client-cpp/build -j14 --target rune_producer_tests` → `no member named 'transactionalId'` / `'NotInTransaction'`.
 - [ ] **Step 3: Implement.** The gate check sits at the top of `Producer::trySendPart_`, the token `trySend` overloads, B's `tryClaim` / `claimBatch` entry and the Tier-2 submit, before any credit reservation:
 
 ```cpp
 if (impl->txnGate() == producer::ProducerImpl::TxnGate::Closed) [[unlikely]] return SendResult::NotInTransaction;
 ```
 (`NotTransactional` and `Open` both pass; the comparison is one byte load + compare on the hot path.) `ProducerImpl::throwForSendResult` maps `NotInTransaction` to `std::logic_error("produce outside a transaction")`. `RejectReason::NotInTransaction` is appended after B's `ClaimHeld`. Lifecycle stubs return `OpResult::InvalidArgument` / throw as specified.
-- [ ] **Step 4: Run** — `ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -R 'ProducerTxnApi|Producer|BatchBuilder|Claim' --output-on-failure -j14` → PASS.
+- [ ] **Step 4: Run** — `ctest --test-dir ~/Projects/se-worktrees/rune-client-cpp/build -R 'ProducerTxnApi|Producer|BatchBuilder|Claim' --output-on-failure -j14` → PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp add include src tests CMakeLists.txt
-git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp commit -m "feat(producer): ProducerConfig::transactionalId, creation validation, SendResult::NotInTransaction, the handle gate on every produce path
+git -C ~/Projects/se-worktrees/rune-client-cpp add include src tests CMakeLists.txt
+git -C ~/Projects/se-worktrees/rune-client-cpp commit -m "feat(producer): ProducerConfig::transactionalId, creation validation, SendResult::NotInTransaction, the handle gate on every produce path
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -640,7 +640,7 @@ using TxnMembership = std::variant<NotInTxn, Adding, Added, AddFailed>;   // Par
 **Migration rule:** every `TransactionalProducerTest` case not already ported in Tasks 5–7 moves to `ProducerTxnTest.cpp` (lifecycle), `ProducerTxnDataTest.cpp` (data / F14 gating / EOS-OOS sequencing) or `ProducerTxnOffsetsTest.cpp`, **same test body semantics, new API**, `*Regression*` names kept verbatim (suite renamed `TransactionalProducer*` → `ProducerTxn*`). Write the old → new name table into the commit body. `client.transactionalProducer(id, cfg)` becomes `cfg.transactionalId = id; client.producer(cfg)`; `tp.send(...)` stays `p.send(...)`; `std::map<TopicPartitionKey, int64_t>` offsets become a `std::vector<OffsetEntry>` built once (examples) or a stack array (tests).
 
 - [ ] **Step 1:** Port the remaining tests (they fail to compile against the deleted header — that is the "failing" state). Add `ProducerTxnRegression.TransactionalProducerTypeIsGoneRegression` (`static_assert(!requires { typename rune::client::TransactionalProducer; })` and `!requires(rune::client::Client& c) { c.transactionalProducer(""); }`).
-- [ ] **Step 2:** Delete the files; fix every compile error by migrating the call site (grep must be empty: `grep -rn "TransactionalProducer\|transactionalProducer" /Users/vradu/Projects/se-worktrees/rune-client-cpp/{include,src,tests,examples,bench} /Users/vradu/Projects/se-worktrees/rune-broker/libs` → only the regression test's `requires` expressions).
+- [ ] **Step 2:** Delete the files; fix every compile error by migrating the call site (grep must be empty: `grep -rn "TransactionalProducer\|transactionalProducer" ~/Projects/se-worktrees/rune-client-cpp/{include,src,tests,examples,bench} ~/Projects/se-worktrees/rune-broker/libs` → only the regression test's `requires` expressions).
 - [ ] **Step 3: Run** — client: everything (`ctest --test-dir … --output-on-failure -j14`); broker: `ctest … -R 'ClientFailoverBroker|ProducerIdBroker' --output-on-failure -j14` (the failover txn case — `SeedCoordinatorCrashedMidTransactionEndsCommittedOrRetriableRegression` — on the unified producer, assertions unchanged).
 - [ ] **Step 4: Commit** (client + broker) — `refactor(client)!: TransactionalProducer removed — transactions are Producer + transactionalId; tests and examples migrated`.
 
@@ -702,7 +702,7 @@ Semantics per FD8. The assignment lives on the duty thread, so the check happens
   - `EosBrokerRegression.ProduceOutsideATransactionIsRefusedAgainstARealBrokerRegression`
   - `ProducerIdBrokerRegression.RetriedBatchAcrossAReconnectIsDeduplicatedRegression` (`ThreeNodes`: a plain acked producer; the seed crashes with a batch answered-but-unseen; the client reconnects and re-sends; the log holds one copy)
   - `ProducerIdBrokerRegression.PlainAckedEveryPathRegression` (9 ops × {`Steady`, `SessionLostMid`} — the matrix's real-broker plain slice, reading `TxnMatrixExpectations.h`)
-- [ ] **Step 2: Run** — `cmake --build … --target rune_client_failover_broker_tests rune_client_broker_tests && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'EosBroker|ProducerIdBroker' --output-on-failure` → PASS (fix forward in the client if a cell fails; every fix gets its own `*Regression*`).
+- [ ] **Step 2: Run** — `cmake --build … --target rune_client_failover_broker_tests rune_client_broker_tests && ctest --test-dir ~/Projects/se-worktrees/rune-broker/build-fast -R 'EosBroker|ProducerIdBroker' --output-on-failure` → PASS (fix forward in the client if a cell fails; every fix gets its own `*Regression*`).
 - [ ] **Step 3: Commit** (broker) — `test(eos): the unified producer against real brokers — every path, fencing, in-doubt commit, leader crash, abort-rewind-redo, plain dedup across reconnect`.
 
 ---
@@ -726,7 +726,7 @@ enum class Outcome : uint8_t { Delivered, DeliveredOnce, AtMostOnce, Refused, Co
 ```
 
 - [ ] **Step 1: Write the tests:** `TxnMatrixCountRegression.CellCountsArePinned` (320 / 188 / 132; NA1 120, NA2 4, NA3 8; R1 18, R2 9, R3 9, R4–R11 19 each — computed by iterating the enums); `TxnMatrix/TxnMatrixTest.Cell/*` (`INSTANTIATE_TEST_SUITE_P` over the cartesian product, `GTEST_SKIP() << "NA: " << rule` for N/A cells), each cell asserting the five "Every cell asserts" points through the `TxnMatrixRig` (one `Client` in Invoker mode per cell, a fresh `transactionalId` / group / topic name per cell).
-- [ ] **Step 2: Run** — `ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -R 'TxnMatrix' --output-on-failure -j14` → 188 pass, 132 skipped with their rule. A failing cell is a bug: fix it (with a `*Regression*` test) in the owning code, never by editing `expect()` without a spec reason recorded in the commit body.
+- [ ] **Step 2: Run** — `ctest --test-dir ~/Projects/se-worktrees/rune-client-cpp/build -R 'TxnMatrix' --output-on-failure -j14` → 188 pass, 132 skipped with their rule. A failing cell is a bug: fix it (with a `*Regression*` test) in the owning code, never by editing `expect()` without a spec reason recorded in the commit body.
 - [ ] **Step 3: Commit** — `test(producer): transaction interaction matrix — 10 ops × 4 entities × 8 timings (188 applicable, 132 N/A by rule)`.
 
 ---
@@ -771,7 +771,7 @@ enum class Outcome : uint8_t { Delivered, DeliveredOnce, AtMostOnce, Refused, Co
 - [ ] **Step 3: Run on the VM** (never the Mac):
 
 ```bash
-rsync -a --delete /Users/vradu/Projects/se-worktrees/ root@$RUNE_VM_HOST:/root/se-worktrees/
+rsync -a --delete ~/Projects/se-worktrees/ root@$RUNE_VM_HOST:/root/se-worktrees/
 ssh root@$RUNE_VM_HOST 'flock /root/vm.lock bash /root/se-worktrees/rune-broker/docker/eos-e2e.sh'
 ssh root@$RUNE_VM_HOST 'flock /root/vm.lock bash -c "cd /root/se-worktrees/rune-broker/docker && ./view-engine-e2e.sh && ./catalog-e2e.sh"'
 ```

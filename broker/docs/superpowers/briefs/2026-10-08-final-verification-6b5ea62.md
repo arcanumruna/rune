@@ -130,7 +130,7 @@ On the box:
 - Gate: `/root/e3g/gate6b/runs/<scenario>.<fs>.<bin>.<i>.log`, `/root/e3g/gate6b/runs-s1/` (scale-1 supplement), and `/root/e3g/gate6b/progress.txt` (per-run timestamps, container count, load)
 - Scripts: `/root/e3g/{build6b.sh,dr6b.sh,gate6b.sh,gate6b-one.sh,gate6b-s1.sh,gate6b-one-s1.sh,master6b.sh}`
 
-Copied locally to `/Users/vradu/.claude/jobs/ceedc822/tmp/box6b/` (`dr/`, `gate/runs`, `gate/runs-s1`, `gate/table-*.md`, `gate/progress.txt`). The tabulator is `/Users/vradu/.claude/jobs/ceedc822/tmp/gate_tab.py`.
+Copied locally to `~/.claude/jobs/ceedc822/tmp/box6b/` (`dr/`, `gate/runs`, `gate/runs-s1`, `gate/table-*.md`, `gate/progress.txt`). The tabulator is `~/.claude/jobs/ceedc822/tmp/gate_tab.py`.
 
 ## Box state at end
 

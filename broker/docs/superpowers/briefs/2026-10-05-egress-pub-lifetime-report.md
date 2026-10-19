@@ -1,6 +1,6 @@
 # Record-egress publication lifetime: report (2026-10-05)
 
-Branch `fix/egress-pub-lifetime` (worktree `/Users/vradu/Projects/rune-broker-wt52`, base `6a67487`). Commit `ca7a789`.
+Branch `fix/egress-pub-lifetime` (worktree `~/Projects/rune-broker-wt52`, base `6a67487`). Commit `ca7a789`.
 
 ## Bug
 `ClientGateway::closeSession_` called `sessions_.remove(sid)`, which destroyed the session's per-worker record-egress `ExclusivePublication`s. The owning worker still held their raw pointers in `WorkerSubscription::egressPub` and pushed through them on every pass. The result was a cross-thread use-after-free, which showed up as `maxMessageLength 0 B` followed by an aeron `OutOfBoundsException` (exit 133) or a SIGSEGV (exit 139).

@@ -51,9 +51,9 @@
 
 ## Task 0: Branches / worktrees (controller, no review)
 
-- [ ] **Step 1:** rune-protocol (shared sibling checkout `/Users/vradu/Projects/rune-protocol`, consumed by every worktree): `git -C /Users/vradu/Projects/rune-protocol switch -c feat/udp-gso` (from its current HEAD f3fa865; leave the unrelated modified `CLAUDE.md` alone — never stage it).
-- [ ] **Step 2:** broker: `git -C /Users/vradu/Projects/rune-broker-wt26 worktree add /Users/vradu/Projects/rune-broker-wt29 -b feat/udp-gso integ/perf-defaults`.
-- [ ] **Step 3:** client: `git -C /Users/vradu/Projects/rune-client-cpp-wt4 worktree add /Users/vradu/Projects/rune-client-cpp-wt5 -b feat/udp-gso HEAD` (HEAD = ab37438; the uncommitted canOffer WIP in wt4 stays there and is NOT part of this plan).
+- [ ] **Step 1:** rune-protocol (shared sibling checkout `~/Projects/rune-protocol`, consumed by every worktree): `git -C ~/Projects/rune-protocol switch -c feat/udp-gso` (from its current HEAD f3fa865; leave the unrelated modified `CLAUDE.md` alone — never stage it).
+- [ ] **Step 2:** broker: `git -C ~/Projects/rune-broker-wt26 worktree add ~/Projects/rune-broker-wt29 -b feat/udp-gso integ/perf-defaults`.
+- [ ] **Step 3:** client: `git -C ~/Projects/rune-client-cpp-wt4 worktree add ~/Projects/rune-client-cpp-wt5 -b feat/udp-gso HEAD` (HEAD = ab37438; the uncommitted canOffer WIP in wt4 stays there and is NOT part of this plan).
 - [ ] **Step 4:** VM tree: `ssh root@$RUNE_VM_HOST 'mkdir -p /root/gso'`; sync script `/root/gso/sync.sh` is created in Task 2 Step 6.
 
 ---
@@ -134,7 +134,7 @@ Add `tests/protocol/net/UdpGsoPlanTest.cpp` to the `add_executable(rune_protocol
 
 - [ ] **Step 2: Run it to verify it fails**
 
-Run: `cd /Users/vradu/Projects/rune-protocol && cmake --build build --target rune_protocol_tests 2>&1 | tail -5`
+Run: `cd ~/Projects/rune-protocol && cmake --build build --target rune_protocol_tests 2>&1 | tail -5`
 Expected: compile error `rune/protocol/net/rune_udp_gso.h: No such file`. (If `build/` is not configured with `-DBUILD_TESTING=ON`, configure it the way `build.sh` in this repo does, adding `-DBUILD_TESTING=ON`.)
 
 - [ ] **Step 3: Implement** — `include/rune/protocol/net/rune_udp_gso.h`:
@@ -507,10 +507,10 @@ cat > /tmp/gso-sync.sh <<'EOF'
 # Mac -> VM source sync for the GSO work (no build dirs, no .git).
 set -e
 for r in rune-protocol rune-fr rune-codec; do
-  rsync -a --delete --exclude build --exclude 'build-*' --exclude .git /Users/vradu/Projects/$r/ root@$RUNE_VM_HOST:/root/gso/$r/
+  rsync -a --delete --exclude build --exclude 'build-*' --exclude .git ~/Projects/$r/ root@$RUNE_VM_HOST:/root/gso/$r/
 done
-rsync -a --delete --exclude 'build*' --exclude .git /Users/vradu/Projects/rune-broker-wt29/ root@$RUNE_VM_HOST:/root/gso/rune-broker/
-rsync -a --delete --exclude 'build*' --exclude .git /Users/vradu/Projects/rune-client-cpp-wt5/ root@$RUNE_VM_HOST:/root/gso/rune-client-cpp/
+rsync -a --delete --exclude 'build*' --exclude .git ~/Projects/rune-broker-wt29/ root@$RUNE_VM_HOST:/root/gso/rune-broker/
+rsync -a --delete --exclude 'build*' --exclude .git ~/Projects/rune-client-cpp-wt5/ root@$RUNE_VM_HOST:/root/gso/rune-client-cpp/
 EOF
 bash /tmp/gso-sync.sh
 ssh root@$RUNE_VM_HOST 'flock -w 7200 /root/vm.lock bash -c "cd /root/gso/rune-broker && export CC=gcc-13 CXX=g++-13 && cmake -S . -B build-rel -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=/root/rune-e5/rune-broker/build/Release/build/Release/generators/conan_toolchain.cmake -DBUILD_TESTING=ON -DBUILD_BROKER_NODE_TESTS=ON -DBUILD_GATEWAY_TESTS=ON -DBUILD_NODE_UDP_TESTS=ON -DBUILD_AERON_REPLICATION_TESTS=ON > /root/gso/cfg.log 2>&1 && nice -n 5 ninja -C build-rel -j4 rune_udp_gso_tests 2>&1 | tail -5"'

@@ -75,7 +75,7 @@ rune-codec (0a, EXTENDED — additive)
   src/Validator.cpp                   FixedStr bounds check (field within block)
   src/Generator.cpp                   FixedStr → std::array<char,N> member + string_view accessor + block read/write
 
-rune-ql (NEW standalone lib repo /Users/vradu/Projects/rune-ql; depends only on rune-codec)
+rune-ql (NEW standalone lib repo ~/Projects/rune-ql; depends only on rune-codec)
   include/rune/ql/Ast.h               TopicDef, FieldDef, ParseError
   include/rune/ql/Parser.h  src/Parser.cpp    tokenizer + recursive-descent parse(text) -> TopicDef | ParseError
   include/rune/ql/Backends.h src/Backends.cpp toDescriptor(TopicDef)->Descriptor; applyArgs(TopicDef)
