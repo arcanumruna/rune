@@ -542,11 +542,12 @@ if(BUILD_BENCHMARKS)
         benchmark/CatalogBootReplayBench.cpp
         benchmark/CatalogHotPathBench.cpp
         benchmark/AuthCheckBench.cpp
-        benchmark/PeerFrameBench.cpp)
+        benchmark/PeerFrameBench.cpp
+        benchmark/RebalanceFailoverBench.cpp)
     target_include_directories(rune_broker_benchmark PRIVATE ${RUNE_PROTOCOL_INCLUDE})
     # FusedRuntimePassBench drives a real broker with the shard tests' wire client.
     target_include_directories(rune_broker_benchmark PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/libs/node/tests/support)
-    target_link_libraries(rune_broker_benchmark PRIVATE rune_storage rune_consensus rune_replication rune_coordination rune_transaction rune_gateway rune_node rune_metadata_msm rune_view benchmark::benchmark)
+    target_link_libraries(rune_broker_benchmark PRIVATE rune_storage rune_consensus rune_replication rune_coordination rune_transaction rune_gateway rune_node rune_metadata_msm rune_dynamic_balancer rune_view benchmark::benchmark)
     target_include_directories(rune_broker_benchmark PRIVATE ${RUNE_NODE_INCLUDE})
     if(aeron_FOUND)
         target_link_libraries(rune_broker_benchmark PRIVATE aeron::aeron)
