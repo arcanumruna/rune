@@ -2858,7 +2858,10 @@ private:
         // R17: read ONCE, here, at the ready edge, from the live storage origin (never captured earlier: a
         // multi-node storage starts Undecided and founds at runtime).
         const bool mb = mayBootstrap_();
-        if (baseLeo == 0 && !mb) {
+        // CP2 8.3: "empty" = the log holds no record but ControllerTermRecords (a crash between the claim's term record
+        // and the bootstrap records leaves a log with offsets but no state), not merely baseLeo == 0.
+        const bool emptyLog = baseLeo == 0 || !appliedStateRecord_;
+        if (emptyLog && !mb) {
             spdlog::critical("MetadataService[{}]: claimed __cluster_metadata with an EMPTY log on a formed storage "
                              "(not a founder with an empty metadata log) - refusing to bootstrap a new metadata log; "
                              "halting the controller role", selfId_);
@@ -2869,12 +2872,12 @@ private:
         // D15: a brand-new metadata log (nothing written by any binary yet) is
         // bootstrapped at this binary's level (KRaft: metadata.version is set
         // when the log is formatted), before any assignment.
-        if (baseLeo == 0 && mb && msm_.featureLevel() < supportedFeatureLevel_)
+        if (emptyLog && mb && msm_.featureLevel() < supportedFeatureLevel_)
             pendingFeatureLevel_ = supportedFeatureLevel_;
         restoreLeaderlessMarks_();   // D15 item 1
         replayStorageRegistrations_();   // ISR v3 (A-I2): the soft storage state of the registrations already held
         storageReplayLevel_ = msm_.featureLevel();
-        if (baseLeo > 0 || mb) emitStaticAssignmentIfNeeded();
+        if (!emptyLog || mb) emitStaticAssignmentIfNeeded();
         reconcileRemovedTopics_(/*force=*/true);   // Task 8: removals recorded while not the ready controller
         drainDynamicQueue();
     }

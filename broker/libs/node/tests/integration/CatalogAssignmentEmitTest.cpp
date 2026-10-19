@@ -4513,6 +4513,35 @@ TEST(MetadataServiceRegression, EmptyClaimNeverBootstrapsOnAFormedStorageRegress
     for (const auto& r : recordsInLog(s.log)) EXPECT_NE(r.type, rune::metadata::kFeatureLevelRecordType);
 }
 
+// CP2 8.3: a crash between the claim's term record and the bootstrap records leaves a log with offsets but no state.
+// The next claim must treat it as EMPTY: a Founder bootstraps it (feature level), a formed storage still refuses.
+// RED: decide "empty" as baseLeo == 0 (the term-only log counts as formed: no level record, level stays 0).
+TEST(MetadataServiceRegression, TermRecordOnlyLogCountsAsEmptyRegression) {
+    for (const bool founder : {true, false}) {
+        SCOPED_TRACE(founder ? "founder" : "formed storage");
+        SoleController s;
+        bool flag = false;
+        s.svc->setMayBootstrap(+[](void* f) noexcept { return *static_cast<bool*>(f); }, &flag);
+        s.drive(100);   // the first claim appends its term record, then refuses (mayBootstrap false) and halts
+        ASSERT_FALSE(s.svc->controllerReady());
+        ASSERT_GT(s.replica->logEndOffset(), 0);
+        for (const auto& r : recordsInLog(s.log)) ASSERT_EQ(r.type, 0x8005);   // term records only
+        s.svc.reset();
+        s.replica.reset();
+        s.replica = std::make_unique<PartitionReplica>(makeMetaCfg(1, 1), Role::Leader, 2, s.nodes, s.nodes, &s.log, &s.transport);
+        s.transport.setLeader(s.replica.get());
+        s.svc = std::make_unique<MetadataService>(s.replica.get(), 1);
+        s.svc->configure({TopicSpec{0, 1, 1, "", "t"}}, s.nodes);
+        flag = founder;
+        s.svc->setMayBootstrap(+[](void* f) noexcept { return *static_cast<bool*>(f); }, &flag);
+        s.drive(100);
+        bool level = false;
+        for (const auto& r : recordsInLog(s.log)) level = level || r.type == rune::metadata::kFeatureLevelRecordType;
+        EXPECT_EQ(s.svc->controllerReady(), founder);
+        EXPECT_EQ(level, founder) << (founder ? "the term-only log was never bootstrapped" : "a formed storage bootstrapped");
+    }
+}
+
 // R17 + the term record: the controller's OWN claim record is the first record a Founder's empty metadata log ever
 // applies.  It must not count as "data on this storage" (the manifest's MetadataLog mark), or every Founder's first
 // claim would read mayBootstrap == false at the ready edge and halt (found by ShardModeRegression.WorkerSideAcks*).
