@@ -2607,6 +2607,7 @@ public:
         routingInputsEpoch_ += msm_.committedVersion() + 1;
         msm_ = rune::metadata::MetadataStateMachine{};
         lastApplied_ = -1;
+        appliedStateRecord_ = false;   // CP2: the rebuild re-derives it from the log it replays
 
         if (hw <= 0) return false;
 

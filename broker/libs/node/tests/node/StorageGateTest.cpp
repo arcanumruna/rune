@@ -75,7 +75,7 @@ TEST_P(StorageGateRegression, TransitionRowsRegression) {
     GateDir d(r.name);
     StorageIdentity::Loaded l{kId, r.origin, r.origin == Origin::Undecided ? r.mode : Mode::None, 0};
     StorageIdentity::write_(d.path.string(), l);
-    StorageGate gate(l, d.path.string(), kSelf, 3);
+    StorageGate gate(l, d.path.string(), kSelf, 3, 0, 0);
     const int64_t c = r.committed == C::Zero ? 0 : r.committed == C::Own ? kId : 0x2222;
     const auto msm = msmWith(c);
     EXPECT_EQ(gate.evaluate(msm, r.ev, 1'000'000'000), r.expect);
@@ -109,7 +109,7 @@ TEST(StorageGateRegression, LegacyIsConfirmedWithNothingCommittedRegression) {
     GateDir d("legacy");
     StorageIdentity::Loaded l{kId, Origin::Legacy, Mode::None, 0};
     StorageIdentity::write_(d.path.string(), l);
-    StorageGate gate(l, d.path.string(), kSelf, 3);
+    StorageGate gate(l, d.path.string(), kSelf, 3, 0, 0);
     EXPECT_TRUE(gate.open());
     EXPECT_EQ(gate.originWireCode(), 2);
     EXPECT_EQ(gate.evaluate(msmWith(0), ev(0, 3), 1), Change::none);
@@ -120,7 +120,7 @@ TEST(StorageGateRegression, OriginIsPersistedBeforeTheStateFlipsRegression) {
     GateDir d("persist");
     StorageIdentity::Loaded l{kId, Origin::Undecided, Mode::New, 0};
     StorageIdentity::write_(d.path.string(), l);
-    StorageGate gate(l, (d.path / "gone").string(), kSelf, 3);   // the dir does not exist: the write fails
+    StorageGate gate(l, (d.path / "gone").string(), kSelf, 3, 0, 0);   // the dir does not exist: the write fails
     EXPECT_EQ(gate.evaluate(msmWith(0), ev(1, 3), 1), Change::none);
     EXPECT_EQ(gate.stateCode(), 2);
     EXPECT_EQ(l.origin, Origin::Undecided);
@@ -133,7 +133,7 @@ TEST(StorageGateRegression, FoundingWaitsAFullDwellRegression) {
     const auto mk = [&](const char* tag, GateDir& d, StorageIdentity::Loaded& l) {
         l = StorageIdentity::Loaded{kId, Origin::Undecided, Mode::Auto, 0};
         StorageIdentity::write_(d.path.string(), l);
-        return std::make_unique<StorageGate>(l, d.path.string(), kSelf, 3, 300 * ms);
+        return std::make_unique<StorageGate>(l, d.path.string(), kSelf, 3, 100 * ms, 300 * ms);
         (void)tag;
     };
     const auto msm = msmWith(0);
@@ -156,6 +156,32 @@ TEST(StorageGateRegression, FoundingWaitsAFullDwellRegression) {
         EXPECT_EQ(g->evaluate(msm, ev(1, 3), 150 * ms), Change::none);
         EXPECT_EQ(g->evaluate(msm, ev(1, 3), 400 * ms), Change::none);   // only 250 ms since the reset
         EXPECT_EQ(g->evaluate(msm, ev(1, 3), 451 * ms), Change::founded);
+    }
+}
+
+// CP2 C1-R: a plain majority (not every member said fresh) founds only after the LONG dwell, which must cover the
+// transport's reconnect to a restarted peer; unanimous fresh evidence founds after the short one.
+// RED: one dwell for both.
+TEST(StorageGateRegression, MajorityFoundingWaitsTheLongDwellRegression) {
+    constexpr int64_t ms = 1'000'000;
+    const auto msm = msmWith(0);
+    {
+        GateDir d("long1");
+        StorageIdentity::Loaded l{kId, Origin::Undecided, Mode::Auto, 0};
+        StorageIdentity::write_(d.path.string(), l);
+        StorageGate g(l, d.path.string(), kSelf, 3, 100 * ms, 2'500 * ms);
+        EXPECT_EQ(g.evaluate(msm, ev(1, 3), 1 * ms), Change::none);
+        EXPECT_EQ(g.evaluate(msm, ev(1, 3), 400 * ms), Change::none) << "a majority founded after the short dwell";
+        EXPECT_EQ(g.evaluate(msm, ev(1, 3), 2'400 * ms), Change::none);
+        EXPECT_EQ(g.evaluate(msm, ev(1, 3), 2'502 * ms), Change::founded);
+    }
+    {
+        GateDir d("long2");
+        StorageIdentity::Loaded l{kId, Origin::Undecided, Mode::Auto, 0};
+        StorageIdentity::write_(d.path.string(), l);
+        StorageGate g(l, d.path.string(), kSelf, 3, 100 * ms, 2'500 * ms);
+        EXPECT_EQ(g.evaluate(msm, ev(2, 3), 1 * ms), Change::none);
+        EXPECT_EQ(g.evaluate(msm, ev(2, 3), 102 * ms), Change::founded) << "a unanimous fresh cluster waited the long dwell";
     }
 }
 

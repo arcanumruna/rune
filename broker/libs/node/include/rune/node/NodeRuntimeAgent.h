@@ -1164,6 +1164,8 @@ private:
             e.maxPeerTerm     = election_->maxPeerLeadershipTermId();
             e.peerWithHistory = election_->peerWithHistory();
             e.peersHeard      = election_->peersHeardCount();
+            e.heardFreshMask  = election_->peersHeardFreshMask();
+            e.memberMask      = election_->memberMask();
             e.controllerId    = election_->leaderMemberId();
             e.controllerTerm  = election_->leadershipTermId();
         }

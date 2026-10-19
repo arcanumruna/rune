@@ -43,6 +43,8 @@ struct Agent {
 // ---------------------------------------------------------------------------
 class ConsensusAgent final : public Agent, public ConsensusMessageHandler {
 public:
+    /// TEST SEAM (CP2 C1-R): see BasicConsensusAdapter::setTestDropFrom.
+    void setTestDropFrom(int32_t peer, int64_t durationNs) noexcept { adapter_.setTestDropFrom(peer, durationNs); }
     // ConsensusModuleAgent.java:403-476  (constructor parameters match the Java
     // constructor's relevant fields).
     //

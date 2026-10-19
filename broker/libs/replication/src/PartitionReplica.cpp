@@ -3253,6 +3253,8 @@ void PartitionReplica::onInternalIsrAck(const InternalIsrAckMsg& m)
 void PartitionReplica::onInternalIsr(const InternalIsrMsg& m)
 {
     if (!internalQuorum_() || m.isrCount < 0 || m.isrCount > InternalIsrMsg::kMaxIsr) return;
+    if (dropInternalIsrUntilNs_ != 0 && std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count() < dropInternalIsrUntilNs_) [[unlikely]] return;
     InternalIsrState st{};
     st.topicId = m.topicId; st.partition = m.partition; st.leaderEpoch = m.leaderEpoch;
     st.version = m.version; st.count = m.isrCount; st.members = m.isr;

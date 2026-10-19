@@ -905,6 +905,8 @@ void BrokerNode::buildMultiNodeConsensus() {
 
     // Inner ConsensusAgent (drives Election, drains IngressRing).
     agent_ = std::make_unique<ConsensusAgent>(*election_, *ingressRing_);
+    if (config_.testDropConsensusFromPeer >= 0)
+        agent_->setTestDropFrom(config_.testDropConsensusFromPeer, config_.testDropConsensusForMs * 1'000'000LL);
 
     // Composite NodeConsensusAgent (polls ingress THEN runs ConsensusAgent).
     nodeAgent_ = std::make_unique<NodeConsensusAgent>(
@@ -1157,6 +1159,10 @@ void BrokerNode::buildReplication() {
         replicaRegistry_->setHoldFetchesUntilForTest(
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() +
             config_.testHoldFollowerFetchesMs * 1'000'000LL);
+    if (config_.testDropConsensusFromPeer >= 0)   // TEST-ONLY (CP2 C1-R): the same dead link on the data plane
+        replicaRegistry_->setDropInternalIsrUntilForTest(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() +
+            config_.testDropConsensusForMs * 1'000'000LL);
     // E2 C1 residual N1: the node-control identity (the same nonce the node
     // registers with every controller) rides each transient lineage report.
     if (lifecycleNonce_ == 0) lifecycleNonce_ = processNonce();
@@ -2733,7 +2739,7 @@ void BrokerNode::buildGateway() {
     if (!config_.isSingleNode())
         storageGate_ = std::make_unique<StorageGate>(storage_, config_.dataDir, config_.nodeId,
                                                      static_cast<int>(config_.peers.size()),
-                                                     std::max<int64_t>(300, 3 * config_.electionStatusIntervalMs) * 1'000'000LL);   // C1 dwell
+                                                     foundingShortDwellNs(), foundingLongDwellNs());   // C1 dwells
     runtimeAgent_ = std::make_unique<NodeRuntimeAgent>(
         innerAgent,
         election_.get(),          // GR-2: election for leaderMemberId/leadershipTermId reads
@@ -3130,6 +3136,16 @@ bool BrokerNode::voteGateThunk_(void* self, int32_t c) noexcept {
         return true;
     }
     return rune::replication::InternalIsrKnowledge::voteGate(n->internalIsrKnowledge_.get(), c);
+}
+// CP2 C1-R: unanimous fresh evidence founds fast (nobody can hold history); a plain majority must outlast the
+// transport's reconnect to a restarted peer (resolver recheck + pending backoff + margin) and the election timeout.
+int64_t BrokerNode::foundingShortDwellNs() const noexcept {
+    return 3 * config_.electionStatusIntervalMs * 1'000'000LL;
+}
+int64_t BrokerNode::foundingLongDwellNs() const noexcept {
+    const int64_t status = config_.electionStatusIntervalMs * 1'000'000LL;
+    return std::max({3 * status, config_.electionTimeoutMs * 1'000'000LL + status,
+                     PeerResolverHub::kRecheckNs + PeerResolverHub::kPendingMaxNs + 500'000'000LL});
 }
 bool BrokerNode::abstainGateThunk_(void* self) noexcept {
     auto* n = static_cast<BrokerNode*>(self);

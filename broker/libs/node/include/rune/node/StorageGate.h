@@ -12,7 +12,7 @@
 //
 //   From        Condition                                         To          Change
 //   Undecided   history (anyHistory || maxPeerTerm > 0)           Unconfirmed joined      (persist `joiner`, R-W3)
-//   Undecided   !history && fresh quorum held for foundingDwellNs  Confirmed   founded     (persist `founder`)
+//   Undecided   !history && fresh quorum held for the dwell    Confirmed   founded     (persist `founder`)
 //               (heardFresh + 1 >= members/2 + 1; the timer resets when the quorum is lost)
 //   Unconfirmed c == id, or (c == 0 && origin Founder/Legacy)     Confirmed   confirmed
 //   Confirmed   c != 0 && c != id                                 Unconfirmed unconfirmed
@@ -47,6 +47,8 @@ struct Evidence {
     int32_t controllerId    = -1;
     int64_t controllerTerm  = 0;
     uint64_t heldLeaderRoles = 0;
+    uint32_t memberMask = 0;       ///< the configured member ids below 32
+    uint32_t heardFreshMask = 0;   ///< members whose canvass said fresh (founding diagnostics: the unheard ones are logged)
 };
 
 class StorageGate {
@@ -57,9 +59,13 @@ public:
 
     /// `storage` is BrokerNode's one Loaded object: persistOrigin()/markPresent() update the instance the gate and
     /// the mayBootstrap thunk read.
+    /// `shortDwellNs`: founding when EVERY member said "no history" (nobody can hold history).  `longDwellNs`: founding on a
+    /// plain majority - it must outlast the transport's own reconnect time to a restarted peer (CP2 C1-R).  No default:
+    /// every construction names both.
     StorageGate(StorageIdentity::Loaded& storage, const std::string& dataDir, int32_t selfId, int members,
-                int64_t foundingDwellNs = 0)
-        : storage_(storage), dataDir_(dataDir), self_(selfId), members_(members), foundingDwellNs_(foundingDwellNs) {
+                int64_t shortDwellNs, int64_t longDwellNs)
+        : storage_(storage), dataDir_(dataDir), self_(selfId), members_(members), shortDwellNs_(shortDwellNs),
+          longDwellNs_(longDwellNs) {
         switch (storage.origin) {
             case Origin::Undecided: state_ = Undecided{storage.id, storage.mode, 0, kNoQuorumYet}; break;
             case Origin::Joiner:    state_ = Unconfirmed{storage.id, Origin::Joiner, 0}; break;
@@ -89,8 +95,16 @@ public:
                 // C1: a fresh quorum must PERSIST for a full dwell, so every live member that holds history has
                 // messaged us (each sends at least once per status/heartbeat interval) before we may found.
                 if (u->freshQuorumSinceNs == kNoQuorumYet) u->freshQuorumSinceNs = nowNs;
-                if (nowNs - u->freshQuorumSinceNs < foundingDwellNs_) return Change::none;
+                const bool unanimous = ev.heardFresh + 1 >= members_for_(ev);
+                if (nowNs - u->freshQuorumSinceNs < (unanimous ? shortDwellNs_ : longDwellNs_)) return Change::none;
                 if (!StorageIdentity::persistOrigin(dataDir_, storage_, Origin::Founder)) return Change::none;
+                if (!unanimous) {
+                    std::string unheard;
+                    for (int m = 0; m < 32; ++m)
+                        if (m != self_ && (ev.memberMask & (1u << m)) != 0 && (ev.heardFreshMask & (1u << m)) == 0) unheard += (unheard.empty() ? "" : ",") + std::to_string(m);
+                    spdlog::warn("storage of node {} founded without hearing members {{{}}}: if one of them holds this "
+                                 "cluster's history, stop this node now", self_, unheard);
+                }
                 spdlog::info("storage CONFIRMED (id={}): founded a new cluster (heard {} of {} members fresh)",
                              StorageIdentity::idHex(storage_.id), ev.heardFresh, members_for_(ev));
                 state_ = Confirmed{storage_.id, Origin::Founder};
@@ -125,6 +139,7 @@ public:
         return Change::none;
     }
 
+    [[nodiscard]] int64_t longDwellNs() const noexcept { return longDwellNs_; }
     [[nodiscard]] bool open()    const noexcept { return std::holds_alternative<Confirmed>(state_); }
     [[nodiscard]] bool mayVote() const noexcept { return open(); }
     [[nodiscard]] bool mayStand() const noexcept { return open(); }
@@ -179,7 +194,8 @@ private:
     std::string                                       dataDir_;
     int32_t                                           self_;
     int                                               members_;
-    int64_t                                           foundingDwellNs_;
+    int64_t                                           shortDwellNs_;
+    int64_t                                           longDwellNs_;
     std::variant<Undecided, Unconfirmed, Confirmed>   state_{Confirmed{0, Origin::Founder}};
 };
 

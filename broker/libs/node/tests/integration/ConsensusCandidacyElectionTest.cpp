@@ -681,26 +681,40 @@ TEST(StorageFormatRegression, NewFormattedIntoARunningClusterJoinsRegression) {
 }
 
 // C1 (CP2 review): history is transitive in the canvass flags - a Joiner that never led still advertises history, so an
-// Undecided peer cannot count it as "fresh".  RED: the old flag formula (boot history / own terms only) gives 2.
+// Undecided peer cannot count it as "fresh".  Both other nodes are stopped: L has no quorum, only canvasses (no NLT), so
+// the wiped X learns of history from L's canvass flag alone and holds no term of its own.
+// RED: the old flag formula (boot history / own terms only) gives 2.
 TEST(StorageGateWiringRegression, AJoinerAdvertisesHistoryRegression) {
     Cluster c(3);
     for (int i = 0; i < 3; ++i) c.start(i);
     const int32_t L = settledLeader(c, {0, 1, 2}, 20s);
     ASSERT_GE(L, 0);
-    const int X = (L + 1) % 3;
+    const int X = (L + 1) % 3, Y = (L + 2) % 3;
     c.stop(X);
+    c.stop(Y);
     c.wipe(X);
     c.startWith(X, [](NodeConfig& k) { k.testHoldFollowerFetchesMs = 60'000; });
     EXPECT_TRUE(until([&] {
         return c.node(X).onControlThreadForTest([&] { return c.node(X).canvassFlagsForTest(); }) == 3;
-    }, 5s)) << "a joiner advertised fresh flags";
+    }, 5s)) << "a joiner advertised fresh flags (" << c.node(X).onControlThreadForTest([&] { return c.node(X).canvassFlagsForTest(); }) << ")";
 }
 
-// C1 (CP2 review): two replaced disks restart (auto) next to one live node that holds the history.  Whichever canvass the
-// second node hears first, it must never found over the live history node: no wiped node leads and the live node's
-// metadata log is never truncated.  Run with --gtest_repeat=20.
-// RED: no founding dwell and the old flag formula - the second node founds on the first joiner's "fresh" canvass.
-TEST(ConsensusCandidacyElectionRegression, TwoReplacedDisksNeverFoundOverALiveHistoryMemberRegression) {
+// C1-R: the founding dwell must cover the transport's reconnect to a restarted peer (resolver recheck 1 s + pending
+// backoff 1 s).  RED: the old max(300 ms, 3 x status) dwell.
+TEST(StorageGateWiringRegression, FoundingDwellCoversPeerReResolutionRegression) {
+    Cluster c(3);
+    for (int i = 0; i < 3; ++i) c.start(i);
+    ASSERT_GE(settledLeader(c, {0, 1, 2}, 20s), 0);
+    const int64_t dwell = c.node(0).onControlThreadForTest([&] { return c.node(0).foundingLongDwellNsForTest(); });
+    EXPECT_GE(dwell, rune::node::PeerResolverHub::kRecheckNs + rune::node::PeerResolverHub::kPendingMaxNs);
+}
+
+// C1 / C1-R (CP2): two replaced disks restart (auto) next to one live node L that holds the history, while L's frames do
+// not reach them for 1.5 s (an address change: the transport reconnects late).  Neither wiped node may found over L: no
+// wiped node leads and L's committed metadata is never truncated.  `dropOnlyToX2`: only X2 loses L's frames - X2 must
+// then join through X1's history flag.  Run with --gtest_repeat=20.
+// RED: the 300 ms dwell (both found at once) / without the transitive flag (X2 founds on X1's fresh canvass).
+void twoReplacedDisksScenario(bool dropOnlyToX2) {
     Cluster c(3);
     for (int i = 0; i < 3; ++i) c.start(i);
     const int32_t L = settledLeader(c, {0, 1, 2}, 20s);
@@ -712,11 +726,17 @@ TEST(ConsensusCandidacyElectionRegression, TwoReplacedDisksNeverFoundOverALiveHi
     c.stop(X2);
     c.wipeRaw(X1);
     c.wipeRaw(X2);
-    const auto autoFmt = [](NodeConfig& k) { k.storageFormat = StorageFormat::Auto; };
-    c.startWith(X1, autoFmt);   // both restart together: each first hears the other's "fresh" canvass
-    c.startWith(X2, autoFmt);
-    ASSERT_TRUE(until([&] { return c.originOnDisk(X1) == "joiner"; }, 15s)) << "X1 decided " << c.originOnDisk(X1);
-    ASSERT_TRUE(until([&] { return c.originOnDisk(X2) == "joiner"; }, 15s))
+    const auto fmt = [&](bool drop) {
+        return [drop, L](NodeConfig& k) {
+            k.storageFormat = StorageFormat::Auto;
+            k.testHoldFollowerFetchesMs = 60'000;   // the data plane would hand them L's history too: model the dead link
+            if (drop) { k.testDropConsensusFromPeer = L; k.testDropConsensusForMs = 1500; }
+        };
+    };
+    c.startWith(X1, fmt(!dropOnlyToX2));   // both restart together: each first hears the other's "fresh" canvass
+    c.startWith(X2, fmt(true));
+    ASSERT_TRUE(until([&] { return c.originOnDisk(X1) == "joiner"; }, 20s)) << "X1 decided " << c.originOnDisk(X1);
+    ASSERT_TRUE(until([&] { return c.originOnDisk(X2) == "joiner"; }, 20s))
         << "X2 decided " << c.originOnDisk(X2) << ": it founded over a live history node";
     const auto end = std::chrono::steady_clock::now() + 5s;
     while (std::chrono::steady_clock::now() < end) {
@@ -725,6 +745,12 @@ TEST(ConsensusCandidacyElectionRegression, TwoReplacedDisksNeverFoundOverALiveHi
         EXPECT_GE(c.meta(L).leo, hw) << "the live node's committed metadata was truncated";
         std::this_thread::sleep_for(20ms);
     }
+}
+TEST(ConsensusCandidacyElectionRegression, TwoReplacedDisksNeverFoundOverALiveHistoryMemberRegression) {
+    twoReplacedDisksScenario(false);
+}
+TEST(ConsensusCandidacyElectionRegression, ReplacedDiskNeverFoundsOnAJoinersFreshCanvassRegression) {
+    twoReplacedDisksScenario(true);
 }
 
 // CP2 review M6: the abstention is switched OFF by the unsafe recovery vote (and only by it) on an unconfirmed storage.

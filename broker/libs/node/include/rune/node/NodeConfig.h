@@ -293,6 +293,10 @@ struct NodeConfig {
     // TEST-ONLY (ISR v3 Step 9, B-I8): every replica of this node emits no follower fetch for this long after
     // start (PartitionReplica::holdFetchesUntilForTest) - a wiped member that cannot catch up yet.  0 = off.
     int64_t testHoldFollowerFetchesMs = 0;
+    // TEST-ONLY (ISR v3 CP2 C1-R): drop every consensus frame sent by this peer for this long after the first frame seen
+    // (an address change / transport reconnect window).  -1 = off.
+    int32_t testDropConsensusFromPeer = -1;
+    int64_t testDropConsensusForMs    = 0;
 
     // Follower periodic-fetch backstop cadence (RUNE_FETCH_INTERVAL_US, default
     // 5000µs = 5ms).  GR-10 push + fast-ack is meant to drive replication; this

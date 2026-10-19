@@ -274,6 +274,8 @@ public:
     [[nodiscard]] int peersHeardFreshCount() const noexcept { return __builtin_popcount(heardFreshMask_); }
     /// Peers heard from at all (any message), and the cluster member count (both for the UNCONFIRMED log line and
     /// StorageGate's founding majority).
+    [[nodiscard]] uint32_t memberMask() const noexcept { uint32_t m = 0; for (const auto& c : clusterMembers_) if (c.id >= 0 && c.id < 32) m |= 1u << c.id; return m; }
+    [[nodiscard]] uint32_t peersHeardFreshMask() const noexcept { return heardFreshMask_; }
     [[nodiscard]] int peersHeardCount() const noexcept { return __builtin_popcount(heardMask_); }
     [[nodiscard]] std::size_t clusterSize() const noexcept { return clusterMembers_.size(); }
     [[nodiscard]] bool anyPeerHistory() const noexcept { return anyHistory_; }

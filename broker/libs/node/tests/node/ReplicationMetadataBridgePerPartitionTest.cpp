@@ -746,7 +746,7 @@ TEST_F(StorageGateBridgeRegression, HeldLeaderRoleRequestsAFailoverRegression) {
     commitUser(msm, 0, kSelf, 3, 4);
     auto bridge = makeBridge(&msm);
     rune::node::StorageIdentity::Loaded L{0xB, rune::node::StorageIdentity::Origin::Joiner, rune::node::StorageIdentity::Mode::None, 0};
-    rune::node::StorageGate gate(L, metaDir_.path, kSelf, 3);
+    rune::node::StorageGate gate(L, metaDir_.path, kSelf, 3, 0, 0);
     ASSERT_EQ(gate.evaluate(msm, Evidence{}, 0), StorageGate::Change::none);
     ASSERT_FALSE(gate.open());
     bridge->setStorageGate(&gate);
@@ -776,7 +776,7 @@ TEST_F(StorageGateBridgeRegression, ConsecutiveHeldReGrantsBackOffRegression) {
     MetadataStateMachine msm;
     auto bridge = makeBridge(&msm);
     rune::node::StorageIdentity::Loaded L{0xB, rune::node::StorageIdentity::Origin::Joiner, rune::node::StorageIdentity::Mode::None, 0};
-    rune::node::StorageGate gate(L, metaDir_.path, kSelf, 3);
+    rune::node::StorageGate gate(L, metaDir_.path, kSelf, 3, 0, 0);
     ASSERT_EQ(gate.evaluate(msm, Evidence{}, 0), StorageGate::Change::none);
     bridge->setStorageGate(&gate);
     int64_t pos = 0, now = 0;
@@ -810,7 +810,7 @@ TEST_F(StorageGateBridgeRegression, CatalogRoleIsHeldAsFollowerOfNobodyRegressio
     bridge->setCoordinatorPartitionsOnController(true);
     bridge->setCatalogRoleRing(&ring);
     rune::node::StorageIdentity::Loaded L{0xB, rune::node::StorageIdentity::Origin::Joiner, rune::node::StorageIdentity::Mode::None, 0};
-    rune::node::StorageGate gate(L, metaDir_.path, kSelf, 3);
+    rune::node::StorageGate gate(L, metaDir_.path, kSelf, 3, 0, 0);
     (void)gate.evaluate(msm, Evidence{}, 0);
     bridge->setStorageGate(&gate);
     (void)bridge->doWork(kNode2, 1);
@@ -830,7 +830,7 @@ TEST_F(StorageGateBridgeRegression, MismatchDemotesALeaderRegression) {
     commitUser(msm, 0, kSelf, 3, 4);
     auto bridge = makeBridge(&msm);
     rune::node::StorageIdentity::Loaded L{0xB, rune::node::StorageIdentity::Origin::Founder, rune::node::StorageIdentity::Mode::None, 0};
-    rune::node::StorageGate gate(L, metaDir_.path, kSelf, 3);
+    rune::node::StorageGate gate(L, metaDir_.path, kSelf, 3, 0, 0);
     ASSERT_EQ(gate.evaluate(msm, Evidence{}, 0), StorageGate::Change::none);
     ASSERT_TRUE(gate.open());
     bridge->setStorageGate(&gate);

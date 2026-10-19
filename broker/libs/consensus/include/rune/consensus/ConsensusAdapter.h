@@ -43,6 +43,10 @@ public:
         : handler_{handler}
     {}
 
+    /// TEST SEAM (CP2 C1-R): drop every frame whose sender is `peer` for `durationNs` from the first frame seen.
+    /// Control-thread consensus ingress only; one compare per frame.  peer < 0 = off.
+    void setTestDropFrom(int32_t peer, int64_t durationNs) noexcept { dropPeer_ = peer; dropForNs_ = durationNs; }
+
     /// Decode one SBE frame and dispatch to the handler.
     /// buf[0..len) is a complete SBE frame starting with an 8-byte header.
     /// Frames shorter than the required message size are rejected (no OOB read);
@@ -63,6 +67,10 @@ public:
         }
     
         const uint16_t tid = peekTemplateId(buf, 0);
+        if (dropPeer_ >= 0) [[unlikely]] {
+            if (dropStartNs_ == 0) dropStartNs_ = nowNs == 0 ? 1 : nowNs;
+            if (nowNs - dropStartNs_ < dropForNs_ && senderOf_(tid, buf, len) == dropPeer_) { ++droppedFrames_; return; }
+        }
     
         switch (tid) {
         case CanvassPositionMsg::TEMPLATE_ID: {
@@ -204,6 +212,27 @@ public:
     [[nodiscard]] int64_t ignoredFrameCount() const noexcept { return ignoredFrameCount_; }
 
 private:
+    /// The sender id of a frame (-1 = unknown / short).  Test seam only.
+    static int32_t senderOf_(uint16_t tid, const uint8_t* buf, std::size_t len) noexcept {
+        switch (tid) {
+        case CanvassPositionMsg::TEMPLATE_ID:   return len >= CanvassPositionMsg::TOTAL_SIZE ? CanvassPositionMsg::decode(buf, 0).followerMemberId : -1;
+        case PreVoteRequestMsg::TEMPLATE_ID:    return len >= PreVoteRequestMsg::TOTAL_SIZE ? PreVoteRequestMsg::decode(buf, 0).candidateId : -1;
+        case PreVoteResponseMsg::TEMPLATE_ID:   return len >= PreVoteResponseMsg::TOTAL_SIZE ? PreVoteResponseMsg::decode(buf, 0).voterId : -1;
+        case TermFloorNoticeMsg::TEMPLATE_ID:   return len >= TermFloorNoticeMsg::TOTAL_SIZE ? TermFloorNoticeMsg::decode(buf, 0).fromMember : -1;
+        case CandidacyStateMsg::TEMPLATE_ID:    return len >= CandidacyStateMsg::TOTAL_SIZE ? CandidacyStateMsg::decode(buf, 0).fromMember : -1;
+        case RequestVoteMsg::TEMPLATE_ID:       return len >= RequestVoteMsg::TOTAL_SIZE ? RequestVoteMsg::decode(buf, 0).candidateMemberId : -1;
+        case VoteMsg::TEMPLATE_ID:              return len >= VoteMsg::TOTAL_SIZE ? VoteMsg::decode(buf, 0).followerMemberId : -1;
+        case NewLeadershipTermMsg::TEMPLATE_ID: return len >= NewLeadershipTermMsg::TOTAL_SIZE ? NewLeadershipTermMsg::decode(buf, 0).leaderMemberId : -1;
+        case AppendPositionMsg::TEMPLATE_ID:    return len >= AppendPositionMsg::TOTAL_SIZE ? AppendPositionMsg::decode(buf, 0).followerMemberId : -1;
+        case StandDownMsg::TEMPLATE_ID:         return len >= StandDownMsg::TOTAL_SIZE ? StandDownMsg::decode(buf, 0).leaderMemberId : -1;
+        case CommitPositionMsg::TEMPLATE_ID:    return len >= CommitPositionMsg::TOTAL_SIZE ? CommitPositionMsg::decode(buf, 0).leaderMemberId : -1;
+        default: return -1;
+        }
+    }
+    int32_t  dropPeer_{-1};
+    int64_t  dropForNs_{0};
+    int64_t  dropStartNs_{0};
+    int64_t  droppedFrames_{0};
     Handler& handler_;
     int64_t  ignoredFrameCount_{0};
 };

@@ -1500,6 +1500,7 @@ public:
     // ISR v3 Step 9 test seams (the first two: call inside onControlThreadForTest).
     /// The flags the next CanvassPosition carries (R12): 2 = valid, | 1 = this process has history; -1 = no publisher.
     /// Test-only, CONTROL thread: does this node abstain from other candidates' ballots right now?
+    [[nodiscard]] int64_t foundingLongDwellNsForTest() const noexcept { return storageGate_ ? storageGate_->longDwellNs() : -1; }
     [[nodiscard]] bool abstainsForTest() noexcept { return abstainGateThunk_(this); }
     [[nodiscard]] int32_t canvassFlagsForTest() const noexcept { return publisher_ ? publisher_->canvassFlags() : -1; }
     /// StorageGate::stateCode(): 0 CONFIRMED, 1 UNCONFIRMED, 2 UNDECIDED (0 on a single node).
@@ -1924,6 +1925,8 @@ private:
     /// RUNE_STORAGE_RECOVERY_VOTE an unconfirmed node votes for what its knowledge ever learned (critical log).
     static bool voteGateThunk_(void* self, int32_t candidate) noexcept;
     static bool abstainGateThunk_(void* self) noexcept;
+    [[nodiscard]] int64_t foundingShortDwellNs() const noexcept;
+    [[nodiscard]] int64_t foundingLongDwellNs() const noexcept;
     void logRecoveryVote_(int32_t candidate) noexcept;
     int publishStorageMetrics_() noexcept;
     std::unique_ptr<StorageGate> storageGate_;   ///< multi-node only (null = open everywhere); control thread
