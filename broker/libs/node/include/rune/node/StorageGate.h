@@ -12,7 +12,8 @@
 //
 //   From        Condition                                         To          Change
 //   Undecided   history (anyHistory || maxPeerTerm > 0)           Unconfirmed joined      (persist `joiner`, R-W3)
-//   Undecided   !history && heardFresh + 1 >= members/2 + 1       Confirmed   founded     (persist `founder`)
+//   Undecided   !history && fresh quorum held for foundingDwellNs  Confirmed   founded     (persist `founder`)
+//               (heardFresh + 1 >= members/2 + 1; the timer resets when the quorum is lost)
 //   Unconfirmed c == id, or (c == 0 && origin Founder/Legacy)     Confirmed   confirmed
 //   Confirmed   c != 0 && c != id                                 Unconfirmed unconfirmed
 //   where c = msm.nodeStorage(self).
@@ -56,10 +57,11 @@ public:
 
     /// `storage` is BrokerNode's one Loaded object: persistOrigin()/markPresent() update the instance the gate and
     /// the mayBootstrap thunk read.
-    StorageGate(StorageIdentity::Loaded& storage, const std::string& dataDir, int32_t selfId, int members)
-        : storage_(storage), dataDir_(dataDir), self_(selfId), members_(members) {
+    StorageGate(StorageIdentity::Loaded& storage, const std::string& dataDir, int32_t selfId, int members,
+                int64_t foundingDwellNs = 0)
+        : storage_(storage), dataDir_(dataDir), self_(selfId), members_(members), foundingDwellNs_(foundingDwellNs) {
         switch (storage.origin) {
-            case Origin::Undecided: state_ = Undecided{storage.id, storage.mode, 0}; break;
+            case Origin::Undecided: state_ = Undecided{storage.id, storage.mode, 0, kNoQuorumYet}; break;
             case Origin::Joiner:    state_ = Unconfirmed{storage.id, Origin::Joiner, 0}; break;
             case Origin::Founder:
             case Origin::Legacy:    state_ = Confirmed{storage.id, storage.origin}; break;
@@ -84,12 +86,17 @@ public:
                 return Change::joined;
             }
             if (ev.heardFresh + 1 >= members_majority_(ev)) {
+                // C1: a fresh quorum must PERSIST for a full dwell, so every live member that holds history has
+                // messaged us (each sends at least once per status/heartbeat interval) before we may found.
+                if (u->freshQuorumSinceNs == kNoQuorumYet) u->freshQuorumSinceNs = nowNs;
+                if (nowNs - u->freshQuorumSinceNs < foundingDwellNs_) return Change::none;
                 if (!StorageIdentity::persistOrigin(dataDir_, storage_, Origin::Founder)) return Change::none;
                 spdlog::info("storage CONFIRMED (id={}): founded a new cluster (heard {} of {} members fresh)",
                              StorageIdentity::idHex(storage_.id), ev.heardFresh, members_for_(ev));
                 state_ = Confirmed{storage_.id, Origin::Founder};
                 return Change::founded;
             }
+            else u->freshQuorumSinceNs = kNoQuorumYet;
             if (nowNs - u->lastLogNs >= kLogEveryNs || u->lastLogNs == 0) {
                 u->lastLogNs = nowNs == 0 ? 1 : nowNs;
                 spdlog::warn("storage UNDECIDED (id={}, mode={}): heard {} of {} members at term 0; founding needs {}. "
@@ -140,7 +147,8 @@ public:
     }
 
 private:
-    struct Undecided   { int64_t id; Mode mode; int64_t lastLogNs; };
+    struct Undecided   { int64_t id; Mode mode; int64_t lastLogNs; int64_t freshQuorumSinceNs; };
+    static constexpr int64_t kNoQuorumYet = INT64_MIN;
     struct Unconfirmed { int64_t id; Origin origin; int64_t lastLogNs; };
     struct Confirmed   { int64_t id; Origin origin; };
     static constexpr int64_t kLogEveryNs = 30'000'000'000LL;
@@ -171,6 +179,7 @@ private:
     std::string                                       dataDir_;
     int32_t                                           self_;
     int                                               members_;
+    int64_t                                           foundingDwellNs_;
     std::variant<Undecided, Unconfirmed, Confirmed>   state_{Confirmed{0, Origin::Founder}};
 };
 

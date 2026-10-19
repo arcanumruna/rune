@@ -3791,4 +3791,27 @@ TEST(ElectionStorageRegression, AnUntrustedStorageAbstainsInsteadOfVetoingRegres
     abstain = false;
     e.onRequestVote(0, 0, /*candidateTermId=*/6, /*candidateId=*/1, nowNs);
     EXPECT_EQ(pub.placeVoteCalls.size(), 1u) << "a trusted node must answer";
+
+    // The same silence for a PreVote (CP2 review M6): no grant, no denial, no state change, counted as an abstention.
+    abstain = true;
+    const uint64_t granted = e.preVotesGrantedForTest(), denied = e.preVotesDeniedForTest(), before = e.abstentionsForTest();
+    e.onPreVoteRequest(nowNs, /*term=*/50, e.logLeadershipTermId(), e.appendPosition(), /*candidate=*/1);
+    EXPECT_EQ(e.preVotesGrantedForTest(), granted) << "an abstaining node granted a pre-vote";
+    EXPECT_EQ(e.preVotesDeniedForTest(), denied) << "an abstaining node denied a pre-vote";
+    EXPECT_EQ(e.abstentionsForTest(), before + 1);
+}
+
+// R12 / M11: only configured members are founding evidence.  RED: count a canvass from an id that is no member.
+TEST(ElectionStorageRegression, ANonMemberCanvassIsNeverFoundingEvidenceRegression) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    StandDownRecorder pub;
+    auto e = makeSdElection(0, pub, nsf, tl, /*seed=*/0);
+    e.doWork(1'000'000LL);
+    e.onCanvassPosition(0, 0, 0, /*from=*/9, /*flags=*/2);
+    EXPECT_EQ(e.peersHeardFreshCount(), 0);
+    EXPECT_EQ(e.peersHeardCount(), 0);
+    e.onCanvassPosition(0, 0, 0, /*from=*/9, /*flags=*/3);
+    EXPECT_FALSE(e.anyPeerHistory());
 }

@@ -1190,10 +1190,7 @@ void BrokerNode::buildReplication() {
         else {
             election_->setVoteGate(&BrokerNode::voteGateThunk_, this);   // ISR v3 Step 9: storage gate first
             // ISR v3 ruling: an unconfirmed storage ABSTAINS (silence) instead of denying - see Election::setAbstainGate.
-            election_->setAbstainGate([](void* self) noexcept {
-                auto* n = static_cast<BrokerNode*>(self);
-                return n->storageGate_ && !n->storageGate_->mayVote() && !n->config_.storageRecoveryVote;
-            }, this);
+            election_->setAbstainGate(&BrokerNode::abstainGateThunk_, this);
             // Round-3 CRITICAL-R3: every vote (the candidate's own included) is
             // gated, so the election participants exchange their newest durable
             // __cluster_metadata ISR state while canvassing / voting — a node
@@ -2735,7 +2732,8 @@ void BrokerNode::buildGateway() {
     // before the runtime thread starts.  Multi-node only: a single node has no gate (open everywhere).
     if (!config_.isSingleNode())
         storageGate_ = std::make_unique<StorageGate>(storage_, config_.dataDir, config_.nodeId,
-                                                     static_cast<int>(config_.peers.size()));
+                                                     static_cast<int>(config_.peers.size()),
+                                                     std::max<int64_t>(300, 3 * config_.electionStatusIntervalMs) * 1'000'000LL);   // C1 dwell
     runtimeAgent_ = std::make_unique<NodeRuntimeAgent>(
         innerAgent,
         election_.get(),          // GR-2: election for leaderMemberId/leadershipTermId reads
@@ -3131,6 +3129,10 @@ bool BrokerNode::voteGateThunk_(void* self, int32_t c) noexcept {
         return true;
     }
     return rune::replication::InternalIsrKnowledge::voteGate(n->internalIsrKnowledge_.get(), c);
+}
+bool BrokerNode::abstainGateThunk_(void* self) noexcept {
+    auto* n = static_cast<BrokerNode*>(self);
+    return n->storageGate_ && !n->storageGate_->mayVote() && !n->config_.storageRecoveryVote;
 }
 void BrokerNode::logRecoveryVote_(int32_t c) noexcept {
     const int64_t term = election_ ? static_cast<int64_t>(election_->candidateTermId()) : -1;

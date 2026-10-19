@@ -1499,6 +1499,8 @@ public:
     [[nodiscard]] const rune::consensus::Election* electionForTest() const noexcept { return election_.get(); }
     // ISR v3 Step 9 test seams (the first two: call inside onControlThreadForTest).
     /// The flags the next CanvassPosition carries (R12): 2 = valid, | 1 = this process has history; -1 = no publisher.
+    /// Test-only, CONTROL thread: does this node abstain from other candidates' ballots right now?
+    [[nodiscard]] bool abstainsForTest() noexcept { return abstainGateThunk_(this); }
     [[nodiscard]] int32_t canvassFlagsForTest() const noexcept { return publisher_ ? publisher_->canvassFlags() : -1; }
     /// StorageGate::stateCode(): 0 CONFIRMED, 1 UNCONFIRMED, 2 UNDECIDED (0 on a single node).
     [[nodiscard]] int storageGateStateForTest() const noexcept { return storageGate_ ? storageGate_->stateCode() : 0; }
@@ -1921,6 +1923,7 @@ private:
     /// ISR v3 Step 9 (§3.6): the consensus vote gate - the storage gate first, then the metadata-ISR knowledge; with
     /// RUNE_STORAGE_RECOVERY_VOTE an unconfirmed node votes for what its knowledge ever learned (critical log).
     static bool voteGateThunk_(void* self, int32_t candidate) noexcept;
+    static bool abstainGateThunk_(void* self) noexcept;
     void logRecoveryVote_(int32_t candidate) noexcept;
     int publishStorageMetrics_() noexcept;
     std::unique_ptr<StorageGate> storageGate_;   ///< multi-node only (null = open everywhere); control thread

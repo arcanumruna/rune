@@ -1135,7 +1135,9 @@ private:
         int work = 0;
         if (canvassPublisher_ != nullptr && election_ != nullptr)
             canvassPublisher_->setCanvassFlags(
-                2 | ((bootHistory_ || election_->leadershipTermId() > 0 || election_->candidateTermId() > 0) ? 1 : 0));
+                2 | ((bootHistory_ || election_->leadershipTermId() > 0 || election_->candidateTermId() > 0 ||
+                  election_->anyPeerHistory() || election_->maxPeerLeadershipTermId() > 0 ||
+                  (storageGate_ != nullptr && storageGate_->stateCode() == 1)) ? 1 : 0));   // C1: history is transitive
         if (storageGate_ == nullptr || metadataService_ == nullptr) return work;
         const auto ch = storageGate_->evaluate(metadataService_->msm(), evidence_(), nowNs);
         if (election_) election_->setStorageHold(!storageGate_->mayStand() || testCandidacyHold_, nowNs);

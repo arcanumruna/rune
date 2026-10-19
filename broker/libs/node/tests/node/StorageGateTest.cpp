@@ -126,4 +126,37 @@ TEST(StorageGateRegression, OriginIsPersistedBeforeTheStateFlipsRegression) {
     EXPECT_EQ(l.origin, Origin::Undecided);
 }
 
+// C1 (CP2 review): a fresh quorum must persist for the founding dwell before the gate founds; history seen inside the
+// dwell wins; losing the quorum resets the timer.  RED: found at once (no dwell).
+TEST(StorageGateRegression, FoundingWaitsAFullDwellRegression) {
+    constexpr int64_t ms = 1'000'000;
+    const auto mk = [&](const char* tag, GateDir& d, StorageIdentity::Loaded& l) {
+        l = StorageIdentity::Loaded{kId, Origin::Undecided, Mode::Auto, 0};
+        StorageIdentity::write_(d.path.string(), l);
+        return std::make_unique<StorageGate>(l, d.path.string(), kSelf, 3, 300 * ms);
+        (void)tag;
+    };
+    const auto msm = msmWith(0);
+    {
+        GateDir d("dwell1"); StorageIdentity::Loaded l; auto g = mk("a", d, l);
+        EXPECT_EQ(g->evaluate(msm, ev(1, 3), 1 * ms), Change::none);
+        EXPECT_EQ(g->evaluate(msm, ev(1, 3), 200 * ms), Change::none);
+        EXPECT_EQ(g->stateCode(), 2);
+        EXPECT_EQ(g->evaluate(msm, ev(1, 3), 302 * ms), Change::founded);
+    }
+    {
+        GateDir d("dwell2"); StorageIdentity::Loaded l; auto g = mk("b", d, l);
+        EXPECT_EQ(g->evaluate(msm, ev(1, 3), 1 * ms), Change::none);
+        EXPECT_EQ(g->evaluate(msm, ev(1, 3, true), 100 * ms), Change::joined);
+    }
+    {
+        GateDir d("dwell3"); StorageIdentity::Loaded l; auto g = mk("c", d, l);
+        EXPECT_EQ(g->evaluate(msm, ev(1, 3), 1 * ms), Change::none);
+        EXPECT_EQ(g->evaluate(msm, ev(0, 3), 100 * ms), Change::none);   // quorum lost: the timer resets
+        EXPECT_EQ(g->evaluate(msm, ev(1, 3), 150 * ms), Change::none);
+        EXPECT_EQ(g->evaluate(msm, ev(1, 3), 400 * ms), Change::none);   // only 250 ms since the reset
+        EXPECT_EQ(g->evaluate(msm, ev(1, 3), 451 * ms), Change::founded);
+    }
+}
+
 } // namespace

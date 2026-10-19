@@ -679,3 +679,71 @@ TEST(StorageFormatRegression, NewFormattedIntoARunningClusterJoinsRegression) {
         return confirmed;
     }, 30s)) << "X was never CONFIRMED";
 }
+
+// C1 (CP2 review): history is transitive in the canvass flags - a Joiner that never led still advertises history, so an
+// Undecided peer cannot count it as "fresh".  RED: the old flag formula (boot history / own terms only) gives 2.
+TEST(StorageGateWiringRegression, AJoinerAdvertisesHistoryRegression) {
+    Cluster c(3);
+    for (int i = 0; i < 3; ++i) c.start(i);
+    const int32_t L = settledLeader(c, {0, 1, 2}, 20s);
+    ASSERT_GE(L, 0);
+    const int X = (L + 1) % 3;
+    c.stop(X);
+    c.wipe(X);
+    c.startWith(X, [](NodeConfig& k) { k.testHoldFollowerFetchesMs = 60'000; });
+    EXPECT_TRUE(until([&] {
+        return c.node(X).onControlThreadForTest([&] { return c.node(X).canvassFlagsForTest(); }) == 3;
+    }, 5s)) << "a joiner advertised fresh flags";
+}
+
+// C1 (CP2 review): two replaced disks restart (auto) next to one live node that holds the history.  Whichever canvass the
+// second node hears first, it must never found over the live history node: no wiped node leads and the live node's
+// metadata log is never truncated.  Run with --gtest_repeat=20.
+// RED: no founding dwell and the old flag formula - the second node founds on the first joiner's "fresh" canvass.
+TEST(ConsensusCandidacyElectionRegression, TwoReplacedDisksNeverFoundOverALiveHistoryMemberRegression) {
+    Cluster c(3);
+    for (int i = 0; i < 3; ++i) c.start(i);
+    const int32_t L = settledLeader(c, {0, 1, 2}, 20s);
+    ASSERT_GE(L, 0);
+    ASSERT_EQ(c.defineTopic(), 0);
+    const int X1 = (L + 1) % 3, X2 = (L + 2) % 3;
+    const int64_t hw = c.meta(L).hw;
+    c.stop(X1);
+    c.stop(X2);
+    c.wipeRaw(X1);
+    c.wipeRaw(X2);
+    const auto autoFmt = [](NodeConfig& k) { k.storageFormat = StorageFormat::Auto; };
+    c.startWith(X1, autoFmt);   // both restart together: each first hears the other's "fresh" canvass
+    c.startWith(X2, autoFmt);
+    ASSERT_TRUE(until([&] { return c.originOnDisk(X1) == "joiner"; }, 15s)) << "X1 decided " << c.originOnDisk(X1);
+    ASSERT_TRUE(until([&] { return c.originOnDisk(X2) == "joiner"; }, 15s))
+        << "X2 decided " << c.originOnDisk(X2) << ": it founded over a live history node";
+    const auto end = std::chrono::steady_clock::now() + 5s;
+    while (std::chrono::steady_clock::now() < end) {
+        EXPECT_FALSE(c.election(X1).closedWith(X1) || c.election(X1).closedWith(X2));
+        EXPECT_FALSE(c.election(X2).closedWith(X1) || c.election(X2).closedWith(X2));
+        EXPECT_GE(c.meta(L).leo, hw) << "the live node's committed metadata was truncated";
+        std::this_thread::sleep_for(20ms);
+    }
+}
+
+// CP2 review M6: the abstention is switched OFF by the unsafe recovery vote (and only by it) on an unconfirmed storage.
+// RED: drop the `!storageRecoveryVote` term in BrokerNode::abstainGateThunk_.
+TEST(StorageGateWiringRegression, RecoveryVoteSwitchesAbstentionOffRegression) {
+    Cluster c(3);
+    for (int i = 0; i < 3; ++i) c.start(i);
+    const int32_t L = settledLeader(c, {0, 1, 2}, 20s);
+    ASSERT_GE(L, 0);
+    const int X = (L + 1) % 3;
+    c.stop(X);
+    c.wipe(X);
+    c.startWith(X, [](NodeConfig& k) { k.testHoldFollowerFetchesMs = 60'000; });
+    ASSERT_EQ(gateStateOf(c, X), 1);
+    EXPECT_TRUE(c.node(X).onControlThreadForTest([&] { return c.node(X).abstainsForTest(); }))
+        << "an unconfirmed storage must abstain";
+    c.stop(X);
+    c.startWith(X, [](NodeConfig& k) { k.testHoldFollowerFetchesMs = 60'000; k.storageRecoveryVote = true; });
+    ASSERT_EQ(gateStateOf(c, X), 1);
+    EXPECT_FALSE(c.node(X).onControlThreadForTest([&] { return c.node(X).abstainsForTest(); }))
+        << "the recovery vote must turn abstention off";
+}

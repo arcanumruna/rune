@@ -761,6 +761,7 @@ void Election::onCanvassPosition(Term    logLeadershipTermId,
 
     // ISR v3 R12: founding evidence.  "Fresh" = the sender says (valid flags) it has no history; an invalid-flags
     // canvass (an old sender's 0) or a history flag is history.
+    if (memberById(followerMemberId) == nullptr) return;   // M11: only members are founding evidence
     noteHeard_(followerMemberId);
     if ((flags & 2) != 0 && (flags & 1) == 0) {
         if (followerMemberId >= 0 && followerMemberId < 32) heardFreshMask_ |= 1u << followerMemberId;
