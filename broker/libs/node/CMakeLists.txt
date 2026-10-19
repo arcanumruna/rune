@@ -172,6 +172,10 @@ if(BUILD_TESTING)
         tests/node/ViewRecoveryRegressionTest.cpp
         tests/node/CatalogApplierTest.cpp
         tests/node/SecurityApplierTest.cpp
+        tests/node/SecurityReadServerTest.cpp
+        tests/node/SecurityWritePathTest.cpp
+        tests/node/SecurityAnswerGateTest.cpp
+        tests/node/SecurityRingCodecTest.cpp
         tests/node/CatalogWritePathTest.cpp
         tests/node/CatalogLeadershipTest.cpp
         tests/node/CatalogReadServerTest.cpp
@@ -1624,7 +1628,8 @@ if(BUILD_TESTING)
         # role + ISR relay units.
         add_executable(rune_catalog_replication_tests tests/integration/CatalogReplicationTest.cpp
                 tests/integration/StorageLossClusterTest.cpp
-                tests/integration/SecurityReplicationTest.cpp)
+                tests/integration/SecurityReplicationTest.cpp
+                tests/integration/AuthBootstrapWindowTest.cpp)
         target_include_directories(rune_catalog_replication_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_catalog_replication_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_catalog_replication_tests PROPERTIES TIMEOUT 360)

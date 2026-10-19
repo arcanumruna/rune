@@ -24,6 +24,8 @@
 #include <rune/node/OneToOneByteRing.h>
 #include <rune/protocol/CatalogTypes.h>
 #include <rune/catalog/CatalogEvent.h>   // rune::catalog::ConfigChange (AlterTopicConfig)
+#include <rune/protocol/SecurityTypes.h>
+#include <rune/security/SecurityEvent.h>   // ScramVerifier (the security DDL messages, authentication Task 10)
 
 #include <concurrent/AtomicBuffer.h>
 
@@ -49,6 +51,9 @@ enum : int32_t {
     // 3, 4: the retired create-topic request / reply (Task 9) — never reused.
     kMsgAdminRole         = 5,   // RETIRED (Task 17): the __topic_schemas / __views role; nothing posts it, the admin thread refuses it
     kMsgEgressFrame       = 6,   // admin → control: [sessionId:i64][response frame]
+    // Authentication Task 10 (D24): admin → control on the egress ring - a security DDL OK that may leave only once THIS
+    // broker enforces the event: [sessionId:i64][eventOffset:i64][response frame] (the SecurityAnswerGate).
+    kMsgEgressFrameGated  = 27,
     kMsgAlterTopic        = 7,   // gateway → admin: ALTER TOPIC (Task 11)
     kMsgCreateView        = 8,   // gateway → admin: CREATE VIEW (Task 19)
     // Catalog history Task 6 (control → admin, on the AdminRoleRing):
@@ -193,6 +198,7 @@ struct DdlMeta {
     std::string                                statement;
     std::string                                clientName;
     std::string                                sourceAddress;
+    std::string                                authenticated;   // the session's user (authentication Task 10; "" = anonymous)
     int64_t                                    sessionId = 0;
     rune::protocol::RequestId                  requestId{};
     std::optional<rune::catalog::ReplayedFrom> replayedFrom;   // set only by `rune catalog replay` (spec §7)
@@ -306,6 +312,43 @@ struct MalformedDdl {
 /// One queued DDL: exactly one request message (the alternative IS the kind).
 using DdlRequest = std::variant<DefineTopicMsg, AlterTopicMsg, CreateViewMsg, DropTopicMsg, DropViewMsg,
                                 AlterViewMsg, AlterTopicConfigMsg, MalformedDdl>;
+
+// ---------------------------------------------------------------------------
+// Authentication Task 10 (D36): the security DDL (79) and the one-time bootstrap (80), gateway → admin on the request
+// ring (kMsgSecurityDdl / kMsgSecurityBootstrap).  The fields are the wire's (range-checked again on decode - never
+// cast); `meta` carries the REDACTED statement, the session's user (`authenticated`), the request id.
+// ---------------------------------------------------------------------------
+inline constexpr uint16_t kTidSecurityDdl       = 79;
+inline constexpr uint16_t kTidSecurityBootstrap = 80;
+
+struct SecurityDdlMsg {
+    int64_t                       session = 0;
+    int64_t                       corr    = 0;
+    DdlMeta                       meta;
+    uint8_t                       kind = 0;               // rune::protocol::client::SecurityOpKind (1..9)
+    std::string                   name;                   // the user / role the op targets (Grant/Revoke: the grantee)
+    uint8_t                       change = 0;             // UserChangeKind (AlterUser)
+    uint8_t                       passwordIndex = 0;      // DropPassword
+    uint8_t                       terminateSessions = 0;  // SetPassword
+    rune::security::ScramVerifier verifier;               // CreateUser, AddPassword, SetPassword
+    uint8_t                       granteeKind = 0, op = 0, resourceType = 0, patternKind = 0;   // Grant / Revoke
+    std::string                   pattern;
+    std::string                   roleName;               // GrantRole / RevokeRole
+};
+
+/// SecurityBootstrap: the gateway already verified the MAC with its ClusterKeys; the nonce is kept as the request's
+/// identity (a retried bootstrap dedupes on it).
+struct SecurityBootstrapMsg {
+    int64_t                       session = 0;
+    int64_t                       corr    = 0;
+    DdlMeta                       meta;                   // clientName, sourceAddress, sessionId
+    std::string                   adminName;
+    rune::security::ScramVerifier verifier;
+    std::array<uint8_t, rune::security::kFakeSaltSeedBytes> fakeSaltSeed{};
+    std::array<uint8_t, 16>       nonce{};
+};
+
+using SecurityRequest = std::variant<SecurityDdlMsg, SecurityBootstrapMsg, MalformedDdl>;
 
 // ---------------------------------------------------------------------------
 // GetSchema request (gateway → admin).  Owning form after drain.
@@ -463,6 +506,7 @@ void layoutMeta(W& w, const DdlMeta& m) {
     w.str32(m.statement);
     w.str16(m.clientName);
     w.str16(m.sourceAddress);
+    w.str16(m.authenticated);
     w.i64(m.sessionId);
     w.u64(m.requestId.hi);
     w.u64(m.requestId.lo);
@@ -477,6 +521,7 @@ inline void readMeta(Reader& r, DdlMeta& m) {
     r.str32(m.statement);
     r.str16(m.clientName);
     r.str16(m.sourceAddress);
+    r.str16(m.authenticated);
     m.sessionId    = r.i64();
     m.requestId.hi = r.u64();
     m.requestId.lo = r.u64();
@@ -557,9 +602,31 @@ template <class W> void layout(W& w, const AlterTopicConfigMsg& m) {
     layoutMeta(w, m.meta);
 }
 
+template <class W> void layoutVerifier(W& w, const rune::security::ScramVerifier& v) {
+    w.bytes32({v.salt.data(), v.salt.size()});
+    w.u32(v.iterations);
+    w.bytes32({v.storedKey.data(), v.storedKey.size()});
+    w.bytes32({v.serverKey.data(), v.serverKey.size()});
+}
+template <class W> void layout(W& w, const SecurityDdlMsg& m) {
+    w.i64(m.session); w.i64(m.corr); layoutMeta(w, m.meta);
+    w.u8(m.kind); w.str16(m.name); w.u8(m.change); w.u8(m.passwordIndex); w.u8(m.terminateSessions);
+    layoutVerifier(w, m.verifier);
+    w.u8(m.granteeKind); w.u8(m.op); w.u8(m.resourceType); w.u8(m.patternKind);
+    w.str16(m.pattern); w.str16(m.roleName);
+}
+template <class W> void layout(W& w, const SecurityBootstrapMsg& m) {
+    w.i64(m.session); w.i64(m.corr); layoutMeta(w, m.meta);
+    w.str16(m.adminName); layoutVerifier(w, m.verifier);
+    w.bytes32({m.fakeSaltSeed.data(), m.fakeSaltSeed.size()});
+    w.bytes32({m.nonce.data(), m.nonce.size()});
+}
+
 } // namespace admin_wire
 
 template <class M> inline constexpr int32_t kDdlMsgType = 0;
+template <> inline constexpr int32_t kDdlMsgType<SecurityDdlMsg>       = kMsgSecurityDdl;
+template <> inline constexpr int32_t kDdlMsgType<SecurityBootstrapMsg> = kMsgSecurityBootstrap;
 template <> inline constexpr int32_t kDdlMsgType<DefineTopicMsg>      = kMsgDefineTopic;
 template <> inline constexpr int32_t kDdlMsgType<AlterTopicMsg>       = kMsgAlterTopic;
 template <> inline constexpr int32_t kDdlMsgType<CreateViewMsg>       = kMsgCreateView;
@@ -697,6 +764,78 @@ inline DdlRequest decodeAlterTopicConfig(const uint8_t* buf, std::size_t len) {
     return admin_wire::finish(r, std::move(m), kTidAlterTopicConfig);
 }
 
+// ---- Security DDL decode (authentication Task 10) ----
+namespace admin_wire {
+/// A verifier read with the library's value rules (salt 16..64, iterations 4096..1e6, 64-byte keys) - never cast.
+inline void readVerifier(Reader& r, rune::security::ScramVerifier& v, bool required) {
+    std::vector<uint8_t> salt, stored, server;
+    r.bytes32(salt);
+    v.iterations = r.u32();
+    r.bytes32(stored);
+    r.bytes32(server);
+    if (!r.ok) return;
+    if (!required) return;   // unused slot: its content is ignored
+    if (salt.size() < rune::security::kSaltMin || salt.size() > rune::security::kSaltMax ||
+        v.iterations < rune::security::kIterMin || v.iterations > rune::security::kIterMax ||
+        stored.size() != rune::security::kKeyBytes || server.size() != rune::security::kKeyBytes) {
+        r.fail("a malformed SCRAM verifier");
+        return;
+    }
+    v.salt = std::move(salt);
+    std::memcpy(v.storedKey.data(), stored.data(), rune::security::kKeyBytes);
+    std::memcpy(v.serverKey.data(), server.data(), rune::security::kKeyBytes);
+}
+} // namespace admin_wire
+
+inline SecurityRequest decodeSecurityDdl(const uint8_t* buf, std::size_t len) {
+    admin_wire::Reader r{buf, len};
+    SecurityDdlMsg m;
+    admin_wire::readHead(r, m);
+    admin_wire::readMeta(r, m.meta);
+    m.kind = r.u8();
+    r.str16(m.name);
+    m.change = r.u8();
+    m.passwordIndex = r.u8();
+    m.terminateSessions = r.u8();
+    const bool hasVerifier = m.kind == 1 || (m.kind == 2 && (m.change == 0 || m.change == 2));
+    admin_wire::readVerifier(r, m.verifier, hasVerifier);
+    m.granteeKind = r.u8(); m.op = r.u8(); m.resourceType = r.u8(); m.patternKind = r.u8();
+    r.str16(m.pattern);
+    r.str16(m.roleName);
+    if (r.ok) {
+        if (m.kind < 1 || m.kind > 9) r.fail("an unknown security op kind");
+        else if (m.kind == 2 && m.change > 4) r.fail("an unknown user change");
+        else if (m.terminateSessions > 1) r.fail("a terminate flag other than 0/1");
+        else if ((m.kind == 6 || m.kind == 7) &&
+                 !(rune::protocol::validSecurityGranteeKind(m.granteeKind) && rune::protocol::validSecurityOperation(m.op) &&
+                   rune::protocol::validSecurityResourceType(m.resourceType) &&
+                   rune::protocol::validSecurityPatternKind(m.patternKind)))
+            r.fail("an unknown grant enum byte");
+    }
+    if (!r.done()) return MalformedDdl{kTidSecurityDdl, m.session, m.corr, r.why != nullptr ? r.why : "unreadable frame"};
+    return SecurityRequest{std::move(m)};
+}
+inline SecurityRequest decodeSecurityBootstrap(const uint8_t* buf, std::size_t len) {
+    admin_wire::Reader r{buf, len};
+    SecurityBootstrapMsg m;
+    admin_wire::readHead(r, m);
+    admin_wire::readMeta(r, m.meta);
+    r.str16(m.adminName);
+    admin_wire::readVerifier(r, m.verifier, true);
+    std::vector<uint8_t> seed, nonce;
+    r.bytes32(seed);
+    r.bytes32(nonce);
+    if (r.ok) {
+        if (seed.size() != m.fakeSaltSeed.size() || nonce.size() != m.nonce.size()) r.fail("a malformed seed / nonce");
+        else {
+            std::memcpy(m.fakeSaltSeed.data(), seed.data(), seed.size());
+            std::memcpy(m.nonce.data(), nonce.data(), nonce.size());
+        }
+    }
+    if (!r.done()) return MalformedDdl{kTidSecurityBootstrap, m.session, m.corr, r.why != nullptr ? r.why : "unreadable frame"};
+    return SecurityRequest{std::move(m)};
+}
+
 // ---- Catalog reads (catalog history Task 12) ----
 /// false = ring full (the gateway answers the retriable NotLeader / retries).
 [[nodiscard]] inline bool encodeCatalogSubscribe(OneToOneByteRing& ring, const CatalogSubscribeMsg& m) {
@@ -706,6 +845,26 @@ inline DdlRequest decodeAlterTopicConfig(const uint8_t* buf, std::size_t len) {
     admin_wire::putI64(p, m.session);
     admin_wire::putI64(p + 8, m.corr);
     admin_wire::putI64(p + 16, m.fromOffset);
+    ring.commit(idx);
+    return true;
+}
+/// Authentication Task 10: the `__security` reads - the catalog layouts under their own message types.
+[[nodiscard]] inline bool encodeSecuritySubscribe(OneToOneByteRing& ring, const CatalogSubscribeMsg& m) {
+    const auto idx = ring.tryClaim(kMsgSecuritySubscribe, kCatalogSubscribeWireLen);
+    if (idx < 0) return false;
+    uint8_t* p = ring.base() + idx;
+    admin_wire::putI64(p, m.session);
+    admin_wire::putI64(p + 8, m.corr);
+    admin_wire::putI64(p + 16, m.fromOffset);
+    ring.commit(idx);
+    return true;
+}
+[[nodiscard]] inline bool encodeSecurityUnsubscribe(OneToOneByteRing& ring, const CatalogUnsubscribeMsg& m) {
+    const auto idx = ring.tryClaim(kMsgSecurityUnsubscribe, kCatalogUnsubscribeWireLen);
+    if (idx < 0) return false;
+    uint8_t* p = ring.base() + idx;
+    admin_wire::putI64(p, m.session);
+    admin_wire::putI64(p + 8, m.subscriptionId);
     ring.commit(idx);
     return true;
 }

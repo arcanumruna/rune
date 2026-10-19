@@ -59,6 +59,10 @@
 #include <rune/gateway/ITxnRequestHandler.h>
 #include <rune/gateway/IAdminRequestSink.h>
 #include <rune/gateway/CatalogRoute.h>
+#include <rune/gateway/SecurityRoute.h>
+#include <rune/gateway/SecurityView.h>
+#include <rune/gateway/SessionAuthGate.h>
+#include <rune/peerlink/ClusterKeys.h>
 // client<->broker TLS/AEAD (Task 7): server-role handshake driver. SessionTable.h
 // (above) already pulls in rune/crypto/Aead.h + Cipher.h for CryptoState; this
 // adds TlsSession itself for PendingConnect's in-flight handshake.
@@ -97,6 +101,7 @@ namespace rune::node { class WorkerPool; struct WorkerReturn; }
 #include <deque>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -383,6 +388,31 @@ public:
     // -----------------------------------------------------------------------
     void setCatalogRoute(rune::gateway::CatalogRoute r) noexcept { catalogRoute_ = std::move(r); }
     [[nodiscard]] const rune::gateway::CatalogRoute& catalogRoute() const noexcept { return catalogRoute_; }
+    // Authentication Task 10 (D36): the `__security` DDL route - the catalog route's twin, consulted by the security
+    // DDL (79) and bootstrap (80) handlers; reads of -7 are never routed.
+    void setSecurityRoute(rune::gateway::SecurityRoute r) noexcept { securityRoute_ = std::move(r); }
+    [[nodiscard]] const rune::gateway::SecurityRoute& securityRoute() const noexcept { return securityRoute_; }
+    /// This broker's OWN copy of the cluster keys (D32; startup thread -> control thread, never shared): the bootstrap
+    /// proof (D4) is verified with it.  Unset (InProcessUnauthenticated / dev): every bootstrap is refused.
+    void setClusterKeys(rune::peerlink::ClusterKeys keys) { clusterKeys_ = std::move(keys); }
+    [[nodiscard]] uint64_t bootstrapsRefused() const noexcept { return bootstrapsRefused_; }
+    /// How this broker authenticates sessions (ConnectResponse.authMode) and the control thread's SecurityView the
+    /// bootstrap window is read from (`__security` holds a Bootstrap event or not).  Required: a session that has not
+    /// authenticated is limited by its SessionAuthGate; default InProcess = no gating, byte-identical to before.
+    /// Both are control-thread values: the view pointer is read on the thread that owns the view (never across threads).
+    void setAuthMode(rune::gateway::GatewayAuthMode m, const rune::gateway::SecurityView* view) noexcept {
+        authMode_ = m;
+        securityView_ = view;
+    }
+    [[nodiscard]] rune::gateway::GatewayAuthMode authMode() const noexcept { return authMode_; }
+    /// Requests refused by the auth gate (AuthenticationFailed + session end).
+    [[nodiscard]] uint64_t authGateRefusals() const noexcept { return authGateRefusals_; }
+    /// Test seam: the gate of an existing session.
+    void setSessionAuthGateForTest(int64_t sid, rune::gateway::SessionAuthGate g) {
+        if (Session* s = sessions_.find(sid)) s->authGate = g;
+    }
+    [[nodiscard]] bool hasSessionForTest(int64_t sid) { return sessions_.find(sid) != nullptr; }
+    [[nodiscard]] uint64_t securitySubscribesForwarded() const noexcept { return securitySubscribesForwarded_; }
     /// DDLs answered by the route without reaching the admin ring (Redirect /
     /// NotLeader / Internal / pre-v8 InvalidRequest).
     [[nodiscard]] uint64_t ddlRoutedAway() const noexcept { return ddlRoutedAway_; }
@@ -1220,6 +1250,8 @@ public:
         case pc::TemplateId::AlterTopicConfig: handleAlterTopicConfig(buf, len); break;
         case pc::TemplateId::DropView:         handleDropView(buf, len); break;
         case pc::TemplateId::AlterView:        handleAlterView(buf, len); break;
+        case pc::TemplateId::SecurityDdl:      handleSecurityDdl(buf, len); break;
+        case pc::TemplateId::SecurityBootstrap: handleSecurityBootstrap(buf, len); break;
         default: break;
         }
     }
@@ -1436,6 +1468,7 @@ private:
         std::string egressChannel;
         int32_t     egressStreamId = 0;
         int32_t     clientVersion  = 0;   ///< D6: ConnectRequest.clientVersion
+        rune::gateway::SessionAuthGate authGate;   ///< decided when the ConnectResponse is built (what the client was told)
 
         // Task 13 (spec §3.4): every worker has this session's reply destination
         // queued (announce-before-accept) — set once, so a ConnectResponse retry
@@ -1638,7 +1671,13 @@ private:
     /// RouteRemote → Redirect, RouteUnknown → NotLeader, RouteHalted → Internal
     /// (ErrorResponse; a pre-v8 session gets its own response type, F37).
     /// false = RouteLocalLeader, or no header / no session (the handler answers).
-    [[nodiscard]] bool ddlRouted_(const uint8_t* buf, std::size_t len);
+    [[nodiscard]] bool ddlRouted_(const uint8_t* buf, std::size_t len) { return ddlRouted_(buf, len, catalogRoute_, "catalog"); }
+    /// The same gate over an explicit route (the `__security` handlers pass securityRoute_).
+    [[nodiscard]] bool ddlRouted_(const uint8_t* buf, std::size_t len, const rune::gateway::CatalogRoute& route,
+                                  const char* log);
+    // Authentication Task 10: SecurityDdl (79) and SecurityBootstrap (80).
+    void handleSecurityDdl      (const uint8_t* buf, std::size_t len);
+    void handleSecurityBootstrap(const uint8_t* buf, std::size_t len);
     // Task 20: GetViewRow (72) — build a GetViewRow WorkerOp routed to the
     // owning worker (same op/return plumbing as PushRead); the worker's
     // ViewRowResult is encoded as a ViewRowResponse (73) in drainWorkerReturns_.
@@ -2067,6 +2106,19 @@ private:
     int  flushPendingCatalogUnsubs_();
     /// handleSubscribe for topicId == kCatalogTopicId: answered here or forwarded.
     void handleCatalogSubscribe_(Session& session, const rune::protocol::client::Subscribe& msg);
+    /// handleSubscribe for topicId == kSecurityTopicId (authentication Task 10): the same contract on the second server.
+    void handleSecuritySubscribe_(Session& session, const rune::protocol::client::Subscribe& msg);
+    uint64_t securitySubscribesForwarded_ = 0;
+    rune::gateway::GatewayAuthMode authMode_ = rune::gateway::GatewayAuthMode::InProcess;
+    const rune::gateway::SecurityView* securityView_ = nullptr;   // control thread's own mirror (same thread as the gateway)
+    uint64_t authGateRefusals_ = 0;
+    /// The gate a NEW session starts in, and the v9 ConnectResponse fields it implies (see SessionAuthGate.h).
+    [[nodiscard]] rune::gateway::SessionAuthGate newSessionGate_(int32_t clientVersion) const;
+    /// true = refused here (AuthenticationFailed in the request's own response type, then the session ends).
+    [[nodiscard]] bool authGateRefuses_(rune::protocol::client::TemplateId tid, const uint8_t* buf, std::size_t len);
+    uint64_t bootstrapsRefused_ = 0;
+    std::optional<rune::peerlink::ClusterKeys> clusterKeys_;
+    std::vector<uint8_t> bootstrapMacScratch_;   // reused MAC input (capacity persists)
 
     // Catalog history Task 12 (Task 8 review N5): view sinks APPLIED here whose
     // compiled plan has not reached every worker yet — a GetViewRow of one is
@@ -2156,6 +2208,7 @@ private:
     rune::gateway::IAdminRequestSink* adminSink_ = nullptr;
     // Catalog history Task 11: the DDL route (setCatalogRoute) + its counters.
     rune::gateway::CatalogRoute catalogRoute_{rune::gateway::RouteLocalLeader{}};
+    rune::gateway::SecurityRoute securityRoute_{rune::gateway::RouteLocalLeader{}};
     uint64_t                    ddlRoutedAway_   = 0;
     uint64_t                    preV8DdlRefused_ = 0;
 

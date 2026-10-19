@@ -97,6 +97,10 @@ struct CountingAdminSink final : IAdminRequestSink {
         catalogUnsubs.push_back({s, id});
         return true;
     }
+    AdminSubmit submitSecurityDdl(const pc::SecurityDdl&, const DdlMetaView&) override { return AdminSubmit::Accepted; }
+    AdminSubmit submitSecurityBootstrap(const pc::SecurityBootstrap&, const DdlMetaView&) override { return AdminSubmit::Accepted; }
+    bool submitSecuritySubscribe(int64_t, int64_t, int64_t) override { return true; }
+    bool submitSecurityUnsubscribe(int64_t, int64_t) override { return true; }
 };
 
 /// One DDL answer as the client sees it: the frame's template, its code and message.

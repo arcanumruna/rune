@@ -154,7 +154,9 @@ inline constexpr std::size_t kMaxRejectionBytes = 64;
     case T::DropTopic:
     case T::AlterTopicConfig:
     case T::DropView:
-    case T::AlterView: {
+    case T::AlterView:
+    case T::SecurityDdl:          // authentication (client version 9): answered by DdlResponse too
+    case T::SecurityBootstrap: {
         pc::DdlResponse r;
         r.sessionId = sessionId; r.correlationId = correlationId; r.errorCode = code;
         static_assert(pc::MessageHeader::ENCODED_SIZE + pc::DdlResponse::BODY_FIXED + 2 <= kMaxRejectionBytes);

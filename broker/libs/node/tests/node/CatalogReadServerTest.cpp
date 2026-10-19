@@ -825,7 +825,7 @@ struct Restarted {
     std::vector<ReadRig::Frame> frames;
     rune::node::CatalogReadServer server;
     explicit Restarted(ReadRig& r)
-        : server(r.replica(),
+        : server(rune::node::kCatalogTopicId, r.replica(),
                  [this](const rune::node::CatalogReadFrameHead& h, std::span<const uint8_t> f) {
                      frames.push_back(ReadRig::Frame{h.session, std::vector<uint8_t>(f.begin(), f.end()),
                                                      h.subscriptionId, h.baseOffset});

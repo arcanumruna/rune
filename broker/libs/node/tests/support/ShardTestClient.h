@@ -339,6 +339,8 @@ public:
     }
 
     int64_t nextCorrelationId() noexcept { return ++corr_; }
+    /// The last ConnectResponse this client decoded (authentication tests read authMode / authState from it).
+    [[nodiscard]] const std::optional<pc::ConnectResponse>& lastConnectResponse() const noexcept { return connect_; }
 
     // ── E2 final fix wave (C1 multi-node): consumer-group frames ──────────────
     /// The ConnectRequest clientVersion of later connects (group frames need >= 3).

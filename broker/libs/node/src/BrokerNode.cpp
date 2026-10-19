@@ -2106,6 +2106,17 @@ void BrokerNode::buildGateway() {
         // Wire in the TopicRegistry (GB-1). Non-owning pointer; registry outlives
         // the gateway (both destroyed in stop() with registry after gateway).
         gateway_->setTopicRegistry(topicRegistry_.get());
+        // Authentication Task 10 (D11/D13): how sessions authenticate + the bootstrap window's view (the control thread's
+        // own SecurityView - the gateway runs on this same thread).
+        gateway_->setAuthMode(config_.authMode == AuthMode::Enabled  ? rune::gateway::GatewayAuthMode::Required
+                              : config_.authMode == AuthMode::DevDisabled ? rune::gateway::GatewayAuthMode::Dev
+                                                                          : rune::gateway::GatewayAuthMode::InProcess,
+                              securityView_ ? &*securityView_ : nullptr);
+        // Authentication Task 10 (D4/D32): the gateway's OWN copy of the cluster keys (loaded on this startup thread,
+        // validated by validateAuth) verifies the bootstrap proof.  Dev / in-process configs hold none.
+        if (config_.authMode == AuthMode::Enabled)
+            if (auto keys = rune::peerlink::loadClusterKeys(config_.clusterKeyFile, config_.clusterKeyFileNext))
+                gateway_->setClusterKeys(std::move(*keys));
         // DR-15 fix round 2 (LOW-4): clients' reply hostnames resolve off-thread.
         if (resolverHub_) gateway_->setHostResolver(resolverHub_->subscribeHostResolver());
         // fsyncgate fail-stop: worker StorageFailure signals (and the gateway's
@@ -3140,6 +3151,7 @@ void BrokerNode::onSecurityApplied_(const uint8_t* p, std::size_t n) {
     // Task 14 turns that into revoked sessions and refused logins).
     if (auto a = securityView_->onApplied(offset, bytes); a) {
         securityAppliedValue_ = offset;
+        securityRefreshedOffset_ = offset;   // Task 13/14: delayed until the permission refresh reached every worker
     } else {
         securityHaltedValue_ = a.error().offset + 1;
     }
@@ -3209,8 +3221,16 @@ BrokerNode::SecurityViewSnap BrokerNode::securityViewForTest() {
         v.appliedOffset = securityView_->appliedOffset();
         v.digest        = securityView_->state().digest();
         v.halted        = securityView_->halted();
+        v.hasSecurityAdmin = securityView_->state().hasSecurityAdmin();
         return v;
     });
+}
+
+bool BrokerNode::gatewayHasSessionForTest(int64_t sessionId) {
+    return onControlThreadForTest([this, sessionId]() { return gateway_ != nullptr && gateway_->hasSessionForTest(sessionId); });
+}
+uint64_t BrokerNode::authGateRefusalsForTest() {
+    return onControlThreadForTest([this]() -> uint64_t { return gateway_ ? gateway_->authGateRefusals() : 0; });
 }
 
 BrokerNode::SecurityMetricsSnap BrokerNode::securityMetricsForTest() {
@@ -3639,6 +3659,7 @@ void BrokerNode::bootFromSecurity_() {
         securityHaltedValue_ = e->offset + 1;
     }
     securityAppliedValue_ = securityView_->appliedOffset();
+    securityRefreshedOffset_ = securityAppliedValue_;   // the booted state is enforced from the first request
     spdlog::info("BrokerNode[{}]: __security booted - {} event(s) replayed, applied through offset {}, applier {}",
                  config_.nodeId, replayed, securityAppliedValue_, bootSecurityApplier_->stateName());
 }
@@ -3774,6 +3795,11 @@ void BrokerNode::buildAdminWorker() {
                                  uint32_t newVersion, int32_t gateTopicId, std::string_view detail) {
             if (!adminWorkerAgent_) return;
             adminWorkerAgent_->postDdlResponse(session, corr, code, objectId, newVersion, gateTopicId, detail);
+        };
+        deps.respondSecurity = [this](int64_t session, int64_t corr, uint16_t code, uint64_t objectId,
+                                      uint32_t newVersion, int64_t gateOffset, std::string_view detail) {
+            if (!adminWorkerAgent_) return;
+            adminWorkerAgent_->postSecurityResponse(session, corr, code, objectId, newVersion, gateOffset, detail);
         };
         deps.respondError = [this](int64_t session, int64_t corr, uint16_t code, std::string_view message) {
             if (!adminWorkerAgent_) return;
@@ -4336,6 +4362,7 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
     //      halted broker giving up the controllership.
     work += resignIfHalted_(leaderNow);
     work += publishCatalogRoute_(leaderNow);
+    work += publishSecurityRoute_(leaderNow);
     work += publishPlacementView_();
     work += reportUnbuildableReplicas_();
     work += checkLinkMtu_(nowNs, /*force=*/false);   // re-check I1: the runtime's clock, no per-pass clock read
@@ -4549,7 +4576,7 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
     if (!catalogReadFlow_.idle()) [[unlikely]] work += catalogReadFlow_.service(catalogSink);
     if (ddlAnswerGate_.empty()) {
         work += agent->egressRing().drain(
-            [this, &send, &serves](int32_t /*tid*/,
+            [this, &send, &serves](int32_t tid,
                                    aeron::concurrent::AtomicBuffer& b,
                                    aeron::util::index_t off,
                                    aeron::util::index_t len) {
@@ -4558,6 +4585,14 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
                 if (n < 8) return;
                 int64_t session;
                 std::memcpy(&session, p, 8);
+                if (tid == kMsgEgressFrameGated) [[unlikely]] {
+                    // Authentication Task 10 (D24): [session][event offset][DdlResponse] - held until this broker's view
+                    // applied the event (pumpSecurityGate_); a full gate answers Internal at once, never drops.
+                    if (n < 16 + rune::protocol::client::MessageHeader::ENCODED_SIZE) return;
+                    const int64_t eventOffset = admin_wire::getI64(p + 8);
+                    securityGate_.hold(session, eventOffset, std::span<const uint8_t>(p + 16, n - 16), send);
+                    return;
+                }
                 const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now().time_since_epoch()).count();
                 switch (ddlAnswerGate_.offer(session, p + 8, n - 8, nowNs, serves)) {
@@ -4572,7 +4607,22 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
             }, 16);
     }
 
+    if (!securityGate_.empty()) [[unlikely]] work += pumpSecurityGate_();
     return work;
+}
+
+// Authentication Task 10 (D24): release the security DDL OKs this broker now enforces.  The enforced offset is the
+// view's applied offset until Task 13/14 delay it to the last permission refresh that reached every worker; a halted
+// mirror answers every held OK Internal (the OK would claim an enforcement this broker can no longer give).
+int BrokerNode::pumpSecurityGate_() {
+    auto send = [this](int64_t session, const uint8_t* f, std::size_t n) {
+        if (gateway_) (void)gateway_->sendControlFrame(session, f, n);
+    };
+    if (!securityView_) return 0;
+    if (securityView_->halted())
+        return securityGate_.failAll("security log halted on this broker; the change may have been applied elsewhere - retry "
+                                     "with the same requestId on another broker", send);
+    return securityGate_.release(std::min(securityView_->appliedOffset(), securityRefreshedOffset_), send);
 }
 
 int AdminControlPlane::doWork(int64_t nowNs) {
@@ -4635,6 +4685,56 @@ int BrokerNode::publishCatalogRoute_(bool consensusLeader) {
                                              : std::string{});
     gateway_->setCatalogRoute(std::move(route));
     catalogRoutePublished_ = PublishedCatalogRoute{kind, key};
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
+// Authentication Task 10 (D36): the `__security` DDL route, control thread - publishCatalogRoute_'s twin over the
+// committed (-7, 0) assignment (single node: the consensus leader) and the view's halt.
+// ---------------------------------------------------------------------------
+int BrokerNode::publishSecurityRoute_(bool consensusLeader) {
+    if (!gateway_) return 0;
+    using rune::gateway::RouteKind;
+    RouteKind kind = RouteKind::Unknown;
+    int64_t   key  = 0;
+    if (securityHaltedValue_ != 0) {
+        kind = RouteKind::Halted;
+        key  = securityHaltedValue_ - 1;
+    } else if (catalogOnController_) {
+        const rune::metadata::PartitionAssignment* pa =
+            metadataService_ ? metadataService_->assignment(kSecurityTopicId, kSecurityPartition) : nullptr;
+        const int32_t leader = pa != nullptr ? pa->leaderNode : rune::metadata::NO_LEADER;
+        if (leader == config_.nodeId) {
+            kind = RouteKind::LocalLeader;
+        } else if (leader >= 0) {
+            kind = RouteKind::Remote;
+            key  = leader;
+        }
+    } else if (consensusLeader) {
+        kind = RouteKind::LocalLeader;
+    }
+    if (securityRoutePublished_.kind && kind == *securityRoutePublished_.kind && key == securityRoutePublished_.key)
+        [[likely]] return 0;
+
+    rune::gateway::SecurityRoute route{rune::gateway::RouteUnknown{}};
+    switch (kind) {
+    case RouteKind::LocalLeader: route = rune::gateway::RouteLocalLeader{}; break;
+    case RouteKind::Remote: {
+        std::string endpoint;
+        for (const auto& peer : config_.peers)
+            if (peer.id == static_cast<int32_t>(key)) endpoint = peer.clientChannel();
+        route = rune::gateway::RouteRemote{std::move(endpoint)};
+        break;
+    }
+    case RouteKind::Halted:  route = rune::gateway::RouteHalted{key}; break;
+    case RouteKind::Unknown: break;
+    }
+    spdlog::info("BrokerNode[{}]: security DDL route -> {}{}", config_.nodeId, rune::gateway::catalogRouteName(route),
+                 kind == RouteKind::Remote   ? " (leader " + std::to_string(key) + ")"
+                 : kind == RouteKind::Halted ? " (applier halted at offset " + std::to_string(key) + ")"
+                                             : std::string{});
+    gateway_->setSecurityRoute(std::move(route));
+    securityRoutePublished_ = PublishedCatalogRoute{kind, key};
     return 1;
 }
 

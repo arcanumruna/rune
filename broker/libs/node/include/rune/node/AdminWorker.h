@@ -106,6 +106,11 @@ struct AdminDeps {
     /// false = full (the server keeps the position and retries).  Unset: catalog
     /// subscribes are answered nowhere — every production / rig AdminWorker sets it.
     CatalogReadEgress catalogRead;
+
+    /// Authentication Task 10 (D24/D36): the DdlResponse (78) of a security DDL / bootstrap.  `gateOffset` >= 0 = an OK
+    /// for the event at that offset, released by the control thread only once THIS broker enforces it (production posts
+    /// kMsgEgressFrameGated); -1 = ungated (a refusal / error).  Unset: security answers go nowhere (rigs without one).
+    SecurityRespond respondSecurity;
 };
 
 // ---------------------------------------------------------------------------
@@ -187,19 +192,41 @@ public:
     /// committed).  No catalog replica: the Subscribe is answered Internal.
     void catalogSubscribe(const CatalogSubscribeMsg& m);
     void catalogUnsubscribe(const CatalogUnsubscribeMsg& m);
-    /// Fix round 0: catalog-read flow control from the control thread.
+    /// Authentication Task 10: a Subscribe / Unsubscribe on `__security` (topic -7), served by the SECOND read server
+    /// (securityReadServer_) from this broker's `__security` replica - the same contract (backlog up to the HW, one
+    /// caught-up marker, the history epoch).  The reader's ADMIN check is the gateway's (Task 12).
+    void securitySubscribe(const CatalogSubscribeMsg& m);
+    void securityUnsubscribe(const CatalogUnsubscribeMsg& m);
+    /// Fix round 0: catalog-read flow control from the control thread - routed by the subscription's id space
+    /// (kSecuritySubscriptionIdBit); a session close reaches both servers.
     void catalogReadPaused(const CatalogReadPausedMsg& m) {
-        if (readServer_) readServer_->onPaused(m.session, m.subscriptionId, m.baseOffset, m.droppedMarker);
+        if (rune::gateway::isSecuritySubscriptionId(m.subscriptionId)) {
+            if (securityReadServer_) securityReadServer_->onPaused(m.session, m.subscriptionId, m.baseOffset, m.droppedMarker);
+        } else if (readServer_) {
+            readServer_->onPaused(m.session, m.subscriptionId, m.baseOffset, m.droppedMarker);
+        }
     }
     void catalogSessionGone(int64_t session) {
         if (readServer_) readServer_->onSessionGone(session);
+        if (securityReadServer_) securityReadServer_->onSessionGone(session);
     }
     void catalogReadResume(const CatalogReadResumeMsg& m) {
-        if (readServer_) readServer_->onResume(m.session, m.subscriptionId);
+        if (rune::gateway::isSecuritySubscriptionId(m.subscriptionId)) {
+            if (securityReadServer_) securityReadServer_->onResume(m.session, m.subscriptionId);
+        } else if (readServer_) {
+            readServer_->onResume(m.session, m.subscriptionId);
+        }
     }
+    [[nodiscard]] const CatalogReadServer* securityReadServer() const noexcept {
+        return securityReadServer_ ? &*securityReadServer_ : nullptr;
+    }
+    /// Security DDL / bootstrap (admin thread, after the request-ring drain).
+    void submitSecurity(SecurityRequest req) { if (securityAdmin_) securityAdmin_->submit(std::move(req)); else rejectSecurityNoLog_(req); }
     [[nodiscard]] const CatalogReadServer* readServer() const noexcept { return readServer_ ? &*readServer_ : nullptr; }
     /// M3: catalog requests wait on the ring while the read server's owed answers are near capacity.
-    [[nodiscard]] bool catalogIntakePaused() const noexcept { return readServer_ && readServer_->intakePaused(); }
+    [[nodiscard]] bool catalogIntakePaused() const noexcept {
+        return (readServer_ && readServer_->intakePaused()) || (securityReadServer_ && securityReadServer_->intakePaused());
+    }
 
     /// Task 20: resolve a view NAME for an open-for-read handshake.  Returns a
     /// ViewRowResponse status: 0 OK (out params set), 3 SchemaMismatch (a pin to
@@ -444,6 +471,8 @@ private:
     bool                                  securityApplyHeldForTest_ = false;
     CatalogRole                           role_{CatalogFollower{}};
     std::optional<CatalogReadServer>      readServer_;   // set iff catalogReplica_ (Task 12)
+    std::optional<CatalogReadServer>      securityReadServer_;   // set iff the security log is attached (auth Task 10)
+    void rejectSecurityNoLog_(const SecurityRequest& req);
 
     InFlight               inFlight_;
     std::deque<DdlRequest> pending_;            // <= kMaxPendingDdl

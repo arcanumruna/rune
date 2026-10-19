@@ -271,7 +271,7 @@ AdminWorker::AdminWorker(SchemaRegistry& reg,
         // No egress wired (DDL-only rigs): nothing ever leaves — a subscription
         // stays Answering (bounded by the cap), never answered as if served.
         if (!deps_.catalogRead) spdlog::debug("AdminWorker: no catalog read egress wired — catalog reads not served");
-        readServer_.emplace(*catalogReplica_,
+        readServer_.emplace(kCatalogTopicId, *catalogReplica_,
                             deps_.catalogRead ? deps_.catalogRead
                                               : CatalogReadEgress([](const CatalogReadFrameHead&, std::span<const uint8_t>) { return false; }),
                             kMaxCatalogSubscriptions, static_cast<int64_t>(selfId_ + 1) << 40);
@@ -298,7 +298,41 @@ void AdminWorker::catalogSubscribe(const CatalogSubscribeMsg& m) {
 }
 
 void AdminWorker::catalogUnsubscribe(const CatalogUnsubscribeMsg& m) {
+    // A single unsubscribe names ONE server by its id space; a session close (-1) ends the session's reads on both.
+    if (m.subscriptionId != -1 && rune::gateway::isSecuritySubscriptionId(m.subscriptionId)) {
+        if (securityReadServer_) securityReadServer_->unsubscribe(m.session, m.subscriptionId);
+        return;
+    }
+    if (m.subscriptionId == -1 && securityReadServer_) securityReadServer_->unsubscribe(m.session, -1);
     if (readServer_) readServer_->unsubscribe(m.session, m.subscriptionId);
+}
+
+void AdminWorker::securitySubscribe(const CatalogSubscribeMsg& m) {
+    if (securityReadServer_) {
+        securityReadServer_->subscribe(m.session, m.corr, m.fromOffset);
+        return;
+    }
+    spdlog::error("AdminWorker: __security Subscribe (session {}) on a broker without a __security - answered Internal",
+                  m.session);
+    if (!deps_.catalogRead) return;
+    namespace pc = rune::protocol::client;
+    pc::SubscribeResponse r;
+    r.sessionId     = m.session;
+    r.correlationId = m.corr;
+    r.errorCode     = static_cast<int16_t>(pc::ErrorCode::Internal);
+    uint8_t frame[pc::SubscribeResponse::ENCODED_SIZE];
+    const std::size_t n = r.encode(frame);
+    (void)deps_.catalogRead(CatalogReadFrameHead{m.session, 0, -1}, std::span<const uint8_t>(frame, n));
+}
+
+void AdminWorker::securityUnsubscribe(const CatalogUnsubscribeMsg& m) {
+    if (securityReadServer_) securityReadServer_->unsubscribe(m.session, m.subscriptionId);
+}
+
+void AdminWorker::rejectSecurityNoLog_(const SecurityRequest& req) {
+    // A configuration without a __security (rigs): every security request is answered Internal, never dropped.
+    const auto [session, corr] = std::visit([](const auto& r) { return std::pair<int64_t, int64_t>{r.session, r.corr}; }, req);
+    if (deps_.respondSecurity) deps_.respondSecurity(session, corr, 6, 0, 0, -1, "this broker has no __security");
 }
 
 int AdminWorker::bootCatalog(BootEffects boot, LiveEffects live) {
@@ -329,7 +363,15 @@ void AdminWorker::attachSecurity(SecurityApplier booted, rune::replication::Part
                                  "the local __security prefix first (refusing to start)");
     securityApplier_.emplace(std::move(booted));
     securityReplica_ = replica;
-    securityAdmin_.emplace(*securityApplier_, replica, selfId_);
+    securityAdmin_.emplace(*securityApplier_, replica, deps_.respondSecurity, selfId_);
+    if (replica != nullptr)
+        // Authentication Task 10: `__security` reads ride a second CatalogReadServer on the same egress; its ids carry
+        // the security id bit so one id names one server.
+        securityReadServer_.emplace(kSecurityTopicId, *replica,
+                                    deps_.catalogRead ? deps_.catalogRead
+                                                      : CatalogReadEgress([](const CatalogReadFrameHead&, std::span<const uint8_t>) { return false; }),
+                                    kMaxCatalogSubscriptions,
+                                    (static_cast<int64_t>(selfId_ + 1) << 40) | rune::gateway::kSecuritySubscriptionIdBit);
     pendingSecurityLive_ = std::move(live);
 }
 
@@ -583,6 +625,9 @@ int AdminWorker::doWork(int64_t nowNs) {
         // replica pass just computed; a halted applier does not stop reads).
         work += readServer_->pump(nowNs);
     }
+    // Authentication Task 10: `__security` reads, after ITS applier (what it serves is the HW its replica pass just
+    // computed; a halted applier does not stop reads).
+    if (securityReadServer_) work += securityReadServer_->pump(nowNs);
     if (advance_(nowNs)) ++work;
     if (updateRole_()) ++work;
     // Rejections answer at once (nothing in flight): take up to a bounded batch

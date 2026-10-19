@@ -10,30 +10,64 @@
 //   SecurityHalted          — this broker's SecurityApplier halted at `offset` (D28): terminal for the process.
 // Every transition logs "AdminWorker: __security role -> <roleName()> (epoch N)" at info.
 //
-// Task 9 ships the role machine; Task 10 adds the write path (submit / in-flight / dedupe / answers).
+// The write path (D36, spec §3): a SecurityDdlMsg / SecurityBootstrapMsg is answered
+//   NotLeader (2)  unless SecurityLeaderServing (catching up, demoted, the commit timed out - all retriable),
+//   Internal (6)   when SecurityHalted;
+// otherwise the leader builds the event from its applied state (objectId / versions, the principal from DdlMeta -
+// `authenticated` = the session's user, "bootstrap" for a bootstrap, D3 - the REDACTED statement, its wall clock),
+// dedupes on (requestId, requestFingerprint) (a committed one answers its original result; a different fingerprint
+// answers InvalidRequest "requestId reused for a different statement"), dry-runs previewApplied (a refusal answers
+// InvalidRequest 39 with refusalName + detail - never appended), encodes, appends acks=all and answers ONCE the event
+// is committed AND applied locally, gated on its offset (D24: the control thread releases the OK only after its own
+// SecurityView applied the event and its permission refresh reached every worker).
+// Hard rules: admin-thread-owned; the in-flight request is std::variant<Idle, AwaitingCommit>; cold path.
 
 #include <rune/node/AdminChannels.h>
 #include <rune/node/SecurityApplier.h>
+#include <rune/security/SecurityEvent.h>
 
 #include <cstdint>
+#include <deque>
+#include <functional>
+#include <string>
 #include <string_view>
+#include <utility>
 #include <variant>
+#include <vector>
 
 namespace rune::replication { class PartitionReplica; struct AlterIsrResponseMsg; }
 
 namespace rune::node {
 
-struct SecurityFollower        { int32_t leaderId = -1; int32_t epoch = 0; };
+/// The largest encoded event the leader writes (the applier mirrors it in one admin→control ring message, and every
+/// `__security` subscriber's Records frame carries it whole).
+inline constexpr std::size_t kSecurityMaxEventBytes = 64 * 1024;
+
+struct SecurityFollower         { int32_t leaderId = -1; int32_t epoch = 0; };
 struct SecurityLeaderCatchingUp { int32_t epoch = 0; };
-struct SecurityLeaderServing   { int32_t epoch = 0; };
-struct SecurityHalted          { int64_t offset = -1; int32_t epoch = 0; };
+struct SecurityLeaderServing    { int32_t epoch = 0; };
+struct SecurityHalted           { int64_t offset = -1; int32_t epoch = 0; };
 using SecurityRole = std::variant<SecurityFollower, SecurityLeaderCatchingUp, SecurityLeaderServing, SecurityHalted>;
+
+/// One answer of the write path: a DdlResponse (78) for (session, corr).  `gateOffset` >= 0: an OK for the event at
+/// that offset - production posts it on the egress ring as kMsgEgressFrameGated; -1: ungated (a refusal / error).
+using SecurityRespond = std::function<void(int64_t session, int64_t corr, uint16_t code, uint64_t objectId,
+                                           uint32_t newVersion, int64_t gateOffset, std::string_view detail)>;
 
 class SecurityAdmin {
 public:
-    SecurityAdmin(SecurityApplier& applier, rune::replication::PartitionReplica* replica, int32_t selfId);
+    SecurityAdmin(SecurityApplier& applier, rune::replication::PartitionReplica* replica, SecurityRespond respond,
+                  int32_t selfId);
+
+    /// Queued, one in flight.  Beyond kMaxPending the request is answered Internal at once (never started).
+    void submit(SecurityRequest r);
+    static constexpr std::size_t kMaxPending = 256;
+    /// An appended event not committed + applied within this bound is answered the retriable NotLeader (the retry with
+    /// the same requestId dedupes to its result).  Below the client's DDL deadline (15 s).
+    static constexpr int64_t kDdlTimeoutNs = 10LL * 1'000'000'000LL;
 
     /// The replica's role (multi-node: the committed (-7, 0) assignment; single node: the consensus leader).
+    /// Demotion answers the in-flight request NotLeader (retriable).
     void onRole(const AdminRoleMsg& role);
     /// ISR v3 Step 10: the committed `__security` leadership is HELD (storage unconfirmed): never lead; ask the
     /// controller for a failover (the restart-fence bump) and serve as a follower of nobody.
@@ -41,7 +75,7 @@ public:
     /// control → admin: the controller's AlterIsrResponse for (-7, 0), verbatim.
     void onAlterIsrResponse(const rune::replication::AlterIsrResponseMsg& r);
 
-    /// One pass: derive Follower ⇄ CatchingUp ⇄ Serving ⇄ Halted from the replica and the applier.
+    /// One pass: advance the in-flight request, derive Follower ⇄ CatchingUp ⇄ Serving ⇄ Halted, start the next.
     int doWork(int64_t nowNs);
 
     [[nodiscard]] const SecurityRole& role() const noexcept { return role_; }
@@ -49,17 +83,48 @@ public:
     [[nodiscard]] std::string_view roleName() const noexcept;
     [[nodiscard]] bool isLeader() const noexcept { return std::holds_alternative<SecurityLeaderServing>(role_); }
     [[nodiscard]] rune::replication::PartitionReplica* replica() const noexcept { return replica_; }
+    [[nodiscard]] uint64_t startedCount() const noexcept { return started_; }
+    [[nodiscard]] uint64_t answeredCount() const noexcept { return answered_; }
+    [[nodiscard]] uint64_t eventsAppended() const noexcept { return eventsAppended_; }
+    [[nodiscard]] std::size_t pendingCount() const noexcept { return pending_.size(); }
+    [[nodiscard]] uint64_t pendingRefused() const noexcept { return pendingRefused_; }
+    [[nodiscard]] bool hasInFlight() const noexcept { return !std::holds_alternative<Idle>(inFlight_); }
+    [[nodiscard]] std::string_view inFlightStateName() const noexcept {
+        return hasInFlight() ? "AwaitingCommit" : "Idle";
+    }
+
+    struct Idle {};
+    struct AwaitingCommit {
+        SecurityRequest              req;
+        rune::security::SecurityEvent event;
+        int64_t                      offset    = -1;
+        int64_t                      startedNs = 0;
+    };
 
 private:
     bool updateRole_();
     void demote_(int32_t leaderId, int32_t epoch);
     void setRole_(SecurityRole next);
     [[nodiscard]] bool caughtUp_() const noexcept;
+    bool advance_(int64_t nowNs);
+    void startNext_(int64_t nowNs);
+    void startDdl_(const SecurityDdlMsg& m, int64_t nowNs, SecurityRequest& req);
+    void startBootstrap_(const SecurityBootstrapMsg& m, int64_t nowNs, SecurityRequest& req);
+    /// Preview, encode and append `e`; false = answered already.
+    bool appendEvent_(SecurityRequest& req, rune::security::SecurityEvent e, int64_t nowNs);
+    void answer_(const SecurityRequest& req, uint16_t code, std::string_view detail = {}, uint64_t objectId = 0,
+                 uint32_t newVersion = 0, int64_t gateOffset = -1);
+    [[nodiscard]] static std::pair<int64_t, int64_t> sessionCorrOf_(const SecurityRequest& req) noexcept;
 
     SecurityApplier&                     applier_;
     rune::replication::PartitionReplica* replica_;
+    SecurityRespond                      respond_;
     int32_t                              selfId_;
     SecurityRole                         role_{SecurityFollower{}};
+    std::variant<Idle, AwaitingCommit>   inFlight_;
+    std::deque<SecurityRequest>          pending_;
+    std::vector<uint8_t>                 eventBuf_;   // the encoded event (capacity reused)
+    uint64_t started_ = 0, answered_ = 0, eventsAppended_ = 0, pendingRefused_ = 0;
 };
 
 } // namespace rune::node

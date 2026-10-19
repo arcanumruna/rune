@@ -44,9 +44,9 @@ uint64_t freshEpoch(int64_t idPrefix) {
 }
 }   // namespace
 
-CatalogReadServer::CatalogReadServer(rune::replication::PartitionReplica& catalog, CatalogReadEgress send,
-                                     std::size_t maxSubs, int64_t idPrefix)
-    : catalog_(catalog), send_(std::move(send)), maxSubs_(maxSubs), idPrefix_(idPrefix),
+CatalogReadServer::CatalogReadServer(int32_t topicId, rune::replication::PartitionReplica& catalog,
+                                     CatalogReadEgress send, std::size_t maxSubs, int64_t idPrefix)
+    : topicId_(topicId), catalog_(catalog), send_(std::move(send)), maxSubs_(maxSubs), idPrefix_(idPrefix),
       readBuf_(kCatalogReadBufferBytes), frameBuf_(kCatalogReadMaxFrameBytes) {
     subs_.reserve(maxSubs_);
     // M3: every owed answer has a bounded source — refusals / re-answers (gated by
@@ -279,7 +279,7 @@ bool CatalogReadServer::sendEpochFrame_(const Sub& s, int64_t recordsBaseOffset,
     r.sessionId      = s.session;
     r.correlationId  = s.corr;
     r.subscriptionId = s.subscriptionId;
-    r.topicId        = kCatalogTopicId;
+    r.topicId        = topicId_;
     r.partition      = kCatalogPartition;
     r.baseOffset     = recordsBaseOffset;
     r.recordBatch    = std::span<const uint8_t>(epoch, kCatalogHistoryEpochBytes);
@@ -316,7 +316,7 @@ bool CatalogReadServer::sendRecords_(const Sub& s, int64_t baseOffset, std::span
     r.sessionId      = s.session;
     r.correlationId  = s.corr;
     r.subscriptionId = s.subscriptionId;
-    r.topicId        = kCatalogTopicId;
+    r.topicId        = topicId_;
     r.partition      = kCatalogPartition;
     r.baseOffset     = baseOffset;
     r.recordBatch    = batches;

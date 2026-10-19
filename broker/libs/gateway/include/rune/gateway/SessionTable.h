@@ -28,6 +28,7 @@
 // touching <Aeron.h>.
 #include <rune/gateway/CryptoState.h>
 #include <rune/gateway/SpillPool.h>
+#include <rune/gateway/SessionAuthGate.h>
 
 #include <array>
 #include <cstddef>
@@ -85,6 +86,9 @@ struct Session {
     // understand (UnknownProducerId is answered OutOfOrderSequence below
     // protocol::client::kClientVersionUnknownProducerId).  0 = unknown (oldest).
     int32_t                                        clientVersion = 0;
+    // Authentication Task 10 (ruling): what this session may do before it authenticates (SessionAuthGate.h).  Set from
+    // the ConnectResponse the client was told; SessionOpen (no gating) on an in-process / dev broker.
+    SessionAuthGate                                authGate;
     // D8b round 2: bit w set = worker w reports this session's ack publication
     // Lost (NOT_CONNECTED); lostSinceNs = when the mask last became non-zero, restarted by a Found
     // from one worker while another is still Lost (D8b-L: a successful claim is proof of life).

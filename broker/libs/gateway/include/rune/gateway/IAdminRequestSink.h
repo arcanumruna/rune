@@ -18,6 +18,7 @@
 // Namespace: rune::gateway.  C++23.
 
 #include <rune/protocol/CatalogTypes.h>
+#include <rune/protocol/client/SecurityMessages.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -39,6 +40,7 @@ struct DdlMetaView {
     std::string_view                statement;
     std::string_view                clientName;
     std::string_view                sourceAddress;   // the session's egress channel (gateway-supplied)
+    std::string_view                authenticated;   // the session's user (authentication Task 10; "" = anonymous)
     int64_t                         sessionId = 0;   // the session (gateway-supplied)
     rune::protocol::RequestId       requestId{};     // {0, 0} = a pre-v8 client (F14)
     std::optional<ReplayedFromView> replayedFrom;    // absent unless the DDL is a replay
@@ -58,6 +60,13 @@ enum class AdminSubmit : uint8_t { Accepted, RingFull, TooLarge };
 inline constexpr int64_t kCatalogSubscriptionIdBase = int64_t{1} << 62;
 [[nodiscard]] constexpr bool isCatalogSubscriptionId(int64_t subscriptionId) noexcept {
     return subscriptionId > 0 && (subscriptionId & kCatalogSubscriptionIdBase) != 0;
+}
+
+/// Authentication Task 10 (D39): `__security` subscriptions (served by the admin thread's SECOND read server) carry bit 62
+/// like every admin-log subscription AND bit 61 - a distinct id space from `__catalog`'s, so one id names one server.
+inline constexpr int64_t kSecuritySubscriptionIdBit = int64_t{1} << 61;
+[[nodiscard]] constexpr bool isSecuritySubscriptionId(int64_t subscriptionId) noexcept {
+    return isCatalogSubscriptionId(subscriptionId) && (subscriptionId & kSecuritySubscriptionIdBit) != 0;
 }
 
 struct IAdminRequestSink {
@@ -124,6 +133,17 @@ struct IAdminRequestSink {
     // catalog subscription of the session (its close).  false = ring full (the
     // gateway retries it — never dropped).
     virtual bool submitCatalogUnsubscribe(int64_t sessionId, int64_t subscriptionId) = 0;
+
+    // Authentication Task 10 (D36): the security DDL (79) and the one-time bootstrap (80), both answered by a
+    // DdlResponse (78) from the admin thread; `meta.statement` is the REDACTED statement.  The bootstrap's MAC was
+    // verified by the gateway before this call.
+    virtual AdminSubmit submitSecurityDdl(const rune::protocol::client::SecurityDdl& m, const DdlMetaView& meta) = 0;
+    virtual AdminSubmit submitSecurityBootstrap(const rune::protocol::client::SecurityBootstrap& m,
+                                                const DdlMetaView& meta) = 0;
+    // A Subscribe / Unsubscribe on `__security` (topic -7): the admin thread's second read server.  Same ring-full rules
+    // as the catalog's; an Unsubscribe of a security subscription id (isSecuritySubscriptionId) uses this one.
+    virtual bool submitSecuritySubscribe(int64_t sessionId, int64_t correlationId, int64_t fromOffset) = 0;
+    virtual bool submitSecurityUnsubscribe(int64_t sessionId, int64_t subscriptionId) = 0;
 };
 
 } // namespace rune::gateway

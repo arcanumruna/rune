@@ -13,6 +13,7 @@
 // Single-threaded test fixture: plain members, no atomics.
 
 #include <rune/node/CatalogPartition.h>
+#include <rune/node/SecurityPartition.h>
 #include <rune/node/CatalogReadServer.h>
 #include <rune/node/NodeConfig.h>
 #include <rune/protocol/RecordBatch.h>
@@ -47,14 +48,20 @@ public:
     static constexpr int32_t kLeader = 2;   // the follower rig's leader
     static constexpr int32_t kEpoch  = 1;
 
-    explicit ReadRig(const char* tag, bool asFollower = false, std::size_t maxSubs = 64)
+    /// `topicId`: the admin log the rig serves - kCatalogTopicId (default, dir `__catalog`) or kSecurityTopicId
+    /// (dir `__security`, subscription ids in the security id space).
+    explicit ReadRig(const char* tag, bool asFollower = false, std::size_t maxSubs = 64,
+                     int32_t topicId = kCatalogTopicId)
         : root_(std::filesystem::temp_directory_path() /
                 (std::string("rune_readrig_") + tag + "_" + std::to_string(::getpid()) + "_" +
                  std::to_string(read_rig_detail::gSeq++))),
           asFollower_(asFollower),
-          replica_(open_(root_ / "__catalog", log_, asFollower ? Mode::Follower : Mode::Leader)),
-          server(*replica_, [this](const CatalogReadFrameHead& h, std::span<const uint8_t> f) { return record_(h, f); },
-                 maxSubs, /*idPrefix=*/int64_t{kSelf + 1} << 40) {
+          topicId_(topicId),
+          replica_(open_(root_ / (topicId == kSecurityTopicId ? "__security" : "__catalog"), log_,
+                         asFollower ? Mode::Follower : Mode::Leader)),
+          server(topicId, *replica_, [this](const CatalogReadFrameHead& h, std::span<const uint8_t> f) { return record_(h, f); },
+                 maxSubs, /*idPrefix=*/(int64_t{kSelf + 1} << 40) |
+                              (topicId == kSecurityTopicId ? rune::gateway::kSecuritySubscriptionIdBit : int64_t{0})) {
         frames.reserve(4096);
         if (asFollower_) source_ = open_(root_ / "source", sourceLog_, Mode::Leader);
     }
@@ -210,6 +217,7 @@ private:
     enum class Mode { Leader, Follower };
     std::filesystem::path root_;
     bool                  asFollower_;
+    int32_t               topicId_;
     int64_t followerHw_ = 0;
     int64_t now_        = 1'000'000;
     int     seq_        = 0;
@@ -255,7 +263,7 @@ private:
         NodeConfig nc;
         nc.nodeId = kSelf;
         const bool solo = m == Mode::Leader;
-        rune::replication::PartitionConfig cfg = makeCatalogPartitionConfig(nc, solo ? 1 : 2);
+        rune::replication::PartitionConfig cfg = makeAdminLogPartitionConfig(nc, solo ? 1 : 2, topicId_);
         const std::vector<rune::replication::NodeId> replicas =
             solo ? std::vector<rune::replication::NodeId>{kSelf}
                  : std::vector<rune::replication::NodeId>{kSelf, kLeader};
@@ -279,11 +287,11 @@ private:
     void apply_(std::span<const uint8_t> records, int64_t hw) {
         rune::replication::FetchResponseMsg resp{};
         resp.leaderEpoch    = kEpoch;
-        resp.partition      = kCatalogPartition;
+        resp.partition      = 0;
         resp.highWatermark  = hw;
         resp.logStartOffset = 0;
         resp.errorCode      = 0;
-        resp.topicId        = kCatalogTopicId;
+        resp.topicId        = topicId_;
         resp.records        = records;
         replica_->applyReplicated(resp);
         (void)replica_->doWork(now_ += 1'000'000);

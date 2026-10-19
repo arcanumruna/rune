@@ -4,6 +4,7 @@
 #include <rune/gateway/ConnectDowngradePolicy.h>
 #include <rune/gateway/CryptoFrame.h>
 #include <rune/gateway/RequestRejection.h>
+#include <rune/gateway/BootstrapProof.h>
 #include <cassert>
 #include <rune_fr/FlightRecorder.h>
 #include <rune/gateway/TopicRegistry.h>
@@ -1219,6 +1220,8 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
         case pc::TemplateId::AlterTopicConfig:
         case pc::TemplateId::DropView:
         case pc::TemplateId::AlterView:
+        case pc::TemplateId::SecurityDdl:
+        case pc::TemplateId::SecurityBootstrap:
         case pc::TemplateId::GetViewRow:
             if (const auto hdr = pc::MessageHeader::decode(buf, len)) {
                 sessions_.touch(hdr->sessionId, nowNs_);
@@ -1227,6 +1230,10 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
         default:
             break;
     }
+
+    // Authentication Task 10 (D13 + the bootstrap-window ruling): while the broker requires authentication an
+    // unauthenticated session may only keep itself alive - and, in the bootstrap window, send SecurityBootstrap.
+    if (authMode_ == rune::gateway::GatewayAuthMode::Required && authGateRefuses_(tid, buf, len)) return true;
 
     switch (tid) {
         case pc::TemplateId::Connect:
@@ -1304,6 +1311,13 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
             break;
         case pc::TemplateId::AlterView:
             handleAlterView(buf, len);
+            break;
+        // Authentication Task 10: security DDL (79) and the one-time bootstrap (80).
+        case pc::TemplateId::SecurityDdl:
+            handleSecurityDdl(buf, len);
+            break;
+        case pc::TemplateId::SecurityBootstrap:
+            handleSecurityBootstrap(buf, len);
             break;
         // Task 20: point read of a materialized view row — routed to the owning
         // worker via the same op/return plumbing as PushRead.
@@ -2397,6 +2411,17 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
             resp.code              = static_cast<int16_t>(pc::ErrorCode::OK);
             resp.leaderMemberId    = thisNodeId_;
             resp.assignedSessionId = pending.sessionId;
+            // Authentication Task 10 (D11): a v9 client of an authenticating broker is told how it authenticates and
+            // where it stands.  Bootstrap window (Required, `__security` holds no Bootstrap event): Anonymous - it may
+            // send ONLY SecurityBootstrap.  Otherwise MustAuthenticate.  An in-process broker keeps the pre-v9 frame.
+            pending.authGate = newSessionGate_(pending.clientVersion);
+            if (authMode_ != rune::gateway::GatewayAuthMode::InProcess && pc::clientUnderstandsAuth(pending.clientVersion)) {
+                resp.v9 = true;
+                resp.authMode = authMode_ == rune::gateway::GatewayAuthMode::Required ? pc::AuthMode::Required
+                                                                                       : pc::AuthMode::DevDisabled;
+                resp.authState = std::holds_alternative<rune::gateway::SessionMustAuthenticate>(pending.authGate)
+                                     ? pc::AuthState::MustAuthenticate : pc::AuthState::Anonymous;
+            }
             if (pending.tls) {
                 // client<->broker TLS/AEAD (Task 7): offer the chosen cipher +
                 // the server's first handshake flight (ServerHello/cert/
@@ -2449,7 +2474,7 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
         // subscribe.
         sessions_.add(pending.sessionId, std::move(pub), nowNs,
                       pending.egressChannel, pending.egressStreamId,
-                      pending.clientVersion);
+                      pending.clientVersion).authGate = pending.authGate;
 
         it = pendingConnects_.erase(it);
     }
@@ -2596,6 +2621,7 @@ void ClientGateway::handleHandshakeContinue_(const uint8_t* buf, std::size_t len
     Session& session = sessions_.add(pending.sessionId, std::move(pending.resolvedPub), nowNs,
                                       pending.egressChannel, pending.egressStreamId,
                                       pending.clientVersion);
+    session.authGate = pending.authGate;
     session.crypto.cipher = keys.cipher;
     session.crypto.recv.emplace(keys.cipher, keys.c2b, keys.c2bPrefix);  // OPENs client->broker
     session.crypto.send.emplace(keys.cipher, keys.b2c, keys.b2cPrefix);  // SEALs broker->client
@@ -4405,6 +4431,12 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
         handleCatalogSubscribe_(*session, msg);
         return;
     }
+    // Authentication Task 10 (D39): `__security` is read the same way, from the SECOND read server of any broker (the
+    // reader's ADMIN check is Task 12's).
+    if (msg.topicId == pc::kSecurityTopicId) [[unlikely]] {
+        handleSecuritySubscribe_(*session, msg);
+        return;
+    }
 
     // GB-4 / MD1-9: Leadership check — data ops MUST reach the partition leader.
     //
@@ -4844,11 +4876,56 @@ void ClientGateway::handleCatalogSubscribe_(Session& session, const pc::Subscrib
     ++catalogSubscribesForwarded_;
 }
 
+// ---------------------------------------------------------------------------
+// Authentication Task 10: a Subscribe on `__security` (topic id -7) - handleCatalogSubscribe_'s contract for the
+// second read server.  A pre-v9 session as before (UnknownTopic), partition != 0 / key-resolved InvalidRequest, no
+// admin thread Internal, a full admin ring the retriable NotLeader.
+// ---------------------------------------------------------------------------
+void ClientGateway::handleSecuritySubscribe_(Session& session, const pc::Subscribe& msg)
+{
+    auto answer = [&](pc::ErrorCode ec) {
+        pc::SubscribeResponse resp;
+        resp.sessionId      = msg.sessionId;
+        resp.correlationId  = msg.correlationId;
+        resp.errorCode      = static_cast<int16_t>(ec);
+        resp.partition      = msg.partition;
+        resp.subscriptionId = 0;
+        const std::size_t n = resp.encode(scratch_.data());
+        sendAnswer_(session, scratch_.data(), n);
+    };
+    if (!pc::clientUnderstandsAuth(session.clientVersion)) {
+        answer(pc::ErrorCode::UnknownTopic);
+        return;
+    }
+    if (msg.partitionKnown != 1 || msg.partition != 0) {
+        answer(pc::ErrorCode::InvalidRequest);
+        return;
+    }
+    if (adminSink_ == nullptr) {
+        answer(pc::ErrorCode::Internal);
+        return;
+    }
+    if (!adminSink_->submitSecuritySubscribe(msg.sessionId, msg.correlationId, msg.fromOffset)) {
+        pc::ErrorResponse er;
+        er.sessionId     = msg.sessionId;
+        er.correlationId = msg.correlationId;
+        er.code          = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+        const std::size_t n = er.encode(scratch_.data());
+        sendAnswer_(session, scratch_.data(), n);
+        return;
+    }
+    ++securitySubscribesForwarded_;
+}
+
 void ClientGateway::forwardCatalogUnsubscribe_(int64_t sid, int64_t subscriptionId)
 {
     if (adminSink_ == nullptr) return;
     // FIFO behind any already waiting (a close after a single unsubscribe stays after it).
-    if (pendingCatalogUnsubs_.empty() && adminSink_->submitCatalogUnsubscribe(sid, subscriptionId)) return;
+    // A `__security` subscription id names the second read server (its own request-ring message).
+    const bool security = subscriptionId != -1 && rune::gateway::isSecuritySubscriptionId(subscriptionId);
+    if (pendingCatalogUnsubs_.empty() &&
+        (security ? adminSink_->submitSecurityUnsubscribe(sid, subscriptionId)
+                  : adminSink_->submitCatalogUnsubscribe(sid, subscriptionId))) return;
     // M3: a close supersedes the session's waiting single unsubscribes; duplicates coalesce.
     if (subscriptionId == -1)
         std::erase_if(pendingCatalogUnsubs_, [sid](const PendingCatalogUnsubscribe& p) { return p.sessionId == sid; });
@@ -4885,8 +4962,11 @@ int ClientGateway::flushPendingCatalogUnsubs_()
 {
     std::size_t sent = 0;
     while (sent < pendingCatalogUnsubs_.size() &&
-           adminSink_->submitCatalogUnsubscribe(pendingCatalogUnsubs_[sent].sessionId,
-                                                pendingCatalogUnsubs_[sent].subscriptionId))
+           (rune::gateway::isSecuritySubscriptionId(pendingCatalogUnsubs_[sent].subscriptionId)
+                ? adminSink_->submitSecurityUnsubscribe(pendingCatalogUnsubs_[sent].sessionId,
+                                                        pendingCatalogUnsubs_[sent].subscriptionId)
+                : adminSink_->submitCatalogUnsubscribe(pendingCatalogUnsubs_[sent].sessionId,
+                                                       pendingCatalogUnsubs_[sent].subscriptionId)))
         ++sent;
     if (sent != 0)
         pendingCatalogUnsubs_.erase(pendingCatalogUnsubs_.begin(),
@@ -7103,23 +7183,24 @@ void ClientGateway::answerAdminSubmit_(const uint8_t* buf, std::size_t len, rune
 // knows another leader (logged at warn — those frames carry no message),
 // Internal when halted, NotLeader when no leader is known.
 // ---------------------------------------------------------------------------
-bool ClientGateway::ddlRouted_(const uint8_t* buf, std::size_t len)
+bool ClientGateway::ddlRouted_(const uint8_t* buf, std::size_t len, const rune::gateway::CatalogRoute& route,
+                               const char* log)
 {
-    if (std::holds_alternative<rune::gateway::RouteLocalLeader>(catalogRoute_)) [[likely]] return false;
+    if (std::holds_alternative<rune::gateway::RouteLocalLeader>(route)) [[likely]] return false;
     const auto hdr = pc::MessageHeader::decode(buf, len);
     if (!hdr) return false;                        // the handler answers / notes it
     Session* session = sessions_.find(hdr->sessionId);
     if (!session) return false;                    // the handler notes it (no session to answer)
     ++ddlRoutedAway_;
-    const auto* halted = std::get_if<rune::gateway::RouteHalted>(&catalogRoute_);
-    const auto* remote = std::get_if<rune::gateway::RouteRemote>(&catalogRoute_);
+    const auto* halted = std::get_if<rune::gateway::RouteHalted>(&route);
+    const auto* remote = std::get_if<rune::gateway::RouteRemote>(&route);
 
     if (!pc::clientUnderstandsCatalogDdl(session->clientVersion)) {
         uint16_t code = static_cast<uint16_t>(pc::ErrorCode::NotLeader);
         const char* why = "pre-v8 DDL: no catalog leader known";
         if (halted != nullptr) {
             code = static_cast<uint16_t>(pc::ErrorCode::Internal);
-            why  = "pre-v8 DDL: catalog apply halted on this broker";
+            why  = "pre-v8 DDL: security/catalog apply halted on this broker";
         } else if (remote != nullptr) {
             code = static_cast<uint16_t>(pc::ErrorCode::InvalidRequest);
             why  = "client too old for cluster DDL routing; upgrade";
@@ -7139,8 +7220,8 @@ bool ClientGateway::ddlRouted_(const uint8_t* buf, std::size_t len)
     char haltedText[64];
     if (halted != nullptr) {
         // Spec §9: never a redirect — the leader may be healthy, THIS broker is not.
-        const int n = std::snprintf(haltedText, sizeof haltedText, "catalog apply halted at offset %lld",
-                                    static_cast<long long>(halted->offset));
+        const int n = std::snprintf(haltedText, sizeof haltedText, "%s apply halted at offset %lld",
+                                    log, static_cast<long long>(halted->offset));
         err.code    = static_cast<int16_t>(pc::ErrorCode::Internal);
         err.message = std::string_view(haltedText, n > 0 ? static_cast<std::size_t>(n) : 0u);
     } else if (remote != nullptr && !remote->leaderClientEndpoint.empty()) {
@@ -7157,7 +7238,7 @@ bool ClientGateway::ddlRouted_(const uint8_t* buf, std::size_t len)
     }
     const std::size_t n = err.encode(scratch_.data());
     spdlog::debug("ClientGateway: DDL tid={} session={} corr={} routed ({}): code {}", hdr->templateId,
-                  hdr->sessionId, hdr->correlationId, rune::gateway::catalogRouteName(catalogRoute_), err.code);
+                  hdr->sessionId, hdr->correlationId, rune::gateway::catalogRouteName(route), err.code);
     sendAnswer_(*session, scratch_.data(), n);
     return true;
 }
@@ -7375,6 +7456,146 @@ void ClientGateway::handleAlterView(const uint8_t* buf, std::size_t len)
             return adminSink_->submitAlterView(m.sessionId, m.correlationId, m.viewName, m.keyField,
                                                m.persistence, m.expectedVersion, m.planBlob, m.planLen, meta);
         });
+}
+
+// ---------------------------------------------------------------------------
+// Authentication Task 10 (ruling): the session gate of an authenticating broker.
+// ---------------------------------------------------------------------------
+rune::gateway::SessionAuthGate ClientGateway::newSessionGate_(int32_t clientVersion) const
+{
+    using namespace rune::gateway;
+    if (authMode_ != GatewayAuthMode::Required) return SessionOpen{};
+    // A pre-v9 client cannot authenticate at all (Task 11 refuses it at the handshake); it is never offered bootstrap.
+    if (!pc::clientUnderstandsAuth(clientVersion)) return SessionMustAuthenticate{};
+    // The bootstrap window: no Bootstrap event applied (no ENABLED security admin).  A missing view is a
+    // misconfiguration - the window is closed, never open by default.
+    if (securityView_ != nullptr && !securityView_->halted() && !securityView_->state().hasSecurityAdmin())
+        return SessionBootstrapOnly{};
+    return SessionMustAuthenticate{};
+}
+
+bool ClientGateway::authGateRefuses_(pc::TemplateId tid, const uint8_t* buf, std::size_t len)
+{
+    using namespace rune::gateway;
+    switch (tid) {   // the session level: always allowed
+        case pc::TemplateId::Connect:
+        case pc::TemplateId::HandshakeContinue:
+        case pc::TemplateId::Keepalive:
+        case pc::TemplateId::Ping:
+        case pc::TemplateId::Disconnect:
+            return false;
+        default:
+            break;
+    }
+    const auto hdr = pc::MessageHeader::decode(buf, len);
+    if (!hdr) return false;                               // the handler answers / notes it
+    Session* session = sessions_.find(hdr->sessionId);
+    if (!session) return false;                           // the handler notes it (no session to answer)
+    bool refuse = true;
+    if (std::holds_alternative<SessionOpen>(session->authGate)) {
+        refuse = false;
+    } else if (std::holds_alternative<SessionBootstrapOnly>(session->authGate)) {
+        // Only SecurityBootstrap, and only while `__security` still holds no Bootstrap event (a closed window refuses
+        // even the session that was offered it).  Its cluster-key MAC is verified by handleSecurityBootstrap (D4).
+        refuse = !(tid == pc::TemplateId::SecurityBootstrap && securityView_ != nullptr && !securityView_->halted() &&
+                   !securityView_->state().hasSecurityAdmin());
+    }
+    if (!refuse) return false;
+    ++authGateRefusals_;
+    if (authGateRefusals_ % 1024 == 1)
+        spdlog::warn("ClientGateway: session {} sent template {} before authenticating - answered AuthenticationFailed and "
+                     "ended (D13; refusals so far: {})", hdr->sessionId, hdr->templateId, authGateRefusals_);
+    if (!rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed), "authentication required")) {
+        // The request has no response type of its own: the session-level ErrorResponse (control ops), so the client
+        // is never left waiting.
+        pc::ErrorResponse er;
+        er.sessionId     = hdr->sessionId;
+        er.correlationId = hdr->correlationId;
+        er.code          = static_cast<int16_t>(pc::ErrorCode::AuthenticationFailed);
+        const std::size_t n = er.encode(scratch_.data());
+        sendAnswer_(*session, scratch_.data(), n);
+    }
+    (void)closeSession_(hdr->sessionId);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Authentication Task 10 (D36): SecurityDdl (79) and SecurityBootstrap (80) - the same copy-and-return discipline as
+// the catalog DDL; answered by a DdlResponse (78) from the admin thread (an OK only once THIS broker enforces the
+// event - the SecurityAnswerGate).  Routed by the `__security` route exactly like catalog DDL: a follower answers
+// Redirect to the leader's client endpoint.  A pre-v9 session can never reach this (Task 11's version gate); until
+// then it is refused here.
+// ---------------------------------------------------------------------------
+void ClientGateway::handleSecurityDdl(const uint8_t* buf, std::size_t len)
+{
+    if (ddlRouted_(buf, len, securityRoute_, "security")) return;
+    if (!adminSink_) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal), "SecurityDdl: admin sink not wired");
+        return;
+    }
+    auto msgOpt = pc::SecurityDdl::decode(buf, len);
+    if (!msgOpt) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), "SecurityDdl body undecodable");
+        return;
+    }
+    const pc::SecurityDdl& m = *msgOpt;
+    Session* session = sessions_.find(m.sessionId);
+    if (!session) {
+        noteUnanswerable_(buf, len, "SecurityDdl for unknown session");
+        return;
+    }
+    if (!pc::clientUnderstandsAuth(session->clientVersion)) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest),
+                             "SecurityDdl needs client version 9");
+        return;
+    }
+    answerAdminSubmit_(buf, len, adminSink_->submitSecurityDdl(m, ddlMetaOf_(&m.ext, m.sessionId, *session)),
+                       "SecurityDdl: admin ring full", "SecurityDdl: request larger than the admin ring message");
+}
+
+void ClientGateway::handleSecurityBootstrap(const uint8_t* buf, std::size_t len)
+{
+    if (ddlRouted_(buf, len, securityRoute_, "security")) return;
+    if (!adminSink_) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal), "SecurityBootstrap: admin sink not wired");
+        return;
+    }
+    auto msgOpt = pc::SecurityBootstrap::decode(buf, len);
+    if (!msgOpt) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), "SecurityBootstrap body undecodable");
+        return;
+    }
+    const pc::SecurityBootstrap& m = *msgOpt;
+    Session* session = sessions_.find(m.sessionId);
+    if (!session) {
+        noteUnanswerable_(buf, len, "SecurityBootstrap for unknown session");
+        return;
+    }
+    if (!pc::clientUnderstandsAuth(session->clientVersion)) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest),
+                             "SecurityBootstrap needs client version 9");
+        return;
+    }
+    // D4: a fresh cluster cannot be hijacked by whoever reaches it first - the request must prove possession of the
+    // cluster key (current or next).  Verified HERE with this thread's own copy of the keys, before the admin thread
+    // is involved; the refusal is explicit, and logged with where it came from.
+    const BootstrapProof proof = verifyBootstrapProof(m, clusterKeys_ ? &*clusterKeys_ : nullptr, bootstrapMacScratch_);
+    if (proof != BootstrapProof::Ok) {
+        ++bootstrapsRefused_;
+        spdlog::warn("security: bootstrap refused from {}: bad cluster-key proof{}", session->egressChannel,
+                     proof == BootstrapProof::NoKey ? " (this broker holds no cluster key: authentication is not enabled)" : "");
+        pc::DdlResponse r;
+        r.sessionId     = m.sessionId;
+        r.correlationId = m.correlationId;
+        r.errorCode     = static_cast<uint16_t>(pc::ErrorCode::InvalidRequest);
+        r.detail        = proof == BootstrapProof::NoKey ? "this broker has no cluster key: authentication is not enabled"
+                                                         : "bootstrap proof does not match this cluster's key";
+        const std::size_t n = r.encode(scratch_.data());
+        sendAnswer_(*session, scratch_.data(), n);
+        return;
+    }
+    answerAdminSubmit_(buf, len, adminSink_->submitSecurityBootstrap(m, ddlMetaOf_(nullptr, m.sessionId, *session)),
+                       "SecurityBootstrap: admin ring full", "SecurityBootstrap: request larger than the admin ring message");
 }
 
 // ---------------------------------------------------------------------------

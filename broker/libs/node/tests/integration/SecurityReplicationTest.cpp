@@ -182,3 +182,86 @@ TEST(SecurityReplicationRegression, ATamperedRecordHaltsTheApplierAndTheControlV
     EXPECT_EQ(m.halted, 2) << "the halt counter is (halted offset + 1)";
     n.stop();
 }
+
+// ===========================================================================
+// Authentication Task 10 (D36 / D24): the security write path through real brokers.
+// ===========================================================================
+namespace {
+namespace pc = rune::protocol::client;
+
+std::vector<uint8_t> createRoleFrame(int64_t sid, int64_t corr, std::string_view role, uint64_t ridLo) {
+    pc::SecurityDdl m;
+    const std::string statement = "CREATE ROLE " + std::string(role) + ";";   // DdlExtension holds a view: keep it alive
+    m.sessionId = sid;
+    m.correlationId = corr;
+    m.ext.clientName = "sec-wire-test";
+    m.ext.statement = statement;
+    m.ext.requestId = {0x5EC7, ridLo};
+    m.kind = pc::SecurityOpKind::CreateRole;
+    m.name = role;
+    std::vector<uint8_t> buf(m.encodedSize());
+    buf.resize(m.encode(buf.data()));
+    return buf;
+}
+}  // namespace
+
+// A follower redirects a security DDL to the __security leader's client endpoint, exactly like catalog DDL; the leader
+// answers OK only once ITS OWN control-thread view applied the event (D24), and every broker converges on it.
+TEST(SecurityReplicationRegression, SecurityDdlViaAFollowerIsRedirectedToTheLeader) {
+    ThreeNodes c = ThreeNodes::start("sec_ddl_redirect");
+    ASSERT_TRUE(awaitSecurityLeader(c, 30s));
+    const int32_t leader = settledSecurityLeader(c);
+    ASSERT_GT(leader, 0);
+    const int32_t follower = leader == 1 ? 2 : 1;
+    ShardTestClient cl(c.clientsDir->path / "wire");
+    cl.keepSessionsAlive(true);
+    cl.setClientVersion(pc::kClientVersionAuth);
+
+    // 1. Via the follower: Redirect (3) naming the leader's client endpoint.
+    int64_t fsid = -1;
+    for (const auto dl = std::chrono::steady_clock::now() + 30s; fsid < 0 && std::chrono::steady_clock::now() < dl;) {
+        fsid = cl.connect(c.clientChannel(follower), kClientStream);
+        if (fsid < 0) std::this_thread::sleep_for(50ms);
+    }
+    ASSERT_GT(fsid, 0);
+    const int64_t corr1 = cl.nextCorrelationId();
+    const auto f1 = createRoleFrame(fsid, corr1, "world_server", 1);
+    ASSERT_TRUE(cl.send(c.clientChannel(follower), kClientStream, f1.data(), f1.size()));
+    const auto a1 = cl.awaitAnyDdlAnswer(corr1, std::chrono::steady_clock::now() + 20s);
+    ASSERT_TRUE(a1.has_value()) << "a follower must answer, never hang";
+    EXPECT_EQ(a1->code, static_cast<int16_t>(pc::ErrorCode::Redirect));
+    EXPECT_EQ(a1->message, c.clientChannel(leader)) << "the __security leader's client endpoint";
+
+    // 2. Via the leader: DdlResponse OK; the leader's own view already holds the event when the OK arrives.
+    int64_t lsid = -1;
+    for (const auto dl = std::chrono::steady_clock::now() + 30s; lsid < 0 && std::chrono::steady_clock::now() < dl;) {
+        lsid = cl.connect(c.clientChannel(leader), kClientStream);
+        if (lsid < 0) std::this_thread::sleep_for(50ms);
+    }
+    ASSERT_GT(lsid, 0);
+    const int64_t corr2 = cl.nextCorrelationId();
+    const auto f2 = createRoleFrame(lsid, corr2, "world_server", 2);
+    ASSERT_TRUE(cl.send(c.clientChannel(leader), kClientStream, f2.data(), f2.size()));
+    const auto a2 = cl.awaitDdl(corr2, std::chrono::steady_clock::now() + 20s);
+    ASSERT_TRUE(a2.has_value());
+    EXPECT_EQ(a2->errorCode, 0) << a2->detail;
+    EXPECT_NE(a2->objectId, 0u);
+    EXPECT_EQ(a2->newVersion, 1u);
+    EXPECT_GE(c.node(leader).securityViewForTest().appliedOffset, 0)
+        << "the OK left only after THIS broker's view applied the event (D24)";
+
+    // 3. Every broker converges on the same state.
+    ASSERT_TRUE(awaitViewsAt(c, 0, 20s));
+    const uint64_t digest = c.node(leader).securityViewForTest().digest;
+    for (BrokerNode* n : c.live()) EXPECT_EQ(n->securityViewForTest().digest, digest) << "node " << n->nodeIdForTest();
+
+    // 4. The retry of the SAME request (same requestId) gets its original result - applied once.
+    const int64_t corr3 = cl.nextCorrelationId();
+    const auto f3 = createRoleFrame(lsid, corr3, "world_server", 2);
+    ASSERT_TRUE(cl.send(c.clientChannel(leader), kClientStream, f3.data(), f3.size()));
+    const auto a3 = cl.awaitDdl(corr3, std::chrono::steady_clock::now() + 20s);
+    ASSERT_TRUE(a3.has_value());
+    EXPECT_EQ(a3->errorCode, 0);
+    EXPECT_EQ(a3->objectId, a2->objectId);
+    EXPECT_EQ(c.node(leader).securityViewForTest().appliedOffset, 0) << "no second event";
+}

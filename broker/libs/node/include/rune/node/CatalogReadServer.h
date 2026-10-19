@@ -158,7 +158,10 @@ public:
 
     /// \param idPrefix the node's cluster id prefix ((nodeId + 1) << 40, as the
     ///                 gateway's): catalog subscription ids stay cluster-unique.
-    CatalogReadServer(rune::replication::PartitionReplica& catalog, CatalogReadEgress send,
+    /// \param topicId  the admin log this server serves (kCatalogTopicId or kSecurityTopicId, authentication Task 10):
+    ///                 stamped on every Records frame.  The ids of a `__security` server must carry
+    ///                 rune::gateway::kSecuritySubscriptionIdBit in `idPrefix` (a distinct id space).
+    CatalogReadServer(int32_t topicId, rune::replication::PartitionReplica& catalog, CatalogReadEgress send,
                       std::size_t maxSubs = 64, int64_t idPrefix = 0);
 
     /// A catalog Subscribe.  fromOffset −2 (earliest) → 0; −1 (latest) or any
@@ -277,6 +280,7 @@ private:
     static constexpr std::size_t kIntakeSlack = 32;   // > one request-ring drain (16)
     int  flushOwed_();
 
+    int32_t                              topicId_;
     rune::replication::PartitionReplica& catalog_;
     CatalogReadEgress                    send_;
     std::size_t                          maxSubs_;

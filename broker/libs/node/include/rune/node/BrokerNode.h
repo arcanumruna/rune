@@ -71,6 +71,7 @@
 #include <rune/codec/Serialize.h>
 #include <rune/node/AdminControlPlane.h>
 #include <rune/node/DdlAnswerGate.h>
+#include <rune/node/SecurityAnswerGate.h>
 #include <rune/node/SchemaFanout.h>
 #include <rune/node/TopicDroppedFanout.h>
 #include <rune/node/ViewSnapshotChannel.h>
@@ -366,6 +367,43 @@ public:
         return encodeCatalogUnsubscribe(requestRing_, CatalogUnsubscribeMsg{sessionId, subscriptionId});
     }
 
+    // ── Authentication Task 10 (D36): security DDL / bootstrap / `__security` reads (gateway → admin) ───────────
+    rune::gateway::AdminSubmit submitSecurityDdl(const rune::protocol::client::SecurityDdl& w,
+                                                 const rune::gateway::DdlMetaView& meta) override {
+        SecurityDdlMsg m;
+        m.session = w.sessionId;
+        m.corr    = w.correlationId;
+        m.meta    = ownMeta_(meta);
+        m.kind    = static_cast<uint8_t>(w.kind);
+        m.name.assign(w.name);
+        m.change            = static_cast<uint8_t>(w.change);
+        m.passwordIndex     = w.passwordIndex;
+        m.terminateSessions = w.terminateSessions;
+        if (w.hasVerifier()) ownVerifier_(w.verifier, m.verifier);
+        m.granteeKind = w.granteeKind; m.op = w.op; m.resourceType = w.resourceType; m.patternKind = w.patternKind;
+        m.pattern.assign(w.pattern);
+        m.roleName.assign(w.roleName);
+        return submitDdl_(m);
+    }
+    rune::gateway::AdminSubmit submitSecurityBootstrap(const rune::protocol::client::SecurityBootstrap& w,
+                                                       const rune::gateway::DdlMetaView& meta) override {
+        SecurityBootstrapMsg m;
+        m.session = w.sessionId;
+        m.corr    = w.correlationId;
+        m.meta    = ownMeta_(meta);
+        m.adminName.assign(w.adminName);
+        ownVerifier_(w.verifier, m.verifier);
+        m.fakeSaltSeed = w.fakeSaltSeed;
+        m.nonce        = w.nonce;
+        return submitDdl_(m);
+    }
+    bool submitSecuritySubscribe(int64_t sessionId, int64_t correlationId, int64_t fromOffset) override {
+        return encodeSecuritySubscribe(requestRing_, CatalogSubscribeMsg{sessionId, correlationId, fromOffset});
+    }
+    bool submitSecurityUnsubscribe(int64_t sessionId, int64_t subscriptionId) override {
+        return encodeSecurityUnsubscribe(requestRing_, CatalogUnsubscribeMsg{sessionId, subscriptionId});
+    }
+
     int doWork(int64_t nowNs) noexcept override {
         int work = 0;
 
@@ -512,6 +550,21 @@ public:
                 else reportBadRequestFrame_(tid, n);
                 break;
             }
+            // Authentication Task 10: the security write path and `__security` reads.
+            case kMsgSecurityDdl:       worker_.submitSecurity(decodeSecurityDdl(p, n)); break;
+            case kMsgSecurityBootstrap: worker_.submitSecurity(decodeSecurityBootstrap(p, n)); break;
+            case kMsgSecuritySubscribe: {
+                CatalogSubscribeMsg m;
+                if (decodeCatalogSubscribe(p, n, m)) worker_.securitySubscribe(m);
+                else reportBadRequestFrame_(tid, n);
+                break;
+            }
+            case kMsgSecurityUnsubscribe: {
+                CatalogUnsubscribeMsg m;
+                if (decodeCatalogUnsubscribe(p, n, m)) worker_.securityUnsubscribe(m);
+                else reportBadRequestFrame_(tid, n);
+                break;
+            }
             default:
                 if (badRequestFrames_++ % 1024 == 0)
                     spdlog::error("AdminWorkerAgent: request-ring frame type={} len={} refused (unknown; refused so "
@@ -576,6 +629,37 @@ public:
         if (egressBacklog_.empty() && tryPostEgress_(session, frame, n)) return true;
         if (!egressBacklog_.push(session, frame, n)) [[unlikely]] haltEgressBacklogFull_();
         return true;
+    }
+    /// Authentication Task 10 (D24) - ADMIN thread only (deps.respondSecurity).  A DdlResponse for a security DDL /
+    /// bootstrap.  `gateOffset` >= 0 (an OK): posted as kMsgEgressFrameGated [session][eventOffset][frame] - the control
+    /// thread releases it only once ITS SecurityView applied that event and its refresh reached the workers; otherwise
+    /// an ordinary egress frame.  The detail is cut to what one frame holds (never a refused answer).
+    void postSecurityResponse(int64_t session, int64_t corr, uint16_t code, uint64_t objectId, uint32_t newVersion,
+                              int64_t gateOffset, std::string_view detail) {
+        namespace pc = rune::protocol::client;
+        pc::DdlResponse r;
+        r.sessionId     = session;
+        r.correlationId = corr;
+        r.errorCode     = code;
+        r.objectId      = objectId;
+        r.newVersion    = newVersion;
+        r.gateTopicId   = -1;
+        const std::size_t fixed = pc::MessageHeader::ENCODED_SIZE + pc::DdlResponse::BODY_FIXED + 2u;
+        r.detail = detail.substr(0, std::min<std::size_t>({detail.size(), 0xFFFFu, 1024u, maxEgressFrameBytes() - fixed - 8u}));
+        if (gateOffset < 0) {
+            const std::size_t n = r.encode(egressStage_.data());
+            [[maybe_unused]] const bool posted = n > 0 && postEgressFrame(session, egressStage_.data(), n);
+            assert(posted && "a clamped DdlResponse always fits one admin egress message");
+            return;
+        }
+        // [eventOffset:i64][frame], keyed with the gated bit; the ring/backlog prepend the session.
+        admin_wire::putI64(egressStage_.data(), gateOffset);
+        const std::size_t n = r.encode(egressStage_.data() + 8);
+        const std::size_t total = 8 + n;
+        if (n == 0 || 8 + total > static_cast<std::size_t>(egressRing_.maxMsgLength())) [[unlikely]] return;
+        const int64_t key = session | kGatedKeyBit;
+        if (egressBacklog_.empty() && tryPostEgress_(key, egressStage_.data(), total)) return;
+        if (!egressBacklog_.push(key, egressStage_.data(), total)) [[unlikely]] haltEgressBacklogFull_();
     }
     /// ADMIN thread only (deps.respondGet).  Encode a TopicSchemaResponse in place
     /// in the egress ring (or, ring full / backlog ahead, via the preallocated
@@ -762,6 +846,7 @@ private:
         m.statement.assign(v.statement);
         m.clientName.assign(v.clientName);
         m.sourceAddress.assign(v.sourceAddress);
+        m.authenticated.assign(v.authenticated);
         m.sessionId       = v.sessionId;
         m.requestId       = v.requestId;
         if (v.replayedFrom)
@@ -769,6 +854,13 @@ private:
                                                          v.replayedFrom->offset,
                                                          std::string(v.replayedFrom->principal)};
         return m;
+    }
+    static void ownVerifier_(const rune::protocol::client::VerifierWire& w, rune::security::ScramVerifier& out) {
+        out.salt.assign(reinterpret_cast<const uint8_t*>(w.salt.data()),
+                        reinterpret_cast<const uint8_t*>(w.salt.data()) + w.salt.size());
+        out.iterations = w.iterations;
+        if (w.storedKey.size() == out.storedKey.size()) std::memcpy(out.storedKey.data(), w.storedKey.data(), out.storedKey.size());
+        if (w.serverKey.size() == out.serverKey.size()) std::memcpy(out.serverKey.data(), w.serverKey.data(), out.serverKey.size());
     }
     /// Encode a DDL on the request ring: TooLarge when it can never fit one ring
     /// message (an explicit, permanent answer), RingFull on back-pressure.
@@ -1082,8 +1174,14 @@ private:
         std::abort();
     }
 
-    bool tryPostEgress_(int64_t session, const uint8_t* frame, std::size_t n) {
-        const auto idx = egressRing_.tryClaim(kMsgEgressFrame, 8 + n);
+    /// A backlog key with this bit set is a GATED frame (authentication Task 10): its data is [eventOffset:i64][frame]
+    /// and it leaves as kMsgEgressFrameGated.  Session ids are cluster-unique and positive: the top bit is free.
+    static constexpr int64_t kGatedKeyBit = std::numeric_limits<int64_t>::min();
+
+    bool tryPostEgress_(int64_t sessionKey, const uint8_t* frame, std::size_t n) {
+        const bool gated = (sessionKey & kGatedKeyBit) != 0;
+        const int64_t session = sessionKey & std::numeric_limits<int64_t>::max();
+        const auto idx = egressRing_.tryClaim(gated ? kMsgEgressFrameGated : kMsgEgressFrame, 8 + n);
         if (idx < 0) return false;
         uint8_t* p = egressRing_.base() + idx;
         std::memcpy(p, &session, 8);
@@ -1357,7 +1455,7 @@ public:
     /// Test-only: the `__security` Log - ONLY while the admin thread is quiesced (before start(), after stop()).
     [[nodiscard]] rune::storage::Log* securityLogForTest() const noexcept { return securityLog_.get(); }
     /// What the CONTROL thread's SecurityView holds (read ON the control thread).
-    struct SecurityViewSnap { bool present = false; int64_t appliedOffset = -1; uint64_t digest = 0; bool halted = false; };
+    struct SecurityViewSnap { bool present = false; int64_t appliedOffset = -1; uint64_t digest = 0; bool halted = false; bool hasSecurityAdmin = false; };
     [[nodiscard]] SecurityViewSnap securityViewForTest();
     /// Append one record to `__security` on THIS broker's admin thread iff it leads (acks=all); returns the record's
     /// base offset, or -1 (not the leader / below minIsr).  Test seam for the log's replication and mirroring - the
@@ -1365,6 +1463,9 @@ public:
     [[nodiscard]] int64_t appendSecurityRecordOnLeaderForTest(std::span<const uint8_t> eventBytes);
     /// Test-only: while held, this broker's `__security` applier applies nothing (the replica still replicates).
     void holdSecurityApplyForTest(bool on);
+    /// Authentication Task 10: the gateway's session table / auth-gate counters (read ON the control thread).
+    [[nodiscard]] bool gatewayHasSessionForTest(int64_t sessionId);
+    [[nodiscard]] uint64_t authGateRefusalsForTest();
     /// Counter values the control thread publishes (read ON the control thread).
     struct SecurityMetricsSnap { int64_t halted = 0; int64_t applied = -1; int64_t authMode = 0; };
     [[nodiscard]] SecurityMetricsSnap securityMetricsForTest();
@@ -2236,6 +2337,13 @@ private:
     // string is built only on a change (an idle control pass allocates nothing).
     struct PublishedCatalogRoute { std::optional<rune::gateway::RouteKind> kind; int64_t key = 0; };
     PublishedCatalogRoute                                 catalogRoutePublished_;
+    // Authentication Task 10 (D24/D36), control thread: the `__security` DDL route last published to the gateway and the
+    // answer gate that holds a security DDL's OK until THIS broker enforces the event.
+    PublishedCatalogRoute                                 securityRoutePublished_;
+    SecurityAnswerGate                                    securityGate_;
+    int64_t                                               securityRefreshedOffset_ = -1;   // Task 13/14: the permission refresh of the event at this offset reached every worker
+    int publishSecurityRoute_(bool consensusLeader);
+    int pumpSecurityGate_();
     /// Control thread: recompute the DDL route; publish it on change.
     int publishCatalogRoute_(bool consensusLeader);
     /// Control thread (Task 11 fix round 1, I2): post the placement view to the
