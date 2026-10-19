@@ -260,6 +260,20 @@ asserts no committed loss, per-key ordering, exactly-once and a single leader. R
 | Replication | `broker/bench/kafka-compare/replbench.sh [parts] [recs] [window]` | 3-node `acks=all` throughput with flight-recorder histograms |
 | Crypto | `rune_crypto_bench`, `rune_crypto_scram_bench` | AEAD ns/op with a budget gate; SCRAM login cost |
 
+### Benchmarking guideline
+
+Numbers are only comparable on a prepared box. The full guideline is
+[broker/bench/BENCHMARKING.md](broker/bench/BENCHMARKING.md); the short form:
+
+1. **Lock.** Everything runs under `flock -w 7200 /root/vm.lock`, from preparation to restore.
+2. **Prepare.** `broker/bench/vm-bench-prepare.sh` kills every benchmark process (`scripts/vm-clean.sh`), clears leftover shm and
+   work dirs, stops k3s (never reboot), saves and flushes iptables, adds the loopback `NOTRACK` and `ACCEPT` rules, raises the
+   `net.core` socket-buffer sysctls (16 MiB, backlog 100000), and checks load, disk, `/dev/shm`, free ports and CPU.
+3. **Method.** Release builds only; defaults (no knobs) with `RUNE_FS_LOG=0`, `RUNE_LOG_LEVEL=warn`, flight recorder off; keep the
+   `effective config:` line; saturate for throughput, open loop for latency; interleaved ABAB runs (n at least 5 latency, 3
+   throughput), median and noise band; no uprobes on hot paths.
+4. **Restore.** `broker/bench/vm-bench-restore.sh` restores sysctls and iptables, starts k3s and waits for Ready.
+
 Numbers are only meaningful on an idle box with a Release build; the harnesses refuse to measure under load. Local and VM
 instructions, the variable list and how to read every output: [docs/benchmarks.md](docs/benchmarks.md).
 

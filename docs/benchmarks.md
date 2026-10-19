@@ -185,6 +185,10 @@ iteration default (4096): a full login is a few milliseconds at most.
 
 ## On the VM
 
+Prepare and restore the box with the scripts and method of [broker/bench/BENCHMARKING.md](../broker/bench/BENCHMARKING.md)
+(`vm-bench-prepare.sh`, `vm-bench-restore.sh`): they apply the loopback `NOTRACK` fast path, flush iptables, stop k3s and set the
+socket-buffer sysctls, and undo all of it.
+
 Throughput and latency numbers are taken on the Linux VM, on an idle box, serialized by the host lock
 ([testing.md](testing.md#running-on-the-remote-vm)):
 
