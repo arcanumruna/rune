@@ -158,7 +158,8 @@ public:
     int leaveGroup(int64_t sid, const std::string& group) {
         pc::LeaveGroup m;
         m.sessionId = sid; m.correlationId = c().nextCorrelationId();
-        m.groupId = bytes(group); m.memberId = bytes("nobody");
+        const std::string member = "nobody";   // outlives the encode: the message holds views
+        m.groupId = bytes(group); m.memberId = bytes(member);
         return rawCode(sendRaw(m, 128, m.correlationId));
     }
     int getTopicSchema(int64_t sid, const std::string& name) {
@@ -261,6 +262,7 @@ private:
     static std::span<const uint8_t> bytes(const std::string& s) {
         return {reinterpret_cast<const uint8_t*>(s.data()), s.size()};
     }
+    static std::span<const uint8_t> bytes(std::string&&) = delete;   // the view would dangle past the full expression
     /// Encode `m` (with optional trailing args) into a scratch buffer, send it, return the answer bytes.
     template <class Msg, class... Rest>
     std::vector<uint8_t> sendRaw(const Msg& m, std::size_t cap, int64_t corr, Rest&&... rest) {

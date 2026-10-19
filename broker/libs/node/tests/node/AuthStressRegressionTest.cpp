@@ -409,7 +409,9 @@ private:
             m.op = static_cast<uint8_t>(c.grant.op == pm::Op::Read ? SO::Read : c.grant.op == pm::Op::Write ? SO::Write : SO::Create);
             m.resourceType = static_cast<uint8_t>(c.grant.cluster ? ST::Cluster : ST::Topic);
             m.patternKind = static_cast<uint8_t>(c.grant.prefix ? SP::Prefix : SP::Exact);
-            m.pattern = c.grant.cluster ? "" : c.grant.text; stmt = "GRANT ...;"; break;
+            // (a `?: ""` here would build a temporary std::string the view dangles from)
+            if (!c.grant.cluster) m.pattern = c.grant.text;
+            stmt = "GRANT ...;"; break;
         case K::GrantRole: m.kind = pc::SecurityOpKind::GrantRole; m.name = c.who; m.roleName = c.role; stmt = "GRANT ROLE;"; break;
         case K::RevokeRole: m.kind = pc::SecurityOpKind::RevokeRole; m.name = c.who; m.roleName = c.role; stmt = "REVOKE ROLE;"; break;
         case K::Disable: case K::Enable:

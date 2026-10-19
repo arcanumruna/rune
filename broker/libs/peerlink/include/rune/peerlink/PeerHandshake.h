@@ -111,7 +111,7 @@ private:
               const std::array<uint8_t, 32>& nonceB, uint64_t incA, uint64_t incB, uint64_t keyId, std::array<uint8_t, 64>& out);
     Out refuseOut_(RefuseReason r, uint64_t keyId);
     Out rekey_(int64_t nowNs);
-    void restorePrior_(const std::optional<Established>& prior, int64_t nowNs) noexcept;
+    void restorePrior_(std::optional<Established> prior, int64_t nowNs) noexcept;
 
     int32_t     self_, peer_;
     uint64_t    incarnation_;
