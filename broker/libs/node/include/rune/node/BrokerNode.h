@@ -2080,7 +2080,7 @@ private:
     //      PendingCreateBehindDrop{spec} (FIFO per name) and runs right after
     //      that name's rename succeeded: the reused name starts EMPTY.
     // -----------------------------------------------------------------------
-    void onCatalogTopicApplied_(const uint8_t* p, std::size_t n);
+    void onCatalogTopicApplied_(const uint8_t* p, std::size_t n, bool isView = false);
     void runCatalogCreate_(const TopicSpec& spec);
     void dropRuntimeTopic_(int32_t topicId, const std::string& name);
     void onCatalogTopicConfig_(const uint8_t* p, std::size_t n);
@@ -2337,6 +2337,7 @@ private:
     // Catalog history Task 16 — the boot from __catalog (startup thread; immutable after start()).
     /// Opens/replays the local __catalog on the startup thread and fills the members below.
     void bootFromCatalog_();
+    rune::gateway::ObjectIndex                            bootObjects_;          // authentication Task 12: the same set as (id, name, kind), handed to the gateway
     std::vector<TopicSpec>                                bootTopics_;           // the catalog's live topics + view sinks (topic-id order)
     std::vector<int32_t>                                  bootDroppedIds_;       // every topic id the catalog dropped
     std::optional<CatalogApplier>                         bootApplier_;          // Booted; handed to the AdminWorker by buildAdminWorker

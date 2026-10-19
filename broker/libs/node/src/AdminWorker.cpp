@@ -988,6 +988,7 @@ AdminWorker::Built AdminWorker::buildEvent_(const DdlRequest& req, const cat::Ca
     b->principal.sessionId       = meta.sessionId != 0 ? meta.sessionId : session;
     b->principal.clientName      = meta.clientName;
     b->principal.sourceAddress   = meta.sourceAddress;
+    b->principal.authenticated   = meta.authenticated;   // authentication Task 12: the session's user ("" = anonymous)
     b->principal.requestId       = meta.requestId;
     b->replayedFrom = meta.replayedFrom;
     b->timestampMs = wallClockMs();

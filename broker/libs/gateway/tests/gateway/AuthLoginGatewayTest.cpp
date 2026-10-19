@@ -341,7 +341,12 @@ TEST(AuthLoginTest, ASessionThatMustChangeItsPasswordMayOnlyChangeItsOwnAndThenI
     rig.gw.onSecurityApplied(*applied);
     EXPECT_TRUE(std::holds_alternative<AuthAuthenticated>(*rig.gw.sessionAuthForTest(o.sid)));
     rig.send(defineTopicFrame(o.sid, 74));
-    EXPECT_EQ(rig.admin.otherSubmits, 1) << "the same session's DefineTopic is now allowed";
+    // Task 12: free of the must-change rule, the session is judged by its grants (admin holds ADMIN, not CREATE).
+    EXPECT_EQ(rig.admin.otherSubmits, 0) << "NotAuthorized, not forwarded";
+    const Frame* denied = rig.last(static_cast<uint16_t>(pc::TemplateId::DefineTopicResponse), o.sid);
+    ASSERT_NE(denied, nullptr);
+    EXPECT_EQ(pc::DefineTopicResponse::decode(denied->bytes.data(), denied->bytes.size())->errorCode,
+              static_cast<uint16_t>(pc::ErrorCode::NotAuthorized));
 }
 
 TEST(AuthLoginRegression, ALoginAgainstAHaltedSecurityLogFailsClosedRegression) {

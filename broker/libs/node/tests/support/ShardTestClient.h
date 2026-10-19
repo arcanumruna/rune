@@ -355,6 +355,18 @@ public:
     }
     /// The sessionId of later ConnectRequests (the resume hint of a reconnecting client; 0 = a fresh connect).
     void setConnectHint(int64_t sessionId) noexcept { connectHint_ = sessionId; }
+    /// Authentication Task 12: keep the raw bytes of every answer frame by correlation id (not Records), so a test can
+    /// compare two answers byte for byte and decode response types this client has no helper for.  Off by default.
+    void captureRawAnswers(bool on = true) noexcept { captureRaw_ = on; }
+    std::optional<std::vector<uint8_t>> awaitRaw(int64_t corr, Clock::time_point deadline) {
+        if (corr == 0) return std::nullopt;
+        while (Clock::now() < deadline) {
+            poll_();
+            if (auto it = raw_.find(corr); it != raw_.end()) return it->second;
+            pause_();
+        }
+        return std::nullopt;
+    }
     /// Authentication Task 11: the raw bytes of the AuthServerFirst (13) / AuthServerFinal (15) frames by correlation id.
     /// The first of the two to arrive for `corr` (a rate-limited or malformed AuthClientFirst is answered by a final
     /// straight away).  nullopt: none by `deadline`.
@@ -933,6 +945,8 @@ private:
     void onFrame_(const uint8_t* p, std::size_t n, int32_t imageSessionId) {
         auto hdr = pc::MessageHeader::decode(p, n);
         if (!hdr) return;
+        if (captureRaw_ && hdr->correlationId != 0 && hdr->templateId != static_cast<uint16_t>(pc::TemplateId::Records))
+            raw_[hdr->correlationId] = std::vector<uint8_t>(p, p + n);   // authentication Task 12: byte-level answer parity
         switch (static_cast<pc::TemplateId>(hdr->templateId)) {
             case pc::TemplateId::ConnectResponse:
                 if (auto r = pc::ConnectResponse::decode(p, n)) { connect_ = *r; connectImage_ = imageSessionId; }
@@ -1053,6 +1067,8 @@ private:
     std::map<int64_t, pc::DefineTopicResponse>      defines_;
     std::map<int64_t, pc::CreateViewResponse>       views_;
     std::map<int64_t, pc::AlterTopicResponse>       alters_;
+    bool                                            captureRaw_ = false;
+    std::map<int64_t, std::vector<uint8_t>>         raw_;       // captureRawAnswers: every answer frame by corr
     std::map<int64_t, DdlAnswer>                    ddls_;      // DdlResponse (78) by corr (Task 11)
     std::map<std::pair<uint16_t, int64_t>, std::vector<uint8_t>> authFrames_;   // AuthServerFirst / Final raw bytes (auth Task 11)
     struct ViewRowSeen { uint16_t status = 0; std::vector<uint8_t> row; };

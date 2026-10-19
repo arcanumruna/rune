@@ -12,6 +12,8 @@ add_library(rune_gateway
     src/SecurityView.cpp
     src/LoginThrottle.cpp
     src/SessionAuth.cpp
+    src/PermissionTable.cpp
+    src/Authorizer.cpp
     src/ScramServer.cpp)
 
 target_include_directories(rune_gateway PUBLIC
@@ -87,6 +89,11 @@ if(BUILD_TESTING)
     target_include_directories(rune_gateway_auth_login_tests PRIVATE ${CMAKE_SOURCE_DIR}/libs/node/tests)
     target_link_libraries(rune_gateway_auth_login_tests PRIVATE rune_gateway rune_node spdlog::spdlog GTest::gtest_main)
     gtest_discover_tests(rune_gateway_auth_login_tests)
+
+    # Authentication Task 12: the per-session permission table, the object index and the Authorizer - pure, no Aeron.
+    add_executable(rune_gateway_permission_table_tests tests/PermissionTableTest.cpp)
+    target_link_libraries(rune_gateway_permission_table_tests PRIVATE rune_gateway GTest::gtest_main)
+    gtest_discover_tests(rune_gateway_permission_table_tests)
 
     # Authentication Task 9: the control thread's SecurityView (D29).
     add_executable(rune_gateway_security_view_tests

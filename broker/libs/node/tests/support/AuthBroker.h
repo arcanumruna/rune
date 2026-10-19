@@ -114,13 +114,27 @@ public:
         }
         channel_ = cfg.clientEndpoint.channel;
         aeronDir_ = cfg.aeronDir;
-        node_ = std::make_unique<BrokerNode>(cfg);
-        node_->start();
-        if (!node_->awaitLeader(std::chrono::seconds(30))) throw std::runtime_error("AuthBroker: no leader");
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-        while (security_cluster::securityOf(*node_).role != rune::replication::Role::Leader) {
-            if (std::chrono::steady_clock::now() > deadline) throw std::runtime_error("AuthBroker: __security never led");
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        cfg_ = cfg;
+        startNode_();
+    }
+    /// Stop the broker and start it again over the SAME data dir (the catalog and the security log replay at boot);
+    /// the admin session is logged in again (the bootstrap and the password change persisted).  Every wire() obtained
+    /// before is gone (its sessions died with the broker).
+    void restart() {
+        const bool hadAdmin = admin_ != nullptr;
+        admin_ = nullptr;
+        adminSid_ = 0;
+        wires_.clear();
+        node_->stop();
+        node_.reset();
+        startNode_();
+        if (hadAdmin) {
+            AuthWireClient& w = wire();
+            const int64_t sid = w.connect(channel_);
+            require(sid > 0, "admin reconnect");
+            require(w.login(channel_, sid, "admin", {kAdminPassword, kAdminPassword}).ok(), "admin login after restart");
+            admin_ = &w;
+            adminSid_ = sid;
         }
     }
     ~AuthBroker() {
@@ -217,12 +231,23 @@ public:
     }
 
 private:
+    void startNode_() {
+        node_ = std::make_unique<BrokerNode>(cfg_);
+        node_->start();
+        if (!node_->awaitLeader(std::chrono::seconds(30))) throw std::runtime_error("AuthBroker: no leader");
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (security_cluster::securityOf(*node_).role != rune::replication::Role::Leader) {
+            if (std::chrono::steady_clock::now() > deadline) throw std::runtime_error("AuthBroker: __security never led");
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
     static void require(bool ok, const std::string& what) {
         if (!ok) throw std::runtime_error("AuthBroker: " + what);
     }
     static int& seq_() { static int s = 0; return s; }
 
     Options                                      opts_;
+    NodeConfig                                   cfg_;
     std::filesystem::path                        dir_;
     std::filesystem::path                        keyFile_;
     uint16_t                                     clientPort_ = 0;

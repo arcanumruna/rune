@@ -1606,6 +1606,16 @@ if(BUILD_TESTING)
                               GTest::gtest_main)
         gtest_discover_tests(rune_auth_login_tests PROPERTIES TIMEOUT 600)
 
+        # Authentication Task 12: the per-session permission tables and the enforcement of every request type against
+        # ONE real authenticating broker (raw frames): AuthEnforcement (the §2.1 map), AuthVisibility (hidden == missing),
+        # CatalogPrincipal (the catalog / security events record the authenticated user).
+        add_executable(rune_auth_enforcement_tests tests/node/AuthEnforcementTest.cpp
+                       tests/node/AuthVisibilityTest.cpp tests/node/CatalogPrincipalTest.cpp)
+        target_include_directories(rune_auth_enforcement_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_auth_enforcement_tests PRIVATE rune_node rune_view rune_codec rune_catalog aeron::aeron
+                              GTest::gtest_main)
+        gtest_discover_tests(rune_auth_enforcement_tests PROPERTIES TIMEOUT 600)
+
         # DR client bugs (2026-10-15): the REAL client against 3 REAL in-process brokers, a leader SIGKILLed mid-op
         # (seed failover, metadata from any live broker, re-route; produce / subscribe / group / txn / DDL / view row).
         add_executable(rune_client_failover_broker_tests tests/client/ClientFailoverBrokerRegressionTest.cpp)

@@ -219,7 +219,10 @@ TEST(AuthLoginTest, BootstrapAdminMustChangePasswordFirst) {
     const auto allowed = w.raw().defineTopicUntil(b.channel(), AuthWireClient::kClientStream, sid, "t1", 1, false, {},
                                                   std::chrono::steady_clock::now() + 20s);
     ASSERT_TRUE(allowed.has_value());
-    EXPECT_EQ(allowed->errorCode, 0) << "the same session's DefineTopic is allowed after the change";
+    // Task 12: the must-change-password rule is gone (not 47) and the Authorizer answers instead: the admin holds ADMIN ON
+    // CLUSTER, which grants no CREATE.
+    EXPECT_EQ(allowed->errorCode, static_cast<uint16_t>(pc::ErrorCode::NotAuthorized))
+        << "the same session is free of the rule: its DefineTopic is judged by its grants";
     // And the new password logs in without the flag.
     const auto again = w.connectAndLogin(b.channel(), "admin", AuthBroker::kAdminPassword);
     EXPECT_TRUE(again.ok());

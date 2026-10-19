@@ -1,6 +1,7 @@
 // ClientGateway.cpp — implementation of the client-facing session gateway (BR-4 / BR-5 / BR-7a / GR-4 / GR-5).
 
 #include <rune/gateway/ClientGateway.h>
+#include <rune/view/PlanSources.h>
 #include <rune/gateway/ConnectDowngradePolicy.h>
 #include <rune/gateway/CryptoFrame.h>
 #include <rune/gateway/RequestRejection.h>
@@ -3386,6 +3387,13 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         answerGate_(*session, *hdr, rune::gateway::gateFor(session->auth, pc::TemplateId::Produce, false, false), buf, len);
         return true;
     }
+    // Authentication Task 12 (D30, spec §2.1): WRITE on the topic - ONE index test, ONE bounds check, ONE byte load
+    // (PermissionTable::allows); an anonymous session (dev / in-process) skips it.  The denial path is cold.
+    if (const auto* authed = std::get_if<rune::gateway::AuthAuthenticated>(&session->auth))
+        if (!authed->perms.allows(msg.topicId, rune::security::opBit(rune::security::Operation::Write))) [[unlikely]]
+            if (deny_(*session, rune::gateway::authorizeTopicId(authed->perms, msg.topicId, rune::security::Operation::Write,
+                                                                 objectIndex_), buf, len))
+                return true;
     // G0.1: capture session id so the public sendRespReliable() test-seam knows
     // which session to target for the duration of this handleProduce() call.
     currentProduceSessionId_ = msg.sessionId;
@@ -4467,6 +4475,17 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     if (!session) [[unlikely]] {
         noteUnanswerable_(buf, len, "Subscribe for unknown session");
         return;
+    }
+
+    // Authentication Task 12 (spec §2.1, D21 / D22): -6 (catalog reads) needs DESCRIBE ON CLUSTER, -7 (security reads)
+    // ADMIN ON CLUSTER, anything else READ on the topic id (one byte load).  Before any routing or redirect.
+    if (const PermissionTable& perms = permsOf_(*session); !perms.isAllowAll()) {
+        namespace rsec = rune::security;
+        std::optional<rune::gateway::Denial> d;
+        if (msg.topicId == pc::kCatalogTopicId)       d = rune::gateway::authorizeCluster(perms, rsec::Operation::Describe);
+        else if (msg.topicId == pc::kSecurityTopicId) d = rune::gateway::authorizeCluster(perms, rsec::Operation::Admin);
+        else                                          d = rune::gateway::authorizeTopicId(perms, msg.topicId, rsec::Operation::Read, objectIndex_);
+        if (deny_(*session, d, buf, len)) return;
     }
 
     // Catalog history Task 12 (spec §7, F19): `__catalog` is readable from ANY
@@ -6969,6 +6988,7 @@ void ClientGateway::handleGroupMessage(const uint8_t* buf, std::size_t len,
         return;
     }
     if (redirectToCoordinator_(*session, hdrOpt->correlationId)) return;   // D4
+    if (denyGroupRequest_(*session, tid, buf, len)) return;                 // authentication Task 12 (D18)
 
     // Fix round 2 (old-client compatibility): a client below
     // kClientVersionInvalidRequest re-joins forever on an InvalidRequest
@@ -7124,6 +7144,7 @@ void ClientGateway::handleTxnMessage(const uint8_t* buf, std::size_t len,
         return;
     }
     if (redirectToCoordinator_(*session, hdrOpt->correlationId)) return;   // D4
+    if (denyTxnRequest_(*session, tid, buf, len)) return;                   // authentication Task 12 (D18)
 
     std::size_t encoded = 0;
     // Fix round 3 (I3): the scratch always holds any fixed-size txn answer and
@@ -7323,6 +7344,11 @@ void ClientGateway::handleDefineTopic(const uint8_t* buf, std::size_t len)
         noteUnanswerable_(buf, len, "DefineTopic for unknown session");
         return;
     }
+    // Authentication Task 12 (spec §2.1): CREATE on the topic name (a CLUSTER grant is part of the table); CreateSchema
+    // is the same request.
+    if (deny_(*session, rune::gateway::authorizeName(permsOf_(*session), rune::security::ResourceType::Topic, m.topicName,
+                                                     rune::security::Operation::Create), buf, len))
+        return;
 
     // Copy-and-return: the sink OWNS the copied bytes (every view points into
     // the ingress buffer and is copied by the sink before return).
@@ -7357,6 +7383,10 @@ void ClientGateway::handleGetTopicSchema(const uint8_t* buf, std::size_t len)
         noteUnanswerable_(buf, len, "GetTopicSchema for unknown session");
         return;
     }
+    // Authentication Task 12 (D18): DESCRIBE on the name, whether it is a topic or a view (the text always says TOPIC).
+    if (deny_(*session, rune::gateway::authorizeTopicOrViewName(permsOf_(*session), m.topicName,
+                                                                 rune::security::Operation::Describe), buf, len))
+        return;
     if (!adminSink_->submitGetSchema(m.sessionId, m.correlationId, m.topicName,
                                      m.requestedFingerprint)) {
         (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal), "GetTopicSchema: admin ring full");
@@ -7393,6 +7423,9 @@ void ClientGateway::handleAlterTopic(const uint8_t* buf, std::size_t len)
         noteUnanswerable_(buf, len, "AlterTopic for unknown session");
         return;
     }
+    if (deny_(*session, rune::gateway::authorizeName(permsOf_(*session), rune::security::ResourceType::Topic, m.topicName,
+                                                     rune::security::Operation::Alter), buf, len))
+        return;
 
     // Copy-and-return: the sink OWNS the copied bytes (topicName/opsBlob views
     // point into the ingress buffer and are copied by the sink before return).
@@ -7434,6 +7467,13 @@ void ClientGateway::handleCreateView(const uint8_t* buf, std::size_t len)
         noteUnanswerable_(buf, len, "CreateView for unknown session");
         return;
     }
+    // Authentication Task 12 (spec §2.1, D19): CREATE on the view name AND READ on every source topic of the plan.
+    {
+        std::optional<rune::gateway::Denial> d = rune::gateway::authorizeName(
+            permsOf_(*session), rune::security::ResourceType::View, m.viewName, rune::security::Operation::Create);
+        if (!d) d = authorizeViewSources_(*session, m.planBlob, m.planLen);
+        if (deny_(*session, d, buf, len)) return;
+    }
 
     // Copy-and-return: the sink OWNS the copied bytes (viewName/keyField/planBlob
     // views point into the ingress buffer and are copied by the sink before return).
@@ -7469,6 +7509,7 @@ void ClientGateway::handleCatalogDdl_(const uint8_t* buf, std::size_t len, const
         noteUnanswerable_(buf, len, what);
         return;
     }
+    if (deny_(*session, authorizeCatalogDdl_(*session, m), buf, len)) return;   // authentication Task 12
     answerAdminSubmit_(buf, len, submit(m, ddlMetaOf_(&m.ext, m.sessionId, *session)),
                        "catalog DDL: admin ring full", "catalog DDL: request larger than the admin ring message");
 }
@@ -7603,6 +7644,204 @@ void ClientGateway::answerGate_(Session& sessionRef, const pc::MessageHeader& hd
     if (end) (void)closeSession_(hdr->sessionId);
 }
 
+
+// ---------------------------------------------------------------------------
+// Authentication Task 12: permission tables and the enforcement helpers.  Control thread only.
+// ---------------------------------------------------------------------------
+const rune::gateway::PermissionTable& ClientGateway::permsOf_(const Session& s) const noexcept
+{
+    if (const auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&s.auth)) return a->perms;
+    // Dev / in-process brokers authenticate nobody: everything is allowed whatever a session's (test-set) state says.
+    if (authMode_ != rune::gateway::GatewayAuthMode::Required || std::holds_alternative<rune::gateway::AuthAnonymous>(s.auth))
+        return allowAllPerms_;
+    return denyAllPerms_;
+}
+
+rune::gateway::PermissionTable ClientGateway::compilePerms_(uint64_t userId) const
+{
+    if (securityView_ == nullptr) return rune::gateway::PermissionTable::denyAll();
+    const std::vector<rune::security::GrantSpec> grants = rune::security::effectiveGrants(securityView_->state(), userId);
+    return rune::gateway::PermissionTable::compile(grants, objectIndex_);
+}
+
+void ClientGateway::onCatalogObjectApplied(int32_t id, const std::string& name, bool isView)
+{
+    if (isView) objectIndex_.onView(id, name); else objectIndex_.onTopic(id, name);
+    const rune::gateway::ObjectEntry* e = objectIndex_.at(id);
+    if (e == nullptr) return;
+    sessions_.forEach([&](Session& s) {
+        if (auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&s.auth)) a->perms.onObjectCreated(id, *e);
+    });
+}
+
+void ClientGateway::onCatalogObjectDropped(int32_t id)
+{
+    objectIndex_.onDropped(id);
+    sessions_.forEach([&](Session& s) {
+        if (auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&s.auth)) a->perms.onObjectDropped(id);
+    });
+}
+
+bool ClientGateway::deny_(Session& session, const std::optional<rune::gateway::Denial>& denial, const uint8_t* buf, std::size_t len)
+{
+    if (!denial) return false;
+    ++notAuthorizedAnswers_;
+    const auto hdr = pc::MessageHeader::decode(buf, len);
+    if (notAuthorizedAnswers_ % 1024 == 1) {
+        const char* user = "<anonymous>";
+        if (const auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&session.auth)) user = a->user.c_str();
+        spdlog::warn("auth: request refused user={} session={} template={}: {} (refusals so far: {})", user, session.sessionId,
+                     hdr ? hdr->templateId : 0, denial->detail, notAuthorizedAnswers_);
+    }
+    if (!hdr) return true;   // the caller decoded the body, so this cannot happen; nothing to answer on
+    // The DDL family carries the D23 detail text; every other response type has no free-text field.
+    switch (static_cast<pc::TemplateId>(hdr->templateId)) {
+        case pc::TemplateId::DropTopic:
+        case pc::TemplateId::AlterTopicConfig:
+        case pc::TemplateId::DropView:
+        case pc::TemplateId::AlterView:
+        case pc::TemplateId::SecurityDdl:
+        case pc::TemplateId::SecurityBootstrap: {
+            pc::DdlResponse r;
+            r.sessionId = hdr->sessionId; r.correlationId = hdr->correlationId;
+            r.errorCode = denial->code; r.detail = denial->detail;
+            if (r.fits() && r.encodedSize() <= scratch_.size()) {
+                sendAnswer_(session, scratch_.data(), r.encode(scratch_.data()));
+                return true;
+            }
+            break;
+        }
+        default: break;
+    }
+    if (!answerRejection_(session, *hdr, denial->code, "not authorized", buf, len)) {
+        pc::ErrorResponse er;
+        er.sessionId = hdr->sessionId; er.correlationId = hdr->correlationId;
+        er.code = static_cast<int16_t>(denial->code); er.message = denial->detail;
+        if (pc::MessageHeader::ENCODED_SIZE + pc::ErrorResponse::BODY_FIXED + 2 + er.message.size() <= scratch_.size())
+            sendAnswer_(session, scratch_.data(), er.encode(scratch_.data()));
+    }
+    return true;
+}
+
+namespace {
+std::string_view sv(std::span<const uint8_t> b) noexcept { return {reinterpret_cast<const char*>(b.data()), b.size()}; }
+}
+
+bool ClientGateway::denyGroupRequest_(Session& session, uint16_t tid, const uint8_t* buf, std::size_t len)
+{
+    namespace rsec = rune::security;
+    using rune::gateway::authorizeName;
+    using rune::gateway::authorizeTopicId;
+    const PermissionTable& perms = permsOf_(session);
+    if (perms.isAllowAll()) return false;
+    const auto group = [&](std::span<const uint8_t> id) {
+        return authorizeName(perms, rsec::ResourceType::Group, sv(id), rsec::Operation::Read);
+    };
+    const auto topic = [&](int32_t id) { return authorizeTopicId(perms, id, rsec::Operation::Read, objectIndex_); };
+    std::optional<rune::gateway::Denial> d;
+    switch (static_cast<pc::TemplateId>(tid)) {
+        case pc::TemplateId::JoinGroup:
+            if (const auto m = pc::JoinGroup::decode(buf, len)) {
+                d = group(m->groupId);
+                for (const int32_t t : m->subscribedTopicIds) { if (d) break; d = topic(t); }
+            }
+            break;
+        case pc::TemplateId::SyncGroup:
+            if (const auto m = pc::SyncGroup::decode(buf, len)) d = group(m->groupId);
+            break;
+        case pc::TemplateId::Heartbeat:
+            if (const auto m = pc::Heartbeat::decode(buf, len)) d = group(m->groupId);
+            break;
+        case pc::TemplateId::OffsetCommit:
+            if (const auto m = pc::OffsetCommit::decode(buf, len)) {
+                d = group(m->groupId);
+                for (const auto& e : m->entries) { if (d) break; d = topic(e.topicId); }
+            }
+            break;
+        case pc::TemplateId::OffsetFetch:
+            if (const auto m = pc::OffsetFetch::decode(buf, len)) {
+                d = group(m->groupId);
+                for (const auto& e : m->entries) { if (d) break; d = topic(e.topicId); }
+            }
+            break;
+        default: break;   // LeaveGroup: nothing (D18); an undecodable body is the service's InvalidRequest
+    }
+    return deny_(session, d, buf, len);
+}
+
+bool ClientGateway::denyTxnRequest_(Session& session, uint16_t tid, const uint8_t* buf, std::size_t len)
+{
+    namespace rsec = rune::security;
+    using rune::gateway::authorizeName;
+    using rune::gateway::authorizeTopicId;
+    const PermissionTable& perms = permsOf_(session);
+    if (perms.isAllowAll()) return false;
+    const auto txn = [&](std::span<const uint8_t> id) {
+        return authorizeName(perms, rsec::ResourceType::TransactionalId, sv(id), rsec::Operation::Write);
+    };
+    const auto group = [&](std::span<const uint8_t> id) {
+        return authorizeName(perms, rsec::ResourceType::Group, sv(id), rsec::Operation::Read);
+    };
+    std::optional<rune::gateway::Denial> d;
+    switch (static_cast<pc::TemplateId>(tid)) {
+        case pc::TemplateId::InitProducerId:
+            if (const auto m = pc::InitProducerId::decode(buf, len))
+                if (!m->transactionalId.empty()) d = txn(m->transactionalId);   // none without one (D18)
+            break;
+        case pc::TemplateId::AddPartitionsToTxn:
+            if (const auto m = pc::AddPartitionsToTxn::decode(buf, len)) {
+                d = txn(m->transactionalId);
+                for (const auto& p : m->partitions) {
+                    if (d) break;
+                    d = authorizeTopicId(perms, p.topicId, rsec::Operation::Write, objectIndex_);
+                }
+            }
+            break;
+        case pc::TemplateId::AddOffsetsToTxn:
+            if (const auto m = pc::AddOffsetsToTxn::decode(buf, len)) { d = txn(m->transactionalId); if (!d) d = group(m->groupId); }
+            break;
+        case pc::TemplateId::TxnOffsetCommit:
+            if (const auto m = pc::TxnOffsetCommit::decode(buf, len)) { d = txn(m->transactionalId); if (!d) d = group(m->groupId); }
+            break;
+        case pc::TemplateId::EndTxn:
+            if (const auto m = pc::EndTxn::decode(buf, len)) d = txn(m->transactionalId);
+            break;
+        default: break;
+    }
+    return deny_(session, d, buf, len);
+}
+
+std::optional<rune::gateway::Denial> ClientGateway::authorizeViewSources_(const Session& session, const uint8_t* blob, std::size_t len) const
+{
+    const PermissionTable& perms = permsOf_(session);
+    if (perms.isAllowAll()) return std::nullopt;
+    // An undecodable blob is the admin thread's InvalidSchema (nothing is created); only a decodable plan names sources.
+    const auto ids = rune::view::planSourceTopicIds(std::span<const uint8_t>(blob, len));
+    if (!ids) return std::nullopt;
+    for (const int32_t id : *ids)
+        if (auto d = rune::gateway::authorizeTopicId(perms, id, rune::security::Operation::Read, objectIndex_)) return d;
+    return std::nullopt;
+}
+
+template <class Msg>
+std::optional<rune::gateway::Denial> ClientGateway::authorizeCatalogDdl_(const Session& session, const Msg& m) const
+{
+    namespace rsec = rune::security;
+    using rune::gateway::authorizeName;
+    const PermissionTable& perms = permsOf_(session);
+    if constexpr (std::is_same_v<Msg, pc::DropTopic>)
+        return authorizeName(perms, rsec::ResourceType::Topic, m.topicName, rsec::Operation::Drop);
+    else if constexpr (std::is_same_v<Msg, pc::AlterTopicConfig>)
+        return authorizeName(perms, rsec::ResourceType::Topic, m.topicName, rsec::Operation::Alter);
+    else if constexpr (std::is_same_v<Msg, pc::DropView>)
+        return authorizeName(perms, rsec::ResourceType::View, m.viewName, rsec::Operation::Drop);
+    else {
+        static_assert(std::is_same_v<Msg, pc::AlterView>);
+        if (auto d = authorizeName(perms, rsec::ResourceType::View, m.viewName, rsec::Operation::Alter)) return d;
+        return authorizeViewSources_(session, m.planBlob, m.planLen);
+    }
+}
+
 void ClientGateway::failLogin_(Session& session, int64_t correlationId, uint32_t retryAfterMs)
 {
     pc::AuthServerFinal f;
@@ -7706,7 +7945,7 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
         spdlog::warn("auth: session {} authenticated over plaintext (no TLS): frames are not integrity-protected",
                      session->sessionId);
     if (ok.mustChangePassword) session->auth = AuthPasswordChangeRequired{ok.userId, ok.user};
-    else                       session->auth = AuthAuthenticated{ok.userId, ok.user, PermissionTable::allowAll()};
+    else                       session->auth = AuthAuthenticated{ok.userId, ok.user, compilePerms_(ok.userId)};
 
     pc::AuthServerFinal f;
     f.sessionId       = hdr->sessionId;
@@ -7750,7 +7989,7 @@ void ClientGateway::onSecurityApplied(const rune::security::Applied& applied)
     if (user == nullptr || user->mustChangePassword) return;   // not (yet) a SET PASSWORD of this user
     sessions_.forEach([&](Session& s) {
         if (const auto* pcr = std::get_if<AuthPasswordChangeRequired>(&s.auth); pcr != nullptr && pcr->userId == applied.objectId) {
-            s.auth = AuthAuthenticated{pcr->userId, pcr->user, PermissionTable::allowAll()};
+            s.auth = AuthAuthenticated{pcr->userId, pcr->user, compilePerms_(pcr->userId)};
         }
     });
 }
@@ -7811,6 +8050,18 @@ void ClientGateway::handleSecurityDdl(const uint8_t* buf, std::size_t len)
         (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest),
                              "SecurityDdl needs client version 9");
         return;
+    }
+    // Authentication Task 12 (D20): ADMIN ON CLUSTER - except a user's own ALTER USER <self> ADD / DROP / SET PASSWORD.
+    {
+        const std::string* self = nullptr;
+        if (const auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&session->auth)) self = &a->user;
+        else if (const auto* p = std::get_if<rune::gateway::AuthPasswordChangeRequired>(&session->auth)) self = &p->user;
+        const bool ownPassword = self != nullptr && m.kind == pc::SecurityOpKind::AlterUser && m.name == *self &&
+                                 (m.change == pc::UserChangeKind::AddPassword || m.change == pc::UserChangeKind::DropPassword ||
+                                  m.change == pc::UserChangeKind::SetPassword);
+        if (!ownPassword &&
+            deny_(*session, rune::gateway::authorizeCluster(permsOf_(*session), rune::security::Operation::Admin), buf, len))
+            return;
     }
     answerAdminSubmit_(buf, len, adminSink_->submitSecurityDdl(m, ddlMetaOf_(&m.ext, m.sessionId, *session)),
                        "SecurityDdl: admin ring full", "SecurityDdl: request larger than the admin ring message");
@@ -7929,6 +8180,12 @@ void ClientGateway::handleGetViewRow(const uint8_t* buf, std::size_t len)
         noteUnanswerable_(buf, len, "GetViewRow for unknown session");
         return;
     }
+    // Authentication Task 12 (spec §2.1, D22): READ on the view's topic id - one byte load; a hidden and a missing id
+    // answer alike.
+    if (const PermissionTable& perms = permsOf_(*session); !perms.isAllowAll())
+        if (deny_(*session, rune::gateway::authorizeTopicId(perms, m.viewTopicId, rune::security::Operation::Read, objectIndex_,
+                                                             rune::security::ResourceType::View), buf, len))
+            return;
 
     // Resolve the owning partition from the key (canonical 8-byte LE key bytes).
     // partitionForKey needs the view's output topic in the registry; an unknown
@@ -8524,6 +8781,8 @@ void ClientGateway::handleMetadata(const uint8_t* buf, std::size_t len)
     std::deque<std::string> endpointStore;
     std::vector<pc::PartitionEntry> parts;
 
+    const PermissionTable& perms = permsOf_(*session);
+    const bool filterPerms = !perms.isAllowAll();
     if (routingImage_) {
         const rune::metadata::RoutingImage* img = routingImage_.get();
         const int32_t cap = img->capacity();
@@ -8568,6 +8827,9 @@ void ClientGateway::handleMetadata(const uint8_t* buf, std::size_t len)
             if (filterTopics && requestedTopics.find(topicId) == requestedTopics.end()) {
                 continue;
             }
+            // Authentication Task 12 (visibility): only partitions of topics the session may DESCRIBE are listed
+            // (an explicit id list is filtered the same way - a hidden id is simply absent).
+            if (filterPerms && !perms.allows(topicId, rune::security::opBit(rune::security::Operation::Describe))) continue;
 
             pc::PartitionEntry p;
             p.topicId     = topicId;

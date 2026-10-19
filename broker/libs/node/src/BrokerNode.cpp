@@ -2121,6 +2121,7 @@ void BrokerNode::buildGateway() {
                               : config_.authMode == AuthMode::DevDisabled ? rune::gateway::GatewayAuthMode::Dev
                                                                           : rune::gateway::GatewayAuthMode::InProcess,
                               securityView_ ? &*securityView_ : nullptr);
+        gateway_->setBootObjects(std::move(bootObjects_));   // authentication Task 12: the catalog's live topics / views at boot
         // Authentication Task 10 (D4/D32): the gateway's OWN copy of the cluster keys (loaded on this startup thread,
         // validated by validateAuth) verifies the bootstrap proof.  Dev / in-process configs hold none.
         // Review C I4: the keys validated in start() ARE the keys in use - one load, handed out as copies; Enabled with
@@ -3482,11 +3483,14 @@ void BrokerNode::bootFromCatalog_() {
     std::vector<TopicSpec> catalogTopics;
     CatalogEffects sink;
     sink.maxFrameBytes = catalogEffectMaxFrame();   // an effect that could never be posted halts the boot, as before
-    sink.topicApplied = [&catalogTopics](const cat::TopicObject& t) {
+    bootObjects_ = rune::gateway::ObjectIndex{};
+    sink.topicApplied = [&catalogTopics, this](const cat::TopicObject& t) {
+        bootObjects_.onTopic(t.topicId, t.name);
         catalogTopics.push_back(bootSpecOfFrame(t.topicId, t.name, t.partitions, t.replicationFactor, t.persistence,
                                                 t.config));
     };
-    sink.sinkApplied = [&catalogTopics](const SinkSpec& sp) {   // a view's sink: a keyed, compacted table, every broker
+    sink.sinkApplied = [&catalogTopics, this](const SinkSpec& sp) {   // a view's sink: a keyed, compacted table, every broker
+        bootObjects_.onView(sp.topicId, sp.name);
         rune::protocol::TopicConfig c;
         c.cleanupPolicy = 1;   // Compact
         c.partitionKey  = sp.keyField;
@@ -4490,12 +4494,15 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
                     std::memcpy(&viewTopicId, p, 4);
                     gateway_->noteViewSinkAwaitingPlan(viewTopicId);
                 }
-                onCatalogTopicApplied_(p, n);
+                onCatalogTopicApplied_(p, n, /*isView*/true);
                 return;
             }
             if (tid == kA2cCatalogTopicDropped) {
                 CatalogTopicDroppedMsg m;
-                if (decodeCatalogTopicDropped(p, n, m)) dropRuntimeTopic_(m.topicId, m.name);
+                if (decodeCatalogTopicDropped(p, n, m)) {
+                    if (gateway_) gateway_->onCatalogObjectDropped(m.topicId);   // authentication Task 12: tables lose the id's bits
+                    dropRuntimeTopic_(m.topicId, m.name);
+                }
                 else if (adminToControlRejects_++ % 1024 == 0) [[unlikely]]
                     spdlog::error("BrokerNode[{}]: malformed kA2cCatalogTopicDropped (len={}) skipped",
                                   config_.nodeId, n);
@@ -5118,13 +5125,16 @@ bool BrokerNode::catalogNameHeldByDrop_(const std::string& name) const noexcept 
     return false;
 }
 
-void BrokerNode::onCatalogTopicApplied_(const uint8_t* p, std::size_t n) {
+void BrokerNode::onCatalogTopicApplied_(const uint8_t* p, std::size_t n, bool isView) {
     CatalogTopicAppliedMsg m;
     if (!decodeCatalogTopicApplied(p, n, m)) {
         if (adminToControlRejects_++ % 1024 == 0) [[unlikely]]
             spdlog::error("BrokerNode[{}]: malformed kA2cCatalogTopicApplied (len={}) skipped", config_.nodeId, n);
         return;
     }
+    // Authentication Task 12 (spec §6): the gateway's ObjectIndex and every authenticated session's permission table
+    // learn the object at the moment the catalog effect is applied here (idempotent), before it is built.
+    if (gateway_) gateway_->onCatalogObjectApplied(m.topicId, m.name, isView);
     TopicSpec spec = topicSpecFromCatalog(m);
     // Step 3: a create whose name a dropped topic still holds (its dir not renamed
     // away yet) waits — FIFO per name, behind any create of that name already waiting.

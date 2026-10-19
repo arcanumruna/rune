@@ -62,6 +62,8 @@
 #include <rune/gateway/SecurityRoute.h>
 #include <rune/gateway/SecurityView.h>
 #include <rune/gateway/SessionAuth.h>
+#include <rune/gateway/Authorizer.h>
+#include <rune/gateway/ObjectIndex.h>
 #include <rune/gateway/LoginThrottle.h>
 #include <rune/gateway/ScramServer.h>
 #include <rune/peerlink/ClusterKeys.h>
@@ -420,6 +422,23 @@ public:
     /// lands with the login - a `SET PASSWORD` of a user lifts the must-change-password state of that user's sessions.
     /// (The general refresh / revoke on every change is Task 14.)
     void onSecurityApplied(const rune::security::Applied& applied);
+    // ── authentication Task 12: per-session permission tables and the enforcement of every request type ──
+    /// Boot (startup thread, before any thread runs): the catalog's live topics / views, from the replay.
+    void setBootObjects(rune::gateway::ObjectIndex objects) { objectIndex_ = std::move(objects); }
+    /// The control drain of kA2cCatalogTopicApplied / kA2cCatalogSinkApplied: a topic / view exists at `id`; every
+    /// authenticated session's table is extended from its retained patterns (spec §6).  Idempotent.
+    void onCatalogObjectApplied(int32_t id, const std::string& name, bool isView);
+    /// kA2cCatalogTopicDropped: the id is gone; every table's bits for it are cleared.  Idempotent.
+    void onCatalogObjectDropped(int32_t id);
+    [[nodiscard]] const rune::gateway::ObjectIndex& objectIndex() const noexcept { return objectIndex_; }
+    /// Requests answered NotAuthorized (45) since start.
+    [[nodiscard]] uint64_t notAuthorizedAnswers() const noexcept { return notAuthorizedAnswers_; }
+    /// Test seam: the permission table of an authenticated session (nullptr = not authenticated).
+    [[nodiscard]] const rune::gateway::PermissionTable* sessionPermissionsForTest(int64_t sid) {
+        const Session* s = sessions_.find(sid);
+        const auto* a = s ? std::get_if<rune::gateway::AuthAuthenticated>(&s->auth) : nullptr;
+        return a ? &a->perms : nullptr;
+    }
     /// Test seam: the auth state of an existing session.
     void setSessionAuthForTest(int64_t sid, rune::gateway::SessionAuth a) {
         if (Session* s = sessions_.find(sid)) s->auth = std::move(a);
@@ -2158,6 +2177,25 @@ private:
     [[nodiscard]] bool resumeAuthenticated_(const rune::protocol::client::ConnectRequest& req);
     /// The throttle key host of a Connect: the Aeron image's source host, else the reply endpoint's host.
     [[nodiscard]] std::string sourceHostOf_(std::string_view egressChannel) const;
+    // ── authentication Task 12 ──
+    rune::gateway::ObjectIndex       objectIndex_;                                       ///< control thread's own (catalog effects)
+    rune::gateway::PermissionTable   allowAllPerms_ = rune::gateway::PermissionTable::allowAll();   ///< anonymous (dev / in-process)
+    rune::gateway::PermissionTable   denyAllPerms_  = rune::gateway::PermissionTable::denyAll();    ///< a session that may not use the data plane
+    uint64_t                         notAuthorizedAnswers_ = 0;
+    /// The permission table the session's auth state grants: its compiled one, allow-all (anonymous), else deny-all.
+    [[nodiscard]] const rune::gateway::PermissionTable& permsOf_(const Session& s) const noexcept;
+    /// Compile the table of `userId` against the live ObjectIndex (login and SET PASSWORD; Task 14 refreshes with it).
+    [[nodiscard]] rune::gateway::PermissionTable compilePerms_(uint64_t userId) const;
+    /// true = DENIED here: answered NotAuthorized (45) in the request's own response type (D23 text where the type
+    /// carries one) - the caller returns without forwarding anything.
+    [[nodiscard]] bool deny_(Session& session, const std::optional<rune::gateway::Denial>& denial, const uint8_t* buf, std::size_t len);
+    /// Group / txn / catalog-DDL request authorization (cold paths): true = denied and answered.
+    [[nodiscard]] bool denyGroupRequest_(Session& session, uint16_t tid, const uint8_t* buf, std::size_t len);
+    [[nodiscard]] bool denyTxnRequest_(Session& session, uint16_t tid, const uint8_t* buf, std::size_t len);
+    template <class Msg> [[nodiscard]] std::optional<rune::gateway::Denial> authorizeCatalogDdl_(const Session& session, const Msg& m) const;
+    /// D19: READ on every source topic of a CreateView / AlterView plan (an undecodable blob is left to the admin thread).
+    [[nodiscard]] std::optional<rune::gateway::Denial> authorizeViewSources_(const Session& session, const uint8_t* blob,
+                                                                              std::size_t len) const;
     rune::gateway::LoginThrottle loginThrottle_;
     int64_t  authTimeoutNs_ = 10'000'000'000LL;
     uint64_t loginsOk_ = 0, loginsFailed_ = 0, loginsRateLimited_ = 0;

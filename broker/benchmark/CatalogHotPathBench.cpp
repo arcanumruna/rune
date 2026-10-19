@@ -84,7 +84,7 @@ BENCHMARK(BM_GatewayProducePlacementGate)
 
 // ---------------------------------------------------------------------------
 // Review C I3 (authentication): the Required-mode cost of a produce.  Arg 0 = InProcess (every session AuthAnonymous),
-// Arg 1 = Required with an AuthAuthenticated session.  Required adds exactly one variant-index compare inside
+// Arg 1 = Required with an AuthAuthenticated allow-all session, Arg 2 = Required with a compiled table (Task 12).  Required adds exactly one variant-index compare inside
 // handleProduce (on the session it already looked up) - within noise of arg 0.
 void BM_GatewayProduceAuthGate(benchmark::State& state) {
     spdlog::set_level(spdlog::level::warn);
@@ -93,6 +93,16 @@ void BM_GatewayProduceAuthGate(benchmark::State& state) {
     if (state.range(0) == 1) {
         rig.gw.setAuthMode(rune::gateway::GatewayAuthMode::Required, &view);
         rig.gw.setSessionAuthForTest(rig.sid, rune::gateway::AuthAuthenticated{1, "ws1", rune::gateway::PermissionTable::allowAll()});
+    } else if (state.range(0) == 2) {
+        // Task 12: Required with a REAL compiled table (one WRITE bit among 4096 topics) - the per-produce check is one
+        // bounds check + one byte load on top of arg 1.
+        rig.gw.setAuthMode(rune::gateway::GatewayAuthMode::Required, &view);
+        rune::gateway::ObjectIndex idx;
+        for (int32_t i = 0; i < 4096; ++i) idx.onTopic(i, "t" + std::to_string(i));
+        idx.onTopic(rig.kTopic, "granted");
+        const std::vector<rune::security::GrantSpec> grants = {
+            {rune::security::Operation::Write, {rune::security::ResourceType::Topic, rune::security::PatternKind::Exact, "granted"}}};
+        rig.gw.setSessionAuthForTest(rig.sid, rune::gateway::AuthAuthenticated{1, "ws1", rune::gateway::PermissionTable::compile(grants, idx)});
     }
     std::vector<std::vector<uint8_t>> frames;
     int64_t corr = 0;
@@ -123,8 +133,30 @@ void BM_GatewayProduceAuthGate(benchmark::State& state) {
                            "a produce was not answered OK");
     state.SetItemsProcessed(state.iterations());
 }
-BENCHMARK(BM_GatewayProduceAuthGate)->Arg(0)->Arg(1)->Unit(benchmark::kNanosecond)->MinTime(1.0)->Repetitions(5)
+BENCHMARK(BM_GatewayProduceAuthGate)->Arg(0)->Arg(1)->Arg(2)->Unit(benchmark::kNanosecond)->MinTime(1.0)->Repetitions(5)
     ->ReportAggregatesOnly(false);
+
+// Authentication Task 12: the per-request check itself - PermissionTable::allows (one bounds check + one byte load)
+// over a 4096-topic table, ids walked in a scrambled order so the load is not a single cached byte.
+void BM_PermissionTableAllows(benchmark::State& state) {
+    rune::gateway::ObjectIndex idx;
+    for (int32_t i = 0; i < 4096; ++i) idx.onTopic(i, "t" + std::to_string(i));
+    const std::vector<rune::security::GrantSpec> grants = {
+        {rune::security::Operation::Write, {rune::security::ResourceType::Topic, rune::security::PatternKind::Prefix, "t1"}}};
+    const auto table = rune::gateway::PermissionTable::compile(grants, idx);
+    const uint8_t write = rune::security::opBit(rune::security::Operation::Write);
+    uint32_t id = 0;
+    uint64_t allowed = 0;
+    allocsOn();
+    for (auto _ : state) {
+        id = (id * 2654435761u + 12345u) & 4095u;
+        allowed += table.allows(static_cast<int32_t>(id), write) ? 1u : 0u;
+    }
+    allocsOff(state);
+    benchmark::DoNotOptimize(allowed);
+    state.SetItemsProcessed(state.iterations());
+}
+BENCHMARK(BM_PermissionTableAllows)->Unit(benchmark::kNanosecond)->MinTime(0.5);
 
 // ---------------------------------------------------------------------------
 void BM_GatewaySubscribePlacementGate(benchmark::State& state) {
