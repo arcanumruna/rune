@@ -162,6 +162,11 @@ volume for `/var/lib/rune` (durable consensus state).
 | `RUNE_STORAGE_FORMAT`           | `auto` (development: empty volumes are formatted automatically) |
 | `RUNE_ELECTION_TIMEOUT_MS`      | `300` (relaxed for cross-container UDP)           |
 
+A wiped or replaced volume rejoins as a replaced disk: with `auto` the empty volume is formatted as a joiner, the
+node logs `storage UNCONFIRMED` (`docker exec <container> rune_role` prints `STORAGE ... state=UNCONFIRMED`) while the
+controller fences and then confirms it, and it never leads or votes until `state=CONFIRMED`. Do not restart another
+node meanwhile. See `docs/release-notes/storage-incarnation.md`.
+
 ### Raw-Aeron ping probe
 
 A standalone probe binary (`ping_probe`) is built from
