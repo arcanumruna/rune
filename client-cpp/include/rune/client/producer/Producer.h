@@ -59,6 +59,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <variant>
 
 namespace rune::client {
 
@@ -242,6 +243,89 @@ enum class SendResult : uint8_t {
                     ///< with this producer's Client
     MessageTooLarge,///< backlog B6: key + value > Producer::kMaxRecordBytes (16 KiB) —
                     ///< rejected at append, never retryable (Kafka MESSAGE_TOO_LARGE)
+};
+
+// ---------------------------------------------------------------------------
+// Phase 2b Part B — zero-copy produce: Claim (one record) / BatchClaim (n
+// records appended as ONE RecordBatch).
+//
+// The caller writes the record straight into the producer's memory:
+//   auto c = p.tryClaim(topic, Key(id), PositionEncoder::kEncodedLength);
+//   if (c) { PositionEncoder(c.buffer()).zone(4).x(118.5); c.commit(); }
+// Copies left (spec §B): Thread mode 2 (producer ring -> Produce frame ->
+// Aeron); Invoker mode 1 (the claim IS the frame's bytes; frame -> Aeron).
+//
+// RAII + move-only: commit() publishes, abort() discards, the destructor aborts
+// an open claim.  A refused claim is false; result() says why (BackPressured:
+// retry later; MessageTooLarge / ValueTooLarge / InvalidTopic / InvalidArgument
+// / Closed / WrongThread / QueueFull / ClaimHeld exactly as for trySend).  The
+// claimed bytes are NOT zeroed (a generated XEncoder zeroes its block).
+//
+// A held claim blocks its producer: Thread mode — the duty side cannot read
+// past it, so never hold one across blocking work and never call a blocking
+// send() on the same producer from the thread holding it; Invoker mode — until
+// it is settled every other send / claim on the producer returns ClaimHeld and
+// its partition is not flushed, and it must be settled on the owner thread.
+// A claim carrying Completions credit is settled on that queue's owner thread.
+// A claim must not outlive its Producer.  Zero allocation.
+// ---------------------------------------------------------------------------
+namespace detail {
+/// The state of an OPEN claim — exactly what settling it needs.
+struct ClaimOpen {
+    producer::ProducerImpl* impl  = nullptr;
+    int64_t                 token = 0;        ///< Ring: the M2O claim index; Direct: the claim generation
+    Completions*            cq    = nullptr;  ///< per-record ack credit (tryClaim(.., cq, token)); nullptr: none
+    Completions*            bq    = nullptr;  ///< batch-ack credit (batchAcksTo); nullptr: none
+    uint32_t                units = 0;        ///< batch-ack units reserved on bq
+};
+/// Settles a claim and its Completions credit (a friend of Completions).
+struct ClaimCredit {
+    /// Publish; true = accepted (its completions follow), false = abandoned
+    /// (nothing follows: every reservation is returned).
+    static bool commit(const ClaimOpen& o) noexcept;
+    /// Discard; every reservation is returned.
+    static void abort(const ClaimOpen& o) noexcept;
+};
+}  // namespace detail
+
+class Claim {
+public:
+    Claim() noexcept = default;  ///< refused: InvalidTopic
+    Claim(Claim&& o) noexcept;
+    Claim& operator=(Claim&& o) noexcept;  ///< aborts this claim first if it is open
+    Claim(const Claim&) = delete;
+    Claim& operator=(const Claim&) = delete;
+    ~Claim();  ///< aborts an open claim
+
+    /// True while open (granted, neither committed nor aborted).
+    [[nodiscard]] explicit operator bool() const noexcept { return std::holds_alternative<Open>(state_); }
+    /// Ok if the claim was granted; otherwise why it was refused.
+    [[nodiscard]] SendResult result() const noexcept;
+    /// The record's value bytes (exactly the claimed length); empty unless open.
+    [[nodiscard]] std::span<uint8_t> buffer() const noexcept;
+    /// Publish the record.  True: accepted, exactly like an Ok send (its ack /
+    /// BatchAck follows).  False: nothing was open, or the claim was abandoned
+    /// under it (Invoker: its partition was failed / the producer closed;
+    /// Thread: Client close released it) — nothing is sent, nothing completes.
+    bool commit() noexcept;
+    /// Discard the record: nothing is sent, nothing completes.  No-op unless open.
+    void abort() noexcept;
+
+private:
+    friend class Producer;
+    struct Refused {
+        SendResult why = SendResult::InvalidTopic;
+    };
+    struct Open {
+        detail::ClaimOpen core;
+        uint8_t*          value = nullptr;
+        uint32_t          len   = 0;
+    };
+    struct Settled {};
+    explicit Claim(SendResult why) noexcept : state_(Refused{why}) {}
+    Claim(const detail::ClaimOpen& core, uint8_t* value, uint32_t len) noexcept
+        : state_(Open{core, value, len}) {}
+    std::variant<Refused, Open, Settled> state_{Refused{}};
 };
 
 // ---------------------------------------------------------------------------
@@ -430,6 +514,22 @@ public:
               Token token);
     void send(TopicHandle topic, const Key& key, std::span<const uint8_t> value, AckToken token);
 
+    // ---- Phase 2b Part B: zero-copy produce (ZERO allocation) -----------------
+
+    /// Claim one record of `valueLen` value bytes (key + valueLen <=
+    /// kMaxRecordBytes), routed by `key` exactly like trySend(topic, key, ..):
+    /// write it through claim.buffer() (e.g. a generated XEncoder), then
+    /// commit().  Non-blocking: a refused claim is false and claim.result()
+    /// says why.  Thread rules as trySend (Invoker: owner thread only).  See
+    /// Claim for the rules while it is held.
+    [[nodiscard]] Claim tryClaim(TopicHandle topic, const Key& key, uint32_t valueLen) noexcept;
+    /// tryClaim with a polled completion (trySend(.., cq, token)'s rules): the
+    /// credit is reserved at claim time and returned if the claim is aborted.
+    [[nodiscard]] Claim tryClaim(TopicHandle topic, const Key& key, uint32_t valueLen, Completions& cq,
+                                 Token token) noexcept;
+    /// tryClaim whose completion goes to the onAck() handler.
+    [[nodiscard]] Claim tryClaim(TopicHandle topic, const Key& key, uint32_t valueLen, AckToken token) noexcept;
+
     /// Setup phase (before the first AckToken send): the per-record ack
     /// handler.  See AckFn.
     void onAck(AckFn fn, void* ctx) noexcept;
@@ -570,6 +670,10 @@ private:
     /// T15b M3: the one send body; `part` computed once by the caller.
     [[nodiscard]] SendResult trySendPart_(TopicHandle topic, int32_t part, const Key& key,
                                           std::span<const uint8_t> value) noexcept;
+    /// 2b-B: the one claim body; `part` computed once by the caller, the
+    /// per-record ack credit (cq) already reserved by the caller.
+    [[nodiscard]] Claim claimPart_(TopicHandle topic, int32_t part, const Key& key, uint32_t valueLen,
+                                   uint64_t ackHandle, Completions* cq) noexcept;
     /// F8c C7: the §3.3 release of the handle's share (see the destructor).
     void release_() noexcept;
 

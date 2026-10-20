@@ -3245,6 +3245,85 @@ aeron::util::index_t ProducerImpl::testClaimSendRecord(int32_t topicId, int32_t 
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2b Part B: zero-copy claims
+// ---------------------------------------------------------------------------
+
+namespace {
+// The SEND_RECORD / CLAIM_BATCH common header [0..33] (topicId, partition,
+// keyLen, inline key zero-padded to 16, flags, ackHandle).
+inline void writeClaimHeader(uint8_t* d, int32_t topicId, int32_t partition, const Key& key,
+                             uint64_t ackHandle) noexcept {
+    writeLE32(d, kRecTopicIdOff, topicId);
+    writeLE32(d, kRecPartOff, partition);
+    d[kRecKeyLenOff] = static_cast<uint8_t>(key.size());
+    std::memset(d + kRecKeyBytesOff, 0, Key::kMaxInline);
+    if (key.size() > 0) std::memcpy(d + kRecKeyBytesOff, key.bytes().data(), key.size());
+    d[kRecFlagsOff] = ackHandle != 0 ? kFlagWantAck : uint8_t{0};
+    writeLE64(d, kRecCorrIdOff, static_cast<int64_t>(ackHandle));
+}
+}  // namespace
+
+ProducerImpl::ClaimGrant ProducerImpl::claimRecord(int32_t topicId, int32_t partition, const Key& key,
+                                                   uint32_t valueLen, uint64_t ackHandle) noexcept {
+    ClaimGrant g;
+    // Direct (Invoker) claims arrive with Part B Task 5; until then a Direct
+    // producer has no ring to claim from — refuse, never touch the unused ring.
+    if (mode_ == IngressMode::Direct) {
+        g.result = SendResult::InvalidArgument;
+        return g;
+    }
+    // Backlog B6: the per-record cap, one O(1) compare (key + value <= 16 KiB).
+    if (key.size() + valueLen > rune::client::Producer::kMaxRecordBytes) {
+        g.result = SendResult::MessageTooLarge;
+        return g;
+    }
+    // fix1 minor 11 parity: a record this ring can NEVER hold is not back-pressure.
+    const std::size_t totalLen = static_cast<std::size_t>(kRecHeaderSize) + valueLen;
+    if (totalLen > static_cast<std::size_t>(ring_.maxMsgLength())) {
+        g.result = SendResult::ValueTooLarge;
+        return g;
+    }
+    aeron::util::index_t idx = -1;
+    try {
+        idx = ring_.tryClaim(kMsgSendRecord, totalLen);
+    } catch (...) {
+        g.result = SendResult::BackPressured;  // unreachable: type and length are pre-checked
+        return g;
+    }
+    if (idx < 0) {
+        // F8c C1(a): the closed bit lives in the tail word the claim CASes.
+        g.result = ring_.closed() ? SendResult::Closed : SendResult::BackPressured;
+        return g;
+    }
+    uint8_t* dst = ring_.base() + idx;
+    writeClaimHeader(dst, topicId, partition, key, ackHandle);
+    writeLE32u(dst, kRecValLenOff, valueLen);
+    g.result = SendResult::Ok;
+    g.token  = idx;
+    g.base   = dst + kRecValBytesOff;
+    return g;
+}
+
+bool ProducerImpl::commitClaim(int64_t token) noexcept {
+    try {
+        ring_.commit(static_cast<aeron::util::index_t>(token));
+        return true;
+    } catch (...) {
+        // Released by Client close's drain unblock (closeFinal): the slot is
+        // padding now and is never read — nothing was accepted.
+        return false;
+    }
+}
+
+void ProducerImpl::abortClaim(int64_t token) noexcept {
+    try {
+        ring_.abort(static_cast<aeron::util::index_t>(token));
+    } catch (...) {
+        // Already released by the close-drain unblock: nothing left to discard.
+    }
+}
+
 ProducerImpl::~ProducerImpl() {
     if (detail::testOnImplFree != nullptr) detail::testOnImplFree(detail::HandleKind::Producer, this);
     // Last owner gone (no other thread can reach this producer): free every

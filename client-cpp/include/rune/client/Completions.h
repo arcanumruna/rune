@@ -52,6 +52,10 @@
 
 namespace rune::client {
 
+namespace detail {
+struct ClaimCredit;  // Phase 2b Part B (producer/Producer.h)
+}  // namespace detail
+
 struct CompletionsConfig {
     uint32_t capacityBytes  = 1u << 20;   ///< ring capacity (power of two)
     uint32_t maxResultBytes = 16u << 10;  ///< reservation for a variable result (schema blob)
@@ -297,6 +301,7 @@ private:
     friend class Client;
     friend class Producer;      // C6: per-record / batch-ack credit + producer-op accounting
     friend class BatchBuilder;  // C6: Tier-2 ack credit
+    friend struct detail::ClaimCredit;  // 2b-B: claim credit (Claim / BatchClaim)
 
     void moveFrom_(Completions& o) noexcept {
         cfg_            = o.cfg_;

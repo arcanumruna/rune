@@ -534,6 +534,26 @@ public:
                                        std::span<const uint8_t> value, int64_t ackHandle,
                                        RejectReason* why = nullptr) noexcept;
 
+    // ---- Phase 2b Part B: zero-copy claims (Producer::tryClaim / claimBatch) ----
+
+    /// What a granted claim hands to Claim / BatchClaim.
+    struct ClaimGrant {
+        SendResult      result  = SendResult::BackPressured;
+        int64_t         token   = 0;        ///< Ring: the M2O claim index; Direct: the claim generation
+        uint8_t*        base    = nullptr;  ///< value bytes of record 0
+        const uint32_t* offsets = nullptr;  ///< Direct batch: record i at base + offsets[i]; nullptr: stride
+    };
+    /// Reserve one record of `valueLen` value bytes: Ring — a SEND_RECORD slot
+    /// in the producer ring with its header written; the caller writes the
+    /// value and commitClaim()s.  ZERO allocation.  Results as trySubmit.
+    [[nodiscard]] ClaimGrant claimRecord(int32_t topicId, int32_t partition, const Key& key,
+                                         uint32_t valueLen, uint64_t ackHandle) noexcept;
+    /// Publish a granted claim.  False: it was released under the caller
+    /// (Ring: Client close's drain unblock) — nothing was accepted.
+    [[nodiscard]] bool commitClaim(int64_t token) noexcept;
+    /// Discard a granted claim (Ring: the slot becomes padding).
+    void abortClaim(int64_t token) noexcept;
+
     /// Slow path of the void send: retries until accepted; throws on non-retryable
     /// results (see Producer.h's send() doc for the exact exception per case).
     /// On BackPressured: if a pump hook is wired, it decides (see PumpResult) —

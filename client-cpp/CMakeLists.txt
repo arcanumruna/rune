@@ -373,6 +373,7 @@ if(aeron_FOUND)
     add_library(rune_client_producer STATIC
         src/producer/ProducerImpl.cpp
         src/producer/Producer.cpp
+        src/producer/Claim.cpp
         src/producer/ProducerHub.cpp
         src/producer/BatchBuilder.cpp
         src/producer/TransactionalProducerImpl.cpp
@@ -1443,6 +1444,7 @@ if(BUILD_TESTING)
             tests/producer/ProducerFlushDirtyTest.cpp
             tests/producer/ProducerAckTokenTest.cpp
             tests/producer/ProducerCloseTest.cpp
+            tests/producer/ProducerClaimTest.cpp
             tests/detail/M2ORingBufferTest.cpp
             tests/detail/OneToOneRingBufferTest.cpp
             tests/detail/CompletionsTest.cpp
