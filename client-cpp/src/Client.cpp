@@ -4316,6 +4316,15 @@ Producer Client::testProducerWithRingCap(ProducerConfig cfg, int32_t ringCap) {
 }
 
 Producer Client::producerWithRingCap_(ProducerConfig cfg, int32_t ringCap, bool direct) {
+    // Phase 2b F: creation validation of a transactional producer.
+    if (!cfg.transactionalId.empty()) {
+        if (cfg.acks == Acks::None) {
+            throw std::invalid_argument("ProducerConfig: a transactional producer needs acks = Leader or All");
+        }
+        if (cfg.transactionalId.size() > 255) {
+            throw std::invalid_argument("ProducerConfig: transactionalId is longer than 255 bytes");
+        }
+    }
     // ProducerImpl owns its own ring buffer (its batch correlation ids are
     // self-tagged — batchcorr — so it takes no shared counter).  F8c C7: held
     // here until the registration is accepted (then the duty side holds its

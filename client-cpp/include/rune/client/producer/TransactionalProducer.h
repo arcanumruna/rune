@@ -68,46 +68,7 @@ namespace rune::client {
 // Forward-declare implementation.
 namespace producer { class TransactionalProducerImpl; }
 
-// ---------------------------------------------------------------------------
-// TopicPartitionKey — (topicId, partition) pair for the addedPartitions set.
-// ---------------------------------------------------------------------------
-struct TopicPartitionKey {
-    int32_t topicId   = 0;
-    int32_t partition = 0;
-    bool operator==(const TopicPartitionKey& o) const noexcept {
-        return topicId == o.topicId && partition == o.partition;
-    }
-    bool operator<(const TopicPartitionKey& o) const noexcept {
-        return topicId < o.topicId ||
-               (topicId == o.topicId && partition < o.partition);
-    }
-};
-
-// ---------------------------------------------------------------------------
-// TxnState — Kafka's TransactionManager states (F8c fix round 1), owned by
-// the duty thread; app threads see it through TransactionalProducer::state().
-//   Uninitialized -> Initializing -> Ready -> InTransaction
-//     -> CommittingTransaction | AbortingTransaction -> Ready
-//   AbortableError: the transaction failed (a refused AddPartitions, a lost
-//     batch, failed offsets): commit completes with that error; the app MUST
-//     abortTransaction().
-//   A commit / abort that times out stays Committing / Aborting (in doubt):
-//     retry the SAME call (abort is refused while committing).  A transaction
-//     with nothing added ends locally (no EndTxn).  Commit's total wait can
-//     reach ~2x transactionOpTimeoutMs (data wait + EndTxn's own budget).
-//   FatalError: fenced (17 / 18) or InvalidTxnState on EndTxn — terminal:
-//     every op completes Fenced, no network op is ever sent again.
-// ---------------------------------------------------------------------------
-enum class TxnState : uint8_t {
-    Uninitialized = 0,
-    Initializing,
-    Ready,
-    InTransaction,
-    CommittingTransaction,
-    AbortingTransaction,
-    AbortableError,
-    FatalError,
-};
+// TopicPartitionKey / TxnState moved to Producer.h (Phase 2b F).
 
 // ---------------------------------------------------------------------------
 // TransactionalProducer — user-facing handle for the Tier-3 transactional API.

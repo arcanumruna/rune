@@ -439,6 +439,7 @@ enum class RejectReason : uint8_t {
     PartitionDeferred,  ///< Direct: this partition still has deferred records that cannot go yet
     Unaddressable,      ///< Direct: the producer's partition table is full
     ClaimHeld,          ///< Direct: an open claim owns the append path (Phase 2b B)
+    NotInTransaction,   ///< transactional producer, handle gate Closed (Phase 2b F)
 };
 
 // ---------------------------------------------------------------------------
@@ -532,6 +533,16 @@ public:
                           std::span<const uint8_t> value,
                           bool wantAck,
                           int64_t correlationId) noexcept;
+
+    // ---- Phase 2b F: the handle gate (issuing-thread state) -------------------
+    //
+    // Written only by the producer's single issuing thread (FD2/FD3): shared-nothing,
+    // no atomic.  NotTransactional = a plain producer (the hot path's only check,
+    // [[likely]]); Closed = transactional, outside a transaction; Open = between
+    // beginTransaction() and commit / abort / close.
+    enum class TxnGate : uint8_t { NotTransactional, Closed, Open };
+    [[nodiscard]] TxnGate txnGate() const noexcept { return txnGate_; }
+    void setTxnGate(TxnGate g) noexcept { txnGate_ = g; }
 
     /// Non-blocking submit (ZERO allocation, lock-free): checks the ring's closed
     /// word FIRST (fix1 C2/I3 — a Producer outliving its closed Client gets
@@ -1463,6 +1474,7 @@ private:
     rune::client::detail::M2ORingBuffer      ring_;
     IngressMode  mode_       = IngressMode::Ring;  // set once before any send (Task 14)
     Completions* batchAckCq_ = nullptr;            // app side: reserve one unit per send (C6)
+    TxnGate      txnGate_    = TxnGate::NotTransactional;  // Phase 2b F: issuing thread only (FD2)
 
     // ---- Agent-thread only (no lock needed — single-writer) ------------------
 

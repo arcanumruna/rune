@@ -297,6 +297,9 @@ std::vector<int32_t> assignShardCores(const ShardGroupConfig& g, uint32_t count,
 
 void validateShardGroupConfig(const ShardGroupConfig& g, uint32_t count) {
     if (count == 0) throw std::invalid_argument("ShardGroupConfig: shard count must be >= 1");
+    if (!g.producer.transactionalId.empty()) {  // Phase 2b F (FD3): same refusal as shardProducerConfig()
+        throw std::invalid_argument("ShardGroupConfig: a ClientShard producer cannot have a transactionalId");
+    }
 
     // Egress: shard i listens on base port + i.  Every port must fit, and none may
     // be the gateway's own endpoint on the same host.
@@ -399,6 +402,10 @@ ClientConfig shardClientConfig(const ShardGroupConfig& g, uint32_t index) {
 }
 
 ProducerConfig shardProducerConfig(const ShardGroupConfig& g) {
+    // Phase 2b F (FD3): a shard owns one producer; a transaction spanning shards is out of scope.
+    if (!g.producer.transactionalId.empty()) {
+        throw std::invalid_argument("ShardGroupConfig: a ClientShard producer cannot have a transactionalId");
+    }
     ProducerConfig p = g.producer;
     if (g.mode == ShardMode::Invoker) p.lingerUs = g.invokerLingerUs;
     return p;

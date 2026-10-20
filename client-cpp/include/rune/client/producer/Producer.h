@@ -61,6 +61,8 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <string>
+#include <string_view>
 #include <utility>
 #include <variant>
 
@@ -78,6 +80,55 @@ enum class Acks : uint8_t {
     None   = 0,  // send without waiting for a response (fully fire-and-forget)
     Leader = 1,  // wait for ProduceResponse from the leader (default)
     All    = 2,  // wait for all replicas (treated as Leader for M-B)
+};
+
+// ---------------------------------------------------------------------------
+// TopicPartitionKey - (topicId, partition) pair (moved here from
+// TransactionalProducer.h, Phase 2b F; unchanged).
+// ---------------------------------------------------------------------------
+struct TopicPartitionKey {
+    int32_t topicId   = 0;
+    int32_t partition = 0;
+    bool operator==(const TopicPartitionKey& o) const noexcept {
+        return topicId == o.topicId && partition == o.partition;
+    }
+    bool operator<(const TopicPartitionKey& o) const noexcept {
+        return topicId < o.topicId ||
+               (topicId == o.topicId && partition < o.partition);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// TxnState - Kafka's TransactionManager states (F8c fix round 1), owned by
+// the duty thread; app threads see it through Producer::state().
+//   Uninitialized -> Initializing -> Ready -> InTransaction
+//     -> CommittingTransaction | AbortingTransaction -> Ready
+//   AbortableError: the transaction failed (a refused AddPartitions, a lost
+//     batch, failed offsets): commit completes with that error; the app MUST
+//     abortTransaction().
+//   A commit / abort that times out stays Committing / Aborting (in doubt):
+//     retry the SAME call (abort is refused while committing).  A transaction
+//     with nothing added ends locally (no EndTxn).  Commit's total wait can
+//     reach ~2x transactionOpTimeoutMs (data wait + EndTxn's own budget).
+//   FatalError: fenced (17 / 18) or InvalidTxnState on EndTxn - terminal:
+//     every op completes Fenced, no network op is ever sent again.
+// ---------------------------------------------------------------------------
+enum class TxnState : uint8_t {
+    Uninitialized = 0,
+    Initializing,
+    Ready,
+    InTransaction,
+    CommittingTransaction,
+    AbortingTransaction,
+    AbortableError,
+    FatalError,
+};
+
+/// One offset of sendOffsetsToTransaction (a span, not a std::map: no allocation at the call).
+struct OffsetEntry {
+    int32_t topicId   = 0;
+    int32_t partition = 0;
+    int64_t offset    = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -110,6 +161,13 @@ struct ProducerConfig {
     int64_t transactionOpTimeoutMs = 60'000;
     int32_t maxFrameBytes    = 65536;   // hard per-FRAME wire cap (≤ this many bytes/frame),
                                          // independent of batchBytes — bounds fragmentation.
+    /// Phase 2b F: non-empty = a transactional producer.  A transactional producer has exactly ONE
+    /// issuing thread (every send / claim / batch / lifecycle call comes from it; Thread mode) - a
+    /// plain producer keeps "any thread".  acks must be Leader or All (Client::producer throws
+    /// std::invalid_argument for acks = None and for an id longer than 255 bytes; ClientShard refuses it).
+    std::string transactionalId;
+    /// InitProducerId's transactionTimeoutMs for a transactional producer.
+    int32_t     transactionTimeoutMs = 60'000;
     int64_t deliveryTimeoutMs = 30000;  // total time to keep retransmitting before failing.
     int64_t agentLivenessTimeoutMs = 1000; // void send(): back-pressured with no ring-consumer
                                            // heartbeat for this long => throw (runner gone)
@@ -249,6 +307,9 @@ enum class SendResult : uint8_t {
     ClaimHeld,      ///< Phase 2b B, Invoker mode: a claim on this producer is still open —
                     ///< commit() or abort() it first.  Never retryable by waiting (the
                     ///< blocking send() throws std::logic_error).
+    NotInTransaction,///< Phase 2b F: a transactional producer outside a transaction (before
+                    ///< beginTransaction() / after commit or abort was issued).  Nothing was
+                    ///< written, no credit is kept; the blocking send() throws std::logic_error.
 };
 
 // ---------------------------------------------------------------------------
@@ -694,6 +755,38 @@ public:
     /// linger / batch size).  Called from a duty-cycle callback it never waits
     /// (the next flush pass flushes all).
     void flush() noexcept;
+
+    // ---- Transactions (Phase 2b F) ------------------------------------------------
+    // Only a producer created with ProducerConfig::transactionalId has a
+    // lifecycle.  On a plain producer every token form returns
+    // OpResult::InvalidArgument (no completion) and every *AndWait /
+    // beginTransaction() throws std::logic_error("<op>: producer has no transactionalId").
+    // A transactional producer outside a transaction refuses every produce path
+    // with SendResult::NotInTransaction (send / sendTo / blocking claim helpers
+    // throw std::logic_error("produce outside a transaction")).
+
+    OpResult initTransactions(const CompletionTarget& target, Token token);
+    void     beginTransaction();
+    OpResult sendOffsetsToTransaction(std::span<const OffsetEntry> offsets, std::string_view groupId,
+                                      const CompletionTarget& target, Token token);
+    OpResult commitTransaction(const CompletionTarget& target, Token token);
+    OpResult abortTransaction(const CompletionTarget& target, Token token);
+    /// Token form of flush(); the existing void flush() stays.
+    OpResult flush(const CompletionTarget& target, Token token);
+
+    static constexpr std::chrono::nanoseconds kDefaultTxnWait = std::chrono::seconds(60);
+    void initTransactionsAndWait(std::chrono::nanoseconds timeout = kDefaultTxnWait);
+    void sendOffsetsToTransactionAndWait(std::span<const OffsetEntry> offsets, std::string_view groupId,
+                                         std::chrono::nanoseconds timeout = kDefaultTxnWait);
+    void commitTransactionAndWait(std::chrono::nanoseconds timeout = kDefaultTxnWait);
+    void abortTransactionAndWait(std::chrono::nanoseconds timeout = kDefaultTxnWait);
+    void flushAndWait(std::chrono::nanoseconds timeout = kDefaultTxnWait);
+
+    [[nodiscard]] TxnState state() const noexcept;
+    [[nodiscard]] int64_t  producerId() const noexcept;  ///< -1 until assigned
+    [[nodiscard]] int16_t  producerEpoch() const noexcept;
+    [[nodiscard]] bool     transactionActive() const noexcept;
+    [[nodiscard]] bool     transactional() const noexcept;
 
     // ---- Close (F8c C6a) --------------------------------------------------------
 

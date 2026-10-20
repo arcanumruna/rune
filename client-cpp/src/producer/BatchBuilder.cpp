@@ -105,6 +105,9 @@ OpResult BatchBuilder::submit_(uint64_t ackHandle) {
     // bytes are moved only when accepted.
     const producer::RejectReason why =
         impl_->submitTier2Batch(topicId_, partition_, ackHandle, recordCount_, batchBytes_);
+    // Phase 2b F: a transactional producer outside a transaction.  OpResult has no such value;
+    // like every other misuse of a Tier-2 batch it throws (the callers return their credit).
+    if (why == producer::RejectReason::NotInTransaction) throw std::logic_error("produce outside a transaction");
     if (why == producer::RejectReason::None) {
         sent_ = true;
         batchBytes_.clear();

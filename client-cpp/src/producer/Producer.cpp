@@ -409,6 +409,75 @@ void Producer::flush() noexcept {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 2b F: transactions (Task 1: the API surface and its refusals; the
+// lifecycle on a transactional producer is wired in Task 8)
+// ---------------------------------------------------------------------------
+
+bool Producer::transactional() const noexcept {
+    return impl_ != nullptr && !impl_->config().transactionalId.empty();
+}
+
+namespace {
+[[noreturn]] void throwNoTransactionalId(const char* op) {
+    throw std::logic_error(std::string(op) + ": producer has no transactionalId");
+}
+[[noreturn]] void throwNotWired(const char* op) {
+    throw std::logic_error(std::string(op) + ": transactional lifecycle is not wired yet");
+}
+}  // namespace
+
+// Token forms: a plain producer is refused explicitly (no completion).  A
+// transactional one is not wired yet: also InvalidArgument until Task 8.
+OpResult Producer::initTransactions(const CompletionTarget&, Token) { return OpResult::InvalidArgument; }
+
+OpResult Producer::sendOffsetsToTransaction(std::span<const OffsetEntry>, std::string_view,
+                                            const CompletionTarget&, Token) {
+    return OpResult::InvalidArgument;
+}
+
+OpResult Producer::commitTransaction(const CompletionTarget&, Token) { return OpResult::InvalidArgument; }
+
+OpResult Producer::abortTransaction(const CompletionTarget&, Token) { return OpResult::InvalidArgument; }
+
+OpResult Producer::flush(const CompletionTarget&, Token) { return OpResult::InvalidArgument; }
+
+void Producer::beginTransaction() {
+    if (!transactional()) throwNoTransactionalId("beginTransaction()");
+    throwNotWired("beginTransaction()");
+}
+
+void Producer::initTransactionsAndWait(std::chrono::nanoseconds) {
+    if (!transactional()) throwNoTransactionalId("initTransactions()");
+    throwNotWired("initTransactions()");
+}
+
+void Producer::sendOffsetsToTransactionAndWait(std::span<const OffsetEntry>, std::string_view,
+                                               std::chrono::nanoseconds) {
+    if (!transactional()) throwNoTransactionalId("sendOffsetsToTransaction()");
+    throwNotWired("sendOffsetsToTransaction()");
+}
+
+void Producer::commitTransactionAndWait(std::chrono::nanoseconds) {
+    if (!transactional()) throwNoTransactionalId("commitTransaction()");
+    throwNotWired("commitTransaction()");
+}
+
+void Producer::abortTransactionAndWait(std::chrono::nanoseconds) {
+    if (!transactional()) throwNoTransactionalId("abortTransaction()");
+    throwNotWired("abortTransaction()");
+}
+
+void Producer::flushAndWait(std::chrono::nanoseconds) {
+    if (!transactional()) throwNoTransactionalId("flush()");
+    throwNotWired("flush()");
+}
+
+TxnState Producer::state() const noexcept { return TxnState::Uninitialized; }
+int64_t  Producer::producerId() const noexcept { return -1; }
+int16_t  Producer::producerEpoch() const noexcept { return -1; }
+bool     Producer::transactionActive() const noexcept { return false; }
+
+// ---------------------------------------------------------------------------
 // F8c C6a: close
 // ---------------------------------------------------------------------------
 

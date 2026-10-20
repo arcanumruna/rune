@@ -336,6 +336,7 @@ ProducerImpl::ProducerImpl(ProducerConfig cfg,
     , ring_(ringBuf_.get(), static_cast<std::size_t>(ringTotalBytes(ringCap)))
     , producerId_(generateProducerId(this))  // F5: unique per instance, never the old shared stub
 {
+    if (!cfg_.transactionalId.empty()) txnGate_ = TxnGate::Closed;  // Phase 2b F: closed until beginTransaction()
     // Pre-reserve partition map and encode scratch to avoid allocs on steady-state.
     partitions_.reserve(16);
     encodeScratch_.reserve(64 * 1024); // Produce wire frame (grown once)
@@ -443,6 +444,13 @@ int64_t ProducerImpl::steadyNowNs_() noexcept {
 SendResult ProducerImpl::trySubmit(int32_t topicId, int32_t partition, const Key& key,
                                    std::span<const uint8_t> value, int64_t ackHandle,
                                    RejectReason* why) noexcept {
+    // Phase 2b F: the one extra branch on the hot path (a byte load + compare).
+    if (txnGate_ != TxnGate::NotTransactional) [[unlikely]] {
+        if (txnGate_ == TxnGate::Closed) {
+            if (why != nullptr) *why = RejectReason::NotInTransaction;
+            return SendResult::NotInTransaction;
+        }
+    }
     if (mode_ == IngressMode::Direct) {
         RejectReason w = RejectReason::None;
         const SendResult r = tryAppendDirect_(topicId, partition, key, value, ackHandle, w);
@@ -958,6 +966,8 @@ void ProducerImpl::throwForSendResult(SendResult r) {
     case SendResult::ClaimHeld:
         throw std::logic_error("Producer::send: a claim is open on this invoker-mode producer - "
                                "commit() or abort() it first");
+    case SendResult::NotInTransaction:
+        throw std::logic_error("produce outside a transaction");
     case SendResult::InvalidArgument:
         throw std::invalid_argument("Producer::send: invalid token or completion queue");
     }
@@ -1098,6 +1108,7 @@ RejectReason ProducerImpl::submitTier2Batch(int32_t topicId,
                                      int32_t recordCount,
                                      std::vector<uint8_t>& batchBytes)
 {
+    if (txnGate_ == TxnGate::Closed) [[unlikely]] return RejectReason::NotInTransaction;
     if (mode_ == IngressMode::Direct) {
         // Task 14: queue straight onto the partition (owner thread only — the same
         // state the ring drain's kMsgTier2Batch branch would touch).  Closed (or a
@@ -3325,6 +3336,11 @@ inline void writeClaimHeader(uint8_t* d, int32_t topicId, int32_t partition, con
 
 ProducerImpl::ClaimGrant ProducerImpl::claimRecord(int32_t topicId, int32_t partition, const Key& key,
                                                    uint32_t valueLen, uint64_t ackHandle) noexcept {
+    if (txnGate_ == TxnGate::Closed) [[unlikely]] {
+        ClaimGrant refused;
+        refused.result = SendResult::NotInTransaction;
+        return refused;
+    }
     // Invoker: the claim is reserved in the partition builder, never in the ring.
     if (mode_ == IngressMode::Direct) return claimRecordDirect_(topicId, partition, key, valueLen, ackHandle);
     ClaimGrant g;
@@ -3381,6 +3397,11 @@ SendResult ProducerImpl::checkBatchClaim_(const Key& key, uint32_t n, uint32_t r
 
 ProducerImpl::ClaimGrant ProducerImpl::claimBatch(int32_t topicId, int32_t partition, const Key& key, uint32_t n,
                                                   uint32_t recLen) noexcept {
+    if (txnGate_ == TxnGate::Closed) [[unlikely]] {
+        ClaimGrant refused;
+        refused.result = SendResult::NotInTransaction;
+        return refused;
+    }
     if (mode_ == IngressMode::Direct) return claimBatchDirect_(topicId, partition, key, n, recLen);
     ClaimGrant g;
     const SendResult check = checkBatchClaim_(key, n, recLen);
