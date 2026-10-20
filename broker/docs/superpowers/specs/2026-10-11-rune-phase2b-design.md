@@ -27,26 +27,43 @@ Order: **C → E → E2 → D → B → F → A** (F added 2026-10-12, after B b
 - `LastNonNull`: value of the most recently written contributor whose value is non-null; NULL if none. New wire rule **`MergeRule::LastNonNull = 8`** (append-only).
 - Table semantics, co-partition rule (single-partition source), and retraction on update / group move / delete are exactly 2a's.
 
-### Storage (user-approved: per-group contributor list)
+> **Amended 2026-10-20 (user decision): contiguous per-group Min/Max value block.** Storage, Maintenance, Persistence and Gates below are amended; Semantics are unchanged.
+> *Why:* the approved list design rescans a retracted Min/Max by walking the group's contributor list, and every hop is a contributor-key hash lookup into a table of up to millions of rows (a dependent cache miss, about 200 ns). On the §14.0 typical-case bench (1M contributors / 10k groups, about 100 per group, 60/25/15 create/update/tombstone churn) a walk costs about 21 µs; about 5.8% of records rescan (2.2% even with uniformly random amounts, since each record has a 1/100 chance of holding each extreme), so record p99 was 21.2 µs and batch p99 25.1 µs against the 5 µs / 10 µs gate. Honest churn fails the gate unless the rescan itself is cheap. The user chose "faster rescans now": each group keeps its Min/Max input values in one contiguous, preallocated, checkpointed block, so a rescan is a sequential scan of packed values (a few independent chunk lookups) instead of a chase through list links. The MRU list stays for `Last`/`LastNonNull`; the 1k/10k extreme-retraction cases stay reported, not gated.
+
+### Storage (user-approved: per-group contributor list; amended 2026-10-20: plus a per-group Min/Max value block)
 Only views that use any of the four rules get the extra columns; 2a-only views keep their 2a layout byte-for-byte.
 - **Contributor row** gains `[prev u64][next u64]` — a doubly linked list of the group's contributors, keys as links (`kNoContributor = UINT64_MAX`), in **MRU order**: every write of a contributor moves it to the list head.
-- **Group row** gains `[head u64]` and, per `Min`/`Max` field, a cached `[value 8B][valid u8]`.
-- **Input value slots get the source field's width** (Last/LastNonNull over `string(N)` stores N bytes) instead of a fixed 8; `AggLayout` carries per-input offset + width.
+- **Group row** gains `[head u64]` and, per `Min`/`Max` field, a cached `[value 8B][state u8]`.
+- **Input value slots get the source field's width** (Last/LastNonNull over `string(N)` stores N bytes) instead of a fixed 8; `AggLayout` carries per-input offset + width. (Plan AD3: Last/LastNonNull inputs only.)
+- **Min/Max value block (amended 2026-10-20)** — only in views with at least one `Min` or `Max`:
+  - A fourth auxiliary table, `blocks`, of fixed-size **chunk rows**. One chunk holds `kBlockEntries = 32` entries of one group, stored column-wise: `[contributorKey u64 × 32][per column: value 8B × 32][per column: null u8 × 32]`, so a row is `32 × (8 + 9 × columns)` bytes. There is one **column per distinct Min/Max source field** (`Min(x)` and `Max(x)` share one), holding the same widened 8-byte value and null flag as the contributor row.
+  - Chunk key = `blockId << 32 | chunkIndex`. `blockId` (u32, never 0) is picked when the group gets its first entry: `blockIdCandidate(groupKey)` (a fixed 64-bit mix), probing linearly past ids in use. An id is in use exactly when its chunk 0 exists. The id is stored in the group row, so the choice survives a restart byte for byte, and ids are reused once their group empties (no counter, no exhaustion).
+  - Group row gains `[blockId u32][blockChunks u32]` after the caches. Contributor row gains `[blockPos u32]` at its end (its entry index in its group's block).
+  - Entries are **dense**: a group of `n` contributors uses positions `0..n-1`, every chunk but the tail is full, and the tail holds `((n-1) mod 32) + 1`. A group keeps at most **one spare** empty chunk past its tail.
+  - Views with only `Last`/`LastNonNull` have no block; their layout is the list layout above.
 
 ### Maintenance
 - **Add** (insert or update of contributor `c` into group `g`): unlink `c` from its old list if any, link at head of `g`; for each Min/Max field with a non-null value: compare with the cached extreme, replace if better (O(1)).
-- **Retract** (update, move, tombstone, missing group value): unlink `c`; for each Min/Max field whose cached value equals `c`'s old value → mark the field **rescan-pending**. After the record's add (if any) completes, each rescan-pending field walks `g`'s list once and recomputes the extreme (O(group size)). An in-place update whose new value is already at least as extreme skips the rescan.
+- **Retract** (update, move, tombstone, missing group value): unlink `c`; for each Min/Max field whose cached value equals `c`'s old value → mark the field **rescan-pending**. After the record's add (if any) completes, each rescan-pending field recomputes the extreme by one sequential scan of `g`'s **value block** (amended 2026-10-20; was a list walk): `ceil(n/32)` independent chunk lookups plus a scan of `n` packed values, about 0.2–0.4 µs for 100 entries. An in-place update whose new value is already at least as extreme skips the rescan.
+- **Value block (amended 2026-10-20):**
+  - An add of a new contributor, or a move into `g`, **appends** at position `n` (into the tail, the spare, or a new chunk at a boundary).
+  - An in-place update (same group) **rewrites** the entry at its position.
+  - A retract that leaves the group (move, tombstone, missing group value) **swap-removes**: the group's last entry moves into the hole and the moved contributor's `blockPos` is patched.
+  - Chunk policy with hysteresis: when the tail chunk empties it becomes the spare; the spare is freed only once the tail chunk is at most half full (16 entries), so ±1 churn at a boundary never frees or re-adds a chunk. When `n` reaches 0 the block (chunk 0) and its id are freed.
 - **Last** = head's value — O(1) always (MRU order; unlinking the head promotes the next). **LastNonNull** = first non-null walking from the head (stops at the first hit).
 - Emit writes Min/Max from the cache (NULL if `nonNull == 0`), Last/LastNonNull from the list.
-- Inconsistency (a link pointing at a missing contributor, a rescan finding a non-null count mismatch) increments `aggInconsistent` and never crashes or invents state (2a rule).
+- Inconsistency (a link pointing at a missing contributor, a rescan finding a non-null count mismatch; amended: a missing chunk, a position out of range, an entry that names a different contributor, a swap-moved contributor that is missing) increments `aggInconsistent` and never crashes or invents state (2a rule): a missing row is never followed and never created.
 
 ### Persistence
-No new tables, no format change: links, heads and caches live in the contributor and group tables the 2a v2 multi-table record already checkpoints offset-atomically. Recovery is unchanged; the per-pass delta cap's worst-case-entries-per-record bound is recomputed (a contributor move dirties: contributor, both neighbours in the old list, the old head's group, the new head, both groups, both view rows — the plan derives the exact bound and the test pins it).
+- Links, heads, caches, block ids and positions live in the contributor and group tables that the 2a v2 multi-table record already checkpoints offset-atomically.
+- **Amended 2026-10-20:** a view with Min/Max checkpoints **one more table**, `blocks` (table id 3), in the same v2 record. The v2 wire format itself is unchanged (it already carries `tableCount` and per-table `[id][rowLen][count]`). Records of 2a-only and Last-only views stay byte-identical (3 tables).
+- Recovery replays all four tables at the same `O`, offset-atomically, like the other three. There is no rebuild step and no eager validation. A chunk missing or damaged after recovery is caught on use (counted, never followed, never created).
+- The per-pass delta cap's worst-case-entries-per-record bound is recomputed (amended): a contributor move dirties at most **5 contributor rows** (the contributor, its two old neighbours, the new group's old head, and the old group's swap-moved contributor), **2 group rows**, **2 view rows** and **3 block rows** (the hole's chunk and the freed spare in the old group, and the append chunk in the new group). That is 12 entries, against 8 for a Last-only view and 5 for 2a. The plan derives the bound and a test pins it.
 
 ### Gates
-- Typical-case fold: record p99 < 5 µs, batch p99 < 10 µs, zero steady-state allocation (§14.0).
-- Separate benchmark: retracting the cached extreme in a group of 1k and 10k contributors — reported, not gated (the known O(group size) path).
-- Tests: extreme retraction surfaces the next (incl. duplicates of the extreme, group moves, in-place raise/lower), Last after deleting the newest, LastNonNull skipping nulls, Float NaN/Inf, restart then retraction of the extreme still exact (Review-Focus style regression), e2e: `user_totals` gains `max`, `min`, `last` across the broker restart.
+- Typical-case fold: record p99 < 5 µs, batch p99 < 10 µs, zero steady-state allocation (§14.0). Never relaxed. Amended 2026-10-20: the gate must pass on the honest churn above, with its natural ~5.8% rescanning records.
+- Separate benchmark: retracting the cached extreme in a group of 1k and 10k contributors — reported, not gated (the O(group size) path, now a sequential scan).
+- Tests: extreme retraction surfaces the next (incl. duplicates of the extreme, group moves, in-place raise/lower), Last after deleting the newest, LastNonNull skipping nulls, Float NaN/Inf, restart then retraction of the extreme still exact (Review-Focus style regression), e2e: `user_totals` gains `max`, `min`, `last` across the broker restart. Amended: the value block is tested across op × block position (chunk 0 slot 0, chunk boundaries, tail, spare reuse and free) × timing (single/multi-record batch, capped pass, checkpoint round trip).
 
 ---
 

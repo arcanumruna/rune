@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Amended 2026-10-20 (user decision): contiguous per-group Min/Max value block.** Task 5's gate run failed on honest churn (record p99 21.2 µs, batch p99 25.1 µs; a ~100-contributor list walk costs ~21 µs at ~200 ns per hop). Spec §A (Storage, Maintenance, Persistence, Gates) is amended. The new **Task 5b** (after Task 5) adds a fourth aux table of fixed 32-entry chunk rows holding each group's Min/Max inputs densely, so a rescan is a sequential scan, not a list walk. It also moves the node's checkpoint/replay/pass cap onto the 4-table record and sets the bound to {5, 2, 2, 3} for Min/Max views. Tasks 6–9 are patched where the bound, layout or tests change. Architecture, Global Constraints, Review Focus, Interaction matrix and File Structure are updated to match. The MRU list, the O(1) head, Last-only views and 2a-only views are unchanged.
+
 > **Updated 2026-10-20 (plan refresh after D/B/F, monorepo)** — re-checked against the monorepo (`/Users/vradu/Projects/rune`, branch `feat/phase2b-a-retractable-min-max-last`, cut from main `a739aab5`) by the Part A preflight (`.superpowers/sdd/2026-10-11-rune-phase2b-a-retractable-min-max-last/preflight.md`; the controller accepted every ruling). Changes:
 > 1. **Monorepo paths:** one repo, one branch. Every path is relative to the repo root: `libs/…` is `broker/libs/…`, `rune-client-cpp/…` is `client-cpp/…`, `docker/…` is `broker/docker/…`, `benchmark/…` is `broker/benchmark/…`, `../rune-codec` is `codec`. The two-repo branch cut and the two-repo commits are gone.
 > 2. **Build dirs and commands:** `build-fast` is `build/root`; `build-bench-rel` is `build/rel` (binary `build/rel/broker/rune_broker_benchmark`; `build/bench-rel` is the client's); `rune-client-cpp/build` is `build/sub-client-cpp`; CatalogGolden runs in `build/sub-codec`. No ASan/TSan builds exist, so the controller runs the sanitizers once at the Phase 2b close. Per-task test runs are affected-area only (F13).
@@ -20,7 +22,7 @@
 
 **Goal:** Aggregate views can maintain `Min`, `Max`, `Last` and `LastNonNull` with exact retraction on update, group move and delete, and keep that exact across a checkpoint/restart. 2a-only views stay exactly as they are.
 
-**Architecture:** Only views that use one of the four rules are **linked**. In a linked view, each contributor row gains `[prev u64][next u64]` links that form a doubly linked MRU list of the group's contributors, keyed by contributor key (`kNoContributor = UINT64_MAX`). Each group row gains `[head u64]` plus, per `Min`/`Max` field, a cached `[value 8B][state u8]`. `Last` is the head's value and `LastNonNull` is the first non-null value walking from the head. `Min`/`Max` come from the cache, and the fold walks the list once only when the cached extreme is retracted. Links, heads and caches live in the contributor and group tables that the 2a v2 multi-table checkpoint already persists, so recovery does not change. The per-pass delta cap's worst case per record grows from 5 to 8 dirty entries for linked views; the plan derives that bound exactly and a test pins it.
+**Architecture:** Only views that use one of the four rules are **linked**. In a linked view, each contributor row gains `[prev u64][next u64]` links that form a doubly linked MRU list of the group's contributors, keyed by contributor key (`kNoContributor = UINT64_MAX`). Each group row gains `[head u64]` plus, per `Min`/`Max` field, a cached `[value 8B][state u8]`. `Last` is the head's value and `LastNonNull` is the first non-null value walking from the head. `Min`/`Max` come from the cache. **Amended 2026-10-20 (Task 5b):** a view with a Min or Max also keeps each group's Min/Max inputs in a **value block**: a fourth aux table of fixed 32-entry chunk rows, column-wise, dense positions, one spare chunk with hysteresis. When the cached extreme is retracted, the fold scans that block sequentially (`ceil(n/32)` independent chunk lookups) instead of walking the list. Links, heads, caches, block ids and positions live in the contributor and group rows; the block table travels as table 3 of the same v2 multi-table checkpoint, offset-atomic. The per-pass delta cap's worst case per record is 5 entries for 2a, 8 for Last-only linked views and 12 ({5, 2, 2, 3}) for Min/Max views; the plan derives that bound exactly and a test pins it.
 
 **Tech Stack:** C++23 (clang, `__int128`), GoogleTest, Google Benchmark, CMake/Ninja (`build/root`), docker e2e on the k3s VM.
 
@@ -51,7 +53,7 @@
 - `LastNonNull` is the value of the most recently written contributor whose value is non-null, or NULL if there is none. It uses the new wire rule **`MergeRule::LastNonNull = 8`** (append-only).
 - Table semantics, the co-partition rule (single-partition source) and retraction on update, group move and delete are exactly 2a's.
 - **Only views that use one of the four rules get the extra columns. 2a-only views keep their 2a layout byte-for-byte**, including the fold, emit order, counters and v2 checkpoint bytes.
-- Wire enums are append-only. Persistence: no new tables and no format change. Recovery is unchanged.
+- Wire enums are append-only. Persistence: no format change. **Amended 2026-10-20:** a view with Min/Max checkpoints one more table (value blocks, id 3) inside the unchanged v2 record; 2a-only and Last-only records stay byte-identical. Recovery replays all tables at the same `O`.
 - Inconsistent state (a link to a missing contributor, or a rescan whose non-null count does not match) increments `aggInconsistent`. It never crashes and never invents state.
 - §14.0 gate (typical-case fold): **record p99 < 5 µs, batch p99 < 10 µs, zero steady-state allocation.** The extreme-retraction benchmark (groups of 1k and 10k contributors) is **reported, not gated**.
 
@@ -67,8 +69,8 @@
 These are the input classes most likely to hurt a user. Each one is pinned by a named test in the task that owns it:
 
 1. **Retracting one of several equal extremes.** `Max` must stay at the duplicated value and must not fall to the next distinct value. Test: `AggRetractableRegression.RetractingOneOfDuplicateExtremesKeepsTheExtremeRegression` (Task 5).
-2. **A restart, then retraction of the extreme.** The rescan must walk the **recovered** list and caches and give the exact next extreme. Tests: `WorkerViewSetRegression.RestartThenRetractingTheMaxIsExactRegression` (Task 7) and the e2e verify leg (Task 9: `o3 5→25` retracts the `min`, `o1 50→20` retracts the `max`).
-3. **The per-pass delta cap with linked rows.** A group move dirties up to 8 rows. If the bound is too low, a large pass throws on the worker thread. Tests: `AggRetractableRegression.WorstCaseMoveDirtiesExactlyTheDerivedBoundRegression` and `AggRetractableRegression.RandomizedOpsMatchBruteForceModelRegression` (Task 6), and `WorkerViewSetRegression.PersistedRetractableMovesDeltasFitTheRingRegression` (Task 7).
+2. **A restart, then retraction of the extreme.** The rescan must scan the **recovered** value block (amended 2026-10-20; it was the list) and caches, and give the exact next extreme. Tests: `WorkerViewSetRegression.RestartThenRetractingTheMaxIsExactRegression` (Task 7) and the e2e verify leg (Task 9: `o3 5→25` retracts the `min`, `o1 50→20` retracts the `max`).
+3. **The per-pass delta cap with linked rows.** A group move dirties up to 12 entries in a Min/Max view: 5 contributor, 2 group, 2 view and 3 value-block rows (8 in a Last-only view). If the bound is too low, a large pass throws on the worker thread. Tests: `AggRetractableRegression.WorstCaseMoveDirtiesExactlyTheBoundRegression` and `AggRetractableRegression.BlockModelAcrossChunkBoundariesMatchesBruteForceRegression` (Task 5b), `AggRetractableRegression.RandomizedOpsMatchBruteForceModelRegression` (Task 6), and `WorkerViewSetRegression.PersistedRetractableMovesDeltasFitTheRingRegression` (Task 7).
 4. **A contributor whose 8-byte key equals the `kNoContributor` sentinel (`0xFF…FF`).** It must be skipped and counted, never linked; linking it would corrupt the list's end marker. Test: `AggRetractableRegression.ContributorKeyEqualToSentinelIsSkippedRegression` (Task 5).
 5. **A damaged link** (a neighbour or head that is missing from the contributor table). It must be counted and must never be followed or created. There must be no loop and no crash. Test: `AggRetractableRegression.DanglingLinkIsCountedNotFollowedRegression` (Task 5).
 
@@ -103,6 +105,8 @@ Every feature is tested across op × entity × timing (CLAUDE.md memory: test in
 | capped-pass boundary / mid-batch resume (pass 1 stops at `bound`, pass 2 resumes from the cursor; dirty entries coalesce inside a pass) | model, every 5th multi-record step is split at a random boundary (bound check: at most records × per-record bound per pass); `WorkerViewSetRegression.PersistedRetractableMovesDeltasFitTheRingRegression` (real caps, Task 7) |
 | across restart (links, head, caches recovered from the v2 checkpoint) | `WorkerViewSetRegression.RestartThenRetractingTheMaxIsExactRegression` (Task 7: in-place lower of the recovered max); the e2e verify leg (Task 9: in-place raise past the cached min, in-place lower of the cached max, with the group move done before the restart) |
 
+**Value block (Task 5b).** Op × block position (chunk 0 slot 0, chunk boundary 31/32 and 63/64, tail, swapped-in entry) × group-size state (first entry and id pick, id collision, boundary ±1 with spare reuse, spare freed at tail ≤ 16, n → 0 frees the id) × timing (single and multi-record batch, capped pass, checkpoint round trip, worker restart). The full cell-to-test table is in Task 5b.
+
 Known thin spots, accepted: tombstone-after-restart and Last/LastNonNull after restart are covered only by the e2e's head values; a restart in the middle of a capped multi-pass range is covered by 2a's recovery tests (the format is unchanged).
 
 ---
@@ -119,7 +123,10 @@ Known thin spots, accepted: tombstone-after-restart and Last/LastNonNull after r
 | `broker/libs/view/include/rune/view/ViewFold.h` | `FoldStats::aggRescans` | 5 |
 | `broker/libs/view/src/AggFold.cpp` | list maintenance, cache maintenance, rescan, Last/LastNonNull emit | 5 |
 | `broker/libs/view/tests/view/AggRetractableTest.cpp` (new), `broker/libs/view/CMakeLists.txt` | fold tests, bound pin, model test | 5, 6 |
-| `broker/libs/node/src/WorkerViewSet.cpp` | per-pass cap from `aggDirtyBoundPerRecord` | 7 |
+| `broker/libs/view/include/rune/view/AggState.h`, `broker/libs/view/src/AggState.cpp`, `broker/libs/view/include/rune/view/AggFold.h`, `broker/libs/view/src/AggFold.cpp` | Min/Max value block: layout, bound {5,2,2,3}, append / in-place / swap-remove / spare policy, block rescan, `blocks` overload | 5b |
+| `broker/libs/view/tests/view/AggStateTest.cpp`, `broker/libs/view/tests/view/AggRetractableTest.cpp` | block layout pins, harness, worst-case pin, block tests and model | 5b |
+| `broker/libs/node/include/rune/node/WorkerViewSet.h`, `broker/libs/node/src/WorkerViewSet.cpp`, `broker/benchmark/ViewFoldBench.cpp` (`AggRig`) | fourth table: hosting, fold call, replay, checkpoint, discard, backlog, per-pass cap | 5b |
+| `broker/libs/node/src/WorkerViewSet.cpp`, `broker/libs/node/include/rune/node/WorkerViewSet.h` | `ViewFoldCounters::aggRescans` (the per-pass cap itself moved to 5b) | 7 |
 | `broker/libs/node/tests/node/WorkerViewSetTest.cpp` | restart regression, large-range move regression | 7 |
 | `broker/benchmark/ViewFoldBench.cpp` | shared `AggRig` helper (F10), `BM_ViewFoldRetractable` (gate; runs right after Task 5, F4), `BM_ViewFoldExtremeRetract` (reported) | 8 |
 | `client-cpp/examples/view_probe.cpp`, `broker/docker/view-engine-e2e.sh`, `docs/api/client-cpp.md` (F5), `broker/docs/release-notes/phase2b-a-retractable-aggregates.md` (F11) | `user_totals` gains `max`/`min`/`last` across the restart; API doc and release note | 9 |
@@ -1986,6 +1993,1336 @@ Expected: `[ViewFoldRetractable gate] … => PASS`, and `BM_ViewFoldAggregate` /
 
 ---
 
+### Task 5b: contiguous Min/Max value block
+
+> **Added 2026-10-20 (user decision, spec §A amended the same day).** Task 5's gate run measured record p99 21.2 µs and batch p99 25.1 µs (`BM_ViewFoldRetractable`, `build/rel`; zero allocations, p50 0.75 µs). About 5.8% of records rescan, and a list walk over ~100 contributors costs ~21 µs (~200 ns per hop: each link is a contributor-key hash lookup into a 1M-row table). Even uniformly random amounts rescan 2.2% of records, so honest churn fails p99 unless the rescan is cheap. The user chose **"faster rescans now"**: each group keeps its Min/Max input values in one contiguous, preallocated, checkpointed block, and a rescan is a sequential scan of packed values. The MRU list, the O(1) head and the 2a byte-identical layout are unchanged; views with only `Last`/`LastNonNull` get no block.
+>
+> **Carried Task 5 review items (both owned here or placed):**
+> 1. The byte-budget half of `WorstCaseMoveDirtiesExactlyTheBoundAndFitsTheBudgetRegression` is tautological (it multiplies the same row lengths on both sides). Step 1c **replaces** that test with `WorstCaseMoveDirtiesExactlyTheBoundRegression`, a pure dirty-count pin on all four tables. The budget itself is pinned on the node side by Task 7's `PersistedRetractableMovesDeltasFitTheRingRegression`, which throws if the bound is too low.
+> 2. `FoldStats::aggRescans` goes up to the node counter beside `aggInconsistent` (`ViewFoldCounters`, `WorkerViewSet.h`). **Task 7 owns it** (Step 3 there), because Task 7 already edits that accumulate block and asserts the counter in its restart regression.
+
+**Files:**
+- Modify: `broker/libs/view/include/rune/view/AggState.h` (block constants and helpers, `AggLayout` block members, `AggDirtyBound::blockRows`, `kAggTableBlocks`, `loadU32`/`storeU32`)
+- Modify: `broker/libs/view/src/AggState.cpp` (`buildAggLayout` tail, `aggDirtyBoundPerRecord`)
+- Modify: `broker/libs/view/include/rune/view/AggFold.h` (the `blocks` overload)
+- Modify: `broker/libs/view/src/AggFold.cpp` (`Ctx::blocks`, block maintenance, the block rescan, the fold's two hook points)
+- Modify: `broker/libs/view/tests/view/AggStateTest.cpp` (layout pins)
+- Modify: `broker/libs/view/tests/view/AggRetractableTest.cpp` (harness, one changed expectation, one replaced test, new block tests)
+- Modify: `broker/libs/node/include/rune/node/WorkerViewSet.h` (`AggInstance::blocks`, the fold call, `discardDirty_`, `dirtyBacklog`)
+- Modify: `broker/libs/node/src/WorkerViewSet.cpp` (`replayInstance`, `maxRecordsPerPassFor`, `buildAndPushCheckpoint_`)
+- Modify: `broker/benchmark/ViewFoldBench.cpp` (`AggRig` owns the block table)
+
+**Interfaces:**
+- Consumes: Task 4's `AggLayout` (`linked`, `inputOff`, `numCached`, `groupCacheOff`, `contribNullOff`), Task 5's fold (`Ctx`, `RetractMode`, `linkedContributor`, `rescan`, `emit`), `ViewTable::get/put/erase/size/drainDirty`, `encodeMultiDelta`/`applyMultiDelta` (v2, up to 64 tables).
+- Produces (exact, in `rune::view`):
+  ```cpp
+  inline constexpr uint32_t kBlockEntries     = 32;   // entries per chunk row (power of two)
+  inline constexpr uint32_t kBlockShift       = 5;    // log2(kBlockEntries)
+  inline constexpr uint32_t kBlockMask        = kBlockEntries - 1;
+  inline constexpr uint32_t kBlockSpareFreeAt = kBlockEntries / 2;   // free the spare once the tail holds <= 16
+  inline constexpr uint32_t kNoBlock          = 0;    // group row blockId: no block
+  inline constexpr uint32_t kBlockIdProbes    = 64;   // linear-probe limit when picking a block id
+  inline constexpr uint8_t  kAggTableBlocks   = 3;    // v2 checkpoint table id
+  constexpr uint64_t blockChunkKey(uint32_t blockId, uint32_t chunk) noexcept;   // blockId << 32 | chunk
+  constexpr uint32_t blockIdCandidate(uint64_t groupKey) noexcept;             // never kNoBlock
+  constexpr uint32_t blockKeyOff(uint32_t slot) noexcept;
+  constexpr uint32_t blockValOff(uint16_t col, uint32_t slot) noexcept;
+  uint32_t blockNullOff(const AggLayout& a, uint16_t col, uint32_t slot) noexcept;
+  uint32_t loadU32(const uint8_t* p) noexcept;  void storeU32(uint8_t* p, uint32_t v) noexcept;
+  struct AggLayout { /* Task 4 members unchanged */
+      uint16_t numBlockCols; std::vector<uint16_t> blockColInput; std::vector<uint16_t> cacheCol;
+      uint32_t contribBlockPosOff; uint32_t groupBlockOff; RowLayout blockRow; };
+  struct AggDirtyBound { uint32_t contributorRows, groupRows, viewRows, blockRows; };
+  AggDirtyBound aggDirtyBoundPerRecord(const AggLayout& a) noexcept;   // 2a {1,2,2,0}; Last-only {4,2,2,0}; Min/Max {5,2,2,3}
+  FoldStats foldAggregateBatch(const CompiledViewPlan& plan, const RowLayout& layout,
+                               const AggLayout& agg, VersionDescriptorCache& vdc,
+                               ViewTable& view, ViewTable& contributors, ViewTable& groups,
+                               ViewTable* blocks, const rune::storage::LogReadView& lv,
+                               int64_t bound, int64_t& cursor);   // new overload
+  // The 10-argument foldAggregateBatch stays and forwards blocks = nullptr (2a / Last-only layouts).
+  ```
+- Produces (node): `rune::node::AggInstance::blocks` (`std::optional<rune::view::ViewTable>`, engaged iff `layout.numBlockCols > 0`) and `AggInstance::blocksOrNull()`. A Min/Max view's v2 record carries 4 tables; 2a-only and Last-only views keep 3, byte for byte.
+
+**Storage** (all little-endian, memcpy-encoded; `{…}` = only when `numBlockCols > 0`):
+- **Block columns:** one per DISTINCT Min/Max source field, in cache order (`Min(x)` and `Max(x)` read the same widened 8-byte value and null bit, so they share a column). `cacheCol[cache]` maps a Min/Max field to its column. `blockColInput[col]` is the contributor input whose value the column copies.
+- **Chunk row** (`blocks` table, `rowLen = kBlockEntries × (8 + 9 × numBlockCols)`): `[contributorKey u64 × 32][per column: value 8B × 32][per column: null u8 × 32]`. It is column-wise, so a rescan of one field reads 8-byte values back to back plus one null byte each, and never the keys. A null entry has flag 1 and value 0 (the contributor slot's bytes).
+- **Chunk key:** `blockChunkKey(blockId, chunkIdx) = blockId << 32 | chunkIdx`. It is exact: ViewTable keys are exact u64, and a (groupKey, chunkIdx) pair does not fit 64 bits, so each group gets a 32-bit `blockId`. The group picks it at its first entry: `blockIdCandidate(groupKey)`, then linear probing past ids whose chunk 0 exists. **Invariant: an id is in use iff its chunk 0 exists.** A group with n ≥ 1 entries owns chunk 0, and chunk 0 is erased exactly when n reaches 0. So there is no counter, no free list, no exhaustion and no extra checkpointed state; the choice is deterministic across a restart (same set of chunk 0 rows), and the id is stored in the group row anyway.
+- **Group row:** `…{[head u64][caches]}{[blockId u32][blockChunks u32]}`. `groupBlockOff` = the end of the caches. `blockChunks` counts the chunk rows the group owns, used plus at most one spare.
+- **Contributor row:** `…[values]{[blockPos u32]}`. `contribBlockPosOff` = the end of the values. Appending it at the end keeps every Task 4 offset (prev/next/null/input) unchanged.
+- **Dense positions:** a group of n entries uses positions 0..n-1. Chunk = pos >> 5, slot = pos & 31. Every chunk before the tail is full; the tail holds `((n-1) & 31) + 1` entries. `used = ceil(n/32)`, and `blockChunks ∈ {used, used+1}`. A spare (`used+1`) exists only while the tail is more than half full.
+- **Bytes past the fill** (slots ≥ the tail fill, and the spare's slots) are stale and never read. Every byte change goes through `put()`, so checkpoint/restore reproduces them exactly anyway.
+
+**Operations** (`Ctx` methods; a missing row is counted in `aggInconsistent` and never followed or created):
+- **Append** (`blockAppend`, a new contributor or a move into g, after `applyContribution(+1)`). pos = n − 1. At pos 0 with no id, pick the id. Chunk `pos>>5`: if it is below `blockChunks`, it is the tail or the spare, so write in place; if it equals `blockChunks`, `put` a new chunk (`blockChunks++`); anything else is a gap (counted). Write `[key, values, nulls]` and store `blockPos`. That is exactly 1 block row.
+- **In-place update** (`blockWrite`, same group, linked view). The position is unchanged. Check `pos < n`, that the chunk exists and that the slot's key equals c, then rewrite values and nulls. 1 block row.
+- **Swap-remove** (`blockRemove`, move-out / tombstone / no-group, after `applyContribution(-1)`, before the old group's emit). `last = n'` (the post-remove count, which is the old last index). If `pos != last`, copy entry `last` into `pos` and patch the moved contributor m's `blockPos` through `linkedContributor(m)`. The tail chunk is only *read* (`get`), so it is not dirtied.
+- **Chunk policy** (after the swap). If `n' == 0`, erase chunk 0 (plus at most one more under corruption, counted) and clear the id. Otherwise, if a spare exists and the tail fill is ≤ 16, erase the spare. When the tail empties it simply *becomes* the spare: no write and no erase. Hysteresis: ±1 churn at a 32-entry boundary never frees or re-adds a chunk; the spare goes only after 16 more removes. At most one chunk is freed per remove, and the invariant `spare ⇒ tail fill > 16` holds by induction.
+- **Rescan** (`rescan`, at emit, only for RescanPending, or an Empty cache that saw an add with a non-null count above 1). Look up chunks `0..used-1` in batches of 8. The lookups are independent (computed keys, not links), so their misses overlap; each row's column is prefetched. Then scan `min(32, n − 32·idx)` entries per chunk: skip nulls, keep the best. The bookkeeping is as before: a missing chunk, `scanned != n` or `seen != nonNull` counts `aggInconsistent`, and the cache becomes Valid with what was found, or Empty.
+- **The Min/Max cache and RescanPending stay unchanged.** Emit is O(1) unless the cached extreme was retracted; an add that is at least as extreme still resolves RescanPending without a scan.
+
+**Dirty bound** (rows per source record per table = checkpoint delta entries; `put` dirties, `get` does not, an erase is one delete entry, an erase after a put in the same interval is still one entry). The worst case is a **move of c from g1 to g2** in a Min/Max view:
+- **contributors:**
+  - `c` (rewritten);
+  - `prev(c)` and `next(c)` (unlink);
+  - g2's old head (link);
+  - **m**, g1's last entry, swap-moved into c's slot (its `blockPos`).
+
+  That is **5** (Task 4's 4, plus m). They are distinct in the worst case: m can be any member of g1 other than c. In-place: c, prev, next, old head = 4 (no swap). Tombstone or no-group: c (delete), prev, next, m = 4.
+- **blocks:**
+  - g1's hole chunk (put);
+  - g1's spare (erase, when the tail falls to 16);
+  - g2's append chunk (put; a new chunk, the spare or the tail).
+
+  That is **3**. The tail chunk is only read. When g1 empties: chunk 0 is erased (1, and the hole is not written) plus g2's append = 2. Under corruption the `n' == 0` cleanup erases at most 2 chunks and writes no hole, so it is still ≤ 3. In-place = 1. Tombstone = 2.
+- **groups 2, view rows 2:** unchanged. The block fields live in the already-dirty group row.
+- **Result:** Min/Max views **{5, 2, 2, 3} = 12 entries**. Last-only linked views **{4, 2, 2, 0} = 8** (unchanged from Task 4). 2a **{1, 2, 2, 0} = 5** (unchanged). The bound also holds under inconsistent state, because every damaged-path branch above writes no more rows than the healthy one, so a corrupt table can never make a capped pass overflow the ring.
+- **Pass sizing:** `maxRecordsPerPassFor` (`WorkerViewSet.cpp`) becomes `fixed = delta hdr + crc + v2 hdr + T × table hdr` (T = 4 with a block, else 3), and `perRecord = Σ_tables bound × (13 + rowLen)`. For 2a and Last-only views `blockRows = 0` and T = 3, so the result is the old value exactly. For Task 7's `user_max` (Count(*), Max(amount), Last(amount)), the row lengths are 45 (contributor), 105 (group), 33 (view) and 544 (block). That gives 5·58 + 2·118 + 2·46 + 3·557 = **2289 B per record**, so **57 records per pass** at the 128 KiB delta message (it was 248 with the Last-only bound).
+
+**Cost estimate** (Release, the bench's shape: 10k groups × ~100 entries, 1 column, so 4 chunk rows of 544 B per group, about 22 MB of blocks. The block index is about 40k keys, under 1 MB, so it stays cache-resident):
+- **Rescan, 100 entries:** 4 independent `get()`s (index probe in L2/L3, ~10–40 ns; the row's first line is a DRAM miss, ~80 ns, and the misses overlap), plus about 20 cache lines of streamed values and nulls and 100 compares. That is **≈ 0.2–0.4 µs**, against ~21 µs for the list walk (50–100×). Pessimistic (no overlap): 4 × 150 ns + 0.1 µs ≈ 0.7 µs.
+- **1k entries:** 32 chunks, **≈ 1.5–3 µs**. **10k:** 313 chunks, **≈ 15–30 µs** (was ~0.2 ms and ~2 ms). Reported, not gated.
+- **Common path:**
+  - An in-place update adds one block `put` (an index probe plus 1–2 row lines), **≈ +40–100 ns**.
+  - An append adds one `put` (+ the id probe on a group's first entry).
+  - A tombstone or move-out adds the hole `put`, a tail `get` and m's contributor `put` (a 1M-row table miss, ~100–150 ns), **≈ +150–300 ns**.
+  - Over the bench's mix, p50 is expected to go from **0.75 → ~0.85–0.9 µs**, and a rescanning record from ~22 µs to ~1.2–1.5 µs, well inside record p99 < 5 µs and batch p99 < 10 µs.
+- **Memory and checkpoint:**
+  - +4 B per contributor and +8 B per group.
+  - Blocks are about 1.1–2× (8 + 9·cols) bytes per entry. Small groups pay a full 32-entry chunk: 544 B per singleton group for one column.
+  - Checkpoint deltas grow by one block row (557 B) per record that touches a Min/Max group, coalesced within a pass. See the risks in the design report.
+
+**Pre-validated (2026-10-20, design author, throwaway worktree, not committed).** Steps 1–6 were applied exactly as written: they compile warning-free in a Debug build, and all 63 `AggRetractable*|AggFold*|AggState*|ViewFold*|ViewCheckpoint*` tests and the node suites (`WorkerViewSet|ViewRecovery|ViewReadiness|ViewSnapshot|GetViewRow|CreateView`) pass. In a Release build on the dev Mac (load average ~10, so noisy), `BM_ViewFoldRetractable` gave record p99 **1.71–1.83 µs**, batch p99 **4.63–4.88 µs**, record p50 **0.83 µs** (was 0.75), steady_alloc 0, rescans 102,947 => **PASS**; `BM_ViewFoldAggregate` still PASSes. Task 8's `BM_ViewFoldExtremeRetract` with the Task 5b patch gave N=1000 p50 1.46 µs / p99 1.71 µs and N=10000 p50 11.4 µs / p99 13.8 µs, `exact=yes`. The implementer's own Step 9 run is still the gate of record.
+
+**Interaction matrix (Task 5b).** Op × block position / group-size state × timing. Each cell names its test (`model` = `BlockModelAcrossChunkBoundariesMatchesBruteForceRegression`; `Task 6 model` = `RandomizedOpsMatchBruteForceModelRegression` with the block checks Task 6 adds).
+
+| Op ↓ / position, state → | chunk 0 slot 0 | last slot of a chunk (31, 63) | first slot of the next chunk (32, 64) | tail / last entry (no swap) | the swapped-in entry, later retracted |
+|---|---|---|---|---|---|
+| tombstone (swap-remove) | `ExtremeRetractionAtEveryBlockPosition…` | same | same | same; `ChunkBoundaryChurnKeepsOneSpare…` | `SwapRemovePatchesTheMovedContributorsPosition…` |
+| in-place lower (rewrite at pos) | `ExtremeRetractionAtEveryBlockPosition…` | same | same | same | `SwapRemovePatches…` (in-place at the NEW position) |
+| move out (swap-remove) + move in (append) | `ExtremeRetractionAtEveryBlockPosition…` | same | same | same | `ValueBlockSurvivesACheckpointRoundTrip…` (moves the swapped-in entry) |
+| no-group rewrite (swap-remove) | Task 6 `NoGroupRewriteUnlinksAndRetractsTheContributorRegression` (asserts the block is freed) | model | model | model | model |
+| append | first entry (id pick): every test; `BlockIdsProbeOnCollision…` | model | boundary +1 → new chunk: `ChunkBoundaryChurn…` (33rd entry) | spare reuse: `ChunkBoundaryChurn…` | model |
+
+| Group-size state | Test |
+|---|---|
+| first entry: id = candidate | `BlockIdsProbeOnCollisionAndAreFreedWithTheGroupRegression` (golden: id == `blockIdCandidate(g)`) |
+| id collision → linear probe | same test (birthday-searched colliding keys) |
+| boundary −1: tail empties → spare kept; boundary +1: spare reused (1 block row, no erase, no new chunk), 5 rounds | `ChunkBoundaryChurnKeepsOneSpareRegression` |
+| tail ≤ 16 → spare freed; > 16 → kept | `ChunkBoundaryChurnKeepsOneSpareRegression`, `WorstCaseMoveDirtiesExactlyTheBoundRegression` |
+| n → 0: chunk 0 and id freed, id reclaimable | `BlockIdsProbeOnCollision…`, Task 6 `NoGroupRewrite…` |
+| worst case reached: 5 contributor + 2 group + 2 view + 3 block | `WorstCaseMoveDirtiesExactlyTheBoundRegression` |
+| damaged: chunk missing (rescan, in-place write); dangling list link with an intact block | `MissingBlockChunkIsCountedNeverCreatedRegression`; `DanglingLinkIsCountedNotFollowedRegression` (changed expectation) |
+| null entries (Float NaN → null) in the block | model (`maxPrice`); Task 5 `NonFiniteMaxInputIsNullAndCountedRegression` (now via the block) |
+
+| Timing | Test |
+|---|---|
+| single-record batches | all deterministic tests above |
+| multi-record batches (1–4, same contributor can repeat), sizes sweeping the 16/32/48/64/80 thresholds | model (4000 steps; dirty ≤ records × bound per table; structure checked after every step) |
+| capped-pass boundary (mid-batch resume) | Task 6 `applySplit` (extended to the block table) |
+| checkpoint round trip (view level: v2 record with 4 tables → fresh tables → same history on both → byte-identical) | `ValueBlockSurvivesACheckpointRoundTripRegression` |
+| worker restart (recovered block, then extreme retraction) | Task 7 `RestartThenRetractingTheMaxIsExactRegression` (asserts 4 tables in the record); e2e (Task 9) |
+
+- [ ] **Step 1a: Failing layout tests.** In `broker/libs/view/tests/view/AggStateTest.cpp`:
+
+In `AggStateRegression.TwoAOnlyLayoutIsUnchangedRegression`, after `EXPECT_EQ(b.viewRows, 2u);` add:
+
+```cpp
+    EXPECT_EQ(b.blockRows, 0u);
+    EXPECT_EQ(a.numBlockCols, 0u);
+    EXPECT_EQ(a.blockRow.rowLen, 0u) << "2a views have no value block";
+```
+
+In `AggState.RetractableLayoutAddsLinksHeadCachesAndPerInputWidths`, replace
+
+```cpp
+    EXPECT_EQ(a.contributorRow.rowLen, 86u);
+```
+
+with
+
+```cpp
+    EXPECT_EQ(a.contribBlockPosOff, 86u);                  // [blockPos u32] after the values
+    EXPECT_EQ(a.contributorRow.rowLen, 90u);
+```
+
+and replace its tail, from `EXPECT_EQ(a.groupRow.rowLen, 256u + 4u * rune::view::kCacheEntryBytes);` to the closing `}`, with:
+
+```cpp
+    EXPECT_EQ(a.groupBlockOff, 256u + 4u * rune::view::kCacheEntryBytes);   // 292: after the caches
+    EXPECT_EQ(a.groupRow.rowLen, 300u);                                      // + [blockId u32][blockChunks u32]
+    // Value block: one column per DISTINCT Min/Max source field, in cache order:
+    // amount (maxAmt + minAmt share it), price, qty.
+    EXPECT_EQ(a.numBlockCols, 3u);
+    EXPECT_EQ(a.blockColInput, (std::vector<uint16_t>{0, 3, 4}));
+    EXPECT_EQ(a.cacheCol, (std::vector<uint16_t>{0, 0, 1, 2}));
+    EXPECT_EQ(a.blockRow.rowLen, rune::view::kBlockEntries * (8u + 9u * 3u));   // 1120
+    const auto b = rune::view::aggDirtyBoundPerRecord(a);
+    EXPECT_EQ(b.contributorRows, 5u);
+    EXPECT_EQ(b.groupRows, 2u);
+    EXPECT_EQ(b.viewRows, 2u);
+    EXPECT_EQ(b.blockRows, 3u);
+}
+```
+
+Append to the file:
+
+```cpp
+// REGRESSION (Task 5b): a linked view with only Last/LastNonNull keeps Task 4's
+// linked layout exactly -- no value block, no position, no block fields, bound {4,2,2,0}.
+TEST(AggStateRegression, LastOnlyLinkedViewHasNoValueBlockRegression) {
+    rune::view::ViewPlan v;
+    v.viewName = "t"; v.key = "userId"; v.sources = {{5, "userId"}};
+    v.output = {{"userId", P::Int64, 0, "userId", R::Replace},
+                {"n", P::Int64, 0, "", R::CountAll},
+                {"last", P::Int64, 0, "amount", R::Last}};
+    static const auto src = statsSrc();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    const auto comp = rune::view::compileView(v, srcs, 9).value();
+    const auto a = rune::view::buildAggLayout(comp.plan, src).value();
+    EXPECT_TRUE(a.linked);
+    EXPECT_EQ(a.numCached, 0u);
+    EXPECT_EQ(a.numBlockCols, 0u);
+    EXPECT_EQ(a.contributorRow.rowLen, 33u);   // gk 8 + prev 8 + next 8 + bitmap 1 + amount 8
+    EXPECT_EQ(a.groupRow.rowLen, 64u);         // 8 + 2x16 + 2x8 + head 8
+    EXPECT_EQ(a.blockRow.rowLen, 0u);
+    const auto b = rune::view::aggDirtyBoundPerRecord(a);
+    EXPECT_EQ(b.contributorRows, 4u);
+    EXPECT_EQ(b.groupRows, 2u);
+    EXPECT_EQ(b.viewRows, 2u);
+    EXPECT_EQ(b.blockRows, 0u);
+}
+
+// The value-block chunk format is checkpointed: pin its constants and offsets.
+TEST(AggState, ValueBlockFormatIsStable) {
+    namespace v = rune::view;
+    EXPECT_EQ(v::kBlockEntries, 32u);
+    EXPECT_EQ(1u << v::kBlockShift, v::kBlockEntries);
+    EXPECT_EQ(v::kBlockSpareFreeAt, 16u);
+    EXPECT_EQ(v::kNoBlock, 0u);
+    EXPECT_EQ(v::kAggTableBlocks, 3u);
+    EXPECT_EQ(v::blockChunkKey(1, 0), uint64_t{1} << 32);
+    EXPECT_EQ(v::blockChunkKey(0xFFFFFFFFu, 7), 0xFFFFFFFF00000007ull);
+    EXPECT_EQ(v::blockKeyOff(31), 248u);
+    EXPECT_EQ(v::blockValOff(0, 0), 256u);
+    EXPECT_EQ(v::blockValOff(1, 3), 512u + 24u);
+    const auto a = rune::view::buildAggLayout(compileStats().plan, statsSrc()).value();   // 3 columns
+    EXPECT_EQ(v::blockNullOff(a, 0, 0), 8u * 32u * 4u);        // after keys + 3 value columns
+    EXPECT_EQ(v::blockNullOff(a, 2, 31), 1024u + 64u + 31u);
+    EXPECT_EQ(v::blockNullOff(a, 2, 31) + 1, a.blockRow.rowLen);
+    for (uint64_t g = 0; g < 100000; ++g) ASSERT_NE(v::blockIdCandidate(g), v::kNoBlock) << g;
+    EXPECT_EQ(v::blockIdCandidate(12345), v::blockIdCandidate(12345));
+}
+```
+
+- [ ] **Step 1b: Harness support.** In `broker/libs/view/tests/view/AggRetractableTest.cpp`:
+
+Add `#include <unordered_map>` to the includes.
+
+In `struct Harness`, after `rune::view::ViewTable groups{agg.groupRow};` add:
+
+```cpp
+    rune::view::ViewTable blocks{agg.blockRow};   // userStats has Min/Max: 3 block columns
+```
+
+In `Harness::apply`, replace the fold call with:
+
+```cpp
+        last = rune::view::foldAggregateBatch(comp.plan, comp.rowLayout, agg, vdc, view,
+                                              contributors, groups, &blocks, lv, bound, cursor);
+```
+
+Replace `struct Drained { … };` and `drainCounts()` with:
+
+```cpp
+    struct Drained {
+        uint32_t contributorRows = 0, groupRows = 0, viewRows = 0, blockRows = 0, pendingCaches = 0;
+    };
+    Drained drainCounts() {
+        Drained d;
+        contributors.drainDirty([&](uint32_t, const uint8_t*, bool, uint64_t) { ++d.contributorRows; });
+        groups.drainDirty([&](uint32_t, const uint8_t* row, bool deleted, uint64_t) {
+            ++d.groupRows;
+            if (deleted) return;
+            for (uint16_t ci = 0; ci < agg.numCached; ++ci) {
+                if (row[agg.groupCacheOff + rune::view::kCacheEntryBytes * ci + 8] ==
+                    static_cast<uint8_t>(rune::view::CacheState::RescanPending)) {
+                    ++d.pendingCaches;
+                }
+            }
+        });
+        view.drainDirty([&](uint32_t, const uint8_t*, bool, uint64_t) { ++d.viewRows; });
+        blocks.drainDirty([&](uint32_t, const uint8_t*, bool, uint64_t) { ++d.blockRows; });
+        return d;
+    }
+
+    // Value-block accessors (Task 5b).
+    uint32_t posOf(int64_t orderId) const {
+        const uint8_t* c = contributors.get(uint64_t(orderId));
+        EXPECT_NE(c, nullptr) << "contributor " << orderId;
+        return c != nullptr ? rune::view::loadU32(c + agg.contribBlockPosOff) : UINT32_MAX;
+    }
+    uint32_t blockIdOf(int64_t userId) const {
+        const uint8_t* g = groups.get(uint64_t(userId));
+        return g != nullptr ? rune::view::loadU32(g + agg.groupBlockOff) : rune::view::kNoBlock;
+    }
+    uint32_t chunksOf(int64_t userId) const {
+        const uint8_t* g = groups.get(uint64_t(userId));
+        return g != nullptr ? rune::view::loadU32(g + agg.groupBlockOff + 4) : 0u;
+    }
+
+    // The value-block invariant (AggState.h), checked for `groupIds`:
+    //  - a group with n entries has a block id and blockChunks == ceil(n/32), or one
+    //    more (a spare) only while the tail chunk holds more than 16 entries;
+    //  - entry p (chunk p/32, slot p%32) names a contributor of that group whose
+    //    stored blockPos is p and whose Min/Max inputs equal the entry's values/nulls;
+    //  - no chunk row exists past blockChunks, and the block table holds exactly the
+    //    listed groups' chunks (nothing leaked).
+    // Returns the number of entries seen (== live contributors when every group is listed).
+    size_t expectBlocksConsistent(const std::vector<int64_t>& groupIds) {
+        namespace v = rune::view;
+        size_t entries = 0, chunkRows = 0;
+        for (const int64_t g : groupIds) {
+            const uint8_t* gr = groups.get(uint64_t(g));
+            if (gr == nullptr) continue;
+            const uint64_t n = v::loadU64(gr);
+            const uint32_t id = v::loadU32(gr + agg.groupBlockOff);
+            const uint32_t chunks = v::loadU32(gr + agg.groupBlockOff + 4);
+            EXPECT_NE(id, v::kNoBlock) << "group " << g;
+            const uint32_t used = static_cast<uint32_t>((n + v::kBlockEntries - 1) / v::kBlockEntries);
+            const uint32_t tailFill = static_cast<uint32_t>(n - uint64_t(used - 1) * v::kBlockEntries);
+            EXPECT_TRUE(chunks == used || (chunks == used + 1 && tailFill > v::kBlockSpareFreeAt))
+                << "group " << g << " n=" << n << " chunks=" << chunks;
+            for (uint64_t p = 0; p < n; ++p) {
+                const uint8_t* row = blocks.get(v::blockChunkKey(id, uint32_t(p / v::kBlockEntries)));
+                EXPECT_NE(row, nullptr) << "group " << g << " entry " << p;
+                if (row == nullptr) continue;
+                const uint32_t s = uint32_t(p % v::kBlockEntries);
+                const uint64_t c = v::loadU64(row + v::blockKeyOff(s));
+                const uint8_t* cr = contributors.get(c);
+                EXPECT_NE(cr, nullptr) << "group " << g << " entry " << p << " names missing " << c;
+                if (cr == nullptr) continue;
+                EXPECT_EQ(v::loadU64(cr), uint64_t(g)) << "contributor " << c;
+                EXPECT_EQ(v::loadU32(cr + agg.contribBlockPosOff), uint32_t(p)) << "contributor " << c;
+                for (uint16_t col = 0; col < agg.numBlockCols; ++col) {
+                    const uint16_t in = agg.blockColInput[col];
+                    const bool isNull = ((cr[agg.contribNullOff + in / 8] >> (in % 8)) & 1u) != 0;
+                    EXPECT_EQ(row[v::blockNullOff(agg, col, s)], isNull ? 1 : 0) << "contributor " << c;
+                    EXPECT_EQ(std::memcmp(row + v::blockValOff(col, s), cr + agg.inputOff[in], 8), 0)
+                        << "contributor " << c << " column " << col;
+                }
+                ++entries;
+            }
+            for (uint32_t k = chunks; k < chunks + 2; ++k)
+                EXPECT_EQ(blocks.get(v::blockChunkKey(id, k)), nullptr) << "group " << g << " leaked chunk " << k;
+            chunkRows += chunks;
+        }
+        EXPECT_EQ(blocks.size(), chunkRows) << "every chunk row belongs to a listed group";
+        return entries;
+    }
+```
+
+After the closing `};` of `Harness` (still inside the anonymous namespace), add the checkpoint helpers:
+
+```cpp
+// The v2 record a worker would checkpoint from the four tables (rows copied:
+// drainDirty's pointer is valid only inside its callback). Drains every table.
+std::vector<uint8_t> checkpointAll(Harness& h) {
+    rune::view::ViewTable* ts[4] = {&h.view, &h.contributors, &h.groups, &h.blocks};
+    const uint32_t lens[4] = {h.comp.rowLayout.rowLen, h.agg.contributorRow.rowLen,
+                              h.agg.groupRow.rowLen, h.agg.blockRow.rowLen};
+    std::vector<std::vector<uint8_t>> bytes[4];
+    std::vector<rune::view::DirtyEntry> entries[4];
+    for (int t = 0; t < 4; ++t) {
+        ts[t]->drainDirty([&](uint32_t rid, const uint8_t* row, bool deleted, uint64_t key) {
+            bytes[t].push_back(deleted ? std::vector<uint8_t>{}
+                                       : std::vector<uint8_t>(row, row + lens[t]));
+            entries[t].push_back({rid, deleted, key, nullptr});
+        });
+        for (size_t i = 0; i < entries[t].size(); ++i)
+            if (!entries[t][i].deleted) entries[t][i].row = bytes[t][i].data();
+    }
+    const rune::view::TableDelta tds[4] = {
+        {rune::view::kAggTableView, lens[0], entries[0]},
+        {rune::view::kAggTableContributors, lens[1], entries[1]},
+        {rune::view::kAggTableGroups, lens[2], entries[2]},
+        {rune::view::kAggTableBlocks, lens[3], entries[3]}};
+    std::vector<uint8_t> out;
+    rune::view::encodeMultiDelta(tds, h.next, out);
+    return out;
+}
+
+// Recovery into fresh tables, then the worker's post-recovery dirty discard.
+void restoreInto(Harness& h, const std::vector<uint8_t>& rec, int64_t next, int64_t cursor) {
+    rune::view::ViewTable* ts[4] = {&h.view, &h.contributors, &h.groups, &h.blocks};
+    const uint32_t lens[4] = {h.comp.rowLayout.rowLen, h.agg.contributorRow.rowLen,
+                              h.agg.groupRow.rowLen, h.agg.blockRow.rowLen};
+    ASSERT_TRUE(rune::view::applyMultiDelta(ts, lens, rec).has_value());
+    h.next = next;
+    h.cursor = cursor;
+    (void)h.drainCounts();
+}
+
+// Same groups, contributors and chunk rows, byte for byte.
+void expectSameState(Harness& a, Harness& b, const std::vector<int64_t>& groupIds, int64_t maxId) {
+    for (const int64_t g : groupIds) {
+        const uint8_t* ga = a.groups.get(uint64_t(g));
+        const uint8_t* gb = b.groups.get(uint64_t(g));
+        ASSERT_EQ(ga == nullptr, gb == nullptr) << "group " << g;
+        if (ga == nullptr) continue;
+        EXPECT_EQ(std::memcmp(ga, gb, a.agg.groupRow.rowLen), 0) << "group row " << g;
+        const uint8_t* va = a.view.get(uint64_t(g));
+        const uint8_t* vb = b.view.get(uint64_t(g));
+        ASSERT_TRUE(va != nullptr && vb != nullptr) << "view row " << g;
+        EXPECT_EQ(std::memcmp(va, vb, a.comp.rowLayout.rowLen), 0) << "view row " << g;
+        const uint32_t id = rune::view::loadU32(ga + a.agg.groupBlockOff);
+        const uint32_t chunks = rune::view::loadU32(ga + a.agg.groupBlockOff + 4);
+        for (uint32_t k = 0; k < chunks; ++k) {
+            const uint8_t* ba = a.blocks.get(rune::view::blockChunkKey(id, k));
+            const uint8_t* bb = b.blocks.get(rune::view::blockChunkKey(id, k));
+            ASSERT_TRUE(ba != nullptr && bb != nullptr) << "group " << g << " chunk " << k;
+            EXPECT_EQ(std::memcmp(ba, bb, a.agg.blockRow.rowLen), 0) << "group " << g << " chunk " << k;
+        }
+    }
+    for (int64_t c = 1; c <= maxId; ++c) {
+        const uint8_t* ca = a.contributors.get(uint64_t(c));
+        const uint8_t* cb = b.contributors.get(uint64_t(c));
+        ASSERT_EQ(ca == nullptr, cb == nullptr) << "contributor " << c;
+        if (ca != nullptr) EXPECT_EQ(std::memcmp(ca, cb, a.agg.contributorRow.rowLen), 0) << "contributor " << c;
+    }
+    EXPECT_EQ(a.blocks.size(), b.blocks.size());
+}
+```
+
+- [ ] **Step 1c: Change one expectation, replace the tautological pin, add the block tests.**
+
+In `AggRetractableRegression.DanglingLinkIsCountedNotFollowedRegression`, replace
+
+```cpp
+    EXPECT_EQ(h.col(100, kMaxAmt).i, 20) << "the rescan only reports values it actually found";
+```
+
+with
+
+```cpp
+    EXPECT_EQ(h.col(100, kMaxAmt).i, 30)
+        << "the rescan reads the VALUE BLOCK, which still holds contributor 2's 30 (the group still counts 2); "
+           "the damaged list is never followed";
+```
+
+(The rest of the test holds: the missing head and neighbour are counted, `Last` is 20, and row 2 is never re-created.)
+
+Delete `AggRetractableRegression.WorstCaseMoveDirtiesExactlyTheBoundAndFitsTheBudgetRegression` (the whole test and its comment) and append:
+
+```cpp
+// REGRESSION (Task 5 review item 1; Task 5b): the per-record bound is REACHED, on
+// every table, by one move: a mid-list contributor at block position 0 of a group
+// whose spare chunk is freed by the remove, moved into a group with a head.
+// A pure dirty-count pin (the byte budget is pinned by Task 7's ring test).
+TEST(AggRetractableRegression, WorstCaseMoveDirtiesExactlyTheBoundRegression) {
+    Harness h;
+    for (int64_t id = 1; id <= 65; ++id) h.putOrd({id, 100, id});   // 65 entries: chunks 0, 1, 2
+    for (int64_t id = 65; id >= 50; --id) h.put(id, tombstone());   // 49: chunk 2 is the spare, tail holds 17
+    ASSERT_EQ(h.chunksOf(100), 3u);
+    h.putOrd({100, 200, 7});                                        // u200 has a head (100)
+    h.putOrd({3, 100, 3});
+    h.putOrd({1, 100, 1});
+    h.putOrd({2, 100, 2});                                          // u100 list: 2 -> 1 -> 3 -> 49 -> ...
+    ASSERT_EQ(h.posOf(1), 0u);
+    (void)h.drainCounts();
+    h.putOrd({1, 200, 50});                                         // move 1 (pos 0, prev 2, next 3) to u200
+    const auto b = rune::view::aggDirtyBoundPerRecord(h.agg);
+    ASSERT_EQ(b.contributorRows, 5u);
+    ASSERT_EQ(b.groupRows, 2u);
+    ASSERT_EQ(b.viewRows, 2u);
+    ASSERT_EQ(b.blockRows, 3u);
+    const auto d = h.drainCounts();
+    EXPECT_EQ(d.contributorRows, b.contributorRows) << "1, its neighbours 2 and 3, u200's old head 100, "
+                                                       "and 49 (u100's last entry, swapped into position 0)";
+    EXPECT_EQ(d.groupRows, b.groupRows);
+    EXPECT_EQ(d.viewRows, b.viewRows);
+    EXPECT_EQ(d.blockRows, b.blockRows) << "u100's hole chunk 0, u100's spare (tail now 16: freed), u200's chunk 0";
+    EXPECT_EQ(d.pendingCaches, 0u);
+    EXPECT_EQ(h.posOf(49), 0u);
+    EXPECT_EQ(h.chunksOf(100), 2u);
+    EXPECT_EQ(h.col(100, kMinAmt).i, 2) << "the moved min rescans the block";
+    EXPECT_EQ(h.col(100, kMaxAmt).i, 49);
+    EXPECT_EQ(h.col(200, kMaxAmt).i, 50);
+    EXPECT_EQ(h.col(200, kMinAmt).i, 7);
+    h.expectBlocksConsistent({100, 200});
+    EXPECT_EQ(h.inconsistent, 0u);
+}
+
+// REGRESSION (Task 5b): removing a mid-block entry moves the group's LAST entry
+// into the hole and patches that contributor's stored position; the moved entry
+// is then rewritten in place and retracted at its NEW position, exactly.
+TEST(AggRetractableRegression, SwapRemovePatchesTheMovedContributorsPositionRegression) {
+    Harness h;
+    for (int64_t id = 1; id <= 40; ++id) h.putOrd({id, 100, 10 * id});   // 2 chunks: 32 + 8
+    h.put(3, tombstone());                                                // hole at 2; 40 moves there
+    EXPECT_EQ(h.posOf(40), 2u);
+    EXPECT_EQ(h.col(100, kMaxAmt).i, 400);
+    h.expectBlocksConsistent({100});
+    h.putOrd({40, 100, 5});                                               // in place at position 2
+    EXPECT_EQ(h.posOf(40), 2u);
+    EXPECT_EQ(h.col(100, kMaxAmt).i, 390) << "the retracted max rescans the block";
+    EXPECT_EQ(h.col(100, kMinAmt).i, 5);
+    h.put(40, tombstone());                                               // 39 (the last) moves to 2
+    EXPECT_EQ(h.posOf(39), 2u);
+    EXPECT_EQ(h.col(100, kMinAmt).i, 10);
+    EXPECT_EQ(h.col(100, kN).i, 38);
+    h.expectBlocksConsistent({100});
+    EXPECT_EQ(h.inconsistent, 0u);
+}
+
+// REGRESSION (Task 5b, chunk policy): at a chunk boundary the block keeps ONE
+// spare, so +-1 churn there never frees or re-adds a chunk; the spare is freed
+// only once the tail chunk holds at most 16 entries.
+TEST(AggRetractableRegression, ChunkBoundaryChurnKeepsOneSpareRegression) {
+    Harness h;
+    for (int64_t id = 1; id <= 33; ++id) h.putOrd({id, 100, id});      // the 33rd entry adds chunk 1
+    EXPECT_EQ(h.chunksOf(100), 2u);
+    EXPECT_EQ(h.blocks.size(), 2u);
+    for (int round = 0; round < 5; ++round) {
+        h.put(33, tombstone());                                        // 32: chunk 1 empties -> the spare
+        EXPECT_EQ(h.chunksOf(100), 2u) << "round " << round;
+        EXPECT_EQ(h.blocks.size(), 2u) << "round " << round;
+        EXPECT_EQ(h.col(100, kMaxAmt).i, 32);
+        (void)h.drainCounts();
+        h.putOrd({33, 100, 33});                                       // 33 again: into the spare
+        const auto d = h.drainCounts();
+        EXPECT_EQ(d.blockRows, 1u) << "round " << round << ": one write, no erase, no new chunk";
+        EXPECT_EQ(h.blocks.size(), 2u);
+        EXPECT_EQ(h.col(100, kMaxAmt).i, 33);
+    }
+    for (int64_t id = 33; id >= 18; --id) h.put(id, tombstone());     // 17 left: the tail holds 17 > 16
+    EXPECT_EQ(h.chunksOf(100), 2u) << "the spare survives while the tail is more than half full";
+    h.put(17, tombstone());                                            // 16: the spare is freed
+    EXPECT_EQ(h.chunksOf(100), 1u);
+    EXPECT_EQ(h.blocks.size(), 1u);
+    EXPECT_EQ(h.col(100, kMaxAmt).i, 16);
+    EXPECT_EQ(h.col(100, kMinAmt).i, 1);
+    h.expectBlocksConsistent({100});
+    EXPECT_EQ(h.inconsistent, 0u);
+}
+
+// REGRESSION (Task 5b, op x position): retracting the cached Max is exact whether
+// its holder sits at chunk 0 slot 0, the last slot of a chunk, the first slot of
+// the next chunk or the group's last entry -- by tombstone, in-place lower and
+// group move.
+TEST(AggRetractableRegression, ExtremeRetractionAtEveryBlockPositionIsExactRegression) {
+    auto mx = [](const std::map<int64_t, int64_t>& m) {
+        int64_t v = INT64_MIN; for (const auto& [k, a] : m) v = std::max(v, a); return v;
+    };
+    auto mn = [](const std::map<int64_t, int64_t>& m) {
+        int64_t v = INT64_MAX; for (const auto& [k, a] : m) v = std::min(v, a); return v;
+    };
+    for (const uint32_t p : {0u, 31u, 32u, 63u, 64u, 99u}) {
+        for (int how = 0; how < 3; ++how) {   // 0 tombstone, 1 in-place lower, 2 move to u200
+            Harness h;
+            std::map<int64_t, int64_t> g100, g200;
+            for (int64_t id = 1; id <= 100; ++id) {
+                const int64_t amt = uint32_t(id - 1) == p ? 1000 : id;
+                h.putOrd({id, 100, amt});
+                g100[id] = amt;
+            }
+            h.putOrd({500, 200, 7});
+            g200[500] = 7;
+            const int64_t holder = int64_t(p) + 1;
+            ASSERT_EQ(h.posOf(holder), p);
+            if (how == 0) { h.put(holder, tombstone()); g100.erase(holder); }
+            else if (how == 1) { h.putOrd({holder, 100, -5}); g100[holder] = -5; }
+            else { h.putOrd({holder, 200, 1000}); g100.erase(holder); g200[holder] = 1000; }
+            EXPECT_GE(h.last.aggRescans, 1u) << "pos " << p << " how " << how;
+            EXPECT_EQ(h.col(100, kMaxAmt).i, mx(g100)) << "pos " << p << " how " << how;
+            EXPECT_EQ(h.col(100, kMinAmt).i, mn(g100)) << "pos " << p << " how " << how;
+            EXPECT_EQ(h.col(200, kMaxAmt).i, mx(g200)) << "pos " << p << " how " << how;
+            EXPECT_EQ(h.col(200, kMinAmt).i, mn(g200)) << "pos " << p << " how " << how;
+            h.expectBlocksConsistent({100, 200});
+            EXPECT_EQ(h.inconsistent, 0u) << "pos " << p << " how " << how;
+        }
+    }
+}
+
+// REGRESSION (Task 5b): a group's block id is its candidate unless that id is
+// taken (linear probe); an emptied group frees every chunk row and its id, and a
+// re-created group reclaims its candidate. Two keys with the same candidate never
+// share chunk rows.
+TEST(AggRetractableRegression, BlockIdsProbeOnCollisionAndAreFreedWithTheGroupRegression) {
+    std::unordered_map<uint32_t, int64_t> seen;   // deterministic birthday search for a collision
+    int64_t g1 = 0, g2 = 0;
+    for (int64_t g = 1; g2 == 0; ++g) {
+        const auto [it, fresh] = seen.emplace(rune::view::blockIdCandidate(uint64_t(g)), g);
+        if (!fresh) { g1 = it->second; g2 = g; }
+    }
+    const uint32_t cand = rune::view::blockIdCandidate(uint64_t(g1));
+    const uint32_t probed = cand == UINT32_MAX ? 1u : cand + 1;
+    Harness h;
+    for (int64_t id = 1; id <= 40; ++id) h.putOrd({id, g1, id});
+    for (int64_t id = 41; id <= 80; ++id) h.putOrd({id, g2, id});
+    EXPECT_EQ(h.blockIdOf(g1), cand);
+    EXPECT_EQ(h.blockIdOf(g2), probed) << "linear probe past the taken candidate";
+    EXPECT_EQ(h.blocks.size(), 4u);
+    EXPECT_EQ(h.col(g1, kMaxAmt).i, 40);
+    EXPECT_EQ(h.col(g2, kMinAmt).i, 41);
+    h.expectBlocksConsistent({g1, g2});
+    for (int64_t id = 1; id <= 40; ++id) h.put(id, tombstone());     // g1 empties
+    EXPECT_FALSE(h.hasGroup(g1));
+    EXPECT_EQ(h.blocks.size(), 2u) << "every chunk row of g1 is freed";
+    EXPECT_EQ(h.blocks.get(rune::view::blockChunkKey(cand, 0)), nullptr);
+    h.putOrd({1, g1, 9});                                            // g1 again: its candidate is free
+    EXPECT_EQ(h.blockIdOf(g1), cand);
+    EXPECT_EQ(h.col(g1, kMaxAmt).i, 9);
+    EXPECT_EQ(h.col(g2, kMaxAmt).i, 80) << "g2's block was never touched";
+    h.expectBlocksConsistent({g1, g2});
+    EXPECT_EQ(h.inconsistent, 0u);
+}
+
+// REGRESSION (Task 5b, damaged block): a missing chunk row is counted, never
+// followed and never re-created -- not by the rescan, not by an in-place write.
+TEST(AggRetractableRegression, MissingBlockChunkIsCountedNeverCreatedRegression) {
+    Harness h;
+    for (int64_t id = 1; id <= 40; ++id) h.putOrd({id, 100, id});    // chunk 0: 1..32, chunk 1: 33..40
+    const uint64_t k1 = rune::view::blockChunkKey(h.blockIdOf(100), 1);
+    ASSERT_TRUE(h.blocks.erase(k1));                                 // damage: chunk 1 vanishes
+    h.put(40, tombstone());                                          // retract the max (the last entry)
+    EXPECT_GE(h.last.aggInconsistent, 1u) << "the rescan meets the missing chunk";
+    EXPECT_EQ(h.col(100, kMaxAmt).i, 32) << "only values actually found are reported";
+    EXPECT_EQ(h.blocks.get(k1), nullptr) << "the rescan never creates a chunk";
+    h.putOrd({35, 100, 99});                                         // in place inside the missing chunk
+    EXPECT_GE(h.last.aggInconsistent, 1u);
+    EXPECT_EQ(h.blocks.get(k1), nullptr) << "an in-place write never creates a chunk";
+    EXPECT_EQ(h.col(100, kMaxAmt).i, 99) << "the Valid cache still takes a strictly better value, O(1)";
+    EXPECT_EQ(h.col(100, kN).i, 39);
+}
+
+// REGRESSION (Task 5b, timing "across restart" at the view level): the value
+// block travels in the v2 record as table 3; recovered tables then behave
+// byte-for-byte like the live ones under the same history (swap-removes, a move,
+// extreme retractions, a spare freed).
+TEST(AggRetractableRegression, ValueBlockSurvivesACheckpointRoundTripRegression) {
+    Harness live;
+    for (int64_t id = 1; id <= 70; ++id) live.putOrd({id, 100, id});   // 3 chunks
+    for (int64_t id = 70; id >= 61; --id) live.put(id, tombstone());   // 60 left: chunk 2 is the spare
+    for (int64_t id = 71; id <= 75; ++id) live.putOrd({id, 200, id});
+    live.putOrd({7, 100, 7});                                          // an in-place rewrite before the checkpoint
+    ASSERT_EQ(live.chunksOf(100), 3u);
+    const auto rec = checkpointAll(live);
+    ASSERT_EQ(rec[12], 4u) << "the v2 record carries four tables";
+    Harness back;
+    restoreInto(back, rec, live.next, live.cursor);
+    expectSameState(live, back, {100, 200}, 75);
+    auto both = [&](auto&& op) {
+        op(live);
+        op(back);
+        expectSameState(live, back, {100, 200}, 75);
+    };
+    both([](Harness& h) { h.put(60, tombstone()); });                  // retract the max (the last entry)
+    both([](Harness& h) { h.put(1, tombstone()); });                   // retract the min at chunk 0 slot 0: 59 swaps in
+    both([](Harness& h) { h.putOrd({59, 200, 1}); });                  // move the swapped-in entry out
+    for (int64_t id = 2; id <= 13; ++id) both([id](Harness& h) { h.put(id, tombstone()); });
+    EXPECT_EQ(back.chunksOf(100), 2u) << "the tail fell to 16: the recovered spare was freed";
+    EXPECT_EQ(back.col(100, kMaxAmt).i, 58);
+    EXPECT_EQ(back.col(100, kMinAmt).i, 14);
+    EXPECT_EQ(back.col(200, kMinAmt).i, 1);
+    EXPECT_EQ(back.col(200, kMaxAmt).i, 75);
+    back.expectBlocksConsistent({100, 200});
+    EXPECT_EQ(back.inconsistent, 0u);
+    EXPECT_EQ(live.inconsistent, 0u);
+}
+
+// REGRESSION (Task 5b, op x block position x timing): 4000 steps of 1-4 records
+// over 160 contributors / 3 groups (group 1 is three times as likely, and the
+// tombstone rate alternates 20%/45% every 500 steps: group 1 ranges over ~33-93
+// entries (across the 64 boundary and both spare thresholds, 48 and 80), groups
+// 2/3 over ~8-39 (across 16 and 32), so swap-removes, spare reuse, spare frees
+// and new chunks all occur), heavily duplicated amounts, Float NaN (null)
+// prices; group moves happen whenever a rewrite picks another group.
+// After EVERY step: Count/Max/Min/MaxPrice of every group equal a brute-force
+// recomputation, the block structure is consistent and covers every live
+// contributor, every table's dirty entries are within records x the bound, no
+// cache is left RescanPending, nothing is inconsistent.
+TEST(AggRetractableRegression, BlockModelAcrossChunkBoundariesMatchesBruteForceRegression) {
+    struct M { int64_t user; int64_t amount; double price; };
+    std::map<int64_t, M> live;
+    Harness h;
+    const auto bound = rune::view::aggDirtyBoundPerRecord(h.agg);
+    uint64_t state = 0xD1B54A32D192ED03ull;
+    auto rnd = [&](uint64_t m) {
+        state = state * 6364136223846793005ull + 1442695040888963407ull;
+        return (state >> 33) % m;
+    };
+    for (uint64_t step = 1; step <= 4000; ++step) {
+        const size_t n = 1 + static_cast<size_t>(rnd(4));
+        const uint64_t delPct = (step / 500) % 2 == 0 ? 20 : 45;
+        std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> recs;
+        for (size_t i = 0; i < n; ++i) {
+            const int64_t id = 1 + static_cast<int64_t>(rnd(160));
+            if (rnd(100) < delPct) {
+                recs.push_back({Harness::key(id), tombstone()});
+                live.erase(id);
+            } else {
+                const uint64_t r = rnd(5);
+                Ord o{id, r < 3 ? 1 : static_cast<int64_t>(r - 1), static_cast<int64_t>(rnd(21)) - 10};
+                o.price = rnd(5) == 0 ? std::numeric_limits<double>::quiet_NaN() : static_cast<double>(rnd(7));
+                recs.push_back({Harness::key(id), encode(o)});
+                live[id] = M{o.user, o.amount, o.price};
+            }
+        }
+        h.apply(recs);
+        const auto d = h.drainCounts();
+        ASSERT_LE(d.contributorRows, n * bound.contributorRows) << "step " << step;
+        ASSERT_LE(d.groupRows, n * bound.groupRows) << "step " << step;
+        ASSERT_LE(d.viewRows, n * bound.viewRows) << "step " << step;
+        ASSERT_LE(d.blockRows, n * bound.blockRows) << "step " << step;
+        ASSERT_EQ(d.pendingCaches, 0u) << "step " << step;
+        for (int64_t g = 1; g <= 3; ++g) {
+            int64_t cnt = 0, mx = INT64_MIN, mn = INT64_MAX;
+            double mp = 0.0;
+            bool anyPrice = false;
+            for (const auto& [k, m] : live) {
+                if (m.user != g) continue;
+                ++cnt;
+                mx = std::max(mx, m.amount);
+                mn = std::min(mn, m.amount);
+                if (!std::isnan(m.price)) { mp = anyPrice ? std::max(mp, m.price) : m.price; anyPrice = true; }
+            }
+            if (cnt == 0) { ASSERT_FALSE(h.hasGroup(g)) << "step " << step << " group " << g; continue; }
+            ASSERT_EQ(h.col(g, kN).i, cnt) << "step " << step << " group " << g;
+            ASSERT_EQ(h.col(g, kMaxAmt).i, mx) << "step " << step << " group " << g;
+            ASSERT_EQ(h.col(g, kMinAmt).i, mn) << "step " << step << " group " << g;
+            const auto p = h.col(g, kMaxPrice);
+            ASSERT_EQ(p.present, anyPrice) << "step " << step << " group " << g;
+            if (anyPrice) ASSERT_DOUBLE_EQ(p.f, mp) << "step " << step << " group " << g;
+        }
+        ASSERT_EQ(h.expectBlocksConsistent({1, 2, 3}), live.size()) << "step " << step;
+        if (::testing::Test::HasFailure()) FAIL() << "first failure at step " << step;
+    }
+    EXPECT_EQ(h.inconsistent, 0u);
+}
+```
+
+- [ ] **Step 2: Run them and confirm they fail.**
+
+Run: `cmake --build build/root -j14 --target rune_view_tests`
+Expected: compile errors `no member named 'blockRows'` / `'numBlockCols'` / `'blockChunkKey'`, and no matching `foldAggregateBatch` overload taking `&blocks`.
+
+- [ ] **Step 3: Implement the layout.** In `broker/libs/view/include/rune/view/AggState.h`:
+
+Replace the header comment block (from `// Per (view, partition) the fold keeps two fixed-width auxiliary ViewTables` through `// Both tables are checkpointed with the output rows in one v2 record (§9.2).`) with:
+
+```cpp
+// Per (view, partition) the fold keeps fixed-width auxiliary ViewTables next
+// to the output rows ({...} = only in a LINKED view, i.e. one using any Phase
+// 2b rule; <...> = only when the view has a Min or Max; a 2a-only view keeps
+// its 2a layout byte-for-byte):
+//   contributors : contributorKey -> [groupKey u64]{[prev u64][next u64]}[null bitmap][values]<[blockPos u32]>
+//   groups       : groupKey -> [contributors u64][accumulators][non-null counts]
+//                              {[head u64][per Min/Max: value 8B, state u8]}<[blockId u32][blockChunks u32]>
+//   blocks       : <blockChunkKey(blockId, chunk) -> [keys u64 x 32][per column: values 8B x 32][per column: nulls u8 x 32]>
+// prev/next/head form a doubly linked MRU list of the group's contributors,
+// keys as links (kNoContributor ends it): every write of a contributor moves it
+// to the head, so Last = head, LastNonNull = first non-null from the head.
+// The value block (Task 5b) holds each group's Min/Max inputs densely at
+// positions 0..n-1 (32 per chunk row; every chunk but the tail full; at most one
+// spare chunk), one column per distinct Min/Max source field: a rescan of a
+// retracted extreme is a sequential scan of ceil(n/32) chunks, not a list walk.
+// Add appends; an in-place update rewrites its entry; a remove swap-removes (the
+// last entry moves into the hole, its contributor's blockPos is patched); the
+// spare is freed once the tail holds <= 16 entries (hysteresis). A group's
+// blockId is chosen at its first entry (blockIdCandidate, then linear probing);
+// an id is in use iff its chunk 0 exists. All tables are checkpointed with the
+// output rows in one v2 record (§9.2; blocks = table id 3).
+```
+
+Directly after `inline constexpr uint32_t kCacheEntryBytes = 9;` add:
+
+```cpp
+// --- Min/Max value block (Task 5b) ---
+inline constexpr uint32_t kBlockEntries     = 32;                 // entries per chunk row
+inline constexpr uint32_t kBlockShift       = 5;
+inline constexpr uint32_t kBlockMask        = kBlockEntries - 1;
+static_assert((1u << kBlockShift) == kBlockEntries, "kBlockEntries must be 1 << kBlockShift");
+inline constexpr uint32_t kBlockSpareFreeAt = kBlockEntries / 2;  // free the spare once the tail holds <= this
+inline constexpr uint32_t kNoBlock          = 0;                  // group row blockId: no block
+inline constexpr uint32_t kBlockIdProbes    = 64;                 // linear-probe limit for a free block id
+
+// Exact chunk-row key: a 32-bit block id (per group) and a 32-bit chunk index.
+inline constexpr uint64_t blockChunkKey(uint32_t blockId, uint32_t chunk) noexcept {
+    return (static_cast<uint64_t>(blockId) << 32) | chunk;
+}
+// First block id tried for group key g (fixed 64-bit finalizer, low 32 bits;
+// never kNoBlock). Collisions are resolved by linear probing in the fold.
+inline constexpr uint32_t blockIdCandidate(uint64_t g) noexcept {
+    g ^= g >> 33; g *= 0xff51afd7ed558ccdULL;
+    g ^= g >> 33; g *= 0xc4ceb9fe1a85ec53ULL;
+    g ^= g >> 33;
+    const uint32_t id = static_cast<uint32_t>(g);
+    return id == kNoBlock ? 1u : id;
+}
+// Chunk-row offsets (column-wise). slot = position & kBlockMask.
+inline constexpr uint32_t blockKeyOff(uint32_t slot) noexcept { return 8u * slot; }
+inline constexpr uint32_t blockValOff(uint16_t col, uint32_t slot) noexcept {
+    return 8u * kBlockEntries * (1u + col) + 8u * slot;
+}
+```
+
+In `struct AggLayout`, after `uint32_t groupCacheOff = 0; // linked only` add:
+
+```cpp
+    // --- Phase 2b Task 5b: Min/Max value block (all 0/empty when numBlockCols == 0) ---
+    uint16_t              numBlockCols       = 0;   // distinct Min/Max source fields
+    std::vector<uint16_t> blockColInput;            // per column: the input whose 8-byte value it copies
+    std::vector<uint16_t> cacheCol;                 // per Min/Max cache index: its column
+    uint32_t              contribBlockPosOff = 0;   // [blockPos u32] at the end of the contributor row
+    uint32_t              groupBlockOff      = 0;   // [blockId u32][blockChunks u32] after the caches
+    RowLayout             blockRow;                 // only rowLen: kBlockEntries * (8 + 9 * numBlockCols)
+```
+
+Directly after the closing `};` of `AggLayout` add:
+
+```cpp
+// Null-flag byte of (column, slot) in a chunk row.
+inline uint32_t blockNullOff(const AggLayout& a, uint16_t col, uint32_t slot) noexcept {
+    return 8u * kBlockEntries * (1u + a.numBlockCols) + kBlockEntries * col + slot;
+}
+```
+
+Replace the `AggDirtyBound` comment and struct with:
+
+```cpp
+// Worst-case rows ONE source record can dirty in each table (= checkpoint
+// delta entries). Min/Max views: a group move dirties the contributor, both of
+// its old neighbours, the new group's old head and the old group's swap-moved
+// last entry (5); both groups (2); both view rows (2); the old group's hole
+// chunk and freed spare plus the new group's append chunk (3). Last-only linked
+// views {4,2,2,0}; 2a {1,2,2,0}. A rescan only reads (get() never dirties); a
+// damaged-state branch never writes more than the healthy one. Derivation:
+// Phase 2b plan Task 5b; pinned by AggRetractableRegression.WorstCaseMoveDirtiesExactlyTheBoundRegression.
+struct AggDirtyBound {
+    uint32_t contributorRows;
+    uint32_t groupRows;
+    uint32_t viewRows;
+    uint32_t blockRows;
+};
+```
+
+After `inline constexpr uint8_t kAggTableGroups = 2;` add:
+
+```cpp
+inline constexpr uint8_t kAggTableBlocks       = 3;   // only views with Min/Max (4 tables)
+```
+
+After the `storeU64` helper add:
+
+```cpp
+inline uint32_t loadU32(const uint8_t* p) noexcept { uint32_t v; std::memcpy(&v, p, 4); return v; }
+inline void     storeU32(uint8_t* p, uint32_t v) noexcept { std::memcpy(p, &v, 4); }
+```
+
+In `broker/libs/view/src/AggState.cpp`, replace everything in `buildAggLayout` from `const uint32_t nFields = static_cast<uint32_t>(a.fields.size());` through `return a;` with:
+
+```cpp
+    // Task 5b: one value-block column per DISTINCT Min/Max source field, in
+    // cache order (Min(x) and Max(x) read the same widened value and null bit).
+    {
+        std::vector<uint16_t> colSrc;
+        for (const AggField& f : a.fields) {
+            if (f.cache == kNoCache) continue;
+            uint16_t col = 0;
+            while (col < colSrc.size() && colSrc[col] != f.srcFieldId) ++col;
+            if (col == colSrc.size()) {
+                colSrc.push_back(f.srcFieldId);
+                a.blockColInput.push_back(f.input);
+            }
+            a.cacheCol.push_back(col);
+        }
+        a.numBlockCols = static_cast<uint16_t>(colSrc.size());
+    }
+    const bool block = a.numBlockCols > 0;
+    const uint32_t nFields = static_cast<uint32_t>(a.fields.size());
+    a.contribPrevOff = a.linked ? 8u : 0u;
+    a.contribNextOff = a.linked ? 16u : 0u;
+    a.contribNullOff = a.linked ? 24u : 8u;
+    a.contribValOff  = a.contribNullOff + (static_cast<uint32_t>(a.numInputs) + 7) / 8;
+    uint32_t off = a.contribValOff;
+    a.inputOff.reserve(a.inputWidth.size());
+    for (const uint16_t w : a.inputWidth) {
+        a.inputOff.push_back(off);
+        off += w;
+    }
+    if (block) {
+        a.contribBlockPosOff = off;
+        off += 4;
+    }
+    a.contributorRow.rowLen = off;
+    a.groupAccOff     = 8;
+    a.groupNonNullOff = 8 + 16u * nFields;
+    const uint32_t nnEnd = a.groupNonNullOff + 8u * nFields;
+    if (a.linked) {
+        a.groupHeadOff      = nnEnd;
+        a.groupCacheOff     = nnEnd + 8;
+        a.groupRow.rowLen   = a.groupCacheOff + kCacheEntryBytes * a.numCached;
+        if (block) {
+            a.groupBlockOff   = a.groupRow.rowLen;
+            a.groupRow.rowLen += 8;
+        }
+    } else {
+        a.groupRow.rowLen   = nnEnd;
+    }
+    a.blockRow.rowLen = block ? kBlockEntries * (8u + 9u * a.numBlockCols) : 0u;
+    return a;
+```
+
+and replace `aggDirtyBoundPerRecord` with:
+
+```cpp
+AggDirtyBound aggDirtyBoundPerRecord(const AggLayout& a) noexcept {
+    const bool block = a.numBlockCols > 0;   // implies linked
+    return AggDirtyBound{a.linked ? (block ? 5u : 4u) : 1u, 2u, 2u, block ? 3u : 0u};
+}
+```
+
+(A 2a layout has no Min/Max, so `numBlockCols == 0` and every 2a offset and length is computed by the same statements as before.)
+
+- [ ] **Step 4: Implement the fold.** In `broker/libs/view/include/rune/view/AggFold.h`, replace the declaration and its comment with:
+
+```cpp
+// Folds every committed record (offset < bound) of `lv` into an aggregate view
+// with TABLE semantics (AggState.h): contributor = 8-byte wire key, group = the
+// group-by value. Same batch walk, control-batch skip, bound stop, and cursor
+// contract as foldBatch (ViewFold.h). Zero heap allocation in steady state.
+// A layout with Min/Max (agg.numBlockCols > 0) also maintains each group's
+// value block in `blocks` (rows of agg.blockRow); `blocks` may be nullptr only
+// when agg.numBlockCols == 0 -- with Min/Max and no table, every block step is
+// counted in aggInconsistent and skipped (never a crash).
+FoldStats foldAggregateBatch(const CompiledViewPlan& plan, const RowLayout& layout,
+                             const AggLayout& agg, VersionDescriptorCache& vdc,
+                             ViewTable& view, ViewTable& contributors, ViewTable& groups,
+                             ViewTable* blocks, const rune::storage::LogReadView& lv,
+                             int64_t bound, int64_t& cursor);
+
+// 2a and Last-only layouts (no value block): blocks = nullptr.
+FoldStats foldAggregateBatch(const CompiledViewPlan& plan, const RowLayout& layout,
+                             const AggLayout& agg, VersionDescriptorCache& vdc,
+                             ViewTable& view, ViewTable& contributors, ViewTable& groups,
+                             const rune::storage::LogReadView& lv, int64_t bound,
+                             int64_t& cursor);
+```
+
+In `broker/libs/view/src/AggFold.cpp`:
+
+(a) After `constexpr uint8_t kPending = …;` add:
+
+```cpp
+// Chunk lookups issued before scanning (independent keys: their misses overlap).
+constexpr uint32_t kRescanBatch = 8;
+```
+
+(b) In `struct Ctx`, after `ViewTable& groups;` add `ViewTable* blocks;   // Min/Max value blocks; nullptr iff agg.numBlockCols == 0`.
+
+(c) Directly after `linkAtHead(...)`, add the block maintenance:
+
+```cpp
+    // --- Min/Max value block (Task 5b; layout in AggState.h) ---
+    uint32_t blockIdOf(const uint8_t* gr) const noexcept { return loadU32(gr + agg.groupBlockOff); }
+    uint32_t blockChunksOf(const uint8_t* gr) const noexcept { return loadU32(gr + agg.groupBlockOff + 4); }
+    void setBlock(uint8_t* gr, uint32_t id, uint32_t chunks) const noexcept {
+        storeU32(gr + agg.groupBlockOff, id);
+        storeU32(gr + agg.groupBlockOff + 4, chunks);
+    }
+
+    // Writes entry `slot` of chunk `row` from contributor c's row `cr`.
+    void writeEntry(uint8_t* row, uint32_t slot, uint64_t c, const uint8_t* cr) const noexcept {
+        storeU64(row + blockKeyOff(slot), c);
+        for (uint16_t col = 0; col < agg.numBlockCols; ++col) {
+            const uint16_t in = agg.blockColInput[col];
+            std::memcpy(row + blockValOff(col, slot), cr + agg.inputOff[in], 8);
+            row[blockNullOff(agg, col, slot)] = nullBit(cr, agg.contribNullOff, in) ? 1 : 0;
+        }
+    }
+    // Copies entry `from` of chunk `src` (key, values, nulls) to entry `to` of chunk `dst`.
+    void moveEntry(uint8_t* dst, uint32_t to, const uint8_t* src, uint32_t from) const noexcept {
+        std::memcpy(dst + blockKeyOff(to), src + blockKeyOff(from), 8);
+        for (uint16_t col = 0; col < agg.numBlockCols; ++col) {
+            std::memcpy(dst + blockValOff(col, to), src + blockValOff(col, from), 8);
+            dst[blockNullOff(agg, col, to)] = src[blockNullOff(agg, col, from)];
+        }
+    }
+
+    // A free block id for group g: its candidate, then linear probing (an id is
+    // in use iff its chunk 0 exists; get() never dirties). kNoBlock if none.
+    uint32_t allocBlockId(uint64_t g) const noexcept {
+        uint32_t id = blockIdCandidate(g);
+        for (uint32_t i = 0; i < kBlockIdProbes; ++i, ++id) {
+            if (id == kNoBlock) id = 1;   // wrapped
+            if (blocks->get(blockChunkKey(id, 0)) == nullptr) return id;
+        }
+        return kNoBlock;
+    }
+
+    // Appends contributor c (row cr, already counted into group g's row gr by
+    // applyContribution(+1)) as the group's last entry, position n-1: into the
+    // tail, the spare, or a new chunk at a boundary. Exactly one chunk row put.
+    void blockAppend(uint64_t c, uint8_t* cr, uint64_t g, uint8_t* gr) noexcept {
+        const uint64_t n = loadU64(gr);
+        if (blocks == nullptr || n == 0 || n > UINT32_MAX) { ++stats.aggInconsistent; return; }
+        const uint32_t pos = static_cast<uint32_t>(n - 1);
+        uint32_t id = blockIdOf(gr);
+        uint32_t chunks = blockChunksOf(gr);
+        if (id == kNoBlock) {
+            if (pos != 0) { ++stats.aggInconsistent; return; }   // entries without a block
+            id = allocBlockId(g);
+            if (id == kNoBlock) { ++stats.aggInconsistent; return; }
+            chunks = 0;
+        }
+        const uint32_t idx = pos >> kBlockShift;
+        uint8_t* row = nullptr;
+        if (idx < chunks) {                                      // the tail, or the spare at a boundary
+            if (blocks->get(blockChunkKey(id, idx)) == nullptr) ++stats.aggInconsistent;
+            else row = blocks->put(blockChunkKey(id, idx));
+        } else if (idx == chunks) {                              // a new chunk (zero-filled)
+            row = blocks->put(blockChunkKey(id, idx));
+            ++chunks;
+        } else {
+            ++stats.aggInconsistent;                             // a gap in the chunk sequence
+        }
+        setBlock(gr, id, chunks);
+        if (row == nullptr) return;
+        writeEntry(row, pos & kBlockMask, c, cr);
+        storeU32(cr + agg.contribBlockPosOff, pos);
+    }
+
+    // Rewrites contributor c's entry in place (same group; position unchanged).
+    void blockWrite(uint64_t c, const uint8_t* cr, const uint8_t* gr) noexcept {
+        const uint32_t pos = loadU32(cr + agg.contribBlockPosOff);
+        const uint32_t id = blockIdOf(gr);
+        if (blocks == nullptr || id == kNoBlock || pos >= loadU64(gr)) { ++stats.aggInconsistent; return; }
+        const uint64_t key = blockChunkKey(id, pos >> kBlockShift);
+        const uint8_t* cur = blocks->get(key);
+        const uint32_t slot = pos & kBlockMask;
+        if (cur == nullptr || loadU64(cur + blockKeyOff(slot)) != c) { ++stats.aggInconsistent; return; }
+        writeEntry(blocks->put(key), slot, c, cr);
+    }
+
+    // Removes contributor c (pre-image row cr) from group gr's block, AFTER
+    // applyContribution(-1) (so loadU64(gr) is the post-remove count n'): the
+    // old last entry (position n') moves into c's slot and its contributor's
+    // blockPos is patched (the tail chunk is only read). Then the chunk policy:
+    // n' == 0 frees the block and its id; a spare is freed once the tail holds
+    // <= kBlockSpareFreeAt entries; an emptied tail simply becomes the spare.
+    // At most: the hole chunk (put) + one erase -> 2 block rows, 1 contributor row.
+    void blockRemove(uint64_t c, const uint8_t* cr, uint8_t* gr) noexcept {
+        const uint64_t n = loadU64(gr);
+        const uint32_t id = blockIdOf(gr);
+        uint32_t chunks = blockChunksOf(gr);
+        const uint32_t pos = loadU32(cr + agg.contribBlockPosOff);
+        if (blocks == nullptr || id == kNoBlock || n > UINT32_MAX || pos > n) {
+            ++stats.aggInconsistent;
+            return;
+        }
+        const uint32_t last = static_cast<uint32_t>(n);
+        if (pos != last) {
+            const uint64_t holeKey = blockChunkKey(id, pos >> kBlockShift);
+            const uint8_t* tail = blocks->get(blockChunkKey(id, last >> kBlockShift));
+            const uint8_t* hole = blocks->get(holeKey);
+            if (tail == nullptr || hole == nullptr ||
+                loadU64(hole + blockKeyOff(pos & kBlockMask)) != c) {
+                ++stats.aggInconsistent;
+            } else {
+                const uint64_t m = loadU64(tail + blockKeyOff(last & kBlockMask));
+                moveEntry(blocks->put(holeKey), pos & kBlockMask, tail, last & kBlockMask);
+                if (uint8_t* mr = linkedContributor(m)) storeU32(mr + agg.contribBlockPosOff, pos);
+            }
+        }
+        if (n == 0) {
+            if (chunks > 2) ++stats.aggInconsistent;              // a 1-entry block owns <= 1 chunk
+            for (uint32_t k = 0; k < std::min<uint32_t>(chunks, 2); ++k)
+                (void)blocks->erase(blockChunkKey(id, k));
+            setBlock(gr, kNoBlock, 0);
+            return;
+        }
+        const uint32_t used = static_cast<uint32_t>((n - 1) >> kBlockShift) + 1;
+        const uint32_t tailFill = static_cast<uint32_t>(n - (static_cast<uint64_t>(used - 1) << kBlockShift));
+        if (chunks == used + 1 && tailFill <= kBlockSpareFreeAt) {
+            (void)blocks->erase(blockChunkKey(id, chunks - 1));
+            --chunks;
+        } else if (chunks != used && chunks != used + 1) {
+            ++stats.aggInconsistent;
+        }
+        setBlock(gr, id, chunks);
+    }
+```
+
+(d) Replace the whole `rescan` function (its comment through its closing `}`) with:
+
+```cpp
+    // Rebuilds Min/Max field i's cache by ONE sequential scan of the group's
+    // value block: ceil(n/32) chunk rows, looked up kRescanBatch at a time (the
+    // keys are computed, not links, so their misses overlap), then n packed
+    // values of the field's column. get() never dirties. A missing chunk, a
+    // short scan or a non-null count mismatch is counted; the cache reports what
+    // was actually found.
+    void rescan(uint8_t* gr, size_t i, const AggField& f) noexcept {
+        ++stats.aggRescans;
+        uint8_t* cv = cacheVal(gr, f.cache);
+        uint8_t* cs = cacheState(gr, f.cache);
+        const uint64_t n = loadU64(gr);
+        const uint64_t nonNull = loadU64(nn(gr, i));
+        const uint16_t col = agg.cacheCol[f.cache];
+        const uint32_t id = blocks != nullptr ? blockIdOf(gr) : kNoBlock;
+        bool have = false;
+        bool bad = id == kNoBlock;
+        uint64_t seen = 0, scanned = 0;
+        const uint64_t chunks = bad ? 0 : (n + kBlockEntries - 1) >> kBlockShift;
+        const uint8_t* rows[kRescanBatch];
+        for (uint64_t base = 0; base < chunks; base += kRescanBatch) {
+            const uint32_t m = static_cast<uint32_t>(std::min<uint64_t>(kRescanBatch, chunks - base));
+            for (uint32_t j = 0; j < m; ++j) {
+                rows[j] = blocks->get(blockChunkKey(id, static_cast<uint32_t>(base + j)));
+                if (rows[j] != nullptr) __builtin_prefetch(rows[j] + blockValOff(col, 0));
+            }
+            for (uint32_t j = 0; j < m; ++j) {
+                const uint8_t* r = rows[j];
+                if (r == nullptr) { bad = true; continue; }
+                const uint64_t first = (base + j) << kBlockShift;
+                const uint32_t cnt = static_cast<uint32_t>(std::min<uint64_t>(kBlockEntries, n - first));
+                const uint8_t* nulls = r + blockNullOff(agg, col, 0);
+                const uint8_t* vals = r + blockValOff(col, 0);
+                for (uint32_t s = 0; s < cnt; ++s) {
+                    if (nulls[s] != 0) continue;
+                    const uint8_t* v = vals + 8u * s;
+                    if (!have || strictlyBetter(f.rule, f.kind, v, cv)) { std::memcpy(cv, v, 8); have = true; }
+                    ++seen;
+                }
+                scanned += cnt;
+            }
+        }
+        if (bad || scanned != n || seen != nonNull) ++stats.aggInconsistent;
+        if (!have) storeU64(cv, 0);
+        *cs = have ? kValid : kEmpty;
+    }
+```
+
+(e) In `retract`, replace
+
+```cpp
+        if (gr == nullptr) return g;   // inconsistent: counted, nothing else changed
+```
+
+with
+
+```cpp
+        if (gr == nullptr) return g;   // inconsistent: counted, nothing else changed
+        // Value block: an in-place update keeps its entry (rewritten after the add);
+        // everything else leaves the group -- swap-remove BEFORE the emit below rescans.
+        if (agg.numBlockCols > 0 && mode != RetractMode::InPlaceLinked) blockRemove(c, cr, gr);
+```
+
+(f) In the fold body, replace
+
+```cpp
+            uint8_t* gr = cx.applyContribution(cr, +1);
+            if (agg.linked) cx.linkAtHead(c, cr, gr);
+            cx.emit(g, gr);
+```
+
+with
+
+```cpp
+            uint8_t* gr = cx.applyContribution(cr, +1);
+            if (agg.linked) cx.linkAtHead(c, cr, gr);
+            if (agg.numBlockCols > 0) {          // implies linked: same group == InPlaceLinked
+                if (hadOld && oldGroup == g) cx.blockWrite(c, cr, gr);
+                else cx.blockAppend(c, cr, g, gr);
+            }
+            cx.emit(g, gr);                      // a rescan here sees the block's new state
+```
+
+(g) Change the definition's signature to the `blocks` overload (add `ViewTable* blocks,` after `ViewTable& groups,`), construct `Ctx cx{layout, agg, view, contributors, groups, blocks, stats};`, and after its closing `}` add the forwarding overload:
+
+```cpp
+FoldStats foldAggregateBatch(const CompiledViewPlan& plan, const RowLayout& layout,
+                             const AggLayout& agg, VersionDescriptorCache& vdc,
+                             ViewTable& view, ViewTable& contributors, ViewTable& groups,
+                             const rune::storage::LogReadView& lv, int64_t bound,
+                             int64_t& cursor) {
+    return foldAggregateBatch(plan, layout, agg, vdc, view, contributors, groups, nullptr, lv,
+                              bound, cursor);
+}
+```
+
+Notes for the implementer:
+- `cr` in `retract` is the pre-image row pointer from `contributors.get(c)`. `blockRemove` reads `blockPos` from it before the tombstone path erases it or the add path rewrites it. Rows never move, so `put()`s elsewhere (m's row, the hole chunk) do not invalidate it or `tail`.
+- The value loop of the add path writes only `inputOff` slots, so `blockPos` (at the row's end) survives an in-place rewrite. For a move, `blockAppend` overwrites it.
+- A rescan after a move-out must see the block *after* the swap-remove: (e) runs before `retract`'s `emit`. A rescan after an in-place update must see the *new* value: (f) runs before the fold's `emit`.
+- The 2a path is unchanged. `numBlockCols == 0` means no block call, no new bytes, and the same `put`/`erase` order. `AggFold*` stays byte-untouched and still calls the 10-argument overload.
+
+- [ ] **Step 5: Run the view tests.**
+
+Run: `cmake --build build/root -j14 --target rune_view_tests && ctest --test-dir build/root -R 'AggRetractable|AggFold|AggState|ViewFold|ViewCheckpoint' -j14 --output-on-failure`
+Expected: 0 failures. That covers every Task 5 test, `DanglingLink…` with its new expectation, the 9 new or replaced block tests and the untouched 2a `AggFold*` suite. If the model fails, the step number in the message localizes it. Debug with superpowers:systematic-debugging and keep the test.
+
+- [ ] **Step 6: Node plumbing (the fourth table).** In `broker/libs/node/include/rune/node/WorkerViewSet.h`:
+
+Replace `struct AggInstance { … };` with:
+
+```cpp
+// Phase 2a: the auxiliary tables of an aggregate (view, partition); Phase 2b
+// Task 5b: plus the per-group Min/Max value blocks when the view has Min/Max.
+struct AggInstance {
+    rune::view::AggLayout layout;        // declared first: the tables are built from it
+    rune::view::ViewTable contributors;  // contributorKey -> pre-image (retraction)
+    rune::view::ViewTable groups;        // groupKey -> accumulators
+    std::optional<rune::view::ViewTable> blocks;   // engaged iff layout.numBlockCols > 0
+    AggInstance(rune::view::AggLayout l, std::size_t indexSlots, std::size_t chunkBytes)
+        : layout(std::move(l)),
+          contributors(layout.contributorRow, indexSlots, chunkBytes),
+          groups(layout.groupRow, indexSlots, chunkBytes) {
+        if (layout.numBlockCols > 0) blocks.emplace(layout.blockRow, indexSlots, chunkBytes);
+    }
+    rune::view::ViewTable* blocksOrNull() noexcept { return blocks ? &*blocks : nullptr; }
+};
+```
+
+In `dirtyBacklog`, replace `if (inst.agg) n += pending(inst.agg->contributors) + pending(inst.agg->groups);` with:
+
+```cpp
+        if (inst.agg) {
+            n += pending(inst.agg->contributors) + pending(inst.agg->groups);
+            if (inst.agg->blocks) n += pending(*inst.agg->blocks);
+        }
+```
+
+In the fold pass, replace the aggregate call's argument line `inst.agg->groups, view, passBound, cursor)` with `inst.agg->groups, inst.agg->blocksOrNull(), view, passBound, cursor)`.
+
+In `discardDirty_`, after `inst.agg->groups.drainDirty(drop);` add `if (inst.agg->blocks) inst.agg->blocks->drainDirty(drop);`.
+
+In `broker/libs/node/src/WorkerViewSet.cpp`:
+
+In `replayInstance`, replace the table set-up and the `apply` lambda (from `rune::view::ViewTable* tables[3];` through the `applyMultiDelta` line) with:
+
+```cpp
+    rune::view::ViewTable* tables[4];
+    uint32_t lens[4];
+    std::size_t nTables = 0;
+    if (inst.agg) {
+        tables[rune::view::kAggTableView]         = &inst.table;
+        tables[rune::view::kAggTableContributors] = &inst.agg->contributors;
+        tables[rune::view::kAggTableGroups]       = &inst.agg->groups;
+        lens[rune::view::kAggTableView]         = inst.layout.rowLen;
+        lens[rune::view::kAggTableContributors] = inst.agg->layout.contributorRow.rowLen;
+        lens[rune::view::kAggTableGroups]       = inst.agg->layout.groupRow.rowLen;
+        nTables = 3;
+        if (inst.agg->blocks) {   // Task 5b: Min/Max value blocks, table id 3
+            tables[rune::view::kAggTableBlocks] = &*inst.agg->blocks;
+            lens[rune::view::kAggTableBlocks]   = inst.agg->layout.blockRow.rowLen;
+            nTables = 4;
+        }
+    }
+    auto apply = [&](std::span<const uint8_t> rec) -> std::optional<rune::view::AppliedDelta> {
+        if (inst.agg)
+            return rune::view::applyMultiDelta(std::span<rune::view::ViewTable* const>(tables, nTables),
+                                               std::span<const uint32_t>(lens, nTables), rec);
+```
+
+(the `return rune::view::applyDelta(…)` line and the rest stay). Also change the function's comment `v2 (all three tables, offset-atomic)` to `v2 (all three tables, or four with Min/Max value blocks; offset-atomic)`.
+
+Replace `maxRecordsPerPassFor` (its comment and body) with:
+
+```cpp
+// Most source records one fold pass may cover so the pass's checkpoint delta
+// (worst case) fits ONE ring message of `maxMsg` payload bytes; 0 if not even
+// one record fits.  Worst case per source record: Replace dirties 1 output row;
+// an aggregate dirties rune::view::aggDirtyBoundPerRecord rows per table (2a:
+// contributor + old/new group + old/new output row; linked views also the
+// contributor's two old neighbours and the new group's old head; Min/Max views
+// also the old group's swap-moved contributor and up to 3 value-block chunks).
+int64_t maxRecordsPerPassFor(const ViewInstance& inst, std::size_t maxMsg) {
+    using namespace rune::view;
+    std::size_t fixed = ViewSnapshotChannel::kDeltaHeaderBytes + kCheckpointCrcBytes;
+    std::size_t perRecord = 0;
+    if (inst.agg) {
+        const AggLayout& a = inst.agg->layout;
+        const std::size_t nTables = a.numBlockCols > 0 ? 4 : 3;
+        fixed += kCheckpointV2HeaderBytes + nTables * kCheckpointV2TableHeaderBytes;
+        const AggDirtyBound b = aggDirtyBoundPerRecord(a);
+        perRecord = b.contributorRows * (kCheckpointEntryHeaderBytes + a.contributorRow.rowLen) +
+                    b.groupRows * (kCheckpointEntryHeaderBytes + a.groupRow.rowLen) +
+                    b.viewRows * (kCheckpointEntryHeaderBytes + inst.layout.rowLen) +
+                    b.blockRows * (kCheckpointEntryHeaderBytes + a.blockRow.rowLen);
+    } else {
+        fixed += kCheckpointV1HeaderBytes;
+        perRecord = kCheckpointEntryHeaderBytes + inst.layout.rowLen;
+    }
+    if (maxMsg <= fixed) return 0;
+    return static_cast<int64_t>((maxMsg - fixed) / perRecord);
+}
+```
+
+In `buildAndPushCheckpoint_`'s aggregate branch, replace from `std::size_t b[4];` through the `encodeMultiDelta` call with:
+
+```cpp
+        std::size_t b[5];
+        b[0] = 0;
+        drainInto(inst.table, inst.layout.rowLen);
+        b[1] = dirtyEntries_.size();
+        drainInto(inst.agg->contributors, inst.agg->layout.contributorRow.rowLen);
+        b[2] = dirtyEntries_.size();
+        drainInto(inst.agg->groups, inst.agg->layout.groupRow.rowLen);
+        b[3] = dirtyEntries_.size();
+        if (inst.agg->blocks) drainInto(*inst.agg->blocks, inst.agg->layout.blockRow.rowLen);
+        b[4] = dirtyEntries_.size();
+        if (dirtyEntries_.empty()) return 0;
+        fixup();
+        auto sub = [&](int i) {
+            return std::span<const rune::view::DirtyEntry>(dirtyEntries_.data() + b[i],
+                                                          b[i + 1] - b[i]);
+        };
+        const rune::view::TableDelta tds[4] = {
+            {rune::view::kAggTableView, inst.layout.rowLen, sub(0)},
+            {rune::view::kAggTableContributors, inst.agg->layout.contributorRow.rowLen, sub(1)},
+            {rune::view::kAggTableGroups, inst.agg->layout.groupRow.rowLen, sub(2)},
+            {rune::view::kAggTableBlocks, inst.agg->layout.blockRow.rowLen, sub(3)}};
+        const std::size_t nTables = inst.agg->blocks ? 4 : 3;   // 2a / Last-only: unchanged 3-table bytes
+        rune::view::encodeMultiDelta(std::span<const rune::view::TableDelta>(tds, nTables),
+                                     inst.foldCursor, inst.pendingDelta);
+```
+
+(and update the comment above it: `output rows + contributor map + group accumulators (+ Min/Max value blocks) in ONE v2 record, so recovery always restores every table at the same O`).
+
+In `broker/benchmark/ViewFoldBench.cpp` (`AggRig`): add `#include <optional>` to the includes; add the member `std::optional<ViewTable> blocks;   // Min/Max value blocks (userStatsView); empty for a 2a view` after `VersionDescriptorCache vdc;`; give the constructor the body `{ if (agg.numBlockCols > 0) blocks.emplace(agg.blockRow); }`; in `drainAll()` add `if (blocks) blocks->drainDirty(nop);`; and in `foldStream` pass `blocks ? &*blocks : nullptr` after `groups`:
+
+```cpp
+        const auto fs = foldAggregateBatch(comp.plan, comp.rowLayout, agg, vdc, view, contributors,
+                                           groups, blocks ? &*blocks : nullptr, lv, s.bound(i), cur);
+```
+
+`prime()` already folds the whole contributor space, so the block table reaches its final population (10k groups × ≤ 4 chunks) and capacity before timing.
+
+- [ ] **Step 7: Run the affected tests.**
+
+Run: `cmake --build build/root -j14 --target rune_view_tests rune_node_tests rune_get_view_row_tests rune_create_view_tests && ctest --test-dir build/root -R 'Agg|ViewFold|ViewCheckpoint|WorkerViewSet|ViewRecovery|ViewReadiness|ViewSnapshot|GetViewRow|CreateView' -j14 --output-on-failure`
+Expected: 0 failures. 2a's `PersistedAggregateLargeRangeDeltasFitTheRing` and `AggregateRecoveryOfLargeCheckpointDoesNotResendRows` pass unchanged (3-table records, same cap).
+
+- [ ] **Step 8: Commit.**
+
+```bash
+git add broker/libs/view/include/rune/view/AggState.h broker/libs/view/src/AggState.cpp broker/libs/view/include/rune/view/AggFold.h broker/libs/view/src/AggFold.cpp broker/libs/view/tests/view/AggStateTest.cpp broker/libs/view/tests/view/AggRetractableTest.cpp broker/libs/node/include/rune/node/WorkerViewSet.h broker/libs/node/src/WorkerViewSet.cpp broker/benchmark/ViewFoldBench.cpp
+git commit -m "feat(view): contiguous per-group Min/Max value block — sequential rescan, swap-remove, spare-chunk hysteresis; checkpoint table 3; exact bound {5,2,2,3}" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+```
+
+- [ ] **Step 9: Rerun the bench gate (`build/rel`).**
+
+```bash
+cmake --build build/rel -j14 --target rune_broker_benchmark
+build/rel/broker/rune_broker_benchmark --benchmark_filter=BM_ViewFoldRetractable
+build/rel/broker/rune_broker_benchmark --benchmark_filter='BM_ViewFold(Aggregate|Replace)'
+```
+
+Expected: `[ViewFoldRetractable gate] ret_record_p99_us=… (<5) ret_batch_p99_us=… (<10) steady_alloc=0 (==0) rescans=… => PASS`, on the same honest churn (no workload change). Report to the controller `ret_record_p50/p99`, `ret_batch_p99`, `ret_rescans` divided by measured records, and the p50 against Task 5's 0.75 µs. `BM_ViewFoldAggregate` and `BM_ViewFoldReplace` must still PASS (2a untouched). On a FAIL, report the record-vs-batch p99 split and a profile **before any tuning**. Never relax the gate or its thresholds. A non-zero `steady_alloc` is a CLAUDE.md #4 violation to fix, not to gate away.
+
+---
+
 ### Task 6: Pin the dirty bound and model-check the fold
 
 These tests target the linked fold's two quiet failure modes: a list or cache that drifts from the truth only after a long, specific history, and a record that dirties more rows than the per-pass cap assumes. Both fail silently in production; here they fail deterministically.
@@ -1994,7 +3331,8 @@ These tests target the linked fold's two quiet failure modes: a list or cache th
 - Modify: `broker/libs/view/tests/view/AggRetractableTest.cpp` (append)
 
 **Interfaces:**
-- Consumes: `aggDirtyBoundPerRecord`, `AggDirtyBound` (Task 4); `Harness::drainCounts` and `Ord`/`encode` (Task 5's test file). Adds `Harness::Rec` and `Harness::applySplit` (Step 1a, F9).
+- Consumes: `aggDirtyBoundPerRecord`, `AggDirtyBound` (Task 4, `blockRows` from Task 5b); `Harness::drainCounts`, `Harness::blocks`, `Drained::blockRows`, `Harness::expectBlocksConsistent` (Task 5b) and `Ord`/`encode` (Task 5's test file). Adds `Harness::Rec` and `Harness::applySplit` (Step 1a, F9).
+- **Amended 2026-10-20 (Task 5b):** the worst-case pin moved to Task 5b (`WorstCaseMoveDirtiesExactlyTheBoundRegression`, all four tables), so this task no longer adds `WorstCaseMoveDirtiesExactlyTheDerivedBoundRegression`. The split pass and the model also check the block table.
 
 - [ ] **Step 1a: Extend the harness (F9).** In `Harness` (Task 5's test file), directly after `drainCounts()`, add a way to fold one batch in two passes. This is the worker's capped-pass shape: pass 1 stops at `bound`, pass 2 resumes from the cursor.
 
@@ -2021,7 +3359,7 @@ These tests target the linked fold's two quiet failure modes: a list or cache th
         size_t done = 0;
         for (const int64_t bnd : {cap, full}) {
             last = rune::view::foldAggregateBatch(comp.plan, comp.rowLayout, agg, vdc, view,
-                                                  contributors, groups, lv, bnd, cursor);
+                                                  contributors, groups, &blocks, lv, bnd, cursor);
             inconsistent += last.aggInconsistent;
             const size_t inPass = static_cast<size_t>(bnd - next) - done;
             done += inPass;
@@ -2029,10 +3367,12 @@ These tests target the linked fold's two quiet failure modes: a list or cache th
             EXPECT_LE(d.contributorRows, inPass * perRec.contributorRows);
             EXPECT_LE(d.groupRows, inPass * perRec.groupRows);
             EXPECT_LE(d.viewRows, inPass * perRec.viewRows);
+            EXPECT_LE(d.blockRows, inPass * perRec.blockRows);
             EXPECT_EQ(d.pendingCaches, 0u);
             total.contributorRows += d.contributorRows;
             total.groupRows += d.groupRows;
             total.viewRows += d.viewRows;
+            total.blockRows += d.blockRows;
             total.pendingCaches += d.pendingCaches;
         }
         next = full;
@@ -2043,34 +3383,6 @@ These tests target the linked fold's two quiet failure modes: a list or cache th
 - [ ] **Step 1: Write the tests.** Append to `broker/libs/view/tests/view/AggRetractableTest.cpp`:
 
 ```cpp
-// REGRESSION (Review Focus #3): the worst case the per-pass delta cap assumes
-// is REACHED by a group move, and no record exceeds it.
-TEST(AggRetractableRegression, WorstCaseMoveDirtiesExactlyTheDerivedBoundRegression) {
-    Harness h;
-    h.putOrd({1, 100, 10});
-    h.putOrd({2, 100, 20});
-    h.putOrd({3, 100, 30});      // u100 list: 3 -> 2 -> 1
-    h.putOrd({4, 200, 40});
-    h.putOrd({5, 200, 50});      // u200 list: 5 -> 4
-    (void)h.drainCounts();
-    h.putOrd({2, 200, 25});      // move 2 (prev 3, next 1) to u200 (old head 5)
-    const auto d = h.drainCounts();
-    const auto b = rune::view::aggDirtyBoundPerRecord(h.agg);
-    ASSERT_EQ(b.contributorRows, 4u);
-    ASSERT_EQ(b.groupRows, 2u);
-    ASSERT_EQ(b.viewRows, 2u);
-    EXPECT_EQ(d.contributorRows, b.contributorRows) << "2, its old neighbours 3 and 1, u200's old head 5";
-    EXPECT_EQ(d.groupRows, b.groupRows);
-    EXPECT_EQ(d.viewRows, b.viewRows);
-    EXPECT_EQ(d.pendingCaches, 0u);
-    EXPECT_EQ(h.col(100, kLastAmt).i, 30);
-    EXPECT_EQ(h.col(200, kLastAmt).i, 25);
-    EXPECT_EQ(h.col(100, kMaxAmt).i, 30);
-    EXPECT_EQ(h.col(100, kMinAmt).i, 10);
-    EXPECT_EQ(h.col(200, kMinAmt).i, 25);
-    EXPECT_EQ(h.inconsistent, 0u);
-}
-
 // REGRESSION (Review Focus #1/#3, F9): a deterministic history of 3000 steps of
 // 1-4 records each (inserts, in-place updates, group moves, deletes; the same
 // contributor can repeat inside one batch) over 24 contributors / 4 groups, with
@@ -2117,7 +3429,9 @@ TEST(AggRetractableRegression, RandomizedOpsMatchBruteForceModelRegression) {
         ASSERT_LE(d.contributorRows, n * bound.contributorRows) << "step " << step;
         ASSERT_LE(d.groupRows, n * bound.groupRows) << "step " << step;
         ASSERT_LE(d.viewRows, n * bound.viewRows) << "step " << step;
+        ASSERT_LE(d.blockRows, n * bound.blockRows) << "step " << step;
         ASSERT_EQ(d.pendingCaches, 0u) << "step " << step;
+        ASSERT_EQ(h.expectBlocksConsistent({1, 2, 3, 4}), live.size()) << "step " << step;
         for (int64_t g = 1; g <= 4; ++g) {
             const M* lastM = nullptr;
             const M* lastNn = nullptr;
@@ -2168,6 +3482,7 @@ TEST(AggRetractableRegression, NoGroupRewriteUnlinksAndRetractsTheContributorReg
     ASSERT_TRUE(agg.linked);
     rune::view::VersionDescriptorCache vdc(src);
     rune::view::ViewTable view(comp.rowLayout), contributors(agg.contributorRow), groups(agg.groupRow);
+    rune::view::ViewTable blocks(agg.blockRow);   // Max(amount): a value block (Task 5b)
     int64_t off = 0;
     auto fold = [&](int64_t id, const std::vector<uint8_t>& value) {
         rune::protocol::RecordBatchBuilder b(off, 0);
@@ -2177,7 +3492,7 @@ TEST(AggRetractableRegression, NoGroupRewriteUnlinksAndRetractsTheContributorReg
         const auto batch = b.build();
         int64_t cur = off;
         const auto st = rune::view::foldAggregateBatch(
-            comp.plan, comp.rowLayout, agg, vdc, view, contributors, groups,
+            comp.plan, comp.rowLayout, agg, vdc, view, contributors, groups, &blocks,
             {batch.data(), batch.size(), off, off + 1}, off + 1, cur);
         ++off;
         return st;
@@ -2204,13 +3519,14 @@ TEST(AggRetractableRegression, NoGroupRewriteUnlinksAndRetractsTheContributorReg
     (void)fold(2, [&] { std::vector<uint8_t> b; le16(b, 16); le16(b, 1); le64(b, 2); le64(b, 30); return b; }());
     EXPECT_EQ(view.get(100), nullptr) << "the last contributor left: group and list are gone";
     EXPECT_EQ(contributors.size(), 0u);
+    EXPECT_EQ(blocks.size(), 0u) << "the emptied group's value block (chunk 0) and id are freed";
 }
 ```
 
 - [ ] **Step 2: Run them.**
 
 Run: `cmake --build build/root -j14 --target rune_view_tests && ctest --test-dir build/root -R 'AggRetractableRegression' --output-on-failure`
-Expected: all three pass on Task 5's fold. If either fails, the failure is a real bug in Task 5. Debug it with superpowers:systematic-debugging, fix it in `AggFold.cpp`, and keep the test as written; the step number in the message localizes the bug.
+Expected: both pass on Task 5b's fold. If either fails, the failure is a real bug in Task 5 or 5b. Debug it with superpowers:systematic-debugging, fix it in `AggFold.cpp`, and keep the test as written; the step number in the message localizes the bug.
 
 - [ ] **Step 3: Run the affected tests and commit.**
 
@@ -2218,19 +3534,22 @@ Run: `ctest --test-dir build/root -R 'AggRetractable|AggFold|AggState' -j14 --ou
 
 ```bash
 git add broker/libs/view/tests/view/AggRetractableTest.cpp
-git commit -m "test(view): pin the linked fold's exact per-record dirty bound; model-check 3000 multi-record steps (capped-pass resume) against brute force; no-group unlink" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+git commit -m "test(view): model-check 3000 multi-record steps (capped-pass resume, value-block structure) against brute force; no-group unlink frees the block" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
 
 ### Task 7: Worker — per-pass cap from the derived bound; restart regression
 
+> **Amended 2026-10-20 (Task 5b):** Task 5b already moved `maxRecordsPerPassFor`, replay, checkpoint encode, `discardDirty_` and `dirtyBacklog` onto the 4-table record. This task keeps its two regressions, which now pin the recovered value block and the {5,2,2,3} budget. Its Step 3 becomes the carried Task 5 review item 2: `FoldStats::aggRescans` surfaced as `ViewFoldCounters::aggRescans`.
+
 **Files:**
-- Modify: `broker/libs/node/src/WorkerViewSet.cpp:132-` (`maxRecordsPerPassFor`: its comment starts at 132, the function at 136)
+- Modify: `broker/libs/node/include/rune/node/WorkerViewSet.h` (`ViewFoldCounters::aggRescans` and its accumulate line next to `aggInconsistent`)
 - Test: `broker/libs/node/tests/node/WorkerViewSetTest.cpp` (append)
 
 **Interfaces:**
-- Consumes: `aggDirtyBoundPerRecord` (Task 4); the linked fold (Task 5). `AggInstance`, `ViewInstance` and the recovery and checkpoint code are unchanged: the new links, heads and caches are bytes inside the contributor and group rows the v2 record already carries.
+- Consumes: `aggDirtyBoundPerRecord` (Tasks 4, 5b); the linked fold (Tasks 5, 5b); `AggInstance::blocks` and the 4-table v2 record (Task 5b).
+- Produces: `rune::node::ViewFoldCounters::aggRescans` (`uint64_t`, cumulative `FoldStats::aggRescans`).
 
 - [ ] **Step 1: Write the failing tests.** Append to the end of `broker/libs/node/tests/node/WorkerViewSetTest.cpp` (after the last test; `orderSrc`, `orderBatch`, `drainDeltas` and `driveToEnd` are defined earlier in the file):
 
@@ -2252,8 +3571,9 @@ rune::view::ViewPlan userMaxPlan(uint8_t persistence) {
 } // namespace
 
 // REGRESSION (Review Focus #2): after recovery, retracting the cached Max must
-// rescan the RECOVERED contributor list (links + head + cache all came back
-// from the v2 checkpoint) and surface the exact next extreme.
+// rescan the RECOVERED value block (table 3 of the v2 checkpoint; links, head,
+// cache, block id and positions came back in the contributor and group rows)
+// and surface the exact next extreme.
 TEST(WorkerViewSetRegression, RestartThenRetractingTheMaxIsExactRegression) {
     const auto src = orderSrc();
     const rune::codec::Descriptor* srcs[] = {&src};
@@ -2269,6 +3589,7 @@ TEST(WorkerViewSetRegression, RestartThenRetractingTheMaxIsExactRegression) {
     ASSERT_EQ(deltas.size(), 1u);
     uint32_t magic; std::memcpy(&magic, deltas[0].data(), 4);
     EXPECT_EQ(magic, rune::view::kViewCheckpointMagicV2) << "no new format: still the v2 record";
+    EXPECT_EQ(deltas[0][12], 4u) << "a Min/Max view's record carries four tables (value blocks = id 3)";
 
     rune::node::ViewSnapshotChannel ch2;
     rune::node::WorkerViewSet vs2(ch2, tmpDir("rune-views-max-rec"));
@@ -2288,19 +3609,22 @@ TEST(WorkerViewSetRegression, RestartThenRetractingTheMaxIsExactRegression) {
     row = vs2.getRow(0x4000000A, 0, 100, L);
     ASSERT_NE(row, nullptr);
     EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 3);
-    EXPECT_EQ(rune::view::readSlot(row, *L, 2).i, 30) << "next extreme found by walking the recovered list";
+    EXPECT_EQ(rune::view::readSlot(row, *L, 2).i, 30) << "next extreme found by scanning the recovered value block";
     EXPECT_EQ(rune::view::readSlot(row, *L, 3).i, 5) << "the re-write is now the head";
     const rune::node::ViewFoldCounters* fc = vs2.foldCounters(0x4000000A, 0);
     ASSERT_NE(fc, nullptr);
     EXPECT_EQ(fc->aggInconsistent, 0u);
+    EXPECT_EQ(fc->aggRescans, 1u) << "the post-restart retraction rescanned once (counter surfaced, Task 5 review item 2)";
 }
 
-// REGRESSION (Review Focus #3): a stream of GROUP MOVES that dirty 8 DISTINCT
-// rows each (no coalescing across records: every move touches its own groups,
-// neighbours and target head) -- the linked worst case. Under the 2a bound
-// (1 contributor row per record) a capped pass claims ~189 KB > the 128 KiB
-// delta-ring max message and the worker THROWS; under the derived bound
-// (4+2+2) every delta fits and the result is exact.
+// REGRESSION (Review Focus #3): a stream of GROUP MOVES that dirty 10 DISTINCT
+// entries each (no coalescing across records: every move touches its own groups,
+// neighbours, target head and two value-block chunks; the middle contributor's
+// swap partner is its own predecessor) -- 4 contributor + 2 group + 2 view + 2
+// block rows, 1674 B. Under a bound without the block rows ({4,2,2,0}: 560 B per
+// record, ~233 records per pass) a pass of move records would claim up to ~390 KB,
+// the first pass over the 128 KiB delta-ring max message THROWS on the worker; under Task 5b's bound
+// ({5,2,2,3}: 2289 B, 57 records per pass) every delta fits and the result is exact.
 TEST(WorkerViewSetRegression, PersistedRetractableMovesDeltasFitTheRingRegression) {
     const auto src = orderSrc();
     const rune::codec::Descriptor* srcs[] = {&src};
@@ -2348,40 +3672,24 @@ TEST(WorkerViewSetRegression, PersistedRetractableMovesDeltasFitTheRingRegressio
 
 Add `#include <algorithm>` and `#include <climits>` to the file's includes if they are missing.
 
-- [ ] **Step 2: Run them and confirm the large-range test fails.**
+- [ ] **Step 2: Run them and confirm they fail.**
 
-Run: `cmake --build build/root -j14 --target rune_node_tests && ctest --test-dir build/root -R 'WorkerViewSetRegression\.(RestartThenRetracting|PersistedRetractableMoves)' --output-on-failure`
-Expected: `PersistedRetractableMovesDeltasFitTheRingRegression` **fails**. `ASSERT_NO_THROW` reports the ring's oversized-claim exception: the 2a formula gives 366 B per record, so a pass covers about 358 move records, which really dirty 528 B each, about 189 KB, over the 128 KiB max message. `RestartThenRetractingTheMaxIsExactRegression` already passes on Task 5's fold. That is expected: it guards the recovery path, which needs no code change.
+Run: `cmake --build build/root -j14 --target rune_node_tests`
+Expected: compile error `no member named 'aggRescans' in 'rune::node::ViewFoldCounters'`. (Amended 2026-10-20: the cap itself landed in Task 5b, so the large-range test passes once it compiles. To see it bite, temporarily drop the `b.blockRows * …` term from `maxRecordsPerPassFor` and confirm the `ASSERT_NO_THROW` failure (the ring’s oversized claim; pre-validated with {5,2,2,0}: `encoded message exceeds maxMsgLength of 131072 length=142858`, the first pass over the limit). Restore it and do not commit that experiment.)
 
-- [ ] **Step 3: Implement.** In `broker/libs/node/src/WorkerViewSet.cpp`, replace the comment (from `// Most source records one fold pass may cover`) and the body of `maxRecordsPerPassFor` with:
+- [ ] **Step 3: Implement (carried Task 5 review item 2).** In `broker/libs/node/include/rune/node/WorkerViewSet.h`, in `struct ViewFoldCounters`, after `uint64_t aggInconsistent  = 0;   // aggregate: retraction found missing/zero state` add:
 
 ```cpp
-// Most source records one fold pass may cover so the pass's checkpoint delta
-// (worst case) fits ONE ring message of `maxMsg` payload bytes; 0 if not even
-// one record fits.  Worst case per source record: Replace dirties 1 output row;
-// an aggregate dirties rune::view::aggDirtyBoundPerRecord rows per table (2a:
-// contributor + old/new group + old/new output row; linked Min/Max/Last views
-// additionally the contributor's two old neighbours and the new group's old head).
-int64_t maxRecordsPerPassFor(const ViewInstance& inst, std::size_t maxMsg) {
-    using namespace rune::view;
-    std::size_t fixed = ViewSnapshotChannel::kDeltaHeaderBytes + kCheckpointCrcBytes;
-    std::size_t perRecord = 0;
-    if (inst.agg) {
-        fixed += kCheckpointV2HeaderBytes + 3 * kCheckpointV2TableHeaderBytes;
-        const AggDirtyBound b = aggDirtyBoundPerRecord(inst.agg->layout);
-        perRecord = b.contributorRows * (kCheckpointEntryHeaderBytes + inst.agg->layout.contributorRow.rowLen) +
-                    b.groupRows * (kCheckpointEntryHeaderBytes + inst.agg->layout.groupRow.rowLen) +
-                    b.viewRows * (kCheckpointEntryHeaderBytes + inst.layout.rowLen);
-    } else {
-        fixed += kCheckpointV1HeaderBytes;
-        perRecord = kCheckpointEntryHeaderBytes + inst.layout.rowLen;
-    }
-    if (maxMsg <= fixed) return 0;
-    return static_cast<int64_t>((maxMsg - fixed) / perRecord);
-}
+    uint64_t aggRescans       = 0;   // aggregate (Phase 2b): Min/Max value-block rescans (retracted extreme)
 ```
 
-For 2a views this computes exactly the old value, because `{1, 2, 2}` gives the old expression.
+and in the fold pass, after `inst.counters.aggInconsistent  += st.aggInconsistent;` add:
+
+```cpp
+        inst.counters.aggRescans       += st.aggRescans;
+```
+
+(`maxRecordsPerPassFor`, replay and the checkpoint encode already carry the value-block table since Task 5b; nothing else changes here.)
 
 - [ ] **Step 4: Run the tests and confirm they pass.**
 
@@ -2394,8 +3702,8 @@ Expected: all pass, including 2a's `PersistedAggregateLargeRangeDeltasFitTheRing
 Run: `cmake --build build/root -j14 --target rune_view_tests && ctest --test-dir build/root -R 'Agg|ViewFold' -j14 --output-on-failure` → 0 failures (Step 4 already ran the node-side suites). The controller's checkpoint after this task runs the full `*Regression*` suite.
 
 ```bash
-git add broker/libs/node/src/WorkerViewSet.cpp broker/libs/node/tests/node/WorkerViewSetTest.cpp
-git commit -m "fix(node): per-pass delta cap uses the exact linked-aggregate dirty bound (4+2+2); restart-then-retract-max regression" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+git add broker/libs/node/include/rune/node/WorkerViewSet.h broker/libs/node/tests/node/WorkerViewSetTest.cpp
+git commit -m "test(node): restart-then-retract-max scans the recovered value block; Min/Max move stream fits the ring under the {5,2,2,3} bound; surface aggRescans" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -2445,7 +3753,7 @@ rune::view::ViewPlan groupMaxView() {
 constexpr int64_t kExtremeGroup = 7;
 ```
 
-- [ ] **Step 2: Factor the shared rig (F10).** `BM_ViewFoldAggregate` and the new gate run the identical workload (same append, drain, fold and prime code). Define it once. Directly before the anonymous namespace's closing `} // namespace` (line 440), add:
+- [ ] **Step 2: Factor the shared rig (F10).** (Amended 2026-10-20: Task 5b Step 6 later gives `AggRig` a `std::optional<ViewTable> blocks` and passes it to the fold. The code below is the pre-5b shape, already committed in cb26f195.) `BM_ViewFoldAggregate` and the new gate run the identical workload (same append, drain, fold and prime code). Define it once. Directly before the anonymous namespace's closing `} // namespace` (line 440), add:
 
 ```cpp
 // --- Shared aggregate rig (BM_ViewFoldAggregate, BM_ViewFoldRetractable) ---
@@ -2594,7 +3902,8 @@ git commit -m "bench(view): §14.0 gate for the retractable fold; shared AggRig 
 // Extreme retraction (Phase 2b) — REPORTED, NOT GATED (spec §A Gates: the known
 // O(group size) path). One group of N contributors with amounts 1..N; each
 // timed op lowers the CURRENT max holder (N, N-1, ..., 2) to 0, so every op
-// retracts the cached Max with a lower value and walks all N contributors.
+// retracts the cached Max with a lower value and scans the group's N-entry
+// value block (Task 5b: ceil(N/32) chunk rows, sequential).
 // Single-record batches; latency per op.
 static void BM_ViewFoldExtremeRetract(benchmark::State& st) {
     const int64_t groupSize = st.range(0);
@@ -2608,6 +3917,7 @@ static void BM_ViewFoldExtremeRetract(benchmark::State& st) {
         auto agg = rune::view::buildAggLayout(comp.plan, src).value();
         ViewTable view(comp.rowLayout);
         ViewTable contributors(agg.contributorRow), groups(agg.groupRow);
+        ViewTable blocks(agg.blockRow);   // groupMaxView has Max: the value block (Task 5b)
         VersionDescriptorCache vdc(src);
 
         // Op.key = contributor id, Op.hp = amount; every record in kExtremeGroup.
@@ -2621,7 +3931,7 @@ static void BM_ViewFoldExtremeRetract(benchmark::State& st) {
             auto lv = s.view(i);
             int64_t cur = 0;
             return foldAggregateBatch(comp.plan, comp.rowLayout, agg, vdc, view, contributors,
-                                      groups, lv, s.bound(i), cur);
+                                      groups, &blocks, lv, s.bound(i), cur);
         };
 
         // Prime (NOT timed): contributors 1..N, amount = id -> max = N.
@@ -2681,7 +3991,7 @@ Run: `cmake --build build/rel -j14 --target rune_broker_benchmark && build/rel/b
 Expected:
 - `[ViewFoldRetractable gate] … => PASS` (`ret_record_p99_us < 5`, `ret_batch_p99_us < 10`, `steady_alloc == 0`).
 - `BM_ViewFoldReplace` and `BM_ViewFoldAggregate` still PASS, which shows the 2a path did not regress (and that the `AggRig` refactor kept its counters and output).
-- `[ViewFoldExtremeRetract N=1000]` and `[ViewFoldExtremeRetract N=10000]` report `exact=yes` with their p50/p99/max. Record these numbers in the commit message; they are not gated.
+- `[ViewFoldExtremeRetract N=1000]` and `[ViewFoldExtremeRetract N=10000]` report `exact=yes` with their p50/p99/max. Record these numbers in the commit message; they are not gated. (Task 5b pre-validation: N=1000 p50 1.46 µs and N=10000 p50 11.4 µs on the dev Mac.)
 
 If the gate fails, profile before changing anything. `ret_rescans / measured records` shows how often the O(group) path ran. A non-zero `steady_alloc` means a hot-path allocation, which is a CLAUDE.md #4 violation that must be fixed rather than gated away. Never relax the gate. The local run is the per-task check; the controller decides whether a clean-box VM confirmation is needed at the Phase 2b close (F14).
 
@@ -2818,11 +4128,11 @@ Update the header comment item `(d)` (the 6 lines from `//     (d) Phase 2a: the
 ```cpp
 //     (d) Phase 2a/2b: the PERSISTED aggregate view user_totals (GROUP BY userId:
 //         Count(*), Sum, Avg, Max, Min, Last over "order") recovers its rows,
-//         contributor map AND MRU lists/caches from the v2 checkpoint:
+//         contributor map, MRU lists/caches AND Min/Max value blocks from the v2 checkpoint:
 //         u100 = {3, 85, 85/3, max 50, min 5, last 5}, u200 absent (emptied by a
 //         pre-restart group move); o3 5 -> 25 retracts the pre-image AND the
 //         cached min -> {3, 105, 35, 50, 25, 25}; o1 50 -> 20 retracts the cached
-//         max -> {3, 75, 25, 30, 20, 20} (both rescans walk the recovered list).
+//         max -> {3, 75, 25, 30, 20, 20} (both rescans scan the recovered value block).
 ```
 
 Build: `cmake --build build/sub-client-cpp --target view_probe`. Expected: it compiles (`build/sub-client-cpp` has `BUILD_EXAMPLES=ON`).
@@ -2899,15 +4209,15 @@ Aggregate views can now maintain `Min`, `Max`, `Last` and `LastNonNull`, exact u
 - `Min` / `Max`: numeric sources only (Int32, Int64, UInt16, UInt32, UInt64, Float64). Output type = source type. Nulls are ignored; NaN and ±Inf count as NULL (counted in `aggNonFinite`). An empty or all-null group gives NULL.
 - `Last`: the value of the most recently written contributor, including NULL. Any fixed-width source type; output type = source type.
 - `LastNonNull`: the most recently written contributor value that is not NULL, or NULL if there is none. It is the new `MergeRule::LastNonNull`, wire value **8** (the enum is append-only; rules 0-7 are unchanged).
-- Retracting the cached Min/Max walks the group's contributors once (O(group size), reported by `BM_ViewFoldExtremeRetract` at 1k and 10k); the typical fold stays inside the §14.0 gate.
+- Retracting the cached Min/Max scans the group's packed Min/Max value block once (O(group size) but sequential, reported by `BM_ViewFoldExtremeRetract` at 1k and 10k); the typical fold stays inside the §14.0 gate.
 
 ## Compatibility
 
-- No checkpoint, catalog or fingerprint format change. The v2 checkpoint already persists the contributor and group tables; the new links, head and caches are bytes inside those rows, so recovery is unchanged. `CatalogGoldenRegression.*` passes unchanged.
+- No catalog or fingerprint format change, and the v2 checkpoint format is unchanged. The new links, head and caches are bytes inside the contributor and group rows. A view with Min/Max checkpoints one more table in the same v2 record (its per-group value blocks, table id 3), restored offset-atomically with the others. `CatalogGoldenRegression.*` passes unchanged.
 - Views that use none of the four rules keep their 2a layout byte for byte.
 - **Upgrade every broker before creating a view with min/max/last (AD1).** `CreateView` events are applied on every broker from `__catalog`, and a broker without Part A cannot install such a plan. There is no version negotiation yet.
 - The client's `MergeRule` gains `LastNonNull`, and the client's `deserializeAuthored` accepts it (`rune catalog replay` re-reads stored plans with it).
-- Per-pass delta cap: a linked view dirties up to 8 rows per source record (2a: 5), and the worker's per-pass record cap now follows from that exact bound.
+- Per-pass delta cap: a view with Min/Max dirties up to 12 entries per source record (Last-only: 8, 2a: 5), and the worker's per-pass record cap now follows from that exact bound.
 ```
 
 - [ ] **Step 7: Run the e2e on the VM (controller-run).** This is a controller checkpoint (k3s VM, `/root/vm.lock`); the implementer stops after Step 8's builds and tests. The controller stages the monorepo **and** a sibling `flight-recorder`, then runs the script under the lock:
@@ -2957,7 +4267,7 @@ The implementer's part ends with the per-task affected-area runs above. The rema
   - `LastNonNull = 8`: Task 1.
   - Storage (links, head, caches, per-input width, 2a untouched): Tasks 3 and 4.
   - Maintenance (add/retract/rescan, skipped rescan, Last O(1), LastNonNull walk, emit, inconsistency): Task 5.
-  - Persistence (no format change, recomputed exact bound + test): Tasks 4, 6 and 7.
+  - Persistence (no format change, recomputed exact bound + test): Tasks 4, 5b, 6 and 7. Amended value block (storage, maintenance, table 3, bound {5,2,2,3}, gate rerun): Task 5b.
   - Gates:
     - typical fold: Task 8.
     - extreme benchmarks at 1k/10k: Task 8.
@@ -2971,7 +4281,7 @@ The implementer's part ends with the per-task affected-area runs above. The rema
     - restart retraction: Task 7.
     - e2e: Task 9.
 - **Type consistency:**
-  - `aggDirtyBoundPerRecord` returns `AggDirtyBound{contributorRows, groupRows, viewRows}` in Tasks 4, 6 and 7.
+  - `aggDirtyBoundPerRecord` returns `AggDirtyBound{contributorRows, groupRows, viewRows, blockRows}` (`blockRows` from Task 5b) in Tasks 5b, 6 and 7.
   - `CacheState`, `kCacheEntryBytes`, `kNoCache` and `kNoContributor` are used identically in Tasks 4, 5 and 6.
   - `encodeSlotValue`/`decodeSlotValue` have the same signatures in Tasks 3 and 5.
   - `FoldStats::aggRescans` is used in Tasks 5 and 8.
@@ -2985,9 +4295,9 @@ The implementer's part ends with the per-task affected-area runs above. The rema
 2. **Contributor key `0xFFFFFFFFFFFFFFFF`** is a valid 8-byte wire key but equals the spec's `kNoContributor` sentinel. **The plan skips it in linked views and counts it as `skippedMalformed`.** 2a views still accept it. The alternative is a separate presence flag per link. Please confirm that fail-closed behaviour.
 3. **`Last`/`LastNonNull` over Float64 NaN/±Inf.** The spec states the NaN→NULL rule only for Min/Max. **The plan returns NaN/Inf verbatim as non-null values for Last/LastNonNull**, matching 2a's `Count(col)`, and does not count them in `aggNonFinite`.
 4. **`[valid u8]` is used as a three-state byte**: Empty 0, Valid 1, RescanPending 2. Values 0 and 1 keep the spec's meaning. State 2 is transient within a record and is never checkpointed (asserted by the model test).
-5. **Dirty-bound enumeration.** The spec's list ("contributor, both neighbours in the old list, the old head's group, the new head, both groups, both view rows") is ambiguous about "the old head's group". The plan derives **4 contributor rows + 2 group rows + 2 view rows = 8**, against 5 for 2a, and pins it exactly. The rescan reads only and dirties nothing extra.
+5. **Dirty-bound enumeration.** The spec's list ("contributor, both neighbours in the old list, the old head's group, the new head, both groups, both view rows") is ambiguous about "the old head's group". The plan derives **4 contributor rows + 2 group rows + 2 view rows = 8**, against 5 for 2a, and pins it exactly. The rescan reads only and dirties nothing extra. *(Amended 2026-10-20, Task 5b: Min/Max views add the swap-moved contributor and 3 value-block rows, {5,2,2,3} = 12; Last-only views stay at 8.)*
 6. **Unused 2a accumulator bytes.** In linked views, each Min/Max/Last/LastNonNull column still occupies its 16-byte 2a accumulator slot in the group row, and that slot is unused. This keeps one group-row shape for both phases. If row compactness matters more than uniformity, the slots could be packed per rule.
-7. **`FoldStats::aggRescans`** is a new observability counter not named in the spec. It is used by tests (to show a rescan was skipped) and benchmarks. It is not surfaced in `ViewFoldCounters`.
+7. **`FoldStats::aggRescans`** is a new observability counter not named in the spec. It is used by tests (to show a rescan was skipped) and benchmarks. It is not surfaced in `ViewFoldCounters`. *(Amended 2026-10-20: surfaced as `ViewFoldCounters::aggRescans` in Task 7, the carried Task 5 review item.)*
 8. **Naming.** The controller gave the slug `a-retractable-min-max-last`. The plan file and branch use `…-phase2b-a-retractable-min-max-last` and `feat/phase2b-a-retractable-min-max-last`, which avoids a doubled `a-a-`.
 
 ### Spec gaps found 2026-10-19
