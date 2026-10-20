@@ -60,8 +60,8 @@ tp.sendOffsetsToTransactionAndWait(offsets, "economy");   // the consumer group'
 tp.commitTransactionAndWait();                            // outputs and offsets, atomically
 ```
 
-- Outside a transaction a transactional producer refuses every produce path with `SendResult::NotInTransaction`; the
-  lifecycle calls on a plain producer throw `std::logic_error`. A newer producer with the same id fences the old one
+- Outside a transaction a transactional producer refuses every produce path with `SendResult::NotInTransaction`; on a
+  plain producer the lifecycle token calls return `OpResult::InvalidArgument` and `beginTransaction()` and the `*AndWait` forms throw `std::logic_error`. A newer producer with the same id fences the old one
   (`TxnState::FatalError`).
 - After an abort, `GroupConsumer::seekToCommittedAndWait()` rewinds the consumer to its committed offsets without a restart
   (`seek(partition, offset)` repositions one partition).

@@ -27,7 +27,7 @@
 #   FLIGHT_RECORDER_DIR   the flight-recorder checkout (default: <monorepo>/../flight-recorder)
 #   EOS_E2E_N             records (default 200000)
 #   E2E_LOG_DIR           when set, the brokers' and the probes' logs are kept there at teardown
-#   E2E_WORK_DIR          scratch dir shared with the client container as /work (default <broker>/.eos-e2e-work)
+#   E2E_WORK_DIR          scratch dir shared with the client container as /work (default: a mktemp dir under <broker>, removed at teardown; yours is kept)
 #   EOS_E2E_PAUSE_MS      pause after every pipeline commit (default 100: keeps the run long enough to inject the faults)
 #   EOS_E2E_PYTHON        python3 for the dr-e2e step (default python3; a venv with requirements.txt is created when pytest is missing)
 #
@@ -45,7 +45,9 @@ export FLIGHT_RECORDER_DIR="${FLIGHT_RECORDER_DIR:-${PROJECTS}/../flight-recorde
 CLIENT_REPO="${PROJECTS}/client-cpp"
 COMPOSE_PROJECT="rune-eos-e2e"
 NETWORK="${COMPOSE_PROJECT}_default"
-WORK_DIR="${E2E_WORK_DIR:-${BROKER_REPO}/.eos-e2e-work}"
+# A work dir this script made (mktemp) is removed at teardown; a caller-supplied E2E_WORK_DIR never is.
+if [ -n "${E2E_WORK_DIR:-}" ]; then WORK_DIR="${E2E_WORK_DIR}"; OWN_WORK=""
+else WORK_DIR="$(mktemp -d "${BROKER_REPO}/.eos-e2e-work.XXXXXX")"; OWN_WORK=1; fi
 
 N="${EOS_E2E_N:-200000}"
 PAUSE_MS="${EOS_E2E_PAUSE_MS:-100}"
@@ -75,7 +77,7 @@ sha256_stdin() { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else s
 repo_tag() {
     local d="$1"
     if [ -e "${d}/.git" ]; then git -C "${d}" rev-parse --short HEAD; return; fi
-    (cd "${d}" && find . -type f -not -path './.eos-e2e-work/*' -not -path './.auth.*' -print0 | LC_ALL=C sort -z | xargs -0 cat | sha256_stdin) | cut -c1-12
+    (cd "${d}" && find . -type f -not -path './.eos-e2e-work*' -not -path './.auth.*' -print0 | LC_ALL=C sort -z | xargs -0 cat | sha256_stdin) | cut -c1-12
 }
 mkdir -p "${WORK_DIR}"
 rune_auth_init   # RUNE_AUTH_DIR (mode 700) holds the cluster key; RUNE_SECRETS_DIR is exported for the compose files
@@ -109,7 +111,7 @@ teardown() {
         cp -f "${WORK_DIR}"/*.out "${WORK_DIR}"/*.err "${WORK_DIR}"/*.progress "${E2E_LOG_DIR}/" 2>/dev/null || true
     fi
     cluster_down
-    rm -rf "${WORK_DIR}" 2>/dev/null || true
+    if [ -n "${OWN_WORK}" ]; then rm -rf "${WORK_DIR}" 2>/dev/null || true; fi
     rune_auth_cleanup        # the cluster key and the generated passwords
     return "${rc}"
 }
@@ -165,7 +167,7 @@ links_since() {
 }
 restart_node() {
     local n=$(( $1 + 1 ))
-    SINCE="$(date -u +%Y-%m-%dT%H:%M:%S)"
+    SINCE="$(date +%s)"   # epoch seconds: no timezone ambiguity
     docker start "$(cname "${n}")" >/dev/null || fail "docker start of rune-${n} failed"
     wait_until "${LINK_WAIT_S}" "rune-${n}'s peer links" links_since "${n}" \
         || { docker logs --tail 60 "$(cname "${n}")" >&2; fail "rune-${n} did not re-establish both peer links within ${LINK_WAIT_S}s"; }
@@ -347,6 +349,7 @@ log "Step 4: a read_committed reader of eos_out..."
 probe_run verify verify "${VERIFY_S}" 3
 [ "${PROBE_RC}" -eq 0 ] || { echo "${PROBE_OUT}" | tail -20 >&2; fail "step 4: verify exited ${PROBE_RC}"; }
 echo "${PROBE_OUT}" | grep -q "EOS-VERIFY: OK count=${N}" || { echo "${PROBE_OUT}" | tail -20 >&2; fail "step 4: verify did not print 'EOS-VERIFY: OK count=${N}'"; }
+echo "${PROBE_OUT}" | grep "EOS-VERIFY: uncommitted=" >&2 || fail "step 4: verify did not report the read_uncommitted count"
 log "Step 4 OK: ${N} records, each id once, v' = 2 * v, the zombie fenced"
 
 # ---------------------------------------------------------------------------

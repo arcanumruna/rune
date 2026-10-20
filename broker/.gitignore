@@ -65,4 +65,4 @@ Thumbs.db
 /docker/secrets/
 /docker/.auth.*/
 /.catalog-e2e-work/
-/.eos-e2e-work/
+/.eos-e2e-work*/

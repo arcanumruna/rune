@@ -314,7 +314,8 @@ try {
 - A transaction is a plain `Producer` created with `ProducerConfig::transactionalId`; every produce path (`send`, `trySend`,
   Tier-2 batches, `tryClaim`, `claimBatch`, a typed claim through `openTopicAndWait<T>(name, producer)`) takes part in it.
   Outside a transaction a transactional producer refuses every produce path with `SendResult::NotInTransaction`; on a plain
-  producer the lifecycle calls throw `std::logic_error` ("producer has no transactionalId"). `acks = None` is rejected.
+  producer the lifecycle token calls return `OpResult::InvalidArgument`, and `beginTransaction()` and the `*AndWait` forms throw
+  `std::logic_error` ("producer has no transactionalId"). `acks = None` is rejected.
   The status getters (`state()`, `producerId()`, ...) work on the thread that created the producer only.
 - A newer producer with the same `transactionalId` fences the old one: its next operation fails and its state is
   `FatalError`.

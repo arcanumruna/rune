@@ -111,6 +111,48 @@ private:
 void putU64(uint8_t* p, uint64_t v) noexcept { std::memcpy(p, &v, 8); }   // little-endian hosts only (x86-64 / arm64)
 uint64_t getU64(const uint8_t* p) noexcept { uint64_t v; std::memcpy(&v, p, 8); return v; }
 
+// ---- the consumer-side decision core (pure: unit-tested by selfcheck) -------------------------------------------
+// Per input partition.  `committed` is the last offset known committed and is NEVER forgotten or lowered by a
+// rebalance; `nextAppend` is the strict filter (-1: not learned yet); `rebase` = the baseline must be learned again
+// from the broker (after a rebalance of that partition or an in-doubt commit): the first record delivered after
+// the rewind is the baseline, and one beyond `hi` (the most the broker can have committed) is a Gap, reported loudly.
+struct PartState {
+    int64_t committed  = -1;
+    int64_t nextAppend = -1;
+    int64_t hi         = INT64_MAX;
+    bool    seen       = false;     // this process ever received a record of / committed this partition
+    bool    rebase     = false;
+};
+enum class Accept { Take, Drop, Gap };
+
+Accept onRecord(PartState& s, int64_t off, bool dropping) noexcept {
+    if (s.rebase && dropping) return Accept::Drop;               // fetches of the old instance, until the rewind returns
+    if (s.rebase || s.nextAppend < 0) {                          // learn the baseline
+        if (s.rebase && off > s.hi) return Accept::Gap;
+        s.committed = off; s.seen = true; s.rebase = false; s.hi = INT64_MAX; s.nextAppend = off + 1;
+        return Accept::Take;
+    }
+    if (off != s.nextAppend) return Accept::Drop;                // a duplicate or a stale push
+    s.nextAppend = off + 1;
+    return Accept::Take;
+}
+// A rebalance of the partition, or an in-doubt commit that may have advanced it to `hi`: committed stays.
+void markRebase(PartState& s, int64_t hi = INT64_MAX) noexcept { s.rebase = true; s.hi = hi; s.nextAppend = -1; }
+// Before a rewind: the strict filter restarts at the known committed offset (a partition to relearn stays unlearned).
+void beforeRewind(PartState& s) noexcept { s.nextAppend = s.rebase ? -1 : s.committed; }
+// The exit rule: every partition's committed offset reached its end.  A partition this process never saw anything
+// of is counted done only after a quiet period (it was fully committed before this process started); a partition
+// it has seen is never done before its committed offset reaches the end.
+bool allDone(const PartState* st, const int64_t* ends, std::size_t n, int64_t idleMs) noexcept {
+    bool unknown = false;
+    for (std::size_t p = 0; p < n; ++p) {
+        if (ends[p] == 0 || st[p].committed >= ends[p]) continue;
+        if (!st[p].seen) { unknown = true; continue; }
+        return false;
+    }
+    return !unknown || idleMs > 15000;
+}
+
 int selfcheck() {
     int bad = 0;
     auto expect = [&](bool ok, const char* what) { if (!ok) { std::fprintf(stderr, "EOS-SELFCHECK: FAIL %s\n", what); ++bad; } };
@@ -129,6 +171,35 @@ int selfcheck() {
     rune::gen::EosOutEncoder(std::span<uint8_t>(out, sizeof out)).id(41).v(transform(valueOf(41)));
     const rune::gen::EosOutDecoder d(std::span<const uint8_t>(out, sizeof out));
     expect(d.id() == 41 && d.v() == transform(valueOf(41)), "typed record round trip");
+    {   // I2: committed survives a rebalance; the idle shortcut is for never-seen partitions only
+        PartState st[2];
+        const int64_t ends[2] = {10, 10};
+        expect(onRecord(st[0], 0, false) == Accept::Take && st[0].committed == 0, "first record is the baseline");
+        expect(onRecord(st[0], 0, false) == Accept::Drop, "a duplicate is dropped");
+        expect(onRecord(st[0], 2, false) == Accept::Drop, "a gap is dropped by the strict filter");
+        st[0].committed = 6;
+        markRebase(st[0]);
+        expect(st[0].committed == 6 && st[0].rebase, "a rebalance keeps committed");
+        expect(!allDone(st, ends, 2, 60000), "a seen partition below its end is never done, however long idle");
+        st[0].committed = 10;
+        expect(!allDone(st, ends, 2, 1000) && allDone(st, ends, 2, 16000), "a never-seen partition is done only after 15 s idle");
+        st[1].committed = 10;
+        expect(allDone(st, ends, 2, 0), "all committed to the end");
+    }
+    {   // I3: an in-doubt commit relearns the baseline from the broker; a stale push never becomes it
+        PartState s;
+        onRecord(s, 0, false); s.committed = 5; s.nextAppend = 12;           // local view: committed 5, batch ends at 9
+        markRebase(s, 9);                                                    // the commit may have advanced to 9
+        beforeRewind(s);
+        expect(s.nextAppend == -1, "a relearning partition has no filter");
+        expect(onRecord(s, 12, true) == Accept::Drop, "pushes during the rewind are ignored");
+        PartState landed = s;
+        expect(onRecord(landed, 9, false) == Accept::Take && landed.committed == 9 && landed.nextAppend == 10, "commit landed: resume at 9");
+        PartState notLanded = s;
+        expect(onRecord(notLanded, 5, false) == Accept::Take && notLanded.committed == 5, "commit not landed: redo from 5");
+        PartState gap = s;
+        expect(onRecord(gap, 11, false) == Accept::Gap, "a first record beyond the batch end is a loud gap");
+    }
     for (int p = 0; p < kPaths; ++p) expect(pathName(p) != nullptr, "path names");
     if (bad == 0) std::printf("EOS-SELFCHECK: OK\n");
     return bad == 0 ? 0 : 1;
@@ -227,13 +298,20 @@ struct InRec { int32_t part; int64_t off; int64_t id; int64_t v; };
 // a record is queued only if it is exactly the next one, so a re-delivery after a rewind (or an in-flight record
 // of a dropped fetch) is never queued twice and nothing is ever skipped.
 struct InState {
-    std::array<int64_t, kMaxParts> committed{};     // -1 = nothing seen yet since the assignment
-    std::array<int64_t, kMaxParts> nextAppend{};
-    std::vector<InRec>             q;               // records not yet in a transaction: q[head..]
-    std::size_t                    head = 0;
-    int64_t                        rebalances = 0;  // onAssigned / onRevoked count
-    InState() { reset(); q.reserve(1u << 18); }
-    void reset() { committed.fill(-1); nextAppend.fill(-1); q.clear(); head = 0; }
+    std::array<PartState, kMaxParts> part{};
+    std::vector<InRec>               q;               // records not yet in a transaction: q[head..]
+    std::size_t                      head = 0;
+    int64_t                          rebalances = 0;  // onAssigned / onRevoked count
+    bool                             dropping = false;// inside a rewind: rebase partitions ignore pushes
+    std::string                      error;           // a Gap: the run must stop with this text
+    InState() { q.reserve(1u << 18); }
+    // A rebalance: queued records are stale, every partition handed over relearns its baseline (committed stays).
+    void rebalance(const std::vector<TopicPartition>& parts) {
+        for (const TopicPartition& tp : parts) {
+            if (tp.partition >= 0 && static_cast<std::size_t>(tp.partition) < part.size()) markRebase(part[static_cast<std::size_t>(tp.partition)]);
+        }
+        q.clear(); head = 0; ++rebalances;
+    }
     [[nodiscard]] std::size_t pending() const noexcept { return q.size() - head; }
     void compact() { if (head == q.size()) { q.clear(); head = 0; } }
 };
@@ -255,6 +333,7 @@ public:
         auto idleSince = Clock::now();
         while (!done(Clock::now() - idleSince)) {
             if (Clock::now() > deadline) { fail("EOS-PIPELINE", "timed out after " + std::to_string(timeoutS) + " s"); return 1; }
+            if (!st_.error.empty()) { fail("EOS-PIPELINE", st_.error); return 1; }
             if (gc_.finished()) { fail("EOS-PIPELINE", "the group consumer ended"); return 1; }
             pump(c_);
             if (st_.pending() == 0) continue;
@@ -279,16 +358,9 @@ public:
     void setTxnId(std::string id) { txnId_ = std::move(id); }
 
 private:
-    // Done when every partition's committed offset reached its end.  A partition this process never saw a record
-    // of (committed -1) was fully committed before it started: counted done after 15 s without any record.
     bool done(Clock::duration idle) const {
-        bool unknown = false;
-        for (std::size_t p = 0; p < ends_.size(); ++p) {
-            if (ends_[p] == 0) continue;
-            if (st_.committed[p] < 0) { unknown = true; continue; }
-            if (st_.committed[p] < ends_[p]) return false;
-        }
-        return !unknown || idle > std::chrono::seconds(15);
+        return allDone(st_.part.data(), ends_.data(), ends_.size(),
+                       std::chrono::duration_cast<std::chrono::milliseconds>(idle).count());
     }
 
     void gather() {
@@ -308,6 +380,7 @@ private:
             if (it == entries_.end()) entries_.push_back(OffsetEntry{in_.topicId, r.part, r.off + 1});
             else it->offset = std::max<int64_t>(it->offset, r.off + 1);
         }
+        commitIssued_ = false;
         try {
             tp_.beginTransaction();
             produce(path);
@@ -316,69 +389,87 @@ private:
                 // Records of an aborted transaction must reach the log (they stay invisible to read_committed).
                 tp_.flushAndWait();
                 tp_.abortTransactionAndWait();
-                return rewound(Outcome::Aborted, abortOnPurpose ? "on purpose" : "rebalance");
+                return rewound(Outcome::Aborted, abortOnPurpose ? "on purpose" : "rebalance", false);
             }
+            commitIssued_ = true;
             tp_.commitTransactionAndWait();
         } catch (const std::exception& ex) {
-            return resolve(ex.what());
+            const std::string why = ex.what();   // the exception object ends with this block
+            return resolve(why);
         }
         return committed(epoch);
     }
 
     Outcome committed(int64_t epoch) {
-        for (const OffsetEntry& e : entries_) st_.committed[static_cast<std::size_t>(e.partition)] = e.offset;
+        for (const OffsetEntry& e : entries_) {
+            PartState& s = st_.part[static_cast<std::size_t>(e.partition)];
+            s.committed = e.offset; s.seen = true;
+        }
         ++commits_;
         records_ += static_cast<int64_t>(batch_.size());
         if (st_.rebalances != epoch) {   // a rebalance during the transaction may have fetched the old offsets
-            try { rewindConsumer(); } catch (const std::exception& ex) { fail("EOS-PIPELINE", std::string("rewind after a rebalance: ") + ex.what()); }
+            rewindConsumer();            // a failed rewind propagates: exit 1 with its cause, never a silent stall
         }
         return Outcome::Committed;
     }
 
     // The transaction threw: decide from the producer's state what happened (a commit whose answer was lost is
     // retried - the same commit is idempotent), then abort + rewind everything else.
-    Outcome resolve(const char* what) {
+    Outcome resolve(std::string why) {
         for (int attempt = 0; attempt < 20; ++attempt) {
             const TxnState s = tp_.state();
             try {
                 switch (s) {
                 case TxnState::FatalError:
-                    return Outcome::Fenced;
+                    // A fence is the only fatal error the zombie leg may report as such.
+                    if (why.find("enced") != std::string::npos) return Outcome::Fenced;
+                    throw std::runtime_error("fatal producer error (not a fence): " + why);
                 case TxnState::CommittingTransaction:
+                    commitIssued_ = true;
                     tp_.commitTransactionAndWait();
                     return committed(st_.rebalances);
                 case TxnState::InTransaction:
                 case TxnState::AbortableError:
                 case TxnState::AbortingTransaction:
                     tp_.abortTransactionAndWait();
-                    return rewound(Outcome::Aborted, what);
+                    return rewound(Outcome::Aborted, why, false);
                 case TxnState::Ready:
-                    return rewound(Outcome::Aborted, what);
+                    // Ready right after a commit call that threw: the commit may have landed. In doubt.
+                    return rewound(Outcome::Aborted, why, commitIssued_);
                 default:
                     break;   // Uninitialized / Initializing: not expected here; pump and look again
                 }
+            } catch (const std::logic_error&) {
+                throw;
             } catch (const std::exception& ex) {
-                what = ex.what();
+                if (s == TxnState::FatalError) throw;
+                why = ex.what();   // copied into the string before the exception ends
             }
             pumpFor(c_, 200);
         }
-        throw std::runtime_error(std::string("transaction unresolved: ") + what);
+        throw std::runtime_error("transaction unresolved: " + why);
     }
 
-    Outcome rewound(Outcome o, const char* why) {
+    // inDoubt: a commit call threw and the producer is Ready - the broker may or may not have the offsets of this
+    // batch.  The partitions of the batch relearn their baseline from the broker (seekToCommitted decides), never
+    // from the probe's local offsets; a first record beyond the batch's end offset is a loud Gap.
+    Outcome rewound(Outcome o, const std::string& why, bool inDoubt) {
         ++aborts_;
-        std::fprintf(stderr, "EOS-PIPELINE: transaction %lld (%s) aborted (%s), rewinding\n", static_cast<long long>(attempt_),
-                     pathName(static_cast<int>(attempt_ % kPaths)), why);
+        std::fprintf(stderr, "EOS-PIPELINE: transaction %lld (%s) aborted (%s)%s, rewinding\n", static_cast<long long>(attempt_),
+                     pathName(static_cast<int>(attempt_ % kPaths)), why.c_str(), inDoubt ? ", commit in doubt" : "");
+        if (inDoubt) for (const OffsetEntry& e : entries_) markRebase(st_.part[static_cast<std::size_t>(e.partition)], e.offset);
         rewindConsumer();
         return o;
     }
 
     void rewindConsumer() {
-        // Strict filter first: whatever the old fetches still push is dropped unless it is exactly the committed offset.
-        for (std::size_t p = 0; p < st_.nextAppend.size(); ++p) st_.nextAppend[p] = st_.committed[p];
+        // Strict filter first: whatever the old fetches still push is dropped unless it is exactly the next offset.
+        for (PartState& p : st_.part) beforeRewind(p);
         st_.q.clear();
         st_.head = 0;
-        gc_.seekToCommittedAndWait();
+        st_.dropping = true;
+        try { gc_.seekToCommittedAndWait(); } catch (...) { st_.dropping = false; throw; }
+        st_.dropping = false;
     }
 
     // ---- the five produce paths: the same typed record bytes ----------------------------------------------------
@@ -463,7 +554,7 @@ private:
     void writeProgress(const std::string& file) const {
         if (file.empty()) return;
         int64_t sum = 0;
-        for (const int64_t v : st_.committed) if (v > 0) sum += v;
+        for (const PartState& p : st_.part) if (p.committed > 0) sum += p.committed;
         const std::string tmp = file + ".tmp";
         { std::ofstream f(tmp, std::ios::trunc); f << sum << '\n'; }
         std::rename(tmp.c_str(), file.c_str());
@@ -480,6 +571,7 @@ private:
     std::vector<InRec>        batch_;
     std::vector<OffsetEntry>  entries_;
     std::array<std::vector<uint32_t>, kMaxParts> byPart_;
+    bool commitIssued_ = false;
     int64_t attempt_ = 0, commits_ = 0, aborts_ = 0, records_ = 0;
 };
 
@@ -540,6 +632,27 @@ int runVerify(Client& c, const TopicHandle& out, int64_t n) {
     while (chk.count() < n && dups == 0 && bad == 0 && Clock::now() < deadline) pump(c);
     pumpFor(c, 5000);
     for (auto& s : subs) s.unsubscribe();
+    // Proof that aborted data was in the log and read_committed filtered it: a read_uncommitted count must exceed N.
+    int64_t uncommitted = 0;
+    {
+        SubscribeOptions uo;
+        uo.from      = From::earliest();
+        uo.isolation = Isolation::ReadUncommitted;
+        std::vector<Subscription> usubs;
+        usubs.reserve(static_cast<std::size_t>(out.partitionCount));
+        auto lastRecord = Clock::now();
+        for (int32_t p = 0; p < out.partitionCount; ++p) {
+            usubs.push_back(c.subscribe(out, p, uo, [&](const Record&) { ++uncommitted; lastRecord = Clock::now(); }));
+        }
+        const auto udeadline = Clock::now() + std::chrono::seconds(300);
+        while (Clock::now() < udeadline && (uncommitted <= n || Clock::now() - lastRecord < std::chrono::seconds(3))) pump(c);
+        for (auto& s : usubs) s.unsubscribe();
+    }
+    if (uncommitted <= n) {
+        std::fprintf(stderr, "EOS-VERIFY: FAIL read_uncommitted count=%lld is not above N=%lld: no aborted data was in the log\n",
+                     static_cast<long long>(uncommitted), static_cast<long long>(n));
+        return 1;
+    }
     if (chk.count() != n || dups != 0 || bad != 0 || total != n) {
         std::fprintf(stderr, "EOS-VERIFY: FAIL count=%lld of %lld total=%lld duplicates=%lld bad=%lld missing=%lld firstMissing=%lld first=%s\n",
                      static_cast<long long>(chk.count()), static_cast<long long>(n), static_cast<long long>(total),
@@ -547,6 +660,7 @@ int runVerify(Client& c, const TopicHandle& out, int64_t n) {
                      static_cast<long long>(chk.firstMissing()), firstProblem.c_str());
         return 1;
     }
+    std::printf("EOS-VERIFY: uncommitted=%lld (> N: aborted records were in the log)\n", static_cast<long long>(uncommitted));
     std::printf("EOS-VERIFY: OK count=%lld\n", static_cast<long long>(n));
     return 0;
 }
@@ -592,17 +706,22 @@ int main() {
             gcfg.sessionTimeoutMs = 10000;
             gcfg.autoOffsetReset  = OffsetReset::Earliest;
             GroupConsumer gc = c.subscribeGroup(groupId, {"eos_in"}, gcfg);
-            const auto reset = [&st](std::vector<TopicPartition>) { st.reset(); ++st.rebalances; };
+            const auto reset = [&st](std::vector<TopicPartition> parts) { st.rebalance(parts); };
             gc.onAssigned(reset);
             gc.onRevoked(reset);
             gc.onRecords([&st](const RecordSet& rs) {
                 const auto p = static_cast<std::size_t>(rs.partition);
-                if (p >= st.nextAppend.size()) return;
+                if (p >= st.part.size()) return;
                 rs.forEachRecord([&](std::string_view, std::string_view val, int64_t off, int64_t) {
-                    if (val.size() < kInBytes) return;
-                    if (st.nextAppend[p] >= 0 && off != st.nextAppend[p]) return;   // a duplicate or a stale push
-                    if (st.committed[p] < 0) st.committed[p] = off;                  // the first record = the group's start
-                    st.nextAppend[p] = off + 1;
+                    if (val.size() < kInBytes || !st.error.empty()) return;
+                    switch (onRecord(st.part[p], off, st.dropping)) {
+                    case Accept::Drop: return;
+                    case Accept::Gap:
+                        st.error = "partition " + std::to_string(p) + ": the first record after the rewind is offset " + std::to_string(off) +
+                                   ", beyond the batch's end " + std::to_string(st.part[p].hi) + " (records skipped)";
+                        return;
+                    case Accept::Take: break;
+                    }
                     const auto* b = reinterpret_cast<const uint8_t*>(val.data());
                     st.q.push_back(InRec{rs.partition, off, static_cast<int64_t>(getU64(b)), static_cast<int64_t>(getU64(b + 8))});
                 });
