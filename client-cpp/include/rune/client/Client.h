@@ -1414,6 +1414,12 @@ private:
     std::string coordinatorChannel_;
     uint32_t    coordIdx_ = 0;          // its agent session index (0 = the seed)
     uint64_t    coordFailBase_ = 0;     // its connectFailures() when it became the coordinator
+    // Phase 2b F Task 11: the duty-clock time the coordinator session (coordIdx_ != 0) was first seen NOT Connected
+    // (0 = it is up / just moved).  A coordinator that stays down past kCoordDownFallbackNs is given up like an
+    // exhausted connect budget (back to the seed, which names the CURRENT coordinator): a crashed coordinator
+    // node's session otherwise retries for minutes and every txn / group op waits on it.
+    int64_t     coordDownSinceNs_ = 0;
+    static constexpr int64_t kCoordDownFallbackNs = 5'000'000'000LL;
     uint64_t    coordinatorRedirects_ = 0;   // coordinator moves followed
     uint64_t    coordinatorFallbacks_ = 0;   // coordinator sessions given up (back to the seed)
     // r2 LOW-3: a coordinator channel whose session was Rejected / Closed, and

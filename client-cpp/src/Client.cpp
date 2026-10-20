@@ -5737,6 +5737,7 @@ void Client::onCoordinatorRedirect_(const std::string& endpoint) {
     if (coordIdx_ == 0) coordinatorChannel_.clear();
     else                coordinatorChannel_ = channel;
     coordFailBase_ = agent_.sessionConnectFailuresAt(coordIdx_);
+    coordDownSinceNs_ = 0;
     groupConsumerHub_.onCoordinatorMoved();   // members -> Rejoining (there)
     producerHub_.onCoordinatorMoved();        // Phase 2b F: AwaitCoordinator requests re-send
     syncCoordinatorSession_();                // already connected: they join at once
@@ -5752,7 +5753,18 @@ void Client::syncCoordinatorSession_() noexcept {
         // it to Backoff): back to the seed, whose node answers again with the
         // current coordinator.  Paced by that session's own connect / backoff
         // cycle (each failure is one event), never a spin.
-        const bool gaveUp = st == session::SessionState::Disconnected ||
+        // A coordinator node that CRASHED: its session goes stale, then retries against a dead endpoint for
+        // minutes before any of the exhausted-budget states above - so a session that stays down for
+        // kCoordDownFallbackNs is given up too (level-triggered; the seed names the current coordinator, and
+        // each fallback is paced by this grace, never a spin).
+        if (st == session::SessionState::Connected) {
+            coordDownSinceNs_ = 0;
+        } else if (coordDownSinceNs_ == 0) {
+            coordDownSinceNs_ = now();
+        }
+        const bool downTooLong = coordDownSinceNs_ != 0 && now() - coordDownSinceNs_ > kCoordDownFallbackNs;
+        const bool gaveUp = downTooLong ||
+                            st == session::SessionState::Disconnected ||
                             st == session::SessionState::Rejected ||
                             st == session::SessionState::Closed ||
                             (st == session::SessionState::Backoff &&
@@ -5765,6 +5777,7 @@ void Client::syncCoordinatorSession_() noexcept {
             }
             coordinatorChannel_.clear();
             coordIdx_ = 0;
+            coordDownSinceNs_ = 0;
             groupConsumerHub_.onCoordinatorMoved();
             producerHub_.onCoordinatorMoved();
             syncCoordinatorSession_();  // once: the seed's tuple (coordIdx_ == 0 now)
