@@ -248,3 +248,30 @@ TEST(SecurityStatementsRegression, PlanBytesAreTheProtocolEnumsRegression) {
     EXPECT_EQ(plan.granteeKind, static_cast<uint8_t>(rp::SecurityGranteeKind::Role));
     EXPECT_TRUE(rp::validSecurityOperation(plan.op) && rp::validSecurityResourceType(plan.resourceType));
 }
+
+// Issue #121: FORCE (the statement may remove the last enabled security admin) on every statement that can remove
+// one; it round-trips through the redacted text and reaches the plan.  GRANT never takes it.
+TEST(SecurityStatementsRegression, ForceParsesRendersAndReachesThePlanRegression) {
+    const std::pair<const char*, const char*> cases[] = {
+        {"alter user admin disable force;", "ALTER USER admin DISABLE FORCE;"},
+        {"drop user admin force;", "DROP USER admin FORCE;"},
+        {"drop role ops force;", "DROP ROLE ops FORCE;"},
+        {"revoke admin on cluster from user admin force;", "REVOKE ADMIN ON CLUSTER FROM USER admin FORCE;"},
+        {"revoke role ops from user admin force;", "REVOKE ROLE ops FROM USER admin FORCE;"},
+    };
+    for (const auto& [src, text] : cases) {
+        auto st = ql::parse(src);
+        ASSERT_TRUE(st.has_value()) << src << ": " << st.error().message;
+        EXPECT_EQ(ql::redactedText(*st), text);
+        auto again = ql::parse(ql::redactedText(*st));
+        ASSERT_TRUE(again.has_value()) << text;
+        auto plan = ql::applySecurityPlan(*again);
+        ASSERT_TRUE(plan.has_value()) << text;
+        EXPECT_TRUE(plan->force) << text;
+    }
+    EXPECT_FALSE(ql::applySecurityPlan(ql::parse("drop user admin;").value())->force);
+    EXPECT_FALSE(ql::applySecurityPlan(ql::parse("alter user admin disable;").value())->force);
+    EXPECT_FALSE(ql::parse("grant admin on cluster to user admin force;").has_value()) << "GRANT takes no FORCE";
+    EXPECT_FALSE(ql::parse("alter user admin enable force;").has_value());
+    EXPECT_EQ(std::get<ql::DropUserDef>(ql::parse("drop user force;").value()).name, "force") << "a user named force";
+}
