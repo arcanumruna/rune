@@ -728,3 +728,89 @@ TEST(AuthLoginRegression, AValidProofNeverStandsInForAdminAdversarialRegression)
     rig.send(alterUserFrame(a.sid, ++corr, "ws1", pc::UserChangeKind::Disable, &a));
     EXPECT_EQ(rig.admin.securityDdls, 0);
 }
+
+// ── PR #410 review, adversarial pass ─────────────────────────────────────────────────────────────────────────────
+// #130 over time: sessions PARKED in AwaitingFinal (first legs sent before any failure) are not a bank of guesses for
+// later windows either.  After the first delay runs out, all the parked finals arrive at once: exactly ONE is verified
+// (it starts the next, longer delay), every other one is refused with retryAfter before its proof is looked at.
+TEST(LoginThrottleRegression, ParkedFinalsGetOneGuessPerDelayWindowAdversarialRegression) {
+    Rig rig;
+    constexpr int kSessions = 20;
+    std::vector<FirstLeg> legs;
+    for (int i = 0; i < kSessions; ++i) {
+        legs.push_back(sendFirst(rig, "ws1"));
+        ASSERT_TRUE(legs.back().first.has_value()) << i;
+    }
+    auto sendWrong = [&](const FirstLeg& f) {
+        rig.send(finalFor(f, "ws1", {"a wrong guess", "another wrong guess"}));
+        const auto fin = lastFinal(rig, f.sid);
+        return fin ? std::optional<uint32_t>(fin->retryAfterMs) : std::nullopt;
+    };
+    for (int i = 0; i < 3; ++i) ASSERT_EQ(sendWrong(legs[static_cast<std::size_t>(i)]), 0u) << "free failures + the one starting the delay";
+    // The 250 ms delay has passed; the 17 parked sessions are still inside their 1 s login deadline.
+    rig.gw_now = 300'000'000; rig.gw.setNowNsForTest(rig.gw_now);
+    int verified = 0, limited = 0;
+    for (int i = 3; i < kSessions; ++i) {
+        const auto r = sendWrong(legs[static_cast<std::size_t>(i)]);
+        ASSERT_TRUE(r.has_value()) << i;
+        if (*r > 0) ++limited; else ++verified;
+    }
+    EXPECT_EQ(verified, 1) << "one guess per delay window, not one per parked session";
+    EXPECT_EQ(limited, kSessions - 4);
+    EXPECT_EQ(rig.gw.loginsFailed(), 4u);
+}
+
+// The SecurityDdl trailer under version skew and garbage, at the gateway: an OLD client's own change (no trailer) and
+// a FORCE-only trailer are refused 45 with the fixed text; an explicit zero flags byte, an unknown flag bit and a
+// proof flag with a short proof are malformed (InvalidRequest); none reaches the admin thread.  A NEW client's frame
+// with FORCE | CredentialProof and a valid proof goes through.
+TEST(AuthLoginRegression, TheSecurityDdlTrailerUnderVersionSkewAndGarbageAdversarialRegression) {
+    Rig rig;
+    const auto a = rig.login("ws1", {kTestPasswordA, ""});
+    ASSERT_EQ(a.fin->errorCode, 0);
+    auto answer = [&](int64_t corr) -> std::optional<pc::DdlResponse> {
+        for (auto it = rig.seen.rbegin(); it != rig.seen.rend(); ++it)
+            if (it->corr == corr && it->tid == static_cast<uint16_t>(pc::TemplateId::DdlResponse))
+                return pc::DdlResponse::decode(it->bytes.data(), it->bytes.size());
+        return std::nullopt;
+    };
+    auto pastDelay = [&] { rig.gw_now += 60'000'000'000; rig.gw.setNowNsForTest(rig.gw_now); };
+    // An old client: no trailer at all.
+    rig.send(alterUserFrame(a.sid, 1001, "ws1", pc::UserChangeKind::AddPassword));
+    ASSERT_TRUE(answer(1001).has_value());
+    EXPECT_EQ(answer(1001)->errorCode, 45);
+    EXPECT_NE(std::string(answer(1001)->detail).find("fresh proof of a current password"), std::string::npos);
+    pastDelay();
+    // Garbage trailers on an otherwise valid signed frame (the flags byte sits right before the 64-byte proof).
+    const std::vector<uint8_t> good = alterUserFrame(a.sid, 1002, "ws1", pc::UserChangeKind::AddPassword, &a);
+    const std::size_t flagsAt = good.size() - 1 - pc::kCredentialProofBytes;
+    ASSERT_EQ(good[flagsAt], pc::kSecurityDdlFlagCredentialProof);
+    struct Bad { std::vector<uint8_t> frame; int code; const char* what; };
+    std::vector<Bad> bad;
+    {   // FORCE only: a trailer of one byte, no proof
+        std::vector<uint8_t> f(good.begin(), good.begin() + static_cast<std::ptrdiff_t>(flagsAt) + 1);
+        f[flagsAt] = pc::kSecurityDdlFlagForce;
+        bad.push_back({f, 45, "FORCE without a proof"});
+    }
+    {   std::vector<uint8_t> f(good.begin(), good.begin() + static_cast<std::ptrdiff_t>(flagsAt) + 1);
+        f[flagsAt] = 0x00;
+        bad.push_back({f, 39, "an explicit zero flags byte"}); }
+    {   std::vector<uint8_t> f = good; f[flagsAt] = 0x06; bad.push_back({f, 39, "an unknown flag bit"}); }
+    {   std::vector<uint8_t> f = good; f.resize(f.size() - 1); bad.push_back({f, 39, "a proof one byte short"}); }
+    int64_t corr = 1100;
+    for (Bad& b : bad) {
+        pc::detail::putLE64(b.frame.data(), 16, ++corr);
+        rig.send(b.frame);
+        const auto d = answer(corr);
+        ASSERT_TRUE(d.has_value()) << b.what;
+        EXPECT_EQ(d->errorCode, b.code) << b.what << ": " << d->detail;
+        pastDelay();
+    }
+    EXPECT_EQ(rig.admin.securityDdls, 0) << "nothing unsigned or malformed was forwarded";
+    // A new client with FORCE | CredentialProof (FORCE is meaningless on ADD PASSWORD and outside the proof; the proof
+    // is what counts): forwarded.
+    std::vector<uint8_t> f = good;
+    f[flagsAt] = pc::kSecurityDdlFlagForce | pc::kSecurityDdlFlagCredentialProof;
+    rig.send(f);
+    EXPECT_EQ(rig.admin.securityDdls, 1) << "a valid proof with FORCE set goes through";
+}

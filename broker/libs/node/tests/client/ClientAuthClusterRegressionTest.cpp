@@ -14,6 +14,9 @@
 #include <rune/client/Completions.h>
 #include <rune/client/producer/Producer.h>
 #include <rune/client/subscriber/Subscription.h>
+#include <rune/ql/Backends.h>
+#include <rune/ql/Parser.h>
+#include "support/SecurityBrokerCluster.h"
 
 #include <gtest/gtest.h>
 
@@ -249,4 +252,33 @@ TEST(ClientAuthClusterRegression, WorldServerClientProducesAndConsumesThroughEve
     EXPECT_EQ(after - before, static_cast<uint64_t>(3 * kFail)) << "exactly one ProduceRequest (refused) per failed record: no retry storm";
 
     for (auto& c : clients) c->close();
+}
+
+// PR #410 review, adversarial pass (#114 through the REAL client on THREE brokers): a user without ADMIN, seeded at a
+// broker that is NOT the __security leader, changes its own password.  The DDL is redirected to the leader and rides
+// the client's session there - it must be re-signed for THAT session's login (a proof made for the seed's session is
+// refused).  The added password then logs in on every broker.
+TEST(ClientAuthClusterRegression, AnOwnPasswordChangeRedirectedToTheSecurityLeaderIsSignedForThatSessionAdversarialRegression) {
+    AuthTrio t("rcselfpw");
+    t.start();
+    t.bootstrapAdmin();
+    t.createUser(1, "ws1", AuthTrio::kPw);
+    const int leader = settledSecurityLeader(t.cluster());
+    ASSERT_GT(leader, 0);
+    const int seed = leader % 3 + 1;   // a follower of __security
+    std::unique_ptr<rc::Client> c;
+    int seq = 0;
+    ASSERT_TRUE(AuthTrio::until(60s, [&] {
+        try { c = std::make_unique<rc::Client>(configFor(t, seed, "ws1", AuthTrio::kPw, seq++)); c->connectAndWait(30s); return true; }
+        catch (const std::exception&) { c.reset(); return false; }
+    }));
+    auto plan = rune::ql::applySecurityPlan(rune::ql::parse("alter user ws1 add password 'ws1-redirected-pw-123';").value());
+    ASSERT_TRUE(plan.has_value());
+    const rc::SecurityDdlResult r = c->securityDdlAndWait(std::move(*plan), rc::DdlOptions{}, 60s);
+    EXPECT_EQ(r.errorCode, 0u) << "seed " << seed << " leader " << leader << ": " << r.detail;
+    c->close();
+    for (int id : {1, 2, 3})
+        EXPECT_TRUE(AuthTrio::until(30s, [&] {
+            try { (void)t.login(id, "ws1", "ws1-redirected-pw-123"); return true; } catch (const std::exception&) { return false; }
+        })) << "node " << id;
 }

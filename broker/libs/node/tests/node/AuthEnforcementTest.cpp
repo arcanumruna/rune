@@ -461,3 +461,96 @@ TEST(AuthEnforcementRegression, AdoptionOfAMaxLengthNameIsGuardedAdversarialRegr
     EXPECT_EQ(r.defineTopicCode(creator, longName), kNotAuthorized);
     EXPECT_EQ(r.defineTopicCode(alterer, longName), 0);
 }
+
+// ── PR #410 review, adversarial pass (the area of #114: retries and replays of an own credential change) ────────
+// The client re-sends a DDL with the SAME request id after a NotLeader / lost session (the leader's dedupe answers the
+// original result).  An own SET PASSWORD (or DROP PASSWORD of the password the session logged in with) that already
+// APPLIED, retried: the retry is still signed with the login's password, which is gone.  It must get its ORIGINAL
+// result (OK), not a 45 "log in again" for a change that applied - the client would then keep the old password and
+// never log in again.
+TEST(AuthEnforcementRegression, ARetriedOwnSetOrDropPasswordAnswersItsOriginalResultAdversarialRegression) {
+    AuthRig r;
+    // SET PASSWORD: the retry's proof is over the replaced password.
+    {
+        std::string name;
+        const int64_t self = r.newUser({}, &name);
+        const AuthWireClient::Verifier v = AuthWireClient::verifierOf("the-set-password-123");
+        pc::SecurityDdl m; m.sessionId = self; m.kind = pc::SecurityOpKind::AlterUser; m.name = name;
+        m.change = pc::UserChangeKind::SetPassword; m.verifier = v.wire();
+        const std::string st = "ALTER USER " + name + " SET PASSWORD '<redacted>';";
+        r.wire().pinRequestId(rune::protocol::RequestId{0x5152, 0x8888});
+        const auto first = r.wire().securityDdl(r.ch(), m, st);
+        ASSERT_EQ(first.errorCode, 0u) << first.detail;
+        const int64_t applied = r.broker().node().securityViewForTest().appliedOffset;
+        const auto retry = r.wire().securityDdl(r.ch(), m, st);
+        r.wire().pinRequestId(std::nullopt);
+        EXPECT_EQ(retry.errorCode, 0u) << "a retry of an applied SET PASSWORD answers its original result: " << retry.detail;
+        EXPECT_EQ(r.broker().node().securityViewForTest().appliedOffset, applied) << "applied once";
+    }
+    // DROP PASSWORD of the password the session logged in with (slot 1): the retry's proof is over the dropped one.
+    {
+        std::string name;
+        const int64_t self = r.newUser({}, &name);   // logged in with AuthRig::kPw (slot 1)
+        r.broker().addPassword(name, "the-second-password-1");
+        pc::SecurityDdl m; m.sessionId = self; m.kind = pc::SecurityOpKind::AlterUser; m.name = name;
+        m.change = pc::UserChangeKind::DropPassword; m.passwordIndex = 1;
+        const std::string st = "ALTER USER " + name + " DROP PASSWORD 1;";
+        r.wire().pinRequestId(rune::protocol::RequestId{0x5153, 0x9999});
+        const auto first = r.wire().securityDdl(r.ch(), m, st);
+        ASSERT_EQ(first.errorCode, 0u) << first.detail;
+        const auto retry = r.wire().securityDdl(r.ch(), m, st);
+        r.wire().pinRequestId(std::nullopt);
+        EXPECT_EQ(retry.errorCode, 0u) << "a retry of an applied DROP PASSWORD answers its original result: " << retry.detail;
+    }
+}
+
+// The FORCE / CredentialProof trailer from a hostile client on statements it does not change: FORCE on a GRANT or a
+// CREATE USER changes nothing, a proof on another user's change does not stand in for ADMIN, and FORCE never lets a
+// non-admin remove anyone.
+TEST(AuthEnforcementRegression, TrailerFlagsOnStatementsTheyDoNotGovernChangeNothingAdversarialRegression) {
+    AuthRig r;
+    std::string victim;
+    (void)r.newUser({}, &victim);
+    std::string name;
+    const int64_t self = r.newUser({}, &name);
+    pc::SecurityDdl dis; dis.sessionId = self; dis.kind = pc::SecurityOpKind::AlterUser; dis.name = victim;
+    dis.change = pc::UserChangeKind::Disable; dis.flags = pc::kSecurityDdlFlagForce;
+    EXPECT_EQ(r.wire().securityDdl(r.ch(), dis, "ALTER USER " + victim + " DISABLE FORCE;").errorCode, 45u)
+        << "FORCE is not ADMIN";
+    pc::SecurityDdl drop; drop.sessionId = self; drop.kind = pc::SecurityOpKind::DropUser; drop.name = victim;
+    drop.flags = pc::kSecurityDdlFlagForce;
+    EXPECT_EQ(r.wire().securityDdl(r.ch(), drop, "DROP USER " + victim + " FORCE;").errorCode, 45u);
+    // An admin's GRANT with FORCE: the normal result.
+    const int64_t admin = r.newUser({cluster(SO::Admin)});
+    pc::SecurityDdl g; g.sessionId = admin; g.kind = pc::SecurityOpKind::Grant; g.name = name;
+    g.granteeKind = static_cast<uint8_t>(rune::protocol::SecurityGranteeKind::User);
+    g.op = static_cast<uint8_t>(SO::Read); g.resourceType = static_cast<uint8_t>(ST::Topic);
+    g.patternKind = static_cast<uint8_t>(rune::protocol::SecurityPatternKind::Exact); g.pattern = "orders";
+    g.flags = pc::kSecurityDdlFlagForce;
+    EXPECT_EQ(r.wire().securityDdl(r.ch(), g, "GRANT READ ON TOPIC orders TO USER " + name + ";").errorCode, 0u);
+    EXPECT_EQ(r.produce(self, r.orders), kNotAuthorized) << "only READ was granted";
+}
+
+// #129 through a ROLE: ALTER held only through a role adopts the schema; the role revoked mid-session, the very next
+// adoption is refused and the schema stays.
+TEST(AuthEnforcementRegression, AdoptionThroughARoleFollowsTheRoleAdversarialRegression) {
+    AuthRig r;
+    ASSERT_GE(r.defineTopic(r.builder, "role.t1", /*typed=*/false), 0);
+    ASSERT_GE(r.defineTopic(r.builder, "role.t2", /*typed=*/false), 0);
+    auto version = [&](const char* t) {
+        const auto a = r.c().awaitSchema(r.c().sendGetTopicSchema(r.ch(), r.stream(), r.builder, t), AuthRig::dl());
+        return a ? static_cast<int>(a->version) : kNoAnswer;
+    };
+    AuthWireClient& aw = r.broker().admin();
+    const int64_t as = r.broker().adminSession();
+    ASSERT_EQ(aw.createRole(r.ch(), as, "alterers").errorCode, 0u);
+    ASSERT_EQ(aw.grant(r.ch(), as, "alterers", true, SO::Alter, ST::Topic, rune::protocol::SecurityPatternKind::Prefix, "role.").errorCode, 0u);
+    std::string name;
+    const int64_t s = r.newUser({prefix(SO::Create, ST::Topic, "role.")}, &name);
+    ASSERT_EQ(aw.grantRole(r.ch(), as, name, "alterers").errorCode, 0u);
+    EXPECT_EQ(r.defineTopicCode(s, "role.t1"), 0) << "ALTER through the role adopts";
+    ASSERT_EQ(aw.revokeRole(r.ch(), as, name, "alterers").errorCode, 0u);
+    const int before = version("role.t2");
+    EXPECT_EQ(r.defineTopicCode(s, "role.t2"), kNotAuthorized) << "the role revoked mid-session";
+    EXPECT_EQ(version("role.t2"), before);
+}

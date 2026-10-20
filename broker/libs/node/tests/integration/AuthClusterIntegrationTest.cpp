@@ -919,3 +919,47 @@ TEST(AuthClusterRegression, TheLastAdminGuardAndOwnChangeProofsHoldAcrossALeader
         if (t.cluster().running(id)) EXPECT_NO_THROW((void)t.login(id, "ws1", "ws1-extra-pw-123")) << "node " << id;
     EXPECT_TRUE(t.cluster().running(survivor));
 }
+
+// PR #410 review, adversarial pass (#121 at the cluster layer): the last admin removed with FORCE reopens the window on
+// EVERY broker; each one still asks for a login (MustAuthenticate) and the other users log in on each; the cluster-key
+// holder re-bootstraps through any broker (a follower redirects), after which every broker closes the window again.
+TEST(AuthClusterRegression, AForcedLastAdminRemovalKeepsEveryBrokerAskingForALoginAdversarialRegression) {
+    AuthTrio t("reopen3");
+    t.start();
+    t.bootstrapAdmin();
+    t.createUser(1, "ws1", AuthTrio::kPw);
+    // Sent to the __security leader (a follower answers Redirect); the admin's own session is revoked by it, so the
+    // outcome is read from the replicated state, not from an answer.
+    const int leader = settledSecurityLeader(t.cluster());
+    ASSERT_GT(leader, 0);
+    {
+        const AuthTrio::Session a = t.adminOn(leader);
+        pc::SecurityDdl m; m.sessionId = a.sid; m.kind = pc::SecurityOpKind::AlterUser; m.name = "admin";
+        m.change = pc::UserChangeKind::Disable; m.flags = pc::kSecurityDdlFlagForce;
+        (void)a.w->securityDdl(t.channel(leader), m, "ALTER USER admin DISABLE FORCE;", std::chrono::seconds{3});
+    }
+    ASSERT_TRUE(AuthTrio::until(60s, [&] {
+        for (int id : {1, 2, 3}) if (t.node(id).securityViewForTest().hasSecurityAdmin) return false;
+        return true;
+    })) << "every broker sees the window open";
+    for (int id : {1, 2, 3}) {
+        AuthWireClient& w = t.wire();
+        ASSERT_GT(w.connect(t.channel(id)), 0) << id;
+        EXPECT_EQ(w.lastConnect()->authState, pc::AuthState::MustAuthenticate) << "node " << id;
+        EXPECT_NO_THROW((void)t.login(id, "ws1")) << "ws1 logs in on node " << id;
+    }
+    // Re-bootstrap through each broker until accepted (a follower answers Redirect): exactly one new admin.
+    bool done = false;
+    for (int round = 0; round < 100 && !done; ++round)
+        for (int id : {1, 2, 3}) {
+            AuthWireClient& w = t.wire();
+            const int64_t s = w.connect(t.channel(id));
+            if (s <= 0) continue;
+            if (w.bootstrap(t.channel(id), s, t.keyContents(id), "rescue", "rescue-otp-123456").errorCode == 0) { done = true; break; }
+        }
+    ASSERT_TRUE(done) << "the cluster-key holder recovers the cluster";
+    EXPECT_TRUE(AuthTrio::until(60s, [&] {
+        for (int id : {1, 2, 3}) if (!t.node(id).securityViewForTest().hasSecurityAdmin) return false;
+        return true;
+    })) << "every broker closes the window again";
+}

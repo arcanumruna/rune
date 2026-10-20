@@ -275,3 +275,23 @@ TEST(SecurityStatementsRegression, ForceParsesRendersAndReachesThePlanRegression
     EXPECT_FALSE(ql::parse("alter user admin enable force;").has_value());
     EXPECT_EQ(std::get<ql::DropUserDef>(ql::parse("drop user force;").value()).name, "force") << "a user named force";
 }
+
+// PR #410 review, adversarial pass: FORCE at the edges of the grammar - case-insensitive, at most once, only at the
+// end, never on a statement that cannot remove an admin, and a name spelled "force" stays a name.
+TEST(SecurityStatementsRegression, ForceAtTheEdgesOfTheGrammarAdversarialRegression) {
+    EXPECT_TRUE(ql::applySecurityPlan(ql::parse("ALTER USER admin DISABLE FoRcE ;").value())->force);
+    EXPECT_FALSE(ql::parse("drop user admin force force;").has_value()) << "FORCE twice";
+    EXPECT_FALSE(ql::parse("drop user force admin;").has_value()) << "FORCE before the name";
+    EXPECT_FALSE(ql::parse("create user u with password 'abcdefghijkl' force;").has_value());
+    EXPECT_FALSE(ql::parse("create role r force;").has_value());
+    EXPECT_FALSE(ql::parse("grant role ops to user admin force;").has_value());
+    EXPECT_FALSE(ql::parse("alter user admin drop password 1 force;").has_value());
+    EXPECT_FALSE(ql::parse("alter user admin set password 'abcdefghijkl' force;").has_value());
+    const auto r = ql::parse("revoke read on topic t from user force force;");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(std::get<ql::RevokeDef>(*r).granteeName, "force");
+    EXPECT_TRUE(std::get<ql::RevokeDef>(*r).force);
+    const auto rr = ql::parse("revoke role force from user force;");
+    ASSERT_TRUE(rr.has_value()) << "a role and a user named force";
+    EXPECT_FALSE(std::get<ql::RevokeRoleDef>(*rr).force);
+}
