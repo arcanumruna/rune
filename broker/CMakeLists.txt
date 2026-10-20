@@ -328,6 +328,9 @@ if(CMAKE_CXX_FLAGS MATCHES "-fsanitize=thread")
     link_libraries(rune_tsan_default_options)
 endif()
 
+# Set before libs/ so libs/node (rune_client_failover_broker_tests includes its tests/) sees it on a fresh configure.
+set(RUNE_CLIENT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../client-cpp" CACHE PATH
+    "Path to the rune-client-cpp sibling repo (rune_client_broker_tests)")
 add_subdirectory(libs/peerlink)
 add_subdirectory(libs/aeronutil)
 add_subdirectory(libs/metadata)
@@ -351,8 +354,6 @@ add_subdirectory(libs/gateway)
 # rune_driver_wake as rune_client_driver_wake) — after libs/ so they all exist;
 # its own tests and benchmarks are not built here (BUILD_TESTING / BUILD_BENCHMARKS
 # are shadowed OFF for the subdirectory only).
-set(RUNE_CLIENT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../client-cpp" CACHE PATH
-    "Path to the rune-client-cpp sibling repo (rune_client_broker_tests)")
 if(BUILD_TESTING)
     if(NOT EXISTS "${RUNE_CLIENT_ROOT}/CMakeLists.txt")
         message(FATAL_ERROR "RUNE_CLIENT_ROOT (${RUNE_CLIENT_ROOT}) has no CMakeLists.txt — the rune-client-cpp "
