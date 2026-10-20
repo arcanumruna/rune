@@ -1,5 +1,8 @@
 // libs/view/tests/view/ViewRowTest.cpp
 #include <gtest/gtest.h>
+#include <climits>
+#include <cstring>
+#include <string>
 #include <rune/view/ViewRow.h>
 #include <rune/codec/Descriptor.h>
 using namespace rune::view;
@@ -37,4 +40,46 @@ TEST(ViewRow, VarLenColumnRejected) {
     auto d = DescriptorBuilder("v",1).add("id",PrimType::Int64,1,true)
              .add("name",PrimType::String).build();
     EXPECT_THROW(buildRowLayout(d), std::invalid_argument);
+}
+
+TEST(ViewRow, SlotValueCodecRoundTripsEveryFixedType) {
+    using P = rune::codec::PrimType;
+    uint8_t buf[8];
+    auto rt = [&](P t, uint16_t w, const rune::codec::FieldValue& v) {
+        std::memset(buf, 0xAB, sizeof buf);
+        rune::view::encodeSlotValue(buf, t, w, v);
+        return rune::view::decodeSlotValue(buf, t, w);
+    };
+    rune::codec::FieldValue v{};
+    v.i = -5;          EXPECT_EQ(rt(P::Int32, 4, v).i, -5);
+    v.i = INT64_MIN;   EXPECT_EQ(rt(P::Int64, 8, v).i, INT64_MIN);
+    v.u = 65535;       EXPECT_EQ(rt(P::UInt16, 2, v).u, 65535u);
+    v.u = 4000000000u; EXPECT_EQ(rt(P::UInt32, 4, v).u, 4000000000u);
+    v.u = 7;           EXPECT_EQ(rt(P::Enum, 4, v).u, 7u);
+    v.u = UINT64_MAX;  EXPECT_EQ(rt(P::UInt64, 8, v).u, UINT64_MAX);
+    v.f = -2.5;        EXPECT_DOUBLE_EQ(rt(P::Float64, 8, v).f, -2.5);
+    v.b = true;        EXPECT_TRUE(rt(P::Bool, 1, v).b);
+    v.bytes = "AB";
+    const auto s = rt(P::FixedStr, 4, v);
+    EXPECT_EQ(std::string(s.bytes), std::string("AB\0\0", 4)) << "short FixedStr is zero-padded to width";
+    EXPECT_TRUE(s.present);
+    EXPECT_EQ(s.type, P::FixedStr);
+}
+
+// F6: golden bytes. Comparing against encodeSlotValue would be a tautology,
+// because writeSlot now calls it.
+TEST(ViewRow, WriteSlotWritesGoldenBytesAtTheSlotOffset) {
+    using P = rune::codec::PrimType;
+    const auto d = rune::codec::DescriptorBuilder("t", 1).add("a", P::Int32).addFixedStr("s", 3).build();
+    const auto L = rune::view::buildRowLayout(d);
+    std::vector<uint8_t> row(L.rowLen, 0xEE);   // a stale-byte canary: padding must really be written
+    rune::codec::FieldValue a{}; a.type = P::Int32; a.present = true; a.i = -7;
+    rune::codec::FieldValue s{}; s.type = P::FixedStr; s.present = true; s.bytes = "xy";
+    rune::view::writeSlot(row.data(), L, 0, a);
+    rune::view::writeSlot(row.data(), L, 1, s);
+    const uint8_t goldenA[] = {0xF9, 0xFF, 0xFF, 0xFF};   // Int32 -7, little-endian
+    const uint8_t goldenS[] = {0x78, 0x79, 0x00};         // FixedStr "xy" at width 3, zero-padded
+    EXPECT_EQ(std::memcmp(row.data() + L.slotOffset[0], goldenA, 4), 0);
+    EXPECT_EQ(std::memcmp(row.data() + L.slotOffset[1], goldenS, 3), 0);
+    EXPECT_EQ(rune::view::readSlot(row.data(), L, 0).i, -7);
 }

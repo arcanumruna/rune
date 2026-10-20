@@ -30,6 +30,17 @@ void setNull(uint8_t* row, const RowLayout& layout, uint16_t slot) noexcept;
 bool isNull(const uint8_t* row, const RowLayout& layout, uint16_t slot) noexcept;
 void clearNull(uint8_t* row, const RowLayout& layout, uint16_t slot) noexcept;
 
+// The fixed-width byte representation of one present value, exactly as a row
+// slot stores it (little-endian; FixedStr copied then zero-padded to `width`).
+// writeSlot/readSlot use these; so does the aggregate fold for Last/LastNonNull
+// contributor values (stored at the source field's own width).
+void encodeSlotValue(uint8_t* dst, rune::codec::PrimType type, uint16_t width,
+                     const rune::codec::FieldValue& v) noexcept;
+// Inverse of encodeSlotValue; the result has present == true. A FixedStr's
+// `bytes` views `src` (valid while `src` is).
+rune::codec::FieldValue decodeSlotValue(const uint8_t* src, rune::codec::PrimType type,
+                                        uint16_t width) noexcept;
+
 // Writes `v` into `row` at `slot`. If `!v.present`, sets the null bit and
 // leaves the slot bytes zero. Otherwise clears the null bit and encodes the
 // width-appropriate representation of `v` per `slotType[slot]`.

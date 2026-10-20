@@ -72,56 +72,96 @@ uint64_t readU(const uint8_t* row, uint32_t off, uint32_t n) noexcept {
 
 } // namespace
 
+void encodeSlotValue(uint8_t* dst, PrimType type, uint16_t width, const FieldValue& v) noexcept {
+    switch (type) {
+        case PrimType::Int32:
+            writeU(dst, 0, static_cast<uint32_t>(static_cast<int32_t>(v.i)), 4);
+            break;
+        case PrimType::Int64:
+            writeU(dst, 0, static_cast<uint64_t>(v.i), 8);
+            break;
+        case PrimType::UInt16:
+            writeU(dst, 0, v.u, 2);
+            break;
+        case PrimType::UInt32:
+        case PrimType::Enum:
+            writeU(dst, 0, v.u, 4);
+            break;
+        case PrimType::UInt64:
+            writeU(dst, 0, v.u, 8);
+            break;
+        case PrimType::Float64: {
+            uint64_t raw = 0;
+            std::memcpy(&raw, &v.f, 8);
+            writeU(dst, 0, raw, 8);
+            break;
+        }
+        case PrimType::Bool:
+            dst[0] = v.b ? 1 : 0;
+            break;
+        case PrimType::FixedStr: {
+            const size_t n = std::min(static_cast<size_t>(width), v.bytes.size());
+            std::memcpy(dst, v.bytes.data(), n);
+            if (n < width) {
+                std::memset(dst + n, 0, width - n);
+            }
+            break;
+        }
+        case PrimType::String:
+        case PrimType::Bytes:
+            // var-len: rejected by buildRowLayout / the compiler; unreachable.
+            break;
+    }
+}
+
+FieldValue decodeSlotValue(const uint8_t* src, PrimType type, uint16_t width) noexcept {
+    FieldValue fv{};
+    fv.type    = type;
+    fv.present = true;
+    switch (type) {
+        case PrimType::Int32:
+            fv.i = static_cast<int32_t>(static_cast<uint32_t>(readU(src, 0, 4)));
+            break;
+        case PrimType::Int64:
+            fv.i = static_cast<int64_t>(readU(src, 0, 8));
+            break;
+        case PrimType::UInt16:
+            fv.u = readU(src, 0, 2);
+            break;
+        case PrimType::UInt32:
+        case PrimType::Enum:
+            fv.u = readU(src, 0, 4);
+            break;
+        case PrimType::UInt64:
+            fv.u = readU(src, 0, 8);
+            break;
+        case PrimType::Float64: {
+            uint64_t raw = readU(src, 0, 8);
+            std::memcpy(&fv.f, &raw, 8);
+            break;
+        }
+        case PrimType::Bool:
+            fv.b = src[0] != 0;
+            fv.i = src[0];
+            break;
+        case PrimType::FixedStr:
+            fv.bytes = std::string_view(reinterpret_cast<const char*>(src), width);
+            break;
+        case PrimType::String:
+        case PrimType::Bytes:
+            // var-len: rejected by buildRowLayout / the compiler; unreachable.
+            break;
+    }
+    return fv;
+}
+
 void writeSlot(uint8_t* row, const RowLayout& layout, uint16_t slot, FieldValue v) noexcept {
     if (!v.present) {
         setNull(row, layout, slot);
         return;
     }
     clearNull(row, layout, slot);
-
-    const uint32_t off   = layout.slotOffset[slot];
-    const uint16_t width = layout.slotWidth[slot];
-    const PrimType type  = layout.slotType[slot];
-
-    switch (type) {
-        case PrimType::Int32:
-            writeU(row, off, static_cast<uint32_t>(static_cast<int32_t>(v.i)), 4);
-            break;
-        case PrimType::Int64:
-            writeU(row, off, static_cast<uint64_t>(v.i), 8);
-            break;
-        case PrimType::UInt16:
-            writeU(row, off, v.u, 2);
-            break;
-        case PrimType::UInt32:
-        case PrimType::Enum:
-            writeU(row, off, v.u, 4);
-            break;
-        case PrimType::UInt64:
-            writeU(row, off, v.u, 8);
-            break;
-        case PrimType::Float64: {
-            uint64_t raw = 0;
-            std::memcpy(&raw, &v.f, 8);
-            writeU(row, off, raw, 8);
-            break;
-        }
-        case PrimType::Bool:
-            row[off] = v.b ? 1 : 0;
-            break;
-        case PrimType::FixedStr: {
-            const size_t n = std::min(static_cast<size_t>(width), v.bytes.size());
-            std::memcpy(row + off, v.bytes.data(), n);
-            if (n < width) {
-                std::memset(row + off + n, 0, width - n);
-            }
-            break;
-        }
-        case PrimType::String:
-        case PrimType::Bytes:
-            // var-len: rejected by buildRowLayout; unreachable for a valid RowLayout.
-            break;
-    }
+    encodeSlotValue(row + layout.slotOffset[slot], layout.slotType[slot], layout.slotWidth[slot], v);
 }
 
 FieldValue readSlot(const uint8_t* row, const RowLayout& layout, uint16_t slot) noexcept {
@@ -131,50 +171,8 @@ FieldValue readSlot(const uint8_t* row, const RowLayout& layout, uint16_t slot) 
         fv.present = false;
         return fv;
     }
-
-    const uint32_t off   = layout.slotOffset[slot];
-    const uint16_t width = layout.slotWidth[slot];
-    const PrimType type  = layout.slotType[slot];
-
-    FieldValue fv{};
-    fv.type    = type;
-    fv.present = true;
-
-    switch (type) {
-        case PrimType::Int32:
-            fv.i = static_cast<int32_t>(static_cast<uint32_t>(readU(row, off, 4)));
-            break;
-        case PrimType::Int64:
-            fv.i = static_cast<int64_t>(readU(row, off, 8));
-            break;
-        case PrimType::UInt16:
-            fv.u = readU(row, off, 2);
-            break;
-        case PrimType::UInt32:
-        case PrimType::Enum:
-            fv.u = readU(row, off, 4);
-            break;
-        case PrimType::UInt64:
-            fv.u = readU(row, off, 8);
-            break;
-        case PrimType::Float64: {
-            uint64_t raw = readU(row, off, 8);
-            std::memcpy(&fv.f, &raw, 8);
-            break;
-        }
-        case PrimType::Bool:
-            fv.b = row[off] != 0;
-            fv.i = row[off];
-            break;
-        case PrimType::FixedStr:
-            fv.bytes = std::string_view(reinterpret_cast<const char*>(row + off), width);
-            break;
-        case PrimType::String:
-        case PrimType::Bytes:
-            // var-len: rejected by buildRowLayout; unreachable for a valid RowLayout.
-            break;
-    }
-    return fv;
+    return decodeSlotValue(row + layout.slotOffset[slot], layout.slotType[slot],
+                           layout.slotWidth[slot]);
 }
 
 } // namespace rune::view
