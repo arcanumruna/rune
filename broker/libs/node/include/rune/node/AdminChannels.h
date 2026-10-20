@@ -160,6 +160,10 @@ enum : int32_t {
     // Authentication Task 16: the admin plane's cumulative dropped inter-broker frames, [count:u64] (paced, only on a
     // change) - the control thread folds it into counter 1'000'235.
     kA2cPeerFrameDrops      = 23,
+    // Phase 2c (subscription filters): a typed topic's EVOLVING descriptor at its current version, [topicId:i32]
+    // [version:u16][blob] (the kA2cSchemaUpdate layout).  The control thread hands it to the gateway, which fans it
+    // out to every worker ahead of any filtered Subscribe.
+    kA2cFilterSchema        = 24,
 };
 
 // ---------------------------------------------------------------------------
@@ -1064,6 +1068,37 @@ inline SchemaUpdateMsg decodeSchemaUpdate(const uint8_t* buf, std::size_t len) {
     return m;
 }
 
+// ---- FilterSchema (admin → control; Phase 2c) ----
+// Same layout as SchemaUpdate: [topicId:i32][version:u16][EVOLVING descriptor blob].
+struct FilterSchemaMsg {
+    int32_t              topicId = -1;
+    uint16_t             version = 0;
+    std::vector<uint8_t> blob;
+};
+
+[[nodiscard]] inline constexpr std::size_t filterSchemaWireLen(std::size_t blobLen) noexcept {
+    return 4 + 2 + blobLen;
+}
+
+/// Writes exactly filterSchemaWireLen(blob.size()) bytes at `p`.
+inline void writeFilterSchema(uint8_t* p, int32_t topicId, uint16_t version, std::span<const uint8_t> blob) noexcept {
+    using namespace admin_wire;
+    putI32(p, topicId);
+    p[4] = static_cast<uint8_t>(version & 0xff);
+    p[5] = static_cast<uint8_t>((version >> 8) & 0xff);
+    if (!blob.empty()) std::memcpy(p + 6, blob.data(), blob.size());
+}
+
+/// False for a frame shorter than its 6-byte header (the caller logs it, rate-limited, and skips it).
+[[nodiscard]] inline bool decodeFilterSchema(const uint8_t* buf, std::size_t len, FilterSchemaMsg& m) {
+    using namespace admin_wire;
+    if (len < 6) return false;
+    m.topicId = getI32(buf);
+    m.version = static_cast<uint16_t>(buf[4]) | static_cast<uint16_t>(static_cast<uint16_t>(buf[5]) << 8);
+    m.blob.assign(buf + 6, buf + len);
+    return true;
+}
+
 // ---- ViewPlanUpdate (Task 19) ----
 // Carries a compiled view plan + its output + source descriptors to install on a
 // worker's WorkerViewSet.  Used on TWO rings with the SAME wire layout:
@@ -1487,6 +1522,11 @@ static_assert(schemaUpdateWireLen(kMaxDescriptorViaRequestRing) <=
                   static_cast<std::size_t>(kAdminToControlRingBytes) / 8,
               "every descriptor the admin request ring can deliver must fit one "
               "SchemaUpdate on the admin->control ring");
+
+// A FilterSchema carries the same descriptor a SchemaUpdate does, so it fits the ring by the same bound.
+static_assert(filterSchemaWireLen(kMaxDescriptorViaRequestRing) <=
+                  static_cast<std::size_t>(kAdminToControlRingBytes) / 8,
+              "every descriptor the admin request ring can deliver must fit one FilterSchema on the admin->control ring");
 
 // ---- admin → control dispatch (F3 round 7, item 3) ----
 // Explicit per-type dispatch: an unknown type or a too-short frame is

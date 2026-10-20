@@ -731,6 +731,21 @@ struct NodeConfig {
     //     — the HW-advancing fast-acks) drained per worker duty cycle from the ingress
     //     ring (RUNE_WORKER_INGRESS_DRAIN_LIMIT; was the OneToOneByteRing default 16).
     int32_t workerIngressDrainLimit      = 1024;
+    // ── Phase 2c: subscription filters (broker-side filtering of a typed topic's pushes).  A value out of its bounds
+    //    refuses start with a message naming the knob.
+    //   - filterMaxSubsPerPartition: filtered subscriptions per (topic, partition) (RUNE_FILTER_MAX_SUBS_PER_PARTITION, [1, 1048576]).
+    //   - filterMaxIndexValuesPerPartition: distinct index values per partition (RUNE_FILTER_MAX_INDEX_VALUES_PER_PARTITION, [1, 1048576]).
+    //   - filterNoteIntervalMs / filterNoteRecords: a subscription that skipped records gets a position note after
+    //     this many ms / skipped records, whichever is first (RUNE_FILTER_NOTE_INTERVAL_MS [1, 60000],
+    //     RUNE_FILTER_NOTE_RECORDS [1, 2^31-1]).
+    //   - filterVersionWaitMs: how long a filter waits for a schema version it has not seen (RUNE_FILTER_VERSION_WAIT_MS, [0, 600000]).
+    //   - filterMatchScratch: the per-worker match scratch, in matches (RUNE_FILTER_MATCH_SCRATCH, [64, 16777216]).
+    uint32_t filterMaxSubsPerPartition        = 4096;
+    uint32_t filterMaxIndexValuesPerPartition = 4096;
+    int32_t  filterNoteIntervalMs             = 50;
+    int64_t  filterNoteRecords                = 65536;
+    int32_t  filterVersionWaitMs              = 5000;
+    uint32_t filterMatchScratch               = 65536;
     //   - workerReturnDrainLimit: acks drained from a worker's return ring per gateway
     //     cycle (RUNE_WORKER_RETURN_DRAIN_LIMIT; was 16).
     int32_t workerReturnDrainLimit       = 1024;

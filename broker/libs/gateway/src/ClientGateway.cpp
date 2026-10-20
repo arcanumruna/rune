@@ -4225,6 +4225,9 @@ rune::node::WorkerOp ClientGateway::buildSubscribeOp_(const BufferedSubscribe& s
     op.logPtr               = log;
     op.replica              = const_cast<rune::replication::PartitionReplica*>(rep);
     op.egressPub            = egressPub;
+    // Phase 2c: the filter rides the op's tail (a view valid for the synchronous enqueue - the record outlives it).
+    if (const auto it = subscriptions_.find(s.subId); it != subscriptions_.end() && !it->second.filter.empty())
+        op.filterBytes = std::span<const uint8_t>(it->second.filter);
     return op;
 }
 
@@ -4254,16 +4257,12 @@ void ClientGateway::enqueueSubscribeOp_(const BufferedSubscribe& s, void* egress
     const auto w = static_cast<std::size_t>(workerPool_->ownerWorkerId(s.topicId, s.partition));
     const bool behind = w < pendingSubOps_.size() && !pendingSubOps_[w].empty();
     if (behind || !workerPool_->tryEnqueueOp(s.topicId, s.partition, std::move(op))) {
-        PendingSubOp p;
-        p.sub = s;
-        p.mdc = egressPub == nullptr;
-        queueSubOp_(std::move(p));
+        queueSubOp_(w, SubOpSubscribe{s, egressPub == nullptr ? EgressRoute::Mdc : EgressRoute::Unicast});
     }
 }
 
-void ClientGateway::queueSubOp_(PendingSubOp p)
+void ClientGateway::queueSubOp_(std::size_t w, PendingSubOp p)
 {
-    const auto w = static_cast<std::size_t>(workerPool_->ownerWorkerId(p.sub.topicId, p.sub.partition));
     if (pendingSubOps_.size() <= w) pendingSubOps_.resize(static_cast<std::size_t>(workerPool_->workerCount()));
     pendingSubOps_[w].push_back(std::move(p));
     const std::size_t n = pendingSubOpsForTest();
@@ -4271,37 +4270,57 @@ void ClientGateway::queueSubOp_(PendingSubOp p)
         spdlog::warn("ClientGateway: {} subscription op(s) waiting for worker ring space — retried every cycle", n);
 }
 
-bool ClientGateway::trySubOp_(const PendingSubOp& p)
+bool ClientGateway::trySubOp_(std::size_t w, const PendingSubOp& p)
 {
-    rune::node::WorkerOp op;
-    if (p.unsubscribe) {
-        op.type           = rune::node::WorkerOp::Type::Unsubscribe;
-        op.subscriptionId = p.sub.subId;
-        op.topicId        = p.sub.topicId;
-        op.partition      = p.sub.partition;
-        return workerPool_->tryEnqueueOp(p.sub.topicId, p.sub.partition, std::move(op));
-    }
-    // Re-resolve the egress publication NOW (never a pointer held across cycles).
-    void* egressPub = nullptr;
-    if (!p.mdc) {
-        rune::gateway::Session* sess = sessions_.find(p.sub.sessionId);
-        if (!sess) return true;   // session gone: the Subscribe is moot (dropped)
-        const int32_t wid = workerPool_->ownerWorkerId(p.sub.topicId, p.sub.partition);
-        auto it = sess->recordEgressByWorker.find(wid);
-        if (it == sess->recordEgressByWorker.end() || !it->second) return true;   // moot
-        egressPub = it->second.get();
-    }
-    const auto& s = p.sub;
-    op = buildSubscribeOp_(s, egressPub);  // A-MAJOR-1: correlationId + replica included
-    return workerPool_->tryEnqueueOp(s.topicId, s.partition, std::move(op));
+    struct Visitor {
+        ClientGateway& g;
+        std::size_t    w;
+        bool operator()(const SubOpUnsubscribe& u) const
+        {
+            rune::node::WorkerOp op;
+            op.type           = rune::node::WorkerOp::Type::Unsubscribe;
+            op.subscriptionId = u.subId;
+            op.topicId        = u.topicId;
+            op.partition      = u.partition;
+            return g.workerPool_->tryEnqueueOp(u.topicId, u.partition, std::move(op));
+        }
+        bool operator()(const SubOpSubscribe& sp) const
+        {
+            const auto& s = sp.sub;
+            // Re-resolve the egress publication NOW (never a pointer held across cycles).
+            void* egressPub = nullptr;
+            if (sp.route == EgressRoute::Unicast) {
+                rune::gateway::Session* sess = g.sessions_.find(s.sessionId);
+                if (!sess) return true;   // session gone: the Subscribe is moot (dropped)
+                const int32_t wid = g.workerPool_->ownerWorkerId(s.topicId, s.partition);
+                auto it = sess->recordEgressByWorker.find(wid);
+                if (it == sess->recordEgressByWorker.end() || !it->second) return true;   // moot
+                egressPub = it->second.get();
+            }
+            rune::node::WorkerOp op = g.buildSubscribeOp_(s, egressPub);  // A-MAJOR-1: correlationId + replica included
+            return g.workerPool_->tryEnqueueOp(s.topicId, s.partition, std::move(op));
+        }
+        bool operator()(const SubOpFilterSchema& f) const
+        {
+            rune::node::WorkerOp op;
+            op.type            = rune::node::WorkerOp::Type::FilterSchema;
+            op.topicId         = f.topicId;
+            op.clientVersion   = f.version;
+            op.schemaUpdateBlob = f.blob;
+            // Direct to worker w (the schema is never ownership-gated); TooLarge is not retried (it was counted when queued).
+            return g.workerPool_->worker(static_cast<int32_t>(w)).enqueueOp(std::move(op)) != rune::node::EnqueueResult::Full;
+        }
+    };
+    return std::visit(Visitor{*this, w}, p);
 }
 
 int ClientGateway::pumpSubOps_()
 {
     int done = 0;
-    for (auto& q : pendingSubOps_) {
+    for (std::size_t w = 0; w < pendingSubOps_.size(); ++w) {
+        auto& q = pendingSubOps_[w];
         while (!q.empty()) {
-            if (!trySubOp_(q.front())) break;   // this worker's ring still full; others proceed
+            if (!trySubOp_(w, q.front())) break;   // this worker's ring still full; others proceed
             q.pop_front();
             ++done;
         }
@@ -4444,14 +4463,10 @@ void ClientGateway::forwardUnsubscribeToWorker_(int64_t subId, int32_t topicId, 
     }
     // M5: never dropped on a full ring — queued (behind any queued Subscribe of
     // the same worker, so the pair keeps its order) and retried every doWork.
-    PendingSubOp p;
-    p.unsubscribe   = true;
-    p.sub.subId     = subId;
-    p.sub.topicId   = topicId;
-    p.sub.partition = partition;
+    PendingSubOp p = SubOpUnsubscribe{subId, topicId, partition};
     const auto w = static_cast<std::size_t>(workerPool_->ownerWorkerId(topicId, partition));
     const bool behind = w < pendingSubOps_.size() && !pendingSubOps_[w].empty();
-    if (behind || !trySubOp_(p)) queueSubOp_(std::move(p));
+    if (behind || !trySubOp_(w, p)) queueSubOp_(w, std::move(p));
 }
 
 // ---------------------------------------------------------------------------
@@ -4566,6 +4581,32 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     }
     if (refuseViewSink_(buf, len, msg.topicId, "Subscribe to a view sink")) [[unlikely]] return;   // VLS B.3
 
+    // Helper: send SubscribeResponse on the session egress.  Phase 2c: a refusal's `detail` (<= 256 bytes) is written
+    // only for a session >= 10 (encodeFor); an older session gets the byte-identical 38-byte frame.
+    auto sendResp = [&](pc::ErrorCode ec, int32_t partition, int64_t subId, std::string_view detail = {}) {
+        pc::SubscribeResponse resp;
+        resp.sessionId      = msg.sessionId;
+        resp.correlationId  = msg.correlationId;
+        resp.errorCode      = static_cast<int16_t>(ec);
+        resp.partition      = partition;
+        resp.subscriptionId = subId;
+        resp.detail         = detail.substr(0, 256);
+        static_assert(pc::SubscribeResponse::ENCODED_SIZE + 2 + 256 <= kScratchSize,
+                      "scratch too small for SubscribeResponse with a detail");
+        const std::size_t encoded = resp.encodeFor(scratch_.data(), session->clientVersion, kScratchSize);
+        // CG round 3 (MEDIUM-2): queued + retried under back-pressure like the
+        // produce answers - never a best-effort drop of the binding answer.
+        sendAnswer_(*session, scratch_.data(), encoded);
+    };
+
+    // Phase 2c (spec 9, E1): a filter is read only from a session >= 10; `__catalog` / `__security` are untyped.
+    if (pc::clientUnderstandsFilters(session->clientVersion) && !msg.filter.empty() &&
+        (msg.topicId == pc::kCatalogTopicId || msg.topicId == pc::kSecurityTopicId)) [[unlikely]] {
+        sendResp(pc::ErrorCode::InvalidRequest, msg.partition, 0,
+                 rune::codec::describe({rune::codec::FilterErrorKind::UntypedTopic}));
+        return;
+    }
+
     // Catalog history Task 12 (spec §7, F19): `__catalog` is readable from ANY
     // broker — never redirected, never routed by the data-plane image.  The
     // admin thread (the catalog replica's owner) answers it.
@@ -4595,22 +4636,6 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
             return;  // engine untouched, no subscription registered
         }
     }
-
-    // Helper: send SubscribeResponse on the session egress.
-    auto sendResp = [&](pc::ErrorCode ec, int32_t partition, int64_t subId) {
-        pc::SubscribeResponse resp;
-        resp.sessionId      = msg.sessionId;
-        resp.correlationId  = msg.correlationId;
-        resp.errorCode      = static_cast<int16_t>(ec);
-        resp.partition      = partition;
-        resp.subscriptionId = subId;
-        static_assert(pc::SubscribeResponse::ENCODED_SIZE <= kScratchSize,
-                      "scratch too small for SubscribeResponse");
-        const std::size_t encoded = resp.encode(scratch_.data());
-        // CG round 3 (MEDIUM-2): queued + retried under back-pressure like the
-        // produce answers — never a best-effort drop of the binding answer.
-        sendAnswer_(*session, scratch_.data(), encoded);
-    };
 
     // 3. Resolve partition.
     int32_t partition = msg.partition;
@@ -4934,6 +4959,42 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
         session->subIdByKey.erase(dup);   // stale index entry (sub already gone)
     }
 
+    // Phase 2c (spec 6 step 1, 9, FD1, FD3): a filter is read only from a session >= 10 (older sessions' trailing
+    // bytes were ignored at decode).  Every refusal is answered with its detail; nothing is registered.  Placed after
+    // the group-carrier and dedupe branches: a duplicate Subscribe re-answers its existing subscription (one ticket).
+    std::span<const uint8_t> filterBytes;
+    FilterAdmission::Ticket  ticket;
+    if (pc::clientUnderstandsFilters(session->clientVersion) && !msg.filter.empty()) [[unlikely]] {
+        if (!perWorkerEgressActive_ || !workerPool_) {
+            sendResp(pc::ErrorCode::InvalidRequest, partition, 0, "filter needs RUNE_WORKER_MODE=shard");
+            return;
+        }
+        const rune::codec::FilterSchema* fs = msg.topicId >= 0 ? filterSchemas_.find(msg.topicId) : nullptr;
+        if (fs == nullptr) {
+            sendResp(pc::ErrorCode::InvalidRequest, partition, 0,
+                     rune::codec::describe({rune::codec::FilterErrorKind::UntypedTopic}));
+            return;
+        }
+        if (filterSchemaTooLargeTopics_.contains(msg.topicId) || !workerPool_->fitsIngressTail(msg.filter.size())) {
+            sendResp(pc::ErrorCode::InvalidRequest, partition, 0,
+                     "filter schema too large for the worker ring (RUNE_WORKER_INGRESS_RING_BYTES)");
+            return;
+        }
+        auto c = rune::codec::CompiledFilter::compile(msg.filter, *fs);
+        if (!c) {
+            sendResp(pc::ErrorCode::InvalidRequest, partition, 0, rune::codec::describe(c.error()));
+            return;
+        }
+        const auto& it = c->term(c->indexTerm());
+        auto t = filterAdmission_.admit(msg.topicId, partition, it.tag, c->values(c->indexTerm()));
+        if (!t) {
+            sendResp(pc::ErrorCode::InvalidRequest, partition, 0, t.error());
+            return;
+        }
+        filterBytes = msg.filter;
+        ticket      = std::move(*t);
+    }
+
     // 6. Allocate subscriptionId and register subscription.
     const int64_t subId = allocSubscriptionId_();
 
@@ -4947,6 +5008,8 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     sub.subscribeCorrId = msg.correlationId;
     sub.hadReplica      = replicaRegistry_ != nullptr &&
                           static_cast<bool>(replicaRegistry_->lookupHandle(msg.topicId, partition));
+    sub.filter.assign(filterBytes.begin(), filterBytes.end());
+    sub.filterTicket = std::move(ticket);
 
     subscriptions_.emplace(subId, std::move(sub));
     session->subIdByKey[subKey] = subId;   // 5a: the dedupe index
@@ -7771,8 +7834,43 @@ void ClientGateway::onCatalogObjectApplied(int32_t id, const std::string& name, 
     });
 }
 
+void ClientGateway::onFilterSchema(int32_t topicId, uint16_t version, std::span<const uint8_t> evolvingBlob)
+{
+    filterSchemas_.install(topicId, version, evolvingBlob);
+    if (!workerPool_) return;   // no workers: nothing serves filters (a filtered Subscribe is refused E12)
+    const std::size_t nw = static_cast<std::size_t>(workerPool_->workerCount());
+    if (pendingSubOps_.size() < nw) pendingSubOps_.resize(nw);
+    if (!workerPool_->fitsIngressTail(evolvingBlob.size())) [[unlikely]] {
+        ++filterSchemaTooLarge_;
+        filterSchemaTooLargeTopics_.insert(topicId);
+        spdlog::error("ClientGateway: filter schema of topicId={} ({} B) can never fit the worker ingress ring "
+                      "(max tail {} B) - filtered Subscribes to it are refused; raise RUNE_WORKER_INGRESS_RING_BYTES",
+                      topicId, evolvingBlob.size(), workerPool_->maxIngressTail());
+        return;
+    }
+    filterSchemaTooLargeTopics_.erase(topicId);
+    for (std::size_t w = 0; w < nw; ++w) {
+        // FIFO with the Subscribe / Unsubscribe ops: behind anything already queued for this worker, so it never
+        // overtakes an op queued before it, and a filtered Subscribe arriving later finds the schema first.
+        if (!pendingSubOps_[w].empty()) {
+            queueSubOp_(w, SubOpFilterSchema{topicId, version, std::vector<uint8_t>(evolvingBlob.begin(), evolvingBlob.end())});
+            continue;
+        }
+        rune::node::WorkerOp op;
+        op.type             = rune::node::WorkerOp::Type::FilterSchema;
+        op.topicId          = topicId;
+        op.clientVersion    = version;
+        op.schemaUpdateBlob.assign(evolvingBlob.begin(), evolvingBlob.end());
+        const auto r = workerPool_->worker(static_cast<int32_t>(w)).enqueueOp(std::move(op));
+        if (r == rune::node::EnqueueResult::Full)
+            queueSubOp_(w, SubOpFilterSchema{topicId, version, std::vector<uint8_t>(evolvingBlob.begin(), evolvingBlob.end())});
+    }
+}
+
 void ClientGateway::onCatalogObjectDropped(int32_t id)
 {
+    filterSchemas_.erase(id);
+    filterSchemaTooLargeTopics_.erase(id);
     objectIndex_.onDropped(id);
     sessions_.forEach([&](Session& s) {
         if (auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&s.auth)) {

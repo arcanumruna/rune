@@ -1115,6 +1115,37 @@ ConfigResult parseNodeConfig(
             }
         }
     };
+    // Phase 2c: subscription-filter knobs.  Strict: unparseable or out of [lo, hi] refuses start, naming the knob.
+    {
+        struct FilterKnob { const char* name; int64_t lo, hi; int64_t def; };
+        const auto read = [&](const FilterKnob& k, int64_t& out) -> std::string {
+            out = k.def;
+            const char* raw = getenv_fn(k.name);
+            if (raw == nullptr || *raw == '\0') return {};
+            int64_t v = 0;
+            const std::string_view sv(raw);
+            const auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), v);
+            if (ec != std::errc{} || ptr != sv.data() + sv.size() || v < k.lo || v > k.hi)
+                return std::string(k.name) + " must be an integer in [" + std::to_string(k.lo) + ", " +
+                       std::to_string(k.hi) + "], got '" + raw + "'";
+            out = v;
+            return {};
+        };
+        int64_t v = 0;
+        std::string err;
+        if (!(err = read({"RUNE_FILTER_MAX_SUBS_PER_PARTITION", 1, 1048576, 4096}, v)).empty()) return {{}, err};
+        cfg.filterMaxSubsPerPartition = static_cast<uint32_t>(v);
+        if (!(err = read({"RUNE_FILTER_MAX_INDEX_VALUES_PER_PARTITION", 1, 1048576, 4096}, v)).empty()) return {{}, err};
+        cfg.filterMaxIndexValuesPerPartition = static_cast<uint32_t>(v);
+        if (!(err = read({"RUNE_FILTER_NOTE_INTERVAL_MS", 1, 60000, 50}, v)).empty()) return {{}, err};
+        cfg.filterNoteIntervalMs = static_cast<int32_t>(v);
+        if (!(err = read({"RUNE_FILTER_NOTE_RECORDS", 1, 2147483647, 65536}, v)).empty()) return {{}, err};
+        cfg.filterNoteRecords = v;
+        if (!(err = read({"RUNE_FILTER_VERSION_WAIT_MS", 0, 600000, 5000}, v)).empty()) return {{}, err};
+        cfg.filterVersionWaitMs = static_cast<int32_t>(v);
+        if (!(err = read({"RUNE_FILTER_MATCH_SCRATCH", 64, 16777216, 65536}, v)).empty()) return {{}, err};
+        cfg.filterMatchScratch = static_cast<uint32_t>(v);
+    }
     parseLimit("RUNE_WORKER_INGRESS_DRAIN_LIMIT", cfg.workerIngressDrainLimit);
     parseLimit("RUNE_WORKER_RETURN_DRAIN_LIMIT",  cfg.workerReturnDrainLimit);
     parseLimit("RUNE_REPL_FRAGMENT_LIMIT",        cfg.replFragmentLimit);

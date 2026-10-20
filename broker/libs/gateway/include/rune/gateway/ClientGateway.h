@@ -68,6 +68,7 @@
 #include <rune/gateway/ObjectIndex.h>
 #include <rune/gateway/LoginThrottle.h>
 #include <rune/gateway/ScramServer.h>
+#include <rune/gateway/FilterAdmission.h>
 #include <rune/peerlink/ClusterKeys.h>
 // client<->broker TLS/AEAD (Task 7): server-role handshake driver. SessionTable.h
 // (above) already pulls in rune/crypto/Aead.h + Cipher.h for CryptoState; this
@@ -448,6 +449,15 @@ public:
     void onCatalogObjectApplied(int32_t id, const std::string& name, bool isView);
     /// kA2cCatalogTopicDropped: the id is gone; every table's bits for it are cleared.  Idempotent.
     void onCatalogObjectDropped(int32_t id);
+
+    /// Phase 2c (control thread): kA2cFilterSchema - a typed topic's EVOLVING descriptor at `version`.  Installed in
+    /// the gateway's registry (filters are validated against it) and fanned out to every worker, in order with the
+    /// Subscribe ops (queued behind them when a ring is full).
+    void onFilterSchema(int32_t topicId, uint16_t version, std::span<const uint8_t> evolvingBlob);
+    /// Phase 2c: the per-(topic, partition) admission caps (RUNE_FILTER_MAX_SUBS_PER_PARTITION / _INDEX_VALUES_).
+    void setFilterLimits(FilterAdmission::Limits l) noexcept { filterAdmission_.setLimits(l); }
+    [[nodiscard]] const FilterAdmission& filterAdmissionForTest() const noexcept { return filterAdmission_; }
+    [[nodiscard]] uint64_t filterSchemaTooLargeForTest() const noexcept { return filterSchemaTooLarge_; }
     [[nodiscard]] const rune::gateway::ObjectIndex& objectIndex() const noexcept { return objectIndex_; }
     /// Requests answered NotAuthorized (45) since start.
     [[nodiscard]] uint64_t notAuthorizedAnswers() const noexcept { return notAuthorizedAnswers_; }
@@ -1511,6 +1521,11 @@ private:
         const rune::replication::PartitionReplica* transientReplica = nullptr;
         uint64_t transientClassRegGen = UINT64_MAX;
         uint64_t transientClassCatGen = UINT64_MAX;
+        // Phase 2c: the client's filter bytes (empty = unfiltered; immutable after registration, handed to the worker
+        // in the Subscribe op's tail - also on a queued retry) and the admission registration they hold.  The ticket
+        // releases itself when this record is erased, whatever the removal path.
+        std::vector<uint8_t>             filter;
+        FilterAdmission::Ticket          filterTicket;
     };
 
     // -----------------------------------------------------------------------
@@ -2402,6 +2417,12 @@ private:
     // Iterated each doWork() to push new Records to each subscriber's egress.
     // Subscriptions are reaped when the owning session is removed/reaped.
     // Single-writer: only accessed on the duty-cycle thread.
+    // Phase 2c: declared BEFORE subscriptions_ - every Subscription's ticket points at the admission table, so the
+    // table must outlive the records (members are destroyed in reverse declaration order).
+    FilterSchemaRegistry                      filterSchemas_;
+    FilterAdmission                           filterAdmission_;
+    std::unordered_set<int32_t>               filterSchemaTooLargeTopics_;   // topics a worker ring cannot hold the schema of
+    uint64_t                                  filterSchemaTooLarge_ = 0;
     std::unordered_map<int64_t, Subscription> subscriptions_;
 
     // GB-3: Monotonic subscription ID generator (starts at 1).
@@ -2665,14 +2686,15 @@ private:
     // and retried every doWork — never dropped.  A queued Subscribe re-resolves
     // its session's egress publication at retry time (never a dangling pointer;
     // a session gone meanwhile drops it).
-    struct PendingSubOp {
-        bool              unsubscribe = false;
-        bool              mdc         = false;   // forwarded with the MDC pub (no unicast)
-        BufferedSubscribe sub;                   // subscribe: everything; unsubscribe: subId/topic/partition
-    };
+    // Phase 2c (fix-on-sight): the op kind is a variant, not a pair of booleans.
+    enum class EgressRoute : uint8_t { Unicast, Mdc };   // Mdc: forwarded with the MDC pub (no unicast)
+    struct SubOpSubscribe    { BufferedSubscribe sub; EgressRoute route = EgressRoute::Unicast; };
+    struct SubOpUnsubscribe  { int64_t subId = 0; int32_t topicId = 0; int32_t partition = 0; };
+    struct SubOpFilterSchema { int32_t topicId = 0; uint16_t version = 0; std::vector<uint8_t> blob; };
+    using PendingSubOp = std::variant<SubOpSubscribe, SubOpUnsubscribe, SubOpFilterSchema>;
     std::vector<std::deque<PendingSubOp>> pendingSubOps_;   // indexed by owning worker
-    bool trySubOp_(const PendingSubOp& p);
-    void queueSubOp_(PendingSubOp p);
+    bool trySubOp_(std::size_t worker, const PendingSubOp& p);
+    void queueSubOp_(std::size_t worker, PendingSubOp p);
     int  pumpSubOps_();
 public:
     [[nodiscard]] uint64_t controlRecordsRefusedForTest() const noexcept { return controlRecordsRefused_; }
@@ -2682,6 +2704,19 @@ public:
         std::size_t n = 0;
         for (const auto& q : pendingSubOps_) n += q.size();
         return n;
+    }
+    /// Test-only: the kinds of worker `w`'s queued ops, oldest first: S subscribe, U unsubscribe, F filter schema.
+    [[nodiscard]] std::string pendingSubOpKindsForTest(std::size_t w) const {
+        std::string out;
+        if (w >= pendingSubOps_.size()) return out;
+        for (const PendingSubOp& p : pendingSubOps_[w])
+            out.push_back(std::holds_alternative<SubOpSubscribe>(p) ? 'S' : std::holds_alternative<SubOpUnsubscribe>(p) ? 'U' : 'F');
+        return out;
+    }
+    /// Test-only: the filter bytes the gateway holds for a subscription (empty = unfiltered / unknown).
+    [[nodiscard]] std::vector<uint8_t> subscriptionFilterForTest(int64_t subId) const {
+        const auto it = subscriptions_.find(subId);
+        return it == subscriptions_.end() ? std::vector<uint8_t>{} : it->second.filter;
     }
     [[nodiscard]] std::size_t pendingAcksForTest() const noexcept { return pendingAcks_.size(); }
     /// Test-only (single-threaded): take the per-cycle min-ISR snapshot now

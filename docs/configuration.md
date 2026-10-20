@@ -153,6 +153,12 @@ clients or peers reach the node through Docker port mappings.
 | `RUNE_IO_COMPLETION_RING_DEPTH` | `1024` | Slots of each worker's I/O completion ring (power of two). |
 | `RUNE_WORKER_INGRESS_DRAIN_LIMIT` | `1024` | Ingress entries a worker drains per pass (positive). |
 | `RUNE_WORKER_RETURN_DRAIN_LIMIT` | `1024` | Return entries drained per pass (positive). |
+| `RUNE_FILTER_MAX_SUBS_PER_PARTITION` | `4096` | Filtered subscriptions per topic partition, `1` to `1048576`. |
+| `RUNE_FILTER_MAX_INDEX_VALUES_PER_PARTITION` | `4096` | Distinct filter index values per topic partition, `1` to `1048576`. |
+| `RUNE_FILTER_NOTE_INTERVAL_MS` | `50` | Milliseconds before a filtered subscription that skipped records gets a position note, `1` to `60000`. |
+| `RUNE_FILTER_NOTE_RECORDS` | `65536` | Skipped records before a position note, `1` to `2147483647`. |
+| `RUNE_FILTER_VERSION_WAIT_MS` | `5000` | Milliseconds a filter waits for a schema version it has not seen, `0` to `600000`. |
+| `RUNE_FILTER_MATCH_SCRATCH` | `65536` | Per-worker match scratch, in matches, `64` to `16777216`. |
 | `RUNE_WORKER_ACK_SLOT_BYTES` | `256` | Return-ring slot for a produce result (64 or more). |
 | `RUNE_WORKER_MAX_OWED_RETURNS` | `4096` | Cap on owed returns, `256` to `8192` (enforced at start). |
 
