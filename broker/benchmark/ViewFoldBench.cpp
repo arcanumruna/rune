@@ -705,3 +705,88 @@ BENCHMARK(BM_ViewFoldRetractable)
     ->Unit(benchmark::kMicrosecond)
     ->Iterations(1)
     ->UseRealTime();
+
+// Extreme retraction (Phase 2b) — REPORTED, NOT GATED (spec §A Gates: the known
+// O(group size) path). One group of N contributors with amounts 1..N; each
+// timed op lowers the CURRENT max holder (N, N-1, ..., 2) to 0, so every op
+// retracts the cached Max with a lower value and scans the group's N-entry
+// value block (Task 5b: ceil(N/32) chunk rows, sequential).
+// Single-record batches; latency per op.
+static void BM_ViewFoldExtremeRetract(benchmark::State& st) {
+    const int64_t groupSize = st.range(0);
+    constexpr int kOne[]        = {1};
+    constexpr int kPrimeBatch[] = {64};
+
+    for (auto _ : st) {
+        auto src = orderSourceV1();
+        const rune::codec::Descriptor* srcs[] = {&src};
+        auto comp = compileView(groupMaxView(), srcs, 0x51000004).value();
+        auto agg = rune::view::buildAggLayout(comp.plan, src).value();
+        ViewTable view(comp.rowLayout);
+        ViewTable contributors(agg.contributorRow), groups(agg.groupRow);
+        ViewTable blocks(agg.blockRow);   // groupMaxView has Max: the value block (Task 5b)
+        VersionDescriptorCache vdc(src);
+
+        // Op.key = contributor id, Op.hp = amount; every record in kExtremeGroup.
+        auto append = [](rune::protocol::RecordBatchBuilder& bb, const Op& op) {
+            const auto kb = keyBytes(static_cast<int64_t>(op.key));
+            const auto val = encodeOrder(static_cast<int64_t>(op.key), kExtremeGroup,
+                                         static_cast<int64_t>(op.hp), 1);
+            bb.append(asSv(kb), asSv(val), 0);
+        };
+        auto fold = [&](const BatchStream& s, size_t i) {
+            auto lv = s.view(i);
+            int64_t cur = 0;
+            return foldAggregateBatch(comp.plan, comp.rowLayout, agg, vdc, view, contributors,
+                                      groups, &blocks, lv, s.bound(i), cur);
+        };
+
+        // Prime (NOT timed): contributors 1..N, amount = id -> max = N.
+        std::vector<Op> prime;
+        prime.reserve(static_cast<size_t>(groupSize));
+        for (int64_t c = 1; c <= groupSize; ++c)
+            prime.push_back(Op{static_cast<uint64_t>(c), static_cast<int32_t>(c), false});
+        const auto ps = buildStream(prime, kPrimeBatch, 1, append);
+        for (size_t i = 0; i < ps.size(); ++i) fold(ps, i);
+
+        // Measured: lower the current max holder to 0 (built before timing).
+        std::vector<Op> ops;
+        for (int64_t k = groupSize; k >= 2; --k)
+            ops.push_back(Op{static_cast<uint64_t>(k), 0, false});
+        const auto ms = buildStream(ops, kOne, 1, append);
+
+        std::vector<uint32_t> lat;
+        lat.reserve(ms.size());
+        uint64_t rescans = 0;
+        for (size_t i = 0; i < ms.size(); ++i) {
+            const auto t0 = std::chrono::steady_clock::now();
+            const auto fs = fold(ms, i);
+            const auto t1 = std::chrono::steady_clock::now();
+            lat.push_back(static_cast<uint32_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()));
+            rescans += fs.aggRescans;
+        }
+
+        const uint8_t* row = view.get(static_cast<uint64_t>(kExtremeGroup));
+        const bool exact = row != nullptr && readSlot(row, comp.rowLayout, 2).i == 1 &&
+                           rescans == ops.size();
+        st.counters["extreme_group_size"] = static_cast<double>(groupSize);
+        st.counters["extreme_p50_us"]     = percentileUs(lat, 0.50);
+        st.counters["extreme_p99_us"]     = percentileUs(lat, 0.99);
+        st.counters["extreme_max_us"]     = percentileUs(lat, 1.0);
+        st.counters["extreme_rescans"]    = static_cast<double>(rescans);
+        st.counters["extreme_exact"]      = exact ? 1.0 : 0.0;
+        std::fprintf(stderr,
+                     "[ViewFoldExtremeRetract N=%lld] p50=%.3fus p99=%.3fus max=%.3fus rescans=%llu "
+                     "(reported, not gated) exact=%s\n",
+                     static_cast<long long>(groupSize), st.counters["extreme_p50_us"].value,
+                     st.counters["extreme_p99_us"].value, st.counters["extreme_max_us"].value,
+                     static_cast<unsigned long long>(rescans), exact ? "yes" : "NO");
+    }
+}
+BENCHMARK(BM_ViewFoldExtremeRetract)
+    ->Arg(1000)
+    ->Arg(10000)
+    ->Unit(benchmark::kMicrosecond)
+    ->Iterations(1)
+    ->UseRealTime();
