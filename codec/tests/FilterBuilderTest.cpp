@@ -72,3 +72,26 @@ TEST(FilterBuilder, TooManyInValuesAndRepeatedFieldAreErrors) {
     EXPECT_EQ(b().field("channel").in(std::span<const FilterLiteral>(many)).build().error().kind, K::TooManyValues);
     EXPECT_EQ(b().field("channel").eq(int64_t{1}).field("channel").eq(int64_t{2}).build().error().kind, K::NotCanonical);
 }
+
+TEST(FilterBuilderRegression, UnsignedAndPlainIntegerLiteralsCompileAndRangeCheckRegression) {
+    const uint32_t w = 42;
+    const uint16_t narrow = 7;
+    const auto a = b().field("worldId").eq(w).build();
+    const auto c = b().field("worldId").eq(42u).build();
+    const auto d = b().field("worldId").eq(int64_t{42}).build();
+    ASSERT_TRUE(a.has_value() && c.has_value() && d.has_value());
+    EXPECT_EQ(*a, *d);
+    EXPECT_EQ(*c, *d);
+    EXPECT_TRUE(b().field("worldId").eq(narrow).build().has_value());
+    EXPECT_EQ(b().field("worldId").eq(-1).build().error().kind, K::ValueOutOfRange);   // plain int, signed
+    const auto i1 = b().field("channel").in({3u, 1u, 2u}).build();
+    const auto i2 = b().field("channel").in({int64_t{1}, int64_t{2}, int64_t{3}}).build();
+    ASSERT_TRUE(i1.has_value() && i2.has_value());
+    EXPECT_EQ(*i1, *i2);
+    EXPECT_EQ(b().field("worldId").in({1ull, 0xFFFFFFFFFull}).build().error().kind, K::ValueOutOfRange);
+    EXPECT_EQ(b().field("zone").eq(7u).build().error().kind, K::TypeMismatch);
+}
+TEST(FilterBuilderRegression, EqOnABoolFieldStillTakesABoolRegression) {
+    EXPECT_TRUE(b().field("alive").eq(true).build().has_value());
+    EXPECT_EQ(b().field("alive").eq(1).build().error().kind, K::TypeMismatch);
+}

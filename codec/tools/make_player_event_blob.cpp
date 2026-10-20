@@ -1,4 +1,4 @@
-// tools/make_player_event_blob.cpp — Phase 2c fixtures: writes player_event.blob and nine_ints.blob into the
+// tools/make_player_event_blob.cpp — Phase 2c fixtures: writes player_event.blob, nine_ints.blob and shadow_names.blob into the
 // given directory (default "."), from which CMake generates player_event.gen.h / nine_ints.gen.h for
 // FilterGeneratedTest.  The player_event builder calls duplicate client-cpp/examples/filter/PlayerEventSchema.h
 // (the codec cannot include client files); a pinned literal fingerprint in both test suites keeps them equal.
@@ -38,5 +38,8 @@ int main(int argc, char* argv[]) {
     DescriptorBuilder nb("nine_ints");
     for (int i = 0; i < 9; ++i) nb.add("f" + std::to_string(i), PrimType::UInt32);
     const auto nineInts = nb.build();
-    return writeBlob(dir + "/player_event.blob", playerEvent) && writeBlob(dir + "/nine_ints.blob", nineInts) ? 0 : 1;
+    // fields named like the locals of the generated Filter::encodeTo: they must still compile (this->name).
+    const auto shadow = DescriptorBuilder("shadow_names").add("w", PrimType::UInt32).add("out", PrimType::UInt32).build();
+    return writeBlob(dir + "/player_event.blob", playerEvent) && writeBlob(dir + "/nine_ints.blob", nineInts) &&
+                   writeBlob(dir + "/shadow_names.blob", shadow) ? 0 : 1;
 }

@@ -337,7 +337,7 @@ static void emitFilter(std::ostringstream& o, const Descriptor& d) {
     std::sort(byTag.begin(), byTag.end(), [](const FieldDescriptor* a, const FieldDescriptor* b) { return a->id < b->id; });
     for (const auto* f : byTag) {
         o << "            w.term(" << f->id << ", ::rune::codec::PrimType::" << primTypeEnumName(f->type) << ", "
-          << static_cast<unsigned>(filterValueWidth(f->type, f->fixedLen)) << ", " << f->name << ");\n";
+          << static_cast<unsigned>(filterValueWidth(f->type, f->fixedLen)) << ", " << "this->" << f->name << ");\n";
     }
     o << "            return w.finish();\n";
     o << "        }\n";
@@ -355,6 +355,9 @@ static void emitFilter(std::ostringstream& o, const Descriptor& d) {
 // ─── generateHeader ───────────────────────────────────────────────────────────
 
 std::string generateHeader(const Descriptor& d, std::string_view nspace) {
+    if (d.find("encodeTo") != nullptr)
+        throw std::invalid_argument("generateHeader: schema '" + d.name +
+            "' has a field named 'encodeTo', which collides with the generated Filter::encodeTo — rename the field");
     if (d.find("Filter") != nullptr)
         throw std::invalid_argument("generateHeader: schema '" + d.name +
             "' has a field named 'Filter', which collides with the generated filter type — rename the field");

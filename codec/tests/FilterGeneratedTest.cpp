@@ -3,6 +3,7 @@
 #include "FilterTestSupport.h"
 #include "generated/nine_ints.gen.h"
 #include "generated/player_event.gen.h"
+#include "generated/shadow_names.gen.h"
 
 #include <rune/codec/Fingerprint.h>
 #include <rune/codec/FilterBuilder.h>
@@ -92,4 +93,33 @@ TEST(FilterGeneratedRegression, PlayerEventFingerprintIsPinnedRegression) {
     // test) client-cpp/examples/filter/PlayerEventSchema.h.
     EXPECT_EQ(E::kFingerprint, kPlayerEventV1Fingerprint);
     EXPECT_EQ(rune::codec::fingerprint(filtertest::playerEvent(1)), kPlayerEventV1Fingerprint);
+}
+
+TEST(FilterGeneratedRegression, FieldsNamedLikeEncodeToLocalsCompileAndEncodeRegression) {
+    using S = rune::gen::ShadowNames;   // fields `w` and `out`
+    const auto a = S::Filter{ .w = 1u, .out = anyOf(3u, 2u) }.encode();
+    const auto b = rune::codec::FilterBuilder::on(S::descriptor()).field("out").in({2u, 3u}).field("w").eq(1u).build();
+    ASSERT_TRUE(b.has_value());
+    EXPECT_EQ(a, *b);
+    EXPECT_EQ(a.len, 2 + (5 + 4) + (5 + 2 * 4));
+}
+TEST(FilterGeneratedRegression, BuilderAndGeneratedAgreeOnDedupSingleInFixedStrBoolAndNegativesRegression) {
+    using namespace rune::codec;
+    auto eqB = [](const FilterBuilder& fb) { auto r = fb.build(); EXPECT_TRUE(r.has_value()); return r ? *r : FilterBytes{}; };
+    const auto d = E::descriptor();
+    // In with duplicates (dedup + sort)
+    EXPECT_EQ(E::Filter{ .channel = anyOf(3, 1, 3, -2, 1) }.encode(),
+              eqB(FilterBuilder::on(d).field("channel").in({int64_t{1}, int64_t{-2}, int64_t{3}, int64_t{3}, int64_t{1}})));
+    // single-value In stays In
+    EXPECT_EQ(E::Filter{ .hp = anyOf(int64_t{5}) }.encode(), eqB(FilterBuilder::on(d).field("hp").in({int64_t{5}})));
+    // FixedStr In (sorted by FilterKey, last byte most significant; duplicates dropped)
+    EXPECT_EQ(E::Filter{ .zone = anyOf("ba", "ab", "ba") }.encode(),
+              eqB(FilterBuilder::on(d).field("zone").in({std::string_view("ab"), std::string_view("ba"), std::string_view("ba")})));
+    // bool In
+    EXPECT_EQ(E::Filter{ .alive = anyOf(true, false, true) }.encode(),
+              eqB(FilterBuilder::on(d).field("alive").in({true, false, true})));
+    // FixedStr filled to its full width
+    EXPECT_EQ(E::Filter{ .zone = "12345678" }.encode(), eqB(FilterBuilder::on(d).field("zone").eq(std::string_view("12345678"))));
+    // negative int32
+    EXPECT_EQ(E::Filter{ .channel = -7 }.encode(), eqB(FilterBuilder::on(d).field("channel").eq(int64_t{-7})));
 }

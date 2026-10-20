@@ -1,4 +1,5 @@
 // tests/GeneratorTest.cpp
+#include "FilterTestSupport.h"
 #include <gtest/gtest.h>
 #include <rune/codec/Generator.h>
 #include <rune/codec/Record.h>
@@ -142,19 +143,7 @@ TEST(Generator, AFieldNamedKeyOnAKeylessSchemaIsAPlainFlyweightSetter) {
 // ── Phase 2c: the nested E::Filter ───────────────────────────────────────────
 
 namespace {
-Descriptor playerEventForGenerator() {
-    return DescriptorBuilder("player_event")
-        .addTagged("playerId", 0, PrimType::UInt64, 1, 0xFFFF, true, {})
-        .addTagged("worldId", 1, PrimType::UInt32, 1, 0xFFFF, false, {})
-        .addTagged("channel", 2, PrimType::Int32, 1, 0xFFFF, false, {})
-        .addFixedStrTagged("zone", 3, 8, 1, 0xFFFF, false)
-        .addTagged("kind", 4, PrimType::Enum, 1, 0xFFFF, false, {1, 2, 3})
-        .addTagged("alive", 5, PrimType::Bool, 1, 0xFFFF, false, {})
-        .addTagged("hp", 6, PrimType::Int64, 1, 0xFFFF, false, {})
-        .addTagged("name", 7, PrimType::String, 1, 0xFFFF, false, {})
-        .addTagged("pos", 8, PrimType::Float64, 1, 0xFFFF, false, {})
-        .build();
-}
+Descriptor playerEventForGenerator() { return filtertest::playerEvent(1); }
 std::size_t at(const std::string& h, const std::string& s, std::size_t from = 0) { return h.find(s, from); }
 }  // namespace
 
@@ -194,4 +183,9 @@ TEST(Generator, RetiredFieldsGetNoFilterMember) {
     EXPECT_NE(h.find("::rune::Match<uint32_t> live{};"), std::string::npos);
     EXPECT_EQ(h.find("::rune::Match<uint32_t> gone{};"), std::string::npos);
     EXPECT_EQ(h.find("w.term(1,"), std::string::npos);
+}
+
+TEST(GeneratorRegression, AFieldNamedEncodeToIsRejectedRegression) {
+    auto d = DescriptorBuilder("t").add("encodeTo", PrimType::Int64).build();
+    EXPECT_THROW((void)generateHeader(d), std::invalid_argument);
 }

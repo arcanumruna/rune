@@ -25,9 +25,7 @@ template <class T> bool intKey(const FilterLiteral& lit, FilterKey& out, bool& r
 }  // namespace
 
 FilterBuilder FilterBuilder::on(const Descriptor& d) {
-    FilterBuilder b;
-    b.d_ = &d;
-    return b;
+    return FilterBuilder(d);
 }
 
 void FilterBuilder::fail_(FilterErrorKind k, uint8_t termIndex, uint16_t tag) noexcept {

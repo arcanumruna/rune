@@ -135,9 +135,11 @@ target_link_libraries(make_player_event_blob PRIVATE rune_codec)
 set(PLAYER_EVENT_BLOB  "${CMAKE_CURRENT_BINARY_DIR}/tests/generated/player_event.blob")
 set(NINE_INTS_BLOB     "${CMAKE_CURRENT_BINARY_DIR}/tests/generated/nine_ints.blob")
 set(PLAYER_EVENT_GEN_H "${CMAKE_CURRENT_BINARY_DIR}/tests/generated/player_event.gen.h")
+set(SHADOW_NAMES_BLOB   "${CMAKE_CURRENT_BINARY_DIR}/tests/generated/shadow_names.blob")
+set(SHADOW_NAMES_GEN_H  "${CMAKE_CURRENT_BINARY_DIR}/tests/generated/shadow_names.gen.h")
 set(NINE_INTS_GEN_H    "${CMAKE_CURRENT_BINARY_DIR}/tests/generated/nine_ints.gen.h")
 add_custom_command(
-    OUTPUT  "${PLAYER_EVENT_BLOB}" "${NINE_INTS_BLOB}"
+    OUTPUT  "${PLAYER_EVENT_BLOB}" "${NINE_INTS_BLOB}" "${SHADOW_NAMES_BLOB}"
     COMMAND make_player_event_blob "${CMAKE_CURRENT_BINARY_DIR}/tests/generated"
     DEPENDS make_player_event_blob
     COMMENT "Generating player_event.blob / nine_ints.blob (2c filter fixtures)"
@@ -154,7 +156,13 @@ add_custom_command(
     DEPENDS rune_codec_gen "${NINE_INTS_BLOB}"
     COMMENT "Generating nine_ints.gen.h from nine_ints.blob"
 )
-add_custom_target(generate_filter_fixture_headers DEPENDS "${PLAYER_EVENT_GEN_H}" "${NINE_INTS_GEN_H}")
+add_custom_command(
+    OUTPUT  "${SHADOW_NAMES_GEN_H}"
+    COMMAND rune_codec_gen "${SHADOW_NAMES_BLOB}" "${SHADOW_NAMES_GEN_H}"
+    DEPENDS rune_codec_gen "${SHADOW_NAMES_BLOB}"
+    COMMENT "Generating shadow_names.gen.h from shadow_names.blob"
+)
+add_custom_target(generate_filter_fixture_headers DEPENDS "${PLAYER_EVENT_GEN_H}" "${NINE_INTS_GEN_H}" "${SHADOW_NAMES_GEN_H}")
 
 enable_testing()
 add_executable(rune_codec_tests
