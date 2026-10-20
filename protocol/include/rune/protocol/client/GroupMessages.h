@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <string_view>
 #include "ArrayView.h"
 #include "Codec.h"
 #include "MessageHeader.h"
@@ -52,7 +53,10 @@ struct TopicPartition32 {
 //   [..+2]    subscribedTopicIds count : uint16
 //   [..+count*4]  subscribedTopicIds entries (each int32 LE)
 //
-// Total = 24 + 4 + 2 + groupId.size() + 2 + memberId.size() + 2 + 4*topicCount
+//   Client version 10: [..+2] filter length : uint16, [..] filter bytes (rune/codec/FilterWire.h) - one filter
+//   per group; OMITTED when empty (the frame is then byte-identical to version 9).
+//
+// Total = 24 + 4 + 2 + groupId.size() + 2 + memberId.size() + 2 + 4*topicCount [+ 2 + filter.size()]
 // ---------------------------------------------------------------------------
 struct JoinGroup {
     int64_t  sessionId        = 0;
@@ -64,17 +68,21 @@ struct JoinGroup {
     // Decoded: zero-copy view — buf must outlive this.  Not usable on encode path.
     Int32ArrayView subscribedTopicIds;
 
+    std::span<const uint8_t> filter;           // client version 10: group filter; empty = none (omitted on the wire)
+
     static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::JoinGroup); // 32
     static constexpr uint16_t BODY_FIXED  = 4;  // sessionTimeoutMs(4)
 
     /// Total encoded size (use when encoding from a vector/span input).
     static std::size_t encodedSizeFor(std::span<const uint8_t> grp,
                                       std::span<const uint8_t> mbr,
-                                      std::size_t topicCount) noexcept {
+                                      std::size_t topicCount,
+                                      std::size_t filterBytes = 0) noexcept {
         return MessageHeader::ENCODED_SIZE + BODY_FIXED
              + 2u + grp.size()
              + 2u + mbr.size()
-             + 2u + 4u * topicCount;
+             + 2u + 4u * topicCount
+             + (filterBytes == 0 ? 0u : 2u + filterBytes);
     }
 
     /// Encode the full frame into buf.  topicIds is an iterable of int32_t.
@@ -114,14 +122,23 @@ struct JoinGroup {
             pos += 4;
         }
 
+        // client version 10: optional group filter, omitted when empty
+        if (!filter.empty()) {
+            pos += putVarBytes(buf + pos, filter.data(), static_cast<uint16_t>(filter.size()));
+        }
+
         return pos;
     }
 
     /// Decode a full frame from buf[0..avail-1].
     /// Returns nullopt on any truncation or header mismatch.
-    /// ALL views (groupId, memberId, subscribedTopicIds) are zero-copy into buf —
+    /// ALL views (groupId, memberId, subscribedTopicIds, filter) are zero-copy into buf —
     /// buf must outlive the decoded result.  No heap allocation.
-    static std::optional<JoinGroup> decode(const uint8_t* buf, std::size_t avail) noexcept {
+    /// `clientVersion` is the session's negotiated version: the filter trailer is parsed only when
+    /// clientUnderstandsFilters(clientVersion); for an older session any bytes after the topic ids are ignored
+    /// (spec E13).  The default parses the trailer.
+    static std::optional<JoinGroup> decode(const uint8_t* buf, std::size_t avail,
+                                           int32_t clientVersion = kClientVersion) noexcept {
         auto hdrOpt = MessageHeader::decode(buf, avail);
         if (!hdrOpt) return std::nullopt;
         const MessageHeader& hdr = *hdrOpt;
@@ -156,6 +173,16 @@ struct JoinGroup {
         pos += 2;
         if (pos + static_cast<std::size_t>(count) * 4u > avail) return std::nullopt;
         msg.subscribedTopicIds = Int32ArrayView(buf + pos, count);
+        pos += static_cast<std::size_t>(count) * 4u;
+
+        // client version 10: optional group filter; any byte left starts the trailer, so a half length
+        // prefix or a length past the end is a clean decode failure.
+        if (clientUnderstandsFilters(clientVersion) && avail > pos) {
+            const uint8_t* fData = nullptr;
+            uint16_t       fLen  = 0;
+            if (!getVarBytes(buf, avail, pos, fData, fLen)) return std::nullopt;
+            msg.filter = std::span<const uint8_t>(fData, fLen);
+        }
 
         return msg;
     }
@@ -176,7 +203,15 @@ struct JoinGroup {
 //   [33..]    memberId bytes
 //
 // Total = 24 + 7 + 2 + memberId.size()
+//
+// Client version 10: a refused join (e.g. a filter mismatch) carries a trailing
+//   [..+2] detail length : uint16, [..] detail bytes (utf-8)
+// after memberId, written only when `detail` is non-empty AND the session is >= kClientVersionFilter.
 // ---------------------------------------------------------------------------
+/// A JoinGroup whose filter differs from the group's is answered {InvalidRequest, detail} where detail starts
+/// with exactly this prefix (then ": the group uses filter <hex>").
+inline constexpr std::string_view kGroupFilterMismatchPrefix = "group filter mismatch";
+
 struct JoinGroupResponse {
     int64_t  sessionId     = 0;
     int64_t  correlationId = 0;
@@ -184,20 +219,26 @@ struct JoinGroupResponse {
     int32_t  generationId  = 0;
     uint8_t  isLeader      = 0;         // 1 = this member is the group leader
     int16_t  errorCode     = 0;         // ErrorCode value; 0 = OK
+    std::string_view detail;            // client version 10: refusal text; empty = none (view)
 
     static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::JoinGroupResponse); // 33
     static constexpr uint16_t BODY_FIXED  = 7;  // generationId(4) + isLeader(1) + errorCode(2)
 
-    /// Total encoded size.
+    /// Total encoded size WITHOUT the detail trailer (what a session below 10 is sent).
     std::size_t encodedSize() const noexcept {
         return MessageHeader::ENCODED_SIZE
              + BODY_FIXED
              + 2u + memberId.size();
     }
 
-    /// Encode the full frame into buf.  buf must be >= encodedSize() bytes.
-    /// Returns total bytes written.
-    std::size_t encode(uint8_t* buf) const noexcept {
+    /// Total encoded size for a session >= kClientVersionFilter (adds the detail trailer when non-empty).
+    std::size_t encodedSizeWithDetail() const noexcept {
+        return encodedSize() + (detail.empty() ? 0u : 2u + clampedDetail());
+    }
+
+    /// Encode the full frame into buf.  buf must be >= encodedSizeWithDetail() bytes.  The detail trailer is
+    /// written only when non-empty and clientUnderstandsFilters(clientVersion).  Returns total bytes written.
+    std::size_t encode(uint8_t* buf, int32_t clientVersion = kClientVersion) const noexcept {
         MessageHeader hdr;
         hdr.blockLength   = BODY_FIXED;
         hdr.templateId    = TEMPLATE_ID;
@@ -218,6 +259,11 @@ struct JoinGroupResponse {
         pos += putVarBytes(buf + pos,
                            memberId.data(),
                            static_cast<uint16_t>(memberId.size()));
+
+        if (!detail.empty() && clientUnderstandsFilters(clientVersion)) {
+            pos += putVarBytes(buf + pos, reinterpret_cast<const uint8_t*>(detail.data()),
+                               static_cast<uint16_t>(clampedDetail()));
+        }
         return pos;
     }
 
@@ -249,8 +295,19 @@ struct JoinGroupResponse {
         if (!getVarBytes(buf, avail, pos, memberIdData, memberIdLen)) return std::nullopt;
         msg.memberId = std::span<const uint8_t>(memberIdData, memberIdLen);
 
+        // client version 10: optional trailing detail; a truncated one is a clean failure
+        if (avail > pos) {
+            const uint8_t* dData = nullptr;
+            uint16_t       dLen  = 0;
+            if (!getVarBytes(buf, avail, pos, dData, dLen)) return std::nullopt;
+            msg.detail = std::string_view(reinterpret_cast<const char*>(dData), dLen);
+        }
+
         return msg;
     }
+
+private:
+    std::size_t clampedDetail() const noexcept { return detail.size() > 0xFFFFu ? 0xFFFFu : detail.size(); }
 };
 
 // ---------------------------------------------------------------------------

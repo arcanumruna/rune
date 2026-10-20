@@ -18,6 +18,7 @@
 #include <climits>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace rpc = rune::protocol::client;
@@ -927,4 +928,121 @@ TEST(GroupConformance, AssignEmptyRevokeGolden) {
     EXPECT_EQ(decoded->correlationId,     kGoldCorrelation);
     EXPECT_EQ(decoded->generationId,      7);
     EXPECT_EQ(decoded->assignment.size(), 0u);
+}
+
+// ===========================================================================
+// Phase 2c (client v10): JoinGroup filter trailer, JoinGroupResponse detail
+// ===========================================================================
+namespace {
+rpc::JoinGroup fixedJoin(std::span<const uint8_t> grp, std::span<const uint8_t> mbr) {
+    rpc::JoinGroup msg;
+    msg.sessionId = 11; msg.correlationId = 12; msg.sessionTimeoutMs = 30000;
+    msg.groupId = grp; msg.memberId = mbr;
+    return msg;
+}
+const std::array<uint8_t, 3> kGrp{'g', 'r', 'p'};
+const std::array<uint8_t, 2> kMbr{'m', '1'};
+const std::array<int32_t, 2> kTopics{7, 9};
+} // namespace
+
+TEST(JoinGroupFilterRegression, UnfilteredJoinIsByteIdenticalRegression) {
+    rpc::JoinGroup msg = fixedJoin(kGrp, kMbr);
+    const std::size_t v9Size = 24 + 4 + (2 + 3) + (2 + 2) + (2 + 8);   // = 47
+    ASSERT_EQ(rpc::JoinGroup::encodedSizeFor(kGrp, kMbr, 2), v9Size);
+    std::array<uint8_t, 128> buf{};
+    ASSERT_EQ(msg.encode(buf.data(), kTopics), v9Size);
+    auto d = rpc::JoinGroup::decode(buf.data(), v9Size);
+    ASSERT_TRUE(d.has_value());
+    EXPECT_TRUE(d->filter.empty());
+    EXPECT_EQ(d->subscribedTopicIds.size(), 2u);
+}
+
+TEST(JoinGroupFilterRegression, FilterRoundTripsRegression) {
+    rpc::JoinGroup msg = fixedJoin(kGrp, kMbr);
+    const std::array<uint8_t, 11> f{1, 1, 5, 0, 4, 1, 1, 0xAA, 0xBB, 0xCC, 0xDD};
+    msg.filter = f;
+    const std::size_t n = 47u + 2u + 11u;
+    ASSERT_EQ(rpc::JoinGroup::encodedSizeFor(kGrp, kMbr, 2, f.size()), n);
+    std::array<uint8_t, 128> buf{};
+    ASSERT_EQ(msg.encode(buf.data(), kTopics), n);
+    auto d = rpc::JoinGroup::decode(buf.data(), n);
+    ASSERT_TRUE(d.has_value());
+    ASSERT_EQ(d->filter.size(), 11u);
+    EXPECT_EQ(std::memcmp(d->filter.data(), f.data(), 11), 0);
+    EXPECT_EQ(d->subscribedTopicIds.size(), 2u);
+    // Pre-v10 session: trailer ignored, everything else intact.
+    auto d9 = rpc::JoinGroup::decode(buf.data(), n, rpc::kClientVersionAuth);
+    ASSERT_TRUE(d9.has_value());
+    EXPECT_TRUE(d9->filter.empty());
+    EXPECT_EQ(d9->subscribedTopicIds.size(), 2u);
+    EXPECT_TRUE(rpc::JoinGroup::decode(buf.data(), 48, rpc::kClientVersionAuth).has_value());
+}
+
+TEST(JoinGroupFilterRegression, TruncatedTrailerIsUndecodableRegression) {
+    rpc::JoinGroup msg = fixedJoin(kGrp, kMbr);
+    const std::array<uint8_t, 11> f{};
+    msg.filter = f;
+    std::array<uint8_t, 128> buf{};
+    const std::size_t n = msg.encode(buf.data(), kTopics);
+    for (std::size_t cut = 48; cut < n; ++cut) {   // 48 = half a length prefix
+        EXPECT_FALSE(rpc::JoinGroup::decode(buf.data(), cut).has_value()) << "cut " << cut;
+    }
+    EXPECT_TRUE(rpc::JoinGroup::decode(buf.data(), 47).has_value());
+}
+
+TEST(JoinGroupFilterRegression, MaxFilterIsAcceptedRegression) {
+    rpc::JoinGroup msg = fixedJoin(kGrp, kMbr);
+    std::vector<uint8_t> f(8234, 0x5A);
+    msg.filter = f;
+    std::vector<uint8_t> buf(rpc::JoinGroup::encodedSizeFor(kGrp, kMbr, 2, f.size()));
+    ASSERT_EQ(msg.encode(buf.data(), kTopics), buf.size());
+    auto d = rpc::JoinGroup::decode(buf.data(), buf.size());
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(d->filter.size(), 8234u);
+}
+
+TEST(JoinGroupResponseDetailRegression, DetailRoundTripsRegression) {
+    rpc::JoinGroupResponse r;
+    r.sessionId = 1; r.correlationId = 2; r.generationId = 3; r.isLeader = 0; r.errorCode = 39;
+    r.memberId = kMbr;
+    r.detail = "group filter mismatch: the group uses filter 0101";
+    std::array<uint8_t, 128> buf{};
+    ASSERT_EQ(r.encodedSize(), 24u + 7u + 2u + 2u);
+    ASSERT_EQ(r.encodedSizeWithDetail(), r.encodedSize() + 2u + r.detail.size());
+    const std::size_t n = r.encode(buf.data(), rpc::kClientVersionFilter);
+    ASSERT_EQ(n, r.encodedSizeWithDetail());
+    auto d = rpc::JoinGroupResponse::decode(buf.data(), n);
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(d->detail, r.detail);
+    EXPECT_EQ(d->memberId.size(), 2u);
+    EXPECT_EQ(d->errorCode, 39);
+    // prefix decodes alone; truncated trailer fails cleanly
+    auto dp = rpc::JoinGroupResponse::decode(buf.data(), r.encodedSize());
+    ASSERT_TRUE(dp.has_value());
+    EXPECT_TRUE(dp->detail.empty());
+    EXPECT_FALSE(rpc::JoinGroupResponse::decode(buf.data(), r.encodedSize() + 1).has_value());
+    EXPECT_FALSE(rpc::JoinGroupResponse::decode(buf.data(), n - 1).has_value());
+}
+
+TEST(JoinGroupResponseDetailRegression, DetailOnlyForV10AndEmptyOmittedAndMaxRoundTripsRegression) {
+    rpc::JoinGroupResponse r;
+    r.errorCode = 39; r.memberId = kMbr; r.detail = "x";
+    std::array<uint8_t, 128> buf{};
+    EXPECT_EQ(r.encode(buf.data(), rpc::kClientVersionAuth), r.encodedSize());   // old client: no trailer
+    EXPECT_GT(r.encode(buf.data(), rpc::kClientVersionFilter), r.encodedSize());
+    r.detail = {};
+    EXPECT_EQ(r.encodedSizeWithDetail(), r.encodedSize());
+    EXPECT_EQ(r.encode(buf.data(), rpc::kClientVersionFilter), r.encodedSize());
+
+    const std::string big(65535, 'z');
+    r.detail = big;
+    std::vector<uint8_t> big_buf(r.encodedSizeWithDetail());
+    ASSERT_EQ(r.encode(big_buf.data()), big_buf.size());
+    auto d = rpc::JoinGroupResponse::decode(big_buf.data(), big_buf.size());
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(d->detail.size(), 65535u);
+}
+
+TEST(JoinGroupFilterRegression, MismatchPrefixIsExactRegression) {
+    EXPECT_EQ(rpc::kGroupFilterMismatchPrefix, std::string_view("group filter mismatch"));
 }

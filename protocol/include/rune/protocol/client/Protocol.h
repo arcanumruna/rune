@@ -288,9 +288,16 @@ inline constexpr int32_t kClientVersionLineageNote                = 7;
 //   SecurityDdl{AlterUser self SetPassword}.  SecurityDdl (79) / SecurityBootstrap (80) are answered by
 //   DdlResponse (78).  An authentication-enabled broker answers a Connect below 9 ConnectResponse{ProtocolVersion}.
 //   ConnectResponse v9 (blockLength 21) carries authMode and authState.
+// 10 — Phase 2c subscription filters: `Subscribe` and `JoinGroup` may carry a trailing filter (`[u16 len][bytes]`,
+//   canonical format in `rune/codec/FilterWire.h`; omitted = no filter). A broker >= 6 serves it and answers a refused
+//   filter `SubscribeResponse` / `JoinGroupResponse` `{InvalidRequest, detail}`, the detail in a trailing
+//   `[u16 len][utf-8]` field sent only to sessions >= 10. A broker below 6 would ignore the trailer, so a client sends
+//   a filter only to a session whose `ConnectResponse.brokerVersion >= kBrokerVersionFilter`. A session below 10 never
+//   has a filter trailer parsed (any bytes after the key / topic ids are ignored) and never sees a detail trailer.
 inline constexpr int32_t kClientVersionCatalog                    = 8;
 inline constexpr int32_t kClientVersionAuth                       = 9;
-inline constexpr int32_t kClientVersion                           = 9;   // what this protocol's client announces
+inline constexpr int32_t kClientVersionFilter                     = 10;  // subscription filters (Phase 2c)
+inline constexpr int32_t kClientVersion                           = 10;  // what this protocol's client announces
 
 // Subscribe{topicId = kCatalogTopicId, partition 0, partitionKnown 1} reads
 // the `__catalog` log (catalog history) from ANY broker — see DataMessages.h
@@ -317,10 +324,13 @@ enum class AuthState : uint8_t { MustAuthenticate = 0, ResumedAuthenticated = 1,
 //   4 — client<->broker TLS/AEAD (Task 4): may choose a cipher / send
 //       handshake bytes on ConnectResponse. See kBrokerVersionCrypto.
 //   5 — authentication: ConnectResponse v9 carries authMode / authState (see client version 9).
+//   6 — Phase 2c subscription filters: serves the Subscribe / JoinGroup filter trailer and answers a refused filter with
+//       a detail string to sessions >= 10 (see client version 10).
 // ---------------------------------------------------------------------------
 inline constexpr int32_t kBrokerVersionExplicitGroupSubscriptions = 3;
 inline constexpr int32_t kBrokerVersionAuth                       = 5;   // authentication (ConnectResponse v9 fields)
-inline constexpr int32_t kBrokerVersion                           = 5;   // what this protocol's broker announces
+inline constexpr int32_t kBrokerVersionFilter                     = 6;   // subscription filters (Phase 2c)
+inline constexpr int32_t kBrokerVersion                           = 6;   // what this protocol's broker announces
 
 /// True when a session that connected with `clientVersion` handles
 /// InvalidRequest (39) as non-retriable on every response type (see version 5).
@@ -363,6 +373,12 @@ inline constexpr int32_t kBrokerVersion                           = 5;   // what
 /// (version 9): templates 12-15, 79, 80 and codes 44-47.
 [[nodiscard]] constexpr bool clientUnderstandsAuth(int32_t clientVersion) noexcept {
     return clientVersion >= kClientVersionAuth;
+}
+
+/// True when a session that connected with `clientVersion` may carry a filter trailer on Subscribe / JoinGroup and
+/// is sent the refusal `detail` trailer on their responses (version 10).  Below 10 the trailer is never parsed or sent.
+[[nodiscard]] constexpr bool clientUnderstandsFilters(int32_t clientVersion) noexcept {
+    return clientVersion >= kClientVersionFilter;
 }
 
 /// The produce error code a session that connected with `clientVersion` is

@@ -188,6 +188,7 @@ if(BUILD_TESTING)
         tests/node/CatalogReadServerTest.cpp
         tests/node/CatalogGatesRegressionTest.cpp
         tests/node/WorkerOwnedIndexRegressionTest.cpp
+        tests/node/WorkerOpWireRegressionTest.cpp
         tests/node/WorkerDroppedTopicRegressionTest.cpp
         tests/node/ReplicationFrameLimitsRegressionTest.cpp
         )

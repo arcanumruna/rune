@@ -79,6 +79,7 @@ inline SecurityBootstrap bootstrap() {
 inline ConnectResponse connectResponseV9() {
     ConnectResponse m; m.sessionId = kSession; m.correlationId = kCorr; m.code = 0; m.leaderMemberId = 2;
     m.assignedSessionId = static_cast<int64_t>(0xDEADBEEFULL);
+    m.brokerVersion = kBrokerVersionAuth;   // the v9 golden vector pins broker version 5 (kBrokerVersion is now 6)
     m.v9 = true; m.authMode = AuthMode::Required; m.authState = AuthState::MustAuthenticate; return m;
 }
 inline ConnectResponse connectResponseV9Crypto() {

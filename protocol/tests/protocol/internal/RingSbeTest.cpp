@@ -341,8 +341,13 @@ TEST(RingSbeRegression, AuthOpTypesAndTailKindsArePinned) {
     EXPECT_EQ(sbe::TailKind::get(9), sbe::TailKind::Value::PEER_KEYS);
     EXPECT_STREQ(sbe::TailKind::c_str(sbe::TailKind::Value::PERMISSION_BITS), "PERMISSION_BITS");
     EXPECT_STREQ(sbe::TailKind::c_str(sbe::TailKind::Value::PEER_KEYS), "PEER_KEYS");
-    EXPECT_THROW((void)sbe::OpType::get(23), std::runtime_error);
-    EXPECT_THROW((void)sbe::TailKind::get(10), std::runtime_error);
+    // Phase 2c (filters): appended, never reused.
+    EXPECT_EQ(sbe::OpType::get(23), sbe::OpType::Value::FILTER_SCHEMA);
+    EXPECT_EQ(sbe::TailKind::get(10), sbe::TailKind::Value::FILTER);
+    EXPECT_STREQ(sbe::OpType::c_str(sbe::OpType::Value::FILTER_SCHEMA), "FILTER_SCHEMA");
+    EXPECT_STREQ(sbe::TailKind::c_str(sbe::TailKind::Value::FILTER), "FILTER");
+    EXPECT_THROW((void)sbe::OpType::get(24), std::runtime_error);
+    EXPECT_THROW((void)sbe::TailKind::get(11), std::runtime_error);
 }
 
 // ---------------------------------------------------------------------------
