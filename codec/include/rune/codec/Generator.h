@@ -26,6 +26,10 @@ namespace rune::codec {
 ///     std::span<const uint8_t> over the content).  TypedTopic::send routes by
 ///     Key(rec.key()); a schema with no key field gets no key() and its typed
 ///     records go to partition 0 with an empty record key.
+///   - Phase 2c — a nested `Filter` (filter-by-example, spec §4): one ::rune::Match<T> member per live
+///     filterable field (fixed-width integers, enum, bool, string(N<=16); none for string / bytes / float64 or
+///     retired fields), in schema field order, plus `encodeTo(span)` (constexpr, noexcept, no allocation) and
+///     `encode()` (throws std::invalid_argument).  E::Filter{} is "no filter".
 ///   - Phase 2b Part B — for a schema whose fields are ALL fixed-size (no
 ///     string / bytes): `<Struct>Encoder` (zero-copy writer over a claimed
 ///     std::span<uint8_t>: chainable setters, kBlockLength, kEncodedLength,
@@ -33,7 +37,8 @@ namespace rune::codec {
 ///     `<Struct>::Encoder` / `<Struct>::Decoder`.
 ///
 /// @throws std::invalid_argument if the descriptor has a key field AND a field
-///         named "key" (the member would collide with the key() accessor).
+///         named "key" (the member would collide with the key() accessor), or a
+///         field named "Filter" (it would collide with the generated filter type).
 ///
 /// @param d       The descriptor to generate code for.
 /// @param nspace  The C++ namespace to emit the struct in (default "rune::gen").

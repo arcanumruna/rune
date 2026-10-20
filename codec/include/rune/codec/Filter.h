@@ -197,6 +197,34 @@ public:
         ++terms_;
     }
 
+    /// Runtime-built terms (FilterBuilder): `keys` are already normalized FilterKeys of the field's `width`
+    /// (any order, duplicates allowed); they are sorted and de-duplicated here exactly like Match values, so the
+    /// bytes equal the Match overload's.  `op` is kept as given (an In with one value stays In, like anyOf(x)).
+    constexpr void term(uint16_t tag, PrimType type, uint8_t width, FilterOp op, std::span<const FilterKey> keys) noexcept {
+        if (err_) return;
+        const uint8_t idx = terms_;
+        if (width == 0 || filterValueWidth(type, width) != width) { fail_({FilterErrorKind::TypeMismatch, idx, tag}); return; }
+        if (terms_ == kMaxFilterTerms) { fail_({FilterErrorKind::TooManyTerms, 0xFF, tag}); return; }
+        if (terms_ > 0 && tag <= lastTag_) { fail_({FilterErrorKind::NotCanonical, idx, tag}); return; }
+        if (keys.size() > kMaxFilterInValues) { fail_({FilterErrorKind::TooManyValues, idx, tag}); return; }
+        if (keys.empty()) { fail_({FilterErrorKind::ValueCount, idx, tag}); return; }
+        if (pos_ + kFilterTermHeaderBytes + keys.size() * width > out_.size()) { fail_({FilterErrorKind::BufferTooSmall, idx, tag}); return; }
+        out_[pos_++] = static_cast<uint8_t>(tag); out_[pos_++] = static_cast<uint8_t>(tag >> 8);
+        out_[pos_++] = static_cast<uint8_t>(type);
+        out_[pos_++] = static_cast<uint8_t>(op);
+        const std::size_t countAt = pos_++;
+        const std::size_t first = pos_;
+        uint8_t count = 0;
+        for (const FilterKey& k : keys) {
+            storeKey_(pos_, k, width);
+            pos_ += width;
+            if (!insertSorted_(first, count, width)) pos_ -= width; else ++count;
+        }
+        out_[countAt] = count;
+        lastTag_ = tag;
+        ++terms_;
+    }
+
     [[nodiscard]] constexpr std::expected<std::size_t, FilterError> finish() noexcept {
         if (err_) return std::unexpected(*err_);
         if (terms_ == 0) return std::size_t{0};

@@ -1,5 +1,6 @@
 // src/Generator.cpp
 #include <rune/codec/Generator.h>
+#include <rune/codec/FilterWire.h>
 #include <rune/codec/Serialize.h>
 #include <sstream>
 #include <cctype>
@@ -270,9 +271,93 @@ static void emitDecoder(std::ostringstream& o, const Descriptor& d, const std::s
     o << "};\n\n";
 }
 
+// ─── Phase 2c: the nested filter-by-example struct (spec §4) ──────────────────
+
+static std::string filterTypeName(const FieldDescriptor& f) {
+    switch (f.type) {
+        case PrimType::Int32:    return "int32";
+        case PrimType::Int64:    return "int64";
+        case PrimType::UInt16:   return "uint16";
+        case PrimType::UInt32:   return "uint32";
+        case PrimType::UInt64:   return "uint64";
+        case PrimType::Enum:     return "enum";
+        case PrimType::Bool:     return "bool";
+        case PrimType::Float64:  return "float64";
+        case PrimType::String:   return "string";
+        case PrimType::Bytes:    return "bytes";
+        case PrimType::FixedStr: return "string(" + std::to_string(f.fixedLen) + ")";
+    }
+    return "?";
+}
+
+static std::string_view primTypeEnumName(PrimType t) noexcept {
+    switch (t) {
+        case PrimType::Int32:    return "Int32";
+        case PrimType::Int64:    return "Int64";
+        case PrimType::UInt16:   return "UInt16";
+        case PrimType::UInt32:   return "UInt32";
+        case PrimType::UInt64:   return "UInt64";
+        case PrimType::Enum:     return "Enum";
+        case PrimType::Bool:     return "Bool";
+        case PrimType::FixedStr: return "FixedStr";
+        default:                 return "";
+    }
+}
+
+static void emitFilter(std::ostringstream& o, const Descriptor& d) {
+    std::vector<const FieldDescriptor*> live;      // eligible live fields, declaration order
+    std::vector<const FieldDescriptor*> skipped;   // live but not filterable
+    for (const auto& f : d.fields) {
+        if (f.untilVersion != 0xFFFF) continue;
+        (isFilterable(f) ? live : skipped).push_back(&f);
+    }
+    o << "    /// Phase 2c filter-by-example (spec §4).  Members follow the schema's field order (designated initializers\n";
+    o << "    /// must too): ";
+    for (std::size_t i = 0; i < live.size(); ++i)
+        o << (i ? ", " : "") << live[i]->name << " (tag " << live[i]->id << ", " << filterTypeName(*live[i]) << ")";
+    if (live.empty()) o << "(no filterable field)";
+    o << ".";
+    if (!skipped.empty()) {
+        o << "  Not filterable: ";
+        for (std::size_t i = 0; i < skipped.size(); ++i)
+            o << (i ? ", " : "") << skipped[i]->name << " (" << filterTypeName(*skipped[i]) << ")";
+        o << ".";
+    }
+    o << "\n";
+    o << "    struct Filter {\n";
+    for (const auto* f : live) {
+        if (f->type == PrimType::FixedStr)
+            o << "        ::rune::Match<std::array<char, " << f->fixedLen << ">> " << f->name << "{};\n";
+        else
+            o << "        ::rune::Match<" << cppType(f->type) << "> " << f->name << "{};\n";
+    }
+    o << "        [[nodiscard]] constexpr std::expected<std::size_t, ::rune::codec::FilterError> encodeTo(std::span<uint8_t> out) const noexcept {\n";
+    o << "            ::rune::codec::FilterWriter w(out);\n";
+    std::vector<const FieldDescriptor*> byTag = live;
+    std::sort(byTag.begin(), byTag.end(), [](const FieldDescriptor* a, const FieldDescriptor* b) { return a->id < b->id; });
+    for (const auto* f : byTag) {
+        o << "            w.term(" << f->id << ", ::rune::codec::PrimType::" << primTypeEnumName(f->type) << ", "
+          << static_cast<unsigned>(filterValueWidth(f->type, f->fixedLen)) << ", " << f->name << ");\n";
+    }
+    o << "            return w.finish();\n";
+    o << "        }\n";
+    o << "        /// Throws std::invalid_argument(describe(error)) — explicit, before anything is sent.\n";
+    o << "        [[nodiscard]] ::rune::codec::FilterBytes encode() const {\n";
+    o << "            ::rune::codec::FilterBytes b;\n";
+    o << "            auto r = encodeTo(std::span<uint8_t>(b.bytes.data(), b.bytes.size()));\n";
+    o << "            if (!r) throw std::invalid_argument(::rune::codec::describe(r.error()));\n";
+    o << "            b.len = static_cast<uint16_t>(*r);\n";
+    o << "            return b;\n";
+    o << "        }\n";
+    o << "    };\n\n";
+}
+
 // ─── generateHeader ───────────────────────────────────────────────────────────
 
 std::string generateHeader(const Descriptor& d, std::string_view nspace) {
+    if (d.find("Filter") != nullptr)
+        throw std::invalid_argument("generateHeader: schema '" + d.name +
+            "' has a field named 'Filter', which collides with the generated filter type — rename the field");
     // Compute derived values
     const uint64_t fp   = fingerprint(d);
     const std::string structName = toPascalCase(d.name);
@@ -306,11 +391,13 @@ std::string generateHeader(const Descriptor& d, std::string_view nspace) {
     o << "#include <cstddef>\n";
     o << "#include <cstdint>\n";
     o << "#include <cstring>\n";
+    o << "#include <expected>\n";
     o << "#include <span>\n";
     o << "#include <stdexcept>\n";
     o << "#include <string_view>\n";
     o << "#include <vector>\n";
     o << "#include <rune/codec/Descriptor.h>\n";
+    o << "#include <rune/codec/Filter.h>\n";
     o << "#include <rune/codec/Fingerprint.h>\n";
     o << "#include <rune/codec/Flyweight.h>\n";
     o << "#include <rune/codec/Serialize.h>\n";
@@ -362,6 +449,8 @@ std::string generateHeader(const Descriptor& d, std::string_view nspace) {
         }
     }
     o << "\n";
+
+    emitFilter(o, d);
 
     // ── key() — Phase 2b Part C ─────────────────────────────────────────────
     // The isKey field's value in the exact form rune::client::Key consumes, so

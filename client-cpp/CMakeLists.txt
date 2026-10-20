@@ -202,7 +202,8 @@ add_library(rune_codec STATIC
     ${RUNE_CODEC_ROOT}/src/Generator.cpp
     ${RUNE_CODEC_ROOT}/src/AlterOps.cpp
     ${RUNE_CODEC_ROOT}/src/Evolve.cpp
-    ${RUNE_CODEC_ROOT}/src/FilterSchema.cpp)
+    ${RUNE_CODEC_ROOT}/src/FilterSchema.cpp
+    ${RUNE_CODEC_ROOT}/src/FilterBuilder.cpp)
 target_include_directories(rune_codec PUBLIC ${RUNE_CODEC_ROOT}/include)
 target_compile_features(rune_codec PUBLIC cxx_std_23)
 endif()
@@ -256,7 +257,8 @@ set(RUNE_CLAIM_GEN_HEADERS
     "${RUNE_CLAIM_GEN_DIR}/gen/tick_sample.gen.h"
     "${RUNE_CLAIM_GEN_DIR}/gen/long_key.gen.h"
     "${RUNE_CLAIM_GEN_DIR}/gen/short_key.gen.h"
-    "${RUNE_CLAIM_GEN_DIR}/gen/eos_out.gen.h")
+    "${RUNE_CLAIM_GEN_DIR}/gen/eos_out.gen.h"
+    "${RUNE_CLAIM_GEN_DIR}/gen/player_event.gen.h")
 add_custom_command(
     OUTPUT  ${RUNE_CLAIM_GEN_HEADERS}
     COMMAND $<TARGET_FILE:rune_gen_claim_schemas> "${RUNE_CLAIM_GEN_DIR}/gen"
@@ -1048,8 +1050,10 @@ if(BUILD_TESTING)
     add_executable(rune_schema_codec_smoke_tests
         tests/SchemaCodecSmokeTest.cpp
         tests/client/ViewPlanAuthorTest.cpp
+        tests/client/PlayerEventSchemaTest.cpp   # Phase 2c Task 4
     )
-    target_include_directories(rune_schema_codec_smoke_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_include_directories(rune_schema_codec_smoke_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include "${RUNE_CLAIM_GEN_DIR}/gen")
+    add_dependencies(rune_schema_codec_smoke_tests generate_claim_schema_headers)
     target_link_libraries(rune_schema_codec_smoke_tests PRIVATE rune_codec GTest::gtest_main)
     gtest_discover_tests(rune_schema_codec_smoke_tests)
 

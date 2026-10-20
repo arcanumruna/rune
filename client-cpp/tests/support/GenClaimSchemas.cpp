@@ -12,6 +12,8 @@
 #include <rune/codec/Descriptor.h>
 #include <rune/codec/Generator.h>
 
+#include "../../examples/filter/PlayerEventSchema.h"
+
 #include <cstdio>
 #include <fstream>
 #include <string>
@@ -68,7 +70,8 @@ int main(int argc, char** argv) {
     return write(dir + "/position.gen.h", position) && write(dir + "/tick_sample.gen.h", tick) &&
                    write(dir + "/long_key.gen.h", longKey) &&
                    write(dir + "/short_key.gen.h", shortKey) &&
-                   write(dir + "/eos_out.gen.h", eosOut)
+                   write(dir + "/eos_out.gen.h", eosOut) &&
+                   write(dir + "/player_event.gen.h", rune::examples::playerEventDescriptor())
                ? 0
                : 1;
 }

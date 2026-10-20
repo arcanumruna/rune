@@ -151,7 +151,8 @@ add_library(rune_codec STATIC
     # per-version materialization (Task 9).
     ${RUNE_CODEC_ROOT}/src/Evolve.cpp
     ${RUNE_CODEC_ROOT}/src/AlterOps.cpp
-    ${RUNE_CODEC_ROOT}/src/FilterSchema.cpp)
+    ${RUNE_CODEC_ROOT}/src/FilterSchema.cpp
+    ${RUNE_CODEC_ROOT}/src/FilterBuilder.cpp)
 target_include_directories(rune_codec PUBLIC ${RUNE_CODEC_ROOT}/include)
 target_compile_features(rune_codec PUBLIC cxx_std_23)
 
