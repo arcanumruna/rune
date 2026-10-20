@@ -420,6 +420,17 @@ if(BUILD_TESTING)
         GTest::gtest_main)
     gtest_discover_tests(rune_worker_tests)
 
+    # Phase 2c Task 6: FilterIndex (value -> members). No Aeron; owns its operator new for the alloc gate.
+    add_executable(rune_filter_engine_tests
+        tests/node/FilterIndexTest.cpp)
+    target_link_libraries(rune_filter_engine_tests PRIVATE
+        rune_node
+        rune_codec
+        GTest::gtest_main)
+    target_compile_definitions(rune_filter_engine_tests PRIVATE RUNE_FILTER_ENGINE_ALLOC_COUNT)
+    gtest_discover_tests(rune_filter_engine_tests PROPERTIES LABELS small)
+    rune_regression_batches(rune_filter_engine_tests 2)
+
     # ---------------------------------------------------------------------------
     # E1 Task 3: WorkerPool unit tests — N workers, deterministic single-owner
     # assignment via ShardRouter, co-partition affinity, assignFromRegistry.
