@@ -162,6 +162,48 @@ struct Harness {
         return d;
     }
 
+    using Rec = std::pair<std::vector<uint8_t>, std::vector<uint8_t>>;
+
+    // Folds `recs` as ONE batch in two passes split after `firstPass` records
+    // (1 <= firstPass < recs.size()): pass 1 is capped by `bound`, pass 2 resumes
+    // mid-batch from the cursor. Returns both passes' dirty entries summed. Each
+    // pass is also checked: at most (records in the pass) x the per-record bound
+    // per table (dirty entries coalesce inside a pass), and no RescanPending cache.
+    Drained applySplit(const std::vector<Rec>& recs, size_t firstPass) {
+        rune::protocol::RecordBatchBuilder b(next, 0);
+        for (const auto& [k, v] : recs) {
+            b.append(std::string_view(reinterpret_cast<const char*>(k.data()), k.size()),
+                     std::string_view(reinterpret_cast<const char*>(v.data()), v.size()), 0);
+        }
+        const auto batch = b.build();
+        const int64_t full = next + static_cast<int64_t>(recs.size());
+        const int64_t cap  = next + static_cast<int64_t>(firstPass);
+        const rune::storage::LogReadView lv{batch.data(), batch.size(), next, full};
+        const auto perRec = rune::view::aggDirtyBoundPerRecord(agg);
+        Drained total;
+        size_t done = 0;
+        for (const int64_t bnd : {cap, full}) {
+            last = rune::view::foldAggregateBatch(comp.plan, comp.rowLayout, agg, vdc, view,
+                                                  contributors, groups, &blocks, lv, bnd, cursor);
+            inconsistent += last.aggInconsistent;
+            const size_t inPass = static_cast<size_t>(bnd - next) - done;
+            done += inPass;
+            const Drained d = drainCounts();
+            EXPECT_LE(d.contributorRows, inPass * perRec.contributorRows);
+            EXPECT_LE(d.groupRows, inPass * perRec.groupRows);
+            EXPECT_LE(d.viewRows, inPass * perRec.viewRows);
+            EXPECT_LE(d.blockRows, inPass * perRec.blockRows);
+            EXPECT_EQ(d.pendingCaches, 0u);
+            total.contributorRows += d.contributorRows;
+            total.groupRows += d.groupRows;
+            total.viewRows += d.viewRows;
+            total.blockRows += d.blockRows;
+            total.pendingCaches += d.pendingCaches;
+        }
+        next = full;
+        return total;
+    }
+
     // Value-block accessors (Task 5b).
     uint32_t posOf(int64_t orderId) const {
         const uint8_t* c = contributors.get(uint64_t(orderId));
@@ -754,4 +796,245 @@ TEST(AggRetractableRegression, BlockModelAcrossChunkBoundariesMatchesBruteForceR
         if (::testing::Test::HasFailure()) FAIL() << "first failure at step " << step;
     }
     EXPECT_EQ(h.inconsistent, 0u);
+}
+
+// REGRESSION (Review Focus #1/#3, F9): a deterministic history of 3000 steps of
+// 1-4 records each (inserts, in-place updates, group moves, deletes; the same
+// contributor can repeat inside one batch) over 24 contributors / 4 groups, with
+// heavy value duplication. Every 5th multi-record step is folded in two passes
+// split at a random mid-batch boundary (capped-pass resume). After EVERY step:
+// each group's Count(*), Sum, Max, Min, Last, Last(bonus), LastNonNull(bonus)
+// equals a brute-force recomputation; each table's dirty entries are within
+// records x the derived per-record bound; no cache is left RescanPending;
+// nothing is ever inconsistent.
+TEST(AggRetractableRegression, RandomizedOpsMatchBruteForceModelRegression) {
+    struct M { int64_t user; int64_t amount; std::optional<int32_t> bonus; uint64_t seq; };
+    std::map<int64_t, M> live;
+    Harness h;
+    const auto bound = rune::view::aggDirtyBoundPerRecord(h.agg);
+    uint64_t state = 0x9E3779B97F4A7C15ull;
+    auto rnd = [&](uint64_t m) {
+        state = state * 6364136223846793005ull + 1442695040888963407ull;
+        return (state >> 33) % m;
+    };
+    uint64_t seq = 0;
+    for (uint64_t step = 1; step <= 3000; ++step) {
+        const size_t n = 1 + static_cast<size_t>(rnd(4));
+        std::vector<Harness::Rec> recs;
+        for (size_t i = 0; i < n; ++i) {
+            const int64_t id = 1 + static_cast<int64_t>(rnd(24));
+            ++seq;
+            if (rnd(100) < 15) {
+                recs.push_back({Harness::key(id), tombstone()});
+                live.erase(id);
+            } else {
+                Ord o{id, 1 + static_cast<int64_t>(rnd(4)), static_cast<int64_t>(rnd(41)) - 20};
+                if (rnd(2) == 0) o.bonus = static_cast<int32_t>(rnd(9));
+                recs.push_back({Harness::key(id), encode(o)});
+                live[id] = M{o.user, o.amount, o.bonus, seq};
+            }
+        }
+        Harness::Drained d;
+        if (n >= 2 && step % 5 == 0) {
+            d = h.applySplit(recs, 1 + static_cast<size_t>(rnd(n - 1)));   // pass 1 stops mid-batch
+        } else {
+            h.apply(recs);
+            d = h.drainCounts();
+        }
+        ASSERT_LE(d.contributorRows, n * bound.contributorRows) << "step " << step;
+        ASSERT_LE(d.groupRows, n * bound.groupRows) << "step " << step;
+        ASSERT_LE(d.viewRows, n * bound.viewRows) << "step " << step;
+        ASSERT_LE(d.blockRows, n * bound.blockRows) << "step " << step;
+        ASSERT_EQ(d.pendingCaches, 0u) << "step " << step;
+        ASSERT_EQ(h.expectBlocksConsistent({1, 2, 3, 4}), live.size()) << "step " << step;
+        for (int64_t g = 1; g <= 4; ++g) {
+            const M* lastM = nullptr;
+            const M* lastNn = nullptr;
+            int64_t cnt = 0, total = 0, mx = INT64_MIN, mn = INT64_MAX;
+            for (const auto& [k, m] : live) {
+                if (m.user != g) continue;
+                ++cnt; total += m.amount;
+                mx = std::max(mx, m.amount); mn = std::min(mn, m.amount);
+                if (lastM == nullptr || m.seq > lastM->seq) lastM = &m;
+                if (m.bonus && (lastNn == nullptr || m.seq > lastNn->seq)) lastNn = &m;
+            }
+            if (cnt == 0) { ASSERT_FALSE(h.hasGroup(g)) << "step " << step << " group " << g; continue; }
+            ASSERT_EQ(h.col(g, kN).i, cnt) << "step " << step << " group " << g;
+            ASSERT_EQ(h.col(g, kTotal).i, total) << "step " << step;
+            ASSERT_EQ(h.col(g, kMaxAmt).i, mx) << "step " << step << " group " << g;
+            ASSERT_EQ(h.col(g, kMinAmt).i, mn) << "step " << step << " group " << g;
+            ASSERT_EQ(h.col(g, kLastAmt).i, lastM->amount) << "step " << step << " group " << g;
+            const auto lb = h.col(g, kLastBonus);
+            ASSERT_EQ(lb.present, lastM->bonus.has_value()) << "step " << step;
+            if (lastM->bonus) ASSERT_EQ(lb.i, *lastM->bonus) << "step " << step;
+            const auto lnn = h.col(g, kLastNnBonus);
+            ASSERT_EQ(lnn.present, lastNn != nullptr) << "step " << step;
+            if (lastNn != nullptr) ASSERT_EQ(lnn.i, *lastNn->bonus) << "step " << step;
+        }
+    }
+    EXPECT_EQ(h.inconsistent, 0u);
+}
+
+// REGRESSION (F9, op "no-group"): a rewrite whose group key is ABSENT retracts
+// the old contributor from a LINKED group -- unlink, count, cache -- and skips.
+// The source declares the group-by field only from v2 (as AggFoldTest's
+// MissingGroupValueRetractsAndSkips does); a v1 record lacks it.
+TEST(AggRetractableRegression, NoGroupRewriteUnlinksAndRetractsTheContributorRegression) {
+    const auto src = rune::codec::DescriptorBuilder("o", 2)
+        .add("orderId", P::Int64, 1, true)
+        .add("amount", P::Int64, 1)
+        .add("userId", P::Int64, 2)
+        .build();
+    rune::view::ViewPlan v;
+    v.viewName = "t"; v.key = "userId"; v.sources = {{5, "userId"}};
+    v.output = {{"userId", P::Int64, 0, "userId", R::Replace},
+                {"n", P::Int64, 0, "", R::CountAll},
+                {"max", P::Int64, 0, "amount", R::Max},
+                {"last", P::Int64, 0, "amount", R::Last}};
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(v, srcs, 9).value();
+    auto agg = rune::view::buildAggLayout(comp.plan, src).value();
+    ASSERT_TRUE(agg.linked);
+    rune::view::VersionDescriptorCache vdc(src);
+    rune::view::ViewTable view(comp.rowLayout), contributors(agg.contributorRow), groups(agg.groupRow);
+    rune::view::ViewTable blocks(agg.blockRow);   // Max(amount): a value block (Task 5b)
+    int64_t off = 0;
+    auto fold = [&](int64_t id, const std::vector<uint8_t>& value) {
+        rune::protocol::RecordBatchBuilder b(off, 0);
+        const auto k = Harness::key(id);
+        b.append(std::string_view(reinterpret_cast<const char*>(k.data()), 8),
+                 std::string_view(reinterpret_cast<const char*>(value.data()), value.size()), 0);
+        const auto batch = b.build();
+        int64_t cur = off;
+        const auto st = rune::view::foldAggregateBatch(
+            comp.plan, comp.rowLayout, agg, vdc, view, contributors, groups, &blocks,
+            {batch.data(), batch.size(), off, off + 1}, off + 1, cur);
+        ++off;
+        return st;
+    };
+    auto v2 = [&](int64_t id, int64_t amount) {
+        std::vector<uint8_t> b;
+        le16(b, 24); le16(b, 2); le64(b, uint64_t(id)); le64(b, uint64_t(amount)); le64(b, 100);
+        return b;
+    };
+    (void)fold(1, v2(1, 50));
+    (void)fold(2, v2(2, 30));                       // list: 2 (head) -> 1; max 50 held by contributor 1
+    std::vector<uint8_t> v1;
+    le16(v1, 16); le16(v1, 1); le64(v1, 1); le64(v1, 50);   // contributor 1 rewritten WITHOUT userId
+    const auto st = fold(1, v1);
+    EXPECT_EQ(st.skippedNoGroup, 1u);
+    EXPECT_EQ(st.aggInconsistent, 0u);
+    const uint8_t* row = view.get(100);
+    ASSERT_NE(row, nullptr) << "contributor 2 still holds the group";
+    EXPECT_EQ(rune::view::readSlot(row, comp.rowLayout, 1).i, 1);
+    EXPECT_EQ(rune::view::readSlot(row, comp.rowLayout, 2).i, 30) << "the retracted max (50) rescans to 30";
+    EXPECT_EQ(rune::view::readSlot(row, comp.rowLayout, 3).i, 30);
+    EXPECT_EQ(contributors.size(), 1u);
+    EXPECT_EQ(contributors.get(1), nullptr);
+    (void)fold(2, [&] { std::vector<uint8_t> b; le16(b, 16); le16(b, 1); le64(b, 2); le64(b, 30); return b; }());
+    EXPECT_EQ(view.get(100), nullptr) << "the last contributor left: group and list are gone";
+    EXPECT_EQ(contributors.size(), 0u);
+    EXPECT_EQ(blocks.size(), 0u) << "the emptied group's value block (chunk 0) and id are freed";
+}
+
+// REGRESSION (Task 5 review carry-over): Min/Max over negative Int32, UInt16 and
+// Float64 (+-0.0), and Last over UInt16 and Bool, model-checked against brute
+// force across inserts, in-place updates, group moves and deletes. Several
+// records for one contributor fall in a single batch. Retracting a single
+// extreme costs exactly one rescan.
+TEST(AggRetractableRegression, NarrowAndSignedTypesMatchBruteForceRegression) {
+    const auto src = rune::codec::DescriptorBuilder("t", 1)
+        .add("id", P::Int64, 1, true)
+        .add("grp", P::Int64, 1)
+        .add("i32", P::Int32, 1)
+        .add("u16", P::UInt16, 1)
+        .add("f", P::Float64, 1)
+        .add("flag", P::Bool, 1)
+        .build();
+    rune::view::ViewPlan v;
+    v.viewName = "t"; v.key = "grp"; v.sources = {{5, "grp"}};
+    v.output = {{"grp", P::Int64, 0, "grp", R::Replace},
+                {"n", P::Int64, 0, "", R::CountAll},
+                {"maxI", P::Int32, 0, "i32", R::Max},  {"minI", P::Int32, 0, "i32", R::Min},
+                {"maxU", P::UInt16, 0, "u16", R::Max}, {"minU", P::UInt16, 0, "u16", R::Min},
+                {"minF", P::Float64, 0, "f", R::Min},  {"maxF", P::Float64, 0, "f", R::Max},
+                {"lastU", P::UInt16, 0, "u16", R::Last}, {"lastB", P::Bool, 0, "flag", R::Last}};
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(v, srcs, 9).value();
+    auto agg = rune::view::buildAggLayout(comp.plan, src).value();
+    rune::view::VersionDescriptorCache vdc(src);
+    rune::view::ViewTable view(comp.rowLayout), contributors(agg.contributorRow),
+        groups(agg.groupRow), blocks(agg.blockRow);
+    int64_t off = 0, cur = 0;
+    uint64_t inconsistent = 0;
+    struct M { int64_t grp; int32_t i; uint16_t u; double f; bool b; uint64_t seq; };
+    std::map<int64_t, M> live;
+    const double fs[] = {-2.5, -0.0, 0.0, 0.0, 1.5, 3.0};
+    uint64_t state = 0xA24BAED4963EE407ull, seq = 0;
+    auto rnd = [&](uint64_t m) {
+        state = state * 6364136223846793005ull + 1442695040888963407ull;
+        return (state >> 33) % m;
+    };
+    uint32_t rescansSeen = 0;
+    for (int step = 1; step <= 1500; ++step) {
+        const size_t n = 1 + static_cast<size_t>(rnd(3));
+        rune::protocol::RecordBatchBuilder b(off, 0);
+        for (size_t k = 0; k < n; ++k) {
+            const int64_t id = 1 + static_cast<int64_t>(rnd(8));
+            const auto key = Harness::key(id);
+            std::vector<uint8_t> val;
+            ++seq;
+            if (rnd(100) < 20) {
+                live.erase(id);
+            } else {
+                M m{1 + static_cast<int64_t>(rnd(2)), static_cast<int32_t>(rnd(7)) - 3,
+                    static_cast<uint16_t>(rnd(4) * 21845), fs[rnd(6)], rnd(2) == 0, seq};
+                le16(val, 35); le16(val, 1); le64(val, uint64_t(id)); le64(val, uint64_t(m.grp));
+                le32(val, uint32_t(m.i)); le16(val, m.u);
+                uint64_t raw; std::memcpy(&raw, &m.f, 8); le64(val, raw);
+                val.push_back(m.b ? 1 : 0);
+                live[id] = m;
+            }
+            b.append(std::string_view(reinterpret_cast<const char*>(key.data()), key.size()),
+                     std::string_view(reinterpret_cast<const char*>(val.data()), val.size()), 0);
+        }
+        const auto batch = b.build();
+        const int64_t bound = off + static_cast<int64_t>(n);
+        const auto st = rune::view::foldAggregateBatch(
+            comp.plan, comp.rowLayout, agg, vdc, view, contributors, groups, &blocks,
+            {batch.data(), batch.size(), off, bound}, bound, cur);
+        off = bound;
+        inconsistent += st.aggInconsistent;
+        rescansSeen += st.aggRescans;
+        for (int64_t g = 1; g <= 2; ++g) {
+            int64_t cnt = 0, mxI = INT32_MIN, mnI = INT32_MAX;
+            uint16_t mxU = 0, mnU = UINT16_MAX;
+            double mnF = 1e9, mxF = -1e9;
+            const M* lastM = nullptr;
+            for (const auto& [id, m] : live) {
+                if (m.grp != g) continue;
+                ++cnt;
+                mxI = std::max<int64_t>(mxI, m.i); mnI = std::min<int64_t>(mnI, m.i);
+                mxU = std::max(mxU, m.u); mnU = std::min(mnU, m.u);
+                mnF = std::min(mnF, m.f); mxF = std::max(mxF, m.f);
+                if (lastM == nullptr || m.seq > lastM->seq) lastM = &m;
+            }
+            const uint8_t* row = view.get(uint64_t(g));
+            if (cnt == 0) { ASSERT_EQ(row, nullptr) << "step " << step; continue; }
+            ASSERT_NE(row, nullptr) << "step " << step;
+            auto col = [&](uint16_t s) { return rune::view::readSlot(row, comp.rowLayout, s); };
+            ASSERT_EQ(col(1).i, cnt) << "step " << step;
+            ASSERT_EQ(col(2).i, mxI) << "step " << step << " group " << g;
+            ASSERT_EQ(col(3).i, mnI) << "step " << step << " group " << g;
+            ASSERT_EQ(col(4).u, mxU) << "step " << step << " group " << g;
+            ASSERT_EQ(col(5).u, mnU) << "step " << step << " group " << g;
+            ASSERT_EQ(col(6).f, mnF) << "step " << step << " group " << g;
+            ASSERT_EQ(col(7).f, mxF) << "step " << step << " group " << g;
+            ASSERT_EQ(col(8).u, lastM->u) << "step " << step << " group " << g;
+            ASSERT_EQ(col(9).b, lastM->b) << "step " << step << " group " << g;
+        }
+        if (::testing::Test::HasFailure()) FAIL() << "first failure at step " << step;
+    }
+    EXPECT_EQ(inconsistent, 0u);
+    EXPECT_GT(rescansSeen, 0u) << "the history must exercise the rescan path";
 }
