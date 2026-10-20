@@ -40,6 +40,8 @@
 
 #include <rune/protocol/RecordBatch.h>
 
+#include "../tests/support/PlainInitPid.h"
+
 #include <Aeron.h>
 #include <Subscription.h>
 #include <ExclusivePublication.h>
@@ -300,6 +302,13 @@ struct ProducerBenchGateway {
             sendRecordBatch(opt->sessionId, kSubscriptionId,
                             /*baseOffset=*/0);
             subscribesHandled_.fetch_add(1, std::memory_order_relaxed);
+            break;
+        }
+
+        case rcc::TemplateId::InitProducerId: {
+            // Phase 2b F (FD4): an acked producer asks the broker for its id before its first batch leaves.
+            const std::size_t n = test_support::plainInitPidReply(buf, len, /*pid=*/4242, replyBuf);
+            if (n > 0) send(replyBuf, n);
             break;
         }
 
