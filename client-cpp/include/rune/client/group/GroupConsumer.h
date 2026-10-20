@@ -48,6 +48,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <variant>
 #include <vector>
 
 namespace rune::client {
@@ -249,6 +250,7 @@ struct GroupConsumerImpl {
         int64_t  subscriptionId = 0;      // bound by the SubscribeResponse (0 = unanswered)
         bool     offsetKnown    = false;  // OffsetFetch answered (OK) for it this generation
         bool     parked         = false;  // refused: retried on fresh metadata
+        bool     rewound        = false;  // Task 10: restarted by a seek, not yet re-bound (the pending Rewind waits on it)
         uint8_t  redirects      = 0;      // consecutive Redirects without a bind
     };
     std::map<TopicPartition, FetchSub> fetch;
@@ -313,6 +315,19 @@ struct GroupConsumerImpl {
     bool              hasCommitSync {false};
     PendingCommitSync commitSync{};
     int64_t commitSyncCorrId {0};   // 0 = its OffsetCommit not sent yet
+
+    // Phase 2b F (Task 10): the pending rewind (seekToCommitted / seek) — at most one,
+    // each state holds exactly what it needs (duty thread only).  Completed exactly once
+    // (Ok when every rewound partition is re-subscribed; Superseded / Rejoined / Closed /
+    // SessionLost / Timeout otherwise).
+    struct NoRewind {};
+    /// seekToCommitted: waiting for the OffsetFetch answer that re-seeds the rewound partitions.
+    struct RewindAwaitFetch  { OpKind kind = OpKind::SeekToCommitted; detail::OpTarget target{}; Token token = 0; int64_t deadlineNs = 0; int32_t generation = 0; };
+    /// Every rewound partition has its start offset (seekToCommitted: fetched; seek: given): waiting
+    /// for each one's new subscription to bind.
+    struct RewindResubscribe { OpKind kind = OpKind::SeekToCommitted; detail::OpTarget target{}; Token token = 0; int64_t deadlineNs = 0; int32_t generation = 0; };
+    using Rewind = std::variant<NoRewind, RewindAwaitFetch, RewindResubscribe>;
+    Rewind rewind{};
 
     // A generation snapshot the near-full status ring refused (fix1 I4).
     bool statusDirty {false};
@@ -457,6 +472,33 @@ public:
     /// callback.
     void commitSyncAndWait(std::chrono::nanoseconds timeout = std::chrono::seconds(60));
 
+    /// Phase 2b F (Task 10, FD8): rewind every assigned partition to its COMMITTED offset without a
+    /// restart — the consumer half of the exactly-once loop (after a transaction abort).  Each
+    /// partition's fetch subscription is dropped (pushes of the old instance are ignored), its
+    /// position becomes unseeded (auto-commit can never commit a stale position) and one
+    /// OffsetFetch re-seeds it; the new subscriptions start at the answer.  Exactly ONE completion
+    /// (op = OpKind::SeekToCommitted) follows an Accepted return:
+    ///   Ok          — every rewound partition is re-subscribed from its fetched offset;
+    ///   Superseded  — a newer rewind replaced it;   Rejoined — the generation changed first
+    ///   (or the group was not Stable when applied);  SessionLost — the session went down;
+    ///   Timeout     — GroupConfig::commitSyncTimeoutMs of duty time;  Closed — close() / Client close.
+    /// Records already handed to onRecords before the command applied stay delivered.
+    /// Synchronous rejections are those of commitSync.  Callable from inside a callback.
+    OpResult seekToCommitted(CompletionTarget target, Token token);
+    /// Cold-path blocking form; throws std::runtime_error on any non-Ok outcome.
+    void seekToCommittedAndWait(std::chrono::nanoseconds timeout = std::chrono::seconds(60));
+
+    /// Restart ONE assigned partition at `offset` (the others are untouched).  Completion as
+    /// seekToCommitted (op = OpKind::Seek), plus OpStatus::InvalidArgument (payload "partition not
+    /// assigned") when `tp` is not in the assignment — that check needs duty-side state (G6).
+    OpResult seek(TopicPartition tp, int64_t offset, CompletionTarget target, Token token);
+    /// Fire-and-forget: issues the token form with an internal handler and drops the result: an
+    /// unassigned partition is reported only by the token / AndWait forms (G6).
+    void seek(TopicPartition tp, int64_t offset);
+    /// Cold-path blocking form; throws std::invalid_argument for an unassigned partition,
+    /// std::runtime_error on any other non-Ok outcome.
+    void seekAndWait(TopicPartition tp, int64_t offset, std::chrono::nanoseconds timeout = std::chrono::seconds(60));
+
     /// Deactivate this consumer: no more dispatch occurs, a pending commitSync
     /// fails.  Idempotent.  Delivery is guaranteed (a full command ring is
     /// waited out on duty-thread progress, never a timeout); never throws.
@@ -489,6 +531,9 @@ private:
     void setCallback_(int which, Fn cb);
 
     static OpResult issueCommitSync_(void* self, const CompletionTarget& target, Token token);
+    static OpResult issueSeekToCommitted_(void* self, const CompletionTarget& target, Token token);
+    struct SeekIssue;  // seekAndWait's issue context (tp + offset)
+    static OpResult issueSeek_(void* ctx, const CompletionTarget& target, Token token);
     /// F8c C7: the §3.3 release of the handle's share (see the destructor).
     void release_() noexcept;
 

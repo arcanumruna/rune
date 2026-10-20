@@ -101,12 +101,13 @@ struct RegisterProducer {
 //   [48..55] b      : int64
 //   [56..63] c      : int64   (F8c C4: completion-target word)
 //   [64..71] d      : int64   (F8c C5: op payload)
+//   [72..79] e      : int64   (Phase 2b F Task 10: second payload word)
 // ---------------------------------------------------------------------------
 struct HubCommandMsg {
     static constexpr uint16_t    TEMPLATE_ID  = 2;
-    static constexpr uint16_t    BODY_FIXED   = 48;
+    static constexpr uint16_t    BODY_FIXED   = 56;
     static constexpr std::size_t ENCODED_SIZE =
-        pc::MessageHeader::ENCODED_SIZE + BODY_FIXED;  // 72
+        pc::MessageHeader::ENCODED_SIZE + BODY_FIXED;  // 80
 
     static std::size_t encode(const ::rune::client::detail::HubCommand& c, uint8_t* buf) noexcept {
         pc::MessageHeader hdr;
@@ -125,6 +126,7 @@ struct HubCommandMsg {
         pc::detail::putLE64(buf, B + 24, c.b);
         pc::detail::putLE64(buf, B + 32, c.c);
         pc::detail::putLE64(buf, B + 40, c.d);
+        pc::detail::putLE64(buf, B + 48, c.e);
         return ENCODED_SIZE;
     }
 
@@ -143,6 +145,7 @@ struct HubCommandMsg {
         c.b      = pc::detail::getLE64(buf, B + 24);
         c.c      = pc::detail::getLE64(buf, B + 32);
         c.d      = pc::detail::getLE64(buf, B + 40);
+        c.e      = pc::detail::getLE64(buf, B + 48);
         return c;
     }
 };

@@ -1482,6 +1482,7 @@ if(BUILD_TESTING)
             tests/client/CompletionsClientTest.cpp
             tests/client/HandleLifetimeTest.cpp
             tests/client/GroupRoutingRegressionTest.cpp
+            tests/client/GroupSeekTest.cpp
             tests/support/AllocCounter.cpp
         )
         target_include_directories(rune_invoker_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})

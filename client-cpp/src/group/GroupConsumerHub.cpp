@@ -131,10 +131,130 @@ void GroupConsumerHub::completeCommitSync_(GroupConsumerImpl& impl, OpStatus st,
     completions_.deliver(p.target, c);
 }
 
+void GroupConsumerHub::completeRewind_(GroupConsumerImpl& impl, OpStatus st, std::string_view text) {
+    using R = GroupConsumerImpl;
+    OpKind kind{};
+    detail::OpTarget target{};
+    Token token = 0;
+    if (const auto* a = std::get_if<R::RewindAwaitFetch>(&impl.rewind)) { kind = a->kind; target = a->target; token = a->token; }
+    else if (const auto* b = std::get_if<R::RewindResubscribe>(&impl.rewind)) { kind = b->kind; target = b->target; token = b->token; }
+    else return;
+    // Cleared BEFORE delivery: a handler may issue a new rewind (applied directly on this
+    // thread) — it must find none pending to supersede.
+    impl.rewind = R::NoRewind{};
+    for (auto& [tp, fs] : impl.fetch) fs.rewound = false;
+    Completion c;
+    c.token = token;
+    c.op    = kind;
+    c.status = st;
+    completions_.deliver(target, c,
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(text.data()), text.size()));
+}
+
+void GroupConsumerHub::advanceRewind_(GroupConsumerImpl& impl, int64_t nowNs) {
+    using R = GroupConsumerImpl;
+    if (std::holds_alternative<R::NoRewind>(impl.rewind)) return;
+    auto deadline = [&] {
+        if (const auto* a = std::get_if<R::RewindAwaitFetch>(&impl.rewind)) return a->deadlineNs;
+        return std::get<R::RewindResubscribe>(impl.rewind).deadlineNs;
+    }();
+    auto generation = [&] {
+        if (const auto* a = std::get_if<R::RewindAwaitFetch>(&impl.rewind)) return a->generation;
+        return std::get<R::RewindResubscribe>(impl.rewind).generation;
+    }();
+    if (impl.state != GroupConsumerState::Stable || impl.generationId != generation) {
+        completeRewind_(impl, OpStatus::Rejoined);
+        return;
+    }
+    if (nowNs >= deadline) {
+        completeRewind_(impl, OpStatus::Timeout);
+        return;
+    }
+    // A rewound partition is re-bound once its new subscription is answered / fed.
+    bool anyUnknown = false, anyUnbound = false;
+    for (auto& [tp, fs] : impl.fetch) {
+        if (!fs.rewound) continue;
+        if (!fs.offsetKnown) { anyUnknown = true; continue; }
+        if (fs.epoch != 0 && fs.subscriptionId != 0) fs.rewound = false;
+        else anyUnbound = true;
+    }
+    if (auto* a = std::get_if<R::RewindAwaitFetch>(&impl.rewind)) {
+        if (anyUnknown) return;
+        impl.rewind = R::RewindResubscribe{a->kind, a->target, a->token, a->deadlineNs, a->generation};
+    }
+    if (!anyUnknown && !anyUnbound) completeRewind_(impl, OpStatus::Ok);
+}
+
+void GroupConsumerHub::applyRewind_(const detail::HubCommand& cmd, GroupConsumerImpl* impl, int64_t nowNs) {
+    using R = GroupConsumerImpl;
+    const bool isSeek = cmd.op == detail::HubCommand::Op::GroupSeek;
+    const OpKind kind = isSeek ? OpKind::Seek : OpKind::SeekToCommitted;
+    const detail::OpTarget target = detail::decodeTarget(cmd);
+    const Token token = static_cast<Token>(cmd.a);
+    auto reply = [&](OpStatus st, std::string_view text = {}) {
+        Completion c;
+        c.token  = token;
+        c.op     = kind;
+        c.status = st;
+        completions_.deliver(target, c,
+            std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(text.data()), text.size()));
+    };
+    if (impl == nullptr || !impl->active) { reply(OpStatus::Closed); return; }
+    TopicPartition seekTp{};
+    if (isSeek) {
+        seekTp = TopicPartition{static_cast<int32_t>(static_cast<uint64_t>(cmd.e) >> 32),
+                                static_cast<int32_t>(static_cast<uint32_t>(cmd.e))};
+        if (impl->state != GroupConsumerState::Stable || impl->assignment.find(seekTp) == impl->assignment.end()) {
+            reply(OpStatus::InvalidArgument, "partition not assigned");
+            return;
+        }
+    } else if (impl->state != GroupConsumerState::Stable) {
+        // The (re)join re-seeds every position from the committed offsets anyway.
+        reply(OpStatus::Rejoined);
+        return;
+    }
+    if (!routed_()) { reply(OpStatus::InvalidArgument, "fetch routing unavailable"); return; }
+    if (!sessionConnected_) { reply(OpStatus::SessionLost); return; }
+    // A rewind already pending is superseded (exactly once) and replaced.
+    completeRewind_(*impl, OpStatus::Superseded);
+    if (!impl->active) { reply(OpStatus::Closed); return; }   // its handler closed the consumer
+
+    auto restart = [&](const TopicPartition& tp, int64_t& pos, int64_t newPos, bool known) {
+        GroupConsumerImpl::FetchSub& fs = impl->fetch[tp];
+        dropFetch_(tp, fs);        // pushes of the old instance are ignored (instance identity)
+        pos             = newPos;  // kUnseededSentinel: auto-commit can never commit a stale position
+        fs.offsetKnown  = known;
+        fs.rewound      = true;
+        fs.parked       = false;
+        fs.redirects    = 0;
+    };
+    const int64_t deadlineNs = nowNs + static_cast<int64_t>(impl->cfg.commitSyncTimeoutMs) * 1'000'000LL;
+    if (isSeek) {
+        restart(seekTp, impl->assignment.find(seekTp)->second, cmd.d, /*known=*/true);
+        impl->rewind = R::RewindResubscribe{kind, target, token, deadlineNs, impl->generationId};
+    } else {
+        if (impl->assignment.empty()) { reply(OpStatus::Ok); return; }
+        for (auto& [tp, pos] : impl->assignment) restart(tp, pos, GroupConsumerImpl::kUnseededSentinel, /*known=*/false);
+        impl->rewind = R::RewindAwaitFetch{kind, target, token, deadlineNs, impl->generationId};
+    }
+    // An OffsetFetch in flight may predate the rewind (its committed offsets could be older than
+    // a commit already sent): its answer is ignored; the retry pass sends a fresh one for the
+    // partitions whose start offset is unknown.
+    impl->offsetFetchCorrId     = 0;
+    impl->offsetFetchPhase      = GroupConsumerImpl::OffsetFetchPhase::Idle;
+    impl->offsetFetchDueNs      = 0;
+    impl->offsetFetchBackoffNs  = 0;
+    if (isSeek) (void)reconcileImpl_(*impl);   // the start offset is known: resubscribe now
+}
+
 int GroupConsumerHub::sweepCommitSyncTimeouts(int64_t nowNs) {
     int n = 0;
     for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
         GroupConsumerImpl* const impl = impls_[ix];
+        if (!std::holds_alternative<GroupConsumerImpl::NoRewind>(impl->rewind)) {
+            advanceRewind_(*impl, nowNs);   // Task 10: bound / fetched / rejoined / timed out
+            ++n;
+        }
         if (impl->hasCommitSync && nowNs >= impl->commitSync.deadlineNs) {
             completeCommitSync_(*impl, OpStatus::Timeout);
             ++n;
@@ -154,6 +274,7 @@ void GroupConsumerHub::setSessionConnected(bool connected, int64_t sessionId, in
         // inside a hub walk).
         for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {
             completeCommitSync_(*impls_[ix], OpStatus::SessionLost);
+            completeRewind_(*impls_[ix], OpStatus::SessionLost);
         }
     }
     sessionConnected_ = connected;
@@ -172,6 +293,7 @@ void GroupConsumerHub::closeStatus_(GroupConsumerImpl& impl) {
 void GroupConsumerHub::finish_(GroupConsumerImpl& impl) {
     impl.active = false;
     completeCommitSync_(impl, OpStatus::Closed);
+    completeRewind_(impl, OpStatus::Closed);
     if (impl.statusDirty) { impl.statusDirty = false; --dirtyCount_; }
     // A callback of this consumer is running (it closed itself): the ring is
     // closed when the callback returns (DispatchScope), so finished() never
@@ -255,6 +377,7 @@ void GroupConsumerHub::toRejoining_(GroupConsumerImpl& impl) {
     if (routed_()) dropAllFetch_(impl);
     impl.state = GroupConsumerState::Rejoining;
     completeCommitSync_(impl, OpStatus::Rejoined);
+    completeRewind_(impl, OpStatus::Rejoined);
 }
 
 void GroupConsumerHub::publishGeneration_(GroupConsumerImpl& impl) {
@@ -340,6 +463,10 @@ void GroupConsumerHub::applyTo_(const detail::HubCommand& cmd, GroupConsumerImpl
         if (!sessionConnected_) completeCommitSync_(*impl, OpStatus::SessionLost);
         break;
     }
+    case Op::GroupSeekToCommitted:
+    case Op::GroupSeek:
+        applyRewind_(cmd, impl, nowNs);   // Task 10: a token op, completed exactly once
+        break;
     case Op::GroupClose: {
         if (impl && impl->active) {
             if (routed_()) dropAllFetch_(*impl);  // its leader-node subscriptions go too
@@ -1282,7 +1409,7 @@ int GroupConsumerHub::flushRequestedCommits(int64_t sessionId)
 bool GroupConsumerHub::hasPendingCommitSync() const noexcept
 {
     for (const auto& impl : impls_) {
-        if (impl->hasCommitSync) return true;
+        if (impl->hasCommitSync || !std::holds_alternative<GroupConsumerImpl::NoRewind>(impl->rewind)) return true;
     }
     return false;
 }
@@ -1291,7 +1418,10 @@ void GroupConsumerHub::onSessionDown()
 {
     for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
         GroupConsumerImpl* const impl = impls_[ix];
-        if (impl->active) completeCommitSync_(*impl, OpStatus::SessionLost);
+        if (impl->active) {
+            completeCommitSync_(*impl, OpStatus::SessionLost);
+            completeRewind_(*impl, OpStatus::SessionLost);
+        }
     }
 }
 
@@ -1667,6 +1797,11 @@ void GroupConsumerHub::onOffsetFetchResponse(const uint8_t* buf, std::size_t len
             const TP tp{r.topicId, r.partition};
             auto it = impl->assignment.find(tp);
             if (it == impl->assignment.end()) continue;
+            if (routed_()) {
+                // Task 10: a seek() positioned this partition explicitly — an answer never moves it.
+                const auto f = impl->fetch.find(tp);
+                if (f != impl->fetch.end() && f->second.rewound && f->second.offsetKnown) continue;
+            }
             if (it->second == GroupConsumerImpl::kUnseededSentinel ||
                 it->second < r.offset) {
                 // Seed: either never seeded, or the committed offset is ahead

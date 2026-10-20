@@ -46,6 +46,9 @@ enum class OpKind : uint8_t {
     // Authentication (Task 8): security DDL (wire 79) and the one-time bootstrap (wire 80), answered by DdlResponse 78.
     SecurityDdl,        ///< Client::securityDdl() / securityDdlAndWait()
     SecurityBootstrap,  ///< Client::bootstrapSecurity() / bootstrapSecurityAndWait()
+    // Phase 2b F (Task 10): GroupConsumer rewind.
+    SeekToCommitted,    ///< GroupConsumer::seekToCommitted() / seekToCommittedAndWait()
+    Seek,               ///< GroupConsumer::seek(tp, offset, target, token) / seekAndWait()
 };
 
 enum class OpStatus : uint8_t {

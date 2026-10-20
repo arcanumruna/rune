@@ -34,6 +34,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <string_view>
 #include <vector>
 
 namespace rune::client::group {
@@ -441,6 +442,13 @@ private:
 
     /// F8c C4: complete impl's pending commitSync (if any) exactly once.
     void completeCommitSync_(GroupConsumerImpl& impl, OpStatus st, uint16_t errorCode = 0);
+    /// Task 10: complete impl's pending rewind (if any) exactly once (cleared BEFORE delivery).
+    void completeRewind_(GroupConsumerImpl& impl, OpStatus st, std::string_view text = {});
+    /// Task 10: apply GroupSeekToCommitted / GroupSeek (duty thread).
+    void applyRewind_(const detail::HubCommand& cmd, GroupConsumerImpl* impl, int64_t nowNs);
+    /// Task 10: move a pending rewind forward (AwaitFetch -> Resubscribe -> Ok) or end it
+    /// (Rejoined: the generation changed / the group left Stable; Timeout).  Once per duty cycle.
+    void advanceRewind_(GroupConsumerImpl& impl, int64_t nowNs);
     detail::CompletionSink completions_{};
     int drainCommit_(GroupConsumerImpl& impl, int64_t sessionId, const SendFn& sendFn);
     static void closeStatus_(GroupConsumerImpl& impl);

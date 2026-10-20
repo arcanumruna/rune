@@ -50,6 +50,13 @@ struct HubCommand {
         /// installs it and frees the holder).  Always via the ring (never
         /// applied directly: replacing a callback while it runs is UB).
         GroupSetCallback = 14,
+        /// Phase 2b F (Task 10): token ops (exactly one completion, like
+        /// GroupCommitSync).  handle = GroupConsumerImpl* (identity); a = Token,
+        /// b / c = the completion target.
+        /// GroupSeekToCommitted: rewind every assigned partition to the committed offset.
+        GroupSeekToCommitted = 15,
+        /// GroupSeek: d = the offset, e = (topicId << 32 | partition) of the partition to restart there.
+        GroupSeek            = 16,
 
         // ---- Client (F8c) ------------------------------------------------------
         /// handle = detail::CompletionRing* of a client-bound Completions: the
@@ -98,6 +105,7 @@ struct HubCommand {
     int64_t  b      = 0;
     int64_t  c      = 0;  ///< F8c C4: second completion-target word
     int64_t  d      = 0;  ///< F8c C5: op payload (a heap holder for txn sends / offsets)
+    int64_t  e      = 0;  ///< Phase 2b F (Task 10): second payload word (GroupSeek's partition)
 };
 
 /// F8c C7: which impl type a HandleRelease carries.

@@ -15,6 +15,7 @@
 #include <exception>
 #include <memory>
 #include <stdexcept>
+#include <span>
 #include <string>
 #include <utility>
 
@@ -200,6 +201,97 @@ void GroupConsumer::commitSyncAndWait(std::chrono::nanoseconds timeout) {
     default:
         throw std::runtime_error("commitSync() failed (status " + std::to_string(static_cast<int>(c.status)) + ")");
     }
+}
+
+// ---------------------------------------------------------------------------
+// seekToCommitted / seek — Phase 2b F (Task 10): token ops, completed exactly
+// once by the duty thread (FD8).  Issued exactly like commitSync.
+// ---------------------------------------------------------------------------
+
+OpResult GroupConsumer::seekToCommitted(CompletionTarget target, Token token) {
+    if (!impl_ || opSink_ == nullptr || impl_->status.closed()) return OpResult::Closed;
+    if (!onDutyThread_() && closed_) return OpResult::Closed;
+    detail::HubCommand cmd;
+    cmd.op     = detail::HubCommand::Op::GroupSeekToCommitted;
+    cmd.handle = reinterpret_cast<uint64_t>(impl_);
+    return opSink_(sinkCtx_, cmd, target, token, OpKind::SeekToCommitted);
+}
+
+OpResult GroupConsumer::issueSeekToCommitted_(void* self, const CompletionTarget& target, Token token) {
+    return static_cast<GroupConsumer*>(self)->seekToCommitted(target, token);
+}
+
+namespace {
+/// Rejects every wait outcome but Ok with the commitSyncAndWait-style exception.
+[[noreturn]] void throwRewind(const char* what, const Completion& c, const std::string& text) {
+    switch (c.status) {
+    case OpStatus::InvalidArgument:
+        throw std::invalid_argument(std::string(what) + " failed: " + text);
+    case OpStatus::Superseded:
+        throw std::runtime_error(std::string(what) + " superseded by a newer rewind");
+    case OpStatus::Rejoined:
+        throw std::runtime_error(std::string(what) + " aborted: the group is rebalancing (rejoin)");
+    case OpStatus::SessionLost:
+        throw SessionLostError(std::string(what) + " aborted: the session to the broker was lost");
+    case OpStatus::Timeout:
+        throw std::runtime_error(std::string(what) + " timed out");
+    case OpStatus::Closed:
+        throw std::runtime_error(std::string(what) + ": GroupConsumer closed");
+    default:
+        throw std::runtime_error(std::string(what) + " failed (status " +
+                                 std::to_string(static_cast<int>(c.status)) + ")");
+    }
+}
+} // namespace
+
+void GroupConsumer::seekToCommittedAndWait(std::chrono::nanoseconds timeout) {
+    if (!impl_ || waitSink_ == nullptr || impl_->status.closed() || (!onDutyThread_() && closed_)) {
+        throw std::runtime_error("seekToCommitted(): GroupConsumer closed");
+    }
+    std::string text;
+    const Completion c = waitSink_(sinkCtx_, "seekToCommitted()", timeout, &GroupConsumer::issueSeekToCommitted_,
+                                   this, &text);
+    if (c.status != OpStatus::Ok) throwRewind("seekToCommitted()", c, text);
+}
+
+struct GroupConsumer::SeekIssue {
+    GroupConsumer*  self;
+    TopicPartition  tp;
+    int64_t         offset;
+};
+
+OpResult GroupConsumer::seek(TopicPartition tp, int64_t offset, CompletionTarget target, Token token) {
+    if (!impl_ || opSink_ == nullptr || impl_->status.closed()) return OpResult::Closed;
+    if (!onDutyThread_() && closed_) return OpResult::Closed;
+    detail::HubCommand cmd;
+    cmd.op     = detail::HubCommand::Op::GroupSeek;
+    cmd.handle = reinterpret_cast<uint64_t>(impl_);
+    cmd.d      = offset;
+    cmd.e      = static_cast<int64_t>((static_cast<uint64_t>(static_cast<uint32_t>(tp.topicId)) << 32) |
+                                      static_cast<uint32_t>(tp.partition));
+    return opSink_(sinkCtx_, cmd, target, token, OpKind::Seek);
+}
+
+OpResult GroupConsumer::issueSeek_(void* ctx, const CompletionTarget& target, Token token) {
+    auto* si = static_cast<SeekIssue*>(ctx);
+    return si->self->seek(si->tp, si->offset, target, token);
+}
+
+void GroupConsumer::seek(TopicPartition tp, int64_t offset) {
+    // G6: fire-and-forget — the internal handler drops the outcome.
+    static constexpr CompletionHandler kDrop{
+        [](void*, const Completion&, std::span<const uint8_t>) noexcept {}, nullptr};
+    (void)seek(tp, offset, CompletionTarget(kDrop), Token{0});
+}
+
+void GroupConsumer::seekAndWait(TopicPartition tp, int64_t offset, std::chrono::nanoseconds timeout) {
+    if (!impl_ || waitSink_ == nullptr || impl_->status.closed() || (!onDutyThread_() && closed_)) {
+        throw std::runtime_error("seek(): GroupConsumer closed");
+    }
+    SeekIssue si{this, tp, offset};
+    std::string text;
+    const Completion c = waitSink_(sinkCtx_, "seek()", timeout, &GroupConsumer::issueSeek_, &si, &text);
+    if (c.status != OpStatus::Ok) throwRewind("seek()", c, text);
 }
 
 // ---------------------------------------------------------------------------

@@ -4900,7 +4900,7 @@ void Client::applyHubCommandDirect_(const detail::HubCommand& cmd) {
             });
         return;
     }
-    if (cmd.op == Op::GroupCommitSync) {
+    if (cmd.op == Op::GroupCommitSync || cmd.op == Op::GroupSeekToCommitted || cmd.op == Op::GroupSeek) {
         detail::HubCommand pinned = cmd;
         pinCommandTarget_(pinned);  // I3: counted before anything can complete it
         groupConsumerHub_.applyCommandDirect(pinned, now());
@@ -5342,7 +5342,7 @@ void Client::applyHubCommand_(const detail::HubCommand& cmd) {
             adopted->releaseNoted = true;  // its handle orphaned the release before this adoption
             noteOrphan_(detail::HandleKind::Subscription, adopted, adopted->orphanFence);
         }
-    } else if (cmd.op == Op::GroupCommitSync) {
+    } else if (cmd.op == Op::GroupCommitSync || cmd.op == Op::GroupSeekToCommitted || cmd.op == Op::GroupSeek) {
         detail::HubCommand pinned = cmd;
         pinCommandTarget_(pinned);  // I3: counted before anything can complete it
         groupConsumerHub_.applyCommand(pinned, now());
@@ -5374,7 +5374,7 @@ detail::HubSubmit Client::hubCommandTrampoline_(void* ctx, const detail::HubComm
     if (cmd.op == Op::HandleRelease) return self->submitRelease_(cmd);
     const bool onDuty = std::this_thread::get_id() == self->dutyThreadId_;
 
-    // F8c C4: GroupCommitSync is a token op (targetedOpTrampoline_), never
+    // F8c C4: GroupCommitSync (and Task 10's GroupSeekToCommitted / GroupSeek) is a token op (targetedOpTrampoline_), never
     // submitted here; the token form is allowed from a duty-cycle callback.
     if (self->agent_.commandRingClosed()) return detail::HubSubmit::Closed;
 
