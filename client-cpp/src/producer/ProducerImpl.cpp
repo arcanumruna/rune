@@ -1496,8 +1496,7 @@ int ProducerImpl::drainRing(int64_t nowNs, int messageLimit) {
             // re-check above).  Never skipped, never dropped.  Any other type is counted.
             if (msgTypeId == kMsgTxnControl) {
                 TxnControl tc;
-                bool       tooBig = false;
-                if (decodeTxnControl_(p, static_cast<std::size_t>(len), tc, tooBig)) {
+                if (decodeTxnControl_(p, static_cast<std::size_t>(len), tc)) {
                     // Handlers fired from the op run in the duty scope; its end-of-scope work (a deferred close,
                     // deferred records) must not run inside this read, so it follows the read (below).
                     const bool prevDuty = inDuty_;
@@ -1505,7 +1504,6 @@ int ProducerImpl::drainRing(int64_t nowNs, int messageLimit) {
                     // An over-cap sendOffsets arrives with empty offsets and group id (its data never travelled): it
                     // goes through the same preamble as every op (Fatal, closed, state gates, one at a time), then
                     // fails the limits check - the order Direct mode has.
-                    (void)tooBig;
                     applyTxnControl(tc, nowNs);
                     inDuty_ = prevDuty;
                     controlApplied = true;
@@ -3154,8 +3152,7 @@ int ProducerImpl::discardRing_(OpStatus st, int limit, uint16_t errorCode) {
                 // Phase 2b F Task 8: a control op that reaches a closed / discarding producer completes Closed
                 // (target, token and CQ credit released exactly as a refused send's), never dropped silently.
                 TxnControl tc;
-                bool       tooBig = false;
-                if (decodeTxnControl_(p, static_cast<std::size_t>(len), tc, tooBig)) {
+                if (decodeTxnControl_(p, static_cast<std::size_t>(len), tc)) {
                     if (const auto* f = std::get_if<FatalError>(&txn_)) {   // a fenced producer: say why
                         refuseTxn_(tc, f->status, f->errorCode, "transactional producer in FatalError (terminal)");
                     } else if (lifeOpen()) {

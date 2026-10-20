@@ -209,8 +209,7 @@ OpResult ProducerImpl::issueTxnControl(const TxnControl& c) noexcept {
     return r;
 }
 
-bool ProducerImpl::decodeTxnControl_(const uint8_t* p, std::size_t len, TxnControl& out, bool& tooBig) noexcept {
-    tooBig = false;
+bool ProducerImpl::decodeTxnControl_(const uint8_t* p, std::size_t len, TxnControl& out) noexcept {
     if (len < kTxnCtlHeaderBytes || p[0] > static_cast<uint8_t>(TxnControl::Kind::Flush)) return false;
     out.kind  = static_cast<TxnControl::Kind>(p[0]);
     out.token = static_cast<Token>(getI64(p + 8));
@@ -222,20 +221,17 @@ bool ProducerImpl::decodeTxnControl_(const uint8_t* p, std::size_t len, TxnContr
     out.target.producerOp = out.kind != TxnControl::Kind::Begin && out.target.handler.fn == nullptr &&
                             out.target.cqRef != kNoCqRef;
     if (len > kTxnCtlMaxBytes) {
-        tooBig = true;
-        return true;
+        return true;   // over-cap: offsets and group id stay empty - applyTxnControl refuses InvalidArgument
     }
     if (out.kind != TxnControl::Kind::SendOffsets) return true;
     const uint32_t glen   = getU32(p + 4);
     const uint32_t ocount = getU32(p + 32);
     if (ocount > kMaxTxnOffsets || glen == 0 || glen > kMaxTxnGroupIdBytes) {
-        tooBig = true;
-        return true;
+        return true;   // over-cap: offsets and group id stay empty - applyTxnControl refuses InvalidArgument
     }
     const std::size_t at = align8(kTxnCtlHeaderBytes + glen);
     if (len < at + static_cast<std::size_t>(ocount) * sizeof(OffsetEntry) || (reinterpret_cast<uintptr_t>(p) & 7u) != 0) {
-        tooBig = true;   // truncated (cannot happen: the issuing side wrote it whole)
-        return true;
+        return true;   // truncated (cannot happen: the issuing side wrote it whole): refused like over-cap
     }
     out.groupId = std::string_view(reinterpret_cast<const char*>(p + kTxnCtlHeaderBytes), glen);
     out.offsets = std::span<const OffsetEntry>(reinterpret_cast<const OffsetEntry*>(p + at), ocount);

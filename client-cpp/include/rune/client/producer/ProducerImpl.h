@@ -1897,10 +1897,10 @@ private:
     void completeJoined_(const TxnJoiners& j, OpKind kind, OpStatus st, uint16_t errorCode,
                          std::string_view text) noexcept;
     void refuseTxn_(const TxnControl& c, OpStatus st, uint16_t errorCode, std::string_view text) noexcept;
-    /// Decode a kMsgTxnControl payload (duty thread); the target is pinned.  False: the message is shorter than
-    /// its header (nothing can be completed).  `tooBig`: SendOffsets over the caps / truncated - refuse it
-    /// InvalidArgument.  offsets / groupId point INTO the ring buffer (valid inside the read callback only).
-    [[nodiscard]] bool decodeTxnControl_(const uint8_t* p, std::size_t len, TxnControl& out, bool& tooBig) noexcept;
+    /// Decode a kMsgTxnControl payload (duty thread); a CQ target is marked producerOp.  False: the message is
+    /// shorter than its header (nothing can be completed).  A SendOffsets over the caps / truncated decodes with
+    /// empty offsets and group id, so applyTxnControl refuses it InvalidArgument.  offsets / groupId point INTO the ring buffer (valid inside the read callback only).
+    [[nodiscard]] bool decodeTxnControl_(const uint8_t* p, std::size_t len, TxnControl& out) noexcept;
     [[gnu::noinline]] OpResult writeTxnControl_(const TxnControl& c, bool overCap) noexcept;
     void markStarted_(TxnStarted s) noexcept;
     void poison_(OpStatus st, uint16_t errorCode, AbortKind kind) noexcept;

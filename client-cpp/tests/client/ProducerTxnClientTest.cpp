@@ -714,48 +714,34 @@ TEST_P(ProducerTxnClientModes, MaxGroupIdAndMaxOffsetsFitTheControlBufferRegress
     EXPECT_EQ(r.got[106].status, rc::OpStatus::Ok);
 }
 
-// I2: a queue released while its control op is still in flight keeps its registry slot quarantined; the late
-// completion is dropped, never delivered to a newer queue, and no credit is mis-returned.
-TEST(ProducerTxnClientRegression, ReleasedQueueWithALiveControlOpNeverReceivesOrMisdeliversItRegression) {
-    TxnRig r(rc::RunnerMode::Thread);
+// I2: a queue released while its control op is still in the producer ring keeps its registry slot quarantined
+// (C6 producer-op accounting) until the op's completion is delivered or dropped; then the slot comes back.
+// RED (mutation): no count at issue -> the slot is reused at once; a double count -> it never comes back.
+TEST(ProducerTxnClientRegression, ReleasedQueueWithAControlOpInTheRingKeepsItsSlotQuarantinedRegression) {
+    TxnRig r(rc::RunnerMode::Invoker);
     r.connect();
-    rc::ProducerConfig pc = txnCfg();
-    pc.produceTimeoutMs   = 150;   // the unanswered AddPartitions is re-sent soon
-    rc::Producer          p = r.client->producer(pc);
-    rc::Completions       cq(*r.client);
-    const rc::TopicHandle topic = r.client->topic("t");
-    ASSERT_NO_FATAL_FAILURE(initAndBegin(r, p, cq));
-    r.gw.replyTxn = false;   // AddPartitions / EndTxn unanswered: the record is held, so the commit stays pending
-    const std::string v = "held";
-    ASSERT_EQ(p.trySend(topic, rc::Key(uint64_t{1}), bytesOf(v)), rc::SendResult::Ok);
-    std::string what;
-    try {
-        p.commitTransactionAndWait(std::chrono::milliseconds(300));   // its private queue is released on the timeout
-    } catch (const std::runtime_error& e) {
-        what = e.what();
+    rc::CompletionsConfig tiny;
+    tiny.capacityBytes  = 1024;
+    tiny.maxResultBytes = 64;
+    tiny.maxErrorText   = 64;
+    std::vector<std::unique_ptr<rc::Completions>> live;   // fill the registry so a freed slot is the next taken
+    for (uint32_t i = 0; i < rc::kMaxCqs - 2; ++i) live.push_back(std::make_unique<rc::Completions>(*r.client, tiny));
+    rc::Producer p = r.client->testProducerWithRingCap(txnCfg(), 64 * 1024);   // Ring ingress: ops ride the ring
+    auto a = std::make_unique<rc::Completions>(*r.client, tiny);
+    const uint32_t aIdx = rc::cqRefIndex(a->cqRef());
+    ASSERT_EQ(p.commitTransaction(*a, 1), rc::OpResult::Accepted);   // sits in the ring: no duty pass has run
+    a.reset();   // released with the op still owed
+    for (int i = 0; i < 64; ++i) {
+        rc::Completions churn(*r.client, tiny);
+        EXPECT_NE(rc::cqRefIndex(churn.cqRef()), aIdx) << "quarantined slot reused at churn " << i;
     }
-    ASSERT_NE(what.find("timed out"), std::string::npos) << what;
-    rc::Completions cq2(*r.client);   // a NEW queue while the first op is still live
-    r.gw.replyTxn = true;
-    ASSERT_TRUE(r.drive([&] {
-        cq2.poll([&](const rc::Completion& c, std::span<const uint8_t>) { r.got[c.token + 1000] = c; });
-        return r.gw.endTxnCommits.size() >= 1 && p.state() == rc::TxnState::Ready;
-    })) << "the abandoned commit still runs to its end";
-    for (int i = 0; i < 200; ++i) {
-        cq2.poll([&](const rc::Completion& c, std::span<const uint8_t>) { r.got[c.token + 1000] = c; });
-        r.gw.pump();
+    const uint64_t stale0 = r.client->testStaleCqDrops();
+    ASSERT_TRUE(r.drive([&] { return r.client->testStaleCqDrops() > stale0; })) << "the op completes into the released queue";
+    for (int i = 0; i < 1'000; ++i) { r.client->doWork(); r.gw.pump(); }
+    bool reused = false;
+    for (int i = 0; i < 8 && !reused; ++i) {
+        rc::Completions churn(*r.client, tiny);
+        reused = rc::cqRefIndex(churn.cqRef()) == aIdx;
     }
-    for (const auto& [k, c] : r.got) {   // 100 is the init on the first queue; keys >= 1000 came through cq2
-        EXPECT_LT(k, rc::Token{1000}) << "a completion reached the newer queue: token " << (k - 1000);
-    }
-    EXPECT_EQ(cq2.reservedBytes(), 0u);
-    EXPECT_EQ(cq2.outstanding(), 0u);
-    // The newer queue is fully usable.
-    p.beginTransaction();
-    ASSERT_EQ(p.abortTransaction(cq2, 7), rc::OpResult::Accepted);
-    ASSERT_TRUE(r.drive([&] {
-        cq2.poll([&](const rc::Completion& c, std::span<const uint8_t>) { r.got[c.token + 1000] = c; });
-        return r.got.count(1007) != 0;
-    }));
-    EXPECT_EQ(r.got[1007].status, rc::OpStatus::Ok);
+    EXPECT_TRUE(reused) << "the slot returns once the op's completion is accounted";
 }
