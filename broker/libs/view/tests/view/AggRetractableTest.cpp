@@ -187,6 +187,9 @@ struct Harness {
                                                   contributors, groups, &blocks, lv, bnd, cursor);
             inconsistent += last.aggInconsistent;
             const size_t inPass = static_cast<size_t>(bnd - next) - done;
+            EXPECT_EQ(cursor, bnd) << "each pass must stop exactly at its bound";
+            EXPECT_EQ(last.applied + last.deleted + last.skippedNoGroup + last.skippedMalformed, inPass)
+                << "each pass processes exactly its share of the records";
             done += inPass;
             const Drained d = drainCounts();
             EXPECT_LE(d.contributorRows, inPass * perRec.contributorRows);
@@ -228,6 +231,11 @@ struct Harness {
     //    listed groups' chunks (nothing leaked).
     // Returns the number of entries seen (== live contributors when every group is listed).
     size_t expectBlocksConsistent(const std::vector<int64_t>& groupIds) {
+        return checkBlocks(agg, groups, contributors, blocks, groupIds);
+    }
+    static size_t checkBlocks(const rune::view::AggLayout& agg, const rune::view::ViewTable& groups,
+                              const rune::view::ViewTable& contributors,
+                              const rune::view::ViewTable& blocks, const std::vector<int64_t>& groupIds) {
         namespace v = rune::view;
         size_t entries = 0, chunkRows = 0;
         for (const int64_t g : groupIds) {
@@ -940,8 +948,12 @@ TEST(AggRetractableRegression, NoGroupRewriteUnlinksAndRetractsTheContributorReg
 // REGRESSION (Task 5 review carry-over): Min/Max over negative Int32, UInt16 and
 // Float64 (+-0.0), and Last over UInt16 and Bool, model-checked against brute
 // force across inserts, in-place updates, group moves and deletes. Several
-// records for one contributor fall in a single batch. Retracting a single
-// extreme costs exactly one rescan.
+// records for one contributor fall in a single batch. Floats compare bit for bit
+// except when +0.0 and -0.0 tie for the extreme: the fold's tie rule (cache
+// update strict; rescan keeps the first in block order) depends on history, so
+// there either sign of a tied member is accepted (pinned exactly by
+// ZeroSignTieSurvivorKeepsItsSignRegression). Block structure and the
+// no-RescanPending invariant are checked every step.
 TEST(AggRetractableRegression, NarrowAndSignedTypesMatchBruteForceRegression) {
     const auto src = rune::codec::DescriptorBuilder("t", 1)
         .add("id", P::Int64, 1, true)
@@ -987,7 +999,7 @@ TEST(AggRetractableRegression, NarrowAndSignedTypesMatchBruteForceRegression) {
             if (rnd(100) < 20) {
                 live.erase(id);
             } else {
-                M m{1 + static_cast<int64_t>(rnd(2)), static_cast<int32_t>(rnd(7)) - 3,
+                M m{1 + static_cast<int64_t>(rnd(2)), [&] { const uint64_t r = rnd(9); return r == 7 ? INT32_MIN : r == 8 ? INT32_MAX : static_cast<int32_t>(r) - 3; }(),
                     static_cast<uint16_t>(rnd(4) * 21845), fs[rnd(6)], rnd(2) == 0, seq};
                 le16(val, 35); le16(val, 1); le64(val, uint64_t(id)); le64(val, uint64_t(m.grp));
                 le32(val, uint32_t(m.i)); le16(val, m.u);
@@ -1006,6 +1018,20 @@ TEST(AggRetractableRegression, NarrowAndSignedTypesMatchBruteForceRegression) {
         off = bound;
         inconsistent += st.aggInconsistent;
         rescansSeen += st.aggRescans;
+        {
+            uint32_t pending = 0;
+            groups.drainDirty([&](uint32_t, const uint8_t* row, bool deleted, uint64_t) {
+                if (deleted) return;
+                for (uint16_t ci = 0; ci < agg.numCached; ++ci)
+                    if (row[agg.groupCacheOff + rune::view::kCacheEntryBytes * ci + 8] ==
+                        static_cast<uint8_t>(rune::view::CacheState::RescanPending)) ++pending;
+            });
+            contributors.drainDirty([](uint32_t, const uint8_t*, bool, uint64_t) {});
+            view.drainDirty([](uint32_t, const uint8_t*, bool, uint64_t) {});
+            blocks.drainDirty([](uint32_t, const uint8_t*, bool, uint64_t) {});
+            ASSERT_EQ(pending, 0u) << "step " << step;
+        }
+        ASSERT_EQ(Harness::checkBlocks(agg, groups, contributors, blocks, {1, 2}), live.size()) << "step " << step;
         for (int64_t g = 1; g <= 2; ++g) {
             int64_t cnt = 0, mxI = INT32_MIN, mnI = INT32_MAX;
             uint16_t mxU = 0, mnU = UINT16_MAX;
@@ -1028,8 +1054,17 @@ TEST(AggRetractableRegression, NarrowAndSignedTypesMatchBruteForceRegression) {
             ASSERT_EQ(col(3).i, mnI) << "step " << step << " group " << g;
             ASSERT_EQ(col(4).u, mxU) << "step " << step << " group " << g;
             ASSERT_EQ(col(5).u, mnU) << "step " << step << " group " << g;
-            ASSERT_EQ(col(6).f, mnF) << "step " << step << " group " << g;
-            ASSERT_EQ(col(7).f, mxF) << "step " << step << " group " << g;
+            auto sameF = [&](double got, double want) {
+                if (want == 0.0) {   // sign ambiguous only if both zero signs are live in the group
+                    bool neg = false, pos = false;
+                    for (const auto& [id, m] : live) if (m.grp == g && m.f == 0.0) (std::signbit(m.f) ? neg : pos) = true;
+                    if (neg && pos) return got == 0.0;
+                }
+                uint64_t a, b2; std::memcpy(&a, &got, 8); std::memcpy(&b2, &want, 8);
+                return a == b2;
+            };
+            ASSERT_TRUE(sameF(col(6).f, mnF)) << "step " << step << " group " << g;
+            ASSERT_TRUE(sameF(col(7).f, mxF)) << "step " << step << " group " << g;
             ASSERT_EQ(col(8).u, lastM->u) << "step " << step << " group " << g;
             ASSERT_EQ(col(9).b, lastM->b) << "step " << step << " group " << g;
         }
@@ -1037,4 +1072,31 @@ TEST(AggRetractableRegression, NarrowAndSignedTypesMatchBruteForceRegression) {
     }
     EXPECT_EQ(inconsistent, 0u);
     EXPECT_GT(rescansSeen, 0u) << "the history must exercise the rescan path";
+}
+
+// REGRESSION (fix round 1): +0.0 and -0.0 are equal values, so which one a Max
+// holds is the fold's tie rule: the cache update is strict (the earlier-held
+// value stays) and a rescan keeps the first equal entry in block order. With a
+// group of only {-0.0, +0.0} the survivor of a retraction is the other one and
+// must keep its own sign, for both insertion orders and both victims.
+TEST(AggRetractableRegression, ZeroSignTieSurvivorKeepsItsSignRegression) {
+    for (const bool negFirst : {true, false}) {
+        for (const int64_t victim : {1, 2}) {
+            Harness h;
+            Ord a{1, 100, 5}, b{2, 100, 5};
+            a.price = negFirst ? -0.0 : 0.0;
+            b.price = negFirst ? 0.0 : -0.0;
+            h.putOrd(a);
+            h.putOrd(b);
+            // Strict cache update: the first-held zero stays the cached Max.
+            EXPECT_EQ(std::signbit(h.col(100, kMaxPrice).f), negFirst) << "negFirst " << negFirst;
+            h.put(victim, tombstone());
+            const bool survivorNeg = (victim == 1) ? !negFirst : negFirst;
+            const auto got = h.col(100, kMaxPrice);
+            ASSERT_TRUE(got.present);
+            EXPECT_EQ(got.f, 0.0);
+            EXPECT_EQ(std::signbit(got.f), survivorNeg) << "negFirst " << negFirst << " victim " << victim;
+            EXPECT_EQ(h.inconsistent, 0u);
+        }
+    }
 }
