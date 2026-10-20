@@ -1,4 +1,3 @@
-
 // broker/libs/view/include/rune/view/AggState.h
 //
 // Aggregate views with TABLE semantics: a contributor is the source record's
@@ -98,7 +97,7 @@ inline constexpr uint32_t blockValOff(uint16_t col, uint32_t slot) noexcept {
 // (also what a zero-filled new group row reads as). Valid: value is the
 // extreme. RescanPending: the extreme was retracted and value still holds that
 // RETRACTED extreme (an upper/lower bound on the rest); resolved -- by an add
-// that is at least as extreme, or by one list walk at emit -- before the record
+// that is at least as extreme, or by one value-block scan at emit -- before the record
 // that set it finishes, so it is never checkpointed.
 enum class CacheState : uint8_t { Empty = 0, Valid = 1, RescanPending = 2 };
 

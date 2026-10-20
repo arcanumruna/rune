@@ -111,7 +111,7 @@ struct Ctx {
         switch (*cs) {
             case kEmpty:
                 if (nnNew == 1) { std::memcpy(cv, v, 8); *cs = kValid; }
-                else { ++stats.aggInconsistent; *cs = kPending; }   // values without a cache: rebuild from the list
+                else { ++stats.aggInconsistent; *cs = kPending; }   // values without a cache: rebuild from the value block
                 break;
             case kValid:
                 if (strictlyBetter(f.rule, f.kind, v, cv)) std::memcpy(cv, v, 8);

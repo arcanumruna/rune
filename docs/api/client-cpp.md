@@ -407,6 +407,7 @@ if (row.status == ViewRowResult::kOk) {
   - `Min` / `Max`: numeric sources only (Int32, Int64, UInt16, UInt32, UInt64, Float64); nulls are ignored (NaN and ±Inf count as NULL); an empty or all-null group gives NULL. Exact under update, group move and delete.
   - `Last`: the value of the most recently written contributor of the group, including NULL. Any fixed-width source type.
   - `LastNonNull`: the most recently written contributor value that is not NULL, or NULL if there is none.
+  - In a view that uses `Min`, `Max`, `Last` or `LastNonNull`, a contributor whose 8-byte key is `0xFFFF_FFFF_FFFF_FFFF` (int64 `-1`) is reserved as the link sentinel: the record is skipped and counted in `skippedMalformed`. Don't use `-1` as an entity id there.
   - All four keep the source field's type as the output type. Create a view that uses one only after every broker runs a build that has them.
 - Rows are fixed-width and decoded positionally against a layout built from the plan's output types. Remember
   `viewTopicId` and `outputFingerprint` from `createView`: a drifted fingerprint is answered `SchemaMismatch`.

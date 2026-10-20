@@ -1,4 +1,3 @@
-
 // broker/libs/view/src/AggState.cpp — see AggState.h.
 #include <rune/view/AggState.h>
 

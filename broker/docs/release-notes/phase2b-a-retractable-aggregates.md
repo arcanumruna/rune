@@ -7,6 +7,7 @@ Aggregate views can now maintain `Min`, `Max`, `Last` and `LastNonNull`, exact u
 - `Min` / `Max`: numeric sources only (Int32, Int64, UInt16, UInt32, UInt64, Float64). Output type = source type. Nulls are ignored; NaN and ±Inf count as NULL (counted in `aggNonFinite`). An empty or all-null group gives NULL.
 - `Last`: the value of the most recently written contributor, including NULL. Any fixed-width source type; output type = source type.
 - `LastNonNull`: the most recently written contributor value that is not NULL, or NULL if there is none. It is the new `MergeRule::LastNonNull`, wire value **8** (the enum is append-only; rules 0-7 are unchanged).
+- In a view that uses `Min`, `Max`, `Last` or `LastNonNull`, a contributor whose 8-byte key is `0xFFFF_FFFF_FFFF_FFFF` (int64 `-1`) is reserved as the link sentinel: the record is skipped and counted in `skippedMalformed`. Don't use `-1` as an entity id there.
 - Retracting the cached Min/Max scans the group's packed Min/Max value block once (O(group size) but sequential, reported by `BM_ViewFoldExtremeRetract` at 1k and 10k); the typical fold stays inside the §14.0 gate.
 
 ## Compatibility
