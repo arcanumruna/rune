@@ -152,7 +152,12 @@ the repo, issues or commits.
 
 - **Never push without the owner's explicit consent for that push.** Consent does not carry over to later pushes. A
   hook in `.claude/settings.json` makes every `git push` ask first. Never force-push without an explicit request.
-- Work on a feature branch, never directly on `main`.
+- Work on a branch, never directly on `main`. Create every branch off the latest `main` (`git fetch` first) and keep it
+  current by merging `main` in before review.
+- Pull request branches are prefixed by kind: `feature/<topic>` for new functionality, `bugfix/<topic>` for fixes.
+- **Pull requests are reviewed by the most capable model.** The reviewer leaves comments on the PR where needed; the
+  implementer resolves each one (fix, or reply with the reason) and pushes. When the reviewer is satisfied it approves,
+  merges the PR and closes the linked issues.
 - Commit messages end with the session's `Co-Authored-By:` trailer.
 - **No secrets in the repo:** no emails, passwords, tokens, keys, IPs or local paths. Everything sensitive comes from
   the environment.
