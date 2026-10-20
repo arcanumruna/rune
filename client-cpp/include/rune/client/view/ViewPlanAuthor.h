@@ -37,13 +37,14 @@
 
 namespace rune::client::view {
 
-// Mirrors rune::view::MergeRule (libs/view/include/rune/view/ViewTypes.h).
-// Phase 2a brokers accept Replace plus the invertible aggregates CountAll
-// (Count(*)), Count(col), Sum and Avg (GROUP BY the view key, single source of
-// one partition); Min/Max/Last are not accepted until Phase 2b. The full set is
-// carried so a plan authored here round-trips byte-identically through the
-// broker's deserializeAuthored.
-enum class MergeRule : uint8_t { Replace, Count, Sum, Avg, Min, Max, Last, CountAll };  // CountAll=7 (Count(*))
+// Mirrors rune::view::MergeRule (broker/libs/view/include/rune/view/ViewTypes.h).
+// Brokers accept Replace (projection, and the GROUP BY column of an aggregate
+// view) plus the aggregates CountAll (Count(*)), Count(col), Sum, Avg (Phase
+// 2a) and the retractable Min, Max, Last, LastNonNull (Phase 2b) - GROUP BY the
+// view key, single source of one partition. Wire values are append-only so a
+// plan authored here round-trips byte-identically through the broker's
+// deserializeAuthored.
+enum class MergeRule : uint8_t { Replace, Count, Sum, Avg, Min, Max, Last, CountAll, LastNonNull };  // CountAll=7, LastNonNull=8
 
 // WITH-clause sizing knobs (rune::view::ViewSizing). 0 fields take the
 // broker's own defaults.
@@ -221,7 +222,7 @@ inline std::optional<ViewPlan> deserializeAuthored(std::span<const uint8_t> buf)
             !detail::readU8(buf, pos, rule))
             return std::nullopt;
         if (type > static_cast<uint8_t>(rune::codec::PrimType::FixedStr)) return std::nullopt;
-        if (rule > static_cast<uint8_t>(MergeRule::CountAll)) return std::nullopt;
+        if (rule > static_cast<uint8_t>(MergeRule::LastNonNull)) return std::nullopt;
         f.type = static_cast<rune::codec::PrimType>(type);
         f.rule = static_cast<MergeRule>(rule);
         p.output.push_back(std::move(f));

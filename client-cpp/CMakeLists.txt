@@ -1046,7 +1046,9 @@ if(BUILD_TESTING)
     # ── Schema codec smoke test (0b Task 9) — no Aeron dependency ───────────────
     add_executable(rune_schema_codec_smoke_tests
         tests/SchemaCodecSmokeTest.cpp
+        tests/client/ViewPlanAuthorTest.cpp
     )
+    target_include_directories(rune_schema_codec_smoke_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_link_libraries(rune_schema_codec_smoke_tests PRIVATE rune_codec GTest::gtest_main)
     gtest_discover_tests(rune_schema_codec_smoke_tests)
 
