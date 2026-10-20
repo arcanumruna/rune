@@ -326,12 +326,17 @@ std::chrono::milliseconds closeBounded(rc::Client& client, std::chrono::millisec
 }
 
 /// One dr_client "produce_subscribe" run (examples/dr_client.cpp doProduce + doSubscribe): `records` acked
-/// sends one at a time (acks=Leader), then a subscription per partition from earliest until this client's
+/// sends one at a time (acks=All, dr_client RUNE_ACKS=all), then a subscription per partition from earliest until this client's
 /// own `records` arrived, unsubscribe, close() — bounded.
-struct DrClientResult { int produced = 0, delivered = 0; std::chrono::milliseconds closeTook{0}; };
+struct DrClientResult {
+    int produced = 0, delivered = 0;
+    std::chrono::milliseconds closeTook{0};
+    std::string detail;   // on a shortfall: every not-Ok send and every Ok send never delivered
+};
 DrClientResult runDrClient(ThreeNodes& c, rc::ClientConfig cfg, const rc::TopicSpec& spec, int cid, int records,
                            std::chrono::milliseconds closeBound) {
     DrClientResult res;
+    std::vector<rc::Completion> acks;   // each seq's completion
     cfg.topics           = {spec};
     cfg.connectTimeoutMs = 40'000;
     cfg.pingTimeoutMs    = 40'000;
@@ -340,10 +345,15 @@ DrClientResult runDrClient(ThreeNodes& c, rc::ClientConfig cfg, const rc::TopicS
     const rc::TopicHandle th = client->topic(spec.name);
     {
         rc::ProducerConfig pcfg;
-        pcfg.acks = rc::Acks::Leader; pcfg.lingerUs = 1; pcfg.batchBytes = 1; pcfg.maxInFlight = 16;
+        // acks=All (TSan triage 2026-10-20): the run asserts every Ok record is delivered, which only a
+        // majority-committed ack promises.  Under acks=Leader a leader failover legitimately truncates acked but
+        // unreplicated records — and a loaded sanitizer build does fail over (a starved heartbeat: "node 2 found
+        // dead", partition 1 moved and back within 70 ms; 1-2 acked records per client were gone).
+        pcfg.acks = rc::Acks::All; pcfg.lingerUs = 1; pcfg.batchBytes = 1; pcfg.maxInFlight = 16;
         pcfg.produceTimeoutMs = 40'000;
         auto p = client->producer(pcfg);
         rc::Completions cq(*client);
+        acks.assign(static_cast<std::size_t>(records), rc::Completion{});
         for (int seq = 0; seq < records; ++seq) {
             const std::string v = "cid=" + std::to_string(cid) + ";" + valueOf(seq);
             const auto bytes = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(v.data()), v.size());
@@ -358,9 +368,12 @@ DrClientResult runDrClient(ThreeNodes& c, rc::ClientConfig cfg, const rc::TopicS
             rc::Completion out;
             const auto w = cq.waitFor(static_cast<rc::Token>(seq) + 1, 40s,
                                       [&](const rc::Completion& d, std::span<const uint8_t>) { out = d; });
+            acks[static_cast<std::size_t>(seq)] = out;
             if (w == rc::Completions::Wait::Done && out.status == rc::OpStatus::Ok) ++res.produced;
+            else if (w != rc::Completions::Wait::Done) acks[static_cast<std::size_t>(seq)].status = rc::OpStatus::Timeout;   // the 40 s wait itself ran out
         }
     }
+    std::vector<std::atomic<int>> seen(static_cast<std::size_t>(records));   // delivery count per seq (agent thread)
     {
         std::atomic<int> mine{0};
         const std::string tag = "cid=" + std::to_string(cid) + ";";
@@ -370,12 +383,28 @@ DrClientResult runDrClient(ThreeNodes& c, rc::ClientConfig cfg, const rc::TopicS
         for (int32_t p = 0; p < spec.partitionCount; ++p)
             subs.push_back(client->subscribe(th, p, o, [&](const rc::Record& r) {
                 const std::string_view s(reinterpret_cast<const char*>(r.value.data()), r.value.size());
-                if (s.rfind(tag, 0) == 0) mine.fetch_add(1, std::memory_order_relaxed);
+                if (s.rfind(tag, 0) != 0) return;
+                mine.fetch_add(1, std::memory_order_relaxed);
+                const auto v = r.value.subspan(tag.size());
+                const int sq = seqOf(v);
+                if (sq >= 0 && sq < records) seen[static_cast<std::size_t>(sq)].fetch_add(1, std::memory_order_relaxed);
             }));
         for (const auto deadline = Clock::now() + 60s; Clock::now() < deadline && mine.load() < records;)
             std::this_thread::sleep_for(2ms);
         res.delivered = mine.load();
         for (auto& s : subs) s.unsubscribe();
+    }
+    if (res.produced != records || res.delivered != records) {
+        std::ostringstream d;
+        for (int sq = 0; sq < records; ++sq) {
+            const rc::Completion& a = acks[static_cast<std::size_t>(sq)];
+            const int n = seen[static_cast<std::size_t>(sq)].load();
+            const bool ok = a.status == rc::OpStatus::Ok;
+            if (ok && n == 1) continue;
+            d << " seq " << sq << ": status=" << static_cast<int>(a.status) << " ec=" << a.errorCode << " offset=" << a.value
+              << " delivered=" << n << (ok && n == 0 ? " [ACKED-OK, NEVER DELIVERED]" : "") << ";";
+        }
+        res.detail = d.str();
     }
     res.closeTook = closeBounded(*client, closeBound, ("cid " + std::to_string(cid)).c_str());
     return res;
@@ -412,8 +441,8 @@ TEST(ClientFailoverBrokerRegression, MultiClientProduceSubscribeCloseIsBoundedRe
     for (auto& t : ts) t.join();
     for (int i = 0; i < kClients; ++i) {
         const auto& r = res[static_cast<std::size_t>(i)];
-        EXPECT_EQ(r.produced, kRecords) << "client " << i;
-        EXPECT_EQ(r.delivered, kRecords) << "client " << i;
+        EXPECT_EQ(r.produced, kRecords) << "client " << i << ":" << r.detail;
+        EXPECT_EQ(r.delivered, kRecords) << "client " << i << ":" << r.detail;
         EXPECT_LT(r.closeTook, 45s) << "client " << i << " close() took " << r.closeTook.count() << " ms";
         std::fprintf(stderr, "[close] client %d produced %d delivered %d close %lld ms\n", i, r.produced, r.delivered,
                      static_cast<long long>(r.closeTook.count()));

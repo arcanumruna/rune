@@ -3086,6 +3086,38 @@ TEST(TransientLineageControllerRegression, DeathDetectionClearsTheRememberedLead
     EXPECT_EQ(c.svc->trustedTransientLineage(0, 0), token) << "the live process's own report did not restore trust";
 }
 
+// TSan triage 2026-10-20: the TEST-ONLY user-decision hold (NodeConfig::testUserDecisionHoldMs) is ONE-SHOT per
+// process — it opens at the controller's first ready edge and a later re-election never re-arms it.  RED (re-armed
+// on every ready edge): a controller re-elected faster than the hold (consensus churn on a loaded sanitizer build)
+// held every USER decision forever — TransientLineageClusterRegression.StaggeredFullRestart... never saw the old
+// leader's partition decided after the window.
+TEST(TransientLineageControllerRegression, UserDecisionHoldIsOneShotNotReArmedByReElectionRegression) {
+    CtlRig c;
+    // The partition leader must not be the controller (node 1) itself.
+    for (int i = 0; i < 4 && c.pa().leaderNode == 1; ++i) { (void)c.svc->onAlterIsr(c.bump()); c.tick(); }
+    ASSERT_NE(c.pa().leaderNode, 1) << "precondition: a partition leader other than the controller";
+    constexpr int64_t kHoldNs = 200'000'000;   // 200 rig ticks
+    c.svc->setUserDecisionHoldForTest(kHoldNs);
+    c.drive(1);                                 // ready: the window opens
+    const int32_t L = c.pa().leaderNode;
+    std::vector<int32_t> live;
+    for (int32_t n : {1, 2, 3}) if (n != L) live.push_back(n);
+    c.drive(220);                               // the window is over (nothing was asked inside it)
+    ASSERT_EQ(c.pa().leaderNode, L);
+    // A re-election of this controller (consensus leadership lost and regained).
+    c.svc->setConsensusLeads(false);
+    c.drive(2);
+    ASSERT_FALSE(c.svc->controllerReady());
+    c.svc->setConsensusLeads(true);
+    for (int i = 0; i == 0 || (i < 200 && !c.svc->controllerReady()); ++i) c.drive(1);   // the re-claim edge
+    ASSERT_TRUE(c.svc->controllerReady());
+    c.drive(1);   // the control cycle's doWork sees the re-ready edge before the tick's decisions
+    (void)c.svc->reassignDeadPartitionLeaders(live, 0);
+    c.drive(50);   // well inside a re-armed window (200 ticks)
+    EXPECT_NE(c.pa().leaderNode, L) << "the re-elected controller re-armed the one-shot hold: the dead leader's "
+                                       "partition was never failed over";
+}
+
 // ---------------------------------------------------------------------------
 // Catalog history Task 8: placement removal of a DROPPED topic is never
 // stranded.  The controller drops a topic whose static assignment is appended

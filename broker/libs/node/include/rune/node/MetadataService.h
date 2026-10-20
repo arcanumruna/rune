@@ -1271,8 +1271,14 @@ public:
         return rune::metadata::lineageConfirmedFor(rec, msm_.assignment(topicId, partition), live)
                    ? rec->lineage : rune::metadata::kLineageUntrusted;
     }
-    /// TEST-ONLY: see NodeConfig::testUserDecisionHoldMs.
+    /// TEST-ONLY: see NodeConfig::testUserDecisionHoldMs.  The window opens the first time this controller is
+    /// ready and is never re-armed (one-shot per process).
     void setUserDecisionHoldForTest(int64_t ns) noexcept { userDecisionHoldNs_ = ns; }
+    [[nodiscard]] bool userDecisionHeld_() noexcept {
+        if (userDecisionHoldNs_ <= 0) return false;
+        if (userDecisionHoldUntilNs_ == kHoldUnarmed) userDecisionHoldUntilNs_ = lastNowNs_ + userDecisionHoldNs_;
+        return lastNowNs_ < userDecisionHoldUntilNs_;
+    }
     /// Catalog history Task 22 seam (CONTROL thread, via onControlThreadForTest): while held a runtime topic is
     /// recorded but its initial placement is not emitted (the window between "applied" and "placement committed" of
     /// the 3-node slice's B1 test); releasing it places every unplaced unit at once.  Never set in production.
@@ -2284,7 +2290,7 @@ public:
         rune::metadata::DynamicBalancer bal;
         std::vector<rune::metadata::BalancerRecord> recs = bal.rebalance(in);
         electionExcludedScratch_.swap(in.electionExcluded);   // M2: capacity kept for the next tick
-        if (userDecisionHoldNs_ > 0 && lastNowNs_ < readySinceNs_ + userDecisionHoldNs_) [[unlikely]] {
+        if (userDecisionHeld_()) [[unlikely]] {
             // TEST-ONLY hold (NodeConfig::testUserDecisionHoldMs): no USER partition decision yet.
             std::erase_if(recs, [](const rune::metadata::BalancerRecord& br) { return br.rec.topicId >= 0; });
             bumpRequests_.clear();   // re-sent by their requesters; decided after the hold
@@ -2429,11 +2435,8 @@ public:
         if (!replica_) return 0;
         lastNowNs_ = nowNs;
         if (firstPassNs_ < 0) firstPassNs_ = nowNs;   // I1 (round 5): report warm-up start
-        if (userDecisionHoldNs_ > 0) {   // TEST-ONLY (NodeConfig::testUserDecisionHoldMs)
-            const bool ready = controllerReady_();
-            if (ready && !holdWasReady_) readySinceNs_ = nowNs;
-            holdWasReady_ = ready;
-        }
+        if (userDecisionHoldNs_ > 0 && userDecisionHoldUntilNs_ == kHoldUnarmed && controllerReady_())
+            userDecisionHoldUntilNs_ = nowNs + userDecisionHoldNs_;   // TEST-ONLY: armed once (first ready)
 
         // The log's existing content changed (a KIP-279 truncation while
         // following): everything applied from the old content is stale — rebuild
@@ -3462,8 +3465,13 @@ private:
     std::deque<int32_t>                                pendingRemovalRecords_;
     std::unordered_map<int32_t, rune::replication::Offset> removalInflight_;
     bool    placementHeldForTest_ = false;   ///< Task 22 seam (holdPlacementForTest)
-    int64_t userDecisionHoldNs_ = 0, readySinceNs_ = 0, lastNowNs_ = 0;   ///< TEST-ONLY hold
-    bool    holdWasReady_       = false;
+    int64_t userDecisionHoldNs_ = 0, lastNowNs_ = 0;   ///< TEST-ONLY hold (length)
+    /// TEST-ONLY hold window, ONE-SHOT per process: kHoldUnarmed until this controller is first ready, then the
+    /// deadline.  Never re-armed by a later re-election (TSan triage 2026-10-20: re-arming on every ready edge let a
+    /// controller churning faster than the hold - consensus re-elections under a loaded sanitizer build - hold every
+    /// USER decision forever).
+    static constexpr int64_t kHoldUnarmed = -1;
+    int64_t userDecisionHoldUntilNs_ = kHoldUnarmed;
     std::unordered_map<int64_t, rune::replication::Offset> lineageInflight_;
     uint64_t lineagesMinted_ = 0, lineagesKept_ = 0, lineageMintCounter_ = 0;
     uint64_t lineageSalt_ = 0x5DEECE66Dull;

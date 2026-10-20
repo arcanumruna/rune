@@ -292,6 +292,11 @@ private:
                 }
             } else if (const auto a = s.c->awaitDefine(r.corr, Clock::now() + 1ms)) { code = a->errorCode; got = true; if (code == 0) exists_[r.topic] = a->topicId; }
             if (!got && revokedFrame_(s)) { got = true; code = 46; if (r.kind == Req::Kind::Create) unknown_.insert(r.topic); }   // the create may or may not have happened   // "SessionRevoked on every in-flight request" (spec §10)
+            // A produce ended by the revocation may still have been appended (the worker admitted it; its ack was
+            // superseded by the session-level SessionRevoked): it keeps counting toward the log-end bound - but only
+            // if some state it was in flight under allowed the WRITE (an unauthorized produce must never be appended).
+            if (r.kind == Req::Kind::Produce && code == 46 && allowedSomewhere_(r.lo, hi, s.user, pm::Op::Write, r.topic))
+                ++maybeAppended_[r.topicId];
             if (!got) {
                 if (now - r.sentAt > 5s) { failWith_("unanswered request (step " + std::to_string(r.step) + ")"); return; }
                 ++i; continue;
@@ -352,10 +357,11 @@ private:
                " shipperPending=" + std::to_string(g.shipperPending);
     }
     /// An upper bound of the partition's log end now: the highest acked offset + 1 plus every produce still unanswered
-    /// (each appends one record).  A Record of an ended subscription at or above it can only come from a produce sent
-    /// after the end - the worker must no longer push it.
+    /// or ended by a SessionRevoked (outcome unknown; each appends at most one record).  A Record of an ended
+    /// subscription at or above it can only come from a produce sent after the end - the worker must no longer push it.
     int64_t logEndBound_(const Sub& s) const {
         int64_t b = (maxAcked_.count(s.topicId) ? maxAcked_.at(s.topicId) : -1) + 1;
+        if (const auto m = maybeAppended_.find(s.topicId); m != maybeAppended_.end()) b += m->second;
         for (const Req& r : reqs_) b += (r.kind == Req::Kind::Produce && r.topicId == s.topicId) ? 1 : 0;
         return b;
     }
@@ -643,6 +649,7 @@ private:
     int seed_, steps_;
     Tally& tally_;
     std::map<int32_t, int64_t> maxAcked_;   // topic id -> highest acked base offset
+    std::map<int32_t, int64_t> maybeAppended_;   // topic id -> produces ended by SessionRevoked (may have been appended)
     std::mt19937_64 rng_;
     std::size_t step_ = 0;
     std::string fail_;

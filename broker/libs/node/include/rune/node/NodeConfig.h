@@ -286,7 +286,9 @@ struct NodeConfig {
     // dynamic leadership decision for a USER partition (failover, leaderless,
     // bump, rebalance) for this long — internal partitions are decided as
     // usual.  Holds a full restart's stale committed leadership in place so a
-    // test can probe it.  0 (default): no hold; never set in production.
+    // test can probe it.  One-shot: measured from this process's FIRST ready
+    // edge, never re-armed by a later re-election.  0 (default): no hold;
+    // never set in production.
     int64_t testUserDecisionHoldMs = 0;
 
     // TEST-ONLY (ISR v3 Step 9, R-I1): hold the consensus candidacy from boot even for a Founder/Legacy storage,
