@@ -1,0 +1,13 @@
+Rune
+Copyright (c) 2026 Arcanum Realms LTD. Licensed under the Arcanum Realms Community License (see LICENSE).
+
+This product includes or is derived from the following third-party works, which remain under their own licenses:
+
+- Aeron and Agrona (Real Logic) — UDP/IPC transport, ring buffers and idle strategies, and the Aeron C++ client
+  the broker and client build on. Apache License 2.0.
+- Simple Binary Encoding (Real Logic) — generated codecs for the internal ring and replication wire formats.
+  Apache License 2.0.
+- OpenSSL — SCRAM-SHA-512, hashing and the optional TLS 1.3 build. Apache License 2.0.
+- spdlog — logging. MIT License.
+- GoogleTest (Google) — tests only, not redistributed in binaries. BSD 3-Clause License.
+- Google Benchmark (Google) — benchmarks only, not redistributed in binaries. Apache License 2.0.

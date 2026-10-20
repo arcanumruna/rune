@@ -1,0 +1,56 @@
+Arcanum Realms Community License Agreement
+Version 1.0
+
+Copyright (c) 2026 Arcanum Realms LTD. All rights reserved.
+
+This Arcanum Realms Community License Agreement ("Agreement") applies to Rune, including its source code, object
+code, documentation and other materials published in this repository (the "Software").
+By copying, using, modifying or distributing the Software you ("Licensee") agree to this Agreement. If you do
+not agree, do not use the Software.
+
+1. License Grant.
+   Subject to the terms and conditions of this Agreement, Arcanum Realms LTD ("Licensor") grants Licensee a non-exclusive,
+   royalty-free, worldwide, non-transferable, non-sublicensable license to:
+   (a) use the Software, including in production, for any purpose other than an Excluded Purpose;
+   (b) copy and modify the Software and create derivative works of it for any purpose other than an Excluded
+       Purpose; and
+   (c) distribute the Software, and derivative works of it, in source or object form, for any purpose other
+       than an Excluded Purpose, provided that every copy is accompanied by this Agreement and any NOTICE file
+       included with the Software.
+
+2. Excluded Purpose.
+   An "Excluded Purpose" is making available any software-as-a-service, platform-as-a-service,
+   infrastructure-as-a-service, managed service or other similar online service, or any software product, that
+   competes with Licensor's products or services that provide the Software, including offering the Software's
+   durable-log, streaming, database or materialized-view functionality to third parties as a hosted or managed
+   service, or selling, reselling or relicensing the Software. Using the Software as the backend of games,
+   products and services that Licensee itself operates is not an Excluded Purpose.
+
+3. Conditions.
+   (a) Licensee must not remove or alter any copyright, license or attribution notices in the Software.
+   (b) Licensee must not use Licensor's names, logos or trademarks (including "Arcanum Realms", "Rune" and the Rune
+       mark) except to accurately identify the origin of the Software.
+   (c) Derivative works must carry prominent notices stating that they were modified, and by whom.
+
+4. Third-Party Components.
+   Components of the Software that were authored by third parties are licensed under their own terms, listed
+   in the NOTICE file. Nothing in this Agreement limits Licensee's rights under those licenses.
+
+5. Termination.
+   This Agreement terminates automatically if Licensee breaches any of its terms. On termination Licensee must
+   stop using, copying, modifying and distributing the Software. Sections 5 to 8 survive termination.
+
+6. Disclaimer of Warranty.
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+   TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, NON-INFRINGEMENT AND ACCURACY.
+
+7. Limitation of Liability.
+   TO THE MAXIMUM EXTENT PERMITTED BY LAW, IN NO EVENT WILL LICENSOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+   INCIDENTAL, SPECIAL, EXEMPLARY OR CONSEQUENTIAL DAMAGES, OR ANY LOSS OF DATA, PROFITS OR GOODWILL, ARISING
+   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THIS AGREEMENT, HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+   EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+
+8. General.
+   Licensor reserves all rights not expressly granted in this Agreement. If any provision of this Agreement is
+   held unenforceable, the remaining provisions remain in effect. For uses that require a different license,
+   including any Excluded Purpose, contact Arcanum Realms LTD for a commercial license.
