@@ -8021,6 +8021,17 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
         return;
     }
     const std::string user = st->user;
+    // Issue #130: the throttle gates every proof VERIFICATION, not only the first leg - otherwise N sessions that all
+    // sent AuthClientFirst before any final get N verified guesses per delay.  The control thread handles the finals
+    // one at a time, so each one sees the failure the previous one recorded.  Refused here: not counted (as at the
+    // first leg), the proof is never looked at.
+    if (const LoginThrottle::Verdict v = loginThrottle_.check(user, session->sourceHost, nowNs_); !v.allowed) {
+        ++loginsRateLimited_;
+        if (unauthLog_.due(1)) [[unlikely]]
+            spdlog::warn("auth: rate limited user={} source={} retry_after_ms={}", user, session->sourceHost, v.retryAfterMs);
+        failLogin_(*session, hdr->correlationId, v.retryAfterMs);
+        return;
+    }
     const auto fin = pc::AuthClientFinal::decode(buf, len);
     std::variant<LoginOk, LoginFailure> verdict = LoginFailure::BadProof;
     if (securityView_ == nullptr || securityView_->halted()) verdict = LoginFailure::SecurityHalted;

@@ -431,3 +431,48 @@ TEST(AuthLoginRegression, FakeSaltsAdvertiseTheMostCommonRealIterationCountRegre
     EXPECT_EQ(r->salts[1].iterations, 8192u) << "the one-password user's pad uses it too";
     EXPECT_EQ(Rig().view.fakeIterations(), 4096u) << "the default when the accounts use it";
 }
+
+// Issue #130: the throttle was checked only at the first leg, so N sessions that all sent AuthClientFirst before any
+// final got N verified guesses per delay.  Every proof verification is now gated by the throttle: of 20 parallel
+// sessions (one host, one user) only the free failures plus the one that starts the delay are verified; every other
+// final is refused with 44 + retryAfterMs, before its proof is looked at, and is not counted.
+TEST(LoginThrottleRegression, ParallelSessionsDoNotMultiplyGuessesRegression) {
+    Rig rig;
+    constexpr int kSessions = 20;
+    struct Pending { int64_t sid = 0, corr = 0; std::string nonce; std::vector<uint8_t> first; };
+    std::vector<Pending> pending;
+    for (int i = 0; i < kSessions; ++i) {
+        Pending p;
+        p.sid = rig.newSession("10.0.0.9", 0);
+        p.nonce = "par-nonce-" + std::to_string(i);
+        pc::AuthClientFirst cf;
+        cf.sessionId = p.sid; cf.correlationId = ++rig.corr; cf.username = "ws1"; cf.clientNonce = p.nonce;
+        p.corr = cf.correlationId;
+        std::vector<uint8_t> b(cf.encodedSize()); b.resize(cf.encode(b.data()));
+        rig.send(b);
+        const Frame* f = rig.last(static_cast<uint16_t>(pc::TemplateId::AuthServerFirst), p.sid);
+        ASSERT_NE(f, nullptr) << "no failure yet: every first leg passes";
+        p.first = f->bytes;
+        pending.push_back(std::move(p));
+    }
+    int verified = 0, limited = 0;
+    for (const Pending& p : pending) {
+        const auto first = pc::AuthServerFirst::decode(p.first.data(), p.first.size());
+        ASSERT_TRUE(first.has_value());
+        auto ans = scramAnswer("ws1", p.nonce, *first, {"a wrong guess", "another wrong guess"}, p.sid, p.corr);
+        ASSERT_TRUE(ans.has_value());
+        std::vector<uint8_t> fb(ans->final.encodedSize()); fb.resize(ans->final.encode(fb.data()));
+        rig.send(fb);
+        const Frame* f = rig.last(static_cast<uint16_t>(pc::TemplateId::AuthServerFinal), p.sid);
+        ASSERT_NE(f, nullptr);
+        const auto fin = pc::AuthServerFinal::decode(f->bytes.data(), f->bytes.size());
+        ASSERT_TRUE(fin.has_value());
+        EXPECT_EQ(fin->errorCode, static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed));
+        if (fin->retryAfterMs > 0) ++limited; else ++verified;
+    }
+    // 2 free pair failures + the 3rd, which starts the 250 ms delay.
+    EXPECT_EQ(verified, 3) << "one guess per allowed slot, not one per session";
+    EXPECT_EQ(limited, kSessions - 3);
+    EXPECT_EQ(rig.gw.loginsFailed(), 3u) << "a refused final is not counted as a failure";
+    EXPECT_EQ(rig.gw.loginsRateLimited(), static_cast<uint64_t>(kSessions - 3));
+}
