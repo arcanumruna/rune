@@ -745,3 +745,34 @@ TEST(ProducerTxnClientRegression, ReleasedQueueWithAControlOpInTheRingKeepsItsSl
     }
     EXPECT_TRUE(reused) << "the slot returns once the op's completion is accounted";
 }
+
+// A broker that keeps the session id on a reconnect (auth Required: resumeAuthenticated_) still lost the in-flight
+// coordinator request with the old connection: the client must re-send it, not wait out its deadline.
+// RED (mutation): Client::syncCoordinatorSession_ keyed on the session id alone -> the AddOffsets is never re-sent.
+TEST(CoordinatorLinkRegression, ReconnectWithTheSameSessionIdResendsInFlightRequestsRegression) {
+    TxnRig r(rc::RunnerMode::Invoker);
+    r.gw.uniqueSessionIds = true;    // ids are kept ...
+    r.gw.newIdOnResume    = false;   // ... on a resume: the SAME id comes back
+    r.connect();
+    rc::Producer    p = r.client->producer(txnCfg());
+    rc::Completions cq(*r.client);
+    ASSERT_NO_FATAL_FAILURE(initAndBegin(r, p, cq));
+    const rc::Key key(uint64_t{1});
+    const std::string v = "x";
+    ASSERT_EQ(p.trySend(r.client->topic("t"), key, bytesOf(v)), rc::SendResult::Ok);
+    settle(r);
+    const int64_t sid = r.gw.lastUniqueSessionId();
+    r.gw.holdTxnReplies = true;   // the offsets leg is processed, its answer never leaves
+    const rc::OffsetEntry e{1, 0, 7};
+    ASSERT_EQ(p.sendOffsetsToTransaction(std::span<const rc::OffsetEntry>(&e, 1), "g", cq, 105), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.drive([&] { return r.gw.txnRequestsUnanswered >= 1; }));
+    const int connects = r.gw.connects;
+    const int before   = r.gw.addOffsets;
+    r.gw.expireSession(sid);
+    r.gw.holdTxnReplies = false;
+    ASSERT_TRUE(r.drive([&] { return r.gw.connects > connects; })) << "no reconnect";
+    ASSERT_EQ(r.gw.lastUniqueSessionId(), sid) << "precondition: the broker kept the session id";
+    ASSERT_TRUE(r.await(cq, 105)) << "the in-flight request was not re-sent (addOffsets " << r.gw.addOffsets << ")";
+    EXPECT_GT(r.gw.addOffsets, before);
+    EXPECT_EQ(r.got[105].status, rc::OpStatus::Ok);
+}

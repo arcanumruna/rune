@@ -975,8 +975,9 @@ void CellRunner::txnFenced() {
             EXPECT_EQ(st, rc::OpStatus::Fenced) << "an op that needs the coordinator completes Fenced";
         } else {
             // An added partition's batch goes straight to the partition leader; it may be acknowledged before the
-            // coordinator reveals the fence at the commit.  Its records are never visible (checked below).
-            EXPECT_TRUE(st == rc::OpStatus::Fenced || st == rc::OpStatus::Ok) << static_cast<int>(st);
+            // coordinator reveals the fence at the commit (EndTxn follows the data): the token is Ok.  Its records
+            // are never visible (checked below).
+            EXPECT_EQ(st, rc::OpStatus::Ok) << "the leader acknowledged the batch before the coordinator revealed the fence";
         }
     }
     EXPECT_EQ(r.p->state(), rc::TxnState::FatalError);

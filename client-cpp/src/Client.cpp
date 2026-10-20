@@ -5779,7 +5779,11 @@ void Client::syncCoordinatorSession_() noexcept {
     }
     const bool connected = st == session::SessionState::Connected;
     // Phase 2b F: a new coordinator session (route or id) - in-flight coordinator requests re-send on it.
-    if (connected && sid != 0 && (coordIdx_ != lastCoordIdx_ || sid != lastCoordSid_)) {
+    // Every (re)establishment counts (the episode changes, or the session was not Connected before): a broker
+    // that keeps the session id on a resume (auth Required: resumeAuthenticated_) is still a new session for
+    // the in-flight requests, which were lost with the old connection.
+    if (connected && sid != 0 && (coordIdx_ != lastCoordIdx_ || sid != lastCoordSid_ || episode != lastCoordEpisode_ ||
+                       lastCoordState_ != session::SessionState::Connected)) {
         producerHub_.onCoordinatorSessionChanged();
     }
     groupConsumerHub_.setSessionConnected(connected, sid, episode);
