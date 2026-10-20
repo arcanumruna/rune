@@ -417,12 +417,23 @@ TEST(ProducerTxnAllocRegression, SteadyStateTransactionsAllocateNothingRegressio
     EXPECT_EQ(r.offset, int64_t{10} * (kWarm + kCounted)) << "every record of every transaction was acknowledged";
 }
 
+namespace {
+// Make a heap pointer escape so the compiler cannot elide the new-expression.
+// [expr.new] lets it omit a replaceable allocation whose result never escapes:
+// at -O1 (the TSan build) clang folded `new Wide{}` + `delete w` away entirely,
+// so the counter saw 0 allocations although the align_val_t overload is wired.
+inline void escape(void* p) { asm volatile("" : : "g"(p) : "memory"); }
+}  // namespace
+
 // The zero-alloc gates must see over-aligned allocations too: they use the
 // align_val_t overloads, which bypass the plain replaced operator new.
+// Fix (TSan triage): the allocations below escape, so an optimizing build
+// (-O1 TSan) still performs them inside the counting window.
 TEST(AllocCounterRegression, OverAlignedNewIsCountedRegression) {
     struct alignas(256) Wide { unsigned char b[256]; };
     alloc_counter::startThisThread();
     auto* w = new Wide{};
+    escape(w);
     const long n = alloc_counter::stopThisThread();
     EXPECT_EQ(reinterpret_cast<std::uintptr_t>(w) % 256u, 0u);
     delete w;
@@ -430,6 +441,7 @@ TEST(AllocCounterRegression, OverAlignedNewIsCountedRegression) {
 
     alloc_counter::start();
     auto* arr = new Wide[3];
+    escape(arr);
     const long g = alloc_counter::stop();
     delete[] arr;
     EXPECT_EQ(g, 1);

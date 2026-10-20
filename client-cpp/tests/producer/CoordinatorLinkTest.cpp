@@ -309,6 +309,15 @@ rc::ProducerConfig plainCfg() {
     c.batchBytes = 16 * 1024;
     return c;
 }
+// Ordinal filler: one small Tier-2 slot instead of the default 64 x 2 x 64 KiB
+// (4095 default fillers reserved 32 GiB; TSan's allocator aborted at its 16 GiB
+// per-size-class cap).
+rc::ProducerConfig fillerCfg() {
+    rc::ProducerConfig c = plainCfg();
+    c.tier2Slots     = 1;
+    c.tier2SlotBytes = 4 * 1024;
+    return c;
+}
 }  // namespace
 
 TEST(CoordinatorLinkRegression, AResponseReachesOnlyItsProducerRegression) {
@@ -417,7 +426,7 @@ TEST(CoordinatorLinkRegression, AStaleAnswerAfterOrdinalReuseIsIgnoredRegression
     std::vector<std::unique_ptr<rp::ProducerImpl>> fillers;
     fillers.reserve(4095);
     for (int i = 0; i < 4095; ++i) {
-        fillers.push_back(std::make_unique<rp::ProducerImpl>(plainCfg(), 1 << 10));
+        fillers.push_back(std::make_unique<rp::ProducerImpl>(fillerCfg(), 1 << 10));
         hub.add(fillers.back().get());
     }
     hub.setCoordinatorSink(fake.sink());

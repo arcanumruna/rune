@@ -71,6 +71,18 @@ ProducerConfig ackCfg(int32_t maxInFlight, int64_t lingerUs = 0) {
     return c;
 }
 
+// A producer that only occupies a hub ordinal (never builds a Tier-2 batch):
+// the default pool preallocates tier2Slots(64) x 2 x 64 KiB = 8 MiB per
+// producer, so the 4096-producer ordinal-exhaustion tests reserved 32 GiB and
+// TSan's allocator aborted (16 GiB cap per size class).  One small slot keeps
+// the filler cheap; the producers under test keep the full config.
+ProducerConfig fillerCfg(int32_t maxInFlight) {
+    ProducerConfig c = ackCfg(maxInFlight);
+    c.tier2Slots     = 1;
+    c.tier2SlotBytes = 4 * 1024;
+    return c;
+}
+
 int pump(ProducerImpl& impl, const ProducerImpl::SendFn& sink, int64_t now = kNow) {
     int flushed = 0;
     for (int i = 0; i < 100'000; ++i) {
@@ -131,7 +143,7 @@ TEST(ProducerInFlight, ReleasedOrdinalReusedOnlyAfterFreshOnesRegression) {
     ProducerHub hub;
     std::vector<std::unique_ptr<ProducerImpl>> impls;
     for (uint32_t i = 0; i <= batchcorr::kMaxOrdinal; ++i) {
-        impls.push_back(std::make_unique<ProducerImpl>(ackCfg(1), 1024));
+        impls.push_back(std::make_unique<ProducerImpl>(fillerCfg(1), 1024));
         hub.add(impls.back().get());
         ASSERT_EQ(impls.back()->ordinal(), i);
     }
@@ -140,8 +152,8 @@ TEST(ProducerInFlight, ReleasedOrdinalReusedOnlyAfterFreshOnesRegression) {
     hub.remove(impls[3].get());
     EXPECT_EQ(hub.size(), static_cast<std::size_t>(batchcorr::kMaxOrdinal) + 1 - 2);
     hub.onProduceResponse(batchcorr::make(7, 0, 0), 100, 0);  // a late ack for the released one: dropped
-    auto a = std::make_unique<ProducerImpl>(ackCfg(1), 1024);
-    auto b = std::make_unique<ProducerImpl>(ackCfg(1), 1024);
+    auto a = std::make_unique<ProducerImpl>(fillerCfg(1), 1024);
+    auto b = std::make_unique<ProducerImpl>(fillerCfg(1), 1024);
     hub.add(a.get());
     hub.add(b.get());
     EXPECT_EQ(a->ordinal(), 7u) << "the oldest released ordinal first";
@@ -158,8 +170,8 @@ TEST(ProducerInFlight, ReleasedOrdinalReusedOnlyAfterFreshOnesRegression) {
 TEST(ProducerInFlight, ReusedOrdinalDropsStaleResponseOfPreviousProducerRegression) {
     ProducerHub hub;
     std::vector<std::unique_ptr<ProducerImpl>> impls;
-    for (uint32_t i = 0; i <= batchcorr::kMaxOrdinal; ++i) {
-        impls.push_back(std::make_unique<ProducerImpl>(ackCfg(4), 1024));
+    for (uint32_t i = 0; i <= batchcorr::kMaxOrdinal; ++i) {  // [9] sends below: full config
+        impls.push_back(std::make_unique<ProducerImpl>(i == 9 ? ackCfg(4) : fillerCfg(4), 1024));
         hub.add(impls.back().get());
     }
     // One batch of `p` on slot 0, acked by its own response unless `ack` is false.
