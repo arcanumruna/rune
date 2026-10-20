@@ -910,6 +910,13 @@ if(BUILD_BENCHMARKS AND aeron_FOUND)
     target_link_libraries(rune_producer_encode_bench PRIVATE
         rune_client_api rune_client_producer benchmark::benchmark)
 
+    # Phase 2b Part B — zero-copy produce gate: send vs tryClaim vs typed send vs
+    # typed claim (p50/p99 + steady-state allocations; exit 1 if a claim form allocates)
+    add_executable(rune_producer_claim_bench bench/ProducerClaimBench.cpp tests/support/AllocCounter.cpp)
+    target_include_directories(rune_producer_claim_bench PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${RUNE_CLAIM_GEN_DIR})
+    target_link_libraries(rune_producer_claim_bench PRIVATE rune_client_api rune_client_producer)
+    add_dependencies(rune_producer_claim_bench generate_claim_schema_headers)
+
     # Phase 2b Part C — TypedTopic::send keyed-routing cost (in-process, no Aeron)
     add_executable(rune_typed_topic_send_bench bench/TypedTopicSendBench.cpp)
     add_dependencies(rune_typed_topic_send_bench generate_characters_header)

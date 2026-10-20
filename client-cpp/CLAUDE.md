@@ -77,6 +77,22 @@ alloc-free handoff). The agent drains, accumulates records into per-
   (`close(target, token)`) / `close()` / `closeImmediately()` per F8c C6a.
 - Idempotence: each partition stamps a monotonic `baseSequence` into the batch
   header (`producerId` is a local stub pending real `InitProducerId`).
+- Phase 2b zero-copy produce: `Producer::tryClaim(topic, key, len)` -> `Claim`
+  (`buffer()` / `commit()` / `abort()`, RAII; refused = false + `result()`),
+  `claimBatch(topic, key, n, recLen)` -> `BatchClaim` (`record(i)`),
+  `TypedTopic::claim(key)` -> `TypedClaim<XEncoder>` (generated encoder over the
+  claimed bytes; all-fixed schemas; the key is written by its constructor, so use
+  non-key setters only).  Thread mode claims a producer-ring slot (2 copies: ring
+  -> frame -> Aeron); Invoker mode reserves the record in the partition's Produce
+  frame (1 copy) under the `DirectClaimOpen` state: every other send on that
+  producer returns `ClaimHeld` until it settles, and a failed/closed partition
+  abandons it (`commit()` -> false).  A `claimBatch` appends its n records
+  contiguously and atomically (nothing foreign between them), but an UNFENCED one
+  can join an open RecordBatch with neighbouring sends, and is acked by the
+  BatchAck(s) covering that RecordBatch, not by "one BatchAck of n"; `flush()`
+  (+ `doWork()` in Invoker mode) before the claim fences it into its own
+  RecordBatch.  Zero allocation (gates: `ProducerClaimAllocRegression`,
+  `TypedClaimAllocRegression`, `rune_producer_claim_bench`).
 - `ProducerHub` holds the producers the duty thread owns (registered through
   the agent command ring — no lock, no atomic); `onProduceResponse` routes acks
   back by the batch id's ordinal.

@@ -46,6 +46,8 @@
 //   Completions cq(client);
 //   p.trySend(topic, Key(orderId), val, cq, token); // opt-in ack: zero alloc
 //   cq.poll([](const Completion& c, auto) { /* c.token, c.value = offset */ });
+//   auto c = p.tryClaim(topic, Key(id), PositionEncoder::kEncodedLength);  // zero-copy (2b)
+//   if (c) { PositionEncoder(c.buffer()).zone(4).x(1.5); c.commit(); }
 
 #pragma once
 
@@ -342,7 +344,10 @@ private:
 
 /// n records of recLen bytes claimed together and appended as ONE RecordBatch
 /// (one partition, contiguous offsets, all or nothing) — Producer::claimBatch.
-/// Same RAII / refusal / holding rules as Claim.
+/// An unfenced claim may JOIN an open RecordBatch with neighbouring sends: its
+/// n records stay contiguous (nothing foreign between them) but the batch is
+/// larger than n.  Call flush() (+ doWork() in Invoker mode) before the claim
+/// to fence it into a RecordBatch of its own.  Same RAII / refusal / holding rules as Claim.
 class BatchClaim {
 public:
     BatchClaim() noexcept = default;  ///< refused: InvalidTopic
@@ -358,8 +363,9 @@ public:
     [[nodiscard]] std::span<uint8_t> record(uint32_t i) const noexcept;
     [[nodiscard]] uint32_t count() const noexcept;         ///< n (0 unless open)
     [[nodiscard]] uint32_t recordLength() const noexcept;  ///< recLen (0 unless open)
-    /// Publish all n records as one RecordBatch (one BatchAck of n).  False:
-    /// nothing was open, or the claim was abandoned under it (see Claim).
+    /// Publish all n records contiguously and atomically into one RecordBatch,
+    /// acked by the BatchAck(s) covering that RecordBatch (shared with any
+    /// neighbouring sends unless fenced by flush()).  False: nothing was open, or the claim was abandoned under it (see Claim).
     bool commit() noexcept;
     void abort() noexcept;
 
@@ -592,8 +598,8 @@ public:
     /// batch within ProducerConfig::maxFrameBytes (a conservative bound) and,
     /// Thread mode, 42 + n x recLen <= the producer ring's maxMsgLength
     /// (MessageTooLarge).  Never ahead of a Tier-2 batch queued earlier on the
-    /// partition.  With batchAcksTo bound it reserves n credit units (one
-    /// BatchAck of n returns them).  ZERO allocation in steady state.
+    /// partition.  With batchAcksTo bound it reserves n credit units (the
+    /// BatchAck(s) covering the claim's RecordBatch return them).  ZERO allocation in steady state.
     [[nodiscard]] BatchClaim claimBatch(TopicHandle topic, const Key& key, uint32_t n, uint32_t recLen) noexcept;
 
     /// Setup phase (before the first AckToken send): the per-record ack

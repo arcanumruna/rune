@@ -212,6 +212,27 @@ p.flush();
 p.closeAndWait(10s);
 ```
 
+### Zero-copy claims
+
+```cpp
+Claim c = p.tryClaim(events, Key(uint64_t{42}), PositionEncoder::kEncodedLength);
+if (c) { PositionEncoder(c.buffer()).userId(42).zone(4).x(1.5); c.commit(); }   // refused: c.result()
+auto bc = p.claimBatch(events, Key(uint64_t{42}), 3, PositionEncoder::kEncodedLength);
+if (bc) { for (uint32_t i = 0; i < 3; ++i) fill(bc.record(i)); bc.commit(); }
+auto w = positions.claim(userId);                  // TypedTopic: the generated encoder over the claim
+if (w) { w.zone(4).x(1.5); w.commit(); }           // non-key setters only; the key is already written
+```
+
+- A claim returns the record's bytes in place (Thread mode: a producer-ring slot, 2 copies to the wire; Invoker mode: the
+  Produce frame, 1 copy). It is false when refused (`result()`: `BackPressured`, `MessageTooLarge`, `Closed`, ...).
+  Destruction without `commit()` aborts. Do not hold a claim across blocking work: while an Invoker claim is open, other sends on
+  that producer return `SendResult::ClaimHeld`. `commit()` returns false if the claim was abandoned (close, failed partition).
+- `claimBatch` appends its n records contiguously and atomically: nothing foreign lands between them. An unfenced
+  claim can join an open `RecordBatch` with neighbouring sends, so it is acked by the `BatchAck`(s) covering that `RecordBatch`,
+  not necessarily by one `BatchAck` of n. Call `flush()` (and `doWork()` in Invoker mode) before the claim to fence it into a
+  `RecordBatch` of its own.
+- Steady-state claims allocate nothing (`rune_producer_claim_bench`).
+
 `Producer::framesSent()` and `recordsSent()` are counters. `ProducerConfig::fromEnv()` builds a config from
 `RUNE_LINGER_US` and friends.
 
@@ -282,8 +303,7 @@ try {
 - Other methods: `flush`, `close`, `closeAndWait`, `producerId()`, `producerEpoch()`, `transactionActive()`. A transactional
   producer needs `WRITE` on its transactional id.
 - A `ReadCommitted` consumer sees a transaction's records only after commit.
-- **Not yet in this tree:** a unified `Producer` with `ProducerConfig::transactionalId`, `tryClaim`/`claimBatch` zero-copy
-  produce, and `GroupConsumer::seekToCommitted()` are designed (see `broker/docs/superpowers/plans/`) but are not in the
+- **Not yet in this tree:** a unified `Producer` with `ProducerConfig::transactionalId` and `GroupConsumer::seekToCommitted()` are designed (see `broker/docs/superpowers/plans/`) but are not in the
   headers. Today a transaction uses `TransactionalProducer`, and after an abort you re-create the consumer or reposition
   it with a new subscription.
 
