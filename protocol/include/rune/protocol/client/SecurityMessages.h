@@ -26,6 +26,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <optional>
 #include <string_view>
 #include <vector>
@@ -262,6 +263,69 @@ inline std::optional<SecurityDdl> SecurityDdl::decode(const uint8_t* buf, std::s
         if (pos != avail) return std::nullopt;
     }
     return m;
+}
+
+/// Issue #114: the message a credential-change proof signs, built identically by the client (which proves) and the
+/// gateway (which verifies).  It binds the proof to the SESSION (`loginNonce` = the SCRAM combined nonce of the login
+/// that authenticated it: unique per login, server-chosen in part) and to the REQUEST (its 128-bit request id, which
+/// the leader dedupes on, and every field of the change), so a proof is useless on another session or for another
+/// change.  The proof itself is SCRAM's: ClientKey XOR HMAC(StoredKey, message) over a CURRENT password's verifier.
+/// Names are length-prefixed (a name may hold any character); only fields the wire carries are covered, so the
+/// decoded request rebuilds the very same text.  Cold path (security DDL rate).
+[[nodiscard]] inline std::string credentialChangeMessage(std::string_view loginNonce, const SecurityDdl& m) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string s;
+    s.reserve(160 + loginNonce.size() + m.name.size() + 2 * (m.verifier.salt.size() + 2 * kVerifierKeyBytes));
+    const auto hex = [&](std::string_view bytes) {
+        for (const char c : bytes) {
+            const auto b = static_cast<uint8_t>(c);
+            s += kHex[b >> 4];
+            s += kHex[b & 0x0F];
+        }
+    };
+    const auto num = [&](uint64_t v) { s += std::to_string(v); };
+    s += "rune-credential-change,r=";
+    s += loginNonce;
+    s += ",q=";
+    num(m.ext.requestId.hi);
+    s += ':';
+    num(m.ext.requestId.lo);
+    s += ",u=";
+    num(m.name.size());
+    s += ':';
+    s += m.name;
+    s += ",k=";
+    num(static_cast<uint8_t>(m.kind));
+    s += ",c=";
+    num(static_cast<uint8_t>(m.change));
+    // Only what the wire carries for this change (the encoder drops the rest): both sides must build the same text.
+    if (m.change == UserChangeKind::DropPassword) {
+        s += ",i=";
+        num(m.passwordIndex);
+    }
+    if (m.change == UserChangeKind::SetPassword) {
+        s += ",t=";
+        num(m.terminateSessions);
+    }
+    if (m.hasVerifier()) {
+        s += ",v=";
+        hex(m.verifier.salt);
+        s += ':';
+        num(m.verifier.iterations);
+        s += ':';
+        hex(m.verifier.storedKey);
+        s += ':';
+        hex(m.verifier.serverKey);
+    }
+    return s;
+}
+
+/// Issue #114: whether `m` is a user's change of its OWN credential (`self` = the session's user): ALTER USER <self>
+/// ADD / DROP / SET PASSWORD.
+[[nodiscard]] inline bool isOwnCredentialChange(const SecurityDdl& m, std::string_view self) noexcept {
+    return !self.empty() && m.kind == SecurityOpKind::AlterUser && m.name == self &&
+           (m.change == UserChangeKind::AddPassword || m.change == UserChangeKind::DropPassword ||
+            m.change == UserChangeKind::SetPassword);
 }
 
 inline std::size_t SecurityBootstrap::encodedSize() const noexcept {

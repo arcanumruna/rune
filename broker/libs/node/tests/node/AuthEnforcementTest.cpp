@@ -238,6 +238,27 @@ TEST(AuthEnforcementRegression, SelfPasswordChangeNeedsNoAdmin) {
         << "another user's password needs ADMIN";
 }
 
+// Issue #114: a user's own ADD / DROP / SET PASSWORD (no ADMIN) needs a fresh proof of a CURRENT password, bound to the
+// session's login and to the request.  The session alone - what a hijacked session can send - changes nothing.
+TEST(AuthEnforcementRegression, SelfPasswordChangeNeedsAFreshProofOfTheCurrentPasswordRegression) {
+    AuthRig r;
+    std::string name;
+    const int64_t self = r.newUser({}, &name);
+    // The user itself (a proof of its current password, as the real client sends) may.
+    EXPECT_EQ(r.wire().alterPassword(r.ch(), self, name, pc::UserChangeKind::AddPassword, "second-password-123").errorCode, 0u);
+    EXPECT_TRUE(r.broker().wire().connectAndLogin(r.ch(), name, "second-password-123").ok()) << "the proven change applied";
+    // The attacker holding only the session: every own-credential change is refused and nothing reaches __security.
+    const int64_t before = r.broker().node().securityViewForTest().appliedOffset;
+    r.wire().signOwnCredentialChanges(false);
+    for (const auto change : {pc::UserChangeKind::AddPassword, pc::UserChangeKind::SetPassword, pc::UserChangeKind::DropPassword}) {
+        const auto a = r.wire().alterPassword(r.ch(), self, name, change,
+                                              change == pc::UserChangeKind::DropPassword ? std::string{} : "attacker-password-123");
+        EXPECT_EQ(a.errorCode, 45u) << static_cast<int>(change);
+        EXPECT_NE(a.detail.find("fresh proof of a current password"), std::string::npos) << a.detail;
+    }
+    EXPECT_EQ(r.broker().node().securityViewForTest().appliedOffset, before) << "no event was appended";
+}
+
 TEST(AuthEnforcementRegression, AdminClusterGrantsNoDataAccess) {
     AuthRig r;
     const int64_t admin = r.newUser({cluster(SO::Admin)});

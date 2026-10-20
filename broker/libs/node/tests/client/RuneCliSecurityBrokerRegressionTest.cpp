@@ -190,3 +190,52 @@ TEST(AuthBootstrapWindowRegression, ACredentialedClientLogsInDuringAReopenedWind
                       "--password-file", otpFile, "--broker", b.endpoint()}, &out, &err), 1);
     EXPECT_NE(err.find("already bootstrapped"), std::string::npos) << err;
 }
+
+namespace {
+int userQl(AuthBroker& b, const std::string& user, const std::string& pwFile, const std::string& statement, std::string* err) {
+    static int n = 0;
+    const std::string file = writeTemp("ustmt" + std::to_string(++n) + ".rql", statement + "\n");
+    std::string out;
+    return runCli({"ql", "--broker", b.endpoint(), "--user", user, "--password-file", pwFile, "-f", file}, &out, err);
+}
+}  // namespace
+
+// Issue #121: the guard judges the EFFECTIVE admin, also when ADMIN comes through a role: dropping the role, revoking
+// it from the user, or revoking ADMIN from the role are each refused while that is the last enabled admin.
+TEST(AuthBootstrapWindowRegression, TheLastAdminThroughARoleIsGuardedTooRegression) {
+    AuthBroker b("clilastrole");
+    b.bootstrapAdmin(kNewPassword);
+    std::string err;
+    ASSERT_EQ(adminQl(b, "create role ops;", &err), 0) << err;
+    ASSERT_EQ(adminQl(b, "grant admin on cluster to role ops;", &err), 0) << err;
+    ASSERT_EQ(adminQl(b, "create user admin2 with password 'admin2-password-1234';", &err), 0) << err;
+    ASSERT_EQ(adminQl(b, "grant role ops to user admin2;", &err), 0) << err;
+    (void)adminQl(b, "alter user admin disable;", &err);   // admin2 (through ops) remains: allowed, ends admin's session
+    ASSERT_NE(adminQl(b, "create role probe;", &err), 0) << "admin is disabled";
+    const std::string pw2 = writeTemp("admin2-pw", "admin2-password-1234\n");
+    for (const char* st : {"drop role ops;", "revoke role ops from user admin2;", "revoke admin on cluster from role ops;"}) {
+        EXPECT_NE(userQl(b, "admin2", pw2, st, &err), 0) << st;
+        EXPECT_NE(err.find("last enabled security admin"), std::string::npos) << st << ": " << err;
+    }
+    EXPECT_TRUE(b.node().securityViewForTest().hasSecurityAdmin);
+    EXPECT_EQ(userQl(b, "admin2", pw2, "create role still_admin;", &err), 0) << "admin2 still holds ADMIN: " << err;
+}
+
+// Issue #114 through the REAL CLI and client on a REAL broker: a user without ADMIN changes its own password (the
+// client proves its current one on the wire); the new password then logs in.
+TEST(AuthEnforcementRegression, ARealClientChangesItsOwnPasswordWithAProofRegression) {
+    AuthBroker b("cliselfpw");
+    b.bootstrapAdmin(kNewPassword);
+    std::string err;
+    ASSERT_EQ(adminQl(b, std::string("create user ws1 with password '") + kWs1Password + "';", &err), 0) << err;
+    const std::string ws1Pw = writeTemp("ws1-pw", std::string(kWs1Password) + "\n");
+    EXPECT_EQ(userQl(b, "ws1", ws1Pw, "alter user ws1 add password 'ws1-second-password-1';", &err), 0) << err;
+    auto second = credentialedClient(b, "ws1", "ws1-second-password-1");
+    std::string connectErr;
+    try { second->connectAndWait(std::chrono::seconds(20)); } catch (const std::exception& e) { connectErr = e.what(); }
+    EXPECT_EQ(connectErr, "") << "the added password logs in";
+    second->closeImmediately();
+    // Changing ANOTHER user's password still needs ADMIN, proof or not.
+    EXPECT_NE(userQl(b, "ws1", ws1Pw, "alter user admin set password 'hijacked-password-1';", &err), 0);
+    EXPECT_NE(err.find("ADMIN"), std::string::npos) << err;
+}

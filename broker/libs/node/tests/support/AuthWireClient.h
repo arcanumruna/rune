@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -127,6 +128,15 @@ public:
             out.finalBytes = fin->bytes;
             out.fin = pc::AuthServerFinal::decode(out.finalBytes.data(), out.finalBytes.size());
         }
+        // Issue #114: like the real client, keep what proves this session's own credential changes - the login nonce
+        // and the salted password of the slot the broker signed with.
+        if (out.ok() && out.fin->serverSignature.size() == 64)
+            for (uint8_t i = 0; i < out.answer->final.count; ++i)
+                if (out.answer->salted[i] &&
+                    std::memcmp(out.answer->expectedSignature[i].data(), out.fin->serverSignature.data(), 64) == 0) {
+                    creds_[sid] = Credential{user, std::string(out.first->combinedNonce), *out.answer->salted[i]};
+                    break;
+                }
         return out;
     }
 
@@ -145,6 +155,16 @@ public:
         m.ext.clientName = "auth-wire-client";
         m.ext.statement = statement;
         m.ext.requestId = pinnedRid_ ? *pinnedRid_ : rune::protocol::RequestId{0xA07E'0000'0000'0000ull | nonce_, ++requestCounter_};
+        // Issue #114: a change of the session's own credential carries a proof of the login's password (unless a test
+        // turned signing off to send what an attacker without the password could).
+        std::array<uint8_t, pc::kCredentialProofBytes> proof{};
+        if (const auto c = creds_.find(m.sessionId); signOwnChanges_ && c != creds_.end() && pc::isOwnCredentialChange(m, c->second.user)) {
+            const auto p = rune::crypto::scram::clientProof(rune::crypto::Digest::Sha512, c->second.salted,
+                                                            pc::credentialChangeMessage(c->second.loginNonce, m));
+            if (p) std::memcpy(proof.data(), p->bytes.data(), proof.size());
+            m.flags |= pc::kSecurityDdlFlagCredentialProof;
+            m.credentialProof = std::string_view(reinterpret_cast<const char*>(proof.data()), proof.size());
+        }
         const auto deadline = Clock::now() + within;
         m.correlationId = cl_.nextCorrelationId();
         std::vector<uint8_t> b(m.encodedSize());
@@ -240,12 +260,19 @@ public:
     /// nullopt = a fresh id per DDL again.
     void pinRequestId(std::optional<rune::protocol::RequestId> r) noexcept { pinnedRid_ = r; }
 
+    /// Issue #114: sign a session's own ADD / DROP / SET PASSWORD (the default, as the real client does); false sends it
+    /// with no proof - what a hijacked session without the password can send.
+    void signOwnCredentialChanges(bool on) noexcept { signOwnChanges_ = on; }
+
     /// Cache Hi(password, salt, i) like the real client's ScramCache: only the first login pays PBKDF2.
     void cacheSaltedPasswords(bool on) noexcept { cacheSaltedPasswords_ = on; }
 
     static constexpr int32_t kClientStream = 1;
 
 private:
+    struct Credential { std::string user, loginNonce; rune::crypto::scram::SaltedPassword salted; };
+    std::map<int64_t, Credential> creds_;   ///< per logged-in session id
+    bool signOwnChanges_ = true;
     ShardTestClient cl_;
     ScramSaltCache cache_;
     bool cacheSaltedPasswords_ = false;

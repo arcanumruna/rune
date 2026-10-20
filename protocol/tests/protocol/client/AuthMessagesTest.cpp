@@ -1,7 +1,10 @@
 #include <rune/protocol/client/AuthMessages.h>
 #include <rune/protocol/client/Dispatch.h>
+#include <rune/protocol/client/SecurityMessages.h>
 #include <gtest/gtest.h>
+#include <array>
 #include <string>
+#include <vector>
 namespace pc = rune::protocol::client;
 
 TEST(AuthMessagesRegression, ErrorCodesAndTemplatesArePinned) {
@@ -122,4 +125,116 @@ TEST(AuthMessagesRegression, WrongTemplateDoesNotDecode) {
     EXPECT_FALSE(pc::AuthServerFirst::decode(buf, n));
     EXPECT_FALSE(pc::AuthClientFinal::decode(buf, n));
     EXPECT_FALSE(pc::AuthServerFinal::decode(buf, n));
+}
+
+namespace {
+struct OwnChange {
+    std::array<char, 16> salt{};
+    std::array<char, 64> stored{}, server{}, proof{};
+    pc::SecurityDdl m;
+    OwnChange() {
+        salt.fill('s'); stored.fill('k'); server.fill('v'); proof.fill('p');
+        m.sessionId = 7; m.correlationId = 9; m.ext.clientName = "c"; m.ext.requestId = {11, 12};
+        m.kind = pc::SecurityOpKind::AlterUser; m.name = "ws1"; m.change = pc::UserChangeKind::AddPassword;
+        m.verifier = pc::VerifierWire{std::string_view(salt.data(), salt.size()), 4096,
+                                      std::string_view(stored.data(), 64), std::string_view(server.data(), 64)};
+    }
+    std::vector<uint8_t> encode() const {
+        std::vector<uint8_t> b(m.encodedSize());
+        b.resize(m.encode(b.data()));
+        return b;
+    }
+};
+}  // namespace
+
+// Issues #121 / #114: the optional SecurityDdl trailer (flags; a credential proof).  Absent = byte-identical to the
+// pre-trailer frame; every malformed trailer is refused, never half-read.
+TEST(AuthMessagesRegression, SecurityDdlTrailerRoundTripsAndRefusesMalformedTrailersRegression) {
+    OwnChange c;
+    const std::vector<uint8_t> plain = c.encode();
+    ASSERT_FALSE(plain.empty());
+    auto d = pc::SecurityDdl::decode(plain.data(), plain.size());
+    ASSERT_TRUE(d);
+    EXPECT_EQ(d->flags, 0);
+    EXPECT_TRUE(d->credentialProof.empty());
+
+    c.m.flags = pc::kSecurityDdlFlagForce;
+    const std::vector<uint8_t> forced = c.encode();
+    ASSERT_EQ(forced.size(), plain.size() + 1);
+    EXPECT_TRUE(std::equal(plain.begin(), plain.end(), forced.begin())) << "the trailer only appends";
+    d = pc::SecurityDdl::decode(forced.data(), forced.size());
+    ASSERT_TRUE(d);
+    EXPECT_EQ(d->flags, pc::kSecurityDdlFlagForce);
+
+    c.m.flags = pc::kSecurityDdlFlagForce | pc::kSecurityDdlFlagCredentialProof;
+    c.m.credentialProof = std::string_view(c.proof.data(), c.proof.size());
+    const std::vector<uint8_t> proven = c.encode();
+    ASSERT_EQ(proven.size(), plain.size() + 1 + 64);
+    d = pc::SecurityDdl::decode(proven.data(), proven.size());
+    ASSERT_TRUE(d);
+    EXPECT_EQ(d->credentialProof, std::string_view(c.proof.data(), 64));
+
+    // Refused encodes: an unknown flag, a proof flag without exactly 64 proof bytes.
+    c.m.flags = 0x80;
+    EXPECT_EQ(c.encode().size(), 0u);
+    c.m.flags = pc::kSecurityDdlFlagCredentialProof;
+    c.m.credentialProof = std::string_view(c.proof.data(), 63);
+    EXPECT_EQ(c.encode().size(), 0u);
+
+    // Refused decodes: an explicit 0 flags byte, an unknown bit, a short proof, bytes after the trailer.
+    auto with = [&](std::vector<uint8_t> tail) { std::vector<uint8_t> b = plain; b.insert(b.end(), tail.begin(), tail.end()); return b; };
+    for (const auto& bad : {with({0x00}), with({0x04}), with({0x82}), with(std::vector<uint8_t>(1 + 63, 0x02)),
+                            with({0x01, 0x00}), [&] { auto b = proven; b.push_back(0); return b; }()}) {
+        EXPECT_FALSE(pc::SecurityDdl::decode(bad.data(), bad.size()).has_value()) << bad.size();
+    }
+    // Every truncation of the proven frame that cuts into the trailer is refused (the cut at the body's end is the
+    // plain frame itself).
+    for (std::size_t n = plain.size() + 1; n < proven.size(); ++n)
+        EXPECT_FALSE(pc::SecurityDdl::decode(proven.data(), n).has_value()) << n;
+}
+
+// Issue #114: the signed message covers exactly what the wire carries.  Any change of a carried field changes it; a
+// client-memory-only field (passwordIndex on an ADD, terminateSessions on a DROP) does not, so the decoded request
+// rebuilds the same text the client signed.
+TEST(AuthMessagesRegression, CredentialChangeMessageCoversExactlyTheWireFieldsRegression) {
+    OwnChange c;
+    const std::string base = pc::credentialChangeMessage("nonce-A", c.m);
+    EXPECT_NE(pc::credentialChangeMessage("nonce-B", c.m), base) << "bound to the login";
+    auto differs = [&](auto mutate, const char* what) {
+        OwnChange o;
+        mutate(o);
+        EXPECT_NE(pc::credentialChangeMessage("nonce-A", o.m), base) << what;
+    };
+    differs([](OwnChange& o) { o.m.ext.requestId.lo = 13; }, "request id");
+    differs([](OwnChange& o) { o.m.name = "ws2"; }, "user");
+    differs([](OwnChange& o) { o.m.change = pc::UserChangeKind::SetPassword; }, "change kind");
+    differs([](OwnChange& o) { o.stored[3] = 'X'; }, "verifier stored key");
+    differs([](OwnChange& o) { o.salt[0] = 'X'; }, "verifier salt");
+    differs([](OwnChange& o) { o.m.verifier.iterations = 8192; }, "verifier iterations");
+    {
+        OwnChange o;
+        o.m.passwordIndex = 2;   // not on the wire for an ADD
+        EXPECT_EQ(pc::credentialChangeMessage("nonce-A", o.m), base);
+    }
+    {
+        OwnChange o;   // the decoded frame rebuilds the same message
+        o.m.passwordIndex = 1;
+        o.m.flags = pc::kSecurityDdlFlagCredentialProof;
+        o.m.credentialProof = std::string_view(o.proof.data(), 64);
+        const auto b = o.encode();
+        const auto d = pc::SecurityDdl::decode(b.data(), b.size());
+        ASSERT_TRUE(d);
+        EXPECT_EQ(pc::credentialChangeMessage("nonce-A", *d), pc::credentialChangeMessage("nonce-A", o.m));
+    }
+    {   // a name holding the separators is length-prefixed: no two names render alike
+        OwnChange a, b;
+        a.m.name = "x,c=2";
+        b.m.name = "x";
+        EXPECT_NE(pc::credentialChangeMessage("n", a.m), pc::credentialChangeMessage("n", b.m));
+    }
+    EXPECT_TRUE(pc::isOwnCredentialChange(c.m, "ws1"));
+    EXPECT_FALSE(pc::isOwnCredentialChange(c.m, "ws2"));
+    EXPECT_FALSE(pc::isOwnCredentialChange(c.m, ""));
+    c.m.change = pc::UserChangeKind::Disable;
+    EXPECT_FALSE(pc::isOwnCredentialChange(c.m, "ws1")) << "DISABLE is not a credential change";
 }

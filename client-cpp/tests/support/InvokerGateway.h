@@ -226,6 +226,7 @@ struct InvokerGateway {
     std::vector<uint8_t> clusterKey;
     int                  bootstraps = 0;                 // accepted bootstraps
     std::set<std::string> mustChange;                    // users that must change their password first (their requests: 47)
+    int unprovenCredentialChanges = 0;                   // issue #114: own-credential changes without a valid proof
     /// Review B M6: the login's first leg is held (AuthClientFirst captured, not answered) until releaseHeldAuth().
     bool holdAuthFirst = false;
     int  heldAuthFirsts = 0;
@@ -979,7 +980,7 @@ private:
         std::string user, combined, clientFirstBare;
         std::vector<rune::crypto::scram::Verifier> real;   // the real slots, oldest first (copied at AuthClientFirst)
     };
-    struct AuthAuthenticated { std::string user; };
+    struct AuthAuthenticated { std::string user; std::string loginNonce; };   // loginNonce: issue #114 proofs
     using AuthSessionState = std::variant<AuthAnonymous, AuthAwaitingFirst, AuthAwaitingFinal, AuthAuthenticated>;
     std::vector<std::pair<int, std::vector<uint8_t>>> heldAuth_;
     std::map<int64_t, AuthSessionState> authState_;
@@ -1128,10 +1129,11 @@ private:
             f.flags = (mustChangePassword || mustChange.count(st->user) != 0) ? rp::kAuthFlagMustChangePassword : uint8_t{0};
             const std::string sigStr(reinterpret_cast<const char*>(sig.bytes.data()), sig.size);
             const std::string loginUser = st->user;
+            const std::string loginNonce = st->combined;
             f.serverSignature = sigStr;
             std::vector<uint8_t> out(f.encodedSize());
             const std::size_t n = f.encode(out.data());
-            it->second = AuthAuthenticated{loginUser};
+            it->second = AuthAuthenticated{loginUser, loginNonce};
             ++authOk;
             authSessionIds.push_back(sid);
             replyTo_(endpoint, sid, out.data(), n);
@@ -1395,7 +1397,18 @@ private:
                     if (t != rcc::TemplateId::Disconnect && t != rcc::TemplateId::Ping) {
                         if (t == rcc::TemplateId::SecurityDdl) {
                             const auto m = rp::SecurityDdl::decode(buf, len);
-                            if (m && m->kind == rp::SecurityOpKind::AlterUser &&
+                            // Issue #114 (as the broker): the change must carry a proof of a current password over
+                            // this session's login nonce.
+                            bool proven = false;
+                            if (m && (m->flags & rp::kSecurityDdlFlagCredentialProof) != 0 && m->credentialProof.size() == 64) {
+                                const std::string msg = rp::credentialChangeMessage(au->loginNonce, *m);
+                                for (const auto& cur : users[au->user])
+                                    proven |= rune::crypto::scram::verifyClientProof(
+                                        rune::crypto::Digest::Sha512, cur.storedKey, msg,
+                                        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(m->credentialProof.data()), 64));
+                            }
+                            if (m && !proven) ++unprovenCredentialChanges;
+                            if (m && proven && m->kind == rp::SecurityOpKind::AlterUser &&
                                 m->change == rp::UserChangeKind::SetPassword && m->name == au->user) {
                                 rune::crypto::scram::Verifier v;
                                 v.salt.assign(m->verifier.salt.begin(), m->verifier.salt.end());

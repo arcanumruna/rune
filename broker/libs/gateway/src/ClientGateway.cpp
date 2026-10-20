@@ -6,6 +6,8 @@
 #include <rune/gateway/CryptoFrame.h>
 #include <rune/gateway/RequestRejection.h>
 #include <rune/gateway/BootstrapProof.h>
+#include <rune/crypto/Kdf.h>
+#include <rune/crypto/Scram.h>
 #include <cassert>
 #include <flight_recorder/FlightRecorder.h>
 #include <rune/gateway/TopicRegistry.h>
@@ -8057,14 +8059,15 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
         return;
     }
     const LoginOk& ok = std::get<LoginOk>(verdict);
+    std::string loginNonce = st->combinedNonce;   // issue #114: before session->auth (which owns *st) is replaced
     ++loginsOk_;
     loginThrottle_.onSuccess(user, session->sourceHost);
     spdlog::info("auth: login ok user={} source={} session={}", ok.user, session->sourceHost, session->sessionId);
     if (!session->crypto.encrypted)   // D12: TLS stays optional - said once per session (a session logs in once)
         spdlog::warn("auth: session {} authenticated over plaintext (no TLS): frames are not integrity-protected",
                      session->sessionId);
-    if (ok.mustChangePassword) session->auth = AuthPasswordChangeRequired{ok.userId, ok.user};
-    else                       session->auth = AuthAuthenticated{ok.userId, ok.user, compilePerms_(ok.userId)};
+    if (ok.mustChangePassword) session->auth = AuthPasswordChangeRequired{ok.userId, ok.user, std::move(loginNonce)};
+    else session->auth = AuthAuthenticated{ok.userId, ok.user, compilePerms_(ok.userId), std::move(loginNonce)};
     // Authentication Task 13: announce-before-accept for permissions - the workers learn this session's WRITE bitmap
     // BEFORE the client learns it is logged in, so it can never produce ahead of its grants.
     const uint64_t shipEpoch = shipPermissions_(*session);
@@ -8206,7 +8209,7 @@ void ClientGateway::refreshSession_(int64_t sid)
         // The Task 11 transition, through this one path: a SET PASSWORD cleared the user's must-change flag.
         const rune::security::UserObject* user = securityView_->state().userById(pcr->userId);
         if (user == nullptr || user->mustChangePassword) return;
-        s->auth = AuthAuthenticated{pcr->userId, pcr->user, compilePerms_(pcr->userId)};
+        s->auth = AuthAuthenticated{pcr->userId, pcr->user, compilePerms_(pcr->userId), pcr->loginNonce};
         (void)shipPermissions_(*s);
         return;
     }
@@ -8366,20 +8369,68 @@ void ClientGateway::handleSecurityDdl(const uint8_t* buf, std::size_t len)
                              "SecurityDdl needs client version 9");
         return;
     }
-    // Authentication Task 12 (D20): ADMIN ON CLUSTER - except a user's own ALTER USER <self> ADD / DROP / SET PASSWORD.
+    // Authentication Task 12 (D20): ADMIN ON CLUSTER - except a user's own ALTER USER <self> ADD / DROP / SET PASSWORD,
+    // which (issue #114) needs a fresh proof of a CURRENT password instead: the session alone (a hijacked plaintext
+    // session, a leaked one) must not turn into a permanent second password.
     {
         const std::string* self = nullptr;
-        if (const auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&session->auth)) self = &a->user;
-        else if (const auto* p = std::get_if<rune::gateway::AuthPasswordChangeRequired>(&session->auth)) self = &p->user;
-        const bool ownPassword = self != nullptr && m.kind == pc::SecurityOpKind::AlterUser && m.name == *self &&
-                                 (m.change == pc::UserChangeKind::AddPassword || m.change == pc::UserChangeKind::DropPassword ||
-                                  m.change == pc::UserChangeKind::SetPassword);
-        if (!ownPassword &&
-            deny_(*session, rune::gateway::authorizeCluster(permsOf_(*session), rune::security::Operation::Admin), buf, len))
-            return;
+        const std::string* loginNonce = nullptr;
+        if (const auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&session->auth)) { self = &a->user; loginNonce = &a->loginNonce; }
+        else if (const auto* p = std::get_if<rune::gateway::AuthPasswordChangeRequired>(&session->auth)) { self = &p->user; loginNonce = &p->loginNonce; }
+        std::optional<rune::gateway::Denial> admin =
+            rune::gateway::authorizeCluster(permsOf_(*session), rune::security::Operation::Admin);
+        const bool ownPassword = self != nullptr && pc::isOwnCredentialChange(m, *self);
+        if (!ownPassword) {
+            if (deny_(*session, admin, buf, len)) return;
+        } else if (admin) {   // no ADMIN: the change must carry a valid proof
+            if (deny_(*session, verifyOwnCredentialChange_(*session, m, *self, *loginNonce), buf, len)) return;
+        }
+        if (ownPassword && m.change == pc::UserChangeKind::AddPassword)   // a second password: always worth a line
+            spdlog::warn("security: user {} adds a password to its own account (session {}, source {})", *self,
+                         session->sessionId, session->sourceHost);
     }
     answerAdminSubmit_(buf, len, adminSink_->submitSecurityDdl(m, ddlMetaOf_(&m.ext, m.sessionId, *session)),
                        "SecurityDdl: admin ring full", "SecurityDdl: request larger than the admin ring message");
+}
+
+std::optional<rune::gateway::Denial> ClientGateway::verifyOwnCredentialChange_(Session& session, const pc::SecurityDdl& m,
+                                                                               const std::string& self,
+                                                                               const std::string& loginNonce)
+{
+    // Issue #114.  Every failure is the same text (it never says which part failed) and counts as a failed login on
+    // the throttle: a proof is a password guess.  Cold path (security DDL rate).
+    rune::gateway::Denial refused;
+    refused.detail = "not authorized: changing your own password needs a fresh proof of a current password (log in again "
+                     "and retry)";
+    const rune::gateway::LoginThrottle::Verdict v = loginThrottle_.check(self, session.sourceHost, nowNs_);
+    if (!v.allowed) {
+        ++loginsRateLimited_;
+        return refused;
+    }
+    bool ok = false;
+    const rune::security::UserObject* user =
+        securityView_ != nullptr && !securityView_->halted() ? securityView_->state().user(self) : nullptr;
+    if (user != nullptr && !loginNonce.empty() && (m.flags & pc::kSecurityDdlFlagCredentialProof) != 0 &&
+        m.credentialProof.size() == pc::kCredentialProofBytes && !m.ext.requestId.none()) {
+        const std::string message = pc::credentialChangeMessage(loginNonce, m);
+        const auto proof = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(m.credentialProof.data()),
+                                                    pc::kCredentialProofBytes);
+        for (const auto& cur : user->verifiers) {   // any CURRENT password; no early exit
+            rune::crypto::DigestBytes stored;
+            std::memcpy(stored.bytes.data(), cur.storedKey.data(), cur.storedKey.size());
+            stored.size = static_cast<uint8_t>(cur.storedKey.size());
+            ok |= rune::crypto::scram::verifyClientProof(rune::crypto::Digest::Sha512, stored, message, proof);
+        }
+    }
+    if (!ok) {
+        loginThrottle_.onFailure(self, session.sourceHost, nowNs_);
+        if (unauthLog_.due(4)) [[unlikely]]
+            spdlog::warn("security: user {} sent a change of its own password without a valid proof (session {}, source {})",
+                         self, session.sessionId, session.sourceHost);
+        return refused;
+    }
+    loginThrottle_.onSuccess(self, session.sourceHost);
+    return std::nullopt;
 }
 
 void ClientGateway::handleSecurityBootstrap(const uint8_t* buf, std::size_t len)

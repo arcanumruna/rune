@@ -39,6 +39,11 @@ struct ScramSentFinal {
     std::array<std::string, 2>                authMessages;
     std::array<rune::crypto::DigestBytes, 2>  expected;     // the server signature each verifier would sign with
     uint8_t                                   count = 1;
+    // Issue #114: what a later own-credential change of this session is proven with - the combined nonce and the
+    // (salt, iterations) of each slot (the salted password itself stays in the ScramCache: no extra key copy).
+    std::string                               combinedNonce;
+    std::array<std::string, 2>                salts;
+    std::array<uint32_t, 2>                   iterations{};
     bool                                      sent = false;   // as ScramSentFirst::sent
 };
 

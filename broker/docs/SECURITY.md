@@ -52,7 +52,7 @@ Rules that keep the model small (D15 to D17):
 | `DropTopic` / `DropView` | `DROP` on the object |
 | Catalog history, as-of, diff, export, replay (`__catalog` reads) (D21) | `DESCRIBE` on `CLUSTER` |
 | User, role and grant DDL; every `SHOW USERS|ROLES|GRANTS|SECURITY HISTORY` (D20) | `ADMIN` on `CLUSTER` |
-| `ALTER USER <self> SET|ADD|DROP PASSWORD` (D20) | nothing (a user changes their own password) |
+| `ALTER USER <self> SET|ADD|DROP PASSWORD` (D20) | no grant, but a fresh proof of a current password (the client sends it; a session alone is not enough) |
 
 **Visibility.** Objects the user cannot `DESCRIBE` do not appear in metadata or listings. Direct
 access to such an object answers `NotAuthorized`, whether or not the object exists, so the answer
@@ -64,7 +64,10 @@ always `not authorized: <OP> on <TYPE> <requested name or id>` (D23).
 
 ## Rune QL statements
 
-All security statements need `ADMIN ON CLUSTER`, except a user changing their own password. A
+All security statements need `ADMIN ON CLUSTER`, except a user changing their own password. That
+change carries a SCRAM proof of a current password, bound to the session's login and to the request,
+so a hijacked or leaked session cannot add or replace a password. After a `SET PASSWORD`, log in again
+before the next change of your own password. A
 statement that carries a password literal is always read from a file or stdin with
 `rune ql -f` (`-e` refuses it, so the password never shows in `ps` or the shell history). Passwords
 are turned into SCRAM verifiers by the client library or the CLI before sending: the plaintext

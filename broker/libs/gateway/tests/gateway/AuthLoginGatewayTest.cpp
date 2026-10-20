@@ -107,7 +107,12 @@ struct Rig {
         return nullptr;
     }
     void send(const std::vector<uint8_t>& f) { gw.applyClientFrameForTest(f.data(), f.size()); }
-    struct Outcome { std::optional<pc::AuthServerFinal> fin; std::vector<uint8_t> finBytes, firstBytes; int64_t sid = 0; };
+    struct Outcome {
+        std::optional<pc::AuthServerFinal> fin; std::vector<uint8_t> finBytes, firstBytes; int64_t sid = 0;
+        // Issue #114: what proves this session's own credential changes (the real client keeps the same).
+        std::string combinedNonce;
+        std::optional<rune::crypto::scram::SaltedPassword> salted;
+    };
     /// The whole exchange; passwords[i] tried against slot i.
     Outcome login(const std::string& user, const std::array<std::string, 2>& passwords, const std::string& host = "10.0.0.9") {
         Outcome o;
@@ -129,6 +134,12 @@ struct Rig {
             const std::size_t mid = seen.size();
             send(fb);
             for (std::size_t i = mid; i < seen.size(); ++i) if (seen[i].tid == static_cast<uint16_t>(pc::TemplateId::AuthServerFinal)) fin = &seen[i];
+            o.combinedNonce = std::string(first->combinedNonce);
+            if (fin != nullptr)
+                if (const auto f = pc::AuthServerFinal::decode(fin->bytes.data(), fin->bytes.size()); f && f->serverSignature.size() == 64)
+                    for (uint8_t i = 0; i < ans->final.count; ++i)
+                        if (ans->salted[i] && std::memcmp(ans->expectedSignature[i].data(), f->serverSignature.data(), 64) == 0)
+                            o.salted = ans->salted[i];
         } else {
             for (std::size_t i = before; i < seen.size(); ++i) if (seen[i].tid == static_cast<uint16_t>(pc::TemplateId::AuthServerFinal)) fin = &seen[i];
         }
@@ -144,7 +155,10 @@ std::vector<uint8_t> defineTopicFrame(int64_t sid, int64_t corr) {
     std::vector<uint8_t> b(m.encodedSize() + 64); b.resize(m.encode(b.data())); return b;
 }
 
-std::vector<uint8_t> alterUserFrame(int64_t sid, int64_t corr, const std::string& name, pc::UserChangeKind change) {
+/// `signer` (issue #114): sign the change with that login's nonce and salted password (`nonce` overrides the nonce: a
+/// proof made for another session).  nullptr = no proof at all.
+std::vector<uint8_t> alterUserFrame(int64_t sid, int64_t corr, const std::string& name, pc::UserChangeKind change,
+                                    const Rig::Outcome* signer = nullptr, std::optional<std::string> nonce = std::nullopt) {
     pc::SecurityDdl m;
     m.sessionId = sid; m.correlationId = corr; m.ext.clientName = "t"; m.ext.requestId = {1, static_cast<uint64_t>(corr)};
     m.kind = pc::SecurityOpKind::AlterUser; m.name = name; m.change = change;
@@ -152,6 +166,14 @@ std::vector<uint8_t> alterUserFrame(int64_t sid, int64_t corr, const std::string
     m.verifier = pc::VerifierWire{std::string_view(reinterpret_cast<const char*>(v.salt.data()), 16), 4096,
         std::string_view(reinterpret_cast<const char*>(v.storedKey.data()), 64),
         std::string_view(reinterpret_cast<const char*>(v.serverKey.data()), 64)};
+    std::array<uint8_t, pc::kCredentialProofBytes> proof{};
+    if (signer != nullptr && signer->salted) {
+        const auto p = rune::crypto::scram::clientProof(rune::crypto::Digest::Sha512, *signer->salted,
+                                                        pc::credentialChangeMessage(nonce ? *nonce : signer->combinedNonce, m));
+        if (p) std::memcpy(proof.data(), p->bytes.data(), proof.size());
+        m.flags |= pc::kSecurityDdlFlagCredentialProof;
+        m.credentialProof = std::string_view(reinterpret_cast<const char*>(proof.data()), proof.size());
+    }
     std::vector<uint8_t> b(m.encodedSize()); b.resize(m.encode(b.data())); return b;
 }
 
@@ -326,8 +348,9 @@ TEST(AuthLoginTest, ASessionThatMustChangeItsPasswordMayOnlyChangeItsOwnAndThenI
         EXPECT_EQ(pc::DdlResponse::decode(f->bytes.data(), f->bytes.size())->errorCode,
                   static_cast<uint16_t>(pc::ErrorCode::PasswordChangeRequired)) << c;
     }
-    // ALTER USER admin SET PASSWORD reaches the admin ring, stamped with the user.
-    rig.send(alterUserFrame(o.sid, 73, "admin", pc::UserChangeKind::SetPassword));
+    // ALTER USER admin SET PASSWORD (proven with the one-time password, issue #114) reaches the admin ring, stamped
+    // with the user.
+    rig.send(alterUserFrame(o.sid, 73, "admin", pc::UserChangeKind::SetPassword, &o));
     EXPECT_EQ(rig.admin.securityDdls, 1);
     EXPECT_EQ(rig.admin.lastAuthenticated, "admin");
     EXPECT_TRUE(std::holds_alternative<AuthPasswordChangeRequired>(*rig.gw.sessionAuthForTest(o.sid))) << "not before it applied";
@@ -475,4 +498,57 @@ TEST(LoginThrottleRegression, ParallelSessionsDoNotMultiplyGuessesRegression) {
     EXPECT_EQ(limited, kSessions - 3);
     EXPECT_EQ(rig.gw.loginsFailed(), 3u) << "a refused final is not counted as a failure";
     EXPECT_EQ(rig.gw.loginsRateLimited(), static_cast<uint64_t>(kSessions - 3));
+}
+
+// Issue #114 at the gateway: a user's own credential change without ADMIN needs a proof of a CURRENT password over the
+// SESSION's login nonce and the request.  No proof, a proof made for another session, a proof under a wrong password:
+// each answered 45 and never forwarded; the right one is forwarded.  Every bad proof counts on the login throttle.
+TEST(AuthLoginRegression, OwnCredentialChangeNeedsAProofBoundToTheSessionRegression) {
+    Rig rig;
+    const auto a = rig.login("ws1", {kTestPasswordA, ""});
+    const auto b = rig.login("ws1", {kTestPasswordA, ""});
+    ASSERT_EQ(a.fin->errorCode, 0);
+    ASSERT_EQ(b.fin->errorCode, 0);
+    ASSERT_TRUE(a.salted.has_value());
+    ASSERT_NE(a.combinedNonce, b.combinedNonce) << "every login has its own nonce";
+    auto answerCode = [&](int64_t corr) -> int {
+        for (auto it = rig.seen.rbegin(); it != rig.seen.rend(); ++it)
+            if (it->corr == corr && it->tid == static_cast<uint16_t>(pc::TemplateId::DdlResponse))
+                return pc::DdlResponse::decode(it->bytes.data(), it->bytes.size())->errorCode;
+        return -1;
+    };
+    Rig::Outcome wrongPassword = a;
+    const std::array<uint8_t, 16> salt{};
+    wrongPassword.salted = rune::crypto::scram::saltPassword(rune::crypto::Digest::Sha512, "not the password", salt, 4096);
+    // Each forged change at a time past the previous throttle delay (2 free, then 250 ms, 500 ms ...), so every one of
+    // them reaches the proof check.
+    struct Forged { int64_t sid; const Rig::Outcome* signer; std::optional<std::string> nonce; const char* what; };
+    const Forged forged[] = {
+        {b.sid, nullptr, std::nullopt, "no proof (what a hijacked session can send)"},
+        {b.sid, &a, std::nullopt, "A's proof replayed on session B"},
+        {a.sid, &a, b.combinedNonce, "a proof over another session's nonce"},
+        {a.sid, &wrongPassword, std::nullopt, "a proof under a wrong password"},
+    };
+    int64_t now = 0;
+    int64_t corr = 80;
+    for (const Forged& f : forged) {
+        rig.send(alterUserFrame(f.sid, ++corr, "ws1", pc::UserChangeKind::AddPassword, f.signer, f.nonce));
+        EXPECT_EQ(answerCode(corr), 45) << f.what;
+        now += 2'000'000'000; rig.gw_now = now; rig.gw.setNowNsForTest(now);
+    }
+    EXPECT_EQ(rig.admin.securityDdls, 0) << "nothing forwarded";
+    EXPECT_TRUE(rig.logContains("sent a change of its own password without a valid proof"));
+    // Bad proofs count on the login throttle: right after one, even a right proof is refused ...
+    rig.send(alterUserFrame(a.sid, ++corr, "ws1", pc::UserChangeKind::AddPassword, &wrongPassword));
+    rig.send(alterUserFrame(a.sid, ++corr, "ws1", pc::UserChangeKind::AddPassword, &a));
+    EXPECT_EQ(answerCode(corr), 45) << "throttled like a login";
+    EXPECT_EQ(rig.admin.securityDdls, 0);
+    // ... and after the delay the session's own proof is accepted (also for SET and DROP).
+    now += 60'000'000'000; rig.gw_now = now; rig.gw.setNowNsForTest(now);
+    rig.send(alterUserFrame(a.sid, ++corr, "ws1", pc::UserChangeKind::AddPassword, &a));
+    EXPECT_EQ(rig.admin.securityDdls, 1) << "the session's own proof is accepted";
+    EXPECT_TRUE(rig.logContains("adds a password to its own account"));
+    rig.send(alterUserFrame(a.sid, ++corr, "ws1", pc::UserChangeKind::SetPassword, &a));
+    rig.send(alterUserFrame(a.sid, ++corr, "ws1", pc::UserChangeKind::DropPassword, &a));
+    EXPECT_EQ(rig.admin.securityDdls, 3);
 }

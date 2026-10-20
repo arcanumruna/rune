@@ -2199,7 +2199,7 @@ private:
     /// handleSubscribe for topicId == kSecurityTopicId (authentication Task 10): the same contract on the second server.
     void handleSecuritySubscribe_(Session& session, const rune::protocol::client::Subscribe& msg);
     uint64_t securitySubscribesForwarded_ = 0;
-    rune::node::UnauthLogLimiter unauthLog_;   ///< X103: 1/1024 limiter of the log lines unauthenticated senders drive (kinds: 0 require-TLS, 1 login rate limited, 2 halted login, 3 bad bootstrap proof, 5 client version refusal, 6 malformed first login leg, 8+ login failed per reason)
+    rune::node::UnauthLogLimiter unauthLog_;   ///< X103: 1/1024 limiter of the log lines unauthenticated senders drive (kinds: 0 require-TLS, 1 login rate limited, 2 halted login, 3 bad bootstrap proof, 4 own-password change without a valid proof (#114), 5 client version refusal, 6 malformed first login leg, 8+ login failed per reason)
     uint64_t controlBatchRefusals_ = 0;   ///< X036: Produce frames refused for carrying a client control batch (rate-limited log)
     static void noteReadCorr_(std::vector<int64_t>& corrs, int64_t corr);
     rune::gateway::GatewayAuthMode authMode_ = rune::gateway::GatewayAuthMode::InProcess;
@@ -2242,6 +2242,12 @@ private:
     /// true = DENIED here: answered NotAuthorized (45) in the request's own response type (D23 text where the type
     /// carries one) - the caller returns without forwarding anything.
     [[nodiscard]] bool deny_(Session& session, const std::optional<rune::gateway::Denial>& denial, const uint8_t* buf, std::size_t len);
+    /// Issue #114: a user's own ADD / DROP / SET PASSWORD without ADMIN - nullopt when it carries a valid proof of a
+    /// current password over credentialChangeMessage(the session's login nonce, m); throttled like a login.
+    [[nodiscard]] std::optional<rune::gateway::Denial> verifyOwnCredentialChange_(Session& session,
+                                                                                const rune::protocol::client::SecurityDdl& m,
+                                                                                const std::string& self,
+                                                                                const std::string& loginNonce);
     /// Group / txn / catalog-DDL request authorization (cold paths): true = denied and answered.
     [[nodiscard]] bool denyGroupRequest_(Session& session, uint16_t tid, const uint8_t* buf, std::size_t len);
     [[nodiscard]] bool denyTxnRequest_(Session& session, uint16_t tid, const uint8_t* buf, std::size_t len);

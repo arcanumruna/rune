@@ -33,6 +33,7 @@
 #include <rune/crypto/Kdf.h>
 #include <rune/crypto/Scram.h>
 #include <rune/protocol/client/AuthMessages.h>
+#include <rune/protocol/client/SecurityMessages.h>
 
 // client<->broker TLS/AEAD (Task 5) — cold-path handshake drive.  TlsSession/AeadCipher
 // are forward-declared-opaque wrappers around OpenSSL; including them here does NOT
@@ -357,6 +358,33 @@ public:
     /// carry ONLY the bootstrap — the broker answers any other frame AuthenticationFailed and closes it, so the
     /// machine sends no keepalive and the Client no connect-time metadata request on it.
     [[nodiscard]] bool anonymousBootstrap() const noexcept { return authInfo_.anonymousBootstrap; }
+
+    /// Issue #114: sign, in place, a SecurityDdl frame that changes this session's OWN credential (ALTER USER <self>
+    /// ADD / DROP / SET PASSWORD carrying the CredentialProof flag): its last kCredentialProofBytes become the SCRAM
+    /// proof of the password this machine logged in with, over credentialChangeMessage(the login's combined nonce,
+    /// the request) - so it is valid on THIS broker session only.  Called on every offer of the frame, after the
+    /// session id is stamped (a redirect or a reconnect re-signs it for the session it now rides).  Any other frame,
+    /// or a session this machine did not log in on, is left untouched (the broker then refuses the change).  Duty
+    /// thread; cold path (PBKDF2 only if the cache lost the entry).
+    void signOwnCredentialChange(uint8_t* buf, std::size_t len) noexcept {
+        namespace rpc = rune::protocol::client;
+        try {
+            if (!loginCredential_ || loginCredential_->sessionId != sessionId_ || authenticatedSessionId_ != sessionId_) return;
+            const auto m = rpc::SecurityDdl::decode(buf, len);
+            if (!m || (m->flags & rpc::kSecurityDdlFlagCredentialProof) == 0 || !rpc::isOwnCredentialChange(*m, cfg_.username))
+                return;
+            const LoginCredential& c = *loginCredential_;
+            const auto salt = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(c.salt.data()), c.salt.size());
+            const auto* sp = cache_->saltedPassword(cfg_.password, salt, c.iterations);
+            if (sp == nullptr) return;
+            const auto proof = rune::crypto::scram::clientProof(rune::crypto::Digest::Sha512, *sp,
+                                                                rpc::credentialChangeMessage(c.loginNonce, *m));
+            if (!proof || proof->size != rpc::kCredentialProofBytes) return;
+            std::memcpy(buf + len - rpc::kCredentialProofBytes, proof->bytes.data(), rpc::kCredentialProofBytes);
+        } catch (...) {
+            // allocation failure: the frame goes unsigned and the broker refuses the change (explicitly)
+        }
+    }
     /// Why the machine refused the broker (Rejected after an OK ConnectResponse that skipped the login); "" if not.
     [[nodiscard]] const std::string& rejectDetail() const noexcept { return rejectDetail_; }
     /// Review B I4: the session user changed their own password — the next login uses the new one, and a
@@ -365,6 +393,10 @@ public:
         if (!cfg_.password.empty()) detail::secureZero(cfg_.password.data(), cfg_.password.size());
         cfg_.password.assign(newPassword);
         authInfo_.passwordChangeRequired = false;
+        // Issue #114: the login's password may be gone (SET replaces every verifier): this session can no longer prove a
+        // further own-credential change (the broker answers "log in again") - never sign with a stale salt, which
+        // would also cost a PBKDF2 on the duty thread.
+        loginCredential_.reset();
     }
     /// Authentication: the retryAfterMs of the AuthServerFinal{44} that last refused this session (0 = none).
     [[nodiscard]] uint32_t authRetryAfterMs() const noexcept { return authInfo_.retryAfterMs; }
@@ -704,6 +736,7 @@ public:
         const std::string cfwp = rs::clientFinalWithoutProof(combined);
         ScramSentFinal fin;
         fin.count = sf.count;
+        fin.combinedNonce = combined;
         rpc::AuthClientFinal out;
         out.sessionId     = sessionId_;
         out.correlationId = correlationId_;
@@ -720,6 +753,8 @@ public:
             if (!proof || !sig || proof->size != rpc::kScramProofBytes) { failAuthLocal_(); return; }
             std::memcpy(out.proofs[i].data(), proof->bytes.data(), rpc::kScramProofBytes);
             fin.expected[i] = *sig;
+            fin.salts[i].assign(sf.salts[i].salt);
+            fin.iterations[i] = sf.salts[i].iterations;
         }
         hsFrameBuf_.resize(out.encodedSize());
         const std::size_t n = out.encode(hsFrameBuf_.data());
@@ -749,8 +784,11 @@ public:
         const auto got = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(f.serverSignature.data()),
                                                   f.serverSignature.size());
         bool match = false;
+        int matched = -1;
         for (uint8_t i = 0; i < fin->count; ++i) {   // no early exit: constant time over the verifiers
-            match |= rune::crypto::constantTimeEqual(fin->expected[i].view(), got);
+            const bool m = rune::crypto::constantTimeEqual(fin->expected[i].view(), got);
+            match |= m;
+            if (m && matched < 0) matched = i;
         }
         if (!match) {
             failAuth_(rpc::ErrorCode::AuthenticationFailed, 0, nowNs);   // "broker failed to prove the password"
@@ -760,6 +798,8 @@ public:
         authInfo_.retryAfterMs           = 0;
         authInfo_.authenticated          = true;
         authenticatedSessionId_          = sessionId_;   // a later resume of THIS id is this machine's own login
+        loginCredential_ = LoginCredential{sessionId_, fin->combinedNonce, fin->salts[static_cast<std::size_t>(matched)],
+                                           fin->iterations[static_cast<std::size_t>(matched)]};
         finishConnected_(nowNs);
     }
 
@@ -1555,6 +1595,10 @@ private:
         bool     anonymousBootstrap = false;   // review B I5: Required + Anonymous — only the bootstrap may be sent
     };
     int64_t     authenticatedSessionId_ = 0;   // the broker session id this machine logged in on (0 = none)
+    // Issue #114: the login that authenticated `sessionId` - what signOwnCredentialChange proves with.  Replaced by
+    // every login; used only while that session is the current one.
+    struct LoginCredential { int64_t sessionId = 0; std::string loginNonce; std::string salt; uint32_t iterations = 0; };
+    std::optional<LoginCredential> loginCredential_;
     std::string rejectDetail_;
     AuthInfo     authInfo_{};
     ScramCache   ownCache_;
