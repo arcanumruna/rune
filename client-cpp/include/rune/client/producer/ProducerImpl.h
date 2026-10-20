@@ -574,6 +574,11 @@ public:
     /// Phase 2b B (owner thread): Invoker claims abandoned while open - their
     /// partition's builder was failed / the producer closed; commit() returned false.
     [[nodiscard]] uint64_t claimsAbandoned() const noexcept { return claimsAbandoned_; }
+    /// Client close drain (Direct mode, owner thread): the thread running close()
+    /// cannot settle a claim it holds, and the open claim's reserved record would
+    /// keep the drain waiting until deliveryTimeoutMs.  Abandons it now (its
+    /// commit() returns false, nothing is sent).  No-op unless a claim is open.
+    void abandonOpenClaimForClose() noexcept;
 
     /// Slow path of the void send: retries until accepted; throws on non-retryable
     /// results (see Producer.h's send() doc for the exact exception per case).

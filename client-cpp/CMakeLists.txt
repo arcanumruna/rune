@@ -1449,6 +1449,7 @@ if(BUILD_TESTING)
             tests/detail/OneToOneRingBufferTest.cpp
             tests/detail/CompletionsTest.cpp
             tests/client/InvokerClientTest.cpp
+            tests/client/ClaimClientTest.cpp
             tests/client/IngressEndpointRoutingTest.cpp
             tests/producer/ProducerRouteParkTest.cpp
             tests/shard/ShardConfigTest.cpp

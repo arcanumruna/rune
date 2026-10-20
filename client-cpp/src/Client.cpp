@@ -4830,6 +4830,7 @@ int Client::checkDrain_() {
         // closeIntake() lost: another closer (a begin-close / closeImmediately
         // still in the command ring) owns this producer's close — wait for it.
         if (p.lifeOpen() && p.closeIntake()) {
+            p.abandonOpenClaimForClose();  // Invoker: this thread cannot settle it while draining
             detail::OpTarget tgt;
             tgt.handler = internal;
             p.applyBeginClose(tgt, 0, t);

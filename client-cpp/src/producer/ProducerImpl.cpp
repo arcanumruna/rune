@@ -3535,6 +3535,11 @@ void ProducerImpl::abandonDirectClaimOn_(PartitionState& ps) noexcept {
     ++claimsAbandoned_;
 }
 
+void ProducerImpl::abandonOpenClaimForClose() noexcept {
+    const auto* o = std::get_if<DirectClaimOpen>(&directClaim_);
+    if (o != nullptr) abandonDirectClaimOn_(*partitions_[o->slot]);
+}
+
 ProducerImpl::~ProducerImpl() {
     if (detail::testOnImplFree != nullptr) detail::testOnImplFree(detail::HandleKind::Producer, this);
     // Last owner gone (no other thread can reach this producer): free every
