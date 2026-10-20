@@ -6,7 +6,7 @@
 // probe is driven entirely by the `rune` CLI:
 //
 //   docker/rune-ql-e2e.sh runs, INSIDE the client container, against the broker:
-//     1. rune schema apply    tests/e2e/characters.rql --broker <node> --validate
+//     1. rune console -f    tests/e2e/characters.rql --broker <node> --validate
 //     2. rune schema generate characters --out <gen> --broker <node>
 //        -> writes <gen>/characters.gen.h  (fingerprint == broker's stored schema)
 //     3. g++ compiles THIS probe against that generated header + the prebuilt
@@ -25,7 +25,7 @@
 //   - ASSERT every field round-trips: id / userId / code[8] / name
 //   - produce a MALFORMED raw record -> ASSERT SchemaValidationFailed (validate=ON)
 //
-// The topic is already defined (by `rune schema apply --validate` in step 1), so
+// The topic is already defined (by `rune console -f --validate` in step 1), so
 // this probe does NOT defineTopic; it opens the existing validated topic.
 //
 // Environment:
@@ -171,7 +171,7 @@ int main() {
         std::cerr << "PROBE: connected\n";
 
         // ---- 2. openTopic<Characters> — EXACT-fingerprint gate ---------------
-        // The topic was defined by `rune schema apply ... --validate` before this
+        // The topic was defined by `rune console -f ... --validate` before this
         // probe ran; here we OPEN it (schema fetched + fingerprint compared).
         std::cerr << "PROBE: openTopic<Characters>(\"characters\")...\n";
         // F8c C3: openTopicAndWait — no std::async thread; throws on a stale

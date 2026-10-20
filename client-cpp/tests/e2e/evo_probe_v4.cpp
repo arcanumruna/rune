@@ -1,6 +1,6 @@
 // tests/e2e/evo_probe_v4.cpp — Task 21 real-Aeron schema-evolution e2e, phase 4.
 //
-// After `rune schema alter tests/e2e/schema_evolution/v4_rename.rql` (RENAME
+// After `rune console -f tests/e2e/schema_evolution/v4_rename.rql` (RENAME
 // COLUMN level TO power; chars_evo v3 -> v4 — a rename changes only the field's
 // declared name, never its durable tag/offset): open the topic bound to v4,
 // produce RUNE_RECORDS_V4 typed v4 records (field `power`), then subscribe

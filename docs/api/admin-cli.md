@@ -1,6 +1,6 @@
 # The `rune` command line
 
-One executable, four command groups: `rune schema`, `rune ql`, `rune catalog` and `rune security`. It is built from
+One executable, five command groups: `rune console`, `rune schema`, `rune ql`, `rune catalog` and `rune security`. It is built from
 `client-cpp/tools/rune_cli.cpp` and `client-cpp/src/cli/`, and talks to a broker with the C++ client in invoker mode.
 Run it with no arguments to print the usage.
 
@@ -25,7 +25,7 @@ A password is **never** accepted on the command line or from the environment: `-
 refused with an explanation. Against a broker in dev mode (`RUNE_AUTH=disabled`) the CLI connects without credentials and
 prints a banner.
 
-Exit codes: `0` success, `1` error, `2` usage error, and `3` for `rune catalog diff` when the two sides differ.
+Exit codes: `0` success, `1` error, `2` usage error, and `3` for `rune catalog diff` when the two sides differ. `rune console -f` exits with the broker's wire error code (see below).
 
 ## `rune ql`
 
@@ -44,13 +44,43 @@ The statement text is recorded in the catalog. The grammar and examples are in [
 | `--verbose` | Print every followed redirect and NotLeader retry to stderr. |
 | `--request-id <32 hex>` | Fix the DDL's request id (not all zero). With `-f`, statement `N` uses the id plus `N - 1`. A re-run returns the original results. |
 
-## `rune schema`
+## `rune console`
 
-Topic schemas, directly against the registry.
+The interactive Rune QL shell, and the way to run a `.rql` script (topic DDL included). It replaces the former
+`rune schema apply` and `rune schema alter`.
 
 ```text
-rune schema apply <file|-> [--dry-run] [--validate] [--broker <ep>]
-rune schema alter <file|-> [--dry-run] [--expected-version N] [--broker <ep>]
+rune console [--broker <ep>] [--cli-egress <ch>] [-f <script.rql|->] [--dry-run]
+             [--validate] [--expected-version N] [--request-id <32 hex>] [--verbose]
+             [--user <u>] [--password-file <p>]
+```
+
+| Flag | Meaning |
+|---|---|
+| `-f <file\|->` | Run a script (`-` is stdin) instead of the interactive shell. |
+| `--dry-run` | Parse and print the plan. No broker needed. |
+| `--validate` | Make the broker validate every produced record against the schema of each `topic` the input defines. |
+| `--expected-version N` | The optimistic-concurrency gate for `alter topic` (0..65535, default 0 = none). A stale value is `SchemaConflict`. |
+| `--request-id <32 hex>` | Fix the DDL's request id (not all zero). With `-f`, statement `N` uses the id plus `N - 1`. A re-run returns the original results; without it, defining a topic that exists is `TopicExists`. |
+| `--verbose` | Print every followed redirect and NotLeader retry to stderr. |
+
+Interactive: the prompt is `rune> ` (`   ...> ` while a statement continues). A statement ends at a `;` outside
+comments and strings. Each completed input is parsed, then run in order over one broker session. A failure skips the
+rest of that input and keeps the session. `exit`, `quit` or end of input leaves with `0`. The one failure that ends
+the session is `SessionRevoked`. Interactive mode needs a terminal when no `--password-file` or `RUNE_PASSWORD_FILE`
+is given: it prompts for the password.
+
+With `-f`: every statement is parsed and prepared first, so nothing is issued unless the whole script is valid. The
+statements then run in order and the run stops at the first failure. Stderr reads
+`<file>:statement N: <CodeName> (<code>) ...`. The exit code is the broker's wire error code, or `1` for a local
+error, or `2` for a usage error. For example `TopicExists` is `25`, `SchemaIncompatible` is `30` and `SchemaConflict`
+is `31`.
+
+## `rune schema`
+
+Read-only access to topic schemas. Define or change a topic with `rune console -f` (or `rune ql`).
+
+```text
 rune schema get <topic> --broker <ep>
 rune schema list [--verbose] --broker <ep>
 rune schema generate --from-file <blob> --out <dir>
@@ -59,8 +89,6 @@ rune schema generate <topic> --out <dir> [--broker <ep>]
 
 | Command | What it does |
 |---|---|
-| `apply` | Parse a `.rql` file holding a `topic` or an `alter topic` statement. `--dry-run` prints the descriptor or the alter plan. Without it, define (or alter) the topic on the broker. `--validate` makes the broker validate every produced record against the schema. |
-| `alter` | Parse an `alter topic` file. `--expected-version N` is the optimistic-concurrency gate (0..65535, default 0 = none); a stale value is `SchemaConflict`. |
 | `get` | Fetch a topic's schema and print it. |
 | `list` | List the topics the broker knows; `--verbose` prints more detail per topic. |
 | `generate --from-file` | Generate a C++ header from a serialized descriptor blob, offline. |

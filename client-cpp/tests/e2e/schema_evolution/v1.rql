@@ -2,7 +2,7 @@
 --
 -- Defines topic `chars_evo` at version 1: id/userId/name.  Consumed by
 -- docker/schema-evolution-e2e.sh:
---   rune schema apply tests/e2e/schema_evolution/v1.rql --broker <node> --validate
+--   rune console -f tests/e2e/schema_evolution/v1.rql --broker <node> --validate
 
 topic chars_evo {
     id     int64,

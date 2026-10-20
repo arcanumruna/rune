@@ -11,21 +11,21 @@
 # What it proves, all against ONE broker, via the `rune` CLI + 4 generated
 # "evo_probe_vN" typed probes (../client-cpp/tests/e2e/evo_probe_v{1..4}.cpp):
 #
-#   1. rune schema apply   v1.rql                  -> v1; produce/consume/decode OK.
-#   2. rune schema alter   v2_add.rql    (ADD)      -> v2; produce v2; consume v1+v2,
+#   1. rune console -f   v1.rql                  -> v1; produce/consume/decode OK.
+#   2. rune console -f   v2_add.rql    (ADD)      -> v2; produce v2; consume v1+v2,
 #                                                      each decoded per its own version.
-#   3. rune schema alter   v3_drop.rql   (DROP)     -> v3 (default BACKWARD succeeds);
+#   3. rune console -f   v3_drop.rql   (DROP)     -> v3 (default BACKWARD succeeds);
 #                                                      old v1/v2 records still decode
 #                                                      the dropped field; v3 omits it.
-#   4. rune schema alter   v4_rename.rql (RENAME)   -> v4; a v3 record decodes
+#   4. rune console -f   v4_rename.rql (RENAME)   -> v4; a v3 record decodes
 #                                                      byte-identical under the new
 #                                                      name (power == old level).
-#   5. rune schema alter   v5_set_compat_forward.rql -> v5 (SET COMPATIBILITY forward);
-#      rune schema alter   v6_drop_reject.rql        -> REJECTED (SchemaIncompatible).
+#   5. rune console -f   v5_set_compat_forward.rql -> v5 (SET COMPATIBILITY forward);
+#      rune console -f   v6_drop_reject.rql        -> REJECTED (SchemaIncompatible).
 #   6. The v1-bound probe binary (compiled ONCE, in step 1, never recompiled)
 #      still opens the topic after it has evolved to v5 (fingerprint-selecting
 #      GetTopicSchema binds it to its own v1, not latest).
-#   7. Two concurrent `rune schema alter` calls with the SAME --expected-version
+#   7. Two concurrent `rune console -f` calls with the SAME --expected-version
 #      -> exactly one succeeds, the other returns SchemaConflict.
 #   8. (GC7) multi-producer-different-versions + long-lineage reopen: AFTER the
 #      full v1..v5 lineage, evo_probe_multi drives a v1-bound AND a v3-bound
@@ -240,7 +240,7 @@ rename_ns() {
 }
 
 echo "[in] ===== PHASE 1: apply v1 (id,userId,name) ====="
-rune schema apply "${RQL}/v1.rql" --broker "${RUNE_TARGET}" --validate \
+rune console -f "${RQL}/v1.rql" --broker "${RUNE_TARGET}" --validate \
     --cli-data-dir /tmp/cli_apply_v1
 
 echo "[in] generate + stage v1 header..."
@@ -254,7 +254,7 @@ cmake --build /build/build --target evo_probe_v1
 RUNE_MODE=produce_consume RUNE_RECORDS_V1="${RECORDS_V1}" /build/build/evo_probe_v1
 
 echo "[in] ===== PHASE 2: alter ADD COLUMN level int32 (v1 -> v2) ====="
-rune schema alter "${RQL}/v2_add.rql" --broker "${RUNE_TARGET}" --expected-version 1 \
+rune console -f "${RQL}/v2_add.rql" --broker "${RUNE_TARGET}" --expected-version 1 \
     --cli-data-dir /tmp/cli_alter_v2
 
 rune schema generate chars_evo --out /tmp/gen-v2 --broker "${RUNE_TARGET}" \
@@ -266,7 +266,7 @@ cmake --build /build/build --target evo_probe_v2
 RUNE_RECORDS_V1="${RECORDS_V1}" RUNE_RECORDS_V2="${RECORDS_V2}" /build/build/evo_probe_v2
 
 echo "[in] ===== PHASE 3: alter DROP COLUMN name (v2 -> v3, default BACKWARD) ====="
-rune schema alter "${RQL}/v3_drop.rql" --broker "${RUNE_TARGET}" --expected-version 2 \
+rune console -f "${RQL}/v3_drop.rql" --broker "${RUNE_TARGET}" --expected-version 2 \
     --cli-data-dir /tmp/cli_alter_v3
 
 rune schema generate chars_evo --out /tmp/gen-v3 --broker "${RUNE_TARGET}" \
@@ -279,7 +279,7 @@ RUNE_RECORDS_V1="${RECORDS_V1}" RUNE_RECORDS_V2="${RECORDS_V2}" RUNE_RECORDS_V3=
     /build/build/evo_probe_v3
 
 echo "[in] ===== PHASE 4: alter RENAME COLUMN level TO power (v3 -> v4) ====="
-rune schema alter "${RQL}/v4_rename.rql" --broker "${RUNE_TARGET}" --expected-version 3 \
+rune console -f "${RQL}/v4_rename.rql" --broker "${RUNE_TARGET}" --expected-version 3 \
     --cli-data-dir /tmp/cli_alter_v4
 
 rune schema generate chars_evo --out /tmp/gen-v4 --broker "${RUNE_TARGET}" \
@@ -292,11 +292,11 @@ RUNE_RECORDS_V1="${RECORDS_V1}" RUNE_RECORDS_V2="${RECORDS_V2}" RUNE_RECORDS_V3=
     RUNE_RECORDS_V4="${RECORDS_V4}" /build/build/evo_probe_v4
 
 echo "[in] ===== PHASE 5: SET COMPATIBILITY forward, then DROP -> must be REJECTED ====="
-rune schema alter "${RQL}/v5_set_compat_forward.rql" --broker "${RUNE_TARGET}" --expected-version 4 \
+rune console -f "${RQL}/v5_set_compat_forward.rql" --broker "${RUNE_TARGET}" --expected-version 4 \
     --cli-data-dir /tmp/cli_alter_v5
 
 set +e
-reject_out=$(rune schema alter "${RQL}/v6_drop_reject.rql" --broker "${RUNE_TARGET}" \
+reject_out=$(rune console -f "${RQL}/v6_drop_reject.rql" --broker "${RUNE_TARGET}" \
     --expected-version 5 --cli-data-dir /tmp/cli_alter_v6_reject 2>&1)
 reject_rc=$?
 set -e
@@ -305,9 +305,9 @@ if [ "${reject_rc}" -eq 0 ]; then
     echo "[in] FAIL: drop-under-forward was ACCEPTED (expected a SchemaIncompatible reject)" >&2
     exit 40
 fi
-# Tighten beyond "any nonzero exit": the CLI's cmdSchemaAlter returns the
-# broker's wire errorCode as its process exit code (rune::cli reportAlterResult
-# -> `return static_cast<int>(r.errorCode)`), and
+# Tighten beyond "any nonzero exit": `rune console -f` stops at the first failing
+# statement and returns the broker's wire errorCode as its exit code
+# (`QlRun::lastErrorCode`; stderr: `<file>:statement N: SchemaIncompatible (30) ...`), and
 # rune::protocol::client::ErrorCode::SchemaIncompatible == 30 (Protocol.h) —
 # distinct from SchemaConflict (31, phase 7) or any other failure mode (e.g. a
 # CLI usage error, a connect/timeout failure, or a different broker rejection).
@@ -330,11 +330,11 @@ RUNE_MODE=open_only /build/build/evo_probe_v1
 
 echo "[in] ===== PHASE 7: concurrent ALTER, same --expected-version -> SchemaConflict ====="
 set +e
-rune schema alter "${RQL}/race_a.rql" --broker "${RUNE_TARGET}" --expected-version 5 \
+rune console -f "${RQL}/race_a.rql" --broker "${RUNE_TARGET}" --expected-version 5 \
     --cli-egress "aeron:udp?endpoint=${RUNE_EGRESS_HOST}:40501" \
     --cli-data-dir /tmp/cli_race_a > /tmp/race_a.out 2>&1 &
 PID_A=$!
-rune schema alter "${RQL}/race_b.rql" --broker "${RUNE_TARGET}" --expected-version 5 \
+rune console -f "${RQL}/race_b.rql" --broker "${RUNE_TARGET}" --expected-version 5 \
     --cli-egress "aeron:udp?endpoint=${RUNE_EGRESS_HOST}:40502" \
     --cli-data-dir /tmp/cli_race_b > /tmp/race_b.out 2>&1 &
 PID_B=$!

@@ -1,6 +1,6 @@
 // tests/e2e/evo_probe_v3.cpp — Task 21 real-Aeron schema-evolution e2e, phase 3.
 //
-// After `rune schema alter tests/e2e/schema_evolution/v3_drop.rql` (DROP COLUMN
+// After `rune console -f tests/e2e/schema_evolution/v3_drop.rql` (DROP COLUMN
 // name; chars_evo v2 -> v3, under the default BACKWARD compatibility mode —
 // the drop is ACCEPTED): open the topic bound to v3, produce RUNE_RECORDS_V3
 // typed v3 records (no `name` field — it no longer exists on the v3 struct,

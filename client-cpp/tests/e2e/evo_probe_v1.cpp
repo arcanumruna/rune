@@ -1,7 +1,7 @@
 // tests/e2e/evo_probe_v1.cpp — Task 21 real-Aeron schema-evolution e2e, phase 1.
 //
 // CLI-driven (header comes from `rune schema generate` at RUNTIME, after
-// `rune schema apply tests/e2e/schema_evolution/v1.rql`), against a REAL
+// `rune console -f tests/e2e/schema_evolution/v1.rql`), against a REAL
 // single-node rune-broker over REAL Aeron (default config).
 //
 // Two modes, selected by RUNE_MODE (default "produce_consume"):

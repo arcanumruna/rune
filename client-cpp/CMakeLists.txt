@@ -693,7 +693,7 @@ if(BUILD_EXAMPLES AND aeron_FOUND)
     # the 0b schema-probe above (build-time codegen from a checked-in blob), this
     # probe's header comes from `rune schema generate` at RUNTIME.  The e2e script
     # (docker/rune-ql-e2e.sh) runs, inside the client container:
-    #     rune schema apply    tests/e2e/characters.rql --broker <node> --validate
+    #     rune console -f   tests/e2e/characters.rql --broker <node> --validate
     #     rune schema generate characters --out ${RUNE_GEN_DIR} --broker <node>
     #     cmake --build . --target rune_ql_probe    (compiles THIS against the header)
     #     ./rune_ql_probe
@@ -730,7 +730,7 @@ if(BUILD_EXAMPLES AND aeron_FOUND)
     #
     # docker/schema-evolution-e2e.sh (rune-broker) drives, phase by phase,
     # INSIDE this image, against a live broker:
-    #   rune schema apply/alter tests/e2e/schema_evolution/*.rql --broker <node>
+    #   rune console -f tests/e2e/schema_evolution/*.rql --broker <node>
     #   rune schema generate chars_evo --out <dir> --broker <node>
     #   (orchestrator copies/renames the generated chars_evo.gen.h into
     #    evo-gen/chars_evo_vN.gen.h, with its "namespace gen {" renamed to
@@ -1637,7 +1637,7 @@ target_link_libraries(rune PRIVATE rune_cli_lib)
 target_compile_features(rune PRIVATE cxx_std_23)
 
 # ── Task 8: rune CLI offline tests ────────────────────────────────────────────
-# Tests schema apply --dry-run (and generate --from-file) without Aeron.
+# Tests console --dry-run -f and schema generate --from-file without Aeron.
 if(BUILD_TESTING)
     add_executable(rune_cli_offline_tests
         tests/RuneCliOfflineTest.cpp
@@ -1688,7 +1688,7 @@ if(BUILD_TESTING AND aeron_FOUND)
     gtest_discover_tests(rune_cli_security_live_tests)
 endif()
 
-# ── Task 9: rune CLI live tests (schema apply/get/list via loopback Aeron) ─────
+# ── Task 9: rune CLI live tests (console -f, schema get/list via loopback Aeron) ─────
 # Requires Aeron (embedded driver + ipc loopback gateway).
 if(BUILD_TESTING AND aeron_FOUND)
     add_executable(rune_cli_live_tests

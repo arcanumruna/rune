@@ -1,6 +1,6 @@
 // tests/e2e/evo_probe_v2.cpp — Task 21 real-Aeron schema-evolution e2e, phase 2.
 //
-// After `rune schema alter tests/e2e/schema_evolution/v2_add.rql` (ADD COLUMN
+// After `rune console -f tests/e2e/schema_evolution/v2_add.rql` (ADD COLUMN
 // level int32; chars_evo v1 -> v2): open the topic bound to v2, produce
 // RUNE_RECORDS_V2 typed v2 records, then subscribe FROM EARLIEST — consuming
 // BOTH the v1 records phase 1 already produced AND these new v2 records —

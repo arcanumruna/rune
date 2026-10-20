@@ -10,7 +10,7 @@
 # configured build tree + sibling headers), enabling docker/rune-ql-e2e.sh to run,
 # INSIDE the container, against the live broker:
 #
-#     rune schema apply    tests/e2e/characters.rql --broker rune-1:40200 --validate
+#     rune console -f    tests/e2e/characters.rql --broker rune-1:40200 --validate
 #     rune schema generate characters --out <RUNE_GEN_DIR> --broker rune-1:40200
 #     cmake --build /build/build --target rune_ql_probe   (compile probe vs header)
 #     ./rune_ql_probe                                      (typed round-trip)

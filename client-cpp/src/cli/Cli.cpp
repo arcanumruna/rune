@@ -14,15 +14,12 @@
 #include "rune/cli/SecurityCommands.h"
 #include "CliSupport.h"
 
-#include "rune/ql/Parser.h"
-#include "rune/ql/Backends.h"
 #include "rune/tools/SchemaGen.h"
 
 #include <rune/codec/Serialize.h>
 #include <rune/codec/Generator.h>
 #include <rune/codec/Fingerprint.h>
 
-#include <charconv>
 #include <iomanip>
 #include <iostream>
 
@@ -31,8 +28,6 @@
 #include <sstream>
 #include <string>
 #include <string_view>
-#include <type_traits>
-#include <variant>
 #include <vector>
 
 // Live broker path requires Aeron.

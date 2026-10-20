@@ -9,7 +9,7 @@
 #   2. Start ONE broker node (self-elects).
 #   3. Wait (bounded) for the node to become LEADER.
 #   4. Run the client container which, INSIDE itself, against the live broker:
-#        a. rune schema apply    tests/e2e/characters.rql --broker rune-1:40200 --validate
+#        a. rune console -f    tests/e2e/characters.rql --broker rune-1:40200 --validate
 #        b. rune schema generate characters --out <gen> --broker rune-1:40200
 #        c. cmake --build ... --target rune_ql_probe   (compile probe vs the header)
 #        d. ./rune_ql_probe   → openTopic<Characters> → produce/consume typed →
@@ -32,6 +32,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLIENT_REPO="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PROJECTS="$(cd "${CLIENT_REPO}/.." && pwd)"
+# authentication is ON: cluster key, bootstrap, e2e user (RUNE_USER / RUNE_PASSWORD_FILE for the CLI + probe)
+# shellcheck source=../../broker/docker/lib/auth.sh
+. "${PROJECTS}/broker/docker/lib/auth.sh"
 
 COMPOSE_FILE="${CLIENT_REPO}/docker/docker-compose.rune-ql.yml"
 CLIENT_DOCKERFILE="${CLIENT_REPO}/docker/Dockerfile.rune-ql-probe"
@@ -69,7 +72,9 @@ teardown() {
     log "Tearing down (compose down -v + client rm)..."
     docker rm -f "${CLIENT_HOSTNAME}" 2>/dev/null || true
     docker compose -f "${COMPOSE_FILE}" down -v --remove-orphans 2>/dev/null || true
+    rune_auth_cleanup
 }
+rune_auth_init   # RUNE_SECRETS_DIR (compose mount of the cluster key) + RUNE_AUTH_WORK_DIR (passwords)
 trap teardown EXIT
 
 # ---------------------------------------------------------------------------
@@ -101,6 +106,8 @@ echo "${out}" | grep -E "^( Image|ERROR|#[0-9]+ (DONE|ERROR))" || true
 docker image inspect "${CLIENT_IMAGE}" >/dev/null 2>&1 || fail "client image not built: ${CLIENT_IMAGE}"
 log "Build complete."
 
+rune_gen_cluster_key "${RUNE_SECRETS_DIR}" || fail "could not generate the cluster key"
+
 # ---------------------------------------------------------------------------
 # Step 2: Start the single broker node.
 # ---------------------------------------------------------------------------
@@ -126,6 +133,10 @@ if [ -z "${leader}" ]; then
 fi
 log "Leader elected: ${leader}"
 
+log "Step 3a: bootstrapping the cluster + the e2e user..."
+rune_auth_prepare "${BROKER_NETWORK}" "rune-1:40200" || fail "bootstrap / e2e user"
+read -r -a AUTH_ARGS <<< "$(rune_auth_probe_args)"
+
 # ---------------------------------------------------------------------------
 # Step 4: Run the CLI-driven client container on the broker network.
 # The client hostname must be DNS-resolvable inside the broker network so the
@@ -143,8 +154,8 @@ set -euo pipefail
 GEN_DIR="${RUNE_GEN_DIR:-/build/build/e2e-gen}"
 mkdir -p "${GEN_DIR}"
 
-echo "[in] rune schema apply (validate=on) ..." >&2
-rune schema apply tests/e2e/characters.rql \
+echo "[in] rune console -f (validate=on) ..." >&2
+rune console -f tests/e2e/characters.rql \
     --broker "${RUNE_TARGET}" \
     --validate \
     --cli-data-dir /tmp/rune_cli_apply
@@ -182,6 +193,7 @@ client_out=$(docker run --rm \
     -e RUNE_DATA_DIR="/tmp/rune_ql_probe" \
     -e RUNE_RECORDS="${PROBE_RECORDS}" \
     -e RUNE_TIMEOUT_MS="${PROBE_TIMEOUT_MS}" \
+    "${AUTH_ARGS[@]}" \
     "${CLIENT_IMAGE}" \
     bash -c "${IN_CONTAINER}" 2>&1)
 client_rc=$?
@@ -206,7 +218,7 @@ log "========================================"
 log "  TASK 10 (0c #11 GATE) CLI-DRIVEN E2E PASSED"
 log "  Single node self-elected: ${leader}"
 log "  Broker compiled against rune-codec (FixedStr)"
-log "  rune schema apply --validate -> generate -> compile probe -> run"
+log "  rune console -f --validate -> generate -> compile probe -> run"
 log "  Probe: openTopic<Characters> -> send×${PROBE_RECORDS} -> consume -> decode"
 log "         round-trip incl. code[8] FixedStr + var name"
 log "         + malformed record REJECTED (SchemaValidationFailed)"

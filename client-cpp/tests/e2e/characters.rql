@@ -6,7 +6,7 @@
 -- `rune schema generate` -> typed produce/consume -> decode -> assert code[8].
 --
 -- Consumed by docker/rune-ql-e2e.sh:
---   rune schema apply    tests/e2e/characters.rql --broker <node> --validate
+--   rune console -f    tests/e2e/characters.rql --broker <node> --validate
 --   rune schema generate characters --out <gen> --broker <node>
 --
 -- Fields:
