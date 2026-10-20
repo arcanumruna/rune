@@ -390,6 +390,7 @@ public:
         m.granteeKind = w.granteeKind; m.op = w.op; m.resourceType = w.resourceType; m.patternKind = w.patternKind;
         m.pattern.assign(w.pattern);
         m.roleName.assign(w.roleName);
+        m.force = (w.flags & rune::protocol::client::kSecurityDdlFlagForce) != 0 ? 1 : 0;
         return submitDdl_(m);
     }
     rune::gateway::AdminSubmit submitSecurityBootstrap(const rune::protocol::client::SecurityBootstrap& w,

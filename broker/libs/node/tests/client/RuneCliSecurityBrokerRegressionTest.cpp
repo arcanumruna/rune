@@ -5,6 +5,7 @@
 #include "support/AuthBroker.h"
 
 #include <rune/cli/Cli.h>
+#include <rune/client/Client.h>
 
 #include <gtest/gtest.h>
 
@@ -12,6 +13,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -56,6 +58,7 @@ std::string squeeze(const std::string& s) {   // table padding -> single spaces
 }
 
 constexpr const char* kOtp = "one-time-password-1";
+constexpr const char* kWs1Password = "ws1-password-123456";
 constexpr const char* kNewPassword = "a-brand-new-password-1";
 
 }  // namespace
@@ -102,4 +105,88 @@ TEST(RuneCliSecurityBrokerRegression, CreateUserGrantAndShowGrants) {
     EXPECT_NE(squeeze(out).find("role:r WRITE TOPIC PREFIX 'world.'"), std::string::npos) << out;
     ASSERT_EQ(runCli({"ql", "--broker", b.endpoint(), "--user", "admin", "--password-file", newFile, "-e", "show users;"}, &out, &err), 0) << err;
     EXPECT_NE(out.find("u"), std::string::npos);
+}
+
+namespace {
+/// `rune ql` as the admin (password kNewPassword) running `statement`.
+int adminQl(AuthBroker& b, const std::string& statement, std::string* err = nullptr) {
+    static const std::string pw = writeTemp("admin-pw", std::string(kNewPassword) + "\n");
+    static int n = 0;
+    const std::string file = writeTemp("stmt" + std::to_string(++n) + ".rql", statement + "\n");   // never a literal in argv
+    std::string out, e;
+    const int rc = runCli({"ql", "--broker", b.endpoint(), "--user", "admin", "--password-file", pw, "-f", file}, &out, &e);
+    if (err) *err = e;
+    return rc;
+}
+bool awaitNoSecurityAdmin(AuthBroker& b) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (b.node().securityViewForTest().hasSecurityAdmin) {
+        if (std::chrono::steady_clock::now() > deadline) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return true;
+}
+std::unique_ptr<rune::client::Client> credentialedClient(AuthBroker& b, const std::string& user, const std::string& pw) {
+    rune::client::ClientConfig c;
+    c.gatewayChannel  = b.channel();
+    c.gatewayStreamId = 1;
+    c.egressChannel   = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());
+    c.egressStreamId  = 2;
+    c.dataDir         = b.clientDir().string();
+    c.username        = user;
+    c.password        = pw;
+    return std::make_unique<rune::client::Client>(c);
+}
+}  // namespace
+
+// Issue #121: removing the last enabled security admin is refused unless the statement says FORCE - whichever
+// statement would do it (DISABLE, DROP USER, REVOKE ADMIN ON CLUSTER); with another enabled admin it is allowed.
+TEST(AuthBootstrapWindowRegression, LastAdminCannotBeDisabledWithoutForceRegression) {
+    AuthBroker b("clilastadmin");
+    b.bootstrapAdmin(kNewPassword);
+    std::string err;
+    for (const char* st : {"alter user admin disable;", "drop user admin;", "revoke admin on cluster from user admin;"}) {
+        EXPECT_NE(adminQl(b, st, &err), 0) << st;
+        EXPECT_NE(err.find("last enabled security admin"), std::string::npos) << st << ": " << err;
+    }
+    EXPECT_TRUE(b.node().securityViewForTest().hasSecurityAdmin) << "nothing was applied";
+    // A second enabled admin: then the first may go without FORCE.
+    ASSERT_EQ(adminQl(b, "create user admin2 with password 'admin2-password-1234';", &err), 0) << err;
+    ASSERT_EQ(adminQl(b, "grant admin on cluster to user admin2;", &err), 0) << err;
+    EXPECT_EQ(adminQl(b, "revoke admin on cluster from user admin2;", &err), 0) << "admin still holds it: " << err;
+    EXPECT_NE(adminQl(b, "revoke admin on cluster from user admin;", &err), 0) << "admin2 lost it again";
+    ASSERT_EQ(adminQl(b, "grant admin on cluster to user admin2;", &err), 0) << err;
+    // Disabling yourself ends your own session (SessionRevoked), so the outcome is read from the state.
+    (void)adminQl(b, "alter user admin disable;", &err);
+    EXPECT_NE(adminQl(b, "create role after_disable;", &err), 0) << "admin is disabled: admin2 remained, no FORCE needed";
+    EXPECT_TRUE(b.node().securityViewForTest().hasSecurityAdmin) << "admin2";
+}
+
+// Issue #121: a REOPENED bootstrap window (the last admin disabled with FORCE) answers MustAuthenticate, so the other
+// users still log in with the real client; `rune security bootstrap` still recovers the cluster (cluster-key MAC).
+TEST(AuthBootstrapWindowRegression, ACredentialedClientLogsInDuringAReopenedWindowRegression) {
+    AuthBroker b("clireopen");
+    b.bootstrapAdmin(kNewPassword);
+    std::string err;
+    ASSERT_EQ(adminQl(b, std::string("create user ws1 with password '") + kWs1Password + "';", &err), 0) << err;
+    (void)adminQl(b, "alter user admin disable force;", &err);   // the admin's own session ends (SessionRevoked)
+    ASSERT_TRUE(awaitNoSecurityAdmin(b)) << "the window is open again";
+
+    auto ws1 = credentialedClient(b, "ws1", kWs1Password);
+    std::string connectErr;
+    try { ws1->connectAndWait(std::chrono::seconds(20)); } catch (const std::exception& e) { connectErr = e.what(); }
+    EXPECT_EQ(connectErr, "") << "a credentialed client logs in while the window is open";
+    EXPECT_EQ(ws1->authStatus().kind, rune::client::AuthStatus::Kind::Authenticated);
+    ws1->closeImmediately();
+
+    // The cluster-key holder re-bootstraps through the same MustAuthenticate answer (no login on that connection).
+    const std::string otpFile = writeTemp("otp-reopen", std::string(kOtp) + "\n");
+    std::string out;
+    EXPECT_EQ(runCli({"security", "bootstrap", "--admin", "admin9", "--cluster-key-file", b.keyFile().string(),
+                      "--password-file", otpFile, "--broker", b.endpoint()}, &out, &err), 0) << err;
+    EXPECT_TRUE(b.node().securityViewForTest().hasSecurityAdmin);
+    // ... and once an admin exists again, a second bootstrap is refused with the explicit text.
+    EXPECT_EQ(runCli({"security", "bootstrap", "--admin", "admin10", "--cluster-key-file", b.keyFile().string(),
+                      "--password-file", otpFile, "--broker", b.endpoint()}, &out, &err), 1);
+    EXPECT_NE(err.find("already bootstrapped"), std::string::npos) << err;
 }

@@ -2209,6 +2209,9 @@ private:
     [[nodiscard]] rune::gateway::SessionAuth newSessionAuth_(int64_t nowNs, int64_t connectCorrelationId) const;
     /// The bootstrap window (SecurityBootstrap accepted): cached in the SecurityView, O(1).
     [[nodiscard]] bool bootstrapOpen_() const noexcept { return securityView_ != nullptr && securityView_->bootstrapWindowOpen(); }
+    /// Issue #121: the window is open AND no `__security` event was ever applied (a fresh cluster: no user exists, so a
+    /// login cannot succeed) - the only case a connect is told Anonymous.  A REOPENED window answers MustAuthenticate.
+    [[nodiscard]] bool neverBootstrapped_() const noexcept { return bootstrapOpen_() && securityView_->appliedOffset() < 0; }
     /// true = refused here: the auth gate (gateFor) answered AuthenticationFailed (and ended the session) or
     /// PasswordChangeRequired (the session stays) in the request's own response type.
     [[nodiscard]] bool authGateRefuses_(rune::protocol::client::TemplateId tid, const uint8_t* buf, std::size_t len);

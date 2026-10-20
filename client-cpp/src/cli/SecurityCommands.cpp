@@ -310,6 +310,14 @@ int cmdBootstrap(const std::vector<std::string>& args, std::ostream& out, std::o
         wipe();
         return 1;
     }
+    if (r.errorCode == static_cast<uint16_t>(rune::protocol::client::ErrorCode::AuthenticationFailed)) {
+        // Issue #121: the session skipped the login (bootstrapOnly) and the broker's gate refused the bootstrap - its
+        // window is closed: an enabled security admin exists.
+        err << "rune: bootstrap refused: this cluster is already bootstrapped - it already has a security admin (it requires a login); "
+               "use `rune ql --user <admin> --password-file <file>` to manage it\n";
+        wipe();
+        return 1;
+    }
     if (r.errorCode != 0) {
         err << "rune: bootstrap refused: code " << r.errorCode << (r.detail.empty() ? "" : " " + r.detail) << "\n";
         wipe();

@@ -318,6 +318,18 @@ bool statementHasUnredactedPassword(std::string_view statement) {
     }
     return false;
 }
+/// Issue #121: true when applying `e` to `state` leaves no enabled security admin.  A copy of the state takes the event
+/// (the library's own apply, so every op kind is judged by the rules that will really run); an event that does not
+/// apply is not judged here (appendEvent_'s dry run answers it).
+bool removesLastSecurityAdmin(const sec::SecurityState& state, const sec::SecurityEvent& e) {
+    sec::SecurityState after = state;
+    sec::SecurityEvent probe = e;
+    auto fp = sec::previewFingerprint(state, probe);
+    if (!fp) return false;
+    probe.fingerprint = *fp;
+    if (!sec::apply(after, probe, state.appliedOffset() + 1)) return false;
+    return !after.hasSecurityAdmin();
+}
 } // namespace
 
 void SecurityAdmin::startDdl_(const SecurityDdlMsg& m, int64_t nowNs, SecurityRequest& req) {
@@ -412,6 +424,16 @@ void SecurityAdmin::startDdl_(const SecurityDdlMsg& m, int64_t nowNs, SecurityRe
     e.newVersion = e.prevVersion + 1;
     e.principal = principalOf(m.meta, m.meta.authenticated, fp);
     e.timestampMs = wallClockMs();
+    // Issue #121: the last-admin guard.  Removing the last ENABLED user that effectively holds ADMIN ON CLUSTER (a
+    // DISABLE, a DROP USER, a REVOKE of ADMIN or of the role carrying it, a DROP ROLE ...) reopens the bootstrap window:
+    // only the cluster-key holder can then manage security.  Refused unless the statement says FORCE.  Decided on the
+    // event itself - the same frozen rules every broker applies, dry-run on a copy of the state (cold: DDL rate) - so
+    // every path that can remove the last admin is covered, not a list of statement kinds.
+    if (m.force == 0 && state.hasSecurityAdmin() && removesLastSecurityAdmin(state, e)) {
+        answer_(req, kInvalidRequest, "this removes the last enabled security admin (no enabled user would hold ADMIN ON "
+                                      "CLUSTER): create or enable another admin first, or say FORCE");
+        return;
+    }
     (void)appendEvent_(req, std::move(e), nowNs);
 }
 

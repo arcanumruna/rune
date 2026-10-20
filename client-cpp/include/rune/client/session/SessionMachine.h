@@ -188,6 +188,12 @@ struct SessionConfig {
     // Required+Anonymous before bootstrap) is refused Rejected(AuthenticationFailed) unless this opt-in is set.
     // Default false.  A client WITHOUT credentials is unaffected.
     bool allowUnauthenticatedBroker = false;
+    // Issue #121: this session exists only to send `rune security bootstrap` (no credentials; the request proves
+    // itself with the cluster-key MAC).  A broker whose bootstrap window was REOPENED (its last admin disabled or
+    // dropped) answers MustAuthenticate, since its other users still log in: such a session then skips the login and
+    // is Connected in the anonymous-bootstrap mode, exactly as on a never-bootstrapped cluster (Required+Anonymous).
+    // Ignored with credentials.  Default false: a credential-less client otherwise starts the (failing) login.
+    bool bootstrapOnly = false;
 
     // Task 9 (downgrade safety, spec §11 require_tls's client-side mirror):
     // when true, a ConnectResponse{OK} that negotiates NO cipher (chosenCipher
@@ -1106,11 +1112,16 @@ private:
         authInfo_.brokerMode = mode;
         authInfo_.authenticated = false;
         authInfo_.anonymousBootstrap = mode == rpc::AuthMode::Required && state == rpc::AuthState::Anonymous;
+        const bool credentialed = !cfg_.username.empty();
         if (mode == rpc::AuthMode::Required && state == rpc::AuthState::MustAuthenticate) {
+            if (!credentialed && cfg_.bootstrapOnly) {   // issue #121: a reopened bootstrap window
+                authInfo_.anonymousBootstrap = true;
+                finishConnected_(nowNs);
+                return;
+            }
             beginAuth_(nowNs);
             return;
         }
-        const bool credentialed = !cfg_.username.empty();
         // Review B I3: a resume is believed only for a session this machine itself authenticated.
         if (credentialed && mode == rpc::AuthMode::Required && state == rpc::AuthState::ResumedAuthenticated &&
             authenticatedSessionId_ != 0 && sessionId_ == authenticatedSessionId_) {

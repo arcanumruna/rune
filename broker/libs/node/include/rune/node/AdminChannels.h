@@ -341,6 +341,7 @@ struct SecurityDdlMsg {
     uint8_t                       granteeKind = 0, op = 0, resourceType = 0, patternKind = 0;   // Grant / Revoke
     std::string                   pattern;
     std::string                   roleName;               // GrantRole / RevokeRole
+    uint8_t                       force = 0;              // issue #121: FORCE - the last security admin may go (0 / 1)
 };
 
 /// SecurityBootstrap: the gateway already verified the MAC with its ClusterKeys; the nonce is kept as the request's
@@ -620,7 +621,7 @@ template <class W> void layout(W& w, const SecurityDdlMsg& m) {
     w.u8(m.kind); w.str16(m.name); w.u8(m.change); w.u8(m.passwordIndex); w.u8(m.terminateSessions);
     layoutVerifier(w, m.verifier);
     w.u8(m.granteeKind); w.u8(m.op); w.u8(m.resourceType); w.u8(m.patternKind);
-    w.str16(m.pattern); w.str16(m.roleName);
+    w.str16(m.pattern); w.str16(m.roleName); w.u8(m.force);
 }
 template <class W> void layout(W& w, const SecurityBootstrapMsg& m) {
     w.i64(m.session); w.i64(m.corr); layoutMeta(w, m.meta);
@@ -810,8 +811,10 @@ inline SecurityRequest decodeSecurityDdl(const uint8_t* buf, std::size_t len) {
     m.granteeKind = r.u8(); m.op = r.u8(); m.resourceType = r.u8(); m.patternKind = r.u8();
     r.str16(m.pattern);
     r.str16(m.roleName);
+    m.force = r.u8();
     if (r.ok) {
         if (m.kind < 1 || m.kind > 9) r.fail("an unknown security op kind");
+        else if (m.force > 1) r.fail("a force flag other than 0/1");
         else if (m.kind == 2 && m.change > 4) r.fail("an unknown user change");
         else if (m.terminateSessions > 1) r.fail("a terminate flag other than 0/1");
         else if ((m.kind == 6 || m.kind == 7) &&

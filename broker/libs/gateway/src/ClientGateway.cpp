@@ -2449,16 +2449,17 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
             resp.leaderMemberId    = thisNodeId_;
             resp.assignedSessionId = pending.sessionId;
             // Authentication Task 10 (D11): a v9 client of an authenticating broker is told how it authenticates and
-            // where it stands.  Bootstrap window (Required, no ENABLED security admin - a fresh cluster, or one whose last admin was disabled / dropped, D3 recovery): Anonymous - it may
-            // send ONLY SecurityBootstrap.  Otherwise MustAuthenticate.  An in-process broker keeps the pre-v9 frame.
+            // where it stands.  A NEVER-bootstrapped cluster (no `__security` event yet: nobody exists who could log
+            // in): Anonymous - it may send ONLY SecurityBootstrap.  Otherwise MustAuthenticate - also while the window
+            // is REOPENED (the last admin disabled / dropped, D3 recovery): the other users still exist and log in
+            // (issue #121), and SecurityBootstrap stays allowed in AwaitingFirst while the window is open (gateFor).
+            // An in-process broker keeps the pre-v9 frame.
             pending.auth = newSessionAuth_(nowNs, pending.correlationId);
             if (authMode_ != rune::gateway::GatewayAuthMode::InProcess && pc::clientUnderstandsAuth(pending.clientVersion)) {
                 resp.v9 = true;
                 resp.authMode = authMode_ == rune::gateway::GatewayAuthMode::Required ? pc::AuthMode::Required
                                                                                        : pc::AuthMode::DevDisabled;
-                // Required: MustAuthenticate - except in the bootstrap window (no enabled admin, SecurityView::bootstrapWindowOpen), where the
-                // session is told Anonymous and may send only SecurityBootstrap (and a login that cannot succeed).
-                resp.authState = authMode_ == rune::gateway::GatewayAuthMode::Required && !bootstrapOpen_()
+                resp.authState = authMode_ == rune::gateway::GatewayAuthMode::Required && !neverBootstrapped_()
                                      ? pc::AuthState::MustAuthenticate : pc::AuthState::Anonymous;
             }
             if (pending.tls) {

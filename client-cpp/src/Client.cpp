@@ -159,6 +159,7 @@ agent::AgentConfig toAgentConfig(const ClientConfig& c) {
     acfg.session.username      = c.username;   // authentication: SCRAM credentials (never logged)
     acfg.session.password      = c.password;
     acfg.session.allowUnauthenticatedBroker = c.allowUnauthenticatedBroker;
+    acfg.session.bootstrapOnly = c.securityBootstrapOnly;
     acfg.session.requireCrypto = c.requireCrypto;
     acfg.transport.clientLivenessTimeoutNs = c.aeronClientLivenessTimeoutNs;
     // F12: malformed env values are reported (once per Client construction —

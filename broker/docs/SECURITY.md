@@ -165,6 +165,10 @@ rune security bootstrap --admin admin \
 - Automation (CI, docker) supplies the one-time password itself with `--password-file <path>`: it is
   never read from an environment variable and never accepted on the command line.
 - A second run refuses: `this cluster is already bootstrapped - it already has a security admin`.
+- The last enabled security admin cannot be removed by accident: `ALTER USER .. DISABLE`, `DROP USER`,
+  `DROP ROLE` or `REVOKE` that would leave no enabled user holding `ADMIN ON CLUSTER` is refused unless
+  the statement ends in `FORCE`. A forced removal reopens the bootstrap window: the other users keep
+  logging in, and the cluster-key holder can run `rune security bootstrap` again (D3 recovery).
 
 ```bash
 rune ql --user admin --password-file otp.txt -f change-password.rql --broker rune-1:40200

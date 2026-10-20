@@ -522,6 +522,8 @@ bool LiveBroker::open(const LiveOptions& o, std::ostream& err, bool withCredenti
     }
     // Authentication (Task 8): who to log in as.  --user / RUNE_USER and --password-file / RUNE_PASSWORD_FILE;
     // a password is NEVER taken from argv (parseArgs refuses --password) or from the environment.
+    // Issue #121: the only connection the CLI opens without credentials is `rune security bootstrap`'s.
+    cfg.securityBootstrapOnly = !withCredentials;
     if (withCredentials) {
         applyCredentials(cfg, o.user, o.passwordFile);
         if (!o.password.empty()) {   // an interactively prompted password replaces any file (the client refuses both)

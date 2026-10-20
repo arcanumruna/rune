@@ -64,20 +64,21 @@ std::string redactedText(const Statement& s) {
                 case AlterUserDef::Change::DropPassword: return h + "DROP PASSWORD " + std::to_string(d.index) + ";";
                 case AlterUserDef::Change::SetPassword:
                     return h + "SET PASSWORD " + kRedacted + (d.terminateSessions ? " TERMINATE SESSIONS;" : ";");
-                case AlterUserDef::Change::Disable: return h + "DISABLE;";
+                case AlterUserDef::Change::Disable: return h + (d.force ? "DISABLE FORCE;" : "DISABLE;");
                 case AlterUserDef::Change::Enable:  return h + "ENABLE;";
             }
             return {};
         }
-        else if constexpr (std::is_same_v<T, DropUserDef>)   return "DROP USER " + name(d.name) + ";";
+        else if constexpr (std::is_same_v<T, DropUserDef>)   return "DROP USER " + name(d.name) + (d.force ? " FORCE;" : ";");
         else if constexpr (std::is_same_v<T, CreateRoleDef>) return "CREATE ROLE " + name(d.name) + ";";
-        else if constexpr (std::is_same_v<T, DropRoleDef>)   return "DROP ROLE " + name(d.name) + ";";
+        else if constexpr (std::is_same_v<T, DropRoleDef>)   return "DROP ROLE " + name(d.name) + (d.force ? " FORCE;" : ";");
         else if constexpr (std::is_same_v<T, GrantDef>)
             return std::string("GRANT ") + opText(d.op) + " ON " + resource(d.resource) + " TO " + granteeText(d.grantee) + " " + name(d.granteeName) + ";";
         else if constexpr (std::is_same_v<T, RevokeDef>)
-            return std::string("REVOKE ") + opText(d.op) + " ON " + resource(d.resource) + " FROM " + granteeText(d.grantee) + " " + name(d.granteeName) + ";";
+            return std::string("REVOKE ") + opText(d.op) + " ON " + resource(d.resource) + " FROM " + granteeText(d.grantee) + " " + name(d.granteeName) + (d.force ? " FORCE;" : ";");
         else if constexpr (std::is_same_v<T, GrantRoleDef>)  return "GRANT ROLE " + name(d.role) + " TO USER " + name(d.user) + ";";
-        else if constexpr (std::is_same_v<T, RevokeRoleDef>) return "REVOKE ROLE " + name(d.role) + " FROM USER " + name(d.user) + ";";
+        else if constexpr (std::is_same_v<T, RevokeRoleDef>)
+            return "REVOKE ROLE " + name(d.role) + " FROM USER " + name(d.user) + (d.force ? " FORCE;" : ";");
         else if constexpr (std::is_same_v<T, ShowUsersDef>)  return "SHOW USERS;";
         else if constexpr (std::is_same_v<T, ShowRolesDef>)  return "SHOW ROLES;";
         else if constexpr (std::is_same_v<T, ShowGrantsDef>)
