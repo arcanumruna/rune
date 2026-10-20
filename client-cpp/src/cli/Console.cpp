@@ -99,17 +99,10 @@ int parseConsoleOptions(const std::vector<std::string>& args, ConsoleOptions& o,
         if (i + 1 >= args.size()) return usage(err, a + " needs a value");
         const std::string& v = args[++i];
         if (a == "-f") o.scriptPath = v;
-        
-        
         else if (a == "--expected-version") expected = v;
         else if (a == "--request-id") requestId = v;
         else if (a == "--broker" || a == "--cli-egress" || a == "--user" || a == "--password-file" || a == "--cli-stream-in" ||
                  a == "--cli-stream-out" || a == "--cli-data-dir") setLive(o, a, v);
-        
-        
-        
-        
-        else o.live.dataDir = v;
     }
     if (!expected.empty()) {
         int value = -1;
@@ -145,6 +138,11 @@ bool prepareAll(std::string_view origin, std::string_view src, const engine::Pre
         return false;
     }
     const std::vector<std::string> texts = engine::splitStatements(src);
+    if (texts.size() != parsed->size()) {
+        err << "rune console: internal error: statement splitter found " << texts.size() << " statements, the parser "
+            << parsed->size() << "; nothing was executed\n";
+        return false;
+    }
     for (std::size_t i = 0; i < parsed->size(); ++i) {
         std::string why;
         auto p = engine::prepare((*parsed)[i], opts, why);
@@ -153,7 +151,7 @@ bool prepareAll(std::string_view origin, std::string_view src, const engine::Pre
             err << why << "\n";
             return false;
         }
-        out.push_back({std::move(*p), i < texts.size() ? texts[i] : std::string()});
+        out.push_back({std::move(*p), texts[i]});
     }
     return true;
 }
