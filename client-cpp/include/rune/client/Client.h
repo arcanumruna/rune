@@ -1057,6 +1057,20 @@ public:
                              r.version);
     }
 
+    /// Phase 2b F (FD7): the same version-binding open, but the typed topic BORROWS `shared` instead of owning
+    /// a producer of its own - its sends and claims go through that producer, inside its transaction when one
+    /// is open.  `shared` must outlive the returned topic.
+    template <class T>
+    [[nodiscard]] TypedTopic<T, ProducerRef> openTopicAndWait(std::string_view name, Producer& shared,
+                                                              std::chrono::nanoseconds timeout = kDefaultWaitTimeout) {
+        TopicSchemaResult r = getTopicSchemaAndWait(name, T::kFingerprint, timeout);
+        if (r.errorCode != 0 || !schemaMatches(T::kFingerprint, std::span<const uint8_t>(r.descriptorBlob))) {
+            throw std::runtime_error("openTopic: generated type is stale — rerun rune schema generate");
+        }
+        return TypedTopic<T, ProducerRef>(ProducerRef(shared),
+                                          TopicHandle{r.topicId, typedPartitionCount(r.partitionCount)}, r.version);
+    }
+
     /// Test hooks (duty thread only, or after close): completions addressed to
     /// a released / reused registry slot and dropped by the generation check;
     /// the CqRef a Completions was registered under (its own field).
@@ -1371,6 +1385,7 @@ private:
     /// close(): hand every registered queue back (producer-close; §3.3 (b)).
     void closeCqRegistry_();
     /// I3: count / uncount a pending op's target slot; recycle a free slot.
+    static void pinTargetTrampoline_(void* ctx, detail::OpTarget& t) noexcept;
     void pinCqSlot_(DutyTarget& t) noexcept;
     void freeCqSlot_(uint32_t idx) noexcept;
     /// I3': apply deferred releases whose fence the drain has passed (all: close).

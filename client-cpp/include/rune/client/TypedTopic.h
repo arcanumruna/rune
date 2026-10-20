@@ -34,7 +34,9 @@
 //   ProducerT contract (default = Producer):
 //     void send(TopicHandle, const Key&, std::span<const uint8_t>)
 //
-//   The second template parameter exists as a test seam: production code uses
+//   ProducerRef (FD7) is the production alternative: TypedTopic<T, ProducerRef> borrows a Producer (e.g. one
+//   inside a transaction) instead of owning one - Client::openTopicAndWait<T>(name, producer).
+//   The second template parameter is also a test seam: production code uses
 //   TypedTopic<MyStruct> (ProducerT defaults to Producer); unit tests that must
 //   not link Aeron use TypedTopic<StubT, StubProducer>.
 //
@@ -48,6 +50,7 @@
 #include <rune/client/Completion.h>
 #include <rune/client/Key.h>
 #include <rune/client/producer/Producer.h>
+#include <rune/client/producer/ProducerRef.h>
 #include <rune/client/TopicHandle.h>
 #include <rune/codec/Fingerprint.h>
 #include <rune/codec/Serialize.h>

@@ -789,6 +789,14 @@ public:
     // with SendResult::NotInTransaction (send / sendTo / blocking claim helpers
     // throw std::logic_error("produce outside a transaction")).
 
+    //
+    // Control ops (FD1): Thread mode writes each one to the producer's own ring, FIFO with the records sent
+    // before it - a commit contains exactly the records issued ahead of it, a record after it is refused
+    // (NotInTransaction).  A full ring is OpResult::BackPressured (the *AndWait forms and beginTransaction()
+    // wait for room).  Invoker mode applies the op at once on the owner thread (WrongThread elsewhere): its
+    // refusals are synchronous where Thread mode accepts and then completes with the failure.
+    // commitTransaction / abortTransaction close the produce gate when they are ISSUED; beginTransaction opens
+    // it once its message is written.  One issuing thread per transactional producer (FD3).
     OpResult initTransactions(const CompletionTarget& target, Token token);
     void     beginTransaction();
     /// One sendOffsetsToTransaction runs at a time: a call made while another is still running completes
@@ -809,11 +817,12 @@ public:
     void abortTransactionAndWait(std::chrono::nanoseconds timeout = kDefaultTxnWait);
     void flushAndWait(std::chrono::nanoseconds timeout = kDefaultTxnWait);
 
-    [[nodiscard]] TxnState state() const noexcept;
-    /// producerId() / producerEpoch() (and the status getters of later tasks) drain a single-consumer status
-    /// ring: they are SINGLE-THREAD per producer, on the same bound thread as batch() (the creating thread,
+    /// state() / producerId() / producerEpoch() / transactionActive() drain a single-consumer status
+    /// ring (FD9): they are SINGLE-THREAD per producer, on the same bound thread as batch() (the creating thread,
     /// or the one that called bindBatchThread()).  From any other thread they return "not available"
-    /// (-1) and touch nothing.
+    /// (TxnState::Uninitialized / -1 / -1 / false) and touch nothing.  They report the latest status the duty
+    /// side published, so after issuing an op a Thread-mode caller sees the change once the op completed.
+    [[nodiscard]] TxnState state() const noexcept;
     [[nodiscard]] int64_t  producerId() const noexcept;  ///< -1 until assigned (or off the bound thread)
     [[nodiscard]] int16_t  producerEpoch() const noexcept;
     [[nodiscard]] bool     transactionActive() const noexcept;
@@ -897,6 +906,12 @@ public:
     void testSetNextSequence(TopicHandle topic, int32_t partition, int32_t seq) noexcept;
 
 private:
+    /// Phase 2b F Task 8: issue one transaction control op (resolves and reserves the completion target).
+    OpResult issueTxn_(std::uint8_t kind, const CompletionTarget& target, Token token,
+                       std::span<const OffsetEntry> offsets, std::string_view groupId);
+    /// The *AndWait body: issue + wait + map the completion to an exception.
+    void txnAndWait_(const char* what, std::chrono::nanoseconds timeout, std::uint8_t kind,
+                     std::span<const OffsetEntry> offsets, std::string_view groupId);
     /// T15b M3: the one send body; `part` computed once by the caller.
     [[nodiscard]] SendResult trySendPart_(TopicHandle topic, int32_t part, const Key& key,
                                           std::span<const uint8_t> value) noexcept;

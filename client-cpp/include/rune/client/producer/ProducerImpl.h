@@ -81,6 +81,22 @@ inline constexpr int32_t kMsgSendRecord  = 1; // SEND_RECORD (producer-ring loca
 inline constexpr int32_t kMsgFlush       = 2; // flush trigger (producer-ring local ID)
 inline constexpr int32_t kMsgTier2Batch  = 3; // Tier-2 explicit batch token
 inline constexpr int32_t kMsgClaimBatch  = 4; // Phase 2b B: claimBatch — n records, ONE RecordBatch
+inline constexpr int32_t kMsgTxnControl  = 5; // Phase 2b F: a transaction control op, FIFO with the records before it
+
+// TXN_CONTROL layout (kMsgTxnControl payload, little endian, Phase 2b F Task 8):
+//   [0]      kind          : u8  (TxnControl::Kind)
+//   [1..3]   pad
+//   [4..7]   groupIdLen    : u32
+//   [8..15]  token         : u64 (HubCommand word a)
+//   [16..23] target word b : i64 (detail::encodeTarget)
+//   [24..31] target word c : i64
+//   [32..35] offsetCount   : u32
+//   [36..]   groupId bytes; then, from the next multiple of 8 at or after 36 + groupIdLen (zero padded),
+//            offsetCount x 16-byte entries (topicId i32, partition i32, offset i64) - 8-aligned, so the duty side
+//            reads them in place.
+// A SendOffsets whose counts are over the caps (kMaxTxnOffsets / a 1..255-byte group id) travels as the 36-byte
+// header ONLY: the duty side completes it InvalidArgument without reading any data.
+inline constexpr std::size_t kTxnCtlHeaderBytes = 36;
 
 // CLAIM_BATCH layout (kMsgClaimBatch payload): [0..33] exactly as SEND_RECORD
 // (topicId, partition, keyLen, inline key, flags = 0, ackHandle = 0), then
@@ -840,6 +856,10 @@ public:
         OpResult (*issueClose)(void* ctx, ProducerImpl& impl, const CompletionTarget* target,
                                Token token) = nullptr;
         detail::AndWaitSink andWait = nullptr;
+        /// Phase 2b F Task 8 (duty side): pin a CQ target's registry slot before its completion is delivered
+        /// (Client::pinCqSlot_; an op read from the producer ring has no command-ring fence).  Absent (bare rig):
+        /// targets are used as they are.
+        void (*pinTarget)(void* ctx, detail::OpTarget& t) noexcept = nullptr;
         /// F8c C7: the handle's §3.3 release (HubCommand::HandleRelease).
         /// Absent (bare rig): no duty side — the handle frees the impl alone.
         detail::HubCommandSink release = nullptr;
@@ -1221,6 +1241,14 @@ public:
     // requests are acquired only by txnStep (never inside an apply / answer), so a completion handler that
     // issues the next op never races the slot its answer is still using.
     void applyTxnControl(const TxnControl& c, int64_t nowNs);
+    /// Phase 2b F Task 8 (ISSUING thread): issue one control op.  Ring mode: a kMsgTxnControl message in this
+    /// producer's ring, FIFO with the records before it (the drain applies it at its place); a full ring is
+    /// BackPressured, a closed intake Closed.  Direct (Invoker) mode: applied at once on the owner thread
+    /// (WrongThread elsewhere).  Gate rules (FD2): Commit / Abort close the gate BEFORE the write (restored if
+    /// nothing was written), Begin opens it AFTER.  The caller (Producer) has resolved and reserved the target;
+    /// on any result but Accepted nothing will complete.  A SendOffsets over the caps is Accepted and completes
+    /// InvalidArgument (in ring order).  Zero allocation.
+    [[nodiscard]] OpResult issueTxnControl(const TxnControl& c) noexcept;
     [[nodiscard]] TxnState txnStateDuty() const noexcept { return static_cast<TxnState>(txn_.index()); }
     [[nodiscard]] const TxnMachine& txnMachine() const noexcept { return txn_; }
     /// One duty pass of the machine (ProducerHub::drainAndFlush, after identityStep): sends the InitProducerId /
@@ -1850,6 +1878,11 @@ private:
     void completeJoined_(const TxnJoiners& j, OpKind kind, OpStatus st, uint16_t errorCode,
                          std::string_view text) noexcept;
     void refuseTxn_(const TxnControl& c, OpStatus st, uint16_t errorCode, std::string_view text) noexcept;
+    /// Decode a kMsgTxnControl payload (duty thread); the target is pinned.  False: the message is shorter than
+    /// its header (nothing can be completed).  `tooBig`: SendOffsets over the caps / truncated - refuse it
+    /// InvalidArgument.  offsets / groupId point INTO the ring buffer (valid inside the read callback only).
+    [[nodiscard]] bool decodeTxnControl_(const uint8_t* p, std::size_t len, TxnControl& out, bool& tooBig) noexcept;
+    [[gnu::noinline]] OpResult writeTxnControl_(const TxnControl& c, bool overCap) noexcept;
     void markStarted_(TxnStarted s) noexcept;
     void poison_(OpStatus st, uint16_t errorCode, AbortKind kind) noexcept;
     void onTxnLegAnswer_(ReqKind kind, int16_t errorCode) noexcept;

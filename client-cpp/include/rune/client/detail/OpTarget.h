@@ -56,20 +56,23 @@ inline void encodeTarget(const OpTarget& t, HubCommand& cmd) noexcept {
                                  static_cast<uint64_t>(t.cqRef));
 }
 
-[[nodiscard]] inline OpTarget decodeTarget(const HubCommand& cmd) noexcept {
+/// The words b / c as written by encodeTarget (a producer-ring message carries them without a HubCommand).
+[[nodiscard]] inline OpTarget decodeTargetWords(int64_t wordB, int64_t wordC) noexcept {
     OpTarget t;
-    if (cmd.b != 0) {
+    if (wordB != 0) {
         using Fn = decltype(CompletionHandler::fn);
-        t.handler.fn  = reinterpret_cast<Fn>(static_cast<uintptr_t>(cmd.b));
-        t.handler.ctx = reinterpret_cast<void*>(static_cast<uintptr_t>(cmd.c));
+        t.handler.fn  = reinterpret_cast<Fn>(static_cast<uintptr_t>(wordB));
+        t.handler.ctx = reinterpret_cast<void*>(static_cast<uintptr_t>(wordC));
         return t;
     }
-    const auto w    = static_cast<uint64_t>(cmd.c);
+    const auto w    = static_cast<uint64_t>(wordC);
     t.reservedBytes = static_cast<uint32_t>(w >> 32);
     t.counted       = ((w >> 16) & 1u) != 0;
     t.cqRef         = static_cast<CqRef>(w & 0xFFFFu);
     return t;
 }
+
+[[nodiscard]] inline OpTarget decodeTarget(const HubCommand& cmd) noexcept { return decodeTargetWords(cmd.b, cmd.c); }
 
 /// Duty-side delivery of one completion (the Client's registry).
 struct CompletionSink {

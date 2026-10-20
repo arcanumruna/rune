@@ -116,9 +116,9 @@ struct Rig {
     Token                         next = 0;
     std::array<Done, 64>          done{};   // by token
 
-    explicit Rig(rc::ProducerConfig c = txnCfg()) {
+    explicit Rig(rc::ProducerConfig c = txnCfg(), int32_t ringCap = 1 << 16) {
         hub.setCoordinatorSink(cap.sink());
-        impl = std::make_unique<ProducerImpl>(std::move(c), 1 << 16);
+        impl = std::make_unique<ProducerImpl>(std::move(c), ringCap);
         hub.add(impl.get());
     }
     ~Rig() { hub.remove(impl.get()); }
@@ -132,6 +132,18 @@ struct Rig {
         c.groupId        = group;
         impl->applyTxnControl(c, now);
         return next;
+    }
+    /// Phase 2b F Task 8: the HANDLE side of the ring path - writes a kMsgTxnControl (the handler form); the next
+    /// pass drains and applies it in ring order.
+    struct Issued { Token token; rc::OpResult result; };
+    Issued issue(TxnControl::Kind k, std::span<const OffsetEntry> offs = {}, std::string_view group = {}) {
+        TxnControl c;
+        c.kind           = k;
+        c.target.handler = rc::CompletionHandler{&Done::on, &done[++next]};
+        c.token          = next;
+        c.offsets        = offs;
+        c.groupId        = group;
+        return {next, impl->issueTxnControl(c)};
     }
     Done& d(Token t) { return done[t]; }
     Token sendOffsets(std::span<const OffsetEntry> offs, std::string_view group = "grp-1") {
@@ -686,4 +698,181 @@ TEST(ProducerTxnOffsets, AllocatesNothingInSteadyState) {
     }
     const long allocs = alloc_counter::stopThisThread();
     EXPECT_EQ(allocs, 0) << "sendOffsets allocated in steady state";
+}
+
+// ---- Task 8: the ring path (kMsgTxnControl) -------------------------------------------------------------------
+
+namespace {
+/// Ring mode: `inTxn()` for a rig whose Begin went through the ring (the gate opens when its message is written).
+void ringReady(Rig& r) {
+    r.ready();
+    const auto b = r.issue(TxnControl::Kind::Begin);
+    ASSERT_EQ(b.result, rc::OpResult::Accepted);
+    EXPECT_EQ(r.impl->txnGate(), ProducerImpl::TxnGate::Open) << "Begin opens the gate once its message is written";
+    r.tick();
+    ASSERT_EQ(r.impl->txnStateDuty(), TxnState::InTransaction);
+}
+}  // namespace
+
+TEST(ProducerTxnControl, ControlOpIsAppliedInRingOrderBetweenRecords) {
+    Rig r;
+    ringReady(r);
+    const rc::Key key(uint64_t{1});
+    const std::string v = "x";
+    const std::span<const uint8_t> val(reinterpret_cast<const uint8_t*>(v.data()), 1);
+    for (int i = 0; i < 3; ++i) ASSERT_EQ(r.impl->trySubmit(1, 0, key, val, 0), rc::SendResult::Ok);
+    const auto c = r.issue(TxnControl::Kind::Commit);
+    ASSERT_EQ(c.result, rc::OpResult::Accepted);
+    EXPECT_EQ(r.impl->txnGate(), ProducerImpl::TxnGate::Closed) << "the commit closes the gate at issue";
+    EXPECT_EQ(r.impl->trySubmit(1, 0, key, val, 0), rc::SendResult::NotInTransaction);
+    // A produce that raced past the gate lands in the ring AFTER the commit message: the drain applies the commit
+    // first (the three records before it are in it), so this one reaches the duty side outside the transaction.
+    r.impl->setTxnGate(ProducerImpl::TxnGate::Open);
+    ASSERT_EQ(r.impl->trySubmit(1, 0, key, val, 0), rc::SendResult::Ok);
+    r.tick();
+    r.tick();
+    EXPECT_EQ(r.impl->txnRecordsRefusedDuty(), 1u) << "the record after the commit was refused, never produced";
+    EXPECT_EQ(r.impl->txnPartitionCount(), 1u) << "the three before it joined the transaction";
+    r.tick();
+    EXPECT_EQ(r.d(c.token).times, 1) << "the commit completes (with the refusal's error: the record after it never joined)";
+    EXPECT_NE(r.d(c.token).status, OpStatus::Ok);
+}
+
+TEST(ProducerTxnControlRegression, ControlOpAfterCloseCompletesClosedRegression) {
+    // Every kind that carries a completion, written to the ring and then discarded by closeImmediately: each token
+    // completes Closed exactly once (never dropped silently), CQ credit and all.
+    for (const TxnControl::Kind kind : {TxnControl::Kind::Init, TxnControl::Kind::SendOffsets, TxnControl::Kind::Commit,
+                                        TxnControl::Kind::Abort, TxnControl::Kind::Flush}) {
+        SCOPED_TRACE(static_cast<int>(kind));
+        Rig r;
+        const OffsetEntry e{1, 0, 5};
+        const auto i = r.issue(kind, std::span<const OffsetEntry>(&e, 1), "g");
+        ASSERT_EQ(i.result, rc::OpResult::Accepted);
+        ASSERT_EQ(r.d(i.token).times, 0);
+        ASSERT_TRUE(r.impl->closeImmediately() == rc::OpResult::Accepted);   // Discarding: the ring is discarded next pass
+        r.tick();
+        EXPECT_EQ(r.d(i.token).times, 1) << "the op in the ring completed";
+        EXPECT_EQ(r.d(i.token).status, OpStatus::Closed);
+        r.tick();
+        EXPECT_EQ(r.d(i.token).times, 1) << "exactly once";
+        // Issued after the close: the intake is closed, nothing is accepted, nothing completes later.
+        const auto late = r.issue(kind, std::span<const OffsetEntry>(&e, 1), "g");
+        EXPECT_NE(late.result, rc::OpResult::Accepted);
+        r.tick();
+        EXPECT_EQ(r.d(late.token).times, 0);
+    }
+}
+
+TEST(ProducerTxnControlRegression, SendOffsetsTravelsTheRingIntoTheDutyScratchRegression) {
+    Rig r(txnCfg(), 1 << 20);
+    ringReady(r);
+    const auto offs = offsetsOf(3);
+    const auto i = r.issue(TxnControl::Kind::SendOffsets, offs, "grp-ring");
+    ASSERT_EQ(i.result, rc::OpResult::Accepted);
+    r.tick();   // the drain applies the op ...
+    r.tick();   // ... and the next pass's txnStep sends AddOffsetsToTxn
+    const auto adds = r.cap.of(rpc::AddOffsetsToTxn::TEMPLATE_ID);
+    ASSERT_EQ(adds.size(), 1u);
+    r.answerFrame(adds[0], rp::ReqKind::AddOffsets, 0);
+    r.tick();
+    const auto commits = r.cap.of(rpc::TxnOffsetCommit::TEMPLATE_ID);
+    ASSERT_EQ(commits.size(), 1u);
+    const auto oc = rpc::TxnOffsetCommit::decode(r.cap.data(commits[0]), commits[0].len);
+    ASSERT_TRUE(oc);
+    EXPECT_EQ(std::string(oc->groupId.begin(), oc->groupId.end()), "grp-ring");
+    ASSERT_EQ(oc->entries.size(), 3u);
+    std::size_t k = 0;
+    for (const auto& e : oc->entries) {
+        EXPECT_EQ(e.topicId, offs[k].topicId);
+        EXPECT_EQ(e.partition, offs[k].partition);
+        EXPECT_EQ(e.offset, offs[k].offset);
+        ++k;
+    }
+    r.answerFrame(commits[0], rp::ReqKind::TxnOffsetCommit, 0);
+    ASSERT_EQ(r.d(i.token).times, 1);
+    EXPECT_EQ(r.d(i.token).status, OpStatus::Ok);
+    // A second call is refused with 19 while one runs: documented, never queued.
+    const auto second = r.issue(TxnControl::Kind::SendOffsets, offsetsOf(2), "grp-ring");
+    const auto third  = r.issue(TxnControl::Kind::SendOffsets, offsetsOf(2), "grp-ring");
+    r.tick();
+    EXPECT_EQ(r.d(third.token).status, OpStatus::BrokerError);
+    EXPECT_EQ(r.d(third.token).code, kInvalidTxnState);
+    EXPECT_EQ(r.d(third.token).times, 1);
+    EXPECT_EQ(r.d(second.token).times, 0) << "the first of the two is running";
+}
+
+TEST(ProducerTxnControlRegression, OverCapSendOffsetsCompletesInvalidArgumentThroughTheRingRegression) {
+    Rig r(txnCfg(), 1 << 20);
+    ringReady(r);
+    const std::size_t framesBefore = r.cap.frames.size();
+    const auto tooMany = offsetsOf(static_cast<int>(rp::kMaxTxnOffsets) + 1);
+    const std::string longGroup(rp::kMaxTxnGroupIdBytes + 1, 'g');
+    const auto a = r.issue(TxnControl::Kind::SendOffsets, tooMany, "grp");
+    const auto b = r.issue(TxnControl::Kind::SendOffsets, offsetsOf(2), longGroup);
+    const auto c = r.issue(TxnControl::Kind::SendOffsets, offsetsOf(2), "");
+    ASSERT_EQ(a.result, rc::OpResult::Accepted);
+    ASSERT_EQ(b.result, rc::OpResult::Accepted);
+    ASSERT_EQ(c.result, rc::OpResult::Accepted);
+    r.tick();
+    for (const Token t : {a.token, b.token, c.token}) {
+        EXPECT_EQ(r.d(t).times, 1) << t;
+        EXPECT_EQ(r.d(t).status, OpStatus::InvalidArgument) << t;
+    }
+    EXPECT_EQ(r.cap.frames.size(), framesBefore) << "nothing reached the coordinator";
+    EXPECT_EQ(r.impl->txnStateDuty(), TxnState::InTransaction) << "an invalid argument does not poison the transaction";
+    // A ring too small to ever carry the message is a plain InvalidArgument (no completion).
+    Rig tiny;
+    ringReady(tiny);
+    const auto big = tiny.issue(TxnControl::Kind::SendOffsets, offsetsOf(1024), "grp");
+    EXPECT_EQ(big.result, rc::OpResult::InvalidArgument);
+    tiny.tick();
+    EXPECT_EQ(tiny.d(big.token).times, 0);
+}
+
+TEST(ProducerTxnControl, IssuingAndApplyingControlOpsAllocatesNothing) {
+    Rig r(txnCfg(), 1 << 20);
+    ringReady(r);
+    const auto offs = offsetsOf(1024);
+    for (int i = 0; i < 3; ++i) {   // warm up: first use of everything
+        const auto f = r.issue(TxnControl::Kind::Flush);
+        r.tick();
+        r.tick();
+        ASSERT_EQ(r.d(f.token).times, 1);
+        r.next = 0;
+        r.done = {};
+    }
+    alloc_counter::startThisThread();
+    for (int i = 0; i < 500; ++i) {
+        r.next = 0;
+        const auto f = r.issue(TxnControl::Kind::Flush);
+        r.tick();
+        r.tick();
+        if (r.d(f.token).times != i + 1) {
+            alloc_counter::stopThisThread();
+            FAIL() << "flush " << i << " did not complete once";
+        }
+    }
+    const long flushAllocs = alloc_counter::stopThisThread();
+    EXPECT_EQ(flushAllocs, 0) << "a flush control op allocated on the issue side or the duty side";
+    // The widest message: 1024 offsets + a 1-byte group, written to the ring and applied (the issue side alone).
+    static int counted = 0;
+    const rc::CompletionHandler h{[](void*, const rc::Completion&, std::span<const uint8_t>) noexcept { ++counted; }, nullptr};
+    TxnControl wide;
+    wide.kind           = TxnControl::Kind::SendOffsets;
+    wide.target.handler = h;
+    wide.token          = 50;
+    wide.offsets        = offs;
+    wide.groupId        = "g";
+    alloc_counter::startThisThread();
+    for (int i = 0; i < 4; ++i) {
+        const rc::OpResult res = r.impl->issueTxnControl(wide);
+        if (res != rc::OpResult::Accepted) {
+            alloc_counter::stopThisThread();
+            FAIL() << "wide control op refused";
+        }
+        r.impl->drainRing(r.now, 256);   // applied on the duty side: copied into the preallocated scratch
+        r.impl->setTxnGate(ProducerImpl::TxnGate::Open);
+    }
+    const long allocs = alloc_counter::stopThisThread();
+    EXPECT_EQ(allocs, 0) << "a sendOffsets control op allocated on the issue side or the duty side";
 }

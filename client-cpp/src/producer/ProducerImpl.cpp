@@ -1410,8 +1410,9 @@ int ProducerImpl::drainRing(int64_t nowNs, int messageLimit) {
     //     produceTimeout tail).
     // Unlike Aeron's ManyToOneRingBuffer, this ring both supports ABORT and
     // dispatches the handler inline (no std::function).
-    return ring_.controlledRead(
-        [this, nowNs](
+    bool controlApplied = false;
+    const int n = ring_.controlledRead(
+        [this, nowNs, &controlApplied](
             int32_t                              msgTypeId,
             aeron::concurrent::AtomicBuffer&     buf,
             aeron::util::index_t                 offset,
@@ -1489,14 +1490,40 @@ int ProducerImpl::drainRing(int64_t nowNs, int messageLimit) {
                 return ControlledAction::CONTINUE;
             }
 
-            // Not a record, not a flush token: a control message (Task 8: kMsgTxnControl is applied HERE).  Today
-            // no other type is ever written - an unknown one is consumed (counted) and ENDS the pass, so whatever a
-            // control message changes is seen by the next pass's decisions (the FD2 re-check above).
-            ++ringForeign_;
+            // Not a record, not a flush token: a control message.  kMsgTxnControl is applied HERE, in ring order
+            // (every record before it is already in its builder, none after it has been read), and it ENDS the
+            // pass either way (consumed): whatever the op changed is seen by the next pass's decisions (the FD2
+            // re-check above).  Never skipped, never dropped.  Any other type is counted.
+            if (msgTypeId == kMsgTxnControl) {
+                TxnControl tc;
+                bool       tooBig = false;
+                if (decodeTxnControl_(p, static_cast<std::size_t>(len), tc, tooBig)) {
+                    // Handlers fired from the op run in the duty scope; its end-of-scope work (a deferred close,
+                    // deferred records) must not run inside this read, so it follows the read (below).
+                    const bool prevDuty = inDuty_;
+                    inDuty_ = true;
+                    if (tooBig) {
+                        refuseTxn_(tc, OpStatus::InvalidArgument, 0,
+                                   "sendOffsetsToTransaction: more than 1024 offsets, or a group id outside 1..255 bytes");
+                    } else {
+                        applyTxnControl(tc, nowNs);
+                    }
+                    inDuty_ = prevDuty;
+                    controlApplied = true;
+                } else {
+                    ++ringForeign_;
+                }
+            } else {
+                ++ringForeign_;
+            }
             lastDrainStop_ = DrainStop::FlushToken;
             return ControlledAction::BREAK;
         },
-        messageLimit) + refused;
+        messageLimit);
+    if (controlApplied) [[unlikely]] {
+        const DutyScope duty(*this);   // runs what the op's handlers deferred (a close, deferred records)
+    }
+    return n + refused;
 }
 
 // ---------------------------------------------------------------------------
@@ -3123,6 +3150,19 @@ int ProducerImpl::discardRing_(OpStatus st, int limit, uint16_t errorCode) {
                 const int32_t part = readLE32(p, kRecPartOff);
                 const int32_t n    = static_cast<int32_t>(readLE32u(p, kBatchCountOff));
                 emitUnsentBatchAck_(tid, part, n, st, static_cast<uint32_t>(n), errorCode);
+            }
+            else if (type == kMsgTxnControl) {
+                // Phase 2b F Task 8: a control op that reaches a closed / discarding producer completes Closed
+                // (target, token and CQ credit released exactly as a refused send's), never dropped silently.
+                TxnControl tc;
+                bool       tooBig = false;
+                if (decodeTxnControl_(p, static_cast<std::size_t>(len), tc, tooBig)) {
+                    if (const auto* f = std::get_if<FatalError>(&txn_)) {   // a fenced producer: say why
+                        refuseTxn_(tc, f->status, f->errorCode, "transactional producer in FatalError (terminal)");
+                    } else {
+                        refuseTxn_(tc, OpStatus::Closed, 0, "producer closed");
+                    }
+                }
             }
             // kMsgFlush: nothing to complete.
         },

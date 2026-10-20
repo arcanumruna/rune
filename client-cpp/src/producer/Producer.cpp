@@ -409,8 +409,7 @@ void Producer::flush() noexcept {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 2b F: transactions (Task 1: the API surface and its refusals; the
-// lifecycle on a transactional producer is wired in Task 8)
+// Phase 2b F: transactions (Task 1: the API surface and its refusals; Task 8: the lifecycle)
 // ---------------------------------------------------------------------------
 
 bool Producer::transactional() const noexcept {
@@ -421,61 +420,150 @@ namespace {
 [[noreturn]] void throwNoTransactionalId(const char* op) {
     throw std::logic_error(std::string(op) + ": producer has no transactionalId");
 }
-[[noreturn]] void throwNotWired(const char* op) {
-    throw std::logic_error(std::string(op) + ": transactional lifecycle is not wired yet");
-}
 }  // namespace
 
-// Token forms: a plain producer is refused explicitly (no completion).  A
-// transactional one is not wired yet: also InvalidArgument until Task 8.
-OpResult Producer::initTransactions(const CompletionTarget&, Token) { return OpResult::InvalidArgument; }
-
-OpResult Producer::sendOffsetsToTransaction(std::span<const OffsetEntry>, std::string_view,
-                                            const CompletionTarget&, Token) {
-    return OpResult::InvalidArgument;
+// Token forms.  A plain producer is refused explicitly (InvalidArgument, no completion).  A transactional one
+// issues a control op: Thread mode writes it to the producer ring (FIFO with the records before it, FD1),
+// Invoker mode applies it at once on the owner thread (WrongThread elsewhere).  Accepted: exactly one completion.
+OpResult Producer::issueTxn_(std::uint8_t kindByte, const CompletionTarget& target, Token token,
+                             std::span<const OffsetEntry> offsets, std::string_view groupId) {
+    if (!impl_ || !transactional()) return OpResult::InvalidArgument;
+    using Kind = producer::TxnControl::Kind;
+    const Kind kind = static_cast<Kind>(kindByte);
+    producer::TxnControl c;
+    c.kind    = kind;
+    c.token   = token;
+    c.offsets = offsets;
+    c.groupId = groupId;
+    if (token > kMaxToken) return OpResult::InvalidArgument;
+    Completions* q = target.cq;
+    if (q == nullptr && target.handler.fn == nullptr) return OpResult::InvalidArgument;
+    if (q != nullptr) {
+        if (q->client_ == nullptr || q->client_ != impl_->hooks().ctx || q->ring_ == nullptr) return OpResult::InvalidArgument;
+        if (!q->onOwnerThread()) return OpResult::WrongThread;
+        // The widest txn completion carries error text; a flush's too.
+        const uint32_t r  = q->reservationFor(OpKind::InitTransactions);
+        const OpResult rr = q->reserve(r);
+        if (rr != OpResult::Accepted) return rr;
+        c.target.reservedBytes = r;
+        c.target.cqRef         = q->cqRef_;
+    } else {
+        c.target.handler = target.handler;
+    }
+    const OpResult r = impl_->issueTxnControl(c);
+    if (r != OpResult::Accepted && q != nullptr) q->unreserve(c.target.reservedBytes);   // nothing will complete
+    return r;
 }
 
-OpResult Producer::commitTransaction(const CompletionTarget&, Token) { return OpResult::InvalidArgument; }
+OpResult Producer::initTransactions(const CompletionTarget& t, Token k) {
+    return issueTxn_(static_cast<std::uint8_t>(producer::TxnControl::Kind::Init), t, k, {}, {});
+}
 
-OpResult Producer::abortTransaction(const CompletionTarget&, Token) { return OpResult::InvalidArgument; }
+OpResult Producer::sendOffsetsToTransaction(std::span<const OffsetEntry> offsets, std::string_view groupId,
+                                            const CompletionTarget& t, Token k) {
+    return issueTxn_(static_cast<std::uint8_t>(producer::TxnControl::Kind::SendOffsets), t, k, offsets, groupId);
+}
 
-OpResult Producer::flush(const CompletionTarget&, Token) { return OpResult::InvalidArgument; }
+OpResult Producer::commitTransaction(const CompletionTarget& t, Token k) {
+    return issueTxn_(static_cast<std::uint8_t>(producer::TxnControl::Kind::Commit), t, k, {}, {});
+}
+
+OpResult Producer::abortTransaction(const CompletionTarget& t, Token k) {
+    return issueTxn_(static_cast<std::uint8_t>(producer::TxnControl::Kind::Abort), t, k, {}, {});
+}
+
+OpResult Producer::flush(const CompletionTarget& t, Token k) {
+    return issueTxn_(static_cast<std::uint8_t>(producer::TxnControl::Kind::Flush), t, k, {}, {});
+}
 
 void Producer::beginTransaction() {
     if (!transactional()) throwNoTransactionalId("beginTransaction()");
-    throwNotWired("beginTransaction()");
+    // A full ring is waited out like a blocking send (the duty cycle drains it); every other refusal throws.
+    producer::ProducerImpl::BlockingWait w = impl_->beginBlockingWait();
+    for (;;) {
+        producer::TxnControl c;   // Begin: void, no target
+        c.kind = producer::TxnControl::Kind::Begin;
+        const OpResult r = impl_->issueTxnControl(c);
+        if (r == OpResult::Accepted) return;
+        if (r == OpResult::BackPressured) {
+            impl_->blockingWaitStep(w);
+            continue;
+        }
+        if (r == OpResult::WrongThread) {
+            throw std::logic_error("beginTransaction(): an Invoker producer is used on its owner thread only");
+        }
+        throw std::logic_error("beginTransaction(): producer closed");
+    }
 }
 
-void Producer::initTransactionsAndWait(std::chrono::nanoseconds) {
-    if (!transactional()) throwNoTransactionalId("initTransactions()");
-    throwNotWired("initTransactions()");
+namespace {
+// Maps a completed op to the *AndWait contract: Ok returns, everything else throws with the outcome.
+void throwForTxnCompletion(const char* what, const Completion& c, const std::string& text) {
+    if (c.status == OpStatus::Ok) return;
+    std::string msg(what);
+    switch (c.status) {
+    case OpStatus::Fenced:         msg += ": ProducerFenced - re-initialize"; break;
+    case OpStatus::Timeout:        msg += ": timed out"; break;
+    case OpStatus::Closed:         msg += ": producer closed"; break;
+    case OpStatus::DeliveryFailed: msg += ": a data batch was not durably acknowledged"; break;
+    case OpStatus::BrokerError:    msg += ": broker error code " + std::to_string(c.errorCode); break;
+    default: msg += ": failed (status " + std::to_string(static_cast<int>(c.status)) + ")"; break;
+    }
+    if (!text.empty()) msg += " (" + text + ")";
+    if (c.status == OpStatus::InvalidArgument) throw std::invalid_argument(msg);
+    throw std::runtime_error(msg);
+}
+}  // namespace
+
+void Producer::txnAndWait_(const char* what, std::chrono::nanoseconds timeout, std::uint8_t kind,
+                           std::span<const OffsetEntry> offsets, std::string_view groupId) {
+    if (!transactional()) throwNoTransactionalId(what);
+    if (impl_->clientClosed()) throw std::runtime_error(std::string(what) + ": producer closed");
+    const auto& hk = impl_->hooks();
+    if (hk.andWait == nullptr) {
+        throw std::logic_error(std::string(what) + ": no Client to wait on (use the token form)");
+    }
+    struct Ctx {
+        Producer*                    self;
+        std::uint8_t                 kind;
+        std::span<const OffsetEntry> offsets;
+        std::string_view             groupId;
+    } ctx{this, kind, offsets, groupId};
+    const detail::AndWaitIssue issue = [](void* x, const CompletionTarget& t, Token k) {
+        auto* c = static_cast<Ctx*>(x);
+        return c->self->issueTxn_(c->kind, t, k, c->offsets, c->groupId);
+    };
+    std::string      text;
+    const Completion c = hk.andWait(hk.ctx, what, timeout, issue, &ctx, &text);
+    throwForTxnCompletion(what, c, text);
 }
 
-void Producer::sendOffsetsToTransactionAndWait(std::span<const OffsetEntry>, std::string_view,
-                                               std::chrono::nanoseconds) {
-    if (!transactional()) throwNoTransactionalId("sendOffsetsToTransaction()");
-    throwNotWired("sendOffsetsToTransaction()");
+void Producer::initTransactionsAndWait(std::chrono::nanoseconds timeout) {
+    txnAndWait_("initTransactions()", timeout, static_cast<std::uint8_t>(producer::TxnControl::Kind::Init), {}, {});
 }
 
-void Producer::commitTransactionAndWait(std::chrono::nanoseconds) {
-    if (!transactional()) throwNoTransactionalId("commitTransaction()");
-    throwNotWired("commitTransaction()");
+void Producer::sendOffsetsToTransactionAndWait(std::span<const OffsetEntry> offsets, std::string_view groupId,
+                                               std::chrono::nanoseconds timeout) {
+    txnAndWait_("sendOffsetsToTransaction()", timeout, static_cast<std::uint8_t>(producer::TxnControl::Kind::SendOffsets), offsets, groupId);
 }
 
-void Producer::abortTransactionAndWait(std::chrono::nanoseconds) {
-    if (!transactional()) throwNoTransactionalId("abortTransaction()");
-    throwNotWired("abortTransaction()");
+void Producer::commitTransactionAndWait(std::chrono::nanoseconds timeout) {
+    txnAndWait_("commitTransaction()", timeout, static_cast<std::uint8_t>(producer::TxnControl::Kind::Commit), {}, {});
 }
 
-void Producer::flushAndWait(std::chrono::nanoseconds) {
-    if (!transactional()) throwNoTransactionalId("flush()");
-    throwNotWired("flush()");
+void Producer::abortTransactionAndWait(std::chrono::nanoseconds timeout) {
+    txnAndWait_("abortTransaction()", timeout, static_cast<std::uint8_t>(producer::TxnControl::Kind::Abort), {}, {});
 }
 
-TxnState Producer::state() const noexcept { return TxnState::Uninitialized; }
+void Producer::flushAndWait(std::chrono::nanoseconds timeout) {
+    txnAndWait_("flush()", timeout, static_cast<std::uint8_t>(producer::TxnControl::Kind::Flush), {}, {});
+}
+
+// Status (FD9): the bound thread only (the creating thread, or bindBatchThread()'s); anywhere else "not available".
+TxnState Producer::state() const noexcept { return impl_ != nullptr ? impl_->appTxnState() : TxnState::Uninitialized; }
 int64_t  Producer::producerId() const noexcept { return impl_ != nullptr ? impl_->appProducerId() : -1; }
 int16_t  Producer::producerEpoch() const noexcept { return impl_ != nullptr ? impl_->appProducerEpoch() : int16_t{-1}; }
-bool     Producer::transactionActive() const noexcept { return false; }
+bool     Producer::transactionActive() const noexcept { return impl_ != nullptr && impl_->appTxnActive(); }
 
 // ---------------------------------------------------------------------------
 // F8c C6a: close

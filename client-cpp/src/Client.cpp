@@ -1136,6 +1136,10 @@ void Client::pinCommandTarget_(detail::HubCommand& cmd) noexcept {
 // F8c C4/C5: token ops issued through handles (commitSync, txn ops)
 // ---------------------------------------------------------------------------
 
+void Client::pinTargetTrampoline_(void* ctx, detail::OpTarget& t) noexcept {
+    static_cast<Client*>(ctx)->pinCqSlot_(t);
+}
+
 OpResult Client::targetedOpTrampoline_(void* ctx, detail::HubCommand& cmd, const CompletionTarget& target,
                                        Token token, OpKind op) {
     return static_cast<Client*>(ctx)->issueTargeted_(cmd, target, token, op);
@@ -4385,6 +4389,7 @@ Producer Client::producerWithRingCap_(ProducerConfig cfg, int32_t ringCap, bool 
         hk.issueClose = &Client::issueProducerCloseTrampoline_;
         hk.andWait    = &Client::andWaitTrampoline_;
         hk.release    = &Client::hubCommandTrampoline_;  // C7: HandleRelease
+        hk.pinTarget  = &Client::pinTargetTrampoline_;   // Phase 2b F Task 8: txn ops read from the producer ring
         impl->setHooks(hk);
     }
 

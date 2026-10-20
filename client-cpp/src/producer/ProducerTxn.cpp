@@ -37,6 +37,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdio>
+#include <cstring>
 #include <optional>
 
 namespace rune::client::producer {
@@ -140,6 +141,103 @@ void ProducerImpl::refuseTxn_(const TxnControl& c, OpStatus st, uint16_t errorCo
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// Phase 2b F Task 8: the handle side - kMsgTxnControl on the producer ring (FD1), the gate (FD2)
+// ---------------------------------------------------------------------------------------------------------------
+
+static_assert(sizeof(OffsetEntry) == 16 && alignof(OffsetEntry) <= 8 && std::is_trivially_copyable_v<OffsetEntry>,
+              "kMsgTxnControl carries OffsetEntry as 16 raw bytes (topicId i32, partition i32, offset i64)");
+
+namespace {
+inline void putU32(uint8_t* p, uint32_t v) noexcept { std::memcpy(p, &v, 4); }
+inline void putI64(uint8_t* p, int64_t v) noexcept { std::memcpy(p, &v, 8); }
+inline uint32_t getU32(const uint8_t* p) noexcept { uint32_t v; std::memcpy(&v, p, 4); return v; }
+inline int64_t  getI64(const uint8_t* p) noexcept { int64_t v; std::memcpy(&v, p, 8); return v; }
+inline std::size_t align8(std::size_t n) noexcept { return (n + 7u) & ~std::size_t{7}; }
+/// The largest kMsgTxnControl: header + a 255-byte group id (padded) + kMaxTxnOffsets entries.
+constexpr std::size_t kTxnCtlMaxBytes = kTxnCtlHeaderBytes + 256 + kMaxTxnOffsets * sizeof(OffsetEntry);
+}  // namespace
+
+OpResult ProducerImpl::writeTxnControl_(const TxnControl& c, bool overCap) noexcept {
+    alignas(8) uint8_t buf[kTxnCtlMaxBytes];   // stack only: a control op allocates nothing
+    std::memset(buf, 0, kTxnCtlHeaderBytes);
+    buf[0] = static_cast<uint8_t>(c.kind);
+    putU32(buf + 4, static_cast<uint32_t>(c.groupId.size()));
+    putI64(buf + 8, static_cast<int64_t>(c.token));
+    detail::HubCommand words;
+    detail::encodeTarget(c.target, words);
+    putI64(buf + 16, words.b);
+    putI64(buf + 24, words.c);
+    putU32(buf + 32, static_cast<uint32_t>(c.offsets.size()));
+    std::size_t len = kTxnCtlHeaderBytes;
+    if (c.kind == TxnControl::Kind::SendOffsets && !overCap) {
+        std::memcpy(buf + len, c.groupId.data(), c.groupId.size());
+        const std::size_t at = align8(len + c.groupId.size());
+        std::memset(buf + len + c.groupId.size(), 0, at - (len + c.groupId.size()));
+        if (!c.offsets.empty()) std::memcpy(buf + at, c.offsets.data(), c.offsets.size() * sizeof(OffsetEntry));
+        len = at + c.offsets.size() * sizeof(OffsetEntry);
+    }
+    if (len > static_cast<std::size_t>(ring_.maxMsgLength())) return OpResult::InvalidArgument;   // a tiny ring
+    if (writeToRing(kMsgTxnControl, buf, len)) return OpResult::Accepted;
+    return closed_() ? OpResult::Closed : OpResult::BackPressured;
+}
+
+OpResult ProducerImpl::issueTxnControl(const TxnControl& c) noexcept {
+    if (!transactional_()) return OpResult::InvalidArgument;
+    if (clientClosed()) return OpResult::Closed;
+    const bool ends = c.kind == TxnControl::Kind::Commit || c.kind == TxnControl::Kind::Abort;
+    if (mode_ == IngressMode::Direct) {
+        if (std::this_thread::get_id() != dutyThreadId_) return OpResult::WrongThread;
+        if (ends) txnGate_ = TxnGate::Closed;   // FD2: before the op is applied
+        TxnControl d = c;
+        if (hooks_.pinTarget != nullptr && c.kind != TxnControl::Kind::Begin) hooks_.pinTarget(hooks_.ctx, d.target);
+        {
+            const DutyScope duty(*this);
+            applyTxnControl(d, clock_());
+        }
+        if (c.kind == TxnControl::Kind::Begin) txnGate_ = TxnGate::Open;
+        return OpResult::Accepted;
+    }
+    const bool overCap = c.kind == TxnControl::Kind::SendOffsets &&
+                         (c.offsets.size() > kMaxTxnOffsets || c.groupId.empty() ||
+                          c.groupId.size() > kMaxTxnGroupIdBytes);
+    const TxnGate prev = txnGate_;
+    if (ends) txnGate_ = TxnGate::Closed;   // FD2: BEFORE the write, so a produce that follows on this thread is refused
+    const OpResult r = writeTxnControl_(c, overCap);
+    if (r != OpResult::Accepted) {
+        txnGate_ = prev;                    // nothing was written: the transaction is still as it was
+        return r;
+    }
+    if (c.kind == TxnControl::Kind::Begin) txnGate_ = TxnGate::Open;   // after the write succeeded
+    return r;
+}
+
+bool ProducerImpl::decodeTxnControl_(const uint8_t* p, std::size_t len, TxnControl& out, bool& tooBig) noexcept {
+    tooBig = false;
+    if (len < kTxnCtlHeaderBytes || p[0] > static_cast<uint8_t>(TxnControl::Kind::Flush)) return false;
+    out.kind  = static_cast<TxnControl::Kind>(p[0]);
+    out.token = static_cast<Token>(getI64(p + 8));
+    out.target = detail::decodeTargetWords(getI64(p + 16), getI64(p + 24));
+    out.offsets = {};
+    out.groupId = {};
+    if (out.kind != TxnControl::Kind::Begin && hooks_.pinTarget != nullptr) hooks_.pinTarget(hooks_.ctx, out.target);
+    if (out.kind != TxnControl::Kind::SendOffsets) return true;
+    const uint32_t glen   = getU32(p + 4);
+    const uint32_t ocount = getU32(p + 32);
+    if (ocount > kMaxTxnOffsets || glen == 0 || glen > kMaxTxnGroupIdBytes) {
+        tooBig = true;
+        return true;
+    }
+    const std::size_t at = align8(kTxnCtlHeaderBytes + glen);
+    if (len < at + static_cast<std::size_t>(ocount) * sizeof(OffsetEntry) || (reinterpret_cast<uintptr_t>(p) & 7u) != 0) {
+        tooBig = true;   // truncated (cannot happen: the issuing side wrote it whole)
+        return true;
+    }
+    out.groupId = std::string_view(reinterpret_cast<const char*>(p + kTxnCtlHeaderBytes), glen);
+    out.offsets = std::span<const OffsetEntry>(reinterpret_cast<const OffsetEntry*>(p + at), ocount);
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
 // Ops (duty thread)
 // ---------------------------------------------------------------------------------------------------------------
 
@@ -148,12 +246,13 @@ void ProducerImpl::applyTxnControl(const TxnControl& c, int64_t nowNs) {
         refuseTxn_(c, OpStatus::InvalidArgument, 0, "producer has no transactionalId");
         return;
     }
-    if (!lifeOpen()) {
-        refuseTxn_(c, OpStatus::Closed, 0, "producer closed");
-        return;
-    }
+    // FatalError first: a fenced producer fails its intake too, and the app must still see WHY (Fenced), not Closed.
     if (const auto* f = std::get_if<FatalError>(&txn_)) {
         refuseTxn_(c, f->status, f->errorCode, "transactional producer in FatalError (terminal)");
+        return;
+    }
+    if (!lifeOpen()) {
+        refuseTxn_(c, OpStatus::Closed, 0, "producer closed");
         return;
     }
     const TxnOp op{c.target, c.token, nowNs + txnOpTimeoutNs_()};

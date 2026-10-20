@@ -437,7 +437,12 @@ struct InvokerGateway {
     // so later errors can overtake earlier OKs.
     int           okDelayPumps  = 0;
     int           produceFrames = 0;
+    // Phase 2b F Task 8: the model's transaction view.  A log batch carrying the TRANSACTIONAL attribute is Open until
+    // the EndTxn of its producer id decides it (Committed / Aborted); a plain batch is NotTxn.  committedValues() is
+    // what a read_committed reader sees.
+    enum class TxnFate : uint8_t { NotTxn, Open, Committed, Aborted };
     struct LogBatch {
+        TxnFate fate = TxnFate::NotTxn;
         int32_t topicId = 0;
         int32_t partition = 0;
         int64_t producerId = -1;
@@ -447,6 +452,24 @@ struct InvokerGateway {
         std::vector<std::vector<uint8_t>> values;
     };
     std::vector<LogBatch> log;
+    /// A read_committed reader's view of `partition`: plain batches and committed transactional ones, in log order.
+    [[nodiscard]] std::vector<std::vector<uint8_t>> committedValues(int32_t partition) const {
+        std::vector<std::vector<uint8_t>> out;
+        for (const auto& b : log) {
+            if (b.partition != partition || b.fate == TxnFate::Open || b.fate == TxnFate::Aborted) continue;
+            for (const auto& v : b.values) out.push_back(v);
+        }
+        return out;
+    }
+    /// Every value of `partition` whose batch is not aborted (a read_uncommitted reader's view, minus aborts).
+    [[nodiscard]] std::size_t visibleBatches(int32_t partition, TxnFate fate) const {
+        std::size_t n = 0;
+        for (const auto& b : log) n += (b.partition == partition && b.fate == fate) ? 1u : 0u;
+        return n;
+    }
+    // TxnOffsetCommit entries received in the open transaction; EndTxn(commit) moves them to committedOffsets.
+    std::vector<std::tuple<int32_t, int32_t, int64_t>> pendingTxnOffsets;
+    std::string lastTxnOffsetGroup;
     // ---- D6: UnknownProducerId (Kafka UNKNOWN_PRODUCER_ID) ----
     // The model answers a Produce with no producer entry and baseSequence != 0
     // UnknownProducerId + logStartOffset — to a session whose ConnectRequest
@@ -1151,6 +1174,7 @@ private:
             lb.producerEpoch = pv.producerEpoch;
             lb.baseSequence  = pv.baseSequence;
             lb.baseOffset    = nextOffset;
+            lb.fate = (r.attributes() & rune::protocol::batch::kAttrTransactional) != 0 ? TxnFate::Open : TxnFate::NotTxn;
             r.forEachRecord([&](std::string_view, std::string_view v, int64_t, int64_t) {
                 lb.values.emplace_back(v.begin(), v.end());
             });
@@ -1667,8 +1691,33 @@ private:
             send(0, out.data(), n);
             return;
         }
-        case rcc::TemplateId::AddOffsetsToTxn:    ++addOffsets; return;
-        case rcc::TemplateId::TxnOffsetCommit:    ++txnOffsetCommits; return;
+        case rcc::TemplateId::AddOffsetsToTxn: {
+            ++addOffsets;
+            const auto ao = rp::AddOffsetsToTxn::decode(buf, len);
+            if (!ao || !replyTxn) return;
+            rp::AddOffsetsToTxnResponse rsp;
+            rsp.sessionId     = ao->sessionId;
+            rsp.correlationId = ao->correlationId;
+            std::vector<uint8_t> out(rp::AddOffsetsToTxnResponse::ENCODED_SIZE);
+            const std::size_t n = rsp.encode(out.data());
+            send(0, out.data(), n);
+            return;
+        }
+        case rcc::TemplateId::TxnOffsetCommit: {
+            ++txnOffsetCommits;
+            const auto oc = rp::TxnOffsetCommit::decode(buf, len);
+            if (!oc) return;
+            lastTxnOffsetGroup.assign(oc->groupId.begin(), oc->groupId.end());
+            for (const auto e : oc->entries) pendingTxnOffsets.emplace_back(e.topicId, e.partition, e.offset);
+            if (!replyTxn) return;
+            rp::TxnOffsetCommitResponse rsp;
+            rsp.sessionId     = oc->sessionId;
+            rsp.correlationId = oc->correlationId;
+            std::vector<uint8_t> out(rp::TxnOffsetCommitResponse::encodedSizeFor(0));
+            const std::size_t n = rsp.encode(out.data(), {});
+            send(0, out.data(), n);
+            return;
+        }
         case rcc::TemplateId::EndTxn: {
             ++endTxns;
             const auto et = rp::EndTxn::decode(buf, len);
@@ -1676,6 +1725,15 @@ private:
             coordinatorSessionIds.push_back(et->sessionId);
             if (txnNotCoordinator_(endpoint, et->sessionId, et->correlationId)) return;
             endTxnCommits.push_back(et->commit);
+            for (auto& b : log) {
+                if (b.fate == TxnFate::Open && b.producerId == et->producerId) {
+                    b.fate = et->commit != 0 ? TxnFate::Committed : TxnFate::Aborted;
+                }
+            }
+            if (et->commit != 0) {
+                for (const auto& [t, p, o] : pendingTxnOffsets) committedOffsets[{t, p}] = o;
+            }
+            pendingTxnOffsets.clear();
             if (!replyTxn) return;
             rp::EndTxnResponse rsp;
             rsp.sessionId     = et->sessionId;
