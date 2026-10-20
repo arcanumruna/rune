@@ -1471,6 +1471,7 @@ if(BUILD_TESTING)
             tests/client/InvokerClientTest.cpp
             tests/client/ProducerTxnClientTest.cpp
             tests/client/TxnMatrixTest.cpp
+            tests/client/TxnStressTest.cpp
             tests/client/ClaimClientTest.cpp
             tests/client/TypedClaimTest.cpp
             tests/client/IngressEndpointRoutingTest.cpp

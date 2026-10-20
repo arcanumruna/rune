@@ -399,6 +399,40 @@ struct InvokerGateway {
         int16_t      code          = 0;       // answers / EndTxn: the code sent (EndTxn: commit flag in `partition`)
     };
     std::vector<TxnFrame> txnFrames;
+    /// Task 13: every coordinator request the fake DECIDED (AddPartitions / AddOffsets / TxnOffsetCommit / EndTxn), in
+    /// arrival order, with the code it was answered with (0 = applied): a model learns which request a scripted code
+    /// landed on without looking inside the client.
+    struct CoordDecision {
+        TxnFrameKind kind          = TxnFrameKind::EndTxn;
+        int16_t      code          = 0;
+        uint8_t      commit        = 0;    // EndTxn: the commit flag
+        int16_t      producerEpoch = -1;
+        bool         answered      = true; // false: the answer was swallowed (holdTxnReplies / !replyTxn)
+        bool         resend        = false;// a re-sent request (same correlation id): its first decision, not applied again
+        int64_t      producerId    = -1;
+        int64_t      correlationId = 0;
+    };
+    std::vector<CoordDecision> coordDecisions;
+    /// A coordinator is idempotent for a re-sent request (FD5: the same correlation id on the new session): it gets
+    /// the FIRST decision again - no second scripted code, no second apply.  Keyed (pid, epoch, correlation id).
+    std::map<std::tuple<int64_t, int16_t, int64_t>, int16_t> coordDecided_;
+    /// The code for a coordinator request; `resend` = it was decided before.
+    int16_t coordDecide_(int64_t pid, int16_t epoch, int64_t corr, bool& resend) {
+        const auto key = std::make_tuple(pid, epoch, corr);
+        if (const auto it = coordDecided_.find(key); it != coordDecided_.end()) {
+            resend = true;
+            return it->second;
+        }
+        resend = false;
+        const int16_t code = txnCoordCode_(pid, epoch);
+        // A retriable answer (27 ConcurrentTransactions, 14 NotCoordinator) is not a decision: the client re-sends the
+        // same request (same correlation id) and it is decided afresh.
+        if (code != static_cast<int16_t>(rune::protocol::client::ErrorCode::ConcurrentTransactions) &&
+            code != static_cast<int16_t>(rune::protocol::client::ErrorCode::NotCoordinator)) {
+            coordDecided_[key] = code;
+        }
+        return code;
+    }
     // Scripted coordinator answers: the next AddPartitions / AddOffsets / TxnOffsetCommit / EndTxn requests are
     // answered with the front code (19 InvalidTxnState, 18 ProducerFenced, ...) and NOT applied; popped per request.
     std::deque<int16_t> txnCoordCodes;
@@ -1729,6 +1763,12 @@ private:
             if (rsp.errorCode == 0 && !plain) {   // a transactional id's epoch grows with every successful init / bump
                 const std::string tid(ip->transactionalId.begin(), ip->transactionalId.end());
                 rsp.producerEpoch = txnEpochs_[tid]++;
+                // A real coordinator's InitProducerId ends the id's previous transaction (Kafka: an ongoing one is
+                // aborted on the epoch bump): a fenced zombie's open batches and staged offsets never commit later.
+                for (auto& b : log) {
+                    if (b.fate == TxnFate::Open && b.producerId == rsp.producerId) b.fate = TxnFate::Aborted;
+                }
+                pendingTxnOffsets.clear();
             }
             std::vector<uint8_t> out(rp::InitProducerIdResponse::ENCODED_SIZE);
             const std::size_t n = rsp.encode(out.data());
@@ -1744,7 +1784,10 @@ private:
             std::vector<rp::TxnPartitionResult> results;
             for (const auto tp : ap->partitions) results.push_back({tp.topicId, tp.partition, 0});
             for (const auto& r : results) txnFrames.push_back({TxnFrameKind::AddPartitionsReq, r.partition, false, ap->producerId, ap->producerEpoch, 0});
-            const int16_t code = txnCoordCode_(ap->producerId, ap->producerEpoch);
+            bool resend = false;
+            const int16_t code = coordDecide_(ap->producerId, ap->producerEpoch, ap->correlationId, resend);
+            coordDecisions.push_back({TxnFrameKind::AddPartitionsReq, code, 0, ap->producerEpoch, replyTxn && !holdTxnReplies, resend,
+                                      ap->producerId, ap->correlationId});
             for (auto& r : results) r.errorCode = code;
             if (!replyTxn) return;
             if (holdTxnReplies) { ++txnRequestsUnanswered; return; }
@@ -1770,7 +1813,10 @@ private:
             const auto ao = rp::AddOffsetsToTxn::decode(buf, len);
             if (!ao) return;
             txnFrames.push_back({TxnFrameKind::AddOffsets, -1, false, ao->producerId, ao->producerEpoch, 0});
-            const int16_t code = txnCoordCode_(ao->producerId, ao->producerEpoch);
+            bool resend = false;
+            const int16_t code = coordDecide_(ao->producerId, ao->producerEpoch, ao->correlationId, resend);
+            coordDecisions.push_back({TxnFrameKind::AddOffsets, code, 0, ao->producerEpoch, replyTxn && !holdTxnReplies, resend,
+                                      ao->producerId, ao->correlationId});
             if (!replyTxn) return;
             if (holdTxnReplies) { ++txnRequestsUnanswered; return; }
             rp::AddOffsetsToTxnResponse rsp;
@@ -1787,11 +1833,14 @@ private:
             const auto oc = rp::TxnOffsetCommit::decode(buf, len);
             if (!oc) return;
             txnFrames.push_back({TxnFrameKind::TxnOffsetCommit, -1, false, oc->producerId, oc->producerEpoch, 0});
-            const int16_t code = txnCoordCode_(oc->producerId, oc->producerEpoch);
+            bool resend = false;
+            const int16_t code = coordDecide_(oc->producerId, oc->producerEpoch, oc->correlationId, resend);
+            coordDecisions.push_back({TxnFrameKind::TxnOffsetCommit, code, 0, oc->producerEpoch, replyTxn && !holdTxnReplies, resend,
+                                      oc->producerId, oc->correlationId});
             lastTxnOffsetGroup.assign(oc->groupId.begin(), oc->groupId.end());
             std::vector<rp::TxnPartitionResult> results;
             for (const auto e : oc->entries) {
-                if (code == 0) pendingTxnOffsets.emplace_back(e.topicId, e.partition, e.offset);
+                if (code == 0 && !resend) pendingTxnOffsets.emplace_back(e.topicId, e.partition, e.offset);
                 results.push_back({e.topicId, e.partition, code});
             }
             if (!replyTxn) return;
@@ -1810,9 +1859,12 @@ private:
             if (!et) return;
             coordinatorSessionIds.push_back(et->sessionId);
             if (txnNotCoordinator_(endpoint, et->sessionId, et->correlationId)) return;
-            const int16_t code = txnCoordCode_(et->producerId, et->producerEpoch);
+            bool resend = false;
+            const int16_t code = coordDecide_(et->producerId, et->producerEpoch, et->correlationId, resend);
             txnFrames.push_back({TxnFrameKind::EndTxn, et->commit, false, et->producerId, et->producerEpoch, code});
-            if (code == 0) {
+            coordDecisions.push_back({TxnFrameKind::EndTxn, code, et->commit, et->producerEpoch, replyTxn && !holdTxnReplies, resend,
+                                      et->producerId, et->correlationId});
+            if (code == 0 && !resend) {
                 endTxnCommits.push_back(et->commit);
                 for (auto& b : log) {
                     if (b.fate == TxnFate::Open && b.producerId == et->producerId) {
