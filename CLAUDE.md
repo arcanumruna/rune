@@ -158,6 +158,18 @@ the repo, issues or commits.
 - **Pull requests are reviewed by the most capable model.** The reviewer leaves comments on the PR where needed; the
   implementer resolves each one (fix, or reply with the reason) and pushes. When the reviewer is satisfied it approves,
   merges the PR and closes the linked issues.
+- **Issue-fix PRs: whole-area and adversarial review.** For a PR that fixes GitHub issues, the review covers the
+  entire area each fix touches, not just the diff: the module it lives in, its callers, sibling paths that share the
+  invariant, and their tests. Both the implementer (before opening the PR) and the reviewer write tests meant to break
+  that whole area, driven through the public API (client API, wire frames, admin/CLI):
+  - malformed, truncated, boundary and oversize inputs;
+  - wrong ordering, replays, races and concurrent calls;
+  - restarts mid-operation;
+  - version skew;
+  - missing or wrong credentials.
+
+  The tests are kept as `Regression` tests. A break in one of the PR's own issues is fixed in the PR. Any other break
+  becomes a labeled GitHub issue with the failing test as its repro.
 - Commit messages end with the session's `Co-Authored-By:` trailer.
 - **No secrets in the repo:** no emails, passwords, tokens, keys, IPs or local paths. Everything sensitive comes from
   the environment.
