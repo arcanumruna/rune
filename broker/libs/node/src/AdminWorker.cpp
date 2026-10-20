@@ -54,6 +54,7 @@ constexpr uint16_t kViewNotAlterable     = 38;
 constexpr uint16_t kInvalidRequest       = 39;
 constexpr uint16_t kInvalidTopicName     = 40;
 constexpr uint16_t kViewSourceIsView     = 41;
+constexpr uint16_t kNotAuthorized        = 45;
 
 /// A malformed request carries no meta: it is treated as id-less (pre-v8) — it is
 /// answered before the dedupe and never fingerprinted.
@@ -1062,6 +1063,9 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
     if (const cat::TopicObject* t = s.topicByName(m.name)) {
         if (t->schema) return Rejected(reject(kTopicExists, {}, t->topicId, t->schema->schemaVersion));
         if (m.blob.empty()) return Rejected(reject(kTopicExists, {}, t->topicId, 0));   // untyped, nothing to adopt
+        // Issue #129: adopting a schema is a new version of a LIVE topic (every other producer's records are then
+        // validated against it), so it needs ALTER on the topic - the gateway's verdict - not CREATE alone.
+        if (!m.adoptDenial.empty()) return Rejected(reject(kNotAuthorized, m.adoptDenial));
         // Final review I1: an EXPLICIT transient define over an untyped DISK topic
         // cannot be honoured (the topic keeps its log backend).
         if (m.persistence == static_cast<uint8_t>(PersistenceMode::Transient) &&

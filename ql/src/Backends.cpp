@@ -148,23 +148,23 @@ std::expected<SecurityPlan, ParseError> applySecurityPlan(const Statement& st) {
             case AlterUserDef::Change::SetPassword:
                 p.change = pc::UserChangeKind::SetPassword; p.password = d->password;
                 p.terminateSessions = d->terminateSessions ? 1 : 0; break;
-            case AlterUserDef::Change::Disable: p.change = pc::UserChangeKind::Disable; break;
+            case AlterUserDef::Change::Disable: p.change = pc::UserChangeKind::Disable; p.force = d->force; break;
             case AlterUserDef::Change::Enable:  p.change = pc::UserChangeKind::Enable; break;
         }
     } else if (const auto* d = std::get_if<DropUserDef>(&st)) {
-        p.kind = pc::SecurityOpKind::DropUser; p.name = d->name;
+        p.kind = pc::SecurityOpKind::DropUser; p.name = d->name; p.force = d->force;
     } else if (const auto* d = std::get_if<CreateRoleDef>(&st)) {
         p.kind = pc::SecurityOpKind::CreateRole; p.name = d->name;
     } else if (const auto* d = std::get_if<DropRoleDef>(&st)) {
-        p.kind = pc::SecurityOpKind::DropRole; p.name = d->name;
+        p.kind = pc::SecurityOpKind::DropRole; p.name = d->name; p.force = d->force;
     } else if (const auto* d = std::get_if<GrantDef>(&st)) {
         p.kind = pc::SecurityOpKind::Grant; grantFields(d->op, d->resource, d->grantee, d->granteeName);
     } else if (const auto* d = std::get_if<RevokeDef>(&st)) {
-        p.kind = pc::SecurityOpKind::Revoke; grantFields(d->op, d->resource, d->grantee, d->granteeName);
+        p.kind = pc::SecurityOpKind::Revoke; grantFields(d->op, d->resource, d->grantee, d->granteeName); p.force = d->force;
     } else if (const auto* d = std::get_if<GrantRoleDef>(&st)) {
         p.kind = pc::SecurityOpKind::GrantRole; p.name = d->user; p.roleName = d->role;
     } else if (const auto* d = std::get_if<RevokeRoleDef>(&st)) {
-        p.kind = pc::SecurityOpKind::RevokeRole; p.name = d->user; p.roleName = d->role;
+        p.kind = pc::SecurityOpKind::RevokeRole; p.name = d->user; p.roleName = d->role; p.force = d->force;
     } else {
         return std::unexpected(ParseError{0, 0, "not a security DDL statement (SHOW statements are client-side reads)"});
     }

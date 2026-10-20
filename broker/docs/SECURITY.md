@@ -46,12 +46,13 @@ Rules that keep the model small (D15 to D17):
 | GetViewRow / openView | `READ` on the view |
 | Metadata, topic and view listings, `GetTopicSchema` | `DESCRIBE` |
 | `CreateTopic` / `CreateView` / `CreateSchema` | `CREATE` on the name (exact or prefix grant), or on `CLUSTER` |
+| `CreateSchema` on an existing untyped topic (a `DefineTopic` with a descriptor) | `ALTER` on the topic as well: it is a new schema version of a live object |
 | `CreateView` / `AlterView` (D19) | also `READ` on every source topic |
 | `AlterSchema` / `AlterView` / `AlterTopicConfig` / `SetCompatibility` | `ALTER` on the object |
 | `DropTopic` / `DropView` | `DROP` on the object |
 | Catalog history, as-of, diff, export, replay (`__catalog` reads) (D21) | `DESCRIBE` on `CLUSTER` |
 | User, role and grant DDL; every `SHOW USERS|ROLES|GRANTS|SECURITY HISTORY` (D20) | `ADMIN` on `CLUSTER` |
-| `ALTER USER <self> SET|ADD|DROP PASSWORD` (D20) | nothing (a user changes their own password) |
+| `ALTER USER <self> SET|ADD|DROP PASSWORD` (D20) | no grant, but a fresh proof of a current password (the client sends it; a session alone is not enough) |
 
 **Visibility.** Objects the user cannot `DESCRIBE` do not appear in metadata or listings. Direct
 access to such an object answers `NotAuthorized`, whether or not the object exists, so the answer
@@ -63,7 +64,10 @@ always `not authorized: <OP> on <TYPE> <requested name or id>` (D23).
 
 ## Rune QL statements
 
-All security statements need `ADMIN ON CLUSTER`, except a user changing their own password. A
+All security statements need `ADMIN ON CLUSTER`, except a user changing their own password. That
+change carries a SCRAM proof of a current password, bound to the session's login and to the request,
+so a hijacked or leaked session cannot add or replace a password. After a `SET PASSWORD`, log in again
+before the next change of your own password. A
 statement that carries a password literal is always read from a file or stdin with
 `rune ql -f` (`-e` refuses it, so the password never shows in `ps` or the shell history). Passwords
 are turned into SCRAM verifiers by the client library or the CLI before sending: the plaintext
@@ -164,6 +168,10 @@ rune security bootstrap --admin admin \
 - Automation (CI, docker) supplies the one-time password itself with `--password-file <path>`: it is
   never read from an environment variable and never accepted on the command line.
 - A second run refuses: `this cluster is already bootstrapped - it already has a security admin`.
+- The last enabled security admin cannot be removed by accident: `ALTER USER .. DISABLE`, `DROP USER`,
+  `DROP ROLE` or `REVOKE` that would leave no enabled user holding `ADMIN ON CLUSTER` is refused unless
+  the statement ends in `FORCE`. A forced removal reopens the bootstrap window: the other users keep
+  logging in, and the cluster-key holder can run `rune security bootstrap` again (D3 recovery).
 
 ```bash
 rune ql --user admin --password-file otp.txt -f change-password.rql --broker rune-1:40200

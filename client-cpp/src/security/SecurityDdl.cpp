@@ -57,6 +57,7 @@ void fillSecurityDdl(const rune::ql::SecurityPlan& plan, uint32_t iterations, ui
     msg.patternKind       = plan.patternKind;
     msg.pattern           = plan.pattern;
     msg.roleName          = plan.roleName;
+    if (plan.force) msg.flags |= rpc::kSecurityDdlFlagForce;
     if (msg.hasVerifier()) {
         buildVerifier(plan.password, iterations, minPasswordLength, vs);
         msg.verifier = vs.view();

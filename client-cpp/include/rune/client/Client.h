@@ -375,6 +375,11 @@ struct ClientConfig {
     // AuthenticationFailed — a rogue endpoint must not receive a credentialed client's data.  Set true to accept
     // such a broker anyway (authStatus() then reports Anonymous).  A Client without credentials is unaffected.
     bool allowUnauthenticatedBroker = false;
+    // securityBootstrapOnly (issue #121): this Client exists only for bootstrapSecurity() and has no credentials.  On a
+    // cluster whose bootstrap window was reopened (its last admin disabled or dropped; the broker answers
+    // MustAuthenticate because its other users still log in) it skips the login instead of failing it.  Ignored with
+    // credentials.  The CLI's `rune security bootstrap` sets it.
+    bool securityBootstrapOnly = false;
     // minPasswordLength / scramIterations: how this client builds a NEW verifier (ALTER USER ...
     // SET PASSWORD, the CLI's bootstrap) — the broker never sees a password, so the minimum is the
     // client's rule (D9).  Not used by the login itself, which follows the broker's salt and count.

@@ -6,4 +6,6 @@ build-*/
 CMakeUserPresets.json
 conan*.cmake
 *.cmake
+# The build's own CMake modules are sources (issue #405: the test-cert generator was never committed).
+!cmake/*.cmake
 .DS_Store

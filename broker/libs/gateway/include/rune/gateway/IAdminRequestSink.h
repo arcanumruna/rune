@@ -80,6 +80,11 @@ struct IAdminRequestSink {
     // DefineTopic (64).  An empty descriptor is an UNTYPED topic (ruling 3).
     // v8: `replicationFactor` (0 = every broker) and the creation `config`
     // (the defaults for a pre-v8 frame).
+    // `adoptDenial` (issue #129): the gateway's verdict on the request turning into a NEW SCHEMA VERSION of an
+    // existing untyped topic (CreateSchemaOps), which needs ALTER on the topic (as AlterTopic), not only CREATE on
+    // the name.  Only the admin thread knows whether the name exists, so the gateway sends its verdict along: "" = the
+    // session may adopt, otherwise the NotAuthorized detail (D23) the admin thread answers if adoption is what the
+    // request would do.
     virtual AdminSubmit submitDefineTopic(int64_t sessionId, int64_t correlationId,
                                           std::string_view name, uint32_t partitionCount,
                                           std::string_view keyField, bool validate,
@@ -87,7 +92,7 @@ struct IAdminRequestSink {
                                           uint8_t persistence,   // Phase 2b E: 0 disk, 1 transient
                                           int16_t replicationFactor,
                                           const rune::protocol::TopicConfigView& config,
-                                          const DdlMetaView& meta) = 0;
+                                          const DdlMetaView& meta, std::string_view adoptDenial) = 0;
 
     // GetTopicSchema (66) — a read, no DDL extension.  requestedFingerprint
     // (Task 13): 0 = latest; non-zero = the SPECIFIC version whose per-version
@@ -142,7 +147,15 @@ struct IAdminRequestSink {
     // Authentication Task 10 (D36): the security DDL (79) and the one-time bootstrap (80), both answered by a
     // DdlResponse (78) from the admin thread; `meta.statement` is the REDACTED statement.  The bootstrap's MAC was
     // verified by the gateway before this call.
-    virtual AdminSubmit submitSecurityDdl(const rune::protocol::client::SecurityDdl& m, const DdlMetaView& meta) = 0;
+    // `denial` (PR #410 review F1): the gateway's authorization verdict - "" = authorized, otherwise the NotAuthorized
+    // detail (no ADMIN, or an own credential change without a valid proof).  A request that carries a request id is
+    // forwarded even when denied: the leader first answers a RETRY of an already-applied request (its dedupe table) with
+    // its original result - the check may depend on state the first attempt changed (a SET PASSWORD replaced the
+    // password the retry is proven with; a REVOKE removed the ADMIN it needed) - and refuses everything else 45.
+    // `proofChecked` (F2): the gateway verified an own-credential proof for it - the leader then answers a request-id
+    // reuse with a different statement exactly like a bad proof.
+    virtual AdminSubmit submitSecurityDdl(const rune::protocol::client::SecurityDdl& m, const DdlMetaView& meta,
+                                          std::string_view denial, bool proofChecked) = 0;
     virtual AdminSubmit submitSecurityBootstrap(const rune::protocol::client::SecurityBootstrap& m,
                                                 const DdlMetaView& meta) = 0;
     // A Subscribe / Unsubscribe on `__security` (topic -7): the admin thread's second read server.  Same ring-full rules

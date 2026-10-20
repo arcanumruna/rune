@@ -248,3 +248,50 @@ TEST(SecurityStatementsRegression, PlanBytesAreTheProtocolEnumsRegression) {
     EXPECT_EQ(plan.granteeKind, static_cast<uint8_t>(rp::SecurityGranteeKind::Role));
     EXPECT_TRUE(rp::validSecurityOperation(plan.op) && rp::validSecurityResourceType(plan.resourceType));
 }
+
+// Issue #121: FORCE (the statement may remove the last enabled security admin) on every statement that can remove
+// one; it round-trips through the redacted text and reaches the plan.  GRANT never takes it.
+TEST(SecurityStatementsRegression, ForceParsesRendersAndReachesThePlanRegression) {
+    const std::pair<const char*, const char*> cases[] = {
+        {"alter user admin disable force;", "ALTER USER admin DISABLE FORCE;"},
+        {"drop user admin force;", "DROP USER admin FORCE;"},
+        {"drop role ops force;", "DROP ROLE ops FORCE;"},
+        {"revoke admin on cluster from user admin force;", "REVOKE ADMIN ON CLUSTER FROM USER admin FORCE;"},
+        {"revoke role ops from user admin force;", "REVOKE ROLE ops FROM USER admin FORCE;"},
+    };
+    for (const auto& [src, text] : cases) {
+        auto st = ql::parse(src);
+        ASSERT_TRUE(st.has_value()) << src << ": " << st.error().message;
+        EXPECT_EQ(ql::redactedText(*st), text);
+        auto again = ql::parse(ql::redactedText(*st));
+        ASSERT_TRUE(again.has_value()) << text;
+        auto plan = ql::applySecurityPlan(*again);
+        ASSERT_TRUE(plan.has_value()) << text;
+        EXPECT_TRUE(plan->force) << text;
+    }
+    EXPECT_FALSE(ql::applySecurityPlan(ql::parse("drop user admin;").value())->force);
+    EXPECT_FALSE(ql::applySecurityPlan(ql::parse("alter user admin disable;").value())->force);
+    EXPECT_FALSE(ql::parse("grant admin on cluster to user admin force;").has_value()) << "GRANT takes no FORCE";
+    EXPECT_FALSE(ql::parse("alter user admin enable force;").has_value());
+    EXPECT_EQ(std::get<ql::DropUserDef>(ql::parse("drop user force;").value()).name, "force") << "a user named force";
+}
+
+// PR #410 review, adversarial pass: FORCE at the edges of the grammar - case-insensitive, at most once, only at the
+// end, never on a statement that cannot remove an admin, and a name spelled "force" stays a name.
+TEST(SecurityStatementsRegression, ForceAtTheEdgesOfTheGrammarAdversarialRegression) {
+    EXPECT_TRUE(ql::applySecurityPlan(ql::parse("ALTER USER admin DISABLE FoRcE ;").value())->force);
+    EXPECT_FALSE(ql::parse("drop user admin force force;").has_value()) << "FORCE twice";
+    EXPECT_FALSE(ql::parse("drop user force admin;").has_value()) << "FORCE before the name";
+    EXPECT_FALSE(ql::parse("create user u with password 'abcdefghijkl' force;").has_value());
+    EXPECT_FALSE(ql::parse("create role r force;").has_value());
+    EXPECT_FALSE(ql::parse("grant role ops to user admin force;").has_value());
+    EXPECT_FALSE(ql::parse("alter user admin drop password 1 force;").has_value());
+    EXPECT_FALSE(ql::parse("alter user admin set password 'abcdefghijkl' force;").has_value());
+    const auto r = ql::parse("revoke read on topic t from user force force;");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(std::get<ql::RevokeDef>(*r).granteeName, "force");
+    EXPECT_TRUE(std::get<ql::RevokeDef>(*r).force);
+    const auto rr = ql::parse("revoke role force from user force;");
+    ASSERT_TRUE(rr.has_value()) << "a role and a user named force";
+    EXPECT_FALSE(std::get<ql::RevokeRoleDef>(*rr).force);
+}

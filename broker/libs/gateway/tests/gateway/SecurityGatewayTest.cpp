@@ -43,7 +43,7 @@ struct RecordingSink final : IAdminRequestSink {
     std::string lastAuthenticated;
     AdminSubmit submitDefineTopic(int64_t, int64_t, std::string_view, uint32_t, std::string_view, bool, const uint8_t*,
                                   uint32_t, uint8_t, int16_t, const rune::protocol::TopicConfigView&,
-                                  const DdlMetaView&) override { ++otherSubmits; return AdminSubmit::Accepted; }
+                                  const DdlMetaView&, std::string_view) override { ++otherSubmits; return AdminSubmit::Accepted; }
     bool submitGetSchema(int64_t, int64_t, std::string_view, uint64_t) override { return true; }
     AdminSubmit submitAlterTopic(int64_t, int64_t, std::string_view, uint16_t, const uint8_t*, uint32_t,
                                  const DdlMetaView&) override { ++otherSubmits; return AdminSubmit::Accepted; }
@@ -57,7 +57,11 @@ struct RecordingSink final : IAdminRequestSink {
                                 uint32_t, const DdlMetaView&) override { ++otherSubmits; return AdminSubmit::Accepted; }
     bool submitCatalogSubscribe(int64_t s, int64_t c, int64_t) override { catSubs.push_back({s, c}); return true; }
     bool submitCatalogUnsubscribe(int64_t s, int64_t id) override { catUnsubs.push_back({s, id}); return true; }
-    AdminSubmit submitSecurityDdl(const pc::SecurityDdl&, const DdlMetaView& m) override {
+    /// `securityDdls` counts the AUTHORIZED forwards; a denied one (PR #410 review F1: forwarded with the gateway's
+    /// verdict, which the leader answers) is recorded in `denied` by correlation id.
+    std::map<int64_t, std::string> denied;
+    AdminSubmit submitSecurityDdl(const pc::SecurityDdl& w, const DdlMetaView& m, std::string_view denial, bool) override {
+        if (!denial.empty()) { denied[w.correlationId] = std::string(denial); return AdminSubmit::Accepted; }
         ++securityDdls; lastAuthenticated = std::string(m.authenticated); return AdminSubmit::Accepted;
     }
     AdminSubmit submitSecurityBootstrap(const pc::SecurityBootstrap&, const DdlMetaView&) override { ++bootstraps; return AdminSubmit::Accepted; }

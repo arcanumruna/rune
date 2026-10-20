@@ -159,6 +159,7 @@ agent::AgentConfig toAgentConfig(const ClientConfig& c) {
     acfg.session.username      = c.username;   // authentication: SCRAM credentials (never logged)
     acfg.session.password      = c.password;
     acfg.session.allowUnauthenticatedBroker = c.allowUnauthenticatedBroker;
+    acfg.session.bootstrapOnly = c.securityBootstrapOnly;
     acfg.session.requireCrypto = c.requireCrypto;
     acfg.transport.clientLivenessTimeoutNs = c.aeronClientLivenessTimeoutNs;
     // F12: malformed env values are reported (once per Client construction —
@@ -1516,6 +1517,13 @@ OpResult Client::securityDdl(rune::ql::SecurityPlan plan, const DdlOptions& ddl,
     DdlOptions d = ddl;
     d.statement  = plan.statement;   // D10: ONLY the redacted statement ever travels
     msg.ext      = ddlExt_(d);
+    // Issue #114: a change of this client's OWN credential carries a proof of its current password; the duty thread
+    // fills the placeholder on every offer, for the broker session the frame then rides (signOwnCredentialChange).
+    static constexpr std::array<uint8_t, rpc::kCredentialProofBytes> kUnsignedProof{};
+    if (rpc::isOwnCredentialChange(msg, cfg_.username)) {
+        msg.flags |= rpc::kSecurityDdlFlagCredentialProof;
+        msg.credentialProof = std::string_view(reinterpret_cast<const char*>(kUnsignedProof.data()), kUnsignedProof.size());
+    }
     std::vector<uint8_t> frame(msg.encodedSize());
     const std::size_t n = msg.encode(frame.data());
     // Review B I4: a user changing THEIR OWN password keeps the plaintext (on the duty thread only, wiped on any

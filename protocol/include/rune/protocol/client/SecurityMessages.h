@@ -15,6 +15,9 @@
 //     DropUser, CreateRole, DropRole   -
 //     Grant, Revoke         granteeKind u8, op u8, resourceType u8, patternKind u8, pattern var16
 //     GrantRole, RevokeRole roleName var16
+//   then an OPTIONAL trailer (absent = flags 0; a pre-trailer decoder ignores it):
+//                           flags u8 (kSecurityDdlFlag*; unknown bits refused) | credentialProof 64 when flags has
+//                           kSecurityDdlFlagCredentialProof
 //   verifier                salt var16 | iterations u32 | storedKey 64 raw bytes | serverKey 64 raw bytes
 //   SecurityBootstrap (80)  header | adminName var16 | verifier | fakeSaltSeed 32 | nonce 16 | mac 64   (D4, D8)
 //   Grant / Revoke enum bytes are range-checked on decode (SecurityTypes.h).
@@ -23,6 +26,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <optional>
 #include <string_view>
 #include <vector>
@@ -46,6 +50,16 @@ inline constexpr std::size_t kBootstrapSeedBytes   = 32;   // the cluster-wide f
 inline constexpr std::size_t kBootstrapNonceBytes  = 16;
 inline constexpr std::size_t kBootstrapMacBytes    = 64;   // HMAC-SHA-512
 inline constexpr std::size_t kSecurityPatternMax   = 249;  // a topic / view / group name bound
+inline constexpr std::size_t kCredentialProofBytes = 64;   // SCRAM-SHA-512 ClientProof size
+
+/// SecurityDdl trailer flags.
+///   Force (issue #121): the statement's FORCE - remove the last enabled security admin anyway (the bootstrap window
+///     reopens, D3 recovery).
+///   CredentialProof (issue #114): a fresh proof of a CURRENT password of the session's own user rides along
+///     (credentialChangeMessage); required for a user's own ADD / DROP / SET PASSWORD without ADMIN.
+inline constexpr uint8_t kSecurityDdlFlagForce           = 0x01;
+inline constexpr uint8_t kSecurityDdlFlagCredentialProof = 0x02;
+inline constexpr uint8_t kSecurityDdlKnownFlags          = kSecurityDdlFlagForce | kSecurityDdlFlagCredentialProof;
 
 struct VerifierWire {
     std::string_view salt;
@@ -66,6 +80,8 @@ struct SecurityDdl {
     uint8_t granteeKind = 0, op = 0, resourceType = 0, patternKind = 0;   // Grant / Revoke
     std::string_view pattern;             // Grant / Revoke
     std::string_view roleName;            // GrantRole / RevokeRole
+    uint8_t flags = 0;                    // the trailer (kSecurityDdlFlag*); 0 = no trailer on the wire
+    std::string_view credentialProof;     // kCredentialProofBytes raw bytes when flags has CredentialProof
 
     static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::SecurityDdl);
     static constexpr uint16_t BODY_FIXED  = 0;
@@ -143,6 +159,7 @@ inline std::size_t SecurityDdl::encodedSize() const noexcept {
         case SecurityOpKind::GrantRole: case SecurityOpKind::RevokeRole: n += 2u + roleName.size(); break;
         default: break;
     }
+    if (flags != 0) n += 1u + ((flags & kSecurityDdlFlagCredentialProof) != 0 ? kCredentialProofBytes : 0u);
     return n;
 }
 
@@ -154,6 +171,8 @@ inline std::size_t SecurityDdl::encode(uint8_t* buf) const noexcept {
     if (hasVerifier() && !detail::verifierFits(verifier)) return 0;
     if ((kind == SecurityOpKind::Grant || kind == SecurityOpKind::Revoke) && !fitsVarLen16(pattern.size())) return 0;
     if ((kind == SecurityOpKind::GrantRole || kind == SecurityOpKind::RevokeRole) && !fitsVarLen16(roleName.size())) return 0;
+    if ((flags & ~kSecurityDdlKnownFlags) != 0) return 0;
+    if ((flags & kSecurityDdlFlagCredentialProof) != 0 && credentialProof.size() != kCredentialProofBytes) return 0;
     std::size_t pos = detail::putAuthHeader(buf, TEMPLATE_ID, BODY_FIXED, sessionId, correlationId);
     pos += putExt(buf + pos, ext);
     buf[pos++] = k;
@@ -174,6 +193,13 @@ inline std::size_t SecurityDdl::encode(uint8_t* buf) const noexcept {
             break;
         case SecurityOpKind::GrantRole: case SecurityOpKind::RevokeRole: pos += putVarStr(buf + pos, roleName); break;
         default: break;
+    }
+    if (flags != 0) {
+        buf[pos++] = flags;
+        if ((flags & kSecurityDdlFlagCredentialProof) != 0) {
+            std::memcpy(buf + pos, credentialProof.data(), kCredentialProofBytes);
+            pos += kCredentialProofBytes;
+        }
     }
     return pos;
 }
@@ -226,7 +252,80 @@ inline std::optional<SecurityDdl> SecurityDdl::decode(const uint8_t* buf, std::s
             break;
         default: break;
     }
+    if (pos < avail) {   // the optional trailer
+        m.flags = buf[pos++];
+        if ((m.flags & ~kSecurityDdlKnownFlags) != 0 || m.flags == 0) return std::nullopt;
+        if ((m.flags & kSecurityDdlFlagCredentialProof) != 0) {
+            if (pos + kCredentialProofBytes > avail) return std::nullopt;
+            m.credentialProof = std::string_view(reinterpret_cast<const char*>(buf + pos), kCredentialProofBytes);
+            pos += kCredentialProofBytes;
+        }
+        if (pos != avail) return std::nullopt;
+    }
     return m;
+}
+
+/// Issue #114: the message a credential-change proof signs, built identically by the client (which proves) and the
+/// gateway (which verifies).  It binds the proof to the SESSION (`loginNonce` = the SCRAM combined nonce of the login
+/// that authenticated it: unique per login, server-chosen in part) and to the REQUEST (its 128-bit request id, which
+/// the leader dedupes on, and every field of the change), so a proof is useless on another session or for another
+/// change.  The proof itself is SCRAM's: ClientKey XOR HMAC(StoredKey, message) over a CURRENT password's verifier.
+/// Names are length-prefixed (a name may hold any character); only fields the wire carries are covered, so the
+/// decoded request rebuilds the very same text.  Cold path (security DDL rate).
+[[nodiscard]] inline std::string credentialChangeMessage(std::string_view loginNonce, const SecurityDdl& m) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string s;
+    s.reserve(160 + loginNonce.size() + m.name.size() + 2 * (m.verifier.salt.size() + 2 * kVerifierKeyBytes));
+    const auto hex = [&](std::string_view bytes) {
+        for (const char c : bytes) {
+            const auto b = static_cast<uint8_t>(c);
+            s += kHex[b >> 4];
+            s += kHex[b & 0x0F];
+        }
+    };
+    const auto num = [&](uint64_t v) { s += std::to_string(v); };
+    s += "rune-credential-change,r=";
+    s += loginNonce;
+    s += ",q=";
+    num(m.ext.requestId.hi);
+    s += ':';
+    num(m.ext.requestId.lo);
+    s += ",u=";
+    num(m.name.size());
+    s += ':';
+    s += m.name;
+    s += ",k=";
+    num(static_cast<uint8_t>(m.kind));
+    s += ",c=";
+    num(static_cast<uint8_t>(m.change));
+    // Only what the wire carries for this change (the encoder drops the rest): both sides must build the same text.
+    if (m.change == UserChangeKind::DropPassword) {
+        s += ",i=";
+        num(m.passwordIndex);
+    }
+    if (m.change == UserChangeKind::SetPassword) {
+        s += ",t=";
+        num(m.terminateSessions);
+    }
+    if (m.hasVerifier()) {
+        s += ",v=";
+        hex(m.verifier.salt);
+        s += ':';
+        num(m.verifier.iterations);
+        s += ':';
+        hex(m.verifier.storedKey);
+        s += ':';
+        hex(m.verifier.serverKey);
+    }
+    return s;
+}
+
+/// Issue #114: whether `m` is a user's change of its OWN credential (`self` = the session's user): ALTER USER <self>
+/// ADD / DROP / SET PASSWORD.
+[[nodiscard]] inline bool isOwnCredentialChange(const SecurityDdl& m, std::string_view self) noexcept {
+    return !self.empty() && m.kind == SecurityOpKind::AlterUser && m.name == self &&
+           (m.change == UserChangeKind::AddPassword || m.change == UserChangeKind::DropPassword ||
+            m.change == UserChangeKind::SetPassword);
 }
 
 inline std::size_t SecurityBootstrap::encodedSize() const noexcept {

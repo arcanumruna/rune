@@ -232,7 +232,10 @@ TEST(AuthBootstrapWindowRegression, TheWindowReopensWhenTheLastAdminIsDisabledSt
     ASSERT_FALSE(n.node->securityViewForTest().hasSecurityAdmin);
     const int64_t s3 = connect(cl, n.channel());
     ASSERT_GT(s3, 0);
-    EXPECT_EQ(cl.lastConnectResponse()->authState, pc::AuthState::Anonymous) << "no enabled admin: the window is open again";
+    // Issue #121: the window is open again, but users exist - a connect is told MustAuthenticate (they log in), and
+    // SecurityBootstrap stays allowed before the login while the window is open.
+    EXPECT_EQ(cl.lastConnectResponse()->authState, pc::AuthState::MustAuthenticate)
+        << "a reopened window still asks for a login: the other users exist";
     // Still MAC-gated: a bad MAC is refused, the right one accepted.
     const int64_t c2 = cl.nextCorrelationId();
     const auto bad = bootstrapFrame(s3, c2, kOtherKey, 5);

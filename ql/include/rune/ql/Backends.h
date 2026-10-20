@@ -56,6 +56,7 @@ struct SecurityPlan {
     uint8_t                                   granteeKind = 0, op = 0, resourceType = 0, patternKind = 0;     // Grant / Revoke
     std::string                               pattern;                    // Grant / Revoke
     std::string                               roleName;                   // GrantRole / RevokeRole
+    bool                                      force = false;              // issue #121: FORCE (the last admin may go)
     std::string                               password;                   // CreateUser / AddPassword / SetPassword
     std::string                               statement;                  // redactedText
 };

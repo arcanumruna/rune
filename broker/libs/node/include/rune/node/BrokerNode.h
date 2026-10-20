@@ -252,7 +252,8 @@ public:
                                                  const uint8_t* descriptorBlob, uint32_t descriptorLen,
                                                  uint8_t persistence, int16_t replicationFactor,
                                                  const rune::protocol::TopicConfigView& config,
-                                                 const rune::gateway::DdlMetaView& meta) override {
+                                                 const rune::gateway::DdlMetaView& meta,
+                                                 std::string_view adoptDenial) override {
         DefineTopicMsg m;
         m.session        = sessionId;
         m.corr           = correlationId;
@@ -265,6 +266,7 @@ public:
         m.replicationFactor = replicationFactor;
         m.config = rune::protocol::convertTopicConfig<rune::protocol::TopicConfig>(config);
         m.meta   = ownMeta_(meta);
+        m.adoptDenial.assign(adoptDenial);
         return submitDdl_(m);
     }
 
@@ -374,7 +376,8 @@ public:
 
     // ── Authentication Task 10 (D36): security DDL / bootstrap / `__security` reads (gateway → admin) ───────────
     rune::gateway::AdminSubmit submitSecurityDdl(const rune::protocol::client::SecurityDdl& w,
-                                                 const rune::gateway::DdlMetaView& meta) override {
+                                                 const rune::gateway::DdlMetaView& meta, std::string_view denial,
+                                                 bool proofChecked) override {
         SecurityDdlMsg m;
         m.session = w.sessionId;
         m.corr    = w.correlationId;
@@ -388,6 +391,9 @@ public:
         m.granteeKind = w.granteeKind; m.op = w.op; m.resourceType = w.resourceType; m.patternKind = w.patternKind;
         m.pattern.assign(w.pattern);
         m.roleName.assign(w.roleName);
+        m.force = (w.flags & rune::protocol::client::kSecurityDdlFlagForce) != 0 ? 1 : 0;
+        m.denial.assign(denial);
+        m.proofChecked = proofChecked ? 1 : 0;
         return submitDdl_(m);
     }
     rune::gateway::AdminSubmit submitSecurityBootstrap(const rune::protocol::client::SecurityBootstrap& w,

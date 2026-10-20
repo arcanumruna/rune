@@ -231,6 +231,10 @@ struct DefineTopicMsg {
     int16_t                     replicationFactor = 0;
     rune::protocol::TopicConfig config;
     DdlMeta                     meta;
+    /// Issue #129: the gateway's verdict on adopting a schema onto an EXISTING untyped topic (ALTER on it):
+    /// "" = allowed (also every in-process / admin-level submit, which no session authorizes), otherwise the
+    /// NotAuthorized detail the admin thread answers when the name turns out to be such a topic.
+    std::string                 adoptDenial;
 };
 
 /// AlterTopic: the client's CAS expectation (expectedVersion = the topic's SCHEMA
@@ -337,6 +341,12 @@ struct SecurityDdlMsg {
     uint8_t                       granteeKind = 0, op = 0, resourceType = 0, patternKind = 0;   // Grant / Revoke
     std::string                   pattern;
     std::string                   roleName;               // GrantRole / RevokeRole
+    uint8_t                       force = 0;              // issue #121: FORCE - the last security admin may go (0 / 1)
+    /// PR #410 review F1: the gateway's verdict ("" = authorized; otherwise the NotAuthorized detail).  The leader
+    /// answers a retry of an applied request with its original result first, then refuses a denied one 45.
+    std::string                   denial;
+    /// PR #410 review F2: the gateway checked an own-credential proof for this request (whatever the outcome).
+    uint8_t                       proofChecked = 0;
 };
 
 /// SecurityBootstrap: the gateway already verified the MAC with its ClusterKeys; the nonce is kept as the request's
@@ -578,7 +588,7 @@ inline std::span<const uint8_t> span8(const std::vector<uint8_t>& v) noexcept { 
 template <class W> void layout(W& w, const DefineTopicMsg& m) {
     w.i64(m.session); w.i64(m.corr); w.i32(m.partitionCount); w.u8(m.validate ? 1 : 0);
     w.str16(m.name); w.str16(m.keyField); w.bytes32(span8(m.blob)); w.u8(m.persistence);
-    w.i16(m.replicationFactor); layoutConfig(w, m.config); layoutMeta(w, m.meta);
+    w.i16(m.replicationFactor); layoutConfig(w, m.config); layoutMeta(w, m.meta); w.str16(m.adoptDenial);
 }
 template <class W> void layout(W& w, const AlterTopicMsg& m) {
     w.i64(m.session); w.i64(m.corr); w.u16(m.expectedVersion); w.str16(m.topicName);
@@ -616,7 +626,7 @@ template <class W> void layout(W& w, const SecurityDdlMsg& m) {
     w.u8(m.kind); w.str16(m.name); w.u8(m.change); w.u8(m.passwordIndex); w.u8(m.terminateSessions);
     layoutVerifier(w, m.verifier);
     w.u8(m.granteeKind); w.u8(m.op); w.u8(m.resourceType); w.u8(m.patternKind);
-    w.str16(m.pattern); w.str16(m.roleName);
+    w.str16(m.pattern); w.str16(m.roleName); w.u8(m.force); w.str16(m.denial); w.u8(m.proofChecked);
 }
 template <class W> void layout(W& w, const SecurityBootstrapMsg& m) {
     w.i64(m.session); w.i64(m.corr); layoutMeta(w, m.meta);
@@ -691,6 +701,7 @@ inline DdlRequest decodeDefineTopic(const uint8_t* buf, std::size_t len) {
     m.replicationFactor = r.i16();
     admin_wire::readConfig(r, m.config);
     admin_wire::readMeta(r, m.meta);
+    r.str16(m.adoptDenial);
     return admin_wire::finish(r, std::move(m), kTidDefineTopic);
 }
 inline DdlRequest decodeAlterTopic(const uint8_t* buf, std::size_t len) {
@@ -805,8 +816,13 @@ inline SecurityRequest decodeSecurityDdl(const uint8_t* buf, std::size_t len) {
     m.granteeKind = r.u8(); m.op = r.u8(); m.resourceType = r.u8(); m.patternKind = r.u8();
     r.str16(m.pattern);
     r.str16(m.roleName);
+    m.force = r.u8();
+    r.str16(m.denial);
+    m.proofChecked = r.u8();
     if (r.ok) {
         if (m.kind < 1 || m.kind > 9) r.fail("an unknown security op kind");
+        else if (m.force > 1) r.fail("a force flag other than 0/1");
+        else if (m.proofChecked > 1) r.fail("a proof-checked flag other than 0/1");
         else if (m.kind == 2 && m.change > 4) r.fail("an unknown user change");
         else if (m.terminateSessions > 1) r.fail("a terminate flag other than 0/1");
         else if ((m.kind == 6 || m.kind == 7) &&
@@ -1479,8 +1495,9 @@ template <typename Write>
 // 6-byte header in front, so every committed descriptor fits.
 // statement(4) + clientName(2) + sourceAddress(2) + authenticated(2, auth Task 10) + sessionId + requestId hi/lo + flag.
 inline constexpr std::size_t kDdlMetaFixedBytes     = 4 + 2 + 2 + 2 + 8 + 8 + 8 + 1;
+// The trailing adoptDenial length prefix (2, issue #129).
 inline constexpr std::size_t kDefineTopicFixedBytes =
-    8 + 8 + 4 + 1 + 2 + 2 + 4 + 1 + 2 + kTopicConfigFixedBytes + 2 + 2 + kDdlMetaFixedBytes;
+    8 + 8 + 4 + 1 + 2 + 2 + 4 + 1 + 2 + kTopicConfigFixedBytes + 2 + 2 + kDdlMetaFixedBytes + 2;
 inline constexpr std::size_t kMaxDescriptorViaRequestRing =
     static_cast<std::size_t>(kAdminRequestRingBytes) / 8 - kDefineTopicFixedBytes;
 static_assert(schemaUpdateWireLen(kMaxDescriptorViaRequestRing) <=

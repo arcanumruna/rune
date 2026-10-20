@@ -144,7 +144,8 @@ public:
             case Op::Metadata: case Op::CatalogRead: return {{SO::Describe, ST::Topic, t()}};
             case Op::CreateTopic: return {{SO::Create, ST::Topic, newTopic()}};
             case Op::CreateView: return {{SO::Create, ST::View, newView()}, {SO::Read, ST::Topic, t()}};
-            case Op::CreateSchema: return {{SO::Create, ST::Topic, u()}};
+            // Issue #129: a schema onto an EXISTING untyped topic is a new version of it - ALTER on it besides CREATE.
+            case Op::CreateSchema: return {{SO::Create, ST::Topic, u()}, {SO::Alter, ST::Topic, u()}};
             case Op::AlterSchema: case Op::SetCompatibility: case Op::AlterTopicConfig: return {{SO::Alter, ST::Topic, t()}};
             case Op::AlterView: return {{SO::Alter, ST::View, v()}, {SO::Read, ST::Topic, t()}};
             case Op::DropTopic: return {{SO::Drop, ST::Topic, t()}};

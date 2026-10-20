@@ -6,6 +6,9 @@
 #include <rune/gateway/CryptoFrame.h>
 #include <rune/gateway/RequestRejection.h>
 #include <rune/gateway/BootstrapProof.h>
+#include <rune/gateway/SecurityRequestFingerprint.h>
+#include <rune/crypto/Kdf.h>
+#include <rune/crypto/Scram.h>
 #include <cassert>
 #include <flight_recorder/FlightRecorder.h>
 #include <rune/gateway/TopicRegistry.h>
@@ -2449,16 +2452,17 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
             resp.leaderMemberId    = thisNodeId_;
             resp.assignedSessionId = pending.sessionId;
             // Authentication Task 10 (D11): a v9 client of an authenticating broker is told how it authenticates and
-            // where it stands.  Bootstrap window (Required, no ENABLED security admin - a fresh cluster, or one whose last admin was disabled / dropped, D3 recovery): Anonymous - it may
-            // send ONLY SecurityBootstrap.  Otherwise MustAuthenticate.  An in-process broker keeps the pre-v9 frame.
+            // where it stands.  A NEVER-bootstrapped cluster (no `__security` event yet: nobody exists who could log
+            // in): Anonymous - it may send ONLY SecurityBootstrap.  Otherwise MustAuthenticate - also while the window
+            // is REOPENED (the last admin disabled / dropped, D3 recovery): the other users still exist and log in
+            // (issue #121), and SecurityBootstrap stays allowed in AwaitingFirst while the window is open (gateFor).
+            // An in-process broker keeps the pre-v9 frame.
             pending.auth = newSessionAuth_(nowNs, pending.correlationId);
             if (authMode_ != rune::gateway::GatewayAuthMode::InProcess && pc::clientUnderstandsAuth(pending.clientVersion)) {
                 resp.v9 = true;
                 resp.authMode = authMode_ == rune::gateway::GatewayAuthMode::Required ? pc::AuthMode::Required
                                                                                        : pc::AuthMode::DevDisabled;
-                // Required: MustAuthenticate - except in the bootstrap window (no enabled admin, SecurityView::bootstrapWindowOpen), where the
-                // session is told Anonymous and may send only SecurityBootstrap (and a login that cannot succeed).
-                resp.authState = authMode_ == rune::gateway::GatewayAuthMode::Required && !bootstrapOpen_()
+                resp.authState = authMode_ == rune::gateway::GatewayAuthMode::Required && !neverBootstrapped_()
                                      ? pc::AuthState::MustAuthenticate : pc::AuthState::Anonymous;
             }
             if (pending.tls) {
@@ -7437,6 +7441,13 @@ void ClientGateway::handleDefineTopic(const uint8_t* buf, std::size_t len)
     if (deny_(*session, rune::gateway::authorizeName(permsOf_(*session), rune::security::ResourceType::Topic, m.topicName,
                                                      rune::security::Operation::Create), buf, len))
         return;
+    // Issue #129: if the name is an existing UNTYPED topic, a descriptor makes this a new schema version of it
+    // (CreateSchemaOps) - ALTER on the topic, exactly as AlterTopic (ALTER implies DESCRIBE, D15).  Whether the name
+    // exists is the admin thread's call (its catalog may be ahead of this thread's index), so the verdict rides along.
+    std::optional<rune::gateway::Denial> adopt;
+    if (m.descriptorLen != 0)
+        adopt = rune::gateway::authorizeName(permsOf_(*session), rune::security::ResourceType::Topic, m.topicName,
+                                             rune::security::Operation::Alter);
 
     // Copy-and-return: the sink OWNS the copied bytes (every view points into
     // the ingress buffer and is copied by the sink before return).
@@ -7444,7 +7455,8 @@ void ClientGateway::handleDefineTopic(const uint8_t* buf, std::size_t len)
                        adminSink_->submitDefineTopic(m.sessionId, m.correlationId, m.topicName, m.partitionCount,
                                                      m.keyField, m.validate, m.descriptorBlob, m.descriptorLen,
                                                      m.persistence, m.replicationFactor, m.config,
-                                                     ddlMetaOf_(m.hasExt ? &m.ext : nullptr, m.sessionId, *session)),
+                                                     ddlMetaOf_(m.hasExt ? &m.ext : nullptr, m.sessionId, *session),
+                                                     adopt ? std::string_view(adopt->detail) : std::string_view{}),
                        "DefineTopic: admin ring full", "DefineTopic: request larger than the admin ring message");
 }
 
@@ -7777,17 +7789,22 @@ void ClientGateway::onCatalogObjectDropped(int32_t id)
     });
 }
 
-bool ClientGateway::deny_(Session& session, const std::optional<rune::gateway::Denial>& denial, const uint8_t* buf, std::size_t len)
+void ClientGateway::noteDenied_(const Session& session, pc::TemplateId tid, const rune::gateway::Denial& denial)
 {
-    if (!denial) return false;
     ++notAuthorizedAnswers_;
-    const auto hdr = pc::MessageHeader::decode(buf, len);
     if (notAuthorizedAnswers_ % 1024 == 1) {
         const char* user = "<anonymous>";
         if (const auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&session.auth)) user = a->user.c_str();
         spdlog::warn("auth: request refused user={} session={} template={}: {} (refusals so far: {})", user, session.sessionId,
-                     hdr ? hdr->templateId : 0, denial->detail, notAuthorizedAnswers_);
+                     static_cast<uint16_t>(tid), denial.detail, notAuthorizedAnswers_);
     }
+}
+
+bool ClientGateway::deny_(Session& session, const std::optional<rune::gateway::Denial>& denial, const uint8_t* buf, std::size_t len)
+{
+    if (!denial) return false;
+    const auto hdr = pc::MessageHeader::decode(buf, len);
+    noteDenied_(session, static_cast<pc::TemplateId>(hdr ? hdr->templateId : 0), *denial);
     if (!hdr) return true;   // the caller decoded the body, so this cannot happen; nothing to answer on
     // The DDL family carries the D23 detail text; every other response type has no free-text field.
     switch (static_cast<pc::TemplateId>(hdr->templateId)) {
@@ -8021,6 +8038,17 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
         return;
     }
     const std::string user = st->user;
+    // Issue #130: the throttle gates every proof VERIFICATION, not only the first leg - otherwise N sessions that all
+    // sent AuthClientFirst before any final get N verified guesses per delay.  The control thread handles the finals
+    // one at a time, so each one sees the failure the previous one recorded.  Refused here: not counted (as at the
+    // first leg), the proof is never looked at.
+    if (const LoginThrottle::Verdict v = loginThrottle_.check(user, session->sourceHost, nowNs_); !v.allowed) {
+        ++loginsRateLimited_;
+        if (unauthLog_.due(1)) [[unlikely]]
+            spdlog::warn("auth: rate limited user={} source={} retry_after_ms={}", user, session->sourceHost, v.retryAfterMs);
+        failLogin_(*session, hdr->correlationId, v.retryAfterMs);
+        return;
+    }
     const auto fin = pc::AuthClientFinal::decode(buf, len);
     std::variant<LoginOk, LoginFailure> verdict = LoginFailure::BadProof;
     if (securityView_ == nullptr || securityView_->halted()) verdict = LoginFailure::SecurityHalted;
@@ -8037,14 +8065,15 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
         return;
     }
     const LoginOk& ok = std::get<LoginOk>(verdict);
+    std::string loginNonce = st->combinedNonce;   // issue #114: before session->auth (which owns *st) is replaced
     ++loginsOk_;
     loginThrottle_.onSuccess(user, session->sourceHost);
     spdlog::info("auth: login ok user={} source={} session={}", ok.user, session->sourceHost, session->sessionId);
     if (!session->crypto.encrypted)   // D12: TLS stays optional - said once per session (a session logs in once)
         spdlog::warn("auth: session {} authenticated over plaintext (no TLS): frames are not integrity-protected",
                      session->sessionId);
-    if (ok.mustChangePassword) session->auth = AuthPasswordChangeRequired{ok.userId, ok.user};
-    else                       session->auth = AuthAuthenticated{ok.userId, ok.user, compilePerms_(ok.userId)};
+    if (ok.mustChangePassword) session->auth = AuthPasswordChangeRequired{ok.userId, ok.user, std::move(loginNonce)};
+    else session->auth = AuthAuthenticated{ok.userId, ok.user, compilePerms_(ok.userId), std::move(loginNonce)};
     // Authentication Task 13: announce-before-accept for permissions - the workers learn this session's WRITE bitmap
     // BEFORE the client learns it is logged in, so it can never produce ahead of its grants.
     const uint64_t shipEpoch = shipPermissions_(*session);
@@ -8186,7 +8215,7 @@ void ClientGateway::refreshSession_(int64_t sid)
         // The Task 11 transition, through this one path: a SET PASSWORD cleared the user's must-change flag.
         const rune::security::UserObject* user = securityView_->state().userById(pcr->userId);
         if (user == nullptr || user->mustChangePassword) return;
-        s->auth = AuthAuthenticated{pcr->userId, pcr->user, compilePerms_(pcr->userId)};
+        s->auth = AuthAuthenticated{pcr->userId, pcr->user, compilePerms_(pcr->userId), pcr->loginNonce};
         (void)shipPermissions_(*s);
         return;
     }
@@ -8346,20 +8375,97 @@ void ClientGateway::handleSecurityDdl(const uint8_t* buf, std::size_t len)
                              "SecurityDdl needs client version 9");
         return;
     }
-    // Authentication Task 12 (D20): ADMIN ON CLUSTER - except a user's own ALTER USER <self> ADD / DROP / SET PASSWORD.
+    // Authentication Task 12 (D20): ADMIN ON CLUSTER - except a user's own ALTER USER <self> ADD / DROP / SET PASSWORD,
+    // which (issue #114) needs a fresh proof of a CURRENT password instead: the session alone (a hijacked plaintext
+    // session, a leaked one) must not turn into a permanent second password.
+    //
+    // PR #410 review F1: the verdict may depend on state the request's own FIRST attempt changed (a SET PASSWORD
+    // replaced the password its retry is proven with; a REVOKE removed the ADMIN its retry needs), and only the leader's
+    // dedupe table knows authoritatively whether this is such a retry.  So a request with a request id is forwarded
+    // with the verdict, never refused here; the leader answers a retry its original result and refuses the rest 45.  A
+    // request without one (pre-v8) cannot be a deduped retry: refused here.
+    std::optional<rune::gateway::Denial> denial;
+    bool proofChecked = false;
     {
         const std::string* self = nullptr;
-        if (const auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&session->auth)) self = &a->user;
-        else if (const auto* p = std::get_if<rune::gateway::AuthPasswordChangeRequired>(&session->auth)) self = &p->user;
-        const bool ownPassword = self != nullptr && m.kind == pc::SecurityOpKind::AlterUser && m.name == *self &&
-                                 (m.change == pc::UserChangeKind::AddPassword || m.change == pc::UserChangeKind::DropPassword ||
-                                  m.change == pc::UserChangeKind::SetPassword);
-        if (!ownPassword &&
-            deny_(*session, rune::gateway::authorizeCluster(permsOf_(*session), rune::security::Operation::Admin), buf, len))
+        const std::string* loginNonce = nullptr;
+        if (const auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&session->auth)) { self = &a->user; loginNonce = &a->loginNonce; }
+        else if (const auto* p = std::get_if<rune::gateway::AuthPasswordChangeRequired>(&session->auth)) { self = &p->user; loginNonce = &p->loginNonce; }
+        std::optional<rune::gateway::Denial> admin =
+            rune::gateway::authorizeCluster(permsOf_(*session), rune::security::Operation::Admin);
+        const bool ownPassword = self != nullptr && pc::isOwnCredentialChange(m, *self);
+        // A TRUE retry: a request this broker's mirror already holds with the same request id AND the same statement
+        // fingerprint (PR #410 review F2: the id alone would let a different change skip the throttle).  The mirror
+        // may lag the leader by an apply, so a retry can also look new: then it is still answered right, only charged
+        // once on the throttle.
+        bool knownRetry = false;
+        if (!m.ext.requestId.none() && securityView_ != nullptr)
+            if (const auto rec = securityView_->state().request(m.ext.requestId))
+                knownRetry = rec->requestFingerprint == rune::gateway::securityDdlFingerprint(m);
+        if (!ownPassword) denial = std::move(admin);
+        else if (admin) {
+            proofChecked = true;
+            denial = verifyOwnCredentialChange_(*session, m, *self, *loginNonce, /*chargeThrottle=*/!knownRetry);
+        }
+        if (denial && m.ext.requestId.none()) {
+            (void)deny_(*session, denial, buf, len);
             return;
+        }
+        if (denial && !knownRetry) noteDenied_(*session, pc::TemplateId::SecurityDdl, *denial);
+        if (!denial && ownPassword && m.change == pc::UserChangeKind::AddPassword)   // a second password: worth a line
+            spdlog::warn("security: user {} adds a password to its own account (session {}, source {})", *self,
+                         session->sessionId, session->sourceHost);
     }
-    answerAdminSubmit_(buf, len, adminSink_->submitSecurityDdl(m, ddlMetaOf_(&m.ext, m.sessionId, *session)),
+    answerAdminSubmit_(buf, len,
+                       adminSink_->submitSecurityDdl(m, ddlMetaOf_(&m.ext, m.sessionId, *session),
+                                                     denial ? std::string_view(denial->detail) : std::string_view{},
+                                                     proofChecked),
                        "SecurityDdl: admin ring full", "SecurityDdl: request larger than the admin ring message");
+}
+
+std::optional<rune::gateway::Denial> ClientGateway::verifyOwnCredentialChange_(Session& session, const pc::SecurityDdl& m,
+                                                                               const std::string& self,
+                                                                               const std::string& loginNonce,
+                                                                               bool chargeThrottle)
+{
+    // Issue #114.  Every failure is the same text (it never says which part failed) and counts as a failed login on
+    // the throttle: a proof is a password guess.  Cold path (security DDL rate).
+    rune::gateway::Denial refused;
+    refused.detail = std::string(rune::gateway::kOwnCredentialProofRefusal);
+    // A retry of a request the leader already applied (chargeThrottle false) is neither throttled nor charged: the
+    // leader answers it from its dedupe table whatever this verdict says.
+    if (chargeThrottle) {
+        const rune::gateway::LoginThrottle::Verdict v = loginThrottle_.check(self, session.sourceHost, nowNs_);
+        if (!v.allowed) {
+            ++loginsRateLimited_;
+            return refused;
+        }
+    }
+    bool ok = false;
+    const rune::security::UserObject* user =
+        securityView_ != nullptr && !securityView_->halted() ? securityView_->state().user(self) : nullptr;
+    if (user != nullptr && !loginNonce.empty() && (m.flags & pc::kSecurityDdlFlagCredentialProof) != 0 &&
+        m.credentialProof.size() == pc::kCredentialProofBytes && !m.ext.requestId.none()) {
+        const std::string message = pc::credentialChangeMessage(loginNonce, m);
+        const auto proof = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(m.credentialProof.data()),
+                                                    pc::kCredentialProofBytes);
+        for (const auto& cur : user->verifiers) {   // any CURRENT password; no early exit
+            rune::crypto::DigestBytes stored;
+            std::memcpy(stored.bytes.data(), cur.storedKey.data(), cur.storedKey.size());
+            stored.size = static_cast<uint8_t>(cur.storedKey.size());
+            ok |= rune::crypto::scram::verifyClientProof(rune::crypto::Digest::Sha512, stored, message, proof);
+        }
+    }
+    if (!ok) {
+        if (!chargeThrottle) return refused;
+        loginThrottle_.onFailure(self, session.sourceHost, nowNs_);
+        if (unauthLog_.due(4)) [[unlikely]]
+            spdlog::warn("security: user {} sent a change of its own password without a valid proof (session {}, source {})",
+                         self, session.sessionId, session.sourceHost);
+        return refused;
+    }
+    if (chargeThrottle) loginThrottle_.onSuccess(self, session.sourceHost);
+    return std::nullopt;
 }
 
 void ClientGateway::handleSecurityBootstrap(const uint8_t* buf, std::size_t len)

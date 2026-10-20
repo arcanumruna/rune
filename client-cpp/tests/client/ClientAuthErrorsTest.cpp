@@ -408,6 +408,7 @@ TEST(ClientAuthErrorsRegression, AfterASelfSetPasswordTheNextLoginUsesTheNewPass
     ASSERT_TRUE(f.accepted());
     ASSERT_TRUE(r.drive([&] { return f.ready(); }));
     ASSERT_TRUE(f.ok()) << f.describe();
+    EXPECT_EQ(r.gw.unprovenCredentialChanges, 0) << "issue #114: the client proved its current password";
     EXPECT_EQ(r.client.authStatus().kind, rc::AuthStatus::Kind::Authenticated) << "the one-time flag is cleared";
     ASSERT_EQ(r.gw.authOk, 1);
     // The session expires: the re-login must present the NEW password.

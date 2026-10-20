@@ -1462,12 +1462,16 @@ transport::AeronTransport::OfferResult ClientAgent::offerToCoordinator(uint32_t 
                                                                       std::size_t len) noexcept {
     using R = transport::AeronTransport::OfferResult;
     if (failed_ || index >= sessions_.size()) [[unlikely]] return R::Fatal;
-    const session::SessionMachine& m = sessions_[index]->machine;
+    session::SessionMachine& m = sessions_[index]->machine;
     // Not Connected: held — the owner re-sends on this session's connect (the
     // group hub re-joins; the txn producer re-sends on the session change).
     if (m.state() != session::SessionState::Connected || m.sessionId() == 0) return R::Retry;
     if (len >= ::rune::protocol::client::MessageHeader::ENCODED_SIZE) {
         ::rune::protocol::client::detail::putLE64(const_cast<uint8_t*>(buf), 8, m.sessionId());
+        // Issue #114: an own-credential change is proven for the session it rides, re-signed on every offer.
+        const auto tid = ::rune::protocol::client::detail::getLE16(buf, 2);
+        if (tid == static_cast<uint16_t>(::rune::protocol::client::TemplateId::SecurityDdl))
+            m.signOwnCredentialChange(const_cast<uint8_t*>(buf), len);
     }
     return offerOnSession(index, buf, len);   // seals under THIS session's crypto state
 }
