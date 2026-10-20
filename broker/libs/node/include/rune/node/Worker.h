@@ -987,11 +987,15 @@ public:
         }
         return t;
     }
-    /// The newest live group of (topic, partition, isolation); nullptr when there is none.
+    /// The most recently created live group of (topic, partition, isolation); nullptr when there is none.
     [[nodiscard]] const filter::FilterGroup* filterGroupForTest(int32_t topicId, int32_t partition, uint8_t isolation) const noexcept {
         const filter::FilterGroup* best = nullptr;
+        uint64_t bestSeq = 0;
         for (const auto& [k, gi] : filterGroupByKey_)
-            if (k.topicId == topicId && k.partition == partition && k.isolation == isolation) best = &filterGroups_[gi];
+            if (k.topicId == topicId && k.partition == partition && k.isolation == isolation && filterGroupSeq_[gi] >= bestSeq) {
+                best = &filterGroups_[gi];
+                bestSeq = filterGroupSeq_[gi];
+            }
         return best;
     }
     [[nodiscard]] const filter::FilterGroup* filterGroupOfSubForTest(int64_t subscriptionId) const noexcept {
@@ -1003,6 +1007,9 @@ public:
     [[nodiscard]] std::size_t filterGroupCountForTest() const noexcept { return filterGroupByKey_.size(); }
     [[nodiscard]] uint64_t filterBindFailuresForTest() const noexcept { return filterBindFailures_; }
     [[nodiscard]] uint64_t filterSchemaErrorsForTest() const noexcept { return filterSchemaErrors_; }
+    [[nodiscard]] uint64_t filterSchemaReplacementsForTest() const noexcept { return filterSchemaReplacements_; }
+    /// Filter bytes and owed bind errors currently held (both must be released with their subscription).
+    [[nodiscard]] std::size_t filterBytesHeldForTest() const noexcept { return filterBytes_.size() + filterBindErrors_.size(); }
     /// The subscription's true position: a filtered InSync member's cursor lives in its group.
     [[nodiscard]] int64_t subscriptionPositionForTest(int64_t subscriptionId) const noexcept {
         for (const auto& s : subs_) if (s.subscriptionId == subscriptionId) return positionOf_(s);
@@ -2793,6 +2800,8 @@ private:
             auto& s = subs_[si];
             if (s.subscriptionId == subId) {
                 if (!std::holds_alternative<SubUnfiltered>(s.filter)) [[unlikely]] unbindFilter_(si);   // re-Subscribe: drop the old member first
+                if (!filterBindErrors_.empty() && filterBindErrors_.erase(subId) != 0) [[unlikely]]
+                    s.pushState = WorkerSubscription::PushState::Live;   // a failed bind is retried by a new request
                 s.sessionId            = op.sessionId();
                 s.subscribeCorrId      = op.correlationId();
                 s.topicId              = op.topicId();
@@ -2966,6 +2975,7 @@ private:
                 spdlog::warn("Worker {}: FilterSchema for topicId={} v{} conflicts with the installed one - replacing it and "
                              "recompiling its filtered subscriptions", workerId_, topicId, version);
                 it->second = std::move(built);   // in place: cached pointers to the schema stay valid
+                ++filterSchemaReplacements_;
                 recompileFilters_(topicId);
             }
             spdlog::debug("Worker {}: FilterSchema installed for topicId={} version={}", workerId_, topicId, version);
@@ -2984,7 +2994,7 @@ private:
         for (std::size_t i = 0; i < subs_.size(); ++i) {
             WorkerSubscription& s = subs_[i];
             if (s.topicId != topicId || std::holds_alternative<SubUnfiltered>(s.filter)) continue;
-            unbindFilter_(i);
+            leaveFilter_(i);   // keeps the filter bytes (and writes the group cursor back): the bind below needs both
             const auto bytes = filterBytes_.find(s.subscriptionId);
             if (bytes == filterBytes_.end()) { failFilterBind_(s, "filter bytes unavailable on the owning worker"); continue; }
             bindFilter_(i, std::span<const uint8_t>(bytes->second));
@@ -3020,7 +3030,8 @@ private:
         if (created) {
             if (!filterScratchReady_) { filterScratch_.reserve(filterCfg_, kFilterRecordsPerBatchReserve); filterScratchReady_ = true; }
             if (!filterFreeGroups_.empty()) { gi = filterFreeGroups_.back(); filterFreeGroups_.pop_back(); }
-            else { gi = static_cast<uint32_t>(filterGroups_.size()); filterGroups_.emplace_back(); filterGroupKeys_.emplace_back(); filterGroupSchemas_.push_back(nullptr); }
+            else { gi = static_cast<uint32_t>(filterGroups_.size()); filterGroups_.emplace_back(); filterGroupKeys_.emplace_back(); filterGroupSchemas_.push_back(nullptr); filterGroupSeq_.push_back(0); }
+            filterGroupSeq_[gi] = filterGroupSeqNext_++;
             filterGroups_[gi].init(s.topicId, s.partition, filterCfg_, src);
             filterGroupKeys_[gi]    = key;
             filterGroupSchemas_[gi] = &fs->second;
@@ -3038,34 +3049,53 @@ private:
         s.filter = SubFiltered{gi, m};
     }
 
-    /// Cold: the subscription cannot be served filtered.  Counted, logged, ONE ErrorResponse{InvalidRequest, corr =
-    /// the Subscribe's correlation id} on its egress (sealed like sendPushTooLarge_), and the subscription is parked.
+    /// Cold: the subscription cannot be served filtered.  Counted, logged, parked, and ONE ErrorResponse{InvalidRequest}
+    /// is OWED: sent now if the egress takes it, otherwise retried every pass (pushOwnedSubscriptions_'s owed-error
+    /// block) until it is sent - a lost error would leave the client waiting forever.  The message names the
+    /// subscription (a recompile's original correlation id is long resolved).
     [[gnu::cold]] [[gnu::noinline]] void failFilterBind_(WorkerSubscription& s, std::string_view reason) {
         ++filterBindFailures_;
         spdlog::error("Worker {}: filtered subscribe sub={} topicId={} partition={} failed: {} (failures={})", workerId_,
                       s.subscriptionId, s.topicId, s.partition, reason, filterBindFailures_);
-        s.filter    = SubUnfiltered{};
-        s.pushState = WorkerSubscription::PushState::Failed;
+        s.filter = SubUnfiltered{};
+        filterBytes_.erase(s.subscriptionId);   // nothing will recompile it
+        s.pushState = WorkerSubscription::PushState::ErrorOwed;
+        filterBindErrors_[s.subscriptionId] = std::string(reason.substr(0, 160));
+        (void)trySendFilterBindError_(s);
+    }
+
+    /// Cold: send the owed bind error.  true = sent (the subscription is then Failed and the debt is cleared); false =
+    /// not sent (no egress, back-pressure, or the seal failed closed): still owed.
+    [[gnu::cold]] [[gnu::noinline]] bool trySendFilterBindError_(WorkerSubscription& s) {
+        const auto it = filterBindErrors_.find(s.subscriptionId);
+        if (it == filterBindErrors_.end()) return false;
         aeron::ExclusivePublication* pub = s.egressPub;
         if (pub == nullptr && workerEgress_ != nullptr) pub = workerEgress_->pub();
-        if (pub == nullptr) return;
+        if (pub == nullptr) return false;
         static_assert(rune::protocol::client::MessageHeader::ENCODED_SIZE + rune::protocol::client::ErrorResponse::BODY_FIXED + 2u + 256u <= kEgressScratchSize);
-        const std::string_view msg = reason.substr(0, 256);
+        char msg[256];
+        const int m = std::snprintf(msg, sizeof msg, "subscription %lld topic %d partition %d: %s",
+                                    static_cast<long long>(s.subscriptionId), s.topicId, s.partition, it->second.c_str());
         rune::protocol::client::ErrorResponse err;
         err.sessionId     = s.sessionId;
         err.correlationId = s.subscribeCorrId;
         err.code          = static_cast<int16_t>(rune::protocol::client::ErrorCode::InvalidRequest);
-        err.message       = msg;
+        err.message       = std::string_view(msg, m > 0 ? std::min<std::size_t>(static_cast<std::size_t>(m), sizeof msg - 1) : 0u);
         const std::size_t n = err.encode(egressScratch_.data());
         RecordsSealCtx seal;
+        int64_t r;
         if (const RecordsSealCtx* sp = sealCtxFor_(s.sessionId, seal)) {
             const std::size_t sn = sealRecordsFrame(*sp, egressScratch_.data(), n, pushTooLargeSealScratch_.data(),
                                                     pushTooLargeSealScratch_.size());
-            if (sn == 0) return;   // fail closed: never a plaintext error on an encrypted session
-            (void)sendEncodedToPub_(pub, pushTooLargeSealScratch_.data(), sn);
-            return;
+            if (sn == 0) return false;   // fail closed: never a plaintext error on an encrypted session
+            r = sendEncodedToPub_(pub, pushTooLargeSealScratch_.data(), sn);
+        } else {
+            r = sendEncodedToPub_(pub, egressScratch_.data(), n);
         }
-        (void)sendEncodedToPub_(pub, egressScratch_.data(), n);
+        if (r <= 0) return false;
+        s.pushState = WorkerSubscription::PushState::Failed;
+        filterBindErrors_.erase(it);
+        return true;
     }
 
     /// The seal context of `sessionId`'s encrypted egress, or nullptr for a plaintext session (the common case).
@@ -3079,16 +3109,28 @@ private:
         return &seal;
     }
 
-    /// Cold: subs_[i] leaves its group (a re-Subscribe, an Unsubscribe or an egress release).
-    void unbindFilter_(std::size_t i) {
+    /// Cold: subs_[i] leaves its group but keeps its filter bytes (a recompile binds it again).  An InSync member's
+    /// own cursor is stale (the group's scan cursor is the truth), so it is written back first: whoever binds it
+    /// again, or reads its position, continues exactly where the client is.
+    void leaveFilter_(std::size_t i) {
         WorkerSubscription& s = subs_[i];
         if (const auto* f = std::get_if<SubFiltered>(&s.filter)) {
             const SubFiltered fl = *f;
+            s.nextOffset = filterGroups_[fl.group].cursorOf(fl.member, s.nextOffset);
             filterGroups_[fl.group].remove(fl.member);
             if (filterGroups_[fl.group].empty()) releaseFilterGroup_(fl.group);
         }
         s.filter = SubUnfiltered{};
-        filterBytes_.erase(s.subscriptionId);
+    }
+    /// Cold: the subscription is going away or being re-bound from a new request (re-Subscribe, Unsubscribe, egress
+    /// release): it leaves its group and every piece of filter state it owns is forgotten.
+    void unbindFilter_(std::size_t i) {
+        leaveFilter_(i);
+        forgetFilterState_(subs_[i]);
+    }
+    void forgetFilterState_(const WorkerSubscription& s) {
+        if (!filterBytes_.empty()) filterBytes_.erase(s.subscriptionId);
+        if (!filterBindErrors_.empty()) filterBindErrors_.erase(s.subscriptionId);
     }
     void releaseFilterGroup_(uint32_t gi) {
         filterGroupByKey_.erase(filterGroupKeys_[gi]);
@@ -3100,6 +3142,7 @@ private:
     /// The ONE removal path: swap-and-pop, and the element moved into slot i is re-pointed in its group.
     void eraseSub_(std::size_t i) {
         if (!std::holds_alternative<SubUnfiltered>(subs_[i].filter)) [[unlikely]] unbindFilter_(i);
+        else if (!filterBindErrors_.empty() || !filterBytes_.empty()) [[unlikely]] forgetFilterState_(subs_[i]);
         const std::size_t last = subs_.size() - 1;
         if (i != last) {
             subs_[i] = subs_[last];
@@ -3404,8 +3447,12 @@ private:
             }
 
             if (s.pushState != WorkerSubscription::PushState::Live) [[unlikely]] {
-                if (s.pushState == WorkerSubscription::PushState::ErrorOwed)
-                    work += sendPushTooLarge_(s, egressPub, sealPtr, positionOf_(s));
+                if (s.pushState == WorkerSubscription::PushState::ErrorOwed) {
+                    if (!filterBindErrors_.empty() && filterBindErrors_.contains(s.subscriptionId)) [[unlikely]]
+                        work += trySendFilterBindError_(s) ? 1 : 0;   // Phase 2c: an owed filter-bind error
+                    else
+                        work += sendPushTooLarge_(s, egressPub, sealPtr, positionOf_(s));
+                }
                 continue;   // parked AT the undeliverable batch
             }
             // Phase 2c: a FILTERED subscription is served by its FilterGroup (pushFilteredGroups_), never here.
@@ -5529,12 +5576,16 @@ private:
     std::vector<FilterGroupKey>                             filterGroupKeys_;      // parallel to filterGroups_
     std::vector<const rune::codec::FilterSchema*>           filterGroupSchemas_;   // parallel to filterGroups_
     std::vector<uint32_t>                                   filterFreeGroups_;
+    std::vector<uint64_t>                                   filterGroupSeq_;       // parallel: creation order (newest = largest)
+    uint64_t                                                filterGroupSeqNext_ = 1;
     std::map<FilterGroupKey, uint32_t>                      filterGroupByKey_;     // cold lookups at Subscribe
+    std::unordered_map<int64_t, std::string>                filterBindErrors_;     // subscriptionId -> owed bind-error reason
     std::unordered_map<int64_t, std::vector<uint8_t>>       filterBytes_;          // subscriptionId -> filter bytes (recompile)
     std::size_t                                             filterRotor_ = 0;
     uint8_t                                                 pushPassRotor_ = 0;    // which pass runs first this cycle
     uint64_t                                                filterBindFailures_ = 0;
     uint64_t                                                filterSchemaErrors_ = 0;
+    uint64_t                                                filterSchemaReplacements_ = 0;
 
     // E5.1.3: desired fragment poll limit for reservation-before-poll (see
     // ingressPollBudget_).  Source: NodeConfig::gatewayFragmentLimit

@@ -841,4 +841,185 @@ TEST_F(WorkerFilterStarvation, FilteredPushNotStarvedByUnfilteredLoadRegression)
     std::filesystem::remove_all(dirB);
 }
 
+
+// ---- fix round 1: schema replacement, owed bind errors, the isolation-carrier wait, disk cursors ----
+rune::codec::Descriptor incompatiblePlayerV1() {   // player_event v1 with `channel` widened to Int64: Incompatible with the installed one
+    using rune::codec::DescriptorBuilder;
+    using rune::codec::PrimType;
+    return DescriptorBuilder("player_event")
+        .addTagged("playerId", 0, PrimType::UInt64, 1, 0xFFFF, true, {})
+        .addTagged("worldId", 1, PrimType::UInt32, 1, 0xFFFF, false, {})
+        .addTagged("channel", 2, PrimType::Int64, 1, 0xFFFF, false, {})
+        .addFixedStrTagged("zone", 3, 8, 1, 0xFFFF, false)
+        .addTagged("kind", 4, PrimType::Enum, 1, 0xFFFF, false, {1, 2, 3})
+        .addTagged("alive", 5, PrimType::Bool, 1, 0xFFFF, false, {})
+        .addTagged("hp", 6, PrimType::Int64, 1, 0xFFFF, false, {})
+        .addTagged("name", 7, PrimType::String, 1, 0xFFFF, false, {})
+        .addTagged("pos", 8, PrimType::Float64, 1, 0xFFFF, false, {})
+        .build();
+}
+
+TEST_F(WorkerFilterRegression, IncompatibleFilterSchemaRecompilesMembersAtTheirPositionRegression) {
+    auto dir = tempLogDir();
+    rune::storage::Log log(dir.string(), 64LL * 1024 * 1024);
+    auto model = [](int64_t from, int64_t to, int r) {   // offset o has world {7, 9, 1}[o % 3]
+        std::vector<int64_t> v;
+        for (int64_t o = from; o < to; ++o) if (o % 3 == r) v.push_back(o);
+        return v;
+    };
+    for (int i = 0; i < 6; ++i) appendRows(log, worlds({7, 9, 1}), 1);
+    openEgress(3420);
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(eg_.get());
+    const Fb f7 = worldEq(7), f9 = worldEq(9);
+    ASSERT_TRUE(w.tryEnqueueOp(schemaOp(kTopic, 1)));
+    ASSERT_TRUE(w.tryEnqueueOp(filteredSubscribeOp(1, kTopic, 0, 0, &log, f7)));
+    FilterCollector c;
+    ASSERT_TRUE(pump(w, c, [&] { return c.offsets(1).size() == 6 && caughtUp(w, 1, 18); }));
+    for (int i = 0; i < 4; ++i) appendRows(log, worlds({7, 9, 1}), 1);   // A advances while InSync: its own cursor goes stale
+    ASSERT_TRUE(pump(w, c, [&] { return c.offsets(1).size() == 10 && caughtUp(w, 1, 30); }));
+    ASSERT_TRUE(std::holds_alternative<filter::InSync>(w.filterGroupOfSubForTest(1)->stateOf(0)));
+    // B binds Behind (nothing delivered yet) in the same drain as the conflicting schema.
+    ASSERT_TRUE(w.tryEnqueueOp(filteredSubscribeOp(2, kTopic, 0, 0, &log, f9)));
+    WorkerOp bad = schemaOp(kTopic, 1);
+    bad.schemaUpdateBlob = rune::codec::serialize(incompatiblePlayerV1());
+    ASSERT_TRUE(w.tryEnqueueOp(std::move(bad)));
+    step(w, c);
+    EXPECT_EQ(w.filterSchemaReplacementsForTest(), 1u) << "the conflicting schema must replace the installed one";
+    for (int i = 0; i < 2; ++i) appendRows(log, worlds({7, 9, 1}), 1);
+    const int64_t end = log.logEndOffset();
+    ASSERT_TRUE(pump(w, c, [&] { return c.offsets(1).size() == model(0, end, 0).size() && c.offsets(2).size() == model(0, end, 1).size(); }))
+        << "A=" << c.offsets(1).size() << " B=" << c.offsets(2).size();
+    settle(w, c, 50ms);
+    EXPECT_EQ(c.offsets(1), model(0, end, 0)) << "no duplicates, no gaps after the recompile";
+    EXPECT_EQ(c.offsets(2), model(0, end, 1));
+    EXPECT_EQ(w.filterBindFailuresForTest(), 0u) << "no member may be failed by a schema replacement";
+    EXPECT_TRUE(c.errors.empty());
+    ASSERT_NE(w.filterGroupOfSubForTest(1), nullptr);
+    EXPECT_EQ(w.filterBytesHeldForTest(), 2u) << "both members keep their bytes for a later replacement";
+    std::filesystem::remove_all(dir);
+}
+
+TEST_F(WorkerFilterRegression, MalformedFilterSchemaKeepsTheOldSchemaRegression) {
+    auto dir = tempLogDir();
+    rune::storage::Log log(dir.string(), 64LL * 1024 * 1024);
+    openEgress(3421);
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(eg_.get());
+    const Fb f = worldEq(7);
+    ASSERT_TRUE(w.tryEnqueueOp(schemaOp(kTopic, 2)));
+    ASSERT_TRUE(w.tryEnqueueOp(filteredSubscribeOp(1, kTopic, 0, 0, &log, f)));
+    WorkerOp bad = schemaOp(kTopic, 2);
+    bad.schemaUpdateBlob = {0xde, 0xad, 0xbe, 0xef, 1, 2, 3};
+    ASSERT_TRUE(w.tryEnqueueOp(std::move(bad)));
+    FilterCollector c;
+    step(w, c);
+    EXPECT_EQ(w.filterSchemaErrorsForTest(), 1u);
+    appendRows(log, worlds({7, 1, 7}));
+    ASSERT_TRUE(pump(w, c, [&] { return c.offsets(1).size() == 2; })) << "delivery continues under the old schema";
+    EXPECT_EQ(c.offsets(1), (std::vector<int64_t>{0, 2}));
+    EXPECT_EQ(w.filterBindFailuresForTest(), 0u);
+    std::filesystem::remove_all(dir);
+}
+
+TEST_F(WorkerFilterRegression, BindErrorIsRetriedUntilSentUnderBackPressureRegression) {
+    auto dirA = tempLogDir();
+    rune::storage::Log logA(dirA.string(), 64LL * 1024 * 1024);
+    for (int i = 0; i < 120; ++i) {   // an unfiltered backlog that fills the egress while nobody polls
+        const int64_t base = logA.logEndOffset();
+        rune::protocol::RecordBatchBuilder b(base, 1000);
+        b.append("k", std::string(4 * 1024, 'x'), 1000);
+        const auto bytes = b.build();
+        logA.appendNoSync(bytes.data(), bytes.size(), base);
+    }
+    openEgress(3422);
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(eg_.get());
+    ASSERT_TRUE(w.tryEnqueueOp(plainSubscribeOp(1, 11, 0, 0, &logA)));
+    FilterCollector c;
+    for (int i = 0; i < 300; ++i) { w.doWork(nowNs()); std::this_thread::sleep_for(100us); }   // no polling: the egress saturates
+    const Fb f = worldEq(7);
+    ASSERT_TRUE(w.tryEnqueueOp(filteredSubscribeOp(2, 12, 0, 0, &logA, f)));   // no FilterSchema for topic 12
+    for (int i = 0; i < 20; ++i) { w.doWork(nowNs()); std::this_thread::sleep_for(100us); }
+    bool owed = false;
+    for (const auto& s : w.subscriptionsForTest()) if (s.subscriptionId == 2) owed = s.pushState == Worker::WorkerSubscription::PushState::ErrorOwed;
+    ASSERT_TRUE(owed) << "precondition: the egress was back-pressured, so the error is still owed";
+    EXPECT_EQ(w.filterBindFailuresForTest(), 1u);
+    ASSERT_TRUE(pump(w, c, [&] { return !c.errors.empty(); })) << "the owed bind error never arrived (a hang)";
+    settle(w, c, 100ms);
+    ASSERT_EQ(c.errors.size(), 1u) << "exactly one";
+    EXPECT_EQ(c.errors[0].code, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    EXPECT_NE(c.errors[0].message.find("subscription 2"), std::string::npos) << c.errors[0].message;
+    EXPECT_EQ(w.filterBytesHeldForTest(), 0u) << "a failed bind must not keep its filter bytes or debt";
+    std::filesystem::remove_all(dirA);
+}
+
+TEST_F(WorkerFilterRegression, GroupMemberWaitsForTheIsolationCarrierBeforeFilteredDeliveryRegression) {
+    auto dir = tempLogDir();
+    rune::storage::Log log(dir.string(), 64LL * 1024 * 1024);
+    BatchOpts txn8; txn8.transactional = true; txn8.producerId = 8;
+    appendRows(log, worlds({7}));                 // @0 committed data
+    appendRows(log, worlds({7}), 2, txn8);        // @1 aborted txn
+    appendRows(log, worlds({7}));                 // @2 committed data
+    NullTransportF t;
+    rune::replication::PartitionReplica rep(leaderCfg(), rune::replication::Role::Leader, 1, {1}, {1}, &log, &t);
+    rep.onLeaderLogAppended();
+    openEgress(3423);
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(eg_.get());
+    w.setOwnedDirect(Worker::OwnedSet{&rep});
+    FilterCollector c;
+    ASSERT_TRUE(w.tryEnqueueOp(markerOp(&rep, 8, /*commit=*/false)));   // abort @3
+    for (int i = 0; i < 8; ++i) step(w, c);
+    rep.onLeaderLogAppended();
+    const Fb f = worldEq(7);
+    ASSERT_TRUE(w.tryEnqueueOp(schemaOp(kTopic, 2)));
+    auto groupSub = [&](int64_t id, bool carrier, uint8_t iso) {
+        WorkerOp op = filteredSubscribeOp(id, kTopic, 0, 0, &log, f);
+        op.replica = &rep; op.isolation = iso; op.isGroup = true; op.groupCarrierReceived = carrier;
+        return op;
+    };
+    // A: carrier arrives as read_uncommitted -> every match, aborted one included, exactly once.
+    ASSERT_TRUE(w.tryEnqueueOp(groupSub(1, false, 1)));
+    settle(w, c, 60ms);
+    EXPECT_TRUE(c.offsets(1).empty()) << "nothing may be delivered before the isolation is known";
+    EXPECT_EQ(w.subscriptionPositionForTest(1), 0);
+    ASSERT_TRUE(w.tryEnqueueOp(groupSub(1, true, 0)));
+    ASSERT_TRUE(pump(w, c, [&] { return c.offsets(1).size() >= 3; }));
+    settle(w, c, 50ms);
+    EXPECT_EQ(c.offsets(1), (std::vector<int64_t>{0, 1, 2}));
+    // B: carrier confirms read_committed -> only the committed matches.
+    ASSERT_TRUE(w.tryEnqueueOp(groupSub(2, false, 1)));
+    settle(w, c, 60ms);
+    EXPECT_TRUE(c.offsets(2).empty());
+    ASSERT_TRUE(w.tryEnqueueOp(groupSub(2, true, 1)));
+    ASSERT_TRUE(pump(w, c, [&] { return c.offsets(2).size() >= 2; }));
+    settle(w, c, 50ms);
+    EXPECT_EQ(c.offsets(2), (std::vector<int64_t>{0, 2}));
+    std::filesystem::remove_all(dir);
+}
+
+TEST_F(WorkerFilterRegression, FilteredDiskCursorBelowTheLogStartIsRaisedRegression) {
+    auto dir = tempLogDir();
+    rune::storage::Log log(dir.string(), 256);   // tiny roll: many sealed segments
+    log.recover();
+    for (int i = 0; i < 40; ++i) appendRows(log, worlds({7, 1}));
+    ASSERT_GT(log.deleteOldSegments(/*retainBytes=*/0), 0);
+    const int64_t start = log.logStartOffset();
+    ASSERT_GT(start, 0);
+    ASSERT_TRUE(log.read(0, 1 << 20).empty());
+    openEgress(3424);
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(eg_.get());
+    const Fb f = worldEq(7);
+    ASSERT_TRUE(w.tryEnqueueOp(schemaOp(kTopic, 2)));
+    ASSERT_TRUE(w.tryEnqueueOp(filteredSubscribeOp(1, kTopic, 0, 0, &log, f)));   // Earliest
+    FilterCollector c;
+    std::vector<int64_t> expect;
+    for (int64_t o = start; o < 80; o += 2) expect.push_back(o);   // world 7 is the even offset of each batch
+    ASSERT_TRUE(pump(w, c, [&] { return c.offsets(1).size() == expect.size(); })) << "stalled below the log start: " << c.offsets(1).size();
+    EXPECT_EQ(c.offsets(1), expect);
+    std::filesystem::remove_all(dir);
+}
+
 }  // namespace
