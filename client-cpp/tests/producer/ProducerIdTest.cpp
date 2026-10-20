@@ -4,7 +4,9 @@
 #include "../support/AckLedger.h"
 #include "../support/FakeCoordinator.h"
 
+#include <rune/client/Completion.h>
 #include <rune/client/Key.h>
+#include <rune/client/producer/BatchBuilder.h>
 #include <rune/client/codec/DataCodec.h>
 #include <rune/client/producer/ProducerHub.h>
 #include <rune/client/producer/ProducerImpl.h>
@@ -106,7 +108,11 @@ struct Rig {
         return n;
     }
     bool send(int32_t part, uint64_t k, bool ack = false, rc::Token t = 0) {
-        return impl->submitSendRecord(1, part, Key(k), kVal, ack, ack ? AckLedger::hi(t) : 0);
+        const int64_t h = ack ? AckLedger::hi(t) : 0;
+        if (impl->ingressMode() == ProducerImpl::IngressMode::Direct) {
+            return impl->trySubmit(1, part, Key(k), kVal, h) == rc::SendResult::Ok;
+        }
+        return impl->submitSendRecord(1, part, Key(k), kVal, ack, h);
     }
 };
 
@@ -380,4 +386,139 @@ TEST(ProducerIdRegression, ALostAnswerIsRequestedAgainAfterTheDeadlineRegression
     EXPECT_FALSE(r.impl->identityAssigned());
     r.answer(initAnswer(r.lastCorr(), 77, 0));
     EXPECT_TRUE(r.impl->identityAssigned());
+}
+
+TEST(ProducerIdRegression, StatusSnapshotsAreNeverLostWhenTheRingIsFullRegression) {
+    Rig r(cfgOf(Acks::Leader));
+    // Many transitions (each lost answer = a new request) with the app never draining: the status ring fills
+    // and refuses publishes.
+    for (int round = 0; round < 12; ++round) {
+        r.ticks(1, 1'500 * kMs);
+        r.ticks(2, kMs);
+    }
+    ASSERT_GE(r.initRequests(), 10u);
+    r.answer(initAnswer(r.lastCorr(), 6161, 5));
+    ASSERT_TRUE(r.impl->identityAssigned());
+    // The app finally looks: it drains what the ring held (stale: the final snapshot was refused) ...
+    EXPECT_EQ(r.impl->appProducerId(), -1) << "precondition: the final snapshot did not fit the ring";
+    // ... and the duty side re-offers the newest snapshot from its cold sweep point.
+    r.impl->sweepTimedOut(std::chrono::steady_clock::time_point{std::chrono::nanoseconds{r.now}});
+    EXPECT_EQ(r.impl->appProducerId(), 6161);
+    EXPECT_EQ(r.impl->appProducerEpoch(), 5);
+}
+
+TEST(ProducerIdRegression, StatusGettersAreBoundToOneThreadRegression) {
+    Rig r(cfgOf(Acks::Leader));
+    r.ticks(2, kMs);
+    r.answer(initAnswer(r.lastCorr(), 808, 1));
+    int64_t offId = 0;
+    int16_t offEp = 0;
+    std::thread other([&] {
+        offId = r.impl->appProducerId();
+        offEp = r.impl->appProducerEpoch();
+    });
+    other.join();
+    EXPECT_EQ(offId, -1) << "off the bound thread: not available, the ring is untouched";
+    EXPECT_EQ(offEp, -1);
+    EXPECT_EQ(r.impl->appProducerId(), 808) << "the bound thread still sees everything";
+    EXPECT_EQ(r.impl->appProducerEpoch(), 1);
+}
+
+TEST(ProducerIdRegression, ErrorResponseWithCodeZeroIsAProtocolErrorRegression) {
+    Rig r(cfgOf(Acks::Leader));
+    AckLedger L;
+    L.attach(*r.impl);
+    ASSERT_TRUE(r.send(0, 1, true, 1));
+    r.ticks(2, kMs);
+    const auto zero = FakeCoordinator::errorResponse(r.lastCorr(), static_cast<rpc::ErrorCode>(0), "?");
+    ASSERT_TRUE(r.hub.onCoordinatorResponse(zero.templateId, zero.data(), zero.len, r.now));
+    ASSERT_TRUE(std::holds_alternative<rp::IdFailed>(r.impl->identity()));
+    EXPECT_EQ(std::get<rp::IdFailed>(r.impl->identity()).errorCode, 39) << "InvalidRequest, never a code-less failure";
+    r.ticks(2, kMs);
+    ASSERT_EQ(L.times(1), 1);
+    EXPECT_EQ(L.last.at(1).ec, 39);
+}
+
+TEST(ProducerIdRegression, FailedIdentityWalksOnlyWhenSomethingIsPendingRegression) {
+    Rig r(cfgOf(Acks::Leader));
+    AckLedger L;
+    L.attach(*r.impl);
+    r.ticks(2, kMs);
+    r.answer(initAnswer(r.lastCorr(), 0, 0, static_cast<int16_t>(rpc::ErrorCode::InvalidRequest)));
+    r.ticks(3, kMs);   // nothing pending: the passes are no-ops
+    for (rc::Token t = 1; t <= 3; ++t) {   // records accepted after the failure still complete, each once
+        ASSERT_TRUE(r.send(static_cast<int32_t>(t % 2), t, true, t));
+        r.ticks(3, kMs);
+        ASSERT_EQ(L.times(t), 1);
+        EXPECT_EQ(L.status(t), OpStatus::DeliveryFailed);
+    }
+}
+
+TEST(ProducerIdRegression, HeldRecordsFailAtDeliveryTimeoutWhileTheIdKeepsRetryingRegression) {
+    for (const bool direct : {false, true}) {
+        SCOPED_TRACE(direct ? "Direct" : "Ring");
+        rc::ProducerConfig cfg = cfgOf(Acks::Leader);
+        cfg.tier2Slots = 4;
+        Rig r(cfg, direct);
+        AckLedger L;
+        L.attach(*r.impl);
+        L.attachBatches(*r.impl);
+        r.ticks(1);   // a Direct producer's append clock is the duty pass's (the Client seeds it at creation)
+        // void, AckToken, a claim, and a Tier-2 batch: all held, the id never answers.
+        ASSERT_TRUE(r.send(0, 1));
+        ASSERT_TRUE(r.send(1, 2, true, 1));
+        ProducerImpl::ClaimGrant g = r.impl->claimRecord(1, 2, Key(uint64_t{3}), 16, AckLedger::h(2));
+        ASSERT_EQ(g.result, rc::SendResult::Ok);
+        std::fill(g.base, g.base + 16, uint8_t{1});
+        ASSERT_TRUE(r.impl->commitClaim(g.token));
+        if (!direct) {   // a Tier-2 batch is a Ring-mode / batch-thread feature
+            rc::BatchBuilder bb(r.impl.get(), 1, 3);
+            for (int i = 0; i < 4; ++i) bb.add(kVal);
+            ASSERT_EQ(bb.send(rc::AckToken{3}), rc::OpResult::Accepted);
+        }
+        r.ticks(10, kMs);
+        EXPECT_TRUE(r.wire.empty());
+        EXPECT_EQ(L.times(1), 0);
+        // Past deliveryTimeoutMs (10 s) with the identity still re-requesting.
+        r.ticks(1, 5'000 * kMs);
+        r.ticks(2, kMs);
+        r.ticks(1, 6'000 * kMs);
+        r.impl->sweepTimedOut(std::chrono::steady_clock::time_point{std::chrono::nanoseconds{r.now}});
+        EXPECT_FALSE(r.impl->identityAssigned());
+        EXPECT_GE(r.initRequests(), 2u) << "still asking";
+        for (rc::Token t = 1; t <= (direct ? 2u : 3u); ++t) {
+            ASSERT_EQ(L.times(t), 1) << "token " << t << " exactly once";
+            EXPECT_EQ(L.status(t), OpStatus::DeliveryFailed);
+        }
+        EXPECT_GE(L.batchAckedRecords(), direct ? 3 : 7) << "the void send and the batch are counted";
+        r.impl->sweepTimedOut(std::chrono::steady_clock::time_point{std::chrono::nanoseconds{r.now + kMs}});
+        for (rc::Token t = 1; t <= 2; ++t) EXPECT_EQ(L.times(t), 1) << "never twice";
+    }
+}
+
+TEST(ProducerIdRegression, CloseWithHeldRecordsCompletesWithinTheBoundRegression) {
+    Rig r(cfgOf(Acks::Leader));
+    AckLedger L;
+    L.attach(*r.impl);
+    ASSERT_TRUE(r.send(0, 1, true, 1));
+    r.ticks(3, kMs);
+    struct Got { int n = 0; OpStatus st = OpStatus::Ok; } got;
+    rc::detail::OpTarget tgt;
+    tgt.handler = rc::CompletionHandler{
+        [](void* ctx, const rc::Completion& c, std::span<const uint8_t>) noexcept {
+            auto* g = static_cast<Got*>(ctx);
+            ++g->n;
+            g->st = c.status;
+        },
+        &got};
+    r.impl->applyBeginClose(tgt, 9, r.now);
+    (void)r.impl->closeIntake();
+    r.ticks(1, 9'000 * kMs);
+    EXPECT_EQ(got.n, 0) << "inside the bound";
+    r.ticks(1, 2'000 * kMs);
+    r.impl->sweepTimedOut(std::chrono::steady_clock::time_point{std::chrono::nanoseconds{r.now}});
+    r.ticks(2, kMs);
+    ASSERT_EQ(got.n, 1) << "completes within deliveryTimeoutMs + one pass";
+    EXPECT_EQ(L.times(1), 1);
+    EXPECT_EQ(L.status(1), OpStatus::DeliveryFailed);
 }

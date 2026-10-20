@@ -807,7 +807,11 @@ public:
     void flushAndWait(std::chrono::nanoseconds timeout = kDefaultTxnWait);
 
     [[nodiscard]] TxnState state() const noexcept;
-    [[nodiscard]] int64_t  producerId() const noexcept;  ///< -1 until assigned
+    /// producerId() / producerEpoch() (and the status getters of later tasks) drain a single-consumer status
+    /// ring: they are SINGLE-THREAD per producer, on the same bound thread as batch() (the creating thread,
+    /// or the one that called bindBatchThread()).  From any other thread they return "not available"
+    /// (-1) and touch nothing.
+    [[nodiscard]] int64_t  producerId() const noexcept;  ///< -1 until assigned (or off the bound thread)
     [[nodiscard]] int16_t  producerEpoch() const noexcept;
     [[nodiscard]] bool     transactionActive() const noexcept;
     [[nodiscard]] bool     transactional() const noexcept;

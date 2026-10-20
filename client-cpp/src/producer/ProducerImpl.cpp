@@ -2776,6 +2776,7 @@ void ProducerImpl::sweepTimedOut(const std::chrono::steady_clock::time_point& no
     const int64_t nowNs =
         std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
     lastNowNs_ = nowNs;  // the duty-cycle clock (Client passes its own now)
+    retryStatus_();  // FD9: a refused identity snapshot is re-offered (cold, once per sweep)
     const DutyScope duty(*this);  // fix1 C1: failure callbacks below defer their retries
     const int64_t deliveryNs = cfg_.deliveryTimeoutMs * 1'000'000LL;
     // fix2: deferred records are accepted records — same delivery deadline,
@@ -3703,7 +3704,17 @@ void ProducerImpl::publishStatus_() noexcept {
         st.producerId    = a->producerId;
         st.producerEpoch = a->epoch;
     }
-    (void)statusRing_.tryPublish(st);   // a refused publish is superseded by the next transition
+    if (statusRing_.tryPublish(st)) {
+        statusSync_ = StatusSynced{};
+    } else {
+        statusSync_ = StatusPending{st};   // coalesced: a newer snapshot replaces it
+    }
+}
+
+void ProducerImpl::retryStatus_() noexcept {
+    if (const auto* p = std::get_if<StatusPending>(&statusSync_); p != nullptr && statusRing_.tryPublish(p->snap)) {
+        statusSync_ = StatusSynced{};
+    }
 }
 
 int ProducerImpl::identityStepCold_(int64_t nowNs) noexcept {
@@ -3714,9 +3725,19 @@ int ProducerImpl::identityStepCold_(int64_t nowNs) noexcept {
         return std::holds_alternative<IdRequested>(identity_) ? 1 : 0;
     }
     if (const auto* f = std::get_if<IdFailed>(&identity_)) {
-        // Every record accepted since the failure completes the same way (explicitly, never silently).
+        // Failed once on entry (onInitAnswer_).  Records accepted since complete the same way - but only
+        // when something is pending (a ring message, a deferred record, a dirty partition): no walk per pass.
+        retryStatus_();
+        const bool pending = (mode_ == IngressMode::Ring && ring_.headPosition() < ring_.tailPosition()) ||
+                             !deferred_.empty() || !dirty_.empty();
+        if (!pending) return 0;
         failAllPending(f->status, f->errorCode);
+        // flushBatches is gated off for good, so it never compacts the dirty list: do it here.
+        for (const uint32_t slot : dirty_) partitions_[slot]->dirty = false;
+        dirty_.clear();
+        return 1;
     }
+    retryStatus_();
     return 0;
 }
 
@@ -3759,7 +3780,10 @@ void ProducerImpl::onInitAnswer_(const CoordAnswer& a, CoordinatorLink::Slot&) n
         identity_ = IdFailed{OpStatus::DeliveryFailed, static_cast<uint16_t>(rpc::ErrorCode::InvalidRequest)};
     } else {
         // Anything the link did not retry (FD5/FD6): non-retriable, so every record fails explicitly.
-        identity_ = IdFailed{OpStatus::DeliveryFailed, static_cast<uint16_t>(a.errorCode)};
+        // An ErrorResponse carrying code 0 is a protocol error: InvalidRequest (39), never a code-less failure.
+        const uint16_t ec = a.errorCode != 0 ? static_cast<uint16_t>(a.errorCode)
+                                             : static_cast<uint16_t>(rpc::ErrorCode::InvalidRequest);
+        identity_ = IdFailed{OpStatus::DeliveryFailed, ec};
     }
     publishStatus_();
     failAllPending(OpStatus::DeliveryFailed, std::get<IdFailed>(identity_).errorCode);

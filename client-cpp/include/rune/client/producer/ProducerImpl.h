@@ -1195,8 +1195,19 @@ public:
 
     /// FD9: the latest identity the duty thread published (ONE app thread; drains the status ring).
     struct ProducerStatus { int64_t producerId = -1; int16_t producerEpoch = -1; uint8_t identityState = 0; };
-    [[nodiscard]] int64_t appProducerId() noexcept { drainStatus_(); return appStatus_.producerId; }
-    [[nodiscard]] int16_t appProducerEpoch() noexcept { drainStatus_(); return appStatus_.producerEpoch; }
+    /// BOUND THREAD ONLY (the creating thread, or bindBatchThread()'s): the cache and the ring's consumer side
+    /// belong to it.  Any other thread gets -1 and touches nothing (a single-consumer ring must not be drained
+    /// by two threads).
+    [[nodiscard]] int64_t appProducerId() noexcept {
+        if (!onBatchThread()) return -1;
+        drainStatus_();
+        return appStatus_.producerId;
+    }
+    [[nodiscard]] int16_t appProducerEpoch() noexcept {
+        if (!onBatchThread()) return -1;
+        drainStatus_();
+        return appStatus_.producerEpoch;
+    }
 
     /// Test-only seam (F5 regression coverage): force the current epoch so a
     /// test can drive the INT16_MAX overflow path without sending 32767 real
@@ -1627,7 +1638,13 @@ private:
     void publishStatus_() noexcept;
     void drainStatus_() noexcept { statusRing_.drainLatest(appStatus_); }
     detail::StatusRing<ProducerStatus, 256> statusRing_;
-    ProducerStatus appStatus_{};   // the app thread's cache (ONE app thread drains the ring)
+    ProducerStatus appStatus_{};   // the bound app thread's cache (it alone drains the ring)
+    // Duty side: is the newest snapshot in the ring?  A refused tryPublish keeps the snapshot here and it is
+    // re-offered from cold points (sweepTimedOut / the identity step) until accepted; only the newest matters.
+    struct StatusSynced {};
+    struct StatusPending { ProducerStatus snap{}; };
+    std::variant<StatusSynced, StatusPending> statusSync_{};
+    void retryStatus_() noexcept;
     // EOS follow-ups: +1 per frame offer (first send or re-send) — orders sends
     // against answers without clocks (fast retransmit; OOS-vs-ack ordering).
     uint64_t sendTick_ = 0;

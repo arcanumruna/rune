@@ -371,6 +371,7 @@ struct InvokerGateway {
     int64_t             initPid = 4242;
     int64_t             plainPidNext = 7000;   ///< the next id a plain (empty transactional id) request is given
     bool                plainUsesInitPidCodes = false;   ///< plain requests also consume initPidCodes (error injection)
+    bool                plainInitPidAnswers = true;   ///< false: plain InitProducerId requests are counted, never answered
     int                 plainInitPids = 0;     ///< InitProducerId requests with an empty transactional id
     int initPids = 0, addPartitions = 0, addOffsets = 0, txnOffsetCommits = 0, endTxns = 0;
     // C10: the sessionId stamped on every txn COORDINATOR request received
@@ -1636,6 +1637,7 @@ private:
             // producer asks the broker for its id - with its own id (plainPidNext, distinct per request);
             // a transactional request is answered only when replyInitPid (as before).
             const bool plain = ip && ip->transactionalId.empty();
+            if (plain && !plainInitPidAnswers) return;   // a broker that never answers an id request
             if (!ip || (!initPidReply && !plain)) return;
             rp::InitProducerIdResponse rsp;
             rsp.sessionId     = ip->sessionId;
