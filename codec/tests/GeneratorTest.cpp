@@ -84,11 +84,31 @@ TEST(Generator, EmitsZeroCopyFlyweightsForAnAllFixedSchema) {
     EXPECT_NE(hdr.find("static constexpr uint32_t kEncodedLength = 4u + kBlockLength;"), std::string::npos);
     EXPECT_NE(hdr.find("static constexpr bool     kHasKey        = true;"), std::string::npos);
     EXPECT_NE(hdr.find("using KeyType = int64_t;"), std::string::npos);
-    EXPECT_NE(hdr.find("PositionEncoder& zone(int32_t v) noexcept {"), std::string::npos);
-    EXPECT_NE(hdr.find("::rune::codec::fly::store<int32_t>(p_ + 4u + 8u, v);"), std::string::npos)
+    EXPECT_NE(hdr.find("[[gnu::always_inline]] PositionEncoder zone(int32_t v) noexcept {"), std::string::npos);
+    EXPECT_NE(hdr.find("::rune::codec::fly::store<int32_t>(p + 4u + 8u, v);"), std::string::npos)
         << "zone sits at block offset 8";
-    EXPECT_NE(hdr.find("PositionEncoder& tag(std::string_view v) noexcept {"), std::string::npos);
+    EXPECT_NE(hdr.find("[[gnu::always_inline]] PositionEncoder tag(std::string_view v) noexcept {"), std::string::npos);
     EXPECT_NE(hdr.find("#include <rune/codec/Flyweight.h>"), std::string::npos);
+}
+
+// Final review I2 regression: the setters chain by value through a local copy
+// of the pointer (no reload after each store when the encoder lives in an
+// escaping object), and the ClaimEncoder's chain yields the ClaimEncoder.
+TEST(GeneratorRegression, FlyweightSettersChainByValueWithoutReloadingThePointerRegression) {
+    auto d = DescriptorBuilder("position").add("userId", PrimType::Int64, 1, true)
+               .add("zone", PrimType::Int32).addFixedStr("tag", 8).build();
+    const std::string hdr = generateHeader(d);
+    EXPECT_EQ(hdr.find("PositionEncoder& zone("), std::string::npos) << "no reference chaining";
+    EXPECT_NE(hdr.find("        uint8_t* const p = p_;\n"
+                       "        ::rune::codec::fly::store<int32_t>(p + 4u + 8u, v);\n"
+                       "        return PositionEncoder(p, Rebind{});\n"),
+              std::string::npos);
+    EXPECT_NE(hdr.find("[[gnu::always_inline]] PositionClaimEncoder zone(int32_t v) noexcept {\n"
+                       "        return PositionClaimEncoder(PositionEncoder::zone(v));\n"),
+              std::string::npos);
+    EXPECT_EQ(hdr.find("using PositionEncoder::zone;"), std::string::npos)
+        << "a using-declaration would return the base, which exposes the key setter";
+    EXPECT_EQ(hdr.find("PositionClaimEncoder userId("), std::string::npos) << "the key stays hidden";
 }
 
 TEST(Generator, NoFlyweightsForASchemaWithVarLenFields) {
@@ -115,6 +135,6 @@ TEST(Generator, AFieldNamedKeyOnAKeylessSchemaIsAPlainFlyweightSetter) {
     auto d = DescriptorBuilder("kv").add("key", PrimType::Int64).add("v", PrimType::Int32).build();
     const std::string hdr = generateHeader(d);
     EXPECT_NE(hdr.find("class KvEncoder {"), std::string::npos);
-    EXPECT_NE(hdr.find("KvEncoder& key(int64_t v) noexcept {"), std::string::npos);
+    EXPECT_NE(hdr.find("[[gnu::always_inline]] KvEncoder key(int64_t v) noexcept {"), std::string::npos);
     EXPECT_EQ(hdr.find("KeyType"), std::string::npos);
 }

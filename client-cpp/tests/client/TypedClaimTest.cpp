@@ -280,3 +280,12 @@ concept CanSetKey = requires(W& w) { w.key(int64_t{1}); } || requires(W& w) { w.
 using PositionClaim = decltype(std::declval<TypedTopic<Position>&>().claim(int64_t{}));
 static_assert(!CanSetKey<PositionClaim>, "the key field must not be reachable through a TypedClaim");
 static_assert(requires(PositionClaim& w) { w.zone(1); }, "non-key setters stay available");
+// Final review I2 regression: a setter chains BY VALUE (the pointer stays in a
+// register across the chain) and never yields the full Encoder, so the key is
+// not reachable through a chain either (w.zone(1).userId(2) was, via the base).
+using PositionChain = decltype(std::declval<PositionClaim&>().zone(1));
+static_assert(std::is_same_v<PositionChain, rune::gen::PositionClaimEncoder>,
+              "a claim setter returns the ClaimEncoder by value");
+static_assert(!CanSetKey<PositionChain>, "the key field must not be reachable through a setter chain");
+static_assert(std::is_same_v<decltype(std::declval<PositionEncoder&>().zone(1)), PositionEncoder>,
+              "an encoder setter returns the encoder by value");

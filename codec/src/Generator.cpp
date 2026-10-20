@@ -101,7 +101,11 @@ static void emitEncoder(std::ostringstream& o, const Descriptor& d, const std::s
     const FieldDescriptor* k = singleKeyField(d);
     o << "// " << cls << " — zero-copy writer over a claimed buffer (Producer::tryClaim,\n"
       << "// TypedTopic::claim).  Same packed little-endian bytes as " << structName << "::encode();\n"
-      << "// every field is stored with memcpy (a claimed buffer is not aligned).\n";
+      << "// every field is stored with memcpy (a claimed buffer is not aligned).\n"
+      << "// The setters chain BY VALUE (a copy is one pointer): a byte store may alias\n"
+      << "// any object the encoder lives in (an escaping TypedClaim), so a chain through\n"
+      << "// *this would reload the pointer after every field; through the returned copy\n"
+      << "// it stays in a register.\n";
     o << "class " << cls << " {\n";
     o << "public:\n";
     o << "    static constexpr uint32_t kBlockLength   = " << d.blockLength << "u;\n";
@@ -117,34 +121,40 @@ static void emitEncoder(std::ostringstream& o, const Descriptor& d, const std::s
     o << "        if (buf.size() < kEncodedLength) {\n";
     o << "            throw std::length_error(\"" << cls << ": buffer is smaller than kEncodedLength\");\n";
     o << "        }\n";
-    o << "        ::rune::codec::fly::store<uint16_t>(p_, static_cast<uint16_t>(kBlockLength));\n";
-    o << "        ::rune::codec::fly::store<uint16_t>(p_ + 2, kVersion);\n";
-    o << "        std::memset(p_ + 4, 0, kBlockLength);\n";
+    o << "        uint8_t* const p = buf.data();\n";
+    o << "        ::rune::codec::fly::store<uint16_t>(p, static_cast<uint16_t>(kBlockLength));\n";
+    o << "        ::rune::codec::fly::store<uint16_t>(p + 2, kVersion);\n";
+    o << "        std::memset(p + 4, 0, kBlockLength);\n";
     o << "    }\n\n";
     for (const auto& f : d.fields) {
         if (f.type == PrimType::FixedStr) {
-            o << "    " << cls << "& " << f.name << "(std::string_view v) noexcept {\n"
-              << "        ::rune::codec::fly::storeFixedStr(p_ + 4u + " << f.offset << "u, v, "
+            o << "    [[gnu::always_inline]] " << cls << " " << f.name << "(std::string_view v) noexcept {\n"
+              << "        uint8_t* const p = p_;\n"
+              << "        ::rune::codec::fly::storeFixedStr(p + 4u + " << f.offset << "u, v, "
               << f.fixedLen << "u);\n"
-              << "        return *this;\n"
+              << "        return " << cls << "(p, Rebind{});\n"
               << "    }\n";
         } else {
-            o << "    " << cls << "& " << f.name << "(" << cppType(f.type) << " v) noexcept {\n"
-              << "        ::rune::codec::fly::store<" << flyType(f.type) << ">(p_ + 4u + " << f.offset
+            o << "    [[gnu::always_inline]] " << cls << " " << f.name << "(" << cppType(f.type)
+              << " v) noexcept {\n"
+              << "        uint8_t* const p = p_;\n"
+              << "        ::rune::codec::fly::store<" << flyType(f.type) << ">(p + 4u + " << f.offset
               << "u, v);\n"
-              << "        return *this;\n"
+              << "        return " << cls << "(p, Rebind{});\n"
               << "    }\n";
         }
     }
     if (k != nullptr) {
         if (k->name != "key") {  // a key field named `key` already has this setter
             if (k->type == PrimType::FixedStr) {
-                o << "    " << cls << "& key(const KeyType& v) noexcept {\n"
-                  << "        std::memcpy(p_ + 4u + " << k->offset << "u, v.data(), " << k->fixedLen << "u);\n"
-                  << "        return *this;\n"
+                o << "    [[gnu::always_inline]] " << cls << " key(const KeyType& v) noexcept {\n"
+                  << "        uint8_t* const p = p_;\n"
+                  << "        std::memcpy(p + 4u + " << k->offset << "u, v.data(), " << k->fixedLen << "u);\n"
+                  << "        return " << cls << "(p, Rebind{});\n"
                   << "    }\n";
             } else {
-                o << "    " << cls << "& key(KeyType v) noexcept { return " << k->name << "(v); }\n";
+                o << "    [[gnu::always_inline]] " << cls << " key(KeyType v) noexcept { return " << k->name
+                  << "(v); }\n";
             }
         }
         if (k->type == PrimType::FixedStr) {
@@ -161,6 +171,8 @@ static void emitEncoder(std::ostringstream& o, const Descriptor& d, const std::s
         }
     }
     o << "\nprivate:\n";
+    o << "    struct Rebind {};  // a setter's returned copy: no header write, no zeroing\n";
+    o << "    " << cls << "(uint8_t* p, Rebind) noexcept : p_(p) {}\n";
     o << "    uint8_t* p_;\n";
     o << "};\n\n";
 }
@@ -188,10 +200,19 @@ static void emitClaimEncoder(std::ostringstream& o, const Descriptor& d, const s
     } else {
         o << "\n    explicit " << cls << "(std::span<uint8_t> buf) : " << base << "(buf) {}\n";
     }
+    // Own setters returning the ClaimEncoder by value (the Encoder's chain
+    // optimisation, and the chain never yields the base: the key setter stays
+    // unreachable through a returned value too).
     for (const auto& f : d.fields) {
         if (k != nullptr && f.name == k->name) continue;
-        o << "    using " << base << "::" << f.name << ";\n";
+        const std::string arg = f.type == PrimType::FixedStr ? std::string("std::string_view")
+                                                             : std::string(cppType(f.type));
+        o << "    [[gnu::always_inline]] " << cls << " " << f.name << "(" << arg << " v) noexcept {\n"
+          << "        return " << cls << "(" << base << "::" << f.name << "(v));\n"
+          << "    }\n";
     }
+    o << "\nprivate:\n";
+    o << "    explicit " << cls << "(const " << base << "& e) noexcept : " << base << "(e) {}\n";
     o << "};\n\n";
 }
 

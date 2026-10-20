@@ -152,7 +152,8 @@ public:
     /// The claim built in place from `make()` (TypedTopic::claim's form).
     template <class Make, class... K>
         requires std::is_invocable_r_v<Claim, Make&>
-    TypedClaim(detail::ClaimInPlace, Make&& make, uint16_t boundVersion, const K&... keyValue)
+    [[gnu::always_inline]] TypedClaim(detail::ClaimInPlace, Make&& make, uint16_t boundVersion,
+                                      const K&... keyValue)
         : Slot(make), E(Slot::target(), keyValue...) {
         stampVersion_(boundVersion);
     }
