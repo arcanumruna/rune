@@ -769,3 +769,250 @@ TEST(ProducerClaimRegression, ClaimBatchWireSizeIsBoundedEvenWithoutAFrameCapReg
     pump(*r.impl, cap.fn());
     EXPECT_EQ(cap.recs.size(), 3u);
 }
+
+// ---------------------------------------------------------------------------
+// Invoker mode (Direct ingress): the claim is reserved IN the Produce frame
+// ---------------------------------------------------------------------------
+
+namespace {
+struct DirectRig {
+    ProducerImpl* impl;
+    Producer      p;
+    explicit DirectRig(ProducerConfig cfg = voidCfg())
+        : impl(new ProducerImpl(cfg, 4 * 1024)), p(impl) {
+        impl->enableDirectIngress({std::this_thread::get_id(), nullptr, nullptr});
+    }
+    /// One owner duty pass (Direct: drainRing is a no-op; flush the builders).
+    void pass(const ProducerImpl::SendFn& sink) { impl->flushBatches(kNow, 42, sink); }
+};
+}  // namespace
+
+// Spec B copy count, Invoker mode: the claimed bytes ARE the Produce frame's
+// bytes — the only copy left is the transport's (frame -> Aeron).
+TEST(ProducerClaimDirect, ClaimWritesStraightIntoTheProduceFrame) {
+    DirectRig r;
+    rc::Claim c = r.p.tryClaim(kTopic, Key(uint64_t{5}), 4);
+    ASSERT_TRUE(c) << static_cast<int>(c.result());
+    fill(c.buffer(), "WXYZ");
+    FrameCapture cap;
+    cap.watch = c.buffer().data();
+    ASSERT_TRUE(c.commit());
+    r.pass(cap.fn());
+    ASSERT_EQ(cap.values(), std::vector<std::string>{"WXYZ"});
+    EXPECT_TRUE(cap.watchInFrame) << "Invoker: 1 copy (frame -> Aeron)";
+}
+
+// Review Focus 3.
+TEST(ProducerClaimDirect, OpenClaimBlocksSendsAndIsNeverFlushedHalfWritten) {
+    DirectRig r;
+    const Key key(uint64_t{1});
+    ASSERT_EQ(r.p.trySend(kTopic, key, bytes("A")), SendResult::Ok);
+    rc::Claim c = r.p.tryClaim(kTopic, key, 1);
+    ASSERT_TRUE(c);
+    EXPECT_EQ(r.p.trySend(kTopic, Key(uint64_t{2}), bytes("x")), SendResult::ClaimHeld);
+    EXPECT_EQ(r.p.tryClaim(kTopic, Key(uint64_t{2}), 1).result(), SendResult::ClaimHeld);
+    EXPECT_EQ(r.p.claimBatch(kTopic, Key(uint64_t{2}), 2, 1).result(), SendResult::ClaimHeld);
+    EXPECT_THROW(r.p.send(kTopic, Key(uint64_t{2}), bytes("x")), std::logic_error)
+        << "a blocking send fails fast — pumping could never settle the caller's own claim";
+    FrameCapture cap;
+    r.pass(cap.fn());
+    EXPECT_EQ(cap.frames, 0) << "a partition with an open claim is not flushed";
+    c.buffer()[0] = 'B';
+    ASSERT_TRUE(c.commit());
+    ASSERT_EQ(r.p.trySend(kTopic, key, bytes("C")), SendResult::Ok);
+    r.pass(cap.fn());
+    EXPECT_EQ(cap.values(), (std::vector<std::string>{"A", "B", "C"}));
+    ASSERT_EQ(cap.recs.size(), 3u);
+    for (int i = 0; i < 3; ++i) EXPECT_EQ(cap.recs[i].offset, i);
+}
+
+// Review Focus 2.
+TEST(ProducerClaimDirect, CloseAbandonsAnOpenClaimAndItsCommitReturnsFalse) {
+    DirectRig r;
+    test_support::AckLedger L;
+    L.attachBatches(*r.impl);
+    rc::Claim c = r.p.tryClaim(kTopic, Key(uint64_t{1}), 3);
+    ASSERT_TRUE(c);
+    fill(c.buffer(), "abc");
+    ASSERT_EQ(r.p.closeImmediately(), rc::OpResult::Accepted);
+    EXPECT_EQ(r.impl->claimsAbandoned(), 1u);
+    EXPECT_FALSE(c.commit()) << "abandoned under the caller: nothing is sent";
+    FrameCapture cap;
+    r.pass(cap.fn());
+    EXPECT_TRUE(cap.recs.empty());
+    EXPECT_TRUE(L.batchAcks.empty()) << "an uncommitted claim was never accepted: no BatchAck";
+}
+
+TEST(ProducerClaimDirect, ClaimOffTheOwnerThreadIsWrongThread) {
+    DirectRig r;
+    SendResult one = SendResult::Ok;
+    SendResult many = SendResult::Ok;
+    std::thread t([&] {
+        one  = r.p.tryClaim(kTopic, Key(uint64_t{1}), 4).result();
+        many = r.p.claimBatch(kTopic, Key(uint64_t{1}), 2, 4).result();
+    });
+    t.join();
+    EXPECT_EQ(one, SendResult::WrongThread);
+    EXPECT_EQ(many, SendResult::WrongThread);
+}
+
+TEST(ProducerClaimDirect, ClaimBatchIsOneRecordBatchAndAbortRollsBackExactly) {
+    DirectRig r;
+    const Key key(uint64_t{1});
+    ASSERT_EQ(r.p.trySend(kTopic, key, bytes("A")), SendResult::Ok);
+    {
+        rc::BatchClaim a = r.p.claimBatch(kTopic, key, 3, 1);
+        ASSERT_TRUE(a);
+        a.record(0)[0] = 'x';
+        a.abort();
+    }
+    FrameCapture cap;
+    {
+        rc::BatchClaim b = r.p.claimBatch(kTopic, key, 2, 2);
+        ASSERT_TRUE(b) << static_cast<int>(b.result());
+        fill(b.record(0), "B1");
+        fill(b.record(1), "B2");
+        cap.watch = b.record(1).data();
+        ASSERT_TRUE(b.commit());
+    }
+    ASSERT_EQ(r.p.trySend(kTopic, key, bytes("C")), SendResult::Ok);
+    r.pass(cap.fn());
+    EXPECT_EQ(cap.values(), (std::vector<std::string>{"A", "B1", "B2", "C"}));
+    EXPECT_EQ(cap.frames, 1);
+    for (int i = 0; i < 4; ++i) EXPECT_EQ(cap.recs[i].offset, i) << "the aborted batch left no gap";
+    EXPECT_TRUE(cap.watchInFrame) << "Invoker claimBatch writes the frame in place too";
+}
+
+TEST(ProducerClaimDirect, AckedClaimCompletesWithItsOwnOffset) {
+    ProducerConfig cfg = voidCfg();
+    cfg.acks = Acks::Leader;
+    DirectRig r(cfg);
+    test_support::AckLedger L;
+    L.attach(r.p);
+    const Key key(uint64_t{1});
+    ASSERT_EQ(r.p.trySend(kTopic, key, bytes("A")), SendResult::Ok);  // offsetDelta 0, void
+    rc::Claim c = r.p.tryClaim(kTopic, key, 1, rc::AckToken{5});      // offsetDelta 1
+    ASSERT_TRUE(c);
+    c.buffer()[0] = 'B';
+    ASSERT_TRUE(c.commit());
+    FrameCapture cap;
+    r.pass(cap.fn());
+    ASSERT_EQ(cap.corrs.size(), 1u);
+    r.impl->onProduceResponse(cap.corrs[0], 200, 0);
+    ASSERT_EQ(L.recs.size(), 1u);
+    EXPECT_EQ(L.recs[0].token, 5u);
+    EXPECT_EQ(L.recs[0].value, 201) << "baseOffset + its own index";
+}
+
+// Claims are never deferred: inside a callback the producer fires during its
+// own duty work, a claim is refused (use trySend() there — it defers).
+TEST(ProducerClaimDirect, ClaimFromInsideAProducerCallbackIsBackPressured) {
+    ProducerConfig cfg = voidCfg();
+    cfg.acks = Acks::Leader;
+    DirectRig r(cfg);
+    struct Ctx {
+        Producer*  p;
+        SendResult got   = SendResult::Ok;
+        int        calls = 0;
+    } ctx{&r.p};
+    r.p.onAck(
+        [](void* c, rc::Token, int64_t, rc::OpStatus, uint16_t) noexcept {
+            auto* x = static_cast<Ctx*>(c);
+            ++x->calls;
+            x->got = x->p->tryClaim(kTopic, Key(uint64_t{2}), 4).result();
+        },
+        &ctx);
+    ASSERT_EQ(r.p.trySend(kTopic, Key(uint64_t{1}), bytes("a"), rc::AckToken{1}), SendResult::Ok);
+    FrameCapture cap;
+    r.pass(cap.fn());
+    ASSERT_EQ(cap.corrs.size(), 1u);
+    r.impl->onProduceResponse(cap.corrs[0], 10, 0);
+    ASSERT_EQ(ctx.calls, 1);
+    EXPECT_EQ(ctx.got, SendResult::BackPressured);
+}
+
+TEST(ProducerClaimAllocRegression, DirectClaimAndClaimBatchSteadyStateAllocateNothingRegression) {
+    DirectRig r;
+    const ProducerImpl::SendFn sink = [](int32_t, int32_t, int32_t, const uint8_t*, std::size_t) {
+        return true;
+    };
+    auto cycle = [&](uint64_t k) {
+        {
+            rc::Claim c = r.p.tryClaim(kTopic, Key(k), 64);
+            if (c) {
+                std::memset(c.buffer().data(), 0x5A, 64);
+                (void)c.commit();
+            }
+        }
+        {
+            rc::BatchClaim b = r.p.claimBatch(kTopic, Key(k), 4, 32);
+            if (b) {
+                for (uint32_t i = 0; i < 4; ++i) std::memset(b.record(i).data(), 0x5B, 32);
+                (void)b.commit();
+            }
+        }
+        r.pass(sink);
+    };
+    for (uint64_t k = 0; k < 64; ++k) cycle(k);  // warm-up: builders, frames, claim offsets
+    alloc_counter::start();
+    for (uint64_t k = 64; k < 1064; ++k) cycle(k);
+    EXPECT_EQ(alloc_counter::stop(), 0L) << "Invoker claims must not allocate in steady state";
+}
+
+// A Direct claimBatch with no frame cap (maxFrameBytes == 0) is still bounded:
+// Direct has no ring traffic (1 KiB trailer-only ring), so the fallback is the
+// max message of the ring Thread mode is sized from.
+TEST(ProducerClaimDirect, ClaimBatchWireSizeIsBoundedEvenWithoutAFrameCapRegression) {
+    ProducerConfig cfg = voidCfg();
+    cfg.maxFrameBytes  = 0;
+    DirectRig r(cfg);
+    const Key key(uint64_t{1});
+    for (const uint32_t n : {100'000'000u, 1'000'000u, 0x7fffffffu}) {
+        rc::BatchClaim b = r.p.claimBatch(kTopic, key, n, 0);
+        EXPECT_FALSE(b);
+        EXPECT_EQ(b.result(), SendResult::MessageTooLarge) << n;
+    }
+    EXPECT_EQ(r.p.claimBatch(kTopic, key, 0, 0).result(), SendResult::InvalidArgument);
+    FrameCapture cap;
+    r.pass(cap.fn());
+    EXPECT_TRUE(cap.recs.empty());
+    rc::BatchClaim ok = r.p.claimBatch(kTopic, key, 3, 0);
+    ASSERT_TRUE(ok);
+    ASSERT_TRUE(ok.commit());
+    r.pass(cap.fn());
+    EXPECT_EQ(cap.recs.size(), 3u);
+}
+
+// Zero-allocation gate, the other Direct claim paths: abort, destructor-abort
+// (single and batch), and a refused (ClaimHeld) claim.
+TEST(ProducerClaimAllocRegression, DirectClaimAbortAndDestructorAllocateNothingRegression) {
+    DirectRig r;
+    const ProducerImpl::SendFn sink = [](int32_t, int32_t, int32_t, const uint8_t*, std::size_t) {
+        return true;
+    };
+    auto cycle = [&](uint64_t k) {
+        {
+            rc::Claim a = r.p.tryClaim(kTopic, Key(k), 64);
+            if (a) a.abort();
+        }
+        {
+            rc::Claim d = r.p.tryClaim(kTopic, Key(k), 64);  // destructor aborts
+            (void)r.p.tryClaim(kTopic, Key(k), 8);           // ClaimHeld: refused, no state touched
+        }
+        {
+            rc::BatchClaim b = r.p.claimBatch(kTopic, Key(k), 4, 32);
+            if (b) b.abort();
+        }
+        {
+            rc::BatchClaim d = r.p.claimBatch(kTopic, Key(k), 4, 32);  // destructor aborts
+        }
+        rc::Claim c = r.p.tryClaim(kTopic, Key(k), 16);
+        if (c) (void)c.commit();
+        r.pass(sink);
+    };
+    for (uint64_t k = 0; k < 64; ++k) cycle(k);
+    alloc_counter::start();
+    for (uint64_t k = 64; k < 1064; ++k) cycle(k);
+    EXPECT_EQ(alloc_counter::stop(), 0L) << "Invoker abort / destructor / refused claims must not allocate";
+}
+

@@ -501,6 +501,12 @@ SendResult ProducerImpl::tryAppendDirect_(int32_t topicId, int32_t partition, co
         why = RejectReason::Closed;
         return SendResult::Closed;
     }
+    // Phase 2b B: an open claim owns the append path until it is settled (its
+    // reserved record sits at the builder tail).  Not retryable by waiting.
+    if (std::holds_alternative<DirectClaimOpen>(directClaim_)) [[unlikely]] {
+        why = RejectReason::ClaimHeld;
+        return SendResult::ClaimHeld;
+    }
     if (key.size() + value.size() > rune::client::Producer::kMaxRecordBytes) [[unlikely]] {  // B6
         why = RejectReason::MessageTooLarge;
         return SendResult::MessageTooLarge;
@@ -946,6 +952,9 @@ void ProducerImpl::throwForSendResult(SendResult r) {
         throw std::logic_error("Producer::send: client closed (or this producer was closed)");
     case SendResult::QueueFull:
         throw std::runtime_error("Producer::send: completion queue has no credit (poll it)");
+    case SendResult::ClaimHeld:
+        throw std::logic_error("Producer::send: a claim is open on this invoker-mode producer - "
+                               "commit() or abort() it first");
     case SendResult::InvalidArgument:
         throw std::invalid_argument("Producer::send: invalid token or completion queue");
     }
@@ -1433,6 +1442,9 @@ rune::client::detail::ControlledAction ProducerImpl::admitRecord_(PartitionState
                                                                   uint32_t valueLen, uint8_t flags,
                                                                   uint64_t ackHandle) {
     using rune::client::detail::ControlledAction;
+    // Phase 2b B: an open Invoker claim owns this partition's builder tail (the
+    // deferred apply pass keeps its records until the claim is settled).
+    if (directClaimOn_(ps)) return ControlledAction::ABORT;
     // Task 14 fix1 I1: never overtake a Tier-2 batch queued earlier on the
     // partition (flushBatches sends Tier-1 first).
     if (!ps.pendingTier2Entries.empty()) return ControlledAction::ABORT;
@@ -1568,6 +1580,9 @@ bool ProducerImpl::encodeAndSend(
     const Sink& sink)
 {
     if (!ps.builder || ps.builder->recordCount() == 0) return false;
+    // Phase 2b B: an open Invoker claim's record is not written yet - never
+    // seal it; the partition stays dirty and flushes once the claim settles.
+    if (directClaimOn_(ps)) return false;
 
     // acks=None: nothing waits for a response, so nothing can detect (or ever
     // retransmit) a lost frame — sequencing a batch nobody tracks just leaves a
@@ -2659,6 +2674,7 @@ void ProducerImpl::failBatch_(PartitionState& ps, InFlightBatch& b, OpStatus st,
 }
 
 void ProducerImpl::failBuilder_(PartitionState& ps, OpStatus st, uint16_t errorCode) {
+    abandonDirectClaimOn_(ps);  // Phase 2b B: an open claim is dropped first (never reported)
     if (!ps.builder || ps.builder->recordCount() == 0) return;
     const int32_t n = ps.builder->recordCount();
     emitUnsentBatchAck_(ps.topicId, ps.partition, n, st, static_cast<uint32_t>(n));
@@ -3290,13 +3306,9 @@ inline void writeClaimHeader(uint8_t* d, int32_t topicId, int32_t partition, con
 
 ProducerImpl::ClaimGrant ProducerImpl::claimRecord(int32_t topicId, int32_t partition, const Key& key,
                                                    uint32_t valueLen, uint64_t ackHandle) noexcept {
+    // Invoker: the claim is reserved in the partition builder, never in the ring.
+    if (mode_ == IngressMode::Direct) return claimRecordDirect_(topicId, partition, key, valueLen, ackHandle);
     ClaimGrant g;
-    // Direct (Invoker) claims arrive with Part B Task 5; until then a Direct
-    // producer has no ring to claim from — refuse, never touch the unused ring.
-    if (mode_ == IngressMode::Direct) {
-        g.result = SendResult::InvalidArgument;
-        return g;
-    }
     // Backlog B6: the per-record cap, one O(1) compare (key + value <= 16 KiB).
     if (key.size() + valueLen > rune::client::Producer::kMaxRecordBytes) {
         g.result = SendResult::MessageTooLarge;
@@ -3338,19 +3350,20 @@ SendResult ProducerImpl::checkBatchClaim_(const Key& key, uint32_t n, uint32_t r
     // no frame cap (maxFrameBytes == 0) the ring's maxMsgLength still bounds the
     // wire size, so n x (tiny recLen) can never make the duty thread reserve an
     // unbounded builder (64-bit: n <= INT32_MAX, perRecord < 64).
-    const int64_t wireCap = cfg_.maxFrameBytes > 0 ? static_cast<int64_t>(cfg_.maxFrameBytes)
-                                                    : static_cast<int64_t>(ring_.maxMsgLength());
+    // Direct has no ring traffic (its ring is 1 KiB, trailer words only): the
+    // fallback is the max message of the ring Thread mode is sized from
+    // (kDefaultProducerRingCap / 8), so both modes accept the same claims.
+    const int64_t ringMax = mode_ == IngressMode::Direct ? static_cast<int64_t>(kDefaultProducerRingCap / 8)
+                                                         : static_cast<int64_t>(ring_.maxMsgLength());
+    const int64_t wireCap = cfg_.maxFrameBytes > 0 ? static_cast<int64_t>(cfg_.maxFrameBytes) : ringMax;
     if (claimBatchWireBound(key.size(), n, recLen) > wireCap) return SendResult::MessageTooLarge;
     return SendResult::Ok;
 }
 
 ProducerImpl::ClaimGrant ProducerImpl::claimBatch(int32_t topicId, int32_t partition, const Key& key, uint32_t n,
                                                   uint32_t recLen) noexcept {
+    if (mode_ == IngressMode::Direct) return claimBatchDirect_(topicId, partition, key, n, recLen);
     ClaimGrant g;
-    if (mode_ == IngressMode::Direct) {  // Direct claims arrive with Task 6
-        g.result = SendResult::InvalidArgument;
-        return g;
-    }
     const SendResult check = checkBatchClaim_(key, n, recLen);
     if (check != SendResult::Ok) {
         g.result = check;
@@ -3383,6 +3396,7 @@ ProducerImpl::ClaimGrant ProducerImpl::claimBatch(int32_t topicId, int32_t parti
 }
 
 bool ProducerImpl::commitClaim(int64_t token) noexcept {
+    if (mode_ == IngressMode::Direct) return commitDirectClaim_(static_cast<uint64_t>(token));
     try {
         ring_.commit(static_cast<aeron::util::index_t>(token));
         return true;
@@ -3394,11 +3408,131 @@ bool ProducerImpl::commitClaim(int64_t token) noexcept {
 }
 
 void ProducerImpl::abortClaim(int64_t token) noexcept {
+    if (mode_ == IngressMode::Direct) {
+        abortDirectClaim_(static_cast<uint64_t>(token));
+        return;
+    }
     try {
         ring_.abort(static_cast<aeron::util::index_t>(token));
     } catch (...) {
         // Already released by the close-drain unblock: nothing left to discard.
     }
+}
+
+SendResult ProducerImpl::directClaimGate_(int32_t topicId, int32_t partition) noexcept {
+    // Foreign thread decided FIRST, before any owner-thread state is read.
+    if (std::this_thread::get_id() != dutyThreadId_) return SendResult::WrongThread;
+    if (directClosed_) return SendResult::Closed;
+    if (std::holds_alternative<DirectClaimOpen>(directClaim_)) return SendResult::ClaimHeld;
+    // Claims are never deferred: inside this producer's own duty work (a
+    // callback it fired) the builders may be mid-walk - use trySend() there.
+    if (inDuty_) return SendResult::BackPressured;
+    // This partition's deferred records go first (same rule as a send).
+    if (!deferred_.empty() && !settleDeferredFor_(topicId, partition)) return SendResult::BackPressured;
+    return SendResult::Ok;
+}
+
+ProducerImpl::ClaimGrant ProducerImpl::claimRecordDirect_(int32_t topicId, int32_t partition, const Key& key,
+                                                          uint32_t valueLen, uint64_t ackHandle) noexcept {
+    using rune::client::detail::ControlledAction;
+    ClaimGrant g;
+    g.result = directClaimGate_(topicId, partition);
+    if (g.result != SendResult::Ok) return g;
+    if (key.size() + valueLen > rune::client::Producer::kMaxRecordBytes) {  // B6
+        g.result = SendResult::MessageTooLarge;
+        return g;
+    }
+    const auto    kb    = key.bytes();
+    const uint8_t flags = ackHandle != 0 ? kFlagWantAck : uint8_t{0};
+    try {
+        PartitionState& ps = getOrCreatePartition(topicId, partition);
+        if (admitRecord_(ps, static_cast<uint8_t>(kb.size()), valueLen, flags, ackHandle) ==
+            ControlledAction::ABORT) {
+            g.result = SendResult::BackPressured;
+            return g;
+        }
+        // Room for the whole record first: the reservation cannot reallocate,
+        // so data() stays put while the caller writes and nothing below throws.
+        ps.builder->reserveExtra(kb.size() + valueLen + ProduceFrameBuilder::kRecordOverheadMax);
+        const ProduceFrameBuilder::Mark mark  = ps.builder->mark();
+        const int32_t                   index = ps.builder->recordCount();
+        const std::size_t off = ps.builder->reserveRecord(
+            std::string_view(reinterpret_cast<const char*>(kb.data()), kb.size()), valueLen, wallMs());
+        directClaim_ = DirectClaimOpen{ps.slotIndex, mark, index, 1, flags, ackHandle, ++claimGen_};
+        g.result = SendResult::Ok;
+        g.token  = static_cast<int64_t>(claimGen_);
+        g.base   = ps.builder->data() + off;
+    } catch (const std::length_error&) {
+        g.result = SendResult::InvalidTopic;   // the partition table is full (unaddressable)
+    } catch (...) {
+        g.result = SendResult::BackPressured;  // bad_alloc growing a builder / the ack ring: nothing reserved
+    }
+    return g;
+}
+
+ProducerImpl::ClaimGrant ProducerImpl::claimBatchDirect_(int32_t topicId, int32_t partition, const Key& key,
+                                                         uint32_t n, uint32_t recLen) noexcept {
+    using rune::client::detail::ControlledAction;
+    ClaimGrant g;
+    g.result = directClaimGate_(topicId, partition);
+    if (g.result != SendResult::Ok) return g;
+    g.result = checkBatchClaim_(key, n, recLen);
+    if (g.result != SendResult::Ok) return g;
+    const auto             kb = key.bytes();
+    const std::string_view kv(reinterpret_cast<const char*>(kb.data()), kb.size());
+    try {
+        if (claimOffsets_.size() < n) claimOffsets_.resize(n);  // high-water mark: warm-up only
+        PartitionState& ps = getOrCreatePartition(topicId, partition);
+        if (admitBatch_(ps, static_cast<uint8_t>(kb.size()), n, recLen) == ControlledAction::ABORT) {
+            g.result = SendResult::BackPressured;
+            return g;
+        }
+        // admitBatch_ reserved capacity for all n: no reservation below
+        // reallocates (data() stays put, nothing throws).
+        const ProduceFrameBuilder::Mark mark  = ps.builder->mark();
+        const int32_t                   first = ps.builder->recordCount();
+        const int64_t                   ts    = wallMs();
+        for (uint32_t i = 0; i < n; ++i) {
+            claimOffsets_[i] = static_cast<uint32_t>(ps.builder->reserveRecord(kv, recLen, ts));
+        }
+        directClaim_ = DirectClaimOpen{ps.slotIndex, mark, first, static_cast<int32_t>(n), 0, 0, ++claimGen_};
+        g.result  = SendResult::Ok;
+        g.token   = static_cast<int64_t>(claimGen_);
+        g.base    = ps.builder->data();
+        g.offsets = claimOffsets_.data();
+    } catch (const std::length_error&) {
+        g.result = SendResult::InvalidTopic;
+    } catch (...) {
+        g.result = SendResult::BackPressured;
+    }
+    return g;
+}
+
+bool ProducerImpl::commitDirectClaim_(uint64_t gen) noexcept {
+    const auto* o = std::get_if<DirectClaimOpen>(&directClaim_);
+    if (o == nullptr || o->gen != gen) return false;  // abandoned under the caller
+    const DirectClaimOpen c = *o;
+    directClaim_ = NoDirectClaim{};
+    // Ack-ring room was reserved by admitRecord_ and nothing else appended to
+    // the partition while the claim was open: noteAppended_ cannot throw here.
+    noteAppended_(*partitions_[c.slot], c.firstIndex, c.count, c.flags, c.ackHandle, lastNowNs_);
+    FLIGHT_RECORDER_MARK_PRODUCE(flight_recorder::Site::ClientAppSend, static_cast<uint32_t>(c.ackHandle));
+    return true;
+}
+
+void ProducerImpl::abortDirectClaim_(uint64_t gen) noexcept {
+    const auto* o = std::get_if<DirectClaimOpen>(&directClaim_);
+    if (o == nullptr || o->gen != gen) return;
+    partitions_[o->slot]->builder->rollback(o->mark);
+    directClaim_ = NoDirectClaim{};
+}
+
+void ProducerImpl::abandonDirectClaimOn_(PartitionState& ps) noexcept {
+    const auto* o = std::get_if<DirectClaimOpen>(&directClaim_);
+    if (o == nullptr || o->slot != ps.slotIndex) return;
+    ps.builder->rollback(o->mark);
+    directClaim_ = NoDirectClaim{};
+    ++claimsAbandoned_;
 }
 
 ProducerImpl::~ProducerImpl() {

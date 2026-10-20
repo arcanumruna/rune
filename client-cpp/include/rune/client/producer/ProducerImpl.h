@@ -438,6 +438,7 @@ enum class RejectReason : uint8_t {
     DeferredFull,       ///< Direct: in-duty deferral arena / partition share full (retry later)
     PartitionDeferred,  ///< Direct: this partition still has deferred records that cannot go yet
     Unaddressable,      ///< Direct: the producer's partition table is full
+    ClaimHeld,          ///< Direct: an open claim owns the append path (Phase 2b B)
 };
 
 // ---------------------------------------------------------------------------
@@ -570,6 +571,9 @@ public:
     [[nodiscard]] bool commitClaim(int64_t token) noexcept;
     /// Discard a granted claim (Ring: the slot becomes padding).
     void abortClaim(int64_t token) noexcept;
+    /// Phase 2b B (owner thread): Invoker claims abandoned while open - their
+    /// partition's builder was failed / the producer closed; commit() returned false.
+    [[nodiscard]] uint64_t claimsAbandoned() const noexcept { return claimsAbandoned_; }
 
     /// Slow path of the void send: retries until accepted; throws on non-retryable
     /// results (see Producer.h's send() doc for the exact exception per case).
@@ -1205,6 +1209,38 @@ private:
     /// claimBatch's size rules, shared by both ingress modes.
     [[nodiscard]] SendResult checkBatchClaim_(const Key& key, uint32_t n, uint32_t recLen) const noexcept;
 
+    // ---- Phase 2b B: the Invoker (Direct) claim state machine (owner thread) ---
+    //   NoDirectClaim --claimRecord / claimBatch--> DirectClaimOpen
+    //   DirectClaimOpen --commit--> NoDirectClaim   (records join the batch: noteAppended_)
+    //   DirectClaimOpen --abort / abandon--> NoDirectClaim (builder rolled back to `mark`)
+    // While open: every other append to the producer is ClaimHeld (trySubmit) or
+    // ABORTed (admitRecord_ - the deferred apply pass), and the partition is not
+    // flushed (encodeAndSend); failBuilder_ abandons it.
+    struct NoDirectClaim {};
+    struct DirectClaimOpen {
+        uint32_t                  slot       = 0;  ///< PartitionState::slotIndex
+        ProduceFrameBuilder::Mark mark{};          ///< the builder before the reservation
+        int32_t                   firstIndex = 0;  ///< offsetDelta of the first reserved record
+        int32_t                   count      = 0;  ///< 1 (tryClaim) or n (claimBatch)
+        uint8_t                   flags      = 0;  ///< kFlagWantAck for an acked tryClaim
+        uint64_t                  ackHandle  = 0;
+        uint64_t                  gen        = 0;  ///< the Claim's token
+    };
+    [[nodiscard]] bool directClaimOn_(const PartitionState& ps) const noexcept {
+        const auto* o = std::get_if<DirectClaimOpen>(&directClaim_);
+        return o != nullptr && o->slot == ps.slotIndex;
+    }
+    /// failBuilder_: the open claim on `ps` (if any) is rolled back and dropped.
+    void abandonDirectClaimOn_(PartitionState& ps) noexcept;
+    /// Owner-thread / closed / held / in-duty / deferred-ahead checks of a claim.
+    [[nodiscard]] SendResult directClaimGate_(int32_t topicId, int32_t partition) noexcept;
+    [[nodiscard]] ClaimGrant claimRecordDirect_(int32_t topicId, int32_t partition, const Key& key,
+                                                uint32_t valueLen, uint64_t ackHandle) noexcept;
+    [[nodiscard]] ClaimGrant claimBatchDirect_(int32_t topicId, int32_t partition, const Key& key, uint32_t n,
+                                               uint32_t recLen) noexcept;
+    [[nodiscard]] bool commitDirectClaim_(uint64_t gen) noexcept;
+    void abortDirectClaim_(uint64_t gen) noexcept;
+
     /// Double a partition's ack-ring, preserving live entries [ackTail, ackHead).
     /// Called only on overflow (deep single-partition pipeline); steady state
     /// never reallocs.
@@ -1504,6 +1540,12 @@ private:
     // Duty-cycle clock of the last drainRing()/flushBatches() (Direct appends
     // stamp batchStartNs with it — the clock is sampled per pass, never per send).
     int64_t     lastNowNs_ = 0;
+
+    // ---- Phase 2b B: Invoker claims (owner thread only) -----------------------
+    std::variant<NoDirectClaim, DirectClaimOpen> directClaim_{};
+    uint64_t              claimGen_        = 0;
+    uint64_t              claimsAbandoned_ = 0;
+    std::vector<uint32_t> claimOffsets_;  ///< Direct claimBatch value offsets (capacity persists)
 
     // ---- Task 14 fix1 C1: re-entrancy deferral (duty/owner thread only) -------
     // inDuty_ is set (RAII, nesting-safe) while this producer walks / resets its

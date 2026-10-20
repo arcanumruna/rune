@@ -243,6 +243,9 @@ enum class SendResult : uint8_t {
                     ///< with this producer's Client
     MessageTooLarge,///< backlog B6: key + value > Producer::kMaxRecordBytes (16 KiB) —
                     ///< rejected at append, never retryable (Kafka MESSAGE_TOO_LARGE)
+    ClaimHeld,      ///< Phase 2b B, Invoker mode: a claim on this producer is still open —
+                    ///< commit() or abort() it first.  Never retryable by waiting (the
+                    ///< blocking send() throws std::logic_error).
 };
 
 // ---------------------------------------------------------------------------
