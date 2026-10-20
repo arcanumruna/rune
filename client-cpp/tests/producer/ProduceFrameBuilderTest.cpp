@@ -10,6 +10,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstring>
 #include <random>
 #include <string>
 #include <vector>
@@ -121,4 +122,60 @@ TEST(ProduceFrameBuilder, SwapHandsTheFrameOverWithoutCopyingAndStartsEmpty) {
     EXPECT_EQ(fb.recordCount(), 0);
     EXPECT_EQ(fb.bodyBytes(), 0u);
     EXPECT_GE(fb.size(), ProduceFrameBuilder::kRecordsStart);
+}
+
+// Phase 2b Part B: an Invoker claim reserves a record in the frame and the caller
+// writes the value in place — the sealed frame must equal append()'s exactly.
+TEST(ProduceFrameBuilder, ReservedRecordFilledInPlaceIsByteIdenticalToAppend) {
+    std::mt19937_64 rng(0x2B0B);
+    for (int iter = 0; iter < 200; ++iter) {
+        const int64_t base = 1'700'000'000'000;
+        ProduceFrameBuilder a(0, base);
+        ProduceFrameBuilder b(0, base);
+        const int recs = 1 + static_cast<int>(rng() % 20);
+        for (int r = 0; r < recs; ++r) {
+            const std::string key = randomBytes(rng, rng() % 17);
+            const std::string val = randomBytes(rng, rng() % 3000);
+            const int64_t ts = base + static_cast<int64_t>(rng() % 100'000);
+            a.append(key, val, ts);
+            const std::size_t at = b.reserveRecord(key, val.size(), ts);
+            std::memcpy(b.data() + at, val.data(), val.size());
+        }
+        ASSERT_EQ(a.recordCount(), b.recordCount());
+        ASSERT_EQ(a.bodyBytes(), b.bodyBytes());
+        const rpc::Produce m = header(rng);
+        const std::size_t la = a.seal(m);
+        const std::size_t lb = b.seal(m);
+        ASSERT_EQ(std::vector<uint8_t>(a.data(), a.data() + la), std::vector<uint8_t>(b.data(), b.data() + lb))
+            << "iter " << iter;
+    }
+}
+
+TEST(ProduceFrameBuilder, RollbackRestoresTheExactFrameAndMaxTimestamp) {
+    ProduceFrameBuilder fb(0, 1000);
+    fb.append("k", "first", 1005);
+    const ProduceFrameBuilder::Mark m = fb.mark();
+    const std::vector<uint8_t> before(fb.data(), fb.data() + fb.size());
+    (void)fb.reserveRecord("k", 40, 9000);  // a later max timestamp
+    (void)fb.reserveRecord("k", 2, 9001);
+    EXPECT_EQ(fb.recordCount(), 3);
+    fb.rollback(m);
+    EXPECT_EQ(fb.recordCount(), 1);
+    EXPECT_EQ(std::vector<uint8_t>(fb.data(), fb.data() + fb.size()), before);
+    ProduceFrameBuilder ref(0, 1000);
+    ref.append("k", "first", 1005);
+    rpc::Produce msg{};
+    const std::size_t lf = fb.seal(msg);
+    const std::size_t lr = ref.seal(msg);
+    EXPECT_EQ(std::vector<uint8_t>(fb.data(), fb.data() + lf), std::vector<uint8_t>(ref.data(), ref.data() + lr))
+        << "maxTimestamp must roll back too";
+}
+
+TEST(ProduceFrameBuilder, ReserveExtraKeepsDataStableAcrossReservations) {
+    ProduceFrameBuilder fb(0, 0);
+    fb.reserveExtra(10 * (100 + ProduceFrameBuilder::kRecordOverheadMax));
+    const uint8_t* d = fb.data();
+    for (int i = 0; i < 10; ++i) (void)fb.reserveRecord("", 100, 0);
+    EXPECT_EQ(fb.data(), d) << "reservations inside reserveExtra() never reallocate";
+    EXPECT_EQ(fb.recordCount(), 10);
 }

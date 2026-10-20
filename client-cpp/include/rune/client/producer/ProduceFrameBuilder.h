@@ -45,6 +45,11 @@ public:
     static constexpr std::size_t kRecordsStart =
         kBatchStart + static_cast<std::size_t>(::rune::protocol::batch::kRecordBatchOverhead);
 
+    /// Upper bound of one record's framing bytes beyond key + value: length
+    /// varint (5) + attributes (1) + tsDelta varlong (10) + offsetDelta (5) +
+    /// keyLen (5) + valueLen (5) + headerCount (1).
+    static constexpr std::size_t kRecordOverheadMax = 32;
+
     ProduceFrameBuilder(int64_t baseOffset, int64_t baseTimestamp) { reset(baseOffset, baseTimestamp); }
 
     /// Empty batch; keeps frame() capacity (no per-batch allocation).
@@ -67,33 +72,40 @@ public:
     /// headerCount(0) — the exact bytes RecordBatchBuilder::append produces, but
     /// written once, without its reserve-and-memmove.
     void append(std::string_view key, std::string_view value, int64_t timestamp) {
-        using ::rune::protocol::writeVarint;
-        using ::rune::protocol::writeVarlong;
-        // [length varint | attrs | tsDelta | offsetDelta | keyLen] then key,
-        // [valueLen] value, headerCount — appended with no zero-fill pass.
-        uint8_t pre[48];
-        std::size_t n = 0;
-        pre[n++] = 0;  // attributes
-        n += writeVarlong(timestamp - baseTimestamp_, pre + n);
-        n += writeVarint(recordCount_, pre + n);
-        n += writeVarint(static_cast<int32_t>(key.size()), pre + n);
-        uint8_t vlen[10];
-        const std::size_t vn = writeVarint(static_cast<int32_t>(value.size()), vlen);
-        const std::size_t bodySize = n + key.size() + vn + value.size() + 1;  // +1 headerCount
-        uint8_t blen[10];
-        const std::size_t bn = writeVarint(static_cast<int32_t>(bodySize), blen);
-
-        const auto* k = reinterpret_cast<const uint8_t*>(key.data());
         const auto* v = reinterpret_cast<const uint8_t*>(value.data());
-        frame_.insert(frame_.end(), blen, blen + bn);
-        frame_.insert(frame_.end(), pre, pre + n);
-        frame_.insert(frame_.end(), k, k + key.size());
-        frame_.insert(frame_.end(), vlen, vlen + vn);
+        (void)writePrefix_(key, value.size(), timestamp);
         frame_.insert(frame_.end(), v, v + value.size());
         frame_.push_back(0);  // headerCount = varint(0)
+        noteRecord_(timestamp);
+    }
 
-        if (timestamp > maxTimestamp_) maxTimestamp_ = timestamp;
-        ++recordCount_;
+    /// Phase 2b Part B (Invoker claims): append one record whose `valueLen`
+    /// value bytes the caller writes later, in place, at data() + the returned
+    /// offset.  Byte-identical to append() once the value is written.  Call
+    /// reserveExtra() first when data() must not move (it then cannot throw).
+    std::size_t reserveRecord(std::string_view key, std::size_t valueLen, int64_t timestamp) {
+        const std::size_t at = writePrefix_(key, valueLen, timestamp);
+        frame_.resize(at + valueLen + 1);
+        frame_[at + valueLen] = 0;  // headerCount = varint(0)
+        noteRecord_(timestamp);
+        return at;
+    }
+
+    /// Capacity for `n` more bytes: appends / reservations within it never
+    /// reallocate (so they never throw and data() never moves).
+    void reserveExtra(std::size_t n) { frame_.reserve(frame_.size() + n); }
+
+    /// A point to roll back to (an aborted / abandoned claim).
+    struct Mark {
+        std::size_t size         = 0;
+        int32_t     recordCount  = 0;
+        int64_t     maxTimestamp = 0;
+    };
+    [[nodiscard]] Mark mark() const noexcept { return Mark{frame_.size(), recordCount_, maxTimestamp_}; }
+    void rollback(const Mark& m) noexcept {
+        frame_.resize(m.size);  // shrink only: never allocates
+        recordCount_  = m.recordCount;
+        maxTimestamp_ = m.maxTimestamp;
     }
 
     [[nodiscard]] int32_t recordCount() const noexcept { return recordCount_; }
@@ -151,6 +163,35 @@ public:
     }
 
 private:
+    /// [length varint | attrs | tsDelta | offsetDelta | keyLen | key | valueLen]
+    /// — the exact bytes RecordBatchBuilder::append produces before the value;
+    /// returns the frame offset where the value goes.
+    std::size_t writePrefix_(std::string_view key, std::size_t valueLen, int64_t timestamp) {
+        using ::rune::protocol::writeVarint;
+        using ::rune::protocol::writeVarlong;
+        uint8_t pre[48];
+        std::size_t n = 0;
+        pre[n++] = 0;  // attributes
+        n += writeVarlong(timestamp - baseTimestamp_, pre + n);
+        n += writeVarint(recordCount_, pre + n);
+        n += writeVarint(static_cast<int32_t>(key.size()), pre + n);
+        uint8_t vlen[10];
+        const std::size_t vn = writeVarint(static_cast<int32_t>(valueLen), vlen);
+        const std::size_t bodySize = n + key.size() + vn + valueLen + 1;  // +1 headerCount
+        uint8_t blen[10];
+        const std::size_t bn = writeVarint(static_cast<int32_t>(bodySize), blen);
+        const auto* k = reinterpret_cast<const uint8_t*>(key.data());
+        frame_.insert(frame_.end(), blen, blen + bn);
+        frame_.insert(frame_.end(), pre, pre + n);
+        frame_.insert(frame_.end(), k, k + key.size());
+        frame_.insert(frame_.end(), vlen, vlen + vn);
+        return frame_.size();
+    }
+    void noteRecord_(int64_t timestamp) noexcept {
+        if (timestamp > maxTimestamp_) maxTimestamp_ = timestamp;
+        ++recordCount_;
+    }
+
     static void putLE(uint8_t* p, uint64_t v, int bytes) noexcept {
         for (int i = 0; i < bytes; ++i) p[i] = static_cast<uint8_t>(v >> (8 * i));
     }
