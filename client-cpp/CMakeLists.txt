@@ -243,6 +243,9 @@ target_link_libraries(rune_ql PUBLIC rune_codec)
 target_compile_features(rune_ql PUBLIC cxx_std_23)
 
 # ── Phase 2b Part B: build-time generated all-fixed schemas (claim tests + bench) ──
+# tests/ is not in the example images (docker/Dockerfile.*.dockerignore): without the generator source the block is
+# skipped (it used to fail every image's configure - fix-on-sight, Phase 2b F Task 15).
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/support/GenClaimSchemas.cpp")
 add_executable(rune_gen_claim_schemas tests/support/GenClaimSchemas.cpp)
 target_link_libraries(rune_gen_claim_schemas PRIVATE rune_codec)
 set(RUNE_CLAIM_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/claim-gen")
@@ -251,7 +254,8 @@ set(RUNE_CLAIM_GEN_HEADERS
     "${RUNE_CLAIM_GEN_DIR}/gen/position.gen.h"
     "${RUNE_CLAIM_GEN_DIR}/gen/tick_sample.gen.h"
     "${RUNE_CLAIM_GEN_DIR}/gen/long_key.gen.h"
-    "${RUNE_CLAIM_GEN_DIR}/gen/short_key.gen.h")
+    "${RUNE_CLAIM_GEN_DIR}/gen/short_key.gen.h"
+    "${RUNE_CLAIM_GEN_DIR}/gen/eos_out.gen.h")
 add_custom_command(
     OUTPUT  ${RUNE_CLAIM_GEN_HEADERS}
     COMMAND $<TARGET_FILE:rune_gen_claim_schemas> "${RUNE_CLAIM_GEN_DIR}/gen"
@@ -259,6 +263,7 @@ add_custom_command(
     COMMENT "2b-B: generating position / tick_sample / long_key .gen.h (all-fixed flyweights)"
 )
 add_custom_target(generate_claim_schema_headers DEPENDS ${RUNE_CLAIM_GEN_HEADERS})
+endif()
 
 # ── rune_client — trivial header-only/interface library ──────────────────────
 add_library(rune_client INTERFACE)
@@ -703,6 +708,34 @@ if(BUILD_EXAMPLES AND aeron_FOUND)
         find_library(UUID_LIB_VIEW_PROBE uuid)
         if(UUID_LIB_VIEW_PROBE)
             target_link_libraries(view_probe PRIVATE ${UUID_LIB_VIEW_PROBE})
+        endif()
+    endif()
+
+    # ── Phase 2b F Task 15 — exactly-once pipeline probe (docker/eos-e2e.sh) ──
+    #
+    # eos_probe.cpp includes eos_out.gen.h (rune::gen::EosOut).  The e2e image has the header that
+    # `rune schema generate eos_out` writes from the broker's stored schema (-DEOS_GEN_DIR=<dir>: the fingerprint
+    # matches by construction); a tree build uses the header rune_gen_claim_schemas generates.
+    set(EOS_GEN_DIR "" CACHE PATH "Directory holding eos_out.gen.h for eos_probe (empty: the build-time generated one)")
+    if(EOS_GEN_DIR OR TARGET generate_claim_schema_headers)
+        add_executable(eos_probe examples/eos_probe.cpp)
+        if(EOS_GEN_DIR)
+            target_include_directories(eos_probe PRIVATE ${RUNE_PROTOCOL_INCLUDE} "${EOS_GEN_DIR}")
+        else()
+            add_dependencies(eos_probe generate_claim_schema_headers)
+            target_include_directories(eos_probe PRIVATE ${RUNE_PROTOCOL_INCLUDE} "${RUNE_CLAIM_GEN_DIR}/gen")
+        endif()
+        target_link_libraries(eos_probe PRIVATE
+            rune_client_api
+            rune_client_producer
+            rune_client_subscriber
+            rune_codec
+        )
+        if(UNIX AND NOT APPLE)
+            find_library(UUID_LIB_EOS_PROBE uuid)
+            if(UUID_LIB_EOS_PROBE)
+                target_link_libraries(eos_probe PRIVATE ${UUID_LIB_EOS_PROBE})
+            endif()
         endif()
     endif()
 

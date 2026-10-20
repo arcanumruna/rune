@@ -7,6 +7,8 @@
 //   tick_sample  seq UInt64, value Float64 (no key field)
 //   short_key    code string(8) KEY, v Int64 (a key send() can route)
 //   long_key     code string(20) KEY, v Int64 (a key send() cannot route)
+//   eos_out      id Int64 KEY, v Int64 (examples/eos_probe.cpp's local build; the e2e image uses the
+//                header `rune schema generate eos_out` writes from the broker's stored schema)
 #include <rune/codec/Descriptor.h>
 #include <rune/codec/Generator.h>
 
@@ -58,10 +60,15 @@ int main(int argc, char** argv) {
                               .addFixedStr("code", 8, 1, true)
                               .add("v", PrimType::Int64)
                               .build();
+    const auto eosOut = DescriptorBuilder("eos_out")
+                            .add("id", PrimType::Int64, 1, true)
+                            .add("v", PrimType::Int64)
+                            .build();
     const std::string dir = argv[1];
     return write(dir + "/position.gen.h", position) && write(dir + "/tick_sample.gen.h", tick) &&
                    write(dir + "/long_key.gen.h", longKey) &&
-                   write(dir + "/short_key.gen.h", shortKey)
+                   write(dir + "/short_key.gen.h", shortKey) &&
+                   write(dir + "/eos_out.gen.h", eosOut)
                ? 0
                : 1;
 }

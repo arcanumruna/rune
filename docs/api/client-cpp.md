@@ -283,9 +283,8 @@ Register the group and its callbacks **before** `connectAndWait()`. Topic names 
 `isolation = IsolationLevel::ReadCommitted` reads only committed transactions. A group consumer ends with a
 `GroupFailReason` (`BrokerTooOld`, `RefusedByBroker`, `RetryBudgetExhausted`, `NotAuthorized`, `SessionRevoked`).
 
-At-most-once, at-least-once and exactly-once are choices of `Acks` and of when you commit: commit **before** handling for
-at-most-once, **after** for at-least-once, and consume, produce and commit the input offsets in one transaction for
-exactly-once.
+At-most-once, at-least-once and exactly-once are choices of `Acks` and of when you commit; see
+[Delivery guarantees](#delivery-guarantees).
 
 ## Transactions
 
@@ -313,9 +312,49 @@ try {
   producer needs `WRITE` on its transactional id.
 - A `ReadCommitted` consumer sees a transaction's records only after commit.
 - A transaction is a plain `Producer` created with `ProducerConfig::transactionalId`; every produce path (`send`, `trySend`,
-  Tier-2 batches, claims) takes part in it. The status getters (`state()`, `producerId()`, ...) work on the thread that created
-  the producer only. **Not yet in this tree:** `GroupConsumer::seekToCommitted()` is designed (see `broker/docs/superpowers/plans/`)
-  but is not in the headers; after an abort you re-create the consumer or reposition it with a new subscription.
+  Tier-2 batches, `tryClaim`, `claimBatch`, a typed claim through `openTopicAndWait<T>(name, producer)`) takes part in it.
+  Outside a transaction a transactional producer refuses every produce path with `SendResult::NotInTransaction`; on a plain
+  producer the lifecycle calls throw `std::logic_error` ("producer has no transactionalId"). `acks = None` is rejected.
+  The status getters (`state()`, `producerId()`, ...) work on the thread that created the producer only.
+- A newer producer with the same `transactionalId` fences the old one: its next operation fails and its state is
+  `FatalError`.
+- `ProducerConfig::tier2Slots` (default 64) is the pool of Tier-2 batch slots; with every slot in use `batch()` returns a
+  refused builder whose `send()` is `BackPressured`.
+
+### Exactly-once consume-transform-produce
+
+```cpp
+GroupConfig g;  g.autoCommit = false;                  // the offsets travel in the transaction
+GroupConsumer gc = client.subscribeGroup("economy", {"orders"}, g);
+// ... onRecords collects the records of one batch ...
+tp.beginTransaction();
+try {
+    for (auto& r : batch) tp.send(out, Key(r.id), transform(r));
+    tp.sendOffsetsToTransactionAndWait(offsets, "economy");   // next offset to read, per partition
+    tp.commitTransactionAndWait();
+} catch (const std::runtime_error&) {
+    if (tp.state() == TxnState::FatalError) return;           // fenced
+    tp.abortTransactionAndWait();
+    gc.seekToCommittedAndWait();                              // re-read the aborted batch, no restart
+}
+```
+
+`GroupConsumer::seekToCommitted()` / `seekToCommittedAndWait()` rewinds every assigned partition to its committed offset;
+`seek(partition, offset)` repositions one partition (`InvalidArgument` for an unassigned one). Records handed to `onRecords`
+before the rewind was applied stay delivered, so drop what you queued and accept only the next expected offset per
+partition. The runnable example is `client-cpp/examples/eos_probe.cpp`; `broker/docker/eos-e2e.sh` runs it on 3 brokers
+through coordinator and leader kills, injected aborts and a fenced zombie.
+
+## Delivery guarantees
+
+| You want | Producer | Consumer |
+|---|---|---|
+| At most once | `Acks::None`, or no retry of a failed send | commit **before** handling |
+| At least once | `Acks::Leader` / `Acks::All`; a retry never writes a record twice (the broker assigns every acked producer an id and sequences each partition, so a resend after a reconnect is deduplicated) | commit **after** handling |
+| Exactly once | `transactionalId`: outputs and consumed offsets commit atomically | `ReadCommitted` on the consumers of the outputs; `seekToCommitted()` after an abort |
+
+`Acks::All` is durable across a leader kill (the record is on a majority before the ack). A transaction that aborts leaves
+its records in the log, invisible to `ReadCommitted` readers.
 
 ## Typed topics and routing
 

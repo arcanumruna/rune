@@ -45,6 +45,40 @@ admin, and `rune security gen-cluster-key --out <path>`. The example binaries (`
 `rune_produce_subscribe` with `RUNE_MODE=ws` is the world-server-style producer / group consumer used by the broker's
 `docker/auth-e2e.sh`. See the broker repo's `docs/SECURITY.md`.
 
+## Transactions
+
+A transactional producer is a plain `Producer` created with `ProducerConfig::transactionalId`; every produce path (`send`,
+`trySend`, `batch()`, `tryClaim`, `claimBatch`, a typed claim) takes part. `TransactionalProducer` is removed.
+
+```cpp
+Producer tp = client.producer({.acks = Acks::All, .transactionalId = "trade-worker-1"});
+client.connectAndWait();
+tp.initTransactionsAndWait();
+tp.beginTransaction();
+tp.send(out, Key(uint64_t{1}), value);
+tp.sendOffsetsToTransactionAndWait(offsets, "economy");   // the consumer group's next offsets
+tp.commitTransactionAndWait();                            // outputs and offsets, atomically
+```
+
+- Outside a transaction a transactional producer refuses every produce path with `SendResult::NotInTransaction`; the
+  lifecycle calls on a plain producer throw `std::logic_error`. A newer producer with the same id fences the old one
+  (`TxnState::FatalError`).
+- After an abort, `GroupConsumer::seekToCommittedAndWait()` rewinds the consumer to its committed offsets without a restart
+  (`seek(partition, offset)` repositions one partition).
+- A producer without a `transactionalId` asks the broker for a producer id when it connects; a resend after a reconnect is
+  deduplicated.
+- `ProducerConfig::tier2Slots` sizes the pool of Tier-2 `batch()` slots (default 64).
+- The full API is in `docs/api/client-cpp.md`; `examples/eos_probe.cpp` is the end-to-end exactly-once loop that
+  `broker/docker/eos-e2e.sh` runs on 3 brokers.
+
+## Delivery guarantees
+
+| You want | Producer | Consumer |
+|---|---|---|
+| At most once | `Acks::None`, or no retry of a failed send | commit before handling |
+| At least once | `Acks::Leader` or `Acks::All` (a retry never writes a record twice) | commit after handling |
+| Exactly once | `transactionalId`: outputs and consumed offsets commit together | `ReadCommitted` readers; `seekToCommitted()` after an abort |
+
 ## Catalog DDL and history
 
 Topics exist only through DDL; the broker has no boot-topics setting. DDL is sent to any broker: a

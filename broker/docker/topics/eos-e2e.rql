@@ -1,0 +1,7 @@
+-- docker/topics/eos-e2e.rql: the topics of docker/eos-e2e.sh (run as the e2e user through rune-2).
+-- Ids in creation order on a fresh cluster: eos_in = 0, eos_out = 1.
+--   eos_in   plain; 8 partitions, rf 3; the fill step writes N 16-byte records {id u64 LE, v u64 LE}
+--   eos_out  typed ({id, v} keyed by id; the generated eos_out.gen.h is built by the script from the broker's
+--            stored schema); 8 partitions, rf 3; the pipeline writes {id, v * 2} in transactions
+topic eos_in partitions 8 replicas 3;
+topic eos_out { id int64, v int64 } partitions 8 replicas 3 key id;
