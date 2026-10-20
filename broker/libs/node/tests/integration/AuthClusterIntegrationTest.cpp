@@ -882,3 +882,40 @@ TEST(AuthClusterRegression, MatrixSliceOpByTimingByViaBrokerRegression) {
     }
     EXPECT_EQ(cells, 45);
 }
+
+// Issue #121 / #114 on THREE brokers: the last-admin guard is the leader's dry run over the replicated state, so a NEW
+// __security leader (the old one killed) refuses removing the last admin exactly as the old one would; and a user's
+// own password change sent through a FOLLOWER broker (redirected session there, its own login nonce) is proven per
+// session: unsigned it is refused, signed it applies and replicates.
+TEST(AuthClusterRegression, TheLastAdminGuardAndOwnChangeProofsHoldAcrossALeaderKillAdversarialRegression) {
+    AuthTrio t("lastadminkill");
+    t.start();
+    t.bootstrapAdmin();
+    t.createUser(1, "ws1", AuthTrio::kPw);
+    const int leader = settledSecurityLeader(t.cluster());
+    ASSERT_GT(leader, 0);
+    t.stopNode(leader);
+    ASSERT_TRUE(awaitSecurityLeader(t.cluster(), 60s)) << "a new __security leader";
+    const int survivor = leader % 3 + 1;
+    auto disable = [](AuthWireClient& w, const std::string& ch, int64_t sid) {
+        return w.alterPassword(ch, sid, "admin", pc::UserChangeKind::Disable);
+    };
+    const auto refused = t.ddl(survivor, disable);
+    EXPECT_EQ(refused.errorCode, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest)) << refused.detail;
+    EXPECT_NE(refused.detail.find("last enabled security admin"), std::string::npos) << refused.detail;
+    // ws1's own password change on the NEW leader (a follower answers Redirect before any check): unsigned it is
+    // refused, signed it applies, and both surviving brokers converge on it.
+    const int newLeader = settledSecurityLeader(t.cluster());
+    ASSERT_GT(newLeader, 0);
+    AuthTrio::Session s = t.login(newLeader, "ws1");
+    s.w->signOwnCredentialChanges(false);
+    const auto unsignedChange = s.w->alterPassword(t.channel(newLeader), s.sid, "ws1", pc::UserChangeKind::AddPassword, "ws1-extra-pw-123");
+    EXPECT_EQ(unsignedChange.errorCode, 45u) << unsignedChange.detail;
+    s.w->signOwnCredentialChanges(true);
+    const auto signedChange = s.w->alterPassword(t.channel(newLeader), s.sid, "ws1", pc::UserChangeKind::AddPassword, "ws1-extra-pw-123");
+    ASSERT_EQ(signedChange.errorCode, 0u) << signedChange.detail;
+    EXPECT_TRUE(t.awaitDigestsAgree(t.node(newLeader).securityViewForTest().appliedOffset, 30s)) << "both survivors applied it";
+    for (int id : {1, 2, 3})
+        if (t.cluster().running(id)) EXPECT_NO_THROW((void)t.login(id, "ws1", "ws1-extra-pw-123")) << "node " << id;
+    EXPECT_TRUE(t.cluster().running(survivor));
+}

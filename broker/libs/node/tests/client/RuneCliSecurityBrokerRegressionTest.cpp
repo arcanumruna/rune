@@ -18,6 +18,7 @@
 #include <vector>
 
 using namespace rune::node::test;
+namespace pc = rune::protocol::client;
 namespace fs = std::filesystem;
 
 namespace {
@@ -202,7 +203,7 @@ int userQl(AuthBroker& b, const std::string& user, const std::string& pwFile, co
 
 // Issue #121: the guard judges the EFFECTIVE admin, also when ADMIN comes through a role: dropping the role, revoking
 // it from the user, or revoking ADMIN from the role are each refused while that is the last enabled admin.
-TEST(AuthBootstrapWindowRegression, TheLastAdminThroughARoleIsGuardedTooRegression) {
+TEST(AuthBootstrapWindowRegression, TheLastAdminThroughARoleIsGuardedTooAdversarialRegression) {
     AuthBroker b("clilastrole");
     b.bootstrapAdmin(kNewPassword);
     std::string err;
@@ -238,4 +239,107 @@ TEST(AuthEnforcementRegression, ARealClientChangesItsOwnPasswordWithAProofRegres
     // Changing ANOTHER user's password still needs ADMIN, proof or not.
     EXPECT_NE(userQl(b, "ws1", ws1Pw, "alter user admin set password 'hijacked-password-1';", &err), 0);
     EXPECT_NE(err.find("ADMIN"), std::string::npos) << err;
+}
+
+// ── Adversarial: the bootstrap window (the area of #121) ────────────────────────────────────────────────────────────
+// Replays and races at the window: a captured bootstrap frame replayed after the window REOPENS is MAC-valid but
+// dedupes on its nonce - it creates no admin; two new bootstraps racing in the reopened window create exactly one.
+TEST(AuthBootstrapWindowRegression, AReplayedBootstrapCreatesNoAdminAndRacingBootstrapsCreateOneAdversarialRegression) {
+    AuthBroker b("clireplay");
+    AuthWireClient& w = b.wire();
+    const int64_t s0 = w.connect(b.channel());
+    ASSERT_GT(s0, 0);
+    const std::vector<uint8_t> captured = w.bootstrapBytes(s0, b.keyContents(), "admin", AuthBroker::kBootstrapPassword);
+    ASSERT_EQ(w.sendBootstrapBytes(b.channel(), s0, captured).errorCode, 0);
+    // The admin changes its one-time password and leaves for good (FORCE): the window reopens.
+    const int64_t s1 = w.connect(b.channel());
+    ASSERT_TRUE(w.login(b.channel(), s1, "admin", {AuthBroker::kBootstrapPassword, AuthBroker::kBootstrapPassword}).ok());
+    ASSERT_EQ(w.alterPassword(b.channel(), s1, "admin", pc::UserChangeKind::SetPassword, kNewPassword).errorCode, 0);
+    ASSERT_EQ(w.createUser(b.channel(), s1, "ws1", kWs1Password).errorCode, 0);
+    pc::SecurityDdl disable; disable.sessionId = s1; disable.kind = pc::SecurityOpKind::AlterUser; disable.name = "admin";
+    disable.change = pc::UserChangeKind::Disable; disable.flags = pc::kSecurityDdlFlagForce;
+    // The admin's own session is revoked by its DISABLE (SessionRevoked, no DdlResponse): do not wait out the deadline.
+    (void)w.securityDdl(b.channel(), disable, "ALTER USER admin DISABLE FORCE;", std::chrono::seconds{2});
+    ASSERT_TRUE(awaitNoSecurityAdmin(b));
+    const int64_t applied = b.node().securityViewForTest().appliedOffset;
+
+    // The replay: answered with its ORIGINAL result, nothing appended, no admin.
+    const int64_t s2 = w.connect(b.channel());
+    ASSERT_GT(s2, 0);
+    EXPECT_EQ(w.lastConnect()->authState, pc::AuthState::MustAuthenticate);
+    const auto replay = w.sendBootstrapBytes(b.channel(), s2, captured);
+    EXPECT_EQ(replay.errorCode, 0) << replay.detail;
+    EXPECT_EQ(b.node().securityViewForTest().appliedOffset, applied) << "the replay appended nothing";
+    EXPECT_FALSE(b.node().securityViewForTest().hasSecurityAdmin) << "and created no admin";
+
+    // Two fresh bootstraps back to back on two sessions: exactly one admin.
+    AuthWireClient& w2 = b.wire();
+    const int64_t sa = w.connect(b.channel()), sb = w2.connect(b.channel());
+    ASSERT_GT(sa, 0);
+    ASSERT_GT(sb, 0);
+    const auto fa = w.bootstrapBytes(sa, b.keyContents(), "rescueA", "rescue-otp-123456", 0x50);
+    const auto fb = w2.bootstrapBytes(sb, b.keyContents(), "rescueB", "rescue-otp-123456", 0x60);
+    std::thread other([&] { (void)w2.sendBootstrapBytes(b.channel(), sb, fb); });
+    (void)w.sendBootstrapBytes(b.channel(), sa, fa);
+    other.join();
+    EXPECT_TRUE(b.node().securityViewForTest().hasSecurityAdmin);
+    EXPECT_EQ(b.node().securityViewForTest().appliedOffset, applied + 1) << "one bootstrap event, not two";
+}
+
+// A reopened window survives a restart: the security log replays, a connect is still told MustAuthenticate and the
+// real client still logs in (a restart must not turn the cluster back into a "never bootstrapped" one).
+TEST(AuthBootstrapWindowRegression, AReopenedWindowSurvivesARestartAdversarialRegression) {
+    AuthBroker b("clireopenrestart");
+    b.bootstrapAdmin(kNewPassword);
+    std::string err;
+    ASSERT_EQ(adminQl(b, std::string("create user ws1 with password '") + kWs1Password + "';", &err), 0) << err;
+    (void)adminQl(b, "alter user admin disable force;", &err);
+    ASSERT_TRUE(awaitNoSecurityAdmin(b));
+    b.restart(/*reloginAdmin=*/false);
+    ASSERT_FALSE(b.node().securityViewForTest().hasSecurityAdmin);
+    AuthWireClient& w = b.wire();
+    ASSERT_GT(w.connect(b.channel()), 0);
+    EXPECT_EQ(w.lastConnect()->authState, pc::AuthState::MustAuthenticate);
+    auto ws1 = credentialedClient(b, "ws1", kWs1Password);
+    std::string connectErr;
+    try { ws1->connectAndWait(std::chrono::seconds(20)); } catch (const std::exception& e) { connectErr = e.what(); }
+    EXPECT_EQ(connectErr, "");
+    EXPECT_EQ(ws1->authStatus().kind, rune::client::AuthStatus::Kind::Authenticated);
+    ws1->closeImmediately();
+    // Wrong credentials in the reopened window are a plain failed login, not "no security admin yet".
+    auto wrong = credentialedClient(b, "ws1", "not-the-password-1");
+    try { wrong->connectAndWait(std::chrono::seconds(20)); connectErr.clear(); } catch (const std::exception& e) { connectErr = e.what(); }
+    EXPECT_NE(connectErr.find("AuthenticationFailed"), std::string::npos) << connectErr;
+    EXPECT_EQ(connectErr.find("no security admin"), std::string::npos) << connectErr;
+    wrong->closeImmediately();
+}
+
+// Two enabled admins disabling EACH OTHER at the same moment: the leader serializes security DDL (the next request is
+// judged only after the previous one applied), so exactly one succeeds and one admin always remains.
+TEST(AuthBootstrapWindowRegression, TwoAdminsDisablingEachOtherConcurrentlyLeaveOneAdversarialRegression) {
+    AuthBroker b("climutual");
+    b.bootstrapAdmin(kNewPassword);
+    std::string err;
+    ASSERT_EQ(adminQl(b, "create user admin2 with password 'admin2-password-1234';", &err), 0) << err;
+    ASSERT_EQ(adminQl(b, "grant admin on cluster to user admin2;", &err), 0) << err;
+    {
+        AuthWireClient& w1 = b.wire();
+        AuthWireClient& w2 = b.wire();
+        const int64_t s1 = w1.connect(b.channel()), s2 = w2.connect(b.channel());
+        ASSERT_TRUE(w1.login(b.channel(), s1, "admin", {kNewPassword, kNewPassword}).ok());
+        ASSERT_TRUE(w2.login(b.channel(), s2, "admin2", {"admin2-password-1234", "admin2-password-1234"}).ok());
+        // The loser's session is revoked by the winner's DISABLE (SessionRevoked, no DdlResponse): a short wait each.
+        auto disable = [&](AuthWireClient& w, int64_t sid, const char* who) {
+            pc::SecurityDdl m; m.sessionId = sid; m.kind = pc::SecurityOpKind::AlterUser; m.name = who;
+            m.change = pc::UserChangeKind::Disable;
+            return w.securityDdl(b.channel(), m, std::string("ALTER USER ") + who + " DISABLE;", std::chrono::seconds{3});
+        };
+        AuthWireClient::DdlAnswer a1, a2;
+        std::thread t2([&] { a2 = disable(w2, s2, "admin"); });
+        a1 = disable(w1, s1, "admin2");
+        t2.join();
+        const int oks = (a1.errorCode == 0 ? 1 : 0) + (a2.errorCode == 0 ? 1 : 0);
+        EXPECT_LE(oks, 1) << a1.errorCode << " " << a1.detail << " / " << a2.errorCode << " " << a2.detail;
+        EXPECT_TRUE(b.node().securityViewForTest().hasSecurityAdmin) << "one admin always remains";
+    }
 }

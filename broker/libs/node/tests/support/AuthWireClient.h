@@ -233,6 +233,40 @@ public:
         return securityDdl(channel, m, "GRANT ROLE " + role + " TO " + user + ";");
     }
 
+    /// The encoded SecurityBootstrap `bootstrap` would send (a test keeps the bytes to replay them later).
+    std::vector<uint8_t> bootstrapBytes(int64_t sid, const std::string& keyFileContents, const std::string& adminName,
+                                        const std::string& oneTimePassword, uint8_t seed = 0x40) {
+        const Verifier v = verifierOf(oneTimePassword);
+        pc::SecurityBootstrap m;
+        m.sessionId = sid; m.correlationId = cl_.nextCorrelationId(); m.adminName = adminName; m.verifier = v.wire();
+        for (std::size_t i = 0; i < m.fakeSaltSeed.size(); ++i) m.fakeSaltSeed[i] = static_cast<uint8_t>(seed + i);
+        rune::crypto::randomBytes(std::span<uint8_t>(m.nonce.data(), m.nonce.size()));
+        const auto key = rune::crypto::deriveClusterKey(std::span<const uint8_t>(
+            reinterpret_cast<const uint8_t*>(keyFileContents.data()), keyFileContents.size()));
+        std::vector<uint8_t> input;
+        pc::bootstrapMacInput(m, input);
+        rune::crypto::DigestBytes mac;
+        if (!key || !rune::crypto::hmac(rune::crypto::Digest::Sha512, key->master, input, mac)) return {};
+        std::memcpy(m.mac.data(), mac.bytes.data(), m.mac.size());
+        std::vector<uint8_t> b(m.encodedSize());
+        b.resize(m.encode(b.data()));
+        return b;
+    }
+    /// Send encoded bootstrap bytes on `sid` (its session id and a fresh correlation id are stamped in); the answer.
+    DdlAnswer sendBootstrapBytes(const std::string& channel, int64_t sid, std::vector<uint8_t> b) {
+        if (b.size() < pc::MessageHeader::ENCODED_SIZE) return {0xFFFF, 0, 0, -1, "no frame"};
+        const int64_t corr = cl_.nextCorrelationId();
+        pc::detail::putLE64(b.data(), 8, sid);
+        pc::detail::putLE64(b.data(), 16, corr);
+        const auto deadline = Clock::now() + std::chrono::seconds{30};
+        if (!cl_.send(channel, kClientStream, b.data(), b.size(), deadline)) return {0xFFFF, 0, 0, -1, "send failed"};
+        const auto a = cl_.awaitAnyDdlAnswer(corr, deadline);
+        if (!a) return {0xFFFF, 0, 0, -1, "no answer"};
+        if (a->responseTemplate == static_cast<uint16_t>(pc::TemplateId::DdlResponse))
+            if (auto d = cl_.awaitDdl(corr, deadline)) return *d;
+        return {static_cast<uint16_t>(a->code), 0, 0, -1, a->message};
+    }
+
     /// SecurityBootstrap with a MAC under the cluster key file's contents (D4).  The answer is a DdlResponse.
     DdlAnswer bootstrap(const std::string& channel, int64_t sid, const std::string& keyFileContents,
                         const std::string& adminName, const std::string& oneTimePassword, uint8_t seed = 0x40) {

@@ -334,3 +334,130 @@ TEST(AuthEnforcementRegression, ObjectsThatExistedAtBootAreCoveredAfterARestartR
     const int64_t viewReader = [&] { r.broker().createUser("vr", AuthRig::kPw, {exact(SO::Read, ST::View, "board")}); return r.login("vr"); }();
     EXPECT_NE(r.getViewRow(viewReader, r.board), kNotAuthorized) << "a boot view sink is typed as a VIEW";
 }
+
+// ── Adversarial: DefineTopic on existing names (the area of #129) ───────────────────────────────────────────────────
+// A CREATE-only user (CREATE ON CLUSTER: every name) cannot reach a live object's schema through any spelling: the
+// same name with no descriptor, a malformed descriptor, a transient define over the disk topic, a name that differs
+// only in case, a view's name - and after a restart (objects known at boot).  None of them changes the schema.
+TEST(AuthEnforcementRegression, ACreateOnlyUserReachesNoLiveSchemaThroughAnyNameFormAdversarialRegression) {
+    AuthRig r;
+    ASSERT_GE(r.defineTopic(r.builder, "world.chat", /*typed=*/false), 0);
+    auto version = [&] {
+        const auto a = r.c().awaitSchema(r.c().sendGetTopicSchema(r.ch(), r.stream(), r.builder, "world.chat"), AuthRig::dl());
+        return a ? static_cast<int>(a->version) : kNoAnswer;
+    };
+    const int before = version();
+    std::string name;
+    int64_t creator = r.newUser({cluster(SO::Create)}, &name);
+    auto define = [&](const std::string& n, std::vector<uint8_t> blob, uint8_t persistence = 0) {
+        return r.ddlCode(r.c().sendDefineTopic(r.ch(), r.stream(), creator, n, 1, blob, persistence));
+    };
+    const int kExists = static_cast<int>(pc::ErrorCode::TopicExists);
+    const int kInvalidSchema = static_cast<int>(pc::ErrorCode::InvalidSchema);
+    EXPECT_EQ(define("world.chat", authRigCharBlob()), kNotAuthorized);
+    EXPECT_EQ(define("world.chat", {}), kExists) << "no descriptor: nothing to adopt";
+    EXPECT_EQ(define("world.chat", {0xFF, 0x00, 0x13}), kInvalidSchema) << "a malformed descriptor never reaches adoption";
+    EXPECT_EQ(define("world.chat", authRigCharBlob(), /*transient=*/1), kNotAuthorized);
+    EXPECT_EQ(define("World.Chat", authRigCharBlob()), kExists) << "a fold-equal name is a collision, not the topic";
+    EXPECT_EQ(define("board", authRigCharBlob()), kExists) << "a view's name";
+    EXPECT_EQ(version(), before);
+    r.restart();
+    creator = r.login(name);
+    EXPECT_EQ(define("world.chat", authRigCharBlob()), kNotAuthorized) << "after a restart";
+    EXPECT_EQ(version(), before);
+}
+
+// A CREATE-only user's typed define racing the builder's untyped define of the same new name: whichever lands
+// first, the creator never ends up having ADOPTED a schema onto the builder's topic (both cannot succeed).
+TEST(AuthEnforcementRegression, ARacingCreateNeverAdoptsAdversarialRegression) {
+    AuthRig r;
+    const int64_t creator = r.newUser({prefix(SO::Create, ST::Topic, "race.")});
+    for (int i = 0; i < 6; ++i) {
+        const std::string n = "race.t" + std::to_string(i);
+        const int64_t cb = r.c().sendDefineTopic(r.ch(), r.stream(), r.builder, n, 1, std::vector<uint8_t>{});
+        const int64_t cc = r.c().sendDefineTopic(r.ch(), r.stream(), creator, n, 1, authRigCharBlob());
+        const int builderCode = r.ddlCode(cb), creatorCode = r.ddlCode(cc);
+        EXPECT_FALSE(builderCode == 0 && creatorCode == 0) << n << ": the creator adopted the builder's topic";
+        EXPECT_TRUE((builderCode == 0 && creatorCode == kNotAuthorized) ||
+                    (creatorCode == 0 && builderCode == static_cast<int>(pc::ErrorCode::TopicExists)))
+            << n << " builder " << builderCode << " creator " << creatorCode;
+    }
+}
+
+// ── Adversarial: a user's own credential change (the area of #114) ───────────────────────────────────────────────
+// The exact signed frame replayed (same request id, same bytes) applies once: the leader dedupes it.
+TEST(AuthEnforcementRegression, AReplayedSignedOwnChangeAppliesOnceAdversarialRegression) {
+    AuthRig r;
+    std::string name;
+    const int64_t self = r.newUser({}, &name);
+    const AuthWireClient::Verifier v = AuthWireClient::verifierOf("replayed-password-1");
+    pc::SecurityDdl m; m.sessionId = self; m.kind = pc::SecurityOpKind::AlterUser; m.name = name;
+    m.change = pc::UserChangeKind::AddPassword; m.verifier = v.wire();
+    r.wire().pinRequestId(rune::protocol::RequestId{0x5151, 0x7777});
+    const auto first = r.wire().securityDdl(r.ch(), m, "ALTER USER " + name + " ADD PASSWORD '<redacted>';");
+    ASSERT_EQ(first.errorCode, 0u) << first.detail;
+    const int64_t applied = r.broker().node().securityViewForTest().appliedOffset;
+    const auto again = r.wire().securityDdl(r.ch(), m, "ALTER USER " + name + " ADD PASSWORD '<redacted>';");
+    r.wire().pinRequestId(std::nullopt);
+    EXPECT_EQ(again.errorCode, 0u) << "the original result: " << again.detail;
+    EXPECT_EQ(r.broker().node().securityViewForTest().appliedOffset, applied) << "applied once";
+    EXPECT_TRUE(r.broker().wire().connectAndLogin(r.ch(), name, "replayed-password-1").ok());
+}
+
+// The proof is of a CURRENT password: once the password a session logged in with is gone (an admin dropped it), that
+// session can no longer change its own credential - a new login with a current password can.
+TEST(AuthEnforcementRegression, AnOwnChangeProvenWithADroppedPasswordIsRefusedAdversarialRegression) {
+    AuthRig r;
+    std::string name;
+    const int64_t oldSession = r.newUser({}, &name);   // logged in with AuthRig::kPw
+    r.broker().addPassword(name, "the-newer-password-1");
+    r.broker().dropOldestPassword(name);               // kPw is gone
+    const auto refused = r.wire().alterPassword(r.ch(), oldSession, name, pc::UserChangeKind::AddPassword, "third-password-123");
+    EXPECT_EQ(refused.errorCode, 45u) << refused.detail;
+    const int64_t fresh = r.login(name, "the-newer-password-1");
+    EXPECT_EQ(r.wire().alterPassword(r.ch(), fresh, name, pc::UserChangeKind::AddPassword, "third-password-123").errorCode, 0u);
+}
+
+// Across a restart: the old session is gone with its login nonce; the new login's proof works, and a proof made for
+// the OLD session's nonce does not carry over (the session id it named no longer exists, and a new session has a new
+// nonce).
+TEST(AuthEnforcementRegression, OwnChangesAcrossARestartNeedTheNewLoginAdversarialRegression) {
+    AuthRig r;
+    std::string name;
+    (void)r.newUser({}, &name);
+    r.restart();
+    const int64_t s = r.login(name);
+    EXPECT_EQ(r.wire().alterPassword(r.ch(), s, name, pc::UserChangeKind::AddPassword, "after-restart-pw-1").errorCode, 0u);
+    r.wire().signOwnCredentialChanges(false);
+    EXPECT_EQ(r.wire().alterPassword(r.ch(), s, name, pc::UserChangeKind::SetPassword, "unsigned-pw-12345").errorCode, 45u);
+}
+
+// ALTER revoked while the session is open: the gateway's verdict follows the live permission table, so the very next
+// adoption attempt is refused - granted again, it applies.
+TEST(AuthEnforcementRegression, AdoptionFollowsAnAlterRevokedMidSessionAdversarialRegression) {
+    AuthRig r;
+    ASSERT_GE(r.defineTopic(r.builder, "live.t", /*typed=*/false), 0);
+    std::string name;
+    const int64_t s = r.newUser({prefix(SO::Create, ST::Topic, "live."), exact(SO::Alter, ST::Topic, "live.t")}, &name);
+    const auto revoked = r.broker().admin().revoke(r.ch(), r.broker().adminSession(), name, false, SO::Alter, ST::Topic,
+                                                  rune::protocol::SecurityPatternKind::Exact, "live.t");
+    ASSERT_EQ(revoked.errorCode, 0u) << revoked.detail;
+    EXPECT_EQ(r.defineTopicCode(s, "live.t"), kNotAuthorized) << "ALTER revoked mid-session";
+    const auto granted = r.broker().admin().grant(r.ch(), r.broker().adminSession(), name, false, SO::Alter, ST::Topic,
+                                                 rune::protocol::SecurityPatternKind::Exact, "live.t");
+    ASSERT_EQ(granted.errorCode, 0u) << granted.detail;
+    EXPECT_EQ(r.defineTopicCode(s, "live.t"), 0) << "granted again";
+}
+
+// Input bounds on the adoption path: a 249-byte topic name (the maximum) - the NotAuthorized detail the gateway hands
+// the admin thread fits the admin ring and the refusal is the same; with ALTER it adopts.
+TEST(AuthEnforcementRegression, AdoptionOfAMaxLengthNameIsGuardedAdversarialRegression) {
+    AuthRig r;
+    const std::string longName = "m." + std::string(247, 'n');
+    ASSERT_EQ(longName.size(), 249u);
+    ASSERT_GE(r.defineTopic(r.builder, longName, /*typed=*/false), 0);
+    const int64_t creator = r.newUser({prefix(SO::Create, ST::Topic, "m.")});
+    const int64_t alterer = r.newUser({prefix(SO::Create, ST::Topic, "m."), prefix(SO::Alter, ST::Topic, "m.")});
+    EXPECT_EQ(r.defineTopicCode(creator, longName), kNotAuthorized);
+    EXPECT_EQ(r.defineTopicCode(alterer, longName), 0);
+}

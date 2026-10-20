@@ -143,8 +143,9 @@ public:
     /// Stop the broker and start it again over the SAME data dir (the catalog and the security log replay at boot);
     /// the admin session is logged in again (the bootstrap and the password change persisted).  Every wire() obtained
     /// before is gone (its sessions died with the broker).
-    void restart() {
-        const bool hadAdmin = admin_ != nullptr;
+    /// `reloginAdmin` false: the admin may no longer log in (disabled / dropped) - nobody is logged in afterwards.
+    void restart(bool reloginAdmin = true) {
+        const bool hadAdmin = admin_ != nullptr && reloginAdmin;
         admin_ = nullptr;
         adminSid_ = 0;
         wires_.clear();

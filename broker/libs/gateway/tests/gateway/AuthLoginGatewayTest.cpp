@@ -552,3 +552,179 @@ TEST(AuthLoginRegression, OwnCredentialChangeNeedsAProofBoundToTheSessionRegress
     rig.send(alterUserFrame(a.sid, ++corr, "ws1", pc::UserChangeKind::DropPassword, &a));
     EXPECT_EQ(rig.admin.securityDdls, 3);
 }
+
+// ── Adversarial: the SCRAM login legs and the throttle (the area of #130) ───────────────────────────────────────────
+namespace {
+struct FirstLeg { int64_t sid = 0, corr = 0; std::string nonce; std::optional<pc::AuthServerFirst> first; std::vector<uint8_t> bytes; };
+FirstLeg sendFirst(Rig& rig, const std::string& user, const std::string& host = "10.0.0.9", int64_t now = 0) {
+    FirstLeg f;
+    f.sid = rig.newSession(host, now);
+    f.nonce = "adv-" + std::to_string(++rig.corr);
+    pc::AuthClientFirst cf;
+    cf.sessionId = f.sid; cf.correlationId = ++rig.corr; cf.username = user; cf.clientNonce = f.nonce;
+    f.corr = cf.correlationId;
+    std::vector<uint8_t> b(cf.encodedSize()); b.resize(cf.encode(b.data()));
+    rig.send(b);
+    if (const Frame* sf = rig.last(static_cast<uint16_t>(pc::TemplateId::AuthServerFirst), f.sid)) {
+        f.bytes = sf->bytes;
+        f.first = pc::AuthServerFirst::decode(f.bytes.data(), f.bytes.size());
+    }
+    return f;
+}
+std::vector<uint8_t> finalFor(const FirstLeg& f, const std::string& user, const std::array<std::string, 2>& pws, uint8_t count = 0) {
+    auto ans = scramAnswer(user, f.nonce, *f.first, pws, f.sid, f.corr, count);
+    std::vector<uint8_t> b(ans->final.encodedSize()); b.resize(ans->final.encode(b.data()));
+    return b;
+}
+std::optional<pc::AuthServerFinal> lastFinal(const Rig& rig, int64_t sid) {
+    const Frame* f = rig.last(static_cast<uint16_t>(pc::TemplateId::AuthServerFinal), sid);
+    if (f == nullptr) return std::nullopt;
+    return pc::AuthServerFinal::decode(f->bytes.data(), f->bytes.size());
+}
+}  // namespace
+
+// Out of order, replayed, malformed, oversize and late login legs: each is answered and ends the exchange; a session
+// never authenticates off another session's final or a replay, and an authenticated session is not disturbed by one.
+TEST(AuthLoginRegression, LoginLegsRefuseOutOfOrderReplayedMalformedAndLateFramesAdversarialRegression) {
+    Rig rig;
+    // A final before any first leg: the gate ends the session.
+    {
+        const int64_t sid = rig.newSession();
+        pc::AuthClientFinal fin; fin.sessionId = sid; fin.correlationId = 5; fin.count = 2;
+        std::vector<uint8_t> b(fin.encodedSize()); b.resize(fin.encode(b.data()));
+        rig.send(b);
+        EXPECT_FALSE(rig.gw.hasSessionForTest(sid)) << "AuthClientFinal in AwaitingFirst";
+    }
+    // A second first leg while the final is owed: ended too.
+    {
+        const FirstLeg f = sendFirst(rig, "ws1");
+        ASSERT_TRUE(f.first.has_value());
+        pc::AuthClientFirst again; again.sessionId = f.sid; again.correlationId = 6; again.username = "ws1"; again.clientNonce = "x";
+        std::vector<uint8_t> b(again.encodedSize()); b.resize(again.encode(b.data()));
+        rig.send(b);
+        EXPECT_FALSE(rig.gw.hasSessionForTest(f.sid)) << "AuthClientFirst in AwaitingFinal";
+    }
+    // One proof where two salts were listed, and a truncated final: failed logins, sessions ended.
+    for (const bool truncate : {false, true}) {
+        const FirstLeg f = sendFirst(rig, "ws1");
+        ASSERT_TRUE(f.first.has_value());
+        std::vector<uint8_t> b = finalFor(f, "ws1", {kTestPasswordA, ""}, truncate ? 0 : 1);
+        if (truncate) b.pop_back();
+        rig.send(b);
+        const auto fin = lastFinal(rig, f.sid);
+        ASSERT_TRUE(fin.has_value()) << truncate;
+        EXPECT_EQ(fin->errorCode, static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed)) << truncate;
+        EXPECT_FALSE(rig.gw.hasSessionForTest(f.sid)) << truncate;
+    }
+    // A username over 128 bytes is refused at the first leg, before any salt.
+    {
+        const FirstLeg f = sendFirst(rig, std::string(129, 'u'));
+        EXPECT_FALSE(f.first.has_value());
+        EXPECT_FALSE(rig.gw.hasSessionForTest(f.sid));
+    }
+    // A valid final replayed on its own (now authenticated) session: answered, the session stays authenticated.
+    const FirstLeg okLeg = sendFirst(rig, "ws1");
+    ASSERT_TRUE(okLeg.first.has_value());
+    const std::vector<uint8_t> okFinal = finalFor(okLeg, "ws1", {kTestPasswordA, ""});
+    rig.send(okFinal);
+    ASSERT_EQ(lastFinal(rig, okLeg.sid)->errorCode, 0);
+    rig.send(okFinal);
+    EXPECT_EQ(lastFinal(rig, okLeg.sid)->errorCode, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest));
+    EXPECT_TRUE(std::holds_alternative<AuthAuthenticated>(*rig.gw.sessionAuthForTest(okLeg.sid)));
+    // ... and on ANOTHER session awaiting its final: its nonce differs, the proof fails.
+    {
+        const FirstLeg other = sendFirst(rig, "ws1");
+        ASSERT_TRUE(other.first.has_value());
+        std::vector<uint8_t> stolen = okFinal;
+        pc::detail::putLE64(stolen.data(), 8, other.sid);
+        rig.send(stolen);
+        const auto fin = lastFinal(rig, other.sid);
+        ASSERT_TRUE(fin.has_value());
+        EXPECT_EQ(fin->errorCode, static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed));
+        EXPECT_FALSE(rig.gw.hasSessionForTest(other.sid));
+    }
+    // A correct final after the session's deadline: failed (timeout), never authenticated.
+    {
+        rig.gw_now = 10'000'000'000; rig.gw.setNowNsForTest(rig.gw_now);
+        const FirstLeg late = sendFirst(rig, "ws2", "10.0.0.33", rig.gw_now);
+        ASSERT_TRUE(late.first.has_value());
+        rig.gw_now += 2'000'000'000; rig.gw.setNowNsForTest(rig.gw_now);
+        rig.send(finalFor(late, "ws2", {kTestPasswordA, ""}));
+        const auto fin = lastFinal(rig, late.sid);
+        ASSERT_TRUE(fin.has_value());
+        EXPECT_EQ(fin->errorCode, static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed));
+        EXPECT_TRUE(rig.logContains("reason=timeout"));
+    }
+}
+
+// The host key of the throttle also gates the FINAL leg: many users guessed in parallel from one host get the host's
+// 10 free failures plus the one that starts the delay - and while that delay runs, even a right password from that
+// host is refused (no proof verified), while the same user from another host is untouched.
+TEST(LoginThrottleRegression, TheHostKeyGatesParallelFinalsAcrossUsersAdversarialRegression) {
+    Rig rig;
+    constexpr int kUsers = 14;
+    std::vector<FirstLeg> legs;
+    for (int i = 0; i < kUsers; ++i) {
+        legs.push_back(sendFirst(rig, "guess" + std::to_string(i)));
+        ASSERT_TRUE(legs.back().first.has_value()) << i;
+    }
+    int verified = 0, limited = 0;
+    for (int i = 0; i < kUsers; ++i) {
+        rig.send(finalFor(legs[static_cast<std::size_t>(i)], "guess" + std::to_string(i), {"wrong", "wrong"}));
+        const auto fin = lastFinal(rig, legs[static_cast<std::size_t>(i)].sid);
+        ASSERT_TRUE(fin.has_value()) << i;
+        EXPECT_EQ(fin->errorCode, static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed));
+        if (fin->retryAfterMs > 0) ++limited; else ++verified;
+    }
+    EXPECT_EQ(verified, 11) << "the host's 10 free failures + the one that starts its delay";
+    EXPECT_EQ(limited, kUsers - 11);
+    const FirstLeg sameHost = sendFirst(rig, "ws1");   // the first leg is refused already (the host is delayed)
+    EXPECT_FALSE(sameHost.first.has_value());
+    EXPECT_GT(lastFinal(rig, sameHost.sid)->retryAfterMs, 0u);
+    EXPECT_EQ(rig.login("ws1", {kTestPasswordA, ""}, "10.0.0.200").fin->errorCode, 0) << "another host is untouched";
+}
+
+// ── Adversarial: SecurityDdl from a non-admin session (the area of #114) ─────────────────────────────────────────
+// Every truncation of a signed own-credential change, and the frame with a byte appended, is answered and never
+// reaches the admin thread; the body cut exactly before its trailer decodes as an UNSIGNED change and is refused 45.
+TEST(AuthLoginRegression, ASignedOwnChangeTruncatedAtEveryOffsetIsNeverForwardedAdversarialRegression) {
+    Rig rig;
+    const auto a = rig.login("ws1", {kTestPasswordA, ""});
+    ASSERT_EQ(a.fin->errorCode, 0);
+    const std::vector<uint8_t> full = alterUserFrame(a.sid, 900, "ws1", pc::UserChangeKind::AddPassword, &a);
+    std::vector<std::vector<uint8_t>> bad;
+    for (std::size_t n = pc::MessageHeader::ENCODED_SIZE; n < full.size(); ++n) bad.emplace_back(full.begin(), full.begin() + n);
+    bad.push_back(full); bad.back().push_back(0x00);
+    for (const auto& b : bad) {
+        const std::size_t before = rig.seen.size();
+        rig.send(b);
+        bool answered = false;
+        for (std::size_t i = before; i < rig.seen.size(); ++i) answered |= rig.seen[i].corr == 900;
+        EXPECT_TRUE(answered) << "length " << b.size();
+        rig.gw_now += 60'000'000'000; rig.gw.setNowNsForTest(rig.gw_now);   // past any throttle delay
+    }
+    EXPECT_EQ(rig.admin.securityDdls, 0) << "nothing malformed or unsigned was forwarded";
+    EXPECT_TRUE(rig.gw.hasSessionForTest(a.sid)) << "an authenticated session survives a bad request";
+    rig.send(full);
+    EXPECT_EQ(rig.admin.securityDdls, 1) << "the intact frame still goes through";
+}
+
+// A valid proof does not make someone ELSE's credential the session's own: another user's name (or the same letters in
+// another case) still needs ADMIN, and a non-credential change of oneself (DISABLE) too.
+TEST(AuthLoginRegression, AValidProofNeverStandsInForAdminAdversarialRegression) {
+    Rig rig;
+    const auto a = rig.login("ws1", {kTestPasswordA, ""});
+    ASSERT_EQ(a.fin->errorCode, 0);
+    int64_t corr = 950;
+    for (const char* name : {"ws2", "WS1", "admin"}) {
+        rig.send(alterUserFrame(a.sid, ++corr, name, pc::UserChangeKind::SetPassword, &a));
+        const Frame* f = nullptr;
+        for (const Frame& x : rig.seen) if (x.corr == corr) f = &x;
+        ASSERT_NE(f, nullptr) << name;
+        const auto d = pc::DdlResponse::decode(f->bytes.data(), f->bytes.size());
+        EXPECT_EQ(d->errorCode, 45) << name;
+        EXPECT_EQ(d->detail, "not authorized: ADMIN on CLUSTER") << name;
+    }
+    rig.send(alterUserFrame(a.sid, ++corr, "ws1", pc::UserChangeKind::Disable, &a));
+    EXPECT_EQ(rig.admin.securityDdls, 0);
+}

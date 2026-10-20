@@ -149,7 +149,7 @@ struct OwnChange {
 
 // Issues #121 / #114: the optional SecurityDdl trailer (flags; a credential proof).  Absent = byte-identical to the
 // pre-trailer frame; every malformed trailer is refused, never half-read.
-TEST(AuthMessagesRegression, SecurityDdlTrailerRoundTripsAndRefusesMalformedTrailersRegression) {
+TEST(AuthMessagesRegression, SecurityDdlTrailerRoundTripsAndRefusesMalformedTrailersAdversarialRegression) {
     OwnChange c;
     const std::vector<uint8_t> plain = c.encode();
     ASSERT_FALSE(plain.empty());
