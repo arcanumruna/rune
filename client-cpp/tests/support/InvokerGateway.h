@@ -554,7 +554,8 @@ struct InvokerGateway {
         return n;
     }
     // TxnOffsetCommit entries received in the open transaction; EndTxn(commit) moves them to committedOffsets.
-    std::vector<std::tuple<int32_t, int32_t, int64_t>> pendingTxnOffsets;
+    /// Per producer id (one open transaction each): its staged (topicId, partition, offset) entries.
+    std::map<int64_t, std::vector<std::tuple<int32_t, int32_t, int64_t>>> pendingTxnOffsets;
     std::string lastTxnOffsetGroup;
     // ---- D6: UnknownProducerId (Kafka UNKNOWN_PRODUCER_ID) ----
     // The model answers a Produce with no producer entry and baseSequence != 0
@@ -1768,7 +1769,7 @@ private:
                 for (auto& b : log) {
                     if (b.fate == TxnFate::Open && b.producerId == rsp.producerId) b.fate = TxnFate::Aborted;
                 }
-                pendingTxnOffsets.clear();
+                pendingTxnOffsets.erase(rsp.producerId);   // only this id's staged offsets
             }
             std::vector<uint8_t> out(rp::InitProducerIdResponse::ENCODED_SIZE);
             const std::size_t n = rsp.encode(out.data());
@@ -1840,7 +1841,7 @@ private:
             lastTxnOffsetGroup.assign(oc->groupId.begin(), oc->groupId.end());
             std::vector<rp::TxnPartitionResult> results;
             for (const auto e : oc->entries) {
-                if (code == 0 && !resend) pendingTxnOffsets.emplace_back(e.topicId, e.partition, e.offset);
+                if (code == 0 && !resend) pendingTxnOffsets[oc->producerId].emplace_back(e.topicId, e.partition, e.offset);
                 results.push_back({e.topicId, e.partition, code});
             }
             if (!replyTxn) return;
@@ -1872,9 +1873,9 @@ private:
                     }
                 }
                 if (et->commit != 0) {
-                    for (const auto& [t, p, o] : pendingTxnOffsets) committedOffsets[{t, p}] = o;
+                    for (const auto& [t, p, o] : pendingTxnOffsets[et->producerId]) committedOffsets[{t, p}] = o;
                 }
-                pendingTxnOffsets.clear();
+                pendingTxnOffsets.erase(et->producerId);
             }
             if (!replyTxn) return;
             if (holdTxnReplies) { ++txnRequestsUnanswered; return; }

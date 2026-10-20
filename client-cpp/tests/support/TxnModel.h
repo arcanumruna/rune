@@ -18,8 +18,10 @@
 //   * 27 ConcurrentTransactions and 14 NotCoordinator are retried: no visible effect;
 //   * 18 ProducerFenced anywhere -> FatalError(Fenced); 19 InvalidTxnState on EndTxn(commit) -> FatalError(19);
 //     19 on a leg (AddPartitions / AddOffsets / TxnOffsetCommit) while the transaction is open or its commit is
-//     still waiting for data -> AbortableError(19): the commit fails 19, the app must abort; 19 on EndTxn(abort)
-//     is either "nothing was open" (abort Ok) or FatalError(19) - the completion says which;
+//     still waiting for data -> AbortableError(19): the commit fails 19, the app must abort; 19 on EndTxn(abort):
+//     if the client HEARD a leg answered OK in this transaction (it exists on the coordinator - Kafka
+//     transactionStarted) FatalError(19), else it was only possibly started and 19 means "nothing open": the abort
+//     is Ok (m15).  (EndTxn is never sent for a transaction no leg was even sent for.);
 //   * a commit completes Ok only if no failure reached the transaction: then every record of it is visible to a
 //     read_committed reader exactly once, every record token of it completed Ok, and the group's committed offset
 //     is the last one it sent; anything else leaves nothing visible;
@@ -132,6 +134,7 @@ public:
         ++txn;
         pending.clear();
         stagedOffset.reset();
+        startedHeard_ = false;
     }
 
     /// Invoker mode: a data op is accepted only on an open gate with the machine InTransaction; otherwise it is
@@ -210,6 +213,9 @@ public:
 
     // ---- the coordinator's decision on one request (the fake's log) ----
     void decision(Leg leg, int16_t code) {
+        if (code == 0 && (leg == Leg::AddPartitions || leg == Leg::AddOffsets || leg == Leg::TxnOffsetCommit)) {
+            startedHeard_ = true;   // the transaction exists on the coordinator (an OK leg the client heard)
+        }
         if (code == 0 || code == 27 || code == 14) return;   // applied / retried: nothing visible
         if (code == 18 || code == 17) {
             toFatal_(kFenced);
@@ -226,9 +232,9 @@ public:
                 toFatal_(kInvalidTxnState);
                 return;
             case Leg::EndTxnAbort:
-                // "Nothing was open" (Ok) or FatalError(19): the abort's completion decides.
+                // Started (an OK leg heard): FatalError(19).  Only possibly started: "nothing open" - the abort is Ok.
                 for (auto& [t, o] : outstanding) {
-                    if (o.kind == TokenKind::Abort && !o.refused) o.allowed = {kOk, kInvalidTxnState};
+                    if (o.kind == TokenKind::Abort && !o.refused) o.allowed = {startedHeard_ ? kInvalidTxnState : kOk};
                 }
                 return;
             }
@@ -335,6 +341,7 @@ private:
     std::map<uint32_t, std::vector<std::pair<Token, Result>>> dataDone_;   // completed record tokens per transaction
     std::set<uint32_t> committedTxns_;
     int joiners_ = 0;   // calls that joined the running commit / abort
+    bool startedHeard_ = false;   // an AddPartitions / AddOffsets / TxnOffsetCommit OK was heard in this transaction
     int flushes_ = 0;   // pending flushes
 
     /// Decided at issue (Invoker: the owner thread applied it): nothing later changes the outcome.

@@ -196,6 +196,10 @@ private:
     int64_t     nextOffset_    = 1;
     int         acceptedRecords_ = 0;
     bool        warm_          = false;     // the current producer finished its warm-up: op issues are measured
+    // A control-plane step (drop, reconnect, seekToCommitted: session establishment, rejoin, OffsetFetch): its passes
+    // are not measured.  Reset at every step.
+    bool        controlPlane_  = false;
+    long        measuredPasses_ = 0;
     long        measured_      = 0;
     bool        dead_          = false;     // the session is dropped (the gateway deaf, or mute)
     int         deadSteps_     = 0;
@@ -244,13 +248,38 @@ private:
     /// One pass, absorbed in causal order: the client's completions (they answer coordinator decisions of EARLIER
     /// passes - the gateway's answers are read by the next doWork), then the decisions the gateway takes now.
     int pass() {
-        int w = client_->doWork();
+        int  w      = 0;
+        long allocs = 0;
+        const bool measure = warm_ && !controlPlane_;
+        if (measure) {
+            // The duty cycle (AddPartitions hold / release, coordinator re-sends, EndTxn, BatchAcks, dedup answers) is
+            // measured too; only doWork() is in the window (the per-thread counter excludes the gateway's pump()).
+            allocs = window_([&] { w = client_->doWork(); });
+        } else {
+            w = client_->doWork();
+        }
         cq_->poll([&](const rc::Completion& c, std::span<const uint8_t>) { arrived_.push_back({c.token, {c.status, c.errorCode}}); ++w; });
         absorbCompletions_();
+        const int metaBefore = gw_->metadataRequests;
         w += gw_->pump();
         absorbDecisions_();
+        // Exempt (control plane): applying a cluster view - this doWork read the MetadataResponse the gateway gave in
+        // the previous pass (a NotCoordinator rediscovery; the metadata apply path builds its tables).  The pass that
+        // SENDS the request is measured (Task 13 fix round 1: it allocated; fixed).
+        const bool metaNow  = gw_->metadataRequests != metaBefore;
+        const bool metadata = metaLastPass_;
+        metaLastPass_ = metaNow;
+        if (measure) {
+            if (metadata) {
+                ++stats_["dutyPassMetadataExempt"];
+            } else {
+                ++measuredPasses_;
+                if (allocs != 0) fail("a duty cycle (doWork) allocated " + std::to_string(allocs) + " times after the warm-up");
+            }
+        }
         return w;
     }
+    bool metaLastPass_ = false;
     /// Run until the client and the gateway are both quiet (bounded).
     void settle() {
         int idle = 0;
@@ -421,6 +450,11 @@ private:
         ASSERT_TRUE(rawAwait_(t, ok));
         ASSERT_TRUE(ok);
         ASSERT_TRUE(drive([&] { return gw_->metadataRequests > 0; }));
+        // Aeron's client conductor creates its heartbeat counter handle once, on its first keepalive check after the
+        // driver published the counter (KEEPALIVE_TIMEOUT_MS = 500 ms): a one-time third-party allocation, run past
+        // here so the measured duty cycles never see it.
+        const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(1200);
+        while (std::chrono::steady_clock::now() < until) pass();
     }
     /// Waits for one token outside the model (connect / init); `ok` = completed Ok.
     bool rawAwait_(rc::Token t, bool& ok) {
@@ -501,6 +535,9 @@ private:
         // the broker unreachable - once while its AddPartitions is outstanding, once after it was added.
         ASSERT_NO_FATAL_FAILURE(backlog_(/*addedFirst=*/false));
         ASSERT_NO_FATAL_FAILURE(backlog_(/*addedFirst=*/true));
+        // In-flight slot buffers circulate with the builder's (ProduceFrameBuilder::swapFrameInto) and converge to
+        // its capacity one swap at a time: one batch per slot after the backlog's high-water mark warms every slot.
+        ASSERT_NO_FATAL_FAILURE(cycleSlots_());
         doCommit_();        // 19: no transaction
         doAbort_();         // 19
         doSendOffsets_();   // 19
@@ -508,6 +545,17 @@ private:
         ASSERT_TRUE(drive([&] { return model_.idle(); }));
         warm_ = true;
         note("producer epoch " + std::to_string(epoch_) + " warm");
+    }
+    void cycleSlots_() {
+        doBegin_();
+        for (int32_t part = 0; part < kPartitions; ++part) {
+            for (int i = 0; i < 16; ++i) {   // > maxInFlight: every in-flight slot of the partition carries a batch
+                (void)doData_(DataOp::TrySendAck, part);
+                ASSERT_TRUE(drive([&] { return acceptedCum_ == ackedCum_; })) << "a slot-cycling batch was never acknowledged";
+            }
+        }
+        doCommit_();
+        ASSERT_TRUE(drive([&] { return model_.state == txm::State::Ready && model_.idle(); })) << "the slot-cycling commit never completed";
     }
     void backlog_(bool addedFirst) {
         doBegin_();
@@ -527,6 +575,7 @@ private:
     /// After FatalError: every token of the fenced producer completes, then a new producer (same id) replaces it.
     void replaceProducer() {
         ++replacements_;
+        warm_ = false;   // closing the fenced producer and warming its replacement: not steady state
         note("replace the fenced producer (epoch " + std::to_string(epoch_) + ")");
         if (!drive([&] { return model_.idle(); }, std::chrono::seconds(5))) {
             fail("a token of the fenced producer never completed:" + model_.describeOutstanding());
@@ -710,6 +759,8 @@ private:
              (accepted ? " accepted" : got == Got::Refused ? " refused" : gaveUp ? " not taken (back-pressured, broker unreachable)" : " FAILED") + (attempts > 0 ? " after " + std::to_string(attempts) + " back-pressured tries" : "") +
              (what.empty() ? "" : " (" + what + ")") + " [" + txm::name(model_.state) + "]");
         if (got == Got::BackPressured && !gaveUp) fail(std::string(name(op)) + " stayed back-pressured for 1.5 s with the broker reachable");
+        // A closed gate (or a machine not InTransaction) refuses BEFORE any back-pressure check: never "not taken".
+        if (gaveUp && !expectAccept) fail(std::string(name(op)) + " answered BackPressured where the model refuses it");
         else if (got == Got::Other) fail(std::string(name(op)) + " failed: " + what);
         else if (!gaveUp && accepted != expectAccept) {
             fail(std::string(name(op)) + (expectAccept ? " was refused; the model: accepted" : " was accepted; the model: refused"));
@@ -775,6 +826,7 @@ private:
         }
     }
     void doSeek_() {
+        controlPlane_ = true;
         if (seekToken_ != 0) return;   // one rewind at a time
         seekToken_     = tok();
         seekDisturbed_ = dead_;
@@ -818,6 +870,7 @@ private:
         note("inject " + std::to_string(code) + " on the next coordinator answer");
     }
     void drop_() {
+        controlPlane_ = true;
         if (dead_) return;
         dead_      = true;
         deadSteps_ = 0;
@@ -835,6 +888,7 @@ private:
         }
     }
     void reconnect_() {
+        controlPlane_ = true;
         const int connects = gw_->connects;
         gw_->deadEndpoints.erase(0);
         gw_->holdTxnReplies = false;
@@ -915,6 +969,7 @@ public:
             }
             note("#" + std::to_string(step_));
             const auto t0 = std::chrono::steady_clock::now();
+            controlPlane_ = false;
             randomStep_();
             fatalSeen_ = false;
             settle();
@@ -942,9 +997,9 @@ public:
                 committedBatches += gw_->visibleBatches(p, Gw::TxnFate::Committed);
                 abortedBatches += gw_->visibleBatches(p, Gw::TxnFate::Aborted);
             }
-            std::printf("[seed %u] %d steps, %ld measured issues, %d replacements, %d epoch bumps, %zu committed / %zu aborted "
+            std::printf("[seed %u] %d steps, %ld measured issues, %ld measured duty passes, %d replacements, %d epoch bumps, %zu committed / %zu aborted "
                         "batches, %d frames re-sent dup;%s |%s\n",
-                        seed_, kSteps, measured_, replacements_, gw_->initPids - 1 - replacements_, committedBatches, abortedBatches,
+                        seed_, kSteps, measured_, measuredPasses_, replacements_, gw_->initPids - 1 - replacements_, committedBatches, abortedBatches,
                         gw_->windowDupAnswers, r.c_str(), s.c_str());
             for (const auto& l : log_) std::printf("    %s\n", l.c_str());
             return;

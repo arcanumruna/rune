@@ -705,9 +705,11 @@ TEST_P(ProducerTxnClientModes, MaxGroupIdAndMaxOffsetsFitTheControlBufferRegress
     ASSERT_TRUE(r.await(cq, 105));
     EXPECT_EQ(r.got[105].status, rc::OpStatus::Ok) << "errorCode " << r.got[105].errorCode;
     EXPECT_EQ(r.gw.lastTxnOffsetGroup, group);
-    ASSERT_EQ(r.gw.pendingTxnOffsets.size(), 1024u) << "every entry reached the coordinator, in order";
+    ASSERT_EQ(r.gw.pendingTxnOffsets.size(), 1u) << "one producer's staged offsets";
+    const auto& staged = r.gw.pendingTxnOffsets.begin()->second;
+    ASSERT_EQ(staged.size(), 1024u) << "every entry reached the coordinator, in order";
     for (std::size_t i = 0; i < offs.size(); ++i) {
-        EXPECT_EQ(std::get<2>(r.gw.pendingTxnOffsets[i]), 1000 + static_cast<int64_t>(i)) << i;
+        EXPECT_EQ(std::get<2>(staged[i]), 1000 + static_cast<int64_t>(i)) << i;
     }
     ASSERT_EQ(p.commitTransaction(cq, 106), rc::OpResult::Accepted);
     ASSERT_TRUE(r.await(cq, 106));
