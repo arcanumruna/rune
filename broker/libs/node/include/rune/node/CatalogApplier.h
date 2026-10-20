@@ -90,7 +90,9 @@ struct CatalogEffects {
     std::function<void(const SinkSpec&)>                                 sinkApplied;      // sink of Create/AlterView (F27)
     std::function<void(int32_t topicId, const std::string& name)>        topicDropped;     // DropTopic, retired sink
     std::function<void(int32_t topicId, std::span<const rune::catalog::ConfigChange>)> topicConfig;
-    std::function<void(const rune::catalog::TopicObject&)>               schemaChanged;    // validators fan-out
+    // Validators fan-out of versions fromVersion..current: live passes the current version (earlier ones were
+    // posted by earlier events), boot passes 1 (workers start empty).
+    std::function<void(const rune::catalog::TopicObject&, uint16_t fromVersion)> schemaChanged;
     std::function<void(const rune::catalog::ViewObject&)>                viewInstalled;    // recovery-ness = the phase (F4)
     std::function<void(int32_t viewTopicId)>                             viewUninstalled;
     std::function<void(int64_t offset, uint64_t digest)>                 applied;          // metric + tests
@@ -153,7 +155,7 @@ public:
     int replayLocal(rune::storage::Log& log, BootEffects boot);
     /// Task 16: the effects of the booted state that need a running broker,
     /// posted ONCE after the workers exist (the broker's boot sink builds the
-    /// topics itself): each typed topic's validator (schemaChanged), each live
+    /// topics itself): each typed topic's validators, every version (schemaChanged), each live
     /// view's sink gate (sinkApplied) + recovery install (viewInstalled), the
     /// `applied` metric, and — when the replay halted — the `halted` effect.
     void postBootStash(const CatalogEffects& sink) const;

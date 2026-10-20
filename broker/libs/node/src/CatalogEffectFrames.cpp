@@ -38,19 +38,26 @@ rune::protocol::TopicConfig sinkConfigOf(const cat::ViewObject& v) {
 std::size_t catalogEffectMaxFrame() noexcept { return static_cast<std::size_t>(kAdminToControlRingBytes) / 8; }
 
 std::vector<uint8_t> materializedDescriptorOf(const cat::TopicObject& t) {
+    return materializedDescriptorOf(t, t.schema->schemaVersion);
+}
+
+std::vector<uint8_t> materializedDescriptorOf(const cat::TopicObject& t, uint16_t version) {
     const cat::SchemaState& s = *t.schema;
     const rune::codec::Descriptor evolving =
         rune::codec::deserialize(std::span<const uint8_t>(s.evolvingBlob.data(), s.evolvingBlob.size()));
-    return rune::codec::serialize(rune::codec::materializeAsOf(evolving, s.schemaVersion));
+    return rune::codec::serialize(rune::codec::materializeAsOf(evolving, version));
 }
 
-std::optional<std::string> topicEffectFramesError(const cat::TopicObject& t, std::size_t maxFrame) {
+std::optional<std::string> topicEffectFramesError(const cat::TopicObject& t, std::size_t maxFrame,
+                                                  uint16_t fromVersion) {
     if (auto e = tooLarge("the TopicApplied effect", t.name, catalogTopicAppliedWireLen(t.name, t.config), maxFrame))
         return e;
     if (t.schema && t.schema->validate) {
         try {
-            const std::size_t n = schemaUpdateWireLen(materializedDescriptorOf(t).size());
-            if (auto e = tooLarge("the validator (SchemaUpdate) effect", t.name, n, maxFrame)) return e;
+            for (uint16_t v = fromVersion; v <= t.schema->schemaVersion; ++v) {
+                const std::size_t n = schemaUpdateWireLen(materializedDescriptorOf(t, v).size());
+                if (auto e = tooLarge("the validator (SchemaUpdate) effect", t.name, n, maxFrame)) return e;
+            }
         } catch (const std::exception& ex) {
             return "the schema of '" + t.name + "' does not materialize: " + ex.what();
         }
@@ -84,7 +91,7 @@ std::optional<std::string> eventEffectFramesError(const cat::CatalogState& after
     case cat::EventKind::AlterSchema:
     case cat::EventKind::SetCompatibility:
     case cat::EventKind::AlterTopicConfig:   // its frame is fixed-size (<= 6 keys); the topic's frames are checked
-        if (const cat::TopicObject* t = after.topicByObjectId(e.objectId)) return topicEffectFramesError(*t, maxFrame);
+        if (const cat::TopicObject* t = after.topicByObjectId(e.objectId)) return topicEffectFramesError(*t, maxFrame, t->schema ? t->schema->schemaVersion : uint16_t{1});
         return std::nullopt;
     case cat::EventKind::DropTopic:
     case cat::EventKind::DropView:

@@ -785,8 +785,9 @@ TEST(CatalogApplierRegression, LeaderDryRunRefusesAnEventWhoseEffectsCannotBePos
     }
 }
 
-// I1 — the coalesced boot sink: a history whose naive (per-event) effect volume
-// exceeds the ring + the initial backlog boots, posting the final state only.
+// I1 — the coalesced boot sink: a big history boots without halting, posting the FINAL state only (no
+// create/drop history).  Workers start empty, so boot posts every registered version's validator: the
+// volume is O(sum of versions), larger than the ring — the backlog grows and drains in order, never aborts.
 TEST(CatalogApplierRegression, CoalescedBootSurvivesAHistoryLargerThanTheBacklogRegression) {
     using namespace rune::node;
     gd::ScriptBuilder b;
@@ -802,7 +803,7 @@ TEST(CatalogApplierRegression, CoalescedBootSurvivesAHistoryLargerThanTheBacklog
         b.alterSchema("grow", {gd::addOp(f, rune::codec::PrimType::Int32)}, "ALTER TOPIC grow ADD ...");
     }
     const auto events = std::move(b).take();
-    // The naive volume: one validator frame per schema version.
+    // The naive volume: one validator frame per schema version (what the boot now posts).
     std::size_t naive = 0;
     {
         cat::CatalogState s;
@@ -820,11 +821,92 @@ TEST(CatalogApplierRegression, CoalescedBootSurvivesAHistoryLargerThanTheBacklog
     AdminWorkerAgent agent(rig.schemas, 1, AdminDeps{});
     // Nothing drains the ring during the boot replay (it runs before the admin thread).
     ASSERT_EQ(rig.applier.replayLocal(rig.replica(), agent.catalogBootEffects()), static_cast<int>(events.size()));
-    EXPECT_FALSE(rig.applier.halted());
-    EXPECT_EQ(agent.catalogBacklogForTest(), 0u) << "the final state fits the ring outright";
-    EXPECT_EQ(typesOf(drainFailureRing(agent)),
-              (std::vector<int32_t>{kA2cCatalogTopicApplied, kA2cSchemaUpdate, kA2cCatalogApplied}))
-        << "one topic, its current validator, one applied";
+    EXPECT_FALSE(rig.applier.halted()) << "a big history is a backlog, never a halt";
+    std::vector<Frame> frames;
+    for (int pass = 0; pass < 4000; ++pass) {
+        for (auto& f : drainFailureRing(agent)) frames.push_back(std::move(f));
+        if (agent.catalogBacklogForTest() == 0) break;
+        (void)agent.flushCatalogBacklogForTest();
+    }
+    for (auto& f : drainFailureRing(agent)) frames.push_back(std::move(f));
+    ASSERT_EQ(agent.catalogBacklogForTest(), 0u);
+    ASSERT_EQ(frames.size(), 403u) << "one topic, its 401 versions' validators, one applied";
+    EXPECT_EQ(frames.front().type, kA2cCatalogTopicApplied);
+    EXPECT_EQ(frames.back().type, kA2cCatalogApplied);
+    for (std::size_t i = 0; i < 401; ++i) {
+        ASSERT_EQ(frames[1 + i].type, kA2cSchemaUpdate) << i;
+        EXPECT_EQ(decodeSchemaUpdate(frames[1 + i].bytes.data(), frames[1 + i].bytes.size()).version, i + 1)
+            << "ascending versions";
+    }
+}
+
+// 5cc480fa made every ALTER re-post the whole history (quadratic).  A LIVE event posts exactly the version it
+// created or changed; BOOT (workers start empty) posts every registered version.
+TEST(CatalogApplierRegression, LiveAlterPostsOnlyTheNewVersionsValidatorRegression) {
+    using namespace rune::node;
+    gd::ScriptBuilder b;
+    {
+        cat::CreateTopicOps o;
+        o.schema = cat::SchemaDef{.keyField = "", .validate = true,
+                                  .descriptorBlob = wideDescriptor("vt", 4, 8, false), .nextTag = 4};
+        b.createTopic("vt", std::move(o), "CREATE TOPIC vt (...)");
+    }
+    for (int i = 0; i < 3; ++i)
+        b.alterSchema("vt", {gd::addOp("extra" + std::to_string(i), rune::codec::PrimType::Int32)}, "ALTER TOPIC vt ADD");
+    const auto events = std::move(b).take();
+
+    CatalogRig rig("ap_live_ver");
+    AdminWorkerAgent agent(rig.schemas, 1, AdminDeps{});
+    rig.restart();
+    ASSERT_EQ(rig.applier.replayLocal(rig.replica(), agent.catalogBootEffects()), 0);
+    ASSERT_TRUE(rig.applier.goLive(agent.catalogLiveEffects()));
+    for (const auto& e : events) rig.appendEventCommitted(e);
+    ASSERT_EQ(rig.applier.applyCommitted(rig.replica()), 4);
+    std::vector<uint16_t> live;
+    for (const auto& f : drainFailureRing(agent))
+        if (f.type == kA2cSchemaUpdate) live.push_back(decodeSchemaUpdate(f.bytes.data(), f.bytes.size()).version);
+    EXPECT_EQ(live, (std::vector<uint16_t>{1, 2, 3, 4})) << "exactly one validator per event, each its own version";
+
+    rig.restart();
+    AdminWorkerAgent agent2(rig.schemas, 1, AdminDeps{});
+    ASSERT_EQ(rig.applier.replayLocal(rig.replica(), agent2.catalogBootEffects()), 4);
+    std::vector<uint16_t> boot;
+    for (const auto& f : drainFailureRing(agent2))
+        if (f.type == kA2cSchemaUpdate) boot.push_back(decodeSchemaUpdate(f.bytes.data(), f.bytes.size()).version);
+    EXPECT_EQ(boot, (std::vector<uint16_t>{1, 2, 3, 4})) << "boot posts every registered version";
+}
+
+// Boot posts every version, so it sizes every version: an OLDER version can be larger than the current one (a
+// dropped field) and must fit the frame too.
+TEST(CatalogApplierRegression, TopicFramesSizeEveryVersionBootWillPostRegression) {
+    using namespace rune::node;
+    gd::ScriptBuilder b;
+    {
+        cat::CreateTopicOps o;
+        o.schema = cat::SchemaDef{.keyField = "", .validate = true,
+                                  .descriptorBlob = wideDescriptor("sh", 40, 40, false), .nextTag = 40};
+        b.createTopic("sh", std::move(o), "CREATE TOPIC sh (...)");
+    }
+    std::vector<rune::codec::AlterOp> drops;
+    for (int i = 0; i < 30; ++i) {
+        std::string f = "f" + std::to_string(i) + "_";
+        f.resize(40, 'x');
+        drops.push_back(gd::dropOp(f));
+    }
+    b.alterSchema("sh", std::move(drops), "ALTER TOPIC sh DROP ...");
+    const auto events = std::move(b).take();
+    cat::CatalogState s;
+    for (std::size_t i = 0; i < events.size(); ++i) ASSERT_TRUE(cat::apply(s, events[i], static_cast<int64_t>(i)).has_value());
+    const cat::TopicObject& t = *s.topicByName("sh");
+    ASSERT_EQ(t.schema->schemaVersion, 2);
+    const std::size_t v1 = schemaUpdateWireLen(materializedDescriptorOf(t, 1).size());
+    const std::size_t v2 = schemaUpdateWireLen(materializedDescriptorOf(t, 2).size());
+    ASSERT_GT(v1, v2) << "the dropped fields make the older version the larger frame";
+    const std::size_t cap = v1 - 1;
+    ASSERT_GE(cap, catalogTopicAppliedWireLen(t.name, t.config));
+    EXPECT_FALSE(topicEffectFramesError(t, cap, 2).has_value()) << "live posts the current version only: it fits";
+    EXPECT_TRUE(topicEffectFramesError(t, cap, 1).has_value()) << "boot posts version 1 too: it does not";
+    EXPECT_FALSE(topicEffectFramesError(t, v1, 1).has_value());
 }
 
 // I1 — the backlog never aborts: it grows (capacity kept) and drains in order.
@@ -1150,7 +1232,7 @@ TEST(CatalogApplierRegression, PostBootStashSkipsObjectsTheBootRefusedAsOversize
     std::vector<std::size_t> topicMin, viewMin;
     for (const auto* t : boot.state().topics()) {
         std::size_t cap = 1;
-        while (cap < (std::size_t{1} << 20) && rune::node::topicEffectFramesError(*t, cap)) ++cap;
+        while (cap < (std::size_t{1} << 20) && rune::node::topicEffectFramesError(*t, cap, 1)) ++cap;
         topicMin.push_back(cap);
         biggest = std::max(biggest, cap);
     }
@@ -1171,7 +1253,7 @@ TEST(CatalogApplierRegression, PostBootStashSkipsObjectsTheBootRefusedAsOversize
     fx.maxFrameBytes = cap;
     fx.sinkApplied    = [&](const rune::node::SinkSpec&) { ++sinks; };
     fx.viewInstalled  = [&](const cat::ViewObject&) { ++installs; };
-    fx.schemaChanged  = [&](const cat::TopicObject&) { ++validators; };
+    fx.schemaChanged  = [&](const cat::TopicObject&, uint16_t) { ++validators; };
     boot.postBootStash(fx);
     std::size_t typedFitting = 0;
     std::size_t i = 0;

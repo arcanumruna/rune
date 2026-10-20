@@ -29,11 +29,14 @@ namespace rune::node {
 /// validator fan-out / a view plan carries for a typed topic.  Throws on a blob
 /// that does not deserialize.
 [[nodiscard]] std::vector<uint8_t> materializedDescriptorOf(const rune::catalog::TopicObject& t);
+/// The same as of an earlier registered `version` (1..current).
+[[nodiscard]] std::vector<uint8_t> materializedDescriptorOf(const rune::catalog::TopicObject& t, uint16_t version);
 
-/// nullopt = every frame of a topic's final state fits `maxFrame` (TopicApplied +
-/// the validator when typed and validated); otherwise the reason.
+/// nullopt = every frame of a topic's effects fits `maxFrame` (TopicApplied + the validator of each version
+/// fromVersion..current when typed and validated); otherwise the reason.  Live sizes the current version
+/// only, boot sizes 1..current (an older version can be larger: a dropped field).
 [[nodiscard]] std::optional<std::string> topicEffectFramesError(const rune::catalog::TopicObject& t,
-                                                                std::size_t maxFrame);
+                                                                std::size_t maxFrame, uint16_t fromVersion);
 /// Same for a view's final state (its sink's TopicApplied + its ViewPlanUpdate,
 /// which carries the first source's materialized descriptor from `state`).
 [[nodiscard]] std::optional<std::string> viewEffectFramesError(const rune::catalog::ViewObject& v,

@@ -192,8 +192,8 @@ void CatalogApplier::postBootStash(const CatalogEffects& sink) const {
         // here too (the replay already halted on them).
         const std::size_t maxFrame = sink.maxFrameBytes;
         for (const cat::TopicObject* t : state_.topics()) {
-            if (maxFrame != 0 && topicEffectFramesError(*t, maxFrame)) continue;
-            if (t->schema && sink.schemaChanged) sink.schemaChanged(*t);
+            if (maxFrame != 0 && topicEffectFramesError(*t, maxFrame, 1)) continue;
+            if (t->schema && sink.schemaChanged) sink.schemaChanged(*t, 1);   // boot: every version
         }
         for (const cat::ViewObject* v : state_.views()) {
             if (maxFrame != 0 && viewEffectFramesError(*v, state_, maxFrame)) continue;
@@ -207,7 +207,7 @@ void CatalogApplier::postBootStash(const CatalogEffects& sink) const {
 
 // ─── emitFinalState_ — the coalesced boot effects (fix round 1, I1) ──────────
 // The FINAL state of every live object, never its history: no create/drop pair
-// for a dropped object, one validator per typed topic (its current version), one
+// for a dropped object, the validators of every registered version of a typed topic (workers start empty), one
 // install per live view, ONE `applied`.  Topics before views (a view's sink and
 // sources exist before its plan).  A frame that cannot fit is an explicit halt
 // (the other objects are still posted — the broker serves what it can).
@@ -224,9 +224,9 @@ void CatalogApplier::emitFinalState_() {
     };
     for (const cat::TopicObject* t : state_.topics()) {
         if (maxFrame != 0)
-            if (auto err = topicEffectFramesError(*t, maxFrame)) { refuse(std::move(*err)); continue; }
+            if (auto err = topicEffectFramesError(*t, maxFrame, 1)) { refuse(std::move(*err)); continue; }
         if (sink->topicApplied) sink->topicApplied(*t);
-        if (t->schema && sink->schemaChanged) sink->schemaChanged(*t);
+        if (t->schema && sink->schemaChanged) sink->schemaChanged(*t, 1);
     }
     for (const cat::ViewObject* v : state_.views()) {
         if (maxFrame != 0)
@@ -513,7 +513,7 @@ void CatalogApplier::effects_(const CatalogEffects& sink, const cat::CatalogEven
     case cat::EventKind::CreateTopic:
         if (const cat::TopicObject* t = state_.topicByObjectId(e.objectId)) {
             if (sink.topicApplied) sink.topicApplied(*t);
-            if (t->schema && sink.schemaChanged) sink.schemaChanged(*t);   // a typed topic's validators follow it
+            if (t->schema && sink.schemaChanged) sink.schemaChanged(*t, t->schema->schemaVersion);   // a typed topic's validator follows it
         }
         return;
     case cat::EventKind::DropTopic:
@@ -529,7 +529,8 @@ void CatalogApplier::effects_(const CatalogEffects& sink, const cat::CatalogEven
     case cat::EventKind::CreateSchema:
     case cat::EventKind::AlterSchema:
     case cat::EventKind::SetCompatibility:
-        if (const cat::TopicObject* t = state_.topicByObjectId(e.objectId); t && sink.schemaChanged) sink.schemaChanged(*t);
+        if (const cat::TopicObject* t = state_.topicByObjectId(e.objectId); t && t->schema && sink.schemaChanged)
+            sink.schemaChanged(*t, t->schema->schemaVersion);   // only the version this event created or changed
         return;
     case cat::EventKind::CreateView:
     case cat::EventKind::AlterView: {

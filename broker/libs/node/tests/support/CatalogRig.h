@@ -77,7 +77,7 @@ struct Recorder {
         e.topicConfig = [this](int32_t id, std::span<const rune::catalog::ConfigChange>) {
             sequence.push_back("topicConfig:" + std::to_string(id));
         };
-        e.schemaChanged = [this](const rune::catalog::TopicObject& t) {
+        e.schemaChanged = [this](const rune::catalog::TopicObject& t, uint16_t) {
             sequence.push_back("schemaChanged:" + std::to_string(t.topicId));
         };
         e.viewInstalled = [this, &viewInstalls](const rune::catalog::ViewObject& v) {
