@@ -114,7 +114,7 @@ TEST(RuneConsoleBrokerRegression, ScriptStopsAtTheFirstBrokerErrorWithItsCodeReg
         "topic never partitions 1;\n");
     const auto r = consoleLive(b, {"-f", f}, "");
     EXPECT_EQ(r.rc, static_cast<int>(rune::protocol::client::ErrorCode::SchemaIncompatible)) << r.err;
-    EXPECT_NE(r.err.find("statement 3: "), std::string::npos) << r.err;
+    EXPECT_NE(r.err.find(f + ":statement 3: "), std::string::npos) << r.err;
     for (const auto& e : b.catalogEvents()) EXPECT_NE(e.event.objectName, "never") << "nothing after the failure is issued";
 }
 
@@ -122,6 +122,18 @@ TEST(RuneConsoleBrokerRegression, ValidateAndExpectedVersionReachTheBrokerRegres
     OneBroker b("console_flags");
     const std::string f1 = writeFile("flags1.rql", "topic fv { id int64 } partitions 1 key id;\nalter topic fv add column a int32;\n");
     ASSERT_EQ(consoleLive(b, {"-f", f1, "--validate", "--expected-version", "1"}, "").rc, 0);
+    {   // --validate reached the broker: the CreateTopic carries validate = true (and a plain run does not)
+        const std::string f3 = writeFile("flags3.rql", "topic plain { id int64 } partitions 1 key id;\n");
+        ASSERT_EQ(consoleLive(b, {"-f", f3}, "").rc, 0);
+        bool sawFv = false, sawPlain = false;
+        for (const auto& e : b.catalogEvents()) {
+            const auto* c = std::get_if<rune::catalog::CreateTopicOps>(&e.event.ops);
+            if (c == nullptr || !c->schema) continue;
+            if (e.event.objectName == "fv") { sawFv = true; EXPECT_TRUE(c->schema->validate); }
+            if (e.event.objectName == "plain") { sawPlain = true; EXPECT_FALSE(c->schema->validate); }
+        }
+        EXPECT_TRUE(sawFv && sawPlain);
+    }
     const std::string f2 = writeFile("flags2.rql", "alter topic fv add column b int32;\n");
     const auto r = consoleLive(b, {"-f", f2, "--expected-version", "1"}, "");   // the topic is at v2 now
     EXPECT_EQ(r.rc, static_cast<int>(rune::protocol::client::ErrorCode::SchemaConflict)) << r.err;

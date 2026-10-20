@@ -594,7 +594,7 @@ bool QlRun::failBroker(uint16_t code, const std::string& detail) {
 
 bool QlRun::fail(const std::string& msg) {
     broker.flushVerbose(err);
-    if (script) err << "statement " << index << ": " << msg << "\n";
+    if (script) err << (origin.empty() ? std::string{} : origin + ":") << "statement " << index << ": " << msg << "\n";
     else err << "rune: " << msg << "\n";
     return false;
 }

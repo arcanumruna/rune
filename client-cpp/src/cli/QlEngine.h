@@ -183,6 +183,8 @@ struct QlRun {
     std::optional<cat::RequestId> lastDdl;   // the last DDL this run issued: reads after it must show it
     std::optional<cat::RequestId> lastSecurityDdl;   // a SHOW after a security DDL waits until the reader shows it
 
+    std::string origin;   // -f path: when set, script errors read "<origin>:statement N: …" (the console; rune ql keeps "statement N: …")
+
     bool exec(const Prepared& p, const std::string& text, const std::optional<cat::RequestId>& rid);
 
     bool fail(const std::string& msg);

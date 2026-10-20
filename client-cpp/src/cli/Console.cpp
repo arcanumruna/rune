@@ -419,6 +419,7 @@ int runLiveSession(const ConsoleOptions& opts, std::string_view script, const Li
 
     LiveExecutor exec{broker, engine::QlRun{broker, out, err, !o.scriptPath.empty(), 1, engine::OutputStyle::Console},
                       o.requestIdBase};
+    exec.run.origin = o.scriptPath;
     int rc = 0;
     if (!o.scriptPath.empty()) {
         rc = runScript(exec, o, script, err);
