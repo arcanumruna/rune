@@ -20,10 +20,10 @@
 #        response for the rest of its life (and hands them to RUN 2 below).
 #     3. produce one "character" record (id=4242, hp=100)
 #     4. getViewRow on BOTH views -> OK, decoded row == {id=4242, hp=100}
-#     5. Phase 2a: defineTopic "order" {orderId key, userId, amount}; createView
-#        "user_totals" (persistence=0; GROUP BY userId: Count(*), Sum, Avg);
-#        produce o1(u100,10) o2(u100,30) o3(u200,5), update o1->50, move
-#        o3->(u100,5) -> u100 = {3, 85, 85/3}, u200 AbsentKey (emptied group).
+#     5. Phase 2a/2b: defineTopic "order" {orderId key, userId, amount}; createView
+#        "user_totals" (persistence=0; GROUP BY userId: Count(*), Sum, Avg, Max,
+#        Min, Last); produce o1(u100,10) o2(u100,30) o3(u200,5), update o1->50,
+#        move o3->(u100,5) -> u100 = {3, 85, 85/3, 50, 5, 5}, u200 AbsentKey.
 #     6. Phase 2b C: typed_route (8 partitions) routed by key.
 #     7. Phase 2b E/E2: transient topic presence_t defined at runtime; produce
 #        acks None/Leader/All; subscribe earliest/offset/latest; read_committed
@@ -45,10 +45,11 @@
 #         runtime-topic recovery.
 #     (c) re-produce the SAME key with a NEW hp value -> BOTH views converge to
 #         the NEW value (live folding resumes after the restart).
-#     (d) user_totals recovered from its v2 checkpoint: u100 = {3, 85, 85/3},
-#         u200 AbsentKey; then o3 5->25 (a PRE-restart contributor) ->
-#         u100 = {3, 105, 35} — proves the contributor map survived (a lost
-#         map would give n 4, total 110).
+#     (d) user_totals recovered from its v2 checkpoint: u100 = {3, 85, 85/3, 50,
+#         5, 5}, u200 AbsentKey; then o3 5->25 (a PRE-restart contributor; also
+#         retracts the cached min) -> {3, 105, 35, 50, 25, 25}; then o1 50->20
+#         (retracts the cached max) -> {3, 75, 25, 30, 20, 20} — proves the
+#         contributor map, MRU lists, caches and value blocks all survived the restart.
 #   GROUP LEGS (E2 final fix wave C1, GroupConsume x Restart): RUNE_MODE=
 #   group_commit after RUN 1 (a consumer group commits presence_t's end) and
 #   RUNE_MODE=group_restart after RUN 2 (the same group delivers every record of
@@ -63,11 +64,9 @@
 #   RUNE_MODE=catalog_dump snapshot taken before the restart must equal the
 #   one taken after it.
 #
-# Usage:  bash docker/view-engine-e2e.sh
-# Run from the rune-broker repo root (this worktree). Requires the sibling
-# worktrees: ../protocol ../codec ../crypto ../flight-recorder ../ql
-# ../client-cpp (feat/view-engine-phase1 on both the broker and the
-# client repo).
+# Usage:  bash broker/docker/view-engine-e2e.sh
+# Run from the monorepo (broker/docker); requires ../flight-recorder next to the
+# monorepo.
 #
 # Constraints (engineering philosophy #5/#7):
 #   - Real client<->broker over real Aeron (NOT in-process); default config.
@@ -580,8 +579,8 @@ log "  -> restart -> re-elected: ${leader2}"
 log "  -> char_persisted recovered OK (readiness gate replay)"
 log "  -> char_transient re-folded from the retained source OK"
 log "  -> reproduce -> both views fold the new value live OK"
-log "  -> user_totals (Count(*)/Sum/Avg) recovered from its v2 checkpoint (VIEW-RECOVERED format=v2, O>0)"
-log "     + post-restart update retracts OK"
+log "  -> user_totals (Count(*)/Sum/Avg/Max/Min/Last) recovered from its v2 checkpoint (VIEW-RECOVERED format=v2, O>0)"
+log "     + post-restart update retracts the pre-image, min and max exactly OK"
 log "  -> typed_route: 8-partition typed topic routed by key (Phase 2b C)"
 log "  -> DDL conformance: alter on a view = 38; two racing clients, exactly one"
 log "     winner per leg (topic 25, view 32, mixed 25); catalog identical across restart"
