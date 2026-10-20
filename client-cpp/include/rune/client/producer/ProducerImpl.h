@@ -1225,10 +1225,18 @@ private:
     // ---- Phase 2b B: the Invoker (Direct) claim state machine (owner thread) ---
     //   NoDirectClaim --claimRecord / claimBatch--> DirectClaimOpen
     //   DirectClaimOpen --commit--> NoDirectClaim   (records join the batch: noteAppended_)
-    //   DirectClaimOpen --abort / abandon--> NoDirectClaim (builder rolled back to `mark`)
+    //   DirectClaimOpen --abort--> NoDirectClaim    (builder rolled back to `mark`)
+    //   DirectClaimOpen --abandon--> DirectClaimAbandoned (failBuilder_ / close:
+    //       rolled back, and the builder's storage - the caller's span - moved
+    //       into claimQuarantine_)
+    //   DirectClaimAbandoned --commit (false) / abort / ~Claim--> NoDirectClaim
     // While open: every other append to the producer is ClaimHeld (trySubmit) or
     // ABORTed (admitRecord_ - the deferred apply pass), and the partition is not
     // flushed (encodeAndSend); failBuilder_ abandons it.
+    // While abandoned (final review I1): the caller may still write its span,
+    // harmlessly - those bytes are in claimQuarantine_, outside every builder
+    // and in-flight frame.  Sends proceed (a failure handler's retries too);
+    // another claim is ClaimHeld until this one is settled (one quarantine).
     struct NoDirectClaim {};
     struct DirectClaimOpen {
         uint32_t                  slot       = 0;  ///< PartitionState::slotIndex
@@ -1239,12 +1247,20 @@ private:
         uint64_t                  ackHandle  = 0;
         uint64_t                  gen        = 0;  ///< the Claim's token
     };
+    struct DirectClaimAbandoned {
+        uint64_t gen = 0;  ///< the Claim's token (its span is in claimQuarantine_)
+    };
     [[nodiscard]] bool directClaimOn_(const PartitionState& ps) const noexcept {
         const auto* o = std::get_if<DirectClaimOpen>(&directClaim_);
         return o != nullptr && o->slot == ps.slotIndex;
     }
-    /// failBuilder_: the open claim on `ps` (if any) is rolled back and dropped.
-    void abandonDirectClaimOn_(PartitionState& ps) noexcept;
+    /// The open claim on `ps` (if any) is rolled back to its mark and becomes
+    /// DirectClaimAbandoned; true when it was.  The caller then moves the
+    /// builder's storage to claimQuarantine_ (detachStorage*) - failBuilder_
+    /// and abandonOpenClaimForClose.
+    [[nodiscard]] bool abandonDirectClaimOn_(PartitionState& ps) noexcept;
+    /// commit / abort of an abandoned claim `gen`: settled (NoDirectClaim).
+    [[gnu::cold, gnu::noinline]] void settleAbandonedClaim_(uint64_t gen) noexcept;
     /// Owner-thread / closed / held / in-duty / deferred-ahead checks of a claim.
     [[nodiscard]] SendResult directClaimGate_(int32_t topicId, int32_t partition) noexcept;
     [[nodiscard]] ClaimGrant claimRecordDirect_(int32_t topicId, int32_t partition, const Key& key,
@@ -1555,7 +1571,12 @@ private:
     int64_t     lastNowNs_ = 0;
 
     // ---- Phase 2b B: Invoker claims (owner thread only) -----------------------
-    std::variant<NoDirectClaim, DirectClaimOpen> directClaim_{};
+    std::variant<NoDirectClaim, DirectClaimOpen, DirectClaimAbandoned> directClaim_{};
+    // DirectClaimAbandoned's storage: the abandoned claim's frame bytes (the
+    // caller's span) while that state holds; otherwise the spare an abandon
+    // swaps into the builder (capacity >= kRecordsStart from construction and
+    // persisting, so an abandon never allocates).
+    FrameBytes            claimQuarantine_;
     uint64_t              claimGen_        = 0;
     uint64_t              claimsAbandoned_ = 0;
     std::vector<uint32_t> claimOffsets_;  ///< Direct claimBatch value offsets (capacity persists)

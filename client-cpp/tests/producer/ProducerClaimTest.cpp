@@ -930,6 +930,161 @@ TEST(ProducerClaimDirect, ClaimFromInsideAProducerCallbackIsBackPressured) {
     EXPECT_EQ(ctx.got, SendResult::BackPressured);
 }
 
+// ---------------------------------------------------------------------------
+// Final review I1: an Invoker claim abandoned while the caller still holds it
+// (a route failure / the delivery sweep inside a pump) must never leave the
+// caller's span inside a buffer the producer appends into or seals.  The
+// failure handler retries each failed record with a longer value (the retry
+// marker), applied (deferred) at the end of the SAME duty pass — over the
+// region the claim was reserved in.  The caller then writes its span; the
+// retried bytes on the wire must be exact.
+// ---------------------------------------------------------------------------
+namespace {
+struct RetryOnFailure {
+    Producer*                p = nullptr;
+    std::vector<std::string> sent;   // value of each AckToken (index = token - 1)
+    int                      failed = 0;
+    std::vector<rc::Token>   ok;
+    static void onAck(void* c, rc::Token t, int64_t, rc::OpStatus st, uint16_t) noexcept {
+        auto* x = static_cast<RetryOnFailure*>(c);
+        if (st == rc::OpStatus::Ok) {
+            x->ok.push_back(t);
+            return;
+        }
+        ++x->failed;
+        const std::string v = x->sent[t - 1] + "#retry-attempt-2";
+        x->sent.push_back(v);
+        (void)x->p->trySend(kTopic, Key(uint64_t{1}), bytes(v), rc::AckToken{x->sent.size()});
+    }
+    SendResult send(std::string v) {
+        sent.push_back(std::move(v));
+        return p->trySend(kTopic, Key(uint64_t{1}), bytes(sent.back()), rc::AckToken{sent.size()});
+    }
+};
+uint16_t failEveryRoute(void*, int32_t, int32_t) noexcept { return 6; }  // NOT_LEADER
+
+bool anyByteIs(const std::vector<std::string>& vs, char c) {
+    for (const auto& v : vs) {
+        if (v.find(c) != std::string::npos) return true;
+    }
+    return false;
+}
+}  // namespace
+
+TEST(ProducerClaimRegression, RouteFailureAbandonKeepsTheHeldClaimOutOfTheRetriedFrameRegression) {
+    ProducerConfig cfg = voidCfg();
+    cfg.acks = Acks::Leader;
+    DirectRig r(cfg);
+    RetryOnFailure h;
+    h.p = &r.p;
+    r.p.onAck(&RetryOnFailure::onAck, &h);
+    FrameCapture cap;
+    r.pass(cap.fn());  // the duty clock
+    ASSERT_EQ(h.send("A"), SendResult::Ok);
+    ASSERT_EQ(h.send("B"), SendResult::Ok);
+    rc::Claim c = r.p.tryClaim(kTopic, Key(uint64_t{1}), 24);
+    ASSERT_TRUE(c);
+
+    // A pump while holding (documented): the route fails, the handler retries.
+    r.impl->failRoutedBroker(&failEveryRoute, nullptr);
+    ASSERT_EQ(h.failed, 2);
+    EXPECT_EQ(r.impl->claimsAbandoned(), 1u);
+    // The caller, not yet told, finishes encoding into its span.
+    std::memset(c.buffer().data(), 'Z', c.buffer().size());
+    EXPECT_FALSE(c.commit()) << "abandoned under the caller: nothing is sent";
+
+    r.pass(cap.fn());
+    EXPECT_EQ(cap.values(), (std::vector<std::string>{"A#retry-attempt-2", "B#retry-attempt-2"}))
+        << "the deferred retries are sent intact after the claim settles";
+    EXPECT_FALSE(anyByteIs(cap.values(), 'Z')) << "the abandoned claim's bytes never reach a frame";
+    ASSERT_EQ(cap.corrs.size(), 1u);
+    r.impl->onProduceResponse(cap.corrs[0], 100, 0);
+    EXPECT_EQ(h.ok, (std::vector<rc::Token>{3, 4}));
+}
+
+TEST(ProducerClaimRegression, DeliverySweepAbandonKeepsTheHeldBatchClaimOutOfTheRetriedFrameRegression) {
+    ProducerConfig cfg = voidCfg();
+    cfg.acks              = Acks::Leader;
+    cfg.deliveryTimeoutMs = 100;
+    DirectRig r(cfg);
+    RetryOnFailure h;
+    h.p = &r.p;
+    r.p.onAck(&RetryOnFailure::onAck, &h);
+    FrameCapture cap;
+    r.pass(cap.fn());  // the duty clock: the records below are accepted at kNow
+    ASSERT_EQ(h.send("early-1"), SendResult::Ok);
+    rc::BatchClaim b = r.p.claimBatch(kTopic, Key(uint64_t{1}), 3, 8);
+    ASSERT_TRUE(b);
+
+    // The records were never sent (no session): the sweep fails the builder.
+    r.impl->sweepTimedOut(std::chrono::steady_clock::time_point(std::chrono::nanoseconds(kNow + 200'000'000)));
+    ASSERT_EQ(h.failed, 1);
+    EXPECT_EQ(r.impl->claimsAbandoned(), 1u);
+    for (uint32_t i = 0; i < b.count(); ++i) std::memset(b.record(i).data(), 'Z', b.recordLength());
+    EXPECT_FALSE(b.commit());
+
+    r.impl->flushBatches(kNow + 200'000'000, 42, cap.fn());  // the duty clock moved on with the sweep
+    EXPECT_EQ(cap.values(), (std::vector<std::string>{"early-1#retry-attempt-2"}));
+    EXPECT_FALSE(anyByteIs(cap.values(), 'Z'));
+}
+
+// While an abandoned claim is unsettled the producer sends (the builder no
+// longer holds the claim) but refuses a second claim; settling it — abort, or
+// the destructor — makes claims available again.
+TEST(ProducerClaimRegression, AbandonedClaimRefusesASecondClaimUntilSettledRegression) {
+    ProducerConfig cfg = voidCfg();
+    cfg.acks = Acks::Leader;
+    DirectRig r(cfg);
+    test_support::AckLedger L;
+    L.attach(r.p);
+    FrameCapture cap;
+    r.pass(cap.fn());
+    ASSERT_EQ(r.p.trySend(kTopic, Key(uint64_t{1}), bytes("A"), rc::AckToken{1}), SendResult::Ok);
+    {
+        rc::Claim c = r.p.tryClaim(kTopic, Key(uint64_t{1}), 8);
+        ASSERT_TRUE(c);
+        r.impl->failRoutedBroker(&failEveryRoute, nullptr);
+        EXPECT_EQ(r.p.trySend(kTopic, Key(uint64_t{1}), bytes("B")), SendResult::Ok)
+            << "the abandoned claim no longer blocks sends";
+        EXPECT_EQ(r.p.tryClaim(kTopic, Key(uint64_t{2}), 4).result(), SendResult::ClaimHeld);
+        EXPECT_EQ(r.p.claimBatch(kTopic, Key(uint64_t{2}), 2, 4).result(), SendResult::ClaimHeld);
+        std::memset(c.buffer().data(), 'Z', c.buffer().size());
+    }  // the destructor settles it
+    rc::Claim d = r.p.tryClaim(kTopic, Key(uint64_t{1}), 1);
+    ASSERT_TRUE(d) << static_cast<int>(d.result());
+    d.buffer()[0] = 'C';
+    ASSERT_TRUE(d.commit());
+    r.pass(cap.fn());
+    EXPECT_EQ(cap.values(), (std::vector<std::string>{"B", "C"}));
+}
+
+// Repeated live abandons swap the claimed storage with the one quarantine
+// buffer: no allocation once warm.
+TEST(ProducerClaimAllocRegression, RepeatedLiveAbandonsAllocateNothingRegression) {
+    ProducerConfig cfg = voidCfg();
+    cfg.acks = Acks::Leader;
+    DirectRig r(cfg);
+    r.p.onAck([](void*, rc::Token, int64_t, rc::OpStatus, uint16_t) noexcept {}, nullptr);
+    const ProducerImpl::SendFn sink = [](int32_t, int32_t, int32_t, const uint8_t*, std::size_t) {
+        return true;
+    };
+    r.pass(sink);
+    const std::vector<uint8_t> early = bytes("early");  // built once: the cycle allocates nothing itself
+    auto cycle = [&](uint64_t k) {
+        (void)r.p.trySend(kTopic, Key(k), early, rc::AckToken{k + 1});
+        rc::Claim c = r.p.tryClaim(kTopic, Key(k), 64);
+        r.impl->failRoutedBroker(&failEveryRoute, nullptr);
+        if (!c.buffer().empty()) std::memset(c.buffer().data(), 'Z', c.buffer().size());
+        (void)c.commit();
+        r.pass(sink);
+    };
+    for (uint64_t k = 0; k < 64; ++k) cycle(k);
+    alloc_counter::start();
+    for (uint64_t k = 64; k < 1064; ++k) cycle(k);
+    EXPECT_EQ(alloc_counter::stop(), 0L) << "an abandon swaps storage; it never allocates";
+    EXPECT_EQ(r.impl->claimsAbandoned(), 1064u);
+}
+
 TEST(ProducerClaimAllocRegression, DirectClaimAndClaimBatchSteadyStateAllocateNothingRegression) {
     DirectRig r;
     const ProducerImpl::SendFn sink = [](int32_t, int32_t, int32_t, const uint8_t*, std::size_t) {

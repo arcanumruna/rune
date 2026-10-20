@@ -272,6 +272,10 @@ enum class SendResult : uint8_t {
 // send() on the same producer from the thread holding it; Invoker mode — until
 // it is settled every other send / claim on the producer returns ClaimHeld and
 // its partition is not flushed, and it must be settled on the owner thread.
+// An Invoker claim abandoned under its holder (a failed partition during a
+// pump, a close) keeps buffer() writable but harmless: the bytes no longer
+// belong to any frame; sends resume, and another claim is ClaimHeld until
+// this one is committed (false), aborted or destroyed.
 // A claim carrying Completions credit is settled on that queue's owner thread.
 // A claim must not outlive its Producer.  Zero allocation.
 // ---------------------------------------------------------------------------
@@ -712,7 +716,8 @@ public:
     OpResult close(const CompletionTarget& target, Token token);
 
     /// Invoker mode: a blocking close() / closeAndWait() abandons a claim this
-    /// (owner) thread holds - its commit() then returns false.  Thread mode: a
+    /// (owner) thread holds once the close is issued - its commit() then returns
+    /// false (a refused close leaves it open).  Thread mode: a
     /// thread holding a claim must settle it BEFORE calling close() (the drain
     /// cannot read past an open ring claim and waits up to deliveryTimeoutMs).
     ///

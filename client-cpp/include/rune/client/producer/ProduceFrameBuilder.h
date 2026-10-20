@@ -163,6 +163,29 @@ public:
         recordCount_ = 0;
     }
 
+    /// Phase 2b B (final review I1): an Invoker claim abandoned while its caller
+    /// still holds a pointer into data().  The builder's storage — the bytes
+    /// the caller may still write — moves to `quarantine`, and the builder
+    /// continues in quarantine's old storage, so no later append or seal can
+    /// ever cover the caller's span.
+    /// detachStorage: the builder is left empty (its records are being failed).
+    /// A swap: `quarantine` must have capacity >= kRecordsStart, then it never
+    /// allocates and never throws.
+    void detachStorage(FrameBytes& quarantine) noexcept {
+        frame_.swap(quarantine);
+        frame_.resize(kRecordsStart);  // within capacity: no allocation, no throw
+        recordCount_  = 0;
+        maxTimestamp_ = baseTimestamp_;
+    }
+    /// detachStorageKeepingRecords: the builder keeps its records (copied into
+    /// fresh storage first: a cold close path, it allocates).  May throw
+    /// bad_alloc; then nothing changed.
+    void detachStorageKeepingRecords(FrameBytes& quarantine) {
+        FrameBytes kept(frame_.begin(), frame_.end());
+        frame_.swap(quarantine);  // quarantine: the caller's storage
+        frame_.swap(kept);        // the builder: its records, in fresh storage
+    }
+
 private:
     /// [length varint | attrs | tsDelta | offsetDelta | keyLen | key | valueLen]
     /// — the exact bytes RecordBatchBuilder::append produces before the value;

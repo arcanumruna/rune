@@ -18,6 +18,7 @@
 #include <cstring>
 #include <memory>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -375,4 +376,86 @@ TEST(ClaimClientRegression, BlockingProducerCloseAbandonsTheOwnersOpenInvokerCla
 
 TEST(ClaimClientRegression, ProducerCloseAndWaitAbandonsTheOwnersOpenInvokerClaimRegression) {
     blockingCloseAbandonsTheOwnersClaim(5826, true);
+}
+
+// Final review I1, end to end: the delivery sweep abandons a held Invoker
+// claim during a pump; the app retries the failed record (a longer value) at
+// once, then finishes writing its claim span.  The retried record reaches the
+// broker byte-exact and nothing the claim held leaks into it.
+TEST(ClaimClientRegression, RetryAfterASweepAbandonIsNeverOverwrittenByTheHeldClaimRegression) {
+    rc::ClientConfig c = cfgFor(rc::RunnerMode::Invoker, 5828, 5829);
+    g_fakeNow   = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch()).count();
+    c.nanoClock = &fakeNow;
+    Rig r(c);
+    r.connect();
+    rc::ProducerConfig pc;
+    pc.acks              = rc::Acks::Leader;
+    pc.lingerUs          = 0;
+    pc.deliveryTimeoutMs = 100;
+    auto p = r.client->producer(pc);
+    const auto topic = r.client->topic("t");
+    const rc::Key key(uint64_t{6});
+    rc::Completions cq(*r.client);
+    ASSERT_EQ(p.trySend(topic, key, bytes("early"), cq, 11), SendResult::Ok);
+    rc::Claim held = p.tryClaim(topic, key, 16);
+    ASSERT_TRUE(held);
+    g_fakeNow += 500'000'000;  // 500 ms > deliveryTimeoutMs
+    bool seen = false;
+    ASSERT_TRUE(r.drive([&] {
+        cq.poll([&](const rc::Completion& cc, std::span<const uint8_t>) {
+            if (cc.token == 11) seen = cc.status == rc::OpStatus::DeliveryFailed;
+        });
+        return seen;
+    }));
+    ASSERT_EQ(p.trySend(topic, key, bytes("early#retry-attempt-2")), SendResult::Ok);
+    std::memset(held.buffer().data(), 'Z', held.buffer().size());  // the caller finishes its encode
+    EXPECT_FALSE(held.commit());
+    p.flush();
+    ASSERT_TRUE(r.drive([&] { return valuesOf(r.gw, 0).size() >= 1; }));
+    EXPECT_EQ(valuesOf(r.gw, 0), (std::vector<std::string>{"early#retry-attempt-2"}));
+    r.client->close();
+}
+
+// Final review I1 (closeAndWait ordering): a closeAndWait refused before its
+// close is issued (here: called from a duty callback) must leave the caller's
+// claim open — it commits and is delivered intact.
+TEST(ClaimClientRegression, RefusedCloseAndWaitLeavesTheHeldInvokerClaimOpenRegression) {
+    Rig r(cfgFor(rc::RunnerMode::Invoker, 5830, 5831));
+    r.connect();
+    rc::ProducerConfig pc;
+    pc.acks     = rc::Acks::Leader;
+    pc.lingerUs = 0;
+    auto p = r.client->producer(pc);
+    const auto topic = r.client->topic("t");
+    const rc::Key key(uint64_t{4});
+    struct Ctx {
+        rc::Producer* p       = nullptr;
+        int           refused = 0;
+        int           acks    = 0;
+    } ctx{&p};
+    p.onAck(
+        [](void* c, rc::Token, int64_t, rc::OpStatus, uint16_t) noexcept {
+            auto* x = static_cast<Ctx*>(c);
+            ++x->acks;
+            try {
+                (void)x->p->closeAndWait(std::chrono::seconds(1));
+            } catch (const std::logic_error&) {
+                ++x->refused;  // a blocking call from a duty callback
+            }
+        },
+        &ctx);
+    ASSERT_EQ(p.trySend(topic, key, bytes("a"), rc::AckToken{1}), SendResult::Ok);
+    p.flush();
+    ASSERT_TRUE(r.drive([&] { return valuesOf(r.gw, 0).size() >= 1; }));
+    rc::Claim held = p.tryClaim(topic, key, 4);
+    ASSERT_TRUE(held);
+    ASSERT_TRUE(r.drive([&] { return ctx.acks == 1; }));  // pumped while holding
+    ASSERT_EQ(ctx.refused, 1);
+    fill(held.buffer(), "LIVE");
+    EXPECT_TRUE(held.commit()) << "the refused close never abandoned the claim";
+    p.flush();
+    ASSERT_TRUE(r.drive([&] { return valuesOf(r.gw, 0).size() >= 2; }));
+    EXPECT_EQ(valuesOf(r.gw, 0), (std::vector<std::string>{"a", "LIVE"}));
+    r.client->close();
 }

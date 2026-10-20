@@ -433,12 +433,14 @@ OpStatus Producer::closeAndWait(std::chrono::nanoseconds timeout) {
         producer::ProducerImpl* impl;
         OpResult                last = OpResult::InvalidArgument;
     } ic{impl_};
-    // Invoker owner: this thread is about to block inside the wait and cannot
-    // commit a claim it holds - abandon it now (no-op for Thread mode / no claim).
-    impl_->abandonOpenClaimForClose();
     const detail::AndWaitIssue issue = [](void* c, const CompletionTarget& t, Token tok) {
         auto* x = static_cast<IssueCtx*>(c);
         x->last = x->impl->beginClose(t, tok);
+        // Invoker owner: this thread now blocks inside the wait and cannot
+        // commit a claim it holds - abandon it (no-op for Thread mode / no
+        // claim).  Final review I1: only once the close is issued; a refused
+        // close (a duty-callback caller, a closed intake) leaves it open.
+        if (x->last == OpResult::Accepted) x->impl->abandonOpenClaimForClose();
         return x->last;
     };
     try {

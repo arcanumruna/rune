@@ -339,6 +339,9 @@ ProducerImpl::ProducerImpl(ProducerConfig cfg,
     // Pre-reserve partition map and encode scratch to avoid allocs on steady-state.
     partitions_.reserve(16);
     encodeScratch_.reserve(64 * 1024); // Produce wire frame (grown once)
+    // Phase 2b B (final review I1): an abandon swaps this into a builder, which
+    // needs its header space - reserved here so an abandon never allocates.
+    claimQuarantine_.reserve(ProduceFrameBuilder::kRecordsStart);
     // M2: frame-cap threshold computed ONCE (cfg_ is immutable).  With the default
     // config (maxFrameBytes == batchBytes) frameCapped_ is FALSE, so the per-record
     // pre-flight collapses out entirely — zero happy-path cost.  It only engages when
@@ -2684,9 +2687,15 @@ void ProducerImpl::failBatch_(PartitionState& ps, InFlightBatch& b, OpStatus st,
 }
 
 void ProducerImpl::failBuilder_(PartitionState& ps, OpStatus st, uint16_t errorCode) {
-    abandonDirectClaimOn_(ps);  // Phase 2b B: an open claim is dropped first (never reported)
-    if (!ps.builder || ps.builder->recordCount() == 0) return;
-    const int32_t n = ps.builder->recordCount();
+    // Phase 2b B: an open claim is abandoned first (never reported).  Final
+    // review I1: its caller may still write the claimed span, so the builder's
+    // storage leaves for the quarantine BEFORE any callback below can queue a
+    // retry into the builder - nothing appended or sealed later can cover it.
+    const bool claimed = abandonDirectClaimOn_(ps);
+    if (!ps.builder) return;
+    const int32_t n = ps.builder->recordCount();  // the records before the claim
+    if (claimed) ps.builder->detachStorage(claimQuarantine_);  // swap: no allocation
+    if (n == 0) return;
     emitUnsentBatchAck_(ps.topicId, ps.partition, n, st, static_cast<uint32_t>(n));
     if (ps.batchAckCount > 0) {
         completeSlice_(ps, ps.batchAckStart, ps.batchAckCount, -1, st, errorCode, false, 0);
@@ -3433,7 +3442,8 @@ SendResult ProducerImpl::directClaimGate_(int32_t topicId, int32_t partition) no
     // Foreign thread decided FIRST, before any owner-thread state is read.
     if (std::this_thread::get_id() != dutyThreadId_) return SendResult::WrongThread;
     if (directClosed_) return SendResult::Closed;
-    if (std::holds_alternative<DirectClaimOpen>(directClaim_)) return SendResult::ClaimHeld;
+    // Open, or abandoned but not yet settled (its span is in the one quarantine).
+    if (!std::holds_alternative<NoDirectClaim>(directClaim_)) return SendResult::ClaimHeld;
     // Claims are never deferred: inside this producer's own duty work (a
     // callback it fired) the builders may be mid-walk - use trySend() there.
     if (inDuty_) return SendResult::BackPressured;
@@ -3520,7 +3530,10 @@ ProducerImpl::ClaimGrant ProducerImpl::claimBatchDirect_(int32_t topicId, int32_
 
 bool ProducerImpl::commitDirectClaim_(uint64_t gen) noexcept {
     const auto* o = std::get_if<DirectClaimOpen>(&directClaim_);
-    if (o == nullptr || o->gen != gen) return false;  // abandoned under the caller
+    if (o == nullptr || o->gen != gen) [[unlikely]] {  // abandoned under the caller
+        settleAbandonedClaim_(gen);
+        return false;
+    }
     const DirectClaimOpen c = *o;
     directClaim_ = NoDirectClaim{};
     // Ack-ring room was reserved by admitRecord_ and nothing else appended to
@@ -3532,24 +3545,51 @@ bool ProducerImpl::commitDirectClaim_(uint64_t gen) noexcept {
 
 void ProducerImpl::abortDirectClaim_(uint64_t gen) noexcept {
     const auto* o = std::get_if<DirectClaimOpen>(&directClaim_);
-    if (o == nullptr || o->gen != gen) return;
+    if (o == nullptr || o->gen != gen) {
+        settleAbandonedClaim_(gen);
+        return;
+    }
     partitions_[o->slot]->builder->rollback(o->mark);
     directClaim_ = NoDirectClaim{};
 }
 
-void ProducerImpl::abandonDirectClaimOn_(PartitionState& ps) noexcept {
+void ProducerImpl::settleAbandonedClaim_(uint64_t gen) noexcept {
+    // The quarantined bytes stay as the next abandon's spare storage; the
+    // settled Claim exposes no span any more.
+    const auto* a = std::get_if<DirectClaimAbandoned>(&directClaim_);
+    if (a != nullptr && a->gen == gen) directClaim_ = NoDirectClaim{};
+}
+
+bool ProducerImpl::abandonDirectClaimOn_(PartitionState& ps) noexcept {
     const auto* o = std::get_if<DirectClaimOpen>(&directClaim_);
-    if (o == nullptr || o->slot != ps.slotIndex) return;
+    if (o == nullptr || o->slot != ps.slotIndex) return false;
     ps.builder->rollback(o->mark);
-    directClaim_ = NoDirectClaim{};
+    directClaim_ = DirectClaimAbandoned{o->gen};
     ++claimsAbandoned_;
+    return true;
 }
 
 void ProducerImpl::abandonOpenClaimForClose() noexcept {
     // Owner-thread, Direct-mode state: anything else is a no-op.
     if (mode_ != IngressMode::Direct || std::this_thread::get_id() != dutyThreadId_) return;
     const auto* o = std::get_if<DirectClaimOpen>(&directClaim_);
-    if (o != nullptr) abandonDirectClaimOn_(*partitions_[o->slot]);
+    if (o == nullptr) return;
+    PartitionState& ps = *partitions_[o->slot];
+    // The records before the claim still drain with the close: they move to
+    // fresh storage and the claim's storage (the caller's span) to the
+    // quarantine (final review I1: the drain appends deferred records and
+    // seals frames while the caller may still write its span).
+    ps.builder->rollback(o->mark);
+    try {
+        ps.builder->detachStorageKeepingRecords(claimQuarantine_);
+    } catch (...) {
+        // bad_alloc copying them out: fail them instead - failBuilder_ abandons
+        // (detaching without a copy), never sending the caller's span.
+        const DutyScope duty(*this);
+        failBuilder_(ps, OpStatus::Closed);
+        return;
+    }
+    (void)abandonDirectClaimOn_(ps);  // rolls back to the same mark again (no-op)
 }
 
 ProducerImpl::~ProducerImpl() {

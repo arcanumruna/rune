@@ -86,7 +86,10 @@ alloc-free handoff). The agent drains, accumulates records into per-
   -> frame -> Aeron); Invoker mode reserves the record in the partition's Produce
   frame (1 copy) under the `DirectClaimOpen` state: every other send on that
   producer returns `ClaimHeld` until it settles, and a failed/closed partition
-  abandons it (`commit()` -> false).  A `claimBatch` appends its n records
+  abandons it (`commit()` -> false) into `DirectClaimAbandoned`: the builder's
+  storage (the caller's still-writable span) moves to the producer's quarantine
+  buffer, so nothing appended or sealed later can contain it; sends resume at
+  once, another claim stays `ClaimHeld` until the abandoned one is settled.  A `claimBatch` appends its n records
   contiguously and atomically (nothing foreign between them), but an UNFENCED one
   can join an open RecordBatch with neighbouring sends, and is acked by the
   BatchAck(s) covering that RecordBatch, not by "one BatchAck of n"; `flush()`

@@ -226,7 +226,9 @@ if (w) { w.zone(4).x(1.5); w.commit(); }           // non-key setters only; the 
 - A claim returns the record's bytes in place (Thread mode: a producer-ring slot, 2 copies to the wire; Invoker mode: the
   Produce frame, 1 copy). It is false when refused (`result()`: `BackPressured`, `MessageTooLarge`, `Closed`, ...).
   Destruction without `commit()` aborts. Do not hold a claim across blocking work: while an Invoker claim is open, other sends on
-  that producer return `SendResult::ClaimHeld`. `commit()` returns false if the claim was abandoned (close, failed partition).
+  that producer return `SendResult::ClaimHeld`. `commit()` returns false if the claim was abandoned (close, failed partition). Writes into an abandoned
+  claim's buffer are harmless (it no longer belongs to any frame); sends resume at once, and a new claim returns `ClaimHeld`
+  until the abandoned one is committed, aborted or destroyed.
 - `claimBatch` appends its n records contiguously and atomically: nothing foreign lands between them. An unfenced
   claim can join an open `RecordBatch` with neighbouring sends, so it is acked by the `BatchAck`(s) covering that `RecordBatch`,
   not necessarily by one `BatchAck` of n. Call `flush()` (and `doWork()` in Invoker mode) before the claim to fence it into a
