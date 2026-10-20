@@ -83,3 +83,28 @@ TEST(ViewRow, WriteSlotWritesGoldenBytesAtTheSlotOffset) {
     EXPECT_EQ(std::memcmp(row.data() + L.slotOffset[1], goldenS, 3), 0);
     EXPECT_EQ(rune::view::readSlot(row.data(), L, 0).i, -7);
 }
+
+// The min(width, size) clamp is the bounds guard for Last-value storage: a
+// longer value is truncated at the width and the byte past it stays intact.
+TEST(ViewRow, SlotValueCodecTruncatesFixedStrAtWidthAndWritesBoolFalse) {
+    using P = rune::codec::PrimType;
+    uint8_t buf[8];
+    std::memset(buf, 0xAB, sizeof buf);
+    rune::codec::FieldValue v{};
+    v.bytes = "ABCDEF";
+    rune::view::encodeSlotValue(buf, P::FixedStr, 4, v);
+    EXPECT_EQ(std::string(rune::view::decodeSlotValue(buf, P::FixedStr, 4).bytes), "ABCD");
+    EXPECT_EQ(buf[4], 0xAB) << "nothing is written past the slot width";
+
+    std::memset(buf, 0xAB, sizeof buf);
+    v.b = false;
+    rune::view::encodeSlotValue(buf, P::Bool, 1, v);
+    EXPECT_EQ(buf[0], 0x00);
+    EXPECT_FALSE(rune::view::decodeSlotValue(buf, P::Bool, 1).b);
+
+    std::memset(buf, 0xAB, sizeof buf);
+    v.f = -2.5;
+    rune::view::encodeSlotValue(buf, P::Float64, 8, v);
+    const uint8_t goldenF[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0xC0};   // -2.5, little-endian IEEE-754
+    EXPECT_EQ(std::memcmp(buf, goldenF, 8), 0);
+}
