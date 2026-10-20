@@ -11,6 +11,7 @@
 [![Auth](https://img.shields.io/badge/auth-SCRAM--SHA--512%20on%20by%20default-cbc3f5?style=flat-square&labelColor=0a0a12)](broker/docs/SECURITY.md)
 [![TLS](https://img.shields.io/badge/TLS%201.3-optional%20build-22d3ee?style=flat-square&labelColor=0a0a12)](crypto/README.md)
 [![Docker](https://img.shields.io/badge/docker-broker%20image-a855f7?style=flat-square&labelColor=0a0a12)](broker/docker/Dockerfile)
+[![License](https://img.shields.io/badge/license-Arcanum%20Realms%20Community-cbc3f5?style=flat-square&labelColor=0a0a12)](LICENSE)
 [![Flight recorder](https://img.shields.io/badge/flight--recorder-separate%20repo-cbc3f5?style=flat-square&labelColor=0a0a12)](https://github.com/arcanumruna/flight-recorder#readme)
 
 **[Website](https://arcanum.regressorspath.com/rune/)** ·
@@ -347,7 +348,10 @@ Every broker setting is an environment variable. The complete table, with defaul
 
 ## License and links
 
-No license file is present in this repository, so no license is granted by it; ask the maintainers before reuse.
+Rune is source-available under the [Arcanum Realms Community License](LICENSE): use, modify and run it as the backend
+of your own games and services, including in production. Offering it to others as a hosted or managed service, or
+reselling it, requires a commercial license from Arcanum Realms LTD. Third-party components keep their own licenses —
+see [NOTICE](NOTICE).
 
 [Website](https://arcanum.regressorspath.com/rune/) · [API page](https://arcanum.regressorspath.com/rune/docs.html) ·
 [Self-host page](https://arcanum.regressorspath.com/rune/selfhost.html) ·
