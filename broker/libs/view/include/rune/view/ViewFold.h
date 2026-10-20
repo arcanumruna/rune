@@ -66,6 +66,9 @@ struct FoldStats {
     // A retraction found missing/zero state (group row absent or a count already
     // 0): counted and skipped with no mutation, never masked.
     uint64_t aggInconsistent  = 0;
+    // Phase 2b: Min/Max caches rebuilt by one walk of the group's contributor
+    // list (the cached extreme was retracted) -- the known O(group size) path.
+    uint64_t aggRescans       = 0;
 };
 
 // Folds every COMMITTED record (offset < bound) in `view` -- a LogReadView
