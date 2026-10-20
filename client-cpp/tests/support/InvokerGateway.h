@@ -369,6 +369,7 @@ struct InvokerGateway {
     bool                initPidReply = false;
     std::deque<int16_t> initPidCodes;
     int64_t             initPid = 4242;
+    std::map<std::string, int16_t> txnEpochs_;   ///< next epoch per transactional id (a bump is an init)
     int64_t             plainPidNext = 7000;   ///< the next id a plain (empty transactional id) request is given
     bool                plainUsesInitPidCodes = false;   ///< plain requests also consume initPidCodes (error injection)
     bool                plainInitPidAnswers = true;   ///< false: plain InitProducerId requests are counted, never answered
@@ -1672,6 +1673,10 @@ private:
             }
             rsp.producerId    = rsp.errorCode != 0 ? -1 : (plain && !initPidReply ? plainPidNext++ : initPid);
             rsp.producerEpoch = 0;
+            if (rsp.errorCode == 0 && !plain) {   // a transactional id's epoch grows with every successful init / bump
+                const std::string tid(ip->transactionalId.begin(), ip->transactionalId.end());
+                rsp.producerEpoch = txnEpochs_[tid]++;
+            }
             std::vector<uint8_t> out(rp::InitProducerIdResponse::ENCODED_SIZE);
             const std::size_t n = rsp.encode(out.data());
             sendToSession(ip->sessionId, out.data(), n);

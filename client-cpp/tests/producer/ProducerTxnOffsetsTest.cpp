@@ -531,7 +531,7 @@ TEST(ProducerTxnOffsets, FencedOnAddOffsetsIsFatal) {
     EXPECT_EQ(r.impl->txnStateDuty(), TxnState::FatalError);
 }
 
-TEST(ProducerTxnOffsets, ConcurrentTransactionsOnAddOffsetsIsRetriedByTheLink) {
+TEST(ProducerTxnOffsetsRegression, AddOffsetsRetriesConcurrentTransactionsRegression) {
     Rig r;
     r.inTxn();
     const Token t = r.sendOffsets(offsetsOf(2));

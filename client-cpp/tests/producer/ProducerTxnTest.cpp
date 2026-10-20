@@ -12,12 +12,12 @@
 //   CommitTransactionEmitsEndTxnCommit                      -> CommitTransactionEmitsEndTxnCommit
 //   EndTxnDeferredUntilAllProduceBatchesAcked               -> CommitWaitsForDataThenSendsEndTxnCommit
 //   AbortTransactionEmitsEndTxnAbort                        -> AbortSendsEndTxnAbort
-//   EndTxnTimeoutStaysInDoubtAndIsRetriedRegression         -> CommitTimeoutIsInDoubtAndARetriedCommitResendsEndTxn
-//   EmptyTransactionSendsNoEndTxnRegression                 -> BeginCommitOfAnEmptyTransactionEndsLocallyWithoutEndTxn
-//   LostBatchAbortBumpsEpochAndRestartsSequencesRegression  -> SequenceGapAbortBumpsTheEpoch
-//   EndTxnRetriesConcurrentTransactionsUntilTerminalRegression -> ConcurrentTransactionsOnEndTxnRetriesUntilFinal
-//   FencedProducerRefusesInitRegression                     -> FencedByASecondProducerFailsEverythingRegression
-//   TxnCloseAbortsOpenBrokerTransactionBeforeReportingClosedRegression -> CloseAbortsAnOpenTransactionFirstRegression
+//   EndTxnTimeoutStaysInDoubtAndIsRetriedRegression         -> (same name)
+//   EmptyTransactionSendsNoEndTxnRegression                 -> (same name)
+//   LostBatchAbortBumpsEpochAndRestartsSequencesRegression  -> (same name)
+//   EndTxnRetriesConcurrentTransactionsUntilTerminalRegression -> (same name)
+//   FencedProducerRefusesInitRegression                     -> (same name)
+//   TxnCloseAbortsOpenBrokerTransactionBeforeReportingClosedRegression -> (same name)
 //   TransientLogFullBackoffIsWallClockTimeRegression        -> TransientLogFullBackoffIsWallClockTimeRegression
 //   (same names) EndTxnNotAuthorizedFailsTheCommitWithoutRetryRegression, InitTxnFencedCompletesFencedRegression,
 //   FlushWithNothingPendingCompletesAtOnce, FlushDuringCommitSendsOneEndTxn, AbortWhileAbortingJoinsThePendingAbort-
@@ -574,7 +574,7 @@ TEST(ProducerTxn, InFlightRequestIsResentOnANewSessionRegression) {
 
 // B-1 (Kafka transactionStarted): nothing added on the coordinator -> the transaction ends LOCALLY, no EndTxn
 // (the coordinator would answer 19 for a transaction that is not Ongoing, which is fatal).  Commit and abort.
-TEST(ProducerTxn, BeginCommitOfAnEmptyTransactionEndsLocallyWithoutEndTxn) {
+TEST(ProducerTxnRegression, EmptyTransactionSendsNoEndTxnRegression) {
     Rig r;
     r.initOk();
     r.begin();
@@ -714,7 +714,7 @@ TEST(ProducerTxn, AbortIsRefusedWhileCommitting) {
 // B-2 (Kafka m1): an EndTxn that times out is IN DOUBT - the producer stays Committing / Aborting, begin and
 // (while committing) abort are refused, nothing is re-sent until the app retries the SAME direction, which
 // re-sends EndTxn.
-TEST(ProducerTxn, CommitTimeoutIsInDoubtAndARetriedCommitResendsEndTxn) {
+TEST(ProducerTxnRegression, EndTxnTimeoutStaysInDoubtAndIsRetriedRegression) {
     for (const bool commitDir : {true, false}) {
         SCOPED_TRACE(commitDir ? "commit" : "abort");
         Rig r;
@@ -808,7 +808,7 @@ TEST(ProducerTxn, CommitAbortCompleteOnceRegression) {
 
 // EndTxn is retried until 0 / 19 / 17 / 18: 27 and every other code (10 MinIsrViolation, 6 Internal) are
 // retried; 19 completes BrokerError (fatal), 17 / 18 Fenced.
-TEST(ProducerTxn, ConcurrentTransactionsOnEndTxnRetriesUntilFinal) {
+TEST(ProducerTxnRegression, EndTxnRetriesConcurrentTransactionsUntilTerminalRegression) {
     struct Case { int16_t terminal; OpStatus expect; TxnState after; };
     for (const Case cs : {Case{0, OpStatus::Ok, TxnState::Ready},
                           Case{ec(rpc::ErrorCode::InvalidTxnState), OpStatus::BrokerError, TxnState::FatalError},
@@ -1021,7 +1021,7 @@ TEST(ProducerTxnRegression, RefusedEndTxnAbortOfferIsReofferedRegression) {
 
 // B-3 (KIP-360): a sequence gap makes the abort bump the epoch - InitProducerId (the transactional id) after
 // EndTxn(abort); the abort completes after the bump, under the new epoch, with sequences restarted.
-TEST(ProducerTxn, SequenceGapAbortBumpsTheEpoch) {
+TEST(ProducerTxnRegression, LostBatchAbortBumpsEpochAndRestartsSequencesRegression) {
     Rig r;
     r.initOk(42, 0);
     r.startTxn();
@@ -1094,7 +1094,7 @@ TEST(ProducerTxn, InDoubtBumpRetryResendsOnlyTheBumpRegression) {
 // flush
 // ============================================================================================================
 
-TEST(ProducerTxn, FlushWithNothingPendingCompletesAtOnce) {
+TEST(ProducerTxnRegression, FlushWithNothingPendingCompletesAtOnce) {
     Rig r;
     r.initOk();
     Op flush = r.flush();
@@ -1124,7 +1124,7 @@ TEST(ProducerTxn, FlushWaitsForTheRecordsAcceptedBeforeIt) {
 }
 
 // The op deadline times the flush out; that never poisons the transaction.
-TEST(ProducerTxn, FlushTimeoutDoesNotPoison) {
+TEST(ProducerTxnRegression, FlushTimeoutDoesNotPoison) {
     Rig r;
     r.initOk();
     r.startTxn();
@@ -1139,7 +1139,7 @@ TEST(ProducerTxn, FlushTimeoutDoesNotPoison) {
 }
 
 // A flush issued while committing neither delays nor duplicates the EndTxn.
-TEST(ProducerTxn, FlushDuringCommitSendsOneEndTxn) {
+TEST(ProducerTxnRegression, FlushDuringCommitSendsOneEndTxn) {
     Rig r;
     r.initOk();
     r.startTxn();
@@ -1160,7 +1160,7 @@ TEST(ProducerTxn, FlushDuringCommitSendsOneEndTxn) {
 // Review Focus #5: 18 on EndTxn (a second producer with the same transactional id bumped the epoch): the commit
 // completes Fenced, the producer is FatalError, every later op completes Fenced, a record is never produced and
 // no frame - coordinator or data - is offered afterwards.
-TEST(ProducerTxnRegression, FencedByASecondProducerFailsEverythingRegression) {
+TEST(ProducerTxnRegression, FencedProducerRefusesInitRegression) {
     Rig r;
     r.initOk();
     r.startTxn();
@@ -1311,7 +1311,7 @@ TEST(ProducerTxnRegression, SessionRevokedIsFatalAndNothingIsResentRegression) {
 
 // close() on an open transaction aborts it FIRST: EndTxn(abort) goes out, the close token completes only after
 // its answer (then the producer drains and closes Ok); later ops complete Closed and nothing more is sent.
-TEST(ProducerTxnRegression, CloseAbortsAnOpenTransactionFirstRegression) {
+TEST(ProducerTxnRegression, TxnCloseAbortsOpenBrokerTransactionBeforeReportingClosedRegression) {
     Rig r;
     r.initOk(77, 0);
     r.startTxn();

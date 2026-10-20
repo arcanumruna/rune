@@ -155,7 +155,7 @@ TEST(ProducerTxnApiRegression, LifecycleOnAPlainProducerIsRefusedExplicitlyRegre
     EXPECT_EQ(p.producerId(), -1);
 }
 
-TEST(ProducerTxnApiRegression, ProduceOutsideATransactionIsRefusedOnEveryPathRegression) {
+TEST(ProducerTxnApiRegression, SendOutsideATransactionIsRefusedRegression) {
     Rig r(cfgOf(Acks::All, "tx-gate"));
     Producer& p = r.p;
     rc::Completions cq(*r.client, smallCq());

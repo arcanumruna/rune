@@ -1148,6 +1148,8 @@ TEST(HubCommandClient, TxnUnknownProducerIdAfterRetentionRestartsSequencesAndCom
             // The unified producer batches the two sends into one produce batch (the old one sent one per send).
             ASSERT_EQ(r.gw.log.size(), 1u) << "the next transaction's batch written exactly once";
             EXPECT_EQ(r.gw.log[0].baseSequence, 0) << "sequences restarted at 0 (the abort's epoch bump)";
+            EXPECT_EQ(r.gw.log[0].values.size(), 2u) << "both keys (2 and 3) are in the batch";
+            EXPECT_EQ(r.gw.log[0].producerEpoch, 1) << "under the bumped epoch";
             EXPECT_EQ(r.gw.endTxnCommits.back(), uint8_t{1});
         } else {
             EXPECT_EQ(c2.status(), rc::OpStatus::BrokerError) << c2.describe();

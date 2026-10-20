@@ -850,7 +850,7 @@ TEST(ProducerTxnDataRegression, RecordsAfterCommitIssueNeverJoinTheCommittingTra
 // An AddPartitionsToTxn with no answer by produceTimeoutMs is sent again (the data still waits for its OK); an abort
 // cancels one still on the link and - since its frame went out - treats the transaction as possibly started: it
 // sends EndTxn(abort), and 19 there means nothing was open (m15).
-TEST(ProducerTxnData, AddPartitionsTimeoutIsResentAndAnAbortTreatsItAsPossiblyStarted) {
+TEST(ProducerTxnDataRegression, TimedOutAddPartitionsAbortsPossiblyStartedTxnRegression) {
     {
         Rig r;
         r.initOk();
