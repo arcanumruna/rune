@@ -9,6 +9,7 @@
 #include <rune/protocol/client/TxnMessages.h>
 
 #include <array>
+#include <cstring>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -31,6 +32,8 @@ struct OfferedFrame {
     int64_t  corrId    = 0;
     int64_t  sessionId = 0;
     uint16_t templateId = 0;
+    uint16_t len       = 0;
+    std::array<uint8_t, 96> head{};   ///< the frame's first bytes (an InitProducerId with a short id fits whole)
 };
 
 class FakeCoordinator {
@@ -116,7 +119,11 @@ private:
         auto* self = static_cast<FakeCoordinator*>(ctx);
         if (self->next != CoordinatorSink::Offer::Retry) {
             const auto h = rpc::MessageHeader::decode(buf, len);
-            if (h) self->offered.push_back({h->correlationId, h->sessionId, h->templateId});
+            if (h) {
+                OfferedFrame f{h->correlationId, h->sessionId, h->templateId, static_cast<uint16_t>(len), {}};
+                std::memcpy(f.head.data(), buf, len < f.head.size() ? len : f.head.size());
+                self->offered.push_back(f);
+            }
         }
         return self->next;
     }

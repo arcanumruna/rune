@@ -17,6 +17,7 @@
 // Before the fix: this test crashes or TSan reports a DATA RACE on impls_.
 // After the fix: all iterations pass cleanly with zero TSan races.
 
+#include "../support/PlainInitPid.h"
 #include "../support/TestCompletions.h"
 #include "../support/AeronTestErrors.h"
 #include <rune/client/Client.h>
@@ -158,6 +159,11 @@ struct RaceGateway {
                 opt->sessionId,
                 opt->correlationId);
             if (n > 0) send(replyBuf, n);
+            return;
+        }
+
+        if (const std::size_t pn = test_support::plainInitPidReply(buf, len, 9001, replyBuf); pn > 0) {
+            send(replyBuf, pn);   // FD4: the broker-assigned producer id
             return;
         }
 

@@ -108,6 +108,7 @@ public:
             // producer per cycle (not once per drainRing() call below, which can
             // run up to 256x/cycle — same relaxed store either way, just cheaper).
             impl->publishHeartbeat(nowNs);
+            work += impl->identityStep(nowNs);   // Phase 2b F (FD4): one index compare once the id is assigned
             // F12: drain a whole pass, then flush ONCE (flushBatches walks only
             // the dirty partitions).  The old loop drained ONE message and then
             // flushed — a walk over EVERY partition per drained record (256 x

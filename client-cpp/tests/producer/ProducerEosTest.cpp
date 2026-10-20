@@ -675,6 +675,8 @@ TEST(EosOosRegression, FollowersOfATimedOutHeadAreResequencedNotFailedRegression
     rc::Producer p = r.client.producer(pc);
     L.attach(p);
     const rc::TopicHandle topic = r.client.topic("t");
+    // FD4: records are held until the broker assigned the id; the timeline below starts once it has.
+    ASSERT_TRUE(r.drive([&] { return p.producerId() >= 0; }));
     r.sendRecord(p, topic, 0, 1);  // H: never arrives
     r.step();                      // H's first send at t0
     r.step(20'000'000);

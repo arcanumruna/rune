@@ -21,6 +21,7 @@
 // machinery to reach it; N simultaneous leader connections are out of scope.
 
 #include "../support/TestCompletions.h"
+#include "../support/PlainInitPid.h"
 #include "../support/AeronTestErrors.h"
 #include <rune/client/Client.h>
 #include <rune/client/Key.h>
@@ -229,6 +230,7 @@ struct MetaGateway {
     }
 
     void onFrame(const uint8_t* buf, std::size_t len) {
+        { uint8_t ipr[64]; if (const std::size_t ipn = test_support::plainInitPidReply(buf, len, 9001, ipr); ipn > 0) { gwSend(ipr, ipn); return; } }  // FD4: broker-assigned id
         const auto tidOpt = rcc::peekTemplate(buf, len);
         if (!tidOpt) return;
         const auto tid = static_cast<rcc::TemplateId>(*tidOpt);

@@ -22,9 +22,8 @@
 //
 // Idempotence:
 //   Each partition carries a monotonic baseSequence stamped into the batch header.
-//   producerId is a per-instance client-drawn random id for M-B (F5 fix — see
-//   ProducerImpl.h/.cpp's generateProducerId()); TODO(milestone-c): real
-//   broker-allocated InitProducerId + zombie-fencing.
+//   producerId is assigned by the broker (InitProducerId with an empty transactional id, Phase 2b F FD4):
+//   an acked producer HOLDS its records until the id arrives, then stamps (id, epoch) per partition.
 //
 // acks=None: the batch is sent without requesting a ProduceResponse.  The void
 //   send fast path with acks=None is fully alloc-free end-to-end.  Nothing

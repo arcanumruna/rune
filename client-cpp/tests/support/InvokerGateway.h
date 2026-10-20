@@ -369,6 +369,9 @@ struct InvokerGateway {
     bool                initPidReply = false;
     std::deque<int16_t> initPidCodes;
     int64_t             initPid = 4242;
+    int64_t             plainPidNext = 7000;   ///< the next id a plain (empty transactional id) request is given
+    bool                plainUsesInitPidCodes = false;   ///< plain requests also consume initPidCodes (error injection)
+    int                 plainInitPids = 0;     ///< InitProducerId requests with an empty transactional id
     int initPids = 0, addPartitions = 0, addOffsets = 0, txnOffsetCommits = 0, endTxns = 0;
     // C10: the sessionId stamped on every txn COORDINATOR request received
     // (InitProducerId / AddPartitionsToTxn / EndTxn) — which client session
@@ -1627,20 +1630,25 @@ private:
             ++initPids;
             const auto ip = rp::InitProducerId::decode(buf, len);
             if (ip) coordinatorSessionIds.push_back(ip->sessionId);
+            if (ip && ip->transactionalId.empty()) ++plainInitPids;
             if (ip && txnNotCoordinator_(endpoint, ip->sessionId, ip->correlationId)) return;
-            if (!ip || !initPidReply) return;
+            // Phase 2b F (FD4): a PLAIN producer (empty transactional id) is always answered - every acked
+            // producer asks the broker for its id - with its own id (plainPidNext, distinct per request);
+            // a transactional request is answered only when replyInitPid (as before).
+            const bool plain = ip && ip->transactionalId.empty();
+            if (!ip || (!initPidReply && !plain)) return;
             rp::InitProducerIdResponse rsp;
             rsp.sessionId     = ip->sessionId;
             rsp.correlationId = ip->correlationId;
-            if (!initPidCodes.empty()) {
+            if (!initPidCodes.empty() && (initPidReply || plainUsesInitPidCodes)) {
                 rsp.errorCode = initPidCodes.front();
                 initPidCodes.pop_front();
             }
-            rsp.producerId    = rsp.errorCode == 0 ? initPid : -1;
+            rsp.producerId    = rsp.errorCode != 0 ? -1 : (plain && !initPidReply ? plainPidNext++ : initPid);
             rsp.producerEpoch = 0;
             std::vector<uint8_t> out(rp::InitProducerIdResponse::ENCODED_SIZE);
             const std::size_t n = rsp.encode(out.data());
-            send(0, out.data(), n);
+            sendToSession(ip->sessionId, out.data(), n);
             return;
         }
         case rcc::TemplateId::AddPartitionsToTxn: {

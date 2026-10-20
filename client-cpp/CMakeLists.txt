@@ -1474,10 +1474,12 @@ if(BUILD_TESTING)
             tests/producer/ProducerClaimTest.cpp
             tests/producer/ProducerTxnApiTest.cpp
             tests/producer/CoordinatorLinkTest.cpp
+            tests/producer/ProducerIdTest.cpp
             tests/detail/M2ORingBufferTest.cpp
             tests/detail/OneToOneRingBufferTest.cpp
             tests/detail/CompletionsTest.cpp
             tests/client/InvokerClientTest.cpp
+            tests/client/ProducerTxnClientTest.cpp
             tests/client/ClaimClientTest.cpp
             tests/client/TypedClaimTest.cpp
             tests/client/IngressEndpointRoutingTest.cpp

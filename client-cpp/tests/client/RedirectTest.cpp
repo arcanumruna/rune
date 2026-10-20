@@ -20,6 +20,7 @@
 // forced onto them.
 
 #include "../support/TestCompletions.h"
+#include "../support/PlainInitPid.h"
 #include "../support/AeronTestErrors.h"
 #include <rune/client/Client.h>
 #include <rune/client/Key.h>
@@ -182,6 +183,7 @@ struct RedirectGateway {
     }
 
     void onFrame(const uint8_t* buf, std::size_t len) {
+        { uint8_t ipr[64]; if (const std::size_t ipn = test_support::plainInitPidReply(buf, len, 9001, ipr); ipn > 0) { gwSend(ipr, ipn); return; } }  // FD4: broker-assigned id
         const auto tidOpt = rcc::peekTemplate(buf, len);
         if (!tidOpt) return;
 
@@ -495,6 +497,7 @@ struct TlsRedirectGateway {
         if (sn > 0) sendRaw(sealed, sn);
     }
     void onFrame(const uint8_t* buf, std::size_t len) {
+        { uint8_t ipr[64]; if (const std::size_t ipn = test_support::plainInitPidReply(buf, len, 9001, ipr, /*headerOnly=*/true); ipn > 0) { sendSealed(ipr, ipn); return; } }  // FD4: broker-assigned id
         const auto tid = rcc::peekTemplate(buf, len);
         if (!tid) return;
         uint8_t out[16384];
@@ -787,6 +790,7 @@ struct M1Gateway {
     }
 
     void onFrame(const uint8_t* buf, std::size_t len) {
+        { uint8_t ipr[64]; if (const std::size_t ipn = test_support::plainInitPidReply(buf, len, 9001, ipr); ipn > 0) { gwSend(ipr, ipn); return; } }  // FD4: broker-assigned id
         const auto tidOpt = rcc::peekTemplate(buf, len);
         if (!tidOpt) return;
         const auto tid = static_cast<rcc::TemplateId>(*tidOpt);
@@ -1018,6 +1022,7 @@ struct DeadGateway {
     }
 
     void onFrame(const uint8_t* buf, std::size_t len) {
+        { uint8_t ipr[64]; if (const std::size_t ipn = test_support::plainInitPidReply(buf, len, 9001, ipr); ipn > 0) { gwSend(ipr, ipn); return; } }  // FD4: broker-assigned id
         const auto tidOpt = rcc::peekTemplate(buf, len);
         if (!tidOpt) return;
         const auto tid = static_cast<rcc::TemplateId>(*tidOpt);
@@ -1226,6 +1231,7 @@ struct MaxRedirectGateway {
     }
 
     void onFrame(const uint8_t* buf, std::size_t len) {
+        { uint8_t ipr[64]; if (const std::size_t ipn = test_support::plainInitPidReply(buf, len, 9001, ipr); ipn > 0) { gwSend(ipr, ipn); return; } }  // FD4: broker-assigned id
         const auto tidOpt = rcc::peekTemplate(buf, len);
         if (!tidOpt) return;
         const auto tid = static_cast<rcc::TemplateId>(*tidOpt);

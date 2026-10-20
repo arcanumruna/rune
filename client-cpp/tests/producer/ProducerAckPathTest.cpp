@@ -441,23 +441,20 @@ TEST(ProducerAcks, AcksNoneTier2BatchesNeverOccupyInFlightSlotsRegression) {
 // so a lost frame opened a permanent gap nothing could ever detect or heal.
 // ---------------------------------------------------------------------------
 
-// (a) Two ProducerImpl instances must draw different, non-negative producerIds
-// — neither may be the old shared magic-stub value.
-TEST(ProducerSequence, TwoInstancesGetUniqueProducerIdsRegression) {
+// (a) Phase 2b F (FD4): the client no longer draws ids.  A bare rig (no coordinator link) starts with the
+// fixed rig id - never the old shared magic stub; distinct live producers get distinct BROKER ids
+// (ProducerId.* / ProducerIdBrokerRegression).
+TEST(ProducerSequence, BareRigsUseTheRigIdNeverTheLegacyStubRegression) {
     ProducerImpl p1(ackCfg(8));
     ProducerImpl p2(ackCfg(8));
 
     constexpr int64_t kLegacyStubProducerId =
         static_cast<int64_t>(0x4352554E'4543422DULL); // old "RUNECB-" magic stub
 
+    EXPECT_EQ(p1.producerId(), kRigProducerId);
     EXPECT_GE(p1.producerId(), 0) << "producerId must be non-negative (idempotent)";
-    EXPECT_GE(p2.producerId(), 0) << "producerId must be non-negative (idempotent)";
-    EXPECT_NE(p1.producerId(), kLegacyStubProducerId)
-        << "must never reissue the old shared stub";
-    EXPECT_NE(p2.producerId(), kLegacyStubProducerId)
-        << "must never reissue the old shared stub";
-    EXPECT_NE(p1.producerId(), p2.producerId())
-        << "two live instances must not share a producerId (broker dedup collision)";
+    EXPECT_NE(p1.producerId(), kLegacyStubProducerId) << "must never reissue the old shared stub";
+    EXPECT_EQ(p2.producerId(), kRigProducerId) << "rigs share the rig id: no client-drawn randomness";
 }
 
 // (b) Epoch overflow (INT16_MAX) — see below, after the SeqCapture/sendOne
@@ -744,8 +741,7 @@ void sendOne(ProducerImpl& impl, const ProducerImpl::SendFn& sink, int32_t parti
 }
 } // namespace
 
-// (b) Epoch overflow (INT16_MAX) must rotate to a FRESH unique producerId —
-// never producerId_+1 — and restart epoch at 0 with every partition's sequence
+// (b) Epoch overflow (INT16_MAX) must rotate to a NEW producerId and restart epoch at 0 with every partition's sequence
 // back at 0.  Uses the debugSetEpochForTest() seam to reach INT16_MAX without
 // actually sending 32767 batches, then drives the SAME delivery-timeout path
 // as DeliveryTimeoutBumpsEpochAndRestartsSequenceRegression below.
@@ -769,9 +765,9 @@ TEST(ProducerSequence, EpochOverflowRotatesToFreshProducerIdRegression) {
 
     EXPECT_EQ(impl.producerEpoch(), 0) << "epoch must restart at 0 after overflow";
     EXPECT_GE(impl.producerId(), 0) << "the rotated id must still be non-negative";
-    EXPECT_NE(impl.producerId(), oldId) << "overflow must draw a NEW id";
-    EXPECT_NE(impl.producerId(), oldId + 1)
-        << "must NOT rotate via +1 (as likely to collide as the original id)";
+    EXPECT_NE(impl.producerId(), oldId) << "overflow must move to a NEW id";
+    // (A bare rig rotates deterministically; a producer wired to a broker asks it for the new id instead -
+    // ProducerId.EpochOverflowRequestsANewId.  Nothing here is client-drawn.)
 
     // The next batch on this (now-reset) partition must start at sequence 0.
     sendOne(impl, sink, 0, late);

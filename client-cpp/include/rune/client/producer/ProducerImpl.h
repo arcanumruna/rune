@@ -54,6 +54,7 @@
 #include <flight_recorder/FlightRecorder.h>
 #include <rune/client/detail/M2ORingBuffer.h> // internal MPSC ring (controlledRead/ABORT, templated read)
 #include <rune/client/detail/OneToOneRingBuffer.h> // Tier-2 free-slot ring (duty -> app)
+#include <rune/client/detail/StatusRing.h>       // FD9: identity snapshots (duty -> app handle)
 
 #include <cassert>
 #include <thread>
@@ -1148,7 +1149,10 @@ public:
     // ---- Phase 2b F Task 2: the coordinator link (duty thread only) -----------
     /// Emplaces the link with this producer's ordinal (ProducerHub::add, right after setOrdinal) and
     /// the sink to offer coordinator frames through.  Before it, a bare rig has no link.
-    void enableCoordinator(CoordinatorSink sink, uint32_t seqBase = 0) { coord_.emplace(ordinal_, sink, seqBase); }
+    void enableCoordinator(CoordinatorSink sink, uint32_t seqBase = 0);
+    /// FD4: this producer's id comes from the broker, not the rig default.  Client::producer calls it on the
+    /// creating thread, before the impl is shared, so the handle reports -1 until the id is assigned.
+    void expectBrokerId();
     /// Cold (ProducerHub::remove): the link's sequence, carried to the ordinal's next incarnation.
     [[nodiscard]] uint32_t coordinatorSeq() const noexcept { return coord_ ? coord_->seq() : 0; }
     [[nodiscard]] bool hasCoordinator() const noexcept { return coord_.has_value(); }
@@ -1158,6 +1162,14 @@ public:
     void onCoordinatorAnswer(const CoordAnswer& a, int64_t nowNs) noexcept;
     /// One duty pass of the link: offers, retries, deadline expiry (expired slots are released).
     int pumpCoordinator(int64_t nowNs) noexcept;
+    /// FD4: one duty pass of the identity machine (ProducerHub::drainAndFlush, before the flush).  An
+    /// IdAssigned producer pays one variant-index compare; the rest is cold.
+    int identityStep(int64_t nowNs) noexcept {
+        if (identity_.index() == kIdAssignedIndex) [[likely]] return 0;
+        return identityStepCold_(nowNs);
+    }
+    [[nodiscard]] bool identityAssigned() const noexcept { return identity_.index() == kIdAssignedIndex; }
+    [[nodiscard]] const ProducerIdentity& identity() const noexcept { return identity_; }
     void onCoordinatorMoved() noexcept { if (coord_) coord_->onCoordinatorMoved(); }
     void onCoordinatorSessionChanged() noexcept { if (coord_) coord_->onSessionChanged(); }
     /// Diagnostics / tests: answers routed to this producer / the id of the last one.
@@ -1170,19 +1182,28 @@ public:
     /// Total records accepted via drainRing (agent-thread only; plain uint64_t).
     uint64_t recordsSent() const noexcept { return recordsSent_; }
 
-    /// This instance's current producerId / epoch (diagnostics + tests; F5).
-    /// Both are agent-thread state but only ever change on the agent thread
-    /// (construction and the epoch-overflow path), so a racy read from another
-    /// thread is stale-but-safe for test assertions taken after a pump.
-    [[nodiscard]] int64_t producerId() const noexcept { return producerId_; }
-    [[nodiscard]] int16_t producerEpoch() const noexcept { return producerEpoch_; }
+    /// This producer's current identity (duty-thread state; diagnostics + tests).  -1 until assigned.
+    /// The app-side handle reads it through appProducerId() / appProducerEpoch() (FD9: a StatusRing).
+    [[nodiscard]] int64_t producerId() const noexcept {
+        const auto* a = std::get_if<IdAssigned>(&identity_);
+        return a != nullptr ? a->producerId : -1;
+    }
+    [[nodiscard]] int16_t producerEpoch() const noexcept {
+        const auto* a = std::get_if<IdAssigned>(&identity_);
+        return a != nullptr ? a->epoch : int16_t{-1};
+    }
+
+    /// FD9: the latest identity the duty thread published (ONE app thread; drains the status ring).
+    struct ProducerStatus { int64_t producerId = -1; int16_t producerEpoch = -1; uint8_t identityState = 0; };
+    [[nodiscard]] int64_t appProducerId() noexcept { drainStatus_(); return appStatus_.producerId; }
+    [[nodiscard]] int16_t appProducerEpoch() noexcept { drainStatus_(); return appStatus_.producerEpoch; }
 
     /// Test-only seam (F5 regression coverage): force the current epoch so a
     /// test can drive the INT16_MAX overflow path without sending 32767 real
     /// batches to get there (partitions with nothing in flight adopt it).
     /// Never called from production code.
     void debugSetEpochForTest(int16_t epoch) noexcept {
-        producerEpoch_ = epoch;
+        if (auto* a = std::get_if<IdAssigned>(&identity_)) a->epoch = epoch;
         for (auto& up : partitions_) {
             if (up->inflight.empty()) up->epoch = epoch;
         }
@@ -1452,8 +1473,8 @@ private:
     void maybeResolve_(PartitionState& ps) noexcept;
     /// The partition moves to a new identity at sequence 0: a producer epoch
     /// bump if it is on the current one (else it adopts the current one).
-    /// Epoch overflow: at INT16_MAX a FRESH unique producerId is drawn (never
-    /// the old id+1 — see generateProducerId()) and the epoch restarts at 0.
+    /// Epoch overflow: at INT16_MAX the identity machine asks the broker for a NEW id
+    /// (IdUnassigned -> InitProducerId, FD4); the partition holds (producerId -1) until it arrives.
     void resetPartition_(PartitionState& ps) noexcept;
     /// Sequence space (int32; the client chooses never to wrap — N-c: since
     /// rune-broker 37564ba the broker accepts the Kafka wrap INT32_MAX -> 0 in
@@ -1588,20 +1609,25 @@ private:
     // their in-flight slot's retained buffer (backlog B4).
     FrameBytes encodeScratch_;
 
-    // Per-instance producerId (F5 fix): drawn fresh at construction by
-    // generateProducerId() (ProducerImpl.cpp) — 63 random bits mixed from
-    // std::random_device, std::chrono::steady_clock, and the process id, never
-    // the old shared magic-stub value.  On the broker, the idempotent-dedup key
-    // is (producerId, partition, baseSequence); two concurrent producers on the
-    // SAME partition with the SAME producerId would collide and deduplicate
-    // incorrectly, which is exactly what the old hardcoded stub caused.
-    // producerId == -1 is reserved by the wire protocol for "non-idempotent"
-    // (see acks=None handling in ProducerImpl.cpp) and is never assigned here.
-    // TODO(milestone-c): the durable fix is a broker-allocated InitProducerId
-    // with zombie-fencing; this client-drawn random id only makes an
-    // accidental collision between two live instances astronomically unlikely.
-    int64_t producerId_;
-    int16_t producerEpoch_ = 0;
+    // ---- Phase 2b F (FD4): the producer identity machine (duty thread only) ----
+    // IdUnassigned -> IdRequested -> IdAssigned | IdFailed.  A bare rig (no link wired) starts IdAssigned
+    // with kRigProducerId; enableCoordinator() moves an acked, non-transactional producer to IdUnassigned
+    // (a transactional one waits for initTransactions, Task 5).  The id comes from the broker
+    // (InitProducerId, empty transactional id); batches are HELD (flushBatches returns) until IdAssigned,
+    // never sent with a guessed id.  Partitions copy (producerId, epoch) at first use (EOS I-4); a
+    // partition created or reset while the id is pending carries producerId -1 and adopts on assignment.
+    ProducerIdentity identity_ = IdAssigned{kRigProducerId, 0};
+    [[nodiscard]] IdAssigned& assigned_() noexcept { return *std::get_if<IdAssigned>(&identity_); }
+    int  identityStepCold_(int64_t nowNs) noexcept;
+    void sendInitProducerId_(int64_t nowNs) noexcept;
+    void onInitAnswer_(const CoordAnswer& a, CoordinatorLink::Slot& s) noexcept;
+    void onInitExpired_(CoordinatorLink::Slot& s) noexcept;
+    void assignIdentity_(int64_t pid, int16_t epoch) noexcept;
+    void restampInflight_(PartitionState& ps) noexcept;
+    void publishStatus_() noexcept;
+    void drainStatus_() noexcept { statusRing_.drainLatest(appStatus_); }
+    detail::StatusRing<ProducerStatus, 256> statusRing_;
+    ProducerStatus appStatus_{};   // the app thread's cache (ONE app thread drains the ring)
     // EOS follow-ups: +1 per frame offer (first send or re-send) — orders sends
     // against answers without clocks (fast retransmit; OOS-vs-ack ordering).
     uint64_t sendTick_ = 0;

@@ -1662,7 +1662,8 @@ if(BUILD_TESTING)
                        tests/client/ClientSessionRevokedBrokerRegressionTest.cpp
                        tests/client/ClientAuthClusterRegressionTest.cpp
                        tests/client/RuneConsoleBrokerRegressionTest.cpp
-                       tests/client/ClaimBrokerRegressionTest.cpp)
+                       tests/client/ClaimBrokerRegressionTest.cpp
+                       tests/client/ProducerIdBrokerRegressionTest.cpp)
         # Phase 2b B Task 8b: ClaimBrokerRegressionTest compiles against the client's build-time generated all-fixed
         # `position.gen.h` (rune_gen_claim_schemas); the embedded client builds it under its own binary dir.
         add_dependencies(rune_client_broker_tests generate_claim_schema_headers)

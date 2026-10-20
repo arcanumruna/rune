@@ -473,8 +473,8 @@ void Producer::flushAndWait(std::chrono::nanoseconds) {
 }
 
 TxnState Producer::state() const noexcept { return TxnState::Uninitialized; }
-int64_t  Producer::producerId() const noexcept { return -1; }
-int16_t  Producer::producerEpoch() const noexcept { return -1; }
+int64_t  Producer::producerId() const noexcept { return impl_ != nullptr ? impl_->appProducerId() : -1; }
+int16_t  Producer::producerEpoch() const noexcept { return impl_ != nullptr ? impl_->appProducerEpoch() : int16_t{-1}; }
 bool     Producer::transactionActive() const noexcept { return false; }
 
 // ---------------------------------------------------------------------------

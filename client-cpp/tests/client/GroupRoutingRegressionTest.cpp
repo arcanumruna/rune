@@ -1885,6 +1885,7 @@ TEST(GroupRoutingRegression, TxnCoordinatorOnTheBootstrapAfterASeedRetargetRegre
     r.gw.coordinatorEndpoint   = 0;   // the bootstrap node is the coordinator
     r.gw.coordinatorRedirectTo = "127.0.0.1:" + std::to_string(r.gw.brokerPort);
     r.gw.initPidReply          = true;
+    r.gw.coordinatorEndpoints.clear();   // FD4: the seed mover's own (plain) InitProducerId is not under test
     const int seedConnects = r.gw.connectsAt[n1];
     auto tp = r.client.transactionalProducer("tx-d4-boot");
     const rc::Token t = r.nextToken++;

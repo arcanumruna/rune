@@ -8,11 +8,13 @@
 // Retries run on the duty clock (wall time), never in duty cycles.  ZERO allocation after construction.
 #pragma once
 
+#include <rune/client/Completion.h>
 #include <rune/client/producer/TxnTypes.h>
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 #include <variant>
 
 namespace rune::client::producer {
@@ -94,6 +96,10 @@ public:
     /// Test hook: pump passes that scanned the slots (an idle link never does).
     [[nodiscard]] uint64_t scans() const noexcept { return scans_; }
     [[nodiscard]] uint32_t ordinal() const noexcept { return ordinal_; }
+    /// The coordinator session exists (the sink reports a non-zero id): a request offered now is sent.
+    [[nodiscard]] bool connected() const noexcept {
+        return sink_.sessionId != nullptr && sink_.sessionId(sink_.ctx) != 0;
+    }
 
     /// The verdict table (FD5 / FD6; Kafka parity, TransactionalProducerImpl::classify_ plus auth).
     [[nodiscard]] static Verdict classify(ReqKind kind, int16_t errorCode) noexcept;
@@ -112,5 +118,19 @@ private:
     uint64_t        gen_ = 0;
     CoordinatorSink sink_;
 };
+
+// ---- Phase 2b F (FD4): the producer identity machine, one state per phase, each holding only its data ----
+// (Declared here, not in TxnTypes.h: IdRequested names CoordinatorLink::Slot.)
+
+/// FD4: a bare ProducerImpl with no link wired (unit rigs, benches) starts IdAssigned with this id.
+inline constexpr int64_t kRigProducerId = 0x7E57'0000'0000'0001LL;
+
+struct IdUnassigned {};
+struct IdRequested { CoordinatorLink::Slot* slot = nullptr; };
+struct IdAssigned  { int64_t producerId = -1; int16_t epoch = 0; };
+struct IdFailed    { OpStatus status = OpStatus::BrokerError; uint16_t errorCode = 0; };
+using ProducerIdentity = std::variant<IdUnassigned, IdRequested, IdAssigned, IdFailed>;
+inline constexpr std::size_t kIdAssignedIndex = 2;   // index of IdAssigned in ProducerIdentity (static_asserted below)
+static_assert(std::is_same_v<std::variant_alternative_t<kIdAssignedIndex, ProducerIdentity>, IdAssigned>);
 
 }  // namespace rune::client::producer

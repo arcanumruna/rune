@@ -23,6 +23,7 @@
 //   - a separate case: a gateway that ALWAYS returns bare NotLeader exhausts the
 //     redirect/retry budget and the future then fails (cbError only after budget).
 
+#include "../support/PlainInitPid.h"
 #include "../support/TestCompletions.h"
 #include "../support/AeronTestErrors.h"
 #include <rune/client/Client.h>
@@ -161,6 +162,11 @@ struct NotLeaderGateway {
                 static_cast<int16_t>(rcc::ErrorCode::OK), 0, kSessionId,
                 opt->sessionId, opt->correlationId);
             if (n > 0) gwSend(replyBuf, n);
+            return;
+        }
+
+        if (const std::size_t pn = test_support::plainInitPidReply(buf, len, 9001, replyBuf); pn > 0) {
+            gwSend(replyBuf, pn);   // FD4: the broker-assigned producer id
             return;
         }
 

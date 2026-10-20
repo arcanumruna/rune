@@ -16,6 +16,7 @@
 #include <rune/client/transport/FrameCrc.h>
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/Protocol.h>
+#include <rune/protocol/client/TxnMessages.h>
 #include <rune/protocol/Crc32c.h>
 #include <rune/protocol/RecordBatch.h>
 #include <flight_recorder/FlightRecorder.h>
@@ -215,90 +216,6 @@ inline void restampBatchIdentity(uint8_t* batch, std::size_t len, int64_t produc
         4);
 }
 
-// ---------------------------------------------------------------------------
-// producerId generation (F5 fix) — see ProducerImpl.h's producerId_ comment.
-//
-// The old code shared one hardcoded magic-stub constant across every
-// ProducerImpl instance; the broker dedups idempotent batches by
-// (producerId, partition, baseSequence), so two producers on the same
-// partition collided and silently deduplicated each other's records.  This
-// generator draws a fresh, effectively-unique, non-negative 64-bit id per
-// instance (and per epoch-overflow rotation) instead.
-//
-// TODO(milestone-c): a client-guessed id is only a stopgap. The durable fix
-// is a broker-allocated InitProducerId RPC with zombie-fencing (a monotonic
-// epoch the broker itself hands out and validates), which this local
-// generator cannot provide (no protection against two processes drawing the
-// same id, however astronomically unlikely).
-// ---------------------------------------------------------------------------
-
-// SplitMix64 — fast, well-distributed 64-bit mixer (public-domain algorithm;
-// used here purely to combine entropy sources, not as a CSPRNG).
-inline uint64_t splitmix64(uint64_t x) noexcept {
-    x += 0x9E3779B97F4A7C15ULL;
-    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
-    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
-    return x ^ (x >> 31);
-}
-
-// The old shared magic-stub producerId — the generator below must never
-// reissue it (that would silently resurrect the collision bug this fix
-// removes).
-inline constexpr int64_t kLegacyStubProducerId =
-    static_cast<int64_t>(0x4352554E'4543422DULL); // "RUNECB-"
-
-// Draws a fresh, non-negative 64-bit producerId by mixing three independent,
-// cheap entropy sources: std::random_device (OS entropy), steady_clock (a
-// monotonic per-call timestamp), and the process id (separates concurrent
-// processes started at the same instant). The result is masked to 63 bits
-// (always >= 0 — the wire protocol reserves -1 for "non-idempotent"); on the
-// vanishingly unlikely chance it comes out as 0 or the old stub, it redraws.
-//
-// std::random_device may throw (no entropy source / sandboxed /dev/urandom), and
-// this function is noexcept (a throw would std::terminate the producer ctor).  On
-// failure the OS-entropy term falls back to steady_clock ^ pid; the clock and pid
-// terms are mixed in below regardless, and the redraw loop still advances
-// because steady_clock moves between iterations.
-uint64_t osEntropyOrFallback(uint64_t clockBits, uint64_t pidBits, uint64_t selfBits) noexcept {
-    try {
-        std::random_device rd;
-        return (static_cast<uint64_t>(rd()) << 32) ^ static_cast<uint64_t>(rd());
-    } catch (...) {
-        return splitmix64(clockBits ^ splitmix64(pidBits) ^ splitmix64(selfBits ^ 0xA5A5A5A5A5A5A5A5ULL));
-    }
-}
-
-// `self` (the ProducerImpl address) separates two producers of one process
-// constructed within the same steady_clock tick when OS entropy is unavailable.
-int64_t generateProducerId(const void* self) noexcept {
-    const uint64_t selfBits = static_cast<uint64_t>(reinterpret_cast<std::uintptr_t>(self));
-    for (;;) {
-        const uint64_t clockBits = static_cast<uint64_t>(
-            std::chrono::steady_clock::now().time_since_epoch().count());
-        const uint64_t pidBits = static_cast<uint64_t>(
-#if defined(_WIN32)
-            ::_getpid()
-#else
-            ::getpid()
-#endif
-        );
-        const uint64_t rdBits = osEntropyOrFallback(clockBits, pidBits, selfBits);
-
-        uint64_t mixed = splitmix64(rdBits);
-        mixed = splitmix64(mixed ^ splitmix64(clockBits));
-        mixed = splitmix64(mixed ^ splitmix64(pidBits));
-        mixed = splitmix64(mixed ^ splitmix64(selfBits));
-
-        const int64_t candidate =
-            static_cast<int64_t>(mixed & 0x7FFFFFFFFFFFFFFFULL); // mask to non-negative
-        if (candidate != 0 && candidate != kLegacyStubProducerId) {
-            return candidate;
-        }
-        // 0 or an exact collision with the retired stub: redraw (astronomically
-        // unlikely — loop rather than special-case it).
-    }
-}
-
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -344,8 +261,10 @@ ProducerImpl::ProducerImpl(ProducerConfig cfg,
     , ring_(ringBuf_.get(), static_cast<std::size_t>(ringTotalBytes(ringCap)))
     , tier2FreeBuf_(makeRingBuffer(static_cast<std::size_t>(tier2FreeRingBytes(cfg.tier2Slots)), kRingAlignment))
     , tier2Free_(tier2FreeBuf_.get(), static_cast<std::size_t>(tier2FreeRingBytes(cfg.tier2Slots)))
-    , producerId_(generateProducerId(this))  // F5: unique per instance, never the old shared stub
 {
+    // FD4: a transactional producer has no usable id until initTransactions (Task 5), even as a bare rig.
+    if (!cfg_.transactionalId.empty()) identity_ = IdUnassigned{};
+    publishStatus_();   // FD9: a bare rig reports its rig id
     // Tier-2 slot pool: sized ONCE (steady state never allocates).  Every slot starts on
     // the app's free stack; capacities are reserved so a batch of up to tier2SlotBytes
     // is built and sealed without touching the heap.
@@ -1364,8 +1283,13 @@ PartitionState& ProducerImpl::getOrCreatePartition(int32_t topicId, int32_t part
     if (idx != detail::FlatIndexMap::kNone) return *partitions_[idx];
     auto ps = std::make_unique<PartitionState>(topicId, partition);
     ps->slotIndex = static_cast<uint32_t>(partitions_.size());
-    ps->producerId = producerId_;  // I-4: the identity its sequences start under
-    ps->epoch      = producerEpoch_;
+    // I-4: the identity its sequences start under; pending (-1) until the broker assigns one (FD4).
+    if (const auto* a = std::get_if<IdAssigned>(&identity_)) {
+        ps->producerId = a->producerId;
+        ps->epoch      = a->epoch;
+    } else {
+        ps->producerId = -1;
+    }
     ps->ackRing.assign(kAckRingCapacity, 0);  // preallocated ONCE (zero per-batch alloc)
     ps->ackMask = kAckRingCapacity - 1;
     ps->inflight = InFlightRing(static_cast<uint32_t>(cfg_.maxInFlight > 0 ? cfg_.maxInFlight : 1));
@@ -2081,6 +2005,9 @@ int ProducerImpl::flushBatches(
     // leader-assigned sessionId.  This prevents Produce frames from being
     // stamped sessionId=0 and silently dropped by the broker.
     if (sessionId == 0) return 0;
+    // FD4: records of an acked producer are HELD (builders keep filling, back-pressure as today) until the
+    // broker assigned its id - never sent with a guessed one.  The one hot-path cost: this index compare.
+    if (identity_.index() != kIdAssignedIndex) [[unlikely]] return 0;
 
     const int64_t lingerNs = cfg_.lingerUs * 1000LL;
     // F8c C0: a duty-thread flush() that met a full ring (see submitFlush) is
@@ -2590,33 +2517,50 @@ void ProducerImpl::maybeResolve_(PartitionState& ps) noexcept {  // E
 }
 
 void ProducerImpl::resetPartition_(PartitionState& ps) noexcept {  // F
-    if (ps.producerId == producerId_ && ps.epoch == producerEpoch_) {
-        if (producerEpoch_ == INT16_MAX) {
-            // Epoch space exhausted: rotate to a FRESH unique id (never producerId_+1 —
-            // an incremented id is just as likely to collide with another live
-            // producer's id as the original was, and gives the broker no reason to
-            // believe this is a distinct producer).  Fresh id + epoch 0 is the same
-            // trust-on-first-use the broker already grants any never-seen producerId.
-            producerId_    = generateProducerId(this);
-            producerEpoch_ = 0;
-        } else {
-            ++producerEpoch_;
-        }
-    }
-    ps.producerId       = producerId_;
-    ps.epoch            = producerEpoch_;
     ps.nextBaseSequence = 0;
     ps.lastAckedSeq     = -1;
     ps.unresolved       = false;
+    auto* id = std::get_if<IdAssigned>(&identity_);
+    if (id == nullptr) {
+        ps.producerId = -1;   // a new id is already pending: this partition adopts it on assignment
+        return;
+    }
+    if (ps.producerId == id->producerId && ps.epoch == id->epoch) {
+        if (id->epoch == INT16_MAX) {
+            // Epoch space exhausted.  Never id+1 (as likely to collide with another live producer's id as
+            // the original): a wired producer asks the BROKER for a new id (a cold InitProducerId, FD4)
+            // and the partition holds until it arrives.  A bare rig has no broker: it rotates
+            // deterministically (rig-only; a rig id is not a real identity).
+            if (!coord_) {
+                id->producerId = id->producerId + 1;
+                id->epoch      = 0;
+                publishStatus_();
+            } else {
+                identity_     = IdUnassigned{};
+                ps.producerId = -1;
+                publishStatus_();
+                std::fprintf(stderr,
+                             "ProducerImpl: topic=%d part=%d epoch space exhausted; requesting a new producer id\n",
+                             ps.topicId, ps.partition);
+                return;
+            }
+        } else {
+            ++id->epoch;
+            publishStatus_();
+        }
+    }
+    ps.producerId = id->producerId;
+    ps.epoch      = id->epoch;
     std::fprintf(stderr,
                  "ProducerImpl: topic=%d part=%d sequences restart at 0 under producerId=%lld epoch=%d\n",
-                 ps.topicId, ps.partition, static_cast<long long>(producerId_), static_cast<int>(producerEpoch_));
+                 ps.topicId, ps.partition, static_cast<long long>(id->producerId), static_cast<int>(id->epoch));
 }
 
 bool ProducerImpl::sequenceRoom_(PartitionState& ps, int32_t n) noexcept {
     if (static_cast<int64_t>(ps.nextBaseSequence) + n <= INT32_MAX) return true;
     if (!ps.inflight.empty()) return false;  // drain first: never fence a stored retransmit
     resetPartition_(ps);                     // new identity at 0, before the overflow
+    if (ps.producerId < 0) return false;     // epoch overflow: the new id is pending, the batch is held
     return static_cast<int64_t>(n) <= INT32_MAX;
 }
 
@@ -2638,8 +2582,13 @@ void ProducerImpl::stampAttempt_(InFlightBatch& b, uint8_t tag) noexcept {
 }
 
 void ProducerImpl::resequence_(PartitionState& ps) noexcept {
-    namespace rb = rune::protocol::batch;
     resetPartition_(ps);
+    if (ps.producerId < 0) return;   // epoch overflow: the stored batches are re-stamped when the new id arrives
+    restampInflight_(ps);
+}
+
+void ProducerImpl::restampInflight_(PartitionState& ps) noexcept {
+    namespace rb = rune::protocol::batch;
     int32_t seq = 0;
     ps.inflight.forEachLive([&](InFlightBatch& b) {
         // Re-stamp the stored frame: Produce body + the CRC-covered batch header.
@@ -3725,16 +3674,122 @@ template int ProducerImpl::retransmitStalled<CountingSink>(int64_t, const Counti
 
 namespace rune::client::producer {
 
+void ProducerImpl::enableCoordinator(CoordinatorSink sink, uint32_t seqBase) {
+    coord_.emplace(ordinal_, sink, seqBase);
+    // A Client producer already expects its broker id (expectBrokerId, at creation); a hub fed a bare impl
+    // moves it off the rig id here.
+    if (const auto* a = std::get_if<IdAssigned>(&identity_); a != nullptr && a->producerId == kRigProducerId) {
+        expectBrokerId();
+    }
+}
+
+void ProducerImpl::expectBrokerId() {
+    // FD4: acks=None never consults an identity (-1/-1/-1 on the wire); a transactional producer's identity
+    // is set by initTransactions (Task 5); every other acked producer asks the broker for its id.
+    if (cfg_.acks == Acks::None) {
+        identity_ = IdAssigned{-1, -1};
+    } else {
+        identity_ = IdUnassigned{};
+        // Partitions made before the id (route pre-creation, Direct appends) hold the rig id: they adopt the real one.
+        for (auto& up : partitions_) up->producerId = -1;
+    }
+    publishStatus_();
+}
+
+void ProducerImpl::publishStatus_() noexcept {
+    ProducerStatus st;
+    st.identityState = static_cast<uint8_t>(identity_.index());
+    if (const auto* a = std::get_if<IdAssigned>(&identity_)) {
+        st.producerId    = a->producerId;
+        st.producerEpoch = a->epoch;
+    }
+    (void)statusRing_.tryPublish(st);   // a refused publish is superseded by the next transition
+}
+
+int ProducerImpl::identityStepCold_(int64_t nowNs) noexcept {
+    if (std::holds_alternative<IdUnassigned>(identity_)) {
+        // A transactional producer's id is requested by initTransactions (Task 5), with its transactional id.
+        if (!cfg_.transactionalId.empty() || !coord_ || !coord_->connected()) return 0;
+        sendInitProducerId_(nowNs);
+        return std::holds_alternative<IdRequested>(identity_) ? 1 : 0;
+    }
+    if (const auto* f = std::get_if<IdFailed>(&identity_)) {
+        // Every record accepted since the failure completes the same way (explicitly, never silently).
+        failAllPending(f->status, f->errorCode);
+    }
+    return 0;
+}
+
+void ProducerImpl::sendInitProducerId_(int64_t nowNs) noexcept {
+    CoordinatorLink::Slot* s = coord_->acquire(
+        ReqKind::InitProducerId, nowNs + std::max<int64_t>(cfg_.produceTimeoutMs, 1) * 1'000'000LL);
+    if (s == nullptr) return;   // no free slot: next pass
+    rune::protocol::client::InitProducerId m;
+    m.correlationId        = s->corrId;
+    m.transactionTimeoutMs = 0;   // a plain producer has no transaction
+    // transactionalId stays empty: an idempotent-only producer id.
+    s->frameLen = static_cast<uint16_t>(m.encode(s->frame.data()));
+    coord_->submit(*s);
+    identity_ = IdRequested{s};
+    publishStatus_();
+}
+
+void ProducerImpl::assignIdentity_(int64_t pid, int16_t epoch) noexcept {
+    identity_ = IdAssigned{pid, epoch};
+    // Partitions that were created, or reset by an epoch overflow, while the id was pending adopt it.
+    for (auto& up : partitions_) {
+        PartitionState& ps = *up;
+        if (ps.producerId >= 0) continue;
+        ps.producerId = pid;
+        ps.epoch      = epoch;
+        if (!ps.inflight.empty()) restampInflight_(ps);
+        markDirty_(ps);
+    }
+    publishStatus_();
+}
+
+void ProducerImpl::onInitAnswer_(const CoordAnswer& a, CoordinatorLink::Slot&) noexcept {
+    namespace rpc = rune::protocol::client;
+    if (a.errorCode == 0 && !a.anyKind) {
+        const auto m = rpc::InitProducerIdResponse::decode(a.frame.data(), a.frame.size());
+        if (m && m->producerId >= 0) {
+            assignIdentity_(m->producerId, m->producerEpoch);
+            return;
+        }
+        identity_ = IdFailed{OpStatus::DeliveryFailed, static_cast<uint16_t>(rpc::ErrorCode::InvalidRequest)};
+    } else {
+        // Anything the link did not retry (FD5/FD6): non-retriable, so every record fails explicitly.
+        identity_ = IdFailed{OpStatus::DeliveryFailed, static_cast<uint16_t>(a.errorCode)};
+    }
+    publishStatus_();
+    failAllPending(OpStatus::DeliveryFailed, std::get<IdFailed>(identity_).errorCode);
+}
+
+void ProducerImpl::onInitExpired_(CoordinatorLink::Slot& s) noexcept {
+    // The answer never came (lost frame, dead coordinator): ask again; records stay held meanwhile.
+    if (const auto* r = std::get_if<IdRequested>(&identity_); r != nullptr && r->slot == &s) {
+        identity_ = IdUnassigned{};
+    }
+}
+
 void ProducerImpl::onCoordinatorAnswer(const CoordAnswer& a, int64_t nowNs) noexcept {
     ++coordAnswersSeen_;
     lastCoordCorrId_ = a.corrId;
     if (!coord_) return;
-    if (CoordinatorLink::Slot* s = coord_->onAnswer(a, nowNs)) coord_->release(*s);
+    CoordinatorLink::Slot* s = coord_->onAnswer(a, nowNs);
+    if (s == nullptr) return;
+    if (s->kind == ReqKind::InitProducerId) {
+        const auto* r = std::get_if<IdRequested>(&identity_);
+        if (r != nullptr && r->slot == s) onInitAnswer_(a, *s);
+    }
+    coord_->release(*s);
 }
 
 int ProducerImpl::pumpCoordinator(int64_t nowNs) noexcept {
     if (!coord_ || coord_->inUse() == 0) [[likely]] return 0;   // idle link: one load, no slot memory
-    return coord_->pump(nowNs, [](CoordinatorLink::Slot&) {});
+    return coord_->pump(nowNs, [this](CoordinatorLink::Slot& s) {
+        if (s.kind == ReqKind::InitProducerId) onInitExpired_(s);
+    });
 }
 
 }  // namespace rune::client::producer

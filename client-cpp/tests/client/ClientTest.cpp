@@ -46,6 +46,7 @@
 //     attaches to the agent's embedded driver via the same aeronDir).
 
 #include "../support/AeronTestErrors.h"
+#include "../support/PlainInitPid.h"
 #include "../support/TestCompletions.h"
 #include <rune/client/Client.h>
 #include <rune/client/codec/Codec.h>
@@ -219,6 +220,7 @@ struct TestGateway {
     }
 
     void onFrame(const uint8_t* buf, std::size_t len) {
+        { uint8_t ipr[64]; if (const std::size_t ipn = test_support::plainInitPidReply(buf, len, 9001, ipr); ipn > 0) { send(ipr, ipn); return; } }  // FD4: broker-assigned id
         auto tidOpt = rcc::peekTemplate(buf, len);
         if (!tidOpt) return;
 

@@ -4358,6 +4358,7 @@ Producer Client::producerWithRingCap_(ProducerConfig cfg, int32_t ringCap, bool 
     // here until the registration is accepted (then the duty side holds its
     // share and the handle the other — spec §3.3).
     auto impl = std::make_unique<producer::ProducerImpl>(cfg, ringCap);
+    impl->expectBrokerId();   // FD4: the id comes from the broker (InitProducerId); records are held until then
 
     // fix1 C1: wire the pump hook in BOTH runner modes — a back-pressured
     // blocking send() must never wait on a ring consumer that IS the calling

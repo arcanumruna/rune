@@ -12,6 +12,7 @@
 // receives is checked: it must arrive after the broker side holds keys and open under
 // them (sealed, not plaintext).
 #include "../support/TestCompletions.h"
+#include "../support/PlainInitPid.h"
 #include "../support/AeronTestErrors.h"
 #include <rune/client/Client.h>
 #include <rune/client/codec/Codec.h>
@@ -256,6 +257,13 @@ struct TwoLegTlsGateway {
             if (t == rcc::TemplateId::MetadataRequest) ++metadataSeen;
             if (*tid == static_cast<uint16_t>(rune::protocol::client::TemplateId::JoinGroup)) ++joinGroupsSeen;
             if (*tid == static_cast<uint16_t>(rune::protocol::client::TemplateId::InitProducerId)) ++initPidsSeen;
+            if (*tid == static_cast<uint16_t>(rune::protocol::client::TemplateId::InitProducerId)) {
+                uint8_t plain[128], sealed[256];   // FD4: a plain producer's id from the "broker"
+                if (const std::size_t pn = test_support::plainInitPidReply(opened, on, 9001, plain); pn > 0) {
+                    const std::size_t sn = rcc::sealFrame(it->second.keys, plain, pn, sealed, sizeof sealed);
+                    if (sn > 0) sendRaw(sealed, sn);
+                }
+            }
             if (t == rcc::TemplateId::Ping) {
                 ++pingsSeen;
                 if (auto pg = rcc::decodePing(opened, on)) {
