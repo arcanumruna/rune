@@ -132,7 +132,9 @@ void logRecovered(const ViewInstance& inst, int64_t recoveredO, std::size_t appl
 // Most source records one fold pass may cover so the pass's checkpoint delta
 // (worst case) fits ONE ring message of `maxMsg` payload bytes; 0 if not even
 // one record fits.  Worst case per source record: Replace dirties 1 output row;
-// an aggregate dirties its contributor + old/new group + old/new output row.
+// an aggregate dirties its contributor + old/new group + old/new output row;
+// a linked (Min/Max/Last) view also dirties the old list neighbours and the new
+// head (see aggDirtyBoundPerRecord).
 int64_t maxRecordsPerPassFor(const ViewInstance& inst, std::size_t maxMsg) {
     using namespace rune::view;
     std::size_t fixed = ViewSnapshotChannel::kDeltaHeaderBytes + kCheckpointCrcBytes;
