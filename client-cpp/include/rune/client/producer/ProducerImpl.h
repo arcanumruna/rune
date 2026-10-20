@@ -275,6 +275,11 @@ struct PartitionState {
     // partition has no work left.  Owner/duty thread only.
     bool dirty = false;
 
+    // Phase 2b F Task 6: membership in the current transaction (CoordinatorLink.h).  Only an Added partition's
+    // NEW batches are sent: a transactional partition waits for its AddPartitionsToTxn OK; a plain producer's
+    // partitions are created Added (flushBatches pays one index compare).  Duty thread only.
+    TxnMembership txn{};
+
     // Task 14 fix2: records of THIS partition waiting in the producer's
     // DeferredArena (owner thread only).  >0 gates this partition's Direct
     // sends (per-partition order) without touching any other partition.
@@ -1227,6 +1232,11 @@ public:
     void onSessionRevoked(uint16_t errorCode) noexcept;
     /// beginTransaction() calls the machine refused (outside Ready): counted, no side effect.
     [[nodiscard]] uint64_t txnRefusedBegins() const noexcept { return txnRefusedBegins_; }
+    /// FD2 duty re-check (Task 6): void records that reached the duty side while the machine was not InTransaction
+    /// - never produced, counted here (they fail the transaction: commit completes with its error).  Duty thread.
+    [[nodiscard]] uint64_t txnRecordsRefusedDuty() const noexcept { return txnRecordsRefusedDuty_; }
+    /// Partitions in the current transaction (left NotInTxn since it began).  Duty thread; diagnostics / tests.
+    [[nodiscard]] std::size_t txnPartitionCount() const noexcept { return txnSeen_.size(); }
     /// Test seams (duty thread): the data / offsets legs of Tasks 6 / 7 drive these through the same paths.
     void testMarkStarted(TxnStarted s = TxnStarted::Yes) noexcept { markStarted_(s); }
     void testPoison(OpStatus st, uint16_t errorCode, AbortKind kind) noexcept { poison_(st, errorCode, kind); }
@@ -1602,10 +1612,19 @@ private:
                        int16_t producerEpoch, int64_t producerId = -1) noexcept;
     /// Records that never reached a batch (failed in the ring / a builder /
     /// the Tier-2 queue / the arena): a BatchAck{baseSequence -1, kClientFailure}.
+    /// Phase 2b F Task 6: every record failure goes through here or txnNoteLoss_ directly - a transactional
+    /// producer's lost record poisons its transaction (a commit never sends EndTxn(commit) over lost data).
     void emitUnsentBatchAck_(int32_t topicId, int32_t partition, int32_t recordCount, OpStatus st,
-                             uint32_t units) noexcept {
+                             uint32_t units, uint16_t errorCode = 0) noexcept {
         emitBatchAck_(topicId, partition, -1, recordCount, -1, BatchAck::kClientFailure, st, units, -1);
+        txnNoteLoss_(st, errorCode, AbortKind::Plain);   // never sent: no sequence gap
     }
+    /// A record of a transactional producer failed (`kind`: BumpEpoch when it was sent - its sequence outcome is
+    /// unknown).  Plain producers: one compare on a failure path only.
+    void txnNoteLoss_(OpStatus st, uint16_t errorCode, AbortKind kind) noexcept {
+        if (txnBatchAttrs_ != 0) [[unlikely]] txnLost_(st, errorCode, kind);
+    }
+    [[gnu::cold, gnu::noinline]] void txnLost_(OpStatus st, uint16_t errorCode, AbortKind kind) noexcept;
     /// Fails a live batch's records and releases its slot.
     void failBatch_(PartitionState& ps, InFlightBatch& b, OpStatus st, uint16_t errorCode = 0);
     /// Fails the never-sent builder records of `ps` (handles + one BatchAck).
@@ -1741,8 +1760,47 @@ private:
     }
     [[nodiscard]] bool txnQuiet_() const noexcept {
         const std::size_t i = txn_.index();
-        return txnFlushN_ == 0 && i != kInitializingIdx && i != kCommittingIdx && i != kAbortingIdx;
+        return txnFlushN_ == 0 && i != kInitializingIdx && i != kCommittingIdx && i != kAbortingIdx &&
+               txnAddQueue_.empty();
     }
+    // ---- Phase 2b F Task 6: transactional data (ProducerTxn.cpp; duty thread only) ----
+    // txnSeen_: the partitions that left NotInTxn in the current transaction (dense slot list, each at most once);
+    // txnAddQueue_: those queued (Adding{nullptr}) for the next AddPartitionsToTxn.  Both reserved with the
+    // partition table (getOrCreatePartition), so pushing never allocates; reset on EndTxn's final answer.
+    std::vector<uint32_t> txnSeen_;
+    std::vector<uint32_t> txnAddQueue_;
+    uint64_t              txnRecordsRefusedDuty_ = 0;
+    /// kAttrTransactional for a transactional producer, 0 for a plain one (immutable after construction): the
+    /// attributes a Tier-2 restamp sets, and the cheap "transactional" test of the failure / intake paths.
+    uint16_t              txnBatchAttrs_ = 0;
+    /// Data of the transaction may flow: InTransaction, or Committing while it waits for the data (AwaitData).
+    [[nodiscard]] bool txnFlowing_() const noexcept;
+    /// The machine is not InTransaction: a record reaching the duty side now is refused (FD2).  Plain: false.
+    [[nodiscard]] bool txnIntakeShut_() const noexcept {
+        return txnBatchAttrs_ != 0 && !std::holds_alternative<InTransaction>(txn_);
+    }
+    /// The (status, code) a record refused / discarded outside a transaction completes with (FD2).
+    [[nodiscard]] TxnOutcome txnRefusal_() const noexcept;
+    /// flushBatches, a partition that is not Added (cold): a NotInTxn one with data is queued for AddPartitions
+    /// while the data flows; everything else is held.  True: it still has work (stays dirty).
+    [[gnu::cold, gnu::noinline]] bool txnHold_(PartitionState& ps) noexcept;
+    void txnEnroll_(PartitionState& ps) noexcept;
+    /// txnStep: AddPartitionsToTxn for the queued partitions (split across slots per kCoordFrameCap).
+    int  addStep_(int64_t nowNs) noexcept;
+    void onAddPartitionsAnswer_(const CoordAnswer& a, CoordinatorLink::Slot& s) noexcept;
+    void onAddExpired_(CoordinatorLink::Slot& s) noexcept;
+    /// No AddPartitionsToTxn is on the link (a stale one re-sent after EndTxn could open a new transaction).
+    [[nodiscard]] bool txnAddsSettled_() const noexcept;
+    /// EndTxn's final answer / a terminal end: every partition of the transaction back to NotInTxn.
+    void txnResetMembership_() noexcept;
+    /// Abort (AwaitData): every record of the producer not yet sent completes `o`, never produced; an
+    /// AddPartitionsToTxn still on the link is cancelled.  True when anything was discarded / cancelled.
+    bool txnDiscardUnsent_(const TxnOutcome& o) noexcept;
+    /// FD2 duty re-check, Ring mode: reads up to `limit` ring messages and refuses each record (never produced).
+    [[gnu::cold, gnu::noinline]] int refuseRingTxn_(int limit) noexcept;
+    /// Sequence reset of a transactional partition (KIP-360: the coordinator owns the epoch - never bumped
+    /// locally): the partition sends nothing new, the transaction must abort and the abort bumps the epoch.
+    [[gnu::cold, gnu::noinline]] void txnResetPartition_(PartitionState& ps) noexcept;
     /// A txn op (or flush) still owes its completion: the producer is not releasable before it is decided.
     [[nodiscard]] bool txnHasLiveOp_() const noexcept;
     int  txnStepCold_(int64_t nowNs) noexcept;

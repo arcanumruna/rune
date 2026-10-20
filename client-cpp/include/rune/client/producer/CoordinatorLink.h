@@ -165,7 +165,10 @@ struct TxnJoiners {
 };
 
 struct AwaitData {};                                          ///< EndTxn waits for every record of the txn to be acked
-struct EndSent  { CoordinatorLink::Slot* slot = nullptr; };   ///< EndTxn on the link
+/// Which send of EndTxn is on the link: the first, or the re-send of an in-doubt one (ResendEnd).  After a re-send
+/// of EndTxn(commit) the first may have landed, so only a definite answer ends it: a non-retriable one is fatal.
+enum class EndTry : uint8_t { First, Resend };
+struct EndSent  { CoordinatorLink::Slot* slot = nullptr; EndTry attempt = EndTry::First; };   ///< EndTxn on the link
 /// Where an op that timed out left its transaction (the app retries the SAME direction, B-2):
 ///   BeforeEnd - EndTxn was never sent (the data wait timed out): the retry waits for the data, then sends it;
 ///   AfterEnd  - EndTxn was sent, its answer is unknown: it may have landed - never poisoned, never aborted over;
@@ -183,12 +186,18 @@ struct Initializing   { TxnOp op; CoordinatorLink::Slot* slot = nullptr; };   //
 struct Ready          {};
 struct InTransaction  { TxnStarted started = TxnStarted::No; };
 struct Committing     { TxnOp op; EndPhase phase = AwaitData{}; TxnStarted started = TxnStarted::No; TxnJoiners joined{}; };
+/// What the records an abort discards complete with (Task 6): the poison of an AbortableError, else 19.
+struct TxnOutcome {
+    OpStatus status    = OpStatus::BrokerError;
+    uint16_t errorCode = 19;   // InvalidTxnState
+};
 struct Aborting       {
     TxnOp      op;
     EndPhase   phase   = AwaitData{};
     TxnStarted started = TxnStarted::No;
     AbortKind  kind    = AbortKind::Plain;
     TxnJoiners joined{};
+    TxnOutcome discard{};   ///< unsent records of the transaction complete with it (never produced)
 };
 struct AbortableError {
     OpStatus   status    = OpStatus::BrokerError;
@@ -199,5 +208,19 @@ struct AbortableError {
 struct FatalError     { OpStatus status = OpStatus::Fenced; uint16_t errorCode = 0; };
 using TxnMachine = std::variant<Uninitialized, Initializing, Ready, InTransaction, Committing, Aborting,
                                 AbortableError, FatalError>;
+
+// ---- Phase 2b F Task 6: a partition's membership in the current transaction (PartitionState::txn) ----
+//   NotInTxn -first record while InTransaction (seen by the flush)-> Adding{nullptr} (queued) -AddPartitionsToTxn
+//   offered-> Adding{slot} -OK-> Added | -non-retriable-> AddFailed (the machine AbortableError) | -timeout-> queued
+//   again (TxnStarted::Maybe when the frame was offered).  Only an Added partition's batches are ever sent; on
+//   EndTxn's final answer every partition of the transaction goes back to NotInTxn.  A plain producer's partitions
+//   are Added for ever: the flush pays one index compare.
+struct NotInTxn  {};
+struct Adding    { CoordinatorLink::Slot* slot = nullptr; };   ///< nullptr: queued for the next AddPartitionsToTxn
+struct Added     {};
+struct AddFailed { uint16_t errorCode = 0; };
+using TxnMembership = std::variant<NotInTxn, Adding, Added, AddFailed>;
+inline constexpr std::size_t kAddedIndex = 2;   // index of Added in TxnMembership
+static_assert(std::is_same_v<std::variant_alternative_t<kAddedIndex, TxnMembership>, Added>);
 
 }  // namespace rune::client::producer

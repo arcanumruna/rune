@@ -264,6 +264,25 @@ struct Rig {
         if (!impl->submitSendRecord(1, part, Key(uint64_t{1}), kVal, false, 0)) return false;
         return impl->drainRing(now, 16) == 1;
     }
+    /// Task 6: the partitions of the records sent so far join the transaction - their AddPartitionsToTxn is
+    /// answered OK (the data is held until then).
+    void addOk() {
+        for (int i = 0; i < 3 && pendingAdd() == nullptr; ++i) tick();
+        const OfferedFrame* f = pendingAdd();
+        ASSERT_NE(f, nullptr) << "no AddPartitionsToTxn for the transaction's records";
+        answeredAdds.push_back(f->corrId);
+        answer(FakeCoordinator::answer(rp::ReqKind::AddPartitions, f->corrId, 0));
+    }
+    [[nodiscard]] const OfferedFrame* pendingAdd() const {
+        for (const auto& f : fake.offered) {
+            if (f.templateId == rpc::AddPartitionsToTxn::TEMPLATE_ID &&
+                std::find(answeredAdds.begin(), answeredAdds.end(), f.corrId) == answeredAdds.end()) {
+                return &f;
+            }
+        }
+        return nullptr;
+    }
+    std::vector<int64_t> answeredAdds;
     void ackLastData(int16_t code = 0, int64_t base = 0) {
         ASSERT_FALSE(wire.empty());
         hub.onProduceResponse(wire.back().corrId, code == 0 ? base : -1, code);
@@ -297,7 +316,7 @@ constexpr bool notBool() { return !std::is_same_v<std::remove_cvref_t<M>, bool>;
 template <class T>
 constexpr bool noBoolMembers() {
     constexpr std::size_t n = fields<T>();
-    static_assert(n <= 5, "extend the binder below");
+    static_assert(n <= 6, "extend the binder below");
     // Structured bindings name each member's declared type (decltype of a binding).
     constexpr auto check = [](T& t) {
         if constexpr (n == 0) {
@@ -315,10 +334,14 @@ constexpr bool noBoolMembers() {
             auto& [a, b, c, d] = t;
             return notBool<decltype(a)>() && notBool<decltype(b)>() && notBool<decltype(c)>() &&
                    notBool<decltype(d)>();
-        } else {
+        } else if constexpr (n == 5) {
             auto& [a, b, c, d, e] = t;
             return notBool<decltype(a)>() && notBool<decltype(b)>() && notBool<decltype(c)>() &&
                    notBool<decltype(d)>() && notBool<decltype(e)>();
+        } else {
+            auto& [a, b, c, d, e, f] = t;
+            return notBool<decltype(a)>() && notBool<decltype(b)>() && notBool<decltype(c)>() &&
+                   notBool<decltype(d)>() && notBool<decltype(e)>() && notBool<decltype(f)>();
         }
     };
     T t{};
@@ -337,6 +360,8 @@ TEST(ProducerTxn, MachineStatesCarryNoBooleans) {
     static_assert(nobool::everyAlternative<rp::EndPhase>(), "an EndPhase carries a bool member");
     static_assert(nobool::noBoolMembers<rp::TxnOp>(), "TxnOp carries a bool member");
     static_assert(nobool::noBoolMembers<rp::TxnJoiners>(), "TxnJoiners carries a bool member");
+    static_assert(nobool::everyAlternative<rp::TxnMembership>(), "a TxnMembership state carries a bool member");
+    static_assert(nobool::noBoolMembers<rp::TxnOutcome>(), "TxnOutcome carries a bool member");
     static_assert(std::variant_size_v<rp::TxnMachine> == static_cast<std::size_t>(TxnState::FatalError) + 1);
     SUCCEED();
 }
@@ -603,6 +628,8 @@ TEST(ProducerTxn, CommitWaitsForDataThenSendsEndTxnCommit) {
     r.startTxn();
     ASSERT_TRUE(r.sendRecord(0));
     ASSERT_TRUE(r.sendRecord(1));
+    r.addOk();
+    ASSERT_TRUE(r.wire.empty()) << "linger: held in the builders";
     Op commit = r.commit();
     r.tick();
     ASSERT_EQ(r.wire.size(), 2u) << "the commit flushes what the transaction accepted";
@@ -630,6 +657,7 @@ TEST(ProducerTxn, EndTxnDeadlineStartsAtItsCreationRegression) {
     r.initOk();
     r.startTxn();
     ASSERT_TRUE(r.sendRecord());
+    r.addOk();
     Op commit = r.commit();   // applied at t0: op deadline t0 + 1 s
     r.tick();
     ASSERT_EQ(r.wire.size(), 1u);
@@ -995,6 +1023,7 @@ TEST(ProducerTxn, SequenceGapAbortBumpsTheEpoch) {
     // The next transaction's data goes out under the bumped epoch from sequence 0.
     r.startTxn();
     ASSERT_TRUE(r.sendRecord());
+    r.addOk();   // Task 6: the partition joins the transaction
     Op commit = r.commit();
     r.tick();
     ASSERT_EQ(r.wire.size(), 1u);
@@ -1057,6 +1086,7 @@ TEST(ProducerTxn, FlushWaitsForTheRecordsAcceptedBeforeIt) {
     r.initOk();
     r.startTxn();
     ASSERT_TRUE(r.sendRecord());
+    r.addOk();   // Task 6: the partition joins the transaction
     Op flush = r.flush();
     r.tick();
     ASSERT_EQ(r.wire.size(), 1u);
@@ -1075,6 +1105,7 @@ TEST(ProducerTxn, FlushTimeoutDoesNotPoison) {
     r.initOk();
     r.startTxn();
     ASSERT_TRUE(r.sendRecord());
+    r.addOk();   // Task 6: the partition joins the transaction
     r.tick();                                      // produced, ack held
     Op flush = r.flush();
     r.tick(r.cfg.transactionOpTimeoutMs * kMs);
@@ -1218,6 +1249,7 @@ TEST(ProducerTxnRegression, SessionRevokedIsFatalAndNothingIsResentRegression) {
         r.initOk();
         r.startTxn();
         ASSERT_TRUE(r.sendRecord());
+        r.addOk();   // Task 6: the partition joins the transaction
         r.tick();
         Op flush = r.flush();
         r.tick();
@@ -1383,6 +1415,7 @@ TEST(ProducerTxnRegression, TransientLogFullBackoffIsWallClockTimeRegression) {
     r.initOk(77, 0);
     r.startTxn();
     ASSERT_TRUE(r.sendRecord());
+    r.addOk();   // Task 6: the partition joins the transaction
     r.tick();
     ASSERT_EQ(r.wire.size(), 1u);
     for (int answer = 0; answer < 12; ++answer) {   // a long full ring: answered 42 again and again
@@ -1471,6 +1504,7 @@ TEST(ProducerTxnRegression, PoisonAfterAnInDoubtCommitEndTxnNeverAbortsRegressio
         r.initOk();
         r.startTxn();
         ASSERT_TRUE(r.sendRecord());
+        r.addOk();   // Task 6: the partition joins the transaction
         Op first = r.commit();
         r.tick();
         r.tick(r.cfg.transactionOpTimeoutMs * kMs);
@@ -1529,6 +1563,9 @@ TEST(ProducerTxnRegression, CloseAfterAnInDoubtBumpRetriesOnlyTheBumpRegression)
     r.tick();
     r.tick(r.cfg.transactionOpTimeoutMs * kMs);
     ASSERT_EQ(abort.status(), OpStatus::Timeout);
+    // Task 6 (re-review Minor 2): a LATE leg OK before close().  The old encoding (started = No once EndTxn(abort)
+    // was answered) let it mark the transaction started again, and close's abort then re-sent EndTxn.
+    r.impl->testLegAnswer(rp::ReqKind::AddPartitions, 0);
     Op cl = r.close();
     r.ticks(3, kMs);
     EXPECT_EQ(r.endTxns(), 1u) << "close re-sent EndTxn under the stale epoch";
@@ -1612,4 +1649,49 @@ TEST(ProducerTxnRegression, CloseOwnAbortAbandonsAnOpenDirectClaimRegression) {
     EXPECT_TRUE(r.wire.empty()) << "the abandoned claim's bytes reached a frame";
     ASSERT_TRUE(cl.ready());
     EXPECT_EQ(cl.status(), OpStatus::Ok);
+}
+
+
+// Task 6 (Task 5 re-review, out of scope there): after an EndTxn(commit) may have landed, only a definite answer ends
+// the commit.  A non-retriable answer to its RE-SEND - 39, or an ErrorResponse with code 0 (read as 39) - is
+// FatalError with that code, never AbortableError: the app could otherwise abort over a commit that landed.  The
+// FIRST EndTxn(commit) answered 39 stays abortable (FD6): nothing can have landed before it.
+TEST(ProducerTxnRegression, RefusedResentCommitIsFatalNeverAbortableRegression) {
+    for (const bool errorResponse : {false, true}) {
+        SCOPED_TRACE(errorResponse ? "ErrorResponse code 0" : "EndTxnResponse 39");
+        Rig r;
+        r.initOk();
+        r.startTxn();
+        Op first = r.commit();
+        r.tick();
+        ASSERT_EQ(r.endTxns(), 1u);
+        r.tick(r.cfg.transactionOpTimeoutMs * kMs);   // never answered: in doubt - it may have landed
+        ASSERT_EQ(first.status(), OpStatus::Timeout);
+        Op retry = r.commit();                         // re-sends EndTxn(commit)
+        r.tick();
+        ASSERT_EQ(r.endTxns(), 2u);
+        if (errorResponse) {
+            r.answer(FakeCoordinator::errorResponse(r.lastEndCorr(), static_cast<rpc::ErrorCode>(0), ""));
+        } else {
+            r.endAnswer(ec(rpc::ErrorCode::InvalidRequest));
+        }
+        ASSERT_TRUE(retry.ready());
+        EXPECT_EQ(retry.status(), OpStatus::BrokerError);
+        EXPECT_EQ(retry.code(), uec(rpc::ErrorCode::InvalidRequest));
+        EXPECT_EQ(r.state(), TxnState::FatalError) << "a commit that may have landed became abortable";
+        Op abort = r.abort();
+        ASSERT_TRUE(abort.ready());
+        EXPECT_EQ(abort.status(), OpStatus::BrokerError);
+        r.ticks(4, kMs);
+        EXPECT_EQ(r.endTxns(), 2u) << "an EndTxn(abort) over a commit that may have landed";
+    }
+    Rig r;   // the first EndTxn(commit) refused: nothing landed - abortable, as FD6 says
+    r.initOk();
+    r.startTxn();
+    Op commit = r.commit();
+    r.tick();
+    r.endAnswer(ec(rpc::ErrorCode::InvalidRequest));
+    ASSERT_TRUE(commit.ready());
+    EXPECT_EQ(commit.status(), OpStatus::BrokerError);
+    EXPECT_EQ(r.state(), TxnState::AbortableError);
 }

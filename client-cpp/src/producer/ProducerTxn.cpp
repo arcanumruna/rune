@@ -1,4 +1,5 @@
-// src/producer/ProducerTxn.cpp - Phase 2b F Task 5: the transaction state machine of ProducerImpl (duty side).
+// src/producer/ProducerTxn.cpp - Phase 2b F Tasks 5 / 6: the transaction state machine of ProducerImpl (duty side)
+// and the transaction's data (AddPartitionsToTxn gating per partition, the duty re-check, poisoning).
 //
 // See ProducerImpl.h ("the transaction machine") and CoordinatorLink.h (the states).  Rules ported from the old
 // TransactionalProducerImpl (Kafka TransactionManager):
@@ -9,12 +10,19 @@
 //   * B-2: a commit / abort that times out is InDoubt; the SAME call re-sends EndTxn (abort refused while
 //     committing); the local state resets only on EndTxn's final answer;
 //   * B-3 / B-4 (KIP-360): a sequence gap makes the abort bump the epoch (InitProducerId after EndTxn(abort));
-//     once EndTxn(abort) is answered the transaction counts as not started, so a retried abort re-sends ONLY the
-//     bump;
+//     once EndTxn(abort) is answered the end phase is Bumping (then InDoubt{Bump} if the bump times out), so a
+//     retried abort re-sends ONLY the bump;
 //   * m15: TxnStarted::Maybe + 19 on EndTxn(abort) = nothing was open: the abort is done;
 //   * FD6: 17 / 18 -> FatalError(Fenced); 19 or 45 / 47 on EndTxn, any non-retriable InitProducerId ->
-//     FatalError(BrokerError code); 39 on EndTxn -> AbortableError(39); a leg's 19 / 45 / unknown ->
+//     FatalError(BrokerError code); 39 on the FIRST EndTxn -> AbortableError(39); a leg's 19 / 45 / unknown ->
 //     AbortableError; SessionRevoked -> FatalError(BrokerError 46);
+//   * Task 6: once an EndTxn(commit) may have landed (it was re-sent after an in-doubt timeout), only a definite
+//     answer ends it - a non-retriable one (incl. 39, and a code-0 ErrorResponse read as 39) is FatalError with
+//     that code, never AbortableError (the app could otherwise abort over a commit that landed);
+//   * Task 6 data: a partition's batches are sent only once its AddPartitionsToTxn is OK (PartitionState::txn);
+//     every record failure poisons the transaction (AbortableError: a commit never sends EndTxn(commit) over lost
+//     data); a record reaching the duty side while the machine is not InTransaction is never produced (FD2); an
+//     abort discards every record not yet sent (Kafka abortUndrainedBatches) - never produced;
 //   * m5 / m13: a second commit / abort while one is pending joins it.
 //
 // Re-entrancy: a completion is delivered only AFTER the state transition it reports is complete (its op copied
@@ -27,6 +35,8 @@
 #include <rune/protocol/client/TxnMessages.h>
 
 #include <algorithm>
+#include <cstdio>
+#include <optional>
 
 namespace rune::client::producer {
 
@@ -217,7 +227,7 @@ void ProducerImpl::applyTxnControl(const TxnControl& c, int64_t nowNs) {
         if (const auto* it = std::get_if<InTransaction>(&txn_)) {
             const TxnStarted started = it->started;
             abandonOpenClaimForClose();
-            txn_ = Aborting{op, AwaitData{}, started, AbortKind::Plain, {}};
+            txn_ = Aborting{op, AwaitData{}, started, AbortKind::Plain, {}, TxnOutcome{}};
             dutyFlushPending_ = true;
             publishStatus_();
             return;
@@ -225,8 +235,9 @@ void ProducerImpl::applyTxnControl(const TxnControl& c, int64_t nowNs) {
         if (const auto* ae = std::get_if<AbortableError>(&txn_)) {
             const TxnStarted started = ae->started;
             const AbortKind  kind    = ae->kind;
+            const TxnOutcome failed{ae->status, ae->errorCode};   // its records complete with the poison
             abandonOpenClaimForClose();
-            txn_ = Aborting{op, AwaitData{}, started, kind, {}};
+            txn_ = Aborting{op, AwaitData{}, started, kind, {}, failed};
             dutyFlushPending_ = true;
             publishStatus_();
             return;
@@ -261,7 +272,7 @@ bool ProducerImpl::txnHasLiveOp_() const noexcept {
 }
 
 bool ProducerImpl::txnDataSettled_() const noexcept {
-    if (!deferred_.empty()) return false;
+    if (!deferred_.empty() || !txnAddsSettled_()) return false;
     for (const auto& up : partitions_) {
         const PartitionState& ps = *up;
         if ((ps.builder && ps.builder->recordCount() > 0) || ps.hasTier2() || !ps.inflight.empty()) return false;
@@ -286,6 +297,7 @@ int ProducerImpl::txnStepCold_(int64_t nowNs) noexcept {
     } else if (std::holds_alternative<Committing>(txn_) || std::holds_alternative<Aborting>(txn_)) {
         work += endStep_(nowNs);
     }
+    if (!txnAddQueue_.empty()) work += addStep_(nowNs);
     if (txnFlushN_ != 0) work += flushStep_(nowNs);
     return work;
 }
@@ -302,6 +314,13 @@ int ProducerImpl::endStep_(int64_t nowNs) noexcept {
         return 1;
     }
     if (std::holds_alternative<AwaitData>(phase)) {
+        if (ab != nullptr) {
+            // Task 6 (Kafka abortUndrainedBatches): an abort never produces what is not sent yet - every record of
+            // the transaction still unsent completes with the abort's outcome.  Completions may run user code: the
+            // state is re-read on the next pass.
+            const TxnOutcome o = ab->discard;
+            if (txnDiscardUnsent_(o)) return 1;
+        }
         // TX-6: EndTxn only once every record of the transaction is acked.
         if (!txnDataSettled_()) {
             dutyFlushPending_ = true;
@@ -328,7 +347,7 @@ int ProducerImpl::endStep_(int64_t nowNs) noexcept {
         s->frameLen = static_cast<uint16_t>(m.encode(s->frame.data()));
         coord_->submit(*s);
         op.deadlineNs = deadline;
-        phase         = EndSent{s};
+        phase         = EndSent{s, std::holds_alternative<ResendEnd>(phase) ? EndTry::Resend : EndTry::First};
         return 1;
     }
     if (auto* b = std::get_if<Bumping>(&phase); b != nullptr && b->slot == nullptr && coord_) {
@@ -454,6 +473,7 @@ void ProducerImpl::enterFatal_(OpStatus st, uint16_t errorCode, std::string_view
     const std::size_t nFlushes = txnFlushN_;
     txnFlushN_ = 0;
     if (coord_) coord_->releaseAll();   // never offered, never re-sent (a session change re-sends nothing)
+    txnResetMembership_();              // the AddPartitions slots are gone with the rest
     txn_      = FatalError{st, errorCode};
     identity_ = IdFailed{st, errorCode};   // the identity machine fails every pending and future record
     publishStatus_();
@@ -482,6 +502,7 @@ void ProducerImpl::finishTxn_() noexcept {
     else if (const auto* ab = std::get_if<Aborting>(&txn_)) { op = ab->op; joined = ab->joined; }
     else return;
     txn_ = Ready{};   // EndTxn's final answer: only now is the transaction closed locally
+    txnResetMembership_();   // Task 6: every partition of the transaction is NotInTxn again
     publishStatus_();
     const OpKind kind = commit ? OpKind::CommitTransaction : OpKind::AbortTransaction;
     completeTxn_(op, kind, OpStatus::Ok, 0, {});
@@ -525,6 +546,10 @@ void ProducerImpl::initExpired_(bool releaseSlot) noexcept {
 }
 
 void ProducerImpl::onTxnSlotExpired_(CoordinatorLink::Slot& s) noexcept {
+    if (s.kind == ReqKind::AddPartitions) {
+        onAddExpired_(s);
+        return;
+    }
     if (const auto* in = std::get_if<Initializing>(&txn_); in != nullptr && in->slot == &s) {
         initExpired_(/*releaseSlot=*/false);
         return;
@@ -620,8 +645,15 @@ void ProducerImpl::onEndTxnAnswer_(const CoordAnswer& a, CoordinatorLink::Slot& 
         return;
     case Verdict::Abortable:
     case Verdict::Reject: {
-        // 39 InvalidRequest (FD6): never re-sent; the transaction can only be aborted (a decode failure is not a
-        // fence).  The end op completes with it.
+        if (cm != nullptr && sent->attempt == EndTry::Resend) {
+            // Task 6: the FIRST EndTxn(commit) may have landed - only a definite answer ends the commit.  A
+            // non-retriable answer to its re-send cannot say it did not: FatalError with that code, never an abort.
+            enterFatal_(OpStatus::BrokerError, ucode,
+                        "EndTxn: the re-sent commit was refused and the first one may have landed (fatal)");
+            return;
+        }
+        // 39 InvalidRequest (FD6) on the first EndTxn: never re-sent; the transaction can only be aborted (a decode
+        // failure is not a fence).  The end op completes with it.
         const bool       commit  = cm != nullptr;
         const TxnOp      op      = commit ? cm->op : ab->op;
         const TxnJoiners joined  = commit ? cm->joined : ab->joined;
@@ -670,10 +702,236 @@ void ProducerImpl::txnDiscard_(OpStatus st, uint16_t errorCode) noexcept {
     const std::size_t nFlushes = txnFlushN_;
     txnFlushN_ = 0;
     if (coord_) coord_->releaseAll();
+    txnResetMembership_();
     if (std::holds_alternative<IdRequested>(identity_)) identity_ = IdUnassigned{};
     publishStatus_();
     for (std::size_t i = 0; i < n; ++i) completeTxn_(ops[i], kinds[i], st, errorCode, "producer closed");
     for (std::size_t i = 0; i < nFlushes; ++i) completeTxn_(flushes[i], OpKind::Flush, st, errorCode, "producer closed");
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Task 6: the transaction's data - AddPartitionsToTxn per partition, the duty re-check, poisoning
+// ---------------------------------------------------------------------------------------------------------------
+
+bool ProducerImpl::txnFlowing_() const noexcept {
+    if (std::holds_alternative<InTransaction>(txn_)) return true;
+    const auto* cm = std::get_if<Committing>(&txn_);
+    return cm != nullptr && std::holds_alternative<AwaitData>(cm->phase);
+}
+
+TxnOutcome ProducerImpl::txnRefusal_() const noexcept {
+    if (const auto* ae = std::get_if<AbortableError>(&txn_)) return TxnOutcome{ae->status, ae->errorCode};
+    if (const auto* f = std::get_if<FatalError>(&txn_)) return TxnOutcome{f->status, f->errorCode};
+    return TxnOutcome{OpStatus::BrokerError, kInvalidTxnState};   // no transaction to produce into
+}
+
+void ProducerImpl::txnLost_(OpStatus st, uint16_t errorCode, AbortKind kind) noexcept {
+    // A record the transaction accepted failed: the transaction can no longer commit (poison_ keeps a commit
+    // that may have landed, and only upgrades the abort kind once it is aborting).
+    poison_(st, errorCode, kind);
+}
+
+void ProducerImpl::txnEnroll_(PartitionState& ps) noexcept {
+    if (std::holds_alternative<NotInTxn>(ps.txn)) txnSeen_.push_back(ps.slotIndex);   // capacity reserved
+}
+
+bool ProducerImpl::txnHold_(PartitionState& ps) noexcept {
+    const bool data = (ps.builder && ps.builder->recordCount() > 0) || ps.hasTier2();
+    if (!data) return false;
+    // The first records of a partition in this transaction: queued for the next AddPartitionsToTxn (txnStep),
+    // and held until it is OK.  Outside the flowing states nothing is added: the data waits for the abort's
+    // discard (or its delivery timeout).
+    if (std::holds_alternative<NotInTxn>(ps.txn) && txnFlowing_()) {
+        txnEnroll_(ps);
+        ps.txn = Adding{nullptr};
+        txnAddQueue_.push_back(ps.slotIndex);   // capacity reserved; each slot at most once
+    }
+    return true;
+}
+
+int ProducerImpl::addStep_(int64_t nowNs) noexcept {
+    if (!txnFlowing_() || !coord_) return 0;   // queued partitions wait (an abort discards their data)
+    const auto* id = std::get_if<IdAssigned>(&identity_);
+    if (id == nullptr) return 0;
+    const int64_t deadline = nowNs + std::max<int64_t>(cfg_.produceTimeoutMs, 1) * 1'000'000LL;
+    const std::span<const uint8_t> txnId(reinterpret_cast<const uint8_t*>(cfg_.transactionalId.data()),
+                                         cfg_.transactionalId.size());
+    int         work = 0;
+    std::size_t q    = 0;
+    const std::size_t n = txnAddQueue_.size();
+    // FD5: one request carries every queued partition; what does not fit one 4096-byte frame goes in the next slot.
+    while (q < n) {
+        CoordinatorLink::Slot* s = coord_->acquire(ReqKind::AddPartitions, deadline);
+        if (s == nullptr) break;   // no free slot: the rest go next pass
+        rpc::AddPartitionsToTxn m;
+        m.correlationId   = s->corrId;
+        m.producerId      = id->producerId;
+        m.producerEpoch   = id->epoch;
+        m.transactionalId = txnId;
+        uint8_t*          f       = s->frame.data();
+        std::size_t       pos     = m.encode(f, {});   // header + body + transactional id + count 0
+        const std::size_t countAt = pos - 2;
+        uint16_t          count   = 0;
+        while (q < n && pos + 8 <= CoordinatorLink::kCoordFrameCap) {
+            PartitionState& ps = *partitions_[txnAddQueue_[q++]];
+            auto* ad = std::get_if<Adding>(&ps.txn);
+            if (ad == nullptr || ad->slot != nullptr) continue;   // no longer queued
+            rpc::detail::putLE32(f, static_cast<int>(pos), ps.topicId);
+            rpc::detail::putLE32(f, static_cast<int>(pos) + 4, ps.partition);
+            pos += 8;
+            ++count;
+            ad->slot = s;
+        }
+        if (count == 0) {
+            coord_->release(*s);
+            break;
+        }
+        rpc::detail::putLE16(f + countAt, 0, count);
+        s->frameLen = static_cast<uint16_t>(pos);
+        coord_->submit(*s);
+        ++work;
+    }
+    txnAddQueue_.erase(txnAddQueue_.begin(), txnAddQueue_.begin() + static_cast<std::ptrdiff_t>(q));   // no allocation
+    return work;
+}
+
+void ProducerImpl::onAddPartitionsAnswer_(const CoordAnswer& a, CoordinatorLink::Slot& s) noexcept {
+    // An ErrorResponse carrying code 0 is a protocol error: InvalidRequest (39), never a code-less success.
+    const int16_t  worst  = (a.anyKind && a.errorCode == 0) ? static_cast<int16_t>(kInvalidRequest) : a.errorCode;
+    const uint16_t uworst = static_cast<uint16_t>(worst);
+    switch (CoordinatorLink::classify(ReqKind::AddPartitions, worst)) {
+    case Verdict::Fenced:
+        enterFatal_(OpStatus::Fenced, uworst, "AddPartitionsToTxn: producer fenced (fatal)");
+        return;
+    case Verdict::Fatal:
+        enterFatal_(OpStatus::BrokerError, uworst, "AddPartitionsToTxn failed (fatal)");
+        return;
+    default:
+        break;
+    }
+    // Per partition: its own result when the response names it, else the request's (worst) code.
+    std::optional<rpc::AddPartitionsToTxnResponse> m;
+    if (!a.anyKind) m = rpc::AddPartitionsToTxnResponse::decode(a.frame.data(), a.frame.size());
+    bool     anyOk    = false;
+    uint16_t failCode = 0;
+    for (const uint32_t slot : txnSeen_) {
+        PartitionState& ps = *partitions_[slot];
+        const auto* ad = std::get_if<Adding>(&ps.txn);
+        if (ad == nullptr || ad->slot != &s) continue;
+        int16_t code = worst;
+        if (m) {
+            for (std::size_t i = 0; i < m->results.size(); ++i) {
+                const auto r = m->results[i];
+                if (r.topicId == ps.topicId && r.partition == ps.partition) {
+                    code = r.errorCode;
+                    break;
+                }
+            }
+        }
+        if (code == 0) {
+            ps.txn = Added{};
+            markDirty_(ps);   // its held batches go on the next flush
+            anyOk = true;
+        } else {
+            ps.txn = AddFailed{static_cast<uint16_t>(code)};   // never produced; discarded at abort
+            if (failCode == 0) failCode = static_cast<uint16_t>(code);
+        }
+    }
+    if (anyOk) markStarted_(TxnStarted::Yes);   // B-1: the coordinator has the transaction now
+    if (failCode != 0) poison_(OpStatus::BrokerError, failCode, AbortKind::Plain);   // never produced: no gap
+}
+
+void ProducerImpl::onAddExpired_(CoordinatorLink::Slot& s) noexcept {
+    // No answer by produceTimeoutMs: queued again (re-sent while the data flows).  A frame that was on the wire may
+    // have added the partitions: the transaction is possibly started (m15: an abort then sends EndTxn(abort)).
+    const bool offered = std::holds_alternative<CoordinatorLink::InFlight>(s.state);
+    bool any = false;
+    for (const uint32_t slot : txnSeen_) {
+        PartitionState& ps = *partitions_[slot];
+        auto* ad = std::get_if<Adding>(&ps.txn);
+        if (ad == nullptr || ad->slot != &s) continue;
+        ad->slot = nullptr;
+        txnAddQueue_.push_back(slot);
+        any = true;
+    }
+    if (any && offered) markStarted_(TxnStarted::Maybe);
+}
+
+bool ProducerImpl::txnAddsSettled_() const noexcept {
+    for (const uint32_t slot : txnSeen_) {
+        const auto* ad = std::get_if<Adding>(&partitions_[slot]->txn);
+        if (ad != nullptr && ad->slot != nullptr) return false;
+    }
+    return true;
+}
+
+void ProducerImpl::txnResetMembership_() noexcept {
+    for (const uint32_t slot : txnSeen_) {
+        PartitionState& ps = *partitions_[slot];
+        if (const auto* ad = std::get_if<Adding>(&ps.txn); ad != nullptr && ad->slot != nullptr && coord_) {
+            coord_->release(*ad->slot);   // idempotent; unreachable after a settled end (the data wait covers it)
+        }
+        ps.txn = NotInTxn{};
+    }
+    txnSeen_.clear();
+    txnAddQueue_.clear();
+}
+
+bool ProducerImpl::txnDiscardUnsent_(const TxnOutcome& o) noexcept {
+    // An AddPartitionsToTxn still on the link is cancelled: the abort never waits for it, and the link never re-sends
+    // it after EndTxn(abort) (a re-sent one could open a new transaction on the coordinator).  One that was on the
+    // wire may have added its partitions: the transaction is possibly started (m15).
+    bool offered = false;
+    bool changed = false;
+    for (const uint32_t slot : txnSeen_) {
+        auto* ad = std::get_if<Adding>(&partitions_[slot]->txn);
+        if (ad == nullptr || ad->slot == nullptr) continue;
+        changed = true;
+        if (std::holds_alternative<CoordinatorLink::InFlight>(ad->slot->state)) offered = true;
+        if (coord_) coord_->release(*ad->slot);   // idempotent: the partitions of one request share its slot
+        ad->slot = nullptr;
+    }
+    if (offered) markStarted_(TxnStarted::Maybe);
+    const DutyScope duty(*this);   // sends from the completions below are deferred (Direct)
+    // The ring holds nothing of this transaction: records ahead of the abort were drained before it applied (FD1),
+    // later ones are refused by the drain (the machine is not InTransaction).
+    if (!deferred_.empty()) {
+        changed = true;
+        failDeferred_(o.status, o.errorCode);
+    }
+    for (std::size_t i = 0; i < partitions_.size(); ++i) {
+        PartitionState& ps = *partitions_[i];
+        if (ps.builder && ps.builder->recordCount() > 0) {
+            changed = true;
+            failBuilder_(ps, o.status, o.errorCode);
+        }
+        while (ps.hasTier2()) {
+            changed = true;
+            const uint32_t slot = t2Pop_(ps);
+            const uint64_t h  = tier2Pool_[slot].ackHandle;
+            const int32_t  rc = tier2Pool_[slot].recordCount;
+            t2Return_(slot);
+            emitUnsentBatchAck_(ps.topicId, ps.partition, rc, o.status, 1, o.errorCode);
+            completeHandle_(h, OpKind::Tier2Batch, -1, rc, o.status, o.errorCode);
+        }
+    }
+    return changed;
+}
+
+void ProducerImpl::txnResetPartition_(PartitionState& ps) noexcept {
+    // KIP-360: a transactional producer's epoch belongs to its coordinator - a local bump would put this
+    // partition's data under an epoch no EndTxn ever ends.  The partition sends nothing new (not Added, its id
+    // pending), the transaction can only abort, and the abort's epoch bump restarts every sequence.
+    ps.producerId = -1;
+    if (std::holds_alternative<NotInTxn>(ps.txn) || std::holds_alternative<Added>(ps.txn)) {
+        txnEnroll_(ps);
+        ps.txn = AddFailed{static_cast<uint16_t>(rpc::ErrorCode::OutOfOrderSequence)};
+    }
+    poison_(OpStatus::BrokerError, static_cast<uint16_t>(rpc::ErrorCode::OutOfOrderSequence), AbortKind::BumpEpoch);
+    std::fprintf(stderr,
+                 "ProducerImpl: topic=%d part=%d transactional sequences must restart: the transaction can only "
+                 "abort (its epoch bump restarts them)\n",
+                 ps.topicId, ps.partition);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -702,11 +960,12 @@ void ProducerImpl::startCloseAbort_(int64_t nowNs) noexcept {
     const TxnOp own{detail::OpTarget{}, 0, nowNs + txnOpTimeoutNs_()};   // empty target: the close's own abort
     if (const auto* it = std::get_if<InTransaction>(&txn_)) {
         const TxnStarted started = it->started;
-        txn_ = Aborting{own, AwaitData{}, started, AbortKind::Plain, {}};
+        txn_ = Aborting{own, AwaitData{}, started, AbortKind::Plain, {}, TxnOutcome{}};
     } else if (const auto* ae = std::get_if<AbortableError>(&txn_)) {
         const TxnStarted started = ae->started;
         const AbortKind  kind    = ae->kind;
-        txn_ = Aborting{own, AwaitData{}, started, kind, {}};
+        const TxnOutcome failed{ae->status, ae->errorCode};
+        txn_ = Aborting{own, AwaitData{}, started, kind, {}, failed};
     } else if (auto* ab = std::get_if<Aborting>(&txn_); ab != nullptr && std::holds_alternative<InDoubt>(ab->phase)) {
         ab->op    = own;   // in doubt (an abort timed out): retried once as the close's own, from the leg left
         ab->phase = resumeFrom(std::get<InDoubt>(ab->phase));

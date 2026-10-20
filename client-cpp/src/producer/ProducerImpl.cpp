@@ -193,9 +193,24 @@ inline bool offerFresh(const Sink& sink, int32_t topicId, int32_t partition, int
 // Backlog B2: re-stamps producerId / producerEpoch / baseSequence (14 contiguous
 // bytes) of a SEALED RecordBatch at `batch` (`len` bytes) and patches its CRC
 // incrementally — bit-exact with a full recompute, without rescanning the batch.
-inline void restampBatchIdentity(uint8_t* batch, std::size_t len, int64_t producerId,
-                                 int16_t producerEpoch, int32_t baseSequence) noexcept {
+// Phase 2b F Task 6: `setAttrs` (kAttrTransactional for a transactional producer)
+// is OR-ed into the attributes (inside the CRC range: patched the same way).  A
+// plain producer passes 0 and its attributes are never touched.
+inline void restampBatchIdentityAndAttributes(uint8_t* batch, std::size_t len, int64_t producerId,
+                                              int16_t producerEpoch, int32_t baseSequence,
+                                              uint16_t setAttrs) noexcept {
     namespace rb = rune::protocol::batch;
+    if (setAttrs != 0) [[unlikely]] {
+        uint8_t oldA[2];
+        std::memcpy(oldA, batch + rb::kAttributesOffset, 2);
+        const uint16_t a = static_cast<uint16_t>(rune::protocol::detail::getLE16(batch + rb::kAttributesOffset) | setAttrs);
+        batch[rb::kAttributesOffset]     = static_cast<uint8_t>(a);
+        batch[rb::kAttributesOffset + 1] = static_cast<uint8_t>(a >> 8);
+        const uint32_t c0 = rune::protocol::detail::getLE32(batch + rb::kCrcOffset);
+        const uint32_t c1 = rune::client::detail::crc32cPatch(c0, len - rb::kAttributesOffset, 0, oldA,
+                                                              batch + rb::kAttributesOffset, 2);
+        for (int i = 0; i < 4; ++i) batch[rb::kCrcOffset + i] = static_cast<uint8_t>(c1 >> (8 * i));
+    }
     constexpr std::size_t kOff = rb::kProducerIdOffset;
     constexpr std::size_t kN   = rb::kRecordCountOffset - rb::kProducerIdOffset;
     static_assert(rb::kProducerEpochOffset == rb::kProducerIdOffset + 8 &&
@@ -286,7 +301,10 @@ ProducerImpl::ProducerImpl(ProducerConfig cfg,
         }
         tier2AppFreeN_ = nSlots;
     }
-    if (!cfg_.transactionalId.empty()) txnGate_ = TxnGate::Closed;  // Phase 2b F: closed until beginTransaction()
+    if (!cfg_.transactionalId.empty()) {
+        txnGate_       = TxnGate::Closed;  // Phase 2b F: closed until beginTransaction()
+        txnBatchAttrs_ = static_cast<uint16_t>(rune::protocol::batch::kAttrTransactional);   // Task 6
+    }
     // Pre-reserve partition map and encode scratch to avoid allocs on steady-state.
     partitions_.reserve(16);
     encodeScratch_.reserve(64 * 1024); // Produce wire frame (grown once)
@@ -455,9 +473,13 @@ SendResult ProducerImpl::tryAppendDirect_(int32_t topicId, int32_t partition, co
         why = RejectReason::WrongThread;
         return SendResult::WrongThread;
     }
-    if (txnGate_ == TxnGate::Closed) [[unlikely]] {
-        why = RejectReason::NotInTransaction;
-        return SendResult::NotInTransaction;
+    // Phase 2b F: the owner thread IS the duty side - the gate and the FD2 re-check (the machine is not
+    // InTransaction) refuse at once.  A plain producer pays the one compare it always paid.
+    if (txnGate_ != TxnGate::NotTransactional) [[unlikely]] {
+        if (txnGate_ == TxnGate::Closed || txnIntakeShut_()) {
+            why = RejectReason::NotInTransaction;
+            return SendResult::NotInTransaction;
+        }
     }
     // Closed is terminal, checked before anything else on the owner thread: a
     // Producer outliving its Client never appends, never reaches the pump hook.
@@ -899,7 +921,7 @@ void ProducerImpl::failDeferred_(OpStatus st, uint16_t errorCode) {
         const uint64_t handle = takeDeferredHandle_(r, &tier2, &rc);
         unaccountDeferred_(h);
         deferred_.kill(r);
-        emitUnsentBatchAck_(h.topicId, h.partition, rc, st, 1);
+        emitUnsentBatchAck_(h.topicId, h.partition, rc, st, 1, errorCode);
         completeHandle_(handle, tier2 ? OpKind::Tier2Batch : OpKind::Send, -1, tier2 ? rc : 0, st, errorCode);
     }
     deferScanning_ = prevScan;
@@ -1111,7 +1133,9 @@ RejectReason ProducerImpl::submitTier2Batch(int32_t topicId,
         // foreign thread): not accepted, the caller fails the handle.
         // Foreign thread decided FIRST, before any member read (owner-thread state).
         if (std::this_thread::get_id() != dutyThreadId_) return RejectReason::WrongThread;
-        if (txnGate_ == TxnGate::Closed) [[unlikely]] return RejectReason::NotInTransaction;
+        if (txnGate_ != TxnGate::NotTransactional) [[unlikely]] {   // the gate + the FD2 re-check (owner = duty)
+            if (txnGate_ == TxnGate::Closed || txnIntakeShut_()) return RejectReason::NotInTransaction;
+        }
         if (directClosed_) return RejectReason::Closed;
         if (inDuty_) {
             // fix1 C1 / fix2: deferred like a Tier-1 record (same per-partition
@@ -1294,6 +1318,8 @@ PartitionState& ProducerImpl::getOrCreatePartition(int32_t topicId, int32_t part
     ps->ackMask = kAckRingCapacity - 1;
     ps->inflight = InFlightRing(static_cast<uint32_t>(cfg_.maxInFlight > 0 ? cfg_.maxInFlight : 1));
     ps->inflight.rebase(seqBase_);  // F8c C7 F2: the ordinal's carried-forward base
+    // Phase 2b F Task 6: a plain producer's partitions are Added for ever (the flush's one index compare passes).
+    if (txnBatchAttrs_ == 0) ps->txn = Added{};
     if (partitions_.size() >= maxPartitions_) {
         throw std::length_error("ProducerImpl: more than 262144 partitions");
     }
@@ -1302,6 +1328,11 @@ PartitionState& ProducerImpl::getOrCreatePartition(int32_t topicId, int32_t part
     // leaves no half-created partition), so markDirty_ never allocates.
     if (dirty_.capacity() < partitions_.size() + 1) {
         dirty_.reserve(std::max<std::size_t>(64, 2 * (partitions_.size() + 1)));
+    }
+    // Task 6: the transaction's partition lists hold each slot at most once, too.
+    if (txnBatchAttrs_ != 0 && txnSeen_.capacity() < partitions_.size() + 1) {
+        txnSeen_.reserve(dirty_.capacity());
+        txnAddQueue_.reserve(dirty_.capacity());
     }
     partitions_.push_back(std::move(ps));
     partitionIndex_.insert(k, partitions_.back()->slotIndex);
@@ -1348,6 +1379,10 @@ int ProducerImpl::drainRing(int64_t nowNs, int messageLimit) {
     if (const auto* dc = std::get_if<LifeDiscarding>(&life_)) [[unlikely]] {
         return discardRing_(dc->status, messageLimit, dc->errorCode);
     }
+    // Phase 2b F (FD2) duty re-check, once per drain pass (never per record): a transactional producer whose
+    // machine is not InTransaction produces nothing it reads now.  A control op in the ring (kMsgTxnControl,
+    // Task 8) must end the pass, so the next pass decides on the state it leaves.  Plain: one compare.
+    if (txnIntakeShut_()) [[unlikely]] return refuseRingTxn_(messageLimit);
 
     // F12: drain up to messageLimit messages in ONE pass; ProducerHub flushes
     // once after it (not once per record).  The pass stops early at a batch
@@ -1464,6 +1499,7 @@ void ProducerImpl::createBuilder_(PartitionState& ps) {
     // there is no per-batch heap allocation.
     const int64_t baseWall = wallMs();
     ps.builder = std::make_unique<ProduceFrameBuilder>(0, baseWall);
+    if (txnBatchAttrs_ != 0) ps.builder->setTransactional(true);   // Phase 2b F Task 6: set once, here
     ps.builderBaseWallMs = baseWall;
 }
 
@@ -1800,7 +1836,8 @@ bool ProducerImpl::encodeAndSendTier2(
         // (computed once over the -1/-1/-1 batch by BatchBuilder) INCREMENTALLY —
         // no rescan of the batch.  NOT advanced until the offer succeeds (below):
         // a back-pressured retry re-stamps the SAME values (a zero delta).
-        restampBatchIdentity(b.data(), b.size(), ps.producerId, ps.epoch, ps.nextBaseSequence);
+        restampBatchIdentityAndAttributes(b.data(), b.size(), ps.producerId, ps.epoch, ps.nextBaseSequence,
+                                          txnBatchAttrs_);
     }
 
     // Encode the Produce wire frame.
@@ -2060,6 +2097,17 @@ int ProducerImpl::flushBatches(
         // the identity the next batch gets).  Kept dirty: re-examined every pass.
         if (ps.parkedCount > 0 || ps.unresolved) {
             dirty_[keep++] = slot;
+            continue;
+        }
+        // ---- Phase 2b F Task 6: no NEW batch of a transactional partition before its AddPartitionsToTxn is OK
+        // (FD10: a plain producer's partitions are Added - this index compare is all it pays per flush).
+        if (ps.txn.index() != kAddedIndex) [[unlikely]] {
+            if (txnHold_(ps)) {
+                dirty_[keep++] = slot;
+            } else {
+                ps.dirty          = false;
+                ps.flushRequested = false;
+            }
             continue;
         }
         // ---- Tier-1: flush pending auto-batch if triggered -------------------
@@ -2362,6 +2410,7 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
             // C4: the next-in-line batch was rejected — it fails, the rest move on.
             emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, -1, ec,
                           OpStatus::BrokerError, units, b->producerEpoch, b->producerId);
+            txnNoteLoss_(OpStatus::BrokerError, static_cast<uint16_t>(ec), AbortKind::BumpEpoch);   // Task 6
             completeSlice_(ps, b->ackStart, b->ackCount, -1, OpStatus::BrokerError,
                            static_cast<uint16_t>(ec), b->tier2, b->recordCount);
             unpark_(ps, *b);
@@ -2410,6 +2459,7 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
     // D: rejected, but an earlier attempt may be stored — outcome unknown.
     emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, -1, ec,
                   OpStatus::BrokerError, units, b->producerEpoch, b->producerId);
+    txnNoteLoss_(OpStatus::BrokerError, static_cast<uint16_t>(ec), AbortKind::BumpEpoch);   // Task 6
     completeSlice_(ps, b->ackStart, b->ackCount, -1, OpStatus::BrokerError,
                    static_cast<uint16_t>(ec), b->tier2, b->recordCount);
     markUnresolved_(ps, *b);
@@ -2520,6 +2570,10 @@ void ProducerImpl::resetPartition_(PartitionState& ps) noexcept {  // F
     ps.nextBaseSequence = 0;
     ps.lastAckedSeq     = -1;
     ps.unresolved       = false;
+    if (txnBatchAttrs_ != 0) [[unlikely]] {   // Phase 2b F Task 6: the coordinator owns a transactional epoch
+        txnResetPartition_(ps);
+        return;
+    }
     auto* id = std::get_if<IdAssigned>(&identity_);
     if (id == nullptr) {
         ps.producerId = -1;   // a new id is already pending: this partition adopts it on assignment
@@ -2613,7 +2667,7 @@ void ProducerImpl::restampInflight_(PartitionState& ps) noexcept {
             putLE(f.data() + kFrameEpochOff, static_cast<uint16_t>(ps.epoch), 2);
             putLE(f.data() + kFrameSeqOff, static_cast<uint32_t>(seq), 4);
             // B2: incremental CRC patch (bit-exact), not a rescan of the batch.
-            restampBatchIdentity(batch, len, ps.producerId, ps.epoch, seq);
+            restampBatchIdentityAndAttributes(batch, len, ps.producerId, ps.epoch, seq, 0);  // attributes kept
         }
         b.producerId    = ps.producerId;
         b.producerEpoch = ps.epoch;
@@ -2725,6 +2779,7 @@ void ProducerImpl::emitBatchAck_(int32_t topicId, int32_t partition, int32_t bas
 void ProducerImpl::failBatch_(PartitionState& ps, InFlightBatch& b, OpStatus st, uint16_t errorCode) {
     emitBatchAck_(ps.topicId, ps.partition, b.baseSequence, b.recordCount, -1, BatchAck::kClientFailure,
                   st, b.tier2 ? 1u : static_cast<uint32_t>(b.recordCount), b.producerEpoch, b.producerId);
+    txnNoteLoss_(st, errorCode, AbortKind::BumpEpoch);   // Task 6: sent, outcome unknown
     completeSlice_(ps, b.ackStart, b.ackCount, -1, st, errorCode, b.tier2, b.recordCount);
     markUnresolved_(ps, b);  // D: outcome at the broker unknown
     releaseResolved_(ps, b);
@@ -2741,7 +2796,7 @@ void ProducerImpl::failBuilder_(PartitionState& ps, OpStatus st, uint16_t errorC
     const int32_t n = ps.builder->recordCount();  // the records before the claim
     if (claimed) ps.builder->detachStorage(claimQuarantine_);  // swap: no allocation
     if (n == 0) return;
-    emitUnsentBatchAck_(ps.topicId, ps.partition, n, st, static_cast<uint32_t>(n));
+    emitUnsentBatchAck_(ps.topicId, ps.partition, n, st, static_cast<uint32_t>(n), errorCode);
     if (ps.batchAckCount > 0) {
         completeSlice_(ps, ps.batchAckStart, ps.batchAckCount, -1, st, errorCode, false, 0);
         ps.ackHead = ps.batchAckStart;  // reclaim the unsent (newest) slice
@@ -3033,7 +3088,7 @@ int ProducerImpl::discardRing_(OpStatus st, int limit, uint16_t errorCode) {
                                        ? static_cast<uint64_t>(readLE64(p, kRecCorrIdOff)) : 0u;
                 const int32_t tid  = readLE32(p, kRecTopicIdOff);
                 const int32_t part = readLE32(p, kRecPartOff);
-                emitUnsentBatchAck_(tid, part, 1, st, 1);
+                emitUnsentBatchAck_(tid, part, 1, st, 1, errorCode);
                 completeHandle_(h, OpKind::Send, -1, 0, st, errorCode);
             } else if (type == kMsgTier2Batch && len >= kT2TokenSize) {
                 const uint32_t slot = static_cast<uint32_t>(readLE64(p, 0));
@@ -3042,7 +3097,7 @@ int ProducerImpl::discardRing_(OpStatus st, int limit, uint16_t errorCode) {
                 const int32_t  rc = e.recordCount;
                 const int32_t  tid = e.topicId, part = e.partition;
                 t2Return_(slot);
-                emitUnsentBatchAck_(tid, part, rc, st, 1);
+                emitUnsentBatchAck_(tid, part, rc, st, 1, errorCode);
                 completeHandle_(h, OpKind::Tier2Batch, -1, rc, st, errorCode);
             } else if (type == kMsgClaimBatch && len >= kBatchHeaderSize) {
                 // Phase 2b B: a committed claimBatch never sent - ONE BatchAck
@@ -3050,11 +3105,53 @@ int ProducerImpl::discardRing_(OpStatus st, int limit, uint16_t errorCode) {
                 const int32_t tid  = readLE32(p, kRecTopicIdOff);
                 const int32_t part = readLE32(p, kRecPartOff);
                 const int32_t n    = static_cast<int32_t>(readLE32u(p, kBatchCountOff));
-                emitUnsentBatchAck_(tid, part, n, st, static_cast<uint32_t>(n));
+                emitUnsentBatchAck_(tid, part, n, st, static_cast<uint32_t>(n), errorCode);
             }
             // kMsgFlush: nothing to complete.
         },
         limit);
+}
+
+// Phase 2b F Task 6 (FD2): the duty re-check of a Ring-mode transactional producer (see drainRing).
+int ProducerImpl::refuseRingTxn_(int limit) noexcept {
+    // FD2: never produced.  Acked records complete with the refusal (the transaction's error, or 19 outside one);
+    // void ones are counted and fail the transaction (a commit completes with its error).
+    const TxnOutcome o = txnRefusal_();
+    const DutyScope duty(*this);
+    uint64_t voids = 0;
+    const int n = ring_.read(
+        [&](int32_t type, aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t off, aeron::util::index_t len) {
+            const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + off);
+            if (type == kMsgSendRecord && len >= kRecHeaderSize) {
+                const uint64_t h = (p[kRecFlagsOff] & kFlagWantAck) ? static_cast<uint64_t>(readLE64(p, kRecCorrIdOff)) : 0u;
+                emitBatchAck_(readLE32(p, kRecTopicIdOff), readLE32(p, kRecPartOff), -1, 1, -1, BatchAck::kClientFailure,
+                              o.status, 1, -1);
+                if (h != 0) completeHandle_(h, OpKind::Send, -1, 0, o.status, o.errorCode);
+                else ++voids;
+            } else if (type == kMsgTier2Batch && len >= kT2TokenSize) {
+                const uint32_t  slot = static_cast<uint32_t>(readLE64(p, 0));
+                const Tier2Slot& e   = tier2Pool_[slot];
+                const uint64_t  h    = e.ackHandle;
+                const int32_t   rc   = e.recordCount;
+                const int32_t   tid = e.topicId, part = e.partition;
+                t2Return_(slot);
+                emitBatchAck_(tid, part, -1, rc, -1, BatchAck::kClientFailure, o.status, 1, -1);
+                if (h != 0) completeHandle_(h, OpKind::Tier2Batch, -1, rc, o.status, o.errorCode);
+                else voids += static_cast<uint64_t>(rc);
+            } else if (type == kMsgClaimBatch && len >= kBatchHeaderSize) {
+                const int32_t nrec = static_cast<int32_t>(readLE32u(p, kBatchCountOff));
+                emitBatchAck_(readLE32(p, kRecTopicIdOff), readLE32(p, kRecPartOff), -1, nrec, -1,
+                              BatchAck::kClientFailure, o.status, static_cast<uint32_t>(nrec), -1);
+                voids += static_cast<uint64_t>(nrec);   // claims carry no ack handle
+            }
+            // kMsgFlush: nothing to complete.
+        },
+        limit);
+    if (voids != 0) {
+        txnRecordsRefusedDuty_ += voids;
+        poison_(o.status, o.errorCode, AbortKind::Plain);
+    }
+    return n;
 }
 
 void ProducerImpl::failRoutedBroker(RouteFailFn pred, void* ctx) noexcept {
@@ -3068,6 +3165,7 @@ void ProducerImpl::failRoutedBroker(RouteFailFn pred, void* ctx) noexcept {
             emitBatchAck_(ps.topicId, ps.partition, b.baseSequence, b.recordCount, -1,
                           static_cast<int16_t>(errorCode), OpStatus::BrokerError, units, b.producerEpoch,
                           b.producerId);
+            txnNoteLoss_(OpStatus::BrokerError, errorCode, AbortKind::BumpEpoch);   // Task 6
             completeSlice_(ps, b.ackStart, b.ackCount, -1, OpStatus::BrokerError, errorCode, b.tier2,
                            b.recordCount);
             markUnresolved_(ps, b);
@@ -3089,6 +3187,7 @@ void ProducerImpl::failInFlightBroker(uint16_t errorCode) noexcept {
             emitBatchAck_(ps.topicId, ps.partition, b.baseSequence, b.recordCount, -1,
                           static_cast<int16_t>(errorCode), OpStatus::BrokerError, units, b.producerEpoch,
                           b.producerId);
+            txnNoteLoss_(OpStatus::BrokerError, errorCode, AbortKind::BumpEpoch);   // Task 6
             completeSlice_(ps, b.ackStart, b.ackCount, -1, OpStatus::BrokerError, errorCode, b.tier2,
                            b.recordCount);
             markUnresolved_(ps, b);
@@ -3122,7 +3221,7 @@ void ProducerImpl::failAllPending(OpStatus st, uint16_t errorCode) noexcept {
             const uint64_t h  = tier2Pool_[slot].ackHandle;
             const int32_t  rc = tier2Pool_[slot].recordCount;
             t2Return_(slot);
-            emitUnsentBatchAck_(ps.topicId, ps.partition, rc, st, 1);
+            emitUnsentBatchAck_(ps.topicId, ps.partition, rc, st, 1, errorCode);
             completeHandle_(h, OpKind::Tier2Batch, -1, rc, st, errorCode);
         }
         ps.builderBytes   = 0;
@@ -3519,7 +3618,9 @@ void ProducerImpl::abortClaim(int64_t token) noexcept {
 SendResult ProducerImpl::directClaimGate_(int32_t topicId, int32_t partition) noexcept {
     // Foreign thread decided FIRST, before any owner-thread state is read.
     if (std::this_thread::get_id() != dutyThreadId_) return SendResult::WrongThread;
-    if (txnGate_ == TxnGate::Closed) [[unlikely]] return SendResult::NotInTransaction;
+    if (txnGate_ != TxnGate::NotTransactional) [[unlikely]] {   // the gate + the FD2 re-check (owner = duty)
+        if (txnGate_ == TxnGate::Closed || txnIntakeShut_()) return SendResult::NotInTransaction;
+    }
     if (directClosed_) return SendResult::Closed;
     // Open, or abandoned but not yet settled (its span is in the one quarantine).
     if (!std::holds_alternative<NoDirectClaim>(directClaim_)) return SendResult::ClaimHeld;
@@ -3850,9 +3951,11 @@ void ProducerImpl::onCoordinatorAnswer(const CoordAnswer& a, int64_t nowNs) noex
         onEndTxnAnswer_(a, *s, nowNs);
         break;
     case ReqKind::AddPartitions:
+        onAddPartitionsAnswer_(a, *s);   // Task 6: the data leg
+        break;
     case ReqKind::AddOffsets:
     case ReqKind::TxnOffsetCommit:
-        break;   // the data / offsets legs (Tasks 6 / 7)
+        break;   // the offsets legs (Task 7)
     }
     coord_->release(*s);
 }

@@ -1477,6 +1477,7 @@ if(BUILD_TESTING)
             tests/producer/CoordinatorLinkTest.cpp
             tests/producer/ProducerIdTest.cpp
             tests/producer/ProducerTxnTest.cpp
+            tests/producer/ProducerTxnDataTest.cpp
             tests/detail/M2ORingBufferTest.cpp
             tests/detail/OneToOneRingBufferTest.cpp
             tests/detail/CompletionsTest.cpp

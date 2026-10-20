@@ -68,6 +68,13 @@ public:
     void setProducerId(int64_t pid) noexcept { producerId_ = pid; }
     void setProducerEpoch(int16_t ep) noexcept { producerEpoch_ = ep; }
     void setBaseSequence(int32_t seq) noexcept { baseSequence_ = seq; }
+    /// Phase 2b F Task 6: every batch this builder seals carries kAttrTransactional (a transactional producer
+    /// sets it once, at the builder's creation; it survives reset() and frame swaps).  A plain producer never
+    /// calls it: seal() writes the same 0 it always wrote.
+    void setTransactional(bool on) noexcept {
+        attributes_ = on ? static_cast<uint16_t>(::rune::protocol::batch::kAttrTransactional) : uint16_t{0};
+    }
+    [[nodiscard]] bool transactional() const noexcept { return attributes_ != 0; }
 
     /// Kafka v2 record: length attrs tsDelta offsetDelta keyLen key valueLen value
     /// headerCount(0) — the exact bytes RecordBatchBuilder::append produces, but
@@ -132,7 +139,7 @@ public:
         putLE(b + rb::kPartitionLeaderEpochOffset, 0xFFFFFFFFull, 4);  // -1
         b[rb::kMagicOffset] = static_cast<uint8_t>(rb::kMagicValue);
         putLE(b + rb::kCrcOffset, 0, 4);                                // sealed on accept
-        putLE(b + rb::kAttributesOffset, 0, 2);
+        putLE(b + rb::kAttributesOffset, attributes_, 2);                // TRANSACTIONAL bit (Task 6) or 0
         putLE(b + rb::kLastOffsetDeltaOffset, static_cast<uint32_t>(recordCount_ - 1), 4);
         putLE(b + rb::kBaseTimestampOffset, static_cast<uint64_t>(baseTimestamp_), 8);
         putLE(b + rb::kMaxTimestampOffset, static_cast<uint64_t>(maxTimestamp_), 8);
@@ -228,6 +235,7 @@ private:
     int64_t producerId_    = -1;
     int16_t producerEpoch_ = -1;
     int32_t baseSequence_  = -1;
+    uint16_t attributes_   = 0;   ///< RecordBatch attributes seal() writes (kAttrTransactional or 0)
 };
 
 }  // namespace rune::client::producer
