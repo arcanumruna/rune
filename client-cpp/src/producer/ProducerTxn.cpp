@@ -59,6 +59,34 @@ inline OpKind opKindOf(TxnControl::Kind k) noexcept {
 inline TxnStarted upgrade(TxnStarted cur, TxnStarted s) noexcept {
     return static_cast<uint8_t>(s) > static_cast<uint8_t>(cur) ? s : cur;
 }
+/// EndTxn may have reached the coordinator (sent, or its re-send pending): a commit there may have landed.
+inline bool endMayHaveLanded(const EndPhase& p) noexcept {
+    if (std::holds_alternative<EndSent>(p) || std::holds_alternative<ResendEnd>(p)) return true;
+    const auto* d = std::get_if<InDoubt>(&p);
+    return d != nullptr && d->at == InDoubtAt::AfterEnd;
+}
+/// EndTxn(abort) was answered OK; only the KIP-360 bump is left (the old `ended`).
+inline bool abortEnded(const EndPhase& p) noexcept {
+    if (std::holds_alternative<Bumping>(p)) return true;
+    const auto* d = std::get_if<InDoubt>(&p);
+    return d != nullptr && d->at == InDoubtAt::Bump;
+}
+/// What an in-doubt timeout of `p` leaves (B-2): the leg that is still unknown.
+inline InDoubt inDoubtFor(const EndPhase& p) noexcept {
+    if (const auto* d = std::get_if<InDoubt>(&p)) return *d;
+    if (std::holds_alternative<Bumping>(p)) return InDoubt{InDoubtAt::Bump};
+    if (std::holds_alternative<EndSent>(p) || std::holds_alternative<ResendEnd>(p)) return InDoubt{InDoubtAt::AfterEnd};
+    return InDoubt{InDoubtAt::BeforeEnd};
+}
+/// The retry of an in-doubt end op resumes at the leg that is left: the data wait, the EndTxn re-send, or the bump.
+inline EndPhase resumeFrom(const InDoubt& d) noexcept {
+    switch (d.at) {
+    case InDoubtAt::BeforeEnd: return AwaitData{};
+    case InDoubtAt::AfterEnd:  return ResendEnd{};
+    case InDoubtAt::Bump:      return Bumping{nullptr};
+    }
+    return AwaitData{};
+}
 inline bool join(TxnJoiners& j, const TxnOp& op) noexcept {
     if (j.n >= j.ops.size()) return false;
     j.ops[j.n++] = op;
@@ -169,9 +197,9 @@ void ProducerImpl::applyTxnControl(const TxnControl& c, int64_t nowNs) {
             return;
         }
         if (auto* cm = std::get_if<Committing>(&txn_)) {
-            if (std::holds_alternative<InDoubt>(cm->phase)) {
-                cm->op    = op;           // B-2: the in-doubt commit is retried - EndTxn(commit) re-sent
-                cm->phase = AwaitData{};
+            if (const auto* d = std::get_if<InDoubt>(&cm->phase)) {
+                cm->op    = op;           // B-2: the in-doubt commit is retried - EndTxn(commit) (re-)sent
+                cm->phase = resumeFrom(*d);
                 return;
             }
             if (join(cm->joined, op)) return;   // m13: one EndTxn, the same completion
@@ -204,9 +232,9 @@ void ProducerImpl::applyTxnControl(const TxnControl& c, int64_t nowNs) {
             return;
         }
         if (auto* ab = std::get_if<Aborting>(&txn_)) {
-            if (std::holds_alternative<InDoubt>(ab->phase)) {
+            if (const auto* d = std::get_if<InDoubt>(&ab->phase)) {
                 ab->op    = op;           // B-2 / B-4: the in-doubt abort is retried (EndTxn, or only the bump)
-                ab->phase = AwaitData{};
+                ab->phase = resumeFrom(*d);
                 return;
             }
             if (join(ab->joined, op)) return;   // m5
@@ -279,10 +307,12 @@ int ProducerImpl::endStep_(int64_t nowNs) noexcept {
             dutyFlushPending_ = true;
             return 0;
         }
-        if (started == TxnStarted::No) {   // B-1 (and B-4: EndTxn(abort) already answered)
+        if (started == TxnStarted::No) {   // B-1: the coordinator never saw it - no EndTxn
             endDone_(nowNs);
             return 1;
         }
+    }
+    if (std::holds_alternative<AwaitData>(phase) || std::holds_alternative<ResendEnd>(phase)) {
         const auto* id = std::get_if<IdAssigned>(&identity_);
         if (!coord_ || id == nullptr) return 0;   // unreachable in practice: the op deadline bounds it
         const int64_t deadline = nowNs + txnOpTimeoutNs_();   // I-4: EndTxn's own budget starts now
@@ -346,7 +376,8 @@ int ProducerImpl::flushStep_(int64_t nowNs) noexcept {
 void ProducerImpl::markStarted_(TxnStarted s) noexcept {
     if (auto* it = std::get_if<InTransaction>(&txn_)) it->started = upgrade(it->started, s);
     else if (auto* cm = std::get_if<Committing>(&txn_)) cm->started = upgrade(cm->started, s);
-    else if (auto* ab = std::get_if<Aborting>(&txn_)) ab->started = upgrade(ab->started, s);
+    // A late leg answer after EndTxn(abort) was answered changes nothing: only the bump is left (B-4).
+    else if (auto* ab = std::get_if<Aborting>(&txn_); ab != nullptr && !abortEnded(ab->phase)) ab->started = upgrade(ab->started, s);
     else if (auto* ae = std::get_if<AbortableError>(&txn_)) ae->started = upgrade(ae->started, s);
 }
 
@@ -358,8 +389,9 @@ void ProducerImpl::poison_(OpStatus st, uint16_t errorCode, AbortKind kind) noex
         return;
     }
     if (auto* cm = std::get_if<Committing>(&txn_)) {
-        // EndTxn already out (or the bump): the data settled before it - nothing left to poison.
-        if (std::holds_alternative<EndSent>(cm->phase) || std::holds_alternative<Bumping>(cm->phase)) return;
+        // EndTxn(commit) went out (or its re-send is pending, or it timed out unanswered): the data settled before
+        // it and the commit may have landed - never turned into an abort (B-2; the old `endSent`).
+        if (endMayHaveLanded(cm->phase)) return;
         const bool        live   = std::holds_alternative<AwaitData>(cm->phase);
         const TxnOp       op     = cm->op;
         const TxnJoiners  joined = cm->joined;
@@ -401,6 +433,8 @@ void ProducerImpl::onTxnLegAnswer_(ReqKind kind, int16_t errorCode) noexcept {
 }
 
 void ProducerImpl::enterFatal_(OpStatus st, uint16_t errorCode, std::string_view text) noexcept {
+    // Already terminal (or closeImmediately detached everything): a late answer changes nothing.
+    if (std::holds_alternative<FatalError>(txn_) || discarding()) return;
     // Terminal (Kafka ProducerFencedException): nothing is ever sent again.  The pending ops are copied out
     // first and completed after the state is FatalError (a handler's next op is refused with this status).
     std::array<TxnOp, 1 + kMaxTxnJoiners> ops{};
@@ -432,8 +466,7 @@ void ProducerImpl::endDone_(int64_t nowNs) noexcept {
     if (auto* ab = std::get_if<Aborting>(&txn_); ab != nullptr && ab->kind == AbortKind::BumpEpoch) {
         // B-3 (KIP-360): the aborted transaction left a sequence gap - bump the epoch (InitProducerId for this
         // transactional id) and restart every sequence before Ready; the abort completes after the bump.  B-4:
-        // from here nothing is open on the broker (started = No): a retried abort re-sends only the bump.
-        ab->started       = TxnStarted::No;
+        // from here nothing is open on the broker: Bumping / InDoubt{Bump} - a retried abort re-sends only the bump.
         ab->op.deadlineNs = nowNs + txnOpTimeoutNs_();
         ab->phase         = Bumping{nullptr};   // txnStep sends it
         return;
@@ -472,7 +505,7 @@ void ProducerImpl::endExpired_(bool releaseSlot) noexcept {
     TxnJoiners&      jref   = cm != nullptr ? cm->joined : ab->joined;
     const TxnJoiners joined = jref;
     jref  = TxnJoiners{};
-    phase = InDoubt{};   // B-2: never Ready over a transaction that may be open, never an abort over a commit
+    phase = inDoubtFor(phase);   // B-2: never Ready over a transaction that may be open, never an abort over a commit
     publishStatus_();
     const OpKind kind = cm != nullptr ? OpKind::CommitTransaction : OpKind::AbortTransaction;
     constexpr std::string_view kWhy = "the transaction's outcome is in doubt (timed out): retry the same call";
@@ -623,14 +656,14 @@ void ProducerImpl::txnDiscard_(OpStatus st, uint16_t errorCode) noexcept {
             take(cm->op, OpKind::CommitTransaction);
             for (uint8_t i = 0; i < cm->joined.n; ++i) take(cm->joined.ops[i], OpKind::CommitTransaction);
         }
-        cm->phase  = InDoubt{};
+        cm->phase  = inDoubtFor(cm->phase);
         cm->joined = TxnJoiners{};
     } else if (auto* ab = std::get_if<Aborting>(&txn_)) {
         if (!std::holds_alternative<InDoubt>(ab->phase)) {
             take(ab->op, OpKind::AbortTransaction);
             for (uint8_t i = 0; i < ab->joined.n; ++i) take(ab->joined.ops[i], OpKind::AbortTransaction);
         }
-        ab->phase  = InDoubt{};
+        ab->phase  = inDoubtFor(ab->phase);
         ab->joined = TxnJoiners{};
     }
     const std::array<TxnOp, kMaxTxnFlushes> flushes = txnFlushes_;
@@ -675,8 +708,8 @@ void ProducerImpl::startCloseAbort_(int64_t nowNs) noexcept {
         const AbortKind  kind    = ae->kind;
         txn_ = Aborting{own, AwaitData{}, started, kind, {}};
     } else if (auto* ab = std::get_if<Aborting>(&txn_); ab != nullptr && std::holds_alternative<InDoubt>(ab->phase)) {
-        ab->op    = own;   // in doubt (an abort timed out): retried once as the close's own
-        ab->phase = AwaitData{};
+        ab->op    = own;   // in doubt (an abort timed out): retried once as the close's own, from the leg left
+        ab->phase = resumeFrom(std::get<InDoubt>(ab->phase));
     } else {
         return;
     }

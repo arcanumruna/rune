@@ -1431,3 +1431,185 @@ TEST(ProducerTxnRegression, AbortAbandonsAnOpenDirectClaimRegression) {
         EXPECT_EQ(op.status(), OpStatus::Ok);
     }
 }
+
+// ============================================================================================================
+// Fix round 1 (review I-1): the facts the old booleans carried survive an in-doubt timeout
+// ============================================================================================================
+
+// endSent: a poison (a late data / leg failure, Task 6 / 7) after EndTxn(commit) went out - answered never, so the
+// commit is InDoubt{AfterEnd} - must not turn the commit into an abort: the state stays Committing, abort stays
+// refused, no EndTxn(abort) ever leaves, and the retried commit re-sends EndTxn(commit) (also when the poison lands
+// in the window before the re-send).  Before EndTxn went out (InDoubt{BeforeEnd}) the same poison does fail it.
+TEST(ProducerTxnRegression, PoisonAfterAnInDoubtCommitEndTxnNeverAbortsRegression) {
+    {
+        Rig r;
+        r.initOk();
+        r.startTxn();
+        Op first = r.commit();
+        r.tick();
+        ASSERT_EQ(r.endTxns(), 1u);
+        r.tick(r.cfg.transactionOpTimeoutMs * kMs);
+        ASSERT_EQ(first.status(), OpStatus::Timeout);
+        r.impl->testPoison(OpStatus::DeliveryFailed, 0, rp::AbortKind::BumpEpoch);
+        EXPECT_EQ(r.state(), TxnState::CommittingTransaction) << "a commit that may have landed was poisoned";
+        Op abort = r.abort();
+        ASSERT_TRUE(abort.ready());
+        EXPECT_EQ(abort.status(), OpStatus::BrokerError);
+        Op retry = r.commit();   // ResendEnd: the re-send is pending
+        r.impl->testPoison(OpStatus::DeliveryFailed, 0, rp::AbortKind::Plain);
+        EXPECT_EQ(r.state(), TxnState::CommittingTransaction);
+        r.tick();
+        ASSERT_EQ(r.endTxns(), 2u);
+        EXPECT_EQ(r.lastEnd()->commit, uint8_t{1}) << "an EndTxn(abort) over a commit that may have landed";
+        r.endAnswer();
+        ASSERT_TRUE(retry.ready());
+        EXPECT_EQ(retry.status(), OpStatus::Ok);
+        EXPECT_EQ(r.state(), TxnState::Ready);
+    }
+    {
+        Rig r;   // InDoubt{BeforeEnd}: the data never settled, nothing was sent - the poison fails the transaction
+        r.initOk();
+        r.startTxn();
+        ASSERT_TRUE(r.sendRecord());
+        Op first = r.commit();
+        r.tick();
+        r.tick(r.cfg.transactionOpTimeoutMs * kMs);
+        ASSERT_EQ(first.status(), OpStatus::Timeout);
+        ASSERT_EQ(r.endTxns(), 0u);
+        r.impl->testPoison(OpStatus::DeliveryFailed, 0, rp::AbortKind::Plain);
+        EXPECT_EQ(r.state(), TxnState::AbortableError);
+        r.ackLastData();
+        Op abort = r.abort();
+        r.tick();
+        ASSERT_EQ(r.endTxns(), 1u);
+        EXPECT_EQ(r.lastEnd()->commit, uint8_t{0});
+        r.endAnswer();
+        ASSERT_TRUE(abort.ready());
+        EXPECT_EQ(abort.status(), OpStatus::Ok);
+    }
+}
+
+// ended (B-4): EndTxn(abort) answered, the bump times out (InDoubt{Bump}), then a LATE leg answer arrives OK.  It must
+// not revive the transaction: the retried abort re-sends only the bump (never EndTxn, never stuck on the unassigned
+// identity) and completes.
+TEST(ProducerTxnRegression, LateLegAnswerAfterABumpTimeoutStillRetriesOnlyTheBumpRegression) {
+    Rig r;
+    r.initOk(42, 0);
+    r.startTxn();
+    r.impl->testPoison(OpStatus::DeliveryFailed, 0, rp::AbortKind::BumpEpoch);
+    Op abort = r.abort();
+    r.tick();
+    r.endAnswer();
+    r.tick();
+    ASSERT_EQ(r.inits(), 2u);
+    r.tick(r.cfg.transactionOpTimeoutMs * kMs);
+    ASSERT_EQ(abort.status(), OpStatus::Timeout);
+    r.impl->testLegAnswer(rp::ReqKind::AddPartitions, 0);   // late OK
+    r.impl->testMarkStarted(rp::TxnStarted::Yes);
+    Op retry = r.abort();
+    r.ticks(4, kMs);
+    EXPECT_EQ(r.endTxns(), 1u) << "the late leg answer sent the retry down the EndTxn branch";
+    ASSERT_EQ(r.inits(), 3u) << "the bump was not re-sent";
+    r.answer(initAnswer(r.lastInitCorr(), 42, 1));
+    ASSERT_TRUE(retry.ready());
+    EXPECT_EQ(retry.status(), OpStatus::Ok);
+    EXPECT_EQ(r.state(), TxnState::Ready);
+    EXPECT_EQ(r.impl->producerEpoch(), 1);
+}
+
+// ended, through close(): close's own abort of an InDoubt{Bump} abort resumes at the bump, never re-sends EndTxn.
+TEST(ProducerTxnRegression, CloseAfterAnInDoubtBumpRetriesOnlyTheBumpRegression) {
+    Rig r;
+    r.initOk(42, 0);
+    r.startTxn();
+    r.impl->testPoison(OpStatus::DeliveryFailed, 0, rp::AbortKind::BumpEpoch);
+    Op abort = r.abort();
+    r.tick();
+    r.endAnswer();
+    r.tick();
+    r.tick(r.cfg.transactionOpTimeoutMs * kMs);
+    ASSERT_EQ(abort.status(), OpStatus::Timeout);
+    Op cl = r.close();
+    r.ticks(3, kMs);
+    EXPECT_EQ(r.endTxns(), 1u) << "close re-sent EndTxn under the stale epoch";
+    ASSERT_EQ(r.inits(), 3u);
+    r.answer(initAnswer(r.lastInitCorr(), 42, 1));
+    r.tick();
+    ASSERT_TRUE(cl.ready());
+    EXPECT_EQ(cl.status(), OpStatus::Ok);
+    EXPECT_EQ(r.state(), TxnState::Ready);
+}
+
+// bumpEpoch: a sequence gap found while the abort's EndTxn is already in flight still bumps the epoch (sticky).
+TEST(ProducerTxnRegression, SequenceGapFoundWhileAbortingStillBumpsRegression) {
+    Rig r;
+    r.initOk(42, 0);
+    r.startTxn();
+    Op abort = r.abort();
+    r.tick();
+    ASSERT_EQ(r.endTxns(), 1u);
+    r.impl->testPoison(OpStatus::DeliveryFailed, 0, rp::AbortKind::BumpEpoch);
+    EXPECT_EQ(r.state(), TxnState::AbortingTransaction);
+    r.endAnswer();
+    EXPECT_FALSE(abort.ready()) << "the gap's epoch bump was dropped";
+    r.tick();
+    ASSERT_EQ(r.inits(), 2u);
+    r.answer(initAnswer(r.lastInitCorr(), 42, 1));
+    ASSERT_TRUE(abort.ready());
+    EXPECT_EQ(abort.status(), OpStatus::Ok);
+    EXPECT_EQ(r.impl->producerEpoch(), 1);
+}
+
+// started: a leg answer arriving after its transaction ended (Ready) changes nothing - the next, empty transaction
+// still ends locally (no EndTxn) and a late failure poisons nothing.
+TEST(ProducerTxnRegression, LateLegAnswerAfterTheTransactionEndedChangesNothingRegression) {
+    Rig r;
+    r.initOk();
+    r.begin();
+    Op c1 = r.commit();
+    r.tick();
+    ASSERT_EQ(c1.status(), OpStatus::Ok);
+    r.impl->testLegAnswer(rp::ReqKind::AddPartitions, 0);
+    r.impl->testLegAnswer(rp::ReqKind::AddOffsets, ec(rpc::ErrorCode::InvalidTxnState));
+    EXPECT_EQ(r.state(), TxnState::Ready);
+    r.begin();
+    Op c2 = r.commit();
+    r.tick();
+    ASSERT_TRUE(c2.ready());
+    EXPECT_EQ(c2.status(), OpStatus::Ok);
+    EXPECT_EQ(r.endTxns(), 0u) << "a late leg answer marked the next transaction started";
+}
+
+// A late fencing answer after closeImmediately detached everything changes nothing (no FatalError, no completion).
+TEST(ProducerTxnRegression, LateFencedAnswerAfterCloseImmediatelyChangesNothingRegression) {
+    Rig r;
+    r.initOk();
+    r.startTxn();
+    Op commit = r.commit();
+    r.impl->applyCloseImmediately(OpStatus::Closed);
+    ASSERT_EQ(commit.status(), OpStatus::Closed);
+    r.impl->testLegAnswer(rp::ReqKind::AddPartitions, ec(rpc::ErrorCode::ProducerFenced));
+    EXPECT_NE(r.state(), TxnState::FatalError);
+    EXPECT_EQ(commit.times(), 1);
+}
+
+// Part B, through close(): close's own abort abandons an open Direct claim (commit() false, nothing in a frame).
+TEST(ProducerTxnRegression, CloseOwnAbortAbandonsAnOpenDirectClaimRegression) {
+    Rig r(txnCfg(), /*direct=*/true);
+    r.initOk();
+    r.startTxn();
+    r.impl->setTxnGate(ProducerImpl::TxnGate::Open);
+    const auto g = r.impl->claimRecord(1, 0, Key(uint64_t{3}), 16, 0);
+    ASSERT_EQ(g.result, rc::SendResult::Ok);
+    Op cl = r.close();
+    std::memset(g.base, 0xC2, 16);
+    EXPECT_FALSE(r.impl->commitClaim(g.token)) << "a claim open across close's abort committed";
+    EXPECT_EQ(r.impl->claimsAbandoned(), 1u);
+    r.tick();
+    ASSERT_EQ(r.endTxns(), 1u);
+    r.endAnswer();
+    r.ticks(2, kMs);
+    EXPECT_TRUE(r.wire.empty()) << "the abandoned claim's bytes reached a frame";
+    ASSERT_TRUE(cl.ready());
+    EXPECT_EQ(cl.status(), OpStatus::Ok);
+}

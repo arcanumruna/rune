@@ -142,9 +142,12 @@ static_assert(std::is_same_v<std::variant_alternative_t<kIdAssignedIndex, Produc
 // ---- Phase 2b F Task 5: the transaction machine, one state per phase, each holding only its data ----
 // (Declared here, not in TxnTypes.h, for the same reason: the states name CoordinatorLink::Slot.)  Owned by
 // ProducerImpl's duty side; the alternative index IS the TxnState value (static_asserted in ProducerImpl.h).
-// Today's TxnSm booleans became states / enums: started + maybeStarted -> TxnStarted, endSent -> EndSent,
-// bumpEpoch -> AbortKind, ended -> Aborting{started = No, phase = Bumping} (a retried abort re-sends only the
-// bump), opId == 0 (in doubt) -> InDoubt.
+// Today's TxnSm booleans became states / enums, and every fact survives an in-doubt timeout:
+//   started / maybeStarted -> TxnStarted (only ever upgraded, and frozen once EndTxn(abort) was answered);
+//   endSent                -> EndSent, then InDoubt{AfterEnd} (a commit that may have landed is never aborted);
+//   bumpEpoch              -> AbortKind (sticky);
+//   ended                  -> Bumping, then InDoubt{Bump} (a retried abort / close re-sends ONLY the bump);
+//   opId == 0 (in doubt)   -> InDoubt{BeforeEnd | AfterEnd | Bump}.
 
 /// One pending lifecycle op: where its single completion goes and when it times out.  An EMPTY target (no
 /// handler, no queue) is the close's own abort: its outcome is the close's, never delivered on its own.
@@ -163,9 +166,17 @@ struct TxnJoiners {
 
 struct AwaitData {};                                          ///< EndTxn waits for every record of the txn to be acked
 struct EndSent  { CoordinatorLink::Slot* slot = nullptr; };   ///< EndTxn on the link
-struct InDoubt  {};                                           ///< the op timed out: the app retries the SAME direction (B-2)
+/// Where an op that timed out left its transaction (the app retries the SAME direction, B-2):
+///   BeforeEnd - EndTxn was never sent (the data wait timed out): the retry waits for the data, then sends it;
+///   AfterEnd  - EndTxn was sent, its answer is unknown: it may have landed - never poisoned, never aborted over;
+///   Bump      - EndTxn(abort) was answered OK, the KIP-360 epoch bump was not: the retry re-sends only the bump.
+enum class InDoubtAt : uint8_t { BeforeEnd, AfterEnd, Bump };
+struct InDoubt  { InDoubtAt at = InDoubtAt::BeforeEnd; };
 struct Bumping  { CoordinatorLink::Slot* slot = nullptr; };   ///< InitProducerId after EndTxn(abort) (B-3); nullptr = not yet sent
-using EndPhase = std::variant<AwaitData, EndSent, InDoubt, Bumping>;
+/// The retry of an InDoubt{AfterEnd} op: EndTxn was sent before (the data had settled) - re-send it at once.  Like
+/// EndSent it may have landed: never poisoned, never aborted over.
+struct ResendEnd {};
+using EndPhase = std::variant<AwaitData, EndSent, InDoubt, Bumping, ResendEnd>;
 
 struct Uninitialized {};
 struct Initializing   { TxnOp op; CoordinatorLink::Slot* slot = nullptr; };   ///< slot nullptr = not yet sent
