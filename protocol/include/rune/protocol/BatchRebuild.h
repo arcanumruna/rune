@@ -5,7 +5,6 @@
 // baseOffset / lastOffsetDelta / timestamps / producer fields, matching records copied verbatim.
 #include <rune/protocol/Crc32c.h>
 #include <rune/protocol/RecordBatch.h>
-#include <rune/protocol/Varint.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -46,6 +45,7 @@ bool forEachRecordSpan(const uint8_t* batch, std::size_t len, Fn&& fn) noexcept 
     const int32_t total = r.totalLength();
     if (total < batch::kRecordBatchOverhead || static_cast<std::size_t>(total) > len) return false;
     const std::size_t end = static_cast<std::size_t>(total);
+    if (r.recordCount() < 0) return false;
     const int64_t base = r.baseOffset();
     std::size_t pos = batch::kRecordBatchOverhead;
     for (int32_t i = 0; i < r.recordCount(); ++i) {
@@ -58,6 +58,7 @@ bool forEachRecordSpan(const uint8_t* batch, std::size_t len, Fn&& fn) noexcept 
         ++pos;                                                               // attributes
         if (!detail::readVarintBounded(batch, recEnd, pos, tsDelta)) return false;
         if (!detail::readVarintBounded(batch, recEnd, pos, offDelta)) return false;
+        if (offDelta < 0 || offDelta > r.lastOffsetDelta()) return false;
         if (!detail::readVarintBounded(batch, recEnd, pos, klen)) return false;
         if (klen > 0) { if (static_cast<uint64_t>(klen) > recEnd - pos) return false; pos += static_cast<std::size_t>(klen); }
         if (!detail::readVarintBounded(batch, recEnd, pos, vlen)) return false;
@@ -76,12 +77,16 @@ bool forEachRecordSpan(const uint8_t* batch, std::size_t len, Fn&& fn) noexcept 
 /// Rebuild `src` keeping the records `keep` lists (ascending indices into `records`, the spans
 /// forEachRecordSpan produced for `src`).  Header fields are copied from `src`; recordCount = keep.size();
 /// length and CRC-32C are recomputed; kept records are copied verbatim.
-/// Returns the bytes written, or 0 (keep empty, an index out of range, or `out` too small).  No allocation.
+/// Returns the bytes written, or 0: keep empty, an index out of range, `keep` not strictly ascending, or `out`
+/// too small.  0 therefore means a refusal OR an empty keep, so callers check keep.empty() first.  No allocation.
 inline std::size_t rebuildBatch(std::span<const uint8_t> src, std::span<const RecordSpan> records,
                                 std::span<const uint32_t> keep, std::span<uint8_t> out) noexcept {
     if (keep.empty() || src.size() < static_cast<std::size_t>(batch::kRecordBatchOverhead)) return 0;
     std::size_t need = batch::kRecordBatchOverhead;
+    int64_t prev = -1;
     for (const uint32_t k : keep) {
+        if (static_cast<int64_t>(k) <= prev) return 0;
+        prev = k;
         if (k >= records.size() || records[k].pos + records[k].len > src.size()) return 0;
         need += records[k].len;
     }

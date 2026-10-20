@@ -71,6 +71,10 @@ TEST(BatchRebuildRegression, RefusesEmptyKeepOutOfRangeAndShortOutputRegression)
     const std::array<uint32_t, 1> one{0};
     std::vector<uint8_t> tiny(batch::kRecordBatchOverhead);
     EXPECT_EQ(rebuildBatch(src, s, one, tiny), 0u);
+    const std::array<uint32_t, 2> dup{1, 1};
+    EXPECT_EQ(rebuildBatch(src, s, dup, out), 0u);
+    const std::array<uint32_t, 2> desc{3, 1};
+    EXPECT_EQ(rebuildBatch(src, s, desc, out), 0u);
 }
 
 TEST(BatchRebuildRegression, ARecordThatDoesNotFitTheBatchStopsTheWalkRegression) {
@@ -87,4 +91,16 @@ TEST(BatchRebuildRegression, ARecordThatDoesNotFitTheBatchStopsTheWalkRegression
     for (int i = 0; i < 4; ++i) b[static_cast<std::size_t>(batch::kLengthOffset + i)] = static_cast<uint8_t>(l >> (8 * i));
     EXPECT_FALSE(forEachRecordSpan(b.data(), b.size(), [&](const RecordSpan&) { ++seen; }));
     EXPECT_EQ(seen, 4);
+}
+
+TEST(BatchRebuild, AnOffsetDeltaPastLastOffsetDeltaStopsTheWalkRegression) {
+    auto b = batch5(0);
+    const auto s = spans(b);
+    // Record layout: bodyLen varint (1 byte), attributes (1), timestampDelta varint (1), offsetDelta varint.
+    const std::size_t at = s[2].pos + 3;
+    ASSERT_EQ(b[at], 4u) << "zigzag(2)";
+    b[at] = 18;   // zigzag(9) > lastOffsetDelta (4)
+    int seen = 0;
+    EXPECT_FALSE(forEachRecordSpan(b.data(), b.size(), [&](const RecordSpan&) { ++seen; }));
+    EXPECT_EQ(seen, 2);
 }

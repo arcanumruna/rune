@@ -83,6 +83,7 @@
 #include <rune/client/detail/HubCommand.h>
 #include <rune/client/detail/M2ORingBuffer.h>
 
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <chrono>
