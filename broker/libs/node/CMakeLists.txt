@@ -1661,8 +1661,13 @@ if(BUILD_TESTING)
                        tests/client/RuneCliSecurityBrokerRegressionTest.cpp
                        tests/client/ClientSessionRevokedBrokerRegressionTest.cpp
                        tests/client/ClientAuthClusterRegressionTest.cpp
-                       tests/client/RuneConsoleBrokerRegressionTest.cpp)
-        target_include_directories(rune_client_broker_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+                       tests/client/RuneConsoleBrokerRegressionTest.cpp
+                       tests/client/ClaimBrokerRegressionTest.cpp)
+        # Phase 2b B Task 8b: ClaimBrokerRegressionTest compiles against the client's build-time generated all-fixed
+        # `position.gen.h` (rune_gen_claim_schemas); the embedded client builds it under its own binary dir.
+        add_dependencies(rune_client_broker_tests generate_claim_schema_headers)
+        target_include_directories(rune_client_broker_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests
+                                   ${CMAKE_BINARY_DIR}/rune-client/claim-gen)
         target_link_libraries(rune_client_broker_tests PRIVATE rune_node rune_view rune_codec rune_catalog
                               rune_client_api rune_cli_lib aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_client_broker_tests PROPERTIES TIMEOUT 600)
