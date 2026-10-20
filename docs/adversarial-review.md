@@ -1,7 +1,11 @@
 # Adversarial review
 
-How to try to break the area of a fix before its PR merges. The implementer applies this before opening the PR, and
-the reviewer applies it again independently. It applies to every PR that fixes a GitHub issue.
+How to try to break the area of a fix before its PR merges. It applies to every PR that fixes GitHub issues.
+
+**It runs once per batch, at the very end.** After every fix in the batch is in, the PR reviewer makes one adversarial
+pass over the union of the areas the batch touches. An area shared by several fixes is attacked once. The implementer
+does not run a separate pass; it fixes each issue with its regression tests. After a fix round, only the areas the
+new diff touches are attacked again.
 
 ## Mindset
 
