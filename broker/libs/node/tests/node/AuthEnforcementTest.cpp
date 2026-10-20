@@ -554,3 +554,47 @@ TEST(AuthEnforcementRegression, AdoptionThroughARoleFollowsTheRoleAdversarialReg
     EXPECT_EQ(r.defineTopicCode(s, "role.t2"), kNotAuthorized) << "the role revoked mid-session";
     EXPECT_EQ(version("role.t2"), before);
 }
+
+// PR #410 review F1, the throttle side: retries of an applied own SET PASSWORD (proven with the replaced password) are
+// answered their original result and are NOT password guesses - after three of them the user still logs in at once
+// from the same host (three charged failures would have started a delay).
+TEST(AuthEnforcementRegression, RetriesOfAnAppliedOwnChangeAreNotChargedOnTheThrottleRegression) {
+    AuthRig r;
+    std::string name;
+    const int64_t self = r.newUser({}, &name);
+    const AuthWireClient::Verifier v = AuthWireClient::verifierOf("the-new-password-123");
+    pc::SecurityDdl m; m.sessionId = self; m.kind = pc::SecurityOpKind::AlterUser; m.name = name;
+    m.change = pc::UserChangeKind::SetPassword; m.verifier = v.wire();
+    const std::string st = "ALTER USER " + name + " SET PASSWORD '<redacted>';";
+    r.wire().pinRequestId(rune::protocol::RequestId{0x5154, 0xAAAA});
+    ASSERT_EQ(r.wire().securityDdl(r.ch(), m, st).errorCode, 0u);
+    for (int i = 0; i < 3; ++i) EXPECT_EQ(r.wire().securityDdl(r.ch(), m, st).errorCode, 0u) << "retry " << i;
+    r.wire().pinRequestId(std::nullopt);
+    const auto login = r.broker().wire().connectAndLogin(r.ch(), name, "the-new-password-123");
+    EXPECT_TRUE(login.ok()) << "not rate limited: code " << login.errorCode() << " retryAfter "
+                            << (login.fin ? login.fin->retryAfterMs : 0u);
+}
+
+// PR #410 review F1, the whole bug class: any security DDL whose gateway check reads state its own first attempt
+// changed.  An admin revoking ITS OWN ADMIN (another admin remains) and retrying with the same request id: the gateway
+// now denies it ADMIN, but the retry gets its original result; a NEW request from it is refused 45.
+TEST(AuthEnforcementRegression, ARetriedRevokeOfOnesOwnAdminAnswersItsOriginalResultRegression) {
+    AuthRig r;
+    std::string name;
+    const int64_t self = r.newUser({cluster(SO::Admin)}, &name);
+    pc::SecurityDdl m; m.sessionId = self; m.kind = pc::SecurityOpKind::Revoke; m.name = name;
+    m.granteeKind = static_cast<uint8_t>(rune::protocol::SecurityGranteeKind::User);
+    m.op = static_cast<uint8_t>(SO::Admin); m.resourceType = static_cast<uint8_t>(ST::Cluster);
+    m.patternKind = static_cast<uint8_t>(rune::protocol::SecurityPatternKind::Exact);
+    const std::string st = "REVOKE ADMIN ON CLUSTER FROM USER " + name + ";";
+    r.wire().pinRequestId(rune::protocol::RequestId{0x5155, 0xBBBB});
+    ASSERT_EQ(r.wire().securityDdl(r.ch(), m, st).errorCode, 0u);
+    const int64_t applied = r.broker().node().securityViewForTest().appliedOffset;
+    const auto retry = r.wire().securityDdl(r.ch(), m, st);
+    r.wire().pinRequestId(std::nullopt);
+    EXPECT_EQ(retry.errorCode, 0u) << "the retry's original result: " << retry.detail;
+    EXPECT_EQ(r.broker().node().securityViewForTest().appliedOffset, applied);
+    const auto fresh = r.wire().createRole(r.ch(), self, "after_revoke");
+    EXPECT_EQ(fresh.errorCode, 45u) << "a new request needs the ADMIN it gave up";
+    EXPECT_EQ(fresh.detail, "not authorized: ADMIN on CLUSTER");
+}

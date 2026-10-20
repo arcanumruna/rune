@@ -2247,7 +2247,11 @@ private:
     [[nodiscard]] std::optional<rune::gateway::Denial> verifyOwnCredentialChange_(Session& session,
                                                                                 const rune::protocol::client::SecurityDdl& m,
                                                                                 const std::string& self,
-                                                                                const std::string& loginNonce);
+                                                                                const std::string& loginNonce,
+                                                                                bool chargeThrottle);
+    /// Count and (rate-limited) log one NotAuthorized verdict - deny_'s bookkeeping, also for a verdict the admin
+    /// thread answers (a forwarded security DDL).
+    void noteDenied_(const Session& session, rune::protocol::client::TemplateId tid, const rune::gateway::Denial& denial);
     /// Group / txn / catalog-DDL request authorization (cold paths): true = denied and answered.
     [[nodiscard]] bool denyGroupRequest_(Session& session, uint16_t tid, const uint8_t* buf, std::size_t len);
     [[nodiscard]] bool denyTxnRequest_(Session& session, uint16_t tid, const uint8_t* buf, std::size_t len);

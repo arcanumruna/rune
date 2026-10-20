@@ -17,7 +17,7 @@
 namespace rune::node {
 
 namespace {
-constexpr uint16_t kOK = 0, kNotLeader = 2, kInternal = 6, kInvalidRequest = 39;
+constexpr uint16_t kOK = 0, kNotLeader = 2, kInternal = 6, kInvalidRequest = 39, kNotAuthorized = 45;
 namespace sec = rune::security;
 namespace pc  = rune::protocol::client;
 
@@ -339,16 +339,24 @@ void SecurityAdmin::startDdl_(const SecurityDdlMsg& m, int64_t nowNs, SecurityRe
         return;
     }
     const uint64_t fp = fingerprintOf(m);
-    // 1. Dedupe (F14) on (requestId, statement fingerprint).
+    // 1. Dedupe (F14) on (requestId, statement fingerprint).  PR #410 review F1: BEFORE the gateway's verdict - a retry
+    // of an applied request gets its original result even when the gateway now denies it (the first attempt changed
+    // what the check reads: the password the retry is proven with, the ADMIN it needed).
     if (!m.meta.requestId.none()) {
         if (const auto rec = state.request(m.meta.requestId)) {
             if (rec->requestFingerprint == fp) {
                 answer_(req, kOK, {}, rec->objectId, rec->newVersion, rec->offset);   // a retry: its ORIGINAL result
+            } else if (!m.denial.empty()) {
+                answer_(req, kNotAuthorized, m.denial);
             } else {
                 answer_(req, kInvalidRequest, "requestId reused for a different statement");
             }
             return;
         }
+    }
+    if (!m.denial.empty()) {   // not a retry: the gateway's refusal stands
+        answer_(req, kNotAuthorized, m.denial);
+        return;
     }
     // 2. Build the operation from the wire fields.
     sec::SecurityEvent e;

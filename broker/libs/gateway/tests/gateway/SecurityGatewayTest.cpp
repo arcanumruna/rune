@@ -57,7 +57,11 @@ struct RecordingSink final : IAdminRequestSink {
                                 uint32_t, const DdlMetaView&) override { ++otherSubmits; return AdminSubmit::Accepted; }
     bool submitCatalogSubscribe(int64_t s, int64_t c, int64_t) override { catSubs.push_back({s, c}); return true; }
     bool submitCatalogUnsubscribe(int64_t s, int64_t id) override { catUnsubs.push_back({s, id}); return true; }
-    AdminSubmit submitSecurityDdl(const pc::SecurityDdl&, const DdlMetaView& m) override {
+    /// `securityDdls` counts the AUTHORIZED forwards; a denied one (PR #410 review F1: forwarded with the gateway's
+    /// verdict, which the leader answers) is recorded in `denied` by correlation id.
+    std::map<int64_t, std::string> denied;
+    AdminSubmit submitSecurityDdl(const pc::SecurityDdl& w, const DdlMetaView& m, std::string_view denial) override {
+        if (!denial.empty()) { denied[w.correlationId] = std::string(denial); return AdminSubmit::Accepted; }
         ++securityDdls; lastAuthenticated = std::string(m.authenticated); return AdminSubmit::Accepted;
     }
     AdminSubmit submitSecurityBootstrap(const pc::SecurityBootstrap&, const DdlMetaView&) override { ++bootstraps; return AdminSubmit::Accepted; }

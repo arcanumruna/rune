@@ -12,6 +12,8 @@
 #include <rune/protocol/client/SecurityMessages.h>
 
 #include <gtest/gtest.h>
+
+#include <map>
 #include <spdlog/sinks/ringbuffer_sink.h>
 #include <spdlog/spdlog.h>
 
@@ -41,7 +43,11 @@ struct RecordingSink final : IAdminRequestSink {
     AdminSubmit submitAlterView(int64_t, int64_t, std::string_view, std::string_view, uint8_t, uint32_t, const uint8_t*, uint32_t, const DdlMetaView&) override { ++otherSubmits; return AdminSubmit::Accepted; }
     bool submitCatalogSubscribe(int64_t, int64_t, int64_t) override { return true; }
     bool submitCatalogUnsubscribe(int64_t, int64_t) override { return true; }
-    AdminSubmit submitSecurityDdl(const pc::SecurityDdl&, const DdlMetaView& m) override {
+    /// `securityDdls` counts the AUTHORIZED forwards; a denied one (PR #410 review F1: forwarded with the gateway's
+    /// verdict, which the leader answers) is recorded in `denied` by correlation id.
+    std::map<int64_t, std::string> denied;
+    AdminSubmit submitSecurityDdl(const pc::SecurityDdl& w, const DdlMetaView& m, std::string_view denial) override {
+        if (!denial.empty()) { denied[w.correlationId] = std::string(denial); return AdminSubmit::Accepted; }
         ++securityDdls; lastAuthenticated = std::string(m.authenticated); return AdminSubmit::Accepted;
     }
     AdminSubmit submitSecurityBootstrap(const pc::SecurityBootstrap&, const DdlMetaView&) override { return AdminSubmit::Accepted; }
@@ -511,11 +517,12 @@ TEST(AuthLoginRegression, OwnCredentialChangeNeedsAProofBoundToTheSessionRegress
     ASSERT_EQ(b.fin->errorCode, 0);
     ASSERT_TRUE(a.salted.has_value());
     ASSERT_NE(a.combinedNonce, b.combinedNonce) << "every login has its own nonce";
+    // A denied request carrying a request id is forwarded with the verdict (PR #410 review F1): the leader answers 45.
     auto answerCode = [&](int64_t corr) -> int {
         for (auto it = rig.seen.rbegin(); it != rig.seen.rend(); ++it)
             if (it->corr == corr && it->tid == static_cast<uint16_t>(pc::TemplateId::DdlResponse))
                 return pc::DdlResponse::decode(it->bytes.data(), it->bytes.size())->errorCode;
-        return -1;
+        return rig.admin.denied.count(corr) != 0 ? 45 : -1;
     };
     Rig::Outcome wrongPassword = a;
     const std::array<uint8_t, 16> salt{};
@@ -697,8 +704,9 @@ TEST(AuthLoginRegression, ASignedOwnChangeTruncatedAtEveryOffsetIsNeverForwarded
     bad.push_back(full); bad.back().push_back(0x00);
     for (const auto& b : bad) {
         const std::size_t before = rig.seen.size();
+        rig.admin.denied.clear();
         rig.send(b);
-        bool answered = false;
+        bool answered = rig.admin.denied.count(900) != 0;   // forwarded with a denial: the leader answers 45
         for (std::size_t i = before; i < rig.seen.size(); ++i) answered |= rig.seen[i].corr == 900;
         EXPECT_TRUE(answered) << "length " << b.size();
         rig.gw_now += 60'000'000'000; rig.gw.setNowNsForTest(rig.gw_now);   // past any throttle delay
@@ -718,12 +726,9 @@ TEST(AuthLoginRegression, AValidProofNeverStandsInForAdminAdversarialRegression)
     int64_t corr = 950;
     for (const char* name : {"ws2", "WS1", "admin"}) {
         rig.send(alterUserFrame(a.sid, ++corr, name, pc::UserChangeKind::SetPassword, &a));
-        const Frame* f = nullptr;
-        for (const Frame& x : rig.seen) if (x.corr == corr) f = &x;
-        ASSERT_NE(f, nullptr) << name;
-        const auto d = pc::DdlResponse::decode(f->bytes.data(), f->bytes.size());
-        EXPECT_EQ(d->errorCode, 45) << name;
-        EXPECT_EQ(d->detail, "not authorized: ADMIN on CLUSTER") << name;
+        // Forwarded with the verdict (PR #410 review F1): the leader answers 45 with it.
+        ASSERT_EQ(rig.admin.denied.count(corr), 1u) << name;
+        EXPECT_EQ(rig.admin.denied[corr], "not authorized: ADMIN on CLUSTER") << name;
     }
     rig.send(alterUserFrame(a.sid, ++corr, "ws1", pc::UserChangeKind::Disable, &a));
     EXPECT_EQ(rig.admin.securityDdls, 0);
@@ -768,10 +773,15 @@ TEST(AuthLoginRegression, TheSecurityDdlTrailerUnderVersionSkewAndGarbageAdversa
     Rig rig;
     const auto a = rig.login("ws1", {kTestPasswordA, ""});
     ASSERT_EQ(a.fin->errorCode, 0);
-    auto answer = [&](int64_t corr) -> std::optional<pc::DdlResponse> {
+    // The gateway's own answer, or (PR #410 review F1) the verdict it forwarded for the leader to answer 45 with.
+    struct Answer { uint16_t errorCode; std::string detail; };
+    auto answer = [&](int64_t corr) -> std::optional<Answer> {
         for (auto it = rig.seen.rbegin(); it != rig.seen.rend(); ++it)
-            if (it->corr == corr && it->tid == static_cast<uint16_t>(pc::TemplateId::DdlResponse))
-                return pc::DdlResponse::decode(it->bytes.data(), it->bytes.size());
+            if (it->corr == corr && it->tid == static_cast<uint16_t>(pc::TemplateId::DdlResponse)) {
+                const auto d = pc::DdlResponse::decode(it->bytes.data(), it->bytes.size());
+                return Answer{d->errorCode, std::string(d->detail)};
+            }
+        if (const auto it = rig.admin.denied.find(corr); it != rig.admin.denied.end()) return Answer{45, it->second};
         return std::nullopt;
     };
     auto pastDelay = [&] { rig.gw_now += 60'000'000'000; rig.gw.setNowNsForTest(rig.gw_now); };

@@ -147,7 +147,13 @@ struct IAdminRequestSink {
     // Authentication Task 10 (D36): the security DDL (79) and the one-time bootstrap (80), both answered by a
     // DdlResponse (78) from the admin thread; `meta.statement` is the REDACTED statement.  The bootstrap's MAC was
     // verified by the gateway before this call.
-    virtual AdminSubmit submitSecurityDdl(const rune::protocol::client::SecurityDdl& m, const DdlMetaView& meta) = 0;
+    // `denial` (PR #410 review F1): the gateway's authorization verdict - "" = authorized, otherwise the NotAuthorized
+    // detail (no ADMIN, or an own credential change without a valid proof).  A request that carries a request id is
+    // forwarded even when denied: the leader first answers a RETRY of an already-applied request (its dedupe table) with
+    // its original result - the check may depend on state the first attempt changed (a SET PASSWORD replaced the
+    // password the retry is proven with; a REVOKE removed the ADMIN it needed) - and refuses everything else 45.
+    virtual AdminSubmit submitSecurityDdl(const rune::protocol::client::SecurityDdl& m, const DdlMetaView& meta,
+                                          std::string_view denial) = 0;
     virtual AdminSubmit submitSecurityBootstrap(const rune::protocol::client::SecurityBootstrap& m,
                                                 const DdlMetaView& meta) = 0;
     // A Subscribe / Unsubscribe on `__security` (topic -7): the admin thread's second read server.  Same ring-full rules

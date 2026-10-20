@@ -7788,17 +7788,22 @@ void ClientGateway::onCatalogObjectDropped(int32_t id)
     });
 }
 
-bool ClientGateway::deny_(Session& session, const std::optional<rune::gateway::Denial>& denial, const uint8_t* buf, std::size_t len)
+void ClientGateway::noteDenied_(const Session& session, pc::TemplateId tid, const rune::gateway::Denial& denial)
 {
-    if (!denial) return false;
     ++notAuthorizedAnswers_;
-    const auto hdr = pc::MessageHeader::decode(buf, len);
     if (notAuthorizedAnswers_ % 1024 == 1) {
         const char* user = "<anonymous>";
         if (const auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&session.auth)) user = a->user.c_str();
         spdlog::warn("auth: request refused user={} session={} template={}: {} (refusals so far: {})", user, session.sessionId,
-                     hdr ? hdr->templateId : 0, denial->detail, notAuthorizedAnswers_);
+                     static_cast<uint16_t>(tid), denial.detail, notAuthorizedAnswers_);
     }
+}
+
+bool ClientGateway::deny_(Session& session, const std::optional<rune::gateway::Denial>& denial, const uint8_t* buf, std::size_t len)
+{
+    if (!denial) return false;
+    const auto hdr = pc::MessageHeader::decode(buf, len);
+    noteDenied_(session, static_cast<pc::TemplateId>(hdr ? hdr->templateId : 0), *denial);
     if (!hdr) return true;   // the caller decoded the body, so this cannot happen; nothing to answer on
     // The DDL family carries the D23 detail text; every other response type has no free-text field.
     switch (static_cast<pc::TemplateId>(hdr->templateId)) {
@@ -8372,6 +8377,13 @@ void ClientGateway::handleSecurityDdl(const uint8_t* buf, std::size_t len)
     // Authentication Task 12 (D20): ADMIN ON CLUSTER - except a user's own ALTER USER <self> ADD / DROP / SET PASSWORD,
     // which (issue #114) needs a fresh proof of a CURRENT password instead: the session alone (a hijacked plaintext
     // session, a leaked one) must not turn into a permanent second password.
+    //
+    // PR #410 review F1: the verdict may depend on state the request's own FIRST attempt changed (a SET PASSWORD
+    // replaced the password its retry is proven with; a REVOKE removed the ADMIN its retry needs), and only the leader's
+    // dedupe table knows authoritatively whether this is such a retry.  So a request with a request id is forwarded
+    // with the verdict, never refused here; the leader answers a retry its original result and refuses the rest 45.  A
+    // request without one (pre-v8) cannot be a deduped retry: refused here.
+    std::optional<rune::gateway::Denial> denial;
     {
         const std::string* self = nullptr;
         const std::string* loginNonce = nullptr;
@@ -8380,32 +8392,45 @@ void ClientGateway::handleSecurityDdl(const uint8_t* buf, std::size_t len)
         std::optional<rune::gateway::Denial> admin =
             rune::gateway::authorizeCluster(permsOf_(*session), rune::security::Operation::Admin);
         const bool ownPassword = self != nullptr && pc::isOwnCredentialChange(m, *self);
-        if (!ownPassword) {
-            if (deny_(*session, admin, buf, len)) return;
-        } else if (admin) {   // no ADMIN: the change must carry a valid proof
-            if (deny_(*session, verifyOwnCredentialChange_(*session, m, *self, *loginNonce), buf, len)) return;
+        // A request id this broker's mirror already holds is a retry (the mirror may lag the leader by an apply, so a
+        // retry can also look new: then it is still answered right, only charged once on the throttle).
+        const bool knownRetry = !m.ext.requestId.none() && securityView_ != nullptr &&
+                                securityView_->state().request(m.ext.requestId).has_value();
+        if (!ownPassword) denial = std::move(admin);
+        else if (admin) denial = verifyOwnCredentialChange_(*session, m, *self, *loginNonce, /*chargeThrottle=*/!knownRetry);
+        if (denial && m.ext.requestId.none()) {
+            (void)deny_(*session, denial, buf, len);
+            return;
         }
-        if (ownPassword && m.change == pc::UserChangeKind::AddPassword)   // a second password: always worth a line
+        if (denial && !knownRetry) noteDenied_(*session, pc::TemplateId::SecurityDdl, *denial);
+        if (!denial && ownPassword && m.change == pc::UserChangeKind::AddPassword)   // a second password: worth a line
             spdlog::warn("security: user {} adds a password to its own account (session {}, source {})", *self,
                          session->sessionId, session->sourceHost);
     }
-    answerAdminSubmit_(buf, len, adminSink_->submitSecurityDdl(m, ddlMetaOf_(&m.ext, m.sessionId, *session)),
+    answerAdminSubmit_(buf, len,
+                       adminSink_->submitSecurityDdl(m, ddlMetaOf_(&m.ext, m.sessionId, *session),
+                                                     denial ? std::string_view(denial->detail) : std::string_view{}),
                        "SecurityDdl: admin ring full", "SecurityDdl: request larger than the admin ring message");
 }
 
 std::optional<rune::gateway::Denial> ClientGateway::verifyOwnCredentialChange_(Session& session, const pc::SecurityDdl& m,
                                                                                const std::string& self,
-                                                                               const std::string& loginNonce)
+                                                                               const std::string& loginNonce,
+                                                                               bool chargeThrottle)
 {
     // Issue #114.  Every failure is the same text (it never says which part failed) and counts as a failed login on
     // the throttle: a proof is a password guess.  Cold path (security DDL rate).
     rune::gateway::Denial refused;
     refused.detail = "not authorized: changing your own password needs a fresh proof of a current password (log in again "
                      "and retry)";
-    const rune::gateway::LoginThrottle::Verdict v = loginThrottle_.check(self, session.sourceHost, nowNs_);
-    if (!v.allowed) {
-        ++loginsRateLimited_;
-        return refused;
+    // A retry of a request the leader already applied (chargeThrottle false) is neither throttled nor charged: the
+    // leader answers it from its dedupe table whatever this verdict says.
+    if (chargeThrottle) {
+        const rune::gateway::LoginThrottle::Verdict v = loginThrottle_.check(self, session.sourceHost, nowNs_);
+        if (!v.allowed) {
+            ++loginsRateLimited_;
+            return refused;
+        }
     }
     bool ok = false;
     const rune::security::UserObject* user =
@@ -8423,13 +8448,14 @@ std::optional<rune::gateway::Denial> ClientGateway::verifyOwnCredentialChange_(S
         }
     }
     if (!ok) {
+        if (!chargeThrottle) return refused;
         loginThrottle_.onFailure(self, session.sourceHost, nowNs_);
         if (unauthLog_.due(4)) [[unlikely]]
             spdlog::warn("security: user {} sent a change of its own password without a valid proof (session {}, source {})",
                          self, session.sessionId, session.sourceHost);
         return refused;
     }
-    loginThrottle_.onSuccess(self, session.sourceHost);
+    if (chargeThrottle) loginThrottle_.onSuccess(self, session.sourceHost);
     return std::nullopt;
 }
 
