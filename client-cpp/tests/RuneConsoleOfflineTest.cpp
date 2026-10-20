@@ -194,6 +194,7 @@ TEST(ConsoleOfflineRegression, ScriptParseErrorHasFileLineColPrefix) {
     const auto r = console({"-f", f.string(), "--dry-run"});
     EXPECT_EQ(r.rc, 1);
     EXPECT_NE(r.err.find(f.string() + ":statement 1: 1:13: "), std::string::npos) << r.err;
+    EXPECT_NE(r.err.find("type"), std::string::npos) << "the message names the unknown type: " << r.err;
 }
 
 TEST(ConsoleOfflineRegression, DryRunDispatchesEachStatementKind) {
@@ -205,6 +206,11 @@ TEST(ConsoleOfflineRegression, DryRunDispatchesEachStatementKind) {
     EXPECT_EQ(a.rc, 0) << a.err;
     EXPECT_NE(a.out.find("alter topic characters"), std::string::npos) << a.out;
     EXPECT_NE(a.out.find("DROP nickname"), std::string::npos) << a.out;
+    EXPECT_EQ(a.out.find("topic characters partitions"), std::string::npos) << "an alter never prints a DefineTopic descriptor: " << a.out;
+    const auto c = console({"-f", writeScript("c2.rql", "alter topic characters add column nickname string, set compatibility backward;").string(), "--dry-run"});
+    EXPECT_EQ(c.rc, 0) << c.err;
+    EXPECT_NE(c.out.find("ADD nickname"), std::string::npos) << c.out;
+    EXPECT_NE(c.out.find("SET_COMPATIBILITY backward"), std::string::npos) << c.out;
 }
 
 TEST(ConsoleOfflineRegression, DryRunPrintsAllAlterOpKinds) {

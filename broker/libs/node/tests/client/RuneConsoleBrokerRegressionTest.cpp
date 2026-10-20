@@ -5,6 +5,8 @@
 #include <rune/cli/Cli.h>
 #include <rune/cli/Console.h>   // runLiveOnFdForTest
 #include <rune/client/session/SessionMachine.h>
+#include <rune/codec/Descriptor.h>
+#include <rune/codec/Serialize.h>
 
 #include <gtest/gtest.h>
 
@@ -87,6 +89,32 @@ TEST(RuneConsoleBrokerRegression, InteractiveDefinesAltersAndReadsInOneSessionRe
     ASSERT_GE(ev.size(), 3u);
     EXPECT_EQ(ev[0].event.statement, "topic player { id int64, name string } partitions 8 key id;")
         << "each DDL records its own statement text";
+    // Migrated from CliLive.SchemaApplyLive / ApplyTransientTopicSendsTransientPersistence: what reaches the broker.
+    bool sawPlayer = false, sawTicks = false, sawLevel = false;
+    for (const auto& e : ev) {
+        if (const auto* c = std::get_if<rune::catalog::CreateTopicOps>(&e.event.ops)) {
+            if (e.event.objectName == "player") {
+                sawPlayer = true;
+                EXPECT_EQ(c->partitions, 8);
+                ASSERT_TRUE(c->schema.has_value());
+                EXPECT_EQ(c->schema->keyField, "id");
+                EXPECT_EQ(c->persistence, rune::catalog::Persistence::Disk);
+                ASSERT_FALSE(c->schema->descriptorBlob.empty()) << "descriptor blob must be non-empty";
+                const auto d = rune::codec::deserialize(std::span<const uint8_t>(c->schema->descriptorBlob));
+                EXPECT_EQ(d.name, "player");
+                EXPECT_EQ(d.fields.size(), 2u);
+            }
+            if (e.event.objectName == "ticks") {
+                sawTicks = true;
+                EXPECT_EQ(c->persistence, rune::catalog::Persistence::Transient) << "a transient topic is never created on disk";
+            }
+        }
+        if (const auto* a = std::get_if<rune::catalog::AlterSchemaOps>(&e.event.ops); a != nullptr && e.event.objectName == "player") {
+            for (const auto& op : a->ops)
+                if (op.type == rune::codec::AlterOpType::Add && op.name == "level") sawLevel = true;
+        }
+    }
+    EXPECT_TRUE(sawPlayer && sawTicks && sawLevel) << "player create, transient ticks create and the level ADD were all issued";
 }
 
 TEST(RuneConsoleBrokerRegression, OneSessionForEveryStatementRegression) {
@@ -101,7 +129,8 @@ TEST(RuneConsoleBrokerRegression, BrokerErrorKeepsTheSessionRegression) {
     OneBroker b("console_err");
     const auto r = consoleLive(b, {}, "topic t partitions 1;\ntopic t partitions 1;\ntopic u partitions 1;\n");
     EXPECT_EQ(r.rc, 0);
-    EXPECT_NE(r.err.find("TopicExists (25)"), std::string::npos) << r.err;
+    EXPECT_NE(r.err.find("TopicExists (25)"), std::string::npos) << r.err;   // was CliLive.SchemaApplyTopicExists ("already exists", rc 0; DD8: now an error line)
+    EXPECT_EQ(r.out.find("ok topic t "), r.out.rfind("ok topic t ")) << "the duplicate is not reported ok: " << r.out;
     EXPECT_NE(r.out.find("ok topic u (1 partition)"), std::string::npos) << "the session continues: " << r.out;
 }
 
@@ -115,6 +144,7 @@ TEST(RuneConsoleBrokerRegression, ScriptStopsAtTheFirstBrokerErrorWithItsCodeReg
     const auto r = consoleLive(b, {"-f", f}, "");
     EXPECT_EQ(r.rc, static_cast<int>(rune::protocol::client::ErrorCode::SchemaIncompatible)) << r.err;
     EXPECT_NE(r.err.find(f + ":statement 3: "), std::string::npos) << r.err;
+    EXPECT_NE(r.err.find("SchemaIncompatible (30)"), std::string::npos) << "the broker code is named: " << r.err;   // was CliLive.AlterTopicSchemaIncompatible
     for (const auto& e : b.catalogEvents()) EXPECT_NE(e.event.objectName, "never") << "nothing after the failure is issued";
 }
 
@@ -137,6 +167,31 @@ TEST(RuneConsoleBrokerRegression, ValidateAndExpectedVersionReachTheBrokerRegres
     const std::string f2 = writeFile("flags2.rql", "alter topic fv add column b int32;\n");
     const auto r = consoleLive(b, {"-f", f2, "--expected-version", "1"}, "");   // the topic is at v2 now
     EXPECT_EQ(r.rc, static_cast<int>(rune::protocol::client::ErrorCode::SchemaConflict)) << r.err;
+    EXPECT_NE(r.err.find("SchemaConflict (31)"), std::string::npos) << "the stale expected version is named: " << r.err;   // was CliLive.AlterTopicSchemaConflict
+}
+
+TEST(RuneConsoleBrokerRegression, ScriptDefinesThenAltersWithExpectedVersionRegression) {
+    OneBroker b("console_evo");
+    const std::string f = writeFile("evo.rql",
+        "topic characters { id int64, userId int64 } partitions 4 key userId;\n"
+        "alter topic characters add column nickname string, set compatibility backward;\n");
+    const auto r = consoleLive(b, {"-f", f, "--expected-version", "1"}, "");
+    ASSERT_EQ(r.rc, 0) << r.err;
+    EXPECT_NE(r.out.find("ok topic characters v1 (4 partitions)"), std::string::npos) << r.out;
+    EXPECT_NE(r.out.find("ok topic characters v2"), std::string::npos) << "the new version is printed: " << r.out;
+    // The ops that reach the broker are the ones parsed (was CliLive.AlterTopicLive's opsBlob decode).
+    bool sawAdd = false, sawCompat = false;
+    for (const auto& e : b.catalogEvents()) {
+        if (e.event.objectName != "characters") continue;
+        if (const auto* a = std::get_if<rune::catalog::AlterSchemaOps>(&e.event.ops))
+            for (const auto& op : a->ops) {
+                if (op.type == rune::codec::AlterOpType::Add && op.name == "nickname") sawAdd = true;
+                if (op.type == rune::codec::AlterOpType::SetCompatibility && op.mode == rune::codec::CompatMode::Backward) sawCompat = true;
+            }
+        if (const auto* sc = std::get_if<rune::catalog::SetCompatibilityOps>(&e.event.ops); sc != nullptr && sc->mode == rune::codec::CompatMode::Backward) sawCompat = true;
+    }
+    EXPECT_TRUE(sawAdd) << "ADD nickname reached the broker";
+    EXPECT_TRUE(sawCompat) << "SET COMPATIBILITY backward reached the broker";
 }
 
 TEST(RuneConsoleBrokerRegression, IdlePromptKeepsTheSessionAliveRegression) {

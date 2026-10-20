@@ -1,37 +1,21 @@
 // tests/RuneCliLiveTest.cpp
 //
-// Task 9 — rune CLI live tests (schema apply/get/list via loopback gateway).
+// rune CLI live tests (schema get/list and `rune ql` via the loopback gateway).
 //
 // Uses the in-process SchemaTestGateway loopback (mirroring ClientSchemaTest)
 // to exercise rune::cli::run() for:
 //
-//   1. CliLive.SchemaApplyLive
-//        rune schema apply <file> --broker aeron:ipc --cli-stream-in X --cli-stream-out Y
-//        → gateway sees DefineTopic with correct name/partitions/keyField
-//        → blob deserialized to the parsed topic's descriptor fingerprint
-//        → CLI output contains "defined: topicId="
-//
-//   2. CliLive.SchemaApplyTopicExists
-//        Gateway returns TopicExists(25).
-//        → CLI returns 0, output contains "already exists"
-//
-//   3. CliLive.SchemaGetLive
-//        rune schema get <topic> → toText output contains "schema characters"
-//
-//   4. CliLive.SchemaGetUnknownTopic
-//        Gateway returns UnknownTopic(7).
-//        → CLI returns 7, err contains "unknown topic"
-//
-//   5. CliLive.SchemaListLive
-//        Apply a topic, then list → output contains the topic name + "id="
-//
-//   6. CliLive.SchemaListVerbose
-//        Apply a topic, list --verbose → output contains version= and fp=
+//   1. CliLive.SchemaGetLive            rune schema get <topic> -> toText output
+//   2. CliLive.SchemaGetUnknownTopic    UnknownTopic(7) -> CLI returns 7, err contains "unknown topic"
+//   3. CliLive.SchemaListLive           define, then list -> the topic name + "id="
+//   4. CliLive.SchemaListVerbose        list --verbose -> version= and fp=
 //
 // Regression tests (engineering rule 6):
-//   7. CliLiveRegression.ApplyLive_TopicNameInOutput
-//   8. CliLiveRegression.GetLive_DescriptorInOutput
-//   9. CliLiveRegression.ListLive_TopicPresent
+//   CliLiveRegression.GetLive_DescriptorInOutput, ListLive_TopicPresent,
+//   QlDefinesATopicAndVerbosePrintsEveryNotLeaderRetry
+//
+// `rune schema apply|alter` were removed (Phase 2b D): their live assertions are carried by
+// RuneConsoleBrokerRegression in the broker's RuneConsoleBrokerRegressionTest.cpp (real broker).
 //
 // All tests are bounded (kFutureTimeout) and use SchemaTestGateway from
 // ClientSchemaTest.cpp (included via the same translation unit pattern).
@@ -470,104 +454,6 @@ CliRunResult runCli(CliTestGateway& gw,
 }
 
 // ===========================================================================
-// Test 1: SchemaApplyLive — gateway sees correct DefineTopic, CLI emits defined
-// ===========================================================================
-TEST(CliLive, SchemaApplyLive) {
-    static constexpr int32_t kIn = 1200, kOut = 1201;
-    const std::string baseDir = cliUniqueDir();
-    const std::string agentDir = baseDir;
-    const std::string aeronDir = agentDir + "/aeron";
-
-    const std::string rqlPath = writeTmpRql(
-        baseDir,
-        "topic characters { id int64, userId int64, name string } "
-        "partitions 16 key userId;");
-
-    CliTestGateway gw(aeronDir, kIn, kOut);
-    gw.defineTopicId   = 0x40000001;
-    gw.defineVersion   = 1;
-    gw.defineErrorCode = 0;
-
-    // Build CLI args.
-    std::vector<std::string> args = {
-        "schema", "apply", rqlPath,
-        "--cli-data-dir", agentDir,
-        "--cli-stream-in",  std::to_string(kIn),
-        "--cli-stream-out", std::to_string(kOut),
-    };
-
-    auto r = runCli(gw, aeronDir, args);
-
-    // Gateway must have seen exactly one DefineTopic.
-    EXPECT_EQ(gw.definesSeen.load(), 1) << "gateway should have seen one DefineTopic";
-    EXPECT_EQ(gw.lastDefineName,       "characters");
-    EXPECT_EQ(gw.lastDefinePartitions, 16u);
-    EXPECT_EQ(gw.lastDefineKeyField,   "userId");
-
-    // The descriptor blob must deserialize to the same fingerprint as the parsed topic.
-    ASSERT_FALSE(gw.lastDefineBlob.empty()) << "descriptor blob must be non-empty";
-    rune::codec::Descriptor d = rune::codec::deserialize(
-        std::span<const uint8_t>(gw.lastDefineBlob.data(), gw.lastDefineBlob.size()));
-    EXPECT_EQ(d.name, "characters");
-
-    // Compare fingerprint against what rune-ql would produce.
-    auto parseResult = rune::ql::parse(
-        "topic characters { id int64, userId int64, name string } "
-        "partitions 16 key userId;");
-    ASSERT_TRUE(parseResult.has_value());
-    rune::ql::DefineTopicPlan plan = rune::ql::applyPlan(std::get<rune::ql::TopicDef>(*parseResult));
-    rune::codec::Descriptor dExpected = rune::codec::deserialize(
-        std::span<const uint8_t>(plan.descriptorBlob.data(), plan.descriptorBlob.size()));
-    EXPECT_EQ(rune::codec::fingerprint(d), rune::codec::fingerprint(dExpected))
-        << "descriptor blob fingerprint must match the parsed topic";
-
-    // CLI must report success.
-    EXPECT_EQ(r.rc, 0) << "CLI must return 0; err=" << r.err;
-    EXPECT_NE(r.out.find("defined"), std::string::npos)
-        << "output must contain 'defined'; got: " << r.out;
-    EXPECT_NE(r.out.find("topicId="), std::string::npos)
-        << "output must contain 'topicId='; got: " << r.out;
-
-    gw.stop();
-    try { std::filesystem::remove_all(baseDir); } catch (...) {}
-}
-
-// ===========================================================================
-// Test 2: SchemaApplyTopicExists — TopicExists(25) → CLI returns 0, "already exists"
-// ===========================================================================
-TEST(CliLive, SchemaApplyTopicExists) {
-    static constexpr int32_t kIn = 1202, kOut = 1203;
-    const std::string baseDir = cliUniqueDir();
-    const std::string agentDir = baseDir;
-    const std::string aeronDir = agentDir + "/aeron";
-
-    const std::string rqlPath = writeTmpRql(
-        baseDir,
-        "topic characters { id int64 } partitions 1 key id;");
-
-    CliTestGateway gw(aeronDir, kIn, kOut);
-    gw.defineTopicId   = -1;
-    gw.defineVersion   = 0;
-    gw.defineErrorCode = static_cast<uint16_t>(rpc::ErrorCode::TopicExists);
-
-    std::vector<std::string> args = {
-        "schema", "apply", rqlPath,
-        "--cli-data-dir", agentDir,
-        "--cli-stream-in",  std::to_string(kIn),
-        "--cli-stream-out", std::to_string(kOut),
-    };
-
-    auto r = runCli(gw, aeronDir, args);
-
-    EXPECT_EQ(r.rc, 0) << "TopicExists must return 0; err=" << r.err;
-    EXPECT_NE(r.out.find("already exists"), std::string::npos)
-        << "output must mention 'already exists'; got: " << r.out;
-
-    gw.stop();
-    try { std::filesystem::remove_all(baseDir); } catch (...) {}
-}
-
-// ===========================================================================
 // Test 3: SchemaGetLive — getTopicSchema returns descriptor, CLI prints toText
 // ===========================================================================
 TEST(CliLive, SchemaGetLive) {
@@ -823,42 +709,6 @@ TEST(CliLive, SchemaListVerbose) {
 }
 
 // ===========================================================================
-// Test 7 (Regression): ApplyLive_TopicNameInOutput
-// ===========================================================================
-TEST(CliLiveRegression, ApplyLive_TopicNameInOutput) {
-    static constexpr int32_t kIn = 1210, kOut = 1211;
-    const std::string baseDir = cliUniqueDir();
-    const std::string agentDir = baseDir;
-    const std::string aeronDir = agentDir + "/aeron";
-
-    const std::string rqlPath = writeTmpRql(
-        baseDir,
-        "topic characters { id int64 } partitions 1 key id;");
-
-    CliTestGateway gw(aeronDir, kIn, kOut);
-    gw.defineTopicId   = 0x40000010;
-    gw.defineVersion   = 1;
-    gw.defineErrorCode = 0;
-
-    std::vector<std::string> args = {
-        "schema", "apply", rqlPath,
-        "--cli-data-dir", agentDir,
-        "--cli-stream-in",  std::to_string(kIn),
-        "--cli-stream-out", std::to_string(kOut),
-    };
-
-    auto r = runCli(gw, aeronDir, args);
-
-    EXPECT_EQ(r.rc, 0) << "regression: apply must return 0; err=" << r.err;
-    EXPECT_NE(r.out.find("characters"), std::string::npos)
-        << "regression: output must contain topic name 'characters'; got: " << r.out;
-    EXPECT_EQ(gw.definesSeen.load(), 1) << "regression: gateway must see exactly one DefineTopic";
-
-    gw.stop();
-    try { std::filesystem::remove_all(baseDir); } catch (...) {}
-}
-
-// ===========================================================================
 // Test 8 (Regression): GetLive_DescriptorInOutput
 // ===========================================================================
 TEST(CliLiveRegression, GetLive_DescriptorInOutput) {
@@ -960,226 +810,6 @@ TEST(CliLiveRegression, ListLive_TopicPresent) {
     EXPECT_TRUE(found) << "regression: 'characters' must appear in listTopics";
 
     client.close();
-    gw.stop();
-    try { std::filesystem::remove_all(baseDir); } catch (...) {}
-}
-
-// ===========================================================================
-// Task 20: `rune schema alter` + `apply` routing an 'alter topic' file.
-// ===========================================================================
-
-// Test 10: AlterTopicLive — gateway sees correct AlterTopic, CLI emits newVersion
-TEST(CliLive, AlterTopicLive) {
-    static constexpr int32_t kIn = 1240, kOut = 1241;
-    const std::string baseDir = cliUniqueDir();
-    const std::string agentDir = baseDir;
-    const std::string aeronDir = agentDir + "/aeron";
-
-    const std::string rqlPath = writeTmpRql(
-        baseDir,
-        "alter topic characters add column nickname string, "
-        "set compatibility backward;");
-
-    CliTestGateway gw(aeronDir, kIn, kOut);
-    gw.alterTopicId    = 0x40000001;
-    gw.alterNewVersion = 2;
-    gw.alterErrorCode  = 0;
-
-    std::vector<std::string> args = {
-        "schema", "alter", rqlPath,
-        "--expected-version", "1",
-        "--cli-data-dir", agentDir,
-        "--cli-stream-in",  std::to_string(kIn),
-        "--cli-stream-out", std::to_string(kOut),
-    };
-
-    auto r = runCli(gw, aeronDir, args);
-
-    EXPECT_EQ(gw.altersSeen.load(), 1) << "gateway should have seen one AlterTopic";
-    EXPECT_EQ(gw.lastAlterName,            "characters");
-    EXPECT_EQ(gw.lastAlterExpectedVersion, 1u);
-    ASSERT_FALSE(gw.lastAlterOpsBlob.empty()) << "opsBlob must be non-empty";
-
-    // The opsBlob must decode to the same ops the CLI parsed.
-    auto decoded = rune::codec::decodeAlterOps(
-        std::span<const uint8_t>(gw.lastAlterOpsBlob.data(), gw.lastAlterOpsBlob.size()));
-    ASSERT_TRUE(decoded.has_value()) << "opsBlob must decode";
-    ASSERT_EQ(decoded->size(), 2u);
-    EXPECT_EQ((*decoded)[0].type, rune::codec::AlterOpType::Add);
-    EXPECT_EQ((*decoded)[0].name, "nickname");
-    EXPECT_EQ((*decoded)[1].type, rune::codec::AlterOpType::SetCompatibility);
-    EXPECT_EQ((*decoded)[1].mode, rune::codec::CompatMode::Backward);
-
-    EXPECT_EQ(r.rc, 0) << "CLI must return 0; err=" << r.err;
-    EXPECT_NE(r.out.find("altered"), std::string::npos)
-        << "output must contain 'altered'; got: " << r.out;
-    EXPECT_NE(r.out.find("newVersion=2"), std::string::npos)
-        << "output must contain 'newVersion=2'; got: " << r.out;
-
-    gw.stop();
-    try { std::filesystem::remove_all(baseDir); } catch (...) {}
-}
-
-// Test 11: AlterTopicSchemaIncompatible — SchemaIncompatible(30) -> clear message
-TEST(CliLive, AlterTopicSchemaIncompatible) {
-    static constexpr int32_t kIn = 1242, kOut = 1243;
-    const std::string baseDir = cliUniqueDir();
-    const std::string agentDir = baseDir;
-    const std::string aeronDir = agentDir + "/aeron";
-
-    const std::string rqlPath = writeTmpRql(
-        baseDir, "alter topic characters drop column id;");
-
-    CliTestGateway gw(aeronDir, kIn, kOut);
-    gw.alterTopicId    = -1;
-    gw.alterNewVersion = 0;
-    gw.alterErrorCode  = static_cast<uint16_t>(rpc::ErrorCode::SchemaIncompatible);
-
-    std::vector<std::string> args = {
-        "schema", "alter", rqlPath,
-        "--cli-data-dir", agentDir,
-        "--cli-stream-in",  std::to_string(kIn),
-        "--cli-stream-out", std::to_string(kOut),
-    };
-
-    auto r = runCli(gw, aeronDir, args);
-
-    EXPECT_EQ(r.rc, static_cast<int>(rpc::ErrorCode::SchemaIncompatible))
-        << "CLI must return 30 (SchemaIncompatible); err=" << r.err;
-    EXPECT_NE(r.err.find("incompatible"), std::string::npos)
-        << "err must mention 'incompatible'; got: " << r.err;
-
-    gw.stop();
-    try { std::filesystem::remove_all(baseDir); } catch (...) {}
-}
-
-// Test 12: AlterTopicSchemaConflict — SchemaConflict(31) -> clear message
-TEST(CliLive, AlterTopicSchemaConflict) {
-    static constexpr int32_t kIn = 1244, kOut = 1245;
-    const std::string baseDir = cliUniqueDir();
-    const std::string agentDir = baseDir;
-    const std::string aeronDir = agentDir + "/aeron";
-
-    const std::string rqlPath = writeTmpRql(
-        baseDir, "alter topic characters add column nickname string;");
-
-    CliTestGateway gw(aeronDir, kIn, kOut);
-    gw.alterTopicId    = -1;
-    gw.alterNewVersion = 0;
-    gw.alterErrorCode  = static_cast<uint16_t>(rpc::ErrorCode::SchemaConflict);
-
-    std::vector<std::string> args = {
-        "schema", "alter", rqlPath,
-        "--expected-version", "5",
-        "--cli-data-dir", agentDir,
-        "--cli-stream-in",  std::to_string(kIn),
-        "--cli-stream-out", std::to_string(kOut),
-    };
-
-    auto r = runCli(gw, aeronDir, args);
-
-    EXPECT_EQ(r.rc, static_cast<int>(rpc::ErrorCode::SchemaConflict))
-        << "CLI must return 31 (SchemaConflict); err=" << r.err;
-    EXPECT_NE(r.err.find("stale"), std::string::npos)
-        << "err must mention 'stale'; got: " << r.err;
-
-    gw.stop();
-    try { std::filesystem::remove_all(baseDir); } catch (...) {}
-}
-
-// Test 13: ApplyAlterFileLive — `apply` on an 'alter topic' file routes to the
-// alter path (gateway sees AlterTopic, not DefineTopic).
-TEST(CliLive, ApplyAlterFileLive) {
-    static constexpr int32_t kIn = 1246, kOut = 1247;
-    const std::string baseDir = cliUniqueDir();
-    const std::string agentDir = baseDir;
-    const std::string aeronDir = agentDir + "/aeron";
-
-    const std::string rqlPath = writeTmpRql(
-        baseDir, "alter topic characters add column nickname string;");
-
-    CliTestGateway gw(aeronDir, kIn, kOut);
-    gw.alterTopicId    = 0x40000005;
-    gw.alterNewVersion = 3;
-    gw.alterErrorCode  = 0;
-
-    std::vector<std::string> args = {
-        "schema", "apply", rqlPath,
-        "--cli-data-dir", agentDir,
-        "--cli-stream-in",  std::to_string(kIn),
-        "--cli-stream-out", std::to_string(kOut),
-    };
-
-    auto r = runCli(gw, aeronDir, args);
-
-    EXPECT_EQ(gw.altersSeen.load(), 1)  << "apply on an alter file must send AlterTopic";
-    EXPECT_EQ(gw.definesSeen.load(), 0) << "apply on an alter file must NOT send DefineTopic";
-    EXPECT_EQ(r.rc, 0) << "CLI must return 0; err=" << r.err;
-    EXPECT_NE(r.out.find("newVersion=3"), std::string::npos)
-        << "output must contain 'newVersion=3'; got: " << r.out;
-
-    gw.stop();
-    try { std::filesystem::remove_all(baseDir); } catch (...) {}
-}
-
-// ===========================================================================
-// Test 14 (Regression): AlterLive_NewVersionInOutput
-// ===========================================================================
-TEST(CliLiveRegression, AlterLive_NewVersionInOutput) {
-    static constexpr int32_t kIn = 1248, kOut = 1249;
-    const std::string baseDir = cliUniqueDir();
-    const std::string agentDir = baseDir;
-    const std::string aeronDir = agentDir + "/aeron";
-
-    const std::string rqlPath = writeTmpRql(
-        baseDir, "alter topic characters add column nickname string;");
-
-    CliTestGateway gw(aeronDir, kIn, kOut);
-    gw.alterTopicId    = 0x40000006;
-    gw.alterNewVersion = 7;
-    gw.alterErrorCode  = 0;
-
-    std::vector<std::string> args = {
-        "schema", "alter", rqlPath,
-        "--cli-data-dir", agentDir,
-        "--cli-stream-in",  std::to_string(kIn),
-        "--cli-stream-out", std::to_string(kOut),
-    };
-
-    auto r = runCli(gw, aeronDir, args);
-
-    EXPECT_EQ(r.rc, 0) << "regression: alter must return 0; err=" << r.err;
-    EXPECT_NE(r.out.find("characters"), std::string::npos)
-        << "regression: output must contain topic name 'characters'; got: " << r.out;
-    EXPECT_NE(r.out.find("newVersion=7"), std::string::npos)
-        << "regression: output must contain 'newVersion=7'; got: " << r.out;
-    EXPECT_EQ(gw.altersSeen.load(), 1) << "regression: gateway must see exactly one AlterTopic";
-
-    gw.stop();
-    try { std::filesystem::remove_all(baseDir); } catch (...) {}
-}
-
-// Phase 2b E: `transient topic ...;` through `rune schema apply` must reach the
-// broker as a TRANSIENT DefineTopic (silently creating a disk topic would be a bug).
-TEST(CliLiveRegression, ApplyTransientTopicSendsTransientPersistence) {
-    static constexpr int32_t kIn = 1240, kOut = 1241;
-    const std::string baseDir = cliUniqueDir();
-    const std::string aeronDir = baseDir + "/aeron";
-    const std::string rqlPath = writeTmpRql(
-        baseDir, "transient topic presence { userId int64, online bool } partitions 4 key userId;");
-    CliTestGateway gw(aeronDir, kIn, kOut);
-    gw.defineTopicId = 0x40000002; gw.defineVersion = 1; gw.defineErrorCode = 0;
-    std::vector<std::string> args = {
-        "schema", "apply", rqlPath,
-        "--cli-data-dir", baseDir,
-        "--cli-stream-in",  std::to_string(kIn),
-        "--cli-stream-out", std::to_string(kOut),
-    };
-    auto r = runCli(gw, aeronDir, args);
-    EXPECT_EQ(r.rc, 0) << r.err;
-    EXPECT_EQ(gw.definesSeen.load(), 1);
-    EXPECT_EQ(gw.lastDefineName, "presence");
-    EXPECT_EQ(gw.lastDefinePersistence, rpc::DefineTopic::kPersistenceTransient);
     gw.stop();
     try { std::filesystem::remove_all(baseDir); } catch (...) {}
 }
