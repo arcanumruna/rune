@@ -1470,6 +1470,7 @@ if(BUILD_TESTING)
             tests/detail/CompletionsTest.cpp
             tests/client/InvokerClientTest.cpp
             tests/client/ProducerTxnClientTest.cpp
+            tests/client/TxnMatrixTest.cpp
             tests/client/ClaimClientTest.cpp
             tests/client/TypedClaimTest.cpp
             tests/client/IngressEndpointRoutingTest.cpp

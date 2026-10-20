@@ -383,6 +383,57 @@ struct InvokerGateway {
     // commit flag of every EndTxn received (1 commit / 0 abort).
     bool                 replyTxn = false;
     std::vector<uint8_t> endTxnCommits;
+    // ---- Phase 2b F Task 12: TxnFakeBroker mode (the transaction interaction matrix) ----
+    // The per-partition frame order: every AddPartitionsToTxn request, every OK answer when it LEFT the fake, every
+    // Produce (with its TRANSACTIONAL bit) in the order the fake saw / sent them, so a test can prove "no
+    // transactional batch before its partition's AddPartitions OK" (the OK is stamped when it is SENT: with
+    // holdAddPartitions the answer leaves only at releaseAddPartitions(), so a Produce that arrives while it is
+    // held was sent before the producer could know the partition was added).
+    enum class TxnFrameKind : uint8_t { AddPartitionsReq, AddPartitionsOk, Produce, AddOffsets, TxnOffsetCommit, EndTxn };
+    struct TxnFrame {
+        TxnFrameKind kind          = TxnFrameKind::Produce;
+        int32_t      partition     = -1;
+        bool         transactional = false;   // Produce: the batch carries the TRANSACTIONAL attribute
+        int64_t      producerId    = -1;
+        int16_t      producerEpoch = -1;
+        int16_t      code          = 0;       // answers / EndTxn: the code sent (EndTxn: commit flag in `partition`)
+    };
+    std::vector<TxnFrame> txnFrames;
+    // Scripted coordinator answers: the next AddPartitions / AddOffsets / TxnOffsetCommit / EndTxn requests are
+    // answered with the front code (19 InvalidTxnState, 18 ProducerFenced, ...) and NOT applied; popped per request.
+    std::deque<int16_t> txnCoordCodes;
+    /// A later init of the same transactional id: bumps its epoch and fences every request still stamped with
+    /// the old one (answered ProducerFenced 18, not applied) - the zombie rule of a real coordinator.
+    std::map<int64_t, int16_t> fencedBelow;   ///< producerId -> the lowest epoch still accepted
+    void fenceTransactionalId(const std::string& tid, int64_t pid) { fencedBelow[pid] = txnEpochs_[tid]++; }
+    /// Coordinator requests are processed but never answered (a session that dies with the frame in flight).
+    bool holdTxnReplies = false;
+    int  txnRequestsUnanswered = 0;   ///< coordinator requests swallowed by holdTxnReplies
+    /// AddPartitionsToTxn answers are queued instead of sent until releaseAddPartitions().
+    bool holdAddPartitions = false;
+    struct HeldAddPartitions { std::vector<uint8_t> frame; std::vector<int32_t> partitions; };
+    std::vector<HeldAddPartitions> heldAddPartitions_;
+    void releaseAddPartitions() {
+        holdAddPartitions = false;
+        for (auto& h : heldAddPartitions_) {
+            for (const int32_t pt : h.partitions) txnFrames.push_back({TxnFrameKind::AddPartitionsOk, pt, false, -1, -1, 0});
+            send(0, h.frame.data(), h.frame.size());
+        }
+        heldAddPartitions_.clear();
+    }
+    /// The code a coordinator request stamped (pid, epoch) is answered with: 18 for a fenced epoch, else the next
+    /// scripted code, else 0.
+    int16_t txnCoordCode_(int64_t pid, int16_t epoch) {
+        if (const auto f = fencedBelow.find(pid); f != fencedBelow.end() && epoch < f->second) {
+            return static_cast<int16_t>(rune::protocol::client::ErrorCode::ProducerFenced);
+        }
+        if (!txnCoordCodes.empty()) {
+            const int16_t c = txnCoordCodes.front();
+            txnCoordCodes.pop_front();
+            return c;
+        }
+        return 0;
+    }
     // T15b fix round 1 (shard lifecycle / gates):
     std::set<int> silentEndpoints;   // ConnectRequests arriving on these endpoints are never answered
     int16_t       connectErrorCode = 0;  // != 0: every ConnectRequest -> ConnectResponse{code}
@@ -1133,6 +1184,8 @@ private:
         const Produced pr{pv.topicId, pv.partition, pv.sessionId, pv.correlationId,
                           r.recordCount(), r.baseSequence(), endpoint, pv.producerEpoch};
         produced.push_back(pr);
+        txnFrames.push_back({TxnFrameKind::Produce, pv.partition, (r.attributes() & rune::protocol::batch::kAttrTransactional) != 0,
+                             pv.producerId, pv.producerEpoch, 0});
         const bool answer = pv.correlationId != 0 && dropAnswer.count(ordinal) == 0;
         const bool acksAll = pv.acks == 1;
         auto ackAt = [&](const Produced& p, int16_t ec, int64_t off, int64_t lso = -1) {
@@ -1687,22 +1740,43 @@ private:
             const auto ap = rp::AddPartitionsToTxn::decode(buf, len);
             if (ap) coordinatorSessionIds.push_back(ap->sessionId);
             if (ap && txnNotCoordinator_(endpoint, ap->sessionId, ap->correlationId)) return;
-            if (!ap || !replyTxn) return;
+            if (!ap) return;
+            std::vector<rp::TxnPartitionResult> results;
+            for (const auto tp : ap->partitions) results.push_back({tp.topicId, tp.partition, 0});
+            for (const auto& r : results) txnFrames.push_back({TxnFrameKind::AddPartitionsReq, r.partition, false, ap->producerId, ap->producerEpoch, 0});
+            const int16_t code = txnCoordCode_(ap->producerId, ap->producerEpoch);
+            for (auto& r : results) r.errorCode = code;
+            if (!replyTxn) return;
+            if (holdTxnReplies) { ++txnRequestsUnanswered; return; }
             rp::AddPartitionsToTxnResponse rsp;
             rsp.sessionId     = ap->sessionId;
             rsp.correlationId = ap->correlationId;
-            std::vector<uint8_t> out(rp::AddPartitionsToTxnResponse::encodedSizeFor(0));
-            const std::size_t n = rsp.encode(out.data(), {});
-            send(0, out.data(), n);
+            std::vector<uint8_t> out(rp::AddPartitionsToTxnResponse::encodedSizeFor(results.size()));
+            const std::size_t n = rsp.encode(out.data(), std::span<const rp::TxnPartitionResult>(results));
+            out.resize(n);
+            if (code == 0 && holdAddPartitions) {
+                HeldAddPartitions h;
+                h.frame = std::move(out);
+                for (const auto& r : results) h.partitions.push_back(r.partition);
+                heldAddPartitions_.push_back(std::move(h));
+                return;
+            }
+            for (const auto& r : results) txnFrames.push_back({TxnFrameKind::AddPartitionsOk, r.partition, false, ap->producerId, ap->producerEpoch, code});
+            send(0, out.data(), out.size());
             return;
         }
         case rcc::TemplateId::AddOffsetsToTxn: {
             ++addOffsets;
             const auto ao = rp::AddOffsetsToTxn::decode(buf, len);
-            if (!ao || !replyTxn) return;
+            if (!ao) return;
+            txnFrames.push_back({TxnFrameKind::AddOffsets, -1, false, ao->producerId, ao->producerEpoch, 0});
+            const int16_t code = txnCoordCode_(ao->producerId, ao->producerEpoch);
+            if (!replyTxn) return;
+            if (holdTxnReplies) { ++txnRequestsUnanswered; return; }
             rp::AddOffsetsToTxnResponse rsp;
             rsp.sessionId     = ao->sessionId;
             rsp.correlationId = ao->correlationId;
+            rsp.errorCode     = code;
             std::vector<uint8_t> out(rp::AddOffsetsToTxnResponse::ENCODED_SIZE);
             const std::size_t n = rsp.encode(out.data());
             send(0, out.data(), n);
@@ -1712,14 +1786,21 @@ private:
             ++txnOffsetCommits;
             const auto oc = rp::TxnOffsetCommit::decode(buf, len);
             if (!oc) return;
+            txnFrames.push_back({TxnFrameKind::TxnOffsetCommit, -1, false, oc->producerId, oc->producerEpoch, 0});
+            const int16_t code = txnCoordCode_(oc->producerId, oc->producerEpoch);
             lastTxnOffsetGroup.assign(oc->groupId.begin(), oc->groupId.end());
-            for (const auto e : oc->entries) pendingTxnOffsets.emplace_back(e.topicId, e.partition, e.offset);
+            std::vector<rp::TxnPartitionResult> results;
+            for (const auto e : oc->entries) {
+                if (code == 0) pendingTxnOffsets.emplace_back(e.topicId, e.partition, e.offset);
+                results.push_back({e.topicId, e.partition, code});
+            }
             if (!replyTxn) return;
+            if (holdTxnReplies) { ++txnRequestsUnanswered; return; }
             rp::TxnOffsetCommitResponse rsp;
             rsp.sessionId     = oc->sessionId;
             rsp.correlationId = oc->correlationId;
-            std::vector<uint8_t> out(rp::TxnOffsetCommitResponse::encodedSizeFor(0));
-            const std::size_t n = rsp.encode(out.data(), {});
+            std::vector<uint8_t> out(rp::TxnOffsetCommitResponse::encodedSizeFor(results.size()));
+            const std::size_t n = rsp.encode(out.data(), std::span<const rp::TxnPartitionResult>(results));
             send(0, out.data(), n);
             return;
         }
@@ -1729,20 +1810,26 @@ private:
             if (!et) return;
             coordinatorSessionIds.push_back(et->sessionId);
             if (txnNotCoordinator_(endpoint, et->sessionId, et->correlationId)) return;
-            endTxnCommits.push_back(et->commit);
-            for (auto& b : log) {
-                if (b.fate == TxnFate::Open && b.producerId == et->producerId) {
-                    b.fate = et->commit != 0 ? TxnFate::Committed : TxnFate::Aborted;
+            const int16_t code = txnCoordCode_(et->producerId, et->producerEpoch);
+            txnFrames.push_back({TxnFrameKind::EndTxn, et->commit, false, et->producerId, et->producerEpoch, code});
+            if (code == 0) {
+                endTxnCommits.push_back(et->commit);
+                for (auto& b : log) {
+                    if (b.fate == TxnFate::Open && b.producerId == et->producerId) {
+                        b.fate = et->commit != 0 ? TxnFate::Committed : TxnFate::Aborted;
+                    }
                 }
+                if (et->commit != 0) {
+                    for (const auto& [t, p, o] : pendingTxnOffsets) committedOffsets[{t, p}] = o;
+                }
+                pendingTxnOffsets.clear();
             }
-            if (et->commit != 0) {
-                for (const auto& [t, p, o] : pendingTxnOffsets) committedOffsets[{t, p}] = o;
-            }
-            pendingTxnOffsets.clear();
             if (!replyTxn) return;
+            if (holdTxnReplies) { ++txnRequestsUnanswered; return; }
             rp::EndTxnResponse rsp;
             rsp.sessionId     = et->sessionId;
             rsp.correlationId = et->correlationId;
+            rsp.errorCode     = code;
             std::vector<uint8_t> out(rp::EndTxnResponse::ENCODED_SIZE);
             const std::size_t n = rsp.encode(out.data());
             send(0, out.data(), n);
