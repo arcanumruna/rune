@@ -744,3 +744,28 @@ TEST(ProducerClaimAllocRegression, ClaimBatchAbortDestructorAndCreditPathsAlloca
     for (uint64_t k = 64; k < 1064; ++k) cycle(k);
     EXPECT_EQ(alloc_counter::stop(), 0L) << "claimBatch abort / destructor / commit must not allocate";
 }
+
+TEST(ProducerClaimRegression, ClaimBatchWireSizeIsBoundedEvenWithoutAFrameCapRegression) {
+    ProducerConfig cfg = voidCfg();
+    cfg.maxFrameBytes = 0;  // no frame cap: the ring's maxMsgLength must still bound the batch
+    CqRig r(cfg);
+    rc::Completions bq(*r.client, smallCq());
+    r.p.batchAcksTo(bq);
+    const Key key(uint64_t{1});
+    for (const uint32_t n : {100'000'000u, 1'000'000u, 0x7fffffffu}) {
+        rc::BatchClaim b = r.p.claimBatch(kTopic, key, n, 0);
+        EXPECT_FALSE(b);
+        EXPECT_EQ(b.result(), SendResult::MessageTooLarge) << n;
+    }
+    EXPECT_EQ(r.p.claimBatch(kTopic, key, 0, 0).result(), SendResult::InvalidArgument);
+    EXPECT_EQ(bq.outstanding(), 0u) << "nothing was credited";
+    FrameCapture cap;
+    pump(*r.impl, cap.fn());  // nothing was claimed: the drain has nothing to reserve
+    EXPECT_TRUE(cap.recs.empty());
+    // A small zero-length batch still works.
+    rc::BatchClaim ok = r.p.claimBatch(kTopic, key, 3, 0);
+    ASSERT_TRUE(ok);
+    ASSERT_TRUE(ok.commit());
+    pump(*r.impl, cap.fn());
+    EXPECT_EQ(cap.recs.size(), 3u);
+}

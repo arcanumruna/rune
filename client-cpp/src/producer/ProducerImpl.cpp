@@ -3334,11 +3334,13 @@ SendResult ProducerImpl::checkBatchClaim_(const Key& key, uint32_t n, uint32_t r
     if (n > static_cast<uint32_t>(INT32_MAX) || key.size() + recLen > rune::client::Producer::kMaxRecordBytes) {
         return SendResult::MessageTooLarge;
     }
-    // A claimBatch is ONE frame: it must fit the hard per-frame wire cap.
-    if (cfg_.maxFrameBytes > 0 &&
-        claimBatchWireBound(key.size(), n, recLen) > static_cast<int64_t>(cfg_.maxFrameBytes)) {
-        return SendResult::MessageTooLarge;
-    }
+    // A claimBatch is ONE frame: it must fit the hard per-frame wire cap.  With
+    // no frame cap (maxFrameBytes == 0) the ring's maxMsgLength still bounds the
+    // wire size, so n x (tiny recLen) can never make the duty thread reserve an
+    // unbounded builder (64-bit: n <= INT32_MAX, perRecord < 64).
+    const int64_t wireCap = cfg_.maxFrameBytes > 0 ? static_cast<int64_t>(cfg_.maxFrameBytes)
+                                                    : static_cast<int64_t>(ring_.maxMsgLength());
+    if (claimBatchWireBound(key.size(), n, recLen) > wireCap) return SendResult::MessageTooLarge;
     return SendResult::Ok;
 }
 
