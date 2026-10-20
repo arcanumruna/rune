@@ -19,6 +19,10 @@ void giveBack(const ClaimOpen& o) noexcept {
 }
 }  // namespace
 
+bool ClaimCredit::mayCommit(const ClaimOpen& o) noexcept {
+    return (o.cq == nullptr || o.cq->onOwnerThread()) && (o.bq == nullptr || o.bq->onOwnerThread());
+}
+
 bool ClaimCredit::commit(const ClaimOpen& o) noexcept {
     if (!o.impl->commitClaim(o.token)) {
         giveBack(o);  // abandoned: no completion will ever arrive
@@ -30,8 +34,8 @@ bool ClaimCredit::commit(const ClaimOpen& o) noexcept {
 }
 
 void ClaimCredit::abort(const ClaimOpen& o) noexcept {
-    o.impl->abortClaim(o.token);
-    giveBack(o);
+    o.impl->abortClaim(o.token);  // the slot must be released from any thread
+    if (mayCommit(o)) giveBack(o);  // credit is owner-thread state: never touched off it
 }
 
 }  // namespace detail
@@ -62,6 +66,7 @@ bool Claim::commit() noexcept {
     const auto* o = std::get_if<Open>(&state_);
     if (o == nullptr) return false;
     const detail::ClaimOpen core = o->core;
+    if (!detail::ClaimCredit::mayCommit(core)) return false;  // stays open: not this thread's to settle
     state_ = Settled{};
     return detail::ClaimCredit::commit(core);
 }

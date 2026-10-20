@@ -7,23 +7,28 @@
 #include "../support/AllocCounter.h"
 #include "../support/FrameCapture.h"
 
+#include <rune/client/Client.h>
+#include <rune/client/Completions.h>
 #include <rune/client/Key.h>
 #include <rune/client/TopicHandle.h>
 #include <rune/client/producer/BatchBuilder.h>
 #include <rune/client/producer/Producer.h>
+#include <rune/client/codec/DataCodec.h>
 #include <rune/client/producer/ProducerImpl.h>
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <span>
-#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <memory>
 #include <vector>
+#include <unistd.h>
 
 namespace rc = rune::client;
 using rc::Acks;
@@ -62,6 +67,40 @@ void pump(ProducerImpl& impl, const ProducerImpl::SendFn& sink) {
         impl.flushBatches(kNow, 42, sink);
     }
 }
+
+// A Client in Invoker mode is used only to REGISTER Completions queues: the
+// producer under test is a bare Ring-mode ProducerImpl whose hooks name that
+// Client, so tryClaim(.., Completions&, Token) accepts the queues.
+std::atomic<int> g_ctr{0};
+rc::ClientConfig regCfg() {
+    rc::ClientConfig c;
+    c.gatewayChannel  = "aeron:ipc";
+    c.gatewayStreamId = 4601;
+    c.egressChannel   = "aeron:ipc";
+    c.egressStreamId  = 4602;
+    c.dataDir = "/tmp/claim_test_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr.fetch_add(1));
+    c.runnerMode = rc::RunnerMode::Invoker;
+    return c;
+}
+rc::CompletionsConfig smallCq(uint32_t cap = 1u << 14) {
+    rc::CompletionsConfig c;
+    c.capacityBytes  = cap;
+    c.maxResultBytes = 64;
+    c.maxErrorText   = 64;
+    return c;
+}
+struct CqRig {
+    std::unique_ptr<rc::Client> client = std::make_unique<rc::Client>(regCfg());
+    ProducerImpl*               impl;
+    Producer                    p;
+    explicit CqRig(ProducerConfig cfg = voidCfg(), std::size_t ring = 64 * 1024)
+        : impl(new ProducerImpl(cfg, ring)), p(impl) {
+        ProducerImpl::Hooks h;
+        h.ctx = client.get();
+        impl->setHooks(h);
+    }
+};
+constexpr uint32_t kUnit = rc::producer::kAckRecordBytes;
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -216,6 +255,133 @@ TEST(ProducerClaim, ClaimNeverOvertakesAQueuedTier2Batch) {
     EXPECT_EQ(cap.values(), (std::vector<std::string>{"A", "X", "Y", "C"}));
 }
 
+
+// ---------------------------------------------------------------------------
+// Completions credit (Task 4 fix round, I1): every failure branch returns it.
+// ---------------------------------------------------------------------------
+
+TEST(ProducerClaim, CqClaimCreditIsReturnedOnAbortDestructorAndRefusal) {
+    CqRig r;
+    rc::Completions cq(*r.client, smallCq());
+    const Key key(uint64_t{1});
+    {
+        rc::Claim c = r.p.tryClaim(kTopic, key, 4, cq, 1);
+        ASSERT_TRUE(c);
+        EXPECT_EQ(cq.outstanding(), 1u);
+        EXPECT_EQ(cq.reservedBytes(), kUnit);
+        c.abort();
+        EXPECT_EQ(cq.outstanding(), 0u) << "abort returns the reservation";
+        EXPECT_EQ(cq.reservedBytes(), 0u);
+    }
+    {
+        rc::Claim c = r.p.tryClaim(kTopic, key, 4, cq, 2);
+        ASSERT_TRUE(c);
+        EXPECT_EQ(cq.outstanding(), 1u);
+    }  // destructor-abort
+    EXPECT_EQ(cq.outstanding(), 0u) << "destructor-abort returns the reservation";
+    EXPECT_EQ(cq.reservedBytes(), 0u);
+    // A refused claim (after the reservation was made) returns it too.
+    rc::Claim big = r.p.tryClaim(kTopic, key, static_cast<uint32_t>(Producer::kMaxRecordBytes), cq, 3);
+    EXPECT_FALSE(big);
+    EXPECT_EQ(big.result(), SendResult::MessageTooLarge);
+    EXPECT_EQ(cq.outstanding(), 0u);
+    EXPECT_EQ(cq.reservedBytes(), 0u);
+    // A committed claim KEEPS its credit until the completion is polled.
+    rc::Claim ok = r.p.tryClaim(kTopic, key, 4, cq, 4);
+    ASSERT_TRUE(ok);
+    ASSERT_TRUE(ok.commit());
+    EXPECT_EQ(cq.outstanding(), 1u);
+    EXPECT_EQ(cq.reservedBytes(), kUnit);
+}
+
+TEST(ProducerClaim, CqClaimIsRefusedWithoutCreditAndTheSlotIsReleasedWhenTheBatchQueueIsFull) {
+    CqRig r;
+    rc::Completions cq(*r.client, smallCq());
+    rc::Completions bq(*r.client, smallCq(1024));
+    r.p.batchAcksTo(bq);
+    uint32_t filled = 0;
+    while (bq.reserve(kUnit) == rc::OpResult::Accepted) ++filled;
+    ASSERT_GT(filled, 0u);
+    const uint32_t bqOutstanding = bq.outstanding();
+    rc::Claim c = r.p.tryClaim(kTopic, Key(uint64_t{1}), 4, cq, 1);
+    EXPECT_FALSE(c);
+    EXPECT_EQ(c.result(), SendResult::QueueFull);
+    EXPECT_EQ(cq.outstanding(), 0u) << "the per-record credit came back";
+    EXPECT_EQ(cq.reservedBytes(), 0u);
+    EXPECT_EQ(bq.outstanding(), bqOutstanding) << "no batch unit was taken";
+    FrameCapture cap;
+    pump(*r.impl, cap.fn());
+    EXPECT_TRUE(cap.recs.empty()) << "the claimed slot was aborted, nothing is sent";
+    for (uint32_t i = 0; i < filled; ++i) bq.unreserve(kUnit);
+}
+
+// Client close (closeFinal) unblocks a claim held across it: commit() reports
+// false (nothing was accepted) and every reservation comes back.
+TEST(ProducerClaim, CommitAfterTheCloseDrainUnblockIsFalseAndReturnsTheCredit) {
+    CqRig r;
+    rc::Completions cq(*r.client, smallCq());
+    rc::Completions bq(*r.client, smallCq());
+    r.p.batchAcksTo(bq);
+    rc::Claim c = r.p.tryClaim(kTopic, Key(uint64_t{1}), 4, cq, 1);
+    ASSERT_TRUE(c);
+    EXPECT_EQ(cq.outstanding(), 1u);
+    EXPECT_EQ(bq.outstanding(), 1u);
+    r.impl->closeFinal(rc::OpStatus::Closed, 1);
+    EXPECT_FALSE(c.commit()) << "released under the writer: nothing was accepted";
+    EXPECT_FALSE(c);
+    EXPECT_EQ(cq.outstanding(), 0u);
+    EXPECT_EQ(cq.reservedBytes(), 0u);
+    EXPECT_EQ(bq.outstanding(), 0u);
+    EXPECT_EQ(bq.reservedBytes(), 0u);
+}
+
+TEST(ProducerClaim, AbortAndDestructorAfterTheCloseDrainUnblockAreSafeAndReturnTheCredit) {
+    CqRig r;
+    rc::Completions cq(*r.client, smallCq());
+    {
+        rc::Claim a = r.p.tryClaim(kTopic, Key(uint64_t{1}), 4, cq, 1);
+        rc::Claim b = r.p.tryClaim(kTopic, Key(uint64_t{2}), 4, cq, 2);
+        ASSERT_TRUE(a);
+        ASSERT_TRUE(b);
+        EXPECT_EQ(cq.outstanding(), 2u);
+        r.impl->closeFinal(rc::OpStatus::Closed, 1);
+        a.abort();  // must not throw out of a noexcept function
+        EXPECT_EQ(cq.outstanding(), 1u);
+    }  // b's destructor
+    EXPECT_EQ(cq.outstanding(), 0u);
+    EXPECT_EQ(cq.reservedBytes(), 0u);
+}
+
+// M1, claim layer: a record the close-drain unblock turned into padding is never
+// reported committed.  (The exact verify/publish interleaving is forced in
+// M2ORingBuffer.CommitRacingUnblockBetweenVerifyAndPublishThrowsRegression.)
+TEST(ProducerClaimRegression, CommitRacingTheCloseUnblockNeverReportsALostRecordCommittedRegression) {
+    CqRig r;
+    rc::Completions cq(*r.client, smallCq());
+    rc::Claim c = r.p.tryClaim(kTopic, Key(uint64_t{1}), 4, cq, 1);
+    ASSERT_TRUE(c);
+    // Same thread plays the drain: it unblocks the (uncommitted) head claim.
+    EXPECT_TRUE(r.impl->testUnblockHeadClaim());
+    EXPECT_FALSE(c.commit());
+    EXPECT_EQ(cq.outstanding(), 0u) << "abandoned: no completion will follow, so the credit is back";
+}
+
+TEST(ProducerClaim, CommitOffTheOwnerThreadOfACarriedQueueStaysOpen) {
+    CqRig r;
+    rc::Completions cq(*r.client, smallCq());
+    rc::Claim c = r.p.tryClaim(kTopic, Key(uint64_t{1}), 4, cq, 1);
+    ASSERT_TRUE(c);
+    fill(c.buffer(), "abcd");
+    bool committed = true;
+    std::thread t([&] { committed = c.commit(); });
+    t.join();
+    EXPECT_FALSE(committed);
+    EXPECT_TRUE(c) << "still open: the owner thread settles it";
+    EXPECT_EQ(cq.outstanding(), 1u) << "the foreign thread did not touch the counters";
+    EXPECT_TRUE(c.commit());
+    EXPECT_EQ(cq.outstanding(), 1u);
+}
+
 TEST(ProducerClaimAllocRegression, RingClaimSteadyStateAllocatesNothingRegression) {
     auto* impl = new ProducerImpl(voidCfg(), 1 << 20);
     Producer p(impl);
@@ -234,4 +400,49 @@ TEST(ProducerClaimAllocRegression, RingClaimSteadyStateAllocatesNothingRegressio
     alloc_counter::start();
     for (uint64_t k = 64; k < 1064; ++k) cycle(k);
     EXPECT_EQ(alloc_counter::stop(), 0L) << "tryClaim + commit + drain/flush must not allocate";
+}
+
+// Zero-allocation gate, the other claim paths: abort, destructor-abort, the
+// Completions overload (abort / destructor-abort) and the AckToken overload
+// (commit + ack round trip).
+TEST(ProducerClaimAllocRegression, AbortCqAndAckTokenClaimPathsAllocateNothingRegression) {
+    ProducerConfig cfg = voidCfg();
+    cfg.acks = Acks::Leader;
+    CqRig r(cfg, 1 << 20);
+    rc::Completions cq(*r.client, smallCq());
+    r.p.onAck([](void*, rc::Token, int64_t, rc::OpStatus, uint16_t) noexcept {}, nullptr);
+    int64_t lastCorr = 0;
+    const ProducerImpl::SendFn sink = [&](int32_t, int32_t, int32_t, const uint8_t* b, std::size_t n) {
+        if (const auto v = rc::codec::decodeProduce(b, n)) lastCorr = v->correlationId;
+        return true;
+    };
+    auto cycle = [&](uint64_t k) {
+        {
+            rc::Claim a = r.p.tryClaim(kTopic, Key(k), 64);
+            if (a) a.abort();
+        }
+        {
+            rc::Claim d = r.p.tryClaim(kTopic, Key(k), 64);
+        }  // destructor-abort
+        {
+            rc::Claim a = r.p.tryClaim(kTopic, Key(k), 64, cq, 1);
+            if (a) a.abort();
+        }
+        {
+            rc::Claim d = r.p.tryClaim(kTopic, Key(k), 64, cq, 2);
+        }
+        rc::Claim t = r.p.tryClaim(kTopic, Key(k), 64, rc::AckToken{3});
+        if (t) {
+            std::memset(t.buffer().data(), 0x5A, 64);
+            (void)t.commit();
+        }
+        lastCorr = 0;
+        pump(*r.impl, sink);
+        if (lastCorr != 0) r.impl->onProduceResponse(lastCorr, 500, 0);
+    };
+    for (uint64_t k = 0; k < 64; ++k) cycle(k);
+    alloc_counter::start();
+    for (uint64_t k = 64; k < 1064; ++k) cycle(k);
+    EXPECT_EQ(alloc_counter::stop(), 0L) << "abort / destructor-abort / cq / AckToken claims must not allocate";
+    EXPECT_EQ(cq.outstanding(), 0u);
 }

@@ -258,6 +258,26 @@ TEST(M2ORingBuffer, UnblockLeavesACommittedRecordAtHeadAlone) {
     EXPECT_EQ(seen[0], 3);
 }
 
+// 2b-B Task 4 fix round (M1): an unblock() landing BETWEEN commit()'s verify
+// and its publish used to be overwritten by an equal store, so commit() returned
+// success for a record that was already padding (silent loss).  The publish is a
+// CAS now: the loser throws.  The interleaving is forced through commitWith().
+TEST(M2ORingBuffer, CommitRacingUnblockBetweenVerifyAndPublishThrowsRegression) {
+    Ring r(512);
+    const auto claim = r.ring.tryClaim(kMsgTypeId, kPayloadLen);
+    ASSERT_GE(claim, 0);
+    bool unblocked = false;
+    EXPECT_THROW(r.ring.commitWith(claim, [&] { unblocked = r.ring.unblock(); }), std::exception)
+        << "the record was turned into padding under the writer: commit must not report success";
+    EXPECT_TRUE(unblocked);
+    EXPECT_TRUE(readAll(r.ring).empty()) << "padding only: nothing was published";
+    EXPECT_EQ(r.ring.headPosition(), r.ring.tailPosition());
+    // And the uncontended commit still publishes.
+    const auto c2 = r.ring.tryClaim(kMsgTypeId, kPayloadLen);
+    ASSERT_GE(c2, 0);
+    EXPECT_NO_THROW(r.ring.commitWith(c2, [] {}));
+}
+
 // Claimed (header written, length negative) but never committed.
 TEST(M2ORingBuffer, UnblockTurnsAnUncommittedClaimAtHeadIntoPadding) {
     Ring r(512);

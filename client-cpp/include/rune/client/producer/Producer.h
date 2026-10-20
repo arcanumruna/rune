@@ -283,6 +283,10 @@ struct ClaimCredit {
     /// Publish; true = accepted (its completions follow), false = abandoned
     /// (nothing follows: every reservation is returned).
     static bool commit(const ClaimOpen& o) noexcept;
+    /// True when this thread may settle the claim's Completions credit: no
+    /// credit is carried, or the caller is that queue's owner thread (the same
+    /// check trySend makes, in every build).
+    static bool mayCommit(const ClaimOpen& o) noexcept;
     /// Discard; every reservation is returned.
     static void abort(const ClaimOpen& o) noexcept;
 };
@@ -307,8 +311,13 @@ public:
     /// BatchAck follows).  False: nothing was open, or the claim was abandoned
     /// under it (Invoker: its partition was failed / the producer closed;
     /// Thread: Client close released it) — nothing is sent, nothing completes.
+    /// A claim carrying Completions credit committed off that queue's owner
+    /// thread returns false and STAYS OPEN (settle it on the owner thread).
     bool commit() noexcept;
     /// Discard the record: nothing is sent, nothing completes.  No-op unless open.
+    /// Off the owner thread of a carried queue the ring slot is still released
+    /// but the credit cannot be returned (it is the owner's plain state): the
+    /// queue loses that credit — settle credit-carrying claims on their owner.
     void abort() noexcept;
 
 private:

@@ -804,6 +804,10 @@ public:
                                                            std::span<const uint8_t> value,
                                                            uint64_t ackHandle) noexcept;
     void testCommitClaim(aeron::util::index_t idx) { ring_.commit(idx); }
+    /// 2b-B Task 4 fix round (M1): runs the close-drain's unblock() on the ring's
+    /// head claim — the interleaving of Client close against a writer that sits
+    /// between a commit's verify and its publish.  Test seam; Ring mode.
+    [[nodiscard]] bool testUnblockHeadClaim() { return ring_.unblock(); }
     /// Ring head / (closed) tail positions (diagnostics / tests).
     [[nodiscard]] int64_t testRingHead() const noexcept { return ring_.headPosition(); }
     [[nodiscard]] int64_t testRingTail() const noexcept { return ring_.tailPosition(); }

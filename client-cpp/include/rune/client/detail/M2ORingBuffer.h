@@ -237,12 +237,30 @@ public:
         return RD::RecordDescriptor::encodedMsgOffset(recordIndex);
     }
 
-    /// Publish a message previously reserved with tryClaim().
-    void commit(aeron::util::index_t index) {
+    /// Publish a message previously reserved with tryClaim().  Throws
+    /// IllegalStateException when the claim was released under the writer
+    /// (unblock() turned it into padding): nothing is published.
+    ///
+    /// The publish is ONE compare-exchange on the record's length word
+    /// (-len -> +len), not a read-verify then a plain store: an unblock() that
+    /// lands between the two steps used to be overwritten by an equal store and
+    /// commit() reported success for a record that was already padding (a
+    /// silently lost record).  With the CAS exactly one of {commit, unblock}
+    /// flips the word; the loser sees it and commit() throws.
+    void commit(aeron::util::index_t index) { commitWith(index, [] {}); }
+
+    /// commit() with a test seam run between the verify and the publish step
+    /// (deterministic interleaving of unblock() against a commit).
+    template <typename Between>
+    void commitWith(aeron::util::index_t index, Between&& between) {
         namespace RD = aeron::concurrent::ringbuffer;
         const aeron::util::index_t recordIndex = computeRecordIndex(index);
-        const std::int32_t recordLength = verifyClaimedSpaceNotReleased(recordIndex);
-        storeRelease32_(RD::RecordDescriptor::lengthOffset(recordIndex), -recordLength);
+        std::int32_t recordLength = verifyClaimedSpaceNotReleased(recordIndex);
+        between();
+        if (!__atomic_compare_exchange_n(word32_(RD::RecordDescriptor::lengthOffset(recordIndex)), &recordLength,
+                                         -recordLength, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
+            throw aeron::util::IllegalStateException("Claimed space previously released", SOURCEINFO);
+        }
     }
 
     /// Discard a message previously reserved with tryClaim() (becomes padding).
