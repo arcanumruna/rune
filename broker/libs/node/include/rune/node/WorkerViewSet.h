@@ -133,6 +133,7 @@ struct ViewFoldCounters {
     uint64_t aggOverflow      = 0;   // aggregate: Sum emitted NULL (did not fit its type)
     uint64_t aggNonFinite     = 0;   // aggregate: NaN/+-Inf Float input treated as NULL
     uint64_t aggInconsistent  = 0;   // aggregate: retraction found missing/zero state
+    uint64_t aggRescans       = 0;   // aggregate (Phase 2b): Min/Max value-block rescans (retracted extreme)
     uint64_t transientRecordsEvicted = 0;   // transient ring dropped records the view had not folded
     uint64_t transientSourceResets   = 0;   // E2: the source ring was recreated / cut under a live cursor (re-folded)
 };
@@ -663,6 +664,7 @@ private:
         inst.counters.aggOverflow      += st.aggOverflow;
         inst.counters.aggNonFinite     += st.aggNonFinite;
         inst.counters.aggInconsistent  += st.aggInconsistent;
+        inst.counters.aggRescans       += st.aggRescans;
 
         // Bug A: this pass's OWN fold may be what just caught the instance up
         // to `bound` — flip it here too (see 1b's doc comment for why this

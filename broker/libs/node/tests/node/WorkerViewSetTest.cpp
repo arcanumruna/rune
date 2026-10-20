@@ -6,7 +6,9 @@
 // the in-memory table and getRow() serves the latest row.
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
+#include <climits>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -1368,4 +1370,119 @@ TEST(WorkerViewSetRegression, UninstallArrivesOnTheInstallRing) {
     const auto r = rune::node::decodeViewPlanUpdate(buf.data(), buf.size());
     EXPECT_TRUE(r.recovery);
     EXPECT_FALSE(r.uninstall);
+}
+
+namespace {
+// user_max = GROUP BY userId: Count(*), Max(amount), Last(amount) over "order"
+// (topic 6) — a LINKED aggregate view (Phase 2b).
+rune::view::ViewPlan userMaxPlan(uint8_t persistence) {
+    using P = rune::codec::PrimType; using R = rune::view::MergeRule;
+    rune::view::ViewPlan v;
+    v.viewName = "user_max"; v.key = "userId"; v.sources = {{6, "userId"}};
+    v.output = {{"userId", P::Int64, 0, "userId", R::Replace},
+                {"n", P::Int64, 0, "", R::CountAll},
+                {"max", P::Int64, 0, "amount", R::Max},
+                {"last", P::Int64, 0, "amount", R::Last}};
+    v.persistence = persistence;
+    return v;
+}
+} // namespace
+
+// REGRESSION (Review Focus #2): after recovery, retracting the cached Max must
+// rescan the RECOVERED value block (table 3 of the v2 checkpoint; links, head,
+// cache, block id and positions came back in the contributor and group rows)
+// and surface the exact next extreme.
+TEST(WorkerViewSetRegression, RestartThenRetractingTheMaxIsExactRegression) {
+    const auto src = orderSrc();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(userMaxPlan(0), srcs, 0x4000000A).value();
+
+    rune::node::ViewSnapshotChannel ch1;
+    rune::node::WorkerViewSet vs1(ch1, tmpDir("rune-views-max-rec"));
+    vs1.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true);
+    const auto b1 = orderBatch(0, {{1, 100, 10}, {2, 100, 50}, {3, 100, 30}});
+    auto rr1 = [&](int64_t, int64_t) { return rune::storage::LogReadView{b1.data(), b1.size(), 0, 3}; };
+    vs1.driveFolds(6, 0, rr1, 3, 0);
+    const auto deltas = drainDeltas(ch1);
+    ASSERT_EQ(deltas.size(), 1u);
+    uint32_t magic; std::memcpy(&magic, deltas[0].data(), 4);
+    EXPECT_EQ(magic, rune::view::kViewCheckpointMagicV2) << "no new format: still the v2 record";
+    EXPECT_EQ(deltas[0][12], 4u) << "a Min/Max view's record carries four tables (value blocks = id 3)";
+
+    rune::node::ViewSnapshotChannel ch2;
+    rune::node::WorkerViewSet vs2(ch2, tmpDir("rune-views-max-rec"));
+    const std::span<const uint8_t> recs[] = {deltas[0]};
+    vs2.installViewForRecovery(comp.plan, comp.rowLayout, src, /*persisted*/ true, /*partition*/ 0,
+                               /*base*/ {}, recs, /*committedTail*/ 3);
+    const rune::view::RowLayout* L = nullptr;
+    const uint8_t* row = vs2.getRow(0x4000000A, 0, 100, L);
+    ASSERT_NE(row, nullptr);
+    EXPECT_EQ(rune::view::readSlot(row, *L, 2).i, 50);
+    EXPECT_EQ(rune::view::readSlot(row, *L, 3).i, 30);
+
+    // Post-restart: the max holder (contributor 2) drops to 5.
+    const auto b2 = orderBatch(3, {{2, 100, 5}});
+    auto rr2 = [&](int64_t, int64_t) { return rune::storage::LogReadView{b2.data(), b2.size(), 3, 4}; };
+    vs2.driveFolds(6, 0, rr2, 4, 0);
+    row = vs2.getRow(0x4000000A, 0, 100, L);
+    ASSERT_NE(row, nullptr);
+    EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 3);
+    EXPECT_EQ(rune::view::readSlot(row, *L, 2).i, 30) << "next extreme found by scanning the recovered value block";
+    EXPECT_EQ(rune::view::readSlot(row, *L, 3).i, 5) << "the re-write is now the head";
+    const rune::node::ViewFoldCounters* fc = vs2.foldCounters(0x4000000A, 0);
+    ASSERT_NE(fc, nullptr);
+    EXPECT_EQ(fc->aggInconsistent, 0u);
+    EXPECT_EQ(fc->aggRescans, 1u) << "the post-restart retraction rescanned once (counter surfaced, Task 5 review item 2)";
+}
+
+// REGRESSION (Review Focus #3): a stream of GROUP MOVES that dirty 10 DISTINCT
+// entries each (no coalescing across records: every move touches its own groups,
+// neighbours, target head and two value-block chunks; the middle contributor's
+// swap partner is its own predecessor) -- 4 contributor + 2 group + 2 view + 2
+// block rows, 1674 B. Under a bound without the block rows ({4,2,2,0}: 560 B per
+// record, ~233 records per pass) a pass of move records would claim up to ~390 KB,
+// the first pass over the 128 KiB delta-ring max message THROWS on the worker; under Task 5b's bound
+// ({5,2,2,3}: 2289 B, 57 records per pass) every delta fits and the result is exact.
+TEST(WorkerViewSetRegression, PersistedRetractableMovesDeltasFitTheRingRegression) {
+    const auto src = orderSrc();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(userMaxPlan(0), srcs, 0x4000000C).value();
+    constexpr int64_t kG = 1000;
+    std::vector<std::array<int64_t, 3>> recs;
+    // Source groups g: contributors 3g+1, 3g+2, 3g+3 (list 3g+3 -> 3g+2 -> 3g+1).
+    for (int64_t g = 0; g < kG; ++g)
+        for (int64_t j = 1; j <= 3; ++j) recs.push_back({3 * g + j, g, 3 * g + j});
+    // Target groups kG+g: one contributor 100000+g each (the head a move links before).
+    for (int64_t g = 0; g < kG; ++g) recs.push_back({100000 + g, kG + g, 100000 + g});
+    // Moves: middle contributor 3g+2 (prev 3g+3, next 3g+1) -> group kG+g, amount 0.
+    for (int64_t g = 0; g < kG; ++g) recs.push_back({3 * g + 2, kG + g, 0});
+    const int64_t total = static_cast<int64_t>(recs.size());
+    const auto batch = orderBatch(0, recs);
+    auto rr = [&](int64_t, int64_t) {
+        return rune::storage::LogReadView{batch.data(), batch.size(), 0, total};
+    };
+
+    rune::node::ViewSnapshotChannel ch;
+    rune::node::WorkerViewSet vs(ch, tmpDir("rune-views-max-large"));
+    vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true);
+    std::vector<std::vector<uint8_t>> deltas;
+    ASSERT_NO_THROW(driveToEnd(vs, ch, 6, rr, total, deltas));
+    EXPECT_GT(deltas.size(), 1u) << "the range must have been split across capped passes";
+
+    const rune::view::RowLayout* L = nullptr;
+    for (int64_t g = 0; g < kG; g += 97) {
+        const uint8_t* src_ = vs.getRow(0x4000000C, 0, uint64_t(g), L);
+        ASSERT_NE(src_, nullptr) << "group " << g;
+        EXPECT_EQ(rune::view::readSlot(src_, *L, 1).i, 2) << "group " << g;
+        EXPECT_EQ(rune::view::readSlot(src_, *L, 2).i, 3 * g + 3) << "group " << g;
+        EXPECT_EQ(rune::view::readSlot(src_, *L, 3).i, 3 * g + 3) << "group " << g;
+        const uint8_t* dst = vs.getRow(0x4000000C, 0, uint64_t(kG + g), L);
+        ASSERT_NE(dst, nullptr) << "group " << kG + g;
+        EXPECT_EQ(rune::view::readSlot(dst, *L, 1).i, 2);
+        EXPECT_EQ(rune::view::readSlot(dst, *L, 2).i, 100000 + g);
+        EXPECT_EQ(rune::view::readSlot(dst, *L, 3).i, 0) << "the moved contributor is the newest";
+    }
+    const rune::node::ViewFoldCounters* fc = vs.foldCounters(0x4000000C, 0);
+    ASSERT_NE(fc, nullptr);
+    EXPECT_EQ(fc->aggInconsistent, 0u);
 }
