@@ -490,6 +490,22 @@ enum class RejectReason : uint8_t {
 inline constexpr std::size_t kMaxTxnOffsets      = 1024;
 inline constexpr std::size_t kMaxTxnGroupIdBytes = 255;
 
+/// The largest kMsgTxnControl payload: the header, a group id of kMaxTxnGroupIdBytes padded to 8, then
+/// kMaxTxnOffsets 16-byte entries.  ONE constant for the issue side's buffer and the duty side's decode.
+inline constexpr std::size_t kTxnCtlMaxBytes =
+    ((kTxnCtlHeaderBytes + kMaxTxnGroupIdBytes + 7) & ~std::size_t{7}) + kMaxTxnOffsets * sizeof(OffsetEntry);
+namespace detail_txnctl {
+constexpr bool entriesEndWithinMax() {
+    for (std::size_t g = 0; g <= kMaxTxnGroupIdBytes; ++g) {
+        if (((kTxnCtlHeaderBytes + g + 7) & ~std::size_t{7}) + kMaxTxnOffsets * sizeof(OffsetEntry) > kTxnCtlMaxBytes) return false;
+    }
+    return true;
+}
+}  // namespace detail_txnctl
+static_assert(detail_txnctl::entriesEndWithinMax(), "every legal group id length fits kTxnCtlMaxBytes");
+static_assert(static_cast<std::size_t>(kDefaultProducerRingCap) / 8 >= kTxnCtlMaxBytes,
+              "the default producer ring carries the largest control message (maxMsgLength = capacity / 8)");
+
 struct TxnControl {
     enum class Kind : uint8_t { Init, Begin, SendOffsets, Commit, Abort, Flush };
     Kind             kind = Kind::Begin;
@@ -1249,6 +1265,9 @@ public:
     /// on any result but Accepted nothing will complete.  A SendOffsets over the caps is Accepted and completes
     /// InvalidArgument (in ring order).  Zero allocation.
     [[nodiscard]] OpResult issueTxnControl(const TxnControl& c) noexcept;
+    /// True when control ops travel the producer ring (Thread mode): the issuer must count a CQ-targeted one in
+    /// Completions::producerIssued_ (C6); a Direct (Invoker) op is applied in place and pinned instead.
+    [[nodiscard]] bool txnOpsOnRing() const noexcept { return mode_ != IngressMode::Direct; }
     [[nodiscard]] TxnState txnStateDuty() const noexcept { return static_cast<TxnState>(txn_.index()); }
     [[nodiscard]] const TxnMachine& txnMachine() const noexcept { return txn_; }
     /// One duty pass of the machine (ProducerHub::drainAndFlush, after identityStep): sends the InitProducerId /

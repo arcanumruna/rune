@@ -452,6 +452,9 @@ OpResult Producer::issueTxn_(std::uint8_t kindByte, const CompletionTarget& targ
     }
     const OpResult r = impl_->issueTxnControl(c);
     if (r != OpResult::Accepted && q != nullptr) q->unreserve(c.target.reservedBytes);   // nothing will complete
+    // C6: a ring op is a producer op of this queue (like trySend(cq)): a release before its completion is
+    // delivered keeps the registry slot quarantined until then.
+    if (r == OpResult::Accepted && q != nullptr && impl_->txnOpsOnRing()) ++q->producerIssued_;
     return r;
 }
 

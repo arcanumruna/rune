@@ -1502,12 +1502,11 @@ int ProducerImpl::drainRing(int64_t nowNs, int messageLimit) {
                     // deferred records) must not run inside this read, so it follows the read (below).
                     const bool prevDuty = inDuty_;
                     inDuty_ = true;
-                    if (tooBig) {
-                        refuseTxn_(tc, OpStatus::InvalidArgument, 0,
-                                   "sendOffsetsToTransaction: more than 1024 offsets, or a group id outside 1..255 bytes");
-                    } else {
-                        applyTxnControl(tc, nowNs);
-                    }
+                    // An over-cap sendOffsets arrives with empty offsets and group id (its data never travelled): it
+                    // goes through the same preamble as every op (Fatal, closed, state gates, one at a time), then
+                    // fails the limits check - the order Direct mode has.
+                    (void)tooBig;
+                    applyTxnControl(tc, nowNs);
                     inDuty_ = prevDuty;
                     controlApplied = true;
                 } else {
@@ -3159,6 +3158,11 @@ int ProducerImpl::discardRing_(OpStatus st, int limit, uint16_t errorCode) {
                 if (decodeTxnControl_(p, static_cast<std::size_t>(len), tc, tooBig)) {
                     if (const auto* f = std::get_if<FatalError>(&txn_)) {   // a fenced producer: say why
                         refuseTxn_(tc, f->status, f->errorCode, "transactional producer in FatalError (terminal)");
+                    } else if (lifeOpen()) {
+                        // A fail-all of a LIVE producer (session lost ...): the op fails with the loss status the
+                        // records ahead of it got; the producer stays open.  A discarded Begin is counted
+                        // (txnRefusedBegins) like any refused void begin.
+                        refuseTxn_(tc, st, errorCode, "discarded: the producer's pending work failed");
                     } else {
                         refuseTxn_(tc, OpStatus::Closed, 0, "producer closed");
                     }

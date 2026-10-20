@@ -690,3 +690,72 @@ TEST(ProducerTxnClientRegression, InvokerOpsOffTheOwnerAreWrongThreadRegression)
     EXPECT_EQ(p.state(), rc::TxnState::Uninitialized) << "nothing was applied";
     EXPECT_EQ(r.gw.initPids, 0);
 }
+
+// C1: the largest legal sendOffsets (255-byte group id, 1024 offsets) is a 16680-byte control message.
+TEST_P(ProducerTxnClientModes, MaxGroupIdAndMaxOffsetsFitTheControlBufferRegression) {
+    TxnRig r(GetParam());
+    r.connect();
+    rc::Producer    p = r.client->producer(txnCfg());
+    rc::Completions cq(*r.client);
+    ASSERT_NO_FATAL_FAILURE(initAndBegin(r, p, cq));
+    const std::string group(255, 'g');
+    std::vector<rc::OffsetEntry> offs(1024);
+    for (std::size_t i = 0; i < offs.size(); ++i) offs[i] = rc::OffsetEntry{1, static_cast<int32_t>(i % 5), static_cast<int64_t>(1000 + i)};
+    ASSERT_EQ(p.sendOffsetsToTransaction(offs, group, cq, 105), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.await(cq, 105));
+    EXPECT_EQ(r.got[105].status, rc::OpStatus::Ok) << "errorCode " << r.got[105].errorCode;
+    EXPECT_EQ(r.gw.lastTxnOffsetGroup, group);
+    ASSERT_EQ(r.gw.pendingTxnOffsets.size(), 1024u) << "every entry reached the coordinator, in order";
+    for (std::size_t i = 0; i < offs.size(); ++i) {
+        EXPECT_EQ(std::get<2>(r.gw.pendingTxnOffsets[i]), 1000 + static_cast<int64_t>(i)) << i;
+    }
+    ASSERT_EQ(p.commitTransaction(cq, 106), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.await(cq, 106));
+    EXPECT_EQ(r.got[106].status, rc::OpStatus::Ok);
+}
+
+// I2: a queue released while its control op is still in flight keeps its registry slot quarantined; the late
+// completion is dropped, never delivered to a newer queue, and no credit is mis-returned.
+TEST(ProducerTxnClientRegression, ReleasedQueueWithALiveControlOpNeverReceivesOrMisdeliversItRegression) {
+    TxnRig r(rc::RunnerMode::Thread);
+    r.connect();
+    rc::ProducerConfig pc = txnCfg();
+    pc.produceTimeoutMs   = 150;   // the unanswered AddPartitions is re-sent soon
+    rc::Producer          p = r.client->producer(pc);
+    rc::Completions       cq(*r.client);
+    const rc::TopicHandle topic = r.client->topic("t");
+    ASSERT_NO_FATAL_FAILURE(initAndBegin(r, p, cq));
+    r.gw.replyTxn = false;   // AddPartitions / EndTxn unanswered: the record is held, so the commit stays pending
+    const std::string v = "held";
+    ASSERT_EQ(p.trySend(topic, rc::Key(uint64_t{1}), bytesOf(v)), rc::SendResult::Ok);
+    std::string what;
+    try {
+        p.commitTransactionAndWait(std::chrono::milliseconds(300));   // its private queue is released on the timeout
+    } catch (const std::runtime_error& e) {
+        what = e.what();
+    }
+    ASSERT_NE(what.find("timed out"), std::string::npos) << what;
+    rc::Completions cq2(*r.client);   // a NEW queue while the first op is still live
+    r.gw.replyTxn = true;
+    ASSERT_TRUE(r.drive([&] {
+        cq2.poll([&](const rc::Completion& c, std::span<const uint8_t>) { r.got[c.token + 1000] = c; });
+        return r.gw.endTxnCommits.size() >= 1 && p.state() == rc::TxnState::Ready;
+    })) << "the abandoned commit still runs to its end";
+    for (int i = 0; i < 200; ++i) {
+        cq2.poll([&](const rc::Completion& c, std::span<const uint8_t>) { r.got[c.token + 1000] = c; });
+        r.gw.pump();
+    }
+    for (const auto& [k, c] : r.got) {   // 100 is the init on the first queue; keys >= 1000 came through cq2
+        EXPECT_LT(k, rc::Token{1000}) << "a completion reached the newer queue: token " << (k - 1000);
+    }
+    EXPECT_EQ(cq2.reservedBytes(), 0u);
+    EXPECT_EQ(cq2.outstanding(), 0u);
+    // The newer queue is fully usable.
+    p.beginTransaction();
+    ASSERT_EQ(p.abortTransaction(cq2, 7), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.drive([&] {
+        cq2.poll([&](const rc::Completion& c, std::span<const uint8_t>) { r.got[c.token + 1000] = c; });
+        return r.got.count(1007) != 0;
+    }));
+    EXPECT_EQ(r.got[1007].status, rc::OpStatus::Ok);
+}

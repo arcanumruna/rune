@@ -876,3 +876,38 @@ TEST(ProducerTxnControl, IssuingAndApplyingControlOpsAllocatesNothing) {
     const long allocs = alloc_counter::stopThisThread();
     EXPECT_EQ(allocs, 0) << "a sendOffsets control op allocated on the issue side or the duty side";
 }
+
+TEST(ProducerTxnControlRegression, LiveProducerFailAllCompletesControlOpsWithTheLossStatusNotClosedRegression) {
+    Rig r;
+    ringReady(r);
+    const rc::Key key(uint64_t{1});
+    const std::string v = "x";
+    const std::span<const uint8_t> val(reinterpret_cast<const uint8_t*>(v.data()), 1);
+    for (int i = 0; i < 3; ++i) ASSERT_EQ(r.impl->trySubmit(1, 0, key, val, 0), rc::SendResult::Ok);
+    const auto commit = r.issue(TxnControl::Kind::Commit);
+    ASSERT_EQ(commit.result, rc::OpResult::Accepted);
+    // The session was lost: ProducerHub::failAll(SessionLost) fails everything the producer holds - the ring too -
+    // while the producer stays OPEN.
+    r.impl->failAllPending(OpStatus::SessionLost);
+    EXPECT_EQ(r.d(commit.token).times, 1);
+    EXPECT_EQ(r.d(commit.token).status, OpStatus::SessionLost) << "the loss status, never Closed";
+    EXPECT_TRUE(r.impl->lifeOpen()) << "the producer is still open";
+    // Still usable: the records ahead of the commit poisoned the transaction; abort it, begin a new one, produce.
+    const auto ab = r.issue(TxnControl::Kind::Abort);
+    r.tick();
+    r.tick();
+    EXPECT_EQ(r.d(ab.token).times, 1);
+    EXPECT_EQ(r.d(ab.token).status, OpStatus::Ok);
+    ASSERT_EQ(r.impl->txnStateDuty(), TxnState::Ready);
+    ASSERT_EQ(r.issue(TxnControl::Kind::Begin).result, rc::OpResult::Accepted);
+    r.tick();
+    EXPECT_EQ(r.impl->txnStateDuty(), TxnState::InTransaction);
+    EXPECT_EQ(r.impl->trySubmit(1, 0, key, val, 0), rc::SendResult::Ok);
+    // A void Begin discarded by a fail-all is not swallowed: it is counted like any refused void begin.
+    Rig b;
+    b.ready();
+    const std::uint64_t before = b.impl->txnRefusedBegins();
+    ASSERT_EQ(b.issue(TxnControl::Kind::Begin).result, rc::OpResult::Accepted);
+    b.impl->failAllPending(OpStatus::SessionLost);
+    EXPECT_EQ(b.impl->txnRefusedBegins(), before + 1);
+}

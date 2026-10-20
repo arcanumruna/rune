@@ -39,6 +39,10 @@ struct OpTarget {
     uint32_t          reservedBytes = 0;  ///< CQ form: the issuer's reservation
     CqRef             cqRef = kNoCqRef;   ///< CQ form: registry reference
     bool              counted = false;    ///< CQ form: pins its slot (I3 quarantine)
+    /// CQ form: the op travelled the producer ring, so it is accounted like every producer-ring CQ op (C6): the
+    /// issuer counted it in Completions::producerIssued_, and its delivery is counted in the slot's prodDelivered
+    /// (not pinned: a release that came first quarantines the slot until this completion is delivered or dropped).
+    bool              producerOp = false;
 };
 
 /// Target <-> HubCommand words b / c (a carries the Token).

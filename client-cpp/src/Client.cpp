@@ -1114,6 +1114,15 @@ void Client::deliver_(const DutyTarget& t, Completion c, std::span<const uint8_t
     } else {
         ++staleCqDrops_;  // released slot (quarantined, never reused yet): dropped
     }
+    if (t.producerOp && idx < cqSlots_.size()) {   // C6: a producer-ring op is delivered (or dropped) here
+        CqSlot& slot = cqSlots_[idx];
+        if (slot.ring != nullptr && slot.gen == cqRefGen(t.cqRef)) {
+            ++slot.prodDelivered;
+        } else if (slot.quarantined && ((cqRefGen(t.cqRef) + 1) & kCqRefGenMask) == slot.gen) {
+            ++slot.prodDelivered;
+            maybeRecycleCqSlot_(idx);
+        }
+    }
     if (t.counted && idx < cqSlots_.size()) {  // I3: this op no longer pins its slot
         CqSlot& slot = cqSlots_[idx];
         --slot.targets;

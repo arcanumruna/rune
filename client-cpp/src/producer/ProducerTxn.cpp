@@ -153,8 +153,6 @@ inline void putI64(uint8_t* p, int64_t v) noexcept { std::memcpy(p, &v, 8); }
 inline uint32_t getU32(const uint8_t* p) noexcept { uint32_t v; std::memcpy(&v, p, 4); return v; }
 inline int64_t  getI64(const uint8_t* p) noexcept { int64_t v; std::memcpy(&v, p, 8); return v; }
 inline std::size_t align8(std::size_t n) noexcept { return (n + 7u) & ~std::size_t{7}; }
-/// The largest kMsgTxnControl: header + a 255-byte group id (padded) + kMaxTxnOffsets entries.
-constexpr std::size_t kTxnCtlMaxBytes = kTxnCtlHeaderBytes + 256 + kMaxTxnOffsets * sizeof(OffsetEntry);
 }  // namespace
 
 OpResult ProducerImpl::writeTxnControl_(const TxnControl& c, bool overCap) noexcept {
@@ -219,7 +217,14 @@ bool ProducerImpl::decodeTxnControl_(const uint8_t* p, std::size_t len, TxnContr
     out.target = detail::decodeTargetWords(getI64(p + 16), getI64(p + 24));
     out.offsets = {};
     out.groupId = {};
-    if (out.kind != TxnControl::Kind::Begin && hooks_.pinTarget != nullptr) hooks_.pinTarget(hooks_.ctx, out.target);
+    // A CQ target of a ring op is accounted as a producer op (the issuer counted it in producerIssued_): marked,
+    // not pinned.  (Direct mode pins in issueTxnControl; the pin hook is not used here.)
+    out.target.producerOp = out.kind != TxnControl::Kind::Begin && out.target.handler.fn == nullptr &&
+                            out.target.cqRef != kNoCqRef;
+    if (len > kTxnCtlMaxBytes) {
+        tooBig = true;
+        return true;
+    }
     if (out.kind != TxnControl::Kind::SendOffsets) return true;
     const uint32_t glen   = getU32(p + 4);
     const uint32_t ocount = getU32(p + 32);
@@ -1204,7 +1209,7 @@ void ProducerImpl::applySendOffsets_(const TxnControl& c, const TxnOp& op) {
         return;
     }
     if (c.groupId.empty() || c.groupId.size() > kMaxTxnGroupIdBytes) {
-        refuseTxn_(c, OpStatus::InvalidArgument, 0, "sendOffsetsToTransaction: the group id must be 1 to 255 bytes");
+        refuseTxn_(c, OpStatus::InvalidArgument, 0, "sendOffsetsToTransaction: at most 1024 offsets and a group id of 1 to 255 bytes");
         return;
     }
     OffsetsScratch& sc = *offsetsScratch_;   // allocated at construction of a transactional producer

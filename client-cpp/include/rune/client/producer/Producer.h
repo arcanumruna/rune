@@ -798,10 +798,15 @@ public:
     // commitTransaction / abortTransaction close the produce gate when they are ISSUED; beginTransaction opens
     // it once its message is written.  One issuing thread per transactional producer (FD3).
     OpResult initTransactions(const CompletionTarget& target, Token token);
+    /// Void: a begin the machine refuses (not Ready: still committing / aborting, fenced, closed, init not done) is
+    /// only counted; it is surfaced by the NEXT op (that op completes 19 / the fenced status) and by the records
+    /// refused behind it.  Call it after the previous commit / abort / init completed.
     void     beginTransaction();
     /// One sendOffsetsToTransaction runs at a time: a call made while another is still running completes
     /// BrokerError(19, InvalidTxnState) at once (no queueing, the transaction is not poisoned) - wait for the first
-    /// completion before issuing the next.  At most 1024 offsets and a 1..255-byte group id (else InvalidArgument).
+    /// completion before issuing the next.  At most 1024 offsets and a 1..255-byte group id: otherwise the call is
+    /// accepted and COMPLETES InvalidArgument.  Only a ring too small to ever carry the message (a tiny producer
+    /// ring) is a synchronous OpResult::InvalidArgument with no completion.
     OpResult sendOffsetsToTransaction(std::span<const OffsetEntry> offsets, std::string_view groupId,
                                       const CompletionTarget& target, Token token);
     OpResult commitTransaction(const CompletionTarget& target, Token token);
