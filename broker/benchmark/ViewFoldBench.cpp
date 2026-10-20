@@ -115,6 +115,7 @@
 #include <cstring>
 #include <random>
 #include <string>
+#include <optional>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
@@ -479,12 +480,15 @@ struct AggRig {
     rune::view::AggLayout     agg;
     ViewTable                 view, contributors, groups;
     VersionDescriptorCache    vdc;
+    std::optional<ViewTable>  blocks;   // Min/Max value blocks (userStatsView); empty for a 2a view
     uint64_t                  rescans = 0;   // summed FoldStats::aggRescans (0 for a 2a-only view)
 
     AggRig(const rune::view::ViewPlan& plan, int32_t viewTopicId)
         : comp(compile(plan, src, viewTopicId)),
           agg(rune::view::buildAggLayout(comp.plan, src).value()),
-          view(comp.rowLayout), contributors(agg.contributorRow), groups(agg.groupRow), vdc(src) {}
+          view(comp.rowLayout), contributors(agg.contributorRow), groups(agg.groupRow), vdc(src) {
+        if (agg.numBlockCols > 0) blocks.emplace(agg.blockRow);
+    }
 
     static rune::view::CompileResult compile(const rune::view::ViewPlan& plan,
                                              const rune::codec::Descriptor& src, int32_t id) {
@@ -508,12 +512,13 @@ struct AggRig {
         view.drainDirty(nop);
         contributors.drainDirty(nop);
         groups.drainDirty(nop);
+        if (blocks) blocks->drainDirty(nop);
     }
     rune::view::FoldStats foldStream(const BatchStream& s, size_t i) {
         auto lv = s.view(i);
         int64_t cur = 0;
         const auto fs = foldAggregateBatch(comp.plan, comp.rowLayout, agg, vdc, view, contributors,
-                                           groups, lv, s.bound(i), cur);
+                                           groups, blocks ? &*blocks : nullptr, lv, s.bound(i), cur);
         rescans += fs.aggRescans;
         return fs;
     }

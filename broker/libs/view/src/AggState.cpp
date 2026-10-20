@@ -70,6 +70,23 @@ std::optional<AggLayout> buildAggLayout(const CompiledViewPlan& plan,
         }
         a.fields.push_back(af);
     }
+    // Task 5b: one value-block column per DISTINCT Min/Max source field, in
+    // cache order (Min(x) and Max(x) read the same widened value and null bit).
+    {
+        std::vector<uint16_t> colSrc;
+        for (const AggField& f : a.fields) {
+            if (f.cache == kNoCache) continue;
+            uint16_t col = 0;
+            while (col < colSrc.size() && colSrc[col] != f.srcFieldId) ++col;
+            if (col == colSrc.size()) {
+                colSrc.push_back(f.srcFieldId);
+                a.blockColInput.push_back(f.input);
+            }
+            a.cacheCol.push_back(col);
+        }
+        a.numBlockCols = static_cast<uint16_t>(colSrc.size());
+    }
+    const bool block = a.numBlockCols > 0;
     const uint32_t nFields = static_cast<uint32_t>(a.fields.size());
     a.contribPrevOff = a.linked ? 8u : 0u;
     a.contribNextOff = a.linked ? 16u : 0u;
@@ -81,6 +98,10 @@ std::optional<AggLayout> buildAggLayout(const CompiledViewPlan& plan,
         a.inputOff.push_back(off);
         off += w;
     }
+    if (block) {
+        a.contribBlockPosOff = off;
+        off += 4;
+    }
     a.contributorRow.rowLen = off;
     a.groupAccOff     = 8;
     a.groupNonNullOff = 8 + 16u * nFields;
@@ -89,14 +110,20 @@ std::optional<AggLayout> buildAggLayout(const CompiledViewPlan& plan,
         a.groupHeadOff      = nnEnd;
         a.groupCacheOff     = nnEnd + 8;
         a.groupRow.rowLen   = a.groupCacheOff + kCacheEntryBytes * a.numCached;
+        if (block) {
+            a.groupBlockOff   = a.groupRow.rowLen;
+            a.groupRow.rowLen += 8;
+        }
     } else {
         a.groupRow.rowLen   = nnEnd;
     }
+    a.blockRow.rowLen = block ? kBlockEntries * (8u + 9u * a.numBlockCols) : 0u;
     return a;
 }
 
 AggDirtyBound aggDirtyBoundPerRecord(const AggLayout& a) noexcept {
-    return AggDirtyBound{a.linked ? 4u : 1u, 2u, 2u};
+    const bool block = a.numBlockCols > 0;   // implies linked
+    return AggDirtyBound{a.linked ? (block ? 5u : 4u) : 1u, 2u, 2u, block ? 3u : 0u};
 }
 
 } // namespace rune::view

@@ -67,7 +67,7 @@ std::vector<uint8_t> readWholeFile(const std::string& path) {
 }
 
 // Replays checkpoint records into one instance: v1 into the output table for a
-// Replace view; v2 (all three tables, offset-atomic) for an aggregate view.
+// Replace view; v2 (all three tables, or four with Min/Max value blocks; offset-atomic) for an aggregate view.
 // Same semantics as rune::view::replay/replayMulti (a bad base => -1; stop at
 // the first bad record; return the last applied O), plus ONE warning when the
 // replay stops before the end of the supplied records — so a wrong-version
@@ -77,8 +77,9 @@ int64_t replayInstance(ViewInstance& inst, std::span<const uint8_t> base,
                        std::span<const std::span<const uint8_t>> deltas,
                        std::size_t& appliedOut) {
     appliedOut = 0;
-    rune::view::ViewTable* tables[3];
-    uint32_t lens[3];
+    rune::view::ViewTable* tables[4];
+    uint32_t lens[4];
+    std::size_t nTables = 0;
     if (inst.agg) {
         tables[rune::view::kAggTableView]         = &inst.table;
         tables[rune::view::kAggTableContributors] = &inst.agg->contributors;
@@ -86,9 +87,17 @@ int64_t replayInstance(ViewInstance& inst, std::span<const uint8_t> base,
         lens[rune::view::kAggTableView]         = inst.layout.rowLen;
         lens[rune::view::kAggTableContributors] = inst.agg->layout.contributorRow.rowLen;
         lens[rune::view::kAggTableGroups]       = inst.agg->layout.groupRow.rowLen;
+        nTables = 3;
+        if (inst.agg->blocks) {   // Task 5b: Min/Max value blocks, table id 3
+            tables[rune::view::kAggTableBlocks] = &*inst.agg->blocks;
+            lens[rune::view::kAggTableBlocks]   = inst.agg->layout.blockRow.rowLen;
+            nTables = 4;
+        }
     }
     auto apply = [&](std::span<const uint8_t> rec) -> std::optional<rune::view::AppliedDelta> {
-        if (inst.agg) return rune::view::applyMultiDelta(tables, lens, rec);
+        if (inst.agg)
+            return rune::view::applyMultiDelta(std::span<rune::view::ViewTable* const>(tables, nTables),
+                                               std::span<const uint32_t>(lens, nTables), rec);
         return rune::view::applyDelta(inst.table, inst.layout, rec);
     };
     int64_t last = -1;
@@ -132,19 +141,23 @@ void logRecovered(const ViewInstance& inst, int64_t recoveredO, std::size_t appl
 // Most source records one fold pass may cover so the pass's checkpoint delta
 // (worst case) fits ONE ring message of `maxMsg` payload bytes; 0 if not even
 // one record fits.  Worst case per source record: Replace dirties 1 output row;
-// an aggregate dirties its contributor + old/new group + old/new output row;
-// a linked (Min/Max/Last) view also dirties the old list neighbours and the new
-// head (see aggDirtyBoundPerRecord).
+// an aggregate dirties rune::view::aggDirtyBoundPerRecord rows per table (2a:
+// contributor + old/new group + old/new output row; linked views also the
+// contributor's two old neighbours and the new group's old head; Min/Max views
+// also the old group's swap-moved contributor and up to 3 value-block chunks).
 int64_t maxRecordsPerPassFor(const ViewInstance& inst, std::size_t maxMsg) {
     using namespace rune::view;
     std::size_t fixed = ViewSnapshotChannel::kDeltaHeaderBytes + kCheckpointCrcBytes;
     std::size_t perRecord = 0;
     if (inst.agg) {
-        fixed += kCheckpointV2HeaderBytes + 3 * kCheckpointV2TableHeaderBytes;
-        const AggDirtyBound b = aggDirtyBoundPerRecord(inst.agg->layout);
-        perRecord = b.contributorRows * (kCheckpointEntryHeaderBytes + inst.agg->layout.contributorRow.rowLen) +
-                    b.groupRows * (kCheckpointEntryHeaderBytes + inst.agg->layout.groupRow.rowLen) +
-                    b.viewRows * (kCheckpointEntryHeaderBytes + inst.layout.rowLen);
+        const AggLayout& a = inst.agg->layout;
+        const std::size_t nTables = a.numBlockCols > 0 ? 4 : 3;
+        fixed += kCheckpointV2HeaderBytes + nTables * kCheckpointV2TableHeaderBytes;
+        const AggDirtyBound b = aggDirtyBoundPerRecord(a);
+        perRecord = b.contributorRows * (kCheckpointEntryHeaderBytes + a.contributorRow.rowLen) +
+                    b.groupRows * (kCheckpointEntryHeaderBytes + a.groupRow.rowLen) +
+                    b.viewRows * (kCheckpointEntryHeaderBytes + inst.layout.rowLen) +
+                    b.blockRows * (kCheckpointEntryHeaderBytes + a.blockRow.rowLen);
     } else {
         fixed += kCheckpointV1HeaderBytes;
         perRecord = kCheckpointEntryHeaderBytes + inst.layout.rowLen;
@@ -676,8 +689,8 @@ int WorkerViewSet::buildAndPushCheckpoint_(ViewInstance& inst) {
                                 inst.pendingDelta);
     } else {
         // Aggregate view: output rows + contributor map + group accumulators in
-        // ONE v2 record, so recovery always restores all three at the same O.
-        std::size_t b[4];
+        // ONE v2 record (+ Min/Max value blocks), so recovery always restores every table at the same O.
+        std::size_t b[5];
         b[0] = 0;
         drainInto(inst.table, inst.layout.rowLen);
         b[1] = dirtyEntries_.size();
@@ -685,17 +698,22 @@ int WorkerViewSet::buildAndPushCheckpoint_(ViewInstance& inst) {
         b[2] = dirtyEntries_.size();
         drainInto(inst.agg->groups, inst.agg->layout.groupRow.rowLen);
         b[3] = dirtyEntries_.size();
+        if (inst.agg->blocks) drainInto(*inst.agg->blocks, inst.agg->layout.blockRow.rowLen);
+        b[4] = dirtyEntries_.size();
         if (dirtyEntries_.empty()) return 0;
         fixup();
         auto sub = [&](int i) {
             return std::span<const rune::view::DirtyEntry>(dirtyEntries_.data() + b[i],
                                                           b[i + 1] - b[i]);
         };
-        const rune::view::TableDelta tds[3] = {
+        const rune::view::TableDelta tds[4] = {
             {rune::view::kAggTableView, inst.layout.rowLen, sub(0)},
             {rune::view::kAggTableContributors, inst.agg->layout.contributorRow.rowLen, sub(1)},
-            {rune::view::kAggTableGroups, inst.agg->layout.groupRow.rowLen, sub(2)}};
-        rune::view::encodeMultiDelta(tds, inst.foldCursor, inst.pendingDelta);
+            {rune::view::kAggTableGroups, inst.agg->layout.groupRow.rowLen, sub(2)},
+            {rune::view::kAggTableBlocks, inst.agg->layout.blockRow.rowLen, sub(3)}};
+        const std::size_t nTables = inst.agg->blocks ? 4 : 3;   // 2a / Last-only: unchanged 3-table bytes
+        rune::view::encodeMultiDelta(std::span<const rune::view::TableDelta>(tds, nTables),
+                                     inst.foldCursor, inst.pendingDelta);
     }
     inst.lastEncodedO = inst.foldCursor;  // attempted/encoded offset, NOT durable
     inst.pendingValid = true;

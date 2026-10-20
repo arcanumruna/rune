@@ -140,6 +140,9 @@ TEST(AggStateRegression, TwoAOnlyLayoutIsUnchangedRegression) {
     EXPECT_EQ(b.contributorRows, 1u);
     EXPECT_EQ(b.groupRows, 2u);
     EXPECT_EQ(b.viewRows, 2u);
+    EXPECT_EQ(b.blockRows, 0u);
+    EXPECT_EQ(a.numBlockCols, 0u);
+    EXPECT_EQ(a.blockRow.rowLen, 0u) << "2a views have no value block";
 }
 
 TEST(AggState, RetractableLayoutAddsLinksHeadCachesAndPerInputWidths) {
@@ -153,7 +156,8 @@ TEST(AggState, RetractableLayoutAddsLinksHeadCachesAndPerInputWidths) {
     EXPECT_EQ(a.contribValOff, 26u);                       // 9 inputs -> 2 bitmap bytes
     EXPECT_EQ(a.inputOff, (std::vector<uint32_t>{26, 34, 42, 50, 58, 66, 70, 74, 78}));
     EXPECT_EQ(a.inputWidth, (std::vector<uint16_t>{8, 8, 8, 8, 8, 4, 4, 4, 8}));
-    EXPECT_EQ(a.contributorRow.rowLen, 86u);
+    EXPECT_EQ(a.contribBlockPosOff, 86u);                  // [blockPos u32] after the values
+    EXPECT_EQ(a.contributorRow.rowLen, 90u);
     // Caches: maxAmt, minAmt, maxPrice, minQty (Min/Max only, in field order).
     EXPECT_EQ(a.numCached, 4u);
     EXPECT_EQ(a.fields[1].cache, 0u);  EXPECT_EQ(a.fields[1].kind, rune::view::AccKind::Signed);
@@ -168,11 +172,19 @@ TEST(AggState, RetractableLayoutAddsLinksHeadCachesAndPerInputWidths) {
     EXPECT_EQ(a.groupNonNullOff, 8u + 10u * 16u);
     EXPECT_EQ(a.groupHeadOff, 248u);
     EXPECT_EQ(a.groupCacheOff, 256u);
-    EXPECT_EQ(a.groupRow.rowLen, 256u + 4u * rune::view::kCacheEntryBytes);
+    EXPECT_EQ(a.groupBlockOff, 256u + 4u * rune::view::kCacheEntryBytes);   // 292: after the caches
+    EXPECT_EQ(a.groupRow.rowLen, 300u);                                      // + [blockId u32][blockChunks u32]
+    // Value block: one column per DISTINCT Min/Max source field, in cache order:
+    // amount (maxAmt + minAmt share it), price, qty.
+    EXPECT_EQ(a.numBlockCols, 3u);
+    EXPECT_EQ(a.blockColInput, (std::vector<uint16_t>{0, 3, 4}));
+    EXPECT_EQ(a.cacheCol, (std::vector<uint16_t>{0, 0, 1, 2}));
+    EXPECT_EQ(a.blockRow.rowLen, rune::view::kBlockEntries * (8u + 9u * 3u));   // 1120
     const auto b = rune::view::aggDirtyBoundPerRecord(a);
-    EXPECT_EQ(b.contributorRows, 4u);
+    EXPECT_EQ(b.contributorRows, 5u);
     EXPECT_EQ(b.groupRows, 2u);
     EXPECT_EQ(b.viewRows, 2u);
+    EXPECT_EQ(b.blockRows, 3u);
 }
 
 TEST(AggState, SentinelsAndCacheStatesAreStable) {
@@ -183,4 +195,50 @@ TEST(AggState, SentinelsAndCacheStatesAreStable) {
     EXPECT_EQ(static_cast<uint8_t>(rune::view::CacheState::RescanPending), 2u);
     EXPECT_TRUE(rune::view::needsContributorList(R::LastNonNull));
     EXPECT_FALSE(rune::view::needsContributorList(R::Sum));
+}
+
+// REGRESSION (Task 5b): a linked view with only Last/LastNonNull keeps Task 4's
+// linked layout exactly -- no value block, no position, no block fields, bound {4,2,2,0}.
+TEST(AggStateRegression, LastOnlyLinkedViewHasNoValueBlockRegression) {
+    rune::view::ViewPlan v;
+    v.viewName = "t"; v.key = "userId"; v.sources = {{5, "userId"}};
+    v.output = {{"userId", P::Int64, 0, "userId", R::Replace},
+                {"n", P::Int64, 0, "", R::CountAll},
+                {"last", P::Int64, 0, "amount", R::Last}};
+    static const auto src = statsSrc();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    const auto comp = rune::view::compileView(v, srcs, 9).value();
+    const auto a = rune::view::buildAggLayout(comp.plan, src).value();
+    EXPECT_TRUE(a.linked);
+    EXPECT_EQ(a.numCached, 0u);
+    EXPECT_EQ(a.numBlockCols, 0u);
+    EXPECT_EQ(a.contributorRow.rowLen, 33u);   // gk 8 + prev 8 + next 8 + bitmap 1 + amount 8
+    EXPECT_EQ(a.groupRow.rowLen, 64u);         // 8 + 2x16 + 2x8 + head 8
+    EXPECT_EQ(a.blockRow.rowLen, 0u);
+    const auto b = rune::view::aggDirtyBoundPerRecord(a);
+    EXPECT_EQ(b.contributorRows, 4u);
+    EXPECT_EQ(b.groupRows, 2u);
+    EXPECT_EQ(b.viewRows, 2u);
+    EXPECT_EQ(b.blockRows, 0u);
+}
+
+// The value-block chunk format is checkpointed: pin its constants and offsets.
+TEST(AggState, ValueBlockFormatIsStable) {
+    namespace v = rune::view;
+    EXPECT_EQ(v::kBlockEntries, 32u);
+    EXPECT_EQ(1u << v::kBlockShift, v::kBlockEntries);
+    EXPECT_EQ(v::kBlockSpareFreeAt, 16u);
+    EXPECT_EQ(v::kNoBlock, 0u);
+    EXPECT_EQ(v::kAggTableBlocks, 3u);
+    EXPECT_EQ(v::blockChunkKey(1, 0), uint64_t{1} << 32);
+    EXPECT_EQ(v::blockChunkKey(0xFFFFFFFFu, 7), 0xFFFFFFFF00000007ull);
+    EXPECT_EQ(v::blockKeyOff(31), 248u);
+    EXPECT_EQ(v::blockValOff(0, 0), 256u);
+    EXPECT_EQ(v::blockValOff(1, 3), 512u + 24u);
+    const auto a = rune::view::buildAggLayout(compileStats().plan, statsSrc()).value();   // 3 columns
+    EXPECT_EQ(v::blockNullOff(a, 0, 0), 8u * 32u * 4u);        // after keys + 3 value columns
+    EXPECT_EQ(v::blockNullOff(a, 2, 31), 1024u + 64u + 31u);
+    EXPECT_EQ(v::blockNullOff(a, 2, 31) + 1, a.blockRow.rowLen);
+    for (uint64_t g = 0; g < 100000; ++g) ASSERT_NE(v::blockIdCandidate(g), v::kNoBlock) << g;
+    EXPECT_EQ(v::blockIdCandidate(12345), v::blockIdCandidate(12345));
 }

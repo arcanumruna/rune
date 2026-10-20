@@ -61,6 +61,8 @@ inline bool sameValue(AccKind kind, const uint8_t* a, const uint8_t* b) noexcept
 constexpr uint8_t kEmpty   = static_cast<uint8_t>(CacheState::Empty);
 constexpr uint8_t kValid   = static_cast<uint8_t>(CacheState::Valid);
 constexpr uint8_t kPending = static_cast<uint8_t>(CacheState::RescanPending);
+// Chunk lookups issued before scanning (independent keys: their misses overlap).
+constexpr uint32_t kRescanBatch = 8;
 
 // What `retract` does with the group the contributor leaves. One state per legal
 // combination (this replaces a (dropIfEmpty, emitNow) bool pair, F8):
@@ -80,6 +82,7 @@ struct Ctx {
     ViewTable& view;
     ViewTable& contributors;
     ViewTable& groups;
+    ViewTable* blocks;   // Min/Max value blocks; nullptr iff agg.numBlockCols == 0
     FoldStats& stats;
 
     uint8_t* acc(uint8_t* g, size_t i) const noexcept { return g + agg.groupAccOff + 16 * i; }
@@ -228,30 +231,177 @@ struct Ctx {
         storeU64(gr + agg.groupHeadOff, c);
     }
 
-    // Rebuilds Min/Max field i's cache by ONE walk of the group's list, bounded
-    // by its contributor count (a cycle or over-long list stops, counted).
+    // --- Min/Max value block (Task 5b; layout in AggState.h) ---
+    uint32_t blockIdOf(const uint8_t* gr) const noexcept { return loadU32(gr + agg.groupBlockOff); }
+    uint32_t blockChunksOf(const uint8_t* gr) const noexcept { return loadU32(gr + agg.groupBlockOff + 4); }
+    void setBlock(uint8_t* gr, uint32_t id, uint32_t chunks) const noexcept {
+        storeU32(gr + agg.groupBlockOff, id);
+        storeU32(gr + agg.groupBlockOff + 4, chunks);
+    }
+
+    // Writes entry `slot` of chunk `row` from contributor c's row `cr`.
+    void writeEntry(uint8_t* row, uint32_t slot, uint64_t c, const uint8_t* cr) const noexcept {
+        storeU64(row + blockKeyOff(slot), c);
+        for (uint16_t col = 0; col < agg.numBlockCols; ++col) {
+            const uint16_t in = agg.blockColInput[col];
+            std::memcpy(row + blockValOff(col, slot), cr + agg.inputOff[in], 8);
+            row[blockNullOff(agg, col, slot)] = nullBit(cr, agg.contribNullOff, in) ? 1 : 0;
+        }
+    }
+    // Copies entry `from` of chunk `src` (key, values, nulls) to entry `to` of chunk `dst`.
+    void moveEntry(uint8_t* dst, uint32_t to, const uint8_t* src, uint32_t from) const noexcept {
+        std::memcpy(dst + blockKeyOff(to), src + blockKeyOff(from), 8);
+        for (uint16_t col = 0; col < agg.numBlockCols; ++col) {
+            std::memcpy(dst + blockValOff(col, to), src + blockValOff(col, from), 8);
+            dst[blockNullOff(agg, col, to)] = src[blockNullOff(agg, col, from)];
+        }
+    }
+
+    // A free block id for group g: its candidate, then linear probing (an id is
+    // in use iff its chunk 0 exists; get() never dirties). kNoBlock if none.
+    uint32_t allocBlockId(uint64_t g) const noexcept {
+        uint32_t id = blockIdCandidate(g);
+        for (uint32_t i = 0; i < kBlockIdProbes; ++i, ++id) {
+            if (id == kNoBlock) id = 1;   // wrapped
+            if (blocks->get(blockChunkKey(id, 0)) == nullptr) return id;
+        }
+        return kNoBlock;
+    }
+
+    // Appends contributor c (row cr, already counted into group g's row gr by
+    // applyContribution(+1)) as the group's last entry, position n-1: into the
+    // tail, the spare, or a new chunk at a boundary. Exactly one chunk row put.
+    void blockAppend(uint64_t c, uint8_t* cr, uint64_t g, uint8_t* gr) noexcept {
+        const uint64_t n = loadU64(gr);
+        if (blocks == nullptr || n == 0 || n > UINT32_MAX) { ++stats.aggInconsistent; return; }
+        const uint32_t pos = static_cast<uint32_t>(n - 1);
+        uint32_t id = blockIdOf(gr);
+        uint32_t chunks = blockChunksOf(gr);
+        if (id == kNoBlock) {
+            if (pos != 0) { ++stats.aggInconsistent; return; }   // entries without a block
+            id = allocBlockId(g);
+            if (id == kNoBlock) { ++stats.aggInconsistent; return; }
+            chunks = 0;
+        }
+        const uint32_t idx = pos >> kBlockShift;
+        uint8_t* row = nullptr;
+        if (idx < chunks) {                                      // the tail, or the spare at a boundary
+            if (blocks->get(blockChunkKey(id, idx)) == nullptr) ++stats.aggInconsistent;
+            else row = blocks->put(blockChunkKey(id, idx));
+        } else if (idx == chunks) {                              // a new chunk (zero-filled)
+            row = blocks->put(blockChunkKey(id, idx));
+            ++chunks;
+        } else {
+            ++stats.aggInconsistent;                             // a gap in the chunk sequence
+        }
+        setBlock(gr, id, chunks);
+        if (row == nullptr) return;
+        writeEntry(row, pos & kBlockMask, c, cr);
+        storeU32(cr + agg.contribBlockPosOff, pos);
+    }
+
+    // Rewrites contributor c's entry in place (same group; position unchanged).
+    void blockWrite(uint64_t c, const uint8_t* cr, const uint8_t* gr) noexcept {
+        const uint32_t pos = loadU32(cr + agg.contribBlockPosOff);
+        const uint32_t id = blockIdOf(gr);
+        if (blocks == nullptr || id == kNoBlock || pos >= loadU64(gr)) { ++stats.aggInconsistent; return; }
+        const uint64_t key = blockChunkKey(id, pos >> kBlockShift);
+        const uint8_t* cur = blocks->get(key);
+        const uint32_t slot = pos & kBlockMask;
+        if (cur == nullptr || loadU64(cur + blockKeyOff(slot)) != c) { ++stats.aggInconsistent; return; }
+        writeEntry(blocks->put(key), slot, c, cr);
+    }
+
+    // Removes contributor c (pre-image row cr) from group gr's block, AFTER
+    // applyContribution(-1) (so loadU64(gr) is the post-remove count n'): the
+    // old last entry (position n') moves into c's slot and its contributor's
+    // blockPos is patched (the tail chunk is only read). Then the chunk policy:
+    // n' == 0 frees the block and its id; a spare is freed once the tail holds
+    // <= kBlockSpareFreeAt entries; an emptied tail simply becomes the spare.
+    // At most: the hole chunk (put) + one erase -> 2 block rows, 1 contributor row.
+    void blockRemove(uint64_t c, const uint8_t* cr, uint8_t* gr) noexcept {
+        const uint64_t n = loadU64(gr);
+        const uint32_t id = blockIdOf(gr);
+        uint32_t chunks = blockChunksOf(gr);
+        const uint32_t pos = loadU32(cr + agg.contribBlockPosOff);
+        if (blocks == nullptr || id == kNoBlock || n > UINT32_MAX || pos > n) {
+            ++stats.aggInconsistent;
+            return;
+        }
+        const uint32_t last = static_cast<uint32_t>(n);
+        if (pos != last) {
+            const uint64_t holeKey = blockChunkKey(id, pos >> kBlockShift);
+            const uint8_t* tail = blocks->get(blockChunkKey(id, last >> kBlockShift));
+            const uint8_t* hole = blocks->get(holeKey);
+            if (tail == nullptr || hole == nullptr ||
+                loadU64(hole + blockKeyOff(pos & kBlockMask)) != c) {
+                ++stats.aggInconsistent;
+            } else {
+                const uint64_t m = loadU64(tail + blockKeyOff(last & kBlockMask));
+                moveEntry(blocks->put(holeKey), pos & kBlockMask, tail, last & kBlockMask);
+                if (uint8_t* mr = linkedContributor(m)) storeU32(mr + agg.contribBlockPosOff, pos);
+            }
+        }
+        if (n == 0) {
+            if (chunks > 2) ++stats.aggInconsistent;              // a 1-entry block owns <= 1 chunk
+            for (uint32_t k = 0; k < std::min<uint32_t>(chunks, 2); ++k)
+                (void)blocks->erase(blockChunkKey(id, k));
+            setBlock(gr, kNoBlock, 0);
+            return;
+        }
+        const uint32_t used = static_cast<uint32_t>((n - 1) >> kBlockShift) + 1;
+        const uint32_t tailFill = static_cast<uint32_t>(n - (static_cast<uint64_t>(used - 1) << kBlockShift));
+        if (chunks == used + 1 && tailFill <= kBlockSpareFreeAt) {
+            (void)blocks->erase(blockChunkKey(id, chunks - 1));
+            --chunks;
+        } else if (chunks != used && chunks != used + 1) {
+            ++stats.aggInconsistent;
+        }
+        setBlock(gr, id, chunks);
+    }
+
+    // Rebuilds Min/Max field i's cache by ONE sequential scan of the group's
+    // value block: ceil(n/32) chunk rows, looked up kRescanBatch at a time (the
+    // keys are computed, not links, so their misses overlap), then n packed
+    // values of the field's column. get() never dirties. A missing chunk, a
+    // short scan or a non-null count mismatch is counted; the cache reports what
+    // was actually found.
     void rescan(uint8_t* gr, size_t i, const AggField& f) noexcept {
         ++stats.aggRescans;
         uint8_t* cv = cacheVal(gr, f.cache);
         uint8_t* cs = cacheState(gr, f.cache);
         const uint64_t n = loadU64(gr);
         const uint64_t nonNull = loadU64(nn(gr, i));
-        uint64_t k = loadU64(gr + agg.groupHeadOff);
-        uint64_t steps = 0, seen = 0;
-        bool have = false, bad = false;
-        while (k != kNoContributor) {
-            if (steps == n) { bad = true; break; }
-            const uint8_t* r = contributors.get(k);
-            if (r == nullptr) { bad = true; break; }
-            ++steps;
-            if (!nullBit(r, agg.contribNullOff, f.input)) {
-                const uint8_t* v = val(r, f.input);
-                if (!have || strictlyBetter(f.rule, f.kind, v, cv)) { std::memcpy(cv, v, 8); have = true; }
-                ++seen;
+        const uint16_t col = agg.cacheCol[f.cache];
+        const uint32_t id = blocks != nullptr ? blockIdOf(gr) : kNoBlock;
+        bool have = false;
+        bool bad = id == kNoBlock;
+        uint64_t seen = 0, scanned = 0;
+        const uint64_t chunks = bad ? 0 : (n + kBlockEntries - 1) >> kBlockShift;
+        const uint8_t* rows[kRescanBatch];
+        for (uint64_t base = 0; base < chunks; base += kRescanBatch) {
+            const uint32_t m = static_cast<uint32_t>(std::min<uint64_t>(kRescanBatch, chunks - base));
+            for (uint32_t j = 0; j < m; ++j) {
+                rows[j] = blocks->get(blockChunkKey(id, static_cast<uint32_t>(base + j)));
+                if (rows[j] != nullptr) __builtin_prefetch(rows[j] + blockValOff(col, 0));
             }
-            k = loadU64(r + agg.contribNextOff);
+            for (uint32_t j = 0; j < m; ++j) {
+                const uint8_t* r = rows[j];
+                if (r == nullptr) { bad = true; continue; }
+                const uint64_t first = (base + j) << kBlockShift;
+                const uint32_t cnt = static_cast<uint32_t>(std::min<uint64_t>(kBlockEntries, n - first));
+                const uint8_t* nulls = r + blockNullOff(agg, col, 0);
+                const uint8_t* vals = r + blockValOff(col, 0);
+                for (uint32_t s = 0; s < cnt; ++s) {
+                    if (nulls[s] != 0) continue;
+                    const uint8_t* v = vals + 8u * s;
+                    if (!have || strictlyBetter(f.rule, f.kind, v, cv)) { std::memcpy(cv, v, 8); have = true; }
+                    ++seen;
+                }
+                scanned += cnt;
+            }
         }
-        if (bad || steps != n || seen != nonNull) ++stats.aggInconsistent;
+        if (bad || scanned != n || seen != nonNull) ++stats.aggInconsistent;
         if (!have) storeU64(cv, 0);
         *cs = have ? kValid : kEmpty;
     }
@@ -383,6 +533,9 @@ struct Ctx {
         uint8_t* gr = applyContribution(cr, -1);
         if (agg.linked) unlink(c, cr, g, gr);
         if (gr == nullptr) return g;   // inconsistent: counted, nothing else changed
+        // Value block: an in-place update keeps its entry (rewritten after the add);
+        // everything else leaves the group -- swap-remove BEFORE the emit below rescans.
+        if (agg.numBlockCols > 0 && mode != RetractMode::InPlaceLinked) blockRemove(c, cr, gr);
         if (loadU64(gr) == 0) {
             if (mode == RetractMode::Delete) dropGroup(g);
         } else if (mode != RetractMode::InPlaceLinked) {
@@ -397,10 +550,10 @@ struct Ctx {
 FoldStats foldAggregateBatch(const CompiledViewPlan& /*plan*/, const RowLayout& layout,
                              const AggLayout& agg, VersionDescriptorCache& vdc,
                              ViewTable& view, ViewTable& contributors, ViewTable& groups,
-                             const rune::storage::LogReadView& lv, int64_t bound,
-                             int64_t& cursor) {
+                             ViewTable* blocks, const rune::storage::LogReadView& lv,
+                             int64_t bound, int64_t& cursor) {
     FoldStats stats{};
-    Ctx cx{layout, agg, view, contributors, groups, stats};
+    Ctx cx{layout, agg, view, contributors, groups, blocks, stats};
     const int64_t from = cursor;   // records below it were folded by a prior (mid-batch) pass
     bool stopped = false;
     bool corrupt = false;
@@ -486,7 +639,11 @@ FoldStats foldAggregateBatch(const CompiledViewPlan& /*plan*/, const RowLayout& 
             }
             uint8_t* gr = cx.applyContribution(cr, +1);
             if (agg.linked) cx.linkAtHead(c, cr, gr);
-            cx.emit(g, gr);
+            if (agg.numBlockCols > 0) {          // implies linked: same group == InPlaceLinked
+                if (hadOld && oldGroup == g) cx.blockWrite(c, cr, gr);
+                else cx.blockAppend(c, cr, g, gr);
+            }
+            cx.emit(g, gr);                      // a rescan here sees the block's new state
             if (hadOld && oldGroup != g) {
                 const uint8_t* og = groups.get(oldGroup);
                 if (og != nullptr && loadU64(og) == 0) cx.dropGroup(oldGroup);
@@ -500,6 +657,15 @@ FoldStats foldAggregateBatch(const CompiledViewPlan& /*plan*/, const RowLayout& 
     // Never move the resume point backwards (a corrupt batch at/after `from`).
     cursor = std::max(from, corrupt ? walkedUpto : std::min(lv.nextOffset, bound));
     return stats;
+}
+
+FoldStats foldAggregateBatch(const CompiledViewPlan& plan, const RowLayout& layout,
+                             const AggLayout& agg, VersionDescriptorCache& vdc,
+                             ViewTable& view, ViewTable& contributors, ViewTable& groups,
+                             const rune::storage::LogReadView& lv, int64_t bound,
+                             int64_t& cursor) {
+    return foldAggregateBatch(plan, layout, agg, vdc, view, contributors, groups, nullptr, lv,
+                              bound, cursor);
 }
 
 } // namespace rune::view

@@ -107,15 +107,20 @@ enum class ViewReadiness : uint8_t { Recovering, RebuildingViews, CatchingUp, Re
 [[nodiscard]] std::vector<std::span<const uint8_t>>
 splitViewCheckpointRecords(std::span<const uint8_t> bytes);
 
-// Phase 2a: the two auxiliary tables of an aggregate (view, partition).
+// Phase 2a: the auxiliary tables of an aggregate (view, partition); Phase 2b
+// Task 5b: plus the per-group Min/Max value blocks when the view has Min/Max.
 struct AggInstance {
     rune::view::AggLayout layout;        // declared first: the tables are built from it
     rune::view::ViewTable contributors;  // contributorKey -> pre-image (retraction)
     rune::view::ViewTable groups;        // groupKey -> accumulators
+    std::optional<rune::view::ViewTable> blocks;   // engaged iff layout.numBlockCols > 0
     AggInstance(rune::view::AggLayout l, std::size_t indexSlots, std::size_t chunkBytes)
         : layout(std::move(l)),
           contributors(layout.contributorRow, indexSlots, chunkBytes),
-          groups(layout.groupRow, indexSlots, chunkBytes) {}
+          groups(layout.groupRow, indexSlots, chunkBytes) {
+        if (layout.numBlockCols > 0) blocks.emplace(layout.blockRow, indexSlots, chunkBytes);
+    }
+    rune::view::ViewTable* blocksOrNull() noexcept { return blocks ? &*blocks : nullptr; }
 };
 
 // Per-(view, partition) fold-anomaly counters, accumulated from every pass's
@@ -507,7 +512,10 @@ public:
             return t.dirtyRids().size() + t.pendingDeleteCount();
         };
         std::size_t n = pending(inst.table);
-        if (inst.agg) n += pending(inst.agg->contributors) + pending(inst.agg->groups);
+        if (inst.agg) {
+            n += pending(inst.agg->contributors) + pending(inst.agg->groups);
+            if (inst.agg->blocks) n += pending(*inst.agg->blocks);
+        }
         return n;
     }
 
@@ -643,7 +651,8 @@ private:
         const rune::view::FoldStats st =
             inst.agg ? rune::view::foldAggregateBatch(inst.plan, inst.layout, inst.agg->layout,
                                                       inst.vdc, inst.table, inst.agg->contributors,
-                                                      inst.agg->groups, view, passBound, cursor)
+                                                      inst.agg->groups, inst.agg->blocksOrNull(), view,
+                                                      passBound, cursor)
                      : rune::view::foldBatch(inst.plan, inst.layout, inst.vdc, inst.table, view,
                                              passBound, cursor);
         inst.foldCursor = cursor;
@@ -698,6 +707,7 @@ private:
         if (inst.agg) {
             inst.agg->contributors.drainDirty(drop);
             inst.agg->groups.drainDirty(drop);
+            if (inst.agg->blocks) inst.agg->blocks->drainDirty(drop);
         }
     }
 
