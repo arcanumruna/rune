@@ -125,7 +125,7 @@ rune security bootstrap --admin <name> --cluster-key-file <path> --broker host:p
 
 Users, roles and grants are managed with Rune QL (`CREATE USER`, `GRANT`, ... in [ql.md](ql.md#security-statements)).
 
-Quickstart: [README, Security](../../README.md#security-quickstart). Reference: [SECURITY.md](../../broker/docs/SECURITY.md).
+Quickstart: [wiki, Security Quickstart](https://github.com/arcanumruna/rune/wiki/Security-Quickstart). Reference: [SECURITY.md](../../broker/docs/SECURITY.md).
 The CLI has no TLS support yet (tracked in SECURITY.md), so it needs a plaintext listener; a broker with
 `RUNE_REQUIRE_TLS=true` refuses it.
 

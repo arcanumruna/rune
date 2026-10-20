@@ -77,7 +77,7 @@ file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests/generated")
 
 add_custom_command(
     OUTPUT  "${CHARACTERS_GEN_H}"
-    COMMAND rune_codec_gen "${CHARACTERS_BLOB}" "${CHARACTERS_GEN_H}"
+    COMMAND $<TARGET_FILE:rune_codec_gen> "${CHARACTERS_BLOB}" "${CHARACTERS_GEN_H}"
     DEPENDS rune_codec_gen "${CHARACTERS_BLOB}"
     COMMENT "Generating characters.gen.h from characters.blob"
 )
@@ -89,7 +89,7 @@ set(FIXEDSTR_SAMPLE_GEN_H "${CMAKE_CURRENT_BINARY_DIR}/tests/generated/fixedstr_
 
 add_custom_command(
     OUTPUT  "${FIXEDSTR_SAMPLE_GEN_H}"
-    COMMAND rune_codec_gen "${FIXEDSTR_SAMPLE_BLOB}" "${FIXEDSTR_SAMPLE_GEN_H}"
+    COMMAND $<TARGET_FILE:rune_codec_gen> "${FIXEDSTR_SAMPLE_BLOB}" "${FIXEDSTR_SAMPLE_GEN_H}"
     DEPENDS rune_codec_gen "${FIXEDSTR_SAMPLE_BLOB}"
     COMMENT "Generating fixedstr_sample.gen.h from fixedstr_sample.blob"
 )
@@ -101,7 +101,7 @@ set(STR_KEYED_GEN_H "${CMAKE_CURRENT_BINARY_DIR}/tests/generated/str_keyed.gen.h
 
 add_custom_command(
     OUTPUT  "${STR_KEYED_GEN_H}"
-    COMMAND rune_codec_gen "${STR_KEYED_BLOB}" "${STR_KEYED_GEN_H}"
+    COMMAND $<TARGET_FILE:rune_codec_gen> "${STR_KEYED_BLOB}" "${STR_KEYED_GEN_H}"
     DEPENDS rune_codec_gen "${STR_KEYED_BLOB}"
     COMMENT "Generating str_keyed.gen.h from str_keyed.blob"
 )
@@ -116,13 +116,13 @@ set(ALLFIXED_SAMPLE_GEN_H "${CMAKE_CURRENT_BINARY_DIR}/tests/generated/allfixed_
 
 add_custom_command(
     OUTPUT  "${ALLFIXED_SAMPLE_BLOB}"
-    COMMAND make_allfixed_sample_blob "${ALLFIXED_SAMPLE_BLOB}"
+    COMMAND $<TARGET_FILE:make_allfixed_sample_blob> "${ALLFIXED_SAMPLE_BLOB}"
     DEPENDS make_allfixed_sample_blob
     COMMENT "Generating allfixed_sample.blob (2b-B flyweight fixture)"
 )
 add_custom_command(
     OUTPUT  "${ALLFIXED_SAMPLE_GEN_H}"
-    COMMAND rune_codec_gen "${ALLFIXED_SAMPLE_BLOB}" "${ALLFIXED_SAMPLE_GEN_H}"
+    COMMAND $<TARGET_FILE:rune_codec_gen> "${ALLFIXED_SAMPLE_BLOB}" "${ALLFIXED_SAMPLE_GEN_H}"
     DEPENDS rune_codec_gen "${ALLFIXED_SAMPLE_BLOB}"
     COMMENT "Generating allfixed_sample.gen.h from allfixed_sample.blob"
 )

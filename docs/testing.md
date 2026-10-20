@@ -35,7 +35,7 @@ cmake --build build
 ```
 
 `BUILD_TESTING=ON` needs Python 3 (the source guards are Python scripts) and GTest. `BUILD_INTEGRATION_TESTING` (default `ON`) builds the
-heavier real-broker targets. The other libraries build and test on their own: [README, Build](../README.md#build).
+heavier real-broker targets. The other libraries build and test on their own: [wiki, Building](https://github.com/arcanumruna/rune/wiki/Building#each-library-on-its-own).
 
 ## Unit and integration tests
 

@@ -142,7 +142,7 @@ The operator view of both is in [CATALOG.md](../../broker/docs/CATALOG.md) and
 ## Build and test
 
 The codec CMake always builds its tests, so GTest must be found (`gtest` comes from Conan, see the
-[README](../../README.md#build)); Google Benchmark is optional and adds `rune_codec_bench` when found.
+[wiki, Building](https://github.com/arcanumruna/rune/wiki/Building#conan-notes)); Google Benchmark is optional and adds `rune_codec_bench` when found.
 
 ```bash
 conan install codec -of build-codec -s build_type=Debug --build=missing
