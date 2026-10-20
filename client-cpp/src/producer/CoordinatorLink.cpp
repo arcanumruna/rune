@@ -63,6 +63,7 @@ CoordinatorLink::Slot* CoordinatorLink::acquire(ReqKind kind, int64_t deadlineNs
         s.state      = Building{};   // claimed; not offered until submit()
         s.kind       = kind;
         s.attempt    = 0;
+        s.offers     = 0;
         s.deadlineNs = deadlineNs;
         s.frameLen   = 0;
         s.corrId     = coordcorr::make(ordinal_, static_cast<uint8_t>(i), (++seq_ == 0 ? ++seq_ : seq_));
@@ -96,6 +97,7 @@ bool CoordinatorLink::offer_(Slot& s) noexcept {
     case CoordinatorSink::Offer::Accepted:
     case CoordinatorSink::Offer::Fatal:   // never deliverable: consumed, the slot's deadline completes it
         s.state = InFlight{sid, s.deadlineNs};
+        ++s.offers;
         return true;
     }
     return false;

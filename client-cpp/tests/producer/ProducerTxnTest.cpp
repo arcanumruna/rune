@@ -1695,3 +1695,39 @@ TEST(ProducerTxnRegression, RefusedResentCommitIsFatalNeverAbortableRegression) 
     EXPECT_EQ(commit.status(), OpStatus::BrokerError);
     EXPECT_EQ(r.state(), TxnState::AbortableError);
 }
+
+// Fix round 1 (review I1): the LINK's own re-send of EndTxn(commit) - after a coordinator move (NotCoordinator,
+// then the Client re-points the coordinator) or a session change - also may have landed: the first offer reached
+// a coordinator and its answer was lost or redirected.  A refusal (39) of the re-offer is FatalError, never
+// AbortableError, and no EndTxn(abort) ever leaves.
+TEST(ProducerTxnRegression, LinkResentCommitRefusedIsFatalNeverAbortableRegression) {
+    for (const bool moved : {true, false}) {
+        SCOPED_TRACE(moved ? "coordinator moved" : "session changed");
+        Rig r;
+        r.initOk();
+        r.startTxn();
+        Op commit = r.commit();
+        r.tick();
+        ASSERT_EQ(r.endTxns(), 1u);
+        const int64_t corr = r.lastEndCorr();
+        if (moved) {
+            r.endAnswer(ec(rpc::ErrorCode::NotCoordinator));   // the link waits for the coordinator move
+            r.hub.onCoordinatorMoved();
+        } else {
+            r.hub.onCoordinatorSessionChanged();                // in flight: re-offered on the new session
+        }
+        r.tick();
+        ASSERT_EQ(r.endTxns(), 2u) << "the link did not re-offer EndTxn(commit)";
+        ASSERT_EQ(r.lastEndCorr(), corr) << "the same request";
+        r.endAnswer(ec(rpc::ErrorCode::InvalidRequest));
+        ASSERT_TRUE(commit.ready());
+        EXPECT_EQ(commit.status(), OpStatus::BrokerError);
+        EXPECT_EQ(commit.code(), uec(rpc::ErrorCode::InvalidRequest));
+        EXPECT_EQ(r.state(), TxnState::FatalError) << "a re-offered commit that may have landed became abortable";
+        Op abort = r.abort();
+        ASSERT_TRUE(abort.ready());
+        EXPECT_EQ(abort.status(), OpStatus::BrokerError);
+        r.ticks(4, kMs);
+        EXPECT_EQ(r.endTxns(), 2u) << "an EndTxn(abort) over a commit that may have landed";
+    }
+}

@@ -1379,10 +1379,21 @@ int ProducerImpl::drainRing(int64_t nowNs, int messageLimit) {
     if (const auto* dc = std::get_if<LifeDiscarding>(&life_)) [[unlikely]] {
         return discardRing_(dc->status, messageLimit, dc->errorCode);
     }
-    // Phase 2b F (FD2) duty re-check, once per drain pass (never per record): a transactional producer whose
-    // machine is not InTransaction produces nothing it reads now.  A control op in the ring (kMsgTxnControl,
-    // Task 8) must end the pass, so the next pass decides on the state it leaves.  Plain: one compare.
-    if (txnIntakeShut_()) [[unlikely]] return refuseRingTxn_(messageLimit);
+    // Phase 2b F (FD2) duty re-check, decided once per drain pass (never per record; plain: one compare): a
+    // transactional producer whose machine is not InTransaction produces nothing it reads now.  The refusal pass
+    // refuses records only: it STOPS at any other message it does not own (lastDrainStop_ Blocked, the message
+    // left in the ring) and the normal drain below takes exactly that one message.  The normal drain ends its
+    // pass at any message that is not a record or a flush token (consumed, DrainStop::FlushToken), so the next
+    // pass decides on the state that message left.
+    // TASK 8: kMsgTxnControl is applied in the normal drain's control-message branch (never in the refusal pass,
+    // never skipped) and must keep ending the pass there.
+    int refused = 0;
+    if (txnIntakeShut_()) [[unlikely]] {
+        refused = refuseRingTxn_(messageLimit);
+        if (lastDrainStop_ != DrainStop::Blocked) return refused;
+        lastDrainStop_ = DrainStop::Drained;
+        messageLimit   = 1;   // the message the refusal pass stopped at
+    }
 
     // F12: drain up to messageLimit messages in ONE pass; ProducerHub flushes
     // once after it (not once per record).  The pass stops early at a batch
@@ -1477,9 +1488,14 @@ int ProducerImpl::drainRing(int64_t nowNs, int messageLimit) {
                 return ControlledAction::CONTINUE;
             }
 
-            return ControlledAction::CONTINUE;  // unknown type: skipped
+            // Not a record, not a flush token: a control message (Task 8: kMsgTxnControl is applied HERE).  Today
+            // no other type is ever written - an unknown one is consumed (counted) and ENDS the pass, so whatever a
+            // control message changes is seen by the next pass's decisions (the FD2 re-check above).
+            ++ringForeign_;
+            lastDrainStop_ = DrainStop::FlushToken;
+            return ControlledAction::BREAK;
         },
-        messageLimit);
+        messageLimit) + refused;
 }
 
 // ---------------------------------------------------------------------------
@@ -3119,9 +3135,18 @@ int ProducerImpl::refuseRingTxn_(int limit) noexcept {
     const TxnOutcome o = txnRefusal_();
     const DutyScope duty(*this);
     uint64_t voids = 0;
-    const int n = ring_.read(
-        [&](int32_t type, aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t off, aeron::util::index_t len) {
+    using rune::client::detail::ControlledAction;
+    lastDrainStop_ = DrainStop::Drained;
+    const int n = ring_.controlledRead(
+        [&](int32_t type, aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t off,
+            aeron::util::index_t len) -> ControlledAction {
             const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + off);
+            if (type != kMsgSendRecord && type != kMsgTier2Batch && type != kMsgClaimBatch && type != kMsgFlush) {
+                // Not ours (Task 8: kMsgTxnControl - an abort issued in AbortableError arrives HERE): left in the
+                // ring for the normal drain to apply.  Swallowing it would leave its op pending for ever.
+                lastDrainStop_ = DrainStop::Blocked;
+                return ControlledAction::ABORT;
+            }
             if (type == kMsgSendRecord && len >= kRecHeaderSize) {
                 const uint64_t h = (p[kRecFlagsOff] & kFlagWantAck) ? static_cast<uint64_t>(readLE64(p, kRecCorrIdOff)) : 0u;
                 emitBatchAck_(readLE32(p, kRecTopicIdOff), readLE32(p, kRecPartOff), -1, 1, -1, BatchAck::kClientFailure,
@@ -3144,7 +3169,8 @@ int ProducerImpl::refuseRingTxn_(int limit) noexcept {
                               BatchAck::kClientFailure, o.status, static_cast<uint32_t>(nrec), -1);
                 voids += static_cast<uint64_t>(nrec);   // claims carry no ack handle
             }
-            // kMsgFlush: nothing to complete.
+            // kMsgFlush: nothing to complete (a plain flush token carries no completion).
+            return ControlledAction::CONTINUE;
         },
         limit);
     if (voids != 0) {
@@ -3962,10 +3988,12 @@ void ProducerImpl::onCoordinatorAnswer(const CoordAnswer& a, int64_t nowNs) noex
 
 int ProducerImpl::pumpCoordinator(int64_t nowNs) noexcept {
     if (!coord_ || coord_->inUse() == 0) [[likely]] return 0;   // idle link: one load, no slot memory
-    return coord_->pump(nowNs, [this](CoordinatorLink::Slot& s) {
+    const int work = coord_->pump(nowNs, [this](CoordinatorLink::Slot& s) {
         if (s.kind == ReqKind::InitProducerId && cfg_.transactionalId.empty()) onInitExpired_(s);
         else onTxnSlotExpired_(s);   // the link releases the slot after this
     });
+    if (work != 0 && transactional_()) noteEndReoffer_();   // Task 6 fix round 1 (I1)
+    return work;
 }
 
 }  // namespace rune::client::producer

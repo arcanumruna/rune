@@ -1237,6 +1237,12 @@ public:
     [[nodiscard]] uint64_t txnRecordsRefusedDuty() const noexcept { return txnRecordsRefusedDuty_; }
     /// Partitions in the current transaction (left NotInTxn since it began).  Duty thread; diagnostics / tests.
     [[nodiscard]] std::size_t txnPartitionCount() const noexcept { return txnSeen_.size(); }
+    /// Ring messages the drain read that were neither a record nor a flush token (Task 8: control ops).  Duty thread.
+    [[nodiscard]] uint64_t ringForeignMessages() const noexcept { return ringForeign_; }
+    /// Test seam: write one raw message of `type` into the producer ring (Ring mode).
+    bool testWriteRing(int32_t type, std::span<const uint8_t> payload) noexcept {
+        return writeToRing(type, payload.data(), payload.size());
+    }
     /// Test seams (duty thread): the data / offsets legs of Tasks 6 / 7 drive these through the same paths.
     void testMarkStarted(TxnStarted s = TxnStarted::Yes) noexcept { markStarted_(s); }
     void testPoison(OpStatus st, uint16_t errorCode, AbortKind kind) noexcept { poison_(st, errorCode, kind); }
@@ -1770,6 +1776,7 @@ private:
     std::vector<uint32_t> txnSeen_;
     std::vector<uint32_t> txnAddQueue_;
     uint64_t              txnRecordsRefusedDuty_ = 0;
+    uint64_t              ringForeign_ = 0;   ///< see ringForeignMessages()
     /// kAttrTransactional for a transactional producer, 0 for a plain one (immutable after construction): the
     /// attributes a Tier-2 restamp sets, and the cheap "transactional" test of the failure / intake paths.
     uint16_t              txnBatchAttrs_ = 0;
@@ -1797,6 +1804,7 @@ private:
     /// AddPartitionsToTxn still on the link is cancelled.  True when anything was discarded / cancelled.
     bool txnDiscardUnsent_(const TxnOutcome& o) noexcept;
     /// FD2 duty re-check, Ring mode: reads up to `limit` ring messages and refuses each record (never produced).
+    /// Stops (lastDrainStop_ Blocked, the message left in the ring) at any message that is not a record / flush.
     [[gnu::cold, gnu::noinline]] int refuseRingTxn_(int limit) noexcept;
     /// Sequence reset of a transactional partition (KIP-360: the coordinator owns the epoch - never bumped
     /// locally): the partition sends nothing new, the transaction must abort and the abort bumps the epoch.
@@ -1829,6 +1837,8 @@ private:
     void onTxnSlotExpired_(CoordinatorLink::Slot& s) noexcept;
     void onTxnInitAnswer_(const CoordAnswer& a, CoordinatorLink::Slot& s, int64_t nowNs) noexcept;
     void onEndTxnAnswer_(const CoordAnswer& a, CoordinatorLink::Slot& s, int64_t nowNs) noexcept;
+    /// EndTxn(commit) offered more than once by the link: EndSent{.., Resend} (an earlier offer may have landed).
+    void noteEndReoffer_() noexcept;
     /// closeImmediately on a transactional producer: every pending txn op / flush completes `st`, every slot is
     /// released, nothing more is sent (the coordinator's transaction timeout aborts an open transaction).
     void txnDiscard_(OpStatus st, uint16_t errorCode) noexcept;

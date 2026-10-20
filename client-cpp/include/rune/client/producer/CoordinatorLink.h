@@ -41,6 +41,7 @@ public:
         ReqKind   kind  = ReqKind::InitProducerId;
         int64_t   corrId = 0;
         uint32_t  attempt = 0;
+        uint32_t  offers  = 0;      ///< frames offered for this request (first send + every re-send of the link)
         int64_t   deadlineNs = 0;   ///< absolute duty-clock expiry, > 0
         uint16_t  frameLen = 0;
         std::array<uint8_t, kCoordFrameCap> frame{};
@@ -165,8 +166,9 @@ struct TxnJoiners {
 };
 
 struct AwaitData {};                                          ///< EndTxn waits for every record of the txn to be acked
-/// Which send of EndTxn is on the link: the first, or the re-send of an in-doubt one (ResendEnd).  After a re-send
-/// of EndTxn(commit) the first may have landed, so only a definite answer ends it: a non-retriable one is fatal.
+/// Which send of EndTxn is on the link: the first, or a re-send - the app's retry of an in-doubt one (ResendEnd), or
+/// the link's own re-offer of the same request (session change, coordinator move, backoff).  After any re-send of
+/// EndTxn(commit) an earlier one may have landed, so only a definite answer ends it: a non-retriable one is fatal.
 enum class EndTry : uint8_t { First, Resend };
 struct EndSent  { CoordinatorLink::Slot* slot = nullptr; EndTry attempt = EndTry::First; };   ///< EndTxn on the link
 /// Where an op that timed out left its transaction (the app retries the SAME direction, B-2):

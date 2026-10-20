@@ -872,6 +872,7 @@ TEST(ProducerTxnData, AddPartitionsTimeoutIsResentAndAnAbortTreatsItAsPossiblySt
         r.ticks(4, kMs);
         EXPECT_EQ(r.adds().size(), 1u) << "the cancelled AddPartitionsToTxn was re-sent after the abort";
         EXPECT_TRUE(r.wire.empty());
+        EXPECT_EQ(r.impl->coordinatorLink()->inUse(), 0u) << "the cancelled AddPartitionsToTxn leaked its slot";
     }
 }
 
@@ -948,4 +949,126 @@ TEST(ProducerTxnData, InvokerModeClaimInATransactionWritesTheFrameAfterAdded) {
     r.endAnswer();
     ASSERT_TRUE(commit.ready());
     EXPECT_EQ(commit.status(), OpStatus::Ok);
+}
+
+// Fix round 1 (review I2): a sequence reset of a transactional partition with several batches in flight.  The
+// batches behind the failed one carry sequences that can never be restarted in place: they fail AT ONCE with the
+// transaction's status (each record exactly once), nothing is re-sent under the old identity, and the abort goes
+// out promptly - never held for the delivery timeout.
+TEST(ProducerTxnDataRegression, TransactionalResetFailsTheStaleInFlightBatchesAtOnceRegression) {
+    Rig r;
+    r.initOk(42, 0);
+    r.begin();
+    ASSERT_EQ(r.sendAck(0, 1, 11), SendResult::Ok);
+    r.tick();
+    r.answerAdd(0);
+    r.tick();
+    ASSERT_EQ(r.sendAck(0, 2, 12), SendResult::Ok);
+    r.tick();
+    ASSERT_EQ(r.sendAck(0, 3, 13), SendResult::Ok);
+    r.tick();
+    ASSERT_EQ(r.wire.size(), 3u) << "three batches in flight";
+    const int64_t t0 = r.now;
+    for (auto& w : r.wire) w.acked = true;
+    r.hub.onProduceResponse(r.wire[0].corrId, -1, ec(rpc::ErrorCode::OutOfOrderSequence));   // C4: next in line
+    EXPECT_EQ(r.acks.times(12), 1) << "a stale batch was left in flight under the old identity";
+    EXPECT_EQ(r.acks.times(13), 1);
+    EXPECT_EQ(r.acks.status(12), OpStatus::BrokerError);
+    r.hub.onProduceResponse(r.wire[1].corrId, -1, ec(rpc::ErrorCode::OutOfOrderSequence));   // late: ignored
+    r.hub.onProduceResponse(r.wire[2].corrId, -1, ec(rpc::ErrorCode::OutOfOrderSequence));
+    EXPECT_EQ(r.state(), TxnState::AbortableError);
+    Op abort = r.abort();
+    r.ticks(2, kMs);
+    ASSERT_EQ(r.endTxns(), 1u) << "the abort waited for the stale batches";
+    EXPECT_EQ(r.lastEnd()->producerEpoch, 0);
+    r.endAnswer();
+    r.tick(kMs);
+    r.answer(Rig::initAnswer(r.last(rpc::InitProducerId::TEMPLATE_ID)->corrId, 42, 1));
+    ASSERT_TRUE(abort.ready());
+    EXPECT_EQ(abort.status(), OpStatus::Ok);
+    EXPECT_LT(r.now - t0, r.cfg.produceTimeoutMs * kMs / 100) << "the abort was not prompt";
+    r.ticks(4, kMs);
+    EXPECT_EQ(r.wire.size(), 3u) << "a stale batch was re-sent";
+    for (const Token t : {Token{11}, Token{12}, Token{13}}) EXPECT_EQ(r.acks.times(t), 1);
+}
+
+// Task 8 pre-requisite: the FD2 refusal pass refuses RECORDS only.  A message it does not own (Task 8:
+// kMsgTxnControl - e.g. an abort issued in AbortableError) is never swallowed: the refusal pass stops at it, the
+// normal drain takes it and ends the pass there, and the records behind it wait for the next pass.  A plain
+// producer's drain also ends its pass at such a message.
+TEST(ProducerTxnDataRegression, RefusalPassStopsAtAMessageItDoesNotOwnRegression) {
+    constexpr int32_t kForeign = 99;
+    const std::array<uint8_t, 4> payload{1, 2, 3, 4};
+    {
+        Rig r;
+        r.initOk();
+        r.begin();
+        r.impl->testPoison(OpStatus::BrokerError, uec(rpc::ErrorCode::NotAuthorized), rp::AbortKind::Plain);
+        ASSERT_EQ(r.send(0, 1), SendResult::Ok);
+        ASSERT_TRUE(r.impl->testWriteRing(kForeign, payload));
+        ASSERT_EQ(r.send(0, 2), SendResult::Ok);
+        EXPECT_EQ(r.impl->drainRing(r.now, 16), 2) << "one refused record + the foreign message";
+        EXPECT_EQ(r.impl->txnRecordsRefusedDuty(), 1u);
+        EXPECT_EQ(r.impl->ringForeignMessages(), 1u) << "the refusal pass swallowed a message it does not own";
+        EXPECT_EQ(r.impl->lastDrainStop(), ProducerImpl::DrainStop::FlushToken) << "the pass did not stop at it";
+        EXPECT_LT(r.impl->testRingHead(), r.impl->testRingTail()) << "the record behind it was read in the same pass";
+        EXPECT_EQ(r.impl->drainRing(r.now, 16), 1);
+        EXPECT_EQ(r.impl->txnRecordsRefusedDuty(), 2u);
+        Op abort = r.abort();
+        r.tick();
+        ASSERT_TRUE(abort.ready());
+    }
+    {
+        ProducerImpl impl(txnCfg(""), 1 << 16);   // plain
+        const auto v = val(1);
+        ASSERT_EQ(impl.trySubmit(kTopic, 0, Key(uint64_t{1}), v, 0), SendResult::Ok);
+        ASSERT_TRUE(impl.testWriteRing(kForeign, payload));
+        ASSERT_EQ(impl.trySubmit(kTopic, 0, Key(uint64_t{1}), v, 0), SendResult::Ok);
+        EXPECT_EQ(impl.drainRing(kT0, 16), 2);
+        EXPECT_EQ(impl.recordsSent(), 1u) << "records after the message joined the same pass";
+        EXPECT_EQ(impl.lastDrainStop(), ProducerImpl::DrainStop::FlushToken);
+        EXPECT_EQ(impl.drainRing(kT0, 16), 1);
+        EXPECT_EQ(impl.recordsSent(), 2u);
+    }
+}
+
+// FD5: more new partitions than one 4096-byte AddPartitionsToTxn holds are split across request slots, in the same
+// pass, each partition named once; every partition's data goes out once all are OK.
+TEST(ProducerTxnData, AddPartitionsSplitAcrossSlotsWhenOneFrameIsFull) {
+    const std::string longId(255, 't');   // header 24 + body 10 + id 2 + 255 + count 2 = 293: 475 entries per frame
+    constexpr std::size_t kFixed = 293;
+    constexpr int kParts = 500;
+    Rig r(Mode::Ring, txnCfg(longId));
+    r.initOk();
+    r.begin();
+    for (int p = 0; p < kParts; ++p) ASSERT_EQ(r.send(p, static_cast<uint8_t>(p)), SendResult::Ok);
+    // Every record drained and every partition queued in ONE flush (the hub drains at most 256 messages a cycle),
+    // then one duty pass sends the AddPartitionsToTxn requests.
+    while (r.impl->drainRing(r.now, 1024) > 0) {}
+    (void)r.impl->flushBatches(r.now, 42, r.sink);
+    r.tick();
+    const auto adds = r.adds();
+    ASSERT_EQ(adds.size(), 2u) << "one frame cannot hold 500 partitions: two requests in one pass";
+    std::size_t named = 0;
+    for (const OfferedFrame* f : adds) {
+        ASSERT_LE(f->len, rp::CoordinatorLink::kCoordFrameCap);
+        named += (f->len - kFixed) / 8;
+    }
+    EXPECT_EQ((adds[0]->len - kFixed) / 8, 475u);
+    EXPECT_EQ(named, static_cast<std::size_t>(kParts)) << "a partition missing from (or doubled in) the requests";
+    EXPECT_NE(adds[0]->corrId, adds[1]->corrId);
+    EXPECT_TRUE(r.wire.empty());
+    r.answerAdd(0);
+    r.tick();
+    EXPECT_EQ(r.wire.size(), 475u) << "the first request's partitions go out";
+    r.answerAdd(0);
+    r.ticks(2);
+    EXPECT_EQ(r.wire.size(), static_cast<std::size_t>(kParts));
+    r.ackAll();
+    Op commit = r.commit();
+    r.tick();
+    r.endAnswer();
+    ASSERT_TRUE(commit.ready());
+    EXPECT_EQ(commit.status(), OpStatus::Ok);
+    EXPECT_EQ(r.impl->coordinatorLink()->inUse(), 0u);
 }

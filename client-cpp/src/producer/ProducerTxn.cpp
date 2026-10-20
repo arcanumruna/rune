@@ -616,7 +616,18 @@ void ProducerImpl::onTxnInitAnswer_(const CoordAnswer& a, CoordinatorLink::Slot&
     }
 }
 
+void ProducerImpl::noteEndReoffer_() noexcept {
+    // Task 6 fix round 1 (I1): the link re-offered EndTxn on its own (a session change, a coordinator move, a backoff
+    // retry) - an earlier offer may have landed.  Recorded in the end phase: EndSent{.., Resend}.
+    auto* cm = std::get_if<Committing>(&txn_);
+    if (cm == nullptr) return;
+    if (auto* e = std::get_if<EndSent>(&cm->phase); e != nullptr && e->slot != nullptr && e->slot->offers > 1) {
+        e->attempt = EndTry::Resend;
+    }
+}
+
 void ProducerImpl::onEndTxnAnswer_(const CoordAnswer& a, CoordinatorLink::Slot& s, int64_t nowNs) noexcept {
+    noteEndReoffer_();   // an offer after the first one: its answer is about a request that may already have landed
     auto* cm = std::get_if<Committing>(&txn_);
     auto* ab = std::get_if<Aborting>(&txn_);
     if (cm == nullptr && ab == nullptr) return;
@@ -646,8 +657,9 @@ void ProducerImpl::onEndTxnAnswer_(const CoordAnswer& a, CoordinatorLink::Slot& 
     case Verdict::Abortable:
     case Verdict::Reject: {
         if (cm != nullptr && sent->attempt == EndTry::Resend) {
-            // Task 6: the FIRST EndTxn(commit) may have landed - only a definite answer ends the commit.  A
-            // non-retriable answer to its re-send cannot say it did not: FatalError with that code, never an abort.
+            // Task 6: an earlier EndTxn(commit) offer may have landed (the app's retry, or the link's own re-offer) -
+            // only a definite answer ends the commit.  A non-retriable answer to a re-send cannot say it did not:
+            // FatalError with that code, never an abort.
             enterFatal_(OpStatus::BrokerError, ucode,
                         "EndTxn: the re-sent commit was refused and the first one may have landed (fatal)");
             return;
@@ -922,16 +934,29 @@ void ProducerImpl::txnResetPartition_(PartitionState& ps) noexcept {
     // KIP-360: a transactional producer's epoch belongs to its coordinator - a local bump would put this
     // partition's data under an epoch no EndTxn ever ends.  The partition sends nothing new (not Added, its id
     // pending), the transaction can only abort, and the abort's epoch bump restarts every sequence.
+    constexpr uint16_t kOos = static_cast<uint16_t>(rpc::ErrorCode::OutOfOrderSequence);
     ps.producerId = -1;
-    if (std::holds_alternative<NotInTxn>(ps.txn) || std::holds_alternative<Added>(ps.txn)) {
+    const bool first = std::holds_alternative<NotInTxn>(ps.txn) || std::holds_alternative<Added>(ps.txn);
+    if (first) {
         txnEnroll_(ps);
-        ps.txn = AddFailed{static_cast<uint16_t>(rpc::ErrorCode::OutOfOrderSequence)};
+        ps.txn = AddFailed{kOos};
     }
-    poison_(OpStatus::BrokerError, static_cast<uint16_t>(rpc::ErrorCode::OutOfOrderSequence), AbortKind::BumpEpoch);
-    std::fprintf(stderr,
-                 "ProducerImpl: topic=%d part=%d transactional sequences must restart: the transaction can only "
-                 "abort (its epoch bump restarts them)\n",
-                 ps.topicId, ps.partition);
+    poison_(OpStatus::BrokerError, kOos, AbortKind::BumpEpoch);
+    // Fix round 1 (I2): every batch still in flight here carries the old sequences, which can never be restarted
+    // in place - re-sent, each would only meet the same gap until its delivery timeout, and the abort would wait for
+    // it.  They fail now with the transaction's status (each record exactly once: the slot is released, a late
+    // answer finds nothing); the abort hides whatever reached the log and its epoch bump fences the rest.
+    const TxnOutcome o = txnRefusal_();
+    ps.inflight.forEachLive([&](InFlightBatch& b) { failBatch_(ps, b, o.status, o.errorCode); });
+    ps.resendParked = false;
+    ps.laneWait     = false;
+    ps.routeResend  = false;
+    if (first) {   // one line per partition per transaction (a reset can repeat while the transaction aborts)
+        std::fprintf(stderr,
+                     "ProducerImpl: topic=%d part=%d transactional sequences must restart: the transaction can only "
+                     "abort (its epoch bump restarts them)\n",
+                     ps.topicId, ps.partition);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------------
