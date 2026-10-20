@@ -2,6 +2,7 @@
 // single-threaded InvokerGateway.  The test thread is the only thread: every drive
 // loop is iteration-capped and advances an injected clock instead of sleeping.
 #include "../support/AckLedger.h"
+#include "../support/AllocCounter.h"
 #include "../support/TestCompletions.h"
 #include "../support/InvokerGateway.h"
 
@@ -944,4 +945,19 @@ TEST(InvokerClient, TxnProducerOpsAfterCloseFailPromptlyRegression) {
     EXPECT_EQ(calls, 0);
     EXPECT_THROW(tp.send(r.client.topic("t"), rc::Key(uint64_t{1}), std::span<const uint8_t>(kVal)),
                  std::logic_error);
+}
+
+// Phase 2b F Task 13 fix round 1 (seeded txn stress, duty-cycle allocation window): every MetadataRequest -
+// including the one a NotCoordinator answer triggers from a transactional producer's duty cycle - default-
+// constructed a whole session::SessionConfig (a std::string member) just to read the default response timeout.
+TEST(InvokerClientAllocRegression, MetadataRequestAllocatesNothingRegression) {
+    Rig r(invokerCfg(4810, 4811));
+    r.connect();
+    r.client.testSubmitMetadataRequest();   // warm: the first request
+    ASSERT_TRUE(r.drive([&] { return r.gw.metadataRequests > 1; }));
+    alloc_counter::startThisThread();
+    r.client.testSubmitMetadataRequest();
+    const long allocs = alloc_counter::stopThisThread();
+    EXPECT_EQ(allocs, 0) << "a MetadataRequest allocated " << allocs << " times";
+    EXPECT_TRUE(r.drive([&] { return r.gw.metadataRequests > 2; }));
 }

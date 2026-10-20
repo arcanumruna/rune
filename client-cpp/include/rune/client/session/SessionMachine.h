@@ -120,7 +120,10 @@ struct SessionConfig {
     // Timeouts / intervals (nanoseconds).
     int64_t connectTimeoutNs    = 5'000'000'000LL;   // 5 s  — give up one connect attempt
     int64_t keepaliveIntervalNs = 1'000'000'000LL;   // 1 s  — send keepalive this often
-    int64_t responseTimeoutNs   = 10'000'000'000LL;  // 10 s — stale session threshold
+    /// The default responseTimeoutNs, readable without constructing a SessionConfig (its std::string member
+    /// allocates - a hot caller must not build one to read a constant).
+    static constexpr int64_t kDefaultResponseTimeoutNs = 10'000'000'000LL;
+    int64_t responseTimeoutNs   = kDefaultResponseTimeoutNs;  // 10 s — stale session threshold
     /// A10: correlationId of this session's keepalive Ping.  The agent gives each session its own negative
     /// value so the Pong is credited to exactly the session it answers (broker session ids are per node and
     /// collide across nodes; application pings use ids >= 1).

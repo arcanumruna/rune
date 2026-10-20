@@ -5914,7 +5914,7 @@ void Client::tickMetadataRefresh() noexcept {
 
 void Client::noteMetadataSent_() noexcept {
     const int64_t timeoutNs = cfg_.responseTimeoutNs > 0 ? cfg_.responseTimeoutNs
-                                                         : session::SessionConfig{}.responseTimeoutNs;
+                                                         : session::SessionConfig::kDefaultResponseTimeoutNs;
     metadataAnswerByNs_ = now() + timeoutNs;
 }
 
