@@ -139,9 +139,10 @@ int64_t maxRecordsPerPassFor(const ViewInstance& inst, std::size_t maxMsg) {
     std::size_t perRecord = 0;
     if (inst.agg) {
         fixed += kCheckpointV2HeaderBytes + 3 * kCheckpointV2TableHeaderBytes;
-        perRecord = 1 * (kCheckpointEntryHeaderBytes + inst.agg->layout.contributorRow.rowLen) +
-                    2 * (kCheckpointEntryHeaderBytes + inst.agg->layout.groupRow.rowLen) +
-                    2 * (kCheckpointEntryHeaderBytes + inst.layout.rowLen);
+        const AggDirtyBound b = aggDirtyBoundPerRecord(inst.agg->layout);
+        perRecord = b.contributorRows * (kCheckpointEntryHeaderBytes + inst.agg->layout.contributorRow.rowLen) +
+                    b.groupRows * (kCheckpointEntryHeaderBytes + inst.agg->layout.groupRow.rowLen) +
+                    b.viewRows * (kCheckpointEntryHeaderBytes + inst.layout.rowLen);
     } else {
         fixed += kCheckpointV1HeaderBytes;
         perRecord = kCheckpointEntryHeaderBytes + inst.layout.rowLen;

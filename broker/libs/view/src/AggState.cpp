@@ -1,4 +1,5 @@
-// libs/view/src/AggState.cpp — see AggState.h.
+
+// broker/libs/view/src/AggState.cpp — see AggState.h.
 #include <rune/view/AggState.h>
 
 #include <algorithm>
@@ -7,11 +8,11 @@ namespace rune::view {
 
 namespace {
 
-std::optional<rune::codec::PrimType> srcType(const rune::codec::Descriptor& d, uint16_t id) {
+const rune::codec::FieldDescriptor* srcField(const rune::codec::Descriptor& d, uint16_t id) {
     for (const auto& f : d.fields) {
-        if (f.id == id) return f.type;
+        if (f.id == id) return &f;
     }
-    return std::nullopt;
+    return nullptr;
 }
 
 AccKind accKindOf(rune::codec::PrimType t) noexcept {
@@ -24,12 +25,17 @@ AccKind accKindOf(rune::codec::PrimType t) noexcept {
     }
 }
 
+bool isLastRule(MergeRule r) noexcept { return r == MergeRule::Last || r == MergeRule::LastNonNull; }
+bool isExtremeRule(MergeRule r) noexcept { return r == MergeRule::Min || r == MergeRule::Max; }
+
 } // namespace
 
 bool isAggregateView(const CompiledViewPlan& plan) noexcept {
     return std::any_of(plan.output.begin(), plan.output.end(),
                        [](const CompiledField& f) { return f.rule != MergeRule::Replace; });
 }
+
+bool needsContributorList(MergeRule r) noexcept { return isExtremeRule(r) || isLastRule(r); }
 
 std::optional<AggLayout> buildAggLayout(const CompiledViewPlan& plan,
                                         const rune::codec::Descriptor& evolvingSrc) {
@@ -47,21 +53,50 @@ std::optional<AggLayout> buildAggLayout(const CompiledViewPlan& plan,
         af.srcFieldId = f.srcFieldId;
         af.kind       = AccKind::None;
         af.input      = kNoSourceField;
+        af.cache      = kNoCache;
+        af.srcType    = f.type;
         if (f.rule != MergeRule::CountAll) {
-            const auto t = srcType(evolvingSrc, f.srcFieldId);
-            if (!t) return std::nullopt;
-            af.input = a.numInputs++;
-            if (f.rule == MergeRule::Sum || f.rule == MergeRule::Avg) af.kind = accKindOf(*t);
+            const rune::codec::FieldDescriptor* sd = srcField(evolvingSrc, f.srcFieldId);
+            if (sd == nullptr) return std::nullopt;
+            af.input   = a.numInputs++;
+            af.srcType = sd->type;
+            a.inputWidth.push_back(isLastRule(f.rule)
+                                       ? static_cast<uint16_t>(rune::codec::fieldWidth(*sd))
+                                       : uint16_t{8});
+            if (f.rule == MergeRule::Sum || f.rule == MergeRule::Avg || isExtremeRule(f.rule))
+                af.kind = accKindOf(sd->type);
+            if (isExtremeRule(f.rule)) af.cache = a.numCached++;
+            if (needsContributorList(f.rule)) a.linked = true;
         }
         a.fields.push_back(af);
     }
-    a.contribNullOff        = 8;
-    a.contribValOff         = 8 + (static_cast<uint32_t>(a.numInputs) + 7) / 8;
-    a.contributorRow.rowLen = a.contribValOff + 8u * a.numInputs;
-    a.groupAccOff           = 8;
-    a.groupNonNullOff       = 8 + 16u * static_cast<uint32_t>(a.fields.size());
-    a.groupRow.rowLen       = a.groupNonNullOff + 8u * static_cast<uint32_t>(a.fields.size());
+    const uint32_t nFields = static_cast<uint32_t>(a.fields.size());
+    a.contribPrevOff = a.linked ? 8u : 0u;
+    a.contribNextOff = a.linked ? 16u : 0u;
+    a.contribNullOff = a.linked ? 24u : 8u;
+    a.contribValOff  = a.contribNullOff + (static_cast<uint32_t>(a.numInputs) + 7) / 8;
+    uint32_t off = a.contribValOff;
+    a.inputOff.reserve(a.inputWidth.size());
+    for (const uint16_t w : a.inputWidth) {
+        a.inputOff.push_back(off);
+        off += w;
+    }
+    a.contributorRow.rowLen = off;
+    a.groupAccOff     = 8;
+    a.groupNonNullOff = 8 + 16u * nFields;
+    const uint32_t nnEnd = a.groupNonNullOff + 8u * nFields;
+    if (a.linked) {
+        a.groupHeadOff      = nnEnd;
+        a.groupCacheOff     = nnEnd + 8;
+        a.groupRow.rowLen   = a.groupCacheOff + kCacheEntryBytes * a.numCached;
+    } else {
+        a.groupRow.rowLen   = nnEnd;
+    }
     return a;
+}
+
+AggDirtyBound aggDirtyBoundPerRecord(const AggLayout& a) noexcept {
+    return AggDirtyBound{a.linked ? 4u : 1u, 2u, 2u};
 }
 
 } // namespace rune::view

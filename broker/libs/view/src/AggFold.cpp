@@ -41,7 +41,7 @@ struct Ctx {
     uint8_t* acc(uint8_t* g, size_t i) const noexcept { return g + agg.groupAccOff + 16 * i; }
     uint8_t* nn(uint8_t* g, size_t i) const noexcept { return g + agg.groupNonNullOff + 8 * i; }
     const uint8_t* val(const uint8_t* c, uint16_t input) const noexcept {
-        return c + agg.contribValOff + 8u * input;
+        return c + agg.inputOff[input];
     }
 
     // Applies one contributor row to its group: sign = +1 add, -1 retract.
@@ -247,12 +247,12 @@ FoldStats foldAggregateBatch(const CompiledViewPlan& /*plan*/, const RowLayout& 
                     ++stats.aggNonFinite;
                 }
                 setNullBit(cr, agg.contribNullOff, f.input, !in.present);
-                uint8_t* dst = cr + agg.contribValOff + 8u * f.input;
-                if (!in.present)                  { storeU64(dst, 0); }
+                uint8_t* dst = cr + agg.inputOff[f.input];
+                if (!in.present)                  { std::memset(dst, 0, agg.inputWidth[f.input]); }
                 else if (f.kind == AccKind::Signed)   { std::memcpy(dst, &in.i, 8); }
                 else if (f.kind == AccKind::Unsigned) { storeU64(dst, in.u); }
                 else if (f.kind == AccKind::Float)    { storeF64(dst, in.f); }
-                else                                  { storeU64(dst, 0); }   // Count(col)
+                else                                  { std::memset(dst, 0, agg.inputWidth[f.input]); }   // Count(col); Last/Min/Max placeholder (Task 5 folds them)
             }
             uint8_t* gr = cx.applyContribution(cr, +1);
             cx.emit(g, gr);
