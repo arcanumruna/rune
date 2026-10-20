@@ -1,6 +1,8 @@
 // FilterIndexTest.cpp — Phase 2c Task 6: FilterIndex (value -> members, open addressing, capped).
 #include "rune/node/filter/FilterIndex.h"
 
+#include "support/AllocWindow.h"
+
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -12,26 +14,6 @@
 #include <random>
 #include <vector>
 
-#ifdef RUNE_FILTER_ENGINE_ALLOC_COUNT
-namespace {
-bool     gArmed  = false;   // single-threaded test binary: plain globals
-uint64_t gAllocs = 0;
-}  // namespace
-void* operator new(std::size_t n) {
-    if (gArmed) ++gAllocs;
-    if (void* p = std::malloc(n ? n : 1)) return p;
-    throw std::bad_alloc();
-}
-void* operator new[](std::size_t n) {
-    if (gArmed) ++gAllocs;
-    if (void* p = std::malloc(n ? n : 1)) return p;
-    throw std::bad_alloc();
-}
-void operator delete(void* p) noexcept { std::free(p); }
-void operator delete(void* p, std::size_t) noexcept { std::free(p); }
-void operator delete[](void* p) noexcept { std::free(p); }
-void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
-#endif
 
 using rune::codec::FilterKey;
 using rune::node::filter::FilterIndex;
@@ -180,17 +162,13 @@ TEST_P(FilterIndexModel, ModelCheckedAgainstAMultimap) {
 }
 INSTANTIATE_TEST_SUITE_P(Seeds, FilterIndexModel, ::testing::Range(1u, 17u));
 
-#ifdef RUNE_FILTER_ENGINE_ALLOC_COUNT
 TEST(FilterIndex, LookupAllocatesNothing) {
     FilterIndex ix;
     ix.init(256, 256);
     for (uint64_t i = 0; i < 200; ++i) ASSERT_TRUE(ix.add(FilterKey{0, i}, static_cast<uint32_t>(i)));
     uint64_t sink = 0;
-    gAllocs = 0;
-    gArmed  = true;
+    rune::testing::AllocWindow window;
     for (uint64_t i = 0; i < 100000; ++i) ix.forEach(FilterKey{0, i % 400}, [&](uint32_t m) { sink += m; });
-    gArmed = false;
-    EXPECT_EQ(gAllocs, 0u);
+    EXPECT_EQ(window.count(), 0u);
     EXPECT_GT(sink, 0u);
 }
-#endif
