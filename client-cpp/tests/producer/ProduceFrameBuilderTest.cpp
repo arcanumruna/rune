@@ -115,7 +115,7 @@ TEST(ProduceFrameBuilder, SwapHandsTheFrameOverWithoutCopyingAndStartsEmpty) {
     for (int i = 0; i < 100; ++i) fb.append("k", std::string(500, 'v'), 2);
     const std::size_t len = fb.seal(rpc::Produce{});
     const uint8_t* storage = fb.data();
-    std::vector<uint8_t> retained;
+    rune::client::producer::FrameBytes retained;  // the in-flight slot buffer type
     fb.swapFrameInto(retained);
     EXPECT_EQ(retained.data(), storage);  // the encoded frame itself, not a copy
     EXPECT_EQ(retained.size(), len);
@@ -178,4 +178,56 @@ TEST(ProduceFrameBuilder, ReserveExtraKeepsDataStableAcrossReservations) {
     for (int i = 0; i < 10; ++i) (void)fb.reserveRecord("", 100, 0);
     EXPECT_EQ(fb.data(), d) << "reservations inside reserveExtra() never reallocate";
     EXPECT_EQ(fb.recordCount(), 10);
+}
+
+// Task 10 regression: the frame buffer (FrameBytes) no longer zeroes growth, so
+// every byte of a sent frame must be WRITTEN — header, record prefixes, values,
+// headerCount.  Fill recycled storage with garbage (the in-flight slot buffer a
+// swap hands back, and the tail a rollback leaves behind), then build through
+// append + reserveRecord; the sealed frame must equal the protocol encoders'.
+TEST(ProduceFrameBuilderRegression, GarbageInRecycledStorageNeverReachesTheSealedFrameRegression) {
+    std::mt19937_64 rng(0x7A10);
+    ProduceFrameBuilder fb(0, 1'700'000'000'000);
+    for (int iter = 0; iter < 100; ++iter) {
+        const int64_t base = 1'700'000'000'000 + iter;
+        // Recycle: hand the frame out and take back a garbage-filled buffer
+        // whose capacity covers the next batch (no reallocation hides it).
+        rune::client::producer::FrameBytes slot;
+        slot.resize(64 * 1024);
+        for (auto& c : slot) c = static_cast<uint8_t>(rng() | 1u);
+        fb.swapFrameInto(slot);
+        fb.reset(0, base);
+        {   // A rolled-back claim leaves garbage past the mark too.
+            const ProduceFrameBuilder::Mark m = fb.mark();
+            const std::size_t at = fb.reserveRecord("x", 900, base);
+            std::memset(fb.data() + at, 0xEE, 900);
+            fb.rollback(m);
+        }
+        rune::protocol::RecordBatchBuilder ref(0, base);
+        const int recs = 1 + static_cast<int>(rng() % 20);
+        for (int r = 0; r < recs; ++r) {
+            const std::string key = (rng() % 3 == 0) ? std::string() : randomBytes(rng, rng() % 17);
+            const std::string val = randomBytes(rng, rng() % 2000);
+            const int64_t ts = base + static_cast<int64_t>(rng() % 100'000);
+            if (r % 2 == 0) {
+                fb.append(key, val, ts);
+            } else {
+                const std::size_t at = fb.reserveRecord(key, val.size(), ts);
+                std::memcpy(fb.data() + at, val.data(), val.size());
+            }
+            ref.append(key, val, ts);
+        }
+        const rpc::Produce hdr = header(rng);
+        fb.setProducerId(hdr.producerId);       ref.setProducerId(hdr.producerId);
+        fb.setProducerEpoch(hdr.producerEpoch); ref.setProducerEpoch(hdr.producerEpoch);
+        fb.setBaseSequence(hdr.baseSequence);   ref.setBaseSequence(hdr.baseSequence);
+        const std::size_t len = fb.seal(hdr);
+        rune::client::transport::sealFrame(fb.data(), len, ProduceFrameBuilder::frameCrc());
+        const std::vector<uint8_t> batch = ref.build();
+        rpc::Produce whole = hdr;
+        whole.recordBatch = batch;
+        std::vector<uint8_t> expect(whole.encodedSize());
+        ASSERT_EQ(whole.encode(expect.data()), expect.size());
+        ASSERT_EQ(std::vector<uint8_t>(fb.data(), fb.data() + len), expect) << "iter=" << iter;
+    }
 }

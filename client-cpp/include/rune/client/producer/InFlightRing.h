@@ -5,6 +5,8 @@
 // batch allocates.  A ProduceResponse is matched to its slot by direct index.
 #pragma once
 
+#include <rune/client/producer/FrameBytes.h>
+
 #include <cstdint>
 #include <vector>
 
@@ -109,7 +111,7 @@ struct InFlightBatch {
     uint8_t  laneFirstTag  = 0;
     uint16_t laneOut       = 0;
     uint16_t staleLaneOut  = 0;
-    std::vector<uint8_t> wireFrame;  ///< encoded Produce frame; capacity reused
+    FrameBytes wireFrame;  ///< encoded Produce frame; capacity reused (swaps with the builder's)
 };
 
 class InFlightRing {

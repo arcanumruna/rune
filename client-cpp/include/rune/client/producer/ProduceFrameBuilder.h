@@ -21,6 +21,7 @@
 // tests/producer/ProduceFrameBuilderTest.cpp.  Single-threaded (duty thread).
 #pragma once
 
+#include <rune/client/producer/FrameBytes.h>
 #include <rune/client/transport/FrameCrc.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/Varint.h>
@@ -154,7 +155,7 @@ public:
     /// that buffer's storage for the next batch — O(1), no copy.  Leaves the
     /// builder reset (empty batch, same baseOffset / timestamps unchanged until
     /// the caller's reset()).
-    void swapFrameInto(std::vector<uint8_t>& retained) {
+    void swapFrameInto(FrameBytes& retained) {
         frame_.swap(retained);
         // Warm-up only: the slot's previous buffer may be smaller than a batch.
         if (frame_.capacity() < retained.capacity()) frame_.reserve(retained.capacity());
@@ -196,7 +197,7 @@ private:
         for (int i = 0; i < bytes; ++i) p[i] = static_cast<uint8_t>(v >> (8 * i));
     }
 
-    std::vector<uint8_t> frame_;
+    FrameBytes frame_;  // growth is not zeroed: every byte is written before a send
     int64_t baseOffset_    = 0;
     int64_t baseTimestamp_ = 0;
     int64_t maxTimestamp_  = 0;

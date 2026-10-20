@@ -9,9 +9,15 @@
 //               invoker : one thread, Direct ingress, a flush pass every 64
 //                        records (Invoker mode; the pass is not timed).
 // Per-record latency = the app-side call(s) for one record including any
-// back-pressure retry (steady_clock around each record).  Allocations = global
-// operator new on THIS thread after a 10'000-record warm-up.  Exit 1 if a claim
-// form allocated (spec B: claim paths 0 allocations in steady state).
+// back-pressure retry (steady_clock around each record).  Under Rosetta the
+// clock ticks every ~41.7 ns, so p50/p99 are quantised; a second, amortised
+// phase therefore produces another N records with NO per-record clock reads and
+// times blocks of CLAIM_BLOCK (default 1024) records: blk_mean_ns /
+// blk_median_ns = ns per record over the blocks (Invoker blocks include the
+// owner's every-64 flush pass — the owner pays it).  Allocations = global
+// operator new on THIS thread after a 10'000-record warm-up, over both phases.
+// Exit 1 if a claim form allocated (spec B: claim paths 0 allocations in
+// steady state).
 #include "../tests/support/AllocCounter.h"
 #include "gen/position.gen.h"
 
@@ -116,13 +122,13 @@ int main() {
         else std::this_thread::yield();
     };
 
+    const int64_t block = std::max<int64_t>(1, envI64("CLAIM_BLOCK", 1024));
     std::vector<int64_t> lat(static_cast<std::size_t>(N));
+    std::vector<int64_t> blk(static_cast<std::size_t>(N / block));  // amortised phase: ns/record per block
     std::vector<uint8_t> scratch(PositionEncoder::kEncodedLength);  // "send": the caller's own buffer
     long allocs = 0;
-    for (int64_t i = 0; i < N; ++i) {
-        if (i == kWarm) alloc_counter::startThisThread();
+    auto produceOne = [&](int64_t i) {
         const Key key(i);
-        const int64_t t0 = nowNs();
         switch (mode) {
         case Mode::Send: {
             PositionEncoder e(scratch);
@@ -169,8 +175,24 @@ int main() {
             }
             break;
         }
+    };
+    // Phase 1: per-record latency.
+    for (int64_t i = 0; i < N; ++i) {
+        if (i == kWarm) alloc_counter::startThisThread();
+        const int64_t t0 = nowNs();
+        produceOne(i);
         lat[static_cast<std::size_t>(i)] = nowNs() - t0;
         if (invoker && (i & 63) == 63) impl.flushBatches(nowNs(), 1, sink);  // end of an owner pass (untimed)
+    }
+    // Phase 2: amortised — blocks of `block` records, one clock pair per block.
+    for (std::size_t b = 0; b < blk.size(); ++b) {
+        const int64_t first = N + static_cast<int64_t>(b) * block;
+        const int64_t t0    = nowNs();
+        for (int64_t i = first; i < first + block; ++i) {
+            produceOne(i);
+            if (invoker && (i & 63) == 63) impl.flushBatches(nowNs(), 1, sink);  // end of an owner pass
+        }
+        blk[b] = nowNs() - t0;
     }
     allocs = alloc_counter::stopThisThread();
     if (invoker) {
@@ -188,10 +210,22 @@ int main() {
     };
     const int64_t p50 = pct(0.50);
     const int64_t p99 = pct(0.99);
-    std::printf("RESULT mode=%s ingress=%s records=%lld p50_ns=%lld p99_ns=%lld allocs=%ld frames=%llu\n",
+    double blkMean = 0.0, blkMedian = 0.0;
+    if (!blk.empty()) {
+        long double sum = 0;
+        for (const int64_t v : blk) sum += v;
+        blkMean = static_cast<double>(sum / static_cast<long double>(blk.size()) / static_cast<long double>(block));
+        const std::size_t mid = blk.size() / 2;
+        std::nth_element(blk.begin(), blk.begin() + static_cast<std::ptrdiff_t>(mid), blk.end());
+        blkMedian = static_cast<double>(blk[mid]) / static_cast<double>(block);
+    }
+    // Fields after frames= are appended (Task 10) so existing parsers still work.
+    std::printf("RESULT mode=%s ingress=%s records=%lld p50_ns=%lld p99_ns=%lld allocs=%ld frames=%llu"
+                " blk_ops=%lld blocks=%zu blk_mean_ns=%.2f blk_median_ns=%.2f\n",
                 modeName.c_str(), invoker ? "invoker" : "thread", static_cast<long long>(N),
                 static_cast<long long>(p50), static_cast<long long>(p99), allocs,
-                static_cast<unsigned long long>(frames));
+                static_cast<unsigned long long>(frames), static_cast<long long>(block), blk.size(), blkMean,
+                blkMedian);
     const bool claimForm = mode == Mode::Claim || mode == Mode::TypedClaim;
     if (claimForm && allocs != 0) {
         std::fprintf(stderr, "GATE FAIL: %s allocated %ld times in steady state (spec B: 0)\n",

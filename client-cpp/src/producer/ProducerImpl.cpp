@@ -1350,6 +1350,34 @@ int ProducerImpl::drainRing(int64_t nowNs, int messageLimit) {
             aeron::util::index_t                 len) -> ControlledAction
         {
             const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + offset);
+            // Task 10 (perf): SEND_RECORD is the hot message — tested first, so the
+            // plain send path pays no compares for the rarer types below.
+            if (msgTypeId == kMsgSendRecord) [[likely]] {
+                const std::size_t sz = static_cast<std::size_t>(len);
+                if (sz < static_cast<std::size_t>(kRecHeaderSize)) return ControlledAction::CONTINUE;
+
+                const int32_t topicId   = readLE32(p, kRecTopicIdOff);
+                const int32_t partition = readLE32(p, kRecPartOff);
+                const uint8_t keyLen    = p[kRecKeyLenOff];
+                const uint8_t flags     = p[kRecFlagsOff];
+                const uint64_t ackHandle = static_cast<uint64_t>(readLE64(p, kRecCorrIdOff));
+                const uint32_t valueLen = readLE32u(p, kRecValLenOff);
+                // Agent-thread: record dequeued from the ring (gap ClientAppSend→here =
+                // app→agent ring handoff).  corr=ack handle (low bits); value=record bytes.
+                FLIGHT_RECORDER_MARK_VAL_PRODUCE(flight_recorder::Site::ClientAgentDrain,
+                                         static_cast<uint32_t>(ackHandle),
+                                         static_cast<double>(valueLen));
+
+                if (sz < static_cast<std::size_t>(kRecHeaderSize) + valueLen)
+                    return ControlledAction::CONTINUE;
+
+                const ControlledAction a =
+                    appendRecord_(topicId, partition, p + kRecKeyBytesOff, keyLen,
+                                  p + kRecValBytesOff, valueLen, flags, ackHandle, nowNs);
+                if (a == ControlledAction::ABORT) lastDrainStop_ = DrainStop::Blocked;
+                return a;
+            }
+
             if (msgTypeId == kMsgFlush) {
                 // F12: only dirty partitions have anything to flush (O(dirty)).
                 for (const uint32_t slot : dirty_) partitions_[slot]->flushRequested = true;
@@ -1393,31 +1421,7 @@ int ProducerImpl::drainRing(int64_t nowNs, int messageLimit) {
                 return ControlledAction::CONTINUE;
             }
 
-            if (msgTypeId != kMsgSendRecord) return ControlledAction::CONTINUE;
-
-            const std::size_t sz = static_cast<std::size_t>(len);
-            if (sz < static_cast<std::size_t>(kRecHeaderSize)) return ControlledAction::CONTINUE;
-
-            const int32_t topicId   = readLE32(p, kRecTopicIdOff);
-            const int32_t partition = readLE32(p, kRecPartOff);
-            const uint8_t keyLen    = p[kRecKeyLenOff];
-            const uint8_t flags     = p[kRecFlagsOff];
-            const uint64_t ackHandle = static_cast<uint64_t>(readLE64(p, kRecCorrIdOff));
-            const uint32_t valueLen = readLE32u(p, kRecValLenOff);
-            // Agent-thread: record dequeued from the ring (gap ClientAppSend→here =
-            // app→agent ring handoff).  corr=ack handle (low bits); value=record bytes.
-            FLIGHT_RECORDER_MARK_VAL_PRODUCE(flight_recorder::Site::ClientAgentDrain,
-                                     static_cast<uint32_t>(ackHandle),
-                                     static_cast<double>(valueLen));
-
-            if (sz < static_cast<std::size_t>(kRecHeaderSize) + valueLen)
-                return ControlledAction::CONTINUE;
-
-            const ControlledAction a =
-                appendRecord_(topicId, partition, p + kRecKeyBytesOff, keyLen,
-                              p + kRecValBytesOff, valueLen, flags, ackHandle, nowNs);
-            if (a == ControlledAction::ABORT) lastDrainStop_ = DrainStop::Blocked;
-            return a;
+            return ControlledAction::CONTINUE;  // unknown type: skipped
         },
         messageLimit);
 }
@@ -1430,7 +1434,11 @@ int ProducerImpl::drainRing(int64_t nowNs, int messageLimit) {
 // ---------------------------------------------------------------------------
 
 void ProducerImpl::ensureBuilder_(PartitionState& ps) {
-    if (ps.builder) return;
+    if (ps.builder) [[likely]] return;
+    createBuilder_(ps);
+}
+
+void ProducerImpl::createBuilder_(PartitionState& ps) {
     // Created ONCE per partition; reused (reset in place) across batches so
     // there is no per-batch heap allocation.
     const int64_t baseWall = wallMs();
@@ -1485,14 +1493,16 @@ rune::client::detail::ControlledAction ProducerImpl::admitRecord_(PartitionState
     if (frameCapped && index == 0) {
         const int32_t soloContrib = recordBodyContrib(static_cast<int32_t>(keyLen), static_cast<int32_t>(valueLen),
                                                       /*tsDelta=*/0, /*offsetDelta=*/0);
-        if (soloContrib > effCap) {
-            std::fprintf(stderr,
-                "ProducerImpl: single record wire=%d exceeds maxFrameBytes=%d "
-                "(topic=%d part=%d); emitting oversize frame (broker may reject)\n",
-                soloContrib, effCap, ps.topicId, ps.partition);
-        }
+        if (soloContrib > effCap) [[unlikely]] warnOversizeRecord_(ps, soloContrib);
     }
     return ControlledAction::CONTINUE;
+}
+
+void ProducerImpl::warnOversizeRecord_(const PartitionState& ps, int32_t soloContrib) const {
+    std::fprintf(stderr,
+        "ProducerImpl: single record wire=%d exceeds maxFrameBytes=%d "
+        "(topic=%d part=%d); emitting oversize frame (broker may reject)\n",
+        soloContrib, effCap_, ps.topicId, ps.partition);
 }
 
 void ProducerImpl::noteAppended_(PartitionState& ps, int32_t firstIndex, int32_t count, uint8_t flags,
@@ -1806,7 +1816,7 @@ bool ProducerImpl::encodeAndSendTier2(
     // in-flight slot it will claim (free: the caller checked canFlight_), so the
     // retained retransmit frame is the encoded frame — no second copy.
     // acks=None retains nothing: the scratch buffer.
-    std::vector<uint8_t>& out = awaitAck ? ps.inflight.peekNext().wireFrame : encodeScratch_;
+    FrameBytes& out = awaitAck ? ps.inflight.peekNext().wireFrame : encodeScratch_;
     out.resize(needed);
     const std::size_t written = msg.encode(out.data());
     if (written == 0) return false;
@@ -2793,7 +2803,7 @@ int ProducerImpl::retransmitStalled(int64_t nowNs, const Sink& sink)
 namespace {
 constexpr std::size_t kHeaderSessionIdOff = 8; // MessageHeader.sessionId LE64
 
-inline void restampSessionId(std::vector<uint8_t>& frame, int64_t sessionId) noexcept {
+inline void restampSessionId(FrameBytes& frame, int64_t sessionId) noexcept {
     if (frame.size() < kHeaderSessionIdOff + 8) return;
     const uint64_t u = static_cast<uint64_t>(sessionId);
     for (int i = 0; i < 8; ++i)

@@ -112,12 +112,23 @@ namespace detail {
 template <class E>
 struct TypedClaimSlot {
     Claim                                  claim;
-    std::array<uint8_t, E::kEncodedLength> scratch{};  // a refused claim's encoder writes here
+    // A refused claim's encoder writes here.  Deliberately NOT zero-filled
+    // (Task 10: that was a per-claim memset on the granted path too); it is
+    // only ever written, never sent or read back.
+    std::array<uint8_t, E::kEncodedLength> scratch;
     explicit TypedClaimSlot(Claim&& c) noexcept : claim(std::move(c)) {}
+    /// Task 10 (perf): the claim is constructed IN the slot from `make()`'s
+    /// prvalue (guaranteed elision) — no Claim move per typed claim.
+    template <class Make>
+        requires std::is_invocable_r_v<Claim, Make&>
+    explicit TypedClaimSlot(Make& make) noexcept(noexcept(make())) : claim(make()) {}
     [[nodiscard]] std::span<uint8_t> target() noexcept {
         return claim ? claim.buffer() : std::span<uint8_t>(scratch.data(), scratch.size());
     }
 };
+
+/// Tag: TypedClaim builds its Claim in place from a factory.
+struct ClaimInPlace {};
 
 template <class K>
 struct IsCharArray : std::false_type {};
@@ -136,9 +147,14 @@ public:
     template <class... K>
     TypedClaim(Claim&& c, uint16_t boundVersion, const K&... keyValue)
         : Slot(std::move(c)), E(Slot::target(), keyValue...) {
-        const std::span<uint8_t> t = Slot::target();
-        t[2] = static_cast<uint8_t>(boundVersion & 0xffu);
-        t[3] = static_cast<uint8_t>((boundVersion >> 8) & 0xffu);
+        stampVersion_(boundVersion);
+    }
+    /// The claim built in place from `make()` (TypedTopic::claim's form).
+    template <class Make, class... K>
+        requires std::is_invocable_r_v<Claim, Make&>
+    TypedClaim(detail::ClaimInPlace, Make&& make, uint16_t boundVersion, const K&... keyValue)
+        : Slot(make), E(Slot::target(), keyValue...) {
+        stampVersion_(boundVersion);
     }
     TypedClaim(const TypedClaim&)            = delete;
     TypedClaim& operator=(const TypedClaim&) = delete;
@@ -150,6 +166,13 @@ public:
     /// Publish (see Claim::commit).  Destruction without commit() aborts.
     bool commit() noexcept { return Slot::claim.commit(); }
     void abort() noexcept { Slot::claim.abort(); }
+
+private:
+    void stampVersion_(uint16_t boundVersion) noexcept {
+        const std::span<uint8_t> t = Slot::target();
+        t[2] = static_cast<uint8_t>(boundVersion & 0xffu);
+        t[3] = static_cast<uint8_t>((boundVersion >> 8) & 0xffu);
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -250,7 +273,9 @@ public:
         using K = typename E::KeyType;
         static_assert(std::is_trivially_copyable_v<K> && sizeof(K) <= Key::kMaxInline,
                       "TypedTopic::claim: the key field cannot be a record key without truncation");
-        return TypedClaim<E>(producer_.tryClaim(topic_, Key(keyValue), E::kEncodedLength), version_, keyValue);
+        return TypedClaim<E>(detail::ClaimInPlace{},
+                             [&] { return producer_.tryClaim(topic_, Key(keyValue), E::kEncodedLength); }, version_,
+                             keyValue);
     }
 
     /// string(N) key field.  For N <= Key::kMaxInline the record key is the N
@@ -279,7 +304,8 @@ public:
         const std::size_t keyLen = N <= Key::kMaxInline ? N : keyValue.size();
         std::memcpy(kb.data(), keyValue.data(), keyValue.size() < keyLen ? keyValue.size() : keyLen);
         return TypedClaim<E>(
-            producer_.tryClaim(topic_, Key(std::span<const uint8_t>(kb.data(), keyLen)), E::kEncodedLength),
+            detail::ClaimInPlace{},
+            [&] { return producer_.tryClaim(topic_, Key(std::span<const uint8_t>(kb.data(), keyLen)), E::kEncodedLength); },
             version_, field);
     }
 
@@ -289,7 +315,8 @@ public:
         requires requires { typename U::ClaimEncoder; } && (!U::ClaimEncoder::kHasKey)
     [[nodiscard]] TypedClaim<typename U::ClaimEncoder> claim() {
         using E = typename U::ClaimEncoder;
-        return TypedClaim<E>(producer_.tryClaim(topic_, Key{}, E::kEncodedLength), version_);
+        return TypedClaim<E>(detail::ClaimInPlace{},
+                             [&] { return producer_.tryClaim(topic_, Key{}, E::kEncodedLength); }, version_);
     }
 
     // ---- Accessors / test seams ------------------------------------------------

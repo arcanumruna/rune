@@ -40,43 +40,21 @@ void ClaimCredit::abort(const ClaimOpen& o) noexcept {
 
 }  // namespace detail
 
-Claim::Claim(Claim&& o) noexcept : state_(std::exchange(o.state_, Settled{})) {}
-
-Claim& Claim::operator=(Claim&& o) noexcept {
-    if (this != &o) {
-        abort();
-        state_ = std::exchange(o.state_, Settled{});
-    }
-    return *this;
-}
-
-Claim::~Claim() { abort(); }
-
-SendResult Claim::result() const noexcept {
-    if (const auto* r = std::get_if<Refused>(&state_)) return r->why;
-    return SendResult::Ok;
-}
-
-std::span<uint8_t> Claim::buffer() const noexcept {
-    if (const auto* o = std::get_if<Open>(&state_)) return {o->value, o->len};
-    return {};
-}
-
-bool Claim::commit() noexcept {
-    const auto* o = std::get_if<Open>(&state_);
-    if (o == nullptr) return false;
-    const detail::ClaimOpen core = o->core;
+// Claim's accessors, move and the open-test of commit() / abort() / ~Claim
+// are inline in Producer.h (Task 10); only settling an Open claim is here.
+// The open state is read in place and the Claim marked Settled after the
+// settle call (no copy of it); nothing a settle calls can reach this Claim.
+bool Claim::commitOpen_() noexcept {
+    const detail::ClaimOpen& core = std::get_if<Open>(&state_)->core;  // callers checked Open
     if (!detail::ClaimCredit::mayCommit(core)) return false;  // stays open: not this thread's to settle
+    const bool ok = detail::ClaimCredit::commit(core);
     state_ = Settled{};
-    return detail::ClaimCredit::commit(core);
+    return ok;
 }
 
-void Claim::abort() noexcept {
-    const auto* o = std::get_if<Open>(&state_);
-    if (o == nullptr) return;
-    const detail::ClaimOpen core = o->core;
+void Claim::abortOpen_() noexcept {
+    detail::ClaimCredit::abort(std::get_if<Open>(&state_)->core);  // callers checked Open
     state_ = Settled{};
-    detail::ClaimCredit::abort(core);
 }
 
 BatchClaim::BatchClaim(BatchClaim&& o) noexcept : state_(std::exchange(o.state_, Settled{})) {}

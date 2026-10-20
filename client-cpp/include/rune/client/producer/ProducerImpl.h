@@ -1191,13 +1191,21 @@ private:
     rune::client::detail::ControlledAction appendRecord_(int32_t topicId, int32_t partition,
         const uint8_t* keyBytes, uint8_t keyLen, const uint8_t* valBytes, uint32_t valueLen,
         uint8_t flags, uint64_t ackHandle, int64_t nowNs);
+    // Task 10 (perf): the per-record helpers below are force-inlined into the
+    // send path (appendRecord_) — out of line they cost ~4 ns/record on the
+    // plain send path (two extra calls + reloads per record).  Their rare
+    // branches (builder creation, the oversize-record warning) are cold,
+    // non-inlined helpers so the inlined body stays small.
     /// Create the partition's builder once (reused across batches).
-    void ensureBuilder_(PartitionState& ps);
+    [[gnu::always_inline]] void ensureBuilder_(PartitionState& ps);
+    [[gnu::cold, gnu::noinline]] void createBuilder_(PartitionState& ps);
     /// Every check before ONE record may join `ps`'s builder (Tier-2 queued
     /// ahead, frame cap, batchBytes, batchRecords), the builder created and the
     /// record's ack-ring room reserved.  ABORT = back-pressure (nothing changed).
-    rune::client::detail::ControlledAction admitRecord_(PartitionState& ps, uint8_t keyLen, uint32_t valueLen,
-                                                        uint8_t flags, uint64_t ackHandle);
+    [[gnu::always_inline]] rune::client::detail::ControlledAction admitRecord_(PartitionState& ps, uint8_t keyLen,
+                                                                               uint32_t valueLen, uint8_t flags,
+                                                                               uint64_t ackHandle);
+    [[gnu::cold, gnu::noinline]] void warnOversizeRecord_(const PartitionState& ps, int32_t soloContrib) const;
     /// Same for a claimBatch of n x recLen: it joins a non-empty builder only
     /// when it fits whole (else flushRequested + ABORT); builder capacity for
     /// all n is reserved so appending them cannot throw (all or none).
@@ -1209,8 +1217,8 @@ private:
     /// Accounting after `count` records starting at offsetDelta `firstIndex`
     /// were written into ps.builder: batch clock, dirty list, the ack handle of
     /// an acked single record (room reserved by admitRecord_), wire size, count.
-    void noteAppended_(PartitionState& ps, int32_t firstIndex, int32_t count, uint8_t flags, uint64_t ackHandle,
-                       int64_t nowNs);
+    [[gnu::always_inline]] void noteAppended_(PartitionState& ps, int32_t firstIndex, int32_t count, uint8_t flags,
+                                              uint64_t ackHandle, int64_t nowNs);
     /// claimBatch's size rules, shared by both ingress modes.
     [[nodiscard]] SendResult checkBatchClaim_(const Key& key, uint32_t n, uint32_t recLen) const noexcept;
 
@@ -1456,7 +1464,7 @@ private:
     // retained; grown once, steady-state = no alloc).  Tier-1 batches are built
     // in place (ProduceFrameBuilder) and acked Tier-2 batches are encoded into
     // their in-flight slot's retained buffer (backlog B4).
-    std::vector<uint8_t> encodeScratch_;
+    FrameBytes encodeScratch_;
 
     // Per-instance producerId (F5 fix): drawn fresh at construction by
     // generateProducerId() (ProducerImpl.cpp) — 63 random bits mixed from

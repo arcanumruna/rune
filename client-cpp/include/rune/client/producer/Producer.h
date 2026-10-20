@@ -61,6 +61,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <utility>
 #include <variant>
 
 namespace rune::client {
@@ -299,34 +300,57 @@ struct ClaimCredit {
 
 class Claim {
 public:
+    // Task 10 (perf): the per-record accessors, the move and the destructor's
+    // "is it still open" test are inline — a claim pays ONE out-of-line call to
+    // settle (commitOpen_ / abortOpen_), not one per accessor, move and
+    // destruction of a moved-from or settled Claim.
     Claim() noexcept = default;  ///< refused: InvalidTopic
-    Claim(Claim&& o) noexcept;
-    Claim& operator=(Claim&& o) noexcept;  ///< aborts this claim first if it is open
+    Claim(Claim&& o) noexcept : state_(std::exchange(o.state_, Settled{})) {}
+    Claim& operator=(Claim&& o) noexcept {  ///< aborts this claim first if it is open
+        if (this != &o) {
+            abort();
+            state_ = std::exchange(o.state_, Settled{});
+        }
+        return *this;
+    }
     Claim(const Claim&) = delete;
     Claim& operator=(const Claim&) = delete;
-    ~Claim();  ///< aborts an open claim
+    ~Claim() { abort(); }  ///< aborts an open claim
 
     /// True while open (granted, neither committed nor aborted).
     [[nodiscard]] explicit operator bool() const noexcept { return std::holds_alternative<Open>(state_); }
     /// Ok if the claim was granted; otherwise why it was refused.
-    [[nodiscard]] SendResult result() const noexcept;
+    [[nodiscard]] SendResult result() const noexcept {
+        if (const auto* r = std::get_if<Refused>(&state_)) return r->why;
+        return SendResult::Ok;
+    }
     /// The record's value bytes (exactly the claimed length); empty unless open.
-    [[nodiscard]] std::span<uint8_t> buffer() const noexcept;
+    [[nodiscard]] std::span<uint8_t> buffer() const noexcept {
+        if (const auto* o = std::get_if<Open>(&state_)) [[likely]] return {o->value, o->len};
+        return {};
+    }
     /// Publish the record.  True: accepted, exactly like an Ok send (its ack /
     /// BatchAck follows).  False: nothing was open, or the claim was abandoned
     /// under it (Invoker: its partition was failed / the producer closed;
     /// Thread: Client close released it) — nothing is sent, nothing completes.
     /// A claim carrying Completions credit committed off that queue's owner
     /// thread returns false and STAYS OPEN (settle it on the owner thread).
-    bool commit() noexcept;
+    bool commit() noexcept {
+        if (!std::holds_alternative<Open>(state_)) [[unlikely]] return false;
+        return commitOpen_();
+    }
     /// Discard the record: nothing is sent, nothing completes.  No-op unless open.
     /// Off the owner thread of a carried queue the ring slot is still released
     /// but the credit cannot be returned (it is the owner's plain state): the
     /// queue loses that credit — settle credit-carrying claims on their owner.
-    void abort() noexcept;
+    void abort() noexcept {
+        if (std::holds_alternative<Open>(state_)) [[unlikely]] abortOpen_();
+    }
 
 private:
     friend class Producer;
+    bool commitOpen_() noexcept;  ///< commit() of an Open claim
+    void abortOpen_() noexcept;   ///< abort() of an Open claim
     struct Refused {
         SendResult why = SendResult::InvalidTopic;
     };
