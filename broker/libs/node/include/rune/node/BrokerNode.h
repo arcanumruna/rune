@@ -1079,20 +1079,26 @@ private:
         });
     }
 
-    /// The validator fan-out of a typed topic's CURRENT schema version (the
-    /// materialized descriptor of that version).
+    /// The validator fan-out of a typed topic: EVERY registered schema version 1..current (the
+    /// materialized descriptor of each).  Workers select a validator by the record's OWN stamped
+    /// version and hard-reject an unknown one, and the typed-transport gate accepts any known
+    /// version, so a producer still writing an older version must keep validating after a restart
+    /// (boot posts only this, never the ALTER history).  Idempotent per worker (insert_or_assign);
+    /// cold path (DDL / boot only).
     void postCatalogValidator_(const rune::catalog::TopicObject& t) {
         if (!t.schema || !t.schema->validate) return;
-        const RegistryEntry* e = catalogSchemas_->byIdVersion(t.topicId, t.schema->schemaVersion);
-        if (e == nullptr) [[unlikely]] {
-            spdlog::error("AdminWorkerAgent: catalog topic '{}' (id={}) schema v{} not in the SchemaRegistry — "
-                          "validator not pushed", t.name, t.topicId, t.schema->schemaVersion);
-            return;
+        for (uint16_t v = 1; v <= t.schema->schemaVersion; ++v) {
+            const RegistryEntry* e = catalogSchemas_->byIdVersion(t.topicId, v);
+            if (e == nullptr) [[unlikely]] {
+                spdlog::error("AdminWorkerAgent: catalog topic '{}' (id={}) schema v{} not in the SchemaRegistry — "
+                              "validator not pushed", t.name, t.topicId, v);
+                continue;
+            }
+            const std::vector<uint8_t> blob = rune::codec::serialize(e->descriptor);
+            postCatalog_(kA2cSchemaUpdate, schemaUpdateWireLen(blob.size()), [&](uint8_t* p) {
+                writeSchemaUpdate(p, t.topicId, e->version, blob);
+            });
         }
-        const std::vector<uint8_t> blob = rune::codec::serialize(e->descriptor);
-        postCatalog_(kA2cSchemaUpdate, schemaUpdateWireLen(blob.size()), [&](uint8_t* p) {
-            writeSchemaUpdate(p, t.topicId, e->version, blob);
-        });
     }
 
     CatalogEffects catalogSink_(uint8_t viewInstallRecovery) {

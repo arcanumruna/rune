@@ -538,10 +538,11 @@ public:
     int64_t sendDefineTopic(const std::string& ch, int32_t stream, int64_t sid, std::string_view name,
                             uint32_t partitions, const std::vector<uint8_t>& descriptor, uint8_t persistence = 0,
                             rune::protocol::RequestId rid = {}, int16_t replicationFactor = 0,
-                            const rune::protocol::TopicConfigView& config = {}) {
+                            const rune::protocol::TopicConfigView& config = {},
+                            bool validate = false) {
         pc::DefineTopic m;
         m.sessionId = sid; m.correlationId = ++corr_; m.topicName = name; m.partitionCount = partitions;
-        m.keyField = "id"; m.validate = false; m.persistence = persistence;
+        m.keyField = "id"; m.validate = validate; m.persistence = persistence;
         m.descriptorBlob = descriptor.data(); m.descriptorLen = static_cast<uint32_t>(descriptor.size());
         m.hasExt = true; m.ext.clientName = "shard-test-client"; m.ext.requestId = ridOr_(rid);
         m.replicationFactor = replicationFactor; m.config = config;

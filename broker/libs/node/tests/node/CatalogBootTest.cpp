@@ -142,7 +142,7 @@ bool quarantineHasEntryStartingWith(const fs::path& dataDir, const std::string& 
 /// ONE single-node broker over a data dir that survives restarts, plus a wire session.
 class BootRig {
 public:
-    struct Def { std::string name; uint32_t partitions = 1; bool typed = false; uint8_t persistence = 0; };
+    struct Def { std::string name; uint32_t partitions = 1; bool typed = false; uint8_t persistence = 0; bool validate = false; };
     struct Res { int code = -1; };
 
     explicit BootRig(const std::string& tag) : dir_(tag), cfg_(makeSingleNodeConfig(dir_.path)) {}
@@ -181,7 +181,8 @@ public:
     Res define(const Def& d) {
         const auto r = client_->awaitDefine(
             client_->sendDefineTopic(gw(), stream(), sid_, d.name, d.partitions,
-                                     d.typed ? charBlob() : std::vector<uint8_t>{}, d.persistence),
+                                     d.typed ? charBlob() : std::vector<uint8_t>{}, d.persistence,
+                                     rune::protocol::RequestId{}, 0, rune::protocol::TopicConfigView{}, d.validate),
             Clock::now() + 10s);
         return {r ? static_cast<int>(r->errorCode) : -1};
     }
@@ -219,9 +220,9 @@ public:
             .has_value();
     }
     /// The produce error code of one attempt (0 = OK).
-    int produceCode(int32_t topicId, int32_t partition) {
+    int produceCode(int32_t topicId, int32_t partition, const std::string& value = "probe") {
         const int64_t corr = ++pcorr_;
-        if (!client_->produce(gw(), stream(), sid_, corr, topicId, partition, /*acks=*/1, oneRecord("probe")))
+        if (!client_->produce(gw(), stream(), sid_, corr, topicId, partition, /*acks=*/1, oneRecord(value)))
             return -1;
         const auto r = client_->awaitProduceResponse(corr);
         return r ? r->errorCode : -1;
@@ -727,6 +728,38 @@ TEST(CatalogBootRegression, EveryEffectKindSurvivesTwoRealRestartsIdenticallyReg
     // and the catalog still takes writes.
     ASSERT_EQ(r.define({.name = "after", .typed = true}).code, kOk);
     EXPECT_EQ(r.topicIdForName("after"), 8);
+}
+
+// A validate=true typed topic that evolved to v2: a producer still writing the OLDER registered
+// v1 (the typed-transport gate accepts any known version) must be accepted by the workers both
+// live and after a restart -- the boot fan-out must install EVERY registered version, not only
+// the current one.
+namespace {
+/// A well-formed `character` v1 record value: [blockLength:u16][version:u16][id:i64][hp:i64].
+std::string charRecordV1() {
+    std::string v(4 + 16, '\0');
+    v[0] = 16; v[2] = 1;
+    v[4] = 7;
+    return v;
+}
+} // namespace
+
+TEST(CatalogBootRegression, OlderRegisteredSchemaVersionStillAcceptedByWorkersAfterRestartRegression) {
+    BootRig r("boot_oldver");
+    ASSERT_TRUE(r.start());
+    ASSERT_EQ(r.define({.name = "chars", .partitions = 1, .typed = true, .validate = true}).code, kOk);   // v1
+    ASSERT_EQ(r.alterSchema("chars", Op::AlterAdd).code, kOk);                                             // v2
+    const auto id = r.topicIdForName("chars");
+    ASSERT_TRUE(id.has_value());
+    ASSERT_TRUE(r.awaitServes(*id));
+    ASSERT_EQ(r.schema("chars")->version, 2);
+    EXPECT_EQ(r.produceCode(*id, 0, charRecordV1()), 0) << "live: the v1 validator was fanned out when v1 registered";
+    ASSERT_TRUE(r.restart());
+    const auto id2 = r.topicIdForName("chars");
+    ASSERT_TRUE(id2.has_value());
+    ASSERT_TRUE(r.awaitServes(*id2));
+    EXPECT_EQ(r.produceCode(*id2, 0, charRecordV1()), 0)
+        << "after restart the workers must still hold the v1 validator (SchemaValidationFailed = only the current version was pushed)";
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
