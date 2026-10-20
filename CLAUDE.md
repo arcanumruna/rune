@@ -160,8 +160,10 @@ the repo, issues or commits.
   merges the PR and closes the linked issues.
 - **Issue-fix PRs: whole-area and adversarial review.** For a PR that fixes GitHub issues, the review covers the
   entire area each fix touches, not just the diff: the module it lives in, its callers, sibling paths that share the
-  invariant, and their tests. Both the implementer (before opening the PR) and the reviewer write tests meant to break
-  that whole area, driven through the public API (client API, wire frames, admin/CLI).
+  invariant, and their tests. **Once per batch, at the very end** (after every fix is in), the reviewer writes tests
+  meant to break the union of the areas the batch touches, driven through the public API (client API, wire frames,
+  admin/CLI). An area shared by several fixes is attacked once; the implementer does not run a separate pass; after a
+  fix round only the areas the new diff touches are attacked again.
   - **Mindset:** assume the fix is wrong and prove it with a failing test. Find every sibling entry point to the same
     state first (gateway, admin channel, replication catch-up, boot recovery, CLI). Re-run the issue's repro at every
     layer.
@@ -194,9 +196,10 @@ the repo, issues or commits.
 - **Implementers** run on a mid-tier model. They are given an exact recipe: where, what (the algorithm and its
   invariant), every call site, the exact tests (setup, action, expected values, and the mutation that turns each one
   red) and the don'ts. They are never handed design decisions.
-- **Agents on GitHub issues.** Every agent dispatched to fix an issue or review an issue-fix PR is told, in its
-  dispatch, to read `docs/adversarial-review.md` first and to apply every attack class that fits the area. Its report
-  lists each class with the tests written or why it does not apply, and the issues it filed.
+- **Agents on GitHub issues.** Every agent dispatched to review an issue-fix PR is told, in its dispatch, to read
+  `docs/adversarial-review.md` first and to apply every attack class that fits the batch's areas. Its report lists
+  each class with the tests written or why it does not apply, and the issues it filed. Fixers are told the pass
+  happens at review, so they do not repeat it.
 - **Reviewers** run on the most capable model. A review is exhaustive and adversarial in one pass: every path, state
   transition and input class, concurrency, lifetimes, bounds, vacuous tests. It reports every bug, not the first
   few. A small scoped re-review can use a mid-tier model.
