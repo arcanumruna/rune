@@ -927,6 +927,12 @@ if(BUILD_BENCHMARKS AND aeron_FOUND)
         "${CMAKE_CURRENT_BINARY_DIR}/gen")
     target_link_libraries(rune_typed_topic_send_bench PRIVATE rune_codec benchmark::benchmark)
 
+    # Phase 2b F Task 14 — transactional vs plain acked on every produce path (p50/p99, records/s, 0 allocations)
+    add_executable(rune_producer_txn_bench bench/ProducerTxnBench.cpp tests/support/AllocCounter.cpp)
+    target_include_directories(rune_producer_txn_bench PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${RUNE_CLAIM_GEN_DIR})
+    target_link_libraries(rune_producer_txn_bench PRIVATE rune_client_api rune_client_producer)
+    add_dependencies(rune_producer_txn_bench generate_claim_schema_headers)
+
     # F8c C1(a) — M2ORingBuffer tryClaim/commit micro-bench (producer hot path)
     add_executable(rune_m2o_claim_bench
         bench/M2OClaimBench.cpp
