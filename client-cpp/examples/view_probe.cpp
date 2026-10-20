@@ -56,12 +56,13 @@
 //         is persisted, so the row comes back;
 //     (c) re-producing the SAME key with a NEW hp value is folded live by
 //         BOTH views after the restart — each converges to the NEW value;
-//     (d) Phase 2a: the PERSISTED aggregate view user_totals (GROUP BY userId:
-//         Count(*), Sum(amount), Avg(amount) over "order") recovers its rows
-//         AND its contributor map from the v2 checkpoint: u100 = {3, 85, 85/3},
-//         u200 absent (emptied by a pre-restart group move), and a post-restart
-//         update of a PRE-restart contributor (o3 5 -> 25) retracts the old
-//         contribution -> u100 = {3, 105, 35} (a lost map would give n 4).
+//     (d) Phase 2a/2b: the PERSISTED aggregate view user_totals (GROUP BY userId:
+//         Count(*), Sum, Avg, Max, Min, Last over "order") recovers its rows,
+//         contributor map, MRU lists/caches AND Min/Max value blocks from the v2 checkpoint:
+//         u100 = {3, 85, 85/3, max 50, min 5, last 5}, u200 absent (emptied by a
+//         pre-restart group move); o3 5 -> 25 retracts the pre-image AND the
+//         cached min -> {3, 105, 35, 50, 25, 25}; o1 50 -> 20 retracts the cached
+//         max -> {3, 75, 25, 30, 20, 20} (both rescans scan the recovered value block).
 //     (e) (Phase 2b E/E2) presence_t: TopicExists with the same id, first
 //         produce at offset 0, subscribe and read_committed from earliest ->
 //         position 1.
@@ -327,12 +328,15 @@ static rcv::ViewPlan userTotalsPlan(int32_t srcTopicId) {
     p.output.push_back(rcv::AuthoredField{"n", P::Int64, 0, "", rcv::MergeRule::CountAll});
     p.output.push_back(rcv::AuthoredField{"total", P::Int64, 0, "amount", rcv::MergeRule::Sum});
     p.output.push_back(rcv::AuthoredField{"avg", P::Float64, 0, "amount", rcv::MergeRule::Avg});
+    p.output.push_back(rcv::AuthoredField{"max", P::Int64, 0, "amount", rcv::MergeRule::Max});
+    p.output.push_back(rcv::AuthoredField{"min", P::Int64, 0, "amount", rcv::MergeRule::Min});
+    p.output.push_back(rcv::AuthoredField{"last", P::Int64, 0, "amount", rcv::MergeRule::Last});
     return p;
 }
-// Slot order == userTotalsPlan output order: userId, n, total, avg.
+// Slot order == userTotalsPlan output order: userId, n, total, avg, max, min, last.
 static rcv::RowLayout userTotalsRowLayout() {
-    const rune::codec::PrimType types[] = {rune::codec::PrimType::Int64, rune::codec::PrimType::Int64,
-                                           rune::codec::PrimType::Int64, rune::codec::PrimType::Float64};
+    using P = rune::codec::PrimType;
+    const P types[] = {P::Int64, P::Int64, P::Int64, P::Float64, P::Int64, P::Int64, P::Int64};
     return rcv::buildRowLayout(types);
 }
 // Sends one order (acked); false + message on failure.
@@ -348,10 +352,12 @@ static bool sendOrder(Client& c, const TopicHandle& th, int64_t o, int64_t u, in
     }
     return true;
 }
-// Polls user `u` until the row is {userId=u, n, total, avg} with every slot
-// present (non-null; avg within 1e-9) or the bound expires.
-static bool waitForTotals(Client& c, int32_t viewId, uint64_t fp, int64_t u, int64_t n, int64_t total,
-                          double avg, int boundMs, int timeoutMs, const char* who) {
+// Expected user_totals row: Phase 2a columns + Phase 2b max/min/last.
+struct Totals { int64_t n; int64_t total; double avg; int64_t max; int64_t min; int64_t last; };
+// Polls user `u` until the row is {userId=u, want...} with every slot present
+// (non-null; avg within 1e-9) or the bound expires.
+static bool waitForTotals(Client& c, int32_t viewId, uint64_t fp, int64_t u, const Totals& w,
+                          int boundMs, int timeoutMs, const char* who) {
     const rcv::RowLayout L = userTotalsRowLayout();
     const auto dl = std::chrono::steady_clock::now() + std::chrono::milliseconds(boundMs);
     ViewRowResult r;
@@ -359,19 +365,24 @@ static bool waitForTotals(Client& c, int32_t viewId, uint64_t fp, int64_t u, int
         r = c.getViewRowAndWait(viewId, static_cast<uint64_t>(u), fp, std::chrono::milliseconds(timeoutMs));
         if (r.status == ViewRowResult::kOk && r.rowBytes.size() == L.rowLen) {
             const auto row = std::span<const uint8_t>(r.rowBytes);
-            const auto uf = rcv::readSlot(row, L, 0);
-            const auto nf = rcv::readSlot(row, L, 1), tf = rcv::readSlot(row, L, 2), af = rcv::readSlot(row, L, 3);
-            const bool allPresent = uf.present && nf.present && tf.present && af.present;
-            if (allPresent && uf.i == u && nf.i == n && tf.i == total && std::abs(af.f - avg) < 1e-9) {
-                std::cerr << "PROBE: " << who << " OK userId=" << u << " n=" << n << " total=" << total
-                          << " avg=" << avg << "\n";
+            const auto uf = rcv::readSlot(row, L, 0), nf = rcv::readSlot(row, L, 1),
+                       tf = rcv::readSlot(row, L, 2), af = rcv::readSlot(row, L, 3),
+                       xf = rcv::readSlot(row, L, 4), mf = rcv::readSlot(row, L, 5),
+                       lf = rcv::readSlot(row, L, 6);
+            const bool allPresent = uf.present && nf.present && tf.present && af.present &&
+                                    xf.present && mf.present && lf.present;
+            if (allPresent && uf.i == u && nf.i == w.n && tf.i == w.total && std::abs(af.f - w.avg) < 1e-9 &&
+                xf.i == w.max && mf.i == w.min && lf.i == w.last) {
+                std::cerr << "PROBE: " << who << " OK userId=" << u << " n=" << w.n << " total=" << w.total
+                          << " avg=" << w.avg << " max=" << w.max << " min=" << w.min << " last=" << w.last << "\n";
                 return true;
             }
             if (std::chrono::steady_clock::now() >= dl) {
                 std::cerr << "PROBE: FAIL " << who << " got userId=" << uf.i << " n=" << nf.i << " total=" << tf.i
-                          << " avg=" << af.f << " (present userId=" << uf.present << " n=" << nf.present
-                          << " total=" << tf.present << " avg=" << af.present << ")"
-                          << " want userId=" << u << " n=" << n << " total=" << total << " avg=" << avg << "\n";
+                          << " avg=" << af.f << " max=" << xf.i << " min=" << mf.i << " last=" << lf.i
+                          << " (allPresent=" << allPresent << ")"
+                          << " want n=" << w.n << " total=" << w.total << " avg=" << w.avg << " max=" << w.max
+                          << " min=" << w.min << " last=" << w.last << "\n";
                 return false;
             }
         } else if (std::chrono::steady_clock::now() >= dl) {
@@ -1272,7 +1283,9 @@ int main(int argc, char** argv) {
             if (!sendOrder(c, ordTh, 1, 100, 10, timeoutMs) || !sendOrder(c, ordTh, 2, 100, 30, timeoutMs) ||
                 !sendOrder(c, ordTh, 3, 200, 5, timeoutMs)  || !sendOrder(c, ordTh, 1, 100, 50, timeoutMs) ||
                 !sendOrder(c, ordTh, 3, 100, 5, timeoutMs)) return 32;
-            if (!waitForTotals(c, viewA.viewTopicId, viewA.outputFingerprint, 100, 3, 85, 85.0 / 3,
+            // MRU after the five writes: o3 (5), o1 (50), o2 (30).
+            if (!waitForTotals(c, viewA.viewTopicId, viewA.outputFingerprint, 100,
+                               Totals{3, 85, 85.0 / 3, 50, 5, 5},
                                boundMs, timeoutMs, "user_totals u100 (initial)")) return 33;
             if (!waitForAbsent(c, viewA.viewTopicId, viewA.outputFingerprint, 200, boundMs, timeoutMs,
                                "user_totals u200 (emptied by group move)")) return 34;
@@ -1455,14 +1468,20 @@ int main(int argc, char** argv) {
 
             // ---- (d) aggregate view recovered: rows AND contributor map --------
             if (orderTopic < 0 || viewIdA < 0) { std::cerr << "PROBE: FAIL missing aggregate handoff env\n"; return 40; }
-            if (!waitForTotals(c, viewIdA, fpA, 100, 3, 85, 85.0 / 3, boundMs, timeoutMs,
+            if (!waitForTotals(c, viewIdA, fpA, 100, Totals{3, 85, 85.0 / 3, 50, 5, 5}, boundMs, timeoutMs,
                                "user_totals u100 (post-restart, recovered)")) return 41;
             if (!waitForAbsent(c, viewIdA, fpA, 200, boundMs, timeoutMs, "user_totals u200 (post-restart)")) return 42;
             // Update a PRE-restart contributor: o3 5 -> 25. Correct only if its
-            // pre-image survived the restart (lost map => n 4, total 110).
+            // pre-image survived the restart (lost map => n 4, total 110); it also
+            // retracts the cached MIN (5) with a higher value -> rescan of the
+            // RECOVERED per-group value block -> min 25.
             if (!sendOrder(c, TopicHandle{orderTopic, 1}, 3, 100, 25, timeoutMs)) return 43;
-            if (!waitForTotals(c, viewIdA, fpA, 100, 3, 105, 35.0, boundMs, timeoutMs,
-                               "user_totals u100 (post-restart update retracts pre-image)")) return 44;
+            if (!waitForTotals(c, viewIdA, fpA, 100, Totals{3, 105, 35.0, 50, 25, 25}, boundMs, timeoutMs,
+                               "user_totals u100 (post-restart update retracts pre-image + min)")) return 44;
+            // o1 50 -> 20 retracts the cached MAX with a lower value -> rescan -> max 30 (o2).
+            if (!sendOrder(c, TopicHandle{orderTopic, 1}, 1, 100, 20, timeoutMs)) return 45;
+            if (!waitForTotals(c, viewIdA, fpA, 100, Totals{3, 75, 25.0, 30, 20, 20}, boundMs, timeoutMs,
+                               "user_totals u100 (post-restart max retraction rescans)")) return 46;
 
             // ---- (e) Phase 2b E/E2: the transient topic EXISTS and is EMPTY ------
             //         Exit codes 90..95 (60..65 would collide with setup's ALTER 60).
