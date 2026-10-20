@@ -33,7 +33,7 @@ enum class OpKind : uint8_t {
     ListTopics,                                                          // client control (C3: listTopics())
     BatchAck,       ///< producer per-batch acknowledgement (C6: Producer::batchAcksTo; see batchAckOf())
     ProducerClose,  ///< producer begin-close (C6a: Producer::close(target, token))
-    TxnClose,       ///< C7: TransactionalProducer::close(target, token)
+    TxnClose,       ///< C7: Producer::close(target, token) of a transactional producer
     ClientDrain,    ///< C7: Client::close()'s producer drain (internal)
     AlterTopic,     ///< Task 18: Client::alterTopic() / alterTopicAndWait()
     CreateView,     ///< Task 21: Client::createView() / createViewAndWait()

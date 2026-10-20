@@ -326,10 +326,6 @@ public:
     /// retries).  Only the 8-byte address crosses the ring.
     Submit submitRegisterProducer(void* impl) noexcept;
 
-    /// Same shared-nothing hand-off for a transactional producer: `impl` is the
-    /// TransactionalProducerImpl* adopted on the duty-cycle thread.
-    Submit submitRegisterTxnProducer(void* impl) noexcept;
-
     /// F8a: hand a subscriber / group-consumer / completion-queue command to
     /// the duty thread (kMsgHubCommand, SBE ring_msg::HubCommandMsg).  The duty
     /// thread drains it and invokes the hub-command hook.
@@ -581,10 +577,6 @@ public:
     }
     void clearProduceAcks() noexcept { produceAcks_.clear(); }
 
-    /// Forward ProduceResponse frames to the egress observer (transactional
-    /// producers need them).  Default true (historical behaviour).
-    void setForwardProduceResponses(bool on) noexcept { forwardProduceResponses_ = on; }
-
     /// The Aeron client closed itself — or the T15b test fault was applied.
     [[nodiscard]] bool transportClosed() const noexcept { return testFault_ || transport_.closed(); }
 
@@ -718,9 +710,6 @@ public:
     using ProducerRegisterFn = std::function<void(void*)>;
     void setProducerRegisterFn(ProducerRegisterFn fn) noexcept {
         producerRegisterFn_ = std::move(fn);
-    }
-    void setTxnProducerRegisterFn(ProducerRegisterFn fn) noexcept {
-        txnProducerRegisterFn_ = std::move(fn);
     }
 
     /// F8a fix2: control frames dropped because their session no longer exists,
@@ -880,7 +869,7 @@ private:
     static constexpr int32_t kMsgSend       = 4;
     static constexpr int32_t kMsgReconnect  = 5; // CB-5 B: force fresh reconnect
     static constexpr int32_t kMsgRegisterProducer = 6; // shared-nothing producer registration
-    static constexpr int32_t kMsgRegisterTxnProducer = 7; // shared-nothing txn producer registration
+    // 7 retired (Phase 2b F: the txn-producer registration; transactions are Producer + transactionalId) - never reuse.
     static constexpr int32_t kMsgHubCommand = 8;          // F8a subscriber / group-consumer command
     static constexpr int32_t kMsgControlOp  = 9;          // F8c C3 client control op (header + frame)
     static constexpr int32_t kMsgTestFault = 98;          // T15b test seam: transportClosed() -> true
@@ -960,7 +949,6 @@ private:
     std::vector<PartitionRoute> routes_;
     std::vector<uint32_t>       freeRoutes_;
     std::vector<ProduceAck>     produceAcks_;  // reserved in the ctor; owner clears
-    bool                        forwardProduceResponses_ = true;
     bool                        mnDebug_ = false;  // RUNE_MN_DEBUG, read ONCE
     uint64_t                    handshakeFinalLegFailures_ = 0;   // fix round 5 (N4-I1), duty thread
 
@@ -1073,7 +1061,6 @@ private:
     ProduceResponseFn  produceResponseFn_;
     ProduceResendFn    produceResendFn_;    // Task 1.4: fired on session-connect (multi-node)
     ProducerRegisterFn producerRegisterFn_; // shared-nothing producer registration (ring-drained)
-    ProducerRegisterFn txnProducerRegisterFn_; // same, transactional producers
     HubCommandFn       hubCommandFn_;          // F8a subscriber / group-consumer commands
     ControlOpFn        controlOpFn_;           // F8c C3 client control ops
     // F8a fix2: duty-thread counters for the kMsgSend drain rule (plain; read

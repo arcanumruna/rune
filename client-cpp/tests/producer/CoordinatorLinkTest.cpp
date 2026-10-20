@@ -525,3 +525,27 @@ TEST(CoordinatorLinkRegression, AnErrorResponseForACoordinatorIdSettlesItWithIts
     EXPECT_EQ(p.coordinatorLink()->inUse(), 0u);
     (void)a;
 }
+
+// Phase 2b F Task 9: the removed separate transactional handle asked the Client to re-discover the coordinator whenever
+// NotCoordinator was answered (once per generation, however many requests waited).  The link kept the wait but
+// not the ask: a typed NotCoordinator answer waited for a cluster view nobody requested.  The sink's rediscover
+// hook is called once per generation and again after the next move.
+TEST(CoordinatorLinkRegression, NotCoordinatorAsksForRediscoveryOncePerGenerationRegression) {
+    FakeCoordinator fake;
+    CoordinatorLink link(0, fake.sink());
+    CoordinatorLink::Slot* a = send(link, ReqKind::EndTxn);
+    CoordinatorLink::Slot* b = send(link, ReqKind::AddPartitions);
+    ASSERT_NE(a, nullptr);
+    ASSERT_NE(b, nullptr);
+    ASSERT_EQ(pumpNoExpiry(link, 1), 2);
+    const auto fa = FakeCoordinator::answer(ReqKind::EndTxn, a->corrId, kNotCoord);
+    const auto fb = FakeCoordinator::answer(ReqKind::AddPartitions, b->corrId, kNotCoord);
+    EXPECT_EQ(link.onAnswer(asAnswer(fa, ReqKind::EndTxn, a->corrId, kNotCoord), 2), nullptr);
+    EXPECT_EQ(fake.rediscovers, 1) << "the first NotCoordinator must ask for a fresh cluster view";
+    EXPECT_EQ(link.onAnswer(asAnswer(fb, ReqKind::AddPartitions, b->corrId, kNotCoord), 3), nullptr);
+    EXPECT_EQ(fake.rediscovers, 1) << "one ask per generation, however many requests wait";
+    link.onCoordinatorMoved();
+    ASSERT_EQ(pumpNoExpiry(link, 4), 2);
+    EXPECT_EQ(link.onAnswer(asAnswer(fa, ReqKind::EndTxn, a->corrId, kNotCoord), 5), nullptr);
+    EXPECT_EQ(fake.rediscovers, 2) << "the next generation asks again";
+}

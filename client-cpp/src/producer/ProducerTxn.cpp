@@ -2,7 +2,7 @@
 // and the transaction's data (AddPartitionsToTxn gating per partition, the duty re-check, poisoning).
 //
 // See ProducerImpl.h ("the transaction machine") and CoordinatorLink.h (the states).  Rules ported from the old
-// TransactionalProducerImpl (Kafka TransactionManager):
+// the removed separate transactional impl (Kafka TransactionManager):
 //   * gating: begin only in Ready; commit / sendOffsets only InTransaction; abort in InTransaction /
 //     AbortableError; init only Uninitialized; FatalError: every op completes with its status; misuse completes
 //     BrokerError(19 InvalidTxnState);
@@ -1025,18 +1025,22 @@ bool ProducerImpl::txnDiscardUnsent_(const TxnOutcome& o) noexcept {
     const DutyScope duty(*this);   // sends from the completions below are deferred (Direct)
     // The ring holds nothing of this transaction: records ahead of the abort were drained before it applied (FD1),
     // later ones are refused by the drain (the machine is not InTransaction).
+    bool dropped = false;   // a record was dropped unproduced
     if (!deferred_.empty()) {
         changed = true;
+        dropped = true;
         failDeferred_(o.status, o.errorCode);
     }
     for (std::size_t i = 0; i < partitions_.size(); ++i) {
         PartitionState& ps = *partitions_[i];
         if (ps.builder && ps.builder->recordCount() > 0) {
             changed = true;
+            dropped = true;
             failBuilder_(ps, o.status, o.errorCode);
         }
         while (ps.hasTier2()) {
             changed = true;
+            dropped = true;
             const uint32_t slot = t2Pop_(ps);
             const uint64_t h  = tier2Pool_[slot].ackHandle;
             const int32_t  rc = tier2Pool_[slot].recordCount;
@@ -1045,21 +1049,34 @@ bool ProducerImpl::txnDiscardUnsent_(const TxnOutcome& o) noexcept {
             completeHandle_(h, OpKind::Tier2Batch, -1, rc, o.status, o.errorCode);
         }
     }
+    if (dropped && txnFlushN_ != 0) {
+        // E3 / B-MEDIUM-1: a flush whose records the abort dropped (never produced) must not complete Ok - it completes
+        // with the abort's outcome (the scan restarts nothing: the array is taken first, completions may run user code).
+        const std::array<TxnOp, kMaxTxnFlushes> flushes = txnFlushes_;
+        const std::size_t                        nFlushes = txnFlushN_;
+        txnFlushN_ = 0;
+        for (std::size_t i = 0; i < nFlushes; ++i) {
+            completeTxn_(flushes[i], OpKind::Flush, o.status, o.errorCode,
+                         "flush: the transaction was aborted; its unsent records were dropped");
+        }
+    }
     return changed;
 }
 
-void ProducerImpl::txnResetPartition_(PartitionState& ps) noexcept {
+static_assert(ProducerImpl::kTxnResetOos == static_cast<uint16_t>(rpc::ErrorCode::OutOfOrderSequence));
+static_assert(ProducerImpl::kTxnResetUnknownPid == static_cast<uint16_t>(rpc::ErrorCode::UnknownProducerId));
+
+void ProducerImpl::txnResetPartition_(PartitionState& ps, uint16_t cause) noexcept {
     // KIP-360: a transactional producer's epoch belongs to its coordinator - a local bump would put this
     // partition's data under an epoch no EndTxn ever ends.  The partition sends nothing new (not Added, its id
     // pending), the transaction can only abort, and the abort's epoch bump restarts every sequence.
-    constexpr uint16_t kOos = static_cast<uint16_t>(rpc::ErrorCode::OutOfOrderSequence);
     ps.producerId = -1;
     const bool first = std::holds_alternative<NotInTxn>(ps.txn) || std::holds_alternative<Added>(ps.txn);
     if (first) {
         txnEnroll_(ps);
-        ps.txn = AddFailed{kOos};
+        ps.txn = AddFailed{cause};
     }
-    poison_(OpStatus::BrokerError, kOos, AbortKind::BumpEpoch);
+    poison_(OpStatus::BrokerError, cause, AbortKind::BumpEpoch);
     // Fix round 1 (I2): every batch still in flight here carries the old sequences, which can never be restarted
     // in place - re-sent, each would only meet the same gap until its delivery timeout, and the abort would wait for
     // it.  They fail now with the transaction's status (each record exactly once: the slot is released, a late
@@ -1078,7 +1095,7 @@ void ProducerImpl::txnResetPartition_(PartitionState& ps) noexcept {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// close(): end the open transaction first (old TransactionalProducer::close semantics)
+// close(): end the open transaction first (the removed transactional handle's close semantics)
 // ---------------------------------------------------------------------------------------------------------------
 
 bool ProducerImpl::txnOpenForClose_() const noexcept {

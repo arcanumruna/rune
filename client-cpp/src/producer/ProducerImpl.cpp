@@ -2444,7 +2444,7 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
             return;
         }
         if (b->baseSequence != ps.lastAckedSeq + 1) {  // C3: a failed predecessor's gap
-            resequence_(ps);                             // (an UnknownProducerId too: the gap explains it)
+            resequence_(ps, unknownPid ? kTxnResetUnknownPid : kTxnResetOos);   // (an UnknownProducerId too: the gap explains it)
             return;
         }
         if (!unknownPid) {
@@ -2474,7 +2474,7 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
                          ps.topicId, ps.partition, static_cast<long long>(ps.lastAckedOffset),
                          static_cast<long long>(logStartOffset));
         }
-        resequence_(ps);
+        resequence_(ps, kTxnResetUnknownPid);
         return;
     }
     // Phase 2b E2 (ruling 2): TransientLogFull (42) — the leader's transient
@@ -2607,12 +2607,12 @@ void ProducerImpl::maybeResolve_(PartitionState& ps) noexcept {  // E
     markDirty_(ps);  // held records may go now
 }
 
-void ProducerImpl::resetPartition_(PartitionState& ps) noexcept {  // F
+void ProducerImpl::resetPartition_(PartitionState& ps, uint16_t cause) noexcept {  // F
     ps.nextBaseSequence = 0;
     ps.lastAckedSeq     = -1;
     ps.unresolved       = false;
     if (txnBatchAttrs_ != 0) [[unlikely]] {   // Phase 2b F Task 6: the coordinator owns a transactional epoch
-        txnResetPartition_(ps);
+        txnResetPartition_(ps, cause);
         return;
     }
     auto* id = std::get_if<IdAssigned>(&identity_);
@@ -2676,8 +2676,8 @@ void ProducerImpl::stampAttempt_(InFlightBatch& b, uint8_t tag) noexcept {
           static_cast<uint64_t>(batchcorr::withAttempt(b.corrId, tag)), 8);
 }
 
-void ProducerImpl::resequence_(PartitionState& ps) noexcept {
-    resetPartition_(ps);
+void ProducerImpl::resequence_(PartitionState& ps, uint16_t cause) noexcept {
+    resetPartition_(ps, cause);
     if (ps.producerId < 0) return;   // epoch overflow: the stored batches are re-stamped when the new id arrives
     restampInflight_(ps);
 }

@@ -65,7 +65,9 @@ struct Capture {
     std::vector<uint8_t> arena;
     int64_t              sid = 77;
     Capture() { frames.reserve(1 << 14); arena.reserve(std::size_t{4} << 20); }
-    [[nodiscard]] rp::CoordinatorSink sink() noexcept { return {&offer, &session, this}; }
+    int                  rediscovers = 0;   ///< re-discovery requests (NotCoordinator answered)
+    [[nodiscard]] rp::CoordinatorSink sink() noexcept { return {&offer, &session, this, &rediscover}; }
+    static void rediscover(void* ctx) noexcept { ++static_cast<Capture*>(ctx)->rediscovers; }
     static rp::CoordinatorSink::Offer offer(void* ctx, const uint8_t* b, std::size_t n) noexcept {
         auto* self = static_cast<Capture*>(ctx);
         const auto h = rpc::MessageHeader::decode(b, n);
@@ -910,4 +912,153 @@ TEST(ProducerTxnControlRegression, LiveProducerFailAllCompletesControlOpsWithThe
     ASSERT_EQ(b.issue(TxnControl::Kind::Begin).result, rc::OpResult::Accepted);
     b.impl->failAllPending(OpStatus::SessionLost);
     EXPECT_EQ(b.impl->txnRefusedBegins(), before + 1);
+}
+
+// ============================================================================================================
+// Phase 2b F Task 9: the offsets cases of the removed transactional producer's test file, on the unified Producer
+// (old -> new names are in the Task 9 commit message).
+// ============================================================================================================
+
+namespace {
+/// A late / duplicate answer: routed to us (ours), changes nothing.
+void answerLate(Rig& r, const Capture::Frame& f, rp::ReqKind kind, int16_t code) {
+    const auto a = FakeCoordinator::answer(kind, f.corrId, code);
+    (void)r.hub.onCoordinatorResponse(a.templateId, a.data(), a.len, r.now);
+}
+}  // namespace
+
+// sendOffsets is two-phase (AddOffsetsToTxn -> TxnOffsetCommit) and completes exactly once - never at phase 1,
+// never twice on duplicates; a commit waits for the offsets (they are part of the transaction).
+TEST(ProducerTxnOffsetsRegression, SendOffsetsTwoPhaseCompletesOnceRegression) {
+    Rig r;
+    r.inTxn();
+    const Token t = r.sendOffsets(offsetsOf(1), "grp");
+    r.tick();
+    const auto ao = r.lastOf(rpc::AddOffsetsToTxn::TEMPLATE_ID);
+    ASSERT_NE(ao.corrId, 0);
+    r.answerFrame(ao, rp::ReqKind::AddOffsets, 0);
+    EXPECT_EQ(r.d(t).times, 0) << "phase 1 is not the completion";
+    answerLate(r, ao, rp::ReqKind::AddOffsets, 0);   // duplicate: ignored
+    r.tick();
+    ASSERT_EQ(r.cap.of(rpc::TxnOffsetCommit::TEMPLATE_ID).size(), 1u) << "phase 2 started exactly once";
+    const auto oc = r.lastOf(rpc::TxnOffsetCommit::TEMPLATE_ID);
+    // A commit waits for the offsets (they are part of the transaction).
+    const Token commit = r.apply(TxnControl::Kind::Commit);
+    r.tick();
+    r.tick();
+    EXPECT_TRUE(r.cap.of(rpc::EndTxn::TEMPLATE_ID).empty()) << "EndTxn before the offsets landed";
+    r.answerFrame(oc, rp::ReqKind::TxnOffsetCommit, 0);
+    answerLate(r, oc, rp::ReqKind::TxnOffsetCommit, 0);   // duplicate
+    ASSERT_EQ(r.d(t).times, 1);
+    EXPECT_EQ(r.d(t).status, OpStatus::Ok);
+    r.tick();
+    ASSERT_EQ(r.cap.of(rpc::EndTxn::TEMPLATE_ID).size(), 1u) << "now the EndTxn";
+    r.answerFrame(r.lastOf(rpc::EndTxn::TEMPLATE_ID), rp::ReqKind::EndTxn, 0);
+    EXPECT_EQ(r.d(commit).status, OpStatus::Ok);
+    EXPECT_EQ(r.d(t).times, 1);
+}
+
+TEST(ProducerTxnOffsetsRegression, TxnOffsetCommitRetriesConcurrentTransactionsRegression) {
+    Rig r;
+    r.inTxn();
+    const Token t = r.sendOffsets(offsetsOf(1), "g");
+    r.tick();
+    r.answerFrame(r.lastOf(rpc::AddOffsetsToTxn::TEMPLATE_ID), rp::ReqKind::AddOffsets, 0);
+    r.tick();
+    const auto oc = r.lastOf(rpc::TxnOffsetCommit::TEMPLATE_ID);
+    ASSERT_NE(oc.corrId, 0);
+    r.answerFrame(oc, rp::ReqKind::TxnOffsetCommit, ec(rpc::ErrorCode::ConcurrentTransactions));
+    EXPECT_EQ(r.d(t).times, 0) << "27 must not complete the op";
+    r.tick(5 * kMs);   // past the 1 ms backoff
+    const auto commits = r.cap.of(rpc::TxnOffsetCommit::TEMPLATE_ID);
+    ASSERT_EQ(commits.size(), 2u) << "27 re-sent the TxnOffsetCommit";
+    EXPECT_EQ(commits[1].corrId, oc.corrId) << "the same request is re-sent";
+    r.answerFrame(oc, rp::ReqKind::TxnOffsetCommit, 0);
+    ASSERT_EQ(r.d(t).times, 1);
+    EXPECT_EQ(r.d(t).status, OpStatus::Ok);
+}
+
+// F14: NotCoordinator never just re-sends into the same (loading / moved) coordinator: it asks to re-discover
+// (once per generation), waits for the move, then backs off and re-sends - on both offsets legs.
+TEST(ProducerTxnOffsetsRegression, NotCoordinatorRediscoversThenRetriesRegression) {
+    Rig r;
+    r.inTxn();
+    const Token t = r.sendOffsets(offsetsOf(1), "g");
+    r.tick();
+    const auto ao = r.lastOf(rpc::AddOffsetsToTxn::TEMPLATE_ID);
+    r.answerFrame(ao, rp::ReqKind::AddOffsets, ec(rpc::ErrorCode::NotCoordinator));
+    EXPECT_EQ(r.cap.rediscovers, 1);
+    for (int i = 0; i < 16; ++i) r.tick(10 * kMs);   // 160 ms: inside the 1 s op deadline
+    EXPECT_EQ(r.cap.of(rpc::AddOffsetsToTxn::TEMPLATE_ID).size(), 1u) << "re-sent before the coordinator moved";
+    EXPECT_EQ(r.d(t).times, 0);
+    r.hub.onCoordinatorMoved();
+    r.tick();
+    ASSERT_EQ(r.cap.of(rpc::AddOffsetsToTxn::TEMPLATE_ID).size(), 2u) << "not re-sent after the re-discovery";
+    r.answerFrame(ao, rp::ReqKind::AddOffsets, 0);
+    r.tick();
+    const auto oc = r.lastOf(rpc::TxnOffsetCommit::TEMPLATE_ID);
+    ASSERT_NE(oc.corrId, 0);
+    r.answerFrame(oc, rp::ReqKind::TxnOffsetCommit, ec(rpc::ErrorCode::NotCoordinator));
+    EXPECT_EQ(r.cap.rediscovers, 2);
+    for (int i = 0; i < 16; ++i) r.tick(10 * kMs);   // 160 ms: inside the 1 s op deadline
+    EXPECT_EQ(r.cap.of(rpc::TxnOffsetCommit::TEMPLATE_ID).size(), 1u);
+    r.hub.onCoordinatorMoved();
+    r.tick();
+    ASSERT_EQ(r.cap.of(rpc::TxnOffsetCommit::TEMPLATE_ID).size(), 2u);
+    r.answerFrame(oc, rp::ReqKind::TxnOffsetCommit, 0);
+    ASSERT_EQ(r.d(t).times, 1);
+    EXPECT_EQ(r.d(t).status, OpStatus::Ok);
+}
+
+// No-hang fix round 2: AddOffsetsToTxn / TxnOffsetCommit answered InvalidRequest (the broker could not decode them)
+// complete their operation with that error at once - never pending, never re-sent.
+TEST(ProducerTxnOffsetsRegression, AddOffsetsAndTxnOffsetCommitInvalidRequestCompleteRegression) {
+    constexpr int16_t kInv = ec(rpc::ErrorCode::InvalidRequest);
+    for (const bool atAddOffsets : {true, false}) {
+        SCOPED_TRACE(atAddOffsets ? "AddOffsetsToTxn" : "TxnOffsetCommit");
+        Rig r;
+        r.inTxn();
+        const Token t = r.sendOffsets(offsetsOf(1), "g");
+        r.tick();
+        const auto ao = r.lastOf(rpc::AddOffsetsToTxn::TEMPLATE_ID);
+        ASSERT_NE(ao.corrId, 0);
+        if (atAddOffsets) {
+            r.answerFrame(ao, rp::ReqKind::AddOffsets, kInv);
+            ASSERT_EQ(r.d(t).times, 1);
+            EXPECT_EQ(r.d(t).status, OpStatus::BrokerError);
+            for (int i = 0; i < 64; ++i) r.tick(10 * kMs);
+            EXPECT_EQ(r.cap.of(rpc::AddOffsetsToTxn::TEMPLATE_ID).size(), 1u);
+            continue;
+        }
+        r.answerFrame(ao, rp::ReqKind::AddOffsets, 0);
+        r.tick();
+        const auto oc = r.lastOf(rpc::TxnOffsetCommit::TEMPLATE_ID);
+        ASSERT_NE(oc.corrId, 0);
+        r.answerFrame(oc, rp::ReqKind::TxnOffsetCommit, kInv);
+        ASSERT_EQ(r.d(t).times, 1);
+        EXPECT_EQ(r.d(t).status, OpStatus::BrokerError);
+        for (int i = 0; i < 64; ++i) r.tick(10 * kMs);
+        EXPECT_EQ(r.cap.of(rpc::TxnOffsetCommit::TEMPLATE_ID).size(), 1u);
+    }
+}
+
+// m15 (AddOffsets): a sendOffsets whose AddOffsetsToTxn was sent but timed out makes the transaction possibly
+// started: the abort sends EndTxn(abort); an answer of 19 there (nothing was open) ends the abort Ok, not fatal.
+TEST(ProducerTxnOffsetsRegression, TimedOutAddOffsetsAbortsPossiblyStartedTxnRegression) {
+    Rig r;
+    r.inTxn();
+    const Token offs = r.sendOffsets(offsetsOf(1), "g");
+    r.tick();
+    ASSERT_EQ(r.cap.of(rpc::AddOffsetsToTxn::TEMPLATE_ID).size(), 1u);   // never answered
+    r.tick(1'500 * kMs);   // transactionOpTimeoutMs = 1000
+    ASSERT_EQ(r.d(offs).times, 1);
+    EXPECT_EQ(r.d(offs).status, OpStatus::Timeout);
+    const Token abort = r.apply(TxnControl::Kind::Abort);
+    r.tick();
+    ASSERT_EQ(r.cap.of(rpc::EndTxn::TEMPLATE_ID).size(), 1u);
+    r.answerFrame(r.lastOf(rpc::EndTxn::TEMPLATE_ID), rp::ReqKind::EndTxn, ec(rpc::ErrorCode::InvalidTxnState));
+    r.tick();
+    ASSERT_EQ(r.d(abort).times, 1);
+    EXPECT_EQ(r.d(abort).status, OpStatus::Ok);
+    EXPECT_EQ(r.impl->txnStateDuty(), TxnState::Ready) << "19 here means nothing was open: not fatal";
 }

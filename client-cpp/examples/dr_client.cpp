@@ -112,7 +112,6 @@
 #include <rune/client/Key.h>
 #include <rune/client/TopicHandle.h>
 #include <rune/client/producer/Producer.h>
-#include <rune/client/producer/TransactionalProducer.h>
 #include <rune/client/subscriber/Subscription.h>
 #include <rune/client/group/GroupConsumer.h>
 #include <rune/protocol/RecordBatch.h>
@@ -503,7 +502,7 @@ static int doGroup(Client& client,
 // ---------------------------------------------------------------------------
 // TX-5: Transactional produce mode (RUNE_MODE=txn_produce).
 //
-// Runs init→begin→produce(records)→commit/abort using the TransactionalProducer.
+// Runs init→begin→produce(records)→commit/abort on a Producer with a transactionalId.
 // Emits:
 //   TXNPRODUCE cid=<c> key=<k> seq=<s> part=<p>   (per record sent)
 //   TXNRESULT txn_id=<id> cid=<c> outcome=committed|aborted
@@ -521,7 +520,8 @@ static int doTxnProduce(Client& c, const TopicHandle& th,
     pcfg.maxInFlight      = 16;
     pcfg.produceTimeoutMs = static_cast<int64_t>(timeoutMs);
 
-    auto tp = c.transactionalProducer(txnId, pcfg);
+    pcfg.transactionalId  = txnId;
+    auto tp = c.producer(pcfg);
 
     // initTransactions (F8c C5: cold-path blocking form; the op itself is
     // bounded by produceTimeoutMs of duty time)
@@ -833,10 +833,8 @@ int main() {
 
         if (mode == "txn_produce") {
             // TX-5: txn_produce — init→begin→send→commit/abort.
-            // transactionalProducer() MUST be called before connect() (setup phase).
-            // We call connect() inside doTxnProduce via the c.connect() path —
-            // but actually transactionalProducer is setup-phase; connect is called
-            // here before dispatching, matching the regular producer pattern.
+            // The transactional Producer (ProducerConfig::transactionalId) is created in doTxnProduce,
+            // after connect() here, like any other producer.
             std::cerr << "CLIENT: txn_produce mode txnId=" << txnId
                       << " commit=" << txnCommit << " records=" << records << "\n";
             std::cerr << "CLIENT: connecting...\n";

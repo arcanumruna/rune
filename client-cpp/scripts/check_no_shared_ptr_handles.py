@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """check_no_shared_ptr_handles.py — F8c C7 guard (rune-client-cpp).
 
-Spec F8c §3.1 / §5 C7: the client's handles (Producer, TransactionalProducer,
-Subscription, GroupConsumer, BatchBuilder, TypedTopic) are MOVE-ONLY and own
+Spec F8c §3.1 / §5 C7: the client's handles (Producer, a transactional
+Producer is a Producer, Subscription, GroupConsumer, BatchBuilder, TypedTopic) are MOVE-ONLY and own
 their impls through the §3.3 release protocol — no std::shared_ptr, no
 refcount, no "last owner frees" decided by an atomic RMW race.  The hubs hold
 owning raw pointers (the duty side's share) and hand them over by ring order.
@@ -106,7 +106,6 @@ REQUIRED_HANDLE_HEADERS = {
     "include/rune/client/TypedTopic.h",
     "include/rune/client/producer/Producer.h",
     "include/rune/client/producer/BatchBuilder.h",
-    "include/rune/client/producer/TransactionalProducer.h",
     "include/rune/client/subscriber/Subscription.h",
     "include/rune/client/group/GroupConsumer.h",
 }

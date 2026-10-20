@@ -23,7 +23,7 @@ Contents: [model](#threading-model) · [connect](#connect) · [authentication](#
   other than a broker error code. Never call a `*AndWait` from a callback; it throws `std::logic_error`.
 - **Exactly once.** An operation either returns a non-`Accepted` `OpResult` (no completion ever) or completes exactly
   once: with its result, its own `Timeout`, a broker error, `NotConnected`, `SessionLost` or `Closed`.
-- Handles (`Producer`, `Subscription`, `GroupConsumer`, `TransactionalProducer`) are **move-only**. A destructor never
+- Handles (`Producer`, `Subscription`, `GroupConsumer`) are **move-only**. A destructor never
   blocks: it equals `closeImmediately()`. Call `close()` first when delivery matters.
 - The hot path allocates nothing: `send`, `trySend` and the token ack forms write into preallocated rings.
 
@@ -290,14 +290,14 @@ exactly-once.
 ## Transactions
 
 ```cpp
-TransactionalProducer tp = client.transactionalProducer("trade-worker-1", {.acks = Acks::All});
-client.connectAndWait();                       // transactionalProducer() is called BEFORE connect
+Producer tp = client.producer({.acks = Acks::All, .transactionalId = "trade-worker-1"});
+client.connectAndWait();
 tp.initTransactionsAndWait();
 tp.beginTransaction();
 try {
     tp.send(out, Key(uint64_t{1}), a);
     tp.send(out, Key(uint64_t{2}), b);
-    std::map<TopicPartitionKey, int64_t> offsets{{{topicId, partition}, nextOffset}};
+    const OffsetEntry offsets[] = {{topicId, partition, nextOffset}};
     tp.sendOffsetsToTransactionAndWait(offsets, "economy");   // the consumer group's input offsets
     tp.commitTransactionAndWait();             // outputs and offsets, atomically
 } catch (const std::runtime_error&) {
@@ -312,9 +312,10 @@ try {
 - Other methods: `flush`, `close`, `closeAndWait`, `producerId()`, `producerEpoch()`, `transactionActive()`. A transactional
   producer needs `WRITE` on its transactional id.
 - A `ReadCommitted` consumer sees a transaction's records only after commit.
-- **Not yet in this tree:** a unified `Producer` with `ProducerConfig::transactionalId` and `GroupConsumer::seekToCommitted()` are designed (see `broker/docs/superpowers/plans/`) but are not in the
-  headers. Today a transaction uses `TransactionalProducer`, and after an abort you re-create the consumer or reposition
-  it with a new subscription.
+- A transaction is a plain `Producer` created with `ProducerConfig::transactionalId`; every produce path (`send`, `trySend`,
+  Tier-2 batches, claims) takes part in it. The status getters (`state()`, `producerId()`, ...) work on the thread that created
+  the producer only. **Not yet in this tree:** `GroupConsumer::seekToCommitted()` is designed (see `broker/docs/superpowers/plans/`)
+  but is not in the headers; after an abort you re-create the consumer or reposition it with a new subscription.
 
 ## Typed topics and routing
 

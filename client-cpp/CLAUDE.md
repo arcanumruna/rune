@@ -102,7 +102,7 @@ alloc-free handoff). The agent drains, accumulates records into per-
 - `ProducerHub` holds the producers the duty thread owns (registered through
   the agent command ring — no lock, no atomic); `onProduceResponse` routes acks
   back by the batch id's ordinal.
-- F8c C7 — handle lifetime (spec §3): `Producer`, `TransactionalProducer`,
+- F8c C7 — handle lifetime (spec §3): `Producer` (plain or transactional),
   `Subscription`, `GroupConsumer`, `TypedTopic` are MOVE-ONLY; `BatchBuilder`
   borrows its producer.  No `shared_ptr` anywhere in the handles or hubs
   (guard: `NoSharedPtrInPublicHandlesGuardRegression`): each impl is owned
@@ -110,7 +110,7 @@ alloc-free handoff). The agent drains, accumulates records into per-
   impl's ownership word (a ring word, one RMW) exactly once, and whichever
   detaches last frees it — nobody waits, nobody refcounts.  A handle's
   destructor hands its share over with one `HandleRelease` command
-  (Producer / TransactionalProducer: `closeImmediately()` unless a close already
+  (Producer: `closeImmediately()` unless a close already
   started; Subscription: unsubscribe; GroupConsumer: close); the duty side
   frees at the end of a duty cycle once nothing references the impl (never
   under a running callback).  The duty thread (Invoker owner, runner callback)
@@ -121,10 +121,10 @@ alloc-free handoff). The agent drains, accumulates records into per-
   bound.  Client close
   hands every still-held impl back to its handle.
 - Shutdown pairs (user decision 2): `Producer::close()` drains /
-  `closeImmediately()` discards; `TransactionalProducer::close()` aborts an open
+  `closeImmediately()` discards; a transactional `Producer::close()` aborts an open
   broker transaction (EndTxn(abort)) before it reports closed /
   `closeImmediately()` discards locally; `Client::close()` drains every
-  producer and closes every transactional producer, then tears down /
+  producer (transactional ones abort first), then tears down /
   `Client::closeImmediately()` (= the destructor) tears down at once.
 
 ### 2.2 Subscriber (`subscriber/`)

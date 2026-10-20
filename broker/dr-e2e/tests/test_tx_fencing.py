@@ -4,7 +4,7 @@ A zombie producer (old epoch) is fenced after a new initProducerId is called
 with the same transactional id.  The fenced producer's late commit must be
 rejected by the broker.
 
-This test exercises the fencing path from TX-5 TransactionalProducerImpl:
+This test exercises the fencing path of a transactional Producer (ProducerConfig::transactionalId):
   - ProducerFenced / InvalidProducerEpoch errorCodes cause the old producer to
     be fenced (producerId reset to -1, all pending futures fail).
 
@@ -15,7 +15,7 @@ Strategy:
   3. P1's new transaction is rejected (ProducerFenced).
   4. P2 commits successfully.
 
-Since we can't interleave two transactionalProducer handles on the same
+Since we can't interleave two transactional producer handles on the same
 dr_client container easily, we simulate via two sequential txn_produce runs
 with the SAME txn_id.  The second run with a fresh initTransactions bumps the
 epoch; the first producer (if it had an open transaction) would be fenced.

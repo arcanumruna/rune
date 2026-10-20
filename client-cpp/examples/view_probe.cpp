@@ -109,7 +109,6 @@
 #include <rune/client/Key.h>
 #include <rune/client/TopicHandle.h>
 #include <rune/client/producer/Producer.h>
-#include <rune/client/producer/TransactionalProducer.h>
 #include <rune/client/view/ViewPlanAuthor.h>
 #include <rune/client/view/ViewRowCodec.h>
 #include <rune/client/TypedTopic.h>
@@ -627,8 +626,9 @@ static bool transientTxn(Client& c, int32_t topicId, const std::string& txnId, i
     ProducerConfig pcfg;
     pcfg.acks             = Acks::All;
     pcfg.produceTimeoutMs = static_cast<int64_t>(timeoutMs);
+    pcfg.transactionalId  = txnId;
     try {
-        auto tp = c.transactionalProducer(txnId, pcfg);
+        auto tp = c.producer(pcfg);
         tp.initTransactionsAndWait(std::chrono::milliseconds(timeoutMs * 2));
         tp.beginTransaction();
         for (int i = 0; i < n; ++i) {
@@ -758,13 +758,14 @@ static int transientFailoverMode(Client& c, std::chrono::milliseconds wait, int 
     // position note (5) delivers them.  The Latest subscription still has
     // delivered nothing when it moves.  Deterministic: no race with the
     // re-subscribe.
-    std::optional<TransactionalProducer> tp;
+    std::optional<Producer> tp;
     {
         ProducerConfig tcfg;
         tcfg.acks             = Acks::All;
         tcfg.produceTimeoutMs = static_cast<int64_t>(timeoutMs);
+        tcfg.transactionalId  = "e2-failover-txn";
         try {
-            tp.emplace(c.transactionalProducer("e2-failover-txn", tcfg));
+            tp.emplace(c.producer(tcfg));
             tp->initTransactionsAndWait(std::chrono::milliseconds(timeoutMs * 2));
             tp->beginTransaction();
             for (int i = 0; i < kTxn; ++i) {

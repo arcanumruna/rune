@@ -82,8 +82,7 @@ enum class Acks : uint8_t {
 };
 
 // ---------------------------------------------------------------------------
-// TopicPartitionKey - (topicId, partition) pair (moved here from
-// TransactionalProducer.h, Phase 2b F; unchanged).
+// TopicPartitionKey - (topicId, partition) pair.
 // ---------------------------------------------------------------------------
 struct TopicPartitionKey {
     int32_t topicId   = 0;
@@ -152,7 +151,7 @@ struct ProducerConfig {
     // transient topic's ring is full of not-yet-replicated records) are re-sent
     // after a backoff with the same identity, never failed early.
     int64_t produceTimeoutMs = 5'000;
-    // F8c fix round 1 (I-4): TransactionalProducer only — the deadline of
+    // F8c fix round 1 (I-4): transactional producers only — the deadline of
     // initTransactions / sendOffsetsToTransaction / commit / abort (Kafka
     // max.block.ms; >= the default transaction timeout).  EndTxn gets a fresh
     // one when it is created (the wait for in-flight data does not consume
@@ -545,7 +544,7 @@ public:
     /// 2026-10-03).  A larger record is REJECTED at append, never silently
     /// dropped: trySend() returns SendResult::MessageTooLarge (non-retriable),
     /// the void send() throws std::length_error, a Tier-2 BatchBuilder::add()
-    /// and TransactionalProducer::send() throw std::length_error.  One O(1)
+    /// and a transactional Producer::send() throw std::length_error.  One O(1)
     /// compare at append — no per-record scan anywhere else.  The broker's
     /// hard limit stays its batch limit (term/8).  Chunking larger payloads is
     /// left to the caller.

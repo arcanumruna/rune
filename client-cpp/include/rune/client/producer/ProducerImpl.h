@@ -1066,6 +1066,11 @@ public:
     /// E2 final fix wave (M3), kept from the transactional producer: a batch answered TransientLogFull (42) is
     /// re-offered after this much DUTY-CLOCK time (capped by produceTimeoutMs) - never a cycle count.
     static constexpr int64_t kTransientLogFullBackoffNs = kRetriableBackoffNs;
+    /// The error a transactional producer's transaction fails with when its sequences must restart (wire values of
+    /// ErrorCode::OutOfOrderSequence / ::UnknownProducerId; the second is the app-visible code when the broker
+    /// forgot the producer).
+    static constexpr uint16_t kTxnResetOos        = 20;
+    static constexpr uint16_t kTxnResetUnknownPid = 28;
     /// DR-15 review M1: a Redirect for `corrId` that is not followed (target
     /// unreachable) is still an answer for the in-flight accounting (NEW-4(b)).
     void noteRedirectAnswer(int64_t corrId) noexcept;
@@ -1248,7 +1253,7 @@ public:
     //   a refused leg / lost data -> AbortableError{status, code, started, kind} (commit completes with it)
     //   17 / 18, 19 or 45 on EndTxn, a non-retriable InitProducerId, a revoked session -> FatalError (terminal)
     //
-    // Semantics are the old TransactionalProducerImpl's (Kafka TransactionManager): state gating (begin only in
+    // Semantics are Kafka's TransactionManager's: state gating (begin only in
     // Ready; commit / sendOffsets only InTransaction; abort in InTransaction / AbortableError; init only
     // Uninitialized; FatalError: every op completes with its status), misuse completes BrokerError(19), an
     // unstarted transaction ends locally (B-1), an op timeout leaves Committing / Aborting InDoubt and the SAME
@@ -1628,7 +1633,9 @@ private:
     /// bump if it is on the current one (else it adopts the current one).
     /// Epoch overflow: at INT16_MAX the identity machine asks the broker for a NEW id
     /// (IdUnassigned -> InitProducerId, FD4); the partition holds (producerId -1) until it arrives.
-    void resetPartition_(PartitionState& ps) noexcept;
+    /// `cause`: the error a TRANSACTIONAL producer's transaction fails with when the sequences must restart
+    /// (OutOfOrderSequence; UnknownProducerId when the broker forgot the producer - the app-visible code 28).
+    void resetPartition_(PartitionState& ps, uint16_t cause = kTxnResetOos) noexcept;
     /// Sequence space (int32; the client chooses never to wrap — N-c: since
     /// rune-broker 37564ba the broker accepts the Kafka wrap INT32_MAX -> 0 in
     /// order and refuses a batch crossing INT32_MAX; not wrapping is compatible
@@ -1644,7 +1651,7 @@ private:
     [[nodiscard]] bool sequenceRoom_(PartitionState& ps, int32_t n) noexcept;
     /// resetPartition_ + every live batch re-stamped (frame + header + CRC) in
     /// order from sequence 0 and queued for re-send (parked), new attempts.
-    void resequence_(PartitionState& ps) noexcept;
+    void resequence_(PartitionState& ps, uint16_t cause = kTxnResetOos) noexcept;
     /// Re-stamp a stored frame's attempt tag (MessageHeader correlationId).
     static void stampAttempt_(InFlightBatch& b, uint8_t tag) noexcept;
     /// NEW-4(b): an answer (any outcome) to attempt `tag` of `b` arrived — one
@@ -1883,7 +1890,7 @@ private:
     [[gnu::cold, gnu::noinline]] int refuseRingTxn_(int limit) noexcept;
     /// Sequence reset of a transactional partition (KIP-360: the coordinator owns the epoch - never bumped
     /// locally): the partition sends nothing new, the transaction must abort and the abort bumps the epoch.
-    [[gnu::cold, gnu::noinline]] void txnResetPartition_(PartitionState& ps) noexcept;
+    [[gnu::cold, gnu::noinline]] void txnResetPartition_(PartitionState& ps, uint16_t cause) noexcept;
     /// A txn op (or flush) still owes its completion: the producer is not releasable before it is decided.
     [[nodiscard]] bool txnHasLiveOp_() const noexcept;
     int  txnStepCold_(int64_t nowNs) noexcept;

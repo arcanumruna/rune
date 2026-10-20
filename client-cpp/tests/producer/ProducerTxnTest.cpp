@@ -6,7 +6,7 @@
 // pass is hub.drainAndFlush on an injected duty clock (no sleeps, no threads, no atomics), completions land in a
 // handler ledger that counts them per token (exactly once is asserted for every token at teardown).
 //
-// Ported from TransactionalProducerTest (lifecycle-only cases; the data side - AddPartitions, records in a
+// Ported from the removed transactional-producer test (lifecycle-only cases; the data side - AddPartitions, records in a
 // transaction - is Task 6, offsets Task 7):
 //   InitTransactionsAcquiresPidEpoch                       -> InitAssignsIdAndEpochAndGoesReady
 //   CommitTransactionEmitsEndTxnCommit                      -> CommitTransactionEmitsEndTxnCommit
@@ -993,6 +993,30 @@ TEST(ProducerTxn, PoisonedTransactionMustBeAbortedBeforeTheNextRegression) {
     r.endAnswer();
     ASSERT_TRUE(commit2.ready());
     EXPECT_EQ(commit2.status(), OpStatus::Ok);
+}
+
+// Phase 2b F Task 9 (the tail of the removed PoisonedTransactionMustBeAbortedBeforeTheNext test): the first
+// EndTxn(abort) offer is refused by the transport and re-offered on a later pass; the abort stays pending (still
+// AbortingTransaction) until the final answer.
+TEST(ProducerTxnRegression, RefusedEndTxnAbortOfferIsReofferedRegression) {
+    Rig r;
+    r.initOk();
+    r.startTxn();
+    r.impl->testPoison(OpStatus::DeliveryFailed, 0, rp::AbortKind::Plain);
+    r.fake.next = rp::CoordinatorSink::Offer::Retry;
+    Op abort = r.abort();
+    r.ticks(3);
+    EXPECT_FALSE(abort.ready());
+    EXPECT_EQ(r.state(), TxnState::AbortingTransaction);
+    EXPECT_EQ(r.endTxns(), 0u) << "a refused offer is not on the wire";
+    r.fake.next = rp::CoordinatorSink::Offer::Accepted;
+    r.tick(5 * kMs);
+    ASSERT_EQ(r.endTxns(), 1u) << "the refused EndTxn was never re-offered";
+    EXPECT_EQ(r.lastEnd()->commit, uint8_t{0});
+    r.endAnswer();
+    ASSERT_TRUE(abort.ready());
+    EXPECT_EQ(abort.status(), OpStatus::Ok);
+    EXPECT_EQ(r.state(), TxnState::Ready);
 }
 
 // B-3 (KIP-360): a sequence gap makes the abort bump the epoch - InitProducerId (the transactional id) after

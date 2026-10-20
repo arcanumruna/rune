@@ -64,20 +64,8 @@ struct HubCommand {
         /// the duty thread, which installs it and frees the holder (C3).
         ClientSetCallback = 22,
 
-        // ---- TransactionalProducer (F8c C5) ------------------------------------
-        // handle = TransactionalProducerImpl* (identity; resolved against the
-        // Client's own list on the ring path, never dereferenced unless found).
-        // Token ops: a = Token, b / c = completion target (encodeTarget).
-        /// InitProducerId.
-        TxnInit         = 30,
-        /// beginTransaction (no completion).
-        TxnBegin        = 31,
-        /// d = heap producer::TxnSendRecord* (ownership passes; no completion).
-        TxnSend         = 32,
-        /// d = heap producer::TxnOffsetsPayload* (ownership passes).
-        TxnSendOffsets  = 33,
-        /// d = 1 commit / 0 abort.
-        TxnEnd          = 34,
+        // 30-37 retired (Phase 2b F: the hub commands of the removed separate transactional handle; transactions are Producer +
+        // transactionalId, their control ops travel the producer ring) - never reuse.
 
         // ---- Producer (F8c C6a) -------------------------------------------------
         /// handle = producer::ProducerImpl* (kept alive by the hub / the issuing
@@ -88,29 +76,18 @@ struct HubCommand {
         /// its own; a pending begin-close token completes Closed).
         ProducerCloseNow   = 41,
 
-        // ---- TransactionalProducer close (F8c C7) -------------------------------
-        /// Token op (a = Token, b / c = target): close — an open broker
-        /// transaction is aborted (EndTxn(abort)) first; the token completes
-        /// once the producer is closed (Ok, or the abort's failure status).
-        TxnClose        = 35,
-        /// closeImmediately: discard locally (pending ops complete Closed, a
-        /// pending close token completes Closed); no completion of its own.
-        TxnCloseNow     = 36,
-        /// Token op: flush — completes once every record sent so far is acked (Kafka producer.flush()).
-        TxnFlush        = 37,
-
         // ---- Handle release (F8c C7, spec §3.3) ---------------------------------
         /// handle = the impl, a = HandleKind.  The handle gives its share of
         /// the impl to the duty side: the duty side first applies the handle's
-        /// destructor semantics (Producer / TransactionalProducer:
+        /// destructor semantics (Producer:
         /// closeImmediately unless a close is already in progress;
         /// Subscription: unsubscribe; GroupConsumer: close), then — once
         /// nothing on the duty side references the impl any more — detaches
         /// its side of the impl's ownership word.  Whichever of the two sides
         /// detaches LAST frees the impl (one RMW each, nobody waits).
         HandleRelease   = 50,
-        /// F8c C7: Client::close() — begin-close every producer and close every
-        /// transactional producer; a = Token, b / c = target; completes Ok once
+        /// F8c C7: Client::close() — begin-close every producer;
+        /// a = Token, b / c = target; completes Ok once
         /// every one of them settled (each bounded by its own deadline).
         ClientDrain     = 51,
     };
@@ -126,13 +103,13 @@ struct HubCommand {
 /// F8c C7: which impl type a HandleRelease carries.
 enum class HandleKind : int64_t {
     Producer      = 1,
-    TxnProducer   = 2,
+    // 2 retired (Phase 2b F: TxnProducer) - never reuse.
     Subscription  = 3,
     GroupConsumer = 4,
 };
 
 /// F8c C7 test seam: called by every handle impl's destructor (Producer,
-/// TransactionalProducer, Subscription and GroupConsumer impls) — counts and
+/// Subscription and GroupConsumer impls) — counts and
 /// attributes frees.  Set it before any thread that may free an impl runs and
 /// clear it after they are joined (never written while another thread reads
 /// it).  nullptr in production.
@@ -175,7 +152,7 @@ enum class SendResult : uint8_t { Accepted, Retry, Fatal };
 [[nodiscard]] constexpr bool isLifecycle(HubCommand::Op op) noexcept {
     return op == HubCommand::Op::Unsubscribe || op == HubCommand::Op::GroupClose ||
            op == HubCommand::Op::CqRelease || op == HubCommand::Op::ProducerBeginClose ||
-           op == HubCommand::Op::ProducerCloseNow || op == HubCommand::Op::TxnCloseNow ||
+           op == HubCommand::Op::ProducerCloseNow ||
            op == HubCommand::Op::HandleRelease;
 }
 

@@ -287,14 +287,6 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
                 }
                 break;
 
-            case kMsgRegisterTxnProducer:
-                if (txnProducerRegisterFn_) {
-                    const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + offset);
-                    auto msg = ring_msg::RegisterProducer::decode(p, static_cast<std::size_t>(len));
-                    if (msg) txnProducerRegisterFn_(reinterpret_cast<void*>(msg->handle));
-                }
-                break;
-
             case kMsgHubCommand:
                 // F8a: subscriber / group-consumer command, applied by the hub
                 // that owns the state — on THIS (duty) thread.
@@ -527,7 +519,7 @@ int ClientAgent::drainRegistrationsForClose() noexcept {
     // fix3 I1: ring_.read() stops dead at a record that is CLAIMED but not yet
     // COMMITTED (its length word is still negative) — it has no way to tell
     // "nothing more was ever written" apart from "another app thread is
-    // mid-write, right now, on a producer()/transactionalProducer() call that
+    // mid-write, right now, on a producer() call that
     // raced this close()". The old `if (n == 0) break;` treated both the same
     // and could leave a fully-committed registration sitting UNREAD behind
     // that in-flight claim (leaked holder; its ring never marked closed).
@@ -602,10 +594,7 @@ int ClientAgent::drainRegistrationsForClose() noexcept {
                     if (controlOpFn_) controlOpFn_(p, static_cast<std::size_t>(len));
                     return;
                 }
-                const ProducerRegisterFn* fn =
-                    (msgTypeId == kMsgRegisterProducer)      ? &producerRegisterFn_
-                    : (msgTypeId == kMsgRegisterTxnProducer) ? &txnProducerRegisterFn_
-                                                             : nullptr;
+                const ProducerRegisterFn* fn = (msgTypeId == kMsgRegisterProducer) ? &producerRegisterFn_ : nullptr;
                 if (fn == nullptr || !*fn) return;  // sends / lifecycle: dropped
                 auto msg = ring_msg::RegisterProducer::decode(p, static_cast<std::size_t>(len));
                 if (msg) (*fn)(reinterpret_cast<void*>(msg->handle));
@@ -663,14 +652,6 @@ ClientAgent::Submit ClientAgent::submitHubCommand(const ::rune::client::detail::
     uint8_t buf[ring_msg::HubCommandMsg::ENCODED_SIZE];
     const std::size_t n = ring_msg::HubCommandMsg::encode(cmd, buf);
     return writeCommand3_(kMsgHubCommand, buf, n);
-}
-
-ClientAgent::Submit ClientAgent::submitRegisterTxnProducer(void* impl) noexcept {
-    ring_msg::RegisterProducer msg;
-    msg.handle = reinterpret_cast<uint64_t>(impl);
-    uint8_t buf[ring_msg::RegisterProducer::ENCODED_SIZE];
-    const std::size_t n = msg.encode(buf);
-    return writeCommand3_(kMsgRegisterTxnProducer, buf, n);
 }
 
 // ---------------------------------------------------------------------------
@@ -1110,7 +1091,6 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
                 produceAcks_.push_back(ProduceAck{opt->correlationId, off, opt->errorCode, opt->logStartOffset});
             }
         }
-        if (forwardProduceResponses_ && egressObserver_) egressObserver_(tid, buf, len);
         break;
     }
 

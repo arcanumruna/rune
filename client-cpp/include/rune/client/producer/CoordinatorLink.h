@@ -108,7 +108,7 @@ public:
         return sink_.sessionId != nullptr && sink_.sessionId(sink_.ctx) != 0;
     }
 
-    /// The verdict table (FD5 / FD6; Kafka parity, TransactionalProducerImpl::classify_ plus auth).
+    /// The verdict table (FD5 / FD6; Kafka parity, plus auth).
     [[nodiscard]] static Verdict classify(ReqKind kind, int16_t errorCode) noexcept;
     /// min(1 ms << (attempt - 1), 100 ms); attempt 0 -> 0.
     [[nodiscard]] static int64_t backoffNs(uint32_t attempt) noexcept;
@@ -123,6 +123,7 @@ private:
     uint32_t        live_ = 0;   // slots not Free (Building included)
     uint64_t        scans_ = 0;
     uint64_t        gen_ = 0;
+    uint64_t        askedGen_ = ~uint64_t{0};   // the generation a re-discovery was last requested for
     CoordinatorSink sink_;
 };
 

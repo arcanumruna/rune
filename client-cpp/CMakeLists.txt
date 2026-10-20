@@ -396,8 +396,6 @@ if(aeron_FOUND)
         src/producer/CoordinatorLink.cpp
         src/producer/ProducerTxn.cpp
         src/producer/BatchBuilder.cpp
-        src/producer/TransactionalProducerImpl.cpp
-        src/producer/TransactionalProducer.cpp
     )
     target_include_directories(rune_client_producer PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -1287,24 +1285,6 @@ if(BUILD_TESTING)
         gtest_discover_tests(rune_producer_race_tests)
     endif()
 
-    # ── TX-5 Transactional producer + read_committed consumer tests ─────────────
-    if(aeron_FOUND)
-        add_executable(rune_txn_producer_tests
-            tests/producer/TransactionalProducerTest.cpp
-        )
-        target_include_directories(rune_txn_producer_tests PRIVATE
-            ${RUNE_PROTOCOL_INCLUDE}
-        )
-        target_link_libraries(rune_txn_producer_tests PRIVATE
-            rune_client_producer
-            rune_client_group
-            rune_client_agent
-            GTest::gtest_main
-        )
-
-        gtest_discover_tests(rune_txn_producer_tests)
-    endif()
-
     # ── BatchBuilder tests (CB-3) — Tier-2 explicit atomic batch ──────────────
     if(aeron_FOUND)
         add_executable(rune_batch_builder_tests
@@ -1401,6 +1381,7 @@ if(BUILD_TESTING)
     # No Aeron dependency: GroupConsumerHub is self-contained (no transport).
     add_executable(rune_group_tests
         tests/group/GroupConsumerTest.cpp
+        tests/group/GroupConsumerReadCommittedTest.cpp
     )
     target_include_directories(rune_group_tests PRIVATE
         ${RUNE_PROTOCOL_INCLUDE}

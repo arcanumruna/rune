@@ -227,3 +227,46 @@ TEST(ProducerTxnApiRegression, TransactionalInvokerProducerOffTheOwnerThreadIsWr
     EXPECT_EQ(impl.claimBatch(7, 0, Key(uint64_t{1}), 2, 8).result, SendResult::NotInTransaction);
     EXPECT_EQ(impl.submitTier2Bytes(7, 0, 0, 1, bb), rc::producer::RejectReason::NotInTransaction);
 }
+
+// fix1 I8: an invalid topic is never silently dropped - the void send() throws, in a transaction or outside one.
+TEST(ProducerTxnApiRegression, SendOnInvalidTopicThrowsRegression) {
+    Rig r(cfgOf(Acks::All, "tx-invalid"));
+    r.impl->setTxnGate(ProducerImpl::TxnGate::Open);
+    EXPECT_THROW(r.p.send(TopicHandle{}, Key(uint64_t{1}), bytes("v")), std::invalid_argument);
+    EXPECT_EQ(r.p.trySend(TopicHandle{}, Key(uint64_t{1}), bytes("v")), SendResult::InvalidTopic);
+    r.impl->setTxnGate(ProducerImpl::TxnGate::Closed);
+    EXPECT_THROW(r.p.send(TopicHandle{}, Key(uint64_t{1}), bytes("v")), std::exception)
+        << "outside a transaction an invalid topic is still refused loudly";
+}
+
+// Backlog B6: a transactional record (key + value) over Producer::kMaxRecordBytes is rejected at append
+// (std::length_error), never sent.
+TEST(ProducerTxnApi, RecordOver16KiBIsRejectedAtAppend) {
+    Rig r(cfgOf(Acks::All, "tx-big"));
+    r.impl->setTxnGate(ProducerImpl::TxnGate::Open);
+    const std::vector<uint8_t> over(Producer::kMaxRecordBytes - 7, 0x09);   // + 8-byte key
+    EXPECT_THROW(r.p.send(kTopic, Key(uint64_t{0}), over), std::length_error);
+    EXPECT_EQ(r.p.trySend(kTopic, Key(uint64_t{0}), over), SendResult::MessageTooLarge);
+    EXPECT_EQ(r.impl->drainRing(1'000'000'000, 256), 0) << "an over-size record reached the ring";
+}
+
+// Phase 2b F Task 9: transactions are Producer + ProducerConfig::transactionalId; the separate handle is gone.
+// (A requires-expression naming a missing type is a hard error outside a template, so the type is pinned through its
+// header and the factory through a dependent concept.)
+namespace {
+template <class C>
+concept HasTransactionalProducerFactory = requires(C& c) { c.transactionalProducer(""); };
+template <class C>
+concept HasProducerFactory = requires(C& c) { c.producer(); };
+}  // namespace
+
+#if __has_include(<rune/client/producer/TransactionalProducer.h>) || __has_include(<rune/client/producer/TransactionalProducerImpl.h>)
+#error "the TransactionalProducer headers must stay deleted (Phase 2b F Task 9)"
+#endif
+
+TEST(ProducerTxnRegression, TransactionalProducerTypeIsGoneRegression) {
+    static_assert(!HasTransactionalProducerFactory<rune::client::Client>,
+                  "Client::transactionalProducer must stay deleted");
+    static_assert(HasProducerFactory<rune::client::Client>, "the concept itself works");
+    SUCCEED();
+}

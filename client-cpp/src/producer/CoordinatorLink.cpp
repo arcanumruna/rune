@@ -134,6 +134,10 @@ CoordinatorLink::Slot* CoordinatorLink::onAnswer(const CoordAnswer& a, int64_t n
     case Verdict::Rediscover:
         if (!std::holds_alternative<InFlight>(s.state)) return nullptr;
         s.state = AwaitCoordinator{gen_};
+        if (askedGen_ != gen_) {   // F14: ask once per generation, however many requests wait
+            askedGen_ = gen_;
+            if (sink_.rediscover != nullptr) sink_.rediscover(sink_.ctx);
+        }
         return nullptr;
     default:
         return &s;

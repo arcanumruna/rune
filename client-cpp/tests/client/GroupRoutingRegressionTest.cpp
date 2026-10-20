@@ -20,7 +20,6 @@
 #include <rune/protocol/RecordBatch.h>
 #include <rune/client/Completions.h>
 #include <rune/client/group/GroupConsumer.h>
-#include <rune/client/producer/TransactionalProducer.h>
 
 #include <gtest/gtest.h>
 
@@ -1623,7 +1622,10 @@ TEST(GroupRoutingRegression, TxnProducerOnAFollowerInitsOnTheCoordinatorRegressi
     r.gw.coordinatorEndpoint   = n1;
     r.gw.coordinatorRedirectTo = "127.0.0.1:" + std::to_string(p1port);
     r.gw.initPidReply          = true;
-    auto tp = r.client.transactionalProducer("tx-d4");
+    rc::ProducerConfig tcfg;
+    tcfg.acks            = rc::Acks::All;
+    tcfg.transactionalId = "tx-d4";
+    auto tp = r.client.producer(tcfg);
     r.connect();
     const auto t0 = std::chrono::steady_clock::now();
     const rc::Token t = r.nextToken++;
@@ -1887,7 +1889,10 @@ TEST(GroupRoutingRegression, TxnCoordinatorOnTheBootstrapAfterASeedRetargetRegre
     r.gw.initPidReply          = true;
     r.gw.coordinatorEndpoints.clear();   // FD4: the seed mover's own (plain) InitProducerId is not under test
     const int seedConnects = r.gw.connectsAt[n1];
-    auto tp = r.client.transactionalProducer("tx-d4-boot");
+    rc::ProducerConfig tcfg;
+    tcfg.acks            = rc::Acks::All;
+    tcfg.transactionalId = "tx-d4-boot";
+    auto tp = r.client.producer(tcfg);
     const rc::Token t = r.nextToken++;
     ASSERT_EQ(tp.initTransactions(r.cq, t), rc::OpResult::Accepted);
     bool done = false;

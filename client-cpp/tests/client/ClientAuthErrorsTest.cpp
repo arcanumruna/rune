@@ -610,7 +610,10 @@ TEST(ClientAuthErrorsRegression, SessionRevokedFailsEverythingInFlightAndDoesNot
 TEST(ClientAuthErrorsRegression, SessionRevokedFailsATransactionalProducersPendingOpRegression) {
     Rig r(authCfg(3742, "ws1", kPw));
     r.connectOk();
-    rc::TransactionalProducer tp = r.client.transactionalProducer("tx-revoked");
+    rc::ProducerConfig tcfg;
+    tcfg.acks            = rc::Acks::All;
+    tcfg.transactionalId = "tx-revoked";
+    rc::Producer tp = r.client.producer(tcfg);
     test_support::TestCq cq(r.client);
     auto init = cq.issue([&](rc::Completions& q, rc::Token t) { return tp.initTransactions(q, t); });
     ASSERT_TRUE(init.accepted());

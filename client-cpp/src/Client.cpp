@@ -209,7 +209,6 @@ Client::Client(ClientConfig cfg)
     // producer-drain / ProduceResponse std::function hooks are installed on the
     // agent (they remain only as test-harness seams).  ProduceResponses are
     // buffered by the agent (produceAcks()) and routed to the hub by dutyCycle().
-    agent_.setForwardProduceResponses(false);  // re-enabled when a txn producer registers
 
     // Task 1.4 (multi-node redirect convergence): fired on the agent thread when a
     // partition-leader session reaches Connected.  Re-offer every in-flight frame
@@ -235,17 +234,6 @@ Client::Client(ClientConfig cfg)
             p->releaseNoted = true;
             noteOrphan_(detail::HandleKind::Producer, p, p->orphanFence());
         }
-    });
-    // Same hand-off for transactional producers (was a mutex-guarded vector that
-    // the runner locked and copied every duty cycle).
-    agent_.setTxnProducerRegisterFn([this](void* impl) {
-        auto* t = static_cast<producer::TransactionalProducerImpl*>(impl);
-        txnProducers_.push_back(t);
-        if (t->status.consumerOrphaned() && !t->releaseNoted) {  // F1: see producers
-            t->releaseNoted = true;
-            noteOrphan_(detail::HandleKind::TxnProducer, t, t->orphanFence);
-        }
-        agent_.setForwardProduceResponses(true);  // txn producers consume raw ProduceResponses
     });
 
     // F8a: subscriber / group-consumer commands from app threads, applied on the
@@ -302,47 +290,9 @@ Client::Client(ClientConfig cfg)
         onMetadataResponse(resp);
     });
 
-    // Built ONCE (not per duty cycle / per frame).  TX-5 / Task 1.4: txn producers
-    // keep their 3-arg SendFn (streamId, buf, len), stamped with the seed
-    // sessionId.  C10: the route follows the frame —
-    //   * Produce (txn data) -> ITS partition's leader route (re-stamped with
-    //     that leader session's id; no route known = the seed, as for any produce);
-    //   * every other txn frame is a COORDINATOR request (InitProducerId,
-    //     AddPartitionsToTxn, AddOffsetsToTxn, TxnOffsetCommit, EndTxn) -> the
-    //     seed session, like the group coordinator's requests.  (It used to take
-    //     topic 0 / partition 0's leader route: on a cluster whose partition
-    //     leaders are spread over the nodes that is not the coordinator.)
-    txnSendFn_ = [this](int32_t streamId, const uint8_t* buf, std::size_t len) -> bool {
-        const auto tid = codec::peekTemplate(buf, len);
-        if (tid && static_cast<codec::TemplateId>(*tid) == codec::TemplateId::Produce) {
-            const auto pv = codec::decodeProduce(buf, len);
-            const int32_t topicId   = pv ? pv->topicId : 0;
-            const int32_t partition = pv ? pv->partition : 0;
-            if (coordIdx_ != 0 && !agent_.hasRoute(topicId, partition)) [[unlikely]] {
-                // D4: the txn producer stamps the COORDINATOR session's id; a
-                // Produce without a partition route rides the seed — its id.
-                // (A routed one is re-stamped with its leader's: r2 LOW-2, never
-                // held on the seed.)
-                const int64_t seedSid = agent_.seedSession().machine.sessionId();
-                if (seedSid == 0) return false;  // held: re-offered next cycle
-                rune::protocol::client::detail::putLE64(const_cast<uint8_t*>(buf), 8, seedSid);
-            }
-            return agent_.offerToPartition(topicId, partition, streamId, buf, len);
-        }
-        // Retry = transiently refused: false, re-offered next cycle.  Fatal =
-        // never deliverable (counted + logged by the agent): consumed, the op
-        // deadline completes the request.  D4: a coordinator request goes to the
-        // coordinator session (the seed until a NotCoordinator names another
-        // node); Retry there also covers "not connected yet" (re-sent once the
-        // session changes — TransactionalProducerImpl::doWork).
-        if (coordIdx_ != 0) [[unlikely]] {
-            return agent_.offerToCoordinator(coordIdx_, buf, len) != transport::AeronTransport::OfferResult::Retry;
-        }
-        return agent_.offerDefault(buf, len) != transport::AeronTransport::OfferResult::Retry;
-    };
-
     // Phase 2b F: every producer's CoordinatorLink offers through the coordinator session.
-    producerHub_.setCoordinatorSink({&Client::coordOfferTrampoline_, &Client::coordSessionIdTrampoline_, this});
+    producerHub_.setCoordinatorSink(
+        {&Client::coordOfferTrampoline_, &Client::coordSessionIdTrampoline_, this, &Client::rediscoverTrampoline_});
 
     // CG-5: GroupConsumerHub is ticked from sweepTimeouts (100 ms cadence).
 
@@ -585,17 +535,8 @@ void Client::closeImpl_(bool drainDeadlineHit) {
     // After agent_.stop(): nothing else touches the producers.
     producerHub_.closeFinalAll(OpStatus::Closed, agent_.closeDrainUnblockAfterYields());
 
-    // TX-5 / F8c C5: every pending txn op completes Closed (its completion
-    // reaches its queue before the registry hand-back below), and each
-    // producer's status channel is finished, so later operations are rejected
-    // Closed at once, never hang.  No lock: the runner was joined above
-    // (Thread mode) or this is the owner thread (Invoker mode).
-    for (producer::TransactionalProducerImpl* tp : txnProducers_) {
-        tp->failAll();
-    }
-
     // CG-5: Deactivate all group consumers (fire onRevoked, send LeaveGroup).
-    // F8c fix round 1 (M-1): spec §4 order — producers, txn producers, THEN
+    // F8c fix round 1 (M-1): spec §4 order - producers, THEN
     // group consumers, then the control tables.
     // MUST be called after agent_.stop() so no agent thread is in onRecords().
     // sendFn here is a best-effort last send (transport may be stopping).
@@ -3157,12 +3098,6 @@ int Client::routeBufferedAcks_() {
 int Client::producerDuty_(int64_t nowNs) {
     const int64_t sessionId = agent_.seedSession().machine.sessionId();
     int work = producerHub_.drainAndFlush(nowNs, sessionId, agent::AgentProduceSink{&agent_});
-    // D4: txn producers run on the COORDINATOR session (== the seed by default):
-    // a coordinator move is a session change — what was in flight is re-sent.
-    if (!txnProducers_.empty()) {
-        const int64_t coordSid = coordIdx_ == 0 ? sessionId : coordSessionId_();
-        for (auto& tp : txnProducers_) work += tp->doWork(nowNs, coordSid, txnSendFn_);
-    }
     return work;
 }
 
@@ -3365,7 +3300,6 @@ void Client::onSeedRevoked_(std::string_view text) {
     // Every subscription and group consumer of the session.
     (void)subscriberHub_.endAllLive(SubscriptionFailReason::SessionRevoked, kRevoked);
     (void)groupConsumerHub_.revokeAll();
-    for (producer::TransactionalProducerImpl* tp : txnProducers_) tp->failRevoked(kRevoked);
     // The seed machine is Rejected(SessionRevoked): the duty cycle's failure tail (enterFailed_) closes the rest
     // — nothing reconnects (D26).
     if (cbError_) invokeUserCallback_("onError", [&] { cbError_(std::string(text)); });
@@ -3664,15 +3598,14 @@ void Client::onEgressFrame(codec::TemplateId tid,
             // redirect-reconnect as robust as the initial connect (both now rely
             // on the single SessionMachine fast-retry publication) and removes
             // the pub-swap race — no busy-spin, connect/setup path only.
-            // Task 1.2: include group + txn pending state so that a redirect
-            // arriving while a group join or txn op is in flight is treated as
+            // Task 1.2: include group pending state so that a redirect
+            // arriving while a group join is in flight is treated as
             // a genuine data-op redirect rather than dropped as a connect-time
-            // redirect.  All four components are agent-thread reads (no locks).
+            // redirect.  All components are agent-thread reads (no locks).
             const bool groupActive = !groupConsumerHub_.empty();
-            const bool txnPending = !txnProducers_.empty();  // duty-cycle thread
             const bool haveWork =
                 producerHub_.hasInFlight() || subscriberHub_.hasPending()
-                || groupActive || txnPending;
+                || groupActive;
             if (!haveWork) {
                 // Connect-time (or duplicate/late) redirect: let the
                 // SessionMachine handle it; do not churn the transport.
@@ -3848,15 +3781,14 @@ void Client::onEgressFrame(codec::TemplateId tid,
         // exhausted does retryRedirectedProduce() fail the pending ack — so
         // cbError_ is never fired for a bare NotLeader until retries run out.
         if (ec == rpc::ErrorCode::NotLeader && opt->message.empty()) {
-            // Task 1.2: mirror the Redirect haveWork expansion — include
-            // group + txn pending so a bare NotLeader while a group or txn op
+            // Task 1.2: mirror the Redirect haveWork expansion - include
+            // group pending so a bare NotLeader while a group op
             // is in flight is retried rather than dropped.
             {
                 bool groupActiveNL = !groupConsumerHub_.empty();
-                const bool txnPendingNL = !txnProducers_.empty();  // duty-cycle thread
                 const bool haveWork =
                     producerHub_.hasInFlight() || subscriberHub_.hasPending()
-                    || groupActiveNL || txnPendingNL;
+                    || groupActiveNL;
                 if (!haveWork) {
                     // No in-flight op to retry (late/duplicate NotLeader for an
                     // already-resolved corrId): arm a background refresh so the map
@@ -4106,66 +4038,17 @@ void Client::onEgressFrame(codec::TemplateId tid,
         break;
     }
 
-    // ---- TX-5: Transactional producer responses --------------------------------
-    // ProduceResponse (tid 17) lands here only once a txn producer registered
-    // (setForwardProduceResponses(true)); the producerHub_ path is the plain-call
-    // ack routing in dutyCycle().  Txn producers iterate the duty-cycle-owned list.
-    // Txn producers need the full buf+len+sendFn for their retry logic.
+    // ---- Phase 2b F: coordinator responses ------------------------------------------------------
+    // A coordinator-tagged correlation id belongs to exactly one producer (by ordinal).  ProduceResponse
+    // (tid 17) is never forwarded here: the agent buffers it (produceAcks()) and dutyCycle() routes it to the
+    // producerHub_.
 
-    case codec::TemplateId::ProduceResponse: {
-        for (auto& tp : txnProducers_) {
-            tp->onProduceResponse(buf, len);
-        }
-        break;
-    }
-
-    case codec::TemplateId::InitProducerIdResponse: {
-        // Phase 2b F: a coordinator-tagged id belongs to exactly one producer (by ordinal); the legacy
-        // TransactionalProducer path below coexists until Task 9.
-        if (producerHub_.onCoordinatorResponse(static_cast<uint16_t>(codec::TemplateId::InitProducerIdResponse), buf, len, now())) break;
-        for (auto& tp : txnProducers_) {
-            tp->onInitProducerIdResponse(buf, len);
-        }
-        break;
-    }
-
-    case codec::TemplateId::AddPartitionsToTxnResponse: {
-        // Phase 2b F: a coordinator-tagged id belongs to exactly one producer (by ordinal); the legacy
-        // TransactionalProducer path below coexists until Task 9.
-        if (producerHub_.onCoordinatorResponse(static_cast<uint16_t>(codec::TemplateId::AddPartitionsToTxnResponse), buf, len, now())) break;
-        for (auto& tp : txnProducers_) {
-            tp->onAddPartitionsToTxnResponse(buf, len);
-        }
-        break;
-    }
-
-    case codec::TemplateId::AddOffsetsToTxnResponse: {
-        // Phase 2b F: a coordinator-tagged id belongs to exactly one producer (by ordinal); the legacy
-        // TransactionalProducer path below coexists until Task 9.
-        if (producerHub_.onCoordinatorResponse(static_cast<uint16_t>(codec::TemplateId::AddOffsetsToTxnResponse), buf, len, now())) break;
-        for (auto& tp : txnProducers_) {
-            tp->onAddOffsetsToTxnResponse(buf, len);
-        }
-        break;
-    }
-
-    case codec::TemplateId::TxnOffsetCommitResponse: {
-        // Phase 2b F: a coordinator-tagged id belongs to exactly one producer (by ordinal); the legacy
-        // TransactionalProducer path below coexists until Task 9.
-        if (producerHub_.onCoordinatorResponse(static_cast<uint16_t>(codec::TemplateId::TxnOffsetCommitResponse), buf, len, now())) break;
-        for (auto& tp : txnProducers_) {
-            tp->onTxnOffsetCommitResponse(buf, len);
-        }
-        break;
-    }
-
+    case codec::TemplateId::InitProducerIdResponse:
+    case codec::TemplateId::AddPartitionsToTxnResponse:
+    case codec::TemplateId::AddOffsetsToTxnResponse:
+    case codec::TemplateId::TxnOffsetCommitResponse:
     case codec::TemplateId::EndTxnResponse: {
-        // Phase 2b F: a coordinator-tagged id belongs to exactly one producer (by ordinal); the legacy
-        // TransactionalProducer path below coexists until Task 9.
-        if (producerHub_.onCoordinatorResponse(static_cast<uint16_t>(codec::TemplateId::EndTxnResponse), buf, len, now())) break;
-        for (auto& tp : txnProducers_) {
-            tp->onEndTxnResponse(buf, len);
-        }
+        (void)producerHub_.onCoordinatorResponse(static_cast<uint16_t>(tid), buf, len, now());
         break;
     }
 
@@ -4541,7 +4424,7 @@ void Client::applyProducerCommand_(const detail::HubCommand& cmd) {
 // F8c C7: handle release (spec §3.3) — no shared_ptr, no refcount, no waits
 // ---------------------------------------------------------------------------
 //
-// Every handle impl (Producer / TransactionalProducer / Subscription /
+// Every handle impl (Producer / Subscription /
 // GroupConsumer) is owned jointly by its handle and the duty side.  Each side
 // detaches its share of the impl's ownership word (a ring word) exactly once;
 // whichever detaches LAST frees the impl.  The duty side detaches when it
@@ -4614,13 +4497,6 @@ void Client::orphanRelease_(const detail::HubCommand& cmd) noexcept {
         if (freed) delete p;
         break;
     }
-    case K::TxnProducer: {
-        auto* t = static_cast<producer::TransactionalProducerImpl*>(impl);
-        t->orphanFence = fence;
-        freed = t->status.detachConsumerOrphaned();
-        if (freed) delete t;
-        break;
-    }
     case K::Subscription: {
         auto* sub = static_cast<SubscriptionImpl*>(impl);
         sub->orphanFence = fence;
@@ -4663,13 +4539,6 @@ void Client::scanOrphans_() {
             noteOrphan_(K::Producer, &p, p.orphanFence());
         }
     });
-    for (std::size_t i = 0; i < txnProducers_.size(); ++i) {
-        producer::TransactionalProducerImpl* t = txnProducers_[i];
-        if (!t->releaseNoted && t->status.consumerOrphaned()) {
-            t->releaseNoted = true;
-            noteOrphan_(K::TxnProducer, t, t->orphanFence);
-        }
-    }
     subscriberHub_.forEachOwned([&](SubscriptionImpl& sub) {
         if (!sub.releaseNoted && sub.status.consumerOrphaned()) {
             sub.releaseNoted = true;
@@ -4719,10 +4588,6 @@ void Client::applyRelease_(const detail::HubCommand& cmd, std::int64_t fence, bo
     case K::Producer:
         static_cast<producer::ProducerImpl*>(impl)->releaseNoted = true;
         if (!closing) static_cast<producer::ProducerImpl*>(impl)->applyHandleRelease();
-        break;
-    case K::TxnProducer:
-        static_cast<producer::TransactionalProducerImpl*>(impl)->releaseNoted = true;
-        if (!closing) static_cast<producer::TransactionalProducerImpl*>(impl)->applyHandleRelease();
         break;
     case K::Subscription: {
         auto* sub = static_cast<SubscriptionImpl*>(impl);
@@ -4778,15 +4643,6 @@ int Client::reapReleases_() noexcept {
                 }
                 break;
             }
-            case K::TxnProducer: {
-                auto* t = static_cast<producer::TransactionalProducerImpl*>(r.impl);
-                if (t->closedDuty()) {
-                    std::erase(txnProducers_, t);
-                    if (t->status.detachProducer()) delete t;
-                    done = true;
-                }
-                break;
-            }
             case K::Subscription: {
                 auto* sub = static_cast<SubscriptionImpl*>(r.impl);
                 if (subscriberHub_.release(sub)) {
@@ -4822,12 +4678,6 @@ void Client::handBackAll_() noexcept {
         ++n;
         if (p->detachDuty()) delete p;
     });
-    std::vector<producer::TransactionalProducerImpl*> txns;
-    txns.swap(txnProducers_);
-    for (producer::TransactionalProducerImpl* t : txns) {
-        ++n;
-        if (t->status.detachProducer()) delete t;
-    }
     subscriberHub_.handBackAll([&n](SubscriptionImpl* sub) noexcept {
         ++n;
         if (sub->status.detachProducer()) delete sub;
@@ -4889,16 +4739,6 @@ int Client::checkDrain_() {
         }
         if (p.lifeOpen() || p.draining()) settled = false;
     });
-    for (std::size_t i = 0; i < txnProducers_.size(); ++i) {  // a handler may register one
-        producer::TransactionalProducerImpl* tp = txnProducers_[i];
-        if (tp->closedDuty()) continue;
-        if (!tp->closingDuty()) {
-            detail::OpTarget tgt;
-            tgt.handler = internal;
-            tp->beginClose(tgt, 0, t);
-        }
-        if (!tp->closedDuty()) settled = false;
-    }
     if (!settled) return 0;
     std::vector<DrainWaiter> ws;
     ws.swap(drainWaiters_);
@@ -5064,10 +4904,6 @@ void Client::applyHubCommandDirect_(const detail::HubCommand& cmd) {
         detail::HubCommand pinned = cmd;
         pinCommandTarget_(pinned);  // I3: counted before anything can complete it
         groupConsumerHub_.applyCommandDirect(pinned, now());
-        return;
-    }
-    if (producer::TransactionalProducerImpl::isTxnOp(cmd.op)) {
-        applyTxnCommand_(cmd, /*direct=*/true);
         return;
     }
     if (cmd.op == Op::GroupClose || cmd.op == Op::GroupCommit) {
@@ -5478,10 +5314,6 @@ void Client::applyHubCommand_(const detail::HubCommand& cmd) {
     default:
         break;
     }
-    if (producer::TransactionalProducerImpl::isTxnOp(cmd.op)) {  // F8c C5
-        applyTxnCommand_(cmd, /*direct=*/false);
-        return;
-    }
     if (cmd.op == Op::SubscribeAdd && cmd.handle != 0) {
         // F8c C3: the Subscribe correlationId comes from the duty-owned counter
         // (header offset 16; the sessionId at offset 8 is stamped by the hub).
@@ -5554,8 +5386,7 @@ detail::HubSubmit Client::hubCommandTrampoline_(void* ctx, const detail::HubComm
     // GroupSetCallback (it could replace a running callback): ring order.
     if (onDuty && (cmd.op == Op::SubscribeAdd || cmd.op == Op::GroupAdd ||
                    cmd.op == Op::Unsubscribe || cmd.op == Op::GroupClose ||
-                   cmd.op == Op::GroupCommit || cmd.op == Op::TxnBegin || cmd.op == Op::TxnSend ||
-                   cmd.op == Op::TxnCloseNow)) {
+                   cmd.op == Op::GroupCommit)) {
         self->applyHubCommandDirect_(cmd);
         return detail::HubSubmit::Accepted;
     }
@@ -5651,41 +5482,6 @@ GroupConsumer Client::subscribeGroup(std::string              groupId,
 
     return GroupConsumer(impl.release(), &Client::hubCommandTrampoline_, this, handleDutyThread_(),
                          &Client::targetedOpTrampoline_, &Client::andWaitTrampoline_);
-}
-
-// ---------------------------------------------------------------------------
-// TX-5: transactionalProducer() — create and register a TransactionalProducer
-// ---------------------------------------------------------------------------
-
-TransactionalProducer Client::transactionalProducer(const std::string& transactionalId,
-                                                     ProducerConfig cfg)
-{
-    // nextCorrId_ is duty-owned: the txn producer only draws ids on the duty
-    // thread (doWork / response handlers), so it shares the plain counter.
-    auto impl = std::make_unique<producer::TransactionalProducerImpl>(  // C7: see producer()
-        transactionalId,
-        cfg,
-        nextCorrId_);
-    // F8c C5: its completions go through the completion-queue registry; F14:
-    // NotCoordinator asks this Client to re-discover the coordinator.  Both
-    // are set before the impl is published to the duty thread (the ring).
-    impl->setCompletionSink(detail::CompletionSink{&Client::deliverTrampoline_, this});
-    impl->setRediscoverHook(&Client::rediscoverTrampoline_, this);
-
-    // Shared-nothing registration through the agent ring (like producer()): the
-    // duty-cycle thread adopts it into txnProducers_ — no mutex, no per-cycle copy.
-    // F8c C2: linearized against close() by the ring (see producerWithRingCap_):
-    // Closed = never written — the producer is born closed: its status channel
-    // abandoned (every later operation is rejected Closed at once instead of
-    // queueing work no duty cycle will ever process) and the duty share
-    // detached (F8c C7: the handle alone owns and frees it).
-    producer::TransactionalProducerImpl* raw = impl.get();
-    if (!submitRegistration_([&] { return agent_.submitRegisterTxnProducer(raw); }, [] {})) {
-        impl->status.abandon();
-        (void)impl->status.detachProducer();  // C7: no duty side will ever hold it
-    }
-    return TransactionalProducer(impl.release(), &Client::hubCommandTrampoline_, this, handleDutyThread_(),
-                                 &Client::targetedOpTrampoline_, &Client::andWaitTrampoline_);
 }
 
 // ---------------------------------------------------------------------------
@@ -5909,10 +5705,9 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
         if (groupConsumerHub_.fetchWaitsForSession()) scheduleMetadataRefresh();
     }
 
-    // F14: a fresh cluster view — txn requests waiting for the coordinator to
-    // be re-discovered (NotCoordinator) back off and re-send.
-    for (auto& tp : txnProducers_) tp->onCoordinatorRediscovered();
-    producerHub_.onCoordinatorMoved();   // Phase 2b F: the same fresh view releases AwaitCoordinator requests
+    // F14: a fresh cluster view - txn requests waiting for the coordinator to be re-discovered
+    // (NotCoordinator) back off and re-send.
+    producerHub_.onCoordinatorMoved();
 }
 
 // D4: see the ErrorResponse handler.  Agent / duty thread.
@@ -6005,7 +5800,7 @@ void Client::syncCoordinatorSession_() noexcept {
 producer::CoordinatorSink::Offer Client::coordOfferTrampoline_(void* ctx, const uint8_t* buf,
                                                                 std::size_t len) noexcept {
     auto* self = static_cast<Client*>(ctx);
-    // The coordinator session (the seed until a NotCoordinator names another node), as txnSendFn_ routes.
+    // The coordinator session (the seed until a NotCoordinator names another node), as the producers' coordinator links route.
     const auto r = self->coordIdx_ != 0 ? self->agent_.offerToCoordinator(self->coordIdx_, buf, len)
                                         : self->agent_.offerDefault(buf, len);
     switch (r) {
@@ -6021,39 +5816,10 @@ int64_t Client::coordSessionIdTrampoline_(void* ctx) noexcept {
 }
 
 void Client::rediscoverTrampoline_(void* ctx) noexcept {
-    // F14: NotCoordinator -> re-discover the coordinator (== the consensus
-    // leader today, F15 §5.1): ask for a fresh cluster view now.  Not
-    // connected: the MetadataRequest sent on the next Connected edge
-    // answers it instead.
+    // F14: NotCoordinator -> re-discover the coordinator (== the consensus leader today, F15 5.1): ask for a fresh
+    // cluster view now.  Not connected: the MetadataRequest sent on the next Connected edge answers it instead.
     // DR client bug 1: through any Connected session (the seed may be the dead one).
     (void)static_cast<Client*>(ctx)->sendMetadataRequestAnywhere_();
-}
-
-producer::TransactionalProducerImpl* Client::findTxn_(uint64_t handle) const noexcept {
-    for (producer::TransactionalProducerImpl* tp : txnProducers_) {
-        if (reinterpret_cast<uint64_t>(tp) == handle) return tp;
-    }
-    return nullptr;
-}
-
-void Client::applyTxnCommand_(const detail::HubCommand& cmd, bool direct) {
-    using Op = detail::HubCommand::Op;
-    detail::HubCommand c = cmd;
-    // I3: a token op's target is pinned when it is applied (before anything
-    // can complete it).  Begin / Send carry no target.
-    if (c.op == Op::TxnInit || c.op == Op::TxnSendOffsets || c.op == Op::TxnEnd || c.op == Op::TxnClose) {
-        pinCommandTarget_(c);
-    }
-    // Ring path: resolve the identity against the duty-owned list (never
-    // dereference an unknown one).  Direct path: the caller's handle holds
-    // the impl for the whole call (it may still be awaiting adoption).
-    producer::TransactionalProducerImpl* impl =
-        direct ? reinterpret_cast<producer::TransactionalProducerImpl*>(c.handle) : findTxn_(c.handle);
-    if (impl == nullptr) {
-        producer::TransactionalProducerImpl::discardCommand(c, detail::CompletionSink{&Client::deliverTrampoline_, this});
-        return;
-    }
-    impl->applyCommand(c, now());
 }
 
 // ---------------------------------------------------------------------------

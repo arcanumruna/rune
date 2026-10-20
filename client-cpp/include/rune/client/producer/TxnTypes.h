@@ -17,7 +17,7 @@ namespace coordcorr {
 /// Coordinator request ids: `kTag | ordinal << 40 | slot << 32 | seq`.
 ///
 /// Tag choice (differs from the plan's 1 << 59, which is the Client's own counter tag - every control op,
-/// ping, DDL and the legacy TransactionalProducer draw `kClientCorrIdTag | n` from it, so the two spaces
+/// ping and DDL draw `kClientCorrIdTag | n` from it, so the two spaces
 /// overlapped for n < 2^32): bit 58 is free, and `isCoord` masks bits 58..62 so a Client counter id (bit 59)
 /// is never mistaken for a coordinator id.
 inline constexpr int64_t kClientCounterTag = int64_t{1} << 59;   // Client::kClientCorrIdTag (static_asserted there)
@@ -79,6 +79,9 @@ struct CoordinatorSink {
     Offer (*offer)(void* ctx, const uint8_t* buf, std::size_t len) noexcept = nullptr;
     int64_t (*sessionId)(void* ctx) noexcept = nullptr;   // 0 = not connected
     void* ctx = nullptr;
+    /// NotCoordinator was answered: ask for a fresh cluster view (the Client sends a MetadataRequest).  Called by
+    /// the link at most once per coordinator generation (until onCoordinatorMoved), on the duty thread.  May be null.
+    void (*rediscover)(void* ctx) noexcept = nullptr;
 };
 
 }  // namespace rune::client::producer

@@ -45,6 +45,14 @@ int64_t realNow() {
 std::atomic<int64_t> g_fakeNowMt{1};
 int64_t fakeNowMt() noexcept { return g_fakeNowMt.load(std::memory_order_relaxed); }
 
+/// A transactional producer's config (Phase 2b F: a Producer with a transactionalId; acks=all as before).
+rc::ProducerConfig txnPcfg(std::string id) {
+    rc::ProducerConfig c;
+    c.acks            = rc::Acks::All;
+    c.transactionalId = std::move(id);
+    return c;
+}
+
 rc::ClientConfig invokerCfg(int32_t in, int32_t eg) {
     rc::ClientConfig c;
     c.gatewayChannel  = "aeron:ipc";
@@ -148,15 +156,14 @@ TEST(InvokerClient, InjectedClockDrivesRetransmitAndDeliveryTimeout) {
     EXPECT_EQ(fut.status(), rc::OpStatus::DeliveryFailed);
 }
 
-// Regression: transactionalProducer() pushed into a mutex-guarded vector that the
-// runner locked and copied every duty cycle.  Registration now crosses through the
-// agent ring like every other app->runner event.
+// Regression: a transactional producer's registration crosses through the agent ring like every other
+// app->runner event (it used to be a mutex-guarded vector the runner locked and copied every duty cycle).
 TEST(InvokerClient, TxnProducerRegistersThroughTheRingRegression) {
     Rig r(invokerCfg(3720, 3721));
-    auto tp = r.client.transactionalProducer("tx-1");
-    EXPECT_EQ(r.client.testTxnProducerCount(), 0u);
+    auto tp = r.client.producer(txnPcfg("tx-1"));
+    EXPECT_EQ(r.client.testProducerCount(), 0u);
     r.client.doWork();
-    EXPECT_EQ(r.client.testTxnProducerCount(), 1u);
+    EXPECT_EQ(r.client.testProducerCount(), 1u);
 }
 
 TEST(InvokerClient, DoWorkIsRejectedInThreadMode) {
@@ -203,7 +210,7 @@ TEST(InvokerClient, CloseFailsUnadoptedProducerRegression) {
         test_support::TestCq cq(client);
         auto fut = cq.send(p, client.topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal));
         ASSERT_TRUE(fut.accepted());
-        auto tp    = client.transactionalProducer("tx-close");
+        auto tp    = client.producer(txnPcfg("tx-close"));
         auto initF = cq.issue([&](rc::Completions& q, rc::Token t) { return tp.initTransactions(q, t); });
         ASSERT_TRUE(initF.accepted()) << initF.describe();
         client.closeImmediately();  // F8c C7: the discarding close (close() would drain first)
@@ -217,7 +224,6 @@ TEST(InvokerClient, CloseFailsUnadoptedProducerRegression) {
         // back to its handle — no shared_ptr holder, nothing leaked).
         EXPECT_EQ(client.testImplsHandedBack(), 2u);
         EXPECT_EQ(client.testProducerCount(), 0u);
-        EXPECT_EQ(client.testTxnProducerCount(), 0u);
     }
 }
 
@@ -353,9 +359,9 @@ TEST(InvokerClient, InvokerRingFullRetryPumpsRegression) {
 
 TEST(InvokerClient, TxnAndRegularProducerAcksBothRouteRegression) {
     Rig r(invokerCfg(3766, 3767));
-    auto tp = r.client.transactionalProducer("tx-2");
+    auto tp = r.client.producer(txnPcfg("tx-2"));
     r.connect();
-    ASSERT_EQ(r.client.testTxnProducerCount(), 1u);  // forwardProduceResponses on
+    ASSERT_EQ(r.client.testProducerCount(), 1u);
     rc::ProducerConfig pcfg;
     pcfg.acks = rc::Acks::Leader;
     pcfg.lingerUs = 0;
@@ -433,9 +439,8 @@ TEST(InvokerClient, ProducerAfterCloseThrowsRegression) {
         rc::Client client(c);
         client.close();
         EXPECT_THROW((void)client.producer(), std::logic_error);
-        EXPECT_THROW((void)client.transactionalProducer("tx-after-close"), std::logic_error);
+        EXPECT_THROW((void)client.producer(txnPcfg("tx-after-close")), std::logic_error);
         EXPECT_EQ(client.testProducerCount(), 0u);
-        EXPECT_EQ(client.testTxnProducerCount(), 0u);
     }
 }
 
@@ -900,8 +905,8 @@ TEST(InvokerClient, ProducerRegisteredAfterCloseDrainSelfClosesRegression) {
 TEST(InvokerClient, TxnProducerRegisteredAfterCloseDrainSelfClosesRegression) {
     Rig r(invokerCfg(3798, 3799));
     r.client.testSetBeforeRegistrationSubmitHook([&] { r.client.close(); });
-    auto tp = r.client.transactionalProducer("tx-race"); // close() ran inside
-    EXPECT_EQ(r.client.testTxnProducerCount(), 0u) << "the drain ran before the submit";
+    auto tp = r.client.producer(txnPcfg("tx-race")); // close() ran inside
+    EXPECT_EQ(r.client.testProducerCount(), 0u) << "the drain ran before the submit";
 
     // Every operation must report the close promptly — never hang, never
     // silently accept: rejected synchronously (no completion will follow).
@@ -911,7 +916,7 @@ TEST(InvokerClient, TxnProducerRegisteredAfterCloseDrainSelfClosesRegression) {
                                   },
                                   &calls};
     EXPECT_EQ(tp.initTransactions(h, 1), rc::OpResult::Closed);
-    tp.beginTransaction();
+    EXPECT_THROW(tp.beginTransaction(), std::logic_error);   // the void begin throws on a closed producer
     EXPECT_THROW(tp.send(r.client.topic("t"), rc::Key(uint64_t{1}), std::span<const uint8_t>(kVal)),
                  std::logic_error);
     EXPECT_EQ(tp.sendOffsetsToTransaction({}, "g", h, 2), rc::OpResult::Closed);
@@ -927,7 +932,7 @@ TEST(InvokerClient, TxnProducerRegisteredAfterCloseDrainSelfClosesRegression) {
 // state, so a post-close commitTransaction() future hung forever).
 TEST(InvokerClient, TxnProducerOpsAfterCloseFailPromptlyRegression) {
     Rig r(invokerCfg(3802, 3803));
-    auto tp = r.client.transactionalProducer("tx-adopted");
+    auto tp = r.client.producer(txnPcfg("tx-adopted"));
     r.client.close();
     EXPECT_EQ(r.client.testImplsHandedBack(), 1u) << "adopted by close()'s drain (then handed back)";
     int calls = 0;

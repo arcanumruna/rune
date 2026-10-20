@@ -22,6 +22,14 @@ using namespace std::chrono_literals;
 
 namespace {
 
+/// A transactional producer's config (Phase 2b F: a Producer with a transactionalId; acks=all as before).
+rc::ProducerConfig txnPcfg(std::string id) {
+    rc::ProducerConfig c;
+    c.acks            = rc::Acks::All;
+    c.transactionalId = std::move(id);
+    return c;
+}
+
 std::atomic<int> g_hubCtr{0};
 
 rc::ClientConfig hubCfg(int32_t in, int32_t eg, rc::RunnerMode mode) {
@@ -892,7 +900,7 @@ TEST(HubCommandClient, TxnCloseCompletesAllClosedRegression) {
     {
         SCOPED_TRACE("Invoker");
         HubRig r(4016);
-        auto tp = r.client.transactionalProducer("tx-close-all");
+        auto tp = r.client.producer(txnPcfg("tx-close-all"));
         r.connect();
         r.gw.initPidReply = true;
         auto init = r.cq.issue([&](rc::Completions& q, rc::Token t) { return tp.initTransactions(q, t); });
@@ -901,8 +909,9 @@ TEST(HubCommandClient, TxnCloseCompletesAllClosedRegression) {
         r.gw.initPidReply = false;  // from here the coordinator never answers
         tp.beginTransaction();
         tp.send(r.client.topic("t"), rc::Key(uint64_t{1}), std::span<const uint8_t>(kTxnVal));
+        const rc::OffsetEntry offsetArr[] = {{1, 0, 5}};
         auto offs = r.cq.issue([&](rc::Completions& q, rc::Token t) {
-            return tp.sendOffsetsToTransaction({{{1, 0}, 5}}, "g", q, t);
+            return tp.sendOffsetsToTransaction(offsetArr, "g", q, t);
         });
         auto commit = r.cq.issue([&](rc::Completions& q, rc::Token t) { return tp.commitTransaction(q, t); });
         auto abort  = r.cq.issue([&](rc::Completions& q, rc::Token t) { return tp.abortTransaction(q, t); });
@@ -938,7 +947,7 @@ TEST(HubCommandClient, TxnCloseCompletesAllClosedRegression) {
     {
         SCOPED_TRACE("Invoker, handler pending at close");
         HubRig r(4022);
-        auto tp = r.client.transactionalProducer("tx-close-handler");
+        auto tp = r.client.producer(txnPcfg("tx-close-handler"));
         HandlerLedger led;
         ASSERT_EQ(tp.initTransactions(led.handler(), 5), rc::OpResult::Accepted);  // never connected
         r.settle(50);
@@ -951,7 +960,7 @@ TEST(HubCommandClient, TxnCloseCompletesAllClosedRegression) {
         SCOPED_TRACE("Thread");
         rc::Client client(hubCfg(4018, 4019, rc::RunnerMode::Thread));
         test_support::TestCq cq(client);
-        auto tp = client.transactionalProducer("tx-close-thread");
+        auto tp = client.producer(txnPcfg("tx-close-thread"));
         auto init = cq.issue([&](rc::Completions& q, rc::Token t) { return tp.initTransactions(q, t); });
         ASSERT_TRUE(init.accepted()) << init.describe();
         EXPECT_FALSE(init.ready()) << "never connected: nothing answers it";
@@ -968,7 +977,7 @@ TEST(HubCommandClient, TxnCloseCompletesAllClosedRegression) {
 // ConcurrentTransactions backs off and retries; then Ok.
 TEST(HubCommandClient, TxnNotCoordinatorRediscoversThroughMetadataRegression) {
     HubRig r(4020);
-    auto tp = r.client.transactionalProducer("tx-nc");
+    auto tp = r.client.producer(txnPcfg("tx-nc"));
     r.connect();
     ASSERT_TRUE(r.drive([&] { return r.gw.metadataRequests >= 1; }));
     r.settle(200);
@@ -997,7 +1006,7 @@ TEST(HubCommandClient, TxnNotCoordinatorRediscoversThroughMetadataRegression) {
 // ITS partition's leader route.
 TEST(HubCommandClient, TxnFramesRouteCoordinatorToSeedAndDataToPartitionLeaderRegression) {
     HubRig r(4026);
-    auto tp = r.client.transactionalProducer("tx-route");
+    auto tp = r.client.producer(txnPcfg("tx-route"));
     r.connect();
     const int64_t seedSid = r.gw.assignedSessionId;  // the seed (coordinator) session
     // Partition 0 of topic 0 is led by another node (its own session, sid 77).
@@ -1045,7 +1054,7 @@ TEST(HubCommandClient, TxnNotLeaderReoffersOnTheNewRouteAndCommitsRegression) {
     const int wA = r.gw.addEndpoint(chA, 4040);
     const int wB = r.gw.addEndpoint(chB, 4040);
     r.gw.partitions = {{1, 0, 0, 1, 4040, "127.0.0.1:24795"}};
-    auto tp = r.client.transactionalProducer("tx-move");
+    auto tp = r.client.producer(txnPcfg("tx-move"));
     r.connect();
     ASSERT_TRUE(r.drive([&] { return r.client.testDataChannelFor(1, 0) == chA; }));
     r.gw.initPidReply = true;
@@ -1084,14 +1093,16 @@ TEST(HubCommandClient, TxnNotLeaderReoffersOnTheNewRouteAndCommitsRegression) {
 // broker model): a transactional producer whose every record retention removed
 // before a failover (the rebuilt producer state forgot it) meets
 // UnknownProducerId on its next transaction's first batch (seq 1) with
-// logStartOffset past everything it had acked -> KIP-360: the partition's
-// sequences restart at 0 under the same epoch and the transaction COMMITS (no
-// forced abort); each record is written once.  Loss instead (acked data at/above
+// logStartOffset past everything it had acked -> the partition's sequences must
+// restart: the transaction fails abortable (UnknownProducerId), its abort's
+// epoch bump restarts them and the NEXT transaction commits (Phase 2b F: the
+// coordinator owns a transactional epoch, so no local restart keeps the
+// transaction); each record is written once.  Loss instead (acked data at/above
 // the log start forgotten) -> the commit fails with the app-visible code 28.
 TEST(HubCommandClient, TxnUnknownProducerIdAfterRetentionRestartsSequencesAndCommitsRegression) {
     for (bool retention : {true, false}) {
         HubRig r(retention ? 4090 : 4092);
-        auto tp = r.client.transactionalProducer(retention ? "tx-upid-ret" : "tx-upid-loss");
+        auto tp = r.client.producer(txnPcfg(retention ? "tx-upid-ret" : "tx-upid-loss"));
         r.connect();
         r.gw.initPidReply = true;
         r.gw.replyTxn     = true;
@@ -1118,12 +1129,25 @@ TEST(HubCommandClient, TxnUnknownProducerIdAfterRetentionRestartsSequencesAndCom
         EXPECT_GT(r.gw.unknownPidAnswers, 0) << "precondition: the broker answered UnknownProducerId";
         EXPECT_EQ(r.gw.crcFailures + r.gw.identityMismatches, 0) << "re-stamped frames are valid";
         if (retention) {
-            EXPECT_EQ(c2.status(), rc::OpStatus::Ok) << "KIP-360: retention must not abort the transaction "
-                                                     << c2.describe();
-            ASSERT_EQ(r.gw.log.size(), 2u) << "both records written exactly once";
-            EXPECT_EQ(r.gw.log[0].baseSequence, 0) << "sequences restarted at 0";
-            EXPECT_EQ(r.gw.log[1].baseSequence, 1);
-            EXPECT_EQ(r.gw.log[0].producerEpoch, 0) << "the same epoch (no bump)";
+            // Phase 2b F (Task 6 design, changed assertion): a transactional producer's epoch belongs to its
+            // coordinator, so a sequence restart can no longer keep the transaction - it fails abortable (28) and the
+            // abort's epoch bump restarts the sequences; the next transaction commits.
+            EXPECT_EQ(c2.status(), rc::OpStatus::BrokerError) << c2.describe();
+            EXPECT_EQ(c2.outcome().c.errorCode,
+                      static_cast<uint16_t>(rune::protocol::client::ErrorCode::UnknownProducerId));
+            EXPECT_EQ(r.gw.log.size(), 0u) << "retention emptied the log; nothing of the failed transaction was written";
+            auto ab = r.cq.issue([&](rc::Completions& q, rc::Token t) { return tp.abortTransaction(q, t); });
+            ASSERT_TRUE(r.drive([&] { return ab.ready(); })) << ab.describe();
+            ASSERT_EQ(ab.status(), rc::OpStatus::Ok) << ab.describe();
+            tp.beginTransaction();
+            tp.send(r.client.topic("t"), rc::Key(uint64_t{2}), std::span<const uint8_t>(kTxnVal));
+            tp.send(r.client.topic("t"), rc::Key(uint64_t{3}), std::span<const uint8_t>(kTxnVal));
+            auto c3 = r.cq.issue([&](rc::Completions& q, rc::Token t) { return tp.commitTransaction(q, t); });
+            ASSERT_TRUE(r.drive([&] { return c3.ready(); })) << c3.describe();
+            EXPECT_EQ(c3.status(), rc::OpStatus::Ok) << c3.describe();
+            // The unified producer batches the two sends into one produce batch (the old one sent one per send).
+            ASSERT_EQ(r.gw.log.size(), 1u) << "the next transaction's batch written exactly once";
+            EXPECT_EQ(r.gw.log[0].baseSequence, 0) << "sequences restarted at 0 (the abort's epoch bump)";
             EXPECT_EQ(r.gw.endTxnCommits.back(), uint8_t{1});
         } else {
             EXPECT_EQ(c2.status(), rc::OpStatus::BrokerError) << c2.describe();

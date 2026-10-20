@@ -399,7 +399,10 @@ TEST(TlsConnectEdgeRegression, NoFrameLeavesBeforeTheHandshakeAndConnectTimeSend
 // gate): InitProducerId leaves plaintext while the session is Handshaking.
 TEST(TlsConnectEdgeRegression, DirectSendsWaitForTheHandshakeRegression) {
     Rig r;
-    auto tp = r.client->transactionalProducer("txn-a");
+    ProducerConfig tcfg;
+    tcfg.acks            = Acks::All;
+    tcfg.transactionalId = "txn-a";
+    auto tp = r.client->producer(tcfg);
     test_support::TestCq cq(*r.client);
     auto init = cq.issue([&](Completions& q, Token t) { return tp.initTransactions(q, t); });
     auto conn = cq.issue([&](Completions& q, Token t) { return r.client->connect(q, t); });

@@ -18,7 +18,6 @@
 #include <rune/client/Completions.h>
 #include <rune/client/producer/Producer.h>
 #include <rune/client/subscriber/Subscription.h>
-#include <rune/client/producer/TransactionalProducer.h>
 
 #include <gtest/gtest.h>
 
@@ -734,7 +733,8 @@ TEST(ClientFailoverBrokerRegression, SeedCoordinatorCrashedMidTransactionEndsCom
     pcfg.acks = rc::Acks::All; pcfg.lingerUs = 1; pcfg.batchBytes = 1;
     pcfg.produceTimeoutMs = 30'000; pcfg.deliveryTimeoutMs = 40'000;
     pcfg.transactionOpTimeoutMs = 25'000;
-    auto tp = client.transactionalProducer("tx-failover", pcfg);
+    pcfg.transactionalId = "tx-failover";
+    auto tp = client.producer(pcfg);
     client.connectAndWait(30s);
     tp.initTransactionsAndWait(60s);
     const rc::TopicHandle th = client.topic("events");

@@ -41,10 +41,11 @@ public:
     int64_t                   sid = 77;          ///< the session id the link reads (0 = not connected)
     CoordinatorSink::Offer    next = CoordinatorSink::Offer::Accepted;
     std::vector<OfferedFrame> offered;           ///< every frame the link offered, in order
+    int                       rediscovers = 0;   ///< re-discovery requests (NotCoordinator answered)
 
     FakeCoordinator() { offered.reserve(1 << 15); }
 
-    [[nodiscard]] CoordinatorSink sink() noexcept { return {&offerThunk, &sessionThunk, this}; }
+    [[nodiscard]] CoordinatorSink sink() noexcept { return {&offerThunk, &sessionThunk, this, &rediscoverThunk}; }
 
     [[nodiscard]] std::size_t offeredFor(int64_t corrId) const noexcept {
         std::size_t n = 0;
@@ -128,6 +129,7 @@ private:
         return self->next;
     }
     static int64_t sessionThunk(void* ctx) noexcept { return static_cast<FakeCoordinator*>(ctx)->sid; }
+    static void rediscoverThunk(void* ctx) noexcept { ++static_cast<FakeCoordinator*>(ctx)->rediscovers; }
 };
 
 }  // namespace test_support

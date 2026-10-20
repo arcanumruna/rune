@@ -1,6 +1,6 @@
 // tests/client/HandleLifetimeTest.cpp — F8c C7: move-only handles and the §3.3
 // release protocol (no shared_ptr, no refcount, no waits), handle destructors
-// (Producer / TransactionalProducer = closeImmediately, Subscription =
+// (Producer, plain or transactional = closeImmediately, Subscription =
 // unsubscribe, GroupConsumer = close) and the Client close() / closeImmediately()
 // pair (user decision 2).
 //
@@ -20,7 +20,6 @@
 #include <rune/client/Client.h>
 #include <rune/client/Completions.h>
 #include <rune/client/producer/ProducerImpl.h>
-#include <rune/client/producer/TransactionalProducerImpl.h>
 
 #include <gtest/gtest.h>
 
@@ -121,6 +120,14 @@ rc::ClientConfig cfgFor(int32_t in, rc::RunnerMode mode = rc::RunnerMode::Invoke
     return c;
 }
 
+/// A transactional producer's config (Phase 2b F: a Producer with a transactionalId; acks=all).
+rc::ProducerConfig txnCfg(std::string id) {
+    rc::ProducerConfig c;
+    c.acks            = rc::Acks::All;
+    c.transactionalId = std::move(id);
+    return c;
+}
+
 rc::ProducerConfig ackCfg() {
     rc::ProducerConfig c;
     c.acks              = rc::Acks::Leader;
@@ -199,9 +206,6 @@ void noopRecords(const rc::Record&) {}
 static_assert(!std::is_copy_constructible_v<rc::Producer> && !std::is_copy_assignable_v<rc::Producer>);
 static_assert(std::is_nothrow_move_constructible_v<rc::Producer> &&
               std::is_nothrow_move_assignable_v<rc::Producer>);
-static_assert(!std::is_copy_constructible_v<rc::TransactionalProducer> &&
-              !std::is_copy_assignable_v<rc::TransactionalProducer>);
-static_assert(std::is_nothrow_move_constructible_v<rc::TransactionalProducer>);
 static_assert(!std::is_copy_constructible_v<rc::Subscription> && !std::is_copy_constructible_v<rc::GroupConsumer>);
 static_assert(!std::is_copy_constructible_v<rc::BatchBuilder>);
 struct StubT {
@@ -231,16 +235,16 @@ TEST(HandleLifetime, MoveOnlyHandlesRegression) {
         ASSERT_TRUE(r.drive([&] { return frees(rcd::HandleKind::Producer) == 1; }))
             << "the overwritten producer is freed once the duty side let go";
 
-        rc::TransactionalProducer t1 = r.client->transactionalProducer("tx-move");
-        rc::TransactionalProducer t2 = std::move(t1);
-        EXPECT_EQ(t1.closeImmediately(), OpResult::Closed);  // NOLINT(bugprone-use-after-move)
+        rc::Producer t1 = r.client->producer(txnCfg("tx-move"));
+        rc::Producer t2 = std::move(t1);
+        EXPECT_FALSE(t1.valid());                            // NOLINT(bugprone-use-after-move)
+        EXPECT_EQ(t1.closeImmediately(), OpResult::InvalidArgument);  // a moved-from handle: no impl
         rc::Subscription s1 = r.client->subscribe(topic, 0, {}, &noopRecords);
         rc::Subscription s2 = std::move(s1);
         EXPECT_FALSE(s1.active());  // NOLINT(bugprone-use-after-move)
     }
     ASSERT_TRUE(r.drive([&] { return totalFrees() == 4; }));
-    EXPECT_EQ(frees(rcd::HandleKind::Producer), 2);
-    EXPECT_EQ(frees(rcd::HandleKind::TxnProducer), 1);
+    EXPECT_EQ(frees(rcd::HandleKind::Producer), 3) << "two plain + one transactional producer";
     EXPECT_EQ(frees(rcd::HandleKind::Subscription), 1);
     r.client->closeImmediately();
     r.client.reset();
@@ -263,11 +267,11 @@ TEST(HandleLifetime, HandleReleaseAcceptedDutyFreesRegression) {
     const auto topic = r.client->topic("t");
     {
         auto p   = r.client->producer(ackCfg());
-        auto tp  = r.client->transactionalProducer("tx-release");
+        auto tp  = r.client->producer(txnCfg("tx-release"));
         auto sub = r.client->subscribe(topic, 0, {}, &noopRecords);
         auto gc  = r.client->subscribeGroup("g-release", {"t"});
         ASSERT_TRUE(r.drive([&] {
-            return r.client->testProducerCount() == 1 && r.client->testTxnProducerCount() == 1 &&
+            return r.client->testProducerCount() == 2 &&
                    r.client->testSubscriptionImplsHeld() == 1 && r.client->testGroupImplsHeld() == 1 &&
                    sub.subscriptionId() > 0;
         }));
@@ -275,14 +279,13 @@ TEST(HandleLifetime, HandleReleaseAcceptedDutyFreesRegression) {
     EXPECT_EQ(totalFrees(), 0) << "the duty side still holds its share";
     EXPECT_EQ(r.client->testPendingReleases(), 4u);
     ASSERT_TRUE(r.drive([&] { return totalFrees() == 4; }));
-    for (const auto k : {rcd::HandleKind::Producer, rcd::HandleKind::TxnProducer, rcd::HandleKind::Subscription,
-                         rcd::HandleKind::GroupConsumer}) {
+    EXPECT_EQ(frees(rcd::HandleKind::Producer), 2) << "the plain and the transactional producer";
+    for (const auto k : {rcd::HandleKind::Subscription, rcd::HandleKind::GroupConsumer}) {
         EXPECT_EQ(frees(k), 1) << "kind " << static_cast<int>(k);
     }
     EXPECT_EQ(g_freesInDoWork.load(), 4) << "each one freed by the duty side (the handle let go first)";
     EXPECT_EQ(r.client->testPendingReleases(), 0u);
     EXPECT_EQ(r.client->testProducerCount(), 0u);
-    EXPECT_EQ(r.client->testTxnProducerCount(), 0u);
     EXPECT_EQ(r.client->testSubscriptionImplsHeld(), 0u);
     EXPECT_EQ(r.client->testGroupImplsHeld(), 0u);
     ASSERT_FALSE(r.gw.unsubscribed.empty()) << "the Subscription destructor unsubscribed";
@@ -303,7 +306,7 @@ TEST(HandleLifetime, ThreadModeReleaseFreesExactlyOnceRegression) {
     const auto topic = client->topic("t");
     {
         auto p   = client->producer(ackCfg());
-        auto tp  = client->transactionalProducer("tx-thread");
+        auto tp  = client->producer(txnCfg("tx-thread"));
         auto sub = client->subscribe(topic, 0, {}, &noopRecords);
         auto gc  = client->subscribeGroup("g-thread", {"t"});
         EXPECT_EQ(p.trySend(topic, rc::Key(uint64_t{1}), kVal), SendResult::Ok);
@@ -316,8 +319,8 @@ TEST(HandleLifetime, ThreadModeReleaseFreesExactlyOnceRegression) {
     client->close();
     EXPECT_EQ(client->testImplsHandedBack(), 0u);
     client.reset();
-    for (const auto k : {rcd::HandleKind::Producer, rcd::HandleKind::TxnProducer, rcd::HandleKind::Subscription,
-                         rcd::HandleKind::GroupConsumer}) {
+    EXPECT_EQ(frees(rcd::HandleKind::Producer), 2) << "the plain and the transactional producer";
+    for (const auto k : {rcd::HandleKind::Subscription, rcd::HandleKind::GroupConsumer}) {
         EXPECT_EQ(frees(k), 1) << "kind " << static_cast<int>(k);
     }
 }
@@ -337,7 +340,7 @@ TEST(HandleLifetime, HandleReleaseAfterCloseHandleFreesRegression) {
         auto client = std::make_unique<rc::Client>(cfgFor(mode == rc::RunnerMode::Invoker ? 5406 : 5408, mode));
         const auto topic = client->topic("t");
         std::optional<rc::Producer>              p(client->producer(ackCfg()));
-        std::optional<rc::TransactionalProducer> tp(client->transactionalProducer("tx-after"));
+        std::optional<rc::Producer>              tp(client->producer(txnCfg("tx-after")));
         std::optional<rc::Subscription>          sub(client->subscribe(topic, 0, {}, &noopRecords));
         std::optional<rc::GroupConsumer>         gc(client->subscribeGroup("g-after", {"t"}));
         if (mode == rc::RunnerMode::Invoker) {
@@ -368,7 +371,7 @@ TEST(HandleLifetime, HandleReleaseAfterCloseHandleFreesRegression) {
 // The ownership word itself: the duty side and the handle detach concurrently
 // (one acq_rel RMW each) — exactly one of them frees the impl, every time.
 // Both word kinds: the M2O ring's (ProducerImpl) and the O2O status ring's
-// (Subscription / GroupConsumer / TransactionalProducer impls).  1000
+// (Subscription / GroupConsumer / transactional Producer impls).  1000
 // iterations each (TSan: the freeing side observes the other side's writes;
 // ASan: never freed twice, never used after free).
 TEST(HandleLifetime, ReleaseRacingCloseExactlyOneFreeRegression) {
@@ -432,7 +435,7 @@ TEST(HandleLifetime, ClientReleaseRacingCloseExactlyOneFreeRegression) {
         for (int k = 0; k < kWorkers; ++k) {
             ts.emplace_back([&, k] {
                 std::optional<rc::Producer>              p(client->producer(ackCfg()));
-                std::optional<rc::TransactionalProducer> tp(client->transactionalProducer("tx-" + std::to_string(k)));
+                std::optional<rc::Producer>              tp(client->producer(txnCfg("tx-" + std::to_string(k))));
                 std::optional<rc::Subscription>          sub(client->subscribe(topic, 0, {}, &noopRecords));
                 std::optional<rc::GroupConsumer>         gc;
                 if (k == 0) gc.emplace(client->subscribeGroup("g-race", {"t"}));  // one group per Client
@@ -478,7 +481,7 @@ struct SelfDestroyingProducer {
     }
 };
 struct SelfDestroyingTxn {
-    std::optional<rc::TransactionalProducer>* tp = nullptr;
+    std::optional<rc::Producer>* tp = nullptr;
     int  calls          = 0;
     int  freesInHandler = -1;
     static void on(void* ctx, const rc::Completion&, std::span<const uint8_t>) noexcept {
@@ -504,7 +507,7 @@ struct SelfDestroyingGroup {
 } // namespace
 
 // A Producer destroyed inside its own onAck, a Subscription inside its own
-// record handler, a TransactionalProducer inside its own completion handler
+// record handler, a transactional Producer inside its own completion handler
 // and a GroupConsumer inside its own commitSync completion: the destructor's
 // semantics apply at once, but the impl is freed only after the walk that
 // fired the callback finished (end of the duty cycle) — never under it (ASan).
@@ -545,14 +548,14 @@ TEST(HandleLifetime, HandleDestroyedInsideOwnCallbackDefersFreeRegression) {
         EXPECT_EQ(got, 1) << "no record after the handle was destroyed";
         EXPECT_EQ(freesInHandler, 1) << "only the producer above was freed while the handler ran";
     }
-    {  // TransactionalProducer, from its own initTransactions completion
-        SCOPED_TRACE("TransactionalProducer");
+    {  // transactional Producer, from its own initTransactions completion
+        SCOPED_TRACE("transactional Producer");
         r.gw.initPidReply = true;
-        std::optional<rc::TransactionalProducer> tp(r.client->transactionalProducer("tx-self"));
+        std::optional<rc::Producer> tp(r.client->producer(txnCfg("tx-self")));
         SelfDestroyingTxn ctx;
         ctx.tp = &tp;
         ASSERT_EQ(tp->initTransactions(rc::CompletionHandler{&SelfDestroyingTxn::on, &ctx}, 1), OpResult::Accepted);
-        ASSERT_TRUE(r.drive([&] { return frees(rcd::HandleKind::TxnProducer) == 1; }));
+        ASSERT_TRUE(r.drive([&] { return frees(rcd::HandleKind::Producer) == 2; }));
         EXPECT_EQ(ctx.calls, 1);
         EXPECT_EQ(ctx.freesInHandler, 2) << "freed under its own response walk";
     }
@@ -595,14 +598,14 @@ TEST(HandleLifetime, InvokerOffOwnerDestroyNeverWaitsRegression) {
         FreeHook hook;
         std::unique_ptr<rc::Client>               client;
         std::optional<rc::Producer>               p;
-        std::optional<rc::TransactionalProducer>  tp;
+        std::optional<rc::Producer>               tp;
         std::optional<rc::Subscription>           sub;
         std::optional<rc::GroupConsumer>          gc;
         std::thread owner([&] {
             client = std::make_unique<rc::Client>(cfgFor(fullRing ? 5416 : 5438));
             const auto topic = client->topic("t");
             p.emplace(client->producer(ackCfg()));
-            tp.emplace(client->transactionalProducer("tx-offowner"));
+            tp.emplace(client->producer(txnCfg("tx-offowner")));
             sub.emplace(client->subscribe(topic, 0, {}, &noopRecords));
             gc.emplace(client->subscribeGroup("g-offowner", {"t"}));
             for (int i = 0; i < 10; ++i) client->doWork();  // adopt the ring registrations
@@ -616,8 +619,8 @@ TEST(HandleLifetime, InvokerOffOwnerDestroyNeverWaitsRegression) {
         EXPECT_EQ(totalFrees(), 0) << "nothing frees an impl off the owner";
         client.reset();  // off-owner close: drains / hands back, frees each impl once
         EXPECT_EQ(totalFrees(), 4);
-        for (const auto k : {rcd::HandleKind::Producer, rcd::HandleKind::TxnProducer,
-                             rcd::HandleKind::Subscription, rcd::HandleKind::GroupConsumer}) {
+        EXPECT_EQ(frees(rcd::HandleKind::Producer), 2) << "the plain and the transactional producer";
+        for (const auto k : {rcd::HandleKind::Subscription, rcd::HandleKind::GroupConsumer}) {
             EXPECT_EQ(frees(k), 1) << "kind " << static_cast<int>(k);
         }
     }
@@ -786,8 +789,10 @@ TEST(HandleLifetime, InvokerOffOwnerOrphanedReleaseKeepsFifoRegression) {
 // kinds.  RED (mutation: the four adoption checks removed): never freed until
 // close (a Subscription would keep dispatching after its destructor).
 TEST(HandleLifetime, InvokerOffOwnerReleaseOrphanedBeforeAdoptionRegression) {
-    for (const rcd::HandleKind kind : {rcd::HandleKind::Subscription, rcd::HandleKind::Producer,
-                                       rcd::HandleKind::GroupConsumer, rcd::HandleKind::TxnProducer}) {
+    // TxnProducer is a transactional rc::Producer (Phase 2b F: HandleKind has no TxnProducer any more); the
+    // enumerator values keep the per-kind gateway stream ids of the original matrix.
+    enum class Kind : int { Producer = 1, TxnProducer = 2, Subscription = 3, GroupConsumer = 4 };
+    for (const Kind kind : {Kind::Subscription, Kind::Producer, Kind::GroupConsumer, Kind::TxnProducer}) {
         SCOPED_TRACE("kind " + std::to_string(static_cast<int>(kind)));
         Watchdog wd("orphaned release before adoption");
         FreeHook hook;
@@ -799,25 +804,28 @@ TEST(HandleLifetime, InvokerOffOwnerReleaseOrphanedBeforeAdoptionRegression) {
         for (int i = 0; i < 50; ++i) r.doWork();  // the head is stuck now
         auto held = [&]() -> std::size_t {
             switch (kind) {
-            case rcd::HandleKind::Subscription:  return r.client->testSubscriptionImplsHeld();
-            case rcd::HandleKind::Producer:      return r.client->testProducerCount();
-            case rcd::HandleKind::GroupConsumer: return r.client->testGroupImplsHeld();
-            case rcd::HandleKind::TxnProducer:   return r.client->testTxnProducerCount();
+            case Kind::Subscription:  return r.client->testSubscriptionImplsHeld();
+            case Kind::Producer:
+            case Kind::TxnProducer:   return r.client->testProducerCount();
+            case Kind::GroupConsumer: return r.client->testGroupImplsHeld();
             }
             return 0;
         };
+        const rcd::HandleKind freed = kind == Kind::Subscription  ? rcd::HandleKind::Subscription
+                                      : kind == Kind::GroupConsumer ? rcd::HandleKind::GroupConsumer
+                                                                    : rcd::HandleKind::Producer;
         // A worker (off the owner: every registration goes through the ring)
         // creates the handle, fills the ring and destroys the handle.
         std::thread worker([&] {
             std::optional<rc::Subscription>          sub;
             std::optional<rc::Producer>              p;
             std::optional<rc::GroupConsumer>         gc;
-            std::optional<rc::TransactionalProducer> tp;
+            std::optional<rc::Producer>              tp;
             switch (kind) {
-            case rcd::HandleKind::Subscription:  sub.emplace(r.client->subscribe(topic, 0, {}, &noopRecords)); break;
-            case rcd::HandleKind::Producer:      p.emplace(r.client->producer(ackCfg())); break;
-            case rcd::HandleKind::GroupConsumer: gc.emplace(r.client->subscribeGroup("g-early", {"t"})); break;
-            case rcd::HandleKind::TxnProducer:   tp.emplace(r.client->transactionalProducer("tx-early")); break;
+            case Kind::Subscription:  sub.emplace(r.client->subscribe(topic, 0, {}, &noopRecords)); break;
+            case Kind::Producer:      p.emplace(r.client->producer(ackCfg())); break;
+            case Kind::GroupConsumer: gc.emplace(r.client->subscribeGroup("g-early", {"t"})); break;
+            case Kind::TxnProducer:   tp.emplace(r.client->producer(txnCfg("tx-early"))); break;
             }
             r.client->testFillCommandRing();
             sub.reset();  // ring full: orphaned before its Add was adopted
@@ -830,9 +838,9 @@ TEST(HandleLifetime, InvokerOffOwnerReleaseOrphanedBeforeAdoptionRegression) {
         EXPECT_EQ(held(), 0u) << "the registration is still behind the stuck head";
         EXPECT_EQ(totalFrees(), 0);
         r.client->testForceIngressOffers(rc::transport::AeronTransport::OfferResult::Accepted, 0);
-        EXPECT_TRUE(r.drive([&] { return frees(kind) == 1; })) << "the orphaned release was never applied";
+        EXPECT_TRUE(r.drive([&] { return frees(freed) == 1; })) << "the orphaned release was never applied";
         EXPECT_EQ(held(), 0u);
-        if (kind == rcd::HandleKind::Subscription) {
+        if (kind == Kind::Subscription) {
             EXPECT_FALSE(r.gw.unsubscribed.empty()) << "the subscription was unsubscribed";
         }
         r.client->closeImmediately();
@@ -860,7 +868,7 @@ TEST(HandleLifetime, InvokerOffOwnerReleaseWhileOwnerPumpsRegression) {
         std::optional<rc::Subscription>          sub(r.client->subscribe(
             topic, 0, rc::SubscribeOptions{rc::From::earliest()},
             [&](const rc::Record&) { delivered.fetch_add(1); }));
-        std::optional<rc::TransactionalProducer> tp(r.client->transactionalProducer("tx-worker"));
+        std::optional<rc::Producer>              tp(r.client->producer(txnCfg("tx-worker")));
         std::optional<rc::GroupConsumer>         gc(r.client->subscribeGroup("g-worker", {"t"}));
         stage.store(1);
         while (stage.load() != 2) std::this_thread::yield();
@@ -871,7 +879,7 @@ TEST(HandleLifetime, InvokerOffOwnerReleaseWhileOwnerPumpsRegression) {
     });
     ASSERT_TRUE(r.drive([&] { return stage.load() == 1 && !r.gw.subscribed.empty(); }));
     ASSERT_TRUE(r.drive([&] { return r.client->testSubscriptionImplsHeld() == 1 &&
-                                     r.client->testTxnProducerCount() == 1 &&
+                                     r.client->testProducerCount() == 1 &&
                                      r.client->testGroupImplsHeld() == 1; }));
     int64_t next = 0;
     r.gw.pushRecords(r.gw.subscribed[0], next, 4);
@@ -888,7 +896,7 @@ TEST(HandleLifetime, InvokerOffOwnerReleaseWhileOwnerPumpsRegression) {
     }));
     worker.join();
     EXPECT_EQ(frees(rcd::HandleKind::Subscription), 1);
-    EXPECT_EQ(frees(rcd::HandleKind::TxnProducer), 1);
+    EXPECT_EQ(frees(rcd::HandleKind::Producer), 1) << "the transactional producer";
     EXPECT_EQ(frees(rcd::HandleKind::GroupConsumer), 1);
     const int after = delivered.load();
     r.gw.pushRecords(r.gw.subscribed[0], next, 3);
@@ -1108,7 +1116,7 @@ TEST(HandleLifetime, ClientCloseAbortsOpenTransactionsRegression) {
         r.connect();
         r.gw.initPidReply = true;
         r.gw.replyTxn     = true;
-        auto tp = r.client->transactionalProducer("tx-client-close");
+        auto tp = r.client->producer(txnCfg("tx-client-close"));
         TestCq cq(*r.client);
         auto init = cq.issue([&](rc::Completions& q, rc::Token t) { return tp.initTransactions(q, t); });
         ASSERT_TRUE(r.drive([&] { return init.ready(); }));

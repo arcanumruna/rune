@@ -49,8 +49,6 @@
 #include <rune/client/TopicHandle.h>
 #include <rune/client/producer/Producer.h>
 #include <rune/client/producer/ProducerHub.h>
-#include <rune/client/producer/TransactionalProducer.h>
-#include <rune/client/producer/TransactionalProducerImpl.h>
 #include <rune/client/subscriber/Subscription.h>
 #include <rune/client/subscriber/SubscriberHub.h>
 #include <rune/client/group/GroupConsumer.h>
@@ -540,8 +538,6 @@ public:
         return agent_.testTransport();
     }
 
-    /// Test hook: transactional producers adopted by the duty-cycle thread.
-    [[nodiscard]] std::size_t testTxnProducerCount() const noexcept { return txnProducers_.size(); }
     /// F8c C7 test hooks (duty thread / owner in Invoker mode, or after close):
     /// handle releases applied but not yet freed by the duty side; subscription
     /// / group-consumer impls the hubs still hold.
@@ -570,7 +566,7 @@ public:
     /// fix5 (txn symmetry) test hook: called inside submitRegistration_ AFTER its
     /// up-front closed fast-fail check and BEFORE the registration is written
     /// to the ring — the exact window the post-submit compare_exchange re-check
-    /// in producer()/transactionalProducer() exists for. A test calls close()
+    /// in producer() exists for. A test calls close()
     /// from here to force "close() won the race" deterministically. Cold path
     /// (registration only); empty by default.
     void testSetBeforeRegistrationSubmitHook(std::function<void()> fn) {
@@ -1165,16 +1161,6 @@ public:
     /// to exercise back-pressure without filling the real default).
     Producer testProducerWithRingCap(ProducerConfig cfg, int32_t ringCap);
 
-    // ---- TX-5: Transactional Producer API -----------------------------------
-
-    /// Create a TransactionalProducer with the given transactional id.
-    /// MUST be called before connect() (setup phase).
-    /// The returned handle's initTransactions() / beginTransaction() / send() /
-    /// commitTransaction() / abortTransaction() lifecycle is fully thread-safe
-    /// via the agent duty cycle.
-    TransactionalProducer transactionalProducer(const std::string& transactionalId,
-                                                ProducerConfig cfg = {});
-
     // ---- CG-5: Consumer-group API -------------------------------------------
 
     /// Join a consumer group and begin receiving pushed Records for assigned
@@ -1442,16 +1428,12 @@ private:
     /// Every group frame (JoinGroup / SyncGroup / Heartbeat / OffsetFetch):
     /// the seed's ring path, or the coordinator session (built once).
     group::SendFn coordSendFn_;
-    /// F8c C5: route one Txn* command to its producer (ring: resolved against
-    /// txnProducers_; direct: the caller's handle holds the impl).
-    void applyTxnCommand_(const detail::HubCommand& cmd, bool direct);
-    [[nodiscard]] producer::TransactionalProducerImpl* findTxn_(uint64_t handle) const noexcept;
-    /// F14: NotCoordinator -> send a MetadataRequest (duty thread).
-    static void rediscoverTrampoline_(void* ctx) noexcept;
     /// Phase 2b F: the CoordinatorSink every producer's CoordinatorLink offers through.
     [[nodiscard]] static producer::CoordinatorSink::Offer coordOfferTrampoline_(void* ctx, const uint8_t* buf,
                                                                                 std::size_t len) noexcept;
     [[nodiscard]] static int64_t coordSessionIdTrampoline_(void* ctx) noexcept;
+    /// F14: NotCoordinator -> send a MetadataRequest (duty thread).
+    static void rediscoverTrampoline_(void* ctx) noexcept;
 
     // ---- F8c C3: control ops (duty-thread owned pending table) --------------
     /// `secret` (review B I4): bytes carried to the duty thread AFTER the wire frame in the same record, handed to the
@@ -1957,19 +1939,10 @@ private:
     // start latch (F8c C8, spec §3.4); the constructor returns only after
     // reading that record, so every other reader is ordered after the write.
     std::thread::id dutyThreadId_;
-    // Built ONCE: the txn producers' send paths (no per-cycle std::function build).
-    std::function<bool(int32_t, const uint8_t*, std::size_t)> txnSendFn_;
-
     // ---- CB-2: ProducerHub + topic registry ----------------------------------
     // Hub is owned by Client and wired into the agent before start().
     producer::ProducerHub producerHub_;
 
-    // ---- TX-5: Transactional producers ---------------------------------------
-    // Duty-cycle-thread owned (registered through the agent ring, like producers).
-    // Created at setup time (before connect()); rarely more than one per client.
-    // F8c C7: raw — the duty side's share of each impl (§3.3); removed by
-    // reapReleases_() (never inside a walk) or handed back at close.
-    std::vector<producer::TransactionalProducerImpl*> txnProducers_;
     std::vector<PendingRelease> releases_;  // duty-thread owned (C7)
     std::vector<PendingRelease> orphans_;   // duty-thread owned (C7 F1): orphaned, not yet applied
     uint64_t implsHandedBack_ = 0;          // closing thread (C7 test hook)
