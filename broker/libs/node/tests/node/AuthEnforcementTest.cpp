@@ -598,3 +598,50 @@ TEST(AuthEnforcementRegression, ARetriedRevokeOfOnesOwnAdminAnswersItsOriginalRe
     EXPECT_EQ(fresh.errorCode, 45u) << "a new request needs the ADMIN it gave up";
     EXPECT_EQ(fresh.detail, "not authorized: ADMIN on CLUSTER");
 }
+
+// PR #410 re-check, adversarial (the throttle exemption of a "known retry"): a hijacked session (no password) reuses
+// the request id of an already-applied request of its user with a DIFFERENT change, so the gateway sees a "known
+// retry" and skips the login throttle.  Its proof guesses must still be throttled like logins, and the answer must not
+// tell a right proof from a wrong one (a right one would otherwise answer "requestId reused", a wrong one 45).
+TEST(AuthEnforcementRegression, AReusedRequestIdIsNoUnthrottledPasswordOracleAdversarialRegression) {
+    AuthRig r;
+    std::string name;
+    const int64_t self = r.newUser({}, &name);
+    const rune::protocol::RequestId applied{0x5156, 0xCCCC};
+    r.wire().pinRequestId(applied);
+    ASSERT_EQ(r.wire().alterPassword(r.ch(), self, name, pc::UserChangeKind::AddPassword, "first-added-pw-123").errorCode, 0u);
+    // The attacker: unsigned (= wrong) guesses under the known request id, well past the free failures.
+    r.wire().signOwnCredentialChanges(false);
+    for (int i = 0; i < 8; ++i) {
+        const auto a = r.wire().alterPassword(r.ch(), self, name, pc::UserChangeKind::SetPassword, "attacker-pw-12345");
+        EXPECT_EQ(a.errorCode, 45u) << i << ": " << a.detail;
+    }
+    // A RIGHT proof (stands in for the guess that hits) under the same id, at once: throttled -> the same 45, not a
+    // distinguishable answer.
+    r.wire().signOwnCredentialChanges(true);
+    const auto hit = r.wire().alterPassword(r.ch(), self, name, pc::UserChangeKind::SetPassword, "attacker-pw-12345");
+    r.wire().pinRequestId(std::nullopt);
+    EXPECT_EQ(hit.errorCode, 45u) << "a right proof right after 8 wrong ones must be throttled, not answered: " << hit.errorCode
+                                  << " " << hit.detail;
+}
+
+// PR #410 review F2, without the throttle's help: a request id reused for a DIFFERENT own change answers exactly the
+// bad-proof refusal whether its proof is right or wrong - the right one first (no failure counted yet, so no delay
+// can mask the difference), then a wrong one.  Neither applies anything.
+TEST(AuthEnforcementRegression, AReusedRequestIdAnswersTheSameForARightAndAWrongProofRegression) {
+    AuthRig r;
+    std::string name;
+    const int64_t self = r.newUser({}, &name);
+    r.wire().pinRequestId(rune::protocol::RequestId{0x5157, 0xDDDD});
+    ASSERT_EQ(r.wire().alterPassword(r.ch(), self, name, pc::UserChangeKind::AddPassword, "first-added-pw-123").errorCode, 0u);
+    const int64_t applied = r.broker().node().securityViewForTest().appliedOffset;
+    const auto right = r.wire().alterPassword(r.ch(), self, name, pc::UserChangeKind::SetPassword, "a-different-pw-123");
+    r.wire().signOwnCredentialChanges(false);
+    const auto wrong = r.wire().alterPassword(r.ch(), self, name, pc::UserChangeKind::SetPassword, "a-different-pw-123");
+    r.wire().signOwnCredentialChanges(true);
+    r.wire().pinRequestId(std::nullopt);
+    EXPECT_EQ(right.errorCode, 45u) << right.detail;
+    EXPECT_EQ(wrong.errorCode, 45u) << wrong.detail;
+    EXPECT_EQ(right.detail, wrong.detail) << "the answer never tells a right proof from a wrong one";
+    EXPECT_EQ(r.broker().node().securityViewForTest().appliedOffset, applied) << "nothing applied";
+}

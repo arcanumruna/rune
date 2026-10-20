@@ -376,7 +376,8 @@ public:
 
     // ── Authentication Task 10 (D36): security DDL / bootstrap / `__security` reads (gateway → admin) ───────────
     rune::gateway::AdminSubmit submitSecurityDdl(const rune::protocol::client::SecurityDdl& w,
-                                                 const rune::gateway::DdlMetaView& meta, std::string_view denial) override {
+                                                 const rune::gateway::DdlMetaView& meta, std::string_view denial,
+                                                 bool proofChecked) override {
         SecurityDdlMsg m;
         m.session = w.sessionId;
         m.corr    = w.correlationId;
@@ -392,6 +393,7 @@ public:
         m.roleName.assign(w.roleName);
         m.force = (w.flags & rune::protocol::client::kSecurityDdlFlagForce) != 0 ? 1 : 0;
         m.denial.assign(denial);
+        m.proofChecked = proofChecked ? 1 : 0;
         return submitDdl_(m);
     }
     rune::gateway::AdminSubmit submitSecurityBootstrap(const rune::protocol::client::SecurityBootstrap& w,

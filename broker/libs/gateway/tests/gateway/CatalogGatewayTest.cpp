@@ -97,7 +97,7 @@ struct CountingAdminSink final : IAdminRequestSink {
         catalogUnsubs.push_back({s, id});
         return true;
     }
-    AdminSubmit submitSecurityDdl(const pc::SecurityDdl&, const DdlMetaView&, std::string_view) override { return AdminSubmit::Accepted; }
+    AdminSubmit submitSecurityDdl(const pc::SecurityDdl&, const DdlMetaView&, std::string_view, bool) override { return AdminSubmit::Accepted; }
     AdminSubmit submitSecurityBootstrap(const pc::SecurityBootstrap&, const DdlMetaView&) override { return AdminSubmit::Accepted; }
     bool submitSecuritySubscribe(int64_t, int64_t, int64_t) override { return true; }
     bool submitSecurityUnsubscribe(int64_t, int64_t) override { return true; }

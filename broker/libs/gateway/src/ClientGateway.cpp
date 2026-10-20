@@ -6,6 +6,7 @@
 #include <rune/gateway/CryptoFrame.h>
 #include <rune/gateway/RequestRejection.h>
 #include <rune/gateway/BootstrapProof.h>
+#include <rune/gateway/SecurityRequestFingerprint.h>
 #include <rune/crypto/Kdf.h>
 #include <rune/crypto/Scram.h>
 #include <cassert>
@@ -8384,6 +8385,7 @@ void ClientGateway::handleSecurityDdl(const uint8_t* buf, std::size_t len)
     // with the verdict, never refused here; the leader answers a retry its original result and refuses the rest 45.  A
     // request without one (pre-v8) cannot be a deduped retry: refused here.
     std::optional<rune::gateway::Denial> denial;
+    bool proofChecked = false;
     {
         const std::string* self = nullptr;
         const std::string* loginNonce = nullptr;
@@ -8392,12 +8394,19 @@ void ClientGateway::handleSecurityDdl(const uint8_t* buf, std::size_t len)
         std::optional<rune::gateway::Denial> admin =
             rune::gateway::authorizeCluster(permsOf_(*session), rune::security::Operation::Admin);
         const bool ownPassword = self != nullptr && pc::isOwnCredentialChange(m, *self);
-        // A request id this broker's mirror already holds is a retry (the mirror may lag the leader by an apply, so a
-        // retry can also look new: then it is still answered right, only charged once on the throttle).
-        const bool knownRetry = !m.ext.requestId.none() && securityView_ != nullptr &&
-                                securityView_->state().request(m.ext.requestId).has_value();
+        // A TRUE retry: a request this broker's mirror already holds with the same request id AND the same statement
+        // fingerprint (PR #410 review F2: the id alone would let a different change skip the throttle).  The mirror
+        // may lag the leader by an apply, so a retry can also look new: then it is still answered right, only charged
+        // once on the throttle.
+        bool knownRetry = false;
+        if (!m.ext.requestId.none() && securityView_ != nullptr)
+            if (const auto rec = securityView_->state().request(m.ext.requestId))
+                knownRetry = rec->requestFingerprint == rune::gateway::securityDdlFingerprint(m);
         if (!ownPassword) denial = std::move(admin);
-        else if (admin) denial = verifyOwnCredentialChange_(*session, m, *self, *loginNonce, /*chargeThrottle=*/!knownRetry);
+        else if (admin) {
+            proofChecked = true;
+            denial = verifyOwnCredentialChange_(*session, m, *self, *loginNonce, /*chargeThrottle=*/!knownRetry);
+        }
         if (denial && m.ext.requestId.none()) {
             (void)deny_(*session, denial, buf, len);
             return;
@@ -8409,7 +8418,8 @@ void ClientGateway::handleSecurityDdl(const uint8_t* buf, std::size_t len)
     }
     answerAdminSubmit_(buf, len,
                        adminSink_->submitSecurityDdl(m, ddlMetaOf_(&m.ext, m.sessionId, *session),
-                                                     denial ? std::string_view(denial->detail) : std::string_view{}),
+                                                     denial ? std::string_view(denial->detail) : std::string_view{},
+                                                     proofChecked),
                        "SecurityDdl: admin ring full", "SecurityDdl: request larger than the admin ring message");
 }
 
@@ -8421,8 +8431,7 @@ std::optional<rune::gateway::Denial> ClientGateway::verifyOwnCredentialChange_(S
     // Issue #114.  Every failure is the same text (it never says which part failed) and counts as a failed login on
     // the throttle: a proof is a password guess.  Cold path (security DDL rate).
     rune::gateway::Denial refused;
-    refused.detail = "not authorized: changing your own password needs a fresh proof of a current password (log in again "
-                     "and retry)";
+    refused.detail = std::string(rune::gateway::kOwnCredentialProofRefusal);
     // A retry of a request the leader already applied (chargeThrottle false) is neither throttled nor charged: the
     // leader answers it from its dedupe table whatever this verdict says.
     if (chargeThrottle) {

@@ -1,4 +1,5 @@
 // SecurityAdmin.cpp — the `__security` leadership on the admin thread (authentication plan D39).  See SecurityAdmin.h.
+#include <rune/gateway/SecurityRequestFingerprint.h>
 #include <cctype>
 #include <rune/node/SecurityAdmin.h>
 
@@ -180,11 +181,11 @@ struct Fnv {
     }
 };
 uint64_t fingerprintOf(const SecurityDdlMsg& m) {
-    Fnv f;
-    f.u(kTidSecurityDdl); f.s(m.meta.statement); f.u(m.kind); f.s(m.name); f.u(m.change); f.u(m.passwordIndex);
-    f.u(m.terminateSessions); f.verifier(m.verifier);
-    f.u(m.granteeKind); f.u(m.op); f.u(m.resourceType); f.u(m.patternKind); f.s(m.pattern); f.s(m.roleName);
-    return f.h;
+    // The ONE definition (PR #410 review F2): the gateway computes the same from the wire request.
+    const rune::gateway::VerifierBytes v{m.verifier.salt, m.verifier.iterations, m.verifier.storedKey, m.verifier.serverKey};
+    return rune::gateway::securityDdlFingerprint(m.meta.statement, m.kind, m.name, m.change, m.passwordIndex,
+                                                 m.terminateSessions, v, m.granteeKind, m.op, m.resourceType,
+                                                 m.patternKind, m.pattern, m.roleName);
 }
 uint64_t fingerprintOf(const SecurityBootstrapMsg& m) {
     Fnv f;
@@ -346,6 +347,10 @@ void SecurityAdmin::startDdl_(const SecurityDdlMsg& m, int64_t nowNs, SecurityRe
         if (const auto rec = state.request(m.meta.requestId)) {
             if (rec->requestFingerprint == fp) {
                 answer_(req, kOK, {}, rec->objectId, rec->newVersion, rec->offset);   // a retry: its ORIGINAL result
+            } else if (m.proofChecked != 0) {
+                // PR #410 review F2: a reused request id on a proof-checked own change answers the SAME as a bad proof,
+                // right proof or wrong - otherwise "requestId reused" for a right one is a password oracle.
+                answer_(req, kNotAuthorized, rune::gateway::kOwnCredentialProofRefusal);
             } else if (!m.denial.empty()) {
                 answer_(req, kNotAuthorized, m.denial);
             } else {
