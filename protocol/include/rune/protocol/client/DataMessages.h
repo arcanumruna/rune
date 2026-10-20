@@ -352,6 +352,10 @@ struct Subscribe {
     static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::Subscribe); // 18
     static constexpr uint16_t BODY_FIXED  = 18; // topicId(4)+partition(4)+partitionKnown(1)+fromOffset(8)+isolation(1)
 
+    /// False when the filter (or key) exceeds its u16 wire length; encode() then returns 0 instead of wrapping
+    /// the length (a wrapped length would decode as "no filter" and deliver everything).
+    [[nodiscard]] bool fits() const noexcept { return key.size() <= 0xFFFFu && filter.size() <= 0xFFFFu; }
+
     /// Total encoded size accounting for the var field.
     std::size_t encodedSize() const noexcept {
         return MessageHeader::ENCODED_SIZE
@@ -361,8 +365,9 @@ struct Subscribe {
     }
 
     /// Encode the full frame into buf.  buf must be ≥ encodedSize() bytes.
-    /// Returns total bytes written.
+    /// Returns total bytes written, or 0 (nothing written) when !fits().
     std::size_t encode(uint8_t* buf) const noexcept {
+        if (!fits()) return 0;
         MessageHeader hdr;
         hdr.blockLength   = BODY_FIXED;
         hdr.templateId    = TEMPLATE_ID;
@@ -396,12 +401,12 @@ struct Subscribe {
     /// Decode a full frame from buf[0..avail-1].
     /// Returns nullopt on any truncation or header mismatch.
     /// The returned span is a zero-copy view into buf — buf must outlive the result.
-    /// `clientVersion` is the session's negotiated version: the filter trailer is parsed only when
-    /// clientUnderstandsFilters(clientVersion); for an older session any bytes after the key are ignored
-    /// (spec E13) and `filter` stays empty.  The default parses the trailer (every frame that ends at the key
-    /// decodes identically either way).
+    /// `clientVersion` is REQUIRED (no default, so a call site cannot forget it): the session's negotiated
+    /// version.  The filter trailer is parsed only when clientUnderstandsFilters(clientVersion); for an older
+    /// session any bytes after the key are ignored (spec E13) and `filter` stays empty.  Client-side codecs and
+    /// tests pass kClientVersion.
     static std::optional<Subscribe> decode(const uint8_t* buf, std::size_t avail,
-                                           int32_t clientVersion = kClientVersion) noexcept {
+                                           int32_t clientVersion) noexcept {
         auto hdrOpt = MessageHeader::decode(buf, avail);
         if (!hdrOpt) return std::nullopt;
         const MessageHeader& hdr = *hdrOpt;
@@ -461,8 +466,10 @@ struct Subscribe {
 // Client version 10: a refused filter is answered {InvalidRequest, detail}, the detail in a trailing
 //   [38..39]  detail length : uint16
 //   [40..]    detail bytes (utf-8)
-// written only when `detail` is non-empty AND the session is >= kClientVersionFilter (encode(buf, clientVersion)):
-// an older client never sees a trailer it cannot parse.  A detail is at most 65535 bytes (longer is truncated).
+// written only by encodeFor(buf, clientVersion, capacity), and only when `detail` is non-empty AND the session is
+// >= kClientVersionFilter: an older client never sees a trailer it cannot parse.  encode(buf) NEVER writes it (it
+// is exactly ENCODED_SIZE, safe for the fixed 38-byte buffers).  A detail is at most 65535 bytes; a longer one is
+// cut at a UTF-8 code-point boundary.
 // ---------------------------------------------------------------------------
 struct SubscribeResponse {
     int64_t sessionId      = 0;
@@ -477,15 +484,14 @@ struct SubscribeResponse {
 
     static constexpr std::size_t ENCODED_SIZE = MessageHeader::ENCODED_SIZE + BODY_FIXED; // 38
 
-    /// Size of the frame encode() writes for a session >= kClientVersionFilter: ENCODED_SIZE, plus the detail
+    /// Size of the frame encodeFor() writes for a session >= kClientVersionFilter: ENCODED_SIZE, plus the detail
     /// trailer when `detail` is non-empty.  (A session below 10 always gets ENCODED_SIZE.)
     std::size_t encodedSizeWithDetail() const noexcept {
         return ENCODED_SIZE + (detail.empty() ? 0u : 2u + clampedDetail());
     }
 
-    /// Encode the full frame into buf (buf >= encodedSizeWithDetail() bytes).  The detail trailer is written only
-    /// when non-empty and clientUnderstandsFilters(clientVersion).  Returns bytes written (38 without a detail).
-    std::size_t encode(uint8_t* buf, int32_t clientVersion = kClientVersion) const noexcept {
+    /// Encode the fixed 38-byte frame into buf; NEVER the detail.  Returns ENCODED_SIZE.
+    std::size_t encode(uint8_t* buf) const noexcept {
         MessageHeader hdr;
         hdr.blockLength   = BODY_FIXED;
         hdr.templateId    = TEMPLATE_ID;
@@ -500,12 +506,21 @@ struct SubscribeResponse {
         detail::putLE32 (buf, fixedBase + 2, partition);
         detail::putLE64 (buf, fixedBase + 6, subscriptionId);
 
-        if (!detail.empty() && clientUnderstandsFilters(clientVersion)) {
-            return ENCODED_SIZE + putVarBytes(buf + ENCODED_SIZE,
-                                              reinterpret_cast<const uint8_t*>(detail.data()),
-                                              static_cast<uint16_t>(clampedDetail()));
-        }
         return ENCODED_SIZE;
+    }
+
+    /// The ONLY path that writes `detail`: encode(), then the trailer when non-empty and
+    /// clientUnderstandsFilters(clientVersion).  `capacity` is buf's size (size it with encodedSizeWithDetail());
+    /// returns 0 and writes nothing when it is too small.  Returns the bytes written.
+    std::size_t encodeFor(uint8_t* buf, int32_t clientVersion, std::size_t capacity) const noexcept {
+        const bool withDetail = !detail.empty() && clientUnderstandsFilters(clientVersion);
+        if (capacity < (withDetail ? encodedSizeWithDetail() : ENCODED_SIZE)) return 0;
+        std::size_t pos = encode(buf);
+        if (withDetail) {
+            pos += putVarBytes(buf + pos, reinterpret_cast<const uint8_t*>(detail.data()),
+                               static_cast<uint16_t>(clampedDetail()));
+        }
+        return pos;
     }
 
     /// Decode a full frame from buf[0..avail-1].
@@ -541,7 +556,7 @@ struct SubscribeResponse {
     }
 
 private:
-    std::size_t clampedDetail() const noexcept { return detail.size() > 0xFFFFu ? 0xFFFFu : detail.size(); }
+    std::size_t clampedDetail() const noexcept { return clampUtf8Len(detail, 0xFFFFu); }
 };
 
 // ---------------------------------------------------------------------------

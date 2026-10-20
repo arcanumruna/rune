@@ -1897,7 +1897,7 @@ private:
             return;
         }
         case rcc::TemplateId::JoinGroup: {
-            const auto j = rp::JoinGroup::decode(buf, len);
+            const auto j = rp::JoinGroup::decode(buf, len, rp::kClientVersion);
             if (!j) return;
             ++joinGroups;
             groupSessionIds.push_back(j->sessionId);

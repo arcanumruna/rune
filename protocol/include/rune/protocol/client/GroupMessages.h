@@ -73,11 +73,18 @@ struct JoinGroup {
     static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::JoinGroup); // 32
     static constexpr uint16_t BODY_FIXED  = 4;  // sessionTimeoutMs(4)
 
-    /// Total encoded size (use when encoding from a vector/span input).
+    /// False when the group id, member id or filter exceeds its u16 wire length; encode() then returns 0 (a
+    /// wrapped filter length would decode as "no filter").
+    [[nodiscard]] bool fits() const noexcept {
+        return groupId.size() <= 0xFFFFu && memberId.size() <= 0xFFFFu && filter.size() <= 0xFFFFu;
+    }
+
+    /// Total encoded size (use when encoding from a vector/span input).  `filterBytes` is REQUIRED (no default):
+    /// pass 0 for no filter, or use the member encodedSize(topicCount), which reads `filter` itself.
     static std::size_t encodedSizeFor(std::span<const uint8_t> grp,
                                       std::span<const uint8_t> mbr,
                                       std::size_t topicCount,
-                                      std::size_t filterBytes = 0) noexcept {
+                                      std::size_t filterBytes) noexcept {
         return MessageHeader::ENCODED_SIZE + BODY_FIXED
              + 2u + grp.size()
              + 2u + mbr.size()
@@ -85,11 +92,17 @@ struct JoinGroup {
              + (filterBytes == 0 ? 0u : 2u + filterBytes);
     }
 
+    /// Total encoded size of THIS message (groupId, memberId, filter) with `topicCount` topic ids.
+    std::size_t encodedSize(std::size_t topicCount) const noexcept {
+        return encodedSizeFor(groupId, memberId, topicCount, filter.size());
+    }
+
     /// Encode the full frame into buf.  topicIds is an iterable of int32_t.
     /// buf must be >= encodedSizeFor(groupId, memberId, topicIds.size()) bytes.
-    /// Returns total bytes written.
+    /// Returns total bytes written, or 0 (nothing written) when !fits().
     std::size_t encode(uint8_t* buf,
                        std::span<const int32_t> topicIds) const noexcept {
+        if (!fits()) return 0;
         MessageHeader hdr;
         hdr.blockLength   = BODY_FIXED;
         hdr.templateId    = TEMPLATE_ID;
@@ -134,11 +147,11 @@ struct JoinGroup {
     /// Returns nullopt on any truncation or header mismatch.
     /// ALL views (groupId, memberId, subscribedTopicIds, filter) are zero-copy into buf —
     /// buf must outlive the decoded result.  No heap allocation.
-    /// `clientVersion` is the session's negotiated version: the filter trailer is parsed only when
-    /// clientUnderstandsFilters(clientVersion); for an older session any bytes after the topic ids are ignored
-    /// (spec E13).  The default parses the trailer.
+    /// `clientVersion` is REQUIRED (no default): the session's negotiated version.  The filter trailer is parsed
+    /// only when clientUnderstandsFilters(clientVersion); for an older session any bytes after the topic ids are
+    /// ignored (spec E13) and `filter` stays empty.  Client-side codecs and tests pass kClientVersion.
     static std::optional<JoinGroup> decode(const uint8_t* buf, std::size_t avail,
-                                           int32_t clientVersion = kClientVersion) noexcept {
+                                           int32_t clientVersion) noexcept {
         auto hdrOpt = MessageHeader::decode(buf, avail);
         if (!hdrOpt) return std::nullopt;
         const MessageHeader& hdr = *hdrOpt;
@@ -206,7 +219,8 @@ struct JoinGroup {
 //
 // Client version 10: a refused join (e.g. a filter mismatch) carries a trailing
 //   [..+2] detail length : uint16, [..] detail bytes (utf-8)
-// after memberId, written only when `detail` is non-empty AND the session is >= kClientVersionFilter.
+// after memberId, written only by encodeFor(buf, clientVersion, capacity) and only when `detail` is non-empty AND
+// the session is >= kClientVersionFilter.  encode(buf) never writes it.
 // ---------------------------------------------------------------------------
 /// A JoinGroup whose filter differs from the group's is answered {InvalidRequest, detail} where detail starts
 /// with exactly this prefix (then ": the group uses filter <hex>").
@@ -231,14 +245,13 @@ struct JoinGroupResponse {
              + 2u + memberId.size();
     }
 
-    /// Total encoded size for a session >= kClientVersionFilter (adds the detail trailer when non-empty).
+    /// Total encoded size encodeFor() writes for a session >= kClientVersionFilter (adds the detail when non-empty).
     std::size_t encodedSizeWithDetail() const noexcept {
         return encodedSize() + (detail.empty() ? 0u : 2u + clampedDetail());
     }
 
-    /// Encode the full frame into buf.  buf must be >= encodedSizeWithDetail() bytes.  The detail trailer is
-    /// written only when non-empty and clientUnderstandsFilters(clientVersion).  Returns total bytes written.
-    std::size_t encode(uint8_t* buf, int32_t clientVersion = kClientVersion) const noexcept {
+    /// Encode the full frame into buf (>= encodedSize() bytes); NEVER the detail.  Returns total bytes written.
+    std::size_t encode(uint8_t* buf) const noexcept {
         MessageHeader hdr;
         hdr.blockLength   = BODY_FIXED;
         hdr.templateId    = TEMPLATE_ID;
@@ -259,8 +272,17 @@ struct JoinGroupResponse {
         pos += putVarBytes(buf + pos,
                            memberId.data(),
                            static_cast<uint16_t>(memberId.size()));
+        return pos;
+    }
 
-        if (!detail.empty() && clientUnderstandsFilters(clientVersion)) {
+    /// The ONLY path that writes `detail`: encode(), then the trailer when non-empty and
+    /// clientUnderstandsFilters(clientVersion).  `capacity` is buf's size (size it with encodedSizeWithDetail());
+    /// returns 0 and writes nothing when it is too small.
+    std::size_t encodeFor(uint8_t* buf, int32_t clientVersion, std::size_t capacity) const noexcept {
+        const bool withDetail = !detail.empty() && clientUnderstandsFilters(clientVersion);
+        if (capacity < (withDetail ? encodedSizeWithDetail() : encodedSize())) return 0;
+        std::size_t pos = encode(buf);
+        if (withDetail) {
             pos += putVarBytes(buf + pos, reinterpret_cast<const uint8_t*>(detail.data()),
                                static_cast<uint16_t>(clampedDetail()));
         }
@@ -307,7 +329,7 @@ struct JoinGroupResponse {
     }
 
 private:
-    std::size_t clampedDetail() const noexcept { return detail.size() > 0xFFFFu ? 0xFFFFu : detail.size(); }
+    std::size_t clampedDetail() const noexcept { return clampUtf8Len(detail, 0xFFFFu); }
 };
 
 // ---------------------------------------------------------------------------

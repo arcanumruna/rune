@@ -343,7 +343,7 @@ TEST(SubscribeDedupeRegression, MalformedSubscribeIsAnsweredInvalidRequestRegres
     Rig r(/*workers=*/false);
     const int64_t sid = r.gw.injectTestSession(0);
     const auto f = headerOnly(pc::TemplateId::Subscribe, sid, 6060, pc::Subscribe::BODY_FIXED);
-    ASSERT_FALSE(pc::Subscribe::decode(f.data(), f.size()).has_value());
+    ASSERT_FALSE(pc::Subscribe::decode(f.data(), f.size(), pc::kClientVersion).has_value());
     r.gw.applySubscribeForTest(f.data(), f.size());
     ASSERT_EQ(r.responses.size(), 1u) << "an undecodable Subscribe must be answered";
     EXPECT_EQ(r.responses[0].correlationId, 6060);
@@ -482,4 +482,62 @@ TEST(ClientGatewayRegression, SubscribeToARuntimeTopicNeverReadsTheWorkerOwnedLo
     ASSERT_EQ(responses[0].errorCode, static_cast<int16_t>(pc::ErrorCode::OK));
     EXPECT_EQ(gw.subscriptionNextOffsetForTest(responses[0].subscriptionId), 0)
         << "the gateway resolved the Earliest start from a log the worker owns (start " << S << ")";
+}
+
+
+// ---------------------------------------------------------------------------
+// Phase 2c Task 5 fix round 1 (I1): P13 / E13 at the real handler.  The Subscribe filter trailer is parsed only for
+// a session that negotiated client version >= 10; a pre-v10 session's trailing bytes are IGNORED (served as today).
+// ---------------------------------------------------------------------------
+namespace {
+std::vector<uint8_t> subscribeWithTail(int64_t sid, int64_t corr, const std::vector<uint8_t>& tail) {
+    auto f = subscribeFrame(sid, corr, 0, 0);
+    f.insert(f.end(), tail.begin(), tail.end());
+    return f;
+}
+std::vector<uint8_t> wellFormedFilterTrailer() {
+    const std::vector<uint8_t> filter{1, 1, 5, 0, 4, 1, 1, 0xAA, 0xBB, 0xCC, 0xDD};
+    std::vector<uint8_t> t{static_cast<uint8_t>(filter.size()), 0};
+    t.insert(t.end(), filter.begin(), filter.end());
+    return t;
+}
+} // namespace
+
+TEST(GatewayFilterWireRegression, PreV10SessionWithTrailingBytesIsServedUnfilteredRegression) {
+    Rig r(/*workers=*/false);
+    const int64_t v9 = r.gw.injectTestSession(0, pc::kClientVersionAuth);
+    // (a) one stray byte after the key: E13 "ignored" - answered OK, a subscription exists.
+    auto stray = subscribeWithTail(v9, 1, {0x7F});
+    r.gw.applySubscribeForTest(stray.data(), stray.size());
+    ASSERT_EQ(r.responses.size(), 1u);
+    EXPECT_EQ(r.responses[0].errorCode, static_cast<int16_t>(pc::ErrorCode::OK));
+    EXPECT_EQ(r.gw.subscriptionCount(), 1u);
+    // (b) a truncated trailer (declared 11, 2 present) is equally ignored.
+    auto cut = subscribeWithTail(v9, 2, {11, 0, 1, 2});
+    r.gw.applySubscribeForTest(cut.data(), cut.size());
+    ASSERT_EQ(r.responses.size(), 2u);
+    EXPECT_EQ(r.responses[1].errorCode, static_cast<int16_t>(pc::ErrorCode::OK));
+    // (c) the same with a WELL-FORMED trailer: still served, and never decoded as a filter - the decoder a
+    //     session of this version is given yields an empty filter.
+    auto good = subscribeWithTail(v9, 3, wellFormedFilterTrailer());
+    r.gw.applySubscribeForTest(good.data(), good.size());
+    ASSERT_EQ(r.responses.size(), 3u);
+    EXPECT_EQ(r.responses[2].errorCode, static_cast<int16_t>(pc::ErrorCode::OK));
+    EXPECT_EQ(r.gw.subscriptionCount(), 3u);
+    const auto asV9 = pc::Subscribe::decode(good.data(), good.size(), r.gw.sessionClientVersion(v9));
+    ASSERT_TRUE(asV9.has_value());
+    EXPECT_TRUE(asV9->filter.empty());
+}
+
+TEST(GatewayFilterWireRegression, V10SessionWithAMalformedTrailerIsRefusedRegression) {
+    Rig r(/*workers=*/false);
+    const int64_t v10 = r.gw.injectTestSession(0, pc::kClientVersionFilter);
+    auto stray = subscribeWithTail(v10, 1, {0x7F});          // a lone length byte
+    r.gw.applySubscribeForTest(stray.data(), stray.size());
+    auto cut = subscribeWithTail(v10, 2, {11, 0, 1, 2});     // declared 11, 2 present
+    r.gw.applySubscribeForTest(cut.data(), cut.size());
+    ASSERT_EQ(r.responses.size(), 2u);
+    EXPECT_EQ(r.responses[0].errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    EXPECT_EQ(r.responses[1].errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    EXPECT_EQ(r.gw.subscriptionCount(), 0u);
 }

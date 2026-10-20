@@ -257,7 +257,7 @@ struct TestFixture {
         msg.memberId = std::span<const uint8_t>(
             reinterpret_cast<const uint8_t*>(memberId.data()), memberId.size());
         const std::size_t reqLen = msg.encode(reqBuf.data(), std::span<const int32_t>());
-        const std::size_t outLen = service->handleJoinGroup(reqBuf.data(), reqLen, clock, outBuf.data(), kBufSize);
+        const std::size_t outLen = service->handleJoinGroup(reqBuf.data(), reqLen, rune::protocol::client::kClientVersion, clock, outBuf.data(), kBufSize);
         auto resp = pc::JoinGroupResponse::decode(outBuf.data(), outLen);
         if (!resp) throw std::runtime_error("JoinGroup decode failed");
         return *resp;

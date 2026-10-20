@@ -4531,8 +4531,14 @@ void ClientGateway::onEgressReleased_(int32_t worker, uint64_t token)
 
 void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
 {
-    // 1. Decode.
-    auto msgOpt = pc::Subscribe::decode(buf, len);
+    // 1. Decode.  P13 / E13: the filter trailer is parsed only for a session that negotiated client version >= 10,
+    // so the session is looked up first.  An unknown session decodes as version 0 (no trailer parsed), which keeps
+    // the existing unknown-session path below exactly as it was.
+    int32_t decodeVersion = 0;
+    if (const auto hdr = pc::MessageHeader::decode(buf, len)) {
+        if (const Session* s0 = sessions_.find(hdr->sessionId)) decodeVersion = s0->clientVersion;
+    }
+    auto msgOpt = pc::Subscribe::decode(buf, len, decodeVersion);
     if (!msgOpt) [[unlikely]] {
         // No-hang (R2): answered SubscribeResponse{InvalidRequest}.
         (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest),
@@ -7086,7 +7092,7 @@ void ClientGateway::handleGroupMessage(const uint8_t* buf, std::size_t len,
     // old client gets as UnknownMember (answerRejection_).
     if (!pc::clientUnderstandsInvalidRequest(session->clientVersion)) [[unlikely]] {
         const bool undecodable =
-            (tid == static_cast<uint16_t>(pc::TemplateId::JoinGroup) && !pc::JoinGroup::decode(buf, len)) ||
+            (tid == static_cast<uint16_t>(pc::TemplateId::JoinGroup) && !pc::JoinGroup::decode(buf, len, session->clientVersion)) ||
             (tid == static_cast<uint16_t>(pc::TemplateId::SyncGroup) && !pc::SyncGroup::decode(buf, len)) ||
             (tid == static_cast<uint16_t>(pc::TemplateId::Heartbeat) && !pc::Heartbeat::decode(buf, len)) ||
             (tid == static_cast<uint16_t>(pc::TemplateId::OffsetFetch) && !pc::OffsetFetch::decode(buf, len));
@@ -7105,7 +7111,7 @@ void ClientGateway::handleGroupMessage(const uint8_t* buf, std::size_t len,
     const auto templateId = static_cast<pc::TemplateId>(tid);
     switch (templateId) {
         case pc::TemplateId::JoinGroup:
-            encoded = groupService_->handleJoinGroup(buf, len, nowNs, scratch_.data(), cap);
+            encoded = groupService_->handleJoinGroup(buf, len, session->clientVersion, nowNs, scratch_.data(), cap);
             break;
         case pc::TemplateId::SyncGroup:
             encoded = groupService_->handleSyncGroup(buf, len, nowNs, scratch_.data(), cap);
@@ -7836,7 +7842,7 @@ bool ClientGateway::denyGroupRequest_(Session& session, uint16_t tid, const uint
     std::optional<rune::gateway::Denial> d;
     switch (static_cast<pc::TemplateId>(tid)) {
         case pc::TemplateId::JoinGroup:
-            if (const auto m = pc::JoinGroup::decode(buf, len)) {
+            if (const auto m = pc::JoinGroup::decode(buf, len, session.clientVersion)) {
                 d = group(m->groupId);
                 for (const int32_t t : m->subscribedTopicIds) { if (d) break; d = topic(t); }
             }

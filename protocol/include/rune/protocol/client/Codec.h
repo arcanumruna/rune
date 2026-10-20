@@ -92,6 +92,15 @@ inline bool getVarBytes32(const uint8_t* buf, std::size_t avail, std::size_t& po
     return true;
 }
 
+/// Length of `s` clamped to at most `maxLen` bytes, backed off to a UTF-8 code-point boundary so a cut text never
+/// ends mid-sequence (a continuation byte 10xxxxxx at the cut means the sequence straddles it).
+inline std::size_t clampUtf8Len(std::string_view s, std::size_t maxLen) noexcept {
+    if (s.size() <= maxLen) return s.size();
+    std::size_t n = maxLen;
+    while (n > 0 && (static_cast<uint8_t>(s[n]) & 0xC0u) == 0x80u) --n;
+    return n;
+}
+
 /// String convenience — encodes a string_view as a var-bytes field.
 inline std::size_t putVarStr(uint8_t* buf, std::string_view s) noexcept {
     return putVarBytes(buf,

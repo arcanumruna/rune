@@ -661,7 +661,7 @@ TEST(ConformanceGolden, SubscribeExplicit) {
 
     assertHeader(golden, rpc::Subscribe::TEMPLATE_ID, rpc::Subscribe::BODY_FIXED);
 
-    auto msgOpt = rpc::Subscribe::decode(golden.data(), golden.size());
+    auto msgOpt = rpc::Subscribe::decode(golden.data(), golden.size(), rpc::kClientVersion);
     ASSERT_TRUE(msgOpt.has_value());
     EXPECT_EQ(msgOpt->sessionId,      kSessionId);
     EXPECT_EQ(msgOpt->correlationId,  kCorrelationId);
@@ -703,7 +703,7 @@ TEST(ConformanceGolden, SubscribeKeyOnly) {
 
     assertHeader(golden, rpc::Subscribe::TEMPLATE_ID, rpc::Subscribe::BODY_FIXED);
 
-    auto msgOpt = rpc::Subscribe::decode(golden.data(), golden.size());
+    auto msgOpt = rpc::Subscribe::decode(golden.data(), golden.size(), rpc::kClientVersion);
     ASSERT_TRUE(msgOpt.has_value());
     EXPECT_EQ(msgOpt->sessionId,      kSessionId);
     EXPECT_EQ(msgOpt->correlationId,  kCorrelationId);
@@ -1032,7 +1032,7 @@ TEST(GroupConformance, JoinGroupFileGolden) {
     assertHeader(golden, rpc::JoinGroup::TEMPLATE_ID, rpc::JoinGroup::BODY_FIXED);
 
     // Decode-golden
-    auto msgOpt = rpc::JoinGroup::decode(golden.data(), golden.size());
+    auto msgOpt = rpc::JoinGroup::decode(golden.data(), golden.size(), rpc::kClientVersion);
     ASSERT_TRUE(msgOpt.has_value());
     EXPECT_EQ(msgOpt->sessionId,        kSessionId);
     EXPECT_EQ(msgOpt->correlationId,    kCorrelationId);

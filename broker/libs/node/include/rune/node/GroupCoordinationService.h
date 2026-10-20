@@ -205,7 +205,7 @@ public:
     // cap the entry count to what fits.
     // Never throws.  Never allocates from heap in steady state.
     // -----------------------------------------------------------------------
-    size_t handleJoinGroup   (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap) override;
+    size_t handleJoinGroup   (const uint8_t* buf, size_t len, int32_t clientVersion, int64_t nowNs, uint8_t* out, size_t outCap) override;
     size_t handleSyncGroup   (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap) override;
     size_t handleHeartbeat   (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap) override;
     size_t handleLeaveGroup  (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap) override;

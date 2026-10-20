@@ -196,7 +196,7 @@ inline std::size_t encodeSubscribe(uint8_t*                  buf,
 /// Returned span is a zero-copy view into buf — buf must outlive the result.
 inline std::optional<SubscribeView> decodeSubscribe(const uint8_t* buf,
                                                      std::size_t    len) noexcept {
-    auto opt = rpc::Subscribe::decode(buf, len);
+    auto opt = rpc::Subscribe::decode(buf, len, rpc::kClientVersion);
     if (!opt) return std::nullopt;
     SubscribeView v;
     v.sessionId      = opt->sessionId;

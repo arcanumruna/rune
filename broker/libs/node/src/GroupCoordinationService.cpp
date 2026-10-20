@@ -390,9 +390,9 @@ static std::string topicNameForId(rune::gateway::TopicRegistry* topics, int32_t 
 // handleJoinGroup (templateId 32)
 // ---------------------------------------------------------------------------
 size_t GroupCoordinationService::handleJoinGroup(
-    const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap)
+    const uint8_t* buf, size_t len, int32_t clientVersion, int64_t nowNs, uint8_t* out, size_t outCap)
 {
-    auto msgOpt = pc::JoinGroup::decode(buf, len);
+    auto msgOpt = pc::JoinGroup::decode(buf, len, clientVersion);
     if (!msgOpt) {
         // No-hang (R2): answered JoinGroupResponse{InvalidRequest}, never dropped.
         spdlog::debug("GroupCoordinationService: JoinGroup decode failed — answered InvalidRequest");

@@ -556,17 +556,14 @@ void GroupConsumerHub::sendJoinGroup(GroupConsumerImpl& impl,
     const auto grpSpan = strSpan(impl.groupId);
     const auto mbrSpan = strSpan(impl.memberId);  // empty = new member
 
-    const std::size_t needed = rpc::JoinGroup::encodedSizeFor(
-        grpSpan, mbrSpan, impl.topicIds.size());
-
-    ensureBuf(impl, needed);
-
     rpc::JoinGroup msg;
     msg.sessionId        = sessionId;
     msg.correlationId    = 0;  // broker ignores; matched by state
     msg.sessionTimeoutMs = impl.cfg.sessionTimeoutMs;
     msg.groupId          = grpSpan;
     msg.memberId         = mbrSpan;
+
+    ensureBuf(impl, msg.encodedSize(impl.topicIds.size()));   // reads msg.filter itself (empty until the filter task)
 
     const std::size_t len = msg.encode(impl.sendBuf.data(),
                                         std::span<const int32_t>(impl.topicIds));
