@@ -53,3 +53,6 @@ docker/README.md
 docker/rune-cluster.env.example
 docker/ping-probe
 dr-e2e/
+
+# eos-e2e.sh's scratch dir (generated passwords live there; a random name would bust the COPY cache)
+.eos-e2e-work*/

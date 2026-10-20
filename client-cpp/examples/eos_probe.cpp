@@ -73,6 +73,7 @@ constexpr int         kTxnRecords  = 500;
 constexpr int         kAbortEvery  = 7;
 constexpr int         kPaths       = 5;
 constexpr int         kMaxParts    = 64;
+constexpr const char* kRejoinText  = "rebalancing (rejoin)";   // GroupConsumer::seekToCommittedAndWait's Rejoined text
 
 int64_t valueOf(int64_t id) noexcept { return id * 7 + 3; }      // what fill writes
 int64_t transform(int64_t v) noexcept { return v * 2; }          // what the pipeline writes
@@ -125,14 +126,17 @@ struct PartState {
 };
 enum class Accept { Take, Drop, Gap };
 
-Accept onRecord(PartState& s, int64_t off, bool dropping) noexcept {
-    if (s.rebase && dropping) return Accept::Drop;               // fetches of the old instance, until the rewind returns
+// RULE: no record at or past the committed offset is ever silently dropped.  The rewind is applied when it is issued, so
+// everything delivered after that is the new instance, starting at the broker's committed offset: the first record is
+// the baseline.  A record ahead of the expected offset is a Gap (loud), a record behind it a duplicate (dropped).
+Accept onRecord(PartState& s, int64_t off) noexcept {
     if (s.rebase || s.nextAppend < 0) {                          // learn the baseline
         if (s.rebase && off > s.hi) return Accept::Gap;
         s.committed = off; s.seen = true; s.rebase = false; s.hi = INT64_MAX; s.nextAppend = off + 1;
         return Accept::Take;
     }
-    if (off != s.nextAppend) return Accept::Drop;                // a duplicate or a stale push
+    if (off > s.nextAppend) return Accept::Gap;                  // would skip records
+    if (off < s.nextAppend) return Accept::Drop;                 // a duplicate (a re-delivery below the position)
     s.nextAppend = off + 1;
     return Accept::Take;
 }
@@ -143,11 +147,13 @@ void beforeRewind(PartState& s) noexcept { s.nextAppend = s.rebase ? -1 : s.comm
 // The exit rule: every partition's committed offset reached its end.  A partition this process never saw anything
 // of is counted done only after a quiet period (it was fully committed before this process started); a partition
 // it has seen is never done before its committed offset reaches the end.
+// Also "unknown": a partition whose in-doubt commit may have landed on its last batch (hi == end): when it did, the
+// rewind re-seeds at the end and nothing is ever delivered.
 bool allDone(const PartState* st, const int64_t* ends, std::size_t n, int64_t idleMs) noexcept {
     bool unknown = false;
     for (std::size_t p = 0; p < n; ++p) {
         if (ends[p] == 0 || st[p].committed >= ends[p]) continue;
-        if (!st[p].seen) { unknown = true; continue; }
+        if (!st[p].seen || (st[p].rebase && st[p].hi == ends[p])) { unknown = true; continue; }
         return false;
     }
     return !unknown || idleMs > 15000;
@@ -174,9 +180,9 @@ int selfcheck() {
     {   // I2: committed survives a rebalance; the idle shortcut is for never-seen partitions only
         PartState st[2];
         const int64_t ends[2] = {10, 10};
-        expect(onRecord(st[0], 0, false) == Accept::Take && st[0].committed == 0, "first record is the baseline");
-        expect(onRecord(st[0], 0, false) == Accept::Drop, "a duplicate is dropped");
-        expect(onRecord(st[0], 2, false) == Accept::Drop, "a gap is dropped by the strict filter");
+        expect(onRecord(st[0], 0) == Accept::Take && st[0].committed == 0, "first record is the baseline");
+        expect(onRecord(st[0], 0) == Accept::Drop, "a duplicate is dropped");
+        expect(onRecord(st[0], 2) == Accept::Gap, "a record ahead of the expected offset is a loud gap, never dropped");
         st[0].committed = 6;
         markRebase(st[0]);
         expect(st[0].committed == 6 && st[0].rebase, "a rebalance keeps committed");
@@ -186,19 +192,39 @@ int selfcheck() {
         st[1].committed = 10;
         expect(allDone(st, ends, 2, 0), "all committed to the end");
     }
-    {   // I3: an in-doubt commit relearns the baseline from the broker; a stale push never becomes it
+    {   // N1: a rewind followed immediately by records at the committed offset loses none of them
         PartState s;
-        onRecord(s, 0, false); s.committed = 5; s.nextAppend = 12;           // local view: committed 5, batch ends at 9
+        onRecord(s, 0); onRecord(s, 1); onRecord(s, 2); onRecord(s, 3);      // consumed 0..3, queued
+        s.committed = 2;                                                     // committed through offset 1
+        beforeRewind(s);                                                     // the rewind is issued: filter restarts at 2
+        expect(onRecord(s, 2) == Accept::Take && onRecord(s, 3) == Accept::Take && s.nextAppend == 4, "records at the committed offset are taken");
+        PartState r;                                                         // a partition to relearn
+        onRecord(r, 0); r.committed = 5; markRebase(r);
+        beforeRewind(r);
+        expect(onRecord(r, 5) == Accept::Take && r.committed == 5 && !r.rebase, "right after a rebase rewind the first record is the baseline");
+    }
+    {   // I3: an in-doubt commit relearns the baseline from the broker
+        PartState s;
+        onRecord(s, 0); s.committed = 5; s.nextAppend = 12;                  // local view: committed 5, batch ends at 9
         markRebase(s, 9);                                                    // the commit may have advanced to 9
         beforeRewind(s);
         expect(s.nextAppend == -1, "a relearning partition has no filter");
-        expect(onRecord(s, 12, true) == Accept::Drop, "pushes during the rewind are ignored");
         PartState landed = s;
-        expect(onRecord(landed, 9, false) == Accept::Take && landed.committed == 9 && landed.nextAppend == 10, "commit landed: resume at 9");
+        expect(onRecord(landed, 9) == Accept::Take && landed.committed == 9 && landed.nextAppend == 10, "commit landed: resume at 9");
         PartState notLanded = s;
-        expect(onRecord(notLanded, 5, false) == Accept::Take && notLanded.committed == 5, "commit not landed: redo from 5");
+        expect(onRecord(notLanded, 5) == Accept::Take && notLanded.committed == 5, "commit not landed: redo from 5");
         PartState gap = s;
-        expect(onRecord(gap, 11, false) == Accept::Gap, "a first record beyond the batch end is a loud gap");
+        expect(onRecord(gap, 11) == Accept::Gap, "a first record beyond the batch end is a loud gap");
+        // Minor 1: the batch was the partition's last (hi == end) and the commit landed: nothing is ever delivered.
+        PartState last;
+        onRecord(last, 0); last.committed = 5; markRebase(last, 10);
+        const int64_t e1[1] = {10};
+        expect(!allDone(&last, e1, 1, 1000) && allDone(&last, e1, 1, 16000), "in-doubt on the last batch terminates after the idle window");
+    }
+    {   // N2: a Rejoined rewind is benign, every other failure is loud
+        expect(std::strstr("seekToCommitted() aborted: the group is rebalancing (rejoin)", kRejoinText) != nullptr, "the Rejoined text is recognised");
+        expect(std::strstr("seekToCommitted() timed out", kRejoinText) == nullptr, "a Timeout is not");
+        expect(std::strstr("seekToCommitted() aborted: the session to the broker was lost", kRejoinText) == nullptr, "SessionLost is not");
     }
     for (int p = 0; p < kPaths; ++p) expect(pathName(p) != nullptr, "path names");
     if (bad == 0) std::printf("EOS-SELFCHECK: OK\n");
@@ -302,7 +328,6 @@ struct InState {
     std::vector<InRec>               q;               // records not yet in a transaction: q[head..]
     std::size_t                      head = 0;
     int64_t                          rebalances = 0;  // onAssigned / onRevoked count
-    bool                             dropping = false;// inside a rewind: rebase partitions ignore pushes
     std::string                      error;           // a Gap: the run must stop with this text
     InState() { q.reserve(1u << 18); }
     // A rebalance: queued records are stale, every partition handed over relearns its baseline (committed stays).
@@ -422,6 +447,11 @@ private:
                 switch (s) {
                 case TxnState::FatalError:
                     // A fence is the only fatal error the zombie leg may report as such.
+                    if (why.find("enced") == std::string::npos) {
+                        // A fence first seen on a produce path has a generic text: in FatalError every op completes
+                        // with the stored status, so one more op names the cause.
+                        try { tp_.abortTransactionAndWait(); } catch (const std::exception& e) { why = e.what(); }
+                    }
                     if (why.find("enced") != std::string::npos) return Outcome::Fenced;
                     throw std::runtime_error("fatal producer error (not a fence): " + why);
                 case TxnState::CommittingTransaction:
@@ -462,14 +492,20 @@ private:
         return o;
     }
 
+    static bool isRejoin(const char* what) { return std::strstr(what, kRejoinText) != nullptr; }
+
     void rewindConsumer() {
         // Strict filter first: whatever the old fetches still push is dropped unless it is exactly the next offset.
         for (PartState& p : st_.part) beforeRewind(p);
         st_.q.clear();
         st_.head = 0;
-        st_.dropping = true;
-        try { gc_.seekToCommittedAndWait(); } catch (...) { st_.dropping = false; throw; }
-        st_.dropping = false;
+        try {
+            gc_.seekToCommittedAndWait();
+        } catch (const std::runtime_error& ex) {
+            if (!isRejoin(ex.what())) throw;   // Timeout / SessionLost / Closed / ...: loud
+            // Rejoined: the rejoin re-seeds every position from the committed offsets itself and the rebalance
+            // callbacks mark the partitions handed over for a new baseline: nothing left to do here.
+        }
     }
 
     // ---- the five produce paths: the same typed record bytes ----------------------------------------------------
@@ -714,11 +750,13 @@ int main() {
                 if (p >= st.part.size()) return;
                 rs.forEachRecord([&](std::string_view, std::string_view val, int64_t off, int64_t) {
                     if (val.size() < kInBytes || !st.error.empty()) return;
-                    switch (onRecord(st.part[p], off, st.dropping)) {
+                    switch (onRecord(st.part[p], off)) {
                     case Accept::Drop: return;
                     case Accept::Gap:
-                        st.error = "partition " + std::to_string(p) + ": the first record after the rewind is offset " + std::to_string(off) +
-                                   ", beyond the batch's end " + std::to_string(st.part[p].hi) + " (records skipped)";
+                        st.error = "partition " + std::to_string(p) + ": record at offset " + std::to_string(off) + " but " +
+                                   (st.part[p].rebase ? "the batch ends at " + std::to_string(st.part[p].hi)
+                                                      : "the next expected offset is " + std::to_string(st.part[p].nextAppend)) +
+                                   " (records would be skipped)";
                         return;
                     case Accept::Take: break;
                     }
