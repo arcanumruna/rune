@@ -598,6 +598,7 @@ SendResult ProducerImpl::tryAppendDirect_(int32_t topicId, int32_t partition, co
 }
 
 void ProducerImpl::enableDirectIngress(const DirectIngress& d) {
+    t2Thread_ = d.owner;  // Invoker mode: the owner thread is the Tier-2 issuing thread
     // Clamps: the arena must fit two max-size records and one partition's share
     // must fit one (a legal deferred send can never livelock as back-pressure),
     // and one partition may hold at most its share (default min(arena/2,
@@ -734,7 +735,9 @@ void ProducerImpl::tier2Collect_() noexcept {
 
 uint32_t ProducerImpl::tier2Acquire() noexcept {
     if (tier2AppFreeN_ == 0) tier2Collect_();
-    return tier2AppFreeN_ == 0 ? kNoTier2Slot : tier2AppFree_[--tier2AppFreeN_];
+    if (tier2AppFreeN_ == 0) return kNoTier2Slot;
+    ++t2Held_;
+    return tier2AppFree_[--tier2AppFreeN_];
 }
 
 std::size_t ProducerImpl::tier2FreeCount() noexcept {
@@ -743,9 +746,11 @@ std::size_t ProducerImpl::tier2FreeCount() noexcept {
 }
 
 void ProducerImpl::t2Return_(uint32_t slot) noexcept {
-    (void)tier2Free_.writeWith(1, 4, [slot](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t at) {
-        b.putInt32(at, static_cast<int32_t>(slot));
-    });
+    [[maybe_unused]] const bool ok =
+        tier2Free_.writeWith(1, 4, [slot](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t at) {
+            b.putInt32(at, static_cast<int32_t>(slot));
+        });
+    assert(ok && "Tier-2 free ring is sized for every slot: a return cannot fail");
 }
 
 void ProducerImpl::unaccountDeferred_(const DeferredHdr& h) noexcept {
@@ -1240,6 +1245,7 @@ RejectReason ProducerImpl::submitTier2Batch(int32_t topicId,
 
 RejectReason ProducerImpl::submitTier2Bytes(int32_t topicId, int32_t partition, uint64_t ackHandle,
                                             int32_t recordCount, std::span<const uint8_t> bytes) {
+    if (!onBatchThread()) return RejectReason::WrongThread;  // before touching the pool
     const uint32_t slot = tier2Acquire();
     if (slot == kNoTier2Slot) return RejectReason::BackPressured;
     tier2Pool_[slot].batchBytes.assign(bytes.begin(), bytes.end());
@@ -1250,7 +1256,7 @@ RejectReason ProducerImpl::submitTier2Bytes(int32_t topicId, int32_t partition, 
         tier2Release(slot);
         throw;
     }
-    if (why != RejectReason::None) tier2Release(slot);
+    if (why != RejectReason::None) tier2Release(slot); else tier2Handed();
     return why;
 }
 

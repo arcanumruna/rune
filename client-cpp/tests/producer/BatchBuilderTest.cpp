@@ -515,7 +515,7 @@ TEST(BatchBuilder, EmptyBatchRejected) {
     auto bb = p.batch(topic, key);
     // No add() calls → empty batch.
 
-    EXPECT_THROW(bb.send(), std::invalid_argument)
+    EXPECT_THROW((void)bb.send(), std::invalid_argument)
         << "send() with 0 records must throw std::invalid_argument";
 
     // Confirm no batch was submitted to the broker.

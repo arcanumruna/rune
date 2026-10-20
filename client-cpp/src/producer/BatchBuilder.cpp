@@ -45,7 +45,14 @@ BatchBuilder::BatchBuilder(producer::ProducerImpl* impl,
     : impl_(impl)
     , topicId_(topicId)
     , partition_(partition)
-{}
+{
+    // Tier-2 is single-thread per producer: decided BEFORE the pool is touched.
+    if (!impl_->onBatchThread()) { state_ = State::Refused; return; }
+    const uint32_t s = impl_->tier2Acquire();
+    if (s == producer::kNoTier2Slot) { state_ = State::Starved; return; }  // pool exhausted: refused
+    slot_  = s;
+    state_ = State::Open;
+}
 
 BatchBuilder::BatchBuilder(BatchBuilder&& o) noexcept
     : impl_(o.impl_), topicId_(o.topicId_), partition_(o.partition_), slot_(o.slot_), state_(o.state_)
@@ -66,7 +73,8 @@ BatchBuilder& BatchBuilder::operator=(BatchBuilder&& o) noexcept {
 BatchBuilder::~BatchBuilder() { releaseSlot_(); }
 
 void BatchBuilder::releaseSlot_() noexcept {
-    if ((state_ == State::Open || state_ == State::Built) && impl_ != nullptr && !impl_->handleDetached()) {
+    if ((state_ == State::Open || state_ == State::Built) && impl_ != nullptr && !impl_->handleDetached() &&
+        impl_->onBatchThread()) {  // off the batch thread the pool is not ours to touch (the slot is lost)
         // Drop the records (the next user of the slot starts empty) and hand it back.
         producer::Tier2Slot& t = impl_->tier2Slot(slot_);
         t.builder.reset(0, 0);
@@ -79,12 +87,12 @@ void BatchBuilder::releaseSlot_() noexcept {
 // add() - accumulate records
 // ---------------------------------------------------------------------------
 
-OpResult BatchBuilder::add(std::span<const uint8_t> value) {
+BatchBuilder& BatchBuilder::add(std::span<const uint8_t> value) {
     return add(value, std::string_view{});
 }
 
-OpResult BatchBuilder::add(std::span<const uint8_t> value,
-                           std::string_view         record_key)
+BatchBuilder& BatchBuilder::add(std::span<const uint8_t> value,
+                                std::string_view         record_key)
 {
     if (state_ == State::Sent || state_ == State::Built) {
         throw std::logic_error("BatchBuilder: add after send");
@@ -94,14 +102,10 @@ OpResult BatchBuilder::add(std::span<const uint8_t> value,
         throw std::length_error("BatchBuilder::add: MessageTooLarge: key + value exceeds "
                                 "Producer::kMaxRecordBytes (16 KiB)");
     }
-    if (state_ == State::Idle || state_ == State::Starved) {
-        const uint32_t s = impl_->tier2Acquire();
-        if (s == producer::kNoTier2Slot) {
-            state_ = State::Starved;
-            return OpResult::BackPressured;  // every slot is in use: nothing was added
-        }
-        slot_  = s;
-        state_ = State::Open;
+    // A refused builder (no slot / off-thread batch()) stores nothing; send() reports why.
+    if (state_ == State::Refused || state_ == State::Starved) return *this;
+    if (!impl_->onBatchThread()) {
+        throw std::logic_error("BatchBuilder: add off the producer's batch thread");
     }
     producer::Tier2Slot& t = impl_->tier2Slot(slot_);
 
@@ -123,7 +127,7 @@ OpResult BatchBuilder::add(std::span<const uint8_t> value,
         reinterpret_cast<const char*>(value.data()), value.size());
 
     t.builder.append(record_key, vv, wallMs());
-    return OpResult::Accepted;
+    return *this;
 }
 
 // ---------------------------------------------------------------------------
@@ -134,13 +138,15 @@ OpResult BatchBuilder::submit_(uint64_t ackHandle) {
     if (state_ == State::Sent) {
         throw std::logic_error("BatchBuilder: send called more than once");
     }
-    if (state_ == State::Starved) return OpResult::BackPressured;  // add() found no free slot
-    if (state_ == State::Idle) {
-        throw std::invalid_argument(
-            "BatchBuilder: empty batch - must add() at least one record before send()");
-    }
+    if (state_ == State::Refused) return OpResult::WrongThread;     // batch() ran off the batch thread
+    if (state_ == State::Starved) return OpResult::BackPressured;   // batch() found every slot in use
+    if (!impl_->onBatchThread()) return OpResult::WrongThread;      // before touching the pool
     producer::Tier2Slot& t = impl_->tier2Slot(slot_);
     if (state_ == State::Open) {
+        if (t.builder.recordCount() == 0) {
+            throw std::invalid_argument(
+                "BatchBuilder: empty batch - must add() at least one record before send()");
+        }
         // Seal the RecordBatch bytes ONCE into the slot (kept across a rejected send for a
         // retry).  baseSequence / producerId / epoch are patched by the agent.
         t.recordCount = t.builder.recordCount();
@@ -157,6 +163,7 @@ OpResult BatchBuilder::submit_(uint64_t ackHandle) {
     if (why == producer::RejectReason::NotInTransaction) throw std::logic_error("produce outside a transaction");
     if (why == producer::RejectReason::None) {
         state_ = State::Sent;  // the duty side owns the slot now
+        impl_->tier2Handed();
     }
     return tier2Result(why);
 }

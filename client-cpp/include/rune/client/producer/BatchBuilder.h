@@ -6,6 +6,10 @@
 // Tier-2 is the explicit form; NO transaction/markers.
 //
 // Threading model:
+//   Tier-2 is single-thread per producer: batch() / add() / send() / destruction run on the
+//   producer's batch thread (the thread that created it; Invoker mode: the owner thread; or the
+//   thread that called Producer::bindBatchThread()).  batch() off that thread returns a refused
+//   builder whose send() is WrongThread.
 //   BatchBuilder is NOT thread-safe.  A single app thread constructs it, calls
 //   add() any number of times, then calls send() exactly once.  After send()
 //   the builder is "consumed" — add() will throw.
@@ -26,7 +30,8 @@
 // RAII / lifecycle:
 //   - add() after send() → throws std::logic_error ("BatchBuilder: add after send").
 //   - send() with 0 records → throws std::invalid_argument ("BatchBuilder: empty batch").
-//   - BatchBuilder destroyed without send() → no-op (nothing produced).
+//   - BatchBuilder destroyed without send() → nothing produced; its pool slot goes back to the
+//     producer (so it must be destroyed on the batch thread, before the Producer).
 //     (Tier-3 RAII auto-abort of uncommitted txns is Milestone C; Tier-2 has
 //      no transaction, so an unsent builder simply does nothing.)
 //
@@ -92,7 +97,7 @@ public:
     /// Append a value to the batch (record key = empty).
     ///
     /// Throws std::logic_error if send() has already been called.
-    OpResult add(std::span<const uint8_t> value);
+    BatchBuilder& add(std::span<const uint8_t> value);
 
     /// Append a value with an optional record-level key.
     ///
@@ -103,12 +108,15 @@ public:
     /// std::length_error (MessageTooLarge, non-retryable) if the record would take the
     /// batch past ProducerConfig::tier2SlotBytes (or the record alone past kMaxRecordBytes).
     ///
-    /// The batch is built in a preallocated pool slot (ProducerConfig::tier2Slots), taken at
-    /// the first successful add().  Returns BackPressured - the record is NOT added, nothing
-    /// allocated - while every slot is in use (batches built or queued, not yet sent); retry
-    /// the add() later.  Accepted otherwise.
-    OpResult add(std::span<const uint8_t> value,
-                 std::string_view         record_key);
+    /// The batch is built in a preallocated pool slot (ProducerConfig::tier2Slots), taken when
+    /// Producer::batch() creates the builder.  A builder that holds a slot never refuses add() for
+    /// the pool - only for size (std::length_error).  A REFUSED builder (every slot in use, or
+    /// batch() called off the batch thread) stores nothing; its send() reports BackPressured /
+    /// WrongThread, so the caller retries the WHOLE batch with a new builder.
+    /// Throws std::logic_error when called off the batch thread on a builder that holds a slot.
+    /// Returns *this (chainable).
+    BatchBuilder& add(std::span<const uint8_t> value,
+                      std::string_view         record_key);
 
     // ---- Flush ---------------------------------------------------------------
 
@@ -132,34 +140,35 @@ public:
     /// one completion follows for the token forms.  Any other result leaves
     /// the batch INTACT (retry send() later): BackPressured (ring full /
     /// deferred arena full / its partition still has deferred records),
-    /// Closed (the producer's intake is closed), WrongThread, QueueFull,
-    /// InvalidArgument (unaddressable partition, bad token / queue).  A batch whose
-    /// add() found the slot pool exhausted (nothing was added) also reports
-    /// BackPressured.
+    /// Closed (the producer's intake is closed), WrongThread (also: the builder was
+    /// made off the batch thread, or send() runs off it), QueueFull,
+    /// InvalidArgument (unaddressable partition, bad token / queue).  A builder
+    /// refused at batch() because every pool slot was in use reports BackPressured
+    /// (nothing was stored: rebuild the batch).
     ///
     /// Throws std::invalid_argument if the batch is empty (no add() calls).
     /// Throws std::logic_error if send() has already been accepted.
-    OpResult send();
-    OpResult send(Completions& cq, Token token);
-    OpResult send(AckToken token);
+    [[nodiscard]] OpResult send();
+    [[nodiscard]] OpResult send(Completions& cq, Token token);
+    [[nodiscard]] OpResult send(AckToken token);
 
 private:
     void checkProducer_() const;
 
     /// Where the batch is.  The slot index is meaningful only in Open / Built (each state
     /// holds exactly what it needs):
-    ///   Idle     no slot taken yet (nothing added);
-    ///   Starved  an add() found every pool slot in use - nothing stored, send() back-pressures;
-    ///   Open     records accumulate in pool slot slot_;
+    ///   Refused  batch() ran off the batch thread: nothing touched, send() = WrongThread;
+    ///   Starved  every pool slot was in use at batch(): add() stores nothing, send() = BackPressured;
+    ///   Open     records accumulate in pool slot slot_ (taken at batch());
     ///   Built    the RecordBatch is sealed in slot slot_ (kept across a rejected send());
     ///   Sent     accepted (or moved-from): the slot belongs to the duty side / nobody.
-    enum class State : uint8_t { Idle, Starved, Open, Built, Sent };
+    enum class State : uint8_t { Refused, Starved, Open, Built, Sent };
 
     producer::ProducerImpl* impl_ = nullptr;  // borrowed (owned by the Producer + duty side)
     int32_t  topicId_   = -1;
     int32_t  partition_ = -1;
     uint32_t slot_      = 0xFFFF'FFFFu;      // kNoTier2Slot
-    State    state_     = State::Idle;
+    State    state_     = State::Refused;
 
     /// Return the held slot (Open / Built) to the producer's pool, exactly once.
     void releaseSlot_() noexcept;

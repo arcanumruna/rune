@@ -55,6 +55,7 @@
 #include <rune/client/detail/M2ORingBuffer.h> // internal MPSC ring (controlledRead/ABORT, templated read)
 #include <rune/client/detail/OneToOneRingBuffer.h> // Tier-2 free-slot ring (duty -> app)
 
+#include <cassert>
 #include <thread>
 #include <chrono>
 #include <cstddef>
@@ -764,12 +765,31 @@ public:
     [[nodiscard]] uint32_t tier2Acquire() noexcept;
     /// Return a slot the caller still owns (a builder dropped before / without an
     /// accepted send) - exactly once per acquired slot.
-    void tier2Release(uint32_t slot) noexcept { tier2AppFree_[tier2AppFreeN_++] = slot; }
+    void tier2Release(uint32_t slot) noexcept {
+        assert(tier2AppFreeN_ < tier2Pool_.size() && t2Held_ > 0 && "Tier-2 slot released twice");
+        --t2Held_;
+        tier2AppFree_[tier2AppFreeN_++] = slot;
+    }
+    /// The slot was accepted by submitTier2Batch: it is the duty side's now.
+    void tier2Handed() noexcept { --t2Held_; }
+
+    // ---- Tier-2 issuing thread (single-thread per producer; Phase 2b F Task 3 / FD3) ----
+    // The slot pool's app side (free stack + SPSC free-ring consumer) is owned by ONE thread: the
+    // thread that created the producer (Invoker mode: the owner thread), or the one that called
+    // bindBatchThread().  Every Tier-2 entry compares against it BEFORE touching the pool.
+    [[nodiscard]] bool onBatchThread() const noexcept { return std::this_thread::get_id() == t2Thread_; }
+    /// Rebind the issuing thread to the caller.  Call before the first batch() from the new
+    /// thread with no BatchBuilder holding a slot (asserted in debug).
+    void bindBatchThread() noexcept {
+        assert(t2Held_ == 0 && "bindBatchThread with a live BatchBuilder");
+        t2Thread_ = std::this_thread::get_id();
+    }
     [[nodiscard]] Tier2Slot& tier2Slot(uint32_t slot) noexcept { return tier2Pool_[slot]; }
     /// Largest RecordBatch (header + records) a slot holds.
     [[nodiscard]] std::size_t tier2SlotBytes() const noexcept { return tier2SlotBytes_; }
-    /// Pool introspection (tests; the batch-issuing thread): total slots, and slots not
-    /// owned by a builder or the duty side (app-local free + returned-but-undrained).
+    /// Pool introspection (tests; BATCH-ISSUING THREAD ONLY - it drains the free ring): total
+    /// slots, and slots not owned by a builder or the duty side (app-local free +
+    /// returned-but-undrained).
     [[nodiscard]] std::size_t tier2SlotCount() const noexcept { return tier2Pool_.size(); }
     [[nodiscard]] std::size_t tier2FreeCount() noexcept;
 
@@ -1547,6 +1567,8 @@ private:
     rune::client::detail::OneToOneRingBuffer  tier2Free_;
     std::vector<uint32_t>                     tier2AppFree_;
     std::size_t                               tier2AppFreeN_ = 0;
+    std::size_t                               t2Held_ = 0;  ///< slots held by live builders (issuing thread)
+    std::thread::id                           t2Thread_ = std::this_thread::get_id();  ///< the bound issuing thread
 
     // ---- Agent-thread only (no lock needed — single-writer) ------------------
 

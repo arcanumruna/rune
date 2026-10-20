@@ -559,3 +559,10 @@ void Producer::testSetNextSequence(TopicHandle topic, int32_t partition, int32_t
 }
 
 } // namespace rune::client
+
+namespace rune::client {
+void Producer::bindBatchThread() {
+    if (!impl_) throw std::logic_error("Producer::bindBatchThread: empty producer");
+    impl_->bindBatchThread();
+}
+} // namespace rune::client

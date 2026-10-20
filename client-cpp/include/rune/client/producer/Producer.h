@@ -163,7 +163,8 @@ struct ProducerConfig {
                                          // independent of batchBytes — bounds fragmentation.
     /// Phase 2b F: non-empty = a transactional producer.  A transactional producer has exactly ONE
     /// issuing thread (every send / claim / batch / lifecycle call comes from it; Thread mode) - a
-    /// plain producer keeps "any thread".  acks must be Leader or All (Client::producer throws
+    /// plain producer keeps "any thread" for send / trySend / tryClaim / claimBatch; its Tier-2 batch()
+    /// is single-thread (the creating thread, or bindBatchThread()).  acks must be Leader or All (Client::producer throws
     /// std::invalid_argument for acks = None and for an id longer than 255 bytes; ClientShard refuses it).
     std::string transactionalId;
     /// InitProducerId's transactionTimeoutMs for a transactional producer.
@@ -498,7 +499,9 @@ private:
 //
 // Sharing across threads (Thread mode): keep ONE Producer and lend
 // `Producer&` to the threads that send — trySend/send are safe concurrently
-// (the producer ring is many-to-one).  The Producer must not be destroyed,
+// (the producer ring is many-to-one).  EXCEPT Tier-2: batch() is single-thread per
+// producer (the creating thread, or the thread that called bindBatchThread()); a
+// batch() from another thread returns a refused builder whose send() is WrongThread.  The Producer must not be destroyed,
 // moved from or moved into while any thread may still be using it (the same
 // contract as any C++ object).  A BatchBuilder borrows the producer and must
 // not outlive it.
@@ -753,7 +756,18 @@ public:
     ///
     /// Idempotent-seq (baseSequence) is shared with Tier-1 and advances
     /// monotonically across both tiers for the same partition.
+    ///
+    /// Single-thread per producer: the thread that created it (Invoker mode: the owner thread), or
+    /// the thread that last called bindBatchThread().  batch() from another thread returns a refused
+    /// builder (send() = WrongThread; the batch pool is untouched).  With every pool slot in use
+    /// (ProducerConfig::tier2Slots) it returns a refused builder whose send() is BackPressured -
+    /// rebuild the whole batch.
     BatchBuilder batch(TopicHandle topic, const Key& key);
+
+    /// Rebind the Tier-2 batch thread to the CALLING thread.  Call it before the first batch() from
+    /// the new thread, with no BatchBuilder live (asserted in debug builds); the hand-off itself
+    /// (e.g. thread start / join) must order the old thread's last use before this call.
+    void bindBatchThread();
 
     // ---- Control -------------------------------------------------------------
 

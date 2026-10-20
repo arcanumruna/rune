@@ -45,13 +45,6 @@ static int64_t envI64(const char* n, int64_t d) {
     const char* v = std::getenv(n); return (v && *v) ? std::atoll(v) : d;
 }
 
-// true if add() refused the record (pool exhausted); the older void add() never refuses.
-template <class B>
-static bool addRefused(B& bb, std::span<const uint8_t> v) {
-    if constexpr (std::is_void_v<decltype(bb.add(v))>) { bb.add(v); return false; }
-    else return bb.add(v) != OpResult::Accepted;
-}
-
 int main() {
     const int64_t N          = envI64("ACCUM_RECORDS", 5'000'000);
     const int32_t valueBytes = (int32_t)envI64("ACCUM_VALUE_BYTES", 256);
@@ -128,18 +121,14 @@ int main() {
     const bool    tier2  = envI64("ACCUM_TIER2", 0) != 0;
     const int32_t t2Recs = (int32_t)envI64("ACCUM_T2_RECORDS", 8);
     if (tier2) {
-        // Tier-2: one explicit batch per iteration.  A full slot pool (HEAD) back-pressures
-        // add(): rebuild the batch until it is accepted.  (Compiles against both the
-        // void-add() and the OpResult-add() BatchBuilder, to compare commits.)
+        // Tier-2: one explicit batch per iteration.  A full slot pool (HEAD) refuses the
+        // builder (send() = BackPressured): rebuild the batch until it is accepted.
         for (int64_t i = 0; i < N; i += t2Recs) {
             const int32_t part = (int32_t)((i / t2Recs) % partitions);
             for (;;) {
                 BatchBuilder bb(&impl, topicId, part);
-                bool full = false;
-                for (int32_t r = 0; r < t2Recs && !full; ++r) {
-                    full = addRefused(bb, std::span<const uint8_t>(val));
-                }
-                if (!full && bb.send() == OpResult::Accepted) break;
+                for (int32_t r = 0; r < t2Recs; ++r) bb.add(std::span<const uint8_t>(val));
+                if (bb.send() == OpResult::Accepted) break;
                 std::this_thread::yield();
             }
         }

@@ -372,7 +372,7 @@ TEST(ProducerAckToken, Tier2AckViaTokenRegression) {
     auto b2 = p.batch(topic, rc::Key(uint64_t{1}));
     for (int i = 0; i < 4; ++i) b2.add(kVal);
     ASSERT_EQ(b2.send(AckToken{9}), OpResult::Accepted);
-    EXPECT_THROW(b2.send(AckToken{10}), std::logic_error) << "a consumed batch cannot be re-sent";
+    EXPECT_THROW((void)b2.send(AckToken{10}), std::logic_error) << "a consumed batch cannot be re-sent";
     ASSERT_TRUE(r.drive([&] { return f.ready() && L.times(9) == 1; }));
     EXPECT_EQ(f.outcome().c.op, rc::OpKind::Tier2Batch);
     EXPECT_EQ(f.outcome().c.aux, 3);

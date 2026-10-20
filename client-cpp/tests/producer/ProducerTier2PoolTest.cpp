@@ -69,9 +69,7 @@ void pump(ProducerImpl& impl, const ProducerImpl::SendFn& sink, int64_t now = kN
 
 OpResult sendBatch(ProducerImpl& impl, rune::client::Token tok, int records = 8) {
     BatchBuilder bb(&impl, 1, 0);
-    for (int i = 0; i < records; ++i) {
-        if (bb.add(kVal) != OpResult::Accepted) return OpResult::BackPressured;
-    }
+    for (int i = 0; i < records; ++i) bb.add(kVal);
     return bb.send(AckToken{tok});
 }
 
@@ -128,9 +126,8 @@ TEST(ProducerTier2Regression, BatchSendAllocatesNothingOnBothThreadsRegression) 
     auto sendOne = [&](long i) {
         for (;;) {
             BatchBuilder bb(&impl, 1, 0);
-            bool full = false;
-            for (int r = 0; r < 8 && !full; ++r) full = bb.add(kVal) != OpResult::Accepted;
-            if (!full && bb.send() == OpResult::Accepted) return;
+            for (int r = 0; r < 8; ++r) bb.add(kVal);
+            if (bb.send() == OpResult::Accepted) return;
             std::this_thread::yield();  // the pool is exhausted until the duty side returns slots
         }
         (void)i;
@@ -200,11 +197,11 @@ TEST(ProducerTier2Pool, SlotsReturnAfterAckAndAfterFailure) {
         ProducerImpl impl(cfgOf(Acks::None, 4));
         {
             BatchBuilder a(&impl, 1, 0);
-            ASSERT_EQ(a.add(kVal), OpResult::Accepted);
+            a.add(kVal);
             EXPECT_EQ(impl.tier2FreeCount(), 3u);
             BatchBuilder b(std::move(a));
             BatchBuilder c(&impl, 1, 0);
-            ASSERT_EQ(c.add(kVal), OpResult::Accepted);
+            c.add(kVal);
             c = std::move(b);  // c's slot is released, b's taken over
             EXPECT_EQ(impl.tier2FreeCount(), 3u);
         }
@@ -228,7 +225,7 @@ TEST(ProducerTier2Pool, ExhaustedPoolIsBackPressuredNotBlockedForever) {
     ASSERT_EQ(cap.frames, 0);
     {
         BatchBuilder third(&impl, 1, 0);
-        EXPECT_EQ(third.add(kVal), OpResult::BackPressured);
+        third.add(kVal);  // refused builder: stores nothing
         EXPECT_EQ(third.send(), OpResult::BackPressured) << "no slot: nothing was added, nothing dropped silently";
     }
     // The session arrives, both are sent: slots come back, the next batch is accepted.
@@ -244,7 +241,7 @@ TEST(ProducerTier2Pool, ExhaustedPoolIsBackPressuredNotBlockedForever) {
 TEST(ProducerTier2Pool, RejectedSendKeepsTheBatchAndItsSlot) {
     ProducerImpl impl(cfgOf(Acks::None, 2));
     BatchBuilder bb(&impl, 1, 0);
-    ASSERT_EQ(bb.add(kVal), OpResult::Accepted);
+    bb.add(kVal);
     impl.markRingClosed();
     EXPECT_EQ(bb.send(), OpResult::Closed);
     EXPECT_EQ(impl.tier2FreeCount(), 1u) << "the slot is still the builder's";
@@ -285,7 +282,7 @@ TEST(ProducerTier2PoolRegression, OversizeBatchIsMessageTooLargeRegression) {
     const std::vector<uint8_t> v(500, 0x33);
     int added = 0;
     EXPECT_THROW(
-        for (int i = 0; i < 10; ++i) { ASSERT_EQ(bb.add(v), OpResult::Accepted); ++added; },
+        for (int i = 0; i < 10; ++i) { bb.add(v); ++added; },
         std::length_error);
     EXPECT_GE(added, 3);
     EXPECT_LT(added, 5);
@@ -307,7 +304,7 @@ TEST(ProducerTier2Pool, DirectDeferredBatchReturnsItsSlot) {
             auto* x = static_cast<Ctx*>(c);
             if (x->fired++ != 0) return;
             BatchBuilder bb(x->impl, 1, 0);
-            (void)bb.add(kVal);
+            bb.add(kVal);
             x->inner = bb.send(AckToken{2});
             x->deferred = x->impl->deferredCount();
         },
@@ -321,4 +318,78 @@ TEST(ProducerTier2Pool, DirectDeferredBatchReturnsItsSlot) {
     EXPECT_EQ(ctx.fired, 2);
     EXPECT_EQ(impl.deferredCount(), 0u);
     EXPECT_EQ(impl.tier2FreeCount(), impl.tier2SlotCount());
+}
+
+// Regression (review I2): the slot is taken at batch().  A builder refused for an empty pool is
+// STICKY: even when a slot comes back between its add() calls, it stores nothing and send() is
+// BackPressured - a batch can never silently miss a record.
+TEST(ProducerTier2PoolRegression, RefusedBuilderNeverSendsAPartialBatchRegression) {
+    ProducerImpl impl(cfgOf(Acks::Leader, 1));
+    Cap cap; const auto sink = cap.fn(); AckLedger L; L.attach(impl);
+    ASSERT_EQ(sendBatch(impl, 1), OpResult::Accepted);   // holds the only slot (queued, no session)
+    impl.drainRing(kNow, 16);
+    impl.flushBatches(kNow, 0, sink);
+    BatchBuilder bb(&impl, 1, 0);                        // pool empty: refused
+    bb.add(kVal);                                        // r1: stored nowhere
+    impl.flushBatches(kNow, 42, sink);                   // the slot comes back
+    ASSERT_EQ(impl.tier2FreeCount(), 1u);
+    bb.add(kVal);                                        // r2: must not start a batch
+    EXPECT_EQ(bb.send(), OpResult::BackPressured) << "never Accepted for a batch missing r1";
+    EXPECT_EQ(impl.tier2FreeCount(), 1u) << "the refused builder holds no slot";
+    EXPECT_EQ(sendBatch(impl, 2), OpResult::Accepted) << "a fresh builder rebuilds the whole batch";
+    pump(impl, sink);
+    EXPECT_EQ(cap.frames, 2);
+}
+
+// Regression (review I1): Tier-2 is single-thread per producer.  batch() off the bound thread
+// is refused (send() = WrongThread) and never touches the pool; bindBatchThread() moves it.
+TEST(ProducerTier2PoolRegression, OffThreadBatchIsWrongThreadAndPoolUntouchedRegression) {
+    ProducerImpl impl(cfgOf(Acks::None, 4));
+    Cap cap; const auto sink = cap.fn();
+    ASSERT_EQ(impl.tier2FreeCount(), 4u);
+    OpResult off = OpResult::Accepted, offAdd = OpResult::Accepted;
+    std::thread other([&] {
+        BatchBuilder bb(&impl, 1, 0);
+        bb.add(kVal);
+        off = bb.send();
+        offAdd = bb.send();
+    });
+    other.join();
+    EXPECT_EQ(off, OpResult::WrongThread);
+    EXPECT_EQ(offAdd, OpResult::WrongThread);
+    EXPECT_EQ(impl.tier2FreeCount(), 4u) << "the off-thread builder never touched the pool";
+    // A builder made on the bound thread but used off it: add() throws, send() is WrongThread,
+    // and the pool is only touched by the owner afterwards.
+    {
+        BatchBuilder bb(&impl, 1, 0);
+        bb.add(kVal);
+        OpResult s2 = OpResult::Accepted; bool threw = false;
+        std::thread t2([&] {
+            try { bb.add(kVal); } catch (const std::logic_error&) { threw = true; }
+            s2 = bb.send();
+        });
+        t2.join();
+        EXPECT_TRUE(threw);
+        EXPECT_EQ(s2, OpResult::WrongThread);
+        EXPECT_EQ(bb.send(), OpResult::Accepted) << "intact: only the one record from the owner thread";
+    }
+    pump(impl, sink);
+    EXPECT_EQ(cap.frames, 1);
+    // Rebinding: the other thread becomes the batch thread.
+    OpResult bound = OpResult::WrongThread;
+    std::thread t3([&] {
+        impl.bindBatchThread();
+        BatchBuilder bb(&impl, 1, 0);
+        bb.add(kVal);
+        bound = bb.send();
+    });
+    t3.join();
+    EXPECT_EQ(bound, OpResult::Accepted);
+    {
+        BatchBuilder bb(&impl, 1, 0);   // now the ORIGINAL thread is the foreign one
+        bb.add(kVal);
+        EXPECT_EQ(bb.send(), OpResult::WrongThread);
+    }
+    impl.bindBatchThread();
+    EXPECT_EQ(sendBatch(impl, 5), OpResult::Accepted);
 }
