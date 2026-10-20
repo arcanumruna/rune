@@ -10,6 +10,7 @@
 #include "../support/FakeCoordinator.h"
 
 #include <rune/client/Completion.h>
+#include <rune/client/Key.h>
 #include <rune/client/producer/ProducerHub.h>
 #include <rune/client/producer/ProducerImpl.h>
 #include <rune/protocol/client/TxnMessages.h>
@@ -365,14 +366,37 @@ TEST(ProducerTxnOffsetsRegression, OffsetsOutsideATransactionCompleteInvalidTxnS
     EXPECT_EQ(r.d(t).code, kInvalidTxnState);
     r.tick(10 * kMs);
     EXPECT_TRUE(r.cap.of(rpc::AddOffsetsToTxn::TEMPLATE_ID).empty()) << "nothing was sent outside a transaction";
-    // Committing
+    // Committing: a started transaction (AddOffsets answered OK), the commit's EndTxn on the wire and unanswered.
     r.begin();
-    r.apply(TxnControl::Kind::Commit);   // unstarted: ends locally
+    const Token first = r.sendOffsets(offsetsOf(1));
+    r.sendOk(first);
+    ASSERT_EQ(r.d(first).status, OpStatus::Ok);
+    r.apply(TxnControl::Kind::Commit);
     r.tick();
+    ASSERT_EQ(r.cap.of(rpc::EndTxn::TEMPLATE_ID).size(), 1u);
+    ASSERT_EQ(r.impl->txnStateDuty(), TxnState::CommittingTransaction);
+    t = r.sendOffsets(offsetsOf(2));
+    ASSERT_EQ(r.d(t).times, 1);
+    EXPECT_EQ(r.d(t).status, OpStatus::BrokerError);
+    EXPECT_EQ(r.d(t).code, kInvalidTxnState);
+    r.tick();
+    EXPECT_EQ(r.cap.of(rpc::AddOffsetsToTxn::TEMPLATE_ID).size(), 1u) << "nothing new was sent while committing";
+    r.answerFrame(r.lastOf(rpc::EndTxn::TEMPLATE_ID), rp::ReqKind::EndTxn, 0);
+    ASSERT_EQ(r.impl->txnStateDuty(), TxnState::Ready);
+    // Aborting: the same, with the abort's EndTxn unanswered.
+    r.begin();
+    const Token second = r.sendOffsets(offsetsOf(1));
+    r.sendOk(second);
+    ASSERT_EQ(r.d(second).status, OpStatus::Ok);
+    r.apply(TxnControl::Kind::Abort);
+    r.tick();
+    ASSERT_EQ(r.cap.of(rpc::EndTxn::TEMPLATE_ID).size(), 2u);
+    ASSERT_EQ(r.impl->txnStateDuty(), TxnState::AbortingTransaction);
     t = r.sendOffsets(offsetsOf(2));
     ASSERT_EQ(r.d(t).times, 1);
     EXPECT_EQ(r.d(t).code, kInvalidTxnState);
-    EXPECT_TRUE(r.cap.of(rpc::AddOffsetsToTxn::TEMPLATE_ID).empty());
+    r.tick();
+    EXPECT_EQ(r.cap.of(rpc::AddOffsetsToTxn::TEMPLATE_ID).size(), 2u);
 }
 
 TEST(ProducerTxnOffsetsRegression, PoisonedTransactionRefusesOffsetsWithThePoisonRegression) {
@@ -385,6 +409,44 @@ TEST(ProducerTxnOffsetsRegression, PoisonedTransactionRefusesOffsetsWithThePoiso
     EXPECT_EQ(r.d(t).code, 77u);
     r.tick(10 * kMs);
     EXPECT_TRUE(r.cap.of(rpc::AddOffsetsToTxn::TEMPLATE_ID).empty());
+}
+
+TEST(ProducerTxnOffsetsRegression, AbortAfterASessionChangeStillEndsAnOfferedTxnRegression) {
+    Rig r;
+    r.inTxn();
+    const Token t = r.sendOffsets(offsetsOf(2));
+    r.tick();   // AddOffsets offered: the coordinator may have opened the transaction
+    ASSERT_EQ(r.cap.of(rpc::AddOffsetsToTxn::TEMPLATE_ID).size(), 1u);
+    r.cap.sid = 0;
+    r.hub.onCoordinatorSessionChanged();   // InFlight -> Unsent: no longer "in flight", but it WAS offered
+    const Token ab = r.apply(TxnControl::Kind::Abort);
+    r.tick();
+    r.tick();
+    EXPECT_EQ(r.d(t).times, 1);
+    r.cap.sid = 78;   // reconnected
+    r.tick();
+    ASSERT_EQ(r.cap.of(rpc::EndTxn::TEMPLATE_ID).size(), 1u) << "the abort must not end locally over an offered leg";
+    r.answerFrame(r.lastOf(rpc::EndTxn::TEMPLATE_ID), rp::ReqKind::EndTxn, 0);
+    EXPECT_EQ(r.d(ab).status, OpStatus::Ok);
+}
+
+TEST(ProducerTxnOffsetsRegression, AbortAfterASessionChangeStillEndsAnOfferedAddPartitionsRegression) {
+    Rig r;
+    r.inTxn();
+    const std::vector<uint8_t> v(16, 0x5A);
+    ASSERT_EQ(r.impl->trySubmit(1, 0, rc::Key(uint64_t{7}), v, 0), rc::SendResult::Ok);
+    for (int i = 0; i < 3 && r.cap.of(rpc::AddPartitionsToTxn::TEMPLATE_ID).empty(); ++i) r.tick();   // AddPartitionsToTxn offered
+    ASSERT_EQ(r.cap.of(rpc::AddPartitionsToTxn::TEMPLATE_ID).size(), 1u);
+    r.cap.sid = 0;
+    r.hub.onCoordinatorSessionChanged();
+    const Token ab = r.apply(TxnControl::Kind::Abort);
+    r.tick();
+    r.tick();
+    r.cap.sid = 78;
+    r.tick();
+    ASSERT_EQ(r.cap.of(rpc::EndTxn::TEMPLATE_ID).size(), 1u) << "the abort must not end locally over an offered leg";
+    r.answerFrame(r.lastOf(rpc::EndTxn::TEMPLATE_ID), rp::ReqKind::EndTxn, 0);
+    EXPECT_EQ(r.d(ab).status, OpStatus::Ok);
 }
 
 TEST(ProducerTxnOffsetsRegression, AnotherCallWhileOneRunsIsRefusedNotInterleavedRegression) {
@@ -561,6 +623,36 @@ TEST(ProducerTxnOffsets, CloseImmediatelyCompletesARunningOffsetsCall) {
     r.tick();
     ASSERT_EQ(r.d(t).times, 1);
     EXPECT_EQ(r.d(t).status, OpStatus::Closed);
+}
+
+TEST(ProducerTxnOffsets, PoisonWhileRunningEndsTheCallWithThePoisonAndSendsNoMoreRequests) {
+    Rig r;
+    r.inTxn();
+    const Token t = r.sendOffsets(offsetsOf(1024), "grp-many");
+    r.tick();
+    r.answerFrame(r.lastOf(rpc::AddOffsetsToTxn::TEMPLATE_ID), rp::ReqKind::AddOffsets, 0);
+    // Another leg fails before the first TxnOffsetCommit goes out.
+    r.impl->testPoison(OpStatus::BrokerError, 77, rp::AbortKind::Plain);
+    r.tick();
+    ASSERT_EQ(r.d(t).times, 1);
+    EXPECT_EQ(r.d(t).status, OpStatus::BrokerError);
+    EXPECT_EQ(r.d(t).code, 77u);
+    EXPECT_TRUE(r.cap.of(rpc::TxnOffsetCommit::TEMPLATE_ID).empty()) << "no request after the poison";
+    // Poisoned between the requests of one call: the unsent rest is never sent.
+    Rig q;
+    q.inTxn();
+    const Token u = q.sendOffsets(offsetsOf(1024), "grp-many");
+    q.tick();
+    q.answerFrame(q.lastOf(rpc::AddOffsetsToTxn::TEMPLATE_ID), rp::ReqKind::AddOffsets, 0);
+    q.cap.sid = 0;   // not connected: nothing is offered, but a poison arrives
+    q.tick();
+    q.impl->testPoison(OpStatus::BrokerError, 78, rp::AbortKind::Plain);
+    q.cap.sid = 77;
+    const std::size_t before = q.cap.of(rpc::TxnOffsetCommit::TEMPLATE_ID).size();
+    q.tick();
+    ASSERT_EQ(q.d(u).times, 1);
+    EXPECT_EQ(q.d(u).code, 78u);
+    EXPECT_EQ(q.cap.of(rpc::TxnOffsetCommit::TEMPLATE_ID).size(), before);
 }
 
 // ---- zero allocation ---------------------------------------------------------------------------------------------

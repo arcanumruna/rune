@@ -791,6 +791,9 @@ public:
 
     OpResult initTransactions(const CompletionTarget& target, Token token);
     void     beginTransaction();
+    /// One sendOffsetsToTransaction runs at a time: a call made while another is still running completes
+    /// BrokerError(19, InvalidTxnState) at once (no queueing, the transaction is not poisoned) - wait for the first
+    /// completion before issuing the next.  At most 1024 offsets and a 1..255-byte group id (else InvalidArgument).
     OpResult sendOffsetsToTransaction(std::span<const OffsetEntry> offsets, std::string_view groupId,
                                       const CompletionTarget& target, Token token);
     OpResult commitTransaction(const CompletionTarget& target, Token token);

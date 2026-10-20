@@ -35,6 +35,7 @@
 #include <rune/protocol/client/TxnMessages.h>
 
 #include <algorithm>
+#include <cassert>
 #include <cstdio>
 #include <optional>
 
@@ -869,7 +870,7 @@ void ProducerImpl::onAddPartitionsAnswer_(const CoordAnswer& a, CoordinatorLink:
 void ProducerImpl::onAddExpired_(CoordinatorLink::Slot& s) noexcept {
     // No answer by produceTimeoutMs: queued again (re-sent while the data flows).  A frame that was on the wire may
     // have added the partitions: the transaction is possibly started (m15: an abort then sends EndTxn(abort)).
-    const bool offered = std::holds_alternative<CoordinatorLink::InFlight>(s.state);
+    const bool offered = s.offers > 0;   // offered at least once (a session change put it back to Unsent)
     bool any = false;
     for (const uint32_t slot : txnSeen_) {
         PartitionState& ps = *partitions_[slot];
@@ -912,7 +913,7 @@ bool ProducerImpl::txnDiscardUnsent_(const TxnOutcome& o) noexcept {
         auto* ad = std::get_if<Adding>(&partitions_[slot]->txn);
         if (ad == nullptr || ad->slot == nullptr) continue;
         changed = true;
-        if (std::holds_alternative<CoordinatorLink::InFlight>(ad->slot->state)) offered = true;
+        if (ad->slot->offers > 0) offered = true;   // a session change leaves it Unsent, but it was offered
         if (coord_) coord_->release(*ad->slot);   // idempotent: the partitions of one request share its slot
         ad->slot = nullptr;
     }
@@ -1115,10 +1116,25 @@ void ProducerImpl::applySendOffsets_(const TxnControl& c, const TxnOp& op) {
     offsetsOp_  = OffsetsAdding{op, nullptr};   // txnStep sends the AddOffsetsToTxn
 }
 
+namespace {
+// TxnOffsetCommit::encode's entry layout (TxnMessages.h): topicId(4) partition(4) offset(8) metaLen(2), no metadata.
+// The entries are written by hand (no entry-array scratch needed); the count is the last field of the empty encode.
+constexpr std::size_t kTxnOffsetEntryBytes = 4 + 4 + 8 + 2;
+// A frame holds the header, the ids (a transactional id is at most 255 bytes, Client.cpp) and at least one entry.
+static_assert(24 + 10 + 2 + 255 + 2 + kMaxTxnGroupIdBytes + 2 + kTxnOffsetEntryBytes <= CoordinatorLink::kCoordFrameCap,
+              "a TxnOffsetCommit frame must hold at least one entry");
+}  // namespace
+
 int ProducerImpl::offsetsStep_(int64_t nowNs) noexcept {
     const std::span<const uint8_t> txnId(reinterpret_cast<const uint8_t*>(cfg_.transactionalId.data()),
                                          cfg_.transactionalId.size());
     OffsetsScratch& sc = *offsetsScratch_;
+    if (const auto* ae = std::get_if<AbortableError>(&txn_)) {
+        // Another leg poisoned the transaction: it can only abort, so no more requests - the call ends with the poison.
+        offsetsEnd_(ae->status, ae->errorCode, "sendOffsetsToTransaction: the transaction failed - abort it",
+                    OffsetsEnd::Cancelled);
+        return 1;
+    }
     const std::span<const uint8_t> group(reinterpret_cast<const uint8_t*>(sc.group.data()), sc.groupLen);
     if (auto* oa = std::get_if<OffsetsAdding>(&offsetsOp_)) {
         if (nowNs >= oa->op.deadlineNs) {
@@ -1169,22 +1185,16 @@ int ProducerImpl::offsetsStep_(int64_t nowNs) noexcept {
         std::size_t       pos     = m.encode(f, {});   // header + ids + count 0
         const std::size_t countAt = pos - 2;
         uint16_t          count   = 0;
-        constexpr std::size_t kEntry = 4 + 4 + 8 + 2;   // topic, partition, offset, empty metadata
-        while (oc->sent < sc.n && pos + kEntry <= CoordinatorLink::kCoordFrameCap) {
+        while (oc->sent < sc.n && pos + kTxnOffsetEntryBytes <= CoordinatorLink::kCoordFrameCap) {
             const OffsetEntry& e = sc.entries[oc->sent++];
             rpc::detail::putLE32(f, static_cast<int>(pos), e.topicId);
             rpc::detail::putLE32(f, static_cast<int>(pos) + 4, e.partition);
             rpc::detail::putLE64(f, static_cast<int>(pos) + 8, e.offset);
             rpc::detail::putLE16(f, static_cast<int>(pos) + 16, 0);
-            pos += kEntry;
+            pos += kTxnOffsetEntryBytes;
             ++count;
         }
-        if (count == 0) {   // the ids alone fill the frame: no entry can ever be sent
-            coord_->release(*s);
-            offsetsEnd_(OpStatus::InvalidArgument, 0, "sendOffsetsToTransaction: transactional id and group id too long",
-                        OffsetsEnd::Failed);
-            return work + 1;
-        }
+        assert(count > 0);   // the frame always has room for an entry (static_assert above)
         rpc::detail::putLE16(f + countAt, 0, count);
         s->frameLen = static_cast<uint16_t>(pos);
         coord_->submit(*s);
@@ -1247,13 +1257,13 @@ bool ProducerImpl::offsetsEnd_(OpStatus st, uint16_t errorCode, std::string_view
     if (const auto* oa = std::get_if<OffsetsAdding>(&offsetsOp_)) {
         op = oa->op;
         if (oa->slot != nullptr) {
-            maybe = std::holds_alternative<CoordinatorLink::InFlight>(oa->slot->state);
+            maybe = oa->slot->offers > 0;   // offered (even if a session change put it back to Unsent)
             if (coord_) coord_->release(*oa->slot);
         }
     } else if (const auto* oc = std::get_if<OffsetsCommitting>(&offsetsOp_)) {
         op = oc->op;
         for (uint8_t i = 0; i < oc->outstanding; ++i) {
-            maybe = maybe || std::holds_alternative<CoordinatorLink::InFlight>(oc->slots[i]->state);
+            maybe = maybe || oc->slots[i]->offers > 0;
             if (coord_) coord_->release(*oc->slots[i]);
         }
     } else {
