@@ -15,11 +15,13 @@
 #include <rune/client/detail/HubCommand.h>
 #include <rune/client/subscriber/SubscriberHub.h>
 #include <rune/client/subscriber/Subscription.h>
+#include <rune/protocol/BatchRebuild.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/Protocol.h>
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <chrono>
 #include <memory>
 #include <vector>
@@ -188,4 +190,22 @@ TEST(SubscriberHubRecordsRegression, AMultiBatchFrameAllocatesNothingRegression)
     const long allocs = alloc_counter::stopThisThread();
     EXPECT_EQ(allocs, 0) << "the per-batch visitor is a template, never a std::function";
     EXPECT_EQ(b.delivered.size(), 64u * 6u);
+}
+
+// Phase 2c Task 1: a holed (rebuilt) batch is delivered with its records' own offsets.  The plain
+// subscription's position is the last DELIVERED record + 1 (today's per-record rule); Task 11 moves a
+// FILTERED subscription's position to the batch end.
+TEST(SubscriberHubRecordsRegression, AHoledBatchDeliversItsOwnOffsetsRegression) {
+    Bound b(kTopic, 12, 102);
+    const auto src = batchAt(10, 5);
+    std::vector<rune::protocol::RecordSpan> s;
+    ASSERT_TRUE(rune::protocol::forEachRecordSpan(src.data(), src.size(), [&](const auto& r) { s.push_back(r); }));
+    const std::array<uint32_t, 2> keep{0, 2};
+    std::vector<uint8_t> out(src.size());
+    const std::size_t n = rune::protocol::rebuildBatch(src, s, keep, out);
+    ASSERT_GT(n, 0u);
+    b.hub.onRecords(b.view(std::span<const uint8_t>(out.data(), n), 10));
+    EXPECT_EQ(b.delivered, (std::vector<int64_t>{10, 12}));
+    EXPECT_EQ(b.impl->nextOffset, 13);
+    EXPECT_EQ(b.hub.malformedBatches(), 0u);
 }

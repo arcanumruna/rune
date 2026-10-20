@@ -75,6 +75,8 @@
 #include <rune/protocol/client/OffsetMessages.h>
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/Protocol.h>
+#include <rune/protocol/BatchRebuild.h>
+#include <rune/protocol/RecordBatch.h>
 
 #include <gtest/gtest.h>
 
@@ -517,6 +519,45 @@ TEST_F(GroupConsumerHubTest, RecordsForAssignedPartition_DeliveredAndPositionAdv
     auto it = impl_->assignment.find(tp);
     ASSERT_NE(it, impl_->assignment.end());
     EXPECT_EQ(it->second, 11);
+}
+
+// Phase 2c Task 1: a holed (rebuilt) batch delivers its own offsets and the group position moves to
+// the SOURCE batch's end (base + lastOffsetDelta + 1), not to the last delivered record + 1.
+TEST_F(GroupConsumerHubTest, AHoledBatchMovesTheGroupPositionToTheSourceEndRegression) {
+    std::vector<int64_t> offsets;
+    int recordsCalled = 0;
+    impl_->cbRecords = [&](const RecordSet& rs) {
+        ++recordsCalled;
+        rs.forEachRecord([&](std::string_view, std::string_view, int64_t o, int64_t) { offsets.push_back(o); });
+    };
+
+    bringToStable(*hub_, sink_, kTopicId, kPartition);
+    seedPosition(*hub_, 10);
+
+    rune::protocol::RecordBatchBuilder bb(10, 1'000'000);
+    for (int i = 0; i < 5; ++i) bb.append("k", "v", 1'000'000 + i);
+    const auto src = bb.build();
+    std::vector<rune::protocol::RecordSpan> spans;
+    ASSERT_TRUE(rune::protocol::forEachRecordSpan(src.data(), src.size(), [&](const auto& r) { spans.push_back(r); }));
+    const std::array<uint32_t, 2> keep{0, 2};
+    std::vector<uint8_t> out(src.size());
+    const std::size_t n = rune::protocol::rebuildBatch(src, spans, keep, out);
+    ASSERT_GT(n, 0u);
+
+    codec::RecordsView rv;
+    rv.topicId     = kTopicId;
+    rv.partition   = kPartition;
+    rv.baseOffset  = 10;
+    rv.sessionId   = kSessionId;
+    rv.recordBatch = std::span<const uint8_t>(out.data(), n);
+    hub_->onRecords(rv);
+
+    EXPECT_EQ(recordsCalled, 1);
+    EXPECT_EQ(offsets, (std::vector<int64_t>{10, 12}));
+    const TopicPartition tp{kTopicId, kPartition};
+    auto it = impl_->assignment.find(tp);
+    ASSERT_NE(it, impl_->assignment.end());
+    EXPECT_EQ(it->second, 15);
 }
 
 // ---------------------------------------------------------------------------
