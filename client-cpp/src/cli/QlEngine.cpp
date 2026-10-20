@@ -382,11 +382,11 @@ void printPlan(const Prepared& p, const std::optional<cat::RequestId>& rid, std:
     if (rid) out << "  request-id " << requestIdHex(*rid) << "\n";
 }
 
-/// Reads the whole script text: a file, or stdin for "-".
-bool readScript(const std::string& path, std::string& text, std::ostream& err) {
+/// Reads the whole script text: a file, or @p stdinStream for "-".
+bool readScript(const std::string& path, std::istream& stdinStream, std::string& text, std::ostream& err) {
     if (path == "-") {
         std::ostringstream buf;
-        buf << std::cin.rdbuf();
+        buf << stdinStream.rdbuf();
         text = buf.str();
         return true;
     }

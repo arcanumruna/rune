@@ -269,7 +269,7 @@ int cmdQl(const std::vector<std::string>& args, std::ostream& out, std::ostream&
     const bool script = a.has("-f");
     std::string text;
     if (script) {
-        if (!readScript(a.value("-f"), text, err)) return 1;
+        if (!readScript(a.value("-f"), std::cin, text, err)) return 1;
     } else {
         text = a.value("-e");
     }

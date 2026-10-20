@@ -9,6 +9,7 @@
 //
 
 #include "rune/cli/Cli.h"
+#include "rune/cli/Console.h"
 #include "rune/cli/CatalogCommands.h"
 #include "rune/cli/SecurityCommands.h"
 #include "CliSupport.h"
@@ -23,6 +24,7 @@
 
 #include <charconv>
 #include <iomanip>
+#include <iostream>
 
 #include <filesystem>
 #include <fstream>
@@ -111,6 +113,9 @@ bool parseExpectedVersion(std::string_view flagStr, uint16_t& out, std::ostream&
 
 void printUsage(std::ostream& err) {
     err << "Usage:\n"
+        << "  rune console [--broker <ep>] [-f <script.rql|->] [--dry-run] [--validate] [--expected-version N]\n"
+        << "      Run Rune QL statements interactively (prompt `rune> `) or from a script (-f; stops at\n"
+        << "      the first error). --dry-run prints each statement's plan (no broker).\n"
         << "  rune schema apply <file|-> [--dry-run] [--validate] [--broker <ep>]\n"
         << "      Parse a .rql schema file (a 'topic' or an 'alter topic' statement);\n"
         << "      --dry-run prints the descriptor / alter plan (no broker).\n"
@@ -808,6 +813,11 @@ namespace rune::cli {
 
 int run(std::vector<std::string> args, std::ostream& out, std::ostream& err)
 {
+    return run(std::move(args), std::cin, out, err);
+}
+
+int run(std::vector<std::string> args, std::istream& in, std::ostream& out, std::ostream& err)
+{
     if (args.empty()) {
         printUsage(err);
         return 1;
@@ -815,6 +825,9 @@ int run(std::vector<std::string> args, std::ostream& out, std::ostream& err)
 
     const std::string& cmd = args[0];
 
+    if (cmd == "console") {
+        return console::cmdConsole(args, in, out, err);
+    }
     if (cmd == "schema") {
         return cmdSchema(args, out, err);
     }

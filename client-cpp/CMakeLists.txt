@@ -1602,6 +1602,7 @@ add_library(rune_cli_lib STATIC
     src/cli/Cli.cpp
     src/cli/CatalogCommands.cpp
     src/cli/QlEngine.cpp
+    src/cli/Console.cpp
     src/cli/SecurityCommands.cpp
 )
 target_include_directories(rune_cli_lib PUBLIC
@@ -1640,6 +1641,7 @@ target_compile_features(rune PRIVATE cxx_std_23)
 if(BUILD_TESTING)
     add_executable(rune_cli_offline_tests
         tests/RuneCliOfflineTest.cpp
+        tests/RuneConsoleOfflineTest.cpp
     )
     target_link_libraries(rune_cli_offline_tests PRIVATE rune_cli_lib GTest::gtest_main)
     target_compile_features(rune_cli_offline_tests PRIVATE cxx_std_23)

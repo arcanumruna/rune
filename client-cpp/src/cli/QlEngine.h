@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <istream>
 #include <ostream>
 #include <string>
 #include <string_view>
@@ -105,8 +106,8 @@ struct PrepareOptions {
 
 void printPlan(const Prepared& p, const std::optional<cat::RequestId>& rid, std::ostream& out);
 
-/// Reads the whole script text: a file, or stdin for "-".
-[[nodiscard]] bool readScript(const std::string& path, std::string& text, std::ostream& err);
+/// Reads the whole script text: a file, or @p stdinStream for "-".
+[[nodiscard]] bool readScript(const std::string& path, std::istream& stdinStream, std::string& text, std::ostream& err);
 
 /// The text of each ';'-terminated statement of `src`, comments (`-- …`) and blanks between
 /// statements dropped, ';' inside a '…' string kept (the rune-ql lexical rules).

@@ -6,6 +6,7 @@
 // main() in tools/rune_cli.cpp is a thin wrapper that calls it.
 //
 #pragma once
+#include <istream>
 #include <ostream>
 #include <string>
 #include <vector>
@@ -21,5 +22,9 @@ namespace rune::cli {
 /// @param err   Stream for error/diagnostic output.
 /// @returns     Exit code: 0 on success, non-zero on error.
 int run(std::vector<std::string> args, std::ostream& out, std::ostream& err);
+
+/// As run(args, out, err), reading the console's interactive / `-f -` input from @p in
+/// instead of std::cin (lets `rune console` be tested without a TTY).
+int run(std::vector<std::string> args, std::istream& in, std::ostream& out, std::ostream& err);
 
 } // namespace rune::cli
