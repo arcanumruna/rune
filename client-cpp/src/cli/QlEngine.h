@@ -135,6 +135,7 @@ struct LiveOptions {
     std::string streamIn, streamOut, dataDir;   // hidden test overrides ("" = default)
     bool        verbose = false;
     std::string user, passwordFile;  // credentials ("" = RUNE_USER / RUNE_PASSWORD_FILE)
+    std::string password;            // an interactively prompted password (never from argv / env); wiped by the caller
 };
 
 /// The LiveOptions the `--broker` / `--cli-*` / `--user` / `--password-file` flags of `a` describe.
@@ -187,6 +188,8 @@ struct QlRun {
     bool fail(const std::string& msg);
     /// A broker refusal: records its code in lastErrorCode, then fail()s with `<Name> (<code>) <detail>`.
     bool failBroker(uint16_t code, const std::string& detail);
+    /// A catalog / security READ failure: records the broker code it carried (e.g. SessionRevoked), then fail()s with `msg`.
+    bool failRead(const std::string& msg, const rc::CatalogReadError& e);
 
     bool run(const PDefine& s, const rc::DdlOptions& ddl);
     bool run(const PAlter& s, const rc::DdlOptions& ddl);

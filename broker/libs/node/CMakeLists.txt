@@ -1660,7 +1660,8 @@ if(BUILD_TESTING)
                        tests/client/ClientLoginBrokerRegressionTest.cpp
                        tests/client/RuneCliSecurityBrokerRegressionTest.cpp
                        tests/client/ClientSessionRevokedBrokerRegressionTest.cpp
-                       tests/client/ClientAuthClusterRegressionTest.cpp)
+                       tests/client/ClientAuthClusterRegressionTest.cpp
+                       tests/client/RuneConsoleBrokerRegressionTest.cpp)
         target_include_directories(rune_client_broker_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_client_broker_tests PRIVATE rune_node rune_view rune_codec rune_catalog
                               rune_client_api rune_cli_lib aeron::aeron GTest::gtest_main)

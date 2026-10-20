@@ -730,6 +730,12 @@ session::SessionState Client::state() const {
     return static_cast<session::SessionState>(seedStatusCache_.state);
 }
 
+int16_t Client::sessionRejectCode() const noexcept {
+    if (std::this_thread::get_id() != dutyThreadId_) return 0;
+    const auto& m = agent_.seedMachine();
+    return m.state() == session::SessionState::Rejected ? m.rejectCode() : int16_t{0};
+}
+
 AuthStatus Client::authStatus() const {
     namespace rpc = rune::protocol::client;
     const auto me = std::this_thread::get_id();

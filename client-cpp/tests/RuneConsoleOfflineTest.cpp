@@ -8,10 +8,13 @@
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <chrono>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "rune/cli/Cli.h"
+#include "rune/cli/Console.h"
 
 namespace fs = std::filesystem;
 
@@ -223,4 +226,73 @@ TEST(ConsoleOfflineRegression, ExpectedVersionMalformedIsCleanErrorNotCrash) {
         EXPECT_EQ(r.rc, 2) << bad;
         EXPECT_NE(r.err.find("--expected-version"), std::string::npos) << bad << ": " << r.err;
     }
+}
+
+// ── PollingFdLineSource (the TTY reader; a pipe stands in for the terminal) ────────────────────────────────────────
+
+namespace {
+void countIdle(void* ctx) noexcept { ++*static_cast<int*>(ctx); }
+}
+
+TEST(ConsolePollingSourceRegression, SplitsLinesStripsCrAndKeepsAnUnterminatedLastLine) {
+    int fds[2];
+    ASSERT_EQ(::pipe(fds), 0);
+    int idle = 0;
+    rune::cli::console::PollingFdLineSource src(fds[0], &countIdle, &idle);
+    const std::string in = "one\r\ntwo\nlast";
+    ASSERT_EQ(::write(fds[1], in.data(), in.size()), static_cast<ssize_t>(in.size()));
+    ::close(fds[1]);
+    std::string line;
+    ASSERT_TRUE(src.next(line)); EXPECT_EQ(line, "one");
+    ASSERT_TRUE(src.next(line)); EXPECT_EQ(line, "two");
+    ASSERT_TRUE(src.next(line)); EXPECT_EQ(line, "last");
+    EXPECT_FALSE(src.next(line));
+    ::close(fds[0]);
+}
+
+TEST(ConsolePollingSourceRegression, PumpsTheClientWhileTheTerminalIsIdle) {
+    int fds[2];
+    ASSERT_EQ(::pipe(fds), 0);
+    int idle = 0;
+    rune::cli::console::PollingFdLineSource src(fds[0], &countIdle, &idle);
+    std::thread writer([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        ASSERT_EQ(::write(fds[1], "go\n", 3), 3);
+    });
+    std::string line;
+    ASSERT_TRUE(src.next(line));
+    writer.join();
+    EXPECT_EQ(line, "go");
+    EXPECT_GE(idle, 4) << "a 50 ms poll between pumps over ~400 ms of silence";
+    EXPECT_EQ(static_cast<uint64_t>(idle), src.idlePumps);
+    ::close(fds[0]); ::close(fds[1]);
+}
+
+TEST(ConsolePollingSourceRegression, AnOverlongLineIsReportedAndDiscardedNotRunTogetherWithTheNextOne) {
+    int fds[2];
+    ASSERT_EQ(::pipe(fds), 0);
+    int idle = 0;
+    std::ostringstream err;
+    rune::cli::console::PollingFdLineSource src(fds[0], &countIdle, &idle);
+    src.err = &err;
+    std::thread writer([&] {   // 100 KiB without a newline, then the line's end and a normal line
+        const std::string chunk(4096, 'x');
+        for (int i = 0; i < 25; ++i) {
+            const char* p = chunk.data();
+            std::size_t left = chunk.size();
+            while (left > 0) { const ssize_t n = ::write(fds[1], p, left); if (n <= 0) return; p += n; left -= static_cast<std::size_t>(n); }
+        }
+        const std::string tail = "yyy\nnext;\n";
+        (void)!::write(fds[1], tail.data(), tail.size());
+        ::close(fds[1]);
+    });
+    std::string line;
+    ASSERT_TRUE(src.next(line));
+    EXPECT_TRUE(line.empty());
+    EXPECT_NE(err.str().find("input line too long"), std::string::npos) << err.str();
+    ASSERT_TRUE(src.next(line));
+    EXPECT_EQ(line, "next;") << "the rest of the long line is dropped, the next line is intact";
+    EXPECT_FALSE(src.next(line));
+    writer.join();
+    ::close(fds[0]);
 }

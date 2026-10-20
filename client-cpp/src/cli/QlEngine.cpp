@@ -522,11 +522,18 @@ bool LiveBroker::open(const LiveOptions& o, std::ostream& err, bool withCredenti
     }
     // Authentication (Task 8): who to log in as.  --user / RUNE_USER and --password-file / RUNE_PASSWORD_FILE;
     // a password is NEVER taken from argv (parseArgs refuses --password) or from the environment.
-    if (withCredentials) applyCredentials(cfg, o.user, o.passwordFile);
+    if (withCredentials) {
+        applyCredentials(cfg, o.user, o.passwordFile);
+        if (!o.password.empty()) {   // an interactively prompted password replaces any file (the client refuses both)
+            cfg.password = o.password;
+            cfg.passwordFile.clear();
+        }
+    }
     ddlTimeout_ = std::chrono::milliseconds(cfg.ddlTimeoutMs);
     verbose_ = o.verbose;
     try {
         client_ = std::make_unique<rc::Client>(cfg);
+        if (!cfg.password.empty()) rc::detail::secureZero(cfg.password.data(), cfg.password.size());
         client_->connectAndWait(kConnectWait);
         printDevBannerIfAny(*client_, err);   // dev mode: say so, loudly
         return true;
@@ -575,6 +582,11 @@ bool QlRun::awaitLastDdl() {
     return fail("the catalog read did not show this script's last DDL (request id " + requestIdHex(*lastDdl) + "): " + why);
 }
 
+bool QlRun::failRead(const std::string& msg, const rc::CatalogReadError& e) {
+    lastErrorCode = e.brokerErrorCode;
+    return fail(msg);
+}
+
 bool QlRun::failBroker(uint16_t code, const std::string& detail) {
     lastErrorCode = code;
     return fail(brokerFailure(code, detail));
@@ -607,7 +619,13 @@ bool QlRun::run(const PDefine& s, const rc::DdlOptions& ddl) {
     broker.flushVerbose(err);
     if (r.errorCode != 0) return failBroker(r.errorCode, r.detail);
     lastDdl = r.requestId;
-    out << "created topic '" << d.name << "' topicId=" << r.topicId << " version=" << r.version << "\n";
+    if (style == OutputStyle::Console) {
+        out << "ok " << (d.persistence == ql::Persistence::Transient ? "transient topic " : "topic ") << d.name;
+        if (!d.descriptorBlob.empty()) out << " v" << r.version;
+        out << " (" << d.partitions << (d.partitions == 1 ? " partition)" : " partitions)") << "\n";
+    } else {
+        out << "created topic '" << d.name << "' topicId=" << r.topicId << " version=" << r.version << "\n";
+    }
     return true;
 }
 bool QlRun::run(const PAlter& s, const rc::DdlOptions& ddl) {
@@ -617,7 +635,8 @@ bool QlRun::run(const PAlter& s, const rc::DdlOptions& ddl) {
     broker.flushVerbose(err);
     if (r.errorCode != 0) return failBroker(r.errorCode, r.detail);
     lastDdl = r.requestId;
-    out << "altered topic '" << d.name << "' version=" << r.newVersion << "\n";
+    if (style == OutputStyle::Console) out << "ok topic " << d.name << " v" << r.newVersion << "\n";
+    else out << "altered topic '" << d.name << "' version=" << r.newVersion << "\n";
     return true;
 }
 bool QlRun::run(const PAlterConfig& s, const rc::DdlOptions& ddl) {
@@ -627,7 +646,8 @@ bool QlRun::run(const PAlterConfig& s, const rc::DdlOptions& ddl) {
     broker.flushVerbose(err);
     if (r.errorCode != 0) return failBroker(r.errorCode, r.detail);
     lastDdl = r.requestId;
-    out << "altered config of topic '" << s.plan.name << "' version=" << r.newVersion << "\n";
+    if (style == OutputStyle::Console) out << "ok topic " << s.plan.name << " config v" << r.newVersion << "\n";
+    else out << "altered config of topic '" << s.plan.name << "' version=" << r.newVersion << "\n";
     return true;
 }
 bool QlRun::run(const PDropTopic& s, const rc::DdlOptions& ddl) {
@@ -635,7 +655,8 @@ bool QlRun::run(const PDropTopic& s, const rc::DdlOptions& ddl) {
     broker.flushVerbose(err);
     if (r.errorCode != 0) return failBroker(r.errorCode, r.detail);
     lastDdl = r.requestId;
-    out << "dropped topic '" << s.name << "'\n";
+    if (style == OutputStyle::Console) out << "ok dropped topic " << s.name << "\n";
+    else out << "dropped topic '" << s.name << "'\n";
     return true;
 }
 // ---- authentication (Task 8): security DDL and SHOW … ---------------------------------------------------------
@@ -646,7 +667,11 @@ bool QlRun::awaitLastSecurityDdl() {
     std::string why = "not visible before the deadline";
     for (;;) {
         const int64_t left = std::max<int64_t>(1, deadline - steadyNowMs());
-        if (auto r = reader.refresh(std::chrono::milliseconds(left)); !r) { why = securityReadFailure(r.error()); break; }
+        if (auto r = reader.refresh(std::chrono::milliseconds(left)); !r) {
+            why = securityReadFailure(r.error());
+            lastErrorCode = r.error().brokerErrorCode;
+            break;
+        }
         if (reader.state().request(*lastSecurityDdl)) return true;
         if (steadyNowMs() >= deadline) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -672,25 +697,25 @@ bool QlRun::run(const PSecShow& s, const rc::DdlOptions&) {
     switch (s.kind) {
         case PSecShow::Kind::Users: {
             const auto r = c.securityUsers(kCatalogWait);
-            if (!r) return fail(securityReadFailure(r.error()));
+            if (!r) return failRead(securityReadFailure(r.error()), r.error());
             out << formatUsersTable(*r);
             return true;
         }
         case PSecShow::Kind::Roles: {
             const auto r = c.securityRoles(kCatalogWait);
-            if (!r) return fail(securityReadFailure(r.error()));
+            if (!r) return failRead(securityReadFailure(r.error()), r.error());
             out << formatRolesTable(*r);
             return true;
         }
         case PSecShow::Kind::Grants: {
             const auto r = c.securityGrantsFor(s.who, s.name, s.at, kCatalogWait);
-            if (!r) return fail(securityReadFailure(r.error()));
+            if (!r) return failRead(securityReadFailure(r.error()), r.error());
             out << formatGrantsTable(*r);
             return true;
         }
         case PSecShow::Kind::History: {
             const auto r = c.securityHistory(s.filter, kCatalogWait);
-            if (!r) return fail(securityReadFailure(r.error()));
+            if (!r) return failRead(securityReadFailure(r.error()), r.error());
             out << formatSecurityHistoryTable(*r);
             return true;
         }
@@ -703,14 +728,15 @@ bool QlRun::run(const PDropView& s, const rc::DdlOptions& ddl) {
     broker.flushVerbose(err);
     if (r.errorCode != 0) return failBroker(r.errorCode, r.detail);
     lastDdl = r.requestId;
-    out << "dropped view '" << s.name << "'\n";
+    if (style == OutputStyle::Console) out << "ok dropped view " << s.name << "\n";
+    else out << "dropped view '" << s.name << "'\n";
     return true;
 }
 
 bool QlRun::run(const PHistory& s, const rc::DdlOptions&) {
     if (!awaitLastDdl()) return false;
     const auto r = broker.client().catalogHistory(s.filter, kCatalogWait);
-    if (!r) return fail(catalogReadFailure(r.error()));
+    if (!r) return failRead(catalogReadFailure(r.error()), r.error());
     static const std::array<std::string, kHistoryColumns> kHeader = {"offset", "time(UTC)", "kind", "object(objectId)",
                                                                      "version", "principal", "replayedFrom", "statement"};
     std::vector<std::array<std::string, kHistoryColumns>> rows{kHeader};
@@ -731,7 +757,7 @@ bool QlRun::run(const PHistory& s, const rc::DdlOptions&) {
 bool QlRun::run(const PAsOf& s, const rc::DdlOptions&) {
     if (!awaitLastDdl()) return false;
     const auto r = broker.client().catalogAsOf(s.at, kCatalogWait);
-    if (!r) return fail(catalogReadFailure(r.error()));
+    if (!r) return failRead(catalogReadFailure(r.error()), r.error());
     if (s.kind == cat::ObjectType::View) {
         const cat::ViewObject* v = r->viewByName(s.name);
         if (v == nullptr) return fail("no view '" + s.name + "' at that point of the catalog");
@@ -747,7 +773,7 @@ bool QlRun::run(const PAsOf& s, const rc::DdlOptions&) {
 bool QlRun::run(const PDiff& s, const rc::DdlOptions&) {
     if (!awaitLastDdl()) return false;
     const auto r = broker.client().catalogDiff(s.a, s.b, kCatalogWait);
-    if (!r) return fail(catalogReadFailure(r.error()));
+    if (!r) return failRead(catalogReadFailure(r.error()), r.error());
     std::size_t shown = 0;
     for (const cat::DiffEntry& d : *r) {
         if (s.restrictToTopic && !(d.type == cat::ObjectType::Topic && d.name == s.onlyTopic)) continue;

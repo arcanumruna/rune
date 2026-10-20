@@ -204,6 +204,8 @@ public:
         }
         return idPrefix_ | nextId_;
     }
+    /// How many session ids were ever handed out (accepted connects; test observability).
+    [[nodiscard]] uint64_t sessionsAllocated() const noexcept { return static_cast<uint64_t>(nextId_); }
     /// Cluster-unique ids: the prefix OR-ed into every id (0 = none, tests).
     void setIdPrefix(int64_t prefix) noexcept { idPrefix_ = prefix; }
 

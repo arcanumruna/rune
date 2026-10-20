@@ -1731,6 +1731,11 @@ public:
             return id;
         });
     }
+    /// Test-only: how many client sessions the gateway ever accepted (read on the control thread).
+    template <class = void>
+    uint64_t testConnectsAccepted() {
+        return onControlThreadForTest([this]() -> uint64_t { return gateway_ ? gateway_->sessionsAllocated() : 0; });
+    }
     template <class = void>
     int64_t processIdentityForTest() {
         return onControlThreadForTest([this]() -> int64_t {

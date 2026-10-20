@@ -16,7 +16,12 @@
 
 #include "rune/ql/Parser.h"
 
+#include <algorithm>
+#include <cerrno>
 #include <charconv>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
 #include <istream>
 #include <optional>
 #include <ostream>
@@ -25,7 +30,60 @@
 #include <variant>
 #include <vector>
 
+#include <poll.h>
+#include <termios.h>
+#include <unistd.h>
+
 namespace rune::cli::console {
+
+bool PollingFdLineSource::next(std::string& line) {
+    for (;;) {
+        const auto end = buf_.begin() + static_cast<std::ptrdiff_t>(len_);
+        if (const auto nl = std::find(buf_.begin(), end, '\n'); nl != end) {
+            const std::size_t used = static_cast<std::size_t>(nl - buf_.begin()) + 1;
+            if (discarding_) {
+                discarding_ = false;
+                std::memmove(buf_.data(), buf_.data() + used, len_ - used);
+                len_ -= used;
+                continue;
+            }
+            line.assign(buf_.begin(), nl);
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            std::memmove(buf_.data(), buf_.data() + used, len_ - used);
+            len_ -= used;
+            return true;
+        }
+        if (discarding_) len_ = 0;   // no newline yet: the over-long line goes on, drop what we hold
+        if (len_ == buf_.size()) {
+            len_        = 0;
+            discarding_ = true;
+            if (err != nullptr) *err << "error: input line too long (64 KiB); the line was discarded\n";
+            line.clear();
+            return true;
+        }
+        pollfd p{fd_, POLLIN, 0};
+        const int n = ::poll(&p, 1, 50);
+        if (n == 0) {
+            ++idlePumps;
+            idle_(ctx_);
+            continue;
+        }
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        const ssize_t got = ::read(fd_, buf_.data() + len_, buf_.size() - len_);
+        if (got < 0 && errno == EINTR) continue;
+        if (got <= 0) {
+            if (len_ == 0 || discarding_) return false;
+            line.assign(buf_.begin(), buf_.begin() + static_cast<std::ptrdiff_t>(len_));   // a last line without '\n'
+            len_ = 0;
+            return true;
+        }
+        len_ += static_cast<std::size_t>(got);
+    }
+}
+
 namespace {
 
 struct ConsoleOptions {
@@ -36,12 +94,6 @@ struct ConsoleOptions {
 #ifdef RUNE_CLI_LIVE_ENABLED
     engine::LiveOptions live;             // --broker / --cli-egress / credentials / hidden flags
 #endif
-};
-
-/// A line of input; false at EOF.  Task 4 adds a polling TTY source.
-struct LineSource {
-    virtual ~LineSource() = default;
-    virtual bool next(std::string& line) = 0;
 };
 
 constexpr std::string_view kPrompt             = "rune> ";
@@ -256,11 +308,145 @@ struct DryRunExecutor {
     [[nodiscard]] bool sessionEnded() const noexcept { return false; }
 };
 
-// Task 4 replaces this with the connected session.
+#ifdef RUNE_CLI_LIVE_ENABLED
+
+struct LiveExecutor {
+    engine::LiveBroker& broker;
+    engine::QlRun       run;
+    std::optional<rune::catalog::RequestId> base;
+    bool ended = false;
+    int execute(const engine::Prepared& p, const std::string& text, std::size_t index) {
+        std::optional<rune::catalog::RequestId> rid;
+        if (base) rid = rune::catalog::RequestId{base->hi, base->lo + (index - 1)};
+        run.index = index;
+        run.lastErrorCode = 0;
+        if (run.exec(p, text, rid)) return 0;
+        // A revoked session fails the client for good: the next statement sees "client closed", with no broker code.
+        if (run.lastErrorCode == 0 && broker.client().sessionRejectCode() ==
+                                          static_cast<int16_t>(rune::protocol::client::ErrorCode::SessionRevoked))
+            run.lastErrorCode = static_cast<uint16_t>(rune::protocol::client::ErrorCode::SessionRevoked);
+        if (run.lastErrorCode == static_cast<uint16_t>(rune::protocol::client::ErrorCode::SessionRevoked)) {
+            ended = true;
+            run.err << "error: SessionRevoked (46): the session ended\n";
+        }
+        return run.lastErrorCode != 0 ? run.lastErrorCode : 1;
+    }
+    [[nodiscard]] bool sessionEnded() const noexcept { return ended; }
+};
+
+void pumpClient(void* ctx) noexcept {
+    try {
+        (void)static_cast<engine::LiveBroker*>(ctx)->client().doWork();
+    } catch (...) {
+    }
+}
+
+/// Reads a password from the terminal with echo off; the terminal is restored on every path.  false on EOF / error.
+bool promptPassword(const std::string& user, std::string& password, std::ostream& err) {
+    termios saved{};
+    const bool haveTermios = ::tcgetattr(STDIN_FILENO, &saved) == 0;
+    if (haveTermios) {
+        termios quiet = saved;
+        quiet.c_lflag &= ~static_cast<tcflag_t>(ECHO);
+        ::tcsetattr(STDIN_FILENO, TCSANOW, &quiet);
+    }
+    struct Restore {
+        bool on; const termios& t;
+        ~Restore() { if (on) ::tcsetattr(STDIN_FILENO, TCSANOW, &t); }
+    } restore{haveTermios, saved};
+    err << "password for " << user << ": " << std::flush;
+    password.clear();
+    bool ok = false;
+    for (;;) {   // byte-wise: nothing of the following input is consumed
+        char c = 0;
+        const ssize_t n = ::read(STDIN_FILENO, &c, 1);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { ok = !password.empty(); break; }
+        if (c == '\n') { ok = true; break; }
+        if (c != '\r') password.push_back(c);
+    }
+    err << "\n";
+    return ok;
+}
+
+struct LiveInput {
+    std::istream* in = nullptr;      // the caller's stream (interactive, non-polling)
+    int           fd = -1;           // >= 0: poll this fd (tests)
+    bool          canPrompt = false; // a password may be prompted on the terminal
+    uint64_t*     idlePumps = nullptr;
+};
+
+int runLiveSession(const ConsoleOptions& opts, std::string_view script, const LiveInput& input, std::ostream& out,
+                   std::ostream& err) {
+    ConsoleOptions o = opts;
+    if (o.live.endpoint.empty()) {
+        if (const char* env = std::getenv("RUNE_BROKER"); env != nullptr) o.live.endpoint = env;
+    }
+    if (o.live.endpoint.empty()) return usage(err, "--broker host:port is required (or --dry-run)");
+
+    // Credentials (DD10): a password only from a file or the terminal prompt.
+    std::string user = o.live.user;
+    if (user.empty()) { if (const char* e = std::getenv("RUNE_USER"); e != nullptr) user = e; }
+    bool havePasswordFile = !o.live.passwordFile.empty();
+    if (!havePasswordFile) { if (const char* e = std::getenv("RUNE_PASSWORD_FILE"); e != nullptr && *e != '\0') havePasswordFile = true; }
+    std::string password;
+    struct Wipe {
+        std::string& s;
+        ~Wipe() { if (!s.empty()) rune::client::detail::secureZero(s.data(), s.size()); }
+    } wipe{password};
+    if (!user.empty() && !havePasswordFile) {
+        if (!(input.canPrompt && o.scriptPath.empty() && ::isatty(STDIN_FILENO)))
+            return usage(err, "--password-file is required with --user (passwords are never read from argv or the environment)");
+        if (!promptPassword(user, password, err)) {
+            err << "rune console: no password entered\n";
+            return 1;
+        }
+        o.live.password = password;
+    }
+
+    engine::LiveBroker broker;
+    const bool opened = broker.open(o.live, err);
+    if (!password.empty()) {
+        rune::client::detail::secureZero(password.data(), password.size());
+        password.clear();
+    }
+    if (!o.live.password.empty()) rune::client::detail::secureZero(o.live.password.data(), o.live.password.size());
+    o.live.password.clear();
+    if (!opened) return 1;
+    if (broker.client().authStatus().kind == rune::client::AuthStatus::Kind::PasswordChangeRequired)
+        err << "WARNING: password change required — run ALTER USER " << broker.client().authStatus().user
+            << " SET PASSWORD '…';\n";
+
+    LiveExecutor exec{broker, engine::QlRun{broker, out, err, !o.scriptPath.empty(), 1, engine::OutputStyle::Console},
+                      o.requestIdBase};
+    int rc = 0;
+    if (!o.scriptPath.empty()) {
+        rc = runScript(exec, o, script, err);
+    } else if (input.fd >= 0 || (input.canPrompt && ::isatty(STDIN_FILENO))) {
+        PollingFdLineSource src(input.fd >= 0 ? input.fd : STDIN_FILENO, &pumpClient, &broker);
+        src.err = &err;
+        rc = runInteractive(exec, o, src, out, err);
+        if (input.idlePumps != nullptr) *input.idlePumps = src.idlePumps;
+    } else {
+        StreamLineSource src(*input.in);
+        rc = runInteractive(exec, o, src, out, err);
+    }
+    broker.flushVerbose(err);
+    return rc;
+}
+
+int runLive(const ConsoleOptions& o, std::istream& in, const std::string& script, std::ostream& out, std::ostream& err) {
+    return runLiveSession(o, script, LiveInput{&in, -1, &in == &std::cin, nullptr}, out, err);
+}
+
+#else
+
 int runLive(const ConsoleOptions&, std::istream&, const std::string&, std::ostream&, std::ostream& err) {
     err << "rune console: live mode requires RUNE_CLI_LIVE_ENABLED and a real Aeron build. Use --dry-run.\n";
     return 1;
 }
+
+#endif
 
 } // namespace
 
@@ -276,6 +462,18 @@ int cmdConsole(const std::vector<std::string>& args, std::istream& in, std::ostr
         return runInteractive(exec, o, src, out, err);
     }
     return runLive(o, in, script, out, err);
+}
+
+int runLiveOnFdForTest([[maybe_unused]] const std::vector<std::string>& args, [[maybe_unused]] int fd,
+                       [[maybe_unused]] std::ostream& out, std::ostream& err, [[maybe_unused]] uint64_t* idlePumps) {
+#ifdef RUNE_CLI_LIVE_ENABLED
+    ConsoleOptions o;
+    if (const int rc = parseConsoleOptions(args, o, err); rc != 0) return rc;
+    return runLiveSession(o, {}, LiveInput{nullptr, fd, false, idlePumps}, out, err);
+#else
+    err << "rune console: live mode requires RUNE_CLI_LIVE_ENABLED\n";
+    return 1;
+#endif
 }
 
 } // namespace rune::cli::console

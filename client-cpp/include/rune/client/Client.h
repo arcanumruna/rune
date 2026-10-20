@@ -723,6 +723,10 @@ public:
     /// Authentication: the seed session's login state (see AuthStatus).  Same threading rule as state().
     [[nodiscard]] AuthStatus authStatus() const;
 
+    /// The broker error code that ended the seed session for good (SessionRevoked 46, AuthenticationFailed 44, ...), or 0
+    /// while the session is not Rejected.  The duty thread only (Invoker owner / a callback); any other thread gets 0.
+    [[nodiscard]] int16_t sessionRejectCode() const noexcept;
+
     // -------------------------------------------------------------------------
     // Control ops (F8c C3) — completion tokens, no futures
     //

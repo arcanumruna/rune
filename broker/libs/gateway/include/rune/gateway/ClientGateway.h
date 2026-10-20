@@ -1105,6 +1105,8 @@ public:
     [[nodiscard]] std::size_t sessionCount() const {
         return sessions_.size();
     }
+    /// Sessions ever accepted (monotonic; control thread).
+    [[nodiscard]] uint64_t sessionsAllocated() const noexcept { return sessions_.sessionsAllocated(); }
 
     // -----------------------------------------------------------------------
     // subscriptionCount — number of active subscriptions (for tests).
