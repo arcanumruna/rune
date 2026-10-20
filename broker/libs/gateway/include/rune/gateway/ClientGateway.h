@@ -573,6 +573,15 @@ public:
         Session* s = sessions_.find(sessionId);
         return s != nullptr ? s->clientVersion : -1;
     }
+    /// Issues #122 / #123 / #124: the principal (security user object id) a session authenticated as; 0 = none (a dev
+    /// / in-process broker, an anonymous or not yet authenticated session, an unknown session).  Member ids and producer
+    /// ids are bound to it.  Control thread.
+    [[nodiscard]] uint64_t sessionPrincipalId(int64_t sessionId) {
+        Session* s = sessions_.find(sessionId);
+        if (s == nullptr) return 0;
+        const auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&s->auth);
+        return a != nullptr ? a->userId : 0;
+    }
     void setClusterIdNode(int32_t nodeId) noexcept {
         idPrefix_ = nodeId >= 0 ? clusterIdPrefix(nodeId) : 0;
         sessions_.setIdPrefix(idPrefix_);

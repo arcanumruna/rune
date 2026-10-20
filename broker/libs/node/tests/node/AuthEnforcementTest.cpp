@@ -13,6 +13,7 @@ using SO = rune::protocol::SecurityOperation;
 namespace {
 constexpr int kOk = 0;
 constexpr int kUnknownTopic = static_cast<int>(pc::ErrorCode::UnknownTopic);
+constexpr int kUnknownMember = static_cast<int>(pc::ErrorCode::UnknownMember);
 }  // namespace
 
 TEST(AuthEnforcementRegression, ProduceAllowedAndDenied) {
@@ -73,10 +74,45 @@ TEST(AuthEnforcementRegression, GroupRowsAllowedAndDenied) {
     EXPECT_EQ(r.offsetFetch(none, "cg", r.orders), kNotAuthorized);
 }
 
-TEST(AuthEnforcementRegression, LeaveGroupNeedsNoGrant) {
+// Issue #123: LeaveGroup needs READ on the group and evicts only the caller's own member.  A zero-grant user is refused
+// 45; a user holding READ on the group but naming another session's member is answered UnknownMember - exactly as for
+// a member that does not exist - and the victim stays a member.
+TEST(AuthEnforcementRegression, LeaveGroupByAnotherSessionOrWithoutReadIsRefusedRegression) {
     AuthRig r;
-    const int64_t none = r.newUser({});
-    EXPECT_NE(r.leaveGroup(none, "anything"), kNotAuthorized) << "D18: LeaveGroup needs nothing";
+    const int64_t ws1 = r.newUser({exact(SO::Read, ST::Group, "world-7"), exact(SO::Read, ST::Topic, "orders")});
+    const int64_t m = r.newUser({});
+    const int64_t n = r.newUser({exact(SO::Read, ST::Group, "world-7")});
+    const auto [member, gen] = r.joinStable(ws1, "world-7", {r.orders});
+    ASSERT_FALSE(member.empty());
+    EXPECT_EQ(r.leaveGroup(m, "world-7", member), kNotAuthorized) << "LeaveGroup needs READ on the group";
+    EXPECT_EQ(r.leaveGroup(n, "world-7", member), kUnknownMember) << "another session's member is not the caller's";
+    EXPECT_EQ(r.leaveGroup(n, "world-7", "world-7-1-00000000000000000000000000000000"), kUnknownMember)
+        << "the same answer as for a member that does not exist";
+    EXPECT_EQ(r.heartbeatAt(ws1, "world-7", member, gen), kOk) << "the victim is still a member at its generation";
+    EXPECT_EQ(r.leaveGroup(ws1, "world-7", member), kOk) << "the owner leaves";
+}
+
+// Issue #124: users u1 and u2 share READ on group g; u1 is member M.  u2 naming M on Heartbeat, Sync and OffsetCommit
+// is answered UnknownMember (as for a member that does not exist) and changes nothing; a JoinGroup naming M joins u2
+// as a NEW member.
+TEST(AuthEnforcementRegression, AnotherPrincipalsMemberIdIsRefusedOnEveryGroupRequestRegression) {
+    AuthRig r;
+    const std::vector<AuthGrant> g{exact(SO::Read, ST::Group, "g"), exact(SO::Read, ST::Topic, "orders")};
+    const int64_t u1 = r.newUser(g);
+    const int64_t u2 = r.newUser(g);
+    const auto [member, gen] = r.joinStable(u1, "g", {r.orders});
+    ASSERT_FALSE(member.empty());
+    ASSERT_EQ(r.commitAs(u1, "g", member, gen, r.orders, 100), kOk);
+    EXPECT_EQ(r.heartbeatAt(u2, "g", member, gen), kUnknownMember);
+    EXPECT_EQ(r.syncGroup(u2, "g", member, gen), kUnknownMember) << "another member's assignment is not handed out";
+    EXPECT_EQ(r.commitAs(u2, "g", member, gen, r.orders, 500), kUnknownMember);
+    EXPECT_EQ(r.committedOffset(u1, "g", r.orders), 100) << "the foreign commit moved the group's position";
+    EXPECT_EQ(r.syncGroup(u1, "g", member, gen), kOk);
+    const auto [code, got] = r.rejoin(u2, "g", member, {r.orders});
+    EXPECT_EQ(code, kOk);
+    EXPECT_FALSE(got.empty());
+    EXPECT_NE(got, member) << "another principal took over the member";
+    EXPECT_NE(r.heartbeatAt(u1, "g", member, gen), kUnknownMember) << "u1 still owns its member (now rebalancing)";
 }
 
 TEST(AuthEnforcementRegression, TransactionRowsAllowedAndDenied) {

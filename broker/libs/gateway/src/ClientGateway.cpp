@@ -7876,7 +7876,10 @@ bool ClientGateway::denyGroupRequest_(Session& session, uint16_t tid, const uint
                 for (const auto& e : m->entries) { if (d) break; d = topic(e.topicId); }
             }
             break;
-        default: break;   // LeaveGroup: nothing (D18); an undecodable body is the service's InvalidRequest
+        case pc::TemplateId::LeaveGroup:   // issue #123: READ on the group, like every other group request
+            if (const auto m = pc::LeaveGroup::decode(buf, len)) d = group(m->groupId);
+            break;
+        default: break;   // an undecodable body is the service's InvalidRequest
     }
     return deny_(session, d, buf, len);
 }

@@ -155,12 +155,46 @@ public:
         const auto a = c().offsetFetch(ch(), stream(), sid, group, topicId, 0);
         return a ? a->second : kNoAnswer;
     }
-    int leaveGroup(int64_t sid, const std::string& group) {
+    int leaveGroup(int64_t sid, const std::string& group, const std::string& member = "nobody") {
         pc::LeaveGroup m;
         m.sessionId = sid; m.correlationId = c().nextCorrelationId();
-        const std::string member = "nobody";   // outlives the encode: the message holds views
+        m.groupId = bytes(group); m.memberId = bytes(member);   // `member` outlives the encode: the message holds views
+        return rawCode(sendRaw(m, 512, m.correlationId));
+    }
+    // ── member-scoped group requests (issues #123 / #124) ──────────────────────────────────────────────────
+    /// Join as a new member and re-join once: a lone member reaches Stable.  Returns (member, generation).
+    std::pair<std::string, int32_t> joinStable(int64_t sid, const std::string& group, std::vector<int32_t> topics) {
+        const auto a = c().joinGroup(ch(), stream(), sid, group, {}, topics);
+        if (!a || a->errorCode != 0) return {{}, -1};
+        const auto b = c().joinGroup(ch(), stream(), sid, group, a->memberId, topics);
+        if (!b || b->errorCode != 0) return {{}, -1};
+        return {b->memberId, b->generation};
+    }
+    /// JoinGroup naming `member`: (errorCode, the member id answered).
+    std::pair<int, std::string> rejoin(int64_t sid, const std::string& group, const std::string& member,
+                                       std::vector<int32_t> topics) {
+        const auto a = c().joinGroup(ch(), stream(), sid, group, member, std::move(topics));
+        return a ? std::pair<int, std::string>{a->errorCode, a->memberId} : std::pair<int, std::string>{kNoAnswer, {}};
+    }
+    int heartbeatAt(int64_t sid, const std::string& group, const std::string& member, int32_t gen) {
+        const auto a = c().heartbeat(ch(), stream(), sid, group, member, gen);
+        return a ? *a : kNoAnswer;
+    }
+    int syncGroup(int64_t sid, const std::string& group, const std::string& member, int32_t gen) {
+        pc::SyncGroup m;
+        m.sessionId = sid; m.correlationId = c().nextCorrelationId(); m.generationId = gen;
         m.groupId = bytes(group); m.memberId = bytes(member);
-        return rawCode(sendRaw(m, 128, m.correlationId));
+        return rawCode(sendRaw(m, 512, m.correlationId));
+    }
+    int commitAs(int64_t sid, const std::string& group, const std::string& member, int32_t gen, int32_t topicId,
+                 int64_t offset) {
+        const auto a = c().offsetCommit(ch(), stream(), sid, group, member, gen, topicId, 0, offset);
+        return a ? *a : kNoAnswer;
+    }
+    /// The committed offset of (topicId, 0) (or kNoAnswer).
+    int64_t committedOffset(int64_t sid, const std::string& group, int32_t topicId) {
+        const auto a = c().offsetFetch(ch(), stream(), sid, group, topicId, 0);
+        return a && a->second == 0 ? a->first : kNoAnswer;
     }
     int getTopicSchema(int64_t sid, const std::string& name) {
         const auto a = c().awaitSchema(c().sendGetTopicSchema(ch(), stream(), sid, name), dl());
@@ -284,6 +318,7 @@ private:
             case pc::TemplateId::TxnOffsetCommitResponse: { auto r = pc::TxnOffsetCommitResponse::decode(p, n); return r ? (r->results.empty() ? 0 : r->results[0].errorCode) : kNoAnswer; }
             case pc::TemplateId::EndTxnResponse: { auto r = pc::EndTxnResponse::decode(p, n); return r ? r->errorCode : kNoAnswer; }
             case pc::TemplateId::LeaveGroupResponse: { auto r = pc::LeaveGroupResponse::decode(p, n); return r ? r->errorCode : kNoAnswer; }
+            case pc::TemplateId::SyncGroupResponse: { auto r = pc::SyncGroupResponse::decode(p, n); return r ? r->errorCode : kNoAnswer; }
             case pc::TemplateId::ErrorResponse: { auto r = pc::ErrorResponse::decode(p, n); return r ? r->code : kNoAnswer; }
             default: return kNoAnswer;
         }

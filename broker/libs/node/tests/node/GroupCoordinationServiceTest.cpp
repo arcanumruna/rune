@@ -1687,3 +1687,172 @@ TEST_F(CG3ServiceTest, AppliedButNotPlacedTopicIsNotAssignedUntilPlacedRegressio
     EXPECT_EQ(counts.at("runtime"), 3);
     service_->setGateway(nullptr);
 }
+
+// ===========================================================================
+// Issues #123 / #124 / #169: a member id is bound to the session that obtained it.  Sync, Heartbeat, Leave and
+// OffsetCommit naming another session's member are answered exactly as for a member that does not exist
+// (UnknownMember), and change nothing.
+// ===========================================================================
+namespace {
+struct JoinedMember { std::string id; int32_t generation = -1; };
+}  // namespace
+
+class MemberBindingTest : public CG3ServiceTest {
+protected:
+    std::string memberOf(std::size_t outLen) {
+        const auto r = pc::JoinGroupResponse::decode(out_, outLen);
+        EXPECT_TRUE(r.has_value());
+        return r ? std::string(reinterpret_cast<const char*>(r->memberId.data()), r->memberId.size()) : std::string{};
+    }
+    /// Session `sid` joins `group` as a new member and the group reaches Stable with it alone.
+    JoinedMember joinStable(int64_t sid, const std::string& group) {
+        std::size_t n = service_->handleJoinGroup(req_, encodeJoinGroup(req_, sid, ++corr_, group, "", 5000), clock_,
+                                                  out_, kBufSize);
+        const std::string id = memberOf(n);
+        clock_ += kStep;
+        n = service_->handleJoinGroup(req_, encodeJoinGroup(req_, sid, ++corr_, group, id, 5000), clock_, out_, kBufSize);
+        EXPECT_EQ(memberOf(n), id);
+        EXPECT_TRUE(driveUntil([&] { return service_->coordinator(group).state() == GroupState::Stable; }, 10));
+        return {id, service_->coordinator(group).generationId()};
+    }
+    int16_t heartbeat(int64_t sid, const std::string& group, const std::string& member, int32_t gen) {
+        return decodeHBErrorCode(out_, service_->handleHeartbeat(req_, encodeHeartbeat(req_, sid, ++corr_, group, member, gen),
+                                                               clock_, out_, kBufSize));
+    }
+    int16_t sync(int64_t sid, const std::string& group, const std::string& member, int32_t gen) {
+        return decodeSyncErrorCode(out_, service_->handleSyncGroup(req_, encodeSyncGroup(req_, sid, ++corr_, group, member, gen),
+                                                                 clock_, out_, kBufSize));
+    }
+    int16_t leave(int64_t sid, const std::string& group, const std::string& member) {
+        return decodeLeaveErrorCode(out_, service_->handleLeaveGroup(req_, encodeLeaveGroup(req_, sid, ++corr_, group, member),
+                                                                   clock_, out_, kBufSize));
+    }
+    int16_t commit(int64_t sid, const std::string& group, const std::string& member, int32_t gen, int64_t offset) {
+        const std::size_t n = service_->handleOffsetCommit(
+            req_, encodeOffsetCommit(req_, sid, ++corr_, group, member, gen, kTestTopicId, 0, offset), clock_, out_, kBufSize);
+        const auto r = pc::OffsetCommitResponse::decode(out_, n);
+        return r && !r->results.empty() ? r->results[0].errorCode : int16_t{-1};
+    }
+    int64_t committed(const std::string& group) {
+        const std::size_t n = service_->handleOffsetFetch(req_, encodeOffsetFetch(req_, 1, ++corr_, group, kTestTopicId, 0),
+                                                          clock_, out_, kBufSize);
+        const auto r = pc::OffsetFetchResponse::decode(out_, n);
+        return r && !r->results.empty() ? r->results[0].offset : int64_t{-999};
+    }
+    static constexpr int16_t kUnknownMember = static_cast<int16_t>(pc::ErrorCode::UnknownMember);
+    static constexpr int16_t kOk            = static_cast<int16_t>(pc::ErrorCode::OK);
+    int64_t corr_ = 10'000;
+};
+
+TEST_F(MemberBindingTest, LeaveGroupOfAnotherSessionsMemberIsRefusedRegression) {
+    const JoinedMember m = joinStable(/*sid=*/1, "world-7");
+    EXPECT_EQ(leave(/*sid=*/2, "world-7", m.id), kUnknownMember) << "another session's member is not this session's to evict";
+    EXPECT_EQ(leave(2, "world-7", "world-7-no-such-member"), kUnknownMember) << "the same answer as a member that does not exist";
+    auto& gc = service_->coordinator("world-7");
+    EXPECT_EQ(gc.memberCount(), 1u);
+    EXPECT_EQ(gc.state(), GroupState::Stable) << "no rebalance";
+    EXPECT_EQ(gc.generationId(), m.generation);
+    EXPECT_EQ(heartbeat(1, "world-7", m.id, m.generation), kOk) << "the owner is still a member";
+    EXPECT_EQ(leave(1, "world-7", m.id), kOk) << "the owner itself may leave";
+    EXPECT_EQ(gc.memberCount(), 0u);
+}
+
+TEST_F(MemberBindingTest, SyncGroupOfAnotherSessionsMemberIsRefusedRegression) {
+    const JoinedMember m = joinStable(1, "g-sync");
+    EXPECT_EQ(sync(2, "g-sync", m.id, m.generation), kUnknownMember) << "another session's assignment is not handed out";
+    EXPECT_EQ(sync(2, "g-sync", "g-sync-no-such-member", m.generation), kUnknownMember);
+    EXPECT_EQ(sync(1, "g-sync", m.id, m.generation), kOk);
+}
+
+TEST_F(MemberBindingTest, HeartbeatOfAnotherSessionsMemberIsRefusedRegression) {
+    const JoinedMember m = joinStable(1, "g-hb");
+    EXPECT_EQ(heartbeat(2, "g-hb", m.id, m.generation), kUnknownMember);
+    EXPECT_EQ(heartbeat(2, "g-hb", "g-hb-no-such-member", m.generation), kUnknownMember);
+    // Only the foreign session heartbeats: the member is not kept alive by it and expires on its own timeout.
+    const int64_t until = clock_ + 6'000 * kStep;
+    while (clock_ < until) {
+        clock_ += 100 * kStep;
+        (void)heartbeat(2, "g-hb", m.id, m.generation);
+        service_->doWork(clock_);
+    }
+    EXPECT_EQ(service_->coordinator("g-hb").memberCount(), 0u) << "a foreign heartbeat refreshed the member";
+}
+
+TEST_F(MemberBindingTest, OffsetCommitOfAnotherSessionsMemberIsRefusedRegression) {
+    const JoinedMember m = joinStable(1, "g-commit");
+    ASSERT_EQ(commit(1, "g-commit", m.id, m.generation, 100), kOk);
+    EXPECT_EQ(commit(2, "g-commit", m.id, m.generation, 500), kUnknownMember);
+    EXPECT_EQ(commit(2, "g-commit", "g-commit-no-such-member", m.generation, 500), kUnknownMember);
+    EXPECT_EQ(committed("g-commit"), 100) << "the foreign commit moved the group's position";
+}
+
+TEST_F(MemberBindingTest, JoinGroupWithAnotherSessionsMemberIdIsRefusedRegression) {
+    const JoinedMember m = joinStable(1, "g-rejoin");
+    // Without a gateway every session is the same (anonymous) principal; a different principal is covered in
+    // AuthEnforcementTest.  Here: an unknown member id never names a member - it gets a fresh one.
+    const std::size_t n = service_->handleJoinGroup(
+        req_, encodeJoinGroup(req_, 2, ++corr_, "g-rejoin", "g-rejoin-chosen-by-the-client", 5000), clock_, out_, kBufSize);
+    const std::string got = memberOf(n);
+    EXPECT_NE(got, "g-rejoin-chosen-by-the-client") << "a client-chosen id is never adopted";
+    EXPECT_NE(got, m.id);
+    EXPECT_FALSE(got.empty());
+}
+
+// Issue #169: generations restart with the coordinator; a commit from a member of the previous coordinator that
+// carries a generation number the new one reuses is refused (the member id is checked, not only the generation).
+TEST_F(MemberBindingTest, OffsetCommitFromAPreRestartMemberIsRefusedRegression) {
+    const JoinedMember old = joinStable(1, "g-restart");
+    ASSERT_EQ(commit(1, "g-restart", old.id, old.generation, 100), kOk);
+    ASSERT_TRUE(pumpHW(1));
+
+    // Restart the coordinator over the same replicated offsets.
+    service_ = std::make_unique<GroupCoordinationService>(store_.get(), registry_.get(), [this] { return isLeader_; },
+                                                          [this] { return leaderNodeId_; });
+    service_->doWork(clock_);
+    ASSERT_EQ(committed("g-restart"), 100);
+    const JoinedMember fresh = joinStable(3, "g-restart");
+    ASSERT_EQ(fresh.generation, old.generation) << "precondition: the new coordinator reuses the generation number";
+
+    EXPECT_EQ(commit(1, "g-restart", old.id, old.generation, 500), kUnknownMember);
+    EXPECT_EQ(commit(3, "g-restart", old.id, old.generation, 500), kUnknownMember) << "the old id, even on a live session";
+    EXPECT_EQ(committed("g-restart"), 100) << "a pre-restart member's late commit moved the position";
+    EXPECT_EQ(commit(3, "g-restart", fresh.id, fresh.generation, 200), kOk);
+}
+
+// Issue #124 (principal binding): sessions 1 and 3 are user 7, session 2 is user 8.  User 8 naming user 7's member
+// in a JoinGroup gets a new member of its own; user 7 re-joining from a new session (a reconnect) takes its member
+// over, and the old session no longer owns it.
+namespace {
+uint64_t principalBySession(void*, int64_t sid) noexcept { return sid == 2 ? 8 : 7; }
+}  // namespace
+
+TEST_F(MemberBindingTest, JoinGroupWithAnotherPrincipalsMemberIdJoinsANewMemberRegression) {
+    service_->setPrincipalResolverForTest(&principalBySession, nullptr);
+    const JoinedMember m = joinStable(/*sid=*/1, "g-principal");
+    const std::string foreign = memberOf(service_->handleJoinGroup(
+        req_, encodeJoinGroup(req_, /*sid=*/2, ++corr_, "g-principal", m.id, 5000), clock_, out_, kBufSize));
+    EXPECT_NE(foreign, m.id) << "another principal took over the member (and its assignment)";
+    EXPECT_FALSE(foreign.empty());
+    EXPECT_EQ(service_->coordinator("g-principal").memberCount(), 2u);
+
+    // Same principal, new session: a re-join of its own member.
+    const std::string again = memberOf(service_->handleJoinGroup(
+        req_, encodeJoinGroup(req_, /*sid=*/3, ++corr_, "g-principal", m.id, 5000), clock_, out_, kBufSize));
+    EXPECT_EQ(again, m.id) << "a reconnecting owner keeps its member";
+    const int32_t gen = service_->coordinator("g-principal").generationId();
+    EXPECT_EQ(heartbeat(1, "g-principal", m.id, gen), kUnknownMember) << "the old session no longer owns it";
+    EXPECT_NE(heartbeat(3, "g-principal", m.id, gen), kUnknownMember);
+}
+
+// The member-id table drops a member the coordinator removed on its own (session expiry): its id is unbound, so a
+// re-join naming it - even by the old owner's session - is a fresh member, and nothing accumulates.
+TEST_F(MemberBindingTest, ExpiredMemberLosesItsBindingRegression) {
+    const JoinedMember m = joinStable(1, "g-expire");
+    ASSERT_TRUE(driveUntil([&] { return service_->coordinator("g-expire").memberCount() == 0; }, 10'000));
+    EXPECT_EQ(heartbeat(1, "g-expire", m.id, m.generation), kUnknownMember);
+    EXPECT_EQ(commit(1, "g-expire", m.id, m.generation, 7), kUnknownMember);
+    EXPECT_EQ(leave(1, "g-expire", m.id), kUnknownMember);
+    const std::string next = memberOf(service_->handleJoinGroup(
+        req_, encodeJoinGroup(req_, 1, ++corr_, "g-expire", m.id, 5000), clock_, out_, kBufSize));
+    EXPECT_NE(next, m.id);
+}
