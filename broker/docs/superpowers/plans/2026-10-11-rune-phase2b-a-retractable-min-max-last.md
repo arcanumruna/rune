@@ -4,7 +4,7 @@
 
 > **Amended 2026-10-20 (user decision): contiguous per-group Min/Max value block.** Task 5's gate run failed on honest churn (record p99 21.2 µs, batch p99 25.1 µs; a ~100-contributor list walk costs ~21 µs at ~200 ns per hop). Spec §A (Storage, Maintenance, Persistence, Gates) is amended. The new **Task 5b** (after Task 5) adds a fourth aux table of fixed 32-entry chunk rows holding each group's Min/Max inputs densely, so a rescan is a sequential scan, not a list walk. It also moves the node's checkpoint/replay/pass cap onto the 4-table record and sets the bound to {5, 2, 2, 3} for Min/Max views. Tasks 6–9 are patched where the bound, layout or tests change. Architecture, Global Constraints, Review Focus, Interaction matrix and File Structure are updated to match. The MRU list, the O(1) head, Last-only views and 2a-only views are unchanged.
 
-> **Updated 2026-10-20 (plan refresh after D/B/F, monorepo)** — re-checked against the monorepo (`/Users/vradu/Projects/rune`, branch `feat/phase2b-a-retractable-min-max-last`, cut from main `a739aab5`) by the Part A preflight (`.superpowers/sdd/2026-10-11-rune-phase2b-a-retractable-min-max-last/preflight.md`; the controller accepted every ruling). Changes:
+> **Updated 2026-10-20 (plan refresh after D/B/F, monorepo)** — re-checked against the monorepo (branch `feat/phase2b-a-retractable-min-max-last`, cut from main `a739aab5`) by the Part A preflight (`.superpowers/sdd/2026-10-11-rune-phase2b-a-retractable-min-max-last/preflight.md`; the controller accepted every ruling). Changes:
 > 1. **Monorepo paths:** one repo, one branch. Every path is relative to the repo root: `libs/…` is `broker/libs/…`, `rune-client-cpp/…` is `client-cpp/…`, `docker/…` is `broker/docker/…`, `benchmark/…` is `broker/benchmark/…`, `../rune-codec` is `codec`. The two-repo branch cut and the two-repo commits are gone.
 > 2. **Build dirs and commands:** `build-fast` is `build/root`; `build-bench-rel` is `build/rel` (binary `build/rel/broker/rune_broker_benchmark`; `build/bench-rel` is the client's); `rune-client-cpp/build` is `build/sub-client-cpp`; CatalogGolden runs in `build/sub-codec`. No ASan/TSan builds exist, so the controller runs the sanitizers once at the Phase 2b close. Per-task test runs are affected-area only (F13).
 > 3. **Stale line hints fixed (S7–S11):** client CMake `1046–1051`; `broker/libs/view/CMakeLists.txt:21–26` (`PlanSourcesTest.cpp` now follows `AggFoldTest.cpp`, so the closing `)` stays where it is); `view_probe.cpp` setup call 1275–1276 and verify block 1456–1465; e2e banner `view-engine-e2e.sh:583–584`. Task 7 also builds `rune_get_view_row_tests` and `rune_create_view_tests` (S9). The VM e2e stages the monorepo plus a sibling `flight-recorder` (S12) and is controller-run.
@@ -32,7 +32,7 @@
 
 ## Execution context
 
-- **Repo:** the monorepo at `/Users/vradu/Projects/rune` (the repo root; run every command below from it). Part A touches `broker/...` and `client-cpp/...`, and uses `codec/...` only for the CatalogGolden proof. Every path in this plan is relative to the repo root.
+- **Repo:** the monorepo (the repo root; run every command below from it). Part A touches `broker/...` and `client-cpp/...`, and uses `codec/...` only for the CatalogGolden proof. Every path in this plan is relative to the repo root.
 - **Branch:** `feat/phase2b-a-retractable-min-max-last` is already cut from main `a739aab5` (D, B and F are merged). There is no branch to create. Verify the preconditions (catalog history is in): `grep -n uninstallView broker/libs/node/src/WorkerViewSet.cpp` (2 hits) and `grep -n kCatalogTopicId broker/libs/node/include/rune/node/CatalogPartition.h` (3 hits).
 - **Builds (all already configured):**
   - `build/root`: broker plus client/ql/codec/crypto sources (Ninja, Debug, `BUILD_TESTING=ON`). `cmake --build build/root -j14 --target <t>` and `ctest --test-dir build/root -R <filter> -j14 --output-on-failure`. Targets: `rune_view_tests` (`broker/libs/view/CMakeLists.txt:21`), `rune_node_tests` (`broker/libs/node/CMakeLists.txt:154`), `rune_get_view_row_tests` (`:705`), `rune_create_view_tests` (`:639`).
@@ -4223,8 +4223,8 @@ Aggregate views can now maintain `Min`, `Max`, `Last` and `LastNonNull`, exact u
 - [ ] **Step 7: Run the e2e on the VM (controller-run).** This is a controller checkpoint (k3s VM, `/root/vm.lock`); the implementer stops after Step 8's builds and tests. The controller stages the monorepo **and** a sibling `flight-recorder`, then runs the script under the lock:
 
 ```bash
-rsync -a --delete --exclude build/ --exclude .git/ /Users/vradu/Projects/rune/ root@$RUNE_VM_HOST:/root/mono/rune/
-rsync -a --delete /Users/vradu/Projects/flight-recorder/ root@$RUNE_VM_HOST:/root/mono/flight-recorder/
+rsync -a --delete --exclude build/ --exclude .git/ "$RUNE_ROOT"/ root@$RUNE_VM_HOST:/root/mono/rune/
+rsync -a --delete "$FLIGHT_RECORDER_ROOT"/ root@$RUNE_VM_HOST:/root/mono/flight-recorder/
 ssh root@$RUNE_VM_HOST 'flock -w 7200 /root/vm.lock bash /root/mono/rune/broker/docker/view-engine-e2e.sh'
 ```
 
