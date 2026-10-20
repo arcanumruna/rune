@@ -277,7 +277,8 @@ done
 
 log "Step 1h: building eos_probe against the header 'rune schema generate eos_out' writes..."
 tx mkdir -p /tmp/eos-gen
-txt "${OP_TIMEOUT_S}" rune schema generate eos_out --out /tmp/eos-gen --broker "rune-1:${BROKER_PORT}" --cli-data-dir /tmp/cli_eos_gen || fail "step 1h: rune schema generate eos_out"
+txt "${OP_TIMEOUT_S}" rune schema generate eos_out --out /tmp/eos-gen --broker "aeron:udp?endpoint=rune-1:${BROKER_PORT}" \
+    --cli-egress "aeron:udp?endpoint=${TOOLS}:${EGRESS_BASE}" --cli-data-dir /tmp/cli_eos_gen || fail "step 1h: rune schema generate eos_out"
 tx test -s /tmp/eos-gen/eos_out.gen.h || fail "step 1h: /tmp/eos-gen/eos_out.gen.h was not written"
 set +e
 out=$(tx sh -c 'cmake -S /build -B /build/build -DEOS_GEN_DIR=/tmp/eos-gen >/dev/null && cmake --build /build/build --target eos_probe -j2' 2>&1); rc=$?
