@@ -1407,7 +1407,7 @@ TEST(WorkerViewSetRegression, RestartThenRetractingTheMaxIsExactRegression) {
     ASSERT_EQ(deltas.size(), 1u);
     uint32_t magic; std::memcpy(&magic, deltas[0].data(), 4);
     EXPECT_EQ(magic, rune::view::kViewCheckpointMagicV2) << "no new format: still the v2 record";
-    EXPECT_EQ(deltas[0][12], 4u) << "a Min/Max view's record carries four tables (value blocks = id 3)";
+    EXPECT_EQ(deltas[0][rune::view::kCheckpointV2HeaderBytes - 1], 4u) << "a Min/Max view's record carries four tables (value blocks = id 3)";
 
     rune::node::ViewSnapshotChannel ch2;
     rune::node::WorkerViewSet vs2(ch2, tmpDir("rune-views-max-rec"));
@@ -1435,27 +1435,35 @@ TEST(WorkerViewSetRegression, RestartThenRetractingTheMaxIsExactRegression) {
     EXPECT_EQ(fc->aggRescans, 1u) << "the post-restart retraction rescanned once (counter surfaced, Task 5 review item 2)";
 }
 
-// REGRESSION (Review Focus #3): a stream of GROUP MOVES that dirty 10 DISTINCT
-// entries each (no coalescing across records: every move touches its own groups,
-// neighbours, target head and two value-block chunks; the middle contributor's
-// swap partner is its own predecessor) -- 4 contributor + 2 group + 2 view + 2
-// block rows, 1674 B. Under a bound without the block rows ({4,2,2,0}: 560 B per
-// record, ~233 records per pass) a pass of move records would claim up to ~390 KB,
-// the first pass over the 128 KiB delta-ring max message THROWS on the worker; under Task 5b's bound
-// ({5,2,2,3}: 2289 B, 57 records per pass) every delta fits and the result is exact.
+// REGRESSION (Review Focus #3, fix round 1): the TRUE worst-case move stream.
+// Each of kG source groups S is built to 65 entries (3 chunks), 16 of them are
+// moved out to a sink group (49 left: chunk 2 is the spare, tail holds 17), the
+// list is reordered so contributor 1 (position 0) sits between 2 and 3 while the
+// last-position entry 49 is NOT its neighbour, and the target group T already
+// has a head.  The final move 1: S -> T then dirties 5 contributor rows (1, its
+// two neighbours, T's old head, the swapped-in 49), 2 group rows, 2 view rows and
+// 3 block rows (S's hole chunk, S's FREED spare, T's chunk) = exactly the
+// {5,2,2,3} bound.  Moves are last in the stream and touch distinct groups, so
+// every pass of moves is full-size.  Under an undercounted block term ({5,2,2,2})
+// the per-pass cap lets a full pass of these moves overflow the ring max message
+// and the worker THROWS; the assertions below prove the worst case is present.
 TEST(WorkerViewSetRegression, PersistedRetractableMovesDeltasFitTheRingRegression) {
     const auto src = orderSrc();
     const rune::codec::Descriptor* srcs[] = {&src};
     auto comp = rune::view::compileView(userMaxPlan(0), srcs, 0x4000000C).value();
-    constexpr int64_t kG = 1000;
+    const auto agg = rune::view::buildAggLayout(comp.plan, src).value();
+    constexpr int64_t kG = 130;
+    auto cid = [](int64_t g, int64_t k) { return (g + 1) * 1000 + k; };
     std::vector<std::array<int64_t, 3>> recs;
-    // Source groups g: contributors 3g+1, 3g+2, 3g+3 (list 3g+3 -> 3g+2 -> 3g+1).
-    for (int64_t g = 0; g < kG; ++g)
-        for (int64_t j = 1; j <= 3; ++j) recs.push_back({3 * g + j, g, 3 * g + j});
-    // Target groups kG+g: one contributor 100000+g each (the head a move links before).
-    for (int64_t g = 0; g < kG; ++g) recs.push_back({100000 + g, kG + g, 100000 + g});
-    // Moves: middle contributor 3g+2 (prev 3g+3, next 3g+1) -> group kG+g, amount 0.
-    for (int64_t g = 0; g < kG; ++g) recs.push_back({3 * g + 2, kG + g, 0});
+    for (int64_t g = 0; g < kG; ++g) recs.push_back({500000 + g, kG + g, 7});          // T's head
+    for (int64_t g = 0; g < kG; ++g) {
+        for (int64_t k = 1; k <= 65; ++k) recs.push_back({cid(g, k), g, k});            // S: 3 chunks
+        for (int64_t k = 65; k >= 50; --k) recs.push_back({cid(g, k), 2 * kG + g, k});  // out to the sink
+        recs.push_back({cid(g, 3), g, 3});                                              // S list: 2 -> 1 -> 3 -> 49 ...
+        recs.push_back({cid(g, 1), g, 1});
+        recs.push_back({cid(g, 2), g, 2});
+    }
+    for (int64_t g = 0; g < kG; ++g) recs.push_back({cid(g, 1), kG + g, 50});          // the worst-case move
     const int64_t total = static_cast<int64_t>(recs.size());
     const auto batch = orderBatch(0, recs);
     auto rr = [&](int64_t, int64_t) {
@@ -1467,20 +1475,47 @@ TEST(WorkerViewSetRegression, PersistedRetractableMovesDeltasFitTheRingRegressio
     vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true);
     std::vector<std::vector<uint8_t>> deltas;
     ASSERT_NO_THROW(driveToEnd(vs, ch, 6, rr, total, deltas));
-    EXPECT_GT(deltas.size(), 1u) << "the range must have been split across capped passes";
+
+    // Largest delta vs the ring budget and vs the undercounted {5,2,2,2} estimate.
+    using namespace rune::view;
+    const auto b = aggDirtyBoundPerRecord(agg);
+    ASSERT_EQ(b.blockRows, 3u);
+    auto perRecord = [&](uint32_t blockRows) {
+        return b.contributorRows * (kCheckpointEntryHeaderBytes + agg.contributorRow.rowLen) +
+               b.groupRows * (kCheckpointEntryHeaderBytes + agg.groupRow.rowLen) +
+               b.viewRows * (kCheckpointEntryHeaderBytes + comp.rowLayout.rowLen) +
+               blockRows * (kCheckpointEntryHeaderBytes + agg.blockRow.rowLen);
+    };
+    const std::size_t recFixed = kCheckpointV2HeaderBytes + 4 * kCheckpointV2TableHeaderBytes + kCheckpointCrcBytes;
+    const std::size_t budget = static_cast<std::size_t>(ch.deltas.maxMsgLength()) -
+                               rune::node::ViewSnapshotChannel::kDeltaHeaderBytes;
+    const std::size_t perReal = perRecord(b.blockRows);
+    const std::size_t recsPerPass = (budget - recFixed) / perReal;
+    std::size_t maxDelta = 0;
+    for (const auto& d : deltas) maxDelta = std::max(maxDelta, d.size());
+    std::printf("[ worst-case ] largest delta %zu B of %zu B budget; %zu recs/pass; measured %zu B/record (bound %zu, undercounted %zu)\n",
+                maxDelta, budget, recsPerPass, (maxDelta - recFixed) / recsPerPass, perReal, perRecord(b.blockRows - 1));
+    EXPECT_LE(maxDelta, budget) << "every delta fits the ring max message";
+    EXPECT_GT(maxDelta, recFixed + recsPerPass * perRecord(b.blockRows - 1))
+        << "the stream really reaches the block term: a 2-block-row bound could not hold this pass";
+    // The freed spare is an ERASE entry (header only, no row payload), so the
+    // worst real record is 5/2/2 rows + 2 chunk upserts + 1 chunk erase: the
+    // bound's third block row is a conservative byte over-count by one payload.
+    EXPECT_EQ((maxDelta - recFixed) / recsPerPass, perRecord(b.blockRows - 1) + kCheckpointEntryHeaderBytes)
+        << "full passes carry 5 contributor + 2 group + 2 view rows, 2 chunk puts and the spare's erase";
 
     const rune::view::RowLayout* L = nullptr;
-    for (int64_t g = 0; g < kG; g += 97) {
-        const uint8_t* src_ = vs.getRow(0x4000000C, 0, uint64_t(g), L);
-        ASSERT_NE(src_, nullptr) << "group " << g;
-        EXPECT_EQ(rune::view::readSlot(src_, *L, 1).i, 2) << "group " << g;
-        EXPECT_EQ(rune::view::readSlot(src_, *L, 2).i, 3 * g + 3) << "group " << g;
-        EXPECT_EQ(rune::view::readSlot(src_, *L, 3).i, 3 * g + 3) << "group " << g;
-        const uint8_t* dst = vs.getRow(0x4000000C, 0, uint64_t(kG + g), L);
-        ASSERT_NE(dst, nullptr) << "group " << kG + g;
-        EXPECT_EQ(rune::view::readSlot(dst, *L, 1).i, 2);
-        EXPECT_EQ(rune::view::readSlot(dst, *L, 2).i, 100000 + g);
-        EXPECT_EQ(rune::view::readSlot(dst, *L, 3).i, 0) << "the moved contributor is the newest";
+    for (int64_t g = 0; g < kG; g += 13) {
+        const uint8_t* s = vs.getRow(0x4000000C, 0, uint64_t(g), L);
+        ASSERT_NE(s, nullptr) << "group " << g;
+        EXPECT_EQ(rune::view::readSlot(s, *L, 1).i, 48) << "group " << g;
+        EXPECT_EQ(rune::view::readSlot(s, *L, 2).i, 49) << "group " << g;
+        EXPECT_EQ(rune::view::readSlot(s, *L, 3).i, 2) << "group " << g << ": newest remaining";
+        const uint8_t* t = vs.getRow(0x4000000C, 0, uint64_t(kG + g), L);
+        ASSERT_NE(t, nullptr) << "group " << kG + g;
+        EXPECT_EQ(rune::view::readSlot(t, *L, 1).i, 2);
+        EXPECT_EQ(rune::view::readSlot(t, *L, 2).i, 50);
+        EXPECT_EQ(rune::view::readSlot(t, *L, 3).i, 50) << "the moved contributor is the newest";
     }
     const rune::node::ViewFoldCounters* fc = vs.foldCounters(0x4000000C, 0);
     ASSERT_NE(fc, nullptr);
