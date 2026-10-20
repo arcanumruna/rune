@@ -142,7 +142,7 @@ struct FilterScratch {
 class FilterGroup {
 public:
     /// Cold.  `sourceId` is opaque: the Worker passes the registry id plus the incarnation of the scan source.
-    void init(int32_t topicId, int32_t partition, uint8_t /*isolation: read_committed comes from the source*/, const FilterConfig& cfg, uint64_t sourceId) {
+    void init(int32_t topicId, int32_t partition, const FilterConfig& cfg, uint64_t sourceId) {
         topicId_ = topicId; partition_ = partition; cfg_ = cfg; sourceId_ = sourceId;
         nodes_.clear();
         nodes_.resize(kSentinels);

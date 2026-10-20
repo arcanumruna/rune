@@ -81,7 +81,7 @@ struct Rig {
     int64_t now = kT0;
 
     explicit Rig(FilterConfig c = {}, uint16_t schemaVersion = 3) : cfg(c), schema(playerSchema(schemaVersion)) {
-        g.init(1, 0, 0, cfg, kSrc);
+        g.init(1, 0, cfg, kSrc);
         sc.reserve(cfg, 256);
     }
     uint32_t add(uint32_t sub, CompiledFilter f) { return g.add(sub, std::move(f), schema, kSrc); }
@@ -527,7 +527,7 @@ TEST(FilterGroupRegression, NinthDistinctIndexFieldIsRefusedRegression) {
     for (uint16_t t = 0; t < 9; ++t) db.addTagged("f" + std::to_string(t), t, PrimType::UInt32, 1, 0xFFFF, t == 0, {});
     const FilterSchema schema = FilterSchema::build(db.build(), 1);
     FilterGroup g;
-    g.init(1, 0, 0, FilterConfig{}, kSrc);
+    g.init(1, 0, FilterConfig{}, kSrc);
     for (uint16_t t = 0; t < 9; ++t) {
         auto f = mk(schema, [&](FilterWriter& w) { w.term(t, PrimType::UInt32, 4, Match<uint32_t>(1u)); });
         const uint32_t m = g.add(t, std::move(f), schema, kSrc);
@@ -836,7 +836,7 @@ TEST(FilterGroupRegression, IndexFieldSlotIsReusedAfterItsLastMemberLeavesRegres
     for (uint16_t t = 0; t < 12; ++t) db.addTagged("f" + std::to_string(t), t, PrimType::UInt32, 1, 0xFFFF, t == 0, {});
     const FilterSchema schema = FilterSchema::build(db.build(), 1);
     FilterGroup g;
-    g.init(1, 0, 0, FilterConfig{}, kSrc);
+    g.init(1, 0, FilterConfig{}, kSrc);
     auto on = [&](uint16_t t, uint32_t v) {
         return mk(schema, [&](FilterWriter& w) { w.term(t, PrimType::UInt32, 4, Match<uint32_t>(v)); });
     };

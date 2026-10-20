@@ -76,6 +76,7 @@
 #include <rune/node/SessionAckSink.h>
 #include <rune/node/UnauthLogLimiter.h>
 #include <limits>
+#include <map>
 #include <rune/node/WorkerOp.h>
 #include <rune/node/detail/NoTypeErasure.h>
 #include <rune/node/WorkerReturnCodec.h>
@@ -110,6 +111,9 @@
 #include <rune/protocol/client/Protocol.h>  // E5.1.3: pc::ErrorCode enum (replaces magic literals)
 #include <rune/codec/Validator.h>
 #include <rune/codec/Serialize.h>
+#include <rune/codec/FilterPredicate.h>   // Phase 2c: CompiledFilter
+#include <rune/codec/FilterSchema.h>
+#include <rune/node/filter/FilterGroup.h>
 
 #include <algorithm>
 #include <array>
@@ -858,6 +862,10 @@ public:
     // and the metadata needed to read + encode + push (I3).  This table is touched
     // ONLY by the worker thread — no locks, no atomics, no cross-thread mutation.
     // -----------------------------------------------------------------------
+    /// Phase 2c: a subscription is either served by the unfiltered push pass (pushOwnedSubscriptions_) or is a member of
+    /// a FilterGroup (pushFilteredGroups_).  A state, not a flag: the filtered pass owns its cursor while it is InSync.
+    struct SubUnfiltered {};
+    struct SubFiltered { uint32_t group = filter::kNil; uint32_t member = filter::kNil; };
     struct WorkerSubscription {
         int64_t subscriptionId       = 0;
         int64_t sessionId            = 0;
@@ -898,6 +906,9 @@ public:
         /// start (no push pass has served it yet) — a transient ring start above
         /// it is not a reader that fell behind (see skipEvictedCursor_).
         bool cursorFresh = true;
+        /// Phase 2c: SubFiltered = a member of filterGroups_[group] (its cursor is the group's while InSync: read it
+        /// through FilterGroup::cursorOf, never `nextOffset` directly).
+        std::variant<SubUnfiltered, SubFiltered> filter = SubUnfiltered{};
     };
 
     // -----------------------------------------------------------------------
@@ -952,6 +963,62 @@ public:
     [[nodiscard]] const std::vector<WorkerSubscription>& subscriptionsForTest() const noexcept {
         return subs_;
     }
+    // ---- Phase 2c: subscription filters (worker thread only; the ForTest accessors are for single-threaded tests) ----
+    /// Before the runner starts, and before the first filtered Subscribe (groups copy it when created).
+    void setFilterConfig(const filter::FilterConfig& cfg) noexcept { filterCfg_ = cfg; }
+    /// Sum over groups and members: the members' own counters plus the group-level counters that no member carries
+    /// (scan-side exclusions, overflow, refusals).  Counters of departed members and groups are gone with them.
+    [[nodiscard]] filter::FilterCounters filterCountersForTest() const noexcept {
+        filter::FilterCounters t;
+        for (std::size_t gi = 0; gi < filterGroups_.size(); ++gi) {
+            if (filterGroups_[gi].empty()) continue;
+            const auto& g = filterGroups_[gi].groupCounters();
+            t.unknownVersionExcluded += g.unknownVersionExcluded; t.nullValueExcluded += g.nullValueExcluded;
+            t.malformed += g.malformed; t.overflowBatches += g.overflowBatches; t.overCap += g.overCap;
+            t.sourceRefused += g.sourceRefused;
+        }
+        for (const auto& s : subs_) {
+            const auto* f = std::get_if<SubFiltered>(&s.filter);
+            if (f == nullptr) continue;
+            const auto m = filterGroups_[f->group].countersOf(f->member);
+            t.zeroCopy += m.zeroCopy; t.rebuilt += m.rebuilt; t.notes += m.notes; t.absentExcluded += m.absentExcluded;
+            t.unknownVersionExcluded += m.unknownVersionExcluded; t.nullValueExcluded += m.nullValueExcluded;
+            t.malformed += m.malformed; t.fellBehind += m.fellBehind; t.rejoined += m.rejoined;
+        }
+        return t;
+    }
+    /// The newest live group of (topic, partition, isolation); nullptr when there is none.
+    [[nodiscard]] const filter::FilterGroup* filterGroupForTest(int32_t topicId, int32_t partition, uint8_t isolation) const noexcept {
+        const filter::FilterGroup* best = nullptr;
+        for (const auto& [k, gi] : filterGroupByKey_)
+            if (k.topicId == topicId && k.partition == partition && k.isolation == isolation) best = &filterGroups_[gi];
+        return best;
+    }
+    [[nodiscard]] const filter::FilterGroup* filterGroupOfSubForTest(int64_t subscriptionId) const noexcept {
+        for (const auto& s : subs_)
+            if (s.subscriptionId == subscriptionId)
+                if (const auto* f = std::get_if<SubFiltered>(&s.filter)) return &filterGroups_[f->group];
+        return nullptr;
+    }
+    [[nodiscard]] std::size_t filterGroupCountForTest() const noexcept { return filterGroupByKey_.size(); }
+    [[nodiscard]] uint64_t filterBindFailuresForTest() const noexcept { return filterBindFailures_; }
+    [[nodiscard]] uint64_t filterSchemaErrorsForTest() const noexcept { return filterSchemaErrors_; }
+    /// The subscription's true position: a filtered InSync member's cursor lives in its group.
+    [[nodiscard]] int64_t subscriptionPositionForTest(int64_t subscriptionId) const noexcept {
+        for (const auto& s : subs_) if (s.subscriptionId == subscriptionId) return positionOf_(s);
+        return -1;
+    }
+    /// What the group's source returns for read(from, cap) on this subscription (bytes); 0 when not servable.
+    [[nodiscard]] std::size_t filterSourceReadBytesForTest(int64_t subscriptionId, int64_t from, std::size_t cap) {
+        for (auto& s : subs_) {
+            if (s.subscriptionId != subscriptionId) continue;
+            FilterSourceImpl src(*this, s);
+            if (src.bound() < 0) return 0;
+            return src.read(from, cap).size();
+        }
+        return 0;
+    }
+
     /// Test-only: release ops (record-egress retire-on-ack) executed.
     [[nodiscard]] uint64_t egressReleasesForTest() const noexcept { return egressReleases_; }
 
@@ -1143,6 +1210,14 @@ public:
             tailSrc  = reinterpret_cast<const uint8_t*>(op.ownedSet.data());
             tailLen  = op.ownedSet.size() * sizeof(uintptr_t);
             break;
+        case WorkerOp::Type::Subscribe:
+            if (!op.filterBytes.empty()) [[unlikely]] {   // Phase 2c: the client's filter rides as the tail
+                tailKind = sbe::TailKind::Value::FILTER;
+                tailSrc  = op.filterBytes.data();
+                tailLen  = op.filterBytes.size();
+            }
+            break;
+        case WorkerOp::Type::FilterSchema:   // Phase 2c: the evolving descriptor blob, like SchemaUpdate
         case WorkerOp::Type::SchemaUpdate:
             // Task 7: descriptor blob carried as the variable tail.
             // topicId is already encoded in the scalar field.
@@ -1753,7 +1828,7 @@ public:
         // AND a WorkerEgress is wired (pre-I3b: gateway still owns push → inert).
         {
             FLIGHT_RECORDER_SLOW_SPAN_RUNTIME(flight_recorder::Site::WorkerEgressPushStage, static_cast<uint32_t>(workerId_));
-            work += pushOwnedSubscriptions_(nowNs);
+            work += pushSubscriptions_(nowNs);
         }
 
         // Step 6.5: drain cleaner/retention/staging queues (disk-backed only).
@@ -1872,7 +1947,7 @@ private:
         // Cold tail: consumer egress push, cleaner drains, time-gated log sync.
         {
             FLIGHT_RECORDER_SLOW_SPAN_RUNTIME(flight_recorder::Site::ShStageColdTail, frW);
-            work += pushOwnedSubscriptions_(nowNs);
+            work += pushSubscriptions_(nowNs);
             for (auto& slot : slots_) {
                 if (!cleanerSwapsDeferred_(slot.replica)) work += slot.replica->drainCleanerSwapsOnOwner();   // D3b
                 work += slot.replica->drainRetentionDeletesOnOwner();
@@ -2513,6 +2588,10 @@ private:
         case WorkerOp::Type::SchemaUpdate:
             executeSchemaUpdateWire_(op);
             break;
+        // Phase 2c: control -> every worker, cold: a typed topic's filter schema (shared-nothing, like SchemaUpdate).
+        case WorkerOp::Type::FilterSchema:
+            executeFilterSchemaWire_(op);
+            break;
         // F1: TEST-ONLY owner-thread hook — cold branch, never sent by production.
         case WorkerOp::Type::TestTask:
             executeTestTaskWire_(op);
@@ -2702,8 +2781,18 @@ private:
     // -------------------------------------------------------------------
     void executeSubscribeWire_(sbe::WorkerOp& op) {
         const int64_t subId = op.subscriptionId();
-        for (auto& s : subs_) {
+        // Phase 2c: a filter tail binds the subscription to its FilterGroup (cold; the tail is read before any other
+        // access of the op's var data).  No tail = an unfiltered subscription, byte for byte the pre-2c path.
+        const bool hasFilter = op.tailKind() == sbe::TailKind::Value::FILTER;
+        std::span<const uint8_t> filterTail;
+        if (hasFilter) [[unlikely]] {
+            const std::uint32_t n = op.tailLength();
+            filterTail = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(op.tail()), n);
+        }
+        for (std::size_t si = 0; si < subs_.size(); ++si) {
+            auto& s = subs_[si];
             if (s.subscriptionId == subId) {
+                if (!std::holds_alternative<SubUnfiltered>(s.filter)) [[unlikely]] unbindFilter_(si);   // re-Subscribe: drop the old member first
                 s.sessionId            = op.sessionId();
                 s.subscribeCorrId      = op.correlationId();
                 s.topicId              = op.topicId();
@@ -2720,6 +2809,7 @@ private:
                 s.active               = true;   // re-subscribe (passed the guard) re-activates
                 s.rc                   = rcOf_(subReplica_(s));
                 s.cursorFresh          = true;   // M2: a requested cursor again (rewind / re-seed)
+                if (hasFilter) [[unlikely]] bindFilter_(si, filterTail);
                 return;
             }
         }
@@ -2740,6 +2830,7 @@ private:
         s.incarnation          = op.incarnation();
         s.rc                   = rcOf_(subReplica_(s));
         subs_.push_back(s);
+        if (hasFilter) [[unlikely]] bindFilter_(subs_.size() - 1, filterTail);
     }
 
     // -------------------------------------------------------------------
@@ -2751,8 +2842,7 @@ private:
         const int64_t subId = op.subscriptionId();
         for (std::size_t i = 0; i < subs_.size(); ++i) {
             if (subs_[i].subscriptionId == subId) {
-                subs_[i] = subs_.back();
-                subs_.pop_back();
+                eraseSub_(i);
                 return;
             }
         }
@@ -2772,8 +2862,7 @@ private:
         const auto pub = static_cast<std::uintptr_t>(op.egressPub());
         for (std::size_t i = 0; i < subs_.size(); ) {
             if (reinterpret_cast<std::uintptr_t>(subs_[i].egressPub) == pub) {
-                subs_[i] = subs_.back();
-                subs_.pop_back();
+                eraseSub_(i);   // swap-and-pop: the moved element is re-examined at the same index
             } else {
                 ++i;
             }
@@ -2837,6 +2926,336 @@ private:
             spdlog::error("Worker {}: executeSchemaUpdateWire_ — unknown exception "
                           "for topicId={} version={}", workerId_, topicId, version);
         }
+    }
+
+    // ===================================================================
+    // Phase 2c: broker-side subscription filters.
+    //
+    // A FILTERED subscription is a member of the FilterGroup of its (topic, partition, isolation, scan source); the
+    // group (FilterGroup.h, a pure engine) reads the partition once, probes an index per record and delivers only the
+    // matches.  Everything here is worker-thread-only and shared-nothing: schemas arrive as FilterSchema ops on the
+    // ingress ring, filter bytes ride the Subscribe op's tail.  Allocation happens only on cold paths (FilterSchema
+    // install, group creation, member binding); the push pass itself allocates nothing.
+    // ===================================================================
+
+    /// One subscription's true position.  A filtered InSync member's cursor lives in its group (FilterGroup::cursorOf);
+    /// EVERY read of a filtered member's position goes through here.
+    [[nodiscard]] int64_t positionOf_(const WorkerSubscription& s) const noexcept {
+        if (const auto* f = std::get_if<SubFiltered>(&s.filter)) [[unlikely]]
+            return filterGroups_[f->group].cursorOf(f->member, s.nextOffset);
+        return s.nextOffset;
+    }
+
+    // executeFilterSchemaWire_: install or extend a typed topic's FilterSchema from the EVOLVING descriptor blob
+    // (tail, DESCRIPTOR_BLOB) at the topic's current version (clientVersion).  A topic that already has one is
+    // extended in place (member terms keep their field indices); a conflicting schema replaces it and every member of
+    // the topic is recompiled from its stored filter bytes at its current position.  A malformed blob keeps the old
+    // schema (counted, logged).
+    [[gnu::cold]] [[gnu::noinline]] void executeFilterSchemaWire_(sbe::WorkerOp& op) {
+        const int32_t  topicId = op.topicId();
+        const uint16_t version = static_cast<uint16_t>(op.clientVersion());
+        const uint32_t tailLen = op.tailLength();
+        const uint8_t* tail    = reinterpret_cast<const uint8_t*>(op.tail());
+        try {
+            const rune::codec::Descriptor desc = rune::codec::deserialize(std::span<const uint8_t>(tail, tailLen));
+            rune::codec::FilterSchema built = rune::codec::FilterSchema::build(desc, version);
+            auto it = filterSchemas_.find(topicId);
+            if (it == filterSchemas_.end()) {
+                filterSchemas_.emplace(topicId, std::move(built));
+            } else if (it->second.extendFrom(built) == rune::codec::FilterSchema::ExtendResult::Incompatible) {
+                spdlog::warn("Worker {}: FilterSchema for topicId={} v{} conflicts with the installed one - replacing it and "
+                             "recompiling its filtered subscriptions", workerId_, topicId, version);
+                it->second = std::move(built);   // in place: cached pointers to the schema stay valid
+                recompileFilters_(topicId);
+            }
+            spdlog::debug("Worker {}: FilterSchema installed for topicId={} version={}", workerId_, topicId, version);
+        } catch (const std::exception& ex) {
+            ++filterSchemaErrors_;
+            spdlog::error("Worker {}: FilterSchema for topicId={} version={} refused (the old schema is kept): {}",
+                          workerId_, topicId, version, ex.what());
+        } catch (...) {
+            ++filterSchemaErrors_;
+            spdlog::error("Worker {}: FilterSchema for topicId={} version={} refused (unknown exception)", workerId_, topicId, version);
+        }
+    }
+
+    /// Cold: every filtered member of `topicId` leaves its group at its current position and binds again.
+    [[gnu::cold]] [[gnu::noinline]] void recompileFilters_(int32_t topicId) {
+        for (std::size_t i = 0; i < subs_.size(); ++i) {
+            WorkerSubscription& s = subs_[i];
+            if (s.topicId != topicId || std::holds_alternative<SubUnfiltered>(s.filter)) continue;
+            unbindFilter_(i);
+            const auto bytes = filterBytes_.find(s.subscriptionId);
+            if (bytes == filterBytes_.end()) { failFilterBind_(s, "filter bytes unavailable on the owning worker"); continue; }
+            bindFilter_(i, std::span<const uint8_t>(bytes->second));
+        }
+    }
+
+    // bindFilter_: compile `bytes` against the topic's schema and make subs_[i] a member of its group.  Any failure is
+    // explicit (never a silent unfiltered fallback): FIFO ordering with the FilterSchema op makes a missing schema or
+    // a compile error unreachable in production, so this branch is defensive - counted, answered once, parked.
+    [[gnu::cold]] [[gnu::noinline]] void bindFilter_(std::size_t i, std::span<const uint8_t> bytes) {
+        WorkerSubscription& s = subs_[i];
+        filterBytes_[s.subscriptionId].assign(bytes.begin(), bytes.end());   // kept for a schema replacement
+        const auto fs = filterSchemas_.find(s.topicId);
+        if (fs == filterSchemas_.end()) { failFilterBind_(s, "filter schema unavailable on the owning worker"); return; }
+        auto compiled = rune::codec::CompiledFilter::compile(bytes, fs->second);
+        if (!compiled) {
+            failFilterBind_(s, "filter rejected on the owning worker: " + rune::codec::describe(compiled.error()));
+            return;
+        }
+        // A transient bind-time cursor below the ring start is a fresh subscribe, not lag (M2); a disk cursor below the
+        // log start is raised by the source's skipEvicted on the first pass.
+        if (rune::replication::PartitionReplica* rep = subReplica_(s); s.logPtr == nullptr && rep != nullptr) {
+            if (rune::storage::InMemoryLog* mem = rep->memoryLog()) {
+                s.nextOffset  = skipEvictedCursor_(*mem, s.nextOffset, true);
+                s.cursorFresh = false;
+            }
+        }
+        const uint64_t src = (static_cast<uint64_t>(s.registryId) << 32) | s.incarnation;
+        const FilterGroupKey key{s.topicId, s.partition, s.isolation, src};
+        auto kit = filterGroupByKey_.find(key);
+        const bool created = kit == filterGroupByKey_.end();
+        uint32_t gi;
+        if (created) {
+            if (!filterScratchReady_) { filterScratch_.reserve(filterCfg_, kFilterRecordsPerBatchReserve); filterScratchReady_ = true; }
+            if (!filterFreeGroups_.empty()) { gi = filterFreeGroups_.back(); filterFreeGroups_.pop_back(); }
+            else { gi = static_cast<uint32_t>(filterGroups_.size()); filterGroups_.emplace_back(); filterGroupKeys_.emplace_back(); filterGroupSchemas_.push_back(nullptr); }
+            filterGroups_[gi].init(s.topicId, s.partition, filterCfg_, src);
+            filterGroupKeys_[gi]    = key;
+            filterGroupSchemas_[gi] = &fs->second;
+            filterGroupByKey_.emplace(key, gi);
+            filterRotor_ = 0;
+        } else {
+            gi = kit->second;
+        }
+        const uint32_t m = filterGroups_[gi].add(static_cast<uint32_t>(i), std::move(*compiled), fs->second, src);
+        if (m == filter::kNil) {
+            if (filterGroups_[gi].empty()) releaseFilterGroup_(gi);
+            failFilterBind_(s, "filter capacity");
+            return;
+        }
+        s.filter = SubFiltered{gi, m};
+    }
+
+    /// Cold: the subscription cannot be served filtered.  Counted, logged, ONE ErrorResponse{InvalidRequest, corr =
+    /// the Subscribe's correlation id} on its egress (sealed like sendPushTooLarge_), and the subscription is parked.
+    [[gnu::cold]] [[gnu::noinline]] void failFilterBind_(WorkerSubscription& s, std::string_view reason) {
+        ++filterBindFailures_;
+        spdlog::error("Worker {}: filtered subscribe sub={} topicId={} partition={} failed: {} (failures={})", workerId_,
+                      s.subscriptionId, s.topicId, s.partition, reason, filterBindFailures_);
+        s.filter    = SubUnfiltered{};
+        s.pushState = WorkerSubscription::PushState::Failed;
+        aeron::ExclusivePublication* pub = s.egressPub;
+        if (pub == nullptr && workerEgress_ != nullptr) pub = workerEgress_->pub();
+        if (pub == nullptr) return;
+        static_assert(rune::protocol::client::MessageHeader::ENCODED_SIZE + rune::protocol::client::ErrorResponse::BODY_FIXED + 2u + 256u <= kEgressScratchSize);
+        const std::string_view msg = reason.substr(0, 256);
+        rune::protocol::client::ErrorResponse err;
+        err.sessionId     = s.sessionId;
+        err.correlationId = s.subscribeCorrId;
+        err.code          = static_cast<int16_t>(rune::protocol::client::ErrorCode::InvalidRequest);
+        err.message       = msg;
+        const std::size_t n = err.encode(egressScratch_.data());
+        RecordsSealCtx seal;
+        if (const RecordsSealCtx* sp = sealCtxFor_(s.sessionId, seal)) {
+            const std::size_t sn = sealRecordsFrame(*sp, egressScratch_.data(), n, pushTooLargeSealScratch_.data(),
+                                                    pushTooLargeSealScratch_.size());
+            if (sn == 0) return;   // fail closed: never a plaintext error on an encrypted session
+            (void)sendEncodedToPub_(pub, pushTooLargeSealScratch_.data(), sn);
+            return;
+        }
+        (void)sendEncodedToPub_(pub, egressScratch_.data(), n);
+    }
+
+    /// The seal context of `sessionId`'s encrypted egress, or nullptr for a plaintext session (the common case).
+    [[nodiscard]] const RecordsSealCtx* sealCtxFor_(int64_t sessionId, RecordsSealCtx& seal) noexcept {
+        WorkerSessionCrypto* cr = findSessionCrypto_(sessionId);
+        if (cr == nullptr) [[likely]] return nullptr;
+        seal.send     = cr->send.has_value() ? &*cr->send : nullptr;   // null send: sealRecordsFrame fails closed
+        seal.sendSeq  = &cr->sendSeq;
+        seal.cipher   = cr->cipher;
+        seal.senderId = static_cast<uint8_t>(workerId_ + 1);
+        return &seal;
+    }
+
+    /// Cold: subs_[i] leaves its group (a re-Subscribe, an Unsubscribe or an egress release).
+    void unbindFilter_(std::size_t i) {
+        WorkerSubscription& s = subs_[i];
+        if (const auto* f = std::get_if<SubFiltered>(&s.filter)) {
+            const SubFiltered fl = *f;
+            filterGroups_[fl.group].remove(fl.member);
+            if (filterGroups_[fl.group].empty()) releaseFilterGroup_(fl.group);
+        }
+        s.filter = SubUnfiltered{};
+        filterBytes_.erase(s.subscriptionId);
+    }
+    void releaseFilterGroup_(uint32_t gi) {
+        filterGroupByKey_.erase(filterGroupKeys_[gi]);
+        filterGroupSchemas_[gi] = nullptr;
+        filterFreeGroups_.push_back(gi);
+        filterRotor_ = 0;
+    }
+
+    /// The ONE removal path: swap-and-pop, and the element moved into slot i is re-pointed in its group.
+    void eraseSub_(std::size_t i) {
+        if (!std::holds_alternative<SubUnfiltered>(subs_[i].filter)) [[unlikely]] unbindFilter_(i);
+        const std::size_t last = subs_.size() - 1;
+        if (i != last) {
+            subs_[i] = subs_[last];
+            if (const auto* f = std::get_if<SubFiltered>(&subs_[i].filter)) [[unlikely]]
+                filterGroups_[f->group].moveSub(f->member, static_cast<uint32_t>(i));
+        }
+        subs_.pop_back();
+    }
+
+    // ---- the FilterGroup's view of the worker: a source (reads), a sink (egress) ----
+    class FilterSourceImpl {
+    public:
+        FilterSourceImpl(Worker& w, WorkerSubscription& s) noexcept : w_(w), s_(s) {}
+        /// HW (the live bound) / LSO (read_committed); < 0 = not servable this pass.
+        [[nodiscard]] int64_t bound() noexcept {
+            if (!s_.active) return -1;
+            rep_ = w_.subReplica_(s_);
+            if (s_.incarnation != 0 && rep_ == nullptr) return -1;   // not owned
+            mem_ = (s_.logPtr == nullptr && rep_ != nullptr) ? rep_->memoryLog() : nullptr;
+            if (s_.logPtr == nullptr && mem_ == nullptr) return -1;
+            bound_ = rep_ != nullptr ? rep_->highWatermark() : s_.logPtr->logEndOffset();
+            rc_ = nullptr;
+            if (s_.isolation == kIsolationReadCommitted && s_.topicId >= 0) [[unlikely]] {
+                if (rep_ == nullptr) return -1;   // no replica -> no RC state -> fail closed
+                rc_ = w_.rcServe_(rep_, s_.rc);
+                if (rc_ == nullptr) return -1;    // not Ready
+                bound_ = rc_->lso(bound_);
+            }
+            return bound_;
+        }
+        /// Whole batches from the batch holding `from`: at least that one, even when it is larger than `cap`.
+        [[nodiscard]] std::span<const uint8_t> read(int64_t from, std::size_t cap) noexcept {
+            const std::size_t c = std::min<std::size_t>(static_cast<std::size_t>(kPushMaxChunkBytes), cap);
+            const rune::storage::LogReadView v = s_.logPtr != nullptr
+                ? w_.readNoFault_(s_.logPtr, from, c, bound_)
+                : mem_->readView(from, static_cast<int32_t>(c));   // zero-copy ring view
+            return {v.data, v.len};
+        }
+        [[nodiscard]] bool readCommitted() const noexcept { return rc_ != nullptr; }
+        [[nodiscard]] bool isAborted(int64_t pid, int64_t base) const noexcept { return rc_->isAborted(pid, base); }
+        /// Transient: the ring start when `from` was evicted.  Disk: the log start when retention deleted `from`.
+        [[nodiscard]] int64_t skipEvicted(int64_t from) noexcept {
+            if (mem_ != nullptr) return w_.skipEvictedCursor_(*mem_, from, false);
+            const int64_t start = s_.logPtr->logStartOffset();
+            return from < start ? start : from;
+        }
+    private:
+        Worker& w_;
+        WorkerSubscription& s_;
+        rune::replication::PartitionReplica* rep_ = nullptr;
+        rune::storage::InMemoryLog* mem_ = nullptr;
+        const RcState* rc_ = nullptr;
+        int64_t bound_ = 0;
+    };
+
+    class FilterSinkImpl {
+    public:
+        explicit FilterSinkImpl(Worker& w) noexcept : w_(w) {}
+        [[nodiscard]] filter::SendOutcome sendBatch(uint32_t sub, int64_t /*base*/, std::span<const uint8_t> b) {
+            return w_.filterSend_(w_.subs_[sub], b, /*isNote=*/false, 0);
+        }
+        [[nodiscard]] filter::SendOutcome sendNote(uint32_t sub, int64_t cursor) {
+            return w_.filterSend_(w_.subs_[sub], {}, /*isNote=*/true, cursor);
+        }
+        [[nodiscard]] int64_t& cursor(uint32_t sub) noexcept { return w_.subs_[sub].nextOffset; }
+        [[nodiscard]] bool deliverable(uint32_t sub) noexcept {
+            const WorkerSubscription& s = w_.subs_[sub];
+            if (!s.active || s.pushState != WorkerSubscription::PushState::Live) return false;
+            if (s.egressPub == nullptr && (w_.workerEgress_ == nullptr || w_.workerEgress_->pub() == nullptr)) return false;
+            // R-2: a group subscription whose isolation carrier has not arrived guessed read_committed; the filtered
+            // pass skips aborted batches for good, so it waits for the true isolation instead of risking a loss.
+            return !(s.isGroup && !s.groupCarrierReceived && s.isolation == kIsolationReadCommitted);
+        }
+    private:
+        Worker& w_;
+    };
+
+    /// One Records frame (a data batch, or a position note when `isNote`) to a filtered subscription, on its own
+    /// egress publication and seal context, exactly like the unfiltered push.  TooLarge parks the subscription
+    /// (ErrorOwed -> the owed error); the group then treats it like a refused send (the member falls behind, parked).
+    filter::SendOutcome filterSend_(WorkerSubscription& s, std::span<const uint8_t> batch, bool isNote, int64_t noteCursor) {
+        namespace pc = rune::protocol::client;
+        aeron::ExclusivePublication* pub = s.egressPub;
+        if (pub == nullptr && workerEgress_ != nullptr) pub = workerEgress_->pub();
+        if (pub == nullptr) return filter::SendOutcome::Retry;
+        RecordsSealCtx seal;
+        const RecordsSealCtx* sealPtr = sealCtxFor_(s.sessionId, seal);
+        int64_t baseOffset = noteCursor;
+        if (!isNote) {
+            baseOffset = 0;
+            for (int i = 0; i < 8; ++i)
+                baseOffset |= (static_cast<int64_t>(batch[rune::protocol::batch::kBaseOffsetOffset + i]) << (i * 8));
+        }
+        pc::Records rec;
+        rec.sessionId      = s.sessionId;
+        rec.correlationId  = s.subscribeCorrId;
+        rec.subscriptionId = s.subscriptionId;
+        rec.topicId        = s.topicId;
+        rec.partition      = s.partition;
+        rec.baseOffset     = baseOffset;
+        rec.recordBatch    = batch;
+        const RecordsSendResult sent = sendRecordsFrame(*pub, rec, egressScratch_.data(), egressScratch_.size(), sealPtr,
+                                                        sealPtr ? &recordsSealScratch_ : nullptr);
+        if (sent.kind == RecordsSendKind::TooLarge) [[unlikely]] {
+            spdlog::error("Worker {}: filtered push sub={} (topicId={} partition={}) failed at offset={}: Records frame {} B exceeds "
+                          "the egress maxMessageLength {} B - MessageTooLarge, subscription parked", workerId_, s.subscriptionId,
+                          s.topicId, s.partition, baseOffset, rec.encodedSize(), pub->maxMessageLength());
+            s.pushState      = WorkerSubscription::PushState::ErrorOwed;
+            s.failedFrameLen = rec.encodedSize();
+            (void)sendPushTooLarge_(s, pub, sealPtr, baseOffset);
+            return filter::SendOutcome::TooLarge;
+        }
+        return sent.position > 0 ? filter::SendOutcome::Sent : filter::SendOutcome::Retry;
+    }
+
+    /// Both push passes, in a rotating order, on ONE shared budget (pushBudgetLeft_): neither can starve the other.
+    /// With no filtered group this is the unfiltered pass behind one predicted branch.
+    int pushSubscriptions_(int64_t nowNs) {
+        if (filterGroupByKey_.empty()) [[likely]] return pushOwnedSubscriptions_(nowNs);
+        return pushSubscriptionsMixed_(nowNs);
+    }
+    [[gnu::noinline]] int pushSubscriptionsMixed_(int64_t nowNs) {
+        const bool filteredFirst = (pushPassRotor_++ & 1u) != 0;
+        int work = 0;
+        if (filteredFirst) {
+            // The pass that runs first sees the budget as this cycle left it: fresh only while it is still full.
+            const bool fresh = pushBudgetLeft_ == kPushPassBudgetBytes;
+            work += pushFilteredGroups_(nowNs, fresh);
+            work += pushOwnedSubscriptions_(nowNs);
+        } else {
+            work += pushOwnedSubscriptions_(nowNs);
+            work += pushFilteredGroups_(nowNs, /*freshBudget=*/false);
+        }
+        return work;
+    }
+
+    /// One pass over every live filtered group (fair: the walk starts where the budget ran out last time).
+    int pushFilteredGroups_(int64_t nowNs, bool freshBudget) {
+        const std::size_t n = filterGroups_.size();
+        if (n == 0) return 0;
+        if (filterRotor_ >= n) filterRotor_ = 0;
+        const std::size_t entry = pushBudgetLeft_;
+        int work = 0;
+        for (std::size_t k = 0; k < n; ++k) {
+            const std::size_t gi = (filterRotor_ + k) % n;
+            if (pushBudgetLeft_ == 0) { filterRotor_ = gi; break; }
+            filter::FilterGroup& g = filterGroups_[gi];
+            if (g.empty()) continue;
+            WorkerSubscription& any = subs_[g.anySub()];
+            FilterSourceImpl src(*this, any);
+            FilterSinkImpl   snk(*this);
+            // Only the group that finds the budget still untouched may take the first-batch allowance.
+            work += g.pass(src, snk, *filterGroupSchemas_[gi], filterScratch_, nowNs, pushBudgetLeft_,
+                           freshBudget && pushBudgetLeft_ == entry);
+        }
+        return work;
     }
 
     // -------------------------------------------------------------------
@@ -2909,12 +3328,14 @@ private:
     // error) ⇒ return 0 — s.pushState stays ErrorOwed, retried next pass,
     // exactly like back-pressure; NEVER a plaintext send on an encrypted
     // session.
+    // Phase 2c: `atOffset` is the undeliverable batch's offset, passed in because a FILTERED member's position is not
+    // always its own `nextOffset` (an InSync member's cursor is the group's: FilterGroup::cursorOf).
     int sendPushTooLarge_(WorkerSubscription& s, aeron::ExclusivePublication* pub,
-                          const RecordsSealCtx* seal = nullptr) {
+                          const RecordsSealCtx* seal, int64_t atOffset) {
         static_assert(kPushTooLargeErrorMaxBytes <= kEgressScratchSize);
         const std::size_t n = encodePushTooLargeError(
             egressScratch_.data(), s.sessionId, s.subscriptionId, s.topicId, s.partition,
-            s.nextOffset, s.failedFrameLen, pub->maxMessageLength());
+            atOffset, s.failedFrameLen, pub->maxMessageLength());
         if (seal) [[unlikely]] {
             const std::size_t sn = sealRecordsFrame(*seal, egressScratch_.data(), n,
                                                     pushTooLargeSealScratch_.data(), pushTooLargeSealScratch_.size());
@@ -2984,9 +3405,12 @@ private:
 
             if (s.pushState != WorkerSubscription::PushState::Live) [[unlikely]] {
                 if (s.pushState == WorkerSubscription::PushState::ErrorOwed)
-                    work += sendPushTooLarge_(s, egressPub, sealPtr);
+                    work += sendPushTooLarge_(s, egressPub, sealPtr, positionOf_(s));
                 continue;   // parked AT the undeliverable batch
             }
+            // Phase 2c: a FILTERED subscription is served by its FilterGroup (pushFilteredGroups_), never here.
+            // One predicted branch per subscription per pass; unfiltered frames are unchanged byte for byte.
+            if (!std::holds_alternative<SubUnfiltered>(s.filter)) [[unlikely]] continue;
 
             // Bound: the live HW (the worker owns the replica); read_committed
             // (F15 §2.4, K1): the LSO of THIS worker's RC state — read on the
@@ -3121,7 +3545,7 @@ private:
                                   rec.encodedSize(), egressPub->maxMessageLength());
                     s.pushState      = WorkerSubscription::PushState::ErrorOwed;
                     s.failedFrameLen = rec.encodedSize();
-                    work += sendPushTooLarge_(s, egressPub, sealPtr);
+                    work += sendPushTooLarge_(s, egressPub, sealPtr, s.nextOffset);
                     break;
                 }
                 const int64_t r = sent.position;
@@ -5085,6 +5509,32 @@ private:
     // IS a hard reject; see schemaRejects_).  Grows only (versions are never
     // un-validated), so a topicId inserted once stays a cheap O(1) hit.
     std::unordered_set<int32_t> validatedTopics_;
+
+    // Phase 2c: filtered subscriptions (worker thread only).  filterSchemas_ is never erased (topic ids are never
+    // reused; the cost is bounded by the typed topics), so pointers into it are stable.  A group is identified by
+    // (topic, partition, isolation, scan source = registry id + incarnation): a re-bound replica never joins the old
+    // group.  Emptied groups go to the free list and are re-init'ed on reuse.
+    struct FilterGroupKey {
+        int32_t topicId = 0, partition = 0;
+        uint8_t isolation = 0;
+        uint64_t source = 0;
+        auto operator<=>(const FilterGroupKey&) const = default;
+    };
+    static constexpr std::size_t kFilterRecordsPerBatchReserve = 4096;
+    filter::FilterConfig                                    filterCfg_{};
+    filter::FilterScratch                                   filterScratch_{};
+    bool                                                    filterScratchReady_ = false;
+    std::unordered_map<int32_t, rune::codec::FilterSchema>  filterSchemas_;
+    std::vector<filter::FilterGroup>                        filterGroups_;
+    std::vector<FilterGroupKey>                             filterGroupKeys_;      // parallel to filterGroups_
+    std::vector<const rune::codec::FilterSchema*>           filterGroupSchemas_;   // parallel to filterGroups_
+    std::vector<uint32_t>                                   filterFreeGroups_;
+    std::map<FilterGroupKey, uint32_t>                      filterGroupByKey_;     // cold lookups at Subscribe
+    std::unordered_map<int64_t, std::vector<uint8_t>>       filterBytes_;          // subscriptionId -> filter bytes (recompile)
+    std::size_t                                             filterRotor_ = 0;
+    uint8_t                                                 pushPassRotor_ = 0;    // which pass runs first this cycle
+    uint64_t                                                filterBindFailures_ = 0;
+    uint64_t                                                filterSchemaErrors_ = 0;
 
     // E5.1.3: desired fragment poll limit for reservation-before-poll (see
     // ingressPollBudget_).  Source: NodeConfig::gatewayFragmentLimit

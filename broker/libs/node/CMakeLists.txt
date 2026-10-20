@@ -1390,6 +1390,22 @@ if(BUILD_TESTING)
         gtest_discover_tests(rune_worker_push_tests
             PROPERTIES TIMEOUT 120
             ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
+        # Phase 2c Task 8: the Worker serves FILTERED subscriptions through FilterGroups (FilterSchema op, the filter
+        # tail on Subscribe, member binding, the filtered push pass); same rig as rune_worker_push_tests.
+        add_executable(rune_worker_filter_tests
+            tests/node/WorkerFilterPushTest.cpp)
+        target_include_directories(rune_worker_filter_tests PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests
+            ${RUNE_CLIENT_ROOT}/examples)
+        target_link_libraries(rune_worker_filter_tests PRIVATE
+            rune_node
+            rune_codec
+            aeron::aeron
+            GTest::gtest_main)
+        gtest_discover_tests(rune_worker_filter_tests
+            PROPERTIES TIMEOUT 180
+            ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
     endif()
 
     # ---------------------------------------------------------------------------
