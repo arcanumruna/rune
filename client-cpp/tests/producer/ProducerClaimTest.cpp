@@ -446,3 +446,301 @@ TEST(ProducerClaimAllocRegression, AbortCqAndAckTokenClaimPathsAllocateNothingRe
     EXPECT_EQ(alloc_counter::stop(), 0L) << "abort / destructor-abort / cq / AckToken claims must not allocate";
     EXPECT_EQ(cq.outstanding(), 0u);
 }
+
+// ---------------------------------------------------------------------------
+// claimBatch — Thread mode (Ring ingress)
+// ---------------------------------------------------------------------------
+
+TEST(ProducerClaim, ClaimBatchLandsAsOneRecordBatchWithContiguousOffsets) {
+    auto* impl = new ProducerImpl(voidCfg(), 64 * 1024);
+    Producer p(impl);
+    const Key key(uint64_t{8});
+    rc::BatchClaim b = p.claimBatch(kTopic, key, 3, 2);
+    ASSERT_TRUE(b) << static_cast<int>(b.result());
+    ASSERT_EQ(b.count(), 3u);
+    ASSERT_EQ(b.recordLength(), 2u);
+    fill(b.record(0), "B1");
+    fill(b.record(1), "B2");
+    fill(b.record(2), "B3");
+    EXPECT_TRUE(b.record(3).empty()) << "out of range";
+    ASSERT_TRUE(b.commit());
+    EXPECT_FALSE(b);
+    FrameCapture cap;
+    pump(*impl, cap.fn());
+    ASSERT_EQ(cap.recs.size(), 3u);
+    EXPECT_EQ(cap.frames, 1) << "one RecordBatch";
+    for (int i = 0; i < 3; ++i) {
+        EXPECT_EQ(cap.recs[i].frame, 0);
+        EXPECT_EQ(cap.recs[i].offset, i) << "contiguous offsets";
+        EXPECT_EQ(cap.recs[i].partition, key.partition(kTopic.partitionCount));
+    }
+    EXPECT_EQ(cap.values(), (std::vector<std::string>{"B1", "B2", "B3"}));
+}
+
+TEST(ProducerClaim, ClaimBatchAbortAndDestructorDeliverNone) {
+    auto* impl = new ProducerImpl(voidCfg(), 64 * 1024);
+    Producer p(impl);
+    {
+        rc::BatchClaim a = p.claimBatch(kTopic, Key(uint64_t{1}), 4, 4);
+        ASSERT_TRUE(a);
+        a.abort();
+        EXPECT_TRUE(a.record(0).empty());
+    }
+    {
+        rc::BatchClaim d = p.claimBatch(kTopic, Key(uint64_t{1}), 4, 4);
+        ASSERT_TRUE(d);
+    }  // the destructor aborts
+    ASSERT_EQ(p.trySend(kTopic, Key(uint64_t{1}), bytes("Z")), SendResult::Ok);
+    FrameCapture cap;
+    pump(*impl, cap.fn());
+    EXPECT_EQ(cap.values(), std::vector<std::string>{"Z"});
+}
+
+// All n records land in ONE batch: they join an open batch only when they fit
+// it whole; otherwise that batch is flushed first and the claim starts a new one.
+TEST(ProducerClaim, ClaimBatchJoinsAnOpenBatchOnlyWhenItFitsWhole) {
+    {
+        ProducerConfig cfg = voidCfg();
+        cfg.lingerUs = 60'000'000;  // only a flush ends a batch
+        auto* impl = new ProducerImpl(cfg, 64 * 1024);
+        Producer p(impl);
+        const Key key(uint64_t{2});
+        ASSERT_EQ(p.trySend(kTopic, key, bytes("A")), SendResult::Ok);
+        rc::BatchClaim b = p.claimBatch(kTopic, key, 3, 2);
+        ASSERT_TRUE(b);
+        fill(b.record(0), "B1");
+        fill(b.record(1), "B2");
+        fill(b.record(2), "B3");
+        ASSERT_TRUE(b.commit());
+        ASSERT_EQ(p.trySend(kTopic, key, bytes("C")), SendResult::Ok);
+        p.flush();
+        FrameCapture cap;
+        pump(*impl, cap.fn());
+        EXPECT_EQ(cap.values(), (std::vector<std::string>{"A", "B1", "B2", "B3", "C"}));
+        EXPECT_EQ(cap.frames, 1);
+        for (int i = 0; i < 5; ++i) EXPECT_EQ(cap.recs[i].offset, i);
+    }
+    {
+        ProducerConfig cfg = voidCfg();
+        cfg.lingerUs   = 60'000'000;
+        cfg.batchBytes = 256;  // A (~75 wire bytes) + 4 x 40-byte records do not fit
+        auto* impl = new ProducerImpl(cfg, 64 * 1024);
+        Producer p(impl);
+        const Key key(uint64_t{2});
+        ASSERT_EQ(p.trySend(kTopic, key, bytes("A")), SendResult::Ok);
+        rc::BatchClaim b = p.claimBatch(kTopic, key, 4, 40);
+        ASSERT_TRUE(b) << static_cast<int>(b.result());
+        for (uint32_t i = 0; i < 4; ++i) std::memset(b.record(i).data(), 'a' + static_cast<int>(i), 40);
+        ASSERT_TRUE(b.commit());
+        p.flush();
+        FrameCapture cap;
+        pump(*impl, cap.fn());
+        ASSERT_EQ(cap.recs.size(), 5u);
+        EXPECT_EQ(cap.recs[0].value, "A");
+        EXPECT_NE(cap.recs[1].frame, cap.recs[0].frame) << "A was flushed first";
+        for (int i = 1; i < 5; ++i) {
+            EXPECT_EQ(cap.recs[i].frame, cap.recs[1].frame) << "the 4 claimed records share one batch";
+            EXPECT_EQ(cap.recs[i].offset, i - 1);
+            EXPECT_EQ(cap.recs[i].value, std::string(40, static_cast<char>('a' + i - 1)));
+        }
+    }
+}
+
+TEST(ProducerClaim, ClaimBatchNeverOvertakesAQueuedTier2Batch) {
+    auto* impl = new ProducerImpl(voidCfg(), 64 * 1024);
+    Producer p(impl);
+    const Key key(uint64_t{5});
+    ASSERT_EQ(p.trySend(kTopic, key, bytes("A")), SendResult::Ok);
+    auto t2 = p.batch(kTopic, key);
+    t2.add(bytes("X"));
+    t2.add(bytes("Y"));
+    ASSERT_EQ(t2.send(), rc::OpResult::Accepted);
+    rc::BatchClaim b = p.claimBatch(kTopic, key, 2, 2);
+    ASSERT_TRUE(b);
+    fill(b.record(0), "B1");
+    fill(b.record(1), "B2");
+    ASSERT_TRUE(b.commit());
+    ASSERT_EQ(p.trySend(kTopic, key, bytes("C")), SendResult::Ok);
+    FrameCapture cap;
+    pump(*impl, cap.fn());
+    EXPECT_EQ(cap.values(), (std::vector<std::string>{"A", "X", "Y", "B1", "B2", "C"}));
+}
+
+TEST(ProducerClaim, ClaimBatchLimitsAreRefusedNeverRetryable) {
+    {
+        ProducerConfig cfg = voidCfg();
+        cfg.maxFrameBytes = 4096;
+        auto* impl = new ProducerImpl(cfg, 64 * 1024);
+        Producer p(impl);
+        const Key key(uint64_t{1});  // 8 key bytes
+        EXPECT_EQ(p.claimBatch(kTopic, key, 0, 4).result(), SendResult::InvalidArgument);
+        EXPECT_EQ(p.claimBatch(kTopic, key, 2, static_cast<uint32_t>(Producer::kMaxRecordBytes - 8 + 1)).result(),
+                  SendResult::MessageTooLarge)
+            << "per-record cap";
+        EXPECT_EQ(p.claimBatch(kTopic, key, 100, 100).result(), SendResult::MessageTooLarge)
+            << "~12 KiB batch > maxFrameBytes 4096";
+        EXPECT_EQ(p.claimBatch(TopicHandle{}, key, 1, 1).result(), SendResult::InvalidTopic);
+    }
+    {
+        ProducerConfig cfg = voidCfg();
+        cfg.maxFrameBytes = 0;                                  // no frame cap
+        auto* impl = new ProducerImpl(cfg, 64 * 1024);          // ring maxMsgLength 8 KiB
+        Producer p(impl);
+        EXPECT_EQ(p.claimBatch(kTopic, Key(uint64_t{1}), 100, 100).result(), SendResult::MessageTooLarge)
+            << "42 + n x recLen > the ring's maxMsgLength";
+    }
+}
+
+TEST(ProducerClaim, ClaimBatchDiscardedByCloseReportsOneBatchAckForAllItsRecords) {
+    auto* impl = new ProducerImpl(voidCfg(), 64 * 1024);
+    Producer p(impl);
+    test_support::AckLedger L;
+    L.attachBatches(*impl);
+    rc::BatchClaim b = p.claimBatch(kTopic, Key(uint64_t{1}), 3, 2);
+    ASSERT_TRUE(b);
+    ASSERT_TRUE(b.commit());
+    ASSERT_EQ(p.closeImmediately(), rc::OpResult::Accepted);  // the batch is still in the ring
+    ASSERT_EQ(L.batchAcks.size(), 1u);
+    EXPECT_EQ(L.batchAcks[0].recordCount, 3);
+    EXPECT_EQ(L.batchAcks[0].baseSequence, -1);
+    EXPECT_EQ(L.batchAcks[0].errorCode, rc::BatchAck::kClientFailure);
+}
+
+TEST(ProducerClaimAllocRegression, RingClaimBatchSteadyStateAllocatesNothingRegression) {
+    auto* impl = new ProducerImpl(voidCfg(), 1 << 20);
+    Producer p(impl);
+    const ProducerImpl::SendFn sink = [](int32_t, int32_t, int32_t, const uint8_t*, std::size_t) {
+        return true;
+    };
+    auto cycle = [&](uint64_t k) {
+        rc::BatchClaim b = p.claimBatch(kTopic, Key(k), 4, 32);
+        if (b) {
+            for (uint32_t i = 0; i < 4; ++i) std::memset(b.record(i).data(), 0x5A, 32);
+            (void)b.commit();
+        }
+        pump(*impl, sink);
+    };
+    for (uint64_t k = 0; k < 64; ++k) cycle(k);
+    alloc_counter::start();
+    for (uint64_t k = 64; k < 1064; ++k) cycle(k);
+    EXPECT_EQ(alloc_counter::stop(), 0L) << "claimBatch + commit + drain/flush must not allocate";
+}
+
+// ---------------------------------------------------------------------------
+// BatchClaim batch-ack credit (n units) and the close-drain unblock
+// ---------------------------------------------------------------------------
+
+TEST(ProducerClaim, ClaimBatchReservesNUnitsReturnedOnAbortDestructorAndRefusal) {
+    CqRig r;
+    rc::Completions bq(*r.client, smallCq());
+    r.p.batchAcksTo(bq);
+    {
+        rc::BatchClaim b = r.p.claimBatch(kTopic, Key(uint64_t{1}), 3, 4);
+        ASSERT_TRUE(b);
+        EXPECT_EQ(bq.outstanding(), 3u);
+        EXPECT_EQ(bq.reservedBytes(), 3 * kUnit);
+        b.abort();
+        EXPECT_EQ(bq.outstanding(), 0u);
+    }
+    {
+        rc::BatchClaim b = r.p.claimBatch(kTopic, Key(uint64_t{1}), 5, 4);
+        ASSERT_TRUE(b);
+        EXPECT_EQ(bq.outstanding(), 5u);
+    }
+    EXPECT_EQ(bq.outstanding(), 0u) << "destructor-abort";
+    EXPECT_EQ(bq.reservedBytes(), 0u);
+    EXPECT_EQ(r.p.claimBatch(kTopic, Key(uint64_t{1}), 0, 4).result(), SendResult::InvalidArgument);
+    EXPECT_EQ(bq.outstanding(), 0u) << "a size refusal takes nothing";
+    // A batch bigger than the queue's room is refused QueueFull, all or none, and its slot is released.
+    CqRig r2;
+    rc::Completions tiny(*r2.client, smallCq(1024));
+    r2.p.batchAcksTo(tiny);
+    const uint32_t room = 1024 / kUnit;
+    rc::BatchClaim huge = r2.p.claimBatch(kTopic, Key(uint64_t{1}), room + 8, 1);
+    EXPECT_FALSE(huge);
+    EXPECT_EQ(huge.result(), SendResult::QueueFull);
+    EXPECT_EQ(tiny.outstanding(), 0u);
+    FrameCapture cap;
+    pump(*r2.impl, cap.fn());
+    EXPECT_TRUE(cap.recs.empty());
+    // Committed: the n units stay until the BatchAck is polled.
+    rc::BatchClaim ok = r2.p.claimBatch(kTopic, Key(uint64_t{1}), 2, 4);
+    ASSERT_TRUE(ok);
+    ASSERT_TRUE(ok.commit());
+    EXPECT_EQ(tiny.outstanding(), 2u);
+}
+
+TEST(ProducerClaim, ClaimBatchCommitAfterTheCloseDrainUnblockIsFalseAndReturnsTheCredit) {
+    CqRig r;
+    rc::Completions bq(*r.client, smallCq());
+    r.p.batchAcksTo(bq);
+    rc::BatchClaim b = r.p.claimBatch(kTopic, Key(uint64_t{1}), 3, 4);
+    ASSERT_TRUE(b);
+    EXPECT_EQ(bq.outstanding(), 3u);
+    r.impl->closeFinal(rc::OpStatus::Closed, 1);
+    EXPECT_FALSE(b.commit());
+    EXPECT_FALSE(b);
+    EXPECT_EQ(bq.outstanding(), 0u);
+    EXPECT_EQ(bq.reservedBytes(), 0u);
+    rc::BatchClaim d = r.p.claimBatch(kTopic, Key(uint64_t{1}), 2, 4);
+    EXPECT_FALSE(d) << "a closed ring refuses";
+    EXPECT_EQ(d.result(), SendResult::Closed);
+    EXPECT_EQ(bq.outstanding(), 0u);
+}
+
+TEST(ProducerClaimRegression, ClaimBatchCommitRacingTheCloseUnblockNeverReportsALostBatchCommittedRegression) {
+    CqRig r;
+    rc::Completions bq(*r.client, smallCq());
+    r.p.batchAcksTo(bq);
+    rc::BatchClaim b = r.p.claimBatch(kTopic, Key(uint64_t{1}), 3, 4);
+    ASSERT_TRUE(b);
+    EXPECT_TRUE(r.impl->testUnblockHeadClaim());
+    EXPECT_FALSE(b.commit());
+    EXPECT_EQ(bq.outstanding(), 0u);
+}
+
+TEST(ProducerClaim, ClaimBatchCommitOffTheOwnerThreadOfACarriedQueueStaysOpen) {
+    CqRig r;
+    rc::Completions bq(*r.client, smallCq());
+    r.p.batchAcksTo(bq);
+    rc::BatchClaim b = r.p.claimBatch(kTopic, Key(uint64_t{1}), 2, 4);
+    ASSERT_TRUE(b);
+    bool committed = true;
+    std::thread t([&] { committed = b.commit(); });
+    t.join();
+    EXPECT_FALSE(committed);
+    EXPECT_TRUE(b) << "still open: the owner thread settles it";
+    EXPECT_EQ(bq.outstanding(), 2u);
+    EXPECT_TRUE(b.commit());
+    EXPECT_EQ(bq.outstanding(), 2u);
+}
+
+TEST(ProducerClaimAllocRegression, ClaimBatchAbortDestructorAndCreditPathsAllocateNothingRegression) {
+    CqRig r(voidCfg(), 1 << 20);
+    rc::Completions bq(*r.client, smallCq(1u << 20));
+    r.p.batchAcksTo(bq);
+    const ProducerImpl::SendFn sink = [](int32_t, int32_t, int32_t, const uint8_t*, std::size_t) {
+        return true;
+    };
+    auto cycle = [&](uint64_t k) {
+        {
+            rc::BatchClaim a = r.p.claimBatch(kTopic, Key(k), 4, 32);
+            if (a) a.abort();
+        }
+        {
+            rc::BatchClaim d = r.p.claimBatch(kTopic, Key(k), 4, 32);
+        }
+        {
+            rc::BatchClaim c = r.p.claimBatch(kTopic, Key(k), 4, 32);
+            if (c) {
+                for (uint32_t i = 0; i < 4; ++i) std::memset(c.record(i).data(), 0x5A, 32);
+                (void)c.commit();
+            }
+        }
+        pump(*r.impl, sink);
+    };
+    for (uint64_t k = 0; k < 64; ++k) cycle(k);
+    alloc_counter::start();
+    for (uint64_t k = 64; k < 1064; ++k) cycle(k);
+    EXPECT_EQ(alloc_counter::stop(), 0L) << "claimBatch abort / destructor / commit must not allocate";
+}

@@ -79,4 +79,56 @@ void Claim::abort() noexcept {
     detail::ClaimCredit::abort(core);
 }
 
+BatchClaim::BatchClaim(BatchClaim&& o) noexcept : state_(std::exchange(o.state_, Settled{})) {}
+
+BatchClaim& BatchClaim::operator=(BatchClaim&& o) noexcept {
+    if (this != &o) {
+        abort();
+        state_ = std::exchange(o.state_, Settled{});
+    }
+    return *this;
+}
+
+BatchClaim::~BatchClaim() { abort(); }
+
+SendResult BatchClaim::result() const noexcept {
+    if (const auto* r = std::get_if<Refused>(&state_)) return r->why;
+    return SendResult::Ok;
+}
+
+std::span<uint8_t> BatchClaim::record(uint32_t i) const noexcept {
+    const auto* o = std::get_if<Open>(&state_);
+    if (o == nullptr || i >= o->n) return {};
+    uint8_t* p = o->offsets != nullptr ? o->base + o->offsets[i]
+                                       : o->base + static_cast<std::size_t>(i) * o->recLen;
+    return {p, o->recLen};
+}
+
+uint32_t BatchClaim::count() const noexcept {
+    const auto* o = std::get_if<Open>(&state_);
+    return o != nullptr ? o->n : 0u;
+}
+
+uint32_t BatchClaim::recordLength() const noexcept {
+    const auto* o = std::get_if<Open>(&state_);
+    return o != nullptr ? o->recLen : 0u;
+}
+
+bool BatchClaim::commit() noexcept {
+    const auto* o = std::get_if<Open>(&state_);
+    if (o == nullptr) return false;
+    const detail::ClaimOpen core = o->core;
+    if (!detail::ClaimCredit::mayCommit(core)) return false;  // stays open: not this thread's to settle
+    state_ = Settled{};
+    return detail::ClaimCredit::commit(core);
+}
+
+void BatchClaim::abort() noexcept {
+    const auto* o = std::get_if<Open>(&state_);
+    if (o == nullptr) return;
+    const detail::ClaimOpen core = o->core;
+    state_ = Settled{};
+    detail::ClaimCredit::abort(core);
+}
+
 }  // namespace rune::client

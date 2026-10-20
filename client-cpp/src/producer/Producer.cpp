@@ -364,6 +364,24 @@ Claim Producer::tryClaim(TopicHandle topic, const Key& key, uint32_t valueLen, A
                       producer::ackhandle::forHandler(token.token), nullptr);
 }
 
+BatchClaim Producer::claimBatch(TopicHandle topic, const Key& key, uint32_t n, uint32_t recLen) noexcept {
+    if (!impl_ || !topic.valid()) return BatchClaim(SendResult::InvalidTopic);
+    const producer::ProducerImpl::ClaimGrant g =
+        impl_->claimBatch(topic.topicId, key.partition(topic.partitionCount), key, n, recLen);
+    if (g.result != SendResult::Ok) return BatchClaim(g.result);
+    detail::ClaimOpen core{impl_, g.token, nullptr, nullptr, 0};
+    if (Completions* bq = impl_->batchAckCq(); bq != nullptr) [[unlikely]] {
+        const SendResult u = reserveBatchUnits(*bq, n);  // one unit per record, like n sends
+        if (u != SendResult::Ok) {
+            detail::ClaimCredit::abort(core);
+            return BatchClaim(u);
+        }
+        core.bq    = bq;
+        core.units = n;
+    }
+    return BatchClaim(core, g.base, g.offsets, n, recLen);
+}
+
 // ---------------------------------------------------------------------------
 // Tier-2: explicit atomic batch
 // ---------------------------------------------------------------------------

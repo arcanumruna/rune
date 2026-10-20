@@ -337,6 +337,49 @@ private:
     std::variant<Refused, Open, Settled> state_{Refused{}};
 };
 
+/// n records of recLen bytes claimed together and appended as ONE RecordBatch
+/// (one partition, contiguous offsets, all or nothing) — Producer::claimBatch.
+/// Same RAII / refusal / holding rules as Claim.
+class BatchClaim {
+public:
+    BatchClaim() noexcept = default;  ///< refused: InvalidTopic
+    BatchClaim(BatchClaim&& o) noexcept;
+    BatchClaim& operator=(BatchClaim&& o) noexcept;  ///< aborts this claim first if it is open
+    BatchClaim(const BatchClaim&) = delete;
+    BatchClaim& operator=(const BatchClaim&) = delete;
+    ~BatchClaim();  ///< aborts an open claim
+
+    [[nodiscard]] explicit operator bool() const noexcept { return std::holds_alternative<Open>(state_); }
+    [[nodiscard]] SendResult result() const noexcept;
+    /// Record i's value bytes (recordLength() bytes); empty for i >= count() or unless open.
+    [[nodiscard]] std::span<uint8_t> record(uint32_t i) const noexcept;
+    [[nodiscard]] uint32_t count() const noexcept;         ///< n (0 unless open)
+    [[nodiscard]] uint32_t recordLength() const noexcept;  ///< recLen (0 unless open)
+    /// Publish all n records as one RecordBatch (one BatchAck of n).  False:
+    /// nothing was open, or the claim was abandoned under it (see Claim).
+    bool commit() noexcept;
+    void abort() noexcept;
+
+private:
+    friend class Producer;
+    struct Refused {
+        SendResult why = SendResult::InvalidTopic;
+    };
+    struct Open {
+        detail::ClaimOpen core;
+        uint8_t*          base    = nullptr;  ///< record 0's value bytes (Ring) / the frame (Direct)
+        const uint32_t*   offsets = nullptr;  ///< Direct: record i at base + offsets[i]; nullptr: stride recLen
+        uint32_t          n       = 0;
+        uint32_t          recLen  = 0;
+    };
+    struct Settled {};
+    explicit BatchClaim(SendResult why) noexcept : state_(Refused{why}) {}
+    BatchClaim(const detail::ClaimOpen& core, uint8_t* base, const uint32_t* offsets, uint32_t n,
+               uint32_t recLen) noexcept
+        : state_(Open{core, base, offsets, n, recLen}) {}
+    std::variant<Refused, Open, Settled> state_{Refused{}};
+};
+
 // ---------------------------------------------------------------------------
 // Producer
 //
@@ -538,6 +581,17 @@ public:
                                  Token token) noexcept;
     /// tryClaim whose completion goes to the onAck() handler.
     [[nodiscard]] Claim tryClaim(TopicHandle topic, const Key& key, uint32_t valueLen, AckToken token) noexcept;
+
+    /// Claim n records of recLen value bytes each for ONE atomic append (one
+    /// RecordBatch on key's partition, contiguous offsets, all or nothing):
+    /// write record(i) for every i, then commit().  Limits — never retryable:
+    /// n >= 1 (InvalidArgument); key + recLen <= kMaxRecordBytes, the whole
+    /// batch within ProducerConfig::maxFrameBytes (a conservative bound) and,
+    /// Thread mode, 42 + n x recLen <= the producer ring's maxMsgLength
+    /// (MessageTooLarge).  Never ahead of a Tier-2 batch queued earlier on the
+    /// partition.  With batchAcksTo bound it reserves n credit units (one
+    /// BatchAck of n returns them).  ZERO allocation in steady state.
+    [[nodiscard]] BatchClaim claimBatch(TopicHandle topic, const Key& key, uint32_t n, uint32_t recLen) noexcept;
 
     /// Setup phase (before the first AckToken send): the per-record ack
     /// handler.  See AckFn.

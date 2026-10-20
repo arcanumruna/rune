@@ -161,6 +161,17 @@ inline int32_t recordBodyContrib(int32_t keyLen, int32_t valueLen,
     return varintLen(bodySize) + bodySize;
 }
 
+// Phase 2b Part B: an upper bound on ONE claimBatch's RecordBatch wire bytes
+// (batch overhead + record bodies): every record is charged the widest
+// timestamp delta and the batch's last offsetDelta.  Compared against
+// maxFrameBytes at claim time and used to reserve builder capacity.
+inline int64_t claimBatchWireBound(std::size_t keyLen, uint32_t n, uint32_t recLen) noexcept {
+    const int32_t perRecord = recordBodyContrib(static_cast<int32_t>(keyLen), static_cast<int32_t>(recLen),
+                                                INT64_MAX >> 1, static_cast<int32_t>(n - 1));
+    return static_cast<int64_t>(rune::protocol::batch::kRecordBatchOverhead) +
+           static_cast<int64_t>(n) * perRecord;
+}
+
 // Backlog B1: offer a freshly encoded frame whose RecordBatch CRC is still
 // unset.  A sink that seals on accept (the Aeron transport via
 // AgentProduceSink, CountingSink) gets the FrameCrc and computes the CRC only
@@ -1351,6 +1362,28 @@ int ProducerImpl::drainRing(int64_t nowNs, int messageLimit) {
                 return ControlledAction::CONTINUE;
             }
 
+            if (msgTypeId == kMsgClaimBatch) {
+                // Phase 2b B: n records claimed as ONE atomic append — all n go
+                // into one builder (one RecordBatch, contiguous offsets) or the
+                // message stays in the ring (ABORT) until they can.
+                const std::size_t bsz = static_cast<std::size_t>(len);
+                if (bsz < static_cast<std::size_t>(kBatchHeaderSize)) return ControlledAction::CONTINUE;
+                const uint32_t n      = readLE32u(p, kBatchCountOff);
+                const uint32_t recLen = readLE32u(p, kBatchRecLenOff);
+                if (n == 0 || bsz < static_cast<std::size_t>(kBatchHeaderSize) +
+                                        static_cast<std::size_t>(n) * recLen) {
+                    return ControlledAction::CONTINUE;  // malformed: the producer validated it
+                }
+                PartitionState& ps = getOrCreatePartition(readLE32(p, kRecTopicIdOff), readLE32(p, kRecPartOff));
+                const uint8_t keyLen = p[kRecKeyLenOff];
+                if (admitBatch_(ps, keyLen, n, recLen) == ControlledAction::ABORT) {
+                    lastDrainStop_ = DrainStop::Blocked;
+                    return ControlledAction::ABORT;
+                }
+                appendBatch_(ps, p + kRecKeyBytesOff, keyLen, p + kBatchRecsOff, n, recLen, nowNs);
+                return ControlledAction::CONTINUE;
+            }
+
             if (msgTypeId != kMsgSendRecord) return ControlledAction::CONTINUE;
 
             const std::size_t sz = static_cast<std::size_t>(len);
@@ -1383,7 +1416,89 @@ int ProducerImpl::drainRing(int64_t nowNs, int messageLimit) {
 // ---------------------------------------------------------------------------
 // Owner/duty thread: append one record to its partition builder (Task 14: the
 // single append path — the ring drain and Direct trySubmit both land here).
+// Phase 2b B: split into admitRecord_ (every check; may throw) and
+// noteAppended_ (accounting) so Invoker claims reserve with the same rules.
 // ---------------------------------------------------------------------------
+
+void ProducerImpl::ensureBuilder_(PartitionState& ps) {
+    if (ps.builder) return;
+    // Created ONCE per partition; reused (reset in place) across batches so
+    // there is no per-batch heap allocation.
+    const int64_t baseWall = wallMs();
+    ps.builder = std::make_unique<ProduceFrameBuilder>(0, baseWall);
+    ps.builderBaseWallMs = baseWall;
+}
+
+rune::client::detail::ControlledAction ProducerImpl::admitRecord_(PartitionState& ps, uint8_t keyLen,
+                                                                  uint32_t valueLen, uint8_t flags,
+                                                                  uint64_t ackHandle) {
+    using rune::client::detail::ControlledAction;
+    // Task 14 fix1 I1: never overtake a Tier-2 batch queued earlier on the
+    // partition (flushBatches sends Tier-1 first).
+    if (!ps.pendingTier2Entries.empty()) return ControlledAction::ABORT;
+
+    // M2: the per-frame cap computed once at construction (cfg_ immutable).
+    const bool    frameCapped = frameCapped_;
+    const int32_t effCap      = effCap_;
+    // Frame-cap path: exact pre-flight of this record's wire contribution
+    // (+1 byte slack for wallMs() jitter between here and the append) — no
+    // emitted RecordBatch ever exceeds effCap.
+    if (frameCapped && ps.builder && ps.builder->recordCount() > 0) {
+        const int64_t tsDelta = wallMs() - ps.builderBaseWallMs;
+        const int32_t contrib = recordBodyContrib(static_cast<int32_t>(keyLen), static_cast<int32_t>(valueLen),
+                                                  tsDelta, ps.builder->recordCount()) + 1;
+        if (ps.builderBytes + contrib > effCap) {
+            // sizeFull will not trigger below the cap: force the flush.
+            if (ps.builderBytes < effCap) ps.flushRequested = true;
+            return ControlledAction::ABORT;
+        }
+    }
+    // Normal path: a full builder ABORTs regardless of the window (no flush
+    // runs between appends in either mode — F12 / Task 14).
+    if (!frameCapped && ps.builderBytes >= effCap) return ControlledAction::ABORT;
+    // Task 14 fix1 M2 / F12: batchRecords enforced at append time too.
+    if (cfg_.batchRecords > 0 && ps.builder && ps.builder->recordCount() >= cfg_.batchRecords) {
+        return ControlledAction::ABORT;
+    }
+    ensureBuilder_(ps);
+    const int32_t index = ps.builder->recordCount();  // this record's offsetDelta
+    // Task 14 fix1 M1: everything that can throw happens BEFORE anything is
+    // committed — the ack slots are reserved here and written by noteAppended_.
+    if ((flags & kFlagWantAck) && ackHandle != 0) {
+        const uint64_t need = static_cast<uint64_t>(index - ps.batchAckCount) + 1u;
+        while (ps.ackHead - ps.ackTail + need > ps.ackRing.size()) growAckRing(ps);
+    }
+    // I2: a single record whose own contribution exceeds the frame cap is
+    // still emitted (alone, to guarantee progress) — surfaced loudly.
+    if (frameCapped && index == 0) {
+        const int32_t soloContrib = recordBodyContrib(static_cast<int32_t>(keyLen), static_cast<int32_t>(valueLen),
+                                                      /*tsDelta=*/0, /*offsetDelta=*/0);
+        if (soloContrib > effCap) {
+            std::fprintf(stderr,
+                "ProducerImpl: single record wire=%d exceeds maxFrameBytes=%d "
+                "(topic=%d part=%d); emitting oversize frame (broker may reject)\n",
+                soloContrib, effCap, ps.topicId, ps.partition);
+        }
+    }
+    return ControlledAction::CONTINUE;
+}
+
+void ProducerImpl::noteAppended_(PartitionState& ps, int32_t firstIndex, int32_t count, uint8_t flags,
+                                 uint64_t ackHandle, int64_t nowNs) {
+    // fix2: the batch clock is the EARLIEST record's acceptance time.
+    if (firstIndex == 0 || nowNs < ps.batchStartNs) ps.batchStartNs = nowNs;
+    markDirty_(ps);  // F12: no-throw (capacity reserved with the partition)
+    // Per-record acks at the record's OWN index (spec §4.3); zeros back-filled
+    // lazily.  Room was reserved by admitRecord_, so pushAck_ never grows here.
+    if ((flags & kFlagWantAck) && ackHandle != 0) {
+        if (ps.batchAckCount == 0) ps.batchAckStart = ps.ackHead;
+        while (ps.batchAckCount < firstIndex) pushAck_(ps, 0);
+        pushAck_(ps, ackHandle);
+    }
+    // The TRUE encoded wire size (batch header + record bodies).
+    ps.builderBytes = static_cast<int32_t>(rune::protocol::batch::kRecordBatchOverhead + ps.builder->bodyBytes());
+    recordsSent_ += static_cast<uint64_t>(count);
+}
 
 rune::client::detail::ControlledAction ProducerImpl::appendRecord_(
     int32_t topicId, int32_t partition, const uint8_t* keyBytes, uint8_t keyLen,
@@ -1391,151 +1506,53 @@ rune::client::detail::ControlledAction ProducerImpl::appendRecord_(
 {
     using rune::client::detail::ControlledAction;
     PartitionState& ps = getOrCreatePartition(topicId, partition);
+    if (admitRecord_(ps, keyLen, valueLen, flags, ackHandle) == ControlledAction::ABORT) {
+        return ControlledAction::ABORT;
+    }
+    const int32_t index = ps.builder->recordCount();
+    const std::string_view kv(reinterpret_cast<const char*>(keyBytes), static_cast<std::size_t>(keyLen));
+    const std::string_view vv(reinterpret_cast<const char*>(valBytes), static_cast<std::size_t>(valueLen));
+    ps.builder->append(kv, vv, wallMs());
+    // ---- committed: nothing below throws -----------------------------------
+    noteAppended_(ps, index, 1, flags, ackHandle, nowNs);
+    return ControlledAction::CONTINUE;
+}
 
-    // Task 14 fix1 I1: a record must never overtake a Tier-2 batch queued before
-    // it on the same partition.  flushBatches sends Tier-1 before Tier-2, so a
-    // record appended while a Tier-2 entry waits (e.g. window full) would leave
-    // first.  Hold it (ABORT: Ring keeps it in the ring, Direct back-pressures /
-    // keeps it deferred) until the Tier-2 queue is empty.
+rune::client::detail::ControlledAction ProducerImpl::admitBatch_(PartitionState& ps, uint8_t keyLen, uint32_t n,
+                                                                 uint32_t recLen) {
+    using rune::client::detail::ControlledAction;
+    // Same ordering rule as a record: never ahead of a queued Tier-2 batch.
     if (!ps.pendingTier2Entries.empty()) return ControlledAction::ABORT;
-
-    // Effective per-frame cap: use maxFrameBytes when it is a tighter bound
-    // than batchBytes (i.e. maxFrameBytes > 0 and < batchBytes).  Zero-cost
-    // on the normal path (maxFrameBytes >= batchBytes): the min-style compare
-    // collapses to batchBytes with no new branch taken.
-    // M2: use the frame-cap values computed once at construction (cfg_ immutable).
-    const bool frameCapped = frameCapped_;
-    const int32_t effCap = effCap_;
-
-    // BACKPRESSURE / FRAME-SPLIT: ABORT before appending when accumulating
-    // this record would push the frame past effCap.
-    //
-    // Normal path (frameCapped=false, effCap=batchBytes):
-    //   ABORT only when ALSO at maxInFlight (can't flush; classic backpressure).
-    //   Zero new hot-path branch: frameCapped=false → condition is identical
-    //   to the old `builderBytes >= batchBytes && inFlight >= maxInFlight`.
-    //
-    // Frame-cap path (frameCapped=true, effCap=maxFrameBytes < batchBytes):
-    //   Use an exact pre-flight check: compute the wire contribution of this
-    //   record (recordBodyContrib) and ABORT if appending it would push
-    //   builderBytes past effCap.  The check uses wallMs() for tsDelta, which
-    //   is the same function the builder calls inside append() — so the
-    //   predicted size matches the actual encoded size.  The builder is reset
-    //   to builderBaseWallMs on each frame boundary.
-    //   ABORT even when inFlight has room so the current frame is flushed
-    //   first; this guarantees NO emitted RecordBatch exceeds effCap wire.
-    if (frameCapped && ps.builder && ps.builder->recordCount() > 0) {
-        // Compute exact wire contribution of this next record.
-        // wallMs() here and inside builder->append() may differ by one ms tick,
-        // which can shift varlongLen(tsDelta) by +1 byte at boundary values.
-        // Adding 1 byte of slack makes the check conservative (splits ≤1 byte
-        // early at boundary values) but guarantees NO overshoot.
-        const int64_t tsDelta = wallMs() - ps.builderBaseWallMs;
-        const int32_t contrib = recordBodyContrib(
-            static_cast<int32_t>(keyLen),
-            static_cast<int32_t>(valueLen),
-            tsDelta,
-            ps.builder->recordCount() /* offsetDelta = current record count */)
-            + 1; // +1 byte slack for wallMs() jitter between pre-flight and append
-
-        if (ps.builderBytes + contrib > effCap) {
-            // Record would overshoot: ABORT.  flushBatches will fire on
-            // sizeFull (builderBytes >= effCap) or via flushRequested=true
-            // when builderBytes < effCap but still needs to flush.
-            if (ps.builderBytes < effCap) {
-                // sizeFull won't trigger (builder not yet at cap); force flush
-                // via otherTrigger so the current batch is sent this cycle.
-                ps.flushRequested = true;
-            }
+    const int64_t body = claimBatchWireBound(keyLen, n, recLen) -
+                         static_cast<int64_t>(rune::protocol::batch::kRecordBatchOverhead);
+    if (ps.builder && ps.builder->recordCount() > 0) {
+        // Join the open batch only when the WHOLE claim fits it; otherwise
+        // flush that batch first and start an empty one with the claim.
+        const bool overBytes   = static_cast<int64_t>(ps.builderBytes) + body > static_cast<int64_t>(effCap_);
+        const bool overRecords = cfg_.batchRecords > 0 &&
+                                 static_cast<int64_t>(ps.builder->recordCount()) + n > cfg_.batchRecords;
+        if (overBytes || overRecords) {
+            ps.flushRequested = true;
             return ControlledAction::ABORT;
         }
     }
-    // Normal-path backpressure: a full builder ABORTs, regardless of the window.
-    // No flush runs between appends in either mode (F12: Ring drains a whole pass
-    // and the hub flushes once after it; Direct (Task 14) flushes at the end of
-    // the owner's pass) — so without this a builder would grow past batchBytes
-    // into an oversized frame.  Ring: the ABORT ends the drain pass, the hub
-    // flushes the full builder and drains again; if the window is full too, the
-    // record stays in the ring (back-pressure).
-    if (!frameCapped && ps.builderBytes >= effCap) {
-        return ControlledAction::ABORT;
-    }
-    // Task 14 fix1 M2 / F12: batchRecords is enforced at append time too, in
-    // both modes (no flush runs between appends).
-    if (cfg_.batchRecords > 0 && ps.builder &&
-        ps.builder->recordCount() >= cfg_.batchRecords) {
-        return ControlledAction::ABORT;
-    }
-
-    // Create the builder ONCE per partition; reused (reset in place) across
-    // batches so there is no per-batch heap allocation.
-    if (!ps.builder) {
-        const int64_t baseWall = wallMs();
-        ps.builder = std::make_unique<ProduceFrameBuilder>(0, baseWall);
-        ps.builderBaseWallMs = baseWall;
-    }
-    // I1 FIX (frame cap): builderBaseWallMs is never re-sampled here — it already
-    // equals the builder's actual baseTimestamp (set at construction above and at
-    // the reset(0, resetWall) in encodeAndSend), so the pre-flight tsDelta is
-    // computed against the SAME base the builder encodes with.
-    const int32_t index = ps.builder->recordCount();  // this record's offsetDelta
-
-    // Per-record acks at the record's OWN index (spec §4.3): the slice of a
-    // batch is aligned with its records, void records hold 0.  Zeros are
-    // back-filled lazily so batches without callbacks cost nothing.
-    //
-    // Task 14 fix1 M1: exception safety.  Everything that can throw (builder
-    // creation above, ack-ring growth here, the builder append below) happens
-    // BEFORE anything is committed; the ack slots are reserved first and only
-    // written after the append succeeded.  So on a throw the record is not in
-    // the builder AND the handle is not in the ack ring — the caller still owns
-    // it (exactly once).
-    const bool wantAck = (flags & kFlagWantAck) && ackHandle != 0;
-    if (wantAck) {
-        const uint64_t need = static_cast<uint64_t>(index - ps.batchAckCount) + 1u;
-        while (ps.ackHead - ps.ackTail + need > ps.ackRing.size()) growAckRing(ps);
-    }
-
-    // I2: a single record whose own wire contribution exceeds the frame cap
-    // cannot be split.  It is still emitted (alone) to guarantee progress, but
-    // we surface it loudly so an over-cap frame is never produced silently.
-    if (frameCapped && ps.builder->recordCount() == 0) {
-        const int32_t soloContrib = recordBodyContrib(
-            static_cast<int32_t>(keyLen), static_cast<int32_t>(valueLen),
-            /*tsDelta=*/0, /*offsetDelta=*/0);
-        if (soloContrib > effCap) {
-            std::fprintf(stderr,
-                "ProducerImpl: single record wire=%d exceeds maxFrameBytes=%d "
-                "(topic=%d part=%d); emitting oversize frame (broker may reject)\n",
-                soloContrib, effCap, topicId, partition);
-        }
-    }
-
-    const std::string_view kv(reinterpret_cast<const char*>(keyBytes),
-                              static_cast<std::size_t>(keyLen));
-    const std::string_view vv(reinterpret_cast<const char*>(valBytes),
-                              static_cast<std::size_t>(valueLen));
-    ps.builder->append(kv, vv, wallMs());
-
-    // ---- committed: nothing below throws (ack slots reserved above) ----------
-    // fix2: the batch clock is the EARLIEST record's acceptance time (a deferred
-    // record carries its own; Kafka accumulator semantics).
-    if (index == 0 || nowNs < ps.batchStartNs) ps.batchStartNs = nowNs;
-    markDirty_(ps);  // F12: no-throw (capacity reserved with the partition)
-    if (wantAck) {
-        if (ps.batchAckCount == 0) ps.batchAckStart = ps.ackHead;
-        while (ps.batchAckCount < index) pushAck_(ps, 0);
-        pushAck_(ps, ackHandle);
-    }
-    // Track the TRUE encoded WIRE size (fixed batch header + accumulated
-    // record bodies), not just value bytes — so the batch flushes at
-    // batchBytes of WIRE and never overshoots the broker's max produce
-    // batch size (the old value-only count undercounted per-record framing
-    // by ~20B/record, producing ~70KB wire for a "64KB" batch → rejected).
-    ps.builderBytes = static_cast<int32_t>(
-        rune::protocol::batch::kRecordBatchOverhead + ps.builder->bodyBytes());
-    ++recordsSent_;
+    ensureBuilder_(ps);
+    ps.builder->reserveExtra(static_cast<std::size_t>(body));  // the n appends cannot reallocate / throw
     return ControlledAction::CONTINUE;
+}
+
+void ProducerImpl::appendBatch_(PartitionState& ps, const uint8_t* keyBytes, uint8_t keyLen, const uint8_t* recs,
+                                uint32_t n, uint32_t recLen, int64_t nowNs) {
+    // Capacity for all n was reserved by admitBatch_: no append below
+    // reallocates, so the n records land together.
+    const int32_t first = ps.builder->recordCount();
+    const std::string_view kv(reinterpret_cast<const char*>(keyBytes), static_cast<std::size_t>(keyLen));
+    const int64_t ts = wallMs();
+    for (uint32_t i = 0; i < n; ++i) {
+        const std::string_view vv(reinterpret_cast<const char*>(recs + static_cast<std::size_t>(i) * recLen), recLen);
+        ps.builder->append(kv, vv, ts);
+    }
+    noteAppended_(ps, first, static_cast<int32_t>(n), 0, 0, nowNs);
 }
 
 // ---------------------------------------------------------------------------
@@ -2947,6 +2964,13 @@ int ProducerImpl::discardRing_(OpStatus st, int limit, uint16_t errorCode) {
                 e.reset();
                 emitUnsentBatchAck_(tid, part, rc, st, 1);
                 completeHandle_(h, OpKind::Tier2Batch, -1, rc, st, errorCode);
+            } else if (type == kMsgClaimBatch && len >= kBatchHeaderSize) {
+                // Phase 2b B: a committed claimBatch never sent - ONE BatchAck
+                // for its n records (n credit units); claims carry no ack handle.
+                const int32_t tid  = readLE32(p, kRecTopicIdOff);
+                const int32_t part = readLE32(p, kRecPartOff);
+                const int32_t n    = static_cast<int32_t>(readLE32u(p, kBatchCountOff));
+                emitUnsentBatchAck_(tid, part, n, st, static_cast<uint32_t>(n));
             }
             // kMsgFlush: nothing to complete.
         },
@@ -3302,6 +3326,57 @@ ProducerImpl::ClaimGrant ProducerImpl::claimRecord(int32_t topicId, int32_t part
     g.result = SendResult::Ok;
     g.token  = idx;
     g.base   = dst + kRecValBytesOff;
+    return g;
+}
+
+SendResult ProducerImpl::checkBatchClaim_(const Key& key, uint32_t n, uint32_t recLen) const noexcept {
+    if (n == 0) return SendResult::InvalidArgument;
+    if (n > static_cast<uint32_t>(INT32_MAX) || key.size() + recLen > rune::client::Producer::kMaxRecordBytes) {
+        return SendResult::MessageTooLarge;
+    }
+    // A claimBatch is ONE frame: it must fit the hard per-frame wire cap.
+    if (cfg_.maxFrameBytes > 0 &&
+        claimBatchWireBound(key.size(), n, recLen) > static_cast<int64_t>(cfg_.maxFrameBytes)) {
+        return SendResult::MessageTooLarge;
+    }
+    return SendResult::Ok;
+}
+
+ProducerImpl::ClaimGrant ProducerImpl::claimBatch(int32_t topicId, int32_t partition, const Key& key, uint32_t n,
+                                                  uint32_t recLen) noexcept {
+    ClaimGrant g;
+    if (mode_ == IngressMode::Direct) {  // Direct claims arrive with Task 6
+        g.result = SendResult::InvalidArgument;
+        return g;
+    }
+    const SendResult check = checkBatchClaim_(key, n, recLen);
+    if (check != SendResult::Ok) {
+        g.result = check;
+        return g;
+    }
+    const uint64_t totalLen = static_cast<uint64_t>(kBatchHeaderSize) + static_cast<uint64_t>(n) * recLen;
+    if (totalLen > static_cast<uint64_t>(ring_.maxMsgLength())) {
+        g.result = SendResult::MessageTooLarge;  // spec B: n x recLen <= the ring's maxMsgLength
+        return g;
+    }
+    aeron::util::index_t idx = -1;
+    try {
+        idx = ring_.tryClaim(kMsgClaimBatch, static_cast<std::size_t>(totalLen));
+    } catch (...) {
+        g.result = SendResult::BackPressured;  // unreachable: type and length are pre-checked
+        return g;
+    }
+    if (idx < 0) {
+        g.result = ring_.closed() ? SendResult::Closed : SendResult::BackPressured;
+        return g;
+    }
+    uint8_t* dst = ring_.base() + idx;
+    writeClaimHeader(dst, topicId, partition, key, 0);
+    writeLE32u(dst, kBatchCountOff, n);
+    writeLE32u(dst, kBatchRecLenOff, recLen);
+    g.result = SendResult::Ok;
+    g.token  = idx;
+    g.base   = dst + kBatchRecsOff;
     return g;
 }
 

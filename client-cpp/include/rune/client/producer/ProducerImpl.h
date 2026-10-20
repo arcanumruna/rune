@@ -75,6 +75,17 @@ namespace rune::client::producer {
 inline constexpr int32_t kMsgSendRecord  = 1; // SEND_RECORD (producer-ring local ID)
 inline constexpr int32_t kMsgFlush       = 2; // flush trigger (producer-ring local ID)
 inline constexpr int32_t kMsgTier2Batch  = 3; // Tier-2 explicit batch token
+inline constexpr int32_t kMsgClaimBatch  = 4; // Phase 2b B: claimBatch — n records, ONE RecordBatch
+
+// CLAIM_BATCH layout (kMsgClaimBatch payload): [0..33] exactly as SEND_RECORD
+// (topicId, partition, keyLen, inline key, flags = 0, ackHandle = 0), then
+//   [34..37] n      : uint32 LE (records)
+//   [38..41] recLen : uint32 LE (value bytes per record)
+//   [42..]          : n x recLen value bytes, contiguous
+inline constexpr int kBatchCountOff   = 34;
+inline constexpr int kBatchRecLenOff  = 38;
+inline constexpr int kBatchRecsOff    = 42;
+inline constexpr int kBatchHeaderSize = 42;
 
 // ---------------------------------------------------------------------------
 // SEND_RECORD layout constants
@@ -548,6 +559,12 @@ public:
     /// value and commitClaim()s.  ZERO allocation.  Results as trySubmit.
     [[nodiscard]] ClaimGrant claimRecord(int32_t topicId, int32_t partition, const Key& key,
                                          uint32_t valueLen, uint64_t ackHandle) noexcept;
+    /// Reserve n records of recLen bytes appended as ONE RecordBatch: Ring — a
+    /// CLAIM_BATCH ring message (header written, records contiguous at `base`).
+    /// Refusals: InvalidArgument (n == 0), MessageTooLarge (per-record cap,
+    /// maxFrameBytes bound, ring maxMsgLength), Closed, BackPressured.
+    [[nodiscard]] ClaimGrant claimBatch(int32_t topicId, int32_t partition, const Key& key, uint32_t n,
+                                        uint32_t recLen) noexcept;
     /// Publish a granted claim.  False: it was released under the caller
     /// (Ring: Client close's drain unblock) — nothing was accepted.
     [[nodiscard]] bool commitClaim(int64_t token) noexcept;
@@ -1165,6 +1182,28 @@ private:
     rune::client::detail::ControlledAction appendRecord_(int32_t topicId, int32_t partition,
         const uint8_t* keyBytes, uint8_t keyLen, const uint8_t* valBytes, uint32_t valueLen,
         uint8_t flags, uint64_t ackHandle, int64_t nowNs);
+    /// Create the partition's builder once (reused across batches).
+    void ensureBuilder_(PartitionState& ps);
+    /// Every check before ONE record may join `ps`'s builder (Tier-2 queued
+    /// ahead, frame cap, batchBytes, batchRecords), the builder created and the
+    /// record's ack-ring room reserved.  ABORT = back-pressure (nothing changed).
+    rune::client::detail::ControlledAction admitRecord_(PartitionState& ps, uint8_t keyLen, uint32_t valueLen,
+                                                        uint8_t flags, uint64_t ackHandle);
+    /// Same for a claimBatch of n x recLen: it joins a non-empty builder only
+    /// when it fits whole (else flushRequested + ABORT); builder capacity for
+    /// all n is reserved so appending them cannot throw (all or none).
+    rune::client::detail::ControlledAction admitBatch_(PartitionState& ps, uint8_t keyLen, uint32_t n,
+                                                       uint32_t recLen);
+    /// Append an admitted CLAIM_BATCH's n records (one timestamp), then account them.
+    void appendBatch_(PartitionState& ps, const uint8_t* keyBytes, uint8_t keyLen, const uint8_t* recs,
+                      uint32_t n, uint32_t recLen, int64_t nowNs);
+    /// Accounting after `count` records starting at offsetDelta `firstIndex`
+    /// were written into ps.builder: batch clock, dirty list, the ack handle of
+    /// an acked single record (room reserved by admitRecord_), wire size, count.
+    void noteAppended_(PartitionState& ps, int32_t firstIndex, int32_t count, uint8_t flags, uint64_t ackHandle,
+                       int64_t nowNs);
+    /// claimBatch's size rules, shared by both ingress modes.
+    [[nodiscard]] SendResult checkBatchClaim_(const Key& key, uint32_t n, uint32_t recLen) const noexcept;
 
     /// Double a partition's ack-ring, preserving live entries [ackTail, ackHead).
     /// Called only on overflow (deep single-partition pipeline); steady state
