@@ -6,6 +6,7 @@
 
 #include <gtest/gtest.h>
 
+#include <stdexcept>
 #include <vector>
 
 using namespace rune::codec;
@@ -24,11 +25,9 @@ TEST(FilterSchema, SlotsMatchMaterializedOffsetsPerVersion) {
             const int32_t i = s.indexOfTag(f.id);
             ASSERT_GE(i, 0) << f.name;
             const FieldSlot sl = s.slot(i, v);
-            const auto* mf = m.find(f.name);
-            // a retired name may coexist with a live one of the same tag-distinct name; match by tag
+            // match the materialized field by tag (a retired name may coexist with a live one)
             const FieldDescriptor* byTag = nullptr;
             for (const auto& x : m.fields) if (x.id == f.id) byTag = &x;
-            (void)mf;
             if (s.field(i).why != FilterSchema::Ineligible::No) { EXPECT_FALSE(sl.present) << f.name; continue; }
             if (!byTag) { EXPECT_FALSE(sl.present) << f.name << " v" << v; continue; }
             ASSERT_TRUE(sl.present) << f.name << " v" << v;
@@ -37,6 +36,16 @@ TEST(FilterSchema, SlotsMatchMaterializedOffsetsPerVersion) {
             EXPECT_EQ(sl.type, f.type);
         }
     }
+}
+
+TEST(FilterSchema, LiteralOffsetsInV1) {   // independent of materializeAsOf: playerId u64 @0, worldId u32 @8, channel i32 @12, zone @16
+    const FilterSchema s = FilterSchema::build(playerEvent(), 3);
+    EXPECT_EQ(s.slot(s.indexOfTag(0), 1).offset, 4u);
+    EXPECT_EQ(s.slot(s.indexOfTag(1), 1).offset, 4u + 8);
+    EXPECT_EQ(s.slot(s.indexOfTag(2), 1).offset, 4u + 12);
+    EXPECT_EQ(s.slot(s.indexOfTag(3), 1).offset, 4u + 16);
+    EXPECT_EQ(s.slot(s.indexOfTag(3), 1).width, 8);
+    EXPECT_EQ(s.slot(s.indexOfTag(1), 1).width, 4);
 }
 
 TEST(FilterSchema, RetiredFieldIsAbsentInLaterVersions) {
@@ -75,7 +84,7 @@ TEST(FilterSchema, ExtendFromKeepsFieldIndicesStable) {
     const int32_t before = s.indexOfTag(1);
     ASSERT_GE(before, 0);
     EXPECT_EQ(s.indexOfTag(9), -1);
-    ASSERT_TRUE(s.extendFrom(FilterSchema::build(playerEvent(3), 3)));
+    ASSERT_EQ(s.extendFrom(FilterSchema::build(playerEvent(3), 3)), FilterSchema::ExtendResult::Extended);
     EXPECT_EQ(s.indexOfTag(1), before);
     EXPECT_EQ(s.maxVersion(), 3);
     const int32_t g = s.indexOfTag(9);
@@ -94,23 +103,68 @@ TEST(FilterSchema, ExtendFromKeepsFieldIndicesStable) {
         }
 }
 
+namespace {
+// every slot of every field, flattened: equal tables <=> unchanged schema
+std::vector<FieldSlot> allSlots(const FilterSchema& s) {
+    std::vector<FieldSlot> out;
+    for (std::size_t i = 0; i < s.fieldCount(); ++i)
+        for (uint16_t v = 0; v <= s.maxVersion() + 1; ++v) out.push_back(s.slot(static_cast<int32_t>(i), v));
+    return out;
+}
+bool sameSlots(const std::vector<FieldSlot>& a, const std::vector<FieldSlot>& b) {
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i)
+        if (a[i].offset != b[i].offset || a[i].width != b[i].width || a[i].type != b[i].type || a[i].present != b[i].present) return false;
+    return true;
+}
+}  // namespace
+
 TEST(FilterSchemaRegression, ExtendFromRefusesAChangedFieldTypeRegression) {
     FilterSchema s = FilterSchema::build(playerEvent(2), 2);
     DescriptorBuilder b("player_event");
     b.addTagged("playerId", 0, PrimType::UInt64, 1, 0xFFFF, true, {});
     b.addTagged("worldId", 1, PrimType::Int64, 1, 0xFFFF, false, {});   // tag 1 retyped
+    b.addTagged("extra", 20, PrimType::UInt32, 1, 0xFFFF, false, {});   // a new tag must not leak in either
     const FilterSchema bad = FilterSchema::build(b.build(), 3);
-    const int32_t w = s.indexOfTag(1);
-    const FieldSlot before = s.slot(w, 2);
-    EXPECT_FALSE(s.extendFrom(bad));
-    EXPECT_EQ(s.maxVersion(), 2);                 // unchanged
-    EXPECT_EQ(s.indexOfTag(9), s.indexOfTag(9));
-    EXPECT_EQ(s.slot(w, 2).offset, before.offset);
-    EXPECT_EQ(s.field(w).type, PrimType::UInt32);
-    // fewer versions is also not an extension
+    const std::size_t fc = s.fieldCount();
+    const auto slots = allSlots(s);
+    EXPECT_EQ(s.extendFrom(bad), FilterSchema::ExtendResult::Incompatible);
+    EXPECT_EQ(s.fieldCount(), fc);
+    EXPECT_EQ(s.maxVersion(), 2);
+    EXPECT_EQ(s.indexOfTag(20), -1);
+    EXPECT_TRUE(sameSlots(slots, allSlots(s)));
+    EXPECT_EQ(s.field(s.indexOfTag(1)).type, PrimType::UInt32);
+    EXPECT_FALSE(s.slot(s.indexOfTag(1), 3).present);
+}
+
+TEST(FilterSchema, ExtendFromOlderOrEqualBuildIsStaleAndChangesNothing) {
     FilterSchema t = FilterSchema::build(playerEvent(3), 3);
-    EXPECT_FALSE(t.extendFrom(FilterSchema::build(playerEvent(1), 1)));
+    const std::size_t fc = t.fieldCount();
+    const auto slots = allSlots(t);
+    EXPECT_EQ(t.extendFrom(FilterSchema::build(playerEvent(1), 1)), FilterSchema::ExtendResult::Stale);
+    EXPECT_EQ(t.extendFrom(FilterSchema::build(playerEvent(3), 3)), FilterSchema::ExtendResult::Stale);
     EXPECT_EQ(t.maxVersion(), 3);
+    EXPECT_EQ(t.fieldCount(), fc);
+    EXPECT_TRUE(sameSlots(slots, allSlots(t)));
+}
+
+TEST(FilterSchemaRegression, BuildRejectsTheSentinelVersionRegression) {
+    EXPECT_THROW((void)FilterSchema::build(playerEvent(1), 0xFFFF), std::invalid_argument);
+    EXPECT_THROW((void)FilterSchema::build(playerEvent(1), 0), std::invalid_argument);
+    EXPECT_NO_THROW((void)FilterSchema::build(playerEvent(1), 1));
+}
+
+TEST(FilterSchema, EmptyFixedStrHasItsOwnReason) {
+    DescriptorBuilder b("t");
+    b.addTagged("k", 0, PrimType::UInt64, 1, 0xFFFF, true, {});
+    b.addFixedStrTagged("z", 1, 0, 1, 0xFFFF, false);
+    const FilterSchema s = FilterSchema::build(b.build(), 1);
+    EXPECT_EQ(s.field(s.indexOfTag(1)).why, FilterSchema::Ineligible::FixedStrEmpty);
+    auto bytes = std::vector<uint8_t>{1, 1, 1, 0, static_cast<uint8_t>(PrimType::FixedStr), 1, 1};
+    auto p = parseFilter(bytes, s);
+    ASSERT_FALSE(p);
+    EXPECT_EQ(p.error().kind, FilterErrorKind::FixedStrEmpty);
+    EXPECT_EQ(describe(p.error()).find("longer than 16"), std::string::npos);
 }
 
 namespace {

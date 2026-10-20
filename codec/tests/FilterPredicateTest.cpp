@@ -7,7 +7,6 @@
 #include <gtest/gtest.h>
 
 #include <array>
-#include <atomic>
 #include <cstdlib>
 #include <new>
 #include <vector>
@@ -16,6 +15,12 @@
 namespace { std::size_t gNewCount = 0; }
 void* operator new(std::size_t n) { ++gNewCount; if (void* p = std::malloc(n ? n : 1)) return p; throw std::bad_alloc(); }
 void* operator new[](std::size_t n) { ++gNewCount; if (void* p = std::malloc(n ? n : 1)) return p; throw std::bad_alloc(); }
+void* operator new(std::size_t n, std::align_val_t a) { ++gNewCount; if (void* p = std::aligned_alloc(std::size_t(a), (n + std::size_t(a) - 1) / std::size_t(a) * std::size_t(a))) return p; throw std::bad_alloc(); }
+void* operator new[](std::size_t n, std::align_val_t a) { return ::operator new(n, a); }
+void operator delete(void* p, std::align_val_t) noexcept { std::free(p); }
+void operator delete[](void* p, std::align_val_t) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t, std::align_val_t) noexcept { std::free(p); }
+void operator delete[](void* p, std::size_t, std::align_val_t) noexcept { std::free(p); }
 void operator delete(void* p) noexcept { std::free(p); }
 void operator delete[](void* p) noexcept { std::free(p); }
 void operator delete(void* p, std::size_t) noexcept { std::free(p); }

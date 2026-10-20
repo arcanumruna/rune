@@ -85,7 +85,7 @@ struct FilterBytes {
 enum class FilterErrorKind : uint8_t {
     Malformed, BadFormatVersion, TermCount, UnknownOp, ValueCount, NotCanonical,
     TooManyTerms, TooManyValues, ValueOutOfRange, UnknownTag, TypeMismatch,
-    VariableLength, FloatField, FixedStrTooLong, UntypedTopic, Capacity, BufferTooSmall, UnknownField };
+    VariableLength, FloatField, FixedStrTooLong, UntypedTopic, Capacity, BufferTooSmall, UnknownField, FixedStrEmpty };
 
 struct FilterError {
     FilterErrorKind kind      = FilterErrorKind::Malformed;
@@ -118,6 +118,7 @@ struct FilterError {
         case FilterErrorKind::Capacity:         return "filter capacity";
         case FilterErrorKind::BufferTooSmall:   return "filter: output buffer too small";
         case FilterErrorKind::UnknownField:     return term + ": unknown field";
+        case FilterErrorKind::FixedStrEmpty:    return termTag + "string(0) field cannot be filtered";
     }
     return "filter: malformed";
 }

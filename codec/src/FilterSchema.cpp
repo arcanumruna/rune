@@ -3,6 +3,7 @@
 #include <rune/codec/Evolve.h>
 
 #include <algorithm>
+#include <stdexcept>
 
 namespace rune::codec {
 
@@ -13,11 +14,14 @@ FilterSchema::Ineligible classify(const FieldDescriptor& f) noexcept {
         case PrimType::String: case PrimType::Bytes: return FilterSchema::Ineligible::VariableLength;
         default: break;
     }
-    return isFilterable(f) ? FilterSchema::Ineligible::No : FilterSchema::Ineligible::FixedStrTooLong;
+    if (isFilterable(f)) return FilterSchema::Ineligible::No;
+    return f.fixedLen == 0 ? FilterSchema::Ineligible::FixedStrEmpty : FilterSchema::Ineligible::FixedStrTooLong;
 }
 }  // namespace
 
 FilterSchema FilterSchema::build(const Descriptor& evolving, uint16_t currentVersion) {
+    if (currentVersion == 0 || currentVersion == 0xFFFF)
+        throw std::invalid_argument("FilterSchema::build: currentVersion must be 1..0xFFFE");
     FilterSchema s;
     s.maxVersion_ = currentVersion;
     s.fields_.reserve(evolving.fields.size());
@@ -28,8 +32,9 @@ FilterSchema FilterSchema::build(const Descriptor& evolving, uint16_t currentVer
         s.fields_.push_back(std::move(x));
     }
     std::sort(s.fields_.begin(), s.fields_.end(), [](const Field& a, const Field& b) { return a.tag < b.tag; });
-    for (uint16_t v = 1; v <= currentVersion; ++v) {
-        const Descriptor m = materializeAsOf(evolving, v);
+    for (uint32_t v = 1; v <= currentVersion; ++v) {
+        const auto ver = static_cast<uint16_t>(v);
+        const Descriptor m = materializeAsOf(evolving, ver);
         for (const auto& f : m.fields) {
             const int32_t i = s.indexOfTag(f.id);
             if (i < 0) continue;
@@ -41,15 +46,15 @@ FilterSchema FilterSchema::build(const Descriptor& evolving, uint16_t currentVer
     return s;
 }
 
-bool FilterSchema::extendFrom(const FilterSchema& newer) {
-    if (newer.maxVersion_ < maxVersion_) return false;
+FilterSchema::ExtendResult FilterSchema::extendFrom(const FilterSchema& newer) {
     for (const auto& n : newer.fields_) {
         const int32_t i = indexOfTag(n.tag);
         if (i >= 0) {
             const Field& o = fields_[static_cast<std::size_t>(i)];
-            if (o.type != n.type || o.fixedLen != n.fixedLen) return false;
+            if (o.type != n.type || o.fixedLen != n.fixedLen) return ExtendResult::Incompatible;
         }
     }
+    if (newer.maxVersion_ <= maxVersion_) return ExtendResult::Stale;
     // Validated: nothing below can refuse.
     for (const auto& n : newer.fields_) {
         int32_t i = indexOfTag(n.tag);
@@ -68,7 +73,7 @@ bool FilterSchema::extendFrom(const FilterSchema& newer) {
     for (auto& f : fields_)   // fields the newer build lacks keep their old slots; pad to the new length
         f.byVersion.resize(static_cast<std::size_t>(newer.maxVersion_) + 1);
     maxVersion_ = newer.maxVersion_;
-    return true;
+    return ExtendResult::Extended;
 }
 
 int32_t FilterSchema::indexOfTag(uint16_t tag) const noexcept {
@@ -105,6 +110,7 @@ std::expected<ParsedFilter, FilterError> parseFilter(std::span<const uint8_t> b,
         switch (f.why) {
             case FilterSchema::Ineligible::VariableLength: return fail(FilterErrorKind::VariableLength, t, tag);
             case FilterSchema::Ineligible::Float:          return fail(FilterErrorKind::FloatField, t, tag);
+            case FilterSchema::Ineligible::FixedStrEmpty:  return fail(FilterErrorKind::FixedStrEmpty, t, tag);
             case FilterSchema::Ineligible::FixedStrTooLong:return fail(FilterErrorKind::FixedStrTooLong, t, tag);
             case FilterSchema::Ineligible::No: break;
         }

@@ -25,7 +25,8 @@ struct FieldSlot {
 
 class FilterSchema {
 public:
-    enum class Ineligible : uint8_t { No, VariableLength, Float, FixedStrTooLong };
+    enum class Ineligible : uint8_t { No, VariableLength, Float, FixedStrTooLong, FixedStrEmpty };
+    enum class ExtendResult : uint8_t { Extended, Stale, Incompatible };
     struct Field {
         uint16_t tag = 0;
         PrimType type = PrimType::Int32;
@@ -35,13 +36,16 @@ public:
     };
 
     /// Cold.  Every field ever declared in `evolving` (live and retired), sorted by tag; slots for v in
-    /// 1..currentVersion from materializeAsOf(evolving, v).  Throws std::invalid_argument on a malformed descriptor.
+    /// 1..currentVersion from materializeAsOf(evolving, v).  Throws std::invalid_argument when currentVersion is 0 or 0xFFFF (the
+    /// codec's "never dropped" sentinel); a malformed descriptor throws from materializeAsOf.
     static FilterSchema build(const Descriptor& evolving, uint16_t currentVersion);
 
     /// Cold.  In place: extend with a newer build of the SAME topic (more versions, more tags); existing field
-    /// indices stay valid.  false (and *this unchanged) when `newer` is not an extension (a tag's type or fixedLen
-    /// differs, or `newer` has fewer versions).
-    [[nodiscard]] bool extendFrom(const FilterSchema& newer);
+    /// indices stay valid (but this may reallocate: references from field() are invalidated, so hold indices).
+    ///   Extended     - applied.
+    ///   Stale        - newer.maxVersion() <= ours and otherwise consistent; *this unchanged (a harmless re-delivery).
+    ///   Incompatible - a tag's type or fixedLen differs; *this unchanged (a real conflict).
+    [[nodiscard]] ExtendResult extendFrom(const FilterSchema& newer);
 
     [[nodiscard]] int32_t      indexOfTag(uint16_t tag) const noexcept;   // -1 = unknown
     [[nodiscard]] const Field& field(int32_t idx) const noexcept { return fields_[static_cast<std::size_t>(idx)]; }
