@@ -10,6 +10,7 @@
 
 #include <chrono>
 #include <map>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -279,4 +280,83 @@ TEST(GroupSeek, ClosingTheConsumerCompletesAPendingRewindClosed) {
     ASSERT_TRUE(driveUntilDone(f.r, f.done, t));
     EXPECT_EQ(f.done[t].c.status, rc::OpStatus::Closed);
     EXPECT_EQ(f.done[t].times, 1);
+}
+
+namespace {
+// Replaces the fixture's onRecords: records every offset, and on the FIRST batch runs `onFirst`
+// inside the callback.
+template <class Fn>
+void wireRewindOnFirstBatch(Fixture& f, Fn onFirst) {
+    auto fired = std::make_shared<bool>(false);
+    f.gc.onRecords([&f, fired, onFirst](const rc::RecordSet& rs) {
+        rs.forEachRecord([&](auto, auto, int64_t offset, int64_t) { f.seen.offsets[rs.partition].push_back(offset); });
+        if (!*fired) { *fired = true; onFirst(rs); }
+    });
+    (void)f.r.drive([] { return false; }, 2'000);   // the setter travels the ring: a few cycles
+}
+} // namespace
+
+// A seek to the current batch's start, issued INSIDE onRecords, must win over the position advance
+// that follows the callback: the batch is redelivered.  RED before the fix: the advance overwrote
+// the seek, the re-pushed batch was dropped as a duplicate (Ok, nothing delivered).
+TEST(GroupSeekRegression, SeekInsideOnRecordsToTheBatchStartRedeliversTheBatchRegression) {
+    Fixture f(4317, 4318, {{kTopic, 1}});
+    const rc::Token t = f.tok();
+    wireRewindOnFirstBatch(f, [&](const rc::RecordSet& rs) {
+        EXPECT_EQ(f.gc.seek({kTopic, 1}, rs.baseOffset, rc::CompletionTarget(f.r.cq), t), rc::OpResult::Accepted);
+    });
+    const auto s = *f.r.gw.latestSubscription(kTopic, 1);
+    f.r.gw.pushRecords(s, 0, 5);
+    ASSERT_TRUE(f.consumed(1, 5));
+    ASSERT_TRUE(driveUntilDone(f.r, f.done, t));
+    EXPECT_EQ(f.done[t].c.status, rc::OpStatus::Ok);
+    const auto cur = *f.r.gw.latestSubscription(kTopic, 1);
+    ASSERT_NE(cur.corrId, s.corrId);
+    EXPECT_EQ(cur.fromOffset, 0);
+    f.r.gw.pushRecords(cur, 0, 5);
+    ASSERT_TRUE(f.consumed(1, 10)) << "the batch the callback rewound to was never redelivered";
+    EXPECT_EQ(f.seen.offsets[1][5], 0);
+}
+
+TEST(GroupSeekRegression, SeekToCommittedInsideOnRecordsRedeliversTheBatchRegression) {
+    Fixture f(4319, 4320, {{kTopic, 1}});
+    const rc::Token t = f.tok();
+    wireRewindOnFirstBatch(f, [&](const rc::RecordSet&) {
+        EXPECT_EQ(f.gc.seekToCommitted(rc::CompletionTarget(f.r.cq), t), rc::OpResult::Accepted);
+    });
+    const auto s = *f.r.gw.latestSubscription(kTopic, 1);
+    f.r.gw.pushRecords(s, 0, 5);
+    ASSERT_TRUE(f.consumed(1, 5));
+    ASSERT_TRUE(driveUntilDone(f.r, f.done, t));
+    EXPECT_EQ(f.done[t].c.status, rc::OpStatus::Ok);
+    const auto cur = *f.r.gw.latestSubscription(kTopic, 1);
+    ASSERT_NE(cur.corrId, s.corrId);
+    EXPECT_EQ(cur.fromOffset, 0);
+    f.r.gw.pushRecords(cur, 0, 5);
+    ASSERT_TRUE(f.consumed(1, 10));
+    EXPECT_EQ(f.seen.offsets[1][5], 0);
+}
+
+// seek(-1) used to land on the unseeded sentinel: the partition was never subscribed again.
+TEST(GroupSeekRegression, NegativeSeekOffsetIsInvalidArgumentNotAStallRegression) {
+    Fixture f(4321, 4322, {{kTopic, 1}});
+    const auto s = *f.r.gw.latestSubscription(kTopic, 1);
+    const rc::Token t = f.tok();
+    ASSERT_EQ(f.gc.seek({kTopic, 1}, -1, rc::CompletionTarget(f.r.cq), t), rc::OpResult::Accepted);
+    ASSERT_TRUE(driveUntilDone(f.r, f.done, t));
+    EXPECT_EQ(f.done[t].c.status, rc::OpStatus::InvalidArgument);
+    EXPECT_EQ(f.done[t].text, "offset must be >= 0");
+    EXPECT_THROW(f.gc.seekAndWait({kTopic, 1}, -5, std::chrono::seconds(5)), std::invalid_argument);
+    EXPECT_THROW(f.gc.seek({kTopic, 1}, -1), std::invalid_argument);
+    // Nothing was disturbed: the original subscription still feeds the partition.
+    EXPECT_EQ(f.r.gw.latestSubscription(kTopic, 1)->corrId, s.corrId);
+    f.r.gw.pushRecords(s, 0, 3);
+    ASSERT_TRUE(f.consumed(1, 3));
+}
+
+// The void seek must not drop a refusal at submit: a closed consumer throws.
+TEST(GroupSeekRegression, VoidSeekOnAClosedConsumerThrowsNeverDropsItRegression) {
+    Fixture f(4323, 4324, {{kTopic, 1}});
+    f.gc.close();
+    EXPECT_THROW(f.gc.seek({kTopic, 1}, 0), std::runtime_error);
 }

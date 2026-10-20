@@ -250,6 +250,7 @@ struct GroupConsumerImpl {
         int64_t  subscriptionId = 0;      // bound by the SubscribeResponse (0 = unanswered)
         bool     offsetKnown    = false;  // OffsetFetch answered (OK) for it this generation
         bool     parked         = false;  // refused: retried on fresh metadata
+        uint32_t rewindEpoch    = 0;      // bumped by every rewind applied to this partition (a delivery callback's seek wins over the post-callback advance)
         bool     rewound        = false;  // Task 10: restarted by a seek, not yet re-bound (the pending Rewind waits on it)
         uint8_t  redirects      = 0;      // consecutive Redirects without a bind
     };
@@ -492,8 +493,11 @@ public:
     /// seekToCommitted (op = OpKind::Seek), plus OpStatus::InvalidArgument (payload "partition not
     /// assigned") when `tp` is not in the assignment — that check needs duty-side state (G6).
     OpResult seek(TopicPartition tp, int64_t offset, CompletionTarget target, Token token);
-    /// Fire-and-forget: issues the token form with an internal handler and drops the result: an
-    /// unassigned partition is reported only by the token / AndWait forms (G6).
+    /// Fire-and-forget: issues the token form with an internal handler and drops the COMPLETION: an
+    /// unassigned partition is reported only by the token / AndWait forms (G6).  A refusal at
+    /// submit is never dropped silently: BackPressured (command ring full) is retried for a
+    /// bounded time then throws std::runtime_error; WrongThread / Closed throw std::runtime_error
+    /// naming the status; offset < 0 throws std::invalid_argument.
     void seek(TopicPartition tp, int64_t offset);
     /// Cold-path blocking form; throws std::invalid_argument for an unassigned partition,
     /// std::runtime_error on any other non-Ok outcome.

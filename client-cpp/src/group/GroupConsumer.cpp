@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <exception>
+#include <chrono>
 #include <memory>
 #include <stdexcept>
 #include <span>
@@ -278,10 +279,30 @@ OpResult GroupConsumer::issueSeek_(void* ctx, const CompletionTarget& target, To
 }
 
 void GroupConsumer::seek(TopicPartition tp, int64_t offset) {
-    // G6: fire-and-forget — the internal handler drops the outcome.
+    // G6: fire-and-forget — the internal handler drops the COMPLETION; a refusal at submit throws.
+    if (offset < 0) throw std::invalid_argument("seek(): offset must be >= 0");
     static constexpr CompletionHandler kDrop{
         [](void*, const Completion&, std::span<const uint8_t>) noexcept {}, nullptr};
-    (void)seek(tp, offset, CompletionTarget(kDrop), Token{0});
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    for (;;) {
+        switch (seek(tp, offset, CompletionTarget(kDrop), Token{0})) {
+        case OpResult::Accepted:
+            return;
+        case OpResult::BackPressured:
+            if (std::chrono::steady_clock::now() >= deadline) {
+                throw std::runtime_error("seek(): not delivered, the command ring stayed full (BackPressured)");
+            }
+            std::this_thread::yield();   // the duty thread drains the ring
+            continue;
+        case OpResult::Closed:
+            throw std::runtime_error("seek(): GroupConsumer closed (Closed)");
+        case OpResult::WrongThread:
+            throw std::runtime_error("seek(): called off the owner thread (WrongThread)");
+        case OpResult::InvalidArgument:
+        case OpResult::QueueFull:
+            throw std::runtime_error("seek(): refused at submit (InvalidArgument/QueueFull)");
+        }
+    }
 }
 
 void GroupConsumer::seekAndWait(TopicPartition tp, int64_t offset, std::chrono::nanoseconds timeout) {

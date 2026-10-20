@@ -201,6 +201,8 @@ void GroupConsumerHub::applyRewind_(const detail::HubCommand& cmd, GroupConsumer
     };
     if (impl == nullptr || !impl->active) { reply(OpStatus::Closed); return; }
     TopicPartition seekTp{};
+    // A negative offset is never a position (-1 is the unseeded sentinel: the partition would stall).
+    if (isSeek && cmd.d < 0) { reply(OpStatus::InvalidArgument, "offset must be >= 0"); return; }
     if (isSeek) {
         seekTp = TopicPartition{static_cast<int32_t>(static_cast<uint64_t>(cmd.e) >> 32),
                                 static_cast<int32_t>(static_cast<uint32_t>(cmd.e))};
@@ -225,6 +227,7 @@ void GroupConsumerHub::applyRewind_(const detail::HubCommand& cmd, GroupConsumer
         pos             = newPos;  // kUnseededSentinel: auto-commit can never commit a stale position
         fs.offsetKnown  = known;
         fs.rewound      = true;
+        ++fs.rewindEpoch;          // a callback-applied rewind survives the post-callback advance
         fs.parked       = false;
         fs.redirects    = 0;
     };
@@ -1515,6 +1518,11 @@ void GroupConsumerHub::onRecords(const codec::RecordsView& rv)
         }
 
         // Deliver to consumer. fix1 C1: noexcept doWork chain — catch/count/log.
+        uint32_t rewindEpoch0 = 0;
+        if (routed_()) {
+            const auto f0 = impl->fetch.find(key);
+            if (f0 != impl->fetch.end()) rewindEpoch0 = f0->second.rewindEpoch;
+        }
         if (impl->cbRecords) {
             DispatchScope scope(*this, *impl);
             try {
@@ -1536,6 +1544,12 @@ void GroupConsumerHub::onRecords(const codec::RecordsView& rv)
         // falls back to 1 for empty/stub batches (test helpers).  The callback
         // may have rebalanced this consumer: look the partition up again.
         const auto again = impl->assignment.find(key);
+        if (routed_()) {
+            // A seek / seekToCommitted applied INSIDE the callback owns the position: the advance
+            // would overwrite it (a seek to this batch's start must redeliver the batch).
+            const auto f1 = impl->fetch.find(key);
+            if (f1 != impl->fetch.end() && f1->second.rewindEpoch != rewindEpoch0) return;
+        }
         if (again != impl->assignment.end() && again->second == pos) again->second = end;
         return;
     }
