@@ -72,3 +72,49 @@ TEST(GeneratorRegression, MoreThanOneKeyFieldIsRejected) {
         EXPECT_NE(msg.find("orderId"), std::string::npos) << msg;
     }
 }
+
+TEST(Generator, EmitsZeroCopyFlyweightsForAnAllFixedSchema) {
+    auto d = DescriptorBuilder("position").add("userId", PrimType::Int64, 1, true)
+               .add("zone", PrimType::Int32).addFixedStr("tag", 8).build();
+    const std::string hdr = generateHeader(d);
+    EXPECT_NE(hdr.find("class PositionEncoder {"), std::string::npos);
+    EXPECT_NE(hdr.find("class PositionDecoder {"), std::string::npos);
+    EXPECT_NE(hdr.find("using Encoder = PositionEncoder;"), std::string::npos);
+    EXPECT_NE(hdr.find("using Decoder = PositionDecoder;"), std::string::npos);
+    EXPECT_NE(hdr.find("static constexpr uint32_t kEncodedLength = 4u + kBlockLength;"), std::string::npos);
+    EXPECT_NE(hdr.find("static constexpr bool     kHasKey        = true;"), std::string::npos);
+    EXPECT_NE(hdr.find("using KeyType = int64_t;"), std::string::npos);
+    EXPECT_NE(hdr.find("PositionEncoder& zone(int32_t v) noexcept {"), std::string::npos);
+    EXPECT_NE(hdr.find("::rune::codec::fly::store<int32_t>(p_ + 4u + 8u, v);"), std::string::npos)
+        << "zone sits at block offset 8";
+    EXPECT_NE(hdr.find("PositionEncoder& tag(std::string_view v) noexcept {"), std::string::npos);
+    EXPECT_NE(hdr.find("#include <rune/codec/Flyweight.h>"), std::string::npos);
+}
+
+TEST(Generator, NoFlyweightsForASchemaWithVarLenFields) {
+    auto d = DescriptorBuilder("characters").add("id", PrimType::Int64, 1, true)
+               .add("name", PrimType::String).build();
+    const std::string hdr = generateHeader(d);
+    EXPECT_EQ(hdr.find("Encoder"), std::string::npos);
+    EXPECT_EQ(hdr.find("Decoder"), std::string::npos);
+    EXPECT_NE(hdr.find("size_t encode(uint8_t* buf) const noexcept"), std::string::npos)
+        << "var-len schemas keep today's struct + encode()";
+}
+
+TEST(Generator, KeylessAllFixedSchemaHasNoKeyHelpers) {
+    auto d = DescriptorBuilder("tick").add("seq", PrimType::UInt64).add("value", PrimType::Float64).build();
+    const std::string hdr = generateHeader(d);
+    EXPECT_NE(hdr.find("class TickEncoder {"), std::string::npos);
+    EXPECT_NE(hdr.find("static constexpr bool     kHasKey        = false;"), std::string::npos);
+    EXPECT_EQ(hdr.find("KeyType"), std::string::npos);
+}
+
+// Part C rejects a `key` field next to a key field, so the only reachable
+// `key` field is on a keyless schema: it gets a plain setter, no key helpers.
+TEST(Generator, AFieldNamedKeyOnAKeylessSchemaIsAPlainFlyweightSetter) {
+    auto d = DescriptorBuilder("kv").add("key", PrimType::Int64).add("v", PrimType::Int32).build();
+    const std::string hdr = generateHeader(d);
+    EXPECT_NE(hdr.find("class KvEncoder {"), std::string::npos);
+    EXPECT_NE(hdr.find("KvEncoder& key(int64_t v) noexcept {"), std::string::npos);
+    EXPECT_EQ(hdr.find("KeyType"), std::string::npos);
+}

@@ -50,6 +50,175 @@ static std::string_view cppType(PrimType t) noexcept {
     return "/* unknown */";
 }
 
+// ─── Phase 2b Part B: zero-copy flyweights (all-fixed schemas) ───────────────
+
+/// True when every field lives in the fixed block (no String / Bytes): only
+/// then is a record's encoded length known before it is written.
+static bool allFixed(const Descriptor& d) {
+    return std::none_of(d.fields.begin(), d.fields.end(),
+                        [](const FieldDescriptor& f) { return isVarLen(f.type); });
+}
+
+/// The schema's single key field; nullptr when it has none or several
+/// (composite keys are Phase 3).
+static const FieldDescriptor* singleKeyField(const Descriptor& d) {
+    const FieldDescriptor* k = nullptr;
+    for (const auto& f : d.fields) {
+        if (!f.isKey) continue;
+        if (k != nullptr) return nullptr;
+        k = &f;
+    }
+    return k;
+}
+
+/// Flyweights are emitted for all-fixed schemas.  (A non-key field named `key`
+/// next to a key field is already rejected above, so no collision can reach here.)
+static bool wantsFlyweights(const Descriptor& d) { return allFixed(d); }
+
+/// The fly::load / fly::store template argument of a fixed scalar field.
+static std::string_view flyType(PrimType t) noexcept {
+    switch (t) {
+        case PrimType::Int32:
+        case PrimType::Enum:    return "int32_t";
+        case PrimType::Int64:   return "int64_t";
+        case PrimType::UInt16:  return "uint16_t";
+        case PrimType::UInt32:  return "uint32_t";
+        case PrimType::UInt64:  return "uint64_t";
+        case PrimType::Float64: return "double";
+        case PrimType::Bool:    return "bool";
+        default:                return "/* not a fixed scalar */";
+    }
+}
+
+/// The generated struct's member type for a field (string(N): std::array<char, N>).
+static std::string memberType(const FieldDescriptor& f) {
+    if (f.type == PrimType::FixedStr) return "std::array<char, " + std::to_string(f.fixedLen) + ">";
+    return std::string(cppType(f.type));
+}
+
+static void emitEncoder(std::ostringstream& o, const Descriptor& d, const std::string& structName) {
+    const std::string cls = structName + "Encoder";
+    const FieldDescriptor* k = singleKeyField(d);
+    o << "// " << cls << " — zero-copy writer over a claimed buffer (Producer::tryClaim,\n"
+      << "// TypedTopic::claim).  Same packed little-endian bytes as " << structName << "::encode();\n"
+      << "// every field is stored with memcpy (a claimed buffer is not aligned).\n";
+    o << "class " << cls << " {\n";
+    o << "public:\n";
+    o << "    static constexpr uint32_t kBlockLength   = " << d.blockLength << "u;\n";
+    o << "    static constexpr uint32_t kEncodedLength = 4u + kBlockLength;\n";
+    o << "    static constexpr uint16_t kVersion       = " << d.version << "u;\n";
+    o << "    static constexpr bool     kHasKey        = " << (k != nullptr ? "true" : "false") << ";\n";
+    if (k != nullptr) o << "    using KeyType = " << memberType(*k) << ";\n";
+    o << "\n";
+    o << "    /// Binds to `buf` (>= kEncodedLength bytes, else std::length_error), writes\n";
+    o << "    /// the record header [blockLength][version] and zeroes the block, so an\n";
+    o << "    /// unset field reads as 0 / empty (never stale ring bytes).\n";
+    o << "    explicit " << cls << "(std::span<uint8_t> buf) : p_(buf.data()) {\n";
+    o << "        if (buf.size() < kEncodedLength) {\n";
+    o << "            throw std::length_error(\"" << cls << ": buffer is smaller than kEncodedLength\");\n";
+    o << "        }\n";
+    o << "        ::rune::codec::fly::store<uint16_t>(p_, static_cast<uint16_t>(kBlockLength));\n";
+    o << "        ::rune::codec::fly::store<uint16_t>(p_ + 2, kVersion);\n";
+    o << "        std::memset(p_ + 4, 0, kBlockLength);\n";
+    o << "    }\n\n";
+    for (const auto& f : d.fields) {
+        if (f.type == PrimType::FixedStr) {
+            o << "    " << cls << "& " << f.name << "(std::string_view v) noexcept {\n"
+              << "        ::rune::codec::fly::storeFixedStr(p_ + 4u + " << f.offset << "u, v, "
+              << f.fixedLen << "u);\n"
+              << "        return *this;\n"
+              << "    }\n";
+        } else {
+            o << "    " << cls << "& " << f.name << "(" << cppType(f.type) << " v) noexcept {\n"
+              << "        ::rune::codec::fly::store<" << flyType(f.type) << ">(p_ + 4u + " << f.offset
+              << "u, v);\n"
+              << "        return *this;\n"
+              << "    }\n";
+        }
+    }
+    if (k != nullptr) {
+        if (k->name != "key") {  // a key field named `key` already has this setter
+            if (k->type == PrimType::FixedStr) {
+                o << "    " << cls << "& key(const KeyType& v) noexcept {\n"
+                  << "        std::memcpy(p_ + 4u + " << k->offset << "u, v.data(), " << k->fixedLen << "u);\n"
+                  << "        return *this;\n"
+                  << "    }\n";
+            } else {
+                o << "    " << cls << "& key(KeyType v) noexcept { return " << k->name << "(v); }\n";
+            }
+        }
+        if (k->type == PrimType::FixedStr) {
+            o << "    [[nodiscard]] KeyType key() const noexcept {\n"
+              << "        KeyType v{};\n"
+              << "        std::memcpy(v.data(), p_ + 4u + " << k->offset << "u, " << k->fixedLen << "u);\n"
+              << "        return v;\n"
+              << "    }\n";
+        } else {
+            o << "    [[nodiscard]] KeyType key() const noexcept {\n"
+              << "        return ::rune::codec::fly::load<" << flyType(k->type) << ">(p_ + 4u + " << k->offset
+              << "u);\n"
+              << "    }\n";
+        }
+    }
+    o << "\nprivate:\n";
+    o << "    uint8_t* p_;\n";
+    o << "};\n\n";
+}
+
+static void emitDecoder(std::ostringstream& o, const Descriptor& d, const std::string& structName) {
+    const std::string cls = structName + "Decoder";
+    const FieldDescriptor* k = singleKeyField(d);
+    o << "// " << cls << " — zero-copy reader over one record of any version: a field\n"
+      << "// outside the record's own block (an older, shorter version) or past its end\n"
+      << "// reads as 0 / empty; a longer block (a newer version) is fine (fixed offsets).\n";
+    o << "class " << cls << " {\n";
+    o << "public:\n";
+    o << "    static constexpr uint32_t kBlockLength = " << d.blockLength << "u;\n";
+    o << "    static constexpr bool     kHasKey      = " << (k != nullptr ? "true" : "false") << ";\n";
+    if (k != nullptr) o << "    using KeyType = " << memberType(*k) << ";\n";
+    o << "\n";
+    o << "    explicit " << cls << "(std::span<const uint8_t> rec) noexcept\n"
+      << "        : p_(rec.data()), size_(rec.size()),\n"
+      << "          bl_(rec.size() >= 2 ? ::rune::codec::fly::load<uint16_t>(rec.data()) : 0u) {}\n\n";
+    for (const auto& f : d.fields) {
+        const uint32_t w = fieldWidth(f);
+        if (f.type == PrimType::FixedStr) {
+            o << "    [[nodiscard]] std::string_view " << f.name << "() const noexcept {\n"
+              << "        return has_(" << f.offset << "u, " << w << "u)\n"
+              << "            ? ::rune::codec::fly::loadFixedStr(p_ + 4u + " << f.offset << "u, " << w << "u)\n"
+              << "            : std::string_view{};\n"
+              << "    }\n";
+        } else {
+            o << "    [[nodiscard]] " << cppType(f.type) << " " << f.name << "() const noexcept {\n"
+              << "        return has_(" << f.offset << "u, " << w << "u)\n"
+              << "            ? ::rune::codec::fly::load<" << flyType(f.type) << ">(p_ + 4u + " << f.offset << "u)\n"
+              << "            : " << cppType(f.type) << "{};\n"
+              << "    }\n";
+        }
+    }
+    if (k != nullptr && k->name != "key") {
+        if (k->type == PrimType::FixedStr) {
+            o << "    [[nodiscard]] KeyType key() const noexcept {\n"
+              << "        KeyType v{};\n"
+              << "        if (has_(" << k->offset << "u, " << k->fixedLen << "u)) {\n"
+              << "            std::memcpy(v.data(), p_ + 4u + " << k->offset << "u, " << k->fixedLen << "u);\n"
+              << "        }\n"
+              << "        return v;\n"
+              << "    }\n";
+        } else {
+            o << "    [[nodiscard]] KeyType key() const noexcept { return " << k->name << "(); }\n";
+        }
+    }
+    o << "\nprivate:\n";
+    o << "    [[nodiscard]] bool has_(uint32_t off, uint32_t w) const noexcept {\n";
+    o << "        return off + w <= bl_ && 4u + off + w <= size_;\n";
+    o << "    }\n";
+    o << "    const uint8_t* p_;\n";
+    o << "    std::size_t    size_;\n";
+    o << "    uint32_t       bl_;\n";
+    o << "};\n\n";
+}
+
 // ─── generateHeader ───────────────────────────────────────────────────────────
 
 std::string generateHeader(const Descriptor& d, std::string_view nspace) {
@@ -83,13 +252,16 @@ std::string generateHeader(const Descriptor& d, std::string_view nspace) {
     o << "// Auto-generated by rune_codec_gen — DO NOT EDIT\n";
     o << "#pragma once\n";
     o << "#include <array>\n";
+    o << "#include <cstddef>\n";
     o << "#include <cstdint>\n";
     o << "#include <cstring>\n";
     o << "#include <span>\n";
+    o << "#include <stdexcept>\n";
     o << "#include <string_view>\n";
     o << "#include <vector>\n";
     o << "#include <rune/codec/Descriptor.h>\n";
     o << "#include <rune/codec/Fingerprint.h>\n";
+    o << "#include <rune/codec/Flyweight.h>\n";
     o << "#include <rune/codec/Serialize.h>\n";
     o << "\n";
 
@@ -99,6 +271,13 @@ std::string generateHeader(const Descriptor& d, std::string_view nspace) {
     }
     o << "\n";
 
+    // ── 2b Part B: flyweight forward declarations (all-fixed schemas) ────────
+    const bool fly = wantsFlyweights(d);
+    if (fly) {
+        o << "class " << structName << "Encoder;\n";
+        o << "class " << structName << "Decoder;\n\n";
+    }
+
     // ── Struct ───────────────────────────────────────────────────────────────
     o << "struct " << structName << " {\n";
 
@@ -107,6 +286,10 @@ std::string generateHeader(const Descriptor& d, std::string_view nspace) {
     o << "    static constexpr uint16_t     kVersion     = " << d.version << "u;\n";
     o << "    static constexpr uint64_t     kFingerprint = " << fp << "ull;\n";
     o << "    static constexpr std::string_view kSchemaName = \"" << d.name << "\";\n";
+    if (fly) {
+        o << "    using Encoder = " << structName << "Encoder;  // zero-copy writer (all-fixed schema)\n";
+        o << "    using Decoder = " << structName << "Decoder;  // zero-copy reader\n";
+    }
     o << "\n";
 
     // ── Members: fixed fields ────────────────────────────────────────────────
@@ -377,6 +560,11 @@ std::string generateHeader(const Descriptor& d, std::string_view nspace) {
     o << "    }\n";
 
     o << "}; // struct " << structName << "\n";
+    if (fly) {
+        o << "\n";
+        emitEncoder(o, d, structName);
+        emitDecoder(o, d, structName);
+    }
 
     // ── Namespace close ──────────────────────────────────────────────────────
     o << "\n";

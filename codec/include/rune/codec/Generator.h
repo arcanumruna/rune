@@ -26,6 +26,11 @@ namespace rune::codec {
 ///     std::span<const uint8_t> over the content).  TypedTopic::send routes by
 ///     Key(rec.key()); a schema with no key field gets no key() and its typed
 ///     records go to partition 0 with an empty record key.
+///   - Phase 2b Part B — for a schema whose fields are ALL fixed-size (no
+///     string / bytes): `<Struct>Encoder` (zero-copy writer over a claimed
+///     std::span<uint8_t>: chainable setters, kBlockLength, kEncodedLength,
+///     key helpers) and `<Struct>Decoder` (zero-copy reader), aliased as
+///     `<Struct>::Encoder` / `<Struct>::Decoder`.
 ///
 /// @throws std::invalid_argument if the descriptor has a key field AND a field
 ///         named "key" (the member would collide with the key() accessor).

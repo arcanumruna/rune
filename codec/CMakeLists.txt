@@ -105,6 +105,27 @@ add_custom_command(
 )
 add_custom_target(generate_str_keyed_header DEPENDS "${STR_KEYED_GEN_H}")
 
+# ── Phase 2b Part B: allfixed_sample flyweight fixture (built, not checked in) ─
+add_executable(make_allfixed_sample_blob tools/make_allfixed_sample_blob.cpp)
+target_link_libraries(make_allfixed_sample_blob PRIVATE rune_codec)
+
+set(ALLFIXED_SAMPLE_BLOB  "${CMAKE_CURRENT_BINARY_DIR}/tests/generated/allfixed_sample.blob")
+set(ALLFIXED_SAMPLE_GEN_H "${CMAKE_CURRENT_BINARY_DIR}/tests/generated/allfixed_sample.gen.h")
+
+add_custom_command(
+    OUTPUT  "${ALLFIXED_SAMPLE_BLOB}"
+    COMMAND make_allfixed_sample_blob "${ALLFIXED_SAMPLE_BLOB}"
+    DEPENDS make_allfixed_sample_blob
+    COMMENT "Generating allfixed_sample.blob (2b-B flyweight fixture)"
+)
+add_custom_command(
+    OUTPUT  "${ALLFIXED_SAMPLE_GEN_H}"
+    COMMAND rune_codec_gen "${ALLFIXED_SAMPLE_BLOB}" "${ALLFIXED_SAMPLE_GEN_H}"
+    DEPENDS rune_codec_gen "${ALLFIXED_SAMPLE_BLOB}"
+    COMMENT "Generating allfixed_sample.gen.h from allfixed_sample.blob"
+)
+add_custom_target(generate_allfixed_sample_header DEPENDS "${ALLFIXED_SAMPLE_GEN_H}")
+
 enable_testing()
 add_executable(rune_codec_tests
     tests/SmokeTest.cpp
@@ -126,12 +147,13 @@ add_executable(rune_codec_tests
     tests/MixedVersionReadTest.cpp
     tests/DecodeBoundaryMatrixTest.cpp
     tests/GeneratedKeyTest.cpp
-    tests/FlyweightTest.cpp)
+    tests/FlyweightTest.cpp
+    tests/FlyweightGeneratedRoundTripTest.cpp)
 target_include_directories(rune_codec_tests PRIVATE
     "${CMAKE_CURRENT_BINARY_DIR}/tests")
 target_link_libraries(rune_codec_tests PRIVATE rune_codec GTest::gtest_main)
 add_dependencies(rune_codec_tests generate_characters_header generate_fixedstr_sample_header
-                 generate_str_keyed_header)
+                 generate_str_keyed_header generate_allfixed_sample_header)
 include(GoogleTest)
 gtest_discover_tests(rune_codec_tests)
 
