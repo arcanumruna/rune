@@ -623,6 +623,10 @@ OpResult Producer::closeImmediately() {
 // Instrumentation counters
 // ---------------------------------------------------------------------------
 
+uint64_t Producer::framesResent() const noexcept {
+    return impl_ ? impl_->framesResent() : 0u;
+}
+
 uint64_t Producer::framesSent() const noexcept {
     return impl_ ? impl_->framesSent() : 0u;
 }

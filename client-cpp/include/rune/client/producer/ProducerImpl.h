@@ -1308,6 +1308,8 @@ public:
 
     /// Total Aeron frames offered to transport (agent-thread only; plain uint64_t).
     uint64_t framesSent()  const noexcept { return framesSent_; }
+    /// Stored frames offered AGAIN (timer / route / parked / redirect retransmits); duty side (Invoker owner in tests).
+    uint64_t framesResent() const noexcept { return framesResent_; }
 
     /// Total records accepted via drainRing (agent-thread only; plain uint64_t).
     uint64_t recordsSent() const noexcept { return recordsSent_; }
@@ -1724,6 +1726,7 @@ private:
     // ---- Instrumentation counters (agent-thread only — plain uint64_t) -------
     // Single-writer (agent thread): no atomics needed per shared-nothing law.
     uint64_t framesSent_  = 0; // total Aeron frames offered to transport
+    uint64_t framesResent_ = 0; // retransmits (offerAttempt_)
     // FR (fr-hop-instrumentation): coalescers for conditions retried every duty
     // cycle (empty when FR is compiled out).
     [[no_unique_address]] flight_recorder::Throttle frOfferRefused_{};

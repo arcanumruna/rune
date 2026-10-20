@@ -2007,6 +2007,7 @@ bool ProducerImpl::offerAttempt_(PartitionState& ps, InFlightBatch& b, int64_t n
     b.lastSendNs   = nowNs;
     b.lastSendTick = ++sendTick_;
     ++b.attempts;
+    ++framesResent_;
     if (b.laneGen != ps.laneGen) {  // NEW-4(b): the first attempt on a new lane
         b.staleLaneOut = static_cast<uint16_t>(b.staleLaneOut + b.laneOut);
         b.laneOut      = 0;

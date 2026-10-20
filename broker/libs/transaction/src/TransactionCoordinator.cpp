@@ -444,7 +444,13 @@ CompleteTransactionResult TransactionCoordinator::completeTransaction(
         // never applied, and recovery does NOT re-drive CompleteCommit → the
         // committed consumer offsets were lost (a read-process-write pipeline
         // reprocesses inputs after failover — an exactly-once violation).
-        if (offsetApplyCb_) {
+        if (checkedOffsetApplyCb_) {
+            // A refusal returns BEFORE anything is persisted or cleared: the txn stays PrepareCommit.
+            for (const auto& po : meta->pendingOffsets) {
+                if (!checkedOffsetApplyCb_(po.group, po.tp, po.offset, /*timestampNs=*/0))
+                    return { .errorCode = CompleteTransactionResult::kOffsetsPending };
+            }
+        } else if (offsetApplyCb_) {
             for (const auto& po : meta->pendingOffsets) {
                 offsetApplyCb_(po.group, po.tp, po.offset, /*timestampNs=*/0);
             }

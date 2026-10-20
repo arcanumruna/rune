@@ -36,8 +36,8 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <array>
-#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <string_view>
@@ -85,9 +85,9 @@ TransactionCoordinationService::TransactionCoordinationService(
     , coordinator_()
 {
     // A committed transaction's consumer-group offsets go to the group coordinator's offset store (setTxnOffsetSink).
-    coordinator_.setOffsetApplyCallback(
+    coordinator_.setCheckedOffsetApplyCallback(
         [this](const std::string& group, const rune::coordination::TopicPartition& tp, rune::coordination::Offset offset,
-               int64_t /*timestampNs*/) { applyTxnOffset_(group, tp, offset); });
+               int64_t /*timestampNs*/) { return applyTxnOffset_(group, tp, offset); });
     // Pre-reserve scratch containers to avoid steady-state allocation.
     partitionScratch_.reserve(32);
     partResultScratch_.reserve(32);
@@ -99,18 +99,11 @@ TransactionCoordinationService::TransactionCoordinationService(
 // ---------------------------------------------------------------------------
 // applyTxnOffset_ - one pending (group, tp, offset) of a transaction that is being COMMITTED.
 // ---------------------------------------------------------------------------
-void TransactionCoordinationService::applyTxnOffset_(const std::string& group,
+bool TransactionCoordinationService::applyTxnOffset_(const std::string& group,
                                                      const rune::coordination::TopicPartition& tp, int64_t offset)
 {
-    const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
-    if (offsetSink_ != nullptr && offsetSink_(offsetSinkCtx_, group, tp, offset, nowNs)) return;
-    // Never silent: the offsets of a committed transaction that could not be applied are lost to the group.
-    ++offsetApplyFailures_;
-    spdlog::error("TCS: a committed transaction's offset (group={} topic={} partition={} offset={}) was NOT applied "
-                  "({}): the group will re-read from its previous committed offset ({} failures so far)",
-                  group, tp.topic, tp.partition, offset, offsetSink_ == nullptr ? "no offset sink wired" : "the group "
-                  "coordinator refused it", offsetApplyFailures_);
+    if (offsetSink_ == nullptr) return true;   // no offset store on this node: nothing to apply to
+    return offsetSink_(offsetSinkCtx_, group, tp, offset, lastNowNs_);   // duty clock, as handleOffsetCommit's nowNs
 }
 
 // ---------------------------------------------------------------------------
@@ -185,6 +178,7 @@ void TransactionCoordinationService::load_(int64_t nowNs)
     const tx::ProducerId maxPid =
         coordinator_.reload(txnState_ ? txnState_->all() : noSnapshot_, coordinatorEpoch_, nowNs);
     awaiting_.clear();
+    offsetsPendingTxns_ = 0;
     queuedRetries_ = 0;
     stuckMarkers_  = 0;
     nextStuckScanNs_ = 0;
@@ -222,6 +216,7 @@ void TransactionCoordinationService::unload_()
         (void)gateway_->sendControlFrame(a.sessionId, buf.data(), n);
     }
     awaiting_.clear();
+    offsetsPendingTxns_ = 0;
     queuedRetries_ = 0;
     stuckMarkers_  = 0;
     nextStuckScanNs_ = 0;
@@ -285,6 +280,7 @@ int TransactionCoordinationService::doWork(int64_t nowNs) {
     // Drive coordinator timeout aborts (sets markersPending on timed-out txns).
     int work = coordinator_.doWork(nowNs);
     work += retryRefusedMarkers_(nowNs);
+    work += retryDeferredCompletions_(nowNs);
     // Observability only, rate-limited (review LOW-1): never a per-pass walk.
     if ((!awaiting_.empty() && nowNs >= nextStuckScanNs_) || (awaiting_.empty() && stuckMarkers_ != 0)) [[unlikely]] {
         nextStuckScanNs_ = nowNs + kStuckScanIntervalNs;
@@ -812,16 +808,15 @@ bool TransactionCoordinationService::dispatchMarkers_(
             ++a.outstanding;
         }
     }
-    if (a.outstanding == 0) {
-        completeAwaiting_(producerId, /*respond=*/false);
-        return false;                                  // completed synchronously
-    }
     if (respSessionId != 0 || respCorrelationId != 0) {
         a.respPending   = true;
         a.sessionId     = respSessionId;
         a.correlationId = respCorrelationId;
     }
-    return true;
+    if (a.outstanding == 0 && completeAwaiting_(producerId, /*respond=*/false)) {
+        return false;                                  // completed synchronously
+    }
+    return true;   // markers outstanding, or the completion deferred on a refused offset apply: answered later
 }
 
 void TransactionCoordinationService::resolveMarker_(int64_t producerId)
@@ -831,13 +826,31 @@ void TransactionCoordinationService::resolveMarker_(int64_t producerId)
     if (--it->second.outstanding == 0) completeAwaiting_(producerId, /*respond=*/true);
 }
 
-void TransactionCoordinationService::completeAwaiting_(int64_t producerId, bool respond)
+bool TransactionCoordinationService::completeAwaiting_(int64_t producerId, bool respond)
 {
     auto it = awaiting_.find(producerId);
-    if (it == awaiting_.end()) return;
-    const AwaitingMarkers a = std::move(it->second);
+    if (it == awaiting_.end()) return true;
+    AwaitingMarkers& cur = it->second;
+    const auto r = coordinator_.completeTransaction(cur.txnId);
+    if (r.errorCode == tx::CompleteTransactionResult::kOffsetsPending) {
+        // The group coordinator refused a committed offset (not loaded after a failover / gated): the txn STAYS
+        // PrepareCommit (nothing persisted, EndTxn not answered); retried from doWork with backoff.
+        if (!cur.offsetsPending) {
+            cur.offsetsPending  = true;
+            cur.offsetBackoffNs = kOffsetRetryMinNs;
+            ++offsetsPendingTxns_;
+            spdlog::warn("TCS: committed offsets of txn '{}' not applied yet (the group coordinator refused) - the "
+                         "commit stays PrepareCommit and is retried", cur.txnId);
+        } else {
+            cur.offsetBackoffNs = std::min(cur.offsetBackoffNs * 2, kOffsetRetryMaxNs);
+        }
+        cur.offsetDueNs = lastNowNs_ + cur.offsetBackoffNs;
+        ++offsetApplyRetries_;
+        return false;
+    }
+    const AwaitingMarkers a = std::move(cur);
     awaiting_.erase(it);
-    const auto r = coordinator_.completeTransaction(a.txnId);
+    if (a.offsetsPending && offsetsPendingTxns_ > 0) --offsetsPendingTxns_;
     ++transactionsCompleted_;
     // F15 m4: persist the resting Complete* (offsets were applied first, inside
     // completeTransaction).  It need not commit before the EndTxn OK: if it is
@@ -855,6 +868,17 @@ void TransactionCoordinationService::completeAwaiting_(int64_t producerId, bool 
         const std::size_t n = resp.encode(buf.data());
         (void)gateway_->sendControlFrame(a.sessionId, buf.data(), n);
     }
+    return true;
+}
+
+int TransactionCoordinationService::retryDeferredCompletions_(int64_t nowNs)
+{
+    if (offsetsPendingTxns_ == 0) return 0;
+    std::vector<int64_t> due;   // cold path (refusals only): completing erases from awaiting_
+    for (const auto& [pid, a] : awaiting_)
+        if (a.offsetsPending && a.offsetDueNs <= nowNs) due.push_back(pid);
+    for (const int64_t pid : due) (void)completeAwaiting_(pid, /*respond=*/true);
+    return static_cast<int>(due.size());
 }
 
 void TransactionCoordinationService::onControlMarkerLanded(int32_t topicId, int32_t partition, int64_t producerId,

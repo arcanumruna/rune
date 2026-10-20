@@ -169,6 +169,9 @@ struct CompleteTransactionResult {
     static constexpr int kOk                = 0;
     static constexpr int kInvalidTransition = 3;
     static constexpr int kUnknownTxnId      = 4;
+    /// A checked offset sink refused an offset of the COMMIT being completed: nothing was persisted, the
+    /// transaction stays PrepareCommit with its pendingOffsets; the caller retries completeTransaction later.
+    static constexpr int kOffsetsPending    = 5;
 
     [[nodiscard]] bool ok() const noexcept { return errorCode == kOk; }
 };
@@ -292,6 +295,14 @@ public:
     /// Install (or replace) the callback that applies a COMMITTED transaction's pending consumer-group
     /// offsets (see OffsetApplyCallback).  Single-writer: the coordinator's owner thread, before it serves.
     void setOffsetApplyCallback(OffsetApplyCallback cb) { offsetApplyCb_ = std::move(cb); }
+
+    /// Checked variant (takes precedence): returns false when the offset could not be applied NOW (the offset
+    /// store is not loaded / not the coordinator / gated).  completeTransaction(COMMIT) then persists NOTHING and
+    /// returns kOffsetsPending, leaving the transaction PrepareCommit so the caller re-drives it - a refused apply
+    /// is never a lost committed offset.  The apply is an overwrite, so a re-drive is idempotent.
+    using CheckedOffsetApplyCallback = std::function<bool(const std::string&, const rune::coordination::TopicPartition&,
+                                                          rune::coordination::Offset, int64_t)>;
+    void setCheckedOffsetApplyCallback(CheckedOffsetApplyCallback cb) { checkedOffsetApplyCb_ = std::move(cb); }
 
     // Non-copyable (holds monotonic state).
     TransactionCoordinator(const TransactionCoordinator&)            = delete;
@@ -565,6 +576,7 @@ private:
     /// Optional callback: called on COMMIT to apply pending consumer-group offsets
     /// to the OffsetStore atomically with the transaction completion (F3).
     OffsetApplyCallback offsetApplyCb_;
+    CheckedOffsetApplyCallback checkedOffsetApplyCb_;
 
     /// Primary state: transactionalId → TransactionMetadata.
     std::unordered_map<TransactionalId, TransactionMetadata> txnMap_;

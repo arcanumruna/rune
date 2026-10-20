@@ -746,8 +746,6 @@ TEST(EosBrokerRegression, ZombieIsFencedAndItsRecordsAreInvisibleRegression) {
     const TxnResult aa = wa.abort();
     EXPECT_TRUE(aa.done) << "the zombie's abort must complete (never hang)";
     EXPECT_NE(aa.status, rc::OpStatus::Ok) << "a fenced producer cannot abort successfully: " << aa.str();
-    std::fprintf(stderr, "[eos] zombie commit %s, abort %s, state %d\n", ac.str().c_str(), aa.str().c_str(),
-                 static_cast<int>(pa.state()));
 
     // B commits its own records.
     ASSERT_TRUE(wb.commit().ok());
@@ -768,14 +766,19 @@ TEST(EosBrokerRegression, ZombieIsFencedAndItsRecordsAreInvisibleRegression) {
 }
 
 // =========================================================================================================
-// 4. An in-doubt commit: the coordinator (and the seed) crashes after EndTxn was offered.
+// 4. An in-doubt commit: the coordinator (and the seed) crashes after EndTxn was offered; the commit times out and
+//    its retry commits the records exactly once.
 // =========================================================================================================
 TEST(EosBrokerRegression, InDoubtCommitRetryCommitsOnceRegression) {
     Env e("eos_indoubt");
     const rc::TopicSpec plain = e.define("eos.plain", kParts);
     const int ctl = e.ctl;
     auto cl = e.open(ctl, {plain});   // the coordinator is the seed's broker
-    rc::Producer p = cl->producer(txnConfig("eos-indoubt"));
+    // The session is declared stale after ~10 s; an op timeout below that makes the first commit a deterministic
+    // Timeout (InDoubt), so the RETRY branch always runs.
+    auto icfg = txnConfig("eos-indoubt");
+    icfg.transactionOpTimeoutMs = 7'000;
+    rc::Producer p = cl->producer(icfg);
     Writer w(*cl, p, cl->topic("eos.plain"), kParts);
     ASSERT_TRUE(w.init().ok());
 
@@ -793,20 +796,10 @@ TEST(EosBrokerRegression, InDoubtCommitRetryCommitsOnceRegression) {
     TxnResult first = w.await(ct, 90s);
     const auto took = Clock::now() - t0;
     ASSERT_TRUE(first.done) << "the in-doubt commit must complete, not hang";
-    const auto stale = std::chrono::nanoseconds(rc::session::SessionConfig{}.responseTimeoutNs);
-    EXPECT_LT(took, stale + 25s + 10s) << "the commit answered within stale + txn op timeout";
-    const bool inDoubtClass = first.status == rc::OpStatus::Ok || first.status == rc::OpStatus::Timeout ||
-                              first.status == rc::OpStatus::SessionLost;
-    EXPECT_TRUE(inDoubtClass) << "an in-doubt commit completes Ok / Timeout / SessionLost, got " << first.str();
-    std::fprintf(stderr, "[eos] in-doubt commit -> %s after %lld ms\n", first.str().c_str(),
-                 static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(took).count()));
-    if (!first.ok()) {
-        const auto t1 = Clock::now();
-        const TxnResult retry = w.commit(90s);
-        EXPECT_TRUE(retry.ok()) << "the retried commit must be Ok, got " << retry.str();
-        std::fprintf(stderr, "[eos] retried commit -> %s after %lld ms\n", retry.str().c_str(),
-                     static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t1).count()));
-    }
+    EXPECT_EQ(first.status, rc::OpStatus::Timeout) << "the commit's answer cannot arrive within the op timeout: " << first.str();
+    EXPECT_LT(took, 12s) << "the Timeout is the op deadline, not a hang";
+    const TxnResult retry = w.commit(90s);   // the in-doubt commit is retried: EndTxn(commit) is idempotent
+    EXPECT_TRUE(retry.ok()) << "the retried commit must be Ok, got " << retry.str();
     int64_t cursor = 500'000;
     ASSERT_TRUE(w.sentinel(recs, cursor).ok());
 
@@ -835,7 +828,6 @@ TEST(EosBrokerRegression, LeaderCrashMidTransactionResendsAndCommitsOnceRegressi
     ASSERT_GT(victim, 0) << "some partition is led by a non-controller broker";
     const int seed = e.otherThan(victim, e.ctl);
     ASSERT_GT(seed, 0);
-    std::fprintf(stderr, "[eos] leader-crash: victim=%d controller=%d seed=%d\n", victim, e.ctl, seed);
     auto cl = e.open(seed, {plain});
     rc::Producer p = cl->producer(txnConfig("eos-leader"));
     Writer w(*cl, p, cl->topic("eos.plain"), kParts);
@@ -854,10 +846,7 @@ TEST(EosBrokerRegression, LeaderCrashMidTransactionResendsAndCommitsOnceRegressi
     (void)cl->doWork();                       // one pass: frames to the victim are on the wire, unacked
     e.c.crash(victim);
     sendSome(120);                            // sent while the leader is gone: re-routed to the new leader
-    const auto tc0 = Clock::now();
     const TxnResult c = w.commit(150s);
-    std::fprintf(stderr, "[eos] commit after leader crash: %s after %lld ms\n", c.str().c_str(),
-                 static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - tc0).count()));
     ASSERT_TRUE(c.ok()) << "the commit after a data-leader crash: " << c.str();
     int64_t cursor = 500'000;
     ASSERT_TRUE(w.sentinel(recs, cursor).ok());
@@ -957,7 +946,6 @@ TEST(EosBrokerRegression, AbortRewindRedoOutputEqualsInputRegression) {
     int64_t cursor = 5'000'000;
     ASSERT_TRUE(w.sentinel(want, cursor).ok());
     w.expectAcksOk("loop");
-    std::fprintf(stderr, "[eos] loop: %d transactions, %d aborted and redone\n", attempts, aborts);
 
     {
         Reader rcRead(e, e.otherThan(e.ctl), {out}, -1, rc::Isolation::ReadCommitted);
@@ -1066,6 +1054,7 @@ TEST(ProducerIdBrokerRegression, RetriedBatchAcrossAReconnectIsDeduplicatedRegre
     (void)cl->doWork();   // the unacked frames are on the wire
     e.c.crash(victim);
     w.expectAcksOk("dedup");
+    EXPECT_GT(p.framesResent(), 0u) << "frames were RE-SENT after the reconnect: the dedup below is not vacuous";
     EXPECT_EQ(p.producerId(), pid0) << "a reconnect keeps the broker-assigned id";
 
     const int via = e.otherThan(victim);
@@ -1112,6 +1101,9 @@ TEST(ProducerIdBrokerRegression, PlainAckedEveryPathRegression) {
     // Steady (R1): every path delivers; acked forms complete Ok.
     for (const mx::Op op : kDataOps) id += w.issue(op, id, recs);
     w.expectAcksOk("steady");
+    p.flush();
+    for (int i = 0; i < 300; ++i) w.step();   // the paths with no ack token are on the wire and answered
+    const uint64_t resentSteady = p.framesResent();
     const int64_t pid0 = p.producerId();
     EXPECT_GE(pid0, 0);
     EXPECT_NE(pid0, rc::producer::kRigProducerId);
@@ -1131,6 +1123,8 @@ TEST(ProducerIdBrokerRegression, PlainAckedEveryPathRegression) {
     Reader rcRead(e, via, {plain, typed}, typed.topicId, rc::Isolation::ReadCommitted);
     ASSERT_TRUE(rcRead.await(recs, 90s, cl.get()));
     for (int i = 0; i < 2000; ++i) { (void)ru.client->doWork(); (void)rcRead.client->doWork(); std::this_thread::yield(); }
+    EXPECT_GT(p.framesResent(), resentSteady) << "frames were RE-SENT after the session loss: the exactly-once "
+                                                 "checks are not vacuous";
     expectExactlyOnce(ru.seen, recs, "read_uncommitted: every record once");
     expectExactlyOnce(rcRead.seen, recs, "read_committed: every record once");
 
@@ -1171,8 +1165,6 @@ TEST(EosBrokerRegression, CoordinatorCrashedUnderANonSeedClientCommitsAfterTheMo
     const auto t0 = Clock::now();
     const TxnResult c = w.commit(60s);
     const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0);
-    std::fprintf(stderr, "[eos] commit after the coordinator crash (seed %d, controller %d): %s after %lld ms\n", seed,
-                 e.ctl, c.str().c_str(), static_cast<long long>(took.count()));
     ASSERT_TRUE(c.ok()) << "the commit after a coordinator crash: " << c.str();
     EXPECT_LT(took, 45s) << "the coordinator was re-discovered, not waited on until the op deadline";
     int64_t cursor = 500'000;

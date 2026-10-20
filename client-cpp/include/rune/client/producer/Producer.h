@@ -886,6 +886,8 @@ public:
 
     /// Total Aeron frames offered to transport since this producer was created.
     uint64_t framesSent() const noexcept;
+    /// Stored frames offered again (retransmits after a timeout / reconnect / redirect); same threading as framesSent().
+    uint64_t framesResent() const noexcept;
 
     /// Total records accepted by send() / batch-add since this producer was
     /// created.

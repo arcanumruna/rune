@@ -209,13 +209,20 @@ public:
 
     /// Phase 2b F Task 11: where a COMMITTED transaction's consumer-group offsets (TxnOffsetCommit) are applied -
     /// the group coordinator's offset store (BrokerNode wires GroupCoordinationService::applyTransactionalOffset).
-    /// Without a sink the offsets would be dropped, so an unwired / refused apply is counted and logged loudly
-    /// (txnOffsetApplyFailures()).  Called on the control thread, from the transaction's completion; the apply is
-    /// an overwrite, so the coordinator's re-drive of a Prepare* transaction after a failover is idempotent.
+    /// The sink returns false when it cannot apply NOW (not the group coordinator / offsets not loaded yet /
+    /// gated): the transaction then stays PrepareCommit, its EndTxn answer stays deferred, and the completion is
+    /// retried from doWork with backoff (duty clock) until the sink accepts - a refused apply never completes the
+    /// commit.  No sink wired = no offset store on this node (unit rigs): offsets are accepted and dropped.
+    /// Called on the control thread; the apply is an overwrite, so re-drives are idempotent.
     using TxnOffsetSink = bool (*)(void* ctx, const std::string& group, const rune::coordination::TopicPartition& tp,
                                    int64_t offset, int64_t nowNs);
     void setTxnOffsetSink(TxnOffsetSink fn, void* ctx) noexcept { offsetSink_ = fn; offsetSinkCtx_ = ctx; }
-    [[nodiscard]] uint64_t txnOffsetApplyFailures() const noexcept { return offsetApplyFailures_; }
+    /// Completion attempts deferred because the sink refused (a retry counter, not a loss counter).
+    [[nodiscard]] uint64_t txnOffsetApplyRetries() const noexcept { return offsetApplyRetries_; }
+    [[nodiscard]] rune::transaction::TxnState txnStateForTest(const rune::transaction::TransactionalId& id) const {
+        const auto* m = coordinator_.metadata(id);
+        return m != nullptr ? m->state : rune::transaction::TxnState::Empty;
+    }
     void setStuckMarkersSink(StuckMarkersSink fn, void* ctx) noexcept {
         stuckSink_ = fn; stuckSinkCtx_ = ctx; stuckPublished_ = -1;
     }
@@ -225,8 +232,13 @@ private:
     uint64_t transactionsCompleted_ = 0;
     TxnOffsetSink offsetSink_    = nullptr;
     void*         offsetSinkCtx_ = nullptr;
-    uint64_t      offsetApplyFailures_ = 0;
-    void applyTxnOffset_(const std::string& group, const rune::coordination::TopicPartition& tp, int64_t offset);
+    uint64_t      offsetApplyRetries_ = 0;
+    std::size_t   offsetsPendingTxns_ = 0;   ///< awaiting_ entries deferred on a refused offset apply
+    static constexpr int64_t kOffsetRetryMinNs = 10'000'000;     // 10 ms
+    static constexpr int64_t kOffsetRetryMaxNs = 1'000'000'000;  // 1 s
+    bool applyTxnOffset_(const std::string& group, const rune::coordination::TopicPartition& tp, int64_t offset);
+    bool completeAwaiting_(int64_t producerId, bool respond);   // true: completed (entry erased)
+    int  retryDeferredCompletions_(int64_t nowNs);
     // Task 10 round 5: Prepare* transactions whose markers are still in flight,
     // keyed by the markers' producerId (one transaction per producer at a time:
     // the next one is refused with ConcurrentTransactions until this completes).
@@ -250,6 +262,9 @@ private:
         int16_t producerEpoch    = 0;       // to rebuild a retried marker
         int32_t coordinatorEpoch = -1;
         bool    commit           = false;
+        bool    offsetsPending   = false;   // completeTransaction deferred: the offset sink refused
+        int64_t offsetDueNs      = 0;
+        int64_t offsetBackoffNs  = 0;
         int64_t dispatchedNs     = 0;       // D9 re-review MEDIUM-2: gauge age of never-refused markers
         std::vector<MarkerRetry> retries;   // refused markers awaiting re-dispatch
     };
@@ -277,7 +292,6 @@ private:
                           const std::vector<rune::transaction::TopicPartition>& parts,
                           int64_t respSessionId = 0, int64_t respCorrelationId = 0);
     void resolveMarker_(int64_t producerId);
-    void completeAwaiting_(int64_t producerId, bool respond);
     [[nodiscard]] int concurrentIfPreparing_(int err) const;
 
     // F15 §5.1 — coordinator load state machine (control thread only).

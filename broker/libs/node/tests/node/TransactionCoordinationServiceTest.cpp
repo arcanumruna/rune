@@ -644,3 +644,95 @@ TEST_F(TransactionCoordinationServiceTest, EndTxnBelowMinOutCapHaltsInsteadOfDef
     EXPECT_DEATH((void)svc_->handleEndTxn(reqBuf_.data(), reqLen, 0, tiny.data(), tiny.size()),
                  "kTxnMinOutCap");
 }
+
+// ===========================================================================
+// Phase 2b F Task 11 (fix round 1): a refused transactional-offset apply defers the commit, never loses the offset.
+// ===========================================================================
+namespace {
+struct RefusingSink {
+    int refusals = 0;          ///< refuse this many applies, then accept
+    int calls    = 0;
+    int accepted = 0;
+    std::vector<int64_t> acceptedOffsets;
+    static bool apply(void* ctx, const std::string&, const rune::coordination::TopicPartition&, int64_t offset, int64_t) {
+        auto* s = static_cast<RefusingSink*>(ctx);
+        ++s->calls;
+        if (s->refusals > 0) { --s->refusals; return false; }
+        ++s->accepted;
+        s->acceptedOffsets.push_back(offset);
+        return true;
+    }
+};
+}  // namespace
+
+TEST_F(TransactionCoordinationServiceTest, RefusedOffsetApplyKeepsPrepareCommitAndRetriesUntilAcceptedRegression) {
+    RefusingSink sink;
+    sink.refusals = 3;
+
+    const std::string txn = "txnOffsetRetry";
+    std::size_t reqLen = encodeInitProducerId(reqBuf_.data(), reqBuf_.size(), 1, 1, 30'000, txn);
+    std::size_t outLen = svc_->handleInitProducerId(reqBuf_.data(), reqLen, 0, outBuf_.data(), outBuf_.size());
+    auto init = pc::InitProducerIdResponse::decode(outBuf_.data(), outLen);
+    ASSERT_TRUE(init);
+    const int64_t pid = init->producerId;
+    const int16_t ep  = init->producerEpoch;
+
+    const std::vector<pc::TxnTopicPartition> parts = {{0, 0}};
+    reqLen = encodeAddPartitions(reqBuf_.data(), reqBuf_.size(), 1, 2, pid, ep, txn, parts);
+    ASSERT_GT(svc_->handleAddPartitions(reqBuf_.data(), reqLen, 0, outBuf_.data(), outBuf_.size()), 0u);
+
+    const std::string grp = "cg-retry";
+    pc::AddOffsetsToTxn add;
+    add.sessionId = 1; add.correlationId = 3; add.producerId = pid; add.producerEpoch = ep;
+    add.transactionalId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(txn.data()), txn.size());
+    add.groupId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(grp.data()), grp.size());
+    reqLen = add.encode(reqBuf_.data());
+    ASSERT_GT(svc_->handleAddOffsets(reqBuf_.data(), reqLen, 0, outBuf_.data(), outBuf_.size()), 0u);
+
+    pc::TxnOffsetCommit toc;
+    toc.sessionId = 1; toc.correlationId = 4; toc.producerId = pid; toc.producerEpoch = ep;
+    toc.transactionalId = add.transactionalId;
+    toc.groupId = add.groupId;
+    const std::vector<pc::TxnOffsetCommitEntry> entries = {{0, 0, 42, {}}};
+    reqLen = toc.encode(reqBuf_.data(), entries);
+    ASSERT_GT(svc_->handleTxnOffsetCommit(reqBuf_.data(), reqLen, 0, outBuf_.data(), outBuf_.size()), 0u);
+
+    reqLen = encodeEndTxn(reqBuf_.data(), reqBuf_.size(), 1, 5, pid, ep, /*commit=*/true, txn);
+    outLen = svc_->handleEndTxn(reqBuf_.data(), reqLen, 0, outBuf_.data(), outBuf_.size());
+    ASSERT_EQ(pc::EndTxnResponse::decode(outBuf_.data(), outLen)->errorCode, 0);
+    ASSERT_EQ(svc_->txnStateForTest(txn), tx::TxnState::PrepareCommit);
+
+    // The controller fails over: a NEW coordinator loads the durable PrepareCommit (with its pending offsets) and
+    // re-drives its markers - exactly where the group coordinator's offsets may not be loaded yet.
+    svc_ = std::make_unique<rune::node::TransactionCoordinationService>(
+        txnStore_.get(), /*topics=*/nullptr, [this] { return isLeader_; }, [this] { return leaderNodeId_; });
+    svc_->setTxnOffsetSink(&RefusingSink::apply, &sink);
+    svc_->setAppendFnOverride([](std::string_view, int32_t, std::span<const uint8_t>) -> int64_t { return 0; });
+    int64_t now = 1'000'000'000;
+    (void)svc_->doWork(now);                                   // loads, dispatches the markers (the seam: outstanding)
+    ASSERT_EQ(svc_->txnStateForTest(txn), tx::TxnState::PrepareCommit);
+    ASSERT_EQ(svc_->awaitingMarkerTxnsForTest(), 1u);
+    svc_->onControlMarkerLanded(0, 0, pid, rune::gateway::ITxnRequestHandler::kAnyCoordinatorEpoch);   // last marker landed
+
+    // The sink refuses 3 times: PrepareCommit holds, the commit is not completed, the offset is not applied.
+    for (int i = 0; i < 3; ++i) {
+        EXPECT_EQ(svc_->txnStateForTest(txn), tx::TxnState::PrepareCommit) << "refusal " << i;
+        EXPECT_EQ(svc_->transactionsCompletedForTest(), 0u) << "EndTxn is not answered while the apply is refused";
+        EXPECT_EQ(svc_->awaitingMarkerTxnsForTest(), 1u) << "the deferred EndTxn is still awaiting";
+        EXPECT_EQ(sink.accepted, 0);
+        now += 1'100'000'000;   // beyond the 1 s backoff cap
+        (void)svc_->doWork(now);
+    }
+    EXPECT_EQ(sink.calls, 4) << "3 refusals + the accepted retry";
+    EXPECT_EQ(sink.accepted, 1) << "the offset is applied exactly once";
+    EXPECT_EQ(sink.acceptedOffsets, (std::vector<int64_t>{42}));
+    EXPECT_EQ(svc_->txnStateForTest(txn), tx::TxnState::CompleteCommit);
+    EXPECT_EQ(svc_->transactionsCompletedForTest(), 1u);
+    EXPECT_EQ(svc_->awaitingMarkerTxnsForTest(), 0u);
+    EXPECT_EQ(svc_->txnOffsetApplyRetries(), 3u);
+
+    // Nothing re-applies a completed commit.
+    now += 1'100'000'000;
+    (void)svc_->doWork(now);
+    EXPECT_EQ(sink.accepted, 1);
+}
