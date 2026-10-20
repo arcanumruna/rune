@@ -29,9 +29,9 @@ namespace rune::node::filter::fakes {
 
 // ---------------------------------------------------------------------------------------------------------------
 // player_event: tags playerId 0 u64, worldId 1 u32, channel 2 i32, zone 3 str(8), kind 4 enum, alive 5 bool,
-// hp 6 i64, name 7 string, pos 8 f64; v2 ADD guild u32 (tag 9); v3 DROP channel.
+// hp 6 i64, name 7 string, pos 8 f64; v2 ADD guild u32 (tag 9); v3 DROP channel; v4 ADD level u32 (tag 10).
 // ---------------------------------------------------------------------------------------------------------------
-inline rune::codec::Descriptor playerEvent(uint16_t uptoVersion = 3) {
+inline rune::codec::Descriptor playerEvent(uint16_t uptoVersion = 4) {
     using namespace rune::codec;
     Descriptor d = rune::examples::playerEventDescriptor();
     uint16_t nextTag = 9;
@@ -43,6 +43,11 @@ inline rune::codec::Descriptor playerEvent(uint16_t uptoVersion = 3) {
     if (uptoVersion >= 3) {
         auto r = applyOps(d, {{AlterOpType::Drop, "channel", "", PrimType::Int32, 0, {}}}, nextTag, 3);
         if (!r) throw std::runtime_error("drop channel");
+        d = *r;
+    }
+    if (uptoVersion >= 4) {   // v4 ADD level u32 (tag 10): a second version without channel
+        auto r = applyOps(d, {{AlterOpType::Add, "level", "", PrimType::UInt32, 0, {}}}, nextTag, 4);
+        if (!r) throw std::runtime_error("add level");
         d = *r;
     }
     return d;
@@ -72,7 +77,7 @@ struct BatchOpts {
 
 inline std::vector<uint8_t> encodePlayerValue(uint16_t version, const PlayerRow& v) {
     using namespace rune::codec;
-    static const Descriptor evolving = playerEvent(3);
+    static const Descriptor evolving = playerEvent(4);
     const Descriptor m = materializeAsOf(evolving, version);
     std::vector<uint8_t> out(4 + m.blockLength, 0);
     fly::store<uint16_t>(out.data(), static_cast<uint16_t>(m.blockLength));

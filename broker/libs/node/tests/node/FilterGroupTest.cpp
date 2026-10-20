@@ -662,18 +662,199 @@ TEST(FilterGroupRegression, BudgetStopsTheScanAtTheBatchThatWouldExceedItRegress
 }
 
 TEST(FilterGroupRegression, ScanSourceIdentityIsEnforcedRegression) {
+    // Debug: add() asserts on a foreign scan source.  Release: add() is addOrRefuse(); that path is exercised in
+    // every build type through the public addOrRefuse() hook (a TU compiled with NDEBUG would break the ODR of the
+    // header-only class).
     ::testing::FLAGS_gtest_death_test_style = "threadsafe";
     Rig r;
-    uint32_t id = 12345;
-    EXPECT_DEBUG_DEATH({ id = r.g.add(0, worldEq(r.schema, 1), r.schema, kSrc + 1); }, "scan source");
-#ifdef NDEBUG
+    EXPECT_DEBUG_DEATH({ (void)r.g.add(0, worldEq(r.schema, 1), r.schema, kSrc + 1); }, "scan source");
+    const uint32_t id = r.g.addOrRefuse(0, worldEq(r.schema, 1), r.schema, kSrc + 1);
     EXPECT_EQ(id, kNil);
     EXPECT_EQ(r.g.groupCounters().sourceRefused, 1u);
     EXPECT_TRUE(r.g.empty());
-#else
-    (void)id;
-#endif
     EXPECT_NE(r.add(0, worldEq(r.schema, 1)), kNil) << "the group's own source is accepted";
+    EXPECT_EQ(r.g.groupCounters().sourceRefused, 1u);
+}
+
+constexpr std::size_t kRealBudget = 128 * 1024;   // Worker kPushPassBudgetBytes
+
+TEST(FilterGroupRegression, BackPressuredBehindMemberDoesNotStarveTheScanUnderTheRealBudgetRegression) {
+    Rig r;
+    const uint32_t live = r.add(0, worldEq(r.schema, 7));
+    r.pass();
+    ASSERT_TRUE(r.inSync(live));
+    // ~80 KiB batches: a read plus a send crosses the 128 KiB pass budget.
+    const std::vector<PlayerRow> big(1500, PlayerRow{.worldId = 7});
+    for (int i = 0; i < 6; ++i) r.src.append(makePlayerBatch(i * 1500, 3, big));
+    r.src.publishAll();
+    const uint32_t stuck = r.add(1, worldEq(r.schema, 7));   // cursor 0: Behind
+    r.sink.refuse(1, 1'000'000);
+    int passes = 0;
+    while (r.sink.dataFor(0).size() < 6 && passes < 20) {
+        ++passes;
+        r.now += 1000;
+        std::size_t budget = kRealBudget;
+        r.passWith(budget, true);
+    }
+    EXPECT_EQ(r.sink.dataFor(0).size(), 6u) << "the InSync member got every batch";
+    EXPECT_LE(passes, 8) << "one batch per pass, bounded";
+    EXPECT_TRUE(r.sink.dataFor(1).empty());
+    EXPECT_FALSE(r.inSync(stuck));
+}
+
+TEST(FilterGroupRegression, LargeCatchUpDoesNotStarveTheLiveTailUnderALimitedBudgetRegression) {
+    Rig r;
+    const std::vector<PlayerRow> chunk(300, PlayerRow{.worldId = 7});   // ~16 KiB
+    for (int i = 0; i < 40; ++i) r.src.append(makePlayerBatch(i * 300, 3, chunk));
+    r.src.publishAll();
+    r.sink.cursor(0) = 40 * 300;   // the live member subscribes at the tail
+    const uint32_t live = r.add(0, worldEq(r.schema, 7));
+    const uint32_t late = r.add(1, worldEq(r.schema, 7));   // from offset 0: a 640 KiB backlog
+    int64_t next = 40 * 300;
+    uint64_t liveBatches = 0;
+    for (int i = 0; i < 60; ++i) {
+        if (i > 0) {
+            r.publish(makePlayerBatch(next, 3, chunk));
+            next += 300;
+        }
+        r.now += 1000;
+        std::size_t budget = kRealBudget;
+        r.passWith(budget, true);
+        if (i > 0) {
+            ++liveBatches;
+            EXPECT_EQ(r.sink.dataFor(0).size(), liveBatches) << "live delivery makes progress in pass " << i;
+        }
+    }
+    EXPECT_TRUE(r.inSync(live));
+    // The backlog drains too, in order and exactly once.
+    for (int i = 0; i < 100 && !r.inSync(late); ++i) { std::size_t b = kRealBudget; r.passWith(b, true); }
+    EXPECT_TRUE(r.inSync(late));
+    const auto got = r.sink.offsetsFor(1);
+    ASSERT_FALSE(got.empty());
+    for (std::size_t i = 0; i < got.size(); ++i) ASSERT_EQ(got[i], static_cast<int64_t>(i)) << i;
+    EXPECT_EQ(got.size(), static_cast<std::size_t>(next));
+}
+
+TEST(FilterGroupRegression, RefusedCatchUpSendRefundsTheReadAndTheFreshAllowanceRegression) {
+    Rig r;
+    r.src.append(makePlayerBatch(0, 3, std::vector<PlayerRow>(20, PlayerRow{.worldId = 7})));   // ~1 KiB
+    r.src.publishAll();
+    r.add(0, worldEq(r.schema, 7));
+    r.add(1, worldEq(r.schema, 7));
+    r.sink.refuse(0, 1);
+    std::size_t budget = 10;
+    r.passWith(budget, true);
+    EXPECT_EQ(r.sink.offsetsFor(1).size(), 20u)
+        << "the refused member gave back the fresh-pass allowance: the next member's oversize batch goes out";
+    EXPECT_TRUE(r.sink.dataFor(0).empty());
+    // And a pass with only a refused member spends nothing.
+    Rig q;
+    q.src.append(makePlayerBatch(0, 3, std::vector<PlayerRow>(20, PlayerRow{.worldId = 7})));
+    q.src.publishAll();
+    q.add(0, worldEq(q.schema, 7));
+    q.sink.refuse(0, 1);
+    std::size_t b2 = 10;
+    q.passWith(b2, true);
+    EXPECT_EQ(b2, 10u) << "a refused send refunds the read charge";
+    q.passWith(b2, true);
+    EXPECT_EQ(q.sink.dataFor(0).size(), 1u);
+}
+
+TEST(FilterGroupRegression, ExpiredVersionWaitDoesNotRestartOnTheNextBatchRegression) {
+    // Scan path: v2 batches interleaved with v1; the schema never arrives.
+    {
+        Rig r(FilterConfig{}, 1);
+        const uint32_t m = r.add(0, worldEq(r.schema, 7));
+        r.pass();
+        ASSERT_TRUE(r.inSync(m));
+        for (int i = 0; i < 6; ++i) r.src.append(makePlayerBatch(i, i % 2 == 0 ? 2 : 1, worlds({7})));
+        r.src.publishAll();
+        r.pass();
+        ASSERT_TRUE(std::holds_alternative<ScanStall>(r.g.scanState()));
+        r.now += 5'000'000'000;   // the one wait
+        r.pass();
+        EXPECT_TRUE(std::holds_alternative<Scanning>(r.g.scanState()));
+        EXPECT_EQ(r.g.cursorOf(m, 0), 6) << "all six batches in ONE pass after ONE wait";
+        EXPECT_EQ(r.sink.offsetsFor(0), offs({1, 3, 5}));
+        EXPECT_EQ(r.g.groupCounters().unknownVersionExcluded, 3u);
+        r.publish(makePlayerBatch(6, 2, worlds({7})));   // a later batch of the expired version: no new wait
+        r.pass();
+        EXPECT_EQ(r.g.cursorOf(m, 0), 7);
+        EXPECT_EQ(r.g.groupCounters().unknownVersionExcluded, 4u);
+    }
+    // Catch-up path.
+    {
+        Rig r(FilterConfig{}, 1);
+        for (int i = 0; i < 6; ++i) r.src.append(makePlayerBatch(i, i % 2 == 0 ? 2 : 1, worlds({7})));
+        r.src.publishAll();
+        const uint32_t m = r.add(0, worldEq(r.schema, 7));
+        r.pass();
+        ASSERT_TRUE(std::holds_alternative<VersionStall>(r.g.stateOf(m)));
+        r.now += 5'000'000'000;
+        r.pass();
+        EXPECT_TRUE(r.inSync(m)) << "one wait, then the member moves through the rest";
+        EXPECT_EQ(r.sink.offsetsFor(0), offs({1, 3, 5}));
+        EXPECT_EQ(r.g.countersOf(m).unknownVersionExcluded, 3u);
+    }
+}
+
+TEST(FilterGroupRegression, MixedAbsentVersionsLogOncePerMemberAndVersionRegression) {
+    LogCapture log;
+    Rig r(FilterConfig{}, 4);   // v3 and v4 both lack channel
+    const uint32_t a = r.add(0, channelIn(r.schema, {1, 2}));
+    const uint32_t b = r.add(1, channelEq(r.schema, 3));
+    const uint32_t c = r.add(2, worldAndChannel(r.schema, 5, 2));   // residual absent
+    r.pass();
+    ASSERT_TRUE(r.inSync(a) && r.inSync(b) && r.inSync(c));
+    for (int i = 0; i < 12; ++i) r.publish(makePlayerBatch(i, i % 2 == 0 ? 3 : 4, worlds({5})));
+    r.pass();
+    EXPECT_EQ(r.g.countersOf(a).absentExcluded, 12u);
+    EXPECT_EQ(log.count("filter: filtered field absent: sub 0 "), 2u) << "v3 once, v4 once";
+    EXPECT_EQ(log.count("filter: filtered field absent: sub 1 "), 2u);
+    EXPECT_EQ(log.count("filter: filtered field absent: sub 2 "), 2u);
+    EXPECT_EQ(log.count("schema version 3 "), 3u);
+    EXPECT_EQ(log.count("schema version 4 "), 3u);
+}
+
+TEST(FilterGroupRegression, CatchUpUnknownVersionWarnsOncePerVersionRegression) {
+    LogCapture log;
+    Rig r(FilterConfig{}, 1);
+    r.src.append(makePlayerBatch(0, 2, worlds({7, 7, 7, 7})));
+    r.src.append(makePlayerBatch(4, 2, worlds({7, 7})));
+    r.src.publishAll();
+    const uint32_t m = r.add(0, worldEq(r.schema, 7));
+    r.pass();
+    r.now += 5'000'000'000;
+    r.drain();
+    EXPECT_EQ(r.g.countersOf(m).unknownVersionExcluded, 6u);
+    EXPECT_EQ(log.count("unknown record schema version: sub 0 "), 1u) << "once per member and version, not per record";
+}
+
+TEST(FilterGroupRegression, IndexFieldSlotIsReusedAfterItsLastMemberLeavesRegression) {
+    using namespace rune::codec;
+    DescriptorBuilder db("wide");
+    for (uint16_t t = 0; t < 12; ++t) db.addTagged("f" + std::to_string(t), t, PrimType::UInt32, 1, 0xFFFF, t == 0, {});
+    const FilterSchema schema = FilterSchema::build(db.build(), 1);
+    FilterGroup g;
+    g.init(1, 0, 0, FilterConfig{}, kSrc);
+    auto on = [&](uint16_t t, uint32_t v) {
+        return mk(schema, [&](FilterWriter& w) { w.term(t, PrimType::UInt32, 4, Match<uint32_t>(v)); });
+    };
+    // 12 distinct fields one after another, one member at a time.
+    for (uint16_t t = 0; t < 12; ++t) {
+        const uint32_t m = g.add(t, on(t, 1), schema, kSrc);
+        ASSERT_NE(m, kNil) << "field " << t;
+        g.remove(m);
+    }
+    EXPECT_EQ(g.groupCounters().overCap, 0u);
+    // 8 fields live, one leaves, a 9th is accepted; with all 8 live it is refused.
+    std::vector<uint32_t> ms;
+    for (uint16_t t = 0; t < 8; ++t) ms.push_back(g.add(t, on(t, 1), schema, kSrc));
+    EXPECT_EQ(g.add(20, on(9, 1), schema, kSrc), kNil);
+    g.remove(ms[3]);
+    EXPECT_NE(g.add(21, on(9, 1), schema, kSrc), kNil) << "the freed slot serves the new field";
+    EXPECT_NE(g.add(22, on(9, 2), schema, kSrc), kNil) << "and takes more members";
+    EXPECT_EQ(g.add(23, on(3, 2), schema, kSrc), kNil) << "all 8 slots hold live fields again: field 3 is now the 9th";
 }
 
 TEST(FilterGroup, SlotsTouchedByAnIdlePassIsZero) {   // PR1: no per-member scan
@@ -791,8 +972,11 @@ TEST(FilterGroup, RecordPathAllocatesNothing) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// Seeded model check: random members, batches, back-pressure, join times; every member's client view equals the
-// matching records at or after its start cursor.
+// Seeded model check.  Random members (Eq / In / residual filters), batches (versions, control, transactional and
+// aborted under read_committed), back-pressure, undeliverable subs, random budgets (fresh or not), remove, moveSub,
+// eviction, a lagging bound and a schema that arrives late (version stalls).  Per member, over every frame it ever
+// received, in order: the offsets strictly increase (a duplicate or a reorder fails), every delivered offset at or
+// after its start is a matching record, and every matching record at or after max(start, final ring start) arrived.
 // ---------------------------------------------------------------------------------------------------------------
 class FilterGroupModel : public ::testing::TestWithParam<uint32_t> {};
 
@@ -803,10 +987,21 @@ TEST_P(FilterGroupModel, DeliveriesEqualTheMatchingRecords) {
     FilterConfig cfg;
     cfg.noteIntervalNs = 100'000;
     cfg.matchScratch = rng() % 3 == 0 ? 6 : 65'536;   // some seeds overflow constantly
-    Rig r(cfg, 2);
-    std::vector<PlayerRow> rows;   // by offset
-    struct M { uint32_t id; uint32_t sub; int64_t start; int kind; uint32_t w; std::vector<int32_t> ch; std::vector<int64_t> hp; };
+    cfg.versionWaitNs = int64_t{1} << 60;             // a stall ends only when the schema arrives
+    cfg.catchUpSharePercent = static_cast<uint32_t>(10 + rng() % 90);
+    const uint16_t startVer = static_cast<uint16_t>(1 + rng() % 2);
+    Rig r(cfg, startVer);
+    const bool rc = rng() % 3 == 0;
+    r.src.setReadCommitted(rc);
+
+    std::vector<PlayerRow> rows;      // by offset
+    std::vector<uint8_t> okRec;       // 1 = a record of a normal (non-control, non-aborted) batch
+    std::vector<int64_t> batchEnds;   // end offset of every published batch
+    int64_t bound = 0, ringStart = 0;
+    struct M { uint32_t id; std::vector<uint32_t> subs; int64_t start; int kind; uint32_t w; std::vector<int32_t> ch;
+               std::vector<int64_t> hp; bool removed = false; };
     std::vector<M> ms;
+    uint32_t nextSub = 0;
     auto matches = [&](const M& m, const PlayerRow& row) {
         switch (m.kind) {
             case 0: return row.worldId == m.w;
@@ -828,40 +1023,98 @@ TEST_P(FilterGroupModel, DeliveriesEqualTheMatchingRecords) {
         }
         CompiledFilter f = m.kind == 0 ? worldEq(r.schema, m.w) : m.kind == 1 ? channelIn(r.schema, m.ch)
                          : m.kind == 2 ? worldAndHpIn(r.schema, m.w, m.hp) : worldAndChannel(r.schema, m.w, m.ch[0]);
-        const uint32_t sub = static_cast<uint32_t>(ms.size());
+        const uint32_t sub = nextSub++;
         r.sink.cursor(sub) = start;
-        m.sub = sub;
+        m.subs.push_back(sub);
         m.id = r.add(sub, std::move(f));
         ASSERT_NE(m.id, kNil);
         ms.push_back(std::move(m));
     };
-    for (int step = 0; step < 60; ++step) {
-        switch (rng() % 5) {
-            case 0: if (ms.size() < 12) addMember(static_cast<int64_t>(rng() % (rows.size() + 1))); break;
-            case 1: if (!ms.empty()) r.sink.refuse(static_cast<uint32_t>(rng() % ms.size()), 1 + static_cast<uint32_t>(rng() % 3)); break;
-            default: {
+    auto liveIdx = [&]() {
+        std::vector<std::size_t> v;
+        for (std::size_t i = 0; i < ms.size(); ++i) if (!ms[i].removed) v.push_back(i);
+        return v;
+    };
+    bool extended = startVer >= 2;
+    const std::size_t budgets[] = {64, 600, 5'000, std::size_t{1} << 20};
+    for (int step = 0; step < 90; ++step) {
+        const auto live = liveIdx();
+        switch (rng() % 10) {
+            case 0: case 1: if (ms.size() < 14) addMember(static_cast<int64_t>(rng() % (rows.size() + 1))); break;
+            case 2: if (!live.empty()) r.sink.refuse(ms[live[rng() % live.size()]].subs.back(), 1 + static_cast<uint32_t>(rng() % 3)); break;
+            case 3: if (!live.empty()) { const auto sub = ms[live[rng() % live.size()]].subs.back(); r.sink.setDeliverable(sub, rng() % 2 == 0); } break;
+            case 4: if (!live.empty() && rng() % 2 == 0) { M& m = ms[live[rng() % live.size()]]; r.g.remove(m.id); m.removed = true; } break;
+            case 5: if (!live.empty()) {
+                M& m = ms[live[rng() % live.size()]];
+                const uint32_t old = m.subs.back(), nw = nextSub++;
+                r.sink.cursor(nw) = r.g.cursorOf(m.id, r.sink.cursor(old));
+                r.g.moveSub(m.id, nw);
+                m.subs.push_back(nw);
+            } break;
+            case 6: if (!batchEnds.empty() && rng() % 2 == 0) ringStart = std::max(ringStart, batchEnds[rng() % batchEnds.size()]); break;
+            case 7: if (!extended && rng() % 2 == 0) { ASSERT_EQ(r.schema.extendFrom(playerSchema(2)), FilterSchema::ExtendResult::Extended); extended = true; } break;
+            default: {   // publish a batch
                 std::vector<PlayerRow> batch;
                 for (uint64_t k = 1 + rng() % 6; k > 0; --k)
                     batch.push_back(PlayerRow{.worldId = static_cast<uint32_t>(rng() % 6), .channel = static_cast<int32_t>(rng() % 4),
                                               .hp = static_cast<int64_t>(rng() % 3)});
-                r.src.append(makePlayerBatch(static_cast<int64_t>(rows.size()), 2, batch));
+                BatchOpts opts;
+                bool ok = true;
+                const uint64_t kind = rng() % 12;
+                if (kind == 0) { opts.control = true; opts.producerId = 5; ok = false; batch.resize(1); }
+                else if (kind <= 2) {
+                    opts.transactional = true;
+                    opts.producerId = 9;
+                    if (rng() % 2 == 0) { if (rc) { r.src.abort(9, static_cast<int64_t>(rows.size())); ok = false; } }
+                }
+                const uint16_t ver = static_cast<uint16_t>(1 + rng() % 2);
+                r.src.append(makePlayerBatch(static_cast<int64_t>(rows.size()), ver, batch, opts));
                 rows.insert(rows.end(), batch.begin(), batch.end());
-                r.src.publishAll();
+                okRec.insert(okRec.end(), batch.size(), ok ? 1 : 0);
+                batchEnds.push_back(static_cast<int64_t>(rows.size()));
             }
         }
+        // The bound only moves forward, to a batch end (HW / LSO).
+        if (!batchEnds.empty() && rng() % 3 != 0) {
+            const int64_t cand = batchEnds[rng() % batchEnds.size()];
+            bound = std::max(bound, cand);
+        }
+        r.src.setBound(bound);
+        r.src.setRingStart(ringStart);
         r.now += static_cast<int64_t>(rng() % 200'000);
-        r.pass();
+        std::size_t budget = budgets[rng() % 4];
+        r.passWith(budget, rng() % 2 == 0);
     }
-    for (int i = 0; i < 300; ++i) {   // let every refusal run out and everyone catch up
+    // Settle: everything deliverable, no refusals, the schema known, the bound at the end, a big fresh budget.
+    if (!extended) ASSERT_EQ(r.schema.extendFrom(playerSchema(2)), FilterSchema::ExtendResult::Extended);
+    for (uint32_t sub = 0; sub < nextSub; ++sub) { r.sink.refuse(sub, 0); r.sink.setDeliverable(sub, true); }
+    bound = static_cast<int64_t>(rows.size());
+    r.src.setBound(bound);
+    for (int i = 0; i < 600; ++i) {
         r.now += 1'000'000;
         if (r.pass() == 0 && i > 5) break;
     }
     for (const M& m : ms) {
-        std::vector<int64_t> expect;
+        std::vector<int64_t> raw;
+        for (const uint32_t sub : m.subs) {
+            const auto o = r.sink.offsetsFor(sub);
+            raw.insert(raw.end(), o.begin(), o.end());
+        }
+        for (std::size_t i = 1; i < raw.size(); ++i)
+            ASSERT_GT(raw[i], raw[i - 1]) << "duplicate or reordered delivery, member " << m.id << " kind " << m.kind;
+        std::set<int64_t> expect;
         for (int64_t o = m.start; o < static_cast<int64_t>(rows.size()); ++o)
-            if (matches(m, rows[static_cast<std::size_t>(o)])) expect.push_back(o);
-        // A start inside a batch gets that whole batch: the model client drops what is below its start.
-        EXPECT_EQ(r.sink.clientView(m.sub, m.start), expect) << "member " << m.id << " kind " << m.kind << " start " << m.start;
+            if (okRec[static_cast<std::size_t>(o)] != 0 && matches(m, rows[static_cast<std::size_t>(o)])) expect.insert(o);
+        std::set<int64_t> got;
+        for (const int64_t o : raw) {
+            if (o < m.start) continue;   // the straddling first batch
+            got.insert(o);
+            EXPECT_TRUE(expect.count(o) != 0) << "member " << m.id << " got a non-matching record " << o;
+        }
+        if (m.removed) continue;
+        for (const int64_t e : expect)
+            if (e >= ringStart) EXPECT_TRUE(got.count(e) != 0) << "member " << m.id << " kind " << m.kind << " start " << m.start
+                                                                << " missed " << e << " (ring start " << ringStart << ")";
     }
 }
-INSTANTIATE_TEST_SUITE_P(Seeds, FilterGroupModel, ::testing::Range(1u, 41u));
+INSTANTIATE_TEST_SUITE_P(Seeds, FilterGroupModel, ::testing::Range(1u, 61u));

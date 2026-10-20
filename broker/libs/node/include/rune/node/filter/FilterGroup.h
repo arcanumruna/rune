@@ -40,6 +40,25 @@ namespace rune::node::filter {
 
 enum class SendOutcome : uint8_t { Sent, Retry, TooLarge };
 
+/// Number of distinct schema versions remembered per set (per member for the logs and the expired waits, per index
+/// field for the absent log).  Eight covers any realistic rolling upgrade; past eight the oldest entry is replaced
+/// round-robin, so the worst case is one repeated log line, never an allocation.
+inline constexpr std::size_t kVersionSetSize = 8;
+struct VersionSet {
+    std::array<uint16_t, kVersionSetSize> v{};
+    uint8_t n = 0, next = 0;
+    [[nodiscard]] bool has(uint16_t x) const noexcept {
+        for (uint8_t i = 0; i < n; ++i) if (v[i] == x) return true;
+        return false;
+    }
+    void add(uint16_t x) noexcept {
+        if (has(x)) return;
+        if (n < kVersionSetSize) { v[n++] = x; return; }
+        v[next] = x;
+        next = static_cast<uint8_t>((next + 1) % kVersionSetSize);
+    }
+};
+
 struct FilterConfig {
     uint32_t maxSubsPerPartition        = 4096;              // RUNE_FILTER_MAX_SUBS_PER_PARTITION
     uint32_t maxIndexValuesPerPartition = 4096;              // RUNE_FILTER_MAX_INDEX_VALUES_PER_PARTITION
@@ -47,6 +66,10 @@ struct FilterConfig {
     uint64_t noteRecords                = 65'536;            // RUNE_FILTER_NOTE_RECORDS
     int64_t  versionWaitNs              = 5'000'000'000;     // RUNE_FILTER_VERSION_WAIT_MS (5000)
     uint32_t matchScratch               = 65'536;            // RUNE_FILTER_MATCH_SCRATCH
+    /// The share of a pass's budget that catch-up (Behind members) may take while the shared scan has work; the
+    /// scan gets the rest and runs first.  Half: a live tail and a catching-up member each keep making progress,
+    /// and neither can starve the other.  With no InSync member, catch-up takes the whole budget.  0..100.
+    uint32_t catchUpSharePercent        = 50;                // RUNE_FILTER_CATCHUP_SHARE_PERCENT
 };
 
 inline constexpr std::size_t kMaxIndexFields = 8;
@@ -64,6 +87,8 @@ struct VersionStall { uint16_t version = 0; int64_t sinceNs = 0; };
 using MemberState = std::variant<Behind, InSync, VersionStall>;
 struct ScanIdle {};
 struct Scanning  { int64_t cursor = 0; };
+/// `cursor` is the scan cursor BEFORE the stalled batch (not its base): equal to the base unless offsets have a gap,
+/// and it keeps the join test (member cursor == scan cursor) and position notes valid across gaps.
 struct ScanStall { int64_t cursor = 0; uint16_t version = 0; int64_t sinceNs = 0; };
 using ScanState = std::variant<ScanIdle, Scanning, ScanStall>;
 
@@ -117,8 +142,8 @@ struct FilterScratch {
 class FilterGroup {
 public:
     /// Cold.  `sourceId` is opaque: the Worker passes the registry id plus the incarnation of the scan source.
-    void init(int32_t topicId, int32_t partition, uint8_t isolation, const FilterConfig& cfg, uint64_t sourceId = 0) {
-        topicId_ = topicId; partition_ = partition; isolation_ = isolation; cfg_ = cfg; sourceId_ = sourceId;
+    void init(int32_t topicId, int32_t partition, uint8_t /*isolation: read_committed comes from the source*/, const FilterConfig& cfg, uint64_t sourceId) {
+        topicId_ = topicId; partition_ = partition; cfg_ = cfg; sourceId_ = sourceId;
         nodes_.clear();
         nodes_.resize(kSentinels);
         for (uint32_t s = 0; s < kSentinels; ++s) {
@@ -133,7 +158,8 @@ public:
         scan_ = ScanIdle{};
         scanned_ = scannedAtSweep_ = 0;
         lastSweepNs_ = 0;
-        lastUnknownLogged_ = 0;
+        loggedUnknownGroup_ = VersionSet{};
+        expiredGroup_ = VersionSet{};
         group_ = FilterCounters{};
         slotsTouched_ = 0;
     }
@@ -141,8 +167,14 @@ public:
     /// Cold.  The member id, or kNil when a cap is reached (counted overCap, never allocating past it) or the
     /// member's scan source differs from the group's (asserts in debug; release counts sourceRefused).
     [[nodiscard]] uint32_t add(uint32_t sub, rune::codec::CompiledFilter f, const rune::codec::FilterSchema& schema,
-                               uint64_t sourceId = 0) {
+                               uint64_t sourceId) {
         assert(sourceId == sourceId_ && "FilterGroup::add: the member's scan source is not the group's");
+        return addOrRefuse(sub, std::move(f), schema, sourceId);
+    }
+    /// add() without the debug assert: the release-build behaviour (refuse and count a foreign scan source),
+    /// public so a Debug build can test the refusal.
+    [[nodiscard]] uint32_t addOrRefuse(uint32_t sub, rune::codec::CompiledFilter f,
+                                       const rune::codec::FilterSchema& schema, uint64_t sourceId) {
         if (sourceId != sourceId_) { ++group_.sourceRefused; return kNil; }
         if (count_ >= cfg_.maxSubsPerPartition) { ++group_.overCap; return kNil; }
         const uint8_t idxTerm = f.indexTerm();
@@ -151,11 +183,22 @@ public:
         (void)schema;
         uint8_t fi = 0;
         while (fi < nFields_ && fields_[fi].schemaField != term.field) ++fi;
-        if (fi == nFields_ && nFields_ == kMaxIndexFields) { ++group_.overCap; return kNil; }
+        bool reuse = false;
+        if (fi == nFields_) {   // a new field: reclaim a slot whose last member left before refusing the 9th
+            uint8_t e = 0;
+            while (e < nFields_ && fields_[e].members != 0) ++e;
+            if (e < nFields_) { fi = e; reuse = true; }
+            else if (nFields_ == kMaxIndexFields) { ++group_.overCap; return kNil; }
+        }
         const uint32_t node = freeHead_ != kNil ? freeHead_ : static_cast<uint32_t>(nodes_.size());
         const uint32_t id   = node - kSentinels;
         IndexField& F = fields_[fi];
-        if (fi == nFields_) {
+        if (reuse) {   // its index is empty (every registration was removed): re-key, keep the table
+            F.schemaField = term.field;
+            F.tag         = term.tag;
+            F.absent      = 0;
+            F.loggedAbsent = VersionSet{};
+        } else if (fi == nFields_) {
             F.schemaField = term.field;
             F.tag         = term.tag;
             F.index.init(cfg_.maxIndexValuesPerPartition, cfg_.maxSubsPerPartition);
@@ -230,16 +273,36 @@ public:
         const int64_t bound = src.bound();
         if (bound < 0) return 0;   // not servable this pass (RC not Ready, not owned)
         assert(scratch.counts.size() >= cfg_.maxSubsPerPartition && "FilterScratch::reserve(cfg) first");
-        Cx<Src, Snk> cx{src, sink, schema, scratch, nowNs, bound, budget, freshBudget};
+        const std::size_t entry = budget;
+        const bool scanActive = inSync_ > 0;
+        const bool hasCatchUp = nodes_[kCatchUp].stateLink.next != kCatchUp;
+        // The scan (the live tail of every InSync member) runs FIRST and is never starved by catch-up; catch-up gets
+        // at most catchUpSharePercent of the budget while the scan has work, and all of it when there is no scan.
+        const std::size_t pct = std::min<std::size_t>(cfg_.catchUpSharePercent, 100);
+        const std::size_t share = (scanActive && hasCatchUp) ? entry / 100 * pct + entry % 100 * pct / 100 : 0;
         int work = 0;
-        // 1. Catch-up: only the non-InSync members, each on its own cursor with its own predicate.
-        for (uint32_t n = nodes_[kCatchUp].stateLink.next; n != kCatchUp && budget > 0;) {
-            const uint32_t nxt = nodes_[n].stateLink.next;   // stepBehind_ may move n to the synced list
-            work += stepBehind_(n - kSentinels, cx);
-            n = nxt;
+        // 1. The shared scan: one read, one index probe per record and index field, residual terms on candidates.
+        std::size_t scanBudget = entry - share, scanSpent = 0;
+        if (scanActive && scanBudget > 0) {
+            const std::size_t b0 = scanBudget;
+            Cx<Src, Snk> cx{src, sink, schema, scratch, nowNs, bound, scanBudget, freshBudget};
+            work += scanStep_(cx);
+            scanSpent = b0 - scanBudget;
         }
-        // 2. The shared scan.
-        if (inSync_ > 0 && budget > 0) work += scanStep_(cx);
+        // 2. Catch-up: only the non-InSync members, each on its own cursor with its own predicate.  It has its own
+        //    fresh-pass allowance, so a scan that took the first oversize batch cannot block a catch-up forever.
+        std::size_t catchBudget = scanActive ? share : entry, catchSpent = 0;
+        if (hasCatchUp && catchBudget > 0) {
+            const std::size_t b0 = catchBudget;
+            Cx<Src, Snk> cx{src, sink, schema, scratch, nowNs, bound, catchBudget, freshBudget};
+            for (uint32_t n = nodes_[kCatchUp].stateLink.next; n != kCatchUp && catchBudget > 0;) {
+                const uint32_t nxt = nodes_[n].stateLink.next;   // stepBehind_ may move n to the synced list
+                work += stepBehind_(n - kSentinels, cx);
+                n = nxt;
+            }
+            catchSpent = b0 - catchBudget;
+        }
+        budget = entry - std::min(entry, scanSpent + catchSpent);
         // 3. Position notes: a sweep at most every noteIntervalNs / 5, or as soon as noteRecords were scanned.
         if (nowNs - lastSweepNs_ >= cfg_.noteIntervalNs / 5 || scanned_ - scannedAtSweep_ >= cfg_.noteRecords)
             work += notes_(sink, nowNs);
@@ -284,8 +347,9 @@ private:
         uint64_t pendingSkipped = 0;       // Behind: records evaluated and not delivered since the last frame / note
         uint64_t absentAtJoin = 0;         // fields_[indexField].absent when it joined (folded on leave)
         int64_t  lastFrameNs = kNoTime;
-        uint16_t loggedVersion = 0;        // unknown-version first log (FD6)
-        uint16_t loggedAbsentVersion = 0;  // absent-field first log (spec §8)
+        VersionSet loggedUnknown;          // unknown-version first log per version (FD6)
+        VersionSet loggedAbsent;           // absent-field first log per version (spec §8)
+        VersionSet expired;                // versions whose wait ran out: excluded without waiting again
         FilterCounters counters;
         Link stateLink;                    // catch-up list (non-InSync) or synced list (InSync); a free slot's chain
         Link noteLink;                     // dormant (InSync, nothing skipped) or pending (may owe a note) list
@@ -297,7 +361,7 @@ private:
         uint32_t members = 0;              // registered members
         uint32_t synced = 0;               // of those, InSync (a field with none is not probed)
         uint64_t absent = 0;
-        uint16_t loggedAbsentVersion = 0;  // hint: the version last logged for this field (reset when a member joins)
+        VersionSet loggedAbsent;           // hint: versions whose members were all logged (reset when a member joins)
     };
     template <class Src, class Snk>
     struct Cx {
@@ -397,13 +461,13 @@ private:
     static void charge_(std::size_t& budget, std::size_t n) noexcept { budget -= std::min(budget, n); }
 
     static bool collect_(FilterScratch& sc, std::span<const uint8_t> bytes, const rune::codec::FilterSchema& schema,
-                         uint16_t& unknownVer, bool& hasUnknown) {
+                         const VersionSet& expired, uint16_t& unknownVer, bool& hasUnknown) {
         sc.records.clear();
         hasUnknown = false;
         return rune::protocol::forEachRecordSpan(bytes.data(), bytes.size(), [&](const rune::protocol::RecordSpan& r) {
             if (!r.nullValue && r.value.size() >= 4) {
                 const uint16_t v = rune::codec::recordVersion(reinterpret_cast<const uint8_t*>(r.value.data()));
-                if (!hasUnknown && !schema.knowsVersion(v)) { hasUnknown = true; unknownVer = v; }
+                if (!hasUnknown && !schema.knowsVersion(v) && !expired.has(v)) { hasUnknown = true; unknownVer = v; }
             }
             sc.pushRecord(r);
         });
@@ -458,8 +522,8 @@ private:
         unlink_<&Member::noteLink>(node);
         pushBack_<&Member::noteLink>(carried > 0 ? kPending : kDormant, node);
         if (m.counters.rejoined < m.counters.fellBehind) { ++m.counters.rejoined; ++group_.rejoined; }
-        F.loggedAbsentVersion = 0;
-        lastUnknownLogged_ = 0;
+        F.loggedAbsent = VersionSet{};
+        loggedUnknownGroup_ = VersionSet{};
     }
     /// Leave InSync at `base` (Retry, TooLarge, not deliverable).  Writes the member's own cursor back.
     template <class Src, class Snk>
@@ -513,18 +577,18 @@ private:
     }
     void logAbsentField_(uint32_t fi, uint16_t version) {
         IndexField& F = fields_[fi];
-        if (F.loggedAbsentVersion == version) return;
-        F.loggedAbsentVersion = version;
+        if (F.loggedAbsent.has(version)) return;
+        F.loggedAbsent.add(version);
         for (uint32_t n = nodes_[kSynced].stateLink.next; n != kSynced; n = nodes_[n].stateLink.next) {
             Member& m = nodes_[n];
-            if (m.indexField != fi || m.loggedAbsentVersion == version) continue;
-            m.loggedAbsentVersion = version;
+            if (m.indexField != fi || m.loggedAbsent.has(version)) continue;
+            m.loggedAbsent.add(version);
             logAbsent_(m, F.tag, version);
         }
     }
     void logAbsentMember_(Member& m, const rune::codec::FilterSchema& schema, uint16_t version) {
-        if (m.loggedAbsentVersion == version) return;
-        m.loggedAbsentVersion = version;
+        if (m.loggedAbsent.has(version)) return;
+        m.loggedAbsent.add(version);
         int32_t tag = -1;
         for (uint8_t i = 0; i < m.filter.termCount(); ++i) {
             const auto& t = m.filter.term(i);
@@ -533,19 +597,17 @@ private:
         }
         logAbsent_(m, tag, version);
     }
-    void logUnknown_(const Member& m, uint16_t version) const {
+    void logUnknownMember_(Member& m, uint16_t version) {
+        if (m.loggedUnknown.has(version)) return;
+        m.loggedUnknown.add(version);
         spdlog::warn("filter: unknown record schema version: sub {} topic {} partition {} schema version {} "
                      "(records of this version are excluded)", m.sub, topicId_, partition_, version);
     }
     void logUnknownGroup_(uint16_t version) {
-        if (lastUnknownLogged_ == version) return;
-        lastUnknownLogged_ = version;
-        for (uint32_t n = nodes_[kSynced].stateLink.next; n != kSynced; n = nodes_[n].stateLink.next) {
-            Member& m = nodes_[n];
-            if (m.loggedVersion == version) continue;
-            m.loggedVersion = version;
-            logUnknown_(m, version);
-        }
+        if (loggedUnknownGroup_.has(version)) return;
+        loggedUnknownGroup_.add(version);
+        for (uint32_t n = nodes_[kSynced].stateLink.next; n != kSynced; n = nodes_[n].stateLink.next)
+            logUnknownMember_(nodes_[n], version);
     }
 
     // ---- step 1: a Behind / VersionStall member reads its own cursor with its own predicate ----
@@ -580,10 +642,12 @@ private:
                     if (tryJoin_(id, cur, cx)) return work;
                     continue;
                 }
+                const std::size_t budgetBefore = cx.budget;
+                const bool firstBefore = cx.firstOk;
                 if (!admit_(cx, h.size)) return work;
                 uint16_t uver = 0;
                 bool unknown = false;
-                if (!collect_(sc, bytes, cx.schema, uver, unknown)) {   // a batch the codec cannot walk: skip it, counted
+                if (!collect_(sc, bytes, cx.schema, m.expired, uver, unknown)) {   // a batch the codec cannot walk: skip it, counted
                     ++m.counters.malformed;
                     noteSkipped_(id, h.count);
                 } else {
@@ -606,7 +670,11 @@ private:
                                 break;
                             case rune::codec::FilterVerdict::UnknownVersion:
                                 ++m.counters.unknownVersionExcluded;
-                                logUnknown_(m, rune::codec::recordVersion(reinterpret_cast<const uint8_t*>(r.value.data())));
+                                {
+                                    const uint16_t uv = rune::codec::recordVersion(reinterpret_cast<const uint8_t*>(r.value.data()));
+                                    m.expired.add(uv);   // the wait is over for this version: no new wait on its next batch
+                                    logUnknownMember_(m, uv);
+                                }
                                 break;
                             case rune::codec::FilterVerdict::Malformed: ++m.counters.malformed; break;
                             case rune::codec::FilterVerdict::NullValue: ++m.counters.nullValueExcluded; break;
@@ -615,7 +683,11 @@ private:
                     if (sc.keep.empty()) {
                         noteSkipped_(id, h.count);
                     } else {
-                        if (send_(cx, m, h, bytes, sc.keep) != SendOutcome::Sent) return work;   // stays at `cur`
+                        if (send_(cx, m, h, bytes, sc.keep) != SendOutcome::Sent) {   // stays at `cur`
+                            cx.budget = budgetBefore;   // a refused send costs the pass nothing: refund the read
+                            cx.firstOk = firstBefore;   // and the fresh-pass allowance it used
+                            return work;
+                        }
                         m.pendingSkipped = 0;
                         m.lastFrameNs = cx.now;
                         unlink_<&Member::noteLink>(node);
@@ -683,7 +755,7 @@ private:
         stalled = false;
         uint16_t uver = 0;
         bool unknown = false;
-        if (!collect_(sc, bytes, cx.schema, uver, unknown)) {   // a batch the codec cannot walk: skip it, counted
+        if (!collect_(sc, bytes, cx.schema, expiredGroup_, uver, unknown)) {   // a batch the codec cannot walk: skip it, counted
             ++group_.malformed;
             advanceScanned_(static_cast<uint64_t>(h.count));
             scan_ = Scanning{h.end};
@@ -710,6 +782,7 @@ private:
             const uint16_t ver = rune::codec::recordVersion(value.data());
             if (!cx.schema.knowsVersion(ver)) {   // only reachable after the wait
                 ++group_.unknownVersionExcluded;
+                expiredGroup_.add(ver);   // the wait is over for this version: no new wait on its next batch
                 logUnknownGroup_(ver);
                 continue;
             }
@@ -849,7 +922,6 @@ private:
     }
 
     int32_t  topicId_ = 0, partition_ = 0;
-    uint8_t  isolation_ = 0;
     uint64_t sourceId_ = 0;
     FilterConfig cfg_;
     std::vector<Member> nodes_;        // [0, kSentinels) list sentinels, then the member slots
@@ -861,7 +933,7 @@ private:
     ScanState scan_ = ScanIdle{};
     uint64_t scanned_ = 0, scannedAtSweep_ = 0;
     int64_t  lastSweepNs_ = 0;
-    uint16_t lastUnknownLogged_ = 0;
+    VersionSet loggedUnknownGroup_, expiredGroup_;
     FilterCounters group_;
     uint64_t slotsTouched_ = 0;
 };
