@@ -295,6 +295,10 @@ public:
     /// instead of approximating from value bytes.
     std::size_t bodyBytes() const { return records_.size(); }
 
+    /// Reserve capacity for `bytes` of record bodies once (so append() never
+    /// reallocates while the body stays within it).
+    void reserveBody(std::size_t bytes) { records_.reserve(bytes); }
+
 private:
     int64_t baseOffset_, baseTimestamp_;
     int64_t maxTimestamp_    = baseTimestamp_;

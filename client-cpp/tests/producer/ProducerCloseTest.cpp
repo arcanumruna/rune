@@ -750,7 +750,7 @@ TEST(ProducerClose, CloseImmediatelyDuringFailAllAndSweepCompletesEachRecordOnce
                 bb.append("", "y", 0);
                 bb.buildInto(bytes);
                 if (cq) ASSERT_EQ(R.bq.reserve(rc::producer::kAckRecordBytes), OpResult::Accepted);
-                ASSERT_EQ(R.impl.submitTier2Batch(1, 0, AckLedger::h(4), 2, bytes),
+                ASSERT_EQ(R.impl.submitTier2Bytes(1, 0, AckLedger::h(4), 2, bytes),
                           rc::producer::RejectReason::None);
                 R.closeOnToken = 1;
                 R.impl.failAllPending(OpStatus::SessionLost);

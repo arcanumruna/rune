@@ -213,7 +213,7 @@ TEST(ProducerTxnApiRegression, TransactionalInvokerProducerOffTheOwnerThreadIsWr
         submit = impl.trySubmit(7, 0, Key(uint64_t{1}), bytes("v"), 0, &why);
         claim  = impl.claimRecord(7, 0, Key(uint64_t{1}), 8, 0).result;
         batch  = impl.claimBatch(7, 0, Key(uint64_t{1}), 2, 8).result;
-        tier2  = impl.submitTier2Batch(7, 0, 0, 1, bb);
+        tier2  = impl.submitTier2Bytes(7, 0, 0, 1, bb);
     });
     other.join();
     EXPECT_EQ(submit, SendResult::WrongThread);
@@ -225,5 +225,5 @@ TEST(ProducerTxnApiRegression, TransactionalInvokerProducerOffTheOwnerThreadIsWr
     EXPECT_EQ(impl.trySubmit(7, 0, Key(uint64_t{1}), bytes("v"), 0, nullptr), SendResult::NotInTransaction);
     EXPECT_EQ(impl.claimRecord(7, 0, Key(uint64_t{1}), 8, 0).result, SendResult::NotInTransaction);
     EXPECT_EQ(impl.claimBatch(7, 0, Key(uint64_t{1}), 2, 8).result, SendResult::NotInTransaction);
-    EXPECT_EQ(impl.submitTier2Batch(7, 0, 0, 1, bb), rc::producer::RejectReason::NotInTransaction);
+    EXPECT_EQ(impl.submitTier2Bytes(7, 0, 0, 1, bb), rc::producer::RejectReason::NotInTransaction);
 }

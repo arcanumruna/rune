@@ -168,6 +168,17 @@ struct ProducerConfig {
     std::string transactionalId;
     /// InitProducerId's transactionTimeoutMs for a transactional producer.
     int32_t     transactionTimeoutMs = 60'000;
+    /// Tier-2 (BatchBuilder) slot pool, preallocated once at creation: this many batches
+    /// may be built or queued-unsent at a time (a slot returns to the pool when its batch
+    /// is encoded and offered, failed or discarded - not at ack).  Exhausted pool =
+    /// BackPressured, never an allocation.  >= 2 x maxInFlight recommended.  Memory:
+    /// tier2Slots x 2 x tier2SlotBytes of address space (touched only as used).
+    int32_t tier2Slots     = 64;
+    /// Largest Tier-2 batch (RecordBatch header + records) one slot holds; 0 = max(batchBytes,
+    /// maxFrameBytes).
+    /// BatchBuilder::add() throws std::length_error (MessageTooLarge, non-retryable) for a
+    /// record that would take the batch past it.
+    int32_t tier2SlotBytes = 0;
     int64_t deliveryTimeoutMs = 30000;  // total time to keep retransmitting before failing.
     int64_t agentLivenessTimeoutMs = 1000; // void send(): back-pressured with no ring-consumer
                                            // heartbeat for this long => throw (runner gone)

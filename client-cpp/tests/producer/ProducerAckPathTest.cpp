@@ -394,10 +394,12 @@ TEST(ProducerAcks, AcksNoneRetainsNoAckRingEntriesRegression) {
 // retransmitting.  Under acks=None Tier-2 behaves like Tier-1: wire id 0, no
 // slot, the future resolves -1 once the frame is handed to the transport.
 TEST(ProducerAcks, AcksNoneTier2BatchesNeverOccupyInFlightSlotsRegression) {
-    auto impl = std::make_unique<ProducerImpl>(noneCfg(/*maxInFlight=*/2));
+    constexpr int kBatches = 200;
+    ProducerConfig cfg = noneCfg(/*maxInFlight=*/2);
+    cfg.tier2Slots = kBatches;  // all 200 queued unsent at once: the pool bounds that (Task 3)
+    auto impl = std::make_unique<ProducerImpl>(cfg);
     Capture cap;
     const auto sink = cap.fn();
-    constexpr int kBatches = 200;
     AckLedger L;
     L.attach(*impl);
     for (int i = 0; i < kBatches; ++i) {

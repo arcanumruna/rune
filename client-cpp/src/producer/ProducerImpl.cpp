@@ -322,6 +322,14 @@ int32_t ringTotalBytes(int32_t cap) noexcept {
     return cap + rune::client::detail::M2ORingBuffer::trailerLength();
 }
 
+// The Tier-2 free-slot ring: one 16-byte record (8 header + 4 index, aligned) per slot, in a
+// power-of-two capacity, so every slot can be in the ring at once and a return never fails.
+int32_t tier2FreeRingBytes(int32_t slots) noexcept {
+    int32_t cap = 32;
+    while (cap < std::max<int32_t>(slots, 1) * 16) cap <<= 1;
+    return cap + rune::client::detail::OneToOneRingBuffer::trailerLength();
+}
+
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -334,8 +342,31 @@ ProducerImpl::ProducerImpl(ProducerConfig cfg,
     , ringBuf_(makeRingBuffer(static_cast<std::size_t>(ringTotalBytes(ringCap)),
                               kRingAlignment))
     , ring_(ringBuf_.get(), static_cast<std::size_t>(ringTotalBytes(ringCap)))
+    , tier2FreeBuf_(makeRingBuffer(static_cast<std::size_t>(tier2FreeRingBytes(cfg.tier2Slots)), kRingAlignment))
+    , tier2Free_(tier2FreeBuf_.get(), static_cast<std::size_t>(tier2FreeRingBytes(cfg.tier2Slots)))
     , producerId_(generateProducerId(this))  // F5: unique per instance, never the old shared stub
 {
+    // Tier-2 slot pool: sized ONCE (steady state never allocates).  Every slot starts on
+    // the app's free stack; capacities are reserved so a batch of up to tier2SlotBytes
+    // is built and sealed without touching the heap.
+    {
+        const std::size_t nSlots = static_cast<std::size_t>(std::max<int32_t>(cfg_.tier2Slots, 1));
+        // Default: the larger of the Tier-1 flush size and the wire frame cap, so a small
+        // batchBytes (flush Tier-1 early) never refuses a Tier-2 batch that fits a frame.
+        tier2SlotBytes_ = static_cast<std::size_t>(
+            cfg_.tier2SlotBytes > 0 ? cfg_.tier2SlotBytes : std::max(cfg_.batchBytes, cfg_.maxFrameBytes));
+        if (tier2SlotBytes_ < static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) + 64) {
+            tier2SlotBytes_ = static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) + 64;
+        }
+        tier2Pool_.resize(nSlots);
+        tier2AppFree_.resize(nSlots);
+        for (std::size_t i = 0; i < nSlots; ++i) {
+            tier2Pool_[i].builder.reserveBody(tier2SlotBytes_);
+            tier2Pool_[i].batchBytes.reserve(tier2SlotBytes_);
+            tier2AppFree_[i] = static_cast<uint32_t>(nSlots - 1 - i);  // pop() hands out slot 0 first
+        }
+        tier2AppFreeN_ = nSlots;
+    }
     if (!cfg_.transactionalId.empty()) txnGate_ = TxnGate::Closed;  // Phase 2b F: closed until beginTransaction()
     // Pre-reserve partition map and encode scratch to avoid allocs on steady-state.
     partitions_.reserve(16);
@@ -652,8 +683,9 @@ SendResult ProducerImpl::deferRecord_(int32_t topicId, int32_t partition,
     return SendResult::Ok;  // the handle (if any) is owned by the producer now
 }
 
-RejectReason ProducerImpl::deferTier2_(std::unique_ptr<Tier2Entry>& entry) noexcept {
-    PartitionState* ps = findPartition_(entry->topicId, entry->partition);
+RejectReason ProducerImpl::deferTier2_(uint32_t slot) noexcept {
+    const Tier2Slot& t = tier2Pool_[slot];
+    PartitionState* ps = findPartition_(t.topicId, t.partition);
     if (ps == nullptr && partitions_.size() + deferredUnknown_ >= maxPartitions_) {
         return RejectReason::Unaddressable;
     }
@@ -666,12 +698,12 @@ RejectReason ProducerImpl::deferTier2_(std::unique_ptr<Tier2Entry>& entry) noexc
     h.len       = kT2TokenSize;
     h.type      = static_cast<uint8_t>(kMsgTier2Batch);
     h.flags     = ps == nullptr ? kDefUnknownPartition : uint8_t{0};
-    h.topicId   = entry->topicId;
-    h.partition = entry->partition;
+    h.topicId   = t.topicId;
+    h.partition = t.partition;
     h.submitNs  = lastNowNs_;
     uint8_t* d = pushDeferred_(h);
     if (d == nullptr) return RejectReason::DeferredFull;
-    writeLE64(d, 0, static_cast<int64_t>(reinterpret_cast<uintptr_t>(entry.release())));
+    writeLE64(d, 0, static_cast<int64_t>(slot));
     if (ps != nullptr) {
         ++ps->deferredCount;
         ps->deferredBytes += static_cast<uint32_t>(size);
@@ -680,6 +712,40 @@ RejectReason ProducerImpl::deferTier2_(std::unique_ptr<Tier2Entry>& entry) noexc
         deferredUnknownBytes_ += size;
     }
     return RejectReason::None;
+}
+
+// ---------------------------------------------------------------------------
+// Tier-2 slot pool
+// ---------------------------------------------------------------------------
+
+void ProducerImpl::tier2Collect_() noexcept {
+    // Collect what the duty side returned (consumer side of the SPSC free ring).  A call
+    // that only consumed end-of-buffer padding returns 0 having advanced: ask again once.
+    for (int zeros = 0; zeros < 2;) {
+        const int n = tier2Free_.read(
+            [this](int32_t, aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t off,
+                   aeron::util::index_t) {
+                tier2AppFree_[tier2AppFreeN_++] = static_cast<uint32_t>(buf.getInt32(off));
+            },
+            INT_MAX);
+        zeros = n == 0 ? zeros + 1 : 0;
+    }
+}
+
+uint32_t ProducerImpl::tier2Acquire() noexcept {
+    if (tier2AppFreeN_ == 0) tier2Collect_();
+    return tier2AppFreeN_ == 0 ? kNoTier2Slot : tier2AppFree_[--tier2AppFreeN_];
+}
+
+std::size_t ProducerImpl::tier2FreeCount() noexcept {
+    tier2Collect_();
+    return tier2AppFreeN_;
+}
+
+void ProducerImpl::t2Return_(uint32_t slot) noexcept {
+    (void)tier2Free_.writeWith(1, 4, [slot](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t at) {
+        b.putInt32(at, static_cast<int32_t>(slot));
+    });
 }
 
 void ProducerImpl::unaccountDeferred_(const DeferredHdr& h) noexcept {
@@ -698,11 +764,13 @@ uint64_t ProducerImpl::takeDeferredHandle_(std::size_t off, bool* tier2, int32_t
     const DeferredHdr* h = deferred_.hdr(off);
     const uint8_t* p = deferred_.payload(off);
     if (h->type == kMsgTier2Batch) {
-        std::unique_ptr<Tier2Entry> e(
-            reinterpret_cast<Tier2Entry*>(static_cast<uintptr_t>(readLE64(p, 0))));
+        const uint32_t slot = static_cast<uint32_t>(readLE64(p, 0));
+        const Tier2Slot& e = tier2Pool_[slot];
         if (tier2 != nullptr) *tier2 = true;
-        if (recordCount != nullptr) *recordCount = e->recordCount;
-        return e->ackHandle;
+        if (recordCount != nullptr) *recordCount = e.recordCount;
+        const uint64_t handle = e.ackHandle;
+        t2Return_(slot);  // the batch is finished (failed / dropped): the slot goes back
+        return handle;
     }
     if (tier2 != nullptr) *tier2 = false;
     if (recordCount != nullptr) *recordCount = 1;
@@ -775,21 +843,22 @@ void ProducerImpl::applyDeferred_() noexcept {
         Lost lostRec{0, h->topicId, h->partition, 1, false};
         const char* lostWhat = nullptr;
         if (!keep && h->type == kMsgTier2Batch) {
-            std::unique_ptr<Tier2Entry> e(reinterpret_cast<Tier2Entry*>(
-                static_cast<uintptr_t>(readLE64(deferred_.payload(r), 0))));
+            const uint32_t slot = static_cast<uint32_t>(readLE64(deferred_.payload(r), 0));
+            Tier2Slot& e = tier2Pool_[slot];
             try {
-                PartitionState& tps = getOrCreatePartition(e->topicId, e->partition);
-                e->enqueuedNs = h->submitNs;
-                const int32_t rc = e->recordCount;
-                tps.pendingTier2Entries.push_back(std::move(*e));
+                PartitionState& tps = getOrCreatePartition(e.topicId, e.partition);
+                e.enqueuedNs = h->submitNs;
+                const int32_t rc = e.recordCount;
+                t2Push_(tps, slot);
                 markDirty_(tps);
                 if (tps.builder && tps.builder->recordCount() > 0) tps.flushRequested = true;
                 recordsSent_ += static_cast<uint64_t>(rc);
                 applied = true;
             } catch (...) {
-                lostRec.handle      = e->ackHandle;
+                lostRec.handle      = e.ackHandle;
                 lostRec.tier2       = true;
-                lostRec.recordCount = e->recordCount;
+                lostRec.recordCount = e.recordCount;
+                t2Return_(slot);
                 lostWhat = "(Tier-2 batch) could not be queued";
             }
         } else if (!keep) {
@@ -1109,7 +1178,7 @@ RejectReason ProducerImpl::submitTier2Batch(int32_t topicId,
                                      int32_t partition,
                                      uint64_t ackHandle,
                                      int32_t recordCount,
-                                     std::vector<uint8_t>& batchBytes)
+                                     uint32_t slot)
 {
     if (mode_ != IngressMode::Direct && txnGate_ == TxnGate::Closed) [[unlikely]] return RejectReason::NotInTransaction;
     if (mode_ == IngressMode::Direct) {
@@ -1123,15 +1192,12 @@ RejectReason ProducerImpl::submitTier2Batch(int32_t topicId,
         if (inDuty_) {
             // fix1 C1 / fix2: deferred like a Tier-1 record (same per-partition
             // order, same validation and full policy).
-            auto entry = std::make_unique<Tier2Entry>();
-            entry->topicId     = topicId;
-            entry->partition   = partition;
-            entry->ackHandle   = ackHandle;
-            entry->recordCount = recordCount;
-            entry->batchBytes  = std::move(batchBytes);
-            const RejectReason why = deferTier2_(entry);
-            if (why != RejectReason::None) batchBytes = std::move(entry->batchBytes);  // C6: retryable
-            return why;
+            Tier2Slot& t = tier2Pool_[slot];
+            t.topicId     = topicId;
+            t.partition   = partition;
+            t.ackHandle   = ackHandle;
+            t.recordCount = recordCount;
+            return deferTier2_(slot);  // not accepted: the slot stays the caller's (C6: retryable)
         }
         if (!deferred_.empty() && !settleDeferredFor_(topicId, partition)) {
             return RejectReason::PartitionDeferred;  // its deferred records must go first
@@ -1143,42 +1209,49 @@ RejectReason ProducerImpl::submitTier2Batch(int32_t topicId,
             return RejectReason::Unaddressable;
         }
         PartitionState& ps = *psp;
-        Tier2Entry e;
-        e.topicId     = topicId;
-        e.partition   = partition;
-        e.ackHandle   = ackHandle;
-        e.recordCount = recordCount;
-        e.enqueuedNs  = lastNowNs_;
-        e.batchBytes  = std::move(batchBytes);
-        try {
-            ps.pendingTier2Entries.push_back(std::move(e));
-        } catch (...) {
-            batchBytes = std::move(e.batchBytes);  // nothing changed: the caller keeps the batch
-            throw;
-        }
+        Tier2Slot& t = tier2Pool_[slot];
+        t.topicId     = topicId;
+        t.partition   = partition;
+        t.ackHandle   = ackHandle;
+        t.recordCount = recordCount;
+        t.enqueuedNs  = lastNowNs_;
+        t2Push_(ps, slot);
         markDirty_(ps);
         if (ps.builder && ps.builder->recordCount() > 0) ps.flushRequested = true;
         recordsSent_ += static_cast<uint64_t>(recordCount);
         return RejectReason::None;
     }
     if (ring_.closed()) return RejectReason::Closed;
-    auto entry = std::make_unique<Tier2Entry>();
-    entry->topicId     = topicId;
-    entry->partition   = partition;
-    entry->ackHandle   = ackHandle;
-    entry->recordCount = recordCount;
-    entry->batchBytes  = std::move(batchBytes);
+    Tier2Slot& t = tier2Pool_[slot];
+    t.topicId     = topicId;
+    t.partition   = partition;
+    t.ackHandle   = ackHandle;
+    t.recordCount = recordCount;
     uint8_t tok[kT2TokenSize];
-    writeLE64(tok, 0, static_cast<int64_t>(reinterpret_cast<uintptr_t>(entry.get())));
+    writeLE64(tok, 0, static_cast<int64_t>(slot));
     if (!writeToRing(kMsgTier2Batch, tok, kT2TokenSize)) {
         // F8c fix round 1 (review m1): a close that landed after the pre-check
         // above is reported as Closed, not back-pressure (the claim failed on
         // the ring's closed bit).  C6: the caller keeps the batch (retryable).
-        batchBytes = std::move(entry->batchBytes);
         return ring_.closed() ? RejectReason::Closed : RejectReason::BackPressured;
     }
-    entry.release();  // ownership now travels through the ring
-    return RejectReason::None;
+    return RejectReason::None;  // the slot's ownership now travels through the ring
+}
+
+RejectReason ProducerImpl::submitTier2Bytes(int32_t topicId, int32_t partition, uint64_t ackHandle,
+                                            int32_t recordCount, std::span<const uint8_t> bytes) {
+    const uint32_t slot = tier2Acquire();
+    if (slot == kNoTier2Slot) return RejectReason::BackPressured;
+    tier2Pool_[slot].batchBytes.assign(bytes.begin(), bytes.end());
+    RejectReason why = RejectReason::None;
+    try {
+        why = submitTier2Batch(topicId, partition, ackHandle, recordCount, slot);
+    } catch (...) {
+        tier2Release(slot);
+        throw;
+    }
+    if (why != RejectReason::None) tier2Release(slot);
+    return why;
 }
 
 // ---------------------------------------------------------------------------
@@ -1405,14 +1478,14 @@ int ProducerImpl::drainRing(int64_t nowNs, int messageLimit) {
 
             if (msgTypeId == kMsgTier2Batch) {
                 if (len < kT2TokenSize) return ControlledAction::CONTINUE;
-                // Take ownership of the heap entry whose address travelled the ring.
-                std::unique_ptr<Tier2Entry> entry(
-                    reinterpret_cast<Tier2Entry*>(static_cast<uintptr_t>(readLE64(p, 0))));
-                PartitionState& ps = getOrCreatePartition(entry->topicId, entry->partition);
+                // Take ownership of the pool slot whose index travelled the ring.
+                const uint32_t slot = static_cast<uint32_t>(readLE64(p, 0));
+                Tier2Slot& entry = tier2Pool_[slot];
+                PartitionState& ps = getOrCreatePartition(entry.topicId, entry.partition);
                 if (ps.builder && ps.builder->recordCount() > 0) ps.flushRequested = true;
-                recordsSent_ += static_cast<uint64_t>(entry->recordCount);
-                entry->enqueuedNs = nowNs;
-                ps.pendingTier2Entries.push_back(std::move(*entry));
+                recordsSent_ += static_cast<uint64_t>(entry.recordCount);
+                entry.enqueuedNs = nowNs;
+                t2Push_(ps, slot);
                 markDirty_(ps);
                 return ControlledAction::CONTINUE;
             }
@@ -1473,7 +1546,7 @@ rune::client::detail::ControlledAction ProducerImpl::admitRecord_(PartitionState
     if (directClaimOn_(ps)) return ControlledAction::ABORT;
     // Task 14 fix1 I1: never overtake a Tier-2 batch queued earlier on the
     // partition (flushBatches sends Tier-1 first).
-    if (!ps.pendingTier2Entries.empty()) return ControlledAction::ABORT;
+    if (ps.hasTier2()) return ControlledAction::ABORT;
 
     // M2: the per-frame cap computed once at construction (cfg_ immutable).
     const bool    frameCapped = frameCapped_;
@@ -1562,7 +1635,7 @@ rune::client::detail::ControlledAction ProducerImpl::admitBatch_(PartitionState&
                                                                  uint32_t recLen) {
     using rune::client::detail::ControlledAction;
     // Same ordering rule as a record: never ahead of a queued Tier-2 batch.
-    if (!ps.pendingTier2Entries.empty()) return ControlledAction::ABORT;
+    if (ps.hasTier2()) return ControlledAction::ABORT;
     const int64_t body = claimBatchWireBound(keyLen, n, recLen) -
                          static_cast<int64_t>(rune::protocol::batch::kRecordBatchOverhead);
     if (ps.builder && ps.builder->recordCount() > 0) {
@@ -1761,7 +1834,7 @@ bool ProducerImpl::encodeAndSend(
 template <class Sink>
 bool ProducerImpl::encodeAndSendTier2(
     PartitionState& ps,
-    Tier2Entry& entry,
+    Tier2Slot& entry,
     int64_t nowNs,
     int64_t sessionId,
     const Sink& sink)
@@ -2076,7 +2149,7 @@ int ProducerImpl::flushBatches(
                                         (cfg_.batchRecords > 0 &&
                                          ps.builder->recordCount() >= cfg_.batchRecords);
             const bool otherTrigger   = lingerExpired || ps.flushRequested || globalFlush ||
-                                        !ps.pendingTier2Entries.empty();
+                                        ps.hasTier2();
             const bool canFlight      = canFlight_(ps);
 
             // maxInFlight gates ALL flushes (bounds outstanding un-acked batches —
@@ -2115,23 +2188,25 @@ int ProducerImpl::flushBatches(
         // (either not triggered, blocked by maxInFlight, or send failed).
         // This enforces strict submission order: no T2 can jump ahead of T1.
         if (!tier1Pending) {
-            while (!ps.pendingTier2Entries.empty()) {
+            while (ps.hasTier2()) {
                 // maxInFlight guard (shared with Tier-1 for this partition).
                 if (!canFlight_(ps)) break;
 
-                Tier2Entry& entry = ps.pendingTier2Entries.front();
+                Tier2Slot& entry = tier2Pool_[ps.t2Head];
 
                 if (!encodeAndSendTier2(ps, entry, nowNs, sessionId, sink)) {
                     break; // back-pressure: keep the entry, retry next cycle (no drop)
                 }
                 ++flushed;
-                ps.pendingTier2Entries.pop_front();
+                // Sent: an acked batch's frame was copied into its in-flight slot and an
+                // unacked one is done - the pool slot goes back (exactly once).
+                t2Return_(t2Pop_(ps));
             }
         }
 
         // F12: still has work -> stays dirty; otherwise leaves the list.  Re-read
         // the state (a callback fired above may have reset this partition).
-        if ((ps.builder && ps.builder->recordCount() > 0) || !ps.pendingTier2Entries.empty() ||
+        if ((ps.builder && ps.builder->recordCount() > 0) || ps.hasTier2() ||
             ps.resendParked) {
             dirty_[keep++] = slot;
         } else {
@@ -2774,11 +2849,11 @@ void ProducerImpl::sweepTimedOut(const std::chrono::steady_clock::time_point& no
         // Tier-2 batches never sent past the deadline: same rule (FIFO, so the
         // expired ones are at the front).  Popped BEFORE the delivery (a handler
         // may queue another Tier-2 batch — deferred in Direct mode).
-        while (!ps.pendingTier2Entries.empty() &&
-               nowNs - ps.pendingTier2Entries.front().enqueuedNs >= deliveryNs) {
-            const uint64_t h  = ps.pendingTier2Entries.front().ackHandle;
-            const int32_t  rc = ps.pendingTier2Entries.front().recordCount;
-            ps.pendingTier2Entries.pop_front();
+        while (ps.hasTier2() && nowNs - tier2Pool_[ps.t2Head].enqueuedNs >= deliveryNs) {
+            const uint32_t slot = t2Pop_(ps);
+            const uint64_t h  = tier2Pool_[slot].ackHandle;
+            const int32_t  rc = tier2Pool_[slot].recordCount;
+            t2Return_(slot);
             emitUnsentBatchAck_(ps.topicId, ps.partition, rc, OpStatus::DeliveryFailed, 1);
             completeHandle_(h, OpKind::Tier2Batch, -1, rc, OpStatus::DeliveryFailed, 0);
         }
@@ -3005,13 +3080,12 @@ int ProducerImpl::discardRing_(OpStatus st, int limit, uint16_t errorCode) {
                 emitUnsentBatchAck_(tid, part, 1, st, 1);
                 completeHandle_(h, OpKind::Send, -1, 0, st, errorCode);
             } else if (type == kMsgTier2Batch && len >= kT2TokenSize) {
-                std::unique_ptr<Tier2Entry> e(
-                    reinterpret_cast<Tier2Entry*>(static_cast<uintptr_t>(readLE64(p, 0))));
-                if (!e) return;
-                const uint64_t h  = e->ackHandle;
-                const int32_t  rc = e->recordCount;
-                const int32_t  tid = e->topicId, part = e->partition;
-                e.reset();
+                const uint32_t slot = static_cast<uint32_t>(readLE64(p, 0));
+                const Tier2Slot& e = tier2Pool_[slot];
+                const uint64_t h  = e.ackHandle;
+                const int32_t  rc = e.recordCount;
+                const int32_t  tid = e.topicId, part = e.partition;
+                t2Return_(slot);
                 emitUnsentBatchAck_(tid, part, rc, st, 1);
                 completeHandle_(h, OpKind::Tier2Batch, -1, rc, st, errorCode);
             } else if (type == kMsgClaimBatch && len >= kBatchHeaderSize) {
@@ -3087,10 +3161,11 @@ void ProducerImpl::failAllPending(OpStatus st, uint16_t errorCode) noexcept {
         PartitionState& ps = *partitions_[i];
         ps.inflight.forEachLive([&](InFlightBatch& b) { failBatch_(ps, b, st, errorCode); });
         failBuilder_(ps, st, errorCode);
-        while (!ps.pendingTier2Entries.empty()) {
-            const uint64_t h  = ps.pendingTier2Entries.front().ackHandle;
-            const int32_t  rc = ps.pendingTier2Entries.front().recordCount;
-            ps.pendingTier2Entries.pop_front();
+        while (ps.hasTier2()) {
+            const uint32_t slot = t2Pop_(ps);
+            const uint64_t h  = tier2Pool_[slot].ackHandle;
+            const int32_t  rc = tier2Pool_[slot].recordCount;
+            t2Return_(slot);
             emitUnsentBatchAck_(ps.topicId, ps.partition, rc, st, 1);
             completeHandle_(h, OpKind::Tier2Batch, -1, rc, st, errorCode);
         }
@@ -3218,7 +3293,7 @@ bool ProducerImpl::fullyDrained_() const noexcept {
     if (!deferred_.empty()) return false;
     for (const auto& up : partitions_) {
         const PartitionState& ps = *up;
-        if ((ps.builder && ps.builder->recordCount() > 0) || !ps.pendingTier2Entries.empty() ||
+        if ((ps.builder && ps.builder->recordCount() > 0) || ps.hasTier2() ||
             !ps.inflight.empty()) {
             return false;
         }
@@ -3620,26 +3695,10 @@ void ProducerImpl::abandonOpenClaimForClose() noexcept {
 
 ProducerImpl::~ProducerImpl() {
     if (detail::testOnImplFree != nullptr) detail::testOnImplFree(detail::HandleKind::Producer, this);
-    // Last owner gone (no other thread can reach this producer): free every
-    // Tier-2 entry still owned here WITHOUT completing anything (a handler's
-    // context may already be dead).  Ack handles are plain tokens: nothing to free.
-    try {
-        for (int pass = 0; pass < 64; ++pass) {
-            const int n = ring_.read(
-                [](int32_t type, aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t off,
-                   aeron::util::index_t len) {
-                    if (type == kMsgTier2Batch && len >= kT2TokenSize) {
-                        const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + off);
-                        delete reinterpret_cast<Tier2Entry*>(static_cast<uintptr_t>(readLE64(p, 0)));
-                    }
-                },
-                INT_MAX);
-            if (n == 0) break;
-        }
-    } catch (...) {}
-    for (std::size_t r = 0; r < deferred_.tail(); r += deferred_.sizeAt(r)) {  // fix1/2: arena
-        if (deferred_.hdr(r)->type != 0) (void)takeDeferredHandle_(r);  // frees a Tier-2 entry
-    }
+    // Last owner gone (no other thread can reach this producer): the Tier-2 slot pool is a
+    // member (every slot, wherever it sits - ring, arena, FIFO - dies with it), so nothing to
+    // free and nothing completes (a handler's context may already be dead).  Ack handles
+    // are plain tokens.
 }
 
 // ---------------------------------------------------------------------------

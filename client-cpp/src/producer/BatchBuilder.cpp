@@ -45,21 +45,48 @@ BatchBuilder::BatchBuilder(producer::ProducerImpl* impl,
     : impl_(impl)
     , topicId_(topicId)
     , partition_(partition)
-    , sent_(false)
 {}
 
-// ---------------------------------------------------------------------------
-// add() — accumulate records
-// ---------------------------------------------------------------------------
-
-void BatchBuilder::add(std::span<const uint8_t> value) {
-    add(value, std::string_view{});
+BatchBuilder::BatchBuilder(BatchBuilder&& o) noexcept
+    : impl_(o.impl_), topicId_(o.topicId_), partition_(o.partition_), slot_(o.slot_), state_(o.state_)
+{
+    o.state_ = State::Sent;  // inert: the slot (if any) is ours now
 }
 
-void BatchBuilder::add(std::span<const uint8_t> value,
-                       std::string_view         record_key)
+BatchBuilder& BatchBuilder::operator=(BatchBuilder&& o) noexcept {
+    if (this != &o) {
+        releaseSlot_();
+        impl_ = o.impl_; topicId_ = o.topicId_; partition_ = o.partition_;
+        slot_ = o.slot_; state_ = o.state_;
+        o.state_ = State::Sent;
+    }
+    return *this;
+}
+
+BatchBuilder::~BatchBuilder() { releaseSlot_(); }
+
+void BatchBuilder::releaseSlot_() noexcept {
+    if ((state_ == State::Open || state_ == State::Built) && impl_ != nullptr && !impl_->handleDetached()) {
+        // Drop the records (the next user of the slot starts empty) and hand it back.
+        producer::Tier2Slot& t = impl_->tier2Slot(slot_);
+        t.builder.reset(0, 0);
+        impl_->tier2Release(slot_);
+    }
+    state_ = State::Sent;
+}
+
+// ---------------------------------------------------------------------------
+// add() - accumulate records
+// ---------------------------------------------------------------------------
+
+OpResult BatchBuilder::add(std::span<const uint8_t> value) {
+    return add(value, std::string_view{});
+}
+
+OpResult BatchBuilder::add(std::span<const uint8_t> value,
+                           std::string_view         record_key)
 {
-    if (sent_ || !batchBytes_.empty()) {
+    if (state_ == State::Sent || state_ == State::Built) {
         throw std::logic_error("BatchBuilder: add after send");
     }
     // Backlog B6: the per-record limit, one O(1) compare at append.
@@ -67,51 +94,69 @@ void BatchBuilder::add(std::span<const uint8_t> value,
         throw std::length_error("BatchBuilder::add: MessageTooLarge: key + value exceeds "
                                 "Producer::kMaxRecordBytes (16 KiB)");
     }
-
-    // Lazy-init builder on first add.
-    if (!builder_) {
-        builder_ = std::make_unique<rune::protocol::RecordBatchBuilder>(
-            0, wallMs());
+    if (state_ == State::Idle || state_ == State::Starved) {
+        const uint32_t s = impl_->tier2Acquire();
+        if (s == producer::kNoTier2Slot) {
+            state_ = State::Starved;
+            return OpResult::BackPressured;  // every slot is in use: nothing was added
+        }
+        slot_  = s;
+        state_ = State::Open;
     }
+    producer::Tier2Slot& t = impl_->tier2Slot(slot_);
+
+    // Slot capacity: the worst-case encoded record (10-byte length reserve + attrs + tsDelta +
+    // offsetDelta + two length varints + header count = 37 bytes of framing) must still fit
+    // with the batch header - checked BEFORE appending, so a refused record leaves the batch
+    // intact and append() never grows the preallocated body.
+    constexpr std::size_t kRecordFraming = 37;
+    if (t.builder.bodyBytes() + kRecordFraming + record_key.size() + value.size() +
+            static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) > impl_->tier2SlotBytes()) {
+        throw std::length_error("BatchBuilder::add: MessageTooLarge: the batch would exceed "
+                                "ProducerConfig::tier2SlotBytes");
+    }
+    // Reset (keeping capacity) on the first record: the batch timestamp base is taken here.
+    if (t.builder.recordCount() == 0) t.builder.reset(0, wallMs());
 
     // Append record: record_key + value.
     const std::string_view vv(
         reinterpret_cast<const char*>(value.data()), value.size());
 
-    builder_->append(record_key, vv, wallMs());
+    t.builder.append(record_key, vv, wallMs());
+    return OpResult::Accepted;
 }
 
 // ---------------------------------------------------------------------------
-// send() — flush as one atomic RecordBatch
+// send() - flush as one atomic RecordBatch
 // ---------------------------------------------------------------------------
 
 OpResult BatchBuilder::submit_(uint64_t ackHandle) {
-    if (sent_) {
+    if (state_ == State::Sent) {
         throw std::logic_error("BatchBuilder: send called more than once");
     }
-    if (batchBytes_.empty()) {
-        if (!builder_ || builder_->recordCount() == 0) {
-            throw std::invalid_argument(
-                "BatchBuilder: empty batch — must add() at least one record before send()");
-        }
-        // Build the RecordBatch bytes ONCE (kept across a rejected send for a
-        // retry).  baseSequence / producerId / epoch are patched by the agent.
-        recordCount_ = builder_->recordCount();
-        builder_->buildInto(batchBytes_);
-        builder_.reset();  // single-use
+    if (state_ == State::Starved) return OpResult::BackPressured;  // add() found no free slot
+    if (state_ == State::Idle) {
+        throw std::invalid_argument(
+            "BatchBuilder: empty batch - must add() at least one record before send()");
     }
-    // Submit: the heap Tier2Entry's address travels through the ring
-    // (kMsgTier2Batch token), in submission order with Tier-1 records.  The
-    // bytes are moved only when accepted.
+    producer::Tier2Slot& t = impl_->tier2Slot(slot_);
+    if (state_ == State::Open) {
+        // Seal the RecordBatch bytes ONCE into the slot (kept across a rejected send for a
+        // retry).  baseSequence / producerId / epoch are patched by the agent.
+        t.recordCount = t.builder.recordCount();
+        t.builder.buildInto(t.batchBytes);
+        t.builder.reset(0, 0);
+        state_ = State::Built;
+    }
+    // Submit: the slot INDEX travels through the ring (kMsgTier2Batch token), in
+    // submission order with Tier-1 records.  The slot is the duty side's only when accepted.
     const producer::RejectReason why =
-        impl_->submitTier2Batch(topicId_, partition_, ackHandle, recordCount_, batchBytes_);
+        impl_->submitTier2Batch(topicId_, partition_, ackHandle, t.recordCount, slot_);
     // Phase 2b F: a transactional producer outside a transaction.  OpResult has no such value;
     // like every other misuse of a Tier-2 batch it throws (the callers return their credit).
     if (why == producer::RejectReason::NotInTransaction) throw std::logic_error("produce outside a transaction");
     if (why == producer::RejectReason::None) {
-        sent_ = true;
-        batchBytes_.clear();
-        batchBytes_.shrink_to_fit();
+        state_ = State::Sent;  // the duty side owns the slot now
     }
     return tier2Result(why);
 }

@@ -78,29 +78,37 @@ public:
                           int32_t partition) noexcept;
 
     // Movable, not copyable.
-    BatchBuilder(BatchBuilder&&) noexcept = default;
-    BatchBuilder& operator=(BatchBuilder&&) noexcept = default;
+    BatchBuilder(BatchBuilder&& o) noexcept;
+    BatchBuilder& operator=(BatchBuilder&& o) noexcept;
     BatchBuilder(const BatchBuilder&) = delete;
     BatchBuilder& operator=(const BatchBuilder&) = delete;
 
-    // Destructor: if send() was never called, this is a no-op (nothing produced).
-    ~BatchBuilder() = default;
+    // Destructor: if send() was never accepted, nothing is produced and the pool slot
+    // (see below) goes back to the producer.
+    ~BatchBuilder();
 
     // ---- Record accumulation -------------------------------------------------
 
     /// Append a value to the batch (record key = empty).
     ///
     /// Throws std::logic_error if send() has already been called.
-    void add(std::span<const uint8_t> value);
+    OpResult add(std::span<const uint8_t> value);
 
     /// Append a value with an optional record-level key.
     ///
     /// Note: the record-level key is distinct from the partition-routing Key;
     /// it is carried inside the RecordBatch body (for application use).
     ///
-    /// Throws std::logic_error if send() has already been called.
-    void add(std::span<const uint8_t> value,
-             std::string_view         record_key);
+    /// Throws std::logic_error if send() has already been called, and
+    /// std::length_error (MessageTooLarge, non-retryable) if the record would take the
+    /// batch past ProducerConfig::tier2SlotBytes (or the record alone past kMaxRecordBytes).
+    ///
+    /// The batch is built in a preallocated pool slot (ProducerConfig::tier2Slots), taken at
+    /// the first successful add().  Returns BackPressured - the record is NOT added, nothing
+    /// allocated - while every slot is in use (batches built or queued, not yet sent); retry
+    /// the add() later.  Accepted otherwise.
+    OpResult add(std::span<const uint8_t> value,
+                 std::string_view         record_key);
 
     // ---- Flush ---------------------------------------------------------------
 
@@ -125,7 +133,9 @@ public:
     /// the batch INTACT (retry send() later): BackPressured (ring full /
     /// deferred arena full / its partition still has deferred records),
     /// Closed (the producer's intake is closed), WrongThread, QueueFull,
-    /// InvalidArgument (unaddressable partition, bad token / queue).
+    /// InvalidArgument (unaddressable partition, bad token / queue).  A batch whose
+    /// add() found the slot pool exhausted (nothing was added) also reports
+    /// BackPressured.
     ///
     /// Throws std::invalid_argument if the batch is empty (no add() calls).
     /// Throws std::logic_error if send() has already been accepted.
@@ -136,22 +146,26 @@ public:
 private:
     void checkProducer_() const;
 
+    /// Where the batch is.  The slot index is meaningful only in Open / Built (each state
+    /// holds exactly what it needs):
+    ///   Idle     no slot taken yet (nothing added);
+    ///   Starved  an add() found every pool slot in use - nothing stored, send() back-pressures;
+    ///   Open     records accumulate in pool slot slot_;
+    ///   Built    the RecordBatch is sealed in slot slot_ (kept across a rejected send());
+    ///   Sent     accepted (or moved-from): the slot belongs to the duty side / nobody.
+    enum class State : uint8_t { Idle, Starved, Open, Built, Sent };
+
     producer::ProducerImpl* impl_ = nullptr;  // borrowed (owned by the Producer + duty side)
-    int32_t topicId_   = -1;
-    int32_t partition_ = -1;
+    int32_t  topicId_   = -1;
+    int32_t  partition_ = -1;
+    uint32_t slot_      = 0xFFFF'FFFFu;      // kNoTier2Slot
+    State    state_     = State::Idle;
 
-    // Per-batch RecordBatchBuilder (reused; reset if needed, but a BatchBuilder
-    // is single-use so the builder is built once).
-    std::unique_ptr<rune::protocol::RecordBatchBuilder> builder_;
-    // The encoded batch, kept across a rejected send() so it can be retried.
-    std::vector<uint8_t> batchBytes_;
-    int32_t              recordCount_ = 0;
+    /// Return the held slot (Open / Built) to the producer's pool, exactly once.
+    void releaseSlot_() noexcept;
 
-    /// Encode (once) and submit with this ack handle (0 = none).
+    /// Seal (once) and submit with this ack handle (0 = none).
     OpResult submit_(uint64_t ackHandle);
-
-    // Lifecycle guard.
-    bool sent_ = false;
 };
 
 } // namespace rune::client

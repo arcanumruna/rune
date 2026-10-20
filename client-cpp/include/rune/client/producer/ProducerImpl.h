@@ -53,6 +53,7 @@
 #include <rune/client/producer/ProduceFrameBuilder.h>
 #include <flight_recorder/FlightRecorder.h>
 #include <rune/client/detail/M2ORingBuffer.h> // internal MPSC ring (controlledRead/ABORT, templated read)
+#include <rune/client/detail/OneToOneRingBuffer.h> // Tier-2 free-slot ring (duty -> app)
 
 #include <thread>
 #include <chrono>
@@ -104,7 +105,7 @@ inline constexpr int kRecHeaderSize  = 38;  // bytes before value
 
 // ---------------------------------------------------------------------------
 // F8c C6 — the 64-bit ack handle (SEND_RECORD ackHandle, PartitionState::
-// ackRing slot, Tier2Entry::ackHandle).  0 = no ack (void record).  Otherwise
+// ackRing slot, Tier2Slot::ackHandle).  0 = no ack (void record).  Otherwise
 // a TAGGED TOKEN, never a pointer (nothing is allocated, owned or freed):
 //   bit 63 = 1            Completions target: bits 48..62 = its CqRef (15 bits:
 //                         10-bit registry index + 5-bit generation),
@@ -135,9 +136,13 @@ inline constexpr uint64_t kRefMask    = 0x7FFF;
 /// per-record / Tier-2 ack, and each credit unit of a BatchAck record.
 inline constexpr uint32_t kAckRecordBytes = kBatchAckUnitBytes;  // CompletionRing::completionRecordBytes(0)
 
-// kMsgTier2Batch token: 8 bytes = a heap Tier2Entry* (int64 LE).  The entry's
-// ownership travels through the ring (spec §1a.2) — no side queue, no mutex.
+// kMsgTier2Batch token: 8 bytes = the pooled Tier2Slot's index (int64 LE, in-process).
+// The slot's ownership travels through the ring (spec §1a.2) — no side queue, no
+// mutex, no heap: the slot returns to the app over the SPSC free ring (tier2Free_).
 inline constexpr int kT2TokenSize = 8;
+
+/// "No Tier-2 slot" (an empty FIFO link, a builder that could not get a slot).
+inline constexpr uint32_t kNoTier2Slot = 0xFFFF'FFFFu;
 
 // Flags bits
 inline constexpr uint8_t kFlagWantAck = 0x01;
@@ -163,20 +168,27 @@ inline constexpr int32_t kDirectProducerRingCap = 1024;
 inline constexpr uint32_t kAckRingCapacity = 16384; // 128 KiB/partition
 
 // ---------------------------------------------------------------------------
-// Tier2Entry — pre-built RecordBatch bytes waiting for agent-thread processing.
+// Tier2Slot - one preallocated Tier-2 batch.  The pool (ProducerImpl::tier2Pool_)
+// is sized ONCE at construction; a slot's RecordBatchBuilder body and its
+// RecordBatch bytes keep their capacity for ever (tier2SlotBytes), so building and
+// sending a batch allocates nothing.
 //
-// The app thread builds the batch bytes (without baseSequence — left 0) into a
-// heap entry and writes its address into the ring (kMsgTier2Batch); the agent
-// takes ownership when it drains the token, stamps the correct baseSequence
-// from PartitionState, then encodes+sends.
+// Ownership moves app -> duty -> app and is NEVER shared: the app thread owns a
+// slot from tier2Acquire() until the kMsgTier2Batch token (carrying its index) is
+// committed to the producer ring; the duty thread then owns it (queued on the
+// partition's intrusive FIFO, `next`) until the batch is encoded+sent, failed or
+// discarded, and returns the index over the SPSC free ring.  The ring's
+// release/acquire is the only synchronisation (the slot has no atomics).
 // ---------------------------------------------------------------------------
-struct Tier2Entry {
+struct Tier2Slot {
     int32_t  topicId     = 0;
     int32_t  partition   = 0;
     uint64_t ackHandle   = 0;  // ackhandle:: tagged token of the batch (0 = none)
     int32_t  recordCount = 0;
     int64_t  enqueuedNs  = 0;  // agent clock when drained (delivery deadline if never sent)
-    std::vector<uint8_t> batchBytes; // pre-built RecordBatch (baseSequence=0, patched by agent)
+    uint32_t next        = kNoTier2Slot;  // intrusive FIFO link (duty only)
+    rune::protocol::RecordBatchBuilder builder{0, 0};  // app: accumulates records (body capacity persists)
+    std::vector<uint8_t> batchBytes; // pre-built RecordBatch (baseSequence=0, patched by agent); capacity persists
 };
 
 // ---------------------------------------------------------------------------
@@ -283,10 +295,13 @@ struct PartitionState {
     uint64_t             batchAckStart = 0; // ackHead at start of current batch
     int32_t              batchAckCount = 0; // slice length of current batch (incl. back-filled 0s)
 
-    // Tier-2 batches queued for this partition (agent-thread only, no mutex).
-    // Populated by drainRing() when kMsgTier2Batch token is processed.
+    // Tier-2 batches queued for this partition (agent-thread only, no mutex): an
+    // intrusive FIFO of pool slot indices linked through Tier2Slot::next.
+    // Populated by drainRing() when a kMsgTier2Batch token is processed.
     // Drained by flushBatches() in FIFO order, after any pending Tier-1 batch.
-    std::deque<Tier2Entry> pendingTier2Entries;
+    uint32_t t2Head = kNoTier2Slot;
+    uint32_t t2Tail = kNoTier2Slot;
+    [[nodiscard]] bool hasTier2() const noexcept { return t2Head != kNoTier2Slot; }
 
     PartitionState() = default;
     PartitionState(int32_t tid, int32_t part)
@@ -717,21 +732,46 @@ public:
 
     /// Submit a pre-built Tier-2 batch (from BatchBuilder::send()).
     ///
-    /// Moves the batch into a heap Tier2Entry and writes its address into the
-    /// ring (kMsgTier2Batch); ownership passes to the agent on commit.  The agent
-    /// processes the token in order with Tier-1 records, stamping baseSequence.
+    /// The batch lives in pool slot `slot` (tier2Acquire(); its batchBytes is the
+    /// sealed RecordBatch, baseSequence = 0, patched by the agent).  The slot's
+    /// INDEX is written into the ring (kMsgTier2Batch); ownership passes to the
+    /// duty side on acceptance - the slot returns to the app over tier2Free_ once
+    /// the batch is sent / failed / discarded.  The agent processes the token in
+    /// order with Tier-1 records, stamping baseSequence.
     ///
     /// ackHandle: an ackhandle:: tagged token (0 = none).  recordCount: records
-    /// in the pre-built batch.  batchBytes: pre-built RecordBatch bytes
-    /// (baseSequence field = 0; patched by the agent) — MOVED FROM only when
-    /// accepted (F8c C6: a rejected batch stays with the caller for a retry).
+    /// in the pre-built batch.  A rejected batch stays with the caller (the slot
+    /// is still the caller's) for a retry (F8c C6).
     ///
     /// fix4: returns RejectReason::None when accepted; otherwise why not.
     RejectReason submitTier2Batch(int32_t topicId,
                                   int32_t partition,
                                   uint64_t ackHandle,
                                   int32_t recordCount,
-                                  std::vector<uint8_t>& batchBytes);
+                                  uint32_t slot);
+
+    /// Pre-sealed bytes in, for tests / tools that build a RecordBatch themselves: takes a
+    /// pool slot, copies `bytes` into it, submits.  BackPressured when no slot is free; a
+    /// rejected batch returns its slot (nothing is retained).
+    RejectReason submitTier2Bytes(int32_t topicId, int32_t partition, uint64_t ackHandle,
+                                  int32_t recordCount, std::span<const uint8_t> bytes);
+
+    // ---- Tier-2 slot pool (app side: the single batch-issuing thread) --------
+
+    /// A free pool slot (its builder and bytes are the caller's until submitTier2Batch
+    /// accepts it or tier2Release returns it), or kNoTier2Slot when every slot is in
+    /// use (the caller reports BackPressured).  Never allocates.
+    [[nodiscard]] uint32_t tier2Acquire() noexcept;
+    /// Return a slot the caller still owns (a builder dropped before / without an
+    /// accepted send) - exactly once per acquired slot.
+    void tier2Release(uint32_t slot) noexcept { tier2AppFree_[tier2AppFreeN_++] = slot; }
+    [[nodiscard]] Tier2Slot& tier2Slot(uint32_t slot) noexcept { return tier2Pool_[slot]; }
+    /// Largest RecordBatch (header + records) a slot holds.
+    [[nodiscard]] std::size_t tier2SlotBytes() const noexcept { return tier2SlotBytes_; }
+    /// Pool introspection (tests; the batch-issuing thread): total slots, and slots not
+    /// owned by a builder or the duty side (app-local free + returned-but-undrained).
+    [[nodiscard]] std::size_t tier2SlotCount() const noexcept { return tier2Pool_.size(); }
+    [[nodiscard]] std::size_t tier2FreeCount() noexcept;
 
     // ---- F8c C6: ack routing (setup phase; read on the duty thread) ----------
 
@@ -1018,7 +1058,7 @@ public:
         for (const auto& up : partitions_) {
             const PartitionState& ps = *up;
             const bool hasTier1 = (ps.batchStartNs != 0) || ps.flushRequested;
-            const bool hasTier2 = !ps.pendingTier2Entries.empty();
+            const bool hasTier2 = ps.hasTier2();
             if (hasTier1 || hasTier2) {
                 topicIdOut   = ps.topicId;
                 partitionOut = ps.partition;
@@ -1319,7 +1359,7 @@ private:
     /// Produce wire frame and offers it to transport.
     template <class Sink>
     bool encodeAndSendTier2(PartitionState& ps,
-                            Tier2Entry& entry,
+                            Tier2Slot& entry,
                             int64_t nowNs,
                             int64_t sessionId,
                             const Sink& sink);
@@ -1496,6 +1536,17 @@ private:
     IngressMode  mode_       = IngressMode::Ring;  // set once before any send (Task 14)
     Completions* batchAckCq_ = nullptr;            // app side: reserve one unit per send (C6)
     TxnGate      txnGate_    = TxnGate::NotTransactional;  // Phase 2b F: issuing thread only (FD2)
+
+    // ---- Tier-2 slot pool (preallocated once; see Tier2Slot) ------------------
+    // App side (the single batch-issuing thread): tier2AppFree_[0, tier2AppFreeN_) are
+    // free slot indices it owns outright; when empty it drains tier2Free_ (the duty
+    // side's returns) into it.  Duty side: t2Return_ writes tier2Free_.
+    std::vector<Tier2Slot>                    tier2Pool_;
+    std::size_t                               tier2SlotBytes_ = 0;
+    std::unique_ptr<uint8_t, void(*)(void*)>  tier2FreeBuf_;
+    rune::client::detail::OneToOneRingBuffer  tier2Free_;
+    std::vector<uint32_t>                     tier2AppFree_;
+    std::size_t                               tier2AppFreeN_ = 0;
 
     // ---- Agent-thread only (no lock needed — single-writer) ------------------
 
@@ -1687,13 +1738,30 @@ private:
     SendResult deferRecord_(int32_t topicId, int32_t partition, std::span<const uint8_t> key,
                             std::span<const uint8_t> value, uint8_t flags, int64_t ackHandle,
                             RejectReason& why) noexcept;
-    RejectReason deferTier2_(std::unique_ptr<Tier2Entry>& entry) noexcept;
+    RejectReason deferTier2_(uint32_t slot) noexcept;
+    void tier2Collect_() noexcept;
+    // ---- Tier-2 partition FIFO + pool return (duty side) -----------------------
+    void t2Push_(PartitionState& ps, uint32_t slot) noexcept {
+        tier2Pool_[slot].next = kNoTier2Slot;
+        if (ps.t2Tail == kNoTier2Slot) ps.t2Head = slot; else tier2Pool_[ps.t2Tail].next = slot;
+        ps.t2Tail = slot;
+    }
+    /// Unlink the FIFO head; the slot is still the duty side's (t2Return_ gives it back).
+    uint32_t t2Pop_(PartitionState& ps) noexcept {
+        const uint32_t slot = ps.t2Head;
+        ps.t2Head = tier2Pool_[slot].next;
+        if (ps.t2Head == kNoTier2Slot) ps.t2Tail = kNoTier2Slot;
+        return slot;
+    }
+    /// Give a finished slot back to the app (SPSC free ring; capacity = pool size, so
+    /// the write cannot fail while each slot is returned exactly once).
+    void t2Return_(uint32_t slot) noexcept;
     uint8_t* pushDeferred_(const DeferredHdr& h) noexcept;
     PartitionState* findPartition_(int32_t topicId, int32_t partition) noexcept;
     /// Removes a record's per-partition / unknown accounting.
     void unaccountDeferred_(const DeferredHdr& h) noexcept;
-    /// The record's ack handle (record: wantAck handle; Tier-2: takes + frees
-    /// the entry and returns its handle).  0 = void.
+    /// The record's ack handle (record: wantAck handle; Tier-2: returns the slot
+    /// to the pool and returns its handle).  0 = void.
     uint64_t takeDeferredHandle_(std::size_t off, bool* tier2 = nullptr,
                                  int32_t* recordCount = nullptr) noexcept;
     /// Outside inDuty_: run the apply pass if `ps`'s (or unknown partitions')

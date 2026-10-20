@@ -212,6 +212,12 @@ p.flush();
 p.closeAndWait(10s);
 ```
 
+A batch is built in a preallocated pool slot (`ProducerConfig::tier2Slots`, default 64; one slot holds up to
+`tier2SlotBytes`, default max(`batchBytes`, `maxFrameBytes`)): no allocation per batch. A slot is held from the first
+`add()` until the batch is encoded and offered (or fails). With every slot in use, `add()` and `send()` return
+`OpResult::BackPressured` and add nothing; a record that would take the batch past a slot throws `std::length_error`.
+A producer's batches are issued from one thread.
+
 ### Zero-copy claims
 
 ```cpp

@@ -15,6 +15,9 @@
 //   ACCUM_VALUE_BYTES  payload size (default 256)
 //   ACCUM_PARTITIONS   distinct partitions (default 8)
 //   ACCUM_RING_CAP     producer ring usable bytes, pow2 (default 4194304 = 4MiB)
+//   ACCUM_TIER2        1 = send Tier-2 batches (BatchBuilder: add x ACCUM_T2_RECORDS + send) instead of
+//                      single records; ACCUM_RECORDS still counts records (default 0 = off)
+//   ACCUM_T2_RECORDS   records per Tier-2 batch (default 8)
 //   Producer knobs: RUNE_LINGER_US, RUNE_BATCH_BYTES, RUNE_BATCH_RECORDS,
 //                   RUNE_MAX_IN_FLIGHT, RUNE_ACKS (via ProducerConfig::fromEnv)
 
@@ -22,6 +25,7 @@
 #include <rune/client/producer/Producer.h>
 #include <rune/client/producer/CountingSink.h>
 #include <rune/client/Key.h>
+#include <rune/client/producer/BatchBuilder.h>
 
 #include <atomic>
 #include <chrono>
@@ -30,6 +34,7 @@
 #include <functional>
 #include <iostream>
 #include <string>
+#include <type_traits>
 #include <thread>
 #include <vector>
 
@@ -113,6 +118,27 @@ int main() {
     });
 
     const auto t0 = clk::now();
+    const bool    tier2  = envI64("ACCUM_TIER2", 0) != 0;
+    const int32_t t2Recs = (int32_t)envI64("ACCUM_T2_RECORDS", 8);
+    if (tier2) {
+        // Tier-2: one explicit batch per iteration.  A full slot pool (HEAD) back-pressures
+        // add(): rebuild the batch until it is accepted.  (Compiles against both the
+        // void-add() and the OpResult-add() BatchBuilder, to compare commits.)
+        for (int64_t i = 0; i < N; i += t2Recs) {
+            const int32_t part = (int32_t)((i / t2Recs) % partitions);
+            for (;;) {
+                BatchBuilder bb(&impl, topicId, part);
+                bool full = false;
+                for (int32_t r = 0; r < t2Recs && !full; ++r) {
+                    using R = decltype(bb.add(std::span<const uint8_t>(val)));
+                    if constexpr (std::is_void_v<R>) bb.add(std::span<const uint8_t>(val));
+                    else full = bb.add(std::span<const uint8_t>(val)) != OpResult::Accepted;
+                }
+                if (!full && bb.send() == OpResult::Accepted) break;
+                std::this_thread::yield();
+            }
+        }
+    } else
     for (int64_t i = 0; i < N; ++i) {
         const int32_t part = (int32_t)(i % partitions);
         Key key((uint64_t)i);

@@ -190,7 +190,7 @@ TEST(ProducerSinkCrc, Tier2StampKeepsTheCrcValidAcrossRetries) {
     for (int i = 0; i < 30; ++i) b.append("key", std::string(400, char('a' + i % 26)), 200 + i);
     std::vector<uint8_t> batch;
     b.buildInto(batch);
-    ASSERT_EQ(impl.submitTier2Batch(1, 0, 0, 30, batch), rune::client::producer::RejectReason::None);
+    ASSERT_EQ(impl.submitTier2Bytes(1, 0, 0, 30, batch), rune::client::producer::RejectReason::None);
     uint64_t frames = 0, bytes = 0;
     int left = 3;
     std::vector<uint8_t> last;
