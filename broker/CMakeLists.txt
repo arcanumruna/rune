@@ -150,7 +150,8 @@ add_library(rune_codec STATIC
     # + the ALTER-op wire codec shared with rune-ql. Required by SchemaRegistry's
     # per-version materialization (Task 9).
     ${RUNE_CODEC_ROOT}/src/Evolve.cpp
-    ${RUNE_CODEC_ROOT}/src/AlterOps.cpp)
+    ${RUNE_CODEC_ROOT}/src/AlterOps.cpp
+    ${RUNE_CODEC_ROOT}/src/FilterSchema.cpp)
 target_include_directories(rune_codec PUBLIC ${RUNE_CODEC_ROOT}/include)
 target_compile_features(rune_codec PUBLIC cxx_std_23)
 

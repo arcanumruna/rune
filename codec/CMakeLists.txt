@@ -9,7 +9,8 @@ add_library(rune_codec STATIC
     src/Validator.cpp
     src/Generator.cpp
     src/Evolve.cpp
-    src/AlterOps.cpp)
+    src/AlterOps.cpp
+    src/FilterSchema.cpp)
 target_include_directories(rune_codec PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 # ── rune_catalog — the shared catalog-history library (spec §6): event model,
@@ -149,7 +150,9 @@ add_executable(rune_codec_tests
     tests/GeneratedKeyTest.cpp
     tests/FlyweightTest.cpp
     tests/FlyweightGeneratedRoundTripTest.cpp
-    tests/FilterWireTest.cpp)
+    tests/FilterWireTest.cpp
+    tests/FilterSchemaTest.cpp
+    tests/FilterPredicateTest.cpp)
 target_include_directories(rune_codec_tests PRIVATE
     "${CMAKE_CURRENT_BINARY_DIR}/tests")
 target_link_libraries(rune_codec_tests PRIVATE rune_codec GTest::gtest_main)
