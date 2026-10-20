@@ -252,7 +252,8 @@ public:
                                                  const uint8_t* descriptorBlob, uint32_t descriptorLen,
                                                  uint8_t persistence, int16_t replicationFactor,
                                                  const rune::protocol::TopicConfigView& config,
-                                                 const rune::gateway::DdlMetaView& meta) override {
+                                                 const rune::gateway::DdlMetaView& meta,
+                                                 std::string_view adoptDenial) override {
         DefineTopicMsg m;
         m.session        = sessionId;
         m.corr           = correlationId;
@@ -265,6 +266,7 @@ public:
         m.replicationFactor = replicationFactor;
         m.config = rune::protocol::convertTopicConfig<rune::protocol::TopicConfig>(config);
         m.meta   = ownMeta_(meta);
+        m.adoptDenial.assign(adoptDenial);
         return submitDdl_(m);
     }
 

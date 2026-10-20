@@ -231,6 +231,10 @@ struct DefineTopicMsg {
     int16_t                     replicationFactor = 0;
     rune::protocol::TopicConfig config;
     DdlMeta                     meta;
+    /// Issue #129: the gateway's verdict on adopting a schema onto an EXISTING untyped topic (ALTER on it):
+    /// "" = allowed (also every in-process / admin-level submit, which no session authorizes), otherwise the
+    /// NotAuthorized detail the admin thread answers when the name turns out to be such a topic.
+    std::string                 adoptDenial;
 };
 
 /// AlterTopic: the client's CAS expectation (expectedVersion = the topic's SCHEMA
@@ -578,7 +582,7 @@ inline std::span<const uint8_t> span8(const std::vector<uint8_t>& v) noexcept { 
 template <class W> void layout(W& w, const DefineTopicMsg& m) {
     w.i64(m.session); w.i64(m.corr); w.i32(m.partitionCount); w.u8(m.validate ? 1 : 0);
     w.str16(m.name); w.str16(m.keyField); w.bytes32(span8(m.blob)); w.u8(m.persistence);
-    w.i16(m.replicationFactor); layoutConfig(w, m.config); layoutMeta(w, m.meta);
+    w.i16(m.replicationFactor); layoutConfig(w, m.config); layoutMeta(w, m.meta); w.str16(m.adoptDenial);
 }
 template <class W> void layout(W& w, const AlterTopicMsg& m) {
     w.i64(m.session); w.i64(m.corr); w.u16(m.expectedVersion); w.str16(m.topicName);
@@ -691,6 +695,7 @@ inline DdlRequest decodeDefineTopic(const uint8_t* buf, std::size_t len) {
     m.replicationFactor = r.i16();
     admin_wire::readConfig(r, m.config);
     admin_wire::readMeta(r, m.meta);
+    r.str16(m.adoptDenial);
     return admin_wire::finish(r, std::move(m), kTidDefineTopic);
 }
 inline DdlRequest decodeAlterTopic(const uint8_t* buf, std::size_t len) {
@@ -1479,8 +1484,9 @@ template <typename Write>
 // 6-byte header in front, so every committed descriptor fits.
 // statement(4) + clientName(2) + sourceAddress(2) + authenticated(2, auth Task 10) + sessionId + requestId hi/lo + flag.
 inline constexpr std::size_t kDdlMetaFixedBytes     = 4 + 2 + 2 + 2 + 8 + 8 + 8 + 1;
+// The trailing adoptDenial length prefix (2, issue #129).
 inline constexpr std::size_t kDefineTopicFixedBytes =
-    8 + 8 + 4 + 1 + 2 + 2 + 4 + 1 + 2 + kTopicConfigFixedBytes + 2 + 2 + kDdlMetaFixedBytes;
+    8 + 8 + 4 + 1 + 2 + 2 + 4 + 1 + 2 + kTopicConfigFixedBytes + 2 + 2 + kDdlMetaFixedBytes + 2;
 inline constexpr std::size_t kMaxDescriptorViaRequestRing =
     static_cast<std::size_t>(kAdminRequestRingBytes) / 8 - kDefineTopicFixedBytes;
 static_assert(schemaUpdateWireLen(kMaxDescriptorViaRequestRing) <=

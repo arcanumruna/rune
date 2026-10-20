@@ -31,7 +31,7 @@ struct RecordingSink final : IAdminRequestSink {
     int securityDdls = 0, otherSubmits = 0;
     std::string lastAuthenticated;
     AdminSubmit submitDefineTopic(int64_t, int64_t, std::string_view, uint32_t, std::string_view, bool, const uint8_t*, uint32_t,
-                                  uint8_t, int16_t, const rune::protocol::TopicConfigView&, const DdlMetaView&) override { ++otherSubmits; return AdminSubmit::Accepted; }
+                                  uint8_t, int16_t, const rune::protocol::TopicConfigView&, const DdlMetaView&, std::string_view) override { ++otherSubmits; return AdminSubmit::Accepted; }
     bool submitGetSchema(int64_t, int64_t, std::string_view, uint64_t) override { return true; }
     AdminSubmit submitAlterTopic(int64_t, int64_t, std::string_view, uint16_t, const uint8_t*, uint32_t, const DdlMetaView&) override { ++otherSubmits; return AdminSubmit::Accepted; }
     AdminSubmit submitCreateView(int64_t, int64_t, std::string_view, std::string_view, uint8_t, const uint8_t*, uint32_t, const DdlMetaView&) override { ++otherSubmits; return AdminSubmit::Accepted; }

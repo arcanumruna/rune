@@ -46,6 +46,7 @@ Rules that keep the model small (D15 to D17):
 | GetViewRow / openView | `READ` on the view |
 | Metadata, topic and view listings, `GetTopicSchema` | `DESCRIBE` |
 | `CreateTopic` / `CreateView` / `CreateSchema` | `CREATE` on the name (exact or prefix grant), or on `CLUSTER` |
+| `CreateSchema` on an existing untyped topic (a `DefineTopic` with a descriptor) | `ALTER` on the topic as well: it is a new schema version of a live object |
 | `CreateView` / `AlterView` (D19) | also `READ` on every source topic |
 | `AlterSchema` / `AlterView` / `AlterTopicConfig` / `SetCompatibility` | `ALTER` on the object |
 | `DropTopic` / `DropView` | `DROP` on the object |

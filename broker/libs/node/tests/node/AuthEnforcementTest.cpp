@@ -136,6 +136,30 @@ TEST(AuthEnforcementRegression, DefineTopicAndCreateSchemaAllowedAndDenied) {
     EXPECT_EQ(r.defineTopicCode(none, "fresh4"), kNotAuthorized);
 }
 
+// Issue #129: a DefineTopic with a descriptor on an EXISTING untyped topic is a new schema version of a live object
+// (CreateSchemaOps), not a creation: it needs ALTER on that topic (which implies DESCRIBE, D15), not only CREATE on
+// the name.
+TEST(AuthEnforcementRegression, CreateSchemaOnAnExistingTopicNeedsAlterRegression) {
+    AuthRig r;
+    ASSERT_GE(r.defineTopic(r.builder, "world.chat", /*typed=*/false), 0);   // untyped, owned by the builder
+    auto schemaVersion = [&] {
+        const auto a = r.c().awaitSchema(r.c().sendGetTopicSchema(r.ch(), r.stream(), r.builder, "world.chat"), AuthRig::dl());
+        return a ? static_cast<int>(a->version) : kNoAnswer;
+    };
+    const int before = schemaVersion();
+    const int64_t creator = r.newUser({prefix(SO::Create, ST::Topic, "world.")});
+    const int64_t describer = r.newUser({prefix(SO::Create, ST::Topic, "world."), exact(SO::Describe, ST::Topic, "world.chat")});
+    const int64_t alterer = r.newUser({prefix(SO::Create, ST::Topic, "world."), exact(SO::Alter, ST::Topic, "world.chat")});
+    EXPECT_EQ(r.defineTopicCode(creator, "world.chat"), kNotAuthorized) << "CREATE on the name does not rewrite a live topic's schema";
+    EXPECT_EQ(r.defineTopicCode(describer, "world.chat"), kNotAuthorized) << "DESCRIBE is not ALTER";
+    EXPECT_EQ(schemaVersion(), before) << "the schema is unchanged";
+    EXPECT_EQ(r.defineTopicCode(creator, "world.fresh"), 0) << "CREATE alone still creates a new typed topic";
+    EXPECT_EQ(r.defineTopicCode(creator, "world.fresh"), static_cast<int>(pc::ErrorCode::TopicExists))
+        << "a typed topic is still TopicExists, not an authorization question";
+    EXPECT_EQ(r.defineTopicCode(alterer, "world.chat"), 0) << "ALTER adopts the schema";
+    EXPECT_NE(schemaVersion(), before);
+}
+
 TEST(AuthEnforcementRegression, CreateViewAndAlterViewAllowedAndDenied) {
     AuthRig r;
     const int64_t may = r.newUser({exact(SO::Create, ST::View, "v1"), exact(SO::Alter, ST::View, "board"),

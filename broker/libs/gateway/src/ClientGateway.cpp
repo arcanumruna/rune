@@ -7437,6 +7437,13 @@ void ClientGateway::handleDefineTopic(const uint8_t* buf, std::size_t len)
     if (deny_(*session, rune::gateway::authorizeName(permsOf_(*session), rune::security::ResourceType::Topic, m.topicName,
                                                      rune::security::Operation::Create), buf, len))
         return;
+    // Issue #129: if the name is an existing UNTYPED topic, a descriptor makes this a new schema version of it
+    // (CreateSchemaOps) - ALTER on the topic, exactly as AlterTopic (ALTER implies DESCRIBE, D15).  Whether the name
+    // exists is the admin thread's call (its catalog may be ahead of this thread's index), so the verdict rides along.
+    std::optional<rune::gateway::Denial> adopt;
+    if (m.descriptorLen != 0)
+        adopt = rune::gateway::authorizeName(permsOf_(*session), rune::security::ResourceType::Topic, m.topicName,
+                                             rune::security::Operation::Alter);
 
     // Copy-and-return: the sink OWNS the copied bytes (every view points into
     // the ingress buffer and is copied by the sink before return).
@@ -7444,7 +7451,8 @@ void ClientGateway::handleDefineTopic(const uint8_t* buf, std::size_t len)
                        adminSink_->submitDefineTopic(m.sessionId, m.correlationId, m.topicName, m.partitionCount,
                                                      m.keyField, m.validate, m.descriptorBlob, m.descriptorLen,
                                                      m.persistence, m.replicationFactor, m.config,
-                                                     ddlMetaOf_(m.hasExt ? &m.ext : nullptr, m.sessionId, *session)),
+                                                     ddlMetaOf_(m.hasExt ? &m.ext : nullptr, m.sessionId, *session),
+                                                     adopt ? std::string_view(adopt->detail) : std::string_view{}),
                        "DefineTopic: admin ring full", "DefineTopic: request larger than the admin ring message");
 }
 

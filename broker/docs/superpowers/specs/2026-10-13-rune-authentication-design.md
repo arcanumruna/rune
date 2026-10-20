@@ -37,6 +37,7 @@ Every client proves who it is, and every request is checked against explicit gra
 | GetViewRow / openView | `READ` on the view |
 | Metadata / topic and view listing | `DESCRIBE` |
 | `CreateTopic` / `CreateView` / `CreateSchema` | `CREATE` on the name (an exact or prefix grant), or on `CLUSTER` |
+| `CreateSchema` on an existing untyped topic (a `DefineTopic` with a descriptor) | `ALTER` on the topic as well: it is a new schema version of a live object |
 | `AlterSchema` / `AlterView` / `AlterTopicConfig` / `SetCompatibility` | `ALTER` on the object |
 | `DropTopic` / `DropView` | `DROP` on the object |
 | Catalog history / as-of / diff (`__catalog` reads) | `DESCRIBE` on the objects shown. Objects the reader cannot describe are filtered out of results. |
