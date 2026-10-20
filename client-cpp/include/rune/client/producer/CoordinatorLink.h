@@ -38,16 +38,22 @@ public:
         ReqKind   kind  = ReqKind::InitProducerId;
         int64_t   corrId = 0;
         uint32_t  attempt = 0;
-        int64_t   deadlineNs = 0;   ///< 0 = none
+        int64_t   deadlineNs = 0;   ///< absolute duty-clock expiry, > 0
         uint16_t  frameLen = 0;
         std::array<uint8_t, kCoordFrameCap> frame{};
     };
 
-    CoordinatorLink(uint32_t ordinal, CoordinatorSink sink) noexcept : ordinal_(ordinal), sink_(sink) {}
+    /// `seqBase`: the ordinal's carried-forward request sequence (ProducerHub keeps it per ordinal, like the
+    /// batch sequences): ids never repeat across incarnations of an ordinal, so a late answer to a closed
+    /// producer's request can never match the new one's.  The 32-bit sequence wraps only after 2^32 requests
+    /// on one ordinal (~50 days at one per millisecond), far past any answer's lifetime.
+    CoordinatorLink(uint32_t ordinal, CoordinatorSink sink, uint32_t seqBase = 0) noexcept
+        : ordinal_(ordinal), seq_(seqBase), sink_(sink) {}
 
     /// A free slot, or nullptr (the caller retries next pass).  The slot carries its correlation id
     /// (`corrId`); the caller encodes the request into slot->frame with that id and sets frameLen, then
-    /// submit() makes it Unsent.  ZERO allocation.  deadlineNs: 0 = never expires.
+    /// submit() makes it Unsent.  ZERO allocation.  deadlineNs MUST be > 0 (absolute duty clock): every slot, in every state, expires by it.
+    /// A non-positive deadline is refused (nullptr; asserts in debug).
     [[nodiscard]] Slot* acquire(ReqKind kind, int64_t deadlineNs) noexcept;
     /// Unsent: pump() offers it.  Stamps the frame's header correlation id.
     void submit(Slot& s) noexcept;
@@ -58,10 +64,12 @@ public:
     /// Returns the work done (offers + expiries).
     template <class OnExpired>
     int pump(int64_t nowNs, OnExpired&& onExpired) {
+        if (live_ == 0) return 0;   // idle: touches no slot memory
+        ++scans_;
         int work = 0;
         for (Slot& s : slots_) {
             if (std::holds_alternative<Free>(s.state) || std::holds_alternative<Building>(s.state)) continue;
-            if (s.deadlineNs != 0 && nowNs >= s.deadlineNs) {
+            if (nowNs >= s.deadlineNs) {
                 onExpired(s);
                 release(s);
                 ++work;
@@ -80,7 +88,11 @@ public:
     void release(Slot& s) noexcept;
     void onCoordinatorMoved() noexcept { ++gen_; }   ///< AwaitCoordinator slots become due
     void onSessionChanged() noexcept;                ///< InFlight -> Unsent (same corrId)
-    [[nodiscard]] std::size_t inUse() const noexcept;
+    [[nodiscard]] std::size_t inUse() const noexcept { return live_; }
+    /// Next sequence to be handed out minus one: ProducerHub carries it to the ordinal's next incarnation.
+    [[nodiscard]] uint32_t seq() const noexcept { return seq_; }
+    /// Test hook: pump passes that scanned the slots (an idle link never does).
+    [[nodiscard]] uint64_t scans() const noexcept { return scans_; }
     [[nodiscard]] uint32_t ordinal() const noexcept { return ordinal_; }
 
     /// The verdict table (FD5 / FD6; Kafka parity, TransactionalProducerImpl::classify_ plus auth).
@@ -94,7 +106,9 @@ private:
 
     std::array<Slot, kMaxCoordRequests> slots_{};
     uint32_t        ordinal_;
-    uint32_t        seq_ = 0;
+    uint32_t        seq_;
+    uint32_t        live_ = 0;   // slots not Free (Building included)
+    uint64_t        scans_ = 0;
     uint64_t        gen_ = 0;
     CoordinatorSink sink_;
 };

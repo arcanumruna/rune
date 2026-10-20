@@ -46,7 +46,8 @@ void ProducerHub::add(ProducerImpl* impl)
     }
     if (nextBase_.size() <= ord) nextBase_.resize(ord + 1, 0);
     impl->setOrdinal(ord, nextBase_[ord]);  // F2: past every sequence a previous incarnation used
-    if (coordSink_.offer != nullptr) impl->enableCoordinator(coordSink_);   // Phase 2b F: after the ordinal
+    if (nextCoordSeq_.size() <= ord) nextCoordSeq_.resize(ord + 1, 0);
+    if (coordSink_.offer != nullptr) impl->enableCoordinator(coordSink_, nextCoordSeq_[ord]);   // Phase 2b F: after the ordinal
     active_.push_back(impl);  // m2: walks visit only the live producers
 }
 
@@ -58,6 +59,7 @@ void ProducerHub::remove(ProducerImpl* impl) noexcept
     // F2: the next producer on this ordinal starts past every sequence this one
     // ever used (cold: once per released producer).
     if (nextBase_.size() > ord) nextBase_[ord] = impl->sequenceEnd() + 1;
+    if (nextCoordSeq_.size() > ord) nextCoordSeq_[ord] = impl->coordinatorSeq();   // coordinator ids never repeat
     for (std::size_t i = 0; i < active_.size(); ++i) {
         if (active_[i] == impl) {
             active_[i] = active_.back();

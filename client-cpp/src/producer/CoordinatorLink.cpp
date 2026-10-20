@@ -55,6 +55,8 @@ int64_t CoordinatorLink::backoffNs(uint32_t attempt) noexcept {
 }
 
 CoordinatorLink::Slot* CoordinatorLink::acquire(ReqKind kind, int64_t deadlineNs) noexcept {
+    assert(deadlineNs > 0 && "every coordinator request needs a deadline");
+    if (deadlineNs <= 0) return nullptr;
     for (std::size_t i = 0; i < slots_.size(); ++i) {
         Slot& s = slots_[i];
         if (!std::holds_alternative<Free>(s.state)) continue;
@@ -63,7 +65,8 @@ CoordinatorLink::Slot* CoordinatorLink::acquire(ReqKind kind, int64_t deadlineNs
         s.attempt    = 0;
         s.deadlineNs = deadlineNs;
         s.frameLen   = 0;
-        s.corrId     = coordcorr::make(ordinal_, static_cast<uint8_t>(i), ++seq_);
+        s.corrId     = coordcorr::make(ordinal_, static_cast<uint8_t>(i), (++seq_ == 0 ? ++seq_ : seq_));
+        ++live_;
         return &s;
     }
     return nullptr;
@@ -76,15 +79,11 @@ void CoordinatorLink::submit(Slot& s) noexcept {
 }
 
 void CoordinatorLink::release(Slot& s) noexcept {
+    if (std::holds_alternative<Free>(s.state)) return;
+    --live_;
     s.state = Free{};
     s.corrId = 0;
     s.frameLen = 0;
-}
-
-std::size_t CoordinatorLink::inUse() const noexcept {
-    std::size_t n = 0;
-    for (const Slot& s : slots_) n += std::holds_alternative<Free>(s.state) ? 0 : 1;
-    return n;
 }
 
 bool CoordinatorLink::offer_(Slot& s) noexcept {

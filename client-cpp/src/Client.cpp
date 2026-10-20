@@ -3488,6 +3488,12 @@ void Client::onEgressFrame(codec::TemplateId tid,
         const auto ec = static_cast<rpc::ErrorCode>(
             static_cast<uint16_t>(opt->code));
 
+        // Phase 2b F: ANY ErrorResponse naming a coordinator request id belongs to that producer's link
+        // (NotCoordinator parks it; other codes settle it with their error instead of timing out).
+        const bool coordRouted =
+            producer::coordcorr::isCoord(opt->correlationId) &&
+            producerHub_.onCoordinatorResponse(static_cast<uint16_t>(codec::TemplateId::ErrorResponse), buf, len, now());
+
         // Catalog history (Task 5, spec §5.1/§5.2/§9): an answer to a pending
         // DDL is decided HERE, before every data-op branch below (which would
         // treat a DDL Redirect as a connect-time one and drop it): Redirect ->
@@ -3610,10 +3616,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
             // Phase 2b F: a producer's coordinator request waits (AwaitCoordinator) for the move below;
             // a redirect naming the coordinator already in use moves nothing, so ask for fresh metadata
             // (its answer releases the waiters too).
-            if (producerHub_.onCoordinatorResponse(static_cast<uint16_t>(codec::TemplateId::ErrorResponse), buf, len,
-                                                   now())) {
-                scheduleMetadataRefresh();
-            }
+            if (coordRouted) scheduleMetadataRefresh();
             onCoordinatorRedirect_(std::string(opt->message));
             break;
         }

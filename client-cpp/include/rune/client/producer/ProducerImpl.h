@@ -1088,7 +1088,9 @@ public:
     // ---- Phase 2b F Task 2: the coordinator link (duty thread only) -----------
     /// Emplaces the link with this producer's ordinal (ProducerHub::add, right after setOrdinal) and
     /// the sink to offer coordinator frames through.  Before it, a bare rig has no link.
-    void enableCoordinator(CoordinatorSink sink) { coord_.emplace(ordinal_, sink); }
+    void enableCoordinator(CoordinatorSink sink, uint32_t seqBase = 0) { coord_.emplace(ordinal_, sink, seqBase); }
+    /// Cold (ProducerHub::remove): the link's sequence, carried to the ordinal's next incarnation.
+    [[nodiscard]] uint32_t coordinatorSeq() const noexcept { return coord_ ? coord_->seq() : 0; }
     [[nodiscard]] bool hasCoordinator() const noexcept { return coord_.has_value(); }
     [[nodiscard]] CoordinatorLink* coordinatorLink() noexcept { return coord_ ? &*coord_ : nullptr; }
     /// An answer routed here by ordinal (ProducerHub::onCoordinatorResponse).  The machines of Tasks

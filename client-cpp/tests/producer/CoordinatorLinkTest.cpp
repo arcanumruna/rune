@@ -33,6 +33,7 @@ constexpr int16_t kInvalidState = static_cast<int16_t>(rpc::ErrorCode::InvalidTx
 constexpr int16_t kNotAuth      = static_cast<int16_t>(rpc::ErrorCode::NotAuthorized);            // 45
 constexpr int16_t kInvalidReq   = static_cast<int16_t>(rpc::ErrorCode::InvalidRequest);           // 39
 constexpr int64_t kMs           = 1'000'000;
+constexpr int64_t kFar          = int64_t{1} << 60;
 
 /// Encode a request of `kind` into the slot (the link never looks past the 24-byte header).
 void encode(CoordinatorLink::Slot& s) {
@@ -48,7 +49,7 @@ void encode(CoordinatorLink::Slot& s) {
     }
 }
 
-CoordinatorLink::Slot* send(CoordinatorLink& link, ReqKind kind, int64_t deadlineNs = 0) {
+CoordinatorLink::Slot* send(CoordinatorLink& link, ReqKind kind, int64_t deadlineNs = int64_t{1} << 60) {
     CoordinatorLink::Slot* s = link.acquire(kind, deadlineNs);
     if (s == nullptr) return nullptr;
     encode(*s);
@@ -68,7 +69,7 @@ int pumpNoExpiry(CoordinatorLink& link, int64_t now) {
 TEST(CoordinatorLink, AcquireSubmitPumpOffersOnceAndInFlightUntilAnswered) {
     FakeCoordinator fake;
     CoordinatorLink link(3, fake.sink());
-    CoordinatorLink::Slot* s = link.acquire(ReqKind::EndTxn, 0);
+    CoordinatorLink::Slot* s = link.acquire(ReqKind::EndTxn, kFar);
     ASSERT_NE(s, nullptr);
     EXPECT_TRUE(rp::coordcorr::isCoord(s->corrId));
     EXPECT_EQ(rp::coordcorr::ordinal(s->corrId), 3u);
@@ -216,11 +217,11 @@ TEST(CoordinatorLink, NoFreeSlotReturnsNullNeverAllocates) {
     std::vector<CoordinatorLink::Slot*> held;
     held.reserve(CoordinatorLink::kMaxCoordRequests);
     for (std::size_t i = 0; i < CoordinatorLink::kMaxCoordRequests; ++i) {
-        CoordinatorLink::Slot* s = link.acquire(ReqKind::EndTxn, 0);
+        CoordinatorLink::Slot* s = link.acquire(ReqKind::EndTxn, kFar);
         ASSERT_NE(s, nullptr) << i;
         held.push_back(s);
     }
-    EXPECT_EQ(link.acquire(ReqKind::EndTxn, 0), nullptr) << "the 9th acquire";
+    EXPECT_EQ(link.acquire(ReqKind::EndTxn, kFar), nullptr) << "the 9th acquire";
     EXPECT_EQ(link.inUse(), CoordinatorLink::kMaxCoordRequests);
     for (auto* s : held) link.release(*s);
     EXPECT_EQ(link.inUse(), 0u);
@@ -230,7 +231,7 @@ TEST(CoordinatorLink, NoFreeSlotReturnsNullNeverAllocates) {
     fake.offered.clear();
     alloc_counter::startThisThread();
     for (int i = 0; i < 10'000; ++i) {
-        CoordinatorLink::Slot* s = link.acquire(ReqKind::AddPartitions, 0);
+        CoordinatorLink::Slot* s = link.acquire(ReqKind::AddPartitions, kFar);
         if (s == nullptr) break;
         encode(*s);
         link.submit(*s);
@@ -402,4 +403,125 @@ TEST(CoordinatorLinkRegression, CoordIdsNeverCollideWithBatchOrFetchIdsRegressio
     }
     EXPECT_FALSE(rp::coordcorr::isCoord(-5)) << "keepalive ids are negative";
     EXPECT_FALSE(rp::coordcorr::isCoord(0));
+}
+
+// ---------------------------------------------------------------------------
+// Fix round 1.
+// ---------------------------------------------------------------------------
+
+TEST(CoordinatorLinkRegression, AStaleAnswerAfterOrdinalReuseIsIgnoredRegression) {
+    // Ordinals are reused only once all 4096 fresh ones are taken: fill 4095 link-less producers, then the
+    // linked one takes the last fresh ordinal; releasing it makes its ordinal the next one handed out.
+    FakeCoordinator fake;
+    rp::ProducerHub hub;
+    std::vector<std::unique_ptr<rp::ProducerImpl>> fillers;
+    fillers.reserve(4095);
+    for (int i = 0; i < 4095; ++i) {
+        fillers.push_back(std::make_unique<rp::ProducerImpl>(plainCfg(), 1 << 10));
+        hub.add(fillers.back().get());
+    }
+    hub.setCoordinatorSink(fake.sink());
+    auto oldP = std::make_unique<rp::ProducerImpl>(plainCfg(), 1 << 10);
+    hub.add(oldP.get());
+    const uint32_t ord = oldP->ordinal();
+    ASSERT_EQ(ord, 4095u);
+    CoordinatorLink::Slot* so = send(*oldP->coordinatorLink(), ReqKind::InitProducerId);
+    ASSERT_NE(so, nullptr);
+    const int64_t oldCorr = so->corrId;
+    hub.remove(oldP.get());
+    oldP.reset();
+
+    auto newP = std::make_unique<rp::ProducerImpl>(plainCfg(), 1 << 10);
+    hub.add(newP.get());
+    ASSERT_EQ(newP->ordinal(), ord) << "the ordinal was reused";
+    CoordinatorLink::Slot* sn = send(*newP->coordinatorLink(), ReqKind::InitProducerId);
+    ASSERT_NE(sn, nullptr);
+    const int64_t newCorr = sn->corrId;
+    EXPECT_NE(newCorr, oldCorr) << "ids never repeat across incarnations of an ordinal";
+
+
+    // The old producer's late answer is dropped by the new link (its request stays pending)...
+    const auto stale = FakeCoordinator::answer(ReqKind::InitProducerId, oldCorr, 0);
+    (void)hub.onCoordinatorResponse(stale.templateId, stale.data(), stale.len, 5);
+    EXPECT_EQ(newP->coordinatorLink()->inUse(), 1u) << "the stale answer settled nothing";
+    EXPECT_TRUE(std::holds_alternative<CoordinatorLink::Unsent>(sn->state));
+    // ...and the new producer's own answer is accepted.
+    const auto mine = FakeCoordinator::answer(ReqKind::InitProducerId, newCorr, 0);
+    EXPECT_TRUE(hub.onCoordinatorResponse(mine.templateId, mine.data(), mine.len, 6));
+    EXPECT_EQ(newP->coordinatorLink()->inUse(), 0u) << "its own answer settled it";
+    hub.remove(newP.get());
+}
+
+TEST(CoordinatorLinkRegression, AnIdleLinkTouchesNoSlotMemoryRegression) {
+    FakeCoordinator fake;
+    rp::ProducerHub hub;
+    hub.setCoordinatorSink(fake.sink());
+    rc::ProducerConfig cfg = plainCfg();
+    cfg.acks = rc::Acks::All;
+    rp::ProducerImpl p(cfg, 1 << 16);
+    hub.add(&p);
+    ASSERT_TRUE(p.hasCoordinator());
+    for (int i = 0; i < 1000; ++i) EXPECT_EQ(p.pumpCoordinator(i), 0);
+    const rp::CoordinatorLink& link = *p.coordinatorLink();
+    EXPECT_EQ(link.scans(), 0u) << "no live request: the duty pass never walks the slots";
+    CoordinatorLink::Slot* s = send(*p.coordinatorLink(), ReqKind::EndTxn);
+    ASSERT_NE(s, nullptr);
+    EXPECT_EQ(p.pumpCoordinator(1), 1);
+    EXPECT_GE(link.scans(), 1u);
+    p.coordinatorLink()->release(*s);
+    const uint64_t scans = link.scans();
+    for (int i = 0; i < 1000; ++i) (void)p.pumpCoordinator(i);
+    EXPECT_EQ(link.scans(), scans) << "idle again";
+}
+
+TEST(CoordinatorLinkRegression, AnAwaitCoordinatorRequestTimesOutAtItsDeadlineRegression) {
+    FakeCoordinator fake;
+    CoordinatorLink link(0, fake.sink());
+    CoordinatorLink::Slot* s = send(link, ReqKind::EndTxn, 9000);
+    ASSERT_EQ(pumpNoExpiry(link, 1), 1);
+    const auto f = FakeCoordinator::errorResponse(s->corrId, rpc::ErrorCode::NotCoordinator, "node2");
+    CoordAnswer a{ReqKind::EndTxn, s->corrId, kNotCoord, std::span<const uint8_t>(f.data(), f.len), true};
+    ASSERT_EQ(link.onAnswer(a, 2), nullptr);
+    ASSERT_TRUE(std::holds_alternative<CoordinatorLink::AwaitCoordinator>(s->state));
+    EXPECT_EQ(pumpNoExpiry(link, 8999), 0) << "no move: still waiting";
+    int expired = 0;
+    EXPECT_EQ(link.pump(9000, [&](CoordinatorLink::Slot&) { ++expired; }), 1);
+    EXPECT_EQ(expired, 1) << "completes Timeout at its deadline";
+    EXPECT_EQ(link.inUse(), 0u);
+    // Fatal offers (consumed, never delivered) expire too.
+    FakeCoordinator dead;
+    dead.next = rp::CoordinatorSink::Offer::Fatal;
+    CoordinatorLink l2(0, dead.sink());
+    ASSERT_NE(send(l2, ReqKind::InitProducerId, 500), nullptr);
+    ASSERT_EQ(pumpNoExpiry(l2, 1), 1);
+    int e2 = 0;
+    EXPECT_EQ(l2.pump(500, [&](CoordinatorLink::Slot&) { ++e2; }), 1);
+    EXPECT_EQ(e2, 1);
+}
+
+TEST(CoordinatorLinkRegression, AnErrorResponseForACoordinatorIdSettlesItWithItsErrorRegression) {
+    FakeCoordinator fake;
+    rp::ProducerHub hub;
+    hub.setCoordinatorSink(fake.sink());
+    rp::ProducerImpl p(plainCfg(), 1 << 16);
+    hub.add(&p);
+    // Link level: a non-NotCoordinator ErrorResponse (45 NotAuthorized on AddPartitions) is handed back.
+    CoordinatorLink::Slot* s = send(*p.coordinatorLink(), ReqKind::AddPartitions);
+    ASSERT_NE(s, nullptr);
+    const int64_t corr = s->corrId;
+    ASSERT_EQ(p.pumpCoordinator(1), 1);
+    const auto e = FakeCoordinator::errorResponse(corr, rpc::ErrorCode::NotAuthorized, "denied");
+    CoordAnswer a{ReqKind::AddPartitions, corr, kNotAuth, std::span<const uint8_t>(e.data(), e.len), true};
+    EXPECT_EQ(CoordinatorLink::classify(ReqKind::AddPartitions, kNotAuth), Verdict::Abortable);
+    // Hub level: it is routed to its producer (and settles the slot instead of waiting for the deadline).
+    EXPECT_TRUE(hub.onCoordinatorResponse(e.templateId, e.data(), e.len, 2));
+    EXPECT_EQ(p.coordAnswersSeen(), 1u);
+    EXPECT_EQ(p.coordinatorLink()->inUse(), 0u);
+    // And a 39 InvalidRequest for an EndTxn settles it too (never retried).
+    CoordinatorLink::Slot* t = send(*p.coordinatorLink(), ReqKind::EndTxn);
+    ASSERT_NE(t, nullptr);
+    const auto bad = FakeCoordinator::errorResponse(t->corrId, rpc::ErrorCode::InvalidRequest, "bad");
+    EXPECT_TRUE(hub.onCoordinatorResponse(bad.templateId, bad.data(), bad.len, 3));
+    EXPECT_EQ(p.coordinatorLink()->inUse(), 0u);
+    (void)a;
 }

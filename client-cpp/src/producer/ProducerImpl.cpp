@@ -3668,7 +3668,7 @@ void ProducerImpl::onCoordinatorAnswer(const CoordAnswer& a, int64_t nowNs) noex
 }
 
 int ProducerImpl::pumpCoordinator(int64_t nowNs) noexcept {
-    if (!coord_) return 0;
+    if (!coord_ || coord_->inUse() == 0) [[likely]] return 0;   // idle link: one load, no slot memory
     return coord_->pump(nowNs, [](CoordinatorLink::Slot&) {});
 }
 
