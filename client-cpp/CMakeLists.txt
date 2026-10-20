@@ -977,6 +977,11 @@ endif()
 if(BUILD_TESTING)
     find_package(GTest REQUIRED)
     include(GoogleTest)
+    # Discover tests at ctest time, not build time: build-time discovery runs each
+    # binary under a 5s DISCOVERY_TIMEOUT that a loaded box can exceed (seen on
+    # rune_cli_security_tests / rune_cli_security_live_tests), failing the build.
+    # Same rule as broker/CMakeLists.txt.
+    set(CMAKE_GTEST_DISCOVER_TESTS_DISCOVERY_MODE PRE_TEST)
 
     # Conformance vector directory — the sibling rune-protocol repo.
     # D6: the golden vectors come from the SAME rune-protocol checkout as the
