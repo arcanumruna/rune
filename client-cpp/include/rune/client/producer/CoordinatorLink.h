@@ -225,4 +225,21 @@ using TxnMembership = std::variant<NotInTxn, Adding, Added, AddFailed>;
 inline constexpr std::size_t kAddedIndex = 2;   // index of Added in TxnMembership
 static_assert(std::is_same_v<std::variant_alternative_t<kAddedIndex, TxnMembership>, Added>);
 
+// ---- Phase 2b F Task 7: the sendOffsetsToTransaction op (one at a time, only while InTransaction) ----
+//   OffsetsIdle -sendOffsets-> OffsetsAdding{op, slot} -AddOffsetsToTxn OK (TxnStarted::Yes)-> OffsetsCommitting
+//   {op, sent, outstanding, slots} -every TxnOffsetCommit request OK-> OffsetsIdle (the op completes Ok)
+//   A non-retriable answer / the op deadline / an abort / a fatal error ends it from either state (slots released).
+// The offsets and the group id live in the duty side's preallocated scratch (ProducerImpl::OffsetsScratch); the
+// states hold only what they need.  FD5: the TxnOffsetCommit entries are split across requests (slots) that fit one
+// kCoordFrameCap frame; `sent` entries are encoded so far, `slots` the requests still unanswered.
+struct OffsetsIdle {};
+struct OffsetsAdding { TxnOp op; CoordinatorLink::Slot* slot = nullptr; };   ///< slot nullptr: not yet sent
+struct OffsetsCommitting {
+    TxnOp    op;
+    uint16_t sent        = 0;   ///< entries already encoded into a request
+    uint8_t  outstanding = 0;   ///< requests sent and unanswered (== the non-null prefix of `slots`)
+    std::array<CoordinatorLink::Slot*, CoordinatorLink::kMaxCoordRequests> slots{};
+};
+using OffsetsOp = std::variant<OffsetsIdle, OffsetsAdding, OffsetsCommitting>;
+
 }  // namespace rune::client::producer

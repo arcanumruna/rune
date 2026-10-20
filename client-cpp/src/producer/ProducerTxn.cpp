@@ -184,8 +184,7 @@ void ProducerImpl::applyTxnControl(const TxnControl& c, int64_t nowNs) {
             refuseTxn_(c, OpStatus::BrokerError, kInvalidTxnState, "sendOffsetsToTransaction: no transaction in progress");
             return;
         }
-        // The AddOffsetsToTxn / TxnOffsetCommit legs arrive with Task 7.
-        refuseTxn_(c, OpStatus::InvalidArgument, 0, "sendOffsetsToTransaction: not supported by this build yet");
+        applySendOffsets_(c, op);
         return;
 
     case TxnControl::Kind::Flush:
@@ -264,7 +263,7 @@ void ProducerImpl::applyTxnControl(const TxnControl& c, int64_t nowNs) {
 // ---------------------------------------------------------------------------------------------------------------
 
 bool ProducerImpl::txnHasLiveOp_() const noexcept {
-    if (txnFlushN_ != 0) return true;
+    if (txnFlushN_ != 0 || offsetsOp_.index() != 0) return true;
     if (std::holds_alternative<Initializing>(txn_)) return true;
     if (const auto* cm = std::get_if<Committing>(&txn_)) return !std::holds_alternative<InDoubt>(cm->phase);
     if (const auto* ab = std::get_if<Aborting>(&txn_)) return !std::holds_alternative<InDoubt>(ab->phase);
@@ -272,7 +271,7 @@ bool ProducerImpl::txnHasLiveOp_() const noexcept {
 }
 
 bool ProducerImpl::txnDataSettled_() const noexcept {
-    if (!deferred_.empty() || !txnAddsSettled_()) return false;
+    if (!deferred_.empty() || !txnAddsSettled_() || offsetsOp_.index() != 0) return false;
     for (const auto& up : partitions_) {
         const PartitionState& ps = *up;
         if ((ps.builder && ps.builder->recordCount() > 0) || ps.hasTier2() || !ps.inflight.empty()) return false;
@@ -298,6 +297,7 @@ int ProducerImpl::txnStepCold_(int64_t nowNs) noexcept {
         work += endStep_(nowNs);
     }
     if (!txnAddQueue_.empty()) work += addStep_(nowNs);
+    if (offsetsOp_.index() != 0) work += offsetsStep_(nowNs);
     if (txnFlushN_ != 0) work += flushStep_(nowNs);
     return work;
 }
@@ -472,6 +472,12 @@ void ProducerImpl::enterFatal_(OpStatus st, uint16_t errorCode, std::string_view
     const std::array<TxnOp, kMaxTxnFlushes> flushes = txnFlushes_;
     const std::size_t nFlushes = txnFlushN_;
     txnFlushN_ = 0;
+    // Task 7: a live sendOffsets op is taken out first (its slots are released); it completes with the rest below.
+    TxnOp offsetsOp{};
+    bool  offsetsLive = false;
+    if (const auto* oa = std::get_if<OffsetsAdding>(&offsetsOp_)) { offsetsOp = oa->op; offsetsLive = true; }
+    else if (const auto* oc = std::get_if<OffsetsCommitting>(&offsetsOp_)) { offsetsOp = oc->op; offsetsLive = true; }
+    offsetsOp_ = OffsetsIdle{};
     if (coord_) coord_->releaseAll();   // never offered, never re-sent (a session change re-sends nothing)
     txnResetMembership_();              // the AddPartitions slots are gone with the rest
     txn_      = FatalError{st, errorCode};
@@ -480,6 +486,7 @@ void ProducerImpl::enterFatal_(OpStatus st, uint16_t errorCode, std::string_view
     failAllPending(st, errorCode);
     for (std::size_t i = 0; i < n; ++i) completeTxn_(ops[i], kinds[i], st, errorCode, text);
     for (std::size_t i = 0; i < nFlushes; ++i) completeTxn_(flushes[i], OpKind::Flush, st, errorCode, text);
+    if (offsetsLive) completeTxn_(offsetsOp, OpKind::SendOffsets, st, errorCode, text);
 }
 
 void ProducerImpl::endDone_(int64_t nowNs) noexcept {
@@ -548,6 +555,10 @@ void ProducerImpl::initExpired_(bool releaseSlot) noexcept {
 void ProducerImpl::onTxnSlotExpired_(CoordinatorLink::Slot& s) noexcept {
     if (s.kind == ReqKind::AddPartitions) {
         onAddExpired_(s);
+        return;
+    }
+    if (s.kind == ReqKind::AddOffsets || s.kind == ReqKind::TxnOffsetCommit) {
+        offsetsExpired_(&s);
         return;
     }
     if (const auto* in = std::get_if<Initializing>(&txn_); in != nullptr && in->slot == &s) {
@@ -713,12 +724,14 @@ void ProducerImpl::txnDiscard_(OpStatus st, uint16_t errorCode) noexcept {
     const std::array<TxnOp, kMaxTxnFlushes> flushes = txnFlushes_;
     const std::size_t nFlushes = txnFlushN_;
     txnFlushN_ = 0;
+    // Task 7: closeImmediately detaches a live sendOffsets op too (completed below, after the slots are released).
     if (coord_) coord_->releaseAll();
     txnResetMembership_();
     if (std::holds_alternative<IdRequested>(identity_)) identity_ = IdUnassigned{};
     publishStatus_();
     for (std::size_t i = 0; i < n; ++i) completeTxn_(ops[i], kinds[i], st, errorCode, "producer closed");
     for (std::size_t i = 0; i < nFlushes; ++i) completeTxn_(flushes[i], OpKind::Flush, st, errorCode, "producer closed");
+    offsetsEnd_(st, errorCode, "producer closed", OffsetsEnd::Cancelled);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -904,6 +917,10 @@ bool ProducerImpl::txnDiscardUnsent_(const TxnOutcome& o) noexcept {
         ad->slot = nullptr;
     }
     if (offered) markStarted_(TxnStarted::Maybe);
+    // Task 7: a sendOffsets op still running is cancelled with the abort's outcome (the abort never waits for it).
+    if (offsetsEnd_(o.status, o.errorCode, "sendOffsetsToTransaction: the transaction was aborted", OffsetsEnd::Cancelled)) {
+        changed = true;
+    }
     const DutyScope duty(*this);   // sends from the completions below are deferred (Direct)
     // The ring holds nothing of this transaction: records ahead of the abort were drained before it applied (FD1),
     // later ones are refused by the drain (the machine is not InTransaction).
@@ -1069,6 +1086,185 @@ int ProducerImpl::closeTxnStep_(int64_t nowNs) noexcept {
         }
     }
     return 0;
+}
+
+
+// ---------------------------------------------------------------------------------------------------------------
+// Task 7: sendOffsetsToTransaction - AddOffsetsToTxn, then TxnOffsetCommit (split per FD5)
+// ---------------------------------------------------------------------------------------------------------------
+
+void ProducerImpl::applySendOffsets_(const TxnControl& c, const TxnOp& op) {
+    // The state gates (InTransaction only; AbortableError refuses with the poison) ran in applyTxnControl.
+    if (offsetsOp_.index() != 0) {
+        refuseTxn_(c, OpStatus::BrokerError, kInvalidTxnState, "sendOffsetsToTransaction: another call is still running");
+        return;
+    }
+    if (c.offsets.size() > kMaxTxnOffsets) {
+        refuseTxn_(c, OpStatus::InvalidArgument, 0, "sendOffsetsToTransaction: at most 1024 offsets per call");
+        return;
+    }
+    if (c.groupId.empty() || c.groupId.size() > kMaxTxnGroupIdBytes) {
+        refuseTxn_(c, OpStatus::InvalidArgument, 0, "sendOffsetsToTransaction: the group id must be 1 to 255 bytes");
+        return;
+    }
+    OffsetsScratch& sc = *offsetsScratch_;   // allocated at construction of a transactional producer
+    std::copy(c.offsets.begin(), c.offsets.end(), sc.entries.begin());
+    std::memcpy(sc.group.data(), c.groupId.data(), c.groupId.size());
+    sc.n        = static_cast<uint16_t>(c.offsets.size());
+    sc.groupLen = static_cast<uint8_t>(c.groupId.size());
+    offsetsOp_  = OffsetsAdding{op, nullptr};   // txnStep sends the AddOffsetsToTxn
+}
+
+int ProducerImpl::offsetsStep_(int64_t nowNs) noexcept {
+    const std::span<const uint8_t> txnId(reinterpret_cast<const uint8_t*>(cfg_.transactionalId.data()),
+                                         cfg_.transactionalId.size());
+    OffsetsScratch& sc = *offsetsScratch_;
+    const std::span<const uint8_t> group(reinterpret_cast<const uint8_t*>(sc.group.data()), sc.groupLen);
+    if (auto* oa = std::get_if<OffsetsAdding>(&offsetsOp_)) {
+        if (nowNs >= oa->op.deadlineNs) {
+            offsetsExpired_(nullptr);
+            return 1;
+        }
+        const auto* id = std::get_if<IdAssigned>(&identity_);
+        if (oa->slot != nullptr || !coord_ || id == nullptr) return 0;
+        CoordinatorLink::Slot* s = coord_->acquire(ReqKind::AddOffsets, oa->op.deadlineNs);
+        if (s == nullptr) return 0;   // no free slot: next pass
+        rpc::AddOffsetsToTxn m;
+        m.correlationId   = s->corrId;
+        m.producerId      = id->producerId;
+        m.producerEpoch   = id->epoch;
+        m.transactionalId = txnId;
+        m.groupId         = group;
+        s->frameLen = static_cast<uint16_t>(m.encode(s->frame.data()));
+        coord_->submit(*s);
+        oa->slot = s;
+        return 1;
+    }
+    auto* oc = std::get_if<OffsetsCommitting>(&offsetsOp_);
+    if (oc == nullptr) return 0;
+    if (nowNs >= oc->op.deadlineNs) {
+        offsetsExpired_(nullptr);
+        return 1;
+    }
+    if (oc->sent >= sc.n) {
+        if (oc->outstanding != 0) return 0;
+        offsetsEnd_(OpStatus::Ok, 0, {}, OffsetsEnd::Done);   // no entries: AddOffsetsToTxn was all there was
+        return 1;
+    }
+    const auto* id = std::get_if<IdAssigned>(&identity_);
+    if (!coord_ || id == nullptr) return 0;
+    int work = 0;
+    // FD5: the entries that do not fit one kCoordFrameCap frame go in the next request (slot); a pass that finds no
+    // free slot leaves the rest for the next one.
+    while (oc->sent < sc.n) {
+        CoordinatorLink::Slot* s = coord_->acquire(ReqKind::TxnOffsetCommit, oc->op.deadlineNs);
+        if (s == nullptr) break;
+        rpc::TxnOffsetCommit m;
+        m.correlationId   = s->corrId;
+        m.producerId      = id->producerId;
+        m.producerEpoch   = id->epoch;
+        m.transactionalId = txnId;
+        m.groupId         = group;
+        uint8_t*          f       = s->frame.data();
+        std::size_t       pos     = m.encode(f, {});   // header + ids + count 0
+        const std::size_t countAt = pos - 2;
+        uint16_t          count   = 0;
+        constexpr std::size_t kEntry = 4 + 4 + 8 + 2;   // topic, partition, offset, empty metadata
+        while (oc->sent < sc.n && pos + kEntry <= CoordinatorLink::kCoordFrameCap) {
+            const OffsetEntry& e = sc.entries[oc->sent++];
+            rpc::detail::putLE32(f, static_cast<int>(pos), e.topicId);
+            rpc::detail::putLE32(f, static_cast<int>(pos) + 4, e.partition);
+            rpc::detail::putLE64(f, static_cast<int>(pos) + 8, e.offset);
+            rpc::detail::putLE16(f, static_cast<int>(pos) + 16, 0);
+            pos += kEntry;
+            ++count;
+        }
+        if (count == 0) {   // the ids alone fill the frame: no entry can ever be sent
+            coord_->release(*s);
+            offsetsEnd_(OpStatus::InvalidArgument, 0, "sendOffsetsToTransaction: transactional id and group id too long",
+                        OffsetsEnd::Failed);
+            return work + 1;
+        }
+        rpc::detail::putLE16(f + countAt, 0, count);
+        s->frameLen = static_cast<uint16_t>(pos);
+        coord_->submit(*s);
+        oc->slots[oc->outstanding++] = s;
+        ++work;
+    }
+    return work;
+}
+
+void ProducerImpl::onOffsetsAnswer_(const CoordAnswer& a, CoordinatorLink::Slot& s) noexcept {
+    // An ErrorResponse carrying code 0 is a protocol error: InvalidRequest (39), never a code-less success.
+    const int16_t  code  = (a.anyKind && a.errorCode == 0) ? static_cast<int16_t>(kInvalidRequest) : a.errorCode;
+    const uint16_t ucode = static_cast<uint16_t>(code);
+    auto* oa = std::get_if<OffsetsAdding>(&offsetsOp_);
+    auto* oc = std::get_if<OffsetsCommitting>(&offsetsOp_);
+    if (s.kind == ReqKind::AddOffsets ? (oa == nullptr || oa->slot != &s) : oc == nullptr) return;   // stale
+    if (oc != nullptr) {   // a TxnOffsetCommit request: it leaves the outstanding set (the caller releases the slot)
+        std::size_t i = 0;
+        while (i < oc->outstanding && oc->slots[i] != &s) ++i;
+        if (i == oc->outstanding) return;   // not ours (stale)
+        for (; i + 1 < oc->outstanding; ++i) oc->slots[i] = oc->slots[i + 1];
+        oc->slots[--oc->outstanding] = nullptr;
+    }
+    switch (CoordinatorLink::classify(s.kind, code)) {
+    case Verdict::Ok:
+        if (oa != nullptr) {
+            markStarted_(TxnStarted::Yes);   // B-1: AddOffsetsToTxn OK - the transaction exists on the coordinator
+            offsetsOp_ = OffsetsCommitting{oa->op, 0, 0, {}};   // txnStep sends the TxnOffsetCommit requests
+        } else if (oc->sent >= offsetsScratch_->n && oc->outstanding == 0) {
+            offsetsEnd_(OpStatus::Ok, 0, {}, OffsetsEnd::Done);
+        }
+        return;
+    case Verdict::Retry:
+    case Verdict::Rediscover:
+        return;   // the link re-sends; never handed over
+    case Verdict::Fenced:
+        enterFatal_(OpStatus::Fenced, ucode, "producer fenced (fatal)");
+        return;
+    case Verdict::Fatal:
+        enterFatal_(OpStatus::BrokerError, ucode, "transaction leg failed (fatal)");
+        return;
+    case Verdict::Abortable:
+    case Verdict::Reject:
+        offsetsEnd_(OpStatus::BrokerError, ucode,
+                    s.kind == ReqKind::AddOffsets ? "AddOffsetsToTxn failed" : "TxnOffsetCommit failed",
+                    OffsetsEnd::Failed);
+        return;
+    }
+}
+
+void ProducerImpl::offsetsExpired_(CoordinatorLink::Slot*) noexcept {
+    // The call is in doubt (a leg may have landed): the transaction can only abort, like any failed leg.
+    offsetsEnd_(OpStatus::Timeout, 0, "sendOffsetsToTransaction: timed out (the offsets are in doubt: abort)",
+                OffsetsEnd::TimedOut);
+}
+
+bool ProducerImpl::offsetsEnd_(OpStatus st, uint16_t errorCode, std::string_view text, OffsetsEnd how) noexcept {
+    TxnOp op{};
+    bool  maybe = false;
+    if (const auto* oa = std::get_if<OffsetsAdding>(&offsetsOp_)) {
+        op = oa->op;
+        if (oa->slot != nullptr) {
+            maybe = std::holds_alternative<CoordinatorLink::InFlight>(oa->slot->state);
+            if (coord_) coord_->release(*oa->slot);
+        }
+    } else if (const auto* oc = std::get_if<OffsetsCommitting>(&offsetsOp_)) {
+        op = oc->op;
+        for (uint8_t i = 0; i < oc->outstanding; ++i) {
+            maybe = maybe || std::holds_alternative<CoordinatorLink::InFlight>(oc->slots[i]->state);
+            if (coord_) coord_->release(*oc->slots[i]);
+        }
+    } else {
+        return false;
+    }
+    offsetsOp_ = OffsetsIdle{};
+    // A leg that was on the wire may have started the transaction: an abort then sends EndTxn(abort) (m15).
+    if (maybe && (how == OffsetsEnd::TimedOut || how == OffsetsEnd::Cancelled)) markStarted_(TxnStarted::Maybe);
+    if (how == OffsetsEnd::Failed || how == OffsetsEnd::TimedOut) poison_(st, errorCode, AbortKind::Plain);
+    completeTxn_(op, OpKind::SendOffsets, st, errorCode, text);
+    return true;
 }
 
 }  // namespace rune::client::producer

@@ -470,6 +470,10 @@ enum class RejectReason : uint8_t {
 // Phase 2b F Task 5: one transaction control op (the kMsgTxnControl payload decoded, Task 8, or an Invoker
 // direct call), applied on the duty thread by ProducerImpl::applyTxnControl.
 // ---------------------------------------------------------------------------
+/// sendOffsetsToTransaction limits (Task 7): more offsets / a longer group id completes InvalidArgument, never truncated.
+inline constexpr std::size_t kMaxTxnOffsets      = 1024;
+inline constexpr std::size_t kMaxTxnGroupIdBytes = 255;
+
 struct TxnControl {
     enum class Kind : uint8_t { Init, Begin, SendOffsets, Commit, Abort, Flush };
     Kind             kind = Kind::Begin;
@@ -1767,8 +1771,32 @@ private:
     [[nodiscard]] bool txnQuiet_() const noexcept {
         const std::size_t i = txn_.index();
         return txnFlushN_ == 0 && i != kInitializingIdx && i != kCommittingIdx && i != kAbortingIdx &&
-               txnAddQueue_.empty();
+               txnAddQueue_.empty() && offsetsOp_.index() == 0;
     }
+    // ---- Phase 2b F Task 7: sendOffsetsToTransaction (ProducerTxn.cpp; duty thread only) ----
+    /// The copy of the call's offsets + group id the op runs from (the caller's span / the Thread-mode ring payload
+    /// is only valid during the apply).  Allocated once at construction of a transactional producer (never on a
+    /// plain one), reused by every op: ZERO allocation per sendOffsets.
+    struct OffsetsScratch {
+        std::array<OffsetEntry, kMaxTxnOffsets> entries{};
+        std::array<char, kMaxTxnGroupIdBytes>   group{};
+        uint16_t                                n        = 0;
+        uint8_t                                 groupLen = 0;
+    };
+    std::unique_ptr<OffsetsScratch> offsetsScratch_;
+    OffsetsOp                       offsetsOp_{OffsetsIdle{}};
+    /// How the op ended.  Failed (a non-retriable answer) and TimedOut (offsets in doubt) poison the transaction (it
+    /// can only abort); TimedOut and Cancelled (an abort / close) may leave a leg on the wire, so the coordinator may
+    /// have started the transaction (TxnStarted::Maybe, m15).  Done changes nothing.
+    enum class OffsetsEnd : uint8_t { Done, Failed, TimedOut, Cancelled };
+    void applySendOffsets_(const TxnControl& c, const TxnOp& op);
+    int  offsetsStep_(int64_t nowNs) noexcept;
+    void onOffsetsAnswer_(const CoordAnswer& a, CoordinatorLink::Slot& s) noexcept;
+    /// The op's deadline passed (`fromLink`: the link expired that slot itself and releases it afterwards).
+    void offsetsExpired_(CoordinatorLink::Slot* fromLink) noexcept;
+    /// End the live op: Idle and every slot released first, then (handlers may run user code) the completion.
+    /// Returns whether an op was live.
+    bool offsetsEnd_(OpStatus st, uint16_t errorCode, std::string_view text, OffsetsEnd how) noexcept;
     // ---- Phase 2b F Task 6: transactional data (ProducerTxn.cpp; duty thread only) ----
     // txnSeen_: the partitions that left NotInTxn in the current transaction (dense slot list, each at most once);
     // txnAddQueue_: those queued (Adding{nullptr}) for the next AddPartitionsToTxn.  Both reserved with the

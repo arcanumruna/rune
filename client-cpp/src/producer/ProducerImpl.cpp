@@ -304,6 +304,7 @@ ProducerImpl::ProducerImpl(ProducerConfig cfg,
     if (!cfg_.transactionalId.empty()) {
         txnGate_       = TxnGate::Closed;  // Phase 2b F: closed until beginTransaction()
         txnBatchAttrs_ = static_cast<uint16_t>(rune::protocol::batch::kAttrTransactional);   // Task 6
+        offsetsScratch_ = std::make_unique<OffsetsScratch>();   // Task 7: preallocated once, reused by every sendOffsets
     }
     // Pre-reserve partition map and encode scratch to avoid allocs on steady-state.
     partitions_.reserve(16);
@@ -3981,7 +3982,8 @@ void ProducerImpl::onCoordinatorAnswer(const CoordAnswer& a, int64_t nowNs) noex
         break;
     case ReqKind::AddOffsets:
     case ReqKind::TxnOffsetCommit:
-        break;   // the offsets legs (Task 7)
+        onOffsetsAnswer_(a, *s);   // Task 7: the sendOffsetsToTransaction legs
+        break;
     }
     coord_->release(*s);
 }
