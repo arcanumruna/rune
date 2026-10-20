@@ -416,3 +416,21 @@ TEST(ProducerTxnAllocRegression, SteadyStateTransactionsAllocateNothingRegressio
     EXPECT_EQ(r.recordFailures, 0);
     EXPECT_EQ(r.offset, int64_t{10} * (kWarm + kCounted)) << "every record of every transaction was acknowledged";
 }
+
+// The zero-alloc gates must see over-aligned allocations too: they use the
+// align_val_t overloads, which bypass the plain replaced operator new.
+TEST(AllocCounterRegression, OverAlignedNewIsCountedRegression) {
+    struct alignas(256) Wide { unsigned char b[256]; };
+    alloc_counter::startThisThread();
+    auto* w = new Wide{};
+    const long n = alloc_counter::stopThisThread();
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(w) % 256u, 0u);
+    delete w;
+    EXPECT_EQ(n, 1);
+
+    alloc_counter::start();
+    auto* arr = new Wide[3];
+    const long g = alloc_counter::stop();
+    delete[] arr;
+    EXPECT_EQ(g, 1);
+}
