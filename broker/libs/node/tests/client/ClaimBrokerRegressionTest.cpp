@@ -304,10 +304,14 @@ TEST(ClaimBrokerRegression, ClaimBatchIsOneAtomicBatchOnTheBrokerRegression) {
 
         // Case 1 (fenced): flush() fences keep the neighbours out of the claimed batch - the broker sees pre (1 record),
         // the claimed batch (exactly 8, one BatchAck of 8) and post (1 record), at offsets 0..9 with no gaps.
+        // A fence is deterministic only once the sealed batch is acked: in Thread mode flush() is a request the
+        // runner may not have served yet, so each fence waits for its batch's ack before the next send.
         sendStr("pre-record");
         fence();
+        ASSERT_TRUE(awaitAcks(1)) << "acked records " << acked;
         claimEight('B');
         fence();
+        ASSERT_TRUE(awaitAcks(9)) << "acked records " << acked;
         sendStr("post-record");
         fence();
         ASSERT_TRUE(awaitAcks(10)) << "acked records " << acked;
