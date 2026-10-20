@@ -681,6 +681,11 @@ public:
     /// any token op.
     OpResult close(const CompletionTarget& target, Token token);
 
+    /// Invoker mode: a blocking close() / closeAndWait() abandons a claim this
+    /// (owner) thread holds - its commit() then returns false.  Thread mode: a
+    /// thread holding a claim must settle it BEFORE calling close() (the drain
+    /// cannot read past an open ring claim and waits up to deliveryTimeoutMs).
+    ///
     /// Blocking close: begin-close + wait for its token (Invoker owner pumps
     /// doWork(); a Thread-mode app thread polls under an idle strategy; from a
     /// duty-cycle callback: std::logic_error).  Returns the token's status (Ok /

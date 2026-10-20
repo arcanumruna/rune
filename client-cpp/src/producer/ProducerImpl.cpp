@@ -3536,6 +3536,8 @@ void ProducerImpl::abandonDirectClaimOn_(PartitionState& ps) noexcept {
 }
 
 void ProducerImpl::abandonOpenClaimForClose() noexcept {
+    // Owner-thread, Direct-mode state: anything else is a no-op.
+    if (mode_ != IngressMode::Direct || std::this_thread::get_id() != dutyThreadId_) return;
     const auto* o = std::get_if<DirectClaimOpen>(&directClaim_);
     if (o != nullptr) abandonDirectClaimOn_(*partitions_[o->slot]);
 }

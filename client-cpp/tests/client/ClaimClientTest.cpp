@@ -14,11 +14,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
-#include <condition_variable>
-#include <cstdio>
-#include <mutex>
 #include <cstring>
 #include <memory>
 #include <span>
@@ -32,8 +28,8 @@ namespace rc = rune::client;
 using rc::SendResult;
 
 namespace {
-std::atomic<int> g_ctr{0};
-int64_t          g_fakeNow = 0;  // test thread only
+int g_ctr = 0;  // single test thread
+int64_t          g_fakeNow = 0;  // test thread only; Invoker mode only (a Thread-mode runner would read it too)
 int64_t fakeNow() noexcept { return g_fakeNow; }
 
 rc::ClientConfig cfgFor(rc::RunnerMode mode, int32_t in, int32_t eg) {
@@ -42,7 +38,7 @@ rc::ClientConfig cfgFor(rc::RunnerMode mode, int32_t in, int32_t eg) {
     c.gatewayStreamId = in;
     c.egressChannel   = "aeron:ipc";
     c.egressStreamId  = eg;
-    c.dataDir = "/tmp/claim_client_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr.fetch_add(1));
+    c.dataDir = "/tmp/claim_client_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr++);
     c.runnerMode = mode;
     rc::TopicSpec ts;
     ts.name           = "t";
@@ -241,7 +237,8 @@ TEST(ClaimClient, ClaimHeldRefusalOfACompletionsClaimReturnsItsQueueCredit) {
 }
 
 // Graceful close() while an Invoker claim is held: commit() returns false,
-// nothing is sent, close completes (bounded: a watchdog ends a hang).
+// nothing is sent, close completes (bounded: measured against a 5 s bound, with
+// the ctest timeout as the hang backstop).
 TEST(ClaimClientRegression, GracefulCloseWithAnInvokerClaimHeldAbandonsItPromptlyRegression) {
     Rig r(cfgFor(rc::RunnerMode::Invoker, 5818, 5819));
     r.connect();
@@ -255,26 +252,9 @@ TEST(ClaimClientRegression, GracefulCloseWithAnInvokerClaimHeldAbandonsItPromptl
     ASSERT_TRUE(held);
     fill(held.buffer(), "LOST");
 
-    std::mutex              m;
-    std::condition_variable cv;
-    bool                    done = false;
-    std::thread watchdog([&] {
-        std::unique_lock<std::mutex> lk(m);
-        if (!cv.wait_for(lk, std::chrono::seconds(30), [&] { return done; })) {
-            std::fprintf(stderr, "close() hung with an open Invoker claim\n");
-            std::_Exit(1);
-        }
-    });
     const auto t0 = std::chrono::steady_clock::now();
     r.client->close();
     const auto closeMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0);
-    {
-        std::lock_guard<std::mutex> lk(m);
-        done = true;
-    }
-    cv.notify_one();
-    watchdog.join();
-
     EXPECT_LT(closeMs.count(), 5000) << "the drain must not wait out deliveryTimeoutMs (30 s) for a claim "
                                          "its own thread holds";
     EXPECT_FALSE(held.commit()) << "the claim was abandoned under the caller";
@@ -357,4 +337,42 @@ TEST(ClaimClient, DeliveryTimeoutAbandonsAnOpenInvokerClaim) {
     ASSERT_TRUE(r.drive([&] { return valuesOf(r.gw, 0).size() >= 1; }));
     EXPECT_EQ(valuesOf(r.gw, 0), (std::vector<std::string>{"after"}));
     r.client->close();
+}
+
+// Blocking Producer::close() / closeAndWait() on the owner thread with an open
+// Invoker claim: the owner is blocked inside close and cannot commit, so the
+// claim is abandoned at once.  acks=None: the earlier record needs no broker
+// answer, so the single-threaded close can finish without pumping the gateway.
+namespace {
+void blockingCloseAbandonsTheOwnersClaim(int32_t in, bool withBound) {
+    Rig r(cfgFor(rc::RunnerMode::Invoker, in, in + 1));
+    r.connect();
+    rc::ProducerConfig pc;
+    pc.acks     = rc::Acks::None;
+    pc.lingerUs = 0;
+    auto p = r.client->producer(pc);
+    const auto topic = r.client->topic("t");
+    const rc::Key key(uint64_t{8});
+    ASSERT_EQ(p.trySend(topic, key, bytes("early")), SendResult::Ok);
+    rc::Claim held = p.tryClaim(topic, key, 4);
+    ASSERT_TRUE(held);
+    fill(held.buffer(), "LOST");
+    const auto t0 = std::chrono::steady_clock::now();
+    const rc::OpStatus st = withBound ? p.closeAndWait(std::chrono::seconds(20)) : p.close();
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0);
+    EXPECT_EQ(st, rc::OpStatus::Ok);
+    EXPECT_LT(ms.count(), 5000) << "must not wait out deliveryTimeoutMs (30 s)";
+    EXPECT_FALSE(held.commit()) << "abandoned under the caller";
+    ASSERT_TRUE(r.drive([&] { return valuesOf(r.gw, 0).size() >= 1; }));
+    EXPECT_EQ(valuesOf(r.gw, 0), (std::vector<std::string>{"early"})) << "the earlier record flushed normally";
+    r.client->close();
+}
+}  // namespace
+
+TEST(ClaimClientRegression, BlockingProducerCloseAbandonsTheOwnersOpenInvokerClaimRegression) {
+    blockingCloseAbandonsTheOwnersClaim(5824, false);
+}
+
+TEST(ClaimClientRegression, ProducerCloseAndWaitAbandonsTheOwnersOpenInvokerClaimRegression) {
+    blockingCloseAbandonsTheOwnersClaim(5826, true);
 }

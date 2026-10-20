@@ -19,7 +19,6 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
-#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <span>
@@ -71,14 +70,14 @@ void pump(ProducerImpl& impl, const ProducerImpl::SendFn& sink) {
 // A Client in Invoker mode is used only to REGISTER Completions queues: the
 // producer under test is a bare Ring-mode ProducerImpl whose hooks name that
 // Client, so tryClaim(.., Completions&, Token) accepts the queues.
-std::atomic<int> g_ctr{0};
+int g_ctr = 0;  // single test thread
 rc::ClientConfig regCfg() {
     rc::ClientConfig c;
     c.gatewayChannel  = "aeron:ipc";
     c.gatewayStreamId = 4601;
     c.egressChannel   = "aeron:ipc";
     c.egressStreamId  = 4602;
-    c.dataDir = "/tmp/claim_test_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr.fetch_add(1));
+    c.dataDir = "/tmp/claim_test_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr++);
     c.runnerMode = rc::RunnerMode::Invoker;
     return c;
 }
