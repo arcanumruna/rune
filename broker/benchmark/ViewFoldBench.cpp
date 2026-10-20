@@ -105,6 +105,7 @@
 #include <rune/view/AggFold.h>
 #include <rune/view/AggState.h>
 #include <rune/view/ViewFold.h>
+#include <rune/view/ViewRow.h>
 
 #include <algorithm>
 #include <atomic>
@@ -216,6 +217,36 @@ rune::view::ViewPlan userTotalsView() {
                   {"avg", PrimType::Float64, 0, "amount", rune::view::MergeRule::Avg}};
     return v;
 }
+
+// --- Retractable aggregate fixtures (Phase 2b) ---
+// user_totals' Count(*)/Sum plus the four list rules over amount: a LINKED view.
+rune::view::ViewPlan userStatsView() {
+    rune::view::ViewPlan v;
+    v.viewName = "user_stats";
+    v.key      = "userId";
+    v.sources  = {{5, "userId"}};
+    v.output   = {{"userId", PrimType::Int64, 0, "userId", rune::view::MergeRule::Replace},
+                  {"n", PrimType::Int64, 0, "", rune::view::MergeRule::CountAll},
+                  {"total", PrimType::Int64, 0, "amount", rune::view::MergeRule::Sum},
+                  {"max", PrimType::Int64, 0, "amount", rune::view::MergeRule::Max},
+                  {"min", PrimType::Int64, 0, "amount", rune::view::MergeRule::Min},
+                  {"last", PrimType::Int64, 0, "amount", rune::view::MergeRule::Last},
+                  {"lastNn", PrimType::Int64, 0, "amount", rune::view::MergeRule::LastNonNull}};
+    return v;
+}
+
+// One group's Count(*) + Max(amount): isolates the O(group) rescan.
+rune::view::ViewPlan groupMaxView() {
+    rune::view::ViewPlan v;
+    v.viewName = "group_max";
+    v.key      = "userId";
+    v.sources  = {{5, "userId"}};
+    v.output   = {{"userId", PrimType::Int64, 0, "userId", rune::view::MergeRule::Replace},
+                  {"n", PrimType::Int64, 0, "", rune::view::MergeRule::CountAll},
+                  {"max", PrimType::Int64, 0, "amount", rune::view::MergeRule::Max}};
+    return v;
+}
+constexpr int64_t kExtremeGroup = 7;
 
 // [blockLength u16 = 24][version u16][orderId i64][userId i64][amount i64]
 std::vector<uint8_t> encodeOrder(int64_t id, int64_t user, int64_t amount, uint16_t version) {
@@ -437,6 +468,70 @@ void reportCommon(benchmark::State& st, const char* prefix, PhaseResult& r, size
     set("final_size",     static_cast<double>(finalSize));
 }
 
+// --- Shared aggregate rig (BM_ViewFoldAggregate, BM_ViewFoldRetractable) ---
+// 1,000,000 contributors / 10,000 groups, amounts from the churn's `hp`.
+constexpr uint64_t kAggContributors = 1'000'000;
+constexpr uint64_t kAggGroups       = 10'000;
+
+struct AggRig {
+    rune::codec::Descriptor   src  = orderSourceV1();
+    rune::view::CompileResult comp;
+    rune::view::AggLayout     agg;
+    ViewTable                 view, contributors, groups;
+    VersionDescriptorCache    vdc;
+    uint64_t                  rescans = 0;   // summed FoldStats::aggRescans (0 for a 2a-only view)
+
+    AggRig(const rune::view::ViewPlan& plan, int32_t viewTopicId)
+        : comp(compile(plan, src, viewTopicId)),
+          agg(rune::view::buildAggLayout(comp.plan, src).value()),
+          view(comp.rowLayout), contributors(agg.contributorRow), groups(agg.groupRow), vdc(src) {}
+
+    static rune::view::CompileResult compile(const rune::view::ViewPlan& plan,
+                                             const rune::codec::Descriptor& src, int32_t id) {
+        const rune::codec::Descriptor* srcs[] = {&src};
+        return compileView(plan, srcs, id).value();
+    }
+
+    // Contributor id c in [0, 1M); group fixed per c.
+    static void append(rune::protocol::RecordBatchBuilder& bb, const Op& op) {
+        const int64_t c = static_cast<int64_t>(op.key % kAggContributors);
+        const auto kb = keyBytes(c);
+        if (op.tombstone) {
+            bb.append(asSv(kb), std::string_view{}, 0);
+        } else {
+            const auto val = encodeOrder(c, c % kAggGroups, static_cast<int64_t>(op.hp), 1);
+            bb.append(asSv(kb), asSv(val), 0);
+        }
+    }
+    void drainAll() {
+        auto nop = [](uint32_t, const uint8_t*, bool, uint64_t) {};
+        view.drainDirty(nop);
+        contributors.drainDirty(nop);
+        groups.drainDirty(nop);
+    }
+    rune::view::FoldStats foldStream(const BatchStream& s, size_t i) {
+        auto lv = s.view(i);
+        int64_t cur = 0;
+        const auto fs = foldAggregateBatch(comp.plan, comp.rowLayout, agg, vdc, view, contributors,
+                                           groups, lv, s.bound(i), cur);
+        rescans += fs.aggRescans;
+        return fs;
+    }
+    // Creates-only fold over the whole contributor space (NOT timed), then drains;
+    // the tables reach their final population and capacity. Resets `rescans`.
+    void prime() {
+        constexpr int kPrimeBatch[] = {64};
+        std::vector<Op> ops;
+        ops.reserve(kAggContributors);
+        for (uint64_t c = 0; c < kAggContributors; ++c)
+            ops.push_back(Op{c, static_cast<int32_t>(c ^ 0x5a5a), false});
+        const auto ps = buildStream(ops, kPrimeBatch, 1, append);
+        for (size_t i = 0; i < ps.size(); ++i) foldStream(ps, i);
+        drainAll();
+        rescans = 0;
+    }
+};
+
 } // namespace
 
 static void BM_ViewFoldReplace(benchmark::State& st) {
@@ -495,55 +590,18 @@ BENCHMARK(BM_ViewFoldReplace)
 //     The contributors table cannot grow in the probe window (population is
 //     bounded by the 1M key space and its capacity was reached while priming).
 static void BM_ViewFoldAggregate(benchmark::State& st) {
-    constexpr uint64_t kContributors      = 1'000'000;
-    constexpr uint64_t kGroups            = 10'000;
+    constexpr uint64_t kContributors      = kAggContributors;   // the liveness proof below uses it
     constexpr uint64_t kDrainEveryBatches = 1000;
-    constexpr int kPrimeBatch[]           = {64};
 
     for (auto _ : st) {
-        auto src = orderSourceV1();
-        const rune::codec::Descriptor* srcs[] = {&src};
-        auto comp = compileView(userTotalsView(), srcs, 0x51000002).value();
-        auto agg = rune::view::buildAggLayout(comp.plan, src).value();
-
-        ViewTable view(comp.rowLayout);
-        ViewTable contributors(agg.contributorRow), groups(agg.groupRow);
-        VersionDescriptorCache vdc(src);
-
-        // Contributor id c in [0, 1M); group fixed per c.
-        auto append = [](rune::protocol::RecordBatchBuilder& bb, const Op& op) {
-            const int64_t c = static_cast<int64_t>(op.key % kContributors);
-            const auto kb = keyBytes(c);
-            if (op.tombstone) {
-                bb.append(asSv(kb), std::string_view{}, 0);
-            } else {
-                const auto val = encodeOrder(c, c % kGroups, static_cast<int64_t>(op.hp), 1);
-                bb.append(asSv(kb), asSv(val), 0);
-            }
-        };
-        auto drainAll = [&] {
-            auto nop = [](uint32_t, const uint8_t*, bool, uint64_t) {};
-            view.drainDirty(nop);
-            contributors.drainDirty(nop);
-            groups.drainDirty(nop);
-        };
-        auto foldStream = [&](const BatchStream& s, size_t i) {
-            auto lv = s.view(i);
-            int64_t cur = 0;
-            return foldAggregateBatch(comp.plan, comp.rowLayout, agg, vdc, view, contributors,
-                                      groups, lv, s.bound(i), cur);
-        };
-
-        // --- Prime: creates-only over the whole contributor space (NOT timed).
-        {
-            std::vector<Op> prime;
-            prime.reserve(kContributors);
-            for (uint64_t c = 0; c < kContributors; ++c)
-                prime.push_back(Op{c, static_cast<int32_t>(c ^ 0x5a5a), false});
-            const auto ps = buildStream(prime, kPrimeBatch, 1, append);
-            for (size_t i = 0; i < ps.size(); ++i) foldStream(ps, i);
-            drainAll();
-        }
+        AggRig rig(userTotalsView(), 0x51000002);
+        auto& view = rig.view;
+        auto& contributors = rig.contributors;
+        auto& groups = rig.groups;
+        auto drainAll = [&] { rig.drainAll(); };
+        auto foldStream = [&](const BatchStream& s, size_t i) { return rig.foldStream(s, i); };
+        auto append = &AggRig::append;
+        rig.prime();
 
         const auto ops = generateChurnOps(kTotalOps);
         const auto stream = buildStream(ops, kBatchSizes, std::size(kBatchSizes), append);
@@ -594,6 +652,51 @@ static void BM_ViewFoldAggregate(benchmark::State& st) {
     }
 }
 BENCHMARK(BM_ViewFoldAggregate)
+    ->Unit(benchmark::kMicrosecond)
+    ->Iterations(1)
+    ->UseRealTime();
+
+// Retractable aggregate gate (Phase 2b, §14.0): user_stats = Count(*), Sum,
+// Max, Min, Last, LastNonNull over amount, grouped by userId — the SAME rig,
+// workload, priming, drain cadence and three phases as BM_ViewFoldAggregate
+// (shared AggRig: 1,000,000 contributors / 10,000 groups, ~100 per group). The
+// churn's pseudo-random amounts retract a group's cached Min or Max on roughly
+// 2% of retracting ops, so this IS the typical case including its occasional
+// O(group) rescans (ret_rescans counts them). BM_ViewFoldExtremeRetract
+// isolates that path. GATE: ret_record_p99_us < 5, ret_batch_p99_us < 10,
+// steady_alloc == 0.
+static void BM_ViewFoldRetractable(benchmark::State& st) {
+    constexpr uint64_t kDrainEveryBatches = 1000;
+
+    for (auto _ : st) {
+        AggRig rig(userStatsView(), 0x51000003);
+        rig.prime();   // also zeroes rescans: count the churn's only
+
+        const auto ops = generateChurnOps(kTotalOps);
+        const auto stream = buildStream(ops, kBatchSizes, std::size(kBatchSizes), AggRig::append);
+        auto r = runPhases(
+            stream, [&](size_t i) { return rig.foldStream(stream, i); }, [&] { rig.drainAll(); },
+            kDrainEveryBatches);
+
+        benchmark::DoNotOptimize(rig.view.size());
+        benchmark::DoNotOptimize(rig.groups.size());
+        benchmark::DoNotOptimize(rig.contributors.size());
+        reportCommon(st, "ret_", r, rig.view.size());
+        st.counters["ret_rescans"]            = static_cast<double>(rig.rescans);
+        st.counters["ret_contributors_final"] = static_cast<double>(rig.contributors.size());
+
+        const double recP99 = st.counters["ret_record_p99_us"];
+        const double batP99 = st.counters["ret_batch_p99_us"];
+        const bool pass = recP99 < 5.0 && batP99 < 10.0 && r.steadyAlloc == 0;
+        st.counters["ret_gate_pass"] = pass ? 1.0 : 0.0;
+        std::fprintf(stderr,
+                     "[ViewFoldRetractable gate] ret_record_p99_us=%.3f (<5) ret_batch_p99_us=%.3f (<10) "
+                     "steady_alloc=%lld (==0) rescans=%llu => %s\n",
+                     recP99, batP99, static_cast<long long>(r.steadyAlloc),
+                     static_cast<unsigned long long>(rig.rescans), pass ? "PASS" : "FAIL");
+    }
+}
+BENCHMARK(BM_ViewFoldRetractable)
     ->Unit(benchmark::kMicrosecond)
     ->Iterations(1)
     ->UseRealTime();
