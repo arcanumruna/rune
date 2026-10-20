@@ -250,7 +250,8 @@ file(MAKE_DIRECTORY "${RUNE_CLAIM_GEN_DIR}/gen")
 set(RUNE_CLAIM_GEN_HEADERS
     "${RUNE_CLAIM_GEN_DIR}/gen/position.gen.h"
     "${RUNE_CLAIM_GEN_DIR}/gen/tick_sample.gen.h"
-    "${RUNE_CLAIM_GEN_DIR}/gen/long_key.gen.h")
+    "${RUNE_CLAIM_GEN_DIR}/gen/long_key.gen.h"
+    "${RUNE_CLAIM_GEN_DIR}/gen/short_key.gen.h")
 add_custom_command(
     OUTPUT  ${RUNE_CLAIM_GEN_HEADERS}
     COMMAND $<TARGET_FILE:rune_gen_claim_schemas> "${RUNE_CLAIM_GEN_DIR}/gen"

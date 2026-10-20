@@ -5,6 +5,7 @@
 //                seq UInt32, tick UInt64, alive Bool, kind Enum{0,1,2},
 //                tag string(8)            -> blockLength 63, kEncodedLength 67
 //   tick_sample  seq UInt64, value Float64 (no key field)
+//   short_key    code string(8) KEY, v Int64 (a key send() can route)
 //   long_key     code string(20) KEY, v Int64 (a key send() cannot route)
 #include <rune/codec/Descriptor.h>
 #include <rune/codec/Generator.h>
@@ -53,9 +54,14 @@ int main(int argc, char** argv) {
                              .addFixedStr("code", 20, 1, true)
                              .add("v", PrimType::Int64)
                              .build();
+    const auto shortKey = DescriptorBuilder("short_key")
+                              .addFixedStr("code", 8, 1, true)
+                              .add("v", PrimType::Int64)
+                              .build();
     const std::string dir = argv[1];
     return write(dir + "/position.gen.h", position) && write(dir + "/tick_sample.gen.h", tick) &&
-                   write(dir + "/long_key.gen.h", longKey)
+                   write(dir + "/long_key.gen.h", longKey) &&
+                   write(dir + "/short_key.gen.h", shortKey)
                ? 0
                : 1;
 }

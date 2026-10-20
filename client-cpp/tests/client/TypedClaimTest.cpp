@@ -7,6 +7,7 @@
 #include "gen/position.gen.h"
 #include "gen/tick_sample.gen.h"
 #include "gen/long_key.gen.h"
+#include "gen/short_key.gen.h"
 
 #include <rune/client/Key.h>
 #include <rune/client/TypedTopic.h>
@@ -36,6 +37,7 @@ using rune::gen::Position;
 using rune::gen::PositionDecoder;
 using rune::gen::PositionEncoder;
 using rune::gen::LongKey;
+using rune::gen::ShortKey;
 using rune::gen::TickSample;
 using test_support::FrameCapture;
 
@@ -225,3 +227,56 @@ TEST(TypedClaimRegression, OverlongStringKeyThrowsAndClaimsNothingRegression) {
     EXPECT_EQ(std::string_view(back.code.data(), 16), k16);
     EXPECT_EQ(back.v, 5);
 }
+
+// string(N <= 16) key: claim(std::string_view) must equal send(rec) byte for byte.
+TEST(TypedClaim, StringKeyClaimMatchesSendForShortKeys) {
+    auto* impl = new ProducerImpl(voidCfg(), 1 << 20);
+    TypedTopic<ShortKey> topic{Producer{impl}, TopicHandle{1, 8}, uint16_t{1}};
+    const std::string_view keys[] = {"",       "a",        "abcdefgh", "abc",
+                                     "ab",     std::string_view("ab\0\0", 4), "zzzzzzz", "k1"};
+    for (const auto k : keys) {
+        ShortKey rec;
+        rec.code.fill('\0');
+        std::memcpy(rec.code.data(), k.data(), k.size());
+        rec.v = 77;
+        topic.send(rec);
+        auto w = topic.claim(k);
+        ASSERT_TRUE(w);
+        w.v(77);
+        ASSERT_TRUE(w.commit());
+    }
+    FrameCapture cap;
+    pump(*impl, cap.fn());
+    ASSERT_EQ(cap.recs.size(), 16u);
+    // Per partition, send/claim pairs stay in order, but partitions interleave: match by key.
+    std::map<std::string, std::vector<test_support::CapturedRecord>> byKey;
+    for (const auto& r : cap.recs) byKey[r.value.substr(4, 8)].push_back(r);
+    EXPECT_EQ(byKey.size(), 7u) << "\"ab\" and \"ab\\0\\0\" are the same padded key";
+    for (const auto& [field, rs] : byKey) {
+        ASSERT_EQ(rs.size() % 2, 0u);
+        for (std::size_t i = 0; i + 1 < rs.size(); i += 2) {
+            EXPECT_EQ(rs[i].partition, rs[i + 1].partition) << field;
+            EXPECT_EQ(rs[i].key, rs[i + 1].key) << field;
+            EXPECT_EQ(rs[i].key.size(), 8u) << "record key = the 8 zero-padded field bytes";
+            EXPECT_EQ(rs[i].value, rs[i + 1].value) << "full value bytes";
+        }
+    }
+}
+
+TEST(TypedClaimRegression, StringKeyLongerThanFieldThrowsAndClaimsNothingRegression) {
+    auto* impl = new ProducerImpl(voidCfg(), 1 << 20);
+    TypedTopic<ShortKey> topic{Producer{impl}, TopicHandle{1, 8}, uint16_t{1}};
+    EXPECT_THROW((void)topic.claim(std::string(9, 'x')), std::invalid_argument);
+    EXPECT_THROW((void)topic.claim(std::string(17, 'x')), std::invalid_argument);
+    FrameCapture cap;
+    pump(*impl, cap.fn());
+    EXPECT_TRUE(cap.recs.empty());
+}
+
+// The routed key cannot be rewritten through a claim (silent-misroute class).
+template <class W>
+concept CanSetKey = requires(W& w) { w.key(int64_t{1}); } || requires(W& w) { w.userId(int64_t{1}); } ||
+                    requires(const W& w) { w.key(); };
+using PositionClaim = decltype(std::declval<TypedTopic<Position>&>().claim(int64_t{}));
+static_assert(!CanSetKey<PositionClaim>, "the key field must not be reachable through a TypedClaim");
+static_assert(requires(PositionClaim& w) { w.zone(1); }, "non-key setters stay available");

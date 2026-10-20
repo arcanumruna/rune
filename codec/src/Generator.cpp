@@ -165,6 +165,36 @@ static void emitEncoder(std::ostringstream& o, const Descriptor& d, const std::s
     o << "};\n\n";
 }
 
+// The writer TypedTopic::claim hands out: the Encoder with the KEY FIELD hidden
+// (private base; the key is written once, by the constructor, and is exactly
+// what the record was routed with — it cannot be rewritten afterwards).
+static void emitClaimEncoder(std::ostringstream& o, const Descriptor& d, const std::string& structName) {
+    const std::string cls  = structName + "ClaimEncoder";
+    const std::string base = structName + "Encoder";
+    const FieldDescriptor* k = singleKeyField(d);
+    o << "// " << cls << " — " << base << " without the key field's accessors: the key is fixed\n"
+      << "// at construction (the routing key of the claim).\n";
+    o << "class " << cls << " : private " << base << " {\n";
+    o << "public:\n";
+    o << "    using " << base << "::kBlockLength;\n";
+    o << "    using " << base << "::kEncodedLength;\n";
+    o << "    using " << base << "::kVersion;\n";
+    o << "    using " << base << "::kHasKey;\n";
+    if (k != nullptr) {
+        o << "    using " << base << "::KeyType;\n\n";
+        o << "    " << cls << "(std::span<uint8_t> buf, const KeyType& keyValue) : " << base << "(buf) {\n"
+          << "        " << base << "::key(keyValue);\n"
+          << "    }\n";
+    } else {
+        o << "\n    explicit " << cls << "(std::span<uint8_t> buf) : " << base << "(buf) {}\n";
+    }
+    for (const auto& f : d.fields) {
+        if (k != nullptr && f.name == k->name) continue;
+        o << "    using " << base << "::" << f.name << ";\n";
+    }
+    o << "};\n\n";
+}
+
 static void emitDecoder(std::ostringstream& o, const Descriptor& d, const std::string& structName) {
     const std::string cls = structName + "Decoder";
     const FieldDescriptor* k = singleKeyField(d);
@@ -275,6 +305,7 @@ std::string generateHeader(const Descriptor& d, std::string_view nspace) {
     const bool fly = wantsFlyweights(d);
     if (fly) {
         o << "class " << structName << "Encoder;\n";
+        o << "class " << structName << "ClaimEncoder;\n";
         o << "class " << structName << "Decoder;\n\n";
     }
 
@@ -289,6 +320,8 @@ std::string generateHeader(const Descriptor& d, std::string_view nspace) {
     if (fly) {
         o << "    using Encoder = " << structName << "Encoder;  // zero-copy writer (all-fixed schema)\n";
         o << "    using Decoder = " << structName << "Decoder;  // zero-copy reader\n";
+        o << "    using ClaimEncoder = " << structName
+          << "ClaimEncoder;  // Encoder minus the key field (TypedTopic::claim)\n";
     }
     o << "\n";
 
@@ -563,6 +596,7 @@ std::string generateHeader(const Descriptor& d, std::string_view nspace) {
     if (fly) {
         o << "\n";
         emitEncoder(o, d, structName);
+        emitClaimEncoder(o, d, structName);
         emitDecoder(o, d, structName);
     }
 
