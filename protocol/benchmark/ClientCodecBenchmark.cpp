@@ -672,7 +672,7 @@ static void BM_Subscribe_Decode(benchmark::State& state) {
     const auto& buf = subscribeBuf();
 
     for (auto _ : state) {
-        auto result = rpc::Subscribe::decode(buf.data(), buf.size());
+        auto result = rpc::Subscribe::decode(buf.data(), buf.size(), rpc::kClientVersion);
         benchmark::DoNotOptimize(result);
     }
 
