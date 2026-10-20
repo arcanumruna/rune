@@ -12,6 +12,7 @@
 #include <optional>
 #include <span>
 #include <type_traits>
+#include <tuple>
 #include <utility>
 
 namespace rune {
@@ -167,6 +168,7 @@ public:
         S st = m.state();
         if (st == S::Unset) return;
         const uint8_t idx = terms_;
+        if (!widthMatches_<T>(type, width)) { fail_({FilterErrorKind::TypeMismatch, idx, tag}); return; }
         if (terms_ == kMaxFilterTerms) { fail_({FilterErrorKind::TooManyTerms, 0xFF, tag}); return; }
         if (terms_ > 0 && tag <= lastTag_) { fail_({FilterErrorKind::NotCanonical, idx, tag}); return; }
         FilterOp op = FilterOp::Eq;
@@ -204,6 +206,12 @@ public:
     }
 
 private:
+    // The caller's width must describe T exactly: no truncation of integers, no read past a char array.
+    template <class T> static constexpr bool widthMatches_(PrimType type, uint8_t width) noexcept {
+        if (width == 0 || filterValueWidth(type, width) != width) return false;
+        if constexpr (rune::IsCharArray<T>::value) return type == PrimType::FixedStr && width <= std::tuple_size_v<T>;
+        else return type != PrimType::FixedStr && width == sizeof(T);
+    }
     template <class T> constexpr void storeValue_(const T& v, uint8_t width) noexcept {
         if constexpr (rune::IsCharArray<T>::value) {
             for (std::size_t i = 0; i < width; ++i) out_[pos_ + i] = static_cast<uint8_t>(v[i]);

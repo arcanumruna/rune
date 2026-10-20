@@ -154,3 +154,74 @@ TEST(MatchRegression, AnErrorStateIsTerminalRegression) {
     ok = anyOf(1u, 2u);
     EXPECT_EQ(ok.state(), Match<uint32_t>::State::In);
 }
+
+TEST(FilterWireRegression, MultiTermGoldenBytesRegression) {
+    FilterBytes b;
+    FilterWriter wr(std::span<uint8_t>(b.bytes.data(), b.bytes.size()));
+    wr.term(0x0102, PrimType::Int32, 4, Match<int32_t>(anyOf(-1, 1, 1)));
+    wr.term(0x0203, PrimType::FixedStr, 4, Match<std::array<char, 4>>(anyOf<const char*>("ba", "ab", "ba")));
+    wr.term(0x0304, PrimType::Bool, 1, Match<bool>(true));
+    auto r = wr.finish();
+    ASSERT_TRUE(r.has_value());
+    const std::array<uint8_t, 2 + 13 + 13 + 6> want{
+        0x01, 0x03,
+        0x02, 0x01, 0x00, 0x02, 0x02, 0x01, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
+        0x03, 0x02, 0x0a, 0x02, 0x02, 0x62, 0x61, 0x00, 0x00, 0x61, 0x62, 0x00, 0x00,
+        0x04, 0x03, 0x06, 0x01, 0x01, 0x01};
+    ASSERT_EQ(*r, want.size());
+    EXPECT_TRUE(std::equal(want.begin(), want.end(), b.bytes.begin()));
+}
+
+TEST(FilterWireRegression, WideAndNarrowGoldenBytesRegression) {
+    FilterBytes b;
+    FilterWriter wr(std::span<uint8_t>(b.bytes.data(), b.bytes.size()));
+    wr.term(1, PrimType::Int64, 8, Match<int64_t>(int64_t{-2}));
+    wr.term(2, PrimType::UInt16, 2, Match<uint16_t>(uint16_t{0xABCD}));
+    auto r = wr.finish();
+    ASSERT_TRUE(r.has_value());
+    const std::array<uint8_t, 2 + 13 + 7> want{
+        0x01, 0x02,
+        0x01, 0x00, 0x01, 0x01, 0x01, 0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0x02, 0x00, 0x02, 0x01, 0x01, 0xcd, 0xab};
+    ASSERT_EQ(*r, want.size());
+    EXPECT_TRUE(std::equal(want.begin(), want.end(), b.bytes.begin()));
+}
+
+TEST(FilterWireRegression, EmptyAnyOfSpanFailsWithValueCountRegression) {
+    FilterBytes b;
+    FilterWriter wr(std::span<uint8_t>(b.bytes.data(), b.bytes.size()));
+    wr.term(1, PrimType::Int32, 4, Match<int32_t>(1));
+    wr.term(2, PrimType::Int32, 4, Match<int32_t>(anyOf(std::span<const int32_t>{})));
+    auto r = wr.finish();
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, FilterErrorKind::ValueCount);
+    EXPECT_EQ(r.error().termIndex, 1);
+}
+
+TEST(FilterWireRegression, ShortBufferFailsWithBufferTooSmallRegression) {
+    std::array<uint8_t, 8> small{};
+    FilterWriter wr{std::span<uint8_t>(small)};
+    wr.term(1, PrimType::Int32, 4, Match<int32_t>(1));   // needs 11
+    auto r = wr.finish();
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, FilterErrorKind::BufferTooSmall);
+    EXPECT_EQ(r.error().termIndex, 0);
+}
+
+TEST(FilterWireRegression, WidthMustMatchTheValueTypeRegression) {
+    auto run = [](auto m, PrimType t, uint8_t w) {
+        std::array<uint8_t, 64> buf{};
+        buf.fill(0xEE);
+        FilterWriter wr{std::span<uint8_t>(buf)};
+        wr.term(9, t, w, m);
+        auto r = wr.finish();
+        EXPECT_FALSE(r.has_value());
+        if (!r) { EXPECT_EQ(r.error().kind, FilterErrorKind::TypeMismatch); EXPECT_EQ(r.error().termIndex, 0); }
+        for (uint8_t x : buf) EXPECT_EQ(x, 0xEE) << "no bytes written";
+    };
+    run(Match<int64_t>(int64_t{1}), PrimType::Int64, 4);                           // would truncate
+    run(Match<int32_t>(1), PrimType::Int32, 8);                                    // wrong width for type
+    run(Match<std::array<char, 4>>("ab"), PrimType::FixedStr, 8);                  // reads past the array
+    run(Match<std::array<char, 20>>("ab"), PrimType::FixedStr, 20);                // wider than 16
+    run(Match<std::array<char, 4>>("ab"), PrimType::FixedStr, 0);
+}

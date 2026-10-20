@@ -51,6 +51,10 @@ enum class FilterOp : uint8_t { Eq = 1, In = 2 };   // wire values, append-only
 }
 
 /// A filter value as a 128-bit little-endian key (zero-extended); compares hi first, then lo.
+/// WIRE CONTRACT: this order defines the canonical sort of In values.  Signed values compare as their
+/// unsigned bit patterns (1 sorts before -1) and FixedStr compares with its LAST byte most significant
+/// ("ba" sorts before "ab").  The writer and the parser MUST both use FilterKey; never "fix" the order
+/// (signed / lexicographic) on one side only, or equal filters stop being byte-equal.
 struct FilterKey {
     uint64_t hi = 0;
     uint64_t lo = 0;
