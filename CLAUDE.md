@@ -168,8 +168,10 @@ the repo, issues or commits.
   - version skew;
   - missing or wrong credentials.
 
-  The tests are kept as `Regression` tests. A break in one of the PR's own issues is fixed in the PR. Any other break
-  becomes a labeled GitHub issue with the failing test as its repro.
+  Passing tests are kept as `Regression` tests. A break in one of the PR's own issues is fixed in the PR. A break that
+  is urgent (a hang, silent loss or a security hole) is fixed at once in its own task. Any other break becomes a labeled
+  GitHub issue whose body carries the failing test as its repro; that test stays out of the suite until the issue is
+  fixed, so the suite stays green.
 - Commit messages end with the session's `Co-Authored-By:` trailer.
 - **No secrets in the repo:** no emails, passwords, tokens, keys, IPs or local paths. Everything sensitive comes from
   the environment.
