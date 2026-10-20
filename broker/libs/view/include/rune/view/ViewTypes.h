@@ -4,8 +4,9 @@
 #include <rune/codec/PrimType.h>
 namespace rune::view {
 // Wire values are APPEND-ONLY (serialized as u8 in plan blobs): CountAll (= SQL
-// Count(*), counts contributors including nulls) was appended at 7 in Phase 2a.
-enum class MergeRule : uint8_t { Replace, Count, Sum, Avg, Min, Max, Last, CountAll };
+// Count(*), counts contributors including nulls) was appended at 7 in Phase 2a;
+// LastNonNull (most recent non-null contributor value) at 8 in Phase 2b.
+enum class MergeRule : uint8_t { Replace, Count, Sum, Avg, Min, Max, Last, CountAll, LastNonNull };
 
 // CompiledField::srcFieldId for a rule that reads no source field (CountAll).
 inline constexpr uint16_t kNoSourceField = 0xFFFF;

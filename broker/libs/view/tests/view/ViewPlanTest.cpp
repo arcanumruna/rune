@@ -237,10 +237,23 @@ TEST(ViewPlanRegression, CountAllRuleRoundTripsAuthoredAndCompiled) {
     EXPECT_EQ(cback->output[1].srcFieldId, rune::view::kNoSourceField);
 }
 
+// Phase 2b: LastNonNull is appended at 8; rules 0-7 keep their meaning.
+TEST(ViewPlanRegression, LastNonNullRuleRoundTripsAtWireValue8) {
+    rune::view::ViewPlan a;
+    a.viewName = "user_stats"; a.key = "userId"; a.sources = {{5, "userId"}};
+    a.output = {{"userId", rune::codec::PrimType::Int64, 0, "userId", rune::view::MergeRule::Replace},
+                {"lnn", rune::codec::PrimType::Int32, 0, "bonus", rune::view::MergeRule::LastNonNull}};
+    auto back = rune::view::deserializeAuthored(rune::view::serializeAuthored(a));
+    ASSERT_TRUE(back.has_value());
+    EXPECT_EQ(back->output[1].rule, rune::view::MergeRule::LastNonNull);
+    EXPECT_EQ(static_cast<uint8_t>(rune::view::MergeRule::LastNonNull), 8u);
+    EXPECT_EQ(static_cast<uint8_t>(rune::view::MergeRule::CountAll), 7u);
+}
+
 TEST(ViewPlanRegression, UnknownRuleValueIsRejected) {
     rune::view::ViewPlan a;
     a.viewName = "v"; a.key = "k"; a.sources = {{5, "k"}};
-    a.output = {{"k", rune::codec::PrimType::Int64, 0, "k", static_cast<rune::view::MergeRule>(8)}};
+    a.output = {{"k", rune::codec::PrimType::Int64, 0, "k", static_cast<rune::view::MergeRule>(9)}};
     EXPECT_FALSE(rune::view::deserializeAuthored(rune::view::serializeAuthored(a)).has_value())
-        << "rule byte 8 (one past CountAll) must be rejected, never cast";
+        << "rule byte 9 (one past LastNonNull) must be rejected, never cast";
 }

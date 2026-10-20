@@ -54,7 +54,8 @@ bool isAggregateRule(MergeRule r) {
 }
 
 bool isPhase2bRule(MergeRule r) {
-    return r == MergeRule::Min || r == MergeRule::Max || r == MergeRule::Last;
+    return r == MergeRule::Min || r == MergeRule::Max || r == MergeRule::Last ||
+           r == MergeRule::LastNonNull;
 }
 
 const char* primName(rune::codec::PrimType t) {
