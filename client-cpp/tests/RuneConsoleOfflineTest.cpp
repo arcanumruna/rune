@@ -256,21 +256,24 @@ TEST(ConsolePollingSourceRegression, SplitsLinesStripsCrAndKeepsAnUnterminatedLa
     ::close(fds[0]);
 }
 
+namespace {
+struct IdleWriter { int count = 0; int fd = -1; };   // the 4th idle pump writes the line: no sleeping writer thread
+void idleThenWrite(void* ctx) noexcept {
+    auto* w = static_cast<IdleWriter*>(ctx);
+    if (++w->count == 4) { [[maybe_unused]] const ssize_t n = ::write(w->fd, "go\n", 3); }
+}
+}
+
 TEST(ConsolePollingSourceRegression, PumpsTheClientWhileTheTerminalIsIdle) {
     int fds[2];
     ASSERT_EQ(::pipe(fds), 0);
-    int idle = 0;
-    rune::cli::console::PollingFdLineSource src(fds[0], &countIdle, &idle);
-    std::thread writer([&] {
-        std::this_thread::sleep_for(std::chrono::milliseconds(400));
-        ASSERT_EQ(::write(fds[1], "go\n", 3), 3);
-    });
+    IdleWriter w{0, fds[1]};
+    rune::cli::console::PollingFdLineSource src(fds[0], &idleThenWrite, &w);
     std::string line;
     ASSERT_TRUE(src.next(line));
-    writer.join();
     EXPECT_EQ(line, "go");
-    EXPECT_GE(idle, 4) << "a 50 ms poll between pumps over ~400 ms of silence";
-    EXPECT_EQ(static_cast<uint64_t>(idle), src.idlePumps);
+    EXPECT_EQ(w.count, 4) << "the source pumps on every idle poll until input arrives, then returns the line";
+    EXPECT_EQ(static_cast<uint64_t>(w.count), src.idlePumps);
     ::close(fds[0]); ::close(fds[1]);
 }
 
