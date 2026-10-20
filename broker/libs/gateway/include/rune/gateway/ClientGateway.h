@@ -2251,6 +2251,8 @@ private:
     /// true = DENIED here: answered NotAuthorized (45) in the request's own response type (D23 text where the type
     /// carries one) - the caller returns without forwarding anything.
     [[nodiscard]] bool deny_(Session& session, const std::optional<rune::gateway::Denial>& denial, const uint8_t* buf, std::size_t len);
+    /// Issue #122: the verdict for a producer id issued to another principal (cold: built only on a refusal).
+    [[gnu::cold]] static rune::gateway::Denial refusedProducerIdDenial_(int64_t producerId);
     /// Issue #114: a user's own ADD / DROP / SET PASSWORD without ADMIN - nullopt when it carries a valid proof of a
     /// current password over credentialChangeMessage(the session's login nonce, m); throttled like a login.
     [[nodiscard]] std::optional<rune::gateway::Denial> verifyOwnCredentialChange_(Session& session,

@@ -658,13 +658,15 @@ public:
     }
     /// Swap `words` into the session's slot (the old buffer comes back in `words`): no allocation.  False = unknown
     /// session (closed meanwhile): nothing installed.
-    bool installWriteGrants(int64_t sessionId, std::vector<uint64_t>& words, bool grantAll, uint64_t epoch) noexcept {
+    bool installWriteGrants(int64_t sessionId, std::vector<uint64_t>& words, bool grantAll, uint64_t epoch,
+                            uint64_t owner = 0) noexcept {
         const std::size_t idx = find_(sessionId);
         if (idx == kNone) return false;
         WriteGrantSlot& g = grants_[idx];
         g.bits.swap(words);
         g.grantAll = grantAll;
         g.epoch    = epoch;
+        g.owner    = owner;
         return true;
     }
     /// Test seam: slots examined by the last find_ of `sessionId` (probe chain length).
@@ -700,7 +702,7 @@ private:
         }
         return kNone;
     }
-    static void resetGrants_(WriteGrantSlot& g) noexcept { g.bits.clear(); g.grantAll = false; g.epoch = 0; }   // capacity persists
+    static void resetGrants_(WriteGrantSlot& g) noexcept { g.bits.clear(); g.grantAll = false; g.epoch = 0; g.owner = 0; }   // capacity persists
     std::size_t insert_(int64_t sid) noexcept {
         if (count_ == kMaxSessions - 1) return kNone;               // one empty slot ends every probe
         std::size_t i = hash_(sid);

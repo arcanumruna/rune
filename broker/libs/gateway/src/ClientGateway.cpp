@@ -8,6 +8,7 @@
 #include <rune/gateway/BootstrapProof.h>
 #include <rune/gateway/SecurityRequestFingerprint.h>
 #include <rune/crypto/Kdf.h>
+#include <rune/protocol/ProducerIdBinding.h>
 #include <rune/crypto/Scram.h>
 #include <cassert>
 #include <flight_recorder/FlightRecorder.h>
@@ -3426,6 +3427,14 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
             if (deny_(*session, rune::gateway::authorizeTopicId(perms, msg.topicId, rune::security::Operation::Write,
                                                                  objectIndex_), buf, len))
                 return true;
+    }
+    // Issue #122: a producer id is honoured only for the principal it was issued to (the owner tag in the id, see
+    // rune/protocol/ProducerIdBinding.h) - one mask and one compare, no lookup.  Another principal's id is refused
+    // whatever its state (nothing to probe), before any producer state is touched.
+    if (msg.producerId >= 0 && authMode_ == rune::gateway::GatewayAuthMode::Required) {
+        const auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&session->auth);
+        if (!rune::protocol::producerIdUsableBy(msg.producerId, a != nullptr ? a->userId : 0)) [[unlikely]]
+            if (deny_(*session, refusedProducerIdDenial_(msg.producerId), buf, len)) return true;
     }
     if (refuseViewSink_(buf, len, msg.topicId, "Produce to a view sink")) [[unlikely]] return true;   // VLS B.3
     // G0.1: capture session id so the public sendRespReliable() test-seam knows
@@ -7789,6 +7798,12 @@ void ClientGateway::onCatalogObjectDropped(int32_t id)
     });
 }
 
+rune::gateway::Denial ClientGateway::refusedProducerIdDenial_(int64_t producerId)
+{
+    return rune::gateway::Denial{static_cast<uint16_t>(pc::ErrorCode::NotAuthorized),
+                                 "not authorized: WRITE on PRODUCER_ID " + std::to_string(producerId)};
+}
+
 void ClientGateway::noteDenied_(const Session& session, pc::TemplateId tid, const rune::gateway::Denial& denial)
 {
     ++notAuthorizedAnswers_;
@@ -8103,7 +8118,8 @@ uint64_t ClientGateway::shipPermissions_(const Session& session)
     const auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&session.auth);
     if (a == nullptr) return 0;   // must-change-password / anonymous: the worker slot stays empty (deny)
     const uint64_t epoch = ++permEpoch_;
-    (void)permissionShipper_.ship(*workerPool_, session.sessionId, a->perms.writeBits(), a->perms.isAllowAll(), epoch);
+    (void)permissionShipper_.ship(*workerPool_, session.sessionId, a->perms.writeBits(), a->perms.isAllowAll(), epoch,
+                                  a->userId);   // #122: producer ids are checked against the principal
     return epoch;
 }
 

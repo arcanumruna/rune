@@ -286,7 +286,7 @@ TEST(WorkerWriteGrantRegression, PermissionStagerReusesItsBuffersAfterTheFirstUp
     // No allocation once both buffers reached their peak size: the staging buffer and the slot buffer swap.
     struct FakeSink {
         std::vector<uint64_t> bits;
-        bool installWriteGrants(int64_t, std::vector<uint64_t>& w, bool, uint64_t) noexcept { bits.swap(w); return true; }
+        bool installWriteGrants(int64_t, std::vector<uint64_t>& w, bool, uint64_t, uint64_t = 0) noexcept { bits.swap(w); return true; }
     } sink;
     PermissionStager st;
     std::vector<uint64_t> chunkWords(512, 7);

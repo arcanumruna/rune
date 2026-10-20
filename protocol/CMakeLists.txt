@@ -29,6 +29,7 @@ if(BUILD_TESTING)
             tests/protocol/CreateTopicRecordTest.cpp
             tests/protocol/NodeJoinRecordTest.cpp
             tests/protocol/ControlTickRecordTest.cpp
+            tests/protocol/ProducerIdBindingTest.cpp
             tests/protocol/client/MessageHeaderTest.cpp
             tests/protocol/client/CryptoEnvelopeTest.cpp
             tests/protocol/client/ControlMessagesConnectTest.cpp

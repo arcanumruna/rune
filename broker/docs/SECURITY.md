@@ -42,7 +42,8 @@ Rules that keep the model small (D15 to D17):
 | `AddOffsetsToTxn` / `TxnOffsetCommit` (D18) | `WRITE` on the transactional id and `READ` on the group |
 | Subscribe (any form) | `READ` on the topic |
 | JoinGroup / SyncGroup / Heartbeat / OffsetFetch / OffsetCommit | `READ` on the group, and `READ` on each topic |
-| LeaveGroup, non-transactional InitProducerId (D18) | nothing (their produces are checked) |
+| LeaveGroup | `READ` on the group |
+| Non-transactional InitProducerId (D18) | nothing (its produces are checked) |
 | GetViewRow / openView | `READ` on the view |
 | Metadata, topic and view listings, `GetTopicSchema` | `DESCRIBE` |
 | `CreateTopic` / `CreateView` / `CreateSchema` | `CREATE` on the name (exact or prefix grant), or on `CLUSTER` |
@@ -53,6 +54,16 @@ Rules that keep the model small (D15 to D17):
 | Catalog history, as-of, diff, export, replay (`__catalog` reads) (D21) | `DESCRIBE` on `CLUSTER` |
 | User, role and grant DDL; every `SHOW USERS|ROLES|GRANTS|SECURITY HISTORY` (D20) | `ADMIN` on `CLUSTER` |
 | `ALTER USER <self> SET|ADD|DROP PASSWORD` (D20) | no grant, but a fresh proof of a current password (the client sends it; a session alone is not enough) |
+
+**Ownership.** A consumer-group member id and a producer id belong to whoever obtained them.
+- A member id is bound to the session and user that joined. SyncGroup, Heartbeat, LeaveGroup and
+  OffsetCommit naming it are honoured only on that session, and are otherwise answered `UnknownMember`,
+  the same answer as for a member that does not exist. A JoinGroup naming it re-joins only for the same
+  user (a reconnect); anyone else joins as a new member with a fresh id. Member ids are random.
+- A producer id carries the user it was issued to. A Produce, AddPartitionsToTxn, AddOffsetsToTxn,
+  TxnOffsetCommit or EndTxn naming another user's producer id is refused (`NotAuthorized` for a Produce, the
+  wrong-producer answer otherwise). Two users sharing `WRITE` on a transactional id each get their own
+  producer id at InitProducerId; the previous holder is fenced.
 
 **Visibility.** Objects the user cannot `DESCRIBE` do not appear in metadata or listings. Direct
 access to such an object answers `NotAuthorized`, whether or not the object exists, so the answer

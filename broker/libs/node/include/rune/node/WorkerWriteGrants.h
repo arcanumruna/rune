@@ -20,6 +20,7 @@ struct WriteGrantSlot {
     std::vector<uint64_t> bits;      ///< bit (id & 63) of word (id >> 6); capacity persists
     bool                  grantAll = false;
     uint64_t              epoch    = 0;   ///< the shipped epoch these bits belong to
+    uint64_t              owner    = 0;   ///< issue #122: the session's principal (producer ids must carry its tag)
 };
 
 /// The hot-path check.
@@ -44,12 +45,13 @@ using PermissionUpdate = std::variant<NoUpdate, Staging>;
 enum class PermissionChunkResult : uint8_t { Staged, Installed, Dropped };
 
 /// The worker's chunk assembler: ONE per worker; the buffer circulates between it, the slots and `spare_` so nothing
-/// allocates once the buffers reached their peak size.  `Sink` provides installWriteGrants(sid, words&, grantAll, epoch).
+/// allocates once the buffers reached their peak size.  `Sink` provides installWriteGrants(sid, words&, grantAll, epoch,
+/// owner).  `owner` (issue #122) is the session's principal; every chunk of an update carries the same one.
 class PermissionStager {
 public:
     template <class Sink>
     PermissionChunkResult apply(Sink& sink, int64_t sessionId, uint64_t firstWord, uint64_t totalWords, uint8_t flags,
-                                uint64_t epoch, const uint8_t* tail, std::size_t tailLen) {
+                                uint64_t epoch, const uint8_t* tail, std::size_t tailLen, uint64_t owner = 0) {
         static_assert(sizeof(uint64_t) == 8);
         if (tailLen % 8 != 0 || firstWord > totalWords || (tailLen / 8) > totalWords - firstWord) return drop_();
         const std::size_t count = tailLen / 8;
@@ -69,7 +71,7 @@ public:
         st->filled = firstWord + count;
         if ((flags & kPermFlagLast) == 0) return PermissionChunkResult::Staged;
         if (st->filled != totalWords) return drop_();
-        const bool ok = sink.installWriteGrants(sessionId, st->words, (flags & kPermFlagGrantAll) != 0, epoch);
+        const bool ok = sink.installWriteGrants(sessionId, st->words, (flags & kPermFlagGrantAll) != 0, epoch, owner);
         spare_ = std::move(st->words);                         // the swapped-out slot buffer: the next staging buffer
         state_ = NoUpdate{};
         return ok ? PermissionChunkResult::Installed : PermissionChunkResult::Dropped;   // unknown / closed session

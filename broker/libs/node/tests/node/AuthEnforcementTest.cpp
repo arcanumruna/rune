@@ -141,6 +141,104 @@ TEST(AuthEnforcementRegression, NonTransactionalInitProducerIdNeedsNoGrantRegres
     EXPECT_EQ(r.initProducerId(none, ""), kOk) << "D18: its produces are checked, not the id";
 }
 
+// Issue #122: a producer id is bound to the principal it was issued to.  Users m and ws2 both hold WRITE on the topic;
+// ws2 runs an idempotent producer P.  m naming P is refused 45 whatever it sends - a higher epoch (a fence), ws2's next
+// sequence (a batch that would make ws2's real batch a "duplicate" and silently drop it), or a transactional batch
+// (pinning the partition's LSO) - and ws2's producer carries on untouched.
+namespace {
+struct ForeignPidRig {
+    AuthRig r;
+    int64_t ws2 = 0, m = 0;
+    AuthRig::ProducerIds p;
+    int64_t firstOffset = -1;
+    ForeignPidRig() {
+        ws2 = r.newUser({exact(SO::Write, ST::Topic, "orders")});
+        m = r.newUser({exact(SO::Write, ST::Topic, "orders")});
+        p = r.initProducer(ws2);
+        EXPECT_EQ(p.code, kOk);
+        const auto a = r.produceAs(ws2, r.orders, p.pid, p.epoch, 0);
+        EXPECT_EQ(a.code, kOk);
+        firstOffset = a.baseOffset;
+    }
+};
+}  // namespace
+
+TEST(AuthEnforcementRegression, ForeignPrincipalCannotFenceAProducerRegression) {
+    ForeignPidRig f;
+    EXPECT_EQ(f.r.produceAs(f.m, f.r.orders, f.p.pid, static_cast<int16_t>(f.p.epoch + 1), 0).code, kNotAuthorized);
+    const auto next = f.r.produceAs(f.ws2, f.r.orders, f.p.pid, f.p.epoch, 1);
+    EXPECT_EQ(next.code, kOk) << "the owner's producer was fenced by another principal";
+    EXPECT_GT(next.baseOffset, f.firstOffset);
+}
+
+TEST(AuthEnforcementRegression, ForeignPrincipalCannotSwallowAProducersBatchRegression) {
+    ForeignPidRig f;
+    EXPECT_EQ(f.r.produceAs(f.m, f.r.orders, f.p.pid, f.p.epoch, 1, false, "junk").code, kNotAuthorized);
+    // A plain record in between: a batch answered as a duplicate of an EARLIER one gets an offset below it.
+    const auto plain = f.r.produceAs(f.m, f.r.orders, -1, 0, -1);
+    ASSERT_EQ(plain.code, kOk);
+    const auto real = f.r.produceAs(f.ws2, f.r.orders, f.p.pid, f.p.epoch, 1, false, "real");
+    EXPECT_EQ(real.code, kOk);
+    EXPECT_GT(real.baseOffset, plain.baseOffset) << "the owner's batch was answered as a duplicate and never stored";
+}
+
+TEST(AuthEnforcementRegression, ForeignPrincipalCannotPinTheLsoWithAnotherPrincipalsPidRegression) {
+    ForeignPidRig f;
+    EXPECT_EQ(f.r.produceAs(f.m, f.r.orders, f.p.pid, f.p.epoch, 1, /*transactional=*/true).code, kNotAuthorized);
+    // m's own id is m's to use (an unregistered transactional batch under one's OWN id is issue #112).
+    const auto own = f.r.initProducer(f.m);
+    ASSERT_EQ(own.code, kOk);
+    EXPECT_NE(own.pid, f.p.pid);
+    EXPECT_EQ(f.r.produceAs(f.m, f.r.orders, own.pid, own.epoch, 0).code, kOk);
+    EXPECT_EQ(f.r.produceAs(f.ws2, f.r.orders, own.pid, own.epoch, 1).code, kNotAuthorized) << "binding is mutual";
+    EXPECT_EQ(f.r.produceAs(f.ws2, f.r.orders, f.p.pid, f.p.epoch, 1).code, kOk);
+}
+
+// Issue #122 on a sharded broker: the worker that receives a Produce directly (per-worker ingress) checks the id
+// against the principal shipped with the session's grants; the gateway-routed path checks it at the gateway.
+TEST(AuthEnforcementRegression, ForeignPidIsRefusedOnWorkerIngressAndTheRoutedPathRegression) {
+    AuthBroker::Options o;
+    o.shard = true;
+    AuthRig r("pidshard", o);
+    const int64_t ws2 = r.newUser({exact(SO::Write, ST::Topic, "orders")});
+    const int64_t m = r.newUser({exact(SO::Write, ST::Topic, "orders")});
+    const std::string worker = r.broker().workerIngressChannel();
+    const auto p = r.initProducer(ws2);
+    ASSERT_EQ(p.code, kOk);
+    const auto first = r.produceAs(ws2, r.orders, p.pid, p.epoch, 0, false, "v", &worker);
+    ASSERT_EQ(first.code, kOk) << "the owner produces over worker ingress";
+    EXPECT_EQ(r.produceAs(m, r.orders, p.pid, static_cast<int16_t>(p.epoch + 1), 0, false, "v", &worker).code, kNotAuthorized);
+    EXPECT_EQ(r.produceAs(m, r.orders, p.pid, p.epoch, 1, false, "junk", &worker).code, kNotAuthorized);
+    EXPECT_EQ(r.produceAs(m, r.orders, p.pid, p.epoch, 1, /*transactional=*/true).code, kNotAuthorized) << "gateway-routed";
+    const auto next = r.produceAs(ws2, r.orders, p.pid, p.epoch, 1, false, "real", &worker);
+    EXPECT_EQ(next.code, kOk) << "the owner's producer was fenced or its batch swallowed";
+    EXPECT_GT(next.baseOffset, first.baseOffset);
+    const auto own = r.initProducer(m);
+    ASSERT_EQ(own.code, kOk);
+    EXPECT_EQ(r.produceAs(m, r.orders, own.pid, own.epoch, 0, false, "v", &worker).code, kOk) << "m's own id is m's";
+}
+
+// Issue #122 on the transaction requests: a principal holding WRITE on a shared transactional id gets an id of its
+// OWN at InitProducerId (the previous holder is fenced), and naming the other principal's id on AddPartitions /
+// EndTxn is answered exactly like any wrong producer id.
+TEST(AuthEnforcementRegression, ASharedTransactionalIdIsReboundToEachPrincipalRegression) {
+    AuthRig r;
+    const std::vector<AuthGrant> g{exact(SO::Write, ST::TransactionalId, "tx-shared"), exact(SO::Write, ST::Topic, "orders")};
+    const int64_t a = r.newUser(g);
+    const int64_t b = r.newUser(g);
+    const auto pa = r.initProducer(a, "tx-shared");
+    ASSERT_EQ(pa.code, kOk);
+    const auto pa2 = r.initProducer(a, "tx-shared");
+    ASSERT_EQ(pa2.code, kOk);
+    EXPECT_EQ(pa2.pid, pa.pid) << "the same principal keeps its id (epoch bump)";
+    EXPECT_EQ(pa2.epoch, pa.epoch + 1);
+    const auto pb = r.initProducer(b, "tx-shared");
+    ASSERT_EQ(pb.code, kOk);
+    EXPECT_NE(pb.pid, pa.pid) << "another principal was handed the first principal's producer id";
+    EXPECT_EQ(pb.epoch, 0);
+    EXPECT_EQ(r.produceAs(b, r.orders, pa.pid, pa2.epoch, 0).code, kNotAuthorized);
+}
+
 TEST(AuthEnforcementRegression, ViewReadAllowedAndDenied) {
     AuthRig r;
     const int64_t may = r.newUser({exact(SO::Read, ST::View, "board")});

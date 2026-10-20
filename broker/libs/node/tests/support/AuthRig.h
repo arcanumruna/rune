@@ -269,6 +269,40 @@ public:
         return rawCode(sendRaw(m, 256, m.correlationId));
     }
 
+    // ── producer identity (issue #122) ─────────────────────────────────────────────────────────────────────
+    struct ProducerIds { int code = kNoAnswer; int64_t pid = -1; int16_t epoch = -1; };
+    ProducerIds initProducer(int64_t sid, const std::string& txnId = "") {
+        pc::InitProducerId m;
+        m.sessionId = sid; m.correlationId = c().nextCorrelationId(); m.transactionTimeoutMs = 30'000;
+        m.transactionalId = bytes(txnId);
+        const auto a = sendRaw(m, 256, m.correlationId);
+        const auto r = a.empty() ? std::nullopt : pc::InitProducerIdResponse::decode(a.data(), a.size());
+        return r ? ProducerIds{r->errorCode, r->producerId, r->producerEpoch} : ProducerIds{};
+    }
+    struct ProduceAnswer { int code = kNoAnswer; int64_t baseOffset = -1; };
+    /// An idempotent (or, `transactional`, transactional) produce of one record as (pid, epoch, seq) - the frame and
+    /// the batch header carry the same identity.  Retried while the partition's producer state is being built
+    /// (NotLeader); every other answer is final.  Bounded.
+    ProduceAnswer produceAs(int64_t sid, int32_t topicId, int64_t pid, int16_t epoch, int32_t seq,
+                            bool transactional = false, const std::string& value = "v", const std::string* channel = nullptr) {
+        rune::protocol::RecordBatchBuilder b(0, 1000);
+        b.setProducerId(pid); b.setProducerEpoch(epoch); b.setBaseSequence(seq); b.setTransactional(transactional);
+        b.append("k", value, 1000);
+        const std::vector<uint8_t> batch = b.build();
+        ProduceAnswer out;
+        for (int attempt = 0; attempt < 200; ++attempt) {
+            const int64_t corr = c().nextCorrelationId();
+            if (!c().produceIdempotent(channel ? *channel : ch(), stream(), sid, corr, topicId, 0, 1, pid, epoch, seq, batch))
+                return out;
+            const auto a = c().awaitProduceResponseUntil(corr, dl());
+            out = a ? ProduceAnswer{a->errorCode, a->baseOffset} : ProduceAnswer{};
+            if (out.code != static_cast<int>(pc::ErrorCode::NotLeader) && out.code != static_cast<int>(pc::ErrorCode::UnknownTopic))
+                break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+        return out;
+    }
+
     /// The topic ids a MetadataRequest{all} lists for the session.
     std::vector<int32_t> metadataTopics(int64_t sid) {
         std::vector<int32_t> ids;
