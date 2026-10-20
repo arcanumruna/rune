@@ -444,12 +444,11 @@ int64_t ProducerImpl::steadyNowNs_() noexcept {
 SendResult ProducerImpl::trySubmit(int32_t topicId, int32_t partition, const Key& key,
                                    std::span<const uint8_t> value, int64_t ackHandle,
                                    RejectReason* why) noexcept {
-    // Phase 2b F: the one extra branch on the hot path (a byte load + compare).
-    if (txnGate_ != TxnGate::NotTransactional) [[unlikely]] {
-        if (txnGate_ == TxnGate::Closed) {
-            if (why != nullptr) *why = RejectReason::NotInTransaction;
-            return SendResult::NotInTransaction;
-        }
+    // Phase 2b F: the one extra branch on the hot path (a byte load + compare).  Direct mode decides
+    // WrongThread FIRST (the gate is owner-written), so its gate check lives in tryAppendDirect_.
+    if (mode_ != IngressMode::Direct && txnGate_ == TxnGate::Closed) [[unlikely]] {
+        if (why != nullptr) *why = RejectReason::NotInTransaction;
+        return SendResult::NotInTransaction;
     }
     if (mode_ == IngressMode::Direct) {
         RejectReason w = RejectReason::None;
@@ -505,6 +504,10 @@ SendResult ProducerImpl::tryAppendDirect_(int32_t topicId, int32_t partition, co
     if (std::this_thread::get_id() != dutyThreadId_) {
         why = RejectReason::WrongThread;
         return SendResult::WrongThread;
+    }
+    if (txnGate_ == TxnGate::Closed) [[unlikely]] {
+        why = RejectReason::NotInTransaction;
+        return SendResult::NotInTransaction;
     }
     // Closed is terminal, checked before anything else on the owner thread: a
     // Producer outliving its Client never appends, never reaches the pump hook.
@@ -1108,13 +1111,14 @@ RejectReason ProducerImpl::submitTier2Batch(int32_t topicId,
                                      int32_t recordCount,
                                      std::vector<uint8_t>& batchBytes)
 {
-    if (txnGate_ == TxnGate::Closed) [[unlikely]] return RejectReason::NotInTransaction;
+    if (mode_ != IngressMode::Direct && txnGate_ == TxnGate::Closed) [[unlikely]] return RejectReason::NotInTransaction;
     if (mode_ == IngressMode::Direct) {
         // Task 14: queue straight onto the partition (owner thread only — the same
         // state the ring drain's kMsgTier2Batch branch would touch).  Closed (or a
         // foreign thread): not accepted, the caller fails the handle.
         // Foreign thread decided FIRST, before any member read (owner-thread state).
         if (std::this_thread::get_id() != dutyThreadId_) return RejectReason::WrongThread;
+        if (txnGate_ == TxnGate::Closed) [[unlikely]] return RejectReason::NotInTransaction;
         if (directClosed_) return RejectReason::Closed;
         if (inDuty_) {
             // fix1 C1 / fix2: deferred like a Tier-1 record (same per-partition
@@ -3336,7 +3340,7 @@ inline void writeClaimHeader(uint8_t* d, int32_t topicId, int32_t partition, con
 
 ProducerImpl::ClaimGrant ProducerImpl::claimRecord(int32_t topicId, int32_t partition, const Key& key,
                                                    uint32_t valueLen, uint64_t ackHandle) noexcept {
-    if (txnGate_ == TxnGate::Closed) [[unlikely]] {
+    if (mode_ != IngressMode::Direct && txnGate_ == TxnGate::Closed) [[unlikely]] {
         ClaimGrant refused;
         refused.result = SendResult::NotInTransaction;
         return refused;
@@ -3397,7 +3401,7 @@ SendResult ProducerImpl::checkBatchClaim_(const Key& key, uint32_t n, uint32_t r
 
 ProducerImpl::ClaimGrant ProducerImpl::claimBatch(int32_t topicId, int32_t partition, const Key& key, uint32_t n,
                                                   uint32_t recLen) noexcept {
-    if (txnGate_ == TxnGate::Closed) [[unlikely]] {
+    if (mode_ != IngressMode::Direct && txnGate_ == TxnGate::Closed) [[unlikely]] {
         ClaimGrant refused;
         refused.result = SendResult::NotInTransaction;
         return refused;
@@ -3462,6 +3466,7 @@ void ProducerImpl::abortClaim(int64_t token) noexcept {
 SendResult ProducerImpl::directClaimGate_(int32_t topicId, int32_t partition) noexcept {
     // Foreign thread decided FIRST, before any owner-thread state is read.
     if (std::this_thread::get_id() != dutyThreadId_) return SendResult::WrongThread;
+    if (txnGate_ == TxnGate::Closed) [[unlikely]] return SendResult::NotInTransaction;
     if (directClosed_) return SendResult::Closed;
     // Open, or abandoned but not yet settled (its span is in the one quarantine).
     if (!std::holds_alternative<NoDirectClaim>(directClaim_)) return SendResult::ClaimHeld;

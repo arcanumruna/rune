@@ -20,6 +20,7 @@
 #include <memory>
 #include <span>
 #include <stdexcept>
+#include <thread>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -196,4 +197,33 @@ TEST(ProducerTxnApiRegression, PlainProducerHotPathIsUnchangedRegression) {
     alloc_counter::startThisThread();
     for (int i = 0; i < 1000; ++i) ASSERT_EQ(r.p.trySend(kTopic, Key(uint64_t(i)), bytes("x")), SendResult::Ok);
     EXPECT_EQ(alloc_counter::stopThisThread(), 0);
+}
+
+// Task 1 review carry: the Direct-mode foreign-thread decision comes BEFORE the (owner-written) txn gate, so a
+// foreign thread on a transactional Invoker producer sees WrongThread and never reads the gate.  The off-thread
+// calls run in a joined std::thread; results are plain locals read after join().
+TEST(ProducerTxnApiRegression, TransactionalInvokerProducerOffTheOwnerThreadIsWrongThreadRegression) {
+    ProducerImpl impl(cfgOf(Acks::All, "tx-direct"), 1 << 20);
+    impl.enableDirectIngress({std::this_thread::get_id(), nullptr, nullptr, 1});
+    ASSERT_EQ(impl.txnGate(), ProducerImpl::TxnGate::Closed);
+    SendResult submit = SendResult::Ok, claim = SendResult::Ok, batch = SendResult::Ok;
+    rc::producer::RejectReason why = rc::producer::RejectReason::None, tier2 = rc::producer::RejectReason::None;
+    std::vector<uint8_t> bb(8, 1);
+    std::thread other([&] {
+        submit = impl.trySubmit(7, 0, Key(uint64_t{1}), bytes("v"), 0, &why);
+        claim  = impl.claimRecord(7, 0, Key(uint64_t{1}), 8, 0).result;
+        batch  = impl.claimBatch(7, 0, Key(uint64_t{1}), 2, 8).result;
+        tier2  = impl.submitTier2Batch(7, 0, 0, 1, bb);
+    });
+    other.join();
+    EXPECT_EQ(submit, SendResult::WrongThread);
+    EXPECT_EQ(why, rc::producer::RejectReason::WrongThread);
+    EXPECT_EQ(claim, SendResult::WrongThread);
+    EXPECT_EQ(batch, SendResult::WrongThread);
+    EXPECT_EQ(tier2, rc::producer::RejectReason::WrongThread);
+    // On the owner thread the closed gate still refuses.
+    EXPECT_EQ(impl.trySubmit(7, 0, Key(uint64_t{1}), bytes("v"), 0, nullptr), SendResult::NotInTransaction);
+    EXPECT_EQ(impl.claimRecord(7, 0, Key(uint64_t{1}), 8, 0).result, SendResult::NotInTransaction);
+    EXPECT_EQ(impl.claimBatch(7, 0, Key(uint64_t{1}), 2, 8).result, SendResult::NotInTransaction);
+    EXPECT_EQ(impl.submitTier2Batch(7, 0, 0, 1, bb), rc::producer::RejectReason::NotInTransaction);
 }
