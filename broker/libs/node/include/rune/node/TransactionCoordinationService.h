@@ -206,6 +206,16 @@ public:
     /// (counter not resolved) → retried on the next scan.  Function pointer +
     /// ctx (no std::function).
     using StuckMarkersSink = bool (*)(void* ctx, int64_t value);
+
+    /// Phase 2b F Task 11: where a COMMITTED transaction's consumer-group offsets (TxnOffsetCommit) are applied -
+    /// the group coordinator's offset store (BrokerNode wires GroupCoordinationService::applyTransactionalOffset).
+    /// Without a sink the offsets would be dropped, so an unwired / refused apply is counted and logged loudly
+    /// (txnOffsetApplyFailures()).  Called on the control thread, from the transaction's completion; the apply is
+    /// an overwrite, so the coordinator's re-drive of a Prepare* transaction after a failover is idempotent.
+    using TxnOffsetSink = bool (*)(void* ctx, const std::string& group, const rune::coordination::TopicPartition& tp,
+                                   int64_t offset, int64_t nowNs);
+    void setTxnOffsetSink(TxnOffsetSink fn, void* ctx) noexcept { offsetSink_ = fn; offsetSinkCtx_ = ctx; }
+    [[nodiscard]] uint64_t txnOffsetApplyFailures() const noexcept { return offsetApplyFailures_; }
     void setStuckMarkersSink(StuckMarkersSink fn, void* ctx) noexcept {
         stuckSink_ = fn; stuckSinkCtx_ = ctx; stuckPublished_ = -1;
     }
@@ -213,6 +223,10 @@ public:
 private:
     uint64_t controlMarkersRefused_ = 0;
     uint64_t transactionsCompleted_ = 0;
+    TxnOffsetSink offsetSink_    = nullptr;
+    void*         offsetSinkCtx_ = nullptr;
+    uint64_t      offsetApplyFailures_ = 0;
+    void applyTxnOffset_(const std::string& group, const rune::coordination::TopicPartition& tp, int64_t offset);
     // Task 10 round 5: Prepare* transactions whose markers are still in flight,
     // keyed by the markers' producerId (one transaction per producer at a time:
     // the next one is refused with ConcurrentTransactions until this completes).

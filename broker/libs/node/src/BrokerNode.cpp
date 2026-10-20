@@ -2499,6 +2499,17 @@ void BrokerNode::buildGateway() {
             txnCoordService_->setStuckMarkersSink(&BrokerNode::publishStuckMarkers_, this);
 
             gateway_->setTxnService(txnCoordService_.get());
+            // Phase 2b F Task 11: a committed transaction's consumer-group offsets (TxnOffsetCommit) are applied to
+            // the group coordinator's offset store - without this they were accepted and silently dropped.
+            if (groupCoordService_) {
+                txnCoordService_->setTxnOffsetSink(
+                    [](void* ctx, const std::string& group, const rune::coordination::TopicPartition& tp,
+                       int64_t offset, int64_t nowNs) {
+                        return static_cast<GroupCoordinationService*>(ctx)->applyTransactionalOffset(group, tp, offset,
+                                                                                                      nowNs);
+                    },
+                    groupCoordService_.get());
+            }
 
             // D9: cross-node transaction markers over the cluster plane — a
             // marker for a partition led elsewhere is forwarded to its leader;

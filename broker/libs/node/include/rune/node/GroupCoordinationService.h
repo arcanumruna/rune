@@ -140,6 +140,13 @@ public:
     static constexpr uint64_t kLineagePending = UINT64_MAX;
     using TransientLineageFn = uint64_t (*)(void* ctx, int32_t topicId, int32_t partition) noexcept;
     void setTransientLineage(TransientLineageFn fn, void* ctx) noexcept { lineageFn_ = fn; lineageCtx_ = ctx; }
+    /// Phase 2b F Task 11: apply one consumer-group offset of a COMMITTED transaction (TxnOffsetCommit) - the same
+    /// overwrite an OffsetCommit performs (replicated, acks-all, stamped with the partition's data lineage), but
+    /// without a member generation: the transaction coordinator already fenced the producer.  False: this node is
+    /// not the group coordinator / its offsets are not loaded yet / the lineage is pending / the append was refused
+    /// (the caller counts and logs it - the offset is never dropped silently).  Control thread.
+    bool applyTransactionalOffset(const std::string& group, const rune::coordination::TopicPartition& tp, int64_t offset,
+                                  int64_t nowNs);
     /// E2 residual round 5 (R1): a counter that moves whenever a committed
     /// lineage changes (MetadataStateMachine::lineageVersion).  On a change the
     /// coordinator sweeps its groups: a group holding a committed offset of a

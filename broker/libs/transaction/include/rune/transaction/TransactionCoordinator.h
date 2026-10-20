@@ -289,6 +289,10 @@ public:
                                     int32_t              coordinatorEpoch = 0,
                                     OffsetApplyCallback  offsetApplyCb = nullptr);
 
+    /// Install (or replace) the callback that applies a COMMITTED transaction's pending consumer-group
+    /// offsets (see OffsetApplyCallback).  Single-writer: the coordinator's owner thread, before it serves.
+    void setOffsetApplyCallback(OffsetApplyCallback cb) { offsetApplyCb_ = std::move(cb); }
+
     // Non-copyable (holds monotonic state).
     TransactionCoordinator(const TransactionCoordinator&)            = delete;
     TransactionCoordinator& operator=(const TransactionCoordinator&) = delete;

@@ -905,6 +905,23 @@ bool GroupCoordinationService::staleLineage_(const rune::coordination::Committed
 }
 
 // ---------------------------------------------------------------------------
+// applyTransactionalOffset - an offset of a committed transaction (see the header).
+// ---------------------------------------------------------------------------
+bool GroupCoordinationService::applyTransactionalOffset(const std::string& group, const coord::TopicPartition& tp,
+                                                        int64_t offset, int64_t nowNs)
+{
+    if (offsets_ == nullptr || !isLocalCoordinator() || !offsetsLoaded_()) return false;
+    uint64_t lineage = 0;
+    if (topics_ != nullptr) {
+        if (const auto id = topics_->topicIdForName(tp.topic)) {
+            lineage = lineageOf_(*id, tp.partition);   // C1: 0 for a disk partition
+            if (lineage == kLineagePending) return false;
+        }
+    }
+    return offsets_->commit(group, tp, offset, {}, nowNs, lineage);
+}
+
+// ---------------------------------------------------------------------------
 // handleOffsetCommit (templateId 40)
 // ---------------------------------------------------------------------------
 size_t GroupCoordinationService::handleOffsetCommit(

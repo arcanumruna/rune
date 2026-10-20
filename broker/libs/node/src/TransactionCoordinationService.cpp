@@ -37,6 +37,7 @@
 #include <spdlog/spdlog.h>
 
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <string_view>
@@ -83,12 +84,33 @@ TransactionCoordinationService::TransactionCoordinationService(
     , leaderIdFn_(std::move(leaderId))
     , coordinator_()
 {
+    // A committed transaction's consumer-group offsets go to the group coordinator's offset store (setTxnOffsetSink).
+    coordinator_.setOffsetApplyCallback(
+        [this](const std::string& group, const rune::coordination::TopicPartition& tp, rune::coordination::Offset offset,
+               int64_t /*timestampNs*/) { applyTxnOffset_(group, tp, offset); });
     // Pre-reserve scratch containers to avoid steady-state allocation.
     partitionScratch_.reserve(32);
     partResultScratch_.reserve(32);
     topicNameScratch_.reserve(32);  // "topic_<N>" stays well within 32 chars
     pendingByPidScratch_.reserve(16);
     toNotifyScratch_.reserve(32);
+}
+
+// ---------------------------------------------------------------------------
+// applyTxnOffset_ - one pending (group, tp, offset) of a transaction that is being COMMITTED.
+// ---------------------------------------------------------------------------
+void TransactionCoordinationService::applyTxnOffset_(const std::string& group,
+                                                     const rune::coordination::TopicPartition& tp, int64_t offset)
+{
+    const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (offsetSink_ != nullptr && offsetSink_(offsetSinkCtx_, group, tp, offset, nowNs)) return;
+    // Never silent: the offsets of a committed transaction that could not be applied are lost to the group.
+    ++offsetApplyFailures_;
+    spdlog::error("TCS: a committed transaction's offset (group={} topic={} partition={} offset={}) was NOT applied "
+                  "({}): the group will re-read from its previous committed offset ({} failures so far)",
+                  group, tp.topic, tp.partition, offset, offsetSink_ == nullptr ? "no offset sink wired" : "the group "
+                  "coordinator refused it", offsetApplyFailures_);
 }
 
 // ---------------------------------------------------------------------------
