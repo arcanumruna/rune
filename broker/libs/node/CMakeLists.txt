@@ -1727,8 +1727,15 @@ if(BUILD_TESTING)
 
         # DR client bugs (2026-10-15): the REAL client against 3 REAL in-process brokers, a leader SIGKILLed mid-op
         # (seed failover, metadata from any live broker, re-route; produce / subscribe / group / txn / DDL / view row).
-        add_executable(rune_client_failover_broker_tests tests/client/ClientFailoverBrokerRegressionTest.cpp)
-        target_include_directories(rune_client_failover_broker_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        # Phase 2b F Task 11: EosBrokerRegressionTest.cpp - the unified transactional Producer against 3 real brokers
+        # (every path, fencing, in-doubt commit, leader crash, abort-rewind-redo, plain dedup across a reconnect);
+        # it kills brokers, so it lives here (RUN_SERIAL).  It reads client-cpp's TxnMatrixExpectations.h and the
+        # build-time generated all-fixed position.gen.h (typed claim through ProducerRef).
+        add_executable(rune_client_failover_broker_tests tests/client/ClientFailoverBrokerRegressionTest.cpp
+                       tests/client/EosBrokerRegressionTest.cpp)
+        add_dependencies(rune_client_failover_broker_tests generate_claim_schema_headers)
+        target_include_directories(rune_client_failover_broker_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests
+                                   ${RUNE_CLIENT_ROOT}/tests ${CMAKE_BINARY_DIR}/rune-client/claim-gen)
         target_link_libraries(rune_client_failover_broker_tests PRIVATE rune_node rune_view rune_codec rune_catalog
                               rune_client_api aeron::aeron GTest::gtest_main)
         target_compile_definitions(rune_client_failover_broker_tests PRIVATE
