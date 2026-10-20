@@ -76,7 +76,8 @@ TEST(SecurityMessagesRegression, VerifierKeysMustBe64Bytes) {
     pc::SecurityBootstrap b; b.adminName = "admin"; b.verifier = {kSalt, 4096, k63, kServer};
     EXPECT_EQ(b.encode(buf), 0u);
     // a verifier with out-of-range salt / iterations encodes but never decodes
-    m.verifier = {std::string(15, 's'), 4096, kStored, kServer};
+    const std::string salt15(15, 's');   // named: VerifierWire holds views, a temporary would dangle
+    m.verifier = {salt15, 4096, kStored, kServer};
     std::size_t n = m.encode(buf); ASSERT_GT(n, 0u);
     EXPECT_FALSE(pc::SecurityDdl::decode(buf, n)) << "salt 15";
     m.verifier = {kSalt, 4095, kStored, kServer};
