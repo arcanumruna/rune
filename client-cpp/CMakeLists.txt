@@ -242,6 +242,23 @@ target_include_directories(rune_ql PUBLIC ${RUNE_QL_ROOT}/include ${RUNE_PROTOCO
 target_link_libraries(rune_ql PUBLIC rune_codec)
 target_compile_features(rune_ql PUBLIC cxx_std_23)
 
+# ── Phase 2b Part B: build-time generated all-fixed schemas (claim tests + bench) ──
+add_executable(rune_gen_claim_schemas tests/support/GenClaimSchemas.cpp)
+target_link_libraries(rune_gen_claim_schemas PRIVATE rune_codec)
+set(RUNE_CLAIM_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/claim-gen")
+file(MAKE_DIRECTORY "${RUNE_CLAIM_GEN_DIR}/gen")
+set(RUNE_CLAIM_GEN_HEADERS
+    "${RUNE_CLAIM_GEN_DIR}/gen/position.gen.h"
+    "${RUNE_CLAIM_GEN_DIR}/gen/tick_sample.gen.h"
+    "${RUNE_CLAIM_GEN_DIR}/gen/long_key.gen.h")
+add_custom_command(
+    OUTPUT  ${RUNE_CLAIM_GEN_HEADERS}
+    COMMAND $<TARGET_FILE:rune_gen_claim_schemas> "${RUNE_CLAIM_GEN_DIR}/gen"
+    DEPENDS rune_gen_claim_schemas
+    COMMENT "2b-B: generating position / tick_sample / long_key .gen.h (all-fixed flyweights)"
+)
+add_custom_target(generate_claim_schema_headers DEPENDS ${RUNE_CLAIM_GEN_HEADERS})
+
 # ── rune_client — trivial header-only/interface library ──────────────────────
 add_library(rune_client INTERFACE)
 target_include_directories(rune_client INTERFACE
@@ -1450,6 +1467,7 @@ if(BUILD_TESTING)
             tests/detail/CompletionsTest.cpp
             tests/client/InvokerClientTest.cpp
             tests/client/ClaimClientTest.cpp
+            tests/client/TypedClaimTest.cpp
             tests/client/IngressEndpointRoutingTest.cpp
             tests/producer/ProducerRouteParkTest.cpp
             tests/shard/ShardConfigTest.cpp
@@ -1463,6 +1481,8 @@ if(BUILD_TESTING)
             tests/support/AllocCounter.cpp
         )
         target_include_directories(rune_invoker_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})
+        target_include_directories(rune_invoker_tests PRIVATE ${RUNE_CLAIM_GEN_DIR})
+        add_dependencies(rune_invoker_tests generate_claim_schema_headers)
         target_link_libraries(rune_invoker_tests PRIVATE rune_client_api GTest::gtest_main)
         if(UNIX AND NOT APPLE)
             find_library(UUID_LIB_INVOKER uuid)

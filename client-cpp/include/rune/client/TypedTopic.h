@@ -52,10 +52,14 @@
 #include <rune/codec/Fingerprint.h>
 #include <rune/codec/Serialize.h>
 
+#include <array>
 #include <cstdint>
+#include <cstring>
 #include <span>
+#include <string_view>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -94,6 +98,60 @@ concept HasRecordKey = requires(const R& r) { r.key(); };
 [[nodiscard]] constexpr int32_t typedPartitionCount(int32_t reported) noexcept {
     return reported > 0 ? reported : 1;
 }
+
+// ---------------------------------------------------------------------------
+// TypedClaim<E> — Phase 2b Part B: what TypedTopic::claim() returns: the
+// generated encoder E (all-fixed schema) bound to the claimed record bytes,
+// plus the claim's commit() / abort().  Chain the setters, then commit():
+//   auto w = positions.claim(userId);  w.zone(4).x(118.5);  w.commit();
+// A refused claim is false (result(): BackPressured / Closed / ...); its
+// setters then write a private scratch block and commit() returns false.
+// Neither copyable nor movable (E points into the claim or into the scratch).
+// ---------------------------------------------------------------------------
+namespace detail {
+template <class E>
+struct TypedClaimSlot {
+    Claim                                  claim;
+    std::array<uint8_t, E::kEncodedLength> scratch{};  // a refused claim's encoder writes here
+    explicit TypedClaimSlot(Claim&& c) noexcept : claim(std::move(c)) {}
+    [[nodiscard]] std::span<uint8_t> target() noexcept {
+        return claim ? claim.buffer() : std::span<uint8_t>(scratch.data(), scratch.size());
+    }
+};
+
+template <class K>
+struct IsCharArray : std::false_type {};
+template <std::size_t N>
+struct IsCharArray<std::array<char, N>> : std::true_type {};
+}  // namespace detail
+
+template <class E>
+class TypedClaim : private detail::TypedClaimSlot<E>, public E {
+    using Slot = detail::TypedClaimSlot<E>;
+
+public:
+    /// `boundVersion`: the TypedTopic's bound schema version, stamped over the
+    /// encoder's codegen kVersion at bytes [2..3]; `keyValue` (keyed schemas):
+    /// written into the key field.
+    template <class... K>
+    TypedClaim(Claim&& c, uint16_t boundVersion, const K&... keyValue)
+        : Slot(std::move(c)), E(Slot::target()) {
+        const std::span<uint8_t> t = Slot::target();
+        t[2] = static_cast<uint8_t>(boundVersion & 0xffu);
+        t[3] = static_cast<uint8_t>((boundVersion >> 8) & 0xffu);
+        if constexpr (sizeof...(K) == 1) E::key(keyValue...);
+    }
+    TypedClaim(const TypedClaim&)            = delete;
+    TypedClaim& operator=(const TypedClaim&) = delete;
+    TypedClaim(TypedClaim&&)                 = delete;
+    TypedClaim& operator=(TypedClaim&&)      = delete;
+
+    [[nodiscard]] explicit operator bool() const noexcept { return static_cast<bool>(Slot::claim); }
+    [[nodiscard]] SendResult result() const noexcept { return Slot::claim.result(); }
+    /// Publish (see Claim::commit).  Destruction without commit() aborts.
+    bool commit() noexcept { return Slot::claim.commit(); }
+    void abort() noexcept { Slot::claim.abort(); }
+};
 
 // ---------------------------------------------------------------------------
 // TypedTopic<T, ProducerT>
@@ -174,6 +232,63 @@ public:
             // (documented pre-2b behaviour, kept by spec §C).
             sendWithKey_(rec, Key{});
         }
+    }
+
+    // ---- Phase 2b Part B: zero-copy typed produce (all-fixed schemas) -------
+
+    /// Claim one record (T::Encoder::kEncodedLength bytes) routed EXACTLY like
+    /// send(rec) with rec.key() == keyValue (Part C: Key(rec.key())), with the
+    /// bound schema version and the key field already written; set the other
+    /// fields on the returned encoder and commit().  ZERO allocation.  The
+    /// claim follows Claim's rules (do not hold it across blocking work; it
+    /// must not outlive this TypedTopic).  Scalar key fields only; a string(N)
+    /// key field takes the std::string_view overload below.
+    template <class U = T>
+        requires requires { typename U::Encoder; } && U::Encoder::kHasKey &&
+                 (!detail::IsCharArray<typename U::Encoder::KeyType>::value)
+    [[nodiscard]] TypedClaim<typename U::Encoder> claim(const typename U::Encoder::KeyType& keyValue) {
+        using E = typename U::Encoder;
+        using K = typename E::KeyType;
+        static_assert(std::is_trivially_copyable_v<K> && sizeof(K) <= Key::kMaxInline,
+                      "TypedTopic::claim: the key field cannot be a record key without truncation");
+        return TypedClaim<E>(producer_.tryClaim(topic_, Key(keyValue), E::kEncodedLength), version_, keyValue);
+    }
+
+    /// string(N) key field.  For N <= Key::kMaxInline the record key is the N
+    /// zero-padded field bytes, exactly what send(rec) routes with.  For
+    /// N > Key::kMaxInline (send cannot route such a field) the record key is
+    /// the given bytes; more than Key::kMaxInline of them throws
+    /// std::invalid_argument BEFORE anything is claimed (never truncated).
+    template <class U = T>
+        requires requires { typename U::Encoder; } && U::Encoder::kHasKey &&
+                 detail::IsCharArray<typename U::Encoder::KeyType>::value
+    [[nodiscard]] TypedClaim<typename U::Encoder> claim(std::string_view keyValue) {
+        using E = typename U::Encoder;
+        using K = typename E::KeyType;
+        constexpr std::size_t N = std::tuple_size_v<K>;
+        if (keyValue.size() > Key::kMaxInline) [[unlikely]] {
+            throw std::invalid_argument("TypedTopic::claim: key is " + std::to_string(keyValue.size()) +
+                                        " bytes; a record key holds at most " +
+                                        std::to_string(Key::kMaxInline) + " (it is never truncated)");
+        }
+        K field{};  // zero padded; the field keeps at most N bytes
+        const std::size_t fieldBytes = keyValue.size() < N ? keyValue.size() : N;
+        std::memcpy(field.data(), keyValue.data(), fieldBytes);
+        std::array<uint8_t, Key::kMaxInline> kb{};
+        const std::size_t keyLen = N <= Key::kMaxInline ? N : keyValue.size();
+        std::memcpy(kb.data(), keyValue.data(), keyValue.size() < keyLen ? keyValue.size() : keyLen);
+        return TypedClaim<E>(
+            producer_.tryClaim(topic_, Key(std::span<const uint8_t>(kb.data(), keyLen)), E::kEncodedLength),
+            version_, field);
+    }
+
+    /// Keyless schema: partition 0, empty record key (spec C's documented
+    /// behaviour for typed topics without a key field).
+    template <class U = T>
+        requires requires { typename U::Encoder; } && (!U::Encoder::kHasKey)
+    [[nodiscard]] TypedClaim<typename U::Encoder> claim() {
+        using E = typename U::Encoder;
+        return TypedClaim<E>(producer_.tryClaim(topic_, Key{}, E::kEncodedLength), version_);
     }
 
     // ---- Accessors / test seams ------------------------------------------------
