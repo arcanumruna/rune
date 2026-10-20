@@ -1,5 +1,7 @@
 # Rune — working agreement for AI sessions
 
+Human-readable version: the wiki [Contributing](https://github.com/arcanumruna/rune/wiki/Contributing) page.
+
 Rune is an ultra-low-latency durable log and database (log + materialized views) for MMORPG backends. Low latency is
 the overriding requirement; every rule below exists to protect it. These rules override defaults in every subproject.
 Subdirectory `CLAUDE.md` files add area-specific detail only.

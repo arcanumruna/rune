@@ -448,7 +448,7 @@ its record was written is **in doubt**: it may still apply, and does at the late
 ## Building against the client
 
 The root build embeds the client for its tests; to use it, build `client-cpp/` on its own
-([README](../../README.md#build)) and link `rune_client_api`. The headers include rune-protocol, rune-codec, rune-ql and
+([wiki, Building](https://github.com/arcanumruna/rune/wiki/Building#each-library-on-its-own)) and link `rune_client_api`. The headers include rune-protocol, rune-codec, rune-ql and
 rune-crypto through sibling include paths, and the examples in `client-cpp/examples/` are complete programs:
 `rune_client_ping`, `rune_produce_subscribe`, `rune_produce_throughput`, `rune_consume_throughput`, `view_probe`,
 `dr_client`. They read credentials from `RUNE_USER` and `RUNE_PASSWORD_FILE` (`examples/ExampleAuth.h`).

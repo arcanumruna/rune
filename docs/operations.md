@@ -18,7 +18,7 @@ Each node runs an **embedded Aeron media driver in the broker process**; there i
 a sized `/dev/shm`, a writable data directory, a peer list and the cluster key. All inter-node and client traffic is
 `aeron:udp`.
 
-1. Build the image ([README](../README.md#docker-images)) or pull your own.
+1. Build the image ([wiki, Docker Images](https://github.com/arcanumruna/rune/wiki/Docker-Images)) or pull your own.
 2. Make one cluster key and give every node the same file: `rune security gen-cluster-key --out cluster.key`.
 3. Format each node's data directory once ([below](#formatting-a-data-directory)).
 4. Start the nodes with `RUNE_NODE_ID`, the same `RUNE_PEERS` everywhere, `RUNE_CLIENT_ENDPOINT`, `RUNE_DATA_DIR` and
@@ -133,7 +133,7 @@ and accepts the current or the next.
 
 After each restart wait until the node logs `peer link with node N established` for both peers before touching the
 next node. `broker/docker/auth-e2e.sh` runs exactly this under a live producer and consumer and checks that every acked
-record arrives ([README, Testing](../README.md#end-to-end-docker-suites)).
+record arrives ([testing.md](testing.md#end-to-end-docker-suites)).
 
 ### Password rotation
 
@@ -164,7 +164,7 @@ partition logs under `topics/`, `__catalog/` and `__security/` (the replicated e
   held, and is logged at critical level.
 - **Halted catalog apply.** A broker whose catalog replay halts moves, renames and deletes nothing and accepts no catalog
   change. Follow the runbook in CATALOG.md.
-- **Proof.** The DR suite ([README, Testing](../README.md#disaster-recovery-suite-dr-e2e)) kills, pauses, restarts and
+- **Proof.** The DR suite ([testing.md](testing.md#disaster-recovery-suite-dr-e2e)) kills, pauses, restarts and
   partitions nodes under load and asserts no loss, per-key ordering, exactly-once and a single leader.
 
 ## Upgrades
