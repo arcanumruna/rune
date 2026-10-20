@@ -1,10 +1,12 @@
-# rune-client-cpp — architecture & working agreement
+# client-cpp — architecture notes for AI sessions
+
+The repo-wide rules are in the root [CLAUDE.md](../CLAUDE.md). This file holds client-specific detail only.
 
 > **What this is:** the standalone, independently-releasable **C++23 Rune client
 > library** — producer, subscriber, and consumer-group member — that downstream
-> apps (e.g. world-server) link to talk to the `rune-broker` cluster over Aeron.
+> apps (e.g. world-server) link to talk to the broker cluster over Aeron.
 > It shares the wire/record formats with the broker via the header-only
-> `rune-protocol` package (consumed at `../protocol/include`).
+> `protocol/` library (consumed at `../protocol/include`).
 
 The design lives in
 `../broker/docs/superpowers/specs/2026-09-11-rune-client-and-broker-runtime-design.md`
@@ -61,7 +63,7 @@ Bottom to top — each layer is a separate CMake target (see §3):
 | Producer | `producer/{Producer,ProducerImpl,BatchBuilder,ProducerHub}` | Auto-batched, idempotent produce. |
 | Subscriber | `subscriber/{Subscription,SubscriberHub}` | Direct topic-partition subscribe + record delivery. |
 | Group | `group/{GroupConsumer,GroupConsumerHub}` | Consumer-group membership, assignment, auto/sync offset commit. |
-| Support | `Key`, `TopicHandle`, `codec/{Codec,DataCodec}`, `Version` | Keys, topic ids, codec adapters over `rune-protocol`. |
+| Support | `Key`, `TopicHandle`, `codec/{Codec,DataCodec}`, `Version` | Keys, topic ids, codec adapters over `protocol/`. |
 
 ### 2.1 Producer (`producer/`)
 Tier-1 producer with a **zero per-send heap allocation** fast path. App threads
@@ -70,13 +72,14 @@ alloc-free handoff). The agent drains, accumulates records into per-
 `(topicId,partition)` `BatchBuilder`s (RecordBatch v2), and flushes a batch when
 **linger elapsed OR `batchBytes` reached OR `flush()` requested**.
 - `Acks`: `None` (fire-and-forget; fully alloc-free end-to-end), `Leader`
-  (default; awaits `ProduceResponse`), `All` (treated as Leader for now).
+  (default; awaits `ProduceResponse`), `All` (awaits commit by the in-sync replica majority).
 - F8c C6: no per-send heap on ANY path — acked sends carry a tagged 64-bit
   token (a `Completions` queue's CqRef + Token, or the producer's `onAck`
   function pointer + Token) in the record's ack slot; begin-close
   (`close(target, token)`) / `close()` / `closeImmediately()` per F8c C6a.
-- Idempotence: each partition stamps a monotonic `baseSequence` into the batch
-  header (`producerId` is a local stub pending real `InitProducerId`).
+- Idempotence: the producer gets its `producerId`/epoch from the broker via
+  `InitProducerId` (coordinator link), and each partition stamps a monotonic
+  `baseSequence` into the batch header.
 - Tier-2 `batch()` is single-thread per producer (the creating thread, or `Producer::bindBatchThread()`): the
   preallocated slot pool's app side is owned by that thread; off-thread `batch()` returns a refused builder
   (`send()` = WrongThread) and never touches the pool. Plain send/trySend/tryClaim/claimBatch stay any-thread.
@@ -182,7 +185,7 @@ memory ordering is exempt, plus temporary capped "SLICE-B" entries.
 ## 3. Build targets & dependencies
 
 Conan 2 + CMake ≥3.31, C++23. Depends on `aeron` (embedded C driver `aeronmd`
-+ C++ client) and `spdlog`; `rune-protocol` is header-only via the sibling
++ C++ client) and `spdlog`; `protocol/` is header-only via the
 include path. On macOS, build **x86_64** for Aeron binary-cache matching.
 
 CMake splits the library into targets so the header-only `rune_client`
@@ -211,35 +214,9 @@ cd build && ctest --output-on-failure
 
 ---
 
-## 4. Engineering law — Aeron/Agrona is the bible
+## 4. Engineering law
 
-This client obeys the same non-negotiable law as the broker: single-writer
-agents under `doWork`/`IdleStrategy`, no hot-path locks or allocation, lock-free
-ring buffers for cross-thread handoff, injected advanceable clocks in tests
-(advance-and-tick, hard iteration caps, no wall-clock waits, no `while(cond)
-doWork()`), and `IdleStrategy` back-off when idle (never a bare spin). The full
-statement is in `../broker/CLAUDE.md` §7 — read it and mirror Aeron's C++
-client exactly.
-
----
-
-## 5. Session workflow
-
-**Tickets - Planka (`planka` MCP).** Board **"Rune / Roadmap"**
-(id `1861164569347490826`): Backlog · In Progress · In Review · Done. Create
-a card before starting; move it as you progress.
-
----
-
-## Engineering Philosophy (HARD RULES — apply everywhere, always)
-
-These are non-negotiable across every Rune repo. Check every design and every fix against all eight:
-
-1. **Shared-nothing.** No shared mutable state, no locks, no atomics-as-coordination, no `thread_local`. Each thread/component owns its data outright.
-2. **Ring buffers are the ONLY cross-thread event passing.** All inter-thread / inter-component communication goes through ring buffers (Aeron-style) — never shared memory or cross-thread callbacks.
-3. **State machines where each STATE holds exactly the variables that state needs** — not scattered booleans. e.g. `PUBLISHED(buffer, destination, publisher, counter)`, `BEHIND(...)`, `INSYNC(...)`. Every edge case = one explicit state with one code path.
-4. **Zero allocations.** No heap allocation on hot paths or in steady state — preallocate, reuse buffers (capacity persists), fixed stack buffers; no per-cycle `std::vector` returns / `std::function` / dynamic containers on the fast path.
-5. **Test everything, benchmark everything.** Prove features via real e2e/integration + benchmarks. No hand-waving; no "done" without the real path green.
-6. **Regression test on EVERY fix**, marked as a regression suite (e.g. `*Regression*`) so they run together.
-7. **Affected-area tests on every fix/implementation; the FULL regression suite at checkpoints.** Each task / fix round: build, then run the test executables covering the code it touches plus every new or changed test. The FULL `*Regression*` suite runs at checkpoints — after a batch of related tasks, before any final/whole-branch review, and after every merge — and is the gate before anything integrates. A checkpoint failure is bisected over the commits since the last green checkpoint.
-8. **Fix-on-sight.** If while reading any file you find code that violates this philosophy (shared state, cross-thread callback, scattered flags, hot-path allocation, untested/un-regressed fix), you FIX it — don't just note it.
+The client obeys the same law as the broker: single-writer agents under `doWork`/`IdleStrategy`, no hot-path locks or
+allocation, Aeron ring buffers for cross-thread hand-off, injected advanceable clocks in tests (advance-and-tick, hard
+iteration caps, no wall-clock waits), `IdleStrategy` back-off when idle. The full statement and the 16-point
+philosophy are in the root [CLAUDE.md](../CLAUDE.md).

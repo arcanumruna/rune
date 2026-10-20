@@ -78,7 +78,7 @@ struct CompletionTarget;
 enum class Acks : uint8_t {
     None   = 0,  // send without waiting for a response (fully fire-and-forget)
     Leader = 1,  // wait for ProduceResponse from the leader (default)
-    All    = 2,  // wait for all replicas (treated as Leader for M-B)
+    All    = 2,  // wait until the batch is committed by the in-sync replica majority
 };
 
 // ---------------------------------------------------------------------------

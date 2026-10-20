@@ -1,15 +1,16 @@
-# rune-protocol — architecture & working agreement
+# protocol — architecture notes for AI sessions
+
+The repo-wide rules are in the root [CLAUDE.md](../CLAUDE.md). This file holds protocol-specific detail only.
 
 > **What this is:** the **header-only C++23 library** that is the single source
 > of truth for every Rune wire and on-disk encoding. Both the broker
-> (`rune-broker`) and the client (`rune-client-cpp`) include these headers so
+> (`broker/`) and the client (`client-cpp/`) include these headers so
 > the two ends can never disagree on a byte layout. No `.cpp` compilation unit
 > ships (only `src/dummy.cpp` exists so CLion indexes the headers); the Conan
 > package is effectively `INTERFACE`.
 
-Released independently as a Conan package. Consumed by siblings via the source
-include path `../protocol/include` (that is how the broker and client
-resolve it during development).
+Published as a Conan package by CI. Inside the monorepo the broker and client
+use it through the source include path `protocol/include`.
 
 ---
 
@@ -117,23 +118,13 @@ cd build && ctest --output-on-failure
   client codec).
 - **Never** run `conan create/export/upload` locally — CI publishes packages.
 
-**Changing the format is a cross-repo event:** a layout change here must be
-mirrored in `rune-broker` and `rune-client-cpp`, and the conformance vectors
-updated.
+**Changing the format touches every consumer:** a layout change here must be
+mirrored in `broker/` and `client-cpp/` in the same change, and the conformance
+vectors updated.
 
 ---
 
-## 4. Engineering law — Aeron/Agrona is the bible
+## 4. Engineering law
 
-The encoders here embody Rune's global engineering law: flat SBE-style fixed
-layouts, reusable encoder/decoder state (zero per-message allocation),
-zero-copy, correct little-endian byte order. See `rune-broker/CLAUDE.md` §7 for
-the full statement (threading, fences, idling) that governs every Rune repo.
-
----
-
-## 5. Session workflow
-
-**Tickets - Planka (`planka` MCP).** Board **"Rune / Roadmap"**
-(id `1861164569347490826`): Backlog · In Progress · In Review · Done. Create
-a card before starting; move it as you progress.
+Aeron/Agrona is the reference implementation: flat SBE-style fixed layouts, reusable encoder/decoder state (zero
+per-message allocation), zero-copy, little-endian. The full statement is §2 of the root [CLAUDE.md](../CLAUDE.md).
