@@ -393,6 +393,7 @@ if(aeron_FOUND)
         src/producer/Producer.cpp
         src/producer/Claim.cpp
         src/producer/ProducerHub.cpp
+        src/producer/CoordinatorLink.cpp
         src/producer/BatchBuilder.cpp
         src/producer/TransactionalProducerImpl.cpp
         src/producer/TransactionalProducer.cpp
@@ -1471,6 +1472,7 @@ if(BUILD_TESTING)
             tests/producer/ProducerCloseTest.cpp
             tests/producer/ProducerClaimTest.cpp
             tests/producer/ProducerTxnApiTest.cpp
+            tests/producer/CoordinatorLinkTest.cpp
             tests/detail/M2ORingBufferTest.cpp
             tests/detail/OneToOneRingBufferTest.cpp
             tests/detail/CompletionsTest.cpp

@@ -262,6 +262,8 @@ public:
     /// 62), connect ids (session * 1e12), keepalive ids (negative) and the
     /// Client's counter.
     static constexpr int64_t kFetchCorrTag = int64_t{1} << 61;
+
+    static constexpr int64_t  kOffsetFetchCorrTag      = int64_t{1} << 60;
     [[nodiscard]] static constexpr bool isFetchCorrId(int64_t c) noexcept {
         return c > 0 && (c & (int64_t{3} << 61)) == kFetchCorrTag;
     }
@@ -459,7 +461,6 @@ private:
     void rejoinForOffsetFetch_(GroupConsumerImpl& impl);
     static constexpr uint32_t kMaxOffsetFetchRejoins   = 8;
     /// I2: OffsetFetch correlationIds (bit 60 tag; disjoint from fetch ids).
-    static constexpr int64_t  kOffsetFetchCorrTag      = int64_t{1} << 60;
     int64_t nextOffsetFetchCorr_ = 1;
     void publishGeneration_(GroupConsumerImpl& impl);
 

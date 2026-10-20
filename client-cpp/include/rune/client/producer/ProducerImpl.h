@@ -48,6 +48,7 @@
 #include <concurrent/AtomicBuffer.h>
 #include <concurrent/BackOffIdleStrategy.h>
 #include <rune/client/detail/FlatIndexMap.h>
+#include <rune/client/producer/CoordinatorLink.h>
 #include <rune/client/producer/InFlightRing.h>
 #include <rune/client/producer/ProduceFrameBuilder.h>
 #include <flight_recorder/FlightRecorder.h>
@@ -61,6 +62,7 @@
 #include <deque>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -1083,6 +1085,23 @@ public:
     }
     [[nodiscard]] uint32_t ordinal() const noexcept { return ordinal_; }
 
+    // ---- Phase 2b F Task 2: the coordinator link (duty thread only) -----------
+    /// Emplaces the link with this producer's ordinal (ProducerHub::add, right after setOrdinal) and
+    /// the sink to offer coordinator frames through.  Before it, a bare rig has no link.
+    void enableCoordinator(CoordinatorSink sink) { coord_.emplace(ordinal_, sink); }
+    [[nodiscard]] bool hasCoordinator() const noexcept { return coord_.has_value(); }
+    [[nodiscard]] CoordinatorLink* coordinatorLink() noexcept { return coord_ ? &*coord_ : nullptr; }
+    /// An answer routed here by ordinal (ProducerHub::onCoordinatorResponse).  The machines of Tasks
+    /// 4-7 consume the settled slot; until then it is released here.
+    void onCoordinatorAnswer(const CoordAnswer& a, int64_t nowNs) noexcept;
+    /// One duty pass of the link: offers, retries, deadline expiry (expired slots are released).
+    int pumpCoordinator(int64_t nowNs) noexcept;
+    void onCoordinatorMoved() noexcept { if (coord_) coord_->onCoordinatorMoved(); }
+    void onCoordinatorSessionChanged() noexcept { if (coord_) coord_->onSessionChanged(); }
+    /// Diagnostics / tests: answers routed to this producer / the id of the last one.
+    [[nodiscard]] uint64_t coordAnswersSeen() const noexcept { return coordAnswersSeen_; }
+    [[nodiscard]] int64_t  lastCoordAnswerCorrId() const noexcept { return lastCoordCorrId_; }
+
     /// Total Aeron frames offered to transport (agent-thread only; plain uint64_t).
     uint64_t framesSent()  const noexcept { return framesSent_; }
 
@@ -1516,6 +1535,9 @@ private:
     // In-flight batches live in each PartitionState::inflight ring; a batch
     // correlation id encodes (ordinal_, partition slot, ring sequence).
     uint32_t ordinal_ = 0;
+    std::optional<CoordinatorLink> coord_;   // Phase 2b F: duty thread only
+    uint64_t coordAnswersSeen_  = 0;
+    int64_t  lastCoordCorrId_   = 0;
     uint64_t seqBase_ = 0;  // F8c C7 F2: the ordinal's carried-forward sequence base
     int64_t  orphanFence_ = 0;  // F8c C7 F1: written by the handle before its orphan RMW
     // Lower bound of every live batch's attemptDeadlineNs: retransmitStalled()

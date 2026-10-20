@@ -11,6 +11,10 @@
 
 #include <rune/client/producer/ProducerHub.h>
 
+#include <rune/protocol/client/ControlMessages.h>
+#include <rune/protocol/client/MessageHeader.h>
+#include <rune/protocol/client/TxnMessages.h>
+
 #include <stdexcept>
 
 namespace rune::client::producer {
@@ -42,6 +46,7 @@ void ProducerHub::add(ProducerImpl* impl)
     }
     if (nextBase_.size() <= ord) nextBase_.resize(ord + 1, 0);
     impl->setOrdinal(ord, nextBase_[ord]);  // F2: past every sequence a previous incarnation used
+    if (coordSink_.offer != nullptr) impl->enableCoordinator(coordSink_);   // Phase 2b F: after the ordinal
     active_.push_back(impl);  // m2: walks visit only the live producers
 }
 
@@ -79,6 +84,105 @@ void ProducerHub::onProduceResponse(int64_t correlationId, int64_t baseOffset, i
     const uint32_t o = batchcorr::ordinal(correlationId);
     if (o < producers_.size() && producers_[o] != nullptr) {
         producers_[o]->onProduceResponse(correlationId, baseOffset, errorCode, logStartOffset);
+    }
+}
+
+namespace {
+namespace rpc = rune::protocol::client;
+
+/// The most severe per-partition verdict decides (fenced > fatal > abortable/reject > rediscover > retry >
+/// ok) so a 27 never masks a non-retriable error.  Returns the code that earned it.
+template <class Results>
+int16_t worstResult(ReqKind kind, const Results& results) noexcept {
+    auto rank = [](Verdict v) {
+        switch (v) {
+        case Verdict::Fenced:     return 5;
+        case Verdict::Fatal:      return 4;
+        case Verdict::Abortable:
+        case Verdict::Reject:     return 3;
+        case Verdict::Rediscover: return 2;
+        case Verdict::Retry:      return 1;
+        case Verdict::Ok:         return 0;
+        }
+        return 0;
+    };
+    int16_t worst = 0;
+    int     best  = 0;
+    for (std::size_t i = 0; i < results.size(); ++i) {
+        const int16_t code = results[i].errorCode;
+        const int     r    = rank(CoordinatorLink::classify(kind, code));
+        if (r > best) { best = r; worst = code; }
+    }
+    return worst;
+}
+}  // namespace
+
+bool ProducerHub::onCoordinatorResponse(uint16_t templateId, const uint8_t* buf, std::size_t len, int64_t nowNs) {
+    const auto hdr = rpc::MessageHeader::decode(buf, len);
+    if (!hdr || !coordcorr::isCoord(hdr->correlationId)) return false;
+    const uint32_t o = coordcorr::ordinal(hdr->correlationId);
+    if (o >= producers_.size() || producers_[o] == nullptr) return false;
+
+    CoordAnswer a{ReqKind::InitProducerId, hdr->correlationId, 0, std::span<const uint8_t>(buf, len), false};
+    switch (static_cast<rpc::TemplateId>(templateId)) {
+    case rpc::TemplateId::InitProducerIdResponse: {
+        const auto m = rpc::InitProducerIdResponse::decode(buf, len);
+        if (!m) return false;
+        a.kind = ReqKind::InitProducerId;
+        a.errorCode = m->errorCode;
+        break;
+    }
+    case rpc::TemplateId::AddPartitionsToTxnResponse: {
+        const auto m = rpc::AddPartitionsToTxnResponse::decode(buf, len);
+        if (!m) return false;
+        a.kind = ReqKind::AddPartitions;
+        a.errorCode = worstResult(a.kind, m->results);
+        break;
+    }
+    case rpc::TemplateId::AddOffsetsToTxnResponse: {
+        const auto m = rpc::AddOffsetsToTxnResponse::decode(buf, len);
+        if (!m) return false;
+        a.kind = ReqKind::AddOffsets;
+        a.errorCode = m->errorCode;
+        break;
+    }
+    case rpc::TemplateId::TxnOffsetCommitResponse: {
+        const auto m = rpc::TxnOffsetCommitResponse::decode(buf, len);
+        if (!m) return false;
+        a.kind = ReqKind::TxnOffsetCommit;
+        a.errorCode = worstResult(a.kind, m->results);
+        break;
+    }
+    case rpc::TemplateId::EndTxnResponse: {
+        const auto m = rpc::EndTxnResponse::decode(buf, len);
+        if (!m) return false;
+        a.kind = ReqKind::EndTxn;
+        a.errorCode = m->errorCode;
+        break;
+    }
+    case rpc::TemplateId::ErrorResponse: {
+        const auto m = rpc::ErrorResponse::decode(buf, len);
+        if (!m) return false;
+        a.anyKind = true;
+        a.errorCode = m->code;
+        break;
+    }
+    default:
+        return false;
+    }
+    producers_[o]->onCoordinatorAnswer(a, nowNs);
+    return true;
+}
+
+void ProducerHub::onCoordinatorMoved() noexcept {
+    for (ProducerImpl* impl : active_) {
+        if (impl != nullptr) impl->onCoordinatorMoved();
+    }
+}
+
+void ProducerHub::onCoordinatorSessionChanged() noexcept {
+    for (ProducerImpl* impl : active_) {
+        if (impl != nullptr) impl->onCoordinatorSessionChanged();
     }
 }
 

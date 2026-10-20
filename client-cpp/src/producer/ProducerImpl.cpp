@@ -3657,3 +3657,19 @@ template int ProducerImpl::retransmitStalled<agent::AgentProduceSink>(
 template int ProducerImpl::retransmitStalled<CountingSink>(int64_t, const CountingSink&);
 
 } // namespace rune::client::producer
+
+namespace rune::client::producer {
+
+void ProducerImpl::onCoordinatorAnswer(const CoordAnswer& a, int64_t nowNs) noexcept {
+    ++coordAnswersSeen_;
+    lastCoordCorrId_ = a.corrId;
+    if (!coord_) return;
+    if (CoordinatorLink::Slot* s = coord_->onAnswer(a, nowNs)) coord_->release(*s);
+}
+
+int ProducerImpl::pumpCoordinator(int64_t nowNs) noexcept {
+    if (!coord_) return 0;
+    return coord_->pump(nowNs, [](CoordinatorLink::Slot&) {});
+}
+
+}  // namespace rune::client::producer

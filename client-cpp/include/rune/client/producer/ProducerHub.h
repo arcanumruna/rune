@@ -131,6 +131,7 @@ public:
                 if (stop == ProducerImpl::DrainStop::Blocked && flushed == 0) break;
             }
             work += impl->retransmitStalled(nowNs, sink);
+            work += impl->pumpCoordinator(nowNs);   // Phase 2b F: coordinator offers / retries / deadlines
             // F8c C6a: a closing producer's begin-close completion / deadline.
             if (!impl->lifeOpen()) [[unlikely]] work += impl->closeDuty(nowNs);
         }
@@ -142,6 +143,22 @@ public:
     /// D6: logStartOffset = ProduceResponse.logStartOffset (-1 = not carried).
     void onProduceResponse(int64_t correlationId, int64_t baseOffset, int16_t errorCode,
                            int64_t logStartOffset = -1);
+
+    // ---- Phase 2b F Task 2: coordinator answers, routed by producer ordinal ----
+
+    /// The sink every producer's CoordinatorLink offers through (set once, before the first add()).
+    void setCoordinatorSink(const CoordinatorSink& sink) noexcept { coordSink_ = sink; }
+
+    /// A coordinator response (InitProducerIdResponse 46 / AddPartitionsToTxnResponse 48 /
+    /// AddOffsetsToTxnResponse 50 / TxnOffsetCommitResponse 52 / EndTxnResponse 54) or an ErrorResponse
+    /// (5) for a coordinator request.  The correlation id names exactly one producer (coordcorr ordinal):
+    /// only that producer sees the answer - never broadcast.  Ids that are not coordinator ids, or name
+    /// no live producer, are ignored.  Returns true when a producer received it.
+    bool onCoordinatorResponse(uint16_t templateId, const uint8_t* buf, std::size_t len, int64_t nowNs);
+    /// The Client re-pointed the coordinator session: waiting requests re-send.
+    void onCoordinatorMoved() noexcept;
+    /// The coordinator session changed (reconnect / new id): in-flight requests re-send on it.
+    void onCoordinatorSessionChanged() noexcept;
 
     /// Fail every pending ack with `st` (redirect-reconnect failure:
     /// SessionLost; the producers stay open).
@@ -279,6 +296,7 @@ private:
     // runner thread.  No atomic, no lock: the shared-nothing law delivers
     // registration via the agent ring (kMsgRegisterProducer), so this vector is
     // never touched concurrently.  Shutdown paths run after the runner is joined.
+    CoordinatorSink coordSink_{};         // Phase 2b F: handed to every producer at add()
     ImplList producers_;                  // by ordinal (ProduceResponse routing); nullptr = released
     ImplList active_;                     // m2: the live producers, dense (every duty walk)
     std::vector<uint32_t> freeOrdinals_;  // F8c C7: released ordinals, FIFO (reused once fresh run out)

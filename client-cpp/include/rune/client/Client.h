@@ -1433,6 +1433,10 @@ private:
     [[nodiscard]] producer::TransactionalProducerImpl* findTxn_(uint64_t handle) const noexcept;
     /// F14: NotCoordinator -> send a MetadataRequest (duty thread).
     static void rediscoverTrampoline_(void* ctx) noexcept;
+    /// Phase 2b F: the CoordinatorSink every producer's CoordinatorLink offers through.
+    [[nodiscard]] static producer::CoordinatorSink::Offer coordOfferTrampoline_(void* ctx, const uint8_t* buf,
+                                                                                std::size_t len) noexcept;
+    [[nodiscard]] static int64_t coordSessionIdTrampoline_(void* ctx) noexcept;
 
     // ---- F8c C3: control ops (duty-thread owned pending table) --------------
     /// `secret` (review B I4): bytes carried to the duty thread AFTER the wire frame in the same record, handed to the
@@ -1843,10 +1847,13 @@ private:
     //   group OffsetFetch             bit 60 (GroupConsumerHub::kOffsetFetchCorrTag)
     //   group fetch Subscribes        bit 61 (GroupConsumerHub::kFetchCorrTag)
     //   producer batches              bit 62 (producer::batchcorr::kTag)
+    //   producer coordinator requests bit 58 (producer::coordcorr::kTag; bit 59 is the counter above)
     // Task 5 fix round 0 (C): the counter used to start at 1 — the seed's
     // connect ids (session 0) count from 1 too, so the n-th connect and the
     // n-th control op shared an id and an answer to one was taken for the other.
     static constexpr int64_t kClientCorrIdTag = int64_t{1} << 59;
+    static_assert(kClientCorrIdTag == producer::coordcorr::kClientCounterTag,
+                  "the coordinator id tag (bit 58) is chosen disjoint from this counter's");
     int64_t                 nextCorrId_ = kClientCorrIdTag | 1;   // duty-owned correlation counter
     std::vector<PendingCtl> pendingCtl_;               // ping / define / get, by corrId (linear: cold)
     // Catalog history (F14): this Client's random 64-bit instance id (drawn once

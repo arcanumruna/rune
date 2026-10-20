@@ -341,6 +341,9 @@ Client::Client(ClientConfig cfg)
         return agent_.offerDefault(buf, len) != transport::AeronTransport::OfferResult::Retry;
     };
 
+    // Phase 2b F: every producer's CoordinatorLink offers through the coordinator session.
+    producerHub_.setCoordinatorSink({&Client::coordOfferTrampoline_, &Client::coordSessionIdTrampoline_, this});
+
     // CG-5: GroupConsumerHub is ticked from sweepTimeouts (100 ms cadence).
 
     agent_.start();  // Invoker: pumps its own driver while resolving (no threads)
@@ -3604,6 +3607,13 @@ void Client::onEgressFrame(codec::TemplateId tid,
         // there (onCoordinatorMoved → Rejoining → its connect); txn requests in
         // flight are re-sent there by the txn producer (a session change).
         if (ec == rpc::ErrorCode::NotCoordinator && !opt->message.empty()) {
+            // Phase 2b F: a producer's coordinator request waits (AwaitCoordinator) for the move below;
+            // a redirect naming the coordinator already in use moves nothing, so ask for fresh metadata
+            // (its answer releases the waiters too).
+            if (producerHub_.onCoordinatorResponse(static_cast<uint16_t>(codec::TemplateId::ErrorResponse), buf, len,
+                                                   now())) {
+                scheduleMetadataRefresh();
+            }
             onCoordinatorRedirect_(std::string(opt->message));
             break;
         }
@@ -4094,6 +4104,9 @@ void Client::onEgressFrame(codec::TemplateId tid,
     }
 
     case codec::TemplateId::InitProducerIdResponse: {
+        // Phase 2b F: a coordinator-tagged id belongs to exactly one producer (by ordinal); the legacy
+        // TransactionalProducer path below coexists until Task 9.
+        if (producerHub_.onCoordinatorResponse(static_cast<uint16_t>(codec::TemplateId::InitProducerIdResponse), buf, len, now())) break;
         for (auto& tp : txnProducers_) {
             tp->onInitProducerIdResponse(buf, len);
         }
@@ -4101,6 +4114,9 @@ void Client::onEgressFrame(codec::TemplateId tid,
     }
 
     case codec::TemplateId::AddPartitionsToTxnResponse: {
+        // Phase 2b F: a coordinator-tagged id belongs to exactly one producer (by ordinal); the legacy
+        // TransactionalProducer path below coexists until Task 9.
+        if (producerHub_.onCoordinatorResponse(static_cast<uint16_t>(codec::TemplateId::AddPartitionsToTxnResponse), buf, len, now())) break;
         for (auto& tp : txnProducers_) {
             tp->onAddPartitionsToTxnResponse(buf, len);
         }
@@ -4108,6 +4124,9 @@ void Client::onEgressFrame(codec::TemplateId tid,
     }
 
     case codec::TemplateId::AddOffsetsToTxnResponse: {
+        // Phase 2b F: a coordinator-tagged id belongs to exactly one producer (by ordinal); the legacy
+        // TransactionalProducer path below coexists until Task 9.
+        if (producerHub_.onCoordinatorResponse(static_cast<uint16_t>(codec::TemplateId::AddOffsetsToTxnResponse), buf, len, now())) break;
         for (auto& tp : txnProducers_) {
             tp->onAddOffsetsToTxnResponse(buf, len);
         }
@@ -4115,6 +4134,9 @@ void Client::onEgressFrame(codec::TemplateId tid,
     }
 
     case codec::TemplateId::TxnOffsetCommitResponse: {
+        // Phase 2b F: a coordinator-tagged id belongs to exactly one producer (by ordinal); the legacy
+        // TransactionalProducer path below coexists until Task 9.
+        if (producerHub_.onCoordinatorResponse(static_cast<uint16_t>(codec::TemplateId::TxnOffsetCommitResponse), buf, len, now())) break;
         for (auto& tp : txnProducers_) {
             tp->onTxnOffsetCommitResponse(buf, len);
         }
@@ -4122,6 +4144,9 @@ void Client::onEgressFrame(codec::TemplateId tid,
     }
 
     case codec::TemplateId::EndTxnResponse: {
+        // Phase 2b F: a coordinator-tagged id belongs to exactly one producer (by ordinal); the legacy
+        // TransactionalProducer path below coexists until Task 9.
+        if (producerHub_.onCoordinatorResponse(static_cast<uint16_t>(codec::TemplateId::EndTxnResponse), buf, len, now())) break;
         for (auto& tp : txnProducers_) {
             tp->onEndTxnResponse(buf, len);
         }
@@ -5869,6 +5894,7 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
     // F14: a fresh cluster view — txn requests waiting for the coordinator to
     // be re-discovered (NotCoordinator) back off and re-send.
     for (auto& tp : txnProducers_) tp->onCoordinatorRediscovered();
+    producerHub_.onCoordinatorMoved();   // Phase 2b F: the same fresh view releases AwaitCoordinator requests
 }
 
 // D4: see the ErrorResponse handler.  Agent / duty thread.
@@ -5899,6 +5925,7 @@ void Client::onCoordinatorRedirect_(const std::string& endpoint) {
     else                coordinatorChannel_ = channel;
     coordFailBase_ = agent_.sessionConnectFailuresAt(coordIdx_);
     groupConsumerHub_.onCoordinatorMoved();   // members -> Rejoining (there)
+    producerHub_.onCoordinatorMoved();        // Phase 2b F: AwaitCoordinator requests re-send
     syncCoordinatorSession_();                // already connected: they join at once
 }
 
@@ -5926,6 +5953,7 @@ void Client::syncCoordinatorSession_() noexcept {
             coordinatorChannel_.clear();
             coordIdx_ = 0;
             groupConsumerHub_.onCoordinatorMoved();
+            producerHub_.onCoordinatorMoved();
             syncCoordinatorSession_();  // once: the seed's tuple (coordIdx_ == 0 now)
             return;
         }
@@ -5937,6 +5965,10 @@ void Client::syncCoordinatorSession_() noexcept {
         return;
     }
     const bool connected = st == session::SessionState::Connected;
+    // Phase 2b F: a new coordinator session (route or id) - in-flight coordinator requests re-send on it.
+    if (connected && sid != 0 && (coordIdx_ != lastCoordIdx_ || sid != lastCoordSid_)) {
+        producerHub_.onCoordinatorSessionChanged();
+    }
     groupConsumerHub_.setSessionConnected(connected, sid, episode);
     lastCoordIdx_     = coordIdx_;
     lastCoordState_   = st;
@@ -5950,6 +5982,24 @@ void Client::syncCoordinatorSession_() noexcept {
         groupConsumerHub_.onConnected(sid, coordSendFn_);
         (void)groupConsumerHub_.reconcileFetch();
     }
+}
+
+producer::CoordinatorSink::Offer Client::coordOfferTrampoline_(void* ctx, const uint8_t* buf,
+                                                                std::size_t len) noexcept {
+    auto* self = static_cast<Client*>(ctx);
+    // The coordinator session (the seed until a NotCoordinator names another node), as txnSendFn_ routes.
+    const auto r = self->coordIdx_ != 0 ? self->agent_.offerToCoordinator(self->coordIdx_, buf, len)
+                                        : self->agent_.offerDefault(buf, len);
+    switch (r) {
+    case transport::AeronTransport::OfferResult::Accepted: return producer::CoordinatorSink::Offer::Accepted;
+    case transport::AeronTransport::OfferResult::Retry:    return producer::CoordinatorSink::Offer::Retry;
+    case transport::AeronTransport::OfferResult::Fatal:    return producer::CoordinatorSink::Offer::Fatal;
+    }
+    return producer::CoordinatorSink::Offer::Retry;
+}
+
+int64_t Client::coordSessionIdTrampoline_(void* ctx) noexcept {
+    return static_cast<Client*>(ctx)->coordSessionId_();
 }
 
 void Client::rediscoverTrampoline_(void* ctx) noexcept {
