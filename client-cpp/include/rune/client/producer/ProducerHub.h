@@ -109,6 +109,7 @@ public:
             // run up to 256x/cycle — same relaxed store either way, just cheaper).
             impl->publishHeartbeat(nowNs);
             work += impl->identityStep(nowNs);   // Phase 2b F (FD4): one index compare once the id is assigned
+            work += impl->txnStep(nowNs);        // Phase 2b F Task 5: one index compare when no txn op is pending
             // F12: drain a whole pass, then flush ONCE (flushBatches walks only
             // the dirty partitions).  The old loop drained ONE message and then
             // flushed — a walk over EVERY partition per drained record (256 x
@@ -176,6 +177,14 @@ public:
     void failInFlightBroker(uint16_t errorCode) {
         for (ProducerImpl* impl : active_) {
             if (impl != nullptr) impl->failInFlightBroker(errorCode);
+        }
+    }
+
+    /// Authentication (D26): the session was revoked.  Every producer completes its in-flight batches with
+    /// `errorCode`; a transactional one goes FatalError (nothing is ever re-sent).  Duty thread.
+    void onSessionRevoked(uint16_t errorCode) noexcept {
+        for (ProducerImpl* impl : active_) {
+            if (impl != nullptr) impl->onSessionRevoked(errorCode);
         }
     }
 

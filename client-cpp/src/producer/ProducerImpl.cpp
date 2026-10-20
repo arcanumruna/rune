@@ -3193,20 +3193,39 @@ void ProducerImpl::applyBeginClose(const detail::OpTarget& target, Token token, 
         hooks_.sink.deliver(target, c);
         return;
     }
+    flushAll_ = true;  // nothing more can join a batch: flush every builder at once
+    if (txnOpenForClose_()) {
+        // Phase 2b F Task 5 (FD1): a transaction is open (or a commit / abort / init is running) - end it first
+        // (EndTxn(abort), or wait for the running op), then drain.  Bounded by transactionOpTimeoutMs.
+        LifeEndingTxn e;
+        e.target     = target;
+        e.token      = token;
+        e.deadlineNs = nowNs + txnOpTimeoutNs_();
+        life_        = e;
+        if (!inDuty_) (void)closeDuty(nowNs);
+        return;
+    }
+    (void)beginDrain_(target, token, nowNs);
+}
+
+int ProducerImpl::beginDrain_(const detail::OpTarget& target, Token token, int64_t nowNs) {
     LifeDraining d;
     d.target     = target;
     d.token      = token;
     d.deadlineNs = nowNs + cfg_.deliveryTimeoutMs * 1'000'000LL;
     life_        = d;
-    flushAll_    = true;  // nothing more can join a batch: flush every builder at once
-    if (!inDuty_) (void)closeDuty(nowNs);  // inside a handler: the next hub pass decides
+    flushAll_    = true;
+    return inDuty_ ? 0 : closeDuty(nowNs);  // inside a handler: the next hub pass decides
 }
 
 void ProducerImpl::applyCloseImmediately(OpStatus st, uint16_t errorCode) {
     (void)closeIntake();  // idempotent: the failure path may be the first closer
     if (discarding()) return;
-    const bool         wasDraining = draining();
-    const LifeDraining d = wasDraining ? std::get<LifeDraining>(life_) : LifeDraining{};
+    // A pending begin-close token (draining, or still ending its transaction) completes Closed.
+    const bool   wasDraining = draining() || endingTxn_();
+    LifeDraining d{};
+    if (const auto* dr = std::get_if<LifeDraining>(&life_)) d = *dr;
+    if (const auto* et = std::get_if<LifeEndingTxn>(&life_)) d = LifeDraining{et->target, et->token, et->deadlineNs};
     life_     = LifeDiscarding{st, errorCode};
     flushAll_ = true;
     if (inDuty_) {
@@ -3222,6 +3241,7 @@ void ProducerImpl::applyCloseImmediately(OpStatus st, uint16_t errorCode) {
         return;
     }
     failAllPending(st, errorCode);
+    if (transactional_()) txnDiscard_(st, errorCode);   // left to the coordinator's transaction timeout
     if (wasDraining) {
         Completion c;
         c.token  = d.token;
@@ -3235,6 +3255,7 @@ void ProducerImpl::runPendingFail_() noexcept {
     const PendingFail pf = pendingFail_;
     pendingFail_ = PendingFail{};
     failAllPending(pf.status, pf.errorCode);  // nested DutyScope: inDuty_ is still set
+    if (transactional_()) txnDiscard_(pf.status, pf.errorCode);
     if (pf.hadToken) {
         Completion c;
         c.token  = pf.drain.token;
@@ -3258,6 +3279,7 @@ bool ProducerImpl::fullyDrained_() const noexcept {
 }
 
 int ProducerImpl::closeDuty(int64_t nowNs) {
+    if (endingTxn_()) [[unlikely]] return closeTxnStep_(nowNs);   // Phase 2b F Task 5
     if (!draining()) return 0;
     const LifeDraining d = std::get<LifeDraining>(life_);
     OpStatus st;
@@ -3700,6 +3722,12 @@ void ProducerImpl::expectBrokerId() {
 void ProducerImpl::publishStatus_() noexcept {
     ProducerStatus st;
     st.identityState = static_cast<uint8_t>(identity_.index());
+    st.txnState      = static_cast<uint8_t>(txn_.index());
+    {
+        const TxnState t = txnStateDuty();
+        st.txnActive = (t == TxnState::InTransaction || t == TxnState::CommittingTransaction ||
+                        t == TxnState::AbortingTransaction || t == TxnState::AbortableError) ? 1 : 0;
+    }
     if (const auto* a = std::get_if<IdAssigned>(&identity_)) {
         st.producerId    = a->producerId;
         st.producerEpoch = a->epoch;
@@ -3721,8 +3749,7 @@ int ProducerImpl::identityStepCold_(int64_t nowNs) noexcept {
     if (std::holds_alternative<IdUnassigned>(identity_)) {
         // A transactional producer's id is requested by initTransactions (Task 5), with its transactional id.
         if (!cfg_.transactionalId.empty() || !coord_ || !coord_->connected()) return 0;
-        sendInitProducerId_(nowNs);
-        return std::holds_alternative<IdRequested>(identity_) ? 1 : 0;
+        return sendInitProducerId_(nowNs + std::max<int64_t>(cfg_.produceTimeoutMs, 1) * 1'000'000LL) != nullptr ? 1 : 0;
     }
     if (const auto* f = std::get_if<IdFailed>(&identity_)) {
         // Failed once on entry (onInitAnswer_).  Records accepted since complete the same way - but only
@@ -3741,18 +3768,25 @@ int ProducerImpl::identityStepCold_(int64_t nowNs) noexcept {
     return 0;
 }
 
-void ProducerImpl::sendInitProducerId_(int64_t nowNs) noexcept {
-    CoordinatorLink::Slot* s = coord_->acquire(
-        ReqKind::InitProducerId, nowNs + std::max<int64_t>(cfg_.produceTimeoutMs, 1) * 1'000'000LL);
-    if (s == nullptr) return;   // no free slot: next pass
+CoordinatorLink::Slot* ProducerImpl::sendInitProducerId_(int64_t deadlineNs) noexcept {
+    CoordinatorLink::Slot* s = coord_->acquire(ReqKind::InitProducerId, deadlineNs);
+    if (s == nullptr) return nullptr;   // no free slot: next pass
     rune::protocol::client::InitProducerId m;
-    m.correlationId        = s->corrId;
-    m.transactionTimeoutMs = 0;   // a plain producer has no transaction
-    // transactionalId stays empty: an idempotent-only producer id.
+    m.correlationId = s->corrId;
+    if (!cfg_.transactionalId.empty()) {
+        // initTransactions / the KIP-360 epoch bump (Task 5): the transactional id (<= 255 bytes, Client::producer
+        // validates; a 4096-byte slot frame holds it whole).
+        m.transactionalId      = std::span<const uint8_t>(
+            reinterpret_cast<const uint8_t*>(cfg_.transactionalId.data()), cfg_.transactionalId.size());
+        m.transactionTimeoutMs = cfg_.transactionTimeoutMs;
+    } else {
+        m.transactionTimeoutMs = 0;   // a plain producer has no transaction; an empty id = idempotent-only
+    }
     s->frameLen = static_cast<uint16_t>(m.encode(s->frame.data()));
     coord_->submit(*s);
     identity_ = IdRequested{s};
     publishStatus_();
+    return s;
 }
 
 void ProducerImpl::assignIdentity_(int64_t pid, int16_t epoch) noexcept {
@@ -3802,9 +3836,23 @@ void ProducerImpl::onCoordinatorAnswer(const CoordAnswer& a, int64_t nowNs) noex
     if (!coord_) return;
     CoordinatorLink::Slot* s = coord_->onAnswer(a, nowNs);
     if (s == nullptr) return;
-    if (s->kind == ReqKind::InitProducerId) {
+    // The answer's slot is released only after its machine handled it (and any completion it delivered): a
+    // handler that issues the next op can never be handed this slot while its answer is still being read.
+    switch (s->kind) {
+    case ReqKind::InitProducerId: {
         const auto* r = std::get_if<IdRequested>(&identity_);
-        if (r != nullptr && r->slot == s) onInitAnswer_(a, *s);
+        if (r == nullptr || r->slot != s) break;   // stale
+        if (cfg_.transactionalId.empty()) onInitAnswer_(a, *s);
+        else onTxnInitAnswer_(a, *s, nowNs);     // initTransactions / the KIP-360 bump (Task 5)
+        break;
+    }
+    case ReqKind::EndTxn:
+        onEndTxnAnswer_(a, *s, nowNs);
+        break;
+    case ReqKind::AddPartitions:
+    case ReqKind::AddOffsets:
+    case ReqKind::TxnOffsetCommit:
+        break;   // the data / offsets legs (Tasks 6 / 7)
     }
     coord_->release(*s);
 }
@@ -3812,7 +3860,8 @@ void ProducerImpl::onCoordinatorAnswer(const CoordAnswer& a, int64_t nowNs) noex
 int ProducerImpl::pumpCoordinator(int64_t nowNs) noexcept {
     if (!coord_ || coord_->inUse() == 0) [[likely]] return 0;   // idle link: one load, no slot memory
     return coord_->pump(nowNs, [this](CoordinatorLink::Slot& s) {
-        if (s.kind == ReqKind::InitProducerId) onInitExpired_(s);
+        if (s.kind == ReqKind::InitProducerId && cfg_.transactionalId.empty()) onInitExpired_(s);
+        else onTxnSlotExpired_(s);   // the link releases the slot after this
     });
 }
 

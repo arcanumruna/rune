@@ -3348,7 +3348,7 @@ void Client::onSeedRevoked_(std::string_view text) {
     constexpr uint16_t kRevoked = static_cast<uint16_t>(rune::protocol::client::ErrorCode::SessionRevoked);
     // Every in-flight request: a pending connect, every control op, every unanswered produce batch.
     failAllControlWithCode_(kRevoked, text);
-    producerHub_.failInFlightBroker(kRevoked);
+    producerHub_.onSessionRevoked(kRevoked);   // in-flight batches + Phase 2b F: a transactional producer goes FatalError
     // Every subscription and group consumer of the session.
     (void)subscriberHub_.endAllLive(SubscriptionFailReason::SessionRevoked, kRevoked);
     (void)groupConsumerHub_.revokeAll();

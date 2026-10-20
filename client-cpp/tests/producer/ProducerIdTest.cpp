@@ -391,8 +391,10 @@ TEST(ProducerIdRegression, ALostAnswerIsRequestedAgainAfterTheDeadlineRegression
 TEST(ProducerIdRegression, StatusSnapshotsAreNeverLostWhenTheRingIsFullRegression) {
     Rig r(cfgOf(Acks::Leader));
     // Many transitions (each lost answer = a new request) with the app never draining: the status ring fills
-    // and refuses publishes.
-    for (int round = 0; round < 12; ++round) {
+    // and refuses publishes.  The ring is 4096 bytes of 24-byte records (~170 snapshots, Task 5): more rounds
+    // than that (the precondition below proves the ring really filled).
+    constexpr int kRounds = 4096 / 24 + 32;
+    for (int round = 0; round < kRounds; ++round) {
         r.ticks(1, 1'500 * kMs);
         r.ticks(2, kMs);
     }

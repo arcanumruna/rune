@@ -9,6 +9,7 @@
 #pragma once
 
 #include <rune/client/Completion.h>
+#include <rune/client/detail/OpTarget.h>
 #include <rune/client/producer/TxnTypes.h>
 
 #include <array>
@@ -88,6 +89,11 @@ public:
     [[nodiscard]] Slot* onAnswer(const CoordAnswer& a, int64_t nowNs) noexcept;
     /// Idempotent.
     void release(Slot& s) noexcept;
+    /// Every slot back to Free (a terminal failure: fenced / revoked / closeImmediately - nothing is ever
+    /// offered or re-sent again for them).  Idempotent.
+    void releaseAll() noexcept {
+        for (Slot& s : slots_) release(s);
+    }
     void onCoordinatorMoved() noexcept { ++gen_; }   ///< AwaitCoordinator slots become due
     void onSessionChanged() noexcept;                ///< InFlight -> Unsent (same corrId)
     [[nodiscard]] std::size_t inUse() const noexcept { return live_; }
@@ -132,5 +138,55 @@ struct IdFailed    { OpStatus status = OpStatus::BrokerError; uint16_t errorCode
 using ProducerIdentity = std::variant<IdUnassigned, IdRequested, IdAssigned, IdFailed>;
 inline constexpr std::size_t kIdAssignedIndex = 2;   // index of IdAssigned in ProducerIdentity (static_asserted below)
 static_assert(std::is_same_v<std::variant_alternative_t<kIdAssignedIndex, ProducerIdentity>, IdAssigned>);
+
+// ---- Phase 2b F Task 5: the transaction machine, one state per phase, each holding only its data ----
+// (Declared here, not in TxnTypes.h, for the same reason: the states name CoordinatorLink::Slot.)  Owned by
+// ProducerImpl's duty side; the alternative index IS the TxnState value (static_asserted in ProducerImpl.h).
+// Today's TxnSm booleans became states / enums: started + maybeStarted -> TxnStarted, endSent -> EndSent,
+// bumpEpoch -> AbortKind, ended -> Aborting{started = No, phase = Bumping} (a retried abort re-sends only the
+// bump), opId == 0 (in doubt) -> InDoubt.
+
+/// One pending lifecycle op: where its single completion goes and when it times out.  An EMPTY target (no
+/// handler, no queue) is the close's own abort: its outcome is the close's, never delivered on its own.
+struct TxnOp {
+    detail::OpTarget target{};
+    Token            token      = 0;
+    int64_t          deadlineNs = 0;   ///< absolute duty clock (transactionOpTimeoutMs)
+};
+/// m5 / m13: calls that joined a pending commit / abort complete with it (one EndTxn).  Fixed capacity (zero
+/// allocation): a call beyond it completes BrokerError(19).
+inline constexpr std::size_t kMaxTxnJoiners = 4;
+struct TxnJoiners {
+    std::array<TxnOp, kMaxTxnJoiners> ops{};
+    uint8_t                           n = 0;
+};
+
+struct AwaitData {};                                          ///< EndTxn waits for every record of the txn to be acked
+struct EndSent  { CoordinatorLink::Slot* slot = nullptr; };   ///< EndTxn on the link
+struct InDoubt  {};                                           ///< the op timed out: the app retries the SAME direction (B-2)
+struct Bumping  { CoordinatorLink::Slot* slot = nullptr; };   ///< InitProducerId after EndTxn(abort) (B-3); nullptr = not yet sent
+using EndPhase = std::variant<AwaitData, EndSent, InDoubt, Bumping>;
+
+struct Uninitialized {};
+struct Initializing   { TxnOp op; CoordinatorLink::Slot* slot = nullptr; };   ///< slot nullptr = not yet sent
+struct Ready          {};
+struct InTransaction  { TxnStarted started = TxnStarted::No; };
+struct Committing     { TxnOp op; EndPhase phase = AwaitData{}; TxnStarted started = TxnStarted::No; TxnJoiners joined{}; };
+struct Aborting       {
+    TxnOp      op;
+    EndPhase   phase   = AwaitData{};
+    TxnStarted started = TxnStarted::No;
+    AbortKind  kind    = AbortKind::Plain;
+    TxnJoiners joined{};
+};
+struct AbortableError {
+    OpStatus   status    = OpStatus::BrokerError;
+    uint16_t   errorCode = 0;
+    TxnStarted started   = TxnStarted::No;
+    AbortKind  kind      = AbortKind::Plain;
+};
+struct FatalError     { OpStatus status = OpStatus::Fenced; uint16_t errorCode = 0; };
+using TxnMachine = std::variant<Uninitialized, Initializing, Ready, InTransaction, Committing, Aborting,
+                                AbortableError, FatalError>;
 
 }  // namespace rune::client::producer

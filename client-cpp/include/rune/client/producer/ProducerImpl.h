@@ -462,6 +462,19 @@ enum class RejectReason : uint8_t {
 };
 
 // ---------------------------------------------------------------------------
+// Phase 2b F Task 5: one transaction control op (the kMsgTxnControl payload decoded, Task 8, or an Invoker
+// direct call), applied on the duty thread by ProducerImpl::applyTxnControl.
+// ---------------------------------------------------------------------------
+struct TxnControl {
+    enum class Kind : uint8_t { Init, Begin, SendOffsets, Commit, Abort, Flush };
+    Kind             kind = Kind::Begin;
+    detail::OpTarget target{};   ///< Begin: ignored (beginTransaction() is void; a refused one is counted)
+    Token            token = 0;
+    std::span<const OffsetEntry> offsets{};   ///< SendOffsets (Task 7)
+    std::string_view groupId{};
+};
+
+// ---------------------------------------------------------------------------
 // ProducerImpl
 // ---------------------------------------------------------------------------
 class ProducerImpl {
@@ -524,7 +537,8 @@ public:
     /// Duty side: inside this producer's own duty work (a handler it fired).
     [[nodiscard]] bool inDutyWork() const noexcept { return inDuty_; }
     [[nodiscard]] bool releasable() const noexcept {
-        return !lifeOpen() && !draining() && !inDuty_ && !pendingFail_.armed && fullyDrained_();
+        return !lifeOpen() && !draining() && !endingTxn_() && !inDuty_ && !pendingFail_.armed && !txnHasLiveOp_() &&
+               fullyDrained_();
     }
     /// Registration refused (the Client was closing): no duty side will ever
     /// hold it — the intake is closed, the Client is "closed" for the handle,
@@ -608,6 +622,8 @@ public:
     /// cannot settle a claim it holds, and the open claim's reserved record would
     /// keep the drain waiting until deliveryTimeoutMs.  Abandons it now (its
     /// commit() returns false, nothing is sent).  No-op unless a claim is open.
+    /// Phase 2b F Task 5: also applied when a commit / abort (or close's own abort) ends the transaction - a
+    /// claim open across the end of its transaction never commits into it, nor into the next one.
     void abandonOpenClaimForClose() noexcept;
 
     /// Slow path of the void send: retries until accepted; throws on non-retryable
@@ -1002,6 +1018,9 @@ public:
     /// N-e: the backoff before a retriable error (MinIsrViolation) is re-sent
     /// (Kafka retry.backoff.ms default), capped by produceTimeoutMs.
     static constexpr int64_t kRetriableBackoffNs = 100'000'000LL;
+    /// E2 final fix wave (M3), kept from the transactional producer: a batch answered TransientLogFull (42) is
+    /// re-offered after this much DUTY-CLOCK time (capped by produceTimeoutMs) - never a cycle count.
+    static constexpr int64_t kTransientLogFullBackoffNs = kRetriableBackoffNs;
     /// DR-15 review M1: a Redirect for `corrId` that is not followed (target
     /// unreachable) is still an answer for the in-flight accounting (NEW-4(b)).
     void noteRedirectAnswer(int64_t corrId) noexcept;
@@ -1176,6 +1195,45 @@ public:
     [[nodiscard]] uint64_t coordAnswersSeen() const noexcept { return coordAnswersSeen_; }
     [[nodiscard]] int64_t  lastCoordAnswerCorrId() const noexcept { return lastCoordCorrId_; }
 
+    // ---- Phase 2b F Task 5: the transaction machine (duty thread only; ProducerTxn.cpp) --------------
+    //
+    //   Uninitialized -init-> Initializing{op, slot} -InitProducerId OK-> Ready -begin-> InTransaction{started}
+    //   InTransaction -commit-> Committing{op, phase, started} -EndTxn OK-> Ready
+    //   InTransaction | AbortableError -abort-> Aborting{op, phase, started, kind} -EndTxn OK [-bump OK]-> Ready
+    //   a refused leg / lost data -> AbortableError{status, code, started, kind} (commit completes with it)
+    //   17 / 18, 19 or 45 on EndTxn, a non-retriable InitProducerId, a revoked session -> FatalError (terminal)
+    //
+    // Semantics are the old TransactionalProducerImpl's (Kafka TransactionManager): state gating (begin only in
+    // Ready; commit / sendOffsets only InTransaction; abort in InTransaction / AbortableError; init only
+    // Uninitialized; FatalError: every op completes with its status), misuse completes BrokerError(19), an
+    // unstarted transaction ends locally (B-1), an op timeout leaves Committing / Aborting InDoubt and the SAME
+    // call re-sends EndTxn (B-2), a sequence gap bumps the epoch on abort (B-3), the local state resets only on
+    // EndTxn's final answer.  Every op completes exactly once, bounded by transactionOpTimeoutMs.  Coordinator
+    // requests are acquired only by txnStep (never inside an apply / answer), so a completion handler that
+    // issues the next op never races the slot its answer is still using.
+    void applyTxnControl(const TxnControl& c, int64_t nowNs);
+    [[nodiscard]] TxnState txnStateDuty() const noexcept { return static_cast<TxnState>(txn_.index()); }
+    [[nodiscard]] const TxnMachine& txnMachine() const noexcept { return txn_; }
+    /// One duty pass of the machine (ProducerHub::drainAndFlush, after identityStep): sends the InitProducerId /
+    /// EndTxn / bump that is due, waits for the data, expires op deadlines, decides pending flushes.  A producer
+    /// with nothing pending pays one index compare.
+    int txnStep(int64_t nowNs) noexcept {
+        if (txnQuiet_()) [[likely]] return 0;
+        return txnStepCold_(nowNs);
+    }
+    /// Authentication (D26): the session was revoked - terminal.  In-flight batches complete BrokerError
+    /// `errorCode`; a transactional producer goes FatalError(BrokerError, errorCode): every pending op completes
+    /// with it and no coordinator request is ever sent or re-sent.  Duty thread.
+    void onSessionRevoked(uint16_t errorCode) noexcept;
+    /// beginTransaction() calls the machine refused (outside Ready): counted, no side effect.
+    [[nodiscard]] uint64_t txnRefusedBegins() const noexcept { return txnRefusedBegins_; }
+    /// Test seams (duty thread): the data / offsets legs of Tasks 6 / 7 drive these through the same paths.
+    void testMarkStarted(TxnStarted s = TxnStarted::Yes) noexcept { markStarted_(s); }
+    void testPoison(OpStatus st, uint16_t errorCode, AbortKind kind) noexcept { poison_(st, errorCode, kind); }
+    /// A transaction leg (AddPartitions / AddOffsets / TxnOffsetCommit) answered `errorCode`, as the link hands
+    /// it over (Retry / Rediscover never reach the machine).
+    void testLegAnswer(ReqKind kind, int16_t errorCode) noexcept { onTxnLegAnswer_(kind, errorCode); }
+
     /// Total Aeron frames offered to transport (agent-thread only; plain uint64_t).
     uint64_t framesSent()  const noexcept { return framesSent_; }
 
@@ -1194,7 +1252,13 @@ public:
     }
 
     /// FD9: the latest identity the duty thread published (ONE app thread; drains the status ring).
-    struct ProducerStatus { int64_t producerId = -1; int16_t producerEpoch = -1; uint8_t identityState = 0; };
+    struct ProducerStatus {
+        int64_t producerId    = -1;
+        int16_t producerEpoch = -1;
+        uint8_t identityState = 0;
+        uint8_t txnState      = 0;   ///< TxnState (Task 5)
+        uint8_t txnActive     = 0;   ///< 1: InTransaction / Committing / Aborting / AbortableError
+    };
     /// BOUND THREAD ONLY (the creating thread, or bindBatchThread()'s): the cache and the ring's consumer side
     /// belong to it.  Any other thread gets -1 and touches nothing (a single-consumer ring must not be drained
     /// by two threads).
@@ -1207,6 +1271,17 @@ public:
         if (!onBatchThread()) return -1;
         drainStatus_();
         return appStatus_.producerEpoch;
+    }
+    /// FD9 (bound thread only; elsewhere Uninitialized / false, nothing touched).
+    [[nodiscard]] TxnState appTxnState() noexcept {
+        if (!onBatchThread()) return TxnState::Uninitialized;
+        drainStatus_();
+        return static_cast<TxnState>(appStatus_.txnState);
+    }
+    [[nodiscard]] bool appTxnActive() noexcept {
+        if (!onBatchThread()) return false;
+        drainStatus_();
+        return appStatus_.txnActive != 0;
     }
 
     /// Test-only seam (F5 regression coverage): force the current epoch so a
@@ -1630,14 +1705,17 @@ private:
     ProducerIdentity identity_ = IdAssigned{kRigProducerId, 0};
     [[nodiscard]] IdAssigned& assigned_() noexcept { return *std::get_if<IdAssigned>(&identity_); }
     int  identityStepCold_(int64_t nowNs) noexcept;
-    void sendInitProducerId_(int64_t nowNs) noexcept;
+    /// InitProducerId into a fresh slot (transactional: the transactional id + transactionTimeoutMs; plain: an
+    /// empty id), identity -> IdRequested.  nullptr when no slot is free (the caller retries next pass).
+    CoordinatorLink::Slot* sendInitProducerId_(int64_t deadlineNs) noexcept;
     void onInitAnswer_(const CoordAnswer& a, CoordinatorLink::Slot& s) noexcept;
     void onInitExpired_(CoordinatorLink::Slot& s) noexcept;
     void assignIdentity_(int64_t pid, int16_t epoch) noexcept;
     void restampInflight_(PartitionState& ps) noexcept;
     void publishStatus_() noexcept;
     void drainStatus_() noexcept { statusRing_.drainLatest(appStatus_); }
-    detail::StatusRing<ProducerStatus, 256> statusRing_;
+    // 4096 bytes (~170 snapshots): every identity AND transaction transition publishes one (FD9).
+    detail::StatusRing<ProducerStatus, 4096> statusRing_;
     ProducerStatus appStatus_{};   // the bound app thread's cache (it alone drains the ring)
     // Duty side: is the newest snapshot in the ring?  A refused tryPublish keeps the snapshot here and it is
     // re-offered from cold points (sweepTimedOut / the identity step) until accepted; only the newest matters.
@@ -1645,6 +1723,63 @@ private:
     struct StatusPending { ProducerStatus snap{}; };
     std::variant<StatusSynced, StatusPending> statusSync_{};
     void retryStatus_() noexcept;
+
+    // ---- Phase 2b F Task 5: the transaction machine (duty thread only; ProducerTxn.cpp) ----------------
+    static constexpr std::size_t kInitializingIdx = static_cast<std::size_t>(TxnState::Initializing);
+    static constexpr std::size_t kCommittingIdx   = static_cast<std::size_t>(TxnState::CommittingTransaction);
+    static constexpr std::size_t kAbortingIdx     = static_cast<std::size_t>(TxnState::AbortingTransaction);
+    /// Pending flush(target, token) ops: a compact prefix [0, txnFlushN_) (zero allocation; one more completes
+    /// BrokerError(19)).
+    static constexpr std::size_t kMaxTxnFlushes = 8;
+    TxnMachine                          txn_{Uninitialized{}};
+    std::array<TxnOp, kMaxTxnFlushes>   txnFlushes_{};
+    uint8_t                             txnFlushN_        = 0;
+    uint64_t                            txnRefusedBegins_ = 0;
+    [[nodiscard]] bool transactional_() const noexcept { return !cfg_.transactionalId.empty(); }
+    [[nodiscard]] int64_t txnOpTimeoutNs_() const noexcept {
+        return (cfg_.transactionOpTimeoutMs > 0 ? cfg_.transactionOpTimeoutMs : 1) * 1'000'000LL;
+    }
+    [[nodiscard]] bool txnQuiet_() const noexcept {
+        const std::size_t i = txn_.index();
+        return txnFlushN_ == 0 && i != kInitializingIdx && i != kCommittingIdx && i != kAbortingIdx;
+    }
+    /// A txn op (or flush) still owes its completion: the producer is not releasable before it is decided.
+    [[nodiscard]] bool txnHasLiveOp_() const noexcept;
+    int  txnStepCold_(int64_t nowNs) noexcept;
+    int  endStep_(int64_t nowNs) noexcept;
+    int  flushStep_(int64_t nowNs) noexcept;
+    /// Every record the producer accepted has completed (builders, Tier-2, in flight, deferred).  The ring is
+    /// NOT consulted: records ahead of a control op in the ring were drained before it applied (FD1).
+    [[nodiscard]] bool txnDataSettled_() const noexcept;
+    void completeTxn_(const TxnOp& op, OpKind kind, OpStatus st, uint16_t errorCode, std::string_view text,
+                      int64_t value = 0, int64_t aux = 0) noexcept;
+    void completeJoined_(const TxnJoiners& j, OpKind kind, OpStatus st, uint16_t errorCode,
+                         std::string_view text) noexcept;
+    void refuseTxn_(const TxnControl& c, OpStatus st, uint16_t errorCode, std::string_view text) noexcept;
+    void markStarted_(TxnStarted s) noexcept;
+    void poison_(OpStatus st, uint16_t errorCode, AbortKind kind) noexcept;
+    void onTxnLegAnswer_(ReqKind kind, int16_t errorCode) noexcept;
+    void enterFatal_(OpStatus st, uint16_t errorCode, std::string_view text) noexcept;
+    /// EndTxn's final OK (or an unstarted transaction): the epoch bump first when required, else Ready.
+    void endDone_(int64_t nowNs) noexcept;
+    /// Committing / Aborting -> Ready; the op and its joiners complete Ok.
+    void finishTxn_() noexcept;
+    /// The pending end op's deadline: InDoubt, the op completes Timeout.  `releaseSlot`: false when the link
+    /// itself expired the slot (it releases it afterwards).
+    void endExpired_(bool releaseSlot) noexcept;
+    void initExpired_(bool releaseSlot) noexcept;
+    void onTxnSlotExpired_(CoordinatorLink::Slot& s) noexcept;
+    void onTxnInitAnswer_(const CoordAnswer& a, CoordinatorLink::Slot& s, int64_t nowNs) noexcept;
+    void onEndTxnAnswer_(const CoordAnswer& a, CoordinatorLink::Slot& s, int64_t nowNs) noexcept;
+    /// closeImmediately on a transactional producer: every pending txn op / flush completes `st`, every slot is
+    /// released, nothing more is sent (the coordinator's transaction timeout aborts an open transaction).
+    void txnDiscard_(OpStatus st, uint16_t errorCode) noexcept;
+    /// close(): the open transaction is aborted (or the running op waited for) before the drain.
+    [[nodiscard]] bool txnOpenForClose_() const noexcept;
+    int  closeTxnStep_(int64_t nowNs) noexcept;
+    void startCloseAbort_(int64_t nowNs) noexcept;
+    void finishTxnClose_(OpStatus st, uint16_t errorCode) noexcept;
+    int  beginDrain_(const detail::OpTarget& target, Token token, int64_t nowNs);
     // EOS follow-ups: +1 per frame offer (first send or re-send) — orders sends
     // against answers without clocks (fast retransmit; OOS-vs-ack ordering).
     uint64_t sendTick_ = 0;
@@ -1684,7 +1819,19 @@ private:
         OpStatus status    = OpStatus::Closed;
         uint16_t errorCode = 0;   // authentication (D26): BrokerError + SessionRevoked for a revoked session
     };
-    std::variant<LifeOpen, LifeDraining, LifeClosed, LifeDiscarding> life_{};
+    // Phase 2b F Task 5: close() of a transactional producer with a transaction open (or an op running) ends it
+    // first - its own EndTxn(abort), or the running commit / abort / init - then drains as LifeDraining.
+    struct CloseAbortNone {};
+    struct CloseAbortRunning {};
+    struct CloseAbortDone { OpStatus status = OpStatus::Ok; uint16_t errorCode = 0; };
+    struct LifeEndingTxn {
+        detail::OpTarget target{};
+        Token            token      = 0;
+        int64_t          deadlineNs = 0;   ///< transactionOpTimeoutMs
+        std::variant<CloseAbortNone, CloseAbortRunning, CloseAbortDone> own{};
+    };
+    std::variant<LifeOpen, LifeDraining, LifeClosed, LifeDiscarding, LifeEndingTxn> life_{};
+    [[nodiscard]] bool endingTxn_() const noexcept { return std::holds_alternative<LifeEndingTxn>(life_); }
     // Duty side: the intake is closed and the duty side knows it (Draining /
     // Closed / Discarding) — every pass flushes at once (no linger: nothing
     // more can join a batch).
@@ -1835,5 +1982,16 @@ private:
     bool settleDeferredFor_(int32_t topicId, int32_t partition) noexcept;
     void noteDeferredLoss_(const char* what) noexcept;
 };
+
+// Phase 2b F Task 5: the machine's alternative index IS the TxnState value.
+static_assert(std::variant_size_v<TxnMachine> == static_cast<std::size_t>(TxnState::FatalError) + 1,
+              "TxnState is the machine's index");
+static_assert(std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>(TxnState::Initializing), TxnMachine>, Initializing>);
+static_assert(std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>(TxnState::Ready), TxnMachine>, Ready>);
+static_assert(std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>(TxnState::InTransaction), TxnMachine>, InTransaction>);
+static_assert(std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>(TxnState::CommittingTransaction), TxnMachine>, Committing>);
+static_assert(std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>(TxnState::AbortingTransaction), TxnMachine>, Aborting>);
+static_assert(std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>(TxnState::AbortableError), TxnMachine>, AbortableError>);
+static_assert(std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>(TxnState::FatalError), TxnMachine>, FatalError>);
 
 } // namespace rune::client::producer

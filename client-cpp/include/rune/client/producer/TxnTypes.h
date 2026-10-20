@@ -41,6 +41,16 @@ inline constexpr int64_t kTagMask = int64_t{0x1F} << 58;
 
 enum class ReqKind : uint8_t { InitProducerId, AddPartitions, AddOffsets, TxnOffsetCommit, EndTxn };
 
+// ---- Phase 2b F Task 5: the transaction machine's per-state facts (the old TxnSm booleans as enums) ----
+
+/// B-1 (Kafka transactionStarted): did the coordinator see this transaction?  No = nothing was ever added (it
+/// ends locally, no EndTxn); Maybe = a leg was sent but never answered (m15: abort sends EndTxn(abort) and a 19
+/// then means "nothing open"); Yes = an AddPartitions / AddOffsets was acknowledged OK.
+enum class TxnStarted : uint8_t { No, Maybe, Yes };
+/// B-3 (KIP-360): a sequence gap (a lost batch) makes the abort bump the epoch (InitProducerId after
+/// EndTxn(abort)) and restart every sequence.
+enum class AbortKind : uint8_t { Plain, BumpEpoch };
+
 /// Coordinator answer, decoded (the link never interprets kind-specific bodies beyond errorCode).
 /// `anyKind`: an ErrorResponse - it matches whichever request owns `corrId`.
 struct CoordAnswer {
