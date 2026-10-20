@@ -45,6 +45,13 @@ static int64_t envI64(const char* n, int64_t d) {
     const char* v = std::getenv(n); return (v && *v) ? std::atoll(v) : d;
 }
 
+// true if add() refused the record (pool exhausted); the older void add() never refuses.
+template <class B>
+static bool addRefused(B& bb, std::span<const uint8_t> v) {
+    if constexpr (std::is_void_v<decltype(bb.add(v))>) { bb.add(v); return false; }
+    else return bb.add(v) != OpResult::Accepted;
+}
+
 int main() {
     const int64_t N          = envI64("ACCUM_RECORDS", 5'000'000);
     const int32_t valueBytes = (int32_t)envI64("ACCUM_VALUE_BYTES", 256);
@@ -130,9 +137,7 @@ int main() {
                 BatchBuilder bb(&impl, topicId, part);
                 bool full = false;
                 for (int32_t r = 0; r < t2Recs && !full; ++r) {
-                    using R = decltype(bb.add(std::span<const uint8_t>(val)));
-                    if constexpr (std::is_void_v<R>) bb.add(std::span<const uint8_t>(val));
-                    else full = bb.add(std::span<const uint8_t>(val)) != OpResult::Accepted;
+                    full = addRefused(bb, std::span<const uint8_t>(val));
                 }
                 if (!full && bb.send() == OpResult::Accepted) break;
                 std::this_thread::yield();
