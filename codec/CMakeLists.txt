@@ -148,7 +148,8 @@ add_executable(rune_codec_tests
     tests/DecodeBoundaryMatrixTest.cpp
     tests/GeneratedKeyTest.cpp
     tests/FlyweightTest.cpp
-    tests/FlyweightGeneratedRoundTripTest.cpp)
+    tests/FlyweightGeneratedRoundTripTest.cpp
+    tests/FilterWireTest.cpp)
 target_include_directories(rune_codec_tests PRIVATE
     "${CMAKE_CURRENT_BINARY_DIR}/tests")
 target_link_libraries(rune_codec_tests PRIVATE rune_codec GTest::gtest_main)
