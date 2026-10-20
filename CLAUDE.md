@@ -172,6 +172,7 @@ the repo, issues or commits.
   is urgent (a hang, silent loss or a security hole) is fixed at once in its own task. Any other break becomes a labeled
   GitHub issue whose body carries the failing test as its repro; that test stays out of the suite until the issue is
   fixed, so the suite stays green.
+  The full playbook (mindset, attack classes, test rules) is `docs/adversarial-review.md`.
 - Commit messages end with the session's `Co-Authored-By:` trailer.
 - **No secrets in the repo:** no emails, passwords, tokens, keys, IPs or local paths. Everything sensitive comes from
   the environment.
