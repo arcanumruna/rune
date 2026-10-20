@@ -115,3 +115,22 @@ TEST(ProducerAllocRegression, AcksNoneVoidSteadyStateAllocatesNothingRegression)
     EXPECT_EQ(allocs, 0L) << "acks=None void steady state must not allocate";
     EXPECT_FALSE(impl.hasInFlight());
 }
+
+// Phase 2b F Task 13 (seeded txn stress): a claim reserves room for its record first
+// (ProduceFrameBuilder::reserveExtra) - an EXACT vector::reserve, so while a builder grew past its high-water
+// mark (a partition held for its AddPartitionsToTxn, or a session down) every claim reallocated and copied the
+// whole builder: O(records) allocations instead of amortized geometric growth.  1000 claim-style appends into one
+// builder must now allocate O(log n) times.
+TEST(ProduceFrameBuilderAllocRegression, ReserveExtraGrowsGeometricallyNotOncePerClaimRegression) {
+    rune::client::producer::ProduceFrameBuilder b(0, kNow);
+    const std::string key = "k";
+    constexpr int kRecords = 1000;
+    alloc_counter::startThisThread();
+    for (int i = 0; i < kRecords; ++i) {
+        b.reserveExtra(key.size() + 24 + rune::client::producer::ProduceFrameBuilder::kRecordOverheadMax);
+        (void)b.reserveRecord(key, 24, kNow);
+    }
+    const long allocs = alloc_counter::stopThisThread();
+    EXPECT_EQ(b.recordCount(), kRecords);
+    EXPECT_LE(allocs, 16) << "reserveExtra reallocated " << allocs << " times for " << kRecords << " claims";
+}

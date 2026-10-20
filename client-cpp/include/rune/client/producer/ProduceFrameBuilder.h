@@ -28,6 +28,7 @@
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/MessageHeader.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -101,7 +102,12 @@ public:
 
     /// Capacity for `n` more bytes: appends / reservations within it never
     /// reallocate (so they never throw and data() never moves).
-    void reserveExtra(std::size_t n) { frame_.reserve(frame_.size() + n); }
+    /// Grows geometrically (an exact reserve would reallocate - and copy the whole builder - on EVERY claim while
+    /// a held builder grows past its high-water mark); capacity persists across batches (reset() keeps it).
+    void reserveExtra(std::size_t n) {
+        const std::size_t need = frame_.size() + n;
+        if (need > frame_.capacity()) frame_.reserve(std::max(need, 2 * frame_.capacity()));
+    }
 
     /// A point to roll back to (an aborted / abandoned claim).
     struct Mark {
