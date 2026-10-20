@@ -178,12 +178,47 @@ TEST(PlanCompilerAggregateRegression, SumDeclaredWithSourceTypeIsRejected) {
     EXPECT_EQ(r.error().message.find("key"), std::string::npos) << "must not classify as KeyInvalid";
 }
 
-TEST(PlanCompilerAggregateRegression, MinMaxLastAreRejectedUntilPhase2b) {
-    for (R rule : {R::Min, R::Max, R::Last}) {
-        auto r = compileAgg(aggPlan({{"x", P::Int32, 0, "amount", rule}}));
-        ASSERT_FALSE(r.has_value());
-        EXPECT_NE(r.error().message.find("Phase 2b"), std::string::npos) << r.error().message;
-    }
+TEST(PlanCompilerAggregateRegression, MinMaxLastLastNonNullCompileWithSourceOutputTypes) {
+    auto r = compileAgg(aggPlan({{"mx", P::Int32, 0, "amount", R::Max},
+                                 {"mn", P::UInt32, 0, "qty", R::Min},
+                                 {"mxp", P::Float64, 0, "price", R::Max},
+                                 {"lastNote", P::Bool, 0, "note", R::Last},
+                                 {"lnn", P::Int32, 0, "amount", R::LastNonNull}}));
+    ASSERT_TRUE(r.has_value()) << r.error().message;
+    const auto& out = r->plan.output;
+    ASSERT_EQ(out.size(), 6u);
+    EXPECT_EQ(out[1].rule, R::Max);         EXPECT_EQ(out[1].type, P::Int32);
+    EXPECT_EQ(out[2].rule, R::Min);         EXPECT_EQ(out[2].type, P::UInt32);
+    EXPECT_EQ(out[3].type, P::Float64);
+    EXPECT_EQ(out[4].rule, R::Last);        EXPECT_EQ(out[4].type, P::Bool);
+    EXPECT_EQ(out[5].rule, R::LastNonNull); EXPECT_EQ(out[5].type, P::Int32);
+}
+
+TEST(PlanCompilerAggregateRegression, MinOverNonNumericIsRejected) {
+    auto r = compileAgg(aggPlan({{"x", P::Bool, 0, "note", R::Min}}));
+    ASSERT_FALSE(r.has_value());
+    EXPECT_NE(r.error().message.find("numeric"), std::string::npos) << r.error().message;
+    EXPECT_EQ(r.error().message.find("key"), std::string::npos) << "must not classify as KeyInvalid";
+}
+
+TEST(PlanCompilerAggregateRegression, MaxDeclaredWithAWidenedTypeIsRejected) {
+    auto r = compileAgg(aggPlan({{"x", P::Int64, 0, "amount", R::Max}}));   // amount is Int32
+    ASSERT_FALSE(r.has_value());
+    EXPECT_NE(r.error().message.find("produces Int32"), std::string::npos) << r.error().message;
+    EXPECT_EQ(r.error().message.find("key"), std::string::npos);
+}
+
+TEST(PlanCompilerAggregateRegression, LastOverFixedStrCarriesTheSourceWidth) {
+    const auto src = rune::codec::DescriptorBuilder("order", 1)
+                         .add("orderId", P::Int64, 1, /*isKey*/ true)
+                         .add("userId", P::Int64)
+                         .addFixedStr("sku", 6)
+                         .build();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto r = rune::view::compileView(aggPlan({{"lastSku", P::FixedStr, 0, "sku", R::Last}}), srcs, 77);
+    ASSERT_TRUE(r.has_value()) << r.error().message;
+    EXPECT_EQ(r->plan.output[1].type, P::FixedStr);
+    EXPECT_EQ(r->rowLayout.slotWidth[1], 6u);
 }
 
 TEST(PlanCompilerAggregateRegression, CountAllWithSourceFieldIsRejected) {

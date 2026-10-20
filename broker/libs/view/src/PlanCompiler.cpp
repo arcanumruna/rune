@@ -49,13 +49,14 @@ bool requiresNumeric(MergeRule rule) {
 }
 
 bool isAggregateRule(MergeRule r) {
-    return r == MergeRule::Count || r == MergeRule::CountAll || r == MergeRule::Sum ||
-           r == MergeRule::Avg;
-}
-
-bool isPhase2bRule(MergeRule r) {
-    return r == MergeRule::Min || r == MergeRule::Max || r == MergeRule::Last ||
-           r == MergeRule::LastNonNull;
+    switch (r) {
+        case MergeRule::Count: case MergeRule::CountAll: case MergeRule::Sum: case MergeRule::Avg:
+        case MergeRule::Min: case MergeRule::Max: case MergeRule::Last: case MergeRule::LastNonNull:
+            return true;
+        case MergeRule::Replace:
+            return false;
+    }
+    return false;
 }
 
 const char* primName(rune::codec::PrimType t) {
@@ -64,12 +65,16 @@ const char* primName(rune::codec::PrimType t) {
         case P::Int32: return "Int32";   case P::Int64: return "Int64";
         case P::UInt16: return "UInt16"; case P::UInt32: return "UInt32";
         case P::UInt64: return "UInt64"; case P::Float64: return "Float64";
-        default: return "a non-numeric type";
+        case P::Bool: return "Bool";     case P::Enum: return "Enum";
+        case P::FixedStr: return "FixedStr";
+        case P::String: return "String"; case P::Bytes: return "Bytes";
     }
+    return "an unknown type";
 }
 
 // The output type an aggregate rule produces from a source field of type `src`
 // (Global Constraints: fixed by rule, never cast). nullopt = not aggregatable.
+// Callers have already rejected var-len sources and non-numeric Min/Max.
 std::optional<rune::codec::PrimType> aggregateOutputType(MergeRule r, rune::codec::PrimType src) {
     using P = rune::codec::PrimType;
     switch (r) {
@@ -83,8 +88,13 @@ std::optional<rune::codec::PrimType> aggregateOutputType(MergeRule r, rune::code
                 case P::Float64:                                 return P::Float64;
                 default:                                         return std::nullopt;
             }
-        default: return std::nullopt;
+        case MergeRule::Min:
+        case MergeRule::Max:      return isNumeric(src) ? std::optional<P>(src) : std::nullopt;
+        case MergeRule::Last:
+        case MergeRule::LastNonNull: return src;
+        case MergeRule::Replace:  return std::nullopt;
     }
+    return std::nullopt;
 }
 
 // Per-output-field resolution result, carried between the resolve pass and
@@ -139,11 +149,6 @@ std::expected<CompileResult, CompileError> compileView(
     resolved.reserve(authored.output.size());
 
     for (const auto& af : authored.output) {
-        if (isPhase2bRule(af.rule)) {
-            return std::unexpected(CompileError{
-                "view '" + authored.viewName + "': output field '" + af.name +
-                "' uses Min/Max/Last, which are not supported until Phase 2b"});
-        }
         if (af.rule == MergeRule::CountAll) {
             if (!af.srcField.empty()) {
                 return std::unexpected(CompileError{
@@ -311,7 +316,8 @@ std::expected<CompileResult, CompileError> compileView(
             if (i != keyOutIdx && authored.output[i].rule == MergeRule::Replace) {
                 return std::unexpected(CompileError{
                     "view '" + authored.viewName + "': column '" + authored.output[i].name +
-                    "' in an aggregate view must be an aggregate (Count, Count(*), Sum, Avg); "
+                    "' in an aggregate view must be an aggregate (Count, Count(*), Sum, Avg, "
+                    "Min, Max, Last, LastNonNull); "
                     "only the group-by column may use Replace"});
             }
         }
