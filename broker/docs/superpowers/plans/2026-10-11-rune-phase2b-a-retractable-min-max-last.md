@@ -2,12 +2,19 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Updated 2026-10-20 (plan refresh after D/B/F, monorepo)** — re-checked against the monorepo (`/Users/vradu/Projects/rune`, branch `feat/phase2b-a-retractable-min-max-last`, cut from main `a739aab5`) by the Part A preflight (`.superpowers/sdd/2026-10-11-rune-phase2b-a-retractable-min-max-last/preflight.md`; the controller accepted every ruling). Changes:
+> 1. **Monorepo paths:** one repo, one branch. Every path is relative to the repo root: `libs/…` is `broker/libs/…`, `rune-client-cpp/…` is `client-cpp/…`, `docker/…` is `broker/docker/…`, `benchmark/…` is `broker/benchmark/…`, `../rune-codec` is `codec`. The two-repo branch cut and the two-repo commits are gone.
+> 2. **Build dirs and commands:** `build-fast` is `build/root`; `build-bench-rel` is `build/rel` (binary `build/rel/broker/rune_broker_benchmark`; `build/bench-rel` is the client's); `rune-client-cpp/build` is `build/sub-client-cpp`; CatalogGolden runs in `build/sub-codec`. No ASan/TSan builds exist, so the controller runs the sanitizers once at the Phase 2b close. Per-task test runs are affected-area only (F13).
+> 3. **Stale line hints fixed (S7–S11):** client CMake `1046–1051`; `broker/libs/view/CMakeLists.txt:21–26` (`PlanSourcesTest.cpp` now follows `AggFoldTest.cpp`, so the closing `)` stays where it is); `view_probe.cpp` setup call 1275–1276 and verify block 1456–1465; e2e banner `view-engine-e2e.sh:583–584`. Task 7 also builds `rune_get_view_row_tests` and `rune_create_view_tests` (S9). The VM e2e stages the monorepo plus a sibling `flight-recorder` (S12) and is controller-run.
+> 4. **Preflight rulings folded into the tasks:** F1 (client `deserializeAuthored` bound and round-trip test, Task 1), F2 (`isPhase2bRule` fail-closed, Task 1), F3 (bisect note, Execution context), F4 (the bench gate runs right after Task 5), F5 and F11 (API doc and release-note steps, Task 9), F6 (golden bytes, Task 3), F7 (intentional test duplication, Task 5), F8 (`RetractMode` enum, Task 5), F9 (*Interaction matrix* section and the extended model test, Task 6), F10 (shared bench helper, Task 8), and the e2e-header fix (Task 9 Step 4).
+> 5. **New decision AD3 (F12):** spec §A Storage's "source field's width" applies to `Last`/`LastNonNull` inputs only; Spec questions Q1–Q8 are ruled as written.
+
 > **Updated 2026-10-19** — re-checked against the code after catalog history (`feat/catalog-history`, broker `c50b06cd`) and the authentication plan; A now runs **last** (order auth → D → B → F → A). Changes:
 > 1. **Branch base:** cut from the integration tip after Part F merged (was `feature/materialized-views`). rune-codec is the `feat/catalog-history` lineage (it now also holds `rune_catalog` / `rune_security`).
-> 2. **The broker view code is unchanged since 2a** apart from `WorkerViewSet` (catalog `uninstallView`, transient-source cursor reconciliation): every `libs/view` line hint below was re-verified and holds. Stale hints fixed: `ViewPlanAuthor.h` enum (now line 46, comment 40–45), client `CMakeLists.txt` `rune_schema_codec_smoke_tests` (now 918–922), `WorkerViewSet.cpp` `maxRecordsPerPassFor` (comment 132–135, function 136), `view_probe.cpp` and `view-engine-e2e.sh` (now anchored by text, not line numbers — both files grew).
+> 2. **The broker view code is unchanged since 2a** apart from `WorkerViewSet` (catalog `uninstallView`, transient-source cursor reconciliation): every `broker/libs/view` line hint below was re-verified and holds. Stale hints fixed: `ViewPlanAuthor.h` enum (now line 46, comment 40–45), client `CMakeLists.txt` `rune_schema_codec_smoke_tests` (was 918–922 on 2026-10-19; now `client-cpp/CMakeLists.txt:1046-1051`), `WorkerViewSet.cpp` `maxRecordsPerPassFor` (comment 132–135, function 136), `view_probe.cpp` and `view-engine-e2e.sh` (now anchored by text, not line numbers — both files grew).
 > 3. **Test dirs:** `WorkerViewSetTest.cpp` now uses the per-process `tmpDir("…")` helper (fix c506bccf); Task 7's tests use it instead of fixed `/tmp/rune-views-*` paths (two concurrent runs would share a checkpoint dir).
 > 4. **Views are created through `__catalog`:** `createViewAndWait` is a catalog DDL (Redirect / NotLeader followed by the client); the `CreateView` event stores the authored plan (`normalizedPlanBlob`, fingerprinted) and the leader's `compiledPlanBlob`, and every broker installs the view from the applied event. Nothing in A changes the event or fingerprint format: the new rule byte 8 and the Min/Max/Last outputs are plan *content*. The e2e's `CATALOG_NAMES` list already contains `user_totals`.
-> 5. **Auth interactions:** no new request type. `CreateView` needs `CREATE VIEW` + `READ` on the source (auth D19), `GetViewRow` needs `READ VIEW`; the auth phase's Task 20 already runs `view-engine-e2e.sh` authenticated (`docker/lib/auth.sh`, `RUNE_USER` / `RUNE_PASSWORD_FILE` passed to the probe) — Task 9 keeps that wiring and adds nothing.
+> 5. **Auth interactions:** no new request type. `CreateView` needs `CREATE VIEW` + `READ` on the source (auth D19), `GetViewRow` needs `READ VIEW`; the auth phase's Task 20 already runs `view-engine-e2e.sh` authenticated (`broker/docker/lib/auth.sh`, `RUNE_USER` / `RUNE_PASSWORD_FILE` passed to the probe) — Task 9 keeps that wiring and adds nothing.
 > 6. **The e2e run** uses the `rsync` + `flock /root/vm.lock` form the other 2026-10 plans use (the old "git archive into /root/view-engine-e2e, rune-fr" staging is gone).
 > 7. New decision **AD1** and spec gap **G1** (mixed-version brokers) — see *Decisions* below.
 
@@ -15,26 +22,26 @@
 
 **Architecture:** Only views that use one of the four rules are **linked**. In a linked view, each contributor row gains `[prev u64][next u64]` links that form a doubly linked MRU list of the group's contributors, keyed by contributor key (`kNoContributor = UINT64_MAX`). Each group row gains `[head u64]` plus, per `Min`/`Max` field, a cached `[value 8B][state u8]`. `Last` is the head's value and `LastNonNull` is the first non-null value walking from the head. `Min`/`Max` come from the cache, and the fold walks the list once only when the cached extreme is retracted. Links, heads and caches live in the contributor and group tables that the 2a v2 multi-table checkpoint already persists, so recovery does not change. The per-pass delta cap's worst case per record grows from 5 to 8 dirty entries for linked views; the plan derives that bound exactly and a test pins it.
 
-**Tech Stack:** C++23 (clang, `__int128`), GoogleTest, Google Benchmark, CMake/Ninja (`build-fast`), docker e2e on the k3s VM.
+**Tech Stack:** C++23 (clang, `__int128`), GoogleTest, Google Benchmark, CMake/Ninja (`build/root`), docker e2e on the k3s VM.
 
-**Spec:** `docs/superpowers/specs/2026-10-11-rune-phase2b-design.md` §A (binding). Parent: `docs/superpowers/specs/2026-10-08-rune-view-engine-single-source-design.md` §6 (aggregate table), §6.4 (nulls), §9.2 (aux state is checkpointed), §14.0 (latency gates).
+**Spec:** `broker/docs/superpowers/specs/2026-10-11-rune-phase2b-design.md` §A (binding). Parent: `broker/docs/superpowers/specs/2026-10-08-rune-view-engine-single-source-design.md` §6 (aggregate table), §6.4 (nulls), §9.2 (aux state is checkpointed), §14.0 (latency gates).
 
-**Builds on:** Phase 2a plan `docs/superpowers/plans/2026-10-11-rune-view-engine-phase2a-invertible-aggregates.md` (landed: `AggState`, `foldAggregateBatch`, v2 checkpoint, `AggInstance`, per-pass cap, `BM_ViewFoldAggregate`, `user_totals` e2e).
+**Builds on:** Phase 2a plan `broker/docs/superpowers/plans/2026-10-11-rune-view-engine-phase2a-invertible-aggregates.md` (landed: `AggState`, `foldAggregateBatch`, v2 checkpoint, `AggInstance`, per-pass cap, `BM_ViewFoldAggregate`, `user_totals` e2e).
 
 ## Execution context
 
-- **Repos:** broker and client only. Use the canonical sibling layout under `~/Projects/se-worktrees/` (`rune-broker`, `rune-client-cpp`, and `../rune-codec` on `feat/schema-evolution-durable-tags`, which the broker CMake requires).
-- **Branches:** cut `feat/phase2b-a-retractable-min-max-last` from each repo's integration tip **after Part F merged** (`<F-tip>` below = that branch, e.g. `feat/phase2b-f-unified-producer` or wherever F was merged):
-  ```bash
-  git -C ~/Projects/se-worktrees/rune-broker switch -c feat/phase2b-a-retractable-min-max-last <F-tip>
-  git -C ~/Projects/se-worktrees/rune-client-cpp switch -c feat/phase2b-a-retractable-min-max-last <F-tip>
-  ```
-  Verify: `grep -n "uninstallView" libs/node/src/WorkerViewSet.cpp` and `grep -n "kCatalogTopicId" libs/node/include/rune/node/CatalogPartition.h` both hit (catalog history is in).
-  All broker paths below are relative to `~/Projects/se-worktrees/rune-broker`. Client paths are prefixed `rune-client-cpp/` and are relative to `~/Projects/se-worktrees/`.
-- **Broker builds:** `build-fast` (Ninja, Debug, `BUILD_TESTING=ON`, already configured). Benchmarks use `build-bench-rel` (Ninja, `-O3 -DNDEBUG`, `BUILD_BENCHMARKS=ON`, already configured). If either directory is missing, configure it with `cmake -S . -B build-fast -G Ninja -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON -DCMAKE_TOOLCHAIN_FILE=build/Debug/generators/conan_toolchain.cmake -DCMAKE_PREFIX_PATH="$PWD/build/Debug/generators"`; for benchmarks, add `-DBUILD_BENCHMARKS=ON -DCMAKE_CXX_FLAGS_DEBUG="-O3 -DNDEBUG"` and use `-B build-bench-rel`.
-- **Client build:** `rune-client-cpp/build` (Unix Makefiles, Debug, `BUILD_TESTING=ON`, `BUILD_EXAMPLES=ON`, already configured). `cmake --build build` re-runs configure when `CMakeLists.txt` changes.
-- **Test gate (CLAUDE.md #7):** each task runs the executables covering what it touches plus every new or changed test (its "Run" step names the filter, `-j14`). The FULL `*Regression*` suite runs at the checkpoints — after Task 4 (layout), after Task 7 (fold + worker), after Task 9 (before the final review) — in each touched repo (broker `ctest --test-dir build-fast -R Regression --output-on-failure -j14`, client `ctest --test-dir build -R Regression --output-on-failure -j14`), also under ASan+UBSan and TSan (broker `build-asan` / `build-tsan`, client `build_tsan` with `BUILD_TESTING=ON`). A checkpoint failure is bisected over the commits since the last green checkpoint. Where a task's own step below still says "run the full Regression suite before committing", the per-task affected-area run is what binds; the full suite belongs to the checkpoint. Every fix gets a test whose suite or name contains `Regression`.
-- Nothing is pushed. Every commit message ends with the trailer `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
+- **Repo:** the monorepo at `/Users/vradu/Projects/rune` (the repo root; run every command below from it). Part A touches `broker/...` and `client-cpp/...`, and uses `codec/...` only for the CatalogGolden proof. Every path in this plan is relative to the repo root.
+- **Branch:** `feat/phase2b-a-retractable-min-max-last` is already cut from main `a739aab5` (D, B and F are merged). There is no branch to create. Verify the preconditions (catalog history is in): `grep -n uninstallView broker/libs/node/src/WorkerViewSet.cpp` (2 hits) and `grep -n kCatalogTopicId broker/libs/node/include/rune/node/CatalogPartition.h` (3 hits).
+- **Builds (all already configured):**
+  - `build/root`: broker plus client/ql/codec/crypto sources (Ninja, Debug, `BUILD_TESTING=ON`). `cmake --build build/root -j14 --target <t>` and `ctest --test-dir build/root -R <filter> -j14 --output-on-failure`. Targets: `rune_view_tests` (`broker/libs/view/CMakeLists.txt:21`), `rune_node_tests` (`broker/libs/node/CMakeLists.txt:154`), `rune_get_view_row_tests` (`:705`), `rune_create_view_tests` (`:639`).
+  - `build/rel`: broker benchmarks (Release `-O3 -DNDEBUG`, `BUILD_BENCHMARKS=ON`, `BUILD_TESTING=OFF`). `cmake --build build/rel -j14 --target rune_broker_benchmark`; the binary is `build/rel/broker/rune_broker_benchmark`. `build/bench-rel` is the *client's* release bench build: do not use it.
+  - `build/sub-client-cpp`: client (Ninja, Debug, `BUILD_TESTING=ON`, `BUILD_EXAMPLES=ON`; `view_probe` and `rune_schema_codec_smoke_tests` are built here). `cmake --build build/sub-client-cpp --target <t>` and `ctest --test-dir build/sub-client-cpp -R <filter>`. It re-runs configure when a `CMakeLists.txt` changes.
+  - `build/sub-codec`: codec. `cmake --build build/sub-codec --target rune_catalog_tests && ctest --test-dir build/sub-codec -R CatalogGolden` (3 tests; `build/root` has none).
+  If a directory is missing, stop and tell the controller; do not configure a new one.
+- **Sanitizers:** none exist in the monorepo (no `build-asan`, `build-tsan` or client `build_tsan`), and the frozen copies under `~/Projects/se-worktrees/` must not be used. The controller runs ASan+UBSan and TSan once, at the Phase 2b close.
+- **Test gate (F13, CLAUDE.md #7):** each task builds and runs only the executables it touches plus its new or changed tests; its "Run" steps name them. `rune_view_tests` covers Tasks 1–6 and 8 (Tasks 1–2 also `rune_create_view_tests`); Task 7 uses `rune_node_tests rune_get_view_row_tests rune_create_view_tests`; the client uses `rune_schema_codec_smoke_tests` (plus `rune_cli_catalog_tests` for the F1 change) and `view_probe`. The FULL `*Regression*` suite, CatalogGolden (`build/sub-codec`), the sanitizers, the VM e2e and any clean-box bench confirmation (F14) are **controller checkpoints** (after Task 4, after Task 7, after Task 9, and the Phase 2b close). A checkpoint failure is bisected over the commits since the last green checkpoint. Where an older step still says "run the full Regression suite", the per-task affected-area run is what binds. Every fix gets a test whose suite or name contains `Regression`.
+- **Bisect note (F3):** the branch merges whole. Commits after Task 2 and before Task 5 must not create Min/Max/Last views: the 2a fold still writes 8 bytes at `contribValOff + 8*input` (`AggFold.cpp:44,250`), which lands past `rowLen` in Task 4's linked layout until Task 5 replaces the fold. Bisect over those commits with unit tests only.
+- **Commits** go on this branch in the monorepo (`git add broker/<p> client-cpp/<p>`). Nothing is pushed. Every commit message ends with the trailer `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`. Never stage `.superpowers/`.
 
 ## Global Constraints
 
@@ -50,8 +57,10 @@
 
 ## Decisions (added 2026-10-19)
 
-- **AD1 — Mixed-version clusters:** a view using `Min` / `Max` / `Last` / `LastNonNull` is created only once **every** broker runs a build with Part A. `CreateView` events are applied on every broker from `__catalog` (the leader validates and compiles; each broker installs from the event's `compiledPlanBlob`), and a pre-A broker cannot install such a plan. A ships no wire/version negotiation for this (pre-1.0, rolling upgrades of the view engine are not supported yet): the release note says "upgrade every broker before creating a view with min/max/last". Task 1 already retargets `ViewPlanRegression.UnknownRuleValueIsRejected` to byte 9 (one past `LastNonNull`), so an unknown future rule still fails closed; Task 9's commit adds the release-note line to `docs/release-notes/` (one file, `phase2b-a-retractable-aggregates.md`).
-- **AD2 — No catalog format change:** nothing in A touches `rune_catalog` (event layout, fingerprints, golden logs); `CatalogGoldenRegression.*` must pass unchanged — run `ctest --test-dir ~/Projects/se-worktrees/rune-codec/build -R CatalogGolden` at each checkpoint as the proof.
+- **AD1 — Mixed-version clusters:** a view using `Min` / `Max` / `Last` / `LastNonNull` is created only once **every** broker runs a build with Part A. `CreateView` events are applied on every broker from `__catalog` (the leader validates and compiles; each broker installs from the event's `compiledPlanBlob`), and a pre-A broker cannot install such a plan. A ships no wire/version negotiation for this (pre-1.0, rolling upgrades of the view engine are not supported yet): the release note says "upgrade every broker before creating a view with min/max/last". Task 1 already retargets `ViewPlanRegression.UnknownRuleValueIsRejected` to byte 9 (one past `LastNonNull`), so an unknown future rule still fails closed; Task 9's commit adds the release-note line to `broker/docs/release-notes/` (one file, `phase2b-a-retractable-aggregates.md`).
+- **AD2 — No catalog format change:** nothing in A touches `rune_catalog` (event layout, fingerprints, golden logs); `CatalogGoldenRegression.*` must pass unchanged — run `cmake --build build/sub-codec --target rune_catalog_tests && ctest --test-dir build/sub-codec -R CatalogGolden` (3 tests; `build/root` has none) at each controller checkpoint as the proof.
+
+- **AD3 — Value-slot width (F12, spec §A Storage):** the spec says input value slots "get the source field's width instead of a fixed 8". Part A applies the source width to **`Last`/`LastNonNull` inputs only**. Count, Sum, Avg, Min and Max keep the widened 8-byte slot, so 2a-only views stay byte-for-byte (Spec question 1) and Min/Max compare in one domain. Spec questions Q1–Q8 are ruled as written (each is fail-closed or 2a-preserving).
 
 ## Review Focus
 
@@ -65,41 +74,74 @@ These are the input classes most likely to hurt a user. Each one is pinned by a 
 
 Also pinned: 2a views are unchanged, by `AggStateRegression.TwoAOnlyLayoutIsUnchangedRegression` (Task 4) and the untouched `AggFold*` suite.
 
+## Interaction matrix
+
+Every feature is tested across op × entity × timing (CLAUDE.md memory: test interaction matrices). Axes:
+- **Op:** insert, in-place raise, in-place equal, in-place lower, group move, tombstone, no-group (the group key is absent).
+- **Entity (rule):** Min, Max, Last, LastNonNull, 2a-only view.
+- **Timing:** same batch / single-record batch, multi-record batch, capped-pass boundary (mid-batch resume), across restart.
+
+**Op × entity.** Each cell names the test that pins it; `model` = `RandomizedOpsMatchBruteForceModelRegression` (Task 6), which mixes every op over all four rules at once and checks every group after every step.
+
+| Op | Min / Max | Last | LastNonNull | 2a-only view |
+|---|---|---|---|---|
+| insert | `MinMaxLastFoldOnInsert` | `MinMaxLastFoldOnInsert` | `MinMaxLastFoldOnInsert` (newer null skipped) | untouched `AggFold*` |
+| in-place raise | `InPlaceRaiseOfTheMaxSkipsTheRescanRegression` (Max); model (Min) | `LastAfterDeletingTheNewestIsThePreviousWriteRegression` (re-write moves to head) | `LastIncludesNullAndLastNonNullSkipsNullsRegression` | `AggFold*` |
+| in-place equal | `InPlaceRaiseOfTheMaxSkipsTheRescanRegression` (equal re-write, no rescan); `RetractingOneOfDuplicateExtremesKeepsTheExtremeRegression` | model | model | `AggFold*` |
+| in-place lower | `InPlaceLowerOfTheMaxRescansRegression`; `UnsignedMinRetractsOnTombstoneRegression` | model | `LastIncludesNullAndLastNonNullSkipsNullsRegression` | `AggFold*` |
+| group move | `GroupMoveOfTheExtremeRescansOldGroupAndRaisesNewRegression`; `WorstCaseMoveDirtiesExactlyTheDerivedBoundRegression` | same two | model | `AggFold*` |
+| tombstone | `RetractingTheMaxSurfacesTheNextRegression`; `NonFiniteMaxInputIsNullAndCountedRegression` | `LastAfterDeletingTheNewestIsThePreviousWriteRegression` | `LastIncludesNullAndLastNonNullSkipsNullsRegression` (down to NULL) | `AggFold*` |
+| no-group | `NoGroupRewriteUnlinksAndRetractsTheContributorRegression` (Task 6) | same | model never produces it; same test covers the unlink | `AggFoldRegression.MissingGroupValueRetractsAndSkips` |
+| sentinel / damaged link | `ContributorKeyEqualToSentinelIsSkippedRegression`, `DanglingLinkIsCountedNotFollowedRegression` (Task 5) | same | same | n/a (no links) |
+
+**Op × timing.**
+
+| Timing | Test |
+|---|---|
+| single-record batches | all Task 5 unit tests; the model's one-record steps |
+| multi-record batch (1–4 records, the same contributor can repeat inside one batch) | model (Task 6, extended per F9) |
+| capped-pass boundary / mid-batch resume (pass 1 stops at `bound`, pass 2 resumes from the cursor; dirty entries coalesce inside a pass) | model, every 5th multi-record step is split at a random boundary (bound check: at most records × per-record bound per pass); `WorkerViewSetRegression.PersistedRetractableMovesDeltasFitTheRingRegression` (real caps, Task 7) |
+| across restart (links, head, caches recovered from the v2 checkpoint) | `WorkerViewSetRegression.RestartThenRetractingTheMaxIsExactRegression` (Task 7: in-place lower of the recovered max); the e2e verify leg (Task 9: in-place raise past the cached min, in-place lower of the cached max, with the group move done before the restart) |
+
+Known thin spots, accepted: tombstone-after-restart and Last/LastNonNull after restart are covered only by the e2e's head values; a restart in the middle of a capped multi-pass range is covered by 2a's recovery tests (the format is unchanged).
+
 ---
 
 ## File Structure
 
 | File | Responsibility | Task |
 |---|---|---|
-| `libs/view/include/rune/view/ViewTypes.h`, `libs/view/src/ViewPlan.cpp` | `MergeRule::LastNonNull = 8`; accept rule byte 8 | 1 |
-| `rune-client-cpp/include/rune/client/view/ViewPlanAuthor.h`, `rune-client-cpp/tests/client/ViewPlanAuthorTest.cpp` (new), `rune-client-cpp/CMakeLists.txt` | client mirror + wire pin | 1 |
-| `libs/view/src/PlanCompiler.cpp` | accept Min/Max/Last/LastNonNull with source output types | 2 |
-| `libs/view/include/rune/view/ViewRow.h`, `libs/view/src/ViewRow.cpp` | `encodeSlotValue`/`decodeSlotValue` (shared by `writeSlot`/`readSlot` and Last storage) | 3 |
-| `libs/view/include/rune/view/AggState.h`, `libs/view/src/AggState.cpp` | linked layout: links, head, caches, per-input offset/width, `aggDirtyBoundPerRecord` | 4 |
-| `libs/view/include/rune/view/ViewFold.h` | `FoldStats::aggRescans` | 5 |
-| `libs/view/src/AggFold.cpp` | list maintenance, cache maintenance, rescan, Last/LastNonNull emit | 5 |
-| `libs/view/tests/view/AggRetractableTest.cpp` (new), `libs/view/CMakeLists.txt` | fold tests, bound pin, model test | 5, 6 |
-| `libs/node/src/WorkerViewSet.cpp` | per-pass cap from `aggDirtyBoundPerRecord` | 7 |
-| `libs/node/tests/node/WorkerViewSetTest.cpp` | restart regression, large-range move regression | 7 |
-| `benchmark/ViewFoldBench.cpp` | `BM_ViewFoldRetractable` (gate), `BM_ViewFoldExtremeRetract` (reported) | 8 |
-| `rune-client-cpp/examples/view_probe.cpp`, `docker/view-engine-e2e.sh` | `user_totals` gains `max`/`min`/`last` across the restart | 9 |
+| `broker/libs/view/include/rune/view/ViewTypes.h`, `broker/libs/view/src/ViewPlan.cpp`, `broker/libs/view/src/PlanCompiler.cpp` (one line) | `MergeRule::LastNonNull = 8`; accept rule byte 8; the compiler stays fail-closed for it until Task 2 (F2) | 1 |
+| `client-cpp/include/rune/client/view/ViewPlanAuthor.h`, `client-cpp/tests/client/ViewPlanAuthorTest.cpp` (new), `client-cpp/CMakeLists.txt` | client mirror + wire pin; `deserializeAuthored` rule bound and round-trip pin (F1) | 1 |
+| `broker/libs/view/src/PlanCompiler.cpp` | accept Min/Max/Last/LastNonNull with source output types | 2 |
+| `broker/libs/view/include/rune/view/ViewRow.h`, `broker/libs/view/src/ViewRow.cpp` | `encodeSlotValue`/`decodeSlotValue` (shared by `writeSlot`/`readSlot` and Last storage) | 3 |
+| `broker/libs/view/include/rune/view/AggState.h`, `broker/libs/view/src/AggState.cpp` | linked layout: links, head, caches, per-input offset/width, `aggDirtyBoundPerRecord` | 4 |
+| `broker/libs/view/include/rune/view/ViewFold.h` | `FoldStats::aggRescans` | 5 |
+| `broker/libs/view/src/AggFold.cpp` | list maintenance, cache maintenance, rescan, Last/LastNonNull emit | 5 |
+| `broker/libs/view/tests/view/AggRetractableTest.cpp` (new), `broker/libs/view/CMakeLists.txt` | fold tests, bound pin, model test | 5, 6 |
+| `broker/libs/node/src/WorkerViewSet.cpp` | per-pass cap from `aggDirtyBoundPerRecord` | 7 |
+| `broker/libs/node/tests/node/WorkerViewSetTest.cpp` | restart regression, large-range move regression | 7 |
+| `broker/benchmark/ViewFoldBench.cpp` | shared `AggRig` helper (F10), `BM_ViewFoldRetractable` (gate; runs right after Task 5, F4), `BM_ViewFoldExtremeRetract` (reported) | 8 |
+| `client-cpp/examples/view_probe.cpp`, `broker/docker/view-engine-e2e.sh`, `docs/api/client-cpp.md` (F5), `broker/docs/release-notes/phase2b-a-retractable-aggregates.md` (F11) | `user_totals` gains `max`/`min`/`last` across the restart; API doc and release note | 9 |
 
 ---
 
 ### Task 1: `MergeRule::LastNonNull` on the wire (broker + client)
 
 **Files:**
-- Modify: `libs/view/include/rune/view/ViewTypes.h:6-8`
-- Modify: `libs/view/src/ViewPlan.cpp:124-126`
-- Modify: `libs/view/tests/view/ViewPlanTest.cpp:240-246`
-- Modify: `rune-client-cpp/include/rune/client/view/ViewPlanAuthor.h:40-46` (the comment block starting `// Mirrors rune::view::MergeRule` and the enum)
-- Create: `rune-client-cpp/tests/client/ViewPlanAuthorTest.cpp`
-- Modify: `rune-client-cpp/CMakeLists.txt:918-922` (the `rune_schema_codec_smoke_tests` target; anchor `add_executable(rune_schema_codec_smoke_tests`)
+- Modify: `broker/libs/view/include/rune/view/ViewTypes.h:6-8`
+- Modify: `broker/libs/view/src/ViewPlan.cpp:124-126`
+- Modify: `broker/libs/view/tests/view/ViewPlanTest.cpp:240-246`
+- Modify: `client-cpp/include/rune/client/view/ViewPlanAuthor.h:40-46` (the comment block starting `// Mirrors rune::view::MergeRule` and the enum)
+- Create: `client-cpp/tests/client/ViewPlanAuthorTest.cpp`
+- Modify: `client-cpp/include/rune/client/view/ViewPlanAuthor.h:224` (F1: the rule bound in the client's own `deserializeAuthored`, used by `rune catalog replay` via `client-cpp/src/cli/CatalogCommands.cpp:549`)
+- Modify: `client-cpp/CMakeLists.txt:1046-1051` (the `rune_schema_codec_smoke_tests` target; anchor `add_executable(rune_schema_codec_smoke_tests`)
+- Modify: `broker/libs/view/src/PlanCompiler.cpp:56-58` (F2: `isPhase2bRule` also lists `LastNonNull`)
 
 **Interfaces:**
 - Produces: `enum class MergeRule : uint8_t { Replace, Count, Sum, Avg, Min, Max, Last, CountAll, LastNonNull };` (`LastNonNull == 8`) in both `rune::view` and `rune::client::view`.
 
-- [ ] **Step 1: Write the failing broker tests.** In `libs/view/tests/view/ViewPlanTest.cpp`, replace the whole `TEST(ViewPlanRegression, UnknownRuleValueIsRejected)` (lines 240–246) with:
+- [ ] **Step 1: Write the failing broker tests.** In `broker/libs/view/tests/view/ViewPlanTest.cpp`, replace the whole `TEST(ViewPlanRegression, UnknownRuleValueIsRejected)` (lines 240–246) with:
 
 ```cpp
 // Phase 2b: LastNonNull is appended at 8; rules 0-7 keep their meaning.
@@ -126,10 +168,10 @@ TEST(ViewPlanRegression, UnknownRuleValueIsRejected) {
 
 - [ ] **Step 2: Run them and confirm they fail.**
 
-Run: `cmake --build build-fast -j --target rune_view_tests && ctest --test-dir build-fast -R 'ViewPlanRegression' --output-on-failure`
+Run: `cmake --build build/root -j14 --target rune_view_tests && ctest --test-dir build/root -R 'ViewPlanRegression' --output-on-failure`
 Expected: compile error `no member named 'LastNonNull' in 'rune::view::MergeRule'`.
 
-- [ ] **Step 3: Implement the broker side.** In `libs/view/include/rune/view/ViewTypes.h`, replace lines 6–8 with:
+- [ ] **Step 3: Implement the broker side.** In `broker/libs/view/include/rune/view/ViewTypes.h`, replace lines 6–8 with:
 
 ```cpp
 // Wire values are APPEND-ONLY (serialized as u8 in plan blobs): CountAll (= SQL
@@ -138,7 +180,7 @@ Expected: compile error `no member named 'LastNonNull' in 'rune::view::MergeRule
 enum class MergeRule : uint8_t { Replace, Count, Sum, Avg, Min, Max, Last, CountAll, LastNonNull };
 ```
 
-In `libs/view/src/ViewPlan.cpp`, replace `isValidMergeRule`:
+In `broker/libs/view/src/ViewPlan.cpp`, replace `isValidMergeRule`:
 
 ```cpp
 bool isValidMergeRule(uint8_t v) {
@@ -146,12 +188,23 @@ bool isValidMergeRule(uint8_t v) {
 }
 ```
 
+In `broker/libs/view/src/PlanCompiler.cpp` (F2), make `isPhase2bRule` list the new rule too, so it stays fail-closed until Task 2 lifts the rejection. Without this, at this commit a `LastNonNull` column would take the Replace type-check path, compile, and the 2a fold would emit NULL for it:
+
+```cpp
+bool isPhase2bRule(MergeRule r) {
+    return r == MergeRule::Min || r == MergeRule::Max || r == MergeRule::Last ||
+           r == MergeRule::LastNonNull;
+}
+```
+
+Task 2 deletes `isPhase2bRule` as planned, so no test pins this transient state.
+
 - [ ] **Step 4: Run the tests and confirm they pass.**
 
-Run: `cmake --build build-fast -j --target rune_view_tests && ctest --test-dir build-fast -R 'ViewPlan' --output-on-failure`
-Expected: every `ViewPlan*` test passes.
+Run: `cmake --build build/root -j14 --target rune_view_tests rune_create_view_tests && ctest --test-dir build/root -R 'ViewPlan|PlanCompiler|CreateView' -j14 --output-on-failure`
+Expected: every `ViewPlan*`, `PlanCompiler*` and `CreateView*` test passes (`MinMaxLastAreRejectedUntilPhase2b` still passes).
 
-- [ ] **Step 5: Write the failing client test.** Create `rune-client-cpp/tests/client/ViewPlanAuthorTest.cpp`:
+- [ ] **Step 5: Write the failing client test.** Create `client-cpp/tests/client/ViewPlanAuthorTest.cpp`:
 
 ```cpp
 // tests/client/ViewPlanAuthorTest.cpp — the client's MergeRule must mirror the
@@ -175,10 +228,21 @@ TEST(ViewPlanAuthorRegression, LastNonNullIsAppendedAtWireValue8) {
     // Tail = [last field's rule u8][persistence u8][sizing: u32 + u32 + u64].
     ASSERT_GE(blob.size(), 18u);
     EXPECT_EQ(blob[blob.size() - 18], 8u) << "LastNonNull must serialize as rule byte 8";
+
+    // F1: the client's own decoder (used by `rune catalog replay`) must round-trip
+    // rule 8 and still reject one past it.
+    const auto back = rcv::deserializeAuthored(blob);
+    ASSERT_TRUE(back.has_value()) << "deserializeAuthored must accept rule byte 8";
+    ASSERT_EQ(back->output.size(), 2u);
+    EXPECT_EQ(back->output[1].rule, rcv::MergeRule::LastNonNull);
+    auto bad = blob;
+    bad[bad.size() - 18] = 9;
+    EXPECT_FALSE(rcv::deserializeAuthored(bad).has_value())
+        << "rule byte 9 (one past LastNonNull) must be rejected, never cast";
 }
 ```
 
-In `rune-client-cpp/CMakeLists.txt`, replace the `rune_schema_codec_smoke_tests` block (lines 918–922; anchor `add_executable(rune_schema_codec_smoke_tests`) with:
+In `client-cpp/CMakeLists.txt`, replace the `rune_schema_codec_smoke_tests` block (lines 1046–1051; anchor `add_executable(rune_schema_codec_smoke_tests`; today it is `add_executable(… tests/SchemaCodecSmokeTest.cpp)`, `target_link_libraries(… rune_codec GTest::gtest_main)` and `gtest_discover_tests`, with no `target_include_directories`) with:
 
 ```cmake
     add_executable(rune_schema_codec_smoke_tests
@@ -190,13 +254,13 @@ In `rune-client-cpp/CMakeLists.txt`, replace the `rune_schema_codec_smoke_tests`
     gtest_discover_tests(rune_schema_codec_smoke_tests)
 ```
 
-Run: `cmake --build rune-client-cpp/build --target rune_schema_codec_smoke_tests`
+Run: `cmake --build build/sub-client-cpp --target rune_schema_codec_smoke_tests`
 Expected: compile error `no member named 'LastNonNull'`.
 
-- [ ] **Step 6: Implement the client mirror.** In `rune-client-cpp/include/rune/client/view/ViewPlanAuthor.h`, replace lines 40–46 (the comment starting `// Mirrors rune::view::MergeRule` and the enum) with:
+- [ ] **Step 6: Implement the client mirror.** In `client-cpp/include/rune/client/view/ViewPlanAuthor.h`, replace lines 40–46 (the comment starting `// Mirrors rune::view::MergeRule` and the enum) with:
 
 ```cpp
-// Mirrors rune::view::MergeRule (libs/view/include/rune/view/ViewTypes.h).
+// Mirrors rune::view::MergeRule (broker/libs/view/include/rune/view/ViewTypes.h).
 // Brokers accept Replace (projection, and the GROUP BY column of an aggregate
 // view) plus the aggregates CountAll (Count(*)), Count(col), Sum, Avg (Phase
 // 2a) and the retractable Min, Max, Last, LastNonNull (Phase 2b) — GROUP BY the
@@ -206,20 +270,36 @@ Expected: compile error `no member named 'LastNonNull'`.
 enum class MergeRule : uint8_t { Replace, Count, Sum, Avg, Min, Max, Last, CountAll, LastNonNull };  // CountAll=7, LastNonNull=8
 ```
 
-- [ ] **Step 7: Run the client test and the client regression suite.**
+Build and run now, before the bound change below: the blob-byte assertion passes and the new round-trip assertion **fails** (`deserializeAuthored must accept rule byte 8`), because the client decoder still rejects every rule above `CountAll`.
 
-Run: `cmake --build rune-client-cpp/build --target rune_schema_codec_smoke_tests view_probe && ctest --test-dir rune-client-cpp/build -R 'ViewPlanAuthor|Regression' --output-on-failure`
-Expected: `ViewPlanAuthorRegression.LastNonNullIsAppendedAtWireValue8` passes, and `view_probe` still compiles.
+Then fix the decoder (F1). In `client-cpp/include/rune/client/view/ViewPlanAuthor.h` replace line 224:
 
-- [ ] **Step 8: Run the broker regression gate and commit both repos.**
+```cpp
+        if (rule > static_cast<uint8_t>(MergeRule::CountAll)) return std::nullopt;
+```
 
-Run: `ctest --test-dir build-fast -R Regression --output-on-failure`. Expected: 0 failures.
+with
+
+```cpp
+        if (rule > static_cast<uint8_t>(MergeRule::LastNonNull)) return std::nullopt;
+```
+
+Without this, any view that uses `LastNonNull` makes `rune catalog replay` fail with "the event's normalized view plan does not decode".
+
+- [ ] **Step 7: Run the client tests.**
+
+Run: `cmake --build build/sub-client-cpp --target rune_schema_codec_smoke_tests rune_cli_catalog_tests view_probe && ctest --test-dir build/sub-client-cpp -R 'ViewPlanAuthor|SchemaCodecSmoke|RuneCliCatalog' --output-on-failure`
+Expected: `ViewPlanAuthorRegression.LastNonNullIsAppendedAtWireValue8` passes (wire byte, round-trip of rule 8, rejection of rule 9), the `RuneCliCatalog*` tests still pass, and `view_probe` still compiles.
+
+- [ ] **Step 8: Run the affected broker tests and commit.**
+
+Run: `ctest --test-dir build/root -R 'ViewPlan|PlanCompiler|CreateView' -j14 --output-on-failure`. Expected: 0 failures. (The full `*Regression*` suite is a controller checkpoint.)
 
 ```bash
-git add libs/view/include/rune/view/ViewTypes.h libs/view/src/ViewPlan.cpp libs/view/tests/view/ViewPlanTest.cpp
+git add broker/libs/view/include/rune/view/ViewTypes.h broker/libs/view/src/ViewPlan.cpp broker/libs/view/src/PlanCompiler.cpp broker/libs/view/tests/view/ViewPlanTest.cpp
 git commit -m "feat(view): MergeRule::LastNonNull appended at wire value 8" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
-git -C ../rune-client-cpp add include/rune/client/view/ViewPlanAuthor.h tests/client/ViewPlanAuthorTest.cpp CMakeLists.txt
-git -C ../rune-client-cpp commit -m "feat(view): client MergeRule::LastNonNull mirrors broker (wire value 8)" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+git add client-cpp/include/rune/client/view/ViewPlanAuthor.h client-cpp/tests/client/ViewPlanAuthorTest.cpp client-cpp/CMakeLists.txt
+git commit -m "feat(view): client MergeRule::LastNonNull mirrors broker (wire value 8); deserializeAuthored accepts it" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -229,14 +309,14 @@ git -C ../rune-client-cpp commit -m "feat(view): client MergeRule::LastNonNull m
 Today the compiler rejects `Min`/`Max`/`Last` with a "Phase 2b" message (`PlanCompiler.cpp:141-145`). This task lifts that rejection and fixes the output types: `Min`/`Max` produce the numeric source type, and `Last`/`LastNonNull` produce any fixed-width source type. A `FixedStr` output already inherits the source's `fixedLen` (the existing `rof.fixedLen` path).
 
 **Files:**
-- Modify: `libs/view/src/PlanCompiler.cpp:51-87`, `:141-145`, `:313`
-- Modify: `libs/view/tests/view/PlanCompilerTest.cpp:181-187`
+- Modify: `broker/libs/view/src/PlanCompiler.cpp:51-87`, `:141-145`, `:313` (line hints are before Task 1's one-line F2 edit, which shifts later lines by +1; anchor by the function names and quoted text)
+- Modify: `broker/libs/view/tests/view/PlanCompilerTest.cpp:181-187`
 
 **Interfaces:**
 - Consumes: `MergeRule::LastNonNull` (Task 1).
 - Produces: an aggregate view may use `Min`/`Max` (numeric source, output type == source type) and `Last`/`LastNonNull` (any fixed-width source, output type == source type, `FixedStr` width == source `fixedLen`). Non-key error messages must **not** contain the word `key` (AdminWorker maps such messages to `ViewKeyInvalid`).
 
-- [ ] **Step 1: Write the failing tests.** In `libs/view/tests/view/PlanCompilerTest.cpp`, replace the whole `TEST(PlanCompilerAggregateRegression, MinMaxLastAreRejectedUntilPhase2b)` (lines 181–187) with:
+- [ ] **Step 1: Write the failing tests.** In `broker/libs/view/tests/view/PlanCompilerTest.cpp`, replace the whole `TEST(PlanCompilerAggregateRegression, MinMaxLastAreRejectedUntilPhase2b)` (lines 181–187) with:
 
 ```cpp
 TEST(PlanCompilerAggregateRegression, MinMaxLastLastNonNullCompileWithSourceOutputTypes) {
@@ -285,10 +365,10 @@ TEST(PlanCompilerAggregateRegression, LastOverFixedStrCarriesTheSourceWidth) {
 
 - [ ] **Step 2: Run them and confirm they fail.**
 
-Run: `cmake --build build-fast -j --target rune_view_tests && ctest --test-dir build-fast -R 'PlanCompilerAggregateRegression' --output-on-failure`
+Run: `cmake --build build/root -j14 --target rune_view_tests && ctest --test-dir build/root -R 'PlanCompilerAggregateRegression' --output-on-failure`
 Expected: `MinMaxLastLastNonNull…` fails with "uses Min/Max/Last, which are not supported until Phase 2b". `LastOverFixedStr…` fails the same way. `MaxDeclaredWithAWidenedType…` fails because its message contains "Phase 2b", not "produces Int32".
 
-- [ ] **Step 3: Implement.** In `libs/view/src/PlanCompiler.cpp`, replace lines 51–87 (`isAggregateRule`, `isPhase2bRule`, `primName`, `aggregateOutputType`) with:
+- [ ] **Step 3: Implement.** In `broker/libs/view/src/PlanCompiler.cpp`, replace lines 51–87 (51–88 after Task 1; `isAggregateRule`, `isPhase2bRule` including Task 1's `LastNonNull` line, `primName`, `aggregateOutputType`) with:
 
 ```cpp
 bool isAggregateRule(MergeRule r) {
@@ -366,15 +446,15 @@ with
 
 - [ ] **Step 4: Run the tests and confirm they pass.**
 
-Run: `cmake --build build-fast -j --target rune_view_tests && ctest --test-dir build-fast -R 'PlanCompiler' --output-on-failure`
-Expected: every `PlanCompiler*` test passes, including the Phase 1/2a tests and `NonGroupReplaceColumnInAggregateViewIsRejected`, which still finds "must be an aggregate".
+Run: `cmake --build build/root -j14 --target rune_view_tests rune_create_view_tests && ctest --test-dir build/root -R 'PlanCompiler|CreateView' -j14 --output-on-failure`
+Expected: every `PlanCompiler*` and `CreateView*` test passes, including the Phase 1/2a tests and `NonGroupReplaceColumnInAggregateViewIsRejected`, which still finds "must be an aggregate".
 
-- [ ] **Step 5: Run the regression gate and commit.**
+- [ ] **Step 5: Run the affected tests and commit.**
 
-Run: `ctest --test-dir build-fast -R Regression --output-on-failure` → 0 failures.
+Run: `ctest --test-dir build/root -R 'PlanCompiler|ViewPlan|CreateView' -j14 --output-on-failure` → 0 failures. (Affected area only, F13; the full `*Regression*` suite is a controller checkpoint.)
 
 ```bash
-git add libs/view/src/PlanCompiler.cpp libs/view/tests/view/PlanCompilerTest.cpp
+git add broker/libs/view/src/PlanCompiler.cpp broker/libs/view/tests/view/PlanCompilerTest.cpp
 git commit -m "feat(view): compile Min/Max (numeric) and Last/LastNonNull (fixed-width) with source output types" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
@@ -385,9 +465,9 @@ git commit -m "feat(view): compile Min/Max (numeric) and Last/LastNonNull (fixed
 `Last`/`LastNonNull` store the source value at the source field's width (a `string(N)` stores N bytes) and copy it into the output slot on emit. The encoding is exactly the one `writeSlot`/`readSlot` already use, so this task factors it out once and gives both callers the same function. `writeSlot`/`readSlot` behaviour does not change.
 
 **Files:**
-- Modify: `libs/view/include/rune/view/ViewRow.h:33-43`
-- Modify: `libs/view/src/ViewRow.cpp:75-178`
-- Test: `libs/view/tests/view/ViewRowTest.cpp`
+- Modify: `broker/libs/view/include/rune/view/ViewRow.h:33-43`
+- Modify: `broker/libs/view/src/ViewRow.cpp:75-178`
+- Test: `broker/libs/view/tests/view/ViewRowTest.cpp`
 
 **Interfaces:**
 - Produces (in `rune::view`):
@@ -398,7 +478,7 @@ git commit -m "feat(view): compile Min/Max (numeric) and Last/LastNonNull (fixed
                                           uint16_t width) noexcept;   // present == true
   ```
 
-- [ ] **Step 1: Write the failing tests.** Append to `libs/view/tests/view/ViewRowTest.cpp`, and add `#include <climits>`, `#include <cstring>` and `#include <string>` next to its existing includes:
+- [ ] **Step 1: Write the failing tests.** Append to `broker/libs/view/tests/view/ViewRowTest.cpp`, and add `#include <climits>`, `#include <cstring>` and `#include <string>` next to its existing includes:
 
 ```cpp
 TEST(ViewRow, SlotValueCodecRoundTripsEveryFixedType) {
@@ -425,30 +505,31 @@ TEST(ViewRow, SlotValueCodecRoundTripsEveryFixedType) {
     EXPECT_EQ(s.type, P::FixedStr);
 }
 
-TEST(ViewRow, WriteSlotIsEncodeSlotValueAtTheSlotOffset) {
+// F6: golden bytes. Comparing against encodeSlotValue would be a tautology,
+// because writeSlot now calls it.
+TEST(ViewRow, WriteSlotWritesGoldenBytesAtTheSlotOffset) {
     using P = rune::codec::PrimType;
     const auto d = rune::codec::DescriptorBuilder("t", 1).add("a", P::Int32).addFixedStr("s", 3).build();
     const auto L = rune::view::buildRowLayout(d);
-    std::vector<uint8_t> row(L.rowLen, 0);
+    std::vector<uint8_t> row(L.rowLen, 0xEE);   // a stale-byte canary: padding must really be written
     rune::codec::FieldValue a{}; a.type = P::Int32; a.present = true; a.i = -7;
     rune::codec::FieldValue s{}; s.type = P::FixedStr; s.present = true; s.bytes = "xy";
     rune::view::writeSlot(row.data(), L, 0, a);
     rune::view::writeSlot(row.data(), L, 1, s);
-    uint8_t ea[4], es[3];
-    rune::view::encodeSlotValue(ea, P::Int32, 4, a);
-    rune::view::encodeSlotValue(es, P::FixedStr, 3, s);
-    EXPECT_EQ(std::memcmp(row.data() + L.slotOffset[0], ea, 4), 0);
-    EXPECT_EQ(std::memcmp(row.data() + L.slotOffset[1], es, 3), 0);
+    const uint8_t goldenA[] = {0xF9, 0xFF, 0xFF, 0xFF};   // Int32 -7, little-endian
+    const uint8_t goldenS[] = {0x78, 0x79, 0x00};         // FixedStr "xy" at width 3, zero-padded
+    EXPECT_EQ(std::memcmp(row.data() + L.slotOffset[0], goldenA, 4), 0);
+    EXPECT_EQ(std::memcmp(row.data() + L.slotOffset[1], goldenS, 3), 0);
     EXPECT_EQ(rune::view::readSlot(row.data(), L, 0).i, -7);
 }
 ```
 
 - [ ] **Step 2: Run them and confirm they fail.**
 
-Run: `cmake --build build-fast -j --target rune_view_tests`
+Run: `cmake --build build/root -j14 --target rune_view_tests`
 Expected: compile error `no member named 'encodeSlotValue' in namespace 'rune::view'`.
 
-- [ ] **Step 3: Implement.** In `libs/view/include/rune/view/ViewRow.h`, insert before the `writeSlot` declaration (line 33):
+- [ ] **Step 3: Implement.** In `broker/libs/view/include/rune/view/ViewRow.h`, insert before the `writeSlot` declaration (line 33):
 
 ```cpp
 // The fixed-width byte representation of one present value, exactly as a row
@@ -463,7 +544,7 @@ rune::codec::FieldValue decodeSlotValue(const uint8_t* src, rune::codec::PrimTyp
                                         uint16_t width) noexcept;
 ```
 
-In `libs/view/src/ViewRow.cpp`, replace everything from `void writeSlot(` (line 75) through the end of `readSlot` (line 178, before `} // namespace rune::view`) with:
+In `broker/libs/view/src/ViewRow.cpp`, replace everything from `void writeSlot(` (line 75) through the end of `readSlot` (line 178, before `} // namespace rune::view`) with:
 
 ```cpp
 void encodeSlotValue(uint8_t* dst, PrimType type, uint16_t width, const FieldValue& v) noexcept {
@@ -572,15 +653,15 @@ FieldValue readSlot(const uint8_t* row, const RowLayout& layout, uint16_t slot) 
 
 - [ ] **Step 4: Run the tests and confirm they pass.**
 
-Run: `cmake --build build-fast -j --target rune_view_tests && ctest --test-dir build-fast -R 'ViewRow|ViewFold|AggFold|ViewCheckpoint' --output-on-failure`
+Run: `cmake --build build/root -j14 --target rune_view_tests && ctest --test-dir build/root -R 'ViewRow|ViewFold|AggFold|ViewCheckpoint' --output-on-failure`
 Expected: all pass. The `writeSlot`/`readSlot` behaviour is unchanged.
 
-- [ ] **Step 5: Run the regression gate and commit.**
+- [ ] **Step 5: Run the affected tests and commit.**
 
-Run: `ctest --test-dir build-fast -R Regression --output-on-failure` → 0 failures.
+Step 4's run is the affected-area gate (F13); re-run it if anything changed since: `ctest --test-dir build/root -R 'ViewRow|ViewFold|AggFold|ViewCheckpoint' -j14 --output-on-failure` → 0 failures.
 
 ```bash
-git add libs/view/include/rune/view/ViewRow.h libs/view/src/ViewRow.cpp libs/view/tests/view/ViewRowTest.cpp
+git add broker/libs/view/include/rune/view/ViewRow.h broker/libs/view/src/ViewRow.cpp broker/libs/view/tests/view/ViewRowTest.cpp
 git commit -m "refactor(view): encodeSlotValue/decodeSlotValue — one fixed-width slot codec for rows and Last values" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
@@ -589,9 +670,9 @@ git commit -m "refactor(view): encodeSlotValue/decodeSlotValue — one fixed-wid
 ### Task 4: `AggState` — the linked layout and the exact dirty bound
 
 **Files:**
-- Modify (full replacement): `libs/view/include/rune/view/AggState.h`
-- Modify (full replacement): `libs/view/src/AggState.cpp`
-- Test: `libs/view/tests/view/AggStateTest.cpp`
+- Modify (full replacement): `broker/libs/view/include/rune/view/AggState.h`
+- Modify (full replacement): `broker/libs/view/src/AggState.cpp`
+- Test: `broker/libs/view/tests/view/AggStateTest.cpp`
 
 **Interfaces:**
 - Consumes: Task 2's compiler acceptance; `rune::codec::fieldWidth`.
@@ -622,7 +703,7 @@ Row layouts (fixed width, little-endian, memcpy-encoded). Braces `{…}` mark pa
 - A rescan only *reads* contributors through `get()`, which never marks a row dirty, and it rewrites `g1`'s cache inside the already-dirty group row. Tombstones and missing-group records touch at most `c` (delete), `prev`, `next`, `g1` and `g1`'s view row, which is 5 or fewer.
 - Linked views therefore have **4 + 2 + 2 = 8**. 2a views keep **1 + 2 + 2 = 5**, the unchanged 2a bound.
 
-- [ ] **Step 1: Write the failing tests.** Append to `libs/view/tests/view/AggStateTest.cpp`:
+- [ ] **Step 1: Write the failing tests.** Append to `broker/libs/view/tests/view/AggStateTest.cpp`:
 
 ```cpp
 namespace {
@@ -725,13 +806,13 @@ Add `#include <vector>` to the file's includes.
 
 - [ ] **Step 2: Run them and confirm they fail.**
 
-Run: `cmake --build build-fast -j --target rune_view_tests`
+Run: `cmake --build build/root -j14 --target rune_view_tests`
 Expected: compile error `no member named 'linked'` / `'kNoCache'`.
 
-- [ ] **Step 3: Implement.** Replace `libs/view/include/rune/view/AggState.h` with:
+- [ ] **Step 3: Implement.** Replace `broker/libs/view/include/rune/view/AggState.h` with:
 
 ```cpp
-// libs/view/include/rune/view/AggState.h
+// broker/libs/view/include/rune/view/AggState.h
 //
 // Aggregate views with TABLE semantics: a contributor is the source record's
 // 8-byte WIRE key, its group the view key read from the record VALUE.
@@ -866,10 +947,10 @@ inline void     storeF64(uint8_t* p, double v) noexcept { std::memcpy(p, &v, 8);
 } // namespace rune::view
 ```
 
-Replace `libs/view/src/AggState.cpp` with:
+Replace `broker/libs/view/src/AggState.cpp` with:
 
 ```cpp
-// libs/view/src/AggState.cpp — see AggState.h.
+// broker/libs/view/src/AggState.cpp — see AggState.h.
 #include <rune/view/AggState.h>
 
 #include <algorithm>
@@ -974,15 +1055,15 @@ AggDirtyBound aggDirtyBoundPerRecord(const AggLayout& a) noexcept {
 
 - [ ] **Step 4: Run the tests and confirm they pass.**
 
-Run: `cmake --build build-fast -j --target rune_view_tests && ctest --test-dir build-fast -R 'AggState|AggFold' --output-on-failure`
+Run: `cmake --build build/root -j14 --target rune_view_tests && ctest --test-dir build/root -R 'AggState|AggFold' --output-on-failure`
 Expected: all pass. `AggFold*` (2a) is unchanged because a 2a layout has `inputOff[i] == contribValOff + 8*i`.
 
-- [ ] **Step 5: Run the regression gate and commit.**
+- [ ] **Step 5: Run the affected tests and commit.**
 
-Run: `ctest --test-dir build-fast -R Regression --output-on-failure` → 0 failures.
+Run: `ctest --test-dir build/root -R 'AggState|AggFold|ViewRow|ViewFold|ViewCheckpoint' -j14 --output-on-failure` → 0 failures. (The controller's checkpoint after this task runs the existing suites only; remember the bisect note in *Execution context*: do not create Min/Max/Last views on commits between Task 2 and Task 5.)
 
 ```bash
-git add libs/view/include/rune/view/AggState.h libs/view/src/AggState.cpp libs/view/tests/view/AggStateTest.cpp
+git add broker/libs/view/include/rune/view/AggState.h broker/libs/view/src/AggState.cpp broker/libs/view/tests/view/AggStateTest.cpp
 git commit -m "feat(view): linked aggregate layout — MRU links, group head, Min/Max caches, per-input widths, exact dirty bound" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
@@ -991,10 +1072,10 @@ git commit -m "feat(view): linked aggregate layout — MRU links, group head, Mi
 ### Task 5: The retractable fold
 
 **Files:**
-- Modify: `libs/view/include/rune/view/ViewFold.h:65-68` (add `aggRescans`)
-- Modify (full replacement): `libs/view/src/AggFold.cpp`
-- Create: `libs/view/tests/view/AggRetractableTest.cpp`
-- Modify: `libs/view/CMakeLists.txt:20-24` (add the test file)
+- Modify: `broker/libs/view/include/rune/view/ViewFold.h:65-68` (add `aggRescans`)
+- Modify (full replacement): `broker/libs/view/src/AggFold.cpp`
+- Create: `broker/libs/view/tests/view/AggRetractableTest.cpp`
+- Modify: `broker/libs/view/CMakeLists.txt:21-26` (add the test file after `tests/view/AggFoldTest.cpp`, line 25)
 
 **Interfaces:**
 - Consumes: `AggLayout`/`AggField`/`CacheState`/`kNoContributor`/`kNoCache`/`kCacheEntryBytes` (Task 4); `encodeSlotValue`/`decodeSlotValue` (Task 3).
@@ -1006,10 +1087,12 @@ git commit -m "feat(view): linked aggregate layout — MRU links, group head, Mi
 - **Emit** first resolves any RescanPending field with one list walk (`rescan`, bounded by the group's contributor count), then writes Min/Max from the cache, `Last` from the head and `LastNonNull` from the first non-null walking from the head.
 - An in-place update (same group) **defers** the retract-side emit until after the add, so a new value that is at least as extreme skips the rescan. A 2a view always emits on retract, exactly as in 2a.
 
-- [ ] **Step 1: Write the failing tests.** Create `libs/view/tests/view/AggRetractableTest.cpp`:
+**Intentional duplication (F7).** `AggRetractableTest.cpp` re-declares `le16/le32/le64` and `Harness::apply/key/put/col` verbatim from `AggFoldTest.cpp:56-112`. This is deliberate: the 2a `AggFold*` suite stays byte-untouched as the 2a-invariance guard, so the new tests do not share a header with it. Reviewers should not flag it.
+
+- [ ] **Step 1: Write the failing tests.** Create `broker/libs/view/tests/view/AggRetractableTest.cpp`:
 
 ```cpp
-// libs/view/tests/view/AggRetractableTest.cpp — Phase 2b retractable
+// broker/libs/view/tests/view/AggRetractableTest.cpp — Phase 2b retractable
 // Min / Max / Last / LastNonNull (per-group MRU contributor list + caches).
 #include <gtest/gtest.h>
 
@@ -1341,21 +1424,22 @@ TEST(AggRetractableRegression, DanglingLinkIsCountedNotFollowedRegression) {
 }
 ```
 
-Add `tests/view/AggRetractableTest.cpp` to `rune_view_tests` in `libs/view/CMakeLists.txt` (after `tests/view/AggFoldTest.cpp`):
+Add `tests/view/AggRetractableTest.cpp` to `rune_view_tests` in `broker/libs/view/CMakeLists.txt` (S8: insert after `tests/view/AggFoldTest.cpp`, line 25):
 
 ```cmake
         tests/view/AggFoldTest.cpp
-        tests/view/AggRetractableTest.cpp)
+        tests/view/AggRetractableTest.cpp
+        tests/view/PlanSourcesTest.cpp)
 ```
 
-(The closing `)` moves from after `AggFoldTest.cpp` to after the new file.)
+(`tests/view/PlanSourcesTest.cpp)` is line 26 and stays last, so the closing `)` does not move.)
 
 - [ ] **Step 2: Run them and confirm they fail.**
 
-Run: `cmake --build build-fast -j --target rune_view_tests`
+Run: `cmake --build build/root -j14 --target rune_view_tests`
 Expected: compile error `no member named 'aggRescans' in 'rune::view::FoldStats'`. Once that member exists, the tests fail at runtime because Min/Max/Last emit NULL.
 
-- [ ] **Step 3a: Add the counter.** In `libs/view/include/rune/view/ViewFold.h`, after the `aggInconsistent` member (line 68), add:
+- [ ] **Step 3a: Add the counter.** In `broker/libs/view/include/rune/view/ViewFold.h`, after the `aggInconsistent` member (line 68), add:
 
 ```cpp
     // Phase 2b: Min/Max caches rebuilt by one walk of the group's contributor
@@ -1363,10 +1447,10 @@ Expected: compile error `no member named 'aggRescans' in 'rune::view::FoldStats'
     uint64_t aggRescans       = 0;
 ```
 
-- [ ] **Step 3b: Replace the fold.** Replace `libs/view/src/AggFold.cpp` with:
+- [ ] **Step 3b: Replace the fold.** Replace `broker/libs/view/src/AggFold.cpp` with:
 
 ```cpp
-// libs/view/src/AggFold.cpp — see AggFold.h / AggState.h.
+// broker/libs/view/src/AggFold.cpp — see AggFold.h / AggState.h.
 #include <rune/view/AggFold.h>
 
 #include <algorithm>
@@ -1429,6 +1513,18 @@ inline bool sameValue(AccKind kind, const uint8_t* a, const uint8_t* b) noexcept
 constexpr uint8_t kEmpty   = static_cast<uint8_t>(CacheState::Empty);
 constexpr uint8_t kValid   = static_cast<uint8_t>(CacheState::Valid);
 constexpr uint8_t kPending = static_cast<uint8_t>(CacheState::RescanPending);
+
+// What `retract` does with the group the contributor leaves. One state per legal
+// combination (this replaces a (dropIfEmpty, emitNow) bool pair, F8):
+//   Delete         tombstone / missing group key: an emptied group loses its rows,
+//                  a non-empty group is re-emitted now.
+//   Move           update into ANOTHER group, or any 2a update: a non-empty old
+//                  group is re-emitted now; an emptied one is dropped by the caller
+//                  after the add.
+//   InPlaceLinked  update within the SAME group of a linked view: no emit and no
+//                  drop here. The caller's add + emit follows, so a new value that
+//                  is at least as extreme skips the rescan.
+enum class RetractMode : uint8_t { Delete, Move, InPlaceLinked };
 
 struct Ctx {
     const RowLayout& layout;
@@ -1732,18 +1828,16 @@ struct Ctx {
     }
 
     // Retracts contributor `c` (pre-image row `cr`) from its group and, in a
-    // linked view, unlinks it. An emptied group loses its rows iff
-    // `dropIfEmpty`; otherwise the caller decides. A non-empty group is
-    // re-emitted iff `emitNow` (an in-place linked update defers it until after
-    // the add, so an at-least-as-extreme new value skips the rescan).
-    uint64_t retract(uint64_t c, const uint8_t* cr, bool dropIfEmpty, bool emitNow) noexcept {
+    // linked view, unlinks it. `mode` says what then happens to the group (see
+    // RetractMode above).
+    uint64_t retract(uint64_t c, const uint8_t* cr, RetractMode mode) noexcept {
         const uint64_t g = loadU64(cr);
         uint8_t* gr = applyContribution(cr, -1);
         if (agg.linked) unlink(c, cr, g, gr);
         if (gr == nullptr) return g;   // inconsistent: counted, nothing else changed
         if (loadU64(gr) == 0) {
-            if (dropIfEmpty) dropGroup(g);
-        } else if (emitNow) {
+            if (mode == RetractMode::Delete) dropGroup(g);
+        } else if (mode != RetractMode::InPlaceLinked) {
             emit(g, gr);
         }
         return g;
@@ -1788,7 +1882,7 @@ FoldStats foldAggregateBatch(const CompiledViewPlan& /*plan*/, const RowLayout& 
             const uint8_t* old = contributors.get(c);
             if (value.empty()) {               // tombstone: retract a known contributor
                 if (old != nullptr) {
-                    (void)cx.retract(c, old, /*dropIfEmpty*/ true, /*emitNow*/ true);
+                    (void)cx.retract(c, old, RetractMode::Delete);
                     contributors.erase(c);
                 }
                 ++stats.deleted;
@@ -1804,7 +1898,7 @@ FoldStats foldAggregateBatch(const CompiledViewPlan& /*plan*/, const RowLayout& 
             const FieldValue gk = rune::codec::readField(d, asBytes(value), agg.keySrcFieldId);
             if (!gk.present) {
                 if (old != nullptr) {
-                    (void)cx.retract(c, old, /*dropIfEmpty*/ true, /*emitNow*/ true);
+                    (void)cx.retract(c, old, RetractMode::Delete);
                     contributors.erase(c);
                 }
                 ++stats.skippedNoGroup;
@@ -1818,8 +1912,8 @@ FoldStats foldAggregateBatch(const CompiledViewPlan& /*plan*/, const RowLayout& 
             if (old != nullptr) {
                 hadOld = true;
                 const bool sameGroup = loadU64(old) == g;
-                oldGroup = cx.retract(c, old, /*dropIfEmpty*/ false,
-                                      /*emitNow*/ !(agg.linked && sameGroup));
+                oldGroup = cx.retract(c, old, agg.linked && sameGroup ? RetractMode::InPlaceLinked
+                                                                       : RetractMode::Move);
             }
 
             uint8_t* cr = contributors.put(c);   // same row when it already existed
@@ -1864,22 +1958,31 @@ FoldStats foldAggregateBatch(const CompiledViewPlan& /*plan*/, const RowLayout& 
 ```
 
 Notes for the implementer. These are the same contract that is enforced in code above:
-- The 2a path is unchanged. With `agg.linked == false`, `emitNow` is always `true`, `unlink`/`linkAtHead` never run, Min/Max/Last never occur, and `inputOff[i] == contribValOff + 8*i`. The order of `put` calls, and therefore the order of dirty entries and the checkpoint bytes, is identical to 2a.
+- The 2a path is unchanged. With `agg.linked == false`, the mode is never `InPlaceLinked` (a non-empty old group is always re-emitted on retract, as in 2a), `unlink`/`linkAtHead` never run, Min/Max/Last never occur, and `inputOff[i] == contribValOff + 8*i`. The order of `put` calls, and therefore the order of dirty entries and the checkpoint bytes, is identical to 2a.
 - `put()` is the only call that marks a row dirty. Neighbour fix-ups therefore go through `linkedContributor` (`get` first, then `put`), and a rescan uses `get` only.
 
 - [ ] **Step 4: Run the tests and confirm they pass.**
 
-Run: `cmake --build build-fast -j --target rune_view_tests && ctest --test-dir build-fast -R 'AggRetractable|AggFold|AggState' --output-on-failure`
+Run: `cmake --build build/root -j14 --target rune_view_tests && ctest --test-dir build/root -R 'AggRetractable|AggFold|AggState' --output-on-failure`
 Expected: every `AggRetractable*` test passes, and every 2a `AggFold*` test passes unchanged.
 
-- [ ] **Step 5: Run the regression gate and commit.**
+- [ ] **Step 5: Run the affected tests and commit.**
 
-Run: `ctest --test-dir build-fast -R Regression --output-on-failure` → 0 failures.
+Run: `ctest --test-dir build/root -R 'AggRetractable|AggFold|AggState|ViewFold|ViewCheckpoint' -j14 --output-on-failure` → 0 failures.
 
 ```bash
-git add libs/view/include/rune/view/ViewFold.h libs/view/src/AggFold.cpp libs/view/tests/view/AggRetractableTest.cpp libs/view/CMakeLists.txt
+git add broker/libs/view/include/rune/view/ViewFold.h broker/libs/view/src/AggFold.cpp broker/libs/view/tests/view/AggRetractableTest.cpp broker/libs/view/CMakeLists.txt
 git commit -m "feat(view): retractable Min/Max/Last/LastNonNull — MRU contributor list, cached extremes, rescan on retracted extreme" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
+
+- [ ] **Step 6: Early gate run (F4).** The typical-case gate is the riskiest number in Part A: the churn retracts a cached extreme on roughly 2% of retracting ops (about 0.8% of records), and each rescan walks about 100 random rows of a 1M-row table, so `ret_record_p99_us < 5` is borderline. Do not wait for Task 8. Do **Task 8 Steps 1–3 now** (fixtures, the shared `AggRig` helper, `BM_ViewFoldRetractable`), commit them as Task 8's first commit, and run the gate in the release build (start benches early):
+
+```bash
+cmake --build build/rel -j14 --target rune_broker_benchmark
+build/rel/broker/rune_broker_benchmark --benchmark_filter='ViewFold(Retractable|Aggregate|Replace)'
+```
+
+Expected: `[ViewFoldRetractable gate] … => PASS`, and `BM_ViewFoldAggregate` / `BM_ViewFoldReplace` still PASS. On a FAIL, report `ret_rescans` divided by the measured records and the record-vs-batch p99 split to the controller **before any tuning**; never relax the gate or its thresholds.
 
 ---
 
@@ -1888,12 +1991,56 @@ git commit -m "feat(view): retractable Min/Max/Last/LastNonNull — MRU contribu
 These tests target the linked fold's two quiet failure modes: a list or cache that drifts from the truth only after a long, specific history, and a record that dirties more rows than the per-pass cap assumes. Both fail silently in production; here they fail deterministically.
 
 **Files:**
-- Modify: `libs/view/tests/view/AggRetractableTest.cpp` (append)
+- Modify: `broker/libs/view/tests/view/AggRetractableTest.cpp` (append)
 
 **Interfaces:**
-- Consumes: `aggDirtyBoundPerRecord`, `AggDirtyBound` (Task 4); `Harness::drainCounts` and `Ord`/`encode` (Task 5's test file).
+- Consumes: `aggDirtyBoundPerRecord`, `AggDirtyBound` (Task 4); `Harness::drainCounts` and `Ord`/`encode` (Task 5's test file). Adds `Harness::Rec` and `Harness::applySplit` (Step 1a, F9).
 
-- [ ] **Step 1: Write the tests.** Append to `libs/view/tests/view/AggRetractableTest.cpp`:
+- [ ] **Step 1a: Extend the harness (F9).** In `Harness` (Task 5's test file), directly after `drainCounts()`, add a way to fold one batch in two passes. This is the worker's capped-pass shape: pass 1 stops at `bound`, pass 2 resumes from the cursor.
+
+```cpp
+    using Rec = std::pair<std::vector<uint8_t>, std::vector<uint8_t>>;
+
+    // Folds `recs` as ONE batch in two passes split after `firstPass` records
+    // (1 <= firstPass < recs.size()): pass 1 is capped by `bound`, pass 2 resumes
+    // mid-batch from the cursor. Returns both passes' dirty entries summed. Each
+    // pass is also checked: at most (records in the pass) x the per-record bound
+    // per table (dirty entries coalesce inside a pass), and no RescanPending cache.
+    Drained applySplit(const std::vector<Rec>& recs, size_t firstPass) {
+        rune::protocol::RecordBatchBuilder b(next, 0);
+        for (const auto& [k, v] : recs) {
+            b.append(std::string_view(reinterpret_cast<const char*>(k.data()), k.size()),
+                     std::string_view(reinterpret_cast<const char*>(v.data()), v.size()), 0);
+        }
+        const auto batch = b.build();
+        const int64_t full = next + static_cast<int64_t>(recs.size());
+        const int64_t cap  = next + static_cast<int64_t>(firstPass);
+        const rune::storage::LogReadView lv{batch.data(), batch.size(), next, full};
+        const auto perRec = rune::view::aggDirtyBoundPerRecord(agg);
+        Drained total;
+        size_t done = 0;
+        for (const int64_t bnd : {cap, full}) {
+            last = rune::view::foldAggregateBatch(comp.plan, comp.rowLayout, agg, vdc, view,
+                                                  contributors, groups, lv, bnd, cursor);
+            inconsistent += last.aggInconsistent;
+            const size_t inPass = static_cast<size_t>(bnd - next) - done;
+            done += inPass;
+            const Drained d = drainCounts();
+            EXPECT_LE(d.contributorRows, inPass * perRec.contributorRows);
+            EXPECT_LE(d.groupRows, inPass * perRec.groupRows);
+            EXPECT_LE(d.viewRows, inPass * perRec.viewRows);
+            EXPECT_EQ(d.pendingCaches, 0u);
+            total.contributorRows += d.contributorRows;
+            total.groupRows += d.groupRows;
+            total.viewRows += d.viewRows;
+            total.pendingCaches += d.pendingCaches;
+        }
+        next = full;
+        return total;
+    }
+```
+
+- [ ] **Step 1: Write the tests.** Append to `broker/libs/view/tests/view/AggRetractableTest.cpp`:
 
 ```cpp
 // REGRESSION (Review Focus #3): the worst case the per-pass delta cap assumes
@@ -1924,12 +2071,15 @@ TEST(AggRetractableRegression, WorstCaseMoveDirtiesExactlyTheDerivedBoundRegress
     EXPECT_EQ(h.inconsistent, 0u);
 }
 
-// REGRESSION (Review Focus #1/#3): a deterministic 3000-op history of inserts,
-// in-place updates, group moves and deletes over 24 contributors / 4 groups,
-// with heavy value duplication. After EVERY record: each group's Count(*), Sum,
-// Max, Min, Last, Last(bonus), LastNonNull(bonus) equals a brute-force
-// recomputation; each table's dirty entries are within the derived bound; no
-// cache is left RescanPending; nothing is ever inconsistent.
+// REGRESSION (Review Focus #1/#3, F9): a deterministic history of 3000 steps of
+// 1-4 records each (inserts, in-place updates, group moves, deletes; the same
+// contributor can repeat inside one batch) over 24 contributors / 4 groups, with
+// heavy value duplication. Every 5th multi-record step is folded in two passes
+// split at a random mid-batch boundary (capped-pass resume). After EVERY step:
+// each group's Count(*), Sum, Max, Min, Last, Last(bonus), LastNonNull(bonus)
+// equals a brute-force recomputation; each table's dirty entries are within
+// records x the derived per-record bound; no cache is left RescanPending;
+// nothing is ever inconsistent.
 TEST(AggRetractableRegression, RandomizedOpsMatchBruteForceModelRegression) {
     struct M { int64_t user; int64_t amount; std::optional<int32_t> bonus; uint64_t seq; };
     std::map<int64_t, M> live;
@@ -1940,35 +2090,47 @@ TEST(AggRetractableRegression, RandomizedOpsMatchBruteForceModelRegression) {
         state = state * 6364136223846793005ull + 1442695040888963407ull;
         return (state >> 33) % m;
     };
+    uint64_t seq = 0;
     for (uint64_t step = 1; step <= 3000; ++step) {
-        const int64_t id = 1 + static_cast<int64_t>(rnd(24));
-        if (rnd(100) < 15) {
-            h.put(id, tombstone());
-            live.erase(id);
-        } else {
-            Ord o{id, 1 + static_cast<int64_t>(rnd(4)), static_cast<int64_t>(rnd(41)) - 20};
-            if (rnd(2) == 0) o.bonus = static_cast<int32_t>(rnd(9));
-            h.putOrd(o);
-            live[id] = M{o.user, o.amount, o.bonus, step};
+        const size_t n = 1 + static_cast<size_t>(rnd(4));
+        std::vector<Harness::Rec> recs;
+        for (size_t i = 0; i < n; ++i) {
+            const int64_t id = 1 + static_cast<int64_t>(rnd(24));
+            ++seq;
+            if (rnd(100) < 15) {
+                recs.push_back({Harness::key(id), tombstone()});
+                live.erase(id);
+            } else {
+                Ord o{id, 1 + static_cast<int64_t>(rnd(4)), static_cast<int64_t>(rnd(41)) - 20};
+                if (rnd(2) == 0) o.bonus = static_cast<int32_t>(rnd(9));
+                recs.push_back({Harness::key(id), encode(o)});
+                live[id] = M{o.user, o.amount, o.bonus, seq};
+            }
         }
-        const auto d = h.drainCounts();
-        ASSERT_LE(d.contributorRows, bound.contributorRows) << "step " << step;
-        ASSERT_LE(d.groupRows, bound.groupRows) << "step " << step;
-        ASSERT_LE(d.viewRows, bound.viewRows) << "step " << step;
+        Harness::Drained d;
+        if (n >= 2 && step % 5 == 0) {
+            d = h.applySplit(recs, 1 + static_cast<size_t>(rnd(n - 1)));   // pass 1 stops mid-batch
+        } else {
+            h.apply(recs);
+            d = h.drainCounts();
+        }
+        ASSERT_LE(d.contributorRows, n * bound.contributorRows) << "step " << step;
+        ASSERT_LE(d.groupRows, n * bound.groupRows) << "step " << step;
+        ASSERT_LE(d.viewRows, n * bound.viewRows) << "step " << step;
         ASSERT_EQ(d.pendingCaches, 0u) << "step " << step;
         for (int64_t g = 1; g <= 4; ++g) {
             const M* lastM = nullptr;
             const M* lastNn = nullptr;
-            int64_t n = 0, total = 0, mx = INT64_MIN, mn = INT64_MAX;
+            int64_t cnt = 0, total = 0, mx = INT64_MIN, mn = INT64_MAX;
             for (const auto& [k, m] : live) {
                 if (m.user != g) continue;
-                ++n; total += m.amount;
+                ++cnt; total += m.amount;
                 mx = std::max(mx, m.amount); mn = std::min(mn, m.amount);
                 if (lastM == nullptr || m.seq > lastM->seq) lastM = &m;
                 if (m.bonus && (lastNn == nullptr || m.seq > lastNn->seq)) lastNn = &m;
             }
-            if (n == 0) { ASSERT_FALSE(h.hasGroup(g)) << "step " << step << " group " << g; continue; }
-            ASSERT_EQ(h.col(g, kN).i, n) << "step " << step << " group " << g;
+            if (cnt == 0) { ASSERT_FALSE(h.hasGroup(g)) << "step " << step << " group " << g; continue; }
+            ASSERT_EQ(h.col(g, kN).i, cnt) << "step " << step << " group " << g;
             ASSERT_EQ(h.col(g, kTotal).i, total) << "step " << step;
             ASSERT_EQ(h.col(g, kMaxAmt).i, mx) << "step " << step << " group " << g;
             ASSERT_EQ(h.col(g, kMinAmt).i, mn) << "step " << step << " group " << g;
@@ -1983,20 +2145,80 @@ TEST(AggRetractableRegression, RandomizedOpsMatchBruteForceModelRegression) {
     }
     EXPECT_EQ(h.inconsistent, 0u);
 }
+
+// REGRESSION (F9, op "no-group"): a rewrite whose group key is ABSENT retracts
+// the old contributor from a LINKED group -- unlink, count, cache -- and skips.
+// The source declares the group-by field only from v2 (as AggFoldTest's
+// MissingGroupValueRetractsAndSkips does); a v1 record lacks it.
+TEST(AggRetractableRegression, NoGroupRewriteUnlinksAndRetractsTheContributorRegression) {
+    const auto src = rune::codec::DescriptorBuilder("o", 2)
+        .add("orderId", P::Int64, 1, true)
+        .add("amount", P::Int64, 1)
+        .add("userId", P::Int64, 2)
+        .build();
+    rune::view::ViewPlan v;
+    v.viewName = "t"; v.key = "userId"; v.sources = {{5, "userId"}};
+    v.output = {{"userId", P::Int64, 0, "userId", R::Replace},
+                {"n", P::Int64, 0, "", R::CountAll},
+                {"max", P::Int64, 0, "amount", R::Max},
+                {"last", P::Int64, 0, "amount", R::Last}};
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(v, srcs, 9).value();
+    auto agg = rune::view::buildAggLayout(comp.plan, src).value();
+    ASSERT_TRUE(agg.linked);
+    rune::view::VersionDescriptorCache vdc(src);
+    rune::view::ViewTable view(comp.rowLayout), contributors(agg.contributorRow), groups(agg.groupRow);
+    int64_t off = 0;
+    auto fold = [&](int64_t id, const std::vector<uint8_t>& value) {
+        rune::protocol::RecordBatchBuilder b(off, 0);
+        const auto k = Harness::key(id);
+        b.append(std::string_view(reinterpret_cast<const char*>(k.data()), 8),
+                 std::string_view(reinterpret_cast<const char*>(value.data()), value.size()), 0);
+        const auto batch = b.build();
+        int64_t cur = off;
+        const auto st = rune::view::foldAggregateBatch(
+            comp.plan, comp.rowLayout, agg, vdc, view, contributors, groups,
+            {batch.data(), batch.size(), off, off + 1}, off + 1, cur);
+        ++off;
+        return st;
+    };
+    auto v2 = [&](int64_t id, int64_t amount) {
+        std::vector<uint8_t> b;
+        le16(b, 24); le16(b, 2); le64(b, uint64_t(id)); le64(b, uint64_t(amount)); le64(b, 100);
+        return b;
+    };
+    (void)fold(1, v2(1, 50));
+    (void)fold(2, v2(2, 30));                       // list: 2 (head) -> 1; max 50 held by contributor 1
+    std::vector<uint8_t> v1;
+    le16(v1, 16); le16(v1, 1); le64(v1, 1); le64(v1, 50);   // contributor 1 rewritten WITHOUT userId
+    const auto st = fold(1, v1);
+    EXPECT_EQ(st.skippedNoGroup, 1u);
+    EXPECT_EQ(st.aggInconsistent, 0u);
+    const uint8_t* row = view.get(100);
+    ASSERT_NE(row, nullptr) << "contributor 2 still holds the group";
+    EXPECT_EQ(rune::view::readSlot(row, comp.rowLayout, 1).i, 1);
+    EXPECT_EQ(rune::view::readSlot(row, comp.rowLayout, 2).i, 30) << "the retracted max (50) rescans to 30";
+    EXPECT_EQ(rune::view::readSlot(row, comp.rowLayout, 3).i, 30);
+    EXPECT_EQ(contributors.size(), 1u);
+    EXPECT_EQ(contributors.get(1), nullptr);
+    (void)fold(2, [&] { std::vector<uint8_t> b; le16(b, 16); le16(b, 1); le64(b, 2); le64(b, 30); return b; }());
+    EXPECT_EQ(view.get(100), nullptr) << "the last contributor left: group and list are gone";
+    EXPECT_EQ(contributors.size(), 0u);
+}
 ```
 
 - [ ] **Step 2: Run them.**
 
-Run: `cmake --build build-fast -j --target rune_view_tests && ctest --test-dir build-fast -R 'AggRetractableRegression' --output-on-failure`
-Expected: both pass on Task 5's fold. If either fails, the failure is a real bug in Task 5. Debug it with superpowers:systematic-debugging, fix it in `AggFold.cpp`, and keep the test as written; the step number in the message localizes the bug.
+Run: `cmake --build build/root -j14 --target rune_view_tests && ctest --test-dir build/root -R 'AggRetractableRegression' --output-on-failure`
+Expected: all three pass on Task 5's fold. If either fails, the failure is a real bug in Task 5. Debug it with superpowers:systematic-debugging, fix it in `AggFold.cpp`, and keep the test as written; the step number in the message localizes the bug.
 
-- [ ] **Step 3: Run the regression gate and commit.**
+- [ ] **Step 3: Run the affected tests and commit.**
 
-Run: `ctest --test-dir build-fast -R Regression --output-on-failure` → 0 failures.
+Run: `ctest --test-dir build/root -R 'AggRetractable|AggFold|AggState' -j14 --output-on-failure` → 0 failures.
 
 ```bash
-git add libs/view/tests/view/AggRetractableTest.cpp
-git commit -m "test(view): pin the linked fold's exact per-record dirty bound; model-check 3000 ops against brute force" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+git add broker/libs/view/tests/view/AggRetractableTest.cpp
+git commit -m "test(view): pin the linked fold's exact per-record dirty bound; model-check 3000 multi-record steps (capped-pass resume) against brute force; no-group unlink" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -2004,13 +2226,13 @@ git commit -m "test(view): pin the linked fold's exact per-record dirty bound; m
 ### Task 7: Worker — per-pass cap from the derived bound; restart regression
 
 **Files:**
-- Modify: `libs/node/src/WorkerViewSet.cpp:132-` (`maxRecordsPerPassFor`: its comment starts at 132, the function at 136)
-- Test: `libs/node/tests/node/WorkerViewSetTest.cpp` (append)
+- Modify: `broker/libs/node/src/WorkerViewSet.cpp:132-` (`maxRecordsPerPassFor`: its comment starts at 132, the function at 136)
+- Test: `broker/libs/node/tests/node/WorkerViewSetTest.cpp` (append)
 
 **Interfaces:**
 - Consumes: `aggDirtyBoundPerRecord` (Task 4); the linked fold (Task 5). `AggInstance`, `ViewInstance` and the recovery and checkpoint code are unchanged: the new links, heads and caches are bytes inside the contributor and group rows the v2 record already carries.
 
-- [ ] **Step 1: Write the failing tests.** Append to the end of `libs/node/tests/node/WorkerViewSetTest.cpp` (after the last test; `orderSrc`, `orderBatch`, `drainDeltas` and `driveToEnd` are defined earlier in the file):
+- [ ] **Step 1: Write the failing tests.** Append to the end of `broker/libs/node/tests/node/WorkerViewSetTest.cpp` (after the last test; `orderSrc`, `orderBatch`, `drainDeltas` and `driveToEnd` are defined earlier in the file):
 
 ```cpp
 namespace {
@@ -2128,10 +2350,10 @@ Add `#include <algorithm>` and `#include <climits>` to the file's includes if th
 
 - [ ] **Step 2: Run them and confirm the large-range test fails.**
 
-Run: `cmake --build build-fast -j --target rune_node_tests && ctest --test-dir build-fast -R 'WorkerViewSetRegression\.(RestartThenRetracting|PersistedRetractableMoves)' --output-on-failure`
+Run: `cmake --build build/root -j14 --target rune_node_tests && ctest --test-dir build/root -R 'WorkerViewSetRegression\.(RestartThenRetracting|PersistedRetractableMoves)' --output-on-failure`
 Expected: `PersistedRetractableMovesDeltasFitTheRingRegression` **fails**. `ASSERT_NO_THROW` reports the ring's oversized-claim exception: the 2a formula gives 366 B per record, so a pass covers about 358 move records, which really dirty 528 B each, about 189 KB, over the 128 KiB max message. `RestartThenRetractingTheMaxIsExactRegression` already passes on Task 5's fold. That is expected: it guards the recovery path, which needs no code change.
 
-- [ ] **Step 3: Implement.** In `libs/node/src/WorkerViewSet.cpp`, replace the comment (from `// Most source records one fold pass may cover`) and the body of `maxRecordsPerPassFor` with:
+- [ ] **Step 3: Implement.** In `broker/libs/node/src/WorkerViewSet.cpp`, replace the comment (from `// Most source records one fold pass may cover`) and the body of `maxRecordsPerPassFor` with:
 
 ```cpp
 // Most source records one fold pass may cover so the pass's checkpoint delta
@@ -2163,15 +2385,16 @@ For 2a views this computes exactly the old value, because `{1, 2, 2}` gives the 
 
 - [ ] **Step 4: Run the tests and confirm they pass.**
 
-Run: `cmake --build build-fast -j --target rune_node_tests && ctest --test-dir build-fast -R 'WorkerViewSet|ViewRecovery|ViewReadiness|GetViewRow|CreateView' --output-on-failure`
+Run: `cmake --build build/root -j14 --target rune_node_tests rune_get_view_row_tests rune_create_view_tests && ctest --test-dir build/root -R 'WorkerViewSet|ViewRecovery|ViewReadiness|GetViewRow|CreateView' -j14 --output-on-failure`
+(S9: `GetViewRow` and `CreateView` live in their own binaries, `rune_get_view_row_tests` and `rune_create_view_tests`; build them or they run stale.)
 Expected: all pass, including 2a's `PersistedAggregateLargeRangeDeltasFitTheRing` and `AggregateRecoveryOfLargeCheckpointDoesNotResendRows`.
 
-- [ ] **Step 5: Run the regression gate and commit.**
+- [ ] **Step 5: Run the affected tests and commit.**
 
-Run: `ctest --test-dir build-fast -R Regression --output-on-failure` → 0 failures.
+Run: `cmake --build build/root -j14 --target rune_view_tests && ctest --test-dir build/root -R 'Agg|ViewFold' -j14 --output-on-failure` → 0 failures (Step 4 already ran the node-side suites). The controller's checkpoint after this task runs the full `*Regression*` suite.
 
 ```bash
-git add libs/node/src/WorkerViewSet.cpp libs/node/tests/node/WorkerViewSetTest.cpp
+git add broker/libs/node/src/WorkerViewSet.cpp broker/libs/node/tests/node/WorkerViewSetTest.cpp
 git commit -m "fix(node): per-pass delta cap uses the exact linked-aggregate dirty bound (4+2+2); restart-then-retract-max regression" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
@@ -2179,13 +2402,16 @@ git commit -m "fix(node): per-pass delta cap uses the exact linked-aggregate dir
 
 ### Task 8: Benchmarks — typical-case gate and extreme-retraction report
 
+Steps 1–3 (fixtures, the shared helper, `BM_ViewFoldRetractable`) are done **right after Task 5** and committed as this task's first commit (F4; Task 5 Step 6 runs the gate). Steps 4–6 follow after Task 7.
+
 **Files:**
-- Modify: `benchmark/ViewFoldBench.cpp` (fixtures after `userTotalsView()`, line ~218; two new benchmarks at the end of the file)
+- Modify: `broker/benchmark/ViewFoldBench.cpp` (fixtures after `userTotalsView()`, lines 208–218; the `AggRig` helper directly before the anonymous namespace's closing `} // namespace`, line 440, because it needs `BatchStream`, `buildStream` and `encodeOrder`; `BM_ViewFoldAggregate` refactored onto it; two new benchmarks at the end of the file)
 
 **Interfaces:**
 - Consumes: `foldAggregateBatch`, `buildAggLayout`, `FoldStats::aggRescans`; the shared harness (`Op`, `buildStream`, `BatchStream`, `runPhases`, `reportCommon`, `percentileUs`, `generateChurnOps`, `kBatchSizes`, `kTotalOps`, `keyBytes`, `asSv`, `encodeOrder`, `orderSourceV1`).
+- Produces: `AggRig` (anonymous namespace): the 1,000,000-contributor / 10,000-group aggregate rig (compile + tables + `append` / `drainAll` / `foldStream` / `prime`), used by both `BM_ViewFoldAggregate` and `BM_ViewFoldRetractable`.
 
-- [ ] **Step 1: Add the fixtures.** Add `#include <rune/view/ViewRow.h>` next to the other `rune/view` includes. Inside the anonymous namespace, directly after `userTotalsView()`, add:
+- [ ] **Step 1: Add the fixtures.** Add `#include <rune/view/ViewRow.h>` next to the other `rune/view` includes. Inside the anonymous namespace, directly after `userTotalsView()` (lines 208–218), add:
 
 ```cpp
 // --- Retractable aggregate fixtures (Phase 2b) ---
@@ -2219,83 +2445,124 @@ rune::view::ViewPlan groupMaxView() {
 constexpr int64_t kExtremeGroup = 7;
 ```
 
-- [ ] **Step 2: Add the gated benchmark.** Append to the end of `benchmark/ViewFoldBench.cpp`:
+- [ ] **Step 2: Factor the shared rig (F10).** `BM_ViewFoldAggregate` and the new gate run the identical workload (same append, drain, fold and prime code). Define it once. Directly before the anonymous namespace's closing `} // namespace` (line 440), add:
+
+```cpp
+// --- Shared aggregate rig (BM_ViewFoldAggregate, BM_ViewFoldRetractable) ---
+// 1,000,000 contributors / 10,000 groups, amounts from the churn's `hp`.
+constexpr uint64_t kAggContributors = 1'000'000;
+constexpr uint64_t kAggGroups       = 10'000;
+
+struct AggRig {
+    rune::codec::Descriptor   src  = orderSourceV1();
+    rune::view::CompileResult comp;
+    rune::view::AggLayout     agg;
+    ViewTable                 view, contributors, groups;
+    VersionDescriptorCache    vdc;
+    uint64_t                  rescans = 0;   // summed FoldStats::aggRescans (0 for a 2a-only view)
+
+    AggRig(const rune::view::ViewPlan& plan, int32_t viewTopicId)
+        : comp(compile(plan, src, viewTopicId)),
+          agg(rune::view::buildAggLayout(comp.plan, src).value()),
+          view(comp.rowLayout), contributors(agg.contributorRow), groups(agg.groupRow), vdc(src) {}
+
+    static rune::view::CompileResult compile(const rune::view::ViewPlan& plan,
+                                             const rune::codec::Descriptor& src, int32_t id) {
+        const rune::codec::Descriptor* srcs[] = {&src};
+        return compileView(plan, srcs, id).value();
+    }
+
+    // Contributor id c in [0, 1M); group fixed per c.
+    static void append(rune::protocol::RecordBatchBuilder& bb, const Op& op) {
+        const int64_t c = static_cast<int64_t>(op.key % kAggContributors);
+        const auto kb = keyBytes(c);
+        if (op.tombstone) {
+            bb.append(asSv(kb), std::string_view{}, 0);
+        } else {
+            const auto val = encodeOrder(c, c % kAggGroups, static_cast<int64_t>(op.hp), 1);
+            bb.append(asSv(kb), asSv(val), 0);
+        }
+    }
+    void drainAll() {
+        auto nop = [](uint32_t, const uint8_t*, bool, uint64_t) {};
+        view.drainDirty(nop);
+        contributors.drainDirty(nop);
+        groups.drainDirty(nop);
+    }
+    rune::view::FoldStats foldStream(const BatchStream& s, size_t i) {
+        auto lv = s.view(i);
+        int64_t cur = 0;
+        const auto fs = foldAggregateBatch(comp.plan, comp.rowLayout, agg, vdc, view, contributors,
+                                           groups, lv, s.bound(i), cur);
+        rescans += fs.aggRescans;
+        return fs;
+    }
+    // Creates-only fold over the whole contributor space (NOT timed), then drains;
+    // the tables reach their final population and capacity. Resets `rescans`.
+    void prime() {
+        constexpr int kPrimeBatch[] = {64};
+        std::vector<Op> ops;
+        ops.reserve(kAggContributors);
+        for (uint64_t c = 0; c < kAggContributors; ++c)
+            ops.push_back(Op{c, static_cast<int32_t>(c ^ 0x5a5a), false});
+        const auto ps = buildStream(ops, kPrimeBatch, 1, append);
+        for (size_t i = 0; i < ps.size(); ++i) foldStream(ps, i);
+        drainAll();
+        rescans = 0;
+    }
+};
+```
+
+Refactor `BM_ViewFoldAggregate` onto it, keeping every counter name and the printed output exactly. Replace the block from `constexpr uint64_t kContributors      = 1'000'000;` through the end of the prime block (`drainAll();\n        }` before `const auto ops = generateChurnOps(kTotalOps);`) with:
+
+```cpp
+    constexpr uint64_t kContributors      = kAggContributors;   // the liveness proof below uses it
+    constexpr uint64_t kDrainEveryBatches = 1000;
+
+    for (auto _ : st) {
+        AggRig rig(userTotalsView(), 0x51000002);
+        auto& view = rig.view;
+        auto& contributors = rig.contributors;
+        auto& groups = rig.groups;
+        auto drainAll = [&] { rig.drainAll(); };
+        auto foldStream = [&](const BatchStream& s, size_t i) { return rig.foldStream(s, i); };
+        auto append = &AggRig::append;
+        rig.prime();
+```
+
+The rest of `BM_ViewFoldAggregate` (the `ops` / `stream` / `runPhases` calls, the retract+re-add proof, the counters and the gate print) stays unchanged: it uses the same local names (`view`, `contributors`, `groups`, `drainAll`, `foldStream`, `append`) and `kGroups` is no longer needed there. Delete any now-unused local.
+
+- [ ] **Step 3: Add the gated benchmark.** Append to the end of `broker/benchmark/ViewFoldBench.cpp`:
 
 ```cpp
 // Retractable aggregate gate (Phase 2b, §14.0): user_stats = Count(*), Sum,
-// Max, Min, Last, LastNonNull over amount, grouped by userId — the SAME
+// Max, Min, Last, LastNonNull over amount, grouped by userId — the SAME rig,
 // workload, priming, drain cadence and three phases as BM_ViewFoldAggregate
-// (1,000,000 contributors / 10,000 groups, ~100 per group). The churn's
-// pseudo-random amounts retract a group's cached Min or Max on roughly 2% of
-// retracting ops, so this IS the typical case including its occasional
+// (shared AggRig: 1,000,000 contributors / 10,000 groups, ~100 per group). The
+// churn's pseudo-random amounts retract a group's cached Min or Max on roughly
+// 2% of retracting ops, so this IS the typical case including its occasional
 // O(group) rescans (ret_rescans counts them). BM_ViewFoldExtremeRetract
 // isolates that path. GATE: ret_record_p99_us < 5, ret_batch_p99_us < 10,
 // steady_alloc == 0.
 static void BM_ViewFoldRetractable(benchmark::State& st) {
-    constexpr uint64_t kContributors      = 1'000'000;
-    constexpr uint64_t kGroups            = 10'000;
     constexpr uint64_t kDrainEveryBatches = 1000;
-    constexpr int kPrimeBatch[]           = {64};
 
     for (auto _ : st) {
-        auto src = orderSourceV1();
-        const rune::codec::Descriptor* srcs[] = {&src};
-        auto comp = compileView(userStatsView(), srcs, 0x51000003).value();
-        auto agg = rune::view::buildAggLayout(comp.plan, src).value();
-
-        ViewTable view(comp.rowLayout);
-        ViewTable contributors(agg.contributorRow), groups(agg.groupRow);
-        VersionDescriptorCache vdc(src);
-
-        auto append = [](rune::protocol::RecordBatchBuilder& bb, const Op& op) {
-            const int64_t c = static_cast<int64_t>(op.key % kContributors);
-            const auto kb = keyBytes(c);
-            if (op.tombstone) {
-                bb.append(asSv(kb), std::string_view{}, 0);
-            } else {
-                const auto val = encodeOrder(c, c % kGroups, static_cast<int64_t>(op.hp), 1);
-                bb.append(asSv(kb), asSv(val), 0);
-            }
-        };
-        auto drainAll = [&] {
-            auto nop = [](uint32_t, const uint8_t*, bool, uint64_t) {};
-            view.drainDirty(nop);
-            contributors.drainDirty(nop);
-            groups.drainDirty(nop);
-        };
-        uint64_t rescans = 0;
-        auto foldStream = [&](const BatchStream& s, size_t i) {
-            auto lv = s.view(i);
-            int64_t cur = 0;
-            const auto fs = foldAggregateBatch(comp.plan, comp.rowLayout, agg, vdc, view, contributors,
-                                               groups, lv, s.bound(i), cur);
-            rescans += fs.aggRescans;
-            return fs;
-        };
-
-        // --- Prime: creates-only over the whole contributor space (NOT timed).
-        {
-            std::vector<Op> prime;
-            prime.reserve(kContributors);
-            for (uint64_t c = 0; c < kContributors; ++c)
-                prime.push_back(Op{c, static_cast<int32_t>(c ^ 0x5a5a), false});
-            const auto ps = buildStream(prime, kPrimeBatch, 1, append);
-            for (size_t i = 0; i < ps.size(); ++i) foldStream(ps, i);
-            drainAll();
-        }
-        rescans = 0;   // count the churn's rescans only
+        AggRig rig(userStatsView(), 0x51000003);
+        rig.prime();   // also zeroes rescans: count the churn's only
 
         const auto ops = generateChurnOps(kTotalOps);
-        const auto stream = buildStream(ops, kBatchSizes, std::size(kBatchSizes), append);
+        const auto stream = buildStream(ops, kBatchSizes, std::size(kBatchSizes), AggRig::append);
         auto r = runPhases(
-            stream, [&](size_t i) { return foldStream(stream, i); }, drainAll, kDrainEveryBatches);
+            stream, [&](size_t i) { return rig.foldStream(stream, i); }, [&] { rig.drainAll(); },
+            kDrainEveryBatches);
 
-        benchmark::DoNotOptimize(view.size());
-        benchmark::DoNotOptimize(groups.size());
-        benchmark::DoNotOptimize(contributors.size());
-        reportCommon(st, "ret_", r, view.size());
-        st.counters["ret_rescans"]            = static_cast<double>(rescans);
-        st.counters["ret_contributors_final"] = static_cast<double>(contributors.size());
+        benchmark::DoNotOptimize(rig.view.size());
+        benchmark::DoNotOptimize(rig.groups.size());
+        benchmark::DoNotOptimize(rig.contributors.size());
+        reportCommon(st, "ret_", r, rig.view.size());
+        st.counters["ret_rescans"]            = static_cast<double>(rig.rescans);
+        st.counters["ret_contributors_final"] = static_cast<double>(rig.contributors.size());
 
         const double recP99 = st.counters["ret_record_p99_us"];
         const double batP99 = st.counters["ret_batch_p99_us"];
@@ -2305,14 +2572,25 @@ static void BM_ViewFoldRetractable(benchmark::State& st) {
                      "[ViewFoldRetractable gate] ret_record_p99_us=%.3f (<5) ret_batch_p99_us=%.3f (<10) "
                      "steady_alloc=%lld (==0) rescans=%llu => %s\n",
                      recP99, batP99, static_cast<long long>(r.steadyAlloc),
-                     static_cast<unsigned long long>(rescans), pass ? "PASS" : "FAIL");
+                     static_cast<unsigned long long>(rig.rescans), pass ? "PASS" : "FAIL");
     }
 }
 BENCHMARK(BM_ViewFoldRetractable)
     ->Unit(benchmark::kMicrosecond)
     ->Iterations(1)
     ->UseRealTime();
+```
 
+Build `build/rel` and run the gate now (Task 5 Step 6), then commit:
+
+```bash
+git add broker/benchmark/ViewFoldBench.cpp
+git commit -m "bench(view): §14.0 gate for the retractable fold; shared AggRig for the aggregate benches" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+```
+
+- [ ] **Step 4: Add the extreme-retraction report.** Append to the end of `broker/benchmark/ViewFoldBench.cpp`:
+
+```cpp
 // Extreme retraction (Phase 2b) — REPORTED, NOT GATED (spec §A Gates: the known
 // O(group size) path). One group of N contributors with amounts 1..N; each
 // timed op lowers the CURRENT max holder (N, N-1, ..., 2) to 0, so every op
@@ -2397,23 +2675,23 @@ BENCHMARK(BM_ViewFoldExtremeRetract)
     ->UseRealTime();
 ```
 
-- [ ] **Step 3: Run the benchmarks.**
+- [ ] **Step 5: Run the benchmarks.**
 
-Run: `cmake --build build-bench-rel -j --target rune_broker_benchmark && ./build-bench-rel/rune_broker_benchmark --benchmark_filter='ViewFold'` (if the binary is not at `build-bench-rel/`, find it with `find build-bench-rel -name rune_broker_benchmark -type f`).
+Run: `cmake --build build/rel -j14 --target rune_broker_benchmark && build/rel/broker/rune_broker_benchmark --benchmark_filter='ViewFold'`
 Expected:
 - `[ViewFoldRetractable gate] … => PASS` (`ret_record_p99_us < 5`, `ret_batch_p99_us < 10`, `steady_alloc == 0`).
-- `BM_ViewFoldReplace` and `BM_ViewFoldAggregate` still PASS, which shows the 2a path did not regress.
+- `BM_ViewFoldReplace` and `BM_ViewFoldAggregate` still PASS, which shows the 2a path did not regress (and that the `AggRig` refactor kept its counters and output).
 - `[ViewFoldExtremeRetract N=1000]` and `[ViewFoldExtremeRetract N=10000]` report `exact=yes` with their p50/p99/max. Record these numbers in the commit message; they are not gated.
 
-If the gate fails, profile before changing anything. `ret_rescans / measured records` shows how often the O(group) path ran. A non-zero `steady_alloc` means a hot-path allocation, which is a CLAUDE.md #4 violation that must be fixed rather than gated away.
+If the gate fails, profile before changing anything. `ret_rescans / measured records` shows how often the O(group) path ran. A non-zero `steady_alloc` means a hot-path allocation, which is a CLAUDE.md #4 violation that must be fixed rather than gated away. Never relax the gate. The local run is the per-task check; the controller decides whether a clean-box VM confirmation is needed at the Phase 2b close (F14).
 
-- [ ] **Step 4: Run the regression gate and commit.**
+- [ ] **Step 6: Run the affected tests and commit.**
 
-Run: `ctest --test-dir build-fast -R Regression --output-on-failure` → 0 failures.
+Run: `cmake --build build/root -j14 --target rune_view_tests && ctest --test-dir build/root -R 'Agg' -j14 --output-on-failure` → 0 failures (the bench change touches no library code; this guards the build).
 
 ```bash
-git add benchmark/ViewFoldBench.cpp
-git commit -m "bench(view): §14.0 gate for the retractable fold; report extreme retraction at 1k/10k (p50/p99 in body)" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+git add broker/benchmark/ViewFoldBench.cpp
+git commit -m "bench(view): report extreme retraction at 1k/10k (p50/p99 in body)" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -2421,9 +2699,10 @@ git commit -m "bench(view): §14.0 gate for the retractable fold; report extreme
 ### Task 9: e2e — `user_totals` gains `max`, `min`, `last` across the restart
 
 **Files:**
-- Modify: `rune-client-cpp/examples/view_probe.cpp` (anchors: the header comment item `//     (d) Phase 2a: the PERSISTED aggregate view user_totals` (~line 59); the helpers `userTotalsPlan` / `userTotalsRowLayout` / `waitForTotals` (~321–380); the setup leg's `"user_totals u100 (initial)"` call (~1272); the verify leg from `// ---- (d) aggregate view recovered` (~1453))
-- Modify: `docker/view-engine-e2e.sh` (anchors: header item `#     5. Phase 2a: defineTopic "order"` (lines 23–26); header item `#     (d) user_totals recovered from its v2 checkpoint` (lines 48–51); the banner `log "  -> user_totals (Count(*)/Sum/Avg) recovered` + the next line (~558–559))
-- Create: `docs/release-notes/phase2b-a-retractable-aggregates.md` (Min / Max / Last / LastNonNull; AD1: upgrade every broker before creating such a view)
+- Modify: `client-cpp/examples/view_probe.cpp` (anchors: the header comment item `//     (d) Phase 2a: the PERSISTED aggregate view user_totals` (lines 59–64); the helpers `userTotalsPlan` (321) / `userTotalsRowLayout` (332–337) / `waitForTotals` (351–383); the setup leg's `"user_totals u100 (initial)"` call (lines 1275–1276); the verify leg `// ---- (d) aggregate view recovered` (block 1456–1465, `return 44;` at 1465))
+- Modify: `broker/docker/view-engine-e2e.sh` (anchors: header item `#     5. Phase 2a: defineTopic "order"` (lines 23–26); header item `#     (d) user_totals recovered from its v2 checkpoint` (lines 48–51); the banner `log "  -> user_totals (Count(*)/Sum/Avg) recovered` + the next line (lines 583–584); the stale usage text at lines 66–70, "Run from the rune-broker repo root … client repo)." (fix-on-sight, Step 4))
+- Modify: `docs/api/client-cpp.md:406` (F5: the `MergeRule` list gains `LastNonNull` and one line each on Min/Max, Last, LastNonNull)
+- Create: `broker/docs/release-notes/phase2b-a-retractable-aggregates.md` (F11: semantics of the four rules, `LastNonNull` = wire 8, no checkpoint/catalog format change, AD1: upgrade every broker before creating such a view)
 
 **Interfaces:**
 - Consumes: everything above, on the real Aeron broker. The handoff env vars are unchanged (same view).
@@ -2433,7 +2712,7 @@ Scenario (`order` = `{orderId key, userId, amount}`, 1 partition; `user_totals` 
 - **restart.**
 - **verify:** the recovered row is `{3, 85, 85/3, 50, 5, 5}`. Then `o3→(u100,25)` retracts the cached **min** (5) with a higher value, so it rescans the recovered list: `{3, 105, 35, 50, 25, 25}`. Then `o1→(u100,20)` retracts the cached **max** (50) with a lower value, so it rescans: `{3, 75, 25, 30, 20, 20}`.
 
-- [ ] **Step 1: Extend the probe helpers.** In `rune-client-cpp/examples/view_probe.cpp`, make these changes:
+- [ ] **Step 1: Extend the probe helpers.** In `client-cpp/examples/view_probe.cpp`, make these changes:
 
 (a) In `userTotalsPlan`, after the `avg` line, add:
 
@@ -2546,9 +2825,9 @@ Update the header comment item `(d)` (the 6 lines from `//     (d) Phase 2a: the
 //         max -> {3, 75, 25, 30, 20, 20} (both rescans walk the recovered list).
 ```
 
-Build: `cmake --build rune-client-cpp/build --target view_probe`. Expected: it compiles.
+Build: `cmake --build build/sub-client-cpp --target view_probe`. Expected: it compiles (`build/sub-client-cpp` has `BUILD_EXAMPLES=ON`).
 
-- [ ] **Step 4: e2e script text.** In `docker/view-engine-e2e.sh`, replace the header item 5 (lines 23–26, from `#     5. Phase 2a: defineTopic "order"`) with:
+- [ ] **Step 4: e2e script text.** In `broker/docker/view-engine-e2e.sh`, replace the header item 5 (lines 23–26, from `#     5. Phase 2a: defineTopic "order"`) with:
 
 ```bash
 #     5. Phase 2a/2b: defineTopic "order" {orderId key, userId, amount}; createView
@@ -2567,44 +2846,107 @@ Replace the header item `(d)` (lines 48–51, from `#     (d) user_totals recove
 #         contributor map, MRU lists and caches all survived the restart.
 ```
 
-Replace the two banner lines (`log "  -> user_totals (Count(*)/Sum/Avg) recovered …"` and `log "     + post-restart update retracts OK"`, ~558–559) with:
+Replace the two banner lines (`log "  -> user_totals (Count(*)/Sum/Avg) recovered …"` and `log "     + post-restart update retracts OK"`, lines 583–584) with:
 
 ```bash
 log "  -> user_totals (Count(*)/Sum/Avg/Max/Min/Last) recovered from its v2 checkpoint (VIEW-RECOVERED format=v2, O>0)"
 log "     + post-restart update retracts the pre-image, min and max exactly OK"
 ```
 
-- [ ] **Step 5: Run the e2e on the VM.** Honour `/root/vm.lock`: claim it with an owner marker and release it afterwards.
+Fix the stale usage text (lines 66–70; the script already computes its monorepo paths, only the comment is stale). Replace
 
 ```bash
-rsync -a --delete ~/Projects/se-worktrees/ root@$RUNE_VM_HOST:/root/se-worktrees/
-ssh root@$RUNE_VM_HOST 'flock /root/vm.lock bash -c "cd /root/se-worktrees/rune-broker && bash docker/view-engine-e2e.sh"'
+# Usage:  bash docker/view-engine-e2e.sh
+# Run from the rune-broker repo root (this worktree). Requires the sibling
+# worktrees: ../protocol ../codec ../crypto ../flight-recorder ../ql
+# ../client-cpp (feat/view-engine-phase1 on both the broker and the
+# client repo).
 ```
-(The script is authenticated since the auth phase — it bootstraps through `docker/lib/auth.sh` and passes `RUNE_USER` / `RUNE_PASSWORD_FILE` to the probe; change nothing there.)
+
+with
+
+```bash
+# Usage:  bash broker/docker/view-engine-e2e.sh
+# Run from the monorepo (broker/docker); requires ../flight-recorder next to the
+# monorepo.
+```
+
+- [ ] **Step 5: Document the new rules in the client API doc (F5).** In `docs/api/client-cpp.md` (line 406) replace
+
+```markdown
+- `MergeRule`: `Replace`, `Count`, `Sum`, `Avg`, `Min`, `Max`, `Last`, `CountAll` (`count(*)`).
+```
+
+with
+
+```markdown
+- `MergeRule`: `Replace`, `Count`, `Sum`, `Avg`, `Min`, `Max`, `Last`, `CountAll` (`count(*)`), `LastNonNull` (wire value 8, appended).
+  - `Min` / `Max`: numeric sources only (Int32, Int64, UInt16, UInt32, UInt64, Float64); nulls are ignored (NaN and ±Inf count as NULL); an empty or all-null group gives NULL. Exact under update, group move and delete.
+  - `Last`: the value of the most recently written contributor of the group, including NULL. Any fixed-width source type.
+  - `LastNonNull`: the most recently written contributor value that is not NULL, or NULL if there is none.
+  - All four keep the source field's type as the output type. Create a view that uses one only after every broker runs a build that has them.
+```
+
+- [ ] **Step 6: Write the release note (F11).** Create `broker/docs/release-notes/phase2b-a-retractable-aggregates.md` (siblings: `phase2b-c-…`, `phase2b-e-…`, `phase2b-f-…`):
+
+```markdown
+# Phase 2b Part A: retractable Min / Max / Last / LastNonNull
+
+Aggregate views can now maintain `Min`, `Max`, `Last` and `LastNonNull`, exact under update, group move, delete and a broker restart.
+
+## Semantics
+
+- `Min` / `Max`: numeric sources only (Int32, Int64, UInt16, UInt32, UInt64, Float64). Output type = source type. Nulls are ignored; NaN and ±Inf count as NULL (counted in `aggNonFinite`). An empty or all-null group gives NULL.
+- `Last`: the value of the most recently written contributor, including NULL. Any fixed-width source type; output type = source type.
+- `LastNonNull`: the most recently written contributor value that is not NULL, or NULL if there is none. It is the new `MergeRule::LastNonNull`, wire value **8** (the enum is append-only; rules 0-7 are unchanged).
+- Retracting the cached Min/Max walks the group's contributors once (O(group size), reported by `BM_ViewFoldExtremeRetract` at 1k and 10k); the typical fold stays inside the §14.0 gate.
+
+## Compatibility
+
+- No checkpoint, catalog or fingerprint format change. The v2 checkpoint already persists the contributor and group tables; the new links, head and caches are bytes inside those rows, so recovery is unchanged. `CatalogGoldenRegression.*` passes unchanged.
+- Views that use none of the four rules keep their 2a layout byte for byte.
+- **Upgrade every broker before creating a view with min/max/last (AD1).** `CreateView` events are applied on every broker from `__catalog`, and a broker without Part A cannot install such a plan. There is no version negotiation yet.
+- The client's `MergeRule` gains `LastNonNull`, and the client's `deserializeAuthored` accepts it (`rune catalog replay` re-reads stored plans with it).
+- Per-pass delta cap: a linked view dirties up to 8 rows per source record (2a: 5), and the worker's per-pass record cap now follows from that exact bound.
+```
+
+- [ ] **Step 7: Run the e2e on the VM (controller-run).** This is a controller checkpoint (k3s VM, `/root/vm.lock`); the implementer stops after Step 8's builds and tests. The controller stages the monorepo **and** a sibling `flight-recorder`, then runs the script under the lock:
+
+```bash
+rsync -a --delete --exclude build/ --exclude .git/ /Users/vradu/Projects/rune/ root@$RUNE_VM_HOST:/root/mono/rune/
+rsync -a --delete /Users/vradu/Projects/flight-recorder/ root@$RUNE_VM_HOST:/root/mono/flight-recorder/
+ssh root@$RUNE_VM_HOST 'flock -w 7200 /root/vm.lock bash /root/mono/rune/broker/docker/view-engine-e2e.sh'
+```
+
+(Without `.git` the image tags fall back to content hashes, `repo_tag` in the script.) The script is authenticated since the auth phase — it bootstraps through `broker/docker/lib/auth.sh` and passes `RUNE_USER` / `RUNE_PASSWORD_FILE` to the probe; change nothing there.
 
 Expected: `VIEW-ENGINE-E2E: OK`, `SCRIPT_EXIT=0`, and six `user_totals` PROBE lines: initial, the u200 group move, recovered, u200 post-restart, pre-image + min, and max retraction.
 
-- [ ] **Step 6: Run the regression gates (both repos) and commit.**
+- [ ] **Step 8: Run the affected tests and commit.**
 
-Run: `ctest --test-dir build-fast -R Regression --output-on-failure` and `ctest --test-dir rune-client-cpp/build -R Regression --output-on-failure`. Expected: 0 failures in each.
+Run: `cmake --build build/sub-client-cpp --target view_probe rune_schema_codec_smoke_tests && ctest --test-dir build/sub-client-cpp -R 'ViewPlanAuthor|SchemaCodecSmoke' --output-on-failure`. Expected: it builds and 0 failures. The full `*Regression*` suites (broker and client), the sanitizers and the e2e are controller checkpoints.
 
 ```bash
-git -C ../rune-client-cpp add examples/view_probe.cpp
-git -C ../rune-client-cpp commit -m "test(view-probe): user_totals gains max/min/last; post-restart retraction of min and max" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
-git add docker/view-engine-e2e.sh docs/release-notes/phase2b-a-retractable-aggregates.md
-git commit -m "test(view): e2e covers retractable Min/Max/Last across a broker restart" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+git add client-cpp/examples/view_probe.cpp docs/api/client-cpp.md
+git commit -m "test(view-probe): user_totals gains max/min/last; post-restart retraction of min and max; document the new MergeRule values" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+git add broker/docker/view-engine-e2e.sh broker/docs/release-notes/phase2b-a-retractable-aggregates.md
+git commit -m "test(view): e2e covers retractable Min/Max/Last across a broker restart; release note" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
 
 ## Finish
 
-- [ ] Run the full broker `*Regression*` suite on the final tree: `ctest --test-dir build-fast -R Regression` → 0 failures.
-- [ ] Run the view suites: `ctest --test-dir build-fast -R 'View|PlanCompiler|Agg|GetViewRow|CreateView|WorkerViewSet'` → 0 failures.
-- [ ] Run the full client `*Regression*` suite: `ctest --test-dir rune-client-cpp/build -R Regression` → 0 failures.
-- [ ] Benchmarks: `BM_ViewFoldRetractable` must PASS; `BM_ViewFoldReplace` and `BM_ViewFoldAggregate` must still PASS; record the `BM_ViewFoldExtremeRetract` 1k/10k numbers.
-- [ ] The e2e on the VM must be green (Task 9).
-- [ ] Hand the branches to the controller. Do not merge or push here.
+The implementer's part ends with the per-task affected-area runs above. The remaining items are **controller checkpoints** (F13):
+
+- [ ] Full broker `*Regression*` suite on the final tree: `ctest --test-dir build/root -R Regression -j14 --output-on-failure` → 0 failures.
+- [ ] View suites: `ctest --test-dir build/root -R 'View|PlanCompiler|Agg|GetViewRow|CreateView|WorkerViewSet' -j14` → 0 failures.
+- [ ] Full client `*Regression*` suite: `ctest --test-dir build/sub-client-cpp -R Regression -j14` → 0 failures.
+- [ ] CatalogGolden (AD2): `cmake --build build/sub-codec --target rune_catalog_tests && ctest --test-dir build/sub-codec -R CatalogGolden` → 3 pass.
+- [ ] Benchmarks (`build/rel`): `BM_ViewFoldRetractable` must PASS; `BM_ViewFoldReplace` and `BM_ViewFoldAggregate` must still PASS; record the `BM_ViewFoldExtremeRetract` 1k/10k numbers.
+- [ ] The e2e on the VM must be green (Task 9 Step 7).
+- [ ] Sanitizers (ASan+UBSan, TSan) run once at the Phase 2b close; none exist in the monorepo today.
+- [ ] Hand the branch to the controller. Do not merge or push here.
 
 ---
 
@@ -2636,6 +2978,8 @@ git commit -m "test(view): e2e covers retractable Min/Max/Last across a broker r
 - **2a invariance:** the non-linked fold path calls the same `put`/`erase` in the same order with the same bytes. `TwoAOnlyLayoutIsUnchangedRegression`, the untouched `AggFold*` suite and 2a's WorkerViewSet ring and recovery tests all guard it.
 
 ## Spec questions
+
+*Ruled 2026-10-20 (F12): Q1–Q8 are accepted exactly as written below; Q1 is recorded as AD3 in *Decisions*.*
 
 1. **Value-slot width for non-Last inputs.** §A Storage says input slots "get the source field's width … instead of a fixed 8". Applied to every input, that would change a 2a view's contributor row (for example, `Sum(Int32)` would shrink to 4 bytes) and break the "2a-only views keep their 2a layout byte-for-byte" rule. **The plan applies the source width only to `Last`/`LastNonNull` inputs.** Count, Sum, Avg, **Min and Max** keep the widened 8-byte slot, so Min/Max compare in one domain. Please confirm.
 2. **Contributor key `0xFFFFFFFFFFFFFFFF`** is a valid 8-byte wire key but equals the spec's `kNoContributor` sentinel. **The plan skips it in linked views and counts it as `skippedMalformed`.** 2a views still accept it. The alternative is a separate presence flag per link. Please confirm that fail-closed behaviour.
