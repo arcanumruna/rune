@@ -557,3 +557,30 @@ TEST(GatewayFilterRegression, OversizedFilterSchemaIsCountedAndFilteredSubscribe
     EXPECT_NE(a.detail.find("too large for the worker ring"), std::string::npos) << a.detail;
     EXPECT_EQ(r.gw.filterAdmissionForTest().subsFor(0, 0), 0u);
 }
+
+// Phase 2c Task 10 (M2): a group's filter is set at JoinGroup; the isolation-carrier Subscribe never carries one.
+TEST(GatewayFilterRegression, GroupCarrierSubscribeWithAFilterIsRefusedRegression) {
+    Rig r;
+    r.typed();
+    const int64_t v10 = r.session(10);
+    const int64_t v9  = r.session(9);
+    const int64_t g10 = r.gw.addGroupSubscription(v10, 0, 0, 0, /*isolation=*/0, /*pendingCarrier=*/true);
+    const int64_t g9  = r.gw.addGroupSubscription(v9, 0, 0, 0, /*isolation=*/0, /*pendingCarrier=*/true);
+    ASSERT_GT(g10, 0);
+    ASSERT_GT(g9, 0);
+
+    const Answer a = r.subscribe(v10, 1, worldEq(7));
+    EXPECT_EQ(a.r.errorCode, kInvalid);
+    EXPECT_EQ(a.detail, "group filters are set at JoinGroup, not on a group subscription");
+    EXPECT_TRUE(r.gw.subscriptionFilterForTest(g10).empty());
+
+    // an empty filter is the carrier as before
+    const Answer ok = r.subscribe(v10, 2, std::span<const uint8_t>{});
+    EXPECT_EQ(ok.r.errorCode, kOk);
+    EXPECT_EQ(ok.r.subscriptionId, g10);
+
+    // a v9 session's trailing bytes were ignored at decode: still the plain carrier
+    const Answer old = r.subscribe(v9, 3, worldEq(7));
+    EXPECT_EQ(old.r.errorCode, kOk);
+    EXPECT_EQ(old.r.subscriptionId, g9);
+}

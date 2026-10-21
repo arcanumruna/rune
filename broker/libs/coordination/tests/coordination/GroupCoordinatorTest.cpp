@@ -1346,3 +1346,54 @@ TEST(GroupCoordinator, ConcurrentJoinAndTimeout_ConsistentState) {
     EXPECT_GT(gc.generationId(), genBefore)
         << "Generation must advance after a member expires";
 }
+
+// ===========================================================================
+// Phase 2c (spec 13.3): one filter per consumer group
+// ===========================================================================
+namespace {
+const std::vector<uint8_t> kF1{1, 1, 0xAA};
+const std::vector<uint8_t> kF2{1, 1, 0xBB};
+const std::vector<std::string> kNoTopics;
+}
+
+TEST(GroupCoordinatorFilter, FirstMemberFixesTheFilter) {
+    GroupCoordinator gc("g");
+    EXPECT_TRUE(gc.admitFilter(kF1));
+    (void)gc.join("a", kDefaultTimeoutMs, kNoTopics, 0);
+    EXPECT_EQ(std::vector<uint8_t>(gc.filterBytes().begin(), gc.filterBytes().end()), kF1);
+    EXPECT_TRUE(gc.admitFilter(kF1));
+    EXPECT_EQ(gc.filterBytes().size(), kF1.size());
+}
+
+TEST(GroupCoordinatorFilter, DifferentFilterIsRefusedWhileMembersExist) {
+    GroupCoordinator gc("g");
+    ASSERT_TRUE(gc.admitFilter(kF1));
+    (void)gc.join("a", kDefaultTimeoutMs, kNoTopics, 0);
+    EXPECT_FALSE(gc.admitFilter(kF2));
+    EXPECT_FALSE(gc.admitFilter({}));
+    EXPECT_EQ(std::vector<uint8_t>(gc.filterBytes().begin(), gc.filterBytes().end()), kF1) << "a refusal changes nothing";
+}
+
+TEST(GroupCoordinatorFilter, EmptyGroupAcceptsANewFilter) {
+    GroupCoordinator gc("g");
+    ASSERT_TRUE(gc.admitFilter(kF1));
+    const JoinResult a = gc.join("a", kDefaultTimeoutMs, kNoTopics, 0);
+    gc.leave(a.memberId, a.generationId, 1);
+    ASSERT_TRUE(gc.isEmpty());
+    EXPECT_TRUE(gc.admitFilter(kF2));
+    (void)gc.join("b", kDefaultTimeoutMs, kNoTopics, 2);
+    EXPECT_EQ(std::vector<uint8_t>(gc.filterBytes().begin(), gc.filterBytes().end()), kF2);
+}
+
+TEST(GroupCoordinatorFilterRegression, NoFilterIsAFilterValueRegression) {
+    GroupCoordinator plain("g");
+    ASSERT_TRUE(plain.admitFilter({}));
+    (void)plain.join("a", kDefaultTimeoutMs, kNoTopics, 0);
+    EXPECT_FALSE(plain.admitFilter(kF1)) << "a group fixed with no filter refuses a filtered member";
+    EXPECT_TRUE(plain.admitFilter({}));
+
+    GroupCoordinator filtered("g");
+    ASSERT_TRUE(filtered.admitFilter(kF1));
+    (void)filtered.join("a", kDefaultTimeoutMs, kNoTopics, 0);
+    EXPECT_FALSE(filtered.admitFilter({})) << "and vice versa";
+}

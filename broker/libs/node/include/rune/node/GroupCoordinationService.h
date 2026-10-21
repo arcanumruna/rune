@@ -373,6 +373,10 @@ private:
     std::map<GroupId, rune::coordination::GroupCoordinator, std::less<>> coordinators_;
     /// LOW-3 (CG round 4): JoinGroup refusals per old-client session (log rate-limit; cold).
     std::map<int64_t, uint64_t> oldClientRefusals_;
+    /// Phase 2c: JoinGroup filter-mismatch refusals per "<group>\x1f<session>" (log rate-limit; cold, cleared at 4,096).
+    std::unordered_map<std::string, uint64_t> filterMismatchRefusals_;
+    std::string filterDetailScratch_;   ///< backs JoinGroupResponse::detail (cold refusal path)
+    void noteFilterMismatch_(const std::string& groupId, int64_t sessionId);
 
     // CG-4: member → sessionId tracking.
     // Keyed by (groupId + ":" + memberId) for global uniqueness.

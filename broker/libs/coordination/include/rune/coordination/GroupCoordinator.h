@@ -57,6 +57,7 @@
 #include <rune/coordination/Assignor.h>
 
 #include <cstdint>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -296,6 +297,11 @@ public:
     /// True if the group has no members.
     [[nodiscard]] bool isEmpty() const noexcept { return members_.empty(); }
 
+    /// Phase 2c (spec 13.3): an EMPTY group adopts `filter` (any, including none); a non-empty one admits
+    /// only byte-identical bytes.  The "unfixed" state is exactly isEmpty() - no extra flag.  Cold (JoinGroup).
+    [[nodiscard]] bool admitFilter(std::span<const uint8_t> filter);
+    [[nodiscard]] std::span<const uint8_t> filterBytes() const noexcept { return filter_; }
+
     /// E2 residual round 5 (R1): start a rebalance NOW (generation bump,
     /// PreparingRebalance) — every member must re-join and re-fetch its
     /// positions; a request at the old generation is fenced.  No-op (false) for
@@ -337,6 +343,7 @@ private:
     std::string       leaderId_;               ///< current leader memberId (empty if none)
 
     std::vector<MemberInfo> members_;          ///< current membership
+    std::vector<uint8_t>    filter_;           ///< the group's filter while it has members (stale bytes are overwritten on the next empty-group join)
 
     // [[rune-shared-nothing-law]] step 4: the process-global atomic counter was
     // removed — it was shared mutable state across GroupCoordinator instances that

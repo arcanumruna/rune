@@ -386,6 +386,39 @@ static std::string topicNameForId(rune::gateway::TopicRegistry* topics, int32_t 
 // Handlers
 // ===========================================================================
 
+namespace {
+
+// The old-client rule of ClientGateway::answerRejection_: a client below 5 re-joins forever on InvalidRequest.
+pc::ErrorCode rejectionCodeFor(int32_t clientVersion) noexcept {
+    return pc::clientUnderstandsInvalidRequest(clientVersion) ? pc::ErrorCode::InvalidRequest : pc::ErrorCode::ProtocolVersion;
+}
+
+// "group filter mismatch: the group uses filter <hex>" (at most 128 bytes shown, then "... (<n> bytes)"), "none" when empty.
+std::string groupFilterMismatchDetail(std::span<const uint8_t> f) {
+    std::string s(pc::kGroupFilterMismatchPrefix);
+    s += ": the group uses filter ";
+    if (f.empty()) { s += "none"; return s; }
+    static constexpr char kHex[] = "0123456789abcdef";
+    const std::size_t shown = std::min<std::size_t>(f.size(), 128);
+    for (std::size_t i = 0; i < shown; ++i) { s += kHex[f[i] >> 4]; s += kHex[f[i] & 0xF]; }
+    if (shown < f.size()) s += "... (" + std::to_string(f.size()) + " bytes)";
+    return s;
+}
+
+}  // namespace
+
+// Log rate-limit for filter-mismatch refusals: first per (group, session), then every power of two (bounded, cold).
+void GroupCoordinationService::noteFilterMismatch_(const std::string& groupId, int64_t sessionId) {
+    if (filterMismatchRefusals_.size() >= 4096) filterMismatchRefusals_.clear();
+    std::string key = groupId;
+    key += '\x1f';
+    key += std::to_string(sessionId);
+    const uint64_t n = ++filterMismatchRefusals_[key];
+    if ((n & (n - 1)) == 0)
+        spdlog::warn("GroupCoordinationService: JoinGroup from session {} refused — group '{}' uses a different filter "
+                     "(refusal #{})", sessionId, groupId, n);
+}
+
 // ---------------------------------------------------------------------------
 // handleJoinGroup (templateId 32)
 // ---------------------------------------------------------------------------
@@ -447,6 +480,30 @@ size_t GroupCoordinationService::handleJoinGroup(
         }
     }
 
+    coord::GroupCoordinator& gc = coordinator(groupIdStr);   // only creates the group
+
+    // Phase 2c (spec 13.3): one filter per group, fixed by the first member, changeable once the group is empty.
+    // The session's version is the one the frame was decoded with: an older member carries no filter.
+    const int32_t ver = clientVersion;
+    const std::span<const uint8_t> filter = pc::clientUnderstandsFilters(ver) ? msg.filter : std::span<const uint8_t>{};
+    if (!gc.admitFilter(filter)) {
+        pc::JoinGroupResponse resp;
+        resp.sessionId     = msg.sessionId;
+        resp.correlationId = msg.correlationId;
+        resp.errorCode     = static_cast<int16_t>(rejectionCodeFor(ver));
+        resp.generationId  = 0;
+        resp.isLeader      = 0;
+        resp.memberId      = std::span<const uint8_t>();
+        if (pc::clientUnderstandsFilters(ver)) {
+            filterDetailScratch_ = groupFilterMismatchDetail(gc.filterBytes());   // cold; reserved member string
+            resp.detail = filterDetailScratch_;
+        }
+        noteFilterMismatch_(groupIdStr, msg.sessionId);
+        // encodeFor writes the detail only to a session >= 10 (encode() never does)
+        const std::size_t n = resp.encodeFor(out, ver, outCap);
+        return n != 0 ? n : resp.encode(out);
+    }
+
     // Collect subscribedTopicIds → topic names.
     // joinTopicsScratch_ is a reused member; clear + refill to avoid per-call
     // vector allocation.  Short topic names benefit from SSO; the vector itself
@@ -459,8 +516,6 @@ size_t GroupCoordinationService::handleJoinGroup(
         }
         // Unknown topicId silently ignored (Assignor ignores topics not in partCounts).
     }
-
-    coord::GroupCoordinator& gc = coordinator(groupIdStr);
 
     // Set rebalance timeout from the member's sessionTimeout (or a sane default).
     gc.setRebalanceTimeoutMs(

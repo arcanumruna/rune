@@ -4908,6 +4908,13 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
                 Subscription& gsub = subIt->second;
                 if (gsub.isGroup && gsub.topicId == msg.topicId &&
                     gsub.partition == partition) {
+                    // Phase 2c (spec 13.3, M2): carriers never carry filters - a group's filter is set at JoinGroup.
+                    // An older session's trailing bytes were ignored at decode (msg.filter is empty for it).
+                    if (pc::clientUnderstandsFilters(session->clientVersion) && !msg.filter.empty()) [[unlikely]] {
+                        sendResp(pc::ErrorCode::InvalidRequest, partition, 0,
+                                 "group filters are set at JoinGroup, not on a group subscription");
+                        return;
+                    }
                     // TX-6b: Mark carrier received and update isolation.
                     // The push loop stalls pre-carrier group subs at any transactional
                     // batch that would be abort-filtered (so nextOffset has NOT advanced

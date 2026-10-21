@@ -130,9 +130,11 @@ static std::size_t encodeJoinGroup(uint8_t* buf,
                                    int64_t corrId,
                                    std::string_view groupId,
                                    std::string_view memberId,
-                                   int32_t sessionTimeoutMs = 5000)
+                                   int32_t sessionTimeoutMs = 5000,
+                                   std::span<const uint8_t> filter = {})
 {
     pc::JoinGroup msg;
+    msg.filter           = filter;
     msg.sessionId        = sessionId;
     msg.correlationId    = corrId;
     msg.sessionTimeoutMs = sessionTimeoutMs;
@@ -1686,4 +1688,61 @@ TEST_F(CG3ServiceTest, AppliedButNotPlacedTopicIsNotAssignedUntilPlacedRegressio
     ASSERT_EQ(counts.count("runtime"), 1u) << "placed: assignable";
     EXPECT_EQ(counts.at("runtime"), 3);
     service_->setGateway(nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2c (spec 13.3): one filter per consumer group, fixed by the first member.
+// ---------------------------------------------------------------------------
+namespace {
+const std::vector<uint8_t> kGroupFilterA{1, 1, 0xAB};
+const std::vector<uint8_t> kGroupFilterB{1, 1, 0xCD};
+}
+
+TEST_F(CG3ServiceTest, MatchingFilterJoinsAndRebalancesNormally) {
+    constexpr int32_t v10 = rune::protocol::client::kClientVersion;
+    auto n = encodeJoinGroup(req_, 1, 1, "fg", "", 5000, kGroupFilterA);
+    auto r1 = pc::JoinGroupResponse::decode(out_, service_->handleJoinGroup(req_, n, v10, clock_, out_, kBufSize));
+    ASSERT_TRUE(r1.has_value());
+    EXPECT_EQ(r1->errorCode, static_cast<int16_t>(pc::ErrorCode::OK));
+    const std::string m1(reinterpret_cast<const char*>(r1->memberId.data()), r1->memberId.size());
+
+    n = encodeJoinGroup(req_, 2, 2, "fg", "", 5000, kGroupFilterA);   // a second member, the same bytes
+    auto r2 = pc::JoinGroupResponse::decode(out_, service_->handleJoinGroup(req_, n, v10, clock_, out_, kBufSize));
+    ASSERT_TRUE(r2.has_value());
+    EXPECT_EQ(r2->errorCode, static_cast<int16_t>(pc::ErrorCode::OK));
+    EXPECT_EQ(service_->coordinator("fg").memberCount(), 2u);
+    EXPECT_EQ(service_->coordinator("fg").state(), GroupState::PreparingRebalance);
+    EXPECT_GT(r2->generationId, r1->generationId);
+}
+
+TEST_F(CG3ServiceTest, FilterMismatchAnswersInvalidRequestWithDetailRegression) {
+    constexpr int32_t v10 = rune::protocol::client::kClientVersion;
+    auto n = encodeJoinGroup(req_, 1, 1, "fg", "", 5000, kGroupFilterA);
+    (void)service_->handleJoinGroup(req_, n, v10, clock_, out_, kBufSize);
+
+    for (const auto* other : {&kGroupFilterB, static_cast<const std::vector<uint8_t>*>(nullptr)}) {
+        n = encodeJoinGroup(req_, 2, 2, "fg", "", 5000, other ? std::span<const uint8_t>(*other) : std::span<const uint8_t>{});
+        const std::size_t o = service_->handleJoinGroup(req_, n, v10, clock_, out_, kBufSize);
+        auto r = pc::JoinGroupResponse::decode(out_, o);
+        ASSERT_TRUE(r.has_value());
+        EXPECT_EQ(r->errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+        EXPECT_TRUE(r->memberId.empty());
+        EXPECT_EQ(r->detail.substr(0, pc::kGroupFilterMismatchPrefix.size()), pc::kGroupFilterMismatchPrefix);
+        EXPECT_NE(r->detail.find("0101ab"), std::string_view::npos) << r->detail;
+    }
+    EXPECT_EQ(service_->coordinator("fg").memberCount(), 1u) << "the refused joiner is not a member";
+}
+
+TEST_F(CG3ServiceTest, OldMemberWithoutFilterIsRefusedFromAFilteredGroupRegression) {
+    auto n = encodeJoinGroup(req_, 1, 1, "fg", "", 5000, kGroupFilterA);
+    (void)service_->handleJoinGroup(req_, n, rune::protocol::client::kClientVersion, clock_, out_, kBufSize);
+
+    n = encodeJoinGroup(req_, 2, 2, "fg", "");
+    const std::size_t o = service_->handleJoinGroup(req_, n, /*clientVersion=*/9, clock_, out_, kBufSize);
+    auto r = pc::JoinGroupResponse::decode(out_, o);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    EXPECT_TRUE(r->detail.empty());
+    EXPECT_EQ(o, pc::JoinGroupResponse{}.encodedSize()) << "the byte-identical legacy frame";
+    EXPECT_EQ(service_->coordinator("fg").memberCount(), 1u);
 }
