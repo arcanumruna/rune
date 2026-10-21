@@ -46,6 +46,19 @@ come from public ConanCenter. `--build=missing` builds any dep lacking a
 prebuilt Linux/amd64 binary from source (aeron pulls a JDK build-requirement
 transiently; the first build is therefore slow but fully self-contained).
 
+`broker/build_docker.sh` wraps the same command and tags the image `rune-broker:<VERSION.txt>`.
+
+## Release
+
+```sh
+broker/release.sh patch   # or minor / major; run on a clean main in sync with origin
+```
+
+The script turns `broker/VERSION.txt` from `X.Y.Z-snapshot` into `X.Y.Z`, tags `broker-vX.Y.Z`, sets the next
+snapshot and pushes the commits and the tag. The tag starts `.github/workflows/broker-image.yml`, which builds
+the image (linux/amd64) and publishes `ghcr.io/arcanumruna/rune-broker:X.Y.Z` and `:latest`. Running the
+workflow by hand builds the image without publishing it.
+
 ---
 
 ## Authentication (on by default)
