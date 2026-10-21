@@ -245,7 +245,7 @@ int main() {
 
         auto sub = c.subscribe(th, /*partition=*/0, opts, [&](const Record& r) {
             rune::gen::Characters d;
-            d.decode(r.value);              // 0c generated zero-copy decode (incl. code[8])
+            if (!d.decode(r.value)) return;  // 0c generated zero-copy decode (incl. code[8]); #418: never misread
             std::lock_guard<std::mutex> lk(mtx);
             got.push_back(Expected{d.id, d.userId, d.code, std::string(d.name)});
             std::cerr << "PROBE: consumed offset=" << r.offset

@@ -91,7 +91,7 @@ security 64 to 95.
 | 54 | `EndTxnResponse` | B→C | `errorCode` |
 | 64 | `DefineTopic` | C→B | `topicName`, `partitionCount`, `keyField`, `validate`, `descriptorBlob`, `persistence`, `replicationFactor`, DDL extension |
 | 65 | `DefineTopicResponse` | B→C | `topicId`, `version`, `errorCode` |
-| 66 | `GetTopicSchema` | C→B | `topicName`, `requestedFingerprint` |
+| 66 | `GetTopicSchema` | C→B | `topicName`, `requestedFingerprint` (0 = latest; `~0` = the evolving lineage) |
 | 67 | `TopicSchemaResponse` | B→C | `topicId`, `version`, `errorCode`, `descriptorBlob`, `partitionCount` |
 | 68 | `AlterTopic` | C→B | `topicName`, `expectedVersion`, `opsBlob`, DDL extension |
 | 69 | `AlterTopicResponse` | B→C | `topicId`, `newVersion`, `errorCode` |

@@ -198,7 +198,11 @@ int main() {
             const auto& raw = got[static_cast<std::size_t>(i)];
             if (rawVersion(raw) != 1) { std::cerr << "PROBE v4: FAIL record " << i << " version!=1\n"; c.close(); return 8; }
             rune::gen_v1::CharsEvo d;
-            d.decode(std::span<const uint8_t>(raw));
+            if (!d.decode(std::span<const uint8_t>(raw))) {   // #418: a version unknown to the reader
+                std::cerr << "PROBE v4: FAIL a record of version " << rawVersion(raw) << " did not decode\n";
+                c.close();
+                return 30;
+            }
             ExpectedV1 exp = makeExpectedV1(i);
             if (d.id != exp.id || d.userId != exp.userId || std::string(d.name) != exp.name) {
                 std::cerr << "PROBE v4: FAIL v1-group mismatch at i=" << i << "\n"; c.close(); return 9;
@@ -209,7 +213,11 @@ int main() {
             const auto& raw = got[static_cast<std::size_t>(n1 + i)];
             if (rawVersion(raw) != 2) { std::cerr << "PROBE v4: FAIL record " << (n1+i) << " version!=2\n"; c.close(); return 10; }
             rune::gen_v2::CharsEvo d;
-            d.decode(std::span<const uint8_t>(raw));
+            if (!d.decode(std::span<const uint8_t>(raw))) {   // #418: a version unknown to the reader
+                std::cerr << "PROBE v4: FAIL a record of version " << rawVersion(raw) << " did not decode\n";
+                c.close();
+                return 30;
+            }
             ExpectedV2 exp = makeExpectedV2(i);
             if (d.id != exp.id || d.userId != exp.userId || std::string(d.name) != exp.name || d.level != exp.level) {
                 std::cerr << "PROBE v4: FAIL v2-group mismatch at i=" << i << "\n"; c.close(); return 11;
@@ -222,9 +230,17 @@ int main() {
             const auto& raw = got[static_cast<std::size_t>(n1 + n2 + i)];
             if (rawVersion(raw) != 3) { std::cerr << "PROBE v4: FAIL record " << (n1+n2+i) << " version!=3\n"; c.close(); return 12; }
             rune::gen_v3::CharsEvo dOld;   // pre-rename view: field `level`
-            dOld.decode(std::span<const uint8_t>(raw));
+            if (!dOld.decode(std::span<const uint8_t>(raw))) {   // #418: a version unknown to the reader
+                std::cerr << "PROBE v4: FAIL a record of version " << rawVersion(raw) << " did not decode\n";
+                c.close();
+                return 30;
+            }
             rune::gen_v4::CharsEvo dNew;   // post-rename view: field `power`
-            dNew.decode(std::span<const uint8_t>(raw));
+            if (!dNew.decode(std::span<const uint8_t>(raw))) {   // #418: a version unknown to the reader
+                std::cerr << "PROBE v4: FAIL a record of version " << rawVersion(raw) << " did not decode\n";
+                c.close();
+                return 30;
+            }
             ExpectedV3 exp = makeExpectedV3(i);
             if (dOld.id != exp.id || dOld.userId != exp.userId || dOld.level != exp.level) {
                 std::cerr << "PROBE v4: FAIL v3-group (old view) mismatch at i=" << i << "\n"; c.close(); return 13;
@@ -241,7 +257,11 @@ int main() {
             const auto& raw = got[static_cast<std::size_t>(n1 + n2 + n3 + i)];
             if (rawVersion(raw) != 4) { std::cerr << "PROBE v4: FAIL record " << (n1+n2+n3+i) << " version!=4\n"; c.close(); return 15; }
             rune::gen_v4::CharsEvo d;
-            d.decode(std::span<const uint8_t>(raw));
+            if (!d.decode(std::span<const uint8_t>(raw))) {   // #418: a version unknown to the reader
+                std::cerr << "PROBE v4: FAIL a record of version " << rawVersion(raw) << " did not decode\n";
+                c.close();
+                return 30;
+            }
             ExpectedV4 exp = makeExpectedV4(i);
             if (d.id != exp.id || d.userId != exp.userId || d.power != exp.power) {
                 std::cerr << "PROBE v4: FAIL v4-group mismatch at i=" << i << "\n"; c.close(); return 16;

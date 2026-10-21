@@ -222,7 +222,7 @@ int main() {
                     const uint16_t ver = rawVersion(raw);
                     if (ver == 1) {
                         rune::gen_v1::CharsEvo d;
-                        d.decode(std::span<const uint8_t>(raw));
+                        if (!d.decode(std::span<const uint8_t>(raw))) { ++crossReads; continue; }   // #418: never misplaced
                         // A v3 sentinel id must NEVER surface in a v1-stamped record.
                         if (d.id >= kV3Base && d.id < kV3Base + m) { ++crossReads; continue; }
                         if (d.id >= kV1Base && d.id < kV1Base + m) {
@@ -236,7 +236,7 @@ int main() {
                         }
                     } else if (ver == 3) {
                         rune::gen_v3::CharsEvo d;
-                        d.decode(std::span<const uint8_t>(raw));
+                        if (!d.decode(std::span<const uint8_t>(raw))) { ++crossReads; continue; }   // #418: never misplaced
                         // A v1 sentinel id must NEVER surface in a v3-stamped record.
                         if (d.id >= kV1Base && d.id < kV1Base + m) { ++crossReads; continue; }
                         if (d.id >= kV3Base && d.id < kV3Base + m) {

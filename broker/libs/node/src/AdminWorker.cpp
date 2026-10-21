@@ -14,6 +14,7 @@
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/Protocol.h>
+#include <rune/protocol/client/SchemaMessages.h>   // kSchemaLineageFingerprint (#418)
 #include <rune/replication/PartitionReplica.h>
 #include <rune/replication/WorkerReplicationTransport.h>   // the __catalog plane (Task 6)
 #include <rune/view/AggState.h>      // rune::view::isAggregateView (Phase 2a)
@@ -587,6 +588,13 @@ void AdminWorker::submitGetSchema(const GetSchemaMsg& msg) {
     const auto* named = reg_.byName(msg.name);
     if (!named) {
         deps_.respondGet(msg.session, msg.corr, -1, 0, /*partitionCount=*/0, {}, kUnknownTopic);
+        return;
+    }
+    if (msg.requestedFingerprint == rune::protocol::client::kSchemaLineageFingerprint) {
+        // #418: the topic's lineage - the latest entry's EVOLVING blob (every field ever declared, with its
+        // lifetime), so a typed reader can place a record of any version.
+        deps_.respondGet(msg.session, msg.corr, named->topicId, named->version, named->partitionCount,
+                         named->descriptorBlob, kOK);
         return;
     }
     const RegistryEntry* e = (msg.requestedFingerprint == 0)

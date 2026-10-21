@@ -192,7 +192,11 @@ int main() {
                 return 8;
             }
             rune::gen_v1::CharsEvo d;
-            d.decode(std::span<const uint8_t>(raw));
+            if (!d.decode(std::span<const uint8_t>(raw))) {   // #418: a version unknown to the reader
+                std::cerr << "PROBE v3: FAIL a record of version " << rawVersion(raw) << " did not decode\n";
+                c.close();
+                return 30;
+            }
             ExpectedV1 exp = makeExpectedV1(i);
             if (d.id != exp.id || d.userId != exp.userId || std::string(d.name) != exp.name) {
                 std::cerr << "PROBE v3: FAIL v1-group (dropped-field decode) mismatch at i=" << i << "\n";
@@ -209,7 +213,11 @@ int main() {
                 return 10;
             }
             rune::gen_v2::CharsEvo d;
-            d.decode(std::span<const uint8_t>(raw));
+            if (!d.decode(std::span<const uint8_t>(raw))) {   // #418: a version unknown to the reader
+                std::cerr << "PROBE v3: FAIL a record of version " << rawVersion(raw) << " did not decode\n";
+                c.close();
+                return 30;
+            }
             ExpectedV2 exp = makeExpectedV2(i);
             if (d.id != exp.id || d.userId != exp.userId || std::string(d.name) != exp.name ||
                 d.level != exp.level) {
@@ -229,7 +237,11 @@ int main() {
                 return 12;
             }
             rune::gen_v3::CharsEvo d;
-            d.decode(std::span<const uint8_t>(raw));
+            if (!d.decode(std::span<const uint8_t>(raw))) {   // #418: a version unknown to the reader
+                std::cerr << "PROBE v3: FAIL a record of version " << rawVersion(raw) << " did not decode\n";
+                c.close();
+                return 30;
+            }
             ExpectedV3 exp = makeExpectedV3(i);
             if (d.id != exp.id || d.userId != exp.userId || d.level != exp.level) {
                 std::cerr << "PROBE v3: FAIL v3-group mismatch at i=" << i << "\n";

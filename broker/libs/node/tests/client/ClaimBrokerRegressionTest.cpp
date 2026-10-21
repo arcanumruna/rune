@@ -14,7 +14,9 @@
 #include <rune/client/Key.h>
 #include <rune/client/TypedTopic.h>
 #include <rune/client/producer/Producer.h>
+#include <rune/codec/AlterOps.h>
 #include <rune/codec/Descriptor.h>
+#include <rune/codec/Evolve.h>
 #include <rune/codec/Serialize.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/replication/PartitionReplica.h>
@@ -537,4 +539,79 @@ TEST(ClaimBrokerRegression, AbortedClaimLeavesNothingOnTheBrokerRegression) {
         p.close();
         cl->close();
     }
+}
+
+// #418, through the real client and broker: a typed reader generated before a mid-block DROP never misreads a record
+// written after it.  Without the topic's lineage the newer record is reported unknown (Decoder::known() false,
+// decode() false); with Client::lineageAndWait<Position> it reads every field right, the dropped one absent.
+TEST(ClaimBrokerRegression, ATypedReaderPlacesRecordsWrittenAfterAMidBlockDropRegression) {
+    ClaimRig rig("claim_lineage");
+    rig.b.createUser("evolver", kPw,
+                     {grants::prefix(SO::Create, ST::Topic, "claim."), grants::prefix(SO::Describe, ST::Topic, "claim."),
+                      grants::prefix(SO::Write, ST::Topic, "claim."), grants::prefix(SO::Read, ST::Topic, "claim."),
+                      grants::prefix(SO::Alter, ST::Topic, "claim.")});
+    const std::string name = "claim.lin";
+    const rune::codec::Descriptor v1 = positionDescriptor();
+    const int32_t tid = rig.define(name, "userId", rune::codec::serialize(v1), /*validate=*/true);
+    ASSERT_GE(tid, 0);
+    auto cl = rig.connect("evolver", rc::RunnerMode::Thread);
+    rc::TypedTopic<Position> typed = cl->openTopicAndWait<Position>(name, 30s);
+    Position a;
+    a.userId = 11; a.zone = 3; a.x = 1.5; a.y = -2.25; a.z = 8; a.flags = 7; a.seq = 9; a.tick = 10; a.alive = true; a.kind = 1;
+    std::memcpy(a.tag.data(), "first", 5);
+    typed.send(a);
+
+    // v2: DROP zone - every field after it moves 4 bytes down.
+    rune::codec::AlterOp drop{}; drop.type = rune::codec::AlterOpType::Drop; drop.name = "zone";
+    const auto altered = cl->alterTopicAndWait(name, 0, rune::codec::encodeAlterOps({drop}), {}, 30s);
+    ASSERT_EQ(altered.errorCode, 0) << altered.detail;
+    ASSERT_EQ(altered.newVersion, 2u);
+    uint16_t nextTag = static_cast<uint16_t>(v1.fields.size());
+    const auto evolving = rune::codec::applyOps(v1, {drop}, nextTag, 2);
+    ASSERT_TRUE(evolving.has_value());
+    const rune::codec::Descriptor at2 = rune::codec::materializeAsOf(*evolving, 2);
+
+    // A v2 writer's record (what a client generated at v2 sends), through the validating produce path.
+    std::vector<uint8_t> b(4 + at2.blockLength, 0);
+    b[0] = static_cast<uint8_t>(at2.blockLength); b[1] = static_cast<uint8_t>(at2.blockLength >> 8); b[2] = 2;
+    const auto put = [&](const char* f, const void* v, std::size_t n) { std::memcpy(b.data() + 4 + at2.find(f)->offset, v, n); };
+    const int64_t uid = 22; const double x = 4.5, y = 5.5, z = 6.5; const uint16_t flags = 0x1234; const uint32_t seq = 77;
+    const uint64_t tick = 88; const uint8_t alive = 1; const int32_t kind = 2;
+    put("userId", &uid, 8); put("x", &x, 8); put("y", &y, 8); put("z", &z, 8); put("flags", &flags, 2); put("seq", &seq, 4);
+    put("tick", &tick, 8); put("alive", &alive, 1); put("kind", &kind, 4); put("tag", "second\0\0", 8);
+    auto p = cl->producer(producerCfg());
+    p.send(rc::TopicHandle{tid, kParts}, rc::Key(uid), std::span<const uint8_t>(b));
+    p.flush();
+
+    std::vector<Rec> recs;
+    ASSERT_TRUE(pumpUntil(*cl, false, [&] { recs = readTopic(rig.b.node(), tid); return recs.size() >= 2; }))
+        << "stored " << recs.size() << " of 2 (a validator refusal drops the record)";
+    const Rec* r1 = nullptr; const Rec* r2 = nullptr;
+    for (const Rec& r : recs) (static_cast<uint8_t>(r.value[2]) == 1 ? r1 : r2) = &r;
+    ASSERT_NE(r1, nullptr); ASSERT_NE(r2, nullptr);
+    const auto bytes = [](const Rec* r) { return std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(r->value.data()), r->value.size()); };
+
+    const Position::Decoder old1(bytes(r1));
+    ASSERT_TRUE(old1.known());
+    EXPECT_EQ(old1.zone(), 3); EXPECT_EQ(old1.x(), 1.5); EXPECT_EQ(old1.seq(), 9u);
+    const Position::Decoder old2(bytes(r2));
+    EXPECT_FALSE(old2.known()) << "a v1 type cannot place a v2 record on its own";
+    EXPECT_EQ(old2.x(), 0.0) << "never the shifted bytes";
+    Position s;
+    EXPECT_FALSE(s.decode(bytes(r2)));
+
+    const Position::Lineage lin = cl->lineageAndWait<Position>(name, 30s);
+    EXPECT_EQ(lin.maxVersion(), 2u);
+    const Position::Decoder now2(bytes(r2), lin);
+    ASSERT_TRUE(now2.known());
+    EXPECT_EQ(now2.userId(), uid); EXPECT_EQ(now2.key(), uid);
+    EXPECT_EQ(now2.zone(), 0) << "dropped at v2: absent";
+    EXPECT_EQ(now2.x(), x); EXPECT_EQ(now2.y(), y); EXPECT_EQ(now2.z(), z);
+    EXPECT_EQ(now2.flags(), flags); EXPECT_EQ(now2.seq(), seq); EXPECT_EQ(now2.tick(), tick);
+    EXPECT_TRUE(now2.alive()); EXPECT_EQ(now2.kind(), kind); EXPECT_EQ(now2.tag().substr(0, 6), "second");
+    ASSERT_TRUE(s.decode(bytes(r2), lin));
+    EXPECT_EQ(s.zone, 0); EXPECT_EQ(s.x, x); EXPECT_EQ(s.tick, tick);
+    ASSERT_TRUE(s.decode(bytes(r1), lin));
+    EXPECT_EQ(s.zone, 3) << "the lineage places the v1 record too";
+    cl->close();
 }
