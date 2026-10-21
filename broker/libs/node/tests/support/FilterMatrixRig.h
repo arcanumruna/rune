@@ -272,7 +272,6 @@ public:
     [[nodiscard]] bool rc() const { return isRc(ent_); }
     [[nodiscard]] Op op() const { return op_; }
     [[nodiscard]] Worker& w(std::size_t i = 0) { return *workers_.at(i); }
-    [[nodiscard]] rune::replication::PartitionReplica& replica() { return *replica_; }
     [[nodiscard]] rune::storage::InMemoryLog* mem() { return mem_.get(); }
     [[nodiscard]] int64_t logEnd() const { return transient() ? mem_->logEndOffset() : log_->logEndOffset(); }
     [[nodiscard]] int64_t logStart() const { return transient() ? mem_->logStartOffset() : log_->logStartOffset(); }
@@ -280,12 +279,13 @@ public:
     [[nodiscard]] const std::vector<BatchRec>& batches() const { return batches_; }
 
     // ---- workers ----
-    std::size_t addWorker(bool owned = true, std::optional<int64_t> noteIntervalNs = std::nullopt) {
+    std::size_t addWorker(bool owned = true, std::optional<int64_t> noteIntervalNs = std::nullopt,
+                          std::optional<int64_t> versionWaitNs = std::nullopt) {
         auto wk = std::make_unique<Worker>(0, kRingBytes, kRingBytes);
         wk->setWorkerEgress(egress_.get());
         filter::FilterConfig fc;
         fc.noteIntervalNs = noteIntervalNs.value_or(cfg_.noteIntervalNs);
-        fc.versionWaitNs = cfg_.versionWaitNs;
+        fc.versionWaitNs = versionWaitNs.value_or(cfg_.versionWaitNs);
         wk->setFilterConfig(fc);
         if (owned) wk->setOwnedDirect(Worker::OwnedSet{replica_.get()});
         workers_.push_back(std::move(wk));
@@ -384,8 +384,6 @@ public:
         batches_.push_back({base, last, std::move(bytes), false, o.transactional ? o.producerId : -1, ver});
         return base;
     }
-    /// Appends `n` batches of `rows` at version `ver` (a wave).
-    void appendWave(int n, const std::vector<PlayerRow>& rows, uint16_t ver = 2) { for (int i = 0; i < n; ++i) append(rows, ver); }
     int64_t appendTxn(int64_t pid, const std::vector<PlayerRow>& rows, uint16_t ver = 2) {
         BatchOpts o;
         o.transactional = true;
@@ -424,7 +422,6 @@ public:
             }
         return lso;
     }
-    [[nodiscard]] TxnState txnState(int64_t pid) const { return txn_.at(pid); }
     [[nodiscard]] bool batchVisible(const BatchRec& b) const {
         if (b.control) return false;                       // markers are never delivered as data
         if (evictedLo_ <= b.base && b.base < evictedHi_) return false;
@@ -457,6 +454,7 @@ public:
         for (const auto* b : expectedBatches(client_.at(m.sub).start)) p = std::max(p, b->last + 1);
         return p;
     }
+    void allowStraddle() { allowStraddle_ = true; }
     void setEvicted(int64_t lo, int64_t hi) { evictedLo_ = lo; evictedHi_ = hi; }
     void skipVersion(uint16_t v) { skipVersions_.insert(v); }
     void clearSkipVersions() { skipVersions_.clear(); }
@@ -495,7 +493,6 @@ public:
 
     // ---- the verdict ----
     [[nodiscard]] MemberView& view(int64_t sub) { return client_[sub]; }
-    [[nodiscard]] Collector& collector() { return coll_; }
 
     /// Assertions 2, 3 and 4 for one member at the current model state.
     void verifyMember(const Member& m, const std::string& where) {
@@ -504,6 +501,7 @@ public:
         for (const auto& s : v.violations) ADD_FAILURE() << s;
         EXPECT_TRUE(coll_.errors.empty()) << "error frames: " << (coll_.errors.empty() ? "" : coll_.errors.front());
         EXPECT_EQ(v.pos, targetPos(m)) << "the model position";
+        if (!allowStraddle_) EXPECT_EQ(v.straddleDrops, 0u) << "a record below the start reached the client";
         if (m.kind == MK::Unfiltered) {
             const auto exp = expectedBatches(v.start);
             ASSERT_EQ(v.dataFrames.size(), exp.size()) << "unfiltered frames";
@@ -521,7 +519,8 @@ public:
     /// Assertion 6 for the plain counters: zeroCopy / rebuilt / notes follow from the frames the filtered members got.
     void verifyCounters(std::size_t wi, const std::vector<Member>& ms, uint64_t absentExpected, uint64_t unknownExpected,
                         const std::string& where,
-                        const std::map<int64_t, std::pair<std::size_t, std::size_t>>* from = nullptr) {
+                        const std::map<int64_t, std::pair<std::size_t, std::size_t>>* from = nullptr,
+                        const filter::FilterCounters* snapshot = nullptr) {
         SCOPED_TRACE("counters @ " + where);
         uint64_t zc = 0, rb = 0, notes = 0;
         std::map<int64_t, const BatchRec*> byBase;
@@ -536,7 +535,7 @@ public:
                 if (it != byBase.end() && it->second->bytes == v.dataFrames[i]) ++zc; else ++rb;
             }
         }
-        const auto c = w(wi).filterCountersForTest();
+        const auto c = snapshot != nullptr ? *snapshot : w(wi).filterCountersForTest();
         EXPECT_EQ(c.zeroCopy, zc) << "zeroCopy";
         EXPECT_EQ(c.rebuilt, rb) << "rebuilt";
         EXPECT_EQ(c.notes, notes) << "notes";
@@ -550,6 +549,7 @@ public:
     /// Assertion 5: the allocations of the measured passes (hot, after the first delivery, no control op in flight).
     void verifyNoAllocation(const std::string& where) {
         EXPECT_EQ(hotAllocs_, 0u) << "heap allocations inside " << hotPasses_ << " measured passes @ " << where;
+        EXPECT_GT(hotPasses_, 0u) << "no measured pass pushed anything: the allocation window never saw work @ " << where;
     }
     [[nodiscard]] uint64_t hotPasses() const { return hotPasses_; }
 
@@ -558,13 +558,7 @@ public:
         const auto* g = groupOf(m);
         return g != nullptr && std::holds_alternative<filter::InSync>(g->stateOf(static_cast<uint32_t>(m.filterIdx)));
     }
-    [[nodiscard]] static std::size_t filteredCount(const std::vector<Member>& ms) {
-        std::size_t n = 0;
-        for (const auto& m : ms) n += (m.kind != MK::Unfiltered);
-        return n;
-    }
 
-    void resetHotMeasure() { hotAllocs_ = 0; hotPasses_ = 0; }
 
 private:
     void openEgress_() {
@@ -612,9 +606,10 @@ private:
         const uint64_t skipsBefore = wk.transientCursorSkipsForTest();
         const auto cb = wk.filterCountersForTest();
         uint64_t n;
+        int work;
         {
             rune::testing::AllocWindow aw;
-            wk.doWork(nowNs());
+            work = wk.doWork(nowNs());
             n = aw.count();
         }
         // The first time an exclusion / eviction happens the engine logs one line (spdlog formats it): not a
@@ -624,7 +619,7 @@ private:
                                 (cb.absentExcluded == 0 && ca.absentExcluded > 0) ||
                                 (cb.unknownVersionExcluded == 0 && ca.unknownVersionExcluded > 0);
         if (firstEvent) return;
-        ++hotPasses_;
+        if (work > 0) ++hotPasses_;   // a measured pass that actually pushed
         hotAllocs_ += n;
     }
 
@@ -689,6 +684,7 @@ private:
     int64_t evictedLo_ = 0, evictedHi_ = 0;
     std::set<uint16_t> skipVersions_;
     bool anyFrame_ = false;
+    bool allowStraddle_ = false;
     uint64_t hotAllocs_ = 0, hotPasses_ = 0;
 };
 

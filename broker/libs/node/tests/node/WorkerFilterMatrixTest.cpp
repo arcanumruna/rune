@@ -155,7 +155,6 @@ void checkSteadyOutcome(Rig& r, Entity e, Timing t, const Ms& ms, std::size_t wi
 void finish(Rig& r, const Ms& ms, const std::string& where, uint64_t absent = 0, uint64_t unknown = 0, std::size_t wi = 0) {
     r.verifyCounters(wi, ms, absent, unknown, where);
     r.verifyNoAllocation(where);
-    EXPECT_GT(r.hotPasses(), 0u) << "no measured pass: the allocation window never opened";
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -174,6 +173,7 @@ void runSteady(Rig& r, Entity e, Timing t, const std::vector<std::vector<PlayerR
 }
 
 void runStraddling(Rig& r, Entity e) {
+    r.allowStraddle();   // the one cell where the client drops records below its start
     const int64_t b0 = start(r);
     // batch 0 @b0..b0+3, batch 1 @b0+4..b0+7 (the straddling one), batch 2 @b0+8..b0+11
     r.append({rowM(), rowN(), rowW(), rowC()});
@@ -237,6 +237,14 @@ void runQuietRun(Rig& r, Entity e) {
     const std::size_t wb = r.addWorker(true, 2'000'000);
     r.installSchema(wb, 2);
     Ms mb = r.subscribeMembers(wb, startB, 10);
+    // The scan reaches the end quickly; the time trigger must then produce the final note within 60 ms.
+    int64_t scanDone = 0;
+    ASSERT_TRUE(r.pumpUntil([&] {
+        for (const auto& m : mb)
+            if (m.kind != MK::Unfiltered && r.w(wb).subscriptionPositionForTest(m.sub) < r.logEnd()) return false;
+        scanDone = nowNs();
+        return true;
+    }));
     ASSERT_TRUE(r.converge(mb));
     r.settle(60ms);
     for (const auto& m : mb) {
@@ -246,10 +254,14 @@ void runQuietRun(Rig& r, Entity e) {
         EXPECT_TRUE(v.dataFrames.empty());
         ASSERT_FALSE(v.notes.empty()) << "the pause needs a note by time";
         EXPECT_EQ(v.notes.back(), r.logEnd()) << "the final note is the log end";
+        std::size_t k = 0;   // the first note that carries the log end
+        while (k < v.notes.size() && v.notes[k] != r.logEnd()) ++k;
+        ASSERT_LT(k, v.notes.size());
+        EXPECT_LE(v.noteAtNs[k] - scanDone, 60'000'000) << "the time-trigger note arrived "
+            << (v.noteAtNs[k] - scanDone) / 1'000'000 << " ms after the scan finished (bound 60 ms)";
     }
     r.verifyCounters(wb, mb, 0, 0, "leg B");
     r.verifyNoAllocation("quiet run");
-    EXPECT_GT(r.hotPasses(), 0u);
     (void)e;
 }
 
@@ -313,15 +325,21 @@ void runOwnershipMove(Rig& r, Entity e) {
     (void)e;
     const int64_t b0 = start(r);
     Ms ms = r.subscribeMembers(0, b0);
-    for (int i = 0; i < 3; ++i) r.append({rowM(), rowN(), rowW(), rowC()});
-    ASSERT_TRUE(r.converge(ms));
-    r.verifyAll(ms, "before the move");
+    std::vector<PlayerRow> rows;
+    for (int i = 0; i < 60; ++i) rows.push_back(i % 5 == 0 ? rowM() : i % 5 == 1 ? rowW() : i % 5 == 2 ? rowC() : i % 5 == 3 ? rowP() : rowN());
+    for (int i = 0; i < 120; ++i) r.append(rows);   // ~600 KB: several passes of the 128 KiB budget
+    for (int i = 0; i < 3; ++i) r.step();           // the stream is under way ...
+    for (const auto& m : ms)
+        ASSERT_LT(r.w(0).subscriptionPositionForTest(m.sub), r.logEnd()) << "precondition: still mid-stream";
+    // ... and the partition leaves worker 0 while records are in flight (a disk partition's subscription stays
+    // hosted on the old worker, so the rig retires it explicitly).
+    const rune::node::filter::FilterCounters oldC = r.w(0).filterCountersForTest();
+    r.disown(0);
+    for (const auto& m : ms) r.unsubscribe(m);
+    r.settle(40ms);   // drain what was already in the egress
     std::map<int64_t, std::size_t> seen;
     for (const auto& m : ms) seen[m.sub] = r.view(m.sub).dataFrames.size();
-    r.disown(0);   // the partition leaves worker 0 (a disk partition's subscription stays hosted there, so it is retired)
-    for (const auto& m : ms) r.unsubscribe(m);
-    r.settle(30ms);
-    for (const auto& m : ms) seen[m.sub] = r.view(m.sub).dataFrames.size();
+    r.verifyCounters(0, ms, 0, 0, "old owner", nullptr, &oldC);   // the old worker's counters match what it delivered
     for (int i = 0; i < 3; ++i) r.append({rowM(), rowP(), rowN(), rowM()});
     r.settle(40ms);
     for (const auto& m : ms) EXPECT_EQ(r.view(m.sub).dataFrames.size(), seen[m.sub]) << "the old owner pushed after the move";
@@ -362,7 +380,9 @@ void runEviction(Rig& r) {
     ASSERT_TRUE(r.converge(ms));
     r.verifyAll(ms, "after the eviction");
     const uint64_t skips = r.w(0).transientCursorSkipsForTest();
-    EXPECT_GE(skips, 1u) << "the E2 eviction counter";
+    // one scan cursor for the filtered group, one per unfiltered subscription
+    const uint64_t cursors = (filtered(ms).empty() ? 0u : 1u) + (ms.size() - filtered(ms).size());
+    EXPECT_EQ(skips, cursors) << "the E2 eviction counter";
     EXPECT_EQ(r.w(0).transientRecordsSkippedForTest(), skips * static_cast<uint64_t>(ringStart - cursor))
         << "every skip counted the evicted records of its cursor";
     for (const auto& m : filtered(ms)) {
@@ -437,10 +457,19 @@ void runVersionLate(Rig& r) {
     ASSERT_TRUE(r.converge(never));
     r.verifyAll(never, "never: v1");
     r.skipVersion(2);   // the worker never learns v2: its records are excluded
+    const int64_t tAppend = nowNs();
     r.append({rowM()}, 2);   // @b0+2, a v2 record
+    // Still stalled shortly before the 50 ms wait ends (only asserted when the rig really got there in time) ...
+    r.settle(30ms);
+    if (nowNs() - tAppend < 45'000'000)
+        for (const auto& m : filtered(never)) {
+            EXPECT_LE(r.view(m.sub).pos, b0 + 2) << "stalled behind the unknown version";
+            EXPECT_EQ(r.w(0).filterCountersForTest().unknownVersionExcluded, 0u) << "excluded before the 50 ms wait";
+        }
+    // ... and never excluded before the wait has run out.
+    ASSERT_TRUE(r.pumpUntil([&] { return r.w(0).filterCountersForTest().unknownVersionExcluded >= 1; }));
+    EXPECT_GE(nowNs() - tAppend, 50'000'000) << "the record was excluded before the 50 ms wait";
     r.settle(20ms);
-    for (const auto& m : filtered(never)) EXPECT_LE(r.view(m.sub).pos, b0 + 2) << "stalled behind the unknown version";
-    r.settle(150ms);   // past the 50 ms wait
     r.append({rowM()}, 1);   // @b0+3
     ASSERT_TRUE(r.converge(never));
     r.verifyAll(never, "never: expired");
@@ -449,13 +478,13 @@ void runVersionLate(Rig& r) {
     r.settle(20ms);
     // ---- leg "late": the schema arrives 20 ms after the record ----
     r.clearSkipVersions();
-    const std::size_t wl = r.addWorker();
+    const std::size_t wl = r.addWorker(true, std::nullopt, /*versionWaitNs=*/1'000'000'000);   // late leg: a 1 s wait
     r.installSchema(wl, 1);
     Ms late = r.subscribeMembers(wl, r.logEnd(), 10);
     ASSERT_TRUE(awaitInSync(r, late));
     ASSERT_TRUE(r.converge(late));
     r.append({rowM()}, 2);   // the v2 record, before its schema
-    r.settle(15ms);
+    r.settle(20ms);
     for (const auto& m : filtered(late)) {
         EXPECT_TRUE(r.view(m.sub).delivered.empty()) << "a record of an unknown version must wait";
         EXPECT_LE(r.view(m.sub).pos, r.logEnd() - 1);
@@ -482,6 +511,8 @@ void runBackPressure(Rig& r) {
     for (int i = 0; i < 80; ++i) r.append(rep(rowM(), 60));
     for (int i = 0; i < 12; ++i) { r.stepUnpolled(); std::this_thread::sleep_for(200us); }   // the egress refuses
     const bool isFiltered = r.op() != Op::Unfiltered;
+    for (const auto& m : ms)   // the egress really refused: no member got through the 80 batches
+        EXPECT_LT(r.w(0).subscriptionPositionForTest(m.sub), r.logEnd()) << "the egress never refused (precondition)";
     if (isFiltered) EXPECT_GE(r.w(0).filterCountersForTest().fellBehind, 1u) << "the egress never refused (precondition)";
     ASSERT_TRUE(r.converge(ms, 60s));
     r.verifyAll(ms, "after the refusals");   // no loss, no duplicate; unfiltered neighbours complete and byte-identical
