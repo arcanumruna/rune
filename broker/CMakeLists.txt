@@ -450,7 +450,7 @@ if(BUILD_PING_PROBE)
     endif()
     add_executable(ping_probe docker/ping-probe/ping_probe.cpp)
     target_include_directories(ping_probe PRIVATE ${RUNE_PROTOCOL_INCLUDE})
-    target_link_libraries(ping_probe PRIVATE aeron::aeron spdlog::spdlog)
+    target_link_libraries(ping_probe PRIVATE aeron::aeron spdlog::spdlog rune_crypto)   # issue #10: TLS sessions
     if(UNIX AND NOT APPLE)
         target_link_libraries(ping_probe PRIVATE -Wl,--no-as-needed uuid -Wl,--as-needed)
     endif()

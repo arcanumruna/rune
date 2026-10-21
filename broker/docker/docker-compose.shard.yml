@@ -10,6 +10,10 @@ x-shard-env: &shard-env
   # Authentication is ON: the base file mounts the cluster key at this path (docker-compose.yml); restated here so
   # the overlay never silently depends on a base change.
   RUNE_CLUSTER_KEY_FILE: /run/secrets/cluster.key
+  # Issue #10: every client session of an authenticating broker is TLS - the broker certificate (and key)
+  # sit next to the cluster key (docker/lib/auth.sh rune_gen_cluster_key writes all three).
+  RUNE_TLS_CERT_FILE: /run/secrets/tls.pem
+  RUNE_TLS_KEY_FILE: /run/secrets/tls.key
   RUNE_PEERS: "0@rune-1:40111:40200:40222:40600:40500,1@rune-2:40111:40200:40222:40600:40500,2@rune-3:40111:40200:40222:40600:40500"
 
 # The explicit worker bases lie inside Linux's ephemeral range: reserved with the node ports (every worker,

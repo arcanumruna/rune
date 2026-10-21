@@ -7,10 +7,12 @@
 # The model every launcher follows:
 #   1. rune_auth_init                       a per-run directory: secrets/ (the cluster key) and work/ (passwords)
 #   2. build the `rune` CLI image            bash docker/create-topics.sh --build-image   (QL_IMAGE)
-#   3. rune_gen_cluster_key "${RUNE_SECRETS_DIR}"   BEFORE `docker compose up`
+#   3. rune_gen_cluster_key "${RUNE_SECRETS_DIR}"   BEFORE `docker compose up` (also writes the broker TLS certificate
+#                                            tls.pem / tls.key and its ca.pem - issue #10: every client session is TLS)
 #   4. rune_auth_prepare <network> <broker>   AFTER the cluster has a consensus leader: bootstrap the first admin,
 #                                            change its password, create the e2e role + user
-#   5. every probe container gets `rune_auth_probe_args` (RUNE_USER / RUNE_PASSWORD_FILE + the work mount)
+#   5. every probe container gets `rune_auth_probe_args` (RUNE_USER / RUNE_PASSWORD_FILE / RUNE_TLS_CA_FILE + the
+#      work mount)
 #   6. rune_auth_cleanup                    in the teardown trap, AFTER `docker compose down`
 #
 # Paths: arguments named "...-file" of rune_bootstrap are CONTAINER paths (/work/..., /run/secrets/...), as in the
@@ -65,7 +67,8 @@ rune_auth_cleanup() {
     [ -n "${RUNE_AUTH_DIR:-}" ] || return 0
     rm -rf "${RUNE_AUTH_DIR}" 2>/dev/null || true
     if [ -z "${_RUNE_AUTH_OWNS_SECRETS:-}" ] && [ -n "${RUNE_SECRETS_DIR:-}" ]; then
-        rm -f "${RUNE_SECRETS_DIR}/cluster.key" "${RUNE_SECRETS_DIR}/cluster.next.key" 2>/dev/null || true
+        rm -f "${RUNE_SECRETS_DIR}/cluster.key" "${RUNE_SECRETS_DIR}/cluster.next.key" "${RUNE_SECRETS_DIR}/tls.pem" \
+              "${RUNE_SECRETS_DIR}/tls.key" "${RUNE_SECRETS_DIR}/ca.pem" 2>/dev/null || true
     fi
     RUNE_AUTH_DIR=""
 }
@@ -85,14 +88,15 @@ _rune_auth_cli() {
     local t="${RUNE_AUTH_CLI_TIMEOUT:-120}"
     local -a to=()
     [ -z "${_RUNE_TIMEOUT}" ] || to=("${_RUNE_TIMEOUT}" -k 5 "${t}")
+    # Issue #13: the CLI reaches the brokers over TLS and trusts the run's CA (in the secrets mount).
     if [ -n "${RUNE_AUTH_TOOLS:-}" ]; then
-        ${to[@]+"${to[@]}"} docker exec "${RUNE_AUTH_TOOLS}" rune "$@"
+        ${to[@]+"${to[@]}"} docker exec -e RUNE_TLS_CA_FILE=/run/secrets/ca.pem "${RUNE_AUTH_TOOLS}" rune "$@"
         return
     fi
     local name="rune-auth-cli-$$-${RANDOM}" rc
     ${to[@]+"${to[@]}"} docker run --rm --name "${name}" \
         --platform linux/amd64 --network "${net}" --shm-size=256m --security-opt seccomp=unconfined \
-        -v "${RUNE_AUTH_WORK_DIR}:/work" -v "${RUNE_SECRETS_DIR}:/run/secrets:ro" \
+        -v "${RUNE_AUTH_WORK_DIR}:/work" -v "${RUNE_SECRETS_DIR}:/run/secrets:ro" -e RUNE_TLS_CA_FILE=/run/secrets/ca.pem \
         -v "${_rune_auth_docker_dir}/topics:/topics:ro" \
         "$(_rune_auth_ql_image)" rune "$@" && rc=0 || rc=$?
     [ "${rc}" -ne 124 ] || docker rm -f "${name}" >/dev/null 2>&1 || true
@@ -107,6 +111,8 @@ rune_auth_cli_admin() {
 
 # rune_gen_cluster_key <dir> : writes <dir>/cluster.key (64 hex characters, mode 0600) with `rune security
 # gen-cluster-key` — the CLI image must exist.  An existing key file is never overwritten (the CLI refuses).
+# For the default name it also writes the run's broker TLS material (rune_gen_tls): an authenticating broker refuses to
+# start without a certificate (issue #10).
 rune_gen_cluster_key() {
     local dir="$1" name="${2:-cluster.key}"
     mkdir -p "${dir}"
@@ -114,6 +120,16 @@ rune_gen_cluster_key() {
     docker run --rm --platform linux/amd64 -v "${abs}:/out" "$(_rune_auth_ql_image)" \
         rune security gen-cluster-key --out "/out/${name}" >&2 || { _rune_auth_fail "gen-cluster-key ${abs}/${name}"; return 1; }
     [ -s "${abs}/${name}" ] || { _rune_auth_fail "${abs}/${name} was not written"; return 1; }
+    if [ "${name}" = "cluster.key" ]; then rune_gen_tls "${abs}" || return 1; fi
+}
+
+# rune_gen_tls <dir> : <dir>/tls.pem + tls.key (the brokers' RUNE_TLS_CERT_FILE / RUNE_TLS_KEY_FILE, mounted from the
+# secrets dir) and <dir>/ca.pem, the CA every client trusts (RUNE_TLS_CA_FILE); ca.pem is also copied into
+# ${RUNE_AUTH_WORK_DIR} for the probes (/work/ca.pem).  The certificate names RUNE_TLS_SAN_HOSTS (docker/lib/gen-tls.sh).
+rune_gen_tls() {
+    local dir="$1"
+    bash "${_rune_auth_lib_dir}/gen-tls.sh" "${dir}" >&2 || { _rune_auth_fail "gen-tls ${dir}"; return 1; }
+    if [ -n "${RUNE_AUTH_WORK_DIR:-}" ]; then cp "${dir}/ca.pem" "${RUNE_AUTH_WORK_DIR}/ca.pem"; fi
 }
 
 # rune_bootstrap <broker host:port> <admin> <otp-file> <key-file> : bootstraps the first security admin of a fresh
@@ -205,8 +221,9 @@ rune_auth_prepare() {
     _rune_auth_log "cluster bootstrapped: admin '${RUNE_AUTH_ADMIN}', e2e user '${RUNE_AUTH_E2E_USER}'"
 }
 
-# rune_auth_probe_args : the docker-run arguments that give a probe container the e2e credentials.
+# rune_auth_probe_args : the docker-run arguments that give a probe container the e2e credentials and the run's CA
+# (credentials travel only over TLS, issue #14).
 #   docker run ... $(rune_auth_probe_args) IMAGE
 rune_auth_probe_args() {
-    echo "-e RUNE_USER=${RUNE_AUTH_E2E_USER} -e RUNE_PASSWORD_FILE=/work/e2e.pw -v ${RUNE_AUTH_WORK_DIR}:/work:ro"
+    echo "-e RUNE_USER=${RUNE_AUTH_E2E_USER} -e RUNE_PASSWORD_FILE=/work/e2e.pw -e RUNE_TLS_CA_FILE=/work/ca.pem -v ${RUNE_AUTH_WORK_DIR}:/work:ro"
 }

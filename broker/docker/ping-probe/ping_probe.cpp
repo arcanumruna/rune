@@ -13,6 +13,9 @@
 //   RUNE_PROBE_EGRESS_STREAM — int, default 2
 //   RUNE_PROBE_TIMEOUT_MS    — int, hard deadline for entire probe, default 8000
 //   RUNE_DATA_DIR            — driver dir, default /tmp/rune_probe_<pid>
+//   RUNE_TLS_CA_FILE         — PEM CA bundle: run the session over TLS (issue #10: an authenticating broker serves only
+//                              TLS sessions), checking the certificate against RUNE_PROBE_TARGET's host.  Unset =
+//                              plaintext (a dev-mode broker).
 //
 // Exit 0 = Pong received. Non-zero = failure (reason printed to stderr).
 //
@@ -23,6 +26,11 @@
 #include <rune/protocol/client/PingMessages.h>
 #include <rune/protocol/client/Protocol.h>
 #include <rune/protocol/client/MessageHeader.h>
+#include <rune/protocol/client/CryptoEnvelope.h>
+
+#include <rune/crypto/Aead.h>
+#include <rune/crypto/Cipher.h>
+#include <rune/crypto/TlsSession.h>
 
 #include <Aeron.h>
 #include <Publication.h>
@@ -37,12 +45,16 @@ extern "C" {
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <iostream>
 #include <memory>
 #include <optional>
 #include <string>
 #include <thread>
+#include <vector>
 #include <unistd.h>
 
 namespace fs = std::filesystem;
@@ -67,6 +79,28 @@ static int getEnvInt(const char* name, int defaultVal) {
     const char* v = std::getenv(name);
     if (!v || !*v) return defaultVal;
     return std::atoi(v);
+}
+
+/// The host of "aeron:udp?endpoint=host:port[|...]" ("" when none).
+static std::string endpointHost(const std::string& ch) {
+    const auto ep = ch.find("endpoint=");
+    if (ep == std::string::npos) return {};
+    std::string hp = ch.substr(ep + 9);
+    if (const auto end = hp.find_first_of("|&"); end != std::string::npos) hp = hp.substr(0, end);
+    const auto colon = hp.rfind(':');
+    return colon == std::string::npos ? hp : hp.substr(0, colon);
+}
+
+/// Every byte the TLS session has pending for the peer.
+static std::string drainTls(rune::crypto::TlsSession& t) {
+    std::string out;
+    uint8_t chunk[4096];
+    for (;;) {
+        const std::size_t n = t.writeOutbound(chunk, sizeof chunk);
+        if (n == 0) break;
+        out.append(reinterpret_cast<const char*>(chunk), n);
+    }
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -228,6 +262,27 @@ int main() {
         }
         std::cerr << "PROBE: publication connected to " << target << "\n";
 
+        // --- TLS (issue #10): the ClientHello rides the ConnectRequest ---
+        const std::string caFile = getEnvStr("RUNE_TLS_CA_FILE");
+        std::optional<rune::crypto::TlsSession> tls;
+        std::string clientHello;
+        uint8_t offeredCipher = static_cast<uint8_t>(rune::crypto::bestLocalCipher());
+        if (!caFile.empty()) {
+            std::ifstream caIn(caFile, std::ios::binary);
+            const std::string caPem((std::istreambuf_iterator<char>(caIn)), std::istreambuf_iterator<char>());
+            const std::string host = endpointHost(target);
+            tls.emplace(rune::crypto::TlsSession::makeClient(caPem.c_str(), host.c_str()));
+            if (caPem.empty() || !tls->valid()) {
+                std::cerr << "PROBE: cannot build a TLS session (CA '" << caFile << "', host '" << host << "')\n";
+                aeron.reset();
+                stopDriver();
+                return 13;
+            }
+            (void)tls->readInbound(nullptr, 0);
+            clientHello = drainTls(*tls);
+            std::cerr << "PROBE: TLS offered (host " << host << ")\n";
+        }
+
         // --- Build ConnectRequest ---
         constexpr std::size_t kScratch = 4096;
         uint8_t scratch[kScratch] = {};
@@ -240,6 +295,10 @@ int main() {
         // The probe never logs in: Ping is a session-level frame the broker answers before authentication.
         req.clientVersion  = pc::kClientVersionAuth;
         req.egressChannel  = egress;
+        if (tls) {
+            req.cipherList     = std::span<const uint8_t>(&offeredCipher, 1);
+            req.handshakeBytes = clientHello;
+        }
         const std::size_t reqLen = req.encode(scratch);
 
         // Offer ConnectRequest (bounded).
@@ -263,7 +322,7 @@ int main() {
 
         // --- Await ConnectResponse ---
         std::optional<pc::ConnectResponse> connResp;
-        std::vector<uint8_t> connRespBuf; // stable storage for decode
+        std::string serverFlight;          // stable storage for the server's TLS flight
 
         aeron::FragmentAssembler connAsm([&](aeron::concurrent::AtomicBuffer& buf,
                                             aeron::util::index_t offset,
@@ -272,7 +331,9 @@ int main() {
             const uint8_t* p = reinterpret_cast<const uint8_t*>(buf.buffer() + offset);
             auto dec = pc::ConnectResponse::decode(p, static_cast<std::size_t>(len));
             if (dec) {
+                serverFlight.assign(dec->handshakeBytes);   // the view dies with the fragment
                 connResp = *dec;
+                connResp->handshakeBytes = {};
             }
         });
 
@@ -298,6 +359,81 @@ int main() {
         std::cerr << "PROBE: ConnectResponse OK sessionId=" << sessionId
                   << " leaderMemberId=" << connResp->leaderMemberId << "\n";
 
+        // --- TLS: finish the handshake over HandshakeContinue legs, then derive the session keys ---
+        std::optional<rune::crypto::AeadCipher> sendKey, recvKey;
+        auto offerFrame = [&](const uint8_t* b, std::size_t n) {
+            while (nowMs() < deadline0) {
+                aeron::concurrent::AtomicBuffer ab(const_cast<uint8_t*>(b), static_cast<aeron::util::index_t>(n));
+                if (pub->offer(ab, 0, static_cast<aeron::util::index_t>(n)) > 0) return true;
+                std::this_thread::sleep_for(2ms);
+            }
+            return false;
+        };
+        if (tls) {
+            if (connResp->chosenCipher == 0) {
+                std::cerr << "PROBE: the broker answered the TLS offer in plaintext (no cipher)\n";
+                aeron.reset();
+                stopDriver();
+                return 14;
+            }
+            const auto chosen = static_cast<rune::crypto::Cipher>(connResp->chosenCipher);
+            std::string inbound = std::move(serverFlight);
+            std::optional<pc::HandshakeContinueResponse> hcr;
+            std::string hcrBytes;
+            aeron::FragmentAssembler hcAsm([&](aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t offset,
+                                               aeron::util::index_t len, aeron::Header&) {
+                const uint8_t* p = reinterpret_cast<const uint8_t*>(buf.buffer() + offset);
+                if (auto dec = pc::HandshakeContinueResponse::decode(p, static_cast<std::size_t>(len))) {
+                    hcrBytes.assign(dec->handshakeBytes);
+                    hcr = *dec;
+                    hcr->handshakeBytes = {};
+                }
+            });
+            for (int leg = 0; leg < 8 && !tls->done(); ++leg) {
+                if (tls->readInbound(reinterpret_cast<const uint8_t*>(inbound.data()), inbound.size()) ==
+                    rune::crypto::HsState::Failed) {
+                    std::cerr << "PROBE: TLS handshake failed (certificate not trusted or not for this host?)\n";
+                    aeron.reset();
+                    stopDriver();
+                    return 15;
+                }
+                const std::string outBytes = drainTls(*tls);
+                if (!outBytes.empty()) {
+                    pc::HandshakeContinue hc;
+                    hc.sessionId = sessionId;
+                    hc.correlationId = req.correlationId;
+                    hc.handshakeBytes = outBytes;
+                    std::vector<uint8_t> f(hc.encodedSize());
+                    if (!offerFrame(f.data(), hc.encode(f.data()))) break;
+                }
+                if (tls->done()) break;
+                hcr.reset();
+                while (nowMs() < deadline0 && !hcr) {
+                    sub->poll(hcAsm.handler(), 10);
+                    std::this_thread::sleep_for(2ms);
+                }
+                if (!hcr || hcr->code != 0) break;
+                inbound = hcrBytes;
+            }
+            if (!tls->done()) {
+                std::cerr << "PROBE: TLS handshake did not complete\n";
+                aeron.reset();
+                stopDriver();
+                return 16;
+            }
+            const auto keys = tls->exportKeys(chosen, sessionId);
+            if (keys.cipher == rune::crypto::Cipher::None) {
+                std::cerr << "PROBE: TLS key export failed\n";
+                aeron.reset();
+                stopDriver();
+                return 17;
+            }
+            sendKey.emplace(keys.cipher, keys.c2b, keys.c2bPrefix);
+            recvKey.emplace(keys.cipher, keys.b2c, keys.b2cPrefix);
+            offeredCipher = static_cast<uint8_t>(keys.cipher);
+            std::cerr << "PROBE: TLS established\n";
+        }
+
         // --- Send Ping ---
         const std::string echoStr = "rune-probe-echo";
         pc::Ping ping;
@@ -305,17 +441,26 @@ int main() {
         ping.correlationId  = 2002;
         ping.echo           = echoStr;
         const std::size_t pingLen = ping.encode(scratch);
-
-        sent = false;
-        while (nowMs() < deadline0 && !sent) {
-            aeron::concurrent::AtomicBuffer ab(scratch, static_cast<aeron::util::index_t>(pingLen));
-            int64_t pos = pub->offer(ab, 0, static_cast<aeron::util::index_t>(pingLen));
-            if (pos > 0) {
-                sent = true;
-            } else {
-                std::this_thread::sleep_for(2ms);
+        std::vector<uint8_t> wire(scratch, scratch + pingLen);
+        if (sendKey) {   // [24 B header][12 B CryptoSubHeader][sealed body][16 B tag], header + subheader the AAD
+            wire.assign(pingLen + pc::kCryptoOverhead, 0);
+            std::memcpy(wire.data(), scratch, pc::MessageHeader::ENCODED_SIZE);
+            pc::CryptoSubHeader subHdr;
+            subHdr.cipher = offeredCipher;
+            subHdr.seq    = 1;
+            subHdr.encode(wire.data() + pc::MessageHeader::ENCODED_SIZE);
+            const std::size_t n = sendKey->seal(1, wire.data(), pc::kCryptoHeaderBytes,
+                                                scratch + pc::MessageHeader::ENCODED_SIZE,
+                                                pingLen - pc::MessageHeader::ENCODED_SIZE, wire.data() + pc::kCryptoHeaderBytes);
+            if (n == 0) {
+                std::cerr << "PROBE: sealing the Ping failed\n";
+                aeron.reset();
+                stopDriver();
+                return 18;
             }
+            wire.resize(pc::kCryptoHeaderBytes + n);
         }
+        sent = offerFrame(wire.data(), wire.size());
         if (!sent) {
             std::cerr << "PROBE: timed out offering Ping\n";
             aeron.reset();
@@ -333,7 +478,21 @@ int main() {
                                             aeron::util::index_t len,
                                             aeron::Header&) {
             const uint8_t* p = reinterpret_cast<const uint8_t*>(buf.buffer() + offset);
-            auto dec = pc::Pong::decode(p, static_cast<std::size_t>(len));
+            std::size_t n = static_cast<std::size_t>(len);
+            std::vector<uint8_t> plain;
+            if (recvKey) {   // an encrypted session's frames open under its b2c key (the gateway is sender 0)
+                const auto subHdr = pc::CryptoSubHeader::decode(p + pc::MessageHeader::ENCODED_SIZE,
+                                                                n > pc::MessageHeader::ENCODED_SIZE ? n - pc::MessageHeader::ENCODED_SIZE : 0);
+                if (!subHdr || n < pc::kCryptoHeaderBytes + 16) return;
+                plain.resize(n);
+                const long pl = recvKey->open(subHdr->seq, p, pc::kCryptoHeaderBytes, p + pc::kCryptoHeaderBytes,
+                                              n - pc::kCryptoHeaderBytes, plain.data() + pc::MessageHeader::ENCODED_SIZE);
+                if (pl < 0) return;
+                std::memcpy(plain.data(), p, pc::MessageHeader::ENCODED_SIZE);
+                p = plain.data();
+                n = pc::MessageHeader::ENCODED_SIZE + static_cast<std::size_t>(pl);
+            }
+            auto dec = pc::Pong::decode(p, n);
             if (dec) {
                 pongEcho = std::string(dec->echo);
                 dec->echo = pongEcho;
