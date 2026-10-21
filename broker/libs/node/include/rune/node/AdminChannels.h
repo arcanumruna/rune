@@ -1469,16 +1469,27 @@ inline void writeSecurityApplied(uint8_t* p, int64_t offset, std::span<const uin
     bytes  = std::span<const uint8_t>(buf + kSecurityAppliedFixedBytes, len - kSecurityAppliedFixedBytes);
     return offset >= 0;
 }
-//   kA2cSecurityServing : [caughtUp:u8][leaderHw:i64]   (issues #15 / #111)
-inline constexpr std::size_t kSecurityServingWireLen = 1 + 8;
-inline void writeSecurityServing(uint8_t* p, bool caughtUp, int64_t leaderHw) noexcept {
+//   kA2cSecurityServing : [caughtUp:u8][leaderHw:i64][epoch:i32][asLeader:u8]   (issues #15 / #111; PR #459 F2: the
+//                         epoch / role the verdict is for, compared with the committed assignment on the control thread)
+inline constexpr std::size_t kSecurityServingWireLen = 1 + 8 + 4 + 1;
+inline void writeSecurityServing(uint8_t* p, bool caughtUp, int64_t leaderHw, int32_t epoch = -1,
+                                 bool asLeader = false) noexcept {
     p[0] = caughtUp ? 1 : 0;
     admin_wire::putI64(p + 1, leaderHw);
+    std::memcpy(p + 9, &epoch, 4);
+    p[13] = asLeader ? 1 : 0;
 }
 [[nodiscard]] inline bool decodeSecurityServing(const uint8_t* buf, std::size_t len, bool& caughtUp, int64_t& leaderHw) noexcept {
-    if (len != kSecurityServingWireLen || buf[0] > 1) return false;
+    if (len != kSecurityServingWireLen || buf[0] > 1 || buf[13] > 1) return false;
     caughtUp = buf[0] == 1;
     leaderHw = admin_wire::getI64(buf + 1);
+    return true;
+}
+[[nodiscard]] inline bool decodeSecurityServing(const uint8_t* buf, std::size_t len, bool& caughtUp, int64_t& leaderHw,
+                                                int32_t& epoch, bool& asLeader) noexcept {
+    if (!decodeSecurityServing(buf, len, caughtUp, leaderHw)) return false;
+    std::memcpy(&epoch, buf + 9, 4);
+    asLeader = buf[13] == 1;
     return true;
 }
 using SecurityHaltedMsg = CatalogHaltedMsg;

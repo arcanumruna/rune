@@ -43,14 +43,16 @@ public:
         uint64_t leaderAnswers      = 0;       ///< PartitionReplica::leaderAnswers()
         bool     caughtUpWithLeader = false;   ///< PartitionReplica::caughtUpWithLeader()
         int64_t  appliedNext        = -1;      ///< the applier's next offset (every record below it is applied)
-        int64_t  highWatermark      = 0;       ///< the replica's committed prefix
+        int64_t  highWatermark      = 0;       ///< the leader's committed HW (PartitionReplica::leaderCommittedHw: a
+                                               ///< follower's is the leader's advertised HW, never capped at its LEO)
     };
 
     explicit SecurityCatchUp(int64_t maxStalenessNs) noexcept : stalenessNs_(maxStalenessNs) {}
 
     /// One pass.  Returns the verdict (also caughtUp()).
     bool step(const Inputs& in) noexcept {
-        if (in.leaderAnswers != answersSeen_) { answersSeen_ = in.leaderAnswers; lastAnswerNs_ = in.nowNs; }
+        const bool answered = in.leaderAnswers != answersSeen_;
+        if (answered) { answersSeen_ = in.leaderAnswers; lastAnswerNs_ = in.nowNs; }
         if (in.present && !in.halted && in.appliedNext >= in.highWatermark) lastAppliedNs_ = in.nowNs;
         if (!in.present || in.halted) { st_ = NotCaughtUp{}; return false; }
         if (in.leader && in.leaderServing) {   // the leader's own log is the truth (and the contact is itself)
@@ -59,13 +61,23 @@ public:
             return true;
         }
         const bool fresh = in.nowNs - lastAnswerNs_ <= stalenessNs_ && in.nowNs - lastAppliedNs_ <= stalenessNs_;
-        if (std::holds_alternative<CaughtUp>(st_)) {
-            // Kept across a leader change while the contact is fresh (a failover is shorter than F); dropped the
-            // moment it is not - from then on only a full catch-up earns it back.
-            if (!fresh) st_ = NotCaughtUp{};
-            return std::holds_alternative<CaughtUp>(st_);
+        if (auto* c = std::get_if<CaughtUp>(&st_)) {
+            // PR #459 F2: a verdict earned as LEADER says nothing about a new leader's log - a demoted broker (a healed
+            // zombie) re-earns it as a follower.  A follower's verdict is kept across a leader change while the contact
+            // is fresh (a failover is shorter than F) and follows the new epoch; dropped the moment it is not fresh -
+            // from then on only a full catch-up earns it back.
+            if (c->asLeader && !in.leader) {
+                st_ = NotCaughtUp{};
+                if (!answered) lastAnswerNs_ = INT64_MIN / 2;   // its own "contact" as leader is no leader answer
+            } else if (!fresh) {
+                st_ = NotCaughtUp{};
+            } else {
+                c->epoch = in.epoch;
+                return true;
+            }
         }
-        if (!in.leader && fresh && in.caughtUpWithLeader && in.appliedNext >= in.highWatermark) {
+        const bool freshNow = in.nowNs - lastAnswerNs_ <= stalenessNs_ && in.nowNs - lastAppliedNs_ <= stalenessNs_;
+        if (!in.leader && freshNow && in.caughtUpWithLeader && in.appliedNext >= in.highWatermark) {
             st_ = CaughtUp{in.epoch, false};
             return true;
         }
@@ -73,6 +85,9 @@ public:
     }
 
     [[nodiscard]] bool caughtUp() const noexcept { return std::holds_alternative<CaughtUp>(st_); }
+    /// PR #459 F2: the epoch / role the verdict is for (meaningful while caughtUp()).
+    [[nodiscard]] int32_t verdictEpoch() const noexcept { const auto* c = std::get_if<CaughtUp>(&st_); return c ? c->epoch : -1; }
+    [[nodiscard]] bool verdictAsLeader() const noexcept { const auto* c = std::get_if<CaughtUp>(&st_); return c && c->asLeader; }
 
 private:
     struct NotCaughtUp {};
@@ -97,13 +112,41 @@ public:
     SecurityServing(int64_t maxStalenessNs, int64_t staleSessionEndNs) noexcept
         : stalenessNs_(maxStalenessNs), sessionEndNs_(staleSessionEndNs) {}
 
-    /// kA2cSecurityServing: the admin thread's latest verdict.
-    void onAdminCaughtUp(bool caughtUp, int64_t leaderHw) noexcept { adminCaughtUp_ = caughtUp; leaderHw_ = leaderHw; }
+    /// kA2cSecurityServing: the admin thread's latest verdict, for `epoch` of the `__security` replica in the role
+    /// `asLeader` (-1: not checked - single node).
+    void onAdminCaughtUp(bool caughtUp, int64_t leaderHw, int32_t epoch = -1, bool asLeader = false) noexcept {
+        adminCaughtUp_ = caughtUp; leaderHw_ = leaderHw; adminEpoch_ = epoch; adminAsLeader_ = asLeader;
+    }
 
-    /// One control pass: `consensusClosed` = the election is CLOSED with a leader right now.
-    Actions step(int64_t nowNs, bool consensusClosed) noexcept {
+    /// PR #459 F2: the committed `__security` assignment as this broker's metadata knows it, and whether that metadata
+    /// map is current (a ready controller, or a follower caught up with its metadata leader and applied through its HW)
+    /// with the count of metadata-leader answers (monotonic) - after a lost consensus contact the map is trusted again
+    /// only once an answer arrived AFTER the contact returned and it is current: a healed zombie must not vouch for its
+    /// old epoch from a map that has not learned the cluster moved on yet.
+    /// `mapControls`: this node is the ready controller now (it won a majority election after the contact returned:
+    /// its log is complete) - its map needs no leader answer.
+    struct Committed { int32_t epoch = -1; bool selfLeads = false; bool mapCurrent = true; uint64_t mapAnswers = 0;
+                       bool mapControls = false; };
+
+    /// One control pass: `consensusClosed` = the election is CLOSED with a leader right now; `committed` (multi-node)
+    /// = the committed assignment - the admin verdict counts only while it is for that epoch and role, so a healed
+    /// zombie (a leader-era verdict of an old epoch) serves nothing until its admin thread vouches for the new one.
+    Actions step(int64_t nowNs, bool consensusClosed, const Committed* committed = nullptr) noexcept {
+        if (!consensusClosed && nowNs - lastConsensusNs_ > stalenessNs_) { mapRefreshOwed_ = true; baselineSet_ = false; }
         if (consensusClosed) lastConsensusNs_ = nowNs;
-        const bool current = adminCaughtUp_ && nowNs - lastConsensusNs_ <= stalenessNs_;
+        if (committed != nullptr && mapRefreshOwed_ && consensusClosed) {
+            if (committed->mapControls) mapRefreshOwed_ = false;
+            else if (!baselineSet_) { mapAnswersBaseline_ = committed->mapAnswers; baselineSet_ = true; }
+            else if (committed->mapAnswers > mapAnswersBaseline_ && committed->mapCurrent) mapRefreshOwed_ = false;
+        }
+        // A LEADER verdict counts only for the committed epoch with this node as its leader (a healed zombie's
+        // leader-era verdict never does); a FOLLOWER verdict is bounded-stale on its own (SecurityCatchUp drops it F
+        // after the leader's last answer), so a failover's epoch bump / a promotion in flight does not interrupt it.
+        const bool forCommitted =
+            committed == nullptr ||
+            (!mapRefreshOwed_ &&
+             (!adminAsLeader_ || (adminEpoch_ == committed->epoch && committed->selfLeads)));
+        const bool current = adminCaughtUp_ && forCommitted && nowNs - lastConsensusNs_ <= stalenessNs_;
         Actions a;
         if (current) {
             if (!std::holds_alternative<Serving>(st_)) { st_ = Serving{}; a.changed = true; }
@@ -132,6 +175,11 @@ private:
     int64_t stalenessNs_;
     int64_t sessionEndNs_;
     bool    adminCaughtUp_   = false;
+    int32_t adminEpoch_      = -1;
+    bool     mapRefreshOwed_     = false;   // PR #459 F2: the consensus contact was lost past F
+    bool     baselineSet_        = false;
+    uint64_t mapAnswersBaseline_ = 0;
+    bool    adminAsLeader_   = false;
     int64_t leaderHw_        = -1;
     int64_t lastConsensusNs_ = INT64_MIN / 2;
 };

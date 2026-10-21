@@ -828,9 +828,9 @@ public:
     [[nodiscard]] SecurityLiveEffects securityLiveEffects() { return SecurityLiveEffects{securitySink_()}; }
     /// Issues #15 / #111 - ADMIN thread only (deps.securityServing): kA2cSecurityServing on the effect FIFO (never
     /// dropped: the backlog keeps it in order behind the applied events).
-    void postSecurityServing(bool caughtUp, int64_t leaderHw) {
+    void postSecurityServing(bool caughtUp, int64_t leaderHw, int32_t epoch, bool asLeader) {
         postCatalog_(kA2cSecurityServing, kSecurityServingWireLen,
-                     [&](uint8_t* p) { writeSecurityServing(p, caughtUp, leaderHw); });
+                     [&](uint8_t* p) { writeSecurityServing(p, caughtUp, leaderHw, epoch, asLeader); });
     }
     [[nodiscard]] SecurityBootEffects securityBootEffects() const { return SecurityBootEffects{}; }
     [[nodiscard]] SecurityEffects securitySinkForBootStash() { return securitySink_(); }
@@ -1511,10 +1511,11 @@ public:
     [[nodiscard]] int64_t appendSecurityRecordOnLeaderForTest(std::span<const uint8_t> eventBytes);
     /// Test-only: while held, this broker's `__security` applier applies nothing (the replica still replicates).
     void holdSecurityApplyForTest(bool on);
-    /// Test-only (issue #111): cut this broker off its peers - the consensus (nothing in, nothing out), the control
-    /// replication transport and the admin plane (nothing in: no metadata, no internal-ISR news, no fetch answers) -
-    /// or reconnect it.  Its client links stay up: a broker the cluster moves past while it still believes its last
-    /// metadata (a zombie leader).  Multi-node only (posted to the control and admin threads).
+    /// Test-only (issue #111): cut this broker off the cluster's control plane - the consensus (nothing in, nothing
+    /// out) and the control replication transport (nothing in: no metadata, no internal-ISR news) - or reconnect it.
+    /// Its client links and admin plane stay up (a frame of the new leader's epoch is refused by its stale replica
+    /// anyway): a broker the cluster moves past while it still believes its last metadata (a zombie leader).
+    /// Multi-node only (posted to the control thread).
     void partitionFromPeersForTest(bool on);
     /// Test-only: the control thread's SecurityServing state ("CatchingUp" / "Serving" / "Stale"; "none" without auth).
     [[nodiscard]] std::string securityServingForTest();
@@ -2139,6 +2140,7 @@ private:
     void onSecurityServing_(const uint8_t* p, std::size_t n);
     int stepSecurityServing_(int64_t nowNs);
     std::optional<SecurityServing> securityServing_;   // engaged iff the broker authenticates (gateway Required)
+    int64_t controlNowNs_ = 0;   // PR #459 M2: the current control pass's clock (serviceAdminControl_), control thread
     void publishSecurityMetrics_() noexcept;
     [[nodiscard]] bool securityMetricsPending_() const noexcept;
     int  serviceAuthMode_(int64_t nowNs);

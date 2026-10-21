@@ -264,7 +264,7 @@ std::optional<std::string> NodeConfig::validateSecurityServing(bool stalenessExp
     if (stalenessExplicit && securityMaxStalenessMs <= liveness + 500)
         return "RUNE_SECURITY_MAX_STALENESS_MS (" + std::to_string(securityMaxStalenessMs) +
                ") must exceed the broker liveness timeout + 500 ms (" + std::to_string(liveness + 500) +
-               "): otherwise every leader failover makes healthy brokers refuse logins";
+               "): otherwise a leadership move makes healthy brokers refuse logins until the new leader answers";
     if (sessionEndExplicit && securityStaleSessionEndMs <= effectiveSecurityMaxStalenessMs())
         return "RUNE_SECURITY_STALE_SESSION_END_MS (" + std::to_string(securityStaleSessionEndMs) +
                ") must exceed RUNE_SECURITY_MAX_STALENESS_MS (" + std::to_string(effectiveSecurityMaxStalenessMs()) + ")";

@@ -4607,7 +4607,11 @@ void ClientGateway::retireRecordEgress_(int64_t sid, int32_t worker,
     r.sessionId = sid;
     r.worker    = worker;
     r.pub       = std::move(pub);
-    r.enqueued  = tryEnqueueEgressRelease_(r);
+    // PR #459 F3: FIFO behind this worker's queued subscription ops (an ending Unsubscribe among them must run while
+    // its egress still exists) - a release never overtakes them.
+    const auto wq = static_cast<std::size_t>(worker);
+    const bool behind = wq < pendingSubOps_.size() && !pendingSubOps_[wq].empty();
+    r.enqueued  = !behind && tryEnqueueEgressRelease_(r);
     if (!r.enqueued) ++retiringUnsent_;
     retiringEgress_.push_back(std::move(r));
 }
@@ -4638,6 +4642,8 @@ int ClientGateway::pumpEgressReleases_()
         if (r.enqueued) continue;
         const uint64_t bit = uint64_t{1} << static_cast<unsigned>(r.worker);
         if ((refused & bit) != 0) continue;
+        const auto wq = static_cast<std::size_t>(r.worker);
+        if (wq < pendingSubOps_.size() && !pendingSubOps_[wq].empty()) { refused |= bit; continue; }   // F3: FIFO
         if (!tryEnqueueEgressRelease_(r)) {
             refused |= bit;
             continue;
@@ -8680,8 +8686,15 @@ void ClientGateway::revokeSession_(int64_t sid, std::string_view reason)
         (void)permissionShipper_.bind(*workerPool_, sid, rune::node::PermissionShipper::kDenyTable, ++permEpoch_, owner);
     }
     const auto code = static_cast<uint16_t>(pc::ErrorCode::SessionRevoked);
-    // Each live subscription (and admin-log read) completes SessionRevoked on its correlation id ...
-    for (const auto& [key, subId] : s->subIdByKey) { (void)subId; sendErrorOn_(*s, key.correlationId, code, reason); }
+    // Each live subscription (and admin-log read) completes SessionRevoked on its correlation id.  PR #459 F3 (the #109
+    // class): a subscription a WORKER pushes is ended by that worker - its 46 follows its last Records on the same
+    // egress, and it is forgotten here first so the close below sends no plain Unsubscribe that would cancel the end.
+    for (const auto& [key, subId] : s->subIdByKey) {
+        const bool workerEnds = perWorkerEgressActive_ && workerPool_ && key.topicId >= 0 &&
+                                forwardUnsubscribeToWorker_(subId, key.topicId, key.partition, static_cast<int16_t>(code), reason);
+        if (workerEnds) subscriptions_.erase(subId);
+        else sendErrorOn_(*s, key.correlationId, code, reason);
+    }
     for (const int64_t corr : s->catalogReadCorrs) sendErrorOn_(*s, corr, code, reason);
     for (const int64_t corr : s->securityReadCorrs) sendErrorOn_(*s, corr, code, reason);
     // ... then the session-level frame (corr 0): every other in-flight request of the session completes with it.

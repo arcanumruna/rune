@@ -3249,14 +3249,15 @@ void BrokerNode::onSecurityServing_(const uint8_t* p, std::size_t n) {
         heldMirror_.frames.emplace_back(kA2cSecurityServing, std::vector<uint8_t>(p, p + n));
         return;
     }
-    bool caughtUp = false;
+    bool caughtUp = false, asLeader = false;
     int64_t leaderHw = -1;
-    if (!decodeSecurityServing(p, n, caughtUp, leaderHw)) [[unlikely]] {
+    int32_t epoch = -1;
+    if (!decodeSecurityServing(p, n, caughtUp, leaderHw, epoch, asLeader)) [[unlikely]] {
         if (adminToControlRejects_++ % 1024 == 0)
             spdlog::error("BrokerNode[{}]: malformed kA2cSecurityServing (len={}) skipped", config_.nodeId, n);
         return;
     }
-    if (securityServing_) securityServing_->onAdminCaughtUp(caughtUp, leaderHw);
+    if (securityServing_) securityServing_->onAdminCaughtUp(caughtUp, leaderHw, epoch, asLeader);
 }
 
 // Issues #15 / #111: one control pass of SecurityServing.  The consensus contact is the election being CLOSED (a
@@ -3266,7 +3267,21 @@ int BrokerNode::stepSecurityServing_(int64_t nowNs) {
     if (!securityServing_ || !gateway_) return 0;
     const bool closed = election_ == nullptr ||
                         election_->stateCode() == static_cast<int32_t>(rune::consensus::ElectionState::Closed);
-    const SecurityServing::Actions a = securityServing_->step(nowNs, closed);
+    // PR #459 F2: multi-node, the verdict counts only for the committed (-7, 0) epoch and role - a healed zombie's
+    // leader-era verdict is for an old epoch, so it serves nothing until its admin thread vouches for the new one.
+    SecurityServing::Committed committed;
+    const SecurityServing::Committed* cp = nullptr;
+    if (catalogOnController_ && metadataService_) {
+        if (const auto* pa = metadataService_->assignment(kSecurityTopicId, kSecurityPartition)) {
+            committed.epoch     = pa->leaderEpoch;
+            committed.selfLeads = pa->leaderNode == config_.nodeId;
+        }
+        committed.mapCurrent = metadataService_->mapCurrent();
+        committed.mapAnswers = metadataService_->mapLeaderAnswers();
+        committed.mapControls = metadataService_->mapControls();
+        cp = &committed;   // no committed assignment yet: epoch -1 never matches a verdict (not current)
+    }
+    const SecurityServing::Actions a = securityServing_->step(nowNs, closed, cp);
     if (a.changed) {
         spdlog::warn("BrokerNode[{}]: __security serving -> {} (admin caught up: {}, consensus closed: {}){}", config_.nodeId,
                      securityServing_->name(), securityServing_->adminCaughtUp(), closed,
@@ -3595,10 +3610,6 @@ void BrokerNode::holdSecurityMirrorForTest(bool on) {
 }
 
 void BrokerNode::partitionFromPeersForTest(bool on) {
-    onAdminThreadForTest([this, on]() {
-        if (catalogPlane_) catalogPlane_->setPartitionedForTest(on);
-        return 0;
-    });
     onControlThreadForTest([this, on]() {
         if (aeronIngress_) aeronIngress_->setPartitionedForTest(on);
         if (udpSink_) udpSink_->setPartitionedForTest(on);
@@ -4182,8 +4193,8 @@ void BrokerNode::buildAdminWorker() {
             adminWorkerAgent_->postErrorResponse(session, corr, code, message);
         };
         // Issues #15 / #111: the `__security` catch-up verdict -> the control thread's SecurityServing.
-        deps.securityServing = [this](bool caughtUp, int64_t leaderHw) {
-            if (adminWorkerAgent_) adminWorkerAgent_->postSecurityServing(caughtUp, leaderHw);
+        deps.securityServing = [this](bool caughtUp, int64_t leaderHw, int32_t epoch, bool asLeader) {
+            if (adminWorkerAgent_) adminWorkerAgent_->postSecurityServing(caughtUp, leaderHw, epoch, asLeader);
         };
         deps.securityMaxStalenessNs = config_.effectiveSecurityMaxStalenessMs() * 1'000'000LL;
         // Catalog history Task 12: the catalog read server's frames (admin thread)
@@ -4666,6 +4677,7 @@ int BrokerNode::pumpViewFanout_() {
 // ---------------------------------------------------------------------------
 int BrokerNode::serviceAdminControl_(int64_t nowNs) {
     int work = 0;
+    controlNowNs_ = nowNs;   // PR #459 M2: the one injected clock of this control pass (the D24 gate's deadline)
 
     // Task 9 (RUNE_TLS SIGHUP reload): polled FIRST, unconditionally — must
     // work even on a deployment with no admin worker configured (the early
@@ -5001,9 +5013,8 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
                     // applied the event (pumpSecurityGate_); a full gate answers Internal at once, never drops.
                     if (n < 16 + rune::protocol::client::MessageHeader::ENCODED_SIZE) return;
                     const int64_t eventOffset = admin_wire::getI64(p + 8);
-                    const int64_t heldNs = std::chrono::duration_cast<std::chrono::nanoseconds>(   // #120: the deadline's clock
-                        std::chrono::steady_clock::now().time_since_epoch()).count();
-                    securityGate_.hold(session, eventOffset, std::span<const uint8_t>(p + 16, n - 16), send, heldNs);
+                    // #120: the deadline runs on the control pass's injected clock (PR #459 M2).
+                    securityGate_.hold(session, eventOffset, std::span<const uint8_t>(p + 16, n - 16), send, controlNowNs_);
                     return;
                 }
                 const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -5041,11 +5052,8 @@ int BrokerNode::pumpSecurityGate_() {
     int n = securityGate_.release(std::min(securityView_->appliedOffset(), enforced), send);
     // Issue #120: never held forever - a worker that does not acknowledge its fence (a stalled op ring) leaves the OK
     // in doubt after the deadline (Internal, "committed at offset N; enforcement not confirmed"; a retry dedupes).
-    if (!securityGate_.empty()) [[unlikely]] {
-        const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
-        n += securityGate_.expire(nowNs, config_.securityGateDeadlineMs * 1'000'000LL, send);
-    }
+    if (!securityGate_.empty()) [[unlikely]]
+        n += securityGate_.expire(controlNowNs_, config_.securityGateDeadlineMs * 1'000'000LL, send);
     return n;
 }
 

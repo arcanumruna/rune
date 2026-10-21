@@ -686,14 +686,19 @@ int AdminWorker::stepSecurityServing_(int64_t nowNs) {
     in.leaderAnswers      = in.present ? securityReplica_->leaderAnswers() : 0;
     in.caughtUpWithLeader = in.present && securityReplica_->caughtUpWithLeader();
     in.appliedNext        = in.present && !in.halted ? securityApplier_->nextOffset() : -1;
-    in.highWatermark      = in.present ? securityReplica_->highWatermark() : 0;
+    in.highWatermark      = in.present ? securityReplica_->leaderCommittedHw() : 0;   // PR #459 F1: never capped at LEO
     const bool caughtUp = securityCatchUp_.step(in);
-    if (securityServingPosted_ == (caughtUp ? 1 : 0)) [[likely]] return 0;
+    const int32_t vEpoch = caughtUp ? securityCatchUp_.verdictEpoch() : -1;
+    const bool vLeader = caughtUp && securityCatchUp_.verdictAsLeader();
+    if (securityServingPosted_ == (caughtUp ? 1 : 0) && securityServingPostedEpoch_ == vEpoch &&
+        securityServingPostedLeader_ == vLeader) [[likely]] return 0;
     securityServingPosted_ = caughtUp ? 1 : 0;
+    securityServingPostedEpoch_ = vEpoch;
+    securityServingPostedLeader_ = vLeader;
     spdlog::info("AdminWorker: __security {} (role {}, epoch {}, applied {} / hw {})",
                  caughtUp ? "caught up - logins served" : "not caught up - logins answer AuthUnavailable",
                  in.leader ? "leader" : "follower", in.epoch, in.appliedNext, in.highWatermark);
-    deps_.securityServing(caughtUp, in.highWatermark);
+    deps_.securityServing(caughtUp, in.highWatermark, vEpoch, vLeader);
     return 1;
 }
 

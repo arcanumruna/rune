@@ -2852,6 +2852,20 @@ private:
         claim_ = ClaimNone{};   // F-B: a later claim always runs a fresh catch-up
     }
 
+public:
+    /// PR #459 F2 (issue #111): this node's committed map is current with the cluster's - a ready controller, or a
+    /// follower whose metadata replica is caught up with its leader (PartitionReplica::caughtUpWithLeader) and whose
+    /// state machine applied through that HW.  Control thread.
+    [[nodiscard]] bool mapCurrent() const noexcept {
+        if (controllerReady_()) return true;
+        return replica_ != nullptr && replica_->role() == rune::replication::Role::Follower &&
+               replica_->caughtUpWithLeader() && lastApplied_ >= replica_->highWatermark();
+    }
+    /// This node is the ready controller (it leads the consensus and its map reflects its whole log).
+    [[nodiscard]] bool mapControls() const noexcept { return controllerReady_(); }
+    /// The metadata leader's answers this node's metadata replica accepted (monotonic).
+    [[nodiscard]] uint64_t mapLeaderAnswers() const noexcept { return replica_ != nullptr ? replica_->leaderAnswers() : 0; }
+private:
     /// This replica may append to the metadata log (the replica's produce gate).
     [[nodiscard]] bool leaderReady_() const noexcept {
         return replica_ != nullptr && replica_->acceptsProduce();

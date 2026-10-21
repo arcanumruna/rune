@@ -5374,12 +5374,14 @@ TEST(PartitionReplicaCaughtUpRegression, AFollowerIsCaughtUpOnlyOnceItsCurrentLe
 
     auto p = makePayload(0x42, 8);
     FetchResponseMsg withRecords{};
-    withRecords.leaderEpoch = 1; withRecords.partition = 0; withRecords.highWatermark = 5;
+    // PR #459 F1: the leader's HW never moves back within an epoch - the fixture's records answer advertises HW 1 (it
+    // used to say 5 and then 1, which no leader does; caughtUpWithLeader now also requires that HW <= our log end).
+    withRecords.leaderEpoch = 1; withRecords.partition = 0; withRecords.highWatermark = 1;
     withRecords.logStartOffset = 0; withRecords.errorCode = kErrNone;
     withRecords.records = std::span<const uint8_t>(p.data(), p.size());
     f.applyReplicated(withRecords);
     ASSERT_EQ(f.logEndOffset(), 1);
-    EXPECT_FALSE(f.caughtUpWithLeader()) << "a response that carried records: more to pull (leader HW 5 > our end 1)";
+    EXPECT_FALSE(f.caughtUpWithLeader()) << "a response that carried records: more to pull";
 
     FetchResponseMsg empty{};
     empty.leaderEpoch = 1; empty.partition = 0; empty.highWatermark = 1;
@@ -5424,4 +5426,32 @@ TEST(InternalIsrKnowledgeRegression, FailClosedAfterAdoptRegression) {
     ASSERT_TRUE(k.offer(st(7, 1, {1, 3})));   // the current leadership proves the knowledge again
     EXPECT_TRUE(k.eligible(3));
     EXPECT_FALSE(k.eligible(2));
+}
+
+// PR #459 F1 (issue #15): a restarted follower whose FIRST answer from its current leader carries no records (the reply
+// to a keepalive, or a fetch at an offset the leader had nothing new for at that instant) went InSync and so was
+// "caught up with the leader" although that answer advertised a committed HW beyond its log end - the __security
+// catch-up gate (and the __catalog boot reconcile) then trusted a log missing committed events.  Caught up = InSync AND
+// the leader's advertised committed HW at or below our log end.
+TEST(CaughtUpWithLeaderRegression, AnEmptyAnswerAdvertisingAHwBeyondTheLogEndIsNotCaughtUpRegression) {
+    TempDir dir("caughtup_f1");
+    rune::storage::Log log(dir.path);
+    InMemoryTransport transport;
+    constexpr NodeId kL = 1, kF = 2;
+    std::vector<NodeId> replicas = {kL, kF};
+    PartitionReplica f(makeConfig(kF), Role::Follower, 1, replicas, replicas, &log, &transport);
+    seedStamped(f, 0, 3, 1, /*hw=*/3);   // what it held before it went down
+    f.becomeFollower(2, kL);             // restarted: following the current leader's epoch
+    EXPECT_FALSE(f.caughtUpWithLeader()) << "no answer of the current leader yet";
+    FetchResponseMsg empty{};
+    empty.errorCode = kErrNone; empty.leaderEpoch = 2; empty.partition = 0;
+    empty.highWatermark = 4; empty.logStartOffset = 0;   // the leader committed a 4th event meanwhile
+    f.applyReplicated(empty);
+    EXPECT_TRUE(f.committedHwKnown());
+    EXPECT_EQ(f.leaderCommittedHw(), 4);
+    EXPECT_LE(f.highWatermark(), 3) << "the own HW is capped at the log end";
+    EXPECT_FALSE(f.caughtUpWithLeader()) << "an empty answer whose HW is beyond the log end is NOT caught up";
+    seedStamped(f, 3, 1, 2, /*hw=*/4);   // the missed event arrives
+    f.applyReplicated(empty);            // and the next answer is empty at the new log end
+    EXPECT_TRUE(f.caughtUpWithLeader());
 }

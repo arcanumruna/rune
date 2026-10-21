@@ -509,7 +509,8 @@ struct NodeConfig {
     // `__security` state is provably current - caught up with the current leader since boot, a leader answer (a
     // follower) within F and the consensus in contact within F; otherwise it answers the retriable AuthUnavailable (48).
     //   RUNE_SECURITY_MAX_STALENESS_MS      — F (default 1 000); must exceed the broker liveness timeout + 500 ms, so a
-    //                                         leader failover never makes a healthy broker stale (an explicit value
+    //                                         leadership move does not make a healthy broker stale (a hard leader
+    //                                         failure can, briefly: #460) (an explicit value
     //                                         that does not is refused; the default is raised to it).
     //   RUNE_SECURITY_STALE_SESSION_END_MS  — R (default 10 000; > F): a broker stale this long ends its authenticated
     //                                         sessions with a session-level 48 (clients reconnect elsewhere).
@@ -1007,7 +1008,7 @@ struct NodeConfig {
     /// nullopt = valid; else the error.  Checked by parseNodeConfig and by
     /// BrokerNode at start (programmatic configs).
     std::optional<std::string> validateCatalogStream() const;
-    /// Issues #15 / #111: F > the broker liveness timeout + 500 ms (a failover never makes a healthy broker stale) and
+    /// Issues #15 / #111: F > the broker liveness timeout + 500 ms (a leadership move does not make a healthy broker stale) and
     /// R > F; a positive gate deadline.  Checked by the env parser (in-process rigs set the fields directly).
     std::optional<std::string> validateSecurityServing(bool stalenessExplicit = true, bool sessionEndExplicit = true) const;
 

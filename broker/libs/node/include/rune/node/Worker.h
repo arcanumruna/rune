@@ -2855,6 +2855,7 @@ private:
     std::vector<EndOwed> endsOwed_;
     bool endedSubsPending_ = false;   // a sub reached Ended this pass: swept after the push loop
     uint64_t subscriptionEndsSeen_ = 0, subscriptionEndsSent_ = 0, enforceFencesSeen_ = 0;
+    uint64_t subscriptionEndsLost_ = 0;   // F3: a release found the egress back-pressured for the terminal frame
     void eraseEndOwed_(int64_t subId) noexcept {
         for (std::size_t k = 0; k < endsOwed_.size(); ++k)
             if (endsOwed_[k].subscriptionId == subId) { endsOwed_[k] = std::move(endsOwed_.back()); endsOwed_.pop_back(); return; }
@@ -2909,23 +2910,66 @@ private:
     // -------------------------------------------------------------------
     [[gnu::cold]] [[gnu::noinline]] void executeEgressReleaseWire_(sbe::WorkerOp& op) {
         const auto pub = static_cast<std::uintptr_t>(op.egressPub());
+        bool endsOwed = false;
         for (std::size_t i = 0; i < subs_.size(); ) {
             if (reinterpret_cast<std::uintptr_t>(subs_[i].egressPub) == pub) {
-                if (subs_[i].pushState == WorkerSubscription::PushState::EndOwed) eraseEndOwed_(subs_[i].subscriptionId);
+                // PR #459 F3: a subscription ended just before its session closed (a revoked session) still owes its
+                // terminal frame - kept (it pushes nothing more) until the push pass sent it; the release waits for it.
+                if (subs_[i].pushState == WorkerSubscription::PushState::EndOwed) { endsOwed = true; ++i; continue; }
                 subs_[i] = subs_.back();
                 subs_.pop_back();
             } else {
                 ++i;
             }
         }
+        if (endsOwed) [[unlikely]] {
+            deferredReleases_.push_back(DeferredRelease{pub, op.sessionId(), op.correlationId(), passNowNs_ + kEndOwedReleaseGraceNs});
+            return;
+        }
+        ackEgressRelease_(op.sessionId(), op.correlationId());
+    }
+    void ackEgressRelease_(int64_t sessionId, int64_t token) {
         WorkerReturn ack;
         ack.type       = WorkerReturn::Type::SessionSignal;
-        ack.sessionId  = op.sessionId();
+        ack.sessionId  = sessionId;
         ack.partition  = workerId_;
         ack.lastOffset = static_cast<int64_t>(SessionSignalKind::EgressReleased);
-        ack.baseOffset = op.correlationId();   // the retire token
+        ack.baseOffset = token;   // the retire token
         enqueueSignal_(ack);
         ++egressReleases_;
+    }
+    // PR #459 F3: releases waiting for an owed terminal frame on their publication (cold: a revoked session's close).
+    // Bounded: past the grace (a client that never reads) the frame is given up, counted, and the release proceeds.
+    static constexpr int64_t kEndOwedReleaseGraceNs = 2'000'000'000;
+    struct DeferredRelease { std::uintptr_t pub; int64_t sessionId; int64_t token; int64_t deadlineNs; };
+    std::vector<DeferredRelease> deferredReleases_;
+    [[gnu::cold]] int serviceDeferredReleases_() {
+        int done = 0;
+        for (std::size_t k = 0; k < deferredReleases_.size(); ) {
+            const DeferredRelease d = deferredReleases_[k];
+            bool owed = false;
+            for (const auto& sub : subs_)
+                if (reinterpret_cast<std::uintptr_t>(sub.egressPub) == d.pub &&
+                    sub.pushState == WorkerSubscription::PushState::EndOwed) { owed = true; break; }
+            if (owed && passNowNs_ < d.deadlineNs) { ++k; continue; }
+            for (std::size_t i = 0; i < subs_.size(); ) {   // everything left on it goes (an end given up is counted)
+                if (reinterpret_cast<std::uintptr_t>(subs_[i].egressPub) == d.pub) {
+                    if (subs_[i].pushState == WorkerSubscription::PushState::EndOwed) {
+                        eraseEndOwed_(subs_[i].subscriptionId);
+                        ++subscriptionEndsLost_;
+                    }
+                    subs_[i] = subs_.back();
+                    subs_.pop_back();
+                } else {
+                    ++i;
+                }
+            }
+            ackEgressRelease_(d.sessionId, d.token);
+            deferredReleases_[k] = deferredReleases_.back();
+            deferredReleases_.pop_back();
+            ++done;
+        }
+        return done;
     }
 
     // -------------------------------------------------------------------
@@ -3071,7 +3115,7 @@ private:
     int pushOwnedSubscriptions_(int64_t /*nowNs*/) {
         using namespace rune::protocol::batch;
         namespace pc = rune::protocol::client;
-        if (subs_.empty()) return 0;
+        if (subs_.empty()) return deferredReleases_.empty() ? 0 : serviceDeferredReleases_();
 
         int work = 0;
         // F5: bounded per pass (kPushPassBudgetBytes, shared with PushRead
@@ -3288,6 +3332,7 @@ private:
             }
         }
         if (endedSubsPending_) [[unlikely]] sweepEndedSubs_();   // issue #109: ended subscriptions leave after the walk
+        if (!deferredReleases_.empty()) [[unlikely]] work += serviceDeferredReleases_();   // F3: after the end frames
         return work;
     }
 

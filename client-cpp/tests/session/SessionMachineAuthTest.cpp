@@ -714,3 +714,44 @@ TEST(ClientAuthUnavailableRegression, BacksOffAndRotatesSeedsRegression) {
         EXPECT_EQ(t.m->state(), sm::SessionState::Connected);
     }
 }
+
+// Adversarial review of PR #459 (issues #15 / #111): a 48 notice that names ANOTHER session (one this machine already
+// left: a late notice from the stale broker after the client moved) never ends the current session; a broker that keeps
+// answering 48 to every re-login is retried with a growing backoff, forever, and never turns into Rejected.
+TEST(ClientAuthUnavailableRegression, AStaleNoticeNeverEndsTheNewSessionAndRepeated48sKeepRetryingAdversarialRegression) {
+    constexpr int16_t kUnavailable = static_cast<int16_t>(pc::ErrorCode::AuthUnavailable);
+    {
+        Rig t("ws1", "correct horse battery", /*forever=*/true, /*allowUnauthenticated=*/true);
+        t.m->connect(0);
+        t.m->onConnectResponse(0, -1, 42, t.io.lastCorrelation(), 1);
+        ASSERT_EQ(t.m->state(), sm::SessionState::Connected);
+        t.m->onErrorResponse(kUnavailable, "stale", /*corr=*/0, 50, /*noticeSessionId=*/41);
+        EXPECT_EQ(t.m->state(), sm::SessionState::Connected) << "a notice for session 41 never ends session 42";
+        EXPECT_EQ(t.m->sessionId(), 42);
+        EXPECT_EQ(t.m->authUnavailableCount(), 0u);
+    }
+    {
+        Rig t("ws1", "correct horse battery", /*forever=*/true, /*allowUnauthenticated=*/true);
+        t.m->connect(0);
+        t.m->onConnectResponse(0, -1, 42, t.io.lastCorrelation(), 1);
+        ASSERT_TRUE(t.m->everLive());
+        int64_t now = 10;
+        t.m->forceReconnect(now);
+        int64_t lastDelay = -1;
+        for (int i = 0; i < 40; ++i) {
+            ASSERT_EQ(t.m->state(), sm::SessionState::Connecting) << i;
+            auto r = authRequired(t.io.lastCorrelation());
+            t.m->onConnectResponse(r.code, -1, 100 + i, t.io.lastCorrelation(), ++now, 0, {}, r.authMode, r.authState);
+            ASSERT_EQ(t.m->state(), sm::SessionState::Authenticating) << i;
+            t.m->onAuthServerFinal(pc::AuthServerFinal{.errorCode = 48}, ++now);
+            ASSERT_EQ(t.m->state(), sm::SessionState::Backoff) << i << ": never Rejected";
+            const int64_t delay = t.m->nextAttemptNs() - now;
+            EXPECT_GE(delay, lastDelay) << i << ": the backoff never shrinks";
+            lastDelay = delay;
+            now = t.m->nextAttemptNs();
+            t.m->tick(now);
+        }
+        EXPECT_EQ(t.m->authUnavailableCount(), 40u);
+        EXPECT_EQ(t.m->rejectCode(), 0);
+    }
+}

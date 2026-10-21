@@ -310,3 +310,70 @@ TEST(SecurityEnforcementFenceRegression, ASubscriptionThatNeverReachedAWorkerIsE
     EXPECT_EQ(r.gw.securityEnforcedOffset(), off);
     EXPECT_TRUE(r.pool.worker(0).subscriptionsForTest().empty());
 }
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// Adversarial review of PR #459: the fence acks out of order, replayed, stale or from a worker that does not exist.
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+namespace {
+rune::node::WorkerReturn fenceAck(int32_t worker, int ring, uint64_t seq) {
+    rune::node::WorkerReturn a;
+    a.type       = rune::node::WorkerReturn::Type::SessionSignal;
+    a.partition  = worker;
+    a.lastOffset = static_cast<int64_t>(rune::node::SessionSignalKind::FenceAck);
+    a.baseOffset = static_cast<int64_t>(seq);
+    a.sessionId  = ring;
+    return a;
+}
+}  // namespace
+
+// Ordering: event 1 (REVOKE READ: an ending Unsubscribe on the op ring + the lifecycle) then event 2 (REVOKE WRITE:
+// lifecycle only).  The lifecycle ack of event 2 arrives first - it covers event 1's lifecycle fence too (FIFO) - but
+// event 1's op ring has not acknowledged: NEITHER event is enforced (the offset moves only forward, in event order).
+TEST(SecurityEnforcementFenceRegression, AckOfALaterEventNeverReleasesAnEarlierOneStillFencedAdversarialRegression) {
+    FenceRig r(1);
+    FakePub pub;
+    const int64_t rs = r.login("r");
+    (void)r.login("w");
+    r.gw.injectRecordEgressForTest(rs, 0, pub.make());
+    pc::Subscribe s;
+    s.sessionId = rs; s.correlationId = 61; s.topicId = 0; s.partition = 0; s.partitionKnown = 1; s.fromOffset = 0;
+    std::vector<uint8_t> buf(s.encodedSize());
+    buf.resize(s.encode(buf.data()));
+    r.gw.applySubscribeForTest(buf.data(), buf.size());
+    r.runAll(1);
+    ASSERT_EQ(r.pool.worker(0).subscriptionsForTest().size(), 1u);
+    const int64_t before = r.gw.securityEnforcedOffset();
+    const uint64_t f0 = r.gw.enforceFencesIssuedForTest();
+    const int64_t e1 = r.revoke(sec::Operation::Read, "r");
+    const int64_t e2 = r.revoke(sec::Operation::Write, "w");
+    ASSERT_EQ(r.gw.enforceFencesIssuedForTest(), f0 + 2);
+    r.gw.handleWorkerReturnForTest(fenceAck(0, 1, f0 + 2));   // lifecycle: event 2's fence (and so event 1's)
+    EXPECT_EQ(r.gw.securityEnforcedOffset(), before) << "event 1's op ring has not acknowledged";
+    r.gw.handleWorkerReturnForTest(fenceAck(0, 0, f0 + 1));   // the op ring: event 1's fence
+    EXPECT_EQ(r.gw.securityEnforcedOffset(), e2) << "both enforced, in order";
+    (void)e1;
+}
+
+// Replays and garbage: a replayed old ack, an ack for a fence never issued on that ring, and acks naming a worker that
+// does not exist (negative, past the pool, past the 64-worker cap) never enforce anything they should not, never crash.
+TEST(SecurityEnforcementFenceRegression, StaleReplayedAndOutOfRangeAcksEnforceNothingAdversarialRegression) {
+    FenceRig r(2);
+    (void)r.login("w");
+    for (int i = 0; i < 3; ++i) r.runAll(1 + i);
+    const int64_t before = r.gw.securityEnforcedOffset();
+    const uint64_t f0 = r.gw.enforceFencesIssuedForTest();
+    const int64_t off = r.revoke(sec::Operation::Write, "w");
+    const uint64_t seq = f0 + 1;
+    for (const int32_t w : {-1, 2, 63, 64, 1000, INT32_MIN, INT32_MAX})
+        r.gw.handleWorkerReturnForTest(fenceAck(w, 1, seq));
+    r.gw.handleWorkerReturnForTest(fenceAck(0, 1, f0));        // a replay of an older fence
+    r.gw.handleWorkerReturnForTest(fenceAck(1, 0, seq));       // the right seq on the WRONG ring
+    EXPECT_EQ(r.gw.securityEnforcedOffset(), before) << "no ack of the event's own fence from every worker yet";
+    r.gw.handleWorkerReturnForTest(fenceAck(0, 1, seq));
+    EXPECT_EQ(r.gw.securityEnforcedOffset(), before) << "worker 1 has not acknowledged";
+    r.gw.handleWorkerReturnForTest(fenceAck(1, 1, seq));
+    EXPECT_EQ(r.gw.securityEnforcedOffset(), off);
+    r.gw.handleWorkerReturnForTest(fenceAck(1, 1, seq));       // duplicate: harmless
+    r.gw.handleWorkerReturnForTest(fenceAck(0, 1, 0));
+    EXPECT_EQ(r.gw.securityEnforcedOffset(), off) << "never moves backward";
+}

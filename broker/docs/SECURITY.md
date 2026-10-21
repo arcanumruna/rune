@@ -287,7 +287,9 @@ current; otherwise it answers the retriable `AuthUnavailable` (48) and the clien
 - **Stale.** A follower whose leader has not answered for `RUNE_SECURITY_MAX_STALENESS_MS` (F, default
   1 000), whose apply lags that long, or any broker that lost contact with the consensus for F (a broker cut
   off the cluster, including a `__security` leader that does not know it was replaced) is stale. F exceeds
-  the broker liveness timeout, so a normal failover never makes a broker stale.
+  the broker liveness timeout, so a planned leadership move does not make a broker stale; a hard leader
+  failure can make the surviving followers answer logins `AuthUnavailable` briefly until the new leader
+  answers them (tracked in #460).
 - A broker stale for `RUNE_SECURITY_STALE_SESSION_END_MS` (R, default 10 000) ends its authenticated
   sessions with a session-level `AuthUnavailable`; their clients reconnect to a current broker. Until then
   those sessions keep working on the state the broker last had: what a broker serves is never more than

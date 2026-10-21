@@ -781,8 +781,17 @@ public:
     /// leader answered its last fetch with nothing beyond our log end (FollowerSync
     /// InSync) after telling us its HW.  A fresh or wiped follower is false until
     /// it has fetched everything the leader had.
+    /// PR #459 F1: an empty answer alone is not enough (FollowerSync goes InSync on ANY answer without records, e.g.
+    /// the reply to a keepalive): the committed HW the current leader advertised in this epoch must also be at or
+    /// below our log end - a restarted follower whose first answer was empty is not caught up while it misses records.
     [[nodiscard]] bool caughtUpWithLeader() const noexcept {
-        return role_ == Role::Leader || (committedHwKnown() && followerSync_.inSync());
+        return role_ == Role::Leader ||
+               (committedHwKnown() && followerSync_.inSync() && followerSync_.leaderHw() <= logEndOffset_());
+    }
+    /// PR #459 F1: the committed HW the current leader last advertised (a follower; 0 before its first answer in this
+    /// epoch), the own HW on a leader.  NOT capped at the local log end, unlike highWatermark().
+    [[nodiscard]] Offset leaderCommittedHw() const noexcept {
+        return role_ == Role::Leader ? highWatermark() : followerSync_.leaderHw();
     }
     /// Issues #15 / #111: how many fetch answers / pushes of the CURRENT (or a newer-known) leader this follower
     /// accepted - monotonic; the owner samples it each pass to know when the leader last answered (no clock here).

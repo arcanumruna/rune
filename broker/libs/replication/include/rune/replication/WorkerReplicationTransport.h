@@ -1017,7 +1017,6 @@ public:
                 assembler_.onFragment(
                     [this, &dispatch](aeron::concurrent::AtomicBuffer& buffer, aeron::util::index_t offset,
                                       aeron::util::index_t length, aeron::Header& header) {
-                        if (partitionedForTest_) [[unlikely]] return;   // issue #111 test seam: this node hears no peer
                         const auto* frame = reinterpret_cast<const uint8_t*>(buffer.buffer() + offset);
                         if (auto* c = std::get_if<rune::peerlink::PeerFrameCrypto>(&crypto_)) [[unlikely]] {
                             // Task 16: open AFTER reassembly, BEFORE any dispatch; a frame that does not open is
@@ -1682,11 +1681,7 @@ private:
 
     // True when constructed via the test-seam constructor (no real Aeron sub).
     bool testMode_ = false;
-    bool partitionedForTest_ = false;   // issue #111 test seam (the polling thread): inbound peer frames dropped
-public:
-    /// Test seam (issue #111), the polling thread only: while set every inbound peer frame is consumed and dropped.
-    void setPartitionedForTest(bool on) noexcept { partitionedForTest_ = on; }
-private:
+
 
     // Shard plane handshake (see enablePlaneHandshake).  Worker-thread only.
     std::array<PeerPlane, kMaxHandshakePeers> hs_{};

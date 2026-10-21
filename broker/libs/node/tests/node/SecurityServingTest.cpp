@@ -2,6 +2,7 @@
 // serve logins, `__security` reads and security DDL (SecurityServing.h).  Deterministic: the clock is a plain number.
 //   SecurityCatchUp  (admin thread)   - caught up since boot with the current leader, and the contact stays fresh;
 //   SecurityServing  (control thread) - CatchingUp | Serving | Stale, the consensus contact, the session end after R.
+#include <rune/node/AdminChannels.h>
 #include <rune/node/SecurityServing.h>
 
 #include <gtest/gtest.h>
@@ -87,6 +88,10 @@ TEST(SecurityServingRegression, AStuckApplierLosesItAfterFRegression) {
 
 // A leader: caught up once SecurityAdmin serves (its whole log committed and applied); a promotion keeps the
 // follower's verdict for F (a failover never makes a healthy broker stale), a leader that never serves loses it.
+// A leader: caught up once SecurityAdmin serves (its whole log committed and applied).  PR #459 F2 (a deliberate change
+// of this test, not a weakening): a DEMOTED leader re-earns the verdict as a follower - its leader-era verdict says
+// nothing about the new leader's log.  A FOLLOWER's verdict survives a leader change within F (and follows the new
+// epoch); a promoted follower keeps it for F while it catches up as leader, and loses it if it never serves.
 TEST(SecurityServingRegression, ALeaderIsCaughtUpWhileItServesAndAFailoverWithinFKeepsItRegression) {
     SecurityCatchUp c(kF);
     SecurityCatchUp::Inputs in;
@@ -94,19 +99,79 @@ TEST(SecurityServingRegression, ALeaderIsCaughtUpWhileItServesAndAFailoverWithin
     EXPECT_FALSE(c.step(in)) << "a fresh leader catching up";
     in.nowNs = 5 * kMs; in.leaderServing = true; in.appliedNext = 4; in.highWatermark = 4;
     EXPECT_TRUE(c.step(in));
-    // Demoted, then a follower of the next epoch: its leader answers within F.
+    EXPECT_TRUE(c.verdictAsLeader());
+    // Demoted: a follower of the next epoch must re-earn it.
     in.nowNs = 20 * kMs; in.leader = false; in.leaderServing = false; in.epoch = 2; in.caughtUpWithLeader = false;
-    EXPECT_TRUE(c.step(in)) << "within F of its last contact";
-    in.nowNs = 30 * kMs; in.leaderAnswers = 1;
+    EXPECT_FALSE(c.step(in)) << "a leader-era verdict does not survive the demotion";
+    in.nowNs = 30 * kMs; in.leaderAnswers = 1; in.caughtUpWithLeader = true;
+    EXPECT_TRUE(c.step(in)) << "re-earned: its new leader answered and it holds and applied the leader's HW";
+    EXPECT_EQ(c.verdictEpoch(), 2);
+    // A follower's verdict survives a failover within F and follows the new epoch.
+    in.nowNs = 40 * kMs; in.epoch = 3; in.caughtUpWithLeader = false;
     EXPECT_TRUE(c.step(in));
-    // Promoted again but never serving (cannot commit: a minority) - lost F after the last contact.
-    in.leader = true; in.epoch = 3;
+    EXPECT_EQ(c.verdictEpoch(), 3);
+    // Promoted but never serving (cannot commit: a minority) - lost F after the last contact.
+    in.leader = true; in.epoch = 4;
     in.nowNs = 30 * kMs + kF;
     EXPECT_TRUE(c.step(in));
     in.nowNs = 31 * kMs + kF;
     EXPECT_FALSE(c.step(in));
     in.nowNs = 40 * kMs + kF; in.leaderServing = true;
     EXPECT_TRUE(c.step(in));
+}
+
+// PR #459 F2: multi-node, a verdict counts only for the committed epoch and role - a healed zombie's leader-era verdict
+// (an older epoch) serves nothing when the contact returns, until the admin thread vouches for the committed one.
+TEST(SecurityServingRegression, AVerdictForAnOtherEpochOrRoleThanTheCommittedOneIsNotCurrentRegression) {
+    SecurityServing s(kF, kR);
+    s.onAdminCaughtUp(true, 3, /*epoch=*/1, /*asLeader=*/true);
+    SecurityServing::Committed now{1, true, true, 5};
+    ASSERT_TRUE(s.step(0, true, &now).changed);
+    ASSERT_TRUE(s.serving());
+    EXPECT_TRUE(s.step(kF + 1, false, &now).changed) << "cut off: stale";
+    // Healed - the FIRST passes still see the old map (epoch 1, self leads): never current on it.
+    EXPECT_FALSE(s.step(kF + 2, true, &now).changed);
+    now.mapCurrent = false; now.mapAnswers = 6;
+    EXPECT_FALSE(s.step(kF + 3, true, &now).changed);
+    EXPECT_FALSE(s.serving()) << "the map has not caught up since the contact returned";
+    SecurityServing::Committed healed{2, false, true, 9};   // the map caught up: epoch 2, another leader
+    EXPECT_FALSE(s.step(kF + 4, true, &healed).changed);
+    EXPECT_FALSE(s.serving()) << "contact back, map current, but the verdict is for epoch 1 as leader";
+    s.onAdminCaughtUp(false, 3, -1, false);
+    EXPECT_FALSE(s.step(kF + 5, true, &healed).changed);
+    s.onAdminCaughtUp(true, 4, 2, false);
+    EXPECT_TRUE(s.step(kF + 6, true, &healed).changed);
+    EXPECT_TRUE(s.serving());
+    s.onAdminCaughtUp(true, 4, 2, true);   // the right epoch, the wrong role
+    EXPECT_TRUE(s.step(kF + 7, true, &healed).changed);
+    EXPECT_FALSE(s.serving());
+}
+
+// PR #459 F2: after a lost consensus contact the map is trusted only once a metadata answer arrived AFTER the contact
+// returned and the map is current - an answer counted before (the frozen map's own) never counts.
+TEST(SecurityServingRegression, AfterALostContactTheMapIsTrustedOnlyAfterAFreshAnswerRegression) {
+    SecurityServing s(kF, kR);
+    s.onAdminCaughtUp(true, 3, 1, true);
+    SecurityServing::Committed c{1, true, true, 10};
+    ASSERT_TRUE(s.step(0, true, &c).changed);
+    (void)s.step(kF + 1, false, &c);           // stale
+    c.mapAnswers = 11;                          // an answer while still cut off (in flight): not after the return
+    (void)s.step(kF + 2, false, &c);
+    (void)s.step(kF + 3, true, &c);             // contact back: the baseline is taken now (11)
+    EXPECT_FALSE(s.serving());
+    (void)s.step(kF + 4, true, &c);
+    EXPECT_FALSE(s.serving()) << "no answer since the return";
+    c.mapAnswers = 12; c.mapCurrent = false;
+    (void)s.step(kF + 5, true, &c);
+    EXPECT_FALSE(s.serving()) << "answered, but not caught up";
+    c.mapAnswers = 13; c.mapCurrent = true;
+    EXPECT_TRUE(s.step(kF + 6, true, &c).changed);
+    EXPECT_TRUE(s.serving());
+    // A short blip (within F) owes nothing.
+    (void)s.step(kF + 7, false, &c);
+    EXPECT_TRUE(s.serving());
+    (void)s.step(kF + 8, true, &c);
+    EXPECT_TRUE(s.serving());
 }
 
 TEST(SecurityServingRegression, AHaltedOrAbsentSecurityLogIsNeverCaughtUpRegression) {
@@ -168,4 +233,66 @@ TEST(SecurityServingRegression, AnAdminVerdictLossMakesItStaleAtOnceRegression) 
     s.onAdminCaughtUp(true, 4);
     EXPECT_TRUE(s.step(2, true).changed);
     EXPECT_TRUE(s.serving());
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// Adversarial review of PR #459 (issues #15 / #111).
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// Input bounds: the admin->control verdict frame, truncated at every length and with every first byte.
+TEST(SecurityServingRegression, TheVerdictFrameTruncatedOrMalformedIsRefusedAdversarialRegression) {
+    uint8_t buf[rune::node::kSecurityServingWireLen + 4]{};
+    rune::node::writeSecurityServing(buf, true, 0x0102030405060708LL);
+    bool up = false; int64_t hw = 0;
+    for (std::size_t n = 0; n <= sizeof buf; ++n)
+        EXPECT_EQ(rune::node::decodeSecurityServing(buf, n, up, hw), n == rune::node::kSecurityServingWireLen) << n;
+    ASSERT_TRUE(rune::node::decodeSecurityServing(buf, rune::node::kSecurityServingWireLen, up, hw));
+    EXPECT_TRUE(up);
+    EXPECT_EQ(hw, 0x0102030405060708LL);
+    for (int v = 2; v < 256; ++v) {
+        buf[0] = static_cast<uint8_t>(v);
+        EXPECT_FALSE(rune::node::decodeSecurityServing(buf, rune::node::kSecurityServingWireLen, up, hw)) << v;
+    }
+}
+
+// The zombie heals (unit layer of AuthRestartAdversarialRegression.AHealedZombie...): it "led" the whole partition (its
+// own contact refreshed every pass), then learns it was replaced and follows the new leader, whose log is AHEAD of its
+// own (the events it missed).  Its leader-era verdict says nothing about the new leader's log: it must not stay caught up
+// until it caught up with that leader and applied what it missed.
+TEST(SecurityServingRegression, ADemotedZombieIsNotCaughtUpUntilItCaughtUpWithItsNewLeaderAdversarialRegression) {
+    SecurityCatchUp c(kF);
+    SecurityCatchUp::Inputs in;
+    in.present = true; in.leader = true; in.leaderServing = true; in.epoch = 1; in.appliedNext = 3; in.highWatermark = 3;
+    for (int64_t t = 0; t <= 20 * kF; t += 100 * kMs) { in.nowNs = t; ASSERT_TRUE(c.step(in)); }   // cut off, "leading"
+    // Healed: demoted to a follower of epoch 2; the new leader's first answer says it holds 4 committed records.
+    in.nowNs = 20 * kF + kMs; in.leader = false; in.leaderServing = false; in.epoch = 2;
+    in.leaderAnswers = 1; in.highWatermark = 4; in.caughtUpWithLeader = false;
+    EXPECT_FALSE(c.step(in)) << "behind its new leader (applied 3 < hw 4): not caught up";
+    in.nowNs += 10 * kMs; in.leaderAnswers = 2;
+    EXPECT_FALSE(c.step(in));
+    in.nowNs += 10 * kMs; in.leaderAnswers = 3; in.caughtUpWithLeader = true; in.appliedNext = 4;
+    EXPECT_TRUE(c.step(in)) << "caught up with the new leader";
+}
+
+// Flapping: the consensus contact toggles every pass (closed / not) - never longer than F apart - the broker stays
+// serving and never ends a session; R counts from the START of a stale episode, and each episode ends sessions once.
+TEST(SecurityServingRegression, AFlappingContactNeverMakesItStaleAndEachEpisodeEndsSessionsOnceAdversarialRegression) {
+    SecurityServing s(kF, kR);
+    s.onAdminCaughtUp(true, 1);
+    ASSERT_TRUE(s.step(0, true).changed);
+    for (int64_t t = 1; t < 50 * kF; t += kF / 2) {
+        const auto a = s.step(t, (t / (kF / 2)) % 2 == 0);
+        EXPECT_FALSE(a.endSessions) << t;
+        EXPECT_TRUE(s.serving()) << t;
+    }
+    int64_t t = 100 * kF;
+    (void)s.step(t, true);
+    int ends = 0;
+    for (int episode = 0; episode < 3; ++episode) {
+        const int64_t start = t;
+        while (t < start + kF + kR + 5 * kMs) { t += kMs; ends += s.step(t, false).endSessions ? 1 : 0; }
+        EXPECT_EQ(ends, episode + 1) << "one end per stale episode";
+        t += kMs;
+        EXPECT_TRUE(s.step(t, true).changed);
+        EXPECT_TRUE(s.serving());
+    }
 }

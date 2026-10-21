@@ -116,7 +116,7 @@ struct AdminDeps {
 
     /// Issues #15 / #111 (M7): this broker's `__security` catch-up verdict changed (SecurityCatchUp) - production posts
     /// kA2cSecurityServing on the admin→control FIFO.  Unset: not tracked (rigs without a control thread).
-    std::function<void(bool caughtUp, int64_t leaderHw)> securityServing;
+    std::function<void(bool caughtUp, int64_t leaderHw, int32_t epoch, bool asLeader)> securityServing;
     /// F (RUNE_SECURITY_MAX_STALENESS_MS, effective): the contact a follower's verdict may lapse for.
     int64_t securityMaxStalenessNs = 1'000'000'000;
 };
@@ -488,6 +488,8 @@ private:
     // first pass).  A refused post is impossible (the effect FIFO backlogs), so the posted value is the control's.
     SecurityCatchUp                       securityCatchUp_{1'000'000'000};
     int                                   securityServingPosted_ = -1;   // -1 none, 0 / 1 the verdict
+    int32_t                               securityServingPostedEpoch_ = -1;   // PR #459 F2: and what it is for
+    bool                                  securityServingPostedLeader_ = false;
     int stepSecurityServing_(int64_t nowNs);
 public:
     [[nodiscard]] bool securityCaughtUpForTest() const noexcept { return securityCatchUp_.caughtUp(); }
