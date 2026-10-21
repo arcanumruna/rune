@@ -2207,6 +2207,30 @@ private:
     uint64_t catalogSubscribesForwarded_ = 0;
     void forwardCatalogUnsubscribe_(int64_t sid, int64_t subscriptionId);
     int  flushPendingCatalogUnsubs_();
+    // Issue #117: an admin-log read end (-2 / -3) of a live session is the Session's own pending state (never the
+    // capped queue above): one entry per session in sessionsWithReadEnds_ (bounded by the sessions), retried until the
+    // admin ring takes it.  A close supersedes it (-1 ends both servers' reads).
+    void endAdminLogReads_(Session& s, uint8_t bit);
+    [[nodiscard]] bool submitReadEnds_(Session& s);   ///< true = nothing of it is pending any more
+    int  flushPendingReadEnds_();
+    std::vector<int64_t> sessionsWithReadEnds_;
+public:
+    /// Issue #117: may this admin-log read frame (`__catalog` / `__security` Records of subscription `subId`) go to
+    /// the session NOW?  The control thread's own gate, independent of the admin thread having processed an end:
+    /// a `__catalog` read needs DESCRIBE ON CLUSTER, a `__security` read ADMIN ON CLUSTER, and a `__security` frame
+    /// whose events this broker's SecurityView has not applied yet waits (a revoke the admin applied first must not
+    /// let its successors through).  Deliver / Withhold (dropped: the reader lost the grant) / Hold (offered later).
+    enum class AdminLogAdmit : uint8_t { Deliver, Withhold, Hold };
+    [[nodiscard]] AdminLogAdmit admitAdminLogFrame(int64_t sessionId, int64_t subId, const uint8_t* frame, std::size_t len);
+    [[nodiscard]] uint64_t adminLogFramesWithheld() const noexcept { return adminLogFramesWithheld_; }
+    [[nodiscard]] std::size_t sessionsWithPendingReadEndsForTest() const noexcept { return sessionsWithReadEnds_.size(); }
+    int pumpReadEndsForTest() { return flushPendingReadEnds_(); }
+    void endAdminLogReadsForTest(int64_t sid, bool security) {
+        if (Session* s = sessions_.find(sid))
+            endAdminLogReads_(*s, security ? Session::kPendingEndSecurityReads : Session::kPendingEndCatalogReads);
+    }
+private:
+    uint64_t adminLogFramesWithheld_ = 0;
     [[nodiscard]] bool submitCatalogOrSecurityUnsub_(int64_t sid, int64_t subscriptionId);
     /// handleSubscribe for topicId == kCatalogTopicId: answered here or forwarded.
     void handleCatalogSubscribe_(Session& session, const rune::protocol::client::Subscribe& msg);
@@ -2760,7 +2784,11 @@ public:
     }
     void closeSessionForTest(int64_t sid) { (void)closeSession_(sid); }
     /// Task 12: the doWork step that retries catalog Unsubscribes the admin ring refused.
-    int pumpCatalogUnsubscribesForTest() { return pendingCatalogUnsubs_.empty() ? 0 : flushPendingCatalogUnsubs_(); }
+    int pumpCatalogUnsubscribesForTest() {   // the doWork retry steps (issue #117: the sessions' read ends too)
+        return (pendingCatalogUnsubs_.empty() ? 0 : flushPendingCatalogUnsubs_()) + flushPendingReadEnds_();
+    }
+    /// Test-only: the admin-log Unsubscribe / end path (kEndCatalogReadsOnly / kEndSecurityReadsOnly / an id / -1).
+    void forwardCatalogUnsubscribeForTest(int64_t sid, int64_t subscriptionId) { forwardCatalogUnsubscribe_(sid, subscriptionId); }
     /// Drive the resolve-completion path for (sid, worker) with `pub` and one
     /// buffered subscribe `subId` on (topicId, partition).
     void resolveRecordEgressForTest(int64_t sid, int32_t worker, std::shared_ptr<aeron::ExclusivePublication> pub,

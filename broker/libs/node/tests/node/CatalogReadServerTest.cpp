@@ -303,6 +303,9 @@ struct FlowHarness {
 
     using Offer = rune::node::CatalogReadFlow::Offer;
     using Room  = rune::node::CatalogReadFlow::Room;
+    rune::node::CatalogReadFlow::Admit admit(int64_t, int64_t, const uint8_t*, std::size_t) {
+        return rune::node::CatalogReadFlow::Admit::Deliver;
+    }
     Offer tryOffer(int64_t s, const uint8_t* f, std::size_t n) {
         Session& ss = sessions.at(s);
         if (ss.inFlight + n > ss.window && ss.inFlight != 0) return Offer::BackPressured;

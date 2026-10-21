@@ -17,6 +17,8 @@
 // (the TopicServabilityTest rig); "committed placement" = the steady-state
 // routing image (committed metadata ready).
 #include <rune/gateway/ClientGateway.h>
+#include <rune/gateway/SecurityView.h>
+#include <rune/gateway/SessionAuth.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/metadata/Gpid.h>
 #include <rune/metadata/RoutingImage.h>
@@ -100,7 +102,12 @@ struct CountingAdminSink final : IAdminRequestSink {
     AdminSubmit submitSecurityDdl(const pc::SecurityDdl&, const DdlMetaView&, std::string_view, bool) override { return AdminSubmit::Accepted; }
     AdminSubmit submitSecurityBootstrap(const pc::SecurityBootstrap&, const DdlMetaView&) override { return AdminSubmit::Accepted; }
     bool submitSecuritySubscribe(int64_t, int64_t, int64_t) override { return true; }
-    bool submitSecurityUnsubscribe(int64_t, int64_t) override { return true; }
+    std::vector<CatalogUnsub> securityUnsubs;
+    bool submitSecurityUnsubscribe(int64_t s, int64_t id) override {
+        if (ringFull) return false;
+        securityUnsubs.push_back({s, id});
+        return true;
+    }
 };
 
 /// One DDL answer as the client sees it: the frame's template, its code and message.
@@ -882,4 +889,87 @@ TEST(CatalogGatewayRegression, SessionClosesBeyondTheQueueAreLeftToTheSweepNever
     g.admin.ringFull = false;
     (void)g.gw.pumpCatalogUnsubscribesForTest();
     EXPECT_EQ(g.admin.catalogUnsubs.size(), 1024u) << "every queued close is delivered";
+}
+
+// Issue #117 (X017 part, M10): a live permission loss's end of a session's `__security` / `__catalog` reads (-3 / -2) is
+// never dropped - not even with the admin ring full and the waiting-unsubscribe queue at its cap (it used to be: "it ends
+// with the session", so a session that lost ADMIN kept streaming every new verifier until it disconnected).  RED before
+// the fix: the -3 was dropped at the cap and never reached the admin.
+TEST(AuthLiveChangeRegression, SecurityReadEndNeverDroppedUnderAdminRingPressureRegression) {
+    GatewayRig g;
+    g.admin.ringFull = true;
+    std::vector<int64_t> others;
+    for (int i = 0; i < 1100; ++i) others.push_back(g.gw.injectTestSession(0, pc::kClientVersion));
+    for (int64_t s : others) g.gw.closeSessionForTest(s);
+    ASSERT_EQ(g.gw.pendingCatalogUnsubscribes(), 1024u) << "the waiting queue is at its cap";
+    g.gw.forwardCatalogUnsubscribeForTest(g.sid, rune::gateway::kEndSecurityReadsOnly);
+    g.gw.forwardCatalogUnsubscribeForTest(g.sid, rune::gateway::kEndCatalogReadsOnly);
+    g.gw.forwardCatalogUnsubscribeForTest(g.sid, rune::gateway::kEndSecurityReadsOnly);   // coalesces
+    for (int pass = 0; pass < 3; ++pass) (void)g.gw.pumpCatalogUnsubscribesForTest();    // still full: kept
+    g.admin.ringFull = false;
+    (void)g.gw.pumpCatalogUnsubscribesForTest();                                         // the duty-cycle retries
+    std::size_t securityEnds = 0, catalogEnds = 0;
+    for (const auto& u : g.admin.securityUnsubs) securityEnds += u.session == g.sid && u.subscriptionId == -1 ? 1 : 0;
+    for (const auto& u : g.admin.catalogUnsubs)
+        catalogEnds += u.session == g.sid && u.subscriptionId == rune::gateway::kEndCatalogReadsOnly ? 1 : 0;
+    EXPECT_EQ(securityEnds, 1u) << "the end of the session's __security reads reached the admin (once: coalesced)";
+    EXPECT_EQ(catalogEnds, 1u) << "the end of the session's __catalog reads reached the admin";
+}
+
+// Issue #117, the control thread's own gate: an admin-log Records frame reaches the session only while it holds the
+// grant NOW (ADMIN ON CLUSTER for `__security`, DESCRIBE ON CLUSTER for `__catalog`), whether or not the admin thread has
+// processed the end yet; and a `__security` frame whose event this broker's SecurityView has not applied waits (the
+// admin can apply and stream a REVOKE and the CREATE USER after it before this thread applies the REVOKE).  RED before
+// the fix: every frame was offered (the admin processing the end was the only stop).
+namespace {
+std::vector<uint8_t> securityRecordsFrame(int64_t sid, int64_t subId, int64_t eventOffset, bool control = false) {
+    rune::protocol::RecordBatchBuilder b(eventOffset, 0);
+    b.setControl(control);
+    b.append("k", "verifier-bearing event", 0);
+    const std::vector<uint8_t> batch = b.build();
+    pc::Records rec;
+    rec.sessionId = sid; rec.correlationId = 9; rec.subscriptionId = subId;
+    rec.topicId = -7; rec.partition = 0; rec.baseOffset = eventOffset;
+    rec.recordBatch = std::span<const uint8_t>(batch.data(), batch.size());
+    std::vector<uint8_t> f(rec.encodedSize());
+    f.resize(rec.encode(f.data()));
+    return f;
+}
+rune::gateway::PermissionTable clusterTable(std::initializer_list<rune::security::Operation> ops) {
+    std::vector<rune::security::GrantSpec> g;
+    for (const auto op : ops)
+        g.push_back({op, rune::security::ResourcePattern{rune::security::ResourceType::Cluster,
+                                                         rune::security::PatternKind::Exact, ""}});
+    std::sort(g.begin(), g.end());
+    return rune::gateway::PermissionTable::compile(g, rune::gateway::ObjectIndex{});
+}
+}  // namespace
+
+TEST(AuthLiveChangeRegression, AdminLogFramesNeedTheReadersGrantAtSendTimeRegression) {
+    using A = ClientGateway::AdminLogAdmit;
+    GatewayRig g;
+    rune::gateway::SecurityView view{rune::security::SecurityState{}};   // applied: nothing yet (-1)
+    g.gw.setAuthMode(GatewayAuthMode::Required, &view);
+    const int64_t secSub = rune::gateway::kCatalogSubscriptionIdBase | rune::gateway::kSecuritySubscriptionIdBit | 1;
+    const int64_t catSub = rune::gateway::kCatalogSubscriptionIdBase | (int64_t{2} << 40) | 1;
+    const auto event0 = securityRecordsFrame(g.sid, secSub, 0);
+    const auto ctrl0  = securityRecordsFrame(g.sid, secSub, 0, /*control=*/true);
+
+    g.gw.setSessionAuthForTest(g.sid, AuthAuthenticated{1, "ops", clusterTable({rune::security::Operation::Admin}), {}});
+    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, secSub, event0.data(), event0.size()), A::Hold)
+        << "an event this broker has not applied yet waits (it may follow a revoke of this very reader)";
+    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, secSub, ctrl0.data(), ctrl0.size()), A::Deliver)
+        << "a control batch is no event (the applier never mirrors it): never held";
+    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, catSub, event0.data(), event0.size()), A::Withhold)
+        << "ADMIN does not give DESCRIBE ON CLUSTER here (no implied cluster ops in this table)"
+           " - unless the table says so";
+
+    g.gw.setSessionAuthForTest(g.sid, AuthAuthenticated{1, "ops", clusterTable({rune::security::Operation::Describe}), {}});
+    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, secSub, ctrl0.data(), ctrl0.size()), A::Withhold)
+        << "lost ADMIN: no __security frame, whatever the admin thread still streams";
+    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, catSub, event0.data(), event0.size()), A::Deliver);
+    EXPECT_GE(g.gw.adminLogFramesWithheld(), 1u);
+
+    g.gw.setAuthMode(GatewayAuthMode::InProcess, nullptr);
+    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, secSub, event0.data(), event0.size()), A::Deliver) << "dev / in-process";
 }

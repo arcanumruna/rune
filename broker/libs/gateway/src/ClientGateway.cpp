@@ -678,6 +678,7 @@ int ClientGateway::doWork(int64_t nowNs) {
     drainPendingResponses(nowNs);
     if (!pendingLineageNotes_.empty()) [[unlikely]] (void)flushPendingLineageNotes_();   // round 6 (F1)
     if (!pendingCatalogUnsubs_.empty()) [[unlikely]] (void)flushPendingCatalogUnsubs_();   // catalog Task 12
+    if (!sessionsWithReadEnds_.empty()) [[unlikely]] (void)flushPendingReadEnds_();         // issue #117
     // No-hang fix round 3: the no-hang counters, logged while the broker runs
     // (on change, at most every kNoHangStatsLogNs) — one compare per duty cycle.
     if (nowNs >= nextNoHangStatsLogNs_) [[unlikely]] (void)logNoHangStatsIfChanged_(nowNs);
@@ -5089,7 +5090,9 @@ void ClientGateway::handleCatalogSubscribe_(Session& session, const pc::Subscrib
         answer(pc::ErrorCode::Internal);
         return;
     }
-    if (!adminSink_->submitCatalogSubscribe(msg.sessionId, msg.correlationId, msg.fromOffset)) {
+    // Issue #117: an end of this kind still owed to the admin goes first (FIFO) - else it would end the new read.
+    const bool endOwed = (session.pendingReadEnds & Session::kPendingEndCatalogReads) != 0 && !submitReadEnds_(session);
+    if (endOwed || !adminSink_->submitCatalogSubscribe(msg.sessionId, msg.correlationId, msg.fromOffset)) {
         // Back-pressure on the admin ring: the retriable NotLeader (the client retries).
         pc::ErrorResponse er;
         er.sessionId     = msg.sessionId;
@@ -5132,7 +5135,9 @@ void ClientGateway::handleSecuritySubscribe_(Session& session, const pc::Subscri
         answer(pc::ErrorCode::Internal);
         return;
     }
-    if (!adminSink_->submitSecuritySubscribe(msg.sessionId, msg.correlationId, msg.fromOffset)) {
+    // Issue #117: an end of this kind still owed to the admin goes first (FIFO) - else it would end the new read.
+    const bool endOwed = (session.pendingReadEnds & Session::kPendingEndSecurityReads) != 0 && !submitReadEnds_(session);
+    if (endOwed || !adminSink_->submitSecuritySubscribe(msg.sessionId, msg.correlationId, msg.fromOffset)) {
         pc::ErrorResponse er;
         er.sessionId     = msg.sessionId;
         er.correlationId = msg.correlationId;
@@ -5157,6 +5162,14 @@ bool ClientGateway::submitCatalogOrSecurityUnsub_(int64_t sid, int64_t subscript
 void ClientGateway::forwardCatalogUnsubscribe_(int64_t sid, int64_t subscriptionId)
 {
     if (adminSink_ == nullptr) return;
+    // Issue #117: an authorization end of a LIVE session is never subject to the cap below (it was dropped there, and
+    // a session that lost ADMIN kept streaming `__security`): the session holds it until the admin ring takes it.
+    if (subscriptionId == rune::gateway::kEndCatalogReadsOnly || subscriptionId == rune::gateway::kEndSecurityReadsOnly) {
+        if (Session* s = sessions_.find(sid))
+            endAdminLogReads_(*s, subscriptionId == rune::gateway::kEndSecurityReadsOnly ? Session::kPendingEndSecurityReads
+                                                                                     : Session::kPendingEndCatalogReads);
+        return;   // no session: its close (-1) ends both servers' reads
+    }
     // FIFO behind any already waiting (a close after a single unsubscribe stays after it).
     // A `__security` subscription id names the second read server (its own request-ring message).
     if (pendingCatalogUnsubs_.empty() && submitCatalogOrSecurityUnsub_(sid, subscriptionId)) return;
@@ -5190,6 +5203,82 @@ void ClientGateway::forwardCatalogUnsubscribe_(int64_t sid, int64_t subscription
         }
     }
     pendingCatalogUnsubs_.push_back(PendingCatalogUnsubscribe{sid, subscriptionId});   // reserved: never allocates
+}
+
+void ClientGateway::endAdminLogReads_(Session& s, uint8_t bit)
+{
+    const bool listed = s.pendingReadEnds != 0;
+    s.pendingReadEnds |= bit;   // coalesced: one end per kind ends every read of that kind
+    if (submitReadEnds_(s) || listed) return;
+    sessionsWithReadEnds_.push_back(s.sessionId);   // one entry per session: bounded by the sessions
+}
+
+bool ClientGateway::submitReadEnds_(Session& s)
+{
+    if (adminSink_ == nullptr) { s.pendingReadEnds = 0; return true; }
+    if ((s.pendingReadEnds & Session::kPendingEndCatalogReads) != 0 &&
+        adminSink_->submitCatalogUnsubscribe(s.sessionId, rune::gateway::kEndCatalogReadsOnly))
+        s.pendingReadEnds &= static_cast<uint8_t>(~Session::kPendingEndCatalogReads);
+    if ((s.pendingReadEnds & Session::kPendingEndSecurityReads) != 0 &&
+        adminSink_->submitSecurityUnsubscribe(s.sessionId, -1))
+        s.pendingReadEnds &= static_cast<uint8_t>(~Session::kPendingEndSecurityReads);
+    return s.pendingReadEnds == 0;
+}
+
+int ClientGateway::flushPendingReadEnds_()
+{
+    int sent = 0;
+    std::size_t keep = 0;
+    for (std::size_t i = 0; i < sessionsWithReadEnds_.size(); ++i) {
+        Session* s = sessions_.find(sessionsWithReadEnds_[i]);
+        if (s == nullptr) continue;                      // closed: its close (-1) supersedes the ends
+        if (submitReadEnds_(*s)) { ++sent; continue; }
+        sessionsWithReadEnds_[keep++] = sessionsWithReadEnds_[i];
+    }
+    sessionsWithReadEnds_.resize(keep);
+    return sent;
+}
+
+ClientGateway::AdminLogAdmit ClientGateway::admitAdminLogFrame(int64_t sessionId, int64_t subId, const uint8_t* frame,
+                                                              std::size_t len)
+{
+    using rune::security::Operation;
+    if (authMode_ != rune::gateway::GatewayAuthMode::Required) return AdminLogAdmit::Deliver;
+    const Session* s = sessions_.find(sessionId);
+    if (s == nullptr) return AdminLogAdmit::Deliver;    // the offer answers NoSession
+    const bool security = rune::gateway::isSecuritySubscriptionId(subId);
+    const PermissionTable& perms = permsOf_(*s);
+    if (!perms.allowsCluster(rune::security::opBit(security ? Operation::Admin : Operation::Describe))) {
+        ++adminLogFramesWithheld_;
+        return AdminLogAdmit::Withhold;
+    }
+    if (!security) return AdminLogAdmit::Deliver;
+    // A `__security` Records frame: [header 24][body 24][u32 batch bytes][batches].  Its newest EVENT (control batches
+    // are consumed by the applier, never mirrored) must be applied by this thread's SecurityView first - otherwise a
+    // revoke the admin applied and streamed ahead of this thread would let the events after it (verifiers) through.
+    constexpr std::size_t kBatchesAt = 24 + 24 + 4;
+    if (len <= kBatchesAt) return AdminLogAdmit::Deliver;   // the epoch note / marker carry no event
+    uint32_t batchBytes = 0;
+    std::memcpy(&batchBytes, frame + kBatchesAt - 4, 4);
+    std::size_t rem = std::min<std::size_t>(batchBytes, len - kBatchesAt);
+    const uint8_t* p = frame + kBatchesAt;
+    int64_t newestEvent = -1;
+    while (rem >= static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead)) {
+        rune::protocol::RecordBatchReader reader(p, rem);
+        if (!reader.ensureValid()) break;
+        if (!reader.isControl())
+            newestEvent = std::max(newestEvent, reader.baseOffset() + static_cast<int64_t>(reader.lastOffsetDelta()));
+        const auto tl = static_cast<std::size_t>(reader.totalLength());
+        if (tl == 0 || tl > rem) break;
+        p += tl;
+        rem -= tl;
+    }
+    if (newestEvent < 0) return AdminLogAdmit::Deliver;
+    if (securityView_ == nullptr || securityView_->halted()) {   // fail closed: the halt revokes the session
+        ++adminLogFramesWithheld_;
+        return AdminLogAdmit::Withhold;
+    }
+    return newestEvent <= securityView_->appliedOffset() ? AdminLogAdmit::Deliver : AdminLogAdmit::Hold;
 }
 
 int ClientGateway::flushPendingCatalogUnsubs_()

@@ -4861,6 +4861,16 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
         AdminWorkerAgent& agent;
         using Offer = CatalogReadFlow::Offer;
         using Room  = CatalogReadFlow::Room;
+        using Admit = CatalogReadFlow::Admit;
+        Admit admit(int64_t session, int64_t subId, const uint8_t* f, std::size_t n) {   // issue #117
+            if (!node.gateway_) return Admit::Deliver;
+            switch (node.gateway_->admitAdminLogFrame(session, subId, f, n)) {
+            case rune::gateway::ClientGateway::AdminLogAdmit::Deliver:  return Admit::Deliver;
+            case rune::gateway::ClientGateway::AdminLogAdmit::Withhold: return Admit::Withhold;
+            case rune::gateway::ClientGateway::AdminLogAdmit::Hold:     break;
+            }
+            return Admit::Hold;
+        }
         Offer tryOffer(int64_t session, const uint8_t* f, std::size_t n) {
             if (!node.gateway_) return Offer::NoSession;
             switch (node.gateway_->tryOfferCatalogFrame(session, f, n)) {
