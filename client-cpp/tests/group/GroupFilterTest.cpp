@@ -316,3 +316,157 @@ TEST_F(GroupFilterHubTest, UnfilteredGroupOnANonRoutedHubStillRunsRegression) {
     EXPECT_TRUE(impl_->active);
     EXPECT_EQ(sink_.ofTemplate(rpc::TemplateId::JoinGroup).size(), 1u);
 }
+
+// ---- Task 12 fix round 1 ----------------------------------------------------------------------------------
+
+// I1: the seed session (target 0) is gated like any other.
+TEST_F(GroupFilterHubTest, SeedSessionBelowFilterVersionIsNeverFetchedUnfilteredRegression) {
+    make(true);
+    hub_->setFetchRouter(fr_.router());
+    toStable();                                   // the seed gate passed at join (current version)
+    fr_.versions[0] = rpc::kBrokerVersionFilter - 1;   // the seed reconnected onto an older node
+    seed(10);
+    EXPECT_TRUE(fr_.subscribes(0).empty()) << "a filtered fetch is never sent to a node that would ignore the filter";
+    fr_.versions[0] = rpc::kBrokerVersionFilter;
+    hub_->reconcileFetch();
+    const auto subs = fr_.subscribes(0);
+    ASSERT_EQ(subs.size(), 1u);
+    EXPECT_FALSE(subs[0].filter.empty());
+}
+
+// I2: a leader's refusal of the filter ends the consumer; never parked into a metadata retry loop.
+TEST_F(GroupFilterHubTest, LeaderFilterRefusalEndsTheConsumerNeverParksRegression) {
+    make(true);
+    hub_->setFetchRouter(fr_.router());
+    toStable();
+    seed(10);
+    const int64_t corr = fr_.subscribes(0).at(0).correlationId;
+    ASSERT_TRUE(hub_->onFetchSubscribeResponse(corr, static_cast<int16_t>(rpc::ErrorCode::InvalidRequest), 0));
+    EXPECT_FALSE(impl_->active);
+    EXPECT_EQ(impl_->failReason, GroupFailReason::RefusedByBroker);
+    EXPECT_FALSE(hub_->takeMetadataWanted());
+}
+
+TEST_F(GroupFilterHubTest, UnfilteredFetchInvalidRequestKeepsItsRetryRegression) {
+    make(false);
+    hub_->setFetchRouter(fr_.router());
+    toStable();
+    seed(10);
+    const int64_t corr = fr_.subscribes(0).at(0).correlationId;
+    ASSERT_TRUE(hub_->onFetchSubscribeResponse(corr, static_cast<int16_t>(rpc::ErrorCode::InvalidRequest), 0));
+    EXPECT_TRUE(impl_->active) << "only a filter refusal ends the consumer";
+    EXPECT_TRUE(hub_->takeMetadataWanted());
+}
+
+TEST_F(GroupFilterHubTest, TransientRefusalOfAFilteredFetchStillRetriesRegression) {
+    make(true);
+    hub_->setFetchRouter(fr_.router());
+    toStable();
+    seed(10);
+    const int64_t corr = fr_.subscribes(0).at(0).correlationId;
+    ASSERT_TRUE(hub_->onFetchSubscribeResponse(corr, static_cast<int16_t>(rpc::ErrorCode::UnknownPartition), 0));
+    EXPECT_TRUE(impl_->active);
+    EXPECT_TRUE(hub_->takeMetadataWanted());
+}
+
+TEST_F(GroupFilterHubTest, BoundFilteredInstanceRefusedByTheLeaderEndsTheConsumerRegression) {
+    make(true);
+    hub_->setFetchRouter(fr_.router());
+    toStable();
+    seed(10);
+    const int64_t corr = fr_.subscribes(0).at(0).correlationId;
+    ASSERT_TRUE(hub_->onFetchSubscribeResponse(corr, 0, 700));   // bound
+    ASSERT_TRUE(impl_->active);
+    EXPECT_TRUE(hub_->onFetchInvalidRequest(corr));
+    EXPECT_FALSE(impl_->active);
+    EXPECT_EQ(impl_->failReason, GroupFailReason::RefusedByBroker);
+}
+
+TEST_F(GroupFilterHubTest, InvalidRequestOnAnUnfilteredBoundInstanceIsNotClaimedRegression) {
+    make(false);
+    hub_->setFetchRouter(fr_.router());
+    toStable();
+    seed(10);
+    const int64_t corr = fr_.subscribes(0).at(0).correlationId;
+    ASSERT_TRUE(hub_->onFetchSubscribeResponse(corr, 0, 700));
+    EXPECT_FALSE(hub_->onFetchInvalidRequest(corr));
+    EXPECT_TRUE(impl_->active);
+}
+
+// M2: every re-arm re-sends the filter.
+TEST_F(GroupFilterHubTest, FilterSurvivesANewGenerationRegression) {
+    make(true);
+    hub_->setFetchRouter(fr_.router());
+    toStable();
+    seed(10);
+    ASSERT_EQ(fr_.subscribes(0).size(), 1u);
+    impl_->state = GroupConsumerState::Rejoining;
+    hub_->onConnected(kSessionId, sink_.fn());
+    auto j = joinOk(2, "m1");
+    hub_->onJoinGroupResponse(j.data(), j.size(), kSessionId, sink_.fn());
+    auto sy = syncOk({{kTopicId, 0}});
+    hub_->onSyncGroupResponse(sy.data(), sy.size(), kSessionId, sink_.fn());
+    seed(12);
+    const auto subs = fr_.subscribes(0);
+    ASSERT_EQ(subs.size(), 2u);
+    EXPECT_EQ(subs[1].fromOffset, 12);
+    EXPECT_EQ(subs[1].filter.size(), someFilter().len);
+}
+
+TEST_F(GroupFilterHubTest, FilterSurvivesALeaderFailoverRegression) {
+    make(true);
+    fr_.sids[1] = 501;
+    hub_->setFetchRouter(fr_.router());
+    toStable();
+    seed(10);
+    ASSERT_EQ(fr_.subscribes(0).size(), 1u);
+    const int64_t corr = fr_.subscribes(0).at(0).correlationId;
+    fr_.leader[0] = 1;                 // the partition moved to node 1
+    int32_t t = 0, p = 0;
+    ASSERT_TRUE(hub_->onFetchSubscribeRefused(corr, /*park=*/false, t, p));   // NotLeader
+    hub_->reconcileFetch();
+    const auto subs = fr_.subscribes(1);
+    ASSERT_EQ(subs.size(), 1u);
+    EXPECT_EQ(subs[0].filter.size(), someFilter().len);
+}
+
+TEST_F(GroupFilterHubTest, FilterSurvivesALostNodeSessionRegression) {
+    make(true);
+    fr_.sids[1] = 501;
+    fr_.leader[0] = 1;
+    hub_->setFetchRouter(fr_.router());
+    toStable();
+    seed(10);
+    ASSERT_EQ(fr_.subscribes(1).size(), 1u);   // unanswered
+    hub_->resendUnanswered(1);                 // node 1's session (re)connected
+    const auto subs = fr_.subscribes(1);
+    ASSERT_EQ(subs.size(), 2u);
+    EXPECT_EQ(subs[1].filter.size(), someFilter().len);
+}
+
+// M2: notes on an unseeded or revoked partition never move a position.
+TEST_F(GroupFilterHubTest, PositionNoteOnAnUnseededPartitionIsIgnoredRegression) {
+    make(true);
+    hub_->setFetchRouter(fr_.router());
+    toStable();   // no OffsetFetch answer yet: the sentinel
+    const TopicPartition tp{kTopicId, 0};
+    ASSERT_EQ(impl_->assignment.at(tp), GroupConsumerImpl::kUnseededSentinel);
+    hub_->onPositionNote(note(5000, 0));
+    hub_->onPositionNote(note(5000, 1));
+    EXPECT_EQ(impl_->assignment.at(tp), GroupConsumerImpl::kUnseededSentinel);
+}
+
+TEST_F(GroupFilterHubTest, PositionNoteOnARevokedPartitionIsIgnoredRegression) {
+    make(true);
+    hub_->setFetchRouter(fr_.router());
+    toStable();
+    seed(10);
+    const int64_t corr = fr_.subscribes(0).at(0).correlationId;
+    rpc::Assign a;
+    a.sessionId = kSessionId; a.generationId = 2;
+    std::vector<uint8_t> frame(rpc::Assign::encodedSizeFor(0));
+    a.encode(frame.data(), std::span<const rpc::TopicPartition32>{});
+    hub_->onAssign(frame.data(), frame.size(), kSessionId, sink_.fn());   // everything revoked
+    hub_->onPositionNote(note(5000, corr));
+    EXPECT_EQ(impl_->assignment.count(TopicPartition{kTopicId, 0}), 0u) << "a note never re-creates a revoked partition";
+}

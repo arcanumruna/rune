@@ -943,8 +943,9 @@ int GroupConsumerHub::reconcileImpl_(GroupConsumerImpl& impl)
         const int32_t minVersion = impl.cfg.filterBytes.empty()
             ? rune::protocol::client::kBrokerVersionExplicitGroupSubscriptions
             : rune::protocol::client::kBrokerVersionFilter;
-        if (target != 0 && router_.brokerVersion != nullptr &&
-            router_.brokerVersion(router_.ctx, target) < minVersion) {
+        // I1: the seed session (target 0) is gated like any other — it may have reconnected onto an older node
+        // while the coordinator lives elsewhere, and a filtered fetch must never go to a node that ignores it.
+        if (router_.brokerVersion != nullptr && router_.brokerVersion(router_.ctx, target) < minVersion) {
             bool logged = false;
             for (const OldNodeLog& o : oldNodeLogged_) {
                 if (o.session == target && o.epoch == ep) { logged = true; break; }
@@ -1075,6 +1076,13 @@ bool GroupConsumerHub::onFetchSubscribeResponse(int64_t corrId, int16_t errorCod
                 refuse_(*impl, refusalFor_(static_cast<rpc::ErrorCode>(static_cast<uint16_t>(errorCode))));
                 return true;
             }
+            if (errorCode == static_cast<int16_t>(rpc::ErrorCode::InvalidRequest) && !impl->cfg.filterBytes.empty()) {
+                // Phase 2c (spec §9): the leader refused this group's FILTER (untyped topic, over its capacity,
+                // unknown tag).  The same bytes would be refused again — never parked for a metadata retry
+                // loop; the consumer ends (Client.cpp passes the refusal detail to onError).
+                refuse_(*impl, GroupFailReason::RefusedByBroker);
+                return true;
+            }
             if (errorCode == 0) {
                 fs.subscriptionId = subscriptionId;
                 fs.redirects      = 0;
@@ -1108,6 +1116,20 @@ bool GroupConsumerHub::onFetchAuthRefused(int64_t corrId, int16_t errorCode)
             // Unanswered (corrId), or a BOUND instance (its Subscribe id: a revoked READ ends it explicitly).
             if (fs.corrId != corrId && !(fs.epoch != 0 && fs.instanceCorr == corrId)) continue;
             refuse_(*impl, refusalFor_(static_cast<rpc::ErrorCode>(static_cast<uint16_t>(errorCode))));
+            return true;
+        }
+    }
+    return false;
+}
+
+bool GroupConsumerHub::onFetchInvalidRequest(int64_t corrId)
+{
+    if (!isFetchCorrId(corrId)) return false;
+    for (GroupConsumerImpl* impl : impls_) {
+        if (!impl->active || impl->cfg.filterBytes.empty()) continue;
+        for (auto& [tp, fs] : impl->fetch) {
+            if (fs.corrId != corrId && !(fs.epoch != 0 && fs.instanceCorr == corrId)) continue;
+            refuse_(*impl, GroupFailReason::RefusedByBroker);
             return true;
         }
     }

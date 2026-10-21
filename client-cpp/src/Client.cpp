@@ -2176,7 +2176,10 @@ void Client::onSeedConnected_(int64_t sessionId, int32_t brokerVersion) {
 
     // MAJOR-2 (round 3): the broker's capability, for every group
     // consumer — present or created later (joinIfConnected).
-    groupConsumerHub_.setBrokerVersion(brokerVersion);
+    // M3 (Phase 2c): the hub judges the COORDINATOR's session.  A seed that reconnected onto another (older)
+    // node while the coordinator lives on a session of its own must not overwrite the coordinator's version
+    // (syncCoordinatorSession_ keeps that one current).
+    if (coordIdx_ == 0) groupConsumerHub_.setBrokerVersion(brokerVersion);
 
     // CG-5: Trigger group consumers to send JoinGroup on connect — only
     // when the SEED (the coordinator's session) connected: a leader
@@ -3477,6 +3480,13 @@ void Client::onEgressFrame(codec::TemplateId tid,
         // Phase 2c: the broker's defensive InvalidRequest on a BOUND subscription's Subscribe correlation id (a
         // filtered stream it can no longer serve): finished with the code, never re-armed.  Cold.
         if (ec == rpc::ErrorCode::InvalidRequest && opt->correlationId != 0) [[unlikely]] {
+            // A FILTERED group's fetch instance (its leader dropped the stream): the consumer ends, surfaced.
+            if (groupConsumerHub_.onFetchInvalidRequest(opt->correlationId)) {
+                std::string msg(opt->message);
+                if (msg.empty()) msg = "group fetch refused by the broker: InvalidRequest (39)";
+                if (cbError_) invokeUserCallback_("onError", [&] { cbError_(msg); });
+                break;
+            }
             const auto snap = agent_.stateAndSessionId();
             const int64_t unsubCorrId = nextCorrId_++;
             if (subscriberHub_.failActiveByCorrelation(
@@ -3976,6 +3986,16 @@ void Client::onEgressFrame(codec::TemplateId tid,
     case codec::TemplateId::SubscribeResponse: {
         auto opt = codec::decodeSubscribeResponse(buf, len);
         if (!opt) break;
+        // Phase 2c: a leader's refusal of a group fetch carries its detail (e.g. why a filter was rejected): the
+        // application reads it through onError.  Cold: only a refusal with a detail.
+        if (opt->errorCode != 0 && (!opt->detail.empty() || opt->detailMalformed) &&
+            group::GroupConsumerHub::isFetchCorrId(opt->correlationId) && cbError_) {
+            const auto code = static_cast<uint16_t>(opt->errorCode);
+            const std::string msg = "group fetch refused (" + std::to_string(code) + "): " +
+                                    (opt->detailMalformed ? std::string("(detail malformed, dropped)")
+                                                          : std::string(opt->detail));
+            invokeUserCallback_("onError", [&] { cbError_(msg); });
+        }
         // A group member's per-partition Subscribe (tagged correlationId).
         if (groupConsumerHub_.onFetchSubscribeResponse(opt->correlationId, opt->errorCode,
                                                        opt->subscriptionId)) {
@@ -5876,8 +5896,9 @@ void Client::syncCoordinatorSession_() noexcept {
     // A coordinator session of its own (re)connected: its members join there at
     // once (the seed's own connect does this in the ConnectResponse handler; a
     // TLS session connects on a later handshake leg — this level check sees it).
+    // M3: the coordinator's own version, kept current for consumers created later (joinIfConnected) as well.
+    if (connected && sid != 0) groupConsumerHub_.setBrokerVersion(agent_.sessionBrokerVersion(coordIdx_));
     if (coordIdx_ != 0 && connected && !groupConsumerHub_.empty()) {
-        groupConsumerHub_.setBrokerVersion(agent_.sessionBrokerVersion(coordIdx_));
         groupConsumerHub_.onConnected(sid, coordSendFn_);
         (void)groupConsumerHub_.reconcileFetch();
     }

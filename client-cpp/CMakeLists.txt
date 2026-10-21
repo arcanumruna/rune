@@ -1536,6 +1536,7 @@ if(BUILD_TESTING)
             tests/client/GroupSeekTest.cpp
             tests/subscriber/SubscriberFilterTest.cpp   # Phase 2c Task 11
             tests/client/SubscriptionSetTest.cpp        # Phase 2c Task 12
+            tests/client/GroupFilterClientTest.cpp      # Phase 2c Task 12 fix round 1
             tests/support/AllocCounter.cpp
         )
         target_include_directories(rune_invoker_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})

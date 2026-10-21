@@ -195,6 +195,8 @@ struct InvokerGateway {
     int dropSubscribeResponsesNext = 0;
     // JoinGroup answers carry this error code (0 = the normal answer).
     int16_t joinErrorCode = 0;
+    std::string joinErrorDetail;                          // Phase 2c: sent with joinErrorCode (JoinGroupResponse detail)
+    std::vector<std::vector<uint8_t>> joinFilters;        // Phase 2c: every JoinGroup's filter bytes (empty = none)
     // No-hang fix round 2: SyncGroup / Heartbeat answers carry these codes
     // (0 = normal); OffsetFetch: the code of offsetFetchErrorsNext answers, and
     // the next N OffsetFetch answers are the broker's whole-request rejection
@@ -979,8 +981,9 @@ private:
         r.memberId      = joinErrorCode != 0 ? std::span<const uint8_t>()
                                              : std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(kMember.data()),
                                                                         kMember.size());
-        std::vector<uint8_t> out(r.encodedSize());
-        const std::size_t n = r.encode(out.data());
+        r.detail = joinErrorCode != 0 ? std::string_view(joinErrorDetail) : std::string_view();
+        std::vector<uint8_t> out(r.encodedSizeWithDetail());
+        const std::size_t n = r.encodeFor(out.data(), rp::kClientVersion, out.size());
         send(0, out.data(), n);
     }
 
@@ -1922,6 +1925,7 @@ private:
             const auto j = rp::JoinGroup::decode(buf, len, rp::kClientVersion);
             if (!j) return;
             ++joinGroups;
+            joinFilters.emplace_back(j->filter.begin(), j->filter.end());
             groupSessionIds.push_back(j->sessionId);
             groupEndpoints.push_back(endpoint);
             if (!groupProtocol) return;

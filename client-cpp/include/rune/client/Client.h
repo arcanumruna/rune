@@ -1139,6 +1139,9 @@ public:
     /// its own copy of `opts` (a filter included) and of `handler`; Record::partition says which partition a
     /// record came from.  The handlers run on the runner thread, one partition's records in order, partitions
     /// interleaved.  Throws std::invalid_argument when partitionCount < 1 (nothing submitted).
+    /// The set covers `topic.partitionCount` AS OF THIS CALL: partitions added to the topic later are not
+    /// subscribed (re-subscribe with a fresh handle), and a stale, larger count fails the extra partitions
+    /// individually (RejectedByBroker).
     ///
     /// Filters: a SubscribeOptions::filter applies to every partition.  subscribe(topic, key, ...) is
     /// PARTITION-WIDE: the key only picks the partition, it does not select records — to read one entity's

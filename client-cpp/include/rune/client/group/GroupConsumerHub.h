@@ -306,6 +306,10 @@ public:
     /// Subscribe's correlationId (unanswered, or a BOUND instance — a revoked READ): its consumer is finished
     /// with the matching GroupFailReason, never re-armed.  False when not a live group fetch.
     bool onFetchAuthRefused(int64_t corrId, int16_t errorCode);
+    /// Phase 2c: the broker's InvalidRequest on a FILTERED group's fetch Subscribe (unanswered, or its bound
+    /// instance: the stream it can no longer serve): the consumer is finished RefusedByBroker, never re-armed.
+    /// False when not a live filtered group fetch.
+    bool onFetchInvalidRequest(int64_t corrId);
     /// Authentication (D26): the session was revoked — every active consumer is finished SessionRevoked.
     int revokeAll();
     /// M2: Unsubscribes the transport refused, re-offered by the duty cycle

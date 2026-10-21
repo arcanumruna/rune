@@ -458,6 +458,7 @@ struct AllPartitions {};
 
 /// One Subscription per partition 0..partitionCount-1 (FD10), owned together: destroying the set releases them
 /// all.  Each is an ordinary Subscription (its own failReason(), position()); the set only aggregates.
+/// Fixed to the partition count at subscribe time: partitions added later are not part of it.
 class SubscriptionSet {
 public:
     explicit SubscriptionSet(std::vector<Subscription> subs) noexcept : subs_(std::move(subs)) {}
