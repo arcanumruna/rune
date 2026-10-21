@@ -49,6 +49,7 @@
 // the Aeron ClientConductor ARE thread-safe, but resolvePending() is only ever
 // called from send() on that same duty-cycle thread anyway.
 
+#include <rune/consensus/IngressRing.h>   // kMaxConsensusFrameBytes (#254)
 #include <rune/consensus/MessageSink.h>
 #include <rune/consensus/Types.h>
 
@@ -140,8 +141,8 @@ public:
         const auto* c = std::get_if<rune::peerlink::PeerFrameCrypto>(&crypto_);
         return c ? c->drops() : 0u;
     }
-    /// The largest consensus frame a sealed sink carries (the ingress ring's maximum message is 8 KiB).
-    static constexpr std::size_t kMaxSealedPayload = 16 * 1024;
+    /// The largest consensus frame a sealed sink carries: the receiver's ingress ring maximum (#254).
+    static constexpr std::size_t kMaxSealedPayload = rune::consensus::kMaxConsensusFrameBytes;
 
     /// Test-only: number of peer publications still unresolved (runs one resolve probe).
     [[nodiscard]] int unresolvedForTest() noexcept { return resolvePending(); }

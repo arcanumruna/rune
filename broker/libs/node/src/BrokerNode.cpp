@@ -70,6 +70,8 @@ namespace rune::node {
 // fields are not yet wired. Multi-node path reads from config_.
 // ---------------------------------------------------------------------------
 static constexpr int kIngressCapacity = 64 * 1024; //  64 KiB
+static_assert(static_cast<std::size_t>(kIngressCapacity) / 8 >= rune::consensus::kMaxConsensusFrameBytes,
+              "#254: the consensus ingress ring must carry the largest consensus frame a peer sends");
 /// Combined fix program M13 (X102): permission bits of every `__security` segment / index / checkpoint file.
 static constexpr unsigned kSecurityFileMode = 0600;
 
