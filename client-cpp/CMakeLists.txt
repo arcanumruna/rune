@@ -1430,6 +1430,7 @@ if(BUILD_TESTING)
     add_executable(rune_group_tests
         tests/group/GroupConsumerTest.cpp
         tests/group/GroupConsumerReadCommittedTest.cpp
+        tests/group/GroupFilterTest.cpp   # Phase 2c Task 12
     )
     target_include_directories(rune_group_tests PRIVATE
         ${RUNE_PROTOCOL_INCLUDE}
@@ -1534,6 +1535,7 @@ if(BUILD_TESTING)
             tests/client/GroupRoutingRegressionTest.cpp
             tests/client/GroupSeekTest.cpp
             tests/subscriber/SubscriberFilterTest.cpp   # Phase 2c Task 11
+            tests/client/SubscriptionSetTest.cpp        # Phase 2c Task 12
             tests/support/AllocCounter.cpp
         )
         target_include_directories(rune_invoker_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})

@@ -154,6 +154,7 @@ struct InvokerGateway {
     // A nonzero code answers every Subscribe with a SubscribeResponse carrying it (nothing is bound, as the
     // broker does for UnknownTopic / UnknownPartition / InvalidRequest).
     int16_t subscribeErrorCode = 0;
+    int32_t subscribeErrorPartition = -1;   // Phase 2c: >= 0 limits subscribeErrorCode to Subscribes for that partition
     // Phase 2c: the refusal text sent with subscribeErrorCode (a session >= kClientVersionFilter gets it as the
     // SubscribeResponse detail trailer; this gateway's sessions always are).
     std::string subscribeErrorDetail;
@@ -1645,7 +1646,7 @@ private:
                     return;
                 }
             }
-            if (subscribeErrorCode != 0) {
+            if (subscribeErrorCode != 0 && (subscribeErrorPartition < 0 || sv->partition == subscribeErrorPartition)) {
                 rp::SubscribeResponse r;
                 r.sessionId = sv->sessionId; r.correlationId = sv->correlationId; r.errorCode = subscribeErrorCode;
                 r.partition = -1; r.subscriptionId = 0; r.detail = subscribeErrorDetail;

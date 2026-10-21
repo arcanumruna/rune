@@ -1135,6 +1135,20 @@ public:
                            SubscribeOptions  opts,
                            RecordHandler     handler);
 
+    /// Every partition of the topic (spec §3): `topic.partitionCount` subscriptions, partition 0..N-1, each with
+    /// its own copy of `opts` (a filter included) and of `handler`; Record::partition says which partition a
+    /// record came from.  The handlers run on the runner thread, one partition's records in order, partitions
+    /// interleaved.  Throws std::invalid_argument when partitionCount < 1 (nothing submitted).
+    ///
+    /// Filters: a SubscribeOptions::filter applies to every partition.  subscribe(topic, key, ...) is
+    /// PARTITION-WIDE: the key only picks the partition, it does not select records — to read one entity's
+    /// records, combine the key (its partition) with a filter on the entity's field:
+    ///   client.subscribe(topic, entityKey, SubscribeOptions{}.filter(EntityEvent::Filter{...entity field...}), h);
+    SubscriptionSet subscribe(TopicHandle       topic,
+                              AllPartitions,
+                              SubscribeOptions  opts,
+                              RecordHandler     handler);
+
     // ---- CB-2: Producer API --------------------------------------------------
 
     /// Look up a topic by name and return its handle (topicId + partitionCount).

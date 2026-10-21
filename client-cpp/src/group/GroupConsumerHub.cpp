@@ -562,8 +562,9 @@ void GroupConsumerHub::sendJoinGroup(GroupConsumerImpl& impl,
     msg.sessionTimeoutMs = impl.cfg.sessionTimeoutMs;
     msg.groupId          = grpSpan;
     msg.memberId         = mbrSpan;
+    msg.filter           = impl.cfg.filterBytes.span();   // Phase 2c: empty = no trailer, the frame is byte-identical to version 9
 
-    ensureBuf(impl, msg.encodedSize(impl.topicIds.size()));   // reads msg.filter itself (empty until the filter task)
+    ensureBuf(impl, msg.encodedSize(impl.topicIds.size()));   // reads msg.filter itself
 
     const std::size_t len = msg.encode(impl.sendBuf.data(),
                                         std::span<const int32_t>(impl.topicIds));
@@ -762,6 +763,10 @@ void GroupConsumerHub::sendSubscribeForPartitions(GroupConsumerImpl& impl,
                                                    const SendFn& sendFn)
 {
     if (impl.assignment.empty()) return;
+    // Phase 2c: this path reaches the broker's group CARRIER Subscribe, which refuses a filter, and it cannot
+    // apply one.  A filtered group is refused before it joins when the hub is not routed (filterNeedsRouting_);
+    // never fall through to an unfiltered fetch.
+    if (!impl.cfg.filterBytes.empty()) return;
 
     const uint8_t isolation = static_cast<uint8_t>(impl.cfg.isolation);
 
@@ -930,9 +935,16 @@ int GroupConsumerHub::reconcileImpl_(GroupConsumerImpl& impl)
         // resumes on the event that exists: the upgraded node's session
         // reconnects (a new episode advertising >= 3) and its accepted connect
         // re-drives reconcile.
+        //
+        // Phase 2c: a FILTERED group raises the bar to kBrokerVersionFilter — a node below it would ignore the
+        // filter and push everything, so the partition is skipped, never fetched unfiltered.  This point is
+        // reached only for a Connected node (ep != 0 above), so the version judged is the live session's: a node
+        // mid-reconnect defers instead of failing, and the upgraded node's connect re-drives reconcile.
+        const int32_t minVersion = impl.cfg.filterBytes.empty()
+            ? rune::protocol::client::kBrokerVersionExplicitGroupSubscriptions
+            : rune::protocol::client::kBrokerVersionFilter;
         if (target != 0 && router_.brokerVersion != nullptr &&
-            router_.brokerVersion(router_.ctx, target) <
-                rune::protocol::client::kBrokerVersionExplicitGroupSubscriptions) {
+            router_.brokerVersion(router_.ctx, target) < minVersion) {
             bool logged = false;
             for (const OldNodeLog& o : oldNodeLogged_) {
                 if (o.session == target && o.epoch == ep) { logged = true; break; }
@@ -941,19 +953,21 @@ int GroupConsumerHub::reconcileImpl_(GroupConsumerImpl& impl)
                 oldNodeLogged_.push_back(OldNodeLog{target, ep});  // cold: once per episode
                 std::fprintf(stderr,
                     "rune-client: group '%s': a partition leader node (session %u) runs broker version %d "
-                    "(< %d, explicit group subscriptions) — its partitions (first: topic %d partition %d) are "
+                    "(< %d, %s) — its partitions (first: topic %d partition %d) are "
                     "not consumed until the node is upgraded and reconnects\n",
-                    impl.groupId.c_str(), target, router_.brokerVersion(router_.ctx, target),
-                    rune::protocol::client::kBrokerVersionExplicitGroupSubscriptions, tp.topicId, tp.partition);
+                    impl.groupId.c_str(), target, router_.brokerVersion(router_.ctx, target), minVersion,
+                    impl.cfg.filterBytes.empty() ? "explicit group subscriptions" : "subscription filters",
+                    tp.topicId, tp.partition);
             }
             continue;
         }
         const int64_t corr = nextFetchCorr_tagged_();
         constexpr std::size_t kSubscribeFrameSize = 44u;
-        ensureBuf(impl, kSubscribeFrameSize);
+        ensureBuf(impl, kSubscribeFrameSize + impl.cfg.filterBytes.len + 2u);
+        // Phase 2c: a plain Subscribe at the leader carries the group's filter (empty = byte-identical to before).
         const std::size_t len = codec::encodeSubscribe(impl.sendBuf.data(), impl.sendBuf.size(), tp.topicId,
                                                        tp.partition, /*partitionKnown=*/1, pos, isolation,
-                                                       /*key=*/{}, sid, corr);
+                                                       /*key=*/{}, sid, corr, impl.cfg.filterBytes.span());
         if (len == 0) continue;
         switch (router_.offer(router_.ctx, target, impl.sendBuf.data(), len)) {
         case detail::SendResult::Accepted:
@@ -1203,10 +1217,12 @@ void GroupConsumerHub::joinIfConnected(int64_t sessionId, const SendFn& sendFn)
     for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
         GroupConsumerImpl* const impl = impls_[ix];
         if (!impl->active || impl->state != GroupConsumerState::Unjoined) continue;
-        if (brokerVersion_ < rune::protocol::client::kBrokerVersionExplicitGroupSubscriptions) {
-            refuse_(*impl, GroupFailReason::BrokerTooOld);
+        if (brokerVersion_ < rune::protocol::client::kBrokerVersionExplicitGroupSubscriptions ||
+            (!impl->cfg.filterBytes.empty() && brokerVersion_ < rune::protocol::client::kBrokerVersionFilter)) {
+            refuse_(*impl, GroupFailReason::BrokerTooOld);   // Phase 2c: a filtered group needs >= kBrokerVersionFilter
             continue;
         }
+        if (filterNeedsRouting_(*impl)) continue;
         sendJoinGroup(*impl, sessionId, sendFn);
     }
 }
@@ -1555,6 +1571,44 @@ void GroupConsumerHub::onRecords(const codec::RecordsView& rv)
     if (routed_() && !late_.empty() && rv.correlationId != 0) learnLateFromRecords_(rv);
 }
 
+// ---------------------------------------------------------------------------
+// onPositionNote — runner thread (hot path: one per idle/filtered frame; no allocation)
+//
+// Phase 2c: a filtered stream delivers fewer records than the log holds; the broker says how far it has
+// scanned with an EMPTY Records frame whose baseOffset is the next offset it will consider.  A filtered group
+// follows it so its commit moves past the filtered-out span.  The instance checks are exactly onRecords'.
+// Unfiltered groups ignore notes (a position past records never delivered would lose them).
+// ---------------------------------------------------------------------------
+
+void GroupConsumerHub::onPositionNote(const codec::RecordsView& rv)
+{
+    if (!routed_()) return;
+    const TP key{rv.topicId, rv.partition};
+    for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {
+        GroupConsumerImpl* const impl = impls_[ix];
+        if (!impl->active || impl->cfg.filterBytes.empty()) continue;
+        if (impl->state != GroupConsumerState::Stable) continue;
+        const auto it = impl->assignment.find(key);
+        if (it == impl->assignment.end()) continue;
+        const auto f = impl->fetch.find(key);
+        if (f == impl->fetch.end()) continue;
+        GroupConsumerImpl::FetchSub& fs = f->second;
+        if (fs.epoch == 0 || rv.correlationId != fs.instanceCorr || rv.sessionId != fs.brokerSid) continue;
+        if (router_.epoch(router_.ctx, fs.session) != fs.epoch) continue;
+        if (fs.subscriptionId == 0) {
+            fs.subscriptionId = rv.subscriptionId;  // bound by its first push
+            fs.corrId         = 0;
+            fs.redirects      = 0;
+        } else if (rv.subscriptionId != fs.subscriptionId) {
+            continue;
+        }
+        // Only forward, and only once seeded (a sentinel position is OffsetFetch's to set).
+        if (it->second != GroupConsumerImpl::kUnseededSentinel && rv.baseOffset > it->second)
+            it->second = rv.baseOffset;
+        return;
+    }
+}
+
 // Task 13 fix round 3 (M2-r2): a Records frame whose batch failed its CRC /
 // length check on the group path — counted, logged at most once per 1024.
 void GroupConsumerHub::noteMalformed_() noexcept
@@ -1585,6 +1639,13 @@ void GroupConsumerHub::onJoinGroupResponse(const uint8_t* buf, std::size_t len,
         // once JoinGroup carries a per-consumer correlationId — for now we
         // support one group per connection, matching Kafka client convention.)
         const auto ec = static_cast<rpc::ErrorCode>(opt->errorCode);
+        // Phase 2c (E10): the group runs with another filter (the first member fixed it).  Re-joining re-sends
+        // the same filter — never retried; the consumer ends FilterMismatch.  Any other InvalidRequest keeps the
+        // existing classification.  (Client.cpp hands the detail text to the error callback.)
+        if (ec == rpc::ErrorCode::InvalidRequest && opt->detail.starts_with(rpc::kGroupFilterMismatchPrefix)) {
+            refuse_(*impl, GroupFailReason::FilterMismatch);
+            break;
+        }
         const GroupVerdict v = classifyGroupAnswer_(ec);
 
         if (v == GroupVerdict::Ok) {
@@ -1903,6 +1964,16 @@ void GroupConsumerHub::onAssign(const uint8_t* buf, std::size_t len,
 // onConnected — called when ConnectResponse{OK} arrives
 // ---------------------------------------------------------------------------
 
+// Phase 2c: a filtered group's fetches are plain Subscribes at the partition leader (routed fetch).  The legacy
+// non-routed path reaches the broker's group carrier Subscribe, which refuses a filter — the group ends
+// FilterMismatch rather than ever delivering unfiltered records.
+bool GroupConsumerHub::filterNeedsRouting_(GroupConsumerImpl& impl)
+{
+    if (impl.cfg.filterBytes.empty() || routed_()) return false;
+    refuse_(impl, GroupFailReason::FilterMismatch);
+    return true;
+}
+
 void GroupConsumerHub::refuse_(GroupConsumerImpl& impl, GroupFailReason why)
 {
     if (!impl.active) return;
@@ -1918,6 +1989,9 @@ void GroupConsumerHub::refuse_(GroupConsumerImpl& impl, GroupFailReason why)
             ? "NotAuthorized: the principal holds no READ on the group / topic (ask an admin for the grant)"
         : why == GroupFailReason::SessionRevoked
             ? "SessionRevoked: the session's user was dropped or disabled"
+        : why == GroupFailReason::FilterMismatch
+            ? "FilterMismatch: the group runs with another filter, or this client cannot apply one (a filtered "
+              "group needs the Client's routed fetch)"
             : "the broker coordinator refused this consumer's request (non-retriable answer)");
     if (routed_()) dropAllFetch_(impl);
     impl.failReason = why;
@@ -1931,10 +2005,12 @@ void GroupConsumerHub::onConnected(int64_t sessionId, const SendFn& sendFn)
         if (!impl->active) continue;
         // MAJOR-2 (round 3): never against a broker that predates explicit
         // group subscriptions (it would auto-subscribe and lose records).
-        if (brokerVersion_ < rune::protocol::client::kBrokerVersionExplicitGroupSubscriptions) {
-            refuse_(*impl, GroupFailReason::BrokerTooOld);
+        if (brokerVersion_ < rune::protocol::client::kBrokerVersionExplicitGroupSubscriptions ||
+            (!impl->cfg.filterBytes.empty() && brokerVersion_ < rune::protocol::client::kBrokerVersionFilter)) {
+            refuse_(*impl, GroupFailReason::BrokerTooOld);   // Phase 2c: a filtered group needs >= kBrokerVersionFilter
             continue;
         }
+        if (filterNeedsRouting_(*impl)) continue;
 
         // fix1 I6: a NEW session (reconnect) means the old one was lost — a
         // commitSync whose OffsetCommit went out on it can never be answered.

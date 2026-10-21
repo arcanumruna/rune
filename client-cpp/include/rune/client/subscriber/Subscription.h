@@ -32,6 +32,7 @@
 #include <memory>
 #include <span>
 #include <thread>
+#include <vector>
 
 namespace rune::client {
 
@@ -446,6 +447,37 @@ private:
     bool                              unsubscribed_ = false;  // handle-local (app-owned)
     // App-owned cache of the latest status snapshot drained from impl_->status.
     mutable SubscriptionStatus        cache_{};
+};
+
+// ---------------------------------------------------------------------------
+// Phase 2c (spec §3): subscribe to EVERY partition of a topic.
+// ---------------------------------------------------------------------------
+
+/// Tag for Client::subscribe(topic, AllPartitions{}, opts, handler).
+struct AllPartitions {};
+
+/// One Subscription per partition 0..partitionCount-1 (FD10), owned together: destroying the set releases them
+/// all.  Each is an ordinary Subscription (its own failReason(), position()); the set only aggregates.
+class SubscriptionSet {
+public:
+    explicit SubscriptionSet(std::vector<Subscription> subs) noexcept : subs_(std::move(subs)) {}
+
+    [[nodiscard]] std::size_t size() const noexcept { return subs_.size(); }
+    /// The partition's own Subscription.  Throws std::out_of_range for a partition not in the set.
+    [[nodiscard]] Subscription& operator[](int32_t partition);
+    /// The partition's next expected offset (Subscription::position()).
+    [[nodiscard]] int64_t position(int32_t partition) const;
+    /// True while ANY partition's subscription is active.
+    [[nodiscard]] bool active() const;
+    /// True once EVERY partition's subscription is finished.
+    [[nodiscard]] bool finished() const;
+    /// The sum of every partition's delivered batch bytes (Subscription::batchBytes()).
+    [[nodiscard]] uint64_t batchBytes() const;
+    /// Unsubscribe every partition (idempotent).
+    void unsubscribe();
+
+private:
+    std::vector<Subscription> subs_;
 };
 
 } // namespace rune::client

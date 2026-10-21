@@ -4026,7 +4026,9 @@ void Client::onEgressFrame(codec::TemplateId tid,
         // broker POSITION NOTE (an empty batch, client version 6, E2 Task 13):
         // it concerns plain subscriptions; a member resumes from its own
         // position (an empty view would move it as one record).
+        // Phase 2c: a FILTERED group follows it (onPositionNote ignores unfiltered groups).
         if (!opt->recordBatch.empty()) [[likely]] groupConsumerHub_.onRecords(*opt);
+        else groupConsumerHub_.onPositionNote(*opt);
         break;
     }
 
@@ -4034,6 +4036,16 @@ void Client::onEgressFrame(codec::TemplateId tid,
 
     case codec::TemplateId::JoinGroupResponse: {
         if (!groupConsumerHub_.empty()) {
+            // Phase 2c: a refusal's detail (e.g. a group filter mismatch) is the application's to read.  Cold:
+            // only an error answer carries one.
+            if (cbError_) {
+                if (const auto jr = rune::protocol::client::JoinGroupResponse::decode(buf, len);
+                    jr && jr->errorCode != 0 && !jr->detail.empty()) {
+                    const std::string msg = "join group refused (" + std::to_string(jr->errorCode) + "): " +
+                                            std::string(jr->detail);
+                    invokeUserCallback_("onError", [&] { cbError_(msg); });
+                }
+            }
             groupConsumerHub_.onJoinGroupResponse(buf, len, coordSessionId_(), coordSendFn_);  // D4
         }
         break;
@@ -4841,6 +4853,19 @@ Subscription Client::subscribe(TopicHandle      topic,
 {
     return subscribeImpl(topic, partition, /*partitionKnown=*/1,
                          {}, opts, std::move(handler));
+}
+
+SubscriptionSet Client::subscribe(TopicHandle      topic,
+                                  AllPartitions,
+                                  SubscribeOptions opts,
+                                  RecordHandler    handler)
+{
+    if (topic.partitionCount < 1)
+        throw std::invalid_argument("subscribe(AllPartitions): topic has no partitions (partitionCount < 1)");
+    std::vector<Subscription> subs;
+    subs.reserve(static_cast<std::size_t>(topic.partitionCount));   // cold: once per subscribe
+    for (int32_t p = 0; p < topic.partitionCount; ++p) subs.push_back(subscribe(topic, p, opts, handler));
+    return SubscriptionSet(std::move(subs));
 }
 
 Subscription Client::subscribeImpl(TopicHandle              topic,
