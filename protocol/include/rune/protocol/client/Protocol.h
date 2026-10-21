@@ -200,6 +200,12 @@ enum class ErrorCode : uint16_t {
                                   // one).  Answered as SubscribeResponse.errorCode on the still-pending Subscribe (its
                                   // OK is held until the egress exists).  RETRIABLE a few times (the client's small
                                   // per-subscription budget, reset by a bind), then a terminal, explicit failure.
+    UnstableOffsetCommit   = 50,  // client version 10 (issue #438): OffsetFetch / OffsetCommit of a (group, partition)
+                                  // an unfinished transaction holds (its TxnOffsetCommit is pending until the
+                                  // transaction's Complete* record commits), or while the transaction coordinator is
+                                  // not loaded on the group coordinator's node (unknown = held).  RETRIABLE: the
+                                  // client re-sends after its backoff; never surfaced as a failure.  Clients below 10
+                                  // are answered NotCoordinator instead (their retriable code).
 };
 
 // ---------------------------------------------------------------------------
@@ -294,9 +300,18 @@ inline constexpr int32_t kClientVersionLineageNote                = 7;
 //   SecurityDdl{AlterUser self SetPassword}.  SecurityDdl (79) / SecurityBootstrap (80) are answered by
 //   DdlResponse (78).  An authentication-enabled broker answers a Connect below 9 ConnectResponse{ProtocolVersion}.
 //   ConnectResponse v9 (blockLength 21) carries authMode and authState.
+//  10 — consumer-group offsets under transactions (issues #125 / #438, KIP-447):
+//   - TxnOffsetCommit may carry an optional trailing block after its entries: generationId (int32) + memberId
+//     (u16 varbytes) of the consumer-group member the offsets belong to.  The coordinator then fences it exactly
+//     like an OffsetCommit (UnknownMember / IllegalGeneration: the transaction must abort, the member rejoins).
+//     No block = legacy (no member check).  An older broker's decoder ignores the trailing bytes (it reads only
+//     `count` entries), so a v10 client may send it to any broker.
+//   - OffsetFetch / OffsetCommit may be answered UnstableOffsetCommit (50), retriable (see the code).  A broker
+//     answers a session below 10 NotCoordinator instead.
 inline constexpr int32_t kClientVersionCatalog                    = 8;
 inline constexpr int32_t kClientVersionAuth                       = 9;
-inline constexpr int32_t kClientVersion                           = 9;   // what this protocol's client announces
+inline constexpr int32_t kClientVersionTxnOffsetFence             = 10;
+inline constexpr int32_t kClientVersion                           = 10;  // what this protocol's client announces
 
 // Subscribe{topicId = kCatalogTopicId, partition 0, partitionKnown 1} reads
 // the `__catalog` log (catalog history) from ANY broker — see DataMessages.h
@@ -369,6 +384,13 @@ inline constexpr int32_t kBrokerVersion                           = 5;   // what
 /// (version 9): templates 12-15, 79, 80 and codes 44-47.
 [[nodiscard]] constexpr bool clientUnderstandsAuth(int32_t clientVersion) noexcept {
     return clientVersion >= kClientVersionAuth;
+}
+
+/// True when a session that connected with `clientVersion` may be answered UnstableOffsetCommit (50) (version 10);
+/// below it the broker answers NotCoordinator (retriable for every client).  A negative version (unknown: rigs) is
+/// treated as current.
+[[nodiscard]] constexpr bool clientUnderstandsUnstableOffsetCommit(int32_t clientVersion) noexcept {
+    return clientVersion < 0 || clientVersion >= kClientVersionTxnOffsetFence;
 }
 
 /// The produce error code a session that connected with `clientVersion` is

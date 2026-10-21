@@ -12,6 +12,8 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <string>
+#include <string_view>
 #include <vector>
 
 namespace rpc = rune::protocol::client;
@@ -904,4 +906,105 @@ TEST(TxnConformance, ByteExactEndTxn) {
     EXPECT_EQ(out->commit,        1u);
     ASSERT_EQ(out->transactionalId.size(), sizeof(kTxnId1));
     EXPECT_EQ(std::memcmp(out->transactionalId.data(), kTxnId1, sizeof(kTxnId1)), 0);
+}
+
+// ===========================================================================
+// Issue #125 (client version 10, KIP-447): TxnOffsetCommit's optional trailing member block.
+// ===========================================================================
+namespace {
+struct TocFrame {
+    std::vector<uint8_t> bytes;
+    std::size_t          entriesEnd = 0;   // where the member block starts
+};
+TocFrame encodeToc(int32_t generation, std::string_view member, bool withMeta = true) {
+    static constexpr uint8_t kTx[]  = {'t', 'x'};
+    static constexpr uint8_t kGrp[] = {'c', 'g'};
+    static constexpr uint8_t kMeta[] = {0x11, 0x22, 0x33};
+    rpc::TxnOffsetCommit m;
+    m.sessionId = 3; m.correlationId = 4; m.producerId = 77; m.producerEpoch = 1;
+    m.transactionalId = {kTx, sizeof kTx};
+    m.groupId         = {kGrp, sizeof kGrp};
+    m.generationId    = generation;
+    m.memberId        = {reinterpret_cast<const uint8_t*>(member.data()), member.size()};
+    const rpc::TxnOffsetCommitEntry entries[] = {{1, 0, 10, withMeta ? std::span<const uint8_t>(kMeta, sizeof kMeta)
+                                                                     : std::span<const uint8_t>{}},
+                                                 {2, 5, 99, {}}};
+    TocFrame f;
+    f.bytes.resize(m.encodedSize(entries));
+    EXPECT_EQ(m.encode(f.bytes.data(), entries), f.bytes.size());
+    f.entriesEnd = rpc::TxnOffsetCommit::encodedSizeFor(m.transactionalId, m.groupId, entries);
+    return f;
+}
+}  // namespace
+
+TEST(TxnOffsetCommitMemberBlockRegression, ALegacyFrameHasNoBlockAndDecodesAsLegacyRegression) {
+    const TocFrame f = encodeToc(-1, "ignored-without-a-generation");
+    EXPECT_EQ(f.bytes.size(), f.entriesEnd) << "a negative generation writes no block (the legacy frame)";
+    const auto m = rpc::TxnOffsetCommit::decode(f.bytes.data(), f.bytes.size());
+    ASSERT_TRUE(m);
+    EXPECT_FALSE(m->hasMemberBlock);
+    EXPECT_EQ(m->generationId, -1);
+    EXPECT_TRUE(m->memberId.empty());
+    ASSERT_EQ(m->entries.size(), 2u);
+    EXPECT_EQ(m->entries[1].offset, 99);
+}
+
+TEST(TxnOffsetCommitMemberBlockRegression, TheBlockRoundTripsAfterTheEntriesRegression) {
+    for (const std::string_view member : {std::string_view{}, std::string_view{"cg-1-0123456789abcdef"}}) {
+        const TocFrame f = encodeToc(7, member);
+        ASSERT_EQ(f.bytes.size(), f.entriesEnd + rpc::TxnOffsetCommit::kMemberBlockFixed + member.size());
+        // Pinned layout: generationId LE32, then u16 length + bytes, right after the last entry.
+        EXPECT_EQ(rpc::detail::getLE32(f.bytes.data(), static_cast<int>(f.entriesEnd)), 7);
+        EXPECT_EQ(rpc::detail::getLE16(f.bytes.data(), static_cast<int>(f.entriesEnd) + 4), member.size());
+        const auto m = rpc::TxnOffsetCommit::decode(f.bytes.data(), f.bytes.size());
+        ASSERT_TRUE(m);
+        EXPECT_TRUE(m->hasMemberBlock);
+        EXPECT_EQ(m->generationId, 7);
+        EXPECT_EQ(std::string_view(reinterpret_cast<const char*>(m->memberId.data()), m->memberId.size()), member);
+        ASSERT_EQ(m->entries.size(), 2u);
+        EXPECT_EQ(m->entries[0].metadata.size(), 3u);
+        EXPECT_EQ(m->entries[1].partition, 5);
+        EXPECT_EQ(m->entries[1].offset, 99);
+    }
+}
+
+TEST(TxnOffsetCommitMemberBlockRegression, ABlockTruncatedAtEveryOffsetIsRejectedRegression) {
+    const std::string member = "member-xyz";
+    const TocFrame f = encodeToc(3, member);
+    // Every cut inside the block (1 byte of it .. all but its last byte) is a malformed frame - never a wrong member.
+    for (std::size_t cut = f.entriesEnd + 1; cut < f.bytes.size(); ++cut)
+        EXPECT_FALSE(rpc::TxnOffsetCommit::decode(f.bytes.data(), cut)) << "accepted a block truncated to " << cut;
+    // Cut exactly at the end of the entries: the legacy frame.
+    const auto legacy = rpc::TxnOffsetCommit::decode(f.bytes.data(), f.entriesEnd);
+    ASSERT_TRUE(legacy);
+    EXPECT_FALSE(legacy->hasMemberBlock);
+    // Every cut inside the entries is malformed too (the block's position depends on them).
+    for (std::size_t cut = f.entriesEnd - 1; cut > f.entriesEnd - 2 * 18; --cut)
+        EXPECT_FALSE(rpc::TxnOffsetCommit::decode(f.bytes.data(), cut)) << "accepted entries truncated to " << cut;
+}
+
+TEST(TxnOffsetCommitMemberBlockRegression, BytesAfterACompleteBlockAreIgnoredAndTheEntriesAreUnchangedRegression) {
+    // Forward compatibility, and the version-skew rule: a decoder reads only `count` entries, so the entries of a
+    // v10 frame decode exactly as those of the legacy frame (an older broker sees the legacy request).
+    const TocFrame v10 = encodeToc(5, "m");
+    const TocFrame v9  = encodeToc(-1, "");
+    ASSERT_EQ(std::memcmp(v10.bytes.data() + 24, v9.bytes.data() + 24, v9.entriesEnd - 24), 0)
+        << "the block must not change any byte before it (an older broker ignores what follows the entries)";
+    std::vector<uint8_t> longer = v10.bytes;
+    longer.push_back(0xEE);
+    longer.push_back(0xFF);
+    const auto m = rpc::TxnOffsetCommit::decode(longer.data(), longer.size());
+    ASSERT_TRUE(m);
+    EXPECT_TRUE(m->hasMemberBlock);
+    EXPECT_EQ(m->generationId, 5);
+    ASSERT_EQ(m->memberId.size(), 1u);
+}
+
+TEST(TxnOffsetCommitMemberBlockRegression, VersionGatesForTheFenceAndUnstableOffsetCommitRegression) {
+    EXPECT_EQ(rpc::kClientVersionTxnOffsetFence, 10);
+    EXPECT_GE(rpc::kClientVersion, rpc::kClientVersionTxnOffsetFence);
+    EXPECT_EQ(static_cast<uint16_t>(rpc::ErrorCode::UnstableOffsetCommit), 50u);
+    EXPECT_TRUE(rpc::clientUnderstandsUnstableOffsetCommit(10));
+    EXPECT_TRUE(rpc::clientUnderstandsUnstableOffsetCommit(-1)) << "unknown (rigs) = current";
+    EXPECT_FALSE(rpc::clientUnderstandsUnstableOffsetCommit(9));
 }
