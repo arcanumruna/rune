@@ -115,6 +115,13 @@ public:
         gateway_ = gateway;
     }
 
+    /// Issue #122: this cycle's committed metadata feature level, pushed by the runtime (NodeRuntimeAgent).  Bound
+    /// producer ids are issued only at MetadataFeature::kBoundProducerIds or above (every member supports them); below
+    /// it ids are issued raw and nothing is rebound (an older coordinator may take over).  Unpushed (-1, rigs without
+    /// a metadata service): bound.
+    void setMetadataFeatureLevel(int16_t level) noexcept { featureLevel_ = level; }
+    [[nodiscard]] bool bindsProducerIds() const noexcept;
+
     /// Test seam (issue #122): resolve a session's principal without a gateway.
     using PrincipalFn = uint64_t (*)(void* ctx, int64_t sessionId) noexcept;
     void setPrincipalResolverForTest(PrincipalFn fn, void* ctx) noexcept { principalFn_ = fn; principalCtx_ = ctx; }
@@ -338,6 +345,7 @@ private:
     // Issue #122: producer ids are issued to, and honoured only for, the session's principal.
     PrincipalFn principalFn_  = nullptr;
     void*       principalCtx_ = nullptr;
+    int16_t     featureLevel_ = -1;   // see setMetadataFeatureLevel()
     /// The authenticated principal of `sessionId` (0: none).
     [[nodiscard]] uint64_t principalOf_(int64_t sessionId) const;
     /// The producer id a request may act as: `pid` itself when the session's principal may name it, else an id that

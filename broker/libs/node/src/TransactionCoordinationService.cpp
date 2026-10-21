@@ -24,6 +24,7 @@
 
 #include <rune/node/TransactionCoordinationService.h>
 #include <rune/protocol/ProducerIdBinding.h>
+#include <rune/replication/ReplicationMessages.h>   // MetadataFeature (#122)
 #include <rune/gateway/RequestRejection.h>
 #include <rune/gateway/ITxnRequestHandler.h>
 #include <cstdlib>
@@ -190,7 +191,9 @@ void TransactionCoordinationService::load_(int64_t nowNs)
         // I7: the next pid lies at or above every ceiling a previous coordinator
         // persisted (idempotent pids are recorded nowhere else) and above every
         // pid in the log.  Nothing is handed out until a fresh ceiling commits.
-        tx::ProducerId base = txnState_->persistedPidCeiling();
+        // #122: a ceiling is in counter units; one persisted by a coordinator that reseeded by a bound id's RAW value
+        // (an older binary over bound ids) is converted like an id, so it never runs the counter past its 38 bits.
+        tx::ProducerId base = rune::protocol::producerIdCounter(txnState_->persistedPidCeiling());
         // #122: the ceiling is in allocator (counter) units; a recovered id is converted (bound ids carry an owner).
         const tx::ProducerId maxCounter = rune::protocol::producerIdCounter(maxPid);
         if (maxCounter + 1 > base) base = maxCounter + 1;
@@ -345,6 +348,11 @@ static size_t answerCannotFit_(const uint8_t* buf, size_t len, uint8_t* out, siz
 // ---------------------------------------------------------------------------
 // Issue #122: producer ids are bound to the principal they were issued to.
 // ---------------------------------------------------------------------------
+bool TransactionCoordinationService::bindsProducerIds() const noexcept
+{
+    return featureLevel_ < 0 || featureLevel_ >= rune::replication::MetadataFeature::kBoundProducerIds;
+}
+
 uint64_t TransactionCoordinationService::principalOf_(int64_t sessionId) const
 {
     if (principalFn_ != nullptr) return principalFn_(principalCtx_, sessionId);
@@ -409,9 +417,11 @@ size_t TransactionCoordinationService::handleInitProducerId(
         return resp.encode(out);
     }
 
-    // Call coordinator.  Issue #122: the id is issued to (bound to) the session's principal.
+    // Call coordinator.  Issue #122: the id is issued to (bound to) the session's principal - once every member
+    // supports bound ids (below the feature level: a raw id, nothing rebound).
     const auto result = coordinator_.initProducerId(
-        txnIdOpt, msg.transactionTimeoutMs, nowNs, principalOf_(msg.sessionId));
+        txnIdOpt, msg.transactionTimeoutMs, nowNs,
+        bindsProducerIds() ? std::optional<uint64_t>(principalOf_(msg.sessionId)) : std::nullopt);
 
     // F15 I7: the allocation may have crossed half a block — prefetch the next.
     advancePidBlock_();

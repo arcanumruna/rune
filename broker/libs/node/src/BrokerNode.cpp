@@ -2829,6 +2829,9 @@ void BrokerNode::buildGateway() {
         storageGate_ = std::make_unique<StorageGate>(storage_, config_.dataDir, config_.nodeId,
                                                      static_cast<int>(config_.peers.size()),
                                                      foundingShortDwellNs(), foundingLongDwellNs());   // C1 dwells
+    // Issue #122: until the runtime pushes the committed metadata feature level, the txn coordinator issues raw
+    // (unbound) producer ids - never a bound id an older member could misread.
+    if (txnCoordService_ && metadataService_) txnCoordService_->setMetadataFeatureLevel(rune::replication::MetadataFeature::kBase);
     runtimeAgent_ = std::make_unique<NodeRuntimeAgent>(
         innerAgent,
         election_.get(),          // GR-2: election for leaderMemberId/leadershipTermId reads

@@ -64,6 +64,11 @@ Rules that keep the model small (D15 to D17):
   TxnOffsetCommit or EndTxn naming another user's producer id is refused (`NotAuthorized` for a Produce, the
   wrong-producer answer otherwise). Two users sharing `WRITE` on a transactional id each get their own
   producer id at InitProducerId; the previous holder is fenced.
+- Producer ids are bound only once every broker in the cluster runs a version that supports it (the
+  metadata feature level). During a rolling upgrade, ids are issued unbound, as before. An unbound id
+  carries no owner and is usable by any user with `WRITE`, so a producer that started before the
+  upgrade completed is unprotected until it re-initializes. A transactional id still holding an unbound id
+  gets a bound one at its next InitProducerId.
 
 **Visibility.** Objects the user cannot `DESCRIBE` do not appear in metadata or listings. Direct
 access to such an object answers `NotAuthorized`, whether or not the object exists, so the answer
