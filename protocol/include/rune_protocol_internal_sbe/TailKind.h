@@ -43,6 +43,7 @@ public:
         EGRESS_CHANNEL = static_cast<std::uint8_t>(7),
         PERMISSION_BITS = static_cast<std::uint8_t>(8),
         PEER_KEYS = static_cast<std::uint8_t>(9),
+        END_DETAIL = static_cast<std::uint8_t>(10),
         NULL_VALUE = static_cast<std::uint8_t>(255)
     };
 
@@ -60,6 +61,7 @@ public:
             case static_cast<std::uint8_t>(7): return EGRESS_CHANNEL;
             case static_cast<std::uint8_t>(8): return PERMISSION_BITS;
             case static_cast<std::uint8_t>(9): return PEER_KEYS;
+            case static_cast<std::uint8_t>(10): return END_DETAIL;
             case static_cast<std::uint8_t>(255): return NULL_VALUE;
         }
 
@@ -80,6 +82,7 @@ public:
             case EGRESS_CHANNEL: return "EGRESS_CHANNEL";
             case PERMISSION_BITS: return "PERMISSION_BITS";
             case PEER_KEYS: return "PEER_KEYS";
+            case END_DETAIL: return "END_DETAIL";
             case NULL_VALUE: return "NULL_VALUE";
         }
 

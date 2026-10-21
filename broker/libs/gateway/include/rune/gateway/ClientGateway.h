@@ -433,10 +433,21 @@ public:
     /// The view halted (the admin applier's kA2cSecurityHalted, or the mirror's own apply error): fail closed - every
     /// authenticated / must-change-password session is revoked (D28).  Idempotent.
     void onSecurityHalted(int64_t offset);
-    /// The newest security event offset whose refresh EVERY worker has accepted (D24 answer gate); -1 = none yet.
+    /// The newest security event offset this broker ENFORCES (D24 answer gate); -1 = none yet.  Issues #109 / #196:
+    /// with workers, an event is enforced once every worker ACKNOWLEDGED the enforcement fence that followed the
+    /// event's ops on both of its rings (bitmaps, binds and closes installed; ended subscriptions' cursors gone) - never
+    /// on ring acceptance.
     [[nodiscard]] int64_t securityEnforcedOffset() const noexcept { return securityEnforcedOffset_; }
-    /// Test probes (Task 18): the event waiting for the shipper to drain (-1 none) and the shipper's queued updates.
-    [[nodiscard]] int64_t securityPendingEnforceForTest() const noexcept { return securityPendingEnforce_; }
+    /// Test probes (Task 18): the newest event still awaiting its fence acks (-1 none) and the shipper's queued updates.
+    [[nodiscard]] int64_t securityPendingEnforceForTest() const noexcept {
+        return pendingEnforce_.empty() ? -1 : pendingEnforce_.back().offset;
+    }
+    /// Issues #109 / #196 probes: fences issued / the newest acked per worker and ring (0 = op ring, 1 = lifecycle).
+    [[nodiscard]] uint64_t enforceFencesIssuedForTest() const noexcept { return enforceFenceSeq_; }
+    [[nodiscard]] uint64_t enforceFenceAckedForTest(int32_t worker, int ring) const noexcept {
+        if (worker < 0 || worker >= kMaxFenceWorkers) return 0;
+        return (ring == 0 ? opFenceAcked_ : lifeFenceAcked_)[static_cast<std::size_t>(worker)];
+    }
     [[nodiscard]] std::size_t permissionPendingUpdatesForTest() const noexcept { return permissionShipper_.pendingUpdates(); }
     /// Issue #259 test seam: authenticate `sid` as `userId` holding exactly `grants` (sorted, unique) - through the pool
     /// and the shipper, as a login does.
@@ -1669,7 +1680,13 @@ private:
                                    int32_t partition, int64_t nextOffset, uint8_t isolation,
                                    bool isGroup, bool groupCarrierReceived,
                                    int64_t subscribeCorrId = 0);
-    void forwardUnsubscribeToWorker_(int64_t subId, int32_t topicId, int32_t partition);
+    /// Forget subscription `subId` on its owning worker (queued behind its Subscribe, never dropped).  Issue #109:
+    /// `endCode` != 0 ENDS it - the worker emits ErrorResponse{endCode, its Subscribe correlation id, endDetail} after
+    /// its last Records.  Returns true when the worker owns the end (the caller must not answer it); false when the
+    /// subscription never reached a worker (its Subscribe was still waiting for the record egress): nothing was sent
+    /// and the caller answers the end itself.
+    bool forwardUnsubscribeToWorker_(int64_t subId, int32_t topicId, int32_t partition, int16_t endCode = 0,
+                                     std::string_view endDetail = {});
     /// Issue #118 (X020, M10): under authentication a Subscribe without its own record egress is never handed to a
     /// worker (it would push on the shared MDC egress every joiner receives): retired NotLeader (a group member's:
     /// the session's members evicted).  Control thread, cold.
@@ -2331,8 +2348,22 @@ private:
     uint64_t loginsOk_ = 0, loginsFailed_ = 0, loginsRateLimited_ = 0;
     // ── authentication Task 14: live security changes ──
     uint64_t sessionsRevoked_ = 0;
-    int64_t  securityEnforcedOffset_ = -1;       ///< every event <= this is enforced here (tables refreshed, bitmaps accepted by every worker)
-    int64_t  securityPendingEnforce_ = -1;       ///< applied here, waiting for the permission shipper to drain
+    int64_t  securityEnforcedOffset_ = -1;       ///< every event <= this is enforced here (see securityEnforcedOffset())
+    // Issues #109 / #196: the enforcement fences.  Each applied security event that touches workers gets one fence
+    // sequence number, sent to EVERY worker behind the event's ops - on the lifecycle ring through the permission
+    // shipper's FIFO (bitmaps / binds; a revoked session is bound to deny first) and on the op ring through the
+    // per-worker pendingSubOps_ FIFO (ending Unsubscribes).  The event is enforced once every worker acknowledged its
+    // fence on every ring in use (SessionSignal FenceAck).  Control thread, cold (one entry per security event).
+    static constexpr int kMaxFenceWorkers = 64;   // validateShardConfig
+    struct PendingEnforce { int64_t offset; uint64_t seq; };
+    std::deque<PendingEnforce>               pendingEnforce_;
+    uint64_t                                 enforceFenceSeq_ = 0;
+    std::array<uint64_t, kMaxFenceWorkers>   opFenceAcked_{};
+    std::array<uint64_t, kMaxFenceWorkers>   lifeFenceAcked_{};
+    [[nodiscard]] bool fencesOpRing_() const noexcept;
+    [[nodiscard]] bool fencesLifecycleRing_() const noexcept;
+    void onEnforceFenceAck_(int32_t worker, int ring, uint64_t seq) noexcept;
+    void promoteEnforced_() noexcept;
     std::vector<int64_t> liveScratch_;           ///< reused session-id list (capacity persists)
     /// Recompile one session's table, end what lost READ, ship the WRITE bits.
     void refreshSession_(int64_t sid);
@@ -2340,7 +2371,7 @@ private:
     void revokeSession_(int64_t sid, std::string_view reason);
     void executeLiveActions_(Session& s, const rune::gateway::LiveActions& act);
     void sendErrorOn_(Session& s, int64_t corr, uint16_t code, std::string_view message);
-    void noteEnforced_(int64_t offset) noexcept;
+    void noteEnforced_(int64_t offset);
     int32_t  currentImageSessionId_ = 0;   ///< the Aeron image (publication) session id of the frame being dispatched
     std::vector<int64_t> authReapScratch_; ///< reused by reapAuthDeadlines_ (capacity persists)
     uint64_t authGateRefusals_ = 0;
@@ -2750,6 +2781,13 @@ private:
         bool              unsubscribe = false;
         bool              mdc         = false;   // forwarded with the MDC pub (no unicast)
         BufferedSubscribe sub;                   // subscribe: everything; unsubscribe: subId/topic/partition
+        // Issue #109: an ENDING Unsubscribe - the worker sends ErrorResponse{endCode, endDetail} after its last Records.
+        int16_t           endCode = 0;
+        std::string       endDetail;
+        // Issues #109 / #196: an enforcement fence for worker `fenceWorker` (no subscription) - acknowledged by the
+        // worker once every op queued before it on its op ring ran.
+        uint64_t          fenceSeq    = 0;
+        int32_t           fenceWorker = -1;
     };
     std::vector<std::deque<PendingSubOp>> pendingSubOps_;   // indexed by owning worker
     bool trySubOp_(const PendingSubOp& p);

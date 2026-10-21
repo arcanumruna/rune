@@ -132,6 +132,12 @@ struct WorkerOp {
         // [sendMaster 32][recvMaster 32] (WorkerOp::peerKeys).  Cold (one per link establishment); never
         // ownership-gated.  (21 = SESSION_PERMISSIONS, Task 12.)
         PeerLinkKeys              = 22, ///< control → worker: install an established peer link's keys
+        // Issues #109 / #196: control → ONE worker on its OP ring (cold, one per security event): an enforcement
+        // fence.  correlationId = the fence sequence number.  The worker answers SessionSignal FenceAck (sessionId 0 =
+        // the op ring) once it executed every op queued before it - the D24 gate's proof that an ended subscription
+        // pushes nothing more.  Never ownership-gated.  (The lifecycle ring's fence is a SessionPermissions op with
+        // kPermFlagFence.)
+        EnforceFence              = 23, ///< control → worker: acknowledge every op queued before this one
         // F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
         // control → owning worker: run a test-owned OwnerThreadTestTask against
         // `replica` on the worker's OWN thread.  The opaque task ref travels in the
@@ -207,6 +213,14 @@ struct WorkerOp {
     // returns EgressReleased (token = correlationId); only then does the gateway
     // destroy the pub.
     void* egressPub = nullptr;
+
+    // Issue #109: an Unsubscribe that ENDS the subscription for the client (a revoked READ).  The worker that pushes
+    // its Records emits the terminal ErrorResponse{endCode, subscribe correlation id, endDetail} on the SAME record
+    // egress after its last Records, then forgets the cursor - no Records frame ever follows the end.  0 = a plain
+    // Unsubscribe (the client asked, the session closed: nothing is owed).  On the wire: endCode rides clientVersion
+    // (Unsubscribe has no version), endDetail the tail (TailKind END_DETAIL; a view valid for the enqueue call).
+    int16_t          endCode = 0;
+    std::string_view endDetail;
 
     // SessionAnnounce (Task 13): the client session's egress stream + channel.
     // egressChannel is a VIEW valid only for the synchronous tryEnqueueOp call
