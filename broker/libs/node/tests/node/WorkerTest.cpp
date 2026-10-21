@@ -69,6 +69,21 @@ using rune::replication::NodeId;
 using rune::storage::InMemoryLog;
 
 namespace {
+/// The slot of a view row.  getRow is called FIRST (it sets the layout): `readSlot(getRow(.., L), *L, s)` left the
+/// order to the compiler, and GCC evaluates `*L` before getRow assigns L (a null dereference on Linux).
+template <class VS>
+rune::codec::FieldValue slotOf(VS& vs, int32_t view, int32_t partition, uint64_t key, uint16_t slot) {
+    const rune::view::RowLayout* layout = nullptr;
+    const uint8_t* row = vs.getRow(view, partition, key, layout);
+    if (row == nullptr || layout == nullptr) {
+        ADD_FAILURE() << "no row for key " << key;
+        return {};
+    }
+    return rune::view::readSlot(row, *layout, slot);
+}
+}  // namespace
+
+namespace {
 
 // Per-PROCESS view data dirs "<temp>/<name>-<pid>": ctest -j runs each test as its
 // own process (and other checkouts run the same suites), so a fixed /tmp/<name>
@@ -882,14 +897,14 @@ TEST(WorkerRegression, ViewOverRecreatedTransientSourceRefoldsRegression) {
     int64_t nowNs = 0;
     for (int i = 0; i < 200 && vs.getRow(kView, 0, 7, L) == nullptr; ++i) w.doWork(nowNs += 1'000'000);
     ASSERT_NE(vs.getRow(kView, 0, 7, L), nullptr);
-    ASSERT_EQ(rune::view::readSlot(vs.getRow(kView, 0, 7, L), *L, 1).i, 55);
+    ASSERT_EQ(slotOf(vs, kView, 0, 7, 1).i, 55);
 
     put(*b.replica, 7, 66);                                   // incarnation 2: offset 0 — a different record
     put(*b.replica, 9, 1);                                    // offset 1: the ring now covers the old cursor 1
     w.setOwnedDirect(Worker::OwnedSet{b.replica.get()});      // the partition's replica was recreated
-    for (int i = 0; i < 200 && rune::view::readSlot(vs.getRow(kView, 0, 7, L), *L, 1).i != 66; ++i)
+    for (int i = 0; i < 200 && slotOf(vs, kView, 0, 7, 1).i != 66; ++i)
         w.doWork(nowNs += 1'000'000);
-    EXPECT_EQ(rune::view::readSlot(vs.getRow(kView, 0, 7, L), *L, 1).i, 66) << "the view kept a row of the old ring";
+    EXPECT_EQ(slotOf(vs, kView, 0, 7, 1).i, 66) << "the view kept a row of the old ring";
     ASSERT_NE(vs.getRow(kView, 0, 9, L), nullptr);
     EXPECT_EQ(vs.foldCounters(kView, 0)->transientSourceResets, 1u);
 }

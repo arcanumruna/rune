@@ -9,6 +9,8 @@
 
 #include <rune/client/group/GroupConsumer.h>
 
+#include <algorithm>
+
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
@@ -363,6 +365,21 @@ int32_t GroupConsumer::generation() const noexcept {
     if (onDutyThread_()) return impl_->generationId;
     (void)impl_->status.drainLatest(cache_);
     return cache_.generationId;
+}
+
+GroupMetadata GroupConsumer::groupMetadata() const {
+    GroupMetadata m;
+    if (!impl_) return m;
+    m.groupId = impl_->groupId;   // config: immutable after construction
+    if (onDutyThread_()) {
+        m.generationId = impl_->generationId;
+        m.memberId     = impl_->memberId;
+        return m;
+    }
+    (void)impl_->status.drainLatest(cache_);
+    m.generationId = cache_.generationId;
+    m.memberId.assign(cache_.memberId, std::min<std::size_t>(cache_.memberIdLen, kMaxGroupMemberIdBytes));
+    return m;
 }
 
 } // namespace rune::client

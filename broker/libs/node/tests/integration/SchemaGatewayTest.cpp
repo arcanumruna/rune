@@ -136,6 +136,16 @@ std::vector<uint8_t> makeBatch() {
 // (kA2cCatalogTopicApplied → TopicRegistry::createTopicAt when realControl), its
 // egress ring the DDL answers (→ gateway.sendControlFrame).
 struct SgHarness {
+    /// Removes the harness's directories when it goes (declared FIRST: destroyed after every member that uses
+    /// them).  They leaked before - 65..260 MB each (preallocated segments), enough to fill a CI disk.
+    struct OwnedDirs {
+        std::vector<std::string> dirs;
+        const std::string& add(std::string d) { dirs.push_back(std::move(d)); return dirs.back(); }
+        ~OwnedDirs() {
+            std::error_code ec;
+            for (const auto& d : dirs) fs::remove_all(d, ec);
+        }
+    } ownedDirs;
     std::string dataDir;
     rune::storage::Log catalogLog;
     std::unique_ptr<NullPartitionTransport> catalogTransport;
@@ -164,8 +174,8 @@ struct SgHarness {
     rune::gateway::ClientGateway gw;
 
     SgHarness()
-        : dataDir(uniqDir("catalog")), catalogLog(madeDir((fs::path(dataDir) / "__catalog").string())),
-          topicDirPath(uniqDir("topics")),
+        : dataDir(ownedDirs.add(uniqDir("catalog"))), catalogLog(madeDir((fs::path(dataDir) / "__catalog").string())),
+          topicDirPath(ownedDirs.add(uniqDir("topics"))),
           gw(rune::gateway::ClientGateway::makeForTest(
                  [c = &egressFnFrames](const uint8_t*, std::size_t){ ++(*c); return int64_t{1}; },
                  /*sessionId=*/1)) {

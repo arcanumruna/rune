@@ -1037,15 +1037,19 @@ TEST(CatalogReadServerRegression, ADamagedEpochFileStartsAFreshEpochRegression) 
 TEST(CatalogReadServerRegression, AnEpochThatCannotBeMadeDurableServesNothingUntilItIsRegression) {
     ReadRig r("rd_ep_ro");
     r.commitEvents(3);
-    const std::filesystem::path dir = r.replica().log()->dir();
-    std::filesystem::permissions(dir, std::filesystem::perms::owner_read | std::filesystem::perms::owner_exec);
+    // The epoch file's path is a non-empty directory: its durable replace (write a temp, rename over it) fails for
+    // every user.  A read-only catalog dir did not: tests run as root on the Linux VM, and root ignores directory
+    // permissions.
+    const std::filesystem::path blocker = epochFileOf(r);
+    std::filesystem::remove(blocker);
+    std::filesystem::create_directories(blocker / "blocked");
     r.server.subscribe(7, 1, -2);
     for (int i = 0; i < 3; ++i) r.server.pump();
     EXPECT_TRUE(r.subscribeAnswered(7, 1)) << "the Subscribe is answered";
     EXPECT_TRUE(r.epochFrames(7).empty()) << "but nothing is served under a non-durable epoch";
     EXPECT_TRUE(r.deliveredOffsets(7).empty());
     EXPECT_GT(r.server.epochWriteFailures(), 0u);
-    std::filesystem::permissions(dir, std::filesystem::perms::owner_all);
+    std::filesystem::remove_all(blocker);
     r.server.pump();
     EXPECT_EQ(r.deliveredOffsets(7), range(0, 3));
     EXPECT_EQ(r.markers(7), (std::vector<int64_t>{3}));

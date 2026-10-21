@@ -1355,7 +1355,9 @@ struct Reg {
                           std::vector<rune::replication::NodeId> replicas = {1}) {
         auto dir = d.path / (std::to_string(topicId) + "_" + std::to_string(part) + "_" + std::to_string(logs.size()));
         fs::create_directories(dir);
-        logs.push_back(std::make_unique<Log>(dir.string(), 64LL * 1024 * 1024));
+        // 1 MiB segments: these replicas hold a few records, and a 64 MiB preallocation per log made the
+        // 200-partition churn test reserve ~13 GB on ext4 (fallocate allocates real blocks) - ENOSPC on the VM.
+        logs.push_back(std::make_unique<Log>(dir.string(), 1LL * 1024 * 1024));
         logs.back()->recover();
         auto r = std::make_unique<PartitionReplica>(cfg(1, 1, topicId, part), Role::Leader, 1,
             replicas, std::vector<rune::replication::NodeId>{1},

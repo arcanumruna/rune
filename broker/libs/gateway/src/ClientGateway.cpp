@@ -7378,8 +7378,11 @@ void ClientGateway::handleGroupMessage(const uint8_t* buf, std::size_t len,
             return;
     }
 
+    // #433: an OffsetCommit answer waits for its __consumer_offsets records to commit - the service parked it and
+    // sends it itself (sendControlFrame) once they do, or NotCoordinator when the offsets partition changed first.
+    if (encoded == 0 && templateId == pc::TemplateId::OffsetCommit) return;   // deferred
     // No-hang (R2): the service answers its own decode failures
-    // (InvalidRequest, RequestRejection.h) — a group handler never defers its
+    // (InvalidRequest, RequestRejection.h) — no other group handler defers its
     // answer, so 0 here means it could not answer at all: Internal, never a drop.
     if (encoded == 0 || encoded > scratch_.size()) [[unlikely]] {
         spdlog::error("ClientGateway: group response tid={} encoded size {} (scratch {}) — answered Internal",
@@ -8179,7 +8182,15 @@ bool ClientGateway::denyTxnRequest_(Session& session, uint16_t tid, const uint8_
             if (const auto m = pc::AddOffsetsToTxn::decode(buf, len)) { d = txn(m->transactionalId); if (!d) d = group(m->groupId); }
             break;
         case pc::TemplateId::TxnOffsetCommit:
-            if (const auto m = pc::TxnOffsetCommit::decode(buf, len)) { d = txn(m->transactionalId); if (!d) d = group(m->groupId); }
+            // Issue #125: READ on every listed topic too, exactly as OffsetCommit (an offset is a read position).
+            if (const auto m = pc::TxnOffsetCommit::decode(buf, len)) {
+                d = txn(m->transactionalId);
+                if (!d) d = group(m->groupId);
+                for (const auto& e : m->entries) {
+                    if (d) break;
+                    d = authorizeTopicId(perms, e.topicId, rsec::Operation::Read, objectIndex_);
+                }
+            }
             break;
         case pc::TemplateId::EndTxn:
             if (const auto m = pc::EndTxn::decode(buf, len)) d = txn(m->transactionalId);

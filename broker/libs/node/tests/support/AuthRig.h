@@ -322,6 +322,25 @@ public:
         return false;
     }
 
+    /// PR #466 review: TxnOffsetCommit of several entries (topic ids, partition 0, offset 1), optionally with the
+    /// version-10 member block (`generation` >= 0).  Returns the FIRST NON-OK entry code (0 = all OK).
+    int txnOffsetCommitMany(int64_t sid, const std::string& txnId, const std::string& group,
+                            const std::vector<int32_t>& topicIds, int64_t pid = 1, int16_t epoch = 0,
+                            int32_t generation = -1, const std::string& member = {}) {
+        pc::TxnOffsetCommit m;
+        m.sessionId = sid; m.correlationId = c().nextCorrelationId(); m.producerId = pid; m.producerEpoch = epoch;
+        m.transactionalId = bytes(txnId); m.groupId = bytes(group);
+        m.generationId = generation; m.memberId = bytes(member);
+        std::vector<pc::TxnOffsetCommitEntry> es;
+        for (const int32_t id : topicIds) es.push_back(pc::TxnOffsetCommitEntry{id, 0, 1, {}});
+        const auto a = sendRaw(m, 1024, m.correlationId, std::span<const pc::TxnOffsetCommitEntry>(es));
+        if (const auto r = a.empty() ? std::nullopt : pc::TxnOffsetCommitResponse::decode(a.data(), a.size())) {
+            for (const auto& e : r->results) if (e.errorCode != 0) return e.errorCode;
+            return 0;
+        }
+        return rawCode(a);
+    }
+
     /// The raw answer frame of `corr` (bounded wait); empty = none.
     std::vector<uint8_t> rawAnswer(int64_t corr) {
         const auto a = c().awaitRaw(corr, dl());

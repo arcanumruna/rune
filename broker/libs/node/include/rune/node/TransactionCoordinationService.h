@@ -262,6 +262,42 @@ public:
     using AnswerSinkFn = void (*)(void* ctx, int64_t sessionId, const uint8_t* frame, std::size_t len);
     void setAnswerSinkForTest(AnswerSinkFn fn, void* ctx) noexcept { answerSink_ = fn; answerSinkCtx_ = ctx; }
 
+    /// #125 (KIP-447): fences a TxnOffsetCommit that carries a member block (BrokerNode wires
+    /// GroupCoordinationService::checkTxnOffsetMember).  Anything but OK: every entry answers that code and nothing
+    /// is added to the transaction.  A frame without the block (legacy) is not checked.  No fence wired (rigs): OK.
+    using TxnOffsetMemberFence = rune::protocol::client::ErrorCode (*)(void* ctx, const std::string& group,
+                                                                        const std::string& memberId,
+                                                                        int32_t generationId, int64_t sessionId);
+    void setTxnOffsetMemberFence(TxnOffsetMemberFence fn, void* ctx) noexcept { memberFence_ = fn; memberFenceCtx_ = ctx; }
+
+    /// #438: the hold of a consumer-group (group, tp) - Held while an unfinished transaction has a pending offset on it
+    /// (from its TxnOffsetCommit until its Complete* record is COMMITTED on __transaction_state), Unknown while this
+    /// coordinator is not loaded, Free otherwise.  Control thread (the group coordinator's probe).
+    [[nodiscard]] rune::coordination::TxnOffsetHold txnOffsetHold(const std::string& group,
+                                                                  const rune::coordination::TopicPartition& tp) const;
+    /// Test: the transaction's pending (group, tp, offset) entries (empty when unknown).
+    [[nodiscard]] std::vector<rune::transaction::PendingTxnOffset> pendingOffsetsForTest(const std::string& txnId) const {
+        const auto* m = coordinator_.metadata(txnId);
+        return m != nullptr ? m->pendingOffsets : std::vector<rune::transaction::PendingTxnOffset>{};
+    }
+
+    /// #359: PrepareCommit transactions whose last offset apply was REFUSED (stuck until the group coordinator takes
+    /// it) and the age of the oldest one (0 when none).  Gauges; a WARN repeats at most every kStuckTxnOffsetWarnNs
+    /// of the injected clock while any is stuck, and one INFO says when none is.  Control thread.
+    static constexpr int64_t kStuckTxnOffsetWarnNs = 30'000'000'000;
+    [[nodiscard]] std::size_t txnOffsetCommitsStuck() const noexcept;
+    [[nodiscard]] int64_t oldestStuckTxnOffsetAgeNs(int64_t nowNs) const noexcept;
+    [[nodiscard]] uint64_t stuckTxnOffsetWarnsForTest() const noexcept { return stuckOffsetWarns_; }
+    /// #359: where the stuck-commit gauges are published (BrokerNode: Aeron counters next to the stuck markers).
+    /// Called on the control thread when a value changes; false = not published yet (retried on the next pass).
+    using StuckTxnOffsetsSink = bool (*)(void* ctx, int64_t stuck, int64_t oldestAgeMs);
+    void setStuckTxnOffsetsSink(StuckTxnOffsetsSink fn, void* ctx) noexcept {
+        stuckOffsetsSink_ = fn; stuckOffsetsSinkCtx_ = ctx; stuckOffsetsPublished_ = {-1, -1};
+    }
+    /// #359: the sink's last refusal reason (GroupCoordinationService::lastTxnOffsetRefusal), read after a Refused.
+    using TxnOffsetRefusalFn = rune::coordination::TxnOffsetRefusal (*)(void* ctx);
+    void setTxnOffsetRefusalReason(TxnOffsetRefusalFn fn) noexcept { offsetRefusalFn_ = fn; }
+
 private:
     // ----- #358 class: nothing that depends on a __transaction_state record happens before it is COMMITTED -----
     // An acks-all append replicates asynchronously; a coordinator failover before the record reaches the new
@@ -320,6 +356,72 @@ private:
     size_t handleTxnOffsetCommit_(const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap);
     size_t handleEndTxn_         (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap);
 
+    // ----- #438: a consumer-group (group, tp) is held by at most one unfinished transaction -----
+    // From the TxnOffsetCommit that adds it until the holder's Complete* record is COMMITTED on __transaction_state.
+    // Rebuilt on every load from the loaded (committed) state: a Prepare* / Ongoing transaction's pendingOffsets are
+    // held again, so a reload never lets another transaction (or a plain commit / a fetch) touch a key whose holder
+    // may still be re-driven.  Another transaction's TxnOffsetCommit on a held key is answered ConcurrentTransactions
+    // (retriable) and adds nothing.  Nodes are recycled (steady state allocates nothing once warm).
+    struct HoldKey {
+        std::string group, topic;
+        int32_t     partition = 0;
+    };
+    struct HoldKeyView {
+        std::string_view group, topic;
+        int32_t          partition = 0;
+    };
+    struct HoldLess {
+        using is_transparent = void;
+        static HoldKeyView v(const HoldKey& k) noexcept { return {k.group, k.topic, k.partition}; }
+        static HoldKeyView v(const HoldKeyView& k) noexcept { return k; }
+        template <class A, class B>
+        bool operator()(const A& a, const B& b) const noexcept {
+            const HoldKeyView x = v(a), y = v(b);
+            if (x.group != y.group) return x.group < y.group;
+            if (x.topic != y.topic) return x.topic < y.topic;
+            return x.partition < y.partition;
+        }
+    };
+    static constexpr int64_t kHoldOpen     = -1;   ///< the holder is unfinished
+    static constexpr int64_t kHoldNeedsPut = -2;   ///< completed; its Complete* record is not appended yet
+    struct Holder {
+        rune::transaction::TransactionalId txnId;
+        int64_t completeRecord = kHoldOpen;   ///< >= 0: completed - released once this record is committed
+        /// kHoldNeedsPut only: the id's last record BEFORE the completion (its Prepare*).  Only a record of the id
+        /// appended after it (> putFloor) can stand in for the refused Complete* - never the Prepare* itself.
+        int64_t putFloor = -1;
+    };
+    using HoldMap = std::map<HoldKey, Holder, HoldLess>;
+    HoldMap holds_;
+    std::vector<HoldMap::node_type> spareHoldNodes_;
+    std::size_t completingHolds_ = 0;   ///< holds whose holder completed (completeRecord != kHoldOpen)
+    void addHold_(const std::string& group, const rune::coordination::TopicPartition& tp, const std::string& txnId);
+    void eraseHold_(HoldMap::iterator it);
+    void clearHolds_();
+    void rebuildHolds_();
+    /// `txnId` completed with its Complete* record at `record` (kHoldNeedsPut: not appended - `putFloor` is the id's
+    /// last record before it; -3: no store).
+    void completeHolds_(const std::string& txnId, int64_t record, int64_t putFloor = -1);
+    int  releaseCommittedHolds_();
+    /// True when a key of offsetsScratch_ is held by another transaction (or by this id's completing one).
+    [[nodiscard]] bool heldByOther_(const std::string& group, const std::string& txnId) const;
+
+    // ----- #359: PrepareCommit transactions stuck on a refused offset apply -----
+    std::size_t stuckOffsetTxns_ = 0;          ///< awaiting_ entries with offsetRefusedSinceNs >= 0
+    int64_t     nextStuckOffsetWarnNs_ = 0;
+    bool        stuckOffsetWarned_ = false;    ///< a WARN went out since none was stuck (an INFO closes it)
+    int64_t     nextStuckOffsetScanNs_ = 0;
+    rune::coordination::TxnOffsetRefusal refusalThisPass_ = rune::coordination::TxnOffsetRefusal::Unknown;
+    void updateStuckOffsets_(int64_t nowNs);
+    void publishStuckOffsets_(int64_t stuck, int64_t oldestAgeMs);
+
+    TxnOffsetMemberFence memberFence_    = nullptr;
+    void*                memberFenceCtx_ = nullptr;
+    uint64_t             stuckOffsetWarns_ = 0;
+    StuckTxnOffsetsSink  stuckOffsetsSink_    = nullptr;
+    void*                stuckOffsetsSinkCtx_ = nullptr;
+    std::pair<int64_t, int64_t> stuckOffsetsPublished_{-1, -1};
+    TxnOffsetRefusalFn   offsetRefusalFn_ = nullptr;
     uint64_t controlMarkersRefused_ = 0;
     uint64_t transactionsCompleted_ = 0;
     TxnOffsetSink offsetSink_    = nullptr;
@@ -366,6 +468,8 @@ private:
         int64_t offsetDueNs      = 0;
         int64_t offsetBackoffNs  = 0;
         int64_t dispatchedNs     = 0;       // D9 re-review MEDIUM-2: gauge age of never-refused markers
+        int64_t offsetRefusedSinceNs = -1;  // #359: the first refusal of the current refused streak (-1: none)
+        rune::coordination::TxnOffsetRefusal offsetRefusal = rune::coordination::TxnOffsetRefusal::Unknown;
         std::vector<MarkerRetry> retries;   // refused markers awaiting re-dispatch
     };
     static constexpr int64_t kMarkerRetryMinNs = 10'000'000;      // 10 ms
@@ -471,6 +575,7 @@ private:
     // Never holds state across call boundaries.
     std::string txnIdScratch_;    ///< txnId span → reusable std::string
     std::string groupIdScratch_;  ///< groupId span → reusable std::string
+    std::string memberIdScratch_; ///< #125: TxnOffsetCommit member id → reusable std::string
 
     // Pre-reserved scratch for partition vectors (addPartitions, endTxn).
     std::vector<rune::transaction::TopicPartition> partitionScratch_;

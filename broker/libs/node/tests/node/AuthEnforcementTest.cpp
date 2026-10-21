@@ -118,8 +118,11 @@ TEST(AuthEnforcementRegression, AnotherPrincipalsMemberIdIsRefusedOnEveryGroupRe
 
 TEST(AuthEnforcementRegression, TransactionRowsAllowedAndDenied) {
     AuthRig r;
+    // Issue #125 correction (not a weakening): TxnOffsetCommit needs READ on every listed topic, exactly as
+    // OffsetCommit does - this row used to pin the hole (WRITE alone let `may` commit offsets of `orders`).  `may`
+    // now holds READ on `orders` too; TxnOffsetCommitNeedsReadOnEveryTopicRegression pins the refusal without it.
     const int64_t may = r.newUser({exact(SO::Write, ST::TransactionalId, "tx1"), exact(SO::Write, ST::Topic, "orders"),
-                                   exact(SO::Read, ST::Group, "cg")});
+                                   exact(SO::Read, ST::Topic, "orders"), exact(SO::Read, ST::Group, "cg")});
     const int64_t txOnly = r.newUser({exact(SO::Write, ST::TransactionalId, "tx1")});
     const int64_t none = r.newUser({});
     EXPECT_EQ(r.initProducerId(may, "tx1"), kOk);
@@ -887,4 +890,51 @@ TEST(AuthEnforcementRegression, ProducerIdBindingSurvivesABrokerRestartAdversari
     ASSERT_EQ(fresh.code, kOk);
     EXPECT_GT(rune::protocol::producerIdCounter(fresh.pid), rune::protocol::producerIdCounter(p.pid))
         << "a recovered bound id's counter was re-issued";
+}
+
+// Issue #125: TxnOffsetCommit needs READ on every listed topic, exactly as OffsetCommit does (the gateway checked only
+// the transactional id and the group).
+TEST(AuthEnforcementRegression, TxnOffsetCommitNeedsReadOnEveryTopicRegression) {
+    AuthRig r;
+    const std::vector<AuthGrant> base{exact(SO::Write, ST::TransactionalId, "tx1"), exact(SO::Write, ST::Topic, "orders"),
+                                      exact(SO::Read, ST::Group, "cg")};
+    std::vector<AuthGrant> withRead = base;
+    withRead.push_back(exact(SO::Read, ST::Topic, "orders"));
+    const int64_t noRead = r.newUser(base);
+    const int64_t reader = r.newUser(withRead);
+    EXPECT_EQ(r.txnOffsetCommit(noRead, "tx1", "cg", r.orders), kNotAuthorized)
+        << "an offset was committed for a topic the caller cannot READ";
+    EXPECT_NE(r.txnOffsetCommit(reader, "tx1", "cg", r.orders), kNotAuthorized);
+}
+
+// Adversarial review of PR #466 (#125), through the real gateway and BrokerNode's fence wiring: READ is needed on
+// EVERY entry's topic (the unreadable one first, last, or after a duplicate; with and without the version-10 member
+// block), the member block is fenced (unknown member, stale generation, another session's member), and a legacy
+// (version-9, no block) frame is still accepted unfenced.
+TEST(AuthEnforcementRegression, TxnOffsetCommitReadOnEveryEntryAndTheMemberFenceOverTheWireAdversarialRegression) {
+    AuthRig r;
+    std::string name;
+    const int64_t u = r.newUser({exact(SO::Write, ST::TransactionalId, "tx1"), exact(SO::Write, ST::Topic, "orders"),
+                                 exact(SO::Read, ST::Topic, "orders"), exact(SO::Read, ST::Group, "cg")}, &name);
+    const auto p = r.initProducer(u, "tx1");
+    ASSERT_EQ(p.code, kOk);
+    EXPECT_EQ(r.txnOffsetCommitMany(u, "tx1", "cg", {r.orders, r.secret}, p.pid, p.epoch), kNotAuthorized)
+        << "the unreadable topic was the last entry";
+    EXPECT_EQ(r.txnOffsetCommitMany(u, "tx1", "cg", {r.secret, r.orders}, p.pid, p.epoch), kNotAuthorized);
+    EXPECT_EQ(r.txnOffsetCommitMany(u, "tx1", "cg", {r.orders, r.orders, r.secret}, p.pid, p.epoch, 1, "m"),
+              kNotAuthorized) << "the member block changed the authorization of the entries";
+
+    const auto [member, gen] = r.joinStable(u, "cg", {r.orders});
+    ASSERT_FALSE(member.empty());
+    ASSERT_EQ(r.addOffsets(u, "tx1", "cg", p.pid, p.epoch), kOk);
+    const int unknownMember = static_cast<int>(pc::ErrorCode::UnknownMember);
+    const int illegalGen    = static_cast<int>(pc::ErrorCode::IllegalGeneration);
+    EXPECT_EQ(r.txnOffsetCommitMany(u, "tx1", "cg", {r.orders}, p.pid, p.epoch, gen, "cg-nobody"), unknownMember);
+    EXPECT_EQ(r.txnOffsetCommitMany(u, "tx1", "cg", {r.orders}, p.pid, p.epoch, gen + 1, member), illegalGen);
+    EXPECT_EQ(r.txnOffsetCommitMany(u, "tx1", "cg", {r.orders}, p.pid, p.epoch, gen - 1, member), illegalGen);
+    const int64_t other = r.login(name);   // the same principal, another session: the member is not its own
+    EXPECT_EQ(r.txnOffsetCommitMany(other, "tx1", "cg", {r.orders}, p.pid, p.epoch, gen, member), unknownMember);
+    EXPECT_EQ(r.txnOffsetCommitMany(u, "tx1", "cg", {r.orders}, p.pid, p.epoch), kOk)
+        << "a legacy (version-9) frame without a member block was refused";
+    EXPECT_EQ(r.txnOffsetCommitMany(u, "tx1", "cg", {r.orders}, p.pid, p.epoch, gen, member), kOk);
 }

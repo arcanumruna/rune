@@ -333,7 +333,7 @@ GroupConsumer gc = client.subscribeGroup("economy", {"orders"}, g);
 tp.beginTransaction();
 try {
     for (auto& r : batch) tp.send(out, Key(r.id), transform(r));
-    tp.sendOffsetsToTransactionAndWait(offsets, "economy");   // next offset to read, per partition
+    tp.sendOffsetsToTransactionAndWait(offsets, gc.groupMetadata());   // next offset to read, per partition
     tp.commitTransactionAndWait();
 } catch (const std::runtime_error&) {
     if (tp.state() == TxnState::FatalError) return;           // fenced
@@ -341,6 +341,14 @@ try {
     gc.seekToCommittedAndWait();                              // re-read the aborted batch, no restart
 }
 ```
+
+Pass `gc.groupMetadata()` (group id, generation, member id) rather than the group id alone: the coordinator then fences
+the offsets by the member and its generation, so a consumer that lost its partitions in a rebalance (a zombie) cannot
+commit them. A stale generation (`IllegalGeneration`, 15) or an unknown member (`UnknownMember`, 12) fails the
+transaction (`AbortableError`): abort, let the consumer rejoin, re-read. The member belongs to the session that joined
+it, so create the transactional producer on the GroupConsumer's own `Client`. While a transaction holds a partition's
+pending offset, the group's `OffsetFetch` and `commitSync` of that partition wait (the broker answers
+`UnstableOffsetCommit`, which the client retries) until the transaction completes.
 
 `GroupConsumer::seekToCommitted()` / `seekToCommittedAndWait()` rewinds every assigned partition to its committed offset;
 `seek(partition, offset)` repositions one partition (`InvalidArgument` for an unassigned one). Records handed to `onRecords`

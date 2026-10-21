@@ -91,12 +91,16 @@ inline constexpr int32_t kMsgTxnControl  = 5; // Phase 2b F: a transaction contr
 //   [16..23] target word b : i64 (detail::encodeTarget)
 //   [24..31] target word c : i64
 //   [32..35] offsetCount   : u32
-//   [36..]   groupId bytes; then, from the next multiple of 8 at or after 36 + groupIdLen (zero padded),
-//            offsetCount x 16-byte entries (topicId i32, partition i32, offset i64) - 8-aligned, so the duty side
-//            reads them in place.
-// A SendOffsets whose counts are over the caps (kMaxTxnOffsets / a 1..255-byte group id) travels as the 36-byte
-// header ONLY: the duty side completes it InvalidArgument without reading any data.
-inline constexpr std::size_t kTxnCtlHeaderBytes = 36;
+//   [36..39] generationId  : i32 (#125: the consumer-group member's generation; -1 = none, the legacy form)
+//   [40..43] memberIdLen   : u32 (#125)
+//   [44..47] zero
+//   [48..]   groupId bytes; then, from the next multiple of 8 (zero padded), memberId bytes; then, from the next
+//            multiple of 8, offsetCount x 16-byte entries (topicId i32, partition i32, offset i64) - 8-aligned, so
+//            the duty side reads them in place.
+// A SendOffsets whose counts are over the caps (kMaxTxnOffsets / a 1..255-byte group id / a member id longer than
+// kMaxGroupMemberIdBytes) travels as the 48-byte header ONLY: the duty side completes it InvalidArgument without
+// reading any data.
+inline constexpr std::size_t kTxnCtlHeaderBytes = 48;
 
 // CLAIM_BATCH layout (kMsgClaimBatch payload): [0..33] exactly as SEND_RECORD
 // (topicId, partition, keyLen, inline key, flags = 0, ackHandle = 0), then
@@ -490,14 +494,22 @@ enum class RejectReason : uint8_t {
 inline constexpr std::size_t kMaxTxnOffsets      = 1024;
 inline constexpr std::size_t kMaxTxnGroupIdBytes = 255;
 
-/// The largest kMsgTxnControl payload: the header, a group id of kMaxTxnGroupIdBytes padded to 8, then
-/// kMaxTxnOffsets 16-byte entries.  ONE constant for the issue side's buffer and the duty side's decode.
+/// #125: the longest member id a SendOffsets carries (GroupMetadata).
+inline constexpr std::size_t kMaxTxnMemberIdBytes = kMaxGroupMemberIdBytes;
+
+/// The largest kMsgTxnControl payload: the header, a group id of kMaxTxnGroupIdBytes padded to 8, a member id of
+/// kMaxTxnMemberIdBytes padded to 8, then kMaxTxnOffsets 16-byte entries.  ONE constant for the issue side's buffer
+/// and the duty side's decode.
 inline constexpr std::size_t kTxnCtlMaxBytes =
-    ((kTxnCtlHeaderBytes + kMaxTxnGroupIdBytes + 7) & ~std::size_t{7}) + kMaxTxnOffsets * sizeof(OffsetEntry);
+    ((kTxnCtlHeaderBytes + kMaxTxnGroupIdBytes + 7) & ~std::size_t{7}) + ((kMaxTxnMemberIdBytes + 7) & ~std::size_t{7}) +
+    kMaxTxnOffsets * sizeof(OffsetEntry);
 namespace detail_txnctl {
+constexpr std::size_t align8(std::size_t n) { return (n + 7u) & ~std::size_t{7}; }
+/// Where the entries start for a group id of `g` bytes and a member id of `m` bytes.
+constexpr std::size_t entriesAt(std::size_t g, std::size_t m) { return align8(align8(kTxnCtlHeaderBytes + g) + m); }
 constexpr bool entriesEndWithinMax() {
     for (std::size_t g = 0; g <= kMaxTxnGroupIdBytes; ++g) {
-        if (((kTxnCtlHeaderBytes + g + 7) & ~std::size_t{7}) + kMaxTxnOffsets * sizeof(OffsetEntry) > kTxnCtlMaxBytes) return false;
+        if (entriesAt(g, kMaxTxnMemberIdBytes) + kMaxTxnOffsets * sizeof(OffsetEntry) > kTxnCtlMaxBytes) return false;
     }
     return true;
 }
@@ -513,6 +525,8 @@ struct TxnControl {
     Token            token = 0;
     std::span<const OffsetEntry> offsets{};   ///< SendOffsets (Task 7)
     std::string_view groupId{};
+    int32_t          generationId = -1;       ///< SendOffsets (#125): the member's generation; -1 = no member block
+    std::string_view memberId{};
 };
 
 // ---------------------------------------------------------------------------
@@ -1837,8 +1851,11 @@ private:
     struct OffsetsScratch {
         std::array<OffsetEntry, kMaxTxnOffsets> entries{};
         std::array<char, kMaxTxnGroupIdBytes>   group{};
+        std::array<char, kMaxTxnMemberIdBytes>  member{};       ///< #125
         uint16_t                                n        = 0;
         uint8_t                                 groupLen = 0;
+        uint16_t                                memberLen    = 0;
+        int32_t                                 generationId = -1;   ///< -1: no member block (legacy)
     };
     std::unique_ptr<OffsetsScratch> offsetsScratch_;
     OffsetsOp                       offsetsOp_{OffsetsIdle{}};
