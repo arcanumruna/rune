@@ -4,12 +4,17 @@
 //   BM_WorkerAllowsWrite                   allowsWrite on a resolved WriteGrantSlot (10 000-topic bitmap), random ids
 //   BM_WorkerSlotLookupPlusAllowsWrite     the worker's full per-frame cost: SessionAckSink slot probe + allowsWrite
 //                                          (reported; the probe is the one hash the frame's admission already pays)
+//   BM_WorkerSlotLookupPlusAllowsWritePlusPidOwner   issue #122: the same plus the producer-id owner check (an
+//                                          idempotent frame): ABAB against BM_WorkerSlotLookupPlusAllowsWrite
+//   BM_GatewayAllowsPlusPidOwner           issue #122: PermissionTable::allows + the owner check: ABAB against
+//                                          BM_GatewayPermissionTableAllows
 #include "BenchGate.h"
 
 #include <rune/gateway/ObjectIndex.h>
 #include <rune/gateway/PermissionTable.h>
 #include <rune/node/SessionAckSink.h>
 #include <rune/node/WorkerWriteGrants.h>
+#include <rune/protocol/ProducerIdBinding.h>
 #include <rune/security/Permissions.h>
 
 #include <benchmark/benchmark.h>
@@ -113,5 +118,64 @@ void BM_WorkerSlotLookupPlusAllowsWrite(benchmark::State& state) {
     state.SetItemsProcessed(state.iterations());
 }
 BENCHMARK(BM_WorkerSlotLookupPlusAllowsWrite)->Unit(benchmark::kNanosecond)->MinTime(0.5)->Repetitions(10)->ReportAggregatesOnly(true);
+
+// Issue #122: producer ids of the frames, all issued to principal 7 except one in 16 (another principal's, refused).
+std::vector<int64_t> framePids() {
+    std::mt19937 rng(4242);
+    std::vector<int64_t> pids(kIds);
+    for (auto& p : pids) p = rune::protocol::bindProducerId(static_cast<int64_t>(rng() & 0xFFFF), (rng() & 15) == 0 ? 8 : 7);
+    return pids;
+}
+
+void BM_WorkerSlotLookupPlusAllowsWritePlusPidOwner(benchmark::State& state) {
+    auto sink = std::make_unique<rune::node::SessionAckSink>(rune::node::AeronSessionPubPolicy{nullptr, 0});
+    constexpr int kSessions = 200;
+    for (int64_t sid = 1; sid <= kSessions; ++sid) {
+        (void)sink->announce(sid, "aeron:ipc", 7, 9, false);
+        std::vector<uint64_t> words = makeSlot().bits;
+        (void)sink->installWriteGrants(sid, words, false, 1, /*owner=*/7);
+    }
+    const auto ids = randomTopicIds();
+    const auto pids = framePids();
+    std::vector<int64_t> sids(kIds);
+    std::mt19937 rng(777);
+    for (auto& s : sids) s = 1 + static_cast<int64_t>(rng() % kSessions);
+    std::size_t k = 0;
+    uint64_t allowed = 0;
+    allocsOn();
+    for (auto _ : state) {
+        const std::size_t i = k++ & (kIds - 1);
+        const rune::node::WriteGrantSlot* g = sink->writeGrants(sids[i]);
+        allowed += (g != nullptr && rune::node::allowsWrite(*g, ids[i]) &&
+                    rune::protocol::producerIdUsableBy(pids[i], g->owner)) ? 1u : 0u;
+    }
+    allocsOff(state);
+    benchmark::DoNotOptimize(allowed);
+    state.SetItemsProcessed(state.iterations());
+}
+BENCHMARK(BM_WorkerSlotLookupPlusAllowsWritePlusPidOwner)->Unit(benchmark::kNanosecond)->MinTime(0.5)->Repetitions(10)->ReportAggregatesOnly(true);
+
+void BM_GatewayAllowsPlusPidOwner(benchmark::State& state) {
+    rune::gateway::ObjectIndex idx;
+    for (int32_t i = 0; i < kTopics; ++i) idx.onTopic(i, "t" + std::to_string(i));
+    const std::vector<rune::security::GrantSpec> grants = {
+        {rune::security::Operation::Write, {rune::security::ResourceType::Topic, rune::security::PatternKind::Prefix, "t1"}}};
+    const auto table = rune::gateway::PermissionTable::compile(grants, idx);
+    const uint8_t write = rune::security::opBit(rune::security::Operation::Write);
+    const auto ids = randomTopicIds();
+    const auto pids = framePids();
+    const uint64_t userId = 7;
+    std::size_t k = 0;
+    uint64_t allowed = 0;
+    allocsOn();
+    for (auto _ : state) {
+        const std::size_t i = k++ & (kIds - 1);
+        allowed += (table.allows(ids[i], write) && rune::protocol::producerIdUsableBy(pids[i], userId)) ? 1u : 0u;
+    }
+    allocsOff(state);
+    benchmark::DoNotOptimize(allowed);
+    state.SetItemsProcessed(state.iterations());
+}
+BENCHMARK(BM_GatewayAllowsPlusPidOwner)->Unit(benchmark::kNanosecond)->MinTime(0.5)->Repetitions(10)->ReportAggregatesOnly(true);
 
 }  // namespace
