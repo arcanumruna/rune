@@ -32,6 +32,7 @@
 #include <rune/codec/Descriptor.h>
 #include <rune/codec/Serialize.h>
 #include <rune/protocol/RecordBatch.h>
+#include <rune/protocol/client/Protocol.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/Log.h>
 
@@ -56,6 +57,7 @@ using namespace std::chrono_literals;
 using namespace rune::node::test::catalog_cluster;
 namespace rc = rune::client;
 namespace mx = rune::client::txnmatrix;
+namespace rpc = rune::protocol::client;
 using rune::gen::Position;
 using Clock = std::chrono::steady_clock;
 
@@ -366,6 +368,11 @@ public:
     TxnResult sendOffsets(std::span<const rc::OffsetEntry> o, std::string_view group, std::chrono::seconds b = 60s) {
         const auto t = tok();
         return wait(p_.sendOffsetsToTransaction(o, group, cq_, t), t, b);
+    }
+    /// #125 (KIP-447): the offsets carry the consumer-group member they belong to.
+    TxnResult sendOffsets(std::span<const rc::OffsetEntry> o, const rc::GroupMetadata& g, std::chrono::seconds b = 60s) {
+        const auto t = tok();
+        return wait(p_.sendOffsetsToTransaction(o, g, cq_, t), t, b);
     }
     /// Issue a commit/abort and return its token without waiting (the in-doubt tests).
     rc::Token issueCommit() {
@@ -1259,5 +1266,84 @@ TEST(EosBrokerRegression, TransactionalOffsetsReachTheGroupOnlyOnCommitRegressio
     gc.close();
     pp.close();
     cp->close();
+    cc->close();
+}
+
+// =========================================================================================================
+// 12. Issue #125 (KIP-447) against real brokers: offsets sent with the consumer's GroupMetadata commit for the current
+// member and generation; a stale generation or an unknown member is fenced (abortable, nothing reaches the group).
+// The producer runs on the GroupConsumer's Client (the member is bound to that session).
+// =========================================================================================================
+TEST(EosBrokerRegression, TxnOffsetsCarryingTheMemberAreFencedByGenerationAndMemberRegression) {
+    constexpr int kInput = 200;
+    Env e("eos_kip447");
+    const rc::TopicSpec in = e.define("eos.in", kParts);
+    {
+        auto ci = e.open(e.otherThan(e.ctl), {in});
+        rc::Producer pi = ci->producer(plainConfig());
+        Writer wi(*ci, pi, ci->topic("eos.in"), kParts);
+        Expected sink;
+        for (int i = 0; i < kInput; ++i) (void)wi.issue(mx::Op::TrySendCq, i, sink);
+        wi.expectAcksOk("input");
+        pi.close();
+        ci->close();
+    }
+    struct Range { int64_t first = -1, count = 0; };
+    std::map<int32_t, Range> seen;
+    auto cc = std::make_unique<rc::Client>(e.cfg(e.otherThan(e.ctl), {in}));
+    rc::GroupConfig gcfg;
+    gcfg.autoCommit      = false;
+    gcfg.autoOffsetReset = rc::OffsetReset::Earliest;
+    rc::GroupConsumer gc = cc->subscribeGroup("eos-kip447-g", {"eos.in"}, gcfg);
+    gc.onRecords([&](const rc::RecordSet& rs) {
+        rs.forEachRecord([&](std::string_view, std::string_view, int64_t off, int64_t) {
+            Range& r = seen[rs.partition];
+            if (r.count == 0 || off < r.first) r.first = off;
+            ++r.count;
+        });
+    });
+    cc->connectAndWait(30s);
+    auto total = [&] { int64_t n = 0; for (const auto& [p, r] : seen) n += r.count; return n; };
+    rc::Producer pp = cc->producer(txnConfig("eos-kip447-tx"));   // the consumer's own Client
+    Writer w(*cc, pp, cc->topic("eos.in"), kParts);
+    ASSERT_TRUE(w.until([&] { return total() >= kInput && !gc.groupMetadata().memberId.empty(); }))
+        << "the consumer joined and read the input";
+    ASSERT_TRUE(w.init().ok());
+    const rc::GroupMetadata meta = gc.groupMetadata();
+    ASSERT_EQ(meta.groupId, "eos-kip447-g");
+    ASSERT_GT(meta.generationId, 0);
+
+    // The current member and generation: committed.
+    {
+        w.begin();
+        const std::vector<rc::OffsetEntry> offs{rc::OffsetEntry{in.topicId, 0, 10}};
+        const TxnResult r = w.sendOffsets(offs, meta);
+        ASSERT_TRUE(r.ok()) << r.str();
+        ASSERT_TRUE(w.commit().ok());
+    }
+    // A stale generation and an unknown member: fenced, abortable; the abort ends the transaction cleanly.
+    struct Bad { const char* what; rc::GroupMetadata m; uint16_t code; };
+    rc::GroupMetadata stale = meta;
+    stale.generationId -= 1;
+    rc::GroupMetadata stranger = meta;
+    stranger.memberId = "eos-kip447-g-999-00000000000000000000000000000000";
+    for (const Bad& b : {Bad{"a stale generation", stale, static_cast<uint16_t>(rpc::ErrorCode::IllegalGeneration)},
+                         Bad{"an unknown member", stranger, static_cast<uint16_t>(rpc::ErrorCode::UnknownMember)}}) {
+        w.begin();
+        const std::vector<rc::OffsetEntry> offs{rc::OffsetEntry{in.topicId, 0, 150}};
+        const TxnResult r = w.sendOffsets(offs, b.m);
+        ASSERT_TRUE(r.done) << b.what;
+        EXPECT_EQ(r.status, rc::OpStatus::BrokerError) << b.what << ": " << r.str();
+        EXPECT_EQ(r.errorCode, b.code) << b.what;
+        EXPECT_EQ(pp.state(), rc::TxnState::AbortableError) << b.what;
+        ASSERT_TRUE(w.abort().ok()) << b.what;
+    }
+    // Only the committed transaction's offset reached the group.
+    seen.clear();
+    gc.seekToCommittedAndWait(60s);
+    ASSERT_TRUE(w.until([&] { return seen.count(0) != 0 && seen[0].count > 0; }));
+    EXPECT_EQ(seen[0].first, 10) << "p0 resumes at the committed offset; the fenced ones never landed";
+    gc.close();
+    pp.close();
     cc->close();
 }

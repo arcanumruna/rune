@@ -19,6 +19,8 @@ constexpr int16_t kProducerFenced         = static_cast<int16_t>(rpc::ErrorCode:
 constexpr int16_t kInvalidTxnState        = static_cast<int16_t>(rpc::ErrorCode::InvalidTxnState);
 constexpr int16_t kConcurrentTransactions = static_cast<int16_t>(rpc::ErrorCode::ConcurrentTransactions);
 constexpr int16_t kInvalidRequest         = static_cast<int16_t>(rpc::ErrorCode::InvalidRequest);
+constexpr int16_t kIllegalGeneration      = static_cast<int16_t>(rpc::ErrorCode::IllegalGeneration);
+constexpr int16_t kUnknownMember          = static_cast<int16_t>(rpc::ErrorCode::UnknownMember);
 constexpr int16_t kAuthenticationFailed   = static_cast<int16_t>(rpc::ErrorCode::AuthenticationFailed);  // 44..47
 constexpr int16_t kPasswordChangeRequired = static_cast<int16_t>(rpc::ErrorCode::PasswordChangeRequired);
 }  // namespace
@@ -35,6 +37,9 @@ Verdict CoordinatorLink::classify(ReqKind kind, int16_t ec) noexcept {
     if (ec >= kAuthenticationFailed && ec <= kPasswordChangeRequired) {
         return (kind == ReqKind::InitProducerId || kind == ReqKind::EndTxn) ? Verdict::Fatal : Verdict::Abortable;
     }
+    // #125 (KIP-447): the TxnOffsetCommit's member block was fenced (the group rebalanced / the member is gone):
+    // never retried - the transaction can only abort; the consumer rejoins and re-processes from the committed offsets.
+    if (kind == ReqKind::TxnOffsetCommit && (ec == kIllegalGeneration || ec == kUnknownMember)) return Verdict::Abortable;
     switch (kind) {
     case ReqKind::InitProducerId:
         return Verdict::Fatal;                                         // anything not retriable is fatal

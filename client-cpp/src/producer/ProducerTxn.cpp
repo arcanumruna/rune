@@ -166,11 +166,16 @@ OpResult ProducerImpl::writeTxnControl_(const TxnControl& c, bool overCap) noexc
     putI64(buf + 16, words.b);
     putI64(buf + 24, words.c);
     putU32(buf + 32, static_cast<uint32_t>(c.offsets.size()));
+    putU32(buf + 36, static_cast<uint32_t>(c.generationId));   // #125
+    putU32(buf + 40, static_cast<uint32_t>(c.memberId.size()));
     std::size_t len = kTxnCtlHeaderBytes;
     if (c.kind == TxnControl::Kind::SendOffsets && !overCap) {
         std::memcpy(buf + len, c.groupId.data(), c.groupId.size());
-        const std::size_t at = align8(len + c.groupId.size());
-        std::memset(buf + len + c.groupId.size(), 0, at - (len + c.groupId.size()));
+        const std::size_t mat = align8(len + c.groupId.size());
+        std::memset(buf + len + c.groupId.size(), 0, mat - (len + c.groupId.size()));
+        if (!c.memberId.empty()) std::memcpy(buf + mat, c.memberId.data(), c.memberId.size());
+        const std::size_t at = align8(mat + c.memberId.size());
+        std::memset(buf + mat + c.memberId.size(), 0, at - (mat + c.memberId.size()));
         if (!c.offsets.empty()) std::memcpy(buf + at, c.offsets.data(), c.offsets.size() * sizeof(OffsetEntry));
         len = at + c.offsets.size() * sizeof(OffsetEntry);
     }
@@ -197,7 +202,7 @@ OpResult ProducerImpl::issueTxnControl(const TxnControl& c) noexcept {
     }
     const bool overCap = c.kind == TxnControl::Kind::SendOffsets &&
                          (c.offsets.size() > kMaxTxnOffsets || c.groupId.empty() ||
-                          c.groupId.size() > kMaxTxnGroupIdBytes);
+                          c.groupId.size() > kMaxTxnGroupIdBytes || c.memberId.size() > kMaxTxnMemberIdBytes);
     const TxnGate prev = txnGate_;
     if (ends) txnGate_ = TxnGate::Closed;   // FD2: BEFORE the write, so a produce that follows on this thread is refused
     const OpResult r = writeTxnControl_(c, overCap);
@@ -216,6 +221,8 @@ bool ProducerImpl::decodeTxnControl_(const uint8_t* p, std::size_t len, TxnContr
     out.target = detail::decodeTargetWords(getI64(p + 16), getI64(p + 24));
     out.offsets = {};
     out.groupId = {};
+    out.generationId = -1;
+    out.memberId = {};
     // A CQ target of a ring op is accounted as a producer op (the issuer counted it in producerIssued_): marked,
     // not pinned.  (Direct mode pins in issueTxnControl; the pin hook is not used here.)
     out.target.producerOp = out.kind != TxnControl::Kind::Begin && out.target.handler.fn == nullptr &&
@@ -226,14 +233,18 @@ bool ProducerImpl::decodeTxnControl_(const uint8_t* p, std::size_t len, TxnContr
     if (out.kind != TxnControl::Kind::SendOffsets) return true;
     const uint32_t glen   = getU32(p + 4);
     const uint32_t ocount = getU32(p + 32);
-    if (ocount > kMaxTxnOffsets || glen == 0 || glen > kMaxTxnGroupIdBytes) {
+    const uint32_t mlen   = getU32(p + 40);
+    if (ocount > kMaxTxnOffsets || glen == 0 || glen > kMaxTxnGroupIdBytes || mlen > kMaxTxnMemberIdBytes) {
         return true;   // over-cap: offsets and group id stay empty - applyTxnControl refuses InvalidArgument
     }
-    const std::size_t at = align8(kTxnCtlHeaderBytes + glen);
+    const std::size_t mat = align8(kTxnCtlHeaderBytes + glen);
+    const std::size_t at  = align8(mat + mlen);
     if (len < at + static_cast<std::size_t>(ocount) * sizeof(OffsetEntry) || (reinterpret_cast<uintptr_t>(p) & 7u) != 0) {
         return true;   // truncated (cannot happen: the issuing side wrote it whole): refused like over-cap
     }
     out.groupId = std::string_view(reinterpret_cast<const char*>(p + kTxnCtlHeaderBytes), glen);
+    out.generationId = static_cast<int32_t>(getU32(p + 36));
+    out.memberId = std::string_view(reinterpret_cast<const char*>(p + mat), mlen);
     out.offsets = std::span<const OffsetEntry>(reinterpret_cast<const OffsetEntry*>(p + at), ocount);
     return true;
 }
@@ -1221,15 +1232,20 @@ void ProducerImpl::applySendOffsets_(const TxnControl& c, const TxnOp& op) {
         refuseTxn_(c, OpStatus::InvalidArgument, 0, "sendOffsetsToTransaction: at most 1024 offsets per call");
         return;
     }
-    if (c.groupId.empty() || c.groupId.size() > kMaxTxnGroupIdBytes) {
-        refuseTxn_(c, OpStatus::InvalidArgument, 0, "sendOffsetsToTransaction: at most 1024 offsets and a group id of 1 to 255 bytes");
+    if (c.groupId.empty() || c.groupId.size() > kMaxTxnGroupIdBytes || c.memberId.size() > kMaxTxnMemberIdBytes) {
+        refuseTxn_(c, OpStatus::InvalidArgument, 0,
+                   "sendOffsetsToTransaction: at most 1024 offsets, a group id of 1 to 255 bytes and a member id of at "
+                   "most 512 bytes");
         return;
     }
     OffsetsScratch& sc = *offsetsScratch_;   // allocated at construction of a transactional producer
     std::copy(c.offsets.begin(), c.offsets.end(), sc.entries.begin());
     std::memcpy(sc.group.data(), c.groupId.data(), c.groupId.size());
+    if (!c.memberId.empty()) std::memcpy(sc.member.data(), c.memberId.data(), c.memberId.size());
     sc.n        = static_cast<uint16_t>(c.offsets.size());
     sc.groupLen = static_cast<uint8_t>(c.groupId.size());
+    sc.memberLen    = static_cast<uint16_t>(c.memberId.size());
+    sc.generationId = c.generationId < 0 ? -1 : c.generationId;   // #125: < 0 = no member block (legacy)
     offsetsOp_  = OffsetsAdding{op, nullptr};   // txnStep sends the AddOffsetsToTxn
 }
 
@@ -1237,9 +1253,11 @@ namespace {
 // TxnOffsetCommit::encode's entry layout (TxnMessages.h): topicId(4) partition(4) offset(8) metaLen(2), no metadata.
 // The entries are written by hand (no entry-array scratch needed); the count is the last field of the empty encode.
 constexpr std::size_t kTxnOffsetEntryBytes = 4 + 4 + 8 + 2;
-// A frame holds the header, the ids (a transactional id is at most 255 bytes, Client.cpp) and at least one entry.
-static_assert(24 + 10 + 2 + 255 + 2 + kMaxTxnGroupIdBytes + 2 + kTxnOffsetEntryBytes <= CoordinatorLink::kCoordFrameCap,
-              "a TxnOffsetCommit frame must hold at least one entry");
+// A frame holds the header, the ids (a transactional id is at most 255 bytes, Client.cpp), at least one entry and the
+// #125 member block (generationId 4 + u16 length + the member id).
+static_assert(24 + 10 + 2 + 255 + 2 + kMaxTxnGroupIdBytes + 2 + kTxnOffsetEntryBytes +
+                      rpc::TxnOffsetCommit::kMemberBlockFixed + kMaxTxnMemberIdBytes <= CoordinatorLink::kCoordFrameCap,
+              "a TxnOffsetCommit frame must hold at least one entry and the member block");
 }  // namespace
 
 int ProducerImpl::offsetsStep_(int64_t nowNs) noexcept {
@@ -1299,10 +1317,14 @@ int ProducerImpl::offsetsStep_(int64_t nowNs) noexcept {
         m.transactionalId = txnId;
         m.groupId         = group;
         uint8_t*          f       = s->frame.data();
-        std::size_t       pos     = m.encode(f, {});   // header + ids + count 0
+        std::size_t       pos     = m.encode(f, {});   // header + ids + count 0 (generationId -1: no block yet)
         const std::size_t countAt = pos - 2;
         uint16_t          count   = 0;
-        while (oc->sent < sc.n && pos + kTxnOffsetEntryBytes <= CoordinatorLink::kCoordFrameCap) {
+        // #125: every request of the split carries the member block after its entries (room reserved for it).
+        m.generationId = sc.generationId;
+        m.memberId     = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(sc.member.data()), sc.memberLen);
+        const std::size_t block = m.memberBlockSize();
+        while (oc->sent < sc.n && pos + kTxnOffsetEntryBytes + block <= CoordinatorLink::kCoordFrameCap) {
             const OffsetEntry& e = sc.entries[oc->sent++];
             rpc::detail::putLE32(f, static_cast<int>(pos), e.topicId);
             rpc::detail::putLE32(f, static_cast<int>(pos) + 4, e.partition);
@@ -1313,6 +1335,7 @@ int ProducerImpl::offsetsStep_(int64_t nowNs) noexcept {
         }
         assert(count > 0);   // the frame always has room for an entry (static_assert above)
         rpc::detail::putLE16(f + countAt, 0, count);
+        pos += m.encodeMemberBlock(f, pos);
         s->frameLen = static_cast<uint16_t>(pos);
         coord_->submit(*s);
         oc->slots[oc->outstanding++] = s;

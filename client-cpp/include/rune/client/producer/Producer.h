@@ -54,6 +54,7 @@
 #include <rune/client/Key.h>
 #include <rune/client/TopicHandle.h>
 #include <rune/client/producer/BatchBuilder.h>
+#include <rune/client/group/GroupMetadata.h>
 
 #include <chrono>
 #include <cstddef>
@@ -808,6 +809,16 @@ public:
     /// ring) is a synchronous OpResult::InvalidArgument with no completion.
     OpResult sendOffsetsToTransaction(std::span<const OffsetEntry> offsets, std::string_view groupId,
                                       const CompletionTarget& target, Token token);
+    /// Issue #125 (KIP-447, needs a broker that understands client version 10 to be enforced; an older broker
+    /// ignores the member and behaves like the groupId form): the offsets carry the consumer-group member they belong
+    /// to (GroupConsumer::groupMetadata()), and the coordinator fences them like an OffsetCommit.  A member of an
+    /// older generation or one it does not know - including one joined on ANOTHER Client (the member is bound to its
+    /// session: run the producer on the GroupConsumer's Client) - completes BrokerError IllegalGeneration (15) /
+    /// UnknownMember (12) and the transaction is AbortableError: abort it, let the consumer rejoin, re-process from
+    /// the committed offsets.  generationId < 0 (not joined) sends no member (the groupId form).  A member id longer
+    /// than kMaxGroupMemberIdBytes completes InvalidArgument.  Otherwise exactly the groupId form.
+    OpResult sendOffsetsToTransaction(std::span<const OffsetEntry> offsets, const GroupMetadata& group,
+                                      const CompletionTarget& target, Token token);
     OpResult commitTransaction(const CompletionTarget& target, Token token);
     OpResult abortTransaction(const CompletionTarget& target, Token token);
     /// Token form of flush(); the existing void flush() stays.
@@ -816,6 +827,8 @@ public:
     static constexpr std::chrono::nanoseconds kDefaultTxnWait = std::chrono::seconds(60);
     void initTransactionsAndWait(std::chrono::nanoseconds timeout = kDefaultTxnWait);
     void sendOffsetsToTransactionAndWait(std::span<const OffsetEntry> offsets, std::string_view groupId,
+                                         std::chrono::nanoseconds timeout = kDefaultTxnWait);
+    void sendOffsetsToTransactionAndWait(std::span<const OffsetEntry> offsets, const GroupMetadata& group,
                                          std::chrono::nanoseconds timeout = kDefaultTxnWait);
     void commitTransactionAndWait(std::chrono::nanoseconds timeout = kDefaultTxnWait);
     void abortTransactionAndWait(std::chrono::nanoseconds timeout = kDefaultTxnWait);
@@ -914,10 +927,12 @@ public:
 private:
     /// Phase 2b F Task 8: issue one transaction control op (resolves and reserves the completion target).
     OpResult issueTxn_(std::uint8_t kind, const CompletionTarget& target, Token token,
-                       std::span<const OffsetEntry> offsets, std::string_view groupId);
+                       std::span<const OffsetEntry> offsets, std::string_view groupId,
+                       int32_t generationId = -1, std::string_view memberId = {});
     /// The *AndWait body: issue + wait + map the completion to an exception.
     void txnAndWait_(const char* what, std::chrono::nanoseconds timeout, std::uint8_t kind,
-                     std::span<const OffsetEntry> offsets, std::string_view groupId);
+                     std::span<const OffsetEntry> offsets, std::string_view groupId,
+                     int32_t generationId = -1, std::string_view memberId = {});
     /// T15b M3: the one send body; `part` computed once by the caller.
     [[nodiscard]] SendResult trySendPart_(TopicHandle topic, int32_t part, const Key& key,
                                           std::span<const uint8_t> value) noexcept;

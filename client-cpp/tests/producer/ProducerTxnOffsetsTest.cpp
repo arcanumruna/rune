@@ -1062,3 +1062,120 @@ TEST(ProducerTxnOffsetsRegression, TimedOutAddOffsetsAbortsPossiblyStartedTxnReg
     EXPECT_EQ(r.d(abort).status, OpStatus::Ok);
     EXPECT_EQ(r.impl->txnStateDuty(), TxnState::Ready) << "19 here means nothing was open: not fatal";
 }
+
+// ===========================================================================
+// Issue #125 (KIP-447): sendOffsetsToTransaction(offsets, GroupMetadata) - every TxnOffsetCommit request of the
+// split carries the member block; the legacy form carries none; a fenced member is abortable, never retried.
+// ===========================================================================
+namespace {
+rc::OpResult issueWithMember(Rig& r, Token& token, std::span<const OffsetEntry> offs, std::string_view group,
+                             int32_t generation, std::string_view member) {
+    TxnControl c;
+    c.kind           = TxnControl::Kind::SendOffsets;
+    c.target.handler = rc::CompletionHandler{&Done::on, &r.done[++r.next]};
+    c.token          = r.next;
+    c.offsets        = offs;
+    c.groupId        = group;
+    c.generationId   = generation;
+    c.memberId       = member;
+    token            = r.next;
+    return r.impl->issueTxnControl(c);
+}
+}  // namespace
+
+TEST(ProducerTxnOffsetsRegression, EveryRequestOfASplitCarriesTheMemberBlockThroughTheRingRegression) {
+    Rig r(txnCfg(), 1 << 20);
+    ringReady(r);
+    const auto offs = offsetsOf(1024);
+    const std::string member = "grp-m-7-0123456789abcdef0123456789abcdef";
+    Token t = 0;
+    ASSERT_EQ(issueWithMember(r, t, offs, "grp-m", 7, member), rc::OpResult::Accepted);
+    r.tick();
+    r.tick();
+    r.answerFrame(r.lastOf(rpc::AddOffsetsToTxn::TEMPLATE_ID), rp::ReqKind::AddOffsets, 0);
+    r.tick();
+    const auto commits = r.cap.of(rpc::TxnOffsetCommit::TEMPLATE_ID);
+    ASSERT_GE(commits.size(), 2u);
+    std::size_t total = 0;
+    for (const auto& f : commits) {
+        EXPECT_LE(f.len, rp::CoordinatorLink::kCoordFrameCap);
+        const auto m = rpc::TxnOffsetCommit::decode(r.cap.data(f), f.len);
+        ASSERT_TRUE(m);
+        EXPECT_TRUE(m->hasMemberBlock) << "a request of the split went out without the member";
+        EXPECT_EQ(m->generationId, 7);
+        EXPECT_EQ(std::string(m->memberId.begin(), m->memberId.end()), member);
+        for (const auto& e : m->entries) {
+            ASSERT_LT(total, offs.size());
+            EXPECT_EQ(e.offset, offs[total].offset);
+            ++total;
+        }
+    }
+    EXPECT_EQ(total, offs.size());
+    for (const auto& f : commits) r.answerFrame(f, rp::ReqKind::TxnOffsetCommit, 0);
+    ASSERT_EQ(r.d(t).times, 1);
+    EXPECT_EQ(r.d(t).status, OpStatus::Ok);
+}
+
+TEST(ProducerTxnOffsetsRegression, TheGroupIdFormAndANegativeGenerationSendNoMemberBlockRegression) {
+    for (const int32_t generation : {-1, -5}) {
+        Rig r(txnCfg(), 1 << 20);
+        ringReady(r);
+        Token t = 0;
+        ASSERT_EQ(issueWithMember(r, t, offsetsOf(2), "grp-l", generation, "ignored"), rc::OpResult::Accepted);
+        r.tick();
+        r.tick();
+        r.answerFrame(r.lastOf(rpc::AddOffsetsToTxn::TEMPLATE_ID), rp::ReqKind::AddOffsets, 0);
+        r.tick();
+        const auto f = r.lastOf(rpc::TxnOffsetCommit::TEMPLATE_ID);
+        const auto m = rpc::TxnOffsetCommit::decode(r.cap.data(f), f.len);
+        ASSERT_TRUE(m);
+        EXPECT_FALSE(m->hasMemberBlock) << "generation " << generation;
+        EXPECT_EQ(m->entries.size(), 2u);
+    }
+}
+
+TEST(ProducerTxnOffsetsRegression, AFencedMemberIsAbortableAndNeverRetriedRegression) {
+    for (const rpc::ErrorCode code : {rpc::ErrorCode::IllegalGeneration, rpc::ErrorCode::UnknownMember}) {
+        Rig r(txnCfg(), 1 << 20);
+        ringReady(r);
+        Token t = 0;
+        ASSERT_EQ(issueWithMember(r, t, offsetsOf(2), "grp-f", 3, "m"), rc::OpResult::Accepted);
+        r.tick();
+        r.tick();
+        r.answerFrame(r.lastOf(rpc::AddOffsetsToTxn::TEMPLATE_ID), rp::ReqKind::AddOffsets, 0);
+        r.tick();
+        r.answerFrame(r.lastOf(rpc::TxnOffsetCommit::TEMPLATE_ID), rp::ReqKind::TxnOffsetCommit, ec(code));
+        ASSERT_EQ(r.d(t).times, 1);
+        EXPECT_EQ(r.d(t).status, OpStatus::BrokerError);
+        EXPECT_EQ(r.d(t).code, uec(code));
+        EXPECT_EQ(r.impl->txnStateDuty(), TxnState::AbortableError) << "the transaction must abort (the app rejoins)";
+        for (int i = 0; i < 32; ++i) r.tick(10 * kMs);
+        EXPECT_EQ(r.cap.of(rpc::TxnOffsetCommit::TEMPLATE_ID).size(), 1u) << "a fenced member was re-sent";
+        EXPECT_EQ(rp::CoordinatorLink::classify(rp::ReqKind::TxnOffsetCommit, ec(code)), rp::Verdict::Abortable);
+    }
+}
+
+TEST(ProducerTxnOffsetsRegression, AMemberIdOverTheCapCompletesInvalidArgumentRegression) {
+    Rig r(txnCfg(), 1 << 20);
+    ringReady(r);
+    const std::size_t framesBefore = r.cap.frames.size();
+    const std::string longMember(rp::kMaxTxnMemberIdBytes + 1, 'm');
+    Token t = 0;
+    ASSERT_EQ(issueWithMember(r, t, offsetsOf(2), "grp", 1, longMember), rc::OpResult::Accepted);
+    r.tick();
+    ASSERT_EQ(r.d(t).times, 1);
+    EXPECT_EQ(r.d(t).status, OpStatus::InvalidArgument);
+    EXPECT_EQ(r.cap.frames.size(), framesBefore);
+    // At the cap exactly: accepted and carried whole.
+    const std::string maxMember(rp::kMaxTxnMemberIdBytes, 'x');
+    Token ok = 0;
+    ASSERT_EQ(issueWithMember(r, ok, offsetsOf(1), "grp", 1, maxMember), rc::OpResult::Accepted);
+    r.tick();
+    r.tick();
+    r.answerFrame(r.lastOf(rpc::AddOffsetsToTxn::TEMPLATE_ID), rp::ReqKind::AddOffsets, 0);
+    r.tick();
+    const auto f = r.lastOf(rpc::TxnOffsetCommit::TEMPLATE_ID);
+    const auto m = rpc::TxnOffsetCommit::decode(r.cap.data(f), f.len);
+    ASSERT_TRUE(m && m->hasMemberBlock);
+    EXPECT_EQ(m->memberId.size(), rp::kMaxTxnMemberIdBytes);
+}
