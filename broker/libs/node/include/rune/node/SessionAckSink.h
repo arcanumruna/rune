@@ -666,7 +666,7 @@ public:
         g.bits.swap(words);
         g.grantAll = grantAll;
         g.epoch    = epoch;
-        g.owner    = owner;
+        g.ownerTag = rune::protocol::pidOwnerTag(owner);
         return true;
     }
     /// Test seam: slots examined by the last find_ of `sessionId` (probe chain length).
@@ -702,7 +702,7 @@ private:
         }
         return kNone;
     }
-    static void resetGrants_(WriteGrantSlot& g) noexcept { g.bits.clear(); g.grantAll = false; g.epoch = 0; g.owner = 0; }   // capacity persists
+    static void resetGrants_(WriteGrantSlot& g) noexcept { g.bits.clear(); g.grantAll = false; g.epoch = 0; g.ownerTag = 0; }   // capacity persists
     std::size_t insert_(int64_t sid) noexcept {
         if (count_ == kMaxSessions - 1) return kNone;               // one empty slot ends every probe
         std::size_t i = hash_(sid);

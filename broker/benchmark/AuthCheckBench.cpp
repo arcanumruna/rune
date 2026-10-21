@@ -4,10 +4,9 @@
 //   BM_WorkerAllowsWrite                   allowsWrite on a resolved WriteGrantSlot (10 000-topic bitmap), random ids
 //   BM_WorkerSlotLookupPlusAllowsWrite     the worker's full per-frame cost: SessionAckSink slot probe + allowsWrite
 //                                          (reported; the probe is the one hash the frame's admission already pays)
-//   BM_WorkerSlotLookupPlusAllowsWritePlusPidOwner   issue #122: the same plus the producer-id owner check (an
-//                                          idempotent frame): ABAB against BM_WorkerSlotLookupPlusAllowsWrite
-//   BM_GatewayAllowsPlusPidOwner           issue #122: PermissionTable::allows + the owner check: ABAB against
-//                                          BM_GatewayPermissionTableAllows
+//   BM_WorkerFrameCheckPidOwner/0|1        issue #122: the worker's per-frame check (slot probe + WRITE bit) without /
+//                                          with the producer-id owner check, over the same frame records (A/B)
+//   BM_GatewayFrameCheckPidOwner/0|1       the same at the gateway (PermissionTable::allows without / with the check)
 #include "BenchGate.h"
 
 #include <rune/gateway/ObjectIndex.h>
@@ -119,15 +118,24 @@ void BM_WorkerSlotLookupPlusAllowsWrite(benchmark::State& state) {
 }
 BENCHMARK(BM_WorkerSlotLookupPlusAllowsWrite)->Unit(benchmark::kNanosecond)->MinTime(0.5)->Repetitions(10)->ReportAggregatesOnly(true);
 
-// Issue #122: producer ids of the frames, all issued to principal 7 except one in 16 (another principal's, refused).
-std::vector<int64_t> framePids() {
+// Issue #122: the per-frame cost of the producer-id owner check, as a fair A/B in ONE binary: the same frame records
+// (session, topic and producer id side by side, as a frame carries them; every id the session's own - a refusal is
+// cold), Arg 0 = the check before #122, Arg 1 = plus the owner check.
+struct Frame { int64_t sid; int64_t pid; int32_t topic; };
+std::vector<Frame> frames(int sessions) {
     std::mt19937 rng(4242);
-    std::vector<int64_t> pids(kIds);
-    for (auto& p : pids) p = rune::protocol::bindProducerId(static_cast<int64_t>(rng() & 0xFFFF), (rng() & 15) == 0 ? 8 : 7);
-    return pids;
+    std::uniform_int_distribution<int32_t> d(0, kTopics - 1);
+    std::vector<Frame> f(kIds);
+    for (auto& x : f) {
+        x.sid = 1 + static_cast<int64_t>(rng() % static_cast<uint32_t>(sessions));
+        x.pid = rune::protocol::bindProducerId(static_cast<int64_t>(rng() & 0xFFFF), /*owner=*/7);
+        x.topic = d(rng);
+    }
+    return f;
 }
 
-void BM_WorkerSlotLookupPlusAllowsWritePlusPidOwner(benchmark::State& state) {
+void BM_WorkerFrameCheckPidOwner(benchmark::State& state) {
+    const bool pidCheck = state.range(0) != 0;
     auto sink = std::make_unique<rune::node::SessionAckSink>(rune::node::AeronSessionPubPolicy{nullptr, 0});
     constexpr int kSessions = 200;
     for (int64_t sid = 1; sid <= kSessions; ++sid) {
@@ -135,47 +143,46 @@ void BM_WorkerSlotLookupPlusAllowsWritePlusPidOwner(benchmark::State& state) {
         std::vector<uint64_t> words = makeSlot().bits;
         (void)sink->installWriteGrants(sid, words, false, 1, /*owner=*/7);
     }
-    const auto ids = randomTopicIds();
-    const auto pids = framePids();
-    std::vector<int64_t> sids(kIds);
-    std::mt19937 rng(777);
-    for (auto& s : sids) s = 1 + static_cast<int64_t>(rng() % kSessions);
+    const auto fs = frames(kSessions);
     std::size_t k = 0;
     uint64_t allowed = 0;
     allocsOn();
     for (auto _ : state) {
-        const std::size_t i = k++ & (kIds - 1);
-        const rune::node::WriteGrantSlot* g = sink->writeGrants(sids[i]);
-        allowed += (g != nullptr && rune::node::allowsWrite(*g, ids[i]) &&
-                    rune::protocol::producerIdUsableBy(pids[i], g->owner)) ? 1u : 0u;
+        const Frame& f = fs[k++ & (kIds - 1)];
+        const rune::node::WriteGrantSlot* g = sink->writeGrants(f.sid);
+        bool ok = g != nullptr && rune::node::allowsWrite(*g, f.topic);
+        if (pidCheck) ok = ok & (g == nullptr || rune::protocol::producerIdUsableByTag(f.pid, g->ownerTag));
+        allowed += ok ? 1u : 0u;
     }
     allocsOff(state);
     benchmark::DoNotOptimize(allowed);
     state.SetItemsProcessed(state.iterations());
 }
-BENCHMARK(BM_WorkerSlotLookupPlusAllowsWritePlusPidOwner)->Unit(benchmark::kNanosecond)->MinTime(0.5)->Repetitions(10)->ReportAggregatesOnly(true);
+BENCHMARK(BM_WorkerFrameCheckPidOwner)->Arg(0)->Arg(1)->Unit(benchmark::kNanosecond)->MinTime(0.5)->Repetitions(10)->ReportAggregatesOnly(true);
 
-void BM_GatewayAllowsPlusPidOwner(benchmark::State& state) {
+void BM_GatewayFrameCheckPidOwner(benchmark::State& state) {
+    const bool pidCheck = state.range(0) != 0;
     rune::gateway::ObjectIndex idx;
     for (int32_t i = 0; i < kTopics; ++i) idx.onTopic(i, "t" + std::to_string(i));
     const std::vector<rune::security::GrantSpec> grants = {
         {rune::security::Operation::Write, {rune::security::ResourceType::Topic, rune::security::PatternKind::Prefix, "t1"}}};
     const auto table = rune::gateway::PermissionTable::compile(grants, idx);
     const uint8_t write = rune::security::opBit(rune::security::Operation::Write);
-    const auto ids = randomTopicIds();
-    const auto pids = framePids();
+    const auto fs = frames(1);
     const uint64_t userId = 7;
     std::size_t k = 0;
     uint64_t allowed = 0;
     allocsOn();
     for (auto _ : state) {
-        const std::size_t i = k++ & (kIds - 1);
-        allowed += (table.allows(ids[i], write) && rune::protocol::producerIdUsableBy(pids[i], userId)) ? 1u : 0u;
+        const Frame& f = fs[k++ & (kIds - 1)];
+        bool ok = table.allows(f.topic, write);
+        if (pidCheck) ok = ok & rune::protocol::producerIdUsableBy(f.pid, userId);
+        allowed += ok ? 1u : 0u;
     }
     allocsOff(state);
     benchmark::DoNotOptimize(allowed);
     state.SetItemsProcessed(state.iterations());
 }
-BENCHMARK(BM_GatewayAllowsPlusPidOwner)->Unit(benchmark::kNanosecond)->MinTime(0.5)->Repetitions(10)->ReportAggregatesOnly(true);
+BENCHMARK(BM_GatewayFrameCheckPidOwner)->Arg(0)->Arg(1)->Unit(benchmark::kNanosecond)->MinTime(0.5)->Repetitions(10)->ReportAggregatesOnly(true);
 
 }  // namespace

@@ -7166,7 +7166,7 @@ private:
             // Issue #122: a producer id is honoured only for the principal it was issued to (its owner tag; the
             // principal is shipped with the grants) - one mask and one compare on the slot just loaded, refused
             // whatever the producer's state (nothing to probe).
-            if (!rune::protocol::producerIdUsableBy(msg.producerId, grants->owner)) [[unlikely]] {
+            if (!rune::protocol::producerIdUsableByTag(msg.producerId, grants->ownerTag)) [[unlikely]] {
                 if (openSeq != 0) [[unlikely]] commitProduceSeq(openCtx, openSeq);   // consumed (answered)
                 return refuseNotAuthorized_(msg, directAck);
             }

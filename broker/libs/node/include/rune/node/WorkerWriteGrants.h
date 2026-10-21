@@ -14,13 +14,16 @@
 #include <variant>
 #include <vector>
 
+#include <rune/protocol/ProducerIdBinding.h>
+
 namespace rune::node {
 
 struct WriteGrantSlot {
     std::vector<uint64_t> bits;      ///< bit (id & 63) of word (id >> 6); capacity persists
     bool                  grantAll = false;
+    uint32_t              ownerTag = 0;   ///< issue #122: pidOwnerTag(the session's principal) - next to grantAll, so
+                                          ///< the per-frame check reads no other cache line than allowsWrite
     uint64_t              epoch    = 0;   ///< the shipped epoch these bits belong to
-    uint64_t              owner    = 0;   ///< issue #122: the session's principal (producer ids must carry its tag)
 };
 
 /// The hot-path check.

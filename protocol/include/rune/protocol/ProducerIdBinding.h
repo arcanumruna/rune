@@ -61,15 +61,23 @@ inline constexpr int64_t kMaxPidCounter  = (int64_t{1} << (62 - kPidOwnerBits)) 
     return isBoundProducerId(pid) && (pid & kPidOwnerMask) == static_cast<int64_t>(pidOwnerTag(principal));
 }
 
-/// THE request check: may `principal` name `pid`?  A bound id only for its owner; a legacy id (version skew) and
-/// "no producer id" (negative) as before.
+/// THE request check against a precomputed `tag` (pidOwnerTag of the session's principal): a bound id only for its
+/// owner; a legacy id (version skew) and "no producer id" (negative) as before.  Branch-free: three ALU ops.
+[[nodiscard]] constexpr bool producerIdUsableByTag(int64_t pid, uint32_t tag) noexcept {
+    const bool bound = (pid & (kBoundPidFlag | INT64_MIN)) == kBoundPidFlag;   // bit 62 set, sign clear
+    return !bound | ((pid & kPidOwnerMask) == static_cast<int64_t>(tag));
+}
+
+/// THE request check: may `principal` name `pid`?
 [[nodiscard]] constexpr bool producerIdUsableBy(int64_t pid, uint64_t principal) noexcept {
-    return !isBoundProducerId(pid) || (pid & kPidOwnerMask) == static_cast<int64_t>(pidOwnerTag(principal));
+    return producerIdUsableByTag(pid, pidOwnerTag(principal));
 }
 
 static_assert(bindProducerId(kMaxPidCounter, uint64_t{1} << 40) > 0, "a bound id is never negative");
 static_assert(producerIdCounter(bindProducerId(12345, 7)) == 12345);
 static_assert(producerIdOwnedBy(bindProducerId(1, 7), 7) && !producerIdOwnedBy(bindProducerId(1, 7), 8));
 static_assert(producerIdUsableBy(42, 8) && producerIdUsableBy(-1, 8), "legacy and absent ids are not refused");
+static_assert(producerIdUsableBy(-1, (uint64_t{1} << 24) - 1) && producerIdUsableBy(INT64_MIN | kBoundPidFlag, 3),
+              "a negative id is never a bound one, whatever its bits");
 
 } // namespace rune::protocol
