@@ -40,7 +40,6 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
-#include <array>
 #include <chrono>
 #include <cstdint>
 #include <deque>
@@ -54,7 +53,6 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
-#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -324,48 +322,13 @@ void pumpFor(const Clients& cs, std::chrono::milliseconds d) {
 // The cluster: OneBroker (shard runtime) or ThreeNodes.
 // ---------------------------------------------------------------------------------------------------------
 
-int32_t leaderOn(rune::node::BrokerNode& n, int32_t topicId, int32_t partition) {
-    return n.onControlThreadForTest([&n, topicId, partition]() -> int32_t {
-        const auto* ms = n.metadataServiceForTest();
-        if (ms == nullptr) return -1;
-        const auto* pa = ms->assignment(topicId, partition);
-        return pa != nullptr ? pa->leaderNode : -1;
-    });
-}
-
-bool awaitLeaders(ThreeNodes& c, int32_t topicId, int32_t parts, std::vector<int32_t>& leaders, std::chrono::milliseconds within) {
-    for (const auto deadline = Clock::now() + within; Clock::now() < deadline; std::this_thread::yield()) {
-        leaders.assign(static_cast<std::size_t>(parts), -1);
-        bool ok = true;
-        const auto running = c.runningNodes();
-        for (int32_t p = 0; p < parts && ok; ++p) {
-            for (int id : running) {
-                const int32_t l = leaderOn(c.node(id), topicId, p);
-                if (l <= 0 || std::find(running.begin(), running.end(), l) == running.end()) { ok = false; break; }
-                if (leaders[static_cast<std::size_t>(p)] == -1) leaders[static_cast<std::size_t>(p)] = l;
-                else if (leaders[static_cast<std::size_t>(p)] != l) { ok = false; break; }
-            }
-        }
-        if (ok) return true;
-    }
-    return false;
-}
-
-int32_t awaitController(ThreeNodes& c) {
-    int32_t ctl = -1;
-    for (const auto deadline = Clock::now() + 30s; Clock::now() < deadline && ctl < 0; std::this_thread::yield())
-        for (rune::node::BrokerNode* n : c.live())
-            if (n->isLeader()) ctl = n->nodeIdForTest();
-    return ctl;
-}
-
 struct Cluster {
     std::unique_ptr<rune::node::test::OneBroker> one;
     std::unique_ptr<ThreeNodes>                  trio;
     int32_t                                      ctl = -1;
     std::unique_ptr<TmpDir>                      scratch;
     std::unique_ptr<rune::node::test::ShardTestClient> oc;   // OffsetFetch probe (solo only)
-    int64_t                                      ocSid = -1;
+    std::map<int, int64_t>                       ocSids;   // node id -> the probe's session on it
 
     static Cluster solo(const std::string& tag, std::function<void(rune::node::NodeConfig&)> tweak = {},
                         rune::node::test::OneBroker::Runtime rt = rune::node::test::OneBroker::Runtime::Shard) {
@@ -376,7 +339,8 @@ struct Cluster {
     }
     static Cluster three(const std::string& tag) {
         Cluster c;
-        c.trio = std::make_unique<ThreeNodes>(ThreeNodes::start(tag));
+        c.trio    = std::make_unique<ThreeNodes>(ThreeNodes::start(tag));
+        c.scratch = std::make_unique<TmpDir>(tag + "_scratch");
         if (!c.trio->awaitCatalogLeader(30s)) throw std::runtime_error("no catalog leader");
         c.ctl = awaitController(*c.trio);
         if (c.ctl <= 0) throw std::runtime_error("no controller");
@@ -447,26 +411,33 @@ struct Cluster {
         return v;
     }
 
-    /// The group's committed offsets (one OffsetFetch per partition, the single broker is the coordinator).
+    /// The group's committed offsets: one OffsetFetch per partition, asked of every running broker until the
+    /// coordinator answers (the others say NotCoordinator).  -2: nobody answered yet.
     std::vector<int64_t> committed(const std::string& group, int32_t topicId) {
-        const std::string channel = one->clientChannel();
-        const int32_t     stream  = rune::node::test::catalog_cluster::kClientStream;
+        const int32_t stream = rune::node::test::catalog_cluster::kClientStream;
+        std::vector<std::pair<std::string, int>> nodes;   // channel, node id
+        if (one) nodes.emplace_back(one->clientChannel(), 0);
+        else for (int id : trio->runningNodes()) nodes.emplace_back(trio->clientChannel(id), id);
         if (!oc) {
             oc = std::make_unique<rune::node::test::ShardTestClient>(scratch->path / "oc");
             oc->setClientVersion(rune::protocol::client::kClientVersion);
-            ocSid = oc->connect(channel, stream);
         }
-        std::vector<int64_t> out;
-        for (int32_t p = 0; p < kParts; ++p) {
-            std::optional<std::pair<int64_t, int16_t>> r;
-            if (ocSid > 0) r = oc->offsetFetch(channel, stream, ocSid, group, topicId, p);
-            out.push_back(r && r->second == 0 ? r->first : -2);
+        std::vector<int64_t> out(kParts, -2);
+        for (const auto& [channel, id] : nodes) {
+            auto it = ocSids.find(id);
+            if (it == ocSids.end()) it = ocSids.emplace(id, oc->connect(channel, stream)).first;
+            if (it->second <= 0) { ocSids.erase(it); continue; }
+            for (int32_t p = 0; p < kParts; ++p) {
+                if (out[static_cast<std::size_t>(p)] != -2) continue;
+                const auto r = oc->offsetFetch(channel, stream, it->second, group, topicId, p);
+                if (r && r->second == 0) out[static_cast<std::size_t>(p)] = r->first;
+            }
         }
         return out;
     }
     void restart() {
         oc.reset();
-        ocSid = -1;
+        ocSids.clear();
         one->restart();
     }
 };
@@ -555,6 +526,7 @@ struct Reader {
             for (const HandleSpec& h : specs) live.push_back(&(*set)[h.part]);
             return;
         }
+        // (A SubscriptionSet takes one From for all partitions, so a resume subscribes per partition.)
         for (std::size_t i = 0; i < specs.size(); ++i) {
             const HandleSpec& h = specs[i];
             Check* chk = &checks[h.check];
@@ -691,7 +663,7 @@ void awaitEnds(Cluster& cl, Reader& rd, const Clients& cs, const char* what) {
     std::vector<int64_t> last;
     const bool ok = pumpUntil(cs, [&] {
         if (rd.anyFinished()) return true;
-        if (rd.isGroup()) return true;   // a group's progress is the commit (awaitGroupCommitted)
+        if (rd.isGroup()) return true;   // a group's progress is the commit (awaitGroupCommitted, below)
         const auto pos = rd.positions();
         last = pos;
         for (std::size_t i = 0; i < pos.size(); ++i)
@@ -774,7 +746,8 @@ void runCell(const CellParam& cp, rc::Persistence persistence = rc::Persistence:
         std::vector<int32_t> leaders;
         ASSERT_TRUE(awaitLeaders(*cl.trio, topic.topicId, kParts, leaders, 30s));
         // Crash the leader of partition 0 unless it is the controller / group coordinator; seed on the controller.
-        crashed = leaders[0] != cl.ctl ? leaders[0] : (leaders[1] != cl.ctl ? leaders[1] : leaders[0]);
+        crashed = leaders[0] != cl.ctl ? leaders[0] : (leaders[1] != cl.ctl ? leaders[1] : leaders[2]);
+        ASSERT_NE(crashed, cl.ctl) << "every partition is led by the controller; the coordinator must survive";
         seed    = cl.ctl != crashed ? cl.ctl : cl.trio->runningNodes().front() == crashed ? cl.trio->runningNodes().back() : cl.trio->runningNodes().front();
     }
 
@@ -807,7 +780,7 @@ void runCell(const CellParam& cp, rc::Persistence persistence = rc::Persistence:
         ASSERT_TRUE(pumpUntil(cs, [&] { return rd.anyFinished() || rd.covers(upTo); })) << what << ": the expected set never arrived";
         ASSERT_FALSE(rd.anyFinished()) << what << ": a subscription ended on its own";
         awaitEnds(cl, rd, cs, what);
-        if (rd.isGroup() && cl.one) EXPECT_TRUE(awaitGroupCommitted(cl, rd, cs)) << what << ": the group's commit never reached the partition ends";
+        if (rd.isGroup()) EXPECT_TRUE(awaitGroupCommitted(cl, rd, cs)) << what << ": the group's commit never reached the partition ends";
         pumpFor(cs, 300ms);   // anything stray (a duplicate, a late foreign record) shows up now
         rd.verifyExact(upTo);
     };
@@ -995,7 +968,7 @@ TEST(FilterBrokerRegression, SchemaMismatchRefusedRegression) {
     expectAdmitted(*ok, "a valid filter after the refusals");
 }
 
-/// `n` records of the model fed to the topic; the checks below read them back.
+/// The seeded model the checks below feed to the topic and read back.
 struct Stream {
     std::vector<Ev> model = makeModel(0xfeed, Cuts{});
 };
@@ -1100,7 +1073,7 @@ TEST(FilterBrokerRegression, GroupFilterMismatchRefusedRegression) {
     Cluster cl = Cluster::solo("fb_e10");
     const rc::TopicSpec t = cl.definePlayerEvent();
     Stream st;
-    Errors errsA, errsB;
+    Errors errsB;
     auto a = cl.open({t}, 0, {});
     Feeder f(*a, a->topic(kTopic), st.model);
     f.feed(0, 1000);
@@ -1110,6 +1083,9 @@ TEST(FilterBrokerRegression, GroupFilterMismatchRefusedRegression) {
     auto ca = std::make_unique<rc::Client>(cl.cfg({t}));
     first.joinGroup(*ca);
     ca->connectAndWait(30s);
+
+    // The first member is in (it consumes the first half) before B arrives, so it is the one that fixed the filter.
+    ASSERT_TRUE(pumpUntil({a.get(), ca.get()}, [&] { return first.covers(1000); })) << "the first member never consumed";
 
     // B: the same group, a different world.
     Reader second(Selection::Group, fm::Op::Eq, st.model, "g_e10");

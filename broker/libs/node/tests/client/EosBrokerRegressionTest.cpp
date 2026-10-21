@@ -73,43 +73,6 @@ constexpr mx::Op kDataOps[] = {mx::Op::Send,       mx::Op::SendTo,     mx::Op::T
 // Cluster plumbing (as ClientFailoverBrokerRegressionTest's, with the partition count a parameter).
 // ---------------------------------------------------------------------------------------------------------
 
-int32_t leaderOn(rune::node::BrokerNode& n, int32_t topicId, int32_t partition) {
-    return n.onControlThreadForTest([&n, topicId, partition]() -> int32_t {
-        const auto* ms = n.metadataServiceForTest();
-        if (ms == nullptr) return -1;
-        const auto* pa = ms->assignment(topicId, partition);
-        return pa != nullptr ? pa->leaderNode : -1;
-    });
-}
-
-/// Every running broker agrees on one live leader for every partition of `topicId` (bounded, no sleep).
-bool awaitLeaders(ThreeNodes& c, int32_t topicId, int32_t parts, std::vector<int32_t>& leaders,
-                  std::chrono::milliseconds within) {
-    for (const auto deadline = Clock::now() + within; Clock::now() < deadline; std::this_thread::yield()) {
-        leaders.assign(static_cast<std::size_t>(parts), -1);
-        bool ok = true;
-        const auto running = c.runningNodes();
-        for (int32_t p = 0; p < parts && ok; ++p) {
-            for (int id : running) {
-                const int32_t l = leaderOn(c.node(id), topicId, p);
-                if (l <= 0 || std::find(running.begin(), running.end(), l) == running.end()) { ok = false; break; }
-                if (leaders[static_cast<std::size_t>(p)] == -1) leaders[static_cast<std::size_t>(p)] = l;
-                else if (leaders[static_cast<std::size_t>(p)] != l) { ok = false; break; }
-            }
-        }
-        if (ok) return true;
-    }
-    return false;
-}
-
-int32_t awaitController(ThreeNodes& c) {
-    int32_t ctl = -1;
-    for (const auto deadline = Clock::now() + 30s; Clock::now() < deadline && ctl < 0; std::this_thread::yield())
-        for (rune::node::BrokerNode* n : c.live())
-            if (n->isLeader()) ctl = n->nodeIdForTest();
-    return ctl;
-}
-
 /// The typed schema of `eos.pos` - the descriptor the client's claim-schema codegen compiles Position from.
 rune::codec::Descriptor positionDescriptor() {
     using rune::codec::DescriptorBuilder;
