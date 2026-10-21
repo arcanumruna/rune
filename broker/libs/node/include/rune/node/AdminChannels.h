@@ -160,6 +160,10 @@ enum : int32_t {
     // Authentication Task 16: the admin plane's cumulative dropped inter-broker frames, [count:u64] (paced, only on a
     // change) - the control thread folds it into counter 1'000'235.
     kA2cPeerFrameDrops      = 23,
+    // Issues #15 / #111 (decision M7): the admin thread's verdict on whether this broker's `__security` state is caught
+    // up and fresh (SecurityCatchUp), posted on change: [caughtUp:u8][leaderHw:i64].  On the SAME FIFO as
+    // kA2cSecurityApplied, behind every applied event of the state it vouches for.
+    kA2cSecurityServing     = 24,
 };
 
 // ---------------------------------------------------------------------------
@@ -1464,6 +1468,18 @@ inline void writeSecurityApplied(uint8_t* p, int64_t offset, std::span<const uin
     offset = admin_wire::getI64(buf);
     bytes  = std::span<const uint8_t>(buf + kSecurityAppliedFixedBytes, len - kSecurityAppliedFixedBytes);
     return offset >= 0;
+}
+//   kA2cSecurityServing : [caughtUp:u8][leaderHw:i64]   (issues #15 / #111)
+inline constexpr std::size_t kSecurityServingWireLen = 1 + 8;
+inline void writeSecurityServing(uint8_t* p, bool caughtUp, int64_t leaderHw) noexcept {
+    p[0] = caughtUp ? 1 : 0;
+    admin_wire::putI64(p + 1, leaderHw);
+}
+[[nodiscard]] inline bool decodeSecurityServing(const uint8_t* buf, std::size_t len, bool& caughtUp, int64_t& leaderHw) noexcept {
+    if (len != kSecurityServingWireLen || buf[0] > 1) return false;
+    caughtUp = buf[0] == 1;
+    leaderHw = admin_wire::getI64(buf + 1);
+    return true;
 }
 using SecurityHaltedMsg = CatalogHaltedMsg;
 inline constexpr std::size_t kSecurityHaltedFixedBytes = kCatalogHaltedFixedBytes;

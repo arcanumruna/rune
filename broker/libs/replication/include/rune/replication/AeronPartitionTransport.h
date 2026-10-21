@@ -403,6 +403,8 @@ public:
     /// \param nowNs  Current time (nanoseconds) — passed to onFetchRequest.
     /// \returns Total work count (fragment polls + dispatches).
     int poll(int64_t nowNs);
+    /// Test seam (issue #111), the polling (control) thread only: while set every inbound peer frame is dropped.
+    void setPartitionedForTest(bool on) noexcept { partitionedForTest_ = on; }
 
     // -----------------------------------------------------------------------
     // E2 inc2a: WorkerPool wiring
@@ -735,6 +737,7 @@ private:
     int64_t  txRateLastNs_ = 0;
     int64_t  txPolls_      = 0;   ///< poll() calls (RUNE_FS_LOG only)
     int64_t  txFragsRecv_  = 0;   ///< fragments received
+    bool     partitionedForTest_ = false;   ///< issue #111 test seam (control thread): inbound peer frames dropped
     int64_t  txOutDrained_ = 0;   ///< outbound messages drained to Aeron
     uint32_t inRecvSeq_    = 0;   ///< FR ReplFragRecv correlation
     // (F9a 29f9aec made the same file-static → per-instance move; one set.)

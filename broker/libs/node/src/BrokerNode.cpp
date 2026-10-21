@@ -2159,6 +2159,14 @@ void BrokerNode::buildGateway() {
                               : config_.authMode == AuthMode::DevDisabled ? rune::gateway::GatewayAuthMode::Dev
                                                                           : rune::gateway::GatewayAuthMode::InProcess,
                               securityView_ ? &*securityView_ : nullptr);
+        // Issues #15 / #111 (M7): an authenticating broker starts CatchingUp - no login, `__security` read or security
+        // DDL is served until the admin thread vouches that its `__security` state is caught up (and the consensus is
+        // in contact).  Dev / in-process brokers authenticate nobody: nothing to gate.
+        if (config_.authMode == AuthMode::Enabled && securityView_) {
+            securityServing_.emplace(config_.effectiveSecurityMaxStalenessMs() * 1'000'000LL,
+                                     config_.effectiveSecurityStaleSessionEndMs() * 1'000'000LL);
+            gateway_->setSecurityServing(false);
+        }
         gateway_->setBootObjects(std::move(bootObjects_));   // authentication Task 12: the catalog's live topics / views at boot
         // Authentication Task 10 (D4/D32): the gateway's OWN copy of the cluster keys (loaded on this startup thread,
         // validated by validateAuth) verifies the bootstrap proof.  Dev / in-process configs hold none.
@@ -3210,7 +3218,7 @@ void BrokerNode::publishCatalogMetrics_() noexcept {
 // ---------------------------------------------------------------------------
 void BrokerNode::onSecurityApplied_(const uint8_t* p, std::size_t n) {
     if (heldMirror_.on) [[unlikely]] {   // test seam: stash, apply nothing
-        heldMirror_.frames.emplace_back(p, p + n);
+        heldMirror_.frames.emplace_back(kA2cSecurityApplied, std::vector<uint8_t>(p, p + n));
         return;
     }
     int64_t offset = -1;
@@ -3233,6 +3241,46 @@ void BrokerNode::onSecurityApplied_(const uint8_t* p, std::size_t n) {
         failSecurityClosed_(a.error().offset, a.error().detail);
     }
     publishSecurityMetrics_();
+}
+
+// Issues #15 / #111: the admin thread's `__security` catch-up verdict (behind every applied event it vouches for).
+void BrokerNode::onSecurityServing_(const uint8_t* p, std::size_t n) {
+    if (heldMirror_.on) [[unlikely]] {   // test seam: in order with the held events
+        heldMirror_.frames.emplace_back(kA2cSecurityServing, std::vector<uint8_t>(p, p + n));
+        return;
+    }
+    bool caughtUp = false;
+    int64_t leaderHw = -1;
+    if (!decodeSecurityServing(p, n, caughtUp, leaderHw)) [[unlikely]] {
+        if (adminToControlRejects_++ % 1024 == 0)
+            spdlog::error("BrokerNode[{}]: malformed kA2cSecurityServing (len={}) skipped", config_.nodeId, n);
+        return;
+    }
+    if (securityServing_) securityServing_->onAdminCaughtUp(caughtUp, leaderHw);
+}
+
+// Issues #15 / #111: one control pass of SecurityServing.  The consensus contact is the election being CLOSED (a
+// steady leader or follower): a minority leader steps down and a cut-off follower re-canvasses, so a partitioned
+// broker - a zombie `__security` leader included - leaves CLOSED and goes Stale F later.
+int BrokerNode::stepSecurityServing_(int64_t nowNs) {
+    if (!securityServing_ || !gateway_) return 0;
+    const bool closed = election_ == nullptr ||
+                        election_->stateCode() == static_cast<int32_t>(rune::consensus::ElectionState::Closed);
+    const SecurityServing::Actions a = securityServing_->step(nowNs, closed);
+    if (a.changed) {
+        spdlog::warn("BrokerNode[{}]: __security serving -> {} (admin caught up: {}, consensus closed: {}){}", config_.nodeId,
+                     securityServing_->name(), securityServing_->adminCaughtUp(), closed,
+                     securityServing_->serving() ? "" : " - logins, __security reads and security DDL answer "
+                                                         "AuthUnavailable (48) until it is current again");
+        gateway_->setSecurityServing(securityServing_->serving());
+    }
+    if (a.endSessions) {
+        spdlog::warn("BrokerNode[{}]: __security stale for more than {} ms - ending the authenticated sessions "
+                     "(AuthUnavailable): their clients reconnect to a current broker",
+                     config_.nodeId, config_.effectiveSecurityStaleSessionEndMs());
+        gateway_->endSessionsSecurityUnavailable();
+    }
+    return a.changed || a.endSessions ? 1 : 0;
 }
 
 void BrokerNode::onSecurityHalted_(const uint8_t* p, std::size_t n) {
@@ -3537,10 +3585,30 @@ void BrokerNode::holdSecurityMirrorForTest(bool on) {
         if (!on) {
             auto frames = std::move(heldMirror_.frames);
             heldMirror_.frames.clear();
-            for (const auto& f : frames) onSecurityApplied_(f.data(), f.size());
+            for (const auto& [tid, f] : frames) {   // in ring order (issues #15 / #111: the verdicts with the events)
+                if (tid == kA2cSecurityServing) onSecurityServing_(f.data(), f.size());
+                else onSecurityApplied_(f.data(), f.size());
+            }
         }
         return 0;
     });
+}
+
+void BrokerNode::partitionFromPeersForTest(bool on) {
+    onAdminThreadForTest([this, on]() {
+        if (catalogPlane_) catalogPlane_->setPartitionedForTest(on);
+        return 0;
+    });
+    onControlThreadForTest([this, on]() {
+        if (aeronIngress_) aeronIngress_->setPartitionedForTest(on);
+        if (udpSink_) udpSink_->setPartitionedForTest(on);
+        if (replTransport_) replTransport_->setPartitionedForTest(on);
+        return 0;
+    });
+}
+
+std::string BrokerNode::securityServingForTest() {
+    return onControlThreadForTest([this]() { return std::string(securityServing_ ? securityServing_->name() : "none"); });
 }
 
 void BrokerNode::holdSecurityApplyForTest(bool on) {
@@ -4113,6 +4181,11 @@ void BrokerNode::buildAdminWorker() {
             if (!adminWorkerAgent_) return;
             adminWorkerAgent_->postErrorResponse(session, corr, code, message);
         };
+        // Issues #15 / #111: the `__security` catch-up verdict -> the control thread's SecurityServing.
+        deps.securityServing = [this](bool caughtUp, int64_t leaderHw) {
+            if (adminWorkerAgent_) adminWorkerAgent_->postSecurityServing(caughtUp, leaderHw);
+        };
+        deps.securityMaxStalenessNs = config_.effectiveSecurityMaxStalenessMs() * 1'000'000LL;
         // Catalog history Task 12: the catalog read server's frames (admin thread)
         // → the agent's catalog-read ring → the control thread → the session.
         deps.catalogRead = [this](const CatalogReadFrameHead& head, std::span<const uint8_t> frame) {
@@ -4133,6 +4206,7 @@ void BrokerNode::buildAdminWorker() {
                                                    adminWorkerAgent_->securityLiveEffects());
         bootSecurityApplier_.reset();
         if (holdCatalogApplyAtBootForTest_) adminWorkerAgent_->worker().holdApplyForTest(true);
+        if (holdSecurityApplyAtBootForTest_) adminWorkerAgent_->worker().holdSecurityApplyForTest(true);
         if (bootReconcileDeferred_) {
             adminWorkerAgent_->worker().deferTopicDirReconcile(config_.dataDir);
         }
@@ -4626,6 +4700,7 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
     });
 
     work += serviceAuthMode_(nowNs);   // Authentication Task 9: the dev-mode warning timer + the auth-mode counter
+    work += stepSecurityServing_(nowNs);   // issues #15 / #111: serving only while provably current
     work += servicePeerLinks_(nowNs);  // Authentication Task 15: the peer link handshakes + key distribution
 
     auto* agent = adminWorkerAgent_.get();
@@ -4746,6 +4821,7 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
             if (tid == kA2cSecurityAlterIsr) { forwardSecurityAlterIsr_(p, n); return; }
             if (tid == kA2cSecurityApplied)  { onSecurityApplied_(p, n); return; }
             if (tid == kA2cSecurityHalted)   { onSecurityHalted_(p, n); return; }
+            if (tid == kA2cSecurityServing)  { onSecurityServing_(p, n); return; }
             if (tid == kA2cPeerFrameDrops) {   // Authentication Task 16: the admin plane's dropped inter-broker frames
                 if (n == 8) std::memcpy(&adminPeerDrops_, p, 8);
                 else if (adminToControlRejects_++ % 1024 == 0)

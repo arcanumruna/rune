@@ -430,6 +430,18 @@ public:
     /// lost READ (explicitly, NotAuthorized), ships its WRITE bits and a lifted must-change-password session becomes
     /// authenticated; Revoke -> every session of the affected users completes SessionRevoked and closes.  Control thread.
     void onSecurityApplied(int64_t offset, const rune::security::Applied& applied);
+    /// Issues #15 / #111 (decision M7), control thread: whether this broker's `__security` state is provably current
+    /// (BrokerNode's SecurityServing).  While it is not, an authenticating gateway answers every login, `__security`
+    /// read and security DDL / bootstrap the retriable AuthUnavailable (48), and never advertises the bootstrap window.
+    /// Sessions already authenticated keep working (until endSessionsSecurityUnavailable).  Default: serving (rigs; the
+    /// broker sets false at boot).
+    void setSecurityServing(bool serving) noexcept { securityServing_ = serving; }
+    [[nodiscard]] bool securityServing() const noexcept { return securityServing_; }
+    /// Issues #15 / #111: this broker stayed stale longer than R - every authenticated / must-change-password session
+    /// is told AuthUnavailable at session level (corr 0) and closed; its client reconnects to a current broker.
+    void endSessionsSecurityUnavailable();
+    [[nodiscard]] uint64_t loginsUnavailable() const noexcept { return loginsUnavailable_; }
+    [[nodiscard]] uint64_t sessionsEndedUnavailable() const noexcept { return sessionsEndedUnavailable_; }
     /// The view halted (the admin applier's kA2cSecurityHalted, or the mirror's own apply error): fail closed - every
     /// authenticated / must-change-password session is revoked (D28).  Idempotent.
     void onSecurityHalted(int64_t offset);
@@ -2279,11 +2291,21 @@ private:
     /// handleSubscribe for topicId == kSecurityTopicId (authentication Task 10): the same contract on the second server.
     void handleSecuritySubscribe_(Session& session, const rune::protocol::client::Subscribe& msg);
     uint64_t securitySubscribesForwarded_ = 0;
-    rune::node::UnauthLogLimiter unauthLog_;   ///< X103: 1/1024 limiter of the log lines unauthenticated senders drive (kinds: 0 require-TLS, 1 login rate limited, 2 halted login, 3 bad bootstrap proof, 4 own-password change without a valid proof (#114), 5 client version refusal, 6 malformed first login leg, 8+ login failed per reason)
+    rune::node::UnauthLogLimiter unauthLog_;   ///< X103: 1/1024 limiter of the log lines unauthenticated senders drive (kinds: 0 require-TLS, 1 login rate limited, 2 halted login, 3 bad bootstrap proof, 4 own-password change without a valid proof (#114), 5 client version refusal, 6 malformed first login leg, 7 login refused: security state not current (#15), 8+ login failed per reason)
     uint64_t controlBatchRefusals_ = 0;   ///< X036: Produce frames refused for carrying a client control batch (rate-limited log)
     static void noteReadCorr_(std::vector<int64_t>& corrs, int64_t corr);
     rune::gateway::GatewayAuthMode authMode_ = rune::gateway::GatewayAuthMode::InProcess;
     const rune::gateway::SecurityView* securityView_ = nullptr;   // control thread's own mirror (same thread as the gateway)
+    bool     securityServing_ = true;           ///< issues #15 / #111: see setSecurityServing
+    uint64_t loginsUnavailable_ = 0, sessionsEndedUnavailable_ = 0;
+    /// Issues #15 / #111: Required mode and the `__security` state is not provably current (a halted view keeps its own
+    /// fail-closed answers, D28).
+    [[nodiscard]] bool securityUnavailable_() const noexcept {
+        return authMode_ == rune::gateway::GatewayAuthMode::Required && !securityServing_ &&
+               !(securityView_ != nullptr && securityView_->halted());
+    }
+    /// The login answer of an unavailable broker: AuthServerFinal{48} + the end of the session (the client retries).
+    void unavailableLogin_(Session& session, int64_t correlationId, std::string_view user);
     /// The auth state a NEW session starts in (D11): AuthAwaitingFirst{now + authTimeout} when authenticating,
     /// AuthAnonymous otherwise.
     [[nodiscard]] rune::gateway::SessionAuth newSessionAuth_(int64_t nowNs, int64_t connectCorrelationId) const;
@@ -2292,6 +2314,17 @@ private:
     /// Issue #121: the window is open AND no `__security` event was ever applied (a fresh cluster: no user exists, so a
     /// login cannot succeed) - the only case a connect is told Anonymous.  A REOPENED window answers MustAuthenticate.
     [[nodiscard]] bool neverBootstrapped_() const noexcept { return bootstrapOpen_() && securityView_->appliedOffset() < 0; }
+    /// Issues #15 (M8): a connect is told Anonymous only while this broker is current - a new / wiped broker whose
+    /// replica is still empty must not advertise the window of a cluster that was bootstrapped long ago.
+    [[nodiscard]] rune::protocol::client::AuthState connectAuthState_() const noexcept {
+        return authMode_ == rune::gateway::GatewayAuthMode::Required && (!neverBootstrapped_() || securityUnavailable_())
+                   ? rune::protocol::client::AuthState::MustAuthenticate
+                   : rune::protocol::client::AuthState::Anonymous;
+    }
+public:
+    /// Test seam: what a v9 Connect to this gateway is told now (the ConnectResponse authState).
+    [[nodiscard]] rune::protocol::client::AuthState connectAuthStateForTest() const noexcept { return connectAuthState_(); }
+private:
     /// true = refused here: the auth gate (gateFor) answered AuthenticationFailed (and ended the session) or
     /// PasswordChangeRequired (the session stays) in the request's own response type.
     [[nodiscard]] bool authGateRefuses_(rune::protocol::client::TemplateId tid, const uint8_t* buf, std::size_t len);

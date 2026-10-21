@@ -963,3 +963,132 @@ TEST(AuthClusterRegression, AForcedLastAdminRemovalKeepsEveryBrokerAskingForALog
         return true;
     })) << "every broker closes the window again";
 }
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// Issues #15 / #111 (decision M7): a broker whose `__security` state is not provably current - restarted behind the
+// cluster, partitioned from its leader, or a partitioned ex-leader (a zombie) - serves no login (the retriable
+// AuthUnavailable, 48) and, stale longer than R, ends its authenticated sessions with a session-level 48.
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+namespace {
+constexpr uint16_t kAuthUnavailable = 48;
+/// The login answer of `user` on broker `id` (a fresh session on the trio wire); 0xFFFF = none / no connect.
+uint16_t loginCode(AuthTrio& t, int id, const std::string& user, const std::string& pw = AuthTrio::kPw) {
+    AuthWireClient& w = t.wire();
+    const int64_t sid = w.connect(t.channel(id));
+    if (sid <= 0) return 0xFFFF;
+    return w.login(t.channel(id), sid, user, {pw, pw}).errorCode();
+}
+/// Shorter R for the tests (F stays the default 1 s: it must exceed the broker liveness + 500 ms).
+void withStaleSessionEnd(AuthTrio& t, int64_t ms) {
+    auto base = t.cluster().configTweak;
+    t.cluster().configTweak = [base, ms](NodeConfig& cfg) { if (base) base(cfg); cfg.securityStaleSessionEndMs = ms; };
+}
+bool sessionEndedWith(AuthTrio::Session& s, int16_t code, std::chrono::milliseconds within) {
+    auto& c = s.w->raw();
+    bool seen = false;
+    c.pollFor(within, [&] {
+        for (const auto& e : c.errors()) if (e.sessionId == s.sid && e.correlationId == 0 && e.code == code) { seen = true; return true; }
+        return false;
+    });
+    if (!seen)
+        for (const auto& e : c.errors())
+            std::fprintf(stderr, "DIAG error sid=%lld corr=%lld code=%d msg=%s (want sid=%lld)\n", (long long)e.sessionId,
+                         (long long)e.correlationId, e.code, e.message.c_str(), (long long)s.sid);
+    return seen;
+}
+}  // namespace
+
+// Issue #15 (RED before the fix: node 3 restarted with its local `__security` prefix - ws1 still enabled there - and,
+// its applier behind, accepted ws1's password although the cluster had disabled ws1 while it was down).
+TEST(AuthRestartRegression, ARestartedBrokerNeverAcceptsADisabledUsersOldPasswordClusterRegression) {
+    AuthTrio t("restartdisabled");
+    t.start();
+    t.bootstrapAdmin();
+    t.createUser(1, "ws1");
+    ASSERT_TRUE(AuthTrio::until(30s, [&] { return loginCode(t, 3, "ws1") == 0; })) << "ws1 logs in on node 3";
+    t.stopNode(3);
+    t.mustOk(t.ddl(1, [](AuthWireClient& w, const std::string& ch, int64_t sid) {
+        return w.alterPassword(ch, sid, "ws1", pc::UserChangeKind::Disable, "");
+    }), "ALTER USER ws1 DISABLE");
+    // Node 3 comes back behind: its applier is held, so its local state (ws1 enabled) never advances on its own.
+    t.cluster().beforeStart = [](int id, BrokerNode& n) { if (id == 3) n.holdSecurityApplyAtBootForTest(true); };
+    t.restart(3, t.keyContentsPath(3));
+    t.cluster().beforeStart = nullptr;
+    int unavailable = 0;
+    for (int i = 0; i < 10; ++i) {
+        const uint16_t code = loginCode(t, 3, "ws1");
+        ASSERT_NE(code, 0) << "attempt " << i << ": the disabled user's old password must never log in";
+        unavailable += code == kAuthUnavailable ? 1 : 0;
+        std::this_thread::sleep_for(100ms);
+    }
+    EXPECT_GT(unavailable, 0) << "a broker that cannot vouch for its state answers the retriable AuthUnavailable";
+    EXPECT_EQ(t.node(3).securityServingForTest(), "CatchingUp");
+    t.node(3).holdSecurityApplyForTest(false);
+    ASSERT_TRUE(t.awaitDigestsAgree(2, 60s)) << "node 3 applied the DISABLE";
+    EXPECT_TRUE(AuthTrio::until(30s, [&] { return loginCode(t, 3, "ws1") == 44; })) << "now judged: disabled (44)";
+    EXPECT_EQ(t.node(3).securityServingForTest(), "Serving");
+}
+
+// Issue #111 (RED before the fix: a follower cut off its `__security` leader kept serving logins and its sessions
+// forever from the frozen state).  Stale after F: logins 48; after R its authenticated sessions end with 48 (their
+// clients move); the contact back plus a full catch-up -> Serving again.
+TEST(AuthRestartRegression, APartitionedBrokerGoesStaleThenEndsSessionsRetriablyRegression) {
+    AuthTrio t("partitionedfollower");
+    withStaleSessionEnd(t, 3'000);
+    t.start();
+    t.bootstrapAdmin();
+    t.createUser(1, "ws1");
+    const int32_t leader = settledSecurityLeader(t.cluster());
+    ASSERT_GT(leader, 0);
+    const int cut = leader == 3 ? 2 : 3;   // a follower
+    AuthTrio::Session live;
+    ASSERT_TRUE(AuthTrio::until(30s, [&] { try { live = t.login(cut, "ws1"); return true; } catch (...) { return false; } }));
+    BrokerNode& n = t.node(cut);
+    n.onAdminThreadForTest([&n]() {   // its `__security` follower hears its leader no more (no fetch, no answer)
+        n.securityReplicaForTest()->holdFetchesUntilForTest(INT64_MAX);
+        return 0;
+    });
+    EXPECT_TRUE(AuthTrio::until(10s, [&] { return n.securityServingForTest() == "Stale"; }));
+    EXPECT_EQ(loginCode(t, cut, "ws1"), kAuthUnavailable) << "a stale broker serves no login";
+    EXPECT_TRUE(n.gatewayHasSessionForTest(live.sid)) << "within R the live session keeps working";
+    EXPECT_TRUE(sessionEndedWith(live, static_cast<int16_t>(kAuthUnavailable), 15s))
+        << "stale past R: the session is ended retriably (session-level 48)";
+    EXPECT_FALSE(n.gatewayHasSessionForTest(live.sid));
+    EXPECT_EQ(loginCode(t, leader, "ws1"), 0) << "a current broker serves";
+    n.onAdminThreadForTest([&n]() { n.securityReplicaForTest()->holdFetchesUntilForTest(0); return 0; });
+    EXPECT_TRUE(AuthTrio::until(30s, [&] { return loginCode(t, cut, "ws1") == 0; })) << "contact back + caught up: serving";
+}
+
+// Issue #111, the zombie leader (RED before the fix: the `__security` leader cut off the consensus kept "leading" -
+// nothing tells it otherwise - and served logins and permissions from its frozen state while the majority moved on: a
+// user DISABLEd there still logged in on it).  Stale F after its last consensus contact: logins 48, sessions ended
+// after R; healed, it follows the new leader and judges the user disabled.
+TEST(AuthRestartRegression, APartitionedSecurityLeaderStopsServingWithoutALeaseRegression) {
+    AuthTrio t("zombieleader");
+    withStaleSessionEnd(t, 3'000);
+    t.start();
+    t.bootstrapAdmin();
+    t.createUser(1, "ws1");
+    const int32_t zombie = settledSecurityLeader(t.cluster());
+    ASSERT_GT(zombie, 0);
+    const int other = zombie == 1 ? 2 : 1;
+    AuthTrio::Session live;
+    ASSERT_TRUE(AuthTrio::until(30s, [&] { try { live = t.login(zombie, "ws1"); return true; } catch (...) { return false; } }));
+    BrokerNode& z = t.node(zombie);
+    z.partitionFromPeersForTest(true);
+    // The majority moves on: a new `__security` leader, then the DISABLE commits there.
+    {   // a retry after a commit timeout may find it applied already (a fresh request id each attempt): either is fine
+        const auto a = t.ddl(other, [](AuthWireClient& w, const std::string& ch, int64_t sid) {
+            return w.alterPassword(ch, sid, "ws1", pc::UserChangeKind::Disable, "");
+        }, 60s);
+        ASSERT_TRUE(a.errorCode == 0 || a.detail.find("already disabled") != std::string::npos)
+            << "ALTER USER ws1 DISABLE (majority): " << a.errorCode << " " << a.detail;
+    }
+    EXPECT_TRUE(AuthTrio::until(10s, [&] { return z.securityServingForTest() == "Stale"; }));
+    for (int i = 0; i < 5; ++i)
+        EXPECT_EQ(loginCode(t, zombie, "ws1"), kAuthUnavailable) << "attempt " << i << ": the zombie serves no login";
+    EXPECT_TRUE(sessionEndedWith(live, static_cast<int16_t>(kAuthUnavailable), 15s)) << "its sessions end after R";
+    z.partitionFromPeersForTest(false);
+    EXPECT_TRUE(AuthTrio::until(60s, [&] { return loginCode(t, zombie, "ws1") == 44; }))
+        << "healed: it follows the new leader and the user is disabled";
+}

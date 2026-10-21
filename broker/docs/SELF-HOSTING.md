@@ -56,6 +56,9 @@ missing or malformed.
 | `RUNE_CLUSTER_KEY_FILE_NEXT` | no | *(unset)* | path | A second key for [rotation](SECURITY.md#the-cluster-key-d32-d35): the broker accepts the current or the next key. |
 | `RUNE_AUTH` | no | `enabled` | `enabled` \| `disabled` | `disabled` is dev mode: no login, every request runs as `anonymous` with full access. **Single-node development only**: a broker with more than one peer refuses to start in dev mode. |
 | `RUNE_AUTH_TIMEOUT_MS` | no | `10000` | int ms | A session that has not completed its login within this is answered `AuthenticationFailed` and ended. |
+| `RUNE_SECURITY_MAX_STALENESS_MS` | no | `1000` | int ms | F: a broker out of contact with its `__security` leader or the consensus this long answers logins `AuthUnavailable` (48) until current again ([details](SECURITY.md#a-broker-serves-only-a-current-security-state-serving)). Must exceed the broker liveness timeout + 500 ms. |
+| `RUNE_SECURITY_STALE_SESSION_END_MS` | no | `10000` | int ms | R (> F): stale this long, the broker ends its authenticated sessions (`AuthUnavailable`); clients reconnect elsewhere. |
+| `RUNE_SECURITY_GATE_DEADLINE_MS` | no | `5000` | int ms | A security DDL OK not confirmed enforced on this broker within this is answered `Internal` (in doubt; retry with the same request id). |
 | `RUNE_TRANSIENT_LOG_RING_BYTES` | no | `8388608` (8 MiB) | int32 bytes | Node-wide ring size of every transient partition. Must be a power of two; any other value keeps the default. `RUNE_MEMORY_LOG_RING_BYTES` is a **deprecated** alias that logs one warning; when both are set, the canonical name wins. |
 
 > Not env-configurable (yet): dynamic membership.

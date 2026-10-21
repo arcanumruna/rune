@@ -784,6 +784,9 @@ public:
     [[nodiscard]] bool caughtUpWithLeader() const noexcept {
         return role_ == Role::Leader || (committedHwKnown() && followerSync_.inSync());
     }
+    /// Issues #15 / #111: how many fetch answers / pushes of the CURRENT (or a newer-known) leader this follower
+    /// accepted - monotonic; the owner samples it each pass to know when the leader last answered (no clock here).
+    [[nodiscard]] uint64_t leaderAnswers() const noexcept { return leaderAnswers_; }
 
     /// Soft per-replica position snapshot for the controller's election path.
     /// leaderEpoch = epoch(); logEndPosition = logEndOffset().
@@ -1623,6 +1626,7 @@ private:
     uint32_t registryId_  = 0;             ///< ReplicaRegistry dense id (0 = unregistered)
     uint32_t incarnation_ = 0;             ///< never-reused registration incarnation
     uint64_t logGeneration_ = 0;           ///< F15: bumped on truncation
+    uint64_t leaderAnswers_ = 0;           ///< issues #15 / #111: accepted current-leader answers (see leaderAnswers())
     Offset   lastTruncationOffset_ = 0;    ///< F15: cut point of the last generation bump
     uint64_t leadershipGeneration_ = 0;    ///< F15 S4: bumped on every Leader <-> Follower transition
     uint64_t epochCheckpointWrites_ = 0;   ///< see checkpointEpochs_

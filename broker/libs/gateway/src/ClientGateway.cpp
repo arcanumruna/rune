@@ -2467,8 +2467,7 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
                 resp.v9 = true;
                 resp.authMode = authMode_ == rune::gateway::GatewayAuthMode::Required ? pc::AuthMode::Required
                                                                                        : pc::AuthMode::DevDisabled;
-                resp.authState = authMode_ == rune::gateway::GatewayAuthMode::Required && !neverBootstrapped_()
-                                     ? pc::AuthState::MustAuthenticate : pc::AuthState::Anonymous;
+                resp.authState = connectAuthState_();
             }
             if (pending.tls) {
                 // client<->broker TLS/AEAD (Task 7): offer the chosen cipher +
@@ -5199,6 +5198,10 @@ void ClientGateway::handleSecuritySubscribe_(Session& session, const pc::Subscri
     }
     if (adminSink_ == nullptr) {
         answer(pc::ErrorCode::Internal);
+        return;
+    }
+    if (securityUnavailable_()) [[unlikely]] {   // issues #15 / #111: a stale replica serves no `__security` read
+        answer(pc::ErrorCode::AuthUnavailable);
         return;
     }
     // Issue #117: an end of this kind still owed to the admin goes first (FIFO) - else it would end the new read.
@@ -8222,6 +8225,43 @@ void ClientGateway::failLogin_(Session& session, int64_t correlationId, uint32_t
     (void)closeSession_(session.sessionId);
 }
 
+void ClientGateway::unavailableLogin_(Session& session, int64_t correlationId, std::string_view user)
+{
+    ++loginsUnavailable_;
+    if (unauthLog_.due(7)) [[unlikely]]
+        spdlog::warn("auth: login refused user={} source={} session={} reason=security-not-current (AuthUnavailable; "
+                     "refused so far: {})", user, session.sourceHost, session.sessionId, loginsUnavailable_);
+    pc::AuthServerFinal f;
+    f.sessionId     = session.sessionId;
+    f.correlationId = correlationId;
+    f.errorCode     = static_cast<uint16_t>(pc::ErrorCode::AuthUnavailable);
+    f.detail        = "this broker's security state is not current - retry on another broker";
+    const std::size_t n = f.encode(scratch_.data());
+    sendAnswer_(session, scratch_.data(), n);
+    (void)closeSession_(session.sessionId);
+}
+
+void ClientGateway::endSessionsSecurityUnavailable()
+{
+    using namespace rune::gateway;
+    liveScratch_.clear();
+    sessions_.forEach([&](Session& s) {
+        if (std::holds_alternative<AuthAuthenticated>(s.auth) || std::holds_alternative<AuthPasswordChangeRequired>(s.auth))
+            liveScratch_.push_back(s.sessionId);
+    });
+    for (const int64_t sid : liveScratch_) {
+        Session* s = sessions_.find(sid);
+        if (s == nullptr) continue;
+        ++sessionsEndedUnavailable_;
+        // Session level (corr 0): every in-flight request of the session ends with it; the client reconnects elsewhere.
+        sendErrorOn_(*s, 0, static_cast<uint16_t>(pc::ErrorCode::AuthUnavailable),
+                     "this broker's security state is stale - reconnect to another broker");
+        (void)closeSession_(sid);
+    }
+    if (!liveScratch_.empty())
+        spdlog::warn("auth: {} authenticated session(s) ended: this broker's security state stayed stale", liveScratch_.size());
+}
+
 void ClientGateway::handleAuthClientFirst_(const uint8_t* buf, std::size_t len)
 {
     using namespace rune::gateway;
@@ -8265,6 +8305,10 @@ void ClientGateway::handleAuthClientFirst_(const uint8_t* buf, std::size_t len)
         failLogin_(*session, m->correlationId, 0);
         return;
     }
+    if (securityUnavailable_()) [[unlikely]] {   // issues #15 / #111: never verified against a stale view
+        unavailableLogin_(*session, m->correlationId, user);
+        return;
+    }
     ServerFirstPlan plan = scramServerFirst(securityView_->state(), *m, deadline, securityView_->fakeIterations());
     if (plan.frame.empty()) {   // no randomness for the nonce: fail closed
         ++loginsFailed_;
@@ -8302,6 +8346,10 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
         if (unauthLog_.due(1)) [[unlikely]]
             spdlog::warn("auth: rate limited user={} source={} retry_after_ms={}", user, session->sourceHost, v.retryAfterMs);
         failLogin_(*session, hdr->correlationId, v.retryAfterMs);
+        return;
+    }
+    if (securityUnavailable_()) [[unlikely]] {   // issues #15 / #111: the view went stale between the two legs
+        unavailableLogin_(*session, hdr->correlationId, user);
         return;
     }
     const auto fin = pc::AuthClientFinal::decode(buf, len);
@@ -8705,6 +8753,11 @@ void ClientGateway::handleSecurityDdl(const uint8_t* buf, std::size_t len)
                              "SecurityDdl needs client version 9");
         return;
     }
+    if (securityUnavailable_()) [[unlikely]] {   // issues #15 / #111: never built on (or judged against) a stale view
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::AuthUnavailable),
+                             "this broker's security state is not current - retry on another broker");
+        return;
+    }
     // Authentication Task 12 (D20): ADMIN ON CLUSTER - except a user's own ALTER USER <self> ADD / DROP / SET PASSWORD,
     // which (issue #114) needs a fresh proof of a CURRENT password instead: the session alone (a hijacked plaintext
     // session, a leaked one) must not turn into a permanent second password.
@@ -8819,6 +8872,11 @@ void ClientGateway::handleSecurityBootstrap(const uint8_t* buf, std::size_t len)
     if (!pc::clientUnderstandsAuth(session->clientVersion)) {
         (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest),
                              "SecurityBootstrap needs client version 9");
+        return;
+    }
+    if (securityUnavailable_()) [[unlikely]] {   // issues #15 / #111
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::AuthUnavailable),
+                             "this broker's security state is not current - retry on another broker");
         return;
     }
     // D4: a fresh cluster cannot be hijacked by whoever reaches it first - the request must prove possession of the

@@ -73,6 +73,7 @@
 #include <rune/node/AdminControlPlane.h>
 #include <rune/node/DdlAnswerGate.h>
 #include <rune/node/SecurityAnswerGate.h>
+#include <rune/node/SecurityServing.h>
 #include <rune/node/SchemaFanout.h>
 #include <rune/node/TopicDroppedFanout.h>
 #include <rune/node/PeerLinkAgent.h>
@@ -825,6 +826,12 @@ public:
     // thread's SecurityView directly (the startup thread, before any thread runs) and postBootStash delivers a
     // boot-time halt through the live sink.
     [[nodiscard]] SecurityLiveEffects securityLiveEffects() { return SecurityLiveEffects{securitySink_()}; }
+    /// Issues #15 / #111 - ADMIN thread only (deps.securityServing): kA2cSecurityServing on the effect FIFO (never
+    /// dropped: the backlog keeps it in order behind the applied events).
+    void postSecurityServing(bool caughtUp, int64_t leaderHw) {
+        postCatalog_(kA2cSecurityServing, kSecurityServingWireLen,
+                     [&](uint8_t* p) { writeSecurityServing(p, caughtUp, leaderHw); });
+    }
     [[nodiscard]] SecurityBootEffects securityBootEffects() const { return SecurityBootEffects{}; }
     [[nodiscard]] SecurityEffects securitySinkForBootStash() { return securitySink_(); }
     /// The `__security` replica's ISR channel (kA2cSecurityAlterIsr) - the control thread forwards it to the controller.
@@ -1504,6 +1511,13 @@ public:
     [[nodiscard]] int64_t appendSecurityRecordOnLeaderForTest(std::span<const uint8_t> eventBytes);
     /// Test-only: while held, this broker's `__security` applier applies nothing (the replica still replicates).
     void holdSecurityApplyForTest(bool on);
+    /// Test-only (issue #111): cut this broker off its peers - the consensus (nothing in, nothing out), the control
+    /// replication transport and the admin plane (nothing in: no metadata, no internal-ISR news, no fetch answers) -
+    /// or reconnect it.  Its client links stay up: a broker the cluster moves past while it still believes its last
+    /// metadata (a zombie leader).  Multi-node only (posted to the control and admin threads).
+    void partitionFromPeersForTest(bool on);
+    /// Test-only: the control thread's SecurityServing state ("CatchingUp" / "Serving" / "Stale"; "none" without auth).
+    [[nodiscard]] std::string securityServingForTest();
     /// Test-only (review C I5), CONTROL thread: while held, the mirrored `__security` frames (kA2cSecurityApplied) are
     /// stashed unapplied - the SecurityView, and with it the D24 answer-gate release, stays where it was; on release
     /// they are applied in order.  Proves no OK leaves before THIS broker enforces the event.
@@ -1584,6 +1598,10 @@ public:
     /// the leader's prefix but not applied it has NOT caught up, so a deferred boot reconcile
     /// must keep waiting.
     void holdCatalogApplyAtBootForTest(bool on) noexcept { holdCatalogApplyAtBootForTest_ = on; }
+    /// Test seam (issue #15), before start(): the `__security` applier applies nothing from the admin thread's first
+    /// pass on (the replica still fetches) until holdSecurityApplyForTest(false) - a restarted broker whose local
+    /// state is behind the cluster's.
+    void holdSecurityApplyAtBootForTest(bool on) noexcept { holdSecurityApplyAtBootForTest_ = on; }
     /// Catalog history Task 22 (checklist 1): a REAL crash for the 3-node slice - stop() without the
     /// controlled-shutdown protocol (no halt, no consensus hand-off, no goodbye to the members): the
     /// threads are joined and the transport torn down, nothing is answered or flushed on purpose.
@@ -2114,6 +2132,13 @@ private:
     void onSecurityApplied_(const uint8_t* p, std::size_t n);
     void failSecurityClosed_(int64_t offset, const std::string& describe);   // Task 14 (D28)
     void onSecurityHalted_(const uint8_t* p, std::size_t n);
+    // Issues #15 / #111 (decision M7): the SecurityServing state (control thread).  kA2cSecurityServing feeds the admin
+    // thread's catch-up verdict; every control pass steps it with the consensus contact (the election CLOSED); a change
+    // is published to the gateway (logins / -7 reads / security DDL answer AuthUnavailable unless Serving), and Stale
+    // longer than R ends the authenticated sessions (48, session level).
+    void onSecurityServing_(const uint8_t* p, std::size_t n);
+    int stepSecurityServing_(int64_t nowNs);
+    std::optional<SecurityServing> securityServing_;   // engaged iff the broker authenticates (gateway Required)
     void publishSecurityMetrics_() noexcept;
     [[nodiscard]] bool securityMetricsPending_() const noexcept;
     int  serviceAuthMode_(int64_t nowNs);
@@ -2400,7 +2425,7 @@ private:
     /// Review C I4: the cluster key(s), loaded ONCE in start() (nullopt unless authMode == Enabled); every component
     /// (gateway now, peer links / frame crypto in Tasks 15-16) takes a copy of THIS.
     std::optional<rune::peerlink::ClusterKeys>            clusterKeys_;
-    struct HeldMirror { bool on = false; std::vector<std::vector<uint8_t>> frames; };   // test seam (control thread)
+    struct HeldMirror { bool on = false; std::vector<std::pair<int32_t, std::vector<uint8_t>>> frames; };   // test seam (control thread): (ring type, bytes)
     HeldMirror                                            heldMirror_;
     uint64_t                                              securityAnswersHeld_    = 0;
     uint64_t                                              securityAnswersDropped_ = 0;
@@ -2457,6 +2482,7 @@ private:
     int                                                   bootReplays_ = 0;      // replayLocal calls that returned >= 0
     bool                                                  bootReconcileDeferred_ = false;   // B6: the admin thread reconciles after catch-up
     bool                                                  holdCatalogApplyAtBootForTest_ = false;
+    bool holdSecurityApplyAtBootForTest_ = false;   // issue #15 test seam (startup thread, before start)
     std::vector<int32_t>                                  topicsAtReplicationBuild_;   // serving topic ids when replication was built
     std::thread::id                                       controlThreadId_;   // start() (controller); see controlThreadIdForTest
     // Control thread: the last consensus-driven catalog role posted (single node).
