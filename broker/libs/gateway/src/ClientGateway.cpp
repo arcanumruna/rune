@@ -8380,7 +8380,7 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
     ++loginsOk_;
     loginThrottle_.onSuccess(user, session->sourceHost);
     spdlog::info("auth: login ok user={} source={} session={}", ok.user, session->sourceHost, session->sessionId);
-    if (!session->crypto.encrypted)   // D12: TLS stays optional - said once per session (a session logs in once)
+    if (!session->crypto.encrypted)   // only under ClientTransport::PlaintextForTest (M1, issue #10) - said once per session
         spdlog::warn("auth: session {} authenticated over plaintext (no TLS): frames are not integrity-protected",
                      session->sessionId);
     if (ok.mustChangePassword) session->auth = AuthPasswordChangeRequired{ok.userId, ok.user, std::move(loginNonce)};

@@ -372,18 +372,23 @@ rising `rune-logins-failed` or `rune-logins-rate-limited`, and on a rising `rune
 Successful and failed logins are metrics and structured logs, not `__security` events (they are
 high-volume).
 
-## Transport security (D12)
+## Transport security (M1, replaces D12)
 
-SCRAM keeps the password off the wire, but it does not protect the data. TLS is optional in the
-broker: with authentication on and TLS not negotiated, the session is authenticated but its frames
-are not integrity-protected, and the broker logs that once per session. Without TLS, an authenticated
-session can be taken over by any UDP sender that can reach the broker (tracked issue #174).
-**In production, build with TLS and set `RUNE_REQUIRE_TLS=true`**, so a client that cannot negotiate TLS
-is refused.
+SCRAM keeps the password off the wire, but only per-frame AEAD binds a frame to its session. So **with authentication
+on, every client session is TLS**:
 
-- TLS needs a broker built with `-DRUNE_TLS=ON` (the docker image is; source builds default to OFF).
-  Without it `RUNE_REQUIRE_TLS` and the `RUNE_TLS_*` settings are silently ignored.
-- The `rune` CLI has no TLS support yet (tracked issue #179), so it cannot connect to a broker with
-  `RUNE_REQUIRE_TLS=true`. Bootstrap and security statements through the CLI need a plaintext
-  listener until that is fixed.
+- The broker answers a plaintext Connect `HandshakeFailed` (29) and creates no session. A plaintext session could be
+  taken over by any UDP sender (session ids are guessable; nothing binds a frame to its session), and its verifiers,
+  bootstrap material and `__security` reads would travel in clear. A Connect never resumes a session by its id.
+- An authenticating broker needs `RUNE_TLS_CERT_FILE` / `RUNE_TLS_KEY_FILE` or it refuses to start;
+  `RUNE_REQUIRE_TLS=false` with authentication refuses to start too.
+- TLS needs a broker built with `-DRUNE_TLS=ON`, the default (and the docker image). A build without it refuses to start
+  with authentication, and with any `RUNE_TLS_*` / `RUNE_REQUIRE_TLS` set, instead of ignoring them.
+- A client with credentials sends them only over TLS: it requires a negotiated cipher, and a refusal that arrives before
+  the TLS keys exist is unauthenticated, so it is retried rather than taken as a verdict. Each session checks the
+  broker certificate against the host of its own endpoint (a pre-TLS redirect never changes that name); the system
+  store with no name to check is refused.
+- The `rune` CLI connects over TLS: `--tls-ca` / `RUNE_TLS_CA_FILE`, `--tls-host` / `RUNE_TLS_HOST`.
+  `--insecure-plaintext` (dev-mode brokers) never sends credentials or the bootstrap.
+
 Inter-broker links are always encrypted when authentication is on.

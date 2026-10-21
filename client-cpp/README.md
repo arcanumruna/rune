@@ -28,8 +28,13 @@ default, so a client without credentials is answered `AuthenticationFailed` (`Cl
 rune::client::ClientConfig cfg;
 cfg.username     = "ws1";
 cfg.passwordFile = "/run/secrets/ws1.pw";   // read once at construction; or cfg.password (never logged or sent)
+cfg.offerCrypto  = true;                    // credentials travel only over TLS (construction throws without it)
+cfg.tlsTrustPem  = caPem;                   // a private CA; unset = the system store
 // cfg.allowUnauthenticatedBroker = true;   // accept a dev-mode broker (RUNE_AUTH=disabled); default: refused
 ```
+
+An authenticating broker serves only TLS sessions. Each session checks the broker certificate against its own
+endpoint's host (`tlsExpectHost` overrides it), and with credentials a session never proceeds without TLS.
 
 - `AuthenticationFailed` (44) ends the session; a rate-limited login (`retryAfterMs`) is retried after the hint.
 - `NotAuthorized` (45) fails exactly that request and is never re-sent; a subscription whose `READ` was revoked ends

@@ -126,8 +126,18 @@ rune security bootstrap --admin <name> --cluster-key-file <path> --broker host:p
 Users, roles and grants are managed with Rune QL (`CREATE USER`, `GRANT`, ... in [ql.md](ql.md#security-statements)).
 
 Quickstart: [wiki, Security Quickstart](https://github.com/arcanumruna/rune/wiki/Security-Quickstart). Reference: [SECURITY.md](../../broker/docs/SECURITY.md).
-The CLI has no TLS support yet (tracked in SECURITY.md), so it needs a plaintext listener; a broker with
-`RUNE_REQUIRE_TLS=true` refuses it.
+Every command that connects reaches a UDP broker over TLS; with credentials or for the bootstrap TLS is required.
+
+| Option | What it does |
+|---|---|
+| `--tls-ca <pem>` (or `RUNE_TLS_CA_FILE`) | Trust this CA bundle instead of the system store. |
+| `--tls-host <name>` (or `RUNE_TLS_HOST`) | Certificate name to check. Default: the host of each broker's endpoint. |
+| `--insecure-plaintext` | Connect without TLS, for a dev-mode broker. It never sends credentials or the bootstrap: with `--user`, a password file or `security bootstrap` it is refused before connecting. |
+
+```bash
+rune security bootstrap --admin admin --cluster-key-file cluster.key --broker rune-1:40200 --tls-ca ca.pem
+RUNE_TLS_CA_FILE=ca.pem rune ql --user admin --password-file admin.pw -e "show users;" --broker rune-1:40200
+```
 
 ## Related tools
 
