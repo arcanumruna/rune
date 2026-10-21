@@ -1650,6 +1650,11 @@ private:
                                    bool isGroup, bool groupCarrierReceived,
                                    int64_t subscribeCorrId = 0);
     void forwardUnsubscribeToWorker_(int64_t subId, int32_t topicId, int32_t partition);
+    /// Issue #118 (X020, M10): under authentication a Subscribe without its own record egress is never handed to a
+    /// worker (it would push on the shared MDC egress every joiner receives): retired NotLeader (a group member's:
+    /// the session's members evicted).  Control thread, cold.
+    void retireWithoutRecordEgress_(int64_t subId);
+    uint64_t subscribesWithoutRecordEgress_ = 0;   ///< issue #118: subscriptions retired for want of their own egress
 
     // Hybrid egress: a Subscribe deferred until its session's per-consumer UNICAST
     // Records publication resolves (NON-BLOCKING — never sleeps on the control
@@ -2937,6 +2942,8 @@ public:
     void noteControlledImagesForTest(int images) noexcept { noteControlledImages_(images); }
     void injectPendingRecordEgressForTest(int64_t sid, int32_t worker) { pendingRecordEgress_[{sid, worker}]; }
     [[nodiscard]] std::size_t pendingRecordEgressCountForTest() const noexcept { return pendingRecordEgress_.size(); }
+    /// Issue #118: subscriptions retired because they had no record egress of their own under authentication.
+    [[nodiscard]] uint64_t subscribesWithoutRecordEgressForTest() const noexcept { return subscribesWithoutRecordEgress_; }
 private:
     int64_t                                 lastFlushNs_ = 0;
 

@@ -4259,6 +4259,14 @@ void ClientGateway::releaseAwaiting_(const BufferedSubscribe& s, void* egressPub
 
 void ClientGateway::enqueueSubscribeOp_(const BufferedSubscribe& s, void* egressPub)
 {
+    // Issue #118 (X020, M10): the ONE place a Subscribe without its own record egress would reach a worker - which then
+    // pushes on its shared dynamic-MDC publication, received by every party joined to the worker's advertised control
+    // port.  Under authentication that is a disclosure to principals without READ: the subscription is retired
+    // retriably instead (never a fallback).
+    if (egressPub == nullptr && authMode_ == rune::gateway::GatewayAuthMode::Required) [[unlikely]] {
+        retireWithoutRecordEgress_(s.subId);
+        return;
+    }
     if (const auto it = subscriptions_.find(s.subId); it != subscriptions_.end()) it->second.cursor = Cursor::AtWorker;
     rune::node::WorkerOp op = buildSubscribeOp_(s, egressPub);
 
@@ -4296,6 +4304,11 @@ bool ClientGateway::trySubOp_(const PendingSubOp& p)
     }
     // Re-resolve the egress publication NOW (never a pointer held across cycles).
     void* egressPub = nullptr;
+    if (p.mdc && authMode_ == rune::gateway::GatewayAuthMode::Required) [[unlikely]] {
+        // Issue #118: never queued under authentication (enqueueSubscribeOp_ retires it); defensive - nothing is sent.
+        retireWithoutRecordEgress_(p.sub.subId);
+        return true;
+    }
     if (!p.mdc) {
         rune::gateway::Session* sess = sessions_.find(p.sub.sessionId);
         if (!sess) return true;   // session gone: the Subscribe is moot (dropped)
@@ -4343,9 +4356,10 @@ void ClientGateway::forwardSubscribeToWorker_(int64_t subId, int64_t sessionId,
     //     the pub is ready (drained by pollPendingRecordEgress_).  Never blocks the
     //     control thread.
     if (!sess || !workerPool_) {
-        enqueueSubscribeOp_(s, nullptr);
+        enqueueSubscribeOp_(s, nullptr);   // under authentication: retired (issue #118)
         return;
     }
+    const bool authRequired = authMode_ == rune::gateway::GatewayAuthMode::Required;
     const int32_t wid = workerPool_->ownerWorkerId(topicId, partition);
     if (auto it = sess->recordEgressByWorker.find(wid);
         it != sess->recordEgressByWorker.end() && it->second) {
@@ -4353,6 +4367,9 @@ void ClientGateway::forwardSubscribeToWorker_(int64_t subId, int64_t sessionId,
         return;
     }
     if (sess->egressChannel.empty() || !aeron_) {
+        // Issue #118: under authentication the Subscribe waits as a FAILED resolve (regId -1), so the retirement is
+        // answered on the next pass, after this Subscribe's OK (the client then re-subscribes from its position).
+        if (authRequired) [[unlikely]] { parkAwaitingEgress_(s); return; }
         enqueueSubscribeOp_(s, nullptr);
         return;
     }
@@ -4371,8 +4388,16 @@ void ClientGateway::forwardSubscribeToWorker_(int64_t subId, int64_t sessionId,
             pend.requestedAtNs = nowNs_;
         } catch (...) {
             spdlog::warn("ClientGateway: record-egress pub create threw for session {} "
-                         "worker {} (channel '{}'); Subscribe uses MDC fallback",
-                         sessionId, wid, sess->egressChannel);
+                         "worker {} (channel '{}'); Subscribe {}",
+                         sessionId, wid, sess->egressChannel,
+                         authRequired ? "retired (no shared-egress fallback under authentication)" : "uses MDC fallback");
+            if (authRequired) [[unlikely]] {   // issue #118: answered on the next pass, after the OK
+                pend.regId = -1;
+                pend.requestedAtNs = nowNs_;
+                pend.waiters.push_back(s);
+                if (const auto it = subscriptions_.find(subId); it != subscriptions_.end()) it->second.cursor = Cursor::AwaitingEgress;
+                return;
+            }
             pendingRecordEgress_.erase({sessionId, wid});
             enqueueSubscribeOp_(s, nullptr);
             return;
@@ -4418,8 +4443,11 @@ void ClientGateway::pollPendingRecordEgress_(int64_t nowNs)
         }
         if (timedOut || pend.regId < 0) {
             spdlog::warn("ClientGateway: record-egress pub for session {} worker {} did not "
-                         "resolve ({} waiters) — falling back to MDC",
-                         sessionId, workerId, pend.waiters.size());
+                         "resolve ({} waiters) — {}",
+                         sessionId, workerId, pend.waiters.size(),
+                         authMode_ == rune::gateway::GatewayAuthMode::Required
+                             ? "retired NotLeader (no shared-egress fallback under authentication)"
+                             : "falling back to MDC");
             for (const auto& w : pend.waiters) releaseAwaiting_(w, nullptr);
             it = pendingRecordEgress_.erase(it);
             continue;
@@ -4438,6 +4466,48 @@ void ClientGateway::onRecordEgressResolved_(int64_t sessionId, int32_t workerId,
     }
     // else: the session closed meanwhile — its buffered subscribes are moot and
     // the pub (never handed to a worker) is released with `pub`.
+}
+
+void ClientGateway::retireWithoutRecordEgress_(int64_t subId)
+{
+    // Issue #118: a subscription this broker cannot serve on its own per-session record egress under authentication.
+    // Explicit, retriable, never silent: a plain subscription gets the position note + NotLeader on its correlation id
+    // (the client's moved-subscription path re-subscribes from its position, bounded by its retry budget); a group
+    // member's partition subscription evicts the session's members (the consumer rejoins).  Nothing reaches a worker.
+    const auto it = subscriptions_.find(subId);
+    if (it == subscriptions_.end()) return;   // ended meanwhile: nothing to answer
+    const Subscription sub = it->second;
+    subscriptions_.erase(it);
+    ++subscribesWithoutRecordEgress_;
+    if ((subscribesWithoutRecordEgress_ & (subscribesWithoutRecordEgress_ - 1)) == 0)   // first + each power of two
+        spdlog::warn("ClientGateway: subscription {:#x} (session {}, topic {} partition {}) has no record egress of its "
+                     "own - retired NotLeader, never pushed on the shared egress under authentication (so far: {})",
+                     subId, sub.sessionId, sub.topicId, sub.partition, subscribesWithoutRecordEgress_);
+    Session* session = sessions_.find(sub.sessionId);
+    if (session == nullptr) return;           // closed: it ended with its session
+    if (sub.isGroup) {
+        if (const auto g = groupMemberSubs_.find(sub.sessionId); g != groupMemberSubs_.end())
+            std::erase(g->second, subId);
+        if (groupService_ != nullptr) groupService_->evictSessionMembers(sub.sessionId, nowNs_);
+        return;
+    }
+    session->subIdByKey.erase(Session::SubKey{sub.subscribeCorrId, sub.topicId, sub.partition});
+    if (pc::clientUnderstandsMovedPositionNote(session->clientVersion)) {
+        pc::Records note;
+        note.sessionId      = sub.sessionId;
+        note.correlationId  = sub.subscribeCorrId;
+        note.subscriptionId = subId;
+        note.topicId        = sub.topicId;
+        note.partition      = sub.partition;
+        note.baseOffset     = sub.nextOffset;
+        note.recordBatch    = {};
+        sendAnswer_(*session, scratch_.data(), note.encode(scratch_.data()));
+    }
+    pc::ErrorResponse err;
+    err.sessionId     = sub.sessionId;
+    err.correlationId = sub.subscribeCorrId;
+    err.code          = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+    sendAnswer_(*session, scratch_.data(), err.encode(scratch_.data()));
 }
 
 void ClientGateway::forwardUnsubscribeToWorker_(int64_t subId, int32_t topicId, int32_t partition)

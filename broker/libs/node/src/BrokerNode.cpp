@@ -1715,7 +1715,10 @@ void BrokerNode::buildWorkerPool() {
     // whatever the worker mode; one without a sink (non-shard per-worker ingress is refused at config time, but a
     // programmatic config could still reach here) refuses every direct-ingress produce.
     if (config_.authMode == AuthMode::Enabled)
-        for (int32_t i = 0; i < wc; ++i) workerPool_->worker(i).requireEnforcement();
+        for (int32_t i = 0; i < wc; ++i) {
+            workerPool_->worker(i).requireEnforcement();
+            workerPool_->worker(i).requirePerSessionEgress();   // issue #118: no Records on the shared MDC egress
+        }
 
     // Apply desired fragment limit + ack-slot reservation size from NodeConfig to
     // each worker (before runners start).

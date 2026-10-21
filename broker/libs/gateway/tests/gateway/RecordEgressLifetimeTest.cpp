@@ -437,3 +437,106 @@ TEST(RecordEgressLifetimeRegression, ASubscribeAwaitingItsEgressPubReachesTheWor
     EXPECT_FALSE(r.gw.subscriptionAwaitsEgressForTest(42));
     EXPECT_EQ(w.subscriptionsForTest().size(), 1u) << "the harness path delivers (so the cancel test is not vacuous)";
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #118 (X020, combined-fix M10): under authentication a Subscribe NEVER falls back to the worker's shared
+// dynamic-MDC publication - every party joined to that worker's control port would receive the Records, READ or not.
+// A Subscribe whose per-session record egress cannot be created or resolved is retired retriably instead (the position
+// note + NotLeader on its correlation id: the client re-subscribes from its position), and the worker never holds a
+// cursor without its own egress.  Outside authentication the MDC fallback stays (the tests above).
+// ─────────────────────────────────────────────────────────────────────────────
+namespace {
+
+struct AuthRigEgress : Rig {
+    std::vector<pc::ErrorResponse> errors;
+    explicit AuthRigEgress(int32_t workers = 1) : Rig(workers) {
+        gw.setOnEgressFrame([this](int64_t, const uint8_t* b, std::size_t n) {
+            const auto hdr = pc::MessageHeader::decode(b, n);
+            if (hdr && hdr->templateId == static_cast<uint16_t>(pc::TemplateId::ErrorResponse))
+                if (auto e = pc::ErrorResponse::decode(b, n)) errors.push_back(*e);
+        });
+        gw.setAuthMode(GatewayAuthMode::Required, nullptr);
+    }
+    int64_t authenticatedSession() {
+        const int64_t sid = gw.injectTestSession(0);
+        gw.setSessionAuthForTest(sid, AuthAuthenticated{1, "reader", PermissionTable::allowAll(), {}});
+        return sid;
+    }
+    [[nodiscard]] int errorOn(int64_t corr) const {
+        for (const auto& e : errors) if (e.correlationId == corr) return e.code;
+        return -1;
+    }
+    [[nodiscard]] static bool anyCursorWithoutItsOwnEgress(rune::node::Worker& w) {
+        for (const auto& s : w.subscriptionsForTest()) if (s.egressPub == nullptr) return true;
+        return false;
+    }
+};
+
+}  // namespace
+
+// The issue's repro at the gateway: consumer A (READ) subscribes, its unicast record egress cannot be resolved (the
+// session has no egress endpoint here, the same path as a failed add or a resolve timeout).  RED before the fix: the
+// Subscribe reached the worker with egressPub = null - the worker pushed A's topic on the shared MDC publication that
+// every joiner of the worker's advertised control port (B, without READ) receives.
+TEST(AuthEnforcementRegression, NoRecordIsEverBroadcastToAnUnauthorizedSubscriberRegression) {
+    AuthRigEgress r;
+    auto& w = r.pool.worker(r.owner(0));
+    const int64_t sid = r.authenticatedSession();
+    r.subscribe(sid, 0);                                       // corr 77
+    for (int pass = 0; pass < 4; ++pass) {
+        r.gw.pollPendingRecordEgressForTest(1 + pass);
+        r.gw.pumpRetryQueuesForTest();
+        w.doWork(1 + pass);
+    }
+    EXPECT_FALSE(AuthRigEgress::anyCursorWithoutItsOwnEgress(w)) << "a cursor on the shared MDC egress broadcasts";
+    EXPECT_TRUE(w.subscriptionsForTest().empty());
+    EXPECT_EQ(r.errorOn(77), static_cast<int>(pc::ErrorCode::NotLeader))
+        << "the subscription is retired retriably on its correlation id, never left silent";
+    EXPECT_EQ(r.gw.subscriptionCount(), 0u) << "the gateway holds no subscription it cannot serve";
+}
+
+// The same rule on the deferred path: a Subscribe parked for its egress pub whose resolve fails (regId -1 / timeout).
+TEST(AuthEnforcementRegression, AFailedRecordEgressResolveNeverFallsBackToTheSharedEgressRegression) {
+    AuthRigEgress r;
+    auto& w = r.pool.worker(r.owner(0));
+    const int64_t sid = r.authenticatedSession();
+    r.gw.addSubscriptionAwaitingEgressForTest(/*subId=*/43, sid, 0, 0);
+    r.gw.pollPendingRecordEgressForTest(1);                    // the resolve failed: the fallback branch
+    r.gw.pumpRetryQueuesForTest();
+    w.doWork(1);
+    w.doWork(2);
+    EXPECT_FALSE(AuthRigEgress::anyCursorWithoutItsOwnEgress(w));
+    EXPECT_TRUE(w.subscriptionsForTest().empty());
+    EXPECT_EQ(r.gw.pendingRecordEgressCountForTest(), 0u);
+    EXPECT_EQ(r.gw.subscriptionCount(), 0u);
+}
+
+// Positive control: under authentication a session WITH its own record egress is forwarded with that pub.
+TEST(AuthEnforcementRegression, ASessionWithItsOwnRecordEgressStillReachesTheWorkerUnderAuthRegression) {
+    AuthRigEgress r;
+    FakePub pub;
+    auto& w = r.pool.worker(r.owner(0));
+    const int64_t sid = r.authenticatedSession();
+    r.gw.injectRecordEgressForTest(sid, r.owner(0), pub.make());
+    r.subscribe(sid, 0);
+    w.doWork(1);
+    ASSERT_EQ(w.subscriptionsForTest().size(), 1u);
+    EXPECT_EQ(w.subscriptionsForTest()[0].egressPub, pub.ptr());
+    EXPECT_EQ(r.errorOn(77), -1);
+    r.gw.closeSessionForTest(sid);
+    w.doWork(2);
+    r.gw.drainWorkerReturnsForTest(3);
+}
+
+// Issue #118, the worker's own check: an authenticating broker's worker (requirePerSessionEgress) never registers a
+// cursor without its session's egress, even if a Subscribe op without one reached it (here: an InProcess gateway sends
+// it).  RED before the fix: the worker registered it and pushed on the shared MDC publication.
+TEST(AuthEnforcementRegression, AnAuthenticatingWorkerNeverRegistersACursorWithoutItsOwnEgressRegression) {
+    Rig r(1);
+    auto& w = r.pool.worker(r.owner(0));
+    w.requirePerSessionEgress();
+    r.gw.forwardSubscribeForTest(51, /*sessionId=*/0, 0, 0, 0, 0, false, false, /*corr=*/9);
+    w.doWork(1);
+    EXPECT_TRUE(w.subscriptionsForTest().empty());
+    EXPECT_EQ(w.subscribesRefusedWithoutEgressForTest(), 1u);
+}

@@ -696,6 +696,12 @@ public:
     void requireEnforcement() noexcept {
         if (!std::holds_alternative<Enforcing>(enforcement_)) enforcement_ = Enforcing{ackSink_.get()};
     }
+    /// Issue #118 (X020): the broker authenticates - a subscription is pushed ONLY on its session's own record egress,
+    /// never on this worker's shared dynamic-MDC publication (every joiner of the advertised control port receives
+    /// that).  A Subscribe op without an egress pub is refused (the gateway never sends one under authentication; this
+    /// is the worker's own fail-closed check).  Before the runner starts.
+    void requirePerSessionEgress() noexcept { perSessionEgressRequired_ = true; }
+    [[nodiscard]] uint64_t subscribesRefusedWithoutEgressForTest() const noexcept { return subscribesRefusedWithoutEgress_; }
     /// Combined fix program (X036, review I1/I3): true when a client-supplied Produce record-batch span must be REFUSED.
     /// A client produce frame carries EXACTLY ONE batch: the append CRC-checks, producer-checks and offset-restamps only
     /// the first batch yet writes the whole span, so a second batch (or trailing bytes) would land unvalidated and break
@@ -2704,6 +2710,17 @@ private:
     // -------------------------------------------------------------------
     void executeSubscribeWire_(sbe::WorkerOp& op) {
         const int64_t subId = op.subscriptionId();
+        if (perSessionEgressRequired_ && op.egressPub() == 0) [[unlikely]] {
+            // Issue #118: never a cursor on the shared egress under authentication; an existing entry of the id is
+            // dropped too (fail closed: its records must not move to the shared publication).
+            for (std::size_t i = 0; i < subs_.size(); ++i)
+                if (subs_[i].subscriptionId == subId) { subs_[i] = subs_.back(); subs_.pop_back(); break; }
+            if ((subscribesRefusedWithoutEgress_++ & 1023) == 0)
+                spdlog::error("Worker {}: Subscribe {:#x} without its own record egress refused - the shared egress "
+                              "carries no Records under authentication (refused so far: {})",
+                              workerId_, subId, subscribesRefusedWithoutEgress_);
+            return;
+        }
         for (auto& s : subs_) {
             if (s.subscriptionId == subId) {
                 s.sessionId            = op.sessionId();
@@ -4643,6 +4660,8 @@ private:
     struct Enforcing { SessionAckSink* sink = nullptr; };
     using EnforcementMode = std::variant<NotEnforcing, Enforcing>;
     EnforcementMode enforcement_{NotEnforcing{}};
+    bool     perSessionEgressRequired_       = false;   ///< issue #118: set once before the runner starts
+    uint64_t subscribesRefusedWithoutEgress_ = 0;
     // Fix round 1 (C1b/c) — the session ack queue bound.  A = queued acks, O =
     // owed returns (reservedAckSlots_, <= kMaxOwedReturnsCeiling).  Every intake
     // step is limited by ackRoom_() = kAckCapacity − A − O (op drain:
