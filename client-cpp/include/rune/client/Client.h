@@ -1610,6 +1610,7 @@ private:
     static uint64_t fetchEpochTrampoline_(void* ctx, uint32_t session) noexcept;
     static void fetchReviveTrampoline_(void* ctx, uint32_t session) noexcept;
     static int32_t fetchBrokerVersionTrampoline_(void* ctx, uint32_t session) noexcept;
+    static int32_t subscribeBrokerVersionTrampoline_(void* ctx, uint32_t session) noexcept;   // Phase 2c: 0 unless Connected
     /// M1 (duty thread, while a group consumer exists): a leader-node session a
     /// group partition subscribes through was lost (left Connected) or became
     /// terminally Disconnected — ask for metadata (the leader may have moved),
@@ -1816,7 +1817,7 @@ private:
                                 int32_t                  partition,
                                 uint8_t                  partitionKnown,
                                 std::span<const uint8_t> keyBytes,
-                                SubscribeOptions         opts,
+                                SubscribeOptions&        opts,   // the caller's own copy: callbacks are moved out
                                 RecordHandler            handler);
 
     // -------------------------------------------------------------------------

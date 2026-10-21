@@ -275,6 +275,8 @@ target_include_directories(rune_client INTERFACE
     $<INSTALL_INTERFACE:include>
 )
 target_link_libraries(rune_client INTERFACE spdlog::spdlog)
+# Phase 2c: the public headers (DataCodec.h, Subscription.h) include rune/codec/FilterWire.h.
+target_include_directories(rune_client INTERFACE ${RUNE_CODEC_ROOT}/include)
 # Authentication (Task 7): the SCRAM client's salted-password cache (SessionMachine.h uses it).
 add_library(rune_client_scram STATIC src/session/ScramClient.cpp)
 target_include_directories(rune_client_scram PUBLIC
@@ -1039,7 +1041,7 @@ if(BUILD_TESTING)
         tests/DataConformanceTest.cpp
     )
     target_link_libraries(rune_client_tests PRIVATE rune_client GTest::gtest_main)
-    target_include_directories(rune_client_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${RUNE_CODEC_ROOT}/include)   # DataCodec.h: FilterWire.h
+    target_include_directories(rune_client_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})
     target_compile_definitions(rune_client_tests PRIVATE
         RUNE_CONFORMANCE_DIR="${RUNE_CONFORMANCE_DIR}"
     )

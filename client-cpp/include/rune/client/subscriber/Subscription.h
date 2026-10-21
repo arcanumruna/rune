@@ -26,6 +26,7 @@
 #include <rune/codec/FilterWire.h>
 
 #include <concepts>
+#include <cstring>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -233,8 +234,18 @@ struct SubscriptionImpl {
     RecordHandler handler;             // always valid (non-null after subscribe())
     std::function<void(int64_t, uint64_t)> onCaughtUp;   // catalog subscriptions only (may be empty)
     std::function<void(uint64_t)> onHistoryEpoch;        // catalog subscriptions only (may be empty)
-    rune::codec::FilterBytes filter;                     // Phase 2c: the encoded filter (empty = unfiltered)
-    [[nodiscard]] bool filtered() const noexcept { return !filter.empty(); }
+    // Phase 2c: the encoded filter, exact-size heap bytes allocated once at subscribe (the cold app-thread path);
+    // an unfiltered subscription allocates and stores nothing.
+    std::unique_ptr<uint8_t[]> filterData;
+    uint16_t                   filterLen = 0;
+    void setFilter(const rune::codec::FilterBytes& b) {
+        if (b.empty()) return;
+        filterData = std::make_unique<uint8_t[]>(b.len);
+        std::memcpy(filterData.get(), b.bytes.data(), b.len);
+        filterLen = b.len;
+    }
+    [[nodiscard]] std::span<const uint8_t> filterSpan() const noexcept { return {filterData.get(), filterLen}; }
+    [[nodiscard]] bool filtered() const noexcept { return filterLen != 0; }
 
     // ---- Duty-thread owned ------------------------------------------------------
     int64_t subscriptionId = 0;  // bound by SubscribeResponse (0 = pending)

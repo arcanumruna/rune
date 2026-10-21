@@ -254,7 +254,7 @@ Client::Client(ClientConfig cfg)
     // from the duty thread (retried every duty cycle on refusal), never via the
     // command ring.
     subscriberHub_.setDirectSend(&Client::directSendTrampoline_, this);
-    subscriberHub_.setBrokerVersionFn(&Client::fetchBrokerVersionTrampoline_, this);   // Phase 2c (SD3)
+    subscriberHub_.setBrokerVersionFn(&Client::subscribeBrokerVersionTrampoline_, this);   // Phase 2c (SD3)
     groupConsumerHub_.setDirectSend(&Client::coordDirectSendTrampoline_, this);  // D4: the coordinator
     // D4: every group frame goes to the COORDINATOR session — the seed's ring
     // path (unchanged) while the coordinator is the seed, else that node's own
@@ -3989,7 +3989,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
             // Phase 2c: a refusal with a detail (a filter the broker rejected) is surfaced through onError, naming
             // what was asked for.  The target is read before the hub forgets the pending Subscribe.
             int32_t refusedTopic = -1, refusedPartition = -1;
-            const bool refusedWithDetail = opt->errorCode != 0 && !opt->detail.empty() &&
+            const bool refusedWithDetail = opt->errorCode != 0 && (!opt->detail.empty() || opt->detailMalformed) &&
                 subscriberHub_.pendingSubscribeTarget(opt->correlationId, refusedTopic, refusedPartition);
             subscriberHub_.onSubscribeResponse(
                 *opt,
@@ -4005,7 +4005,9 @@ void Client::onEgressFrame(codec::TemplateId tid,
                                        ? "InvalidRequest" : "Error";
                 const std::string msg = "subscribe topic " + std::to_string(refusedTopic) + " partition " +
                                         std::to_string(refusedPartition) + " refused: " + name + " (" +
-                                        std::to_string(code) + "): " + std::string(opt->detail);
+                                        std::to_string(code) + "): " +
+                                        (opt->detailMalformed ? std::string("(detail malformed, dropped)")
+                                                              : std::string(opt->detail));
                 invokeUserCallback_("onError", [&] { cbError_(msg); });
             }
         }
@@ -4845,7 +4847,7 @@ Subscription Client::subscribeImpl(TopicHandle              topic,
                                     int32_t                  partition,
                                     uint8_t                  partitionKnown,
                                     std::span<const uint8_t> keyBytes,
-                                    SubscribeOptions         opts,
+                                    SubscribeOptions&        opts,
                                     RecordHandler            handler)
 {
     // Build the impl.  Its immutable fields are written HERE, before the
@@ -4861,7 +4863,7 @@ Subscription Client::subscribeImpl(TopicHandle              topic,
     impl->fromWire      = opts.from.toWire();
     impl->isolation     = static_cast<uint8_t>(opts.isolation);
     impl->handler       = std::move(handler);
-    impl->filter        = opts.filterBytes;   // Phase 2c: encoded once, here; every (re-)send reuses it
+    impl->setFilter(opts.filterBytes);   // Phase 2c: copied once, here; every (re-)send reuses it
     // Catalog history (Task 13): the epoch note / caught-up marker callbacks (TopicHandle::catalog()).
     if (isEventLogTopic(topic.topicId)) {
         impl->onCaughtUp     = std::move(opts.onCaughtUp);
@@ -4980,6 +4982,13 @@ int64_t Client::fetchSessionIdTrampoline_(void* ctx, uint32_t session) noexcept 
 
 uint64_t Client::fetchEpochTrampoline_(void* ctx, uint32_t session) noexcept {
     return static_cast<Client*>(ctx)->agent_.connectedEpoch(session);
+}
+
+// Phase 2c (SD3): the subscribe gate's version — 0 unless the session is Connected NOW.  The agent keeps the last
+// accepted version across a disconnect; a node restarted on a newer broker must not be judged by it.
+int32_t Client::subscribeBrokerVersionTrampoline_(void* ctx, uint32_t session) noexcept {
+    auto& agent = static_cast<Client*>(ctx)->agent_;
+    return agent.connectedEpoch(session) != 0 ? agent.sessionBrokerVersion(session) : 0;
 }
 
 int32_t Client::fetchBrokerVersionTrampoline_(void* ctx, uint32_t session) noexcept {

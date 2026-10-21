@@ -157,6 +157,7 @@ struct InvokerGateway {
     // Phase 2c: the refusal text sent with subscribeErrorCode (a session >= kClientVersionFilter gets it as the
     // SubscribeResponse detail trailer; this gateway's sessions always are).
     std::string subscribeErrorDetail;
+    bool        subscribeBadDetailTrailer = false;   // append a half length prefix after the 38 fixed bytes
     // E2 round 6 (F1): a TRANSIENT partition's current data lineage (partition ->
     // token).  A Subscribe carrying a lineage CLAIM (partitionKnown, 8-byte key)
     // for a partition listed here with another token is answered
@@ -1648,8 +1649,9 @@ private:
                 rp::SubscribeResponse r;
                 r.sessionId = sv->sessionId; r.correlationId = sv->correlationId; r.errorCode = subscribeErrorCode;
                 r.partition = -1; r.subscriptionId = 0; r.detail = subscribeErrorDetail;
-                std::vector<uint8_t> eout(r.encodedSizeWithDetail());
-                const std::size_t en = r.encodeFor(eout.data(), rp::kClientVersion, eout.size());
+                std::vector<uint8_t> eout(r.encodedSizeWithDetail() + 1);
+                std::size_t en = r.encodeFor(eout.data(), rp::kClientVersion, eout.size());
+                if (subscribeBadDetailTrailer) { r.detail = {}; en = r.encode(eout.data()); eout[en++] = 0x05; }
                 if (en > 0) send(replyFromArrival ? endpoint : 0, eout.data(), en);
                 return;
             }

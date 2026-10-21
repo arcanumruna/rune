@@ -121,7 +121,7 @@ std::unique_ptr<SubscribeRequest> SubscriberHub::makeSubscribeRequest(
         keyBytes,
         sessionId,
         impl->correlationId,
-        impl->filter.span());
+        impl->filterSpan());
 
     auto req = std::make_unique<SubscribeRequest>();
     req->impl     = impl;
@@ -642,7 +642,7 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv, int64_t currentSessi
 
                 impl.nextOffset = absOffset + 1;
             });
-            if (impl.filtered() && last + 1 > impl.nextOffset) [[unlikely]] impl.nextOffset = last + 1;   // the rebuilt batch spans its source
+            if (impl.active && impl.filtered() && last + 1 > impl.nextOffset) [[unlikely]] impl.nextOffset = last + 1;   // the rebuilt batch spans its source; not past records an unsubscribing handler never got
         }
         if (batchLen >= rest.size()) break;
         rest = rest.subspan(batchLen);
@@ -801,7 +801,7 @@ bool SubscriberHub::rearmMovedAway(int64_t correlationId, int64_t newCorrId, int
         const std::size_t frameLen = codec::encodeSubscribe(frameBuf, sizeof(frameBuf), impl.topicId, part,
                                                             /*partitionKnown=*/1, from, impl.isolation,
                                                             lineageClaim_(impl, claim), sessionId, newCorrId,
-                                                            impl.filter.span());
+                                                            impl.filterSpan());
         if (frameLen == 0) return false;
         auto req = std::make_unique<SubscribeRequest>();   // cold: once per leadership move
         req->impl     = &impl;
@@ -885,7 +885,7 @@ bool SubscriberHub::restartFromLogStart(int64_t correlationId, int64_t seedSid,
     const std::size_t frameLen = codec::encodeSubscribe(frameBuf, sizeof(frameBuf), impl.topicId, part,
                                                         /*partitionKnown=*/1, kFromEarliest, impl.isolation,
                                                         std::span<const uint8_t>{}, seedSid, correlationId,
-                                                        impl.filter.span());
+                                                        impl.filterSpan());
     if (frameLen == 0) return false;
     try {
         it->second->subscribeFrame.assign(frameBuf, frameBuf + frameLen);
@@ -1072,7 +1072,7 @@ int SubscriberHub::driveHomed(int64_t seedSid, std::chrono::steady_clock::time_p
         const std::size_t frameLen = codec::encodeSubscribe(frameBuf, sizeof(frameBuf), impl.topicId, part,
                                                             /*partitionKnown=*/1, from, impl.isolation,
                                                             lineageClaim_(impl, claim), seedSid, newCorr,
-                                                            impl.filter.span());
+                                                            impl.filterSpan());
         if (frameLen == 0) { ++homed; continue; }
         std::unique_ptr<SubscribeRequest> req;
         try {

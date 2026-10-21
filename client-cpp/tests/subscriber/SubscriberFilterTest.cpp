@@ -261,3 +261,165 @@ TEST(SubscriberFilterRegression, WorkerInvalidRequestFailsTheBoundSubscriptionRe
 TEST(ClientFilterSchemaRegression, SharedDescriptorMatchesTheCodecToolRegression) {
     EXPECT_EQ(rune::codec::fingerprint(rune::examples::playerEventDescriptor()), E::kFingerprint);
 }
+
+// ---- Fix round 1 ------------------------------------------------------------------------------------------------
+
+// I1: the handler unsubscribes on the first record of a rebuilt batch: the position must not jump past the
+// matches it never got, or the documented "re-subscribe from position()" loses them.
+TEST(SubscriberFilterRegression, HandlerUnsubscribeMidBatchKeepsTheLastDeliveredPositionRegression) {
+    FilterRig r(4326);
+    r.connect();
+    std::vector<int64_t> seen;
+    rc::Subscription* self = nullptr;
+    rc::SubscribeOptions opts;
+    opts.filter(E::Filter{.worldId = 7u});
+    auto sub = r.client.subscribe(r.client.topic("t"), 0, opts, [&](const rc::Record& rec) {
+        seen.push_back(rec.offset);
+        if (self != nullptr) self->unsubscribe();
+    });
+    self = &sub;
+    ASSERT_TRUE(r.drive([&] { return sub.subscriptionId() != 0; }));
+    r.gw.pushBatch(*r.firstSub(), 10, holedBatch(10));
+    ASSERT_TRUE(r.drive([&] { return sub.finished(); }));
+    EXPECT_EQ(seen, (std::vector<int64_t>{10}));
+    EXPECT_EQ(sub.position(), 11) << "last delivered + 1, not the batch end (15)";
+    // Re-subscribe from position(): the broker re-sends the batch from 11 on; the record at 12 is delivered.
+    seen.clear();
+    rc::SubscribeOptions again;
+    again.from = rc::From::offset(sub.position());
+    again.filter(E::Filter{.worldId = 7u});
+    auto sub2 = r.client.subscribe(r.client.topic("t"), 0, again, [&](const rc::Record& rec) { seen.push_back(rec.offset); });
+    ASSERT_TRUE(r.drive([&] { return r.gw.subscribed.size() == 2 && sub2.subscriptionId() != 0; }));
+    EXPECT_EQ(r.gw.subscribed[1].fromOffset, 11);
+    r.gw.pushBatch(r.gw.subscribed[1], 10, holedBatch(10));
+    ASSERT_TRUE(r.drive([&] { return sub2.position() == 15; }));
+    EXPECT_EQ(seen, (std::vector<int64_t>{10, 12}));   // nothing between 11 and 15 was lost (10 is the broker's batch)
+}
+
+namespace {
+struct TwoNode : FilterRig {
+    int n1 = 0;
+    int port1 = 0;
+    explicit TwoNode(int32_t in) : FilterRig(in) {
+        const auto [e, p] = addNode(in);
+        n1 = e; port1 = p;
+        gw.moreBrokers = {{1, "127.0.0.1", port1}};
+        gw.partitions  = {{1, 0, /*leader*/ 0, 1, in, ""}, {1, 1, /*leader*/ 0, 1, in, ""}};
+    }
+    void redirectTo1(const test_support::InvokerGateway::Subscribed& s) {
+        gw.subscribeLeader = {{0, n1}, {1, n1}};
+        gw.partitions      = {{1, 0, n1, 1, 0, ""}, {1, 1, n1, 1, 0, ""}};
+        gw.sendError(0, static_cast<int16_t>(rune::protocol::client::ErrorCode::Redirect),
+                     "127.0.0.1:" + std::to_string(port1), s.sessionId, s.corrId);
+    }
+};
+}  // namespace
+
+// I2: a node session that is reconnecting still remembers the version of its PREVIOUS connect.  The node was
+// restarted on a newer broker: the filtered Subscribe is held until the reconnect, never failed BrokerTooOld.
+TEST(SubscriberFilterRegression, ReconnectingNodeWithAStaleOldVersionHoldsTheFilteredSubscribeRegression) {
+    TwoNode r(4328);
+    r.gw.advertisedBrokerVersionAt[r.n1] = 5;
+    r.connect();
+    // A plain subscription connects node 1's session while it is still v5.
+    r.gw.subscribeLeader = {{0, r.n1}, {1, 0}};
+    auto plain = r.client.subscribe(r.client.topic("t"), 0, {}, &noopRecords);
+    ASSERT_TRUE(r.drive([&] { return plain.subscriptionId() != 0; }));
+    const auto plainSub = r.gw.subscribed.back();
+    ASSERT_EQ(plainSub.endpoint, r.n1);
+    // The filtered one is bound on the seed (partition 1).
+    rc::SubscribeOptions opts;
+    opts.filter(E::Filter{.worldId = 7u});
+    auto filtered = r.client.subscribe(r.client.topic("t"), 1, opts, &noopRecords);
+    ASSERT_TRUE(r.drive([&] { return filtered.subscriptionId() != 0; }));
+    const auto fSub = r.gw.subscribed.back();
+    ASSERT_EQ(fSub.endpoint, 0);
+    // Node 1 restarts on v6 and its client session drops; before it reconnects, the partition moves there.
+    r.gw.advertisedBrokerVersionAt[r.n1] = 6;
+    r.gw.expireSession(plainSub.sessionId);
+    ASSERT_TRUE(r.drive([&] { return r.client.testSessionStateAt(1) != rc::session::SessionState::Connected; }));
+    r.redirectTo1(fSub);
+    ASSERT_TRUE(r.drive([&] { return r.gw.subscribed.back().endpoint == r.n1 && !r.gw.subscribed.back().filter.empty(); }))
+        << "held until node 1 reconnected, then sent";
+    EXPECT_NE(filtered.failReason(), rc::SubscriptionFailReason::BrokerTooOld);
+    EXPECT_FALSE(filtered.finished());
+}
+
+// I3: the filter survives a lost node session (driveHomed re-arms the bound subscription) ...
+TEST(SubscriberFilterRegression, FilterSurvivesALostNodeSessionRearmRegression) {
+    TwoNode r(4330);
+    r.connect();
+    rc::SubscribeOptions opts;
+    opts.filter(E::Filter{.worldId = 7u});
+    r.gw.subscribeLeader = {{0, r.n1}, {1, 0}};
+    r.gw.partitions      = {{1, 0, r.n1, 1, 4330, ""}, {1, 1, 0, 1, 4330, ""}};
+    auto sub = r.client.subscribe(r.client.topic("t"), 0, opts, &noopRecords);
+    ASSERT_TRUE(r.drive([&] { return sub.subscriptionId() != 0; }));
+    const auto first = r.gw.subscribed.back();
+    ASSERT_EQ(first.endpoint, r.n1);
+    ASSERT_FALSE(first.filter.empty());
+    r.gw.expireSession(first.sessionId);
+    ASSERT_TRUE(r.drive([&] { return r.gw.subscribed.size() == 2; })) << "re-armed on the reconnected node session";
+    EXPECT_EQ(r.gw.subscribed[1].filter, first.filter);
+    for (const auto& f : r.gw.subscribeFrames) {
+        const auto v = rcc::decodeSubscribe(f.data(), f.size());
+        ASSERT_TRUE(v.has_value());
+        EXPECT_FALSE(v->filter.empty()) << "never an unfiltered fallback";
+    }
+}
+
+// ... and a transient partition's data reset (restartFromLogStart).
+TEST(SubscriberFilterRegression, FilterSurvivesADataResetRestartRegression) {
+    FilterRig r(4332);
+    r.connect();
+    rc::SubscribeOptions opts;
+    opts.filter(E::Filter{.worldId = 7u});
+    auto sub = r.client.subscribe(r.client.topic("t"), 0, opts, &noopRecords);
+    ASSERT_TRUE(r.drive([&] { return sub.subscriptionId() != 0; }));
+    const auto first = *r.firstSub();
+    r.gw.sendLineageNote(first, 1);
+    r.gw.pushRecords(first, 0, 3);
+    ASSERT_TRUE(r.drive([&] { return sub.position() == 3; }));
+    r.gw.partitionLineage[0] = 2;   // the partition's data was reset: the resume's claim (1) no longer matches
+    r.gw.sendError(0, static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader), "", first.sessionId, first.corrId);
+    ASSERT_TRUE(r.drive([&] { return r.gw.dataResetAnswers == 1 && r.gw.subscribed.size() == 2; }));
+    EXPECT_EQ(sub.dataResets(), 1u);
+    EXPECT_EQ(r.gw.subscribed[1].fromOffset, -2) << "restarted at the log start";
+    EXPECT_EQ(r.gw.subscribed[1].filter, first.filter);
+    EXPECT_FALSE(r.gw.subscribed[1].filter.empty());
+    for (const auto& f : r.gw.subscribeFrames) {
+        const auto v = rcc::decodeSubscribe(f.data(), f.size());
+        ASSERT_TRUE(v.has_value());
+        EXPECT_FALSE(v->filter.empty());
+    }
+}
+
+// M1: a refusal whose detail trailer is cut short still finishes the subscription with the broker's code.
+TEST(SubscriberFilterRegression, TruncatedRefusalDetailStillSurfacesTheRefusalRegression) {
+    FilterRig r(4334);
+    r.gw.subscribeErrorCode = 39;
+    r.gw.subscribeBadDetailTrailer = true;
+    r.connect();
+    rc::SubscribeOptions opts;
+    opts.filter(E::Filter{.worldId = 7u});
+    auto sub = r.client.subscribe(r.client.topic("t"), 0, opts, &noopRecords);
+    ASSERT_TRUE(r.drive([&] { return sub.finished(); }, 20'000)) << "a refusal, not a subscribe timeout";
+    EXPECT_EQ(sub.failReason(), rc::SubscriptionFailReason::RejectedByBroker);
+    EXPECT_EQ(sub.brokerErrorCode(), 39);
+    ASSERT_FALSE(r.errors.empty());
+    EXPECT_NE(r.errors.back().find("refused"), std::string::npos) << r.errors.back();
+}
+
+// I4: an unfiltered subscription carries no filter storage.
+TEST(SubscriberFilter, UnfilteredSubscriptionImplCarriesNoFilterStorage) {
+    EXPECT_LT(sizeof(rc::SubscriptionImpl), 1024u);
+    rc::SubscriptionImpl impl;
+    EXPECT_FALSE(impl.filtered());
+    EXPECT_EQ(impl.filterData.get(), nullptr);
+    rc::SubscribeOptions o;
+    o.filter(E::Filter{.worldId = 7u});
+    impl.setFilter(o.filterBytes);
+    EXPECT_TRUE(impl.filtered());
+    EXPECT_EQ(std::vector<uint8_t>(impl.filterSpan().begin(), impl.filterSpan().end()),
+              std::vector<uint8_t>(o.filterBytes.span().begin(), o.filterBytes.span().end()));
+}

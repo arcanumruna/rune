@@ -230,6 +230,7 @@ struct SubscribeResponseView {
     int32_t partition      = 0;
     int64_t subscriptionId = 0;
     std::string_view detail;  // Phase 2c: the refusal text (view into the original buffer; empty = none)
+    bool detailMalformed = false;  // the detail trailer was truncated: dropped, the fixed fields are intact
 };
 
 /// Encode a SubscribeResponse frame (38 bytes) into buf[0..cap-1].
@@ -256,8 +257,15 @@ inline std::size_t encodeSubscribeResponse(uint8_t*    buf,
 inline std::optional<SubscribeResponseView> decodeSubscribeResponse(const uint8_t* buf,
                                                                       std::size_t    len) noexcept {
     auto opt = rpc::SubscribeResponse::decode(buf, len);
+    bool malformedDetail = false;
+    if (!opt && len > rpc::SubscribeResponse::ENCODED_SIZE) {
+        // A mangled detail trailer must not hide the refusal itself: decode the fixed part, drop the detail.
+        opt = rpc::SubscribeResponse::decode(buf, rpc::SubscribeResponse::ENCODED_SIZE);
+        malformedDetail = opt.has_value();
+    }
     if (!opt) return std::nullopt;
     SubscribeResponseView v;
+    v.detailMalformed = malformedDetail;
     v.sessionId      = opt->sessionId;
     v.correlationId  = opt->correlationId;
     v.errorCode      = opt->errorCode;
