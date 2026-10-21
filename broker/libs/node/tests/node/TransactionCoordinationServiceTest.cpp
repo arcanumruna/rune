@@ -1455,3 +1455,200 @@ TEST_F(TransactionCoordinationServiceTest, AStuckOffsetApplyIsCountedAgedAndRepo
     EXPECT_GE(warns, 2u) << "no periodic WARN while a commit is stuck";
     EXPECT_LE(warns, 3u) << "the WARN is rate-limited (once per 30 s)";
 }
+
+// ===========================================================================
+// #438 over a two-replica __transaction_state: a hold is released only once the holder's Complete* record is
+// COMMITTED - a reload while it is appended but not committed answers Unknown (the load waits for HW == LEO), and
+// the committed state frees the key on both the old service and a fresh load.
+// ===========================================================================
+namespace {
+struct RepTxn {
+    rune::node::TransactionCoordinationService* svc = nullptr;
+    std::function<void()> commitAll;   // the follower fetches + the service's doWork
+    CapturedAnswers*      answers = nullptr;
+    std::array<uint8_t, 1024> req{}, out{};
+    int64_t corr = 100;
+    /// The answer's first error code: inline, or (parked) once the records commit.
+    template <class Resp>
+    int16_t answer(std::size_t n) {
+        if (n == 0) {
+            commitAll();
+            if (answers->frames.empty()) return -1;
+            const auto f = answers->frames.back();
+            answers->frames.clear();
+            const auto r = Resp::decode(f.data(), f.size());
+            return r ? r->errorCode : int16_t{-1};
+        }
+        const auto r = Resp::decode(out.data(), n);
+        return r ? r->errorCode : int16_t{-1};
+    }
+    int16_t addOffsets(const std::string& txn, int64_t pid, int16_t ep, const std::string& group, int64_t now) {
+        pc::AddOffsetsToTxn m;
+        m.sessionId = 1; m.correlationId = ++corr; m.producerId = pid; m.producerEpoch = ep;
+        m.transactionalId = {reinterpret_cast<const uint8_t*>(txn.data()), txn.size()};
+        m.groupId = {reinterpret_cast<const uint8_t*>(group.data()), group.size()};
+        return answer<pc::AddOffsetsToTxnResponse>(svc->handleAddOffsets(req.data(), m.encode(req.data()), now,
+                                                                         out.data(), out.size()));
+    }
+    int16_t commit(const std::string& txn, int64_t pid, int16_t ep, const std::string& group, int64_t offset,
+                   int64_t now) {
+        pc::TxnOffsetCommit m;
+        m.sessionId = 1; m.correlationId = ++corr; m.producerId = pid; m.producerEpoch = ep;
+        m.transactionalId = {reinterpret_cast<const uint8_t*>(txn.data()), txn.size()};
+        m.groupId = {reinterpret_cast<const uint8_t*>(group.data()), group.size()};
+        const std::vector<pc::TxnOffsetCommitEntry> e = {{0, 0, offset, {}}};
+        const std::size_t n = svc->handleTxnOffsetCommit(req.data(), m.encode(req.data(), e), now, out.data(), out.size());
+        if (n == 0) {
+            commitAll();
+            if (answers->frames.empty()) return -1;
+            const auto f = answers->frames.back();
+            answers->frames.clear();
+            const auto r = pc::TxnOffsetCommitResponse::decode(f.data(), f.size());
+            return r && !r->results.empty() ? r->results[0].errorCode : int16_t{-1};
+        }
+        const auto r = pc::TxnOffsetCommitResponse::decode(out.data(), n);
+        return r && !r->results.empty() ? r->results[0].errorCode : int16_t{-1};
+    }
+    int16_t endTxn(const std::string& txn, int64_t pid, int16_t ep, bool commitIt, int64_t now) {
+        const std::size_t n = encodeEndTxn(req.data(), req.size(), 1, ++corr, pid, ep, commitIt, txn);
+        return answer<pc::EndTxnResponse>(svc->handleEndTxn(req.data(), n, now, out.data(), out.size()));
+    }
+};
+}  // namespace
+
+TEST_F(TxnStateReplicationTest, AHoldOutlivesTheCompletionUntilItsCompleteRecordCommitsRegression) {
+    using H = rune::coordination::TxnOffsetHold;
+    const rune::coordination::TopicPartition key{"topic_0", 0};
+    int16_t epA = 0, epB = 0;
+    const int64_t pa = initPid("tx-a", epA);
+    const int64_t pb = initPid("tx-b", epB);
+    RepTxn t;
+    t.svc = svc_.get();
+    t.answers = &answers_;
+    t.commitAll = [this, &t] { followerFetches(); (void)t.svc->doWork(now_); };
+    ASSERT_EQ(t.addOffsets("tx-a", pa, epA, "cgh", now_), 0);
+    ASSERT_EQ(t.commit("tx-a", pa, epA, "cgh", 42, now_), 0);
+    ASSERT_EQ(t.addOffsets("tx-b", pb, epB, "cgh", now_), 0);
+    EXPECT_EQ(svc_->txnOffsetHold("cgh", key), H::Held);
+    EXPECT_EQ(svc_->txnOffsetHold("cgh", rune::coordination::TopicPartition{"", -1}), H::Held) << "any key of the group";
+    EXPECT_EQ(svc_->txnOffsetHold("other", key), H::Free);
+    EXPECT_EQ(t.commit("tx-b", pb, epB, "cgh", 50, now_), static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions));
+    EXPECT_EQ(t.commit("tx-a", pa, epA, "cgh", 43, now_), 0) << "the holder itself commits the key again";
+    ASSERT_EQ(t.endTxn("tx-a", pa, epA, /*commit=*/true, now_), 0);
+
+    // a is PrepareCommit; a new coordinator load re-drives it (markers through the seam), and the marker lands.
+    svc_ = std::make_unique<rune::node::TransactionCoordinationService>(
+        txnStore_.get(), /*topics=*/nullptr, [this] { return isLeader_; }, [] { return rune::node::NodeId{1}; });
+    svc_->setAnswerSinkForTest(&CapturedAnswers::sink, &answers_);
+    svc_->setAppendFnOverride([](std::string_view, int32_t, std::span<const uint8_t>) -> int64_t { return 0; });
+    t.svc = svc_.get();
+    (void)svc_->doWork(now_);
+    ASSERT_TRUE(svc_->isLoaded());
+    EXPECT_EQ(svc_->txnOffsetHold("cgh", key), H::Held) << "the load forgot the PrepareCommit's key";
+    svc_->onControlMarkerLanded(0, 0, pa, rune::gateway::ITxnRequestHandler::kAnyCoordinatorEpoch);
+    ASSERT_EQ(svc_->txnStateForTest("tx-a"), tx::TxnState::CompleteCommit);
+    (void)svc_->doWork(now_);
+    EXPECT_EQ(svc_->txnOffsetHold("cgh", key), H::Held)
+        << "released before the CompleteCommit record committed (a reload could still re-drive a)";
+    EXPECT_EQ(t.commit("tx-b", pb, epB, "cgh", 50, now_), static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions));
+
+    // A reload NOW (CompleteCommit appended, not committed): nothing is known until the load can fold the log.
+    auto fresh = std::make_unique<rune::node::TransactionCoordinationService>(
+        txnStore_.get(), /*topics=*/nullptr, [this] { return isLeader_; }, [] { return rune::node::NodeId{1}; });
+    (void)fresh->doWork(now_);
+    EXPECT_FALSE(fresh->isLoaded());
+    EXPECT_EQ(fresh->txnOffsetHold("cgh", key), H::Unknown);
+
+    followerFetches();   // the CompleteCommit record commits
+    (void)svc_->doWork(now_);
+    EXPECT_EQ(svc_->txnOffsetHold("cgh", key), H::Free);
+    (void)fresh->doWork(now_);
+    ASSERT_TRUE(fresh->isLoaded());
+    EXPECT_EQ(fresh->txnOffsetHold("cgh", key), H::Free) << "a committed CompleteCommit holds nothing after a load";
+    EXPECT_EQ(t.commit("tx-b", pb, epB, "cgh", 50, now_), 0) << "the key is free for the next transaction";
+    EXPECT_EQ(svc_->txnOffsetHold("cgh", key), H::Held);
+}
+
+// #125: a member block fenced with any code answers EVERY entry that code; a store-less rig (no fence) accepts it.
+TEST_F(TransactionCoordinationServiceTest, AMemberFenceRefusalAnswersEveryEntryAndAddsNothingRegression) {
+    struct Fence {
+        pc::ErrorCode code = pc::ErrorCode::NotCoordinator;
+        static pc::ErrorCode check(void* ctx, const std::string&, const std::string&, int32_t, int64_t) {
+            return static_cast<Fence*>(ctx)->code;
+        }
+    } fence;
+    const OffsetsTxn t = beginOffsetsTxn(*svc_, reqBuf_.data(), outBuf_.data(), outBuf_.size(), "txf", "cgf", 0);
+    ASSERT_GE(t.pid, 0);
+    EXPECT_EQ(txnOffsetCommit(*svc_, reqBuf_.data(), outBuf_.data(), outBuf_.size(), t, 3, 0, 0, "m"), 0)
+        << "no fence wired: a block is accepted";
+    svc_->setTxnOffsetMemberFence(&Fence::check, &fence);
+    for (const pc::ErrorCode c : {pc::ErrorCode::NotCoordinator, pc::ErrorCode::UnknownMember,
+                                  pc::ErrorCode::IllegalGeneration}) {
+        fence.code = c;
+        pc::TxnOffsetCommit m;
+        m.sessionId = 1; m.correlationId = 9; m.producerId = t.pid; m.producerEpoch = t.epoch;
+        m.transactionalId = {reinterpret_cast<const uint8_t*>(t.txn.data()), t.txn.size()};
+        m.groupId = {reinterpret_cast<const uint8_t*>(t.group.data()), t.group.size()};
+        m.generationId = 0;
+        const std::vector<pc::TxnOffsetCommitEntry> e = {{0, 0, 7, {}}, {0, 1, 8, {}}};
+        const auto r = pc::TxnOffsetCommitResponse::decode(
+            outBuf_.data(), svc_->handleTxnOffsetCommit(reqBuf_.data(), m.encode(reqBuf_.data(), e), 0, outBuf_.data(),
+                                                        outBuf_.size()));
+        ASSERT_TRUE(r && r->results.size() == 2u);
+        EXPECT_EQ(r->results[0].errorCode, static_cast<int16_t>(c));
+        EXPECT_EQ(r->results[1].errorCode, static_cast<int16_t>(c));
+        EXPECT_EQ(svc_->pendingOffsetsForTest("txf").size(), 1u) << "a fenced commit added offsets";
+    }
+}
+
+// #359: the stuck gauge clears when the group coordinator takes the offsets; the sink's reason reaches the gauge
+// publication (and the WARN); a Replicating answer is not "stuck".
+TEST_F(TransactionCoordinationServiceTest, AStuckCommitClearsWhenTheOffsetsAreTakenAndPublishesItsGaugesRegression) {
+    const OffsetsTxn t = beginOffsetsTxn(*svc_, reqBuf_.data(), outBuf_.data(), outBuf_.size(), "tx359b", "cg359b", 0);
+    ASSERT_EQ(txnOffsetCommit(*svc_, reqBuf_.data(), outBuf_.data(), outBuf_.size(), t, 7, 0), 0);
+    std::size_t n = encodeEndTxn(reqBuf_.data(), reqBuf_.size(), 1, 5, t.pid, t.epoch, /*commit=*/true, t.txn);
+    ASSERT_EQ(pc::EndTxnResponse::decode(outBuf_.data(), svc_->handleEndTxn(reqBuf_.data(), n, 0, outBuf_.data(),
+                                                                            outBuf_.size()))->errorCode, 0);
+    svc_ = std::make_unique<rune::node::TransactionCoordinationService>(
+        txnStore_.get(), /*topics=*/nullptr, [this] { return isLeader_; }, [this] { return leaderNodeId_; });
+    struct ReasonSink : RefusingSink {
+        int reasonCalls = 0;
+        static rune::coordination::TxnOffsetRefusal reason(void* ctx) {
+            ++static_cast<ReasonSink*>(static_cast<RefusingSink*>(ctx))->reasonCalls;
+            return rune::coordination::TxnOffsetRefusal::NotLoaded;
+        }
+    } sink;
+    sink.refusals    = 5;
+    sink.replicating = 2;
+    svc_->setTxnOffsetSink(&RefusingSink::apply, static_cast<RefusingSink*>(&sink));
+    svc_->setTxnOffsetRefusalReason(&ReasonSink::reason);
+    const int& reasonCalls = sink.reasonCalls;
+    struct Gauges {
+        std::vector<std::pair<int64_t, int64_t>> seen;
+        static bool sink(void* ctx, int64_t stuck, int64_t ageMs) {
+            static_cast<Gauges*>(ctx)->seen.emplace_back(stuck, ageMs);
+            return true;
+        }
+    } gauges;
+    svc_->setStuckTxnOffsetsSink(&Gauges::sink, &gauges);
+    svc_->setAppendFnOverride([](std::string_view, int32_t, std::span<const uint8_t>) -> int64_t { return 0; });
+    int64_t now = 1'000'000'000;
+    (void)svc_->doWork(now);
+    svc_->onControlMarkerLanded(0, 0, t.pid, rune::gateway::ITxnRequestHandler::kAnyCoordinatorEpoch);
+    EXPECT_EQ(svc_->txnOffsetCommitsStuck(), 1u);
+    EXPECT_GE(reasonCalls, 1) << "the refusal reason was never asked for";
+    bool sawStuck = false;
+    for (int i = 0; i < 400 && svc_->txnStateForTest(t.txn) != tx::TxnState::CompleteCommit; ++i) {
+        now += 100'000'000;
+        (void)svc_->doWork(now);
+        if (svc_->txnOffsetCommitsStuck() == 0 && sink.refusals > 0) ADD_FAILURE() << "cleared while still refused";
+        for (const auto& g : gauges.seen) sawStuck = sawStuck || g.first == 1;
+    }
+    ASSERT_EQ(svc_->txnStateForTest(t.txn), tx::TxnState::CompleteCommit);
+    EXPECT_TRUE(sawStuck) << "the stuck gauge was never published";
+    EXPECT_EQ(svc_->txnOffsetCommitsStuck(), 0u);
+    EXPECT_EQ(svc_->oldestStuckTxnOffsetAgeNs(now), 0);
+    (void)svc_->doWork(now + 1);
+    ASSERT_FALSE(gauges.seen.empty());
+    EXPECT_EQ(gauges.seen.back(), (std::pair<int64_t, int64_t>{0, 0})) << "the gauges did not return to 0";
+}

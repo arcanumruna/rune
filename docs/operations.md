@@ -103,6 +103,8 @@ Aeron's counter tools or `rune_role`. Labels end with `node=<id>`.
 | `rune-peer-links-established` | 1 000 233 | Peers whose link is currently established. |
 | `rune-peer-link-refusals` | 1 000 234 | Peer-link refusals logged by this broker. Alert on a rising count. |
 | `rune-peer-frame-drops` | 1 000 235 | Inter-broker frames dropped for want of a link or because they did not open. |
+| `rune-txn-offset-commits-stuck` | 1 000 240 | Transaction commits waiting because the group coordinator refuses their consumer-group offsets. Alert on a non-zero value that persists. |
+| `rune-txn-offset-stuck-age-ms` | 1 000 241 | Age of the oldest of those, in ms. A WARN names it every 30 s while any is stuck. |
 
 Type ids are defined in `broker/libs/node/include/rune/node/RoleCounter.h`. Logins are metrics and structured logs, not
 `__security` events.

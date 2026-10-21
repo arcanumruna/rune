@@ -118,8 +118,11 @@ TEST(AuthEnforcementRegression, AnotherPrincipalsMemberIdIsRefusedOnEveryGroupRe
 
 TEST(AuthEnforcementRegression, TransactionRowsAllowedAndDenied) {
     AuthRig r;
+    // Issue #125 correction (not a weakening): TxnOffsetCommit needs READ on every listed topic, exactly as
+    // OffsetCommit does - this row used to pin the hole (WRITE alone let `may` commit offsets of `orders`).  `may`
+    // now holds READ on `orders` too; TxnOffsetCommitNeedsReadOnEveryTopicRegression pins the refusal without it.
     const int64_t may = r.newUser({exact(SO::Write, ST::TransactionalId, "tx1"), exact(SO::Write, ST::Topic, "orders"),
-                                   exact(SO::Read, ST::Group, "cg")});
+                                   exact(SO::Read, ST::Topic, "orders"), exact(SO::Read, ST::Group, "cg")});
     const int64_t txOnly = r.newUser({exact(SO::Write, ST::TransactionalId, "tx1")});
     const int64_t none = r.newUser({});
     EXPECT_EQ(r.initProducerId(may, "tx1"), kOk);

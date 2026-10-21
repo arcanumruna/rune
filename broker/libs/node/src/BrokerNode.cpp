@@ -525,6 +525,10 @@ void BrokerNode::start() {
         stuckMarkersCounterRegId_ = aeron_->addCounter(
             kStuckMarkersCounterTypeId, roleKey, kRoleKeyLength,
             stuckMarkersLabel(config_.nodeId));
+        stuckTxnOffsetsCounterRegId_ = aeron_->addCounter(
+            kStuckTxnOffsetCommitsCounterTypeId, roleKey, kRoleKeyLength, stuckTxnOffsetCommitsLabel(config_.nodeId));
+        stuckTxnOffsetAgeCounterRegId_ = aeron_->addCounter(
+            kStuckTxnOffsetAgeMsCounterTypeId, roleKey, kRoleKeyLength, stuckTxnOffsetAgeMsLabel(config_.nodeId));
         outOfSyncCounterRegId_ = aeron_->addCounter(
             kOutOfSyncCounterTypeId, roleKey, kRoleKeyLength, outOfSyncLabel(config_.nodeId));
         catalogHaltedCounterRegId_ = aeron_->addCounter(
@@ -2502,6 +2506,7 @@ void BrokerNode::buildGateway() {
             txnCoordService_->setGateway(gateway_.get());
             // D9 review MEDIUM-3: the stuck-markers gauge → its Aeron counter.
             txnCoordService_->setStuckMarkersSink(&BrokerNode::publishStuckMarkers_, this);
+            txnCoordService_->setStuckTxnOffsetsSink(&BrokerNode::publishStuckTxnOffsets_, this);   // #359
 
             gateway_->setTxnService(txnCoordService_.get());
             // Phase 2b F Task 11: a committed transaction's consumer-group offsets (TxnOffsetCommit) are applied to
@@ -2517,6 +2522,24 @@ void BrokerNode::buildGateway() {
                     [](void* ctx, const rune::coordination::TxnOffsetToken& token) {
                         static_cast<GroupCoordinationService*>(ctx)->releaseTransactionalOffsets(token);
                     });
+                // #359: why the group coordinator refused (the stuck-commit WARN names it).
+                txnCoordService_->setTxnOffsetRefusalReason([](void* ctx) {
+                    return static_cast<GroupCoordinationService*>(ctx)->lastTxnOffsetRefusal();
+                });
+                // #125 (KIP-447): a TxnOffsetCommit's member block is fenced by the group coordinator's rules.
+                txnCoordService_->setTxnOffsetMemberFence(
+                    [](void* ctx, const std::string& group, const std::string& member, int32_t generation,
+                       int64_t sessionId) {
+                        return static_cast<GroupCoordinationService*>(ctx)->checkTxnOffsetMember(group, member,
+                                                                                                  generation, sessionId);
+                    },
+                    groupCoordService_.get());
+                // #438: a (group, tp) an unfinished transaction holds is neither fetched nor plainly committed.
+                groupCoordService_->setTxnOffsetHoldProbe(
+                    [](void* ctx, const std::string& group, const rune::coordination::TopicPartition& tp) {
+                        return static_cast<TransactionCoordinationService*>(ctx)->txnOffsetHold(group, tp);
+                    },
+                    txnCoordService_.get());
             }
 
             // D9: cross-node transaction markers over the cluster plane — a
@@ -2540,6 +2563,7 @@ void BrokerNode::buildGateway() {
         } catch (const std::exception& ex) {
             spdlog::error("BrokerNode[{}]: TransactionCoordinationService setup failed: {}; "
                           "transactions will not work", nodeId, ex.what());
+            if (groupCoordService_) groupCoordService_->setTxnOffsetHoldProbe(nullptr, nullptr);   // #438
             txnCoordService_.reset();
             txnState_.reset();
             txnReplica_.reset();
@@ -3136,6 +3160,23 @@ void BrokerNode::publishProvisionMetric_(void* self, int metric, std::int64_t va
         try { c = n->aeron_->findCounter(reg); } catch (...) { c.reset(); }
     }
     if (c) c->set(value);
+}
+
+bool BrokerNode::publishStuckTxnOffsets_(void* self, std::int64_t stuck, std::int64_t oldestAgeMs)
+{
+    auto* n = static_cast<BrokerNode*>(self);
+    if (!n->aeron_) return false;
+    const auto resolve = [&](std::shared_ptr<aeron::Counter>& c, std::int64_t reg) {
+        if (!c && reg >= 0) {
+            try { c = n->aeron_->findCounter(reg); } catch (...) { c.reset(); }
+        }
+        return static_cast<bool>(c);
+    };
+    if (!resolve(n->stuckTxnOffsetsCounter_, n->stuckTxnOffsetsCounterRegId_) ||
+        !resolve(n->stuckTxnOffsetAgeCounter_, n->stuckTxnOffsetAgeCounterRegId_)) return false;
+    n->stuckTxnOffsetsCounter_->set(stuck);
+    n->stuckTxnOffsetAgeCounter_->set(oldestAgeMs);
+    return true;
 }
 
 bool BrokerNode::publishStuckMarkers_(void* self, std::int64_t value)
@@ -4395,6 +4436,7 @@ void BrokerNode::stop() {
     runtimeAgent_.reset();    // composite agent (holds refs to inner agent + gateway + replication)
     workerPool_.reset();      // E1: holds non-owning replica ptrs; drop before replicaRegistry_ frees them
     // TX-3: destroy txn coordination service before gateway (holds gateway* + txnState*).
+    if (groupCoordService_) groupCoordService_->setTxnOffsetHoldProbe(nullptr, nullptr);   // #438: its ctx goes
     txnCoordService_.reset(); // TransactionCoordinationService (no Aeron resources, holds gateway*)
     // CG-6: destroy group coordination service before gateway (it holds a gateway* ref).
     groupCoordService_.reset(); // GroupCoordinationService (no Aeron resources, holds gateway* + offsets*)
@@ -4481,6 +4523,8 @@ void BrokerNode::stop() {
     roleCounter_.reset();
     termCounter_.reset();
     stuckMarkersCounter_.reset();   // D9: release before aeron_ (the Counter dtor uses the conductor)
+    stuckTxnOffsetsCounter_.reset();
+    stuckTxnOffsetAgeCounter_.reset();
     outOfSyncCounter_.reset();      // readiness gate (L5): same rule
     catalogHaltedCounter_.reset();  // catalog history Task 7: same rule
     unplaceableCounter_.reset();    // Task 11 fix round 1

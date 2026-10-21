@@ -2381,3 +2381,165 @@ TEST(OffsetCommitDurabilityRegression, AHeldKeyIsNeitherFetchedNorPlainlyCommitt
     if (n == 0) { g.fetch(); g.svc.doWork(g.clock); }
     EXPECT_EQ(g.store.fetch("g438", tp(std::string(kTestTopic), 0))->offset, 6);
 }
+
+// ===========================================================================
+// M1 interaction matrix (#433 / #438 / #125): parked OffsetCommit answers, holds × request × client version, and
+// the TxnOffsetCommit member fence.
+// ===========================================================================
+namespace {
+std::size_t encodeTwoEntryCommit(uint8_t* buf, int64_t sessionId, int64_t corr, std::string_view group,
+                                 std::string_view member, int32_t gen, int32_t topicB, int64_t offset) {
+    pc::OffsetCommit msg;
+    msg.sessionId = sessionId; msg.correlationId = corr; msg.generationId = gen;
+    msg.groupId  = {reinterpret_cast<const uint8_t*>(group.data()), group.size()};
+    msg.memberId = {reinterpret_cast<const uint8_t*>(member.data()), member.size()};
+    const std::array<pc::OffsetCommitEntry, 2> entries{
+        pc::OffsetCommitEntry{kTestTopicId, 0, offset, {}}, pc::OffsetCommitEntry{topicB, 0, offset, {}}};
+    return msg.encode(buf, std::span<const pc::OffsetCommitEntry>(entries));
+}
+int64_t corrOf(const std::vector<uint8_t>& f) {
+    const auto r = pc::OffsetCommitResponse::decode(f.data(), f.size());
+    return r ? r->correlationId : -1;
+}
+}  // namespace
+
+TEST(OffsetCommitDurabilityRegression, ParkedAnswersLeaveInRequestOrderEvenWhenALaterOneIsCommittedRegression) {
+    CommitRig g("gorder");
+    const int64_t c1 = g.corr;
+    ASSERT_EQ(g.commit("gorder", 10), 0u);
+    g.fetch();   // the first record commits ...
+    const int64_t c2 = g.corr;
+    // ... but its answer is still parked (doWork has not run): the next commit queues behind it, even though the
+    // follower will have its record at once.
+    ASSERT_EQ(g.commit("gorder", 11), 0u) << "a commit overtook a parked one on the same coordinator";
+    EXPECT_EQ(g.svc.parkedOffsetCommits(), 2u);
+    g.fetch();
+    g.svc.doWork(g.clock);
+    ASSERT_EQ(g.answers.frames.size(), 2u);
+    EXPECT_EQ(corrOf(g.answers.frames[0]), c1);
+    EXPECT_EQ(corrOf(g.answers.frames[1]), c2);
+    EXPECT_EQ(CommitRig::codeOf(g.answers.frames[1].data(), g.answers.frames[1].size()), 0);
+}
+
+TEST(OffsetCommitDurabilityRegression, ACoordinatorThatStopsCoordinatingAnswersParkedCommitsNotCoordinatorRegression) {
+    CommitRig g("glost");
+    ASSERT_EQ(g.commit("glost", 5), 0u);
+    g.svc.setLocalLeadership(false);
+    g.fetch();   // the record even commits: this node no longer coordinates the group, so it does not say OK
+    g.svc.doWork(g.clock);
+    ASSERT_EQ(g.answers.frames.size(), 1u) << "a parked commit is always answered";
+    EXPECT_EQ(CommitRig::codeOf(g.answers.frames[0].data(), g.answers.frames[0].size()),
+              static_cast<int16_t>(pc::ErrorCode::NotCoordinator));
+    EXPECT_EQ(g.svc.parkedOffsetCommits(), 0u);
+}
+
+TEST(OffsetCommitDurabilityRegression, ALostParkedCommitKeepsItsNonOkEntriesAndRewritesOnlyOkOnesRegression) {
+    CommitRig g("gmixed");
+    const std::size_t n = g.svc.handleOffsetCommit(
+        g.req, encodeTwoEntryCommit(g.req, 1, g.corr++, "gmixed", g.member, g.gen, /*unknown topic*/ 77, 9), g.clock,
+        g.out, sizeof g.out);
+    ASSERT_EQ(n, 0u);
+    g.rep.becomeFollower(2, 2);
+    g.rep.becomeLeader(3, std::vector<NodeId>{1, 2});
+    g.svc.doWork(g.clock);
+    ASSERT_EQ(g.answers.frames.size(), 1u);
+    const auto r = pc::OffsetCommitResponse::decode(g.answers.frames[0].data(), g.answers.frames[0].size());
+    ASSERT_TRUE(r && r->results.size() == 2u);
+    EXPECT_EQ(r->results[0].errorCode, static_cast<int16_t>(pc::ErrorCode::NotCoordinator));
+    EXPECT_EQ(r->results[1].errorCode, static_cast<int16_t>(pc::ErrorCode::UnknownTopic));
+}
+
+TEST(OffsetCommitDurabilityRegression, AFullParkRefusesNotCoordinatorWithoutAppendingRegression) {
+    CommitRig g("gfull");
+    std::size_t parked = 0;
+    for (int i = 0; i < 1000 && g.commit("gfull", 100 + i) == 0; ++i) ++parked;
+    ASSERT_EQ(parked, g.svc.parkedOffsetCommits());
+    ASSERT_GT(parked, 0u);
+    const auto leo = g.rep.logEndOffset();
+    const std::size_t n = g.commit("gfull", 5000);
+    ASSERT_GT(n, 0u) << "a full park answers at once (never a hang)";
+    EXPECT_EQ(CommitRig::codeOf(g.out, n), static_cast<int16_t>(pc::ErrorCode::NotCoordinator));
+    EXPECT_EQ(g.rep.logEndOffset(), leo) << "a refused commit was appended";
+    EXPECT_GE(g.svc.parkRefusalsForTest(), 1u);
+    g.fetch();
+    g.svc.doWork(g.clock);
+    EXPECT_EQ(g.answers.frames.size(), parked) << "every parked answer is released once its record commits";
+    EXPECT_EQ(g.svc.parkedOffsetCommits(), 0u);
+    EXPECT_EQ(g.commit("gfull", 6000), 0u) << "room again once the park drained";
+}
+
+// #438 × request kind × client version: Free serves; Held / Unknown answer the retriable code (50 to a client >= 10
+// or of unknown version, NotCoordinator below) and append nothing.
+TEST(OffsetCommitDurabilityRegression, HoldStateByRequestByClientVersionMatrixRegression) {
+    using H = rune::coordination::TxnOffsetHold;
+    struct Probe {
+        H hold = H::Free;
+        static H of(void* ctx, const std::string&, const TopicPartition&) { return static_cast<Probe*>(ctx)->hold; }
+    };
+    struct Version {
+        int32_t v = -1;
+        static int32_t of(void* ctx, int64_t) noexcept { return static_cast<Version*>(ctx)->v; }
+    };
+    const auto unstable = static_cast<int16_t>(pc::ErrorCode::UnstableOffsetCommit);
+    const auto notCoord = static_cast<int16_t>(pc::ErrorCode::NotCoordinator);
+    int row = 0;
+    for (const H hold : {H::Free, H::Held, H::Unknown}) {
+        for (const int32_t version : {-1, 9, 10}) {
+            const std::string group = "gm" + std::to_string(row++);
+            CommitRig g(group);
+            Probe probe{hold};
+            Version ver{version};
+            g.svc.setClientVersionResolverForTest(&Version::of, &ver);
+            ASSERT_EQ(g.commit(group, 40), 0u);   // a committed offset to (not) hand out: committed while Free
+            g.fetch();
+            g.svc.doWork(g.clock);
+            g.svc.setTxnOffsetHoldProbe(&Probe::of, &probe);
+            const int16_t refused = version == 9 ? notCoord : unstable;
+            SCOPED_TRACE(::testing::Message() << "hold=" << static_cast<int>(hold) << " version=" << version);
+            // OffsetFetch of one entry
+            std::size_t n = g.svc.handleOffsetFetch(g.req, encodeOffsetFetch(g.req, 1, g.corr++, group, kTestTopicId, 0),
+                                                    g.clock, g.out, sizeof g.out);
+            auto f = pc::OffsetFetchResponse::decode(g.out, n);
+            ASSERT_TRUE(f && f->results.size() == 1u);
+            EXPECT_EQ(f->results[0].errorCode, hold == H::Free ? int16_t{0} : refused);
+            EXPECT_EQ(f->results[0].offset, hold == H::Free ? int64_t{40} : int64_t{-1});
+            // OffsetFetch of every committed offset (fetch-all)
+            n = g.svc.handleOffsetFetch(g.req, encodeOffsetFetchAll(g.req, 1, g.corr++, group), g.clock, g.out,
+                                        sizeof g.out);
+            f = pc::OffsetFetchResponse::decode(g.out, n);
+            ASSERT_TRUE(f && f->results.size() == 1u);
+            EXPECT_EQ(f->results[0].errorCode, hold == H::Free ? int16_t{0} : refused);
+            // plain OffsetCommit
+            const auto leo = g.rep.logEndOffset();
+            n = g.commit(group, 41);
+            if (hold == H::Free) {
+                EXPECT_EQ(n, 0u) << "parked until committed";
+                EXPECT_EQ(g.rep.logEndOffset(), leo + 1);
+            } else {
+                ASSERT_GT(n, 0u);
+                EXPECT_EQ(CommitRig::codeOf(g.out, n), refused);
+                EXPECT_EQ(g.rep.logEndOffset(), leo) << "a plain record was appended over a held key";
+            }
+        }
+    }
+}
+
+// #125: GroupCoordinationService::checkTxnOffsetMember applies exactly the OffsetCommit member rules.
+TEST(OffsetCommitDurabilityRegression, TxnOffsetMemberFenceMatrixRegression) {
+    using EC = pc::ErrorCode;
+    CommitRig g("gfence");
+    struct Row { const char* what; std::string group; std::string member; int32_t gen; int64_t session; EC want; };
+    const std::vector<Row> rows = {
+        {"the member at its generation", "gfence", g.member, g.gen, 1, EC::OK},
+        {"a stale generation", "gfence", g.member, g.gen - 1, 1, EC::IllegalGeneration},
+        {"a future generation", "gfence", g.member, g.gen + 1, 1, EC::IllegalGeneration},
+        {"another session's member", "gfence", g.member, g.gen, 2, EC::UnknownMember},
+        {"an unknown member", "gfence", "nobody", g.gen, 1, EC::UnknownMember},
+        {"an empty member", "gfence", "", g.gen, 1, EC::UnknownMember},
+        {"an unknown group", "other", g.member, g.gen, 1, EC::UnknownMember},
+    };
+    for (const Row& r : rows)
+        EXPECT_EQ(g.svc.checkTxnOffsetMember(r.group, r.member, r.gen, r.session), r.want) << r.what;
+    g.svc.setLocalLeadership(false);
+    EXPECT_EQ(g.svc.checkTxnOffsetMember("gfence", g.member, g.gen, 1), EC::NotCoordinator);
+}

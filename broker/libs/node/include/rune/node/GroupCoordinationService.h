@@ -161,6 +161,29 @@ public:
     void releaseTransactionalOffsets(const rune::coordination::TxnOffsetToken& token);
     /// #358: transactional offset records appended and not yet known committed (test / observability).
     [[nodiscard]] std::size_t txnOffsetsReplicating() const noexcept { return txnOffsetsWaiting_; }
+    /// #359: why the last applyTransactionalOffset was Refused (the transaction coordinator's stuck-commit WARN).
+    [[nodiscard]] rune::coordination::TxnOffsetRefusal lastTxnOffsetRefusal() const noexcept { return lastRefusal_; }
+
+    /// #125 (KIP-447): the member fence of a TxnOffsetCommit that carries a member block - exactly the OffsetCommit
+    /// rules: NotCoordinator off the coordinator; OK for a current member of `group` bound to `sessionId` at the
+    /// group's generation; IllegalGeneration for such a member at another generation; UnknownMember otherwise
+    /// (another session's member is answered exactly as a member that does not exist).  Control thread.
+    [[nodiscard]] rune::protocol::client::ErrorCode checkTxnOffsetMember(const std::string& group,
+                                                                         const std::string& memberId,
+                                                                         int32_t generationId, int64_t sessionId);
+
+    /// #438: whether an unfinished transaction holds a (group, tp) (BrokerNode wires the transaction coordinator).
+    /// Held / Unknown: OffsetFetch and plain OffsetCommit of that key answer UnstableOffsetCommit (NotCoordinator
+    /// to a client below 10) - retriable.  No probe (rigs) = Free.  Plain function pointer + ctx.
+    using TxnOffsetHoldProbe = rune::coordination::TxnOffsetHold (*)(void* ctx, const std::string& group,
+                                                                     const rune::coordination::TopicPartition& tp);
+    void setTxnOffsetHoldProbe(TxnOffsetHoldProbe fn, void* ctx) noexcept { holdProbe_ = fn; holdProbeCtx_ = ctx; }
+
+    /// #433: plain OffsetCommit answers parked until their __consumer_offsets records commit (test / observability).
+    [[nodiscard]] std::size_t parkedOffsetCommits() const noexcept { return parkedCount_; }
+    /// Test seam: where a parked answer goes when no gateway is wired (production: ClientGateway::sendControlFrame).
+    using AnswerSinkFn = void (*)(void* ctx, int64_t sessionId, const uint8_t* frame, std::size_t len);
+    void setAnswerSinkForTest(AnswerSinkFn fn, void* ctx) noexcept { answerSink_ = fn; answerSinkCtx_ = ctx; }
     /// E2 residual round 5 (R1): a counter that moves whenever a committed
     /// lineage changes (MetadataStateMachine::lineageVersion).  On a change the
     /// coordinator sweeps its groups: a group holding a committed offset of a
@@ -306,6 +329,73 @@ private:
     };
     static constexpr std::size_t kMaxTxnOffsetWaiters = 64;   ///< per key; beyond: Refused (the coordinator retries)
     std::map<TxnOffsetKey, TxnOffsetKeyState> txnOffsetsInFlight_;
+    rune::coordination::TxnOffsetRefusal lastRefusal_ = rune::coordination::TxnOffsetRefusal::Unknown;
+    rune::coordination::TxnOffsetApply refuse_(rune::coordination::TxnOffsetRefusal why) noexcept {
+        lastRefusal_ = why;
+        return rune::coordination::TxnOffsetApply::Refused;
+    }
+    TxnOffsetHoldProbe holdProbe_    = nullptr;
+    void*              holdProbeCtx_ = nullptr;
+    AnswerSinkFn       answerSink_    = nullptr;
+    void*              answerSinkCtx_ = nullptr;
+    /// #438: the key's hold (no probe: Free).  partition < 0 asks for "any key of the group" (fetch-all).
+    [[nodiscard]] rune::coordination::TxnOffsetHold holdOf_(const std::string& group,
+                                                            const rune::coordination::TopicPartition& tp) const {
+        return holdProbe_ != nullptr ? holdProbe_(holdProbeCtx_, group, tp) : rune::coordination::TxnOffsetHold::Free;
+    }
+    /// #438: the retriable code a held key is answered with on `sessionId`: UnstableOffsetCommit (client >= 10),
+    /// NotCoordinator below.
+    [[nodiscard]] int16_t unstableFor_(int64_t sessionId);
+    uint64_t unstableAnswers_ = 0;
+
+    // ----- #433: a plain OffsetCommit is answered only once its __consumer_offsets records are COMMITTED -----
+    // An acks-all append replicates asynchronously: an OK on the local append is lost with a failover of the offsets
+    // partition.  So an answer with an OK entry whose record the high watermark has not passed is PARKED - FIFO, in
+    // record order - and released by doWork: OK as built once the high watermark passes its newest record under the
+    // same leadership and log generation; any change (leadership / log generation, the replica stops leading, this
+    // node stops coordinating) answers its OK entries NotCoordinator (retriable, the commit is idempotent) - never
+    // an OK for a record that may be gone.  Preallocated: a fixed ring of parked answers and one of their results
+    // (no steady-state allocation); when either is full the commit is refused NotCoordinator WITHOUT appending.
+    struct ParkedCommit {
+        int64_t  sessionId     = 0;
+        int64_t  correlationId = 0;
+        int64_t  maxRecordAt   = -1;   ///< the newest record of its OK entries
+        uint64_t leadershipGen = 0, logGen = 0;
+        uint32_t resultsAt     = 0;    ///< ring index of its first result
+        uint32_t count         = 0;    ///< its results (the response's entries, in request order)
+    };
+    static constexpr std::size_t kMaxParkedCommits      = 256;
+    static constexpr std::size_t kParkedResultsCapacity = 8192;
+    /// The most results one parked answer may hold: the encoded answer fits the release frame (the gateway's
+    /// one-frame answer bound).  header 24 + count 2, 10 B per result.
+    static constexpr std::size_t kParkedFrameBytes = 68 * 1024;
+    static constexpr std::size_t kMaxParkedResultsPerCommit = (kParkedFrameBytes - 26) / 10;
+    static_assert(kMaxParkedResultsPerCommit <= kParkedResultsCapacity);
+    std::array<ParkedCommit, kMaxParkedCommits> parked_{};
+    std::size_t parkedHead_   = 0;
+    std::size_t parkedCount_  = 0;
+    std::vector<rune::protocol::client::OffsetCommitResult> parkedResults_;   ///< ring, sized once at construction
+    std::size_t resultsHead_  = 0;
+    std::size_t resultsUsed_  = 0;
+    std::array<uint8_t, kParkedFrameBytes> parkedFrame_{};   ///< release encode buffer
+    uint64_t parkRefusals_ = 0;
+    [[nodiscard]] bool parkHasRoomFor_(std::size_t results) const noexcept {
+        return parkedCount_ < kMaxParkedCommits && kParkedResultsCapacity - resultsUsed_ >= results;
+    }
+    void parkCommit_(int64_t sessionId, int64_t correlationId, int64_t maxRecordAt);
+    int  releaseParkedCommits_();
+    void sendDeferred_(int64_t sessionId, const uint8_t* frame, std::size_t n);
+    using ClientVersionFn = int32_t (*)(void* ctx, int64_t sessionId) noexcept;
+    ClientVersionFn clientVersionFn_  = nullptr;
+    void*           clientVersionCtx_ = nullptr;
+public:
+    /// Test seam: resolve a session's client version without a gateway (-1 = unknown: treated as current).
+    void setClientVersionResolverForTest(ClientVersionFn fn, void* ctx) noexcept {
+        clientVersionFn_ = fn; clientVersionCtx_ = ctx;
+    }
+    [[nodiscard]] uint64_t parkRefusalsForTest() const noexcept { return parkRefusals_; }
+    [[nodiscard]] uint64_t unstableAnswersForTest() const noexcept { return unstableAnswers_; }
+private:
     std::size_t txnOffsetsWaiting_ = 0;   ///< total waiters (txnOffsetsReplicating())
     /// A plain OffsetCommit appended record `at` for (group, tp): it is the key's newest record.
     void notePlainOffsetCommit_(const std::string& group, const rune::coordination::TopicPartition& tp, int64_t at);
