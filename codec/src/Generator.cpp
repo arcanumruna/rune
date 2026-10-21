@@ -357,7 +357,9 @@ static void emitDecodeFastPath(std::ostringstream& o, const Descriptor& d) {
     if (!vars.empty()) {
         std::sort(vars.begin(), vars.end(), [](const FieldDescriptor* a, const FieldDescriptor* b) { return a->offset < b->offset; });
         // At kVersion the var fields are exactly the members, in var-index order: one sequential walk.
-        o << "            std::size_t pos = 4u + bl;\n";
+        // F1 (PR #434 review): a hostile block length past the record's end starts the walk AT the end (every var
+        // field empty) - `n - pos` never wraps.
+        o << "            std::size_t pos = 4u + bl <= n ? 4u + bl : n;\n";
         for (const FieldDescriptor* f : vars) {
             o << "            if (n - pos >= 4u && ::rune::codec::fly::load<uint32_t>(r + pos) <= n - pos - 4u) {\n"
               << "                const uint32_t len = ::rune::codec::fly::load<uint32_t>(r + pos);\n"
@@ -423,7 +425,7 @@ static void emitDecode(std::ostringstream& o, const Descriptor& d, const std::st
         }
     }
     if (anyVar) {
-        o << "        std::size_t pos = 4u + bl;\n";
+        o << "        std::size_t pos = 4u + bl <= n ? 4u + bl : n;   // never past the end (F1)\n";
         o << "        uint32_t    at  = 0;\n";
         for (std::size_t i = 0; i < d.fields.size(); ++i) {
             const auto& f = d.fields[i];

@@ -658,7 +658,7 @@ struct RefusingSink {
     int replicating = 0;       ///< #358: then answer Replicating this many times before Applied
     std::vector<int64_t> offered;
     static rune::coordination::TxnOffsetApply apply(void* ctx, const std::string&, const rune::coordination::TopicPartition&,
-                                                    int64_t offset, int64_t) {
+                                                    int64_t offset, int64_t, uint64_t) {
         auto* s = static_cast<RefusingSink*>(ctx);
         ++s->calls;
         s->offered.push_back(offset);
@@ -783,12 +783,6 @@ TEST_F(TransactionCoordinationServiceTest, CompleteCommitWaitsUntilTheOffsetReco
     reqLen = encodeEndTxn(reqBuf_.data(), reqBuf_.size(), 1, 5, pid, ep, /*commit=*/true, txn);
     (void)svc_->handleEndTxn(reqBuf_.data(), reqLen, 0, outBuf_.data(), outBuf_.size());
     ASSERT_EQ(svc_->txnStateForTest(txn), tx::TxnState::PrepareCommit);
-    // The rig has no gateway: a coordinator that loads the durable PrepareCommit re-drives its markers through the
-    // append seam (outstanding until they land), exactly the re-drive path of a failover.
-    svc_ = std::make_unique<rune::node::TransactionCoordinationService>(
-        txnStore_.get(), /*topics=*/nullptr, [this] { return isLeader_; }, [this] { return leaderNodeId_; });
-    svc_->setTxnOffsetSink(&RefusingSink::apply, &sink);
-    svc_->setAppendFnOverride([](std::string_view, int32_t, std::span<const uint8_t>) -> int64_t { return 0; });
     // The rig has no gateway: a coordinator that loads the durable PrepareCommit re-drives its markers through the
     // append seam (outstanding until they land), exactly the re-drive path of a failover.
     svc_ = std::make_unique<rune::node::TransactionCoordinationService>(
@@ -1104,4 +1098,163 @@ TEST_F(TxnStateReplicationTest, AbortMarkersWaitForThePrepareAbortRecordToCommit
     EXPECT_EQ(markerAppends, 1) << "the abort marker goes out once its record is committed";
     EXPECT_EQ(svc_->prepareGates(), 0u);
     EXPECT_EQ(svc_->awaitingMarkerTxnsForTest(), 1u);
+}
+
+// ===========================================================================
+// Adversarial review of PR #434 (#358 class): the parked-answer / Prepare-gate machinery driven the way a hostile or
+// buggy client and a failing cluster would: pipelined and replayed requests from several sessions, a leadership lost
+// and regained under a parked answer, an append refused after a demotion the coordinator has not noticed yet, and a
+// coordinator restarted over an uncommitted tail.
+// ===========================================================================
+namespace {
+struct SessionAnswers {
+    struct A { int64_t session; std::vector<uint8_t> frame; };
+    std::vector<A> got;
+    static void sink(void* ctx, int64_t session, const uint8_t* f, std::size_t n) {
+        static_cast<SessionAnswers*>(ctx)->got.push_back({session, std::vector<uint8_t>(f, f + n)});
+    }
+    [[nodiscard]] int64_t corrOf(std::size_t i) const {
+        const auto h = pc::MessageHeader::decode(got[i].frame.data(), got[i].frame.size());
+        return h ? h->correlationId : -1;
+    }
+};
+}  // namespace
+
+TEST_F(TxnStateReplicationTest, PipelinedAnswersOfSeveralSessionsAreReleasedInRecordOrderToTheirOwnSessionAdversarialRegression) {
+    SessionAnswers sa;
+    svc_->setAnswerSinkForTest(&SessionAnswers::sink, &sa);
+    // Two sessions, three requests back to back, none committed yet; a replay of the first one among them.
+    std::size_t n = encodeInitProducerId(reqBuf_.data(), reqBuf_.size(), /*session=*/1, /*corr=*/101, 30'000, "txA");
+    ASSERT_EQ(svc_->handleInitProducerId(reqBuf_.data(), n, now_, outBuf_.data(), outBuf_.size()), 0u);
+    n = encodeInitProducerId(reqBuf_.data(), reqBuf_.size(), /*session=*/3, /*corr=*/301, 30'000, "txB");
+    ASSERT_EQ(svc_->handleInitProducerId(reqBuf_.data(), n, now_, outBuf_.data(), outBuf_.size()), 0u);
+    n = encodeInitProducerId(reqBuf_.data(), reqBuf_.size(), /*session=*/1, /*corr=*/102, 30'000, "txA");   // replay
+    ASSERT_EQ(svc_->handleInitProducerId(reqBuf_.data(), n, now_, outBuf_.data(), outBuf_.size()), 0u);
+    EXPECT_EQ(svc_->parkedAnswers(), 3u);
+    for (int i = 0; i < 3; ++i) (void)svc_->doWork(now_ + 1 + i);
+    EXPECT_TRUE(sa.got.empty()) << "nothing is answered while every record is only on the leader";
+    followerFetches();
+    (void)svc_->doWork(now_);
+    ASSERT_EQ(sa.got.size(), 3u);
+    EXPECT_EQ(sa.got[0].session, 1); EXPECT_EQ(sa.corrOf(0), 101);
+    EXPECT_EQ(sa.got[1].session, 3); EXPECT_EQ(sa.corrOf(1), 301);
+    EXPECT_EQ(sa.got[2].session, 1); EXPECT_EQ(sa.corrOf(2), 102);
+    const auto a1 = pc::InitProducerIdResponse::decode(sa.got[0].frame.data(), sa.got[0].frame.size());
+    const auto a2 = pc::InitProducerIdResponse::decode(sa.got[2].frame.data(), sa.got[2].frame.size());
+    ASSERT_TRUE(a1 && a2);
+    EXPECT_EQ(a1->errorCode, 0);
+    EXPECT_EQ(a2->errorCode, 0);
+    EXPECT_EQ(a2->producerId, a1->producerId);
+    EXPECT_GT(a2->producerEpoch, a1->producerEpoch) << "the replay fences the first epoch, as a fresh InitProducerId";
+    EXPECT_EQ(svc_->parkedAnswers(), 0u);
+}
+
+TEST_F(TxnStateReplicationTest, ALeadershipLostAndRegainedUnderAParkedAnswerAnswersNotCoordinatorAdversarialRegression) {
+    int16_t ep = 0;
+    const int64_t pid = initPid("txAba", ep);
+    ASSERT_GE(pid, 0);
+    const std::vector<pc::TxnTopicPartition> parts = {{0, 0}};
+    std::size_t n = encodeAddPartitions(reqBuf_.data(), reqBuf_.size(), 1, ++corr_, pid, ep, "txAba", parts);
+    ASSERT_EQ(svc_->handleAddPartitions(reqBuf_.data(), n, now_, outBuf_.data(), outBuf_.size()), 0u);
+    // Leadership moves away and comes back (a new epoch) between two duty cycles: the coordinator never sees it
+    // lost, yet the answer it parked belongs to a leadership that no longer exists.
+    replica_->becomeFollower(/*leaderEpoch=*/2, /*leaderId=*/2);
+    replica_->becomeLeader(/*newEpoch=*/3, std::vector<rep::NodeId>{1, 2});
+    followerFetches();
+    (void)svc_->doWork(now_);
+    ASSERT_EQ(answers_.frames.size(), 1u);
+    const auto r = pc::AddPartitionsToTxnResponse::decode(answers_.frames[0].data(), answers_.frames[0].size());
+    ASSERT_TRUE(r);
+    ASSERT_EQ(r->results.size(), 1u);
+    EXPECT_EQ(r->results[0].errorCode, static_cast<int16_t>(pc::ErrorCode::NotCoordinator))
+        << "an answer parked under epoch 1 is never released by epoch 3's high watermark";
+    EXPECT_EQ(svc_->parkedAnswers(), 0u);
+}
+
+TEST_F(TxnStateReplicationTest, AnAppendRefusedAfterAnUnnoticedDemotionIsNeverAnsweredOkAdversarialRegression) {
+    int16_t ep = 0;
+    const int64_t pid = initPid("txDemoted", ep);
+    ASSERT_GE(pid, 0);
+    // The replica is demoted, and the request arrives before the coordinator's next duty cycle notices.
+    replica_->becomeFollower(/*leaderEpoch=*/2, /*leaderId=*/2);
+    const std::vector<pc::TxnTopicPartition> parts = {{0, 0}};
+    const std::size_t n = encodeAddPartitions(reqBuf_.data(), reqBuf_.size(), 1, ++corr_, pid, ep, "txDemoted", parts);
+    const std::size_t out = svc_->handleAddPartitions(reqBuf_.data(), n, now_, outBuf_.data(), outBuf_.size());
+    ASSERT_GT(out, 0u) << "a refused append is answered at once";
+    const auto r = pc::AddPartitionsToTxnResponse::decode(outBuf_.data(), out);
+    ASSERT_TRUE(r);
+    ASSERT_EQ(r->results.size(), 1u);
+    EXPECT_EQ(r->results[0].errorCode, static_cast<int16_t>(pc::ErrorCode::NotCoordinator))
+        << "never an OK for a registration that was not appended";
+    EXPECT_EQ(svc_->parkedAnswers(), 0u);
+}
+
+TEST_F(TxnStateReplicationTest, AnEndTxnPipelinedBehindAnUncommittedRegistrationWritesNoMarkerAndUnloadAnswersBothAdversarialRegression) {
+    int markerAppends = 0;
+    svc_->setAppendFnOverride([&](std::string_view, int32_t, std::span<const uint8_t>) -> int64_t {
+        ++markerAppends;
+        return 0;
+    });
+    int16_t ep = 0;
+    const int64_t pid = initPid("txPipe", ep);
+    ASSERT_GE(pid, 0);
+    const std::vector<pc::TxnTopicPartition> parts = {{0, 0}};
+    std::size_t n = encodeAddPartitions(reqBuf_.data(), reqBuf_.size(), 1, 201, pid, ep, "txPipe", parts);
+    ASSERT_EQ(svc_->handleAddPartitions(reqBuf_.data(), n, now_, outBuf_.data(), outBuf_.size()), 0u);
+    n = encodeEndTxn(reqBuf_.data(), reqBuf_.size(), 1, 202, pid, ep, /*commit=*/true, "txPipe");
+    ASSERT_EQ(svc_->handleEndTxn(reqBuf_.data(), n, now_, outBuf_.data(), outBuf_.size()), 0u);
+    for (int i = 0; i < 3; ++i) (void)svc_->doWork(now_ + 1 + i);
+    EXPECT_EQ(markerAppends, 0) << "no COMMIT marker ahead of an uncommitted PrepareCommit";
+    EXPECT_TRUE(answers_.frames.empty());
+    isLeader_ = false;   // the coordinator moves before anything committed
+    (void)svc_->doWork(now_ + 10);
+    EXPECT_EQ(markerAppends, 0);
+    ASSERT_EQ(answers_.frames.size(), 2u) << "both waiting answers are answered, none dropped";
+    const auto add = pc::AddPartitionsToTxnResponse::decode(answers_.frames[0].data(), answers_.frames[0].size());
+    const auto end = pc::EndTxnResponse::decode(answers_.frames[1].data(), answers_.frames[1].size());
+    ASSERT_TRUE(add && end);
+    ASSERT_EQ(add->results.size(), 1u);
+    EXPECT_EQ(add->results[0].errorCode, static_cast<int16_t>(pc::ErrorCode::NotCoordinator));
+    EXPECT_EQ(end->correlationId, 202);
+    EXPECT_EQ(end->errorCode, static_cast<int16_t>(pc::ErrorCode::NotCoordinator));
+    EXPECT_EQ(svc_->parkedAnswers(), 0u);
+    EXPECT_EQ(svc_->prepareGates(), 0u);
+}
+
+TEST_F(TxnStateReplicationTest, ACoordinatorRestartedOverAnUncommittedTailLoadsOnlyOnceItCommitsAdversarialRegression) {
+    int16_t ep = 0;
+    const int64_t pid = initPid("txRestart", ep);
+    ASSERT_GE(pid, 0);
+    const std::vector<pc::TxnTopicPartition> parts = {{0, 3}};
+    std::size_t n = encodeAddPartitions(reqBuf_.data(), reqBuf_.size(), 1, ++corr_, pid, ep, "txRestart", parts);
+    ASSERT_EQ(svc_->handleAddPartitions(reqBuf_.data(), n, now_, outBuf_.data(), outBuf_.size()), 0u);
+    // Crash: the coordinator process state is gone, the log keeps the uncommitted registration.
+    svc_ = std::make_unique<rune::node::TransactionCoordinationService>(
+        txnStore_.get(), /*topics=*/nullptr, [this] { return isLeader_; }, [] { return rune::node::NodeId{1}; });
+    svc_->setAnswerSinkForTest(&CapturedAnswers::sink, &answers_);
+    (void)svc_->doWork(now_);
+    n = encodeAddPartitions(reqBuf_.data(), reqBuf_.size(), 1, ++corr_, pid, ep, "txRestart", parts);
+    std::size_t out = svc_->handleAddPartitions(reqBuf_.data(), n, now_, outBuf_.data(), outBuf_.size());
+    ASSERT_GT(out, 0u);
+    auto r = pc::AddPartitionsToTxnResponse::decode(outBuf_.data(), out);
+    ASSERT_TRUE(r);
+    ASSERT_EQ(r->results.size(), 1u);
+    EXPECT_EQ(r->results[0].errorCode, static_cast<int16_t>(pc::ErrorCode::NotCoordinator))
+        << "not loaded while the log holds an uncommitted tail";
+    followerFetches();
+    (void)svc_->doWork(now_);
+    // Loaded from the committed log: the retry is answered (parked behind its own record, then released).
+    n = encodeAddPartitions(reqBuf_.data(), reqBuf_.size(), 1, ++corr_, pid, ep, "txRestart", parts);
+    out = svc_->handleAddPartitions(reqBuf_.data(), n, now_, outBuf_.data(), outBuf_.size());
+    if (out == 0) {
+        followerFetches();
+        (void)svc_->doWork(now_);
+        ASSERT_EQ(answers_.frames.size(), 1u);
+        r = pc::AddPartitionsToTxnResponse::decode(answers_.frames[0].data(), answers_.frames[0].size());
+    } else {
+        r = pc::AddPartitionsToTxnResponse::decode(outBuf_.data(), out);
+    }
+    ASSERT_TRUE(r);
+    ASSERT_EQ(r->results.size(), 1u);
+    EXPECT_EQ(r->results[0].errorCode, 0) << "the registration survived the restart";
 }

@@ -362,3 +362,113 @@ TEST(LineageDecodeRegression, TheGeneratedTypeIsTheVersionNotTheWholeLineage) {
     EXPECT_THROW((void)rune::codec::generateHeader(evolvingAt(Lineage::Mix, 2), 0), std::invalid_argument);
     EXPECT_THROW((void)rune::codec::generateHeader(evolvingAt(Lineage::Mix, 2), 3), std::invalid_argument);
 }
+
+// ── Adversarial review of PR #434 (#418): hostile headers against every reader, every writer version ──
+//
+// Every string_view a decode hands out must lie inside the record span (or be the default empty view): the record
+// is placed at the front of a large zeroed backing buffer, so a read past the span is observable as a view that
+// points outside it (and stays inside the allocation: no crash, a deterministic failure).
+
+namespace {
+
+std::vector<std::string_view> views(const EvoMixV1& s) { return {s.nick, s.bio}; }
+std::vector<std::string_view> views(const EvoMixV2& s) { return {s.bio}; }
+std::vector<std::string_view> views(const EvoMixV3& s) { return {s.bio, s.motto}; }
+std::vector<std::string_view> views(const EvoMixV4& s) { return {s.motto}; }
+
+bool inside(std::string_view v, std::span<const uint8_t> rec) {
+    if (v.data() == nullptr) return v.empty();
+    const auto* b = reinterpret_cast<const char*>(rec.data());
+    return v.data() >= b && v.data() + v.size() <= b + rec.size();
+}
+
+template <class T>
+void sweepBlockLength(Lineage l, uint16_t w, uint16_t verOverride) {
+    const std::vector<uint8_t> rec = recordAt(l, w);
+    std::vector<uint8_t> backing(rec.size() + 0x10000 + 64, 0);
+    std::copy(rec.begin(), rec.end(), backing.begin());
+    backing[2] = static_cast<uint8_t>(verOverride); backing[3] = static_cast<uint8_t>(verOverride >> 8);
+    const std::span<const uint8_t> span(backing.data(), rec.size());
+    const auto lin = runtimeLineage<T>(l);
+    for (uint32_t bl = 0; bl <= 0xFFFF; ++bl) {
+        backing[0] = static_cast<uint8_t>(bl); backing[1] = static_cast<uint8_t>(bl >> 8);
+        T s;
+        (void)s.decode(span);
+        for (const auto v : views(s))
+            ASSERT_TRUE(inside(v, span)) << T::kSchemaName << " v" << w << " record, ver " << verOverride << ", bl " << bl
+                                         << ": a var field read past the record";
+        T t;
+        (void)t.decode(span, lin);
+        for (const auto v : views(t))
+            ASSERT_TRUE(inside(v, span)) << T::kSchemaName << "+lineage v" << w << " record, ver " << verOverride
+                                         << ", bl " << bl << ": a var field read past the record";
+    }
+}
+
+template <class T> void sweepEveryWriter(Lineage l) {
+    for (uint16_t w = 1; w <= 4; ++w) {
+        sweepBlockLength<T>(l, w, w);              // the record's own version, a hostile block length
+        sweepBlockLength<T>(l, w, T::kVersion);    // claims the reader's own version: the inlined fast path
+    }
+}
+
+}  // namespace
+
+TEST(LineageDecodeRegression, AHostileBlockLengthNeverReadsAVarFieldPastTheRecordV1AdversarialRegression) {
+    sweepEveryWriter<EvoMixV1>(Lineage::Mix);
+}
+TEST(LineageDecodeRegression, AHostileBlockLengthNeverReadsAVarFieldPastTheRecordV2AdversarialRegression) {
+    sweepEveryWriter<EvoMixV2>(Lineage::Mix);
+}
+TEST(LineageDecodeRegression, AHostileBlockLengthNeverReadsAVarFieldPastTheRecordV3AdversarialRegression) {
+    sweepEveryWriter<EvoMixV3>(Lineage::Mix);
+}
+TEST(LineageDecodeRegression, AHostileBlockLengthNeverReadsAVarFieldPastTheRecordV4AdversarialRegression) {
+    sweepEveryWriter<EvoMixV4>(Lineage::Mix);
+}
+
+TEST(LineageDecodeRegression, AHostileVarLengthReadsThatFieldAndEveryLaterOneEmptyAdversarialRegression) {
+    // v3 record read by the v3 type (fast path) and by the v4 type (row path): the first var length is hostile.
+    for (const uint32_t bad : {0xFFFFFFFFu, 0xFFFFFFFCu, 0x80000000u, 0x10000u}) {
+        std::vector<uint8_t> rec = recordAt(Lineage::Mix, 3);
+        const uint16_t bl = static_cast<uint16_t>(rec[0] | (rec[1] << 8));
+        std::memcpy(rec.data() + 4 + bl, &bad, 4);
+        EvoMixV3 s;
+        ASSERT_TRUE(s.decode(rec));
+        EXPECT_TRUE(s.bio.empty()) << bad;
+        EXPECT_TRUE(s.motto.empty()) << bad << ": never read from inside the bad field's bytes";
+        EXPECT_EQ(s.level, valueFor(Lineage::Mix, 6, 3).i) << "the fixed block is still read";
+        EvoMixV4 t;
+        ASSERT_TRUE(t.decode(rec));
+        EXPECT_TRUE(t.motto.empty()) << bad;
+    }
+}
+
+TEST(LineageDecodeRegression, EveryHeaderAndTruncationOfAFixedRecordReadsInsideItAdversarialRegression) {
+    // The zero-copy Decoder and the struct, every (version, block length, size) of a v3 evo_fix record: the
+    // string(4) field's view stays inside the record, and a version the reader does not know reads nothing.
+    const std::vector<uint8_t> full = recordAt(Lineage::Fix, 3);
+    std::vector<uint8_t> backing(full.size() + 0x10000 + 64, 0);
+    std::copy(full.begin(), full.end(), backing.begin());
+    for (const uint16_t ver : {uint16_t{0}, uint16_t{1}, uint16_t{2}, uint16_t{3}, uint16_t{4}, uint16_t{5}, uint16_t{0xFFFF}}) {
+        backing[2] = static_cast<uint8_t>(ver); backing[3] = static_cast<uint8_t>(ver >> 8);
+        for (const uint32_t bl : {0u, 1u, 8u, 15u, 16u, 23u, 24u, 27u, 28u, 29u, 0x7FFFu, 0xFFFFu}) {
+            backing[0] = static_cast<uint8_t>(bl); backing[1] = static_cast<uint8_t>(bl >> 8);
+            for (std::size_t n = 0; n <= full.size(); ++n) {
+                const std::span<const uint8_t> span(backing.data(), n);
+                const EvoFixV2Decoder d(span);
+                ASSERT_TRUE(inside(d.code(), span)) << "ver " << ver << " bl " << bl << " n " << n;
+                if (ver > EvoFixV2::kVersion || ver == 0) {
+                    EXPECT_FALSE(d.known());
+                    EXPECT_EQ(d.id(), 0);
+                }
+                EvoFixV2 s;
+                const bool ok = s.decode(span);
+                if (ver > EvoFixV2::kVersion || ver == 0 || n < 4) {
+                    EXPECT_FALSE(ok) << "ver " << ver << " bl " << bl << " n " << n;
+                    EXPECT_EQ(s.id, 0);
+                }
+            }
+        }
+    }
+}

@@ -615,3 +615,78 @@ TEST(ClaimBrokerRegression, ATypedReaderPlacesRecordsWrittenAfterAMidBlockDropRe
     EXPECT_EQ(s.zone, 3) << "the lineage places the v1 record too";
     cl->close();
 }
+
+// Adversarial review of PR #434 (#418): the lineage fetch through the real client and broker, attacked.  The topic
+// evolves AGAIN after a reader fetched its lineage (a schema change between the fetch and the consume); the lineage
+// is asked for a topic that does not exist, for a topic of another schema, and by a principal without DESCRIBE.
+TEST(ClaimBrokerRegression, ALineageGoesStaleOnTheNextAlterIsRefetchedAndIsRefusedWhereItMustAdversarialRegression) {
+    ClaimRig rig("claim_lineage_adv");
+    rig.b.createUser("evolver", kPw,
+                     {grants::prefix(SO::Create, ST::Topic, "claim."), grants::prefix(SO::Describe, ST::Topic, "claim."),
+                      grants::prefix(SO::Write, ST::Topic, "claim."), grants::prefix(SO::Read, ST::Topic, "claim."),
+                      grants::prefix(SO::Alter, ST::Topic, "claim.")});
+    rig.b.createUser("outsider", kPw, {grants::prefix(SO::Describe, ST::Topic, "elsewhere.")});
+    const std::string name = "claim.lin2";
+    const rune::codec::Descriptor v1 = positionDescriptor();
+    ASSERT_GE(rig.define(name, "userId", rune::codec::serialize(v1), /*validate=*/true), 0);
+    const std::string other = "claim.other";
+    ASSERT_GE(rig.define(other, "k",
+                         rune::codec::serialize(rune::codec::DescriptorBuilder("other")
+                                                    .add("k", rune::codec::PrimType::Int64, 1, true)
+                                                    .build()),
+                         /*validate=*/true),
+              0);
+    auto cl = rig.connect("evolver", rc::RunnerMode::Thread);
+
+    const auto alter = [&](rune::codec::AlterOp op, uint16_t expectVersion) {
+        const auto r = cl->alterTopicAndWait(name, 0, rune::codec::encodeAlterOps({op}), {}, 30s);
+        ASSERT_EQ(r.errorCode, 0) << r.detail;
+        ASSERT_EQ(r.newVersion, expectVersion);
+    };
+    rune::codec::AlterOp drop{}; drop.type = rune::codec::AlterOpType::Drop; drop.name = "zone";
+    alter(drop, 2);
+    const Position::Lineage lin2 = cl->lineageAndWait<Position>(name, 30s);
+    ASSERT_EQ(lin2.maxVersion(), 2u);
+    rune::codec::AlterOp drop2{}; drop2.type = rune::codec::AlterOpType::Drop; drop2.name = "x";
+    alter(drop2, 3);   // y, z, ... move again
+
+    // A v3 writer's record, laid out from the v3 layout the client computes itself.
+    uint16_t nextTag = static_cast<uint16_t>(v1.fields.size());
+    auto ev = rune::codec::applyOps(v1, {drop}, nextTag, 2);
+    ASSERT_TRUE(ev.has_value());
+    ev = rune::codec::applyOps(*ev, {drop2}, nextTag, 3);
+    ASSERT_TRUE(ev.has_value());
+    const rune::codec::Descriptor at3 = rune::codec::materializeAsOf(*ev, 3);
+    std::vector<uint8_t> b(4 + at3.blockLength, 0);
+    b[0] = static_cast<uint8_t>(at3.blockLength); b[1] = static_cast<uint8_t>(at3.blockLength >> 8); b[2] = 3;
+    const int64_t uid = 33; const double y = 7.25; const uint64_t tick = 99;
+    std::memcpy(b.data() + 4 + at3.find("userId")->offset, &uid, 8);
+    std::memcpy(b.data() + 4 + at3.find("y")->offset, &y, 8);
+    std::memcpy(b.data() + 4 + at3.find("tick")->offset, &tick, 8);
+
+    Position s;
+    EXPECT_FALSE(s.decode(b, lin2)) << "a lineage fetched before the next ALTER does not know v3: reported, not misread";
+    EXPECT_EQ(s.y, 0.0);
+    const Position::Decoder staleD(b, lin2);
+    EXPECT_FALSE(staleD.known());
+    EXPECT_EQ(staleD.y(), 0.0);
+    const Position::Lineage lin3 = cl->lineageAndWait<Position>(name, 30s);
+    ASSERT_EQ(lin3.maxVersion(), 3u);
+    ASSERT_TRUE(s.decode(b, lin3));
+    EXPECT_EQ(s.userId, uid);
+    EXPECT_EQ(s.y, y);
+    EXPECT_EQ(s.tick, tick);
+    EXPECT_EQ(s.x, 0.0) << "dropped at v3: absent";
+    EXPECT_EQ(s.zone, 0) << "dropped at v2: absent";
+
+    EXPECT_THROW((void)cl->lineageAndWait<Position>("claim.nope", 30s), std::runtime_error) << "no such topic";
+    EXPECT_THROW((void)cl->lineageAndWait<Position>(other, 30s), std::invalid_argument) << "another schema";
+    cl->close();
+
+    auto out = rig.connect("outsider", rc::RunnerMode::Thread);
+    EXPECT_THROW((void)out->lineageAndWait<Position>(name, 30s), std::runtime_error)
+        << "the lineage is a DESCRIBE like any schema read";
+    const auto plain = out->getTopicSchemaAndWait(name, 30s);
+    EXPECT_NE(plain.errorCode, 0) << "and the plain read is refused alike";
+    out->close();
+}

@@ -193,3 +193,49 @@ TEST(AeronIngressRegression, TheSealedSenderBoundIsTheIngressRingMaximum) {
     IngressRing ring{kDefaultIngressCapacity};
     EXPECT_EQ(ring.maxMsgLength(), kMaxConsensusFrameBytes);
 }
+
+// ── Adversarial review of PR #434 (#254): hostile frames at the exact sealed boundary ──
+namespace {
+void offerRaw(Rig& r, std::size_t len, uint8_t fill) {
+    std::vector<uint8_t> wire(len, fill);
+    aeron::concurrent::AtomicBuffer buf(wire.data(), static_cast<aeron::util::index_t>(wire.size()));
+    const auto deadline = std::chrono::steady_clock::now() + 10s;
+    while (r.pub->offer(buf, 0, static_cast<aeron::util::index_t>(wire.size())) < 0) {
+        ASSERT_LT(std::chrono::steady_clock::now(), deadline) << "offer back-pressured for 10 s";
+        r.ingress->poll(10);
+        r.drainRing();
+    }
+}
+}  // namespace
+
+TEST(AeronIngressRegression, SealedJunkAtTheBoundaryIsAnOpenDropAndOneByteMoreIsOversizeAdversarialRegression) {
+    Rig r(/*sealed=*/true);
+    const std::size_t max = r.ring.maxMsgLength();
+    // Junk of exactly the largest sealed frame: it reaches the cipher and fails to open (never the ring).
+    offerRaw(r, max + pl::kPeerFrameOverhead, 0xA5);
+    ASSERT_NO_THROW({ ASSERT_TRUE(r.pollUntil([&] { return r.ingress->peerFrameDrops() == 1; })); });
+    EXPECT_EQ(r.ingress->oversizeDrops(), 0u);
+    // One byte more: refused by size before any cipher work.
+    offerRaw(r, max + pl::kPeerFrameOverhead + 1, 0xA5);
+    ASSERT_NO_THROW({ ASSERT_TRUE(r.pollUntil([&] { return r.ingress->oversizeDrops() == 1; })); });
+    EXPECT_EQ(r.ingress->peerFrameDrops(), 1u);
+    // Tiny junk (shorter than the seal overhead) is an open drop, never a ring write or a throw.
+    offerRaw(r, 1, 0x00);
+    ASSERT_NO_THROW({ ASSERT_TRUE(r.pollUntil([&] { return r.ingress->peerFrameDrops() == 2; })); });
+    EXPECT_EQ(r.delivered, 0u);
+    // The link still works: a real sealed frame of the ring maximum arrives intact.
+    r.send(max);
+    ASSERT_NO_THROW({ ASSERT_TRUE(r.pollUntil([&] { return r.delivered == 1; })); });
+    EXPECT_EQ(r.lastLen, max);
+}
+
+TEST(AeronIngressRegression, APlainFrameOfOneByteAndOfTheMaximumArriveAndTheOversizeCounterIsExactAdversarialRegression) {
+    Rig r(/*sealed=*/false);
+    const std::size_t max = r.ring.maxMsgLength();
+    offerRaw(r, 1, 0x01);
+    offerRaw(r, max + 1, 0x02);
+    offerRaw(r, max, 0x03);
+    offerRaw(r, 4 * max, 0x04);   // far above (fragmented by Aeron, reassembled, then refused)
+    ASSERT_NO_THROW({ ASSERT_TRUE(r.pollUntil([&] { return r.delivered == 2 && r.ingress->oversizeDrops() == 2; })); });
+    EXPECT_EQ(r.lastLen, max);
+}

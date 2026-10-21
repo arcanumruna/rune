@@ -108,7 +108,7 @@ bool TransactionCoordinationService::applyTxnOffset_(const std::string& group,
 {
     if (offsetSink_ == nullptr) return true;   // no offset store on this node: nothing to apply to
     // Duty clock, as handleOffsetCommit's nowNs.  #358: only a COMMITTED offset counts as applied.
-    switch (offsetSink_(offsetSinkCtx_, group, tp, offset, lastNowNs_)) {
+    switch (offsetSink_(offsetSinkCtx_, group, tp, offset, lastNowNs_, completionToken_)) {
         case rune::coordination::TxnOffsetApply::Applied:     return true;
         case rune::coordination::TxnOffsetApply::Replicating: return false;
         case rune::coordination::TxnOffsetApply::Refused:     break;
@@ -1082,6 +1082,18 @@ bool TransactionCoordinationService::completeAwaiting_(int64_t producerId, bool 
     if (it == awaiting_.end()) return true;
     AwaitingMarkers& cur = it->second;
     offsetRefusedThisPass_ = false;
+    completionToken_ = 0;
+    if (const auto* m = coordinator_.metadata(cur.txnId)) {
+        // F2: unique per transaction (a producer's next transaction starts after this one completed) and stable
+        // across this coordinator's retries; another coordinator's re-drive gets its own record appended.
+        uint64_t h = 0xcbf29ce484222325ull;
+        for (const uint64_t v : {static_cast<uint64_t>(m->producerId), static_cast<uint64_t>(m->producerEpoch),
+                                 static_cast<uint64_t>(m->txnStartNs), static_cast<uint64_t>(coordinatorEpoch_)}) {
+            h ^= v;
+            h *= 0x100000001b3ull;
+        }
+        completionToken_ = h | 1u;   // never the anonymous 0
+    }
     const auto r = coordinator_.completeTransaction(cur.txnId);
     if (r.errorCode == tx::CompleteTransactionResult::kOffsetsPending && !offsetRefusedThisPass_) {
         // #358: every offset is appended, some not committed yet on the offsets replica.  CompleteCommit waits for

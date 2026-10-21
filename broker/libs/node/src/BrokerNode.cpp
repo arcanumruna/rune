@@ -2506,9 +2506,9 @@ void BrokerNode::buildGateway() {
             if (groupCoordService_) {
                 txnCoordService_->setTxnOffsetSink(
                     [](void* ctx, const std::string& group, const rune::coordination::TopicPartition& tp,
-                       int64_t offset, int64_t nowNs) {
+                       int64_t offset, int64_t nowNs, uint64_t token) {
                         return static_cast<GroupCoordinationService*>(ctx)->applyTransactionalOffset(group, tp, offset,
-                                                                                                      nowNs);
+                                                                                                      nowNs, token);
                     },
                     groupCoordService_.get());
             }

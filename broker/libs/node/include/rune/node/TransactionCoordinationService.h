@@ -230,9 +230,11 @@ public:
     /// completion is re-checked on every doWork (no backoff: it waits on replication, not on a refusal) until every
     /// offset is Applied.  No sink wired = no offset store on this node (unit rigs): offsets are accepted and
     /// dropped.  Called on the control thread; the apply is an overwrite, so re-drives are idempotent.
+    /// `token` (PR #434 review F2): one value per committing transaction (producer id, epoch, start), so the sink
+    /// answers a transaction only from the offset record THAT transaction appended.
     using TxnOffsetSink = rune::coordination::TxnOffsetApply (*)(void* ctx, const std::string& group,
                                                                  const rune::coordination::TopicPartition& tp,
-                                                                 int64_t offset, int64_t nowNs);
+                                                                 int64_t offset, int64_t nowNs, uint64_t token);
     void setTxnOffsetSink(TxnOffsetSink fn, void* ctx) noexcept { offsetSink_ = fn; offsetSinkCtx_ = ctx; }
     /// Completion attempts deferred because the sink refused (a retry counter, not a loss counter).
     [[nodiscard]] uint64_t txnOffsetApplyRetries() const noexcept { return offsetApplyRetries_; }
@@ -319,6 +321,7 @@ private:
     uint64_t      offsetApplyRetries_ = 0;
     uint64_t      offsetReplicationWaits_ = 0;
     bool          offsetRefusedThisPass_  = false;   ///< #358: a completion pass met a Refused (vs only Replicating)
+    uint64_t      completionToken_        = 0;       ///< F2: the transaction completeAwaiting_ is completing
     std::size_t   offsetsPendingTxns_ = 0;   ///< awaiting_ entries deferred on a refused offset apply
     static constexpr int64_t kOffsetRetryMinNs = 10'000'000;     // 10 ms
     static constexpr int64_t kOffsetRetryMaxNs = 1'000'000'000;  // 1 s

@@ -938,7 +938,7 @@ bool GroupCoordinationService::staleLineage_(const rune::coordination::Committed
 // ---------------------------------------------------------------------------
 coord::TxnOffsetApply GroupCoordinationService::applyTransactionalOffset(const std::string& group,
                                                                          const coord::TopicPartition& tp,
-                                                                         int64_t offset, int64_t nowNs)
+                                                                         int64_t offset, int64_t nowNs, uint64_t token)
 {
     using R = coord::TxnOffsetApply;
     if (offsets_ == nullptr || !isLocalCoordinator() || !offsetsLoaded_()) return R::Refused;
@@ -954,24 +954,54 @@ coord::TxnOffsetApply GroupCoordinationService::applyTransactionalOffset(const s
     // #358: Applied only once the record is COMMITTED (HW past it); a pending record is waited on, not re-appended -
     // unless the replica's leadership or log changed under it (it may be gone): then it is appended again.
     const uint64_t leadGen = r->leadershipGeneration(), logGen = r->logGeneration();
-    TxnOffsetKey key{group, tp.topic, tp.partition, offset};
-    if (auto it = txnOffsetsInFlight_.find(key); it != txnOffsetsInFlight_.end()) {
-        if (it->second.leadershipGen == leadGen && it->second.logGen == logGen) {
-            if (r->highWatermark() <= it->second.recordOffset) return R::Replicating;
-            txnOffsetsInFlight_.erase(it);
-            return R::Applied;
+    const int64_t hw = r->highWatermark();
+    const auto slot = txnOffsetsInFlight_.try_emplace(TxnOffsetKey{group, tp.topic, tp.partition}).first;
+    auto& waiters = slot->second;
+    struct DropEmpty {   // no empty per-key vectors linger in the map
+        std::map<TxnOffsetKey, std::vector<TxnOffsetInFlight>>& m;
+        decltype(slot) it;
+        ~DropEmpty() { if (it->second.empty()) m.erase(it); }
+    } dropEmpty{txnOffsetsInFlight_, slot};
+    const std::size_t before = waiters.size();
+    std::erase_if(waiters, [&](const TxnOffsetInFlight& e) { return e.leadershipGen != leadGen || e.logGen != logGen; });
+    for (std::size_t i = 0; i < waiters.size(); ++i) {
+        TxnOffsetInFlight& e = waiters[i];
+        if (e.token != token || e.offset != offset) continue;   // F2: only this transaction's own record answers it
+        if (hw <= e.recordOffset) {
+            txnOffsetsWaiting_ -= before - waiters.size();
+            return R::Replicating;
         }
-        txnOffsetsInFlight_.erase(it);
+        // Committed.  A newer append superseded it (its value was overwritten in order): Applied, never re-appended.
+        // Not superseded: it is the key's newest record, so every older one is committed too - they all leave.
+        if (e.superseded) waiters.erase(waiters.begin() + static_cast<std::ptrdiff_t>(i));
+        else waiters.clear();
+        txnOffsetsWaiting_ -= before - waiters.size();
+        return R::Applied;
     }
-    // Entries of an earlier generation are never asked about again (their transaction re-drives with a fresh append).
-    std::erase_if(txnOffsetsInFlight_, [&](const auto& e) {
-        return e.second.leadershipGen != leadGen || e.second.logGen != logGen;
-    });
+    txnOffsetsWaiting_ -= before - waiters.size();
     const int64_t at = offsets_->commitAt(group, tp, offset, {}, nowNs, lineage);
     if (at < 0) return R::Refused;
-    if (r->highWatermark() > at) return R::Applied;
-    txnOffsetsInFlight_.emplace(std::move(key), TxnOffsetInFlight{at, leadGen, logGen});
+    for (TxnOffsetInFlight& e : waiters) e.superseded = true;   // older records of this key: overwritten in order
+    if (hw > at || r->highWatermark() > at) {
+        txnOffsetsWaiting_ -= waiters.size();
+        waiters.clear();                                         // every older record is committed as well
+        return R::Applied;
+    }
+    if (waiters.size() >= kMaxTxnOffsetWaiters) {               // bound: drop the oldest (a waiter long gone)
+        waiters.erase(waiters.begin());
+        --txnOffsetsWaiting_;
+    }
+    waiters.push_back(TxnOffsetInFlight{token, offset, at, leadGen, logGen, false});
+    ++txnOffsetsWaiting_;
     return R::Replicating;
+}
+
+void GroupCoordinationService::supersedeTxnOffsets_(const std::string& group, const coord::TopicPartition& tp)
+{
+    if (txnOffsetsWaiting_ == 0) return;
+    const auto it = txnOffsetsInFlight_.find(TxnOffsetKey{group, tp.topic, tp.partition});
+    if (it == txnOffsetsInFlight_.end()) return;
+    for (TxnOffsetInFlight& e : it->second) e.superseded = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1123,6 +1153,7 @@ size_t GroupCoordinationService::handleOffsetCommit(
             }
         }
         const bool committed = offsets_->commit(groupIdStr, tp, e.offset, meta, nowNs, lineage);
+        if (committed) supersedeTxnOffsets_(groupIdStr, tp);   // F2: a waiting transactional record is now older
         r.errorCode = committed ? static_cast<int16_t>(pc::ErrorCode::OK)
                                 : static_cast<int16_t>(pc::ErrorCode::MinIsrViolation);
         commitResultScratch_.push_back(r);
