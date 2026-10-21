@@ -16,6 +16,7 @@
 //   idDescriptor / addColumnOps / viewPlanOver — DDL payload builders.
 //
 // Every wait is bounded (the deadline is the failure, never a hang).
+#include "support/CatalogBrokerCluster.h"
 #include "support/TestNodeConfig.h"
 
 #include <rune/aeronutil/testing/FreePort.h>
@@ -36,6 +37,7 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -48,31 +50,42 @@ namespace rune::node::test {
 
 class OneBroker {
 public:
-    explicit OneBroker(const std::string& tag)
+    /// Legacy (the default, what every earlier suite pins) or the shipped shard runtime (Phase 2c: filtered
+    /// subscriptions are served in shard mode only).  `tweak` edits the NodeConfig before every start.
+    enum class Runtime { Legacy, Shard };
+
+    explicit OneBroker(const std::string& tag, Runtime runtime = Runtime::Legacy,
+                       std::function<void(NodeConfig&)> tweak = {})
         : dir_(std::filesystem::temp_directory_path() /
                ("rune_onebroker_" + tag + "_" + std::to_string(::getpid()) + "_" + std::to_string(seq_()++))) {
         std::filesystem::remove_all(dir_);
         std::filesystem::create_directories(dir_);
         NodeConfig cfg;
-        pinLegacyRuntime(cfg);
-        cfg.nodeId = 0;
-        cfg.dataDir = (dir_ / "broker").string();
-        cfg.aeronDir = (dir_ / "broker" / "aeron").string();
-        cfg.consensusStreamId = 10;
-        PeerConfig self;
-        self.id = 0;
-        self.host = "127.0.0.1";
-        self.consensusPort = rune::aeronutil::testing::allocFreeUdpPort();
-        cfg.peers = {self};
-        clientPort_ = rune::aeronutil::testing::allocFreeUdpPort();
-        cfg.clientEndpoint.channel = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(clientPort_);
-        cfg.clientEndpoint.streamId = 1;
-        cfg.workerCount = 1;
+        if (runtime == Runtime::Shard) {
+            const auto ports = catalog_cluster::Ports::discover(1);
+            cfg = catalog_cluster::makeConfig(1, dir_ / "broker", ports, 1, catalog_cluster::Mode::Shard);
+            clientPort_   = ports.client[0];
+            clientStream_ = catalog_cluster::kClientStream;
+        } else {
+            pinLegacyRuntime(cfg);
+            cfg.nodeId = 0;
+            cfg.dataDir = (dir_ / "broker").string();
+            cfg.aeronDir = (dir_ / "broker" / "aeron").string();
+            cfg.consensusStreamId = 10;
+            PeerConfig self;
+            self.id = 0;
+            self.host = "127.0.0.1";
+            self.consensusPort = rune::aeronutil::testing::allocFreeUdpPort();
+            cfg.peers = {self};
+            clientPort_ = rune::aeronutil::testing::allocFreeUdpPort();
+            cfg.clientEndpoint.channel = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(clientPort_);
+            cfg.clientEndpoint.streamId = 1;
+            cfg.workerCount = 1;
+        }
+        if (tweak) tweak(cfg);
+        cfg_     = cfg;
         channel_ = cfg.clientEndpoint.channel;
-        node_ = std::make_unique<BrokerNode>(cfg);
-        node_->start();
-        if (!node_->awaitLeader(std::chrono::seconds(30)))
-            throw std::runtime_error("OneBroker: the node never became the leader");
+        startNode_();
     }
     ~OneBroker() {
         clients_.clear();
@@ -88,7 +101,7 @@ public:
     rune::client::Client* connectClient() {
         rune::client::ClientConfig c;
         c.gatewayChannel  = channel_;
-        c.gatewayStreamId = 1;
+        c.gatewayStreamId = clientStream_;
         c.egressChannel   = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());
         c.egressStreamId  = 2;
         c.dataDir         = (dir_ / ("client" + std::to_string(clients_.size()))).string();
@@ -96,6 +109,27 @@ public:
         client->connectAndWait(std::chrono::seconds(20));
         clients_.push_back(std::move(client));
         return clients_.back().get();
+    }
+
+    /// A fresh ClientConfig seeded on the node (own embedded driver, UDP egress, own data dir); the caller owns the
+    /// Client it builds.
+    [[nodiscard]] rune::client::ClientConfig clientConfig() {
+        rune::client::ClientConfig c;
+        c.gatewayChannel  = channel_;
+        c.gatewayStreamId = clientStream_;
+        c.egressChannel   = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());
+        c.egressStreamId  = 2;
+        c.dataDir         = (dir_ / ("own_client" + std::to_string(ownClients_++))).string();
+        return c;
+    }
+
+    /// A clean stop and a start on the same data dir and ports (the node recovers its topics and logs).  Every
+    /// client connected before it loses its session.
+    void restart() {
+        clients_.clear();
+        node_->stop();
+        node_.reset();
+        startNode_();
     }
 
     [[nodiscard]] BrokerNode& node() noexcept { return *node_; }
@@ -258,6 +292,12 @@ public:
     }
 
 private:
+    void startNode_() {
+        node_ = std::make_unique<BrokerNode>(cfg_);
+        node_->start();
+        if (!node_->awaitLeader(std::chrono::seconds(30)))
+            throw std::runtime_error("OneBroker: the node never became the leader");
+    }
     static int& seq_() {
         static int s = 0;   // single-threaded test binaries
         return s;
@@ -265,6 +305,9 @@ private:
     std::filesystem::path                              dir_;
     uint16_t                                           clientPort_ = 0;
     std::string                                        channel_;
+    int32_t                                            clientStream_ = 1;
+    int                                                ownClients_ = 0;
+    NodeConfig                                         cfg_;
     std::unique_ptr<BrokerNode>                        node_;
     std::vector<std::unique_ptr<rune::client::Client>> clients_;
 };
