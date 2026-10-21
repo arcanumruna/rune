@@ -17,13 +17,6 @@ PermissionRef::~PermissionRef() {
     if (pool_ != nullptr) pool_->release_(id_);
 }
 
-const PermissionTable& PermissionRef::table() const noexcept {
-    if (table_ != nullptr) return *table_;
-    if (owned_) return *owned_;
-    static const PermissionTable kDeny = PermissionTable::denyAll();
-    return kDeny;
-}
-
 uint64_t PermissionPool::hashOf_(std::span<const rsec::GrantSpec> grants) noexcept {
     uint64_t h = 0xcbf29ce484222325ULL;   // FNV-1a over every field of every grant
     auto mix = [&h](uint64_t v) { h ^= v; h *= 0x100000001b3ULL; };

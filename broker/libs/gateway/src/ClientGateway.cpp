@@ -4267,7 +4267,10 @@ void ClientGateway::enqueueSubscribeOp_(const BufferedSubscribe& s, void* egress
         retireWithoutRecordEgress_(s.subId);
         return;
     }
-    if (const auto it = subscriptions_.find(s.subId); it != subscriptions_.end()) it->second.cursor = Cursor::AtWorker;
+    if (const auto it = subscriptions_.find(s.subId); it != subscriptions_.end()) {
+        it->second.cursor = Cursor::AtWorker;
+        if (it->second.okOwed) sendOwedSubscribeOk_(s.subId);   // F1: the egress exists: the held OK goes first
+    }
     rune::node::WorkerOp op = buildSubscribeOp_(s, egressPub);
 
     // M5: never dropped — a refused Subscribe (or one behind a queued lifecycle
@@ -4468,6 +4471,24 @@ void ClientGateway::onRecordEgressResolved_(int64_t sessionId, int32_t workerId,
     // the pub (never handed to a worker) is released with `pub`.
 }
 
+void ClientGateway::sendOwedSubscribeOk_(int64_t subId)
+{
+    const auto it = subscriptions_.find(subId);
+    if (it == subscriptions_.end() || !it->second.okOwed) return;
+    Subscription& sub = it->second;
+    sub.okOwed = false;
+    Session* session = sessions_.find(sub.sessionId);
+    if (session == nullptr) return;
+    pc::SubscribeResponse resp;
+    resp.sessionId      = sub.sessionId;
+    resp.correlationId  = sub.subscribeCorrId;
+    resp.errorCode      = 0;
+    resp.partition      = sub.partition;
+    resp.subscriptionId = subId;
+    sendAnswer_(*session, scratch_.data(), resp.encode(scratch_.data()));
+    if (std::exchange(sub.okOwedLineage, false)) noteLineage_(subId);
+}
+
 void ClientGateway::retireWithoutRecordEgress_(int64_t subId)
 {
     // Issue #118: a subscription this broker cannot serve on its own per-session record egress under authentication.
@@ -4485,6 +4506,18 @@ void ClientGateway::retireWithoutRecordEgress_(int64_t subId)
                      subId, sub.sessionId, sub.topicId, sub.partition, subscribesWithoutRecordEgress_);
     Session* session = sessions_.find(sub.sessionId);
     if (session == nullptr) return;           // closed: it ended with its session
+    if (sub.okOwed) {
+        // PR #441 F1: the Subscribe was never answered OK - refuse it as a PENDING request (bare NotLeader): the
+        // client spends that request's retry budget and fails it explicitly once the budget is gone ("Subscribe
+        // failed: NotLeader (retry budget exhausted)"); a group member's fetch counts its refusals the same way.
+        session->subIdByKey.erase(Session::SubKey{sub.subscribeCorrId, sub.topicId, sub.partition});
+        pc::ErrorResponse err;
+        err.sessionId     = sub.sessionId;
+        err.correlationId = sub.subscribeCorrId;
+        err.code          = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+        sendAnswer_(*session, scratch_.data(), err.encode(scratch_.data()));
+        return;
+    }
     if (sub.isGroup) {
         if (const auto g = groupMemberSubs_.find(sub.sessionId); g != groupMemberSubs_.end())
             std::erase(g->second, subId);
@@ -5005,7 +5038,7 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
             spdlog::debug("ClientGateway: duplicate Subscribe sessionId={} corrId={} topic={} partition={} "
                           "→ existing subId={} (no second subscription)",
                           msg.sessionId, msg.correlationId, msg.topicId, partition, dup->second);
-            sendResp(pc::ErrorCode::OK, partition, dup->second);
+            if (!existing->second.okOwed) sendResp(pc::ErrorCode::OK, partition, dup->second);   // F1: else it is owed
             return;
         }
         session->subIdByKey.erase(dup);   // stale index entry (sub already gone)
@@ -5025,6 +5058,17 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     sub.hadReplica      = replicaRegistry_ != nullptr &&
                           static_cast<bool>(replicaRegistry_->lookupHandle(msg.topicId, partition));
 
+    // PR #441 F1 (issue #118): under authentication a worker-pushed partition answers OK only once the session's own
+    // record egress for the owning worker exists (now, or when it resolves); a failed resolve then refuses the
+    // still-pending Subscribe NotLeader - the client's budget for THAT request counts, and runs out explicitly.
+    const bool workerPushed = perWorkerEgressActive_ && workerPool_ && msg.topicId >= 0;
+    if (workerPushed && authMode_ == rune::gateway::GatewayAuthMode::Required) {
+        const int32_t wid = workerPool_->ownerWorkerId(msg.topicId, partition);
+        const auto eg = session->recordEgressByWorker.find(wid);
+        sub.okOwed        = eg == session->recordEgressByWorker.end() || !eg->second;
+        sub.okOwedLineage = sub.okOwed && served.kind == ServedPartition::Kind::Transient;
+    }
+    const bool okOwed = sub.okOwed;
     subscriptions_.emplace(subId, std::move(sub));
     session->subIdByKey[subKey] = subId;   // 5a: the dedupe index
 
@@ -5033,12 +5077,13 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     // egress.  User partitions only (internal topicId < 0 stay gateway-pushed).
     // The gateway keeps its subscriptions_ record for setup/teardown; its
     // pushSubscriptions() skips these subs (see the per-worker-egress guard there).
-    if (perWorkerEgressActive_ && workerPool_ && msg.topicId >= 0) {
+    if (workerPushed) {
         forwardSubscribeToWorker_(subId, msg.sessionId, msg.topicId, partition,
                                   nextOffset, msg.isolation,
                                   /*isGroup=*/false, /*groupCarrierReceived=*/false,
                                   /*subscribeCorrId=*/msg.correlationId);
     }
+    if (okOwed) return;   // F1: the OK (and the lineage note) follow the egress, or the refusal replaces them
 
     // Reply SubscribeResponse{OK, partition, subscriptionId}.
     sendResp(pc::ErrorCode::OK, partition, subId);

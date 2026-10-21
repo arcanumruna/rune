@@ -58,14 +58,18 @@ void BM_GatewayPermissionTableAllows(benchmark::State& state) {
     for (int32_t i = 0; i < kTopics; ++i) idx.onTopic(i, "t" + std::to_string(i));
     const std::vector<rune::security::GrantSpec> grants = {
         {rune::security::Operation::Write, {rune::security::ResourceType::Topic, rune::security::PatternKind::Prefix, "t1"}}};
-    const auto table = rune::gateway::PermissionTable::compile(grants, idx);
+    // PR #441 F2: through a pooled PermissionRef, exactly as ClientGateway::permsOf_ reads it on every check.
+    rune::gateway::PermissionPool pool;
+    const rune::gateway::PermissionRef ref = pool.acquire(grants, idx);
+    const rune::gateway::PermissionTable& table = ref.table();
+    benchmark::DoNotOptimize(&table);
     const uint8_t write = rune::security::opBit(rune::security::Operation::Write);
     const auto ids = randomTopicIds();
     std::size_t k = 0;
     uint64_t allowed = 0;
     allocsOn();
     for (auto _ : state) {
-        allowed += table.allows(ids[k++ & (kIds - 1)], write) ? 1u : 0u;
+        allowed += ref.table().allows(ids[k++ & (kIds - 1)], write) ? 1u : 0u;
     }
     allocsOff(state);
     benchmark::DoNotOptimize(allowed);
@@ -174,7 +178,11 @@ void BM_GatewayFrameCheckPidOwner(benchmark::State& state) {
     for (int32_t i = 0; i < kTopics; ++i) idx.onTopic(i, "t" + std::to_string(i));
     const std::vector<rune::security::GrantSpec> grants = {
         {rune::security::Operation::Write, {rune::security::ResourceType::Topic, rune::security::PatternKind::Prefix, "t1"}}};
-    const auto table = rune::gateway::PermissionTable::compile(grants, idx);
+    // PR #441 F2: through a pooled PermissionRef, exactly as ClientGateway::permsOf_ reads it on every check.
+    rune::gateway::PermissionPool pool;
+    const rune::gateway::PermissionRef ref = pool.acquire(grants, idx);
+    const rune::gateway::PermissionTable& table = ref.table();
+    benchmark::DoNotOptimize(&table);
     const uint8_t write = rune::security::opBit(rune::security::Operation::Write);
     const auto fs = frames(1);
     const uint64_t userId = 7;
@@ -183,7 +191,7 @@ void BM_GatewayFrameCheckPidOwner(benchmark::State& state) {
     allocsOn();
     for (auto _ : state) {
         const Frame& f = fs[k++ & (kIds - 1)];
-        bool ok = table.allows(f.topic, write);
+        bool ok = ref.table().allows(f.topic, write);
         if (pidCheck) ok = ok & rune::protocol::producerIdUsableBy(f.pid, userId);
         allowed += ok ? 1u : 0u;
     }

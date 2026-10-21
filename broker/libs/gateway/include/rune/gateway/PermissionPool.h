@@ -31,16 +31,22 @@ namespace rune::gateway {
 
 class PermissionPool;
 
+/// The deny-everything table a ref without a table of its own points at (never null: the hot path is ONE load).
+[[nodiscard]] inline const PermissionTable* denyAllPermissionTable() noexcept {
+    static const PermissionTable kDeny = PermissionTable::denyAll();
+    return &kDeny;
+}
+
 /// A session's hold on one pooled table (or, test seams only, a table of its own).  Copy = one more holder.
 class PermissionRef {
 public:
     PermissionRef() = default;
     /// Test seam / unpooled: a table owned by this ref alone (shipped as nothing: never used on a shard worker).
     PermissionRef(PermissionTable owned)   // NOLINT(google-explicit-constructor): AuthAuthenticated{..., table, ...}
-        : owned_(std::make_shared<const PermissionTable>(std::move(owned))) {}
+        : owned_(std::make_shared<const PermissionTable>(std::move(owned))) { table_ = owned_.get(); }
     PermissionRef(const PermissionRef& o);
     PermissionRef(PermissionRef&& o) noexcept
-        : pool_(std::exchange(o.pool_, nullptr)), id_(o.id_), table_(std::exchange(o.table_, nullptr)),
+        : pool_(std::exchange(o.pool_, nullptr)), id_(o.id_), table_(std::exchange(o.table_, denyAllPermissionTable())),
           owned_(std::move(o.owned_)) {}
     PermissionRef& operator=(PermissionRef o) noexcept { swap(o); return *this; }
     ~PermissionRef();
@@ -48,7 +54,8 @@ public:
         std::swap(pool_, o.pool_); std::swap(id_, o.id_); std::swap(table_, o.table_); owned_.swap(o.owned_);
     }
 
-    [[nodiscard]] const PermissionTable& table() const noexcept;
+    /// The hot path (every produce / subscribe / fetch authorization): ONE load, inline, never null.
+    [[nodiscard]] const PermissionTable& table() const noexcept { return *table_; }
     const PermissionTable* operator->() const noexcept { return &table(); }
     /// The pool id (what a shard worker knows the table by); kNoId = not pooled.
     static constexpr uint32_t kNoId = UINT32_MAX;
@@ -59,7 +66,7 @@ private:
     PermissionRef(PermissionPool* pool, uint32_t id, const PermissionTable* t) noexcept : pool_(pool), id_(id), table_(t) {}
     PermissionPool*                          pool_  = nullptr;
     uint32_t                                 id_    = 0;
-    const PermissionTable*                   table_ = nullptr;   // the pool entry's table (stable: entries never move)
+    const PermissionTable*                   table_ = denyAllPermissionTable();   // never null   // the pool entry's table (stable: entries never move)
     std::shared_ptr<const PermissionTable>   owned_;            // test seam only (never on a pooled ref)
 };
 

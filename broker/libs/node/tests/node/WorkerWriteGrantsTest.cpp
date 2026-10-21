@@ -370,3 +370,57 @@ TEST(WorkerWriteGrantRegression, ABindToNoTableDeniesEverythingRegression) {
     f.steps(4);
     EXPECT_FALSE(allowsWrite(*f.slot(5), 1));
 }
+
+// ── PR #441 adversarial review (issue #259 area): the worker's table store under hostile / racing ops ──
+
+// Lifetime: a slot still bound to a table (its session's close not yet seen by the worker) when that table is dropped and
+// its id reused by ANOTHER set must never inherit the new set's WRITE.
+TEST(WorkerWriteGrantRegression, AStaleSlotNeverInheritsATableIdReusedByAnotherSetAdversarialRegression) {
+    Fixture f;
+    f.announce(5, false);
+    f.announce(6, false);
+    f.tableChunk(3, 0, 1, bitsFor({1}, 1), true);
+    f.bind(5, 3, 1);
+    f.steps(8);
+    ASSERT_TRUE(allowsWrite(*f.slot(5), 1));
+    f.dropTable(3);                                  // 5's set freed (its close is still behind)
+    f.tableChunk(3, 0, 1, bitsFor({2}, 1), true);   // the id reused by another set
+    f.bind(6, 3, 2);
+    f.steps(8);
+    EXPECT_FALSE(allowsWrite(*f.slot(5), 1));
+    EXPECT_FALSE(allowsWrite(*f.slot(5), 2)) << "the stale slot was reset at the drop: never the new set's bits";
+    EXPECT_TRUE(allowsWrite(*f.slot(6), 2));
+}
+
+// Input bounds: hostile SESSION_PERMISSIONS ops (ids at / beyond the store, negative ids, a patch past its total, a tail
+// that is not whole words, no variant flag, an unknown session) change nothing and never crash.
+TEST(WorkerWriteGrantRegression, MalformedPermissionOpsChangeNothingAdversarialRegression) {
+    Fixture f;
+    f.announce(5, false);
+    f.tableChunk(3, 0, 1, bitsFor({1}, 1), true);
+    f.bind(5, 3, 1);
+    f.steps(8);
+    ASSERT_TRUE(allowsWrite(*f.slot(5), 1));
+    const int64_t kMax = static_cast<int64_t>(kMaxWritePermTables);
+    f.bind(5, kMax, 2);                                    // beyond the store: refused, the slot keeps table 3
+    f.tableChunk(kMax, 0, 1, bitsFor({1}, 1), true);
+    f.tableChunk(-7, 0, 1, bitsFor({1}, 1), true);
+    f.patch(kMax, 0, 1, bitsFor({4}, 1));
+    f.patch(-1, 0, 1, bitsFor({4}, 1));
+    f.patch(3, 5, 2, bitsFor({4}, 1));                     // first > total
+    f.patch(3, 1, 1, bitsFor({4}, 1));                     // n > total - first
+    f.dropTable(kMax);
+    f.dropTable(-3);
+    f.bind(424242, 3, 3);                                  // unknown session
+    {
+        WorkerOp o; o.type = WorkerOp::Type::SessionPermissions; o.sessionId = 3;
+        o.isolation = kPermFlagLast;                       // no variant flag
+        const auto w = bitsFor({9}, 1); o.permWords = w.data(); o.permWordCount = w.size();
+        ASSERT_TRUE(f.worker->tryEnqueueOp(std::move(o)));
+    }
+    f.steps(16);
+    EXPECT_TRUE(allowsWrite(*f.slot(5), 1)) << "nothing of it touched table 3 or the slot";
+    EXPECT_FALSE(allowsWrite(*f.slot(5), 4));
+    EXPECT_FALSE(allowsWrite(*f.slot(5), 9));
+    EXPECT_EQ(f.slot(5)->epoch, 1u);
+}

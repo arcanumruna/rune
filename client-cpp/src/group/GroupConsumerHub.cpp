@@ -1067,6 +1067,7 @@ bool GroupConsumerHub::onFetchSubscribeResponse(int64_t corrId, int16_t errorCod
             if (errorCode == 0) {
                 fs.subscriptionId = subscriptionId;
                 fs.redirects      = 0;
+                fs.refusals       = 0;   // F1: bound
             } else {
                 fs.epoch        = 0;     // nothing registered (UnknownTopic / UnknownPartition / ...)
                 fs.brokerSid    = 0;
@@ -1130,6 +1131,12 @@ bool GroupConsumerHub::onFetchSubscribeRefused(int64_t corrId, bool park, int32_
             // the answer have been a stray one, no second stream leaks.
             if (fs.corrId != corrId && fs.subscriptionId != 0)
                 unsubscribe_(fs.session, fs.epoch, fs.subscriptionId, tp);
+            const bool neverBound = fs.subscriptionId == 0;
+            if (neverBound && ++fs.refusals > kMaxFetchRefusalsWithoutBind) {
+                // PR #441 F1: never served, whatever the route - an explicit end, not an endless re-route.
+                refuse_(*impl, GroupFailReason::RetryBudgetExhausted);
+                return false;   // nothing to re-route
+            }
             fs.corrId         = 0;
             fs.epoch          = 0;  // registered nothing
             fs.brokerSid      = 0;
@@ -1464,6 +1471,7 @@ void GroupConsumerHub::onRecords(const codec::RecordsView& rv)
                 fs.subscriptionId = rv.subscriptionId;  // bound by its first push
                 fs.corrId         = 0;
                 fs.redirects      = 0;
+                fs.refusals       = 0;   // F1: bound
             } else if (rv.subscriptionId != fs.subscriptionId) {
                 continue;
             }

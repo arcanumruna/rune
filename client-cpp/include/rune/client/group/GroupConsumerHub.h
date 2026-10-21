@@ -271,6 +271,10 @@ public:
     /// Consecutive Redirects of one partition (no bind in between) after which
     /// it is parked until fresh metadata (no ping-pong storm).
     static constexpr uint8_t kMaxFetchRedirects = 8;
+    /// PR #441 F1: a partition fetch refused this many times in a row WITHOUT ever binding (a broker that can never
+    /// serve it - e.g. its record egress to this client cannot be built) ends the consumer explicitly
+    /// (RetryBudgetExhausted) instead of re-routing forever.  Any bind resets it; a failover re-routes far fewer times.
+    static constexpr uint16_t kMaxFetchRefusalsWithoutBind = 32;
 
     /// Bring every Stable consumer's subscriptions in line with the current
     /// leaders and sessions (cold: group / routing events).  Also re-offers

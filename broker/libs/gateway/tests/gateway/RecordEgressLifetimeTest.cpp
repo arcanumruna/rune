@@ -574,3 +574,167 @@ TEST(PermissionShippingRegression, ARoleOfManySessionsShipsOneTableAndOneBindEac
         << "one word per worker (a patch of the shared table), not every session's bitmap";
     EXPECT_EQ(r.gw.permissionCompilesForTest(), 1u) << "a created object recompiles nothing";
 }
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// PR #441 adversarial review (issue #118 area): no Records on the shared egress under authentication.
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+namespace {
+struct AnswerLog : Rig {
+    struct Answer { bool isError; int64_t corr; int code; int64_t subId; };
+    std::vector<Answer> answers;   // in send order
+    explicit AnswerLog(int32_t workers = 1) : Rig(workers) {
+        gw.setOnEgressFrame([this](int64_t, const uint8_t* b, std::size_t n) {
+            const auto hdr = pc::MessageHeader::decode(b, n);
+            if (!hdr) return;
+            if (hdr->templateId == static_cast<uint16_t>(pc::TemplateId::ErrorResponse)) {
+                if (auto e = pc::ErrorResponse::decode(b, n)) answers.push_back({true, e->correlationId, e->code, 0});
+            } else if (hdr->templateId == static_cast<uint16_t>(pc::TemplateId::SubscribeResponse)) {
+                if (auto s = pc::SubscribeResponse::decode(b, n))
+                    answers.push_back({false, s->correlationId, s->errorCode, s->subscriptionId});
+            }
+        });
+        gw.setAuthMode(GatewayAuthMode::Required, nullptr);
+    }
+    int64_t authenticated() {
+        const int64_t sid = gw.injectTestSession(0);
+        gw.setSessionAuthForTest(sid, AuthAuthenticated{1, "reader", PermissionTable::allowAll(), {}});
+        return sid;
+    }
+    void subscribeCorr(int64_t sid, int64_t corr) {
+        pc::Subscribe s;
+        s.sessionId = sid; s.correlationId = corr; s.topicId = 0; s.partition = 0; s.partitionKnown = 1;
+        s.fromOffset = 0; s.isolation = 0;
+        std::vector<uint8_t> buf(s.encodedSize());
+        buf.resize(s.encode(buf.data()));
+        gw.applySubscribeForTest(buf.data(), buf.size());
+    }
+    void unsubscribe(int64_t sid, int64_t subId) {
+        pc::Unsubscribe u;
+        u.sessionId = sid; u.correlationId = 999; u.subscriptionId = subId;
+        std::vector<uint8_t> buf(pc::Unsubscribe::ENCODED_SIZE);
+        u.encode(buf.data());
+        gw.applyUnsubscribeForTest(buf.data(), buf.size());
+    }
+    void cycle(int64_t now) {
+        gw.pollPendingRecordEgressForTest(now);
+        gw.pumpRetryQueuesForTest();
+        for (int32_t w = 0; w < pool.workerCount(); ++w) pool.worker(w).doWork(now);
+    }
+    [[nodiscard]] int64_t okSubId(int64_t corr) const {
+        for (const auto& a : answers) if (!a.isError && a.corr == corr && a.code == 0) return a.subId;
+        return 0;
+    }
+    [[nodiscard]] bool refused(int64_t corr) const {
+        for (const auto& a : answers)
+            if (a.isError && a.corr == corr && a.code == static_cast<int>(pc::ErrorCode::NotLeader)) return true;
+        return false;
+    }
+};
+}  // namespace
+
+// Attack (issue #118, liveness of the retirement): a session whose record egress can NEVER be built (here: no egress
+// endpoint; in production a persistently failing add or resolve) re-subscribes as the client does after each retirement
+// (rearmMovedAway: a fresh correlation id each time).  The retirement must end in an explicit failure within a bounded
+// number of attempts.  It does not: every attempt is answered Subscribe OK and only THEN NotLeader on the bound
+// correlation id, which the client takes as a MOVED subscription - re-armed as a new pending Subscribe with a fresh
+// retry budget (SubscriberHub::rearmMovedAway: nlRetries = 0) - so the budget never runs out: an endless
+// subscribe / OK / NotLeader loop with no records and no error for the application.
+TEST(AuthEnforcementAdversarialRegression, AnEgressFailedSubscribeIsNeverAnsweredOkBeforeItsRetirementAdversarialRegression) {
+    AnswerLog r;
+    const int64_t sid = r.authenticated();
+    int okThenRetired = 0;
+    for (int attempt = 0; attempt < 16; ++attempt) {
+        const int64_t corr = 1000 + attempt;
+        r.subscribeCorr(sid, corr);
+        for (int p = 0; p < 3; ++p) r.cycle(1 + attempt * 3 + p);
+        okThenRetired += r.okSubId(corr) != 0 && r.refused(corr) ? 1 : 0;
+        ASSERT_TRUE(r.okSubId(corr) != 0 || r.refused(corr)) << "every attempt is answered";
+    }
+    EXPECT_EQ(okThenRetired, 0)
+        << "an OK followed by NotLeader is a MOVE on the client (fresh budget each time): the loop never ends explicitly";
+}
+
+// Resources + no fallback over many attempts: whatever the number of failed re-subscribes, no cursor ever reaches the
+// worker, the gateway keeps no subscription and no pending resolve, and the counter counts every retirement.
+TEST(AuthEnforcementAdversarialRegression, RepeatedReSubscribesWithoutEgressLeaveNothingBehindAdversarialRegression) {
+    AnswerLog r;
+    auto& w = r.pool.worker(r.owner(0));
+    const int64_t sid = r.authenticated();
+    for (int attempt = 0; attempt < 64; ++attempt) {
+        r.subscribeCorr(sid, 2000 + attempt);
+        r.cycle(1 + attempt);
+        ASSERT_TRUE(w.subscriptionsForTest().empty()) << "attempt " << attempt;
+    }
+    r.cycle(1000);
+    EXPECT_EQ(r.gw.subscriptionCount(), 0u);
+    EXPECT_EQ(r.gw.pendingRecordEgressCountForTest(), 0u);
+    EXPECT_EQ(r.gw.subscribesWithoutRecordEgressForTest(), 64u);
+}
+
+// Ordering race: the client unsubscribes the parked subscription before the retirement pass.  Nothing is refused for
+// it afterwards (no stray NotLeader re-arming a subscription the app ended), nothing reaches the worker.
+TEST(AuthEnforcementAdversarialRegression, AnUnsubscribeBeforeTheRetirementLeavesNoRefusalAndNoCursorAdversarialRegression) {
+    AnswerLog r;
+    auto& w = r.pool.worker(r.owner(0));
+    const int64_t sid = r.authenticated();
+    r.subscribeCorr(sid, 77);
+    // PR #441 F1: under authentication the OK is held until the egress resolves, so the client does not know the id
+    // yet; the gateway's own (an end of the held subscription by id, e.g. a stale client retry) is used instead.
+    const int64_t subId = r.okSubId(77) != 0 ? r.okSubId(77) : r.gw.subscriptionIdOfCorrForTest(sid, 77);
+    ASSERT_NE(subId, 0);
+    r.unsubscribe(sid, subId);
+    for (int p = 0; p < 4; ++p) r.cycle(1 + p);
+    EXPECT_FALSE(r.refused(77)) << "an ended subscription is not retired again";
+    EXPECT_TRUE(w.subscriptionsForTest().empty());
+    EXPECT_EQ(r.gw.subscriptionCount(), 0u);
+    EXPECT_EQ(r.gw.pendingRecordEgressCountForTest(), 0u);
+}
+
+// Restart-in-the-middle: the session closes while its Subscribe is parked for the egress; the next passes hand nothing
+// to the worker and leave no pending resolve behind.
+TEST(AuthEnforcementAdversarialRegression, ASessionClosedWhileItsSubscribeIsParkedLeavesNothingAdversarialRegression) {
+    AnswerLog r;
+    auto& w = r.pool.worker(r.owner(0));
+    const int64_t sid = r.authenticated();
+    r.subscribeCorr(sid, 77);
+    r.gw.closeSessionForTest(sid);
+    for (int p = 0; p < 4; ++p) r.cycle(1 + p);
+    EXPECT_TRUE(w.subscriptionsForTest().empty());
+    EXPECT_EQ(r.gw.pendingRecordEgressCountForTest(), 0u);
+    EXPECT_EQ(r.gw.subscriptionCount(), 0u);
+}
+
+// Sibling path: a GROUP member's partition subscription without its own egress under authentication never reaches the
+// worker either (the same funnel; the group rebalance path).
+TEST(AuthEnforcementAdversarialRegression, AGroupMemberSubscribeWithoutEgressNeverReachesTheWorkerAdversarialRegression) {
+    AnswerLog r;
+    auto& w = r.pool.worker(r.owner(0));
+    const int64_t sid = r.authenticated();
+    r.gw.forwardSubscribeForTest(61, sid, 0, 0, 0, 0, /*isGroup=*/true, /*groupCarrierReceived=*/true, /*corr=*/0);
+    for (int p = 0; p < 4; ++p) r.cycle(1 + p);
+    EXPECT_TRUE(w.subscriptionsForTest().empty());
+    EXPECT_FALSE(AuthRigEgress::anyCursorWithoutItsOwnEgress(w));
+}
+
+// The worker's own check against a replayed / re-sent Subscribe: an EXISTING cursor (with its session's egress) that is
+// re-subscribed under the same id without an egress is dropped - its records never move to the shared publication.
+TEST(AuthEnforcementAdversarialRegression, AnExistingCursorReSubscribedWithoutEgressIsDroppedByTheWorkerAdversarialRegression) {
+    Rig r(1);   // an InProcess gateway (sends what the worker must refuse)
+    FakePub pub;
+    auto& w = r.pool.worker(r.owner(0));
+    w.requirePerSessionEgress();
+    const int64_t a = r.gw.injectTestSession(0);
+    const int64_t b = r.gw.injectTestSession(0);
+    r.gw.injectRecordEgressForTest(a, r.owner(0), pub.make());
+    r.gw.forwardSubscribeForTest(51, a, 0, 0, 0, 0, false, false, /*corr=*/9);
+    w.doWork(1);
+    ASSERT_EQ(w.subscriptionsForTest().size(), 1u);
+    ASSERT_EQ(w.subscriptionsForTest()[0].egressPub, pub.ptr());
+    r.gw.forwardSubscribeForTest(51, b, 0, 0, 0, 0, false, false, /*corr=*/10);   // same id, no egress
+    w.doWork(2);
+    EXPECT_TRUE(w.subscriptionsForTest().empty()) << "fail closed: the cursor is dropped, never moved to the shared egress";
+    EXPECT_EQ(w.subscribesRefusedWithoutEgressForTest(), 1u);
+    r.gw.closeSessionForTest(a);
+    w.doWork(3);
+    r.gw.drainWorkerReturnsForTest(4);
+}

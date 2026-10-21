@@ -338,3 +338,150 @@ TEST(AuthLiveChangeRegression, TheGrantOkIsEnforcedByTheAnsweringBrokerImmediate
         ASSERT_EQ(t.r.produce(s, t.r.orders), 45) << "REVOKE then, with zero delay, a produce: refused (iteration " << i << ")";
     }
 }
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// PR #441 adversarial review (issue #259 area): pooled tables, binds, patches and drops - enforced on the SHARD worker
+// (a real authenticating broker, producing straight to the worker's ingress).
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+namespace {
+/// The worker-ingress produce of `sid` to `topic`: retried through NotLeader / UnknownTopic / no answer while the
+/// partition settles (bounded), else the first definitive code.
+int shardProduceCode(Live& t, int64_t sid, int32_t topic, int attempts = 1) {
+    int code = kNoAnswer;
+    for (int a = 0; a < attempts; ++a) {
+        const int64_t corr = t.r.c().nextCorrelationId();
+        if (!t.r.c().produce(t.b().workerIngressChannel(), AuthRig::stream(), sid, corr, topic, 0, 1, makeBatch(1)))
+            return kNoAnswer;
+        const auto ack = t.r.c().awaitProduceResponseUntil(corr, AuthRig::dl(10));
+        code = ack ? ack->errorCode : kNoAnswer;
+        if (code != static_cast<int>(pc::ErrorCode::NotLeader) && code != static_cast<int>(pc::ErrorCode::UnknownTopic) &&
+            code != kNoAnswer)
+            return code;
+        std::this_thread::sleep_for(25ms);   // the partition settling (pre-existing pattern of this file)
+    }
+    return code;
+}
+AuthBroker::Options shardOptions() { AuthBroker::Options o; o.shard = true; return o; }
+}  // namespace
+
+// Concurrency / auth: one role's members share ONE table on the worker; flipping the role's WRITE repeatedly is enforced
+// on every member's worker slot at the DDL's OK, and a bystander with its own grant set is never touched.
+TEST(AuthLiveChangeAdversarialRegression, ARoleFlippedRepeatedlyIsEnforcedOnEveryMembersWorkerSlotAdversarialRegression) {
+    Live t("adv259flip", shardOptions());
+    ASSERT_EQ(t.createRole("writers"), 0);
+    ASSERT_EQ(t.grantRoleOp("writers", SO::Write, ST::Topic, SP::Exact, "orders"), 0);
+    std::vector<int64_t> members;
+    for (int i = 0; i < 3; ++i) {
+        std::string name;
+        members.push_back(t.r.newUser({}, &name));
+        ASSERT_EQ(t.grantRole(name, "writers"), 0);
+    }
+    const int64_t bystander = t.r.newUser({exact(SO::Write, ST::Topic, "orders"), exact(SO::Write, ST::Topic, "secret")});
+    for (const int64_t s : members) ASSERT_EQ(shardProduceCode(t, s, t.r.orders, 200), 0);
+    ASSERT_EQ(shardProduceCode(t, bystander, t.r.orders, 200), 0);
+    for (int flip = 0; flip < 3; ++flip) {
+        ASSERT_EQ(t.revoke("writers", true, SO::Write, ST::Topic, SP::Exact, "orders"), 0) << flip;
+        for (const int64_t s : members) EXPECT_EQ(shardProduceCode(t, s, t.r.orders), 45) << "flip " << flip;
+        EXPECT_EQ(shardProduceCode(t, bystander, t.r.orders), 0) << "another grant set's table is untouched";
+        ASSERT_EQ(t.grantRoleOp("writers", SO::Write, ST::Topic, SP::Exact, "orders"), 0) << flip;
+        for (const int64_t s : members) EXPECT_EQ(shardProduceCode(t, s, t.r.orders), 0) << "flip " << flip;
+    }
+}
+
+// Lifetime: a grant set whose last session leaves is freed and its id reused by ANOTHER set; the new holder never
+// gets the old set's WRITE on the worker, and the old user logging in again gets its own back.
+TEST(AuthLiveChangeAdversarialRegression, AFreedTableIdReusedByAnotherSetNeverGrantsTheOldWritesAdversarialRegression) {
+    Live t("adv259reuse", shardOptions());
+    std::string a;
+    const int64_t sa = t.r.newUser({exact(SO::Write, ST::Topic, "orders")}, &a);
+    ASSERT_EQ(shardProduceCode(t, sa, t.r.orders, 200), 0);
+    ASSERT_TRUE(t.r.c().disconnect(t.ch(), t.r.stream(), sa));
+    // The Disconnect rides the same client publication as the next user's Connect: the gateway closes `sa` (its table's
+    // last holder: freed) before that login acquires a table - the id is reused.
+    const int64_t sb = t.r.newUser({exact(SO::Write, ST::Topic, "secret")});
+    EXPECT_EQ(shardProduceCode(t, sb, t.r.orders, 1), 45) << "the reused table holds the NEW set only";
+    EXPECT_EQ(shardProduceCode(t, sb, t.r.secret, 200), 0);
+    const int64_t sa2 = t.r.login(a);
+    EXPECT_EQ(shardProduceCode(t, sa2, t.r.orders, 200), 0);
+    EXPECT_EQ(shardProduceCode(t, sa2, t.r.secret, 1), 45);
+}
+
+// Prefix extension through the PATCH path: two sessions of one user share a table; a topic the prefix covers, created
+// after login, becomes writable on the worker for both; one outside the prefix stays refused.
+TEST(AuthLiveChangeAdversarialRegression, ATopicCreatedAfterLoginReachesEverySharerOnTheShardAdversarialRegression) {
+    Live t("adv259patch", shardOptions());
+    std::string w;
+    const int64_t s1 = t.r.newUser({prefix(SO::Write, ST::Topic, "w.")}, &w);
+    const int64_t s2 = t.r.login(w);
+    const int32_t late = t.r.defineTopic(t.r.builder, "w.late");
+    ASSERT_GE(late, 0);
+    ASSERT_TRUE(t.r.awaitListed(late));
+    EXPECT_EQ(shardProduceCode(t, s1, late, 200), 0);
+    EXPECT_EQ(shardProduceCode(t, s2, late, 200), 0);
+    const int32_t other = t.r.defineTopic(t.r.builder, "x.late");
+    ASSERT_GE(other, 0);
+    ASSERT_TRUE(t.r.awaitListed(other));
+    EXPECT_EQ(shardProduceCode(t, s1, other, 200), 45);
+}
+
+// Crash and restart (issue #117 Hold gate): after a restart the control thread's mirror is the booted state plus the
+// live re-applies; an admin reading `__security` from the start must get every event and the caught-up marker (never
+// held forever behind the gate), and a live event after it arrives too.
+TEST(AuthLiveChangeAdversarialRegression, ASecurityHistoryReadAfterARestartIsNeverHeldForeverAdversarialRegression) {
+    Live t("adv117restart");
+    for (int i = 0; i < 3; ++i) (void)t.r.newUser({exact(SO::Read, ST::Topic, "orders")});
+    t.r.restart();
+    auto& c = t.b().admin().raw();
+    const int64_t corr = c.sendSubscribe(t.ch(), AuthRig::stream(), t.adminSid(), pc::kSecurityTopicId, 0);
+    ASSERT_EQ(c.awaitSubscribeCode(corr, AuthRig::dl()).value_or(-1), 0);
+    const int64_t sub = c.subscriptionIdOf(corr).value_or(0);
+    ASSERT_NE(sub, 0);
+    auto markerSeen = [&] {
+        for (const auto& p : c.records()) if (p.subscriptionId == sub && p.bytes.size() == 8 && p.baseOffset >= 0) return true;
+        return false;
+    };
+    auto newest = [&] {
+        int64_t n = -1;
+        for (const auto& p : c.records()) {
+            if (p.subscriptionId != sub || p.bytes.size() <= 8) continue;
+            std::size_t pos = 0;
+            while (pos + 61 <= p.bytes.size()) {
+                rune::protocol::RecordBatchReader rd(p.bytes.data() + pos, p.bytes.size() - pos);
+                if (!rd.ensureValid()) break;
+                n = std::max(n, rd.baseOffset() + static_cast<int64_t>(rd.lastOffsetDelta()));
+                pos += static_cast<std::size_t>(rd.totalLength());
+            }
+        }
+        return n;
+    };
+    ASSERT_TRUE(c.pollUntil(markerSeen)) << "the history read reached its caught-up marker after the restart";
+    const int64_t before = newest();
+    EXPECT_GE(before, 3) << "the bootstrap, the builder and the three users at least";
+    (void)t.r.newUser({});
+    EXPECT_TRUE(c.pollUntil([&] { return newest() > before; })) << "a live event after the restart is not held forever";
+}
+
+// Auth, revoked mid-stream (issue #117 end-to-end): a `__security` reader that loses ADMIN gets 45 and NOT ONE frame of
+// the verifier-bearing events after its revoke, over repeated revoke / re-grant / re-subscribe rounds.
+TEST(AuthLiveChangeAdversarialRegression, ARevokedSecurityReaderGetsNoEventAfterItsRevokeOverRoundsAdversarialRegression) {
+    Live t("adv117rounds");
+    std::string name;
+    const int64_t s = t.r.newUser({cluster(SO::Admin), cluster(SO::Describe)}, &name);
+    for (int round = 0; round < 3; ++round) {
+        const int64_t corr = t.r.c().sendSubscribe(t.ch(), t.r.stream(), s, pc::kSecurityTopicId, 0);
+        ASSERT_EQ(t.r.c().awaitSubscribeCode(corr, AuthRig::dl()).value_or(-1), 0) << round;
+        const int64_t sub = t.r.c().subscriptionIdOf(corr).value_or(0);
+        ASSERT_NE(sub, 0);
+        ASSERT_TRUE(t.r.c().pollUntil([&] {
+            for (const auto& p : t.r.c().records()) if (p.subscriptionId == sub && p.bytes.size() == 8 && p.baseOffset >= 0) return true;
+            return false;
+        })) << "caught up, round " << round;
+        ASSERT_EQ(t.revoke(name, false, SO::Admin, ST::Cluster, SP::Exact, ""), 0) << round;
+        EXPECT_EQ(t.errorOn(corr), 45) << round;
+        const std::size_t seen = t.pushes(sub);
+        (void)t.r.newUser({});   // a CREATE USER: a new verifier in `__security`
+        EXPECT_TRUE(t.quiet(sub, 300ms)) << "no frame after the revoke, round " << round;
+        EXPECT_EQ(t.pushes(sub), seen);
+        ASSERT_EQ(t.b().admin().grant(t.ch(), t.adminSid(), name, false, SO::Admin, ST::Cluster, SP::Exact, "").errorCode, 0);
+    }
+}

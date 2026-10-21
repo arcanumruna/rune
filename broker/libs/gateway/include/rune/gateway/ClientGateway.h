@@ -1471,6 +1471,11 @@ private:
     enum class Cursor : uint8_t { GatewayPushed, AwaitingEgress, AtWorker };
     struct Subscription {
         Cursor  cursor         = Cursor::GatewayPushed;
+        /// PR #441 F1 (issue #118): under authentication the Subscribe's OK waits for the session's own record egress
+        /// (sent when the Subscribe goes to its worker); a failure answers the still-PENDING Subscribe NotLeader, so the
+        /// client's per-request retry budget counts and ends explicitly (an OK then NotLeader was a fresh-budget move).
+        bool    okOwed         = false;
+        bool    okOwedLineage  = false;   ///< the held OK is followed by the transient lineage note
         int64_t subscriptionId = 0;
         int64_t sessionId      = 0;
         // The correlationId of the client's Subscribe that created it: stamped
@@ -1669,6 +1674,8 @@ private:
     /// worker (it would push on the shared MDC egress every joiner receives): retired NotLeader (a group member's:
     /// the session's members evicted).  Control thread, cold.
     void retireWithoutRecordEgress_(int64_t subId);
+    /// F1: the held SubscribeResponse{OK} of `subId` (its egress resolved) - and the lineage note it owes.
+    void sendOwedSubscribeOk_(int64_t subId);
     uint64_t subscribesWithoutRecordEgress_ = 0;   ///< issue #118: subscriptions retired for want of their own egress
 
     // Hybrid egress: a Subscribe deferred until its session's per-consumer UNICAST
@@ -2991,6 +2998,14 @@ public:
     void noteControlledImagesForTest(int images) noexcept { noteControlledImages_(images); }
     void injectPendingRecordEgressForTest(int64_t sid, int32_t worker) { pendingRecordEgress_[{sid, worker}]; }
     [[nodiscard]] std::size_t pendingRecordEgressCountForTest() const noexcept { return pendingRecordEgress_.size(); }
+    /// PR #441 F1 probe: the subscription id the session's Subscribe `corr` registered (0 = none) - known to the
+    /// gateway even while its OK is held.
+    [[nodiscard]] int64_t subscriptionIdOfCorrForTest(int64_t sid, int64_t corr) {
+        Session* s = sessions_.find(sid);
+        if (s == nullptr) return 0;
+        for (const auto& [key, subId] : s->subIdByKey) if (key.correlationId == corr) return subId;
+        return 0;
+    }
     /// Issue #118: subscriptions retired because they had no record egress of their own under authentication.
     [[nodiscard]] uint64_t subscribesWithoutRecordEgressForTest() const noexcept { return subscribesWithoutRecordEgress_; }
 private:

@@ -2662,3 +2662,57 @@ TEST_F(GroupConsumerHubTest, AFrameWhoseOnlyBatchIsCorruptMovesNothingRegression
     EXPECT_EQ(impl_->assignment.at(TopicPartition{kTopicId, kPartition}), 10);
     EXPECT_EQ(hub_->malformedBatches(), 1u);
 }
+
+// PR #441 F1 (issue #118, the group half): a partition fetch a broker can NEVER serve (under authentication: the
+// session's own record egress to this client cannot be built - the broker refuses every Subscribe NotLeader and never
+// answers it OK) ends the consumer explicitly (RetryBudgetExhausted) after a bounded number of refusals, instead of
+// parking / re-routing / re-subscribing forever with no records and no error.  RED before: no bound at all.
+TEST_F(GroupConsumerHubTest, AFetchRefusedForeverWithoutABindEndsTheConsumerExplicitlyRegression) {
+    FakeFetchRouter fr;
+    fr.leader = {{0, 0u}, {1, 0u}};
+    hub_->setFetchRouter(fr.router());
+    stableWithTwoPartitions(*hub_, sink_);
+    auto ofr = makeOffsetFetchResponse(kTopicId, 1, 0);
+    hub_->onOffsetFetchResponse(ofr.data(), ofr.size());
+    int refusals = 0;
+    for (int round = 0; round < 1000 && impl_->active; ++round) {
+        std::vector<rune::client::codec::SubscribeView> subs;
+        for (const auto& v : fr.subscribes(0)) if (v.partition == 1) subs.push_back(v);
+        ASSERT_FALSE(subs.empty()) << "round " << round << ": the fetch is re-subscribed after each refusal";
+        int32_t t = -1, p = -1;
+        (void)hub_->onFetchSubscribeRefused(subs.back().correlationId, /*park=*/true, t, p);
+        ++refusals;
+        hub_->unparkFetch();          // fresh metadata names the same leader again
+        (void)hub_->reconcileFetch();
+    }
+    EXPECT_FALSE(impl_->active) << "the consumer ends instead of looping";
+    EXPECT_EQ(impl_->failReason, GroupFailReason::RetryBudgetExhausted) << "explicit, visible reason";
+    EXPECT_EQ(refusals, GroupConsumerHub::kMaxFetchRefusalsWithoutBind + 1);
+}
+
+// Positive control: refusals interleaved with binds (a failover that recovers) never exhaust the budget.
+TEST_F(GroupConsumerHubTest, FetchRefusalsSeparatedByABindNeverEndTheConsumerRegression) {
+    FakeFetchRouter fr;
+    fr.leader = {{0, 0u}, {1, 0u}};
+    hub_->setFetchRouter(fr.router());
+    stableWithTwoPartitions(*hub_, sink_);
+    auto ofr = makeOffsetFetchResponse(kTopicId, 1, 0);
+    hub_->onOffsetFetchResponse(ofr.data(), ofr.size());
+    for (int round = 0; round < 4 * GroupConsumerHub::kMaxFetchRefusalsWithoutBind; ++round) {
+        std::vector<rune::client::codec::SubscribeView> subs;
+        for (const auto& v : fr.subscribes(0)) if (v.partition == 1) subs.push_back(v);
+        ASSERT_FALSE(subs.empty());
+        const auto sub = subs.back();
+        if (round % 8 == 7) {
+            ASSERT_TRUE(hub_->onFetchSubscribeResponse(sub.correlationId, 0, 900 + round));   // bound
+            int32_t t = -1, p = -1;   // ... then its node stops serving it (a demotion): a bound refusal
+            (void)hub_->onFetchSubscribeRefused(sub.correlationId, /*park=*/true, t, p);
+        } else {
+            int32_t t = -1, p = -1;
+            (void)hub_->onFetchSubscribeRefused(sub.correlationId, /*park=*/true, t, p);
+        }
+        hub_->unparkFetch();
+        (void)hub_->reconcileFetch();
+    }
+    EXPECT_TRUE(impl_->active);
+}

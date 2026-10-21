@@ -248,3 +248,103 @@ TEST(PermissionPoolRegression, AnUnpooledRefIsItsOwnTableAndDenyByDefaultRegress
     const rg::PermissionRef copy = all;
     EXPECT_TRUE(copy->isAllowAll());
 }
+
+// ── PR #441 adversarial review (issue #259 area): the pool's lifetimes, id reuse and bounds ──
+namespace {
+std::vector<rs::GrantSpec> writeOne(int i) { return {g(Operation::Write, ResourceType::Topic, PatternKind::Exact, "t" + std::to_string(i))}; }
+}  // namespace
+
+// Lifetime / ordering: a set freed and its id reused by another set BEFORE the events were drained.  The workers must
+// see Freed before the new Created (a drop never lands after the new table), and every Created ships the id's CURRENT
+// content (never the freed set's bits).
+TEST(PermissionPoolAdversarialRegression, AnIdFreedAndReusedBeforeTheDrainNeverShipsTheOldBitsAdversarialRegression) {
+    auto idx = manyTopics(10);   // odd ids: "worldw.N"
+    rg::PermissionPool pool;
+    uint32_t id = 0;
+    {
+        const auto a = pool.acquire(roleSet("world"), idx);   // WRITE on the odd topics
+        id = a.id();
+    }
+    const auto b = pool.acquire(roleSet("other"), idx);       // WRITE on nothing here
+    ASSERT_EQ(b.id(), id) << "the freed id is reused";
+    std::vector<std::pair<rg::PermissionPool::Event, bool>> evs;
+    pool.drainEvents([&](rg::PermissionPool::Event e, uint32_t i, const rg::PermissionTable& t) {
+        EXPECT_EQ(i, id);
+        evs.emplace_back(e, t.allows(1, rs::opBit(Operation::Write)));
+    });
+    ASSERT_EQ(evs.size(), 3u);
+    EXPECT_EQ(evs[0].first, rg::PermissionPool::Event::Created);
+    EXPECT_EQ(evs[1].first, rg::PermissionPool::Event::Freed);
+    EXPECT_EQ(evs[2].first, rg::PermissionPool::Event::Created) << "the drop precedes the new table";
+    EXPECT_FALSE(evs[0].second) << "even the first Created ships the CURRENT (new) set, never the freed one's WRITE";
+    EXPECT_FALSE(evs[2].second);
+}
+
+// Resources: the pool is bounded; a new set beyond it fails CLOSED (deny-all, never another set's table), an existing set
+// still shares, and freeing one makes room again.
+TEST(PermissionPoolAdversarialRegression, AFullPoolFailsClosedAndRecoversWhenASetLeavesAdversarialRegression) {
+    rg::ObjectIndex idx;
+    for (int i = 0; i < 8; ++i) idx.onTopic(i, "t" + std::to_string(i));
+    rg::PermissionPool pool;
+    std::vector<rg::PermissionRef> held;
+    held.reserve(rg::PermissionPool::kMaxTables);
+    for (uint32_t i = 0; i < rg::PermissionPool::kMaxTables; ++i) held.push_back(pool.acquire(writeOne(static_cast<int>(i)), idx));
+    ASSERT_EQ(pool.liveTables(), rg::PermissionPool::kMaxTables);
+    const auto over = pool.acquire(writeOne(999'999), idx);
+    EXPECT_EQ(over.id(), rg::PermissionRef::kNoId);
+    EXPECT_FALSE(over->allows(0, rs::opBit(Operation::Write)));
+    EXPECT_FALSE(over->isAllowAll());
+    const auto shared = pool.acquire(writeOne(3), idx);
+    EXPECT_EQ(shared.id(), held[3].id()) << "an existing set still shares when the pool is full";
+    EXPECT_TRUE(shared->allows(3, rs::opBit(Operation::Write)));
+    held[5] = rg::PermissionRef{};   // its last holder leaves
+    const auto again = pool.acquire(writeOne(999'999), idx);
+    EXPECT_NE(again.id(), rg::PermissionRef::kNoId);
+    EXPECT_FALSE(again->allows(5, rs::opBit(Operation::Write))) << "the reused entry is the new set's";
+}
+
+// Lifetime: copies, moves, self-assignment and swaps keep the count exact - one Freed when (and only when) the last
+// holder goes, never a double release.
+TEST(PermissionPoolAdversarialRegression, RefCopiesMovesAndSelfAssignmentKeepTheCountExactAdversarialRegression) {
+    const auto idx = manyTopics(4);
+    rg::PermissionPool pool;
+    auto a = pool.acquire(roleSet("world"), idx);
+    const uint32_t id = a.id();
+    pool.drainEvents([](auto, uint32_t, const rg::PermissionTable&) {});
+    {
+        rg::PermissionRef b = a;                 // 2
+        rg::PermissionRef c = std::move(b);      // 2 (b empty)
+        auto& self = c;
+        c = self;                                // 2
+        rg::PermissionRef d;
+        d.swap(c);                               // 2
+        EXPECT_EQ(pool.refsOf(id), 2u);
+        a = std::move(d);                        // a's old hold released, d's moved in: 1
+        EXPECT_EQ(pool.refsOf(id), 1u);
+    }
+    EXPECT_EQ(pool.refsOf(id), 1u);
+    EXPECT_FALSE(pool.hasEvents()) << "no Freed while a holder remains";
+    a = rg::PermissionRef{};
+    int freed = 0;
+    pool.drainEvents([&](rg::PermissionPool::Event e, uint32_t, const rg::PermissionTable&) {
+        freed += e == rg::PermissionPool::Event::Freed ? 1 : 0;
+    });
+    EXPECT_EQ(freed, 1);
+    EXPECT_EQ(pool.liveTables(), 0u);
+}
+
+// Schema-ish churn on the object index: a topic dropped and its id reused by a name the set does NOT cover clears the
+// WRITE bit in every live table (never a stale allow for the new topic).
+TEST(PermissionPoolAdversarialRegression, ADroppedTopicIdReusedOutsideThePrefixIsNotWritableAdversarialRegression) {
+    auto idx = manyTopics(4);   // 1, 3 = "worldw.*"
+    rg::PermissionPool pool;
+    const auto r = pool.acquire(roleSet("world"), idx);
+    ASSERT_TRUE(r->allows(3, rs::opBit(Operation::Write)));
+    idx.onDropped(3);
+    pool.onObjectDropped(3, [](uint32_t, const rg::PermissionTable&, bool, bool) {});
+    EXPECT_FALSE(r->allows(3, rs::opBit(Operation::Write)));
+    idx.onTopic(3, "elsewhere.3");
+    pool.onObjectCreated(3, *idx.at(3), [](uint32_t, const rg::PermissionTable&, bool, bool) {});
+    EXPECT_FALSE(r->allows(3, rs::opBit(Operation::Write))) << "the reused id is a different topic";
+    EXPECT_FALSE(r->allows(3, rs::opBit(Operation::Read)));
+}
