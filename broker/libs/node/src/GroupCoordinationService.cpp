@@ -10,6 +10,7 @@
 #include <rune/gateway/RequestRejection.h>
 
 #include <rune/gateway/ClientGateway.h>  // CG-4: addGroupSubscription / revokeGroupSubscriptions / sendControlFrame
+#include <rune/crypto/Kdf.h>             // issues #123 / #124: the random half of member ids
 
 #include <rune/protocol/client/GroupMessages.h>
 #include <rune/protocol/client/OffsetMessages.h>
@@ -19,6 +20,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <charconv>
 #include <cstring>
 
 namespace rune::node {
@@ -91,7 +93,49 @@ coord::GroupCoordinator& GroupCoordinationService::coordinator(const GroupId& gr
         std::forward_as_tuple(groupId),
         std::forward_as_tuple(groupId, /*nowNs=*/0));
     (void)ok;
+    inserted->second.setMemberIdEntropy(
+        [](uint8_t* out, std::size_t n) noexcept { return rune::crypto::randomBytes(std::span<uint8_t>(out, n)); });
     return inserted->second;
+}
+
+// ---------------------------------------------------------------------------
+// Issues #123 / #124 / #169: member ownership (see memberSessionMap_).
+// ---------------------------------------------------------------------------
+void GroupCoordinationService::buildMemberKey_(std::string_view groupId, std::string_view memberId) {
+    // PR #423 review F2: "<group length>:<group><member>" - unambiguous for any bytes in either id (a ':' separator
+    // alone let group "x" + member "y:m" alias group "x:y" + member "m").  No allocation once the capacity is reached.
+    char len[8];
+    const auto [end, ec] = std::to_chars(len, len + sizeof len, groupId.size());
+    (void)ec;   // a u16-prefixed wire field: at most 5 digits
+    memberKeyScratch_.clear();
+    memberKeyScratch_.append(len, static_cast<std::size_t>(end - len));
+    memberKeyScratch_ += ':';
+    memberKeyScratch_.append(groupId);
+    memberKeyScratch_.append(memberId);
+}
+
+const GroupCoordinationService::MemberBinding* GroupCoordinationService::bindingOf_(std::string_view groupId,
+                                                                                    std::string_view memberId) {
+    if (memberId.empty()) return nullptr;
+    buildMemberKey_(groupId, memberId);
+    const auto it = memberSessionMap_.find(memberKeyScratch_);
+    return it == memberSessionMap_.end() ? nullptr : &it->second;
+}
+
+uint64_t GroupCoordinationService::principalOf_(int64_t sessionId) const {
+    if (principalFn_ != nullptr) return principalFn_(principalCtx_, sessionId);
+    return gateway_ != nullptr ? gateway_->sessionPrincipalId(sessionId) : 0;
+}
+
+void GroupCoordinationService::drainDeparted_(std::string_view groupId, coord::GroupCoordinator& gc) {
+    if (!gc.hasDeparted()) return;
+    gc.takeDeparted(departedScratch_);
+    for (const std::string& m : departedScratch_) {
+        if (gc.hasMember(m)) continue;   // re-joined since (same id, its owner): keep the binding
+        buildMemberKey_(groupId, m);
+        memberSessionMap_.erase(memberKeyScratch_);
+    }
+    departedScratch_.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -172,6 +216,7 @@ int GroupCoordinationService::doWork(int64_t nowNs) {
 
         const int w = coord.doWork(nowNs);
         work += w;
+        drainDeparted_(groupId, coord);   // #124: expired / timed-out members lose their binding
 
         // CG-4: detect PreparingRebalance entry (membership change) and eagerly
         // revoke all group push subscriptions + send empty Assign to each member.
@@ -460,7 +505,17 @@ size_t GroupCoordinationService::handleJoinGroup(
         // Unknown topicId silently ignored (Assignor ignores topics not in partCounts).
     }
 
+    // Issues #123 / #124: a non-empty member id is a RE-JOIN only when it is bound to this session's principal (the
+    // same session, or a reconnect of the same principal).  Any other id - another principal's member, a member that
+    // no longer exists, an id the client made up - joins as a NEW member with a fresh id: the answer looks the same
+    // whether or not the id names someone (nothing to enumerate), and an id is never adopted from the client.
+    // PR #423 review F2: and only for a CURRENT member of THIS group (a binding never stands in for membership).
+    const uint64_t principal = principalOf_(msg.sessionId);
     coord::GroupCoordinator& gc = coordinator(groupIdStr);
+    if (!memberIdScratch_.empty()) {
+        const MemberBinding* b = bindingOf_(groupIdStr, memberIdStr);
+        if (b == nullptr || b->principal != principal || !gc.hasMember(memberIdStr)) memberIdScratch_.clear();
+    }
 
     // Set rebalance timeout from the member's sessionTimeout (or a sane default).
     gc.setRebalanceTimeoutMs(
@@ -494,11 +549,8 @@ size_t GroupCoordinationService::handleJoinGroup(
     // but from a new TCP session with a different sessionId).
     if (!jr.memberId.empty() && jr.errorCode != coord::JoinResult::kErrDead) {
         // CG-7 zero-alloc: build composite key into pre-reserved scratch.
-        memberKeyScratch_.clear();
-        memberKeyScratch_.append(groupIdStr);
-        memberKeyScratch_ += ':';
-        memberKeyScratch_.append(jr.memberId);
-        memberSessionMap_[memberKeyScratch_] = msg.sessionId;
+        buildMemberKey_(groupIdStr, jr.memberId);
+        memberSessionMap_[memberKeyScratch_] = MemberBinding{msg.sessionId, principal};
         spdlog::debug("GroupCoordinationService: JoinGroup tracking member '{}' sessionId={}",
                       memberKeyScratch_, msg.sessionId);
     }
@@ -601,6 +653,10 @@ size_t GroupCoordinationService::handleSyncGroup(
         return resp.encode(out, {});
     }
 
+    // Issues #124: another session's member is answered as a member that does not exist (an empty id is never a
+    // member): its assignment is never handed out.
+    if (!ownsMember_(groupIdStr, memberIdStr, msg.sessionId)) memberIdScratch_.clear();
+
     // Followers call syncGroup with empty assignment map; they get their assignment
     // from the coordinator once Stable.
     const coord::Assignment emptyAssignment;
@@ -694,6 +750,9 @@ size_t GroupCoordinationService::handleHeartbeat(
         return resp.encode(out);
     }
 
+    // Issue #124: another session's member is answered as a member that does not exist and is not refreshed (a
+    // foreign heartbeat never keeps a dead member alive).
+    if (!ownsMember_(groupIdStr, memberIdStr, msg.sessionId)) memberIdScratch_.clear();
     const coord::HeartbeatResult hr =
         it->second.heartbeat(memberIdStr, msg.generationId, nowNs);
 
@@ -736,51 +795,39 @@ size_t GroupCoordinationService::handleLeaveGroup(
         return resp.encode(out);
     }
 
+    pc::LeaveGroupResponse resp;
+    resp.sessionId     = msg.sessionId;
+    resp.correlationId = msg.correlationId;
+
+    // Issue #123: a member leaves only on the session it is bound to.  Another session's member - and a member that
+    // does not exist, with the same answer - is UnknownMember: nothing is revoked, nothing rebalances.
+    auto it = coordinators_.find(groupIdStr);
+    if (it == coordinators_.end() || !ownsMember_(groupIdStr, memberIdStr, msg.sessionId) ||
+        !it->second.hasMember(memberIdStr)) {
+        resp.errorCode = static_cast<int16_t>(pc::ErrorCode::UnknownMember);
+        return resp.encode(out);
+    }
+
     // CG-4 fix (#3): revoke the leaving member's group push subscriptions BEFORE
     // erasing the session mapping.  This prevents dual-owner: the next
     // PreparingRebalance iterates coord.members() which no longer contains the
     // departed member — so without this explicit revoke the member keeps receiving
     // records for its old partitions until session reap, which can overlap with
     // the reassigned owner (dup delivery, single-owner violation).
-    if (gateway_ && !memberIdStr.empty()) {
-        memberKeyScratch_.clear();
-        memberKeyScratch_.append(groupIdStr);
-        memberKeyScratch_ += ':';
-        memberKeyScratch_.append(memberIdStr);
-        const auto sessIt = memberSessionMap_.find(memberKeyScratch_);
-        if (sessIt != memberSessionMap_.end()) {
-            const int64_t leavingSid = sessIt->second;
-            gateway_->revokeGroupSubscriptions(leavingSid);
-            spdlog::debug("GroupCoordinationService: LeaveGroup revoking subs for "
-                          "member='{}' sessionId={}", memberIdStr, leavingSid);
-        }
+    if (gateway_) {
+        gateway_->revokeGroupSubscriptions(msg.sessionId);
+        spdlog::debug("GroupCoordinationService: LeaveGroup revoking subs for "
+                      "member='{}' sessionId={}", memberIdStr, msg.sessionId);
     }
 
-    auto it = coordinators_.find(groupIdStr);
-    if (it != coordinators_.end()) {
-        // Leave is generation-fenced inside GroupCoordinator::leave.
-        // We need the member's last-known generationId; since the protocol
-        // frame doesn't carry it for LeaveGroup (templateId 38), we pass
-        // the current coordinator generationId (faithful Kafka: leave is
-        // fenced; unknown/stale leaves are no-ops).
-        it->second.leave(memberIdStr, it->second.generationId(), nowNs);
-    }
-    // If group doesn't exist: no-op (treat as already left).
+    // Leave is generation-fenced inside GroupCoordinator::leave.
+    // We need the member's last-known generationId; since the protocol
+    // frame doesn't carry it for LeaveGroup (templateId 38), we pass
+    // the current coordinator generationId (faithful Kafka: leave is
+    // fenced; unknown/stale leaves are no-ops).
+    it->second.leave(memberIdStr, it->second.generationId(), nowNs);
+    drainDeparted_(groupIdStr, it->second);   // CG-4: drop member → session mapping on Leave
 
-    // CG-4: drop member → session mapping on Leave.
-    if (!memberIdStr.empty()) {
-        // memberKeyScratch_ was already built above; rebuild in case the
-        // gateway block was skipped (empty gateway_).
-        memberKeyScratch_.clear();
-        memberKeyScratch_.append(groupIdStr);
-        memberKeyScratch_ += ':';
-        memberKeyScratch_.append(memberIdStr);
-        memberSessionMap_.erase(memberKeyScratch_);
-    }
-
-    pc::LeaveGroupResponse resp;
-    resp.sessionId     = msg.sessionId;
-    resp.correlationId = msg.correlationId;
     resp.errorCode     = static_cast<int16_t>(pc::ErrorCode::OK);
     return resp.encode(out);
 }
@@ -809,21 +856,15 @@ void GroupCoordinationService::evictMember(std::string_view groupId, std::string
     evictScratch_.clear();
     for (const auto& member : coord.members()) {
         if (!memberId.empty() && member.memberId != memberId) continue;
-        memberKeyScratch_.clear();
-        memberKeyScratch_.append(groupId);
-        memberKeyScratch_ += ':';
-        memberKeyScratch_.append(member.memberId);
+        buildMemberKey_(groupId, member.memberId);
         const auto it = memberSessionMap_.find(memberKeyScratch_);
-        if (it != memberSessionMap_.end() && it->second == sessionId) evictScratch_.push_back(member.memberId);
+        if (it != memberSessionMap_.end() && it->second.sessionId == sessionId) evictScratch_.push_back(member.memberId);
     }
     for (const auto& m : evictScratch_) {
         spdlog::warn("GroupCoordinationService: old client (session {}) member '{}' of group '{}' evicted — "
                      "answered UnknownMember instead of an error it would ignore", sessionId, m, groupId);
         coord.leave(m, coord.generationId(), nowNs);
-        memberKeyScratch_.clear();
-        memberKeyScratch_.append(groupId);
-        memberKeyScratch_ += ':';
-        memberKeyScratch_.append(m);
+        buildMemberKey_(groupId, m);
         memberSessionMap_.erase(memberKeyScratch_);
     }
 }
@@ -836,12 +877,9 @@ int GroupCoordinationService::removeUnauthorizedMembers(int64_t sessionId, int64
         if (check.mayRead(check.ctx, groupId)) continue;
         evictScratch_.clear();
         for (const auto& member : coord.members()) {
-            memberKeyScratch_.clear();
-            memberKeyScratch_.append(groupId);
-            memberKeyScratch_ += ':';
-            memberKeyScratch_.append(member.memberId);
+            buildMemberKey_(groupId, member.memberId);
             const auto it = memberSessionMap_.find(memberKeyScratch_);
-            if (it != memberSessionMap_.end() && it->second == sessionId) evictScratch_.push_back(member.memberId);
+            if (it != memberSessionMap_.end() && it->second.sessionId == sessionId) evictScratch_.push_back(member.memberId);
         }
         if (evictScratch_.empty()) continue;
         if (gateway_) gateway_->revokeGroupSubscriptions(sessionId);   // as LeaveGroup: before the mapping goes
@@ -849,10 +887,7 @@ int GroupCoordinationService::removeUnauthorizedMembers(int64_t sessionId, int64
             spdlog::warn("GroupCoordinationService: session {} lost READ on group '{}' - member '{}' removed (its next "
                          "request is answered NotAuthorized)", sessionId, groupId, memberId);
             coord.leave(memberId, coord.generationId(), nowNs);
-            memberKeyScratch_.clear();
-            memberKeyScratch_.append(groupId);
-            memberKeyScratch_ += ':';
-            memberKeyScratch_.append(memberId);
+            buildMemberKey_(groupId, memberId);
             memberSessionMap_.erase(memberKeyScratch_);
             ++removed;
         }
@@ -865,12 +900,9 @@ void GroupCoordinationService::evictSessionMembers(int64_t sessionId, int64_t no
     for (auto& [groupId, coord] : coordinators_) {
         evictScratch_.clear();
         for (const auto& member : coord.members()) {
-            memberKeyScratch_.clear();
-            memberKeyScratch_.append(groupId);
-            memberKeyScratch_ += ':';
-            memberKeyScratch_.append(member.memberId);
+            buildMemberKey_(groupId, member.memberId);
             const auto it = memberSessionMap_.find(memberKeyScratch_);
-            if (it != memberSessionMap_.end() && it->second == sessionId) evictScratch_.push_back(member.memberId);
+            if (it != memberSessionMap_.end() && it->second.sessionId == sessionId) evictScratch_.push_back(member.memberId);
         }
         if (evictScratch_.empty()) continue;
         if (gateway_) gateway_->revokeGroupSubscriptions(sessionId);
@@ -878,10 +910,7 @@ void GroupCoordinationService::evictSessionMembers(int64_t sessionId, int64_t no
             spdlog::warn("GroupCoordinationService: old client (session {}) member '{}' of group '{}' evicted — "
                          "answered UnknownMember instead of an error it would ignore", sessionId, memberId, groupId);
             coord.leave(memberId, coord.generationId(), nowNs);
-            memberKeyScratch_.clear();
-            memberKeyScratch_.append(groupId);
-            memberKeyScratch_ += ':';
-            memberKeyScratch_.append(memberId);
+            buildMemberKey_(groupId, memberId);
             memberSessionMap_.erase(memberKeyScratch_);
         }
     }
@@ -975,10 +1004,16 @@ size_t GroupCoordinationService::handleOffsetCommit(
         return resp.encode(out, std::span<const pc::OffsetCommitResult>(commitResultScratch_));
     }
 
-    // Generation fence: verify the member is in the group at the claimed generation.
+    // Member + generation fence (issues #124 / #169, Kafka parity): the commit is honoured only for a CURRENT member
+    // of the group, bound to THIS session, at the group's generation.  Generations restart with the coordinator, so
+    // the generation alone let a pre-restart member's late commit (or another session's) move the group's position.
+    // Another session's member is answered exactly as a member that does not exist.
     auto it = coordinators_.find(groupIdStr);
     const bool groupExists = (it != coordinators_.end());
-    bool genOk = groupExists && (msg.generationId == it->second.generationId());   // R1: cleared by a forced rebalance
+    memberIdScratch_.assign(reinterpret_cast<const char*>(msg.memberId.data()), msg.memberId.size());
+    const bool memberOk = groupExists && ownsMember_(groupIdStr, memberIdScratch_, msg.sessionId) &&
+                          it->second.hasMember(memberIdScratch_);
+    bool genOk = memberOk && (msg.generationId == it->second.generationId());   // R1: cleared by a forced rebalance
 
     commitResultScratch_.clear();
     const bool loaded = offsetsLoaded_();   // E2 residual round 4
@@ -1002,8 +1037,8 @@ size_t GroupCoordinationService::handleOffsetCommit(
 
         if (!genOk) {
             r.errorCode = static_cast<int16_t>(
-                groupExists ? pc::ErrorCode::IllegalGeneration
-                            : pc::ErrorCode::UnknownMember);
+                memberOk ? pc::ErrorCode::IllegalGeneration
+                         : pc::ErrorCode::UnknownMember);
             commitResultScratch_.push_back(r);
             continue;
         }
@@ -1273,14 +1308,11 @@ void GroupCoordinationService::onEnterPreparingRebalance(
 
     for (const auto& member : coord.members()) {
         // CG-7 zero-alloc: build memberKey into pre-reserved scratch string.
-        memberKeyScratch_.clear();
-        memberKeyScratch_.append(groupId);
-        memberKeyScratch_ += ':';
-        memberKeyScratch_.append(member.memberId);
+        buildMemberKey_(groupId, member.memberId);
         const auto it = memberSessionMap_.find(memberKeyScratch_);
         if (it == memberSessionMap_.end()) continue;  // no session tracked yet (early join)
 
-        const int64_t sessionId = it->second;
+        const int64_t sessionId = it->second.sessionId;
 
         // 1. Eagerly revoke all group push subscriptions for this member.
         gateway_->revokeGroupSubscriptions(sessionId);
@@ -1342,10 +1374,7 @@ void GroupCoordinationService::onReachedStable(
 
     for (const auto& member : coord.members()) {
         // CG-7 zero-alloc: build memberKey into pre-reserved scratch string.
-        memberKeyScratch_.clear();
-        memberKeyScratch_.append(groupId);
-        memberKeyScratch_ += ':';
-        memberKeyScratch_.append(member.memberId);
+        buildMemberKey_(groupId, member.memberId);
         const auto it = memberSessionMap_.find(memberKeyScratch_);
         if (it == memberSessionMap_.end()) {
             spdlog::warn("GroupCoordinationService::onReachedStable: "
@@ -1353,7 +1382,7 @@ void GroupCoordinationService::onReachedStable(
                          member.memberId, groupId);
             continue;
         }
-        const int64_t sessionId = it->second;
+        const int64_t sessionId = it->second.sessionId;
 
         // Build assignment for the Assign frame only (no subscription creation).
         assignFrameTpScratch_.clear();

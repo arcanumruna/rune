@@ -26,6 +26,7 @@
 // ---------------------------------------------------------------------------
 
 #include <rune/transaction/ProducerIdAllocator.h>
+#include <rune/protocol/ProducerIdBinding.h>
 #include <rune/storage/ProducerIdScan.h>
 
 namespace rune::transaction {
@@ -49,7 +50,7 @@ void recoverProducerIdWatermark(ProducerIdAllocator& alloc,
 {
     const ProducerId maxSeen = rune::storage::scanMaxProducerId(log, highWatermark);
     if (maxSeen >= 0) {
-        alloc.reseedAtLeast(maxSeen);
+        alloc.reseedAtLeast(rune::protocol::producerIdCounter(maxSeen));   // #122: counter units
     }
 }
 

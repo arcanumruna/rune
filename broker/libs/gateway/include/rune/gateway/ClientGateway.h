@@ -573,6 +573,15 @@ public:
         Session* s = sessions_.find(sessionId);
         return s != nullptr ? s->clientVersion : -1;
     }
+    /// Issues #122 / #123 / #124: the principal (security user object id) a session authenticated as; 0 = none (a dev
+    /// / in-process broker, an anonymous or not yet authenticated session, an unknown session).  Member ids and producer
+    /// ids are bound to it.  Control thread.
+    [[nodiscard]] uint64_t sessionPrincipalId(int64_t sessionId) {
+        Session* s = sessions_.find(sessionId);
+        if (s == nullptr) return 0;
+        const auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&s->auth);
+        return a != nullptr ? a->userId : 0;
+    }
     void setClusterIdNode(int32_t nodeId) noexcept {
         idPrefix_ = nodeId >= 0 ? clusterIdPrefix(nodeId) : 0;
         sessions_.setIdPrefix(idPrefix_);
@@ -2242,6 +2251,8 @@ private:
     /// true = DENIED here: answered NotAuthorized (45) in the request's own response type (D23 text where the type
     /// carries one) - the caller returns without forwarding anything.
     [[nodiscard]] bool deny_(Session& session, const std::optional<rune::gateway::Denial>& denial, const uint8_t* buf, std::size_t len);
+    /// Issue #122: the verdict for a producer id issued to another principal (cold: built only on a refusal).
+    [[gnu::cold]] static rune::gateway::Denial refusedProducerIdDenial_(int64_t producerId);
     /// Issue #114: a user's own ADD / DROP / SET PASSWORD without ADMIN - nullopt when it carries a valid proof of a
     /// current password over credentialChangeMessage(the session's login nonce, m); throttled like a login.
     [[nodiscard]] std::optional<rune::gateway::Denial> verifyOwnCredentialChange_(Session& session,

@@ -286,13 +286,13 @@ TEST(WorkerWriteGrantRegression, PermissionStagerReusesItsBuffersAfterTheFirstUp
     // No allocation once both buffers reached their peak size: the staging buffer and the slot buffer swap.
     struct FakeSink {
         std::vector<uint64_t> bits;
-        bool installWriteGrants(int64_t, std::vector<uint64_t>& w, bool, uint64_t) noexcept { bits.swap(w); return true; }
+        bool installWriteGrants(int64_t, std::vector<uint64_t>& w, bool, uint64_t, uint64_t) noexcept { bits.swap(w); return true; }
     } sink;
     PermissionStager st;
     std::vector<uint64_t> chunkWords(512, 7);
     auto update = [&] {
-        EXPECT_EQ(st.apply(sink, 1, 0, 1024, 0, 1, reinterpret_cast<const uint8_t*>(chunkWords.data()), 4096), PermissionChunkResult::Staged);
-        EXPECT_EQ(st.apply(sink, 1, 512, 1024, kPermFlagLast, 1, reinterpret_cast<const uint8_t*>(chunkWords.data()), 4096),
+        EXPECT_EQ(st.apply(sink, 1, 0, 1024, 0, 1, reinterpret_cast<const uint8_t*>(chunkWords.data()), 4096, /*owner=*/7), PermissionChunkResult::Staged);
+        EXPECT_EQ(st.apply(sink, 1, 512, 1024, kPermFlagLast, 1, reinterpret_cast<const uint8_t*>(chunkWords.data()), 4096, /*owner=*/7),
                   PermissionChunkResult::Installed);
     };
     update();

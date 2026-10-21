@@ -26,7 +26,7 @@ TEST(PermissionShipperRegression, AFullRingResumesWithoutDuplicatingAChunk) {
     PermissionShipper s;
     fillLifecycleRing(p->worker(1));                    // worker 1 cannot take anything
     const auto bits = words(20'000);                    // 40 chunks of 512 words (more than the 64 KiB ring holds)
-    EXPECT_FALSE(s.ship(*p, 5, bits, false, 1));
+    EXPECT_FALSE(s.ship(*p, 5, bits, false, 1, /*owner=*/7));
     EXPECT_EQ(s.fullyShippedEpoch(5), 0u);
     for (int round = 0; round < 200 && s.fullyShippedEpoch(5) < 1; ++round) {
         drain(p->worker(0));
@@ -46,8 +46,8 @@ TEST(PermissionShipperRegression, LatestUpdateReplacesAQueuedOne) {
     auto p = pool(2);
     PermissionShipper s;
     fillLifecycleRing(p->worker(1));
-    EXPECT_FALSE(s.ship(*p, 5, words(10), false, 1));   // worker 0 takes it, worker 1 is queued
-    EXPECT_FALSE(s.ship(*p, 5, words(10), false, 2));   // the queued older update is replaced
+    EXPECT_FALSE(s.ship(*p, 5, words(10), false, 1, /*owner=*/7));   // worker 0 takes it, worker 1 is queued
+    EXPECT_FALSE(s.ship(*p, 5, words(10), false, 2, /*owner=*/7));   // the queued older update is replaced
     EXPECT_EQ(s.pendingUpdates(), 1u);
     drain(p->worker(1));
     (void)s.retry(*p);
@@ -62,7 +62,7 @@ TEST(PermissionShipperRegression, FullyShippedEpochAdvancesOnlyWhenEveryWorkerHa
     auto p = pool(3);
     PermissionShipper s;
     fillLifecycleRing(p->worker(2));
-    EXPECT_FALSE(s.ship(*p, 9, words(3), true, 7));
+    EXPECT_FALSE(s.ship(*p, 9, words(3), true, 7, /*owner=*/7));
     EXPECT_EQ(s.fullyShippedEpoch(9), 0u) << "two of three workers is not shipped";
     drain(p->worker(2));
     EXPECT_GE(s.retry(*p), 1);
@@ -75,7 +75,7 @@ TEST(PermissionShipperRegression, FullyShippedEpochAdvancesOnlyWhenEveryWorkerHa
 TEST(PermissionShipperRegression, AnEmptyBitmapIsShippedAsOneLastChunk) {
     auto p = pool(1);
     PermissionShipper s;
-    EXPECT_TRUE(s.ship(*p, 4, {}, false, 3)) << "a user with no WRITE grant still replaces the table";
+    EXPECT_TRUE(s.ship(*p, 4, {}, false, 3, /*owner=*/7)) << "a user with no WRITE grant still replaces the table";
     drain(p->worker(0));
     EXPECT_EQ(p->worker(0).sessionPermissionChunksSeenForTest(), 1u);
 }

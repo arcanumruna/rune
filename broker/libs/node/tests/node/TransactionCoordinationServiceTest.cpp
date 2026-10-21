@@ -21,6 +21,7 @@
 // ---------------------------------------------------------------------------
 
 #include <gtest/gtest.h>
+#include <rune/protocol/ProducerIdBinding.h>
 
 #include <rune/node/TransactionCoordinationService.h>
 #include <rune/transaction/ReplicatedTxnStateStore.h>
@@ -735,4 +736,90 @@ TEST_F(TransactionCoordinationServiceTest, RefusedOffsetApplyKeepsPrepareCommitA
     now += 1'100'000'000;
     (void)svc_->doWork(now);
     EXPECT_EQ(sink.accepted, 1);
+}
+
+// ===========================================================================
+// Issue #122: InitProducerId issues the id bound to the session's principal; AddPartitions / EndTxn naming another
+// principal's id are answered exactly like any wrong producer id and change nothing.  Sessions 1 and 3 are user 7,
+// session 2 is user 8.
+// ===========================================================================
+namespace {
+uint64_t txnPrincipalBySession(void*, int64_t sid) noexcept { return sid == 2 ? 8 : 7; }
+}  // namespace
+
+TEST_F(TransactionCoordinationServiceTest, AnotherPrincipalsProducerIdIsAnsweredAsAWrongIdRegression) {
+    svc_->setPrincipalResolverForTest(&txnPrincipalBySession, nullptr);
+    std::size_t n = svc_->handleInitProducerId(reqBuf_.data(), encodeInitProducerId(reqBuf_.data(), reqBuf_.size(), 1, 1,
+                                                                                    30'000, "txA"),
+                                               0, outBuf_.data(), outBuf_.size());
+    const auto init = pc::InitProducerIdResponse::decode(outBuf_.data(), n);
+    ASSERT_TRUE(init);
+    ASSERT_EQ(init->errorCode, 0);
+    EXPECT_TRUE(rune::protocol::producerIdOwnedBy(init->producerId, 7));
+    const int64_t pid = init->producerId;
+    const int16_t epoch = init->producerEpoch;
+    const std::vector<pc::TxnTopicPartition> parts = {{0, 0}};
+    auto addCode = [&](int64_t sid, int64_t p) {
+        const std::size_t len = encodeAddPartitions(reqBuf_.data(), reqBuf_.size(), sid, 2, p, epoch, "txA", parts);
+        const std::size_t out = svc_->handleAddPartitions(reqBuf_.data(), len, 0, outBuf_.data(), outBuf_.size());
+        const auto r = pc::AddPartitionsToTxnResponse::decode(outBuf_.data(), out);
+        return r && !r->results.empty() ? static_cast<int>(r->results[0].errorCode) : -1;
+    };
+    auto endCode = [&](int64_t sid, int64_t p, bool commit) {
+        const std::size_t len = encodeEndTxn(reqBuf_.data(), reqBuf_.size(), sid, 3, p, epoch, commit, "txA");
+        const std::size_t out = svc_->handleEndTxn(reqBuf_.data(), len, 0, outBuf_.data(), outBuf_.size());
+        const auto r = pc::EndTxnResponse::decode(outBuf_.data(), out);
+        return r ? static_cast<int>(r->errorCode) : -1;
+    };
+    const int wrongId = addCode(2, 99);
+    EXPECT_NE(wrongId, 0);
+    EXPECT_EQ(addCode(2, pid), wrongId) << "another principal's id must look like any wrong id";
+    ASSERT_EQ(addCode(3, pid), 0) << "the owner (on another session) adds the partition";
+    EXPECT_EQ(endCode(2, pid, /*commit=*/false), endCode(2, 99, false)) << "a foreign EndTxn is a wrong-id EndTxn";
+    EXPECT_EQ(svc_->txnStateForTest("txA"), tx::TxnState::Ongoing) << "the foreign EndTxn aborted the owner's transaction";
+
+    // Principal 8 taking the transactional id over gets a fresh id of its own.
+    n = svc_->handleInitProducerId(reqBuf_.data(), encodeInitProducerId(reqBuf_.data(), reqBuf_.size(), 2, 4, 30'000, "txA"),
+                                   0, outBuf_.data(), outBuf_.size());
+    const auto taken = pc::InitProducerIdResponse::decode(outBuf_.data(), n);
+    ASSERT_TRUE(taken);
+    ASSERT_EQ(taken->errorCode, 0);
+    EXPECT_NE(taken->producerId, pid);
+    EXPECT_TRUE(rune::protocol::producerIdOwnedBy(taken->producerId, 8));
+}
+
+// PR #423 review F1 (issue #122, rolling upgrade): bound producer ids are issued only once the committed metadata
+// feature level says every member supports them.  Below it, ids are raw and a transactional id is never rebound
+// (an older coordinator may take over and must never see a bound id); at the level, ids are bound and a raw id held
+// by a transactional id is rebound to its caller.
+TEST_F(TransactionCoordinationServiceTest, BoundProducerIdsWaitForTheClusterFeatureLevelRegression) {
+    namespace rr = rune::replication;
+    svc_->setPrincipalResolverForTest(&txnPrincipalBySession, nullptr);
+    auto init = [&](int64_t sid, std::string_view txnId) {
+        const std::size_t n = svc_->handleInitProducerId(
+            reqBuf_.data(), encodeInitProducerId(reqBuf_.data(), reqBuf_.size(), sid, 1, 30'000, txnId), 0,
+            outBuf_.data(), outBuf_.size());
+        const auto r = pc::InitProducerIdResponse::decode(outBuf_.data(), n);
+        EXPECT_TRUE(r && r->errorCode == 0);
+        return r ? std::pair<int64_t, int16_t>{r->producerId, r->producerEpoch} : std::pair<int64_t, int16_t>{-1, -1};
+    };
+    svc_->setMetadataFeatureLevel(rr::MetadataFeature::kStorageIdentity);   // a member still runs an older binary
+    EXPECT_FALSE(svc_->bindsProducerIds());
+    const auto idem = init(1, "");
+    EXPECT_GE(idem.first, 0);
+    EXPECT_FALSE(rune::protocol::isBoundProducerId(idem.first)) << "a bound id was issued in a mixed cluster";
+    const auto a = init(1, "tx-gate");
+    const auto b = init(2, "tx-gate");
+    EXPECT_FALSE(rune::protocol::isBoundProducerId(a.first));
+    EXPECT_EQ(b.first, a.first) << "below the level a transactional id keeps its id (no rebinding)";
+    EXPECT_EQ(b.second, a.second + 1);
+
+    svc_->setMetadataFeatureLevel(rr::MetadataFeature::kBoundProducerIds);   // every member upgraded
+    EXPECT_TRUE(svc_->bindsProducerIds());
+    const auto bound = init(1, "");
+    EXPECT_TRUE(rune::protocol::producerIdOwnedBy(bound.first, 7));
+    EXPECT_GT(rune::protocol::producerIdCounter(bound.first), idem.first) << "the counter continues past the raw ids";
+    const auto rebound = init(2, "tx-gate");
+    EXPECT_NE(rebound.first, a.first) << "the raw id, owned by nobody, is rebound at the level";
+    EXPECT_TRUE(rune::protocol::producerIdOwnedBy(rebound.first, 8));
 }

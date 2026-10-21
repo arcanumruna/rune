@@ -18,6 +18,7 @@
 #include <rune/node/WorkerPool.h>
 #include <rune/node/WorkerReturnCodec.h>
 #include <rune/protocol/RecordBatch.h>
+#include <rune/protocol/ProducerIdBinding.h>
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/Protocol.h>
 #include <rune/protocol/client/ControlMessages.h>
@@ -6100,4 +6101,28 @@ TEST(D4TxnRegression, MalformedEndTxnFramesAreIgnoredRegression) {
     // a halt, never the "deferred" 0 the gateway would never answer.
     EXPECT_DEATH((void)T.tcs->handleEndTxn(f.data(), f.size(), 1, T.out.data(), 1), "kTxnMinOutCap");
     SUCCEED();
+}
+
+// ============================================================================
+// Adversarial review of PR #423 (issue #122), version skew: a rolling upgrade moves the transaction coordinator from
+// an upgraded node to an older one and back.  The older coordinator reloads a BOUND id from __transaction_state,
+// reseeds its allocator past the raw id and persists its next pid block ceiling in raw id units (old load_:
+// base = maxPid + 1, then advancePidBlock_: base + kBlockSize).  The upgraded coordinator that takes over next must
+// keep issuing ids: the ceiling must not exhaust the bound format's 38-bit counter.
+// ============================================================================
+TEST(TxnPidBlockRegression, ACeilingPersistedByAPreBindingCoordinatorDoesNotExhaustPidsVersionSkewAdversarialRegression) {
+    namespace rp = rune::protocol;
+    CoordRig R(Role::Leader, 1, {1}, {1});
+    const auto t = R.initPid("t");
+    ASSERT_EQ(t.err, 0);
+    ASSERT_TRUE(rp::isBoundProducerId(t.pid)) << "precondition: the upgraded coordinator issues bound ids";
+    // The older coordinator's load + first block over this state.
+    ASSERT_GE(R.store->putPidBlockCeiling(t.pid + 1 + tx::ProducerIdAllocator::kBlockSize), 0);
+    R.newCoordinator();   // the upgraded node takes the coordinator back
+    const auto idem = R.initPid("");
+    EXPECT_EQ(idem.err, 0) << "InitProducerId fails for good after an older coordinator ran over bound ids";
+    EXPECT_TRUE(rp::isBoundProducerId(idem.pid));
+    EXPECT_GT(rp::producerIdCounter(idem.pid), rp::producerIdCounter(t.pid));
+    const auto t2 = R.initPid("t2");
+    EXPECT_EQ(t2.err, 0);
 }

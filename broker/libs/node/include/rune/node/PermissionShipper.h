@@ -29,7 +29,9 @@ public:
     static constexpr int         kMaxWorkers = 64;   // validateShardConfig
 
     /// Queue `bits` for `sessionId` to every worker; returns true once every worker accepted it.
-    bool ship(WorkerPool& pool, int64_t sessionId, std::span<const uint64_t> bits, bool grantAll, uint64_t epoch) {
+    /// `owner` (issue #122): the session's principal, installed with the bits (producer ids must carry its tag).
+    bool ship(WorkerPool& pool, int64_t sessionId, std::span<const uint64_t> bits, bool grantAll, uint64_t epoch,
+              uint64_t owner) {
         // Latest wins: an older queued update of this session is dropped (a worker mid-way through it restarts).
         for (std::size_t i = 0; i < pending_.size(); ++i)
             if (pending_[i].sessionId == sessionId) { pending_.erase(pending_.begin() + static_cast<std::ptrdiff_t>(i)); break; }
@@ -37,6 +39,7 @@ public:
         u.sessionId = sessionId;
         u.epoch     = epoch;
         u.grantAll  = grantAll;
+        u.owner     = owner;
         u.bits.assign(bits.begin(), bits.end());
         u.pendingMask = allMask_(pool);
         pending_.push_back(std::move(u));
@@ -78,6 +81,7 @@ private:
         int64_t               sessionId = 0;
         uint64_t              epoch = 0;
         bool                  grantAll = false;
+        uint64_t              owner    = 0;
         std::vector<uint64_t> bits;
         uint64_t              pendingMask = 0;                    // workers that have not accepted the last chunk
         std::array<uint32_t, kMaxWorkers> nextWord{};             // per worker: the next word to send
@@ -106,6 +110,7 @@ private:
                 op.nextOffset    = static_cast<int64_t>(first);
                 op.hwBound       = static_cast<int64_t>(total);
                 op.correlationId = static_cast<int64_t>(u.epoch);
+                op.producerId    = static_cast<int64_t>(u.owner);   // #122: the principal (every chunk)
                 op.isolation     = static_cast<uint8_t>((last ? kPermFlagLast : 0u) | (u.grantAll ? kPermFlagGrantAll : 0u));
                 op.permWords     = u.bits.data() + first;
                 op.permWordCount = count;

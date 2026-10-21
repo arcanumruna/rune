@@ -105,6 +105,7 @@
 #include <rune/transaction/ControlMarker.h>
 #include <rune/transaction/ReadCommittedView.h>
 #include <rune/protocol/RecordBatch.h>
+#include <rune/protocol/ProducerIdBinding.h>
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/ControlMessages.h>
 #include <rune/protocol/client/Protocol.h>  // E5.1.3: pc::ErrorCode enum (replaces magic literals)
@@ -2579,7 +2580,8 @@ private:
         const std::uint32_t tailLen = op.tailLength();   // SBE var data: the length FIRST, then tail() advances past it
         const auto* tail = reinterpret_cast<const uint8_t*>(op.tail());
         const PermissionChunkResult r = permStager_.apply(
-            *ackSink_, op.sessionId(), first, total, op.isolation(), static_cast<uint64_t>(op.correlationId()), tail, tailLen);
+            *ackSink_, op.sessionId(), first, total, op.isolation(), static_cast<uint64_t>(op.correlationId()), tail, tailLen,
+            static_cast<uint64_t>(op.producerId()));   // #122: the session's principal
         if (r == PermissionChunkResult::Dropped) [[unlikely]]
             spdlog::debug("Worker {}: permission chunk for session {} dropped (closed session or out-of-order chunk)",
                           workerId_, op.sessionId());
@@ -7158,6 +7160,13 @@ private:
                     ++intakeGrantHolds_;
                     return kIngressHeld;                             // seq NOT committed: it re-opens
                 }
+                if (openSeq != 0) [[unlikely]] commitProduceSeq(openCtx, openSeq);   // consumed (answered)
+                return refuseNotAuthorized_(msg, directAck);
+            }
+            // Issue #122: a producer id is honoured only for the principal it was issued to (its owner tag; the
+            // principal is shipped with the grants) - one mask and one compare on the slot just loaded, refused
+            // whatever the producer's state (nothing to probe).
+            if (!rune::protocol::producerIdUsableByTag(msg.producerId, grants->ownerTag)) [[unlikely]] {
                 if (openSeq != 0) [[unlikely]] commitProduceSeq(openCtx, openSeq);   // consumed (answered)
                 return refuseNotAuthorized_(msg, directAck);
             }

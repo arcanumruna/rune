@@ -23,6 +23,8 @@
 // ---------------------------------------------------------------------------
 
 #include <rune/node/TransactionCoordinationService.h>
+#include <rune/protocol/ProducerIdBinding.h>
+#include <rune/replication/ReplicationMessages.h>   // MetadataFeature (#122)
 #include <rune/gateway/RequestRejection.h>
 #include <rune/gateway/ITxnRequestHandler.h>
 #include <cstdlib>
@@ -88,6 +90,7 @@ TransactionCoordinationService::TransactionCoordinationService(
     coordinator_.setCheckedOffsetApplyCallback(
         [this](const std::string& group, const rune::coordination::TopicPartition& tp, rune::coordination::Offset offset,
                int64_t /*timestampNs*/) { return applyTxnOffset_(group, tp, offset); });
+    coordinator_.setBoundProducerIds(true);   // issue #122: every id this service issues carries its owner
     // Pre-reserve scratch containers to avoid steady-state allocation.
     partitionScratch_.reserve(32);
     partResultScratch_.reserve(32);
@@ -188,8 +191,12 @@ void TransactionCoordinationService::load_(int64_t nowNs)
         // I7: the next pid lies at or above every ceiling a previous coordinator
         // persisted (idempotent pids are recorded nowhere else) and above every
         // pid in the log.  Nothing is handed out until a fresh ceiling commits.
-        tx::ProducerId base = txnState_->persistedPidCeiling();
-        if (maxPid + 1 > base) base = maxPid + 1;
+        // #122: a ceiling is in counter units; one persisted by a coordinator that reseeded by a bound id's RAW value
+        // (an older binary over bound ids) is converted like an id, so it never runs the counter past its 38 bits.
+        tx::ProducerId base = rune::protocol::producerIdCounter(txnState_->persistedPidCeiling());
+        // #122: the ceiling is in allocator (counter) units; a recovered id is converted (bound ids carry an owner).
+        const tx::ProducerId maxCounter = rune::protocol::producerIdCounter(maxPid);
+        if (maxCounter + 1 > base) base = maxCounter + 1;
         if (base > 0) coordinator_.allocator().reseedAtLeast(base - 1);
         coordinator_.allocator().resetGate();             // gated; no limit from an earlier load
         pidCeilingPending_       = -1;
@@ -339,6 +346,28 @@ static size_t answerCannotFit_(const uint8_t* buf, size_t len, uint8_t* out, siz
 }
 
 // ---------------------------------------------------------------------------
+// Issue #122: producer ids are bound to the principal they were issued to.
+// ---------------------------------------------------------------------------
+bool TransactionCoordinationService::bindsProducerIds() const noexcept
+{
+    return featureLevel_ < 0 || featureLevel_ >= rune::replication::MetadataFeature::kBoundProducerIds;
+}
+
+uint64_t TransactionCoordinationService::principalOf_(int64_t sessionId) const
+{
+    if (principalFn_ != nullptr) return principalFn_(principalCtx_, sessionId);
+    return gateway_ != nullptr ? gateway_->sessionPrincipalId(sessionId) : 0;
+}
+
+int64_t TransactionCoordinationService::requestPid_(int64_t pid, int64_t sessionId) const
+{
+    // Another principal's id acts as an id that matches no transaction: the coordinator answers it exactly like a
+    // wrong producer id (nothing to tell "someone else's" from "nobody's").  Never a valid id (ids are >= 0).
+    constexpr int64_t kNoSuchProducerId = INT64_MIN;
+    return rune::protocol::producerIdUsableBy(pid, principalOf_(sessionId)) ? pid : kNoSuchProducerId;
+}
+
+// ---------------------------------------------------------------------------
 // handleInitProducerId (templateId 45)
 // ---------------------------------------------------------------------------
 size_t TransactionCoordinationService::handleInitProducerId(
@@ -388,9 +417,11 @@ size_t TransactionCoordinationService::handleInitProducerId(
         return resp.encode(out);
     }
 
-    // Call coordinator.
+    // Call coordinator.  Issue #122: the id is issued to (bound to) the session's principal - once every member
+    // supports bound ids (below the feature level: a raw id, nothing rebound).
     const auto result = coordinator_.initProducerId(
-        txnIdOpt, msg.transactionTimeoutMs, nowNs);
+        txnIdOpt, msg.transactionTimeoutMs, nowNs,
+        bindsProducerIds() ? std::optional<uint64_t>(principalOf_(msg.sessionId)) : std::nullopt);
 
     // F15 I7: the allocation may have crossed half a block — prefetch the next.
     advancePidBlock_();
@@ -489,7 +520,7 @@ size_t TransactionCoordinationService::handleAddPartitions(
     }
 
     const auto result = coordinator_.addPartitions(
-        txnIdScratch_, msg.producerId, msg.producerEpoch,
+        txnIdScratch_, requestPid_(msg.producerId, msg.sessionId), msg.producerEpoch,
         partitionScratch_, nowNs);
 
     // Persist before responding (pass the real coordinatorEpoch, not literal 0).
@@ -560,7 +591,7 @@ size_t TransactionCoordinationService::handleAddOffsets(
     // X-1: AddOffsetsToTxn opens the transaction from Empty / Complete* (Kafka).
     offsetsScratch_.clear();
     const auto result = coordinator_.addOffsetsToTxn(
-        txnIdScratch_, msg.producerId, msg.producerEpoch,
+        txnIdScratch_, requestPid_(msg.producerId, msg.sessionId), msg.producerEpoch,
         groupIdScratch_, offsetsScratch_, nowNs, /*beginsTxn=*/true);
 
     // Persist before responding (pass the real coordinatorEpoch, not literal 0).
@@ -645,7 +676,7 @@ size_t TransactionCoordinationService::handleTxnOffsetCommit(
     }
 
     const auto result = coordinator_.addOffsetsToTxn(
-        txnIdScratch_, msg.producerId, msg.producerEpoch,
+        txnIdScratch_, requestPid_(msg.producerId, msg.sessionId), msg.producerEpoch,
         groupIdScratch_, offsetsScratch_, nowNs);
 
     // Persist before responding (pass the real coordinatorEpoch, not literal 0).
@@ -707,7 +738,7 @@ size_t TransactionCoordinationService::handleEndTxn(
 
     const bool commit = (msg.commit != 0);
     const auto result = coordinator_.endTransaction(
-        txnIdScratch_, msg.producerId, msg.producerEpoch, commit, nowNs);
+        txnIdScratch_, requestPid_(msg.producerId, msg.sessionId), msg.producerEpoch, commit, nowNs);
 
     // F15 §5.4: an OK for a same-direction retry of a COMPLETED transaction is
     // the idempotent answer — no transition, nothing persisted, no markers.

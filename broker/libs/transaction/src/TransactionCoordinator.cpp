@@ -57,7 +57,7 @@ TransactionCoordinator::TransactionCoordinator(ProducerIdAllocator allocator,
         // A1: reseed so the next allocation is strictly greater than any live pid.
         // No-op if the injected allocator already starts above maxPid.
         if (maxPid >= 0) {
-            allocator_.reseedAtLeast(maxPid);
+            allocator_.reseedAtLeast(reseedCounter_(maxPid));   // #122: counter units
         }
     }
 }
@@ -106,12 +106,24 @@ void persistTransition(TransactionLog* log,
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
+// allocatePid_ — issue #122: an id bound to its owner (or a raw counter in rigs).
+// ---------------------------------------------------------------------------
+ProducerId TransactionCoordinator::allocatePid_(const std::optional<uint64_t>& owner) noexcept
+{
+    const ProducerId counter = allocator_.allocate();
+    if (counter < 0 || !owner.has_value()) return counter;   // a sentinel, or a raw id (no owner)
+    if (counter > rune::protocol::kMaxPidCounter) return ProducerIdAllocator::kExhausted;
+    return rune::protocol::bindProducerId(counter, *owner);
+}
+
+// ---------------------------------------------------------------------------
 // initProducerId
 // ---------------------------------------------------------------------------
 InitProducerIdResult TransactionCoordinator::initProducerId(
     std::optional<TransactionalId> txnId,
     int32_t                        txnTimeoutMs,
-    int64_t                        nowNs)
+    int64_t                        nowNs,
+    std::optional<uint64_t>        owner)
 {
     // Resolve effective timeout.
     // txnTimeoutMs < 0 → explicitly invalid (mirror Kafka: INVALID_TXN_TIMEOUT_MS).
@@ -128,7 +140,7 @@ InitProducerIdResult TransactionCoordinator::initProducerId(
 
     // No transactional id → fresh producer, no state machine entry.
     if (!txnId.has_value() || txnId->empty()) {
-        ProducerId pid   = allocator_.allocate();
+        ProducerId pid   = allocatePid_(owner);
         if (pid < 0) return allocationFailure_(pid);
         return { .producerId = pid, .producerEpoch = 0, .errorCode = 0 };
     }
@@ -138,7 +150,7 @@ InitProducerIdResult TransactionCoordinator::initProducerId(
 
     if (meta == nullptr) {
         // Unknown txnId → create new metadata (Empty, epoch 0).
-        ProducerId pid = allocator_.allocate();
+        ProducerId pid = allocatePid_(owner);
         if (pid < 0) return allocationFailure_(pid);
         TransactionMetadata newMeta;
         newMeta.txnId             = id;
@@ -171,9 +183,13 @@ InitProducerIdResult TransactionCoordinator::initProducerId(
     // epoch 0) instead of wrapping.  Wrapping to 0 would un-fence epoch-0 zombies.
     ProducerEpoch newEpoch;
     ProducerId    newPid = meta->producerId;
-    if (meta->producerEpoch == INT16_MAX) {
-        // Epoch space exhausted — allocate a fresh PID.
-        newPid   = allocator_.allocate();
+    // Issue #122: the id must be the caller's.  Another principal's id (or a legacy id, issued to nobody) is never
+    // handed over: the caller gets a fresh id of its own, through the same path as an epoch overflow (the previous
+    // holder is fenced; an Ongoing transaction is aborted under the OLD id, the new one adopted once it resolves).
+    const bool foreign = owner.has_value() && !rune::protocol::producerIdOwnedBy(meta->producerId, *owner);
+    if (meta->producerEpoch == INT16_MAX || foreign) {
+        // Epoch space exhausted (or the id is not the caller's) — allocate a fresh PID.
+        newPid   = allocatePid_(owner);
         if (newPid < 0) return allocationFailure_(newPid);   // nothing mutated
         newEpoch = 0;
     } else {

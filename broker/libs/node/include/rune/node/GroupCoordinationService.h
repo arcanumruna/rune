@@ -375,13 +375,42 @@ private:
     std::map<int64_t, uint64_t> oldClientRefusals_;
 
     // CG-4: member → sessionId tracking.
-    // Keyed by (groupId + ":" + memberId) for global uniqueness.
-    // Populated on JoinGroup; cleared on Leave/expiry revoke.
+    // Keyed by buildMemberKey_(groupId, memberId) ("<len>:<group><member>", unambiguous).
+    // Populated on JoinGroup; cleared on Leave and whenever the coordinator
+    // removes the member (expiry, join timeout: drainDeparted_).
     // Used by doWork to know which egress session to send Assign frames to and
     // which session to create push subscriptions for.
+    // Issues #123 / #124 / #169: it is also THE ownership record — a member id
+    // is bound to the session (and principal) that obtained it.  Sync,
+    // Heartbeat, Leave and OffsetCommit are honoured only on that session; a
+    // JoinGroup naming it is a re-join only for that principal (a reconnect),
+    // and a fresh member otherwise.  A refusal is answered exactly as for a
+    // member that does not exist.
     // Single-writer (duty-cycle thread); no locks needed.
     // std::map with std::less<> enables transparent find() with string_view.
-    std::map<std::string, int64_t, std::less<>> memberSessionMap_;
+    struct MemberBinding { int64_t sessionId = 0; uint64_t principal = 0; };
+    std::map<std::string, MemberBinding, std::less<>> memberSessionMap_;
+    /// The map key of (groupId, memberId) into memberKeyScratch_ (unambiguous: length-prefixed group).
+    void buildMemberKey_(std::string_view groupId, std::string_view memberId);
+    /// The binding of (groupId, memberId), or nullptr.  Builds memberKeyScratch_.
+    const MemberBinding* bindingOf_(std::string_view groupId, std::string_view memberId);
+    /// True when (groupId, memberId) is bound to `sessionId`.
+    bool ownsMember_(std::string_view groupId, std::string_view memberId, int64_t sessionId) {
+        const MemberBinding* b = bindingOf_(groupId, memberId);
+        return b != nullptr && b->sessionId == sessionId;
+    }
+    /// The authenticated principal of `sessionId` (0: none — dev / in-process brokers, unit rigs).
+    [[nodiscard]] uint64_t principalOf_(int64_t sessionId) const;
+    /// Drop the bindings of the members `coord` removed since the last drain (cold).
+    void drainDeparted_(std::string_view groupId, rune::coordination::GroupCoordinator& coord);
+    std::vector<std::string> departedScratch_;
+public:
+    /// Test seam: resolve a session's principal without a gateway.
+    using PrincipalFn = uint64_t (*)(void* ctx, int64_t sessionId) noexcept;
+    void setPrincipalResolverForTest(PrincipalFn fn, void* ctx) noexcept { principalFn_ = fn; principalCtx_ = ctx; }
+private:
+    PrincipalFn principalFn_  = nullptr;
+    void*       principalCtx_ = nullptr;
 
     // CG-7 zero-alloc: per-handler scratch strings.
     // Assigned via assign(data, size) each call — no heap alloc when
