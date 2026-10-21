@@ -2292,8 +2292,17 @@ void Client::sweepControl_(int64_t nowNs) {
         agent_.seedMachine().state() == session::SessionState::Disconnected) [[unlikely]] {
         static constexpr std::string_view kGaveUp =
             "connect() gave up (redirect budget exhausted or connect refused): not connected";
-        completeConnect_(OpStatus::NotConnected, 0, 0, kGaveUp);
-        if (cbError_) invokeUserCallback_("onError", [&] { cbError_(std::string(kGaveUp)); });
+        // Issue #13 / #14: a session that requires TLS and never got it says why (the refusals were unauthenticated,
+        // so they were retried, not reported as a verdict).
+        static constexpr std::string_view kNoTls =
+            "connect() gave up: no TLS session (HandshakeFailed, 29) - the broker's certificate is not trusted or does "
+            "not name its host (ClientConfig tlsTrustPem / tlsExpectHost; the CLI's --tls-ca / --tls-host), or the "
+            "broker answered without TLS";
+        const int16_t last = agent_.seedMachine().lastConnectError();
+        const bool noTls = last == static_cast<int16_t>(static_cast<uint16_t>(rune::protocol::client::ErrorCode::HandshakeFailed));
+        const std::string_view why = noTls ? kNoTls : kGaveUp;
+        completeConnect_(OpStatus::NotConnected, 0, last > 0 ? static_cast<uint16_t>(last) : 0, why);
+        if (cbError_) invokeUserCallback_("onError", [&] { cbError_(std::string(why)); });
     }
     if (hasPendingConnect_ && nowNs >= pendingConnect_.deadlineNs) {
         completeConnect_(OpStatus::Timeout, 0, 0, {});
@@ -2345,7 +2354,10 @@ void Client::throwForStatus_(const char* what, const Completion& c, std::span<co
     case OpStatus::Ok:             return;
     case OpStatus::Timeout:        msg += ": timed out"; break;
     case OpStatus::Closed:         msg += ": client closed"; break;
-    case OpStatus::NotConnected:   msg += ": not connected (state != Connected)"; break;
+    case OpStatus::NotConnected:
+        msg += ": not connected (state != Connected)";
+        if (!payload.empty()) msg += ": " + std::string(reinterpret_cast<const char*>(payload.data()), payload.size());
+        break;
     case OpStatus::SessionLost:    msg += ": session lost before the answer"; break;
     case OpStatus::InvalidArgument:
         msg += ": invalid argument";

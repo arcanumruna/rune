@@ -540,7 +540,7 @@ bool LiveBroker::open(const LiveOptions& o, std::ostream& err, bool withCredenti
         applyTls(cfg, o.tlsCa, o.tlsHost, o.insecurePlaintext);   // issue #13: after the credentials / bootstrap mode
     } catch (const std::exception& e) {
         lastFailure_ = e.what();
-        err << "rune: " << e.what() << "\n";
+        if (!quietFailure) err << "rune: " << e.what() << "\n";   // a quiet caller reports lastFailure() itself
         if (!cfg.password.empty()) rc::detail::secureZero(cfg.password.data(), cfg.password.size());
         close();
         return false;
