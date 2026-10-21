@@ -10,7 +10,8 @@
 #                (e) an unfiltered Partition(0) control) are checked for their exact sets against the model while a
 #                producer (one committed and one aborted transaction, then N records) runs;
 #      ~30 %:    `docker kill` of the leader of partition 3; restarted once progress resumes;
-#      ~60 %:    `docker restart` of a non-leader, non-seed node;
+#      ~60 %:    `docker restart` of a node that is neither the seed nor the original partition-3 leader (after the kill it may lead
+#                partition 3 now: extra stress);
 #      the consumer must exit 0 within 600 s;
 #   4. ERRORS:   the refusals (untyped topic, stale descriptor, the subscription cap, a second group filter);
 #   5. ALTER:    ADD guild (v2), DROP channel (v3) under a live subscription; the broker log names the absent field once
@@ -23,7 +24,7 @@
 #     the filtered p50 / p99 (median over the runs) are no worse than unfiltered beyond the run-to-run band,
 # and prints FILTER-SCENARIO: OK (or FAIL <why>).  The absolute docker p50 / p99 are printed as information only.
 # The scenario needs the clean benchmark box (broker/bench/vm-bench-prepare.sh, restored in the trap) and so the host
-# lock: run it as   flock -w 7200 /root/vm.lock bash broker/docker/filter-e2e.sh --scenario
+# lock: run it as   flock -w 7200 "${RUNE_VM_LOCK_FILE:-/root/vm.lock}" bash broker/docker/filter-e2e.sh --scenario
 #
 # Usage:  bash broker/docker/filter-e2e.sh [--scenario]      (the monorepo is found from this file's location)
 # Environment (all optional):
@@ -293,7 +294,7 @@ if [ "${SCENARIO}" = "1" ]; then
         BENCH_PREPARED=""
         log "vm-bench-prepare.sh refused (attempt ${attempt}); retrying"
     done
-    [ -n "${prepared}" ] || fail "vm-bench-prepare.sh failed 5 times (hold the lock: flock -w 7200 /root/vm.lock bash $0 --scenario)"
+    [ -n "${prepared}" ] || fail "vm-bench-prepare.sh failed 5 times (hold the lock: flock -w 7200 ${RUNE_VM_LOCK_FILE:-/root/vm.lock} bash $0 --scenario)"
 fi
 
 log "Step 1e: the 3-node cluster up..."
@@ -401,7 +402,8 @@ fi
 # ===========================================================================
 # The functional legs.
 # ===========================================================================
-# Seed = a node that is neither the partition-3 leader (killed at ~30 %) nor the node bounced at ~60 %.
+# Seed = a node that is neither the partition-3 leader (killed at ~30 %) nor the node bounced at ~60 % (which may lead
+# partition 3 by then: the bounce is extra stress, not a non-leader restart).
 LEADER3=$(partition_leader "${TOPIC_ID}" 3) || fail "no leader for player_event partition 3"
 SEED_NODE=$(( (LEADER3 + 1) % 3 + 1 ))
 BOUNCE=$(( (LEADER3 + 2) % 3 ))     # node id 0-2: neither the leader of partition 3 nor the seed (SEED_NODE - 1)
@@ -439,7 +441,7 @@ log "Step 3a: ~30 % - docker kill of the leader of partition 3..."
 wait_progress $(( (N + 40) * 30 / 100 )) "step 3a"
 pl=$(partition_leader "${TOPIC_ID}" 3) || fail "step 3a: no leader for partition 3"
 at=$(progress)
-log "  partition 3 leader = node ${pl} (rune-$(( pl + 1 ))) at ${at} acked records; docker kill"
+log "  partition 3 leader = node ${pl} (rune-$(( pl + 1 ))), consensus leader / group coordinator = node $(consensus_leader || echo unknown), at ${at} acked records; docker kill"
 kill_node "${pl}"
 wait_resume "${at}" "step 3a"
 log "  progress resumed ($(progress) records); restarting rune-$(( pl + 1 ))"

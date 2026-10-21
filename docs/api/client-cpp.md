@@ -306,7 +306,7 @@ SubscriptionSet world = client.subscribe(events, AllPartitions{}, o,
   the same filter.
 - **Refusals.** The broker answers a filter it cannot serve explicitly, never by sending everything: the subscription
   ends `RejectedByBroker` with `brokerErrorCode() == 39` (InvalidRequest), and the reason reaches `onError` as
-  `subscribe topic <id> partition <p> refused: InvalidRequest: <detail>`:
+  `subscribe topic <id> partition <p> refused: InvalidRequest (39): <detail>`:
 
   | Detail | Cause |
   |---|---|

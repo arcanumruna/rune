@@ -7,6 +7,7 @@
 #include "player_event.gen.h"
 
 #include <rune/client/Client.h>
+#include <rune/protocol/RecordBatch.h>
 
 #include <gtest/gtest.h>
 
@@ -65,6 +66,61 @@ TEST(SubscriptionSet, HandlerSeesEachRecordsPartition) {
     EXPECT_EQ(seen, (std::vector<int32_t>{0, 1, 2, 3}));
     for (int32_t p = 0; p < kParts; ++p) EXPECT_EQ(set.position(p), 1);
     EXPECT_GT(set.batchBytes(), 0u);
+}
+
+namespace {
+std::vector<uint8_t> batchOf(int64_t base, int records) {
+    rune::protocol::RecordBatchBuilder b(base, 1000);
+    for (int i = 0; i < records; ++i) b.append("k", std::string(20 + i, 'v'), 1000);
+    return b.build();
+}
+} // namespace
+
+TEST(SubscriptionSet, BatchBytesIsTheExactSumOverThePartitions) {
+    SetRig r(4410);
+    r.connect();
+    std::size_t delivered = 0;
+    auto set = r.client.subscribe(fourPartitions(r.client), rc::AllPartitions{}, {}, [&](const rc::Record&) { ++delivered; });
+    ASSERT_TRUE(r.drive([&] { return set.active() && r.gw.subscribed.size() == static_cast<std::size_t>(kParts); }));
+    uint64_t want = 0;
+    std::size_t records = 0;
+    for (const auto& s : r.gw.subscribed) {
+        const int n = 1 + s.partition;   // a different size per partition
+        const auto b = batchOf(0, n);
+        want += b.size();
+        records += static_cast<std::size_t>(n);
+        r.gw.pushBatch(s, 0, b);
+    }
+    ASSERT_TRUE(r.drive([&] { return delivered == records; }));
+    r.passes(20);
+    EXPECT_EQ(set.batchBytes(), want);
+    uint64_t sum = 0;
+    for (int32_t p = 0; p < kParts; ++p) sum += set[p].batchBytes();
+    EXPECT_EQ(sum, want);
+}
+
+TEST(SubscriptionSetRegression, BatchBytesOfAHandleThatDoesNotReadConvergesRegression) {
+    // The status ring is small (about a dozen snapshots): a handle that never reads while many frames arrive makes the
+    // duty side refuse publishes (dirty).  Phase 2c Task 17 fix round 1 (I1): the first read after that drained a
+    // STALE snapshot (the scenario's bytes undercount).  One read frees the ring, the next duty pass republishes.
+    SetRig r(4412);
+    r.connect();
+    std::size_t delivered = 0;
+    auto set = r.client.subscribe(fourPartitions(r.client), rc::AllPartitions{}, {}, [&](const rc::Record&) { ++delivered; });
+    ASSERT_TRUE(r.drive([&] { return set.active() && r.gw.subscribed.size() == static_cast<std::size_t>(kParts); }));
+    const auto s0 = r.gw.subscribed[0];
+    uint64_t want = 0;
+    constexpr int kFrames = 200;
+    for (int i = 0; i < kFrames; ++i) {
+        const auto b = batchOf(i, 1);
+        want += b.size();
+        r.gw.pushBatch(s0, i, b);
+        r.passes(1);            // no read of the handle in between
+    }
+    ASSERT_TRUE(r.drive([&] { return delivered == static_cast<std::size_t>(kFrames); }));
+    (void)set[s0.partition].batchBytes();   // the drain frees the ring ...
+    r.passes(20);                           // ... the duty side republishes the dirty snapshot
+    EXPECT_EQ(set[s0.partition].batchBytes(), want);
 }
 
 TEST(SubscriptionSet, UnsubscribeEndsEveryPartition) {

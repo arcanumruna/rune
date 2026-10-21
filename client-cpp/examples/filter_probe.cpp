@@ -355,6 +355,7 @@ struct Sink {
     std::map<int64_t, int>      seen;
     std::size_t                 covered = 0;
     int64_t                     emptySeen = 0;
+    int64_t                     rewinds = 0;         // group only: records at or below the partition's highest seq seen
     int64_t                     records = 0;
     std::map<int32_t, int64_t>  lastSeq;
     std::vector<std::string>    bad;
@@ -388,7 +389,11 @@ struct Sink {
                  std::to_string(d.playerId) + ")");
         if (partition != e.part || parts.count(partition) == 0)
             note("seq " + std::to_string(d.seq) + " arrived on partition " + std::to_string(partition));
-        if (!group) {
+        if (group) {   // at-least-once: a rewind is allowed, but only as many as there were assignments (checked by the caller)
+            auto it = lastSeq.find(partition);
+            if (it != lastSeq.end() && d.seq <= it->second) ++rewinds;
+            lastSeq[partition] = std::max(d.seq, it == lastSeq.end() ? d.seq : it->second);
+        } else {
             auto it = lastSeq.find(partition);
             if (it != lastSeq.end() && d.seq <= it->second) note("seq " + std::to_string(d.seq) + " out of order on partition " + std::to_string(partition));
             lastSeq[partition] = std::max(d.seq, it == lastSeq.end() ? d.seq : it->second);
@@ -558,7 +563,7 @@ void sendRecord(const Ev& e, Send&& send) {
 
 int runProduce(const Env& env) {
     const long durationS = envInt("FILTER_E2E_DURATION_S", 0);
-    const long rate      = envInt("FILTER_E2E_RATE", 2000);
+    const long rate      = envInt("FILTER_E2E_RATE", 1000);
     const std::string progressFile = envStr("FILTER_E2E_PROGRESS_FILE");
     Client c(makeConfig(env, 0));
     c.connectAndWait();
@@ -706,6 +711,9 @@ int runConsume(const Env& env) {
     };
     GroupConsumer gc1 = g1c.subscribeGroup("worlds-9", {kTopicName}, gcfg);
     GroupConsumer gc2 = g2c.subscribeGroup("worlds-9", {kTopicName}, gcfg);
+    int assignEvents = 0;   // onAssigned calls of both members: every one is a generation a redelivery may follow
+    gc1.onAssigned([&assignEvents](std::vector<TopicPartition>) { ++assignEvents; });
+    gc2.onAssigned([&assignEvents](std::vector<TopicPartition>) { ++assignEvents; });
     gc1.onRecords(onGroupRecords);
     gc2.onRecords(onGroupRecords);
     const Clients cs{&plain, &g1c, &g2c};
@@ -787,6 +795,12 @@ int runConsume(const Env& env) {
             ++violations;
             fail("FILTER-CONSUME", h.sink->label + " partition " + std::to_string(h.part) + ": position " + std::to_string(h.cur->position()) + " short of the end");
         }
+    }
+    // M2: a group may rewind (at-least-once) only after a generation change: no more rewinding partitions than assignments.
+    std::printf("FILTER-CONSUME: group worlds-9 assignments=%d rewound-records=%lld duplicates-allowed-only-after-an-assignment\n", assignEvents, static_cast<long long>(sd.rewinds));
+    if (sd.rewinds > 0 && assignEvents <= 2) {
+        ++violations;
+        fail("FILTER-CONSUME", "group worlds-9 redelivered " + std::to_string(sd.rewinds) + " records without a rebalance (assignments " + std::to_string(assignEvents) + ")");
     }
     int resubs = 0;
     for (const PartHandle& h : handles) resubs += h.resubs;
@@ -889,6 +903,10 @@ int runErrors(const Env& env) {
                 expectRefused(*s, "E8", "filter capacity");
                 if (!errs.has("RUNE_FILTER_MAX_SUBS_PER_PARTITION")) { ++bad; fail(tag, "E8: the detail does not name the knob: " + errs.all()); }
                 std::printf("%s E8 refused after %zu admitted (cap %d)\n", tag, subs.size(), cap);
+                // Earlier legs' filtered subscriptions on partition 0 (a, b, c, d) may still count until their sessions are reaped.
+                constexpr int kSlack = 4;
+                const int admitted = static_cast<int>(subs.size());
+                if (admitted > cap || admitted < cap - kSlack) { ++bad; fail(tag, "E8: refused after " + std::to_string(admitted) + " admitted, the cap is " + std::to_string(cap) + " (slack " + std::to_string(kSlack) + ")"); }
             }
             subs.push_back(std::move(s));
         }
@@ -1033,7 +1051,8 @@ struct World {
     bool     measuring = false;
     int64_t  records = 0, foreign = 0;
     std::vector<uint32_t> latUs;
-    std::size_t oneRecordBytes = 0;     // a one-record batch of this world's record shape (the ideal per record)
+    std::size_t oneRecordBytes = 0;
+    std::size_t keyValueBytes = 0;      // key + value of one record: the physical floor of a delivered record's bytes     // a one-record batch of this world's record shape (the ideal per record)
     std::optional<SubscriptionSet> set;
     uint64_t bytesAtStart = 0;
 };
@@ -1065,6 +1084,7 @@ int runWorld(const Env& env) {
             if (ev.worldId != wp->id) { if (!wp->unfiltered) ++wp->foreign; return; }
             if (!wp->measuring) return;
             ++wp->records;
+            if (wp->keyValueBytes == 0) wp->keyValueBytes = r.key.size() + r.value.size();
             if (wp->oneRecordBytes == 0) {
                 rune::protocol::RecordBatchBuilder b(0, 0);
                 b.append(std::string_view(reinterpret_cast<const char*>(r.key.data()), r.key.size()),
@@ -1085,13 +1105,31 @@ int runWorld(const Env& env) {
     };
     if (!pumpUntil({&c}, bound, 120)) { fail(tag, "the subscriptions never all bound"); return 1; }
     for (auto& w : worlds) if (w->set->finished()) { fail(tag, "world " + std::to_string(w->id) + ": a subscription ended"); return 1; }
-    pumpFor({&c}, 2000);   // settle: the first batches
+    // SubscriptionStatus reaches the handle through a small ring: a handle that does not read lets it fill, and the next read
+    // then returns a stale snapshot (the cause of the first scenario's bytes undercount).  Reading every set often keeps
+    // the snapshot fresh, and the final value is read after unsubscribing (the final snapshot is exact).
+    auto pumpReading = [&](int ms) {
+        auto nextRead = Clock::now();
+        for (const auto dl = Clock::now() + std::chrono::milliseconds(ms); Clock::now() < dl;) {
+            pumpAll({&c});
+            if (Clock::now() >= nextRead) {
+                for (auto& w : worlds) (void)w->set->batchBytes();
+                nextRead = Clock::now() + std::chrono::milliseconds(20);
+            }
+        }
+    };
+    pumpReading(2000);   // settle: the first batches
+    pumpReading(100);    // the reads above freed the rings; let the duty side republish its dirty snapshots
     for (auto& w : worlds) { w->measuring = true; w->bytesAtStart = w->set->batchBytes(); w->records = 0; w->latUs.clear(); }
     std::printf("FILTER-WORLD: READY worlds=%d\n", count);
     std::fflush(stdout);
-    pumpFor({&c}, static_cast<int>(secs * 1000));
-    for (auto& w : worlds) w->measuring = false;
+    pumpReading(static_cast<int>(secs * 1000));
+    int endedEarly = 0;
+    for (auto& w : worlds) if (w->set->finished()) ++endedEarly;
+    for (auto& w : worlds) { w->measuring = false; w->set->unsubscribe(); }
+    pumpUntil({&c}, [&] { for (auto& w : worlds) if (!w->set->finished()) return false; return true; }, 60);
     int bad = 0;
+    if (endedEarly != 0) { ++bad; fail(tag, std::to_string(endedEarly) + " world servers had a subscription end during the run"); }
     for (auto& w : worlds) {
         std::sort(w->latUs.begin(), w->latUs.end());
         auto pct = [&](double q) { return w->latUs.empty() ? 0.0 : static_cast<double>(w->latUs[std::min(w->latUs.size() - 1, static_cast<std::size_t>(q * static_cast<double>(w->latUs.size())))]); };
@@ -1101,8 +1139,12 @@ int runWorld(const Env& env) {
                     pct(0.50), pct(0.99));
         if (w->foreign != 0) { ++bad; fail(tag, "world " + std::to_string(w->id) + ": " + std::to_string(w->foreign) + " foreign records reached a filtered subscription"); }
         if (w->records == 0) { ++bad; fail(tag, "world " + std::to_string(w->id) + ": no records"); }
+        // The physical floor: every delivered record carries at least its key and value.
+        if (bytes < static_cast<uint64_t>(w->records) * w->keyValueBytes) {
+            ++bad;
+            fail(tag, "world " + std::to_string(w->id) + ": " + std::to_string(bytes) + " batch bytes for " + std::to_string(w->records) + " records of at least " + std::to_string(w->keyValueBytes) + " bytes: the bytes are undercounted");
+        }
     }
-    for (auto& w : worlds) if (w->set->finished()) { ++bad; fail(tag, "world " + std::to_string(w->id) + ": a subscription ended during the run"); }
     std::printf("FILTER-WORLD: %s\n", bad == 0 ? "OK" : "FAIL");
     std::fflush(stdout);
     return bad == 0 ? 0 : 1;
