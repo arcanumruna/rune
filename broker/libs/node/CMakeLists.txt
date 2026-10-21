@@ -1426,6 +1426,24 @@ if(BUILD_TESTING)
             PROPERTIES TIMEOUT 600
             ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
         rune_regression_batches(rune_worker_filter_matrix_tests 4 TIMEOUT 900 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
+        # Phase 2c Task 16 (hard rule 4): 10,000 steady-state filtered batches (50 filtered members + 1 unfiltered, mixed
+        # matches and position notes) allocate nothing on the worker thread.  AllocWindow.cpp replaces the global
+        # operator new (binary-wide) - own binary, like the catalog's.
+        add_executable(rune_filter_alloc_regression_tests
+            tests/node/FilterAllocRegressionTest.cpp
+            tests/support/AllocWindow.cpp)
+        target_include_directories(rune_filter_alloc_regression_tests PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests
+            ${RUNE_CLIENT_ROOT}/examples)
+        target_link_libraries(rune_filter_alloc_regression_tests PRIVATE
+            rune_node
+            rune_codec
+            aeron::aeron
+            GTest::gtest_main)
+        gtest_discover_tests(rune_filter_alloc_regression_tests
+            PROPERTIES TIMEOUT 300
+            ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
     endif()
 
     # ---------------------------------------------------------------------------

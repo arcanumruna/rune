@@ -546,8 +546,11 @@ if(BUILD_BENCHMARKS)
         benchmark/CatalogHotPathBench.cpp
         benchmark/AuthCheckBench.cpp
         benchmark/PeerFrameBench.cpp
-        benchmark/RebalanceFailoverBench.cpp)
+        benchmark/RebalanceFailoverBench.cpp
+        benchmark/FilterPushBench.cpp)
     target_include_directories(rune_broker_benchmark PRIVATE ${RUNE_PROTOCOL_INCLUDE})
+    # FilterPushBench reuses the filter test fakes (player_event rows and batches) and the shared example schema.
+    target_include_directories(rune_broker_benchmark PRIVATE ${RUNE_CLIENT_ROOT}/examples)
     # FusedRuntimePassBench drives a real broker with the shard tests' wire client.
     target_include_directories(rune_broker_benchmark PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/libs/node/tests/support)
     target_link_libraries(rune_broker_benchmark PRIVATE rune_storage rune_consensus rune_replication rune_coordination rune_transaction rune_gateway rune_node rune_metadata_msm rune_dynamic_balancer rune_view benchmark::benchmark)

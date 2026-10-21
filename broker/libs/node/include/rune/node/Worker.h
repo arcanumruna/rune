@@ -2802,6 +2802,7 @@ private:
                 if (!std::holds_alternative<SubUnfiltered>(s.filter)) [[unlikely]] unbindFilter_(si);   // re-Subscribe: drop the old member first
                 if (!filterBindErrors_.empty() && filterBindErrors_.erase(subId) != 0) [[unlikely]]
                     s.pushState = WorkerSubscription::PushState::Live;   // a failed bind is retried by a new request
+                pushListDirty_ = true;
                 s.sessionId            = op.sessionId();
                 s.subscribeCorrId      = op.correlationId();
                 s.topicId              = op.topicId();
@@ -2839,6 +2840,7 @@ private:
         s.incarnation          = op.incarnation();
         s.rc                   = rcOf_(subReplica_(s));
         subs_.push_back(s);
+        pushListDirty_ = true;
         if (hasFilter) [[unlikely]] bindFilter_(subs_.size() - 1, filterTail);
     }
 
@@ -3047,6 +3049,7 @@ private:
             return;
         }
         s.filter = SubFiltered{gi, m};
+        pushListDirty_ = true;
     }
 
     /// Cold: the subscription cannot be served filtered.  Counted, logged, parked, and ONE ErrorResponse{InvalidRequest}
@@ -3060,6 +3063,7 @@ private:
         s.filter = SubUnfiltered{};
         filterBytes_.erase(s.subscriptionId);   // nothing will recompile it
         s.pushState = WorkerSubscription::PushState::ErrorOwed;
+        pushListDirty_ = true;
         filterBindErrors_[s.subscriptionId] = std::string(reason.substr(0, 160));
         (void)trySendFilterBindError_(s);
     }
@@ -3094,6 +3098,7 @@ private:
         }
         if (r <= 0) return false;
         s.pushState = WorkerSubscription::PushState::Failed;
+        pushListDirty_ = true;
         filterBindErrors_.erase(it);
         return true;
     }
@@ -3121,6 +3126,7 @@ private:
             if (filterGroups_[fl.group].empty()) releaseFilterGroup_(fl.group);
         }
         s.filter = SubUnfiltered{};
+        pushListDirty_ = true;
     }
     /// Cold: the subscription is going away or being re-bound from a new request (re-Subscribe, Unsubscribe, egress
     /// release): it leaves its group and every piece of filter state it owns is forgotten.
@@ -3141,6 +3147,7 @@ private:
 
     /// The ONE removal path: swap-and-pop, and the element moved into slot i is re-pointed in its group.
     void eraseSub_(std::size_t i) {
+        pushListDirty_ = true;
         if (!std::holds_alternative<SubUnfiltered>(subs_[i].filter)) [[unlikely]] unbindFilter_(i);
         else if (!filterBindErrors_.empty() || !filterBytes_.empty()) [[unlikely]] forgetFilterState_(subs_[i]);
         const std::size_t last = subs_.size() - 1;
@@ -3251,6 +3258,7 @@ private:
                           "the egress maxMessageLength {} B - MessageTooLarge, subscription parked", workerId_, s.subscriptionId,
                           s.topicId, s.partition, baseOffset, rec.encodedSize(), pub->maxMessageLength());
             s.pushState      = WorkerSubscription::PushState::ErrorOwed;
+            pushListDirty_   = true;   // the unfiltered pass must now visit it (the owed error)
             s.failedFrameLen = rec.encodedSize();
             (void)sendPushTooLarge_(s, pub, sealPtr, baseOffset);
             return filter::SendOutcome::TooLarge;
@@ -3392,7 +3400,28 @@ private:
         return 1;
     }
 
-    int pushOwnedSubscriptions_(int64_t /*nowNs*/) {
+    /// The unfiltered push pass.  With no filtered group it walks every subscription (the pre-2c loop); with one it walks
+    /// pushList_ - the subscriptions this pass must look at (unfiltered ones, and filtered ones that are not Live: an owed
+    /// error) - so idle FILTERED subscribers cost it nothing and the push cost stays flat in their number (Task 16).
+    int pushOwnedSubscriptions_(int64_t nowNs) {
+        if (filterGroupByKey_.empty()) [[likely]] return pushOwnedSubscriptionsImpl_<false>(nowNs);
+        if (pushListDirty_) [[unlikely]] rebuildPushList_();
+        return pushOwnedSubscriptionsImpl_<true>(nowNs);
+    }
+    /// Cold-ish (a subscription was added / removed / re-bound, or a filtered one changed push state): O(subscriptions).
+    /// The capacity follows subs_.capacity(), so a steady-state rebuild never allocates.
+    void rebuildPushList_() {
+        pushListDirty_ = false;
+        if (pushList_.capacity() < subs_.capacity()) pushList_.reserve(subs_.capacity());
+        pushList_.clear();
+        for (std::size_t i = 0; i < subs_.size(); ++i) {
+            const auto& s = subs_[i];
+            if (std::holds_alternative<SubUnfiltered>(s.filter) || s.pushState != WorkerSubscription::PushState::Live)
+                pushList_.push_back(static_cast<uint32_t>(i));
+        }
+    }
+    template <bool Listed>
+    int pushOwnedSubscriptionsImpl_(int64_t /*nowNs*/) {
         using namespace rune::protocol::batch;
         namespace pc = rune::protocol::client;
         if (subs_.empty()) return 0;
@@ -3401,12 +3430,13 @@ private:
         // F5: bounded per pass (kPushPassBudgetBytes, shared with PushRead
         // answers) and fair — the walk starts at the subscription the budget
         // ran out on last pass.
-        const std::size_t nSubs = subs_.size();
+        const std::size_t nSubs = Listed ? pushList_.size() : subs_.size();   // the rotor is a position in the walked sequence
         if (pushRotor_ >= nSubs) pushRotor_ = 0;
         for (std::size_t k = 0; k < nSubs; ++k) {
-            const std::size_t si = (pushRotor_ + k) % nSubs;
+            const std::size_t lp = (pushRotor_ + k) % nSubs;
+            const std::size_t si = Listed ? pushList_[lp] : lp;
             auto& s = subs_[si];
-            if (pushBudgetLeft_ == 0) { pushRotor_ = si; break; }
+            if (pushBudgetLeft_ == 0) { pushRotor_ = lp; break; }
             if (!s.active) continue;   // parked: partition moved away (E2: the source is resolved below)
 
             // Hybrid egress: prefer this consumer's UNICAST pub (independent
@@ -3524,7 +3554,7 @@ private:
                 // F5: never past this pass's budget, except the one batch a pass
                 // that pushed nothing yet must take (progress).
                 if (batchSize > pushBudgetLeft_ && !(freshPass && pushed == 0)) {
-                    pushRotor_ = si;
+                    pushRotor_ = lp;
                     pushBudgetLeft_ = 0;
                     break;
                 }
@@ -5440,6 +5470,8 @@ private:
         ReplReadScope(const ReplReadScope&) = delete;
         ReplReadScope& operator=(const ReplReadScope&) = delete;
     };
+    std::vector<uint32_t>                 pushList_;          ///< Phase 2c: the subscriptions the unfiltered pass walks once a filtered group exists
+    bool                                  pushListDirty_ = true;   ///< pushList_ is stale: rebuilt at the next pass
     std::size_t                           pushRotor_ = 0;   ///< in-worker push: first sub served next pass
     uint64_t                              pushReadChunks_ = 0, pushReadBytes_ = 0, pushReadsDeferred_ = 0;
 
