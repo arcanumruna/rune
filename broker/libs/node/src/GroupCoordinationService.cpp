@@ -936,18 +936,42 @@ bool GroupCoordinationService::staleLineage_(const rune::coordination::Committed
 // ---------------------------------------------------------------------------
 // applyTransactionalOffset - an offset of a committed transaction (see the header).
 // ---------------------------------------------------------------------------
-bool GroupCoordinationService::applyTransactionalOffset(const std::string& group, const coord::TopicPartition& tp,
-                                                        int64_t offset, int64_t nowNs)
+coord::TxnOffsetApply GroupCoordinationService::applyTransactionalOffset(const std::string& group,
+                                                                         const coord::TopicPartition& tp,
+                                                                         int64_t offset, int64_t nowNs)
 {
-    if (offsets_ == nullptr || !isLocalCoordinator() || !offsetsLoaded_()) return false;
+    using R = coord::TxnOffsetApply;
+    if (offsets_ == nullptr || !isLocalCoordinator() || !offsetsLoaded_()) return R::Refused;
     uint64_t lineage = 0;
     if (topics_ != nullptr) {
         if (const auto id = topics_->topicIdForName(tp.topic)) {
             lineage = lineageOf_(*id, tp.partition);   // C1: 0 for a disk partition
-            if (lineage == kLineagePending) return false;
+            if (lineage == kLineagePending) return R::Refused;
         }
     }
-    return offsets_->commit(group, tp, offset, {}, nowNs, lineage);
+    const rune::replication::PartitionReplica* r = offsets_->replica();
+    if (r == nullptr) return offsets_->commit(group, tp, offset, {}, nowNs, lineage) ? R::Applied : R::Refused;
+    // #358: Applied only once the record is COMMITTED (HW past it); a pending record is waited on, not re-appended -
+    // unless the replica's leadership or log changed under it (it may be gone): then it is appended again.
+    const uint64_t leadGen = r->leadershipGeneration(), logGen = r->logGeneration();
+    TxnOffsetKey key{group, tp.topic, tp.partition, offset};
+    if (auto it = txnOffsetsInFlight_.find(key); it != txnOffsetsInFlight_.end()) {
+        if (it->second.leadershipGen == leadGen && it->second.logGen == logGen) {
+            if (r->highWatermark() <= it->second.recordOffset) return R::Replicating;
+            txnOffsetsInFlight_.erase(it);
+            return R::Applied;
+        }
+        txnOffsetsInFlight_.erase(it);
+    }
+    // Entries of an earlier generation are never asked about again (their transaction re-drives with a fresh append).
+    std::erase_if(txnOffsetsInFlight_, [&](const auto& e) {
+        return e.second.leadershipGen != leadGen || e.second.logGen != logGen;
+    });
+    const int64_t at = offsets_->commitAt(group, tp, offset, {}, nowNs, lineage);
+    if (at < 0) return R::Refused;
+    if (r->highWatermark() > at) return R::Applied;
+    txnOffsetsInFlight_.emplace(std::move(key), TxnOffsetInFlight{at, leadGen, logGen});
+    return R::Replicating;
 }
 
 // ---------------------------------------------------------------------------

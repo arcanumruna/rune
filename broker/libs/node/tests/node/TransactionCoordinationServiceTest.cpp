@@ -655,13 +655,18 @@ struct RefusingSink {
     int calls    = 0;
     int accepted = 0;
     std::vector<int64_t> acceptedOffsets;
-    static bool apply(void* ctx, const std::string&, const rune::coordination::TopicPartition&, int64_t offset, int64_t) {
+    int replicating = 0;       ///< #358: then answer Replicating this many times before Applied
+    std::vector<int64_t> offered;
+    static rune::coordination::TxnOffsetApply apply(void* ctx, const std::string&, const rune::coordination::TopicPartition&,
+                                                    int64_t offset, int64_t) {
         auto* s = static_cast<RefusingSink*>(ctx);
         ++s->calls;
-        if (s->refusals > 0) { --s->refusals; return false; }
+        s->offered.push_back(offset);
+        if (s->refusals > 0) { --s->refusals; return rune::coordination::TxnOffsetApply::Refused; }
+        if (s->replicating > 0) { --s->replicating; return rune::coordination::TxnOffsetApply::Replicating; }
         ++s->accepted;
         s->acceptedOffsets.push_back(offset);
-        return true;
+        return rune::coordination::TxnOffsetApply::Applied;
     }
 };
 }  // namespace
@@ -736,6 +741,146 @@ TEST_F(TransactionCoordinationServiceTest, RefusedOffsetApplyKeepsPrepareCommitA
     now += 1'100'000'000;
     (void)svc_->doWork(now);
     EXPECT_EQ(sink.accepted, 1);
+}
+
+// ===========================================================================
+// #358: CompleteCommit waits until every committed offset record is COMMITTED on the offsets replica.  While the
+// sink answers Replicating the transaction stays PrepareCommit (nothing persisted, EndTxn not answered) and the
+// completion is re-checked on the very next doWork (a replication wait, not a refusal: no backoff); every offset is
+// offered on every pass, so they replicate together.
+// ===========================================================================
+TEST_F(TransactionCoordinationServiceTest, CompleteCommitWaitsUntilTheOffsetRecordsAreCommittedRegression) {
+    RefusingSink sink;
+    sink.replicating = 4;   // the two offsets answer Replicating on two passes, then Applied
+    svc_->setTxnOffsetSink(&RefusingSink::apply, &sink);
+    svc_->setAppendFnOverride([](std::string_view, int32_t, std::span<const uint8_t>) -> int64_t { return 0; });
+
+    const std::string txn = "txnOffsetHw";
+    std::size_t reqLen = encodeInitProducerId(reqBuf_.data(), reqBuf_.size(), 1, 1, 30'000, txn);
+    std::size_t outLen = svc_->handleInitProducerId(reqBuf_.data(), reqLen, 0, outBuf_.data(), outBuf_.size());
+    auto init = pc::InitProducerIdResponse::decode(outBuf_.data(), outLen);
+    ASSERT_TRUE(init);
+    const int64_t pid = init->producerId;
+    const int16_t ep  = init->producerEpoch;
+    const std::vector<pc::TxnTopicPartition> parts = {{0, 0}};
+    reqLen = encodeAddPartitions(reqBuf_.data(), reqBuf_.size(), 1, 2, pid, ep, txn, parts);
+    ASSERT_GT(svc_->handleAddPartitions(reqBuf_.data(), reqLen, 0, outBuf_.data(), outBuf_.size()), 0u);
+    const std::string grp = "cg-hw";
+    pc::AddOffsetsToTxn add;
+    add.sessionId = 1; add.correlationId = 3; add.producerId = pid; add.producerEpoch = ep;
+    add.transactionalId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(txn.data()), txn.size());
+    add.groupId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(grp.data()), grp.size());
+    reqLen = add.encode(reqBuf_.data());
+    ASSERT_GT(svc_->handleAddOffsets(reqBuf_.data(), reqLen, 0, outBuf_.data(), outBuf_.size()), 0u);
+    pc::TxnOffsetCommit toc;
+    toc.sessionId = 1; toc.correlationId = 4; toc.producerId = pid; toc.producerEpoch = ep;
+    toc.transactionalId = add.transactionalId;
+    toc.groupId = add.groupId;
+    const std::vector<pc::TxnOffsetCommitEntry> entries = {{0, 0, 42, {}}, {0, 1, 43, {}}};
+    reqLen = toc.encode(reqBuf_.data(), entries);
+    ASSERT_GT(svc_->handleTxnOffsetCommit(reqBuf_.data(), reqLen, 0, outBuf_.data(), outBuf_.size()), 0u);
+
+    reqLen = encodeEndTxn(reqBuf_.data(), reqBuf_.size(), 1, 5, pid, ep, /*commit=*/true, txn);
+    (void)svc_->handleEndTxn(reqBuf_.data(), reqLen, 0, outBuf_.data(), outBuf_.size());
+    ASSERT_EQ(svc_->txnStateForTest(txn), tx::TxnState::PrepareCommit);
+    // The rig has no gateway: a coordinator that loads the durable PrepareCommit re-drives its markers through the
+    // append seam (outstanding until they land), exactly the re-drive path of a failover.
+    svc_ = std::make_unique<rune::node::TransactionCoordinationService>(
+        txnStore_.get(), /*topics=*/nullptr, [this] { return isLeader_; }, [this] { return leaderNodeId_; });
+    svc_->setTxnOffsetSink(&RefusingSink::apply, &sink);
+    svc_->setAppendFnOverride([](std::string_view, int32_t, std::span<const uint8_t>) -> int64_t { return 0; });
+    // The rig has no gateway: a coordinator that loads the durable PrepareCommit re-drives its markers through the
+    // append seam (outstanding until they land), exactly the re-drive path of a failover.
+    svc_ = std::make_unique<rune::node::TransactionCoordinationService>(
+        txnStore_.get(), /*topics=*/nullptr, [this] { return isLeader_; }, [this] { return leaderNodeId_; });
+    svc_->setTxnOffsetSink(&RefusingSink::apply, &sink);
+    svc_->setAppendFnOverride([](std::string_view, int32_t, std::span<const uint8_t>) -> int64_t { return 0; });
+    int64_t now = 1'000'000'000;
+    (void)svc_->doWork(now);
+    ASSERT_EQ(svc_->awaitingMarkerTxnsForTest(), 1u);
+    svc_->onControlMarkerLanded(0, 0, pid, rune::gateway::ITxnRequestHandler::kAnyCoordinatorEpoch);
+
+    // Pass 1 (the landing marker) and pass 2 (the next doWork, 1 us later): both offsets offered, Replicating.
+    EXPECT_EQ(sink.offered, (std::vector<int64_t>{42, 43})) << "every offset is offered on the first pass";
+    EXPECT_EQ(svc_->txnStateForTest(txn), tx::TxnState::PrepareCommit) << "never CompleteCommit before the offsets commit";
+    EXPECT_EQ(svc_->transactionsCompletedForTest(), 0u);
+    EXPECT_EQ(svc_->awaitingMarkerTxnsForTest(), 1u);
+    now += 1'000;
+    (void)svc_->doWork(now);
+    EXPECT_EQ(sink.offered.size(), 4u) << "re-checked on the very next doWork, no backoff";
+    EXPECT_EQ(svc_->txnStateForTest(txn), tx::TxnState::PrepareCommit);
+    EXPECT_EQ(svc_->transactionsCompletedForTest(), 0u);
+    // Pass 3: committed.
+    now += 1'000;
+    (void)svc_->doWork(now);
+    EXPECT_EQ(sink.acceptedOffsets, (std::vector<int64_t>{42, 43}));
+    EXPECT_EQ(svc_->txnStateForTest(txn), tx::TxnState::CompleteCommit);
+    EXPECT_EQ(svc_->transactionsCompletedForTest(), 1u);
+    EXPECT_EQ(svc_->awaitingMarkerTxnsForTest(), 0u);
+    EXPECT_EQ(svc_->txnOffsetReplicationWaits(), 2u);
+    EXPECT_EQ(svc_->txnOffsetApplyRetries(), 0u) << "a replication wait is not a refusal";
+    now += 1'100'000'000;
+    (void)svc_->doWork(now);
+    EXPECT_EQ(sink.calls, 6) << "nothing re-applies a completed commit";
+}
+
+// #358: a refusal met on a pass after replication waits backs off like any refusal; the commit still completes only
+// once every offset is Applied.
+TEST_F(TransactionCoordinationServiceTest, ARefusalAfterReplicationWaitsBacksOffAndStillWaitsForCommitRegression) {
+    RefusingSink sink;
+    sink.replicating = 1;
+    svc_->setTxnOffsetSink(&RefusingSink::apply, &sink);
+    svc_->setAppendFnOverride([](std::string_view, int32_t, std::span<const uint8_t>) -> int64_t { return 0; });
+    const std::string txn = "txnOffsetHw2";
+    std::size_t reqLen = encodeInitProducerId(reqBuf_.data(), reqBuf_.size(), 1, 1, 30'000, txn);
+    std::size_t outLen = svc_->handleInitProducerId(reqBuf_.data(), reqLen, 0, outBuf_.data(), outBuf_.size());
+    auto init = pc::InitProducerIdResponse::decode(outBuf_.data(), outLen);
+    ASSERT_TRUE(init);
+    const int64_t pid = init->producerId;
+    const int16_t ep  = init->producerEpoch;
+    const std::vector<pc::TxnTopicPartition> parts = {{0, 0}};
+    reqLen = encodeAddPartitions(reqBuf_.data(), reqBuf_.size(), 1, 2, pid, ep, txn, parts);
+    ASSERT_GT(svc_->handleAddPartitions(reqBuf_.data(), reqLen, 0, outBuf_.data(), outBuf_.size()), 0u);
+    const std::string grp = "cg-hw2";
+    pc::AddOffsetsToTxn add;
+    add.sessionId = 1; add.correlationId = 3; add.producerId = pid; add.producerEpoch = ep;
+    add.transactionalId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(txn.data()), txn.size());
+    add.groupId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(grp.data()), grp.size());
+    reqLen = add.encode(reqBuf_.data());
+    ASSERT_GT(svc_->handleAddOffsets(reqBuf_.data(), reqLen, 0, outBuf_.data(), outBuf_.size()), 0u);
+    pc::TxnOffsetCommit toc;
+    toc.sessionId = 1; toc.correlationId = 4; toc.producerId = pid; toc.producerEpoch = ep;
+    toc.transactionalId = add.transactionalId;
+    toc.groupId = add.groupId;
+    const std::vector<pc::TxnOffsetCommitEntry> entries = {{0, 0, 7, {}}};
+    reqLen = toc.encode(reqBuf_.data(), entries);
+    ASSERT_GT(svc_->handleTxnOffsetCommit(reqBuf_.data(), reqLen, 0, outBuf_.data(), outBuf_.size()), 0u);
+    reqLen = encodeEndTxn(reqBuf_.data(), reqBuf_.size(), 1, 5, pid, ep, /*commit=*/true, txn);
+    (void)svc_->handleEndTxn(reqBuf_.data(), reqLen, 0, outBuf_.data(), outBuf_.size());
+    // The rig has no gateway: a coordinator that loads the durable PrepareCommit re-drives its markers through the
+    // append seam (outstanding until they land), exactly the re-drive path of a failover.
+    svc_ = std::make_unique<rune::node::TransactionCoordinationService>(
+        txnStore_.get(), /*topics=*/nullptr, [this] { return isLeader_; }, [this] { return leaderNodeId_; });
+    svc_->setTxnOffsetSink(&RefusingSink::apply, &sink);
+    svc_->setAppendFnOverride([](std::string_view, int32_t, std::span<const uint8_t>) -> int64_t { return 0; });
+    int64_t now = 1'000'000'000;
+    (void)svc_->doWork(now);
+    ASSERT_EQ(svc_->awaitingMarkerTxnsForTest(), 1u);
+    svc_->onControlMarkerLanded(0, 0, pid, rune::gateway::ITxnRequestHandler::kAnyCoordinatorEpoch);
+    ASSERT_EQ(sink.calls, 1);                                  // Replicating
+    sink.refusals = 1;                                         // the offsets leader moves away: Refused next
+    now += 1'000;
+    (void)svc_->doWork(now);
+    ASSERT_EQ(sink.calls, 2);
+    EXPECT_EQ(svc_->txnOffsetApplyRetries(), 1u);
+    now += 1'000;
+    (void)svc_->doWork(now);
+    EXPECT_EQ(sink.calls, 2) << "a refusal backs off (10 ms), it is not re-asked on the next microsecond";
+    EXPECT_EQ(svc_->txnStateForTest(txn), tx::TxnState::PrepareCommit);
+    now += 20'000'000;
+    (void)svc_->doWork(now);
+    EXPECT_EQ(sink.calls, 3);
+    EXPECT_EQ(svc_->txnStateForTest(txn), tx::TxnState::CompleteCommit);
 }
 
 // ===========================================================================

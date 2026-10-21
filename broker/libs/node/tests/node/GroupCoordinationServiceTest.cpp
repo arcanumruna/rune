@@ -1984,3 +1984,95 @@ TEST_F(MemberBindingTest, LeaveGroupTruncatedAtEveryOffsetAdversarialRegression)
     }
     EXPECT_EQ(heartbeat(1, "g-trunc", m.id, m.generation), kOk);
 }
+
+// ===========================================================================
+// #358: a COMMITTED transaction's offset is Applied only once the __consumer_offsets record is committed (the
+// offsets replica's high watermark passed it).  Until then Replicating - the transaction coordinator keeps the
+// transaction PrepareCommit and asks again - and asking again waits on the same record (never re-appends) unless
+// the offsets replica's leadership changed under it (the record may be gone): then it is appended again.
+// ===========================================================================
+TEST(TxnOffsetApplyRegression, ATransactionalOffsetIsAppliedOnlyOnceTheOffsetsRecordIsCommittedRegression) {
+    using rune::coordination::TxnOffsetApply;
+    TempDir dir("txnoff_hw"), topicDir("txnoff_hw_topics");
+    rune::storage::Log log(dir.path);
+    NullTransport transport;
+    // Leader 1 with follower 2 in the ISR: an acks-all append commits only once 2 has fetched it.
+    PartitionReplica rep(makeSingleNodeConfig(1, /*minIsr=*/1), Role::Leader, /*epoch=*/1,
+                         std::vector<NodeId>{1, 2}, std::vector<NodeId>{1, 2}, &log, &transport);
+    ReplicatedOffsetStore store(&rep);
+    rune::gateway::TopicRegistry registry(std::vector<TopicSpec>{makeTopicSpec(std::string(kTestTopic), 2, kTestTopicId)},
+                                          topicDir.path);
+    GroupCoordinationService svc(&store, &registry, [] { return true; }, [] { return NodeId{1}; });
+    int64_t clock = 0;
+    svc.doWork(clock);   // loads the (empty) offsets
+
+    const auto followerFetches = [&](int64_t upTo) {
+        FetchRequestMsg req{};
+        req.leaderEpoch = rep.epoch(); req.partition = 0; req.followerId = 2; req.fetchOffset = upTo;
+        req.maxBytes = 1 << 20; req.topicId = 0;
+        clock += 1'000'000;
+        (void)rep.onFetchRequest(req, clock);
+        rep.doWork(clock);
+    };
+
+    EXPECT_EQ(svc.applyTransactionalOffset("g", tp(std::string(kTestTopic), 0), 42, clock), TxnOffsetApply::Replicating)
+        << "appended, not committed: never Applied on the local append alone";
+    const auto leo = rep.logEndOffset();
+    ASSERT_EQ(rep.highWatermark(), 0);
+    EXPECT_EQ(svc.applyTransactionalOffset("g", tp(std::string(kTestTopic), 0), 42, clock), TxnOffsetApply::Replicating);
+    EXPECT_EQ(rep.logEndOffset(), leo) << "asking again waits on the record, it does not append another";
+    EXPECT_EQ(svc.txnOffsetsReplicating(), 1u);
+
+    followerFetches(leo);
+    ASSERT_GT(rep.highWatermark(), leo - 1) << "the follower has the record: committed";
+    EXPECT_EQ(svc.applyTransactionalOffset("g", tp(std::string(kTestTopic), 0), 42, clock), TxnOffsetApply::Applied);
+    EXPECT_EQ(svc.txnOffsetsReplicating(), 0u);
+    EXPECT_EQ(rep.logEndOffset(), leo);
+    ASSERT_TRUE(store.fetch("g", tp(std::string(kTestTopic), 0)).has_value());
+    EXPECT_EQ(store.fetch("g", tp(std::string(kTestTopic), 0))->offset, 42);
+
+    // A pending record whose leadership changes (it may be truncated away) is appended again by the new leadership.
+    EXPECT_EQ(svc.applyTransactionalOffset("g", tp(std::string(kTestTopic), 1), 7, clock), TxnOffsetApply::Replicating);
+    const auto leo2 = rep.logEndOffset();
+    rep.becomeFollower(/*leaderEpoch=*/2, /*leaderId=*/2);
+    rep.becomeLeader(/*newEpoch=*/3, std::vector<NodeId>{1, 2});
+    EXPECT_EQ(svc.applyTransactionalOffset("g", tp(std::string(kTestTopic), 1), 7, clock), TxnOffsetApply::Refused)
+        << "the new leadership has not reloaded the offsets yet";
+    followerFetches(rep.logEndOffset());   // the new leadership commits its log end ...
+    clock += 1'000'000;
+    svc.doWork(clock);                     // ... and the group coordinator reloads the offsets
+    const auto r = svc.applyTransactionalOffset("g", tp(std::string(kTestTopic), 1), 7, clock);
+    EXPECT_EQ(r, TxnOffsetApply::Replicating);
+    EXPECT_GT(rep.logEndOffset(), leo2) << "a new leadership appends the offset again";
+    EXPECT_EQ(svc.txnOffsetsReplicating(), 1u) << "the earlier leadership's entry is gone";
+    followerFetches(rep.logEndOffset());
+    EXPECT_EQ(svc.applyTransactionalOffset("g", tp(std::string(kTestTopic), 1), 7, clock), TxnOffsetApply::Applied);
+
+    // Not the coordinator: Refused, nothing appended.
+    GroupCoordinationService notCoord(&store, &registry, [] { return false; }, [] { return NodeId{2}; });
+    const auto leo3 = rep.logEndOffset();
+    EXPECT_EQ(notCoord.applyTransactionalOffset("g", tp(std::string(kTestTopic), 0), 99, clock), TxnOffsetApply::Refused);
+    EXPECT_EQ(rep.logEndOffset(), leo3);
+}
+
+// #358: a single-replica offsets partition commits on the append itself - Applied at once, nothing waits.
+TEST(TxnOffsetApplyRegression, ASingleReplicaOffsetsPartitionAppliesAtOnceRegression) {
+    using rune::coordination::TxnOffsetApply;
+    TempDir dir("txnoff_one"), topicDir("txnoff_one_topics");
+    rune::storage::Log log(dir.path);
+    NullTransport transport;
+    PartitionReplica rep(makeSingleNodeConfig(1, 1), Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1},
+                         &log, &transport);
+    ReplicatedOffsetStore store(&rep);
+    rune::gateway::TopicRegistry registry(std::vector<TopicSpec>{makeTopicSpec(std::string(kTestTopic), 2, kTestTopicId)},
+                                          topicDir.path);
+    GroupCoordinationService svc(&store, &registry, [] { return true; }, [] { return NodeId{1}; });
+    svc.doWork(0);
+    auto r = svc.applyTransactionalOffset("g", tp(std::string(kTestTopic), 0), 5, 0);
+    if (r == TxnOffsetApply::Replicating) {   // the HW may move on the replica's next duty pass
+        rep.doWork(1'000'000);
+        r = svc.applyTransactionalOffset("g", tp(std::string(kTestTopic), 0), 5, 1'000'000);
+    }
+    EXPECT_EQ(r, TxnOffsetApply::Applied);
+    EXPECT_EQ(svc.txnOffsetsReplicating(), 0u);
+}

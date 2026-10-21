@@ -47,6 +47,7 @@
 
 #include <rune/coordination/GroupCoordinator.h>
 #include <rune/coordination/ReplicatedOffsetStore.h>
+#include <rune/coordination/TxnOffsetApply.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/gateway/IGroupRequestHandler.h>
 
@@ -142,11 +143,18 @@ public:
     void setTransientLineage(TransientLineageFn fn, void* ctx) noexcept { lineageFn_ = fn; lineageCtx_ = ctx; }
     /// Phase 2b F Task 11: apply one consumer-group offset of a COMMITTED transaction (TxnOffsetCommit) - the same
     /// overwrite an OffsetCommit performs (replicated, acks-all, stamped with the partition's data lineage), but
-    /// without a member generation: the transaction coordinator already fenced the producer.  False: this node is
+    /// without a member generation: the transaction coordinator already fenced the producer.  Refused: this node is
     /// not the group coordinator / its offsets are not loaded yet / the lineage is pending / the append was refused
-    /// (the caller counts and logs it - the offset is never dropped silently).  Control thread.
-    bool applyTransactionalOffset(const std::string& group, const rune::coordination::TopicPartition& tp, int64_t offset,
-                                  int64_t nowNs);
+    /// (the caller counts and logs it - the offset is never dropped silently).
+    /// #358: Applied only once the offset record is COMMITTED on the offsets replica (its high watermark passed
+    /// it); until then Replicating.  The first call appends; a repeat for the same (group, tp, offset) waits on that
+    /// record and appends again only when it may be gone (the offsets replica changed leadership or truncated).
+    /// Control thread.
+    rune::coordination::TxnOffsetApply applyTransactionalOffset(const std::string& group,
+                                                                const rune::coordination::TopicPartition& tp,
+                                                                int64_t offset, int64_t nowNs);
+    /// #358: transactional offset records appended and not yet known committed (test / observability).
+    [[nodiscard]] std::size_t txnOffsetsReplicating() const noexcept { return txnOffsetsInFlight_.size(); }
     /// E2 residual round 5 (R1): a counter that moves whenever a committed
     /// lineage changes (MetadataStateMachine::lineageVersion).  On a change the
     /// coordinator sweeps its groups: a group holding a committed offset of a
@@ -263,6 +271,20 @@ private:
     // Members
     // -----------------------------------------------------------------------
     rune::coordination::ReplicatedOffsetStore* offsets_;    // non-owning
+    /// #358: a transactional offset record appended and waited on: its log offset and the offsets replica's
+    /// (leadership, log) generation it was appended under.  Cold path (one entry per committing (group, tp,
+    /// offset)); erased once committed, replaced when its generation is stale.
+    struct TxnOffsetKey {
+        std::string group, topic;
+        int32_t     partition = 0;
+        int64_t     offset    = 0;
+        auto operator<=>(const TxnOffsetKey&) const = default;
+    };
+    struct TxnOffsetInFlight {
+        int64_t  recordOffset = -1;
+        uint64_t leadershipGen = 0, logGen = 0;
+    };
+    std::map<TxnOffsetKey, TxnOffsetInFlight> txnOffsetsInFlight_;
     rune::gateway::TopicRegistry*              topics_;     // non-owning; may be null
     std::function<bool()>                      isLeaderFn_;
     int8_t                                     localLeader_ = -1;   // see setLocalLeadership()

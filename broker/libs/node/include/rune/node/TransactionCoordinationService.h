@@ -55,6 +55,7 @@
 #include <rune/gateway/ITxnRequestHandler.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/protocol/client/TxnMessages.h>
+#include <rune/coordination/TxnOffsetApply.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -220,16 +221,22 @@ public:
 
     /// Phase 2b F Task 11: where a COMMITTED transaction's consumer-group offsets (TxnOffsetCommit) are applied -
     /// the group coordinator's offset store (BrokerNode wires GroupCoordinationService::applyTransactionalOffset).
-    /// The sink returns false when it cannot apply NOW (not the group coordinator / offsets not loaded yet /
-    /// gated): the transaction then stays PrepareCommit, its EndTxn answer stays deferred, and the completion is
-    /// retried from doWork with backoff (duty clock) until the sink accepts - a refused apply never completes the
-    /// commit.  No sink wired = no offset store on this node (unit rigs): offsets are accepted and dropped.
-    /// Called on the control thread; the apply is an overwrite, so re-drives are idempotent.
-    using TxnOffsetSink = bool (*)(void* ctx, const std::string& group, const rune::coordination::TopicPartition& tp,
-                                   int64_t offset, int64_t nowNs);
+    /// Refused when it cannot apply NOW (not the group coordinator / offsets not loaded yet / gated): the
+    /// transaction then stays PrepareCommit, its EndTxn answer stays deferred, and the completion is retried from
+    /// doWork with backoff (duty clock) until the sink accepts - a refused apply never completes the commit.
+    /// #358: Replicating while the offset record is appended but not yet committed on the offsets replica: the
+    /// transaction likewise stays PrepareCommit (CompleteCommit is not persisted, EndTxn not answered) and the
+    /// completion is re-checked on every doWork (no backoff: it waits on replication, not on a refusal) until every
+    /// offset is Applied.  No sink wired = no offset store on this node (unit rigs): offsets are accepted and
+    /// dropped.  Called on the control thread; the apply is an overwrite, so re-drives are idempotent.
+    using TxnOffsetSink = rune::coordination::TxnOffsetApply (*)(void* ctx, const std::string& group,
+                                                                 const rune::coordination::TopicPartition& tp,
+                                                                 int64_t offset, int64_t nowNs);
     void setTxnOffsetSink(TxnOffsetSink fn, void* ctx) noexcept { offsetSink_ = fn; offsetSinkCtx_ = ctx; }
     /// Completion attempts deferred because the sink refused (a retry counter, not a loss counter).
     [[nodiscard]] uint64_t txnOffsetApplyRetries() const noexcept { return offsetApplyRetries_; }
+    /// #358: completion attempts deferred because an offset record was still replicating.
+    [[nodiscard]] uint64_t txnOffsetReplicationWaits() const noexcept { return offsetReplicationWaits_; }
     [[nodiscard]] rune::transaction::TxnState txnStateForTest(const rune::transaction::TransactionalId& id) const {
         const auto* m = coordinator_.metadata(id);
         return m != nullptr ? m->state : rune::transaction::TxnState::Empty;
@@ -244,6 +251,8 @@ private:
     TxnOffsetSink offsetSink_    = nullptr;
     void*         offsetSinkCtx_ = nullptr;
     uint64_t      offsetApplyRetries_ = 0;
+    uint64_t      offsetReplicationWaits_ = 0;
+    bool          offsetRefusedThisPass_  = false;   ///< #358: a completion pass met a Refused (vs only Replicating)
     std::size_t   offsetsPendingTxns_ = 0;   ///< awaiting_ entries deferred on a refused offset apply
     static constexpr int64_t kOffsetRetryMinNs = 10'000'000;     // 10 ms
     static constexpr int64_t kOffsetRetryMaxNs = 1'000'000'000;  // 1 s
@@ -371,6 +380,7 @@ private:
         bool    commit;
     };
     std::vector<MarkerNotify>                   toNotifyScratch_;
+    std::vector<int64_t>                        dueScratch_;   ///< retryDeferredCompletions_ (reused)
 
     // Per-transactionalId coordinator (single global coordinator, v1 seam).
     // One coordinator manages all transactions on this node.

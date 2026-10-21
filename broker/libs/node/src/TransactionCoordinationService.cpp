@@ -97,6 +97,7 @@ TransactionCoordinationService::TransactionCoordinationService(
     topicNameScratch_.reserve(32);  // "topic_<N>" stays well within 32 chars
     pendingByPidScratch_.reserve(16);
     toNotifyScratch_.reserve(32);
+    dueScratch_.reserve(16);
 }
 
 // ---------------------------------------------------------------------------
@@ -106,7 +107,14 @@ bool TransactionCoordinationService::applyTxnOffset_(const std::string& group,
                                                      const rune::coordination::TopicPartition& tp, int64_t offset)
 {
     if (offsetSink_ == nullptr) return true;   // no offset store on this node: nothing to apply to
-    return offsetSink_(offsetSinkCtx_, group, tp, offset, lastNowNs_);   // duty clock, as handleOffsetCommit's nowNs
+    // Duty clock, as handleOffsetCommit's nowNs.  #358: only a COMMITTED offset counts as applied.
+    switch (offsetSink_(offsetSinkCtx_, group, tp, offset, lastNowNs_)) {
+        case rune::coordination::TxnOffsetApply::Applied:     return true;
+        case rune::coordination::TxnOffsetApply::Replicating: return false;
+        case rune::coordination::TxnOffsetApply::Refused:     break;
+    }
+    offsetRefusedThisPass_ = true;
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -862,14 +870,28 @@ bool TransactionCoordinationService::completeAwaiting_(int64_t producerId, bool 
     auto it = awaiting_.find(producerId);
     if (it == awaiting_.end()) return true;
     AwaitingMarkers& cur = it->second;
+    offsetRefusedThisPass_ = false;
     const auto r = coordinator_.completeTransaction(cur.txnId);
+    if (r.errorCode == tx::CompleteTransactionResult::kOffsetsPending && !offsetRefusedThisPass_) {
+        // #358: every offset is appended, some not committed yet on the offsets replica.  CompleteCommit waits for
+        // them (a failover of the offsets partition could otherwise lose an offset the transaction log says is
+        // committed); re-checked on the next doWork - the wait is on replication, not on a refusal: no backoff.
+        if (!cur.offsetsPending) {
+            cur.offsetsPending = true;
+            ++offsetsPendingTxns_;
+        }
+        cur.offsetBackoffNs = 0;
+        cur.offsetDueNs     = lastNowNs_;
+        ++offsetReplicationWaits_;
+        return false;
+    }
     if (r.errorCode == tx::CompleteTransactionResult::kOffsetsPending) {
         // The group coordinator refused a committed offset (not loaded after a failover / gated): the txn STAYS
         // PrepareCommit (nothing persisted, EndTxn not answered); retried from doWork with backoff.
-        if (!cur.offsetsPending) {
+        if (!cur.offsetsPending || cur.offsetBackoffNs == 0) {
+            if (!cur.offsetsPending) ++offsetsPendingTxns_;
             cur.offsetsPending  = true;
             cur.offsetBackoffNs = kOffsetRetryMinNs;
-            ++offsetsPendingTxns_;
             spdlog::warn("TCS: committed offsets of txn '{}' not applied yet (the group coordinator refused) - the "
                          "commit stays PrepareCommit and is retried", cur.txnId);
         } else {
@@ -905,11 +927,13 @@ bool TransactionCoordinationService::completeAwaiting_(int64_t producerId, bool 
 int TransactionCoordinationService::retryDeferredCompletions_(int64_t nowNs)
 {
     if (offsetsPendingTxns_ == 0) return 0;
-    std::vector<int64_t> due;   // cold path (refusals only): completing erases from awaiting_
+    // Completing erases from awaiting_, so the due ids are collected first (a reused member: #358 re-checks a
+    // replicating commit on every doWork, which must not allocate per cycle).
+    dueScratch_.clear();
     for (const auto& [pid, a] : awaiting_)
-        if (a.offsetsPending && a.offsetDueNs <= nowNs) due.push_back(pid);
-    for (const int64_t pid : due) (void)completeAwaiting_(pid, /*respond=*/true);
-    return static_cast<int>(due.size());
+        if (a.offsetsPending && a.offsetDueNs <= nowNs) dueScratch_.push_back(pid);
+    for (const int64_t pid : dueScratch_) (void)completeAwaiting_(pid, /*respond=*/true);
+    return static_cast<int>(dueScratch_.size());
 }
 
 void TransactionCoordinationService::onControlMarkerLanded(int32_t topicId, int32_t partition, int64_t producerId,
