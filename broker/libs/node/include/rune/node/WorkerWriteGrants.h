@@ -54,7 +54,7 @@ class PermissionStager {
 public:
     template <class Sink>
     PermissionChunkResult apply(Sink& sink, int64_t sessionId, uint64_t firstWord, uint64_t totalWords, uint8_t flags,
-                                uint64_t epoch, const uint8_t* tail, std::size_t tailLen, uint64_t owner = 0) {
+                                uint64_t epoch, const uint8_t* tail, std::size_t tailLen, uint64_t owner) {
         static_assert(sizeof(uint64_t) == 8);
         if (tailLen % 8 != 0 || firstWord > totalWords || (tailLen / 8) > totalWords - firstWord) return drop_();
         const std::size_t count = tailLen / 8;

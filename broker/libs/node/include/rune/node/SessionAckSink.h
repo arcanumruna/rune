@@ -659,7 +659,7 @@ public:
     /// Swap `words` into the session's slot (the old buffer comes back in `words`): no allocation.  False = unknown
     /// session (closed meanwhile): nothing installed.
     bool installWriteGrants(int64_t sessionId, std::vector<uint64_t>& words, bool grantAll, uint64_t epoch,
-                            uint64_t owner = 0) noexcept {
+                            uint64_t owner) noexcept {
         const std::size_t idx = find_(sessionId);
         if (idx == kNone) return false;
         WriteGrantSlot& g = grants_[idx];

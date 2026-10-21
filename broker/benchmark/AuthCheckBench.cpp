@@ -98,7 +98,7 @@ void BM_WorkerSlotLookupPlusAllowsWrite(benchmark::State& state) {
     for (int64_t sid = 1; sid <= kSessions; ++sid) {
         (void)sink->announce(sid, "aeron:ipc", 7, 9, false);
         std::vector<uint64_t> words = makeSlot().bits;
-        (void)sink->installWriteGrants(sid, words, false, 1);
+        (void)sink->installWriteGrants(sid, words, false, 1, /*owner=*/7);
     }
     const auto ids = randomTopicIds();
     std::vector<int64_t> sids(kIds);

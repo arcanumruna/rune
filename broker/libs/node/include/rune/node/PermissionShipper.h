@@ -31,7 +31,7 @@ public:
     /// Queue `bits` for `sessionId` to every worker; returns true once every worker accepted it.
     /// `owner` (issue #122): the session's principal, installed with the bits (producer ids must carry its tag).
     bool ship(WorkerPool& pool, int64_t sessionId, std::span<const uint64_t> bits, bool grantAll, uint64_t epoch,
-              uint64_t owner = 0) {
+              uint64_t owner) {
         // Latest wins: an older queued update of this session is dropped (a worker mid-way through it restarts).
         for (std::size_t i = 0; i < pending_.size(); ++i)
             if (pending_[i].sessionId == sessionId) { pending_.erase(pending_.begin() + static_cast<std::ptrdiff_t>(i)); break; }
