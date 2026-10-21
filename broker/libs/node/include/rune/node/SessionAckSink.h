@@ -232,7 +232,7 @@ public:
         const bool fresh = (idx == kNone);
         if (fresh) idx = insert_(sessionId);
         if (idx == kNone) return false;                                   // table full
-        if (fresh) grants_[idx].grantAll = grantAll;
+        if (fresh) grants_[idx].table = grantAll ? allowAllWriteTable() : denyWriteTable();
         clientVersion_[idx] = clientVersion;
         PubState& st = states_[idx];
         if (edges_[idx].lost) { edges_[idx].lost = 0; markDirty_(idx); }   // a fresh publication: not lost (yet)
@@ -656,17 +656,44 @@ public:
         const std::size_t idx = find_(sessionId);
         return idx == kNone ? nullptr : &grants_[idx];
     }
-    /// Swap `words` into the session's slot (the old buffer comes back in `words`): no allocation.  False = unknown
-    /// session (closed meanwhile): nothing installed.
-    bool installWriteGrants(int64_t sessionId, std::vector<uint64_t>& words, bool grantAll, uint64_t epoch,
-                            uint64_t owner) noexcept {
+    /// Issue #259: swap `words` into TABLE `tableId` (the old buffer comes back in `words`): no allocation.  Every
+    /// session bound to it sees the new bits at once.  False = an id beyond the store (never sent by the runtime).
+    bool installWriteGrants(int64_t tableId, std::vector<uint64_t>& words, bool grantAll, uint64_t /*epoch*/,
+                            uint64_t /*owner*/) noexcept {
+        if (static_cast<uint64_t>(tableId) >= kMaxWritePermTables) return false;
+        WritePermTable& t = permTables_[static_cast<std::size_t>(tableId)];
+        t.bits.swap(words);
+        t.grantAll = grantAll;
+        return true;
+    }
+    /// Words [first, first + n) of table `tableId`, the table resized to `total` words (a created / dropped object).
+    /// Cold (DDL rate); a grown table allocates here, on the lifecycle ring, never on the produce path.
+    bool patchWriteTable(int64_t tableId, uint64_t first, uint64_t total, const uint8_t* words, std::size_t n) {
+        if (static_cast<uint64_t>(tableId) >= kMaxWritePermTables || first > total || n > total - first) return false;
+        WritePermTable& t = permTables_[static_cast<std::size_t>(tableId)];
+        if (t.bits.size() != total) t.bits.resize(static_cast<std::size_t>(total), 0);
+        if (n != 0) std::memcpy(t.bits.data() + first, words, n * 8);   // little-endian hosts only
+        return true;
+    }
+    /// Session `sessionId` now uses table `tableId` (< 0: deny everything).  False = unknown session / bad id.
+    bool bindWriteGrants(int64_t sessionId, int64_t tableId, uint64_t epoch, uint64_t owner) noexcept {
         const std::size_t idx = find_(sessionId);
-        if (idx == kNone) return false;
+        if (idx == kNone || tableId >= static_cast<int64_t>(kMaxWritePermTables)) return false;
         WriteGrantSlot& g = grants_[idx];
-        g.bits.swap(words);
-        g.grantAll = grantAll;
+        g.table    = tableId < 0 ? denyWriteTable() : &permTables_[static_cast<std::size_t>(tableId)];
         g.epoch    = epoch;
         g.ownerTag = rune::protocol::pidOwnerTag(owner);
+        return true;
+    }
+    /// Table `tableId` is freed: every slot still pointing at it is reset to deny (a closing session's), its bits
+    /// cleared (capacity persists).  O(kMaxSessions), cold (a grant set's last holder left).
+    bool dropWriteTable(int64_t tableId) noexcept {
+        if (static_cast<uint64_t>(tableId) >= kMaxWritePermTables) return false;
+        WritePermTable* t = &permTables_[static_cast<std::size_t>(tableId)];
+        for (std::size_t i = 0; i < kMaxSessions; ++i)
+            if (grants_[i].table == t) grants_[i].table = denyWriteTable();
+        t->bits.clear();
+        t->grantAll = false;
         return true;
     }
     /// Test seam: slots examined by the last find_ of `sessionId` (probe chain length).
@@ -702,7 +729,7 @@ private:
         }
         return kNone;
     }
-    static void resetGrants_(WriteGrantSlot& g) noexcept { g.bits.clear(); g.grantAll = false; g.epoch = 0; g.ownerTag = 0; }   // capacity persists
+    static void resetGrants_(WriteGrantSlot& g) noexcept { g.table = denyWriteTable(); g.epoch = 0; g.ownerTag = 0; }
     std::size_t insert_(int64_t sid) noexcept {
         if (count_ == kMaxSessions - 1) return kNone;               // one empty slot ends every probe
         std::size_t i = hash_(sid);
@@ -1077,6 +1104,7 @@ private:
     std::array<Edges, kMaxSessions>                                  edges_{};
     std::array<int32_t, kMaxSessions>                                clientVersion_{}; // D6: per session
     std::array<WriteGrantSlot, kMaxSessions>                         grants_{};        // authentication Task 13: moved with its key like clientVersion_
+    std::unique_ptr<WritePermTable[]> permTables_ = std::make_unique<WritePermTable[]>(kMaxWritePermTables);   // #259: stable addresses
     std::array<int64_t, kMaxSessions>                                dirty_{};         // edges to report
     std::size_t                                                      dirtyCount_ = 0;
     std::array<int64_t, kMaxSessions>                                creditDirty_{};   // D8c: credits to report

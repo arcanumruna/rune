@@ -233,6 +233,8 @@ senderId u8` (0 = gateway, `i+1` = worker `i`) and a `seq u64`
 | 45 | `NotAuthorized` | Not granted (default deny), or the object is not visible. Fails exactly that request. | never re-sent |
 | 46 | `SessionRevoked` | The session's user was dropped, disabled or terminated. Terminal for the session. | terminal for the session |
 | 47 | `PasswordChangeRequired` | A one-time-password session may only change its password. | fails that request |
+| 48 | (reserved) | Reserved for `AuthUnavailable`. |  |
+| 49 | `RecordEgressUnavailable` | Authenticating broker only: the session's own record stream for the partition's worker could not be built (there is no shared-stream fallback). Sent in `SubscribeResponse.errorCode` on the pending Subscribe. | retried a few times (a bind resets the count), then fails the subscription or the group consumer with an error |
 
 The broker-internal storage errors (`rune::protocol::ErrorCode`, [`Errors.h`](../../protocol/include/rune/protocol/Errors.h))
 are a separate, small enum used inside the log: `OffsetOutOfRange`=1, `CorruptRecord`=2, `InvalidRecordBatch`=3,

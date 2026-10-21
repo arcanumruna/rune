@@ -49,7 +49,7 @@ std::string uniqueDir(const char* prefix) {
            "_" + std::to_string(g_ctr.fetch_add(1));
 }
 
-enum class SubMode { OkAfterOneNotLeader, AlwaysNotLeader, Silent, MovesAfterBind, MovesMidBatch };
+enum class SubMode { OkAfterOneNotLeader, AlwaysNotLeader, Silent, MovesAfterBind, MovesMidBatch, AlwaysEgressUnavailable };
 
 struct SubGateway {
     std::atomic<int> subscribesSeen{0};
@@ -178,7 +178,11 @@ struct SubGateway {
             if (mode == SubMode::Silent) return;
             if (mode == SubMode::MovesAfterBind || mode == SubMode::MovesMidBatch) { movesAfterBind(*opt, k); return; }
             std::size_t n;
-            if (mode == SubMode::AlwaysNotLeader || k == 1) {
+            if (mode == SubMode::AlwaysEgressUnavailable) {   // PR #441 F4: the held Subscribe's refusal
+                n = rcc::encodeSubscribeResponse(replyBuf, sizeof(replyBuf),
+                        static_cast<int16_t>(rp::ErrorCode::RecordEgressUnavailable), opt->partition,
+                        /*subscriptionId=*/0, opt->sessionId, opt->correlationId);
+            } else if (mode == SubMode::AlwaysNotLeader || k == 1) {
                 n = rcc::encodeErrorResponse(replyBuf, sizeof(replyBuf),
                         static_cast<int16_t>(rp::ErrorCode::NotLeader), std::string_view{},
                         opt->sessionId, opt->correlationId);
@@ -501,4 +505,25 @@ TEST(SubscribeNotLeaderRegression, PositionNoteIsIgnoredAfterADeliveryRegression
     EXPECT_EQ(seen.mask.load(), 0x1Fu);
     EXPECT_EQ(seen.dupes.load(), 0);
     sub.unsubscribe();
+}
+
+// PR #441 F1/F4 (issue #118): an authenticating broker that can never build this session's record stream answers every
+// (re-)Subscribe SubscribeResponse{RecordEgressUnavailable}.  The client retries it a few times, then fails the
+// subscription explicitly (RejectedByBroker, code 49) and fires onError - never an endless subscribe loop.
+TEST(SubscribeNotLeaderRegression, RecordEgressUnavailableForeverFailsExplicitlyWithinBudgetRegression) {
+    Rig r("snl_e", 4730, 4731, SubMode::AlwaysEgressUnavailable, 60'000);
+    const auto t0 = std::chrono::steady_clock::now();
+    auto sub = r.subscribe();
+    bool failed = false;
+    for (int i = 0; i < 6000 * 3; ++i) {
+        r.gw->poll(16);
+        if (sub.finished()) { failed = true; break; }
+        std::this_thread::sleep_for(2ms);
+    }
+    ASSERT_TRUE(failed) << "gateway saw " << r.gw->subscribesSeen.load() << " Subscribe(s)";
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, 20s) << "the budget ends it, not the 60 s clock";
+    EXPECT_EQ(sub.failReason(), SubscriptionFailReason::RejectedByBroker);
+    EXPECT_EQ(sub.brokerErrorCode(), static_cast<uint16_t>(rp::ErrorCode::RecordEgressUnavailable));
+    EXPECT_GE(r.errors.load(), 1);
+    EXPECT_EQ(r.gw->subscribesSeen.load(), 1 + Client::kMaxEgressUnavailableRetriesForTest) << "retried, bounded";
 }

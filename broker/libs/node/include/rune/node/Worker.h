@@ -696,6 +696,12 @@ public:
     void requireEnforcement() noexcept {
         if (!std::holds_alternative<Enforcing>(enforcement_)) enforcement_ = Enforcing{ackSink_.get()};
     }
+    /// Issue #118 (X020): the broker authenticates - a subscription is pushed ONLY on its session's own record egress,
+    /// never on this worker's shared dynamic-MDC publication (every joiner of the advertised control port receives
+    /// that).  A Subscribe op without an egress pub is refused (the gateway never sends one under authentication; this
+    /// is the worker's own fail-closed check).  Before the runner starts.
+    void requirePerSessionEgress() noexcept { perSessionEgressRequired_ = true; }
+    [[nodiscard]] uint64_t subscribesRefusedWithoutEgressForTest() const noexcept { return subscribesRefusedWithoutEgress_; }
     /// Combined fix program (X036, review I1/I3): true when a client-supplied Produce record-batch span must be REFUSED.
     /// A client produce frame carries EXACTLY ONE batch: the append CRC-checks, producer-checks and offset-restamps only
     /// the first batch yet writes the whole span, so a second batch (or trailing bytes) would land unvalidated and break
@@ -2570,21 +2576,35 @@ private:
     // sink adds this worker's own exclusive publication on its next flush.
     // Workers without worker-side acks (legacy, unit rigs) only count it.
     // -------------------------------------------------------------------
-    // Authentication Task 13 (D30): one chunk of a session's WRITE bitmap.  Staged in this worker's one
-    // PermissionStager and swapped into the session's slot on the last chunk (a partial table is never visible).
+    // Authentication Task 13 (D30) / issue #259: the WRITE tables and the sessions' bindings to them (see
+    // WorkerWriteGrants.h for the variants).  A full table is staged in this worker's one PermissionStager and swapped
+    // in on its last chunk (a partial table is never visible); a patch, a bind and a drop are single ops.
     [[gnu::cold]] void executeSessionPermissionsWire_(sbe::WorkerOp& op) {
         ++sessionPermissionChunksSeen_;
         if (!ackSink_) return;   // a worker without worker-side acks keeps no session table (and enforces nothing)
         const auto first = static_cast<uint64_t>(op.nextOffset());
         const auto total = static_cast<uint64_t>(op.hwBound());
+        const uint8_t flags = op.isolation();
         const std::uint32_t tailLen = op.tailLength();   // SBE var data: the length FIRST, then tail() advances past it
         const auto* tail = reinterpret_cast<const uint8_t*>(op.tail());
-        const PermissionChunkResult r = permStager_.apply(
-            *ackSink_, op.sessionId(), first, total, op.isolation(), static_cast<uint64_t>(op.correlationId()), tail, tailLen,
-            static_cast<uint64_t>(op.producerId()));   // #122: the session's principal
-        if (r == PermissionChunkResult::Dropped) [[unlikely]]
-            spdlog::debug("Worker {}: permission chunk for session {} dropped (closed session or out-of-order chunk)",
-                          workerId_, op.sessionId());
+        bool ok = true;
+        if ((flags & kPermFlagBind) != 0) {
+            ok = ackSink_->bindWriteGrants(op.sessionId(), op.nextOffset(), static_cast<uint64_t>(op.correlationId()),
+                                           static_cast<uint64_t>(op.producerId()));   // #122: the session's principal
+        } else if ((flags & kPermFlagDrop) != 0) {
+            ok = ackSink_->dropWriteTable(op.sessionId());
+        } else if ((flags & kPermFlagPatch) != 0) {
+            ok = tailLen % 8 == 0 && ackSink_->patchWriteTable(op.sessionId(), first, total, tail, tailLen / 8);
+        } else if ((flags & kPermFlagTable) != 0) {
+            ok = permStager_.apply(*ackSink_, op.sessionId(), first, total, flags,
+                                   static_cast<uint64_t>(op.correlationId()), tail, tailLen,
+                                   static_cast<uint64_t>(op.producerId())) != PermissionChunkResult::Dropped;
+        } else {
+            ok = false;   // no variant flag: not sent by this runtime
+        }
+        if (!ok) [[unlikely]]
+            spdlog::debug("Worker {}: permission op (flags {:#x}) for {} dropped (closed session, bad id or out-of-order "
+                          "chunk)", workerId_, flags, op.sessionId());
     }
 
     [[gnu::cold]] void executeSessionAnnounceWire_(sbe::WorkerOp& op) {
@@ -2704,6 +2724,17 @@ private:
     // -------------------------------------------------------------------
     void executeSubscribeWire_(sbe::WorkerOp& op) {
         const int64_t subId = op.subscriptionId();
+        if (perSessionEgressRequired_ && op.egressPub() == 0) [[unlikely]] {
+            // Issue #118: never a cursor on the shared egress under authentication; an existing entry of the id is
+            // dropped too (fail closed: its records must not move to the shared publication).
+            for (std::size_t i = 0; i < subs_.size(); ++i)
+                if (subs_[i].subscriptionId == subId) { subs_[i] = subs_.back(); subs_.pop_back(); break; }
+            if ((subscribesRefusedWithoutEgress_++ & 1023) == 0)
+                spdlog::error("Worker {}: Subscribe {:#x} without its own record egress refused - the shared egress "
+                              "carries no Records under authentication (refused so far: {})",
+                              workerId_, subId, subscribesRefusedWithoutEgress_);
+            return;
+        }
         for (auto& s : subs_) {
             if (s.subscriptionId == subId) {
                 s.sessionId            = op.sessionId();
@@ -4643,6 +4674,8 @@ private:
     struct Enforcing { SessionAckSink* sink = nullptr; };
     using EnforcementMode = std::variant<NotEnforcing, Enforcing>;
     EnforcementMode enforcement_{NotEnforcing{}};
+    bool     perSessionEgressRequired_       = false;   ///< issue #118: set once before the runner starts
+    uint64_t subscribesRefusedWithoutEgress_ = 0;
     // Fix round 1 (C1b/c) — the session ack queue bound.  A = queued acks, O =
     // owed returns (reservedAckSlots_, <= kMaxOwedReturnsCeiling).  Every intake
     // step is limited by ackRoom_() = kAckCapacity − A − O (op drain:

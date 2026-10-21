@@ -34,6 +34,7 @@
 //   bool    postPaused(int64_t session, int64_t subscriptionId, int64_t baseOffset, bool droppedMarker);
 //   bool    postResume(int64_t session, int64_t subscriptionId);
 //   bool    postSessionGone(int64_t session);      // fix round 3: a probe found it gone
+//   Admit   admit(int64_t session, int64_t subscriptionId, const uint8_t* frame, std::size_t n);   // issue #117
 
 #include <rune/node/CatalogReadServer.h>
 
@@ -51,6 +52,10 @@ class CatalogReadFlow {
 public:
     enum class Offer : uint8_t { Sent, BackPressured, NoSession };
     enum class Room  : uint8_t { Ready, NotYet, Gone };
+    /// Issue #117: the control thread's own authorization of each Records frame (Sink::admit): Deliver, Withhold (the
+    /// reader lost its grant: dropped, never sent - whether or not the admin processed the end yet), Hold (not yet:
+    /// paused and re-read from the log like a back-pressured frame).
+    enum class Admit : uint8_t { Deliver, Withhold, Hold };
 
     struct PauseOwed    { int64_t baseOffset = -1; bool droppedMarker = false; };
     struct AwaitingAck  {};
@@ -101,17 +106,27 @@ public:
             return;
         }
         if (len == 0) return;   // an ack for a subscription not paused here (already cleared)
-        switch (sink.tryOffer(h.session, frame, len)) {
-        case Offer::Sent:
-            ++delivered_;
-            return;
-        case Offer::NoSession:
-            return;   // closed: the session close ends its catalog subscriptions on the admin
-        case Offer::BackPressured:
-            break;
+        const Admit admitted = sink.admit(h.session, h.subscriptionId, frame, len);
+        if (admitted == Admit::Withhold) [[unlikely]] { ++withheld_; return; }
+        if (admitted == Admit::Deliver) {
+            switch (sink.tryOffer(h.session, frame, len)) {
+            case Offer::Sent:
+                ++delivered_;
+                return;
+            case Offer::NoSession:
+                return;   // closed: the session close ends its catalog subscriptions on the admin
+            case Offer::BackPressured:
+                break;
+            }
         }
         ++pauses_;
         ++dropped_;
+        if (entries_.size() >= capacity_ && admitted == Admit::Hold) [[unlikely]] {
+            // Cannot happen (as below); a held frame is never sent around the gate: dropped, loudly.
+            spdlog::error("CatalogReadFlow: {} paused catalog subscriptions (the capacity) — held frame of {:#x} "
+                          "dropped", entries_.size(), h.subscriptionId);
+            return;
+        }
         if (entries_.size() >= capacity_) [[unlikely]] {
             // Cannot happen (one entry per paused subscription; capacity >= the
             // admin's subscription cap).  Never a silent drop: queue it reliably.
@@ -177,6 +192,7 @@ public:
     [[nodiscard]] uint64_t    resumes() const noexcept { return resumes_; }
     [[nodiscard]] uint64_t    dropped() const noexcept { return dropped_; }
     [[nodiscard]] uint64_t    delivered() const noexcept { return delivered_; }
+    [[nodiscard]] uint64_t    withheld() const noexcept { return withheld_; }   ///< issue #117
     [[nodiscard]] uint64_t    malformed() const noexcept { return malformed_; }
     [[nodiscard]] uint64_t    sessionsGone() const noexcept { return sessionsGone_; }
 
@@ -193,7 +209,7 @@ private:
 
     std::size_t        capacity_;
     std::vector<Entry> entries_;
-    uint64_t pauses_ = 0, resumes_ = 0, dropped_ = 0, delivered_ = 0, malformed_ = 0, sessionsGone_ = 0;
+    uint64_t pauses_ = 0, resumes_ = 0, dropped_ = 0, delivered_ = 0, malformed_ = 0, sessionsGone_ = 0, withheld_ = 0;
 };
 
 } // namespace rune::node

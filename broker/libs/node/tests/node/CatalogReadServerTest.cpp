@@ -303,6 +303,26 @@ struct FlowHarness {
 
     using Offer = rune::node::CatalogReadFlow::Offer;
     using Room  = rune::node::CatalogReadFlow::Room;
+    // PR #441 adversarial: a mirror that lags the read server - a Records frame whose newest record is above
+    // `appliedUpTo` is Held (the control thread's #117 gate), as ClientGateway::admitAdminLogFrame does.
+    int64_t  appliedUpTo = INT64_MAX;
+    uint64_t holds = 0;
+    rune::node::CatalogReadFlow::Admit admit(int64_t, int64_t, const uint8_t* f, std::size_t n) {
+        if (appliedUpTo == INT64_MAX) return rune::node::CatalogReadFlow::Admit::Deliver;
+        const auto r = pc::Records::decode(f, n);
+        int64_t newest = -1;
+        if (r && r->recordBatch.size() != 8) {
+            std::size_t pos = 0;
+            while (pos + 61 <= r->recordBatch.size()) {
+                rune::protocol::RecordBatchReader rd(r->recordBatch.data() + pos, r->recordBatch.size() - pos);
+                if (!rd.ensureValid()) break;
+                newest = std::max(newest, rd.baseOffset() + static_cast<int64_t>(rd.lastOffsetDelta()));
+                pos += static_cast<std::size_t>(rd.totalLength());
+            }
+        }
+        if (newest > appliedUpTo) { ++holds; return rune::node::CatalogReadFlow::Admit::Hold; }
+        return rune::node::CatalogReadFlow::Admit::Deliver;
+    }
     Offer tryOffer(int64_t s, const uint8_t* f, std::size_t n) {
         Session& ss = sessions.at(s);
         if (ss.inFlight + n > ss.window && ss.inFlight != 0) return Offer::BackPressured;
@@ -1102,4 +1122,47 @@ TEST(CatalogReadServerRegression, ADroppedNoteOnAStreamOpenedAtTheHwStillGetsIts
     EXPECT_EQ(marks, 1) << "and the marker dropped behind it";
     EXPECT_EQ(markAt, 2);
     EXPECT_TRUE(h.seen(7).first.empty()) << "no data below the HW";
+}
+
+// PR #441 adversarial (issue #117 Hold path, data integrity): a reader whose frames are HELD because this broker's
+// mirror lags the read server (the admin applied and streamed events the control thread has not yet) is paused and
+// re-read from the log until the mirror catches up - every record exactly once, in order, one marker, nothing on the
+// reliable path, no entry left paused, and never a hang while the mirror advances.
+TEST(CatalogReadServerRegression, HeldFramesAreReReadFromTheLogExactlyOnceAsTheMirrorAdvancesAdversarialRegression) {
+    ReadRig r("rd_flow_hold");
+    r.commitEvents(600);
+    FlowHarness h(r);
+    h.sessions[1] = {/*window=*/1 << 22, 0, /*drainPerPass=*/1 << 22};
+    h.appliedUpTo = -1;   // the mirror has applied nothing yet
+    r.server.subscribe(1, 1, -2);
+    int done = -1;
+    for (int p = 0; p < 20'000 && done < 0; ++p) {
+        h.pass();
+        h.appliedUpTo += 13;   // the mirror catches up slowly
+        if (!h.seen(1).second.empty()) done = p;
+    }
+    ASSERT_GE(done, 0) << "the held reader reached the end: no hang while the mirror advances";
+    const auto [offs, marks] = h.seen(1);
+    EXPECT_EQ(offs, range(0, 600)) << "every record exactly once, in order, across the holds";
+    EXPECT_EQ(marks, (std::vector<int64_t>{600}));
+    EXPECT_GT(h.holds, 5u) << "non-vacuous: frames were held";
+    EXPECT_EQ(h.flow.resumes(), h.flow.pauses());
+    EXPECT_EQ(h.flow.paused(), 0u);
+    EXPECT_EQ(h.sessions[1].reliableFrames, 1u) << "a held frame never takes the reliable path around the gate";
+}
+
+// A mirror that never advances: the reader is held (nothing delivered past the mirror), the hold stays one paused entry
+// (bounded), and nothing above the mirror ever reaches the session.
+TEST(CatalogReadServerRegression, AMirrorThatNeverAdvancesDeliversNothingAboveItAndStaysBoundedAdversarialRegression) {
+    ReadRig r("rd_flow_hold_stuck");
+    r.commitEvents(50);
+    FlowHarness h(r);
+    h.sessions[1] = {/*window=*/1 << 22, 0, /*drainPerPass=*/1 << 22};
+    h.appliedUpTo = 9;
+    r.server.subscribe(1, 1, -2);
+    for (int p = 0; p < 200; ++p) h.pass();
+    const auto [offs, marks] = h.seen(1);
+    for (int64_t o : offs) EXPECT_LE(o, 9) << "nothing above the mirror";
+    EXPECT_TRUE(marks.empty());
+    EXPECT_LE(h.flow.paused(), 1u) << "one entry per held subscription";
 }

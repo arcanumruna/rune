@@ -271,6 +271,10 @@ public:
     /// Consecutive Redirects of one partition (no bind in between) after which
     /// it is parked until fresh metadata (no ping-pong storm).
     static constexpr uint8_t kMaxFetchRedirects = 8;
+    /// PR #441 F4: a partition fetch answered RecordEgressUnavailable (the broker cannot build this session's record
+    /// stream) this many times since its last bind ends the consumer explicitly (RetryBudgetExhausted).  Only that
+    /// cause counts: NotLeader / Redirect (a failover, however long) re-route without a bound, as before.
+    static constexpr uint8_t kMaxEgressRefusalsWithoutBind = 8;
 
     /// Bring every Stable consumer's subscriptions in line with the current
     /// leaders and sessions (cold: group / routing events).  Also re-offers

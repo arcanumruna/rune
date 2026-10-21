@@ -752,3 +752,25 @@ TEST(SubscriberHubCommand, PushNeverBindsAPendingSubscriptionWithoutASessionRegr
     EXPECT_EQ(impl->subscriptionId, 77);
     EXPECT_EQ(delivered, 2);
 }
+
+// PR #441 F4 version skew: how a client that does not know RecordEgressUnavailable (49) handles it.  The SubscriberHub
+// treats ANY non-zero SubscribeResponse code it is not told about as a terminal refusal of that pending Subscribe:
+// finished explicitly (RejectedByBroker, the broker's code kept), nothing left pending - never a re-subscribe loop.
+// The Client's bounded retry of 49 sits in front of this hub (Client.cpp); an older client reaches this path directly.
+TEST(SubscriberHubCommand, AnUnknownSubscribeRefusalCodeFinishesThePendingSubscribeExplicitlyRegression) {
+    for (const int16_t code : {int16_t{49}, int16_t{250}}) {
+        SubscriberHub hub;
+        CaptureSend   send;
+        auto impl = makeImpl(40 + code);
+        hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn());
+        ASSERT_EQ(hub.pendingCount(), 1u);
+        auto rsp = bindRsp(40 + code, 0);
+        rsp.errorCode = code;
+        hub.onSubscribeResponse(rsp, 0, kSession, send.fn());
+        EXPECT_EQ(hub.pendingCount(), 0u) << "code " << code << ": nothing stays pending";
+        EXPECT_EQ(impl->failReason, rc::SubscriptionFailReason::RejectedByBroker) << "code " << code;
+        EXPECT_EQ(impl->brokerErrorCode, static_cast<uint16_t>(code)) << "the broker's code is kept";
+        EXPECT_FALSE(impl->active);
+        EXPECT_EQ(send.countSubscribe(), 1) << "never re-sent";
+    }
+}

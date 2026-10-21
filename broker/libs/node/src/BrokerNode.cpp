@@ -1715,7 +1715,10 @@ void BrokerNode::buildWorkerPool() {
     // whatever the worker mode; one without a sink (non-shard per-worker ingress is refused at config time, but a
     // programmatic config could still reach here) refuses every direct-ingress produce.
     if (config_.authMode == AuthMode::Enabled)
-        for (int32_t i = 0; i < wc; ++i) workerPool_->worker(i).requireEnforcement();
+        for (int32_t i = 0; i < wc; ++i) {
+            workerPool_->worker(i).requireEnforcement();
+            workerPool_->worker(i).requirePerSessionEgress();   // issue #118: no Records on the shared MDC egress
+        }
 
     // Apply desired fragment limit + ack-slot reservation size from NodeConfig to
     // each worker (before runners start).
@@ -4858,6 +4861,16 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
         AdminWorkerAgent& agent;
         using Offer = CatalogReadFlow::Offer;
         using Room  = CatalogReadFlow::Room;
+        using Admit = CatalogReadFlow::Admit;
+        Admit admit(int64_t session, int64_t subId, const uint8_t* f, std::size_t n) {   // issue #117
+            if (!node.gateway_) return Admit::Deliver;
+            switch (node.gateway_->admitAdminLogFrame(session, subId, f, n)) {
+            case rune::gateway::ClientGateway::AdminLogAdmit::Deliver:  return Admit::Deliver;
+            case rune::gateway::ClientGateway::AdminLogAdmit::Withhold: return Admit::Withhold;
+            case rune::gateway::ClientGateway::AdminLogAdmit::Hold:     break;
+            }
+            return Admit::Hold;
+        }
         Offer tryOffer(int64_t session, const uint8_t* f, std::size_t n) {
             if (!node.gateway_) return Offer::NoSession;
             switch (node.gateway_->tryOfferCatalogFrame(session, f, n)) {

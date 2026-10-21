@@ -2662,3 +2662,108 @@ TEST_F(GroupConsumerHubTest, AFrameWhoseOnlyBatchIsCorruptMovesNothingRegression
     EXPECT_EQ(impl_->assignment.at(TopicPartition{kTopicId, kPartition}), 10);
     EXPECT_EQ(hub_->malformedBatches(), 1u);
 }
+
+// PR #441 F1/F4 (issue #118, the group half): a partition fetch an authenticating broker can NEVER serve (the
+// session's own record egress to this client cannot be built) is answered SubscribeResponse{RecordEgressUnavailable}
+// on every re-subscribe.  The consumer ends explicitly (RetryBudgetExhausted) after a small bounded number of those,
+// instead of parking / re-subscribing forever with no records and no error.  RED before: no bound at all.
+TEST_F(GroupConsumerHubTest, AFetchRefusedForeverWithoutABindEndsTheConsumerExplicitlyRegression) {
+    FakeFetchRouter fr;
+    fr.leader = {{0, 0u}, {1, 0u}};
+    hub_->setFetchRouter(fr.router());
+    stableWithTwoPartitions(*hub_, sink_);
+    auto ofr = makeOffsetFetchResponse(kTopicId, 1, 0);
+    hub_->onOffsetFetchResponse(ofr.data(), ofr.size());
+    constexpr auto kEgress = static_cast<int16_t>(rpc::ErrorCode::RecordEgressUnavailable);
+    int refusals = 0;
+    for (int round = 0; round < 1000 && impl_->active; ++round) {
+        std::vector<rune::client::codec::SubscribeView> subs;
+        for (const auto& v : fr.subscribes(0)) if (v.partition == 1) subs.push_back(v);
+        ASSERT_FALSE(subs.empty()) << "round " << round << ": the fetch is re-subscribed after each refusal";
+        ASSERT_TRUE(hub_->onFetchSubscribeResponse(subs.back().correlationId, kEgress, 0));
+        ++refusals;
+        hub_->unparkFetch();          // fresh metadata
+        (void)hub_->reconcileFetch();
+    }
+    EXPECT_FALSE(impl_->active) << "the consumer ends instead of looping";
+    EXPECT_EQ(impl_->failReason, GroupFailReason::RetryBudgetExhausted) << "explicit, visible reason";
+    EXPECT_EQ(refusals, GroupConsumerHub::kMaxEgressRefusalsWithoutBind + 1);
+}
+
+// Positive control: RecordEgressUnavailable answers separated by binds (an egress that recovers) never exhaust it.
+TEST_F(GroupConsumerHubTest, FetchRefusalsSeparatedByABindNeverEndTheConsumerRegression) {
+    FakeFetchRouter fr;
+    fr.leader = {{0, 0u}, {1, 0u}};
+    hub_->setFetchRouter(fr.router());
+    stableWithTwoPartitions(*hub_, sink_);
+    auto ofr = makeOffsetFetchResponse(kTopicId, 1, 0);
+    hub_->onOffsetFetchResponse(ofr.data(), ofr.size());
+    constexpr auto kEgress = static_cast<int16_t>(rpc::ErrorCode::RecordEgressUnavailable);
+    for (int round = 0; round < 8 * GroupConsumerHub::kMaxEgressRefusalsWithoutBind; ++round) {
+        std::vector<rune::client::codec::SubscribeView> subs;
+        for (const auto& v : fr.subscribes(0)) if (v.partition == 1) subs.push_back(v);
+        ASSERT_FALSE(subs.empty());
+        const auto sub = subs.back();
+        if (round % 4 == 3) {
+            ASSERT_TRUE(hub_->onFetchSubscribeResponse(sub.correlationId, 0, 900 + round));   // bound
+            int32_t t = -1, p = -1;   // ... then its node stops serving it (a demotion): a routing refusal
+            (void)hub_->onFetchSubscribeRefused(sub.correlationId, /*park=*/true, t, p);
+        } else {
+            ASSERT_TRUE(hub_->onFetchSubscribeResponse(sub.correlationId, kEgress, 0));
+        }
+        hub_->unparkFetch();
+        (void)hub_->reconcileFetch();
+    }
+    EXPECT_TRUE(impl_->active);
+}
+
+// PR #441 re-check adversarial (the 32-refusal bound vs a legitimately slow failover): a partition with NO leader for a
+// while - its only replica's broker restarting, or an election plus the controller's leader move - is answered NotLeader
+// on every fetch re-subscribe.  The client drives one re-subscribe per fresh metadata answer (an urgent ask at most every
+// 100 ms, kUrgentMetadataMinGapNs; the backoff resets on every answer), so a 10 s outage is ~100 refusals of a fetch that
+// has not bound yet.  The consumer must survive it and bind once a leader appears: a failover is not an error.
+TEST_F(GroupConsumerHubTest, ATenSecondLeaderlessFailoverNeverEndsTheConsumerAdversarialRegression) {
+    FakeFetchRouter fr;
+    fr.leader = {{0, 0u}, {1, 0u}};
+    hub_->setFetchRouter(fr.router());
+    stableWithTwoPartitions(*hub_, sink_);
+    auto ofr = makeOffsetFetchResponse(kTopicId, 1, 0);
+    hub_->onOffsetFetchResponse(ofr.data(), ofr.size());
+    constexpr int kMetadataAnswersIn10s = 100;   // one per 100 ms
+    for (int answer = 0; answer < kMetadataAnswersIn10s && impl_->active; ++answer) {
+        std::vector<rune::client::codec::SubscribeView> subs;
+        for (const auto& v : fr.subscribes(0)) if (v.partition == 1) subs.push_back(v);
+        ASSERT_FALSE(subs.empty()) << "answer " << answer;
+        int32_t t = -1, p = -1;
+        (void)hub_->onFetchSubscribeRefused(subs.back().correlationId, /*park=*/true, t, p);   // still no leader
+        hub_->unparkFetch();          // the next metadata answer
+        (void)hub_->reconcileFetch();
+    }
+    EXPECT_TRUE(impl_->active) << "a 10 s leaderless failover ended the group consumer (RetryBudgetExhausted)";
+    std::vector<rune::client::codec::SubscribeView> subs;
+    for (const auto& v : fr.subscribes(0)) if (v.partition == 1) subs.push_back(v);
+    ASSERT_FALSE(subs.empty());
+    EXPECT_TRUE(hub_->onFetchSubscribeResponse(subs.back().correlationId, 0, 4242)) << "the new leader binds it";
+}
+
+// PR #441 F4 version skew, the group half: a group hub that does not know a refusal code parks the fetch and retries it
+// after fresh metadata, without a bound (the pre-#441 behaviour for every non-auth code).  An OLDER client therefore
+// re-subscribes forever on RecordEgressUnavailable (noted on the PR and #118; no compatibility gate by ruling); this
+// pins that behaviour for an unknown code, so a change to it is a decision, not an accident.
+TEST_F(GroupConsumerHubTest, AnUnknownFetchRefusalCodeIsParkedAndRetriedWithoutABoundRegression) {
+    FakeFetchRouter fr;
+    fr.leader = {{0, 0u}, {1, 0u}};
+    hub_->setFetchRouter(fr.router());
+    stableWithTwoPartitions(*hub_, sink_);
+    auto ofr = makeOffsetFetchResponse(kTopicId, 1, 0);
+    hub_->onOffsetFetchResponse(ofr.data(), ofr.size());
+    for (int round = 0; round < 100; ++round) {
+        std::vector<rune::client::codec::SubscribeView> subs;
+        for (const auto& v : fr.subscribes(0)) if (v.partition == 1) subs.push_back(v);
+        ASSERT_FALSE(subs.empty());
+        ASSERT_TRUE(hub_->onFetchSubscribeResponse(subs.back().correlationId, /*unknown*/ 250, 0));
+        hub_->unparkFetch();
+        (void)hub_->reconcileFetch();
+    }
+    EXPECT_TRUE(impl_->active) << "an unknown code is retried, not bounded (an older client on code 49 loops)";
+}

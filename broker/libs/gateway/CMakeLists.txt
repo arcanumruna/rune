@@ -13,6 +13,7 @@ add_library(rune_gateway
     src/LoginThrottle.cpp
     src/SessionAuth.cpp
     src/PermissionTable.cpp
+    src/PermissionPool.cpp
     src/Authorizer.cpp
     src/LiveSecurityChanges.cpp
     src/ScramServer.cpp)

@@ -1703,12 +1703,15 @@ private:
 public:
     [[nodiscard]] uint64_t testStaleSubscribeRedirects() const noexcept { return staleSubscribeRedirects_; }
     [[nodiscard]] uint64_t testRedirectFollowsHeld() const noexcept { return redirectFollowsHeld_; }
+    /// PR #441 F4: re-sends of ONE pending Subscribe answered RecordEgressUnavailable before it fails explicitly.
+    static constexpr int kMaxEgressUnavailableRetriesForTest = 3;
 private:
     std::vector<int64_t>  redirectedSubscribes_;
     int                   redirectMetaSeen_ = 0;
     int64_t               nextRedirectedResendNs_ = 0;
     static constexpr int64_t kRedirectedResendInitNs = 100'000'000LL;     // 100 ms
     static constexpr int64_t kRedirectedResendMaxNs  = 2'000'000'000LL;   // 2 s
+    static constexpr int kMaxEgressUnavailableRetries = kMaxEgressUnavailableRetriesForTest;
     int64_t               redirectedResendBackoffNs_ = kRedirectedResendInitNs;
     uint64_t              unreachableRedirects_ = 0;
     uint64_t groupUpMask_   = 0;  // leader sessions (bit i-1 = session i) Connected last pass

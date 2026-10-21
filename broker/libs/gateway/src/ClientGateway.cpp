@@ -678,6 +678,7 @@ int ClientGateway::doWork(int64_t nowNs) {
     drainPendingResponses(nowNs);
     if (!pendingLineageNotes_.empty()) [[unlikely]] (void)flushPendingLineageNotes_();   // round 6 (F1)
     if (!pendingCatalogUnsubs_.empty()) [[unlikely]] (void)flushPendingCatalogUnsubs_();   // catalog Task 12
+    if (!sessionsWithReadEnds_.empty()) [[unlikely]] (void)flushPendingReadEnds_();         // issue #117
     // No-hang fix round 3: the no-hang counters, logged while the broker runs
     // (on change, at most every kNoHangStatsLogNs) — one compare per duty cycle.
     if (nowNs >= nextNoHangStatsLogNs_) [[unlikely]] (void)logNoHangStatsIfChanged_(nowNs);
@@ -1522,7 +1523,6 @@ bool ClientGateway::closeSession_(int64_t sid, bool notifyExpired)
     // Task 13: the workers forget it too (its queued acks drop, its
     // publications are released) — retried until every worker has it.
     if (shardMode_ && workerPool_) sessionAnnouncer_.close(*workerPool_, sid);
-    permissionShipper_.forget(sid);
     for (std::size_t i = 0; i < heldLoginFinals_.size(); ++i)
         if (heldLoginFinals_[i].sessionId == sid) { heldLoginFinals_.erase(heldLoginFinals_.begin() + static_cast<std::ptrdiff_t>(i)); break; }
     // Hybrid egress: drop any in-flight record-egress resolves for this session
@@ -4259,7 +4259,18 @@ void ClientGateway::releaseAwaiting_(const BufferedSubscribe& s, void* egressPub
 
 void ClientGateway::enqueueSubscribeOp_(const BufferedSubscribe& s, void* egressPub)
 {
-    if (const auto it = subscriptions_.find(s.subId); it != subscriptions_.end()) it->second.cursor = Cursor::AtWorker;
+    // Issue #118 (X020, M10): the ONE place a Subscribe without its own record egress would reach a worker - which then
+    // pushes on its shared dynamic-MDC publication, received by every party joined to the worker's advertised control
+    // port.  Under authentication that is a disclosure to principals without READ: the subscription is retired
+    // retriably instead (never a fallback).
+    if (egressPub == nullptr && authMode_ == rune::gateway::GatewayAuthMode::Required) [[unlikely]] {
+        retireWithoutRecordEgress_(s.subId);
+        return;
+    }
+    if (const auto it = subscriptions_.find(s.subId); it != subscriptions_.end()) {
+        it->second.cursor = Cursor::AtWorker;
+        if (it->second.okOwed) sendOwedSubscribeOk_(s.subId);   // F1: the egress exists: the held OK goes first
+    }
     rune::node::WorkerOp op = buildSubscribeOp_(s, egressPub);
 
     // M5: never dropped — a refused Subscribe (or one behind a queued lifecycle
@@ -4296,6 +4307,11 @@ bool ClientGateway::trySubOp_(const PendingSubOp& p)
     }
     // Re-resolve the egress publication NOW (never a pointer held across cycles).
     void* egressPub = nullptr;
+    if (p.mdc && authMode_ == rune::gateway::GatewayAuthMode::Required) [[unlikely]] {
+        // Issue #118: never queued under authentication (enqueueSubscribeOp_ retires it); defensive - nothing is sent.
+        retireWithoutRecordEgress_(p.sub.subId);
+        return true;
+    }
     if (!p.mdc) {
         rune::gateway::Session* sess = sessions_.find(p.sub.sessionId);
         if (!sess) return true;   // session gone: the Subscribe is moot (dropped)
@@ -4343,9 +4359,10 @@ void ClientGateway::forwardSubscribeToWorker_(int64_t subId, int64_t sessionId,
     //     the pub is ready (drained by pollPendingRecordEgress_).  Never blocks the
     //     control thread.
     if (!sess || !workerPool_) {
-        enqueueSubscribeOp_(s, nullptr);
+        enqueueSubscribeOp_(s, nullptr);   // under authentication: retired (issue #118)
         return;
     }
+    const bool authRequired = authMode_ == rune::gateway::GatewayAuthMode::Required;
     const int32_t wid = workerPool_->ownerWorkerId(topicId, partition);
     if (auto it = sess->recordEgressByWorker.find(wid);
         it != sess->recordEgressByWorker.end() && it->second) {
@@ -4353,6 +4370,9 @@ void ClientGateway::forwardSubscribeToWorker_(int64_t subId, int64_t sessionId,
         return;
     }
     if (sess->egressChannel.empty() || !aeron_) {
+        // Issue #118: under authentication the Subscribe waits as a FAILED resolve (regId -1), so the retirement is
+        // answered on the next pass, after this Subscribe's OK (the client then re-subscribes from its position).
+        if (authRequired) [[unlikely]] { parkAwaitingEgress_(s); return; }
         enqueueSubscribeOp_(s, nullptr);
         return;
     }
@@ -4371,8 +4391,16 @@ void ClientGateway::forwardSubscribeToWorker_(int64_t subId, int64_t sessionId,
             pend.requestedAtNs = nowNs_;
         } catch (...) {
             spdlog::warn("ClientGateway: record-egress pub create threw for session {} "
-                         "worker {} (channel '{}'); Subscribe uses MDC fallback",
-                         sessionId, wid, sess->egressChannel);
+                         "worker {} (channel '{}'); Subscribe {}",
+                         sessionId, wid, sess->egressChannel,
+                         authRequired ? "retired (no shared-egress fallback under authentication)" : "uses MDC fallback");
+            if (authRequired) [[unlikely]] {   // issue #118: answered on the next pass, after the OK
+                pend.regId = -1;
+                pend.requestedAtNs = nowNs_;
+                pend.waiters.push_back(s);
+                if (const auto it = subscriptions_.find(subId); it != subscriptions_.end()) it->second.cursor = Cursor::AwaitingEgress;
+                return;
+            }
             pendingRecordEgress_.erase({sessionId, wid});
             enqueueSubscribeOp_(s, nullptr);
             return;
@@ -4418,8 +4446,11 @@ void ClientGateway::pollPendingRecordEgress_(int64_t nowNs)
         }
         if (timedOut || pend.regId < 0) {
             spdlog::warn("ClientGateway: record-egress pub for session {} worker {} did not "
-                         "resolve ({} waiters) — falling back to MDC",
-                         sessionId, workerId, pend.waiters.size());
+                         "resolve ({} waiters) — {}",
+                         sessionId, workerId, pend.waiters.size(),
+                         authMode_ == rune::gateway::GatewayAuthMode::Required
+                             ? "retired NotLeader (no shared-egress fallback under authentication)"
+                             : "falling back to MDC");
             for (const auto& w : pend.waiters) releaseAwaiting_(w, nullptr);
             it = pendingRecordEgress_.erase(it);
             continue;
@@ -4438,6 +4469,80 @@ void ClientGateway::onRecordEgressResolved_(int64_t sessionId, int32_t workerId,
     }
     // else: the session closed meanwhile — its buffered subscribes are moot and
     // the pub (never handed to a worker) is released with `pub`.
+}
+
+void ClientGateway::sendOwedSubscribeOk_(int64_t subId)
+{
+    const auto it = subscriptions_.find(subId);
+    if (it == subscriptions_.end() || !it->second.okOwed) return;
+    Subscription& sub = it->second;
+    sub.okOwed = false;
+    Session* session = sessions_.find(sub.sessionId);
+    if (session == nullptr) return;
+    pc::SubscribeResponse resp;
+    resp.sessionId      = sub.sessionId;
+    resp.correlationId  = sub.subscribeCorrId;
+    resp.errorCode      = 0;
+    resp.partition      = sub.partition;
+    resp.subscriptionId = subId;
+    sendAnswer_(*session, scratch_.data(), resp.encode(scratch_.data()));
+    if (std::exchange(sub.okOwedLineage, false)) noteLineage_(subId);
+}
+
+void ClientGateway::retireWithoutRecordEgress_(int64_t subId)
+{
+    // Issue #118: a subscription this broker cannot serve on its own per-session record egress under authentication.
+    // Explicit, retriable, never silent: a plain subscription gets the position note + NotLeader on its correlation id
+    // (the client's moved-subscription path re-subscribes from its position, bounded by its retry budget); a group
+    // member's partition subscription evicts the session's members (the consumer rejoins).  Nothing reaches a worker.
+    const auto it = subscriptions_.find(subId);
+    if (it == subscriptions_.end()) return;   // ended meanwhile: nothing to answer
+    const Subscription sub = it->second;
+    subscriptions_.erase(it);
+    ++subscribesWithoutRecordEgress_;
+    if ((subscribesWithoutRecordEgress_ & (subscribesWithoutRecordEgress_ - 1)) == 0)   // first + each power of two
+        spdlog::warn("ClientGateway: subscription {:#x} (session {}, topic {} partition {}) has no record egress of its "
+                     "own - retired NotLeader, never pushed on the shared egress under authentication (so far: {})",
+                     subId, sub.sessionId, sub.topicId, sub.partition, subscribesWithoutRecordEgress_);
+    Session* session = sessions_.find(sub.sessionId);
+    if (session == nullptr) return;           // closed: it ended with its session
+    if (sub.okOwed) {
+        // PR #441 F1/F4: the Subscribe was never answered OK - it is answered now, as the pending request it still
+        // is, with its own cause (RecordEgressUnavailable, never a routing NotLeader): the client retries it a few
+        // times (plain and group-member fetches alike), then fails it explicitly; routing refusals stay unbounded.
+        session->subIdByKey.erase(Session::SubKey{sub.subscribeCorrId, sub.topicId, sub.partition});
+        pc::SubscribeResponse resp;
+        resp.sessionId      = sub.sessionId;
+        resp.correlationId  = sub.subscribeCorrId;
+        resp.errorCode      = static_cast<int16_t>(pc::ErrorCode::RecordEgressUnavailable);
+        resp.partition      = sub.partition;
+        resp.subscriptionId = 0;
+        sendAnswer_(*session, scratch_.data(), resp.encode(scratch_.data()));
+        return;
+    }
+    if (sub.isGroup) {
+        if (const auto g = groupMemberSubs_.find(sub.sessionId); g != groupMemberSubs_.end())
+            std::erase(g->second, subId);
+        if (groupService_ != nullptr) groupService_->evictSessionMembers(sub.sessionId, nowNs_);
+        return;
+    }
+    session->subIdByKey.erase(Session::SubKey{sub.subscribeCorrId, sub.topicId, sub.partition});
+    if (pc::clientUnderstandsMovedPositionNote(session->clientVersion)) {
+        pc::Records note;
+        note.sessionId      = sub.sessionId;
+        note.correlationId  = sub.subscribeCorrId;
+        note.subscriptionId = subId;
+        note.topicId        = sub.topicId;
+        note.partition      = sub.partition;
+        note.baseOffset     = sub.nextOffset;
+        note.recordBatch    = {};
+        sendAnswer_(*session, scratch_.data(), note.encode(scratch_.data()));
+    }
+    pc::ErrorResponse err;
+    err.sessionId     = sub.sessionId;
+    err.correlationId = sub.subscribeCorrId;
+    err.code          = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+    sendAnswer_(*session, scratch_.data(), err.encode(scratch_.data()));
 }
 
 void ClientGateway::forwardUnsubscribeToWorker_(int64_t subId, int32_t topicId, int32_t partition)
@@ -4935,7 +5040,7 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
             spdlog::debug("ClientGateway: duplicate Subscribe sessionId={} corrId={} topic={} partition={} "
                           "→ existing subId={} (no second subscription)",
                           msg.sessionId, msg.correlationId, msg.topicId, partition, dup->second);
-            sendResp(pc::ErrorCode::OK, partition, dup->second);
+            if (!existing->second.okOwed) sendResp(pc::ErrorCode::OK, partition, dup->second);   // F1: else it is owed
             return;
         }
         session->subIdByKey.erase(dup);   // stale index entry (sub already gone)
@@ -4955,6 +5060,17 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     sub.hadReplica      = replicaRegistry_ != nullptr &&
                           static_cast<bool>(replicaRegistry_->lookupHandle(msg.topicId, partition));
 
+    // PR #441 F1 (issue #118): under authentication a worker-pushed partition answers OK only once the session's own
+    // record egress for the owning worker exists (now, or when it resolves); a failed resolve then refuses the
+    // still-pending Subscribe NotLeader - the client's budget for THAT request counts, and runs out explicitly.
+    const bool workerPushed = perWorkerEgressActive_ && workerPool_ && msg.topicId >= 0;
+    if (workerPushed && authMode_ == rune::gateway::GatewayAuthMode::Required) {
+        const int32_t wid = workerPool_->ownerWorkerId(msg.topicId, partition);
+        const auto eg = session->recordEgressByWorker.find(wid);
+        sub.okOwed        = eg == session->recordEgressByWorker.end() || !eg->second;
+        sub.okOwedLineage = sub.okOwed && served.kind == ServedPartition::Kind::Transient;
+    }
+    const bool okOwed = sub.okOwed;
     subscriptions_.emplace(subId, std::move(sub));
     session->subIdByKey[subKey] = subId;   // 5a: the dedupe index
 
@@ -4963,12 +5079,13 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     // egress.  User partitions only (internal topicId < 0 stay gateway-pushed).
     // The gateway keeps its subscriptions_ record for setup/teardown; its
     // pushSubscriptions() skips these subs (see the per-worker-egress guard there).
-    if (perWorkerEgressActive_ && workerPool_ && msg.topicId >= 0) {
+    if (workerPushed) {
         forwardSubscribeToWorker_(subId, msg.sessionId, msg.topicId, partition,
                                   nextOffset, msg.isolation,
                                   /*isGroup=*/false, /*groupCarrierReceived=*/false,
                                   /*subscribeCorrId=*/msg.correlationId);
     }
+    if (okOwed) return;   // F1: the OK (and the lineage note) follow the egress, or the refusal replaces them
 
     // Reply SubscribeResponse{OK, partition, subscriptionId}.
     sendResp(pc::ErrorCode::OK, partition, subId);
@@ -5019,7 +5136,9 @@ void ClientGateway::handleCatalogSubscribe_(Session& session, const pc::Subscrib
         answer(pc::ErrorCode::Internal);
         return;
     }
-    if (!adminSink_->submitCatalogSubscribe(msg.sessionId, msg.correlationId, msg.fromOffset)) {
+    // Issue #117: an end of this kind still owed to the admin goes first (FIFO) - else it would end the new read.
+    const bool endOwed = (session.pendingReadEnds & Session::kPendingEndCatalogReads) != 0 && !submitReadEnds_(session);
+    if (endOwed || !adminSink_->submitCatalogSubscribe(msg.sessionId, msg.correlationId, msg.fromOffset)) {
         // Back-pressure on the admin ring: the retriable NotLeader (the client retries).
         pc::ErrorResponse er;
         er.sessionId     = msg.sessionId;
@@ -5062,7 +5181,9 @@ void ClientGateway::handleSecuritySubscribe_(Session& session, const pc::Subscri
         answer(pc::ErrorCode::Internal);
         return;
     }
-    if (!adminSink_->submitSecuritySubscribe(msg.sessionId, msg.correlationId, msg.fromOffset)) {
+    // Issue #117: an end of this kind still owed to the admin goes first (FIFO) - else it would end the new read.
+    const bool endOwed = (session.pendingReadEnds & Session::kPendingEndSecurityReads) != 0 && !submitReadEnds_(session);
+    if (endOwed || !adminSink_->submitSecuritySubscribe(msg.sessionId, msg.correlationId, msg.fromOffset)) {
         pc::ErrorResponse er;
         er.sessionId     = msg.sessionId;
         er.correlationId = msg.correlationId;
@@ -5087,6 +5208,14 @@ bool ClientGateway::submitCatalogOrSecurityUnsub_(int64_t sid, int64_t subscript
 void ClientGateway::forwardCatalogUnsubscribe_(int64_t sid, int64_t subscriptionId)
 {
     if (adminSink_ == nullptr) return;
+    // Issue #117: an authorization end of a LIVE session is never subject to the cap below (it was dropped there, and
+    // a session that lost ADMIN kept streaming `__security`): the session holds it until the admin ring takes it.
+    if (subscriptionId == rune::gateway::kEndCatalogReadsOnly || subscriptionId == rune::gateway::kEndSecurityReadsOnly) {
+        if (Session* s = sessions_.find(sid))
+            endAdminLogReads_(*s, subscriptionId == rune::gateway::kEndSecurityReadsOnly ? Session::kPendingEndSecurityReads
+                                                                                     : Session::kPendingEndCatalogReads);
+        return;   // no session: its close (-1) ends both servers' reads
+    }
     // FIFO behind any already waiting (a close after a single unsubscribe stays after it).
     // A `__security` subscription id names the second read server (its own request-ring message).
     if (pendingCatalogUnsubs_.empty() && submitCatalogOrSecurityUnsub_(sid, subscriptionId)) return;
@@ -5120,6 +5249,82 @@ void ClientGateway::forwardCatalogUnsubscribe_(int64_t sid, int64_t subscription
         }
     }
     pendingCatalogUnsubs_.push_back(PendingCatalogUnsubscribe{sid, subscriptionId});   // reserved: never allocates
+}
+
+void ClientGateway::endAdminLogReads_(Session& s, uint8_t bit)
+{
+    const bool listed = s.pendingReadEnds != 0;
+    s.pendingReadEnds |= bit;   // coalesced: one end per kind ends every read of that kind
+    if (submitReadEnds_(s) || listed) return;
+    sessionsWithReadEnds_.push_back(s.sessionId);   // one entry per session: bounded by the sessions
+}
+
+bool ClientGateway::submitReadEnds_(Session& s)
+{
+    if (adminSink_ == nullptr) { s.pendingReadEnds = 0; return true; }
+    if ((s.pendingReadEnds & Session::kPendingEndCatalogReads) != 0 &&
+        adminSink_->submitCatalogUnsubscribe(s.sessionId, rune::gateway::kEndCatalogReadsOnly))
+        s.pendingReadEnds &= static_cast<uint8_t>(~Session::kPendingEndCatalogReads);
+    if ((s.pendingReadEnds & Session::kPendingEndSecurityReads) != 0 &&
+        adminSink_->submitSecurityUnsubscribe(s.sessionId, -1))
+        s.pendingReadEnds &= static_cast<uint8_t>(~Session::kPendingEndSecurityReads);
+    return s.pendingReadEnds == 0;
+}
+
+int ClientGateway::flushPendingReadEnds_()
+{
+    int sent = 0;
+    std::size_t keep = 0;
+    for (std::size_t i = 0; i < sessionsWithReadEnds_.size(); ++i) {
+        Session* s = sessions_.find(sessionsWithReadEnds_[i]);
+        if (s == nullptr) continue;                      // closed: its close (-1) supersedes the ends
+        if (submitReadEnds_(*s)) { ++sent; continue; }
+        sessionsWithReadEnds_[keep++] = sessionsWithReadEnds_[i];
+    }
+    sessionsWithReadEnds_.resize(keep);
+    return sent;
+}
+
+ClientGateway::AdminLogAdmit ClientGateway::admitAdminLogFrame(int64_t sessionId, int64_t subId, const uint8_t* frame,
+                                                              std::size_t len)
+{
+    using rune::security::Operation;
+    if (authMode_ != rune::gateway::GatewayAuthMode::Required) return AdminLogAdmit::Deliver;
+    const Session* s = sessions_.find(sessionId);
+    if (s == nullptr) return AdminLogAdmit::Deliver;    // the offer answers NoSession
+    const bool security = rune::gateway::isSecuritySubscriptionId(subId);
+    const PermissionTable& perms = permsOf_(*s);
+    if (!perms.allowsCluster(rune::security::opBit(security ? Operation::Admin : Operation::Describe))) {
+        ++adminLogFramesWithheld_;
+        return AdminLogAdmit::Withhold;
+    }
+    if (!security) return AdminLogAdmit::Deliver;
+    // A `__security` Records frame: [header 24][body 24][u32 batch bytes][batches].  Its newest EVENT (control batches
+    // are consumed by the applier, never mirrored) must be applied by this thread's SecurityView first - otherwise a
+    // revoke the admin applied and streamed ahead of this thread would let the events after it (verifiers) through.
+    constexpr std::size_t kBatchesAt = 24 + 24 + 4;
+    if (len <= kBatchesAt) return AdminLogAdmit::Deliver;   // the epoch note / marker carry no event
+    uint32_t batchBytes = 0;
+    std::memcpy(&batchBytes, frame + kBatchesAt - 4, 4);
+    std::size_t rem = std::min<std::size_t>(batchBytes, len - kBatchesAt);
+    const uint8_t* p = frame + kBatchesAt;
+    int64_t newestEvent = -1;
+    while (rem >= static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead)) {
+        rune::protocol::RecordBatchReader reader(p, rem);
+        if (!reader.ensureValid()) break;
+        if (!reader.isControl())
+            newestEvent = std::max(newestEvent, reader.baseOffset() + static_cast<int64_t>(reader.lastOffsetDelta()));
+        const auto tl = static_cast<std::size_t>(reader.totalLength());
+        if (tl == 0 || tl > rem) break;
+        p += tl;
+        rem -= tl;
+    }
+    if (newestEvent < 0) return AdminLogAdmit::Deliver;
+    if (securityView_ == nullptr || securityView_->halted()) {   // fail closed: the halt revokes the session
+        ++adminLogFramesWithheld_;
+        return AdminLogAdmit::Withhold;
+    }
+    return newestEvent <= securityView_->appliedOffset() ? AdminLogAdmit::Deliver : AdminLogAdmit::Hold;
 }
 
 int ClientGateway::flushPendingCatalogUnsubs_()
@@ -7752,7 +7957,7 @@ void ClientGateway::answerGate_(Session& sessionRef, const pc::MessageHeader& hd
 // ---------------------------------------------------------------------------
 const rune::gateway::PermissionTable& ClientGateway::permsOf_(const Session& s) const noexcept
 {
-    if (const auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&s.auth)) return a->perms;
+    if (const auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&s.auth)) return a->perms.table();
     // Dev / in-process brokers authenticate nobody: everything is allowed whatever a session's (test-set) state says.
     // On an authenticating broker only AuthAuthenticated holds grants: AuthAnonymous (the state of nobody who logged
     // in) is denied everything (X013).
@@ -7760,11 +7965,25 @@ const rune::gateway::PermissionTable& ClientGateway::permsOf_(const Session& s) 
     return denyAllPerms_;
 }
 
-rune::gateway::PermissionTable ClientGateway::compilePerms_(uint64_t userId) const
+rune::gateway::PermissionRef ClientGateway::compilePerms_(uint64_t userId)
 {
-    if (securityView_ == nullptr) return rune::gateway::PermissionTable::denyAll();
-    const std::vector<rune::security::GrantSpec> grants = rune::security::effectiveGrants(securityView_->state(), userId);
-    return rune::gateway::PermissionTable::compile(grants, objectIndex_);
+    if (securityView_ == nullptr) return rune::gateway::PermissionRef{};   // deny-all
+    // Issue #259: the effective set is computed per principal (O(its grants)); the table is compiled only when no
+    // session holds that exact set already.
+    return permPool_.acquire(rune::security::effectiveGrants(securityView_->state(), userId), objectIndex_);
+}
+
+void ClientGateway::syncPermissionTables_()
+{
+    if (!permPool_.hasEvents()) return;
+    const bool shipping = authMode_ == rune::gateway::GatewayAuthMode::Required && shardMode_ && workerPool_;
+    permPool_.drainEvents([&](rune::gateway::PermissionPool::Event ev, uint32_t id, const PermissionTable& t) {
+        if (!shipping) return;
+        if (ev == rune::gateway::PermissionPool::Event::Created)
+            (void)permissionShipper_.shipTable(*workerPool_, id, t.writeBits(), t.isAllowAll());
+        else
+            (void)permissionShipper_.dropTable(*workerPool_, id);
+    });
 }
 
 void ClientGateway::onCatalogObjectApplied(int32_t id, const std::string& name, bool isView)
@@ -7772,24 +7991,27 @@ void ClientGateway::onCatalogObjectApplied(int32_t id, const std::string& name, 
     if (isView) objectIndex_.onView(id, name); else objectIndex_.onTopic(id, name);
     const rune::gateway::ObjectEntry* e = objectIndex_.at(id);
     if (e == nullptr) return;
-    sessions_.forEach([&](Session& s) {
-        if (auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&s.auth)) {
-            a->perms.onObjectCreated(id, *e);
-            // Prefix extension (spec §6): a WRITE grant that now covers the new topic reaches the workers too.
-            if (a->perms.allows(id, rune::security::opBit(rune::security::Operation::Write))) (void)shipPermissions_(s);
-        }
+    // Issue #259: every LIVE TABLE once (not every session); a table whose WRITE bit of the new object changed (a
+    // prefix grant now covering it, spec §6) ships that one word - never a full bitmap.
+    syncPermissionTables_();   // the workers know every live table before any patch of one
+    const bool shipping = authMode_ == rune::gateway::GatewayAuthMode::Required && shardMode_ && workerPool_;
+    permPool_.onObjectCreated(id, *e, [&](uint32_t tid, const PermissionTable& t, bool before, bool after) {
+        if (!shipping || before == after) return;
+        const auto w = static_cast<std::size_t>(id) / 64;
+        (void)permissionShipper_.patchTable(*workerPool_, tid, w, t.writeBits().subspan(w, 1), t.writeBits().size());
     });
 }
 
 void ClientGateway::onCatalogObjectDropped(int32_t id)
 {
     objectIndex_.onDropped(id);
-    sessions_.forEach([&](Session& s) {
-        if (auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&s.auth)) {
-            const bool hadWrite = a->perms.allows(id, rune::security::opBit(rune::security::Operation::Write));
-            a->perms.onObjectDropped(id);
-            if (hadWrite) (void)shipPermissions_(s);
-        }
+    syncPermissionTables_();
+    const bool shipping = authMode_ == rune::gateway::GatewayAuthMode::Required && shardMode_ && workerPool_;
+    permPool_.onObjectDropped(id, [&](uint32_t tid, const PermissionTable& t, bool before, bool) {
+        if (!shipping || !before) return;
+        const auto w = static_cast<std::size_t>(id) / 64;
+        if (w < t.writeBits().size())
+            (void)permissionShipper_.patchTable(*workerPool_, tid, w, t.writeBits().subspan(w, 1), t.writeBits().size());
     });
 }
 
@@ -8098,7 +8320,7 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
     f.flags           = ok.mustChangePassword ? pc::kAuthFlagMustChangePassword : uint8_t{0};
     f.serverSignature = std::string_view(reinterpret_cast<const char*>(ok.serverSignature.data()), ok.serverSignature.size());
     const std::size_t finalLen = f.encode(scratch_.data());
-    if (shipEpoch != 0 && permissionShipper_.fullyShippedEpoch(session->sessionId) < shipEpoch) {
+    if (shipEpoch != 0 && permissionShipper_.shippedSeq() < shipEpoch) {
         // A worker's lifecycle ring is full: hold the OK (cold, login rate) until every worker accepted the bitmap.
         heldLoginFinals_.push_back({session->sessionId, shipEpoch,
                                     std::vector<uint8_t>(scratch_.data(), scratch_.data() + finalLen)});
@@ -8112,20 +8334,24 @@ uint64_t ClientGateway::shipPermissions_(const Session& session)
     if (authMode_ != rune::gateway::GatewayAuthMode::Required || !shardMode_ || !workerPool_) return 0;
     const auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&session.auth);
     if (a == nullptr) return 0;   // must-change-password / anonymous: the worker slot stays empty (deny)
+    syncPermissionTables_();   // a new table's content goes first: a bind never names a table the workers lack
     const uint64_t epoch = ++permEpoch_;
-    (void)permissionShipper_.ship(*workerPool_, session.sessionId, a->perms.writeBits(), a->perms.isAllowAll(), epoch,
-                                  a->userId);   // #122: producer ids are checked against the principal
-    return epoch;
+    const uint32_t id = a->perms.id();
+    return permissionShipper_.bind(*workerPool_, session.sessionId,
+                                   id == rune::gateway::PermissionRef::kNoId ? rune::node::PermissionShipper::kDenyTable
+                                                                             : static_cast<int64_t>(id),
+                                   epoch, a->userId);   // #122: producer ids are checked against the principal
 }
 
 int ClientGateway::servicePermissionShippingWork_()
 {
     int work = 0;
+    syncPermissionTables_();   // issue #259: a freed table's drop (after every rebind away from it)
     if (!workerPool_ || !shardMode_) return 0;
     if (permissionShipper_.pendingUpdates() != 0) work += permissionShipper_.retry(*workerPool_);
     for (std::size_t i = 0; i < heldLoginFinals_.size(); ) {
         HeldLoginFinal& h = heldLoginFinals_[i];
-        if (permissionShipper_.fullyShippedEpoch(h.sessionId) < h.epoch) { ++i; continue; }
+        if (permissionShipper_.shippedSeq() < h.epoch) { ++i; continue; }
         if (Session* s = sessions_.find(h.sessionId)) sendAnswer_(*s, h.frame.data(), h.frame.size());
         heldLoginFinals_.erase(heldLoginFinals_.begin() + static_cast<std::ptrdiff_t>(i));
         ++work;
@@ -8235,13 +8461,14 @@ void ClientGateway::refreshSession_(int64_t sid)
     }
     auto* a = std::get_if<AuthAuthenticated>(&s->auth);
     if (a == nullptr) return;
-    PermissionTable fresh = compilePerms_(a->userId);
-    const LiveActions actions = refreshActions(a->perms, fresh, *s, objectIndex_);
-    const bool writeChanged = a->perms.isAllowAll() != fresh.isAllowAll() ||
-                              !std::equal(a->perms.writeBits().begin(), a->perms.writeBits().end(),
-                                          fresh.writeBits().begin(), fresh.writeBits().end());
-    a->perms = std::move(fresh);
-    if (writeChanged) (void)shipPermissions_(*s);   // a revoked WRITE fails the next produce on both paths
+    // Issue #259: a pooled table - compiled only if no session holds the new set yet; the same set = the same table.
+    PermissionRef fresh = compilePerms_(a->userId);
+    if (fresh.id() == a->perms.id() && fresh.id() != PermissionRef::kNoId) return;   // nothing changed for it
+    const LiveActions actions = refreshActions(a->perms.table(), fresh.table(), *s, objectIndex_);
+    // The old table is held until the rebind is queued: its drop (if this was its last holder) must FOLLOW the bind,
+    // or the worker would deny this session between the two.
+    const PermissionRef old = std::exchange(a->perms, std::move(fresh));
+    (void)shipPermissions_(*s);   // a revoked WRITE fails the next produce on both paths
     if (!actions.empty()) executeLiveActions_(*s, actions);
 }
 
