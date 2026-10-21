@@ -4925,7 +4925,9 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
                     // applied the event (pumpSecurityGate_); a full gate answers Internal at once, never drops.
                     if (n < 16 + rune::protocol::client::MessageHeader::ENCODED_SIZE) return;
                     const int64_t eventOffset = admin_wire::getI64(p + 8);
-                    securityGate_.hold(session, eventOffset, std::span<const uint8_t>(p + 16, n - 16), send);
+                    const int64_t heldNs = std::chrono::duration_cast<std::chrono::nanoseconds>(   // #120: the deadline's clock
+                        std::chrono::steady_clock::now().time_since_epoch()).count();
+                    securityGate_.hold(session, eventOffset, std::span<const uint8_t>(p + 16, n - 16), send, heldNs);
                     return;
                 }
                 const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -4960,7 +4962,15 @@ int BrokerNode::pumpSecurityGate_() {
     // Task 14: the gateway reports what it enforces (tables refreshed, bitmaps accepted by every worker); the boot / no-gateway
     // baseline is securityRefreshedOffset_.
     const int64_t enforced = gateway_ ? std::max(securityRefreshedOffset_, gateway_->securityEnforcedOffset()) : securityRefreshedOffset_;
-    return securityGate_.release(std::min(securityView_->appliedOffset(), enforced), send);
+    int n = securityGate_.release(std::min(securityView_->appliedOffset(), enforced), send);
+    // Issue #120: never held forever - a worker that does not acknowledge its fence (a stalled op ring) leaves the OK
+    // in doubt after the deadline (Internal, "committed at offset N; enforcement not confirmed"; a retry dedupes).
+    if (!securityGate_.empty()) [[unlikely]] {
+        const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        n += securityGate_.expire(nowNs, config_.securityGateDeadlineMs * 1'000'000LL, send);
+    }
+    return n;
 }
 
 int AdminControlPlane::doWork(int64_t nowNs) {

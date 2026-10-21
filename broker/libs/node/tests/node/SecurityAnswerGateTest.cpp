@@ -88,3 +88,32 @@ TEST(SecurityAnswerGateRegression, AHaltedMirrorAnswersEveryHeldOkInternal) {
     }
     EXPECT_TRUE(gate.empty());
 }
+
+// Issue #120 (RED before the fix: no deadline - an OK whose enforcement a worker never acknowledges, e.g. a worker whose
+// op ring is paused by a slow consumer's ack backlog, was held forever and the DDL client saw only its own timeout).
+// Past the deadline it is answered Internal "committed at offset N; enforcement on this broker not confirmed" on the
+// same correlation id (a retry with the same requestId dedupes); a younger OK stays held.
+TEST(SecurityAnswerGateRegression, HeldSecurityOkIsAnsweredInDoubtAfterTheDeadlineRegression) {
+    SecurityAnswerGate gate;
+    std::vector<Sent> sent;
+    auto send = [&](int64_t s, const uint8_t* f, std::size_t n) { sent.push_back({s, std::vector<uint8_t>(f, f + n)}); };
+    constexpr int64_t kDeadline = 5'000'000'000;
+    gate.hold(7, /*offset=*/12, okFrame(7, 42), send, /*nowNs=*/1'000);
+    gate.hold(8, /*offset=*/13, okFrame(8, 43), send, /*nowNs=*/3'000'000'000);
+    EXPECT_EQ(gate.release(11, send), 0);
+    EXPECT_EQ(gate.expire(1'000 + kDeadline, kDeadline, send), 0) << "exactly at the deadline: still held";
+    EXPECT_TRUE(sent.empty());
+    EXPECT_EQ(gate.expire(1'001 + kDeadline, kDeadline, send), 1) << "past it: answered in doubt";
+    ASSERT_EQ(sent.size(), 1u);
+    EXPECT_EQ(sent[0].session, 7);
+    const auto r = pc::DdlResponse::decode(sent[0].frame.data(), sent[0].frame.size());
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->correlationId, 42) << "on the held request's own correlation id";
+    EXPECT_EQ(r->errorCode, static_cast<uint16_t>(pc::ErrorCode::Internal));
+    EXPECT_NE(std::string(r->detail).find("committed at offset 12"), std::string::npos) << r->detail;
+    EXPECT_NE(std::string(r->detail).find("not confirmed"), std::string::npos) << r->detail;
+    EXPECT_EQ(gate.size(), 1u) << "the younger OK stays held";
+    EXPECT_EQ(gate.expiredAnswers(), 1u);
+    EXPECT_EQ(gate.release(13, send), 1) << "and is released normally once enforced";
+    EXPECT_TRUE(gate.empty());
+}

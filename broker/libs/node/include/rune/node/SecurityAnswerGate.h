@@ -11,7 +11,9 @@
 // min(applied, refreshed) offset on every control pass.
 //
 // No-hang: a full gate answers Internal at once (never drops, never blocks); a halted view answers every held OK
-// Internal (failAll) - the OK would claim an enforcement this broker can no longer give.
+// Internal (failAll) - the OK would claim an enforcement this broker can no longer give; issue #120: an OK held past
+// the deadline (RUNE_SECURITY_GATE_DEADLINE_MS) is answered Internal "committed at offset N; enforcement on this broker
+// not confirmed" (expire) - the change is committed, a retry with the same requestId dedupes to its result.
 //
 // Control-thread-owned, single-threaded.  Preallocated (kSlots x kFrameMax); hold / release never allocate.
 
@@ -19,7 +21,9 @@
 #include <rune/protocol/client/Protocol.h>
 #include <rune/protocol/client/SchemaMessages.h>
 
+#include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -43,7 +47,7 @@ public:
     /// Hold the OK `frame` of the event at `offset` for `sessionId`.  A frame that does not fit a slot, or a full gate,
     /// is answered Internal through `send` at once - never dropped.
     template <class Send>
-    void hold(int64_t sessionId, int64_t offset, std::span<const uint8_t> frame, Send&& send) {
+    void hold(int64_t sessionId, int64_t offset, std::span<const uint8_t> frame, Send&& send, int64_t nowNs = 0) {
         if (count_ == kSlots || frame.size() > kFrameMax) [[unlikely]] {
             answerInternal_(sessionId, frame, count_ == kSlots ? "the security answer gate is full - the change may have been "
                                                                  "applied; retry with the same requestId"
@@ -54,6 +58,7 @@ public:
         Slot& s = slots_[count_++];
         s.session = sessionId;
         s.offset  = offset;
+        s.heldAtNs = nowNs;
         s.len     = static_cast<uint16_t>(frame.size());
         std::memcpy(s.frame.data(), frame.data(), frame.size());
     }
@@ -78,6 +83,35 @@ public:
         return sent;
     }
 
+    /// Issue #120: every OK held since before `nowNs - deadlineNs` is answered Internal (in doubt: committed, not
+    /// confirmed enforced here) - never held forever.  Returns the number answered.
+    template <class Send>
+    int expire(int64_t nowNs, int64_t deadlineNs, Send&& send) {
+        int n = 0;
+        std::size_t keep = 0;
+        for (std::size_t i = 0; i < count_; ++i) {
+            Slot& s = slots_[i];
+            if (nowNs - s.heldAtNs > deadlineNs) {
+                char detail[200];
+                const int m = std::snprintf(detail, sizeof detail,
+                                            "committed at offset %lld; enforcement on this broker not confirmed within "
+                                            "%lld ms - retry with the same requestId",
+                                            static_cast<long long>(s.offset), static_cast<long long>(deadlineNs / 1'000'000));
+                answerInternal_(s.session, std::span<const uint8_t>(s.frame.data(), s.len),
+                                std::string_view(detail, m > 0 ? static_cast<std::size_t>(std::min<int>(m, sizeof detail - 1)) : 0u),
+                                send);
+                ++n;
+                ++expired_;
+            } else {
+                if (keep != i) slots_[keep] = s;
+                ++keep;
+            }
+        }
+        count_ = keep;
+        return n;
+    }
+    [[nodiscard]] uint64_t expiredAnswers() const noexcept { return expired_; }
+
     /// The mirror halted: every held OK is answered Internal.
     template <class Send>
     int failAll(std::string_view detail, Send&& send) {
@@ -95,6 +129,7 @@ private:
     struct Slot {
         int64_t session = 0;
         int64_t offset  = -1;
+        int64_t heldAtNs = 0;
         uint16_t len    = 0;
         std::array<uint8_t, kFrameMax> frame{};
     };
@@ -118,6 +153,7 @@ private:
     std::unique_ptr<Slot[]> slots_;
     std::size_t count_ = 0;
     uint64_t internalAnswers_ = 0;
+    uint64_t expired_ = 0;
 };
 
 } // namespace rune::node

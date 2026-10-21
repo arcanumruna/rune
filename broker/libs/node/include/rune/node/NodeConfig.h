@@ -505,6 +505,36 @@ struct NodeConfig {
     std::string clusterKeyFileNext;
     int64_t     authTimeoutMs    = 10'000;
     int32_t     peerAuthStreamId = 40;
+    // Issues #15 / #111 (decision M7): a broker serves logins, `__security` reads and security DDL only while its
+    // `__security` state is provably current - caught up with the current leader since boot, a leader answer (a
+    // follower) within F and the consensus in contact within F; otherwise it answers the retriable AuthUnavailable (48).
+    //   RUNE_SECURITY_MAX_STALENESS_MS      — F (default 1 000); must exceed the broker liveness timeout + 500 ms, so a
+    //                                         leader failover never makes a healthy broker stale (an explicit value
+    //                                         that does not is refused; the default is raised to it).
+    //   RUNE_SECURITY_STALE_SESSION_END_MS  — R (default 10 000; > F): a broker stale this long ends its authenticated
+    //                                         sessions with a session-level 48 (clients reconnect elsewhere).
+    //   RUNE_SECURITY_GATE_DEADLINE_MS      — issue #120: a security DDL OK held by the D24 gate longer than this
+    //                                         (default 5 000) is answered Internal "committed; enforcement not confirmed".
+    int64_t     securityMaxStalenessMs     = 1'000;
+    int64_t     securityStaleSessionEndMs  = 10'000;
+    int64_t     securityGateDeadlineMs     = 5'000;
+    /// F and R as the broker applies them: never below liveness + 501 ms / F + 1 ms (a default raised by long election
+    /// timings or RUNE_BROKER_LIVENESS_TIMEOUT_MS; an explicit env value that violates it is refused at parse).
+    [[nodiscard]] int64_t effectiveSecurityMaxStalenessMs() const noexcept {
+        const int64_t floor = effectiveBrokerLivenessMs() + 501;
+        return securityMaxStalenessMs > floor ? securityMaxStalenessMs : floor;
+    }
+    [[nodiscard]] int64_t effectiveSecurityStaleSessionEndMs() const noexcept {
+        const int64_t f = effectiveSecurityMaxStalenessMs();
+        return securityStaleSessionEndMs > f ? securityStaleSessionEndMs : f + 1;
+    }
+    /// The broker liveness timeout the controller applies (ms): brokerLivenessTimeoutMs, else 3 x the election's
+    /// leader-heartbeat timeout (max(electionTimeout, 3 x statusInterval)) - the same derivation as the runtime's.
+    [[nodiscard]] int64_t effectiveBrokerLivenessMs() const noexcept {
+        if (brokerLivenessTimeoutMs > 0) return brokerLivenessTimeoutMs;
+        const int64_t hb = electionTimeoutMs > 3 * electionStatusIntervalMs ? electionTimeoutMs : 3 * electionStatusIntervalMs;
+        return 3 * hb;
+    }
 
     // Milestone E1: number of in-process partition workers. Each owned shard is
     // assigned to worker = hash(shardId) % workerCount (ShardRouter). Default 1
@@ -977,6 +1007,9 @@ struct NodeConfig {
     /// nullopt = valid; else the error.  Checked by parseNodeConfig and by
     /// BrokerNode at start (programmatic configs).
     std::optional<std::string> validateCatalogStream() const;
+    /// Issues #15 / #111: F > the broker liveness timeout + 500 ms (a failover never makes a healthy broker stale) and
+    /// R > F; a positive gate deadline.  Checked by the env parser (in-process rigs set the fields directly).
+    std::optional<std::string> validateSecurityServing(bool stalenessExplicit = true, bool sessionEndExplicit = true) const;
 
     /// Authentication plan Task 9 (D31/D32).  nullopt = valid; else the explicit refusal naming the variable:
     ///   * DevDisabled with more than one peer ("RUNE_AUTH=disabled (dev mode) refuses to start as part of a
