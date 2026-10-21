@@ -49,6 +49,8 @@ bool readAll(int fd, void* buf, std::size_t n, std::chrono::steady_clock::time_p
 std::vector<std::vector<uint16_t>> allocateConcurrently() {
     int go[2];
     if (::pipe(go) != 0) return {};
+    int rel[2];   // release: the parent closes its write end once it read every child
+    if (::pipe(rel) != 0) return {};
     std::vector<pid_t> kids;
     std::vector<int>   answers;
     for (int k = 0; k < kChildren; ++k) {
@@ -70,8 +72,13 @@ std::vector<std::vector<uint16_t>> allocateConcurrently() {
             uint32_t n = static_cast<uint32_t>(mine.size());
             (void)::write(out[1], &n, sizeof n);
             (void)::write(out[1], mine.data(), n * sizeof(uint16_t));
-            pollfd pf{go[0], POLLIN, 0};
-            (void)::poll(&pf, 1, 30'000);   // hold the blocks until the parent read everyone (EOF), bounded
+            // Hold the blocks until the parent read everyone: EOF on the RELEASE pipe (nothing is ever written to
+            // it), bounded.  Holding on the barrier pipe was wrong: poll(POLLIN) returned at once while a slower
+            // sibling's barrier byte was still unread, so a fast child exited - releasing its blocks - while the
+            // others were still claiming, and they took the same ports (seen on Linux).
+            ::close(rel[1]);
+            pollfd pf{rel[0], POLLIN, 0};
+            if (::poll(&pf, 1, 30'000) > 0) { char eof; (void)::read(rel[0], &eof, 1); }
             ::_exit(0);
         }
         ::close(out[1]);
@@ -90,7 +97,9 @@ std::vector<std::vector<uint16_t>> allocateConcurrently() {
         if (!readAll(fd, v.data(), n * sizeof(uint16_t), deadline)) break;
         all.push_back(std::move(v));
     }
-    ::close(go[1]);   // release the children
+    ::close(go[1]);
+    ::close(rel[1]);  // release the children (EOF)
+    ::close(rel[0]);
     for (int fd : answers) ::close(fd);
     for (pid_t p : kids) { int st = 0; ::waitpid(p, &st, 0); }
     return all;

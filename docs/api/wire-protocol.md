@@ -19,7 +19,7 @@ body; all integers are little-endian. The source of truth is the headers:
 Variable-length fields (strings, byte blobs) follow the fixed part, each with a length prefix.
 
 Capability is negotiated with two numbers in `Connect`/`ConnectResponse`: `clientVersion` (this protocol's client
-announces `9`, `kClientVersion`) and `brokerVersion` (`5`, `kBrokerVersion`). A broker answers a client below a
+announces `10`, `kClientVersion`) and `brokerVersion` (`5`, `kBrokerVersion`). A broker answers a client below a
 feature's version in the older way; an authentication-enabled broker answers a `Connect` below 9
 `ConnectResponse{ProtocolVersion}`.
 
@@ -33,6 +33,7 @@ feature's version in the older way; an authentication-enabled broker answers a `
 | 7 | Transient lineage note and claim (`PartitionDataReset`, 43). |
 | 8 | Catalog DDL: the DDL extension, frames 74 to 78, DDL redirects. |
 | 9 | Authentication: frames 12 to 15, 79 and 80, error codes 44 to 47. |
+| 10 | `TxnOffsetCommit` member block (`generationId`, `memberId` after the entries; KIP-447); `UnstableOffsetCommit` (50). An older broker ignores the block; a broker answers a session below 10 `NotCoordinator` instead of 50. |
 
 ## Frame catalogue
 
@@ -85,7 +86,7 @@ security 64 to 95.
 | 48 | `AddPartitionsToTxnResponse` | B→C | `results` |
 | 49 | `AddOffsetsToTxn` | C→B | `producerId`, `producerEpoch`, `transactionalId`, `groupId` |
 | 50 | `AddOffsetsToTxnResponse` | B→C | `errorCode` |
-| 51 | `TxnOffsetCommit` | C→B | `producerId`, `producerEpoch`, `transactionalId`, `groupId`, `entries` |
+| 51 | `TxnOffsetCommit` | C→B | `producerId`, `producerEpoch`, `transactionalId`, `groupId`, `entries`, then optionally (client 10) `generationId` i32 + `memberId` |
 | 52 | `TxnOffsetCommitResponse` | B→C | `results` |
 | 53 | `EndTxn` | C→B | `producerId`, `producerEpoch`, `commit`, `transactionalId` |
 | 54 | `EndTxnResponse` | B→C | `errorCode` |
@@ -235,6 +236,7 @@ senderId u8` (0 = gateway, `i+1` = worker `i`) and a `seq u64`
 | 47 | `PasswordChangeRequired` | A one-time-password session may only change its password. | fails that request |
 | 48 | `AuthUnavailable` | The broker's `__security` state is not current (catching up after a start, or stale: cut off its leader or the consensus): no login, `__security` read or security DDL is served. As the session-level `ErrorResponse` (correlation id 0): the broker stayed stale too long and ended the session. Sent to every client version. | retried: back off and reconnect fresh, rotating brokers; never terminal |
 | 49 | `RecordEgressUnavailable` | Authenticating broker only: the session's own record stream for the partition's worker could not be built (there is no shared-stream fallback). Sent in `SubscribeResponse.errorCode` on the pending Subscribe. | retried a few times (a bind resets the count), then fails the subscription or the group consumer with an error |
+| 50 | `UnstableOffsetCommit` | Client 10: `OffsetFetch` / `OffsetCommit` of a partition an unfinished transaction holds a pending offset on (until its completion is durable), or while the transaction coordinator is not loaded. Nothing is appended. | retried after a backoff, never surfaced |
 
 The broker-internal storage errors (`rune::protocol::ErrorCode`, [`Errors.h`](../../protocol/include/rune/protocol/Errors.h))
 are a separate, small enum used inside the log: `OffsetOutOfRange`=1, `CorruptRecord`=2, `InvalidRecordBatch`=3,

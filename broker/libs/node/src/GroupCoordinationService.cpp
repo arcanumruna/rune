@@ -62,6 +62,7 @@ GroupCoordinationService::GroupCoordinationService(
     groupIdScratch_.reserve(64);
     memberIdScratch_.reserve(64);
     memberKeyScratch_.reserve(128);
+    parkedResults_.resize(kParkedResultsCapacity);   // #433: the parked answers' results ring (once)
 }
 
 // ---------------------------------------------------------------------------
@@ -206,11 +207,12 @@ int GroupCoordinationService::doWork(int64_t nowNs) {
         offsetsRebuilt_ = false;
     }
 
-    if (coordinators_.empty()) return 0;
+    int work = parkedCount_ != 0 ? releaseParkedCommits_() : 0;   // #433
+
+    if (coordinators_.empty()) return work;
 
     sweepSupersededLineages_(nowNs);   // R1 (round 5)
 
-    int work = 0;
     for (auto& [groupId, coord] : coordinators_) {
         const coord::GroupState stateBefore = coord.state();
 
@@ -942,16 +944,18 @@ coord::TxnOffsetApply GroupCoordinationService::applyTransactionalOffset(const s
                                                                          coord::TxnOffsetToken token)
 {
     using R = coord::TxnOffsetApply;
-    if (offsets_ == nullptr || !isLocalCoordinator() || !offsetsLoaded_()) return R::Refused;
+    using Why = coord::TxnOffsetRefusal;
+    if (offsets_ == nullptr || !isLocalCoordinator()) return refuse_(Why::NotCoordinator);
+    if (!offsetsLoaded_()) return refuse_(Why::NotLoaded);
     uint64_t lineage = 0;
     if (topics_ != nullptr) {
         if (const auto id = topics_->topicIdForName(tp.topic)) {
             lineage = lineageOf_(*id, tp.partition);   // C1: 0 for a disk partition
-            if (lineage == kLineagePending) return R::Refused;
+            if (lineage == kLineagePending) return refuse_(Why::LineagePending);
         }
     }
     const rune::replication::PartitionReplica* r = offsets_->replica();
-    if (r == nullptr) return offsets_->commit(group, tp, offset, {}, nowNs, lineage) ? R::Applied : R::Refused;
+    if (r == nullptr) return offsets_->commit(group, tp, offset, {}, nowNs, lineage) ? R::Applied : refuse_(Why::AppendRefused);
     // #358: Applied only once a record carrying this offset or a NEWER one of the key is COMMITTED (see the header).
     const uint64_t leadGen = r->leadershipGeneration(), logGen = r->logGeneration();
     const int64_t  hw = r->highWatermark();
@@ -982,16 +986,16 @@ coord::TxnOffsetApply GroupCoordinationService::applyTransactionalOffset(const s
             // was the newest and may be gone hands that role back to the newest waiter.
             if (i + 1 != k.waiters.size()) return R::Replicating;
             const int64_t at = offsets_->commitAt(group, tp, offset, {}, nowNs, lineage);
-            if (at < 0) return R::Refused;
+            if (at < 0) return refuse_(Why::AppendRefused);
             w.recordOffset = at; w.leadershipGen = leadGen; w.logGen = logGen;
             k.lastRecord = at; k.lastLeadershipGen = leadGen; k.lastLogGen = logGen;
             k.lastCommitted = r->highWatermark() > at; k.plainIsLast = false;
             return k.lastCommitted ? leave() : R::Replicating;
         }
-        if (k.waiters.size() >= kMaxTxnOffsetWaiters) return R::Refused;   // never evict: the coordinator retries
+        if (k.waiters.size() >= kMaxTxnOffsetWaiters) return refuse_(Why::TooManyWaiters);   // never evict: retried
     }
     const int64_t at = offsets_->commitAt(group, tp, offset, {}, nowNs, lineage);
-    if (at < 0) return R::Refused;
+    if (at < 0) return refuse_(Why::AppendRefused);
     if (slot == txnOffsetsInFlight_.end()) slot = txnOffsetsInFlight_.try_emplace(key).first;
     TxnOffsetKeyState& k = slot->second;
     {   // older anonymous entries can never be asked for again (see above)
@@ -1102,6 +1106,20 @@ size_t GroupCoordinationService::handleOffsetCommit(
     commitResultScratch_.clear();
     const bool loaded = offsetsLoaded_();   // E2 residual round 4
 
+    // #433: a commit whose records may need to wait for the high watermark is parked; it is accepted only when the
+    // park has room for its whole answer - otherwise it is refused NotCoordinator (retriable) with NOTHING appended.
+    const bool mayPark = offsets_ != nullptr && offsets_->replica() != nullptr;
+    const std::size_t maxResults = mayPark ? kMaxParkedResultsPerCommit : SIZE_MAX;
+    const bool parkFull = mayPark && genOk && loaded &&
+                          !parkHasRoomFor_(std::min<std::size_t>(msg.entries.size(), maxResults));
+    if (parkFull) [[unlikely]] {
+        if ((parkRefusals_++ & 1023u) == 0)
+            spdlog::warn("GroupCoordinationService: OffsetCommit refused NotCoordinator (retriable) - {} answers are "
+                         "already waiting for their records to commit ({} refusals so far)", parkedCount_,
+                         parkRefusals_);
+    }
+    int64_t maxRecordAt = -1;   // #433: the newest record this request appended
+
     // Iterate entries defensively (CG-1 note: count can overstate; stop when
     // the view iterator ends, which happens when the frame bytes run out).
     // Also bound-check BEFORE each push so the final encode never overruns outCap.
@@ -1109,7 +1127,7 @@ size_t GroupCoordinationService::handleOffsetCommit(
         // Stop if adding this result would overrun the output buffer.
         const std::size_t needed =
             pc::OffsetCommitResponse::encodedSizeFor(commitResultScratch_.size() + 1);
-        if (needed > outCap) {
+        if (needed > outCap || commitResultScratch_.size() >= maxResults) {
             spdlog::warn("GroupCoordinationService: OffsetCommit response capped at {} entries "
                          "(outCap={} would be exceeded)", commitResultScratch_.size(), outCap);
             break;
@@ -1118,6 +1136,12 @@ size_t GroupCoordinationService::handleOffsetCommit(
         pc::OffsetCommitResult r;
         r.topicId   = e.topicId;
         r.partition = e.partition;
+
+        if (parkFull) [[unlikely]] {
+            r.errorCode = static_cast<int16_t>(pc::ErrorCode::NotCoordinator);
+            commitResultScratch_.push_back(r);
+            continue;
+        }
 
         if (!genOk) {
             r.errorCode = static_cast<int16_t>(
@@ -1148,6 +1172,16 @@ size_t GroupCoordinationService::handleOffsetCommit(
         const coord::TopicPartition tp{topicName, e.partition};
         const std::string_view meta(
             reinterpret_cast<const char*>(e.metadata.data()), e.metadata.size());
+
+        // #438: an unfinished transaction holds this key (or the transaction coordinator is not loaded here:
+        // unknown = held) - a plain record never races its pending transactional one.  Retriable; nothing appended.
+        // (A deviation from Kafka, which lets a plain commit through: here it would be overwritten - or rewind
+        // the key - when the transaction completes.)
+        if (holdOf_(groupIdStr, tp) != coord::TxnOffsetHold::Free) [[unlikely]] {
+            r.errorCode = unstableFor_(msg.sessionId);
+            commitResultScratch_.push_back(r);
+            continue;
+        }
 
         const uint64_t lineage = lineageOf_(e.topicId, e.partition);   // C1
         if (lineage == kLineagePending) [[unlikely]] {
@@ -1184,16 +1218,105 @@ size_t GroupCoordinationService::handleOffsetCommit(
         }
         const int64_t at = offsets_->commitAt(groupIdStr, tp, e.offset, meta, nowNs, lineage);
         const bool committed = at >= 0;
-        if (committed) notePlainOffsetCommit_(groupIdStr, tp, at);   // the newest record of the key (F2)
+        if (committed) {
+            notePlainOffsetCommit_(groupIdStr, tp, at);   // the newest record of the key (F2)
+            if (at > maxRecordAt) maxRecordAt = at;
+        }
         r.errorCode = committed ? static_cast<int16_t>(pc::ErrorCode::OK)
                                 : static_cast<int16_t>(pc::ErrorCode::MinIsrViolation);
         commitResultScratch_.push_back(r);
+    }
+
+    // #433: OK only once every appended record is committed.  A commit behind parked ones is parked too (answers
+    // leave in request order).  A single-replica offsets partition commits on the append: answered inline.
+    if (mayPark && maxRecordAt >= 0 &&
+        (parkedCount_ != 0 || offsets_->replica()->highWatermark() <= maxRecordAt)) {
+        parkCommit_(msg.sessionId, msg.correlationId, maxRecordAt);
+        return 0;   // sent by releaseParkedCommits_ (the gateway treats a 0 OffsetCommit answer as deferred)
     }
 
     pc::OffsetCommitResponse resp;
     resp.sessionId     = msg.sessionId;
     resp.correlationId = msg.correlationId;
     return resp.encode(out, std::span<const pc::OffsetCommitResult>(commitResultScratch_));
+}
+
+// ---------------------------------------------------------------------------
+// #433: parked OffsetCommit answers (see the header).
+// ---------------------------------------------------------------------------
+void GroupCoordinationService::parkCommit_(int64_t sessionId, int64_t correlationId, int64_t maxRecordAt)
+{
+    // Room was checked before anything was appended (parkFull); the results are the response's, capped alike.
+    const rune::replication::PartitionReplica* r = offsets_->replica();
+    ParkedCommit& p = parked_[(parkedHead_ + parkedCount_) % kMaxParkedCommits];
+    p.sessionId     = sessionId;
+    p.correlationId = correlationId;
+    p.maxRecordAt   = maxRecordAt;
+    p.leadershipGen = r->leadershipGeneration();
+    p.logGen        = r->logGeneration();
+    p.resultsAt     = static_cast<uint32_t>((resultsHead_ + resultsUsed_) % kParkedResultsCapacity);
+    p.count         = static_cast<uint32_t>(commitResultScratch_.size());
+    for (std::size_t i = 0; i < commitResultScratch_.size(); ++i)
+        parkedResults_[(p.resultsAt + i) % kParkedResultsCapacity] = commitResultScratch_[i];
+    resultsUsed_ += p.count;
+    ++parkedCount_;
+}
+
+int GroupCoordinationService::releaseParkedCommits_()
+{
+    // Sent reliably through sendControlFrame like an Assign frame: it always fits the gateway spill's staging buffer.
+    static_assert(kParkedFrameBytes <= rune::gateway::ClientGateway::spillSizing().stage,
+                  "parked OffsetCommit answers must be spillable");
+    const rune::replication::PartitionReplica* r = offsets_ != nullptr ? offsets_->replica() : nullptr;
+    const bool coordinating = isLocalCoordinator();
+    int n = 0;
+    while (parkedCount_ != 0) {
+        ParkedCommit& p = parked_[parkedHead_];
+        const bool sameGen = r != nullptr && r->leadershipGeneration() == p.leadershipGen &&
+                             r->logGeneration() == p.logGen;
+        const bool lost = !sameGen || !coordinating || !r->acceptsProduce();
+        if (!lost && r->highWatermark() <= p.maxRecordAt) break;   // still replicating (later ones are newer)
+        commitResultScratch_.clear();
+        for (uint32_t i = 0; i < p.count; ++i) {
+            pc::OffsetCommitResult res = parkedResults_[(p.resultsAt + i) % kParkedResultsCapacity];
+            // The record may be gone with the old leadership / log: never an OK for it.  Retriable (idempotent).
+            if (lost && res.errorCode == static_cast<int16_t>(pc::ErrorCode::OK))
+                res.errorCode = static_cast<int16_t>(pc::ErrorCode::NotCoordinator);
+            commitResultScratch_.push_back(res);
+        }
+        if (lost)
+            spdlog::info("GroupCoordinationService: a parked OffsetCommit (session {}, corr {}) answered "
+                         "NotCoordinator - the offsets partition changed before its record {} committed",
+                         p.sessionId, p.correlationId, p.maxRecordAt);
+        pc::OffsetCommitResponse resp;
+        resp.sessionId     = p.sessionId;
+        resp.correlationId = p.correlationId;
+        const std::size_t len = resp.encode(parkedFrame_.data(),
+                                            std::span<const pc::OffsetCommitResult>(commitResultScratch_));
+        sendDeferred_(p.sessionId, parkedFrame_.data(), len);
+        resultsHead_ = (resultsHead_ + p.count) % kParkedResultsCapacity;
+        resultsUsed_ -= p.count;
+        parkedHead_ = (parkedHead_ + 1) % kMaxParkedCommits;
+        --parkedCount_;
+        ++n;
+    }
+    return n;
+}
+
+void GroupCoordinationService::sendDeferred_(int64_t sessionId, const uint8_t* frame, std::size_t n)
+{
+    if (gateway_ != nullptr) (void)gateway_->sendControlFrame(sessionId, frame, n);   // queued, never dropped
+    else if (answerSink_ != nullptr) answerSink_(answerSinkCtx_, sessionId, frame, n);
+}
+
+int16_t GroupCoordinationService::unstableFor_(int64_t sessionId)
+{
+    ++unstableAnswers_;
+    const int32_t v = clientVersionFn_ != nullptr ? clientVersionFn_(clientVersionCtx_, sessionId)
+                    : gateway_ != nullptr        ? gateway_->sessionClientVersion(sessionId)
+                                                 : -1;
+    return static_cast<int16_t>(pc::clientUnderstandsUnstableOffsetCommit(v) ? pc::ErrorCode::UnstableOffsetCommit
+                                                                            : pc::ErrorCode::NotCoordinator);
 }
 
 // ---------------------------------------------------------------------------
@@ -1281,6 +1404,22 @@ size_t GroupCoordinationService::handleOffsetFetch(
     }
 
     if (msg.entries.empty()) {
+        // #438: a fetch-all cannot list a held key that has no committed offset yet: while ANY key of the group is
+        // held (or the hold state is unknown) the whole fetch is answered the retriable sentinel.
+        if (holdOf_(groupIdStr, coord::TopicPartition{std::string{}, -1}) != coord::TxnOffsetHold::Free) [[unlikely]] {
+            if (pc::OffsetFetchResponse::encodedSizeFor(1) <= outCap) {
+                pc::OffsetFetchResult sentinel;
+                sentinel.topicId   = -1;
+                sentinel.partition = -1;
+                sentinel.offset    = -1;
+                sentinel.errorCode = unstableFor_(msg.sessionId);
+                fetchResultScratch_.push_back(sentinel);
+            }
+            pc::OffsetFetchResponse resp;
+            resp.sessionId     = msg.sessionId;
+            resp.correlationId = msg.correlationId;
+            return resp.encode(out, std::span<const pc::OffsetFetchResult>(fetchResultScratch_));
+        }
         // Fetch all committed offsets for the group.
         // Bound-check BEFORE writing each result so a large fetch-all never
         // overruns a fixed scratch buffer.  Results that would exceed outCap
@@ -1341,7 +1480,12 @@ size_t GroupCoordinationService::handleOffsetFetch(
                 r.offset = -1; // no-offset sentinel
             } else {
                 const coord::TopicPartition tp{topicName, e.partition};
-                if (lineageOf_(e.topicId, e.partition) == kLineagePending) [[unlikely]] {
+                if (holdOf_(groupIdStr, tp) != coord::TxnOffsetHold::Free) [[unlikely]] {
+                    // #438: an unfinished transaction holds the key (or unknown = held): its committed offset is
+                    // about to change - neither it nor "none" is answered; retriable.
+                    r.offset    = -1;
+                    r.errorCode = unstableFor_(msg.sessionId);
+                } else if (lineageOf_(e.topicId, e.partition) == kLineagePending) [[unlikely]] {
                     // C1: the current leadership has not confirmed the lineage
                     // yet — neither the offset nor "none" can be answered.
                     ++pendingLineageAnswers_;
@@ -1527,3 +1671,21 @@ void GroupCoordinationService::onReachedStable(
 }
 
 } // namespace rune::node
+
+namespace rune::node {
+// ---------------------------------------------------------------------------
+// #125 (KIP-447): the member fence of a TxnOffsetCommit - handleOffsetCommit's member + generation rules.
+// ---------------------------------------------------------------------------
+rune::protocol::client::ErrorCode GroupCoordinationService::checkTxnOffsetMember(const std::string& group,
+                                                                                const std::string& memberId,
+                                                                                int32_t generationId, int64_t sessionId)
+{
+    using EC = rune::protocol::client::ErrorCode;
+    if (!isLocalCoordinator()) return EC::NotCoordinator;
+    const auto it = coordinators_.find(group);
+    const bool memberOk = it != coordinators_.end() && ownsMember_(group, memberId, sessionId) &&
+                          it->second.hasMember(memberId);
+    if (!memberOk) return EC::UnknownMember;   // another session's member: exactly as one that does not exist
+    return generationId == it->second.generationId() ? EC::OK : EC::IllegalGeneration;
+}
+}  // namespace rune::node

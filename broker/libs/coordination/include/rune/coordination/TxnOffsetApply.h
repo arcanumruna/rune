@@ -11,6 +11,27 @@ namespace rune::coordination {
 /// (CompleteCommit, EndTxn answered) only once every one of its offsets is Applied.
 enum class TxnOffsetApply : uint8_t { Applied, Replicating, Refused };
 
+/// Issue #359: why an apply was Refused (the group coordinator reports its last refusal; the transaction
+/// coordinator logs it with the stuck-commit WARN).  Unknown: the sink gave no reason (rigs).
+enum class TxnOffsetRefusal : uint8_t { Unknown, NotCoordinator, NotLoaded, LineagePending, AppendRefused, TooManyWaiters };
+
+[[nodiscard]] constexpr const char* toString(TxnOffsetRefusal r) noexcept {
+    switch (r) {
+        case TxnOffsetRefusal::NotCoordinator: return "NotCoordinator";
+        case TxnOffsetRefusal::NotLoaded:      return "NotLoaded";
+        case TxnOffsetRefusal::LineagePending: return "LineagePending";
+        case TxnOffsetRefusal::AppendRefused:  return "AppendRefused";
+        case TxnOffsetRefusal::TooManyWaiters: return "TooManyWaiters";
+        case TxnOffsetRefusal::Unknown:        break;
+    }
+    return "Unknown";
+}
+
+/// Issue #438: whether an unfinished transaction holds a consumer-group (group, topic, partition).  A held key is
+/// neither fetched nor plainly committed (UnstableOffsetCommit, retriable) until the holder's Complete* record is
+/// committed.  Unknown: the transaction coordinator is not loaded on this node - treated as Held.
+enum class TxnOffsetHold : uint8_t { Free, Held, Unknown };
+
 /// PR #434 review: the committing transaction an offset apply belongs to - compared field by field.  The
 /// coordinator fills all four (one value per transaction and coordinator load); a rig may name a transaction by a
 /// plain number (`producerId` only).

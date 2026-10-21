@@ -2767,3 +2767,124 @@ TEST_F(GroupConsumerHubTest, AnUnknownFetchRefusalCodeIsParkedAndRetriedWithoutA
     }
     EXPECT_TRUE(impl_->active) << "an unknown code is retried, not bounded (an older client on code 49 loops)";
 }
+
+// ===========================================================================
+// Issue #438 (client version 10): UnstableOffsetCommit - a transaction holds the key - is waited out: an OffsetFetch
+// answered 50 is re-fetched without spending the retry budget, a commitSync answered 50 is re-sent after a backoff on
+// the duty clock; neither is surfaced.  Issue #125: groupMetadata() names the member of the current generation.
+// ===========================================================================
+namespace {
+std::vector<uint8_t> makeOffsetFetchError(int64_t corr, int16_t code) {
+    rpc::OffsetFetchResult r;
+    r.topicId = kTopicId; r.partition = kPartition; r.offset = -1; r.errorCode = code;
+    rpc::OffsetFetchResponse msg;
+    msg.sessionId = kSessionId; msg.correlationId = corr;
+    std::vector<uint8_t> buf(rpc::OffsetFetchResponse::encodedSizeFor(1));
+    msg.encode(buf.data(), std::span<const rpc::OffsetFetchResult>(&r, 1));
+    return buf;
+}
+}  // namespace
+
+TEST_F(GroupConsumerHubTest, UnstableOffsetFetchAnswersNeverSpendTheRetryBudgetRegression) {
+    bringToStable(*hub_, sink_, kTopicId, kPartition);
+    for (int i = 0; i < 32; ++i) {   // 4x the budget (kMaxOffsetFetchAttempts = 8)
+        impl_->offsetFetchCorrId = 9'000 + i;   // each answer is to a fresh (re-sent) fetch
+        const auto f = makeOffsetFetchError(impl_->offsetFetchCorrId,
+                                            static_cast<int16_t>(rpc::ErrorCode::UnstableOffsetCommit));
+        hub_->onOffsetFetchResponse(f.data(), f.size());
+        ASSERT_TRUE(impl_->active) << "answer " << i << " ended the consumer: " << static_cast<int>(impl_->failReason);
+    }
+    EXPECT_EQ(impl_->offsetFetchAttempts, 0u);
+    EXPECT_EQ(impl_->state, GroupConsumerState::Stable) << "a held key is not a rebalance";
+    EXPECT_EQ(impl_->assignment.at(TopicPartition{kTopicId, kPartition}), GroupConsumerImpl::kUnseededSentinel)
+        << "an unstable answer seeded a position";
+    // The control: a retriable error that IS budgeted ends the consumer after the budget (the mutation the 50 rule
+    // guards against).
+    for (int i = 0; i <= 8 && impl_->active; ++i) {
+        impl_->offsetFetchCorrId = 19'000 + i;
+        const auto f = makeOffsetFetchError(impl_->offsetFetchCorrId, static_cast<int16_t>(rpc::ErrorCode::NotLeader));
+        hub_->onOffsetFetchResponse(f.data(), f.size());
+    }
+    EXPECT_FALSE(impl_->active);
+    EXPECT_EQ(impl_->failReason, GroupFailReason::RetryBudgetExhausted);
+}
+
+TEST_F(GroupConsumerHubTest, CommitSyncAnsweredUnstableIsResentAfterABackoffOnTheDutyClockRegression) {
+    bringToStable(*hub_, sink_, kTopicId, kPartition);
+    seedPosition(*hub_, 7);
+    GroupConsumer gc(impl_.get(), &directSink, hub_.get(), {}, &directOpSink);
+    auto op = commitSyncOp(gc);
+    int64_t now = 1'000'000'000;
+    hub_->doWork(now, kSessionId, sink_.fn());
+    const int64_t corr1 = lastCommitCorrId(sink_);
+    ASSERT_NE(corr1, 0);
+    const auto unstable = static_cast<int16_t>(rpc::ErrorCode::UnstableOffsetCommit);
+    auto r1 = makeOffsetCommitResponse(corr1, unstable);
+    hub_->onOffsetCommitResponse(r1.data(), r1.size());
+    EXPECT_FALSE(op.ready()) << "UnstableOffsetCommit was surfaced";
+    (void)hub_->sweepCommitSyncTimeouts(now);              // arms the retry: now + 20 ms
+    hub_->doWork(now, kSessionId, sink_.fn());
+    EXPECT_EQ(lastCommitCorrId(sink_), corr1) << "re-sent without a backoff";
+    now += GroupConsumerHub::kCommitRetryMinNs;
+    (void)hub_->sweepCommitSyncTimeouts(now);
+    hub_->doWork(now, kSessionId, sink_.fn());
+    const int64_t corr2 = lastCommitCorrId(sink_);
+    ASSERT_NE(corr2, corr1) << "never re-sent";
+    // A second 50: the backoff doubles.
+    auto r2 = makeOffsetCommitResponse(corr2, unstable);
+    hub_->onOffsetCommitResponse(r2.data(), r2.size());
+    (void)hub_->sweepCommitSyncTimeouts(now);
+    now += GroupConsumerHub::kCommitRetryMinNs;
+    (void)hub_->sweepCommitSyncTimeouts(now);
+    hub_->doWork(now, kSessionId, sink_.fn());
+    EXPECT_EQ(lastCommitCorrId(sink_), corr2) << "the second retry did not back off further";
+    now += GroupConsumerHub::kCommitRetryMinNs;
+    (void)hub_->sweepCommitSyncTimeouts(now);
+    hub_->doWork(now, kSessionId, sink_.fn());
+    const int64_t corr3 = lastCommitCorrId(sink_);
+    ASSERT_NE(corr3, corr2);
+    auto ok = makeOffsetCommitResponse(corr3);
+    hub_->onOffsetCommitResponse(ok.data(), ok.size());
+    ASSERT_TRUE(op.ready());
+    EXPECT_EQ(op.status(), OpStatus::Ok);
+    EXPECT_EQ(op.times(), 1);
+}
+
+TEST_F(GroupConsumerHubTest, CommitSyncAnsweredUnstableStillTimesOutAtItsDeadlineRegression) {
+    bringToStable(*hub_, sink_, kTopicId, kPartition);
+    seedPosition(*hub_, 7);
+    GroupConsumer gc(impl_.get(), &directSink, hub_.get(), {}, &directOpSink);
+    auto op = commitSyncOp(gc);
+    int64_t now = 1'000'000'000;
+    for (int i = 0; i < 200 && !op.ready(); ++i) {
+        hub_->doWork(now, kSessionId, sink_.fn());
+        const int64_t corr = lastCommitCorrId(sink_);
+        if (corr != 0 && impl_->commitSyncCorrId == corr) {
+            auto r = makeOffsetCommitResponse(corr, static_cast<int16_t>(rpc::ErrorCode::UnstableOffsetCommit));
+            hub_->onOffsetCommitResponse(r.data(), r.size());
+        }
+        now += 500'000'000;   // 0.5 s of duty clock per pass
+        (void)hub_->sweepCommitSyncTimeouts(now);
+    }
+    ASSERT_TRUE(op.ready()) << "a key held for ever left the commitSync pending for ever";
+    EXPECT_EQ(op.status(), OpStatus::Timeout);
+}
+
+TEST_F(GroupConsumerHubTest, GroupMetadataNamesTheMemberOfTheCurrentGenerationRegression) {
+    GroupConsumer gc(impl_.get(), &directSink, hub_.get(), {}, &directOpSink);
+    auto before = gc.groupMetadata();
+    EXPECT_EQ(before.groupId, "test-group");
+    EXPECT_TRUE(before.memberId.empty()) << "a member before the first join";
+    bringToStable(*hub_, sink_, kTopicId, kPartition, /*genId=*/4, "test-group-1-abcdef");
+    const auto m = gc.groupMetadata();   // app side: the published snapshot
+    EXPECT_EQ(m.groupId, "test-group");
+    EXPECT_EQ(m.generationId, 4);
+    EXPECT_EQ(m.memberId, "test-group-1-abcdef");
+    // A rejoin with a new member id and generation is published too.
+    auto jgr = makeJoinGroupResponseOK(5, "test-group-2-012345");
+    impl_->state = GroupConsumerState::Joining;
+    hub_->onJoinGroupResponse(jgr.data(), jgr.size(), kSessionId, sink_.fn());
+    const auto m2 = gc.groupMetadata();
+    EXPECT_EQ(m2.generationId, 5);
+    EXPECT_EQ(m2.memberId, "test-group-2-012345");
+}

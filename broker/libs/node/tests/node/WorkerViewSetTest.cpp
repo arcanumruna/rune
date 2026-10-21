@@ -37,6 +37,21 @@
 #include <unistd.h>
 
 namespace {
+/// The slot of a view row.  getRow is called FIRST (it sets the layout): `readSlot(getRow(.., L), *L, s)` left the
+/// order to the compiler, and GCC evaluates `*L` before getRow assigns L (a null dereference on Linux).
+template <class VS>
+rune::codec::FieldValue slotOf(VS& vs, int32_t view, int32_t partition, uint64_t key, uint16_t slot) {
+    const rune::view::RowLayout* layout = nullptr;
+    const uint8_t* row = vs.getRow(view, partition, key, layout);
+    if (row == nullptr || layout == nullptr) {
+        ADD_FAILURE() << "no row for key " << key;
+        return {};
+    }
+    return rune::view::readSlot(row, *layout, slot);
+}
+}  // namespace
+
+namespace {
 
 // Every view data dir is per PROCESS: "<temp>/<name>-<pid>".  ctest runs each
 // test as its own process (-j6) and other checkouts on this machine run the same
@@ -1155,15 +1170,15 @@ TEST(WorkerViewSetRegression, TransientSourceRecreatedRefoldsFromRingStartRegres
     vs.driveFolds(5, 0, rr1, 2, 0, &tb1);
     const rune::view::RowLayout* L = nullptr;
     ASSERT_NE(vs.getRow(0x40000035, 0, 7, L), nullptr);
-    ASSERT_EQ(rune::view::readSlot(vs.getRow(0x40000035, 0, 7, L), *L, 1).i, 10);
+    ASSERT_EQ(slotOf(vs, 0x40000035, 0, 7, 1).i, 10);
 
     const auto inc2 = concatBatches({upsertAt(0, 7, 99), upsertAt(1, 8, 98), upsertAt(2, 9, 97)});
     auto rr2 = [&](int64_t, int64_t) { return rune::storage::LogReadView{inc2.data(), inc2.size(), 0, 3}; };
     rune::node::TransientBounds tb2{0, 3};
     tb2.incarnation = 2;
     vs.driveFolds(5, 0, rr2, 3, 0, &tb2);
-    EXPECT_EQ(rune::view::readSlot(vs.getRow(0x40000035, 0, 7, L), *L, 1).i, 99) << "a stale row survived";
-    EXPECT_EQ(rune::view::readSlot(vs.getRow(0x40000035, 0, 8, L), *L, 1).i, 98) << "a stale row survived";
+    EXPECT_EQ(slotOf(vs, 0x40000035, 0, 7, 1).i, 99) << "a stale row survived";
+    EXPECT_EQ(slotOf(vs, 0x40000035, 0, 8, 1).i, 98) << "a stale row survived";
     ASSERT_NE(vs.getRow(0x40000035, 0, 9, L), nullptr);
     EXPECT_EQ(vs.foldCounters(0x40000035, 0)->transientSourceResets, 1u);
     EXPECT_EQ(vs.foldCounters(0x40000035, 0)->transientRecordsEvicted, 0u) << "a recreation is not an eviction";
@@ -1196,8 +1211,8 @@ TEST(WorkerViewSetRegression, TransientSourceCutBelowCursorRefoldsFromTheCutRegr
     tb1.cutOffset     = 1;
     vs.driveFolds(5, 0, rr1, 3, 0, &tb1);
     const rune::view::RowLayout* L = nullptr;
-    EXPECT_EQ(rune::view::readSlot(vs.getRow(0x40000036, 0, 8, L), *L, 1).i, 22);
-    EXPECT_EQ(rune::view::readSlot(vs.getRow(0x40000036, 0, 9, L), *L, 1).i, 33);
+    EXPECT_EQ(slotOf(vs, 0x40000036, 0, 8, 1).i, 22);
+    EXPECT_EQ(slotOf(vs, 0x40000036, 0, 9, 1).i, 33);
     EXPECT_EQ(vs.foldCounters(0x40000036, 0)->transientSourceResets, 1u);
 
     // Generation 2, cut at 5 (above the cursor 3): nothing the view folded changed.
@@ -1262,7 +1277,7 @@ TEST(WorkerViewSetRegression, TransientSourceGenerationJumpRefoldsFromRingStartR
     rune::node::TransientBounds tb0{0, 8};
     vs.driveFolds(5, 0, rrG0, 8, 0, &tb0);   // Live, cursor 8, generation 0
     const rune::view::RowLayout* L = nullptr;
-    ASSERT_EQ(rune::view::readSlot(vs.getRow(0x40000038, 0, 103, L), *L, 1).i, 3);
+    ASSERT_EQ(slotOf(vs, 0x40000038, 0, 103, 1).i, 3);
 
     // Truncated at 2 (gen 1), refilled, truncated at 5 (gen 2), refilled: the
     // ring now holds new values for offsets [2,8).  Only the last cut (5) is kept.
@@ -1278,7 +1293,7 @@ TEST(WorkerViewSetRegression, TransientSourceGenerationJumpRefoldsFromRingStartR
     tb2.cutOffset     = 5;
     vs.driveFolds(5, 0, rrG2, 8, 0, &tb2);
     for (int64_t k = 102; k <= 107; ++k)
-        EXPECT_EQ(rune::view::readSlot(vs.getRow(0x40000038, 0, static_cast<uint64_t>(k), L), *L, 1).i, k - 50)
+        EXPECT_EQ(slotOf(vs, 0x40000038, 0, static_cast<uint64_t>(k), 1).i, k - 50)
             << "stale row for key " << k;
     EXPECT_EQ(vs.foldCounters(0x40000038, 0)->transientSourceResets, 1u);
     EXPECT_EQ(vs.foldCounters(0x40000038, 0)->transientRecordsEvicted, 0u);

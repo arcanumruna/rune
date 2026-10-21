@@ -2812,6 +2812,12 @@ private:
     std::int64_t                     stuckMarkersCounterRegId_ = -1;
     std::shared_ptr<aeron::Counter>  stuckMarkersCounter_;
     static bool publishStuckMarkers_(void* self, std::int64_t value);
+    // #359: stuck transactional offset commits (count, oldest age ms).
+    std::int64_t                     stuckTxnOffsetsCounterRegId_ = -1;
+    std::int64_t                     stuckTxnOffsetAgeCounterRegId_ = -1;
+    std::shared_ptr<aeron::Counter>  stuckTxnOffsetsCounter_;
+    std::shared_ptr<aeron::Counter>  stuckTxnOffsetAgeCounter_;
+    static bool publishStuckTxnOffsets_(void* self, std::int64_t stuck, std::int64_t oldestAgeMs);
 
     // -----------------------------------------------------------------------
     // State flags — CONTROLLER-owned (F9a: no atomics).  Written only by the
