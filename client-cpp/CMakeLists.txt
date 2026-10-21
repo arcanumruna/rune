@@ -744,6 +744,29 @@ if(BUILD_EXAMPLES AND aeron_FOUND)
         endif()
     endif()
 
+    # ── Phase 2c Task 17 — subscription-filter probe (docker/filter-e2e.sh) ──
+    #
+    # filter_probe.cpp includes the build-time generated player_event.gen.h (rune::gen::PlayerEvent with its Filter,
+    # from examples/filter/PlayerEventSchema.h, the descriptor the probe also defines the topic with) and the shared
+    # schema header: both come from the tree, so the probe image needs tests/ (GenClaimSchemas.cpp) in its context.
+    if(TARGET generate_claim_schema_headers)
+        add_executable(filter_probe examples/filter_probe.cpp)
+        add_dependencies(filter_probe generate_claim_schema_headers)
+        target_include_directories(filter_probe PRIVATE ${RUNE_PROTOCOL_INCLUDE} "${RUNE_CLAIM_GEN_DIR}/gen" "${CMAKE_CURRENT_SOURCE_DIR}/examples")
+        target_link_libraries(filter_probe PRIVATE
+            rune_client_api
+            rune_client_producer
+            rune_client_subscriber
+            rune_codec
+        )
+        if(UNIX AND NOT APPLE)
+            find_library(UUID_LIB_FILTER_PROBE uuid)
+            if(UUID_LIB_FILTER_PROBE)
+                target_link_libraries(filter_probe PRIVATE ${UUID_LIB_FILTER_PROBE})
+            endif()
+        endif()
+    endif()
+
     # ── Task 10 (0c #11 gate) — CLI-driven rune-ql typed probe ────────────────
     #
     # tests/e2e/rune_ql_probe.cpp is the 0c single-node real-Aeron probe.  Unlike

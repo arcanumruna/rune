@@ -1,0 +1,21 @@
+# docker-compose.filter.yml — the 3-node subscription-filter cluster of docker/filter-e2e.sh (overlay on
+# docker-compose.yml + docker-compose.auth.yml).
+#
+#   docker compose -p rune-filter-e2e -f docker/docker-compose.yml -f docker/docker-compose.auth.yml \
+#       -f docker/docker-compose.filter.yml up -d rune-1 rune-2 rune-3
+#
+# Two filter knobs (docs/configuration.md): the per-partition subscription cap (the MMORPG scenario holds 200 world
+# servers on every partition) and the position-note interval (a quiet filtered subscription's position follows the
+# log's end within this many milliseconds).  Unset, they fall back to the broker's own defaults.
+
+x-filter-env: &filter-env
+  RUNE_FILTER_MAX_SUBS_PER_PARTITION: "${RUNE_FILTER_MAX_SUBS_PER_PARTITION:-4096}"
+  RUNE_FILTER_NOTE_INTERVAL_MS: "${RUNE_FILTER_NOTE_INTERVAL_MS:-50}"
+
+services:
+  rune-1:
+    environment: *filter-env
+  rune-2:
+    environment: *filter-env
+  rune-3:
+    environment: *filter-env
