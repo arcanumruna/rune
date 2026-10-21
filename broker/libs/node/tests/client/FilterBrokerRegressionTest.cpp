@@ -603,6 +603,7 @@ struct Feeder {
     const std::vector<Ev>&  model;
     bool                    transactional;
     std::size_t             sent = 0, acked = 0, failed = 0;
+    Clients                 others;   // Invoker clients that must keep being pumped while this producer waits
 
     Feeder(rc::Client& c, rc::TopicHandle t, const std::vector<Ev>& m, std::string txnId = {})
         : client(c), p(c.producer(config(txnId))), th(t), model(m), transactional(!txnId.empty()) {
@@ -637,7 +638,9 @@ struct Feeder {
     /// Plain producer: every record acked (acks=all).
     void flush() {
         p.flush();
-        EXPECT_TRUE(pumpUntil({&client}, [&] { return acked == sent; }, 90s)) << "acked " << acked << " of " << sent;
+        Clients cs{&client};
+        cs.insert(cs.end(), others.begin(), others.end());
+        EXPECT_TRUE(pumpUntil(cs, [&] { return acked == sent; }, 90s)) << "acked " << acked << " of " << sent;
         EXPECT_EQ(failed, 0u);
     }
     void feed(int from, int to) { send(from, to); flush(); }
@@ -802,7 +805,10 @@ void runCell(const CellParam& cp, rc::Persistence persistence = rc::Persistence:
         ASSERT_TRUE(pumpUntil(clients(), [&] { return rd.covers(1000) || rd.anyFinished(); })) << "the first half never arrived";
         cl.trio->crash(crashed);
         std::vector<int32_t> leaders;
-        ASSERT_TRUE(awaitLeaders(*cl.trio, topic.topicId, kParts, leaders, 60s)) << "no leaders after the crash";
+        // Pumped: an Invoker client that is not driven for seconds loses its session (and a group its position).
+        ASSERT_TRUE(pumpUntil(clients(), [&] { return awaitLeaders(*cl.trio, topic.topicId, kParts, leaders, 1ms); }, 60s))
+            << "no leaders after the crash";
+        if (readerClient) f.others = {readerClient.get()};
         f.feed(1000, kRecords);
         finish(kRecords, "leader move");
         break;
